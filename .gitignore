@@ -1,0 +1,10 @@
+# ESP-IDF build outputs
+firmware/wqn-zectrix-note4/build/
+firmware/wqn-zectrix-note4/build-*/
+firmware/wqn-zectrix-note4/sdkconfig
+firmware/wqn-zectrix-note4/sdkconfig.old
+firmware/wqn-zectrix-note4/managed_components/
+firmware/wqn-zectrix-note4/%SystemDrive%/
+
+# Local project notes and handoff docs
+docs/

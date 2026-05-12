@@ -1,0 +1,27 @@
+menu "WQN firmware"
+
+    config WQN_WIFI_STA_ENABLE
+        bool "Enable WQN WiFi station"
+        default n
+        help
+            Enable the minimal WiFi station flow. Keep this disabled for the
+            offline board-diagnostics build and until CMOS5 plus backup restore
+            checks are complete.
+
+    config WQN_WIFI_SSID
+        string "WQN WiFi SSID"
+        default ""
+        depends on WQN_WIFI_STA_ENABLE
+        help
+            Development WiFi SSID. This value is stored only in local sdkconfig,
+            which is ignored by git.
+
+    config WQN_WIFI_PASSWORD
+        string "WQN WiFi password"
+        default ""
+        depends on WQN_WIFI_STA_ENABLE
+        help
+            Development WiFi password. This value is stored only in local
+            sdkconfig, which is ignored by git.
+
+endmenu
