@@ -5,10 +5,14 @@
 #define WQN_BOARD_ID "zectrix-s3-epaper-4.2"
 
 #ifndef WQN_API_BASE
-#define WQN_API_BASE "https://wqn.example.com/api/esp32"
+#define WQN_API_BASE "https://wqn.helema.cn/api/esp32"
 #endif
 
 #define WQN_NVS_NAMESPACE "wqn"
 #define WQN_NVS_ACCESS_TOKEN_KEY "access_token"
 
 #define WQN_SYNC_LIMIT 20
+
+#ifndef WQN_DEBUG_PROBLEM_IDS
+#define WQN_DEBUG_PROBLEM_IDS ""
+#endif

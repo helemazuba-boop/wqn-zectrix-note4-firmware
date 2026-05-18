@@ -13,11 +13,18 @@ WiFi or call any WQN network endpoint.
   while EPD, audio, amp, and NFC power stay off.
 - Boot diagnostics: firmware version, board id, target, ESP-IDF version, chip
   features, Flash size, PSRAM initialized/size, WiFi MAC, and reset reason.
-- Optional WiFi station flow behind `CONFIG_WQN_WIFI_STA_ENABLE`.
-- No AP provisioning, pairing, sync, review upload, or HTTP requests yet.
+- Optional WiFi station flow behind `CONFIG_WQN_WIFI_STA_ENABLE`, including open
+  networks with an empty password.
+- Minimal WQN pairing and sync path behind WiFi enablement, with local token
+  storage, masked token logs, pending review upload retry, due problem sync,
+  local problem cache, and optional `/problem-index` refresh when the cloud
+  endpoint is available.
+- No AP provisioning, WQN web UI calls outside the ESP32 API, review input UI,
+  asset downloads, or display UI yet.
 
-Do not flash this firmware to the physical device until `CMOS5` and the backup
-restore path are confirmed.
+The official firmware remains in OTA slot 0 during test flashes. Use the
+confirmed backup/restore path before writing any experimental firmware to the
+device.
 
 ## Build
 
@@ -39,7 +46,8 @@ call D:\Program\Espressif\idf_cmd_init.bat
 idf.py --no-ccache -B build-user-s3 build
 ```
 
-Development builds may override the API base for future work:
+The default WQN ESP32 API base is `https://wqn.helema.cn/api/esp32`.
+Development builds may override it:
 
 ```powershell
 idf.py -DWQN_API_BASE=https://your-host.example.com/api/esp32 build
@@ -62,10 +70,14 @@ WQN firmware -> WQN WiFi SSID
 WQN firmware -> WQN WiFi password
 ```
 
-The credentials are stored in local `sdkconfig`, which is ignored by git. When
-enabled, the firmware starts STA mode, logs connect/disconnect events, prints
-IP/netmask/gateway after DHCP succeeds, and retries after disconnects. It still
-does not call WQN APIs.
+The credentials are stored in local `sdkconfig`, which is ignored by git. Leave
+the password empty for open public WiFi. When enabled, the firmware starts STA
+mode, logs connect/disconnect events, prints IP/netmask/gateway after DHCP
+succeeds, retries after disconnects, then runs the WQN pairing and due problem
+sync flow. If a token is already stored, pairing is skipped; pending review
+results are uploaded first, then due problem details are merged into the local
+NVS cache. If the cloud exposes `/problem-index`, the firmware also refreshes
+the first page of the all-problem index.
 
 ## Recovery Gate
 
@@ -83,10 +95,9 @@ Known backup facts:
 - Expected size: `16777216` bytes / 16 MiB
 - SHA256: `C965245CE42F90938A28588D88A0DBFF9D03E2AD76C31B27DE65B03875FD1F02`
 
-Before any custom flash, confirm whether `CMOS5` means a different chip target
-or only an official firmware/runtime label. Also verify the restore flow on the
-actual device. Suggested command templates, to be run only after the target and
-serial port are confirmed:
+`CMOS5` and the physical backup path have been confirmed on the actual device.
+Keep the verified 16 MiB backup image outside this repository. Suggested command
+templates:
 
 ```powershell
 # Read current full flash backup from the device.

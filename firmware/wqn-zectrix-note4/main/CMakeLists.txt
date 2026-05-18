@@ -7,6 +7,7 @@ idf_component_register(
         "storage.cpp"
         "text_render.cpp"
         "wifi_manager.cpp"
+        "wqn_api.cpp"
     INCLUDE_DIRS "."
     REQUIRES
         driver
@@ -14,6 +15,8 @@ idf_component_register(
         esp_system
         esp_timer
         app_update
+        esp_http_client
+        esp-tls
         esp_event
         esp_netif
         esp_psram
@@ -25,6 +28,7 @@ idf_component_register(
 )
 
 set(WQN_API_BASE "" CACHE STRING "Override the WQN ESP32 API base URL")
+set(WQN_DEBUG_PROBLEM_IDS "" CACHE STRING "Local-only comma-separated ESP32 debug problem IDs")
 
 target_compile_definitions(
     ${COMPONENT_LIB}
@@ -38,5 +42,13 @@ if(WQN_API_BASE)
         ${COMPONENT_LIB}
         PRIVATE
             WQN_API_BASE=\"${WQN_API_BASE}\"
+    )
+endif()
+
+if(WQN_DEBUG_PROBLEM_IDS)
+    target_compile_definitions(
+        ${COMPONENT_LIB}
+        PRIVATE
+            WQN_DEBUG_PROBLEM_IDS=\"${WQN_DEBUG_PROBLEM_IDS}\"
     )
 endif()

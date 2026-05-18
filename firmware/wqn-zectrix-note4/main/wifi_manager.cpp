@@ -7,6 +7,7 @@
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_wifi.h"
+#include "freertos/event_groups.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "lwip/ip4_addr.h"
@@ -17,9 +18,12 @@ constexpr char kTag[] = "wqn_wifi";
 constexpr TickType_t kReconnectDelay = pdMS_TO_TICKS(5000);
 
 #if CONFIG_WQN_WIFI_STA_ENABLE
+constexpr EventBits_t kWifiConnectedBit = BIT0;
+
 bool g_initialized = false;
 bool g_reconnect_pending = false;
 bool g_wifi_connected = false;
+EventGroupHandle_t g_wifi_event_group = nullptr;
 
 void WifiReconnectTask(void*)
 {
@@ -65,6 +69,9 @@ void WifiEventHandler(void*, esp_event_base_t event_base, int32_t event_id, void
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         const auto* event = static_cast<wifi_event_sta_disconnected_t*>(event_data);
         g_wifi_connected = false;
+        if (g_wifi_event_group != nullptr) {
+            xEventGroupClearBits(g_wifi_event_group, kWifiConnectedBit);
+        }
         ESP_LOGW(kTag, "WiFi disconnected: reason=%d", event ? event->reason : -1);
         QueueReconnect();
         return;
@@ -84,6 +91,9 @@ void WifiEventHandler(void*, esp_event_base_t event_base, int32_t event_id, void
             IP2STR(&event->ip_info.netmask),
             IP2STR(&event->ip_info.gw));
         g_wifi_connected = true;
+        if (g_wifi_event_group != nullptr) {
+            xEventGroupSetBits(g_wifi_event_group, kWifiConnectedBit);
+        }
     }
 }
 
@@ -117,6 +127,11 @@ esp_err_t StartWifiStationIfEnabled()
         return ESP_OK;
     }
 
+    g_wifi_event_group = xEventGroupCreate();
+    if (g_wifi_event_group == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
+
     ESP_RETURN_ON_ERROR(esp_netif_init(), kTag, "init esp-netif");
     esp_err_t event_loop_result = esp_event_loop_create_default();
     if (event_loop_result != ESP_OK && event_loop_result != ESP_ERR_INVALID_STATE) {
@@ -138,7 +153,8 @@ esp_err_t StartWifiStationIfEnabled()
         reinterpret_cast<char*>(wifi_config.sta.password),
         CONFIG_WQN_WIFI_PASSWORD,
         sizeof(wifi_config.sta.password) - 1);
-    wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+    wifi_config.sta.threshold.authmode =
+        std::strlen(CONFIG_WQN_WIFI_PASSWORD) == 0 ? WIFI_AUTH_OPEN : WIFI_AUTH_WPA2_PSK;
     wifi_config.sta.sae_pwe_h2e = WPA3_SAE_PWE_BOTH;
 
     ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_STA, &wifi_config), kTag, "set WiFi STA config");
@@ -150,6 +166,21 @@ esp_err_t StartWifiStationIfEnabled()
 #else
     ESP_LOGI(kTag, "WiFi station disabled by CONFIG_WQN_WIFI_STA_ENABLE");
     return ESP_OK;
+#endif
+}
+
+esp_err_t WaitForWifiStationConnected(TickType_t timeout)
+{
+#if CONFIG_WQN_WIFI_STA_ENABLE
+    if (g_wifi_event_group == nullptr) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    const EventBits_t bits = xEventGroupWaitBits(g_wifi_event_group, kWifiConnectedBit, pdFALSE, pdFALSE, timeout);
+    return (bits & kWifiConnectedBit) ? ESP_OK : ESP_ERR_TIMEOUT;
+#else
+    (void)timeout;
+    return ESP_ERR_INVALID_STATE;
 #endif
 }
 
