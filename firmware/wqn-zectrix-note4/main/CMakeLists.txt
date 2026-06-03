@@ -1,12 +1,23 @@
 idf_component_register(
     SRCS
         "main.cpp"
+        "ai_session.cpp"
+        "audio_capture.cpp"
+        "audio_selftest.cpp"
         "board_zectrix_note4.cpp"
+        "button_input.cpp"
         "contract_fixtures.cpp"
+        "device_ui.cpp"
         "diagnostics.cpp"
+        "epd_display.cpp"
+        "fonts/SourceHanSansSC_Regular_slim.c"
+        "power_manager.cpp"
         "storage.cpp"
         "text_render.cpp"
+        "time_app.cpp"
+        "ui_model.cpp"
         "wifi_manager.cpp"
+        "word_app.cpp"
         "wqn_api.cpp"
     INCLUDE_DIRS "."
     REQUIRES
@@ -15,6 +26,7 @@ idf_component_register(
         esp_system
         esp_timer
         app_update
+        esp_adc
         esp_http_client
         esp-tls
         esp_event

@@ -3,6 +3,7 @@
 #include "driver/gpio.h"
 #include "esp_check.h"
 #include "esp_log.h"
+#include "power_manager.h"
 
 namespace {
 
@@ -58,6 +59,8 @@ namespace wqn {
 
 esp_err_t InitZectrixNote4SafePins()
 {
+    wqn::ReleaseDeepSleepHolds();
+
     const uint64_t disabled_power_outputs =
         (1ULL << kEpdPower) |
         (1ULL << kAudioPower) |

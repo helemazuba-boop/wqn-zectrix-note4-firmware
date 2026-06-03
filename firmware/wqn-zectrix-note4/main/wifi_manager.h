@@ -7,5 +7,6 @@ namespace wqn {
 
 esp_err_t StartWifiStationIfEnabled();
 esp_err_t WaitForWifiStationConnected(TickType_t timeout);
+bool IsWifiStationConnected();
 
 }  // namespace wqn

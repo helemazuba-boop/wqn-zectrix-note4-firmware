@@ -1,111 +1,163 @@
 # WQN ZecTrix Note4 Firmware
 
-This is the headless ESP-IDF firmware skeleton for the WQN ZecTrix Note4
-companion device. The default build is offline: it initializes safe board pins,
-prints diagnostics over Serial, parses local API fixtures, and does not start
-WiFi or call any WQN network endpoint.
+中文说明见 [README.zh-CN.md](README.zh-CN.md).
 
-## Current Scope
+This directory contains the ESP-IDF firmware for the WQN ZecTrix Note4
+companion device, an ESP32-S3 e-paper study terminal built around the
+`zectrix-s3-epaper-4.2` board profile.
 
-- ESP-IDF project targeting `esp32s3`.
-- 16 MB Flash layout aligned with the official ZecTrix baseline.
-- Safe GPIO initialization for `zectrix-s3-epaper-4.2`: GPIO17 VBAT hold is on,
-  while EPD, audio, amp, and NFC power stay off.
-- Boot diagnostics: firmware version, board id, target, ESP-IDF version, chip
-  features, Flash size, PSRAM initialized/size, WiFi MAC, and reset reason.
-- Optional WiFi station flow behind `CONFIG_WQN_WIFI_STA_ENABLE`, including open
-  networks with an empty password.
-- Minimal WQN pairing and sync path behind WiFi enablement, with local token
-  storage, masked token logs, pending review upload retry, due problem sync,
-  local problem cache, and optional `/problem-index` refresh when the cloud
-  endpoint is available.
-- No AP provisioning, WQN web UI calls outside the ESP32 API, review input UI,
-  asset downloads, or display UI yet.
+The firmware connects the physical device to the WQN cloud service while
+keeping provider secrets and user data off the microcontroller. The device
+handles local input, e-paper rendering, audio capture, lightweight caching, and
+calls only the WQN ESP32 API. Cloud-only responsibilities such as ASR providers,
+LLM providers, Supabase access, notebook permissions, and AI tool execution stay
+on the server.
 
-The official firmware remains in OTA slot 0 during test flashes. Use the
-confirmed backup/restore path before writing any experimental firmware to the
-device.
+## Hardware Target
+
+- MCU: ESP32-S3.
+- Flash layout: 16 MiB, aligned with the ZecTrix Note4 baseline partitioning.
+- Display: 400 x 300 e-paper panel using the Note4 controller command set.
+- Input: physical buttons for page navigation, selection, timer control, and AI
+  push-to-talk.
+- Audio: ES8311/I2S microphone path for recording; provider processing is done
+  by the WQN server.
+- Power domains: explicit GPIO control for board hold, e-paper rail, audio
+  power, amplifier, NFC, and low-power idle behavior.
+
+## Firmware Roles
+
+- Board bring-up and diagnostics: safe GPIO initialization, chip/flash/PSRAM
+  diagnostics, reset reason, WiFi MAC, battery diagnostics, and serial logs.
+- WQN cloud connection: optional WiFi station mode, pairing token storage,
+  masked token logging, due problem sync, problem index refresh, review upload
+  retry, Todo sync, and AI request upload.
+- E-paper UI: local device pages for home/time, countdown, pomodoro, cached
+  problems, Todo, word/notebook-facing study flows, and AI conversation status.
+- E-paper refresh control: full refresh and local partial-window refresh support
+  with cooldown and idle power-off controls.
+- AI audio path: long-press confirm to record, release to upload 16 kHz mono PCM
+  to the WQN server, then display transcript, reply text, and action summaries.
+- Local storage: NVS-backed pairing token and small device-side caches used for
+  offline display and retry behavior.
+
+## Security Boundary
+
+The firmware must not contain Supabase service keys, DashScope keys, model
+provider keys, notebook access rules, or AI function-call execution logic. It
+authenticates to the WQN server with the device pairing token and treats HTTP
+`401` as the only condition that clears the local token. Other server/provider
+errors are displayed to the user without destroying pairing state.
+
+Local `sdkconfig` may contain WiFi credentials for development and is ignored by
+git. Do not commit copied firmware images, WiFi credentials, access tokens,
+audio captures, or user data.
 
 ## Build
 
-Activate ESP-IDF first, then run:
+Use ESP-IDF 5.5.x for this project. On this Windows workstation the known ESP-IDF
+root is:
+
+```txt
+D:\Program\Espressif\frameworks\esp-idf-v5.5.4
+```
+
+From a PowerShell or Command Prompt with ESP-IDF loaded:
 
 ```powershell
 cd D:\projects\wqn-zectrix-note4-firmware\firmware\wqn-zectrix-note4
-idf.py --no-ccache -B build-user-s3 set-target esp32s3
-idf.py --no-ccache -B build-user-s3 build
+idf.py --no-ccache -B build-ai-local-s3 set-target esp32s3
+idf.py --no-ccache -B build-ai-local-s3 build
 ```
 
-The Codex sandbox has a separate Windows user and can fail ESP-IDF toolchain
-discovery. The verified local command path is:
+If the shell has not loaded ESP-IDF yet, use:
 
 ```cmd
 set IDF_TOOLS_PATH=D:\Program\Espressif
 set IDF_PATH=D:\Program\Espressif\frameworks\esp-idf-v5.5.4
 call D:\Program\Espressif\idf_cmd_init.bat
-idf.py --no-ccache -B build-user-s3 build
+idf.py --no-ccache -B build-ai-local-s3 build
 ```
 
-The default WQN ESP32 API base is `https://wqn.helema.cn/api/esp32`.
-Development builds may override it:
-
-```powershell
-idf.py -DWQN_API_BASE=https://your-host.example.com/api/esp32 build
-```
-
-## Optional WiFi Station
-
-WiFi is disabled by default. To test station mode after the board/recovery
-checks are complete:
-
-```powershell
-idf.py -B build-user-s3 menuconfig
-```
-
-Enable:
+The default WQN ESP32 API base is:
 
 ```txt
-WQN firmware -> Enable WQN WiFi station
-WQN firmware -> WQN WiFi SSID
-WQN firmware -> WQN WiFi password
+https://wqn.helema.cn/api/esp32
 ```
 
-The credentials are stored in local `sdkconfig`, which is ignored by git. Leave
-the password empty for open public WiFi. When enabled, the firmware starts STA
-mode, logs connect/disconnect events, prints IP/netmask/gateway after DHCP
-succeeds, retries after disconnects, then runs the WQN pairing and due problem
-sync flow. If a token is already stored, pairing is skipped; pending review
-results are uploaded first, then due problem details are merged into the local
-NVS cache. If the cloud exposes `/problem-index`, the firmware also refreshes
-the first page of the all-problem index.
+Development builds can override it:
 
-## Recovery Gate
+```powershell
+idf.py -B build-ai-local-s3 -DWQN_API_BASE=https://your-host.example.com/api/esp32 build
+```
 
-Reference material:
+## Main Configuration Switches
+
+Configure features through `idf.py menuconfig` under `WQN firmware`:
+
+- `CONFIG_WQN_WIFI_STA_ENABLE`: enables WiFi station mode and WQN API calls.
+- `CONFIG_WQN_WIFI_SSID` / `CONFIG_WQN_WIFI_PASSWORD`: local development WiFi
+  credentials stored in ignored `sdkconfig`.
+- `CONFIG_WQN_EPD_UI_ENABLE`: enables the e-paper UI and button-driven device
+  application.
+- `CONFIG_WQN_EPD_LOCAL_PARTIAL_ENABLE`: enables the Note4 local partial-window
+  refresh path.
+- `CONFIG_WQN_EPD_IDLE_POWER_OFF_MS`: powers off the e-paper rail after UI idle
+  time to save battery.
+- `CONFIG_WQN_DEEP_SLEEP_ENABLE`: optional experimental deep sleep path.
+- `CONFIG_WQN_AI_ENABLE`: enables AI firmware modules; provider secrets still
+  stay server-side.
+- `CONFIG_WQN_AUDIO_SELFTEST_ENABLE`: captures and logs audio statistics at boot
+  without uploading audio.
+
+## Local Flashing
+
+The local flashing helper builds and flashes the development device:
+
+```cmd
+firmware\wqn-zectrix-note4\tools\portable-flasher\build-flash-local.bat COM7
+```
+
+Defaults:
+
+- Build directory: `build-ai-local-s3`
+- Port: `COM7`
+- Baud: `921600`
+
+`COM5` is treated as the official-firmware checkpoint and the helper refuses to
+flash it. Use `COM7` for development unless the target device assignment has
+explicitly changed.
+
+## Recovery Reference
+
+Keep the verified official backup image outside this repository:
 
 ```txt
-D:\projects\ESP32DOC\zectrix
-D:\projects\ESP32DOC\zectrix\main\boards\zectrix-s3-epaper-4.2
 D:\projects\ESP32DOC\zectrix_note4_backup.bin
 ```
 
 Known backup facts:
 
-- Path: `D:\projects\ESP32DOC\zectrix_note4_backup.bin`
-- Expected size: `16777216` bytes / 16 MiB
-- SHA256: `C965245CE42F90938A28588D88A0DBFF9D03E2AD76C31B27DE65B03875FD1F02`
+- Expected size: `16777216` bytes / 16 MiB.
+- SHA256: `C965245CE42F90938A28588D88A0DBFF9D03E2AD76C31B27DE65B03875FD1F02`.
 
-`CMOS5` and the physical backup path have been confirmed on the actual device.
-Keep the verified 16 MiB backup image outside this repository. Suggested command
-templates:
+Command templates:
 
 ```powershell
-# Read current full flash backup from the device.
+# Read a full flash backup from a device.
 python -m esptool --chip esp32s3 -p COMx -b 460800 read_flash 0x0 0x1000000 current_device_backup.bin
 
 # Restore the preserved official backup.
 python -m esptool --chip esp32s3 -p COMx -b 460800 write_flash --flash_mode dio --flash_size 16MB --flash_freq 80m 0x0 D:\projects\ESP32DOC\zectrix_note4_backup.bin
 ```
 
-Keep the official backup untouched and do not commit copied firmware images,
-WiFi credentials, tokens, or user data.
+## Development Notes
+
+- Keep firmware-side changes focused on device behavior, transport contracts,
+  power control, local rendering, and local caches.
+- Keep cloud-side logic in the WQN web service: ASR, model selection, notebook
+  permissions, Todo tools, Supabase access, and AI function calls.
+- Prefer fresh build directories for major feature lines (`build-ai-local-s3`,
+  `build-user-s3`, or another explicit name) to avoid stale configuration.
+- Serial logs and reverse-engineering extraction artifacts are local diagnostics
+  and are ignored by git.

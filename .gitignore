@@ -1,10 +1,28 @@
 # ESP-IDF build outputs
 firmware/wqn-zectrix-note4/build/
 firmware/wqn-zectrix-note4/build-*/
+firmware/wqn-zectrix-note4/dist/
+firmware/wqn-zectrix-note4/tools/portable-flasher/.cache/
+firmware/wqn-zectrix-note4/tools/portable-flasher/.pyinstaller/
 firmware/wqn-zectrix-note4/sdkconfig
 firmware/wqn-zectrix-note4/sdkconfig.old
 firmware/wqn-zectrix-note4/managed_components/
 firmware/wqn-zectrix-note4/%SystemDrive%/
+
+# Local logs and diagnostics
+*.log
+*.err
+*.trace
+*.tmp
+
+# Local cache files
+.cache/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local reverse-engineering extraction artifacts
+analysis/
 
 # Local project notes and handoff docs
 docs/

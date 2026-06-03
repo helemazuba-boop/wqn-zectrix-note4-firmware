@@ -6,11 +6,14 @@
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_netif.h"
+#include "esp_netif_sntp.h"
 #include "esp_wifi.h"
 #include "freertos/event_groups.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "lwip/ip4_addr.h"
+
+#include <ctime>
 
 namespace {
 
@@ -23,7 +26,34 @@ constexpr EventBits_t kWifiConnectedBit = BIT0;
 bool g_initialized = false;
 bool g_reconnect_pending = false;
 bool g_wifi_connected = false;
+bool g_sntp_started = false;
 EventGroupHandle_t g_wifi_event_group = nullptr;
+
+const char* DisconnectReasonName(uint8_t reason)
+{
+    switch (reason) {
+        case WIFI_REASON_AUTH_EXPIRE:
+            return "AUTH_EXPIRE";
+        case WIFI_REASON_AUTH_FAIL:
+            return "AUTH_FAIL";
+        case WIFI_REASON_BEACON_TIMEOUT:
+            return "BEACON_TIMEOUT";
+        case WIFI_REASON_NO_AP_FOUND:
+            return "NO_AP_FOUND";
+        case WIFI_REASON_CONNECTION_FAIL:
+            return "CONNECTION_FAIL";
+        case WIFI_REASON_HANDSHAKE_TIMEOUT:
+            return "HANDSHAKE_TIMEOUT";
+        case WIFI_REASON_NO_AP_FOUND_W_COMPATIBLE_SECURITY:
+            return "NO_AP_FOUND_COMPATIBLE_SECURITY";
+        case WIFI_REASON_NO_AP_FOUND_IN_AUTHMODE_THRESHOLD:
+            return "NO_AP_FOUND_AUTHMODE_THRESHOLD";
+        case WIFI_REASON_NO_AP_FOUND_IN_RSSI_THRESHOLD:
+            return "NO_AP_FOUND_RSSI_THRESHOLD";
+        default:
+            return "OTHER";
+    }
+}
 
 void WifiReconnectTask(void*)
 {
@@ -58,6 +88,37 @@ void QueueReconnect()
     }
 }
 
+void TimeSyncCallback(struct timeval*)
+{
+    std::time_t now = 0;
+    std::time(&now);
+    char buffer[32] = {};
+    std::tm time_info = {};
+    localtime_r(&now, &time_info);
+    std::strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", &time_info);
+    ESP_LOGI(kTag, "SNTP time synced: %s", buffer);
+}
+
+void StartSntpOnce()
+{
+    if (g_sntp_started) {
+        return;
+    }
+
+    setenv("TZ", "CST-8", 1);
+    tzset();
+
+    esp_sntp_config_t config = ESP_NETIF_SNTP_DEFAULT_CONFIG("ntp.aliyun.com");
+    config.sync_cb = TimeSyncCallback;
+    const esp_err_t result = esp_netif_sntp_init(&config);
+    if (result == ESP_OK || result == ESP_ERR_INVALID_STATE) {
+        g_sntp_started = true;
+        ESP_LOGI(kTag, "SNTP started");
+    } else {
+        ESP_LOGW(kTag, "SNTP start failed: %s", esp_err_to_name(result));
+    }
+}
+
 void WifiEventHandler(void*, esp_event_base_t event_base, int32_t event_id, void* event_data)
 {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
@@ -72,7 +133,12 @@ void WifiEventHandler(void*, esp_event_base_t event_base, int32_t event_id, void
         if (g_wifi_event_group != nullptr) {
             xEventGroupClearBits(g_wifi_event_group, kWifiConnectedBit);
         }
-        ESP_LOGW(kTag, "WiFi disconnected: reason=%d", event ? event->reason : -1);
+        ESP_LOGW(
+            kTag,
+            "WiFi disconnected: reason=%d (%s) rssi=%d",
+            event ? event->reason : -1,
+            event ? DisconnectReasonName(event->reason) : "NO_EVENT",
+            event ? event->rssi : 0);
         QueueReconnect();
         return;
     }
@@ -94,6 +160,7 @@ void WifiEventHandler(void*, esp_event_base_t event_base, int32_t event_id, void
         if (g_wifi_event_group != nullptr) {
             xEventGroupSetBits(g_wifi_event_group, kWifiConnectedBit);
         }
+        StartSntpOnce();
     }
 }
 
@@ -181,6 +248,15 @@ esp_err_t WaitForWifiStationConnected(TickType_t timeout)
 #else
     (void)timeout;
     return ESP_ERR_INVALID_STATE;
+#endif
+}
+
+bool IsWifiStationConnected()
+{
+#if CONFIG_WQN_WIFI_STA_ENABLE
+    return g_wifi_connected;
+#else
+    return false;
 #endif
 }
 

@@ -1,5 +1,6 @@
 #include "wqn_api.h"
 
+#include <algorithm>
 #include <array>
 #include <cctype>
 #include <cstdio>
@@ -17,6 +18,7 @@
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_netif_sntp.h"
+#include "esp_task_wdt.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "storage.h"
@@ -30,7 +32,7 @@ constexpr int kHttpTimeoutMs = 10000;
 constexpr TickType_t kWifiConnectTimeout = pdMS_TO_TICKS(30000);
 constexpr TickType_t kSntpSyncTimeout = pdMS_TO_TICKS(15000);
 constexpr TickType_t kPollDelay = pdMS_TO_TICKS(2000);
-constexpr int kPollAttempts = 150;
+constexpr int kPollAttempts = 60;
 constexpr size_t kProblemPreviewChars = 240;
 constexpr std::time_t kMinReasonableUnixTime = 1704067200;  // 2024-01-01 UTC
 
@@ -45,6 +47,20 @@ public:
 private:
     cJSON* root_ = nullptr;
 };
+
+void FeedTaskWatchdogIfSubscribed()
+{
+    if (esp_task_wdt_status(nullptr) == ESP_OK) {
+        ESP_ERROR_CHECK_WITHOUT_ABORT(esp_task_wdt_reset());
+    }
+}
+
+void DelayAndFeedWatchdog(TickType_t delay)
+{
+    FeedTaskWatchdogIfSubscribed();
+    vTaskDelay(delay);
+    FeedTaskWatchdogIfSubscribed();
+}
 
 std::string BuildMacAddress()
 {
@@ -126,7 +142,9 @@ esp_err_t EnsureClockSyncedForHttps()
         return result;
     }
 
+    FeedTaskWatchdogIfSubscribed();
     result = esp_netif_sntp_sync_wait(kSntpSyncTimeout);
+    FeedTaskWatchdogIfSubscribed();
     if (result != ESP_OK) {
         return result;
     }
@@ -140,8 +158,11 @@ esp_err_t EnsureClockSyncedForHttps()
 esp_err_t WaitForNetworkReadyForHttps()
 {
     ESP_LOGI(kTag, "waiting for WiFi before WQN API request");
+    FeedTaskWatchdogIfSubscribed();
     ESP_RETURN_ON_ERROR(wqn::WaitForWifiStationConnected(kWifiConnectTimeout), kTag, "wait for WiFi");
+    FeedTaskWatchdogIfSubscribed();
     ESP_RETURN_ON_ERROR(EnsureClockSyncedForHttps(), kTag, "sync clock for HTTPS");
+    FeedTaskWatchdogIfSubscribed();
     return ESP_OK;
 }
 
@@ -189,12 +210,14 @@ esp_err_t HttpRequest(
     }
 
     result = esp_http_client_open(client, is_post ? post_body.size() : 0);
+    FeedTaskWatchdogIfSubscribed();
     if (result != ESP_OK) {
         esp_http_client_cleanup(client);
         return result;
     }
     if (is_post) {
         const int written = esp_http_client_write(client, post_body.c_str(), post_body.size());
+        FeedTaskWatchdogIfSubscribed();
         if (written < 0 || static_cast<size_t>(written) != post_body.size()) {
             esp_http_client_close(client);
             esp_http_client_cleanup(client);
@@ -226,6 +249,113 @@ esp_err_t HttpRequest(
     return result;
 }
 
+esp_err_t HttpBinaryPost(
+    const std::string& url,
+    const std::string& bearer_token,
+    const uint8_t* request_body,
+    size_t request_body_size,
+    int duration_ms,
+    const std::string& conversation_id,
+    int* status_code,
+    std::string* response_body)
+{
+    if (status_code == nullptr || response_body == nullptr || (request_body == nullptr && request_body_size > 0)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    response_body->clear();
+    esp_http_client_config_t config = {};
+    config.url = url.c_str();
+    config.method = HTTP_METHOD_POST;
+    config.timeout_ms = 30000;
+    config.crt_bundle_attach = esp_crt_bundle_attach;
+    config.buffer_size = 2048;
+    config.buffer_size_tx = 2048;
+
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (client == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    esp_err_t result = esp_http_client_set_header(client, "Accept", "application/json");
+    if (result == ESP_OK) {
+        const std::string auth = "Bearer " + bearer_token;
+        result = esp_http_client_set_header(client, "Authorization", auth.c_str());
+    }
+    if (result == ESP_OK) {
+        result = esp_http_client_set_header(client, "Content-Type", "application/octet-stream");
+    }
+    if (result == ESP_OK) {
+        result = esp_http_client_set_header(client, "X-WQN-Audio-Sample-Rate", "16000");
+    }
+    if (result == ESP_OK) {
+        result = esp_http_client_set_header(client, "X-WQN-Audio-Sample-Format", "s16le");
+    }
+    if (result == ESP_OK) {
+        result = esp_http_client_set_header(client, "X-WQN-Audio-Channels", "1");
+    }
+    char duration_header[16] = {};
+    std::snprintf(duration_header, sizeof(duration_header), "%d", duration_ms);
+    if (result == ESP_OK) {
+        result = esp_http_client_set_header(client, "X-WQN-Audio-Duration-Ms", duration_header);
+    }
+    if (result == ESP_OK && !conversation_id.empty()) {
+        result = esp_http_client_set_header(client, "X-WQN-Conversation-Id", conversation_id.c_str());
+    }
+    if (result != ESP_OK) {
+        esp_http_client_cleanup(client);
+        return result;
+    }
+
+    result = esp_http_client_open(client, request_body_size);
+    FeedTaskWatchdogIfSubscribed();
+    if (result != ESP_OK) {
+        esp_http_client_cleanup(client);
+        return result;
+    }
+
+    size_t written_total = 0;
+    while (written_total < request_body_size) {
+        const size_t remaining = request_body_size - written_total;
+        const int written = esp_http_client_write(
+            client,
+            reinterpret_cast<const char*>(request_body + written_total),
+            remaining > 2048 ? 2048 : remaining);
+        if (written <= 0) {
+            esp_http_client_close(client);
+            esp_http_client_cleanup(client);
+            return ESP_FAIL;
+        }
+        written_total += static_cast<size_t>(written);
+        FeedTaskWatchdogIfSubscribed();
+    }
+
+    const int content_length = esp_http_client_fetch_headers(client);
+    FeedTaskWatchdogIfSubscribed();
+    *status_code = esp_http_client_get_status_code(client);
+    if (content_length < 0) {
+        ESP_LOGW(kTag, "AI HTTP response has unknown content length");
+    }
+
+    std::array<char, 512> buffer = {};
+    while (true) {
+        const int read = esp_http_client_read(client, buffer.data(), buffer.size() - 1);
+        if (read < 0) {
+            result = ESP_FAIL;
+            break;
+        }
+        if (read == 0) {
+            break;
+        }
+        response_body->append(buffer.data(), read);
+        FeedTaskWatchdogIfSubscribed();
+    }
+
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+    return result;
+}
+
 bool GetSuccess(cJSON* root)
 {
     cJSON* success = cJSON_GetObjectItemCaseSensitive(root, "success");
@@ -250,6 +380,32 @@ int GetOptionalInt(cJSON* object, const char* key)
 {
     cJSON* item = cJSON_GetObjectItemCaseSensitive(object, key);
     return cJSON_IsNumber(item) ? item->valueint : 0;
+}
+
+std::string BuildApiErrorMessage(cJSON* root, int status_code)
+{
+    std::string code;
+    std::string message;
+    cJSON* error = cJSON_GetObjectItemCaseSensitive(root, "error");
+    if (cJSON_IsObject(error)) {
+        code = GetOptionalString(error, "code");
+        message = GetOptionalString(error, "message");
+    }
+    if (message.empty()) {
+        message = GetOptionalString(root, "message");
+    }
+    if (message.empty() && !code.empty()) {
+        message = code;
+    }
+    if (message.empty()) {
+        char fallback[48] = {};
+        std::snprintf(fallback, sizeof(fallback), "HTTP %d", status_code);
+        message = fallback;
+    }
+    if (!code.empty()) {
+        return code + ": " + message;
+    }
+    return message;
 }
 
 bool GetOptionalBool(cJSON* object, const char* key)
@@ -311,6 +467,150 @@ void ParseAssetManifest(cJSON* array, std::vector<wqn::WqnAssetManifestItem>* ma
     }
 }
 
+void ParseAiActions(cJSON* array, std::vector<wqn::WqnAiAction>* actions)
+{
+    if (actions == nullptr) {
+        return;
+    }
+    actions->clear();
+    if (!cJSON_IsArray(array)) {
+        return;
+    }
+
+    const int count = cJSON_GetArraySize(array);
+    actions->reserve(count);
+    for (int i = 0; i < count; ++i) {
+        cJSON* item = cJSON_GetArrayItem(array, i);
+        if (!cJSON_IsObject(item)) {
+            continue;
+        }
+
+        wqn::WqnAiAction action;
+        action.type = GetOptionalString(item, "type");
+        action.notebook_id = GetOptionalString(item, "notebook_id");
+        action.note_id = GetOptionalString(item, "note_id");
+        action.todo_id = GetOptionalString(item, "todo_id");
+        action.title = GetOptionalString(item, "title");
+        action.status = GetOptionalString(item, "status");
+        action.due_at = GetOptionalString(item, "due_at");
+        action.reminder_at = GetOptionalString(item, "reminder_at");
+        if (!action.type.empty()) {
+            actions->push_back(std::move(action));
+        }
+    }
+}
+
+void ParseAiStatusTrace(cJSON* array, std::vector<wqn::WqnAiStatusTraceItem>* trace)
+{
+    if (trace == nullptr) {
+        return;
+    }
+    trace->clear();
+    if (!cJSON_IsArray(array)) {
+        return;
+    }
+
+    const int count = cJSON_GetArraySize(array);
+    trace->reserve(count);
+    for (int i = 0; i < count; ++i) {
+        cJSON* item = cJSON_GetArrayItem(array, i);
+        if (!cJSON_IsObject(item)) {
+            continue;
+        }
+
+        wqn::WqnAiStatusTraceItem parsed;
+        parsed.stage = GetOptionalString(item, "stage");
+        parsed.status = GetOptionalString(item, "status");
+        parsed.detail = GetOptionalString(item, "detail");
+        parsed.elapsed_ms = GetOptionalInt(item, "elapsed_ms");
+        if (!parsed.stage.empty()) {
+            trace->push_back(std::move(parsed));
+        }
+    }
+}
+
+void ParseAiAsrSummary(cJSON* object, wqn::WqnAiAsrSummary* asr)
+{
+    if (asr == nullptr) {
+        return;
+    }
+    *asr = wqn::WqnAiAsrSummary{};
+    if (!cJSON_IsObject(object)) {
+        return;
+    }
+
+    asr->provider = GetOptionalString(object, "provider");
+    asr->model = GetOptionalString(object, "model");
+    asr->status = GetOptionalString(object, "status");
+    asr->text = GetOptionalString(object, "text");
+    asr->request_id = GetOptionalString(object, "request_id");
+    asr->elapsed_ms = GetOptionalInt(object, "elapsed_ms");
+}
+
+void ParseAiFunctionCalls(cJSON* array, std::vector<wqn::WqnAiFunctionCallSummary>* calls)
+{
+    if (calls == nullptr) {
+        return;
+    }
+    calls->clear();
+    if (!cJSON_IsArray(array)) {
+        return;
+    }
+
+    const int count = cJSON_GetArraySize(array);
+    calls->reserve(count);
+    for (int i = 0; i < count; ++i) {
+        cJSON* item = cJSON_GetArrayItem(array, i);
+        if (!cJSON_IsObject(item)) {
+            continue;
+        }
+
+        wqn::WqnAiFunctionCallSummary call;
+        call.name = GetOptionalString(item, "name");
+        call.status = GetOptionalString(item, "status");
+        call.display = GetOptionalString(item, "display");
+        call.action_type = GetOptionalString(item, "action_type");
+        call.title = GetOptionalString(item, "title");
+        if (!call.name.empty() || !call.display.empty()) {
+            calls->push_back(std::move(call));
+        }
+    }
+}
+
+esp_err_t ParseTodoObject(cJSON* item, int index, wqn::WqnTodoItem* todo)
+{
+    if (!cJSON_IsObject(item) || todo == nullptr) {
+        ESP_LOGW(kTag, "todo response contains non-object at index=%d", index);
+        return ESP_FAIL;
+    }
+
+    wqn::WqnTodoItem parsed;
+    parsed.id = GetOptionalString(item, "id");
+    parsed.title = GetOptionalString(item, "title");
+    parsed.status = GetOptionalString(item, "status");
+    parsed.priority = GetOptionalString(item, "priority");
+    parsed.due_at = GetOptionalString(item, "due_at");
+    parsed.reminder_at = GetOptionalString(item, "reminder_at");
+    parsed.subject_name = GetOptionalString(item, "subject_name");
+    parsed.updated_at = GetOptionalString(item, "updated_at");
+    parsed.completed_at = GetOptionalString(item, "completed_at");
+
+    if (parsed.id.empty() || parsed.title.empty()) {
+        ESP_LOGW(kTag, "todo item missing id/title at index=%d", index);
+        return ESP_FAIL;
+    }
+    if (parsed.status.empty()) {
+        parsed.status = "pending";
+    }
+    if (parsed.status != "pending" && parsed.status != "completed" && parsed.status != "cancelled") {
+        ESP_LOGW(kTag, "todo item has unsupported status=%s at index=%d", parsed.status.c_str(), index);
+        return ESP_FAIL;
+    }
+
+    *todo = std::move(parsed);
+    return ESP_OK;
+}
+
 esp_err_t ParseProblemObject(cJSON* item, int index, wqn::WqnProblem* problem)
 {
     if (!cJSON_IsObject(item) || problem == nullptr) {
@@ -334,12 +634,17 @@ esp_err_t ParseProblemObject(cJSON* item, int index, wqn::WqnProblem* problem)
     if (parsed.content_text.empty()) {
         parsed.content_text = wqn::HtmlToPlainText(GetOptionalString(item, "content"));
     }
-    parsed.solution_text = wqn::HtmlToPlainText(GetOptionalString(item, "solution_text"));
+    parsed.solution_text = GetOptionalString(item, "solution_text");
+    if (parsed.solution_text.empty()) {
+        parsed.solution_text = wqn::HtmlToPlainText(GetOptionalString(item, "solution"));
+    }
     ParseAssetManifest(cJSON_GetObjectItemCaseSensitive(item, "assets"), &parsed.assets);
     if (parsed.assets.empty()) {
         ParseAssetManifest(cJSON_GetObjectItemCaseSensitive(item, "attachments"), &parsed.assets);
     }
     ParseAssetManifest(cJSON_GetObjectItemCaseSensitive(item, "solution_assets"), &parsed.solution_assets);
+    parsed.asset_count = static_cast<int>(parsed.assets.size());
+    parsed.solution_asset_count = static_cast<int>(parsed.solution_assets.size());
 
     if (parsed.id.empty()) {
         ESP_LOGW(kTag, "problem detail missing id at index=%d", index);
@@ -503,6 +808,82 @@ esp_err_t ParseProblemIndexResponse(const std::string& body, wqn::WqnProblemInde
     return ESP_OK;
 }
 
+esp_err_t ParseTodoListResponseImpl(const std::string& body, wqn::WqnTodoListPage* page)
+{
+    if (page == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    page->todos.clear();
+    page->next_cursor.clear();
+    page->has_more = false;
+    page->total = 0;
+    page->server_time.clear();
+
+    JsonDocument document(body);
+    if (!document.ok()) {
+        ESP_LOGW(kTag, "todo list response is not valid JSON");
+        return ESP_FAIL;
+    }
+
+    cJSON* data = cJSON_GetObjectItemCaseSensitive(document.root(), "data");
+    cJSON* items = cJSON_GetObjectItemCaseSensitive(data, "todos");
+    if (!GetSuccess(document.root()) || !cJSON_IsObject(data) || !cJSON_IsArray(items)) {
+        ESP_LOGW(kTag, "todo list response missing success/data/todos");
+        return ESP_FAIL;
+    }
+
+    page->next_cursor = GetOptionalString(data, "next_cursor");
+    page->has_more = GetOptionalBool(data, "has_more");
+    page->total = GetOptionalInt(data, "total");
+    page->server_time = GetOptionalString(data, "server_time");
+
+    const int count = std::min(cJSON_GetArraySize(items), 8);
+    page->todos.reserve(count);
+    for (int i = 0; i < count; ++i) {
+        wqn::WqnTodoItem todo;
+        const esp_err_t parse_result = ParseTodoObject(cJSON_GetArrayItem(items, i), i, &todo);
+        if (parse_result != ESP_OK) {
+            ESP_LOGW(kTag, "skip invalid todo item at index=%d", i);
+            continue;
+        }
+        page->todos.push_back(std::move(todo));
+    }
+    if (page->total == 0) {
+        page->total = cJSON_GetArraySize(items);
+    }
+
+    return ESP_OK;
+}
+
+esp_err_t ParseTodoCompleteResponseImpl(const std::string& body, wqn::WqnTodoItem* todo)
+{
+    if (todo == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *todo = wqn::WqnTodoItem{};
+
+    JsonDocument document(body);
+    if (!document.ok()) {
+        ESP_LOGW(kTag, "todo complete response is not valid JSON");
+        return ESP_FAIL;
+    }
+
+    cJSON* data = cJSON_GetObjectItemCaseSensitive(document.root(), "data");
+    cJSON* item = cJSON_GetObjectItemCaseSensitive(data, "todo");
+    if (!GetSuccess(document.root()) || !cJSON_IsObject(data) || !cJSON_IsObject(item)) {
+        ESP_LOGW(kTag, "todo complete response missing success/data/todo");
+        return ESP_FAIL;
+    }
+
+    ESP_RETURN_ON_ERROR(ParseTodoObject(item, 0, todo), kTag, "parse completed todo");
+    if (todo->status != "completed") {
+        ESP_LOGW(kTag, "todo complete response returned status=%s", todo->status.c_str());
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
 std::string BuildProblemIndexPath(const wqn::WqnProblemIndexRequest& request)
 {
     std::string path = "/problem-index?limit=" + std::to_string(request.limit > 0 ? request.limit : 50);
@@ -516,6 +897,11 @@ std::string BuildProblemIndexPath(const wqn::WqnProblemIndexRequest& request)
         path += "&subject_id=" + UrlEncode(request.subject_id);
     }
     return path;
+}
+
+std::string BuildTodoListPath()
+{
+    return "/todos?scope=today&status=pending&limit=8";
 }
 
 void AddJsonString(cJSON* object, const char* key, const std::string& value)
@@ -562,6 +948,32 @@ esp_err_t BuildReviewCompleteBody(const std::vector<wqn::WqnReviewResult>& resul
         }
         cJSON_AddItemToArray(items, item);
     }
+
+    char* rendered = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (rendered == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
+    *body = rendered;
+    cJSON_free(rendered);
+    return ESP_OK;
+}
+
+esp_err_t BuildTodoCompleteBody(const std::string& todo_id, const std::string& completed_at, std::string* body)
+{
+    if (body == nullptr || todo_id.empty()) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    body->clear();
+
+    cJSON* root = cJSON_CreateObject();
+    if (root == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    cJSON_AddStringToObject(root, "todo_id", todo_id.c_str());
+    AddJsonString(root, "completed_at", completed_at);
+    cJSON_AddStringToObject(root, "firmware_version", WQN_FIRMWARE_VERSION);
 
     char* rendered = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
@@ -682,6 +1094,7 @@ esp_err_t RunPairingFlowIfNeeded()
 
     ESP_LOGI(kTag, "pairing poll started for mac=%s", mac_address.c_str());
     for (int attempt = 1; attempt <= kPollAttempts; ++attempt) {
+        FeedTaskWatchdogIfSubscribed();
         bool paired = false;
         const esp_err_t result = PollPairingOnce(mac_address, &paired);
         if (result == ESP_OK && paired) {
@@ -690,7 +1103,7 @@ esp_err_t RunPairingFlowIfNeeded()
         if (result != ESP_OK) {
             ESP_LOGW(kTag, "poll attempt %d failed: %s", attempt, esp_err_to_name(result));
         }
-        vTaskDelay(kPollDelay);
+        DelayAndFeedWatchdog(kPollDelay);
     }
 
     ESP_LOGW(kTag, "pairing poll timed out");
@@ -841,7 +1254,7 @@ esp_err_t FetchProblemIndex(const std::string& token, const WqnProblemIndexReque
         return ClearTokenOnUnauthorized("problem-index");
     }
     if (IsUnsupportedStatus(status_code)) {
-        ESP_LOGW(kTag, "problem-index unsupported HTTP status=%d", status_code);
+        ESP_LOGI(kTag, "problem-index unsupported HTTP status=%d", status_code);
         return ESP_ERR_NOT_SUPPORTED;
     }
     if (status_code != 200) {
@@ -886,6 +1299,141 @@ esp_err_t UploadReviewComplete(const std::string& token, const std::vector<WqnRe
     return ESP_OK;
 }
 
+esp_err_t FetchTodayPendingTodos(const std::string& token, WqnTodoListPage* page)
+{
+    if (page == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    page->todos.clear();
+    page->next_cursor.clear();
+    page->has_more = false;
+    page->total = 0;
+    page->server_time.clear();
+
+    if (token.empty()) {
+        return ESP_OK;
+    }
+    const esp_err_t token_result = ValidateTokenOrClear(token, "todo-list");
+    if (token_result != ESP_OK) {
+        return token_result;
+    }
+
+    ESP_RETURN_ON_ERROR(WaitForNetworkReadyForHttps(), kTag, "prepare network for todo-list");
+
+    const std::string url = BuildUrl(BuildTodoListPath());
+    int status_code = 0;
+    std::string body;
+    esp_err_t result = HttpRequest("GET", url, &token, nullptr, &status_code, &body);
+    if (result != ESP_OK) {
+        ESP_LOGW(kTag, "todo-list failed: %s", esp_err_to_name(result));
+        return result;
+    }
+    if (status_code == 401) {
+        return ClearTokenOnUnauthorized("todo-list");
+    }
+    if (status_code != 200) {
+        ESP_LOGW(kTag, "todo-list HTTP status=%d", status_code);
+        return ESP_FAIL;
+    }
+
+    return ParseTodoListResponse(body, page);
+}
+
+esp_err_t CompleteTodo(const std::string& token, const std::string& todo_id, const std::string& completed_at, WqnTodoItem* todo)
+{
+    if (todo_id.empty()) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (todo != nullptr) {
+        *todo = WqnTodoItem{};
+    }
+    if (token.empty()) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    const esp_err_t token_result = ValidateTokenOrClear(token, "todo-complete");
+    if (token_result != ESP_OK) {
+        return token_result;
+    }
+
+    ESP_RETURN_ON_ERROR(WaitForNetworkReadyForHttps(), kTag, "prepare network for todo-complete");
+
+    std::string request_body;
+    ESP_RETURN_ON_ERROR(BuildTodoCompleteBody(todo_id, completed_at, &request_body), kTag, "build todo-complete request");
+
+    const std::string url = BuildUrl("/todos/complete");
+    int status_code = 0;
+    std::string body;
+    esp_err_t result = HttpRequest("POST", url, &token, &request_body, &status_code, &body);
+    if (result != ESP_OK) {
+        ESP_LOGW(kTag, "todo-complete failed: %s", esp_err_to_name(result));
+        return result;
+    }
+    if (status_code == 401) {
+        return ClearTokenOnUnauthorized("todo-complete");
+    }
+    if (status_code < 200 || status_code >= 300) {
+        ESP_LOGW(kTag, "todo-complete HTTP status=%d", status_code);
+        return ESP_FAIL;
+    }
+
+    WqnTodoItem parsed;
+    result = ParseTodoCompleteResponse(body, &parsed);
+    if (result != ESP_OK) {
+        return result;
+    }
+    if (todo != nullptr) {
+        *todo = std::move(parsed);
+    }
+    return ESP_OK;
+}
+
+esp_err_t ParseTodoListResponse(const std::string& body, WqnTodoListPage* page)
+{
+    return ParseTodoListResponseImpl(body, page);
+}
+
+esp_err_t ParseTodoCompleteResponse(const std::string& body, WqnTodoItem* todo)
+{
+    return ParseTodoCompleteResponseImpl(body, todo);
+}
+
+esp_err_t ParseAiChatResponseBody(const std::string& body, WqnAiChatResponse* response)
+{
+    if (response == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *response = WqnAiChatResponse{};
+
+    JsonDocument document(body);
+    if (!document.ok()) {
+        ESP_LOGW(kTag, "AI response JSON parse failed");
+        response->error_message = "AI response JSON parse failed";
+        return ESP_FAIL;
+    }
+
+    cJSON* data = cJSON_GetObjectItemCaseSensitive(document.root(), "data");
+    if (!GetSuccess(document.root()) || !cJSON_IsObject(data)) {
+        ESP_LOGW(kTag, "AI response missing success/data");
+        response->error_message = BuildApiErrorMessage(document.root(), 200);
+        return ESP_FAIL;
+    }
+
+    response->transcript = GetOptionalString(data, "transcript");
+    response->reply_text = GetOptionalString(data, "reply_text");
+    response->conversation_id = GetOptionalString(data, "conversation_id");
+    response->latency_ms = GetOptionalInt(data, "latency_ms");
+    ParseAiActions(cJSON_GetObjectItemCaseSensitive(data, "actions"), &response->actions);
+    ParseAiStatusTrace(cJSON_GetObjectItemCaseSensitive(data, "status_trace"), &response->status_trace);
+    ParseAiAsrSummary(cJSON_GetObjectItemCaseSensitive(data, "asr"), &response->asr);
+    ParseAiFunctionCalls(cJSON_GetObjectItemCaseSensitive(data, "function_calls"), &response->function_calls);
+    if (response->transcript.empty() && response->reply_text.empty()) {
+        ESP_LOGW(kTag, "AI response missing transcript and reply_text");
+        response->error_message = "AI response missing transcript and reply_text";
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
 esp_err_t SyncDueProblemsAndLog(const std::string& token)
 {
     std::vector<std::string> due_problem_ids;
@@ -908,6 +1456,57 @@ esp_err_t SyncDueProblemsAndLog(const std::string& token)
     }
 
     return ESP_OK;
+}
+
+esp_err_t UploadAiAudioChat(
+    const std::string& token,
+    const uint8_t* pcm_data,
+    size_t pcm_size,
+    int duration_ms,
+    const std::string& conversation_id,
+    WqnAiChatResponse* response)
+{
+    if (pcm_data == nullptr || pcm_size == 0 || response == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    ESP_RETURN_ON_ERROR(ValidateTokenOrClear(token, "AI audio"), kTag, "validate AI token");
+    ESP_RETURN_ON_ERROR(WaitForNetworkReadyForHttps(), kTag, "prepare network for AI audio");
+
+    const std::string url = BuildUrl("/ai/transcribe-chat");
+    int status_code = 0;
+    std::string body;
+    const esp_err_t result =
+        HttpBinaryPost(url, token, pcm_data, pcm_size, duration_ms, conversation_id, &status_code, &body);
+    if (result != ESP_OK) {
+        ESP_LOGW(kTag, "AI audio upload failed: %s", esp_err_to_name(result));
+        return result;
+    }
+    ESP_LOGI(kTag, "AI audio response: status=%d bytes=%u", status_code, static_cast<unsigned>(body.size()));
+
+    if (status_code == 401) {
+        response->error_code = "unauthorized";
+        response->error_message = "设备授权已失效";
+        return ClearTokenOnUnauthorized("AI audio");
+    }
+    if (status_code < 200 || status_code >= 300) {
+        ESP_LOGW(kTag, "AI audio request rejected: status=%d body=%s", status_code, TruncateForLog(body, 160).c_str());
+        JsonDocument error_document(body);
+        response->error_message = error_document.ok() ? BuildApiErrorMessage(error_document.root(), status_code) : "";
+        if (error_document.ok()) {
+            cJSON* error = cJSON_GetObjectItemCaseSensitive(error_document.root(), "error");
+            if (cJSON_IsObject(error)) {
+                response->error_code = GetOptionalString(error, "code");
+            }
+        }
+        if (response->error_message.empty()) {
+            char fallback[48] = {};
+            std::snprintf(fallback, sizeof(fallback), "HTTP %d", status_code);
+            response->error_message = fallback;
+        }
+        return ESP_FAIL;
+    }
+
+    return ParseAiChatResponseBody(body, response);
 }
 
 }  // namespace wqn

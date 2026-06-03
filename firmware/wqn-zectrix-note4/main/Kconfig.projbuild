@@ -24,4 +24,84 @@ menu "WQN firmware"
             Development WiFi password. This value is stored only in local
             sdkconfig, which is ignored by git.
 
+    config WQN_EPD_UI_ENABLE
+        bool "Enable ZecTrix Note4 e-paper UI"
+        default n
+        help
+            Enable the first hardware UI path using the Note4 400x300 e-paper
+            panel and physical buttons. This powers GPIO6 for display refreshes.
+            Keep disabled for headless network-only builds.
+
+    config WQN_EPD_LOCAL_PARTIAL_ENABLE
+        bool "Enable local EPD partial-window refresh"
+        default y
+        depends on WQN_EPD_UI_ENABLE
+        help
+            Enable the Note4 controller's 0x83 local partial-window refresh
+            path. This keeps the EPD rail powered after refreshes so the panel
+            controller can preserve hot-refresh state between UI operations.
+
+    config WQN_EPD_PARTIAL_COOLDOWN_MS
+        int "EPD local partial cooldown in milliseconds"
+        default 450
+        range 0 2000
+        depends on WQN_EPD_LOCAL_PARTIAL_ENABLE
+        help
+            Minimum delay between local partial refreshes. The closed firmware
+            waits for both BUSY release and a software cooldown before sending
+            the next 0x83 window.
+
+    config WQN_EPD_IDLE_POWER_OFF_MS
+        int "Power off EPD rail after UI idle milliseconds"
+        default 15000
+        range 0 600000
+        depends on WQN_EPD_UI_ENABLE
+        help
+            Cut GPIO6 after the UI has been idle for this long. This drops the
+            hot partial-refresh state and saves power. Set 0 to keep the EPD
+            rail on as long as the firmware is running.
+
+    config WQN_DEEP_SLEEP_ENABLE
+        bool "Enable experimental deep sleep after UI idle"
+        default n
+        depends on WQN_EPD_UI_ENABLE
+        help
+            Enter ESP32-S3 deep sleep after the UI has been idle. Wake sources
+            are RTC-capable GPIO0, GPIO18, and GPIO5. GPIO39 cannot wake from
+            deep sleep on ESP32-S3. GPIO17 is held high to preserve board power.
+
+    config WQN_DEEP_SLEEP_IDLE_MS
+        int "Deep sleep idle timeout in milliseconds"
+        default 300000
+        range 10000 86400000
+        depends on WQN_DEEP_SLEEP_ENABLE
+        help
+            Idle time before entering deep sleep. Keep large while validating
+            wakeup behavior on COM7.
+
+    config WQN_DEEP_SLEEP_TIMER_WAKE_SEC
+        int "Deep sleep timer wake interval in seconds"
+        default 0
+        range 0 86400
+        depends on WQN_DEEP_SLEEP_ENABLE
+        help
+            Optional RTC timer wake interval. Set 0 to wake only from GPIO0,
+            GPIO18, or GPIO5.
+
+    config WQN_AI_ENABLE
+        bool "Enable WQN AI firmware modules"
+        default n
+        help
+            Enable experimental AI support modules. Provider secrets must stay
+            on the WQN server and must never be embedded in firmware.
+
+    config WQN_AUDIO_SELFTEST_ENABLE
+        bool "Run WQN audio capture self-test at boot"
+        default n
+        depends on WQN_AI_ENABLE
+        help
+            Initialize the ES8311/I2S microphone path, capture a short sample,
+            print channel RMS/peak statistics over serial, then power audio off.
+            This mode does not upload audio or start WiFi by itself.
+
 endmenu
