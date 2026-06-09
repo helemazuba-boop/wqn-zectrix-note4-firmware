@@ -9,11 +9,18 @@
 #include "esp_adc/adc_cali.h"
 #include "esp_adc/adc_cali_scheme.h"
 #include "esp_adc/adc_oneshot.h"
+#include "esp_flash.h"
+#include "esp_heap_caps.h"
+#include "esp_idf_version.h"
 #include "epd_display.h"
 #include "esp_check.h"
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_mac.h"
+#include "esp_psram.h"
 #include "esp_timer.h"
+#include "driver/gpio.h"
+#include "nvs.h"
 #include "online_sync.h"
 #include "power_manager.h"
 #include "freertos/FreeRTOS.h"
@@ -24,6 +31,7 @@
 #include "storage.h"
 #include "ui_model.h"
 #include "wifi_manager.h"
+#include "word_pack.h"
 #include "wqn_api.h"
 
 #include <algorithm>
@@ -48,6 +56,14 @@ constexpr int kEpdTextWidth = wqn::kEpdWidth - 12;
 constexpr int64_t kRepeatedLongPressMinDurationMs = 1150;
 constexpr size_t kWrappedBodyMaxLines = 4;
 constexpr std::time_t kMinReasonableUnixTime = 1704067200;  // 2024-01-01 UTC
+constexpr gpio_num_t kChargeDetect = GPIO_NUM_2;            // CHRG_L: low means charging.
+constexpr gpio_num_t kChargeFull = GPIO_NUM_1;              // STDBY_H: high means full.
+constexpr int kBatteryShutdownPercent = 0;
+constexpr int kBatteryShutdownMv = 3450;
+constexpr int kBatteryShutdownDebounceCount = 3;
+constexpr const char* kPmuStatusUnknown = "unknown";
+constexpr size_t kSettingsItemCount = 6;
+constexpr uint32_t kAutoSyncOptions[] = {0, 15, 30, 60, 240};
 
 #if CONFIG_WQN_EPD_UI_ENABLE
 
@@ -67,6 +83,9 @@ TaskHandle_t g_refresh_task = nullptr;
 QueueHandle_t g_todo_request_queue = nullptr;
 QueueHandle_t g_todo_result_queue = nullptr;
 TaskHandle_t g_todo_task = nullptr;
+QueueHandle_t g_word_request_queue = nullptr;
+QueueHandle_t g_word_result_queue = nullptr;
+TaskHandle_t g_word_task = nullptr;
 wqn::UiFrame g_pending_frame;
 std::string g_pending_signature;
 bool g_refresh_pending = false;
@@ -74,6 +93,7 @@ bool g_refresh_busy = false;
 TickType_t g_refresh_due_tick = 0;
 RefreshSchedule g_refresh_schedule = RefreshSchedule::kNone;
 volatile bool g_todo_cloud_busy = false;
+volatile bool g_word_cloud_busy = false;
 
 void BuildHomeSummary(wqn::UiState* state);
 
@@ -85,6 +105,7 @@ enum class TodoCloudOp {
 struct TodoCloudRequest {
     TodoCloudOp op = TodoCloudOp::kRefresh;
     char todo_id[64] = {};
+    char cursor[160] = {};
 };
 
 struct TodoCloudResult {
@@ -94,6 +115,35 @@ struct TodoCloudResult {
     char todo_id[64] = {};
     wqn::WqnTodoListPage page;
     wqn::WqnTodoItem todo;
+};
+
+enum class WordCloudOp {
+    kPackSync,
+    kSubmit,
+    kSearch,
+    kAiLookup,
+};
+
+struct WordCloudRequest {
+    WordCloudOp op = WordCloudOp::kPackSync;
+    char word_id[64] = {};
+    char outcome[16] = {};
+    char word[80] = {};
+    char query[96] = {};
+};
+
+struct WordCloudResult {
+    WordCloudOp op = WordCloudOp::kPackSync;
+    esp_err_t result = ESP_FAIL;
+    bool auth_required = false;
+    char word_id[64] = {};
+    char outcome[16] = {};
+    char word[80] = {};
+    wqn::WordPackIndex pack_index;
+    wqn::WqnWordReviewSubmitResult submit;
+    wqn::WqnWordSearchResult search;
+    wqn::WqnWordAiLookupResult lookup;
+    std::string message;
 };
 
 int RefreshRank(RefreshSchedule schedule)
@@ -202,6 +252,13 @@ struct BatteryReading {
     int adc_mv = 0;
     int battery_mv = 0;
     int percent = 0;
+    int chrg_l = 1;
+    int stdby_h = 0;
+    bool charging = false;
+    bool full = false;
+    bool power_present_or_status_known = false;
+    const char* pmu_status = kPmuStatusUnknown;
+    bool pmu_implemented = false;
 };
 
 bool ShouldLogBattery()
@@ -277,16 +334,204 @@ bool ReadBatteryStatus(BatteryReading* reading)
         (-1 * reading->battery_mv * reading->battery_mv + 9016 * reading->battery_mv - 19189000) / 10000;
     computed_percent = std::min(100, std::max(0, computed_percent));
     reading->percent = computed_percent;
+    reading->chrg_l = gpio_get_level(kChargeDetect);
+    reading->stdby_h = gpio_get_level(kChargeFull);
+    reading->charging = reading->chrg_l == 0;
+    reading->full = reading->stdby_h == 1;
+    reading->power_present_or_status_known = reading->charging || reading->full;
+    reading->pmu_status = kPmuStatusUnknown;
+    reading->pmu_implemented = false;
     if (ShouldLogBattery()) {
         ESP_LOGI(
             kTag,
-            "battery adc_raw=%d adc_mv=%d battery_mv=%d percent=%d",
+            "battery adc_raw=%d adc_mv=%d battery_mv=%d percent=%d chrg_l=%d stdby_h=%d charging=%d full=%d pmu_status=%s pmu_implemented=%d",
             reading->raw,
             reading->adc_mv,
             reading->battery_mv,
-            reading->percent);
+            reading->percent,
+            reading->chrg_l,
+            reading->stdby_h,
+            reading->charging ? 1 : 0,
+            reading->full ? 1 : 0,
+            reading->pmu_status,
+            reading->pmu_implemented ? 1 : 0);
     }
     return true;
+}
+
+std::string BatteryLabel(const BatteryReading& reading)
+{
+    if (reading.full) {
+        return "满电";
+    }
+    if (reading.charging) {
+        return "充电 " + std::to_string(reading.percent) + "%";
+    }
+    if (reading.percent <= kBatteryShutdownPercent) {
+        return "低电";
+    }
+    return std::to_string(reading.percent) + "%";
+}
+
+void CheckLowBatteryProtection(const BatteryReading* reading)
+{
+    static int shutdown_count = 0;
+
+    if (reading == nullptr || reading->battery_mv <= 0) {
+        if (shutdown_count != 0) {
+            ESP_LOGI(kTag, "Battery shutdown count reset: invalid reading depleted_candidate=0 shutdown_count=0");
+        }
+        shutdown_count = 0;
+        ESP_LOGI(kTag, "battery protection skipped: invalid reading pmu_status=%s depleted_candidate=0 shutdown_count=%d",
+                 kPmuStatusUnknown,
+                 shutdown_count);
+        return;
+    }
+
+    const bool depleted_candidate =
+        reading->percent == kBatteryShutdownPercent &&
+        reading->battery_mv <= kBatteryShutdownMv &&
+        !reading->charging &&
+        !reading->full;
+    if (!depleted_candidate) {
+        if (shutdown_count != 0) {
+            ESP_LOGI(kTag, "Battery shutdown count reset: percent=%d battery_mv=%d charging=%d full=%d depleted_candidate=0 shutdown_count=0",
+                     reading->percent,
+                     reading->battery_mv,
+                     reading->charging ? 1 : 0,
+                     reading->full ? 1 : 0);
+        }
+        shutdown_count = 0;
+        ESP_LOGI(kTag, "battery protection percent=%d battery_mv=%d charging=%d full=%d pmu_status=%s depleted_candidate=0 shutdown_count=%d",
+                 reading->percent,
+                 reading->battery_mv,
+                 reading->charging ? 1 : 0,
+                 reading->full ? 1 : 0,
+                 reading->pmu_status,
+                 shutdown_count);
+        return;
+    }
+
+    ++shutdown_count;
+    ESP_LOGW(kTag, "battery protection percent=%d battery_mv=%d charging=%d full=%d pmu_status=%s depleted_candidate=1 shutdown_count=%d/%d",
+             reading->percent,
+             reading->battery_mv,
+             reading->charging ? 1 : 0,
+             reading->full ? 1 : 0,
+             reading->pmu_status,
+             shutdown_count,
+             kBatteryShutdownDebounceCount);
+    if (shutdown_count >= kBatteryShutdownDebounceCount) {
+        wqn::ShutdownForBatteryDepleted();
+    }
+}
+
+size_t AutoSyncOptionIndex(uint32_t minutes)
+{
+    for (size_t i = 0; i < sizeof(kAutoSyncOptions) / sizeof(kAutoSyncOptions[0]); ++i) {
+        if (kAutoSyncOptions[i] == minutes) {
+            return i;
+        }
+    }
+    return 0;
+}
+
+std::string OnlineSyncStatusLabel(const char* status)
+{
+    if (status == nullptr || status[0] == '\0') {
+        return "空闲";
+    }
+    if (std::strcmp(status, "syncing") == 0) {
+        return "正在同步";
+    }
+    if (std::strcmp(status, "success") == 0) {
+        return "已同步";
+    }
+    if (std::strcmp(status, "failed") == 0) {
+        return "同步失败";
+    }
+    if (std::strcmp(status, "waiting-pair") == 0) {
+        return "等待配对";
+    }
+    if (std::strcmp(status, "wifi-disabled") == 0) {
+        return "WiFi 未启用";
+    }
+    return status;
+}
+
+void UpdateSettingsDiagnostics(wqn::UiState* state)
+{
+    if (state == nullptr) {
+        return;
+    }
+
+    uint32_t minutes = 0;
+    if (wqn::LoadAutoSyncIntervalMinutes(&minutes) == ESP_OK) {
+        state->settings.auto_sync_interval_min = minutes;
+        state->settings.auto_sync_selected = AutoSyncOptionIndex(minutes);
+    } else {
+        state->settings.auto_sync_interval_min = 0;
+        state->settings.auto_sync_selected = 0;
+    }
+
+    wqn::SettingsDiagnosticsSnapshot& snapshot = state->settings.diagnostics;
+    BatteryReading battery = {};
+    if (ReadBatteryStatus(&battery)) {
+        snapshot.adc_raw = battery.raw;
+        snapshot.adc_mv = battery.adc_mv;
+        snapshot.battery_mv = battery.battery_mv;
+        snapshot.battery_percent = battery.percent;
+        snapshot.charging = battery.charging;
+        snapshot.full = battery.full;
+    }
+
+    uint32_t flash_size = 0;
+    if (esp_flash_get_size(nullptr, &flash_size) == ESP_OK) {
+        snapshot.flash_size = flash_size;
+    }
+
+    nvs_stats_t nvs_stats = {};
+    if (nvs_get_stats(nullptr, &nvs_stats) == ESP_OK) {
+        snapshot.nvs_used_entries = nvs_stats.used_entries;
+        snapshot.nvs_free_entries = nvs_stats.free_entries;
+        snapshot.nvs_total_entries = nvs_stats.total_entries;
+    }
+
+    if (esp_psram_is_initialized()) {
+        snapshot.psram_total = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
+        snapshot.psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+        snapshot.psram_used = snapshot.psram_total >= snapshot.psram_free ? snapshot.psram_total - snapshot.psram_free : 0;
+    } else {
+        snapshot.psram_total = 0;
+        snapshot.psram_free = 0;
+        snapshot.psram_used = 0;
+    }
+
+    uint8_t mac[6] = {};
+    if (esp_read_mac(mac, ESP_MAC_WIFI_STA) == ESP_OK) {
+        char buffer[24] = {};
+        std::snprintf(
+            buffer,
+            sizeof(buffer),
+            "%02X:%02X:%02X:%02X:%02X:%02X",
+            mac[0],
+            mac[1],
+            mac[2],
+            mac[3],
+            mac[4],
+            mac[5]);
+        snapshot.mac_label = buffer;
+    }
+
+    snapshot.firmware_version = WQN_FIRMWARE_VERSION;
+    snapshot.board_id = WQN_BOARD_ID;
+    snapshot.idf_target = CONFIG_IDF_TARGET;
+
+    wqn::OnlineSyncSnapshot online = {};
+    wqn::GetOnlineSyncSnapshot(&online);
+    if (online.status[0] != '\0') {
+        state->settings.sync_status = OnlineSyncStatusLabel(online.status);
+    }
 }
 
 std::string LimitForEpd(const std::string& text)
@@ -1002,7 +1247,11 @@ esp_err_t RenderAiToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
     wqn::ClearEpdFramebuffer(true);
     DrawHorizontalLine(0, 27, wqn::kEpdWidth);
     ESP_RETURN_ON_ERROR(wqn::DrawUtf8Text(10, 6, "AI", true), kTag, "draw AI title");
-    std::string status = std::string(AiStatusLabel(ai.status)) + "  82%";
+    std::string status = AiStatusLabel(ai.status);
+    if (!frame.home.battery_label.empty()) {
+        status += "  ";
+        status += frame.home.battery_label;
+    }
     const int status_width = wqn::MeasureUtf8TextWidth(status.c_str());
     ESP_RETURN_ON_ERROR(
         wqn::DrawUtf8Text(std::max(10, wqn::kEpdWidth - status_width - 10), 6, status.c_str(), true),
@@ -1060,38 +1309,291 @@ esp_err_t RenderWordToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
     ESP_RETURN_ON_ERROR(DrawClippedText(282, 36, 108, word.progress_line), kTag, "draw word progress");
     DrawHorizontalLine(10, 58, 380);
 
+    auto draw_choice = [](int y, const std::string& title, const std::string& subtitle, bool selected) -> esp_err_t {
+        const int x = 38;
+        const int width = 324;
+        const int height = 42;
+        if (selected) {
+            DrawRect(x - 3, y - 3, width + 6, height + 6);
+            DrawRect(x - 1, y - 1, width + 2, height + 2);
+        } else {
+            DrawRect(x, y, width, height);
+        }
+        ESP_RETURN_ON_ERROR(DrawClippedText(x + 12, y + 7, 180, title), kTag, "draw word choice title");
+        ESP_RETURN_ON_ERROR(DrawClippedText(x + 160, y + 7, 150, subtitle), kTag, "draw word choice subtitle");
+        return ESP_OK;
+    };
+
+    auto draw_word_back = [&word]() -> esp_err_t {
+        DrawRect(22, 128, 356, 116);
+        const std::string title = word.part_of_speech.empty() ? word.meaning : word.part_of_speech + "  " + word.meaning;
+        ESP_RETURN_ON_ERROR(DrawWrappedText(34, 140, 332, title, 2), kTag, "draw word meaning");
+        if (!word.example.empty()) {
+            ESP_RETURN_ON_ERROR(DrawWrappedText(34, 184, 332, word.example, 2), kTag, "draw word example");
+        }
+        if (!word.example_translation.empty()) {
+            ESP_RETURN_ON_ERROR(DrawWrappedText(34, 224, 332, word.example_translation, 1), kTag, "draw word translation");
+        }
+        return ESP_OK;
+    };
+
+    if (word.mode == wqn::WordAppMode::kHome) {
+        ESP_RETURN_ON_ERROR(DrawCenteredText(20, 72, 360, "单词复习"), kTag, "draw word home title");
+        ESP_RETURN_ON_ERROR(
+            draw_choice(110, "顺序复习", word.pack_ready ? "从词库开始" : "需同步词库", word.home_selection == wqn::WordHomeSelection::kSequential),
+            kTag,
+            "draw sequential choice");
+        ESP_RETURN_ON_ERROR(
+            draw_choice(162, "随机复习", word.pack_ready ? "打乱今日词" : "需同步词库", word.home_selection == wqn::WordHomeSelection::kRandom),
+            kTag,
+            "draw random choice");
+        ESP_RETURN_ON_ERROR(
+            draw_choice(214, "词典", word.pack_ready ? "按字母查词" : "在线同步后使用", word.home_selection == wqn::WordHomeSelection::kDictionary),
+            kTag,
+            "draw dictionary choice");
+        ESP_RETURN_ON_ERROR(DrawClippedText(12, 278, 376, word.hint), kTag, "draw word hint");
+        return RefreshFrame(schedule);
+    }
+
+    if (word.mode == wqn::WordAppMode::kDictionary) {
+        const std::string prefix = word.dictionary_prefix.empty() ? "选择首字母" : word.dictionary_prefix;
+        ESP_RETURN_ON_ERROR(DrawCenteredText(20, 70, 360, prefix), kTag, "draw dictionary prefix");
+        const int start_x = 28;
+        const int start_y = 108;
+        const int cell_w = 42;
+        const int cell_h = 30;
+        for (size_t i = 0; i < word.dictionary_letters.size() && i < 24; ++i) {
+            const int col = static_cast<int>(i % 8);
+            const int row = static_cast<int>(i / 8);
+            const int x = start_x + col * cell_w;
+            const int y = start_y + row * cell_h;
+            if (i == word.dictionary_letter_selected) {
+                DrawRect(x - 2, y - 2, cell_w - 4, cell_h - 2);
+            }
+            char letter[2] = {word.dictionary_letters[i], 0};
+            ESP_RETURN_ON_ERROR(DrawCenteredText(x, y + 7, cell_w - 8, letter), kTag, "draw dictionary letter");
+        }
+        int y = 212;
+        for (size_t i = 0; i < word.dictionary_preview_words.size() && i < 3; ++i) {
+            const std::string marker = i == word.dictionary_match_selected ? "> " : "  ";
+            ESP_RETURN_ON_ERROR(DrawClippedText(42, y, 300, marker + word.dictionary_preview_words[i]), kTag, "draw dictionary preview");
+            y += 22;
+        }
+        ESP_RETURN_ON_ERROR(DrawClippedText(12, 278, 376, word.hint), kTag, "draw word hint");
+        return RefreshFrame(schedule);
+    }
+
+    if (word.mode == wqn::WordAppMode::kLookupChoice) {
+        ESP_RETURN_ON_ERROR(DrawCenteredText(20, 76, 360, word.dictionary_prefix), kTag, "draw lookup query");
+        ESP_RETURN_ON_ERROR(
+            draw_choice(128, "在线搜索", "查 WQN 服务器", word.lookup_selection == wqn::WordLookupSelection::kOnlineSearch),
+            kTag,
+            "draw online lookup choice");
+        ESP_RETURN_ON_ERROR(
+            draw_choice(182, "询问 AI", "临时释义", word.lookup_selection == wqn::WordLookupSelection::kAiLookup),
+            kTag,
+            "draw ai lookup choice");
+        ESP_RETURN_ON_ERROR(DrawClippedText(12, 278, 376, word.hint), kTag, "draw word hint");
+        return RefreshFrame(schedule);
+    }
+
     if (!word.has_card) {
-        ESP_RETURN_ON_ERROR(DrawCenteredText(20, 108, 360, word.word), kTag, "draw word empty title");
-        ESP_RETURN_ON_ERROR(DrawCenteredText(20, 138, 360, word.meaning), kTag, "draw word empty body");
-        ESP_RETURN_ON_ERROR(DrawCenteredText(20, 226, 360, word.hint), kTag, "draw word empty hint");
+        ESP_RETURN_ON_ERROR(DrawCenteredText(20, 118, 360, "词库未同步"), kTag, "draw word empty title");
+        ESP_RETURN_ON_ERROR(DrawCenteredText(20, 148, 360, word.hint), kTag, "draw word empty body");
         return RefreshFrame(schedule);
     }
 
     const std::string position =
-        std::to_string(word.card_position) + "/" + std::to_string(std::max<uint16_t>(1, word.card_count));
-    ESP_RETURN_ON_ERROR(DrawCenteredText(20, 70, 360, position), kTag, "draw word position");
+        word.card_count == 0 ? "" : std::to_string(word.card_position) + "/" + std::to_string(std::max<uint16_t>(1, word.card_count));
+    ESP_RETURN_ON_ERROR(DrawCenteredText(20, 68, 360, position), kTag, "draw word position");
 
-    ESP_RETURN_ON_ERROR(DrawCenteredText(20, 100, 360, word.word), kTag, "draw word headword");
+    ESP_RETURN_ON_ERROR(DrawCenteredText(20, 94, 360, word.word), kTag, "draw word headword");
     if (!word.phonetic.empty()) {
-        ESP_RETURN_ON_ERROR(DrawCenteredText(20, 125, 360, word.phonetic), kTag, "draw word phonetic");
+        ESP_RETURN_ON_ERROR(DrawCenteredText(20, 118, 360, word.phonetic), kTag, "draw word phonetic");
     }
 
-    if (word.showing_back) {
-        DrawRect(24, 154, 352, 76);
-        ESP_RETURN_ON_ERROR(DrawWrappedText(34, 165, 332, word.meaning, 2), kTag, "draw word meaning");
-        if (!word.example.empty()) {
-            ESP_RETURN_ON_ERROR(DrawWrappedText(34, 214, 332, word.example, 2), kTag, "draw word example");
-        }
-        if (!word.example_translation.empty()) {
-            ESP_RETURN_ON_ERROR(DrawWrappedText(34, 250, 332, word.example_translation, 1), kTag, "draw word example translation");
-        }
+    if (word.mode == wqn::WordAppMode::kReviewFront) {
+        DrawRect(74, 164, 252, 48);
+        ESP_RETURN_ON_ERROR(DrawCenteredText(74, 181, 252, "先回忆释义"), kTag, "draw recall prompt");
     } else {
-        DrawRect(74, 164, 252, 40);
-        ESP_RETURN_ON_ERROR(DrawCenteredText(74, 175, 252, "先回忆释义"), kTag, "draw word recall prompt");
+        ESP_RETURN_ON_ERROR(draw_word_back(), kTag, "draw word back");
     }
 
     ESP_RETURN_ON_ERROR(DrawClippedText(12, 278, 376, word.hint), kTag, "draw word hint");
     return RefreshFrame(schedule);
+}
+
+std::string BytesLabel(size_t bytes)
+{
+    char buffer[32] = {};
+    if (bytes >= 1024 * 1024) {
+        std::snprintf(buffer, sizeof(buffer), "%lu MB", static_cast<unsigned long>(bytes / (1024 * 1024)));
+    } else if (bytes >= 1024) {
+        std::snprintf(buffer, sizeof(buffer), "%lu KB", static_cast<unsigned long>(bytes / 1024));
+    } else {
+        std::snprintf(buffer, sizeof(buffer), "%lu B", static_cast<unsigned long>(bytes));
+    }
+    return buffer;
+}
+
+esp_err_t DrawSettingsRow(int y, const std::string& title, const std::string& value, bool selected)
+{
+    constexpr int kX = 14;
+    constexpr int kWidth = 372;
+    constexpr int kHeight = 34;
+    if (selected) {
+        FillRect(kX - 4, y - 3, kWidth + 8, kHeight, true);
+    } else {
+        DrawHorizontalLine(kX, y + kHeight - 3, kWidth);
+    }
+    const bool black_text = !selected;
+    ESP_RETURN_ON_ERROR(DrawClippedText(kX, y + 5, 210, title, black_text), kTag, "draw settings title");
+    if (!value.empty()) {
+        const int value_width = wqn::MeasureUtf8TextWidth(value.c_str());
+        ESP_RETURN_ON_ERROR(
+            DrawClippedText(std::max(kX + 220, kX + kWidth - value_width - 4), y + 5, 150, value, black_text),
+            kTag,
+            "draw settings value");
+    }
+    return ESP_OK;
+}
+
+esp_err_t DrawSettingsDialogBox(const std::string& title)
+{
+    FillRect(28, 44, 344, 216, false);
+    DrawRect(28, 44, 344, 216);
+    DrawHorizontalLine(44, 80, 312);
+    DrawRect(118, 224, 164, 28);
+    ESP_RETURN_ON_ERROR(DrawCenteredText(44, 58, 312, title), kTag, "draw settings dialog title");
+    return DrawCenteredText(118, 231, 164, "确认");
+}
+
+esp_err_t RenderSettingsDialog(const wqn::SettingsAppState& settings)
+{
+    const wqn::SettingsDiagnosticsSnapshot& diag = settings.diagnostics;
+    switch (settings.dialog) {
+        case wqn::SettingsDialog::kAutoSync: {
+            ESP_RETURN_ON_ERROR(DrawSettingsDialogBox("自动同步间隔"), kTag, "draw auto sync dialog");
+            int y = 94;
+            for (size_t i = 0; i < sizeof(kAutoSyncOptions) / sizeof(kAutoSyncOptions[0]); ++i) {
+                const bool selected = i == settings.auto_sync_selected;
+                if (selected) {
+                    FillRect(70, y - 3, 260, 24, true);
+                }
+                ESP_RETURN_ON_ERROR(
+                    DrawCenteredText(70, y + 1, 260, wqn::AutoSyncIntervalLabel(kAutoSyncOptions[i]), !selected),
+                    kTag,
+                    "draw auto sync option");
+                y += 27;
+            }
+            ESP_RETURN_ON_ERROR(DrawCenteredText(44, 202, 312, "上下选择"), kTag, "draw auto sync help");
+            break;
+        }
+        case wqn::SettingsDialog::kBattery: {
+            ESP_RETURN_ON_ERROR(DrawSettingsDialogBox("电量详情"), kTag, "draw battery dialog");
+            ESP_RETURN_ON_ERROR(DrawClippedText(52, 92, 300, "adc_raw: " + std::to_string(diag.adc_raw)), kTag, "draw battery raw");
+            ESP_RETURN_ON_ERROR(DrawClippedText(52, 112, 300, "adc_mv: " + std::to_string(diag.adc_mv)), kTag, "draw battery adc");
+            ESP_RETURN_ON_ERROR(DrawClippedText(52, 132, 300, "battery_mv: " + std::to_string(diag.battery_mv)), kTag, "draw battery mv");
+            ESP_RETURN_ON_ERROR(DrawClippedText(52, 152, 300, "percent: " + std::to_string(diag.battery_percent) + "%"), kTag, "draw battery percent");
+            ESP_RETURN_ON_ERROR(
+                DrawClippedText(52, 172, 300, std::string("charging/full: ") + (diag.charging ? "1" : "0") + "/" + (diag.full ? "1" : "0")),
+                kTag,
+                "draw battery flags");
+            ESP_RETURN_ON_ERROR(DrawClippedText(52, 196, 300, "公式: (-V^2+9016V-19189000)/10000"), kTag, "draw battery formula");
+            break;
+        }
+        case wqn::SettingsDialog::kStorage: {
+            ESP_RETURN_ON_ERROR(DrawSettingsDialogBox("存储详情"), kTag, "draw storage dialog");
+            ESP_RETURN_ON_ERROR(DrawClippedText(52, 92, 300, "Flash: " + BytesLabel(diag.flash_size)), kTag, "draw flash size");
+            ESP_RETURN_ON_ERROR(
+                DrawClippedText(
+                    52,
+                    114,
+                    300,
+                    "NVS entries: " + std::to_string(diag.nvs_used_entries) + "/" + std::to_string(diag.nvs_total_entries)),
+                kTag,
+                "draw nvs entries");
+            ESP_RETURN_ON_ERROR(DrawClippedText(52, 136, 300, "NVS free: " + std::to_string(diag.nvs_free_entries)), kTag, "draw nvs free");
+            ESP_RETURN_ON_ERROR(DrawClippedText(52, 158, 300, "PSRAM total: " + BytesLabel(diag.psram_total)), kTag, "draw psram total");
+            ESP_RETURN_ON_ERROR(DrawClippedText(52, 180, 300, "PSRAM free: " + BytesLabel(diag.psram_free)), kTag, "draw psram free");
+            ESP_RETURN_ON_ERROR(DrawClippedText(52, 202, 300, "PSRAM used: " + BytesLabel(diag.psram_used)), kTag, "draw psram used");
+            break;
+        }
+        case wqn::SettingsDialog::kFactoryReset:
+            ESP_RETURN_ON_ERROR(DrawSettingsDialogBox("恢复出厂"), kTag, "draw factory reset dialog");
+            ESP_RETURN_ON_ERROR(DrawWrappedText(54, 98, 292, "将清除 NVS 中的配对、缓存、待上传、AI 会话、单词进度和设置。", 3), kTag, "draw reset body");
+            ESP_RETURN_ON_ERROR(DrawCenteredText(44, 176, 312, "这是不可撤销操作"), kTag, "draw reset warning");
+            ESP_RETURN_ON_ERROR(DrawCenteredText(44, 200, 312, "长按确认执行，短按确认取消"), kTag, "draw reset help");
+            break;
+        case wqn::SettingsDialog::kNone:
+        default:
+            break;
+    }
+    return ESP_OK;
+}
+
+esp_err_t RenderSettingsToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
+{
+    const wqn::SettingsAppState& settings = frame.settings;
+    const wqn::SettingsDiagnosticsSnapshot& diag = settings.diagnostics;
+    wqn::ClearEpdFramebuffer(true);
+
+    DrawHorizontalLine(0, 27, wqn::kEpdWidth);
+    std::string title = "设置";
+    if (!diag.mac_label.empty()) {
+        title += " (MAC: " + diag.mac_label + ")";
+    }
+    ESP_RETURN_ON_ERROR(DrawClippedText(10, 6, 250, title), kTag, "draw settings title");
+    std::string status = CurrentClockLabel();
+    if (!frame.home.wifi_label.empty()) {
+        status += "  " + frame.home.wifi_label;
+    }
+    if (!frame.home.battery_label.empty()) {
+        status += "  " + frame.home.battery_label;
+    }
+    const int status_width = wqn::MeasureUtf8TextWidth(status.c_str());
+    ESP_RETURN_ON_ERROR(
+        DrawClippedText(std::max(10, wqn::kEpdWidth - status_width - 10), 6, std::min(180, status_width + 4), status),
+        kTag,
+        "draw settings status");
+
+    const std::string auto_sync_label = wqn::AutoSyncIntervalLabel(settings.auto_sync_interval_min);
+    const std::string battery_value =
+        diag.full ? "满电" : (diag.charging ? "充电 " + std::to_string(diag.battery_percent) + "%" : std::to_string(diag.battery_percent) + "%");
+    const std::string storage_value = "NVS " + std::to_string(diag.nvs_used_entries) + "/" + std::to_string(diag.nvs_total_entries);
+    const std::string version_value = diag.firmware_version.empty() ? WQN_FIRMWARE_VERSION : diag.firmware_version;
+
+    const std::string titles[kSettingsItemCount] = {
+        "立即同步",
+        "自动同步间隔",
+        "电量",
+        "存储详情",
+        "固件版本",
+        "恢复出厂",
+    };
+    const std::string values[kSettingsItemCount] = {
+        settings.sync_status.empty() ? "空闲" : settings.sync_status,
+        auto_sync_label,
+        battery_value,
+        storage_value,
+        version_value,
+        "",
+    };
+
+    int y = 42;
+    for (size_t i = 0; i < kSettingsItemCount; ++i) {
+        ESP_RETURN_ON_ERROR(DrawSettingsRow(y, titles[i], values[i], i == settings.selected), kTag, "draw settings row");
+        y += 38;
+    }
+    ESP_RETURN_ON_ERROR(
+        DrawClippedText(14, 274, 372, settings.notice.empty() ? "上下选择，确认操作，长按确认返回首页" : settings.notice),
+        kTag,
+        "draw settings help");
+
+    if (settings.dialog != wqn::SettingsDialog::kNone) {
+        ESP_RETURN_ON_ERROR(RenderSettingsDialog(settings), kTag, "draw settings dialog");
+    }
+    return RefreshFrame(schedule == RefreshSchedule::kCommit ? RefreshSchedule::kCommit : RefreshSchedule::kConfig);
 }
 
 esp_err_t DrawMetricCard(int x, int y, int width, const wqn::HomeMetric& metric)
@@ -1179,6 +1681,339 @@ esp_err_t RenderHomeToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
         y += 53;
     }
 
+    return RefreshFrame(schedule);
+}
+
+bool IsAsciiDigit(char c)
+{
+    return c >= '0' && c <= '9';
+}
+
+std::string TodoDueTimeLabel(const std::string& due_at)
+{
+    for (size_t i = 0; i + 4 < due_at.size(); ++i) {
+        if (!IsAsciiDigit(due_at[i]) || !IsAsciiDigit(due_at[i + 1]) || due_at[i + 2] != ':' ||
+            !IsAsciiDigit(due_at[i + 3]) || !IsAsciiDigit(due_at[i + 4])) {
+            continue;
+        }
+        const int hour = (due_at[i] - '0') * 10 + (due_at[i + 1] - '0');
+        const int minute = (due_at[i + 3] - '0') * 10 + (due_at[i + 4] - '0');
+        if (hour >= 0 && hour <= 23 && minute >= 0 && minute <= 59) {
+            return due_at.substr(i, 5);
+        }
+    }
+    return "--:--";
+}
+
+std::string TodoDueDateLabel(const std::string& due_at)
+{
+    if (due_at.size() >= 10 && IsAsciiDigit(due_at[0]) && IsAsciiDigit(due_at[1]) &&
+        IsAsciiDigit(due_at[2]) && IsAsciiDigit(due_at[3]) && due_at[4] == '-' &&
+        IsAsciiDigit(due_at[5]) && IsAsciiDigit(due_at[6]) && due_at[7] == '-' &&
+        IsAsciiDigit(due_at[8]) && IsAsciiDigit(due_at[9])) {
+        return due_at.substr(0, 10);
+    }
+    return "无到期日期";
+}
+
+const char* TodoSyncStatusText(wqn::TodoSyncStatus status)
+{
+    switch (status) {
+        case wqn::TodoSyncStatus::kLoading:
+            return "同步中";
+        case wqn::TodoSyncStatus::kReady:
+            return "已同步";
+        case wqn::TodoSyncStatus::kSyncFailed:
+            return "同步失败";
+        case wqn::TodoSyncStatus::kCompleting:
+            return "完成中";
+        case wqn::TodoSyncStatus::kCompleteFailed:
+            return "完成失败";
+        case wqn::TodoSyncStatus::kCompleted:
+            return "已完成";
+        case wqn::TodoSyncStatus::kAuthRequired:
+            return "未配对";
+        case wqn::TodoSyncStatus::kIdle:
+        default:
+            return "待同步";
+    }
+}
+
+std::string TodoItemStatusText(const wqn::WqnTodoItem& item, bool selected, wqn::TodoSyncStatus sync_status)
+{
+    if (sync_status == wqn::TodoSyncStatus::kLoading) {
+        return "同步中";
+    }
+    if (sync_status == wqn::TodoSyncStatus::kSyncFailed) {
+        return "同步失败";
+    }
+    if (selected && sync_status == wqn::TodoSyncStatus::kCompleting) {
+        return "完成中";
+    }
+    if (selected && sync_status == wqn::TodoSyncStatus::kCompleteFailed) {
+        return "完成失败";
+    }
+    if (!item.completed_at.empty() || item.status == "completed" || item.status == "done") {
+        return "已完成";
+    }
+    if (item.status == "cancelled" || item.status == "canceled") {
+        return "已取消";
+    }
+    if (item.status == "overdue") {
+        return "已逾期";
+    }
+    if (item.status == "pending" || item.status.empty()) {
+        return "待完成";
+    }
+    return item.status;
+}
+
+std::string TodoCardMetaLabel(const wqn::WqnTodoItem& item, bool selected, wqn::TodoSyncStatus sync_status)
+{
+    const std::string subject = item.subject_name.empty() ? "未分类" : item.subject_name;
+    return subject + " · " + TodoItemStatusText(item, selected, sync_status) + " · " + TodoDueDateLabel(item.due_at);
+}
+
+std::string TodoStatusNote(const wqn::TodoUiState& todo)
+{
+    switch (todo.sync_status) {
+        case wqn::TodoSyncStatus::kLoading:
+            return "正在同步 Todo";
+        case wqn::TodoSyncStatus::kCompleting:
+            return "正在完成选中待办";
+        case wqn::TodoSyncStatus::kCompleteFailed:
+            return "完成失败，请稍后重试";
+        case wqn::TodoSyncStatus::kCompleted:
+            return "已完成选中待办";
+        case wqn::TodoSyncStatus::kSyncFailed:
+            return "同步失败，显示当前缓存";
+        case wqn::TodoSyncStatus::kAuthRequired:
+            return "请重新配对后同步";
+        case wqn::TodoSyncStatus::kReady:
+        case wqn::TodoSyncStatus::kIdle:
+        default:
+            break;
+    }
+    return todo.status_message;
+}
+
+int TodoPendingCount(const wqn::TodoUiState& todo)
+{
+    if (todo.total_pending > 0) {
+        return todo.total_pending;
+    }
+    return static_cast<int>(todo.todos.size());
+}
+
+bool ParseTodoDueTime(const std::string& due_at, std::tm* due_tm)
+{
+    if (due_tm == nullptr || due_at.size() < 10 || !IsAsciiDigit(due_at[0]) || !IsAsciiDigit(due_at[1]) ||
+        !IsAsciiDigit(due_at[2]) || !IsAsciiDigit(due_at[3]) || due_at[4] != '-' || !IsAsciiDigit(due_at[5]) ||
+        !IsAsciiDigit(due_at[6]) || due_at[7] != '-' || !IsAsciiDigit(due_at[8]) || !IsAsciiDigit(due_at[9])) {
+        return false;
+    }
+
+    std::tm parsed = {};
+    parsed.tm_year = (due_at[0] - '0') * 1000 + (due_at[1] - '0') * 100 + (due_at[2] - '0') * 10 +
+                     (due_at[3] - '0') - 1900;
+    parsed.tm_mon = (due_at[5] - '0') * 10 + (due_at[6] - '0') - 1;
+    parsed.tm_mday = (due_at[8] - '0') * 10 + (due_at[9] - '0');
+    parsed.tm_hour = 23;
+    parsed.tm_min = 59;
+    parsed.tm_sec = 59;
+
+    if (due_at.size() >= 16 && due_at[10] == 'T' && IsAsciiDigit(due_at[11]) && IsAsciiDigit(due_at[12]) &&
+        due_at[13] == ':' && IsAsciiDigit(due_at[14]) && IsAsciiDigit(due_at[15])) {
+        parsed.tm_hour = (due_at[11] - '0') * 10 + (due_at[12] - '0');
+        parsed.tm_min = (due_at[14] - '0') * 10 + (due_at[15] - '0');
+        if (due_at.size() >= 19 && due_at[16] == ':' && IsAsciiDigit(due_at[17]) && IsAsciiDigit(due_at[18])) {
+            parsed.tm_sec = (due_at[17] - '0') * 10 + (due_at[18] - '0');
+        } else {
+            parsed.tm_sec = 0;
+        }
+    }
+
+    if (parsed.tm_mon < 0 || parsed.tm_mon > 11 || parsed.tm_mday < 1 || parsed.tm_mday > 31 ||
+        parsed.tm_hour < 0 || parsed.tm_hour > 23 || parsed.tm_min < 0 || parsed.tm_min > 59 ||
+        parsed.tm_sec < 0 || parsed.tm_sec > 59) {
+        return false;
+    }
+    *due_tm = parsed;
+    return true;
+}
+
+int TodoOverdueCount(const wqn::TodoUiState& todo)
+{
+    int count = 0;
+    const std::time_t now = CurrentUnixTime();
+    const bool has_valid_clock = now >= kMinReasonableUnixTime;
+    for (const wqn::WqnTodoItem& item : todo.todos) {
+        if (item.status == "overdue") {
+            ++count;
+            continue;
+        }
+        if (!has_valid_clock || item.due_at.empty() || item.status == "completed" || item.status == "done" ||
+            item.status == "cancelled" || item.status == "canceled") {
+            continue;
+        }
+        std::tm due_tm = {};
+        if (!ParseTodoDueTime(item.due_at, &due_tm)) {
+            continue;
+        }
+        const std::time_t due_time = mktime(&due_tm);
+        if (due_time != static_cast<std::time_t>(-1) && due_time < now) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+size_t TodoVisibleStart(const wqn::TodoUiState& todo, size_t selected, size_t visible_count)
+{
+    if (todo.todos.size() <= visible_count) {
+        return 0;
+    }
+    if (selected + 1 >= visible_count) {
+        return std::min(selected + 1 - visible_count, todo.todos.size() - visible_count);
+    }
+    return 0;
+}
+
+void DrawDashedVerticalLine(int x, int y, int height)
+{
+    constexpr int kDash = 6;
+    constexpr int kGap = 5;
+    for (int offset = 0; offset < height; offset += kDash + kGap) {
+        DrawVerticalLine(x, y + offset, std::min(kDash, height - offset));
+    }
+}
+
+void DrawTimelineNode(int cx, int cy, bool selected)
+{
+    constexpr int kRadius = 6;
+    constexpr int kInnerRadius = 3;
+    for (int dy = -kRadius; dy <= kRadius; ++dy) {
+        for (int dx = -kRadius; dx <= kRadius; ++dx) {
+            const int distance = dx * dx + dy * dy;
+            if (distance > kRadius * kRadius) {
+                continue;
+            }
+            wqn::DrawEpdPixel(cx + dx, cy + dy, false);
+            const bool black = selected || distance >= kInnerRadius * kInnerRadius;
+            wqn::DrawEpdPixel(cx + dx, cy + dy, black);
+        }
+    }
+}
+
+esp_err_t DrawTodoStatusBar(const wqn::TodoUiState& todo, const wqn::HomeSummary& home)
+{
+    DrawHorizontalLine(0, 27, wqn::kEpdWidth);
+    ESP_RETURN_ON_ERROR(wqn::DrawUtf8Text(10, 6, "Todo", true), kTag, "draw todo title");
+
+    std::string status = "今日 " + std::to_string(TodoPendingCount(todo));
+    status += "  逾期 ";
+    status += std::to_string(TodoOverdueCount(todo));
+    status += "  ";
+    status += TodoSyncStatusText(todo.sync_status);
+    status += "  ";
+    status += CurrentClockLabel();
+    status += "  ";
+    status += home.wifi_label.empty() ? "WiFi" : home.wifi_label;
+    if (!home.battery_label.empty()) {
+        status += "  ";
+        status += home.battery_label;
+    }
+
+    constexpr int kStatusMaxWidth = wqn::kEpdWidth - 74;
+    const std::string clipped = wqn::TruncateUtf8TextToWidth(status, kStatusMaxWidth);
+    const int status_width = wqn::MeasureUtf8TextWidth(clipped.c_str());
+    ESP_RETURN_ON_ERROR(
+        wqn::DrawUtf8Text(std::max(74, wqn::kEpdWidth - status_width - 10), 6, clipped.c_str(), true),
+        kTag,
+        "draw todo status");
+    return ESP_OK;
+}
+
+esp_err_t DrawTodoCard(const wqn::WqnTodoItem& item, bool selected, wqn::TodoSyncStatus sync_status, int x, int y, int width, int height)
+{
+    DrawRect(x, y, width, height);
+    if (selected) {
+        DrawRect(x + 3, y + 3, width - 6, height - 6);
+    }
+
+    const std::string title = item.title.empty() ? "未命名 Todo" : item.title;
+    ESP_RETURN_ON_ERROR(DrawClippedText(x + 8, y + 7, 48, TodoDueTimeLabel(item.due_at)), kTag, "draw todo time");
+    ESP_RETURN_ON_ERROR(DrawClippedText(x + 62, y + 7, width - 70, title), kTag, "draw todo title text");
+    ESP_RETURN_ON_ERROR(
+        DrawClippedText(x + 8, y + 31, width - 16, TodoCardMetaLabel(item, selected, sync_status)),
+        kTag,
+        "draw todo meta");
+    return ESP_OK;
+}
+
+esp_err_t DrawTodoEmptyState(const wqn::TodoUiState& todo)
+{
+    std::string title = "暂无 Todo";
+    std::string body = "今天没有待办事项";
+    if (todo.sync_status == wqn::TodoSyncStatus::kAuthRequired) {
+        title = "设备未配对";
+        body = "请先在网页端扫码配对";
+    } else if (todo.sync_status == wqn::TodoSyncStatus::kSyncFailed) {
+        title = "Todo 同步失败";
+        body = "请检查 WiFi 后重试";
+    } else if (todo.sync_status == wqn::TodoSyncStatus::kLoading) {
+        title = "正在同步 Todo";
+        body = "正在从云端获取今天的待办";
+    }
+
+    DrawRect(28, 72, 344, 128);
+    ESP_RETURN_ON_ERROR(DrawCenteredText(36, 106, 328, title), kTag, "draw todo empty title");
+    ESP_RETURN_ON_ERROR(DrawCenteredText(36, 136, 328, body), kTag, "draw todo empty body");
+    ESP_RETURN_ON_ERROR(DrawCenteredText(36, 174, 328, TodoSyncStatusText(todo.sync_status)), kTag, "draw todo empty status");
+    return ESP_OK;
+}
+
+esp_err_t RenderTodoToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
+{
+    const wqn::TodoUiState& todo = frame.todo;
+    wqn::ClearEpdFramebuffer(true);
+    ESP_RETURN_ON_ERROR(DrawTodoStatusBar(todo, frame.home), kTag, "draw todo status bar");
+
+    if (todo.sync_status == wqn::TodoSyncStatus::kAuthRequired || todo.todos.empty()) {
+        ESP_RETURN_ON_ERROR(DrawTodoEmptyState(todo), kTag, "draw todo empty state");
+        return RefreshFrame(schedule);
+    }
+
+    constexpr size_t kMaxVisibleTodos = 4;
+    constexpr int kTimelineX = 34;
+    constexpr int kCardX = 54;
+    constexpr int kCardY = 38;
+    constexpr int kCardWidth = 336;
+    constexpr int kCardHeight = 54;
+    constexpr int kCardGap = 8;
+
+    const size_t selected = std::min(todo.selected, todo.todos.size() - 1);
+    const size_t visible_count = std::min(kMaxVisibleTodos, todo.todos.size());
+    const size_t start = TodoVisibleStart(todo, selected, visible_count);
+    const int timeline_start_y = kCardY + 13;
+    const int timeline_height = static_cast<int>((visible_count - 1) * (kCardHeight + kCardGap)) + 1;
+    DrawDashedVerticalLine(kTimelineX, timeline_start_y, std::max(1, timeline_height));
+
+    for (size_t visible_index = 0; visible_index < visible_count; ++visible_index) {
+        const size_t item_index = start + visible_index;
+        const bool is_selected = item_index == selected;
+        const int y = kCardY + static_cast<int>(visible_index) * (kCardHeight + kCardGap);
+        DrawTimelineNode(kTimelineX, y + 13, is_selected);
+        ESP_RETURN_ON_ERROR(
+            DrawTodoCard(todo.todos[item_index], is_selected, todo.sync_status, kCardX, y, kCardWidth, kCardHeight),
+            kTag,
+            "draw todo card");
+    }
+
+    const std::string note = TodoStatusNote(todo);
+    if (!note.empty()) {
+        ESP_RETURN_ON_ERROR(DrawClippedText(kCardX, 282, kCardWidth, note), kTag, "draw todo message");
+    }
     return RefreshFrame(schedule);
 }
 
@@ -1276,6 +2111,17 @@ bool QueueTodoRefresh()
     return QueueTodoCloudRequest(request);
 }
 
+bool QueueTodoRefreshCursor(const std::string& cursor)
+{
+    if (cursor.empty()) {
+        return false;
+    }
+    TodoCloudRequest request;
+    request.op = TodoCloudOp::kRefresh;
+    std::snprintf(request.cursor, sizeof(request.cursor), "%s", cursor.c_str());
+    return QueueTodoCloudRequest(request);
+}
+
 bool QueueTodoComplete(const std::string& todo_id)
 {
     if (todo_id.empty()) {
@@ -1292,9 +2138,21 @@ void ApplyTodoList(wqn::UiState* state, wqn::WqnTodoListPage page)
     if (state == nullptr) {
         return;
     }
+    const int selected_index = page.selected_index;
     state->todo.todos = std::move(page.todos);
     state->todo.loaded_once = true;
     state->todo.total_pending = page.total > 0 ? page.total : static_cast<int>(state->todo.todos.size());
+    state->todo.previous_cursor = page.previous_cursor;
+    state->todo.next_cursor = page.next_cursor;
+    state->todo.has_earlier = page.has_earlier;
+    state->todo.has_later = page.has_later;
+    if (!state->todo.todos.empty()) {
+        if (selected_index >= 0 && selected_index < static_cast<int>(state->todo.todos.size())) {
+            state->todo.selected = static_cast<size_t>(selected_index);
+        } else if (state->todo.selected >= state->todo.todos.size()) {
+            state->todo.selected = state->todo.todos.size() - 1;
+        }
+    }
     state->todo.sync_status = wqn::TodoSyncStatus::kReady;
     state->todo.status_message.clear();
     wqn::ClampUiSelection(state);
@@ -1353,6 +2211,60 @@ bool ApplyTodoCloudResult(wqn::UiState* state, const TodoCloudResult& result)
     return false;
 }
 
+bool ApplyWordCloudResult(wqn::UiState* state, const WordCloudResult& result)
+{
+    if (state == nullptr) {
+        return false;
+    }
+    if (result.op == WordCloudOp::kPackSync) {
+        if (result.result == ESP_OK) {
+            wqn::ApplyWordPackIndex(&state->word_app, result.pack_index, result.message);
+        } else {
+            state->word_app.cloud_sync_failed = true;
+            state->word_app.cloud_loaded_once = true;
+            state->word_app.cloud_sync_requested = false;
+            state->word_app.message = result.auth_required ? "请重新配对" : "单词同步失败";
+        }
+        BuildHomeSummary(state);
+        return true;
+    }
+
+    if (result.op == WordCloudOp::kSubmit) {
+        if (result.result == ESP_OK) {
+            if (std::strcmp(result.outcome, "unknown") == 0) {
+                state->word_app.message = "已加入遗忘的单词";
+            } else if (std::strcmp(result.outcome, "known") == 0) {
+                state->word_app.message = "已记录";
+            } else {
+                state->word_app.message = "已同步";
+            }
+        } else {
+            state->word_app.message = result.auth_required ? "请重新配对" : "单词同步失败";
+        }
+        BuildHomeSummary(state);
+        return true;
+    }
+    if (result.op == WordCloudOp::kSearch) {
+        if (result.result == ESP_OK) {
+            wqn::ApplyWordSearchResult(&state->word_app, result.search);
+        } else {
+            state->word_app.message = result.auth_required ? "请重新配对" : "在线搜索失败";
+        }
+        BuildHomeSummary(state);
+        return true;
+    }
+    if (result.op == WordCloudOp::kAiLookup) {
+        if (result.result == ESP_OK) {
+            wqn::ApplyWordAiLookupResult(&state->word_app, result.lookup);
+        } else {
+            state->word_app.message = result.auth_required ? "请重新配对" : "AI 查词失败";
+        }
+        BuildHomeSummary(state);
+        return true;
+    }
+    return false;
+}
+
 void SendTodoCloudResult(TodoCloudResult* result)
 {
     if (result == nullptr) {
@@ -1361,6 +2273,160 @@ void SendTodoCloudResult(TodoCloudResult* result)
     if (g_todo_result_queue == nullptr || xQueueSend(g_todo_result_queue, &result, pdMS_TO_TICKS(100)) != pdTRUE) {
         g_todo_cloud_busy = false;
         delete result;
+    }
+}
+
+bool IsWordCloudBusy()
+{
+    return g_word_cloud_busy;
+}
+
+bool QueueWordCloudRequest(const WordCloudRequest& request)
+{
+    if (g_word_request_queue == nullptr || IsWordCloudBusy()) {
+        return false;
+    }
+    if (xQueueSend(g_word_request_queue, &request, 0) != pdTRUE) {
+        return false;
+    }
+    g_word_cloud_busy = true;
+    return true;
+}
+
+bool QueueWordReviewRefresh()
+{
+    WordCloudRequest request;
+    request.op = WordCloudOp::kPackSync;
+    return QueueWordCloudRequest(request);
+}
+
+bool QueueWordReviewSubmit(const wqn::WqnWordReviewSubmission& submission, const std::string& word)
+{
+    if (submission.word_id.empty() || submission.outcome.empty()) {
+        return false;
+    }
+    WordCloudRequest request;
+    request.op = WordCloudOp::kSubmit;
+    std::snprintf(request.word_id, sizeof(request.word_id), "%s", submission.word_id.c_str());
+    std::snprintf(request.outcome, sizeof(request.outcome), "%s", submission.outcome.c_str());
+    std::snprintf(request.word, sizeof(request.word), "%s", word.c_str());
+    return QueueWordCloudRequest(request);
+}
+
+bool QueueWordSearch(const wqn::WqnWordSearchRequest& search)
+{
+    if (search.query.empty() && search.prefix.empty()) {
+        return false;
+    }
+    WordCloudRequest request;
+    request.op = WordCloudOp::kSearch;
+    const std::string query = !search.query.empty() ? search.query : search.prefix;
+    std::snprintf(request.query, sizeof(request.query), "%s", query.c_str());
+    return QueueWordCloudRequest(request);
+}
+
+bool QueueWordAiLookup(const wqn::WqnWordAiLookupRequest& lookup)
+{
+    if (lookup.query.empty() && lookup.prefix.empty()) {
+        return false;
+    }
+    WordCloudRequest request;
+    request.op = WordCloudOp::kAiLookup;
+    const std::string query = !lookup.query.empty() ? lookup.query : lookup.prefix;
+    std::snprintf(request.query, sizeof(request.query), "%s", query.c_str());
+    return QueueWordCloudRequest(request);
+}
+
+void SendWordCloudResult(WordCloudResult* result)
+{
+    if (result == nullptr) {
+        return;
+    }
+    if (g_word_result_queue == nullptr || xQueueSend(g_word_result_queue, &result, pdMS_TO_TICKS(100)) != pdTRUE) {
+        g_word_cloud_busy = false;
+        delete result;
+    }
+}
+
+void WordCloudTask(void*)
+{
+    ESP_LOGI(kTag, "Word cloud task started");
+    while (true) {
+        WordCloudRequest request;
+        if (xQueueReceive(g_word_request_queue, &request, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+
+        WordCloudResult* result = new (std::nothrow) WordCloudResult();
+        if (result == nullptr) {
+            g_word_cloud_busy = false;
+            ESP_LOGW(kTag, "alloc Word cloud result failed");
+            continue;
+        }
+        result->op = request.op;
+        std::snprintf(result->word_id, sizeof(result->word_id), "%s", request.word_id);
+        std::snprintf(result->outcome, sizeof(result->outcome), "%s", request.outcome);
+        std::snprintf(result->word, sizeof(result->word), "%s", request.word);
+        result->message.clear();
+
+        std::string token;
+        if (!LoadValidTokenForTodo(&token)) {
+            result->auth_required = true;
+            result->result = ESP_ERR_INVALID_STATE;
+            SendWordCloudResult(result);
+            continue;
+        }
+
+        if (request.op == WordCloudOp::kPackSync) {
+            wqn::WqnWordPackManifest manifest;
+            result->result = wqn::FetchWordPackManifest(token, &manifest);
+            if (result->result == ESP_OK) {
+                for (const wqn::WqnWordPackManifestItem& item : manifest.packs) {
+                    if (!wqn::WordPackNeedsDownload(item)) {
+                        continue;
+                    }
+                    std::string pack_body;
+                    result->result = wqn::DownloadWordPack(token, item, &pack_body);
+                    if (result->result != ESP_OK) {
+                        break;
+                    }
+                    result->result = wqn::SaveWordPackFromBytes(item, pack_body);
+                    if (result->result != ESP_OK) {
+                        break;
+                    }
+                }
+            }
+            if (result->result == ESP_OK) {
+                result->result = wqn::SaveWordPackManifest(manifest);
+            }
+            if (result->result == ESP_OK) {
+                result->result = wqn::LoadWordPackIndex(&result->pack_index);
+                result->message = result->pack_index.status_message;
+            }
+        } else if (request.op == WordCloudOp::kSubmit) {
+            wqn::WqnWordReviewSubmission submission;
+            submission.word_id = request.word_id;
+            submission.outcome = request.outcome;
+            submission.mode = "sequential";
+            result->result = wqn::SubmitWordReview(token, submission, &result->submit);
+        } else if (request.op == WordCloudOp::kSearch) {
+            wqn::WqnWordSearchRequest search;
+            search.query = request.query;
+            search.limit = 8;
+            result->result = wqn::SearchWords(token, search, &result->search);
+        } else if (request.op == WordCloudOp::kAiLookup) {
+            wqn::WqnWordAiLookupRequest lookup;
+            lookup.query = request.query;
+            result->result = wqn::LookupWordWithAi(token, lookup, &result->lookup);
+        } else {
+            result->result = ESP_ERR_INVALID_ARG;
+        }
+
+        if (result->result != ESP_OK) {
+            std::string after_token;
+            result->auth_required = !LoadValidTokenForTodo(&after_token);
+        }
+        SendWordCloudResult(result);
     }
 }
 
@@ -1391,10 +2457,12 @@ void TodoCloudTask(void*)
         }
 
         if (request.op == TodoCloudOp::kRefresh) {
-            result->result = wqn::FetchTodayPendingTodos(token, &result->page);
+            wqn::WqnTodoTimelineRequest timeline_request;
+            timeline_request.cursor = request.cursor;
+            timeline_request.limit = 24;
+            result->result = wqn::FetchTodoTimeline(token, timeline_request, &result->page);
         } else if (request.op == TodoCloudOp::kComplete) {
-            result->result =
-                wqn::CompleteTodo(token, request.todo_id, CurrentIsoTimestamp(), &result->todo);
+            result->result = wqn::CompleteTodo(token, request.todo_id, &result->todo);
         } else {
             result->result = ESP_ERR_INVALID_ARG;
         }
@@ -1448,7 +2516,7 @@ bool RefreshTodosFromCloud(wqn::UiState* state)
 
     state->todo.sync_status = wqn::TodoSyncStatus::kLoading;
     wqn::WqnTodoListPage page;
-    const esp_err_t result = wqn::FetchTodayPendingTodos(token, &page);
+    const esp_err_t result = wqn::FetchTodoTimeline(token, &page);
     if (result == ESP_OK) {
         ApplyTodoList(state, std::move(page));
         return true;
@@ -1478,31 +2546,6 @@ RefreshSchedule CompleteSelectedTodo(wqn::UiState* state)
         return RefreshSchedule::kNone;
     }
 
-    {
-        std::string token;
-        if (!LoadValidTokenForTodo(&token)) {
-            state->todo.sync_status = wqn::TodoSyncStatus::kAuthRequired;
-            state->todo.status_message = "Pair again";
-            return RefreshSchedule::kCommit;
-        }
-
-        const std::string todo_id = state->todo.todos[selected].id;
-        if (!QueueTodoComplete(todo_id)) {
-            if (IsTodoCloudBusy()) {
-                state->todo.sync_status = wqn::TodoSyncStatus::kCompleting;
-                state->todo.status_message = "Completing";
-            } else {
-                state->todo.sync_status = wqn::TodoSyncStatus::kCompleteFailed;
-                state->todo.status_message = "Todo queue failed";
-            }
-            return RefreshSchedule::kCommit;
-        }
-
-        state->todo.sync_status = wqn::TodoSyncStatus::kCompleting;
-        state->todo.status_message = "Completing";
-        return RefreshSchedule::kCommit;
-    }
-
     std::string token;
     if (!LoadValidTokenForTodo(&token)) {
         state->todo.sync_status = wqn::TodoSyncStatus::kAuthRequired;
@@ -1511,30 +2554,19 @@ RefreshSchedule CompleteSelectedTodo(wqn::UiState* state)
     }
 
     const std::string todo_id = state->todo.todos[selected].id;
-    state->todo.sync_status = wqn::TodoSyncStatus::kCompleting;
-    wqn::WqnTodoItem completed;
-    const esp_err_t result = wqn::CompleteTodo(token, todo_id, CurrentIsoTimestamp(), &completed);
-    if (result != ESP_OK) {
-        std::string after_token;
-        if (!LoadValidTokenForTodo(&after_token)) {
-            state->todo.sync_status = wqn::TodoSyncStatus::kAuthRequired;
-            state->todo.status_message = "请重新配对";
+    if (!QueueTodoComplete(todo_id)) {
+        if (IsTodoCloudBusy()) {
+            state->todo.sync_status = wqn::TodoSyncStatus::kCompleting;
+            state->todo.status_message = "完成中";
         } else {
             state->todo.sync_status = wqn::TodoSyncStatus::kCompleteFailed;
-            state->todo.status_message = "完成失败";
+            state->todo.status_message = "Todo 完成排队失败";
         }
-        ESP_LOGW(kTag, "todo complete failed: %s", esp_err_to_name(result));
         return RefreshSchedule::kCommit;
     }
 
-    state->todo.todos.erase(state->todo.todos.begin() + selected);
-    if (state->todo.total_pending > 0) {
-        --state->todo.total_pending;
-    }
-    state->todo.sync_status = wqn::TodoSyncStatus::kCompleted;
-    state->todo.status_message = "已完成";
-    wqn::ClampUiSelection(state);
-    BuildHomeSummary(state);
+    state->todo.sync_status = wqn::TodoSyncStatus::kCompleting;
+    state->todo.status_message = "完成中";
     return RefreshSchedule::kCommit;
 }
 
@@ -1547,7 +2579,7 @@ void BuildHomeSummary(wqn::UiState* state)
     wqn::HomeSummary home;
     home.wifi_label = state->status.wifi_connected ? "WiFi" : "离线";
     BatteryReading battery = {};
-    home.battery_label = ReadBatteryStatus(&battery) ? std::to_string(battery.percent) + "%" : "--%";
+    home.battery_label = ReadBatteryStatus(&battery) ? BatteryLabel(battery) : "--%";
 
     // UI contract: one line only. Source priority is pomodoro > countdown > clock.
     home.primary_time_line = ChooseHomePrimaryTimeLine(state->time_app);
@@ -1578,6 +2610,16 @@ void BuildHomeSummary(wqn::UiState* state)
 
     state->home = std::move(home);
     wqn::ClampUiSelection(state);
+}
+
+void CheckBatteryProtection()
+{
+    BatteryReading battery = {};
+    if (ReadBatteryStatus(&battery)) {
+        CheckLowBatteryProtection(&battery);
+    } else {
+        CheckLowBatteryProtection(nullptr);
+    }
 }
 
 bool LoadUiState(wqn::UiState* state)
@@ -1625,6 +2667,7 @@ bool LoadUiState(wqn::UiState* state)
     state->status.wifi_connected = false;
 #endif
 
+    UpdateSettingsDiagnostics(state);
     wqn::ClampUiSelection(state);
     BuildHomeSummary(state);
     return true;
@@ -1703,8 +2746,163 @@ bool ScreenUsesClockMinute(const wqn::UiState& state)
     if (state.screen == wqn::UiScreen::kHome) {
         return !wqn::TimeAppHasActiveTimer(state.time_app);
     }
+    if (state.screen == wqn::UiScreen::kTodo) {
+        return true;
+    }
     return state.screen == wqn::UiScreen::kTime && state.time_app.tile == wqn::TimeTile::kClock &&
            !state.time_app.config_mode;
+}
+
+void OpenSettingsDialog(wqn::UiState* state, wqn::SettingsDialog dialog)
+{
+    if (state == nullptr) {
+        return;
+    }
+    UpdateSettingsDiagnostics(state);
+    state->settings.dialog = dialog;
+    if (dialog == wqn::SettingsDialog::kAutoSync) {
+        state->settings.auto_sync_selected = AutoSyncOptionIndex(state->settings.auto_sync_interval_min);
+    }
+}
+
+RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiState* state)
+{
+    if (state == nullptr || state->screen != wqn::UiScreen::kSettings || !event.HasEvent()) {
+        return RefreshSchedule::kNone;
+    }
+
+    const bool short_press = event.type == wqn::ButtonEventType::kShortPress;
+    const bool long_press = event.type == wqn::ButtonEventType::kLongPress;
+    const bool repeated_long_press = long_press && event.duration_ms >= kRepeatedLongPressMinDurationMs;
+    if (repeated_long_press) {
+        return RefreshSchedule::kNone;
+    }
+
+    if (event.type == wqn::ButtonEventType::kLongRelease) {
+        return RefreshSchedule::kNone;
+    }
+
+    if (state->settings.dialog == wqn::SettingsDialog::kAutoSync) {
+        if (short_press && event.button == wqn::ButtonId::kUp) {
+            if (state->settings.auto_sync_selected == 0) {
+                return RefreshSchedule::kNone;
+            }
+            --state->settings.auto_sync_selected;
+            return RefreshSchedule::kConfig;
+        }
+        if (short_press && event.button == wqn::ButtonId::kDownPower) {
+            if (state->settings.auto_sync_selected + 1 >= sizeof(kAutoSyncOptions) / sizeof(kAutoSyncOptions[0])) {
+                return RefreshSchedule::kNone;
+            }
+            ++state->settings.auto_sync_selected;
+            return RefreshSchedule::kConfig;
+        }
+        if (short_press && event.button == wqn::ButtonId::kConfirm) {
+            const uint32_t minutes = kAutoSyncOptions[state->settings.auto_sync_selected];
+            const esp_err_t result = wqn::SaveAutoSyncIntervalMinutes(minutes);
+            if (result == ESP_OK) {
+                state->settings.auto_sync_interval_min = minutes;
+                state->settings.notice = "自动同步已保存：" + wqn::AutoSyncIntervalLabel(minutes);
+                wqn::RequestOnlineSyncNow();
+            } else {
+                state->settings.notice = "自动同步保存失败";
+                ESP_LOGW(kTag, "save auto sync interval failed: %s", esp_err_to_name(result));
+            }
+            state->settings.dialog = wqn::SettingsDialog::kNone;
+            return RefreshSchedule::kCommit;
+        }
+        return RefreshSchedule::kNone;
+    }
+
+    if (state->settings.dialog == wqn::SettingsDialog::kBattery ||
+        state->settings.dialog == wqn::SettingsDialog::kStorage) {
+        if (event.button == wqn::ButtonId::kConfirm && (short_press || long_press)) {
+            state->settings.dialog = wqn::SettingsDialog::kNone;
+            return RefreshSchedule::kCommit;
+        }
+        return RefreshSchedule::kNone;
+    }
+
+    if (state->settings.dialog == wqn::SettingsDialog::kFactoryReset) {
+        if (long_press && event.button == wqn::ButtonId::kConfirm) {
+            state->settings.notice = "正在恢复出厂";
+            ESP_LOGW(kTag, "factory reset requested from settings page");
+            const esp_err_t reset_result = wqn::FactoryResetNvsAndRestart();
+            state->settings.notice = "恢复失败";
+            ESP_LOGE(kTag, "factory reset failed: %s", esp_err_to_name(reset_result));
+            return RefreshSchedule::kCommit;
+        }
+        if (short_press && event.button == wqn::ButtonId::kConfirm) {
+            state->settings.dialog = wqn::SettingsDialog::kNone;
+            state->settings.notice = "已取消恢复出厂";
+            return RefreshSchedule::kCommit;
+        }
+        return RefreshSchedule::kNone;
+    }
+
+    if (long_press && event.button == wqn::ButtonId::kConfirm) {
+        state->screen = wqn::UiScreen::kHome;
+        BuildHomeSummary(state);
+        return RefreshSchedule::kCommit;
+    }
+    if (long_press && event.button == wqn::ButtonId::kUp) {
+        wqn::HandleUiInput(state, wqn::UiInput::kTopPrevious);
+        BuildHomeSummary(state);
+        return RefreshSchedule::kCommit;
+    }
+    if (long_press && event.button == wqn::ButtonId::kDownPower) {
+        wqn::HandleUiInput(state, wqn::UiInput::kTopNext);
+        BuildHomeSummary(state);
+        return RefreshSchedule::kCommit;
+    }
+
+    if (!short_press) {
+        return RefreshSchedule::kNone;
+    }
+
+    if (event.button == wqn::ButtonId::kUp) {
+        if (state->settings.selected == 0) {
+            return RefreshSchedule::kNone;
+        }
+        --state->settings.selected;
+        return RefreshSchedule::kCommit;
+    }
+    if (event.button == wqn::ButtonId::kDownPower) {
+        if (state->settings.selected + 1 >= kSettingsItemCount) {
+            return RefreshSchedule::kNone;
+        }
+        ++state->settings.selected;
+        return RefreshSchedule::kCommit;
+    }
+    if (event.button != wqn::ButtonId::kConfirm) {
+        return RefreshSchedule::kNone;
+    }
+
+    switch (state->settings.selected) {
+        case 0:
+            wqn::RequestOnlineSyncNow();
+            state->settings.sync_status = "已请求同步";
+            state->settings.notice = "已请求同步";
+            return RefreshSchedule::kCommit;
+        case 1:
+            OpenSettingsDialog(state, wqn::SettingsDialog::kAutoSync);
+            return RefreshSchedule::kCommit;
+        case 2:
+            OpenSettingsDialog(state, wqn::SettingsDialog::kBattery);
+            return RefreshSchedule::kCommit;
+        case 3:
+            OpenSettingsDialog(state, wqn::SettingsDialog::kStorage);
+            return RefreshSchedule::kCommit;
+        case 4:
+            UpdateSettingsDiagnostics(state);
+            state->settings.notice = "固件 " + state->settings.diagnostics.firmware_version;
+            return RefreshSchedule::kCommit;
+        case 5:
+            OpenSettingsDialog(state, wqn::SettingsDialog::kFactoryReset);
+            return RefreshSchedule::kCommit;
+        default:
+            return RefreshSchedule::kNone;
+    }
 }
 
 RefreshSchedule ApplyButtonEvent(const wqn::ButtonEvent& event, wqn::UiState* state)
@@ -1723,13 +2921,21 @@ RefreshSchedule ApplyButtonEvent(const wqn::ButtonEvent& event, wqn::UiState* st
     const bool time_running_exit =
         long_press && event.button == wqn::ButtonId::kConfirm && state->screen == wqn::UiScreen::kTime &&
         wqn::TimeAppHasActiveTimer(state->time_app);
+    if (state->screen == wqn::UiScreen::kSettings) {
+        return ApplySettingsButtonEvent(event, state);
+    }
     if (repeated_long_press && !time_value_edit_repeat && !time_running_exit) {
         return RefreshSchedule::kNone;
     }
     if (long_release && event.button == wqn::ButtonId::kConfirm && state->screen == wqn::UiScreen::kAi) {
-        if (state->ai.status == wqn::AiSessionStatus::kListening) {
+        if (state->ai.status == wqn::AiSessionStatus::kListening ||
+            state->ai.status == wqn::AiSessionStatus::kWaitingReply) {
 #if CONFIG_WQN_AI_ENABLE
             const esp_err_t ret = wqn::StopAiRecordingAndSubmit();
+            wqn::AiSessionState ai_state;
+            if (wqn::CopyAiSessionToUi(&ai_state)) {
+                state->ai = ai_state;
+            }
             if (ret != ESP_OK) {
                 ESP_LOGW(kTag, "AI recording stop failed: %s", esp_err_to_name(ret));
                 state->ai.status = wqn::AiSessionStatus::kError;
@@ -1772,6 +2978,23 @@ RefreshSchedule ApplyButtonEvent(const wqn::ButtonEvent& event, wqn::UiState* st
     if (!long_press && !long_release && event.button == wqn::ButtonId::kConfirm && state->screen == wqn::UiScreen::kTodo) {
         return CompleteSelectedTodo(state);
     }
+    if (!long_press && !long_release && state->screen == wqn::UiScreen::kTodo && event.button == wqn::ButtonId::kUp &&
+        state->todo.selected == 0 && state->todo.has_earlier && !state->todo.previous_cursor.empty()) {
+        if (QueueTodoRefreshCursor(state->todo.previous_cursor)) {
+            state->todo.sync_status = wqn::TodoSyncStatus::kLoading;
+            state->todo.status_message = "Todo syncing";
+            return RefreshSchedule::kSelection;
+        }
+    }
+    if (!long_press && !long_release && state->screen == wqn::UiScreen::kTodo && event.button == wqn::ButtonId::kDownPower &&
+        !state->todo.todos.empty() && state->todo.selected + 1 >= state->todo.todos.size() &&
+        state->todo.has_later && !state->todo.next_cursor.empty()) {
+        if (QueueTodoRefreshCursor(state->todo.next_cursor)) {
+            state->todo.sync_status = wqn::TodoSyncStatus::kLoading;
+            state->todo.status_message = "Todo syncing";
+            return RefreshSchedule::kSelection;
+        }
+    }
 
     switch (event.button) {
         case wqn::ButtonId::kUp:
@@ -1802,6 +3025,12 @@ RefreshSchedule ApplyButtonEvent(const wqn::ButtonEvent& event, wqn::UiState* st
     if (state->screen != old_screen) {
         if (state->screen == wqn::UiScreen::kTodo) {
             RefreshTodosFromCloud(state);
+        } else if (state->screen == wqn::UiScreen::kWord && state->word_app.cloud_sync_requested) {
+            if (!QueueWordReviewRefresh()) {
+                state->word_app.message = IsWordCloudBusy() ? "单词同步中" : "单词同步失败";
+            } else {
+                state->word_app.message = "单词同步中";
+            }
         }
         BuildHomeSummary(state);
         return RefreshSchedule::kCommit;
@@ -1818,6 +3047,32 @@ RefreshSchedule ApplyButtonEvent(const wqn::ButtonEvent& event, wqn::UiState* st
     }
     if (state->screen == wqn::UiScreen::kWord &&
         wqn::WordAppSignature(state->word_app) != old_word_signature) {
+        wqn::WqnWordReviewSubmission submission;
+        std::string word;
+        if (wqn::TakeWordReviewSubmission(&state->word_app, &submission, &word)) {
+            if (!QueueWordReviewSubmit(submission, word)) {
+                state->word_app.pending_submit_word_id = submission.word_id;
+                state->word_app.pending_submit_outcome = submission.outcome;
+                state->word_app.pending_submit_word = word;
+                state->word_app.message = IsWordCloudBusy() ? "单词同步中" : "单词同步失败";
+            }
+        }
+        wqn::WqnWordSearchRequest search_request;
+        if (wqn::TakeWordSearchRequest(&state->word_app, &search_request)) {
+            if (!QueueWordSearch(search_request)) {
+                state->word_app.search_pending = true;
+                state->word_app.pending_search_query = search_request.query.empty() ? search_request.prefix : search_request.query;
+                state->word_app.message = IsWordCloudBusy() ? "单词同步中" : "在线搜索失败";
+            }
+        }
+        wqn::WqnWordAiLookupRequest lookup_request;
+        if (wqn::TakeWordAiLookupRequest(&state->word_app, &lookup_request)) {
+            if (!QueueWordAiLookup(lookup_request)) {
+                state->word_app.ai_lookup_pending = true;
+                state->word_app.pending_ai_query = lookup_request.query.empty() ? lookup_request.prefix : lookup_request.query;
+                state->word_app.message = IsWordCloudBusy() ? "单词同步中" : "AI 查词失败";
+            }
+        }
         BuildHomeSummary(state);
         return RefreshSchedule::kSelection;
     }
@@ -1903,6 +3158,8 @@ std::string FrameSignature(const wqn::UiFrame& frame)
     }
     if (frame.screen == wqn::UiScreen::kAi) {
         signature.append("|ai:");
+        signature.append(frame.home.battery_label);
+        signature.push_back('/');
         signature.append(std::to_string(static_cast<int>(frame.ai.status)));
         signature.push_back('/');
         signature.append(frame.ai.user_text);
@@ -1930,6 +3187,12 @@ std::string FrameSignature(const wqn::UiFrame& frame)
         signature.append(std::to_string(frame.todo.total_pending));
         signature.push_back('/');
         signature.append(frame.todo.status_message);
+        signature.push_back('/');
+        signature.append(CurrentClockLabel());
+        signature.push_back('/');
+        signature.append(frame.home.wifi_label);
+        signature.push_back('/');
+        signature.append(frame.home.battery_label);
         for (const wqn::WqnTodoItem& item : frame.todo.todos) {
             signature.push_back('/');
             signature.append(item.id);
@@ -1945,7 +3208,9 @@ std::string FrameSignature(const wqn::UiFrame& frame)
     }
     if (frame.screen == wqn::UiScreen::kWord) {
         signature.append("|word:");
-        signature.append(frame.word_app.showing_back ? "back" : "front");
+        signature.append(std::to_string(static_cast<int>(frame.word_app.mode)));
+        signature.push_back('/');
+        signature.append(std::to_string(static_cast<int>(frame.word_app.home_selection)));
         signature.push_back('/');
         signature.append(std::to_string(frame.word_app.card_position));
         signature.push_back('/');
@@ -1957,7 +3222,62 @@ std::string FrameSignature(const wqn::UiFrame& frame)
         signature.push_back('/');
         signature.append(frame.word_app.meaning);
         signature.push_back('/');
+        signature.append(frame.word_app.dictionary_prefix);
+        signature.push_back('/');
+        signature.append(std::to_string(frame.word_app.dictionary_letter_selected));
+        signature.push_back('/');
+        signature.append(std::to_string(frame.word_app.dictionary_match_selected));
+        signature.push_back('/');
         signature.append(frame.word_app.hint);
+    }
+    if (frame.screen == wqn::UiScreen::kSettings) {
+        const wqn::SettingsDiagnosticsSnapshot& diag = frame.settings.diagnostics;
+        signature.append("|settings:");
+        signature.append(std::to_string(frame.settings.selected));
+        signature.push_back('/');
+        signature.append(std::to_string(static_cast<int>(frame.settings.dialog)));
+        signature.push_back('/');
+        signature.append(std::to_string(frame.settings.auto_sync_selected));
+        signature.push_back('/');
+        signature.append(std::to_string(frame.settings.auto_sync_interval_min));
+        signature.push_back('/');
+        signature.append(frame.settings.sync_status);
+        signature.push_back('/');
+        signature.append(frame.settings.notice);
+        signature.push_back('/');
+        signature.append(diag.mac_label);
+        signature.push_back('/');
+        signature.append(std::to_string(diag.adc_raw));
+        signature.push_back('/');
+        signature.append(std::to_string(diag.adc_mv));
+        signature.push_back('/');
+        signature.append(std::to_string(diag.battery_mv));
+        signature.push_back('/');
+        signature.append(std::to_string(diag.battery_percent));
+        signature.push_back('/');
+        signature.append(diag.charging ? "charging" : "not-charging");
+        signature.push_back('/');
+        signature.append(diag.full ? "full" : "not-full");
+        signature.push_back('/');
+        signature.append(std::to_string(diag.flash_size));
+        signature.push_back('/');
+        signature.append(std::to_string(diag.nvs_used_entries));
+        signature.push_back('/');
+        signature.append(std::to_string(diag.nvs_free_entries));
+        signature.push_back('/');
+        signature.append(std::to_string(diag.nvs_total_entries));
+        signature.push_back('/');
+        signature.append(std::to_string(diag.psram_total));
+        signature.push_back('/');
+        signature.append(std::to_string(diag.psram_free));
+        signature.push_back('/');
+        signature.append(diag.firmware_version);
+        signature.push_back('/');
+        signature.append(CurrentClockLabel());
+        signature.push_back('/');
+        signature.append(frame.home.wifi_label);
+        signature.push_back('/');
+        signature.append(frame.home.battery_label);
     }
     for (const wqn::UiLine& line : frame.lines) {
         signature.push_back('|');
@@ -2003,8 +3323,14 @@ esp_err_t RenderFrameToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
     if (frame.screen == wqn::UiScreen::kAi) {
         return RenderAiToEpd(frame, schedule);
     }
+    if (frame.screen == wqn::UiScreen::kTodo) {
+        return RenderTodoToEpd(frame, schedule);
+    }
     if (frame.screen == wqn::UiScreen::kWord) {
         return RenderWordToEpd(frame, schedule);
+    }
+    if (frame.screen == wqn::UiScreen::kSettings) {
+        return RenderSettingsToEpd(frame, schedule);
     }
 
     wqn::ClearEpdFramebuffer(true);
@@ -2176,6 +3502,7 @@ void DeviceUiTask(void*)
 
     wqn::UiState state;
     LoadUiState(&state);
+    CheckBatteryProtection();
     std::string last_clock_label = CurrentClockLabel();
     std::string last_frame_signature;
     {
@@ -2202,6 +3529,18 @@ void DeviceUiTask(void*)
                         refresh_schedule = StrongerSchedule(refresh_schedule, RefreshSchedule::kCommit);
                     }
                     delete todo_result;
+                }
+            }
+        }
+        if (g_word_result_queue != nullptr) {
+            WordCloudResult* word_result = nullptr;
+            while (xQueueReceive(g_word_result_queue, &word_result, 0) == pdTRUE) {
+                g_word_cloud_busy = false;
+                if (word_result != nullptr) {
+                    if (ApplyWordCloudResult(&state, *word_result) && state.screen == wqn::UiScreen::kWord) {
+                        refresh_schedule = StrongerSchedule(refresh_schedule, RefreshSchedule::kCommit);
+                    }
+                    delete word_result;
                 }
             }
         }
@@ -2237,6 +3576,7 @@ void DeviceUiTask(void*)
         if (now - last_status_refresh >= kStatusRefreshDelay) {
             const std::string before_signature = FrameSignature(wqn::RenderUiFrame(state));
             LoadUiState(&state);
+            CheckBatteryProtection();
             const std::string after_signature = FrameSignature(wqn::RenderUiFrame(state));
             if (after_signature != before_signature && refresh_schedule == RefreshSchedule::kNone) {
                 refresh_schedule = RefreshSchedule::kSelection;
@@ -2291,6 +3631,20 @@ esp_err_t StartDeviceUiIfEnabled()
         }
     }
 
+    if (g_word_request_queue == nullptr) {
+        g_word_request_queue = xQueueCreate(3, sizeof(WordCloudRequest));
+        if (g_word_request_queue == nullptr) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
+    if (g_word_result_queue == nullptr) {
+        g_word_result_queue = xQueueCreate(3, sizeof(WordCloudResult*));
+        if (g_word_result_queue == nullptr) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
     if (g_refresh_task == nullptr) {
         const BaseType_t refresh_created =
             xTaskCreate(EpdRefreshTask, "wqn_epd_refresh", 8192, nullptr, 1, &g_refresh_task);
@@ -2305,6 +3659,15 @@ esp_err_t StartDeviceUiIfEnabled()
             xTaskCreate(TodoCloudTask, "wqn_todo_cloud", 8192, nullptr, 3, &g_todo_task);
         if (todo_created != pdPASS) {
             g_todo_task = nullptr;
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
+    if (g_word_task == nullptr) {
+        const BaseType_t word_created =
+            xTaskCreate(WordCloudTask, "wqn_word_cloud", 8192, nullptr, 3, &g_word_task);
+        if (word_created != pdPASS) {
+            g_word_task = nullptr;
             return ESP_ERR_NO_MEM;
         }
     }

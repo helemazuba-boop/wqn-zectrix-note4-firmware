@@ -29,7 +29,7 @@ constexpr char kTag[] = "wqn_power";
 constexpr gpio_num_t kConfirmWake = GPIO_NUM_0;
 constexpr gpio_num_t kDownPowerWake = GPIO_NUM_18;
 constexpr gpio_num_t kRtcIntWake = GPIO_NUM_5;
-constexpr gpio_num_t kVbatHold = GPIO_NUM_17;
+constexpr gpio_num_t kBoardPowerLatch = GPIO_NUM_17;
 constexpr gpio_num_t kEpdPower = GPIO_NUM_6;
 constexpr gpio_num_t kAudioPower = GPIO_NUM_42;
 constexpr gpio_num_t kAudioAmp = GPIO_NUM_46;
@@ -105,7 +105,7 @@ void ReleaseDeepSleepHolds()
     gpio_hold_dis(kAudioAmp);
     gpio_hold_dis(kNfcPower);
     gpio_hold_dis(kLed);
-    gpio_hold_dis(kVbatHold);
+    gpio_hold_dis(kBoardPowerLatch);
 }
 
 void NoteUserActivity()
@@ -136,7 +136,7 @@ esp_err_t PrepareForDeepSleep()
     HoldOutput(kAudioAmp, 0);
     HoldOutput(kNfcPower, 0);
     HoldOutput(kLed, 1);
-    HoldOutput(kVbatHold, 1);
+    HoldOutput(kBoardPowerLatch, 1);
     gpio_deep_sleep_hold_en();
 
     const uint64_t wake_mask =
@@ -177,6 +177,27 @@ void EnterDeepSleepIfEnabled()
     ESP_LOGI(kTag, "entering deep sleep");
     esp_deep_sleep_start();
 #endif
+}
+
+void ShutdownForBatteryDepleted()
+{
+    ESP_LOGW(kTag, "Battery depleted, shutting down");
+
+    esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+
+    PowerOffEpd();
+    HoldOutput(kEpdPower, 0);
+    HoldOutput(kAudioPower, 0);
+    HoldOutput(kAudioAmp, 0);
+    HoldOutput(kNfcPower, 0);
+    HoldOutput(kLed, 1);
+
+    gpio_deep_sleep_hold_dis();
+    gpio_hold_dis(kBoardPowerLatch);
+    gpio_set_level(kBoardPowerLatch, 0);
+
+    ESP_LOGI(kTag, "entering depleted-battery deep sleep with PWR_ON latch released");
+    esp_deep_sleep_start();
 }
 
 void PowerOffEpdAfterIdleIfNeeded()

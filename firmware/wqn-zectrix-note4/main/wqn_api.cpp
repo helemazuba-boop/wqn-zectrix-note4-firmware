@@ -490,8 +490,17 @@ void ParseAiActions(cJSON* array, std::vector<wqn::WqnAiAction>* actions)
         action.notebook_id = GetOptionalString(item, "notebook_id");
         action.note_id = GetOptionalString(item, "note_id");
         action.todo_id = GetOptionalString(item, "todo_id");
+        action.word_id = GetOptionalString(item, "word_id");
+        if (action.word_id.empty()) {
+            action.word_id = GetOptionalString(item, "word_entry_id");
+        }
+        action.deck_id = GetOptionalString(item, "deck_id");
+        action.word = GetOptionalString(item, "word");
+        action.problem_set_id = GetOptionalString(item, "problem_set_id");
+        action.problem_id = GetOptionalString(item, "problem_id");
         action.title = GetOptionalString(item, "title");
         action.status = GetOptionalString(item, "status");
+        action.outcome = GetOptionalString(item, "outcome");
         action.due_at = GetOptionalString(item, "due_at");
         action.reminder_at = GetOptionalString(item, "reminder_at");
         if (!action.type.empty()) {
@@ -609,6 +618,284 @@ esp_err_t ParseTodoObject(cJSON* item, int index, wqn::WqnTodoItem* todo)
 
     *todo = std::move(parsed);
     return ESP_OK;
+}
+
+int FindNearestDueTodoIndex(const std::vector<wqn::WqnTodoItem>& todos, const std::string& server_time)
+{
+    if (todos.empty()) {
+        return -1;
+    }
+
+    int nearest_future = -1;
+    std::string nearest_future_due;
+    int nearest_past = -1;
+    std::string nearest_past_due;
+    for (size_t i = 0; i < todos.size(); ++i) {
+        const std::string& due = todos[i].due_at;
+        if (due.empty()) {
+            continue;
+        }
+        if (!server_time.empty() && due < server_time) {
+            if (nearest_past < 0 || due > nearest_past_due) {
+                nearest_past = static_cast<int>(i);
+                nearest_past_due = due;
+            }
+        } else if (nearest_future < 0 || due < nearest_future_due) {
+            nearest_future = static_cast<int>(i);
+            nearest_future_due = due;
+        }
+    }
+    if (nearest_future >= 0) {
+        return nearest_future;
+    }
+    if (nearest_past >= 0) {
+        return nearest_past;
+    }
+    return 0;
+}
+
+bool IsValidWordStatus(const std::string& status)
+{
+    return status.empty() ||
+           status == "new" ||
+           status == "learning" ||
+           status == "review" ||
+           status == "mastered";
+}
+
+esp_err_t ParseWordDeckObject(cJSON* item, int index, wqn::WqnWordDeck* deck)
+{
+    if (!cJSON_IsObject(item) || deck == nullptr) {
+        ESP_LOGW(kTag, "word deck response contains non-object at index=%d", index);
+        return ESP_FAIL;
+    }
+
+    wqn::WqnWordDeck parsed;
+    parsed.id = GetOptionalString(item, "id");
+    parsed.title = GetOptionalString(item, "title");
+    parsed.description = GetOptionalString(item, "description");
+    parsed.source = GetOptionalString(item, "source");
+    parsed.language = GetOptionalString(item, "language");
+    parsed.target_language = GetOptionalString(item, "target_language");
+    parsed.updated_at = GetOptionalString(item, "updated_at");
+    parsed.is_system = GetOptionalBool(item, "is_system");
+    parsed.deleted = GetOptionalBool(item, "deleted");
+    parsed.revision = GetOptionalInt(item, "revision");
+    parsed.word_count = GetOptionalInt(item, "word_count");
+    parsed.due_count = GetOptionalInt(item, "due_count");
+    parsed.mastered_count = GetOptionalInt(item, "mastered_count");
+
+    if (parsed.id.empty()) {
+        ESP_LOGW(kTag, "word deck missing id at index=%d", index);
+        return ESP_FAIL;
+    }
+    if (!parsed.deleted && parsed.title.empty()) {
+        ESP_LOGW(kTag, "word deck missing title at index=%d", index);
+        return ESP_FAIL;
+    }
+    if (parsed.source.empty()) {
+        parsed.source = parsed.is_system ? "system" : "user";
+    }
+
+    *deck = std::move(parsed);
+    return ESP_OK;
+}
+
+esp_err_t ParseWordEntryObject(cJSON* item, int index, wqn::WqnWordEntry* entry)
+{
+    if (!cJSON_IsObject(item) || entry == nullptr) {
+        ESP_LOGW(kTag, "word entry response contains non-object at index=%d", index);
+        return ESP_FAIL;
+    }
+
+    wqn::WqnWordEntry parsed;
+    parsed.id = GetOptionalString(item, "id");
+    parsed.deck_id = GetOptionalString(item, "deck_id");
+    parsed.word = GetOptionalString(item, "word");
+    parsed.normalized_word = GetOptionalString(item, "normalized_word");
+    parsed.phonetic = GetOptionalString(item, "phonetic");
+    parsed.meaning = GetOptionalString(item, "meaning");
+    parsed.example = GetOptionalString(item, "example");
+    parsed.example_translation = GetOptionalString(item, "example_translation");
+    parsed.part_of_speech = GetOptionalString(item, "part_of_speech");
+    parsed.status = GetOptionalString(item, "status");
+    parsed.due_at = GetOptionalString(item, "due_at");
+    parsed.deleted = GetOptionalBool(item, "deleted");
+    parsed.revision = GetOptionalInt(item, "revision");
+
+    if (parsed.id.empty()) {
+        ESP_LOGW(kTag, "word entry missing id at index=%d", index);
+        return ESP_FAIL;
+    }
+    if (!parsed.deleted && (parsed.word.empty() || parsed.meaning.empty())) {
+        ESP_LOGW(kTag, "word entry missing word/meaning at index=%d", index);
+        return ESP_FAIL;
+    }
+    if (!IsValidWordStatus(parsed.status)) {
+        ESP_LOGW(kTag, "word entry unsupported status=%s at index=%d", parsed.status.c_str(), index);
+        return ESP_FAIL;
+    }
+
+    *entry = std::move(parsed);
+    return ESP_OK;
+}
+
+esp_err_t ParseWordProgressObject(cJSON* item, int index, wqn::WqnWordProgress* progress)
+{
+    if (!cJSON_IsObject(item) || progress == nullptr) {
+        ESP_LOGW(kTag, "word progress response contains non-object at index=%d", index);
+        return ESP_FAIL;
+    }
+
+    wqn::WqnWordProgress parsed;
+    parsed.word_id = GetOptionalString(item, "word_id");
+    if (parsed.word_id.empty()) {
+        parsed.word_id = GetOptionalString(item, "word_entry_id");
+    }
+    if (parsed.word_id.empty()) {
+        parsed.word_id = GetOptionalString(item, "id");
+    }
+    parsed.status = GetOptionalString(item, "status");
+    parsed.due_at = GetOptionalString(item, "due_at");
+    parsed.interval_days = GetOptionalInt(item, "interval_days");
+    parsed.correct_streak = GetOptionalInt(item, "correct_streak");
+    parsed.lapses = GetOptionalInt(item, "lapses");
+    parsed.reviewed_count = GetOptionalInt(item, "reviewed_count");
+    parsed.known_count = GetOptionalInt(item, "known_count");
+    parsed.unknown_count = GetOptionalInt(item, "unknown_count");
+    parsed.revision = GetOptionalInt(item, "revision");
+
+    if (parsed.word_id.empty()) {
+        ESP_LOGW(kTag, "word progress missing word_id at index=%d", index);
+        return ESP_FAIL;
+    }
+    if (!IsValidWordStatus(parsed.status)) {
+        ESP_LOGW(kTag, "word progress unsupported status=%s at index=%d", parsed.status.c_str(), index);
+        return ESP_FAIL;
+    }
+
+    *progress = std::move(parsed);
+    return ESP_OK;
+}
+
+esp_err_t ParseWordPackManifestItem(cJSON* item, int index, wqn::WqnWordPackManifestItem* pack)
+{
+    if (!cJSON_IsObject(item) || pack == nullptr) {
+        ESP_LOGW(kTag, "word pack manifest contains non-object at index=%d", index);
+        return ESP_FAIL;
+    }
+
+    wqn::WqnWordPackManifestItem parsed;
+    parsed.pack_id = GetOptionalString(item, "pack_id");
+    if (parsed.pack_id.empty()) {
+        parsed.pack_id = GetOptionalString(item, "id");
+    }
+    parsed.deck_id = GetOptionalString(item, "deck_id");
+    parsed.title = GetOptionalString(item, "title");
+    parsed.revision = GetOptionalString(item, "revision");
+    if (parsed.revision.empty()) {
+        const int revision = GetOptionalInt(item, "revision");
+        if (revision > 0) {
+            parsed.revision = std::to_string(revision);
+        }
+    }
+    parsed.schema_version = GetOptionalString(item, "schema_version");
+    if (parsed.schema_version.empty()) {
+        const int schema_version = GetOptionalInt(item, "schema_version");
+        if (schema_version > 0) {
+            parsed.schema_version = std::to_string(schema_version);
+        }
+    }
+    parsed.format = GetOptionalString(item, "format");
+    parsed.compression = GetOptionalString(item, "compression");
+    parsed.sha256 = GetOptionalString(item, "sha256");
+    parsed.download_url = GetOptionalString(item, "download_url");
+    parsed.entry_count = GetOptionalInt(item, "entry_count");
+    parsed.byte_size = GetOptionalInt(item, "byte_size");
+    if (parsed.byte_size <= 0) {
+        parsed.byte_size = GetOptionalInt(item, "bytes");
+    }
+
+    if (parsed.pack_id.empty() || parsed.deck_id.empty() || parsed.sha256.empty() || parsed.download_url.empty()) {
+        ESP_LOGW(kTag, "word pack manifest item missing required fields at index=%d", index);
+        return ESP_FAIL;
+    }
+    if (parsed.format.empty()) {
+        parsed.format = "jsonl";
+    }
+    if (parsed.compression.empty()) {
+        parsed.compression = "none";
+    }
+    if (parsed.schema_version.empty()) {
+        parsed.schema_version = "1";
+    }
+
+    *pack = std::move(parsed);
+    return ESP_OK;
+}
+
+void ParseLooseWordEntry(cJSON* item, wqn::WqnWordEntry* word)
+{
+    if (!cJSON_IsObject(item) || word == nullptr) {
+        return;
+    }
+    word->id = GetOptionalString(item, "id");
+    if (word->id.empty()) {
+        word->id = GetOptionalString(item, "word_id");
+    }
+    if (word->id.empty()) {
+        word->id = GetOptionalString(item, "word_entry_id");
+    }
+    word->deck_id = GetOptionalString(item, "deck_id");
+    word->word = GetOptionalString(item, "word");
+    word->normalized_word = GetOptionalString(item, "normalized_word");
+    word->phonetic = GetOptionalString(item, "phonetic");
+    word->meaning = GetOptionalString(item, "meaning");
+    word->example = GetOptionalString(item, "example");
+    word->example_translation = GetOptionalString(item, "example_translation");
+    word->part_of_speech = GetOptionalString(item, "part_of_speech");
+    word->status = GetOptionalString(item, "status");
+    word->due_at = GetOptionalString(item, "due_at");
+    word->revision = GetOptionalInt(item, "revision");
+}
+
+void ParseWordReviewActions(cJSON* array, std::vector<wqn::WqnWordReviewResultAction>* actions)
+{
+    if (actions == nullptr) {
+        return;
+    }
+    actions->clear();
+    if (!cJSON_IsArray(array)) {
+        return;
+    }
+
+    const int count = cJSON_GetArraySize(array);
+    actions->reserve(count);
+    for (int i = 0; i < count; ++i) {
+        cJSON* item = cJSON_GetArrayItem(array, i);
+        if (!cJSON_IsObject(item)) {
+            ESP_LOGW(kTag, "word review action contains non-object at index=%d", i);
+            continue;
+        }
+
+        wqn::WqnWordReviewResultAction action;
+        action.type = GetOptionalString(item, "type");
+        action.word_id = GetOptionalString(item, "word_id");
+        if (action.word_id.empty()) {
+            action.word_id = GetOptionalString(item, "word_entry_id");
+        }
+        action.word = GetOptionalString(item, "word");
+        action.problem_set_id = GetOptionalString(item, "problem_set_id");
+        action.problem_id = GetOptionalString(item, "problem_id");
+        action.deck_id = GetOptionalString(item, "deck_id");
+        action.title = GetOptionalString(item, "title");
+        action.status = GetOptionalString(item, "status");
+        action.outcome = GetOptionalString(item, "outcome");
+        action.due_at = GetOptionalString(item, "due_at");
+        if (!action.type.empty()) {
+            actions->push_back(std::move(action));
+        }
+    }
 }
 
 esp_err_t ParseProblemObject(cJSON* item, int index, wqn::WqnProblem* problem)
@@ -815,10 +1102,15 @@ esp_err_t ParseTodoListResponseImpl(const std::string& body, wqn::WqnTodoListPag
     }
 
     page->todos.clear();
+    page->previous_cursor.clear();
     page->next_cursor.clear();
+    page->has_earlier = false;
+    page->has_later = false;
     page->has_more = false;
     page->total = 0;
     page->server_time.clear();
+    page->selected_todo_id.clear();
+    page->selected_index = -1;
 
     JsonDocument document(body);
     if (!document.ok()) {
@@ -833,12 +1125,18 @@ esp_err_t ParseTodoListResponseImpl(const std::string& body, wqn::WqnTodoListPag
         return ESP_FAIL;
     }
 
+    page->previous_cursor = GetOptionalString(data, "previous_cursor");
     page->next_cursor = GetOptionalString(data, "next_cursor");
+    page->has_earlier = GetOptionalBool(data, "has_earlier");
+    page->has_later = GetOptionalBool(data, "has_later");
     page->has_more = GetOptionalBool(data, "has_more");
     page->total = GetOptionalInt(data, "total");
     page->server_time = GetOptionalString(data, "server_time");
+    page->selected_todo_id = GetOptionalString(data, "selected_todo_id");
+    cJSON* selected_index = cJSON_GetObjectItemCaseSensitive(data, "selected_index");
+    page->selected_index = cJSON_IsNumber(selected_index) ? selected_index->valueint : -1;
 
-    const int count = std::min(cJSON_GetArraySize(items), 8);
+    const int count = std::min(cJSON_GetArraySize(items), 24);
     page->todos.reserve(count);
     for (int i = 0; i < count; ++i) {
         wqn::WqnTodoItem todo;
@@ -851,6 +1149,17 @@ esp_err_t ParseTodoListResponseImpl(const std::string& body, wqn::WqnTodoListPag
     }
     if (page->total == 0) {
         page->total = cJSON_GetArraySize(items);
+    }
+    if (!page->selected_todo_id.empty()) {
+        for (size_t i = 0; i < page->todos.size(); ++i) {
+            if (page->todos[i].id == page->selected_todo_id) {
+                page->selected_index = static_cast<int>(i);
+                break;
+            }
+        }
+    }
+    if (page->selected_index < 0 || page->selected_index >= static_cast<int>(page->todos.size())) {
+        page->selected_index = FindNearestDueTodoIndex(page->todos, page->server_time);
     }
 
     return ESP_OK;
@@ -884,6 +1193,283 @@ esp_err_t ParseTodoCompleteResponseImpl(const std::string& body, wqn::WqnTodoIte
     return ESP_OK;
 }
 
+esp_err_t ParseWordSyncResponseImpl(const std::string& body, wqn::WqnWordSyncPage* page)
+{
+    if (page == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *page = wqn::WqnWordSyncPage{};
+
+    JsonDocument document(body);
+    if (!document.ok()) {
+        ESP_LOGW(kTag, "word sync response is not valid JSON");
+        return ESP_FAIL;
+    }
+
+    cJSON* data = cJSON_GetObjectItemCaseSensitive(document.root(), "data");
+    if (!GetSuccess(document.root()) || !cJSON_IsObject(data)) {
+        ESP_LOGW(kTag, "word sync response missing success/data");
+        return ESP_FAIL;
+    }
+
+    page->cursor = GetOptionalString(data, "cursor");
+    page->server_time = GetOptionalString(data, "server_time");
+
+    cJSON* decks = cJSON_GetObjectItemCaseSensitive(data, "decks");
+    cJSON* entries = cJSON_GetObjectItemCaseSensitive(data, "entries");
+    cJSON* progress = cJSON_GetObjectItemCaseSensitive(data, "progress");
+    if ((decks != nullptr && !cJSON_IsArray(decks)) ||
+        (entries != nullptr && !cJSON_IsArray(entries)) ||
+        (progress != nullptr && !cJSON_IsArray(progress))) {
+        ESP_LOGW(kTag, "word sync response has invalid array fields");
+        return ESP_FAIL;
+    }
+
+    if (cJSON_IsArray(decks)) {
+        const int count = cJSON_GetArraySize(decks);
+        page->decks.reserve(count);
+        for (int i = 0; i < count; ++i) {
+            wqn::WqnWordDeck deck;
+            const esp_err_t parsed = ParseWordDeckObject(cJSON_GetArrayItem(decks, i), i, &deck);
+            if (parsed != ESP_OK) {
+                ESP_LOGW(kTag, "skip invalid word deck at index=%d", i);
+                continue;
+            }
+            page->decks.push_back(std::move(deck));
+        }
+    }
+
+    if (cJSON_IsArray(entries)) {
+        const int count = cJSON_GetArraySize(entries);
+        page->entries.reserve(count);
+        for (int i = 0; i < count; ++i) {
+            wqn::WqnWordEntry entry;
+            const esp_err_t parsed = ParseWordEntryObject(cJSON_GetArrayItem(entries, i), i, &entry);
+            if (parsed != ESP_OK) {
+                ESP_LOGW(kTag, "skip invalid word entry at index=%d", i);
+                continue;
+            }
+            page->entries.push_back(std::move(entry));
+        }
+    }
+
+    if (cJSON_IsArray(progress)) {
+        const int count = cJSON_GetArraySize(progress);
+        page->progress.reserve(count);
+        for (int i = 0; i < count; ++i) {
+            wqn::WqnWordProgress item;
+            const esp_err_t parsed = ParseWordProgressObject(cJSON_GetArrayItem(progress, i), i, &item);
+            if (parsed != ESP_OK) {
+                ESP_LOGW(kTag, "skip invalid word progress at index=%d", i);
+                continue;
+            }
+            page->progress.push_back(std::move(item));
+        }
+    }
+
+    return ESP_OK;
+}
+
+esp_err_t ParseWordReviewQueueResponseImpl(const std::string& body, wqn::WqnWordReviewQueue* queue)
+{
+    if (queue == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *queue = wqn::WqnWordReviewQueue{};
+
+    JsonDocument document(body);
+    if (!document.ok()) {
+        ESP_LOGW(kTag, "word review queue response is not valid JSON");
+        return ESP_FAIL;
+    }
+
+    cJSON* data = cJSON_GetObjectItemCaseSensitive(document.root(), "data");
+    cJSON* words = cJSON_GetObjectItemCaseSensitive(data, "words");
+    if (!GetSuccess(document.root()) || !cJSON_IsObject(data) || !cJSON_IsArray(words)) {
+        ESP_LOGW(kTag, "word review queue response missing success/data/words");
+        return ESP_FAIL;
+    }
+
+    queue->mode = GetOptionalString(data, "mode");
+    queue->daily_target = GetOptionalInt(data, "daily_target");
+    queue->reviewed_today = GetOptionalInt(data, "reviewed_today");
+    queue->due_count = GetOptionalInt(data, "due_count");
+
+    const int count = cJSON_GetArraySize(words);
+    queue->words.reserve(count);
+    for (int i = 0; i < count; ++i) {
+        wqn::WqnWordEntry word;
+        const esp_err_t parsed = ParseWordEntryObject(cJSON_GetArrayItem(words, i), i, &word);
+        if (parsed != ESP_OK) {
+            ESP_LOGW(kTag, "skip invalid review word at index=%d", i);
+            continue;
+        }
+        queue->words.push_back(std::move(word));
+    }
+
+    return ESP_OK;
+}
+
+esp_err_t ParseWordReviewSubmitResponseImpl(const std::string& body, wqn::WqnWordReviewSubmitResult* result)
+{
+    if (result == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *result = wqn::WqnWordReviewSubmitResult{};
+
+    JsonDocument document(body);
+    if (!document.ok()) {
+        ESP_LOGW(kTag, "word review submit response is not valid JSON");
+        return ESP_FAIL;
+    }
+
+    cJSON* data = cJSON_GetObjectItemCaseSensitive(document.root(), "data");
+    if (!GetSuccess(document.root()) || !cJSON_IsObject(data)) {
+        ESP_LOGW(kTag, "word review submit response missing success/data");
+        return ESP_FAIL;
+    }
+
+    result->word_id = GetOptionalString(data, "word_id");
+    if (result->word_id.empty()) {
+        result->word_id = GetOptionalString(data, "word_entry_id");
+    }
+    result->status = GetOptionalString(data, "status");
+    result->due_at = GetOptionalString(data, "due_at");
+    if (result->word_id.empty() || !IsValidWordStatus(result->status)) {
+        ESP_LOGW(kTag, "word review submit response missing word_id or has invalid status");
+        return ESP_FAIL;
+    }
+    ParseWordReviewActions(cJSON_GetObjectItemCaseSensitive(data, "actions"), &result->actions);
+    return ESP_OK;
+}
+
+esp_err_t ParseWordSearchResponseImpl(const std::string& body, wqn::WqnWordSearchResult* result)
+{
+    if (result == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *result = wqn::WqnWordSearchResult{};
+
+    JsonDocument document(body);
+    if (!document.ok()) {
+        ESP_LOGW(kTag, "word search response is not valid JSON");
+        return ESP_FAIL;
+    }
+
+    cJSON* data = cJSON_GetObjectItemCaseSensitive(document.root(), "data");
+    cJSON* words = cJSON_GetObjectItemCaseSensitive(data, "words");
+    if (!GetSuccess(document.root()) || !cJSON_IsObject(data) || !cJSON_IsArray(words)) {
+        ESP_LOGW(kTag, "word search response missing success/data/words");
+        return ESP_FAIL;
+    }
+
+    result->prefix = GetOptionalString(data, "prefix");
+    const int word_count = cJSON_GetArraySize(words);
+    result->words.reserve(word_count);
+    for (int i = 0; i < word_count; ++i) {
+        wqn::WqnWordEntry word;
+        const esp_err_t parsed = ParseWordEntryObject(cJSON_GetArrayItem(words, i), i, &word);
+        if (parsed != ESP_OK) {
+            ESP_LOGW(kTag, "skip invalid search word at index=%d", i);
+            continue;
+        }
+        result->words.push_back(std::move(word));
+    }
+
+    cJSON* next_letters = cJSON_GetObjectItemCaseSensitive(data, "next_letters");
+    if (next_letters != nullptr && !cJSON_IsArray(next_letters)) {
+        ESP_LOGW(kTag, "word search response has invalid next_letters");
+        return ESP_FAIL;
+    }
+    if (cJSON_IsArray(next_letters)) {
+        const int letter_count = cJSON_GetArraySize(next_letters);
+        result->next_letters.reserve(letter_count);
+        for (int i = 0; i < letter_count; ++i) {
+            cJSON* item = cJSON_GetArrayItem(next_letters, i);
+            if (cJSON_IsString(item) && item->valuestring != nullptr && std::strlen(item->valuestring) > 0) {
+                result->next_letters.emplace_back(item->valuestring);
+            }
+        }
+    }
+
+    return ESP_OK;
+}
+
+esp_err_t ParseWordPackManifestResponseImpl(const std::string& body, wqn::WqnWordPackManifest* manifest)
+{
+    if (manifest == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *manifest = wqn::WqnWordPackManifest{};
+
+    JsonDocument document(body);
+    if (!document.ok()) {
+        ESP_LOGW(kTag, "word pack manifest response is not valid JSON");
+        return ESP_FAIL;
+    }
+
+    cJSON* data = cJSON_GetObjectItemCaseSensitive(document.root(), "data");
+    cJSON* packs = cJSON_GetObjectItemCaseSensitive(data, "packs");
+    if (!GetSuccess(document.root()) || !cJSON_IsObject(data) || !cJSON_IsArray(packs)) {
+        ESP_LOGW(kTag, "word pack manifest response missing success/data/packs");
+        return ESP_FAIL;
+    }
+
+    manifest->server_time = GetOptionalString(data, "server_time");
+    const int count = cJSON_GetArraySize(packs);
+    manifest->packs.reserve(count);
+    for (int i = 0; i < count; ++i) {
+        wqn::WqnWordPackManifestItem item;
+        const esp_err_t parsed = ParseWordPackManifestItem(cJSON_GetArrayItem(packs, i), i, &item);
+        if (parsed != ESP_OK) {
+            ESP_LOGW(kTag, "skip invalid word pack manifest item at index=%d", i);
+            continue;
+        }
+        manifest->packs.push_back(std::move(item));
+    }
+    return ESP_OK;
+}
+
+esp_err_t ParseWordAiLookupResponseImpl(const std::string& body, wqn::WqnWordAiLookupResult* result)
+{
+    if (result == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *result = wqn::WqnWordAiLookupResult{};
+
+    JsonDocument document(body);
+    if (!document.ok()) {
+        ESP_LOGW(kTag, "word AI lookup response is not valid JSON");
+        return ESP_FAIL;
+    }
+
+    cJSON* data = cJSON_GetObjectItemCaseSensitive(document.root(), "data");
+    cJSON* word = cJSON_GetObjectItemCaseSensitive(data, "lookup");
+    if (!cJSON_IsObject(word)) {
+        word = cJSON_GetObjectItemCaseSensitive(data, "word");
+    }
+    if (!GetSuccess(document.root()) || !cJSON_IsObject(data) || !cJSON_IsObject(word)) {
+        ESP_LOGW(kTag, "word AI lookup response missing success/data/lookup");
+        return ESP_FAIL;
+    }
+    ParseLooseWordEntry(word, &result->word);
+    if (result->word.word.empty()) {
+        result->word.word = GetOptionalString(word, "query");
+    }
+    if (result->word.normalized_word.empty()) {
+        result->word.normalized_word = result->word.word;
+    }
+    if (result->word.meaning.empty()) {
+        ESP_LOGW(kTag, "word AI lookup response missing meaning");
+        return ESP_FAIL;
+    }
+    if (result->word.status.empty()) {
+        result->word.status = "new";
+    }
+    result->reply_text = GetOptionalString(data, "reply_text");
+    return ESP_OK;
+}
+
 std::string BuildProblemIndexPath(const wqn::WqnProblemIndexRequest& request)
 {
     std::string path = "/problem-index?limit=" + std::to_string(request.limit > 0 ? request.limit : 50);
@@ -899,9 +1485,83 @@ std::string BuildProblemIndexPath(const wqn::WqnProblemIndexRequest& request)
     return path;
 }
 
-std::string BuildTodoListPath()
+std::string BuildTodoListPath(const wqn::WqnTodoTimelineRequest& request)
 {
-    return "/todos?scope=today&status=pending&limit=8";
+    const int limit = std::clamp(request.limit > 0 ? request.limit : 24, 1, 24);
+    std::string path = "/todos?scope=timeline&status=pending&limit=" + std::to_string(limit);
+    if (!request.cursor.empty()) {
+        path += "&cursor=" + UrlEncode(request.cursor);
+    }
+    return path;
+}
+
+int ClampRequestLimit(int value, int fallback, int maximum)
+{
+    return std::clamp(value > 0 ? value : fallback, 1, maximum);
+}
+
+std::string BuildWordSyncPath(const wqn::WqnWordSyncRequest& request)
+{
+    const int limit = ClampRequestLimit(request.limit, 200, 200);
+    std::string path = "/words/sync?";
+    if (!request.cursor.empty()) {
+        path += "since=" + UrlEncode(request.cursor) + "&";
+    }
+    path += "limit=" + std::to_string(limit);
+    return path;
+}
+
+std::string BuildWordReviewQueuePath(const wqn::WqnWordReviewQueueRequest& request)
+{
+    const std::string mode = request.mode.empty() ? "sequential" : request.mode;
+    const int limit = ClampRequestLimit(request.limit, 20, 50);
+    return "/words/review?mode=" + UrlEncode(mode) + "&limit=" + std::to_string(limit);
+}
+
+std::string BuildWordSearchPath(const wqn::WqnWordSearchRequest& request)
+{
+    const int limit = ClampRequestLimit(request.limit, 8, 50);
+    std::string path = "/words/search?";
+    if (!request.query.empty()) {
+        path += "q=" + UrlEncode(request.query);
+    } else {
+        path += "prefix=" + UrlEncode(request.prefix);
+    }
+    path += "&limit=" + std::to_string(limit);
+    return path;
+}
+
+std::string BuildWordPackDownloadUrl(const std::string& download_url)
+{
+    if (download_url.rfind("http://", 0) == 0 || download_url.rfind("https://", 0) == 0) {
+        return download_url;
+    }
+    constexpr char kEsp32Prefix[] = "/api/esp32";
+    if (download_url.rfind(kEsp32Prefix, 0) == 0) {
+        return BuildUrl(download_url.substr(std::strlen(kEsp32Prefix)));
+    }
+    return BuildUrl(download_url);
+}
+
+esp_err_t BuildWordAiLookupBody(const wqn::WqnWordAiLookupRequest& request, std::string* body)
+{
+    if (body == nullptr || (request.query.empty() && request.prefix.empty())) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    cJSON* root = cJSON_CreateObject();
+    if (root == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
+    const std::string word = !request.query.empty() ? request.query : request.prefix;
+    cJSON_AddStringToObject(root, "word", word.c_str());
+    char* rendered = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (rendered == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
+    *body = rendered;
+    cJSON_free(rendered);
+    return ESP_OK;
 }
 
 void AddJsonString(cJSON* object, const char* key, const std::string& value)
@@ -959,7 +1619,7 @@ esp_err_t BuildReviewCompleteBody(const std::vector<wqn::WqnReviewResult>& resul
     return ESP_OK;
 }
 
-esp_err_t BuildTodoCompleteBody(const std::string& todo_id, const std::string& completed_at, std::string* body)
+esp_err_t BuildTodoCompleteBody(const std::string& todo_id, std::string* body)
 {
     if (body == nullptr || todo_id.empty()) {
         return ESP_ERR_INVALID_ARG;
@@ -972,8 +1632,32 @@ esp_err_t BuildTodoCompleteBody(const std::string& todo_id, const std::string& c
     }
 
     cJSON_AddStringToObject(root, "todo_id", todo_id.c_str());
-    AddJsonString(root, "completed_at", completed_at);
-    cJSON_AddStringToObject(root, "firmware_version", WQN_FIRMWARE_VERSION);
+
+    char* rendered = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (rendered == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
+    *body = rendered;
+    cJSON_free(rendered);
+    return ESP_OK;
+}
+
+esp_err_t BuildWordReviewBody(const wqn::WqnWordReviewSubmission& submission, std::string* body)
+{
+    if (body == nullptr || submission.word_id.empty() || submission.outcome.empty()) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    body->clear();
+
+    cJSON* root = cJSON_CreateObject();
+    if (root == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    cJSON_AddStringToObject(root, "word_id", submission.word_id.c_str());
+    cJSON_AddStringToObject(root, "outcome", submission.outcome.c_str());
+    cJSON_AddStringToObject(root, "mode", submission.mode.empty() ? "sequential" : submission.mode.c_str());
 
     char* rendered = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
@@ -1299,16 +1983,21 @@ esp_err_t UploadReviewComplete(const std::string& token, const std::vector<WqnRe
     return ESP_OK;
 }
 
-esp_err_t FetchTodayPendingTodos(const std::string& token, WqnTodoListPage* page)
+esp_err_t FetchTodoTimeline(const std::string& token, const WqnTodoTimelineRequest& request, WqnTodoListPage* page)
 {
     if (page == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
     page->todos.clear();
+    page->previous_cursor.clear();
     page->next_cursor.clear();
+    page->has_earlier = false;
+    page->has_later = false;
     page->has_more = false;
     page->total = 0;
     page->server_time.clear();
+    page->selected_todo_id.clear();
+    page->selected_index = -1;
 
     if (token.empty()) {
         return ESP_OK;
@@ -1320,7 +2009,7 @@ esp_err_t FetchTodayPendingTodos(const std::string& token, WqnTodoListPage* page
 
     ESP_RETURN_ON_ERROR(WaitForNetworkReadyForHttps(), kTag, "prepare network for todo-list");
 
-    const std::string url = BuildUrl(BuildTodoListPath());
+    const std::string url = BuildUrl(BuildTodoListPath(request));
     int status_code = 0;
     std::string body;
     esp_err_t result = HttpRequest("GET", url, &token, nullptr, &status_code, &body);
@@ -1339,7 +2028,18 @@ esp_err_t FetchTodayPendingTodos(const std::string& token, WqnTodoListPage* page
     return ParseTodoListResponse(body, page);
 }
 
-esp_err_t CompleteTodo(const std::string& token, const std::string& todo_id, const std::string& completed_at, WqnTodoItem* todo)
+esp_err_t FetchTodoTimeline(const std::string& token, WqnTodoListPage* page)
+{
+    WqnTodoTimelineRequest request;
+    return FetchTodoTimeline(token, request, page);
+}
+
+esp_err_t FetchTodayPendingTodos(const std::string& token, WqnTodoListPage* page)
+{
+    return FetchTodoTimeline(token, page);
+}
+
+esp_err_t CompleteTodo(const std::string& token, const std::string& todo_id, WqnTodoItem* todo)
 {
     if (todo_id.empty()) {
         return ESP_ERR_INVALID_ARG;
@@ -1358,7 +2058,7 @@ esp_err_t CompleteTodo(const std::string& token, const std::string& todo_id, con
     ESP_RETURN_ON_ERROR(WaitForNetworkReadyForHttps(), kTag, "prepare network for todo-complete");
 
     std::string request_body;
-    ESP_RETURN_ON_ERROR(BuildTodoCompleteBody(todo_id, completed_at, &request_body), kTag, "build todo-complete request");
+    ESP_RETURN_ON_ERROR(BuildTodoCompleteBody(todo_id, &request_body), kTag, "build todo-complete request");
 
     const std::string url = BuildUrl("/todos/complete");
     int status_code = 0;
@@ -1387,6 +2087,263 @@ esp_err_t CompleteTodo(const std::string& token, const std::string& todo_id, con
     return ESP_OK;
 }
 
+esp_err_t FetchWordSync(const std::string& token, const WqnWordSyncRequest& request, WqnWordSyncPage* page)
+{
+    if (page == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *page = WqnWordSyncPage{};
+    if (token.empty()) {
+        return ESP_OK;
+    }
+    const esp_err_t token_result = ValidateTokenOrClear(token, "word-sync");
+    if (token_result != ESP_OK) {
+        return token_result;
+    }
+
+    ESP_RETURN_ON_ERROR(WaitForNetworkReadyForHttps(), kTag, "prepare network for word-sync");
+
+    const std::string url = BuildUrl(BuildWordSyncPath(request));
+    int status_code = 0;
+    std::string body;
+    esp_err_t result = HttpRequest("GET", url, &token, nullptr, &status_code, &body);
+    if (result != ESP_OK) {
+        ESP_LOGW(kTag, "word-sync failed: %s", esp_err_to_name(result));
+        return result;
+    }
+    if (status_code == 401) {
+        return ClearTokenOnUnauthorized("word-sync");
+    }
+    if (status_code != 200) {
+        ESP_LOGW(kTag, "word-sync HTTP status=%d", status_code);
+        return ESP_FAIL;
+    }
+
+    return ParseWordSyncResponse(body, page);
+}
+
+esp_err_t FetchWordReviewQueue(const std::string& token, const WqnWordReviewQueueRequest& request, WqnWordReviewQueue* queue)
+{
+    if (queue == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *queue = WqnWordReviewQueue{};
+    if (token.empty()) {
+        return ESP_OK;
+    }
+    const esp_err_t token_result = ValidateTokenOrClear(token, "word-review-list");
+    if (token_result != ESP_OK) {
+        return token_result;
+    }
+
+    ESP_RETURN_ON_ERROR(WaitForNetworkReadyForHttps(), kTag, "prepare network for word-review-list");
+
+    const std::string url = BuildUrl(BuildWordReviewQueuePath(request));
+    int status_code = 0;
+    std::string body;
+    esp_err_t result = HttpRequest("GET", url, &token, nullptr, &status_code, &body);
+    if (result != ESP_OK) {
+        ESP_LOGW(kTag, "word-review-list failed: %s", esp_err_to_name(result));
+        return result;
+    }
+    if (status_code == 401) {
+        return ClearTokenOnUnauthorized("word-review-list");
+    }
+    if (status_code != 200) {
+        ESP_LOGW(kTag, "word-review-list HTTP status=%d", status_code);
+        return ESP_FAIL;
+    }
+
+    return ParseWordReviewQueueResponse(body, queue);
+}
+
+esp_err_t SubmitWordReview(const std::string& token, const WqnWordReviewSubmission& submission, WqnWordReviewSubmitResult* result)
+{
+    if (result != nullptr) {
+        *result = WqnWordReviewSubmitResult{};
+    }
+    if (token.empty() || submission.word_id.empty() || submission.outcome.empty()) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    const esp_err_t token_result = ValidateTokenOrClear(token, "word-review");
+    if (token_result != ESP_OK) {
+        return token_result;
+    }
+
+    ESP_RETURN_ON_ERROR(WaitForNetworkReadyForHttps(), kTag, "prepare network for word-review");
+
+    std::string request_body;
+    ESP_RETURN_ON_ERROR(BuildWordReviewBody(submission, &request_body), kTag, "build word-review request");
+
+    const std::string url = BuildUrl("/words/review");
+    int status_code = 0;
+    std::string body;
+    esp_err_t http_result = HttpRequest("POST", url, &token, &request_body, &status_code, &body);
+    if (http_result != ESP_OK) {
+        ESP_LOGW(kTag, "word-review failed: %s", esp_err_to_name(http_result));
+        return http_result;
+    }
+    if (status_code == 401) {
+        return ClearTokenOnUnauthorized("word-review");
+    }
+    if (status_code < 200 || status_code >= 300) {
+        ESP_LOGW(kTag, "word-review HTTP status=%d", status_code);
+        return ESP_FAIL;
+    }
+
+    if (result == nullptr) {
+        return ESP_OK;
+    }
+    return ParseWordReviewSubmitResponse(body, result);
+}
+
+esp_err_t SearchWords(const std::string& token, const WqnWordSearchRequest& request, WqnWordSearchResult* result)
+{
+    if (result == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *result = WqnWordSearchResult{};
+    if (request.query.empty() && request.prefix.empty()) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (token.empty()) {
+        return ESP_OK;
+    }
+    const esp_err_t token_result = ValidateTokenOrClear(token, "word-search");
+    if (token_result != ESP_OK) {
+        return token_result;
+    }
+
+    ESP_RETURN_ON_ERROR(WaitForNetworkReadyForHttps(), kTag, "prepare network for word-search");
+
+    const std::string url = BuildUrl(BuildWordSearchPath(request));
+    int status_code = 0;
+    std::string body;
+    esp_err_t http_result = HttpRequest("GET", url, &token, nullptr, &status_code, &body);
+    if (http_result != ESP_OK) {
+        ESP_LOGW(kTag, "word-search failed: %s", esp_err_to_name(http_result));
+        return http_result;
+    }
+    if (status_code == 401) {
+        return ClearTokenOnUnauthorized("word-search");
+    }
+    if (status_code != 200) {
+        ESP_LOGW(kTag, "word-search HTTP status=%d", status_code);
+        return ESP_FAIL;
+    }
+
+    return ParseWordSearchResponse(body, result);
+}
+
+esp_err_t FetchWordPackManifest(const std::string& token, WqnWordPackManifest* manifest)
+{
+    if (manifest == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *manifest = WqnWordPackManifest{};
+    if (token.empty()) {
+        return ESP_OK;
+    }
+    const esp_err_t token_result = ValidateTokenOrClear(token, "word-pack-manifest");
+    if (token_result != ESP_OK) {
+        return token_result;
+    }
+
+    ESP_RETURN_ON_ERROR(WaitForNetworkReadyForHttps(), kTag, "prepare network for word-pack-manifest");
+
+    const std::string url = BuildUrl("/words/packs/manifest");
+    int status_code = 0;
+    std::string body;
+    esp_err_t http_result = HttpRequest("GET", url, &token, nullptr, &status_code, &body);
+    if (http_result != ESP_OK) {
+        ESP_LOGW(kTag, "word-pack-manifest failed: %s", esp_err_to_name(http_result));
+        return http_result;
+    }
+    if (status_code == 401) {
+        return ClearTokenOnUnauthorized("word-pack-manifest");
+    }
+    if (status_code != 200) {
+        ESP_LOGW(kTag, "word-pack-manifest HTTP status=%d", status_code);
+        return ESP_FAIL;
+    }
+
+    return ParseWordPackManifestResponse(body, manifest);
+}
+
+esp_err_t DownloadWordPack(const std::string& token, const WqnWordPackManifestItem& item, std::string* body)
+{
+    if (body == nullptr || item.download_url.empty()) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    body->clear();
+    if (token.empty()) {
+        return ESP_OK;
+    }
+    const esp_err_t token_result = ValidateTokenOrClear(token, "word-pack-download");
+    if (token_result != ESP_OK) {
+        return token_result;
+    }
+
+    ESP_RETURN_ON_ERROR(WaitForNetworkReadyForHttps(), kTag, "prepare network for word-pack-download");
+
+    const std::string url = BuildWordPackDownloadUrl(item.download_url);
+    int status_code = 0;
+    esp_err_t http_result = HttpRequest("GET", url, &token, nullptr, &status_code, body);
+    if (http_result != ESP_OK) {
+        ESP_LOGW(kTag, "word-pack-download failed: %s", esp_err_to_name(http_result));
+        return http_result;
+    }
+    if (status_code == 401) {
+        return ClearTokenOnUnauthorized("word-pack-download");
+    }
+    if (status_code != 200) {
+        ESP_LOGW(kTag, "word-pack-download HTTP status=%d", status_code);
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
+esp_err_t LookupWordWithAi(const std::string& token, const WqnWordAiLookupRequest& request, WqnWordAiLookupResult* result)
+{
+    if (result == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *result = WqnWordAiLookupResult{};
+    if (request.query.empty() && request.prefix.empty()) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (token.empty()) {
+        return ESP_OK;
+    }
+    const esp_err_t token_result = ValidateTokenOrClear(token, "word-ai-lookup");
+    if (token_result != ESP_OK) {
+        return token_result;
+    }
+
+    ESP_RETURN_ON_ERROR(WaitForNetworkReadyForHttps(), kTag, "prepare network for word-ai-lookup");
+
+    std::string request_body;
+    ESP_RETURN_ON_ERROR(BuildWordAiLookupBody(request, &request_body), kTag, "build word-ai-lookup request");
+
+    const std::string url = BuildUrl("/words/ai-lookup");
+    int status_code = 0;
+    std::string body;
+    esp_err_t http_result = HttpRequest("POST", url, &token, &request_body, &status_code, &body);
+    if (http_result != ESP_OK) {
+        ESP_LOGW(kTag, "word-ai-lookup failed: %s", esp_err_to_name(http_result));
+        return http_result;
+    }
+    if (status_code == 401) {
+        return ClearTokenOnUnauthorized("word-ai-lookup");
+    }
+    if (status_code < 200 || status_code >= 300) {
+        ESP_LOGW(kTag, "word-ai-lookup HTTP status=%d", status_code);
+        return ESP_FAIL;
+    }
+
+    return ParseWordAiLookupResponse(body, result);
+}
+
 esp_err_t ParseTodoListResponse(const std::string& body, WqnTodoListPage* page)
 {
     return ParseTodoListResponseImpl(body, page);
@@ -1395,6 +2352,36 @@ esp_err_t ParseTodoListResponse(const std::string& body, WqnTodoListPage* page)
 esp_err_t ParseTodoCompleteResponse(const std::string& body, WqnTodoItem* todo)
 {
     return ParseTodoCompleteResponseImpl(body, todo);
+}
+
+esp_err_t ParseWordSyncResponse(const std::string& body, WqnWordSyncPage* page)
+{
+    return ParseWordSyncResponseImpl(body, page);
+}
+
+esp_err_t ParseWordReviewQueueResponse(const std::string& body, WqnWordReviewQueue* queue)
+{
+    return ParseWordReviewQueueResponseImpl(body, queue);
+}
+
+esp_err_t ParseWordReviewSubmitResponse(const std::string& body, WqnWordReviewSubmitResult* result)
+{
+    return ParseWordReviewSubmitResponseImpl(body, result);
+}
+
+esp_err_t ParseWordSearchResponse(const std::string& body, WqnWordSearchResult* result)
+{
+    return ParseWordSearchResponseImpl(body, result);
+}
+
+esp_err_t ParseWordPackManifestResponse(const std::string& body, WqnWordPackManifest* manifest)
+{
+    return ParseWordPackManifestResponseImpl(body, manifest);
+}
+
+esp_err_t ParseWordAiLookupResponse(const std::string& body, WqnWordAiLookupResult* result)
+{
+    return ParseWordAiLookupResponseImpl(body, result);
 }
 
 esp_err_t ParseAiChatResponseBody(const std::string& body, WqnAiChatResponse* response)

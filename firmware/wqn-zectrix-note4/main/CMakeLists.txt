@@ -17,6 +17,7 @@ idf_component_register(
         "time_app.cpp"
         "ui_model.cpp"
         "wifi_manager.cpp"
+        "word_pack.cpp"
         "word_app.cpp"
         "wqn_api.cpp"
     INCLUDE_DIRS "."
@@ -35,8 +36,10 @@ idf_component_register(
         esp_wifi
         json
         lwip
+        mbedtls
         nvs_flash
         spi_flash
+        spiffs
 )
 
 set(WQN_API_BASE "" CACHE STRING "Override the WQN ESP32 API base URL")

@@ -14,10 +14,10 @@ namespace wqn {
 enum class UiScreen {
     kAi,
     kTodo,
+    kSettings,
     kHome,
     kTime,
     kWord,
-    kStatus,
     kLibrary,
     kProblem,
     kSolution,
@@ -88,6 +88,10 @@ struct TodoUiState {
     std::string status_message;
     bool loaded_once = false;
     int total_pending = 0;
+    std::string previous_cursor;
+    std::string next_cursor;
+    bool has_earlier = false;
+    bool has_later = false;
 };
 
 struct HomeMetric {
@@ -112,6 +116,44 @@ struct HomeSummary {
     std::vector<HomeTask> tasks;
 };
 
+enum class SettingsDialog {
+    kNone,
+    kAutoSync,
+    kBattery,
+    kStorage,
+    kFactoryReset,
+};
+
+struct SettingsDiagnosticsSnapshot {
+    int adc_raw = 0;
+    int adc_mv = 0;
+    int battery_mv = 0;
+    int battery_percent = 0;
+    bool charging = false;
+    bool full = false;
+    uint32_t flash_size = 0;
+    size_t nvs_used_entries = 0;
+    size_t nvs_free_entries = 0;
+    size_t nvs_total_entries = 0;
+    size_t psram_total = 0;
+    size_t psram_free = 0;
+    size_t psram_used = 0;
+    std::string mac_label;
+    std::string firmware_version;
+    std::string board_id;
+    std::string idf_target;
+};
+
+struct SettingsAppState {
+    size_t selected = 0;
+    SettingsDialog dialog = SettingsDialog::kNone;
+    size_t auto_sync_selected = 0;
+    uint32_t auto_sync_interval_min = 0;
+    std::string sync_status;
+    std::string notice;
+    SettingsDiagnosticsSnapshot diagnostics;
+};
+
 struct UiRuntimeStatus {
     bool wifi_enabled = false;
     bool wifi_connected = false;
@@ -133,6 +175,7 @@ struct UiState {
     TimeAppState time_app;
     WordAppState word_app;
     TodoUiState todo;
+    SettingsAppState settings;
     HomeSummary home;
     std::vector<CachedProblem> problems;
 };
@@ -150,6 +193,7 @@ struct UiFrame {
     TodoUiState todo;
     TimeAppState time_app;
     WordAppSnapshot word_app;
+    SettingsAppState settings;
     size_t selected_home_task = 0;
     std::vector<UiLine> lines;
 };

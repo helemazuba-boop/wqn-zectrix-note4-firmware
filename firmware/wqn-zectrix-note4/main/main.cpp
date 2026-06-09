@@ -1,4 +1,5 @@
 #include <string>
+#include <cstring>
 #include <utility>
 #include <vector>
 
@@ -14,6 +15,7 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "esp_timer.h"
 #include "online_sync.h"
 #include "power_manager.h"
 #include "storage.h"
@@ -77,6 +79,14 @@ void ConfirmRunningApp()
 #if CONFIG_WQN_WIFI_STA_ENABLE
 
 TaskHandle_t g_wqn_online_task = nullptr;
+wqn::OnlineSyncSnapshot g_online_sync_snapshot = {};
+constexpr TickType_t kOnlineSyncRetryDelay = pdMS_TO_TICKS(10000);
+constexpr TickType_t kUnpairedPollingDelay = pdMS_TO_TICKS(2000);
+
+void SetOnlineSyncStatus(const char* status)
+{
+    std::snprintf(g_online_sync_snapshot.status, sizeof(g_online_sync_snapshot.status), "%s", status == nullptr ? "" : status);
+}
 
 bool LoadUsableToken(std::string* token)
 {
@@ -100,6 +110,12 @@ bool LoadUsableToken(std::string* token)
         return false;
     }
     return true;
+}
+
+bool HasUsableStoredToken()
+{
+    std::string token;
+    return LoadUsableToken(&token);
 }
 
 std::vector<wqn::CachedProblem> ToCachedProblems(const std::vector<wqn::WqnProblem>& problems)
@@ -327,12 +343,50 @@ bool RunWqnOnlineRound()
     return true;
 }
 
+TickType_t NextOnlineSyncWaitDelay(bool round_synced, bool has_token_after_round)
+{
+    if (!has_token_after_round) {
+        return kUnpairedPollingDelay;
+    }
+    if (round_synced) {
+        return wqn::GetConfiguredOnlineSyncDelayTicks();
+    }
+
+    const TickType_t configured_delay = wqn::GetConfiguredOnlineSyncDelayTicks();
+    return configured_delay == portMAX_DELAY ? portMAX_DELAY : kOnlineSyncRetryDelay;
+}
+
 void WqnOnlineTask(void*)
 {
     ESP_LOGI(kTag, "WQN online task started");
+    g_online_sync_snapshot.task_running = true;
+    SetOnlineSyncStatus("idle");
+    bool first_round = true;
     while (true) {
+        if (first_round && wqn::GetConfiguredOnlineSyncDelayTicks() == portMAX_DELAY && HasUsableStoredToken()) {
+            ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        }
+        first_round = false;
+
+        g_online_sync_snapshot.last_started_ms = esp_timer_get_time() / 1000;
+        SetOnlineSyncStatus("syncing");
         const bool synced = RunWqnOnlineRound();
-        ulTaskNotifyTake(pdTRUE, synced ? pdMS_TO_TICKS(60000) : pdMS_TO_TICKS(10000));
+        g_online_sync_snapshot.last_finished_ms = esp_timer_get_time() / 1000;
+        g_online_sync_snapshot.last_round_success = synced;
+        const bool has_token_after_round = HasUsableStoredToken();
+        if (synced) {
+            ++g_online_sync_snapshot.success_count;
+            SetOnlineSyncStatus("success");
+        } else {
+            ++g_online_sync_snapshot.failure_count;
+            SetOnlineSyncStatus(has_token_after_round ? "failed" : "waiting-pair");
+        }
+        const TickType_t delay = NextOnlineSyncWaitDelay(synced, has_token_after_round);
+        if (delay == portMAX_DELAY) {
+            ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        } else {
+            ulTaskNotifyTake(pdTRUE, delay);
+        }
     }
 }
 
@@ -354,11 +408,44 @@ namespace wqn {
 
 void NotifyOnlineSyncRequested()
 {
+    RequestOnlineSyncNow();
+}
+
+void RequestOnlineSyncNow()
+{
 #if CONFIG_WQN_WIFI_STA_ENABLE
     if (g_wqn_online_task != nullptr) {
         xTaskNotifyGive(g_wqn_online_task);
     }
 #endif
+}
+
+void GetOnlineSyncSnapshot(OnlineSyncSnapshot* snapshot)
+{
+    if (snapshot == nullptr) {
+        return;
+    }
+#if CONFIG_WQN_WIFI_STA_ENABLE
+    *snapshot = g_online_sync_snapshot;
+#else
+    *snapshot = {};
+    std::snprintf(snapshot->status, sizeof(snapshot->status), "%s", "wifi-disabled");
+#endif
+    uint32_t minutes = 0;
+    if (LoadAutoSyncIntervalMinutes(&minutes) == ESP_OK) {
+        snapshot->interval_minutes = minutes;
+    }
+}
+
+TickType_t GetConfiguredOnlineSyncDelayTicks()
+{
+    uint32_t minutes = 0;
+    if (LoadAutoSyncIntervalMinutes(&minutes) != ESP_OK || minutes == 0) {
+        return portMAX_DELAY;
+    }
+    const uint64_t milliseconds = static_cast<uint64_t>(minutes) * 60ULL * 1000ULL;
+    const uint64_t ticks = milliseconds / portTICK_PERIOD_MS;
+    return ticks > static_cast<uint64_t>(portMAX_DELAY - 1) ? portMAX_DELAY - 1 : static_cast<TickType_t>(ticks);
 }
 
 }  // namespace wqn
@@ -376,7 +463,7 @@ extern "C" void app_main(void)
 
     const bool contract_ok = wqn::RunContractFixtureSelfTest();
     if (!contract_ok) {
-        ESP_LOGE(kTag, "contract fixture self-test failed; network flow remains disabled");
+        ESP_LOGE(kTag, "contract fixture self-test failed; network flow will continue for pairing");
     }
 
     ConfirmRunningApp();
@@ -386,9 +473,7 @@ extern "C" void app_main(void)
     ESP_ERROR_CHECK_WITHOUT_ABORT(wqn::RunAudioSelfTestIfEnabled());
 
 #if CONFIG_WQN_WIFI_STA_ENABLE
-    if (contract_ok) {
-        ESP_ERROR_CHECK_WITHOUT_ABORT(StartWqnOnlineTask());
-    }
+    ESP_ERROR_CHECK_WITHOUT_ABORT(StartWqnOnlineTask());
 #else
     ESP_LOGI(kTag, "pairing flow disabled because WiFi STA is disabled");
 #endif

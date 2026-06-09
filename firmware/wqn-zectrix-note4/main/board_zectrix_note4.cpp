@@ -21,7 +21,7 @@ constexpr gpio_num_t kAudioPower = GPIO_NUM_42;
 constexpr gpio_num_t kAudioAmp = GPIO_NUM_46;
 constexpr gpio_num_t kLed = GPIO_NUM_3;
 constexpr gpio_num_t kNfcPower = GPIO_NUM_21;
-constexpr gpio_num_t kVbatPowerEnable = GPIO_NUM_17;
+constexpr gpio_num_t kBoardPowerLatch = GPIO_NUM_17;
 
 constexpr gpio_num_t kPageUp = GPIO_NUM_39;
 constexpr gpio_num_t kPageDownAndPowerDetect = GPIO_NUM_18;
@@ -67,7 +67,7 @@ esp_err_t InitZectrixNote4SafePins()
         (1ULL << kAudioAmp) |
         (1ULL << kNfcPower) |
         (1ULL << kLed) |
-        (1ULL << kVbatPowerEnable);
+        (1ULL << kBoardPowerLatch);
 
     ESP_RETURN_ON_ERROR(ConfigureOutputs(disabled_power_outputs), kTag, "configure power outputs");
 
@@ -76,7 +76,7 @@ esp_err_t InitZectrixNote4SafePins()
     gpio_set_level(kAudioAmp, 0);
     gpio_set_level(kNfcPower, 0);
     gpio_set_level(kLed, 1);
-    gpio_set_level(kVbatPowerEnable, 1);
+    gpio_set_level(kBoardPowerLatch, 1);
 
     const uint64_t epd_bus_pins =
         (1ULL << kEpdBusy) |
@@ -97,7 +97,7 @@ esp_err_t InitZectrixNote4SafePins()
         (1ULL << kNfcFd);
     ESP_RETURN_ON_ERROR(ConfigureInputs(button_and_status_inputs), kTag, "configure input pins");
 
-    ESP_LOGI(kTag, "safe pins ready: VBAT hold on, EPD/audio/amp/NFC off, LED off");
+    ESP_LOGI(kTag, "safe pins ready: PWR_ON latch on, EPD/audio/amp/NFC off, LED off");
     return ESP_OK;
 }
 

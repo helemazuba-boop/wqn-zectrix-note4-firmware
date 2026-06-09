@@ -8,6 +8,8 @@
 #include "config.h"
 #include "esp_check.h"
 #include "esp_log.h"
+#include "esp_spiffs.h"
+#include "esp_system.h"
 #include "nvs.h"
 #include "nvs_flash.h"
 #include "sdkconfig.h"
@@ -19,10 +21,17 @@ constexpr size_t kAccessTokenLength = 64;
 constexpr char kProblemsKey[] = "problems";
 constexpr char kPendingReviewsKey[] = "pending_reviews";
 constexpr char kAiSessionKey[] = "ai_session_day";
-constexpr char kAccessTokenSavedAtKey[] = "access_token_saved_at";
-constexpr char kAccessTokenExpiresAtKey[] = "access_token_expires_at";
+// ESP-IDF NVS keys are limited to 15 visible characters.
+constexpr char kAccessTokenSavedAtKey[] = "token_saved";
+constexpr char kAccessTokenExpiresAtKey[] = "token_exp";
+constexpr char kAutoSyncIntervalMinKey[] = "sync_min";
+static_assert(sizeof(kAccessTokenSavedAtKey) <= 16, "NVS key must fit ESP-IDF's 15-character limit");
+static_assert(sizeof(kAccessTokenExpiresAtKey) <= 16, "NVS key must fit ESP-IDF's 15-character limit");
+static_assert(sizeof(kAutoSyncIntervalMinKey) <= 16, "NVS key must fit ESP-IDF's 15-character limit");
 constexpr uint64_t kAccessTokenMaxAgeSeconds = 30ULL * 24ULL * 60ULL * 60ULL;
 constexpr std::time_t kMinReasonableUnixTime = 1704067200;  // 2024-01-01 UTC
+constexpr char kStoragePartitionLabel[] = "storage";
+constexpr char kStorageBasePath[] = "/storage";
 
 struct NvsHandle {
     ~NvsHandle()
@@ -217,6 +226,36 @@ bool ClockIsReasonable()
     return CurrentUnixTime() >= static_cast<uint64_t>(kMinReasonableUnixTime);
 }
 
+bool IsValidAutoSyncInterval(uint32_t minutes)
+{
+    return minutes == 0 || minutes == 15 || minutes == 30 || minutes == 60 || minutes == 240;
+}
+
+esp_err_t InitStoragePartition()
+{
+    esp_vfs_spiffs_conf_t config = {};
+    config.base_path = kStorageBasePath;
+    config.partition_label = kStoragePartitionLabel;
+    config.max_files = 8;
+    config.format_if_mount_failed = true;
+
+    esp_err_t result = esp_vfs_spiffs_register(&config);
+    if (result == ESP_ERR_INVALID_STATE) {
+        return ESP_OK;
+    }
+    ESP_RETURN_ON_ERROR(result, kTag, "mount storage SPIFFS");
+
+    size_t total = 0;
+    size_t used = 0;
+    result = esp_spiffs_info(kStoragePartitionLabel, &total, &used);
+    if (result == ESP_OK) {
+        ESP_LOGI(kTag, "storage SPIFFS ready: total=%u used=%u", static_cast<unsigned>(total), static_cast<unsigned>(used));
+    } else {
+        ESP_LOGW(kTag, "storage SPIFFS info failed: %s", esp_err_to_name(result));
+    }
+    return ESP_OK;
+}
+
 esp_err_t ClearAccessTokenKeys()
 {
     esp_err_t result = ClearNvsKey(WQN_NVS_ACCESS_TOKEN_KEY);
@@ -342,7 +381,7 @@ esp_err_t InitStorage()
     ESP_LOGW(kTag, "NVS encryption is disabled; access token is protected by local expiry metadata only");
 #endif
     ESP_LOGI(kTag, "NVS ready");
-    return ESP_OK;
+    return InitStoragePartition();
 }
 
 esp_err_t LoadAccessToken(std::string* token)
@@ -636,6 +675,58 @@ esp_err_t LoadAiSessionForDay(const std::string& day, CachedAiSession* session)
 esp_err_t ClearAiSession()
 {
     return ClearNvsKey(kAiSessionKey);
+}
+
+esp_err_t LoadAutoSyncIntervalMinutes(uint32_t* minutes)
+{
+    if (minutes == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    uint64_t raw = 0;
+    bool found = false;
+    ESP_RETURN_ON_ERROR(LoadU64FromNvs(kAutoSyncIntervalMinKey, &raw, &found), kTag, "load auto sync interval");
+    const uint32_t value = found ? static_cast<uint32_t>(raw) : 0;
+    *minutes = IsValidAutoSyncInterval(value) ? value : 0;
+    return ESP_OK;
+}
+
+esp_err_t SaveAutoSyncIntervalMinutes(uint32_t minutes)
+{
+    if (!IsValidAutoSyncInterval(minutes)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    return SaveU64ToNvs(kAutoSyncIntervalMinKey, minutes);
+}
+
+std::string AutoSyncIntervalLabel(uint32_t minutes)
+{
+    switch (minutes) {
+        case 0:
+            return "从不";
+        case 15:
+            return "15分";
+        case 30:
+            return "30分";
+        case 60:
+            return "1小时";
+        case 240:
+            return "4小时";
+        default:
+            return "从不";
+    }
+}
+
+esp_err_t FactoryResetNvsAndRestart()
+{
+    ESP_LOGW(kTag, "factory reset requested: erasing NVS and restarting");
+    esp_err_t result = nvs_flash_deinit();
+    if (result != ESP_OK && result != ESP_ERR_INVALID_STATE) {
+        return result;
+    }
+    ESP_RETURN_ON_ERROR(nvs_flash_erase(), kTag, "erase NVS for factory reset");
+    esp_restart();
+    return ESP_OK;
 }
 
 }  // namespace wqn

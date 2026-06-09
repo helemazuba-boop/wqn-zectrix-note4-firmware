@@ -1,345 +1,184 @@
 #include "word_app.h"
 
 #include <algorithm>
-#include <cstring>
+#include <cstddef>
+#include <cstdlib>
 #include <ctime>
+#include <string>
 
 #include "esp_check.h"
 #include "esp_log.h"
-#include "nvs.h"
 
 namespace {
 
 constexpr char kTag[] = "wqn_word";
-constexpr char kNvsNamespace[] = "vocab";
-constexpr char kProgressKey[] = "progress";
-constexpr uint32_t kProgressMagic = 0x31565157;  // WQV1
-constexpr uint16_t kProgressVersion = 1;
 constexpr uint16_t kDefaultDailyTarget = 20;
-constexpr int32_t kSecondsPerDay = 86400;
+constexpr size_t kDictionaryPreviewLimit = 8;
 
-const wqn::WordCard kWordDeck[] = {
-    {1, "abandon", "/əˈbændən/", "放弃；抛弃", "Do not abandon the plan too early.", "不要过早放弃这个计划。"},
-    {2, "accurate", "/ˈækjərət/", "准确的；精确的", "The data must be accurate.", "数据必须准确。"},
-    {3, "analysis", "/əˈnæləsɪs/", "分析", "The analysis explains the mistake.", "这个分析解释了错误。"},
-    {4, "approach", "/əˈproʊtʃ/", "方法；接近", "Try a different approach.", "换一种方法试试。"},
-    {5, "assume", "/əˈsuːm/", "假设；认为", "We assume the answer is correct.", "我们假设答案是正确的。"},
-    {6, "benefit", "/ˈbenɪfɪt/", "益处；受益", "Review brings long-term benefit.", "复习会带来长期收益。"},
-    {7, "concept", "/ˈkɑːnsept/", "概念", "The concept is simple but important.", "这个概念简单但重要。"},
-    {8, "confirm", "/kənˈfɜːrm/", "确认", "Please confirm your choice.", "请确认你的选择。"},
-    {9, "consistent", "/kənˈsɪstənt/", "一致的；稳定的", "Keep a consistent study habit.", "保持稳定的学习习惯。"},
-    {10, "context", "/ˈkɑːntekst/", "上下文；背景", "Context helps you remember words.", "上下文能帮助你记单词。"},
-    {11, "derive", "/dɪˈraɪv/", "推导；获得", "Derive the formula step by step.", "一步步推导公式。"},
-    {12, "efficient", "/ɪˈfɪʃnt/", "高效的", "A small review queue is efficient.", "小复习队列更高效。"},
-    {13, "estimate", "/ˈestɪmeɪt/", "估计；估算", "Estimate the answer first.", "先估算答案。"},
-    {14, "evidence", "/ˈevɪdəns/", "证据", "Use evidence before guessing.", "先看证据，不要猜。"},
-    {15, "factor", "/ˈfæktər/", "因素；因子", "Time is an important factor.", "时间是重要因素。"},
-    {16, "function", "/ˈfʌŋkʃn/", "函数；功能", "This function updates progress.", "这个函数更新进度。"},
-    {17, "improve", "/ɪmˈpruːv/", "改进；提高", "Daily practice improves memory.", "每日练习提高记忆。"},
-    {18, "interval", "/ˈɪntərvl/", "间隔", "The review interval gets longer.", "复习间隔会变长。"},
-    {19, "method", "/ˈmeθəd/", "方法", "Choose the simplest method.", "选择最简单的方法。"},
-    {20, "specific", "/spəˈsɪfɪk/", "具体的；特定的", "Give a specific example.", "给出一个具体例子。"},
-    {21, "strategy", "/ˈstrætədʒi/", "策略", "A review strategy reduces forgetting.", "复习策略能减少遗忘。"},
-    {22, "structure", "/ˈstrʌktʃər/", "结构", "The sentence structure is clear.", "句子结构很清楚。"},
-    {23, "sufficient", "/səˈfɪʃnt/", "足够的", "Give sufficient time to review.", "留出足够时间复习。"},
-    {24, "verify", "/ˈverɪfaɪ/", "验证", "Verify the result after solving.", "解完后验证结果。"},
-};
-
-constexpr size_t kWordDeckSize = sizeof(kWordDeck) / sizeof(kWordDeck[0]);
-
-struct ProgressHeader {
-    uint32_t magic;
-    uint16_t version;
-    uint16_t count;
-    int32_t stats_day;
-    uint16_t reviewed_today;
-    uint16_t correct_today;
-    uint16_t streak_days;
-    uint16_t daily_target;
-};
-
-struct PackedWordProgressState {
-    int32_t due_day;
-    int32_t last_review_day;
-    uint16_t interval_days;
-    uint8_t status;
-    uint8_t correct_streak;
-    uint16_t lapses;
-    uint16_t reserved;
-};
-
-int32_t CurrentDay()
+size_t SelectionIndex(wqn::WordHomeSelection selection)
 {
-    std::time_t now = 0;
-    std::time(&now);
-    if (now <= 0) {
-        return 0;
+    return static_cast<size_t>(selection);
+}
+
+wqn::WordHomeSelection HomeSelectionFromIndex(size_t index)
+{
+    switch (index % 3) {
+        case 0:
+            return wqn::WordHomeSelection::kSequential;
+        case 1:
+            return wqn::WordHomeSelection::kRandom;
+        default:
+            return wqn::WordHomeSelection::kDictionary;
     }
-    return static_cast<int32_t>(now / kSecondsPerDay);
 }
 
-wqn::WordReviewStatus ClampStatus(uint8_t raw)
+std::string HomeSelectionLabel(wqn::WordHomeSelection selection)
 {
-    switch (static_cast<wqn::WordReviewStatus>(raw)) {
-        case wqn::WordReviewStatus::kNew:
-        case wqn::WordReviewStatus::kLearning:
-        case wqn::WordReviewStatus::kReview:
-        case wqn::WordReviewStatus::kMastered:
-            return static_cast<wqn::WordReviewStatus>(raw);
+    switch (selection) {
+        case wqn::WordHomeSelection::kSequential:
+            return "顺序复习";
+        case wqn::WordHomeSelection::kRandom:
+            return "随机复习";
+        case wqn::WordHomeSelection::kDictionary:
+            return "词典";
     }
-    return wqn::WordReviewStatus::kNew;
+    return "顺序复习";
 }
 
-uint16_t ClampDailyTarget(uint16_t target)
+bool HasPackWords(const wqn::WordAppState& state)
 {
-    return static_cast<uint16_t>(std::min<uint16_t>(200, std::max<uint16_t>(1, target)));
+    return !state.pack_index.entries.empty();
 }
 
-uint16_t ClampInterval(uint32_t days)
-{
-    return static_cast<uint16_t>(std::min<uint32_t>(days, 180));
-}
-
-bool IsDue(const wqn::WordProgressState& state, int32_t today)
-{
-    if (state.status == wqn::WordReviewStatus::kNew) {
-        return true;
-    }
-    return state.due_day <= today;
-}
-
-const wqn::WordCard* CurrentCard(const wqn::WordAppState& state)
-{
-    if (state.queue_position >= state.queue.size()) {
-        return nullptr;
-    }
-    const size_t deck_index = state.queue[state.queue_position];
-    if (deck_index >= kWordDeckSize) {
-        return nullptr;
-    }
-    return &kWordDeck[deck_index];
-}
-
-void ResetDailyStatsIfNeeded(wqn::WordAppState* state)
+void RefreshDictionaryState(wqn::WordAppState* state)
 {
     if (state == nullptr) {
         return;
     }
-    const int32_t today = CurrentDay();
-    if (state->today == today) {
-        return;
+    state->dictionary_letters = wqn::WordPackNextLetters(state->pack_index, state->dictionary_prefix);
+    if (state->dictionary_letter_selected >= state->dictionary_letters.size()) {
+        state->dictionary_letter_selected = 0;
     }
-    if (state->today != 0 && state->reviewed_today > 0) {
-        state->streak_days = static_cast<uint16_t>(std::min<int>(UINT16_MAX, state->streak_days + 1));
-    }
-    state->today = today;
-    state->reviewed_today = 0;
-    state->correct_today = 0;
-}
-
-void BuildQueue(wqn::WordAppState* state)
-{
-    if (state == nullptr) {
-        return;
-    }
-    state->queue.clear();
-    state->queue_position = 0;
-    if (state->reviewed_today >= state->daily_target) {
-        return;
-    }
-
-    const size_t remaining = state->daily_target - state->reviewed_today;
-    for (size_t i = 0; i < state->progress.size() && state->queue.size() < remaining; ++i) {
-        const wqn::WordProgressState& progress = state->progress[i];
-        if (progress.status != wqn::WordReviewStatus::kNew && progress.due_day <= state->today) {
-            state->queue.push_back(i);
-        }
-    }
-    for (size_t i = 0; i < state->progress.size() && state->queue.size() < remaining; ++i) {
-        if (state->progress[i].status == wqn::WordReviewStatus::kNew) {
-            state->queue.push_back(i);
-        }
+    wqn::FindWordPackPrefixMatches(state->pack_index, state->dictionary_prefix, kDictionaryPreviewLimit, &state->dictionary_matches);
+    if (state->dictionary_match_selected >= state->dictionary_matches.size()) {
+        state->dictionary_match_selected = 0;
     }
 }
 
-esp_err_t LoadProgress(wqn::WordAppState* state)
+esp_err_t LoadCurrentReviewWord(wqn::WordAppState* state)
 {
     if (state == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
-    state->progress.assign(kWordDeckSize, wqn::WordProgressState{});
-    state->daily_target = kDefaultDailyTarget;
-
-    nvs_handle_t handle = 0;
-    esp_err_t ret = nvs_open(kNvsNamespace, NVS_READONLY, &handle);
-    if (ret == ESP_ERR_NVS_NOT_FOUND) {
+    state->current_word = wqn::WqnWordEntry{};
+    if (state->review_indices.empty() || state->review_position >= state->review_indices.size()) {
         return ESP_OK;
     }
-    if (ret != ESP_OK) {
-        return ret;
+    const size_t index = state->review_indices[state->review_position];
+    if (index >= state->pack_index.entries.size()) {
+        return ESP_ERR_INVALID_ARG;
     }
-
-    size_t blob_size = 0;
-    ret = nvs_get_blob(handle, kProgressKey, nullptr, &blob_size);
-    if (ret == ESP_ERR_NVS_NOT_FOUND) {
-        nvs_close(handle);
-        return ESP_OK;
-    }
-    if (ret != ESP_OK || blob_size < sizeof(ProgressHeader)) {
-        nvs_close(handle);
-        return ret == ESP_OK ? ESP_OK : ret;
-    }
-
-    std::vector<uint8_t> blob(blob_size);
-    ret = nvs_get_blob(handle, kProgressKey, blob.data(), &blob_size);
-    nvs_close(handle);
-    if (ret != ESP_OK) {
-        return ret;
-    }
-
-    ProgressHeader header = {};
-    std::memcpy(&header, blob.data(), sizeof(header));
-    if (header.magic != kProgressMagic || header.version != kProgressVersion) {
-        ESP_LOGW(kTag, "ignore incompatible word progress blob");
-        return ESP_OK;
-    }
-
-    state->today = header.stats_day;
-    state->reviewed_today = header.reviewed_today;
-    state->correct_today = header.correct_today;
-    state->streak_days = header.streak_days;
-    state->daily_target = ClampDailyTarget(header.daily_target);
-
-    const size_t available_count = (blob.size() - sizeof(ProgressHeader)) / sizeof(PackedWordProgressState);
-    const size_t copy_count = std::min({kWordDeckSize, static_cast<size_t>(header.count), available_count});
-    for (size_t i = 0; i < copy_count; ++i) {
-        PackedWordProgressState packed = {};
-        std::memcpy(&packed, blob.data() + sizeof(ProgressHeader) + i * sizeof(PackedWordProgressState), sizeof(packed));
-        wqn::WordProgressState progress;
-        progress.status = ClampStatus(packed.status);
-        progress.due_day = packed.due_day;
-        progress.last_review_day = packed.last_review_day;
-        progress.interval_days = packed.interval_days;
-        progress.correct_streak = packed.correct_streak;
-        progress.lapses = packed.lapses;
-        state->progress[i] = progress;
-    }
-    return ESP_OK;
+    return wqn::ReadWordPackEntry(state->pack_index.entries[index], &state->current_word);
 }
 
-esp_err_t SaveProgress(const wqn::WordAppState& state)
+esp_err_t LoadCurrentDictionaryWord(wqn::WordAppState* state)
 {
-    ProgressHeader header = {};
-    header.magic = kProgressMagic;
-    header.version = kProgressVersion;
-    header.count = static_cast<uint16_t>(std::min<size_t>(state.progress.size(), UINT16_MAX));
-    header.stats_day = state.today;
-    header.reviewed_today = state.reviewed_today;
-    header.correct_today = state.correct_today;
-    header.streak_days = state.streak_days;
-    header.daily_target = state.daily_target;
-
-    const size_t packed_count = header.count;
-    std::vector<uint8_t> blob(sizeof(ProgressHeader) + packed_count * sizeof(PackedWordProgressState));
-    std::memcpy(blob.data(), &header, sizeof(header));
-    for (size_t i = 0; i < packed_count; ++i) {
-        PackedWordProgressState packed = {};
-        packed.due_day = state.progress[i].due_day;
-        packed.last_review_day = state.progress[i].last_review_day;
-        packed.interval_days = state.progress[i].interval_days;
-        packed.status = static_cast<uint8_t>(state.progress[i].status);
-        packed.correct_streak = state.progress[i].correct_streak;
-        packed.lapses = state.progress[i].lapses;
-        std::memcpy(blob.data() + sizeof(ProgressHeader) + i * sizeof(PackedWordProgressState), &packed, sizeof(packed));
+    if (state == nullptr) {
+        return ESP_ERR_INVALID_ARG;
     }
-
-    nvs_handle_t handle = 0;
-    esp_err_t ret = nvs_open(kNvsNamespace, NVS_READWRITE, &handle);
-    if (ret != ESP_OK) {
-        return ret;
+    state->current_word = wqn::WqnWordEntry{};
+    if (state->dictionary_matches.empty() || state->dictionary_match_selected >= state->dictionary_matches.size()) {
+        return ESP_OK;
     }
-    ret = nvs_set_blob(handle, kProgressKey, blob.data(), blob.size());
-    if (ret == ESP_OK) {
-        ret = nvs_commit(handle);
+    const size_t index = state->dictionary_matches[state->dictionary_match_selected];
+    if (index >= state->pack_index.entries.size()) {
+        return ESP_ERR_INVALID_ARG;
     }
-    nvs_close(handle);
-    return ret;
+    return wqn::ReadWordPackEntry(state->pack_index.entries[index], &state->current_word);
 }
 
-void ApplyAnswer(wqn::WordProgressState* progress, bool known, int32_t today)
+void BuildReviewQueue(wqn::WordAppState* state, bool random)
 {
-    if (progress == nullptr) {
+    if (state == nullptr) {
         return;
     }
-    progress->last_review_day = today;
-    if (!known) {
-        progress->status = wqn::WordReviewStatus::kLearning;
-        progress->correct_streak = 0;
-        progress->lapses = ClampInterval(static_cast<uint32_t>(progress->lapses) + 1);
-        progress->interval_days = 0;
-        progress->due_day = today;
+    state->review_indices.clear();
+    state->review_position = 0;
+    state->random_review = random;
+    const size_t limit = std::min<size_t>(state->pack_index.entries.size(), state->daily_target);
+    state->review_indices.reserve(limit);
+    for (size_t i = 0; i < state->pack_index.entries.size() && state->review_indices.size() < limit; ++i) {
+        state->review_indices.push_back(i);
+    }
+    if (random && state->review_indices.size() > 1) {
+        std::srand(static_cast<unsigned>(std::time(nullptr)));
+        for (size_t i = state->review_indices.size() - 1; i > 0; --i) {
+            const size_t j = static_cast<size_t>(std::rand()) % (i + 1);
+            std::swap(state->review_indices[i], state->review_indices[j]);
+        }
+    }
+}
+
+void QueueReviewSubmission(wqn::WordAppState* state, const wqn::WqnWordEntry& word, const char* outcome)
+{
+    if (state == nullptr || outcome == nullptr || outcome[0] == '\0' || word.id.empty()) {
         return;
     }
-
-    progress->correct_streak =
-        static_cast<uint8_t>(std::min<uint32_t>(static_cast<uint32_t>(progress->correct_streak) + 1, UINT8_MAX));
-    switch (progress->status) {
-        case wqn::WordReviewStatus::kNew:
-            progress->status = wqn::WordReviewStatus::kLearning;
-            progress->interval_days = 1;
-            break;
-        case wqn::WordReviewStatus::kLearning:
-            progress->status = progress->correct_streak >= 2 ? wqn::WordReviewStatus::kReview : wqn::WordReviewStatus::kLearning;
-            progress->interval_days = progress->correct_streak >= 2 ? 3 : 1;
-            break;
-        case wqn::WordReviewStatus::kReview:
-            progress->interval_days = ClampInterval(std::max<uint32_t>(3, progress->interval_days * 2U));
-            if (progress->correct_streak >= 5 && progress->interval_days >= 30) {
-                progress->status = wqn::WordReviewStatus::kMastered;
-            }
-            break;
-        case wqn::WordReviewStatus::kMastered:
-            progress->interval_days = 90;
-            break;
-    }
-    progress->due_day = today + progress->interval_days;
+    state->pending_submit_word_id = word.id;
+    state->pending_submit_outcome = outcome;
+    state->pending_submit_word = word.word;
 }
 
-uint16_t CountDue(const wqn::WordAppState& state)
+void AdvanceReview(wqn::WordAppState* state)
 {
-    uint32_t due = 0;
-    for (const wqn::WordProgressState& progress : state.progress) {
-        if (IsDue(progress, state.today)) {
-            ++due;
-        }
+    if (state == nullptr || state->review_indices.empty()) {
+        return;
     }
-    return static_cast<uint16_t>(std::min<uint32_t>(due, UINT16_MAX));
+    if (state->review_position + 1 < state->review_indices.size()) {
+        ++state->review_position;
+        ESP_ERROR_CHECK_WITHOUT_ABORT(LoadCurrentReviewWord(state));
+        state->mode = wqn::WordAppMode::kReviewFront;
+        return;
+    }
+    state->mode = wqn::WordAppMode::kHome;
+    state->review_indices.clear();
+    state->review_position = 0;
+    state->current_word = wqn::WqnWordEntry{};
+    state->message = "本轮复习完成";
 }
 
-uint16_t CountMastered(const wqn::WordAppState& state)
+void RequestOnlineLookup(wqn::WordAppState* state)
 {
-    uint32_t mastered = 0;
-    for (const wqn::WordProgressState& progress : state.progress) {
-        if (progress.status == wqn::WordReviewStatus::kMastered) {
-            ++mastered;
-        }
+    if (state == nullptr || state->dictionary_prefix.empty()) {
+        return;
     }
-    return static_cast<uint16_t>(std::min<uint32_t>(mastered, UINT16_MAX));
+    state->pending_search_query = state->dictionary_prefix;
+    state->search_pending = true;
+    state->message = "正在在线搜索";
 }
 
-std::string StatusText(wqn::WordReviewStatus status)
+void RequestAiLookup(wqn::WordAppState* state)
 {
-    switch (status) {
-        case wqn::WordReviewStatus::kNew:
-            return "新词";
-        case wqn::WordReviewStatus::kLearning:
-            return "学习中";
-        case wqn::WordReviewStatus::kReview:
-            return "复习";
-        case wqn::WordReviewStatus::kMastered:
-            return "已掌握";
+    if (state == nullptr || state->dictionary_prefix.empty()) {
+        return;
     }
-    return "新词";
+    state->pending_ai_query = state->dictionary_prefix;
+    state->ai_lookup_pending = true;
+    state->message = "正在询问 AI";
+}
+
+void MarkCurrentAsUnknown(wqn::WordAppState* state)
+{
+    if (state == nullptr) {
+        return;
+    }
+    QueueReviewSubmission(state, state->current_word, "unknown");
+    state->message = state->current_word.id.empty() ? "临时词无法加入错词本" : "已标记不认识";
+}
+
+uint16_t ClampUint16(size_t value)
+{
+    return static_cast<uint16_t>(std::min<size_t>(value, UINT16_MAX));
 }
 
 }  // namespace
@@ -351,18 +190,31 @@ esp_err_t InitWordApp(WordAppState* state)
     if (state == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
-    const esp_err_t ret = LoadProgress(state);
-    if (ret != ESP_OK) {
-        ESP_LOGW(kTag, "load progress failed: %s", esp_err_to_name(ret));
+    if (state->initialized) {
+        return ESP_OK;
     }
-    ResetDailyStatsIfNeeded(state);
-    BuildQueue(state);
+
+    state->daily_target = kDefaultDailyTarget;
+    state->mode = WordAppMode::kHome;
+    state->home_selection = WordHomeSelection::kSequential;
+    state->lookup_selection = WordLookupSelection::kOnlineSearch;
+    state->message = "词库同步中";
+
+    const esp_err_t storage_result = InitWordPackStorage();
+    if (storage_result != ESP_OK) {
+        state->message = "词库分区不可用";
+    } else {
+        WordPackIndex index;
+        const esp_err_t index_result = LoadWordPackIndex(&index);
+        ApplyWordPackIndex(state, index, index.status_message);
+        if (index_result != ESP_OK) {
+            ESP_LOGW(kTag, "load local word pack index failed: %s", esp_err_to_name(index_result));
+        }
+    }
+
     state->initialized = true;
-    state->showing_back = false;
-    if (state->queue.empty()) {
-        state->message = "今日单词已完成";
-    }
-    return ret == ESP_OK ? ESP_OK : ret;
+    state->cloud_sync_requested = !state->cloud_loaded_once || state->pack_index.pack_error;
+    return ESP_OK;
 }
 
 esp_err_t HandleWordAppInput(WordAppState* state, WordInput input)
@@ -373,101 +225,315 @@ esp_err_t HandleWordAppInput(WordAppState* state, WordInput input)
     if (!state->initialized) {
         ESP_RETURN_ON_ERROR(InitWordApp(state), kTag, "init word app");
     }
-    ResetDailyStatsIfNeeded(state);
-    if (state->queue.empty()) {
-        BuildQueue(state);
-        if (state->queue.empty()) {
-            state->message = "今日单词已完成";
+
+    switch (state->mode) {
+        case WordAppMode::kHome: {
+            size_t selected = SelectionIndex(state->home_selection);
+            if (input == WordInput::kUp) {
+                selected = (selected + 2) % 3;
+                state->home_selection = HomeSelectionFromIndex(selected);
+                state->message = HomeSelectionLabel(state->home_selection);
+                return ESP_OK;
+            }
+            if (input == WordInput::kDown) {
+                selected = (selected + 1) % 3;
+                state->home_selection = HomeSelectionFromIndex(selected);
+                state->message = HomeSelectionLabel(state->home_selection);
+                return ESP_OK;
+            }
+            if (input == WordInput::kLongConfirm) {
+                state->cloud_sync_requested = true;
+                state->message = "词库同步中";
+                return ESP_OK;
+            }
+            if (input != WordInput::kConfirm) {
+                return ESP_OK;
+            }
+            if (state->home_selection == WordHomeSelection::kDictionary) {
+                state->mode = WordAppMode::kDictionary;
+                state->dictionary_prefix.clear();
+                RefreshDictionaryState(state);
+                state->message = HasPackWords(*state) ? "选择首字母" : "词库未同步";
+                return ESP_OK;
+            }
+            if (!HasPackWords(*state)) {
+                state->message = state->pack_index.status_message.empty() ? "词库未同步" : state->pack_index.status_message;
+                state->cloud_sync_requested = true;
+                return ESP_OK;
+            }
+            BuildReviewQueue(state, state->home_selection == WordHomeSelection::kRandom);
+            ESP_RETURN_ON_ERROR(LoadCurrentReviewWord(state), kTag, "load current review word");
+            state->mode = WordAppMode::kReviewFront;
+            state->message = "确认翻面";
             return ESP_OK;
         }
-    }
 
-    const size_t deck_index = state->queue[state->queue_position];
-    if (deck_index >= state->progress.size()) {
-        BuildQueue(state);
-        return ESP_OK;
-    }
-
-    switch (input) {
-        case WordInput::kConfirm:
-            if (!state->showing_back) {
-                state->showing_back = true;
-                state->message = "确认=认识，上=不认识，下=稍后";
-                return ESP_OK;
+        case WordAppMode::kReviewFront:
+            if (input == WordInput::kConfirm) {
+                state->mode = WordAppMode::kReviewBack;
+                state->message = "确认认识，上键不认识，下键跳过";
+            } else if (input == WordInput::kDown) {
+                AdvanceReview(state);
+                state->message = "已跳过";
+            } else if (input == WordInput::kLongConfirm) {
+                state->mode = WordAppMode::kHome;
+                state->message = "已返回单词主页";
             }
-            ApplyAnswer(&state->progress[deck_index], true, state->today);
-            ++state->reviewed_today;
-            ++state->correct_today;
-            state->message = "已记住";
-            break;
+            return ESP_OK;
 
-        case WordInput::kUp:
-            if (!state->showing_back) {
-                if (state->queue_position > 0) {
-                    --state->queue_position;
+        case WordAppMode::kReviewBack:
+            if (input == WordInput::kConfirm) {
+                QueueReviewSubmission(state, state->current_word, "known");
+                ++state->reviewed_today;
+                ++state->correct_today;
+                state->message = "已记录认识";
+                AdvanceReview(state);
+            } else if (input == WordInput::kUp) {
+                QueueReviewSubmission(state, state->current_word, "unknown");
+                ++state->reviewed_today;
+                state->message = "已加入遗忘的单词";
+                AdvanceReview(state);
+            } else if (input == WordInput::kDown) {
+                AdvanceReview(state);
+                state->message = "已跳过";
+            } else if (input == WordInput::kLongConfirm) {
+                state->mode = WordAppMode::kHome;
+                state->message = "已返回单词主页";
+            }
+            return ESP_OK;
+
+        case WordAppMode::kDictionary:
+            if (input == WordInput::kLongConfirm) {
+                if (!state->dictionary_prefix.empty()) {
+                    state->dictionary_prefix.pop_back();
+                    RefreshDictionaryState(state);
+                    state->message = state->dictionary_prefix.empty() ? "选择首字母" : state->dictionary_prefix;
+                } else {
+                    state->mode = WordAppMode::kHome;
+                    state->message = "已返回单词主页";
                 }
-                state->message = "上一词";
                 return ESP_OK;
             }
-            ApplyAnswer(&state->progress[deck_index], false, state->today);
-            ++state->reviewed_today;
-            state->message = "已标记复习";
-            break;
-
-        case WordInput::kDown:
-        case WordInput::kLongConfirm:
-            if (state->queue_position + 1 < state->queue.size()) {
-                ++state->queue_position;
-            } else {
-                state->queue_position = 0;
+            if (input == WordInput::kUp) {
+                if (!state->dictionary_letters.empty()) {
+                    state->dictionary_letter_selected =
+                        (state->dictionary_letter_selected + state->dictionary_letters.size() - 1) % state->dictionary_letters.size();
+                }
+                return ESP_OK;
             }
-            state->showing_back = false;
-            state->message = "稍后再看";
+            if (input == WordInput::kDown) {
+                if (!state->dictionary_letters.empty()) {
+                    state->dictionary_letter_selected = (state->dictionary_letter_selected + 1) % state->dictionary_letters.size();
+                }
+                return ESP_OK;
+            }
+            if (input != WordInput::kConfirm) {
+                return ESP_OK;
+            }
+            if (!state->dictionary_letters.empty()) {
+                state->dictionary_prefix.push_back(state->dictionary_letters[state->dictionary_letter_selected]);
+                RefreshDictionaryState(state);
+                if (state->dictionary_matches.size() == 1 && state->dictionary_letters.empty()) {
+                    ESP_RETURN_ON_ERROR(LoadCurrentDictionaryWord(state), kTag, "load dictionary detail");
+                    state->mode = WordAppMode::kDictionaryDetail;
+                    state->message = "上键标记不认识";
+                } else if (state->dictionary_matches.empty()) {
+                    state->mode = WordAppMode::kLookupChoice;
+                    state->lookup_selection = WordLookupSelection::kOnlineSearch;
+                    state->message = "本地未命中";
+                } else {
+                    state->message = state->dictionary_prefix;
+                }
+                return ESP_OK;
+            }
+            if (!state->dictionary_matches.empty()) {
+                ESP_RETURN_ON_ERROR(LoadCurrentDictionaryWord(state), kTag, "load dictionary detail");
+                state->mode = WordAppMode::kDictionaryDetail;
+                state->message = "上键标记不认识";
+                return ESP_OK;
+            }
+            state->mode = WordAppMode::kLookupChoice;
+            state->lookup_selection = WordLookupSelection::kOnlineSearch;
+            state->message = "本地未命中";
+            return ESP_OK;
+
+        case WordAppMode::kDictionaryDetail:
+            if (input == WordInput::kUp) {
+                MarkCurrentAsUnknown(state);
+            } else if (input == WordInput::kConfirm || input == WordInput::kLongConfirm) {
+                state->mode = WordAppMode::kDictionary;
+                state->message = state->dictionary_prefix.empty() ? "选择首字母" : state->dictionary_prefix;
+            }
+            return ESP_OK;
+
+        case WordAppMode::kLookupChoice:
+            if (input == WordInput::kUp || input == WordInput::kDown) {
+                state->lookup_selection = state->lookup_selection == WordLookupSelection::kOnlineSearch ? WordLookupSelection::kAiLookup
+                                                                                                      : WordLookupSelection::kOnlineSearch;
+                return ESP_OK;
+            }
+            if (input == WordInput::kLongConfirm) {
+                state->mode = WordAppMode::kDictionary;
+                state->message = state->dictionary_prefix.empty() ? "选择首字母" : state->dictionary_prefix;
+                return ESP_OK;
+            }
+            if (input == WordInput::kConfirm) {
+                if (state->lookup_selection == WordLookupSelection::kOnlineSearch) {
+                    RequestOnlineLookup(state);
+                } else {
+                    RequestAiLookup(state);
+                }
+            }
+            return ESP_OK;
+
+        case WordAppMode::kLookupResult:
+            if (input == WordInput::kUp) {
+                MarkCurrentAsUnknown(state);
+            } else if (input == WordInput::kConfirm || input == WordInput::kLongConfirm) {
+                state->mode = WordAppMode::kDictionary;
+                state->message = state->dictionary_prefix.empty() ? "选择首字母" : state->dictionary_prefix;
+            }
             return ESP_OK;
     }
 
-    ESP_RETURN_ON_ERROR(SaveProgress(*state), kTag, "save word progress");
-    BuildQueue(state);
-    state->showing_back = false;
-    if (state->queue.empty()) {
-        state->message = "今日单词已完成";
-    }
     return ESP_OK;
+}
+
+void ApplyWordPackIndex(WordAppState* state, const WordPackIndex& index, const std::string& message)
+{
+    if (state == nullptr) {
+        return;
+    }
+    state->pack_index = index;
+    state->cloud_loaded_once = index.has_manifest;
+    state->cloud_sync_failed = index.pack_error;
+    state->cloud_sync_requested = !index.has_manifest || index.pack_error;
+    state->message = !message.empty() ? message : index.status_message;
+    if (state->message.empty()) {
+        state->message = HasPackWords(*state) ? "词库已就绪" : "词库未同步";
+    }
+    RefreshDictionaryState(state);
+}
+
+void ApplyWordSearchResult(WordAppState* state, const WqnWordSearchResult& result)
+{
+    if (state == nullptr) {
+        return;
+    }
+    state->online_results = result.words;
+    state->online_result_selected = 0;
+    if (!state->online_results.empty()) {
+        state->current_word = state->online_results.front();
+        state->mode = WordAppMode::kLookupResult;
+        state->message = "在线搜索结果";
+    } else {
+        state->mode = WordAppMode::kLookupChoice;
+        state->lookup_selection = WordLookupSelection::kAiLookup;
+        state->message = "未找到，确认询问 AI";
+    }
+}
+
+void ApplyWordAiLookupResult(WordAppState* state, const WqnWordAiLookupResult& result)
+{
+    if (state == nullptr) {
+        return;
+    }
+    state->lookup_word = result.word;
+    state->current_word = result.word;
+    state->mode = WordAppMode::kLookupResult;
+    state->message = "AI 临时释义";
+}
+
+bool TakeWordSearchRequest(WordAppState* state, WqnWordSearchRequest* request)
+{
+    if (state == nullptr || request == nullptr || !state->search_pending) {
+        return false;
+    }
+    request->query = state->pending_search_query;
+    request->limit = 8;
+    state->search_pending = false;
+    state->pending_search_query.clear();
+    return true;
+}
+
+bool TakeWordAiLookupRequest(WordAppState* state, WqnWordAiLookupRequest* request)
+{
+    if (state == nullptr || request == nullptr || !state->ai_lookup_pending) {
+        return false;
+    }
+    request->query = state->pending_ai_query;
+    state->ai_lookup_pending = false;
+    state->pending_ai_query.clear();
+    return true;
+}
+
+bool TakeWordReviewSubmission(WordAppState* state, WqnWordReviewSubmission* submission, std::string* word)
+{
+    if (state == nullptr || submission == nullptr) {
+        return false;
+    }
+    if (state->pending_submit_word_id.empty() || state->pending_submit_outcome.empty()) {
+        return false;
+    }
+    submission->word_id = state->pending_submit_word_id;
+    submission->outcome = state->pending_submit_outcome;
+    submission->mode = state->random_review ? "random" : "sequential";
+    if (word != nullptr) {
+        *word = state->pending_submit_word;
+    }
+    state->pending_submit_word_id.clear();
+    state->pending_submit_outcome.clear();
+    state->pending_submit_word.clear();
+    return true;
 }
 
 WordAppSnapshot BuildWordAppSnapshot(const WordAppState& state)
 {
     WordAppSnapshot snapshot;
-    snapshot.showing_back = state.showing_back;
+    snapshot.mode = state.mode;
+    snapshot.home_selection = state.home_selection;
+    snapshot.lookup_selection = state.lookup_selection;
+    snapshot.pack_ready = HasPackWords(state);
+    snapshot.pack_truncated = state.pack_index.truncated;
+    snapshot.cloud_sync_failed = state.cloud_sync_failed;
     snapshot.reviewed_today = state.reviewed_today;
     snapshot.correct_today = state.correct_today;
     snapshot.daily_target = state.daily_target;
-    snapshot.due_count = CountDue(state);
-    snapshot.mastered_count = CountMastered(state);
-    snapshot.total_count = static_cast<uint16_t>(kWordDeckSize);
-    snapshot.card_count = static_cast<uint16_t>(std::min<size_t>(state.queue.size(), UINT16_MAX));
-    snapshot.card_position = state.queue.empty() ? 0 : static_cast<uint16_t>(state.queue_position + 1);
-    snapshot.finished_today = state.queue.empty();
+    snapshot.due_count = ClampUint16(state.pack_index.entries.size());
+    snapshot.total_count = ClampUint16(state.pack_index.entries.size());
+    snapshot.card_count = ClampUint16(state.review_indices.size());
+    snapshot.card_position = state.review_indices.empty() ? 0 : ClampUint16(state.review_position + 1);
+    snapshot.finished_today = state.review_indices.empty() && (state.mode == WordAppMode::kReviewFront || state.mode == WordAppMode::kReviewBack);
+    snapshot.pack_count = state.pack_index.pack_count;
+    snapshot.pack_bytes = state.pack_index.pack_bytes;
+    snapshot.dictionary_prefix = state.dictionary_prefix;
+    snapshot.dictionary_letters = state.dictionary_letters;
+    snapshot.dictionary_letter_selected = state.dictionary_letter_selected;
+    snapshot.dictionary_match_selected = state.dictionary_match_selected;
+    snapshot.online_result_selected = state.online_result_selected;
     snapshot.progress_line = WordAppProgressLabel(state);
     snapshot.status_line = WordAppStatusLine(state);
-    snapshot.hint = state.message.empty() ? "确认翻面；长按确认稍后" : state.message;
+    snapshot.hint = state.message.empty() ? "确认选择，长按确认返回" : state.message;
 
-    const WordCard* card = CurrentCard(state);
-    if (card == nullptr) {
-        snapshot.word = "今日完成";
-        snapshot.meaning = "没有待复习单词";
-        snapshot.hint = "长按上下切换页面";
-        return snapshot;
+    const WqnWordEntry& word = state.current_word;
+    if (!word.word.empty()) {
+        snapshot.has_card = true;
+        snapshot.word = word.word;
+        snapshot.phonetic = word.phonetic;
+        snapshot.meaning = word.meaning;
+        snapshot.example = word.example;
+        snapshot.example_translation = word.example_translation;
+        snapshot.part_of_speech = word.part_of_speech;
     }
-    snapshot.has_card = true;
-    snapshot.word = card->word == nullptr ? "" : card->word;
-    snapshot.phonetic = card->phonetic == nullptr ? "" : card->phonetic;
-    snapshot.meaning = card->meaning == nullptr ? "" : card->meaning;
-    snapshot.example = card->example == nullptr ? "" : card->example;
-    snapshot.example_translation = card->example_translation == nullptr ? "" : card->example_translation;
-    const size_t deck_index = state.queue[state.queue_position];
-    if (deck_index < state.progress.size()) {
-        snapshot.status_line += " · " + StatusText(state.progress[deck_index].status);
+
+    for (size_t i = 0; i < state.dictionary_matches.size() && i < kDictionaryPreviewLimit; ++i) {
+        const size_t index = state.dictionary_matches[i];
+        if (index < state.pack_index.entries.size()) {
+            snapshot.dictionary_preview_words.push_back(state.pack_index.entries[index].word);
+        }
+    }
+    for (const WqnWordEntry& entry : state.online_results) {
+        snapshot.online_words.push_back(entry.word);
     }
     return snapshot;
 }
@@ -483,23 +549,41 @@ std::string WordAppProgressLabel(const WordAppState& state)
 
 std::string WordAppStatusLine(const WordAppState& state)
 {
-    return "今日 " + std::to_string(state.reviewed_today) + "/" + std::to_string(state.daily_target) +
-           " · 待复习 " + std::to_string(CountDue(state));
+    if (!state.pack_index.mounted) {
+        return "词库分区不可用";
+    }
+    if (state.cloud_sync_failed) {
+        return "词库同步异常";
+    }
+    if (!HasPackWords(state)) {
+        return state.pack_index.status_message.empty() ? "词库未同步" : state.pack_index.status_message;
+    }
+    return "本地词库 " + std::to_string(state.pack_index.entries.size()) + " 词";
 }
 
 std::string WordAppSignature(const WordAppState& state)
 {
     std::string signature;
-    signature.reserve(80);
-    signature.append(state.showing_back ? "back" : "front");
+    signature.reserve(180);
+    signature.append(std::to_string(static_cast<int>(state.mode)));
     signature.push_back('/');
-    signature.append(std::to_string(state.queue_position));
+    signature.append(std::to_string(static_cast<int>(state.home_selection)));
     signature.push_back('/');
-    signature.append(std::to_string(state.queue.size()));
+    signature.append(std::to_string(state.review_position));
     signature.push_back('/');
-    signature.append(std::to_string(state.reviewed_today));
+    signature.append(std::to_string(state.review_indices.size()));
     signature.push_back('/');
-    signature.append(std::to_string(state.correct_today));
+    signature.append(state.current_word.id);
+    signature.push_back('/');
+    signature.append(state.current_word.word);
+    signature.push_back('/');
+    signature.append(state.dictionary_prefix);
+    signature.push_back('/');
+    signature.append(std::to_string(state.dictionary_letter_selected));
+    signature.push_back('/');
+    signature.append(std::to_string(state.dictionary_match_selected));
+    signature.push_back('/');
+    signature.append(std::to_string(state.pack_index.entries.size()));
     signature.push_back('/');
     signature.append(state.message);
     return signature;

@@ -9,11 +9,11 @@ firmware/wqn-zectrix-note4/sdkconfig.old
 firmware/wqn-zectrix-note4/managed_components/
 firmware/wqn-zectrix-note4/%SystemDrive%/
 
-# Local logs and diagnostics
-*.log
-*.err
-*.trace
-*.tmp
+# Local logs and diagnostics (any depth)
+**/*.log
+**/*.err
+**/*.trace
+**/*.tmp
 
 # Local cache files
 .cache/

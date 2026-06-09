@@ -125,14 +125,14 @@ const char* ScreenName(wqn::UiScreen screen)
             return "AI";
         case wqn::UiScreen::kTodo:
             return "Todo";
+        case wqn::UiScreen::kSettings:
+            return "设置";
         case wqn::UiScreen::kHome:
             return "首页";
         case wqn::UiScreen::kTime:
             return "时间";
         case wqn::UiScreen::kWord:
             return "单词";
-        case wqn::UiScreen::kStatus:
-            return "状态";
         case wqn::UiScreen::kLibrary:
             return "题库";
         case wqn::UiScreen::kProblem:
@@ -154,6 +154,8 @@ wqn::UiScreen PreviousTopScreen(wqn::UiScreen screen)
     switch (screen) {
         case wqn::UiScreen::kAi:
             return wqn::UiScreen::kTodo;
+        case wqn::UiScreen::kSettings:
+            return wqn::UiScreen::kAi;
         case wqn::UiScreen::kLibrary:
         case wqn::UiScreen::kProblem:
         case wqn::UiScreen::kSolution:
@@ -162,8 +164,7 @@ wqn::UiScreen PreviousTopScreen(wqn::UiScreen screen)
         case wqn::UiScreen::kReviewQueued:
             return wqn::UiScreen::kAi;
         case wqn::UiScreen::kHome:
-        case wqn::UiScreen::kStatus:
-            return wqn::UiScreen::kLibrary;
+            return wqn::UiScreen::kSettings;
         case wqn::UiScreen::kTime:
             return wqn::UiScreen::kHome;
         case wqn::UiScreen::kWord:
@@ -178,7 +179,9 @@ wqn::UiScreen NextTopScreen(wqn::UiScreen screen)
 {
     switch (screen) {
         case wqn::UiScreen::kAi:
-            return wqn::UiScreen::kLibrary;
+            return wqn::UiScreen::kSettings;
+        case wqn::UiScreen::kSettings:
+            return wqn::UiScreen::kHome;
         case wqn::UiScreen::kLibrary:
         case wqn::UiScreen::kProblem:
         case wqn::UiScreen::kSolution:
@@ -187,7 +190,6 @@ wqn::UiScreen NextTopScreen(wqn::UiScreen screen)
         case wqn::UiScreen::kReviewQueued:
             return wqn::UiScreen::kHome;
         case wqn::UiScreen::kHome:
-        case wqn::UiScreen::kStatus:
             return wqn::UiScreen::kTime;
         case wqn::UiScreen::kTime:
             return wqn::UiScreen::kWord;
@@ -253,23 +255,6 @@ std::string StatusLabel(const std::string& status)
         return "已掌握";
     }
     return status;
-}
-
-void RenderStatus(const wqn::UiState& state, wqn::UiFrame* frame)
-{
-    AddLine(frame, wqn::UiTextStyle::kTitle, "WQN Note4");
-    AddLine(frame, wqn::UiTextStyle::kMeta, std::string("WiFi：") + (state.status.wifi_enabled ? "已启用" : "关闭"));
-    AddLine(frame, wqn::UiTextStyle::kMeta, std::string("联网：") + (state.status.wifi_connected ? "已连接" : "离线"));
-    AddLine(frame, wqn::UiTextStyle::kMeta, std::string("配对：") + (state.status.paired ? "已配对" : "未配对"));
-    if (!state.status.token_mask.empty()) {
-        AddLine(frame, wqn::UiTextStyle::kMeta, "令牌：" + state.status.token_mask);
-    }
-    AddLine(frame, wqn::UiTextStyle::kMeta, "本地题目：" + std::to_string(state.problems.size()));
-    AddLine(frame, wqn::UiTextStyle::kMeta, "待上传：" + std::to_string(state.status.pending_reviews));
-    if (!state.status.last_sync_status.empty()) {
-        AddLine(frame, wqn::UiTextStyle::kBody, "同步：" + state.status.last_sync_status);
-    }
-    AddLine(frame, wqn::UiTextStyle::kMeta, "下：题库  长按确认：上传队列");
 }
 
 void RenderAi(const wqn::UiState& state, wqn::UiFrame* frame)
@@ -531,6 +516,9 @@ void ClampUiSelection(UiState* state)
     } else if (state->todo.selected >= state->todo.todos.size()) {
         state->todo.selected = state->todo.todos.size() - 1;
     }
+    if (state->settings.selected >= 6) {
+        state->settings.selected = 5;
+    }
     const size_t ai_pages = AiSessionPageCount(state->ai);
     if (state->ai.page >= ai_pages) {
         state->ai.page = ai_pages > 0 ? ai_pages - 1 : 0;
@@ -568,6 +556,10 @@ void HandleUiInput(UiState* state, UiInput input)
                 --state->selected_home_task;
             } else if (state->screen == UiScreen::kTodo && state->todo.selected > 0) {
                 --state->todo.selected;
+            } else if (state->screen == UiScreen::kSettings) {
+                if (state->settings.selected > 0) {
+                    --state->settings.selected;
+                }
             } else if (state->screen == UiScreen::kReviewScore) {
                 state->selected_review = PreviousReviewChoice(state->selected_review);
             } else if (state->screen == UiScreen::kLibrary && state->selected_problem > 0) {
@@ -576,8 +568,6 @@ void HandleUiInput(UiState* state, UiInput input)
                 state->screen = UiScreen::kProblem;
             } else if (state->screen == UiScreen::kReviewQueued) {
                 state->screen = UiScreen::kProblem;
-            } else if (state->screen != UiScreen::kHome) {
-                state->screen = UiScreen::kStatus;
             }
             break;
 
@@ -596,10 +586,12 @@ void HandleUiInput(UiState* state, UiInput input)
                 ++state->selected_home_task;
             } else if (state->screen == UiScreen::kTodo && state->todo.selected + 1 < state->todo.todos.size()) {
                 ++state->todo.selected;
+            } else if (state->screen == UiScreen::kSettings) {
+                if (state->settings.selected + 1 < 6) {
+                    ++state->settings.selected;
+                }
             } else if (state->screen == UiScreen::kReviewScore) {
                 state->selected_review = NextReviewChoice(state->selected_review);
-            } else if (state->screen == UiScreen::kStatus) {
-                state->screen = UiScreen::kLibrary;
             } else if (state->screen == UiScreen::kLibrary && state->selected_problem + 1 < state->problems.size()) {
                 ++state->selected_problem;
             } else if (state->screen == UiScreen::kProblem) {
@@ -621,8 +613,6 @@ void HandleUiInput(UiState* state, UiInput input)
                     state->screen = (state->selected_home_task == 0 && !state->problems.empty()) ? UiScreen::kProblem :
                                                                                                      UiScreen::kLibrary;
                 }
-            } else if (state->screen == UiScreen::kStatus) {
-                state->screen = UiScreen::kLibrary;
             } else if (state->screen == UiScreen::kLibrary && !state->problems.empty()) {
                 state->screen = UiScreen::kProblem;
             } else if (state->screen == UiScreen::kProblem) {
@@ -631,6 +621,8 @@ void HandleUiInput(UiState* state, UiInput input)
                 state->screen = UiScreen::kReviewScore;
             } else if (state->screen == UiScreen::kReviewQueue || state->screen == UiScreen::kReviewQueued) {
                 state->screen = UiScreen::kLibrary;
+            } else if (state->screen == UiScreen::kSettings) {
+                // Settings actions are handled in device_ui.cpp because they need storage and diagnostics.
             }
             break;
 
@@ -646,14 +638,10 @@ void HandleUiInput(UiState* state, UiInput input)
                     state->ai.status != AiSessionStatus::kWaitingReply) {
 #if CONFIG_WQN_AI_ENABLE
                     if (StartAiRecordingSession() == ESP_OK) {
-                        state->ai.status = AiSessionStatus::kListening;
-                        state->ai.user_text.clear();
-                        state->ai.assistant_text.clear();
-                        state->ai.pending_text = "正在录音...";
-                        state->ai.status_detail.clear();
-                        state->ai.function_call_summaries.clear();
-                        state->ai.page = 0;
-                        state->ai.status_since_ms = 0;
+                        AiSessionState ai_state;
+                        if (CopyAiSessionToUi(&ai_state)) {
+                            state->ai = ai_state;
+                        }
                     } else {
                         AiSessionState ai_error;
                         if (CopyAiSessionToUi(&ai_error)) {
@@ -672,9 +660,9 @@ void HandleUiInput(UiState* state, UiInput input)
                 }
                 break;
             } else if (state->screen == UiScreen::kHome) {
-                state->screen = UiScreen::kStatus;
-            } else if (state->screen == UiScreen::kStatus) {
-                state->screen = UiScreen::kReviewQueue;
+                state->screen = UiScreen::kSettings;
+            } else if (state->screen == UiScreen::kSettings) {
+                state->screen = UiScreen::kHome;
             } else {
                 state->screen = UiScreen::kLibrary;
             }
@@ -713,8 +701,9 @@ UiFrame RenderUiFrame(const UiState& state)
     frame.ai = state.ai;
     frame.todo = state.todo;
     frame.word_app = BuildWordAppSnapshot(state.word_app);
+    frame.settings = state.settings;
     frame.selected_home_task = state.selected_home_task;
-    frame.prefer_full_refresh = state.screen == UiScreen::kHome || state.screen == UiScreen::kStatus;
+    frame.prefer_full_refresh = state.screen == UiScreen::kHome;
     if (state.screen != UiScreen::kHome) {
         AddLine(&frame, UiTextStyle::kMeta, ScreenName(state.screen));
     }
@@ -726,6 +715,8 @@ UiFrame RenderUiFrame(const UiState& state)
         case UiScreen::kTodo:
             RenderTodo(state, &frame);
             break;
+        case UiScreen::kSettings:
+            break;
         case UiScreen::kHome:
             RenderHome(state, &frame);
             break;
@@ -734,9 +725,6 @@ UiFrame RenderUiFrame(const UiState& state)
             break;
         case UiScreen::kWord:
             RenderWord(state, &frame);
-            break;
-        case UiScreen::kStatus:
-            RenderStatus(state, &frame);
             break;
         case UiScreen::kLibrary:
             RenderLibrary(state, &frame);

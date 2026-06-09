@@ -57,4 +57,9 @@ esp_err_t SaveAiSessionForDay(const CachedAiSession& session);
 esp_err_t LoadAiSessionForDay(const std::string& day, CachedAiSession* session);
 esp_err_t ClearAiSession();
 
+esp_err_t LoadAutoSyncIntervalMinutes(uint32_t* minutes);
+esp_err_t SaveAutoSyncIntervalMinutes(uint32_t minutes);
+std::string AutoSyncIntervalLabel(uint32_t minutes);
+esp_err_t FactoryResetNvsAndRestart();
+
 }  // namespace wqn

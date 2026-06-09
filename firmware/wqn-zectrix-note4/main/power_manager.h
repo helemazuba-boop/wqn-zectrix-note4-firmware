@@ -12,5 +12,6 @@ bool IsUiIdleForSleep();
 esp_err_t PrepareForDeepSleep();
 void EnterDeepSleepIfEnabled();
 void PowerOffEpdAfterIdleIfNeeded();
+void ShutdownForBatteryDepleted();
 
 }  // namespace wqn
