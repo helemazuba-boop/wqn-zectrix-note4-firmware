@@ -15,6 +15,8 @@
 
 #include <ctime>
 
+#include "storage.h"
+
 namespace {
 
 constexpr char kTag[] = "wqn_wifi";
@@ -182,16 +184,17 @@ esp_err_t RegisterHandlers()
 
 namespace wqn {
 
-esp_err_t StartWifiStationIfEnabled()
+esp_err_t StartWifiWithCredentials(const char* ssid, const char* password)
 {
 #if CONFIG_WQN_WIFI_STA_ENABLE
-    if (g_initialized) {
-        return ESP_OK;
+    if (ssid == nullptr || ssid[0] == '\0') {
+        ESP_LOGW(kTag, "cannot start WiFi: empty SSID");
+        return ESP_ERR_INVALID_ARG;
     }
 
-    if (std::strlen(CONFIG_WQN_WIFI_SSID) == 0) {
-        ESP_LOGW(kTag, "WiFi station enabled but CONFIG_WQN_WIFI_SSID is empty; not starting WiFi");
-        return ESP_OK;
+    if (g_initialized) {
+        ESP_LOGI(kTag, "WiFi already initialized, switching to new credentials");
+        ESP_RETURN_ON_ERROR(esp_wifi_disconnect(), kTag, "disconnect before reconfigure");
     }
 
     g_wifi_event_group = xEventGroupCreate();
@@ -215,21 +218,54 @@ esp_err_t StartWifiStationIfEnabled()
     ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_STA), kTag, "set WiFi STA mode");
 
     wifi_config_t wifi_config = {};
-    std::strncpy(reinterpret_cast<char*>(wifi_config.sta.ssid), CONFIG_WQN_WIFI_SSID, sizeof(wifi_config.sta.ssid) - 1);
-    std::strncpy(
-        reinterpret_cast<char*>(wifi_config.sta.password),
-        CONFIG_WQN_WIFI_PASSWORD,
-        sizeof(wifi_config.sta.password) - 1);
+    std::strncpy(reinterpret_cast<char*>(wifi_config.sta.ssid), ssid, sizeof(wifi_config.sta.ssid) - 1);
+    if (password != nullptr && password[0] != '\0') {
+        std::strncpy(reinterpret_cast<char*>(wifi_config.sta.password), password, sizeof(wifi_config.sta.password) - 1);
+    }
     wifi_config.sta.threshold.authmode =
-        std::strlen(CONFIG_WQN_WIFI_PASSWORD) == 0 ? WIFI_AUTH_OPEN : WIFI_AUTH_WPA2_PSK;
+        (password == nullptr || password[0] == '\0') ? WIFI_AUTH_OPEN : WIFI_AUTH_WPA2_PSK;
     wifi_config.sta.sae_pwe_h2e = WPA3_SAE_PWE_BOTH;
 
     ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_STA, &wifi_config), kTag, "set WiFi STA config");
+    ESP_RETURN_ON_ERROR(esp_wifi_set_ps(WIFI_PS_NONE), kTag, "set WiFi power save");
     ESP_RETURN_ON_ERROR(esp_wifi_start(), kTag, "start WiFi");
 
     g_initialized = true;
-    ESP_LOGI(kTag, "WiFi station flow enabled");
+    ESP_LOGI(kTag, "WiFi station started with SSID: %s", ssid);
     return ESP_OK;
+#else
+    (void)ssid;
+    (void)password;
+    ESP_LOGI(kTag, "WiFi station disabled by CONFIG_WQN_WIFI_STA_ENABLE");
+    return ESP_OK;
+#endif
+}
+
+esp_err_t StartWifiStationIfEnabled()
+{
+#if CONFIG_WQN_WIFI_STA_ENABLE
+    if (g_initialized) {
+        return ESP_OK;
+    }
+
+    std::string ssid;
+    std::string password;
+
+    // Layer 1: Try runtime NVS credentials first (from provisioning or settings page)
+    if (wqn::LoadWifiCredentials(&ssid, &password) == ESP_OK && !ssid.empty()) {
+        ESP_LOGI(kTag, "using runtime WiFi credentials from NVS (SSID=%s)", ssid.c_str());
+        return StartWifiWithCredentials(ssid.c_str(), password.c_str());
+    }
+
+    // Layer 2: Fall back to compile-time sdkconfig credentials (developer-only, local-only)
+    if (std::strlen(CONFIG_WQN_WIFI_SSID) > 0) {
+        ESP_LOGI(kTag, "using compile-time WiFi credentials from sdkconfig (SSID=%s)", CONFIG_WQN_WIFI_SSID);
+        return StartWifiWithCredentials(CONFIG_WQN_WIFI_SSID, CONFIG_WQN_WIFI_PASSWORD);
+    }
+
+    // Layer 3: No credentials available; caller should start provisioning mode
+    ESP_LOGI(kTag, "no WiFi credentials available; provisioning mode required");
+    return ESP_ERR_NOT_FOUND;
 #else
     ESP_LOGI(kTag, "WiFi station disabled by CONFIG_WQN_WIFI_STA_ENABLE");
     return ESP_OK;

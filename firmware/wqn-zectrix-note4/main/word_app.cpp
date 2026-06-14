@@ -14,6 +14,7 @@ namespace {
 constexpr char kTag[] = "wqn_word";
 constexpr uint16_t kDefaultDailyTarget = 20;
 constexpr size_t kDictionaryPreviewLimit = 8;
+constexpr size_t kWordHomeSelectionCount = 3;
 
 size_t SelectionIndex(wqn::WordHomeSelection selection)
 {
@@ -22,7 +23,7 @@ size_t SelectionIndex(wqn::WordHomeSelection selection)
 
 wqn::WordHomeSelection HomeSelectionFromIndex(size_t index)
 {
-    switch (index % 3) {
+    switch (index % kWordHomeSelectionCount) {
         case 0:
             return wqn::WordHomeSelection::kSequential;
         case 1:
@@ -32,7 +33,7 @@ wqn::WordHomeSelection HomeSelectionFromIndex(size_t index)
     }
 }
 
-std::string HomeSelectionLabel(wqn::WordHomeSelection selection)
+[[maybe_unused]] std::string HomeSelectionLabel(wqn::WordHomeSelection selection)
 {
     switch (selection) {
         case wqn::WordHomeSelection::kSequential:
@@ -230,15 +231,13 @@ esp_err_t HandleWordAppInput(WordAppState* state, WordInput input)
         case WordAppMode::kHome: {
             size_t selected = SelectionIndex(state->home_selection);
             if (input == WordInput::kUp) {
-                selected = (selected + 2) % 3;
+                selected = (selected + kWordHomeSelectionCount - 1) % kWordHomeSelectionCount;
                 state->home_selection = HomeSelectionFromIndex(selected);
-                state->message = HomeSelectionLabel(state->home_selection);
                 return ESP_OK;
             }
             if (input == WordInput::kDown) {
-                selected = (selected + 1) % 3;
+                selected = (selected + 1) % kWordHomeSelectionCount;
                 state->home_selection = HomeSelectionFromIndex(selected);
-                state->message = HomeSelectionLabel(state->home_selection);
                 return ESP_OK;
             }
             if (input == WordInput::kLongConfirm) {

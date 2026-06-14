@@ -13,11 +13,12 @@
 #include "esp_ota_ops.h"
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "esp_timer.h"
 #include "online_sync.h"
 #include "power_manager.h"
+#include "provision_manager.h"
 #include "storage.h"
 #include "wifi_manager.h"
 #include "wqn_api.h"
@@ -63,6 +64,18 @@ void LogTokenState()
         ESP_LOGW(kTag, "stored access token has invalid shape");
     } else {
         ESP_LOGI(kTag, "paired token present: %s", wqn::MaskTokenForLog(token).c_str());
+    }
+}
+
+void LogWifiCredentialState()
+{
+    std::string ssid;
+    std::string password;
+    const esp_err_t result = wqn::LoadWifiCredentials(&ssid, &password);
+    if (result == ESP_OK && !ssid.empty()) {
+        ESP_LOGI(kTag, "WiFi credentials stored: SSID=%s", ssid.c_str());
+    } else {
+        ESP_LOGI(kTag, "WiFi credentials: none stored (first boot or factory reset)");
     }
 }
 
@@ -458,6 +471,7 @@ extern "C" void app_main(void)
 
     ESP_ERROR_CHECK(wqn::InitStorage());
     LogTokenState();
+    LogWifiCredentialState();
     LogCachedProblemState();
     LogPendingReviewState();
 
@@ -468,7 +482,45 @@ extern "C" void app_main(void)
 
     ConfirmRunningApp();
     ESP_ERROR_CHECK(wqn::InitAiSession());
+
+#if CONFIG_WQN_WIFI_STA_ENABLE && CONFIG_WQN_PROVISION_ENABLE
+    bool needs_provisioning = false;
+    {
+        std::string ssid;
+        std::string password;
+        if (wqn::LoadWifiCredentials(&ssid, &password) != ESP_OK || ssid.empty()) {
+            needs_provisioning = true;
+        }
+    }
+
+    if (needs_provisioning) {
+        ESP_LOGI(kTag, "no WiFi credentials found; starting provisioning mode");
+        wqn::SetProvisionDoneCallback([](const std::string& ssid, const std::string& password) {
+            ESP_LOGI(kTag, "provisioning done, SSID=%s; starting WiFi", ssid.c_str());
+            const esp_err_t ret = wqn::StartWifiWithCredentials(ssid.c_str(), password.c_str());
+            if (ret != ESP_OK) {
+                ESP_LOGE(kTag, "WiFi start after provisioning failed: %s", esp_err_to_name(ret));
+            }
+        });
+        wqn::StartProvisioningMode();
+    } else {
+        const esp_err_t wifi_ret = wqn::StartWifiStationIfEnabled();
+        if (wifi_ret != ESP_OK) {
+            ESP_LOGW(kTag, "WiFi station start failed: %s; starting provisioning", esp_err_to_name(wifi_ret));
+            wqn::SetProvisionDoneCallback([](const std::string& ssid, const std::string& password) {
+                ESP_LOGI(kTag, "provisioning done after WiFi failure, SSID=%s; starting WiFi", ssid.c_str());
+                const esp_err_t ret = wqn::StartWifiWithCredentials(ssid.c_str(), password.c_str());
+                if (ret != ESP_OK) {
+                    ESP_LOGE(kTag, "WiFi start after provisioning failed: %s", esp_err_to_name(ret));
+                }
+            });
+            wqn::StartProvisioningMode();
+        }
+    }
+#else
     ESP_ERROR_CHECK(wqn::StartWifiStationIfEnabled());
+#endif
+
     ESP_ERROR_CHECK(wqn::StartDeviceUiIfEnabled());
     ESP_ERROR_CHECK_WITHOUT_ABORT(wqn::RunAudioSelfTestIfEnabled());
 

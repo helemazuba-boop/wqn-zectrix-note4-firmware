@@ -24,6 +24,17 @@ menu "WQN firmware"
             Development WiFi password. This value is stored only in local
             sdkconfig, which is ignored by git.
 
+    config WQN_PROVISION_ENABLE
+        bool "Enable WiFi provisioning (SoftAP + captive portal)"
+        default y
+        depends on WQN_WIFI_STA_ENABLE
+        help
+            Enable in-app WiFi provisioning for new users with no saved
+            credentials. Starts a captive portal on SoftAP "ZECTRIX_XXXX"
+            at http://192.168.4.1 when no NVS WiFi credentials are found.
+            Set to n only when using a fixed compile-time SSID/password
+            or when the device is always offline.
+
     config WQN_EPD_UI_ENABLE
         bool "Enable ZecTrix Note4 e-paper UI"
         default n
@@ -53,17 +64,19 @@ menu "WQN firmware"
 
     config WQN_EPD_IDLE_POWER_OFF_MS
         int "Power off EPD rail after UI idle milliseconds"
-        default 15000
+        default 1500
         range 0 600000
         depends on WQN_EPD_UI_ENABLE
         help
-            Cut GPIO6 after the UI has been idle for this long. This drops the
-            hot partial-refresh state and saves power. Set 0 to keep the EPD
-            rail on as long as the firmware is running.
+            Cut GPIO6 after the UI has been idle for this long. The previous
+            framebuffer stays synced in CPU memory, so later partial refreshes
+            can still diff against the visible panel image after a cold rail
+            restart. Set 0 to keep the EPD rail on as long as the firmware is
+            running.
 
     config WQN_DEEP_SLEEP_ENABLE
-        bool "Enable experimental deep sleep after UI idle"
-        default n
+        bool "Enable deep sleep after UI idle"
+        default y
         depends on WQN_EPD_UI_ENABLE
         help
             Enter ESP32-S3 deep sleep after the UI has been idle. Wake sources
@@ -72,12 +85,11 @@ menu "WQN firmware"
 
     config WQN_DEEP_SLEEP_IDLE_MS
         int "Deep sleep idle timeout in milliseconds"
-        default 300000
+        default 60000
         range 10000 86400000
         depends on WQN_DEEP_SLEEP_ENABLE
         help
-            Idle time before entering deep sleep. Keep large while validating
-            wakeup behavior on COM7.
+            Idle time before entering deep sleep. Default 60 seconds for normal use.
 
     config WQN_DEEP_SLEEP_TIMER_WAKE_SEC
         int "Deep sleep timer wake interval in seconds"
@@ -103,5 +115,27 @@ menu "WQN firmware"
             Initialize the ES8311/I2S microphone path, capture a short sample,
             print channel RMS/peak statistics over serial, then power audio off.
             This mode does not upload audio or start WiFi by itself.
+
+    config WQN_BATTERY_LOW_THRESHOLD_MV
+        int "Battery low shutdown threshold in millivolts"
+        default 3450
+        help
+            When battery voltage drops below this and USB is not connected,
+            the device shuts down. Official firmware uses 3450mV (3.45V).
+
+    config WQN_BATTERY_OTA_THRESHOLD_PCT
+        int "Minimum battery percent for OTA upgrades"
+        default 50
+        help
+            Prevent OTA upgrades when battery is below this threshold.
+            From official firmware string: "电量不足...请充电至50%%以上"
+
+    config WQN_CHARGING_DEEP_SLEEP_EXTRA_MS
+        int "Extra idle time before deep sleep when charging (ms)"
+        default 300000
+        help
+            When charging, extend deep sleep idle timeout by this amount
+            so the device stays awake longer for syncing/updates.
+            Default 5 minutes extra.
 
 endmenu

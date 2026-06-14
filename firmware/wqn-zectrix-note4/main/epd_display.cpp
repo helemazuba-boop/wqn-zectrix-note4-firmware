@@ -186,6 +186,8 @@ esp_err_t WaitBusyTimeout(int timeout_ms)
     const TickType_t timeout = pdMS_TO_TICKS(timeout_ms);
     while (gpio_get_level(kEpdBusy) == 0) {
         if ((xTaskGetTickCount() - start) > timeout) {
+            ESP_LOGW(kTag, "EPD BUSY wait timed out: %d ms elapsed, gpio8=%d",
+                     timeout_ms, static_cast<int>(gpio_get_level(kEpdBusy)));
             return ESP_ERR_TIMEOUT;
         }
         vTaskDelay(pdMS_TO_TICKS(1));
@@ -309,8 +311,8 @@ esp_err_t InitGpio()
     busy.mode = GPIO_MODE_INPUT;
     busy.pin_bit_mask = (1ULL << kEpdBusy);
     busy.pull_down_en = GPIO_PULLDOWN_DISABLE;
-    busy.pull_up_en = GPIO_PULLUP_DISABLE;
-    ESP_RETURN_ON_ERROR(gpio_config(&busy), kTag, "configure EPD busy");
+    busy.pull_up_en = GPIO_PULLUP_ENABLE;
+    ESP_RETURN_ON_ERROR(gpio_config(&busy), kTag, "configure EPD busy with pull-up");
 
     SetCs(true);
     SetDc(true);
@@ -363,7 +365,7 @@ void PowerOnEpd()
     g_epd_rail_powered = true;
 }
 
-void DropEpdHotState(bool cut_rail)
+void DropEpdHotState(bool cut_rail, bool invalidate_framebuffer)
 {
     if (cut_rail) {
         gpio_hold_dis(kEpdPower);
@@ -372,9 +374,11 @@ void DropEpdHotState(bool cut_rail)
         g_epd_rail_powered = false;
     }
     g_epd_powered = false;
-    g_previous_framebuffer_synced = false;
+    if (invalidate_framebuffer) {
+        g_previous_framebuffer_synced = false;
+        g_partial_refreshes_since_full = 0;
+    }
     g_hot_refresh_ok = false;
-    g_partial_refreshes_since_full = 0;
     g_last_epd_refresh_us = 0;
 }
 
@@ -394,7 +398,7 @@ esp_err_t InitPanelSequence()
 
     ESP_RETURN_ON_ERROR(SendCommand(0x00), kTag, "EPD panel setting");
     ESP_RETURN_ON_ERROR(SendData(0x2F), kTag, "EPD panel setting data0");
-    ESP_RETURN_ON_ERROR(SendData(0x2E), kTag, "EPD panel setting data1");
+    ESP_RETURN_ON_ERROR(SendData(0x0E), kTag, "EPD panel setting data1");
 
     ESP_RETURN_ON_ERROR(SendCommand(0xE9), kTag, "EPD OTP command");
     ESP_RETURN_ON_ERROR(SendData(0x01), kTag, "EPD OTP data");
@@ -519,6 +523,39 @@ DirtyRect FindDirtyRect(const uint8_t* previous, const uint8_t* current)
     return rect;
 }
 
+DirtyRect AlignDirtyRect(const DirtyRect& rect)
+{
+    DirtyRect aligned = rect;
+    if (!aligned.valid) {
+        return aligned;
+    }
+    const int x_start_px = aligned.x_start_byte * 8;
+    const int x_end_px = (aligned.x_end_byte + 1) * 8 - 1;
+    const int aligned_x_start = (x_start_px / 8) * 8;
+    const int aligned_x_end = ((x_end_px + 8) / 8) * 8 - 1;
+    aligned.x_start_byte = std::max(0, aligned_x_start / 8);
+    aligned.x_end_byte = std::min(kEpdBytesPerRow - 1, (aligned_x_end + 1) / 8 - 1);
+    aligned.y_start = std::max(0, (aligned.y_start / 8) * 8);
+    aligned.y_end = std::min(kEpdHeight - 1, ((aligned.y_end + 8) / 8) * 8 - 1);
+    return aligned;
+}
+
+DirtyRect ClampDirtyRect(const DirtyRect& rect)
+{
+    DirtyRect clamped = rect;
+    if (!clamped.valid) {
+        return clamped;
+    }
+    clamped.x_start_byte = std::max(0, clamped.x_start_byte);
+    clamped.x_end_byte = std::min(kEpdBytesPerRow - 1, clamped.x_end_byte);
+    clamped.y_start = std::max(0, clamped.y_start);
+    clamped.y_end = std::min(kEpdHeight - 1, clamped.y_end);
+    if (clamped.x_end_byte < clamped.x_start_byte || clamped.y_end < clamped.y_start) {
+        clamped.valid = false;
+    }
+    return clamped;
+}
+
 int DirtyRectPixelWidth(const DirtyRect& rect)
 {
     return (rect.x_end_byte - rect.x_start_byte + 1) * 8;
@@ -556,6 +593,24 @@ esp_err_t WaitPartialCooldown()
     return ESP_OK;
 }
 
+esp_err_t WaitPanelStatusReady(int max_retries)
+{
+    for (int i = 0; i < max_retries; ++i) {
+        ESP_RETURN_ON_ERROR(SendCommand(0xE0), kTag, "EPD status check cmd");
+        ESP_RETURN_ON_ERROR(SendData(0x00), kTag, "EPD status check data");
+        ESP_RETURN_ON_ERROR(SendCommand(0xA5), kTag, "EPD status probe cmd");
+        const esp_err_t busy_ret = WaitBusyTimeout(kPartialCommandBusyTimeoutMs);
+        if (busy_ret == ESP_OK) {
+            vTaskDelay(pdMS_TO_TICKS(1));
+            return ESP_OK;
+        }
+        ESP_LOGW(kTag, "EPD panel status probe retry %d/%d", i + 1, max_retries);
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+    ESP_LOGW(kTag, "EPD panel status not ready after %d retries", max_retries);
+    return ESP_ERR_TIMEOUT;
+}
+
 bool ShouldKeepEpdPowered()
 {
 #ifdef CONFIG_WQN_EPD_LOCAL_PARTIAL_ENABLE
@@ -570,39 +625,39 @@ esp_err_t TriggerDisplayUpdate(bool is_partial, bool keep_powered)
     if (!g_epd_rail_powered) {
         PowerOnEpd();
     }
-    if (!g_epd_powered || !keep_powered) {
+    if (!g_epd_powered) {
         esp_err_t ret = SendCommand(0x04);
         if (ret != ESP_OK) {
-            DropEpdHotState(true);
+            DropEpdHotState(true, true);
             return ret;
         }
         ret = WaitBusyTimeout(is_partial ? kPartialRefreshBusyTimeoutMs : kBusyTimeoutMs);
         if (ret != ESP_OK) {
             ESP_LOGW(kTag, "EPD power-on wait timed out; dropping hot refresh state");
-            DropEpdHotState(true);
+            DropEpdHotState(true, true);
             return ret;
         }
         g_epd_powered = true;
     }
     esp_err_t ret = SendCommand(0x12);
     if (ret != ESP_OK) {
-        DropEpdHotState(true);
+        DropEpdHotState(true, true);
         return ret;
     }
     ret = SendData(0x00);
     if (ret != ESP_OK) {
-        DropEpdHotState(true);
+        DropEpdHotState(true, true);
         return ret;
     }
     const esp_err_t refresh_ret = WaitBusyTimeout(is_partial ? kPartialRefreshBusyTimeoutMs : kBusyTimeoutMs);
     if (refresh_ret != ESP_OK) {
         ESP_LOGW(kTag, "EPD %s refresh timed out; dropping hot refresh state", is_partial ? "partial" : "full");
-        DropEpdHotState(true);
+        DropEpdHotState(true, true);
         return refresh_ret;
     }
     g_last_epd_refresh_us = esp_timer_get_time();
     g_hot_refresh_ok = keep_powered;
-    if (!is_partial) {
+    if (!is_partial && !keep_powered) {
         ESP_RETURN_ON_ERROR(SendCommand(0x02), kTag, "EPD power off command");
         ESP_RETURN_ON_ERROR(SendData(0x00), kTag, "EPD power off data");
         ESP_RETURN_ON_ERROR(WaitBusy(), kTag, "wait EPD power off command");
@@ -1173,7 +1228,8 @@ esp_err_t SetPartialWindow(const DirtyRect& rect)
 
 esp_err_t SendDirtyRectToPanel(const DirtyRect& rect)
 {
-    ESP_RETURN_ON_ERROR(EnsurePanelReadyForWrite(true), kTag, "prepare EPD panel for local partial write");
+    const bool hot_ready = g_epd_rail_powered && g_epd_powered && g_hot_refresh_ok;
+    ESP_RETURN_ON_ERROR(EnsurePanelReadyForWrite(hot_ready), kTag, "prepare EPD panel for local partial write");
     ESP_RETURN_ON_FALSE(g_framebuffer != nullptr, ESP_ERR_INVALID_STATE, kTag, "EPD framebuffer not allocated");
     ESP_RETURN_ON_FALSE(
         g_previous_framebuffer != nullptr,
@@ -1181,21 +1237,28 @@ esp_err_t SendDirtyRectToPanel(const DirtyRect& rect)
         kTag,
         "previous EPD framebuffer not allocated");
     ESP_RETURN_ON_FALSE(
-        g_epd_powered && g_previous_framebuffer_synced,
+        g_previous_framebuffer_synced,
         ESP_ERR_INVALID_STATE,
         kTag,
-        "EPD local partial requires a powered panel with synced previous framebuffer");
+        "EPD local partial requires a synced previous framebuffer");
+
+    DirtyRect aligned = ClampDirtyRect(AlignDirtyRect(rect));
+    if (!aligned.valid) {
+        ESP_LOGW(kTag, "EPD local partial: empty window after alignment/clamp, skipping");
+        return ESP_OK;
+    }
 
     ESP_RETURN_ON_ERROR(PreparePanelForLocalPartialWrite(), kTag, "prepare EPD local partial write");
-    ESP_RETURN_ON_ERROR(SetPartialWindow(rect), kTag, "set EPD partial window");
+    ESP_RETURN_ON_ERROR(WaitPanelStatusReady(3), kTag, "EPD panel status not ready for local partial");
+    ESP_RETURN_ON_ERROR(SetPartialWindow(aligned), kTag, "set EPD partial window");
     ESP_RETURN_ON_ERROR(SendCommand(0x10), kTag, "EPD partial DTM1 write");
     ESP_RETURN_ON_ERROR(WaitBusyTimeout(kPartialCommandBusyTimeoutMs), kTag, "wait EPD partial RAM command");
 
-    const int window_bytes = rect.x_end_byte - rect.x_start_byte + 1;
+    const int window_bytes = aligned.x_end_byte - aligned.x_start_byte + 1;
     uint8_t line[kEpdBytesPerRow * 2] = {};
-    for (int y = rect.y_start; y <= rect.y_end; ++y) {
-        const uint8_t* src = g_framebuffer + y * kEpdBytesPerRow + rect.x_start_byte;
-        const uint8_t* previous = g_previous_framebuffer + y * kEpdBytesPerRow + rect.x_start_byte;
+    for (int y = aligned.y_start; y <= aligned.y_end; ++y) {
+        const uint8_t* src = g_framebuffer + y * kEpdBytesPerRow + aligned.x_start_byte;
+        const uint8_t* previous = g_previous_framebuffer + y * kEpdBytesPerRow + aligned.x_start_byte;
         for (int xb = 0; xb < window_bytes; ++xb) {
             InterleavePreviousAndCurrent(previous[xb], src[xb], &line[xb * 2], &line[xb * 2 + 1]);
         }
@@ -1212,7 +1275,8 @@ esp_err_t SendDirtyRectToPanel(const DirtyRect& rect)
 
 esp_err_t RefreshEpdFull(bool allow_local_partial, bool force_full_refresh)
 {
-    constexpr float kForceFullDiffRatio = 0.30f;
+    ESP_LOGI(kTag, "EPD RefreshEpdFull: enter partial=%d full=%d fb=%p prev=%p synced=%d",
+        allow_local_partial, force_full_refresh, g_framebuffer, g_previous_framebuffer, g_previous_framebuffer_synced);
     constexpr float kMaxLocalPartialAreaRatio = 0.45f;
     constexpr bool kEnableLocalPartialWindow =
 #ifdef CONFIG_WQN_EPD_LOCAL_PARTIAL_ENABLE
@@ -1241,15 +1305,12 @@ esp_err_t RefreshEpdFull(bool allow_local_partial, bool force_full_refresh)
     const DirtyRect dirty_rect = FindDirtyRect(g_previous_framebuffer, g_framebuffer);
     const float dirty_area_ratio = DirtyRectAreaRatio(dirty_rect);
     bool full_refresh = force_full_refresh || !g_previous_framebuffer_synced;
-    if (!full_refresh && diff_ratio >= kForceFullDiffRatio) {
-        full_refresh = true;
-    }
     if (!full_refresh && g_partial_refreshes_since_full >= kMaxPartialRefreshesBeforeFull) {
-        full_refresh = true;
+        ESP_LOGI(kTag, "EPD full refresh deferred: partial_since_full=%u", static_cast<unsigned>(g_partial_refreshes_since_full));
     }
     const bool hot_update = !full_refresh && g_epd_rail_powered && g_epd_powered && g_hot_refresh_ok;
     bool local_partial =
-        allow_local_partial && kEnableLocalPartialWindow && hot_update && dirty_rect.valid &&
+        allow_local_partial && kEnableLocalPartialWindow && !full_refresh && dirty_rect.valid &&
         dirty_area_ratio <= kMaxLocalPartialAreaRatio;
     if (local_partial && DirtyRectHeight(dirty_rect) > kLocalPartialMaxHeight) {
         local_partial = false;
@@ -1271,19 +1332,25 @@ esp_err_t RefreshEpdFull(bool allow_local_partial, bool force_full_refresh)
 
     esp_err_t refresh_ret =
         local_partial ? SendDirtyRectToPanel(dirty_rect) : SendFramebufferToPanel(!full_refresh, hot_update);
-    if (refresh_ret != ESP_OK && !full_refresh) {
+    if (refresh_ret != ESP_OK) {
         ESP_LOGW(
             kTag,
-            "EPD %s failed: %s; retrying once with cold full refresh",
+            "EPD %s failed: %s; clearing state and forcing full refresh recovery",
             local_partial ? "local partial" : "partial framebuffer",
             esp_err_to_name(refresh_ret));
-        DropEpdHotState(true);
-        full_refresh = true;
-        local_partial = false;
-        refresh_ret = SendFramebufferToPanel(false, false);
-    }
-    if (refresh_ret != ESP_OK) {
-        DropEpdHotState(true);
+        DropEpdHotState(true, true);
+        if (!full_refresh) {
+            ESP_LOGI(kTag, "EPD: attempting automatic full refresh recovery");
+            refresh_ret = SendFramebufferToPanel(false, false);
+            if (refresh_ret != ESP_OK) {
+                ESP_LOGE(kTag, "EPD full refresh recovery failed: %s", esp_err_to_name(refresh_ret));
+                DropEpdHotState(true, true);
+                return refresh_ret;
+            }
+            ESP_LOGI(kTag, "EPD full refresh recovery succeeded");
+        } else {
+            return refresh_ret;
+        }
     }
     ESP_RETURN_ON_ERROR(refresh_ret, kTag, "send EPD framebuffer");
     std::memcpy(g_previous_framebuffer, g_framebuffer, kEpdFramebufferSize);
@@ -1294,7 +1361,7 @@ esp_err_t RefreshEpdFull(bool allow_local_partial, bool force_full_refresh)
 
 void PowerOffEpd()
 {
-    DropEpdHotState(true);
+    DropEpdHotState(true, false);
 }
 
 }  // namespace wqn

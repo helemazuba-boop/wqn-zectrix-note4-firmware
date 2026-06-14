@@ -62,4 +62,9 @@ esp_err_t SaveAutoSyncIntervalMinutes(uint32_t minutes);
 std::string AutoSyncIntervalLabel(uint32_t minutes);
 esp_err_t FactoryResetNvsAndRestart();
 
+esp_err_t LoadWifiCredentials(std::string* ssid, std::string* password);
+esp_err_t SaveWifiCredentials(const std::string& ssid, const std::string& password);
+esp_err_t ClearWifiCredentials();
+bool HasWifiCredentials();
+
 }  // namespace wqn

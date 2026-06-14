@@ -98,6 +98,15 @@ esp_err_t InitZectrixNote4SafePins()
     ESP_RETURN_ON_ERROR(ConfigureInputs(button_and_status_inputs), kTag, "configure input pins");
 
     ESP_LOGI(kTag, "safe pins ready: PWR_ON latch on, EPD/audio/amp/NFC off, LED off");
+
+    constexpr gpio_num_t kI2cSda = GPIO_NUM_47;
+    constexpr gpio_num_t kI2cScl = GPIO_NUM_48;
+    constexpr int kI2cClkHz = 100000;
+    ESP_RETURN_ON_ERROR(
+        wqn::InitPowerHardware(I2C_NUM_0, kI2cSda, kI2cScl, kI2cClkHz),
+        kTag,
+        "init power hardware (ADC, I2C, RTC)");
+
     return ESP_OK;
 }
 

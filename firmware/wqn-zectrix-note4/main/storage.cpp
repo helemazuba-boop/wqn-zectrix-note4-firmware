@@ -25,9 +25,13 @@ constexpr char kAiSessionKey[] = "ai_session_day";
 constexpr char kAccessTokenSavedAtKey[] = "token_saved";
 constexpr char kAccessTokenExpiresAtKey[] = "token_exp";
 constexpr char kAutoSyncIntervalMinKey[] = "sync_min";
+constexpr char kWifiSsidKey[] = "wifi_ssid";
+constexpr char kWifiPasswordKey[] = "wifi_pass";
 static_assert(sizeof(kAccessTokenSavedAtKey) <= 16, "NVS key must fit ESP-IDF's 15-character limit");
 static_assert(sizeof(kAccessTokenExpiresAtKey) <= 16, "NVS key must fit ESP-IDF's 15-character limit");
 static_assert(sizeof(kAutoSyncIntervalMinKey) <= 16, "NVS key must fit ESP-IDF's 15-character limit");
+static_assert(sizeof(kWifiSsidKey) <= 16, "NVS key must fit ESP-IDF's 15-character limit");
+static_assert(sizeof(kWifiPasswordKey) <= 16, "NVS key must fit ESP-IDF's 15-character limit");
 constexpr uint64_t kAccessTokenMaxAgeSeconds = 30ULL * 24ULL * 60ULL * 60ULL;
 constexpr std::time_t kMinReasonableUnixTime = 1704067200;  // 2024-01-01 UTC
 constexpr char kStoragePartitionLabel[] = "storage";
@@ -727,6 +731,37 @@ esp_err_t FactoryResetNvsAndRestart()
     ESP_RETURN_ON_ERROR(nvs_flash_erase(), kTag, "erase NVS for factory reset");
     esp_restart();
     return ESP_OK;
+}
+
+esp_err_t LoadWifiCredentials(std::string* ssid, std::string* password)
+{
+    if (ssid == nullptr || password == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    ESP_RETURN_ON_ERROR(LoadStringFromNvs(kWifiSsidKey, ssid), kTag, "load WiFi SSID");
+    return LoadStringFromNvs(kWifiPasswordKey, password);
+}
+
+esp_err_t SaveWifiCredentials(const std::string& ssid, const std::string& password)
+{
+    ESP_RETURN_ON_ERROR(SaveStringToNvs(kWifiSsidKey, ssid), kTag, "save WiFi SSID");
+    return SaveStringToNvs(kWifiPasswordKey, password);
+}
+
+esp_err_t ClearWifiCredentials()
+{
+    esp_err_t result = ClearNvsKey(kWifiSsidKey);
+    const esp_err_t clear_pass = ClearNvsKey(kWifiPasswordKey);
+    if (result == ESP_OK) {
+        result = clear_pass;
+    }
+    return result;
+}
+
+bool HasWifiCredentials()
+{
+    std::string ssid;
+    return LoadStringFromNvs(kWifiSsidKey, &ssid) == ESP_OK && !ssid.empty();
 }
 
 }  // namespace wqn

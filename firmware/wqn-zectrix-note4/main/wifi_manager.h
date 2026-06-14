@@ -6,6 +6,7 @@
 namespace wqn {
 
 esp_err_t StartWifiStationIfEnabled();
+esp_err_t StartWifiWithCredentials(const char* ssid, const char* password);
 esp_err_t WaitForWifiStationConnected(TickType_t timeout);
 bool IsWifiStationConnected();
 

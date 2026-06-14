@@ -12,9 +12,29 @@ idf_component_register(
         "epd_display.cpp"
         "fonts/SourceHanSansSC_Regular_slim.c"
         "power_manager.cpp"
+        "pcf8563.cpp"
+        "provision_manager.cpp"
         "storage.cpp"
         "text_render.cpp"
         "time_app.cpp"
+        "ui/battery.cpp"
+        "ui/clock.cpp"
+        "ui/diagnostics.cpp"
+        "ui/graphics.cpp"
+        "ui/page_ai.cpp"
+        "ui/page_home.cpp"
+        "ui/page_settings.cpp"
+        "ui/page_time.cpp"
+        "ui/page_todo.cpp"
+        "ui/page_word.cpp"
+        "ui/seven_segment.cpp"
+        "ui/text_wrappers.cpp"
+        "ui/todo_cloud.cpp"
+        "ui/ui_input.cpp"
+        "ui/ui_refresh.cpp"
+        "ui/ui_render.cpp"
+        "ui/ui_state.cpp"
+        "ui/word_cloud.cpp"
         "ui_model.cpp"
         "wifi_manager.cpp"
         "word_pack.cpp"
@@ -24,6 +44,7 @@ idf_component_register(
     REQUIRES
         driver
         esp_hw_support
+        esp_http_server
         esp_system
         esp_timer
         app_update

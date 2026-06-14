@@ -15,6 +15,7 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "power_manager.h"
 
 namespace {
 
@@ -148,6 +149,11 @@ esp_err_t InitI2c(i2c_master_bus_handle_t* bus)
 {
     if (bus == nullptr) {
         return ESP_ERR_INVALID_ARG;
+    }
+    i2c_master_bus_handle_t shared = wqn::GetSharedI2cBusHandle();
+    if (shared != nullptr) {
+        *bus = shared;
+        return ESP_OK;
     }
     i2c_master_bus_config_t config = {};
     config.i2c_port = kCodecI2cPort;

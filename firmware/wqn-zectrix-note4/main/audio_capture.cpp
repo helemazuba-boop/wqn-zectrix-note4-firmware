@@ -16,6 +16,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "power_manager.h"
 
 namespace {
 
@@ -203,14 +204,19 @@ esp_err_t InitI2c(i2c_master_bus_handle_t* bus)
     if (*bus != nullptr) {
         return ESP_OK;
     }
-    i2c_master_bus_config_t config = {};
-    config.i2c_port = kCodecI2cPort;
-    config.sda_io_num = kCodecSda;
-    config.scl_io_num = kCodecScl;
-    config.clk_source = I2C_CLK_SRC_DEFAULT;
-    config.glitch_ignore_cnt = 7;
-    config.flags.enable_internal_pullup = 1;
-    return i2c_new_master_bus(&config, bus);
+    *bus = wqn::GetSharedI2cBusHandle();
+    if (*bus == nullptr) {
+        ESP_LOGW(kTag, "shared I2C bus not available, creating own");
+        i2c_master_bus_config_t config = {};
+        config.i2c_port = kCodecI2cPort;
+        config.sda_io_num = kCodecSda;
+        config.scl_io_num = kCodecScl;
+        config.clk_source = I2C_CLK_SRC_DEFAULT;
+        config.glitch_ignore_cnt = 7;
+        config.flags.enable_internal_pullup = 1;
+        return i2c_new_master_bus(&config, bus);
+    }
+    return ESP_OK;
 }
 
 esp_err_t AddCodecDevice(i2c_master_bus_handle_t bus, i2c_master_dev_handle_t* dev)

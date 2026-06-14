@@ -1,0 +1,226 @@
+I (427) cpu_start: GPIO 44 and 43 are used as console UART I/O pins
+I (428) cpu_start: Pro cpu start user code
+I (428) cpu_start: cpu freq: 240000000 Hz
+I (429) app_init: Application information:
+I (433) app_init: Project name:     wqn-zectrix-note4
+I (438) app_init: App version:      0.1.0
+I (442) app_init: Compile time:     Jun 13 2026 18:18:41
+I (447) app_init: ELF file SHA256:  12fd3ba40...
+I (451) app_init: ESP-IDF:          v5.5.4
+I (455) efuse_init: Min chip rev:     v0.0
+I (459) efuse_init: Max chip rev:     v0.99 
+I (463) efuse_init: Chip rev:         v0.2
+I (467) heap_init: Initializing. RAM available for dynamic allocation:
+I (473) heap_init: At 3FCAB0E8 len 0003E628 (249 KiB): RAM
+I (478) heap_init: At 3FCE9710 len 00005724 (21 KiB): RAM
+I (483) heap_init: At 3FCF0000 len 00008000 (32 KiB): DRAM
+I (488) heap_init: At 600FE060 len 00001F88 (7 KiB): RTCRAM
+I (494) esp_psram: Adding pool of 8192K of PSRAM memory to heap allocator
+I (501) spi_flash: detected chip: generic
+I (504) spi_flash: flash io: qio
+I (507) sleep_gpio: Configure to isolate all GPIO pins in sleep state
+I (513) sleep_gpio: Enable automatic switching of GPIO sleep configuration
+I (520) main_task: Started on CPU0
+I (530) esp_psram: Reserving pool of 64K of internal memory for DMA/internal allocations
+I (530) main_task: Calling app_main()
+I (530) wqn_board: safe pins ready: PWR_ON latch on, EPD/audio/amp/NFC off, LED off
+I (540) wqn_power: ADC calibration (curve fitting) enabled
+I (550) wqn_power: ADC initialized: channel=3 atten=3 bits=12 samples=10
+I (550) wqn_power: shared I2C bus created: port=0 SDA=47 SCL=48 clk=100000
+I (560) wqn_pcf8563: PCF8563 attached to shared I2C bus
+I (560) wqn_power: PCF8563 initialized on shared I2C bus
+I (570) wqn_power: wakeup cause: undefined (0)
+I (570) wqn_diag: wqn-zectrix-note4 0.1.0
+I (580) wqn_diag: board=zectrix-s3-epaper-4.2 target=esp32s3 idf=v5.5.4
+I (580) wqn_diag: api_base=https://wqn.helema.cn/api/esp32
+I (590) wqn_diag: chip cores=2 revision=2 features=wifi ble 
+I (590) wqn_diag: flash_size=16777216 bytes
+I (600) wqn_diag: psram=initialized size=8388608 bytes
+I (600) wqn_diag: wifi_mac=AC:A7:04:E9:5E:78
+I (610) wqn_diag: reset_reason=poweron
+W (630) wqn_storage: NVS encryption is disabled; access token is protected by local expiry metadata only
+I (630) wqn_storage: NVS ready
+I (1020) wqn_storage: storage SPIFFS ready: total=7703441 used=0
+W (1020) wqn_storage: clock is not synced; token expiry check deferred
+I (1020) wqn_main: paired token present: d7a0...ba0f
+I (1030) wqn_main: WiFi credentials: none stored (first boot or factory reset)
+I (1040) wqn_main: cached problems: count=1
+I (1040) wqn_main: pending review uploads: count=0
+W (1050) wqn_api: word deck missing id at index=1
+W (1050) wqn_api: skip invalid word deck at index=1
+W (1050) wqn_api: word entry missing word/meaning at index=1
+W (1060) wqn_api: skip invalid word entry at index=1
+W (1060) wqn_api: word progress missing word_id at index=1
+W (1070) wqn_api: skip invalid word progress at index=1
+W (1070) wqn_api: word entry missing id at index=1
+W (1080) wqn_api: skip invalid review word at index=1
+W (1080) wqn_api: word entry missing word/meaning at index=1
+W (1090) wqn_api: skip invalid search word at index=1
+I (1090) wqn_contract: contract fixture self-test passed
+I (1100) wqn_main: running app marked valid
+I (1100) wqn_main: no WiFi credentials found; starting provisioning mode
+I (1110) wqn_prov: provisioning task started
+I (1110) pp: pp rom version: e7ae62f
+I (1110) net80211: net80211 rom version: e7ae62f
+I (1120) wqn_ui: EPD refresh task started
+I (1120) wqn_ui: Todo cloud task started
+I (1130) wifi:wifi driver task: 3fceea94, prio:23, stack:6656, core=0
+I (1140) wifi:wifi firmware version: 0947e8b
+I (1140) wifi:wifi certification version: v7.0
+I (1140) wifi:config NVS flash: enabled
+I (1140) wifi:config nano formatting: disabled
+I (1150) wifi:Init data frame dynamic rx buffer num: 6
+I (1150) wifi:Init static rx mgmt buffer num: 5
+I (1160) wifi:Init management short buffer num: 32
+I (1160) wifi:Init dynamic tx buffer num: 32
+I (1170) wifi:Init static tx FG buffer num: 2
+I (1170) wifi:Init static rx buffer size: 1600
+I (1170) wifi:Init static rx buffer num: 3
+I (1180) wifi:Init dynamic rx buffer num: 6
+I (1180) wqn_ui: Word cloud task started
+I (1180) wifi_init: rx ba win: 3
+I (1190) wifi_init: accept mbox: 6
+I (1190) wifi_init: tcpip mbox: 16
+I (1190) wifi_init: udp mbox: 6
+I (1200) wifi_init: tcp mbox: 6
+I (1200) wifi_init: tcp tx win: 5760
+I (1200) wifi_init: tcp rx win: 5760
+I (1210) wifi_init: tcp mss: 1440
+I (1210) wifi_init: WiFi IRAM OP enabled
+I (1210) wifi_init: WiFi RX IRAM OP enabled
+I (1220) wqn_ui: device UI task started
+I (1220) phy_init: phy_version 711,97bcf0a2,Aug 25 2025,19:04:10
+I (1220) wqn_ui: clock seeded from build time: 2026-06-13 18:18:53 CST
+I (1230) wqn_epd: allocated EPD framebuffer in PSRAM, size=15000
+I (1240) wqn_epd: allocated EPD framebuffer in PSRAM, size=15000
+I (1260) wifi:mode : softAP (ac:a7:04:e9:5e:79)
+I (1260) wifi:Total power save buffer number: 16
+I (1260) wifi:Init max length of beacon: 752/752
+I (1260) wifi:Init max length of beacon: 752/752
+I (1270) wqn_prov: SoftAP started: SSID=WQN_N4_0000 IP=192.168.4.1
+I (1270) esp_netif_lwip: DHCP server started on interface WIFI_AP_DEF with IP: 192.168.4.1
+I (1280) wqn_main: WQN online task started
+I (1280) wqn_prov: HTTP server started on port 80
+I (1290) wqn_prov: provisioning server ready
+I (1280) wqn_prov: DNS proxy listening on UDP:53, redirecting to 192.168.4.1
+I (1280) wqn_main: firmware initialization complete
+W (1580) word_pack: storage SPIFFS mount point is not available
+E (1580) adc_oneshot: adc_oneshot_new_unit(99): adc1 is already in use
+E (1580) adc_oneshot: adc_oneshot_new_unit(99): adc1 is already in use
+E (1590) adc_oneshot: adc_oneshot_new_unit(99): adc1 is already in use
+I (1590) wqn_ui: battery protection skipped: invalid reading pmu_status=unknown depleted_candidate=0 shutdown_count=0
+I (402) MSPI Timing: Enter psram timing tuning
+I (407) esp_psram: Found 8MB PSRAM device
+I (410) esp_psram: Speed: 80MHz
+I (413) cpu_start: Multicore app
+I (427) cpu_start: GPIO 44 and 43 are used as console UART I/O pins
+I (428) cpu_start: Pro cpu start user code
+I (428) cpu_start: cpu freq: 240000000 Hz
+I (429) app_init: Application information:
+I (433) app_init: Project name:     wqn-zectrix-note4
+I (438) app_init: App version:      0.1.0
+I (442) app_init: Compile time:     Jun 13 2026 18:18:41
+I (447) app_init: ELF file SHA256:  12fd3ba40...
+I (451) app_init: ESP-IDF:          v5.5.4
+I (455) efuse_init: Min chip rev:     v0.0
+I (459) efuse_init: Max chip rev:     v0.99 
+I (463) efuse_init: Chip rev:         v0.2
+I (467) heap_init: Initializing. RAM available for dynamic allocation:
+I (473) heap_init: At 3FCAB0E8 len 0003E628 (249 KiB): RAM
+I (478) heap_init: At 3FCE9710 len 00005724 (21 KiB): RAM
+I (483) heap_init: At 3FCF0000 len 00008000 (32 KiB): DRAM
+I (488) heap_init: At 600FE060 len 00001F88 (7 KiB): RTCRAM
+I (494) esp_psram: Adding pool of 8192K of PSRAM memory to heap allocator
+I (501) spi_flash: detected chip: generic
+I (504) spi_flash: flash io: qio
+I (507) sleep_gpio: Configure to isolate all GPIO pins in sleep state
+I (513) sleep_gpio: Enable automatic switching of GPIO sleep configuration
+I (520) main_task: Started on CPU0
+I (530) esp_psram: Reserving pool of 64K of internal memory for DMA/internal allocations
+I (530) main_task: Calling app_main()
+I (530) wqn_board: safe pins ready: PWR_ON latch on, EPD/audio/amp/NFC off, LED off
+I (540) wqn_power: ADC calibration (curve fitting) enabled
+I (550) wqn_power: ADC initialized: channel=3 atten=3 bits=12 samples=10
+I (550) wqn_power: shared I2C bus created: port=0 SDA=47 SCL=48 clk=100000
+I (560) wqn_pcf8563: PCF8563 attached to shared I2C bus
+I (560) wqn_power: PCF8563 initialized on shared I2C bus
+I (570) wqn_power: wakeup cause: undefined (0)
+I (570) wqn_diag: wqn-zectrix-note4 0.1.0
+I (580) wqn_diag: board=zectrix-s3-epaper-4.2 target=esp32s3 idf=v5.5.4
+I (580) wqn_diag: api_base=https://wqn.helema.cn/api/esp32
+I (590) wqn_diag: chip cores=2 revision=2 features=wifi ble 
+I (590) wqn_diag: flash_size=16777216 bytes
+I (600) wqn_diag: psram=initialized size=8388608 bytes
+I (600) wqn_diag: wifi_mac=AC:A7:04:E9:5E:78
+I (610) wqn_diag: reset_reason=poweron
+W (630) wqn_storage: NVS encryption is disabled; access token is protected by local expiry metadata only
+I (630) wqn_storage: NVS ready
+I (1020) wqn_storage: storage SPIFFS ready: total=7703441 used=0
+W (1020) wqn_storage: clock is not synced; token expiry check deferred
+I (1020) wqn_main: paired token present: d7a0...ba0f
+I (1030) wqn_main: WiFi credentials: none stored (first boot or factory reset)
+I (1040) wqn_main: cached problems: count=1
+I (1040) wqn_main: pending review uploads: count=0
+W (1050) wqn_api: word deck missing id at index=1
+W (1050) wqn_api: skip invalid word deck at index=1
+W (1050) wqn_api: word entry missing word/meaning at index=1
+W (1060) wqn_api: skip invalid word entry at index=1
+W (1060) wqn_api: word progress missing word_id at index=1
+W (1070) wqn_api: skip invalid word progress at index=1
+W (1070) wqn_api: word entry missing id at index=1
+W (1080) wqn_api: skip invalid review word at index=1
+W (1080) wqn_api: word entry missing word/meaning at index=1
+W (1090) wqn_api: skip invalid search word at index=1
+I (1090) wqn_contract: contract fixture self-test passed
+I (1100) wqn_main: running app marked valid
+I (1100) wqn_main: no WiFi credentials found; starting provisioning mode
+I (1110) wqn_prov: provisioning task started
+I (1110) pp: pp rom version: e7ae62f
+I (1110) net80211: net80211 rom version: e7ae62f
+I (1120) wqn_ui: EPD refresh task started
+I (1120) wqn_ui: Todo cloud task started
+I (1130) wifi:wifi driver task: 3fceea94, prio:23, stack:6656, core=0
+I (1140) wifi:wifi firmware version: 0947e8b
+I (1140) wifi:wifi certification version: v7.0
+I (1140) wifi:config NVS flash: enabled
+I (1140) wifi:config nano formatting: disabled
+I (1150) wifi:Init data frame dynamic rx buffer num: 6
+I (1150) wifi:Init static rx mgmt buffer num: 5
+I (1160) wifi:Init management short buffer num: 32
+I (1160) wifi:Init dynamic tx buffer num: 32
+I (1170) wifi:Init static tx FG buffer num: 2
+I (1170) wifi:Init static rx buffer size: 1600
+I (1170) wifi:Init static rx buffer num: 3
+I (1180) wifi:Init dynamic rx buffer num: 6
+I (1180) wqn_ui: Word cloud task started
+I (1180) wifi_init: rx ba win: 3
+I (1190) wifi_init: accept mbox: 6
+I (1190) wifi_init: tcpip mbox: 16
+I (1190) wifi_init: udp mbox: 6
+I (1200) wifi_init: tcp mbox: 6
+I (1200) wifi_init: tcp tx win: 5760
+I (1200) wifi_init: tcp rx win: 5760
+I (1210) wifi_init: tcp mss: 1440
+I (1210) wifi_init: WiFi IRAM OP enabled
+I (1210) wifi_init: WiFi RX IRAM OP enabled
+I (1220) wqn_ui: device UI task started
+I (1220) phy_init: phy_version 711,97bcf0a2,Aug 25 2025,19:04:10
+I (1220) wqn_ui: clock seeded from build time: 2026-06-13 18:18:53 CST
+I (1230) wqn_epd: allocated EPD framebuffer in PSRAM, size=15000
+I (1240) wqn_epd: allocated EPD framebuffer in PSRAM, size=15000
+I (1260) wifi:mode : softAP (ac:a7:04:e9:5e:79)
+I (1260) wifi:Total power save buffer number: 16
+I (1260) wifi:Init max length of beacon: 752/752
+I (1260) wifi:Init max length of beacon: 752/752
+I (1270) wqn_prov: SoftAP started: SSID=WQN_N4_0000 IP=192.168.4.1
+I (1270) esp_netif_lwip: DHCP server started on interface WIFI_AP_DEF with IP: 192.168.4.1
+I (1280) wqn_main: WQN online task started
+I (1280) wqn_prov: HTTP server started on port 80
+I (1290) wqn_prov: provisioning server ready
+I (1280) wqn_prov: DNS proxy listening on UDP:53, redirecting to 192.168.4.1
+I (1280) wqn_main: firmware initialization complete
+W (1580) word_pack: storage SPIFFS mount point is not available
+E (1580) adc_oneshot: adc_oneshot_new_unit(99): adc1 is already in use
+E (1580) adc_oneshot: adc_oneshot_new_unit(99): adc1 is already in use
+E (1590) adc_oneshot: adc_oneshot_new_unit(99): adc1 is already in use
+I (1590) wqn_ui: battery protection skipped: invalid reading pmu_status=unknown depleted_candidate=0 shutdown_count=0
