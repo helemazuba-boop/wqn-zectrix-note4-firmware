@@ -1361,7 +1361,35 @@ esp_err_t RefreshEpdFull(bool allow_local_partial, bool force_full_refresh)
 
 void PowerOffEpd()
 {
+    // [epd-leak-fix] Spec book §5.3 requires sending SSD1683 deep-sleep command
+    // 0x07/0xA5 before cutting GPIO 6, otherwise the controller remains in an
+    // active state and current backflows through protection diodes when the
+    // rail drops. Best-effort: if SPI is busy or failed, fall through to the
+    // rail cut so we never wedge the device on a power-down path.
+    if (g_spi != nullptr && g_epd_rail_powered) {
+        const esp_err_t deep_sleep_ret = SendCommand(0x07);
+        if (deep_sleep_ret == ESP_OK) {
+            if (SendData(0xA5) == ESP_OK) {
+                // Use a short timeout — power-down path must not block 30s.
+                // Best-effort: failure here is logged in WaitBusyTimeout.
+                (void)WaitBusyTimeout(1000);
+            }
+        } else {
+            ESP_LOGW(kTag, "EPD deep-sleep command failed: %s", esp_err_to_name(deep_sleep_ret));
+        }
+    }
+
     DropEpdHotState(true, false);
+
+    // [epd-leak-fix] Spec book §5.3 step 3: reconfigure SPI pins to low-output
+    // or high-impedance after the rail drops, to prevent diode backflow into
+    // the de-powered EPD module. gpio_hold_en keeps them there through deep sleep.
+    constexpr gpio_num_t kSpiPins[] = {kEpdSck, kEpdMosi, kEpdCs, kEpdDc, kEpdReset};
+    for (gpio_num_t pin : kSpiPins) {
+        gpio_hold_dis(pin);
+        gpio_set_level(pin, 0);
+        gpio_hold_en(pin);
+    }
 }
 
 }  // namespace wqn
