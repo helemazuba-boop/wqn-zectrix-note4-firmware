@@ -165,8 +165,13 @@ bool IsUiIdleForSleepEx(int extra_idle_ms)
     threshold_ms += extra_idle_ms;
 
     const int64_t now_ms = NowMs();
-    const int64_t last_activity_ms = std::max(g_last_user_activity_ms, g_last_epd_activity_ms);
-    return last_activity_ms > 0 && (now_ms - last_activity_ms) >= threshold_ms;
+    // [power-fix] Only the last user activity drives the deep-sleep idle
+    // timer. NoteEpdActivity() is called on every partial refresh (e.g. the
+    // clock screen's minute-rollover), so including it in `std::max(user,
+    // epd)` made the threshold unreachable and permanently pinned the
+    // device in active mode. EPD activity is still tracked separately for
+    // the EPD rail power-off path.
+    return g_last_user_activity_ms > 0 && (now_ms - g_last_user_activity_ms) >= threshold_ms;
 }
 
 esp_err_t InitPowerHardware(i2c_port_t i2c_port, gpio_num_t i2c_sda, gpio_num_t i2c_scl, int i2c_clk_hz)

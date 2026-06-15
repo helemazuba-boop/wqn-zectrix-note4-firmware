@@ -78,6 +78,15 @@ esp_err_t InitZectrixNote4SafePins()
     gpio_set_level(kLed, 1);
     gpio_set_level(kBoardPowerLatch, 1);
 
+    // [power-fix] Tell ESP-IDF that the board power-latch pin must NOT be
+    // switched to "sleep" mode by the IO_MUX during light/deep sleep. With
+    // CONFIG_ESP_SLEEP_GPIO_RESET_WORKAROUND=y, the SLP_SEL bit would otherwise
+    // be cleared and the pad re-isolated, releasing the latch and triggering
+    // the 1.6s boot loop. Disabling sleep-mode selection for this pin keeps
+    // the active push-pull HIGH configuration all the way through the sleep
+    // entry, matching the official firmware's `ConfigureSleepInput` path.
+    ESP_ERROR_CHECK(gpio_sleep_sel_dis(kBoardPowerLatch));
+
     const uint64_t epd_bus_pins =
         (1ULL << kEpdBusy) |
         (1ULL << kEpdReset) |

@@ -59,17 +59,51 @@ const char* DisconnectReasonName(uint8_t reason)
 
 void WifiReconnectTask(void*)
 {
+    // [power-fix] Mirrors the official firmware's bounded retry + power-down
+    // backoff: attempt 5 fast reconnects (5s apart), then stop the radio,
+    // sleep 60s to save power, and start the radio again for the next batch.
+    // Previously the loop just re-issued esp_wifi_connect() every 5s
+    // forever, keeping the WiFi modem (~100mA+) continuously hot.
+    constexpr int kFastRetryMax = 5;
+    constexpr int kBackoffSec = 60;
+    constexpr int kBackoffSliceMs = 1000;
+
+    int retry = 0;
     while (!g_wifi_connected) {
         vTaskDelay(kReconnectDelay);
         if (g_wifi_connected) {
             break;
         }
 
-        ESP_LOGI(kTag, "retrying WiFi station connection");
+        ESP_LOGI(kTag, "retrying WiFi station connection (attempt %d/%d)", retry + 1, kFastRetryMax);
         const esp_err_t result = esp_wifi_connect();
         if (result != ESP_OK && result != ESP_ERR_WIFI_CONN) {
             ESP_LOGW(kTag, "WiFi reconnect request failed: %s", esp_err_to_name(result));
         }
+
+        if (++retry < kFastRetryMax) {
+            continue;
+        }
+
+        // 5 fast retries exhausted. Stop the radio to drop the ~100mA
+        // modem current, then back off for kBackoffSec before trying again.
+        ESP_LOGW(kTag, "WiFi fast-retry exhausted (%d), stopping radio and backing off %d s", kFastRetryMax, kBackoffSec);
+        if (esp_wifi_stop() != ESP_OK) {
+            ESP_LOGW(kTag, "esp_wifi_stop() failed during backoff");
+        }
+        // Sleep in 1s slices so an external QueueReconnect() can still wake
+        // us up promptly when something else (e.g. a button press that
+        // wants to re-provision) requests a new connection.
+        for (int slept = 0; slept < kBackoffSec && !g_wifi_connected; ++slept) {
+            vTaskDelay(pdMS_TO_TICKS(kBackoffSliceMs));
+        }
+        if (g_wifi_connected) {
+            break;
+        }
+        if (esp_wifi_start() != ESP_OK) {
+            ESP_LOGW(kTag, "esp_wifi_start() failed after backoff, will retry anyway");
+        }
+        retry = 0;
     }
 
     g_reconnect_pending = false;

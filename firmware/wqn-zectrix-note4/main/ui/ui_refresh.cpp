@@ -455,6 +455,17 @@ void EpdRefreshTask(void*)
                 wqn::NoteEpdActivity();
                 esp_rom_printf("I (%u) wqn_ui: EPD UI refresh done: schedule=%s elapsed_ms=%lld\n",
                                (unsigned)xTaskGetTickCount(), RefreshScheduleName(schedule), static_cast<long long>(refresh_elapsed_ms));
+
+                // [power-fix] After a successful partial refresh (typically
+                // the clock screen's minute-rollover), if the user has been
+                // idle for the deep-sleep threshold we enter deep sleep
+                // immediately instead of spinning in the UI loop until the
+                // device_ui task notices. This matches the official
+                // firmware's "refresh -> deep sleep -> RTC alarm wake"
+                // pattern. EnterDeepSleepIfEnabled() is a no-op unless
+                // CONFIG_WQN_DEEP_SLEEP_ENABLE=y and the device has been
+                // user-idle for >= WQN_DEEP_SLEEP_IDLE_MS.
+                wqn::EnterDeepSleepIfEnabled();
             } else {
                 esp_rom_printf("W (%u) wqn_ui: EPD UI render failed: %s\n",
                                (unsigned)xTaskGetTickCount(), esp_err_to_name(result));

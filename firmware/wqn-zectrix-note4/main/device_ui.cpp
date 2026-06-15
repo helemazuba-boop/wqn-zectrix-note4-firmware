@@ -185,11 +185,16 @@ void DeviceUiTask(void*)
 
         wqn::PowerOffEpdAfterIdleIfNeeded();
 
-        // [epd-hang-fix] esp_light_sleep_start() unconditionally isolates all GPIOs
-        // (CONFIG_ESP_SLEEP_GPIO_RESET_WORKAROUND=y), which releases the GPIO 17 power-latch
-        // and causes a 1.6s boot loop on first boot. Disabled until the proper
-        // wakeup source + gpio_hold_en(GPIO_17) flow is in place.
-        vTaskDelay(pdMS_TO_TICKS(10));
+        // [power-fix] With CONFIG_PM_ENABLE=y, the FreeRTOS idle task now
+        // auto-enters light sleep whenever every task is in vTaskDelay. The
+        // previous "esp_light_sleep_start() unconditionally isolates all
+        // GPIOs" failure was caused by CONFIG_ESP_SLEEP_GPIO_RESET_WORKAROUND
+        // releasing the GPIO 17 power-latch; that is now suppressed by
+        // gpio_sleep_sel_dis(kBoardPowerLatch) in InitZectrixNote4SafePins().
+        // Bumping the delay from 10ms to 50ms gives PM DFS a cleaner window
+        // to actually transition the CPU into light sleep, while still
+        // keeping the UI loop responsive to button events.
+        vTaskDelay(pdMS_TO_TICKS(50));
 
         wqn::EnterDeepSleepIfEnabled();
 
