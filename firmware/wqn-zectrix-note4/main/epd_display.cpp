@@ -1380,10 +1380,14 @@ void PowerOffEpd()
         const esp_err_t deep_sleep_ret = SendCommand(0x07);
         if (deep_sleep_ret == ESP_OK) {
             if (SendData(0xA5) == ESP_OK) {
-                // 200ms is plenty for SSD1683 to enter deep sleep; failure
-                // here just prints a warning inside WaitBusyTimeout and the
-                // rail still gets cut.
-                (void)WaitBusyTimeout(200);
+                // Do not poll BUSY here: once the SSD1683 enters deep sleep
+                // it leaves BUSY asserted low (or floating) forever, so any
+                // WaitBusyTimeout will always burn its full budget and emit
+                // an "EPD BUSY wait timed out" warning. The SPI transmit is
+                // synchronous, so by the time SendData returns the byte has
+                // been clocked out; a 10ms delay is plenty for the controller
+                // to latch the command before we cut the rail.
+                vTaskDelay(pdMS_TO_TICKS(10));
             }
         } else {
             ESP_LOGW(kTag, "EPD deep-sleep command failed: %s", esp_err_to_name(deep_sleep_ret));
