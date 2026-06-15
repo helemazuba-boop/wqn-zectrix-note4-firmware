@@ -359,6 +359,16 @@ void FreeFramebuffer(uint8_t*& fb)
 
 void PowerOnEpd()
 {
+    // [epd-leak-fix] Release hold on SPI pins before driving the rail up.
+    // PowerOffEpd() holds kEpd{Sck,Mosi,Cs,Dc,Reset} low to block diode
+    // backflow into the de-powered EPD module. That hold survives deep sleep,
+    // so on the next refresh we must explicitly release it or the panel
+    // remains hardware-reset and SPI never reaches the controller.
+    constexpr gpio_num_t kSpiPins[] = {kEpdSck, kEpdMosi, kEpdCs, kEpdDc, kEpdReset};
+    for (gpio_num_t pin : kSpiPins) {
+        gpio_hold_dis(pin);
+    }
+
     gpio_hold_dis(kEpdPower);
     gpio_set_level(kEpdPower, 1);
     gpio_hold_en(kEpdPower);
@@ -1370,9 +1380,10 @@ void PowerOffEpd()
         const esp_err_t deep_sleep_ret = SendCommand(0x07);
         if (deep_sleep_ret == ESP_OK) {
             if (SendData(0xA5) == ESP_OK) {
-                // Use a short timeout — power-down path must not block 30s.
-                // Best-effort: failure here is logged in WaitBusyTimeout.
-                (void)WaitBusyTimeout(1000);
+                // 200ms is plenty for SSD1683 to enter deep sleep; failure
+                // here just prints a warning inside WaitBusyTimeout and the
+                // rail still gets cut.
+                (void)WaitBusyTimeout(200);
             }
         } else {
             ESP_LOGW(kTag, "EPD deep-sleep command failed: %s", esp_err_to_name(deep_sleep_ret));
