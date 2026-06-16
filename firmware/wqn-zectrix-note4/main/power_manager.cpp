@@ -5,6 +5,7 @@
 #include "driver/adc.h"
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
+#include "driver/uart.h"
 #include "esp_adc/adc_cali.h"
 #include "esp_adc/adc_cali_scheme.h"
 #include "esp_adc/adc_oneshot.h"
@@ -110,6 +111,14 @@ void HoldOutput(gpio_num_t pin, int level)
 // press). With it, the last user-activity timestamp is preserved across
 // deep-sleep cycles, so the idle threshold is satisfied immediately on wake.
 RTC_DATA_ATTR int64_t g_last_user_activity_ms = 0;
+// [power-fix] Boot counter persisted in RTC slow memory.  If the device
+// wakes from deep sleep and IsUiIdleForSleep() is immediately true (e.g. no
+// user activity since the last sleep), the device will go straight back to
+// deep sleep.  After N consecutive deep-sleep cycles with no user activity
+// we give up and stay awake so the user can interact with the device.  A
+// real user will press a button before the counter hits the limit.
+RTC_DATA_ATTR uint32_t g_deep_sleep_cycle_count = 0;
+static constexpr uint32_t kMaxConsecutiveSleepCycles = 3;
 int64_t g_last_epd_activity_ms = 0;
 bool g_epd_idle_cut = false;
 
@@ -417,8 +426,26 @@ void EnterDeepSleepIfEnabled()
     }
 
     if (!IsUiIdleForSleep()) {
+        // [power-fix] User interacted, reset the consecutive-sleep counter.
+        g_deep_sleep_cycle_count = 0;
         return;
     }
+
+    // [power-fix] If IsUiIdleForSleep() was true immediately on wake (i.e.
+    // no new user activity since the last sleep), increment the counter.
+    // After kMaxConsecutiveSleepCycles of pure idle wakes, stop trying to
+    // sleep and let the device stay awake so the user can wake it with a
+    // button press.  User activity resets the counter on next wake.
+    if (g_deep_sleep_cycle_count >= kMaxConsecutiveSleepCycles) {
+        ESP_LOGW(kTag,
+            "consecutive deep-sleep limit reached (%u); staying awake; "
+            "any button press will reset the counter",
+            g_deep_sleep_cycle_count);
+        g_deep_sleep_cycle_count = 0;
+        return;
+    }
+    ++g_deep_sleep_cycle_count;
+    ESP_LOGI(kTag, "deep-sleep cycle %u/%u", g_deep_sleep_cycle_count, kMaxConsecutiveSleepCycles);
 
     const esp_err_t result = PrepareForDeepSleep();
     if (result != ESP_OK) {
@@ -432,6 +459,16 @@ void EnterDeepSleepIfEnabled()
     ESP_LOGI(kTag, "=== PM locks before deep sleep ===");
     esp_pm_dump_locks(stdout);
     ESP_LOGI(kTag, "=== end PM lock dump ===");
+
+    // [power-fix] Flush the UART TX buffer and wait for the USB CDC
+    // hardware to finish transmitting before entering deep sleep.
+    // Without this the last few log lines (including the lock dump)
+    // are silently dropped because the USB peripheral is clock-gated
+    // the instant esp_deep_sleep_start() is called.
+    // uart_wait_tx_idle_polling() spins until TX FIFO is empty.
+    ESP_LOGI(kTag, "flushing UART before deep sleep...");
+    uart_wait_tx_idle_polling(static_cast<uart_port_t>(CONFIG_ESP_CONSOLE_UART_NUM));
+    vTaskDelay(pdMS_TO_TICKS(50));
 
     ESP_LOGI(kTag, "entering deep sleep");
     esp_deep_sleep_start();
