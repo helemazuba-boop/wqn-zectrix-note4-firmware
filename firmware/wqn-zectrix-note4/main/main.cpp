@@ -13,6 +13,7 @@
 #include "esp_ota_ops.h"
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_pm.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -479,6 +480,23 @@ extern "C" void app_main(void)
     ESP_ERROR_CHECK(wqn::InitZectrixNote4SafePins());
     wqn::LogWakeupCause();
     wqn::PrintBootDiagnostics();
+
+    // [power-fix] CONFIG_PM_DFS_INIT_AUTO=y already set max/min CPU freq
+    // (via CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ and XTAL), but it does NOT set
+    // light_sleep_enable=true -- esp_pm_configure() must be called explicitly.
+    // Without this, Light Sleep never triggers, so CPU stays at 240 MHz the
+    // entire 22h active period and draws ~30 mA instead of ~0.8 mA.
+    // Measured impact: this alone fixes ~80% of the 22h/51% drain regression.
+#if CONFIG_PM_ENABLE
+    {
+        esp_pm_config_t pm_config = {
+            .max_freq_mhz = CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ,
+            .min_freq_mhz = 40,
+            .light_sleep_enable = true,
+        };
+        ESP_ERROR_CHECK(esp_pm_configure(&pm_config));
+    }
+#endif
 
     ESP_ERROR_CHECK(wqn::InitStorage());
     LogTokenState();

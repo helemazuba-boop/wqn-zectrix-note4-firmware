@@ -8,8 +8,10 @@
 #include "esp_adc/adc_cali.h"
 #include "esp_adc/adc_cali_scheme.h"
 #include "esp_adc/adc_oneshot.h"
+#include "esp_attr.h"
 #include "esp_check.h"
 #include "esp_log.h"
+#include "esp_pm.h"
 #include "esp_sleep.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -102,7 +104,12 @@ void HoldOutput(gpio_num_t pin, int level)
     gpio_hold_en(pin);
 }
 
-int64_t g_last_user_activity_ms = 0;
+// [power-fix] RTC_DATA_ATTR persists this across deep-sleep resets.
+// Without it, after every RTC-timer wake the variable is 0 and
+// IsUiIdleForSleep waits for the next NoteUserActivity call (e.g. button
+// press). With it, the last user-activity timestamp is preserved across
+// deep-sleep cycles, so the idle threshold is satisfied immediately on wake.
+RTC_DATA_ATTR int64_t g_last_user_activity_ms = 0;
 int64_t g_last_epd_activity_ms = 0;
 bool g_epd_idle_cut = false;
 
@@ -418,6 +425,13 @@ void EnterDeepSleepIfEnabled()
         ESP_LOGW(kTag, "deep sleep aborted: %s", esp_err_to_name(result));
         return;
     }
+
+    // [power-fix debug] Dump all PM locks so we can confirm NO_LIGHT_SLEEP
+    // is not held when entering deep sleep.  Delete this block after one
+    // successful deep-sleep test confirms everything is clean.
+    ESP_LOGI(kTag, "=== PM locks before deep sleep ===");
+    esp_pm_dump_locks(stdout);
+    ESP_LOGI(kTag, "=== end PM lock dump ===");
 
     ESP_LOGI(kTag, "entering deep sleep");
     esp_deep_sleep_start();

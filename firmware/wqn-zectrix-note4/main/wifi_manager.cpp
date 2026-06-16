@@ -7,6 +7,7 @@
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_netif_sntp.h"
+#include "esp_pm.h"
 #include "esp_wifi.h"
 #include "freertos/event_groups.h"
 #include "freertos/FreeRTOS.h"
@@ -91,6 +92,12 @@ void WifiReconnectTask(void*)
         if (esp_wifi_stop() != ESP_OK) {
             ESP_LOGW(kTag, "esp_wifi_stop() failed during backoff");
         }
+        // [power-fix debug] Confirm no PM locks are held at this point so
+        // Light Sleep is actually available during the 60s backoff.
+        ESP_LOGI(kTag, "=== PM locks before WiFi backoff ===");
+        esp_pm_dump_locks(stdout);
+        ESP_LOGI(kTag, "=== end PM lock dump ===");
+
         // Sleep in 1s slices so an external QueueReconnect() can still wake
         // us up promptly when something else (e.g. a button press that
         // wants to re-provision) requests a new connection.
