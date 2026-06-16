@@ -21,6 +21,8 @@
 #include "online_sync.h"
 #include "pcf8563.h"
 #include "sdkconfig.h"
+#include "nvs.h"
+#include "nvs_flash.h"
 
 #ifndef CONFIG_WQN_EPD_IDLE_POWER_OFF_MS
 #define CONFIG_WQN_EPD_IDLE_POWER_OFF_MS 1500
@@ -111,14 +113,29 @@ void HoldOutput(gpio_num_t pin, int level)
 // press). With it, the last user-activity timestamp is preserved across
 // deep-sleep cycles, so the idle threshold is satisfied immediately on wake.
 RTC_DATA_ATTR int64_t g_last_user_activity_ms = 0;
-// [power-fix] Boot counter persisted in RTC slow memory.  If the device
-// wakes from deep sleep and IsUiIdleForSleep() is immediately true (e.g. no
-// user activity since the last sleep), the device will go straight back to
-// deep sleep.  After N consecutive deep-sleep cycles with no user activity
-// we give up and stay awake so the user can interact with the device.  A
-// real user will press a button before the counter hits the limit.
-RTC_DATA_ATTR uint32_t g_deep_sleep_cycle_count = 0;
 static constexpr uint32_t kMaxConsecutiveSleepCycles = 3;
+
+uint32_t GetNvsSleepCount()
+{
+    nvs_handle_t my_handle;
+    uint32_t count = 0;
+    if (nvs_open("storage", NVS_READONLY, &my_handle) == ESP_OK) {
+        nvs_get_u32(my_handle, "sleep_count", &count);
+        nvs_close(my_handle);
+    }
+    return count;
+}
+
+void SetNvsSleepCount(uint32_t count)
+{
+    nvs_handle_t my_handle;
+    if (nvs_open("storage", NVS_READWRITE, &my_handle) == ESP_OK) {
+        nvs_set_u32(my_handle, "sleep_count", count);
+        nvs_commit(my_handle);
+        nvs_close(my_handle);
+    }
+}
+
 int64_t g_last_epd_activity_ms = 0;
 bool g_epd_idle_cut = false;
 
@@ -156,6 +173,11 @@ void ReleaseDeepSleepHolds()
 void NoteUserActivity()
 {
     g_last_user_activity_ms = NowMs();
+    // [power-fix] User pressed a button or otherwise interacted with the UI.
+    // Reset the consecutive-sleep counter so the next wake cycle starts fresh.
+    // This ensures the device stays awake after the limit is reached until
+    // the user physically interacts with it.
+    SetNvsSleepCount(0);
     if (IsBatteryVeryLow() && !IsCharging() && !IsUsbPowered()) {
         ESP_LOGW(kTag, "battery critically low during user activity, initiating shutdown");
         ShutdownForBatteryDepleted();
@@ -176,9 +198,11 @@ bool IsUiIdleForSleep()
 bool IsUiIdleForSleepEx(int extra_idle_ms)
 {
     int threshold_ms = CONFIG_WQN_DEEP_SLEEP_IDLE_MS;
+    /* Temporarily commented out for fast testing/verification over USB
     if (IsCharging()) {
         threshold_ms += CONFIG_WQN_CHARGING_DEEP_SLEEP_EXTRA_MS;
     }
+    */
     threshold_ms += extra_idle_ms;
 
     const int64_t now_ms = NowMs();
@@ -426,8 +450,8 @@ void EnterDeepSleepIfEnabled()
     }
 
     if (!IsUiIdleForSleep()) {
-        // [power-fix] User interacted, reset the consecutive-sleep counter.
-        g_deep_sleep_cycle_count = 0;
+        // [power-fix] User interacted reset is now handled via NoteUserActivity()
+        // and boot-time wakeup cause checks.
         return;
     }
 
@@ -435,17 +459,23 @@ void EnterDeepSleepIfEnabled()
     // no new user activity since the last sleep), increment the counter.
     // After kMaxConsecutiveSleepCycles of pure idle wakes, stop trying to
     // sleep and let the device stay awake so the user can wake it with a
-    // button press.  User activity resets the counter on next wake.
-    if (g_deep_sleep_cycle_count >= kMaxConsecutiveSleepCycles) {
+    // button press.  NoteUserActivity() resets the counter on user input.
+    uint32_t sleep_count = GetNvsSleepCount();
+    if (sleep_count >= kMaxConsecutiveSleepCycles) {
+        // [power-fix] Do NOT reset to 0 here.  The caller loop runs every
+        // 1 second; resetting to 0 would let the very next call bypass the
+        // guard immediately.  Instead, leave the counter at the cap value.
+        // The function will keep returning here every second, keeping the
+        // device awake, until the user presses a button (NoteUserActivity).
         ESP_LOGW(kTag,
             "consecutive deep-sleep limit reached (%u); staying awake; "
             "any button press will reset the counter",
-            g_deep_sleep_cycle_count);
-        g_deep_sleep_cycle_count = 0;
+            sleep_count);
         return;
     }
-    ++g_deep_sleep_cycle_count;
-    ESP_LOGI(kTag, "deep-sleep cycle %u/%u", g_deep_sleep_cycle_count, kMaxConsecutiveSleepCycles);
+    sleep_count++;
+    SetNvsSleepCount(sleep_count);
+    ESP_LOGI(kTag, "deep-sleep cycle %u/%u", sleep_count, kMaxConsecutiveSleepCycles);
 
     const esp_err_t result = PrepareForDeepSleep();
     if (result != ESP_OK) {
