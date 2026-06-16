@@ -12,6 +12,7 @@
 #include "esp_system.h"
 #include "nvs.h"
 #include "nvs_flash.h"
+#include "online_sync.h"
 #include "sdkconfig.h"
 
 namespace {
@@ -407,13 +408,26 @@ esp_err_t SaveAccessToken(const std::string& token)
     if (result != ESP_OK) {
         ESP_LOGW(kTag, "access token metadata save failed, clearing token: %s", esp_err_to_name(result));
         ESP_ERROR_CHECK_WITHOUT_ABORT(ClearAccessTokenKeys());
+        return result;
     }
+
+    // [power-fix] The online sync task is parked on portMAX_DELAY while
+    // the device is unpaired. Waking it here lets it run the first real
+    // sync round immediately after pairing instead of waiting for the
+    // next user action or scheduled interval.
+    RequestOnlineSyncNow();
     return result;
 }
 
 esp_err_t ClearAccessToken()
 {
-    return ClearAccessTokenKeys();
+    // [power-fix] If clearing the token was triggered by some external
+    // event (e.g. the server returning 401 during sync), we want the
+    // online task to re-evaluate its delay immediately rather than stay
+    // parked on whatever value it was using.
+    const esp_err_t result = ClearAccessTokenKeys();
+    wqn::RequestOnlineSyncNow();
+    return result;
 }
 
 bool IsAccessTokenExpired()

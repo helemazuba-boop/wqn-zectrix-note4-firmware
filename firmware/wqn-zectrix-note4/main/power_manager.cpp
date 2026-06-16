@@ -15,6 +15,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "epd_display.h"
+#include "online_sync.h"
 #include "pcf8563.h"
 #include "sdkconfig.h"
 
@@ -395,6 +396,16 @@ void EnterDeepSleepIfEnabled()
 #if CONFIG_WQN_DEEP_SLEEP_ENABLE
     if (IsBatteryVeryLow() && !IsCharging() && !IsUsbPowered()) {
         ShutdownForBatteryDepleted();
+        return;
+    }
+
+    // [power-fix] Refuse to enter deep sleep while the device is still
+    // unpaired. Provisioning is signalled by the SoftAP + captive portal
+    // sitting on the radio; yanking the CPU out from under it would kill
+    // the user mid-flow (they can take more than 60s to type a WiFi
+    // password). The check is cheap (NVS read) and matches the official
+    // firmware's "no token -> never sleep" rule.
+    if (!wqn::HasUsableStoredToken()) {
         return;
     }
 

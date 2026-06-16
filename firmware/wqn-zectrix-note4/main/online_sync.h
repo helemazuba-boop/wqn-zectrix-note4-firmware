@@ -22,4 +22,10 @@ void RequestOnlineSyncNow();
 void GetOnlineSyncSnapshot(OnlineSyncSnapshot* snapshot);
 TickType_t GetConfiguredOnlineSyncDelayTicks();
 
+// [power-fix] Returns true when the device has a usable access token
+// (i.e. pairing finished). Power manager uses this to refuse deep sleep
+// while the device is still in provisioning mode, which would otherwise
+// tear down the SoftAP / captive portal mid-flow.
+bool HasUsableStoredToken();
+
 }  // namespace wqn

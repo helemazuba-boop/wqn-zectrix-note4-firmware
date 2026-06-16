@@ -94,7 +94,6 @@ void ConfirmRunningApp()
 TaskHandle_t g_wqn_online_task = nullptr;
 wqn::OnlineSyncSnapshot g_online_sync_snapshot = {};
 constexpr TickType_t kOnlineSyncRetryDelay = pdMS_TO_TICKS(10000);
-constexpr TickType_t kUnpairedPollingDelay = pdMS_TO_TICKS(2000);
 
 void SetOnlineSyncStatus(const char* status)
 {
@@ -359,7 +358,13 @@ bool RunWqnOnlineRound()
 TickType_t NextOnlineSyncWaitDelay(bool round_synced, bool has_token_after_round)
 {
     if (!has_token_after_round) {
-        return kUnpairedPollingDelay;
+        // [power-fix] Once the device has lost (or never had) an access
+        // token it is in provisioning mode. Polling the server every 2s
+        // serves no purpose -- the device cannot authenticate -- and it
+        // keeps the CPU + radio hot for no benefit. Block on the
+        // notification until something (e.g. a fresh token save in
+        // wqn::SaveAccessToken) wakes us back up.
+        return portMAX_DELAY;
     }
     if (round_synced) {
         return wqn::GetConfiguredOnlineSyncDelayTicks();
@@ -376,7 +381,7 @@ void WqnOnlineTask(void*)
     SetOnlineSyncStatus("idle");
     bool first_round = true;
     while (true) {
-        if (first_round && wqn::GetConfiguredOnlineSyncDelayTicks() == portMAX_DELAY && HasUsableStoredToken()) {
+        if (first_round && wqn::GetConfiguredOnlineSyncDelayTicks() == portMAX_DELAY && wqn::HasUsableStoredToken()) {
             ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
         }
         first_round = false;
@@ -386,7 +391,7 @@ void WqnOnlineTask(void*)
         const bool synced = RunWqnOnlineRound();
         g_online_sync_snapshot.last_finished_ms = esp_timer_get_time() / 1000;
         g_online_sync_snapshot.last_round_success = synced;
-        const bool has_token_after_round = HasUsableStoredToken();
+        const bool has_token_after_round = wqn::HasUsableStoredToken();
         if (synced) {
             ++g_online_sync_snapshot.success_count;
             SetOnlineSyncStatus("success");
@@ -418,6 +423,12 @@ esp_err_t StartWqnOnlineTask()
 }  // namespace
 
 namespace wqn {
+
+bool HasUsableStoredToken()
+{
+    std::string token;
+    return LoadUsableToken(&token);
+}
 
 void NotifyOnlineSyncRequested()
 {
@@ -501,8 +512,15 @@ extern "C" void app_main(void)
             if (ret != ESP_OK) {
                 ESP_LOGE(kTag, "WiFi start after provisioning failed: %s", esp_err_to_name(ret));
             }
+            // [power-fix] Wake the online sync task so it polls the WQN
+            // server for pairing as soon as the radio is up.
+            wqn::RequestOnlineSyncNow();
         });
         wqn::StartProvisioningMode();
+        // [power-fix] Wake the online sync task so it can poll the
+        // server for pairing status. Without this it would stay parked
+        // on portMAX_DELAY forever.
+        wqn::RequestOnlineSyncNow();
     } else {
         const esp_err_t wifi_ret = wqn::StartWifiStationIfEnabled();
         if (wifi_ret != ESP_OK) {
@@ -513,8 +531,10 @@ extern "C" void app_main(void)
                 if (ret != ESP_OK) {
                     ESP_LOGE(kTag, "WiFi start after provisioning failed: %s", esp_err_to_name(ret));
                 }
+                wqn::RequestOnlineSyncNow();
             });
             wqn::StartProvisioningMode();
+            wqn::RequestOnlineSyncNow();
         }
     }
 #else
