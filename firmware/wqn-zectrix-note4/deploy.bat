@@ -14,8 +14,8 @@ echo  WQN Note4 Flash Deploy (Unified Script)
 echo ========================================
 echo.
 
-:: Step 1: Load ESP-IDF environment
-echo [Step 1] Loading ESP-IDF environment...
+:: Step 1: Build the project (always do this to pick up any code changes)
+echo [Step 1] Building project...
 call "D:\Program\Espressif\frameworks\esp-idf-v5.5.4\export.bat"
 if errorlevel 1 (
     echo   ERROR: Failed to load ESP-IDF environment.
@@ -23,18 +23,23 @@ if errorlevel 1 (
     pause
     exit /b 1
 )
+idf.py -B "%BUILD_DIR%" build
+if errorlevel 1 (
+    echo   ERROR: Build failed^!
+    pause
+    exit /b 1
+)
 echo   Done.
 
 :: Step 2: Prompt for COM port
 echo.
-set /p COM_PORT="Enter COM port (e.g. COM7) or press Enter for COM7: "
-if "%COM_PORT%"=="" set "COM_PORT=COM7"
+set "COM_PORT=COM7"
 
 echo.
 echo [Step 2] Using COM port: %COM_PORT%
 echo.
 
-:: Step 3: Erase entire flash
+:: Step 3: Erase entire flash (this takes ~30 seconds)...
 echo [Step 3] Erasing entire flash (this takes ~30 seconds)...
 idf.py -p %COM_PORT% -B "%BUILD_DIR%" erase-flash
 if errorlevel 1 (
