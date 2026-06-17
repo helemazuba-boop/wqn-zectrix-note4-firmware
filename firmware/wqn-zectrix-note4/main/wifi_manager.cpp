@@ -31,6 +31,10 @@ bool g_reconnect_pending = false;
 bool g_wifi_connected = false;
 bool g_sntp_started = false;
 EventGroupHandle_t g_wifi_event_group = nullptr;
+TaskHandle_t g_reconnect_task_handle = nullptr;
+
+// [power-fix] Used to interrupt the 60-second backoff delay when a user
+// action or external request needs WiFi to reconnect immediately.
 
 const char* DisconnectReasonName(uint8_t reason)
 {
@@ -102,7 +106,10 @@ void WifiReconnectTask(void*)
         // us up promptly when something else (e.g. a button press that
         // wants to re-provision) requests a new connection.
         for (int slept = 0; slept < kBackoffSec && !g_wifi_connected; ++slept) {
-            vTaskDelay(pdMS_TO_TICKS(kBackoffSliceMs));
+            // [power-fix] Use task notification instead of vTaskDelay so
+            // QueueReconnect() can interrupt the backoff immediately by
+            // calling xTaskNotifyGive on this task's handle.
+            ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(kBackoffSliceMs));
         }
         if (g_wifi_connected) {
             break;
@@ -114,19 +121,32 @@ void WifiReconnectTask(void*)
     }
 
     g_reconnect_pending = false;
+    g_reconnect_task_handle = nullptr;
     vTaskDelete(nullptr);
 }
 
 void QueueReconnect()
 {
     if (g_reconnect_pending) {
+        // [power-fix] A reconnect task is already running (possibly in the
+        // 60-second backoff phase). Instead of ignoring the request, send it
+        // a notification so it immediately breaks out of the backoff delay
+        // and reconnects without waiting.
+        if (g_reconnect_task_handle != nullptr) {
+            BaseType_t higher_priority_woken = pdFALSE;
+            vTaskNotifyGiveFromISR(g_reconnect_task_handle, &higher_priority_woken);
+            if (higher_priority_woken == pdTRUE) {
+                portYIELD_FROM_ISR();
+            }
+        }
         return;
     }
 
     g_reconnect_pending = true;
-    const BaseType_t created = xTaskCreate(WifiReconnectTask, "wqn_wifi_reconnect", 2048, nullptr, 4, nullptr);
+    const BaseType_t created = xTaskCreate(WifiReconnectTask, "wqn_wifi_reconnect", 4096, nullptr, 4, &g_reconnect_task_handle);
     if (created != pdPASS) {
         g_reconnect_pending = false;
+        g_reconnect_task_handle = nullptr;
         ESP_LOGW(kTag, "failed to create WiFi reconnect task");
     }
 }

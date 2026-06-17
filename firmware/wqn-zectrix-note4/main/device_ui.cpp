@@ -58,7 +58,6 @@ int64_t g_last_active_us_local = 0;
 void DeviceUiTask(void*)
 {
     ESP_LOGI(kTag, "device UI task started");
-    wqn::NoteUserActivity();
     SeedClockFromBuildTimeIfNeeded();
 
     esp_err_t result = wqn::InitButtonInput();

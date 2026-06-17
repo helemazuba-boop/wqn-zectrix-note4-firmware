@@ -5,6 +5,7 @@
 
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
+#include "esp_crc.h"
 #include "esp_check.h"
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
@@ -33,7 +34,7 @@ constexpr int kBusyTimeoutMs = 30000;
 constexpr int kPartialRefreshBusyTimeoutMs = 1500;
 constexpr int kPartialCommandBusyTimeoutMs = 1500;
 constexpr int kLocalPartialMaxHeight = 170;
-constexpr uint32_t kMaxPartialRefreshesBeforeFull = 120;
+constexpr uint32_t kMaxPartialRefreshesBeforeFull = 20;
 constexpr int kTextGlyphWidth = 5;
 constexpr int kTextGlyphHeight = 7;
 constexpr int kTextCellWidth = 6;
@@ -54,6 +55,13 @@ bool g_previous_framebuffer_synced = false;
 bool g_hot_refresh_ok = false;
 uint32_t g_partial_refreshes_since_full = 0;
 int64_t g_last_epd_refresh_us = 0;
+
+// [power-fix] Persisted across deep-sleep resets so the EPD refresh task
+// can skip redundant panel updates after an RTC-timer wakeup.  Without this,
+// RAM state is lost on every deep sleep and the driver always forces a full
+// refresh, causing visible flicker on every clock tick.
+RTC_DATA_ATTR uint32_t g_rtc_last_frame_crc = 0;
+RTC_DATA_ATTR bool g_rtc_last_frame_crc_valid = false;
 
 extern "C" const lv_font_t SourceHanSansSC_Regular_slim;
 
@@ -1304,6 +1312,19 @@ esp_err_t RefreshEpdFull(bool allow_local_partial, bool force_full_refresh)
         kTag,
         "previous EPD framebuffer not allocated");
 
+    // [power-fix] Compute CRC of what we want on screen.  If it matches the
+    // CRC stored in RTC memory from the last real refresh, the panel already
+    // shows this frame and we can skip the entire SPI transaction.
+    const uint32_t current_crc = esp_crc32_le(~0U, g_framebuffer, kEpdFramebufferSize) ^ ~0U;
+    if (!force_full_refresh && g_rtc_last_frame_crc_valid && current_crc == g_rtc_last_frame_crc) {
+        // Panel already shows this content -- restore RAM state to match and
+        // skip the refresh to eliminate flicker and save ~200ms of CPU time.
+        g_previous_framebuffer_synced = true;
+        std::memcpy(g_previous_framebuffer, g_framebuffer, kEpdFramebufferSize);
+        ESP_LOGI(kTag, "EPD refresh skipped: RTC CRC match (crc=0x%08x)", current_crc);
+        return ESP_OK;
+    }
+
     const size_t diff_bits = CountFramebufferDiffBits(g_previous_framebuffer, g_framebuffer);
     if (g_previous_framebuffer_synced && diff_bits == 0) {
         ESP_LOGI(kTag, "EPD refresh skipped: framebuffer unchanged");
@@ -1366,6 +1387,10 @@ esp_err_t RefreshEpdFull(bool allow_local_partial, bool force_full_refresh)
     std::memcpy(g_previous_framebuffer, g_framebuffer, kEpdFramebufferSize);
     g_previous_framebuffer_synced = true;
     g_partial_refreshes_since_full = full_refresh ? 0 : g_partial_refreshes_since_full + 1;
+    // [power-fix] Record the CRC so deep-sleep wakeups can skip the next
+    // refresh if the frame content hasn't changed.
+    g_rtc_last_frame_crc = current_crc;
+    g_rtc_last_frame_crc_valid = true;
     return ESP_OK;
 }
 

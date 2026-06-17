@@ -362,9 +362,13 @@ bool IsUsbPowered()
     return IsCharging() || IsFullyCharged();
 }
 
+// kChargeFull (GPIO1) is the /STDBY pin of the charge IC (e.g. TP4056).
+// It is open-drain active-low: when the battery is NOT fully charged the
+// pin floats high (via MCU pull-up); when fully charged it is driven low.
+// Therefore we detect a full charge by reading 0, not 1.
 bool IsFullyCharged()
 {
-    return gpio_get_level(kChargeFull) == 1;
+    return gpio_get_level(kChargeFull) == 0;
 }
 
 bool IsBatteryLow()
