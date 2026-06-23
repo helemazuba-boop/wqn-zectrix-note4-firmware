@@ -33,3 +33,9 @@ analysis/
 
 # Local project notes and handoff docs
 docs/
+
+# AI assistant working dirs (tool state, not source)
+.claude/
+.opencode/
+.vscode/
+.codeartsdoer
