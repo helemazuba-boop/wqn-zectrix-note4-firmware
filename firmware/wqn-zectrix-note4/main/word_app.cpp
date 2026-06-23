@@ -106,9 +106,11 @@ void BuildReviewQueue(wqn::WordAppState* state, bool random)
     state->review_indices.clear();
     state->review_position = 0;
     state->random_review = random;
-    const size_t limit = std::min<size_t>(state->pack_index.entries.size(), state->daily_target);
+    // Review the whole pack, not just daily_target. The index already lives in
+    // PSRAM, and review_indices is just ~size_t per word (~14 KB for 3500).
+    const size_t limit = state->pack_index.entries.size();
     state->review_indices.reserve(limit);
-    for (size_t i = 0; i < state->pack_index.entries.size() && state->review_indices.size() < limit; ++i) {
+    for (size_t i = 0; i < state->pack_index.entries.size(); ++i) {
         state->review_indices.push_back(i);
     }
     if (random && state->review_indices.size() > 1) {
@@ -241,8 +243,9 @@ esp_err_t HandleWordAppInput(WordAppState* state, WordInput input)
                 return ESP_OK;
             }
             if (input == WordInput::kLongConfirm) {
-                state->cloud_sync_requested = true;
-                state->message = "词库同步中";
+                // Long-press confirm on the word home is handled by the UI layer
+                // (ui_model.cpp) to exit back to the device home screen. Pack
+                // sync is triggered automatically when entering the word page.
                 return ESP_OK;
             }
             if (input != WordInput::kConfirm) {
@@ -306,6 +309,8 @@ esp_err_t HandleWordAppInput(WordAppState* state, WordInput input)
                 if (!state->dictionary_prefix.empty()) {
                     state->dictionary_prefix.pop_back();
                     RefreshDictionaryState(state);
+                    state->dictionary_letter_selected = 0;
+                    state->dictionary_match_selected = 0;
                     state->message = state->dictionary_prefix.empty() ? "选择首字母" : state->dictionary_prefix;
                 } else {
                     state->mode = WordAppMode::kHome;
@@ -332,10 +337,15 @@ esp_err_t HandleWordAppInput(WordAppState* state, WordInput input)
             if (!state->dictionary_letters.empty()) {
                 state->dictionary_prefix.push_back(state->dictionary_letters[state->dictionary_letter_selected]);
                 RefreshDictionaryState(state);
+                state->dictionary_letter_selected = 0;
+                state->dictionary_match_selected = 0;
                 if (state->dictionary_matches.size() == 1 && state->dictionary_letters.empty()) {
-                    ESP_RETURN_ON_ERROR(LoadCurrentDictionaryWord(state), kTag, "load dictionary detail");
-                    state->mode = WordAppMode::kDictionaryDetail;
-                    state->message = "上键标记不认识";
+                    if (LoadCurrentDictionaryWord(state) == ESP_OK) {
+                        state->mode = WordAppMode::kDictionaryDetail;
+                        state->message = "上键标记不认识";
+                    } else {
+                        state->message = "词条读取失败";
+                    }
                 } else if (state->dictionary_matches.empty()) {
                     state->mode = WordAppMode::kLookupChoice;
                     state->lookup_selection = WordLookupSelection::kOnlineSearch;
@@ -346,9 +356,12 @@ esp_err_t HandleWordAppInput(WordAppState* state, WordInput input)
                 return ESP_OK;
             }
             if (!state->dictionary_matches.empty()) {
-                ESP_RETURN_ON_ERROR(LoadCurrentDictionaryWord(state), kTag, "load dictionary detail");
-                state->mode = WordAppMode::kDictionaryDetail;
-                state->message = "上键标记不认识";
+                if (LoadCurrentDictionaryWord(state) == ESP_OK) {
+                    state->mode = WordAppMode::kDictionaryDetail;
+                    state->message = "上键标记不认识";
+                } else {
+                    state->message = "词条读取失败";
+                }
                 return ESP_OK;
             }
             state->mode = WordAppMode::kLookupChoice;
@@ -539,11 +552,13 @@ WordAppSnapshot BuildWordAppSnapshot(const WordAppState& state)
 
 std::string WordAppProgressLabel(const WordAppState& state)
 {
-    if (state.daily_target == 0) {
-        return "--%";
+    // Progress through the current review queue (whole pack), shown as
+    // "current/total" rather than a daily-target percentage.
+    if (state.review_indices.empty()) {
+        return "";
     }
-    const int percent = std::min(100, static_cast<int>(state.reviewed_today) * 100 / state.daily_target);
-    return std::to_string(percent) + "%";
+    return std::to_string(state.review_position + 1) + "/" +
+           std::to_string(state.review_indices.size());
 }
 
 std::string WordAppStatusLine(const WordAppState& state)

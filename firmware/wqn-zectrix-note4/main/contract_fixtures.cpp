@@ -27,6 +27,16 @@ const char kPollNoPending[] = R"json({
   "timestamp": "2026-05-10T12:00:00.000Z"
 })json";
 
+const char kPollAlreadyPaired[] = R"json({
+  "success": true,
+  "data": {
+    "status": "already_paired",
+    "device_name": "ZecTrix_Note4",
+    "message": "Device is already paired. Unpair from the web before requesting a new token."
+  },
+  "timestamp": "2026-05-10T12:00:00.000Z"
+})json";
+
 const char kSyncDue[] = R"json({
   "success": true,
   "data": {
@@ -447,6 +457,22 @@ bool CheckPollNoPending()
            Require(cJSON_IsString(status) && std::strcmp(status->valuestring, "no_pending") == 0, "poll no_pending status");
 }
 
+bool CheckPollAlreadyPaired()
+{
+    JsonDocument document(kPollAlreadyPaired);
+    if (!Require(document.ok(), "poll already_paired parses")) {
+        return false;
+    }
+
+    cJSON* data = cJSON_GetObjectItemCaseSensitive(document.root(), "data");
+    cJSON* status = cJSON_GetObjectItemCaseSensitive(data, "status");
+    cJSON* token = cJSON_GetObjectItemCaseSensitive(data, "access_token");
+
+    return Require(CheckSuccess(document.root()), "poll already_paired success") &&
+           Require(cJSON_IsString(status) && std::strcmp(status->valuestring, "already_paired") == 0, "poll already_paired status") &&
+           Require(token == nullptr || cJSON_IsNull(token), "poll already_paired must not echo access_token");
+}
+
 bool CheckSyncDue()
 {
     JsonDocument document(kSyncDue);
@@ -674,6 +700,7 @@ bool RunContractFixtureSelfTest()
     const bool ok =
         CheckPollPaired() &&
         CheckPollNoPending() &&
+        CheckPollAlreadyPaired() &&
         CheckSyncDue() &&
         CheckProblemDetails() &&
         CheckProblemMathFallback() &&

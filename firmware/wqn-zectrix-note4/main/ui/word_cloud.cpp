@@ -10,6 +10,7 @@
 #include <string>
 
 #include "esp_log.h"
+#include "esp_spiffs.h"
 #include "word_pack.h"
 #include "wqn_api.h"
 
@@ -181,6 +182,26 @@ void WordCloudTask(void*)
             wqn::WqnWordPackManifest manifest;
             result->result = wqn::FetchWordPackManifest(token, &manifest);
             if (result->result == ESP_OK) {
+                size_t total_needed = 0;
+                for (const auto& item : manifest.packs) {
+                    if (wqn::WordPackNeedsDownload(item) && item.byte_size > 0) {
+                        total_needed += item.byte_size;
+                    }
+                }
+                if (total_needed > 0) {
+                    size_t total_bytes = 0, used_bytes = 0;
+                    if (esp_spiffs_info("storage", &total_bytes, &used_bytes) == ESP_OK) {
+                        const size_t available = total_bytes > used_bytes ? total_bytes - used_bytes : 0;
+                        if (available < total_needed) {
+                            ESP_LOGW(kTag, "SPIFFS space insufficient: need=%u avail=%u",
+                                     static_cast<unsigned>(total_needed), static_cast<unsigned>(available));
+                            result->result = ESP_ERR_NO_MEM;
+                            result->message = "存储空间不足";
+                        }
+                    }
+                }
+
+                std::vector<std::string> downloaded_stems;
                 for (const wqn::WqnWordPackManifestItem& item : manifest.packs) {
                     if (!wqn::WordPackNeedsDownload(item)) {
                         continue;
@@ -193,6 +214,15 @@ void WordCloudTask(void*)
                     result->result = wqn::SaveWordPackFromBytes(item, pack_body);
                     if (result->result != ESP_OK) {
                         break;
+                    }
+                    downloaded_stems.push_back(wqn::SafePackStemFromId(item.pack_id));
+                }
+                if (result->result != ESP_OK && !downloaded_stems.empty()) {
+                    ESP_LOGW(kTag, "rolling back %u downloaded packs due to error",
+                             static_cast<unsigned>(downloaded_stems.size()));
+                    for (const std::string& stem : downloaded_stems) {
+                        std::string path = std::string("/storage/wp_") + stem + ".wqwp";
+                        std::remove(path.c_str());
                     }
                 }
             }

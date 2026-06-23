@@ -1,4 +1,4 @@
-#include "wqn_api.h"
+﻿#include "wqn_api.h"
 
 #include <algorithm>
 #include <array>
@@ -1742,7 +1742,11 @@ esp_err_t PollPairingOnce(const std::string& mac_address, bool* paired)
         ESP_RETURN_ON_ERROR(wqn::SaveAccessToken(token), kTag, "save access token");
         ESP_LOGI(kTag, "pairing complete, token=%s", wqn::MaskTokenForLog(token).c_str());
         *paired = true;
-    } else if (status == "no_pending" || status == "expired") {
+    } else if (status == "no_pending" || status == "expired" || status == "already_paired") {
+        // already_paired means a device row exists on the server but no fresh
+        // pending pairing request has been issued from the web. The server
+        // refuses to re-emit the token; the user must unpair from the web and
+        // re-initiate pairing. Keep polling without saving anything.
         ESP_LOGI(kTag, "pairing status=%s", status.c_str());
     } else {
         ESP_LOGW(kTag, "unexpected pairing status=%s", status.c_str());
@@ -2267,7 +2271,12 @@ esp_err_t FetchWordPackManifest(const std::string& token, WqnWordPackManifest* m
         return ESP_FAIL;
     }
 
-    return ParseWordPackManifestResponse(body, manifest);
+    const esp_err_t parse_result = ParseWordPackManifestResponse(body, manifest);
+    if (parse_result == ESP_OK) {
+        ESP_LOGI(kTag, "word-pack-manifest ok: packs=%u",
+                 static_cast<unsigned>(manifest->packs.size()));
+    }
+    return parse_result;
 }
 
 esp_err_t DownloadWordPack(const std::string& token, const WqnWordPackManifestItem& item, std::string* body)
@@ -2287,10 +2296,12 @@ esp_err_t DownloadWordPack(const std::string& token, const WqnWordPackManifestIt
     ESP_RETURN_ON_ERROR(WaitForNetworkReadyForHttps(), kTag, "prepare network for word-pack-download");
 
     const std::string url = BuildWordPackDownloadUrl(item.download_url);
+    ESP_LOGI(kTag, "word-pack-download: pack_id=%s url=%s bytes_expected=%d",
+             item.pack_id.c_str(), url.c_str(), item.byte_size);
     int status_code = 0;
     esp_err_t http_result = HttpRequest("GET", url, &token, nullptr, &status_code, body);
     if (http_result != ESP_OK) {
-        ESP_LOGW(kTag, "word-pack-download failed: %s", esp_err_to_name(http_result));
+        ESP_LOGW(kTag, "word-pack-download failed: %s url=%s", esp_err_to_name(http_result), url.c_str());
         return http_result;
     }
     if (status_code == 401) {
