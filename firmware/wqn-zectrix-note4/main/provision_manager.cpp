@@ -37,6 +37,7 @@ constexpr EventBits_t kProvFailBit = BIT1;
 volatile ProvisionState g_prov_state = ProvisionState::kIdle;
 std::string g_prov_ssid;
 std::string g_prov_password;
+std::string g_prov_ap_ssid;
 
 httpd_handle_t g_http_server = nullptr;
 TaskHandle_t g_prov_task_handle = nullptr;
@@ -511,8 +512,12 @@ esp_err_t StartSoftAp()
         return ret;
     }
 
+    // [fix] Read the AP MAC from the wifi driver, not the netif. The netif MAC
+    // is all-zero before esp_wifi_start() fills it, which made every device
+    // advertise the same SSID (WQN_N4_0000). esp_wifi_get_mac() is valid after
+    // esp_wifi_init() and returns the real MAC the AP will use.
     uint8_t mac[6] = {};
-    ret = esp_netif_get_mac(ap_netif, mac);
+    ret = esp_wifi_get_mac(WIFI_IF_AP, mac);
     if (ret != ESP_OK) {
         mac[3] = 0x12;
         mac[4] = 0x34;
@@ -521,6 +526,7 @@ esp_err_t StartSoftAp()
     char ap_ssid[16] = {};
     std::snprintf(ap_ssid, sizeof(ap_ssid), "%s%02X%02X", kApSsidPrefix,
                   static_cast<unsigned>(mac[3]), static_cast<unsigned>(mac[4]));
+    g_prov_ap_ssid = ap_ssid;
 
     wifi_config_t ap_config = {};
     std::strncpy(reinterpret_cast<char*>(ap_config.ap.ssid), ap_ssid, sizeof(ap_config.ap.ssid) - 1);
@@ -772,6 +778,15 @@ ProvisionState GetProvisioningState()
     return g_prov_state;
 #else
     return ProvisionState::kIdle;
+#endif
+}
+
+const char* GetProvisioningApSsid()
+{
+#if defined(CONFIG_WQN_WIFI_STA_ENABLE) && defined(CONFIG_WQN_PROVISION_ENABLE)
+    return g_prov_ap_ssid.c_str();
+#else
+    return "";
 #endif
 }
 

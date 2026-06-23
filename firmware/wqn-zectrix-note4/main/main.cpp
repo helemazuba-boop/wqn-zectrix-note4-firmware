@@ -23,6 +23,7 @@
 #include "storage.h"
 #include "wifi_manager.h"
 #include "wqn_api.h"
+#include "ui/ui_internal.h"
 
 namespace {
 
@@ -353,6 +354,10 @@ bool RunWqnOnlineRound()
         return false;
     }
 
+    if (device_ui_internal::QueueWordReviewRefresh()) {
+        ESP_LOGI(kTag, "word pack sync queued after online round");
+    }
+
     return true;
 }
 
@@ -492,7 +497,7 @@ extern "C" void app_main(void)
         esp_pm_config_t pm_config = {
             .max_freq_mhz = CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ,
             .min_freq_mhz = 40,
-            .light_sleep_enable = true,
+            .light_sleep_enable = false,
         };
         ESP_ERROR_CHECK(esp_pm_configure(&pm_config));
     }
@@ -517,7 +522,8 @@ extern "C" void app_main(void)
     {
         std::string ssid;
         std::string password;
-        if (wqn::LoadWifiCredentials(&ssid, &password) != ESP_OK || ssid.empty()) {
+        if ((wqn::LoadWifiCredentials(&ssid, &password) != ESP_OK || ssid.empty())
+            && std::strlen(CONFIG_WQN_WIFI_SSID) == 0) {
             needs_provisioning = true;
         }
     }

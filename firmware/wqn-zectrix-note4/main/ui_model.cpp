@@ -4,6 +4,7 @@
 #include <cstdint>
 
 #include "ai_session.h"
+#include "provision_manager.h"
 
 namespace {
 
@@ -145,6 +146,8 @@ const char* ScreenName(wqn::UiScreen screen)
             return "复习反馈";
         case wqn::UiScreen::kReviewQueued:
             return "已记录";
+        case wqn::UiScreen::kProvisioning:
+            return "配网";
     }
     return "WQN";
 }
@@ -171,6 +174,8 @@ wqn::UiScreen PreviousTopScreen(wqn::UiScreen screen)
             return wqn::UiScreen::kTime;
         case wqn::UiScreen::kTodo:
             return wqn::UiScreen::kWord;
+        case wqn::UiScreen::kProvisioning:
+            return wqn::UiScreen::kHome;
     }
     return wqn::UiScreen::kHome;
 }
@@ -197,6 +202,8 @@ wqn::UiScreen NextTopScreen(wqn::UiScreen screen)
             return wqn::UiScreen::kTodo;
         case wqn::UiScreen::kTodo:
             return wqn::UiScreen::kAi;
+        case wqn::UiScreen::kProvisioning:
+            return wqn::UiScreen::kHome;
     }
     return wqn::UiScreen::kHome;
 }
@@ -631,7 +638,14 @@ void HandleUiInput(UiState* state, UiInput input)
                 HandleTimeAppInput(&state->time_app, TimeInput::kLongConfirm);
                 break;
             } else if (state->screen == UiScreen::kWord) {
-                HandleWordAppInput(&state->word_app, WordInput::kLongConfirm);
+                // Long-press confirm = universal back. At the word home, exit to
+                // the device home screen; in any deeper word mode, let the word
+                // app pop one level.
+                if (state->word_app.mode == WordAppMode::kHome) {
+                    state->screen = UiScreen::kHome;
+                } else {
+                    HandleWordAppInput(&state->word_app, WordInput::kLongConfirm);
+                }
                 break;
             } else if (state->screen == UiScreen::kAi) {
                 if (state->ai.status != AiSessionStatus::kListening &&
@@ -696,6 +710,24 @@ bool TickAiSession(UiState* state, int64_t now_ms)
 UiFrame RenderUiFrame(const UiState& state)
 {
     UiFrame frame;
+
+    // [fix] While WiFi provisioning is active, override the screen with a
+    // provisioning prompt (which SoftAP to join + captive-portal URL). The
+    // generic fallback in RenderFrameToEpd draws frame.lines for screens it
+    // doesn't specialise, so no new renderer/dispatch is needed.
+    if (wqn::GetProvisioningState() != wqn::ProvisionState::kIdle &&
+        wqn::GetProvisioningApSsid()[0] != '\0') {
+        frame.screen = UiScreen::kProvisioning;
+        frame.prefer_full_refresh = true;
+        AddLine(&frame, UiTextStyle::kTitle, "设备配网");
+        AddLine(&frame, UiTextStyle::kBody, "请用手机连接 WiFi 热点:");
+        AddLine(&frame, UiTextStyle::kSelected, wqn::GetProvisioningApSsid());
+        AddLine(&frame, UiTextStyle::kBody, "然后浏览器访问:");
+        AddLine(&frame, UiTextStyle::kSelected, "192.168.4.1");
+        AddLine(&frame, UiTextStyle::kMeta, "输入家庭 WiFi 完成配网");
+        return frame;
+    }
+
     frame.screen = state.screen;
     frame.home = state.home;
     frame.ai = state.ai;
@@ -743,6 +775,9 @@ UiFrame RenderUiFrame(const UiState& state)
             break;
         case UiScreen::kReviewQueued:
             RenderReviewQueued(state, &frame);
+            break;
+        case UiScreen::kProvisioning:
+            // Handled by the provisioning early-return above; unreachable here.
             break;
     }
 

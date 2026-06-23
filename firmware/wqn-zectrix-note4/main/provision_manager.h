@@ -25,6 +25,7 @@ struct ProvisionDoneCallback {};
 esp_err_t StartProvisioningMode();
 esp_err_t StopProvisioningMode();
 ProvisionState GetProvisioningState();
+const char* GetProvisioningApSsid();
 const char* ProvisionStateLabel(ProvisionState state);
 void SetProvisionDoneCallback(ProvisionDoneCallback callback);
 

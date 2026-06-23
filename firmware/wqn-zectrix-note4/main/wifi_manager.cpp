@@ -143,7 +143,11 @@ void QueueReconnect()
     }
 
     g_reconnect_pending = true;
-    const BaseType_t created = xTaskCreate(WifiReconnectTask, "wqn_wifi_reconnect", 4096, nullptr, 4, &g_reconnect_task_handle);
+    // [fix] Stack was 4096 which overflowed (panic "stack overflow in task
+    // wqn_wifi_reconn") during provisioning, causing a boot loop that kept the
+    // SoftAP alive only ~30s. 8192 matches wqn_prov/wqn_dns. Name shortened to
+    // <=16 chars so FreeRTOS doesn't truncate it (was wqn_wifi_reconnect -> wqn_wifi_reconn).
+    const BaseType_t created = xTaskCreate(WifiReconnectTask, "wqn_wifi_rec", 8192, nullptr, 4, &g_reconnect_task_handle);
     if (created != pdPASS) {
         g_reconnect_pending = false;
         g_reconnect_task_handle = nullptr;
@@ -288,7 +292,7 @@ esp_err_t StartWifiWithCredentials(const char* ssid, const char* password)
     wifi_config.sta.sae_pwe_h2e = WPA3_SAE_PWE_BOTH;
 
     ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_STA, &wifi_config), kTag, "set WiFi STA config");
-    ESP_RETURN_ON_ERROR(esp_wifi_set_ps(WIFI_PS_NONE), kTag, "set WiFi power save");
+    ESP_RETURN_ON_ERROR(esp_wifi_set_ps(WIFI_PS_MIN_MODEM), kTag, "set WiFi power save");
     ESP_RETURN_ON_ERROR(esp_wifi_start(), kTag, "start WiFi");
 
     g_initialized = true;

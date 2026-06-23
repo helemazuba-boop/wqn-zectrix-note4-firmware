@@ -24,6 +24,7 @@ enum class UiScreen {
     kReviewQueue,
     kReviewScore,
     kReviewQueued,
+    kProvisioning,
 };
 
 enum class UiInput {
