@@ -35,6 +35,7 @@ using device_ui_internal::FrameSignature;
 using device_ui_internal::LoadUiState;
 using device_ui_internal::RefreshSchedule;
 using device_ui_internal::RequestEpdUiRefresh;
+using device_ui_internal::IsEpdRefreshBusy;
 using device_ui_internal::ScreenUsesClockMinute;
 using device_ui_internal::SeedClockFromBuildTimeIfNeeded;
 using device_ui_internal::ShouldRefreshTimeTick;
@@ -103,7 +104,15 @@ void DeviceUiTask(void*)
             poll_delay = kUiPollDelayTicks;
             g_last_active_us_local = esp_timer_get_time();
         }
-        refresh_schedule = StrongerSchedule(refresh_schedule, ApplyButtonEvent(event, &state));
+        // [refresh-ghost-fix] While the EPD is mid-refresh (1-3 seconds for a full frame),
+        // any new button event would queue a second refresh into the secondary slot.
+        // On a slow EPD this causes two refreshes in quick succession → ghosting artifacts
+        // from incomplete particle settling. Skip button processing while busy so the
+        // user effectively sees a "press-and-wait" pattern; the next press after the
+        // refresh completes will be picked up on the next poll cycle.
+        if (!IsEpdRefreshBusy()) {
+            refresh_schedule = StrongerSchedule(refresh_schedule, ApplyButtonEvent(event, &state));
+        }
 
         if (g_todo_result_queue != nullptr) {
             device_ui_internal::TodoCloudResult* todo_result = nullptr;
@@ -133,7 +142,11 @@ void DeviceUiTask(void*)
         const int64_t now_ms = esp_timer_get_time() / 1000;
         if (wqn::TickTimeApp(&state.time_app, now_ms)) {
             UpdateHomePrimaryTimeLine(&state);
-            if (ShouldRefreshTimeTick(state)) {
+            // [timer-fix] If the timer just fired, immediately promote to kTimer
+            // so the EPD refreshes without waiting for the next clock tick.
+            if (state.time_app.status == wqn::TimerStatus::kAlerting) {
+                refresh_schedule = StrongerSchedule(refresh_schedule, RefreshSchedule::kTimer);
+            } else if (ShouldRefreshTimeTick(state)) {
                 refresh_schedule = StrongerSchedule(refresh_schedule, RefreshSchedule::kTimer);
             }
         }
@@ -184,18 +197,14 @@ void DeviceUiTask(void*)
 
         wqn::PowerOffEpdAfterIdleIfNeeded();
 
-        // [power-fix] With CONFIG_PM_ENABLE=y, the FreeRTOS idle task now
-        // auto-enters light sleep whenever every task is in vTaskDelay. The
-        // previous "esp_light_sleep_start() unconditionally isolates all
-        // GPIOs" failure was caused by CONFIG_ESP_SLEEP_GPIO_RESET_WORKAROUND
-        // releasing the GPIO 17 power-latch; that is now suppressed by
-        // gpio_sleep_sel_dis(kBoardPowerLatch) in InitZectrixNote4SafePins().
-        // Bumping the delay from 10ms to 50ms gives PM DFS a cleaner window
-        // to actually transition the CPU into light sleep, while still
-        // keeping the UI loop responsive to button events.
-        vTaskDelay(pdMS_TO_TICKS(50));
-
-        wqn::EnterDeepSleepIfEnabled();
+        // [download-fix] Don't deep-sleep while a cloud task is mid-flight
+        // (word-pack download / todo sync). Sleeping yanks the CPU and cuts the
+        // radio during a TLS stream, truncating the download and corrupting the
+        // local cache (surfaces as "word deck missing id ... skip invalid" on
+        // the next boot). Wait until the transfer finishes.
+        if (!g_word_cloud_busy && !g_todo_cloud_busy) {
+            wqn::EnterDeepSleepIfEnabled();
+        }
 
         const int64_t idle_ms = (esp_timer_get_time() - g_last_active_us_local) / 1000;
         const bool screen_active = (state.screen == wqn::UiScreen::kTime ||
@@ -208,6 +217,13 @@ void DeviceUiTask(void*)
         } else if (idle_ms < 3000) {
             poll_delay = kUiPollDelayTicks;
         } else {
+            poll_delay = kUiIdlePollDelayTicks;
+        }
+        // [timer-fix] When on the clock standby page with a timer running in
+        // the background, the screen is static (no seconds). Use the idle poll
+        // rate to give Light Sleep a chance between ticks.
+        if (state.screen == wqn::UiScreen::kTime && state.time_app.tile == wqn::TimeTile::kClock &&
+            wqn::TimeAppHasActiveTimer(state.time_app) && !event.HasEvent()) {
             poll_delay = kUiIdlePollDelayTicks;
         }
 
@@ -277,14 +293,14 @@ esp_err_t StartDeviceUiIfEnabled()
 
     if (device_ui_internal::g_word_task == nullptr) {
         const BaseType_t word_created =
-            xTaskCreate(device_ui_internal::WordCloudTask, "wqn_word_cloud", 8192, nullptr, 3, &device_ui_internal::g_word_task);
+            xTaskCreate(device_ui_internal::WordCloudTask, "wqn_word_cloud", 16384, nullptr, 3, &device_ui_internal::g_word_task);
         if (word_created != pdPASS) {
             device_ui_internal::g_word_task = nullptr;
             return ESP_ERR_NO_MEM;
         }
     }
 
-    const BaseType_t created = xTaskCreate(DeviceUiTask, "wqn_ui", 8192, nullptr, 4, nullptr);
+    const BaseType_t created = xTaskCreate(DeviceUiTask, "wqn_ui", 16384, nullptr, 4, nullptr);
     if (created != pdPASS) {
         return ESP_ERR_NO_MEM;
     }
