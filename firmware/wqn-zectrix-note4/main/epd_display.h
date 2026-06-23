@@ -42,4 +42,8 @@ esp_err_t RefreshEpdFull(bool allow_local_partial = true, bool force_full_refres
 // Powers down only the EPD rail on GPIO6. Board-level GPIO17 is intentionally untouched.
 void PowerOffEpd();
 
+// Returns true if the EPD is currently being initialized or is mid-refresh.
+// Used by the power manager to prevent cutting EPD power during active SPI traffic.
+bool IsEpdBusy();
+
 }  // namespace wqn

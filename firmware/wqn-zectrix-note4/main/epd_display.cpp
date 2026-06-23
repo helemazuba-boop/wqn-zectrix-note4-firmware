@@ -192,14 +192,31 @@ esp_err_t WaitBusyTimeout(int timeout_ms)
 {
     const TickType_t start = xTaskGetTickCount();
     const TickType_t timeout = pdMS_TO_TICKS(timeout_ms);
+    const int entry_level = gpio_get_level(kEpdBusy);
+    int first_transition_level = entry_level;
+    TickType_t transition_tick = 0;
+    bool transition_seen = false;
     while (gpio_get_level(kEpdBusy) == 0) {
+        const int lvl = gpio_get_level(kEpdBusy);
+        if (!transition_seen && lvl != entry_level) {
+            transition_seen = true;
+            first_transition_level = lvl;
+            transition_tick = xTaskGetTickCount();
+        }
         if ((xTaskGetTickCount() - start) > timeout) {
-            ESP_LOGW(kTag, "EPD BUSY wait timed out: %d ms elapsed, gpio8=%d",
-                     timeout_ms, static_cast<int>(gpio_get_level(kEpdBusy)));
+            ESP_LOGW(kTag, "[BUSY-PROBE] TIMEOUT to=%dms entry=%d exit=%d trans=%s first_trans_lvl=%d elapsed=%dms",
+                     timeout_ms, entry_level, static_cast<int>(gpio_get_level(kEpdBusy)),
+                     transition_seen ? "yes" : "no", first_transition_level,
+                     static_cast<int>(pdTICKS_TO_MS(xTaskGetTickCount() - start)));
             return ESP_ERR_TIMEOUT;
         }
         vTaskDelay(pdMS_TO_TICKS(1));
     }
+    ESP_LOGI(kTag, "[BUSY-PROBE] OK to=%dms entry=%d exit=%d trans=%s first_trans_lvl=%d trans_at=%dms elapsed=%dms",
+             timeout_ms, entry_level, static_cast<int>(gpio_get_level(kEpdBusy)),
+             transition_seen ? "yes" : "no", first_transition_level,
+             transition_seen ? static_cast<int>(pdTICKS_TO_MS(transition_tick - start)) : 0,
+             static_cast<int>(pdTICKS_TO_MS(xTaskGetTickCount() - start)));
     return ESP_OK;
 }
 
@@ -696,7 +713,7 @@ void DrawPlaceholderGlyph(int x, int y, bool black)
     }
 }
 
-void DrawPlaceholderCjkGlyph(int x, int y, bool black)
+[[maybe_unused]] void DrawPlaceholderCjkGlyph(int x, int y, bool black)
 {
     for (int yy = 1; yy < kCjkFontHeight - 1; ++yy) {
         for (int xx = 1; xx < kCjkFallbackWidth - 1; ++xx) {
@@ -833,6 +850,23 @@ bool DecodeUtf8(const char*& cursor, uint32_t* codepoint)
     return true;
 }
 
+// [font-fix] Map punctuation the slim font lacks a glyph for to an ASCII
+// equivalent so it renders via the 5x7 ASCII path instead of a hollow box.
+// Codepoints with no sensible ASCII equivalent (e.g. IPA phonetics) are left
+// unchanged and skipped by DrawCjkGlyph/MeasureCodepointWidth.
+uint32_t NormalizeCodepointForDisplay(uint32_t cp)
+{
+    switch (cp) {
+        case 0x2018: case 0x2019: case 0xFF07: return 0x27;  // ' ' ＇ -> '
+        case 0x201C: case 0x201D: return 0x22;               // " " -> "
+        case 0x2013: case 0x2014: case 0x2212: return 0x2D;  // – — − -> -
+        case 0x2026: return 0x2E;                            // … -> .
+        case 0x00B7: case 0x2022: return 0x2E;               // · • -> .
+        case 0x00A0: case 0x2007: case 0x202F: return 0x20;  // nbsp 等 -> 空格
+        default: return cp;
+    }
+}
+
 int MeasureCodepointWidth(uint32_t codepoint)
 {
     if (codepoint == '\n' || codepoint == '\r') {
@@ -844,7 +878,9 @@ int MeasureCodepointWidth(uint32_t codepoint)
 
     const lv_font_fmt_txt_glyph_dsc_t* glyph = FindCjkGlyph(codepoint);
     if (glyph == nullptr) {
-        return kCjkFallbackWidth;
+        // [font-fix] No glyph (e.g. IPA phonetics): skip (zero width) instead
+        // of a placeholder cell. Matches DrawCjkGlyph which draws nothing here.
+        return 0;
     }
     return std::max<int>(1, (glyph->adv_w + 8) >> 4);
 }
@@ -854,7 +890,7 @@ void DrawCjkGlyph(int x, int y, uint32_t codepoint, bool black)
     const lv_font_fmt_txt_dsc_t* font_dsc = SourceHanSansSC_Regular_slim.dsc;
     const lv_font_fmt_txt_glyph_dsc_t* glyph = FindCjkGlyph(codepoint);
     if (font_dsc == nullptr || glyph == nullptr || glyph->box_w == 0 || glyph->box_h == 0) {
-        DrawPlaceholderCjkGlyph(x, y, black);
+        // [font-fix] Missing glyph: draw nothing (skip) instead of a hollow box.
         return;
     }
 
@@ -982,6 +1018,7 @@ esp_err_t DrawUtf8Text(int x, int y, const char* text, bool black)
         if (cursor == before) {
             break;
         }
+        codepoint = NormalizeCodepointForDisplay(codepoint);
         if (codepoint == '\r') {
             continue;
         }
@@ -1024,6 +1061,7 @@ int MeasureUtf8TextWidth(const char* text)
         if (cursor == before) {
             break;
         }
+        codepoint = NormalizeCodepointForDisplay(codepoint);
         if (codepoint == '\r') {
             continue;
         }
