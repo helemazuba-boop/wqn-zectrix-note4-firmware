@@ -28,4 +28,9 @@ TickType_t GetConfiguredOnlineSyncDelayTicks();
 // tear down the SoftAP / captive portal mid-flow.
 bool HasUsableStoredToken();
 
+#if CONFIG_WQN_WIFI_STA_ENABLE
+extern TaskHandle_t g_wqn_online_task;
+esp_err_t StartWqnOnlineTask();
+#endif
+
 }  // namespace wqn

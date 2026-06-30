@@ -10,6 +10,7 @@
 #include "ai_session.h"
 #include "epd_display.h"
 #include "esp_log.h"
+#include "flash_session.h"
 
 namespace device_ui_internal {
 
@@ -118,7 +119,103 @@ esp_err_t RenderAiToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
     wqn::ClearEpdFramebuffer(true);
     DrawHorizontalLine(0, 27, wqn::kEpdWidth);
     ESP_RETURN_ON_ERROR(wqn::DrawUtf8Text(10, 6, "AI", true), kTag, "draw AI title");
+    const char* tier_label = wqn::AiTierLabel(ai.tier);
+    ESP_RETURN_ON_ERROR(
+        wqn::DrawUtf8Text(10 + 30, 6, tier_label, true),
+        kTag,
+        "draw AI tier label");
     std::string status = AiStatusLabel(ai.status);
+
+    // Flash realtime mode rendering
+    if (ai.tier == wqn::AiTier::kFlash) {
+        // Read Flash status from the local state copy, NOT from
+        // wqn::GetFlashStatus() — calling that would re-acquire the mutex
+        // inside the render path and stall the UI thread.
+        if (ai.flash_is_streaming) {
+            status = "实时";
+        } else if (ai.status == wqn::AiSessionStatus::kListening) {
+            status = "连接中";
+        } else if (ai.status == wqn::AiSessionStatus::kError) {
+            status = "错误";
+        } else {
+            status = "就绪";
+        }
+
+        if (!frame.home.battery_label.empty()) {
+            status += "  ";
+            status += frame.home.battery_label;
+        }
+        const int status_width = wqn::MeasureUtf8TextWidth(status.c_str());
+        ESP_RETURN_ON_ERROR(
+            wqn::DrawUtf8Text(std::max(10, wqn::kEpdWidth - status_width - 10), 6, status.c_str(), true),
+            kTag,
+            "draw flash status");
+
+        // Recording indicator wave
+        if (ai.flash_is_streaming) {
+            const int wave_x = 180;
+            const int base_y = 140;
+            const int heights[] = {10, 20, 14, 18, 8};
+            for (int i = 0; i < 5; ++i) {
+                FillRect(wave_x + i * 12, base_y - heights[i], 6, heights[i], true);
+            }
+            ESP_RETURN_ON_ERROR(
+                wqn::DrawUtf8Text(28, 60, "正在录音...", true),
+                kTag, "draw flash recording label");
+        } else if (ai.status == wqn::AiSessionStatus::kListening) {
+            ESP_RETURN_ON_ERROR(
+                wqn::DrawUtf8Text(28, 60, ai.flash_pending.empty() ? "正在连接..." : ai.flash_pending.c_str(), false),
+                kTag, "draw flash connecting");
+        } else if (ai.status == wqn::AiSessionStatus::kError) {
+            std::string err = ai.flash_error.empty() ? "连接失败" : ai.flash_error;
+            ESP_RETURN_ON_ERROR(
+                wqn::DrawUtf8Text(28, 60, ("错误: " + err).c_str(), false),
+                kTag, "draw flash error");
+        } else {
+            ESP_RETURN_ON_ERROR(
+                wqn::DrawUtf8Text(28, 60, "长按开始说话", false),
+                kTag, "draw flash idle");
+        }
+
+        // Show transcript
+        if (!ai.flash_transcript.empty()) {
+            ESP_RETURN_ON_ERROR(
+                DrawClippedText(28, 160, 344, ("你说: " + ai.flash_transcript).c_str()),
+                kTag, "draw flash transcript");
+        }
+        if (!ai.assistant_text.empty()) {
+            ESP_RETURN_ON_ERROR(
+                DrawClippedText(28, 200, 344, ("助手: " + ai.assistant_text).c_str()),
+                kTag, "draw flash assistant");
+        }
+
+        // Flash input bar
+        const int x = 12;
+        const int y = 252;
+        const int width = 376;
+        const int height = 36;
+        const char* bar_label = nullptr;
+        bool bar_filled = false;
+        if (ai.flash_is_streaming) {
+            bar_label = "松开停止，短按发送";
+            bar_filled = true;
+        } else if (ai.status == wqn::AiSessionStatus::kListening) {
+            bar_label = "连接中...";
+        } else if (ai.status == wqn::AiSessionStatus::kError) {
+            bar_label = "长按重试";
+        } else {
+            bar_label = "长按说话";
+        }
+        if (bar_filled) {
+            FillRect(x, y, width, height, true);
+            ESP_RETURN_ON_ERROR(wqn::DrawUtf8Text(x + 8, y + 9, bar_label, false), kTag, "draw flash bar label");
+        } else {
+            DrawRect(x, y, width, height);
+            ESP_RETURN_ON_ERROR(wqn::DrawUtf8Text(x + 8, y + 9, bar_label, true), kTag, "draw flash bar label");
+        }
+        return RefreshFrame(frame, schedule);
+    }
+
     if (!frame.home.battery_label.empty()) {
         status += "  ";
         status += frame.home.battery_label;

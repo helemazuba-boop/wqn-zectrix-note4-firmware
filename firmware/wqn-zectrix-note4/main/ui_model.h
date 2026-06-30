@@ -59,8 +59,20 @@ enum class AiSessionStatus {
     kError,
 };
 
+enum class AiTier : uint8_t {
+    kFlash = 0,
+    kStd = 1,
+    kPro = 2,
+    kCount = 3,
+};
+
+AiTier NextAiTier(AiTier current);
+AiTier PrevAiTier(AiTier current);
+const char* AiTierLabel(AiTier tier);
+
 struct AiSessionState {
     AiSessionStatus status = AiSessionStatus::kIdle;
+    AiTier tier = AiTier::kStd;
     std::string user_text;
     std::string assistant_text;
     std::string pending_text;
@@ -69,6 +81,12 @@ struct AiSessionState {
     std::string conversation_id;
     int64_t status_since_ms = 0;
     size_t page = 0;
+
+    // Flash realtime session fields (used when tier == kFlash)
+    std::string flash_transcript;
+    std::string flash_pending;
+    std::string flash_error;
+    bool flash_is_streaming = false;
 };
 
 enum class TodoSyncStatus {

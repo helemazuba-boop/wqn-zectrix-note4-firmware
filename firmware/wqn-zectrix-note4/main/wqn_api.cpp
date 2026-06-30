@@ -267,7 +267,7 @@ esp_err_t HttpBinaryPost(
     esp_http_client_config_t config = {};
     config.url = url.c_str();
     config.method = HTTP_METHOD_POST;
-    config.timeout_ms = 30000;
+    config.timeout_ms = 600000;  // 10 minutes: covers ASR (up to 90s poll + submit) + LLM (up to 6min)
     config.crt_bundle_attach = esp_crt_bundle_attach;
     config.buffer_size = 2048;
     config.buffer_size_tx = 2048;

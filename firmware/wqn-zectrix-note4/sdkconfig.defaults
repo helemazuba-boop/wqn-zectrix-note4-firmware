@@ -17,3 +17,9 @@ CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
 CONFIG_MBEDTLS_SSL_KEEP_PEER_CERTIFICATE=n
 
 CONFIG_SPI_FLASH_VERIFY_WRITE=y
+
+# WebSocket transport: nginx reverse proxy returns a large upgrade response
+# (INGRESSCOOKIE + many access-control-* + x-stainless-* headers) that exceeds
+# the default 1024-byte buffer and aborts the WS handshake with
+# "Header size exceeded buffer size". 4096 is plenty for any sane proxy.
+CONFIG_WS_BUFFER_SIZE=4096

@@ -93,7 +93,6 @@ void ConfirmRunningApp()
 
 #if CONFIG_WQN_WIFI_STA_ENABLE
 
-TaskHandle_t g_wqn_online_task = nullptr;
 wqn::OnlineSyncSnapshot g_online_sync_snapshot = {};
 constexpr TickType_t kOnlineSyncRetryDelay = pdMS_TO_TICKS(10000);
 
@@ -124,12 +123,6 @@ bool LoadUsableToken(std::string* token)
         return false;
     }
     return true;
-}
-
-bool HasUsableStoredToken()
-{
-    std::string token;
-    return LoadUsableToken(&token);
 }
 
 std::vector<wqn::CachedProblem> ToCachedProblems(const std::vector<wqn::WqnProblem>& problems)
@@ -414,16 +407,6 @@ void WqnOnlineTask(void*)
     }
 }
 
-esp_err_t StartWqnOnlineTask()
-{
-    const BaseType_t created = xTaskCreate(WqnOnlineTask, "wqn_online", 12288, nullptr, 5, &g_wqn_online_task);
-    if (created != pdPASS) {
-        g_wqn_online_task = nullptr;
-        return ESP_ERR_NO_MEM;
-    }
-    return ESP_OK;
-}
-
 #endif  // CONFIG_WQN_WIFI_STA_ENABLE
 
 }  // namespace
@@ -435,6 +418,22 @@ bool HasUsableStoredToken()
     std::string token;
     return LoadUsableToken(&token);
 }
+
+#if CONFIG_WQN_WIFI_STA_ENABLE
+
+TaskHandle_t g_wqn_online_task = nullptr;
+
+esp_err_t StartWqnOnlineTask()
+{
+    const BaseType_t created = xTaskCreate(WqnOnlineTask, "wqn_online", 12288, nullptr, 5, &g_wqn_online_task);
+    if (created != pdPASS) {
+        g_wqn_online_task = nullptr;
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
+}
+
+#endif  // CONFIG_WQN_WIFI_STA_ENABLE
 
 void NotifyOnlineSyncRequested()
 {
@@ -569,7 +568,7 @@ extern "C" void app_main(void)
     ESP_ERROR_CHECK_WITHOUT_ABORT(wqn::RunAudioSelfTestIfEnabled());
 
 #if CONFIG_WQN_WIFI_STA_ENABLE
-    ESP_ERROR_CHECK_WITHOUT_ABORT(StartWqnOnlineTask());
+    ESP_ERROR_CHECK_WITHOUT_ABORT(wqn::StartWqnOnlineTask());
 #else
     ESP_LOGI(kTag, "pairing flow disabled because WiFi STA is disabled");
 #endif

@@ -8,6 +8,7 @@
 
 #include "ai_session.h"
 #include "esp_log.h"
+#include "flash_session.h"
 
 namespace device_ui_internal {
 
@@ -175,13 +176,34 @@ RefreshSchedule ApplyButtonEvent(const wqn::ButtonEvent& event, wqn::UiState* st
     if (state->screen == wqn::UiScreen::kSettings) {
         return ApplySettingsButtonEvent(event, state);
     }
+
+    // Double-press on AI page: cycle Flash / STD / Pro
+    if (event.type == wqn::ButtonEventType::kDoublePress && state->screen == wqn::UiScreen::kAi) {
+        wqn::AiTier new_tier = wqn::GetAiTier();
+        if (event.button == wqn::ButtonId::kUp) {
+            new_tier = wqn::PrevAiTier(new_tier);
+        } else if (event.button == wqn::ButtonId::kDownPower) {
+            new_tier = wqn::NextAiTier(new_tier);
+        }
+        wqn::SetAiTier(new_tier);
+        // Sync the global tier into the UI state so the next FrameSignature
+        // differs (otherwise the refresh dedup pipeline drops the redraw and
+        // the user only sees the change after navigating away and back).
+        state->ai.tier = new_tier;
+        return RefreshSchedule::kAi;
+    }
+
     if (repeated_long_press && !time_value_edit_repeat && !time_running_exit) {
         return RefreshSchedule::kNone;
     }
     if (long_release && event.button == wqn::ButtonId::kConfirm && state->screen == wqn::UiScreen::kAi) {
+#if CONFIG_WQN_AI_ENABLE
+        if (state->ai.tier == wqn::AiTier::kFlash) {
+            wqn::OnFlashButtonReleased();
+            return RefreshSchedule::kAi;
+        }
         if (state->ai.status == wqn::AiSessionStatus::kListening ||
             state->ai.status == wqn::AiSessionStatus::kWaitingReply) {
-#if CONFIG_WQN_AI_ENABLE
             const esp_err_t ret = wqn::StopAiRecordingAndSubmit();
             wqn::AiSessionState ai_state;
             if (wqn::CopyAiSessionToUi(&ai_state)) {
@@ -195,15 +217,15 @@ RefreshSchedule ApplyButtonEvent(const wqn::ButtonEvent& event, wqn::UiState* st
                 state->ai.status_since_ms = esp_timer_get_time() / 1000;
             }
             return RefreshSchedule::kAi;
-#else
-            state->ai.status = wqn::AiSessionStatus::kWaitingReply;
-            state->ai.status_since_ms = esp_timer_get_time() / 1000;
-            if (state->ai.pending_text.empty()) {
-                state->ai.pending_text = "AI 功能未启用";
-            }
-            return RefreshSchedule::kAi;
-#endif
         }
+#else
+        state->ai.status = wqn::AiSessionStatus::kWaitingReply;
+        state->ai.status_since_ms = esp_timer_get_time() / 1000;
+        if (state->ai.pending_text.empty()) {
+            state->ai.pending_text = "AI 功能未启用";
+        }
+        return RefreshSchedule::kAi;
+#endif
         return RefreshSchedule::kNone;
     }
     if (long_release) {

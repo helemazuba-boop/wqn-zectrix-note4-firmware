@@ -1,10 +1,6 @@
 // Device UI entry points: StartDeviceUiIfEnabled() + DeviceUiTask().
 // All other responsibilities (rendering, refresh, cloud, state, input) live in main/ui/.
 
-#include "device_ui.h"
-
-#include "ui/ui_internal.h"
-
 #include <cstdio>
 #include <ctime>
 #include <string>
@@ -12,12 +8,15 @@
 #include "ai_session.h"
 #include "button_input.h"
 #include "config.h"
+#include "device_ui.h"
 #include "driver/gpio.h"
 #include "epd_display.h"
 #include "esp_log.h"
 #include "esp_sleep.h"
 #include "esp_timer.h"
+#include "flash_session.h"
 #include "power_manager.h"
+#include "ui/ui_internal.h"
 #include "ui_model.h"
 #include "wqn_api.h"
 
@@ -47,6 +46,7 @@ using device_ui_internal::IsTodoCloudBusy;
 using device_ui_internal::IsWordCloudBusy;
 using device_ui_internal::g_todo_cloud_busy;
 using device_ui_internal::g_todo_result_queue;
+using device_ui_internal::g_refresh_busy;
 using device_ui_internal::g_word_cloud_busy;
 using device_ui_internal::g_word_result_queue;
 
@@ -104,7 +104,11 @@ void DeviceUiTask(void*)
             poll_delay = kUiPollDelayTicks;
             g_last_active_us_local = esp_timer_get_time();
         }
-        refresh_schedule = StrongerSchedule(refresh_schedule, ApplyButtonEvent(event, &state));
+        // Skip button processing while EPD is busy to avoid ghosting artifacts
+        // from two rapid refreshes. The next press will be picked up on the next poll cycle.
+        if (!g_refresh_busy) {
+            refresh_schedule = StrongerSchedule(refresh_schedule, ApplyButtonEvent(event, &state));
+        }
 
         if (g_todo_result_queue != nullptr) {
             device_ui_internal::TodoCloudResult* todo_result = nullptr;
@@ -146,6 +150,38 @@ void DeviceUiTask(void*)
 #if CONFIG_WQN_AI_ENABLE
         if (wqn::CopyAiSessionToUi(&state.ai) && state.screen == wqn::UiScreen::kAi) {
             refresh_schedule = StrongerSchedule(refresh_schedule, RefreshSchedule::kAi);
+        }
+        wqn::FlashUiState flash_ui;
+        if (wqn::CopyFlashStateToUi(&flash_ui)) {
+            // Map FlashStatus onto the local AI state so the render layer can
+            // read everything from state.ai without grabbing any mutex.
+            switch (flash_ui.status) {
+                case wqn::FlashStatus::kError:
+                    state.ai.status = wqn::AiSessionStatus::kError;
+                    state.ai.flash_is_streaming = false;
+                    break;
+                case wqn::FlashStatus::kStreaming:
+                    state.ai.status = wqn::AiSessionStatus::kWaitingReply;
+                    state.ai.flash_is_streaming = true;
+                    break;
+                case wqn::FlashStatus::kConnecting:
+                    state.ai.status = wqn::AiSessionStatus::kListening;
+                    state.ai.flash_is_streaming = false;
+                    break;
+                default:
+                    state.ai.status = wqn::AiSessionStatus::kIdle;
+                    state.ai.flash_is_streaming = false;
+                    break;
+            }
+            state.ai.flash_transcript = flash_ui.user_transcript;
+            state.ai.assistant_text = flash_ui.assistant_text;
+            state.ai.pending_text = flash_ui.pending_text;
+            state.ai.flash_pending = flash_ui.pending_text;
+            state.ai.flash_error = flash_ui.error_message;
+            state.ai.status_since_ms = flash_ui.status_since_ms;
+            if (state.screen == wqn::UiScreen::kAi) {
+                refresh_schedule = StrongerSchedule(refresh_schedule, RefreshSchedule::kAi);
+            }
         }
 #endif
 

@@ -14,6 +14,10 @@ constexpr gpio_num_t kConfirmPin = GPIO_NUM_0;
 constexpr int64_t kDebounceMs = 40;
 constexpr int64_t kLongPressMs = 1000;
 constexpr int64_t kLongPressRepeatMs = 260;
+constexpr int64_t kDoublePressWindowMs = 300;
+
+int64_t g_last_short_release_at_ms = 0;
+wqn::ButtonId g_last_short_release_button = wqn::ButtonId::kNone;
 
 struct ButtonState {
     wqn::ButtonId id;
@@ -24,6 +28,8 @@ struct ButtonState {
     int64_t raw_changed_at_ms = 0;
     int64_t stable_changed_at_ms = 0;
     int64_t last_long_press_event_at_ms = 0;
+    int64_t last_reported_at_ms = 0;
+    bool double_armed = false;
 };
 
 std::array<ButtonState, 3> g_buttons = {{
@@ -106,6 +112,14 @@ ButtonEvent PollButtonInput()
             } else {
                 const int64_t duration_ms = now_ms - previous_stable_changed_at_ms;
                 if (!button.long_press_reported) {
+                    if (g_last_short_release_button == button.id &&
+                        now_ms - g_last_short_release_at_ms <= kDoublePressWindowMs) {
+                        g_last_short_release_button = wqn::ButtonId::kNone;
+                        g_last_short_release_at_ms = 0;
+                        return MakeEvent(button.id, ButtonEventType::kDoublePress, duration_ms);
+                    }
+                    g_last_short_release_button = button.id;
+                    g_last_short_release_at_ms = now_ms;
                     return MakeEvent(button.id, ButtonEventType::kShortPress, duration_ms);
                 }
                 return MakeEvent(button.id, ButtonEventType::kLongRelease, duration_ms);

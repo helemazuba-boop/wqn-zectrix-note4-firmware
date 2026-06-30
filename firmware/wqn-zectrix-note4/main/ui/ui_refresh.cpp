@@ -204,6 +204,8 @@ std::string FrameSignature(const wqn::UiFrame& frame)
         signature.push_back('/');
         signature.append(std::to_string(static_cast<int>(frame.ai.status)));
         signature.push_back('/');
+        signature.append(std::to_string(static_cast<int>(frame.ai.tier)));
+        signature.push_back('/');
         signature.append(frame.ai.user_text);
         signature.push_back('/');
         signature.append(frame.ai.assistant_text);

@@ -18,6 +18,7 @@ enum class ButtonEventType {
     kShortPress,
     kLongPress,
     kLongRelease,
+    kDoublePress,
 };
 
 struct ButtonEvent {

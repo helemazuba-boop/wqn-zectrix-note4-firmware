@@ -111,8 +111,17 @@ std::string MessageForAiRequestFailure(const wqn::WqnAiChatResponse& response, e
     if (response.error_code == "asr_failed") {
         return "识别失败";
     }
+    if (response.error_code == "asr_timeout") {
+        return "识别超时，请稍后重试";
+    }
     if (response.error_code == "model_failed") {
         return "模型回复失败";
+    }
+    if (response.error_code == "chat_timeout") {
+        return "AI 回复超时，请稍后重试";
+    }
+    if (response.error_code == "provider_unavailable") {
+        return "AI 服务暂时不可用，请稍后重试";
     }
     if (response.error_code == "unauthorized") {
         return "设备授权已失效，请重新配对";
@@ -684,6 +693,29 @@ bool CopyAiSessionToUi(AiSessionState* state)
     return changed;
 }
 
+void SetAiTier(AiTier tier)
+{
+    if (g_lock == nullptr) {
+        return;
+    }
+    xSemaphoreTake(g_lock, portMAX_DELAY);
+    g_state.tier = tier;
+    MarkChanged();
+    xSemaphoreGive(g_lock);
+}
+
+AiTier GetAiTier()
+{
+    if (g_lock == nullptr) {
+        return AiTier::kStd;
+    }
+    AiTier result = AiTier::kStd;
+    xSemaphoreTake(g_lock, portMAX_DELAY);
+    result = g_state.tier;
+    xSemaphoreGive(g_lock);
+    return result;
+}
+
 }  // namespace wqn
 
 #else
@@ -708,6 +740,16 @@ esp_err_t StopAiRecordingAndSubmit()
 bool CopyAiSessionToUi(AiSessionState*)
 {
     return false;
+}
+
+void SetAiTier(AiTier tier)
+{
+    (void)tier;
+}
+
+AiTier GetAiTier()
+{
+    return AiTier::kStd;
 }
 
 }  // namespace wqn

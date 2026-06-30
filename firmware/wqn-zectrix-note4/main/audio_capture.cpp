@@ -387,7 +387,9 @@ void CleanupCaptureHardware(bool keep_power)
         g_audio.rx = nullptr;
     }
     if (!keep_power && g_audio.i2c_bus != nullptr) {
-        ESP_ERROR_CHECK_WITHOUT_ABORT(i2c_del_master_bus(g_audio.i2c_bus));
+        if (g_audio.i2c_bus != wqn::GetSharedI2cBusHandle()) {
+            ESP_ERROR_CHECK_WITHOUT_ABORT(i2c_del_master_bus(g_audio.i2c_bus));
+        }
         g_audio.i2c_bus = nullptr;
     }
     if (!keep_power) {

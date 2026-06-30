@@ -4,6 +4,7 @@
 #include <cstdint>
 
 #include "ai_session.h"
+#include "flash_session.h"
 #include "provision_manager.h"
 
 namespace {
@@ -538,6 +539,7 @@ void HandleUiInput(UiState* state, UiInput input)
         return;
     }
     ClampUiSelection(state);
+    const wqn::UiScreen screen_before = state->screen;
 
     switch (input) {
         case UiInput::kTopPrevious:
@@ -651,7 +653,9 @@ void HandleUiInput(UiState* state, UiInput input)
                 if (state->ai.status != AiSessionStatus::kListening &&
                     state->ai.status != AiSessionStatus::kWaitingReply) {
 #if CONFIG_WQN_AI_ENABLE
-                    if (StartAiRecordingSession() == ESP_OK) {
+                    if (state->ai.tier == AiTier::kFlash) {
+                        wqn::OnFlashButtonPressed();
+                    } else if (StartAiRecordingSession() == ESP_OK) {
                         AiSessionState ai_state;
                         if (CopyAiSessionToUi(&ai_state)) {
                             state->ai = ai_state;
@@ -683,6 +687,15 @@ void HandleUiInput(UiState* state, UiInput input)
             break;
     }
     ClampUiSelection(state);
+#if CONFIG_WQN_AI_ENABLE
+    // Leaving the AI screen while in Flash tier must tear down the WebSocket
+    // and the audio streaming task — otherwise they keep running in the
+    // background and drain the battery.
+    if (screen_before == wqn::UiScreen::kAi && state->screen != wqn::UiScreen::kAi &&
+        state->ai.tier == wqn::AiTier::kFlash) {
+        wqn::StopFlashSession();
+    }
+#endif
 }
 
 bool TickAiSession(UiState* state, int64_t now_ms)
@@ -782,6 +795,35 @@ UiFrame RenderUiFrame(const UiState& state)
     }
 
     return frame;
+}
+
+}  // namespace
+
+namespace wqn {
+
+AiTier NextAiTier(AiTier current)
+{
+    return static_cast<AiTier>((static_cast<uint8_t>(current) + 1) % static_cast<uint8_t>(AiTier::kCount));
+}
+
+AiTier PrevAiTier(AiTier current)
+{
+    const uint8_t val = static_cast<uint8_t>(current);
+    return static_cast<AiTier>((val + static_cast<uint8_t>(AiTier::kCount) - 1) % static_cast<uint8_t>(AiTier::kCount));
+}
+
+const char* AiTierLabel(AiTier tier)
+{
+    switch (tier) {
+        case AiTier::kFlash:
+            return "Flash";
+        case AiTier::kStd:
+            return "STD";
+        case AiTier::kPro:
+            return "Pro";
+        default:
+            return "???";
+    }
 }
 
 }  // namespace wqn

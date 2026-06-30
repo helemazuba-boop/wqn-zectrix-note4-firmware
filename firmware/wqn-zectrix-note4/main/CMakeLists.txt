@@ -3,6 +3,7 @@ idf_component_register(
         "main.cpp"
         "ai_session.cpp"
         "audio_capture.cpp"
+        "audio_player.cpp"
         "audio_selftest.cpp"
         "board_zectrix_note4.cpp"
         "button_input.cpp"
@@ -40,6 +41,7 @@ idf_component_register(
         "word_pack.cpp"
         "word_app.cpp"
         "wqn_api.cpp"
+        "flash_session.cpp"
     INCLUDE_DIRS "."
     REQUIRES
         driver
@@ -50,7 +52,7 @@ idf_component_register(
         app_update
         esp_adc
         esp_http_client
-        esp-tls
+        esp_websocket_client
         esp_event
         esp_netif
         esp_psram

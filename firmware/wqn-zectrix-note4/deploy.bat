@@ -39,17 +39,7 @@ echo.
 echo [Step 2] Using COM port: %COM_PORT%
 echo.
 
-:: Step 3: Erase entire flash (this takes ~30 seconds)...
-echo [Step 3] Erasing entire flash (this takes ~30 seconds)...
-idf.py -p %COM_PORT% -B "%BUILD_DIR%" erase-flash
-if errorlevel 1 (
-    echo   ERROR: Erase failed^!
-    pause
-    exit /b 1
-)
-echo   Done.
-
-:: Step 4: Flash all partitions
+:: Step 3: Flash all partitions (SKIP erase-flash so NVS pairing token survives)
 echo.
 echo [Step 4] Flashing all partitions...
 idf.py -p %COM_PORT% -B "%BUILD_DIR%" flash
