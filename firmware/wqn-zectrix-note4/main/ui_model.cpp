@@ -653,9 +653,12 @@ void HandleUiInput(UiState* state, UiInput input)
                 if (state->ai.status != AiSessionStatus::kListening &&
                     state->ai.status != AiSessionStatus::kWaitingReply) {
 #if CONFIG_WQN_AI_ENABLE
-                    if (state->ai.tier == AiTier::kFlash) {
-                        wqn::OnFlashButtonPressed();
-                    } else if (StartAiRecordingSession() == ESP_OK) {
+                    // [ptt-fix] Flash tier uses instant kPress/kRelease events
+                    // routed through ui_input.cpp; skip the long-confirm path
+                    // entirely so PTT doesn't have to wait 1 s for the long-
+                    // press threshold.
+                    if (state->ai.tier != AiTier::kFlash &&
+                        StartAiRecordingSession() == ESP_OK) {
                         AiSessionState ai_state;
                         if (CopyAiSessionToUi(&ai_state)) {
                             state->ai = ai_state;

@@ -379,6 +379,7 @@ void SubmitTask(void*)
         audio.duration_ms = kMaxAudioDurationMs;
     }
     SetStateLocked(wqn::AiSessionStatus::kWaitingReply, "正在上传语音...", "", "");
+    const std::string tier_str = g_state.tier == wqn::AiTier::kPro ? "pro" : "std";
     xSemaphoreGive(g_lock);
 
     std::string token;
@@ -400,6 +401,7 @@ void SubmitTask(void*)
         audio.samples.size() * sizeof(int16_t),
         audio.duration_ms,
         g_conversation_id,
+        tier_str,
         &response);
     wqn::ReleaseAudioCapturePower();
 

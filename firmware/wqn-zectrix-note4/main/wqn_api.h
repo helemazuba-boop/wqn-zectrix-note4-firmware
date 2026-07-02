@@ -302,6 +302,7 @@ esp_err_t UploadAiAudioChat(
     size_t pcm_size,
     int duration_ms,
     const std::string& conversation_id,
+    const std::string& tier,
     WqnAiChatResponse* response);
 
 esp_err_t ParseTodoListResponse(const std::string& body, WqnTodoListPage* page);

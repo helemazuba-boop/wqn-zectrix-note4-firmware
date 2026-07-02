@@ -338,6 +338,7 @@ extern std::string g_pending_signatures[2];
 extern std::atomic<int> g_consumer_index;
 extern bool g_refresh_pending;
 extern bool g_refresh_busy;
+extern int g_rtc_screen_val;
 extern TickType_t g_refresh_due_tick;
 extern RefreshSchedule g_refresh_schedule;
 

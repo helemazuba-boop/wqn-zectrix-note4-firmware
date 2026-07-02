@@ -86,6 +86,18 @@ bool LoadUiState(wqn::UiState* state)
         return false;
     }
 
+    // Restore last screen from RTC slow memory (survives deep sleep). On cold boot
+    // or RTC corruption, g_rtc_screen_val may be 0 (= kAi) which is unsafe, or
+    // contain an out-of-range value; fall back to kHome in either case.
+    constexpr int kScreenFallback = static_cast<int>(wqn::UiScreen::kHome);
+    const int saved_screen = g_rtc_screen_val;
+    if (saved_screen >= static_cast<int>(wqn::UiScreen::kAi) &&
+        saved_screen <= static_cast<int>(wqn::UiScreen::kProvisioning)) {
+        state->screen = static_cast<wqn::UiScreen>(saved_screen);
+    } else {
+        state->screen = static_cast<wqn::UiScreen>(kScreenFallback);
+    }
+
     std::vector<wqn::CachedProblem> problems;
     esp_err_t result = wqn::LoadProblems(&problems);
     if (result == ESP_OK) {

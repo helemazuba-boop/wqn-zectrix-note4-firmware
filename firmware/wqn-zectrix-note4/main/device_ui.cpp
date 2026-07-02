@@ -2,6 +2,7 @@
 // All other responsibilities (rendering, refresh, cloud, state, input) live in main/ui/.
 
 #include <cstdio>
+#include <cstring>
 #include <ctime>
 #include <string>
 
@@ -20,7 +21,77 @@
 #include "ui_model.h"
 #include "wqn_api.h"
 
+namespace device_ui_internal {
+// Last screen survives deep sleep via RTC slow memory. Initialized to kHome (=3)
+// rather than 0 so cold boot / RTC corruption can't accidentally land on kAi.
+// LoadUiState() validates the restored value before use.
+RTC_DATA_ATTR int g_rtc_screen_val = static_cast<int>(wqn::UiScreen::kHome);
+
+// [timer-skip] Last successfully-rendered (screen, clock-label) pair, stored
+// in RTC slow memory. On a timer wake-up we compare the freshly-rendered
+// frame's clock label + screen against these and skip the entire refresh
+// pipeline if both match -- the panel already shows this content.
+// Initialized to a sentinel screen value so the first wake-up after a cold
+// boot / RTC reset is never mistakenly skipped.
+RTC_DATA_ATTR int g_rtc_last_rendered_screen_id = -1;
+RTC_DATA_ATTR char g_rtc_last_rendered_clock[8] = {};
+} // namespace device_ui_internal
+
 namespace {
+
+// [timer-skip] Compute the screen-id that should participate in the
+// timer-wakeup skip decision. Configurable / editing screens must never be
+// skipped because their state can change between refreshes without touching
+// the clock label.
+bool ScreenSupportsTimerSkip(wqn::UiScreen screen)
+{
+    return screen == wqn::UiScreen::kHome ||
+           screen == wqn::UiScreen::kTime ||
+           screen == wqn::UiScreen::kWord ||
+           screen == wqn::UiScreen::kTodo;
+}
+
+bool TrySkipInitRefresh(wqn::UiScreen screen, const char* clock_label)
+{
+    using device_ui_internal::g_rtc_last_rendered_screen_id;
+    using device_ui_internal::g_rtc_last_rendered_clock;
+    // Only attempt the skip on timer wake-up; button / power-on wake-ups must
+    // always render so the user sees immediate feedback.
+    if (esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_TIMER) {
+        return false;
+    }
+    if (!ScreenSupportsTimerSkip(screen)) {
+        return false;
+    }
+    if (clock_label == nullptr || clock_label[0] == '\0') {
+        return false;
+    }
+    if (g_rtc_last_rendered_screen_id < 0) {
+        // Cold boot / RTC reset -- nothing valid to compare against.
+        return false;
+    }
+    if (static_cast<int>(screen) != g_rtc_last_rendered_screen_id) {
+        return false;
+    }
+    if (std::strcmp(clock_label, g_rtc_last_rendered_clock) != 0) {
+        return false;
+    }
+    ESP_LOGI("wqn_ui", "Init refresh skipped: panel already shows this exact frame (screen=%d clock=%s)",
+             static_cast<int>(screen), clock_label);
+    return true;
+}
+
+void RecordInitRefresh(wqn::UiScreen screen, const char* clock_label)
+{
+    using device_ui_internal::g_rtc_last_rendered_screen_id;
+    using device_ui_internal::g_rtc_last_rendered_clock;
+    if (!ScreenSupportsTimerSkip(screen) || clock_label == nullptr || clock_label[0] == '\0') {
+        return;
+    }
+    g_rtc_last_rendered_screen_id = static_cast<int>(screen);
+    std::strncpy(g_rtc_last_rendered_clock, clock_label, sizeof(g_rtc_last_rendered_clock) - 1);
+    g_rtc_last_rendered_clock[sizeof(g_rtc_last_rendered_clock) - 1] = '\0';
+}
 
 constexpr char kTag[] = "wqn_ui";
 constexpr TickType_t kUiPollDelayTicks = pdMS_TO_TICKS(50);
@@ -47,6 +118,7 @@ using device_ui_internal::IsWordCloudBusy;
 using device_ui_internal::g_todo_cloud_busy;
 using device_ui_internal::g_todo_result_queue;
 using device_ui_internal::g_refresh_busy;
+using device_ui_internal::g_rtc_screen_val;
 using device_ui_internal::g_word_cloud_busy;
 using device_ui_internal::g_word_result_queue;
 
@@ -58,7 +130,13 @@ int64_t g_last_active_us_local = 0;
 void DeviceUiTask(void*)
 {
     ESP_LOGI(kTag, "device UI task started");
-    wqn::NoteUserActivity();
+    // Skip the wake-up timer case: we just woke from RTC and the user did
+    // not interact with the device, so recording activity here would
+    // defeat the idle-off timer the moment the user stops touching the
+    // keypad after a long sleep.
+    if (esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_TIMER) {
+        wqn::NoteUserActivity();
+    }
     SeedClockFromBuildTimeIfNeeded();
 
     esp_err_t result = wqn::InitButtonInput();
@@ -80,6 +158,7 @@ void DeviceUiTask(void*)
     ESP_LOGI(kTag, "DeviceUiTask: calling LoadUiState");
     LoadUiState(&state);
     ESP_LOGI(kTag, "DeviceUiTask: LoadUiState done");
+    device_ui_internal::g_last_rendered_screen = state.screen;
     CheckBatteryProtection();
     ESP_LOGI(kTag, "DeviceUiTask: CheckBatteryProtection done");
     std::string last_clock_label = CurrentClockLabel();
@@ -87,9 +166,34 @@ void DeviceUiTask(void*)
     {
         const wqn::UiFrame frame = wqn::RenderUiFrame(state);
         last_frame_signature = FrameSignature(frame);
-        ESP_LOGI(kTag, "Requesting initial EPD refresh: signature_len=%zu schedule=immediate", last_frame_signature.size());
-        const bool req_ok = RequestEpdUiRefresh(frame, last_frame_signature, RefreshSchedule::kImmediate);
-        ESP_LOGI(kTag, "RequestEpdUiRefresh returned %d, g_refresh_task=%p", req_ok, device_ui_internal::g_refresh_task);
+        RefreshSchedule init_schedule = RefreshSchedule::kImmediate;
+        // [epd-crc-bypass-fix] On timer wake-up we want to skip the
+        // un-conditional full refresh, but only if the current screen can
+        // tolerate a partial pipeline. Screens like AI / Word / Todo have
+        // scrolling overlays or partial-screen markers that would ghost if
+        // we only refreshed the clock region, so fall back to kImmediate.
+        if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER &&
+            (state.screen == wqn::UiScreen::kTime ||
+             state.screen == wqn::UiScreen::kHome)) {
+            init_schedule = RefreshSchedule::kClock;
+        }
+        // [timer-skip] If a timer wake-up finds the freshly-rendered frame's
+        // (screen, clock label) identical to the last successful render --
+        // e.g. a per-minute RTC tick that fires within the same minute --
+        // skip the refresh pipeline entirely. The panel already shows this
+        // content, so we avoid any SPI traffic and any flicker.
+        const char* const init_clock = last_clock_label.c_str();
+        const bool skip_init_refresh = TrySkipInitRefresh(state.screen, init_clock);
+        ESP_LOGI(kTag, "Requesting initial EPD refresh: signature_len=%zu schedule=%s skip=%d",
+                 last_frame_signature.size(), device_ui_internal::RefreshScheduleName(init_schedule),
+                 skip_init_refresh ? 1 : 0);
+        if (!skip_init_refresh) {
+            const bool req_ok = RequestEpdUiRefresh(frame, last_frame_signature, init_schedule);
+            ESP_LOGI(kTag, "RequestEpdUiRefresh returned %d, g_refresh_task=%p", req_ok, device_ui_internal::g_refresh_task);
+            if (req_ok) {
+                RecordInitRefresh(state.screen, init_clock);
+            }
+        }
     }
     TickType_t last_status_refresh = xTaskGetTickCount();
     g_last_active_us_local = esp_timer_get_time();
@@ -151,6 +255,9 @@ void DeviceUiTask(void*)
         if (wqn::CopyAiSessionToUi(&state.ai) && state.screen == wqn::UiScreen::kAi) {
             refresh_schedule = StrongerSchedule(refresh_schedule, RefreshSchedule::kAi);
         }
+        // [amp-fix] Pump the flash amp idle-tail timer regardless of screen so
+        // stale open-amp state is closed even when the user has navigated away.
+        wqn::PollFlashAmpIdle();
         wqn::FlashUiState flash_ui;
         if (wqn::CopyFlashStateToUi(&flash_ui)) {
             // Map FlashStatus onto the local AI state so the render layer can
@@ -227,7 +334,10 @@ void DeviceUiTask(void*)
         // wakeup source + gpio_hold_en(GPIO_17) flow is in place.
         vTaskDelay(pdMS_TO_TICKS(10));
 
-        wqn::EnterDeepSleepIfEnabled();
+        g_rtc_screen_val = static_cast<int>(state.screen);
+        const bool enable_timer_wakeup = (state.screen == wqn::UiScreen::kHome ||
+                                          state.screen == wqn::UiScreen::kTime);
+        wqn::EnterDeepSleepIfEnabled(enable_timer_wakeup);
 
         const int64_t idle_ms = (esp_timer_get_time() - g_last_active_us_local) / 1000;
         const bool screen_active = (state.screen == wqn::UiScreen::kTime ||

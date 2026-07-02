@@ -30,6 +30,14 @@ struct ButtonState {
     int64_t last_long_press_event_at_ms = 0;
     int64_t last_reported_at_ms = 0;
     bool double_armed = false;
+    // [ptt-fix] When a debounced press or release transition is first observed,
+    // schedule an edge event (kPress / kRelease) for the *next* poll. The
+    // Press event is delivered immediately (priority over the existing
+    // long/short release logic, so PTT reacts with zero latency), and the
+    // existing kShortPress/kLongRelease/kDoublePress / kLongPress machinery
+    // is left untouched for every other UI consumer.
+    bool edge_event_pending = false;
+    wqn::ButtonEventType pending_edge = wqn::ButtonEventType::kNone;
 };
 
 std::array<ButtonState, 3> g_buttons = {{
@@ -94,6 +102,17 @@ ButtonEvent PollButtonInput()
     const int64_t now_ms = NowMs();
 
     for (ButtonState& button : g_buttons) {
+        // [ptt-fix] Drain any queued press/release edge event first. This runs
+        // before the GPIO sampling so a freshly-armed edge is delivered on the
+        // very next poll (one-button-input-period latency, ~50 ms) without
+        // waiting for the long-press threshold.
+        if (button.edge_event_pending) {
+            button.edge_event_pending = false;
+            const wqn::ButtonEventType et = button.pending_edge;
+            button.pending_edge = wqn::ButtonEventType::kNone;
+            return MakeEvent(button.id, et, 0);
+        }
+
         const bool pressed = ReadPressed(button.pin);
         if (pressed != button.raw_pressed) {
             button.raw_pressed = pressed;
@@ -109,6 +128,12 @@ ButtonEvent PollButtonInput()
             if (button.stable_pressed) {
                 button.long_press_reported = false;
                 button.last_long_press_event_at_ms = now_ms;
+                // [ptt-fix] Defer the kPress edge to the next poll so long-
+                // press consumers still see kLongPress after the debounce
+                // window passes, but PTT consumers see kPress within ~50 ms
+                // instead of waiting for the 1-second long-press threshold.
+                button.pending_edge = wqn::ButtonEventType::kPress;
+                button.edge_event_pending = true;
             } else {
                 const int64_t duration_ms = now_ms - previous_stable_changed_at_ms;
                 if (!button.long_press_reported) {
@@ -116,12 +141,25 @@ ButtonEvent PollButtonInput()
                         now_ms - g_last_short_release_at_ms <= kDoublePressWindowMs) {
                         g_last_short_release_button = wqn::ButtonId::kNone;
                         g_last_short_release_at_ms = 0;
+                        // [ptt-fix] Queue kRelease edge so PTT reacts at the
+                        // release transition regardless of whether this drop
+                        // was classified as a double-press.
+                        button.pending_edge = wqn::ButtonEventType::kRelease;
+                        button.edge_event_pending = true;
                         return MakeEvent(button.id, ButtonEventType::kDoublePress, duration_ms);
                     }
                     g_last_short_release_button = button.id;
                     g_last_short_release_at_ms = now_ms;
+                    // [ptt-fix] Same idea on a plain short release.
+                    button.pending_edge = wqn::ButtonEventType::kRelease;
+                    button.edge_event_pending = true;
                     return MakeEvent(button.id, ButtonEventType::kShortPress, duration_ms);
                 }
+                // [ptt-fix] Long release path keeps the legacy event for
+                // settings menu exit etc., but also queues kRelease so the
+                // PTT capture stop happens on the press transition.
+                button.pending_edge = wqn::ButtonEventType::kRelease;
+                button.edge_event_pending = true;
                 return MakeEvent(button.id, ButtonEventType::kLongRelease, duration_ms);
             }
         }

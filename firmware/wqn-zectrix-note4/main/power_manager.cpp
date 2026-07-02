@@ -113,6 +113,7 @@ void HoldOutput(gpio_num_t pin, int level)
 // press). With it, the last user-activity timestamp is preserved across
 // deep-sleep cycles, so the idle threshold is satisfied immediately on wake.
 RTC_DATA_ATTR int64_t g_last_user_activity_ms = 0;
+static bool g_user_interacted_current_boot = false;
 static constexpr uint32_t kMaxConsecutiveSleepCycles = 3;
 
 uint32_t GetNvsSleepCount()
@@ -172,6 +173,7 @@ void ReleaseDeepSleepHolds()
 
 void NoteUserActivity()
 {
+    g_user_interacted_current_boot = true;
     g_last_user_activity_ms = NowMs();
     // [power-fix] User pressed a button or otherwise interacted with the UI.
     // Reset the consecutive-sleep counter so the next wake cycle starts fresh.
@@ -197,6 +199,12 @@ bool IsUiIdleForSleep()
 
 bool IsUiIdleForSleepEx(int extra_idle_ms)
 {
+    // If we woke up by a timer and there has been no user interaction in this boot session,
+    // we should sleep immediately.
+    if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER && !g_user_interacted_current_boot) {
+        return true;
+    }
+
     int threshold_ms = CONFIG_WQN_DEEP_SLEEP_IDLE_MS;
     /* Temporarily commented out for fast testing/verification over USB
     if (IsCharging()) {
@@ -382,9 +390,9 @@ bool IsBatteryVeryLow()
     return GetBatteryVoltageMv() <= kVeryLowMv;
 }
 
-esp_err_t PrepareForDeepSleep()
+esp_err_t PrepareForDeepSleep(bool enable_timer_wakeup)
 {
-    ESP_LOGI(kTag, "preparing board for deep sleep");
+    ESP_LOGI(kTag, "preparing board for deep sleep (enable_timer_wakeup=%d)", enable_timer_wakeup);
 
     PowerOffEpd();
     HoldOutput(kEpdPower, 0);
@@ -405,26 +413,27 @@ esp_err_t PrepareForDeepSleep()
         "enable ext1 wakeup");
 
 #if CONFIG_WQN_DEEP_SLEEP_TIMER_WAKE_SEC > 0
-    if (g_pcf8563_initialized) {
-        if (Pcf8563ConfigureTimerWake(CONFIG_WQN_DEEP_SLEEP_TIMER_WAKE_SEC)) {
-            ESP_LOGI(kTag, "deep sleep using PCF8563 timer wake: %d sec", CONFIG_WQN_DEEP_SLEEP_TIMER_WAKE_SEC);
+    if (enable_timer_wakeup) {
+        if (g_pcf8563_initialized) {
+            if (Pcf8563ConfigureTimerWake(CONFIG_WQN_DEEP_SLEEP_TIMER_WAKE_SEC)) {
+                ESP_LOGI(kTag, "deep sleep using PCF8563 timer wake: %d sec", CONFIG_WQN_DEEP_SLEEP_TIMER_WAKE_SEC);
+            } else {
+                ESP_LOGW(kTag, "PCF8563 timer config failed, falling back to ESP32 internal timer");
+                ESP_RETURN_ON_ERROR(
+                    esp_sleep_enable_timer_wakeup(static_cast<uint64_t>(CONFIG_WQN_DEEP_SLEEP_TIMER_WAKE_SEC) * 1000000ULL),
+                    kTag,
+                    "enable ESP32 timer wakeup");
+            }
         } else {
-            ESP_LOGW(kTag, "PCF8563 timer config failed, falling back to ESP32 internal timer");
             ESP_RETURN_ON_ERROR(
                 esp_sleep_enable_timer_wakeup(static_cast<uint64_t>(CONFIG_WQN_DEEP_SLEEP_TIMER_WAKE_SEC) * 1000000ULL),
                 kTag,
                 "enable ESP32 timer wakeup");
         }
-    } else
-#endif
-    {
-#if CONFIG_WQN_DEEP_SLEEP_TIMER_WAKE_SEC > 0
-        ESP_RETURN_ON_ERROR(
-            esp_sleep_enable_timer_wakeup(static_cast<uint64_t>(CONFIG_WQN_DEEP_SLEEP_TIMER_WAKE_SEC) * 1000000ULL),
-            kTag,
-            "enable ESP32 timer wakeup");
-#endif
+    } else {
+        ESP_LOGI(kTag, "timer wakeup disabled for this sleep cycle");
     }
+#endif
 
     ESP_LOGI(
         kTag,
@@ -435,7 +444,7 @@ esp_err_t PrepareForDeepSleep()
     return ESP_OK;
 }
 
-void EnterDeepSleepIfEnabled()
+void EnterDeepSleepIfEnabled(bool enable_timer_wakeup)
 {
 #if CONFIG_WQN_DEEP_SLEEP_ENABLE
     if (IsBatteryVeryLow() && !IsCharging() && !IsUsbPowered()) {
@@ -456,6 +465,10 @@ void EnterDeepSleepIfEnabled()
     if (!IsUiIdleForSleep()) {
         // [power-fix] User interacted reset is now handled via NoteUserActivity()
         // and boot-time wakeup cause checks.
+        return;
+    }
+
+    if (IsEpdBusy()) {
         return;
     }
 
@@ -481,7 +494,7 @@ void EnterDeepSleepIfEnabled()
     SetNvsSleepCount(sleep_count);
     ESP_LOGI(kTag, "deep-sleep cycle %u/%u", sleep_count, kMaxConsecutiveSleepCycles);
 
-    const esp_err_t result = PrepareForDeepSleep();
+    const esp_err_t result = PrepareForDeepSleep(enable_timer_wakeup);
     if (result != ESP_OK) {
         ESP_LOGW(kTag, "deep sleep aborted: %s", esp_err_to_name(result));
         return;

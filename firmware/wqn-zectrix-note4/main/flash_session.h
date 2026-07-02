@@ -30,6 +30,10 @@ FlashStatus GetFlashStatus();
 bool IsFlashConnected();
 bool CopyFlashStateToUi(FlashUiState* state);
 bool IsFlashTranscribing();
+// Periodically called from the UI task; closes the audio amp after the configured
+// idle tail so long pauses between server audio deltas don't leave the speaker
+// enabled (pop/click at the next turn). Safe to call when flash is idle.
+void PollFlashAmpIdle();
 void OnFlashButtonPressed();
 void OnFlashButtonReleased();
 

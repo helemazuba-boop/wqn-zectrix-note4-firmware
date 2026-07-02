@@ -163,6 +163,30 @@ RefreshSchedule ApplyButtonEvent(const wqn::ButtonEvent& event, wqn::UiState* st
         return RefreshSchedule::kNone;
     }
 
+    // [ptt-fix] Edge events (kPress / kRelease) drive the Flash PTT path with
+    // sub-50 ms latency. Detect them here before any long-press logic so the
+    // confirm-button press triggers capture immediately, the release stops it
+    // immediately, and the legacy kLongPress/kLongRelease paths are left
+    // unused on the AI / Flash page (avoiding double-firing).
+    if (state->screen == wqn::UiScreen::kAi &&
+        event.button == wqn::ButtonId::kConfirm &&
+        (event.type == wqn::ButtonEventType::kPress ||
+         event.type == wqn::ButtonEventType::kRelease)) {
+#if CONFIG_WQN_AI_ENABLE
+        if (state->ai.tier == wqn::AiTier::kFlash) {
+            if (event.type == wqn::ButtonEventType::kPress) {
+                wqn::OnFlashButtonPressed();
+            } else {
+                wqn::OnFlashButtonReleased();
+            }
+            return RefreshSchedule::kAi;
+        }
+#endif
+        // Non-Flash tier: let kPress translate to kConfirm (legacy behaviour)
+        // by leaving the event unmodified and falling through. Other tiers
+        // (STD / Pro) still rely on kLongPress to start recording.
+    }
+
     const bool long_press = event.type == wqn::ButtonEventType::kLongPress;
     const bool long_release = event.type == wqn::ButtonEventType::kLongRelease;
     const bool repeated_long_press = long_press && event.duration_ms >= kRepeatedLongPressMinDurationMs;
@@ -198,8 +222,11 @@ RefreshSchedule ApplyButtonEvent(const wqn::ButtonEvent& event, wqn::UiState* st
     }
     if (long_release && event.button == wqn::ButtonId::kConfirm && state->screen == wqn::UiScreen::kAi) {
 #if CONFIG_WQN_AI_ENABLE
+        // [ptt-fix] Flash tier uses the kRelease edge event for its stop hook
+        // (delivered ~50 ms after the press transition), which arrives before
+        // this kLongRelease. Calling OnFlashButtonReleased twice would
+        // double-submit the audio buffer, so skip here.
         if (state->ai.tier == wqn::AiTier::kFlash) {
-            wqn::OnFlashButtonReleased();
             return RefreshSchedule::kAi;
         }
         if (state->ai.status == wqn::AiSessionStatus::kListening ||

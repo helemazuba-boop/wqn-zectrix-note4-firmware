@@ -15,6 +15,14 @@ enum class ButtonId {
 
 enum class ButtonEventType {
     kNone = 0,
+    // Edge events (FIFO from PollButtonInput). These fire on the debounced
+    // press / release transitions and are the canonical signal for PTT-style
+    // "press-to-talk" flows where every millisecond of leading-edge audio
+    // matters. Older derived events (kShortPress / kLongPress / kLongRelease
+    // / kDoublePress) are still emitted on the release transition for
+    // non-PTT flows that want delayed-press semantics.
+    kPress,
+    kRelease,
     kShortPress,
     kLongPress,
     kLongRelease,

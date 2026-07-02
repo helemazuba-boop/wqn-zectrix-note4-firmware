@@ -1,4 +1,4 @@
-﻿#include "wqn_api.h"
+#include "wqn_api.h"
 
 #include <algorithm>
 #include <array>
@@ -256,6 +256,7 @@ esp_err_t HttpBinaryPost(
     size_t request_body_size,
     int duration_ms,
     const std::string& conversation_id,
+    const std::string& tier,
     int* status_code,
     std::string* response_body)
 {
@@ -301,6 +302,9 @@ esp_err_t HttpBinaryPost(
     }
     if (result == ESP_OK && !conversation_id.empty()) {
         result = esp_http_client_set_header(client, "X-WQN-Conversation-Id", conversation_id.c_str());
+    }
+    if (result == ESP_OK && !tier.empty()) {
+        result = esp_http_client_set_header(client, "X-WQN-Ai-Tier", tier.c_str());
     }
     if (result != ESP_OK) {
         esp_http_client_cleanup(client);
@@ -2462,6 +2466,7 @@ esp_err_t UploadAiAudioChat(
     size_t pcm_size,
     int duration_ms,
     const std::string& conversation_id,
+    const std::string& tier,
     WqnAiChatResponse* response)
 {
     if (pcm_data == nullptr || pcm_size == 0 || response == nullptr) {
@@ -2474,7 +2479,7 @@ esp_err_t UploadAiAudioChat(
     int status_code = 0;
     std::string body;
     const esp_err_t result =
-        HttpBinaryPost(url, token, pcm_data, pcm_size, duration_ms, conversation_id, &status_code, &body);
+        HttpBinaryPost(url, token, pcm_data, pcm_size, duration_ms, conversation_id, tier, &status_code, &body);
     if (result != ESP_OK) {
         ESP_LOGW(kTag, "AI audio upload failed: %s", esp_err_to_name(result));
         return result;

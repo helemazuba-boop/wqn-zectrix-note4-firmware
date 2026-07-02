@@ -80,6 +80,10 @@ struct FlashState {
     i2s_chan_handle_t stream_tx = nullptr;  // duplex TX for audio playback
     i2c_master_bus_handle_t stream_i2c_bus = nullptr;
     bool stream_audio_powered = false;
+    // [amp-fix] amp is opened lazily on the first playback write and closed via
+    // an idle-tail timer (or synchronously on release / stop / cleanup).
+    int64_t amp_idle_due_ms = 0;
+    bool amp_idle_armed = false;
 };
 
 FlashState g_flash;
@@ -203,6 +207,7 @@ constexpr uint8_t kStreamEs8311Address = 0x18;
 constexpr uint32_t kStreamDmaFrameNum = 256;
 constexpr int kStreamChunkFrames = 240;    // 15 ms at 16 kHz
 constexpr int kStreamChunkBytes = kStreamChunkFrames * 2;  // 16-bit mono
+constexpr int64_t kAmpIdleTailMs = 600;    // turn amp off this long after last audio-delta write
 
 constexpr uint8_t ES8311_REG_RESET = 0x00;
 constexpr uint8_t ES8311_REG_CLK_MAN1 = 0x01;
@@ -244,10 +249,42 @@ void SetStreamAudioPower(bool enabled)
     gpio_hold_dis(kStreamAudioPower);
     gpio_set_level(kStreamAudioPower, enabled ? 1 : 0);
     gpio_hold_en(kStreamAudioPower);
+}
 
+// [amp-fix] Was: amp was hard-tied to power and forced off, so response.audio.delta
+// PCM data went into I2S TX but the user heard nothing (ES8311 line-out disabled).
+// Now amp is independent: off during capture (avoid feedback), on while the server
+// is streaming audio out, off after a short idle tail so consecutive spoken turns
+// don't accumulate click/pop artifacts. Direct write to GPIO46 is OK only because
+// flash mode and audio_player (TTS) are mutually exclusive on this UI.
+void SetStreamAudioAmp(bool enabled)
+{
     gpio_hold_dis(kStreamAudioAmp);
-    gpio_set_level(kStreamAudioAmp, 0);
+    gpio_set_level(kStreamAudioAmp, enabled ? 1 : 0);
     gpio_hold_en(kStreamAudioAmp);
+}
+
+// Check whether the idle tail has expired and turn the amp off if so. Cheap
+// enough to call from the UI loop on every poll. Safe to call when flash is
+// idle (no-op).
+void CheckAmpIdleTail()
+{
+    if (g_flash.mutex == nullptr) {
+        return;
+    }
+    bool should_off = false;
+    xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+    if (g_flash.amp_idle_armed) {
+        const int64_t now_ms = esp_timer_get_time() / 1000;
+        if (now_ms >= g_flash.amp_idle_due_ms) {
+            g_flash.amp_idle_armed = false;
+            should_off = true;
+        }
+    }
+    xSemaphoreGive(g_flash.mutex);
+    if (should_off) {
+        SetStreamAudioAmp(false);
+    }
 }
 
 esp_err_t InitStreamEs8311Adc(i2c_master_bus_handle_t bus)
@@ -380,6 +417,14 @@ void CleanupStreamHardware()
         g_flash.stream_i2c_bus = nullptr;
     }
     g_flash.stream_audio_powered = false;
+    // [amp-fix] Always force amp off on hardware teardown; the mutex may
+    // already be taken here, so write GPIO directly and clear the timer flag.
+    if (g_flash.mutex != nullptr) {
+        xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+        g_flash.amp_idle_armed = false;
+        xSemaphoreGive(g_flash.mutex);
+    }
+    SetStreamAudioAmp(false);
 }
 
 void AudioStreamingTask(void* param)
@@ -485,6 +530,17 @@ void StartAudioStreaming()
     SetStreamAudioPower(true);
     g_flash.stream_audio_powered = true;
     vTaskDelay(pdMS_TO_TICKS(250));  // warm-up delay for ES8311
+
+    // [amp-fix] Always start in a closed-amp state. The amp is enabled lazily
+    // by the response.audio.delta handler when the server actually starts
+    // streaming playback, and closed by the idle tail or by release/stop.
+    if (g_flash.mutex != nullptr) {
+        xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+        g_flash.amp_idle_armed = false;
+        xSemaphoreGive(g_flash.mutex);
+    }
+    SetStreamAudioAmp(false);
+
     xTaskCreatePinnedToCore(&AudioStreamingTask, "flash_stream", 4096, nullptr, 10,
                              &g_flash.stream_task, 1);
 }
@@ -620,6 +676,15 @@ void ParseAndHandleEvent(const char* data, size_t len)
             // panic on the next allocation.
             const size_t safe_bytes = pcm.size() & ~static_cast<size_t>(1);
             if (safe_bytes >= 2 && g_flash.stream_tx != nullptr) {
+                // [amp-fix] First playback chunk in a turn enables the amp and
+                // arms the idle-tail timer. Subsequent chunks just re-arm the
+                // timer; the timer is cancelled by StopAudioStreaming / Done /
+                // CleanupStreamHardware.
+                xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+                g_flash.amp_idle_armed = true;
+                g_flash.amp_idle_due_ms = esp_timer_get_time() / 1000 + kAmpIdleTailMs;
+                xSemaphoreGive(g_flash.mutex);
+                SetStreamAudioAmp(true);
                 // Mono PCM from server → stereo interleaved for I2S TX
                 const size_t sample_count = safe_bytes / 2;
                 std::vector<int16_t> stereo(sample_count * 2);
@@ -639,6 +704,14 @@ void ParseAndHandleEvent(const char* data, size_t len)
 
     if (std::strcmp(type, "response.done") == 0) {
         ESP_LOGI(kTag, "response done");
+        // [amp-fix] Server finished the turn; close the amp tail early instead
+        // of waiting for the idle timer.
+        if (g_flash.mutex != nullptr) {
+            xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+            g_flash.amp_idle_armed = false;
+            xSemaphoreGive(g_flash.mutex);
+        }
+        SetStreamAudioAmp(false);
         return;
     }
 
@@ -1042,6 +1115,11 @@ bool IsFlashTranscribing()
     return transcribing;
 }
 
+void PollFlashAmpIdle()
+{
+    CheckAmpIdleTail();
+}
+
 void OnFlashButtonPressed()
 {
     if (g_flash.mutex == nullptr) {
@@ -1093,6 +1171,16 @@ void OnFlashButtonReleased()
         StopAudioStreaming();
     }
 
+    // [amp-fix] Force the amp off the moment the user lets go of PTT, regardless
+    // of whether audio was actually playing back. The idle-tail timer would also
+    // do this but only after up to 600 ms of silence — too late for a clean handoff.
+    if (g_flash.mutex != nullptr) {
+        xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+        g_flash.amp_idle_armed = false;
+        xSemaphoreGive(g_flash.mutex);
+    }
+    SetStreamAudioAmp(false);
+
     // Send commit/response only if WS was actually connected
     xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
     if (ws_connected && g_flash.ws_client != nullptr) {
@@ -1116,6 +1204,7 @@ FlashStatus GetFlashStatus() { return FlashStatus::kIdle; }
 bool IsFlashConnected() { return false; }
 bool CopyFlashStateToUi(FlashUiState*) { return false; }
 bool IsFlashTranscribing() { return false; }
+void PollFlashAmpIdle() {}
 void OnFlashButtonPressed() {}
 void OnFlashButtonReleased() {}
 }  // namespace wqn

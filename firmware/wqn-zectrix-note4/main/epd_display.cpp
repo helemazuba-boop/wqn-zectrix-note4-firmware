@@ -1470,4 +1470,18 @@ void PowerOffEpd()
     }
 }
 
-}  // namespace wqn
+} // namespace wqn
+
+// Helpers outside the main `wqn` namespace block (which closed at the end of
+// PowerOffEpd above) so we don't reopen the same namespace. The flag itself
+// lives in the device_ui_internal translation unit (ui_refresh.cpp);
+// forward-declare here to read it without dragging in ui_internal.h.
+namespace device_ui_internal {
+extern bool g_refresh_busy;
+}  // namespace device_ui_internal
+
+bool wqn::IsEpdBusy()
+{
+    return ::device_ui_internal::g_refresh_busy;
+}
+
