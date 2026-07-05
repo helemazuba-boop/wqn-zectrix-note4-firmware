@@ -104,4 +104,31 @@ std::string JoinAiFunctionCallSummaries(const std::vector<std::string>& summarie
     return output;
 }
 
+// [tool-display] Numbered, status-prefixed tool summary lines.
+//
+// The AI session state carries display strings that already begin with an
+// emoji marker (🔧 running, ✅ success, ❌ failed) — see ai_session.cpp's
+// kToolStart/kToolResult branches. For the EPD action-page we want a tighter
+// layout: one line per tool with "N." prefix, keeping the status marker at
+// the start of the body so the user can scan the order and outcome at a
+// glance.
+std::string FormatAiFunctionCallSummaries(const std::vector<std::string>& summaries)
+{
+    std::string output;
+    int index = 0;
+    for (const std::string& summary : summaries) {
+        if (summary.empty()) {
+            continue;
+        }
+        if (!output.empty()) {
+            output += "\n";
+        }
+        ++index;
+        output += std::to_string(index);
+        output += ". ";
+        output += summary;
+    }
+    return output;
+}
+
 }  // namespace device_ui_internal

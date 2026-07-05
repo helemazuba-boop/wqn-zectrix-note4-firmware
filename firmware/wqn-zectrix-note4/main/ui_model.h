@@ -55,6 +55,7 @@ enum class AiSessionStatus {
     kIdle,
     kListening,
     kWaitingReply,
+    kStreaming,         // v2 SSE: connected, server is producing events
     kReplyReady,
     kError,
 };
@@ -87,6 +88,13 @@ struct AiSessionState {
     std::string flash_pending;
     std::string flash_error;
     bool flash_is_streaming = false;
+
+    // v2 SSE incremental render fields (Std/Pro tiers).
+    // assistant_partial accumulates streamed text.delta events between two
+    // commits and is flushed to assistant_text on text.end / final.
+    std::string assistant_partial;
+    std::string user_partial;          // transient asr.delta buffer
+    int64_t last_render_ms = 0;        // last chunked partial-refresh timestamp
 };
 
 enum class TodoSyncStatus {

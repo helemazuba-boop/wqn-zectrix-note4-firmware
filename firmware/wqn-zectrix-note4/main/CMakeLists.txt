@@ -15,6 +15,7 @@ idf_component_register(
         "power_manager.cpp"
         "pcf8563.cpp"
         "provision_manager.cpp"
+        "sse_chunk.cpp"
         "storage.cpp"
         "text_render.cpp"
         "time_app.cpp"
@@ -41,6 +42,7 @@ idf_component_register(
         "word_pack.cpp"
         "word_app.cpp"
         "wqn_api.cpp"
+        "wqn_api_stream.cpp"
         "flash_session.cpp"
     INCLUDE_DIRS "."
     REQUIRES
@@ -57,6 +59,7 @@ idf_component_register(
         esp_netif
         esp_psram
         esp_wifi
+        freertos
         json
         lwip
         mbedtls

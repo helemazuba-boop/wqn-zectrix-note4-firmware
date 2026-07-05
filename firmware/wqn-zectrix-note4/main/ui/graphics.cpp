@@ -92,19 +92,39 @@ esp_err_t RefreshStableRegion(const UiRect& rect, RefreshSchedule schedule)
 
 esp_err_t RefreshFrame(const wqn::UiFrame& frame, RefreshSchedule schedule)
 {
-    ESP_LOGI(kTag, "RefreshFrame: enter schedule=%s screen=%d", RefreshScheduleName(schedule), static_cast<int>(frame.screen));
+    ESP_LOGI(kTag, "RefreshFrame: enter schedule=%s screen=%d last_rendered_screen=%d",
+             RefreshScheduleName(schedule), static_cast<int>(frame.screen),
+             static_cast<int>(g_last_rendered_screen));
     const bool allow_local_partial =
         schedule == RefreshSchedule::kClock || schedule == RefreshSchedule::kTimer ||
         schedule == RefreshSchedule::kSelection || schedule == RefreshSchedule::kConfig ||
         schedule == RefreshSchedule::kAi;
+    // [power-fix] Force a full refresh when:
+    //   (a) the panel is being shown a genuinely different screen, OR
+    //   (b) the producer asked for kCommit (used for screen transitions,
+    //       time-app layout changes like Clock<->CountdownConfig, todo /
+    //       word cloud-result updates, factory-reset, review-queue submit).
+    //       These cases redraw the entire framebuffer, so a partial pipeline
+    //       with the dirty-rect search still ends up sending the whole
+    //       framebuffer and accumulating ghosting. The full waveform clears
+    //       whatever was on the panel before.
+    //   The kImmediate branch is intentionally absent here -- on RTC wake the
+    //   CRC fast path inside RefreshEpdFull() suppresses the SPI transfer
+    //   when nothing changed.
     const bool force_full_refresh =
-        schedule == RefreshSchedule::kImmediate ||
-        frame.screen != g_last_rendered_screen;
+        frame.screen != g_last_rendered_screen ||
+        schedule == RefreshSchedule::kCommit;
     if (frame.screen != g_last_rendered_screen) {
         ESP_LOGI(kTag, "EPD: screen change detected (%d -> %d), forcing full refresh",
                  static_cast<int>(g_last_rendered_screen), static_cast<int>(frame.screen));
     }
     g_last_rendered_screen = frame.screen;
+    ESP_LOGI(kTag,
+             "RefreshFrame: schedule=%s allow_local=%d force_full=%d screen=%d tier=%d",
+             RefreshScheduleName(schedule), allow_local_partial ? 1 : 0,
+             force_full_refresh ? 1 : 0,
+             static_cast<int>(frame.screen),
+             static_cast<int>(frame.ai.tier));
     return wqn::RefreshEpdFull(allow_local_partial, force_full_refresh);
 }
 

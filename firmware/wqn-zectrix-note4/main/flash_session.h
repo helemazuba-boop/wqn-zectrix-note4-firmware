@@ -14,11 +14,13 @@ enum class FlashStatus {
     kError,
 };
 
+// Public surface returned to the UI; everything is a snapshot.
 struct FlashUiState {
     FlashStatus status = FlashStatus::kIdle;
-    std::string user_transcript;
-    std::string assistant_text;
-    std::string pending_text;
+    std::string user_transcript;   // incremental ASR text
+    std::string assistant_text;    // incremental assistant transcript
+    std::string pending_text;      // human-readable status
+    std::string tool_label;        // "🔧 tool..." or "✅ tool done"
     std::string error_message;
     int64_t status_since_ms = 0;
 };
@@ -30,6 +32,7 @@ FlashStatus GetFlashStatus();
 bool IsFlashConnected();
 bool CopyFlashStateToUi(FlashUiState* state);
 bool IsFlashTranscribing();
+
 // Periodically called from the UI task; closes the audio amp after the configured
 // idle tail so long pauses between server audio deltas don't leave the speaker
 // enabled (pop/click at the next turn). Safe to call when flash is idle.

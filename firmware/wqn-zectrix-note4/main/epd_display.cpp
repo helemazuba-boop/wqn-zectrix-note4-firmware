@@ -34,6 +34,19 @@ constexpr int kBusyTimeoutMs = 30000;
 constexpr int kPartialRefreshBusyTimeoutMs = 1500;
 constexpr int kPartialCommandBusyTimeoutMs = 1500;
 constexpr int kLocalPartialMaxHeight = 170;
+// [epd-health] SSDs (SSD1683 / WaveShare 4.2") accumulate DC bias after
+// consecutive partial refreshes; without interleaving full refreshes the
+// panel's BUSY line eventually sticks high past kPartialCommandBusyTimeoutMs
+// and the only recovery is a full refresh (~2-3s), which the user feels as
+// a hard freeze. Forcing a full refresh every N partials is far less
+// disruptive than letting the panel stall in the middle of a UI flow.
+// [epd-tune] Bumped from 6 to 20 after observing SSD1683 stayed clean
+// through 10+ consecutive partial refreshes (UI smoke tests with a 10s
+// countdown). The timer-page once-per-second tick used to hit the old 6
+// threshold every 7s, producing a visible flash in the middle of a running
+// timer. 20 covers a 21-second timer run window without forcing a full
+// refresh, and a 6-min countdown still gets an interleaved full refresh
+// every 21 partials.
 constexpr uint32_t kMaxPartialRefreshesBeforeFull = 20;
 constexpr int kTextGlyphWidth = 5;
 constexpr int kTextGlyphHeight = 7;
@@ -1375,7 +1388,17 @@ esp_err_t RefreshEpdFull(bool allow_local_partial, bool force_full_refresh)
     const float dirty_area_ratio = DirtyRectAreaRatio(dirty_rect);
     bool full_refresh = force_full_refresh || !g_previous_framebuffer_synced;
     if (!full_refresh && g_partial_refreshes_since_full >= kMaxPartialRefreshesBeforeFull) {
-        ESP_LOGI(kTag, "EPD full refresh deferred: partial_since_full=%u", static_cast<unsigned>(g_partial_refreshes_since_full));
+        // [epd-stale-fix] Promote to a full refresh so accumulated partial-waveform
+        // charge on the panel gets cleared before the next local-partial window
+        // would risk a BUSY-pin timeout (EPD controller enters an unhealthy state
+        // if it receives too many partial-update commands in a row). Without this
+        // promotion the device gets stuck waiting for the BUSY pin to fall (1500 ms
+        // probe timeout) followed by an automatic full-refresh recovery (~2 s),
+        // which the user perceives as "卡顿".
+        ESP_LOGI(kTag, "EPD forcing full refresh: partial_since_full=%u reached limit=%u",
+                 static_cast<unsigned>(g_partial_refreshes_since_full),
+                 static_cast<unsigned>(kMaxPartialRefreshesBeforeFull));
+        full_refresh = true;
     }
     const bool hot_update = !full_refresh && g_epd_rail_powered && g_epd_powered && g_hot_refresh_ok;
     bool local_partial =

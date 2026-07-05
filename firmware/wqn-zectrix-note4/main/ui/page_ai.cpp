@@ -24,6 +24,8 @@ const char* AiStatusLabel(wqn::AiSessionStatus status)
             return "录音";
         case wqn::AiSessionStatus::kWaitingReply:
             return "识别";
+        case wqn::AiSessionStatus::kStreaming:
+            return "流式";
         case wqn::AiSessionStatus::kReplyReady:
             return "完成";
         case wqn::AiSessionStatus::kError:
@@ -41,6 +43,9 @@ std::string AiAssistantFallbackText(const wqn::AiSessionState& ai)
     }
     if (ai.status == wqn::AiSessionStatus::kWaitingReply) {
         return ai.pending_text.empty() ? "正在上传并等待模型回复..." : ai.pending_text;
+    }
+    if (ai.status == wqn::AiSessionStatus::kStreaming) {
+        return ai.pending_text.empty() ? "服务器处理中…" : ai.pending_text;
     }
     if (ai.status == wqn::AiSessionStatus::kError) {
         return "请求失败，请长按确认重试。";
@@ -84,6 +89,18 @@ esp_err_t DrawAiInputBar(const wqn::AiSessionState& ai, size_t page, size_t page
     } else if (waiting) {
         label = "服务器处理中";
         state = "等待";
+    } else if (ai.status == wqn::AiSessionStatus::kStreaming) {
+        // Show the latest tool chip on the input bar while SSE is live.
+        if (!ai.status_detail.empty()) {
+            label = ai.status_detail;
+            // [tool-display] Add a blinker on the right side of the input bar
+            // so the user can tell a tool is still mid-execution (the server
+            // hasn't pushed the matching tool.result/tool.error event yet).
+            state = "执行中▏";
+        } else {
+            label = "服务器处理中";
+            state = "流式";
+        }
     } else if (ai.status == wqn::AiSessionStatus::kReplyReady) {
         label = "长按继续追问";
         state = "就绪";
@@ -226,13 +243,18 @@ esp_err_t RenderAiToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
         kTag,
         "draw AI status");
 
-    const bool has_user_text = !ai.user_text.empty();
-    const std::string user_text = has_user_text ? ai.user_text : "长按确认键开始语音提问";
+    const bool has_user_text = !ai.user_text.empty() || !ai.user_partial.empty();
+    const std::string user_text = has_user_text
+        ? (ai.user_text.empty() ? ai.user_partial : ai.user_text)
+        : "长按确认键开始语音提问";
     const size_t text_page_count = wqn::AiSessionTextPageCount(ai);
     const size_t page_count = wqn::AiSessionPageCount(ai);
     const size_t page = std::min(ai.page, page_count > 0 ? page_count - 1 : 0);
     const bool action_page = !ai.function_call_summaries.empty() && page >= text_page_count;
-    std::string assistant_text = action_page ? JoinAiFunctionCallSummaries(ai.function_call_summaries) : ai.assistant_text;
+    // During v2 streaming the assistant_text grows lazily; for the first paint
+    // we splice assistant_partial in so the user sees characters appear.
+    std::string assistant_text = action_page ? FormatAiFunctionCallSummaries(ai.function_call_summaries)
+                                             : (ai.assistant_text + ai.assistant_partial);
     if (assistant_text.empty()) {
         assistant_text = AiAssistantFallbackText(ai);
     }

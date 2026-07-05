@@ -317,6 +317,8 @@ std::string FrameSignature(const wqn::UiFrame& frame)
 bool RequestEpdUiRefresh(const wqn::UiFrame& frame, const std::string& signature, RefreshSchedule schedule)
 {
     if (g_refresh_mutex == nullptr || g_refresh_task == nullptr || schedule == RefreshSchedule::kNone) {
+        ESP_LOGW(kTag, "RequestEpdUiRefresh rejected: prereqs (mutex=%p task=%p schedule=%s)",
+                 g_refresh_mutex, g_refresh_task, RefreshScheduleName(schedule));
         return false;
     }
 
@@ -329,6 +331,10 @@ bool RequestEpdUiRefresh(const wqn::UiFrame& frame, const std::string& signature
         // the in-flight frame. Deep-copy once into the secondary slot (rare in steady state).
         if (g_secondary.pending && RefreshRank(schedule) < RefreshRank(g_secondary.schedule)) {
             xSemaphoreGive(g_refresh_mutex);
+            ESP_LOGW(kTag,
+                     "RequestEpdUiRefresh dropped: schedule=%s rank<secondary=%s sig_len=%zu",
+                     RefreshScheduleName(schedule),
+                     RefreshScheduleName(g_secondary.schedule), signature.size());
             return false;
         }
         ESP_LOGI(kTag, "RequestEpdUiRefresh: busy, queuing into secondary slot schedule=%s sig_len=%zu",

@@ -163,6 +163,20 @@ RefreshSchedule ApplyButtonEvent(const wqn::ButtonEvent& event, wqn::UiState* st
         return RefreshSchedule::kNone;
     }
 
+    // [PTT-Filter-Fix] Filter out raw kPress/kRelease edge events for all UI
+    // components except the Confirm button on the AI page when the Flash
+    // voice tier is active. This prevents double-firing / double-paging bugs.
+    const bool is_flash_ptt =
+        state->screen == wqn::UiScreen::kAi &&
+        event.button == wqn::ButtonId::kConfirm &&
+        state->ai.tier == wqn::AiTier::kFlash;
+
+    if ((event.type == wqn::ButtonEventType::kPress ||
+         event.type == wqn::ButtonEventType::kRelease) &&
+        !is_flash_ptt) {
+        return RefreshSchedule::kNone;
+    }
+
     // [ptt-fix] Edge events (kPress / kRelease) drive the Flash PTT path with
     // sub-50 ms latency. Detect them here before any long-press logic so the
     // confirm-button press triggers capture immediately, the release stops it
@@ -201,12 +215,30 @@ RefreshSchedule ApplyButtonEvent(const wqn::ButtonEvent& event, wqn::UiState* st
         return ApplySettingsButtonEvent(event, state);
     }
 
-    // Double-press on AI page: cycle Flash / STD / Pro
-    if (event.type == wqn::ButtonEventType::kDoublePress && state->screen == wqn::UiScreen::kAi) {
-        wqn::AiTier new_tier = wqn::GetAiTier();
+    // Tier switch on AI page: prev tier via kUp, next tier via kDownPower.
+    // Accept any of these gestures:
+    //   1. The original kDoublePress -- still works for fast double-taps.
+    //   2. A plain kShortPress on the top page (page == 0). At page 0 there
+    //      is no page-up/page-down action to conflict with, so the press
+    //      can drive the tier switcher instead. This makes tier cycling
+    //      reliable without depending on a 300 ms double-tap window.
+    const bool on_ai_top_page =
+        state->screen == wqn::UiScreen::kAi && state->ai.page == 0;
+    const bool double_press_tier =
+        event.type == wqn::ButtonEventType::kDoublePress &&
+        state->screen == wqn::UiScreen::kAi;
+    const bool short_press_tier =
+        event.type == wqn::ButtonEventType::kShortPress && on_ai_top_page;
+    const bool tier_switch_event =
+        double_press_tier || short_press_tier;
+    if (tier_switch_event &&
+        (event.button == wqn::ButtonId::kUp ||
+         event.button == wqn::ButtonId::kDownPower)) {
+        const wqn::AiTier old_tier = wqn::GetAiTier();
+        wqn::AiTier new_tier = old_tier;
         if (event.button == wqn::ButtonId::kUp) {
             new_tier = wqn::PrevAiTier(new_tier);
-        } else if (event.button == wqn::ButtonId::kDownPower) {
+        } else {
             new_tier = wqn::NextAiTier(new_tier);
         }
         wqn::SetAiTier(new_tier);
@@ -214,7 +246,22 @@ RefreshSchedule ApplyButtonEvent(const wqn::ButtonEvent& event, wqn::UiState* st
         // differs (otherwise the refresh dedup pipeline drops the redraw and
         // the user only sees the change after navigating away and back).
         state->ai.tier = new_tier;
+        ESP_LOGI(kTag,
+                 "AI tier switch: button=%d event_type=%d tier %d -> %d, schedule=kAi",
+                 static_cast<int>(event.button),
+                 static_cast<int>(event.type),
+                 static_cast<int>(old_tier), static_cast<int>(new_tier));
         return RefreshSchedule::kAi;
+    }
+    // [tier-reset] When the user presses Up/DownPower on the AI top page
+    // without a tier switch intent (none of the gestures above), it's a
+    // no-op -- swallow the event so the page index doesn't get bumped and
+    // we don't burn an unnecessary refresh.
+    if (on_ai_top_page &&
+        event.type == wqn::ButtonEventType::kShortPress &&
+        (event.button == wqn::ButtonId::kUp ||
+         event.button == wqn::ButtonId::kDownPower)) {
+        return RefreshSchedule::kNone;
     }
 
     if (repeated_long_press && !time_value_edit_repeat && !time_running_exit) {

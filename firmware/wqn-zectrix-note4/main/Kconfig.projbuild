@@ -107,7 +107,39 @@ menu "WQN firmware"
             Enable experimental AI support modules. Provider secrets must stay
             on the WQN server and must never be embedded in firmware.
 
-    config WQN_AUDIO_SELFTEST_ENABLE
+    config WQN_AI_STREAMING_ENABLE
+        bool "Enable v2 SSE streaming for Std/Pro AI tier (new default)"
+        default y
+        depends on WQN_AI_ENABLE
+        help
+            When enabled, STD/PRO tiers request X-WQN-Protocol: v2-streaming
+            and consume an SSE event stream from POST /api/esp32/ai/transcribe-chat.
+            The firmware renders partial ASR delta, assistant transcript deltas,
+            tool calls, and incremental status chips to the EPD as events arrive.
+            When disabled, falls back to the legacy v1 one-shot JSON response.
+
+    config WQN_AI_V1_FALLBACK
+        bool "Compile legacy v1 one-shot JSON path (debug fallback)"
+        default y
+        depends on WQN_AI_ENABLE
+        help
+            Keeps the legacy UploadAiAudioChat() + HttpBinaryPost() path compiled
+            behind a macro so the firmware can be temporarily rebuilt for
+            comparison against the v2 SSE stream. Used at runtime only when
+            WQN_AI_STREAMING_ENABLE is n.
+
+    config WQN_FLASH_PROTOCOL_V2
+        bool "Flash mode uses the wqn-flash-v2 Realtime protocol (WQN proxy)"
+        default y
+        depends on WQN_AI_ENABLE
+        help
+            The new WS endpoint is wss://wqn.helema.cn/api/esp32/realtime with
+            Sec-WebSocket-Protocol: wqn-flash-v2. Uplink audio is PCM16 binary
+            frames (480 B each), downlink TTS audio is also binary and is
+            rendered to ES8311 via the existing flash I2S duplex path.
+            Disable only to fall back to the legacy StepFun-shaped protocol.
+
+    config WQN_AI_AUDIO_SELFTEST_ENABLE
         bool "Run WQN audio capture self-test at boot"
         default n
         depends on WQN_AI_ENABLE

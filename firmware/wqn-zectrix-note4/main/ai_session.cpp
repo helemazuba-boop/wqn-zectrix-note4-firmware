@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <ctime>
+#include <random>
 #include <string>
 
 #include "audio_capture.h"
@@ -38,6 +39,10 @@ bool g_loaded_today = false;
 bool g_prepare_active = false;
 bool g_recording_requested = false;
 uint32_t g_prepare_generation = 0;
+bool g_streaming_active = false;        // true while SubmitTask is parsing SSE events
+bool g_streaming_force_full_render = false; // when true the next UI tick does a full refresh
+std::string g_pending_tool_label;        // "🔧 create_todo…" or "✅ ..." for status bar
+int64_t g_tool_clear_at_ms = 0;          // scheduled status-bar clear
 
 void MarkChanged()
 {
@@ -72,6 +77,32 @@ void SetErrorLocked(const std::string& message)
     MarkChanged();
 }
 
+std::string RenderStreamingStatusLocked()
+{
+    // Used by the UI when ai.status == kStreaming (v2 SSE).
+    const int64_t now_ms = esp_timer_get_time() / 1000;
+    const int elapsed_s = g_state.status_since_ms > 0
+        ? static_cast<int>((now_ms - g_state.status_since_ms) / 1000)
+        : 0;
+    std::string label = "服务器处理中";
+    if (elapsed_s > 0) {
+        label += "·";
+        label += std::to_string(elapsed_s);
+        label += "s";
+    }
+    if (!g_state.user_partial.empty()) {
+        label += " · 听写 ";
+        label += std::to_string(g_state.user_partial.size());
+        label += "字";
+    }
+    if (!g_state.assistant_partial.empty()) {
+        label += " · 回复 ";
+        label += std::to_string(g_state.assistant_partial.size());
+        label += "字";
+    }
+    return label;
+}
+
 void SetCancelledBeforeRecordingLocked()
 {
     g_state.status = wqn::AiSessionStatus::kIdle;
@@ -82,6 +113,170 @@ void SetCancelledBeforeRecordingLocked()
     g_state.function_call_summaries.clear();
     g_state.status_since_ms = esp_timer_get_time() / 1000;
     MarkChanged();
+}
+
+// ============================================================================
+// v2 SSE consumer
+// ============================================================================
+//
+// SubmitTask drives the SSE stream on its own task stack. Each callback runs on
+// that stack, so we take g_lock only briefly and we never call esp_http_client
+// or cJSON inside the lock.
+//
+// Incremental text/tool updates must not rewrite the entire assistant_text;
+// they go to assistant_partial, and the UI tick renders the partial at the
+// configured throttle.
+void OnSseEvent(const wqn::WqnAiSseEvent& ev)
+{
+    xSemaphoreTake(g_lock, portMAX_DELAY);
+    switch (ev.kind) {
+        case wqn::WqnAiSseEvent::Kind::kReady: {
+            g_state.status = wqn::AiSessionStatus::kStreaming;
+            g_state.pending_text = "已连接 · 等待模型…";
+            if (!ev.conversation_id.empty()) {
+                g_conversation_id = ev.conversation_id;
+            }
+            g_state.status_since_ms = esp_timer_get_time() / 1000;
+            break;
+        }
+        case wqn::WqnAiSseEvent::Kind::kStage: {
+            g_state.pending_text = ev.stage.empty() ? g_state.pending_text : ev.stage;
+            g_state.status_since_ms = esp_timer_get_time() / 1000;
+            break;
+        }
+        case wqn::WqnAiSseEvent::Kind::kAsrDelta: {
+            g_state.user_partial += ev.delta;
+            g_state.last_render_ms = esp_timer_get_time() / 1000;
+            break;
+        }
+        case wqn::WqnAiSseEvent::Kind::kAsrComplete: {
+            g_state.user_text = ev.text;
+            g_state.user_partial.clear();
+            g_streaming_force_full_render = true;
+            g_state.status_since_ms = esp_timer_get_time() / 1000;
+            break;
+        }
+        case wqn::WqnAiSseEvent::Kind::kAsrFailed: {
+            g_state.user_partial.clear();
+            g_state.user_text = ev.error_message.empty() ? "识别失败" : ev.error_message;
+            g_state.status_since_ms = esp_timer_get_time() / 1000;
+            break;
+        }
+        case wqn::WqnAiSseEvent::Kind::kTextStart: {
+            g_state.assistant_partial.clear();
+            g_state.last_render_ms = esp_timer_get_time() / 1000;
+            break;
+        }
+        case wqn::WqnAiSseEvent::Kind::kTextDelta: {
+            g_state.assistant_partial += ev.delta;
+            g_state.last_render_ms = esp_timer_get_time() / 1000;
+            break;
+        }
+        case wqn::WqnAiSseEvent::Kind::kTextEnd: {
+            if (!ev.full_text.empty()) {
+                g_state.assistant_text = ev.full_text;
+            } else {
+                g_state.assistant_text += g_state.assistant_partial;
+            }
+            g_state.assistant_partial.clear();
+            g_streaming_force_full_render = true;
+            g_state.status_since_ms = esp_timer_get_time() / 1000;
+            break;
+        }
+        case wqn::WqnAiSseEvent::Kind::kToolStart: {
+            std::string label = "🔧 ";
+            label += ev.tool_name.empty() ? "tool" : ev.tool_name;
+            label += "…";
+            g_pending_tool_label = label;
+            g_tool_clear_at_ms = 0;
+            g_state.function_call_summaries.push_back(ev.tool_name.empty() ? std::string("tool") : ev.tool_name);
+            // [tool-display] Mirror the live tool label into status_detail so
+            // the page_ai "执行中▏" inline status chip reflects the current
+            // tool without the UI having to read the streaming view API.
+            g_state.status_detail = label;
+            g_state.status_since_ms = esp_timer_get_time() / 1000;
+            break;
+        }
+        case wqn::WqnAiSseEvent::Kind::kToolResult:
+        case wqn::WqnAiSseEvent::Kind::kToolError: {
+            std::string label = ev.tool_ok ? "✅ " : "❌ ";
+            label += ev.tool_display.empty() ? ev.tool_name : ev.tool_display;
+            g_pending_tool_label = label;
+            g_tool_clear_at_ms = esp_timer_get_time() / 1000 + 2000;
+            // Pop the last placeholder pushed by ToolStart and replace with the display.
+            if (!g_state.function_call_summaries.empty() &&
+                g_state.function_call_summaries.back() == ev.tool_name) {
+                g_state.function_call_summaries.back() = ev.tool_display.empty()
+                    ? ev.tool_name
+                    : ev.tool_display;
+            }
+            // [tool-display] Keep status_detail pointing at the most recent
+            // tool outcome for the inline status chip. Will be cleared on
+            // next kState/kFinal or after g_tool_clear_at_ms expires.
+            g_state.status_detail = label;
+            g_state.status_since_ms = esp_timer_get_time() / 1000;
+            break;
+        }
+        case wqn::WqnAiSseEvent::Kind::kState: {
+            g_state.status_detail = ev.error_message.empty() ? ev.stage : ev.error_message;
+            g_state.status_since_ms = esp_timer_get_time() / 1000;
+            break;
+        }
+        case wqn::WqnAiSseEvent::Kind::kError: {
+            std::string msg = ev.error_message.empty() ? ev.error_code : ev.error_message;
+            g_state.status = wqn::AiSessionStatus::kError;
+            g_state.pending_text.clear();
+            if (g_state.assistant_text.empty()) {
+                g_state.assistant_text = msg;
+            }
+            if (g_state.assistant_partial.empty()) {
+                g_state.assistant_partial.clear();
+            }
+            g_streaming_active = false;
+            g_state.status_since_ms = esp_timer_get_time() / 1000;
+            break;
+        }
+        case wqn::WqnAiSseEvent::Kind::kFinal: {
+            // Stable state: stop streaming, push everything into the canonical
+            // fields, clear partials.
+            if (!ev.full_text.empty()) {
+                g_state.assistant_text = ev.full_text;
+            } else if (!g_state.assistant_partial.empty()) {
+                g_state.assistant_text += g_state.assistant_partial;
+            }
+            g_state.assistant_partial.clear();
+            g_state.user_partial.clear();
+            g_state.pending_text.clear();
+            g_state.status = wqn::AiSessionStatus::kReplyReady;
+            if (!ev.conversation_id.empty()) {
+                g_conversation_id = ev.conversation_id;
+            }
+            g_state.conversation_id = g_conversation_id;
+            g_state.page = 0;
+            g_streaming_force_full_render = true;
+            g_streaming_active = false;
+            g_state.status_since_ms = esp_timer_get_time() / 1000;
+            break;
+        }
+    }
+    MarkChanged();
+    xSemaphoreGive(g_lock);
+}
+
+// Trampoline that lets us pass `&OnSseEvent` to the C-style callback.
+void TrampolineSseEvent(const wqn::WqnAiSseEvent& ev, void* /*user*/)
+{
+    OnSseEvent(ev);
+}
+
+// Request-id used by the SSE idempotency header. Same shape as the v1
+// `request_id` (16 hex chars) so server-side logs read consistently.
+std::string GenerateRequestId()
+{
+    static std::mt19937 rng{static_cast<unsigned>(esp_timer_get_time())};
+    char buf[20];
+    std::snprintf(buf, sizeof(buf), "%08x%08x", rng(), rng());
+    return std::string(buf, 16);
 }
 
 bool IsCurrentPrepareTaskLocked(uint32_t generation)
@@ -380,6 +575,15 @@ void SubmitTask(void*)
     }
     SetStateLocked(wqn::AiSessionStatus::kWaitingReply, "正在上传语音...", "", "");
     const std::string tier_str = g_state.tier == wqn::AiTier::kPro ? "pro" : "std";
+    const std::string conversation_id = g_conversation_id;
+    g_streaming_active = true;
+    g_streaming_force_full_render = false;
+    g_pending_tool_label.clear();
+    g_tool_clear_at_ms = 0;
+    g_state.assistant_partial.clear();
+    g_state.user_partial.clear();
+    g_state.function_call_summaries.clear();
+    g_state.status_detail.clear();
     xSemaphoreGive(g_lock);
 
     std::string token;
@@ -387,6 +591,7 @@ void SubmitTask(void*)
     if (result != ESP_OK || !wqn::IsValidAccessToken(token)) {
         wqn::ReleaseAudioCapturePower();
         xSemaphoreTake(g_lock, portMAX_DELAY);
+        g_streaming_active = false;
         SetErrorLocked("设备未配对");
         g_submit_task = nullptr;
         xSemaphoreGive(g_lock);
@@ -394,62 +599,118 @@ void SubmitTask(void*)
         return;
     }
 
+    esp_err_t submit_result = ESP_OK;
     wqn::WqnAiChatResponse response;
-    result = wqn::UploadAiAudioChat(
+    bool used_streaming = false;
+
+#if CONFIG_WQN_AI_STREAMING_ENABLE
+    // v2 SSE path
+    wqn::WqnAiStreamRequest req;
+    req.token = token;
+    req.pcm = audio.samples;             // vector<int16_t> copy; small relative to 80KB cap
+    req.duration_ms = audio.duration_ms;
+    req.tier = tier_str;
+    req.conversation_id = conversation_id;
+    req.request_id = GenerateRequestId(); // helper below
+    req.callback = &TrampolineSseEvent;
+    req.user_ctx = nullptr;
+    submit_result = wqn::UploadAiAudioChatStream(req, &response);
+    used_streaming = true;
+#else
+    // v1 fallback path (kept behind CONFIG_WQN_AI_V1_FALLBACK for debug compare).
+    submit_result = wqn::UploadAiAudioChat(
         token,
         reinterpret_cast<const uint8_t*>(audio.samples.data()),
         audio.samples.size() * sizeof(int16_t),
         audio.duration_ms,
-        g_conversation_id,
+        conversation_id,
         tier_str,
         &response);
+#endif
+
     wqn::ReleaseAudioCapturePower();
 
     xSemaphoreTake(g_lock, portMAX_DELAY);
-    if (result == ESP_OK) {
-        g_conversation_id = response.conversation_id;
-        g_state.status = wqn::AiSessionStatus::kReplyReady;
-        g_state.pending_text.clear();
-        if (!response.transcript.empty()) {
-            g_state.user_text = response.transcript;
-        } else if (g_state.user_text.empty()) {
-            g_state.user_text = "未返回转写";
-        }
-        if (!response.reply_text.empty()) {
-            g_state.assistant_text = response.reply_text;
+    g_streaming_active = false;
+
+    if (used_streaming) {
+        // The SSE consumer has already pushed everything into g_state.
+        if (submit_result != ESP_OK || g_state.status == wqn::AiSessionStatus::kError) {
+            if (g_state.status != wqn::AiSessionStatus::kError) {
+                const std::string msg = response.error_message.empty()
+                    ? response.error_code
+                    : response.error_message;
+                SetErrorLocked(msg.empty() ? "AI 请求失败" : ("AI 请求失败: " + msg));
+            }
+        } else if (g_state.status != wqn::AiSessionStatus::kReplyReady) {
+            // Stream finished cleanly but never delivered a `final` event: surface a
+            // soft error so the user sees something other than a frozen spinner.
+            SetErrorLocked(response.error_message.empty() ? "服务器未返回完成事件" : response.error_message);
         } else {
-            g_state.assistant_text = "模型未返回文本回复";
-        }
-        g_state.status_detail = BuildStatusDetail(response);
-        g_state.function_call_summaries.clear();
-        for (const auto& call : response.function_calls) {
-            if (!call.display.empty()) {
-                g_state.function_call_summaries.push_back(call.display);
+            // Persist today's session for cache.
+            if (!response.conversation_id.empty()) {
+                g_conversation_id = response.conversation_id;
+                g_state.conversation_id = g_conversation_id;
             }
+            // Build a synthetic legacy response so the persistence path is shared
+            // with the v1 flow (SaveTodaySessionLocked expects that shape).
+            if (!response.transcript.empty()) g_state.user_text = response.transcript;
+            if (!response.reply_text.empty()) g_state.assistant_text = response.reply_text;
+            response.transcript = g_state.user_text;
+            response.reply_text = g_state.assistant_text;
+            response.latency_ms = response.latency_ms;
+            response.conversation_id = g_conversation_id;
+            SaveTodaySessionLocked(response);
         }
-        const std::string action_summary = BuildAiActionSummary(response.actions);
-        if (!action_summary.empty()) {
-            if (g_state.function_call_summaries.empty()) {
-                g_state.function_call_summaries.push_back(action_summary);
-            }
-            if (!g_state.assistant_text.empty()) {
-                g_state.assistant_text += "\n";
-            }
-            g_state.assistant_text += action_summary;
-        }
-        g_state.page = 0;
-        g_state.conversation_id = g_conversation_id;
-        g_state.status_since_ms = esp_timer_get_time() / 1000;
-        SaveTodaySessionLocked(response);
-        MarkChanged();
-        ESP_LOGI(kTag, "AI response ready: latency_ms=%d transcript_bytes=%u reply_bytes=%u actions=%u",
-                 response.latency_ms,
-                 static_cast<unsigned>(response.transcript.size()),
-                 static_cast<unsigned>(response.reply_text.size()),
-                 static_cast<unsigned>(response.actions.size()));
     } else {
-        SetErrorLocked(MessageForAiRequestFailure(response, result));
+        // v1 one-shot: replicate the legacy behaviour verbatim.
+        if (submit_result == ESP_OK) {
+            g_conversation_id = response.conversation_id;
+            g_state.status = wqn::AiSessionStatus::kReplyReady;
+            g_state.pending_text.clear();
+            if (!response.transcript.empty()) {
+                g_state.user_text = response.transcript;
+            } else if (g_state.user_text.empty()) {
+                g_state.user_text = "未返回转写";
+            }
+            if (!response.reply_text.empty()) {
+                g_state.assistant_text = response.reply_text;
+            } else {
+                g_state.assistant_text = "模型未返回文本回复";
+            }
+            g_state.status_detail = BuildStatusDetail(response);
+            g_state.function_call_summaries.clear();
+            for (const auto& call : response.function_calls) {
+                if (!call.display.empty()) {
+                    g_state.function_call_summaries.push_back(call.display);
+                }
+            }
+            const std::string action_summary = BuildAiActionSummary(response.actions);
+            if (!action_summary.empty()) {
+                if (g_state.function_call_summaries.empty()) {
+                    g_state.function_call_summaries.push_back(action_summary);
+                }
+                if (!g_state.assistant_text.empty()) {
+                    g_state.assistant_text += "\n";
+                }
+                g_state.assistant_text += action_summary;
+            }
+            g_state.page = 0;
+            g_state.conversation_id = g_conversation_id;
+            g_state.status_since_ms = esp_timer_get_time() / 1000;
+            SaveTodaySessionLocked(response);
+            MarkChanged();
+            ESP_LOGI(kTag,
+                     "AI response ready: latency_ms=%d transcript_bytes=%u reply_bytes=%u actions=%u",
+                     response.latency_ms,
+                     static_cast<unsigned>(response.transcript.size()),
+                     static_cast<unsigned>(response.reply_text.size()),
+                     static_cast<unsigned>(response.actions.size()));
+        } else {
+            SetErrorLocked(MessageForAiRequestFailure(response, submit_result));
+        }
     }
+
     g_submit_task = nullptr;
     xSemaphoreGive(g_lock);
     vTaskDelete(nullptr);
@@ -716,6 +977,39 @@ AiTier GetAiTier()
     result = g_state.tier;
     xSemaphoreGive(g_lock);
     return result;
+}
+
+bool CopyAiStreamingStatus(AiStreamingStatusView* view)
+{
+    if (view == nullptr || g_lock == nullptr) {
+        return false;
+    }
+    xSemaphoreTake(g_lock, portMAX_DELAY);
+    view->streaming_active = g_streaming_active;
+    view->status = g_state.status;
+    view->status_since_ms = g_state.status_since_ms;
+    view->last_render_ms = g_state.last_render_ms;
+    view->pending_label = RenderStreamingStatusLocked();
+    view->tool_label = g_pending_tool_label;
+    view->force_full_render = g_streaming_force_full_render;
+    if (g_streaming_force_full_render) {
+        g_streaming_force_full_render = false;
+    }
+    if (g_tool_clear_at_ms > 0 && esp_timer_get_time() / 1000 >= g_tool_clear_at_ms) {
+        g_pending_tool_label.clear();
+        g_tool_clear_at_ms = 0;
+        view->tool_label.clear();
+        // [tool-display] Keep status_detail in sync with the cleared tool
+        // label so the inline status chip stops showing the stale marker.
+        if (g_state.status_detail.find('\xF0') != std::string::npos) {
+            // Cheap check for an emoji 4-byte prefix (🔧 / ✅ / ❌ are all
+            // 4-byte UTF-8). Avoids stomping on human-readable stage labels
+            // like "识别完成 320ms" copied in by kState.
+            g_state.status_detail.clear();
+        }
+    }
+    xSemaphoreGive(g_lock);
+    return true;
 }
 
 }  // namespace wqn

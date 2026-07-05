@@ -296,6 +296,84 @@ esp_err_t FetchWordPackManifest(const std::string& token, WqnWordPackManifest* m
 esp_err_t DownloadWordPack(const std::string& token, const WqnWordPackManifestItem& item, std::string* body);
 esp_err_t LookupWordWithAi(const std::string& token, const WqnWordAiLookupRequest& request, WqnWordAiLookupResult* result);
 esp_err_t SyncDueProblemsAndLog(const std::string& token);
+
+// === v2 SSE streaming (Std/Pro tier, default path when WQN_AI_STREAMING_ENABLE=y) ===
+//
+// StreamParser callbacks are invoked from the audio-streaming task. Callbacks
+// MUST return quickly (no blocking, no nested esp_http_client calls) and the
+// same WqnSseEvent value must remain valid until the next callback returns.
+//
+struct WqnAiSseEvent {
+    enum class Kind {
+        kReady,
+        kStage,
+        kAsrDelta,
+        kAsrComplete,
+        kAsrFailed,
+        kTextStart,
+        kTextDelta,
+        kTextEnd,
+        kToolStart,
+        kToolResult,
+        kToolError,
+        kState,
+        kError,
+        kFinal,
+    };
+    Kind kind = Kind::kReady;
+    uint64_t event_id = 0;
+    std::string raw_json;
+
+    // Convenience fields parsed out of the SSE frame.
+    std::string delta;
+    std::string text;
+    std::string full_text;
+    std::string sentence_id;
+    std::string tool_call_id;
+    std::string tool_name;
+    std::string tool_display;
+    bool tool_ok = false;
+    int tool_items_count = 0;
+    int tool_elapsed_ms = 0;
+    std::string stage;
+    int elapsed_ms = 0;
+    int text_chars = 0;
+    int turn_id_offset = 0;
+    std::string error_code;
+    std::string error_message;
+    std::string error_stage;
+    std::string conversation_id;
+    int latency_ms = 0;
+    // final
+    std::vector<WqnAiAction> actions;
+    std::vector<WqnAiFunctionCallSummary> function_calls;
+};
+
+typedef void (*WqnAiSseCallback)(const WqnAiSseEvent& event, void* user_ctx);
+
+struct WqnAiStreamRequest {
+    std::string token;
+    std::vector<int16_t> pcm;        // mono s16le 16 kHz
+    int duration_ms = 0;
+    std::string tier = "std";        // "std" | "pro"
+    std::string conversation_id;     // optional
+    std::string request_id;          // optional idempotency UUID, server generates if empty
+    int timeout_ms = 0;              // 0 = use WQN_AI_SSE_TIMEOUT_MS
+    WqnAiSseCallback callback = nullptr;
+    void* user_ctx = nullptr;
+};
+
+// Streams a SSE response from POST {WQN_API_BASE}{WQN_AI_SSE_REQUEST_PATH}.
+//
+// On ESP_OK the call has returned because either the server emitted `final` or
+// the client received an error event.  On ESP_FAIL a transport/HTTP-level
+// failure occurred before the stream could deliver any final frame; the caller
+// should look at response->error_code / error_message.
+esp_err_t UploadAiAudioChatStream(const WqnAiStreamRequest& request, WqnAiChatResponse* response);
+
+// === Legacy v1 one-shot JSON (Std/Pro tier, kept behind WQN_AI_V1_FALLBACK) ===
+//   This remains in case the v2 SSE server regresses; the firmware rebuild with
+//   WQN_AI_STREAMING_ENABLE=n will pick up the legacy path.
 esp_err_t UploadAiAudioChat(
     const std::string& token,
     const uint8_t* pcm_data,

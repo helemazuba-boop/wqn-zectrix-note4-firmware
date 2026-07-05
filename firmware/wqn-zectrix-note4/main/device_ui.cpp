@@ -55,9 +55,38 @@ bool TrySkipInitRefresh(wqn::UiScreen screen, const char* clock_label)
 {
     using device_ui_internal::g_rtc_last_rendered_screen_id;
     using device_ui_internal::g_rtc_last_rendered_clock;
-    // Only attempt the skip on timer wake-up; button / power-on wake-ups must
-    // always render so the user sees immediate feedback.
-    if (esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_TIMER) {
+    // [timer-skip] ESP32-S3's built-in USB Serial/JTAG controller triggers
+    // a USB_UART_CHIP_RESET on every deep-sleep wake-up. That reset clears
+    // esp_sleep_get_wakeup_cause() (it returns ESP_SLEEP_WAKEUP_UNDEFINED),
+    // but RTC slow memory is preserved across that reset -- so the cached
+    // (screen, clock) values written by RecordInitRefresh() are still valid.
+    //
+    // We use esp_sleep_get_ext1_wakeup_status() to distinguish user-input
+    // wake-ups (button presses on GPIO 0/18) from automatic timer wake-ups
+    // (PCF8563 INT on GPIO 5). When the chip reset hides the cause, EXT1
+    // status also reads 0 -- in that case we still try the skip because the
+    // framebuffer is identical by definition (the panel cannot have changed
+    // while the CPU was asleep).
+    const esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+    const uint64_t ext1_status = esp_sleep_get_ext1_wakeup_status();
+    const bool user_input_wakeup =
+        cause == ESP_SLEEP_WAKEUP_EXT0 || cause == ESP_SLEEP_WAKEUP_EXT1 ||
+        cause == ESP_SLEEP_WAKEUP_GPIO || cause == ESP_SLEEP_WAKEUP_UART ||
+        cause == ESP_SLEEP_WAKEUP_TOUCHPAD || cause == ESP_SLEEP_WAKEUP_ULP;
+    // If EXT1 status is non-zero, only treat it as a user-input wake-up if
+    // one of the button pins (GPIO 0 / GPIO 18) is set. A bare GPIO 5 hit
+    // (PCF8563 INT) is a timer wake-up and is eligible for the skip.
+    const bool button_pin_set =
+        (ext1_status & ((1ULL << GPIO_NUM_0) | (1ULL << GPIO_NUM_18))) != 0;
+    ESP_LOGI("wqn_ui",
+             "TrySkipInitRefresh: cause=%d ext1_status=0x%llx screen=%d clock=%s "
+             "rtc_screen=%d rtc_clock=\"%s\" user_input_wakeup=%d button_pin_set=%d",
+             static_cast<int>(cause),
+             static_cast<unsigned long long>(ext1_status),
+             static_cast<int>(screen), clock_label ? clock_label : "(null)",
+             g_rtc_last_rendered_screen_id, g_rtc_last_rendered_clock,
+             user_input_wakeup ? 1 : 0, button_pin_set ? 1 : 0);
+    if (user_input_wakeup || button_pin_set) {
         return false;
     }
     if (!ScreenSupportsTimerSkip(screen)) {
@@ -67,7 +96,7 @@ bool TrySkipInitRefresh(wqn::UiScreen screen, const char* clock_label)
         return false;
     }
     if (g_rtc_last_rendered_screen_id < 0) {
-        // Cold boot / RTC reset -- nothing valid to compare against.
+        // True cold boot / RTC never programmed -- nothing valid to compare.
         return false;
     }
     if (static_cast<int>(screen) != g_rtc_last_rendered_screen_id) {
@@ -76,8 +105,9 @@ bool TrySkipInitRefresh(wqn::UiScreen screen, const char* clock_label)
     if (std::strcmp(clock_label, g_rtc_last_rendered_clock) != 0) {
         return false;
     }
-    ESP_LOGI("wqn_ui", "Init refresh skipped: panel already shows this exact frame (screen=%d clock=%s)",
-             static_cast<int>(screen), clock_label);
+    ESP_LOGI("wqn_ui", "Init refresh skipped: panel already shows this exact frame (screen=%d clock=%s cause=%d ext1=0x%llx)",
+             static_cast<int>(screen), clock_label, static_cast<int>(cause),
+             static_cast<unsigned long long>(ext1_status));
     return true;
 }
 
@@ -91,6 +121,30 @@ void RecordInitRefresh(wqn::UiScreen screen, const char* clock_label)
     g_rtc_last_rendered_screen_id = static_cast<int>(screen);
     std::strncpy(g_rtc_last_rendered_clock, clock_label, sizeof(g_rtc_last_rendered_clock) - 1);
     g_rtc_last_rendered_clock[sizeof(g_rtc_last_rendered_clock) - 1] = '\0';
+}
+
+// [timer-skip] Main-loop minute-tick gate. Returns true when the minute has
+// not advanced since the last successful refresh and ScreenUsesClockMinute
+// would otherwise issue a kClock schedule. By suppressing the schedule here
+// we avoid the full-refresh forced by g_previous_framebuffer_synced=false
+// after every deep-sleep wake-up.
+bool ShouldSkipMinuteTickRefresh(wqn::UiScreen screen, const char* clock_label)
+{
+    using device_ui_internal::g_rtc_last_rendered_screen_id;
+    using device_ui_internal::g_rtc_last_rendered_clock;
+    if (clock_label == nullptr || clock_label[0] == '\0') {
+        return false;
+    }
+    if (!ScreenSupportsTimerSkip(screen)) {
+        return false;
+    }
+    if (g_rtc_last_rendered_screen_id < 0) {
+        return false;
+    }
+    if (static_cast<int>(screen) != g_rtc_last_rendered_screen_id) {
+        return false;
+    }
+    return std::strcmp(clock_label, g_rtc_last_rendered_clock) == 0;
 }
 
 constexpr char kTag[] = "wqn_ui";
@@ -158,7 +212,13 @@ void DeviceUiTask(void*)
     ESP_LOGI(kTag, "DeviceUiTask: calling LoadUiState");
     LoadUiState(&state);
     ESP_LOGI(kTag, "DeviceUiTask: LoadUiState done");
-    device_ui_internal::g_last_rendered_screen = state.screen;
+    // [power-fix] Do NOT seed g_last_rendered_screen from state.screen here:
+    // a deep-sleep wake-up that goes through USB_UART_CHIP_RESET loses this
+    // RAM variable, and unconditionally re-writing it from the freshly loaded
+    // UI state would later trip the "screen change detected" branch in
+    // RefreshFrame() and force a full refresh on every wake-up. Treat -1 as
+    // "unknown", which forces the first refresh to be full but keeps subsequent
+    // wake-ups inside the same screen and clock label on the RTC-CRC fast path.
     CheckBatteryProtection();
     ESP_LOGI(kTag, "DeviceUiTask: CheckBatteryProtection done");
     std::string last_clock_label = CurrentClockLabel();
@@ -208,10 +268,28 @@ void DeviceUiTask(void*)
             poll_delay = kUiPollDelayTicks;
             g_last_active_us_local = esp_timer_get_time();
         }
-        // Skip button processing while EPD is busy to avoid ghosting artifacts
-        // from two rapid refreshes. The next press will be picked up on the next poll cycle.
-        if (!g_refresh_busy) {
-            refresh_schedule = StrongerSchedule(refresh_schedule, ApplyButtonEvent(event, &state));
+        // Apply the button event regardless of EPD refresh state. The previous
+        // "skip while g_refresh_busy" guard was making press/release events
+        // silently dropped whenever a slow partial refresh was in flight (a
+        // timer-page layout change can hold g_refresh_busy=true for 100-300 ms,
+        // which is long enough to swallow the user's next press entirely). The
+        // refresh task itself dedups via frame_signature and the primary /
+        // secondary queue pair in ui_refresh.cpp, so racing with a refresh in
+        // flight is safe -- the worst case is the new event lands in the
+        // secondary slot and is picked up on the next consume.
+        {
+            const RefreshSchedule before_sched = refresh_schedule;
+            const RefreshSchedule after_sched =
+                StrongerSchedule(refresh_schedule, ApplyButtonEvent(event, &state));
+            if (after_sched != before_sched && after_sched == RefreshSchedule::kAi) {
+                ESP_LOGI(kTag,
+                         "AI button refresh scheduled: button=%d type=%d busy=%d screen=%d tier=%d",
+                         static_cast<int>(event.button), static_cast<int>(event.type),
+                         g_refresh_busy ? 1 : 0,
+                         static_cast<int>(state.screen),
+                         static_cast<int>(state.ai.tier));
+            }
+            refresh_schedule = after_sched;
         }
 
         if (g_todo_result_queue != nullptr) {
@@ -251,6 +329,38 @@ void DeviceUiTask(void*)
             refresh_schedule = StrongerSchedule(refresh_schedule, RefreshSchedule::kAi);
         }
 
+wqn::AiStreamingStatusView streaming_view{};
+        bool streaming_changed = false;
+#if CONFIG_WQN_AI_ENABLE
+        streaming_changed = wqn::CopyAiStreamingStatus(&streaming_view);
+#endif
+        if (streaming_changed) {
+            // v2 SSE status overrides the static "上传" label.
+            switch (streaming_view.status) {
+                case wqn::AiSessionStatus::kStreaming:
+                    state.ai.status = wqn::AiSessionStatus::kStreaming;
+                    state.ai.pending_text = streaming_view.pending_label;
+                    break;
+                case wqn::AiSessionStatus::kReplyReady:
+                    state.ai.status = wqn::AiSessionStatus::kReplyReady;
+                    state.ai.pending_text.clear();
+                    break;
+                case wqn::AiSessionStatus::kError:
+                    state.ai.status = wqn::AiSessionStatus::kError;
+                    break;
+                default:
+                    break;
+            }
+            if (state.screen == wqn::UiScreen::kAi &&
+                streaming_view.last_render_ms != state.ai.last_render_ms) {
+                state.ai.last_render_ms = streaming_view.last_render_ms;
+                refresh_schedule = StrongerSchedule(refresh_schedule, RefreshSchedule::kAi);
+            }
+            if (state.screen == wqn::UiScreen::kAi) {
+                state.ai.status_detail = streaming_view.tool_label;
+            }
+        }
+
 #if CONFIG_WQN_AI_ENABLE
         if (wqn::CopyAiSessionToUi(&state.ai) && state.screen == wqn::UiScreen::kAi) {
             refresh_schedule = StrongerSchedule(refresh_schedule, RefreshSchedule::kAi);
@@ -285,6 +395,15 @@ void DeviceUiTask(void*)
             state.ai.pending_text = flash_ui.pending_text;
             state.ai.flash_pending = flash_ui.pending_text;
             state.ai.flash_error = flash_ui.error_message;
+            // Flash tier uses status_detail for the tool chip on the input bar;
+            // when there's no tool active we leave the previous value alone so a
+            // settled response still shows its ASR/llm latency summary.
+            if (!flash_ui.tool_label.empty()) {
+                state.ai.status_detail = flash_ui.tool_label;
+            } else if (!state.ai.flash_is_streaming && !state.ai.status_detail.empty()) {
+                // After a turn settles, prefer the asr/llm summary if the tool
+                // chip has not been cleared by the auto-timeout in ai_session.
+            }
             state.ai.status_since_ms = flash_ui.status_since_ms;
             if (state.screen == wqn::UiScreen::kAi) {
                 refresh_schedule = StrongerSchedule(refresh_schedule, RefreshSchedule::kAi);
@@ -296,7 +415,14 @@ void DeviceUiTask(void*)
         if (clock_label != last_clock_label) {
             last_clock_label = clock_label;
             UpdateHomePrimaryTimeLine(&state);
-            if (ScreenUsesClockMinute(state)) {
+            // [timer-skip] If the new minute label matches the last
+            // successfully-rendered clock label we still need to update
+            // state.time_app / home.primary_time_line above, but the on-screen
+            // pixels are already correct -- suppress the refresh request so we
+            // don't fall into the deep-sleep-induced forced-full-refresh path.
+            const bool minute_changed_on_panel =
+                !ShouldSkipMinuteTickRefresh(state.screen, clock_label.c_str());
+            if (ScreenUsesClockMinute(state) && minute_changed_on_panel) {
                 refresh_schedule = StrongerSchedule(refresh_schedule, RefreshSchedule::kClock);
             }
         }
@@ -316,13 +442,29 @@ void DeviceUiTask(void*)
         if (refresh_schedule != RefreshSchedule::kNone) {
             const wqn::UiFrame frame = wqn::RenderUiFrame(state);
             const std::string frame_signature = FrameSignature(frame);
+            ESP_LOGI(kTag,
+                     "dispatch refresh: schedule=%s sig_match=%d last_len=%zu new_len=%zu screen=%d tier=%d",
+                     device_ui_internal::RefreshScheduleName(refresh_schedule),
+                     frame_signature == last_frame_signature ? 1 : 0,
+                     last_frame_signature.size(), frame_signature.size(),
+                     static_cast<int>(state.screen), static_cast<int>(state.ai.tier));
             if (frame_signature != last_frame_signature) {
                 if (RequestEpdUiRefresh(frame, frame_signature, refresh_schedule)) {
                     ESP_LOGI(kTag, "EPD UI refresh requested: schedule=%s", device_ui_internal::RefreshScheduleName(refresh_schedule));
                     last_frame_signature = frame_signature;
+                    // [timer-skip] Persist the clock label that is now on the
+                    // panel so the next minute-tick inside the same minute
+                    // (e.g. a re-render caused by a status refresh or by the
+                    // main loop running twice before deep sleep) is suppressed.
+                    RecordInitRefresh(state.screen, last_clock_label.c_str());
                     g_last_active_us_local = esp_timer_get_time();
                     poll_delay = kUiPollDelayTicks;
+                } else {
+                    ESP_LOGW(kTag, "EPD UI refresh request rejected: schedule=%s",
+                             device_ui_internal::RefreshScheduleName(refresh_schedule));
                 }
+            } else {
+                ESP_LOGI(kTag, "EPD UI refresh skipped: signature unchanged");
             }
         }
 

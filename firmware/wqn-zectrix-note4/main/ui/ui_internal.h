@@ -254,6 +254,7 @@ esp_err_t DrawWrappedText(int x, int y, int width, const std::string& text, int 
 std::string LimitForEpd(const std::string& text);
 std::string Utf8PageSlice(const std::string& text, size_t page, size_t chars_per_page);
 std::string JoinAiFunctionCallSummaries(const std::vector<std::string>& summaries);
+std::string FormatAiFunctionCallSummaries(const std::vector<std::string>& summaries);
 
 // ---- Seven segment ----------------------------------------------------------
 
