@@ -95,7 +95,23 @@ struct AiSessionState {
     std::string assistant_partial;
     std::string user_partial;          // transient asr.delta buffer
     int64_t last_render_ms = 0;        // last chunked partial-refresh timestamp
+
+    // v2 multi-turn layout fields: scroll offset for the chat viewport
+    // (in 18-px line units, 0 == top of newest message) and toast state for
+    // status broadcasts above the viewport. The toast never carries an
+    // elapsed-seconds counter by design; the user reaches "still working"
+    // signal by the toast being present at all, with a blink dot.
+    int32_t scroll_offset_lines = 0;
+    bool toast_visible = false;
+    std::string toast_label;       // e.g. "\xe2\x97\x8f 录音中 00:04" / "\xe2\x97\x8f 上传…"
+    int64_t toast_since_ms = 0;
+    int32_t toast_recording_ms = 0;  // running counter for the recording label (only)
+    int64_t scroll_no_op_hint_ms = 0; // when Down is pressed at the bottom, briefly stamp a "已最新" hint
 };
+
+// Returns the current scroll offset in 18-px line units (0 == bottom / newest).
+// UI tasks read this under the AI mutex; safe to call from any task.
+int32_t GetAiScrollOffsetLines();
 
 enum class TodoSyncStatus {
     kIdle,
@@ -231,6 +247,7 @@ size_t AiSessionTextPageCount(const AiSessionState& ai);
 size_t AiSessionPageCount(const AiSessionState& ai);
 bool TickAiSession(UiState* state, int64_t now_ms);
 UiFrame RenderUiFrame(const UiState& state);
+void RequestForceFullRefresh();  // one-shot: next RenderUiFrame forces full refresh
 const char* ReviewChoiceLabel(ReviewChoice choice);
 const char* ReviewChoiceStatus(ReviewChoice choice);
 

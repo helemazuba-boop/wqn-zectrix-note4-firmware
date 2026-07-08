@@ -200,7 +200,12 @@ std::string FrameSignature(const wqn::UiFrame& frame)
     }
     if (frame.screen == wqn::UiScreen::kAi) {
         signature.append("|ai:");
-        signature.append(frame.home.battery_label);
+        // [sig-fix] Do NOT include frame.home.battery_label here: it changes
+        // every minute when BuildHomeSummary refreshes the ADC reading, which
+        // would trigger a signature change → refresh → full refresh (dirty
+        // rect >85% on AI page) every minute. The AI page status bar is drawn
+        // by DrawStatusBar which reads home.battery_label directly; it doesn't
+        // need to be in the dedup signature.
         signature.push_back('/');
         signature.append(std::to_string(static_cast<int>(frame.ai.status)));
         signature.push_back('/');
@@ -217,6 +222,19 @@ std::string FrameSignature(const wqn::UiFrame& frame)
         signature.append(frame.ai.conversation_id);
         signature.push_back('/');
         signature.append(std::to_string(frame.ai.page));
+        // v2 chat scroll + toast: keep the signature unique across scroll
+        // movements and toast label updates so the dedup pipeline does not
+        // drop the redraw.
+        signature.push_back('/');
+        signature.append(std::to_string(frame.ai.scroll_offset_lines));
+        signature.push_back('/');
+        signature.append(frame.ai.toast_visible ? "1" : "0");
+        signature.push_back('/');
+        signature.append(frame.ai.toast_label);
+        // [scroll-hint] Track the latest no-op Down press so the renderer
+        // can flash a "已最新" hint at the bottom for a brief moment.
+        signature.push_back('/');
+        signature.append(std::to_string(frame.ai.scroll_no_op_hint_ms));
         for (const std::string& summary : frame.ai.function_call_summaries) {
             signature.push_back('/');
             signature.append(summary);

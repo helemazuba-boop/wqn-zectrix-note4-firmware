@@ -329,6 +329,18 @@ void DeviceUiTask(void*)
             refresh_schedule = StrongerSchedule(refresh_schedule, RefreshSchedule::kAi);
         }
 
+        // v2: while the user is recording, the top toast label needs to tick
+        // up so "● 录音中 00:04" advances once a second. We do this here on
+        // the UI task (the audio task only knows about stream samples).
+        if (state.screen == wqn::UiScreen::kAi &&
+            state.ai.status == wqn::AiSessionStatus::kListening) {
+            // Use the recording start time stored in g_state via status_since_ms.
+            const int32_t elapsed = static_cast<int32_t>(now_ms - state.ai.status_since_ms);
+            if (elapsed >= 0) {
+                wqn::SetAiRecordingLabel(elapsed);
+            }
+        }
+
 wqn::AiStreamingStatusView streaming_view{};
         bool streaming_changed = false;
 #if CONFIG_WQN_AI_ENABLE
@@ -354,6 +366,15 @@ wqn::AiStreamingStatusView streaming_view{};
             if (state.screen == wqn::UiScreen::kAi &&
                 streaming_view.last_render_ms != state.ai.last_render_ms) {
                 state.ai.last_render_ms = streaming_view.last_render_ms;
+                refresh_schedule = StrongerSchedule(refresh_schedule, RefreshSchedule::kAi);
+            }
+            // [streaming-fix] Streaming consumer demanded a full redraw (e.g.
+            // kFinal clearing the upload toast and showing the new assistant
+            // bubble). Without this bump the screen would stay on the stale
+            // "上传" pixel set, since the FrameSignature diff may otherwise
+            // not catch the transition when only toast_visible + content
+            // changed inside one tick.
+            if (state.screen == wqn::UiScreen::kAi && streaming_view.force_full_render) {
                 refresh_schedule = StrongerSchedule(refresh_schedule, RefreshSchedule::kAi);
             }
             if (state.screen == wqn::UiScreen::kAi) {

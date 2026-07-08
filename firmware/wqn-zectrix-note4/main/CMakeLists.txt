@@ -1,6 +1,7 @@
 idf_component_register(
     SRCS
         "main.cpp"
+        "ai_history.cpp"
         "ai_session.cpp"
         "audio_capture.cpp"
         "audio_player.cpp"

@@ -286,10 +286,7 @@ esp_err_t RenderTimeToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule);
 
 // ---- AI page ----------------------------------------------------------------
 
-esp_err_t DrawAiBubble(int x, int y, int width, int height, const std::string& text, bool me, bool pending);
-esp_err_t DrawAiInputBar(const wqn::AiSessionState& ai, size_t page, size_t page_count);
 esp_err_t RenderAiToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule);
-std::string AiAssistantFallbackText(const wqn::AiSessionState& ai);
 const char* AiStatusLabel(wqn::AiSessionStatus status);
 
 // ---- Word page --------------------------------------------------------------

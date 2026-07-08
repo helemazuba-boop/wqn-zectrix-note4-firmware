@@ -163,6 +163,9 @@ RefreshSchedule ApplyButtonEvent(const wqn::ButtonEvent& event, wqn::UiState* st
         return RefreshSchedule::kNone;
     }
 
+    const size_t old_page = state->ai.page;
+    const wqn::AiTier old_ai_tier = state->ai.tier;
+
     // [PTT-Filter-Fix] Filter out raw kPress/kRelease edge events for all UI
     // components except the Confirm button on the AI page when the Flash
     // voice tier is active. This prevents double-firing / double-paging bugs.
@@ -215,23 +218,21 @@ RefreshSchedule ApplyButtonEvent(const wqn::ButtonEvent& event, wqn::UiState* st
         return ApplySettingsButtonEvent(event, state);
     }
 
-    // Tier switch on AI page: prev tier via kUp, next tier via kDownPower.
-    // Accept any of these gestures:
-    //   1. The original kDoublePress -- still works for fast double-taps.
-    //   2. A plain kShortPress on the top page (page == 0). At page 0 there
-    //      is no page-up/page-down action to conflict with, so the press
-    //      can drive the tier switcher instead. This makes tier cycling
-    //      reliable without depending on a 300 ms double-tap window.
-    const bool on_ai_top_page =
-        state->screen == wqn::UiScreen::kAi && state->ai.page == 0;
-    const bool double_press_tier =
+    // Tier switch on AI page: double-press Up/Down within a WIDE window.
+    // The global kDoublePressWindowMs (500 ms) in button_input.cpp is too
+    // tight — users naturally wait 300-500 ms for the EPD refresh between
+    // taps, so their second tap arrives >900 ms later and is never detected
+    // as a kDoublePress. Instead of widening the global window (which would
+    // affect other pages), we track the last AI scroll button + timestamp
+    // here and treat a second short-press of the SAME button within 1 s as
+    // a tier switch. We also catch kDoublePress (fast <500 ms) directly.
+    static int64_t last_ai_tap_ms = 0;
+    static wqn::ButtonId last_ai_tap_button = wqn::ButtonId::kNone;
+    constexpr int64_t kAiTierSwitchWindowMs = 1000;
+
+    // Fast path: button_input already detected a kDoublePress (<500 ms).
+    if (state->screen == wqn::UiScreen::kAi &&
         event.type == wqn::ButtonEventType::kDoublePress &&
-        state->screen == wqn::UiScreen::kAi;
-    const bool short_press_tier =
-        event.type == wqn::ButtonEventType::kShortPress && on_ai_top_page;
-    const bool tier_switch_event =
-        double_press_tier || short_press_tier;
-    if (tier_switch_event &&
         (event.button == wqn::ButtonId::kUp ||
          event.button == wqn::ButtonId::kDownPower)) {
         const wqn::AiTier old_tier = wqn::GetAiTier();
@@ -242,26 +243,49 @@ RefreshSchedule ApplyButtonEvent(const wqn::ButtonEvent& event, wqn::UiState* st
             new_tier = wqn::NextAiTier(new_tier);
         }
         wqn::SetAiTier(new_tier);
-        // Sync the global tier into the UI state so the next FrameSignature
-        // differs (otherwise the refresh dedup pipeline drops the redraw and
-        // the user only sees the change after navigating away and back).
         state->ai.tier = new_tier;
-        ESP_LOGI(kTag,
-                 "AI tier switch: button=%d event_type=%d tier %d -> %d, schedule=kAi",
-                 static_cast<int>(event.button),
-                 static_cast<int>(event.type),
+        wqn::RequestForceFullRefresh();
+        ESP_LOGI(kTag, "AI tier switch (fast double-press): tier %d -> %d",
                  static_cast<int>(old_tier), static_cast<int>(new_tier));
+        last_ai_tap_button = wqn::ButtonId::kNone;
         return RefreshSchedule::kAi;
     }
-    // [tier-reset] When the user presses Up/DownPower on the AI top page
-    // without a tier switch intent (none of the gestures above), it's a
-    // no-op -- swallow the event so the page index doesn't get bumped and
-    // we don't burn an unnecessary refresh.
-    if (on_ai_top_page &&
+
+    // Slow path: two kShortPress events of the same button within 1 s.
+    const bool is_ai_short_press =
+        state->screen == wqn::UiScreen::kAi &&
         event.type == wqn::ButtonEventType::kShortPress &&
         (event.button == wqn::ButtonId::kUp ||
-         event.button == wqn::ButtonId::kDownPower)) {
-        return RefreshSchedule::kNone;
+         event.button == wqn::ButtonId::kDownPower);
+
+    if (is_ai_short_press) {
+        const int64_t now_ms = esp_timer_get_time() / 1000;
+        if (last_ai_tap_button == event.button &&
+            (now_ms - last_ai_tap_ms) <= kAiTierSwitchWindowMs) {
+            // Second tap of the same button within 1 s → tier switch
+            const wqn::AiTier old_tier = wqn::GetAiTier();
+            wqn::AiTier new_tier = old_tier;
+            if (event.button == wqn::ButtonId::kUp) {
+                new_tier = wqn::PrevAiTier(new_tier);
+            } else {
+                new_tier = wqn::NextAiTier(new_tier);
+            }
+            wqn::SetAiTier(new_tier);
+            state->ai.tier = new_tier;
+            wqn::RequestForceFullRefresh();
+            ESP_LOGI(kTag,
+                     "AI tier switch (slow double-tap): button=%d tier %d -> %d, dt=%lld ms",
+                     static_cast<int>(event.button),
+                     static_cast<int>(old_tier), static_cast<int>(new_tier),
+                     static_cast<long long>(now_ms - last_ai_tap_ms));
+            last_ai_tap_button = wqn::ButtonId::kNone;
+            last_ai_tap_ms = 0;
+            return RefreshSchedule::kAi;
+        }
+        // First tap (or different button / expired) → record and fall through
+        // to normal scroll handling.
+        last_ai_tap_button = event.button;
+        last_ai_tap_ms = now_ms;
     }
 
     if (repeated_long_press && !time_value_edit_repeat && !time_running_exit) {
@@ -303,6 +327,70 @@ RefreshSchedule ApplyButtonEvent(const wqn::ButtonEvent& event, wqn::UiState* st
         return RefreshSchedule::kNone;
     }
     if (long_release) {
+        return RefreshSchedule::kNone;
+    }
+
+    // -------------------------------------------------------------------
+    // v2 AI scroll: short-press Up/Down on AI page drives the chat
+    // viewport instead of paging through the assistant text. We do this
+    // explicitly here (instead of letting it fall through to HandleUiInput)
+    // so tier switch (kDoublePress) remains untouched and idle stays clean.
+    //
+    // Recording / waiting state must NOT scroll — the page is reserved for
+    // the recording surface.
+    // -------------------------------------------------------------------
+    if (state->screen == wqn::UiScreen::kAi && !long_press &&
+        (event.type == wqn::ButtonEventType::kShortPress) &&
+        (event.button == wqn::ButtonId::kUp || event.button == wqn::ButtonId::kDownPower) &&
+        state->ai.status != wqn::AiSessionStatus::kListening &&
+        state->ai.status != wqn::AiSessionStatus::kWaitingReply &&
+        state->ai.status != wqn::AiSessionStatus::kStreaming) {
+        constexpr int32_t kScrollStepRows = 2;
+        if (event.button == wqn::ButtonId::kUp) {
+            // Up = "older" content above. Scroll band shifts content down.
+            wqn::RequestAiScrollUp(kScrollStepRows);
+        } else {
+            // Down = "newer". Scroll band shifts content up.
+            const int32_t before = state->ai.scroll_offset_lines;
+            wqn::RequestAiScrollDown(kScrollStepRows);
+            // [scroll-hint] If the user is already at the limit the scroll
+            // is a no-op. Stamp a transient hint so the E-ink panel gives
+            // visible feedback ("已最新") instead of looking frozen.
+            state->ai.scroll_offset_lines = wqn::GetAiScrollOffsetLines();
+            if (state->ai.scroll_offset_lines == before) {
+                wqn::StampScrollNoOpHint();
+            }
+        }
+        state->ai.scroll_offset_lines = wqn::GetAiScrollOffsetLines();
+        wqn::AiSessionState updated;
+        if (wqn::CopyAiSessionToUi(&updated)) {
+            state->ai.scroll_no_op_hint_ms = updated.scroll_no_op_hint_ms;
+            state->ai.toast_label = updated.toast_label;
+            state->ai.toast_visible = updated.toast_visible;
+        }
+        ESP_LOGI(kTag, "AI scroll: button=%d step=%ld -> offset=%ld hint_ms=%lld",
+                 static_cast<int>(event.button),
+                 static_cast<long>(kScrollStepRows),
+                 static_cast<long>(state->ai.scroll_offset_lines),
+                 static_cast<long long>(state->ai.scroll_no_op_hint_ms));
+        return RefreshSchedule::kAi;
+    }
+    // Block Up/Down while busy on AI page so the user cannot accidentally
+    // scroll mid-recording or mid-stream.
+    if (state->screen == wqn::UiScreen::kAi && !long_press &&
+        (event.type == wqn::ButtonEventType::kShortPress) &&
+        (event.button == wqn::ButtonId::kUp || event.button == wqn::ButtonId::kDownPower) &&
+        (state->ai.status == wqn::AiSessionStatus::kListening ||
+         state->ai.status == wqn::AiSessionStatus::kWaitingReply ||
+         state->ai.status == wqn::AiSessionStatus::kStreaming)) {
+        return RefreshSchedule::kNone;
+    }
+    // Short-press confirm on AI page is a no-op now (long-press starts,
+    // long-release submits). Keep behavior symmetric with the no-scroll
+    // case so the user doesn't get double-submits.
+    if (state->screen == wqn::UiScreen::kAi && !long_press && !long_release &&
+        event.type == wqn::ButtonEventType::kShortPress &&
+        event.button == wqn::ButtonId::kConfirm) {
         return RefreshSchedule::kNone;
     }
 
@@ -383,7 +471,10 @@ RefreshSchedule ApplyButtonEvent(const wqn::ButtonEvent& event, wqn::UiState* st
         return RefreshSchedule::kCommit;
     }
     if (state->screen == wqn::UiScreen::kAi) {
-        return RefreshSchedule::kAi;
+        if (state->ai.page != old_page || state->ai.tier != old_ai_tier) {
+            return RefreshSchedule::kAi;
+        }
+        return RefreshSchedule::kNone;
     }
     if (!SameTimeAppState(state->time_app, old_time_app)) {
         BuildHomeSummary(state);

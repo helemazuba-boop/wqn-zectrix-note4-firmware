@@ -9,6 +9,7 @@
 #include <random>
 #include <string>
 
+#include "ai_history.h"
 #include "audio_capture.h"
 #include "esp_check.h"
 #include "esp_log.h"
@@ -74,6 +75,7 @@ void SetErrorLocked(const std::string& message)
     }
     g_state.assistant_text = message;
     g_state.status_since_ms = esp_timer_get_time() / 1000;
+    g_state.toast_visible = false;
     MarkChanged();
 }
 
@@ -112,6 +114,7 @@ void SetCancelledBeforeRecordingLocked()
     g_state.status_detail.clear();
     g_state.function_call_summaries.clear();
     g_state.status_since_ms = esp_timer_get_time() / 1000;
+    g_state.toast_visible = false;
     MarkChanged();
 }
 
@@ -129,58 +132,79 @@ void SetCancelledBeforeRecordingLocked()
 void OnSseEvent(const wqn::WqnAiSseEvent& ev)
 {
     xSemaphoreTake(g_lock, portMAX_DELAY);
+    const int64_t now_ms = esp_timer_get_time() / 1000;
+    wqn::AiHistory& history = wqn::GetAiHistory();
     switch (ev.kind) {
         case wqn::WqnAiSseEvent::Kind::kReady: {
             g_state.status = wqn::AiSessionStatus::kStreaming;
             g_state.pending_text = "已连接 · 等待模型…";
+            g_state.toast_label = "● 服务器处理中";
+            g_state.toast_visible = true;
+            g_state.toast_since_ms = now_ms;
             if (!ev.conversation_id.empty()) {
                 g_conversation_id = ev.conversation_id;
             }
-            g_state.status_since_ms = esp_timer_get_time() / 1000;
+            g_state.status_since_ms = now_ms;
             break;
         }
         case wqn::WqnAiSseEvent::Kind::kStage: {
             g_state.pending_text = ev.stage.empty() ? g_state.pending_text : ev.stage;
-            g_state.status_since_ms = esp_timer_get_time() / 1000;
+            g_state.status_since_ms = now_ms;
             break;
         }
         case wqn::WqnAiSseEvent::Kind::kAsrDelta: {
             g_state.user_partial += ev.delta;
-            g_state.last_render_ms = esp_timer_get_time() / 1000;
+            g_state.last_render_ms = now_ms;
             break;
         }
         case wqn::WqnAiSseEvent::Kind::kAsrComplete: {
             g_state.user_text = ev.text;
             g_state.user_partial.clear();
             g_streaming_force_full_render = true;
-            g_state.status_since_ms = esp_timer_get_time() / 1000;
+            g_state.status_since_ms = now_ms;
+            if (!ev.text.empty()) {
+                std::pmr::string txt(ev.text.data(), ev.text.size(),
+                                     history.LatestTool() ? std::pmr::get_default_resource()
+                                                          : std::pmr::get_default_resource());
+                // Defer the actual history push to outside the lock to keep
+                // alloc pressure off the streaming critical section. Stash in
+                // g_user_text until the post-event hook runs.
+                history.AppendUser(std::move(txt), now_ms);
+            }
             break;
         }
         case wqn::WqnAiSseEvent::Kind::kAsrFailed: {
             g_state.user_partial.clear();
             g_state.user_text = ev.error_message.empty() ? "识别失败" : ev.error_message;
-            g_state.status_since_ms = esp_timer_get_time() / 1000;
+            g_state.status_since_ms = now_ms;
             break;
         }
         case wqn::WqnAiSseEvent::Kind::kTextStart: {
             g_state.assistant_partial.clear();
-            g_state.last_render_ms = esp_timer_get_time() / 1000;
+            g_state.last_render_ms = now_ms;
             break;
         }
         case wqn::WqnAiSseEvent::Kind::kTextDelta: {
             g_state.assistant_partial += ev.delta;
-            g_state.last_render_ms = esp_timer_get_time() / 1000;
+            g_state.last_render_ms = now_ms;
             break;
         }
         case wqn::WqnAiSseEvent::Kind::kTextEnd: {
+            std::string final_text;
             if (!ev.full_text.empty()) {
                 g_state.assistant_text = ev.full_text;
+                final_text = ev.full_text;
             } else {
                 g_state.assistant_text += g_state.assistant_partial;
+                final_text = g_state.assistant_text;
             }
             g_state.assistant_partial.clear();
             g_streaming_force_full_render = true;
-            g_state.status_since_ms = esp_timer_get_time() / 1000;
+            g_state.status_since_ms = now_ms;
+            if (!final_text.empty()) {
+                std::pmr::string txt(final_text.data(), final_text.size());
+                history.AppendAssistant(std::move(txt), now_ms);
+            }
             break;
         }
         case wqn::WqnAiSseEvent::Kind::kToolStart: {
@@ -194,7 +218,12 @@ void OnSseEvent(const wqn::WqnAiSseEvent& ev)
             // the page_ai "执行中▏" inline status chip reflects the current
             // tool without the UI having to read the streaming view API.
             g_state.status_detail = label;
-            g_state.status_since_ms = esp_timer_get_time() / 1000;
+            g_state.status_since_ms = now_ms;
+            {
+                std::pmr::string nm(ev.tool_name.data(), ev.tool_name.size());
+                std::pmr::string args(ev.tool_display.data(), ev.tool_display.size());
+                history.AppendToolStart(std::move(nm), std::move(args), now_ms);
+            }
             break;
         }
         case wqn::WqnAiSseEvent::Kind::kToolResult:
@@ -202,7 +231,7 @@ void OnSseEvent(const wqn::WqnAiSseEvent& ev)
             std::string label = ev.tool_ok ? "✅ " : "❌ ";
             label += ev.tool_display.empty() ? ev.tool_name : ev.tool_display;
             g_pending_tool_label = label;
-            g_tool_clear_at_ms = esp_timer_get_time() / 1000 + 2000;
+            g_tool_clear_at_ms = now_ms + 2000;
             // Pop the last placeholder pushed by ToolStart and replace with the display.
             if (!g_state.function_call_summaries.empty() &&
                 g_state.function_call_summaries.back() == ev.tool_name) {
@@ -214,12 +243,20 @@ void OnSseEvent(const wqn::WqnAiSseEvent& ev)
             // tool outcome for the inline status chip. Will be cleared on
             // next kState/kFinal or after g_tool_clear_at_ms expires.
             g_state.status_detail = label;
-            g_state.status_since_ms = esp_timer_get_time() / 1000;
+            g_state.status_since_ms = now_ms;
+            {
+                std::pmr::string nm(ev.tool_name.data(), ev.tool_name.size());
+                std::pmr::string args(ev.tool_display.data(), ev.tool_display.size());
+                std::pmr::string result(ev.tool_display.data(), ev.tool_display.size());
+                history.PopLastIf(wqn::ChatMessageKind::kToolStart);
+                history.AppendToolResult(std::move(nm), std::move(args), std::move(result),
+                                          ev.tool_ok, ev.tool_elapsed_ms, now_ms);
+            }
             break;
         }
         case wqn::WqnAiSseEvent::Kind::kState: {
             g_state.status_detail = ev.error_message.empty() ? ev.stage : ev.error_message;
-            g_state.status_since_ms = esp_timer_get_time() / 1000;
+            g_state.status_since_ms = now_ms;
             break;
         }
         case wqn::WqnAiSseEvent::Kind::kError: {
@@ -232,30 +269,46 @@ void OnSseEvent(const wqn::WqnAiSseEvent& ev)
             if (g_state.assistant_partial.empty()) {
                 g_state.assistant_partial.clear();
             }
+            g_state.toast_visible = false;
             g_streaming_active = false;
-            g_state.status_since_ms = esp_timer_get_time() / 1000;
+            g_state.status_since_ms = now_ms;
             break;
         }
         case wqn::WqnAiSseEvent::Kind::kFinal: {
             // Stable state: stop streaming, push everything into the canonical
             // fields, clear partials.
+            std::string final_text;
             if (!ev.full_text.empty()) {
                 g_state.assistant_text = ev.full_text;
+                final_text = ev.full_text;
             } else if (!g_state.assistant_partial.empty()) {
                 g_state.assistant_text += g_state.assistant_partial;
+                final_text = g_state.assistant_text;
             }
             g_state.assistant_partial.clear();
             g_state.user_partial.clear();
             g_state.pending_text.clear();
             g_state.status = wqn::AiSessionStatus::kReplyReady;
+            g_state.toast_visible = false;
             if (!ev.conversation_id.empty()) {
                 g_conversation_id = ev.conversation_id;
             }
             g_state.conversation_id = g_conversation_id;
             g_state.page = 0;
+            g_state.scroll_offset_lines = 0;
             g_streaming_force_full_render = true;
             g_streaming_active = false;
-            g_state.status_since_ms = esp_timer_get_time() / 1000;
+            g_state.status_since_ms = now_ms;
+            // [history-fix] Always push the assistant's final reply into the
+            // history buffer at kFinal, even if kTextEnd was not emitted (the
+            // cloud pipeline sometimes terminates the stream with a single
+            // kFinal carrying the full text). Without this, the viewport would
+            // appear empty after the upload toast clears and the user would
+            // see a stale "上传" pixel set on the E-ink panel.
+            if (!final_text.empty()) {
+                std::pmr::string txt(final_text.data(), final_text.size());
+                history.AppendAssistant(std::move(txt), now_ms);
+            }
             break;
         }
     }
@@ -467,36 +520,13 @@ std::string BuildStatusDetail(const wqn::WqnAiChatResponse& response)
     return detail;
 }
 
-void SaveTodaySessionLocked(const wqn::WqnAiChatResponse& response)
+void SaveTodaySessionLocked(const wqn::WqnAiChatResponse& /*response*/)
 {
-    const std::string day = CurrentLocalDay();
-    if (day.empty()) {
-        return;
-    }
-
-    wqn::CachedAiSession session;
-    session.day = day;
-    session.conversation_id = g_conversation_id;
-    session.transcript = g_state.user_text;
-    session.reply_text = response.reply_text.empty() ? g_state.assistant_text : response.reply_text;
-    session.status_detail = g_state.status_detail;
-    session.latency_ms = response.latency_ms;
-    for (const auto& call : response.function_calls) {
-        if (!call.display.empty()) {
-            session.function_call_summaries.push_back(call.display);
-        }
-    }
-    if (session.function_call_summaries.empty()) {
-        const std::string action_summary = BuildAiActionSummary(response.actions);
-        if (!action_summary.empty()) {
-            session.function_call_summaries.push_back(action_summary);
-        }
-    }
-
-    const esp_err_t saved = wqn::SaveAiSessionForDay(session);
-    if (saved != ESP_OK) {
-        ESP_LOGW(kTag, "save AI session failed: %s", esp_err_to_name(saved));
-    }
+    // v2: PSRAM-only persistence per the plan. The session lives in wqn::AiHistory
+    // and is intentionally lost on reboot. We do NOT touch NVS from here; the
+    // historical SaveAiSessionForDay() call was the source of
+    // ESP_ERR_NVS_NOT_ENOUGH_SPACE on full NVS, so we skip it.
+    ESP_LOGD(kTag, "SaveTodaySessionLocked: no-op, history lives in PSRAM");
 }
 
 void LoadTodaySessionLocked()
@@ -506,28 +536,16 @@ void LoadTodaySessionLocked()
     }
     g_loaded_today = true;
 
-    const std::string day = CurrentLocalDay();
-    if (day.empty()) {
-        return;
-    }
-
-    wqn::CachedAiSession session;
-    const esp_err_t loaded = wqn::LoadAiSessionForDay(day, &session);
-    if (loaded != ESP_OK || session.day.empty()) {
-        return;
-    }
-
-    g_conversation_id = session.conversation_id;
-    g_state.status = wqn::AiSessionStatus::kReplyReady;
-    g_state.user_text = session.transcript;
-    g_state.assistant_text = session.reply_text;
-    g_state.pending_text.clear();
-    g_state.status_detail = session.status_detail;
-    g_state.function_call_summaries = session.function_call_summaries;
-    g_state.conversation_id = g_conversation_id;
-    g_state.page = 0;
-    g_state.status_since_ms = esp_timer_get_time() / 1000;
-    MarkChanged();
+    // v2: PSRAM-only. The session lives entirely in wqn::AiHistory and is
+    // intentionally lost on reboot. We do NOT call LoadAiSessionForDay()
+    // (which would also fight ESP_ERR_NVS_NOT_ENOUGH_SPACE).
+    //
+    // On boot the history is empty. Recent replies are rebuilt from the
+    // resume-conversation flow on the cloud side; we keep
+    // g_conversation_id so the next session can rejoin the chat.
+    (void)wqn::GetAiHistory();
+    ESP_LOGI(kTag, "LoadTodaySessionLocked: PSRAM history ready, size=%zu",
+             wqn::GetAiHistory().size());
 }
 
 void SubmitTask(void*)
@@ -574,6 +592,11 @@ void SubmitTask(void*)
         audio.duration_ms = kMaxAudioDurationMs;
     }
     SetStateLocked(wqn::AiSessionStatus::kWaitingReply, "正在上传语音...", "", "");
+    g_state.toast_label = "● 上传…";
+    g_state.toast_visible = true;
+    g_state.toast_since_ms = esp_timer_get_time() / 1000;
+    g_state.toast_recording_ms = 0;
+    MarkChanged();
     const std::string tier_str = g_state.tier == wqn::AiTier::kPro ? "pro" : "std";
     const std::string conversation_id = g_conversation_id;
     g_streaming_active = true;
@@ -668,6 +691,7 @@ void SubmitTask(void*)
             g_conversation_id = response.conversation_id;
             g_state.status = wqn::AiSessionStatus::kReplyReady;
             g_state.pending_text.clear();
+            g_state.toast_visible = false;
             if (!response.transcript.empty()) {
                 g_state.user_text = response.transcript;
             } else if (g_state.user_text.empty()) {
@@ -698,6 +722,27 @@ void SubmitTask(void*)
             g_state.page = 0;
             g_state.conversation_id = g_conversation_id;
             g_state.status_since_ms = esp_timer_get_time() / 1000;
+
+            // Append User Question to History
+            if (!g_state.user_text.empty()) {
+                std::pmr::string txt(g_state.user_text.data(), g_state.user_text.size());
+                wqn::GetAiHistory().AppendUser(std::move(txt), g_state.status_since_ms);
+            }
+
+            // Append Tool/Action summaries if present
+            for (const auto& summary : g_state.function_call_summaries) {
+                std::pmr::string nm("action", 6);
+                std::pmr::string args(summary.data(), summary.size());
+                std::pmr::string result("done", 4);
+                wqn::GetAiHistory().AppendToolResult(std::move(nm), std::move(args), std::move(result), true, 0, g_state.status_since_ms);
+            }
+
+            // Append Assistant Reply to History
+            if (!g_state.assistant_text.empty()) {
+                std::pmr::string txt(g_state.assistant_text.data(), g_state.assistant_text.size());
+                wqn::GetAiHistory().AppendAssistant(std::move(txt), g_state.status_since_ms);
+            }
+
             SaveTodaySessionLocked(response);
             MarkChanged();
             ESP_LOGI(kTag,
@@ -801,11 +846,16 @@ void PrepareRecordingTask(void* parameter)
         g_state.function_call_summaries.clear();
         g_state.conversation_id = g_conversation_id;
         g_state.page = 0;
-        g_state.status_since_ms = esp_timer_get_time() / 1000;
+        g_state.scroll_offset_lines = 0;
+        g_state.toast_label = "● 录音中 00:00";
+        g_state.toast_visible = true;
+        g_state.toast_since_ms = esp_timer_get_time() / 1000;
+        g_state.toast_recording_ms = 0;
+        g_state.status_since_ms = g_state.toast_since_ms;
         MarkChanged();
         FinishPrepareTaskLocked(generation);
         xSemaphoreGive(g_lock);
-        ESP_LOGI(kTag, "AI recording started after WiFi ready");
+        ESP_LOGI(kTag, "AI recording started after WiFi ready; toast=录音中");
         vTaskDelete(nullptr);
         return;
     }
@@ -870,6 +920,7 @@ esp_err_t StartAiRecordingSession()
     g_state.function_call_summaries.clear();
     g_state.conversation_id = g_conversation_id;
     g_state.page = 0;
+    g_state.scroll_offset_lines = 0;
     g_state.status_since_ms = esp_timer_get_time() / 1000;
     g_prepare_active = true;
     g_recording_requested = true;
@@ -979,6 +1030,36 @@ AiTier GetAiTier()
     return result;
 }
 
+void ClearAiConversationContext()
+{
+    if (g_lock == nullptr) {
+        return;
+    }
+    xSemaphoreTake(g_lock, portMAX_DELAY);
+    // [context-clear] STD/PRO context is "temporarily shared" for one
+    // AI-screen visit. On leave we drop the local conversation so the next
+    // visit starts fresh; the cloud keeps the saved conversation in
+    // esp32_ai_conversations for the future reuse/reopen UI flow.
+    g_conversation_id.clear();
+    g_state.conversation_id.clear();
+    g_state.user_text.clear();
+    g_state.assistant_text.clear();
+    g_state.assistant_partial.clear();
+    g_state.user_partial.clear();
+    g_state.pending_text.clear();
+    g_state.status_detail.clear();
+    g_state.function_call_summaries.clear();
+    g_pending_tool_label.clear();
+    g_state.status = wqn::AiSessionStatus::kIdle;
+    g_state.status_since_ms = esp_timer_get_time() / 1000;
+    g_state.page = 0;
+    g_state.toast_visible = false;
+    g_state.toast_label.clear();
+    wqn::GetAiHistory().Clear();
+    MarkChanged();
+    xSemaphoreGive(g_lock);
+}
+
 bool CopyAiStreamingStatus(AiStreamingStatusView* view)
 {
     if (view == nullptr || g_lock == nullptr) {
@@ -1012,6 +1093,183 @@ bool CopyAiStreamingStatus(AiStreamingStatusView* view)
     return true;
 }
 
+// ============================================================================
+// v2 toast + scroll helpers
+// ============================================================================
+//
+// These run on the UI task side (key dispatch, status changes). They live in
+// ai_session.cpp because they share state with the SSE consumer (`g_lock`,
+// `g_state`). They always take the AI mutex briefly so the UI tick sees a
+// consistent snapshot.
+//
+// All toast labels are emitted without an elapsed-seconds counter, per the
+// v2 design contract. The recording state retains a local elapsed counter so
+// the chip can still flash "录音中 00:04" without that counter being part of
+// the canonical pending_text / toast_label string.
+void ShowAiToast(const std::string& label)
+{
+    if (g_lock == nullptr) {
+        return;
+    }
+    xSemaphoreTake(g_lock, portMAX_DELAY);
+    g_state.toast_label = label;
+    g_state.toast_visible = true;
+    g_state.toast_since_ms = esp_timer_get_time() / 1000;
+    if (label.find("录音") != std::string::npos) {
+        g_state.toast_recording_ms = 0;
+    }
+    MarkChanged();
+    xSemaphoreGive(g_lock);
+}
+
+void HideAiToast()
+{
+    if (g_lock == nullptr) {
+        return;
+    }
+    xSemaphoreTake(g_lock, portMAX_DELAY);
+    if (g_state.toast_visible) {
+        g_state.toast_visible = false;
+        g_state.toast_label.clear();
+        g_state.toast_recording_ms = 0;
+        MarkChanged();
+    }
+    xSemaphoreGive(g_lock);
+}
+
+void SetAiRecordingLabel(int32_t elapsed_ms)
+{
+    if (g_lock == nullptr) {
+        return;
+    }
+    xSemaphoreTake(g_lock, portMAX_DELAY);
+    if (g_state.toast_visible && g_state.status == wqn::AiSessionStatus::kListening) {
+        g_state.toast_recording_ms = elapsed_ms;
+        char buf[40];
+        const int seconds = static_cast<int>(elapsed_ms / 1000);
+        const int minutes = seconds / 60;
+        const int s = seconds % 60;
+        std::snprintf(buf, sizeof(buf), "\xe2\x97\x8f 录音中 %02d:%02d", minutes, s);
+        g_state.toast_label = buf;
+        MarkChanged();
+    }
+    xSemaphoreGive(g_lock);
+}
+
+void ResetAiScroll()
+{
+    if (g_lock == nullptr) {
+        return;
+    }
+    xSemaphoreTake(g_lock, portMAX_DELAY);
+    if (g_state.scroll_offset_lines != 0) {
+        g_state.scroll_offset_lines = 0;
+        MarkChanged();
+    }
+    xSemaphoreGive(g_lock);
+}
+
+void RequestAiScrollUp(int32_t lines)
+{
+    if (g_lock == nullptr || lines <= 0) {
+        return;
+    }
+    xSemaphoreTake(g_lock, portMAX_DELAY);
+    int32_t target = g_state.scroll_offset_lines + lines;
+    constexpr int32_t kMaxScrollRows = 256;
+    if (target > kMaxScrollRows) {
+        target = kMaxScrollRows;
+    }
+    if (target < -kMaxScrollRows) {
+        target = -kMaxScrollRows;
+    }
+    if (target != g_state.scroll_offset_lines) {
+        g_state.scroll_offset_lines = target;
+        MarkChanged();
+    }
+    xSemaphoreGive(g_lock);
+}
+
+void RequestAiScrollDown(int32_t lines)
+{
+    if (g_lock == nullptr || lines <= 0) {
+        return;
+    }
+    xSemaphoreTake(g_lock, portMAX_DELAY);
+    int32_t target = g_state.scroll_offset_lines - lines;
+    constexpr int32_t kMaxScrollRows = 256;
+    if (target > kMaxScrollRows) {
+        target = kMaxScrollRows;
+    }
+    if (target < -kMaxScrollRows) {
+        target = -kMaxScrollRows;
+    }
+    if (target != g_state.scroll_offset_lines) {
+        g_state.scroll_offset_lines = target;
+        MarkChanged();
+    }
+    xSemaphoreGive(g_lock);
+}
+
+void SetAiScrollOffsetLines(int32_t val)
+{
+    if (g_lock == nullptr) {
+        return;
+    }
+    xSemaphoreTake(g_lock, portMAX_DELAY);
+    constexpr int32_t kMaxScrollRows = 256;
+    int32_t target = val;
+    if (target > kMaxScrollRows) {
+        target = kMaxScrollRows;
+    }
+    if (target < -kMaxScrollRows) {
+        target = -kMaxScrollRows;
+    }
+    if (g_state.scroll_offset_lines != target) {
+        g_state.scroll_offset_lines = target;
+        MarkChanged();
+    }
+    xSemaphoreGive(g_lock);
+}
+
+void StampScrollNoOpHint()
+{
+    if (g_lock == nullptr) {
+        return;
+    }
+    xSemaphoreTake(g_lock, portMAX_DELAY);
+    g_state.scroll_no_op_hint_ms = esp_timer_get_time() / 1000;
+    MarkChanged();
+    xSemaphoreGive(g_lock);
+}
+
+int32_t GetAiScrollOffsetLines()
+{
+    if (g_lock == nullptr) {
+        return 0;
+    }
+    xSemaphoreTake(g_lock, portMAX_DELAY);
+    int32_t val = g_state.scroll_offset_lines;
+    xSemaphoreGive(g_lock);
+    return val;
+}
+
+bool IsAiToastVisible()
+{
+    if (g_lock == nullptr) {
+        return false;
+    }
+    xSemaphoreTake(g_lock, portMAX_DELAY);
+    const bool visible = g_state.toast_visible;
+    xSemaphoreGive(g_lock);
+    return visible;
+}
+
+const std::string& CurrentAiToastLabel()
+{
+    return g_state.toast_label;
+}
+
 }  // namespace wqn
 
 #else
@@ -1038,6 +1296,8 @@ bool CopyAiSessionToUi(AiSessionState*)
     return false;
 }
 
+void ClearAiConversationContext() {}
+
 void SetAiTier(AiTier tier)
 {
     (void)tier;
@@ -1046,6 +1306,38 @@ void SetAiTier(AiTier tier)
 AiTier GetAiTier()
 {
     return AiTier::kStd;
+}
+
+int32_t GetAiScrollOffsetLines()
+{
+    return 0;
+}
+
+bool CopyAiStreamingStatus(AiStreamingStatusView* view)
+{
+    if (view != nullptr) {
+        view->streaming_active = false;
+        view->force_full_render = false;
+        view->status = AiSessionStatus::kIdle;
+        view->status_since_ms = 0;
+        view->last_render_ms = 0;
+    }
+    return false;
+}
+
+void ShowAiToast(const std::string&) {}
+void HideAiToast() {}
+void SetAiRecordingLabel(int32_t) {}
+void ResetAiScroll() {}
+void RequestAiScrollUp(int32_t) {}
+void RequestAiScrollDown(int32_t) {}
+void SetAiScrollOffsetLines(int32_t) {}
+void StampScrollNoOpHint() {}
+bool IsAiToastVisible() { return false; }
+const std::string& CurrentAiToastLabel()
+{
+    static const std::string empty;
+    return empty;
 }
 
 }  // namespace wqn

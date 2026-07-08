@@ -381,14 +381,23 @@ bool IsFullyCharged()
 
 bool IsBatteryLow()
 {
-    return GetBatteryVoltageMv() <= CONFIG_WQN_BATTERY_LOW_THRESHOLD_MV;
+    const uint16_t mv = GetBatteryVoltageMv();
+    if (mv == 0) {
+        return false;
+    }
+    return mv <= CONFIG_WQN_BATTERY_LOW_THRESHOLD_MV;
 }
 
 bool IsBatteryVeryLow()
 {
+    const uint16_t mv = GetBatteryVoltageMv();
+    if (mv == 0) {
+        return false;
+    }
     constexpr int kVeryLowMv = 3430;
-    return GetBatteryVoltageMv() <= kVeryLowMv;
+    return mv <= kVeryLowMv;
 }
+
 
 esp_err_t PrepareForDeepSleep(bool enable_timer_wakeup)
 {

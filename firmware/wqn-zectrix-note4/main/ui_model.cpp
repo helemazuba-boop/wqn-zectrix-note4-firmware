@@ -4,13 +4,13 @@
 #include <cstdint>
 
 #include "ai_session.h"
+#include "epd_display.h"
 #include "flash_session.h"
 #include "provision_manager.h"
 
 namespace {
 
 constexpr size_t kPreviewChars = 96;
-constexpr size_t kAiCharsPerPage = 92;
 constexpr int64_t kAiMockReplyDelayMs = 1300;
 
 bool DecodeUtf8(const char*& cursor, uint32_t* codepoint)
@@ -85,20 +85,6 @@ std::string Truncate(const std::string& text, size_t limit)
     return output;
 }
 
-size_t CountUtf8Codepoints(const std::string& text)
-{
-    const char* cursor = text.c_str();
-    size_t count = 0;
-    while (*cursor != '\0') {
-        const char* before = cursor;
-        uint32_t codepoint = 0;
-        if (!DecodeUtf8(cursor, &codepoint) || cursor == before) {
-            break;
-        }
-        ++count;
-    }
-    return count;
-}
 
 std::string AiPagedTextSource(const wqn::AiSessionState& ai)
 {
@@ -494,9 +480,28 @@ const char* ReviewChoiceStatus(ReviewChoice choice)
 
 size_t AiSessionTextPageCount(const AiSessionState& ai)
 {
-    const size_t chars = CountUtf8Codepoints(AiPagedTextSource(ai));
-    return std::max<size_t>(1, (chars + kAiCharsPerPage - 1) / kAiCharsPerPage);
+    std::string text = AiPagedTextSource(ai);
+    if (text.empty()) {
+        return 1;
+    }
+
+    const bool has_user_text = !ai.user_text.empty() || !ai.user_partial.empty();
+    const std::string user_text = has_user_text
+        ? (ai.user_text.empty() ? ai.user_partial : ai.user_text)
+        : "";
+    std::vector<std::string> user_lines;
+    if (!user_text.empty()) {
+        user_lines = wqn::WrapUtf8TextToWidth(user_text, 388, 2);
+    }
+
+    const int assistant_y = user_lines.empty() ? 34 : (34 + user_lines.size() * 18 + 6);
+    const int assistant_height = 294 - assistant_y;
+    const int assistant_max_lines = (assistant_height - 14) / 18;
+
+    const std::vector<std::string> lines = wqn::WrapUtf8TextToWidth(text, 388 - 16, 9999);
+    return std::max<size_t>(1, (lines.size() + assistant_max_lines - 1) / assistant_max_lines);
 }
+
 
 size_t AiSessionPageCount(const AiSessionState& ai)
 {
@@ -691,12 +696,16 @@ void HandleUiInput(UiState* state, UiInput input)
     }
     ClampUiSelection(state);
 #if CONFIG_WQN_AI_ENABLE
-    // Leaving the AI screen while in Flash tier must tear down the WebSocket
-    // and the audio streaming task — otherwise they keep running in the
-    // background and drain the battery.
-    if (screen_before == wqn::UiScreen::kAi && state->screen != wqn::UiScreen::kAi &&
-        state->ai.tier == wqn::AiTier::kFlash) {
-        wqn::StopFlashSession();
+    // Leaving the AI screen: Flash tears down its realtime WebSocket; STD/PRO
+    // clear their "temporarily shared" conversation context so the next visit
+    // starts fresh (the cloud keeps the saved conversation in
+    // esp32_ai_conversations for the future reuse/reopen UI flow).
+    if (screen_before == wqn::UiScreen::kAi && state->screen != wqn::UiScreen::kAi) {
+        if (state->ai.tier == wqn::AiTier::kFlash) {
+            wqn::StopFlashSession();
+        } else {
+            wqn::ClearAiConversationContext();
+        }
     }
 #endif
 }
@@ -722,6 +731,12 @@ bool TickAiSession(UiState* state, int64_t now_ms)
     return false;
 #endif
 }
+
+// [tier-flash] One-shot flag set by RequestForceFullRefresh() and consumed by
+// RenderUiFrame. Lets callers like the AI tier-switch handler force a full
+// EPD refresh without changing the RenderUiFrame API.
+bool g_force_full_refresh_next = false;
+void RequestForceFullRefresh() { g_force_full_refresh_next = true; }
 
 UiFrame RenderUiFrame(const UiState& state)
 {
@@ -751,7 +766,10 @@ UiFrame RenderUiFrame(const UiState& state)
     frame.word_app = BuildWordAppSnapshot(state.word_app);
     frame.settings = state.settings;
     frame.selected_home_task = state.selected_home_task;
-    frame.prefer_full_refresh = state.screen == UiScreen::kHome;
+    // [tier-flash] Force a full refresh when RequestForceFullRefresh() was
+    // called (e.g. AI tier switch). The one-shot flag is consumed here.
+    frame.prefer_full_refresh = (state.screen == UiScreen::kHome) || g_force_full_refresh_next;
+    g_force_full_refresh_next = false;
     if (state.screen != UiScreen::kHome) {
         AddLine(&frame, UiTextStyle::kMeta, ScreenName(state.screen));
     }

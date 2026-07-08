@@ -1158,7 +1158,8 @@ void WebsocketEventHandler(void* handler_args, esp_event_base_t, int32_t event_i
                         static_cast<const char*>(event->data_ptr),
                         static_cast<size_t>(event->data_len));
                     // All fragments received — parse complete frame
-                    if (event->payload_offset + event->data_len >=
+                    if (event->payload_len > 0 &&
+                        event->payload_offset + event->data_len >=
                         event->payload_len) {
                         ParseAndHandleEvent(g_flash.ws_reassembly_buf.data(),
                                             g_flash.ws_reassembly_buf.size());
@@ -1213,8 +1214,18 @@ void HandleV2DownlinkAudio(const uint8_t* data, size_t len,
         return;
     }
     if (payload_offset == 0) {
+        // [oom-guard] Cap the reassembly buffer at 64 KB. TTS audio chunks are
+        // typically 2-6 KB; a malicious or buggy proxy claiming a huge
+        // payload_len would otherwise exhaust PSRAM.
+        constexpr size_t kMaxAudioFrameBytes = 64 * 1024;
+        if (payload_len > kMaxAudioFrameBytes) {
+            ESP_LOGW(kTag, "audio frame payload_len=%llu exceeds cap %u, dropping",
+                     static_cast<unsigned long long>(payload_len),
+                     static_cast<unsigned>(kMaxAudioFrameBytes));
+            return;
+        }
         g_flash.audio_reassembly_buf.clear();
-        g_flash.audio_reassembly_buf.reserve(payload_len);
+        g_flash.audio_reassembly_buf.reserve(static_cast<size_t>(payload_len));
     }
     g_flash.audio_reassembly_buf.append(reinterpret_cast<const char*>(data), len);
     if (g_flash.audio_reassembly_buf.size() < payload_len) {
@@ -1241,6 +1252,8 @@ void HandleV2DownlinkAudio(const uint8_t* data, size_t len,
     const size_t pcm_bytes = g_flash.audio_reassembly_buf.size() - sizeof(AudioFrameHeader);
     const size_t safe_bytes = pcm_bytes & ~static_cast<size_t>(1);  // align to int16
     if (safe_bytes < 2) {
+        ESP_LOGD(kTag, "audio frame seq=%u has %u PCM bytes (< 1 sample), skipping",
+                 static_cast<unsigned>(hdr.seq), static_cast<unsigned>(safe_bytes));
         g_flash.audio_reassembly_buf.clear();
         return;
     }
@@ -1333,11 +1346,12 @@ esp_err_t StartFlashSession()
 
     esp_websocket_client_config_t cfg = {};
 #if CONFIG_WQN_FLASH_PROTOCOL_V2
-    // wss://{host}{path}
-    cfg.uri = nullptr;
-    cfg.host = kWsHost;
-    cfg.path = kWsPath;
-    cfg.port = 443;
+    // [port-fix] ESP-IDF's host+path mode sometimes ignores cfg.port and
+    // defaults to 80, causing "connecting to host ...:80" + HTTP 301
+    // redirect instead of a WS upgrade on 443. Use the full URI form
+    // (wss://host/path) which makes esp_websocket_client respect 443
+    // implicitly from the "wss://" scheme.
+    cfg.uri = "wss://" WQN_API_BASE_HOST WQN_FLASH_WS_PATH;
     cfg.subprotocol = kWsSubprotocol;
 #else
     cfg.uri = kWsUri;

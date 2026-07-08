@@ -78,9 +78,11 @@
 #endif
 
 // Output sample rate is negotiated at session.update time; StepAudio Realtime
-// is native 24 kHz, accept either 16000 or 24000 from the proxy.
+// is native 24 kHz, but the I2S duplex path runs at 16 kHz (shared BCLK/WS
+// with the microphone capture). Requesting 16 kHz from the proxy avoids a
+// firmware-side resampler — the proxy (or StepFun) downmixes to 16 kHz.
 #ifndef WQN_FLASH_OUTPUT_SAMPLE_RATE_HZ
-#define WQN_FLASH_OUTPUT_SAMPLE_RATE_HZ 24000
+#define WQN_FLASH_OUTPUT_SAMPLE_RATE_HZ 16000
 #endif
 
 // Upstream audio chunk (480 B = 240 frames @ 16 kHz = 15 ms).
