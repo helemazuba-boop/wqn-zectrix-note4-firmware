@@ -451,6 +451,18 @@ esp_err_t LoadWordPackIndex(WordPackIndex* index)
         }
     }
 
+    // [sort-fix] Sort entries globally by normalized_word. Each pack file is
+    // individually sorted, but multi-pack concatenation breaks the global
+    // ordering that FindWordPackPrefixMatches / WordPackNextLetters rely on
+    // for their early-break optimization (strncmp > 0 -> break). Without
+    // this sort, the dictionary may silently miss matches from later packs.
+    if (index->entries.size() > 1) {
+        std::sort(index->entries.begin(), index->entries.end(),
+                  [](const WordPackIndexEntry& a, const WordPackIndexEntry& b) {
+                      return std::strcmp(a.normalized_word, b.normalized_word) < 0;
+                  });
+    }
+
     if (index->entries.empty() && index->status_message.empty()) {
         index->status_message = "词库为空";
     } else if (index->status_message.empty()) {
@@ -554,10 +566,20 @@ void FindWordPackPrefixMatches(const WordPackIndex& index, const std::string& pr
     }
     matches->clear();
     const std::string normalized = NormalizeWordLookupText(prefix);
+    // [dict-perf] Pack entries are sorted by normalized_word (cloud-side
+    // loadDeckEntries orders by sort_index, normalized_word). Once we pass
+    // the prefix range (strncmp > 0), all subsequent entries are also past
+    // the range, so we can break early instead of scanning all 3500+.
     for (size_t i = 0; i < index.entries.size(); ++i) {
-        if (!normalized.empty() &&
-            std::strncmp(index.entries[i].normalized_word, normalized.c_str(), normalized.size()) != 0) {
-            continue;
+        if (!normalized.empty()) {
+            const int cmp = std::strncmp(index.entries[i].normalized_word,
+                                         normalized.c_str(), normalized.size());
+            if (cmp < 0) {
+                continue;  // before prefix range
+            }
+            if (cmp > 0) {
+                break;  // past prefix range, done
+            }
         }
         matches->push_back(i);
         if (matches->size() >= limit) {
@@ -570,14 +592,23 @@ std::vector<char> WordPackNextLetters(const WordPackIndex& index, const std::str
 {
     const std::string normalized = NormalizeWordLookupText(prefix);
     std::vector<char> letters;
+    // [dict-perf] Same early-break optimization as FindWordPackPrefixMatches:
+    // entries are sorted, so once strncmp > 0 we've passed the prefix range.
     for (const WordPackIndexEntry& entry : index.entries) {
         const size_t nw_len = std::strlen(entry.normalized_word);
         if (nw_len <= normalized.size()) {
+            // Entry is shorter than prefix; if sorted, skip (don't break
+            // - a shorter entry could still be "before" the prefix).
             continue;
         }
-        if (!normalized.empty() &&
-            std::strncmp(entry.normalized_word, normalized.c_str(), normalized.size()) != 0) {
-            continue;
+        if (!normalized.empty()) {
+            const int cmp = std::strncmp(entry.normalized_word, normalized.c_str(), normalized.size());
+            if (cmp < 0) {
+                continue;  // before prefix range
+            }
+            if (cmp > 0) {
+                break;  // past prefix range, done
+            }
         }
         const char next = entry.normalized_word[normalized.size()];
         if (next < 'a' || next > 'z') {

@@ -3,6 +3,7 @@
 #if CONFIG_WQN_AI_ENABLE
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cstring>
 #include <string>
@@ -10,6 +11,7 @@
 
 #include "audio_player.h"
 #include "audio_capture.h"
+#include "ai_history.h"
 #include "cJSON.h"
 #include "config.h"
 #include "driver/gpio.h"
@@ -82,7 +84,6 @@ constexpr int kSampleRate = 16000;
 constexpr int kChunkFrames = 240;
 constexpr int kChunkBytes = kChunkFrames * 2;
 constexpr int kChunkIntervalMs = 15;
-constexpr uint32_t kOutputSampleRate = WQN_FLASH_OUTPUT_SAMPLE_RATE_HZ;
 
 constexpr int kMaxReconnectAttempts = 3;
 constexpr TickType_t kWifiReadyWait = pdMS_TO_TICKS(15000);
@@ -136,7 +137,8 @@ struct FlashState {
     // subsequent response.audio.delta events.
     RingbufHandle_t playback_ringbuf = nullptr;
     TaskHandle_t playback_task = nullptr;
-    size_t playback_queued_bytes = 0;
+    std::atomic<size_t> playback_queued_bytes{0};  // [race-fix] accessed from WS task + playback task + UI task
+    std::atomic<bool> drain_playback{false};       // [drain-fix] flag set by UI task, consumed by playback task
     size_t playback_dropped_bytes = 0;
 };
 
@@ -408,7 +410,7 @@ void CheckAmpIdleTail()
 // user still hears the leading edge of the response).
 bool EnqueuePlaybackPcm(const uint8_t* pcm, size_t bytes)
 {
-    if (g_flash.playback_ringbuf == nullptr || bytes == 0) {
+    if (g_flash.playback_ringbuf == nullptr || pcm == nullptr || bytes == 0) {
         return false;
     }
     const size_t aligned = bytes & ~static_cast<size_t>(1);
@@ -426,7 +428,7 @@ bool EnqueuePlaybackPcm(const uint8_t* pcm, size_t bytes)
                  static_cast<unsigned>(g_flash.playback_dropped_bytes));
         return false;
     }
-    g_flash.playback_queued_bytes += aligned;
+    g_flash.playback_queued_bytes.fetch_add(aligned, std::memory_order_relaxed);
     return true;
 }
 
@@ -435,20 +437,11 @@ bool EnqueuePlaybackPcm(const uint8_t* pcm, size_t bytes)
 // immediately and the next response starts from silence.
 void DrainPlaybackRingbuf()
 {
-    if (g_flash.playback_ringbuf == nullptr) {
-        return;
-    }
-    size_t item_size = 0;
-    char* item = nullptr;
-    while ((item = static_cast<char*>(xRingbufferReceive(
-                   g_flash.playback_ringbuf, &item_size, 0))) != nullptr) {
-        vRingbufferReturnItem(g_flash.playback_ringbuf, item);
-    }
-    // ESP-IDF 5.x exposes only xRingbufferReset() (FreeRTOS-Kconfig-aware) as
-    // vRingbufferReset(); the API isn't available in stock FreeRTOS. We rely on
-    // having drained all items above, so no reset call is needed.
-    g_flash.playback_queued_bytes = 0;
-    g_flash.playback_dropped_bytes = 0;
+    // [drain-fix] Don't call xRingbufferReceive from the UI task - FreeRTOS
+    // ringbuffers are single-consumer and FlashPlaybackTask (Core 1) is the
+    // only legitimate receiver. Instead, set a flag that the playback task
+    // checks at the top of its loop; it will discard all queued items itself.
+    g_flash.drain_playback.store(true, std::memory_order_relaxed);
 }
 
 // [playback-fix] Independent FreeRTOS task that drains the ringbuffer and
@@ -465,13 +458,35 @@ void FlashPlaybackTask(void* /*param*/)
         if (item == nullptr) {
             continue;
         }
+        // [drain-fix] Check the drain flag before processing any item. The UI
+        // task sets this to request "drop all queued audio" (barge-in). We
+        // spin through the ringbuffer here as the single legitimate consumer.
+        if (g_flash.drain_playback.load(std::memory_order_relaxed)) {
+            size_t drain_size = 0;
+            char* drain_item = nullptr;
+            while ((drain_item = static_cast<char*>(xRingbufferReceive(
+                           g_flash.playback_ringbuf, &drain_size, 0))) != nullptr) {
+                vRingbufferReturnItem(g_flash.playback_ringbuf, drain_item);
+            }
+            g_flash.playback_queued_bytes.store(0, std::memory_order_relaxed);
+            g_flash.drain_playback.store(false, std::memory_order_relaxed);
+            // Also discard the item we just received - it's part of the drain.
+            vRingbufferReturnItem(g_flash.playback_ringbuf, item);
+            continue;
+        }
+
         // Silence-fill small items so I2S DMA does not underrun; this also
         // preserves mono->stereo alignment if the proxy delivered a sub-frame.
         const size_t sample_count = item_size / 2;
         const int16_t* mono = reinterpret_cast<const int16_t*>(item);
 
         if (g_flash.stream_tx == nullptr) {
+            // [busyloop-fix] Was: vRingbufferReturnItem + continue with no
+            // delay. If ringbuffer had data and stream_tx was null (e.g. I2S
+            // not yet initialized or already cleaned up), this spun at 100%
+            // CPU on Core 1. Add a short delay to yield.
             vRingbufferReturnItem(g_flash.playback_ringbuf, item);
+            vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
 
@@ -499,16 +514,21 @@ void FlashPlaybackTask(void* /*param*/)
                           pdMS_TO_TICKS(50));
         vRingbufferReturnItem(g_flash.playback_ringbuf, item);
 
-        if (g_flash.playback_queued_bytes >= item_size) {
-            g_flash.playback_queued_bytes -= item_size;
+        size_t queued = g_flash.playback_queued_bytes.load(std::memory_order_relaxed);
+        if (queued >= item_size) {
+            g_flash.playback_queued_bytes.fetch_sub(item_size, std::memory_order_relaxed);
         } else {
-            g_flash.playback_queued_bytes = 0;
+            g_flash.playback_queued_bytes.store(0, std::memory_order_relaxed);
         }
     }
 }
 
 void EnsurePlaybackRingbuf()
 {
+    // [lock-fix] Guard with mutex to prevent double-alloc / double-task-create
+    // if StartFlashSession is called rapidly (e.g. error recovery).
+    if (g_flash.mutex == nullptr) return;
+    xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
     if (g_flash.playback_ringbuf == nullptr) {
         g_flash.playback_ringbuf = xRingbufferCreate(
             kPlaybackRingbufBytes, RINGBUF_TYPE_BYTEBUF);
@@ -526,6 +546,7 @@ void EnsurePlaybackRingbuf()
             g_flash.playback_task = nullptr;
         }
     }
+    xSemaphoreGive(g_flash.mutex);
 }
 
 esp_err_t InitStreamEs8311Adc(i2c_master_bus_handle_t bus)
@@ -542,24 +563,80 @@ esp_err_t InitStreamEs8311Adc(i2c_master_bus_handle_t bus)
     auto write = [&](uint8_t r, uint8_t v) { return WriteEs8311Reg(dev, r, v); };
     auto read = [&](uint8_t r, uint8_t* v) { return ReadEs8311Reg(dev, r, v); };
     esp_err_t ret = ESP_OK;
-    // NOTE: ES8311 is shared with audio_player (DAC). Do NOT perform a full chip
-    // reset (write ES8311_REG_RESET = 0x80) here — it wipes all DAC/PGA settings
-    // and breaks subsequent playback. Only configure ADC-specific registers and
-    // assume the codec has been powered up by audio_player or by SetStreamAudioPower.
 
-    // Configure ADC digital gain, volume, and clock for capture path
-    ret |= write(ES8311_REG_ADC_CTRL1, 0x1F);    // ADC PGA volume
-    ret |= write(ES8311_REG_ADC_CTRL2, 0x7F);    // ADC max analog gain
-    ret |= write(ES8311_REG_ADC_DGAIN1, 0x10);   // ADC digital gain
-    ret |= write(ES8311_REG_ADC_DGAIN6, 0x0A);   // ADC ALC target level
-    ret |= write(ES8311_REG_ADC_DGAIN7, 0x6A);   // ADC ALC settings
+    // [adc-fix] Use the verified ADC init sequence from audio_capture.cpp::
+    // InitEs8311Adc (lines 261-322), NOT the DAC sequence from audio_player.
+    // The DAC sequence was missing ADC-specific registers (ADC_REG15=0x40 MIC
+    // bias, ADC_REG16/17 PGA/ALC, SYSTEM14, CLK08, DAC37) -> ADC input path
+    // unconfigured -> max_sample=0 (silent mic). Register names mapped to this
+    // file's constants; bare addresses where no const exists (0x08/0x0D/0x0E/
+    // 0x12/0x37). Matches audio_capture.cpp verbatim.
+    ret |= write(ES8311_REG_GPIO, 0x08);            // GPIO_REG44
+    ret |= write(ES8311_REG_CLK_MAN1, 0x30);        // CLK01
+    ret |= write(ES8311_REG_CLK_MAN2, 0x00);        // CLK02
+    ret |= write(ES8311_REG_CLK_MAN3, 0x10);        // CLK03
+    ret |= write(ES8311_REG_ADC_DGAIN4, 0x24);      // 0x16 ADC_REG16 (MIC amp)
+    ret |= write(ES8311_REG_RESERVED1, 0x10);        // 0x04 CLK04
+    ret |= write(ES8311_REG_RESERVED2, 0x00);        // 0x05 CLK05
+    ret |= write(ES8311_REG_SYSTEM1, 0x00);          // 0x0B
+    ret |= write(ES8311_REG_SYSTEM2, 0x00);          // 0x0C
+    ret |= write(ES8311_REG_ADC_CTRL1, 0x1F);       // 0x10 (PGA volume)
+    ret |= write(ES8311_REG_ADC_CTRL2, 0x7F);       // 0x11 (ADC max gain)
+    ret |= write(ES8311_REG_RESET, 0x80);
+    uint8_t reg00 = 0;
+    if (read(ES8311_REG_RESET, &reg00) == ESP_OK) {
+        ret |= write(ES8311_REG_RESET, reg00 & 0xBF);
+    } else { ret = ESP_FAIL; }
 
-    // Enable ADC path (SDPIN is the ADC digital interface register)
+    ret |= write(ES8311_REG_CLK_MAN1, 0x3F);
+    uint8_t reg06 = 0;
+    if (read(ES8311_REG_RESERVED3, &reg06) == ESP_OK) {  // 0x06
+        ret |= write(ES8311_REG_RESERVED3, reg06 & ~0x20);
+    } else { ret = ESP_FAIL; }
+
+    ret |= write(ES8311_REG_ADC_DGAIN1, 0x10);      // 0x13 SYSTEM13
+    ret |= write(ES8311_REG_ADC_DGAIN6, 0x0A);      // 0x1B
+    ret |= write(ES8311_REG_ADC_DGAIN7, 0x6A);      // 0x1C
+    ret |= write(ES8311_REG_GPIO, 0x58);
+    ret |= write(ES8311_REG_CLK_MAN2, 0x00);
+    ret |= write(ES8311_REG_CLK_MAN3, 0x10);
+    ret |= write(ES8311_REG_RESERVED1, 0x10);        // 0x04
+    ret |= write(ES8311_REG_RESERVED2, 0x00);        // 0x05
+    ret |= write(ES8311_REG_RESERVED3, 0x0F);        // 0x06 (ADC clock)
+    ret |= write(ES8311_REG_RESERVED4, 0x00);        // 0x07
+    ret |= write(0x08, 0xFF);                        // CLK08 (no const)
+
     uint8_t reg = 0;
-    if (read(ES8311_REG_SDPIN, &reg) == ESP_OK) {
+    if (read(ES8311_REG_SDPOUT, &reg) == ESP_OK) {   // 0x0A
+        ret |= write(ES8311_REG_SDPOUT, reg & ~0x40);
+    } else { ret = ESP_FAIL; }
+    if (read(ES8311_REG_SDPIN, &reg) == ESP_OK) {    // 0x09
         ret |= write(ES8311_REG_SDPIN, reg & ~0x40);
-    } else {
-        ret = ESP_FAIL;
+    } else { ret = ESP_FAIL; }
+
+    ret |= write(ES8311_REG_ADC_DGAIN5, 0xBF);      // 0x17 ADC_REG17
+    ret |= write(0x0E, 0x02);                        // SYSTEM0E
+    ret |= write(0x12, 0x00);                        // SYSTEM12
+    ret |= write(ES8311_REG_ADC_DGAIN2, 0x1A);      // 0x14 SYSTEM14
+    if (read(ES8311_REG_ADC_DGAIN2, &reg) == ESP_OK) {
+        ret |= write(ES8311_REG_ADC_DGAIN2, reg & ~0x40);
+    } else { ret = ESP_FAIL; }
+    ret |= write(0x0D, 0x01);                        // SYSTEM0D
+    ret |= write(ES8311_REG_ADC_DGAIN3, 0x40);      // 0x15 ADC_REG15 (MIC bias) -- KEY: was 0x00
+    ret |= write(0x37, 0x08);                        // DAC_REG37
+    ret |= write(ES8311_REG_GP, 0x00);               // 0x45
+
+    // [es8311-diag] Read back key ADC registers to confirm writes landed.
+    // Expected: SDPIN(0x09) bit6=0, SDPOUT(0x0A) bit6=0 (both interfaces powered),
+    // SYS1(0x0B)=0x44, CLK06=0x0F, CLK04=0x10, ADC10=0x1F, ADC11=0x7F, ALC1B=0x0A.
+    // If SDPOUT bit6=1 -> ADC still in power-down. If reads return 0xFF -> I2C no-ACK.
+    {
+        uint8_t v09=0xFF, v0A=0xFF, v0B=0xFF, v06=0xFF, v04=0xFF, v10=0xFF, v11=0xFF, v14=0xFF, v1B=0xFF;
+        read(0x09, &v09); read(0x0A, &v0A); read(0x0B, &v0B);
+        read(0x06, &v06); read(0x04, &v04);
+        read(0x10, &v10); read(0x11, &v11); read(0x14, &v14); read(0x1B, &v1B);
+        ESP_LOGI(kTag, "es8311 readback: SDPIN=0x%02x SDPOUT=0x%02x SYS1=0x%02x CLK06=0x%02x CLK04=0x%02x ADC10=0x%02x ADC11=0x%02x ADC14=0x%02x ALC1B=0x%02x",
+                 v09, v0A, v0B, v06, v04, v10, v11, v14, v1B);
     }
 
     i2c_master_bus_rm_device(dev);
@@ -671,6 +748,10 @@ void CleanupStreamHardware()
 void AudioStreamingTask(void* param)
 {
     (void)param;
+    // [deadlock-fix] ES8311 warm-up delay moved here from StartAudioStreaming
+    // so the WS client lock is released before we sleep. See comment there.
+    vTaskDelay(pdMS_TO_TICKS(250));
+
     uint8_t i2s_buf[kStreamChunkBytes * 2];  // stereo, 2 bytes/sample
 
     // Init I2C bus (try shared, fallback to own)
@@ -721,24 +802,54 @@ void AudioStreamingTask(void* param)
         esp_err_t read_err = i2s_channel_read(
             g_flash.stream_rx, i2s_buf, sizeof(i2s_buf), &bytes_read, pdMS_TO_TICKS(20));
         if (read_err != ESP_OK || bytes_read == 0) {
-            if (read_err != ESP_ERR_TIMEOUT) {
+            if (read_err == ESP_ERR_TIMEOUT) {
+                // [i2s-diag] Timeout = DMA has no data = ADC path not running.
+                // Distinguishes a dead capture path (timeouts, no pcm diag)
+                // from a working path with silent mic (successful reads,
+                // pcm diag max_sample=0). Log every 50th to avoid spam.
+                static int i2s_timeout_count = 0;
+                if (++i2s_timeout_count % 50 == 1) {
+                    ESP_LOGW(kTag, "I2S read timeout #%d (no DMA data; ES8311 ADC clock?)", i2s_timeout_count);
+                }
+            } else {
                 ESP_LOGW(kTag, "I2S read error: %s", esp_err_to_name(read_err));
             }
+            // [cpu-fix] Yield on read failure. Without this the task (priority 10)
+            // spins at 100% retrying i2s_channel_read instantly, flooding UART and
+            // drowning earlier logs (e.g. es8311 readback).
+            vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
 
-        // Convert stereo interleaved to mono (left channel only).
-        // I2S stereo 16-bit layout: [L0_lo L0_hi R0_lo R0_hi L1_lo L1_hi ...]
-        // Each stereo frame is 4 bytes (2 channels × 2 bytes/sample).
+        // [channel-fix] Convert stereo interleaved to mono by averaging L+R
+        // (matches audio_capture.cpp:476-484). The mic may be routed to either
+        // channel; left-only (old code) read a floating pin -> max_sample=0.
+        // I2S stereo 16-bit layout: [L0 R0 L1 R1 ...] (2 bytes/sample).
         const int stereo_frames = static_cast<int>(bytes_read / 4);
         const int frames = std::min(stereo_frames, kStreamChunkFrames);
         uint8_t mono_buf[kStreamChunkBytes];
         const int16_t* stereo_samples = reinterpret_cast<const int16_t*>(i2s_buf);
         int16_t* mono_samples = reinterpret_cast<int16_t*>(mono_buf);
         for (int i = 0; i < frames; ++i) {
-            mono_samples[i] = stereo_samples[i * 2];  // left channel only
+            const int left = static_cast<int>(stereo_samples[i * 2]);
+            const int right = static_cast<int>(stereo_samples[i * 2 + 1]);
+            mono_samples[i] = static_cast<int16_t>(std::clamp((left + right) / 2, -32768, 32767));
         }
         size_t mono_bytes = static_cast<size_t>(frames) * 2;
+
+        // [diag] Log PCM level every ~1 second (66 chunks at 15ms = ~1s).
+        // If max_sample is ~0, microphone/ADC isn't working. If >1000, audio
+        // has content. This is the key diagnostic for the empty-ASR issue.
+        static int diag_chunk_counter = 0;
+        if (diag_chunk_counter++ % 66 == 0) {
+            int16_t max_sample = 0;
+            for (int i = 0; i < frames; ++i) {
+                int16_t s = mono_samples[i];
+                if (s < 0) s = static_cast<int16_t>(-s);
+                if (s > max_sample) max_sample = s;
+            }
+            ESP_LOGI(kTag, "pcm diag: frames=%d max_sample=%d", frames, max_sample);
+        }
 
         // Send via WebSocket if connected.
         // v2 uses binary frames (24-byte header + PCM); v1 fallback sends
@@ -751,14 +862,26 @@ void AudioStreamingTask(void* param)
 #if CONFIG_WQN_FLASH_PROTOCOL_V2
             std::vector<uint8_t> frame;
             BuildV2AudioFrame(&frame, mono_buf, mono_bytes, ++g_flash.uplink_seq, /*final=*/false);
+            // [timeout-fix] Was 50ms - WiFi jitter fills TCP tx buffer for
+            // >50ms -> send returns 0 -> WS client treats as fatal -> closes
+            // connection (code 1006). 1000ms lets TCP retransmit recover.
             esp_websocket_client_send_bin(g_flash.ws_client,
                                          reinterpret_cast<const char*>(frame.data()),
                                          frame.size(),
-                                         pdMS_TO_TICKS(50));
+                                         pdMS_TO_TICKS(1000));
+            // [i2s-diag] Confirm uplink audio is actually being sent. Paired
+            // with the I2S timeout log above: if this never prints but timeouts
+            // do, the capture path is dead. If this prints but StepFun still
+            // says "append not called", the proxy/StepFun side is dropping them.
+            static int uplink_append_count = 0;
+            if (++uplink_append_count % 66 == 1) {
+                ESP_LOGI(kTag, "uplink append #%d seq=%u bytes=%u",
+                         uplink_append_count, g_flash.uplink_seq, (unsigned)mono_bytes);
+            }
 #else
             std::string b64 = EncodeBase64(mono_buf, mono_bytes);
             std::string msg = R"({"type":"input_audio_buffer.append","audio":"}" + b64 + R"("})";
-            esp_websocket_client_send_text(g_flash.ws_client, msg.c_str(), msg.size(), pdMS_TO_TICKS(50));
+            esp_websocket_client_send_text(g_flash.ws_client, msg.c_str(), msg.size(), pdMS_TO_TICKS(1000));
 #endif
         }
     }
@@ -781,7 +904,13 @@ void StartAudioStreaming()
     // Power on audio hardware first
     SetStreamAudioPower(true);
     g_flash.stream_audio_powered = true;
-    vTaskDelay(pdMS_TO_TICKS(250));  // warm-up delay for ES8311
+    // [deadlock-fix] The 250ms ES8311 warm-up delay was here, but
+    // StartAudioStreaming() is called from WebsocketEventHandler which
+    // holds the WS client's internal lock. vTaskDelay here blocks the WS
+    // task for 250ms, and the AudioStreamingTask (priority 10) that we
+    // create below preempts and tries esp_websocket_client_send_bin()
+    // which needs that same lock -> 5s timeout deadlock. Move the delay
+    // into AudioStreamingTask so the WS lock is released immediately.
 
     // [amp-fix] Always start in a closed-amp state. The amp is enabled lazily
     // by the response.audio.delta handler when the server actually starts
@@ -793,7 +922,7 @@ void StartAudioStreaming()
     }
     SetStreamAudioAmp(false);
 
-    xTaskCreatePinnedToCore(&AudioStreamingTask, "flash_stream", 4096, nullptr, 10,
+    xTaskCreatePinnedToCore(&AudioStreamingTask, "flash_stream", 8192, nullptr, 10,
                              &g_flash.stream_task, 1);
 }
 
@@ -808,8 +937,12 @@ void StopAudioStreaming()
     // while we also try to delete it) and a double-free of hardware resources.
     g_flash.capture_started = false;
     TaskHandle_t task = g_flash.stream_task;
-    // Wait for the task to notice the flag and self-delete (max ~50 ms).
-    for (int i = 0; i < 5; ++i) {
+    // [panic-fix] Wait for the task to self-delete. Was 50 ms - too short if the
+    // task is blocked in esp_websocket_client_send_bin (1 s timeout). Forcing
+    // vTaskDelete while the task holds the WS client internal lock corrupts its
+    // queue -> xQueueGenericSend NULL assert -> panic reboot. 1.5 s covers a full
+    // send_bin timeout so the task exits cleanly.
+    for (int i = 0; i < 150; ++i) {
         vTaskDelay(pdMS_TO_TICKS(10));
         if (g_flash.stream_task == nullptr) {
             // Task self-deleted successfully
@@ -872,6 +1005,24 @@ void ParseAndHandleEvent(const char* data, size_t len)
     // v2 control-frame events (text frames containing JSON).
     // ============================================================
 #if CONFIG_WQN_FLASH_PROTOCOL_V2
+    if (std::strcmp(type, "error") == 0) {
+        // [error-fix] Surface StepFun/proxy error messages instead of relying solely
+        // on the subsequent WS close. Event shape per StepFun docs:
+        // {"type":"error","error":{"type":..,"code":..,"message":..}}
+        std::string msg = "服务错误";
+        const cJSON* err_obj = cJSON_GetObjectItem(g.p, "error");
+        if (err_obj != nullptr) {
+            const cJSON* m_item = cJSON_GetObjectItem(err_obj, "message");
+            if (cJSON_IsString(m_item) && m_item->valuestring != nullptr && m_item->valuestring[0] != '\0') {
+                msg = m_item->valuestring;
+            }
+        }
+        ESP_LOGW(kTag, "flash session error event: %s", msg.c_str());
+        xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+        SetErrorLocked(msg);
+        xSemaphoreGive(g_flash.mutex);
+        return;
+    }
     if (std::strcmp(type, "session.ready") == 0 ||
         std::strcmp(type, "session.created") == 0 ||
         std::strcmp(type, "session.updated") == 0) {
@@ -910,7 +1061,8 @@ void ParseAndHandleEvent(const char* data, size_t len)
         return;
     }
 
-    if (std::strcmp(type, "asr.complete") == 0) {
+    if (std::strcmp(type, "asr.complete") == 0 ||
+        std::strcmp(type, "conversation.item.input_audio_transcription.completed") == 0) {
         const char* tr = JsonStr(g.p, "transcript");
         if (tr != nullptr) {
             xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
@@ -920,6 +1072,12 @@ void ParseAndHandleEvent(const char* data, size_t len)
             MarkChanged();
             xSemaphoreGive(g_flash.mutex);
             ESP_LOGI(kTag, "transcription: %s", tr);
+            // [display-fix] Write the finalized user transcript into AiHistory
+            // so RenderAiHistoryViewport (page_ai.cpp) picks it up. Without
+            // this, Flash mode text is invisible on the e-paper screen.
+            wqn::GetAiHistory().AppendUser(
+                std::pmr::string(tr, std::pmr::polymorphic_allocator<char>{}),
+                esp_timer_get_time() / 1000);
         }
         return;
     }
@@ -972,12 +1130,24 @@ void ParseAndHandleEvent(const char* data, size_t len)
 
     if (std::strcmp(type, "turn.done") == 0 || std::strcmp(type, "response.done") == 0) {
         ESP_LOGI(kTag, "turn done");
+        // [display-fix] Write the accumulated assistant text into AiHistory
+        // so it shows up on the e-paper viewport. We do this here (at turn
+        // completion) rather than on every delta to avoid pushing partial
+        // fragments into the history deque.
+        std::string assistant_snapshot;
         if (g_flash.mutex != nullptr) {
             xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+            assistant_snapshot = g_flash.assistant_text;
             g_flash.amp_idle_armed = false;
             g_flash.status_since_ms = esp_timer_get_time() / 1000;
             MarkChanged();
             xSemaphoreGive(g_flash.mutex);
+        }
+        if (!assistant_snapshot.empty()) {
+            wqn::GetAiHistory().AppendAssistant(
+                std::pmr::string(assistant_snapshot.begin(), assistant_snapshot.end(),
+                                 std::pmr::polymorphic_allocator<char>{}),
+                esp_timer_get_time() / 1000);
         }
         SetStreamAudioAmp(false);
         return;
@@ -1081,19 +1251,26 @@ void WebsocketEventHandler(void* handler_args, esp_event_base_t, int32_t event_i
             g_flash.status_since_ms = esp_timer_get_time() / 1000;
             g_flash.uplink_seq = 0;
             MarkChanged();
+            esp_websocket_client_handle_t client = g_flash.ws_client;
+            xSemaphoreGive(g_flash.mutex);
+            if (client == nullptr) break;
 
 #if CONFIG_WQN_FLASH_PROTOCOL_V2
-            // wqn-flash-v2: every negotiation happens through the session.update
-            // control JSON. We pin the voice + audio format + instructions here
-            // and ask the proxy to call StepAudio 2.5 Realtime on our behalf.
+            // [api-fix] session.update aligned to StepFun official Realtime API
+            // docs (https://platform.stepfun.com/docs/llms.txt). Previous
+            // version had three fatal errors that caused StepFun to silently
+            // ignore the session config and never trigger TTS:
+            //   1. Missing "modalities" (required field)
+            //   2. "vad" -> should be "turn_detection"
+            //   3. "mode" -> should be "type"
+            // Also removed input_sample_rate / output_sample_rate (not in spec).
+            // model is set by the relay's rewriteSessionUpdate, not here.
             std::string session_update = std::string(R"({"type":"session.update","session":)") +
-                R"({"model":")" + std::string(WQN_FLASH_WS_MODEL) +
+                R"({"modalities":["text","audio"],)" +
+                R"("instructions":")" + std::string(kDefaultInstructions) +
                 R"(","voice":")" + kDefaultVoice +
-                R"(","input_audio_format":"pcm16","input_sample_rate":16000)" +
-                R"(,"output_audio_format":"opus","output_sample_rate":)" +
-                std::to_string(static_cast<long long>(kOutputSampleRate)) +
-                R"(,"instructions":")" + std::string(kDefaultInstructions) +
-                R"(","vad":{"mode":"server_vad","prefix_padding_ms":500,"silence_duration_ms":200}}})";
+                R"(","input_audio_format":"pcm16")" +
+                R"(,"output_audio_format":"pcm16","turn_detection":null}})";
 #else
             std::string session_update = std::string(R"({"type":"session.update","session":)") +
                 R"({"modalities":["text","audio"],"instructions":")" +
@@ -1102,9 +1279,8 @@ void WebsocketEventHandler(void* handler_args, esp_event_base_t, int32_t event_i
                 R"(","input_audio_format":"pcm16","output_audio_format":"pcm16")" +
                 R"(,"turn_detection":{"type":"server_vad","prefix_padding_ms":500,"silence_duration_ms":200}}})";
 #endif
-            esp_websocket_client_send_text(g_flash.ws_client, session_update.c_str(),
+            esp_websocket_client_send_text(client, session_update.c_str(),
                                            session_update.size(), pdMS_TO_TICKS(5000));
-            xSemaphoreGive(g_flash.mutex);
             break;
         }
 
@@ -1150,6 +1326,13 @@ void WebsocketEventHandler(void* handler_args, esp_event_base_t, int32_t event_i
                 } else {
                     // Fragmented frame — accumulate into reassembly buffer
                     if (event->payload_offset == 0) {
+                        // [oom-guard] Cap control-frame reassembly at 128 KB.
+                        constexpr size_t kMaxWsFrameBytes = 128 * 1024;
+                        if (event->payload_len > kMaxWsFrameBytes) {
+                            ESP_LOGW(kTag, "WS control frame payload_len=%llu exceeds cap, dropping",
+                                     static_cast<unsigned long long>(event->payload_len));
+                            break;
+                        }
                         g_flash.ws_reassembly_buf.clear();
                         g_flash.ws_reassembly_buf.reserve(
                             static_cast<size_t>(event->payload_len));
@@ -1307,6 +1490,11 @@ esp_err_t StartFlashSession()
         return ESP_ERR_INVALID_STATE;
     }
 
+    // [i2s-conflict-fix] audio_player.cpp holds I2S_NUM_0 open after
+    // playing word pronunciation or system sounds. Flash needs the same
+    // port for duplex (RX+TX). Force-release it before we try to init.
+    wqn::StopAudioPlayback();
+
     esp_err_t result = StartWifiStationIfEnabled();
     if (result != ESP_OK) {
         result = WaitForWifiStationConnected(kWifiReadyWait);
@@ -1356,7 +1544,7 @@ esp_err_t StartFlashSession()
 #else
     cfg.uri = kWsUri;
 #endif
-    cfg.network_timeout_ms = static_cast<int>(kWsConnectTimeout / portTICK_PERIOD_MS);
+    cfg.network_timeout_ms = static_cast<int>(kWsConnectTimeout * portTICK_PERIOD_MS);
     // [stack-fix] Default WS task stack is 4 KB which is too small for the
     // cJSON parsing + Base64 decoding + I2S operations done inside the event
     // callback. Increase to 8 KB to prevent stack overflow panics.
@@ -1369,6 +1557,11 @@ esp_err_t StartFlashSession()
     // no server verification source (error 0x8017 SSL_SETUP_FAILED). Attach
     // the bundled root CA store — same pattern as wqn_api.cpp's HTTP client.
     cfg.crt_bundle_attach = esp_crt_bundle_attach;
+    // [keepalive-fix] Reconnect fast (2s, not default 10s) so PTT retry
+    // feels responsive after a momentary drop. Ping every 20s to keep the
+    // connection alive through ALB/SLB idle timeouts (default 50s).
+    cfg.reconnect_timeout_ms = 2000;
+    cfg.ping_interval_sec = 20;
 
     g_flash.ws_client = esp_websocket_client_init(&cfg);
     if (g_flash.ws_client == nullptr) {
@@ -1563,6 +1756,16 @@ void OnFlashButtonPressed()
     xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
 
     if (g_flash.status == InternalStatus::kIdle || g_flash.status == InternalStatus::kError) {
+        // [error-recovery-fix] When in kError, the old WS client is still
+        // alive (connection not closed, just got an error event). StartFlashSession
+        // sees ws_client != nullptr and returns early without reconnecting,
+        // permanently locking the device in kError. Force-stop the old session
+        // first so StartFlashSession creates a fresh client.
+        if (g_flash.status == InternalStatus::kError) {
+            xSemaphoreGive(g_flash.mutex);
+            StopFlashSession();
+            xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+        }
         xSemaphoreGive(g_flash.mutex);
         StartFlashSession();
         xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
@@ -1577,7 +1780,7 @@ void OnFlashButtonPressed()
     // response.cancelled / conversation.item.truncate to StepFun Realtime.
     bool need_barge_in = false;
     if (g_flash.ws_connected && g_flash.status == InternalStatus::kStreaming &&
-        (g_flash.playback_queued_bytes > 0 || !g_flash.tool_label.empty())) {
+        (g_flash.playback_queued_bytes.load(std::memory_order_relaxed) > 0 || !g_flash.tool_label.empty())) {
         need_barge_in = true;
     }
 
@@ -1641,27 +1844,45 @@ void OnFlashButtonReleased()
     }
     SetStreamAudioAmp(false);
 
-    // Send turn-end only if WS was actually connected.
-    // v2: a binary "end-of-turn" frame with kFlagFinal signals the proxy that
-    // no more audio will follow for this turn; the server flushes ASR and
-    // asks the model to respond.  v1 fallback: send the OpenAI-style commit +
-    // response.create pair that StepFun shaped servers understand.
+    // [deadlock-fix] Send turn-end WITHOUT holding g_flash.mutex. The WS
+    // client's internal lock is acquired by esp_websocket_client_send_*,
+    // and the WS event handler (which holds that lock) may try to take
+    // g_flash.mutex in ParseAndHandleEvent. Nesting g_flash.mutex ->
+    // client->lock while the WS task holds client->lock -> g_flash.mutex
+    // is a classic AB-BA deadlock. Copy handle + seq under our lock,
+    // release, then send.
+    bool should_send = false;
+    esp_websocket_client_handle_t client = nullptr;
+    uint32_t seq = 0;
+
     xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
-    if (ws_connected && g_flash.ws_client != nullptr) {
+    if (ws_connected && g_flash.ws_client != nullptr && was_capturing) {
+        // [empty-frame-fix] Only send the final end-of-turn frame if we
+        // actually captured audio this session. Without was_capturing, every
+        // button release in error/idle state sends an empty final frame ->
+        // relay forwards an empty append + commit to StepFun -> "audio is
+        // required" error -> session corrupted.
+        should_send = true;
+        client = g_flash.ws_client;
+        ++g_flash.uplink_seq;
+        seq = g_flash.uplink_seq;
+    }
+    xSemaphoreGive(g_flash.mutex);
+
+    if (should_send) {
 #if CONFIG_WQN_FLASH_PROTOCOL_V2
         std::vector<uint8_t> end;
-        BuildV2AudioFrame(&end, nullptr, 0, ++g_flash.uplink_seq, /*final=*/true);
-        esp_websocket_client_send_bin(g_flash.ws_client,
+        BuildV2AudioFrame(&end, nullptr, 0, seq, /*final=*/true);
+        esp_websocket_client_send_bin(client,
                                       reinterpret_cast<const char*>(end.data()),
                                       end.size(), pdMS_TO_TICKS(1000));
 #else
         std::string commit = R"({"type":"input_audio_buffer.commit"})";
-        esp_websocket_client_send_text(g_flash.ws_client, commit.c_str(), commit.size(), pdMS_TO_TICKS(1000));
+        esp_websocket_client_send_text(client, commit.c_str(), commit.size(), pdMS_TO_TICKS(1000));
         std::string resp_create = R"({"type":"response.create"})";
-        esp_websocket_client_send_text(g_flash.ws_client, resp_create.c_str(), resp_create.size(), pdMS_TO_TICKS(1000));
+        esp_websocket_client_send_text(client, resp_create.c_str(), resp_create.size(), pdMS_TO_TICKS(1000));
 #endif
     }
-    xSemaphoreGive(g_flash.mutex);
 }
 
 }  // namespace wqn

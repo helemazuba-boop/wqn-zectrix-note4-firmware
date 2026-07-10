@@ -696,16 +696,12 @@ void HandleUiInput(UiState* state, UiInput input)
     }
     ClampUiSelection(state);
 #if CONFIG_WQN_AI_ENABLE
-    // Leaving the AI screen: Flash tears down its realtime WebSocket; STD/PRO
-    // clear their "temporarily shared" conversation context so the next visit
-    // starts fresh (the cloud keeps the saved conversation in
-    // esp32_ai_conversations for the future reuse/reopen UI flow).
-    if (screen_before == wqn::UiScreen::kAi && state->screen != wqn::UiScreen::kAi) {
-        if (state->ai.tier == wqn::AiTier::kFlash) {
-            wqn::StopFlashSession();
-        } else {
-            wqn::ClearAiConversationContext();
-        }
+    // Leaving the AI screen while in Flash tier must tear down the WebSocket
+    // and the audio streaming task — otherwise they keep running in the
+    // background and drain the battery.
+    if (screen_before == wqn::UiScreen::kAi && state->screen != wqn::UiScreen::kAi &&
+        state->ai.tier == wqn::AiTier::kFlash) {
+        wqn::StopFlashSession();
     }
 #endif
 }
@@ -737,6 +733,11 @@ bool TickAiSession(UiState* state, int64_t now_ms)
 // EPD refresh without changing the RenderUiFrame API.
 bool g_force_full_refresh_next = false;
 void RequestForceFullRefresh() { g_force_full_refresh_next = true; }
+bool ConsumeForceFullRefresh() {
+    bool val = g_force_full_refresh_next;
+    g_force_full_refresh_next = false;
+    return val;
+}
 
 UiFrame RenderUiFrame(const UiState& state)
 {
@@ -766,10 +767,13 @@ UiFrame RenderUiFrame(const UiState& state)
     frame.word_app = BuildWordAppSnapshot(state.word_app);
     frame.settings = state.settings;
     frame.selected_home_task = state.selected_home_task;
-    // [tier-flash] Force a full refresh when RequestForceFullRefresh() was
-    // called (e.g. AI tier switch). The one-shot flag is consumed here.
+    // [force-full-fix] Check the one-shot flag but do NOT consume it here.
+    // RenderUiFrame may be called multiple times per tick (once for signature
+    // comparison, once for actual render). If we clear it here, the signature
+    // call eats the flag and the actual render frame gets prefer_full=false.
+    // Consumption is deferred to ConsumeForceFullRefresh() called by the
+    // render path in device_ui.cpp after it has the final frame.
     frame.prefer_full_refresh = (state.screen == UiScreen::kHome) || g_force_full_refresh_next;
-    g_force_full_refresh_next = false;
     if (state.screen != UiScreen::kHome) {
         AddLine(&frame, UiTextStyle::kMeta, ScreenName(state.screen));
     }

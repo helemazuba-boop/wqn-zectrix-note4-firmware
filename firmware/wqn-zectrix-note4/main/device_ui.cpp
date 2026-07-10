@@ -462,6 +462,14 @@ wqn::AiStreamingStatusView streaming_view{};
 
         if (refresh_schedule != RefreshSchedule::kNone) {
             const wqn::UiFrame frame = wqn::RenderUiFrame(state);
+            // [force-full-fix] Consume the one-shot flag HERE, after the final
+            // render frame is built. RenderUiFrame above checks (but doesn't
+            // clear) the flag, so all signature-comparison calls earlier in
+            // this tick also saw it. Now we apply it to the actual frame that
+            // will be pushed to the EPD, and clear it for the next tick.
+            if (wqn::ConsumeForceFullRefresh()) {
+                const_cast<wqn::UiFrame&>(frame).prefer_full_refresh = true;
+            }
             const std::string frame_signature = FrameSignature(frame);
             ESP_LOGI(kTag,
                      "dispatch refresh: schedule=%s sig_match=%d last_len=%zu new_len=%zu screen=%d tier=%d",
@@ -500,7 +508,13 @@ wqn::AiStreamingStatusView streaming_view{};
         g_rtc_screen_val = static_cast<int>(state.screen);
         const bool enable_timer_wakeup = (state.screen == wqn::UiScreen::kHome ||
                                           state.screen == wqn::UiScreen::kTime);
-        wqn::EnterDeepSleepIfEnabled(enable_timer_wakeup);
+        // [download-fix] Don't deep-sleep while a cloud task is mid-flight
+        // (word-pack download / todo sync). Sleeping yanks the CPU and cuts
+        // the radio during a TLS stream, truncating the download and
+        // corrupting the local cache.
+        if (!g_word_cloud_busy && !g_todo_cloud_busy) {
+            wqn::EnterDeepSleepIfEnabled(enable_timer_wakeup);
+        }
 
         const int64_t idle_ms = (esp_timer_get_time() - g_last_active_us_local) / 1000;
         const bool screen_active = (state.screen == wqn::UiScreen::kTime ||

@@ -4,6 +4,8 @@ setlocal EnableExtensions
 :: ========== Configuration ==========
 set "PROJECT_DIR=D:\projects\wqn-zectrix-note4-firmware\firmware\wqn-zectrix-note4"
 set "BUILD_DIR=build-ai-local-s3"
+set "COM_PORT=COM7"
+set "IDF_EXPORT=D:\Program\Espressif\frameworks\esp-idf-v5.5.4\export.bat"
 :: ===================================
 
 cd /d "%PROJECT_DIR%"
@@ -14,12 +16,25 @@ echo  WQN Note4 Flash Deploy (Unified Script)
 echo ========================================
 echo.
 
-:: Step 1: Build the project (always do this to pick up any code changes)
+:: Step 0: Kill any existing monitor_serial.bat / monitor_serial.ps1
+::          so the COM port is free for flashing.
+echo [Step 0] Stopping existing serial monitor...
+taskkill /F /FI "WINDOWTITLE eq monitor_serial*" >nul 2>&1
+:: Also kill any lingering PowerShell monitor by script name
+for /f "tokens=2" %%P in ('tasklist /FI "IMAGENAME eq powershell.exe" /FO CSV /NH 2^>nul ^| findstr /I "monitor_serial"') do (
+    taskkill /F /PID %%P >nul 2>&1
+)
+:: Kill by the actual process command line (most reliable)
+wmic process where "commandline like '%%monitor_serial%%'" call terminate >nul 2>&1
+echo   Done.
+
+:: Step 1: Activate ESP-IDF and build
+echo.
 echo [Step 1] Building project...
-call "D:\Program\Espressif\frameworks\esp-idf-v5.5.4\export.bat"
+call "%IDF_EXPORT%"
 if errorlevel 1 (
     echo   ERROR: Failed to load ESP-IDF environment.
-    echo   Check that IDF is installed at D:\Program Files\Espressif\frameworks\esp-idf-v5.5.4
+    echo   Check that IDF is installed at %IDF_EXPORT%
     pause
     exit /b 1
 )
@@ -31,17 +46,13 @@ if errorlevel 1 (
 )
 echo   Done.
 
-:: Step 2: Prompt for COM port
-echo.
-set "COM_PORT=COM7"
-
+:: Step 2: COM port
 echo.
 echo [Step 2] Using COM port: %COM_PORT%
 echo.
 
-:: Step 3: Flash all partitions (SKIP erase-flash so NVS pairing token survives)
-echo.
-echo [Step 4] Flashing all partitions...
+:: Step 3: Flash (SKIP erase-flash so NVS pairing token survives)
+echo [Step 3] Flashing all partitions...
 idf.py -p %COM_PORT% -B "%BUILD_DIR%" flash
 if errorlevel 1 (
     echo   ERROR: Flash failed^!
@@ -56,11 +67,13 @@ echo  Flash complete^!
 echo ========================================
 echo.
 
-:: Step 5: Open a plain serial listener (idf.py monitor is broken on Native USB-Serial-JTAG)
-echo [Step 5] Opening plain serial listener on %COM_PORT% @ 115200...
-echo   Reading from %COM_PORT% and writing to wqn.log.
-echo   Press Ctrl+C in this window to stop.
+:: Step 4: Open serial monitor (new window, won't close when deploy.bat exits)
+echo [Step 4] Opening serial monitor on %COM_PORT%...
+start "monitor_serial" cmd /c ""%~dp0scripts\monitor_serial.bat" %COM_PORT%"
+echo   Monitor opened in new window.
 echo.
+echo Deploy complete. You can close this window.
 
-python "%~dp0listen_usb.py" -p %COM_PORT% -b 115200 -o "%~dp0wqn.log"
-exit /b %ERRORLEVEL%
+:: Keep window open so user sees the result
+pause
+endlocal

@@ -210,6 +210,11 @@ esp_err_t InitWordApp(WordAppState* state)
         WordPackIndex index;
         const esp_err_t index_result = LoadWordPackIndex(&index);
         ApplyWordPackIndex(state, index, index.status_message);
+        // [target-fix] daily_target follows the actual pack size, not a
+        // hardcoded 20. BuildReviewQueue already covers the whole pack;
+        // this just makes the snapshot field consistent for any UI that
+        // reads it (progress_label already uses review_indices.size()).
+        state->daily_target = ClampUint16(state->pack_index.entries.size());
         if (index_result != ESP_OK) {
             ESP_LOGW(kTag, "load local word pack index failed: %s", esp_err_to_name(index_result));
         }
@@ -420,6 +425,9 @@ void ApplyWordPackIndex(WordAppState* state, const WordPackIndex& index, const s
     state->cloud_loaded_once = index.has_manifest;
     state->cloud_sync_failed = index.pack_error;
     state->cloud_sync_requested = !index.has_manifest || index.pack_error;
+    // [target-fix] Keep daily_target in sync with the actual pack size
+    // whenever the index is refreshed (initial load + cloud sync).
+    state->daily_target = ClampUint16(index.entries.size());
     state->message = !message.empty() ? message : index.status_message;
     if (state->message.empty()) {
         state->message = HasPackWords(*state) ? "词库已就绪" : "词库未同步";

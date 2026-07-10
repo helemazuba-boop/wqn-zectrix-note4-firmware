@@ -74,7 +74,7 @@
 #endif
 
 #ifndef WQN_FLASH_DEFAULT_INSTRUCTIONS
-#define WQN_FLASH_DEFAULT_INSTRUCTIONS "你是个人助理小云,请用可爱风格的方式回答用户的问题。"
+#define WQN_FLASH_DEFAULT_INSTRUCTIONS "你是一个乐于助人的AI助手。"
 #endif
 
 // Output sample rate is negotiated at session.update time; StepAudio Realtime

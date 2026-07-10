@@ -248,6 +248,7 @@ size_t AiSessionPageCount(const AiSessionState& ai);
 bool TickAiSession(UiState* state, int64_t now_ms);
 UiFrame RenderUiFrame(const UiState& state);
 void RequestForceFullRefresh();  // one-shot: next RenderUiFrame forces full refresh
+bool ConsumeForceFullRefresh();  // returns true if flag was set, then clears it
 const char* ReviewChoiceLabel(ReviewChoice choice);
 const char* ReviewChoiceStatus(ReviewChoice choice);
 

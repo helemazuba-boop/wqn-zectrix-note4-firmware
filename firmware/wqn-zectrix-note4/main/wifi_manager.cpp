@@ -132,12 +132,11 @@ void QueueReconnect()
         // 60-second backoff phase). Instead of ignoring the request, send it
         // a notification so it immediately breaks out of the backoff delay
         // and reconnects without waiting.
+        // [isr-fix] QueueReconnect is called from the WiFi event handler which
+        // runs in the event loop TASK, not an ISR. Using vTaskNotifyGiveFromISR
+        // here corrupts FreeRTOS scheduler state. Use the task-level API.
         if (g_reconnect_task_handle != nullptr) {
-            BaseType_t higher_priority_woken = pdFALSE;
-            vTaskNotifyGiveFromISR(g_reconnect_task_handle, &higher_priority_woken);
-            if (higher_priority_woken == pdTRUE) {
-                portYIELD_FROM_ISR();
-            }
+            xTaskNotifyGive(g_reconnect_task_handle);
         }
         return;
     }

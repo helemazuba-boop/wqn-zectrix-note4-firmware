@@ -225,7 +225,7 @@ esp_err_t WaitBusyTimeout(int timeout_ms)
         }
         vTaskDelay(pdMS_TO_TICKS(1));
     }
-    ESP_LOGI(kTag, "[BUSY-PROBE] OK to=%dms entry=%d exit=%d trans=%s first_trans_lvl=%d trans_at=%dms elapsed=%dms",
+    ESP_LOGD(kTag, "[BUSY-PROBE] OK to=%dms entry=%d exit=%d trans=%s first_trans_lvl=%d trans_at=%dms elapsed=%dms",
              timeout_ms, entry_level, static_cast<int>(gpio_get_level(kEpdBusy)),
              transition_seen ? "yes" : "no", first_transition_level,
              transition_seen ? static_cast<int>(pdTICKS_TO_MS(transition_tick - start)) : 0,
@@ -1265,7 +1265,7 @@ esp_err_t SendFramebufferToPanel(bool partial, bool hot_update)
             }
         }
         ESP_RETURN_ON_ERROR(WriteBytes(line, sizeof(line)), kTag, "write EPD line");
-        if ((y & 0x0F) == 0) {
+        if ((y & 0x3F) == 0) {
             vTaskDelay(1);
         }
     }
@@ -1332,7 +1332,7 @@ esp_err_t SendDirtyRectToPanel(const DirtyRect& rect)
             InterleavePreviousAndCurrent(previous[xb], src[xb], &line[xb * 2], &line[xb * 2 + 1]);
         }
         ESP_RETURN_ON_ERROR(WriteBytes(line, static_cast<size_t>(window_bytes * 2)), kTag, "write EPD partial line");
-        if ((y & 0x0F) == 0) {
+        if ((y & 0x3F) == 0) {
             vTaskDelay(1);
         }
     }
