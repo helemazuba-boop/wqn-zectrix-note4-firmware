@@ -64,6 +64,37 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
         return RefreshSchedule::kNone;
     }
 
+    if (state->settings.dialog == wqn::SettingsDialog::kVolume) {
+        if (short_press && event.button == wqn::ButtonId::kUp) {
+            if (state->settings.volume_selected == 0) {
+                return RefreshSchedule::kNone;
+            }
+            --state->settings.volume_selected;
+            return RefreshSchedule::kConfig;
+        }
+        if (short_press && event.button == wqn::ButtonId::kDownPower) {
+            if (state->settings.volume_selected + 1 >= kVolumeOptionsCount) {
+                return RefreshSchedule::kNone;
+            }
+            ++state->settings.volume_selected;
+            return RefreshSchedule::kConfig;
+        }
+        if (short_press && event.button == wqn::ButtonId::kConfirm) {
+            const int percent = kVolumeOptions[state->settings.volume_selected];
+            const esp_err_t result = wqn::SaveVolumePercent(percent);
+            if (result == ESP_OK) {
+                state->settings.volume_percent = percent;
+                state->settings.notice = "音量已保存：" + wqn::VolumeLabel(percent);
+            } else {
+                state->settings.notice = "音量保存失败";
+                ESP_LOGW(kTag, "save volume failed: %s", esp_err_to_name(result));
+            }
+            state->settings.dialog = wqn::SettingsDialog::kNone;
+            return RefreshSchedule::kConfig;
+        }
+        return RefreshSchedule::kNone;
+    }
+
     if (state->settings.dialog == wqn::SettingsDialog::kBattery ||
         state->settings.dialog == wqn::SettingsDialog::kStorage) {
         if (event.button == wqn::ButtonId::kConfirm && (short_press || long_press)) {
@@ -146,10 +177,13 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
             OpenSettingsDialog(state, wqn::SettingsDialog::kStorage);
             return RefreshSchedule::kConfig;
         case 4:
+            OpenSettingsDialog(state, wqn::SettingsDialog::kVolume);
+            return RefreshSchedule::kConfig;
+        case 5:
             UpdateSettingsDiagnostics(state);
             state->settings.notice = "固件 " + state->settings.diagnostics.firmware_version;
             return RefreshSchedule::kConfig;
-        case 5:
+        case 6:
             OpenSettingsDialog(state, wqn::SettingsDialog::kFactoryReset);
             return RefreshSchedule::kConfig;
         default:

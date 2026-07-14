@@ -13,8 +13,6 @@
 namespace device_ui_internal {
 
 constexpr char kTag[] = "wqn_ui";
-constexpr int kEpdTextWidth = wqn::kEpdWidth - 12;
-constexpr size_t kWrappedBodyMaxLines = 4;
 
 esp_err_t RenderFrameToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
 {
@@ -77,18 +75,18 @@ esp_err_t RenderFrameToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
         const int x = selected ? 6 : 0;
         if (line.style == wqn::UiTextStyle::kWrappedBody) {
             const std::vector<std::string> wrapped =
-                wqn::WrapUtf8TextToWidth(line.text, kEpdTextWidth - x, kWrappedBodyMaxLines);
+                wqn::WrapUtf8TextToWidth(line.text, kTextWidth - x, kMaxWrapLines);
             for (const std::string& wrapped_line : wrapped) {
                 if (y > wqn::kEpdHeight - 12) {
                     break;
                 }
                 ESP_RETURN_ON_ERROR(wqn::DrawUtf8Text(x, y, wrapped_line.c_str(), true), kTag, "draw UI wrapped line");
-                y += 18;
+                y += kCjkLineHeight;
             }
         } else {
             const std::string text = LimitForEpd(line.text);
             ESP_RETURN_ON_ERROR(wqn::DrawUtf8Text(x, y, text.c_str(), true), kTag, "draw UI line");
-            y += 18;
+            y += kCjkLineHeight;
         }
     }
 

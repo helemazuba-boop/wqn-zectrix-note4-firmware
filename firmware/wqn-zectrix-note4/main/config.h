@@ -74,20 +74,20 @@
 #endif
 
 #ifndef WQN_FLASH_DEFAULT_INSTRUCTIONS
-#define WQN_FLASH_DEFAULT_INSTRUCTIONS "你是一个乐于助人的AI助手。"
+#define WQN_FLASH_DEFAULT_INSTRUCTIONS "你是WQN中的学习助手，使用简要的中文回答用户问题"
 #endif
 
 // Output sample rate is negotiated at session.update time; StepAudio Realtime
-// is native 24 kHz, but the I2S duplex path runs at 16 kHz (shared BCLK/WS
-// with the microphone capture). Requesting 16 kHz from the proxy avoids a
-// firmware-side resampler — the proxy (or StepFun) downmixes to 16 kHz.
+// is native 24 kHz. The I2S duplex path also runs at 24 kHz (shared BCLK/WS
+// with the microphone capture), so no firmware-side resampler is needed -
+// the proxy forwards 24 kHz PCM verbatim in both directions.
 #ifndef WQN_FLASH_OUTPUT_SAMPLE_RATE_HZ
-#define WQN_FLASH_OUTPUT_SAMPLE_RATE_HZ 16000
+#define WQN_FLASH_OUTPUT_SAMPLE_RATE_HZ 24000
 #endif
 
-// Upstream audio chunk (480 B = 240 frames @ 16 kHz = 15 ms).
+// Upstream audio chunk (720 B = 360 frames @ 24 kHz = 15 ms).
 #ifndef WQN_FLASH_AUDIO_CHUNK_FRAMES
-#define WQN_FLASH_AUDIO_CHUNK_FRAMES 240
+#define WQN_FLASH_AUDIO_CHUNK_FRAMES 360
 #endif
 #ifndef WQN_FLASH_AUDIO_CHUNK_BYTES
 #define WQN_FLASH_AUDIO_CHUNK_BYTES (WQN_FLASH_AUDIO_CHUNK_FRAMES * 2)

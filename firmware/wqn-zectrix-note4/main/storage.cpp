@@ -735,6 +735,80 @@ std::string AutoSyncIntervalLabel(uint32_t minutes)
     }
 }
 
+// [hw-volume] Global playback volume (0-100%). Persisted in the "audio"
+// namespace as "output_volume" (i32) to match the original closed-source
+// firmware, so the setting survives a firmware swap. Read also accepts u8 in
+// case the blob was written that way. A process-wide cache backs
+// GetPlaybackVolumePercent() so the audio path never touches flash; the level
+// is applied to ES8311 DAC registers (0x32/0x31) during codec init.
+constexpr int kVolumeDefaultPercent = 100;
+constexpr const char* kAudioNamespace = "audio";
+constexpr const char* kVolumeNvsKey = "output_volume";
+int g_volume_percent_cache = kVolumeDefaultPercent;
+
+esp_err_t LoadVolumePercent(int* percent)
+{
+    if (percent == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    int v = kVolumeDefaultPercent;
+    nvs_handle_t h = 0;
+    esp_err_t ret = nvs_open(kAudioNamespace, NVS_READONLY, &h);
+    if (ret == ESP_OK) {
+        int32_t i32v = 0;
+        esp_err_t gr = nvs_get_i32(h, kVolumeNvsKey, &i32v);
+        if (gr == ESP_ERR_NVS_TYPE_MISMATCH) {
+            // Origin firmware may have stored it as u8.
+            uint8_t u8v = 0;
+            gr = nvs_get_u8(h, kVolumeNvsKey, &u8v);
+            if (gr == ESP_OK) v = static_cast<int>(u8v);
+        } else if (gr == ESP_OK) {
+            v = static_cast<int>(i32v);
+        }
+        nvs_close(h);
+    } else if (ret == ESP_ERR_NVS_NOT_FOUND) {
+        // Namespace doesn't exist yet (first boot) - use default.
+        ret = ESP_OK;
+    }
+    if (v < 0) v = 0;
+    if (v > 100) v = 100;
+    *percent = v;
+    g_volume_percent_cache = v;
+    return ret;
+}
+
+esp_err_t SaveVolumePercent(int percent)
+{
+    if (percent < 0 || percent > 100) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    g_volume_percent_cache = percent;
+    nvs_handle_t h = 0;
+    esp_err_t ret = nvs_open(kAudioNamespace, NVS_READWRITE, &h);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    ret = nvs_set_i32(h, kVolumeNvsKey, static_cast<int32_t>(percent));
+    if (ret == ESP_OK) {
+        ret = nvs_commit(h);
+    }
+    nvs_close(h);
+    return ret;
+}
+
+std::string VolumeLabel(int percent)
+{
+    if (percent <= 0) {
+        return "静音";
+    }
+    return std::to_string(percent) + "%";
+}
+
+int GetPlaybackVolumePercent()
+{
+    return g_volume_percent_cache;
+}
+
 esp_err_t FactoryResetNvsAndRestart()
 {
     ESP_LOGW(kTag, "factory reset requested: erasing NVS and restarting");

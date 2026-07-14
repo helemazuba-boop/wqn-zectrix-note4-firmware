@@ -259,27 +259,35 @@ esp_err_t StartWifiWithCredentials(const char* ssid, const char* password)
     if (g_initialized) {
         ESP_LOGI(kTag, "WiFi already initialized, switching to new credentials");
         ESP_RETURN_ON_ERROR(esp_wifi_disconnect(), kTag, "disconnect before reconfigure");
+        // [reconfig-fix] delete old event group to avoid leak on recreate below
+        if (g_wifi_event_group != nullptr) {
+            vEventGroupDelete(g_wifi_event_group);
+            g_wifi_event_group = nullptr;
+        }
+    } else {
+        // [reconfig-fix] first-time-only init. esp_netif_init/esp_wifi_init
+        // return INVALID_STATE on second call; esp_netif_create_default_wifi_sta
+        // would leak a duplicate netif. Reconfigs skip this block.
+        ESP_RETURN_ON_ERROR(esp_netif_init(), kTag, "init esp-netif");
+        esp_err_t event_loop_result = esp_event_loop_create_default();
+        if (event_loop_result != ESP_OK && event_loop_result != ESP_ERR_INVALID_STATE) {
+            ESP_RETURN_ON_ERROR(event_loop_result, kTag, "create default event loop");
+        }
+        if (esp_netif_create_default_wifi_sta() == nullptr) {
+            return ESP_ERR_NO_MEM;
+        }
+        wifi_init_config_t init_config = WIFI_INIT_CONFIG_DEFAULT();
+        ESP_RETURN_ON_ERROR(esp_wifi_init(&init_config), kTag, "init WiFi");
+        ESP_RETURN_ON_ERROR(RegisterHandlers(), kTag, "register WiFi handlers");
+        ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_STA), kTag, "set WiFi STA mode");
     }
 
-    g_wifi_event_group = xEventGroupCreate();
     if (g_wifi_event_group == nullptr) {
-        return ESP_ERR_NO_MEM;
+        g_wifi_event_group = xEventGroupCreate();
+        if (g_wifi_event_group == nullptr) {
+            return ESP_ERR_NO_MEM;
+        }
     }
-
-    ESP_RETURN_ON_ERROR(esp_netif_init(), kTag, "init esp-netif");
-    esp_err_t event_loop_result = esp_event_loop_create_default();
-    if (event_loop_result != ESP_OK && event_loop_result != ESP_ERR_INVALID_STATE) {
-        ESP_RETURN_ON_ERROR(event_loop_result, kTag, "create default event loop");
-    }
-
-    if (esp_netif_create_default_wifi_sta() == nullptr) {
-        return ESP_ERR_NO_MEM;
-    }
-
-    wifi_init_config_t init_config = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_RETURN_ON_ERROR(esp_wifi_init(&init_config), kTag, "init WiFi");
-    ESP_RETURN_ON_ERROR(RegisterHandlers(), kTag, "register WiFi handlers");
-    ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_STA), kTag, "set WiFi STA mode");
 
     wifi_config_t wifi_config = {};
     std::strncpy(reinterpret_cast<char*>(wifi_config.sta.ssid), ssid, sizeof(wifi_config.sta.ssid) - 1);

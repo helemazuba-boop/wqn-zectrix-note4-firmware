@@ -576,6 +576,7 @@ esp_err_t StartSoftAp()
     ESP_LOGI(kTag, "SoftAP started: SSID=%s IP=" IPSTR, ap_ssid, IP2STR(&softap_ip.ip));
 
     TaskHandle_t dns_task = nullptr;
+    uint32_t* dns_task_arg = new uint32_t(softap_ip.ip.addr);
     xTaskCreatePinnedToCore(
         [](void* arg) {
             const uint32_t esp_ip = *static_cast<uint32_t*>(arg);
@@ -635,12 +636,16 @@ esp_err_t StartSoftAp()
                 response[3] = flags[1];
                 response[4] = question_count[0];
                 response[5] = question_count[1];
-                response[6] = authority[0];
-                response[7] = authority[1];
-                response[8] = authority[2];
-                response[9] = authority[3];
-                response[10] = answer_count[0];
-                response[11] = answer_count[1];
+                // [dns-fix] Correct DNS header field mapping: bytes 6-7 =
+                // ANCOUNT (answer count), 8-9 = NSCOUNT (authority), 10-11 =
+                // ARCOUNT (additional). Was swapped -> ANCOUNT=0 so phones
+                // dropped the response and never popped the captive portal.
+                response[6] = answer_count[0];
+                response[7] = answer_count[1];
+                response[8] = authority[0];
+                response[9] = authority[1];
+                response[10] = authority[2];
+                response[11] = authority[3];
 
                 int resp_len = n;
                 uint8_t* ptr = response + n;
@@ -669,7 +674,11 @@ esp_err_t StartSoftAp()
             close(sock);
             vTaskDelete(nullptr);
         },
-        "wqn_dns", 8192, new uint32_t(softap_ip.ip.addr), 1, &dns_task, 1);
+        "wqn_dns", 8192, dns_task_arg, 1, &dns_task, 1);
+    if (dns_task == nullptr) {
+        delete dns_task_arg;  // [leak-fix] free arg on task create failure (lambda only deletes on success)
+        ESP_LOGW(kTag, "DNS proxy task create failed");
+    }
 
     return ESP_OK;
 }

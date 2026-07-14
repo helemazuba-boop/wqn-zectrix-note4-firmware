@@ -62,6 +62,21 @@ void DrawSegment(int x, int y, int width, int height)
     FillRect(x, y, width, height, true);
 }
 
+// [L3-semantics] Named wrappers for FillRect(..., black=true) so the 4 distinct
+// intents of "black fill" are retrievable at call sites. L2 will migrate the
+// existing FillRect(true) callers (selection / progress / role bar / activity
+// dot) to these. See docs/13-ui-design-language.md §13.4.6.
+void DrawSelectedFill(int x, int y, int width, int height) { FillRect(x, y, width, height, true); }  // reverse-fill selection
+void DrawProgressFill(int x, int y, int width, int height) { FillRect(x, y, width, height, true); }  // progress bar fill
+void DrawRoleBar(int x, int y, int width, int height) { FillRect(x, y, width, height, true); }       // role marker bar (AI assistant)
+void DrawActivityDot(int x, int y, int size) { FillRect(x, y, size, size, true); }                    // activity indicator dot
+
+// [L3-doc] RefreshRegion/RefreshStableRegion: the UiRect is logged + feeds
+// FrameSignature dedup, but the actual refresh scope is decided by
+// RefreshEpdFull's internal FindDirtyRect (dirty bits vs g_previous_framebuffer).
+// Passing a region does NOT hard-clip the panel refresh to that rect; callers
+// should treat this as "request a refresh, hint at what changed". True
+// region-constrained local refresh is deferred to L4.
 esp_err_t RefreshRegion(const UiRect& rect, RefreshSchedule schedule)
 {
     ESP_LOGI(
@@ -112,7 +127,8 @@ esp_err_t RefreshFrame(const wqn::UiFrame& frame, RefreshSchedule schedule)
     //   when nothing changed.
     const bool force_full_refresh =
         frame.screen != g_last_rendered_screen ||
-        schedule == RefreshSchedule::kCommit;
+        schedule == RefreshSchedule::kCommit ||
+        frame.prefer_full_refresh;  // [full-refresh-fix] honor producer's full-refresh request (was dead code -> ghosting on tier switch / provision exit)
     if (frame.screen != g_last_rendered_screen) {
         ESP_LOGI(kTag, "EPD: screen change detected (%d -> %d), forcing full refresh",
                  static_cast<int>(g_last_rendered_screen), static_cast<int>(frame.screen));

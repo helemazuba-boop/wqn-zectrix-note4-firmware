@@ -29,6 +29,16 @@ size_t AutoSyncOptionIndex(uint32_t minutes)
     return 0;
 }
 
+size_t VolumeOptionIndex(int percent)
+{
+    for (size_t i = 0; i < kVolumeOptionsCount; ++i) {
+        if (kVolumeOptions[i] == percent) {
+            return i;
+        }
+    }
+    return kVolumeOptionsCount - 1;  // default to max volume
+}
+
 std::string OnlineSyncStatusLabel(const char* status)
 {
     if (status == nullptr || status[0] == '\0') {
@@ -78,6 +88,15 @@ void UpdateSettingsDiagnostics(wqn::UiState* state)
     } else {
         state->settings.auto_sync_interval_min = 0;
         state->settings.auto_sync_selected = 0;
+    }
+
+    int volume_percent = 100;
+    if (wqn::LoadVolumePercent(&volume_percent) == ESP_OK) {
+        state->settings.volume_percent = volume_percent;
+        state->settings.volume_selected = VolumeOptionIndex(volume_percent);
+    } else {
+        state->settings.volume_percent = 100;
+        state->settings.volume_selected = VolumeOptionIndex(100);
     }
 
     wqn::SettingsDiagnosticsSnapshot& snapshot = state->settings.diagnostics;

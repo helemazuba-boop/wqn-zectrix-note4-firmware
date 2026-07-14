@@ -28,6 +28,8 @@
 #include "online_sync.h"
 #include "esp_timer.h"
 #include "power_manager.h"
+#include "ui_layout.h"
+#include "typography.h"
 
 namespace device_ui_internal {
 
@@ -70,11 +72,14 @@ constexpr TickType_t kSelectionRefreshDelay = pdMS_TO_TICKS(180);
 constexpr TickType_t kConfigRefreshDelay = pdMS_TO_TICKS(120);
 constexpr TickType_t kAiRefreshDelay = pdMS_TO_TICKS(120);
 
-constexpr size_t kSettingsItemCount = 6;
+constexpr size_t kSettingsItemCount = 7;
 constexpr uint32_t kAutoSyncOptions[] = {0, 15, 30, 60, 240};
 constexpr std::size_t kAutoSyncOptionsCount = sizeof(kAutoSyncOptions) / sizeof(kAutoSyncOptions[0]);
+constexpr int kVolumeOptions[] = {0, 25, 50, 75, 100};
+constexpr std::size_t kVolumeOptionsCount = sizeof(kVolumeOptions) / sizeof(kVolumeOptions[0]);
 
-constexpr UiRect kStatusBarRect = {0, 0, wqn::kEpdWidth, 30, "status-bar"};
+// kStatusBarRect removed: dead constant (height 30 was never referenced).
+// Use kStatusBarHeight / kStatusBarDividerY in ui_layout.h instead.
 constexpr UiRect kHomePrimaryRect = {8, 33, 384, 31, "home-primary-time"};
 constexpr UiRect kTimeStandbyRect = {0, 42, wqn::kEpdWidth, 172, "time-standby"};
 constexpr UiRect kTimerRunRect = {0, 58, wqn::kEpdWidth, 186, "timer-run"};
@@ -104,6 +109,7 @@ void CheckLowBatteryProtection(const BatteryReading* reading);
 void CheckBatteryProtection();
 
 size_t AutoSyncOptionIndex(uint32_t minutes);
+size_t VolumeOptionIndex(int percent);
 std::string OnlineSyncStatusLabel(const char* status);
 std::string BytesLabel(size_t bytes);
 void UpdateSettingsDiagnostics(wqn::UiState* state);
@@ -244,6 +250,11 @@ void DrawRect(int x, int y, int width, int height);
 void FillRect(int x, int y, int width, int height, bool black);
 void ClearRect(const UiRect& rect);
 void DrawSegment(int x, int y, int width, int height);
+// [L3-semantics] Named black-fill wrappers (defined in graphics.cpp). L2 migrates call sites.
+void DrawSelectedFill(int x, int y, int width, int height);
+void DrawProgressFill(int x, int y, int width, int height);
+void DrawRoleBar(int x, int y, int width, int height);
+void DrawActivityDot(int x, int y, int size);
 esp_err_t RefreshRegion(const UiRect& rect, RefreshSchedule schedule);
 esp_err_t RefreshStableRegion(const UiRect& rect, RefreshSchedule schedule);
 esp_err_t RefreshFrame(const wqn::UiFrame& frame, RefreshSchedule schedule);

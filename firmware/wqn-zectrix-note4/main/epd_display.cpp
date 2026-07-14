@@ -12,7 +12,7 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "lvgl/lvgl.h"
+#include "font_fmt.h"
 #include "sdkconfig.h"
 
 namespace wqn {
@@ -56,6 +56,15 @@ constexpr int kCjkLineHeight = 18;
 constexpr int kCjkFallbackWidth = 16;
 constexpr int kCjkFontHeight = 16;
 constexpr int kCjkFontBaseLine = 2;
+
+// [L3-baseline] Vertical offset for 5x7 ASCII glyphs in DrawUtf8Text so the
+// ASCII baseline aligns with the CJK baseline. CJK baseline sits at
+// y + (kCjkFontHeight - kCjkFontBaseLine) = y + 14. This 5x7 font has no
+// descenders ('A' legs and 'g'/'p'/'y' tails all end on row 6 = the baseline),
+// so ASCII baseline = glyph top + (kTextGlyphHeight - 1) = top + 6, and the
+// top must be at y + 14 - 6 = 8. Replaces the hard-coded +5 that left ASCII
+// ~3px above the CJK baseline in mixed lines like "WiFi 已连接".
+constexpr int kAsciiBaselineOffset = (kCjkFontHeight - kCjkFontBaseLine) - (kTextGlyphHeight - 1);  // = 8
 
 spi_device_handle_t g_spi = nullptr;
 uint8_t* g_framebuffer = nullptr;
@@ -993,27 +1002,6 @@ void DrawEpdPixel(int x, int y, bool black)
     }
 }
 
-esp_err_t DrawAsciiText(int x, int y, const char* text, bool black)
-{
-    ESP_RETURN_ON_FALSE(g_framebuffer != nullptr, ESP_ERR_INVALID_STATE, kTag, "EPD framebuffer not allocated");
-    ESP_RETURN_ON_FALSE(text != nullptr, ESP_ERR_INVALID_ARG, kTag, "text is null");
-
-    int cursor_x = x;
-    for (const unsigned char* p = reinterpret_cast<const unsigned char*>(text); *p != '\0'; ++p) {
-        if (*p == '\n') {
-            y += kTextLineHeight;
-            cursor_x = x;
-            continue;
-        }
-        DrawGlyph(cursor_x, y, *p, black);
-        cursor_x += kTextCellWidth;
-        if (cursor_x >= kEpdWidth) {
-            break;
-        }
-    }
-    return ESP_OK;
-}
-
 esp_err_t DrawUtf8Text(int x, int y, const char* text, bool black)
 {
     ESP_RETURN_ON_FALSE(g_framebuffer != nullptr, ESP_ERR_INVALID_STATE, kTag, "EPD framebuffer not allocated");
@@ -1047,7 +1035,7 @@ esp_err_t DrawUtf8Text(int x, int y, const char* text, bool black)
         }
 
         if (codepoint >= 0x20 && codepoint <= 0x7E) {
-            DrawGlyph(cursor_x, cursor_y + 5, static_cast<unsigned char>(codepoint), black);
+            DrawGlyph(cursor_x, cursor_y + kAsciiBaselineOffset, static_cast<unsigned char>(codepoint), black);
         } else {
             DrawCjkGlyph(cursor_x, cursor_y, codepoint, black);
         }
@@ -1172,17 +1160,6 @@ std::vector<std::string> WrapUtf8TextToWidth(const std::string& text, int max_wi
         lines.push_back(line);
     }
     return lines;
-}
-
-esp_err_t DrawSimpleText(int x, int y, const char* text)
-{
-    return DrawUtf8Text(x, y, text, true);
-}
-
-esp_err_t DrawTextLine(int line, const char* text, bool black)
-{
-    ESP_RETURN_ON_FALSE(line >= 0, ESP_ERR_INVALID_ARG, kTag, "negative text line");
-    return DrawUtf8Text(0, line * kCjkLineHeight, text, black);
 }
 
 namespace {

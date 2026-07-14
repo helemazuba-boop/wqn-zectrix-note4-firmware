@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cmath>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -29,6 +30,7 @@
 #include "freertos/task.h"
 #include "power_manager.h"
 #include "storage.h"
+#include "audio_volume.h"
 #include "wifi_manager.h"
 
 namespace {
@@ -53,7 +55,7 @@ void HandleV2DownlinkAudio(const uint8_t* data, size_t len,
 //                  [u16 version    = 2]
 //                  [u16 flags      = 0x0001 stream | 0x0002 final]
 //                  [u32 seq        = monotonic per session]
-//                  [u32 sample_rate= 16000]
+//                  [u32 sample_rate= 24000]
 //                  [u32 channels   = 1]
 //                  [u32 reserved   = 0]
 //                  [audio bytes ...]
@@ -80,8 +82,8 @@ constexpr char kWsUri[] = "wss://wqn.helema.cn/v1/realtime?model=stepaudio-2.5-r
 constexpr char kDefaultVoice[] = "qingchunshaonv";
 #endif
 
-constexpr int kSampleRate = 16000;
-constexpr int kChunkFrames = 240;
+constexpr int kSampleRate = 24000;
+constexpr int kChunkFrames = 360;
 constexpr int kChunkBytes = kChunkFrames * 2;
 constexpr int kChunkIntervalMs = 15;
 
@@ -105,6 +107,7 @@ struct FlashState {
     bool ws_connected = false;
     std::string user_transcript;
     std::string assistant_text;
+    std::string thinking_text;  // [thinking] rolling摘要 of response.thinking.delta (capped at 200 chars)
     std::string pending_text;
     std::string tool_label;
     std::string error_message;
@@ -121,12 +124,29 @@ struct FlashState {
     i2s_chan_handle_t stream_tx = nullptr;  // duplex TX for audio playback
     i2c_master_bus_handle_t stream_i2c_bus = nullptr;
     bool stream_audio_powered = false;
-    // [amp-fix] amp is opened lazily on the first playback write and closed via
-    // an idle-tail timer (or synchronously on release / stop / cleanup).
+    // The playback task keeps this true for the entire blocking I2S write.
+    // The amp idle timer may only turn GPIO46 off after the write has returned
+    // and the queued PCM count has reached zero.
+    bool playback_write_active = false;
+    bool playback_abort_requested = false;
     int64_t amp_idle_due_ms = 0;
     bool amp_idle_armed = false;
     // v2 uplink frame counter
     uint32_t uplink_seq = 0;
+    // [barge-fix] uplink_seq snapshot at PTT press. If unchanged on release,
+    // the user tapped too fast (<250ms) for the streaming task to capture any
+    // audio -> skip the empty final frame, which would otherwise trigger a
+    // commit + response.create that collides with the barge-in response.cancel
+    // (causes interleaved/serial replies + "append is not called" error).
+    uint32_t capture_base_seq = 0;
+    // [inflight-fix] True after we send a turn-end frame (commit+create) and
+    // until response.done/error arrives. Guards against:
+    //  - barge-in sending response.cancel when no response is in-flight
+    //    ("no ongoing response to cancel")
+    //  - a second turn-end while the prior response is still generating
+    //    ("ongoing response already exists")
+    // Ref: ElatoAI/xiaozhi track response state to avoid these races.
+    bool response_in_flight = false;
     // v2 downlink binary frame reassembly buffer
     std::string audio_reassembly_buf;
     // [playback-fix] Decouple I2S writes from the WebSocket event task.
@@ -154,6 +174,7 @@ void SetErrorLocked(const std::string& message)
     g_flash.status = InternalStatus::kError;
     g_flash.pending_text.clear();
     g_flash.error_message = message;
+    g_flash.response_in_flight = false;  // [inflight-fix] error ends any in-flight response
     g_flash.status_since_ms = esp_timer_get_time() / 1000;
     MarkChanged();
 }
@@ -199,7 +220,7 @@ struct AudioFrameHeader {
     uint16_t version;      // 2
     uint16_t flags;        // bit 0: streaming, bit 1: end-of-turn
     uint32_t seq;
-    uint32_t sample_rate;  // 16000
+    uint32_t sample_rate;  // 24000
     uint32_t channels;     // 1
     uint32_t reserved;     // 0
 };
@@ -310,15 +331,17 @@ constexpr gpio_num_t kStreamCodecScl = GPIO_NUM_48;
 constexpr i2c_port_num_t kStreamCodecI2cPort = I2C_NUM_0;
 constexpr uint8_t kStreamEs8311Address = 0x18;
 constexpr uint32_t kStreamDmaFrameNum = 256;
-constexpr int kStreamChunkFrames = 240;    // 15 ms at 16 kHz
+constexpr int kStreamChunkFrames = 360;    // 15 ms at 24 kHz
 constexpr int kStreamChunkBytes = kStreamChunkFrames * 2;  // 16-bit mono
 constexpr int64_t kAmpIdleTailMs = 600;    // turn amp off this long after last audio-delta write
 
 // [playback-fix] FreeRTOS ringbuffer for decoded downlink PCM. Sized for
-// ~1.5 s of 24 kHz mono audio = 72000 bytes. Byte-mode ringbuffer is required
-// so we can carry an arbitrary byte slice (the v2 downlink frames arrive in
-// 24-byte-header + variable-length PCM chunks).
-constexpr size_t kPlaybackRingbufBytes = 72000;
+// ~11 s of 24 kHz mono audio = 524288 bytes (512 KB). Cloud TTS (StepFun)
+// generates faster than realtime (~3-4x); this buffer absorbs burst delivery
+// while the DAC plays at 1x. ESP32-S3 has 8 MB PSRAM — 256 KB is safe.
+// Byte-mode ringbuffer is required so we can carry an arbitrary byte slice
+// (the v2 downlink frames arrive in 24-byte-header + variable-length PCM chunks).
+constexpr size_t kPlaybackRingbufBytes = 524288;
 constexpr size_t kPlaybackRingbufItemMax = 4096;  // matches an average downlink chunk
 
 constexpr uint8_t ES8311_REG_RESET = 0x00;
@@ -356,11 +379,11 @@ esp_err_t ReadEs8311Reg(i2c_master_dev_handle_t dev, uint8_t reg, uint8_t* value
     return i2c_master_transmit_receive(dev, &reg, 1, value, 1, pdMS_TO_TICKS(100));
 }
 
-void SetStreamAudioPower(bool enabled)
+void SetStreamAudioPower(bool /*enabled*/)
 {
-    gpio_hold_dis(kStreamAudioPower);
-    gpio_set_level(kStreamAudioPower, enabled ? 1 : 0);
-    gpio_hold_en(kStreamAudioPower);
+    // [inflight-fix] GPIO42 (codec power) is boot-常通 - do not toggle.
+    // Mirrors xiaozhi/Zectrix closed firmware. (Was causing pop + cold-start
+    // recording garbage from frequent power cycling.)
 }
 
 // [amp-fix] Was: amp was hard-tied to power and forced off, so response.audio.delta
@@ -376,27 +399,25 @@ void SetStreamAudioAmp(bool enabled)
     gpio_hold_en(kStreamAudioAmp);
 }
 
-// Check whether the idle tail has expired and turn the amp off if so. Cheap
-// enough to call from the UI loop on every poll. Safe to call when flash is
-// idle (no-op).
+// Turn the amp off only after physical playback has finished and its idle tail
+// has elapsed. Server response completion is not a playback-completion signal.
 void CheckAmpIdleTail()
 {
     if (g_flash.mutex == nullptr) {
         return;
     }
-    bool should_off = false;
     xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
     if (g_flash.amp_idle_armed) {
         const int64_t now_ms = esp_timer_get_time() / 1000;
-        if (now_ms >= g_flash.amp_idle_due_ms) {
+        const bool queue_empty =
+            g_flash.playback_queued_bytes.load(std::memory_order_acquire) == 0;
+        if (!g_flash.playback_write_active && queue_empty &&
+            now_ms >= g_flash.amp_idle_due_ms) {
             g_flash.amp_idle_armed = false;
-            should_off = true;
+            SetStreamAudioAmp(false);
         }
     }
     xSemaphoreGive(g_flash.mutex);
-    if (should_off) {
-        SetStreamAudioAmp(false);
-    }
 }
 
 // [playback-fix] Decode PCM (mono s16le) into the playback ringbuffer.
@@ -437,11 +458,15 @@ bool EnqueuePlaybackPcm(const uint8_t* pcm, size_t bytes)
 // immediately and the next response starts from silence.
 void DrainPlaybackRingbuf()
 {
-    // [drain-fix] Don't call xRingbufferReceive from the UI task - FreeRTOS
-    // ringbuffers are single-consumer and FlashPlaybackTask (Core 1) is the
-    // only legitimate receiver. Instead, set a flag that the playback task
-    // checks at the top of its loop; it will discard all queued items itself.
-    g_flash.drain_playback.store(true, std::memory_order_relaxed);
+    // The playback task is the only ringbuffer consumer. Request a drain and
+    // remember that any write currently returning must not re-arm the PA tail.
+    g_flash.drain_playback.store(true, std::memory_order_release);
+    if (g_flash.mutex != nullptr) {
+        xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+        g_flash.playback_abort_requested = true;
+        g_flash.amp_idle_armed = false;
+        xSemaphoreGive(g_flash.mutex);
+    }
 }
 
 // [playback-fix] Independent FreeRTOS task that drains the ringbuffer and
@@ -453,14 +478,14 @@ void FlashPlaybackTask(void* /*param*/)
     std::vector<int16_t> stereo;  // reused scratch buffer
     while (true) {
         size_t item_size = 0;
-        char* item = static_cast<char*>(
-            xRingbufferReceive(g_flash.playback_ringbuf, &item_size, portMAX_DELAY));
+        char* item = static_cast<char*>(xRingbufferReceiveUpTo(
+            g_flash.playback_ringbuf, &item_size, portMAX_DELAY,
+            kPlaybackRingbufItemMax));
         if (item == nullptr) {
             continue;
         }
-        // [drain-fix] Check the drain flag before processing any item. The UI
-        // task sets this to request "drop all queued audio" (barge-in). We
-        // spin through the ringbuffer here as the single legitimate consumer.
+        // If playback was explicitly interrupted, do not leave the PA state
+        // marked active while discarding the current and queued PCM.
         if (g_flash.drain_playback.load(std::memory_order_relaxed)) {
             size_t drain_size = 0;
             char* drain_item = nullptr;
@@ -468,57 +493,146 @@ void FlashPlaybackTask(void* /*param*/)
                            g_flash.playback_ringbuf, &drain_size, 0))) != nullptr) {
                 vRingbufferReturnItem(g_flash.playback_ringbuf, drain_item);
             }
-            g_flash.playback_queued_bytes.store(0, std::memory_order_relaxed);
+            g_flash.playback_queued_bytes.store(0, std::memory_order_release);
             g_flash.drain_playback.store(false, std::memory_order_relaxed);
-            // Also discard the item we just received - it's part of the drain.
+            xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+            g_flash.playback_write_active = false;
+            g_flash.playback_abort_requested = false;
+            g_flash.amp_idle_armed = false;
+            xSemaphoreGive(g_flash.mutex);
+            // Also discard the item we just received - it is part of the drain.
             vRingbufferReturnItem(g_flash.playback_ringbuf, item);
             continue;
         }
 
-        // Silence-fill small items so I2S DMA does not underrun; this also
-        // preserves mono->stereo alignment if the proxy delivered a sub-frame.
-        const size_t sample_count = item_size / 2;
+        const size_t sample_count = item_size / sizeof(int16_t);
         const int16_t* mono = reinterpret_cast<const int16_t*>(item);
 
+        // [tts-diag] Downlink PCM level (mirrors uplink pcm diag). If max is
+        // full-scale (~32767) -> noisy source data (StepFun content issue). If
+        // speech level (few thousand) -> data OK (points to ES8311 analog domain).
+        static int downlink_diag_counter = 0;
+        if (downlink_diag_counter++ % 10 == 0) {
+            int16_t max_sample = 0;
+            int64_t sum_sq = 0;
+            for (size_t i = 0; i < sample_count; ++i) {
+                int16_t s = mono[i];
+                int16_t a = s < 0 ? static_cast<int16_t>(-s) : s;
+                if (a > max_sample) max_sample = a;
+                sum_sq += static_cast<int64_t>(s) * s;
+            }
+            int32_t rms = sample_count > 0
+                ? static_cast<int32_t>(std::sqrt(static_cast<double>(sum_sq) / sample_count))
+                : 0;
+            // max=peak, rms=energy. rms/max>0.5 -> noisy data (StepFun content).
+            // rms/max<0.3 -> clean speech (DAC analog issue).
+            ESP_LOGI(kTag, "downlink pcm diag: frames=%u max=%d rms=%d",
+                     static_cast<unsigned>(sample_count), max_sample, rms);
+        }
+
         if (g_flash.stream_tx == nullptr) {
-            // [busyloop-fix] Was: vRingbufferReturnItem + continue with no
-            // delay. If ringbuffer had data and stream_tx was null (e.g. I2S
-            // not yet initialized or already cleaned up), this spun at 100%
-            // CPU on Core 1. Add a short delay to yield.
+            // PCM cannot be played until the duplex TX channel exists. Put the
+            // block back after a short delay instead of dropping response audio
+            // during first-turn codec/I2S initialization.
             vRingbufferReturnItem(g_flash.playback_ringbuf, item);
             vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
 
-        // Cheap piggyback: extend the amp idle tail so consecutive chunks
-        // within the same turn don't toggle the speaker off between frames.
+        // Mark the full blocking write as active before opening the PA. Do not
+        // start the idle tail yet: a byte-buffer receive can represent much more
+        // than 600 ms of PCM, and another task must not close GPIO46 mid-write.
         {
             xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
-            g_flash.amp_idle_armed = true;
-            g_flash.amp_idle_due_ms = esp_timer_get_time() / 1000 + kAmpIdleTailMs;
+            if (g_flash.playback_abort_requested ||
+                g_flash.drain_playback.load(std::memory_order_acquire)) {
+                g_flash.playback_write_active = false;
+                g_flash.amp_idle_armed = false;
+                xSemaphoreGive(g_flash.mutex);
+                vRingbufferReturnItem(g_flash.playback_ringbuf, item);
+                continue;
+            }
+            g_flash.playback_write_active = true;
+            g_flash.amp_idle_armed = false;
             xSemaphoreGive(g_flash.mutex);
         }
         SetStreamAudioAmp(true);
 
+        // [hw-volume] PCM sent at 100% - volume is the ES8311 DAC register
+        // (0x32/0x31) set during InitStreamEs8311Adc, not software scaling
+        // (which ruined SNR + quantization + log feel).
         stereo.resize(sample_count * 2);
         for (size_t i = 0; i < sample_count; ++i) {
             stereo[i * 2] = mono[i];
             stereo[i * 2 + 1] = mono[i];
         }
-        size_t written = 0;
-        // pdMS_TO_TICKS(50) — same grace window as before. With the ringbuffer
-        // decoupled, a slow i2s write here no longer stalls the WS event task;
-        // it just queues more PCM in the ringbuffer (or drops newest bytes).
-        i2s_channel_write(g_flash.stream_tx, stereo.data(),
-                          stereo.size() * sizeof(int16_t), &written,
-                          pdMS_TO_TICKS(50));
+        // [underrun-fix] portMAX_DELAY + drain loop: never drop samples. The
+        // old pdMS_TO_TICKS(50) timed out when DMA was full + EPD/network
+        // stole CPU, and we ignored `written` < requested -> periodic sample
+        // gaps = the "train-brake" whine. portMAX_DELAY lets the I2S driver
+        // self-pace to the audio clock (absorbs cloud<->ESP32 16kHz drift),
+        // and we loop until the whole stereo frame is written. On stop the
+        // channel is disabled, which makes a blocked write return
+        // ESP_ERR_INVALID_STATE so we break out. (Ref: xiaozhi-esp32
+        // esp_codec_dev_write uses portMAX_DELAY internally.)
+        const size_t total_bytes = stereo.size() * sizeof(int16_t);
+        // GPIO46 must cover the samples already queued in I2S DMA as well as
+        // the blocking write itself. At 24 kHz stereo s16, 6 x 256 DMA frames
+        // hold about 64 ms; add that to the post-write PA tail.
+        constexpr int64_t kStreamDmaTailMs =
+            (6LL * kStreamDmaFrameNum * 1000 + kSampleRate - 1) / kSampleRate;
+        const int64_t audio_duration_ms =
+            (static_cast<int64_t>(sample_count) * 1000 + kSampleRate - 1) /
+            kSampleRate;
+        size_t total = 0;
+        int64_t write_start_us = esp_timer_get_time();
+        esp_err_t last_werr = ESP_OK;
+        while (total < total_bytes) {
+            size_t written = 0;
+            last_werr = i2s_channel_write(
+                g_flash.stream_tx,
+                reinterpret_cast<const uint8_t*>(stereo.data()) + total,
+                total_bytes - total, &written, portMAX_DELAY);
+            if (last_werr != ESP_OK || written == 0) {
+                break;  // channel disabled/closed on stop - drop the rest
+            }
+            total += written;
+        }
+        // The write duration should track the PCM duration at 1x. With the
+        // 4096-byte mono receive cap this is about 85 ms per block.
+        int64_t write_ms = (esp_timer_get_time() - write_start_us) / 1000;
+        static int write_log_counter = 0;
+        if (write_log_counter++ % 10 == 0 || write_ms > 200) {
+            ESP_LOGI(kTag, "i2s write: ms=%lld total=%u werr=%s",
+                     static_cast<long long>(write_ms),
+                     static_cast<unsigned>(total), esp_err_to_name(last_werr));
+        }
         vRingbufferReturnItem(g_flash.playback_ringbuf, item);
 
         size_t queued = g_flash.playback_queued_bytes.load(std::memory_order_relaxed);
         if (queued >= item_size) {
-            g_flash.playback_queued_bytes.fetch_sub(item_size, std::memory_order_relaxed);
+            g_flash.playback_queued_bytes.fetch_sub(item_size, std::memory_order_release);
         } else {
-            g_flash.playback_queued_bytes.store(0, std::memory_order_relaxed);
+            g_flash.playback_queued_bytes.store(0, std::memory_order_release);
+        }
+
+        // Arm the PA deadline after this write. `i2s_channel_write` returns when
+        // data is copied to DMA, so include this block's audio duration and the
+        // DMA reservoir before applying the idle tail. If another block follows,
+        // it cancels/replaces this deadline while keeping GPIO46 high.
+        {
+            xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+            g_flash.playback_write_active = false;
+            if (g_flash.playback_abort_requested) {
+                g_flash.playback_abort_requested = false;
+                g_flash.amp_idle_armed = false;
+            } else {
+                g_flash.amp_idle_due_ms = esp_timer_get_time() / 1000 +
+                                          audio_duration_ms + kStreamDmaTailMs +
+                                          kAmpIdleTailMs;
+                g_flash.amp_idle_armed = true;
+            }
+            xSemaphoreGive(g_flash.mutex);
         }
     }
 }
@@ -539,7 +653,7 @@ void EnsurePlaybackRingbuf()
     }
     if (g_flash.playback_ringbuf != nullptr && g_flash.playback_task == nullptr) {
         const BaseType_t created = xTaskCreatePinnedToCore(
-            FlashPlaybackTask, "flash_playback", 4096, nullptr, 5,
+            FlashPlaybackTask, "flash_playback", 4096, nullptr, 10,
             &g_flash.playback_task, 1);
         if (created != pdPASS) {
             ESP_LOGE(kTag, "flash playback task create failed");
@@ -551,6 +665,16 @@ void EnsurePlaybackRingbuf()
 
 esp_err_t InitStreamEs8311Adc(i2c_master_bus_handle_t bus)
 {
+    // [init-once] ES8311 register sequence (incl. 0x00 reset + 0x0B bias) runs
+    // ONCE. Re-running reset per turn wipes the DAC bias (0x0B=0x44) -> DAC
+    // stops consuming I2S TX -> DMA fills -> ringbuffer full -> hiss/no-sound.
+    // Mirrors xiaozhi/Zectrix closed firmware: codec configured once at first
+    // use; subsequent turns only toggle mute/PA. (Gemini cross-checked.)
+    static bool s_es8311_configured = false;
+    if (s_es8311_configured) {
+        return ESP_OK;
+    }
+
     i2c_master_dev_handle_t dev = nullptr;
     i2c_device_config_t dev_cfg = {};
     dev_cfg.dev_addr_length = I2C_ADDR_BIT_LEN_7;
@@ -583,16 +707,24 @@ esp_err_t InitStreamEs8311Adc(i2c_master_bus_handle_t bus)
     ret |= write(ES8311_REG_ADC_CTRL1, 0x1F);       // 0x10 (PGA volume)
     ret |= write(ES8311_REG_ADC_CTRL2, 0x7F);       // 0x11 (ADC max gain)
     ret |= write(ES8311_REG_RESET, 0x80);
+    vTaskDelay(pdMS_TO_TICKS(2));  // [init-fix] let ES8311 software reset take effect before read-back
     uint8_t reg00 = 0;
     if (read(ES8311_REG_RESET, &reg00) == ESP_OK) {
         ret |= write(ES8311_REG_RESET, reg00 & 0xBF);
-    } else { ret = ESP_FAIL; }
+    }  // [init-fix] read failed (I2C jitter) - skip RMW, not fatal (reset + later writes cover it)
+
+    // [analog-bias-fix] REG0B=0x00 aligns official esp_codec_dev es8311_open
+    // (es8311_ref.c:571) which never writes 0x44. Prior 0x44 was misattribution:
+    // the "0x00=silent" symptom was actually REG37=0x08 (ADC-only mode, fixed
+    // to 0x16). 0x44 changes VSEL/VMID analog bias -> unstable reference ->
+    // 味呲 hiss. If 0x00 silent on this board, root cause is elsewhere (not REG0B).
+    ret |= write(ES8311_REG_SYSTEM1, 0x00);  // 0x0B official esp_codec_dev value
 
     ret |= write(ES8311_REG_CLK_MAN1, 0x3F);
     uint8_t reg06 = 0;
     if (read(ES8311_REG_RESERVED3, &reg06) == ESP_OK) {  // 0x06
         ret |= write(ES8311_REG_RESERVED3, reg06 & ~0x20);
-    } else { ret = ESP_FAIL; }
+    }  // [init-fix] read failed (I2C jitter) - skip RMW, not fatal (reset + later writes cover it)
 
     ret |= write(ES8311_REG_ADC_DGAIN1, 0x10);      // 0x13 SYSTEM13
     ret |= write(ES8311_REG_ADC_DGAIN6, 0x0A);      // 0x1B
@@ -602,17 +734,17 @@ esp_err_t InitStreamEs8311Adc(i2c_master_bus_handle_t bus)
     ret |= write(ES8311_REG_CLK_MAN3, 0x10);
     ret |= write(ES8311_REG_RESERVED1, 0x10);        // 0x04
     ret |= write(ES8311_REG_RESERVED2, 0x00);        // 0x05
-    ret |= write(ES8311_REG_RESERVED3, 0x0F);        // 0x06 (ADC clock)
+    ret |= write(ES8311_REG_RESERVED3, 0x0F);        // 0x06 (bclk_div = 16, esp_codec_dev official; 0x07 stereo experiment showed no effect - bclk_div not the root cause)
     ret |= write(ES8311_REG_RESERVED4, 0x00);        // 0x07
     ret |= write(0x08, 0xFF);                        // CLK08 (no const)
 
     uint8_t reg = 0;
     if (read(ES8311_REG_SDPOUT, &reg) == ESP_OK) {   // 0x0A
-        ret |= write(ES8311_REG_SDPOUT, reg & ~0x40);
-    } else { ret = ESP_FAIL; }
+        ret |= write(ES8311_REG_SDPOUT, (reg & ~0x40) | 0x0C);  // [wordlen-fix] 16bit I2S (bit[4:2]=011, bit[1:0]=00) - uplink ASR verified working at 0x0C; Gemini 0x0D (LJ) broke ASR
+    }  // [init-fix] read failed (I2C jitter) - skip RMW, not fatal (reset + later writes cover it)
     if (read(ES8311_REG_SDPIN, &reg) == ESP_OK) {    // 0x09
-        ret |= write(ES8311_REG_SDPIN, reg & ~0x40);
-    } else { ret = ESP_FAIL; }
+        ret |= write(ES8311_REG_SDPIN, (reg & ~0x40) | 0x0C);  // [wordlen-fix] 16bit I2S (bit[4:2]=011, bit[1:0]=00) - uplink ASR verified working at 0x0C; Gemini 0x0D (LJ) broke ASR
+    }  // [init-fix] read failed (I2C jitter) - skip RMW, not fatal (reset + later writes cover it)
 
     ret |= write(ES8311_REG_ADC_DGAIN5, 0xBF);      // 0x17 ADC_REG17
     ret |= write(0x0E, 0x02);                        // SYSTEM0E
@@ -620,27 +752,50 @@ esp_err_t InitStreamEs8311Adc(i2c_master_bus_handle_t bus)
     ret |= write(ES8311_REG_ADC_DGAIN2, 0x1A);      // 0x14 SYSTEM14
     if (read(ES8311_REG_ADC_DGAIN2, &reg) == ESP_OK) {
         ret |= write(ES8311_REG_ADC_DGAIN2, reg & ~0x40);
-    } else { ret = ESP_FAIL; }
+    }  // [init-fix] read failed (I2C jitter) - skip RMW, not fatal (reset + later writes cover it)
     ret |= write(0x0D, 0x01);                        // SYSTEM0D
     ret |= write(ES8311_REG_ADC_DGAIN3, 0x40);      // 0x15 ADC_REG15 (MIC bias) -- KEY: was 0x00
-    ret |= write(0x37, 0x08);                        // DAC_REG37
+    ret |= write(0x37, 0x08);  // Official esp_codec_dev DAC/BOTH value; clean A/B with corrected REG32 and PA timing.
     ret |= write(ES8311_REG_GP, 0x00);               // 0x45
 
-    // [es8311-diag] Read back key ADC registers to confirm writes landed.
+    // [hw-volume] Apply persisted volume before the final DAC readback so the
+    // log reflects the registers used for playback.
+    wqn::SetEs8311Volume(dev, wqn::GetPlaybackVolumePercent());
+
+    // Read back key ADC and DAC registers to confirm the complete init landed.
     // Expected: SDPIN(0x09) bit6=0, SDPOUT(0x0A) bit6=0 (both interfaces powered),
     // SYS1(0x0B)=0x44, CLK06=0x0F, CLK04=0x10, ADC10=0x1F, ADC11=0x7F, ALC1B=0x0A.
     // If SDPOUT bit6=1 -> ADC still in power-down. If reads return 0xFF -> I2C no-ACK.
     {
-        uint8_t v09=0xFF, v0A=0xFF, v0B=0xFF, v06=0xFF, v04=0xFF, v10=0xFF, v11=0xFF, v14=0xFF, v1B=0xFF;
+        uint8_t v09=0xFF, v0A=0xFF, v0B=0xFF, v06=0xFF, v04=0xFF, v10=0xFF, v11=0xFF, v14=0xFF, v1B=0xFF, v37=0xFF;
+        uint8_t v0D=0xFF, v0E=0xFF, v12=0xFF, v13=0xFF, v31=0xFF, v32=0xFF;
         read(0x09, &v09); read(0x0A, &v0A); read(0x0B, &v0B);
         read(0x06, &v06); read(0x04, &v04);
-        read(0x10, &v10); read(0x11, &v11); read(0x14, &v14); read(0x1B, &v1B);
-        ESP_LOGI(kTag, "es8311 readback: SDPIN=0x%02x SDPOUT=0x%02x SYS1=0x%02x CLK06=0x%02x CLK04=0x%02x ADC10=0x%02x ADC11=0x%02x ADC14=0x%02x ALC1B=0x%02x",
-                 v09, v0A, v0B, v06, v04, v10, v11, v14, v1B);
+        read(0x10, &v10); read(0x11, &v11); read(0x14, &v14); read(0x1B, &v1B); read(0x37, &v37);
+        read(0x0D, &v0D); read(0x0E, &v0E); read(0x12, &v12); read(0x13, &v13); read(0x31, &v31); read(0x32, &v32);
+        ESP_LOGI(kTag, "es8311 readback: SDPIN=0x%02x SDPOUT=0x%02x SYS1=0x%02x CLK06=0x%02x CLK04=0x%02x ADC10=0x%02x ADC11=0x%02x ADC14=0x%02x ALC1B=0x%02x DAC37=0x%02x",
+                 v09, v0A, v0B, v06, v04, v10, v11, v14, v1B, v37);
+        // DAC analog-domain readback after SetEs8311Volume. Expected: REG0D=0x01,
+        // REG0E=0x02, REG12=0x00, REG13=0x10, REG31 bit6:5 clear when unmuted,
+        // and REG32=0xBF at 100% (0 dB).
+        ESP_LOGI(kTag, "es8311 dac readback: REG0D=0x%02x REG0E=0x%02x REG12=0x%02x REG13=0x%02x REG31=0x%02x REG32=0x%02x",
+                 v0D, v0E, v12, v13, v31, v32);
     }
 
     i2c_master_bus_rm_device(dev);
-    return ret;
+    // [init-fix] Do NOT fail the whole ADC init on a single register-write
+    // jitter. The ES8311 sequence is idempotent (later writes overwrite
+    // earlier ones) and the readback above already confirms the key registers
+    // landed (ADC10/11/14, ALC1B, DAC37, CLK06/04). A single I2C no-ACK on an
+    // untracked register (GPIO/SYSTEM/0x08) used to set ret!=ESP_OK -> init
+    // "failed" -> the streaming task was killed -> "I2S read timeout" +
+    // max_sample=0 cascaded, even though 99% of writes succeeded. Log and
+    // soldier on; the readback is the real verdict.
+    if (ret != ESP_OK) {
+        ESP_LOGW(kTag, "es8311 ADC init: some register writes jittered (ret=%s) - readback above, continuing", esp_err_to_name(ret));
+    }
+    s_es8311_configured = true;  // [init-once] mark configured so subsequent turns skip the reset sequence
+    return ESP_OK;
 }
 
 esp_err_t InitStreamI2sDuplex(i2s_chan_handle_t* rx_handle)
@@ -649,10 +804,10 @@ esp_err_t InitStreamI2sDuplex(i2s_chan_handle_t* rx_handle)
         return ESP_ERR_INVALID_ARG;
     }
     if (*rx_handle != nullptr) {
-        ESP_RETURN_ON_ERROR(i2s_channel_enable(*rx_handle), kTag, "enable stream I2S RX");
-        if (g_flash.stream_tx != nullptr) {
-            ESP_RETURN_ON_ERROR(i2s_channel_enable(g_flash.stream_tx), kTag, "enable stream I2S TX");
-        }
+        // [inflight-fix] Channels are常驻 (created once, never deleted/disabled).
+        // They stay enabled across turns - no re-enable needed (i2s_channel_enable
+        // on an already-enabled channel returns ESP_ERR_INVALID_STATE). Just
+        // return OK; the RX/TX are still live from the first turn.
         return ESP_OK;
     }
     i2s_chan_config_t chan_cfg = {};
@@ -718,16 +873,13 @@ void CleanupStreamHardware()
     // Do NOT delete any shared I2C bus or pull codec power — those are managed
     // by audio_player (which is also using the same ES8311 codec and audio amp).
     // Pulling the power here would cut off any audio that is still being played.
-    if (g_flash.stream_tx != nullptr) {
-        i2s_channel_disable(g_flash.stream_tx);
-        i2s_del_channel(g_flash.stream_tx);
-        g_flash.stream_tx = nullptr;
-    }
-    if (g_flash.stream_rx != nullptr) {
-        i2s_channel_disable(g_flash.stream_rx);
-        i2s_del_channel(g_flash.stream_rx);
-        g_flash.stream_rx = nullptr;
-    }
+    // [inflight-fix] Do NOT disable/delete I2S channels here. They are常驻
+    // (created once in InitStreamI2sDuplex, reused across turns). Deleting TX
+    // here meant TTS playback (which runs AFTER capture stops) found
+    // stream_tx=nullptr and skipped i2s_channel_write -> no sound. Disabling
+    // TX would break TTS the same way. Mirrors xiaozhi/Zectrix closed
+    // firmware: I2S channels stay enabled; only codec power/mute toggles.
+    // (RX/TX handles remain valid for the next turn + for FlashPlaybackTask.)
     if (g_flash.stream_i2c_bus != nullptr) {
         if (g_flash.stream_i2c_bus != wqn::GetSharedI2cBusHandle()) {
             i2c_del_master_bus(g_flash.stream_i2c_bus);
@@ -735,14 +887,9 @@ void CleanupStreamHardware()
         g_flash.stream_i2c_bus = nullptr;
     }
     g_flash.stream_audio_powered = false;
-    // [amp-fix] Always force amp off on hardware teardown; the mutex may
-    // already be taken here, so write GPIO directly and clear the timer flag.
-    if (g_flash.mutex != nullptr) {
-        xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
-        g_flash.amp_idle_armed = false;
-        xSemaphoreGive(g_flash.mutex);
-    }
-    SetStreamAudioAmp(false);
+    // Capture cleanup deliberately leaves GPIO46 to FlashPlaybackTask. TTS can
+    // already be queued when the capture task exits, so closing the PA here
+    // would race with the first playback block.
 }
 
 void AudioStreamingTask(void* param)
@@ -787,6 +934,15 @@ void AudioStreamingTask(void* param)
 
     ESP_LOGI(kTag, "audio streaming task started");
 
+    // [adc-warmup] Discard the first few chunks after init: the ES8311 ADC
+    // needs ~60ms to stabilize after power-on, and the first samples are zero
+    // (cold-start pcm diag shows max_sample=0 -> empty ASR for the first turn).
+    for (int warmup = 0; warmup < 4; ++warmup) {
+        size_t warmup_bytes = 0;
+        i2s_channel_read(g_flash.stream_rx, i2s_buf, sizeof(i2s_buf),
+                         &warmup_bytes, pdMS_TO_TICKS(100));
+    }
+
     while (true) {
         // Check if capture should stop
         bool should_capture = false;
@@ -799,8 +955,14 @@ void AudioStreamingTask(void* param)
 
         // Read one chunk (stereo 16-bit, 240 frames = 960 bytes per channel)
         size_t bytes_read = 0;
+        // [timeout-fix] 200ms (was 20ms). i2s_channel_read returns immediately
+        // when DMA data is ready, so a larger timeout adds zero normal-case
+        // latency - it only bounds the worst case. 20ms was too tight: 960 bytes
+        // @ 64 B/ms needs 15ms to fill, and EPD/WS preemption of this priority-10
+        // task left no margin -> ~98% false timeouts + fragmented audio. 200ms
+        // covers fill time + scheduling jitter; stop latency stays <200ms.
         esp_err_t read_err = i2s_channel_read(
-            g_flash.stream_rx, i2s_buf, sizeof(i2s_buf), &bytes_read, pdMS_TO_TICKS(20));
+            g_flash.stream_rx, i2s_buf, sizeof(i2s_buf), &bytes_read, pdMS_TO_TICKS(200));
         if (read_err != ESP_OK || bytes_read == 0) {
             if (read_err == ESP_ERR_TIMEOUT) {
                 // [i2s-diag] Timeout = DMA has no data = ADC path not running.
@@ -827,13 +989,14 @@ void AudioStreamingTask(void* param)
         // I2S stereo 16-bit layout: [L0 R0 L1 R1 ...] (2 bytes/sample).
         const int stereo_frames = static_cast<int>(bytes_read / 4);
         const int frames = std::min(stereo_frames, kStreamChunkFrames);
-        uint8_t mono_buf[kStreamChunkBytes];
+        int16_t mono_buf[kStreamChunkFrames];
         const int16_t* stereo_samples = reinterpret_cast<const int16_t*>(i2s_buf);
-        int16_t* mono_samples = reinterpret_cast<int16_t*>(mono_buf);
+        // [mic-fix] Mic is on the L channel; R floats (pcm diag confirms
+        // L_peak=5608..13170, R_peak=0). The "R only" attempt sent silence
+        // (R_peak=0 -> mono_peak=0 -> cloud got nothing). Take L only for
+        // full-level mono (averaging (L+0)/2 worked but halved the level).
         for (int i = 0; i < frames; ++i) {
-            const int left = static_cast<int>(stereo_samples[i * 2]);
-            const int right = static_cast<int>(stereo_samples[i * 2 + 1]);
-            mono_samples[i] = static_cast<int16_t>(std::clamp((left + right) / 2, -32768, 32767));
+            mono_buf[i] = stereo_samples[i * 2];  // L channel (mic)
         }
         size_t mono_bytes = static_cast<size_t>(frames) * 2;
 
@@ -843,12 +1006,18 @@ void AudioStreamingTask(void* param)
         static int diag_chunk_counter = 0;
         if (diag_chunk_counter++ % 66 == 0) {
             int16_t max_sample = 0;
+            int16_t left_peak = 0, right_peak = 0;
             for (int i = 0; i < frames; ++i) {
-                int16_t s = mono_samples[i];
+                int16_t s = mono_buf[i];
                 if (s < 0) s = static_cast<int16_t>(-s);
                 if (s > max_sample) max_sample = s;
+                int16_t l = static_cast<int16_t>(std::abs(static_cast<int>(stereo_samples[i * 2])));
+                int16_t r = static_cast<int16_t>(std::abs(static_cast<int>(stereo_samples[i * 2 + 1])));
+                if (l > left_peak) left_peak = l;
+                if (r > right_peak) right_peak = r;
             }
-            ESP_LOGI(kTag, "pcm diag: frames=%d max_sample=%d", frames, max_sample);
+            ESP_LOGI(kTag, "pcm diag: frames=%d L_peak=%d R_peak=%d mono_peak=%d",
+                     frames, left_peak, right_peak, max_sample);
         }
 
         // Send via WebSocket if connected.
@@ -861,7 +1030,7 @@ void AudioStreamingTask(void* param)
         if (ws_ok) {
 #if CONFIG_WQN_FLASH_PROTOCOL_V2
             std::vector<uint8_t> frame;
-            BuildV2AudioFrame(&frame, mono_buf, mono_bytes, ++g_flash.uplink_seq, /*final=*/false);
+            BuildV2AudioFrame(&frame, reinterpret_cast<const uint8_t*>(mono_buf), mono_bytes, ++g_flash.uplink_seq, /*final=*/false);
             // [timeout-fix] Was 50ms - WiFi jitter fills TCP tx buffer for
             // >50ms -> send returns 0 -> WS client treats as fatal -> closes
             // connection (code 1006). 1000ms lets TCP retransmit recover.
@@ -879,7 +1048,7 @@ void AudioStreamingTask(void* param)
                          uplink_append_count, g_flash.uplink_seq, (unsigned)mono_bytes);
             }
 #else
-            std::string b64 = EncodeBase64(mono_buf, mono_bytes);
+            std::string b64 = EncodeBase64(reinterpret_cast<const uint8_t*>(mono_buf), mono_bytes);
             std::string msg = R"({"type":"input_audio_buffer.append","audio":"}" + b64 + R"("})";
             esp_websocket_client_send_text(g_flash.ws_client, msg.c_str(), msg.size(), pdMS_TO_TICKS(1000));
 #endif
@@ -912,11 +1081,12 @@ void StartAudioStreaming()
     // which needs that same lock -> 5s timeout deadlock. Move the delay
     // into AudioStreamingTask so the WS lock is released immediately.
 
-    // [amp-fix] Always start in a closed-amp state. The amp is enabled lazily
-    // by the response.audio.delta handler when the server actually starts
-    // streaming playback, and closed by the idle tail or by release/stop.
+    // Capture starts with the speaker path closed. Do not set the drain flag
+    // here: on the first turn the playback task may be blocked waiting for its
+    // first item, and a stale drain request would discard that response.
     if (g_flash.mutex != nullptr) {
         xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+        g_flash.playback_abort_requested = true;
         g_flash.amp_idle_armed = false;
         xSemaphoreGive(g_flash.mutex);
     }
@@ -942,7 +1112,7 @@ void StopAudioStreaming()
     // vTaskDelete while the task holds the WS client internal lock corrupts its
     // queue -> xQueueGenericSend NULL assert -> panic reboot. 1.5 s covers a full
     // send_bin timeout so the task exits cleanly.
-    for (int i = 0; i < 150; ++i) {
+    for (int i = 0; i < 200; ++i) {  // [stop-fix] 2.0s (was 1.5s) - covers a full 1s send_bin + processing
         vTaskDelay(pdMS_TO_TICKS(10));
         if (g_flash.stream_task == nullptr) {
             // Task self-deleted successfully
@@ -1018,6 +1188,19 @@ void ParseAndHandleEvent(const char* data, size_t len)
             }
         }
         ESP_LOGW(kTag, "flash session error event: %s", msg.c_str());
+        // [barge-tolerate] Two StepFun errors are expected timing artifacts of
+        // barge-in / fast PTT, not real failures:
+        //  - "ongoing response already exists": response.create reached StepFun
+        //    before the prior response.cancel was applied (cancel/create race).
+        //  - "no ongoing response to cancel": response.cancel sent when no
+        //    response is currently in-flight.
+        // The Realtime session stays usable after both, so downgrade to a
+        // warning instead of SetErrorLocked (which would flip the session to
+        // kError and block further interaction until a reconnect).
+        if (msg.find("ongoing response already exists") != std::string::npos ||
+            msg.find("no ongoing response to cancel") != std::string::npos) {
+            return;
+        }
         xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
         SetErrorLocked(msg);
         xSemaphoreGive(g_flash.mutex);
@@ -1065,9 +1248,18 @@ void ParseAndHandleEvent(const char* data, size_t len)
         std::strcmp(type, "conversation.item.input_audio_transcription.completed") == 0) {
         const char* tr = JsonStr(g.p, "transcript");
         if (tr != nullptr) {
+            // [order-fix] Snapshot thinking_text inside the lock, then AppendUser
+            // + AppendThinking summary outside. StepFun delivers transcription
+            // AFTER thinking.delta/text.delta, so appending here gives the natural
+            // chat order: [user] [thinking] [assistant].
+            std::string thinking_snapshot;
             xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
             g_flash.user_transcript = tr;
             g_flash.pending_text.clear();
+            if (!g_flash.thinking_text.empty()) {
+                thinking_snapshot = g_flash.thinking_text;
+                g_flash.thinking_text.clear();
+            }
             g_flash.status_since_ms = esp_timer_get_time() / 1000;
             MarkChanged();
             xSemaphoreGive(g_flash.mutex);
@@ -1078,6 +1270,56 @@ void ParseAndHandleEvent(const char* data, size_t len)
             wqn::GetAiHistory().AppendUser(
                 std::pmr::string(tr, std::pmr::polymorphic_allocator<char>{}),
                 esp_timer_get_time() / 1000);
+            if (!thinking_snapshot.empty()) {
+                if (thinking_snapshot.size() > 40) {
+                    thinking_snapshot = thinking_snapshot.substr(0, 40) + "...";
+                }
+                std::string label = "💭 " + thinking_snapshot;
+                wqn::GetAiHistory().AppendThinking(
+                    std::pmr::string(label.begin(), label.end(),
+                                     std::pmr::polymorphic_allocator<char>{}),
+                    esp_timer_get_time() / 1000);
+                ESP_LOGI(kTag, "thinking摘要: %s", label.c_str());
+            }
+        }
+        return;
+    }
+
+    // [thinking] StepFun docs name this response.thinking.delta (confirmed via
+    // StepFun official docs + the Step-Realtime-Console sample app). Also
+    // accept OpenAI-style response.reasoning*.delta as a fallback in case the
+    // upstream/proxy renames it. Field is the top-level `delta` string in both.
+    if (std::strcmp(type, "response.thinking.delta") == 0 ||
+        std::strcmp(type, "response.reasoning.delta") == 0 ||
+        std::strcmp(type, "response.reasoning_summary_text.delta") == 0) {
+        const char* delta = JsonStr(g.p, "delta");
+        if (delta != nullptr && delta[0] != '\0') {
+            xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+            const bool first_chunk = g_flash.thinking_text.empty();
+            if (g_flash.thinking_text.size() < 200) {
+                g_flash.thinking_text += delta;
+                if (g_flash.thinking_text.size() > 200) g_flash.thinking_text.resize(200);
+            }
+            xSemaphoreGive(g_flash.mutex);
+            // [thinking-display] pending_text is a DEAD field - no renderer
+            // reads it (DrawAiStatusBar draws AiStatusLabel, not pending_text;
+            // RenderAiHistoryViewport draws AiHistory). So drive the screen via
+            // AiHistory.AppendThinking, exactly like AppendUser/AppendAssistant.
+            // Push a placeholder on the first chunk so the user sees the model
+            // is thinking; the final摘要 replaces it when the reply starts
+            // (text.delta). Later chunks only accumulate (no per-chunk UI
+            // refresh - E-ink can't keep up and the text would flicker).
+            if (first_chunk) {
+                ESP_LOGI(kTag, "thinking stream started (%s)", type);
+                // [order-fix] Do NOT AppendThinking here. StepFun delivers events
+                // as thinking.delta -> text.delta -> transcription (user transcript
+                // arrives asynchronously AFTER the reply starts). Appending thinking
+                // here would place it BEFORE the user transcript in history ->
+                // display order "thinking -> 转写 -> AI" instead of "转写 -> thinking
+                // -> AI". We accumulate thinking_text and append the summary only
+                // when the transcription arrives (asr.complete), so it lands after
+                // the user message.
+            }
         }
         return;
     }
@@ -1086,7 +1328,16 @@ void ParseAndHandleEvent(const char* data, size_t len)
         std::strcmp(type, "response.audio_transcript.delta") == 0) {
         const char* delta = JsonStr(g.p, "delta");
         if (delta != nullptr && delta[0] != '\0') {
+            // [thinking-display] Replace the "思考中..." placeholder with the
+            // final摘要 once the actual reply starts streaming. Snapshot +
+            // clear thinking_text inside the lock; do the AppendThinking
+            // outside the lock (matches the AppendUser/AppendAssistant pattern
+            // - PMR alloc off the streaming critical section).
             xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+            // [order-fix] Do NOT clear thinking_text or AppendThinking here.
+            // thinking_text is appended as a summary when the transcription
+            // arrives (asr.complete), so it lands after the user message. We
+            // only accumulate assistant_text here.
             g_flash.assistant_text += delta;
             g_flash.status_since_ms = esp_timer_get_time() / 1000;
             MarkChanged();
@@ -1130,15 +1381,18 @@ void ParseAndHandleEvent(const char* data, size_t len)
 
     if (std::strcmp(type, "turn.done") == 0 || std::strcmp(type, "response.done") == 0) {
         ESP_LOGI(kTag, "turn done");
-        // [display-fix] Write the accumulated assistant text into AiHistory
-        // so it shows up on the e-paper viewport. We do this here (at turn
-        // completion) rather than on every delta to avoid pushing partial
-        // fragments into the history deque.
+        // This event means the server has finished generating, not that the
+        // device has finished playing its paced PCM queue. FlashPlaybackTask
+        // owns GPIO46 and closes it only after queue drain + idle tail.
+        // Write the accumulated assistant text into AiHistory at turn completion
+        // so it shows up on the e-paper viewport without pushing partial deltas.
         std::string assistant_snapshot;
         if (g_flash.mutex != nullptr) {
             xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
             assistant_snapshot = g_flash.assistant_text;
-            g_flash.amp_idle_armed = false;
+            g_flash.assistant_text.clear();  // [barge-fix] clear after snapshot so next turn starts fresh - was accumulating across turns (barge-in leftover bled into next reply)
+            g_flash.thinking_text.clear();
+            g_flash.response_in_flight = false;  // [inflight-fix] response done - allow next turn
             g_flash.status_since_ms = esp_timer_get_time() / 1000;
             MarkChanged();
             xSemaphoreGive(g_flash.mutex);
@@ -1149,7 +1403,6 @@ void ParseAndHandleEvent(const char* data, size_t len)
                                  std::pmr::polymorphic_allocator<char>{}),
                 esp_timer_get_time() / 1000);
         }
-        SetStreamAudioAmp(false);
         return;
     }
 #endif  // CONFIG_WQN_FLASH_PROTOCOL_V2
@@ -1201,12 +1454,8 @@ void ParseAndHandleEvent(const char* data, size_t len)
 
     if (std::strcmp(type, "response.done") == 0) {
         ESP_LOGI(kTag, "response done");
-        if (g_flash.mutex != nullptr) {
-            xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
-            g_flash.amp_idle_armed = false;
-            xSemaphoreGive(g_flash.mutex);
-        }
-        SetStreamAudioAmp(false);
+        // Generation completion can precede local paced playback by seconds.
+        // Leave GPIO46 under FlashPlaybackTask's queue-drain idle-tail control.
         return;
     }
 #endif  // !CONFIG_WQN_FLASH_PROTOCOL_V2
@@ -1234,7 +1483,18 @@ void ParseAndHandleEvent(const char* data, size_t len)
         return;
     }
 
-    ESP_LOGD(kTag, "unhandled WS event: %s", type);
+    // [thinking-diag] Surface thinking/reasoning events at INFO so we can
+    // confirm the exact event name StepFun uses at runtime (docs say
+    // response.thinking.delta, but the two investigation agents disagreed on
+    // thinking vs reasoning - verify at runtime). If this fires, the event
+    // name needs to be added to the thinking.delta branch above. Other
+    // unhandled events stay at DEBUG to avoid log spam.
+    if (std::strstr(type, "thinking") != nullptr ||
+        std::strstr(type, "reasoning") != nullptr) {
+        ESP_LOGI(kTag, "unhandled thinking/reasoning event: %s", type);
+    } else {
+        ESP_LOGD(kTag, "unhandled WS event: %s", type);
+    }
 }
 
 void WebsocketEventHandler(void* handler_args, esp_event_base_t, int32_t event_id, void* event_data)
@@ -1265,12 +1525,21 @@ void WebsocketEventHandler(void* handler_args, esp_event_base_t, int32_t event_i
             //   3. "mode" -> should be "type"
             // Also removed input_sample_rate / output_sample_rate (not in spec).
             // model is set by the relay's rewriteSessionUpdate, not here.
+            // [tts-speed-fix] Mirror the official demo's session.update fields
+            // exactly. Missing max_response_output_tokens / temperature /
+            // tools / tool_choice / input_audio_transcription caused StepFun
+            // to generate TTS at 0.51x with 47 x 700-1300ms stalls (vs demo's
+            // 5x continuous). Hypothesis: default max_response_output_tokens
+            // is small -> StepFun segments TTS into many small chunks, each
+            // with a generation pause. Setting 4096 enables whole-response TTS.
             std::string session_update = std::string(R"({"type":"session.update","session":)") +
                 R"({"modalities":["text","audio"],)" +
                 R"("instructions":")" + std::string(kDefaultInstructions) +
                 R"(","voice":")" + kDefaultVoice +
                 R"(","input_audio_format":"pcm16")" +
-                R"(,"output_audio_format":"pcm16","turn_detection":null}})";
+                R"(,"output_audio_format":"pcm16","input_audio_transcription":null)" +
+                R"(,"turn_detection":null,"tools":[],"tool_choice":"auto")" +
+                R"(,"temperature":0.8,"max_response_output_tokens":4096}})";
 #else
             std::string session_update = std::string(R"({"type":"session.update","session":)") +
                 R"({"modalities":["text","audio"],"instructions":")" +
@@ -1405,6 +1674,7 @@ void HandleV2DownlinkAudio(const uint8_t* data, size_t len,
             ESP_LOGW(kTag, "audio frame payload_len=%llu exceeds cap %u, dropping",
                      static_cast<unsigned long long>(payload_len),
                      static_cast<unsigned>(kMaxAudioFrameBytes));
+            g_flash.audio_reassembly_buf.clear();  // [oom-guard] drop stale buf so later fragments don't pollute
             return;
         }
         g_flash.audio_reassembly_buf.clear();
@@ -1447,6 +1717,14 @@ void HandleV2DownlinkAudio(const uint8_t* data, size_t len,
     EnqueuePlaybackPcm(reinterpret_cast<const uint8_t*>(
                            g_flash.audio_reassembly_buf.data() + sizeof(AudioFrameHeader)),
                        safe_bytes);
+    // [tts-diag] Confirm TTS audio frames reach the device. If this prints but
+    // no sound, the ES8311 DAC path is the culprit (see dac-fix on 0x37); if it
+    // never prints, the proxy isn't forwarding response.audio.delta as binary.
+    static int downlink_frame_count = 0;
+    if (++downlink_frame_count % 50 == 1) {
+        ESP_LOGI(kTag, "downlink audio frame #%d seq=%u pcm_bytes=%u",
+                 downlink_frame_count, (unsigned)hdr.seq, (unsigned)safe_bytes);
+    }
     g_flash.audio_reassembly_buf.clear();
 }
 #endif  // CONFIG_WQN_FLASH_PROTOCOL_V2
@@ -1519,6 +1797,8 @@ esp_err_t StartFlashSession()
     g_flash.error_message.clear();
     g_flash.user_transcript.clear();
     g_flash.assistant_text.clear();
+    g_flash.thinking_text.clear();
+    g_flash.response_in_flight = false;  // [inflight-fix] reset on new session
     g_flash.status_since_ms = esp_timer_get_time() / 1000;
     MarkChanged();
     xSemaphoreGive(g_flash.mutex);
@@ -1630,6 +1910,7 @@ esp_err_t StopFlashSession()
     // [playback-fix] Drop any PCM already enqueued for the playback task so
     // the user does not hear the tail of the previous response after a stop.
     DrainPlaybackRingbuf();
+    SetStreamAudioAmp(false);
 
     // Disconnect WebSocket OUTSIDE the mutex to avoid deadlock with its event handler
     esp_websocket_client_handle_t client_to_destroy = nullptr;
@@ -1779,14 +2060,18 @@ void OnFlashButtonPressed()
     // device half of the CLEAR_PLAYER double-action; the proxy then sends
     // response.cancelled / conversation.item.truncate to StepFun Realtime.
     bool need_barge_in = false;
-    if (g_flash.ws_connected && g_flash.status == InternalStatus::kStreaming &&
-        (g_flash.playback_queued_bytes.load(std::memory_order_relaxed) > 0 || !g_flash.tool_label.empty())) {
+    if (g_flash.ws_connected && g_flash.response_in_flight) {
+        // [inflight-fix] Only cancel when a response is actually in-flight
+        // (tracked via response_in_flight: set on turn-end, cleared on
+        // response.done/error). The old check (playback_queued || tool_label)
+        // fired even after response.done -> "no ongoing response to cancel".
         need_barge_in = true;
     }
 
     if (g_flash.ws_connected &&
         (g_flash.status == InternalStatus::kStreaming || g_flash.status == InternalStatus::kSessionUpdating)) {
         g_flash.capture_started = true;
+        g_flash.capture_base_seq = g_flash.uplink_seq;  // [barge-fix] detect empty capture on release
         g_flash.pending_text = "正在录音...";
         g_flash.status_since_ms = esp_timer_get_time() / 1000;
         MarkChanged();
@@ -1797,6 +2082,14 @@ void OnFlashButtonPressed()
             // the speaker goes silent the instant the user lets go of PTT.
             DrainPlaybackRingbuf();
             SetStreamAudioAmp(false);
+            // [inflight-fix] Flush I2S TX DMA: disable+enable clears any residual
+            // TTS samples the DMA already fetched (DrainPlaybackRingbuf only
+            // clears the ringbuffer, not the DMA buffer). Mirrors xiaozhi
+            // ResetDecoder clearing audio_playback_queue.
+            if (g_flash.stream_tx != nullptr) {
+                i2s_channel_disable(g_flash.stream_tx);
+                i2s_channel_enable(g_flash.stream_tx);
+            }
             // Remote side: ask the proxy to cancel the in-progress response.
             const char* cancel = "{\"type\":\"response.cancel\"}";
             esp_websocket_client_send_text(g_flash.ws_client, cancel,
@@ -1806,6 +2099,14 @@ void OnFlashButtonPressed()
         }
 
         StartAudioStreaming();
+    } else if (g_flash.status == InternalStatus::kConnecting) {
+        // [cold-start] Session still connecting - the press is recorded and
+        // recording auto-starts on session.ready (see session.ready handler).
+        // Tell the user to hold so they don't release early and lose the turn.
+        g_flash.pending_text = "正在连接...请按住";
+        g_flash.status_since_ms = esp_timer_get_time() / 1000;
+        MarkChanged();
+        xSemaphoreGive(g_flash.mutex);
     } else {
         xSemaphoreGive(g_flash.mutex);
     }
@@ -1834,15 +2135,21 @@ void OnFlashButtonReleased()
         StopAudioStreaming();
     }
 
-    // [amp-fix] Force the amp off the moment the user lets go of PTT, regardless
-    // of whether audio was actually playing back. The idle-tail timer would also
-    // do this but only after up to 600 ms of silence — too late for a clean handoff.
+    // Force the PA off when capture ends. Mark any playback write racing with
+    // this transition as aborted so it cannot re-arm the idle tail afterward.
     if (g_flash.mutex != nullptr) {
         xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+        g_flash.playback_abort_requested = true;
         g_flash.amp_idle_armed = false;
         xSemaphoreGive(g_flash.mutex);
     }
     SetStreamAudioAmp(false);
+
+    if (was_capturing) {
+        xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+        g_flash.playback_abort_requested = false;
+        xSemaphoreGive(g_flash.mutex);
+    }
 
     // [deadlock-fix] Send turn-end WITHOUT holding g_flash.mutex. The WS
     // client's internal lock is acquired by esp_websocket_client_send_*,
@@ -1856,16 +2163,26 @@ void OnFlashButtonReleased()
     uint32_t seq = 0;
 
     xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
-    if (ws_connected && g_flash.ws_client != nullptr && was_capturing) {
-        // [empty-frame-fix] Only send the final end-of-turn frame if we
-        // actually captured audio this session. Without was_capturing, every
-        // button release in error/idle state sends an empty final frame ->
-        // relay forwards an empty append + commit to StepFun -> "audio is
-        // required" error -> session corrupted.
+    const bool captured_audio = (g_flash.uplink_seq != g_flash.capture_base_seq);
+    const bool prev_in_flight = g_flash.response_in_flight;
+    if (ws_connected && g_flash.ws_client != nullptr && was_capturing && captured_audio && !prev_in_flight) {
+        // [barge-fix] Only send the final end-of-turn frame if real audio was
+        // captured (uplink_seq advanced past capture_base_seq). A fast barge-in
+        // tap leaves uplink_seq unchanged; sending an empty final frame would
+        // trigger commit + response.create that collides with the just-sent
+        // response.cancel -> interleaved replies ("串台") + "append is not
+        // called" error.
+        // [inflight-fix] Also require !prev_in_flight: sending commit+create
+        // while the prior response is still generating -> "ongoing response
+        // already exists". If prev_in_flight, skip (audio lost, user must
+        // re-press after the prior response finishes).
         should_send = true;
         client = g_flash.ws_client;
         ++g_flash.uplink_seq;
         seq = g_flash.uplink_seq;
+        g_flash.response_in_flight = true;  // in-flight until response.done/error
+    } else if (was_capturing && captured_audio && prev_in_flight) {
+        ESP_LOGW(kTag, "skip turn-end: prior response still in-flight");
     }
     xSemaphoreGive(g_flash.mutex);
 

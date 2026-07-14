@@ -1,3 +1,9 @@
+// Font format type stubs: lv_font_fmt_txt_dsc_t and friends, used to parse the
+// pre-baked SourceHanSansSC font blob. This is NOT LVGL -- the firmware does
+// not use the LVGL widget toolkit; these structs only describe the font
+// binary's layout (borrowed from LVGL's lv_font_fmt_txt format). Renamed from
+// lvgl/lvgl.h to avoid implying an LVGL dependency.
+// See docs/13-ui-design-language.md §13.1.
 #pragma once
 
 #include <stddef.h>

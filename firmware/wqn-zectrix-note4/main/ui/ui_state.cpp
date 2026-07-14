@@ -186,6 +186,7 @@ RefreshSchedule QueueSelectedReview(wqn::UiState* state)
         review.selected_status.c_str(),
         state->status.pending_reviews);
     wqn::NotifyOnlineSyncRequested();
+    BuildHomeSummary(state);  // [home-stats-fix] refresh home stats so pending/today counts update immediately (was stale until 60s poll)
     return RefreshSchedule::kCommit;
 }
 

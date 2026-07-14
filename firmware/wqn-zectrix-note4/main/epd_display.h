@@ -25,14 +25,10 @@ size_t GetEpdFramebufferSize();
 void ClearEpdFramebuffer(bool white = true);
 void DrawEpdPixel(int x, int y, bool black);
 
-// Minimal ASCII text path for bring-up.
-esp_err_t DrawAsciiText(int x, int y, const char* text, bool black = true);
 esp_err_t DrawUtf8Text(int x, int y, const char* text, bool black = true);
 int MeasureUtf8TextWidth(const char* text);
 std::string TruncateUtf8TextToWidth(const std::string& text, int max_width_px);
 std::vector<std::string> WrapUtf8TextToWidth(const std::string& text, int max_width_px, size_t max_lines);
-esp_err_t DrawSimpleText(int x, int y, const char* text);
-esp_err_t DrawTextLine(int line, const char* text, bool black = true);
 
 // Sends the framebuffer to the panel and performs a blocking refresh. Local
 // partial-window refresh can be disabled for page-level commits that are too

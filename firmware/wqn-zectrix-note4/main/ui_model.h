@@ -164,6 +164,7 @@ enum class SettingsDialog {
     kAutoSync,
     kBattery,
     kStorage,
+    kVolume,
     kFactoryReset,
 };
 
@@ -192,6 +193,8 @@ struct SettingsAppState {
     SettingsDialog dialog = SettingsDialog::kNone;
     size_t auto_sync_selected = 0;
     uint32_t auto_sync_interval_min = 0;
+    int volume_percent = 100;
+    size_t volume_selected = 0;
     std::string sync_status;
     std::string notice;
     SettingsDiagnosticsSnapshot diagnostics;

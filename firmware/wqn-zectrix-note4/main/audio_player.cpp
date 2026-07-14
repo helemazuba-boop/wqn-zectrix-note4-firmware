@@ -12,6 +12,8 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "power_manager.h"
+#include "storage.h"
+#include "audio_volume.h"
 
 namespace {
 
@@ -42,6 +44,7 @@ constexpr uint8_t ES8311_CLK_MANAGER_REG04 = 0x04;
 constexpr uint8_t ES8311_CLK_MANAGER_REG05 = 0x05;
 constexpr uint8_t ES8311_CLK_MANAGER_REG06 = 0x06;
 constexpr uint8_t ES8311_CLK_MANAGER_REG07 = 0x07;
+constexpr uint8_t ES8311_CLK_MANAGER_REG08 = 0x08;
 constexpr uint8_t ES8311_SDPIN_REG09 = 0x09;
 constexpr uint8_t ES8311_SDPOUT_REG0A = 0x0A;
 constexpr uint8_t ES8311_SYSTEM_REG0B = 0x0B;
@@ -71,10 +74,8 @@ PlayerState g_player;
 
 void SetAudioPowerForPlayback(bool enabled)
 {
-    gpio_hold_dis(kAudioPower);
-    gpio_set_level(kAudioPower, enabled ? 1 : 0);
-    gpio_hold_en(kAudioPower);
-
+    // [inflight-fix] GPIO42 (codec power) is boot-常通 - do not toggle.
+    // Only manage the PA (GPIO46): on for playback, off otherwise.
     gpio_hold_dis(kAudioAmp);
     gpio_set_level(kAudioAmp, enabled ? 1 : 0);
     gpio_hold_en(kAudioAmp);
@@ -194,18 +195,18 @@ esp_err_t InitEs8311Dac(i2c_master_bus_handle_t bus)
     ret |= write(ES8311_SYSTEM_REG0E, 0x02);
     ret |= write(ES8311_SYSTEM_REG12, 0x00);
 
-    ret |= write(ES8311_DAC_REG37, 0x16);
+    ret |= write(ES8311_DAC_REG37, 0x16);            // [dac-fix] DAC output enable (Gemini 0x08 -> TTS silent; reverted to 0x16)
 
     uint8_t dac_iface = 0;
     if (ReadCodecReg(dev, ES8311_SDPIN_REG09, &dac_iface) == ESP_OK) {
-        dac_iface &= ~0x40;
+        dac_iface = (dac_iface & ~0x40) | 0x0C;  // [wordlen-fix] 16bit I2S (bit[4:2]=011, bit[1:0]=00) - reverted from Gemini 0x0D (LJ broke format)
         ret |= write(ES8311_SDPIN_REG09, dac_iface);
     } else {
         ret = ESP_FAIL;
     }
     uint8_t adc_iface = 0;
     if (ReadCodecReg(dev, ES8311_SDPOUT_REG0A, &adc_iface) == ESP_OK) {
-        adc_iface &= ~0x40;
+        adc_iface = (adc_iface & ~0x40) | 0x0C;  // [wordlen-fix] 16bit I2S (bit[4:2]=011, bit[1:0]=00) - reverted from Gemini 0x0D (LJ broke format)
         ret |= write(ES8311_SDPOUT_REG0A, adc_iface);
     } else {
         ret = ESP_FAIL;
@@ -215,12 +216,15 @@ esp_err_t InitEs8311Dac(i2c_master_bus_handle_t bus)
     ret |= write(ES8311_CLK_MANAGER_REG03, 0x10);
     ret |= write(ES8311_CLK_MANAGER_REG04, 0x10);
     ret |= write(ES8311_CLK_MANAGER_REG05, 0x00);
-    ret |= write(ES8311_CLK_MANAGER_REG06, 0x0F);
+    ret |= write(ES8311_CLK_MANAGER_REG06, 0x0F);    // bclk_div = 16 (esp_codec_dev official; Gemini 0x03 broke clock - reverted)
     ret |= write(ES8311_CLK_MANAGER_REG07, 0x00);
 
     ret |= write(ES8311_SYSTEM_REG0B, 0x44);
     ret |= write(ES8311_SYSTEM_REG0C, 0x00);
 
+    // [hw-volume] Apply persisted volume to ES8311 DAC registers (0x32/0x31)
+    // before releasing the I2C device handle. Software PCM scaling was removed.
+    wqn::SetEs8311Volume(dev, wqn::GetPlaybackVolumePercent());
     ESP_ERROR_CHECK_WITHOUT_ABORT(i2c_master_bus_rm_device(dev));
     if (ret == ESP_OK) {
         ESP_LOGI(kTag, "ES8311 DAC init ok: sample_rate=%d", kPlaybackSampleRate);
@@ -345,6 +349,8 @@ esp_err_t PlayPcmSamples(const int16_t* samples, size_t count)
     }
 
     std::vector<int16_t> stereo(count * 2);
+    // [hw-volume] PCM sent at 100% - volume is the ES8311 DAC register
+    // (0x32/0x31) set during InitEs8311Dac, not software scaling.
     for (size_t i = 0; i < count; ++i) {
         const int16_t s = samples[i];
         stereo[i * 2] = s;

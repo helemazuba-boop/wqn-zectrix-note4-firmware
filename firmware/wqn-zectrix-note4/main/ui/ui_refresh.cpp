@@ -303,6 +303,10 @@ std::string FrameSignature(const wqn::UiFrame& frame)
         signature.push_back('/');
         signature.append(std::to_string(frame.settings.auto_sync_interval_min));
         signature.push_back('/');
+        signature.append(std::to_string(frame.settings.volume_percent));
+        signature.push_back('/');
+        signature.append(std::to_string(frame.settings.volume_selected));
+        signature.push_back('/');
         signature.append(frame.settings.sync_status);
         signature.push_back('/');
         signature.append(frame.settings.notice);

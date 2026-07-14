@@ -16,7 +16,7 @@ namespace device_ui_internal {
 
 constexpr char kTag[] = "wqn_ui";
 constexpr gpio_num_t kChargeDetect = GPIO_NUM_2;            // CHRG_L: low means charging.
-constexpr gpio_num_t kChargeFull = GPIO_NUM_1;              // STDBY_H: high means full.
+constexpr gpio_num_t kChargeFull = GPIO_NUM_1;              // /STDBY: low means full (active-low, open-drain). Matches power_manager.cpp IsFullyCharged().
 constexpr int kBatteryShutdownPercent = 0;
 constexpr int kBatteryShutdownMv = 3450;
 constexpr int kBatteryShutdownDebounceCount = 3;
@@ -76,7 +76,13 @@ bool ReadBatteryStatus(BatteryReading* reading)
     reading->chrg_l = gpio_get_level(kChargeDetect);
     reading->stdby_h = gpio_get_level(kChargeFull);
     reading->charging = reading->chrg_l == 0;
-    reading->full = reading->stdby_h == 1;
+    // [charge-polarity-fix] /STDBY is active-low (TP4056 open-drain): driven
+    // LOW when full/standby, floats HIGH otherwise. power_manager.cpp
+    // IsFullyCharged() already reads == 0; this UI path was inverted (== 1),
+    // which showed "满电" while charging/discharging and hid "满电" when actually
+    // full. It also gated CheckLowBatteryProtection's depleted_candidate on
+    // !full, so a discharging battery could never trip the shutdown debounce.
+    reading->full = reading->stdby_h == 0;
     reading->power_present_or_status_known = reading->charging || reading->full;
     reading->pmu_status = kPmuStatusUnknown;
     reading->pmu_implemented = false;

@@ -325,6 +325,8 @@ esp_err_t ScanPackFile(
     }
     if (!std::feof(file)) {
         index->truncated = true;
+        // [trunc-warn] Log when the pack exceeds the hard cap so it's not silent
+        ESP_LOGW(kTag, "word pack truncated at kMaxIndexEntries=%zu (pack=%s) - excess entries dropped", kMaxIndexEntries, item.pack_id.c_str());
     }
     std::fclose(file);
     return ESP_OK;

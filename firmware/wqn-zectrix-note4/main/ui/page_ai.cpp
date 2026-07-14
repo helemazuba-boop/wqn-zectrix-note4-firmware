@@ -32,7 +32,7 @@ constexpr int kAiStatusBarH = 27;
 // vertical space we previously lost to the redundant toast strip.
 constexpr int kAiViewportY = kAiStatusBarY + kAiStatusBarH;     // 27
 constexpr int kAiViewportH = wqn::kEpdHeight - kAiViewportY;     // 273
-constexpr int kAiLineH = 18;                                   // single line height
+constexpr int kAiLineH = kCjkLineHeight;                                   // single line height
 constexpr int kAiLineGap = 4;                                  // vertical gap between bubbles
 constexpr int kAiAssistantLeftBorder = 4;                      // assistant left edge 4px inset
 constexpr int kAiHistoryLeftPad = 6;
@@ -213,7 +213,7 @@ int DrawThinkingBlock(int x, int y, int max_w, const std::string& text)
     for (int r = 0; r < row_count; ++r) {
         const int line_y = y + r * row_h + 4;
         if (line_y >= kAiViewportY && line_y + row_h <= wqn::kEpdHeight) {
-            DRC(text_x, line_y, lines[r].c_str(), false);
+            DRC(text_x, line_y, lines[r].c_str(), true);
         }
     }
     return total_h;

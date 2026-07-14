@@ -10,11 +10,10 @@
 namespace device_ui_internal {
 
 constexpr char kTag[] = "wqn_ui";
-constexpr int kEpdTextWidth = wqn::kEpdWidth - 12;
 
 std::string LimitForEpd(const std::string& text)
 {
-    return wqn::TruncateUtf8TextToWidth(text, kEpdTextWidth);
+    return wqn::TruncateUtf8TextToWidth(text, kTextWidth);
 }
 
 esp_err_t DrawClippedText(int x, int y, int max_width, const std::string& text, bool black)
@@ -37,7 +36,7 @@ esp_err_t DrawWrappedText(int x, int y, int width, const std::string& text, int 
     int line_y = y;
     for (const std::string& line : lines) {
         ESP_RETURN_ON_ERROR(wqn::DrawUtf8Text(x, line_y, line.c_str(), black), kTag, "draw wrapped text");
-        line_y += 18;
+        line_y += kCjkLineHeight;
     }
     return ESP_OK;
 }

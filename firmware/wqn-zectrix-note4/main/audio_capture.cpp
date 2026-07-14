@@ -104,12 +104,11 @@ int64_t IntegerSqrt(int64_t value)
     return result;
 }
 
-void SetAudioPowerUnlocked(bool enabled)
+void SetAudioPowerUnlocked(bool /*enabled*/)
 {
-    gpio_hold_dis(kAudioPower);
-    gpio_set_level(kAudioPower, enabled ? 1 : 0);
-    gpio_hold_en(kAudioPower);
-
+    // [inflight-fix] GPIO42 (codec power) is boot-常通 - do not toggle here
+    // (was causing pop + cold-start recording garbage). Only manage the PA
+    // (GPIO46): off during capture to avoid feedback.
     gpio_hold_dis(kAudioAmp);
     gpio_set_level(kAudioAmp, 0);
     gpio_hold_en(kAudioAmp);
@@ -297,12 +296,12 @@ esp_err_t InitEs8311Adc(i2c_master_bus_handle_t bus)
     ret |= write(ES8311_CLK_MANAGER_REG08, 0xFF);
 
     if (read(ES8311_SDPOUT_REG0A, &reg) == ESP_OK) {
-        ret |= write(ES8311_SDPOUT_REG0A, reg & ~0x40);
+        ret |= write(ES8311_SDPOUT_REG0A, (reg & ~0x40) | 0x0C);  // [wordlen-fix] 16bit WL matches I2S 16bit
     } else {
         ret = ESP_FAIL;
     }
     if (read(ES8311_SDPIN_REG09, &reg) == ESP_OK) {
-        ret |= write(ES8311_SDPIN_REG09, reg & ~0x40);
+        ret |= write(ES8311_SDPIN_REG09, (reg & ~0x40) | 0x0C);  // [wordlen-fix] 16bit WL matches I2S 16bit
     } else {
         ret = ESP_FAIL;
     }

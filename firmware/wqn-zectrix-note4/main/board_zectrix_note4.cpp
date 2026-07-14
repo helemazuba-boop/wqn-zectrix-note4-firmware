@@ -72,7 +72,12 @@ esp_err_t InitZectrixNote4SafePins()
     ESP_RETURN_ON_ERROR(ConfigureOutputs(disabled_power_outputs), kTag, "configure power outputs");
 
     gpio_set_level(kEpdPower, 0);
-    gpio_set_level(kAudioPower, 0);
+    // [inflight-fix] ES8311 codec power (GPIO42) ON at boot and held - never
+    // toggled per turn. Mirrors xiaozhi/Zectrix closed firmware. Frequent
+    // cycling caused pop + cold-start recording garbage (ADC unstable for
+    // ~hundreds of ms after power-on). Low-power via codec registers, not GPIO42.
+    gpio_set_level(kAudioPower, 1);
+    gpio_hold_en(kAudioPower);
     gpio_set_level(kAudioAmp, 0);
     gpio_set_level(kNfcPower, 0);
     gpio_set_level(kLed, 1);

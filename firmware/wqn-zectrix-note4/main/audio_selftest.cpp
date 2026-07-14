@@ -35,10 +35,10 @@ constexpr gpio_num_t kCodecScl = GPIO_NUM_48;
 constexpr i2c_port_num_t kCodecI2cPort = I2C_NUM_0;
 constexpr uint8_t kEs8311Address = 0x18;
 
-constexpr int kSampleRate = 16000;
+constexpr int kSampleRate = 24000;
 constexpr int kChannels = 2;
 constexpr int kCaptureSeconds = 2;
-constexpr size_t kReadFrames = 240;
+constexpr size_t kReadFrames = 360;
 constexpr size_t kReadSamples = kReadFrames * kChannels;
 
 constexpr uint8_t ES8311_RESET_REG00 = 0x00;
@@ -134,12 +134,10 @@ void LogChannelStats(const char* name, const ChannelStats& stats)
         static_cast<int>(stats.peak));
 }
 
-void SetAudioPower(bool enabled)
+void SetAudioPower(bool /*enabled*/)
 {
-    gpio_hold_dis(kAudioPower);
-    gpio_set_level(kAudioPower, enabled ? 1 : 0);
-    gpio_hold_en(kAudioPower);
-
+    // [inflight-fix] GPIO42 (codec power) is boot-常通 - do not toggle.
+    // Only manage the PA (GPIO46): off (selftest keeps amp off).
     gpio_hold_dis(kAudioAmp);
     gpio_set_level(kAudioAmp, 0);
     gpio_hold_en(kAudioAmp);
@@ -444,7 +442,12 @@ esp_err_t RunProbeAndCapture()
 
     result = CaptureI2sStats();
 
-    ESP_ERROR_CHECK_WITHOUT_ABORT(i2c_del_master_bus(i2c_bus));
+    // [shared-i2c-fix] Only delete the bus if selftest created it. InitI2c
+    // reuses wqn::GetSharedI2cBusHandle() when available; deleting that shared
+    // bus here would kill RTC (pcf8563) + NFC + power-mgr I2C access -> panic.
+    if (i2c_bus != nullptr && i2c_bus != wqn::GetSharedI2cBusHandle()) {
+        ESP_ERROR_CHECK_WITHOUT_ABORT(i2c_del_master_bus(i2c_bus));
+    }
     SetAudioPower(false);
     ESP_LOGI(kTag, "audio power off");
     if (result != ESP_OK) {

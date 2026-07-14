@@ -11,7 +11,6 @@
 namespace device_ui_internal {
 
 constexpr char kTag[] = "wqn_ui";
-constexpr int kWrappedBodyMaxLines = 4;
 
 esp_err_t DrawMetricCard(int x, int y, int width, const wqn::HomeMetric& metric)
 {

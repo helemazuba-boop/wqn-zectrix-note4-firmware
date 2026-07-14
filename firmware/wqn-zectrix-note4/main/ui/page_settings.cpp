@@ -38,9 +38,11 @@ esp_err_t DrawSettingsRow(size_t row_index, int y, const std::string& title, con
     } else if (row_index == 1) {
         tag = "设置";
     } else if (row_index == 4) {
-        tag = "系统";
+        tag = "设置";  // volume
     } else if (row_index == 5) {
-        tag = "重置";
+        tag = "系统";  // firmware version
+    } else if (row_index == 6) {
+        tag = "重置";  // factory reset
     }
     DrawRect(kX + 298, y + 8, 54, 20);
     ESP_RETURN_ON_ERROR(DrawCenteredText(kX + 298, y + 10, 54, tag), kTag, "draw settings tag");
@@ -132,6 +134,20 @@ esp_err_t RenderSettingsDialog(const wqn::SettingsAppState& settings)
             ESP_RETURN_ON_ERROR(DrawClippedText(88, 202, 224, "PSRAM free: " + BytesLabel(diag.psram_free)), kTag, "draw psram free");
             break;
         }
+        case wqn::SettingsDialog::kVolume: {
+            ESP_RETURN_ON_ERROR(DrawSettingsDialogBox("音量"), kTag, "draw volume dialog");
+            for (size_t i = 0; i < kVolumeOptionsCount; ++i) {
+                const int x = (i % 2 == 0) ? 88 : 204;
+                const int y = 94 + static_cast<int>(i / 2) * 40;
+                const bool selected = i == settings.volume_selected;
+                ESP_RETURN_ON_ERROR(
+                    DrawSettingsOptionCard(x, y, 96, wqn::VolumeLabel(kVolumeOptions[i]), selected),
+                    kTag,
+                    "draw volume option");
+            }
+            ESP_RETURN_ON_ERROR(DrawCenteredText(86, 202, 228, "上下选择  确认保存"), kTag, "draw volume help");
+            break;
+        }
         case wqn::SettingsDialog::kFactoryReset:
             ESP_RETURN_ON_ERROR(DrawSettingsDialogBox("恢复出厂"), kTag, "draw factory reset dialog");
             ESP_RETURN_ON_ERROR(DrawWrappedText(54, 98, 292, "将清除 NVS 中的配对、缓存、待上传、AI 会话、单词进度和设置。", 3), kTag, "draw reset body");
@@ -178,6 +194,7 @@ esp_err_t RenderSettingsToEpd(const wqn::UiFrame& frame, RefreshSchedule schedul
     }
 
     const std::string auto_sync_label = wqn::AutoSyncIntervalLabel(settings.auto_sync_interval_min);
+    const std::string volume_label = wqn::VolumeLabel(settings.volume_percent);
     const std::string battery_value =
         diag.full ? "满电" : (diag.charging ? "充电 " + std::to_string(diag.battery_percent) + "%" : std::to_string(diag.battery_percent) + "%");
     const std::string storage_value = "NVS " + std::to_string(diag.nvs_used_entries) + "/" + std::to_string(diag.nvs_total_entries);
@@ -188,6 +205,7 @@ esp_err_t RenderSettingsToEpd(const wqn::UiFrame& frame, RefreshSchedule schedul
         "自动同步间隔",
         "电量",
         "存储详情",
+        "音量",
         "固件版本",
         "恢复出厂",
     };
@@ -196,6 +214,7 @@ esp_err_t RenderSettingsToEpd(const wqn::UiFrame& frame, RefreshSchedule schedul
         auto_sync_label,
         battery_value,
         storage_value,
+        volume_label,
         version_value,
         "",
     };
@@ -231,6 +250,8 @@ void OpenSettingsDialog(wqn::UiState* state, wqn::SettingsDialog dialog)
     state->settings.dialog = dialog;
     if (dialog == wqn::SettingsDialog::kAutoSync) {
         state->settings.auto_sync_selected = AutoSyncOptionIndex(state->settings.auto_sync_interval_min);
+    } else if (dialog == wqn::SettingsDialog::kVolume) {
+        state->settings.volume_selected = VolumeOptionIndex(state->settings.volume_percent);
     }
 }
 

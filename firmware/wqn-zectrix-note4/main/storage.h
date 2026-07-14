@@ -60,6 +60,10 @@ esp_err_t ClearAiSession();
 esp_err_t LoadAutoSyncIntervalMinutes(uint32_t* minutes);
 esp_err_t SaveAutoSyncIntervalMinutes(uint32_t minutes);
 std::string AutoSyncIntervalLabel(uint32_t minutes);
+esp_err_t LoadVolumePercent(int* percent);
+esp_err_t SaveVolumePercent(int percent);
+std::string VolumeLabel(int percent);
+int GetPlaybackVolumePercent();  // cached level (0-100); applied to ES8311 DAC registers
 esp_err_t FactoryResetNvsAndRestart();
 
 esp_err_t LoadWifiCredentials(std::string* ssid, std::string* password);

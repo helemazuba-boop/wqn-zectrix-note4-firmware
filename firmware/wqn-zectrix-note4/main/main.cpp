@@ -508,6 +508,15 @@ extern "C" void app_main(void)
     LogCachedProblemState();
     LogPendingReviewState();
 
+    // [volume] Restore persisted playback volume into the process-wide cache so
+    // the first playback after boot uses the user's level, not the 100% default.
+    {
+        int boot_volume = 100;
+        if (wqn::LoadVolumePercent(&boot_volume) == ESP_OK) {
+            ESP_LOGI(kTag, "playback volume restored: %d%%", boot_volume);
+        }
+    }
+
     const bool contract_ok = wqn::RunContractFixtureSelfTest();
     if (!contract_ok) {
         ESP_LOGE(kTag, "contract fixture self-test failed; network flow will continue for pairing");

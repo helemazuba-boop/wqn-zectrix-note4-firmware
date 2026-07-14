@@ -230,7 +230,9 @@ void DrawTimelineNode(int cx, int cy, bool selected)
             if (distance > kRadius * kRadius) {
                 continue;
             }
-            wqn::DrawEpdPixel(cx + dx, cy + dy, false);
+            // [L3-cleanup] Removed a dead white-pixel write that was immediately
+            // overwritten by the black/white write below. Selected = solid black
+            // disc; unselected = black ring (distance >= inner^2) + white core.
             const bool black = selected || distance >= kInnerRadius * kInnerRadius;
             wqn::DrawEpdPixel(cx + dx, cy + dy, black);
         }

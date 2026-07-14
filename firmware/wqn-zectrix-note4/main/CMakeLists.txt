@@ -5,6 +5,7 @@ idf_component_register(
         "ai_session.cpp"
         "audio_capture.cpp"
         "audio_player.cpp"
+        "audio_volume.cpp"
         "audio_selftest.cpp"
         "board_zectrix_note4.cpp"
         "button_input.cpp"
