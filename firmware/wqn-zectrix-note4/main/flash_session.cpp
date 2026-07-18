@@ -175,11 +175,6 @@ struct FlashState {
 
 FlashState g_flash;
 
-std::pmr::string FlashPmrText(const std::string& text)
-{
-    return std::pmr::string(text.data(), text.size());
-}
-
 bool EnsureFlashThinkingHistoryLocked(int64_t now_ms)
 {
     if (!g_flash.history_user_committed || g_flash.thinking_text.empty()) {
@@ -188,12 +183,12 @@ bool EnsureFlashThinkingHistoryLocked(int64_t now_ms)
     const std::string label = "💭 " + g_flash.thinking_text;
     wqn::AiHistory& history = wqn::GetAiHistory(wqn::AiHistoryChannel::kFlash);
     if (g_flash.thinking_message_id == wqn::kInvalidChatMessageId) {
-        g_flash.thinking_message_id = history.AppendThinking(FlashPmrText(label), now_ms);
+        g_flash.thinking_message_id = history.AppendThinking(label, now_ms);
         return g_flash.thinking_message_id != wqn::kInvalidChatMessageId;
     }
     return history.ReplaceText(g_flash.thinking_message_id,
                                wqn::ChatMessageKind::kThinking,
-                               FlashPmrText(label), now_ms);
+                               label, now_ms);
 }
 
 bool FinalizeFlashAssistantLocked(int64_t now_ms)
@@ -204,12 +199,12 @@ bool FinalizeFlashAssistantLocked(int64_t now_ms)
     wqn::AiHistory& history = wqn::GetAiHistory(wqn::AiHistoryChannel::kFlash);
     if (g_flash.assistant_message_id == wqn::kInvalidChatMessageId) {
         g_flash.assistant_message_id =
-            history.AppendAssistant(FlashPmrText(g_flash.assistant_text), now_ms);
+            history.AppendAssistant(g_flash.assistant_text, now_ms);
         return g_flash.assistant_message_id != wqn::kInvalidChatMessageId;
     }
     return history.ReplaceText(g_flash.assistant_message_id,
                                wqn::ChatMessageKind::kAssistant,
-                               FlashPmrText(g_flash.assistant_text), now_ms);
+                               g_flash.assistant_text, now_ms);
 }
 
 void ResetFlashTurnAssemblyLocked()
@@ -966,6 +961,19 @@ void CleanupStreamHardware()
     // would race with the first playback block.
 }
 
+void FinishAudioStreamingTask(const char* error_message = nullptr)
+{
+    CleanupStreamHardware();
+    xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+    g_flash.capture_started = false;
+    g_flash.stream_task = nullptr;
+    if (error_message != nullptr) {
+        SetErrorLocked(error_message);
+    }
+    xSemaphoreGive(g_flash.mutex);
+    vTaskDelete(nullptr);
+}
+
 // [i2s-handoff] Session-level teardown of the duplex I2S channels. Unlike
 // CleanupStreamHardware (per-turn, keeps channels常驻 so TTS can play after
 // capture stops), this DELETES stream_rx/stream_tx so STD/Pro can claim
@@ -1046,7 +1054,7 @@ void AudioStreamingTask(void* param)
         if (i2c_new_master_bus(&bus_cfg, &g_flash.stream_i2c_bus) != ESP_OK) {
             ESP_LOGW(kTag, "stream I2C bus init failed");
             g_flash.stream_i2c_bus = nullptr;
-            vTaskDelete(nullptr);
+            FinishAudioStreamingTask("音频总线初始化失败");
             return;
         }
     }
@@ -1054,16 +1062,14 @@ void AudioStreamingTask(void* param)
     // Init ES8311 ADC
     if (InitStreamEs8311Adc(g_flash.stream_i2c_bus) != ESP_OK) {
         ESP_LOGW(kTag, "stream ES8311 ADC init failed");
-        CleanupStreamHardware();
-        vTaskDelete(nullptr);
+        FinishAudioStreamingTask("麦克风初始化失败");
         return;
     }
 
     // Init I2S RX
     if (InitStreamI2sDuplex(&g_flash.stream_rx) != ESP_OK) {
         ESP_LOGW(kTag, "stream I2S RX init failed");
-        CleanupStreamHardware();
-        vTaskDelete(nullptr);
+        FinishAudioStreamingTask("音频通道初始化失败");
         return;
     }
 
@@ -1191,18 +1197,19 @@ void AudioStreamingTask(void* param)
     }
 
     ESP_LOGI(kTag, "audio streaming task exiting");
-    CleanupStreamHardware();
-    // Clear the global handle BEFORE self-deletion so StopAudioStreaming()
-    // can detect task exit without touching already-freed memory.
-    xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
-    g_flash.stream_task = nullptr;
-    xSemaphoreGive(g_flash.mutex);
-    vTaskDelete(nullptr);
+    // Clear the global handle before self-deletion so StopAudioStreaming can
+    // detect every exit path, including hardware-init failures above.
+    FinishAudioStreamingTask();
 }
 
 void StartAudioStreaming()
 {
+    if (g_flash.mutex == nullptr) {
+        return;
+    }
+    xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
     if (g_flash.stream_task != nullptr) {
+        xSemaphoreGive(g_flash.mutex);
         return;
     }
     // Power on audio hardware first
@@ -1219,29 +1226,38 @@ void StartAudioStreaming()
     // Capture starts with the speaker path closed. Do not set the drain flag
     // here: on the first turn the playback task may be blocked waiting for its
     // first item, and a stale drain request would discard that response.
-    if (g_flash.mutex != nullptr) {
-        xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
-        g_flash.playback_abort_requested = true;
-        g_flash.amp_idle_armed = false;
-        xSemaphoreGive(g_flash.mutex);
-    }
+    g_flash.playback_abort_requested = true;
+    g_flash.amp_idle_armed = false;
     SetStreamAudioAmp(false);
 
-    xTaskCreatePinnedToCore(&AudioStreamingTask, "flash_stream", 8192, nullptr, 10,
-                             &g_flash.stream_task, 1);
+    const BaseType_t created = xTaskCreatePinnedToCore(
+        &AudioStreamingTask, "flash_stream", 8192, nullptr, 10,
+        &g_flash.stream_task, 1);
+    if (created != pdPASS) {
+        g_flash.stream_task = nullptr;
+        g_flash.capture_started = false;
+        SetErrorLocked("录音任务启动失败");
+        ESP_LOGE(kTag, "audio streaming task create failed");
+    }
+    xSemaphoreGive(g_flash.mutex);
 }
 
 void StopAudioStreaming()
 {
-    if (g_flash.stream_task == nullptr) {
+    if (g_flash.mutex == nullptr) {
         return;
     }
     // Signal the task to stop by clearing the flag. Do NOT externally call
     // vTaskDelete() here — let the task delete itself after it reads the flag
     // and cleans up. Otherwise we risk a double-cleanup (task deleting itself
     // while we also try to delete it) and a double-free of hardware resources.
+    xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
     g_flash.capture_started = false;
-    TaskHandle_t task = g_flash.stream_task;
+    const TaskHandle_t task = g_flash.stream_task;
+    xSemaphoreGive(g_flash.mutex);
+    if (task == nullptr) {
+        return;
+    }
     // [panic-fix] Wait for the task to self-delete. The task can block in
     // esp_websocket_client_send_bin (1 s timeout) or i2s_channel_read (200 ms),
     // so it needs up to ~1.2 s after capture_started is cleared to exit. 3.0 s
@@ -1249,7 +1265,10 @@ void StopAudioStreaming()
     // alive (see below) - never vTaskDelete (corrupts FreeRTOS lists -> reboot).
     for (int i = 0; i < 300; ++i) {  // 3.0s (was 2.0s)
         vTaskDelay(pdMS_TO_TICKS(10));
-        if (g_flash.stream_task == nullptr) {
+        xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+        const bool stopped = g_flash.stream_task == nullptr;
+        xSemaphoreGive(g_flash.mutex);
+        if (stopped) {
             // Task self-deleted successfully
             return;
         }
@@ -1257,12 +1276,9 @@ void StopAudioStreaming()
     // Task still alive — force cleanup (rare fallback for hung task)
     ESP_LOGE(kTag, "streaming task did not exit within 3s; leaving alive (will exit on WS destroy)");
     CleanupStreamHardware();
-    if (eTaskGetState(task) != eDeleted) {
-        // [panic-fix] Do NOT vTaskDelete a task blocked in a driver/WS syscall -
-        // it corrupts FreeRTOS lists (StoreProhibited reboot; decoded backtrace:
-        // uxListRemove<-vTaskDelete<-StopAudioStreaming). Leave it alive;
-        // StopFlashSession's WS destroy unblocks send_bin so it self-exits.
-    }
+    // Do not query or delete `task` here: it may self-delete between the poll
+    // and this point, making even eTaskGetState(task) a stale-handle access.
+    // WebSocket destruction will unblock a still-live sender so it can exit.
     (void)task;
 }
 
@@ -1391,7 +1407,7 @@ void ParseAndHandleEvent(const char* data, size_t len)
             if (!g_flash.history_user_committed && tr[0] != '\0') {
                 g_flash.history_user_committed =
                     wqn::GetAiHistory(wqn::AiHistoryChannel::kFlash)
-                        .AppendUser(FlashPmrText(tr), now_ms) != wqn::kInvalidChatMessageId;
+                        .AppendUser(tr, now_ms) != wqn::kInvalidChatMessageId;
             }
             // ASR establishes the ordering boundary. Any Thinking accumulated
             // before ASR now appears once, immediately after User. Do not clear

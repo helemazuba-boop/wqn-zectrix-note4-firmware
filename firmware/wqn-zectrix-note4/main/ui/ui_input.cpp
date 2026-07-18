@@ -309,6 +309,10 @@ static RefreshSchedule ApplyStatusBarEditEvent(const wqn::ButtonEvent& event, wq
             if (s > max_idx) { s = 0; }
             state->status_edit.selected = static_cast<uint8_t>(s);
             state->status_edit.last_action_ms = now_ms;
+            // A double-confirm is only meaningful for two presses on the
+            // same toggle. Do not let a recent cycle on the previous icon
+            // reverse a value that was never changed on the new selection.
+            state->status_edit.last_cycle_ms = 0;
             return RefreshSchedule::kSelection;
         }
         return RefreshSchedule::kNone;
@@ -377,6 +381,12 @@ RefreshSchedule ApplyButtonEvent(const wqn::ButtonEvent& event, wqn::UiState* st
          event.type == wqn::ButtonEventType::kHoldPress)) {
 #if CONFIG_WQN_AI_ENABLE
         if (state->ai.tier == wqn::AiTier::kFlash) {
+            if (event.type == wqn::ButtonEventType::kPress) {
+                // Reset a stale candidate left by a screen/tier transition
+                // before this physical press starts a new PTT gesture.
+                g_flash_ptt_started = false;
+                return RefreshSchedule::kNone;
+            }
             if (event.type == wqn::ButtonEventType::kHoldPress) {
                 wqn::OnFlashButtonPressed();
                 g_flash_ptt_started = true;
@@ -393,6 +403,19 @@ RefreshSchedule ApplyButtonEvent(const wqn::ButtonEvent& event, wqn::UiState* st
         // Non-Flash tiers ignore raw/hold edges. Their legacy long-press path
         // below still starts recording at kLongPress.
         return RefreshSchedule::kNone;
+    }
+
+    // A 200..999 ms Flash PTT hold is still classified by button_input as a
+    // derived short/double press before its queued raw kRelease arrives. Do
+    // not treat that derived event as a status-bar double-confirm: doing so
+    // would enter edit mode and swallow the raw release, leaving capture on.
+    if (state->screen == wqn::UiScreen::kAi &&
+        state->ai.tier == wqn::AiTier::kFlash &&
+        event.button == wqn::ButtonId::kConfirm && g_flash_ptt_started &&
+        (event.type == wqn::ButtonEventType::kShortPress ||
+         event.type == wqn::ButtonEventType::kDoublePress ||
+         event.type == wqn::ButtonEventType::kLongRelease)) {
+        return RefreshSchedule::kAi;
     }
 
     const bool long_press = event.type == wqn::ButtonEventType::kLongPress;

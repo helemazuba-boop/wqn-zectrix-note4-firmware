@@ -1,8 +1,8 @@
 // wqn_api_stream.cpp - Implementation of the v2 SSE streaming AI client.
 //
 // Design notes:
-//   * We use a single esp_http_client in chunked mode. Post body is the
-//     multipart buffer built by MultipartEncoder.
+//   * The request body is raw 16 kHz mono s16le PCM. Metadata travels in the
+//     X-WQN-* headers shared with the cloud route's validated contract.
 //   * The event handler drives an SSE frame parser that calls back into the
 //     caller's WqnAiSseCallback on every complete frame.
 //   * We tolerate mid-stream disconnects: a partial frame is discarded and
@@ -17,7 +17,6 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <ctime>
 #include <string>
 #include <vector>
 
@@ -28,7 +27,6 @@
 #include "esp_http_client.h"
 #include "esp_log.h"
 #include "esp_mac.h"
-#include "esp_timer.h"
 #include "sse_chunk.h"
 #include "storage.h"
 
@@ -47,12 +45,8 @@ struct StreamContext {
   std::string error_code;
   std::string error_message;
   uint64_t last_event_id = 0;
+  bool terminal_event_seen = false;
 };
-
-bool ShouldKeepEvent(const wqn::WqnAiSseEvent& event)
-{
-  return true;
-}
 
 std::string BuildMacAddress()
 {
@@ -180,9 +174,11 @@ void DispatchEvent(StreamContext* ctx, const wqn::SseFrameBuffer& frame,
 
   // Drive ctx-level error state if this is an `error` frame.
   if (k == wqn::WqnAiSseEvent::Kind::kError) {
+    ctx->terminal_event_seen = true;
     ctx->error_code = ev.error_code.empty() ? "model_failed" : ev.error_code;
     ctx->error_message = ev.error_message;
   } else if (k == wqn::WqnAiSseEvent::Kind::kFinal && ctx->response != nullptr) {
+    ctx->terminal_event_seen = true;
     ctx->response->latency_ms = ev.latency_ms;
     ctx->response->conversation_id = ev.conversation_id;
     // Pull actions / function_calls into the response so legacy callers keep working.
@@ -249,13 +245,14 @@ void DispatchEvent(StreamContext* ctx, const wqn::SseFrameBuffer& frame,
   ctx->request.callback(ev, ctx->request.user_ctx);
 }
 
-esp_err_t WriteMultipartBody(esp_http_client_handle_t client,
-                             const std::string& body)
+esp_err_t WriteRequestBody(esp_http_client_handle_t client,
+                           const uint8_t* body, size_t body_size)
 {
   size_t written = 0;
-  while (written < body.size()) {
-    const size_t chunk = std::min<size_t>(body.size() - written, 2048);
-    const int w = esp_http_client_write(client, body.data() + written, chunk);
+  while (written < body_size) {
+    const size_t chunk = std::min<size_t>(body_size - written, 2048);
+    const int w = esp_http_client_write(
+        client, reinterpret_cast<const char*>(body + written), chunk);
     if (w <= 0) {
       return ESP_FAIL;
     }
@@ -322,7 +319,7 @@ esp_err_t OnHttpEvent(esp_http_client_event_t* evt)
     }
     case HTTP_EVENT_DISCONNECTED: {
       ESP_LOGD(kTag, "HTTP disconnected");
-      if (ctx->error_code.empty()) {
+      if (!ctx->terminal_event_seen && ctx->error_code.empty()) {
         // transport-level disconnect before final/error frame
         ctx->error_code = "model_failed";
         ctx->error_message = "stream disconnected before completion";
@@ -350,54 +347,13 @@ esp_err_t UploadAiAudioChatStream(const WqnAiStreamRequest& request,
   if (!wqn::IsValidAccessToken(request.token)) {
     return ESP_ERR_INVALID_STATE;
   }
-
-  // Build the multipart body.
-  wqn::MultipartEncoder mp;
-  mp.begin("ai-audio");
-
-  char audio_meta[256];
-  std::snprintf(audio_meta, sizeof(audio_meta),
-                "{\"sample_rate\":16000,\"sample_format\":\"s16le\",\"channels\":1,\"duration_ms\":%d,\"byte_size\":%u}",
-                request.duration_ms,
-                static_cast<unsigned>(request.pcm.size() * sizeof(int16_t)));
-  mp.part_json("audio_meta", std::string(audio_meta));
-
-  std::time_t now = 0;
-  std::time(&now);
-  int64_t boot_ms = esp_timer_get_time() / 1000;
-  // [shell->wire] session_meta now carries the thinking controls. Built as a
-  // std::string (not snprintf) so the xhigh system_prompt_extra (~200 chars)
-  // can't overflow a fixed buffer.
-  std::string session_meta = "{\"started_at_ms\":";
-  session_meta += std::to_string(static_cast<long long>(now) * 1000LL);
-  session_meta += ",\"ui_locale\":\"zh-CN\",\"active_tier\":\"";
-  session_meta += request.tier.empty() ? "std" : request.tier;
-  session_meta += "\",\"boot_ms\":";
-  session_meta += std::to_string(static_cast<long long>(boot_ms));
-  session_meta += ",\"enable_thinking\":";
-  session_meta += request.enable_thinking ? "true" : "false";
-  if (!request.reasoning_effort.empty()) {
-      session_meta += ",\"reasoning_effort\":\"";
-      session_meta += request.reasoning_effort;
-      session_meta += "\"";
+  if (request.pcm.empty() || request.duration_ms <= 0) {
+    return ESP_ERR_INVALID_ARG;
   }
-  if (!request.system_prompt_extra.empty()) {
-      session_meta += ",\"system_prompt_extra\":\"";
-      for (char c : request.system_prompt_extra) {  // escape JSON specials
-          if (c == '"' || c == '\\') session_meta += '\\';
-          session_meta += c;
-      }
-      session_meta += "\"";
-  }
-  session_meta += "}";
-  mp.part_json("session_meta", session_meta);
 
-  const uint8_t* pcm_bytes = reinterpret_cast<const uint8_t*>(request.pcm.data());
+  const uint8_t* pcm_bytes =
+      reinterpret_cast<const uint8_t*>(request.pcm.data());
   const size_t pcm_size = request.pcm.size() * sizeof(int16_t);
-  const std::string fname =
-      "turn-" + std::to_string(static_cast<long long>(now)) + ".pcm";
-  mp.part_binary("audio", fname, pcm_bytes, pcm_size);
-  mp.end();
 
   // Build the URL with the protocol query so v2 servers unambiguously switch.
   std::string url = std::string(WQN_API_BASE) + WQN_AI_SSE_REQUEST_PATH +
@@ -414,7 +370,7 @@ esp_err_t UploadAiAudioChatStream(const WqnAiStreamRequest& request,
   cfg.timeout_ms = request.timeout_ms > 0 ? request.timeout_ms : WQN_AI_SSE_TIMEOUT_MS;
   cfg.crt_bundle_attach = esp_crt_bundle_attach;
   cfg.buffer_size = 1024;                  // SSE lines are short; keep the buffer small
-  cfg.buffer_size_tx = 4096;                // multipart body is large
+  cfg.buffer_size_tx = 4096;
   cfg.event_handler = OnHttpEvent;
   cfg.user_data = &ctx;
 
@@ -425,8 +381,12 @@ esp_err_t UploadAiAudioChatStream(const WqnAiStreamRequest& request,
 
   std::string auth = "Bearer " + request.token;
   esp_http_client_set_header(client, "Authorization", auth.c_str());
-  esp_http_client_set_header(client, "Content-Type", nullptr);  // we override via the body
-  esp_http_client_set_header(client, "Content-Type", mp.boundary_for_header().c_str());
+  esp_http_client_set_header(client, "Content-Type", "application/octet-stream");
+  esp_http_client_set_header(client, "X-WQN-Audio-Sample-Rate", "16000");
+  esp_http_client_set_header(client, "X-WQN-Audio-Sample-Format", "s16le");
+  esp_http_client_set_header(client, "X-WQN-Audio-Channels", "1");
+  const std::string duration_ms = std::to_string(request.duration_ms);
+  esp_http_client_set_header(client, "X-WQN-Audio-Duration-Ms", duration_ms.c_str());
   esp_http_client_set_header(client, WQN_AI_SSE_HEADER_PROTOCOL,
                              WQN_AI_SSE_PROTOCOL_VALUE);
   esp_http_client_set_header(client, WQN_AI_SSE_HEADER_ACCEPT,
@@ -444,15 +404,25 @@ esp_err_t UploadAiAudioChatStream(const WqnAiStreamRequest& request,
   if (!request.request_id.empty()) {
     esp_http_client_set_header(client, "X-WQN-Request-Id", request.request_id.c_str());
   }
+  esp_http_client_set_header(
+      client, "X-WQN-Enable-Thinking",
+      request.enable_thinking ? "true" : "false");
+  if (!request.reasoning_effort.empty()) {
+    esp_http_client_set_header(
+        client, "X-WQN-Reasoning-Effort", request.reasoning_effort.c_str());
+  }
 
-  const std::string& body = mp.buffer();
-  esp_err_t err = esp_http_client_open(client, body.size());
+  esp_err_t err = esp_http_client_open(client, pcm_size);
   if (err == ESP_OK) {
-    err = WriteMultipartBody(client, body);
+    err = WriteRequestBody(client, pcm_bytes, pcm_size);
   }
 
   if (err == ESP_OK) {
-    err = esp_http_client_fetch_headers(client);
+    // fetch_headers returns the response Content-Length (which may be a
+    // positive byte count), not esp_err_t. Treat every non-negative value as
+    // success so a buffered/non-chunked SSE response is still consumed.
+    const int64_t header_result = esp_http_client_fetch_headers(client);
+    err = header_result < 0 ? ESP_FAIL : ESP_OK;
   }
   if (err == ESP_OK) {
     // Pull the chunked stream until close.

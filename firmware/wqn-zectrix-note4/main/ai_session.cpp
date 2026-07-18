@@ -59,11 +59,6 @@ struct StdProTurnAssembly {
 };
 StdProTurnAssembly g_turn;
 
-std::pmr::string PmrText(const std::string& text)
-{
-    return std::pmr::string(text.data(), text.size());
-}
-
 std::string ThinkingLabel(const std::string& text)
 {
     return text.empty() ? std::string() : std::string("💭 ") + text;
@@ -81,11 +76,11 @@ bool EnsureThinkingHistoryLocked(wqn::AiHistory& history, int64_t now_ms)
     }
     const std::string label = ThinkingLabel(g_turn.thinking_text);
     if (g_turn.thinking_id == wqn::kInvalidChatMessageId) {
-        g_turn.thinking_id = history.AppendThinking(PmrText(label), now_ms);
+        g_turn.thinking_id = history.AppendThinking(label, now_ms);
         return g_turn.thinking_id != wqn::kInvalidChatMessageId;
     }
     return history.ReplaceText(g_turn.thinking_id, wqn::ChatMessageKind::kThinking,
-                               PmrText(label), now_ms);
+                               label, now_ms);
 }
 
 bool FinalizeThinkingLocked(wqn::AiHistory& history, const std::string& authoritative,
@@ -107,11 +102,11 @@ bool FinalizeAssistantLocked(wqn::AiHistory& history, const std::string& authori
         return false;
     }
     if (g_turn.assistant_id == wqn::kInvalidChatMessageId) {
-        g_turn.assistant_id = history.AppendAssistant(PmrText(g_turn.assistant_text), now_ms);
+        g_turn.assistant_id = history.AppendAssistant(g_turn.assistant_text, now_ms);
         return g_turn.assistant_id != wqn::kInvalidChatMessageId;
     }
     return history.ReplaceText(g_turn.assistant_id, wqn::ChatMessageKind::kAssistant,
-                               PmrText(g_turn.assistant_text), now_ms);
+                               g_turn.assistant_text, now_ms);
 }
 
 void MarkChanged()
@@ -241,7 +236,7 @@ void OnSseEvent(const wqn::WqnAiSseEvent& ev)
             g_state.status_since_ms = now_ms;
             if (!g_turn.user_committed && !ev.text.empty()) {
                 g_turn.user_committed =
-                    history.AppendUser(PmrText(ev.text), now_ms) != wqn::kInvalidChatMessageId;
+                    history.AppendUser(ev.text, now_ms) != wqn::kInvalidChatMessageId;
             }
             EnsureThinkingHistoryLocked(history, now_ms);
             if (g_turn.assistant_terminal) {
@@ -310,7 +305,7 @@ void OnSseEvent(const wqn::WqnAiSseEvent& ev)
             g_state.function_call_summaries.push_back(ev.tool_name.empty() ? "tool" : ev.tool_name);
             g_state.status_detail = label;
             g_state.status_since_ms = now_ms;
-            history.AppendToolStart(PmrText(ev.tool_name), PmrText(ev.tool_display), now_ms);
+            history.AppendToolStart(ev.tool_name, ev.tool_display, now_ms);
             break;
         }
         case wqn::WqnAiSseEvent::Kind::kToolResult:
@@ -327,8 +322,8 @@ void OnSseEvent(const wqn::WqnAiSseEvent& ev)
             g_state.status_detail = label;
             g_state.status_since_ms = now_ms;
             history.PopLastIf(wqn::ChatMessageKind::kToolStart);
-            history.AppendToolResult(PmrText(ev.tool_name), PmrText(ev.tool_display),
-                                     PmrText(ev.tool_display), ev.tool_ok,
+            history.AppendToolResult(ev.tool_name, ev.tool_display,
+                                     ev.tool_display, ev.tool_ok,
                                      ev.tool_elapsed_ms, now_ms);
             break;
         }
@@ -530,23 +525,6 @@ std::string BuildAiActionSummary(const std::vector<wqn::WqnAiAction>& actions)
     return summary;
 }
 
-std::string CurrentLocalDay()
-{
-    std::time_t now = 0;
-    std::time(&now);
-    if (now < 1704067200) {
-        return "";
-    }
-    std::tm local = {};
-    localtime_r(&now, &local);
-    const int year = std::clamp(local.tm_year + 1900, 0, 9999);
-    const int month = std::clamp(local.tm_mon + 1, 1, 12);
-    const int day = std::clamp(local.tm_mday, 1, 31);
-    char buffer[16] = {};
-    std::snprintf(buffer, sizeof(buffer), "%04d-%02d-%02d", year, month, day);
-    return std::string(buffer);
-}
-
 std::string BuildStatusDetail(const wqn::WqnAiChatResponse& response)
 {
     std::string detail;
@@ -660,7 +638,6 @@ void SubmitTask(void*)
     g_state.toast_recording_ms = 0;
     MarkChanged();
     const std::string tier_str = g_state.tier == wqn::AiTier::kPro ? "pro" : "std";
-    const wqn::AiTier tier = g_state.tier;
     const wqn::ThinkingLevel thinking_level = g_state.thinking_level;
     const std::string conversation_id = g_conversation_id;
     g_streaming_active = true;
@@ -699,9 +676,8 @@ void SubmitTask(void*)
     req.duration_ms = audio.duration_ms;
     req.tier = tier_str;
     req.conversation_id = conversation_id;
-    // [shell->wire] thinking params from the snapshot (tier + thinking_level
-    // captured under lock above). reasoning_effort sent for both tiers; PRO
-    // adds enable_thinking (off->false) + xhigh system prompt at high.
+    // Thinking params from the snapshot (tier + thinking_level captured under
+    // lock above). The cloud maps the bounded level to provider parameters.
     {
         const char* effort = "medium";
         switch (thinking_level) {
@@ -712,15 +688,7 @@ void SubmitTask(void*)
             default: break;
         }
         req.reasoning_effort = effort;
-        if (tier == wqn::AiTier::kPro) {
-            req.enable_thinking = (thinking_level != wqn::ThinkingLevel::kOff);
-            if (thinking_level == wqn::ThinkingLevel::kHigh) {
-                req.system_prompt_extra =
-                    "Reasoning effort is set to xhigh. Please think carefully through the task, "
-                    "validate key assumptions, consider plausible alternatives, and prioritize "
-                    "correctness, consistency, and clarity in the final answer.";
-            }
-        }
+        req.enable_thinking = (thinking_level != wqn::ThinkingLevel::kOff);
     }
     req.request_id = GenerateRequestId(); // helper below
     req.callback = &TrampolineSseEvent;
@@ -813,22 +781,21 @@ void SubmitTask(void*)
 
             // Append User Question to History
             if (!g_state.user_text.empty()) {
-                std::pmr::string txt(g_state.user_text.data(), g_state.user_text.size());
-                wqn::GetAiHistory(wqn::AiHistoryChannel::kStdPro).AppendUser(std::move(txt), g_state.status_since_ms);
+                wqn::GetAiHistory(wqn::AiHistoryChannel::kStdPro)
+                    .AppendUser(g_state.user_text, g_state.status_since_ms);
             }
 
             // Append Tool/Action summaries if present
             for (const auto& summary : g_state.function_call_summaries) {
-                std::pmr::string nm("action", 6);
-                std::pmr::string args(summary.data(), summary.size());
-                std::pmr::string result("done", 4);
-                wqn::GetAiHistory(wqn::AiHistoryChannel::kStdPro).AppendToolResult(std::move(nm), std::move(args), std::move(result), true, 0, g_state.status_since_ms);
+                wqn::GetAiHistory(wqn::AiHistoryChannel::kStdPro)
+                    .AppendToolResult("action", summary, "done", true, 0,
+                                      g_state.status_since_ms);
             }
 
             // Append Assistant Reply to History
             if (!g_state.assistant_text.empty()) {
-                std::pmr::string txt(g_state.assistant_text.data(), g_state.assistant_text.size());
-                wqn::GetAiHistory(wqn::AiHistoryChannel::kStdPro).AppendAssistant(std::move(txt), g_state.status_since_ms);
+                wqn::GetAiHistory(wqn::AiHistoryChannel::kStdPro)
+                    .AppendAssistant(g_state.assistant_text, g_state.status_since_ms);
             }
 
             SaveTodaySessionLocked(response);
