@@ -747,13 +747,14 @@ UiFrame RenderUiFrame(const UiState& state)
     // provisioning prompt (which SoftAP to join + captive-portal URL). The
     // generic fallback in RenderFrameToEpd draws frame.lines for screens it
     // doesn't specialise, so no new renderer/dispatch is needed.
+    const std::string provisioning_ssid = wqn::GetProvisioningApSsid();
     if (wqn::GetProvisioningState() != wqn::ProvisionState::kIdle &&
-        wqn::GetProvisioningApSsid()[0] != '\0') {
+        !provisioning_ssid.empty()) {
         frame.screen = UiScreen::kProvisioning;
         frame.prefer_full_refresh = true;
         AddLine(&frame, UiTextStyle::kTitle, "设备配网");
         AddLine(&frame, UiTextStyle::kBody, "请用手机连接 WiFi 热点:");
-        AddLine(&frame, UiTextStyle::kSelected, wqn::GetProvisioningApSsid());
+        AddLine(&frame, UiTextStyle::kSelected, provisioning_ssid);
         AddLine(&frame, UiTextStyle::kBody, "然后浏览器访问:");
         AddLine(&frame, UiTextStyle::kSelected, "192.168.4.1");
         AddLine(&frame, UiTextStyle::kMeta, "输入家庭 WiFi 完成配网");

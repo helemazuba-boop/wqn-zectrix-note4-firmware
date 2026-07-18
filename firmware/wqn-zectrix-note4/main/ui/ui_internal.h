@@ -247,6 +247,7 @@ std::string TwoDigit(int value);
 void DrawHorizontalLine(int x, int y, int width);
 void DrawVerticalLine(int x, int y, int height);
 void DrawRect(int x, int y, int width, int height);
+void DrawRoundedRect(int x, int y, int width, int height, int radius);
 void FillRect(int x, int y, int width, int height, bool black);
 void ClearRect(const UiRect& rect);
 void DrawSegment(int x, int y, int width, int height);
@@ -275,6 +276,14 @@ int SevenSegmentTextWidth(const std::string& text, int scale);
 void DrawSevenSegmentDigit(int x, int y, int scale, char digit);
 void DrawSevenSegmentTextCentered(int y, const std::string& text, int scale);
 void DrawStandbyClockDigits(int y, const std::string& text);
+
+// Map ASCII digits/colon to font_zectrix artistic-glyph codepoints (clock + timer).
+std::string ZectrixArtText(const std::string& ascii);
+// Draw the running-timer duration with the 48px artistic digit font, centered.
+void DrawTimerDigitsArt(int y, const std::string& ascii_duration);
+// Draw [wifi][battery] status icons (font_zectrix_16_1) right-aligned at right_edge.
+// Returns the x just left of the cluster (for drawing time/other text before it).
+int DrawStatusBarIcons(int right_edge, int y, const wqn::HomeSummary& home);
 
 // ---- Home page --------------------------------------------------------------
 

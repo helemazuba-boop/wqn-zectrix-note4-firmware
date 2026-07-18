@@ -7,6 +7,8 @@
 
 #include "esp_err.h"
 
+#include "font_fmt.h"  // lv_font_t for DrawTextWithFont
+
 namespace wqn {
 
 constexpr int kEpdWidth = 400;
@@ -27,6 +29,12 @@ void DrawEpdPixel(int x, int y, bool black);
 
 esp_err_t DrawUtf8Text(int x, int y, const char* text, bool black = true);
 int MeasureUtf8TextWidth(const char* text);
+
+// Draw / measure text with an arbitrary LVGL-format font (e.g. font_zectrix_48_1).
+// Iterates UTF-8 codepoints; missing glyphs are skipped (zero width, nothing drawn).
+void DrawTextWithFont(int x, int y, const lv_font_t* font, const char* text, bool black = true);
+int MeasureTextWithFont(const lv_font_t* font, const char* text);
+void DrawTextWithFontCentered(int x, int y, int width, const lv_font_t* font, const char* text, bool black = true);
 std::string TruncateUtf8TextToWidth(const std::string& text, int max_width_px);
 std::vector<std::string> WrapUtf8TextToWidth(const std::string& text, int max_width_px, size_t max_lines);
 

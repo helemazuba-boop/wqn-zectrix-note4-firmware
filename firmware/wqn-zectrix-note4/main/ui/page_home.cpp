@@ -70,15 +70,7 @@ esp_err_t RenderHomeToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
 
     DrawHorizontalLine(0, 27, wqn::kEpdWidth);
     ESP_RETURN_ON_ERROR(wqn::DrawUtf8Text(10, 6, "首页", true), kTag, "draw home title");
-    std::string status = home.wifi_label;
-    if (!home.battery_label.empty()) {
-        status += "  " + home.battery_label;
-    }
-    const int status_width = wqn::MeasureUtf8TextWidth(status.c_str());
-    ESP_RETURN_ON_ERROR(
-        wqn::DrawUtf8Text(std::max(10, wqn::kEpdWidth - status_width - 10), 6, status.c_str(), true),
-        kTag,
-        "draw home status");
+    DrawStatusBarIcons(wqn::kEpdWidth - 10, 6, home);
 
     DrawRect(10, 35, 380, 26);
     ESP_RETURN_ON_ERROR(DrawCenteredText(10, 39, 380, home.primary_time_line), kTag, "draw home primary time");

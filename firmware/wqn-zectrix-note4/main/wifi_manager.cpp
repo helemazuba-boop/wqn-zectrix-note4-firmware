@@ -277,7 +277,15 @@ esp_err_t StartWifiWithCredentials(const char* ssid, const char* password)
             return ESP_ERR_NO_MEM;
         }
         wifi_init_config_t init_config = WIFI_INIT_CONFIG_DEFAULT();
-        ESP_RETURN_ON_ERROR(esp_wifi_init(&init_config), kTag, "init WiFi");
+        // [prov-handoff] WiFi 驱动全程只 init 一次、常驻不 deinit（官方
+        // esp-wifi-connect 范式）。配网（provision_manager::StartSoftAp）已
+        // 在 APSTA 模式下调过 esp_wifi_init()，这里会返回
+        // ESP_ERR_INVALID_STATE —— 复用活着的驱动即可，不要重 init。
+        // 无配网路径下返回 ESP_OK，行为不变。
+        const esp_err_t init_ret = esp_wifi_init(&init_config);
+        if (init_ret != ESP_OK && init_ret != ESP_ERR_INVALID_STATE) {
+            ESP_RETURN_ON_ERROR(init_ret, kTag, "init WiFi");
+        }
         ESP_RETURN_ON_ERROR(RegisterHandlers(), kTag, "register WiFi handlers");
         ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_STA), kTag, "set WiFi STA mode");
     }
@@ -365,6 +373,22 @@ bool IsWifiStationConnected()
     return g_wifi_connected;
 #else
     return false;
+#endif
+}
+
+int GetWifiRssi()
+{
+#if CONFIG_WQN_WIFI_STA_ENABLE
+    if (!g_wifi_connected) {
+        return 0;
+    }
+    wifi_ap_record_t ap;
+    if (esp_wifi_sta_get_ap_info(&ap) != ESP_OK) {
+        return 0;
+    }
+    return ap.rssi;
+#else
+    return 0;
 #endif
 }
 

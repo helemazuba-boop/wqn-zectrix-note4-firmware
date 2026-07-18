@@ -7,6 +7,7 @@
 
 #include "epd_display.h"
 #include "esp_log.h"
+#include "font_zectrix.h"
 #include "word_app.h"
 
 namespace device_ui_internal {
@@ -52,19 +53,60 @@ esp_err_t RenderWordToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
     };
 
     if (word.mode == wqn::WordAppMode::kHome) {
-        ESP_RETURN_ON_ERROR(DrawCenteredText(20, 72, 360, "单词复习"), kTag, "draw word home title");
+        // [word-home-cards] Prototype 16: three rounded feature cards in the
+        // content area (no centered "单词复习" big title — the status bar already
+        // says 单词). Selected = rounded + 2px concentric double-line (user's
+        // rounded design language). Left = font_zectrix glyph, center = title +
+        // dynamic subtitle, right = a rounded status chip.
+        constexpr int kCardX = 10;
+        constexpr int kCardW = 380;
+        constexpr int kCardH = 60;
+        constexpr int kCardGap = 12;
+        constexpr int kCardY0 = 66;
+        const std::string count_chip = std::to_string(word.total_count) + " 词";
+        auto draw_card = [&word, &count_chip](int y0, const char* icon, const std::string& title, const std::string& subtitle,
+                                              const std::string& chip, bool selected) -> esp_err_t {
+            DrawRoundedRect(kCardX, y0, kCardW, kCardH, 6);
+            if (selected) {
+                DrawRoundedRect(kCardX + 2, y0 + 2, kCardW - 4, kCardH - 4, 4);
+            }
+            wqn::DrawTextWithFont(kCardX + 16, y0 + 22, &font_zectrix_16_1, icon, true);  // returns void
+            ESP_RETURN_ON_ERROR(DrawClippedText(kCardX + 48, y0 + 10, 220, title), kTag, "draw word card title");
+            ESP_RETURN_ON_ERROR(DrawClippedText(kCardX + 48, y0 + 34, 220, subtitle), kTag, "draw word card subtitle");
+            // Right status chip: rounded 88x26 box + centered label.
+            const std::string chip_text = wqn::TruncateUtf8TextToWidth(chip, 80);
+            DrawRoundedRect(kCardX + 278, y0 + 17, 88, 26, 6);
+            ESP_RETURN_ON_ERROR(DrawCenteredText(kCardX + 278, y0 + 22, 88, chip_text), kTag, "draw word card chip");
+            return ESP_OK;
+        };
+        const bool ready = word.pack_ready;
         ESP_RETURN_ON_ERROR(
-            draw_choice(110, "顺序复习", word.pack_ready ? "从词库开始" : "需同步词库", word.home_selection == wqn::WordHomeSelection::kSequential),
+            draw_card(kCardY0,
+                      FONT_ZECTRIX_ICON_TODO,
+                      "顺序复习",
+                      ready ? "从词库开始" : "需同步词库",
+                      ready ? count_chip : "未同步",
+                      word.home_selection == wqn::WordHomeSelection::kSequential),
             kTag,
-            "draw sequential choice");
+            "draw sequential card");
         ESP_RETURN_ON_ERROR(
-            draw_choice(162, "随机复习", word.pack_ready ? "打乱今日词" : "需同步词库", word.home_selection == wqn::WordHomeSelection::kRandom),
+            draw_card(kCardY0 + (kCardH + kCardGap),
+                      FONT_ZECTRIX_ICON_SYNC,
+                      "随机复习",
+                      ready ? "打乱今日词" : "需同步词库",
+                      ready ? count_chip : "未同步",
+                      word.home_selection == wqn::WordHomeSelection::kRandom),
             kTag,
-            "draw random choice");
+            "draw random card");
         ESP_RETURN_ON_ERROR(
-            draw_choice(214, "词典", word.pack_ready ? "按字母查词" : "在线同步后使用", word.home_selection == wqn::WordHomeSelection::kDictionary),
+            draw_card(kCardY0 + 2 * (kCardH + kCardGap),
+                      FONT_ZECTRIX_ICON_SETTING,  // TODO(image-gen): swap to a book/A-Z glyph once generated.
+                      "词典",
+                      ready ? "按字母查词" : "在线同步后使用",
+                      ready ? "A-Z" : "未同步",
+                      word.home_selection == wqn::WordHomeSelection::kDictionary),
             kTag,
-            "draw dictionary choice");
+            "draw dictionary card");
         ESP_RETURN_ON_ERROR(DrawClippedText(12, 278, 376, word.hint), kTag, "draw word hint");
         if (schedule == RefreshSchedule::kSelection || schedule == RefreshSchedule::kConfig) {
             return RefreshStableRegion({0, 64, wqn::kEpdWidth, 220, "word-home"}, schedule);

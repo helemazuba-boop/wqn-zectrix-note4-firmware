@@ -46,8 +46,17 @@ void BuildHomeSummary(wqn::UiState* state)
 
     wqn::HomeSummary home;
     home.wifi_label = state->status.wifi_connected ? "WiFi" : "离线";
+    home.wifi_connected = state->status.wifi_connected;
+    home.wifi_rssi = wqn::GetWifiRssi();
     BatteryReading battery = {};
-    home.battery_label = ReadBatteryStatus(&battery) ? BatteryLabel(battery) : "--%";
+    if (ReadBatteryStatus(&battery)) {
+        home.battery_label = BatteryLabel(battery);
+        home.battery_percent = battery.percent;
+        home.charging = battery.charging;
+        home.full = battery.full;
+    } else {
+        home.battery_label = "--%";
+    }
 
     // UI contract: one line only. Source priority is pomodoro > countdown > clock.
     home.primary_time_line = ChooseHomePrimaryTimeLine(state->time_app);

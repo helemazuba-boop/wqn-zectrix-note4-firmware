@@ -7,6 +7,7 @@
 
 #include "epd_display.h"
 #include "esp_log.h"
+#include "font_zectrix.h"
 
 namespace device_ui_internal {
 
@@ -16,26 +17,21 @@ void DrawStatusBar(const char* title, const wqn::HomeSummary& home)
 {
     DrawHorizontalLine(0, 27, wqn::kEpdWidth);
     wqn::DrawUtf8Text(10, 6, title, true);
-    std::string status = CurrentClockLabel();
-    if (!home.battery_label.empty()) {
-        status += "  " + home.battery_label;
+    // Right-edge icon cluster (wifi + battery), then time to its left.
+    const int icons_left = DrawStatusBarIcons(wqn::kEpdWidth - 10, 6, home);
+    const std::string time_str = CurrentClockLabel();
+    const int time_w = wqn::MeasureUtf8TextWidth(time_str.c_str());
+    const int time_x = icons_left - 6 - time_w;
+    if (time_x >= 10) {
+        wqn::DrawUtf8Text(time_x, 6, time_str.c_str(), true);
     }
-    const int status_width = wqn::MeasureUtf8TextWidth(status.c_str());
-    wqn::DrawUtf8Text(std::max(10, wqn::kEpdWidth - status_width - 10), 6, status.c_str(), true);
 }
 
 void DrawClockStatusBar(const wqn::HomeSummary& home)
 {
     DrawHorizontalLine(0, 27, wqn::kEpdWidth);
     wqn::DrawUtf8Text(10, 6, TimeTileTitle(wqn::TimeTile::kClock), true);
-    if (!home.battery_label.empty()) {
-        const int status_width = wqn::MeasureUtf8TextWidth(home.battery_label.c_str());
-        wqn::DrawUtf8Text(
-            std::max(10, wqn::kEpdWidth - status_width - 10),
-            6,
-            home.battery_label.c_str(),
-            true);
-    }
+    DrawStatusBarIcons(wqn::kEpdWidth - 10, 6, home);
 }
 
 void DrawProgressBar(int x, int y, int width, int height, int current, int total)
@@ -58,7 +54,9 @@ void DrawConfigBox(int x, int y, int width, int height, const std::string& value
         DrawRect(x, y, width, height);
     }
     const bool black_text = !selected;
-    DrawCenteredText(x, y + 7, width, value, black_text);
+    // Value rendered with the 16px artistic digit font; label stays CJK.
+    const std::string zvalue = ZectrixArtText(value);
+    wqn::DrawTextWithFontCentered(x, y + 7, width, &font_zectrix_16_1, zvalue.c_str(), black_text);
     DrawCenteredText(x, y + height - 20, width, label, black_text);
 }
 
@@ -74,7 +72,7 @@ void DrawActionBox(int x, int y, int width, const std::string& label, bool selec
 
 esp_err_t RenderClockStandbyContent()
 {
-    DrawStandbyClockDigits(58, CurrentClockLabel());
+    DrawStandbyClockDigits(80, CurrentClockLabel());
     ESP_RETURN_ON_ERROR(DrawCenteredText(0, 174, wqn::kEpdWidth, CurrentDateLabel()), kTag, "draw clock date");
     return ESP_OK;
 }
@@ -161,7 +159,7 @@ esp_err_t RenderTimerRunToEpd(const wqn::TimeAppState& time_app)
     const std::string label =
         time_app.active_mode == wqn::TimerMode::kPomodoro ? wqn::PomodoroPhaseLabel(time_app.pomodoro_phase) : "倒计时";
     ESP_RETURN_ON_ERROR(DrawCenteredText(0, 68, wqn::kEpdWidth, label), kTag, "draw timer label");
-    DrawSevenSegmentTextCentered(98, wqn::FormatTimerDuration(time_app.remaining_seconds), 7);
+    DrawTimerDigitsArt(110, wqn::FormatTimerDuration(time_app.remaining_seconds));
     if (time_app.status == wqn::TimerStatus::kPaused) {
         ESP_RETURN_ON_ERROR(DrawCenteredText(0, 185, wqn::kEpdWidth, "已暂停"), kTag, "draw paused label");
     } else if (time_app.status == wqn::TimerStatus::kAlerting) {

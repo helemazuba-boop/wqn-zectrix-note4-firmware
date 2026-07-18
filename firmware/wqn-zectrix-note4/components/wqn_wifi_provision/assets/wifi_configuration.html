@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>WQN Note4 配网</title>
+  <style>
+    *{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;background:#f4f4f5;font-family:system-ui,sans-serif;color:#18181b}.card{width:min(420px,calc(100% - 32px));background:#fff;border-radius:14px;padding:28px;box-shadow:0 8px 30px #0002}h1{font-size:22px;margin:0 0 6px}.sub{margin:0 0 22px;color:#71717a;font-size:14px}label{display:block;margin:14px 0 6px;font-size:14px;font-weight:600}select,input,button{width:100%;padding:12px;border-radius:9px;font-size:16px}select,input{border:1px solid #d4d4d8;background:#fff}button{margin-top:18px;border:0;background:#18181b;color:#fff;font-weight:700}.muted{font-size:12px;color:#71717a;margin-top:8px}.msg{min-height:20px;margin-top:12px;font-size:14px}.error{color:#b91c1c}.ok{color:#15803d}
+  </style>
+</head>
+<body><main class="card">
+  <h1>WQN Note4</h1><p class="sub">选择 WiFi 并输入密码</p>
+  <form id="form">
+    <label for="ssid">WiFi 网络</label>
+    <select id="ssid" required><option value="">正在扫描…</option></select>
+    <p class="muted" id="scan-note">设备会自动刷新附近网络</p>
+    <label for="password">密码</label>
+    <input id="password" type="password" maxlength="64" autocomplete="off" placeholder="开放网络留空">
+    <button id="submit" type="submit">保存并连接</button>
+    <div class="msg" id="msg"></div>
+  </form>
+</main>
+<script>
+const sel=document.getElementById('ssid'),msg=document.getElementById('msg'),btn=document.getElementById('submit');
+function show(text,kind=''){msg.textContent=text;msg.className='msg '+kind}
+async function scan(){
+  try{
+    const r=await fetch('/scan',{cache:'no-store'}),d=await r.json(),old=sel.value;
+    sel.innerHTML='';
+    const aps=Array.isArray(d.aps)?d.aps:[];
+    if(!aps.length){sel.innerHTML='<option value="">未找到网络，正在重试…</option>';return}
+    for(const ap of aps){const o=document.createElement('option');o.value=ap.ssid;o.textContent=`${ap.ssid}  ${ap.rssi} dBm${ap.authmode===0?'（开放）':''}`;sel.appendChild(o)}
+    if(old&&aps.some(ap=>ap.ssid===old))sel.value=old;
+  }catch(e){show('读取网络列表失败，正在重试','error')}
+}
+scan();setInterval(scan,5000);
+document.getElementById('form').addEventListener('submit',async e=>{
+  e.preventDefault();if(!sel.value){show('请选择 WiFi 网络','error');return}
+  btn.disabled=true;show('正在保存…');
+  try{
+    const r=await fetch('/submit',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ssid:sel.value,password:document.getElementById('password').value})});
+    const d=await r.json();if(!r.ok||!d.success)throw new Error(d.error||'保存失败');
+    show('保存成功，设备即将连接','ok');setTimeout(()=>location.href='/done.html',300);
+  }catch(e){show(e.message||'保存失败','error');btn.disabled=false}
+});
+</script></body></html>

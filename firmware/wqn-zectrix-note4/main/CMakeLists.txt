@@ -14,6 +14,8 @@ idf_component_register(
         "diagnostics.cpp"
         "epd_display.cpp"
         "fonts/SourceHanSansSC_Regular_slim.c"
+        "fonts/font_zectrix_16_1.c"
+        "fonts/font_zectrix_48_1.c"
         "power_manager.cpp"
         "pcf8563.cpp"
         "provision_manager.cpp"
@@ -61,6 +63,7 @@ idf_component_register(
         esp_netif
         esp_psram
         esp_wifi
+        wqn_wifi_provision
         freertos
         json
         lwip

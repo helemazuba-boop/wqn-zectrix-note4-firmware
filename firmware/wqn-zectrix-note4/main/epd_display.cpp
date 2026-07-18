@@ -764,10 +764,13 @@ void DrawGlyph(int x, int y, unsigned char ch, bool black)
     }
 }
 
-const lv_font_fmt_txt_glyph_dsc_t* FindCjkGlyph(uint32_t codepoint)
+const lv_font_fmt_txt_glyph_dsc_t* FindGlyphInFont(const lv_font_t* font, uint32_t codepoint)
 {
-    const lv_font_fmt_txt_dsc_t* font_dsc = SourceHanSansSC_Regular_slim.dsc;
-    if (font_dsc == nullptr || codepoint == 0) {
+    if (font == nullptr || codepoint == 0) {
+        return nullptr;
+    }
+    const lv_font_fmt_txt_dsc_t* font_dsc = font->dsc;
+    if (font_dsc == nullptr) {
         return nullptr;
     }
 
@@ -889,6 +892,16 @@ uint32_t NormalizeCodepointForDisplay(uint32_t cp)
     }
 }
 
+int MeasureGlyphWidthInFont(const lv_font_t* font, uint32_t codepoint)
+{
+    const lv_font_fmt_txt_glyph_dsc_t* glyph = FindGlyphInFont(font, codepoint);
+    if (glyph == nullptr) {
+        // [font-fix] No glyph (e.g. IPA phonetics): zero width, matches DrawGlyphFromFont.
+        return 0;
+    }
+    return std::max<int>(1, (glyph->adv_w + 8) >> 4);
+}
+
 int MeasureCodepointWidth(uint32_t codepoint)
 {
     if (codepoint == '\n' || codepoint == '\r') {
@@ -897,20 +910,16 @@ int MeasureCodepointWidth(uint32_t codepoint)
     if (codepoint >= 0x20 && codepoint <= 0x7E) {
         return kTextCellWidth;
     }
-
-    const lv_font_fmt_txt_glyph_dsc_t* glyph = FindCjkGlyph(codepoint);
-    if (glyph == nullptr) {
-        // [font-fix] No glyph (e.g. IPA phonetics): skip (zero width) instead
-        // of a placeholder cell. Matches DrawCjkGlyph which draws nothing here.
-        return 0;
-    }
-    return std::max<int>(1, (glyph->adv_w + 8) >> 4);
+    return MeasureGlyphWidthInFont(&SourceHanSansSC_Regular_slim, codepoint);
 }
 
-void DrawCjkGlyph(int x, int y, uint32_t codepoint, bool black)
+void DrawGlyphFromFont(int x, int y, const lv_font_t* font, uint32_t codepoint, bool black)
 {
-    const lv_font_fmt_txt_dsc_t* font_dsc = SourceHanSansSC_Regular_slim.dsc;
-    const lv_font_fmt_txt_glyph_dsc_t* glyph = FindCjkGlyph(codepoint);
+    if (font == nullptr) {
+        return;
+    }
+    const lv_font_fmt_txt_dsc_t* font_dsc = font->dsc;
+    const lv_font_fmt_txt_glyph_dsc_t* glyph = FindGlyphInFont(font, codepoint);
     if (font_dsc == nullptr || glyph == nullptr || glyph->box_w == 0 || glyph->box_h == 0) {
         // [font-fix] Missing glyph: draw nothing (skip) instead of a hollow box.
         return;
@@ -918,7 +927,7 @@ void DrawCjkGlyph(int x, int y, uint32_t codepoint, bool black)
 
     const uint8_t* bitmap = &font_dsc->glyph_bitmap[glyph->bitmap_index];
     const int draw_x = x + glyph->ofs_x;
-    const int draw_y = y + (kCjkFontHeight - kCjkFontBaseLine) - glyph->box_h - glyph->ofs_y;
+    const int draw_y = y + (font->line_height - font->base_line) - glyph->box_h - glyph->ofs_y;
     int bit_index = 0;
     for (int row = 0; row < glyph->box_h; ++row) {
         for (int col = 0; col < glyph->box_w; ++col, ++bit_index) {
@@ -929,6 +938,11 @@ void DrawCjkGlyph(int x, int y, uint32_t codepoint, bool black)
             }
         }
     }
+}
+
+void DrawCjkGlyph(int x, int y, uint32_t codepoint, bool black)
+{
+    DrawGlyphFromFont(x, y, &SourceHanSansSC_Regular_slim, codepoint, black);
 }
 
 }  // namespace
@@ -1074,6 +1088,81 @@ int MeasureUtf8TextWidth(const char* text)
         current_width += MeasureCodepointWidth(codepoint);
     }
     return std::max(max_width, current_width);
+}
+
+void DrawTextWithFont(int x, int y, const lv_font_t* font, const char* text, bool black)
+{
+    if (text == nullptr || font == nullptr) {
+        return;
+    }
+    int cursor_x = x;
+    int cursor_y = y;
+    const char* cursor = text;
+    while (*cursor != '\0') {
+        uint32_t codepoint = 0;
+        const char* before = cursor;
+        if (!DecodeUtf8(cursor, &codepoint)) {
+            break;
+        }
+        if (cursor == before) {
+            break;
+        }
+        if (codepoint == '\r') {
+            continue;
+        }
+        if (codepoint == '\n') {
+            cursor_y += font->line_height;
+            cursor_x = x;
+            continue;
+        }
+
+        const int glyph_width = MeasureGlyphWidthInFont(font, codepoint);
+        if (cursor_x + glyph_width > kEpdWidth) {
+            break;
+        }
+        DrawGlyphFromFont(cursor_x, cursor_y, font, codepoint, black);
+        cursor_x += glyph_width;
+    }
+}
+
+int MeasureTextWithFont(const lv_font_t* font, const char* text)
+{
+    if (font == nullptr || text == nullptr) {
+        return 0;
+    }
+    int max_width = 0;
+    int current_width = 0;
+    const char* cursor = text;
+    while (*cursor != '\0') {
+        uint32_t codepoint = 0;
+        const char* before = cursor;
+        if (!DecodeUtf8(cursor, &codepoint)) {
+            break;
+        }
+        if (cursor == before) {
+            break;
+        }
+        if (codepoint == '\r') {
+            continue;
+        }
+        if (codepoint == '\n') {
+            max_width = std::max(max_width, current_width);
+            current_width = 0;
+            continue;
+        }
+        current_width += MeasureGlyphWidthInFont(font, codepoint);
+    }
+    return std::max(max_width, current_width);
+}
+
+void DrawTextWithFontCentered(int x, int y, int width, const lv_font_t* font, const char* text, bool black)
+{
+    if (font == nullptr || text == nullptr) {
+        return;
+    }
+    const int text_width = MeasureTextWithFont(font, text);
+    const int draw_x = x + std::max(0, (width - text_width) / 2);
+    DrawTextWithFont(draw_x, y, font, text, black);
 }
 
 std::string TruncateUtf8TextToWidth(const std::string& text, int max_width_px)

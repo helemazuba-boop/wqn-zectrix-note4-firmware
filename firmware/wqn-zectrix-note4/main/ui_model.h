@@ -173,6 +173,12 @@ struct HomeSummary {
     std::string wifi_label = "WiFi";
     std::string battery_label = "--%";
     std::string primary_time_line = "--:--";
+    // Raw state for status-bar icons (font_zectrix). Populated by BuildHomeSummary.
+    int battery_percent = 0;
+    bool charging = false;
+    bool full = false;
+    bool wifi_connected = false;
+    int wifi_rssi = 0;  // dBm (e.g. -65); 0 if not connected.
     HomeMetric review_metric = {"0", "今日复习"};
     HomeMetric todo_metric = {"--", "今日 Todo"};
     HomeMetric word_metric = {"--%", "单词进度"};
