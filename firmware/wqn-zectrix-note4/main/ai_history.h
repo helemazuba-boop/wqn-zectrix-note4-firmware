@@ -1,115 +1,116 @@
 // AI conversation history: PSRAM-backed ring buffer for chat messages and tool blocks.
-// Rebuilt each boot — no NVS persistence. Single conversation per device.
-//
-// The structure is intentionally simple: std::deque<ChatMessage> over a
-// std::pmr::monotonic_buffer_resource so every string lives in one contiguous
-// PSRAM region that can be reclaimed in O(1) when the cap is exceeded.
+// Rebuilt each boot — no NVS persistence. STD/Pro and Flash use independent histories.
 
 #pragma once
 
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <memory>
 #include <memory_resource>
 #include <string>
+#include <vector>
 
 #include "esp_err.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 
 namespace wqn {
+
+using ChatMessageId = uint64_t;
+constexpr ChatMessageId kInvalidChatMessageId = 0;
 
 enum class ChatMessageKind : uint8_t {
     kUser,
     kAssistant,
     kThinking,
-    kToolStart,   // placeholder emitted when tool.start arrives
-    kToolResult,  // finalised tool block: tool_name + args + result + elapsed
+    kToolStart,
+    kToolResult,
+};
+
+enum class AiHistoryChannel : uint8_t {
+    kStdPro,
+    kFlash,
 };
 
 struct ChatMessage {
+    ChatMessageId id = kInvalidChatMessageId;
     ChatMessageKind kind = ChatMessageKind::kUser;
     int64_t timestamp_ms = 0;
-
-    // For kUser / kAssistant / kThinking / kToolResult.
     std::pmr::string text;
-
-    // Tool block payload (populated for kToolStart / kToolResult).
     std::pmr::string tool_name;
     std::pmr::string tool_args_json;
     std::pmr::string tool_result_json;
     int32_t tool_elapsed_ms = 0;
     bool tool_ok = false;
-
-    // Local-only auxiliary state (UI sizing hint): approximate rendered row
-    // count after wrap. Filled by the renderer on first draw, since messages
-    // of varying length cost different row budgets.
     int rendered_rows_hint = 0;
+};
+
+// Plain immutable DTO used by UiFrame. It never borrows PMR storage from AiHistory.
+struct ChatMessageSnapshot {
+    ChatMessageId id = kInvalidChatMessageId;
+    ChatMessageKind kind = ChatMessageKind::kUser;
+    int64_t timestamp_ms = 0;
+    std::string text;
+    std::string tool_name;
+    std::string tool_args_json;
+    std::string tool_result_json;
+    int32_t tool_elapsed_ms = 0;
+    bool tool_ok = false;
+};
+
+struct AiHistorySnapshot {
+    uint64_t revision = 0;
+    std::vector<ChatMessageSnapshot> messages;
 };
 
 class AiHistory {
 public:
-    // Allocates an internal monotonic buffer of `cap_bytes` from PSRAM when
-    // available. Falls back to internal heap if PSRAM is missing. Idempotent.
     esp_err_t Init(size_t cap_bytes);
-
-    // Clear history (does not release the PSRAM pool — reuse it).
     void Clear();
 
-    // Append a copy of `msg`. Allocates from the PSRAM pool. Trims oldest
-    // entries (from the front of the deque) until total cost ≤ cap.
-    void Append(ChatMessage msg);
+    ChatMessageId AppendUser(std::pmr::string text, int64_t now_ms);
+    ChatMessageId AppendAssistant(std::pmr::string text, int64_t now_ms);
+    ChatMessageId AppendThinking(std::pmr::string text, int64_t now_ms);
+    ChatMessageId AppendToolStart(std::pmr::string name, std::pmr::string args, int64_t now_ms);
+    ChatMessageId AppendToolResult(std::pmr::string name, std::pmr::string args,
+                                   std::pmr::string result, bool ok, int32_t elapsed_ms,
+                                   int64_t now_ms);
 
-    // Convenience builders — push a fully-formed message in one call.
-    void AppendUser(std::pmr::string text, int64_t now_ms);
-    void AppendAssistant(std::pmr::string text, int64_t now_ms);
-    void AppendThinking(std::pmr::string text, int64_t now_ms);
-    void AppendToolStart(std::pmr::string name, std::pmr::string args, int64_t now_ms);
-    void AppendToolResult(std::pmr::string name, std::pmr::string args,
-                          std::pmr::string result, bool ok, int32_t elapsed_ms,
-                          int64_t now_ms);
+    // Replace a known message without changing order. The kind guard prevents a
+    // late event from overwriting a different message after eviction/clear.
+    bool ReplaceText(ChatMessageId id, ChatMessageKind expected_kind,
+                     std::pmr::string text, int64_t now_ms);
 
-    // Number of stored messages.
-    size_t size() const { return messages_.size(); }
-
-    // True if there is no recorded message yet.
-    bool empty() const { return messages_.empty(); }
-
-    // Index from the front of the deque (0 = oldest, size-1 = newest).
-    const ChatMessage& at(size_t index) const { return messages_[index]; }
-
-    // Removes the latest message if it matches kind. Returns true if popped.
     bool PopLastIf(ChatMessageKind kind);
+    std::shared_ptr<const AiHistorySnapshot> Snapshot() const;
 
-    // Approximate byte cost of all stored strings.
-    size_t byte_size() const { return byte_size_; }
-
-    // Configured cap (bytes).
+    size_t size() const;
+    bool empty() const;
+    size_t byte_size() const;
     size_t cap() const { return cap_bytes_; }
-
-    // Lookup the most recent (front) tool message by id; nullptr if none.
-    const ChatMessage* LatestTool() const;
+    uint64_t revision() const;
 
 private:
-    // Track the in-pool byte cost of one message so eviction stays cheap.
+    ChatMessageId AppendLocked(ChatMessage msg);
     size_t CostOf(const ChatMessage& m) const;
-
-    void ReleaseMessageStorage();
+    void TrimLocked();
 
     std::pmr::monotonic_buffer_resource pool_;
-    std::pmr::memory_resource* heap_ = nullptr;   // non-owning, may be PSRAM pool or upstream
+    std::pmr::memory_resource* heap_ = nullptr;
     std::deque<ChatMessage> messages_;
+    mutable SemaphoreHandle_t mutex_ = nullptr;
     size_t byte_size_ = 0;
     size_t cap_bytes_ = 0;
+    ChatMessageId next_message_id_ = 1;
+    uint64_t revision_ = 0;
     bool initialized_ = false;
 };
 
-// PSRAM-aware allocator backend used by the monotonic pool. Pulls one big
-// chunk via heap_caps_malloc when PSRAM is present, otherwise falls back to
-// plain heap_alloc_caps.
 class PsramBufferResource : public std::pmr::memory_resource {
 public:
     explicit PsramBufferResource(size_t bytes);
     ~PsramBufferResource() override;
-
     bool using_psram() const { return using_psram_; }
 
 private:
@@ -122,8 +123,9 @@ private:
     bool using_psram_ = false;
 };
 
-// Process-global accessor used by ai_session.cpp and the AI page renderer.
-// Idempotent — first call lazily allocates the underlying PSRAM pool.
-AiHistory& GetAiHistory();
+// Explicit channel selection prevents a late background stream from writing to
+// the history of whichever tier happens to be visible now.
+AiHistory& GetAiHistory(AiHistoryChannel channel);
+std::shared_ptr<const AiHistorySnapshot> GetAiHistorySnapshot(AiHistoryChannel channel);
 
 }  // namespace wqn

@@ -12,6 +12,7 @@ constexpr gpio_num_t kDownPowerPin = GPIO_NUM_18;
 constexpr gpio_num_t kConfirmPin = GPIO_NUM_0;
 
 constexpr int64_t kDebounceMs = 40;
+constexpr int64_t kHoldPressMs = 200;  // [mistouch] Flash PTT start threshold
 constexpr int64_t kLongPressMs = 1000;
 constexpr int64_t kLongPressRepeatMs = 260;
 constexpr int64_t kDoublePressWindowMs = 300;
@@ -25,6 +26,7 @@ struct ButtonState {
     bool raw_pressed = false;
     bool stable_pressed = false;
     bool long_press_reported = false;
+    bool hold_press_reported = false;  // [mistouch] one-shot kHoldPress at 200ms
     int64_t raw_changed_at_ms = 0;
     int64_t stable_changed_at_ms = 0;
     int64_t last_long_press_event_at_ms = 0;
@@ -127,6 +129,7 @@ ButtonEvent PollButtonInput()
 
             if (button.stable_pressed) {
                 button.long_press_reported = false;
+                button.hold_press_reported = false;
                 button.last_long_press_event_at_ms = now_ms;
                 // [ptt-fix] Defer the kPress edge to the next poll so long-
                 // press consumers still see kLongPress after the debounce
@@ -162,6 +165,15 @@ ButtonEvent PollButtonInput()
                 button.edge_event_pending = true;
                 return MakeEvent(button.id, ButtonEventType::kLongRelease, duration_ms);
             }
+        }
+
+        // [mistouch] One-shot 200ms hold event before the legacy 1s long-press.
+        // Flash PTT uses this; all other UI paths ignore kHoldPress.
+        if (button.raw_pressed && button.stable_pressed && !button.hold_press_reported &&
+            now_ms - button.stable_changed_at_ms >= kHoldPressMs) {
+            button.hold_press_reported = true;
+            return MakeEvent(button.id, ButtonEventType::kHoldPress,
+                             now_ms - button.stable_changed_at_ms);
         }
 
         if (button.raw_pressed && button.stable_pressed && now_ms - button.stable_changed_at_ms >= kLongPressMs &&

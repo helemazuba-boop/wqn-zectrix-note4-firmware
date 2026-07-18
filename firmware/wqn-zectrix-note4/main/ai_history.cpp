@@ -1,4 +1,4 @@
-// AI history implementation: PSRAM-backed ring buffer.
+// AI history implementation: PSRAM-backed ring buffer + immutable UI snapshots.
 
 #include "ai_history.h"
 
@@ -13,18 +13,14 @@ namespace wqn {
 namespace {
 constexpr char kTag[] = "ai_history";
 constexpr size_t kAlignBytes = 64;
+constexpr size_t kCapBytes = 512 * 1024;
 }  // namespace
-
-// ============================================================================
-// PsramBufferResource
-// ============================================================================
 
 PsramBufferResource::PsramBufferResource(size_t bytes)
 {
     if (bytes == 0) {
         return;
     }
-    // Round up to alignment to keep std::pmr happy.
     const size_t aligned = (bytes + kAlignBytes - 1) & ~(kAlignBytes - 1);
     chunk_ = heap_caps_malloc(aligned, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (chunk_ != nullptr) {
@@ -32,8 +28,7 @@ PsramBufferResource::PsramBufferResource(size_t bytes)
         using_psram_ = true;
         return;
     }
-    ESP_LOGW(kTag, "PSRAM not available (%zu bytes), falling back to internal heap",
-             aligned);
+    ESP_LOGW(kTag, "PSRAM not available (%zu bytes), falling back to internal heap", aligned);
     chunk_ = heap_caps_malloc(aligned, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (chunk_ != nullptr) {
         chunk_size_ = aligned;
@@ -54,14 +49,10 @@ PsramBufferResource::~PsramBufferResource()
 void* PsramBufferResource::do_allocate(size_t bytes, size_t alignment)
 {
     if (chunk_ == nullptr) {
-        // Out-of-band: caller asked for more than the configured chunk. Use
-        // the matching cap so we are still inside our memory budget hint.
         const size_t cap_flag = using_psram_ ? (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
                                              : (MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
         return heap_caps_aligned_alloc(alignment, bytes, cap_flag);
     }
-    // monotonic_buffer_resource will only request up to its upstream pool.
-    // Just forward to the underlying malloc for this scoped arena.
     (void)alignment;
     const size_t cap_flag = using_psram_ ? (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
                                          : (MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
@@ -74,16 +65,11 @@ void PsramBufferResource::do_deallocate(void* p, size_t bytes, size_t alignment)
     if (p == nullptr) {
         return;
     }
-    // Allocations inside the monotonic buffer resource are never released
-    // individually — the whole arena goes away with the pool destructor.
-    // The fallback path (heap_caps_aligned_alloc) still owns the block so we
-    // must free it.
     if (p != chunk_ && (reinterpret_cast<uint8_t*>(p) < reinterpret_cast<uint8_t*>(chunk_) ||
                          reinterpret_cast<uint8_t*>(p) >=
                              reinterpret_cast<uint8_t*>(chunk_) + chunk_size_)) {
         heap_caps_free(p);
     } else {
-        // Owned by the arena; ignore.
         (void)bytes;
     }
 }
@@ -93,162 +79,278 @@ bool PsramBufferResource::do_is_equal(const memory_resource& other) const noexce
     return this == &other;
 }
 
-// ============================================================================
-// AiHistory
-// ============================================================================
-
 esp_err_t AiHistory::Init(size_t cap_bytes)
 {
+    if (mutex_ == nullptr) {
+        mutex_ = xSemaphoreCreateMutex();
+        if (mutex_ == nullptr) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    xSemaphoreTake(mutex_, portMAX_DELAY);
     if (initialized_) {
+        xSemaphoreGive(mutex_);
         return ESP_OK;
     }
+
     cap_bytes_ = cap_bytes;
-    auto* arena = new PsramBufferResource(cap_bytes);
+    auto* arena = new (std::nothrow) PsramBufferResource(cap_bytes);
+    if (arena == nullptr) {
+        xSemaphoreGive(mutex_);
+        return ESP_ERR_NO_MEM;
+    }
     heap_ = arena;
-    // Construct the monotonic pool over the arena in place; the type is
-    // move-only so we destroy any prior value first and re-init via the
-    // allocator-aware constructor.
     pool_.release();
     new (&pool_) std::pmr::monotonic_buffer_resource(cap_bytes, arena);
     byte_size_ = 0;
     messages_.clear();
+    next_message_id_ = 1;
+    revision_ = 0;
     initialized_ = true;
-    ESP_LOGI(kTag, "Init cap=%zu bytes psram=%d",
-             cap_bytes_, arena->using_psram() ? 1 : 0);
+    ESP_LOGI(kTag, "Init cap=%zu bytes psram=%d", cap_bytes_, arena->using_psram() ? 1 : 0);
+    xSemaphoreGive(mutex_);
     return ESP_OK;
 }
 
 void AiHistory::Clear()
 {
-    messages_.clear();
-    byte_size_ = 0;
-}
-
-void AiHistory::Append(ChatMessage msg)
-{
-    if (!initialized_) {
+    if (mutex_ == nullptr) {
         return;
     }
-    // Move-construct into the deque so the strings route through the PMR pool.
-    // The temporaries in `msg` were passed by value so this is cheap.
-    const size_t cost = CostOf(msg);
-    messages_.push_back(std::move(msg));
-    byte_size_ += cost;
+    xSemaphoreTake(mutex_, portMAX_DELAY);
+    if (!messages_.empty()) {
+        messages_.clear();
+        byte_size_ = 0;
+        ++revision_;
+    }
+    xSemaphoreGive(mutex_);
+}
 
-    // Trim from the front until we fit under the cap. We always keep at
-    // least the most recent message so a streaming answer never disappears
-    // entirely.
+size_t AiHistory::CostOf(const ChatMessage& m) const
+{
+    return sizeof(ChatMessage) + m.text.size() + m.tool_name.size() +
+           m.tool_args_json.size() + m.tool_result_json.size();
+}
+
+void AiHistory::TrimLocked()
+{
     while (byte_size_ > cap_bytes_ && messages_.size() > 1) {
         byte_size_ -= CostOf(messages_.front());
         messages_.pop_front();
     }
 }
 
-size_t AiHistory::CostOf(const ChatMessage& m) const
+ChatMessageId AiHistory::AppendLocked(ChatMessage msg)
 {
-    size_t total = sizeof(ChatMessage);
-    total += m.text.size();
-    total += m.tool_name.size();
-    total += m.tool_args_json.size();
-    total += m.tool_result_json.size();
-    return total;
+    if (!initialized_) {
+        return kInvalidChatMessageId;
+    }
+    msg.id = next_message_id_++;
+    const ChatMessageId id = msg.id;
+    byte_size_ += CostOf(msg);
+    messages_.push_back(std::move(msg));
+    TrimLocked();
+    ++revision_;
+    return id;
 }
 
-void AiHistory::ReleaseMessageStorage()
+ChatMessageId AiHistory::AppendUser(std::pmr::string text, int64_t now_ms)
 {
-    // No-op: monotonic buffer never frees. Kept for future rebalance code.
+    if (mutex_ == nullptr) return kInvalidChatMessageId;
+    ChatMessage msg;
+    msg.kind = ChatMessageKind::kUser;
+    msg.timestamp_ms = now_ms;
+    msg.text = std::move(text);
+    xSemaphoreTake(mutex_, portMAX_DELAY);
+    ChatMessageId id = AppendLocked(std::move(msg));
+    xSemaphoreGive(mutex_);
+    return id;
 }
 
-void AiHistory::AppendUser(std::pmr::string text, int64_t now_ms)
+ChatMessageId AiHistory::AppendAssistant(std::pmr::string text, int64_t now_ms)
 {
-    ChatMessage m;
-    m.kind = ChatMessageKind::kUser;
-    m.timestamp_ms = now_ms;
-    m.text = std::move(text);
-    Append(std::move(m));
+    if (mutex_ == nullptr) return kInvalidChatMessageId;
+    ChatMessage msg;
+    msg.kind = ChatMessageKind::kAssistant;
+    msg.timestamp_ms = now_ms;
+    msg.text = std::move(text);
+    xSemaphoreTake(mutex_, portMAX_DELAY);
+    ChatMessageId id = AppendLocked(std::move(msg));
+    xSemaphoreGive(mutex_);
+    return id;
 }
 
-void AiHistory::AppendAssistant(std::pmr::string text, int64_t now_ms)
+ChatMessageId AiHistory::AppendThinking(std::pmr::string text, int64_t now_ms)
 {
-    ChatMessage m;
-    m.kind = ChatMessageKind::kAssistant;
-    m.timestamp_ms = now_ms;
-    m.text = std::move(text);
-    Append(std::move(m));
+    if (mutex_ == nullptr) return kInvalidChatMessageId;
+    ChatMessage msg;
+    msg.kind = ChatMessageKind::kThinking;
+    msg.timestamp_ms = now_ms;
+    msg.text = std::move(text);
+    xSemaphoreTake(mutex_, portMAX_DELAY);
+    ChatMessageId id = AppendLocked(std::move(msg));
+    xSemaphoreGive(mutex_);
+    return id;
 }
 
-void AiHistory::AppendThinking(std::pmr::string text, int64_t now_ms)
+ChatMessageId AiHistory::AppendToolStart(std::pmr::string name, std::pmr::string args,
+                                         int64_t now_ms)
 {
-    ChatMessage m;
-    m.kind = ChatMessageKind::kThinking;
-    m.timestamp_ms = now_ms;
-    m.text = std::move(text);
-    Append(std::move(m));
+    if (mutex_ == nullptr) return kInvalidChatMessageId;
+    ChatMessage msg;
+    msg.kind = ChatMessageKind::kToolStart;
+    msg.timestamp_ms = now_ms;
+    msg.tool_name = std::move(name);
+    msg.tool_args_json = std::move(args);
+    xSemaphoreTake(mutex_, portMAX_DELAY);
+    ChatMessageId id = AppendLocked(std::move(msg));
+    xSemaphoreGive(mutex_);
+    return id;
 }
 
-void AiHistory::AppendToolStart(std::pmr::string name, std::pmr::string args, int64_t now_ms)
+ChatMessageId AiHistory::AppendToolResult(std::pmr::string name, std::pmr::string args,
+                                          std::pmr::string result, bool ok,
+                                          int32_t elapsed_ms, int64_t now_ms)
 {
-    ChatMessage m;
-    m.kind = ChatMessageKind::kToolStart;
-    m.timestamp_ms = now_ms;
-    m.tool_name = std::move(name);
-    m.tool_args_json = std::move(args);
-    Append(std::move(m));
+    if (mutex_ == nullptr) return kInvalidChatMessageId;
+    ChatMessage msg;
+    msg.kind = ChatMessageKind::kToolResult;
+    msg.timestamp_ms = now_ms;
+    msg.tool_name = std::move(name);
+    msg.tool_args_json = std::move(args);
+    msg.tool_result_json = std::move(result);
+    msg.tool_ok = ok;
+    msg.tool_elapsed_ms = elapsed_ms;
+    xSemaphoreTake(mutex_, portMAX_DELAY);
+    ChatMessageId id = AppendLocked(std::move(msg));
+    xSemaphoreGive(mutex_);
+    return id;
 }
 
-void AiHistory::AppendToolResult(std::pmr::string name, std::pmr::string args,
-                                 std::pmr::string result, bool ok, int32_t elapsed_ms,
-                                 int64_t now_ms)
+bool AiHistory::ReplaceText(ChatMessageId id, ChatMessageKind expected_kind,
+                            std::pmr::string text, int64_t now_ms)
 {
-    ChatMessage m;
-    m.kind = ChatMessageKind::kToolResult;
-    m.timestamp_ms = now_ms;
-    m.tool_name = std::move(name);
-    m.tool_args_json = std::move(args);
-    m.tool_result_json = std::move(result);
-    m.tool_ok = ok;
-    m.tool_elapsed_ms = elapsed_ms;
-    Append(std::move(m));
+    if (id == kInvalidChatMessageId || mutex_ == nullptr) {
+        return false;
+    }
+    xSemaphoreTake(mutex_, portMAX_DELAY);
+    for (ChatMessage& msg : messages_) {
+        if (msg.id != id) continue;
+        if (msg.kind != expected_kind) {
+            xSemaphoreGive(mutex_);
+            return false;
+        }
+        const std::string incoming(text.data(), text.size());
+        if (msg.text.size() == incoming.size() &&
+            std::memcmp(msg.text.data(), incoming.data(), incoming.size()) == 0) {
+            xSemaphoreGive(mutex_);
+            return true;
+        }
+        byte_size_ -= CostOf(msg);
+        msg.text.assign(incoming.data(), incoming.size());
+        msg.timestamp_ms = now_ms;
+        byte_size_ += CostOf(msg);
+        TrimLocked();
+        ++revision_;
+        xSemaphoreGive(mutex_);
+        return true;
+    }
+    xSemaphoreGive(mutex_);
+    return false;
 }
 
 bool AiHistory::PopLastIf(ChatMessageKind kind)
 {
+    if (mutex_ == nullptr) return false;
+    xSemaphoreTake(mutex_, portMAX_DELAY);
     if (messages_.empty() || messages_.back().kind != kind) {
+        xSemaphoreGive(mutex_);
         return false;
     }
     byte_size_ -= CostOf(messages_.back());
     messages_.pop_back();
+    ++revision_;
+    xSemaphoreGive(mutex_);
     return true;
 }
 
-const ChatMessage* AiHistory::LatestTool() const
+std::shared_ptr<const AiHistorySnapshot> AiHistory::Snapshot() const
 {
-    for (auto it = messages_.rbegin(); it != messages_.rend(); ++it) {
-        if (it->kind == ChatMessageKind::kToolStart || it->kind == ChatMessageKind::kToolResult) {
-            return &(*it);
-        }
+    auto snapshot = std::make_shared<AiHistorySnapshot>();
+    if (mutex_ == nullptr) return snapshot;
+    xSemaphoreTake(mutex_, portMAX_DELAY);
+    snapshot->revision = revision_;
+    snapshot->messages.reserve(messages_.size());
+    for (const ChatMessage& msg : messages_) {
+        ChatMessageSnapshot out;
+        out.id = msg.id;
+        out.kind = msg.kind;
+        out.timestamp_ms = msg.timestamp_ms;
+        out.text.assign(msg.text.data(), msg.text.size());
+        out.tool_name.assign(msg.tool_name.data(), msg.tool_name.size());
+        out.tool_args_json.assign(msg.tool_args_json.data(), msg.tool_args_json.size());
+        out.tool_result_json.assign(msg.tool_result_json.data(), msg.tool_result_json.size());
+        out.tool_elapsed_ms = msg.tool_elapsed_ms;
+        out.tool_ok = msg.tool_ok;
+        snapshot->messages.push_back(std::move(out));
     }
-    return nullptr;
+    xSemaphoreGive(mutex_);
+    return snapshot;
 }
 
-// ---------------------------------------------------------------------------
-// Process-global accessor (single conversation for the whole device).
-// ---------------------------------------------------------------------------
+size_t AiHistory::size() const
+{
+    if (mutex_ == nullptr) return 0;
+    xSemaphoreTake(mutex_, portMAX_DELAY);
+    size_t value = messages_.size();
+    xSemaphoreGive(mutex_);
+    return value;
+}
+
+bool AiHistory::empty() const { return size() == 0; }
+
+size_t AiHistory::byte_size() const
+{
+    if (mutex_ == nullptr) return 0;
+    xSemaphoreTake(mutex_, portMAX_DELAY);
+    size_t value = byte_size_;
+    xSemaphoreGive(mutex_);
+    return value;
+}
+
+uint64_t AiHistory::revision() const
+{
+    if (mutex_ == nullptr) return 0;
+    xSemaphoreTake(mutex_, portMAX_DELAY);
+    uint64_t value = revision_;
+    xSemaphoreGive(mutex_);
+    return value;
+}
 
 namespace {
-AiHistory g_history;
-bool g_history_inited = false;
+AiHistory g_history_stdpro;
+AiHistory g_history_flash;
+bool g_stdpro_inited = false;
+bool g_flash_inited = false;
 }  // namespace
 
-AiHistory& GetAiHistory()
+AiHistory& GetAiHistory(AiHistoryChannel channel)
 {
-    if (!g_history_inited) {
-        constexpr size_t kCapBytes = 512 * 1024;
-        if (g_history.Init(kCapBytes) == ESP_OK) {
-            g_history_inited = true;
+    if (channel == AiHistoryChannel::kFlash) {
+        if (!g_flash_inited && g_history_flash.Init(kCapBytes) == ESP_OK) {
+            g_flash_inited = true;
         }
+        return g_history_flash;
     }
-    return g_history;
+    if (!g_stdpro_inited && g_history_stdpro.Init(kCapBytes) == ESP_OK) {
+        g_stdpro_inited = true;
+    }
+    return g_history_stdpro;
+}
+
+std::shared_ptr<const AiHistorySnapshot> GetAiHistorySnapshot(AiHistoryChannel channel)
+{
+    return GetAiHistory(channel).Snapshot();
 }
 
 }  // namespace wqn

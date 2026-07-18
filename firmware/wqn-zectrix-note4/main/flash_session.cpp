@@ -107,7 +107,12 @@ struct FlashState {
     bool ws_connected = false;
     std::string user_transcript;
     std::string assistant_text;
-    std::string thinking_text;  // [thinking] rolling摘要 of response.thinking.delta (capped at 200 chars)
+    std::string thinking_text;
+    bool history_user_committed = false;
+    bool thinking_done = false;
+    bool turn_done_received = false;
+    wqn::ChatMessageId thinking_message_id = wqn::kInvalidChatMessageId;
+    wqn::ChatMessageId assistant_message_id = wqn::kInvalidChatMessageId;
     std::string pending_text;
     std::string tool_label;
     std::string error_message;
@@ -147,6 +152,7 @@ struct FlashState {
     //    ("ongoing response already exists")
     // Ref: ElatoAI/xiaozhi track response state to avoid these races.
     bool response_in_flight = false;
+    bool response_started = false;  // [phase-fix] delta received for CURRENT turn
     // v2 downlink binary frame reassembly buffer
     std::string audio_reassembly_buf;
     // [playback-fix] Decouple I2S writes from the WebSocket event task.
@@ -159,10 +165,64 @@ struct FlashState {
     TaskHandle_t playback_task = nullptr;
     std::atomic<size_t> playback_queued_bytes{0};  // [race-fix] accessed from WS task + playback task + UI task
     std::atomic<bool> drain_playback{false};       // [drain-fix] flag set by UI task, consumed by playback task
+    // [i2s-handoff] Set by StopFlashSession so FlashPlaybackTask self-exits
+    // before TearDownStreamChannels deletes stream_tx. Without this the
+    // playback task is a persistent writer of stream_tx and cannot be deleted
+    // safely. Reset to false in EnsurePlaybackRingbuf before recreating the task.
+    std::atomic<bool> playback_stop{false};
     size_t playback_dropped_bytes = 0;
 };
 
 FlashState g_flash;
+
+std::pmr::string FlashPmrText(const std::string& text)
+{
+    return std::pmr::string(text.data(), text.size());
+}
+
+bool EnsureFlashThinkingHistoryLocked(int64_t now_ms)
+{
+    if (!g_flash.history_user_committed || g_flash.thinking_text.empty()) {
+        return false;
+    }
+    const std::string label = "💭 " + g_flash.thinking_text;
+    wqn::AiHistory& history = wqn::GetAiHistory(wqn::AiHistoryChannel::kFlash);
+    if (g_flash.thinking_message_id == wqn::kInvalidChatMessageId) {
+        g_flash.thinking_message_id = history.AppendThinking(FlashPmrText(label), now_ms);
+        return g_flash.thinking_message_id != wqn::kInvalidChatMessageId;
+    }
+    return history.ReplaceText(g_flash.thinking_message_id,
+                               wqn::ChatMessageKind::kThinking,
+                               FlashPmrText(label), now_ms);
+}
+
+bool FinalizeFlashAssistantLocked(int64_t now_ms)
+{
+    if (!g_flash.history_user_committed || g_flash.assistant_text.empty()) {
+        return false;
+    }
+    wqn::AiHistory& history = wqn::GetAiHistory(wqn::AiHistoryChannel::kFlash);
+    if (g_flash.assistant_message_id == wqn::kInvalidChatMessageId) {
+        g_flash.assistant_message_id =
+            history.AppendAssistant(FlashPmrText(g_flash.assistant_text), now_ms);
+        return g_flash.assistant_message_id != wqn::kInvalidChatMessageId;
+    }
+    return history.ReplaceText(g_flash.assistant_message_id,
+                               wqn::ChatMessageKind::kAssistant,
+                               FlashPmrText(g_flash.assistant_text), now_ms);
+}
+
+void ResetFlashTurnAssemblyLocked()
+{
+    g_flash.user_transcript.clear();
+    g_flash.assistant_text.clear();
+    g_flash.thinking_text.clear();
+    g_flash.history_user_committed = false;
+    g_flash.thinking_done = false;
+    g_flash.turn_done_received = false;
+    g_flash.thinking_message_id = wqn::kInvalidChatMessageId;
+    g_flash.assistant_message_id = wqn::kInvalidChatMessageId;
+}
 
 void MarkChanged()
 {
@@ -175,6 +235,7 @@ void SetErrorLocked(const std::string& message)
     g_flash.pending_text.clear();
     g_flash.error_message = message;
     g_flash.response_in_flight = false;  // [inflight-fix] error ends any in-flight response
+    g_flash.response_started = false;
     g_flash.status_since_ms = esp_timer_get_time() / 1000;
     MarkChanged();
 }
@@ -477,9 +538,21 @@ void FlashPlaybackTask(void* /*param*/)
     ESP_LOGI(kTag, "flash playback task started");
     std::vector<int16_t> stereo;  // reused scratch buffer
     while (true) {
+        // [i2s-handoff] StopFlashSession sets this before deleting stream_tx.
+        // The receive below uses a 100 ms timeout so we re-check this flag
+        // promptly even when idle (blocked on the ringbuf). A blocked
+        // i2s_channel_write is unblocked separately by i2s_channel_disable
+        // in TearDownStreamChannels.
+        if (g_flash.playback_stop.load(std::memory_order_relaxed)) {
+            ESP_LOGI(kTag, "flash playback task exiting (stop)");
+            xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+            g_flash.playback_task = nullptr;
+            xSemaphoreGive(g_flash.mutex);
+            vTaskDelete(nullptr);
+        }
         size_t item_size = 0;
         char* item = static_cast<char*>(xRingbufferReceiveUpTo(
-            g_flash.playback_ringbuf, &item_size, portMAX_DELAY,
+            g_flash.playback_ringbuf, &item_size, pdMS_TO_TICKS(100),
             kPlaybackRingbufItemMax));
         if (item == nullptr) {
             continue;
@@ -652,6 +725,7 @@ void EnsurePlaybackRingbuf()
         }
     }
     if (g_flash.playback_ringbuf != nullptr && g_flash.playback_task == nullptr) {
+        g_flash.playback_stop.store(false, std::memory_order_relaxed);  // [i2s-handoff] clear stale stop from a prior StopFlashSession
         const BaseType_t created = xTaskCreatePinnedToCore(
             FlashPlaybackTask, "flash_playback", 4096, nullptr, 10,
             &g_flash.playback_task, 1);
@@ -892,6 +966,67 @@ void CleanupStreamHardware()
     // would race with the first playback block.
 }
 
+// [i2s-handoff] Session-level teardown of the duplex I2S channels. Unlike
+// CleanupStreamHardware (per-turn, keeps channels常驻 so TTS can play after
+// capture stops), this DELETES stream_rx/stream_tx so STD/Pro can claim
+// I2S_NUM_0. Called only from StopFlashSession, AFTER StopAudioStreaming + WS
+// destroy, so AudioStreamingTask is no longer reading stream_rx. The persistent
+// FlashPlaybackTask (writer of stream_tx) is stopped here first.
+void TearDownStreamChannels()
+{
+    // 1. Stop FlashPlaybackTask so stream_tx has no writer. drain_playback
+    //    discards in-flight PCM; playback_stop makes the task self-exit at its
+    //    loop top (polled every 100 ms). Disabling stream_tx first breaks any
+    //    blocked i2s_channel_write (returns INVALID_STATE) so the task unblocks
+    //    even mid-write.
+    if (g_flash.stream_tx != nullptr) {
+        i2s_channel_disable(g_flash.stream_tx);
+    }
+    if (g_flash.playback_task != nullptr) {
+        g_flash.drain_playback.store(true, std::memory_order_relaxed);
+        g_flash.playback_stop.store(true, std::memory_order_relaxed);
+        for (int i = 0; i < 40; ++i) {  // up to 400 ms (4x the 100 ms receive poll)
+            vTaskDelay(pdMS_TO_TICKS(10));
+            if (g_flash.playback_task == nullptr) {
+                break;
+            }
+        }
+    }
+
+    // 2. Delete stream_tx (safe now: playback task stopped). If the playback
+    //    task somehow didn't exit, skip to avoid use-after-free on stream_tx.
+    bool tx_torn_down = false;
+    if (g_flash.playback_task == nullptr && g_flash.stream_tx != nullptr) {
+        i2s_del_channel(g_flash.stream_tx);
+        g_flash.stream_tx = nullptr;
+        tx_torn_down = true;
+    } else if (g_flash.playback_task != nullptr) {
+        ESP_LOGE(kTag, "playback task still alive; skipping stream_tx teardown (UAF risk)");
+    }
+
+    // 3. AudioStreamingTask (reader of stream_rx) must be gone. StopFlashSession
+    //    ran StopAudioStreaming + WS destroy before us, so stream_task should be
+    //    null. If it isn't, skip stream_rx teardown - deleting it while the task
+    //    may read would UAF.
+    TaskHandle_t stream_task = nullptr;
+    if (g_flash.mutex != nullptr) {
+        xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+        stream_task = g_flash.stream_task;
+        xSemaphoreGive(g_flash.mutex);
+    }
+    if (stream_task == nullptr && g_flash.stream_rx != nullptr) {
+        i2s_channel_disable(g_flash.stream_rx);
+        i2s_del_channel(g_flash.stream_rx);
+        g_flash.stream_rx = nullptr;
+    } else if (stream_task != nullptr) {
+        ESP_LOGE(kTag, "stream task still alive; skipping stream_rx teardown (UAF risk)");
+    }
+
+    ESP_LOGI(kTag, "stream I2S teardown: tx=%s rx=%s",
+             tx_torn_down ? "released" : "kept",
+             (g_flash.stream_rx == nullptr) ? "released" : "kept");
+}
+
 void AudioStreamingTask(void* param)
 {
     (void)param;
@@ -1107,12 +1242,12 @@ void StopAudioStreaming()
     // while we also try to delete it) and a double-free of hardware resources.
     g_flash.capture_started = false;
     TaskHandle_t task = g_flash.stream_task;
-    // [panic-fix] Wait for the task to self-delete. Was 50 ms - too short if the
-    // task is blocked in esp_websocket_client_send_bin (1 s timeout). Forcing
-    // vTaskDelete while the task holds the WS client internal lock corrupts its
-    // queue -> xQueueGenericSend NULL assert -> panic reboot. 1.5 s covers a full
-    // send_bin timeout so the task exits cleanly.
-    for (int i = 0; i < 200; ++i) {  // [stop-fix] 2.0s (was 1.5s) - covers a full 1s send_bin + processing
+    // [panic-fix] Wait for the task to self-delete. The task can block in
+    // esp_websocket_client_send_bin (1 s timeout) or i2s_channel_read (200 ms),
+    // so it needs up to ~1.2 s after capture_started is cleared to exit. 3.0 s
+    // covers two send_bin timeouts + jitter. If it still doesn't exit, leave it
+    // alive (see below) - never vTaskDelete (corrupts FreeRTOS lists -> reboot).
+    for (int i = 0; i < 300; ++i) {  // 3.0s (was 2.0s)
         vTaskDelay(pdMS_TO_TICKS(10));
         if (g_flash.stream_task == nullptr) {
             // Task self-deleted successfully
@@ -1120,14 +1255,15 @@ void StopAudioStreaming()
         }
     }
     // Task still alive — force cleanup (rare fallback for hung task)
-    ESP_LOGW(kTag, "streaming task did not exit cleanly, forcing cleanup");
+    ESP_LOGE(kTag, "streaming task did not exit within 3s; leaving alive (will exit on WS destroy)");
     CleanupStreamHardware();
     if (eTaskGetState(task) != eDeleted) {
-        vTaskDelete(task);
+        // [panic-fix] Do NOT vTaskDelete a task blocked in a driver/WS syscall -
+        // it corrupts FreeRTOS lists (StoreProhibited reboot; decoded backtrace:
+        // uxListRemove<-vTaskDelete<-StopAudioStreaming). Leave it alive;
+        // StopFlashSession's WS destroy unblocks send_bin so it self-exits.
     }
-    xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
-    g_flash.stream_task = nullptr;
-    xSemaphoreGive(g_flash.mutex);
+    (void)task;
 }
 
 // RAII guard so each early-return path automatically frees the cJSON tree.
@@ -1248,79 +1384,74 @@ void ParseAndHandleEvent(const char* data, size_t len)
         std::strcmp(type, "conversation.item.input_audio_transcription.completed") == 0) {
         const char* tr = JsonStr(g.p, "transcript");
         if (tr != nullptr) {
-            // [order-fix] Snapshot thinking_text inside the lock, then AppendUser
-            // + AppendThinking summary outside. StepFun delivers transcription
-            // AFTER thinking.delta/text.delta, so appending here gives the natural
-            // chat order: [user] [thinking] [assistant].
-            std::string thinking_snapshot;
+            const int64_t now_ms = esp_timer_get_time() / 1000;
             xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
             g_flash.user_transcript = tr;
             g_flash.pending_text.clear();
-            if (!g_flash.thinking_text.empty()) {
-                thinking_snapshot = g_flash.thinking_text;
-                g_flash.thinking_text.clear();
+            if (!g_flash.history_user_committed && tr[0] != '\0') {
+                g_flash.history_user_committed =
+                    wqn::GetAiHistory(wqn::AiHistoryChannel::kFlash)
+                        .AppendUser(FlashPmrText(tr), now_ms) != wqn::kInvalidChatMessageId;
             }
-            g_flash.status_since_ms = esp_timer_get_time() / 1000;
+            // ASR establishes the ordering boundary. Any Thinking accumulated
+            // before ASR now appears once, immediately after User. Do not clear
+            // the accumulator; thinking.done/turn.done will replace this row.
+            EnsureFlashThinkingHistoryLocked(now_ms);
+            if (g_flash.turn_done_received) {
+                EnsureFlashThinkingHistoryLocked(now_ms);
+                FinalizeFlashAssistantLocked(now_ms);
+            }
+            g_flash.status_since_ms = now_ms;
             MarkChanged();
             xSemaphoreGive(g_flash.mutex);
             ESP_LOGI(kTag, "transcription: %s", tr);
-            // [display-fix] Write the finalized user transcript into AiHistory
-            // so RenderAiHistoryViewport (page_ai.cpp) picks it up. Without
-            // this, Flash mode text is invisible on the e-paper screen.
-            wqn::GetAiHistory().AppendUser(
-                std::pmr::string(tr, std::pmr::polymorphic_allocator<char>{}),
-                esp_timer_get_time() / 1000);
-            if (!thinking_snapshot.empty()) {
-                if (thinking_snapshot.size() > 40) {
-                    thinking_snapshot = thinking_snapshot.substr(0, 40) + "...";
-                }
-                std::string label = "💭 " + thinking_snapshot;
-                wqn::GetAiHistory().AppendThinking(
-                    std::pmr::string(label.begin(), label.end(),
-                                     std::pmr::polymorphic_allocator<char>{}),
-                    esp_timer_get_time() / 1000);
-                ESP_LOGI(kTag, "thinking摘要: %s", label.c_str());
-            }
         }
         return;
     }
 
-    // [thinking] StepFun docs name this response.thinking.delta (confirmed via
-    // StepFun official docs + the Step-Realtime-Console sample app). Also
-    // accept OpenAI-style response.reasoning*.delta as a fallback in case the
-    // upstream/proxy renames it. Field is the top-level `delta` string in both.
     if (std::strcmp(type, "response.thinking.delta") == 0 ||
         std::strcmp(type, "response.reasoning.delta") == 0 ||
         std::strcmp(type, "response.reasoning_summary_text.delta") == 0) {
         const char* delta = JsonStr(g.p, "delta");
         if (delta != nullptr && delta[0] != '\0') {
             xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
-            const bool first_chunk = g_flash.thinking_text.empty();
-            if (g_flash.thinking_text.size() < 200) {
+            const bool first_visible =
+                g_flash.history_user_committed &&
+                g_flash.thinking_message_id == wqn::kInvalidChatMessageId;
+            g_flash.response_started = true;
+            if (!g_flash.thinking_done) {
                 g_flash.thinking_text += delta;
-                if (g_flash.thinking_text.size() > 200) g_flash.thinking_text.resize(200);
+            }
+            if (first_visible) {
+                // Show the first available prefix once. Later deltas only
+                // accumulate; thinking.done replaces this row with full text.
+                EnsureFlashThinkingHistoryLocked(esp_timer_get_time() / 1000);
+                MarkChanged();
             }
             xSemaphoreGive(g_flash.mutex);
-            // [thinking-display] pending_text is a DEAD field - no renderer
-            // reads it (DrawAiStatusBar draws AiStatusLabel, not pending_text;
-            // RenderAiHistoryViewport draws AiHistory). So drive the screen via
-            // AiHistory.AppendThinking, exactly like AppendUser/AppendAssistant.
-            // Push a placeholder on the first chunk so the user sees the model
-            // is thinking; the final摘要 replaces it when the reply starts
-            // (text.delta). Later chunks only accumulate (no per-chunk UI
-            // refresh - E-ink can't keep up and the text would flicker).
-            if (first_chunk) {
-                ESP_LOGI(kTag, "thinking stream started (%s)", type);
-                // [order-fix] Do NOT AppendThinking here. StepFun delivers events
-                // as thinking.delta -> text.delta -> transcription (user transcript
-                // arrives asynchronously AFTER the reply starts). Appending thinking
-                // here would place it BEFORE the user transcript in history ->
-                // display order "thinking -> 转写 -> AI" instead of "转写 -> thinking
-                // -> AI". We accumulate thinking_text and append the summary only
-                // when the transcription arrives (asr.complete), so it lands after
-                // the user message.
-            }
         }
+        return;
+    }
+
+    if (std::strcmp(type, "response.thinking.done") == 0 ||
+        std::strcmp(type, "response.reasoning.done") == 0 ||
+        std::strcmp(type, "response.reasoning_summary_text.done") == 0) {
+        const char* full = JsonStr(g.p, "full_text");
+        if (full == nullptr || full[0] == '\0') full = JsonStr(g.p, "text");
+        if (full == nullptr || full[0] == '\0') full = JsonStr(g.p, "thinking");
+        if (full == nullptr || full[0] == '\0') full = JsonStr(g.p, "content");
+        const int64_t now_ms = esp_timer_get_time() / 1000;
+        xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+        if (full != nullptr && full[0] != '\0') {
+            g_flash.thinking_text = full;
+        }
+        g_flash.thinking_done = true;
+        EnsureFlashThinkingHistoryLocked(now_ms);
+        const size_t thinking_chars = g_flash.thinking_text.size();
+        MarkChanged();
+        xSemaphoreGive(g_flash.mutex);
+        ESP_LOGI(kTag, "thinking done: chars=%u",
+                 static_cast<unsigned>(thinking_chars));
         return;
     }
 
@@ -1334,6 +1465,7 @@ void ParseAndHandleEvent(const char* data, size_t len)
             // outside the lock (matches the AppendUser/AppendAssistant pattern
             // - PMR alloc off the streaming critical section).
             xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+            g_flash.response_started = true;  // [phase-fix] current turn entered generation
             // [order-fix] Do NOT clear thinking_text or AppendThinking here.
             // thinking_text is appended as a summary when the transcription
             // arrives (asr.complete), so it lands after the user message. We
@@ -1381,28 +1513,20 @@ void ParseAndHandleEvent(const char* data, size_t len)
 
     if (std::strcmp(type, "turn.done") == 0 || std::strcmp(type, "response.done") == 0) {
         ESP_LOGI(kTag, "turn done");
-        // This event means the server has finished generating, not that the
-        // device has finished playing its paced PCM queue. FlashPlaybackTask
-        // owns GPIO46 and closes it only after queue drain + idle tail.
-        // Write the accumulated assistant text into AiHistory at turn completion
-        // so it shows up on the e-paper viewport without pushing partial deltas.
-        std::string assistant_snapshot;
-        if (g_flash.mutex != nullptr) {
-            xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
-            assistant_snapshot = g_flash.assistant_text;
-            g_flash.assistant_text.clear();  // [barge-fix] clear after snapshot so next turn starts fresh - was accumulating across turns (barge-in leftover bled into next reply)
-            g_flash.thinking_text.clear();
-            g_flash.response_in_flight = false;  // [inflight-fix] response done - allow next turn
-            g_flash.status_since_ms = esp_timer_get_time() / 1000;
-            MarkChanged();
-            xSemaphoreGive(g_flash.mutex);
+        const int64_t now_ms = esp_timer_get_time() / 1000;
+        xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+        g_flash.turn_done_received = true;
+        // Finalize in strict order only after ASR established User. If ASR is
+        // late, keep both accumulators; the ASR branch completes this sequence.
+        if (g_flash.history_user_committed) {
+            EnsureFlashThinkingHistoryLocked(now_ms);
+            FinalizeFlashAssistantLocked(now_ms);
         }
-        if (!assistant_snapshot.empty()) {
-            wqn::GetAiHistory().AppendAssistant(
-                std::pmr::string(assistant_snapshot.begin(), assistant_snapshot.end(),
-                                 std::pmr::polymorphic_allocator<char>{}),
-                esp_timer_get_time() / 1000);
-        }
+        g_flash.response_in_flight = false;
+        g_flash.response_started = false;
+        g_flash.status_since_ms = now_ms;
+        MarkChanged();
+        xSemaphoreGive(g_flash.mutex);
         return;
     }
 #endif  // CONFIG_WQN_FLASH_PROTOCOL_V2
@@ -1799,6 +1923,7 @@ esp_err_t StartFlashSession()
     g_flash.assistant_text.clear();
     g_flash.thinking_text.clear();
     g_flash.response_in_flight = false;  // [inflight-fix] reset on new session
+    g_flash.response_started = false;
     g_flash.status_since_ms = esp_timer_get_time() / 1000;
     MarkChanged();
     xSemaphoreGive(g_flash.mutex);
@@ -1936,6 +2061,25 @@ esp_err_t StopFlashSession()
         esp_websocket_client_destroy(client_to_destroy);
     }
 
+    // [i2s-handoff] WS destroy unblocks any AudioStreamingTask stuck in
+    // esp_websocket_client_send_bin (the only thing StopAudioStreaming's 3 s
+    // wait couldn't break). Wait briefly for it to self-exit, then tear down
+    // the duplex I2S channels so STD/Pro can claim I2S_NUM_0. TearDownStream
+    // Channels also stops FlashPlaybackTask and verifies stream_task is gone
+    // before deleting stream_rx (UAF-safe).
+    {
+        xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+        TaskHandle_t stuck = g_flash.stream_task;
+        xSemaphoreGive(g_flash.mutex);
+        for (int i = 0; i < 150 && stuck != nullptr; ++i) {  // up to 1.5 s
+            vTaskDelay(pdMS_TO_TICKS(10));
+            xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+            stuck = g_flash.stream_task;
+            xSemaphoreGive(g_flash.mutex);
+        }
+    }
+    TearDownStreamChannels();
+
     ESP_LOGI(kTag, "flash session stopped");
     return ESP_OK;
 }
@@ -2008,6 +2152,15 @@ bool CopyFlashStateToUi(FlashUiState* state)
     state->tool_label = g_flash.tool_label;
     state->error_message = g_flash.error_message;
     state->status_since_ms = g_flash.status_since_ms;
+    // [phase-fix] Snapshot actual turn state. InternalStatus::kStreaming alone
+    // only says the WebSocket session is connected.
+    state->connected = g_flash.ws_connected;
+    state->capture_started = g_flash.capture_started;
+    state->response_in_flight = g_flash.response_in_flight;
+    state->response_started = g_flash.response_started;
+    state->playback_active =
+        g_flash.playback_write_active ||
+        g_flash.playback_queued_bytes.load(std::memory_order_acquire) > 0;
     g_flash.changed = false;
     xSemaphoreGive(g_flash.mutex);
     return true;
@@ -2070,6 +2223,9 @@ void OnFlashButtonPressed()
 
     if (g_flash.ws_connected &&
         (g_flash.status == InternalStatus::kStreaming || g_flash.status == InternalStatus::kSessionUpdating)) {
+        // [turn-lifecycle] This function is only reached after the 200ms hold
+        // threshold, so it is a real PTT turn (short/double taps never get here).
+        ResetFlashTurnAssemblyLocked();
         g_flash.capture_started = true;
         g_flash.capture_base_seq = g_flash.uplink_seq;  // [barge-fix] detect empty capture on release
         g_flash.pending_text = "正在录音...";
@@ -2112,7 +2268,7 @@ void OnFlashButtonPressed()
     }
 }
 
-void OnFlashButtonReleased()
+void OnFlashButtonReleased(bool submit)
 {
     if (g_flash.mutex == nullptr) {
         return;
@@ -2165,7 +2321,7 @@ void OnFlashButtonReleased()
     xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
     const bool captured_audio = (g_flash.uplink_seq != g_flash.capture_base_seq);
     const bool prev_in_flight = g_flash.response_in_flight;
-    if (ws_connected && g_flash.ws_client != nullptr && was_capturing && captured_audio && !prev_in_flight) {
+    if (submit && ws_connected && g_flash.ws_client != nullptr && was_capturing && captured_audio && !prev_in_flight) {
         // [barge-fix] Only send the final end-of-turn frame if real audio was
         // captured (uplink_seq advanced past capture_base_seq). A fast barge-in
         // tap leaves uplink_seq unchanged; sending an empty final frame would
@@ -2181,6 +2337,7 @@ void OnFlashButtonReleased()
         ++g_flash.uplink_seq;
         seq = g_flash.uplink_seq;
         g_flash.response_in_flight = true;  // in-flight until response.done/error
+        g_flash.response_started = false;   // [phase-fix] no delta for this turn yet
     } else if (was_capturing && captured_audio && prev_in_flight) {
         ESP_LOGW(kTag, "skip turn-end: prior response still in-flight");
     }
@@ -2202,6 +2359,38 @@ void OnFlashButtonReleased()
     }
 }
 
+void AbortFlashPlayback()
+{
+    if (g_flash.mutex == nullptr) {
+        return;
+    }
+    // [barge-in] Local silence: drain queued PCM + flush I2S TX DMA + amp off.
+    // Mirrors the local half of OnFlashButtonPressed's barge-in (without
+    // starting a new turn). FlashPlaybackTask keeps running (idle, blocked on
+    // its ringbuf receive); it is NOT stopped here - that is session-level, in
+    // TearDownStreamChannels.
+    DrainPlaybackRingbuf();
+    SetStreamAudioAmp(false);
+    if (g_flash.stream_tx != nullptr) {
+        i2s_channel_disable(g_flash.stream_tx);
+        i2s_channel_enable(g_flash.stream_tx);
+    }
+    // Remote: ask the proxy to cancel the in-flight response so the server
+    // stops sending more TTS audio. Without this, audio.delta frames already
+    // in flight would refill the ringbuf and playback would resume.
+    xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+    const bool cancel = g_flash.ws_connected && g_flash.response_in_flight;
+    esp_websocket_client_handle_t client = g_flash.ws_client;
+    xSemaphoreGive(g_flash.mutex);
+    if (cancel && client != nullptr) {
+        const char* msg = "{\"type\":\"response.cancel\"}";
+        esp_websocket_client_send_text(client, msg, std::strlen(msg), pdMS_TO_TICKS(1000));
+        ESP_LOGI(kTag, "flash playback aborted (response.cancel sent)");
+    } else {
+        ESP_LOGI(kTag, "flash playback aborted (local only)");
+    }
+}
+
 }  // namespace wqn
 
 #else
@@ -2216,7 +2405,8 @@ bool CopyFlashStateToUi(FlashUiState*) { return false; }
 bool IsFlashTranscribing() { return false; }
 void PollFlashAmpIdle() {}
 void OnFlashButtonPressed() {}
-void OnFlashButtonReleased() {}
+void OnFlashButtonReleased(bool) {}
+void AbortFlashPlayback() {}
 }  // namespace wqn
 
 #endif

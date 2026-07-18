@@ -23,6 +23,9 @@ enum class ButtonEventType {
     // non-PTT flows that want delayed-press semantics.
     kPress,
     kRelease,
+    // [mistouch] One-shot hold threshold (200 ms). Flash PTT starts here,
+    // not on raw kPress, so short/double taps never enter capture/"识别".
+    kHoldPress,
     kShortPress,
     kLongPress,
     kLongRelease,

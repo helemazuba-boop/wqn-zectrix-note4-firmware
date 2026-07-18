@@ -305,11 +305,15 @@ esp_err_t SyncDueProblemsAndLog(const std::string& token);
 //
 struct WqnAiSseEvent {
     enum class Kind {
+        kUnknown,
         kReady,
         kStage,
         kAsrDelta,
         kAsrComplete,
         kAsrFailed,
+        kThinkingStart,
+        kThinkingDelta,
+        kThinkingDone,
         kTextStart,
         kTextDelta,
         kTextEnd,
@@ -317,10 +321,11 @@ struct WqnAiSseEvent {
         kToolResult,
         kToolError,
         kState,
+        kTurnDone,
         kError,
         kFinal,
     };
-    Kind kind = Kind::kReady;
+    Kind kind = Kind::kUnknown;
     uint64_t event_id = 0;
     std::string raw_json;
 
@@ -361,6 +366,13 @@ struct WqnAiStreamRequest {
     int timeout_ms = 0;              // 0 = use WQN_AI_SSE_TIMEOUT_MS
     WqnAiSseCallback callback = nullptr;
     void* user_ctx = nullptr;
+    // [shell->wire] Thinking controls sent in session_meta. reasoning_effort is
+    // sent for BOTH tiers (STD/StepFun uses it; PRO/Qwen ignores for now, sent
+    // for future model upgrades). enable_thinking + system_prompt_extra are
+    // PRO-only (Qwen enable_thinking bool + xhigh prompt at the high level).
+    std::string reasoning_effort;    // "low"|"medium"|"high"; empty = don't send
+    bool enable_thinking = true;     // PRO only: false disables thinking
+    std::string system_prompt_extra; // PRO high level: xhigh reasoning prompt
 };
 
 // Streams a SSE response from POST {WQN_API_BASE}{WQN_AI_SSE_REQUEST_PATH}.

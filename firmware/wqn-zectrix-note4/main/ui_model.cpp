@@ -763,6 +763,16 @@ UiFrame RenderUiFrame(const UiState& state)
     frame.screen = state.screen;
     frame.home = state.home;
     frame.ai = state.ai;
+    if (state.screen == UiScreen::kAi) {
+        const AiHistoryChannel channel = state.ai.tier == AiTier::kFlash
+            ? AiHistoryChannel::kFlash
+            : AiHistoryChannel::kStdPro;
+        frame.ai_history = GetAiHistorySnapshot(channel);
+        if (frame.ai_history) {
+            frame.ai_history_revision = frame.ai_history->revision;
+        }
+    }
+    frame.status_edit = state.status_edit;  // [shell] status-bar edit mode
     frame.todo = state.todo;
     frame.word_app = BuildWordAppSnapshot(state.word_app);
     frame.settings = state.settings;

@@ -239,6 +239,21 @@ std::string FrameSignature(const wqn::UiFrame& frame)
             signature.push_back('/');
             signature.append(summary);
         }
+        // [shell] status-bar edit mode + toggle values: MUST be in the signature
+        // so entering/exiting edit mode and cycling toggles changes the sig and
+        // triggers a refresh (otherwise the dedup pipeline skips the redraw).
+        signature.push_back('/');
+        signature.append(frame.status_edit.active ? "1" : "0");
+        signature.push_back('/');
+        signature.append(std::to_string(frame.status_edit.selected));
+        signature.push_back('/');
+        signature.append(std::to_string(static_cast<int>(frame.ai.thinking_level)));
+        signature.push_back('/');
+        signature.append(frame.ai.tts_on ? "1" : "0");
+        signature.push_back('/');
+        signature.append(frame.ai.expand_content ? "1" : "0");
+        signature.push_back('/');
+        signature.append(std::to_string(frame.ai_history_revision));
     }
     if (frame.screen == wqn::UiScreen::kTodo) {
         signature.append("|todo:");

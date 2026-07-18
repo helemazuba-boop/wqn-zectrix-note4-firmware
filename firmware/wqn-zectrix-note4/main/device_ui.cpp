@@ -329,6 +329,14 @@ void DeviceUiTask(void*)
             refresh_schedule = StrongerSchedule(refresh_schedule, RefreshSchedule::kAi);
         }
 
+        // [shell] Status-bar edit mode: 3 s inactivity auto-exit.
+        if (state.status_edit.active && state.screen == wqn::UiScreen::kAi &&
+            state.status_edit.last_action_ms > 0 &&
+            now_ms - state.status_edit.last_action_ms >= 3000) {
+            state.status_edit.active = false;
+            refresh_schedule = StrongerSchedule(refresh_schedule, RefreshSchedule::kSelection);
+        }
+
         // v2: while the user is recording, the top toast label needs to tick
         // up so "● 录音中 00:04" advances once a second. We do this here on
         // the UI task (the audio task only knows about stream samples).
@@ -396,18 +404,39 @@ wqn::AiStreamingStatusView streaming_view{};
             switch (flash_ui.status) {
                 case wqn::FlashStatus::kError:
                     state.ai.status = wqn::AiSessionStatus::kError;
+                    state.ai.flash_status_label = "错误";
                     state.ai.flash_is_streaming = false;
                     break;
                 case wqn::FlashStatus::kStreaming:
-                    state.ai.status = wqn::AiSessionStatus::kWaitingReply;
-                    state.ai.flash_is_streaming = true;
+                    // [phase-fix] kStreaming means "WebSocket connected", not
+                    // "ASR active". Derive the actual turn phase from snapshot
+                    // facts instead of always mapping it to kWaitingReply/识别.
+                    if (flash_ui.capture_started) {
+                        state.ai.status = wqn::AiSessionStatus::kListening;
+                        state.ai.flash_status_label = "录音";
+                    } else if (flash_ui.playback_active) {
+                        state.ai.status = wqn::AiSessionStatus::kReplyReady;
+                        state.ai.flash_status_label = "播放";
+                    } else if (flash_ui.response_in_flight && flash_ui.response_started) {
+                        state.ai.status = wqn::AiSessionStatus::kStreaming;
+                        state.ai.flash_status_label = "生成";
+                    } else if (flash_ui.response_in_flight) {
+                        state.ai.status = wqn::AiSessionStatus::kWaitingReply;
+                        state.ai.flash_status_label = "识别";
+                    } else {
+                        state.ai.status = wqn::AiSessionStatus::kIdle;
+                        state.ai.flash_status_label = "就绪";
+                    }
+                    state.ai.flash_is_streaming = flash_ui.response_in_flight;
                     break;
                 case wqn::FlashStatus::kConnecting:
                     state.ai.status = wqn::AiSessionStatus::kListening;
+                    state.ai.flash_status_label = "连接";
                     state.ai.flash_is_streaming = false;
                     break;
                 default:
                     state.ai.status = wqn::AiSessionStatus::kIdle;
+                    state.ai.flash_status_label = "空闲";
                     state.ai.flash_is_streaming = false;
                     break;
             }
@@ -478,7 +507,26 @@ wqn::AiStreamingStatusView streaming_view{};
                      last_frame_signature.size(), frame_signature.size(),
                      static_cast<int>(state.screen), static_cast<int>(state.ai.tier));
             if (frame_signature != last_frame_signature) {
-                if (RequestEpdUiRefresh(frame, frame_signature, refresh_schedule)) {
+                // [flash-throttle] Flash streaming updates the sig every ~70ms but
+                // the EPD partial takes ~734ms; coalesce into ~300ms refreshes so
+                // the panel isn't buried and partial-charge ghosting stays bounded.
+                // last_frame_signature is NOT updated on skip, so the pending change
+                // renders on the next eligible tick (not lost).
+                bool skip_for_throttle = false;
+                if (state.screen == wqn::UiScreen::kAi &&
+                    state.ai.tier == wqn::AiTier::kFlash &&
+                    state.ai.flash_is_streaming) {
+                    static int64_t last_flash_render_ms = 0;
+                    const int64_t now_ms_d = esp_timer_get_time() / 1000;
+                    if (now_ms_d - last_flash_render_ms < 300) {
+                        skip_for_throttle = true;
+                    } else {
+                        last_flash_render_ms = now_ms_d;
+                    }
+                }
+                if (skip_for_throttle) {
+                    ESP_LOGI(kTag, "Flash refresh throttled (coalescing streaming deltas)");
+                } else if (RequestEpdUiRefresh(frame, frame_signature, refresh_schedule)) {
                     ESP_LOGI(kTag, "EPD UI refresh requested: schedule=%s", device_ui_internal::RefreshScheduleName(refresh_schedule));
                     last_frame_signature = frame_signature;
                     // [timer-skip] Persist the clock label that is now on the

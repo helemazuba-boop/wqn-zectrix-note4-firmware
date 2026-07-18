@@ -85,25 +85,36 @@ void DispatchEvent(StreamContext* ctx, const wqn::SseFrameBuffer& frame,
   }
 
   const std::string ev_name = event_name;
-  // event_kind lookup
-  auto kind_from = [&](const char* n, wqn::WqnAiSseEvent::Kind k){
-    return ev_name == n ? k : wqn::WqnAiSseEvent::Kind::kReady;
-  };
-  wqn::WqnAiSseEvent::Kind k = wqn::WqnAiSseEvent::Kind::kReady;
-  if      (ev_name == "ready")       k = wqn::WqnAiSseEvent::Kind::kReady;
-  else if (ev_name == "stage")       k = wqn::WqnAiSseEvent::Kind::kStage;
-  else if (ev_name == "asr.delta")   k = wqn::WqnAiSseEvent::Kind::kAsrDelta;
-  else if (ev_name == "asr.complete") k = wqn::WqnAiSseEvent::Kind::kAsrComplete;
-  else if (ev_name == "asr.failed")   k = wqn::WqnAiSseEvent::Kind::kAsrFailed;
-  else if (ev_name == "text.start")   k = wqn::WqnAiSseEvent::Kind::kTextStart;
-  else if (ev_name == "text.delta")   k = wqn::WqnAiSseEvent::Kind::kTextDelta;
-  else if (ev_name == "text.end")     k = wqn::WqnAiSseEvent::Kind::kTextEnd;
-  else if (ev_name == "tool.start")   k = wqn::WqnAiSseEvent::Kind::kToolStart;
-  else if (ev_name == "tool.result")  k = wqn::WqnAiSseEvent::Kind::kToolResult;
-  else if (ev_name == "tool.error")   k = wqn::WqnAiSseEvent::Kind::kToolError;
-  else if (ev_name == "state")        k = wqn::WqnAiSseEvent::Kind::kState;
-  else if (ev_name == "error")        k = wqn::WqnAiSseEvent::Kind::kError;
-  else if (ev_name == "final")        k = wqn::WqnAiSseEvent::Kind::kFinal;
+  using Kind = wqn::WqnAiSseEvent::Kind;
+  Kind k = Kind::kUnknown;
+  if      (ev_name == "ready")        k = Kind::kReady;
+  else if (ev_name == "stage")        k = Kind::kStage;
+  else if (ev_name == "asr.delta")    k = Kind::kAsrDelta;
+  else if (ev_name == "asr.complete") k = Kind::kAsrComplete;
+  else if (ev_name == "asr.failed")   k = Kind::kAsrFailed;
+  else if (ev_name == "thinking.start" || ev_name == "reasoning.start" ||
+           ev_name == "response.thinking.start" || ev_name == "response.reasoning.start")
+                                            k = Kind::kThinkingStart;
+  else if (ev_name == "thinking.delta" || ev_name == "reasoning.delta" ||
+           ev_name == "response.thinking.delta" || ev_name == "response.reasoning.delta" ||
+           ev_name == "response.reasoning_summary_text.delta")
+                                            k = Kind::kThinkingDelta;
+  else if (ev_name == "thinking.done" || ev_name == "thinking.end" ||
+           ev_name == "reasoning.done" || ev_name == "reasoning.end" ||
+           ev_name == "response.thinking.done" || ev_name == "response.reasoning.done" ||
+           ev_name == "response.reasoning_summary_text.done")
+                                            k = Kind::kThinkingDone;
+  else if (ev_name == "text.start")    k = Kind::kTextStart;
+  else if (ev_name == "text.delta")    k = Kind::kTextDelta;
+  else if (ev_name == "text.end")      k = Kind::kTextEnd;
+  else if (ev_name == "tool.start")    k = Kind::kToolStart;
+  else if (ev_name == "tool.result")   k = Kind::kToolResult;
+  else if (ev_name == "tool.error")    k = Kind::kToolError;
+  else if (ev_name == "state")         k = Kind::kState;
+  else if (ev_name == "turn.done" || ev_name == "response.done")
+                                            k = Kind::kTurnDone;
+  else if (ev_name == "error")         k = Kind::kError;
+  else if (ev_name == "final")         k = Kind::kFinal;
   ev.kind = k;
 
   // Now copy relevant fields.
@@ -351,16 +362,35 @@ esp_err_t UploadAiAudioChatStream(const WqnAiStreamRequest& request,
                 static_cast<unsigned>(request.pcm.size() * sizeof(int16_t)));
   mp.part_json("audio_meta", std::string(audio_meta));
 
-  char session_meta[256];
   std::time_t now = 0;
   std::time(&now);
   int64_t boot_ms = esp_timer_get_time() / 1000;
-  std::snprintf(session_meta, sizeof(session_meta),
-                "{\"started_at_ms\":%lld,\"ui_locale\":\"zh-CN\",\"active_tier\":\"%s\",\"boot_ms\":%lld}",
-                static_cast<long long>(now) * 1000LL,
-                request.tier.empty() ? "std" : request.tier.c_str(),
-                static_cast<long long>(boot_ms));
-  mp.part_json("session_meta", std::string(session_meta));
+  // [shell->wire] session_meta now carries the thinking controls. Built as a
+  // std::string (not snprintf) so the xhigh system_prompt_extra (~200 chars)
+  // can't overflow a fixed buffer.
+  std::string session_meta = "{\"started_at_ms\":";
+  session_meta += std::to_string(static_cast<long long>(now) * 1000LL);
+  session_meta += ",\"ui_locale\":\"zh-CN\",\"active_tier\":\"";
+  session_meta += request.tier.empty() ? "std" : request.tier;
+  session_meta += "\",\"boot_ms\":";
+  session_meta += std::to_string(static_cast<long long>(boot_ms));
+  session_meta += ",\"enable_thinking\":";
+  session_meta += request.enable_thinking ? "true" : "false";
+  if (!request.reasoning_effort.empty()) {
+      session_meta += ",\"reasoning_effort\":\"";
+      session_meta += request.reasoning_effort;
+      session_meta += "\"";
+  }
+  if (!request.system_prompt_extra.empty()) {
+      session_meta += ",\"system_prompt_extra\":\"";
+      for (char c : request.system_prompt_extra) {  // escape JSON specials
+          if (c == '"' || c == '\\') session_meta += '\\';
+          session_meta += c;
+      }
+      session_meta += "\"";
+  }
+  session_meta += "}";
+  mp.part_json("session_meta", session_meta);
 
   const uint8_t* pcm_bytes = reinterpret_cast<const uint8_t*>(request.pcm.data());
   const size_t pcm_size = request.pcm.size() * sizeof(int16_t);

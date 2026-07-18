@@ -1,9 +1,11 @@
 #pragma once
 
 #include <cstddef>
+#include <memory>
 #include <string>
 #include <vector>
 
+#include "ai_history.h"
 #include "storage.h"
 #include "time_app.h"
 #include "word_app.h"
@@ -71,6 +73,17 @@ AiTier NextAiTier(AiTier current);
 AiTier PrevAiTier(AiTier current);
 const char* AiTierLabel(AiTier tier);
 
+// [shell] Thinking effort level shown as the status-bar lightbulb icon
+// (off/low/med/high = 0..3 rays). Local-only for now (server controls the real
+// thinking level); the status-bar toggle cycles this for display.
+enum class ThinkingLevel : uint8_t {
+    kOff = 0,
+    kLow,
+    kMed,
+    kHigh,
+    kCount = 4,
+};
+
 struct AiSessionState {
     AiSessionStatus status = AiSessionStatus::kIdle;
     AiTier tier = AiTier::kStd;
@@ -87,6 +100,7 @@ struct AiSessionState {
     std::string flash_transcript;
     std::string flash_pending;
     std::string flash_error;
+    std::string flash_status_label;  // [phase-fix] 连接/就绪/录音/识别/生成/播放/错误
     bool flash_is_streaming = false;
 
     // v2 SSE incremental render fields (Std/Pro tiers).
@@ -107,6 +121,13 @@ struct AiSessionState {
     int64_t toast_since_ms = 0;
     int32_t toast_recording_ms = 0;  // running counter for the recording label (only)
     int64_t scroll_no_op_hint_ms = 0; // when Down is pressed at the bottom, briefly stamp a "已最新" hint
+
+    // [shell] Status-bar quick toggles (AI page). Local, cyclable via the
+    // status-bar edit mode; NOT wired to backend (thinking level is server-
+    // controlled, TTS/Flash sound WIP). See docs/13-ui-design-language.md.
+    ThinkingLevel thinking_level = ThinkingLevel::kMed;
+    bool tts_on = false;
+    bool expand_content = true;   // [expand] default full thinking/tool display (Flash can't toggle)
 };
 
 // Returns the current scroll offset in 18-px line units (0 == bottom / newest).
@@ -210,8 +231,21 @@ struct UiRuntimeStatus {
     std::string last_sync_status;
 };
 
+// [shell] Status-bar edit mode (global, currently AI page only): which toggle
+// icon is selected and when the last edit happened (for the 3 s exit timeout).
+// The toggle VALUES themselves live in the per-page app state (e.g. AI's
+// thinking_level / tts_on / expand_content in AiSessionState).
+struct StatusBarEditState {
+    bool active = false;
+    uint8_t selected = 0;       // index into the page's toggle list
+    int64_t last_action_ms = 0; // for 3 s inactivity auto-exit
+    int64_t last_cycle_ms = 0;  // [shell] ts of last forward cycle; a 2nd short
+                                // confirm within kStatusBarEditDblMs = save & exit
+};
+
 struct UiState {
     UiScreen screen = UiScreen::kHome;
+    StatusBarEditState status_edit;
     size_t selected_home_task = 0;
     size_t selected_problem = 0;
     ReviewChoice selected_review = ReviewChoice::kNeedsReview;
@@ -234,8 +268,11 @@ struct UiLine {
 struct UiFrame {
     UiScreen screen = UiScreen::kHome;
     bool prefer_full_refresh = false;
+    StatusBarEditState status_edit;  // [shell] status-bar edit mode for render
     HomeSummary home;
     AiSessionState ai;
+    std::shared_ptr<const AiHistorySnapshot> ai_history;
+    uint64_t ai_history_revision = 0;
     TodoUiState todo;
     TimeAppState time_app;
     WordAppSnapshot word_app;

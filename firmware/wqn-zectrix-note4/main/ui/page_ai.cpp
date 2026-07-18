@@ -71,14 +71,120 @@ const char* AiStatusLabel(wqn::AiSessionStatus status)
 
 #define DRC(...) do { (void)wqn::DrawUtf8Text(__VA_ARGS__); } while (0)
 
-void DrawAiStatusBar(const wqn::AiSessionState& ai, const wqn::HomeSummary& home)
+// [shell] 16px status-bar toggle icons (thinking/TTS/expand). x,y = top-left of
+// the 16x16 cell. selected = 反白 (ink bg + paper glyph). Crude pixel art via
+// FillRect/DrawEpdPixel; good enough for the shell, refine in L2.
+// See docs/13-ui-design-language.md.
+static void DrawSlash16(int x, int y, bool black) {
+    for (int i = 0; i < 12; ++i) {
+        wqn::DrawEpdPixel(x + 2 + i, y + 13 - i, black);
+    }
+}
+static void DrawThinkingIcon(int x, int y, wqn::ThinkingLevel level, bool selected) {
+    const bool c = !selected;  // icon pixel color: black normally, paper when反白
+    if (selected) { FillRect(x, y, 16, 16, true); }
+    FillRect(x + 4, y + 4, 8, 5, c);  // glass
+    FillRect(x + 6, y + 9, 4, 3, c);  // base
+    const int rays = static_cast<int>(level);  // off=0, low=1, med=2, high=3
+    if (rays >= 1) { FillRect(x + 7, y + 1, 2, 2, c); }   // top ray
+    if (rays >= 2) { FillRect(x + 2, y + 4, 2, 2, c); }   // left ray
+    if (rays >= 3) { FillRect(x + 12, y + 4, 2, 2, c); }  // right ray
+}
+static void DrawTtsIcon(int x, int y, bool on, bool selected) {
+    const bool c = !selected;
+    if (selected) { FillRect(x, y, 16, 16, true); }
+    FillRect(x + 2, y + 6, 3, 4, c);  // stem
+    FillRect(x + 5, y + 4, 3, 8, c);  // cone
+    if (on) {
+        FillRect(x + 10, y + 6, 1, 4, c);  // wave 1
+        FillRect(x + 12, y + 4, 1, 8, c);  // wave 2
+    } else {
+        DrawSlash16(x, y, c);
+    }
+}
+static void DrawExpandIcon(int x, int y, bool on, bool selected) {
+    const bool c = !selected;
+    if (selected) { FillRect(x, y, 16, 16, true); }
+    FillRect(x + 3, y + 4, 10, 3, c);  // bar 1
+    FillRect(x + 3, y + 9, 10, 3, c);  // bar 2
+    if (!on) { DrawSlash16(x, y, c); }
+}
+
+// [tier-icon] Status-bar tier indicator (16px, display only - tier switch is
+// double-press Up/Down). Flash=lightning, STD=hourglass, Pro=brain.
+static void DrawLightningIcon(int x, int y, bool selected) {
+    const bool c = !selected;
+    if (selected) { FillRect(x, y, 16, 16, true); }
+    FillRect(x + 9, y + 2, 2, 3, c);
+    FillRect(x + 7, y + 5, 3, 2, c);
+    FillRect(x + 9, y + 6, 2, 3, c);
+    FillRect(x + 5, y + 8, 4, 2, c);
+    FillRect(x + 7, y + 10, 2, 4, c);
+}
+static void DrawHourglassIcon(int x, int y, bool selected) {
+    const bool c = !selected;
+    if (selected) { FillRect(x, y, 16, 16, true); }
+    FillRect(x + 3, y + 3, 10, 2, c);   // top bar
+    FillRect(x + 4, y + 5, 8, 1, c);
+    FillRect(x + 6, y + 6, 4, 1, c);
+    FillRect(x + 7, y + 7, 2, 1, c);    // apex
+    FillRect(x + 6, y + 9, 4, 1, c);
+    FillRect(x + 4, y + 10, 8, 1, c);
+    FillRect(x + 3, y + 11, 10, 2, c);  // bottom bar
+}
+static void DrawBrainIcon(int x, int y, bool selected) {
+    const bool c = !selected;
+    if (selected) { FillRect(x, y, 16, 16, true); }
+    FillRect(x + 4, y + 4, 8, 8, c);    // body
+    FillRect(x + 3, y + 6, 1, 3, c);    // left bump
+    FillRect(x + 12, y + 6, 1, 3, c);   // right bump
+    FillRect(x + 5, y + 3, 2, 1, c);    // top-left bump
+    FillRect(x + 9, y + 3, 2, 1, c);    // top-right bump
+    FillRect(x + 5, y + 12, 2, 1, c);   // bottom-left bump
+    FillRect(x + 9, y + 12, 2, 1, c);   // bottom-right bump
+}
+// [trash] Clear-context action button (edit-mode index 3, STD/Pro only).
+static void DrawTrashIcon(int x, int y, bool selected) {
+    const bool c = !selected;
+    if (selected) { FillRect(x, y, 16, 16, true); }
+    FillRect(x + 4, y + 3, 8, 2, c);    // lid
+    FillRect(x + 3, y + 5, 10, 1, c);   // lid base
+    FillRect(x + 5, y + 6, 1, 8, c);    // left wall
+    FillRect(x + 10, y + 6, 1, 8, c);   // right wall
+    FillRect(x + 5, y + 13, 6, 1, c);   // bottom
+    FillRect(x + 7, y + 7, 1, 6, c);    // mid rib
+}
+
+constexpr int kAiToggleX = 62;
+constexpr int kAiToggleY = 5;
+constexpr int kAiToggleStep = 21;
+
+void DrawAiStatusBar(const wqn::AiSessionState& ai, const wqn::HomeSummary& home, const wqn::StatusBarEditState& status_edit)
 {
     // Status bar occupies y=0..27 with a bottom divider line.
     DrawHorizontalLine(0, kAiStatusBarH - 1, wqn::kEpdWidth);
     // Left: page title + tier chip.
-    DRC(6, 6, "AI", true);
-    const char* tier_label = wqn::AiTierLabel(ai.tier);
-    DRC(6 + 24, 6, tier_label, true);
+    // [tier-icon] Tier indicator + edit-mode button 0 (replaces "AI" + tier text):
+    // Flash=lightning, STD=hourglass, Pro=brain. confirm cycles tier (all tiers).
+    const bool tier_sel = status_edit.active && status_edit.selected == 0;
+    switch (ai.tier) {
+        case wqn::AiTier::kFlash: DrawLightningIcon(6, kAiToggleY, tier_sel); break;
+        case wqn::AiTier::kPro:   DrawBrainIcon(6, kAiToggleY, tier_sel); break;
+        case wqn::AiTier::kStd:
+        default:                  DrawHourglassIcon(6, kAiToggleY, tier_sel); break;
+    }
+
+    // [shell] Toggle zone (STD/Pro only): thinking(1)/TTS(2)/expand(3)/trash(4).
+    // Flash hides the whole zone (only the tier icon, button 0, is editable).
+    if (ai.tier != wqn::AiTier::kFlash) {
+        if (status_edit.active) {
+            DrawRect(kAiToggleX - 4, kAiToggleY - 2, kAiToggleStep * 4 + 2, 20);
+        }
+        DrawThinkingIcon(kAiToggleX + 0 * kAiToggleStep, kAiToggleY, ai.thinking_level, status_edit.active && status_edit.selected == 1);
+        DrawTtsIcon(kAiToggleX + 1 * kAiToggleStep, kAiToggleY, ai.tts_on, status_edit.active && status_edit.selected == 2);
+        DrawExpandIcon(kAiToggleX + 2 * kAiToggleStep, kAiToggleY, ai.expand_content, status_edit.active && status_edit.selected == 3);
+        DrawTrashIcon(kAiToggleX + 3 * kAiToggleStep, kAiToggleY, status_edit.active && status_edit.selected == 4);
+    }
 
     // Center column: when the toast is visible, replace the clock with the
     // toast label so the user still has a top-level status readout without
@@ -100,7 +206,10 @@ void DrawAiStatusBar(const wqn::AiSessionState& ai, const wqn::HomeSummary& home
     // Right-of-status: idle-state status label only (skipped while toast
     // owns the centre column to avoid double-drawing).
     if (!ai.toast_visible) {
-        const std::string status = AiStatusLabel(ai.status);
+        const std::string status =
+            (ai.tier == wqn::AiTier::kFlash && !ai.flash_status_label.empty())
+                ? ai.flash_status_label
+                : AiStatusLabel(ai.status);
         if (!status.empty()) {
             const int status_width = wqn::MeasureUtf8TextWidth(status.c_str());
             const int status_x = std::max(0, 320 - status_width);
@@ -171,7 +280,7 @@ int DrawAssistantBlock(int x, int y, int max_w, const std::string& text)
     // layout measured a block as 64 rows tall but only 32 rows were actually
     // drawn — the remaining text was silently dropped and subsequent messages
     // were positioned based on a height that didn't match what was rendered.
-    constexpr size_t kAssistantRowCap = 64;
+    constexpr size_t kAssistantRowCap = 1024;  // [expand] was 64; raised to effectively remove the reply display cap (full reply, scrollable)
     const auto lines = WrapForViewport(text, max_w - kAiAssistantLeftBorder - 6, kAssistantRowCap);
     const int row_count = static_cast<int>(lines.size());
     const int row_h = kAiLineH;
@@ -196,9 +305,40 @@ int DrawAssistantBlock(int x, int y, int max_w, const std::string& text)
     return total_h;
 }
 
-int DrawThinkingBlock(int x, int y, int max_w, const std::string& text)
+std::vector<std::string> BuildThinkingLines(const std::string& text, int max_w, bool expanded)
 {
-    const auto lines = WrapForViewport(text, max_w - 14, 3);
+    if (expanded) {
+        return WrapForViewport(text, max_w - 14, 1024);
+    }
+    std::string one = wqn::TruncateUtf8TextToWidth(text, max_w - 14);
+    if (one.size() < text.size() && one.find("...") == std::string::npos) {
+        one = wqn::TruncateUtf8TextToWidth(text, max_w - 14 - 18) + "...";
+    }
+    return {one.empty() ? std::string("💭") : one};
+}
+
+int ToolBlockHeight(const wqn::ChatMessageSnapshot& tool, int max_w, bool expanded)
+{
+    const int row_h = kAiLineH;
+    int expected_h = 6 + row_h;
+    if (expanded) {
+        if (!tool.tool_args_json.empty()) {
+            expected_h += static_cast<int>(WrapForViewport(
+                "args: " + tool.tool_args_json, max_w - 12, 2).size()) * row_h;
+        }
+        if (!tool.tool_result_json.empty()) {
+            std::string result = tool.tool_ok ? "✅ result: " : "❌ result: ";
+            result += tool.tool_result_json;
+            expected_h += static_cast<int>(WrapForViewport(result, max_w - 12, 2).size()) * row_h;
+        }
+        expected_h += row_h;
+    }
+    return expected_h + 6;
+}
+
+int DrawThinkingBlock(int x, int y, int max_w, const std::string& text, bool expanded)
+{
+    const auto lines = BuildThinkingLines(text, max_w, expanded);
     const int row_count = static_cast<int>(lines.size());
     const int row_h = kAiLineH;
     const int total_h = row_count * row_h + 6;
@@ -219,30 +359,30 @@ int DrawThinkingBlock(int x, int y, int max_w, const std::string& text)
     return total_h;
 }
 
-int DrawToolBlock(int x, int y, int max_w, const wqn::ChatMessage& tool)
+int DrawToolBlock(int x, int y, int max_w, const wqn::ChatMessageSnapshot& tool, bool expanded)
 {
+    const char* marker = expanded ? "▾" : "▸";
     char header[64];
-    std::snprintf(header, sizeof(header), "▾ [Tool: %s]",
+    std::snprintf(header, sizeof(header), "%s [Tool: %s]", marker,
                   tool.tool_name.c_str()[0] ? tool.tool_name.c_str() : "tool");
     char elapsed[32] = {};
     std::snprintf(elapsed, sizeof(elapsed), "elapsed: %ld ms", static_cast<long>(tool.tool_elapsed_ms));
 
     const int row_h = kAiLineH;
-    int expected_h = 6 + row_h;  // header + 2 + padding
+    const int expected_h = ToolBlockHeight(tool, max_w, expanded);
 
     std::vector<std::string> args_lines;
-    if (!tool.tool_args_json.empty()) {
-        args_lines = WrapForViewport("args: " + std::string(tool.tool_args_json.data(), tool.tool_args_json.size()), max_w - 12, 2);
-        expected_h += args_lines.size() * row_h;
-    }
     std::vector<std::string> result_lines;
-    if (!tool.tool_result_json.empty()) {
-        std::string r_line = tool.tool_ok ? "✅ result: " : "❌ result: ";
-        r_line += std::string(tool.tool_result_json.data(), tool.tool_result_json.size());
-        result_lines = WrapForViewport(r_line, max_w - 12, 2);
-        expected_h += result_lines.size() * row_h;
+    if (expanded) {
+        if (!tool.tool_args_json.empty()) {
+            args_lines = WrapForViewport("args: " + tool.tool_args_json, max_w - 12, 2);
+        }
+        if (!tool.tool_result_json.empty()) {
+            std::string r_line = tool.tool_ok ? "✅ result: " : "❌ result: ";
+            r_line += tool.tool_result_json;
+            result_lines = WrapForViewport(r_line, max_w - 12, 2);
+        }
     }
-    expected_h += row_h; // elapsed
 
     const int visible_top = std::max(kAiViewportY, y);
     const int visible_bottom = std::min(wqn::kEpdHeight, y + expected_h);
@@ -264,39 +404,44 @@ int DrawToolBlock(int x, int y, int max_w, const wqn::ChatMessage& tool)
         DRC(x + 4, y + 4, header, true);
     }
 
-    int cur_y = y + 4 + row_h;
-    // Args row.
-    for (const auto& l : args_lines) {
-        if (cur_y >= kAiViewportY && cur_y + row_h <= wqn::kEpdHeight) {
-            DRC(x + 8, cur_y, l.c_str(), true);
+    if (expanded) {
+        int cur_y = y + 4 + row_h;
+        // Args row.
+        for (const auto& l : args_lines) {
+            if (cur_y >= kAiViewportY && cur_y + row_h <= wqn::kEpdHeight) {
+                DRC(x + 8, cur_y, l.c_str(), true);
+            }
+            cur_y += row_h;
         }
-        cur_y += row_h;
-    }
 
-    // Result row.
-    for (const auto& l : result_lines) {
-        if (cur_y >= kAiViewportY && cur_y + row_h <= wqn::kEpdHeight) {
-            DRC(x + 8, cur_y, l.c_str(), true);
+        // Result row.
+        for (const auto& l : result_lines) {
+            if (cur_y >= kAiViewportY && cur_y + row_h <= wqn::kEpdHeight) {
+                DRC(x + 8, cur_y, l.c_str(), true);
+            }
+            cur_y += row_h;
         }
-        cur_y += row_h;
+
+        // Elapsed row.
+        if (cur_y >= kAiViewportY && cur_y + row_h <= wqn::kEpdHeight) {
+            DRC(x + 8, cur_y, elapsed, true);
+        }
     }
 
-    // Elapsed row.
-    if (cur_y >= kAiViewportY && cur_y + row_h <= wqn::kEpdHeight) {
-        DRC(x + 8, cur_y, elapsed, true);
-    }
-
-    return expected_h + 6;
+    return expected_h;
 }
 
-void RenderAiHistoryViewport(const wqn::AiSessionState& ai, int32_t scroll_offset_lines)
+void RenderAiHistoryViewport(const wqn::AiSessionState& ai,
+                            const std::shared_ptr<const wqn::AiHistorySnapshot>& snapshot,
+                            int32_t scroll_offset_lines)
 {
     // Clear the viewport region explicitly (partial-region contract).
     DrawHistoryClear(kAiViewportY, wqn::kEpdHeight);
 
     const int line_h = kAiLineH;
-    const wqn::AiHistory& history = wqn::GetAiHistory();
-    if (history.empty() && ai.status == wqn::AiSessionStatus::kIdle) {
+    static const std::vector<wqn::ChatMessageSnapshot> kEmpty;
+    const auto& messages = snapshot ? snapshot->messages : kEmpty;
+    if (messages.empty() && ai.status == wqn::AiSessionStatus::kIdle) {
         const std::string hint = "长按确认键开始语音提问";
         const auto lines = WrapForViewport(hint, kAiAssistantW - kAiAssistantLeftBorder - 6, 4);
         int y = kAiViewportY + 30;
@@ -314,12 +459,12 @@ void RenderAiHistoryViewport(const wqn::AiSessionState& ai, int32_t scroll_offse
         int rows_consumed;
     };
     std::vector<Layout> layout;
-    const size_t n = history.size();
+    const size_t n = messages.size();
     
     // Index 0 is oldest, n-1 is newest. We build layout from newest (n-1) to oldest (0).
     for (size_t i = 0; i < n; ++i) {
         const size_t msg_idx = n - 1 - i;
-        const wqn::ChatMessage& msg = history.at(msg_idx);
+        const wqn::ChatMessageSnapshot& msg = messages[msg_idx];
         int h = 0;
         int rows_consumed = 0;
         const std::string body(msg.text.empty() ? std::string("-")
@@ -331,29 +476,16 @@ void RenderAiHistoryViewport(const wqn::AiSessionState& ai, int32_t scroll_offse
         } else if (msg.kind == wqn::ChatMessageKind::kAssistant) {
             // Layout pass — keep the row cap generous so a long reply still
             // measures its true height before we hit the viewport clip.
-            constexpr size_t kAssistantLayoutRowCap = 64;
+            constexpr size_t kAssistantLayoutRowCap = 1024;  // [expand] must match kAssistantRowCap (was 64)
             const auto lines = WrapForViewport(body, kAiAssistantW - kAiAssistantLeftBorder - 6, kAssistantLayoutRowCap);
             h = static_cast<int>(lines.size()) * line_h + 6;
             rows_consumed = static_cast<int>(lines.size());
         } else if (msg.kind == wqn::ChatMessageKind::kThinking) {
-            const auto lines = WrapForViewport(body, kAiAssistantW - 14, 3);
+            const auto lines = BuildThinkingLines(body, kAiAssistantW, ai.expand_content);
             h = static_cast<int>(lines.size()) * line_h + 6;
             rows_consumed = static_cast<int>(lines.size());
         } else {
-            // Tool block
-            int expected_h = 6 + line_h;
-            if (!msg.tool_args_json.empty()) {
-                auto lines = WrapForViewport("args: " + std::string(msg.tool_args_json.data(), msg.tool_args_json.size()), kAiAssistantW - 12, 2);
-                expected_h += lines.size() * line_h;
-            }
-            if (!msg.tool_result_json.empty()) {
-                std::string r_line = msg.tool_ok ? "✅ result: " : "❌ result: ";
-                r_line += std::string(msg.tool_result_json.data(), msg.tool_result_json.size());
-                auto lines = WrapForViewport(r_line, kAiAssistantW - 12, 2);
-                expected_h += lines.size() * line_h;
-            }
-            expected_h += line_h; // elapsed
-            h = expected_h + 6;
+            h = ToolBlockHeight(msg, kAiAssistantW, ai.expand_content);
             rows_consumed = h / line_h;
         }
         layout.push_back({h, msg_idx, rows_consumed});
@@ -400,7 +532,7 @@ void RenderAiHistoryViewport(const wqn::AiSessionState& ai, int32_t scroll_offse
     int newest_user_idx = -1;
     for (size_t i = 0; i < layout.size(); ++i) {
         const Layout& L = layout[i];
-        if (history.at(L.msg_idx).kind == wqn::ChatMessageKind::kUser) {
+        if (messages[L.msg_idx].kind == wqn::ChatMessageKind::kUser) {
             newest_user_idx = static_cast<int>(i);
             break;
         }
@@ -447,7 +579,7 @@ void RenderAiHistoryViewport(const wqn::AiSessionState& ai, int32_t scroll_offse
     // Draw all messages that intersect with the viewport
     for (int i = layout_size - 1; i >= 0; --i) {
         const Layout& L = layout[i];
-        const wqn::ChatMessage& msg = history.at(L.msg_idx);
+        const wqn::ChatMessageSnapshot& msg = messages[L.msg_idx];
         const int block_top = kAiViewportY + (virtual_tops[i] - window_top);
 
         // Clip completely above viewport
@@ -475,9 +607,9 @@ void RenderAiHistoryViewport(const wqn::AiSessionState& ai, int32_t scroll_offse
         } else if (msg.kind == wqn::ChatMessageKind::kAssistant) {
             DrawAssistantBlock(x_left, block_top, kAiAssistantW, body);
         } else if (msg.kind == wqn::ChatMessageKind::kThinking) {
-            DrawThinkingBlock(x_left, block_top, kAiAssistantW, body);
+            DrawThinkingBlock(x_left, block_top, kAiAssistantW, body, ai.expand_content);
         } else {
-            DrawToolBlock(x_left, block_top, kAiAssistantW, msg);
+            DrawToolBlock(x_left, block_top, kAiAssistantW, msg, ai.expand_content);
         }
     }
 
@@ -485,7 +617,7 @@ void RenderAiHistoryViewport(const wqn::AiSessionState& ai, int32_t scroll_offse
     // `kAiViewportBottomPad` slack so it never overlaps content. ▲ sits in
     // the top-right corner when there's more above. The indicator strip is
     // cleared each tick to avoid ghosting on the E-ink panel.
-    if (history.size() > 1) {
+    if (messages.size() > 1) {
         const bool more_above = !oldest_fully_visible;
         const bool more_below = (window_top < max_window_top);
         // Reserve a 22x18 px region at the bottom-right; clear it before
@@ -532,10 +664,10 @@ esp_err_t RenderAiToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
     wqn::ClearEpdFramebuffer(true);
 
     // Section 1: status bar (no battery, merges toast state).
-    DrawAiStatusBar(ai, frame.home);
+    DrawAiStatusBar(ai, frame.home, frame.status_edit);
 
     // Section 2: viewport (no bottom input bar, no separate toast strip).
-    RenderAiHistoryViewport(ai, ai.scroll_offset_lines);
+    RenderAiHistoryViewport(ai, frame.ai_history, ai.scroll_offset_lines);
 
     return RefreshFrame(frame, schedule);
 }

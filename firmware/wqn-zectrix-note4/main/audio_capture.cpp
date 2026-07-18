@@ -154,7 +154,14 @@ esp_err_t EnsureAudioService()
 void CancelAudioPowerOffTimerUnlocked()
 {
     if (g_audio.power_timer != nullptr) {
-        ESP_ERROR_CHECK_WITHOUT_ABORT(esp_timer_stop(g_audio.power_timer));
+        // esp_timer_stop returns ESP_ERR_INVALID_STATE if the timer was never
+        // started or already expired - both are benign here. Using
+        // ESP_ERROR_CHECK_WITHOUT_ABORT would log a scary abort when Flash
+        // mode (which never starts this timer) transitions to STD/Pro.
+        const esp_err_t ret = esp_timer_stop(g_audio.power_timer);
+        if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+            ESP_LOGW(kTag, "esp_timer_stop unexpected: %s", esp_err_to_name(ret));
+        }
     }
 }
 
@@ -381,7 +388,13 @@ void CleanupCaptureHardware(bool keep_power)
         ESP_ERROR_CHECK_WITHOUT_ABORT(i2s_channel_disable(g_audio.rx));
         g_audio.rx_enabled = false;
     }
-    if (!keep_power && g_audio.rx != nullptr) {
+    // [i2s-handoff] Always delete the RX channel (not just disable) so the
+    // I2S_NUM_0 RX slot is released for Flash's duplex channels. A disabled
+    // channel still holds the port slot (i2s_new_channel returns
+    // ESP_ERR_NOT_FOUND/"no available channel"), which is what blocked Flash
+    // after a STD recording. Mirrors audio_player.cpp StopAudioPlayback (which
+    // deletes g_player.tx). InitI2s recreates the channel on next start.
+    if (g_audio.rx != nullptr) {
         ESP_ERROR_CHECK_WITHOUT_ABORT(i2s_del_channel(g_audio.rx));
         g_audio.rx = nullptr;
     }
@@ -566,11 +579,17 @@ esp_err_t StopAudioCapture(AudioCaptureChunk* chunk)
     ESP_RETURN_ON_ERROR(EnsureAudioService(), kTag, "init audio service");
     xSemaphoreTake(g_audio.mutex, portMAX_DELAY);
     if (!g_audio.running && g_audio.task == nullptr) {
+        const bool has_samples = !g_audio.chunk.samples.empty();
         if (chunk != nullptr) {
             *chunk = g_audio.chunk;
         }
         xSemaphoreGive(g_audio.mutex);
-        return ESP_OK;
+        // [handshake-guard] No active capture: CaptureTask already exited.
+        // If the chunk is empty this is a stale-listening state (CaptureTask
+        // init failed but AI status stayed kListening) - returning ESP_OK
+        // would submit a 0-duration clip as success. Surface it as an error
+        // so the caller reports 录音太短/失败 instead of a silent 0/0 submit.
+        return has_samples ? ESP_OK : ESP_ERR_INVALID_STATE;
     }
     g_audio.stop_requested = true;
     xSemaphoreGive(g_audio.mutex);

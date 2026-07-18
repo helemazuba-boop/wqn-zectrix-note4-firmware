@@ -18,6 +18,11 @@ void ClearAiConversationContext();
 bool CopyAiSessionToUi(AiSessionState* state);
 void SetAiTier(AiTier tier);
 AiTier GetAiTier();
+// [shell->wire] Status-bar toggle setters: propagate UI changes into g_state so
+// they survive CopyAiSessionToUi's full-struct overwrite and reach the request.
+void SetAiThinkingLevel(ThinkingLevel level);
+void SetAiTtsOn(bool on);
+void SetAiExpandContent(bool expanded);
 int32_t GetAiScrollOffsetLines();
 
 // Lightweight, mutex-free snapshot of v2 SSE streaming bookkeeping. UI calls

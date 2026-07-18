@@ -45,6 +45,75 @@ bool g_streaming_force_full_render = false; // when true the next UI tick does a
 std::string g_pending_tool_label;        // "🔧 create_todo…" or "✅ ..." for status bar
 int64_t g_tool_clear_at_ms = 0;          // scheduled status-bar clear
 
+struct StdProTurnAssembly {
+    uint64_t last_event_id = 0;
+    bool user_committed = false;
+    bool thinking_seen = false;
+    bool thinking_done = false;
+    wqn::ChatMessageId thinking_id = wqn::kInvalidChatMessageId;
+    std::string thinking_text;
+    wqn::ChatMessageId assistant_id = wqn::kInvalidChatMessageId;
+    std::string assistant_text;
+    bool text_started = false;
+    bool assistant_terminal = false;
+};
+StdProTurnAssembly g_turn;
+
+std::pmr::string PmrText(const std::string& text)
+{
+    return std::pmr::string(text.data(), text.size());
+}
+
+std::string ThinkingLabel(const std::string& text)
+{
+    return text.empty() ? std::string() : std::string("💭 ") + text;
+}
+
+void ResetTurnAssemblyLocked()
+{
+    g_turn = StdProTurnAssembly{};
+}
+
+bool EnsureThinkingHistoryLocked(wqn::AiHistory& history, int64_t now_ms)
+{
+    if (!g_turn.user_committed || g_turn.thinking_text.empty()) {
+        return false;
+    }
+    const std::string label = ThinkingLabel(g_turn.thinking_text);
+    if (g_turn.thinking_id == wqn::kInvalidChatMessageId) {
+        g_turn.thinking_id = history.AppendThinking(PmrText(label), now_ms);
+        return g_turn.thinking_id != wqn::kInvalidChatMessageId;
+    }
+    return history.ReplaceText(g_turn.thinking_id, wqn::ChatMessageKind::kThinking,
+                               PmrText(label), now_ms);
+}
+
+bool FinalizeThinkingLocked(wqn::AiHistory& history, const std::string& authoritative,
+                            int64_t now_ms)
+{
+    if (!authoritative.empty()) {
+        g_turn.thinking_text = authoritative;
+    }
+    return EnsureThinkingHistoryLocked(history, now_ms);
+}
+
+bool FinalizeAssistantLocked(wqn::AiHistory& history, const std::string& authoritative,
+                             int64_t now_ms)
+{
+    if (!authoritative.empty()) {
+        g_turn.assistant_text = authoritative;
+    }
+    if (!g_turn.user_committed || g_turn.assistant_text.empty()) {
+        return false;
+    }
+    if (g_turn.assistant_id == wqn::kInvalidChatMessageId) {
+        g_turn.assistant_id = history.AppendAssistant(PmrText(g_turn.assistant_text), now_ms);
+        return g_turn.assistant_id != wqn::kInvalidChatMessageId;
+    }
+    return history.ReplaceText(g_turn.assistant_id, wqn::ChatMessageKind::kAssistant,
+                               PmrText(g_turn.assistant_text), now_ms);
+}
+
 void MarkChanged()
 {
     g_changed = true;
@@ -133,97 +202,115 @@ void OnSseEvent(const wqn::WqnAiSseEvent& ev)
 {
     xSemaphoreTake(g_lock, portMAX_DELAY);
     const int64_t now_ms = esp_timer_get_time() / 1000;
-    wqn::AiHistory& history = wqn::GetAiHistory();
+    wqn::AiHistory& history = wqn::GetAiHistory(wqn::AiHistoryChannel::kStdPro);
+
+    if (ev.event_id != 0 && ev.event_id <= g_turn.last_event_id) {
+        xSemaphoreGive(g_lock);
+        return;
+    }
+    if (ev.event_id != 0) {
+        g_turn.last_event_id = ev.event_id;
+    }
+
     switch (ev.kind) {
-        case wqn::WqnAiSseEvent::Kind::kReady: {
+        case wqn::WqnAiSseEvent::Kind::kUnknown:
+            ESP_LOGD(kTag, "ignore unknown SSE event id=%llu",
+                     static_cast<unsigned long long>(ev.event_id));
+            break;
+        case wqn::WqnAiSseEvent::Kind::kReady:
             g_state.status = wqn::AiSessionStatus::kStreaming;
             g_state.pending_text = "已连接 · 等待模型…";
             g_state.toast_label = "● 服务器处理中";
             g_state.toast_visible = true;
             g_state.toast_since_ms = now_ms;
-            if (!ev.conversation_id.empty()) {
-                g_conversation_id = ev.conversation_id;
-            }
+            if (!ev.conversation_id.empty()) g_conversation_id = ev.conversation_id;
             g_state.status_since_ms = now_ms;
             break;
-        }
-        case wqn::WqnAiSseEvent::Kind::kStage: {
-            g_state.pending_text = ev.stage.empty() ? g_state.pending_text : ev.stage;
+        case wqn::WqnAiSseEvent::Kind::kStage:
+            if (!ev.stage.empty()) g_state.pending_text = ev.stage;
             g_state.status_since_ms = now_ms;
             break;
-        }
-        case wqn::WqnAiSseEvent::Kind::kAsrDelta: {
+        case wqn::WqnAiSseEvent::Kind::kAsrDelta:
             g_state.user_partial += ev.delta;
             g_state.last_render_ms = now_ms;
             break;
-        }
-        case wqn::WqnAiSseEvent::Kind::kAsrComplete: {
+        case wqn::WqnAiSseEvent::Kind::kAsrComplete:
             g_state.user_text = ev.text;
             g_state.user_partial.clear();
             g_streaming_force_full_render = true;
             g_state.status_since_ms = now_ms;
-            if (!ev.text.empty()) {
-                std::pmr::string txt(ev.text.data(), ev.text.size(),
-                                     history.LatestTool() ? std::pmr::get_default_resource()
-                                                          : std::pmr::get_default_resource());
-                // Defer the actual history push to outside the lock to keep
-                // alloc pressure off the streaming critical section. Stash in
-                // g_user_text until the post-event hook runs.
-                history.AppendUser(std::move(txt), now_ms);
+            if (!g_turn.user_committed && !ev.text.empty()) {
+                g_turn.user_committed =
+                    history.AppendUser(PmrText(ev.text), now_ms) != wqn::kInvalidChatMessageId;
+            }
+            EnsureThinkingHistoryLocked(history, now_ms);
+            if (g_turn.assistant_terminal) {
+                FinalizeThinkingLocked(history, std::string(), now_ms);
+                FinalizeAssistantLocked(history, g_turn.assistant_text, now_ms);
             }
             break;
-        }
-        case wqn::WqnAiSseEvent::Kind::kAsrFailed: {
+        case wqn::WqnAiSseEvent::Kind::kAsrFailed:
             g_state.user_partial.clear();
             g_state.user_text = ev.error_message.empty() ? "识别失败" : ev.error_message;
             g_state.status_since_ms = now_ms;
             break;
-        }
-        case wqn::WqnAiSseEvent::Kind::kTextStart: {
-            g_state.assistant_partial.clear();
-            g_state.last_render_ms = now_ms;
+        case wqn::WqnAiSseEvent::Kind::kThinkingStart:
+            g_turn.thinking_seen = true;
             break;
-        }
-        case wqn::WqnAiSseEvent::Kind::kTextDelta: {
-            g_state.assistant_partial += ev.delta;
-            g_state.last_render_ms = now_ms;
-            break;
-        }
-        case wqn::WqnAiSseEvent::Kind::kTextEnd: {
-            std::string final_text;
-            if (!ev.full_text.empty()) {
-                g_state.assistant_text = ev.full_text;
-                final_text = ev.full_text;
-            } else {
-                g_state.assistant_text += g_state.assistant_partial;
-                final_text = g_state.assistant_text;
+        case wqn::WqnAiSseEvent::Kind::kThinkingDelta:
+            if (!g_turn.thinking_done && !ev.delta.empty()) {
+                g_turn.thinking_seen = true;
+                g_turn.thinking_text += ev.delta;
+                if (g_turn.thinking_id == wqn::kInvalidChatMessageId) {
+                    EnsureThinkingHistoryLocked(history, now_ms);  // first visible prefix only
+                    g_streaming_force_full_render = true;
+                }
             }
+            break;
+        case wqn::WqnAiSseEvent::Kind::kThinkingDone: {
+            const std::string authoritative = !ev.full_text.empty() ? ev.full_text
+                : (!ev.text.empty() ? ev.text : g_turn.thinking_text);
+            g_turn.thinking_seen = !authoritative.empty();
+            g_turn.thinking_done = true;
+            FinalizeThinkingLocked(history, authoritative, now_ms);
+            g_streaming_force_full_render = true;
+            break;
+        }
+        case wqn::WqnAiSseEvent::Kind::kTextStart:
+            if (!g_turn.text_started) {
+                g_turn.text_started = true;
+                g_state.assistant_partial.clear();
+                g_turn.assistant_text.clear();
+            }
+            g_state.last_render_ms = now_ms;
+            break;
+        case wqn::WqnAiSseEvent::Kind::kTextDelta:
+            if (!g_turn.assistant_terminal) {
+                g_state.assistant_partial += ev.delta;
+                g_turn.assistant_text += ev.delta;
+                g_state.last_render_ms = now_ms;
+            }
+            break;
+        case wqn::WqnAiSseEvent::Kind::kTextEnd: {
+            const std::string final_text = !ev.full_text.empty() ? ev.full_text
+                : (!ev.text.empty() ? ev.text : g_turn.assistant_text);
+            g_state.assistant_text = final_text;
             g_state.assistant_partial.clear();
+            g_turn.assistant_terminal = true;
+            FinalizeThinkingLocked(history, std::string(), now_ms);
+            FinalizeAssistantLocked(history, final_text, now_ms);
             g_streaming_force_full_render = true;
             g_state.status_since_ms = now_ms;
-            if (!final_text.empty()) {
-                std::pmr::string txt(final_text.data(), final_text.size());
-                history.AppendAssistant(std::move(txt), now_ms);
-            }
             break;
         }
         case wqn::WqnAiSseEvent::Kind::kToolStart: {
-            std::string label = "🔧 ";
-            label += ev.tool_name.empty() ? "tool" : ev.tool_name;
-            label += "…";
+            std::string label = "🔧 " + (ev.tool_name.empty() ? std::string("tool") : ev.tool_name) + "…";
             g_pending_tool_label = label;
             g_tool_clear_at_ms = 0;
-            g_state.function_call_summaries.push_back(ev.tool_name.empty() ? std::string("tool") : ev.tool_name);
-            // [tool-display] Mirror the live tool label into status_detail so
-            // the page_ai "执行中▏" inline status chip reflects the current
-            // tool without the UI having to read the streaming view API.
+            g_state.function_call_summaries.push_back(ev.tool_name.empty() ? "tool" : ev.tool_name);
             g_state.status_detail = label;
             g_state.status_since_ms = now_ms;
-            {
-                std::pmr::string nm(ev.tool_name.data(), ev.tool_name.size());
-                std::pmr::string args(ev.tool_display.data(), ev.tool_display.size());
-                history.AppendToolStart(std::move(nm), std::move(args), now_ms);
-            }
+            history.AppendToolStart(PmrText(ev.tool_name), PmrText(ev.tool_display), now_ms);
             break;
         }
         case wqn::WqnAiSseEvent::Kind::kToolResult:
@@ -232,83 +319,58 @@ void OnSseEvent(const wqn::WqnAiSseEvent& ev)
             label += ev.tool_display.empty() ? ev.tool_name : ev.tool_display;
             g_pending_tool_label = label;
             g_tool_clear_at_ms = now_ms + 2000;
-            // Pop the last placeholder pushed by ToolStart and replace with the display.
             if (!g_state.function_call_summaries.empty() &&
                 g_state.function_call_summaries.back() == ev.tool_name) {
-                g_state.function_call_summaries.back() = ev.tool_display.empty()
-                    ? ev.tool_name
-                    : ev.tool_display;
+                g_state.function_call_summaries.back() =
+                    ev.tool_display.empty() ? ev.tool_name : ev.tool_display;
             }
-            // [tool-display] Keep status_detail pointing at the most recent
-            // tool outcome for the inline status chip. Will be cleared on
-            // next kState/kFinal or after g_tool_clear_at_ms expires.
             g_state.status_detail = label;
             g_state.status_since_ms = now_ms;
-            {
-                std::pmr::string nm(ev.tool_name.data(), ev.tool_name.size());
-                std::pmr::string args(ev.tool_display.data(), ev.tool_display.size());
-                std::pmr::string result(ev.tool_display.data(), ev.tool_display.size());
-                history.PopLastIf(wqn::ChatMessageKind::kToolStart);
-                history.AppendToolResult(std::move(nm), std::move(args), std::move(result),
-                                          ev.tool_ok, ev.tool_elapsed_ms, now_ms);
-            }
+            history.PopLastIf(wqn::ChatMessageKind::kToolStart);
+            history.AppendToolResult(PmrText(ev.tool_name), PmrText(ev.tool_display),
+                                     PmrText(ev.tool_display), ev.tool_ok,
+                                     ev.tool_elapsed_ms, now_ms);
             break;
         }
-        case wqn::WqnAiSseEvent::Kind::kState: {
+        case wqn::WqnAiSseEvent::Kind::kState:
             g_state.status_detail = ev.error_message.empty() ? ev.stage : ev.error_message;
             g_state.status_since_ms = now_ms;
             break;
-        }
+        case wqn::WqnAiSseEvent::Kind::kTurnDone:
+            g_turn.assistant_terminal = true;
+            FinalizeThinkingLocked(history, std::string(), now_ms);
+            FinalizeAssistantLocked(history, g_turn.assistant_text, now_ms);
+            g_streaming_force_full_render = true;
+            break;
         case wqn::WqnAiSseEvent::Kind::kError: {
-            std::string msg = ev.error_message.empty() ? ev.error_code : ev.error_message;
+            const std::string msg = ev.error_message.empty() ? ev.error_code : ev.error_message;
             g_state.status = wqn::AiSessionStatus::kError;
             g_state.pending_text.clear();
-            if (g_state.assistant_text.empty()) {
-                g_state.assistant_text = msg;
-            }
-            if (g_state.assistant_partial.empty()) {
-                g_state.assistant_partial.clear();
-            }
+            if (g_state.assistant_text.empty()) g_state.assistant_text = msg;
             g_state.toast_visible = false;
             g_streaming_active = false;
             g_state.status_since_ms = now_ms;
             break;
         }
         case wqn::WqnAiSseEvent::Kind::kFinal: {
-            // Stable state: stop streaming, push everything into the canonical
-            // fields, clear partials.
-            std::string final_text;
-            if (!ev.full_text.empty()) {
-                g_state.assistant_text = ev.full_text;
-                final_text = ev.full_text;
-            } else if (!g_state.assistant_partial.empty()) {
-                g_state.assistant_text += g_state.assistant_partial;
-                final_text = g_state.assistant_text;
-            }
+            const std::string final_text = !ev.full_text.empty() ? ev.full_text
+                : (!g_turn.assistant_text.empty() ? g_turn.assistant_text : g_state.assistant_text);
+            g_turn.assistant_terminal = true;
+            FinalizeThinkingLocked(history, std::string(), now_ms);
+            FinalizeAssistantLocked(history, final_text, now_ms);
+            g_state.assistant_text = final_text;
             g_state.assistant_partial.clear();
             g_state.user_partial.clear();
             g_state.pending_text.clear();
             g_state.status = wqn::AiSessionStatus::kReplyReady;
             g_state.toast_visible = false;
-            if (!ev.conversation_id.empty()) {
-                g_conversation_id = ev.conversation_id;
-            }
+            if (!ev.conversation_id.empty()) g_conversation_id = ev.conversation_id;
             g_state.conversation_id = g_conversation_id;
             g_state.page = 0;
             g_state.scroll_offset_lines = 0;
             g_streaming_force_full_render = true;
             g_streaming_active = false;
             g_state.status_since_ms = now_ms;
-            // [history-fix] Always push the assistant's final reply into the
-            // history buffer at kFinal, even if kTextEnd was not emitted (the
-            // cloud pipeline sometimes terminates the stream with a single
-            // kFinal carrying the full text). Without this, the viewport would
-            // appear empty after the upload toast clears and the user would
-            // see a stale "上传" pixel set on the E-ink panel.
-            if (!final_text.empty()) {
-                std::pmr::string txt(final_text.data(), final_text.size());
-                history.AppendAssistant(std::move(txt), now_ms);
-            }
             break;
         }
     }
@@ -543,9 +605,9 @@ void LoadTodaySessionLocked()
     // On boot the history is empty. Recent replies are rebuilt from the
     // resume-conversation flow on the cloud side; we keep
     // g_conversation_id so the next session can rejoin the chat.
-    (void)wqn::GetAiHistory();
+    (void)wqn::GetAiHistory(wqn::AiHistoryChannel::kStdPro);
     ESP_LOGI(kTag, "LoadTodaySessionLocked: PSRAM history ready, size=%zu",
-             wqn::GetAiHistory().size());
+             wqn::GetAiHistory(wqn::AiHistoryChannel::kStdPro).size());
 }
 
 void SubmitTask(void*)
@@ -598,9 +660,12 @@ void SubmitTask(void*)
     g_state.toast_recording_ms = 0;
     MarkChanged();
     const std::string tier_str = g_state.tier == wqn::AiTier::kPro ? "pro" : "std";
+    const wqn::AiTier tier = g_state.tier;
+    const wqn::ThinkingLevel thinking_level = g_state.thinking_level;
     const std::string conversation_id = g_conversation_id;
     g_streaming_active = true;
     g_streaming_force_full_render = false;
+    ResetTurnAssemblyLocked();
     g_pending_tool_label.clear();
     g_tool_clear_at_ms = 0;
     g_state.assistant_partial.clear();
@@ -634,6 +699,29 @@ void SubmitTask(void*)
     req.duration_ms = audio.duration_ms;
     req.tier = tier_str;
     req.conversation_id = conversation_id;
+    // [shell->wire] thinking params from the snapshot (tier + thinking_level
+    // captured under lock above). reasoning_effort sent for both tiers; PRO
+    // adds enable_thinking (off->false) + xhigh system prompt at high.
+    {
+        const char* effort = "medium";
+        switch (thinking_level) {
+            case wqn::ThinkingLevel::kOff: effort = "low"; break;  // StepFun has no off; low is closest
+            case wqn::ThinkingLevel::kLow: effort = "low"; break;
+            case wqn::ThinkingLevel::kMed: effort = "medium"; break;
+            case wqn::ThinkingLevel::kHigh: effort = "high"; break;
+            default: break;
+        }
+        req.reasoning_effort = effort;
+        if (tier == wqn::AiTier::kPro) {
+            req.enable_thinking = (thinking_level != wqn::ThinkingLevel::kOff);
+            if (thinking_level == wqn::ThinkingLevel::kHigh) {
+                req.system_prompt_extra =
+                    "Reasoning effort is set to xhigh. Please think carefully through the task, "
+                    "validate key assumptions, consider plausible alternatives, and prioritize "
+                    "correctness, consistency, and clarity in the final answer.";
+            }
+        }
+    }
     req.request_id = GenerateRequestId(); // helper below
     req.callback = &TrampolineSseEvent;
     req.user_ctx = nullptr;
@@ -726,7 +814,7 @@ void SubmitTask(void*)
             // Append User Question to History
             if (!g_state.user_text.empty()) {
                 std::pmr::string txt(g_state.user_text.data(), g_state.user_text.size());
-                wqn::GetAiHistory().AppendUser(std::move(txt), g_state.status_since_ms);
+                wqn::GetAiHistory(wqn::AiHistoryChannel::kStdPro).AppendUser(std::move(txt), g_state.status_since_ms);
             }
 
             // Append Tool/Action summaries if present
@@ -734,13 +822,13 @@ void SubmitTask(void*)
                 std::pmr::string nm("action", 6);
                 std::pmr::string args(summary.data(), summary.size());
                 std::pmr::string result("done", 4);
-                wqn::GetAiHistory().AppendToolResult(std::move(nm), std::move(args), std::move(result), true, 0, g_state.status_since_ms);
+                wqn::GetAiHistory(wqn::AiHistoryChannel::kStdPro).AppendToolResult(std::move(nm), std::move(args), std::move(result), true, 0, g_state.status_since_ms);
             }
 
             // Append Assistant Reply to History
             if (!g_state.assistant_text.empty()) {
                 std::pmr::string txt(g_state.assistant_text.data(), g_state.assistant_text.size());
-                wqn::GetAiHistory().AppendAssistant(std::move(txt), g_state.status_since_ms);
+                wqn::GetAiHistory(wqn::AiHistoryChannel::kStdPro).AppendAssistant(std::move(txt), g_state.status_since_ms);
             }
 
             SaveTodaySessionLocked(response);
@@ -1030,6 +1118,42 @@ AiTier GetAiTier()
     return result;
 }
 
+// [shell->wire] Toggle setters (mirror SetAiTier): update g_state under lock +
+// MarkChanged so CopyAiSessionToUi flushes the new value to the UI and the
+// request builder (above) reads the up-to-date g_state.thinking_level.
+void SetAiThinkingLevel(ThinkingLevel level)
+{
+    if (g_lock == nullptr) {
+        return;
+    }
+    xSemaphoreTake(g_lock, portMAX_DELAY);
+    g_state.thinking_level = level;
+    MarkChanged();
+    xSemaphoreGive(g_lock);
+}
+
+void SetAiTtsOn(bool on)
+{
+    if (g_lock == nullptr) {
+        return;
+    }
+    xSemaphoreTake(g_lock, portMAX_DELAY);
+    g_state.tts_on = on;
+    MarkChanged();
+    xSemaphoreGive(g_lock);
+}
+
+void SetAiExpandContent(bool expanded)
+{
+    if (g_lock == nullptr) {
+        return;
+    }
+    xSemaphoreTake(g_lock, portMAX_DELAY);
+    g_state.expand_content = expanded;
+    MarkChanged();
+    xSemaphoreGive(g_lock);
+}
+
 void ClearAiConversationContext()
 {
     if (g_lock == nullptr) {
@@ -1055,7 +1179,7 @@ void ClearAiConversationContext()
     g_state.page = 0;
     g_state.toast_visible = false;
     g_state.toast_label.clear();
-    wqn::GetAiHistory().Clear();
+    wqn::GetAiHistory(wqn::AiHistoryChannel::kStdPro).Clear();
     MarkChanged();
     xSemaphoreGive(g_lock);
 }
@@ -1307,6 +1431,10 @@ AiTier GetAiTier()
 {
     return AiTier::kStd;
 }
+
+void SetAiThinkingLevel(ThinkingLevel) {}
+void SetAiTtsOn(bool) {}
+void SetAiExpandContent(bool) {}
 
 int32_t GetAiScrollOffsetLines()
 {
