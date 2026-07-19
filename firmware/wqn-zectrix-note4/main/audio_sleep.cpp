@@ -1,29 +1,13 @@
 #include "audio_sleep.h"
 
-#include <atomic>
-
 #include "audio_capture.h"
 #include "audio_player.h"
-#include "driver/gpio.h"
-#include "esp_log.h"
 #include "esp_timer.h"
 #include "flash_session.h"
 #include "runtime/sleep_coordinator.h"
+#include "services/audio_service.h"
 
 namespace {
-
-constexpr char kTag[] = "wqn_audio_sleep";
-constexpr gpio_num_t kAudioPower = GPIO_NUM_42;
-constexpr gpio_num_t kAudioAmp = GPIO_NUM_46;
-
-std::atomic<bool> g_sleep_prepared{false};
-
-void HoldAudioOutput(gpio_num_t pin, int level)
-{
-    gpio_hold_dis(pin);
-    gpio_set_level(pin, level);
-    gpio_hold_en(pin);
-}
 
 bool DeadlineExpired(int64_t deadline_us)
 {
@@ -41,12 +25,11 @@ esp_err_t PrepareAudioForSleep(const power::PrepareSleepCommand& command)
     }
 
     if (command.mode == power::SleepMode::kBatteryEmergency) {
-        if (IsFlashSessionActive()) {
-            ESP_ERROR_CHECK_WITHOUT_ABORT(StopFlashSession());
-        }
-        if (IsAudioCaptureRunning()) {
-            ESP_ERROR_CHECK_WITHOUT_ABORT(StopAudioCapture(nullptr));
-        }
+        // Emergency shutdown has a hard hardware deadline. Do not wait for
+        // WebSocket/task teardown here: AudioService first rejects new driver
+        // operations, drains current I/O, and physically disables PA/codec.
+        // Deep sleep then terminates the remaining software tasks.
+        return services::PrepareAudioServiceForSleep(command);
     }
 
     if (IsAudioCaptureRunning() || IsFlashSessionActive() ||
@@ -64,33 +47,17 @@ esp_err_t PrepareAudioForSleep(const power::PrepareSleepCommand& command)
         return ESP_ERR_TIMEOUT;
     }
 
-    // The codec rail is kept warm during normal runtime, but both codec and
-    // amplifier must be off for deep sleep. This adapter is the sole M3 sleep
-    // path touching the audio rails; PowerCoordinator no longer does so.
-    HoldAudioOutput(kAudioAmp, 0);
-    HoldAudioOutput(kAudioPower, 0);
-    g_sleep_prepared.store(true, std::memory_order_release);
-    ESP_LOGI(kTag, "audio prepared for sleep: generation=%u mode=%s",
-             static_cast<unsigned>(command.generation),
-             power::SleepModeName(command.mode));
-    return ESP_OK;
+    return services::PrepareAudioServiceForSleep(command);
 }
 
-void RollbackAudioAfterSleepAbort()
+void RollbackAudioAfterSleepAbort(uint32_t generation)
 {
-    if (!g_sleep_prepared.exchange(false, std::memory_order_acq_rel)) {
-        return;
-    }
-    HoldAudioOutput(kAudioPower, 1);
-    HoldAudioOutput(kAudioAmp, 0);
-    ESP_LOGI(kTag, "audio sleep preparation rolled back");
+    services::RollbackAudioServiceAfterSleepAbort(generation);
 }
 
 void ReleaseAudioDeepSleepHolds()
 {
-    gpio_hold_dis(kAudioPower);
-    gpio_hold_dis(kAudioAmp);
-    g_sleep_prepared.store(false, std::memory_order_release);
+    services::ReleaseAudioServiceDeepSleepHolds();
 }
 
 }  // namespace wqn

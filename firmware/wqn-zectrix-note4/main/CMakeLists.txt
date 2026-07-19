@@ -28,6 +28,7 @@ idf_component_register(
         "runtime/sleep_snapshot.cpp"
         "runtime/wake_context.cpp"
         "services/connectivity_service.cpp"
+        "services/audio_service.cpp"
         "services/storage_service.cpp"
         "services/sync_service.cpp"
         "sse_chunk.cpp"
@@ -100,6 +101,31 @@ if(NOT WQN_DEVICE_CONTROL_SCHEMA_SHA256 STREQUAL WQN_DEVICE_CONTROL_MANIFEST_SHA
         "device-control-v3 schema hash mismatch: actual=${WQN_DEVICE_CONTROL_SCHEMA_SHA256} "
         "manifest=${WQN_DEVICE_CONTROL_MANIFEST_SHA256}")
 endif()
+
+# M6 ownership gate: feature/session modules only see opaque AudioService
+# handles. Note4 bootstrap and AudioService are the two deliberate low-level
+# exceptions (pre-service safe pins, then the sole runtime owner).
+set(WQN_AUDIO_CLIENT_SOURCES
+    "audio_capture.cpp"
+    "audio_player.cpp"
+    "audio_selftest.cpp"
+    "audio_sleep.cpp"
+    "audio_volume.cpp"
+    "flash_session.cpp")
+foreach(WQN_AUDIO_CLIENT IN LISTS WQN_AUDIO_CLIENT_SOURCES)
+    file(READ "${CMAKE_CURRENT_LIST_DIR}/${WQN_AUDIO_CLIENT}"
+        WQN_AUDIO_CLIENT_SOURCE)
+    if(WQN_AUDIO_CLIENT_SOURCE MATCHES
+        "#[ \t]*include[ \t]*[<\"]driver/(gpio|i2c_master|i2s_std)\\.h")
+        message(FATAL_ERROR
+            "M6 audio ownership violation: ${WQN_AUDIO_CLIENT} includes an ESP-IDF audio driver")
+    endif()
+    if(WQN_AUDIO_CLIENT_SOURCE MATCHES
+        "GPIO_NUM_(42|46)|GetSharedI2cBusHandle")
+        message(FATAL_ERROR
+            "M6 audio ownership violation: ${WQN_AUDIO_CLIENT} bypasses AudioService")
+    endif()
+endforeach()
 
 set(WQN_API_BASE "" CACHE STRING "Override the WQN ESP32 API base URL")
 set(WQN_DEBUG_PROBLEM_IDS "" CACHE STRING "Local-only comma-separated ESP32 debug problem IDs")

@@ -21,6 +21,7 @@
 #include "power/wake_controller.h"
 #include "runtime/sleep_coordinator.h"
 #include "runtime/wake_context.h"
+#include "services/audio_service.h"
 #include "services/connectivity_service.h"
 #include "storage.h"
 #include "wqn_api.h"
@@ -116,6 +117,7 @@ extern "C" void app_main(void)
     }
 #endif
     ESP_ERROR_CHECK(wqn::runtime::InitSleepCoordinator());
+    ESP_ERROR_CHECK(wqn::services::StartAudioService());
 
     ESP_ERROR_CHECK(wqn::InitStorage());
     LogTokenState();

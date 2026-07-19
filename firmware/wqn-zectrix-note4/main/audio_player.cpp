@@ -1,18 +1,15 @@
 #include "audio_player.h"
 
 #include <algorithm>
+#include <array>
 #include <cstring>
 
-#include "driver/gpio.h"
-#include "driver/i2c_master.h"
-#include "driver/i2s_std.h"
 #include "esp_check.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
-#include "power_manager.h"
-#include "runtime/sleep_coordinator.h"
+#include "services/audio_service.h"
 #include "storage.h"
 #include "audio_volume.h"
 
@@ -20,22 +17,9 @@ namespace {
 
 constexpr char kTag[] = "wqn_audio_player";
 
-constexpr gpio_num_t kAudioPower = GPIO_NUM_42;
-constexpr gpio_num_t kAudioAmp = GPIO_NUM_46;
-
-constexpr gpio_num_t kI2sMclk = GPIO_NUM_14;
-constexpr gpio_num_t kI2sBclk = GPIO_NUM_15;
-constexpr gpio_num_t kI2sWs = GPIO_NUM_38;
-constexpr gpio_num_t kI2sDin = GPIO_NUM_16;
-constexpr gpio_num_t kI2sDout = GPIO_NUM_45;
-
-constexpr gpio_num_t kCodecSda = GPIO_NUM_47;
-constexpr gpio_num_t kCodecScl = GPIO_NUM_48;
-constexpr i2c_port_num_t kCodecI2cPort = I2C_NUM_0;
-constexpr uint8_t kEs8311Address = 0x18;
-
 constexpr int kPlaybackSampleRate = 16000;
 constexpr int kPlaybackChannels = 1;
+constexpr size_t kPlaybackChunkFrames = 512;
 
 constexpr uint8_t ES8311_RESET_REG00 = 0x00;
 constexpr uint8_t ES8311_CLK_MANAGER_REG01 = 0x01;
@@ -67,22 +51,34 @@ struct PlayerState {
     bool initialized = false;
     bool tx_enabled = false;
     bool powered = false;
-    i2c_master_bus_handle_t i2c_bus = nullptr;
-    i2s_chan_handle_t tx = nullptr;
+    wqn::services::AudioBusHandle i2c_bus = nullptr;
+    wqn::services::AudioChannelHandle tx = nullptr;
+    wqn::services::AudioSession session;
 };
 
 PlayerState g_player;
 
-void SetAudioPowerForPlayback(bool enabled)
+esp_err_t SetAudioPowerForPlayback(bool enabled)
 {
     // [inflight-fix] GPIO42 (codec power) is boot-常通 - do not toggle.
     // Only manage the PA (GPIO46): on for playback, off otherwise.
-    gpio_hold_dis(kAudioAmp);
-    gpio_set_level(kAudioAmp, enabled ? 1 : 0);
-    gpio_hold_en(kAudioAmp);
+    const esp_err_t result = wqn::services::SetAudioAmplifier(
+        g_player.session, enabled);
+    if (result != ESP_OK) {
+        ESP_LOGW(kTag, "set amplifier=%d failed: %s",
+                 enabled ? 1 : 0, esp_err_to_name(result));
+    }
+    return result;
 }
 
-esp_err_t InitI2c(i2c_master_bus_handle_t* bus)
+void RecordFirstError(esp_err_t candidate, esp_err_t* result)
+{
+    if (result != nullptr && *result == ESP_OK && candidate != ESP_OK) {
+        *result = candidate;
+    }
+}
+
+esp_err_t InitI2c(wqn::services::AudioBusHandle* bus)
 {
     if (bus == nullptr) {
         return ESP_ERR_INVALID_ARG;
@@ -90,49 +86,39 @@ esp_err_t InitI2c(i2c_master_bus_handle_t* bus)
     if (*bus != nullptr) {
         return ESP_OK;
     }
-    *bus = wqn::GetSharedI2cBusHandle();
-    if (*bus != nullptr) {
-        return ESP_OK;
-    }
-    i2c_master_bus_config_t config = {};
-    config.i2c_port = kCodecI2cPort;
-    config.sda_io_num = kCodecSda;
-    config.scl_io_num = kCodecScl;
-    config.clk_source = I2C_CLK_SRC_DEFAULT;
-    config.glitch_ignore_cnt = 7;
-    config.flags.enable_internal_pullup = 1;
-    return i2c_new_master_bus(&config, bus);
+    return wqn::services::GetSharedAudioBus(g_player.session, bus);
 }
 
-esp_err_t AddCodecDevice(i2c_master_bus_handle_t bus, i2c_master_dev_handle_t* dev)
+esp_err_t AddCodecDevice(
+    wqn::services::AudioBusHandle bus,
+    wqn::services::AudioCodecHandle* dev)
 {
     if (bus == nullptr || dev == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
-    i2c_device_config_t config = {};
-    config.dev_addr_length = I2C_ADDR_BIT_LEN_7;
-    config.device_address = kEs8311Address;
-    config.scl_speed_hz = 100000;
-    return i2c_master_bus_add_device(bus, &config, dev);
+    return wqn::services::AddAudioCodec(g_player.session, bus, dev);
 }
 
-esp_err_t WriteCodecReg(i2c_master_dev_handle_t dev, uint8_t reg, uint8_t value)
+esp_err_t WriteCodecReg(
+    wqn::services::AudioCodecHandle dev, uint8_t reg, uint8_t value)
 {
-    const uint8_t data[] = {reg, value};
-    return i2c_master_transmit(dev, data, sizeof(data), 100);
+    return wqn::services::WriteAudioCodecRegister(
+        g_player.session, dev, reg, value);
 }
 
-esp_err_t ReadCodecReg(i2c_master_dev_handle_t dev, uint8_t reg, uint8_t* value)
+esp_err_t ReadCodecReg(
+    wqn::services::AudioCodecHandle dev, uint8_t reg, uint8_t* value)
 {
     if (value == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
-    return i2c_master_transmit_receive(dev, &reg, sizeof(reg), value, sizeof(*value), 100);
+    return wqn::services::ReadAudioCodecRegister(
+        g_player.session, dev, reg, value);
 }
 
-esp_err_t InitEs8311Dac(i2c_master_bus_handle_t bus)
+esp_err_t InitEs8311Dac(wqn::services::AudioBusHandle bus)
 {
-    i2c_master_dev_handle_t dev = nullptr;
+    wqn::services::AudioCodecHandle dev = nullptr;
     ESP_RETURN_ON_ERROR(AddCodecDevice(bus, &dev), kTag, "add ES8311 device for DAC");
 
     auto write = [&](uint8_t reg, uint8_t value) -> esp_err_t {
@@ -225,8 +211,11 @@ esp_err_t InitEs8311Dac(i2c_master_bus_handle_t bus)
 
     // [hw-volume] Apply persisted volume to ES8311 DAC registers (0x32/0x31)
     // before releasing the I2C device handle. Software PCM scaling was removed.
-    wqn::SetEs8311Volume(dev, wqn::GetPlaybackVolumePercent());
-    ESP_ERROR_CHECK_WITHOUT_ABORT(i2c_master_bus_rm_device(dev));
+    wqn::SetEs8311Volume(
+        g_player.session, dev, wqn::GetPlaybackVolumePercent());
+    const esp_err_t remove_result =
+        wqn::services::RemoveAudioCodec(g_player.session, &dev);
+    RecordFirstError(remove_result, &ret);
     if (ret == ESP_OK) {
         ESP_LOGI(kTag, "ES8311 DAC init ok: sample_rate=%d", kPlaybackSampleRate);
     } else {
@@ -235,53 +224,25 @@ esp_err_t InitEs8311Dac(i2c_master_bus_handle_t bus)
     return ret;
 }
 
-esp_err_t InitI2sTx(i2s_chan_handle_t* tx_handle)
+esp_err_t InitI2sTx(wqn::services::AudioChannelHandle* tx_handle)
 {
     if (tx_handle == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
     if (*tx_handle != nullptr) {
         if (!g_player.tx_enabled) {
-            ESP_RETURN_ON_ERROR(i2s_channel_enable(*tx_handle), kTag, "enable I2S TX");
+            ESP_RETURN_ON_ERROR(
+                wqn::services::EnableAudioChannel(g_player.session, *tx_handle),
+                kTag, "enable I2S TX");
             g_player.tx_enabled = true;
         }
         return ESP_OK;
     }
 
-    i2s_chan_config_t channel_config = {};
-    channel_config.id = I2S_NUM_0;
-    channel_config.role = I2S_ROLE_MASTER;
-    channel_config.dma_desc_num = 6;
-    channel_config.dma_frame_num = 256;
-    channel_config.auto_clear_after_cb = true;
-    channel_config.intr_priority = 0;
-    ESP_RETURN_ON_ERROR(i2s_new_channel(&channel_config, tx_handle, nullptr), kTag, "create I2S TX channel");
-
-    i2s_std_config_t std_config = {};
-    std_config.clk_cfg.sample_rate_hz = kPlaybackSampleRate;
-    std_config.clk_cfg.clk_src = I2S_CLK_SRC_DEFAULT;
-    std_config.clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_256;
-    std_config.slot_cfg.data_bit_width = I2S_DATA_BIT_WIDTH_16BIT;
-    std_config.slot_cfg.slot_bit_width = I2S_SLOT_BIT_WIDTH_AUTO;
-    std_config.slot_cfg.slot_mode = I2S_SLOT_MODE_STEREO;
-    std_config.slot_cfg.slot_mask = I2S_STD_SLOT_BOTH;
-    std_config.slot_cfg.ws_width = I2S_DATA_BIT_WIDTH_16BIT;
-    std_config.slot_cfg.ws_pol = false;
-    std_config.slot_cfg.bit_shift = true;
-    std_config.slot_cfg.left_align = true;
-    std_config.slot_cfg.big_endian = false;
-    std_config.slot_cfg.bit_order_lsb = false;
-    std_config.gpio_cfg.mclk = kI2sMclk;
-    std_config.gpio_cfg.bclk = kI2sBclk;
-    std_config.gpio_cfg.ws = kI2sWs;
-    std_config.gpio_cfg.dout = kI2sDout;
-    std_config.gpio_cfg.din = I2S_GPIO_UNUSED;
-    std_config.gpio_cfg.invert_flags.mclk_inv = false;
-    std_config.gpio_cfg.invert_flags.bclk_inv = false;
-    std_config.gpio_cfg.invert_flags.ws_inv = false;
-
-    ESP_RETURN_ON_ERROR(i2s_channel_init_std_mode(*tx_handle, &std_config), kTag, "init I2S TX std mode");
-    ESP_RETURN_ON_ERROR(i2s_channel_enable(*tx_handle), kTag, "enable I2S TX");
+    ESP_RETURN_ON_ERROR(
+        wqn::services::CreateAudioTxChannel(
+            g_player.session, kPlaybackSampleRate, 256, true, tx_handle),
+        kTag, "create I2S TX channel");
     g_player.tx_enabled = true;
     return ESP_OK;
 }
@@ -311,10 +272,18 @@ esp_err_t InitAudioPlayer()
         return ESP_OK;
     }
 
-    SetAudioPowerForPlayback(true);
-    g_player.powered = true;
+    const esp_err_t session_result = wqn::services::BeginAudioActivity(
+        wqn::services::AudioActivity::kPlayback, &g_player.session);
+    if (session_result != ESP_OK) {
+        xSemaphoreGive(g_player.mutex);
+        return session_result;
+    }
 
-    esp_err_t result = InitI2c(&g_player.i2c_bus);
+    esp_err_t result = SetAudioPowerForPlayback(true);
+    g_player.powered = result == ESP_OK;
+    if (result == ESP_OK) {
+        result = InitI2c(&g_player.i2c_bus);
+    }
     if (result == ESP_OK) {
         result = InitEs8311Dac(g_player.i2c_bus);
     }
@@ -327,8 +296,14 @@ esp_err_t InitAudioPlayer()
         ESP_LOGI(kTag, "audio player initialized");
     } else {
         ESP_LOGE(kTag, "audio player init failed: %s", esp_err_to_name(result));
-        SetAudioPowerForPlayback(false);
-        g_player.powered = false;
+        const esp_err_t power_result = SetAudioPowerForPlayback(false);
+        RecordFirstError(power_result, &result);
+        if (power_result == ESP_OK) {
+            g_player.powered = false;
+        }
+        const esp_err_t end_result =
+            wqn::services::EndAudioActivity(&g_player.session);
+        RecordFirstError(end_result, &result);
     }
 
     xSemaphoreGive(g_player.mutex);
@@ -341,44 +316,49 @@ esp_err_t PlayPcmSamples(const int16_t* samples, size_t count)
         return ESP_ERR_INVALID_ARG;
     }
 
-    wqn::runtime::SleepLease sleep_lease =
-        wqn::runtime::SleepLease::TryAcquire(
-            wqn::runtime::SleepBlocker::kAudio, "audio-playback", __FILE__, __LINE__);
-    if (!sleep_lease) {
-        return ESP_ERR_INVALID_STATE;
-    }
-
     ESP_RETURN_ON_ERROR(InitAudioPlayer(), kTag, "init audio player");
 
     xSemaphoreTake(g_player.mutex, portMAX_DELAY);
     if (!g_player.initialized || g_player.tx == nullptr) {
         xSemaphoreGive(g_player.mutex);
+        StopAudioPlayback();
         return ESP_ERR_INVALID_STATE;
     }
 
-    std::vector<int16_t> stereo(count * 2);
-    // [hw-volume] PCM sent at 100% - volume is the ES8311 DAC register
-    // (0x32/0x31) set during InitEs8311Dac, not software scaling.
-    for (size_t i = 0; i < count; ++i) {
-        const int16_t s = samples[i];
-        stereo[i * 2] = s;
-        stereo[i * 2 + 1] = s;
+    // Fixed scratch storage keeps playback bounded regardless of caller input.
+    // [hw-volume] PCM is sent at 100%; ES8311 registers own volume.
+    std::array<int16_t, kPlaybackChunkFrames * 2> stereo = {};
+    esp_err_t result = ESP_OK;
+    size_t offset = 0;
+    while (offset < count) {
+        const size_t frames = std::min(kPlaybackChunkFrames, count - offset);
+        for (size_t i = 0; i < frames; ++i) {
+            const int16_t sample = samples[offset + i];
+            stereo[i * 2] = sample;
+            stereo[i * 2 + 1] = sample;
+        }
+        size_t bytes_written = 0;
+        result = wqn::services::WriteAudioChannel(
+            g_player.session, g_player.tx, stereo.data(),
+            frames * 2 * sizeof(int16_t), &bytes_written,
+            pdMS_TO_TICKS(1000));
+        if (result != ESP_OK ||
+            bytes_written != frames * 2 * sizeof(int16_t)) {
+            if (result == ESP_OK) {
+                result = ESP_ERR_INVALID_SIZE;
+            }
+            break;
+        }
+        offset += frames;
     }
-
-    size_t bytes_written = 0;
-    const esp_err_t result = i2s_channel_write(
-        g_player.tx,
-        stereo.data(),
-        stereo.size() * sizeof(int16_t),
-        &bytes_written,
-        pdMS_TO_TICKS(1000));
 
     xSemaphoreGive(g_player.mutex);
 
     if (result != ESP_OK) {
         ESP_LOGW(kTag, "I2S write failed: %s", esp_err_to_name(result));
     }
-    return result;
+    const esp_err_t stop_result = StopAudioPlayback();
+    return result == ESP_OK ? stop_result : result;
 }
 
 esp_err_t StopAudioPlayback()
@@ -387,33 +367,51 @@ esp_err_t StopAudioPlayback()
         return ESP_OK;
     }
     xSemaphoreTake(g_player.mutex, portMAX_DELAY);
+    esp_err_t result = ESP_OK;
     if (g_player.tx != nullptr && g_player.tx_enabled) {
-        ESP_ERROR_CHECK_WITHOUT_ABORT(i2s_channel_disable(g_player.tx));
-        g_player.tx_enabled = false;
+        const esp_err_t disable_result =
+            wqn::services::DisableAudioChannel(g_player.session, g_player.tx);
+        RecordFirstError(disable_result, &result);
+        if (disable_result == ESP_OK) {
+            g_player.tx_enabled = false;
+        }
     }
     if (g_player.tx != nullptr) {
-        ESP_ERROR_CHECK_WITHOUT_ABORT(i2s_del_channel(g_player.tx));
-        g_player.tx = nullptr;
+        const esp_err_t delete_result =
+            wqn::services::DeleteAudioChannel(g_player.session, &g_player.tx);
+        RecordFirstError(delete_result, &result);
+        if (delete_result == ESP_OK) {
+            g_player.tx_enabled = false;
+        }
     }
     if (g_player.i2c_bus != nullptr) {
-        if (g_player.i2c_bus != wqn::GetSharedI2cBusHandle()) {
-            ESP_ERROR_CHECK_WITHOUT_ABORT(i2c_del_master_bus(g_player.i2c_bus));
-        }
         g_player.i2c_bus = nullptr;
     }
     g_player.initialized = false;
     if (g_player.powered) {
-        SetAudioPowerForPlayback(false);
-        g_player.powered = false;
+        const esp_err_t power_result = SetAudioPowerForPlayback(false);
+        RecordFirstError(power_result, &result);
+        if (power_result == ESP_OK) {
+            g_player.powered = false;
+        }
+    }
+    if (g_player.tx == nullptr && !g_player.powered) {
+        RecordFirstError(
+            wqn::services::EndAudioActivity(&g_player.session), &result);
     }
     xSemaphoreGive(g_player.mutex);
-    ESP_LOGI(kTag, "audio player stopped");
-    return ESP_OK;
+    if (result == ESP_OK) {
+        ESP_LOGI(kTag, "audio player stopped");
+    } else {
+        ESP_LOGE(kTag, "audio player teardown failed; session retained: %s",
+                 esp_err_to_name(result));
+    }
+    return result;
 }
 
 bool IsAudioPlayerPlaying()
 {
-    return false;
+    return services::GetAudioSnapshot().state == services::AudioState::kPlaying;
 }
 
 void DeinitAudioPlayer()

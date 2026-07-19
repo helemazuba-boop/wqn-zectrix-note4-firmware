@@ -515,7 +515,7 @@ static void RollbackSleepPreparation(uint32_t generation, const char* reason)
     // its lease as part of the synchronous rollback.
     runtime::CancelSleepQuiesce(generation);
     services::RollbackConnectivityAfterSleepAbort();
-    RollbackAudioAfterSleepAbort();
+    RollbackAudioAfterSleepAbort(generation);
     RollbackStorageAfterSleepAbort();
     RollbackDisplayAfterSleepAbort();
     RollbackBoardPowerState();

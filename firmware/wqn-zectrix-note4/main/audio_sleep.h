@@ -5,10 +5,11 @@
 
 namespace wqn {
 
-// M3 compatibility adapter. M6 will move these GPIO/I2S calls into the final
-// AudioService task without changing the PrepareSleep contract.
+// Compatibility surface used by PowerCoordinator. Runtime audio GPIO and
+// state changes are delegated to AudioService; callers outside this adapter
+// must not manipulate the Note4 audio rails during sleep transitions.
 esp_err_t PrepareAudioForSleep(const power::PrepareSleepCommand& command);
-void RollbackAudioAfterSleepAbort();
+void RollbackAudioAfterSleepAbort(uint32_t generation);
 void ReleaseAudioDeepSleepHolds();
 
 }  // namespace wqn
