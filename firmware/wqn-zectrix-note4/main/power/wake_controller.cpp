@@ -22,17 +22,28 @@ constexpr char kTag[] = "wqn_wake";
 constexpr gpio_num_t kConfirmWake = GPIO_NUM_0;
 constexpr gpio_num_t kDownPowerWake = GPIO_NUM_18;
 constexpr gpio_num_t kRtcIntWake = GPIO_NUM_5;
+constexpr gpio_num_t kChargeDetectWake = GPIO_NUM_2;
+constexpr gpio_num_t kChargeFullWake = GPIO_NUM_1;
 constexpr uint64_t kUserInputWakeMask =
     (1ULL << kConfirmWake) | (1ULL << kDownPowerWake);
 constexpr uint64_t kRtcWakeMask = 1ULL << kRtcIntWake;
-constexpr uint64_t kWakeMask = kUserInputWakeMask | kRtcWakeMask;
+constexpr uint64_t kExternalPowerWakeMask =
+    (1ULL << kChargeDetectWake) | (1ULL << kChargeFullWake);
+constexpr uint64_t kWakeMask =
+    kUserInputWakeMask | kRtcWakeMask | kExternalPowerWakeMask;
 
 std::atomic<bool> g_pcf8563_available{false};
 
 uint64_t ActiveLowWakePins()
 {
     uint64_t active_mask = 0;
-    constexpr gpio_num_t pins[] = {kConfirmWake, kDownPowerWake, kRtcIntWake};
+    constexpr gpio_num_t pins[] = {
+        kConfirmWake,
+        kDownPowerWake,
+        kRtcIntWake,
+        kChargeDetectWake,
+        kChargeFullWake,
+    };
     for (gpio_num_t pin : pins) {
         if (gpio_get_level(pin) == 0) {
             active_mask |= 1ULL << pin;

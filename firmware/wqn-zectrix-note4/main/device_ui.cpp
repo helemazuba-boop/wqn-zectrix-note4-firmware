@@ -764,25 +764,8 @@ wqn::AiStreamingStatusView streaming_view{};
     }
 }
 
-}  // namespace
-
-namespace wqn {
-
-esp_err_t StartDeviceUiIfEnabled()
+esp_err_t EnsureDisplayPipelineStarted()
 {
-#if CONFIG_WQN_EPD_UI_ENABLE
-    if (g_sync_event_queue == nullptr) {
-        g_sync_event_queue = xQueueCreateStatic(
-            kSyncEventQueueDepth,
-            sizeof(wqn::services::SyncEvent),
-            g_sync_event_queue_buffer,
-            &g_sync_event_queue_storage);
-        if (g_sync_event_queue == nullptr) {
-            return ESP_ERR_NO_MEM;
-        }
-        wqn::services::SetSyncEventSink(UiSyncEventSink);
-    }
-
     if (device_ui_internal::g_refresh_mutex == nullptr) {
         device_ui_internal::g_refresh_mutex = xSemaphoreCreateMutex();
         if (device_ui_internal::g_refresh_mutex == nullptr) {
@@ -797,6 +780,47 @@ esp_err_t StartDeviceUiIfEnabled()
         if (device_ui_internal::g_display_result_queue == nullptr) {
             return ESP_ERR_NO_MEM;
         }
+    }
+
+    if (device_ui_internal::g_refresh_task == nullptr) {
+        const BaseType_t refresh_created =
+            xTaskCreate(
+                device_ui_internal::EpdRefreshTask,
+                "wqn_epd_refresh",
+                12288,
+                nullptr,
+                5,
+                &device_ui_internal::g_refresh_task);
+        if (refresh_created != pdPASS) {
+            device_ui_internal::g_refresh_task = nullptr;
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    return ESP_OK;
+}
+
+}  // namespace
+
+namespace wqn {
+
+esp_err_t StartDeviceUiIfEnabled()
+{
+#if CONFIG_WQN_EPD_UI_ENABLE
+    const esp_err_t display_result = EnsureDisplayPipelineStarted();
+    if (display_result != ESP_OK) {
+        return display_result;
+    }
+
+    if (g_sync_event_queue == nullptr) {
+        g_sync_event_queue = xQueueCreateStatic(
+            kSyncEventQueueDepth,
+            sizeof(wqn::services::SyncEvent),
+            g_sync_event_queue_buffer,
+            &g_sync_event_queue_storage);
+        if (g_sync_event_queue == nullptr) {
+            return ESP_ERR_NO_MEM;
+        }
+        wqn::services::SetSyncEventSink(UiSyncEventSink);
     }
 
     if (device_ui_internal::g_todo_request_queue == nullptr) {
@@ -825,15 +849,6 @@ esp_err_t StartDeviceUiIfEnabled()
         device_ui_internal::g_word_result_queue =
             xQueueCreate(1, sizeof(device_ui_internal::WordCloudResultReady));
         if (device_ui_internal::g_word_result_queue == nullptr) {
-            return ESP_ERR_NO_MEM;
-        }
-    }
-
-    if (device_ui_internal::g_refresh_task == nullptr) {
-        const BaseType_t refresh_created =
-            xTaskCreate(device_ui_internal::EpdRefreshTask, "wqn_epd_refresh", 12288, nullptr, 5, &device_ui_internal::g_refresh_task);
-        if (refresh_created != pdPASS) {
-            device_ui_internal::g_refresh_task = nullptr;
             return ESP_ERR_NO_MEM;
         }
     }
@@ -867,6 +882,68 @@ esp_err_t StartDeviceUiIfEnabled()
 #else
     ESP_LOGI(kTag, "EPD device UI disabled by CONFIG_WQN_EPD_UI_ENABLE");
     return ESP_OK;
+#endif
+}
+
+esp_err_t ShowStorageRecoveryUi(esp_err_t storage_error)
+{
+#if CONFIG_WQN_EPD_UI_ENABLE
+    const esp_err_t start_result = EnsureDisplayPipelineStarted();
+    if (start_result != ESP_OK) {
+        return start_result;
+    }
+
+    char error_line[80] = {};
+    std::snprintf(
+        error_line,
+        sizeof(error_line),
+        "错误：%s (0x%lx)",
+        esp_err_to_name(storage_error),
+        static_cast<unsigned long>(storage_error));
+
+    wqn::UiFrame frame;
+    frame.screen = wqn::UiScreen::kProvisioning;
+    frame.prefer_full_refresh = true;
+    frame.lines = {
+        {wqn::UiTextStyle::kTitle, "存储恢复失败"},
+        {wqn::UiTextStyle::kWarning, "业务服务已安全停止"},
+        {wqn::UiTextStyle::kBody, error_line},
+        {wqn::UiTextStyle::kWrappedBody, "请重启设备；若仍失败，请重新烧录或检查 Flash。"},
+    };
+
+    constexpr wqn::display::DisplayRevision kRecoveryRevision = 1;
+    const wqn::display::DisplaySubmission submission =
+        device_ui_internal::RequestEpdUiRefresh(
+            frame,
+            "m7-storage-recovery",
+            kRecoveryRevision,
+            device_ui_internal::RefreshSchedule::kCommit,
+            wqn::display::WaveformRequirement::kFull);
+    if (!submission.accepted) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    wqn::display::DisplayResult result;
+    if (xQueueReceive(
+            device_ui_internal::g_display_result_queue,
+            &result,
+            pdMS_TO_TICKS(45000)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    device_ui_internal::AcknowledgeDisplayResult(result.revision);
+    if (result.status != wqn::display::DisplayStatus::kPresented) {
+        return result.error == ESP_OK ? ESP_FAIL : result.error;
+    }
+
+    // Give the panel controller its configured cooling interval, then use the
+    // same display-owner idle path as the normal UI before entering the inert
+    // recovery loop in app_main.
+    vTaskDelay(pdMS_TO_TICKS(CONFIG_WQN_EPD_IDLE_POWER_OFF_MS + 100));
+    wqn::PowerOffEpdAfterIdleIfNeeded();
+    return ESP_OK;
+#else
+    ESP_LOGE(kTag, "storage recovery UI unavailable because EPD UI is disabled");
+    return ESP_ERR_NOT_SUPPORTED;
 #endif
 }
 

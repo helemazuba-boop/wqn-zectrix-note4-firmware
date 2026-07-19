@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <utility>
 
 #include "ai_session.h"
 #include "audio_sleep.h"
@@ -130,6 +131,8 @@ std::atomic<bool> g_timer_wakeup_preference{true};
 std::atomic<bool> g_battery_shutdown_requested{false};
 uint32_t g_next_sleep_generation = 1;
 int64_t g_sleep_retry_not_before_us = 0;
+wqn::runtime::SleepLease g_usb_power_lease;
+bool g_usb_power_policy_sampled = false;
 
 constexpr int64_t kPrepareSleepTimeoutUs = 5 * 1000 * 1000;
 constexpr int64_t kSleepRetryBackoffUs = 30 * 1000 * 1000;
@@ -383,6 +386,41 @@ bool IsFullyCharged()
     return gpio_get_level(kChargeFull) == 0;
 }
 
+void RefreshUsbPowerSleepPolicy()
+{
+    const bool charging = IsCharging();
+    const bool full = IsFullyCharged();
+    const bool usb_powered = charging || full;
+
+    if (usb_powered && !g_usb_power_lease) {
+        runtime::SleepLease lease = runtime::SleepLease::TryAcquire(
+            runtime::SleepBlocker::kUsbPower,
+            "usb-power-present",
+            __FILE__,
+            __LINE__);
+        if (!lease) {
+            ESP_LOGW(
+                kTag,
+                "USB power detected but sleep lease acquisition was denied: charging=%d full=%d",
+                charging ? 1 : 0,
+                full ? 1 : 0);
+            return;
+        }
+        g_usb_power_lease = std::move(lease);
+        ESP_LOGI(
+            kTag,
+            "USB power detected: charging=%d full=%d; light/deep sleep blocked",
+            charging ? 1 : 0,
+            full ? 1 : 0);
+    } else if (!usb_powered && g_usb_power_lease) {
+        g_usb_power_lease.Reset();
+        ESP_LOGI(kTag, "USB power removed; light/deep sleep policy restored");
+    } else if (!g_usb_power_policy_sampled && !usb_powered) {
+        ESP_LOGI(kTag, "USB power not detected; normal sleep policy active");
+    }
+    g_usb_power_policy_sampled = true;
+}
+
 bool IsBatteryLow()
 {
     const uint16_t mv = GetBatteryVoltageMv();
@@ -603,6 +641,13 @@ static void EnterDeepSleepIfEnabled(bool enable_timer_wakeup)
         RunBatteryEmergencyShutdown();
         return;
     }
+    // The charger status pins are also deep-sleep wake sources. This explicit
+    // guard prevents beginning quiesce while USB is already present; the USB
+    // SleepLease additionally keeps automatic light sleep out of serial and
+    // charging sessions.
+    if (IsUsbPowered()) {
+        return;
+    }
     if (esp_timer_get_time() < g_sleep_retry_not_before_us ||
         !HasUsableStoredToken() || !IsUiIdleForSleep() ||
         HasUnregisteredRuntimeActivity() || IsEpdBusy()) {
@@ -662,6 +707,7 @@ static void PowerCoordinatorTask(void*)
     ESP_LOGI(kTag, "power coordinator task started: stack_free=%u",
              static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
     while (true) {
+        RefreshUsbPowerSleepPolicy();
         runtime::LogLongHeldSleepLeases(esp_timer_get_time(), kLeaseWarningAfterUs);
         EnterDeepSleepIfEnabled(g_timer_wakeup_preference.load(std::memory_order_acquire));
         ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000));

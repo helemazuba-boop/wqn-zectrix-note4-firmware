@@ -9,10 +9,12 @@
 #include "contract_fixtures.h"
 #include "device_ui.h"
 #include "diagnostics.h"
+#include "driver/uart.h"
 #include "esp_ota_ops.h"
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_pm.h"
+#include "esp_system.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -20,6 +22,7 @@
 #include "power_manager.h"
 #include "power/wake_controller.h"
 #include "runtime/sleep_coordinator.h"
+#include "runtime/storage_schema.h"
 #include "runtime/wake_context.h"
 #include "services/audio_service.h"
 #include "services/connectivity_service.h"
@@ -93,6 +96,24 @@ void ConfirmRunningApp()
     }
 }
 
+[[noreturn]] void EnterStorageRecoveryMode(
+    esp_err_t error,
+    uint32_t observed_generation)
+{
+    ESP_LOGE(
+        kTag,
+        "storage recovery mode: generation_observed=%lu error=%s; business startup blocked",
+        static_cast<unsigned long>(observed_generation),
+        esp_err_to_name(error));
+    const esp_err_t recovery_ui = wqn::ShowStorageRecoveryUi(error);
+    if (recovery_ui != ESP_OK) {
+        ESP_LOGE(kTag, "storage recovery UI failed: %s", esp_err_to_name(recovery_ui));
+    }
+    while (true) {
+        vTaskDelay(pdMS_TO_TICKS(60000));
+    }
+}
+
 }  // namespace
 
 extern "C" void app_main(void)
@@ -117,9 +138,43 @@ extern "C" void app_main(void)
     }
 #endif
     ESP_ERROR_CHECK(wqn::runtime::InitSleepCoordinator());
-    ESP_ERROR_CHECK(wqn::services::StartAudioService());
+    wqn::RefreshUsbPowerSleepPolicy();
 
-    ESP_ERROR_CHECK(wqn::InitStorage());
+    // M7 boot gate: destructive local migration is complete (including its
+    // durable generation marker) before any audio, storage, network, UI or
+    // synchronization business task can start.
+    const wqn::runtime::StorageSchemaBootResult storage_schema =
+        wqn::runtime::EnsureStorageSchema();
+    if (storage_schema.action ==
+        wqn::runtime::StorageSchemaBootAction::kRestartRequired) {
+        ESP_LOGW(
+            kTag,
+            "storage schema migration complete: generation=%lu reset_id=%s; restarting",
+            static_cast<unsigned long>(wqn::runtime::kStorageSchemaGeneration),
+            storage_schema.reset_id);
+        // A deliberate migration restart must not make the bootloader treat a
+        // newly installed OTA image as a failed first boot.
+        ConfirmRunningApp();
+        ESP_LOGW(kTag, "storage schema restart now");
+        uart_wait_tx_idle_polling(
+            static_cast<uart_port_t>(CONFIG_ESP_CONSOLE_UART_NUM));
+        esp_restart();
+        return;
+    }
+    if (storage_schema.action ==
+        wqn::runtime::StorageSchemaBootAction::kRecoveryRequired) {
+        EnterStorageRecoveryMode(
+            storage_schema.error,
+            storage_schema.observed_generation);
+    }
+
+    const esp_err_t storage_init_result = wqn::InitStorage();
+    if (storage_init_result != ESP_OK) {
+        EnterStorageRecoveryMode(
+            storage_init_result,
+            wqn::runtime::kStorageSchemaGeneration);
+    }
+    ESP_ERROR_CHECK(wqn::services::StartAudioService());
     LogTokenState();
     LogWifiCredentialState();
     LogCachedProblemState();

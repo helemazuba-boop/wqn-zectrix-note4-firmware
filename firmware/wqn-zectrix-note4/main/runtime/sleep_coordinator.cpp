@@ -138,6 +138,8 @@ const char* SleepBlockerName(SleepBlocker blocker)
             return "storage";
         case SleepBlocker::kConnectivity:
             return "connectivity";
+        case SleepBlocker::kUsbPower:
+            return "usb-power";
         case SleepBlocker::kCount:
         default:
             return "unknown";
@@ -335,7 +337,11 @@ void LogLongHeldSleepLeases(int64_t now_us, int64_t warning_after_us)
     taskENTER_CRITICAL(&g_lease_lock);
     for (size_t i = 0; i < g_lease_records.size(); ++i) {
         LeaseRecord& record = g_lease_records[i];
-        if (!record.active || now_us - record.acquired_us < warning_after_us ||
+        // External USB power is a policy lease, not a work transaction. It is
+        // expected to remain held for the full duration of a development or
+        // charging session, so it must not generate a false stuck-work alarm.
+        if (!record.active || record.blocker == SleepBlocker::kUsbPower ||
+            now_us - record.acquired_us < warning_after_us ||
             (record.last_warning_us != 0 && now_us - record.last_warning_us < warning_after_us)) {
             continue;
         }

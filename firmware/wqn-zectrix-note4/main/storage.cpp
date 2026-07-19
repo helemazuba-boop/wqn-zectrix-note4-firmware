@@ -14,6 +14,7 @@
 #include "nvs_flash.h"
 #include "online_sync.h"
 #include "runtime/sleep_coordinator.h"
+#include "runtime/storage_schema.h"
 #include "services/storage_service.h"
 #include "sdkconfig.h"
 
@@ -309,7 +310,10 @@ esp_err_t InitStoragePartition()
     config.base_path = kStorageBasePath;
     config.partition_label = kStoragePartitionLabel;
     config.max_files = 8;
-    config.format_if_mount_failed = true;
+    // M7 owns all destructive recovery in the pre-business schema gate. A
+    // mount failure here must stop startup instead of silently replacing data
+    // and then running with an uncommitted schema generation.
+    config.format_if_mount_failed = false;
 
     esp_err_t result = esp_vfs_spiffs_register(&config);
     if (result == ESP_ERR_INVALID_STATE) {
@@ -440,14 +444,10 @@ bool IsValidAccessToken(const std::string& token)
 
 esp_err_t InitStorage()
 {
-    esp_err_t result = nvs_flash_init();
-    if (result == ESP_ERR_NVS_NO_FREE_PAGES || result == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_LOGW(kTag, "NVS requires erase before init: %s", esp_err_to_name(result));
-        ESP_RETURN_ON_ERROR(nvs_flash_erase(), kTag, "erase NVS");
-        result = nvs_flash_init();
-    }
-
-    ESP_RETURN_ON_ERROR(result, kTag, "init NVS");
+    // EnsureStorageSchema() has already initialized and validated default NVS.
+    // Re-initialization is harmless, but no erase is allowed after the marker
+    // gate because it would let business services run without generation=3.
+    ESP_RETURN_ON_ERROR(nvs_flash_init(), kTag, "init validated NVS");
 #if CONFIG_NVS_ENCRYPTION
     ESP_LOGI(kTag, "NVS encryption is enabled by sdkconfig");
 #else
@@ -888,15 +888,11 @@ esp_err_t SaveVolumeTransaction(void* opaque)
 
 esp_err_t FactoryResetTransaction(void*)
 {
-    ESP_LOGW(kTag, "factory reset requested: erasing NVS and restarting");
-    esp_err_t result = nvs_flash_deinit();
-    if (result != ESP_OK && result != ESP_ERR_INVALID_STATE) {
-        return result;
-    }
-    result = nvs_flash_erase();
-    if (result != ESP_OK) {
-        return result;
-    }
+    ESP_LOGW(kTag, "factory reset requested: invalidating schema marker and restarting");
+    ESP_RETURN_ON_ERROR(
+        wqn::runtime::InvalidateStorageSchemaForFactoryReset(),
+        kTag,
+        "invalidate storage schema marker");
     esp_restart();
     return ESP_OK;
 }

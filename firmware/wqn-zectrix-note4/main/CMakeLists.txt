@@ -26,6 +26,7 @@ idf_component_register(
         "provision_manager.cpp"
         "runtime/sleep_coordinator.cpp"
         "runtime/sleep_snapshot.cpp"
+        "runtime/storage_schema.cpp"
         "runtime/wake_context.cpp"
         "services/connectivity_service.cpp"
         "services/audio_service.cpp"

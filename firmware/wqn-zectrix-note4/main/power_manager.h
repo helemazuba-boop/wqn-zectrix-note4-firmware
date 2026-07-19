@@ -16,6 +16,9 @@ bool IsUiIdleForSleep();
 bool IsUiIdleForSleepEx(int extra_idle_ms);
 
 esp_err_t StartPowerCoordinator();
+// Synchronizes USB/charger status with the global sleep policy. Call once
+// after InitSleepCoordinator(), then periodically from PowerCoordinator.
+void RefreshUsbPowerSleepPolicy();
 void SetDeepSleepTimerWakePreference(bool enabled);
 void PowerOffEpdAfterIdleIfNeeded();
 void ShutdownForBatteryDepleted();

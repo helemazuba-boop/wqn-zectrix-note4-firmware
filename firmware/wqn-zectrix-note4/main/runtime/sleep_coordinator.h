@@ -17,6 +17,7 @@ enum class SleepBlocker : uint8_t {
     kFlashSession,
     kStorage,
     kConnectivity,
+    kUsbPower,
     kCount,
 };
 
