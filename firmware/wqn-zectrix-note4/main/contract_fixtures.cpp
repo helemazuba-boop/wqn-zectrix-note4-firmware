@@ -4,6 +4,7 @@
 #include <string>
 
 #include "cJSON.h"
+#include "device_protocol/v3.h"
 #include "esp_log.h"
 #include "text_render.h"
 #include "wqn_api.h"
@@ -11,6 +12,85 @@
 namespace {
 
 constexpr char kTag[] = "wqn_contract";
+
+const char kV3Bootstrap[] = R"json({
+  "ok": true,
+  "request_id": "req_bootstrap_0001",
+  "server_time_ms": 1784426400000,
+  "data": {
+    "device_id": "22222222-2222-4222-8222-222222222222",
+    "config_revision": 7,
+    "sync_cursor": 42,
+    "media_protocols": {
+      "ai_sse": "v2-streaming",
+      "flash": "wqn-flash-v2"
+    }
+  }
+})json";
+
+const char kV3Sync[] = R"json({
+  "ok": true,
+  "request_id": "req_sync_000000001",
+  "server_time_ms": 1784426400000,
+  "data": {
+    "config_revision": 7,
+    "sync_cursor": 43,
+    "configuration": { "auto_sync_interval_minutes": 60 },
+    "summaries": {
+      "due_problem_ids": ["33333333-3333-4333-8333-333333333333"],
+      "todo_count": 2,
+      "word_due_count": 5
+    },
+    "content_manifest": []
+  }
+})json";
+
+const char kV3Error[] = R"json({
+  "ok": false,
+  "request_id": "req_sync_000000002",
+  "error": {
+    "code": "TEMPORARILY_UNAVAILABLE",
+    "retryable": true,
+    "retry_after_ms": 10000
+  }
+})json";
+
+const char kV3ClaimStart[] = R"json({
+  "ok": true,
+  "request_id": "req_claim_start_0001",
+  "server_time_ms": 1784426400000,
+  "data": {
+    "claim_id": "11111111-1111-4111-8111-111111111111",
+    "display_code": "31415926",
+    "expires_at_ms": 1784427000000,
+    "poll_interval_ms": 3000
+  }
+})json";
+
+const char kV3ClaimPending[] = R"json({
+  "ok": true,
+  "request_id": "req_claim_poll_0000",
+  "server_time_ms": 1784426401000,
+  "data": {
+    "status": "pending",
+    "poll_interval_ms": 3000
+  }
+})json";
+
+const char kV3ClaimApproved[] = R"json({
+  "ok": true,
+  "request_id": "req_claim_poll_0001",
+  "server_time_ms": 1784426403000,
+  "data": {
+    "status": "approved",
+    "sealed_credential": {
+      "server_public_key": "BBDnMwKxCsA1KvHzI0dBZKXH8nHx3oWyBzF9owKtZcV2e3ixYp0yb6M8SQrtQmReGkE_bjHgJxQkj7nJlFJvVn0",
+      "salt": "ERERERERQRGBEREREREREQ",
+      "iv": "IiIiIiIiIiIiIiIi",
+      "ciphertext": "MzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMz"
+    }
+  }
+})json";
 
 const char kPollPaired[] = R"json({
   "success": true,
@@ -691,6 +771,110 @@ bool CheckUnauthorizedError()
            Require(cJSON_IsNumber(status) && status->valueint == 401, "error status");
 }
 
+bool CheckV3ControlContract()
+{
+    wqn::protocol::v3::RequestMetadata metadata;
+    metadata.request_id = "req_claim_start_0001";
+    metadata.boot_id = "boot_contract_0001";
+    metadata.firmware_version = "0.1.0-contract";
+    metadata.config_revision = 99;
+    metadata.sync_cursor = 88;
+    std::string request_body;
+    if (!Require(
+            wqn::protocol::v3::BuildClaimStartRequest(
+                metadata,
+                "AABBCCDDEEFF",
+                std::string(86, 'A'),
+                &request_body) == ESP_OK,
+            "v3 claim start request build")) {
+        return false;
+    }
+    JsonDocument claim_request(request_body.c_str());
+    if (!Require(claim_request.ok(), "v3 claim start request parses") ||
+        !Require(
+            cJSON_GetObjectItemCaseSensitive(
+                claim_request.root(), "config_revision") == nullptr,
+            "v3 claim request omits config revision") ||
+        !Require(
+            cJSON_GetObjectItemCaseSensitive(
+                claim_request.root(), "sync_cursor") == nullptr,
+            "v3 claim request omits sync cursor")) {
+        return false;
+    }
+
+    wqn::protocol::v3::ClaimStartData claim_start;
+    wqn::protocol::v3::Error error;
+    if (!Require(
+            wqn::protocol::v3::ParseClaimStartResponse(
+                kV3ClaimStart,
+                "req_claim_start_0001",
+                &claim_start,
+                &error) == ESP_OK,
+            "v3 claim start parse") ||
+        !Require(claim_start.display_code == "31415926", "v3 claim code") ||
+        !Require(claim_start.poll_interval_ms == 3000, "v3 claim poll interval")) {
+        return false;
+    }
+
+    wqn::protocol::v3::ClaimPollData claim_poll;
+    if (!Require(
+            wqn::protocol::v3::ParseClaimPollResponse(
+                kV3ClaimPending,
+                "req_claim_poll_0000",
+                &claim_poll,
+                &error) == ESP_OK,
+            "v3 claim pending parse") ||
+        !Require(
+            claim_poll.status == wqn::protocol::v3::ClaimStatus::kPending,
+            "v3 claim pending status") ||
+        !Require(claim_poll.poll_interval_ms == 3000, "v3 pending interval")) {
+        return false;
+    }
+    if (!Require(
+            wqn::protocol::v3::ParseClaimPollResponse(
+                kV3ClaimApproved,
+                "req_claim_poll_0001",
+                &claim_poll,
+                &error) == ESP_OK,
+            "v3 claim approved parse") ||
+        !Require(
+            claim_poll.status == wqn::protocol::v3::ClaimStatus::kApproved,
+            "v3 claim approved status") ||
+        !Require(
+            !claim_poll.sealed_credential.ciphertext.empty(),
+            "v3 claim sealed credential")) {
+        return false;
+    }
+
+    wqn::protocol::v3::BootstrapData bootstrap;
+    if (!Require(
+            wqn::protocol::v3::ParseBootstrapResponse(
+                kV3Bootstrap, "req_bootstrap_0001", &bootstrap, &error) == ESP_OK,
+            "v3 bootstrap parse") ||
+        !Require(bootstrap.config_revision == 7, "v3 bootstrap revision") ||
+        !Require(bootstrap.sync_cursor == 42, "v3 bootstrap cursor")) {
+        return false;
+    }
+
+    wqn::protocol::v3::SyncData sync;
+    if (!Require(
+            wqn::protocol::v3::ParseSyncResponse(
+                kV3Sync, "req_sync_000000001", &sync, &error) == ESP_OK,
+            "v3 sync parse") ||
+        !Require(sync.due_problem_ids.size() == 1, "v3 sync due count") ||
+        !Require(sync.todo_count == 2, "v3 sync todo count") ||
+        !Require(sync.word_due_count == 5, "v3 sync word count")) {
+        return false;
+    }
+
+    const esp_err_t error_result = wqn::protocol::v3::ParseSyncResponse(
+        kV3Error, "req_sync_000000002", &sync, &error);
+    return Require(error_result != ESP_OK, "v3 error returns failure") &&
+           Require(error.code == "TEMPORARILY_UNAVAILABLE", "v3 error code") &&
+           Require(error.retryable, "v3 error retryable") &&
+           Require(error.retry_after_ms == 10000, "v3 retry delay");
+}
+
 }  // namespace
 
 namespace wqn {
@@ -713,7 +897,8 @@ bool RunContractFixtureSelfTest()
         CheckWordReviewSubmit() &&
         CheckWordSearch() &&
         CheckAiWordActions() &&
-        CheckUnauthorizedError();
+        CheckUnauthorizedError() &&
+        CheckV3ControlContract();
 
     if (ok) {
         ESP_LOGI(kTag, "contract fixture self-test passed");

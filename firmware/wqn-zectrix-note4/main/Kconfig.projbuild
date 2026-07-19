@@ -35,6 +35,15 @@ menu "WQN firmware"
             Set to n only when using a fixed compile-time SSID/password
             or when the device is always offline.
 
+    config WQN_DEVICE_CONTROL_V3_ENABLE
+        bool "Use isolated device-control v3 bootstrap/sync"
+        default n
+        depends on WQN_WIFI_STA_ENABLE
+        help
+            Route authenticated control-plane bootstrap and summary sync through
+            /api/esp32/v3. Keep disabled in production until the coordinated M7
+            cutover; AI SSE remains v2-streaming and Flash remains wqn-flash-v2.
+
     config WQN_EPD_UI_ENABLE
         bool "Enable ZecTrix Note4 e-paper UI"
         default n

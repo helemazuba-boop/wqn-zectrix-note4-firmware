@@ -183,14 +183,18 @@ esp_err_t RefreshFrame(const wqn::UiFrame& frame, RefreshSchedule schedule)
         ESP_LOGI(kTag, "EPD: screen change detected (%d -> %d), forcing full refresh",
                  static_cast<int>(g_last_rendered_screen), static_cast<int>(frame.screen));
     }
-    g_last_rendered_screen = frame.screen;
     ESP_LOGI(kTag,
              "RefreshFrame: schedule=%s allow_local=%d force_full=%d screen=%d tier=%d",
              RefreshScheduleName(schedule), allow_local_partial ? 1 : 0,
              force_full_refresh ? 1 : 0,
              static_cast<int>(frame.screen),
              static_cast<int>(frame.ai.tier));
-    return wqn::RefreshEpdFull(allow_local_partial, force_full_refresh);
+    const esp_err_t result =
+        wqn::RefreshEpdFull(allow_local_partial, force_full_refresh);
+    if (result == ESP_OK) {
+        g_last_rendered_screen = frame.screen;
+    }
+    return result;
 }
 
 }  // namespace device_ui_internal

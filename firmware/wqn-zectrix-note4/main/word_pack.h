@@ -82,6 +82,5 @@ esp_err_t ReadWordPackEntry(const WordPackIndexEntry& index_entry, WqnWordEntry*
 void FindWordPackPrefixMatches(const WordPackIndex& index, const std::string& prefix, size_t limit, std::vector<size_t>* matches);
 std::vector<char> WordPackNextLetters(const WordPackIndex& index, const std::string& prefix);
 std::string NormalizeWordLookupText(const std::string& value);
-std::string SafePackStemFromId(const std::string& pack_id);
 
 }  // namespace wqn

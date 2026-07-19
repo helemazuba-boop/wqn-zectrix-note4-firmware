@@ -1,7 +1,6 @@
 #include "storage.h"
 
 #include <cstdint>
-#include <ctime>
 #include <vector>
 
 #include "cJSON.h"
@@ -10,9 +9,12 @@
 #include "esp_log.h"
 #include "esp_spiffs.h"
 #include "esp_system.h"
+#include "esp_timer.h"
 #include "nvs.h"
 #include "nvs_flash.h"
 #include "online_sync.h"
+#include "runtime/sleep_coordinator.h"
+#include "services/storage_service.h"
 #include "sdkconfig.h"
 
 namespace {
@@ -22,19 +24,16 @@ constexpr size_t kAccessTokenLength = 64;
 constexpr char kProblemsKey[] = "problems";
 constexpr char kPendingReviewsKey[] = "pending_reviews";
 constexpr char kAiSessionKey[] = "ai_session_day";
-// ESP-IDF NVS keys are limited to 15 visible characters.
-constexpr char kAccessTokenSavedAtKey[] = "token_saved";
-constexpr char kAccessTokenExpiresAtKey[] = "token_exp";
 constexpr char kAutoSyncIntervalMinKey[] = "sync_min";
 constexpr char kWifiSsidKey[] = "wifi_ssid";
 constexpr char kWifiPasswordKey[] = "wifi_pass";
-static_assert(sizeof(kAccessTokenSavedAtKey) <= 16, "NVS key must fit ESP-IDF's 15-character limit");
-static_assert(sizeof(kAccessTokenExpiresAtKey) <= 16, "NVS key must fit ESP-IDF's 15-character limit");
+constexpr char kControlConfigRevisionKey[] = "v3_cfg_rev";
+constexpr char kControlSyncCursorKey[] = "v3_cursor";
 static_assert(sizeof(kAutoSyncIntervalMinKey) <= 16, "NVS key must fit ESP-IDF's 15-character limit");
 static_assert(sizeof(kWifiSsidKey) <= 16, "NVS key must fit ESP-IDF's 15-character limit");
 static_assert(sizeof(kWifiPasswordKey) <= 16, "NVS key must fit ESP-IDF's 15-character limit");
-constexpr uint64_t kAccessTokenMaxAgeSeconds = 30ULL * 24ULL * 60ULL * 60ULL;
-constexpr std::time_t kMinReasonableUnixTime = 1704067200;  // 2024-01-01 UTC
+static_assert(sizeof(kControlConfigRevisionKey) <= 16, "NVS key must fit ESP-IDF's 15-character limit");
+static_assert(sizeof(kControlSyncCursorKey) <= 16, "NVS key must fit ESP-IDF's 15-character limit");
 constexpr char kStoragePartitionLabel[] = "storage";
 constexpr char kStorageBasePath[] = "/storage";
 
@@ -47,6 +46,23 @@ struct NvsHandle {
     }
 
     nvs_handle_t handle = 0;
+};
+
+class StorageWriteGuard {
+public:
+    StorageWriteGuard(const char* holder, const char* file, int line)
+        : lease_(wqn::runtime::SleepLease::TryAcquire(
+              wqn::runtime::SleepBlocker::kStorage, holder, file, line))
+    {
+        if (!lease_) {
+            ESP_LOGW(kTag, "storage write rejected during sleep quiesce: holder=%s", holder);
+        }
+    }
+
+    explicit operator bool() const { return static_cast<bool>(lease_); }
+
+private:
+    wqn::runtime::SleepLease lease_;
 };
 
 class JsonDocument {
@@ -111,7 +127,7 @@ esp_err_t LoadStringFromNvs(const char* key, std::string* value)
     return ESP_OK;
 }
 
-esp_err_t SaveStringToNvs(const char* key, const std::string& value)
+esp_err_t SaveStringToNvsRaw(const char* key, const std::string& value)
 {
     NvsHandle nvs;
     ESP_RETURN_ON_ERROR(nvs_open(WQN_NVS_NAMESPACE, NVS_READWRITE, &nvs.handle), kTag, "open NVS namespace");
@@ -121,6 +137,23 @@ esp_err_t SaveStringToNvs(const char* key, const std::string& value)
         result = nvs_commit(nvs.handle);
     }
     return result;
+}
+
+struct StringWriteContext {
+    const char* key;
+    const std::string* value;
+};
+
+esp_err_t SaveStringTransaction(void* opaque)
+{
+    const auto* context = static_cast<const StringWriteContext*>(opaque);
+    return SaveStringToNvsRaw(context->key, *context->value);
+}
+
+esp_err_t SaveStringToNvs(const char* key, const std::string& value)
+{
+    StringWriteContext context = {key, &value};
+    return wqn::services::ExecuteStorageTransaction(SaveStringTransaction, &context);
 }
 
 esp_err_t LoadU64FromNvs(const char* key, uint64_t* value, bool* found)
@@ -147,7 +180,7 @@ esp_err_t LoadU64FromNvs(const char* key, uint64_t* value, bool* found)
     return ESP_OK;
 }
 
-esp_err_t SaveU64ToNvs(const char* key, uint64_t value)
+esp_err_t SaveU64ToNvsRaw(const char* key, uint64_t value)
 {
     NvsHandle nvs;
     ESP_RETURN_ON_ERROR(nvs_open(WQN_NVS_NAMESPACE, NVS_READWRITE, &nvs.handle), kTag, "open NVS namespace");
@@ -157,6 +190,23 @@ esp_err_t SaveU64ToNvs(const char* key, uint64_t value)
         result = nvs_commit(nvs.handle);
     }
     return result;
+}
+
+struct U64WriteContext {
+    const char* key;
+    uint64_t value;
+};
+
+esp_err_t SaveU64Transaction(void* opaque)
+{
+    const auto* context = static_cast<const U64WriteContext*>(opaque);
+    return SaveU64ToNvsRaw(context->key, context->value);
+}
+
+esp_err_t SaveU64ToNvs(const char* key, uint64_t value)
+{
+    U64WriteContext context = {key, value};
+    return wqn::services::ExecuteStorageTransaction(SaveU64Transaction, &context);
 }
 
 esp_err_t LoadBlobFromNvs(const char* key, std::string* value)
@@ -188,7 +238,7 @@ esp_err_t LoadBlobFromNvs(const char* key, std::string* value)
     return ESP_OK;
 }
 
-esp_err_t SaveBlobToNvs(const char* key, const std::string& value)
+esp_err_t SaveBlobToNvsRaw(const char* key, const std::string& value)
 {
     NvsHandle nvs;
     ESP_RETURN_ON_ERROR(nvs_open(WQN_NVS_NAMESPACE, NVS_READWRITE, &nvs.handle), kTag, "open NVS namespace");
@@ -200,7 +250,24 @@ esp_err_t SaveBlobToNvs(const char* key, const std::string& value)
     return result;
 }
 
-esp_err_t ClearNvsKey(const char* key)
+struct BlobWriteContext {
+    const char* key;
+    const std::string* value;
+};
+
+esp_err_t SaveBlobTransaction(void* opaque)
+{
+    const auto* context = static_cast<const BlobWriteContext*>(opaque);
+    return SaveBlobToNvsRaw(context->key, *context->value);
+}
+
+esp_err_t SaveBlobToNvs(const char* key, const std::string& value)
+{
+    BlobWriteContext context = {key, &value};
+    return wqn::services::ExecuteStorageTransaction(SaveBlobTransaction, &context);
+}
+
+esp_err_t ClearNvsKeyRaw(const char* key)
 {
     NvsHandle nvs;
     esp_err_t result = nvs_open(WQN_NVS_NAMESPACE, NVS_READWRITE, &nvs.handle);
@@ -219,16 +286,16 @@ esp_err_t ClearNvsKey(const char* key)
     return result;
 }
 
-uint64_t CurrentUnixTime()
+esp_err_t ClearNvsKeyTransaction(void* opaque)
 {
-    std::time_t now = 0;
-    std::time(&now);
-    return now > 0 ? static_cast<uint64_t>(now) : 0;
+    return ClearNvsKeyRaw(static_cast<const char*>(opaque));
 }
 
-bool ClockIsReasonable()
+esp_err_t ClearNvsKey(const char* key)
 {
-    return CurrentUnixTime() >= static_cast<uint64_t>(kMinReasonableUnixTime);
+    return wqn::services::ExecuteStorageTransaction(
+        ClearNvsKeyTransaction,
+        const_cast<char*>(key));
 }
 
 bool IsValidAutoSyncInterval(uint32_t minutes)
@@ -261,62 +328,63 @@ esp_err_t InitStoragePartition()
     return ESP_OK;
 }
 
+esp_err_t ClearIdentityStateRaw()
+{
+    NvsHandle nvs;
+    esp_err_t result = nvs_open(WQN_NVS_NAMESPACE, NVS_READWRITE, &nvs.handle);
+    if (result == ESP_ERR_NVS_NOT_FOUND) {
+        return ESP_OK;
+    }
+    ESP_RETURN_ON_ERROR(result, kTag, "open NVS namespace");
+
+    const char* const keys[] = {
+        WQN_NVS_ACCESS_TOKEN_KEY,
+        kControlConfigRevisionKey,
+        kControlSyncCursorKey,
+    };
+    for (const char* key : keys) {
+        result = nvs_erase_key(nvs.handle, key);
+        if (result != ESP_OK && result != ESP_ERR_NVS_NOT_FOUND) {
+            return result;
+        }
+    }
+    return nvs_commit(nvs.handle);
+}
+
+esp_err_t ClearIdentityStateTransaction(void*)
+{
+    return ClearIdentityStateRaw();
+}
+
 esp_err_t ClearAccessTokenKeys()
 {
-    esp_err_t result = ClearNvsKey(WQN_NVS_ACCESS_TOKEN_KEY);
-    const esp_err_t clear_saved_at = ClearNvsKey(kAccessTokenSavedAtKey);
-    const esp_err_t clear_expires_at = ClearNvsKey(kAccessTokenExpiresAtKey);
-    if (result == ESP_OK) {
-        result = clear_saved_at;
-    }
-    if (result == ESP_OK) {
-        result = clear_expires_at;
-    }
-    return result;
+    return wqn::services::ExecuteStorageTransaction(
+        ClearIdentityStateTransaction,
+        nullptr);
 }
 
-esp_err_t SaveAccessTokenMetadata(uint64_t now)
+esp_err_t SaveDeviceControlStateRaw(const wqn::DeviceControlState& state)
 {
-    if (now < static_cast<uint64_t>(kMinReasonableUnixTime)) {
-        ESP_LOGW(kTag, "clock is not synced; token expiry metadata not written");
-        return ESP_OK;
-    }
-
-    ESP_RETURN_ON_ERROR(SaveU64ToNvs(kAccessTokenSavedAtKey, now), kTag, "save token saved_at");
-    return SaveU64ToNvs(kAccessTokenExpiresAtKey, now + kAccessTokenMaxAgeSeconds);
+    NvsHandle nvs;
+    ESP_RETURN_ON_ERROR(
+        nvs_open(WQN_NVS_NAMESPACE, NVS_READWRITE, &nvs.handle),
+        kTag,
+        "open NVS namespace");
+    ESP_RETURN_ON_ERROR(
+        nvs_set_u64(nvs.handle, kControlConfigRevisionKey, state.config_revision),
+        kTag,
+        "stage v3 config revision");
+    ESP_RETURN_ON_ERROR(
+        nvs_set_u64(nvs.handle, kControlSyncCursorKey, state.sync_cursor),
+        kTag,
+        "stage v3 sync cursor");
+    return nvs_commit(nvs.handle);
 }
 
-esp_err_t EnsureAccessTokenFresh(std::string* token)
+esp_err_t SaveDeviceControlStateTransaction(void* opaque)
 {
-    if (token == nullptr || token->empty() || !wqn::IsValidAccessToken(*token)) {
-        return ESP_OK;
-    }
-
-    uint64_t expires_at = 0;
-    bool has_expires_at = false;
-    ESP_RETURN_ON_ERROR(LoadU64FromNvs(kAccessTokenExpiresAtKey, &expires_at, &has_expires_at), kTag, "load token expires_at");
-
-    const uint64_t now = CurrentUnixTime();
-    if (!has_expires_at || expires_at == 0) {
-        if (ClockIsReasonable()) {
-            ESP_LOGW(kTag, "stored token has no expiry metadata; adding local max-age metadata");
-            return SaveAccessTokenMetadata(now);
-        }
-        ESP_LOGW(kTag, "stored token has no expiry metadata; accepting temporarily until clock is synced");
-        return ESP_OK;
-    }
-
-    if (!ClockIsReasonable()) {
-        ESP_LOGW(kTag, "clock is not synced; token expiry check deferred");
-        return ESP_OK;
-    }
-
-    if (expires_at <= now) {
-        ESP_LOGW(kTag, "stored token expired; clearing token");
-        token->clear();
-        return ClearAccessTokenKeys();
-    }
-    return ESP_OK;
+    return SaveDeviceControlStateRaw(
+        *static_cast<const wqn::DeviceControlState*>(opaque));
 }
 
 esp_err_t JsonToString(cJSON* root, std::string* output)
@@ -383,31 +451,31 @@ esp_err_t InitStorage()
 #if CONFIG_NVS_ENCRYPTION
     ESP_LOGI(kTag, "NVS encryption is enabled by sdkconfig");
 #else
-    ESP_LOGW(kTag, "NVS encryption is disabled; access token is protected by local expiry metadata only");
+    ESP_LOGW(kTag, "NVS encryption is disabled; device credentials are stored as plaintext NVS values");
 #endif
     ESP_LOGI(kTag, "NVS ready");
-    return InitStoragePartition();
+    ESP_RETURN_ON_ERROR(InitStoragePartition(), kTag, "init storage partition");
+    return services::StartStorageService();
 }
 
 esp_err_t LoadAccessToken(std::string* token)
 {
-    ESP_RETURN_ON_ERROR(LoadStringFromNvs(WQN_NVS_ACCESS_TOKEN_KEY, token), kTag, "load access token");
-    return EnsureAccessTokenFresh(token);
+    return LoadStringFromNvs(WQN_NVS_ACCESS_TOKEN_KEY, token);
 }
 
 esp_err_t SaveAccessToken(const std::string& token)
 {
+    StorageWriteGuard write("save-access-token", __FILE__, __LINE__);
+    if (!write) {
+        return ESP_ERR_INVALID_STATE;
+    }
     if (!IsValidAccessToken(token)) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    esp_err_t result = SaveStringToNvs(WQN_NVS_ACCESS_TOKEN_KEY, token);
-    if (result == ESP_OK) {
-        result = SaveAccessTokenMetadata(CurrentUnixTime());
-    }
+    const esp_err_t result = SaveStringToNvs(WQN_NVS_ACCESS_TOKEN_KEY, token);
     if (result != ESP_OK) {
-        ESP_LOGW(kTag, "access token metadata save failed, clearing token: %s", esp_err_to_name(result));
-        ESP_ERROR_CHECK_WITHOUT_ABORT(ClearAccessTokenKeys());
+        ESP_LOGW(kTag, "access token save failed: %s", esp_err_to_name(result));
         return result;
     }
 
@@ -421,6 +489,10 @@ esp_err_t SaveAccessToken(const std::string& token)
 
 esp_err_t ClearAccessToken()
 {
+    StorageWriteGuard write("clear-access-token", __FILE__, __LINE__);
+    if (!write) {
+        return ESP_ERR_INVALID_STATE;
+    }
     // [power-fix] If clearing the token was triggered by some external
     // event (e.g. the server returning 401 during sync), we want the
     // online task to re-evaluate its delay immediately rather than stay
@@ -428,16 +500,6 @@ esp_err_t ClearAccessToken()
     const esp_err_t result = ClearAccessTokenKeys();
     wqn::RequestOnlineSyncNow();
     return result;
-}
-
-bool IsAccessTokenExpired()
-{
-    uint64_t expires_at = 0;
-    bool found = false;
-    if (LoadU64FromNvs(kAccessTokenExpiresAtKey, &expires_at, &found) != ESP_OK || !found || expires_at == 0) {
-        return false;
-    }
-    return ClockIsReasonable() && expires_at <= CurrentUnixTime();
 }
 
 std::string MaskTokenForLog(const std::string& token)
@@ -448,8 +510,46 @@ std::string MaskTokenForLog(const std::string& token)
     return token.substr(0, 4) + "..." + token.substr(token.size() - 4);
 }
 
+esp_err_t LoadDeviceControlState(DeviceControlState* state)
+{
+    if (state == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *state = {};
+    bool config_found = false;
+    bool cursor_found = false;
+    ESP_RETURN_ON_ERROR(
+        LoadU64FromNvs(kControlConfigRevisionKey, &state->config_revision, &config_found),
+        kTag,
+        "load v3 config revision");
+    ESP_RETURN_ON_ERROR(
+        LoadU64FromNvs(kControlSyncCursorKey, &state->sync_cursor, &cursor_found),
+        kTag,
+        "load v3 sync cursor");
+    if (config_found != cursor_found) {
+        ESP_LOGW(kTag, "incomplete v3 control checkpoint; resetting both values");
+        *state = {};
+    }
+    return ESP_OK;
+}
+
+esp_err_t SaveDeviceControlState(const DeviceControlState& state)
+{
+    StorageWriteGuard write("save-v3-control-state", __FILE__, __LINE__);
+    if (!write) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    return services::ExecuteStorageTransaction(
+        SaveDeviceControlStateTransaction,
+        const_cast<DeviceControlState*>(&state));
+}
+
 esp_err_t SaveProblems(const std::vector<CachedProblem>& problems)
 {
+    StorageWriteGuard write("save-problems", __FILE__, __LINE__);
+    if (!write) {
+        return ESP_ERR_INVALID_STATE;
+    }
     JsonDocument document(cJSON_CreateArray());
     if (document.root() == nullptr) {
         return ESP_ERR_NO_MEM;
@@ -520,11 +620,19 @@ esp_err_t LoadProblems(std::vector<CachedProblem>* problems)
 
 esp_err_t ClearProblems()
 {
+    StorageWriteGuard write("clear-problems", __FILE__, __LINE__);
+    if (!write) {
+        return ESP_ERR_INVALID_STATE;
+    }
     return ClearNvsKey(kProblemsKey);
 }
 
 esp_err_t EnqueueReviewResult(const PendingReviewResult& result)
 {
+    StorageWriteGuard write("enqueue-review", __FILE__, __LINE__);
+    if (!write) {
+        return ESP_ERR_INVALID_STATE;
+    }
     if (result.problem_id.empty() || result.selected_status.empty()) {
         return ESP_ERR_INVALID_ARG;
     }
@@ -605,11 +713,19 @@ esp_err_t LoadPendingReviewResults(std::vector<PendingReviewResult>* results)
 
 esp_err_t ClearPendingReviewResults()
 {
+    StorageWriteGuard write("clear-pending-reviews", __FILE__, __LINE__);
+    if (!write) {
+        return ESP_ERR_INVALID_STATE;
+    }
     return ClearNvsKey(kPendingReviewsKey);
 }
 
 esp_err_t SaveAiSessionForDay(const CachedAiSession& session)
 {
+    StorageWriteGuard write("save-ai-session", __FILE__, __LINE__);
+    if (!write) {
+        return ESP_ERR_INVALID_STATE;
+    }
     if (session.day.empty()) {
         return ESP_ERR_INVALID_ARG;
     }
@@ -692,6 +808,10 @@ esp_err_t LoadAiSessionForDay(const std::string& day, CachedAiSession* session)
 
 esp_err_t ClearAiSession()
 {
+    StorageWriteGuard write("clear-ai-session", __FILE__, __LINE__);
+    if (!write) {
+        return ESP_ERR_INVALID_STATE;
+    }
     return ClearNvsKey(kAiSessionKey);
 }
 
@@ -711,6 +831,10 @@ esp_err_t LoadAutoSyncIntervalMinutes(uint32_t* minutes)
 
 esp_err_t SaveAutoSyncIntervalMinutes(uint32_t minutes)
 {
+    StorageWriteGuard write("save-sync-interval", __FILE__, __LINE__);
+    if (!write) {
+        return ESP_ERR_INVALID_STATE;
+    }
     if (!IsValidAutoSyncInterval(minutes)) {
         return ESP_ERR_INVALID_ARG;
     }
@@ -746,6 +870,37 @@ constexpr const char* kAudioNamespace = "audio";
 constexpr const char* kVolumeNvsKey = "output_volume";
 int g_volume_percent_cache = kVolumeDefaultPercent;
 
+esp_err_t SaveVolumeTransaction(void* opaque)
+{
+    const int percent = *static_cast<const int*>(opaque);
+    nvs_handle_t handle = 0;
+    esp_err_t result = nvs_open(kAudioNamespace, NVS_READWRITE, &handle);
+    if (result != ESP_OK) {
+        return result;
+    }
+    result = nvs_set_i32(handle, kVolumeNvsKey, static_cast<int32_t>(percent));
+    if (result == ESP_OK) {
+        result = nvs_commit(handle);
+    }
+    nvs_close(handle);
+    return result;
+}
+
+esp_err_t FactoryResetTransaction(void*)
+{
+    ESP_LOGW(kTag, "factory reset requested: erasing NVS and restarting");
+    esp_err_t result = nvs_flash_deinit();
+    if (result != ESP_OK && result != ESP_ERR_INVALID_STATE) {
+        return result;
+    }
+    result = nvs_flash_erase();
+    if (result != ESP_OK) {
+        return result;
+    }
+    esp_restart();
+    return ESP_OK;
+}
+
 esp_err_t LoadVolumePercent(int* percent)
 {
     if (percent == nullptr) {
@@ -779,21 +934,15 @@ esp_err_t LoadVolumePercent(int* percent)
 
 esp_err_t SaveVolumePercent(int percent)
 {
+    StorageWriteGuard write("save-volume", __FILE__, __LINE__);
+    if (!write) {
+        return ESP_ERR_INVALID_STATE;
+    }
     if (percent < 0 || percent > 100) {
         return ESP_ERR_INVALID_ARG;
     }
     g_volume_percent_cache = percent;
-    nvs_handle_t h = 0;
-    esp_err_t ret = nvs_open(kAudioNamespace, NVS_READWRITE, &h);
-    if (ret != ESP_OK) {
-        return ret;
-    }
-    ret = nvs_set_i32(h, kVolumeNvsKey, static_cast<int32_t>(percent));
-    if (ret == ESP_OK) {
-        ret = nvs_commit(h);
-    }
-    nvs_close(h);
-    return ret;
+    return services::ExecuteStorageTransaction(SaveVolumeTransaction, &percent);
 }
 
 std::string VolumeLabel(int percent)
@@ -811,14 +960,11 @@ int GetPlaybackVolumePercent()
 
 esp_err_t FactoryResetNvsAndRestart()
 {
-    ESP_LOGW(kTag, "factory reset requested: erasing NVS and restarting");
-    esp_err_t result = nvs_flash_deinit();
-    if (result != ESP_OK && result != ESP_ERR_INVALID_STATE) {
-        return result;
+    StorageWriteGuard write("factory-reset", __FILE__, __LINE__);
+    if (!write) {
+        return ESP_ERR_INVALID_STATE;
     }
-    ESP_RETURN_ON_ERROR(nvs_flash_erase(), kTag, "erase NVS for factory reset");
-    esp_restart();
-    return ESP_OK;
+    return services::ExecuteStorageTransaction(FactoryResetTransaction, nullptr);
 }
 
 esp_err_t LoadWifiCredentials(std::string* ssid, std::string* password)
@@ -832,12 +978,20 @@ esp_err_t LoadWifiCredentials(std::string* ssid, std::string* password)
 
 esp_err_t SaveWifiCredentials(const std::string& ssid, const std::string& password)
 {
+    StorageWriteGuard write("save-wifi-credentials", __FILE__, __LINE__);
+    if (!write) {
+        return ESP_ERR_INVALID_STATE;
+    }
     ESP_RETURN_ON_ERROR(SaveStringToNvs(kWifiSsidKey, ssid), kTag, "save WiFi SSID");
     return SaveStringToNvs(kWifiPasswordKey, password);
 }
 
 esp_err_t ClearWifiCredentials()
 {
+    StorageWriteGuard write("clear-wifi-credentials", __FILE__, __LINE__);
+    if (!write) {
+        return ESP_ERR_INVALID_STATE;
+    }
     esp_err_t result = ClearNvsKey(kWifiSsidKey);
     const esp_err_t clear_pass = ClearNvsKey(kWifiPasswordKey);
     if (result == ESP_OK) {
@@ -850,6 +1004,22 @@ bool HasWifiCredentials()
 {
     std::string ssid;
     return LoadStringFromNvs(kWifiSsidKey, &ssid) == ESP_OK && !ssid.empty();
+}
+
+esp_err_t PrepareStorageForSleep(int64_t deadline_us)
+{
+    if (deadline_us > 0 && esp_timer_get_time() >= deadline_us) {
+        return ESP_ERR_TIMEOUT;
+    }
+    return runtime::ActiveSleepBlockerCount(runtime::SleepBlocker::kStorage) == 0
+        ? ESP_OK
+        : ESP_ERR_INVALID_STATE;
+}
+
+void RollbackStorageAfterSleepAbort()
+{
+    // Accepted writes are synchronous NVS commits or fclose/rename SPIFFS
+    // transactions. The global quiesce gate reopening is the only rollback.
 }
 
 }  // namespace wqn

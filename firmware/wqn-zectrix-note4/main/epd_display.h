@@ -46,6 +46,13 @@ esp_err_t RefreshEpdFull(bool allow_local_partial = true, bool force_full_refres
 // Powers down only the EPD rail on GPIO6. Board-level GPIO17 is intentionally untouched.
 void PowerOffEpd();
 
+// Attempts the same serialized power-off without cutting the rail while a
+// refresh owns the driver. Returns ESP_ERR_TIMEOUT when the operation is busy.
+esp_err_t TryPowerOffEpd(uint32_t timeout_ms = 0);
+esp_err_t PrepareDisplayForSleep(int64_t deadline_us);
+void RollbackDisplayAfterSleepAbort();
+void ReleaseEpdDeepSleepHolds();
+
 // Returns true if the EPD is currently being initialized or is mid-refresh.
 // Used by the power manager to prevent cutting EPD power during active SPI traffic.
 bool IsEpdBusy();

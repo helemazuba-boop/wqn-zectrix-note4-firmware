@@ -13,6 +13,7 @@
 #include "freertos/task.h"
 
 #include "storage.h"
+#include "runtime/sleep_coordinator.h"
 #include "wifi_provision_portal.h"
 
 #if defined(CONFIG_WQN_WIFI_STA_ENABLE) && defined(CONFIG_WQN_PROVISION_ENABLE)
@@ -33,6 +34,7 @@ TaskHandle_t g_prov_task = nullptr;
 std::unique_ptr<wqn::provision::WifiProvisionPortal> g_portal;
 std::atomic<wqn::ProvisionState> g_prov_state{wqn::ProvisionState::kIdle};
 std::atomic<bool> g_session_active{false};
+wqn::runtime::SleepLease g_provision_sleep_lease;
 std::string g_prov_ssid;
 std::string g_prov_password;
 char g_prov_ap_ssid[33] = {};
@@ -41,6 +43,7 @@ wqn::ProvisionDoneCallback g_prov_done_callback;
 void PublishStopped()
 {
     std::lock_guard<std::mutex> lock(g_prov_mutex);
+    g_provision_sleep_lease.Reset();
     g_session_active = false;
     xEventGroupSetBits(g_prov_events, kStoppedBit);
 }
@@ -173,9 +176,19 @@ esp_err_t StartProvisioningMode()
         return ESP_OK;
     }
 
+    wqn::runtime::SleepLease lease =
+        wqn::runtime::SleepLease::TryAcquire(
+            wqn::runtime::SleepBlocker::kProvisioning, "provisioning", __FILE__, __LINE__);
+    if (!lease) {
+        ESP_LOGW(kTag, "provisioning start rejected: sleep quiesce in progress");
+        return ESP_ERR_INVALID_STATE;
+    }
+    g_provision_sleep_lease = std::move(lease);
+
     if (g_prov_events == nullptr) {
         g_prov_events = xEventGroupCreate();
         if (g_prov_events == nullptr) {
+            g_provision_sleep_lease.Reset();
             return ESP_ERR_NO_MEM;
         }
     }
@@ -184,6 +197,7 @@ esp_err_t StartProvisioningMode()
         if (created != pdPASS) {
             g_prov_task = nullptr;
             g_prov_state = ProvisionState::kFailed;
+            g_provision_sleep_lease.Reset();
             return ESP_ERR_NO_MEM;
         }
     }
@@ -234,6 +248,15 @@ ProvisionState GetProvisioningState()
     return g_prov_state.load();
 #else
     return ProvisionState::kIdle;
+#endif
+}
+
+bool IsProvisioningActive()
+{
+#if defined(CONFIG_WQN_WIFI_STA_ENABLE) && defined(CONFIG_WQN_PROVISION_ENABLE)
+    return g_session_active.load(std::memory_order_acquire);
+#else
+    return false;
 #endif
 }
 

@@ -1,7 +1,12 @@
 #include "power_manager.h"
 
 #include <algorithm>
+#include <atomic>
 
+#include "ai_session.h"
+#include "audio_sleep.h"
+#include "audio_capture.h"
+#include "audio_player.h"
 #include "driver/adc.h"
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
@@ -12,17 +17,23 @@
 #include "esp_attr.h"
 #include "esp_check.h"
 #include "esp_log.h"
-#include "esp_pm.h"
 #include "esp_sleep.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "epd_display.h"
+#include "flash_session.h"
 #include "online_sync.h"
 #include "pcf8563.h"
+#include "power/sleep_protocol.h"
+#include "power/wake_controller.h"
+#include "provision_manager.h"
+#include "runtime/sleep_coordinator.h"
+#include "runtime/sleep_snapshot.h"
+#include "runtime/wake_context.h"
 #include "sdkconfig.h"
-#include "nvs.h"
-#include "nvs_flash.h"
+#include "storage.h"
+#include "services/connectivity_service.h"
 
 #ifndef CONFIG_WQN_EPD_IDLE_POWER_OFF_MS
 #define CONFIG_WQN_EPD_IDLE_POWER_OFF_MS 1500
@@ -48,13 +59,7 @@ namespace {
 
 constexpr char kTag[] = "wqn_power";
 
-constexpr gpio_num_t kConfirmWake = GPIO_NUM_0;
-constexpr gpio_num_t kDownPowerWake = GPIO_NUM_18;
-constexpr gpio_num_t kRtcIntWake = GPIO_NUM_5;
 constexpr gpio_num_t kBoardPowerLatch = GPIO_NUM_17;
-constexpr gpio_num_t kEpdPower = GPIO_NUM_6;
-constexpr gpio_num_t kAudioPower = GPIO_NUM_42;
-constexpr gpio_num_t kAudioAmp = GPIO_NUM_46;
 constexpr gpio_num_t kNfcPower = GPIO_NUM_21;
 constexpr gpio_num_t kLed = GPIO_NUM_3;
 
@@ -107,35 +112,9 @@ void HoldOutput(gpio_num_t pin, int level)
     gpio_hold_en(pin);
 }
 
-// [power-fix] RTC_DATA_ATTR persists this across deep-sleep resets.
-// Without it, after every RTC-timer wake the variable is 0 and
-// IsUiIdleForSleep waits for the next NoteUserActivity call (e.g. button
-// press). With it, the last user-activity timestamp is preserved across
-// deep-sleep cycles, so the idle threshold is satisfied immediately on wake.
 RTC_DATA_ATTR int64_t g_last_user_activity_ms = 0;
+RTC_DATA_ATTR uint32_t g_consecutive_sleep_cycles = 0;
 static bool g_user_interacted_current_boot = false;
-static constexpr uint32_t kMaxConsecutiveSleepCycles = 3;
-
-uint32_t GetNvsSleepCount()
-{
-    nvs_handle_t my_handle;
-    uint32_t count = 0;
-    if (nvs_open("storage", NVS_READONLY, &my_handle) == ESP_OK) {
-        nvs_get_u32(my_handle, "sleep_count", &count);
-        nvs_close(my_handle);
-    }
-    return count;
-}
-
-void SetNvsSleepCount(uint32_t count)
-{
-    nvs_handle_t my_handle;
-    if (nvs_open("storage", NVS_READWRITE, &my_handle) == ESP_OK) {
-        nvs_set_u32(my_handle, "sleep_count", count);
-        nvs_commit(my_handle);
-        nvs_close(my_handle);
-    }
-}
 
 int64_t g_last_epd_activity_ms = 0;
 bool g_epd_idle_cut = false;
@@ -143,9 +122,27 @@ bool g_epd_idle_cut = false;
 adc_oneshot_unit_handle_t g_adc_handle = nullptr;
 adc_cali_handle_t g_adc_cali_handle = nullptr;
 bool g_adc_initialized = false;
-bool g_pcf8563_initialized = false;
 
 i2c_master_bus_handle_t g_i2c_bus = nullptr;
+
+TaskHandle_t g_power_coordinator_task = nullptr;
+std::atomic<bool> g_timer_wakeup_preference{true};
+std::atomic<bool> g_battery_shutdown_requested{false};
+uint32_t g_next_sleep_generation = 1;
+int64_t g_sleep_retry_not_before_us = 0;
+
+constexpr int64_t kPrepareSleepTimeoutUs = 5 * 1000 * 1000;
+constexpr int64_t kSleepRetryBackoffUs = 30 * 1000 * 1000;
+constexpr int64_t kEmergencyStorageTimeoutUs = 2 * 1000 * 1000;
+constexpr int64_t kEmergencyHardwareTimeoutUs = 2 * 1000 * 1000;
+constexpr int64_t kLeaseWarningAfterUs = 60 * 1000 * 1000;
+
+bool HasUnregisteredRuntimeActivity()
+{
+    return wqn::IsProvisioningActive() || wqn::IsAudioCaptureRunning() ||
+        wqn::IsAudioPlayerPlaying() || wqn::IsAiSessionActive() ||
+        wqn::IsFlashSessionActive();
+}
 
 }  // namespace
 
@@ -153,19 +150,27 @@ namespace wqn {
 
 void LogWakeupCause()
 {
-    const esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
-    ESP_LOGI(kTag, "wakeup cause: %s (%d)", WakeupCauseName(cause), static_cast<int>(cause));
-    if (cause == ESP_SLEEP_WAKEUP_EXT1) {
-        ESP_LOGI(kTag, "ext1 wakeup status mask=0x%llx", static_cast<unsigned long long>(esp_sleep_get_ext1_wakeup_status()));
-    }
+    const runtime::WakeContext& wake = runtime::GetWakeContext();
+    ESP_LOGI(kTag,
+             "wake context: kind=%s raw=%s(%d) reset=%d ext1=0x%llx pcf_valid=%d "
+             "pcf_af=%d pcf_tf=%d sleep_snapshot=%d sleep_generation=%u "
+             "sleep_cycles=%u timer_requested=%d panel_cache=%s",
+             runtime::WakeKindName(wake.kind), WakeupCauseName(wake.raw_cause),
+             static_cast<int>(wake.raw_cause), static_cast<int>(wake.reset_reason),
+             static_cast<unsigned long long>(wake.ext1_status),
+             wake.pcf_flags_valid ? 1 : 0,
+             wake.pcf_alarm ? 1 : 0,
+             wake.pcf_timer ? 1 : 0,
+             wake.sleep_snapshot_valid ? 1 : 0,
+             static_cast<unsigned>(wake.sleep_generation),
+             static_cast<unsigned>(wake.consecutive_sleep_cycles),
+             wake.requested_timer_wakeup ? 1 : 0,
+             wake.panel_cache_trusted ? "trusted" : "untrusted");
 }
 
 void ReleaseDeepSleepHolds()
 {
     gpio_deep_sleep_hold_dis();
-    gpio_hold_dis(kEpdPower);
-    gpio_hold_dis(kAudioPower);
-    gpio_hold_dis(kAudioAmp);
     gpio_hold_dis(kNfcPower);
     gpio_hold_dis(kLed);
     gpio_hold_dis(kBoardPowerLatch);
@@ -175,11 +180,8 @@ void NoteUserActivity()
 {
     g_user_interacted_current_boot = true;
     g_last_user_activity_ms = NowMs();
-    // [power-fix] User pressed a button or otherwise interacted with the UI.
-    // Reset the consecutive-sleep counter so the next wake cycle starts fresh.
-    // This ensures the device stays awake after the limit is reached until
-    // the user physically interacts with it.
-    SetNvsSleepCount(0);
+    // A physical interaction starts a new HIL/product idle sequence.
+    g_consecutive_sleep_cycles = 0;
     if (IsBatteryVeryLow() && !IsCharging() && !IsUsbPowered()) {
         ESP_LOGW(kTag, "battery critically low during user activity, initiating shutdown");
         ShutdownForBatteryDepleted();
@@ -201,7 +203,8 @@ bool IsUiIdleForSleepEx(int extra_idle_ms)
 {
     // If we woke up by a timer and there has been no user interaction in this boot session,
     // we should sleep immediately.
-    if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER && !g_user_interacted_current_boot) {
+    if (runtime::GetWakeContext().kind == runtime::WakeKind::kScheduledTimer &&
+        !g_user_interacted_current_boot) {
         return true;
     }
 
@@ -280,9 +283,10 @@ esp_err_t InitPowerHardware(i2c_port_t i2c_port, gpio_num_t i2c_sda, gpio_num_t 
     }
 
     if (Pcf8563InitWithBus(g_i2c_bus)) {
-        g_pcf8563_initialized = true;
+        power::SetPcf8563WakeAvailable(true);
         ESP_LOGI(kTag, "PCF8563 initialized on shared I2C bus");
     } else {
+        power::SetPcf8563WakeAvailable(false);
         ESP_LOGW(kTag, "PCF8563 init failed; RTC timer wake will use ESP32 internal timer");
     }
 
@@ -399,157 +403,301 @@ bool IsBatteryVeryLow()
 }
 
 
-esp_err_t PrepareForDeepSleep(bool enable_timer_wakeup)
+static power::PrepareSleepResult MakePrepareResult(
+    const power::PrepareSleepCommand& command,
+    power::SleepService service,
+    esp_err_t error)
 {
-    ESP_LOGI(kTag, "preparing board for deep sleep (enable_timer_wakeup=%d)", enable_timer_wakeup);
-
-    PowerOffEpd();
-    HoldOutput(kEpdPower, 0);
-    HoldOutput(kAudioPower, 0);
-    HoldOutput(kAudioAmp, 0);
-    HoldOutput(kNfcPower, 0);
-    HoldOutput(kLed, 1);
-    HoldOutput(kBoardPowerLatch, 1);
-    gpio_deep_sleep_hold_en();
-
-    const uint64_t wake_mask =
-        (1ULL << kConfirmWake) |
-        (1ULL << kDownPowerWake) |
-        (1ULL << kRtcIntWake);
-    ESP_RETURN_ON_ERROR(
-        esp_sleep_enable_ext1_wakeup(wake_mask, ESP_EXT1_WAKEUP_ANY_LOW),
-        kTag,
-        "enable ext1 wakeup");
-
-#if CONFIG_WQN_DEEP_SLEEP_TIMER_WAKE_SEC > 0
-    if (enable_timer_wakeup) {
-        if (g_pcf8563_initialized) {
-            if (Pcf8563ConfigureTimerWake(CONFIG_WQN_DEEP_SLEEP_TIMER_WAKE_SEC)) {
-                ESP_LOGI(kTag, "deep sleep using PCF8563 timer wake: %d sec", CONFIG_WQN_DEEP_SLEEP_TIMER_WAKE_SEC);
-            } else {
-                ESP_LOGW(kTag, "PCF8563 timer config failed, falling back to ESP32 internal timer");
-                ESP_RETURN_ON_ERROR(
-                    esp_sleep_enable_timer_wakeup(static_cast<uint64_t>(CONFIG_WQN_DEEP_SLEEP_TIMER_WAKE_SEC) * 1000000ULL),
-                    kTag,
-                    "enable ESP32 timer wakeup");
-            }
-        } else {
-            ESP_RETURN_ON_ERROR(
-                esp_sleep_enable_timer_wakeup(static_cast<uint64_t>(CONFIG_WQN_DEEP_SLEEP_TIMER_WAKE_SEC) * 1000000ULL),
-                kTag,
-                "enable ESP32 timer wakeup");
-        }
+    power::PrepareSleepResult result;
+    result.generation = command.generation;
+    result.service = service;
+    result.error = error;
+    if (error == ESP_OK) {
+        result.status = power::SleepPrepareStatus::kReady;
+    } else if (error == ESP_ERR_TIMEOUT ||
+               (command.deadline_us > 0 && esp_timer_get_time() >= command.deadline_us)) {
+        result.status = power::SleepPrepareStatus::kTimedOut;
     } else {
-        ESP_LOGI(kTag, "timer wakeup disabled for this sleep cycle");
+        result.status = power::SleepPrepareStatus::kDenied;
     }
-#endif
-
-    ESP_LOGI(
-        kTag,
-        "deep sleep armed: wake_gpio_mask=0x%llx timer_sec=%d pcf8563=%s",
-        static_cast<unsigned long long>(wake_mask),
-        CONFIG_WQN_DEEP_SLEEP_TIMER_WAKE_SEC,
-        g_pcf8563_initialized ? "yes" : "no");
-    return ESP_OK;
+    ESP_LOGI(kTag,
+             "prepare-sleep result: generation=%u service=%s status=%s error=%s",
+             static_cast<unsigned>(result.generation),
+             power::SleepServiceName(result.service),
+             power::SleepPrepareStatusName(result.status),
+             esp_err_to_name(result.error));
+    return result;
 }
 
-void EnterDeepSleepIfEnabled(bool enable_timer_wakeup)
+static power::PrepareSleepResults BroadcastPrepareSleep(const power::PrepareSleepCommand& command)
 {
-#if CONFIG_WQN_DEEP_SLEEP_ENABLE
-    if (IsBatteryVeryLow() && !IsCharging() && !IsUsbPowered()) {
-        ShutdownForBatteryDepleted();
-        return;
+    power::PrepareSleepResults results{};
+    ESP_LOGI(kTag, "prepare-sleep broadcast: generation=%u mode=%s deadline_us=%lld",
+             static_cast<unsigned>(command.generation),
+             power::SleepModeName(command.mode),
+             static_cast<long long>(command.deadline_us));
+
+    const auto deadline_result = [&command]() {
+        return command.deadline_us > 0 && esp_timer_get_time() >= command.deadline_us
+            ? ESP_ERR_TIMEOUT
+            : ESP_OK;
+    };
+
+    esp_err_t error = deadline_result();
+    if (error == ESP_OK) {
+        error = PrepareDisplayForSleep(command.deadline_us);
     }
+    results[static_cast<size_t>(power::SleepService::kDisplay)] =
+        MakePrepareResult(command, power::SleepService::kDisplay, error);
 
-    // [power-fix] Refuse to enter deep sleep while the device is still
-    // unpaired. Provisioning is signalled by the SoftAP + captive portal
-    // sitting on the radio; yanking the CPU out from under it would kill
-    // the user mid-flow (they can take more than 60s to type a WiFi
-    // password). The check is cheap (NVS read) and matches the official
-    // firmware's "no token -> never sleep" rule.
-    if (!wqn::HasUsableStoredToken()) {
-        return;
+    error = deadline_result();
+    if (error == ESP_OK) {
+        error = PrepareStorageForSleep(command.deadline_us);
     }
+    results[static_cast<size_t>(power::SleepService::kStorage)] =
+        MakePrepareResult(command, power::SleepService::kStorage, error);
 
-    if (!IsUiIdleForSleep()) {
-        // [power-fix] User interacted reset is now handled via NoteUserActivity()
-        // and boot-time wakeup cause checks.
-        return;
+    error = deadline_result();
+    if (error == ESP_OK) {
+        error = PrepareAudioForSleep(command);
     }
+    results[static_cast<size_t>(power::SleepService::kAudio)] =
+        MakePrepareResult(command, power::SleepService::kAudio, error);
 
-    if (IsEpdBusy()) {
-        return;
+    error = deadline_result();
+    if (error == ESP_OK) {
+        error = services::PrepareConnectivityForSleep(command);
     }
+    results[static_cast<size_t>(power::SleepService::kConnectivity)] =
+        MakePrepareResult(command, power::SleepService::kConnectivity, error);
+    return results;
+}
 
-    // [power-fix] If IsUiIdleForSleep() was true immediately on wake (i.e.
-    // no new user activity since the last sleep), increment the counter.
-    // After kMaxConsecutiveSleepCycles of pure idle wakes, stop trying to
-    // sleep and let the device stay awake so the user can wake it with a
-    // button press.  NoteUserActivity() resets the counter on user input.
-    uint32_t sleep_count = GetNvsSleepCount();
-    if (sleep_count >= kMaxConsecutiveSleepCycles) {
-        // [power-fix] Do NOT reset to 0 here.  The caller loop runs every
-        // 1 second; resetting to 0 would let the very next call bypass the
-        // guard immediately.  Instead, leave the counter at the cap value.
-        // The function will keep returning here every second, keeping the
-        // device awake, until the user presses a button (NoteUserActivity).
-        ESP_LOGW(kTag,
-            "consecutive deep-sleep limit reached (%u); staying awake; "
-            "any button press will reset the counter",
-            sleep_count);
-        return;
+static bool AllServicesReady(
+    const power::PrepareSleepCommand& command,
+    const power::PrepareSleepResults& results)
+{
+    for (const power::PrepareSleepResult& result : results) {
+        if (result.generation != command.generation ||
+            result.status != power::SleepPrepareStatus::kReady) {
+            return false;
+        }
     }
-    sleep_count++;
-    SetNvsSleepCount(sleep_count);
-    ESP_LOGI(kTag, "deep-sleep cycle %u/%u", sleep_count, kMaxConsecutiveSleepCycles);
+    return true;
+}
 
-    const esp_err_t result = PrepareForDeepSleep(enable_timer_wakeup);
-    if (result != ESP_OK) {
-        ESP_LOGW(kTag, "deep sleep aborted: %s", esp_err_to_name(result));
-        return;
+static void PrepareBoardPowerState(power::SleepMode mode)
+{
+    HoldOutput(kNfcPower, 0);
+    HoldOutput(kLed, 1);
+    HoldOutput(kBoardPowerLatch, mode == power::SleepMode::kIdle ? 1 : 0);
+    gpio_deep_sleep_hold_en();
+}
+
+static void RollbackBoardPowerState()
+{
+    gpio_deep_sleep_hold_dis();
+    gpio_hold_dis(kNfcPower);
+    gpio_set_level(kNfcPower, 0);
+    gpio_hold_dis(kLed);
+    gpio_set_level(kLed, 1);
+    gpio_hold_dis(kBoardPowerLatch);
+    gpio_set_level(kBoardPowerLatch, 1);
+}
+
+static void RollbackSleepPreparation(uint32_t generation, const char* reason)
+{
+    ESP_LOGW(kTag, "sleep rollback: generation=%u reason=%s retry_ms=30000",
+             static_cast<unsigned>(generation), reason);
+    power::DisarmWakeSources();
+    // Reopen lease acquisition before services restore active hardware. A
+    // service returning to Connecting/Provisioning must be able to reacquire
+    // its lease as part of the synchronous rollback.
+    runtime::CancelSleepQuiesce(generation);
+    services::RollbackConnectivityAfterSleepAbort();
+    RollbackAudioAfterSleepAbort();
+    RollbackStorageAfterSleepAbort();
+    RollbackDisplayAfterSleepAbort();
+    RollbackBoardPowerState();
+    runtime::InvalidateSleepSnapshot();
+    g_sleep_retry_not_before_us = esp_timer_get_time() + kSleepRetryBackoffUs;
+}
+
+static uint32_t NextSleepGeneration()
+{
+    uint32_t generation = g_next_sleep_generation++;
+    if (generation == 0) {
+        generation = g_next_sleep_generation++;
     }
+    return generation;
+}
 
-    // [power-fix debug] Dump all PM locks so we can confirm NO_LIGHT_SLEEP
-    // is not held when entering deep sleep.  Delete this block after one
-    // successful deep-sleep test confirms everything is clean.
-    ESP_LOGI(kTag, "=== PM locks before deep sleep ===");
-    esp_pm_dump_locks(stdout);
-    ESP_LOGI(kTag, "=== end PM lock dump ===");
-
-    // [power-fix] Flush the UART TX buffer and wait for the USB CDC
-    // hardware to finish transmitting before entering deep sleep.
-    // Without this the last few log lines (including the lock dump)
-    // are silently dropped because the USB peripheral is clock-gated
-    // the instant esp_deep_sleep_start() is called.
-    // uart_wait_tx_idle_polling() spins until TX FIFO is empty.
-    ESP_LOGI(kTag, "flushing UART before deep sleep...");
+static void CommitDeepSleep(const power::PrepareSleepCommand& command)
+{
+    ESP_LOGI(kTag, "deep-sleep commit: generation=%u mode=%s consecutive=%u stack_free=%u",
+             static_cast<unsigned>(command.generation),
+             power::SleepModeName(command.mode),
+             static_cast<unsigned>(g_consecutive_sleep_cycles),
+             static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
     uart_wait_tx_idle_polling(static_cast<uart_port_t>(CONFIG_ESP_CONSOLE_UART_NUM));
     vTaskDelay(pdMS_TO_TICKS(50));
 
-    ESP_LOGI(kTag, "entering deep sleep");
+    // This is intentionally the only deep-sleep call site in the firmware.
     esp_deep_sleep_start();
+    RollbackSleepPreparation(command.generation, "deep-sleep-returned");
+}
+
+static void RunBatteryEmergencyShutdown()
+{
+    const uint32_t generation = NextSleepGeneration();
+    if (!runtime::BeginEmergencySleepQuiesce(generation)) {
+        ESP_LOGE(kTag, "cannot begin emergency quiesce: generation=%u",
+                 static_cast<unsigned>(generation));
+        return;
+    }
+
+    const int64_t storage_deadline_us = esp_timer_get_time() + kEmergencyStorageTimeoutUs;
+    while (runtime::ActiveSleepBlockerCount(runtime::SleepBlocker::kStorage) != 0 &&
+           esp_timer_get_time() < storage_deadline_us) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    power::PrepareSleepCommand command;
+    command.generation = generation;
+    command.mode = power::SleepMode::kBatteryEmergency;
+    command.deadline_us = esp_timer_get_time() + kEmergencyHardwareTimeoutUs;
+    const power::PrepareSleepResults results = BroadcastPrepareSleep(command);
+    for (const power::PrepareSleepResult& result : results) {
+        if (result.status != power::SleepPrepareStatus::kReady) {
+            ESP_LOGW(kTag, "emergency shutdown continuing after service failure: service=%s status=%s",
+                     power::SleepServiceName(result.service),
+                     power::SleepPrepareStatusName(result.status));
+        }
+    }
+
+    power::DisarmWakeSources();
+    PrepareBoardPowerState(power::SleepMode::kBatteryEmergency);
+    runtime::SleepSnapshot snapshot;
+    snapshot.generation = generation;
+    snapshot.mode = power::SleepMode::kBatteryEmergency;
+    snapshot.consecutive_cycles = g_consecutive_sleep_cycles;
+    runtime::CommitSleepSnapshot(snapshot);
+    CommitDeepSleep(command);
+}
+
+static bool PreemptIdleSleepForBatteryEmergency(uint32_t generation)
+{
+    if (!g_battery_shutdown_requested.exchange(false, std::memory_order_acq_rel)) {
+        return false;
+    }
+    RollbackSleepPreparation(generation, "battery-emergency-preemption");
+    RunBatteryEmergencyShutdown();
+    return true;
+}
+
+static void EnterDeepSleepIfEnabled(bool enable_timer_wakeup)
+{
+#if CONFIG_WQN_DEEP_SLEEP_ENABLE
+    if (g_battery_shutdown_requested.exchange(false, std::memory_order_acq_rel) ||
+        (IsBatteryVeryLow() && !IsCharging() && !IsUsbPowered())) {
+        RunBatteryEmergencyShutdown();
+        return;
+    }
+    if (esp_timer_get_time() < g_sleep_retry_not_before_us ||
+        !HasUsableStoredToken() || !IsUiIdleForSleep() ||
+        HasUnregisteredRuntimeActivity() || IsEpdBusy()) {
+        return;
+    }
+
+    const uint32_t generation = NextSleepGeneration();
+    if (!runtime::TryBeginSleepQuiesce(generation)) {
+        return;
+    }
+
+    power::PrepareSleepCommand command;
+    command.generation = generation;
+    command.mode = power::SleepMode::kIdle;
+    command.deadline_us = esp_timer_get_time() + kPrepareSleepTimeoutUs;
+    const power::PrepareSleepResults results = BroadcastPrepareSleep(command);
+    if (!AllServicesReady(command, results)) {
+        RollbackSleepPreparation(generation, "service-denied-or-timeout");
+        return;
+    }
+    if (PreemptIdleSleepForBatteryEmergency(generation)) {
+        return;
+    }
+
+    const power::WakeArmResult wake =
+        power::ArmWakeSources(enable_timer_wakeup, command.deadline_us);
+    if (wake.error != ESP_OK) {
+        RollbackSleepPreparation(generation, esp_err_to_name(wake.error));
+        return;
+    }
+    if (PreemptIdleSleepForBatteryEmergency(generation)) {
+        return;
+    }
+
+    PrepareBoardPowerState(power::SleepMode::kIdle);
+    ++g_consecutive_sleep_cycles;
+    runtime::SleepSnapshot snapshot;
+    snapshot.generation = generation;
+    snapshot.mode = power::SleepMode::kIdle;
+    snapshot.timer_wakeup_enabled = enable_timer_wakeup;
+    snapshot.consecutive_cycles = g_consecutive_sleep_cycles;
+    snapshot.wake_gpio_mask = wake.wake_gpio_mask;
+    runtime::CommitSleepSnapshot(snapshot);
+    CommitDeepSleep(command);
+#else
+    (void)enable_timer_wakeup;
 #endif
+}
+
+void SetDeepSleepTimerWakePreference(bool enabled)
+{
+    g_timer_wakeup_preference.store(enabled, std::memory_order_release);
+}
+
+static void PowerCoordinatorTask(void*)
+{
+    ESP_LOGI(kTag, "power coordinator task started: stack_free=%u",
+             static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
+    while (true) {
+        runtime::LogLongHeldSleepLeases(esp_timer_get_time(), kLeaseWarningAfterUs);
+        EnterDeepSleepIfEnabled(g_timer_wakeup_preference.load(std::memory_order_acquire));
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000));
+    }
+}
+
+esp_err_t StartPowerCoordinator()
+{
+    if (g_power_coordinator_task != nullptr) {
+        return ESP_OK;
+    }
+    runtime::SleepSnapshot snapshot;
+    if (runtime::LoadSleepSnapshot(&snapshot)) {
+        g_next_sleep_generation = snapshot.generation + 1;
+        if (g_next_sleep_generation == 0) {
+            g_next_sleep_generation = 1;
+        }
+        g_consecutive_sleep_cycles = snapshot.consecutive_cycles;
+    }
+    const BaseType_t created =
+        xTaskCreate(PowerCoordinatorTask, "wqn_power_coord", 8192, nullptr, 4, &g_power_coordinator_task);
+    if (created != pdPASS) {
+        g_power_coordinator_task = nullptr;
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
 }
 
 void ShutdownForBatteryDepleted()
 {
-    ESP_LOGW(kTag, "Battery depleted, shutting down");
-
-    esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
-
-    PowerOffEpd();
-    HoldOutput(kEpdPower, 0);
-    HoldOutput(kAudioPower, 0);
-    HoldOutput(kAudioAmp, 0);
-    HoldOutput(kNfcPower, 0);
-    HoldOutput(kLed, 1);
-
-    gpio_deep_sleep_hold_dis();
-    gpio_hold_dis(kBoardPowerLatch);
-    gpio_set_level(kBoardPowerLatch, 0);
-
-    ESP_LOGI(kTag, "entering depleted-battery deep sleep with PWR_ON latch released");
-    esp_deep_sleep_start();
+    if (!g_battery_shutdown_requested.exchange(true, std::memory_order_acq_rel)) {
+        ESP_LOGW(kTag, "battery depleted: emergency shutdown requested");
+    }
+    if (g_power_coordinator_task != nullptr) {
+        xTaskNotifyGive(g_power_coordinator_task);
+    }
 }
 
 void PowerOffEpdAfterIdleIfNeeded()
@@ -562,9 +710,13 @@ void PowerOffEpdAfterIdleIfNeeded()
         return;
     }
 
-    ESP_LOGI(kTag, "EPD idle power-off after %d ms", idle_ms);
-    PowerOffEpd();
-    g_epd_idle_cut = true;
+    const esp_err_t result = TryPowerOffEpd(0);
+    if (result == ESP_OK) {
+        ESP_LOGI(kTag, "EPD idle power-off after %d ms", idle_ms);
+        g_epd_idle_cut = true;
+    } else if (result != ESP_ERR_TIMEOUT) {
+        ESP_LOGW(kTag, "EPD idle power-off failed: %s", esp_err_to_name(result));
+    }
 }
 
 }  // namespace wqn

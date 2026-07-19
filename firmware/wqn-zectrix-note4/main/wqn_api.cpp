@@ -21,9 +21,10 @@
 #include "esp_task_wdt.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "mbedtls/sha256.h"
+#include "services/connectivity_service.h"
 #include "storage.h"
 #include "text_render.h"
-#include "wifi_manager.h"
 
 namespace {
 
@@ -35,6 +36,26 @@ constexpr TickType_t kPollDelay = pdMS_TO_TICKS(2000);
 constexpr int kPollAttempts = 60;
 constexpr size_t kProblemPreviewChars = 240;
 constexpr std::time_t kMinReasonableUnixTime = 1704067200;  // 2024-01-01 UTC
+
+std::string StableRequestIdForBody(const std::string& body)
+{
+    std::array<unsigned char, 32> digest = {};
+    if (mbedtls_sha256(
+            reinterpret_cast<const unsigned char*>(body.data()),
+            body.size(),
+            digest.data(),
+            0) != 0) {
+        return "";
+    }
+    constexpr char kHex[] = "0123456789abcdef";
+    std::string request_id = "req_";
+    request_id.reserve(52);
+    for (size_t index = 0; index < 24; ++index) {
+        request_id.push_back(kHex[digest[index] >> 4]);
+        request_id.push_back(kHex[digest[index] & 0x0f]);
+    }
+    return request_id;
+}
 
 class JsonDocument {
 public:
@@ -159,7 +180,7 @@ esp_err_t WaitForNetworkReadyForHttps()
 {
     ESP_LOGI(kTag, "waiting for WiFi before WQN API request");
     FeedTaskWatchdogIfSubscribed();
-    ESP_RETURN_ON_ERROR(wqn::WaitForWifiStationConnected(kWifiConnectTimeout), kTag, "wait for WiFi");
+    ESP_RETURN_ON_ERROR(wqn::services::WaitForConnectivity(kWifiConnectTimeout), kTag, "wait for WiFi");
     FeedTaskWatchdogIfSubscribed();
     ESP_RETURN_ON_ERROR(EnsureClockSyncedForHttps(), kTag, "sync clock for HTTPS");
     FeedTaskWatchdogIfSubscribed();
@@ -172,7 +193,9 @@ esp_err_t HttpRequest(
     const std::string* bearer_token,
     const std::string* request_body,
     int* status_code,
-    std::string* response_body)
+    std::string* response_body,
+    const char* protocol = nullptr,
+    const std::string* request_id = nullptr)
 {
     if (status_code == nullptr || response_body == nullptr) {
         return ESP_ERR_INVALID_ARG;
@@ -203,6 +226,12 @@ esp_err_t HttpRequest(
     }
     if (result == ESP_OK && std::strcmp(method, "POST") == 0) {
         result = esp_http_client_set_header(client, "Content-Type", "application/json");
+    }
+    if (result == ESP_OK && protocol != nullptr) {
+        result = esp_http_client_set_header(client, "X-WQN-Protocol", protocol);
+    }
+    if (result == ESP_OK && request_id != nullptr && !request_id->empty()) {
+        result = esp_http_client_set_header(client, "X-WQN-Request-Id", request_id->c_str());
     }
     if (result != ESP_OK) {
         esp_http_client_cleanup(client);
@@ -1802,6 +1831,201 @@ esp_err_t RunPairingFlowIfNeeded()
     return ESP_ERR_TIMEOUT;
 }
 
+esp_err_t StartDeviceClaimV3(
+    const protocol::v3::RequestMetadata& metadata,
+    const std::string& hardware_id,
+    const std::string& device_public_key,
+    protocol::v3::ClaimStartData* data,
+    protocol::v3::Error* error)
+{
+    if (hardware_id.empty() || device_public_key.empty() || data == nullptr ||
+        error == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    ESP_RETURN_ON_ERROR(
+        WaitForNetworkReadyForHttps(), kTag, "prepare v3 claim start network");
+
+    std::string request_body;
+    ESP_RETURN_ON_ERROR(
+        protocol::v3::BuildClaimStartRequest(
+            metadata, hardware_id, device_public_key, &request_body),
+        kTag,
+        "build v3 claim start");
+    int status_code = 0;
+    std::string response_body;
+    const esp_err_t request_result = HttpRequest(
+        "POST",
+        BuildUrl("/v3/claim/start"),
+        nullptr,
+        &request_body,
+        &status_code,
+        &response_body,
+        protocol::v3::kProtocolHeader,
+        &metadata.request_id);
+    if (request_result != ESP_OK) {
+        return request_result;
+    }
+    const esp_err_t parse_result = protocol::v3::ParseClaimStartResponse(
+        response_body, metadata.request_id, data, error);
+    if (status_code != 200 || parse_result != ESP_OK) {
+        ESP_LOGW(
+            kTag,
+            "v3 claim start failed: status=%d code=%s retryable=%d",
+            status_code,
+            error->code.c_str(),
+            error->retryable ? 1 : 0);
+        return parse_result == ESP_OK ? ESP_FAIL : parse_result;
+    }
+    return ESP_OK;
+}
+
+esp_err_t PollDeviceClaimV3(
+    const protocol::v3::RequestMetadata& metadata,
+    const std::string& claim_id,
+    protocol::v3::ClaimPollData* data,
+    protocol::v3::Error* error)
+{
+    if (claim_id.empty() || data == nullptr || error == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    ESP_RETURN_ON_ERROR(
+        WaitForNetworkReadyForHttps(), kTag, "prepare v3 claim poll network");
+
+    std::string request_body;
+    ESP_RETURN_ON_ERROR(
+        protocol::v3::BuildClaimPollRequest(metadata, claim_id, &request_body),
+        kTag,
+        "build v3 claim poll");
+    int status_code = 0;
+    std::string response_body;
+    const esp_err_t request_result = HttpRequest(
+        "POST",
+        BuildUrl("/v3/claim/poll"),
+        nullptr,
+        &request_body,
+        &status_code,
+        &response_body,
+        protocol::v3::kProtocolHeader,
+        &metadata.request_id);
+    if (request_result != ESP_OK) {
+        return request_result;
+    }
+    const esp_err_t parse_result = protocol::v3::ParseClaimPollResponse(
+        response_body, metadata.request_id, data, error);
+    if (status_code != 200 || parse_result != ESP_OK) {
+        ESP_LOGW(
+            kTag,
+            "v3 claim poll failed: status=%d code=%s retryable=%d retry_after_ms=%u",
+            status_code,
+            error->code.c_str(),
+            error->retryable ? 1 : 0,
+            static_cast<unsigned>(error->retry_after_ms));
+        return parse_result == ESP_OK ? ESP_FAIL : parse_result;
+    }
+    return ESP_OK;
+}
+
+esp_err_t BootstrapDeviceControlV3(
+    const std::string& token,
+    const protocol::v3::RequestMetadata& metadata,
+    protocol::v3::BootstrapData* data,
+    protocol::v3::Error* error)
+{
+    if (token.empty() || data == nullptr || error == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    ESP_RETURN_ON_ERROR(ValidateTokenOrClear(token, "v3 bootstrap"), kTag, "validate token");
+    ESP_RETURN_ON_ERROR(WaitForNetworkReadyForHttps(), kTag, "prepare v3 bootstrap network");
+
+    std::string request_body;
+    ESP_RETURN_ON_ERROR(
+        protocol::v3::BuildBootstrapRequest(metadata, &request_body),
+        kTag,
+        "build v3 bootstrap");
+    int status_code = 0;
+    std::string response_body;
+    const std::string url = BuildUrl("/v3/bootstrap");
+    const esp_err_t request_result = HttpRequest(
+        "POST",
+        url,
+        &token,
+        &request_body,
+        &status_code,
+        &response_body,
+        protocol::v3::kProtocolHeader,
+        &metadata.request_id);
+    if (request_result != ESP_OK) {
+        return request_result;
+    }
+    const esp_err_t parse_result = protocol::v3::ParseBootstrapResponse(
+        response_body, metadata.request_id, data, error);
+    if (status_code == 401) {
+        ESP_ERROR_CHECK_WITHOUT_ABORT(ClearAccessToken());
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (status_code != 200 || parse_result != ESP_OK) {
+        ESP_LOGW(
+            kTag,
+            "v3 bootstrap failed: status=%d code=%s retryable=%d",
+            status_code,
+            error->code.c_str(),
+            error->retryable ? 1 : 0);
+        return parse_result == ESP_OK ? ESP_FAIL : parse_result;
+    }
+    return ESP_OK;
+}
+
+esp_err_t SyncDeviceControlV3(
+    const std::string& token,
+    const protocol::v3::RequestMetadata& metadata,
+    protocol::v3::SyncData* data,
+    protocol::v3::Error* error)
+{
+    if (token.empty() || data == nullptr || error == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    ESP_RETURN_ON_ERROR(ValidateTokenOrClear(token, "v3 sync"), kTag, "validate token");
+    ESP_RETURN_ON_ERROR(WaitForNetworkReadyForHttps(), kTag, "prepare v3 sync network");
+
+    std::string request_body;
+    ESP_RETURN_ON_ERROR(
+        protocol::v3::BuildSyncRequest(metadata, &request_body),
+        kTag,
+        "build v3 sync");
+    int status_code = 0;
+    std::string response_body;
+    const std::string url = BuildUrl("/v3/sync");
+    const esp_err_t request_result = HttpRequest(
+        "POST",
+        url,
+        &token,
+        &request_body,
+        &status_code,
+        &response_body,
+        protocol::v3::kProtocolHeader,
+        &metadata.request_id);
+    if (request_result != ESP_OK) {
+        return request_result;
+    }
+    const esp_err_t parse_result = protocol::v3::ParseSyncResponse(
+        response_body, metadata.request_id, data, error);
+    if (status_code == 401) {
+        ESP_ERROR_CHECK_WITHOUT_ABORT(ClearAccessToken());
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (status_code != 200 || parse_result != ESP_OK) {
+        ESP_LOGW(
+            kTag,
+            "v3 sync failed: status=%d code=%s retryable=%d retry_after_ms=%u",
+            status_code,
+            error->code.c_str(),
+            error->retryable ? 1 : 0,
+            static_cast<unsigned>(error->retry_after_ms));
+        return parse_result == ESP_OK ? ESP_FAIL : parse_result;
+    }
+    return ESP_OK;
+}
+
 esp_err_t ProbeSyncAndClearTokenOnUnauthorized(const std::string& token)
 {
     if (token.empty()) {
@@ -1973,9 +2197,14 @@ esp_err_t UploadReviewComplete(const std::string& token, const std::vector<WqnRe
     ESP_RETURN_ON_ERROR(BuildReviewCompleteBody(results, &request_body), kTag, "build review-complete request");
 
     const std::string url = BuildUrl("/review-complete");
+    const std::string request_id = StableRequestIdForBody(request_body);
+    if (request_id.empty()) {
+        return ESP_FAIL;
+    }
     int status_code = 0;
     std::string body;
-    esp_err_t result = HttpRequest("POST", url, &token, &request_body, &status_code, &body);
+    esp_err_t result = HttpRequest(
+        "POST", url, &token, &request_body, &status_code, &body, nullptr, &request_id);
     if (result != ESP_OK) {
         ESP_LOGW(kTag, "review-complete failed: %s", esp_err_to_name(result));
         return result;

@@ -11,8 +11,10 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "font_fmt.h"
+#include "runtime/wake_context.h"
 #include "sdkconfig.h"
 
 namespace wqn {
@@ -84,6 +86,39 @@ int64_t g_last_epd_refresh_us = 0;
 // refresh, causing visible flicker on every clock tick.
 RTC_DATA_ATTR uint32_t g_rtc_last_frame_crc = 0;
 RTC_DATA_ATTR bool g_rtc_last_frame_crc_valid = false;
+
+SemaphoreHandle_t EpdOperationMutex()
+{
+    // Recursive because a full refresh powers the panel off from inside the
+    // already-serialized refresh operation.
+    static SemaphoreHandle_t mutex = xSemaphoreCreateRecursiveMutex();
+    return mutex;
+}
+
+class EpdOperationGuard {
+public:
+    explicit EpdOperationGuard(TickType_t timeout)
+        : mutex_(EpdOperationMutex())
+    {
+        locked_ = mutex_ != nullptr && xSemaphoreTakeRecursive(mutex_, timeout) == pdTRUE;
+    }
+
+    ~EpdOperationGuard()
+    {
+        if (locked_) {
+            xSemaphoreGiveRecursive(mutex_);
+        }
+    }
+
+    EpdOperationGuard(const EpdOperationGuard&) = delete;
+    EpdOperationGuard& operator=(const EpdOperationGuard&) = delete;
+
+    bool locked() const { return locked_; }
+
+private:
+    SemaphoreHandle_t mutex_ = nullptr;
+    bool locked_ = false;
+};
 
 extern "C" const lv_font_t SourceHanSansSC_Regular_slim;
 
@@ -949,6 +984,8 @@ void DrawCjkGlyph(int x, int y, uint32_t codepoint, bool black)
 
 esp_err_t InitEpdDisplay()
 {
+    EpdOperationGuard operation(portMAX_DELAY);
+    ESP_RETURN_ON_FALSE(operation.locked(), ESP_ERR_NO_MEM, kTag, "create/take EPD operation mutex");
     if (g_initialized) {
         return ESP_OK;
     }
@@ -1410,6 +1447,8 @@ esp_err_t SendDirtyRectToPanel(const DirtyRect& rect)
 
 esp_err_t RefreshEpdFull(bool allow_local_partial, bool force_full_refresh)
 {
+    EpdOperationGuard operation(portMAX_DELAY);
+    ESP_RETURN_ON_FALSE(operation.locked(), ESP_ERR_NO_MEM, kTag, "take EPD refresh operation mutex");
     ESP_LOGI(kTag, "EPD RefreshEpdFull: enter partial=%d full=%d fb=%p prev=%p synced=%d",
         allow_local_partial, force_full_refresh, g_framebuffer, g_previous_framebuffer, g_previous_framebuffer_synced);
     constexpr float kMaxLocalPartialAreaRatio = 0.45f;
@@ -1433,7 +1472,8 @@ esp_err_t RefreshEpdFull(bool allow_local_partial, bool force_full_refresh)
     // CRC stored in RTC memory from the last real refresh, the panel already
     // shows this frame and we can skip the entire SPI transaction.
     const uint32_t current_crc = esp_crc32_le(~0U, g_framebuffer, kEpdFramebufferSize) ^ ~0U;
-    if (!force_full_refresh && g_rtc_last_frame_crc_valid && current_crc == g_rtc_last_frame_crc) {
+    if (!force_full_refresh && wqn::runtime::GetWakeContext().panel_cache_trusted &&
+        g_rtc_last_frame_crc_valid && current_crc == g_rtc_last_frame_crc) {
         // Panel already shows this content -- restore RAM state to match and
         // skip the refresh to eliminate flicker and save ~200ms of CPU time.
         g_previous_framebuffer_synced = true;
@@ -1523,6 +1563,11 @@ esp_err_t RefreshEpdFull(bool allow_local_partial, bool force_full_refresh)
 
 void PowerOffEpd()
 {
+    EpdOperationGuard operation(portMAX_DELAY);
+    if (!operation.locked()) {
+        ESP_LOGE(kTag, "EPD power-off skipped: operation mutex unavailable");
+        return;
+    }
     // [epd-leak-fix] Spec book §5.3 requires sending SSD1683 deep-sleep command
     // 0x07/0xA5 before cutting GPIO 6, otherwise the controller remains in an
     // active state and current backflows through protection diodes when the
@@ -1559,6 +1604,17 @@ void PowerOffEpd()
     }
 }
 
+esp_err_t TryPowerOffEpd(uint32_t timeout_ms)
+{
+    EpdOperationGuard operation(pdMS_TO_TICKS(timeout_ms));
+    if (!operation.locked()) {
+        return ESP_ERR_TIMEOUT;
+    }
+    // Recursive acquisition keeps every power-off path on the same lock.
+    PowerOffEpd();
+    return ESP_OK;
+}
+
 } // namespace wqn
 
 // Helpers outside the main `wqn` namespace block (which closed at the end of
@@ -1566,11 +1622,54 @@ void PowerOffEpd()
 // lives in the device_ui_internal translation unit (ui_refresh.cpp);
 // forward-declare here to read it without dragging in ui_internal.h.
 namespace device_ui_internal {
-extern bool g_refresh_busy;
+bool IsEpdRefreshPipelineBusy();
 }  // namespace device_ui_internal
 
 bool wqn::IsEpdBusy()
 {
-    return ::device_ui_internal::g_refresh_busy;
+    if (::device_ui_internal::IsEpdRefreshPipelineBusy()) {
+        return true;
+    }
+    EpdOperationGuard operation(0);
+    return !operation.locked();
 }
 
+esp_err_t wqn::PrepareDisplayForSleep(int64_t deadline_us)
+{
+    // Quiesce closes display-lease acquisition before this is called. Drain an
+    // already accepted frame/result first; powering down ahead of a pending
+    // refresh would turn an accepted revision into an invisible success.
+    while (::device_ui_internal::IsEpdRefreshPipelineBusy()) {
+        if (deadline_us > 0 && esp_timer_get_time() >= deadline_us) {
+            return ESP_ERR_TIMEOUT;
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    const int64_t remaining_us = deadline_us > 0
+        ? deadline_us - esp_timer_get_time()
+        : 0;
+    if (deadline_us > 0 && remaining_us <= 0) {
+        return ESP_ERR_TIMEOUT;
+    }
+    const uint32_t timeout_ms = deadline_us > 0
+        ? static_cast<uint32_t>((remaining_us + 999) / 1000)
+        : 0;
+    return TryPowerOffEpd(timeout_ms);
+}
+
+void wqn::RollbackDisplayAfterSleepAbort()
+{
+    // Power-off is a valid Ready state during ordinary runtime. The next
+    // accepted DisplayIntent owns wake/re-init, so rollback must not touch
+    // GPIO6 behind DisplayService's state machine.
+}
+
+void wqn::ReleaseEpdDeepSleepHolds()
+{
+    constexpr gpio_num_t kSpiPins[] = {kEpdSck, kEpdMosi, kEpdCs, kEpdDc, kEpdReset};
+    gpio_hold_dis(kEpdPower);
+    for (gpio_num_t pin : kSpiPins) {
+        gpio_hold_dis(pin);
+    }
+}

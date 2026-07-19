@@ -12,6 +12,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "power_manager.h"
+#include "runtime/sleep_coordinator.h"
 #include "storage.h"
 #include "audio_volume.h"
 
@@ -338,6 +339,13 @@ esp_err_t PlayPcmSamples(const int16_t* samples, size_t count)
 {
     if (samples == nullptr || count == 0) {
         return ESP_ERR_INVALID_ARG;
+    }
+
+    wqn::runtime::SleepLease sleep_lease =
+        wqn::runtime::SleepLease::TryAcquire(
+            wqn::runtime::SleepBlocker::kAudio, "audio-playback", __FILE__, __LINE__);
+    if (!sleep_lease) {
+        return ESP_ERR_INVALID_STATE;
     }
 
     ESP_RETURN_ON_ERROR(InitAudioPlayer(), kTag, "init audio player");

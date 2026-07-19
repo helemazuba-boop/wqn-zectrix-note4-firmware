@@ -19,7 +19,6 @@ esp_err_t RenderFrameToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
     ESP_LOGI(kTag, "RenderFrameToEpd: enter schedule=%s screen=%d", RefreshScheduleName(schedule), static_cast<int>(frame.screen));
     const UBaseType_t hwm_before_render = uxTaskGetStackHighWaterMark(nullptr);
     ESP_LOGI(kTag, "RenderFrameToEpd: stack HWM before render: %u bytes free", static_cast<unsigned>(hwm_before_render * sizeof(StackType_t)));
-    g_last_rendered_screen = frame.screen;
     if (schedule == RefreshSchedule::kClock) {
         if (frame.screen == wqn::UiScreen::kHome) {
             return RenderHomePrimaryRegion(frame.home, schedule);

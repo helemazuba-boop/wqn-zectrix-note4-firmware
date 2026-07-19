@@ -1,8 +1,10 @@
 #include "board_zectrix_note4.h"
 
 #include "driver/gpio.h"
+#include "audio_sleep.h"
 #include "esp_check.h"
 #include "esp_log.h"
+#include "epd_display.h"
 #include "power_manager.h"
 
 namespace {
@@ -60,6 +62,8 @@ namespace wqn {
 esp_err_t InitZectrixNote4SafePins()
 {
     wqn::ReleaseDeepSleepHolds();
+    wqn::ReleaseEpdDeepSleepHolds();
+    wqn::ReleaseAudioDeepSleepHolds();
 
     const uint64_t disabled_power_outputs =
         (1ULL << kEpdPower) |

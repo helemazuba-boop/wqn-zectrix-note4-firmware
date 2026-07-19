@@ -37,13 +37,19 @@ struct CachedAiSession {
     int latency_ms = 0;
 };
 
+struct DeviceControlState {
+    uint64_t config_revision = 0;
+    uint64_t sync_cursor = 0;
+};
+
 esp_err_t InitStorage();
 esp_err_t LoadAccessToken(std::string* token);
 esp_err_t SaveAccessToken(const std::string& token);
 esp_err_t ClearAccessToken();
 bool IsValidAccessToken(const std::string& token);
-bool IsAccessTokenExpired();
 std::string MaskTokenForLog(const std::string& token);
+esp_err_t LoadDeviceControlState(DeviceControlState* state);
+esp_err_t SaveDeviceControlState(const DeviceControlState& state);
 
 esp_err_t SaveProblems(const std::vector<CachedProblem>& problems);
 esp_err_t LoadProblems(std::vector<CachedProblem>* problems);
@@ -70,5 +76,10 @@ esp_err_t LoadWifiCredentials(std::string* ssid, std::string* password);
 esp_err_t SaveWifiCredentials(const std::string& ssid, const std::string& password);
 esp_err_t ClearWifiCredentials();
 bool HasWifiCredentials();
+
+// M3 compatibility boundary. Writes are synchronous and each public write
+// transaction holds kStorage, so Ready means every accepted commit is durable.
+esp_err_t PrepareStorageForSleep(int64_t deadline_us);
+void RollbackStorageAfterSleepAbort();
 
 }  // namespace wqn

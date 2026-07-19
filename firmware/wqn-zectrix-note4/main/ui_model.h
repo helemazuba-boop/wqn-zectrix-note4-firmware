@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
@@ -234,6 +235,7 @@ struct UiRuntimeStatus {
     bool syncing = false;
     int pending_reviews = 0;
     std::string token_mask;
+    std::string claim_code;
     std::string last_sync_status;
 };
 
@@ -249,9 +251,24 @@ struct StatusBarEditState {
                                 // confirm within kStatusBarEditDblMs = save & exit
 };
 
-struct UiState {
+// Reducer-owned gesture memory. Keeping these values inside AppState removes
+// hidden file-static history from button reduction, so replaying the same
+// timestamped input sequence starts from and produces the same state.
+struct UiGestureState {
+    bool flash_ptt_started = false;
+    int64_t last_ai_confirm_tap_ms = 0;
+};
+
+// M4: the application state has exactly one owner (UiRuntime on DeviceUiTask).
+// `revision` is advanced by the reducer for every accepted state mutation and
+// is also used as the revision of the resulting DisplayIntent.  Keep the
+// UiState alias during page-by-page migration so render code does not need a
+// flag-day rename.
+struct AppState {
+    uint64_t revision = 0;
     UiScreen screen = UiScreen::kHome;
     StatusBarEditState status_edit;
+    UiGestureState gestures;
     size_t selected_home_task = 0;
     size_t selected_problem = 0;
     ReviewChoice selected_review = ReviewChoice::kNeedsReview;
@@ -265,6 +282,8 @@ struct UiState {
     HomeSummary home;
     std::vector<CachedProblem> problems;
 };
+
+using UiState = AppState;
 
 struct UiLine {
     UiTextStyle style = UiTextStyle::kBody;

@@ -4,6 +4,7 @@
 #include <vector>
 
 #include "esp_err.h"
+#include "device_protocol/v3.h"
 
 namespace wqn {
 
@@ -279,6 +280,27 @@ struct WqnAiChatResponse {
 };
 
 esp_err_t RunPairingFlowIfNeeded();
+esp_err_t StartDeviceClaimV3(
+    const protocol::v3::RequestMetadata& metadata,
+    const std::string& hardware_id,
+    const std::string& device_public_key,
+    protocol::v3::ClaimStartData* data,
+    protocol::v3::Error* error);
+esp_err_t PollDeviceClaimV3(
+    const protocol::v3::RequestMetadata& metadata,
+    const std::string& claim_id,
+    protocol::v3::ClaimPollData* data,
+    protocol::v3::Error* error);
+esp_err_t BootstrapDeviceControlV3(
+    const std::string& token,
+    const protocol::v3::RequestMetadata& metadata,
+    protocol::v3::BootstrapData* data,
+    protocol::v3::Error* error);
+esp_err_t SyncDeviceControlV3(
+    const std::string& token,
+    const protocol::v3::RequestMetadata& metadata,
+    protocol::v3::SyncData* data,
+    protocol::v3::Error* error);
 esp_err_t ProbeSyncAndClearTokenOnUnauthorized(const std::string& token);
 esp_err_t SyncDueProblemIds(const std::string& token, std::vector<std::string>* due_problem_ids, int* total);
 esp_err_t FetchProblems(const std::string& token, const std::vector<std::string>& problem_ids, std::vector<WqnProblem>* problems);

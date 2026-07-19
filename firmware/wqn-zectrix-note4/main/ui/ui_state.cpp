@@ -9,8 +9,8 @@
 
 #include "esp_log.h"
 #include "online_sync.h"
+#include "services/connectivity_service.h"
 #include "storage.h"
-#include "wifi_manager.h"
 #include "word_app.h"
 #include "wqn_api.h"
 
@@ -47,7 +47,7 @@ void BuildHomeSummary(wqn::UiState* state)
     wqn::HomeSummary home;
     home.wifi_label = state->status.wifi_connected ? "WiFi" : "离线";
     home.wifi_connected = state->status.wifi_connected;
-    home.wifi_rssi = wqn::GetWifiRssi();
+    home.wifi_rssi = wqn::services::GetConnectivityRssi();
     BatteryReading battery = {};
     if (ReadBatteryStatus(&battery)) {
         home.battery_label = BatteryLabel(battery);
@@ -68,9 +68,13 @@ void BuildHomeSummary(wqn::UiState* state)
     home.todo_metric.label = "今日 Todo";
     home.word_metric.value = wqn::WordAppProgressLabel(state->word_app);
     home.word_metric.label = "单词进度";
-    home.current_status =
-        "本地 " + std::to_string(state->problems.size()) + " 题 · 待上传 " +
-        std::to_string(state->status.pending_reviews);
+    if (!state->status.paired && !state->status.claim_code.empty()) {
+        home.current_status = "配对码 " + state->status.claim_code + " · 请在网页确认";
+    } else {
+        home.current_status =
+            "本地 " + std::to_string(state->problems.size()) + " 题 · 待上传 " +
+            std::to_string(state->status.pending_reviews);
+    }
 
     home.tasks.clear();
     if (!state->problems.empty()) {
@@ -133,14 +137,18 @@ bool LoadUiState(wqn::UiState* state)
     if (result == ESP_OK && !token.empty() && wqn::IsValidAccessToken(token)) {
         state->status.paired = true;
         state->status.token_mask = wqn::MaskTokenForLog(token);
+        state->status.claim_code.clear();
     } else {
         state->status.paired = false;
         state->status.token_mask.clear();
+        wqn::OnlineSyncSnapshot sync_snapshot;
+        wqn::GetOnlineSyncSnapshot(&sync_snapshot);
+        state->status.claim_code = sync_snapshot.claim_code;
     }
 
 #if CONFIG_WQN_WIFI_STA_ENABLE
     state->status.wifi_enabled = true;
-    state->status.wifi_connected = wqn::IsWifiStationConnected();
+    state->status.wifi_connected = wqn::services::IsConnectivityOnline();
 #else
     state->status.wifi_enabled = false;
     state->status.wifi_connected = false;

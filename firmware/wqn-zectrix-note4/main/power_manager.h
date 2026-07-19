@@ -15,8 +15,8 @@ void NoteEpdActivity();
 bool IsUiIdleForSleep();
 bool IsUiIdleForSleepEx(int extra_idle_ms);
 
-esp_err_t PrepareForDeepSleep(bool enable_timer_wakeup = true);
-void EnterDeepSleepIfEnabled(bool enable_timer_wakeup = true);
+esp_err_t StartPowerCoordinator();
+void SetDeepSleepTimerWakePreference(bool enabled);
 void PowerOffEpdAfterIdleIfNeeded();
 void ShutdownForBatteryDepleted();
 

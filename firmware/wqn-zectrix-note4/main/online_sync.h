@@ -15,6 +15,8 @@ struct OnlineSyncSnapshot {
     int64_t last_started_ms = 0;
     int64_t last_finished_ms = 0;
     char status[64] = {};
+    char claim_code[9] = {};
+    uint64_t claim_expires_at_ms = 0;
 };
 
 void NotifyOnlineSyncRequested();

@@ -14,7 +14,6 @@ namespace device_ui_internal {
 
 constexpr char kTag[] = "wqn_ui";
 constexpr int64_t kRepeatedLongPressMinDurationMs = 1150;
-static bool g_flash_ptt_started = false;  // [mistouch] true only after kHoldPress (200ms)
 
 RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiState* state)
 {
@@ -236,9 +235,11 @@ static void CycleAiStatusBarToggleReverse(wqn::UiState* state, uint8_t index)
 // short-confirm = cycle selected toggle; up/down = move selection (wrap 0..2);
 // long-confirm (release) = exit. Edge events (Press/Release) are consumed so
 // Flash PTT never fires mid-edit (though edit mode is only entered on Std/Pro).
-static RefreshSchedule ApplyStatusBarEditEvent(const wqn::ButtonEvent& event, wqn::UiState* state)
+static RefreshSchedule ApplyStatusBarEditEvent(
+    const wqn::ButtonEvent& event,
+    int64_t now_ms,
+    wqn::UiState* state)
 {
-    const int64_t now_ms = esp_timer_get_time() / 1000;
     if (event.button == wqn::ButtonId::kConfirm) {
         if (event.type == wqn::ButtonEventType::kShortPress) {
             // [tier] index 0 = cycle tier (immediate switch + exit, no double-click).
@@ -320,7 +321,10 @@ static RefreshSchedule ApplyStatusBarEditEvent(const wqn::ButtonEvent& event, wq
     return RefreshSchedule::kNone;
 }
 
-RefreshSchedule ApplyButtonEvent(const wqn::ButtonEvent& event, wqn::UiState* state)
+RefreshSchedule ApplyButtonEvent(
+    const wqn::ButtonEvent& event,
+    int64_t event_time_ms,
+    wqn::UiState* state)
 {
     if (state == nullptr || !event.HasEvent()) {
         return RefreshSchedule::kNone;
@@ -328,7 +332,7 @@ RefreshSchedule ApplyButtonEvent(const wqn::ButtonEvent& event, wqn::UiState* st
 
     // [shell] Status-bar edit mode intercepts all input on the AI page.
     if (state->screen == wqn::UiScreen::kAi && state->status_edit.active) {
-        return ApplyStatusBarEditEvent(event, state);
+        return ApplyStatusBarEditEvent(event, event_time_ms, state);
     }
 
     const size_t old_page = state->ai.page;
@@ -384,16 +388,17 @@ RefreshSchedule ApplyButtonEvent(const wqn::ButtonEvent& event, wqn::UiState* st
             if (event.type == wqn::ButtonEventType::kPress) {
                 // Reset a stale candidate left by a screen/tier transition
                 // before this physical press starts a new PTT gesture.
-                g_flash_ptt_started = false;
+                state->gestures.flash_ptt_started = false;
                 return RefreshSchedule::kNone;
             }
             if (event.type == wqn::ButtonEventType::kHoldPress) {
                 wqn::OnFlashButtonPressed();
-                g_flash_ptt_started = true;
+                state->gestures.flash_ptt_started = true;
                 return RefreshSchedule::kAi;
             }
-            if (event.type == wqn::ButtonEventType::kRelease && g_flash_ptt_started) {
-                g_flash_ptt_started = false;
+            if (event.type == wqn::ButtonEventType::kRelease &&
+                state->gestures.flash_ptt_started) {
+                state->gestures.flash_ptt_started = false;
                 wqn::OnFlashButtonReleased(true);
                 return RefreshSchedule::kAi;
             }
@@ -411,7 +416,7 @@ RefreshSchedule ApplyButtonEvent(const wqn::ButtonEvent& event, wqn::UiState* st
     // would enter edit mode and swallow the raw release, leaving capture on.
     if (state->screen == wqn::UiScreen::kAi &&
         state->ai.tier == wqn::AiTier::kFlash &&
-        event.button == wqn::ButtonId::kConfirm && g_flash_ptt_started &&
+        event.button == wqn::ButtonId::kConfirm && state->gestures.flash_ptt_started &&
         (event.type == wqn::ButtonEventType::kShortPress ||
          event.type == wqn::ButtonEventType::kDoublePress ||
          event.type == wqn::ButtonEventType::kLongRelease)) {
@@ -439,34 +444,33 @@ RefreshSchedule ApplyButtonEvent(const wqn::ButtonEvent& event, wqn::UiState* st
     // works too: the mis-touch filter (<200ms) discards the PTT captures of the
     // two short taps, so no voice is submitted. Fast double-press (<500ms) is
     // caught as kDoublePress directly; slow (two kShortPress within 1s) below.
-    static int64_t last_ai_confirm_tap_ms = 0;
     constexpr int64_t kAiStatusBarEditWindowMs = 1000;
     if (state->screen == wqn::UiScreen::kAi &&
         event.button == wqn::ButtonId::kConfirm &&
         event.type == wqn::ButtonEventType::kDoublePress) {
-        const int64_t now_ms = esp_timer_get_time() / 1000;
         state->status_edit.active = true;
         state->status_edit.selected = 0;
-        state->status_edit.last_action_ms = now_ms;
+        state->status_edit.last_action_ms = event_time_ms;
         state->status_edit.last_cycle_ms = 0;
-        last_ai_confirm_tap_ms = 0;
+        state->gestures.last_ai_confirm_tap_ms = 0;
         ESP_LOGI(kTag, "AI status-bar edit: enter (fast double-press)");
         return RefreshSchedule::kSelection;
     }
     if (state->screen == wqn::UiScreen::kAi &&
         event.type == wqn::ButtonEventType::kShortPress &&
         event.button == wqn::ButtonId::kConfirm) {
-        const int64_t now_ms = esp_timer_get_time() / 1000;
-        if (now_ms - last_ai_confirm_tap_ms <= kAiStatusBarEditWindowMs) {
+        if (state->gestures.last_ai_confirm_tap_ms > 0 &&
+            event_time_ms - state->gestures.last_ai_confirm_tap_ms <=
+            kAiStatusBarEditWindowMs) {
             state->status_edit.active = true;
             state->status_edit.selected = 0;
-            state->status_edit.last_action_ms = now_ms;
+            state->status_edit.last_action_ms = event_time_ms;
             state->status_edit.last_cycle_ms = 0;
-            last_ai_confirm_tap_ms = 0;
+            state->gestures.last_ai_confirm_tap_ms = 0;
             ESP_LOGI(kTag, "AI status-bar edit: enter (double-confirm)");
             return RefreshSchedule::kSelection;
         }
-        last_ai_confirm_tap_ms = now_ms;
+        state->gestures.last_ai_confirm_tap_ms = event_time_ms;
         // fall through: first tap acts normally
     }
 
@@ -503,13 +507,13 @@ RefreshSchedule ApplyButtonEvent(const wqn::ButtonEvent& event, wqn::UiState* st
                 state->ai.status = wqn::AiSessionStatus::kError;
                 state->ai.assistant_text = "AI 录音停止失败";
                 state->ai.pending_text.clear();
-                state->ai.status_since_ms = esp_timer_get_time() / 1000;
+                state->ai.status_since_ms = event_time_ms;
             }
             return RefreshSchedule::kAi;
         }
 #else
         state->ai.status = wqn::AiSessionStatus::kWaitingReply;
-        state->ai.status_since_ms = esp_timer_get_time() / 1000;
+        state->ai.status_since_ms = event_time_ms;
         if (state->ai.pending_text.empty()) {
             state->ai.pending_text = "AI 功能未启用";
         }
@@ -649,6 +653,8 @@ RefreshSchedule ApplyButtonEvent(const wqn::ButtonEvent& event, wqn::UiState* st
     }
 
     if (state->screen != old_screen) {
+        state->gestures.flash_ptt_started = false;
+        state->gestures.last_ai_confirm_tap_ms = 0;
         if (state->screen == wqn::UiScreen::kTodo) {
             RefreshTodosFromCloud(state);
         } else if (state->screen == wqn::UiScreen::kWord && state->word_app.cloud_sync_requested) {

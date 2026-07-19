@@ -8,6 +8,7 @@
 #include <ctime>
 #include <random>
 #include <string>
+#include <utility>
 
 #include "ai_history.h"
 #include "audio_capture.h"
@@ -17,8 +18,9 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "runtime/sleep_coordinator.h"
+#include "services/connectivity_service.h"
 #include "storage.h"
-#include "wifi_manager.h"
 #include "wqn_api.h"
 
 namespace {
@@ -42,6 +44,7 @@ bool g_recording_requested = false;
 uint32_t g_prepare_generation = 0;
 bool g_streaming_active = false;        // true while SubmitTask is parsing SSE events
 bool g_streaming_force_full_render = false; // when true the next UI tick does a full refresh
+wqn::runtime::SleepLease g_ai_sleep_lease;
 std::string g_pending_tool_label;        // "🔧 create_todo…" or "✅ ..." for status bar
 int64_t g_tool_clear_at_ms = 0;          // scheduled status-bar clear
 
@@ -114,6 +117,24 @@ void MarkChanged()
     g_changed = true;
 }
 
+void ReleaseAiSleepLeaseIfIdleLocked()
+{
+    const bool state_active =
+        g_state.status == wqn::AiSessionStatus::kListening ||
+        g_state.status == wqn::AiSessionStatus::kWaitingReply ||
+        g_state.status == wqn::AiSessionStatus::kStreaming;
+    if (!g_prepare_active && g_prepare_task == nullptr && g_submit_task == nullptr &&
+        !g_streaming_active && !state_active) {
+        g_ai_sleep_lease.Reset();
+    }
+}
+
+void FinishSubmitTaskLocked()
+{
+    g_submit_task = nullptr;
+    ReleaseAiSleepLeaseIfIdleLocked();
+}
+
 void SetStateLocked(wqn::AiSessionStatus status, const std::string& pending, const std::string& user, const std::string& reply)
 {
     g_state.status = status;
@@ -141,6 +162,7 @@ void SetErrorLocked(const std::string& message)
     g_state.status_since_ms = esp_timer_get_time() / 1000;
     g_state.toast_visible = false;
     MarkChanged();
+    ReleaseAiSleepLeaseIfIdleLocked();
 }
 
 std::string RenderStreamingStatusLocked()
@@ -180,6 +202,7 @@ void SetCancelledBeforeRecordingLocked()
     g_state.status_since_ms = esp_timer_get_time() / 1000;
     g_state.toast_visible = false;
     MarkChanged();
+    ReleaseAiSleepLeaseIfIdleLocked();
 }
 
 // ============================================================================
@@ -398,8 +421,11 @@ void FinishPrepareTaskLocked(uint32_t generation)
 {
     if (generation == g_prepare_generation) {
         g_prepare_active = false;
+    }
+    if (g_prepare_task == xTaskGetCurrentTaskHandle() || generation == g_prepare_generation) {
         g_prepare_task = nullptr;
     }
+    ReleaseAiSleepLeaseIfIdleLocked();
 }
 
 bool HasEffectiveSpeech(const wqn::AudioCaptureChunk& audio)
@@ -597,7 +623,7 @@ void SubmitTask(void*)
     if (result != ESP_OK) {
         wqn::ReleaseAudioCapturePower();
         SetErrorLocked("录音停止失败");
-        g_submit_task = nullptr;
+        FinishSubmitTaskLocked();
         xSemaphoreGive(g_lock);
         vTaskDelete(nullptr);
         return;
@@ -613,7 +639,7 @@ void SubmitTask(void*)
     if (audio.duration_ms < kMinAudioDurationMs || audio.samples.empty()) {
         wqn::ReleaseAudioCapturePower();
         SetErrorLocked("录音太短");
-        g_submit_task = nullptr;
+        FinishSubmitTaskLocked();
         xSemaphoreGive(g_lock);
         vTaskDelete(nullptr);
         return;
@@ -622,7 +648,7 @@ void SubmitTask(void*)
     if (!HasEffectiveSpeech(audio)) {
         wqn::ReleaseAudioCapturePower();
         SetErrorLocked("未检测到有效语音");
-        g_submit_task = nullptr;
+        FinishSubmitTaskLocked();
         xSemaphoreGive(g_lock);
         vTaskDelete(nullptr);
         return;
@@ -658,7 +684,7 @@ void SubmitTask(void*)
         xSemaphoreTake(g_lock, portMAX_DELAY);
         g_streaming_active = false;
         SetErrorLocked("设备未配对");
-        g_submit_task = nullptr;
+        FinishSubmitTaskLocked();
         xSemaphoreGive(g_lock);
         vTaskDelete(nullptr);
         return;
@@ -811,7 +837,7 @@ void SubmitTask(void*)
         }
     }
 
-    g_submit_task = nullptr;
+    FinishSubmitTaskLocked();
     xSemaphoreGive(g_lock);
     vTaskDelete(nullptr);
 }
@@ -836,9 +862,9 @@ void PrepareRecordingTask(void* parameter)
         failure = PrepareFailure::kInvalidToken;
         result = ESP_ERR_INVALID_STATE;
     } else {
-        result = wqn::StartWifiStationIfEnabled();
-        if (result == ESP_OK && !wqn::IsWifiStationConnected()) {
-            result = wqn::WaitForWifiStationConnected(kWifiReadyWait);
+        result = wqn::services::StartConnectivity();
+        if (result == ESP_OK && !wqn::services::IsConnectivityOnline()) {
+            result = wqn::services::WaitForConnectivity(kWifiReadyWait);
         }
         if (result != ESP_OK) {
             failure = PrepareFailure::kWifi;
@@ -960,13 +986,18 @@ esp_err_t StartAiRecordingSession()
 
     xSemaphoreTake(g_lock, portMAX_DELAY);
     if (g_state.status == AiSessionStatus::kListening || g_state.status == AiSessionStatus::kWaitingReply ||
-        g_submit_task != nullptr || g_prepare_active) {
+        g_submit_task != nullptr || g_prepare_task != nullptr || g_prepare_active) {
         xSemaphoreGive(g_lock);
         return ESP_ERR_INVALID_STATE;
     }
-    xSemaphoreGive(g_lock);
-
-    xSemaphoreTake(g_lock, portMAX_DELAY);
+    wqn::runtime::SleepLease sleep_lease =
+        wqn::runtime::SleepLease::TryAcquire(
+            wqn::runtime::SleepBlocker::kAiSession, "ai-session", __FILE__, __LINE__);
+    if (!sleep_lease) {
+        xSemaphoreGive(g_lock);
+        return ESP_ERR_INVALID_STATE;
+    }
+    g_ai_sleep_lease = std::move(sleep_lease);
     g_state.status = AiSessionStatus::kWaitingReply;
     g_state.user_text.clear();
     g_state.assistant_text.clear();
@@ -1018,7 +1049,6 @@ esp_err_t StopAiRecordingAndSubmit()
         g_recording_requested = false;
         ++g_prepare_generation;
         g_prepare_active = false;
-        g_prepare_task = nullptr;
         SetCancelledBeforeRecordingLocked();
         xSemaphoreGive(g_lock);
         return ESP_OK;
@@ -1147,6 +1177,7 @@ void ClearAiConversationContext()
     g_state.toast_visible = false;
     g_state.toast_label.clear();
     wqn::GetAiHistory(wqn::AiHistoryChannel::kStdPro).Clear();
+    ReleaseAiSleepLeaseIfIdleLocked();
     MarkChanged();
     xSemaphoreGive(g_lock);
 }
@@ -1182,6 +1213,20 @@ bool CopyAiStreamingStatus(AiStreamingStatusView* view)
     }
     xSemaphoreGive(g_lock);
     return true;
+}
+
+bool IsAiSessionActive()
+{
+    if (g_lock == nullptr) {
+        return false;
+    }
+    xSemaphoreTake(g_lock, portMAX_DELAY);
+    const bool active =
+        g_prepare_active || g_prepare_task != nullptr || g_submit_task != nullptr ||
+        g_streaming_active || g_state.status == AiSessionStatus::kListening ||
+        g_state.status == AiSessionStatus::kWaitingReply;
+    xSemaphoreGive(g_lock);
+    return active;
 }
 
 // ============================================================================

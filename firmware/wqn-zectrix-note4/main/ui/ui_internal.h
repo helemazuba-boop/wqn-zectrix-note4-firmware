@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <ctime>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include "esp_err.h"
@@ -30,6 +31,7 @@
 #include "power_manager.h"
 #include "ui_layout.h"
 #include "typography.h"
+#include "display/display_types.h"
 
 namespace device_ui_internal {
 
@@ -44,6 +46,7 @@ enum class RefreshSchedule {
     kClock,
     kSelection,
     kTimer,
+    kCoalesced,
     kCommit,
     kImmediate,
 };
@@ -173,11 +176,26 @@ struct WordCloudResult {
     std::string message;
 };
 
-void SendTodoCloudResult(TodoCloudResult* result);
-void SendWordCloudResult(WordCloudResult* result);
+struct TodoCloudResultReady {
+    uint32_t generation = 0;
+};
+
+struct WordCloudResultReady {
+    uint32_t generation = 0;
+};
+
+static_assert(std::is_trivially_copyable_v<TodoCloudResultReady>);
+static_assert(std::is_trivially_copyable_v<WordCloudResultReady>);
+
+void SendTodoCloudResult();
+void SendWordCloudResult();
+const TodoCloudResult* PeekTodoCloudResult(uint32_t generation);
+const WordCloudResult* PeekWordCloudResult(uint32_t generation);
 
 bool IsTodoCloudBusy();
 bool IsWordCloudBusy();
+void FinishTodoCloudRequest();
+void FinishWordCloudRequest();
 
 bool QueueTodoCloudRequest(const TodoCloudRequest& request);
 bool QueueWordCloudRequest(const WordCloudRequest& request);
@@ -213,15 +231,25 @@ bool TimeAppStructureChanged(const wqn::TimeAppState& before, const wqn::TimeApp
 bool ShouldRefreshTimeTick(const wqn::UiState& state);
 bool ScreenUsesClockMinute(const wqn::UiState& state);
 
-RefreshSchedule ApplyButtonEvent(const wqn::ButtonEvent& event, wqn::UiState* state);
+RefreshSchedule ApplyButtonEvent(
+    const wqn::ButtonEvent& event,
+    int64_t event_time_ms,
+    wqn::UiState* state);
 
 void OpenSettingsDialog(wqn::UiState* state, wqn::SettingsDialog dialog);
 
 // ---- Render -----------------------------------------------------------------
 
 esp_err_t RenderFrameToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule);
-bool RequestEpdUiRefresh(const wqn::UiFrame& frame, const std::string& signature, RefreshSchedule schedule);
+wqn::display::DisplaySubmission RequestEpdUiRefresh(
+    const wqn::UiFrame& frame,
+    const std::string& signature,
+    wqn::display::DisplayRevision revision,
+    RefreshSchedule schedule,
+    wqn::display::WaveformRequirement waveform);
+void AcknowledgeDisplayResult(wqn::display::DisplayRevision revision);
 void EpdRefreshTask(void*);
+bool IsEpdRefreshPipelineBusy();
 void DeviceUiTask(void*);
 
 std::string FrameSignature(const wqn::UiFrame& frame);
@@ -351,11 +379,12 @@ extern TaskHandle_t g_todo_task;
 extern QueueHandle_t g_word_request_queue;
 extern QueueHandle_t g_word_result_queue;
 extern TaskHandle_t g_word_task;
+extern QueueHandle_t g_display_result_queue;
 extern wqn::UiFrame g_pending_frames[2];
 extern std::string g_pending_signatures[2];
+extern wqn::display::DisplayIntent g_pending_intents[2];
 extern std::atomic<int> g_consumer_index;
 extern bool g_refresh_pending;
-extern bool g_refresh_busy;
 extern int g_rtc_screen_val;
 extern TickType_t g_refresh_due_tick;
 extern RefreshSchedule g_refresh_schedule;
@@ -363,14 +392,13 @@ extern RefreshSchedule g_refresh_schedule;
 struct SecondarySlot {
     wqn::UiFrame frame;
     std::string signature;
+    wqn::display::DisplayIntent intent;
     RefreshSchedule schedule = RefreshSchedule::kNone;
     TickType_t due_tick = 0;
     bool pending = false;
 };
 extern SecondarySlot g_secondary;
 
-extern volatile bool g_todo_cloud_busy;
-extern volatile bool g_word_cloud_busy;
 extern volatile wqn::UiScreen g_last_rendered_screen;
 
 }  // namespace device_ui_internal

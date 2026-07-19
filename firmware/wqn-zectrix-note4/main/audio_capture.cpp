@@ -17,6 +17,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "power_manager.h"
+#include "runtime/sleep_coordinator.h"
 
 namespace {
 
@@ -86,6 +87,7 @@ struct AudioServiceState {
     i2s_chan_handle_t rx = nullptr;
     esp_timer_handle_t power_timer = nullptr;
     wqn::AudioCaptureChunk chunk;
+    wqn::runtime::SleepLease sleep_lease;
 };
 
 AudioServiceState g_audio;
@@ -449,6 +451,7 @@ void CaptureTask(void*)
         xSemaphoreTake(g_audio.mutex, portMAX_DELAY);
         g_audio.running = false;
         g_audio.task = nullptr;
+        g_audio.sleep_lease.Reset();
         xSemaphoreGive(g_audio.mutex);
         vTaskDelete(nullptr);
         return;
@@ -524,6 +527,7 @@ void CaptureTask(void*)
     const int logged_rms = g_audio.chunk.rms;
     g_audio.running = false;
     g_audio.task = nullptr;
+    g_audio.sleep_lease.Reset();
     xSemaphoreGive(g_audio.mutex);
     ESP_LOGI(
         kTag,
@@ -554,6 +558,14 @@ esp_err_t StartAudioCapture()
         xSemaphoreGive(g_audio.mutex);
         return ESP_ERR_INVALID_STATE;
     }
+    wqn::runtime::SleepLease sleep_lease =
+        wqn::runtime::SleepLease::TryAcquire(
+            wqn::runtime::SleepBlocker::kAudio, "audio-capture", __FILE__, __LINE__);
+    if (!sleep_lease) {
+        xSemaphoreGive(g_audio.mutex);
+        return ESP_ERR_INVALID_STATE;
+    }
+    g_audio.sleep_lease = std::move(sleep_lease);
     g_audio.running = true;
     g_audio.stop_requested = false;
     g_audio.initialized = false;
@@ -566,6 +578,7 @@ esp_err_t StartAudioCapture()
     if (created != pdPASS) {
         g_audio.running = false;
         g_audio.task = nullptr;
+        g_audio.sleep_lease.Reset();
         xSemaphoreGive(g_audio.mutex);
         return ESP_ERR_NO_MEM;
     }

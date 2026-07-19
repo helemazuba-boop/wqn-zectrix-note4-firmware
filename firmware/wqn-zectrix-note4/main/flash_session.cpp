@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstring>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "audio_player.h"
@@ -29,9 +30,10 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "power_manager.h"
+#include "runtime/sleep_coordinator.h"
+#include "services/connectivity_service.h"
 #include "storage.h"
 #include "audio_volume.h"
-#include "wifi_manager.h"
 
 namespace {
 
@@ -174,6 +176,7 @@ struct FlashState {
 };
 
 FlashState g_flash;
+wqn::runtime::SleepLease g_flash_sleep_lease;
 
 bool EnsureFlashThinkingHistoryLocked(int64_t now_ms)
 {
@@ -1894,7 +1897,10 @@ esp_err_t InitFlashSession()
 esp_err_t StartFlashSession()
 {
     if (g_flash.mutex == nullptr) {
-        InitFlashSession();
+        const esp_err_t init_result = InitFlashSession();
+        if (init_result != ESP_OK) {
+            return init_result;
+        }
     }
 
     xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
@@ -1908,47 +1914,58 @@ esp_err_t StartFlashSession()
         return ESP_ERR_INVALID_STATE;
     }
 
-    // [i2s-conflict-fix] audio_player.cpp holds I2S_NUM_0 open after
-    // playing word pronunciation or system sounds. Flash needs the same
-    // port for duplex (RX+TX). Force-release it before we try to init.
-    wqn::StopAudioPlayback();
-
-    esp_err_t result = StartWifiStationIfEnabled();
-    if (result != ESP_OK) {
-        result = WaitForWifiStationConnected(kWifiReadyWait);
-        if (result != ESP_OK) {
-            xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
-            SetErrorLocked("WiFi 未就绪");
-            xSemaphoreGive(g_flash.mutex);
-            return result;
-        }
-    } else if (!IsWifiStationConnected()) {
-        result = WaitForWifiStationConnected(kWifiReadyWait);
-        if (result != ESP_OK) {
-            xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
-            SetErrorLocked("WiFi 未连接");
-            xSemaphoreGive(g_flash.mutex);
-            return result;
-        }
+    wqn::runtime::SleepLease sleep_lease =
+        wqn::runtime::SleepLease::TryAcquire(
+            wqn::runtime::SleepBlocker::kFlashSession, "flash-session", __FILE__, __LINE__);
+    if (!sleep_lease) {
+        xSemaphoreGive(g_flash.mutex);
+        return ESP_ERR_INVALID_STATE;
     }
-
+    g_flash_sleep_lease = std::move(sleep_lease);
     g_flash.status = InternalStatus::kConnecting;
     g_flash.pending_text = "正在连接...";
     g_flash.error_message.clear();
     g_flash.user_transcript.clear();
     g_flash.assistant_text.clear();
     g_flash.thinking_text.clear();
-    g_flash.response_in_flight = false;  // [inflight-fix] reset on new session
+    g_flash.response_in_flight = false;
     g_flash.response_started = false;
     g_flash.status_since_ms = esp_timer_get_time() / 1000;
     MarkChanged();
     xSemaphoreGive(g_flash.mutex);
+
+    // [i2s-conflict-fix] audio_player.cpp holds I2S_NUM_0 open after
+    // playing word pronunciation or system sounds. Flash needs the same
+    // port for duplex (RX+TX). Force-release it before we try to init.
+    wqn::StopAudioPlayback();
+
+    esp_err_t result = services::StartConnectivity();
+    if (result != ESP_OK) {
+        result = services::WaitForConnectivity(kWifiReadyWait);
+        if (result != ESP_OK) {
+            xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+            SetErrorLocked("WiFi 未就绪");
+            g_flash_sleep_lease.Reset();
+            xSemaphoreGive(g_flash.mutex);
+            return result;
+        }
+    } else if (!services::IsConnectivityOnline()) {
+        result = services::WaitForConnectivity(kWifiReadyWait);
+        if (result != ESP_OK) {
+            xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+            SetErrorLocked("WiFi 未连接");
+            g_flash_sleep_lease.Reset();
+            xSemaphoreGive(g_flash.mutex);
+            return result;
+        }
+    }
 
     std::string access_token;
     esp_err_t tok_err = wqn::LoadAccessToken(&access_token);
     if (tok_err != ESP_OK || access_token.empty()) {
         xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
         SetErrorLocked("未登录，请先完成账号配对");
+        g_flash_sleep_lease.Reset();
         xSemaphoreGive(g_flash.mutex);
         return ESP_ERR_INVALID_STATE;
     }
@@ -1988,6 +2005,7 @@ esp_err_t StartFlashSession()
     if (g_flash.ws_client == nullptr) {
         xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
         SetErrorLocked("WS 客户端初始化失败");
+        g_flash_sleep_lease.Reset();
         xSemaphoreGive(g_flash.mutex);
         return ESP_ERR_NO_MEM;
     }
@@ -2013,6 +2031,7 @@ esp_err_t StartFlashSession()
         g_flash.ws_client = nullptr;
         xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
         SetErrorLocked("WS 事件注册失败");
+        g_flash_sleep_lease.Reset();
         xSemaphoreGive(g_flash.mutex);
         return reg_err;
     }
@@ -2023,6 +2042,7 @@ esp_err_t StartFlashSession()
         g_flash.ws_client = nullptr;
         xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
         SetErrorLocked("WS 连接失败");
+        g_flash_sleep_lease.Reset();
         xSemaphoreGive(g_flash.mutex);
         return result;
     }
@@ -2095,6 +2115,10 @@ esp_err_t StopFlashSession()
         }
     }
     TearDownStreamChannels();
+
+    xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+    g_flash_sleep_lease.Reset();
+    xSemaphoreGive(g_flash.mutex);
 
     ESP_LOGI(kTag, "flash session stopped");
     return ESP_OK;
@@ -2191,6 +2215,22 @@ bool IsFlashTranscribing()
     const bool transcribing = g_flash.capture_started && g_flash.ws_connected;
     xSemaphoreGive(g_flash.mutex);
     return transcribing;
+}
+
+bool IsFlashSessionActive()
+{
+    if (g_flash.mutex == nullptr) {
+        return false;
+    }
+    xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+    const bool active =
+        g_flash.ws_client != nullptr || g_flash.status == InternalStatus::kConnecting ||
+        g_flash.status == InternalStatus::kSessionUpdating ||
+        g_flash.status == InternalStatus::kStreaming || g_flash.capture_started ||
+        g_flash.response_in_flight || g_flash.playback_write_active ||
+        g_flash.playback_queued_bytes.load(std::memory_order_acquire) > 0;
+    xSemaphoreGive(g_flash.mutex);
+    return active;
 }
 
 void PollFlashAmpIdle()

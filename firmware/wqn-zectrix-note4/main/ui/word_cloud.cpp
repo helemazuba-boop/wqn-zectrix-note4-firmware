@@ -6,11 +6,11 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
-#include <new>
 #include <string>
 
 #include "esp_log.h"
 #include "esp_spiffs.h"
+#include "runtime/sleep_coordinator.h"
 #include "word_pack.h"
 #include "wqn_api.h"
 
@@ -21,22 +21,44 @@ constexpr char kTag[] = "wqn_ui";
 QueueHandle_t g_word_request_queue = nullptr;
 QueueHandle_t g_word_result_queue = nullptr;
 TaskHandle_t g_word_task = nullptr;
-volatile bool g_word_cloud_busy = false;
+static std::atomic<bool> g_word_cloud_busy{false};
+wqn::runtime::SleepLease g_word_sleep_lease;
+WordCloudResult g_word_result_slot;
+uint32_t g_word_result_generation = 0;
+
+void FinishWordCloudRequest()
+{
+    g_word_sleep_lease.Reset();
+    g_word_cloud_busy.store(false, std::memory_order_release);
+}
 
 bool IsWordCloudBusy()
 {
-    return g_word_cloud_busy;
+    return g_word_cloud_busy.load(std::memory_order_acquire);
 }
 
 bool QueueWordCloudRequest(const WordCloudRequest& request)
 {
-    if (g_word_request_queue == nullptr || IsWordCloudBusy()) {
+    if (g_word_request_queue == nullptr) {
         return false;
     }
+    bool expected = false;
+    if (!g_word_cloud_busy.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        return false;
+    }
+    wqn::runtime::SleepLease lease =
+        wqn::runtime::SleepLease::TryAcquire(
+            wqn::runtime::SleepBlocker::kWordCloud, "word-cloud", __FILE__, __LINE__);
+    if (!lease) {
+        g_word_cloud_busy.store(false, std::memory_order_release);
+        return false;
+    }
+    g_word_sleep_lease = std::move(lease);
     if (xQueueSend(g_word_request_queue, &request, 0) != pdTRUE) {
+        FinishWordCloudRequest();
         return false;
     }
-    g_word_cloud_busy = true;
     return true;
 }
 
@@ -84,14 +106,21 @@ bool QueueWordAiLookup(const wqn::WqnWordAiLookupRequest& lookup)
     return QueueWordCloudRequest(request);
 }
 
-void SendWordCloudResult(WordCloudResult* result)
+const WordCloudResult* PeekWordCloudResult(uint32_t generation)
 {
-    if (result == nullptr) {
-        return;
+    if (generation == 0 || generation != g_word_result_generation) {
+        return nullptr;
     }
-    if (g_word_result_queue == nullptr || xQueueSend(g_word_result_queue, &result, pdMS_TO_TICKS(100)) != pdTRUE) {
-        g_word_cloud_busy = false;
-        delete result;
+    return &g_word_result_slot;
+}
+
+void SendWordCloudResult()
+{
+    WordCloudResultReady ready;
+    ready.generation = g_word_result_generation;
+    if (g_word_result_queue == nullptr ||
+        xQueueSend(g_word_result_queue, &ready, pdMS_TO_TICKS(100)) != pdTRUE) {
+        FinishWordCloudRequest();
     }
 }
 
@@ -158,30 +187,30 @@ void WordCloudTask(void*)
             continue;
         }
 
-        WordCloudResult* result = new (std::nothrow) WordCloudResult();
-        if (result == nullptr) {
-            g_word_cloud_busy = false;
-            ESP_LOGW(kTag, "alloc Word cloud result failed");
-            continue;
+        g_word_result_slot = WordCloudResult{};
+        ++g_word_result_generation;
+        if (g_word_result_generation == 0) {
+            ++g_word_result_generation;
         }
-        result->op = request.op;
-        std::snprintf(result->word_id, sizeof(result->word_id), "%s", request.word_id);
-        std::snprintf(result->outcome, sizeof(result->outcome), "%s", request.outcome);
-        std::snprintf(result->word, sizeof(result->word), "%s", request.word);
-        result->message.clear();
+        WordCloudResult& result = g_word_result_slot;
+        result.op = request.op;
+        std::snprintf(result.word_id, sizeof(result.word_id), "%s", request.word_id);
+        std::snprintf(result.outcome, sizeof(result.outcome), "%s", request.outcome);
+        std::snprintf(result.word, sizeof(result.word), "%s", request.word);
+        result.message.clear();
 
         std::string token;
         if (!LoadValidTokenForTodo(&token)) {
-            result->auth_required = true;
-            result->result = ESP_ERR_INVALID_STATE;
-            SendWordCloudResult(result);
+            result.auth_required = true;
+            result.result = ESP_ERR_INVALID_STATE;
+            SendWordCloudResult();
             continue;
         }
 
         if (request.op == WordCloudOp::kPackSync) {
             wqn::WqnWordPackManifest manifest;
-            result->result = wqn::FetchWordPackManifest(token, &manifest);
-            if (result->result == ESP_OK) {
+            result.result = wqn::FetchWordPackManifest(token, &manifest);
+            if (result.result == ESP_OK) {
                 size_t total_needed = 0;
                 for (const auto& item : manifest.packs) {
                     if (wqn::WordPackNeedsDownload(item) && item.byte_size > 0) {
@@ -195,68 +224,58 @@ void WordCloudTask(void*)
                         if (available < total_needed) {
                             ESP_LOGW(kTag, "SPIFFS space insufficient: need=%u avail=%u",
                                      static_cast<unsigned>(total_needed), static_cast<unsigned>(available));
-                            result->result = ESP_ERR_NO_MEM;
-                            result->message = "存储空间不足";
+                            result.result = ESP_ERR_NO_MEM;
+                            result.message = "存储空间不足";
                         }
                     }
                 }
 
-                std::vector<std::string> downloaded_stems;
                 for (const wqn::WqnWordPackManifestItem& item : manifest.packs) {
                     if (!wqn::WordPackNeedsDownload(item)) {
                         continue;
                     }
                     std::string pack_body;
-                    result->result = wqn::DownloadWordPack(token, item, &pack_body);
-                    if (result->result != ESP_OK) {
+                    result.result = wqn::DownloadWordPack(token, item, &pack_body);
+                    if (result.result != ESP_OK) {
                         break;
                     }
-                    result->result = wqn::SaveWordPackFromBytes(item, pack_body);
-                    if (result->result != ESP_OK) {
+                    result.result = wqn::SaveWordPackFromBytes(item, pack_body);
+                    if (result.result != ESP_OK) {
                         break;
-                    }
-                    downloaded_stems.push_back(wqn::SafePackStemFromId(item.pack_id));
-                }
-                if (result->result != ESP_OK && !downloaded_stems.empty()) {
-                    ESP_LOGW(kTag, "rolling back %u downloaded packs due to error",
-                             static_cast<unsigned>(downloaded_stems.size()));
-                    for (const std::string& stem : downloaded_stems) {
-                        std::string path = std::string("/storage/wp_") + stem + ".wqwp";
-                        std::remove(path.c_str());
                     }
                 }
             }
-            if (result->result == ESP_OK) {
-                result->result = wqn::SaveWordPackManifest(manifest);
+            if (result.result == ESP_OK) {
+                result.result = wqn::SaveWordPackManifest(manifest);
             }
-            if (result->result == ESP_OK) {
-                result->result = wqn::LoadWordPackIndex(&result->pack_index);
-                result->message = result->pack_index.status_message;
+            if (result.result == ESP_OK) {
+                result.result = wqn::LoadWordPackIndex(&result.pack_index);
+                result.message = result.pack_index.status_message;
             }
         } else if (request.op == WordCloudOp::kSubmit) {
             wqn::WqnWordReviewSubmission submission;
             submission.word_id = request.word_id;
             submission.outcome = request.outcome;
             submission.mode = "sequential";
-            result->result = wqn::SubmitWordReview(token, submission, &result->submit);
+            result.result = wqn::SubmitWordReview(token, submission, &result.submit);
         } else if (request.op == WordCloudOp::kSearch) {
             wqn::WqnWordSearchRequest search;
             search.query = request.query;
             search.limit = 8;
-            result->result = wqn::SearchWords(token, search, &result->search);
+            result.result = wqn::SearchWords(token, search, &result.search);
         } else if (request.op == WordCloudOp::kAiLookup) {
             wqn::WqnWordAiLookupRequest lookup;
             lookup.query = request.query;
-            result->result = wqn::LookupWordWithAi(token, lookup, &result->lookup);
+            result.result = wqn::LookupWordWithAi(token, lookup, &result.lookup);
         } else {
-            result->result = ESP_ERR_INVALID_ARG;
+            result.result = ESP_ERR_INVALID_ARG;
         }
 
-        if (result->result != ESP_OK) {
+        if (result.result != ESP_OK) {
             std::string after_token;
-            result->auth_required = !LoadValidTokenForTodo(&after_token);
+            result.auth_required = !LoadValidTokenForTodo(&after_token);
         }
-        SendWordCloudResult(result);
+        SendWordCloudResult();
     }
 }
 
