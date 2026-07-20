@@ -19,6 +19,7 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_spiffs.h"
+#include "esp_timer.h"
 #include "mbedtls/sha256.h"
 #include "runtime/sleep_coordinator.h"
 #include "services/storage_service.h"
@@ -1278,6 +1279,7 @@ esp_err_t ReadWordPackEntry(const WordPackIndexEntry& index_entry, WqnWordEntry*
     // A card turn performs a bounded SPIFFS seek, JSONL read and cJSON parse.
     // Keep that foreground work off the 40 MHz DFS floor as well.
     auto cpu_lease = runtime::CpuPerformanceLease::TryAcquire();
+    const int64_t started_us = esp_timer_get_time();
     *entry = WqnWordEntry{};
 
     const std::string path = PackPathForStem(index_entry.pack_stem);
@@ -1289,6 +1291,7 @@ esp_err_t ReadWordPackEntry(const WordPackIndexEntry& index_entry, WqnWordEntry*
         std::fclose(file);
         return ESP_FAIL;
     }
+    const int64_t opened_us = esp_timer_get_time();
     // [stack-fix] 4 KB on the stack + the deep fgets->SPIFFS->esp_partition_read
     // ->tlsf_walk_pool call chain overflowed the 8 KB task stack and corrupted
     // the adjacent heap (crash in tlsf_walk_pool reading a smashed block header).
@@ -1297,6 +1300,7 @@ esp_err_t ReadWordPackEntry(const WordPackIndexEntry& index_entry, WqnWordEntry*
     std::string line;
     const esp_err_t line_result = ReadBoundedPackLine(file, &line_buffer, &line);
     std::fclose(file);
+    const int64_t read_us = esp_timer_get_time();
     if (line_result != ESP_OK) {
         return line_result;
     }
@@ -1307,6 +1311,14 @@ esp_err_t ReadWordPackEntry(const WordPackIndexEntry& index_entry, WqnWordEntry*
     }
     entry->id = index_entry.word_id;
     entry->deck_id = index_entry.deck_id;
+    const int64_t finished_us = esp_timer_get_time();
+    ESP_LOGI(
+        kTag,
+        "word card loaded: open_seek_ms=%lld read_close_ms=%lld parse_ms=%lld total_ms=%lld",
+        static_cast<long long>((opened_us - started_us) / 1000),
+        static_cast<long long>((read_us - opened_us) / 1000),
+        static_cast<long long>((finished_us - read_us) / 1000),
+        static_cast<long long>((finished_us - started_us) / 1000));
     return ESP_OK;
 }
 

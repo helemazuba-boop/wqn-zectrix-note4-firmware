@@ -996,12 +996,17 @@ template <typename Transaction>
 esp_err_t ExecuteWithStorageLease(
     const char* holder,
     Transaction transaction,
-    void* context)
+    void* context,
+    bool foreground = false)
 {
     wqn::runtime::SleepLease lease = wqn::runtime::SleepLease::TryAcquire(
         wqn::runtime::SleepBlocker::kStorage, holder, __FILE__, __LINE__);
     if (!lease) return ESP_ERR_INVALID_STATE;
-    return wqn::services::ExecuteStorageTransaction(transaction, context);
+    return foreground
+        ? wqn::services::ExecuteForegroundStorageTransaction(
+              transaction, context, holder)
+        : wqn::services::ExecuteStorageTransactionNamed(
+              transaction, context, holder);
 }
 
 }  // namespace
@@ -1097,7 +1102,10 @@ esp_err_t CommitWordObservation(
 {
     CommitContext context{&observation, &advanced_session};
     return ExecuteWithStorageLease(
-        "word-observation-commit", CommitObservationTransaction, &context);
+        "word-observation-commit",
+        CommitObservationTransaction,
+        &context,
+        true);
 }
 
 esp_err_t PeekPendingWordObservation(DurableWordObservation* observation)

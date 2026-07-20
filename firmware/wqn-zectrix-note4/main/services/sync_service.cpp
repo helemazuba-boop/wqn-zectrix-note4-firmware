@@ -42,6 +42,7 @@ bool LoadUsableToken(std::string* token);
 TaskHandle_t g_sync_service_task = nullptr;
 std::atomic<bool> g_full_sync_requested{false};
 std::atomic<bool> g_word_outbox_sync_requested{false};
+std::atomic<uint32_t> g_word_interaction_generation{0};
 constexpr uint32_t kWordOutboxQuietPeriodMs = 5000;
 StaticTimer_t g_word_outbox_timer_storage;
 TimerHandle_t g_word_outbox_timer = nullptr;
@@ -86,6 +87,7 @@ uint8_t g_word_outbox_retry_attempts = 0;
 enum class WordOutboxUploadState : uint8_t {
     kDrained,
     kPending,
+    kYielded,
     kFailed,
 };
 
@@ -858,8 +860,18 @@ esp_err_t SyncDueProblemsAndCacheV3(const std::string& token)
 WordOutboxUploadState UploadPendingWordObservations(const std::string& token)
 {
     constexpr size_t kMaxWordObservationsPerRound = 64;
+    const uint32_t interaction_generation =
+        g_word_interaction_generation.load(std::memory_order_acquire);
     size_t uploaded = 0;
     for (; uploaded < kMaxWordObservationsPerRound;) {
+        if (g_word_interaction_generation.load(std::memory_order_acquire) !=
+            interaction_generation) {
+            ESP_LOGI(
+                kTag,
+                "word outbox batch yielded to interaction: uploaded=%u",
+                static_cast<unsigned>(uploaded));
+            return WordOutboxUploadState::kYielded;
+        }
         wqn::DurableWordObservation pending;
         esp_err_t result = wqn::PeekPendingWordObservation(&pending);
         if (result == ESP_ERR_NOT_FOUND) {
@@ -1150,7 +1162,15 @@ void SyncServiceTask(void*)
         sleep_lease.Reset();
         TickType_t delay = NextSyncWaitDelay(synced, has_token_after_round);
 #if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
-        if (g_last_word_outbox_upload_state == WordOutboxUploadState::kPending) {
+        if (g_last_word_outbox_upload_state == WordOutboxUploadState::kYielded) {
+            // Do not turn a user-induced yield into the old 100 ms upload
+            // loop. Resume only after another complete quiet period.
+            if (g_word_outbox_timer == nullptr ||
+                xTimerReset(g_word_outbox_timer, 0) != pdPASS) {
+                g_word_outbox_sync_requested.store(true, std::memory_order_release);
+                delay = std::min(delay, pdMS_TO_TICKS(100));
+            }
+        } else if (g_last_word_outbox_upload_state == WordOutboxUploadState::kPending) {
             g_word_outbox_sync_requested.store(true, std::memory_order_release);
             const TickType_t retry_delay = WordOutboxRetryWaitDelay();
             delay = std::min(
@@ -1230,6 +1250,13 @@ void RequestSyncNow()
     if (g_sync_service_task != nullptr) {
         xTaskNotifyGive(g_sync_service_task);
     }
+#endif
+}
+
+void NoteWordInteraction()
+{
+#if CONFIG_WQN_WIFI_STA_ENABLE && CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
+    g_word_interaction_generation.fetch_add(1, std::memory_order_acq_rel);
 #endif
 }
 

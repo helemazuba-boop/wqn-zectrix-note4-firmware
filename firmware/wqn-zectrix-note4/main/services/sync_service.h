@@ -49,6 +49,10 @@ void SetSyncEventSink(SyncEventSink sink);
 
 esp_err_t StartSyncService();
 void RequestSyncNow();
+// Marks the beginning of an interactive word action. An in-flight outbox
+// batch finishes its current idempotent item, then yields until the user has
+// been quiet again.
+void NoteWordInteraction();
 // Coalesces repeated word observations and uploads them after a short quiet
 // period. This never requests the full control/problem/content sync round.
 void RequestWordOutboxUpload();

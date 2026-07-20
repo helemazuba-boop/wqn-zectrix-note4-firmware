@@ -132,6 +132,9 @@ constexpr char kTag[] = "wqn_ui";
 constexpr TickType_t kUiPollDelayTicks = pdMS_TO_TICKS(50);
 constexpr TickType_t kUiIdlePollDelayTicks = pdMS_TO_TICKS(500);
 constexpr TickType_t kStatusRefreshDelayTicks = pdMS_TO_TICKS(60000);
+// Full UI snapshot reloads touch several persistent domains. Keep them out of
+// the word interaction window; typed sync events already update live status.
+constexpr int64_t kStatusReloadInteractionQuietUs = 5LL * 1000LL * 1000LL;
 constexpr UBaseType_t kSyncEventQueueDepth = 4;
 
 using device_ui_internal::BuildHomeSummary;
@@ -492,6 +495,9 @@ void DeviceUiTask(void*)
         if (event.HasEvent()) {
             wqn::NoteUserActivity();
             wqn::NoteEpdActivity();
+            if (state.screen == wqn::UiScreen::kWord) {
+                wqn::services::NoteWordInteraction();
+            }
             poll_delay = kUiPollDelayTicks;
             g_last_active_us_local = esp_timer_get_time();
         }
@@ -626,16 +632,28 @@ wqn::AiStreamingStatusView streaming_view{};
         }
 
         const TickType_t now = xTaskGetTickCount();
-        if (now - last_status_refresh >= kStatusRefreshDelayTicks) {
-            // Storage/Wi-Fi reads are an effect. Build the typed snapshot
-            // outside UiRuntime, then reduce that immutable observation into
-            // the single owned AppState.
-            g_ui_reload_snapshot = state;
-            device_ui_internal::LoadUiState(&g_ui_reload_snapshot);
-            const device_ui_internal::UiUpdate update =
-                ui_runtime.DispatchStatusReload(std::move(g_ui_reload_snapshot));
+        const bool status_reload_due =
+            now - last_status_refresh >= kStatusRefreshDelayTicks;
+        const bool interaction_quiet =
+            esp_timer_get_time() - g_last_active_us_local >=
+            kStatusReloadInteractionQuietUs;
+        if (status_reload_due && refresh_schedule == RefreshSchedule::kNone &&
+            !event.HasEvent() && interaction_quiet) {
+            if (state.screen != wqn::UiScreen::kWord) {
+                // Storage/Wi-Fi reads are an effect. Build the typed snapshot
+                // outside UiRuntime, then reduce that immutable observation
+                // into the single owned AppState. The word page is excluded:
+                // its session has one live owner and receives typed sync
+                // events, so reloading every persistent domain is stale work.
+                g_ui_reload_snapshot = state;
+                device_ui_internal::LoadUiState(&g_ui_reload_snapshot);
+                const device_ui_internal::UiUpdate update =
+                    ui_runtime.DispatchStatusReload(
+                        std::move(g_ui_reload_snapshot));
+                refresh_schedule =
+                    StrongerSchedule(refresh_schedule, update.refresh);
+            }
             CheckBatteryProtection();
-            refresh_schedule = StrongerSchedule(refresh_schedule, update.refresh);
             last_status_refresh = now;
         }
 

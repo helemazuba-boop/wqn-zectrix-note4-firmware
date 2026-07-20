@@ -1056,6 +1056,16 @@ void ApplyWordObservationCommitResult(WordAppState* state, esp_err_t result)
         state->message = "已保存，待同步";
     }
     RequestCandidatePageIfNeeded(state);
+    if (action == protocol::word_study_v1::ObservationAction::kRevealed &&
+        state->session.persisted.active &&
+        state->session.persisted.position <
+            state->session.persisted.remote.items.size()) {
+        // Revealing the back does not advance the item. current_word already
+        // owns the exact pinned content, so reopening and reparsing the same
+        // JSONL record only delays the flip.
+        state->mode = WordAppMode::kReviewBack;
+        return;
+    }
     FinishOrLoadAdvancedReview(state);
 }
 
