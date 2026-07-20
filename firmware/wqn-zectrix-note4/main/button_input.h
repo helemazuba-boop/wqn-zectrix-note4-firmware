@@ -19,9 +19,8 @@ enum class ButtonEventType {
     // press / release transitions and are the canonical signal for PTT-style
     // "press-to-talk" flows where every millisecond of leading-edge audio
     // matters. Older derived events (kShortPress / kLongPress / kLongRelease
-    // Derived short/long events are still emitted on the release transition
-    // for non-PTT flows. The UI
-    // shell synthesizes kDoublePress after atomically delaying confirm only.
+    // / kDoublePress) are still emitted on the release transition for
+    // non-PTT flows that want delayed-press semantics.
     kPress,
     kRelease,
     // [mistouch] One-shot hold threshold (200 ms). Flash PTT starts here,

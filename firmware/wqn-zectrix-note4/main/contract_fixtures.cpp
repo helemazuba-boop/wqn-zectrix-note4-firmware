@@ -8,8 +8,6 @@
 #include "device_protocol/word_study.h"
 #include "esp_log.h"
 #include "text_render.h"
-#include "ui/confirm_gesture_arbiter.h"
-#include "ui/status_control.h"
 #include "wqn_api.h"
 #include "wqn_api_stream_internal.h"
 
@@ -1250,9 +1248,7 @@ bool RunContractFixtureSelfTest()
         CheckUnauthorizedError() &&
         CheckV3ControlContract() &&
         CheckWordStudyV1Contract() &&
-        CheckAiStreamHttpFailures() &&
-        wqn::ui::RunConfirmGestureArbiterSelfTest() &&
-        device_ui_internal::RunStatusControlShellSelfTest();
+        CheckAiStreamHttpFailures();
 
     if (ok) {
         ESP_LOGI(kTag, "contract fixture self-test passed");

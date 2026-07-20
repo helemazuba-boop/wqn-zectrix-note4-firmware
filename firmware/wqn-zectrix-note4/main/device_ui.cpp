@@ -21,7 +21,6 @@
 #include "runtime/wake_context.h"
 #include "services/sync_service.h"
 #include "ui/ui_internal.h"
-#include "ui/confirm_gesture_arbiter.h"
 #include "ui/ui_runtime.h"
 #include "ui_model.h"
 #include "wqn_api.h"
@@ -137,20 +136,6 @@ constexpr TickType_t kStatusRefreshDelayTicks = pdMS_TO_TICKS(60000);
 // the word interaction window; typed sync events already update live status.
 constexpr int64_t kStatusReloadInteractionQuietUs = 5LL * 1000LL * 1000LL;
 constexpr UBaseType_t kSyncEventQueueDepth = 4;
-
-uint32_t ConfirmGestureContext(const wqn::AppState& state)
-{
-    uint32_t context = static_cast<uint32_t>(state.screen) & 0xffU;
-    context |= (static_cast<uint32_t>(state.status_edit.active ? 1 : 0) << 8U);
-    context |= (static_cast<uint32_t>(state.status_edit.provider) & 0x0fU) << 9U;
-    context |= (static_cast<uint32_t>(state.status_edit.selected) & 0x0fU) << 13U;
-    if (state.screen == wqn::UiScreen::kWord) {
-        context |= (static_cast<uint32_t>(state.word_app.mode) & 0xffU) << 17U;
-    } else if (state.screen == wqn::UiScreen::kAi) {
-        context |= (static_cast<uint32_t>(state.ai.tier) & 0x03U) << 17U;
-    }
-    return context;
-}
 
 using device_ui_internal::BuildHomeSummary;
 using device_ui_internal::CheckBatteryProtection;
@@ -321,9 +306,7 @@ wqn::display::WaveformRequirement RequestedWaveform(
     if (frame.prefer_full_refresh) {
         return wqn::display::WaveformRequirement::kFull;
     }
-    if (schedule == RefreshSchedule::kSelection ||
-        schedule == RefreshSchedule::kConfig ||
-        schedule == RefreshSchedule::kStatus) {
+    if (schedule == RefreshSchedule::kSelection || schedule == RefreshSchedule::kConfig) {
         return wqn::display::WaveformRequirement::kPartial;
     }
     return wqn::display::WaveformRequirement::kAuto;
@@ -482,7 +465,6 @@ void DeviceUiTask(void*)
     g_last_active_us_local = esp_timer_get_time();
     TickType_t poll_delay = kUiPollDelayTicks;
     bool word_pack_refresh_pending = false;
-    wqn::ui::ConfirmGestureArbiter confirm_arbiter;
 
     while (true) {
         RefreshSchedule refresh_schedule = pending_refresh_schedule;
@@ -510,7 +492,6 @@ void DeviceUiTask(void*)
             }
         }
         const wqn::ButtonEvent event = wqn::PollButtonInput();
-        const int64_t button_time_ms = esp_timer_get_time() / 1000;
         if (event.HasEvent()) {
             wqn::NoteUserActivity();
             wqn::NoteEpdActivity();
@@ -529,26 +510,16 @@ void DeviceUiTask(void*)
         // secondary queue pair in ui_refresh.cpp, so racing with a refresh in
         // flight is safe -- the worst case is the new event lands in the
         // secondary slot and is picked up on the next consume.
-        const wqn::ui::ConfirmGestureBatch gesture_batch = event.HasEvent()
-            ? confirm_arbiter.Process(
-                  event, button_time_ms, ConfirmGestureContext(state))
-            : confirm_arbiter.Poll(
-                  button_time_ms, ConfirmGestureContext(state));
-        for (size_t gesture_index = 0;
-             gesture_index < gesture_batch.count;
-             ++gesture_index) {
-            const wqn::ButtonEvent& semantic_event =
-                gesture_batch.events[gesture_index];
+        if (event.HasEvent()) {
             const RefreshSchedule before_sched = refresh_schedule;
             const device_ui_internal::UiUpdate update =
-                ui_runtime.DispatchButton(semantic_event, button_time_ms);
+                ui_runtime.DispatchButton(event, esp_timer_get_time() / 1000);
             const RefreshSchedule after_sched =
                 StrongerSchedule(refresh_schedule, update.refresh);
             if (after_sched != before_sched && after_sched == RefreshSchedule::kAi) {
                 ESP_LOGI(kTag,
                          "AI button refresh scheduled: button=%d type=%d revision=%llu screen=%d tier=%d",
-                         static_cast<int>(semantic_event.button),
-                         static_cast<int>(semantic_event.type),
+                         static_cast<int>(event.button), static_cast<int>(event.type),
                          static_cast<unsigned long long>(update.revision),
                          static_cast<int>(state.screen),
                          static_cast<int>(state.ai.tier));

@@ -214,42 +214,6 @@ uint16_t ClampUint16(size_t value)
     return static_cast<uint16_t>(std::min<size_t>(value, UINT16_MAX));
 }
 
-const wqn::WordPackIdentity* FindScopeIdentity(
-    const wqn::WordAppState& state,
-    const std::string& deck_id)
-{
-    if (deck_id.empty()) return nullptr;
-    const auto it = std::find_if(
-        state.pack_index.pack_identities.begin(),
-        state.pack_index.pack_identities.end(),
-        [&](const wqn::WordPackIdentity& identity) {
-            return deck_id == identity.deck_id;
-        });
-    return it == state.pack_index.pack_identities.end() ? nullptr : &*it;
-}
-
-std::string ScopeIdentityLabel(
-    const wqn::WordAppState& state,
-    const std::string& deck_id)
-{
-    if (deck_id.empty()) return "全部词库";
-    const wqn::WordPackIdentity* identity = FindScopeIdentity(state, deck_id);
-    if (identity == nullptr) return "全部词库";
-    if (identity->title[0] != '\0') return identity->title;
-    const size_t index = static_cast<size_t>(identity - state.pack_index.pack_identities.data());
-    return "词库 " + std::to_string(index + 1);
-}
-
-bool PreferredScopeMatchesActiveSession(const wqn::WordAppState& state)
-{
-    const auto& active = state.session.persisted.remote.deck_ids;
-    if (state.preferred_scope_deck_id.empty()) {
-        return active.empty();
-    }
-    return active.size() == 1 &&
-           state.preferred_scope_deck_id == active.front().value;
-}
-
 void InstallWordPackIndex(
     wqn::WordAppState* state,
     wqn::WordPackIndex index,
@@ -259,12 +223,6 @@ void InstallWordPackIndex(
     const bool pack_error = index.pack_error;
     const std::string status_message = index.status_message;
     state->pack_index = std::move(index);
-    if (!state->preferred_scope_deck_id.empty() &&
-        FindScopeIdentity(*state, state->preferred_scope_deck_id) == nullptr) {
-        state->preferred_scope_deck_id.clear();
-        state->scope_change_pending = state->session.persisted.active &&
-            !PreferredScopeMatchesActiveSession(*state);
-    }
     state->cloud_loaded_once = has_manifest;
     state->cloud_sync_failed = pack_error;
     state->cloud_sync_requested = !has_manifest || pack_error;
@@ -378,13 +336,6 @@ esp_err_t InitWordApp(WordAppState* state)
     if (storage_result != ESP_OK) {
         state->message = "词库分区不可用";
     } else {
-        std::string saved_scope;
-        const esp_err_t scope_result = LoadWordScopePreference(&saved_scope);
-        if (scope_result == ESP_OK) {
-            state->preferred_scope_deck_id = std::move(saved_scope);
-        } else if (scope_result != ESP_ERR_NOT_FOUND) {
-            ESP_LOGW(kTag, "load word scope preference failed: %s", esp_err_to_name(scope_result));
-        }
         WordPackIndex index;
         const esp_err_t index_result = LoadWordPackIndex(&index);
         const std::string index_message = index.status_message;
@@ -443,8 +394,6 @@ esp_err_t InitWordApp(WordAppState* state)
         }
     }
     RequestCandidatePageIfNeeded(state);
-    state->scope_change_pending = state->session.persisted.active &&
-        !PreferredScopeMatchesActiveSession(*state);
     if (state->mode == WordAppMode::kHome && found_paused_session) {
         state->message = "上次会话可继续";
     } else if (state->mode == WordAppMode::kHome && found_corrupt_session) {
@@ -861,10 +810,6 @@ bool TakeWordSessionStartRequest(
     }
     request->mode = state->session.requested_mode;
     request->scope = {};
-    if (!state->preferred_scope_deck_id.empty() &&
-        FindScopeIdentity(*state, state->preferred_scope_deck_id) != nullptr) {
-        request->scope.deck_ids.push_back(state->preferred_scope_deck_id);
-    }
     request->optional_count = 0;
     request->seed.clear();
     state->session.start_requested = false;
@@ -895,7 +840,6 @@ void ApplyWordSessionStartResult(
         state->message = "会话数据过大";
         return;
     }
-    state->scope_change_pending = false;
     if (!persisted.active) {
         state->mode = WordAppMode::kHome;
         state->message = "暂时没有建议复习的单词";
@@ -1172,7 +1116,6 @@ WordAppSnapshot BuildWordAppSnapshot(const WordAppState& state)
     snapshot.progress_line = WordAppProgressLabel(state);
     snapshot.status_line = WordAppStatusLine(state);
     snapshot.hint = state.message.empty() ? "确认选择，长按确认返回" : state.message;
-    snapshot.scope_control_label = WordScopeControlLabel(state);
 
     const WqnWordEntry& word = state.current_word;
     if (!word.word.empty()) {
@@ -1226,53 +1169,6 @@ std::string WordAppStatusLine(const WordAppState& state)
     return "本地词库 " + std::to_string(state.pack_index.entries.size()) + " 词";
 }
 
-std::string WordScopeControlLabel(const WordAppState& state)
-{
-    if (state.scope_change_pending) {
-        return "下轮 " + ScopeIdentityLabel(state, state.preferred_scope_deck_id);
-    }
-    if (state.session.persisted.active) {
-        const auto& active = state.session.persisted.remote.deck_ids;
-        if (active.size() == 1) {
-            return ScopeIdentityLabel(state, active.front().value);
-        }
-        return "全部词库";
-    }
-    return ScopeIdentityLabel(state, state.preferred_scope_deck_id);
-}
-
-void CycleWordScopeForNextSession(WordAppState* state)
-{
-    if (state == nullptr || state->pack_index.pack_identities.empty()) {
-        if (state != nullptr) state->message = "暂无可选词库";
-        return;
-    }
-
-    size_t current = 0;  // 0 = all; 1..N = one deck
-    if (!state->preferred_scope_deck_id.empty()) {
-        const auto it = std::find_if(
-            state->pack_index.pack_identities.begin(),
-            state->pack_index.pack_identities.end(),
-            [&](const WordPackIdentity& identity) {
-                return state->preferred_scope_deck_id == identity.deck_id;
-            });
-        if (it != state->pack_index.pack_identities.end()) {
-            current = static_cast<size_t>(
-                it - state->pack_index.pack_identities.begin()) + 1;
-        }
-    }
-    const size_t next = (current + 1) %
-        (state->pack_index.pack_identities.size() + 1);
-    state->preferred_scope_deck_id = next == 0
-        ? std::string()
-        : state->pack_index.pack_identities[next - 1].deck_id;
-    state->scope_change_pending = state->session.persisted.active &&
-        !PreferredScopeMatchesActiveSession(*state);
-    state->message = state->scope_change_pending
-        ? "词库范围将在下轮生效"
-        : "词库范围已设为 " + WordScopeControlLabel(*state);
-}
-
 std::string WordAppSignature(const WordAppState& state)
 {
     std::string signature;
@@ -1300,10 +1196,6 @@ std::string WordAppSignature(const WordAppState& state)
     signature.append(std::to_string(state.dictionary_match_selected));
     signature.push_back('/');
     signature.append(std::to_string(state.pack_index.entries.size()));
-    signature.push_back('/');
-    signature.append(state.preferred_scope_deck_id);
-    signature.push_back('/');
-    signature.append(state.scope_change_pending ? "1" : "0");
     signature.push_back('/');
     signature.append(state.message);
     return signature;

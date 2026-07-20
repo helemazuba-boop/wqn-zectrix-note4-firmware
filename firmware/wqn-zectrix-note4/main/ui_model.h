@@ -239,20 +239,16 @@ struct UiRuntimeStatus {
     std::string last_sync_status;
 };
 
-enum class StatusControlProvider : uint8_t {
-    kNone,
-    kAi,
-    kWord,
-};
-
-// Page-independent status-control shell state. Values remain owned by their
-// provider; the shell only remembers the captured owner and selection.
+// [shell] Status-bar edit mode (global, currently AI page only): which toggle
+// icon is selected and when the last edit happened (for the 3 s exit timeout).
+// The toggle VALUES themselves live in the per-page app state (e.g. AI's
+// thinking_level / tts_on / expand_content in AiSessionState).
 struct StatusBarEditState {
     bool active = false;
-    StatusControlProvider provider = StatusControlProvider::kNone;
-    UiScreen owner_screen = UiScreen::kHome;
     uint8_t selected = 0;       // index into the page's toggle list
     int64_t last_action_ms = 0; // for 3 s inactivity auto-exit
+    int64_t last_cycle_ms = 0;  // [shell] ts of last forward cycle; a 2nd short
+                                // confirm within kStatusBarEditDblMs = save & exit
 };
 
 // Reducer-owned gesture memory. Keeping these values inside AppState removes
@@ -260,6 +256,7 @@ struct StatusBarEditState {
 // timestamped input sequence starts from and produces the same state.
 struct UiGestureState {
     bool flash_ptt_started = false;
+    int64_t last_ai_confirm_tap_ms = 0;
 };
 
 // M4: the application state has exactly one owner (UiRuntime on DeviceUiTask).

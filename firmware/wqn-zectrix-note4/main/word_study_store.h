@@ -139,8 +139,4 @@ esp_err_t AcknowledgeWordObservation(const std::string& request_id);
 esp_err_t ReadWordOutboxSnapshot(WordOutboxSnapshot* snapshot);
 esp_err_t PrepareWordObservationOutboxForSleep(int64_t deadline_us);
 
-// Durable next-session deck scope. Empty means all visible decks.
-esp_err_t LoadWordScopePreference(std::string* deck_id);
-esp_err_t SaveWordScopePreference(const std::string& deck_id);
-
 }  // namespace wqn

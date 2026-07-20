@@ -30,12 +30,8 @@ constexpr char kLegacySessionBackupPath[] = "/storage/wsess.bak";
 constexpr char kOutboxPath[] = "/storage/wout.v1";
 constexpr char kOutboxTempPath[] = "/storage/wout.tmp";
 constexpr char kOutboxBackupPath[] = "/storage/wout.bak";
-constexpr char kScopePath[] = "/storage/wscope.v1";
-constexpr char kScopeTempPath[] = "/storage/wscope.tmp";
-constexpr char kScopeBackupPath[] = "/storage/wscope.bak";
 constexpr uint32_t kSessionMagic = UINT32_C(0x53535157);  // WQSS
 constexpr uint32_t kOutboxMagic = UINT32_C(0x424f5157);  // WQOB
-constexpr uint32_t kScopeMagic = UINT32_C(0x43535157);  // WQSC
 constexpr uint16_t kLegacySessionSchemaVersion = 1;
 constexpr uint16_t kSessionSchemaVersion = 2;
 constexpr uint16_t kOutboxSchemaVersion = 1;
@@ -76,18 +72,9 @@ struct OutboxRecord {
     char occurred_at[33];
     uint32_t crc;
 };
-
-struct ScopePreferenceRecord {
-    uint32_t magic;
-    uint16_t version;
-    uint16_t reserved;
-    char deck_id[37];
-    uint32_t crc;
-};
 #pragma pack(pop)
 
 static_assert(sizeof(OutboxRecord) == 200);
-static_assert(sizeof(ScopePreferenceRecord) == 49);
 
 struct OutboxScan {
     std::vector<OutboxRecord, wqn::WordStorePsramAllocator<OutboxRecord>> pending;
@@ -1081,51 +1068,6 @@ esp_err_t SnapshotTransaction(void* context)
     return ESP_OK;
 }
 
-esp_err_t SaveScopePreferenceTransaction(void* context)
-{
-    const auto* deck_id = static_cast<const std::string*>(context);
-    if (deck_id == nullptr || deck_id->size() > 36) return ESP_ERR_INVALID_ARG;
-    ScopePreferenceRecord record = {};
-    record.magic = kScopeMagic;
-    record.version = 1;
-    if (!CopyFixedText(record.deck_id, sizeof(record.deck_id), *deck_id)) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    record.crc = Crc32(&record, offsetof(ScopePreferenceRecord, crc));
-    return AtomicWrite(
-        kScopePath,
-        kScopeTempPath,
-        kScopeBackupPath,
-        &record,
-        sizeof(record));
-}
-
-esp_err_t LoadScopePreferenceFile(const char* path, std::string* deck_id)
-{
-    if (path == nullptr || deck_id == nullptr) return ESP_ERR_INVALID_ARG;
-    FILE* file = std::fopen(path, "rb");
-    if (file == nullptr) return errno == ENOENT ? ESP_ERR_NOT_FOUND : ESP_FAIL;
-    ScopePreferenceRecord record = {};
-    const bool read = std::fread(&record, 1, sizeof(record), file) == sizeof(record);
-    const bool closed = std::fclose(file) == 0;
-    if (!read || !closed || record.magic != kScopeMagic || record.version != 1 ||
-        record.deck_id[sizeof(record.deck_id) - 1] != '\0' ||
-        record.crc != Crc32(&record, offsetof(ScopePreferenceRecord, crc))) {
-        return ESP_ERR_INVALID_CRC;
-    }
-    *deck_id = record.deck_id;
-    return ESP_OK;
-}
-
-esp_err_t LoadScopePreferenceTransaction(void* context)
-{
-    auto* deck_id = static_cast<std::string*>(context);
-    if (deck_id == nullptr) return ESP_ERR_INVALID_ARG;
-    esp_err_t result = LoadScopePreferenceFile(kScopePath, deck_id);
-    if (result == ESP_OK || !FileExists(kScopeBackupPath)) return result;
-    return LoadScopePreferenceFile(kScopeBackupPath, deck_id);
-}
-
 template <typename Transaction>
 esp_err_t ExecuteWithStorageLease(
     const char* holder,
@@ -1273,23 +1215,6 @@ esp_err_t PrepareWordObservationOutboxForSleep(int64_t deadline_us)
         PrepareOutboxForSleepTransaction,
         &context,
         "word-outbox-sleep-compact");
-}
-
-esp_err_t LoadWordScopePreference(std::string* deck_id)
-{
-    if (deck_id == nullptr) return ESP_ERR_INVALID_ARG;
-    deck_id->clear();
-    return ExecuteWithStorageLease(
-        "word-scope-load", LoadScopePreferenceTransaction, deck_id);
-}
-
-esp_err_t SaveWordScopePreference(const std::string& deck_id)
-{
-    return ExecuteWithStorageLease(
-        "word-scope-save",
-        SaveScopePreferenceTransaction,
-        const_cast<std::string*>(&deck_id),
-        true);
 }
 
 }  // namespace wqn

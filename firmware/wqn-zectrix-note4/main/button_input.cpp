@@ -15,6 +15,11 @@ constexpr int64_t kDebounceMs = 40;
 constexpr int64_t kHoldPressMs = 200;  // [mistouch] Flash PTT start threshold
 constexpr int64_t kLongPressMs = 1000;
 constexpr int64_t kLongPressRepeatMs = 260;
+constexpr int64_t kDoublePressWindowMs = 300;
+
+int64_t g_last_short_release_at_ms = 0;
+wqn::ButtonId g_last_short_release_button = wqn::ButtonId::kNone;
+
 struct ButtonState {
     wqn::ButtonId id;
     gpio_num_t pin;
@@ -26,11 +31,12 @@ struct ButtonState {
     int64_t stable_changed_at_ms = 0;
     int64_t last_long_press_event_at_ms = 0;
     int64_t last_reported_at_ms = 0;
+    bool double_armed = false;
     // [ptt-fix] When a debounced press or release transition is first observed,
     // schedule an edge event (kPress / kRelease) for the *next* poll. The
     // Press event is delivered immediately (priority over the existing
     // long/short release logic, so PTT reacts with zero latency), and the
-    // existing kShortPress/kLongRelease/kLongPress machinery
+    // existing kShortPress/kLongRelease/kDoublePress / kLongPress machinery
     // is left untouched for every other UI consumer.
     bool edge_event_pending = false;
     wqn::ButtonEventType pending_edge = wqn::ButtonEventType::kNone;
@@ -85,7 +91,6 @@ esp_err_t InitButtonInput()
         button.raw_pressed = pressed;
         button.stable_pressed = pressed;
         button.long_press_reported = false;
-        button.hold_press_reported = false;
         button.raw_changed_at_ms = now_ms;
         button.stable_changed_at_ms = now_ms;
         button.last_long_press_event_at_ms = now_ms;
@@ -135,8 +140,20 @@ ButtonEvent PollButtonInput()
             } else {
                 const int64_t duration_ms = now_ms - previous_stable_changed_at_ms;
                 if (!button.long_press_reported) {
-                    // Double-confirm classification belongs to the UI shell.
-                    // Emit every physical short release exactly once here.
+                    if (g_last_short_release_button == button.id &&
+                        now_ms - g_last_short_release_at_ms <= kDoublePressWindowMs) {
+                        g_last_short_release_button = wqn::ButtonId::kNone;
+                        g_last_short_release_at_ms = 0;
+                        // [ptt-fix] Queue kRelease edge so PTT reacts at the
+                        // release transition regardless of whether this drop
+                        // was classified as a double-press.
+                        button.pending_edge = wqn::ButtonEventType::kRelease;
+                        button.edge_event_pending = true;
+                        return MakeEvent(button.id, ButtonEventType::kDoublePress, duration_ms);
+                    }
+                    g_last_short_release_button = button.id;
+                    g_last_short_release_at_ms = now_ms;
+                    // [ptt-fix] Same idea on a plain short release.
                     button.pending_edge = wqn::ButtonEventType::kRelease;
                     button.edge_event_pending = true;
                     return MakeEvent(button.id, ButtonEventType::kShortPress, duration_ms);
