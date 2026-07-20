@@ -563,6 +563,23 @@ esp_err_t MigrateLegacyProblemCache()
     return ESP_OK;
 }
 
+esp_err_t MigrateLegacyProblemCacheTransaction(void*)
+{
+    return MigrateLegacyProblemCache();
+}
+
+struct ProblemCacheReadContext {
+    std::vector<wqn::CachedProblem>* problems = nullptr;
+};
+
+esp_err_t LoadProblemCacheTransaction(void* opaque)
+{
+    auto* context = static_cast<ProblemCacheReadContext*>(opaque);
+    return context == nullptr || context->problems == nullptr
+        ? ESP_ERR_INVALID_ARG
+        : wqn::problem_cache::Load(context->problems);
+}
+
 }  // namespace
 
 namespace wqn {
@@ -598,7 +615,13 @@ esp_err_t InitStorage()
     ESP_LOGI(kTag, "NVS ready");
     ESP_RETURN_ON_ERROR(InitStoragePartition(), kTag, "init storage partition");
     ESP_RETURN_ON_ERROR(services::StartStorageService(), kTag, "start storage service");
-    const esp_err_t migration_result = MigrateLegacyProblemCache();
+    // Legacy JSON parsing, WQPC inflate/deflate and file validation are all
+    // deliberately executed on StorageService. Besides preserving single
+    // ownership, this prevents their deeper bounded stack from consuming the
+    // 8 KiB IDF main task during boot.
+    const esp_err_t migration_result = services::ExecuteStorageTransaction(
+        MigrateLegacyProblemCacheTransaction,
+        nullptr);
     if (migration_result != ESP_OK) {
         ESP_LOGW(
             kTag,
@@ -733,7 +756,10 @@ esp_err_t LoadProblems(std::vector<CachedProblem>* problems)
         return ESP_ERR_INVALID_ARG;
     }
 
-    const esp_err_t result = problem_cache::Load(problems);
+    ProblemCacheReadContext context = {problems};
+    const esp_err_t result = services::ExecuteStorageTransaction(
+        LoadProblemCacheTransaction,
+        &context);
     if (result == ESP_ERR_NOT_FOUND) {
         problems->clear();
         return ESP_OK;
