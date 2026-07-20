@@ -4,10 +4,12 @@
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
+#include <new>
 #include <string>
 #include <utility>
 
 #include "esp_check.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 
 namespace {
@@ -1470,6 +1472,46 @@ std::string WordAppSignature(const WordAppState& state)
     return signature;
 }
 
+namespace {
+
+// WordAppState is intentionally large (currently 1408 bytes). The boot
+// contract test needs several independent states, so keeping them as ordinary
+// locals would exceed app_main's fixed 8 KiB stack even though the test runs
+// sequentially. Allocate each bounded fixture in PSRAM and release it when the
+// self-test returns; production runtime state ownership is unchanged.
+class WordPageFixtureState {
+public:
+    WordPageFixtureState()
+    {
+        storage_ = heap_caps_malloc(
+            sizeof(WordAppState), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (storage_ != nullptr) {
+            state_ = new (storage_) WordAppState();
+        }
+    }
+
+    ~WordPageFixtureState()
+    {
+        if (state_ != nullptr) {
+            state_->~WordAppState();
+        }
+        heap_caps_free(storage_);
+    }
+
+    WordPageFixtureState(const WordPageFixtureState&) = delete;
+    WordPageFixtureState& operator=(const WordPageFixtureState&) = delete;
+
+    explicit operator bool() const { return state_ != nullptr; }
+    WordAppState* operator->() { return state_; }
+    WordAppState& get() { return *state_; }
+
+private:
+    void* storage_ = nullptr;
+    WordAppState* state_ = nullptr;
+};
+
+}  // namespace
+
 bool RunWordPageStateSelfTest()
 {
     auto require = [](bool condition, const char* label) {
@@ -1479,30 +1521,32 @@ bool RunWordPageStateSelfTest()
         return condition;
     };
 
-    WordAppState home;
-    home.initialized = true;
-    home.mode = WordAppMode::kHome;
+    WordPageFixtureState home;
+    if (!home) return require(false, "allocate home fixture");
+    home->initialized = true;
+    home->mode = WordAppMode::kHome;
     for (size_t index = 0; index < 500; ++index) {
         const WordInput input = (index % 2 == 0)
             ? WordInput::kDown
             : WordInput::kUp;
-        if (HandleWordAppInput(&home, input) != ESP_OK) return false;
+        if (HandleWordAppInput(&home.get(), input) != ESP_OK) return false;
     }
-    if (!require(home.mode == WordAppMode::kHome,
+    if (!require(home->mode == WordAppMode::kHome,
                  "home mixed navigation remains home")) {
         return false;
     }
 
-    WordAppState study;
-    study.initialized = true;
-    study.mode = WordAppMode::kWordCard;
-    study.card_source = WordCardSource::kStudy;
-    study.card_phase = WordCardPhase::kFront;
-    study.session.persisted.active = true;
-    study.session.persisted.phase = WordPresentationPhase::kFront;
-    study.session.persisted.remote.session_id =
+    WordPageFixtureState study;
+    if (!study) return require(false, "allocate study fixture");
+    study->initialized = true;
+    study->mode = WordAppMode::kWordCard;
+    study->card_source = WordCardSource::kStudy;
+    study->card_phase = WordCardPhase::kFront;
+    study->session.persisted.active = true;
+    study->session.persisted.phase = WordPresentationPhase::kFront;
+    study->session.persisted.remote.session_id =
         "00000000-0000-4000-8000-000000000001";
-    study.session.persisted.remote.next_sequence = 7;
+    study->session.persisted.remote.next_sequence = 7;
     StoredWordSessionItem item;
     std::snprintf(
         item.item_id,
@@ -1515,47 +1559,48 @@ bool RunWordPageStateSelfTest()
         "%s",
         "00000000-0000-4000-8000-000000000003");
     item.ordinal = 11;
-    study.session.persisted.remote.items.push_back(item);
+    study->session.persisted.remote.items.push_back(item);
 
-    if (HandleWordAppInput(&study, WordInput::kConfirm) != ESP_OK ||
-        !require(study.mode == WordAppMode::kWordCard,
+    if (HandleWordAppInput(&study.get(), WordInput::kConfirm) != ESP_OK ||
+        !require(study->mode == WordAppMode::kWordCard,
                  "front and revealed share WordCard") ||
-        !require(study.card_phase == WordCardPhase::kPersisting,
+        !require(study->card_phase == WordCardPhase::kPersisting,
                  "front confirm enters persisting") ||
-        !require(study.session.pending_observation.action ==
+        !require(study->session.pending_observation.action ==
                      protocol::word_study_v1::ObservationAction::kRevealed,
                  "front confirm records revealed")) {
         return false;
     }
 
     const DurableWordObservation pending =
-        study.session.pending_observation;
+        study->session.pending_observation;
     for (size_t index = 0; index < 500; ++index) {
         const WordInput input = index % 3 == 0
             ? WordInput::kConfirm
             : (index % 3 == 1 ? WordInput::kDown
                               : WordInput::kLongConfirm);
-        if (HandleWordAppInput(&study, input) != ESP_OK) return false;
+        if (HandleWordAppInput(&study.get(), input) != ESP_OK) return false;
     }
-    if (!require(study.card_phase == WordCardPhase::kPersisting,
+    if (!require(study->card_phase == WordCardPhase::kPersisting,
                  "persisting blocks mixed input") ||
-        !require(study.session.pending_observation.sequence == pending.sequence &&
-                     study.session.pending_observation.item_id == pending.item_id &&
-                     study.session.pending_observation.action == pending.action,
+        !require(study->session.pending_observation.sequence == pending.sequence &&
+                     study->session.pending_observation.item_id == pending.item_id &&
+                     study->session.pending_observation.action == pending.action,
                  "persisting keeps one observation")) {
         return false;
     }
 
-    WordAppState mixed;
-    mixed.initialized = true;
-    mixed.mode = WordAppMode::kWordCard;
-    mixed.card_source = WordCardSource::kStudy;
-    mixed.session.persisted.remote.session_id =
+    WordPageFixtureState mixed;
+    if (!mixed) return require(false, "allocate mixed fixture");
+    mixed->initialized = true;
+    mixed->mode = WordAppMode::kWordCard;
+    mixed->card_source = WordCardSource::kStudy;
+    mixed->session.persisted.remote.session_id =
         "00000000-0000-4000-8000-000000000010";
-    mixed.session.persisted.remote.mode =
+    mixed->session.persisted.remote.mode =
         protocol::word_study_v1::Mode::kSequential;
     constexpr size_t kMixedItemCount = 64;
-    mixed.session.persisted.remote.items.reserve(kMixedItemCount);
+    mixed->session.persisted.remote.items.reserve(kMixedItemCount);
     for (size_t index = 0; index < kMixedItemCount; ++index) {
         StoredWordSessionItem mixed_item;
         std::snprintf(
@@ -1569,17 +1614,17 @@ bool RunWordPageStateSelfTest()
             "%s",
             "00000000-0000-4000-8000-000000000020");
         mixed_item.ordinal = index;
-        mixed.session.persisted.remote.items.push_back(mixed_item);
+        mixed->session.persisted.remote.items.push_back(mixed_item);
     }
     for (size_t index = 0; index < 500; ++index) {
         const size_t item_index = index % kMixedItemCount;
-        mixed.session.persisted.active = true;
-        mixed.session.persisted.paused = false;
-        mixed.session.persisted.position = item_index;
-        mixed.session.persisted.phase = WordPresentationPhase::kBack;
-        mixed.session.persisted.remote.next_sequence = index;
-        mixed.card_phase = WordCardPhase::kRevealed;
-        mixed.session.commit_state = WordObservationCommitState::kIdle;
+        mixed->session.persisted.active = true;
+        mixed->session.persisted.paused = false;
+        mixed->session.persisted.position = item_index;
+        mixed->session.persisted.phase = WordPresentationPhase::kBack;
+        mixed->session.persisted.remote.next_sequence = index;
+        mixed->card_phase = WordCardPhase::kRevealed;
+        mixed->session.commit_state = WordObservationCommitState::kIdle;
         const WordInput input = index % 3 == 0
             ? WordInput::kConfirm
             : (index % 3 == 1 ? WordInput::kUp : WordInput::kDown);
@@ -1588,7 +1633,7 @@ bool RunWordPageStateSelfTest()
             : (index % 3 == 1
                    ? protocol::word_study_v1::ObservationAction::kUnknown
                    : protocol::word_study_v1::ObservationAction::kSkipped);
-        if (HandleWordAppInput(&mixed, input) != ESP_OK) return false;
+        if (HandleWordAppInput(&mixed.get(), input) != ESP_OK) return false;
         char request_id[40] = {};
         std::snprintf(
             request_id,
@@ -1598,7 +1643,7 @@ bool RunWordPageStateSelfTest()
         DurableWordObservation observation;
         PersistedWordSession advanced;
         if (!TakeWordObservationEffect(
-                &mixed,
+                &mixed.get(),
                 request_id,
                 "2026-07-20T12:00:00Z",
                 &observation,
@@ -1606,67 +1651,69 @@ bool RunWordPageStateSelfTest()
             observation.sequence != index ||
             observation.action != expected_action ||
             observation.item_id !=
-                mixed.session.persisted.remote.items[item_index].item_id ||
+                mixed->session.persisted.remote.items[item_index].item_id ||
             advanced.position != item_index + 1 ||
             advanced.remote.next_sequence != index + 1) {
             return require(false, "500 mixed actions preserve attribution");
         }
-        mixed.session.pending_observation = {};
-        mixed.session.pending_advanced_session = {};
+        mixed->session.pending_observation = {};
+        mixed->session.pending_advanced_session = {};
     }
 
-    WordAppState revealed;
-    revealed.initialized = true;
-    revealed.mode = WordAppMode::kWordCard;
-    revealed.card_source = WordCardSource::kStudy;
-    revealed.card_phase = WordCardPhase::kRevealed;
-    revealed.session.persisted = study.session.persisted;
-    revealed.session.persisted.phase = WordPresentationPhase::kBack;
-    revealed.session.commit_state = WordObservationCommitState::kIdle;
-    if (HandleWordAppInput(&revealed, WordInput::kUp) != ESP_OK ||
-        !require(revealed.session.pending_observation.action ==
+    WordPageFixtureState revealed;
+    if (!revealed) return require(false, "allocate revealed fixture");
+    revealed->initialized = true;
+    revealed->mode = WordAppMode::kWordCard;
+    revealed->card_source = WordCardSource::kStudy;
+    revealed->card_phase = WordCardPhase::kRevealed;
+    revealed->session.persisted = study->session.persisted;
+    revealed->session.persisted.phase = WordPresentationPhase::kBack;
+    revealed->session.commit_state = WordObservationCommitState::kIdle;
+    if (HandleWordAppInput(&revealed.get(), WordInput::kUp) != ESP_OK ||
+        !require(revealed->session.pending_observation.action ==
                      protocol::word_study_v1::ObservationAction::kUnknown,
                  "revealed up records unknown") ||
-        !require(revealed.card_phase == WordCardPhase::kPersisting,
+        !require(revealed->card_phase == WordCardPhase::kPersisting,
                  "classification persists before advance")) {
         return false;
     }
 
-    WordAppState dictionary;
-    dictionary.initialized = true;
-    dictionary.mode = WordAppMode::kWordCard;
-    dictionary.card_source = WordCardSource::kDictionary;
-    dictionary.card_phase = WordCardPhase::kRevealed;
-    dictionary.current_word.id = item.item_id;
-    dictionary.current_word.word = "baseline";
-    if (HandleWordAppInput(&dictionary, WordInput::kLongConfirm) != ESP_OK ||
-        !require(!dictionary.session.observation_effect_ready,
+    WordPageFixtureState dictionary;
+    if (!dictionary) return require(false, "allocate dictionary fixture");
+    dictionary->initialized = true;
+    dictionary->mode = WordAppMode::kWordCard;
+    dictionary->card_source = WordCardSource::kDictionary;
+    dictionary->card_phase = WordCardPhase::kRevealed;
+    dictionary->current_word.id = item.item_id;
+    dictionary->current_word.word = "baseline";
+    if (HandleWordAppInput(&dictionary.get(), WordInput::kLongConfirm) != ESP_OK ||
+        !require(!dictionary->session.observation_effect_ready,
                  "dictionary view does not create progress") ||
-        !require(dictionary.mode == WordAppMode::kDictionaryPicker,
+        !require(dictionary->mode == WordAppMode::kDictionaryPicker,
                  "dictionary card returns to picker")) {
         return false;
     }
 
-    dictionary.mode = WordAppMode::kWordCard;
-    dictionary.card_phase = WordCardPhase::kRevealed;
-    dictionary.session.persisted.active = true;
-    dictionary.session.persisted.remote.mode =
+    dictionary->mode = WordAppMode::kWordCard;
+    dictionary->card_phase = WordCardPhase::kRevealed;
+    dictionary->session.persisted.active = true;
+    dictionary->session.persisted.remote.mode =
         protocol::word_study_v1::Mode::kDictionary;
-    dictionary.session.persisted.remote.session_id =
+    dictionary->session.persisted.remote.session_id =
         "00000000-0000-4000-8000-000000000004";
-    dictionary.session.persisted.remote.next_sequence = 3;
-    if (HandleWordAppInput(&dictionary, WordInput::kUp) != ESP_OK ||
-        !require(dictionary.session.pending_observation.action ==
+    dictionary->session.persisted.remote.next_sequence = 3;
+    if (HandleWordAppInput(&dictionary.get(), WordInput::kUp) != ESP_OK ||
+        !require(dictionary->session.pending_observation.action ==
                      protocol::word_study_v1::ObservationAction::kUnknown,
                  "dictionary shares revealed-card controls") ||
-        !require(dictionary.card_phase == WordCardPhase::kPersisting,
+        !require(dictionary->card_phase == WordCardPhase::kPersisting,
                  "dictionary classification persists first")) {
         return false;
     }
     DurableWordObservation dictionary_observation;
     PersistedWordSession dictionary_advanced;
     if (!require(TakeWordObservationEffect(
-                     &dictionary,
+                     &dictionary.get(),
                      "req_word_dictionary_0001",
                      "2026-07-20T12:00:00Z",
                      &dictionary_observation,
@@ -1678,39 +1725,40 @@ bool RunWordPageStateSelfTest()
         return false;
     }
 
-    WordAppState stale;
-    stale.initialized = true;
-    stale.mode = WordAppMode::kHome;
-    stale.home_selection = WordHomeSelection::kRandom;
+    WordPageFixtureState stale;
+    if (!stale) return require(false, "allocate stale-result fixture");
+    stale->initialized = true;
+    stale->mode = WordAppMode::kHome;
+    stale->home_selection = WordHomeSelection::kRandom;
     protocol::word_study_v1::SessionData stale_session;
     if (!require(!ApplyWordSessionStartResult(
-                     &stale, ESP_OK, std::move(stale_session)),
+                     &stale.get(), ESP_OK, std::move(stale_session)),
                  "cancelled session result is ignored") ||
-        !require(stale.mode == WordAppMode::kHome &&
-                     stale.home_selection == WordHomeSelection::kRandom,
+        !require(stale->mode == WordAppMode::kHome &&
+                     stale->home_selection == WordHomeSelection::kRandom,
                  "stale session result preserves selection")) {
         return false;
     }
 
-    stale.mode = WordAppMode::kDictionaryPicker;
-    stale.dictionary_stage = WordDictionaryStage::kLookupChoice;
-    stale.lookup_result_expected = true;
-    stale.active_lookup_query = "alpha";
-    CancelWordLookupResult(&stale);
+    stale->mode = WordAppMode::kDictionaryPicker;
+    stale->dictionary_stage = WordDictionaryStage::kLookupChoice;
+    stale->lookup_result_expected = true;
+    stale->active_lookup_query = "alpha";
+    CancelWordLookupResult(&stale.get());
     WqnWordSearchResult stale_lookup;
     stale_lookup.prefix = "alpha";
     if (!require(!ApplyWordSearchResult(
-                     &stale, "alpha", stale_lookup),
+                     &stale.get(), "alpha", stale_lookup),
                  "cancelled lookup result is ignored") ||
-        !require(stale.mode == WordAppMode::kDictionaryPicker,
+        !require(stale->mode == WordAppMode::kDictionaryPicker,
                  "stale lookup result preserves picker")) {
         return false;
     }
 
-    const WordAppSnapshot front_snapshot = BuildWordAppSnapshot(study);
-    dictionary.mode = WordAppMode::kDictionaryPicker;
-    dictionary.card_phase = WordCardPhase::kRevealed;
-    const WordAppSnapshot dictionary_snapshot = BuildWordAppSnapshot(dictionary);
+    const WordAppSnapshot front_snapshot = BuildWordAppSnapshot(study.get());
+    dictionary->mode = WordAppMode::kDictionaryPicker;
+    dictionary->card_phase = WordCardPhase::kRevealed;
+    const WordAppSnapshot dictionary_snapshot = BuildWordAppSnapshot(dictionary.get());
     return require(front_snapshot.mode == WordAppMode::kWordCard,
                    "study snapshot uses WordCard") &&
         require(dictionary_snapshot.mode == WordAppMode::kDictionaryPicker,
