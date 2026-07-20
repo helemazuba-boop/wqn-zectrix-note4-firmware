@@ -733,8 +733,12 @@ esp_err_t LoadSessionTransaction(void* opaque)
         return ESP_ERR_INVALID_ARG;
     }
     auto* session = context->session;
-    ESP_RETURN_ON_ERROR(
-        LoadSessionRaw(context->mode, session), kTag, "load word session");
+    const esp_err_t session_result = LoadSessionRaw(context->mode, session);
+    if (session_result != ESP_OK) {
+        // An unused mode has no file by design. Let the caller distinguish
+        // NOT_FOUND without emitting an error-level log on every index load.
+        return session_result;
+    }
     OutboxScan scan;
     ESP_RETURN_ON_ERROR(ScanOutbox(&scan), kTag, "scan word outbox");
     bool changed = false;
