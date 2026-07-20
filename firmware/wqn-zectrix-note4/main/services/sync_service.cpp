@@ -52,6 +52,10 @@ constexpr uint32_t kClaimRetryBaseMs = 15000;
 constexpr uint32_t kClaimRetryMaxMs = 5 * 60 * 1000;
 constexpr uint32_t kStorageCapacityRetryMs = 5 * 60 * 1000;
 constexpr uint8_t kClaimRetryMaxShift = 4;
+constexpr uint32_t kWordOutboxRetryBaseMs = 30000;
+constexpr uint32_t kWordOutboxRetryMaxMs = 5 * 60 * 1000;
+constexpr uint32_t kWordOutboxRetryJitterMaxMs = 2000;
+constexpr uint8_t kWordOutboxRetryMaxShift = 4;
 std::string g_bootstrap_request_id;
 std::string g_sync_request_id;
 wqn::protocol::v3::ClaimKeyPair g_claim_key_pair;
@@ -60,6 +64,77 @@ std::string g_claim_id;
 uint32_t g_claim_poll_interval_ms = kClaimPollFloorMs;
 uint8_t g_claim_retry_attempts = 0;
 bool g_claim_active = false;
+std::string g_word_outbox_retry_request_id;
+int64_t g_word_outbox_retry_not_before_ms = 0;
+uint8_t g_word_outbox_retry_attempts = 0;
+
+void ResetWordOutboxRetryBackoff()
+{
+    g_word_outbox_retry_request_id.clear();
+    g_word_outbox_retry_not_before_ms = 0;
+    g_word_outbox_retry_attempts = 0;
+}
+
+bool WordOutboxRetryDeferred(
+    const std::string& request_id,
+    int64_t now_ms)
+{
+    if (g_word_outbox_retry_request_id != request_id) {
+        ResetWordOutboxRetryBackoff();
+        return false;
+    }
+    return g_word_outbox_retry_not_before_ms > now_ms;
+}
+
+void ScheduleWordOutboxRetry(
+    const std::string& request_id,
+    uint32_t server_retry_after_ms)
+{
+    if (g_word_outbox_retry_request_id != request_id) {
+        ResetWordOutboxRetryBackoff();
+        g_word_outbox_retry_request_id = request_id;
+    }
+    const uint8_t shift =
+        std::min(g_word_outbox_retry_attempts, kWordOutboxRetryMaxShift);
+    const uint32_t local_delay_ms = std::min(
+        kWordOutboxRetryBaseMs << shift,
+        kWordOutboxRetryMaxMs);
+    const uint32_t requested_delay_ms =
+        std::min(server_retry_after_ms, kWordOutboxRetryMaxMs);
+    const uint32_t base_delay_ms =
+        std::max(local_delay_ms, requested_delay_ms);
+    const uint32_t available_jitter_ms =
+        kWordOutboxRetryMaxMs - base_delay_ms;
+    const uint32_t jitter_ms = esp_random() %
+        (std::min(available_jitter_ms, kWordOutboxRetryJitterMaxMs) + 1);
+    const uint32_t delay_ms = base_delay_ms + jitter_ms;
+    if (g_word_outbox_retry_attempts < std::numeric_limits<uint8_t>::max()) {
+        ++g_word_outbox_retry_attempts;
+    }
+    g_word_outbox_retry_not_before_ms =
+        esp_timer_get_time() / 1000 + static_cast<int64_t>(delay_ms);
+    ESP_LOGW(
+        kTag,
+        "word outbox retry scheduled: request=%s attempt=%u retry_after_ms=%lu",
+        request_id.c_str(),
+        static_cast<unsigned>(g_word_outbox_retry_attempts),
+        static_cast<unsigned long>(delay_ms));
+}
+
+TickType_t WordOutboxRetryWaitDelay()
+{
+    if (g_word_outbox_retry_request_id.empty()) {
+        return portMAX_DELAY;
+    }
+    const int64_t remaining_ms =
+        g_word_outbox_retry_not_before_ms - esp_timer_get_time() / 1000;
+    if (remaining_ms <= 0) {
+        return 1;
+    }
+    return pdMS_TO_TICKS(
+        static_cast<uint32_t>(
+            std::min<int64_t>(remaining_ms, kWordOutboxRetryMaxMs)));
+}
 
 bool IsStorageCapacityError(esp_err_t error)
 {
@@ -806,12 +881,23 @@ bool RunSyncRound()
         wqn::DurableWordObservation pending;
         result = wqn::PeekPendingWordObservation(&pending);
         if (result == ESP_ERR_NOT_FOUND) {
+            ResetWordOutboxRetryBackoff();
             result = ESP_OK;
             break;
         }
         if (result != ESP_OK) {
             ESP_LOGW(kTag, "word outbox read failed: %s", esp_err_to_name(result));
             return false;
+        }
+        const int64_t now_ms = esp_timer_get_time() / 1000;
+        if (WordOutboxRetryDeferred(pending.request_id, now_ms)) {
+            ESP_LOGI(
+                kTag,
+                "word outbox head deferred: request=%s remaining_ms=%lld",
+                pending.request_id.c_str(),
+                static_cast<long long>(
+                    g_word_outbox_retry_not_before_ms - now_ms));
+            break;
         }
         wqn::protocol::word_study_v1::ObservationRequest request;
         request.metadata = MakeControlMetadata();
@@ -834,7 +920,10 @@ bool RunSyncRound()
                 static_cast<unsigned long long>(pending.sequence),
                 word_error.code.empty() ? "TRANSPORT" : word_error.code.c_str(),
                 esp_err_to_name(result));
-            return false;
+            ScheduleWordOutboxRetry(
+                pending.request_id,
+                word_error.retryable ? word_error.retry_after_ms : 0);
+            break;
         }
         result = wqn::AcknowledgeWordObservation(pending.request_id);
         if (result != ESP_OK) {
@@ -843,8 +932,10 @@ bool RunSyncRound()
                 "word outbox ack failed: request=%s error=%s",
                 pending.request_id.c_str(),
                 esp_err_to_name(result));
-            return false;
+            ScheduleWordOutboxRetry(pending.request_id, 0);
+            break;
         }
+        ResetWordOutboxRetryBackoff();
     }
     if (word_observations_uploaded > 0) {
         ESP_LOGI(
@@ -888,19 +979,20 @@ bool RunSyncRound()
 
 TickType_t NextSyncWaitDelay(bool round_synced, bool has_token_after_round)
 {
+    TickType_t wait_delay = portMAX_DELAY;
 #if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
     if (g_control_retry_after_ms > 0) {
         const uint32_t retry_after_ms = g_control_retry_after_ms;
         g_control_retry_after_ms = 0;
-        return pdMS_TO_TICKS(retry_after_ms);
-    }
+        wait_delay = pdMS_TO_TICKS(retry_after_ms);
+    } else
 #endif
     if (!has_token_after_round) {
 #if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
         const uint32_t wait_ms = g_claim_active
             ? ClaimPollDelayMs()
             : AddClaimJitter(kClaimRetryBaseMs);
-        return pdMS_TO_TICKS(wait_ms);
+        wait_delay = pdMS_TO_TICKS(wait_ms);
 #else
         // [power-fix] Once the device has lost (or never had) an access
         // token it is in provisioning mode. Polling the server every 2s
@@ -908,15 +1000,24 @@ TickType_t NextSyncWaitDelay(bool round_synced, bool has_token_after_round)
         // keeps the CPU + radio hot for no benefit. Block on the
         // notification until something (e.g. a fresh token save in
         // wqn::SaveAccessToken) wakes us back up.
-        return portMAX_DELAY;
+        wait_delay = portMAX_DELAY;
 #endif
-    }
-    if (round_synced) {
-        return wqn::services::GetConfiguredSyncDelayTicks();
+    } else if (round_synced) {
+        wait_delay = wqn::services::GetConfiguredSyncDelayTicks();
+    } else {
+        const TickType_t configured_delay =
+            wqn::services::GetConfiguredSyncDelayTicks();
+        wait_delay = configured_delay == portMAX_DELAY
+            ? portMAX_DELAY
+            : kSyncRetryDelay;
     }
 
-    const TickType_t configured_delay = wqn::services::GetConfiguredSyncDelayTicks();
-    return configured_delay == portMAX_DELAY ? portMAX_DELAY : kSyncRetryDelay;
+#if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
+    if (has_token_after_round) {
+        wait_delay = std::min(wait_delay, WordOutboxRetryWaitDelay());
+    }
+#endif
+    return wait_delay;
 }
 
 void SyncServiceTask(void*)

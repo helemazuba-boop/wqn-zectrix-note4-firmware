@@ -461,6 +461,7 @@ void DeviceUiTask(void*)
     TickType_t last_status_refresh = xTaskGetTickCount();
     g_last_active_us_local = esp_timer_get_time();
     TickType_t poll_delay = kUiPollDelayTicks;
+    bool word_pack_refresh_pending = false;
 
     while (true) {
         RefreshSchedule refresh_schedule = pending_refresh_schedule;
@@ -476,10 +477,12 @@ void DeviceUiTask(void*)
                 refresh_schedule =
                     StrongerSchedule(refresh_schedule, update.refresh);
                 if (sync_event.status ==
-                        wqn::services::SyncEventStatus::kSucceeded &&
-                    !device_ui_internal::QueueWordReviewRefresh()) {
-                    ESP_LOGW(kTag, "word refresh queue full after sync: sequence=%lu",
-                             static_cast<unsigned long>(sync_event.sequence));
+                    wqn::services::SyncEventStatus::kSucceeded) {
+                    // Sync notifications can arrive while a session page,
+                    // search, or an earlier pack refresh owns WordCloud. Keep
+                    // one coalesced refresh request instead of misreporting
+                    // the busy owner as a full queue.
+                    word_pack_refresh_pending = true;
                 }
             }
         }
@@ -735,6 +738,12 @@ wqn::AiStreamingStatusView streaming_view{};
             FinishWordCloudRequest();
         }
         device_ui_internal::PumpWordCandidatePrefetch(&ui_runtime);
+        if (word_pack_refresh_pending &&
+            !device_ui_internal::IsWordCloudBusy() &&
+            device_ui_internal::QueueWordReviewRefresh()) {
+            word_pack_refresh_pending = false;
+            ESP_LOGI(kTag, "queued coalesced word pack refresh after sync");
+        }
 
         wqn::PowerOffEpdAfterIdleIfNeeded();
 

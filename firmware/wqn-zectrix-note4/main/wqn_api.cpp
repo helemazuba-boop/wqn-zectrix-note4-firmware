@@ -33,6 +33,7 @@ namespace {
 
 constexpr char kTag[] = "wqn_api";
 constexpr int kHttpTimeoutMs = 10000;
+constexpr int kWordSessionHttpTimeoutMs = 30000;
 constexpr TickType_t kWifiConnectTimeout = pdMS_TO_TICKS(30000);
 constexpr TickType_t kSntpSyncTimeout = pdMS_TO_TICKS(15000);
 constexpr TickType_t kPollDelay = pdMS_TO_TICKS(2000);
@@ -235,7 +236,8 @@ esp_err_t HttpRequest(
     int* status_code,
     std::string* response_body,
     const char* protocol = nullptr,
-    const std::string* request_id = nullptr)
+    const std::string* request_id = nullptr,
+    int timeout_ms = kHttpTimeoutMs)
 {
     if (status_code == nullptr || response_body == nullptr) {
         return ESP_ERR_INVALID_ARG;
@@ -249,7 +251,7 @@ esp_err_t HttpRequest(
     esp_http_client_config_t config = {};
     config.url = url.c_str();
     config.method = is_post ? HTTP_METHOD_POST : HTTP_METHOD_GET;
-    config.timeout_ms = kHttpTimeoutMs;
+    config.timeout_ms = timeout_ms;
     config.crt_bundle_attach = esp_crt_bundle_attach;
     config.buffer_size = 2048;
     config.buffer_size_tx = 1024;
@@ -2650,7 +2652,8 @@ esp_err_t CreateWordStudySessionV1(
         &status_code,
         &body,
         protocol::v3::kProtocolHeader,
-        &request.metadata.request_id);
+        &request.metadata.request_id,
+        kWordSessionHttpTimeoutMs);
     if (http_result != ESP_OK) return http_result;
     if (status_code == 401) return ClearTokenOnUnauthorized("word-study-session");
     const esp_err_t parse_result = protocol::word_study_v1::ParseSessionResponse(
