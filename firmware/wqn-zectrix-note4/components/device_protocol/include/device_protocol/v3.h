@@ -9,6 +9,10 @@
 namespace wqn::protocol::v3 {
 
 inline constexpr char kProtocolHeader[] = "3";
+// Protocol counters are JSON numbers on both the TypeScript server and the
+// device. Keeping them within IEEE-754's exact integer range prevents a valid
+// checkpoint from being rounded before it reaches uint64_t storage.
+inline constexpr uint64_t kMaxSafeJsonInteger = 9007199254740991ULL;
 #ifndef WQN_DEVICE_CONTROL_SCHEMA_SHA256
 #error "device-control-v3 schema hash must be injected by the component build"
 #endif

@@ -29,6 +29,7 @@
 #include "esp_mac.h"
 #include "sse_chunk.h"
 #include "storage.h"
+#include "wqn_api_stream_internal.h"
 
 namespace {
 
@@ -279,18 +280,7 @@ esp_err_t OnHttpEvent(esp_http_client_event_t* evt)
         ESP_LOGI(kTag, "HTTP status=%d", ctx->http_status);
         if (ctx->http_status >= 400) {
           ctx->fatal = true;
-          switch (ctx->http_status) {
-            case 401: ctx->error_code = "unauthorized"; break;
-            case 413: ctx->error_code = "too_large"; break;
-            case 415:
-            case 422: ctx->error_code = "invalid_audio"; break;
-            case 429: ctx->error_code = "rate_limited"; break;
-            case 504: ctx->error_code = "chat_timeout"; break;
-            case 503: ctx->error_code = "disabled"; break;
-            case 500: ctx->error_code = "model_failed"; break;
-            case 502: ctx->error_code = "provider_unavailable"; break;
-            default:  ctx->error_code = "bad_request";
-          }
+          ctx->error_code = wqn::internal::AiStreamHttpErrorCode(ctx->http_status);
         }
       }
       break;
@@ -335,6 +325,36 @@ esp_err_t OnHttpEvent(esp_http_client_event_t* evt)
 }  // namespace
 
 namespace wqn {
+
+namespace internal {
+
+const char* AiStreamHttpErrorCode(int http_status)
+{
+  switch (http_status) {
+    case 401: return "unauthorized";
+    case 413: return "too_large";
+    case 415:
+    case 422: return "invalid_audio";
+    case 429: return "rate_limited";
+    case 504: return "chat_timeout";
+    case 503: return "disabled";
+    case 500: return "model_failed";
+    case 502: return "provider_unavailable";
+    default: return "bad_request";
+  }
+}
+
+esp_err_t FinalizeAiStreamResult(bool fatal_http_status, esp_err_t transport_result)
+{
+  // A successfully fetched HTTP error response is still an application-level
+  // failure. error_code is diagnostic output, not the success predicate.
+  if (fatal_http_status) {
+    return ESP_FAIL;
+  }
+  return transport_result;
+}
+
+}  // namespace internal
 
 esp_err_t UploadAiAudioChatStream(const WqnAiStreamRequest& request,
                                   WqnAiChatResponse* response)
@@ -451,13 +471,7 @@ esp_err_t UploadAiAudioChatStream(const WqnAiStreamRequest& request,
   // The user callback may have already gotten a `final` event. Either way,
   // return ESP_OK when the stream completed; transport-level failures map to
   // ESP_FAIL and surface via `response->error_*` fields.
-  if (ctx.fatal && response->error_code.empty()) {
-    return ESP_FAIL;
-  }
-  if (err != ESP_OK) {
-    return err;
-  }
-  return ESP_OK;
+  return internal::FinalizeAiStreamResult(ctx.fatal, err);
 }
 
 }  // namespace wqn

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <climits>
+#include <cmath>
 
 #include "cJSON.h"
 
@@ -26,12 +27,26 @@ std::string StringField(cJSON* object, const char* key)
         : "";
 }
 
-uint64_t U64Field(cJSON* object, const char* key)
+bool U64Field(cJSON* object, const char* key, uint64_t* output)
 {
+    if (output == nullptr) {
+        return false;
+    }
     cJSON* value = cJSON_GetObjectItemCaseSensitive(object, key);
-    return cJSON_IsNumber(value) && value->valuedouble >= 0
-        ? static_cast<uint64_t>(value->valuedouble)
-        : 0;
+    if (!cJSON_IsNumber(value) || !std::isfinite(value->valuedouble) ||
+        value->valuedouble < 0 ||
+        value->valuedouble > static_cast<double>(wqn::protocol::v3::kMaxSafeJsonInteger) ||
+        std::floor(value->valuedouble) != value->valuedouble) {
+        return false;
+    }
+    *output = static_cast<uint64_t>(value->valuedouble);
+    return true;
+}
+
+uint64_t OptionalU64Field(cJSON* object, const char* key)
+{
+    uint64_t value = 0;
+    return U64Field(object, key, &value) ? value : 0;
 }
 
 esp_err_t Render(cJSON* root, std::string* body)
@@ -83,6 +98,10 @@ esp_err_t BuildRequest(
     if (document.root() == nullptr) {
         return ESP_ERR_NO_MEM;
     }
+    if (metadata.config_revision > wqn::protocol::v3::kMaxSafeJsonInteger ||
+        metadata.sync_cursor > wqn::protocol::v3::kMaxSafeJsonInteger) {
+        return ESP_ERR_INVALID_ARG;
+    }
     const esp_err_t metadata_result = AddRequestMetadata(document.root(), metadata);
     if (metadata_result != ESP_OK) {
         return metadata_result;
@@ -131,7 +150,7 @@ esp_err_t ParseEnvelope(
         error->code = StringField(error_object, "code");
         error->retryable = cJSON_IsTrue(retryable);
         error->retry_after_ms = static_cast<uint32_t>(
-            std::min<uint64_t>(U64Field(error_object, "retry_after_ms"), UINT32_MAX));
+            std::min<uint64_t>(OptionalU64Field(error_object, "retry_after_ms"), UINT32_MAX));
         return ESP_FAIL;
     }
     *data = cJSON_GetObjectItemCaseSensitive(root, "data");
@@ -215,9 +234,13 @@ esp_err_t ParseClaimStartResponse(
     }
     data->claim_id = StringField(payload, "claim_id");
     data->display_code = StringField(payload, "display_code");
-    data->expires_at_ms = U64Field(payload, "expires_at_ms");
+    uint64_t poll_interval_ms = 0;
+    if (!U64Field(payload, "expires_at_ms", &data->expires_at_ms) ||
+        !U64Field(payload, "poll_interval_ms", &poll_interval_ms)) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
     data->poll_interval_ms = static_cast<uint32_t>(
-        std::min<uint64_t>(U64Field(payload, "poll_interval_ms"), UINT32_MAX));
+        std::min<uint64_t>(poll_interval_ms, UINT32_MAX));
     const bool valid_code = data->display_code.size() == 8 &&
         std::all_of(
             data->display_code.begin(),
@@ -250,8 +273,12 @@ esp_err_t ParseClaimPollResponse(
     const std::string status = StringField(payload, "status");
     if (status == "pending") {
         data->status = ClaimStatus::kPending;
+        uint64_t poll_interval_ms = 0;
+        if (!U64Field(payload, "poll_interval_ms", &poll_interval_ms)) {
+            return ESP_ERR_INVALID_RESPONSE;
+        }
         data->poll_interval_ms = static_cast<uint32_t>(
-            std::min<uint64_t>(U64Field(payload, "poll_interval_ms"), UINT32_MAX));
+            std::min<uint64_t>(poll_interval_ms, UINT32_MAX));
         if (data->poll_interval_ms < 1000 || data->poll_interval_ms > 30000) {
             return ESP_ERR_INVALID_RESPONSE;
         }
@@ -302,9 +329,9 @@ esp_err_t ParseBootstrapResponse(
     }
     cJSON* media = cJSON_GetObjectItemCaseSensitive(payload, "media_protocols");
     data->device_id = StringField(payload, "device_id");
-    data->config_revision = U64Field(payload, "config_revision");
-    data->sync_cursor = U64Field(payload, "sync_cursor");
-    if (data->device_id.empty() || !cJSON_IsObject(media) ||
+    if (!U64Field(payload, "config_revision", &data->config_revision) ||
+        !U64Field(payload, "sync_cursor", &data->sync_cursor) ||
+        data->device_id.empty() || !cJSON_IsObject(media) ||
         StringField(media, "ai_sse") != "v2-streaming" ||
         StringField(media, "flash") != "wqn-flash-v2") {
         return ESP_ERR_INVALID_RESPONSE;
@@ -328,20 +355,28 @@ esp_err_t ParseSyncResponse(
     if (result != ESP_OK) {
         return result;
     }
-    data->config_revision = U64Field(payload, "config_revision");
-    data->sync_cursor = U64Field(payload, "sync_cursor");
+    if (!U64Field(payload, "config_revision", &data->config_revision) ||
+        !U64Field(payload, "sync_cursor", &data->sync_cursor)) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
     cJSON* configuration = cJSON_GetObjectItemCaseSensitive(payload, "configuration");
     cJSON* summaries = cJSON_GetObjectItemCaseSensitive(payload, "summaries");
     cJSON* due = cJSON_GetObjectItemCaseSensitive(summaries, "due_problem_ids");
     if (!cJSON_IsObject(configuration) || !cJSON_IsObject(summaries) || !cJSON_IsArray(due)) {
         return ESP_ERR_INVALID_RESPONSE;
     }
+    uint64_t auto_sync_interval_minutes = 0;
+    uint64_t todo_count = 0;
+    uint64_t word_due_count = 0;
+    if (!U64Field(configuration, "auto_sync_interval_minutes", &auto_sync_interval_minutes) ||
+        !U64Field(summaries, "todo_count", &todo_count) ||
+        !U64Field(summaries, "word_due_count", &word_due_count)) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
     data->auto_sync_interval_minutes = static_cast<uint32_t>(
-        std::min<uint64_t>(U64Field(configuration, "auto_sync_interval_minutes"), UINT32_MAX));
-    data->todo_count = static_cast<int>(
-        std::min<uint64_t>(U64Field(summaries, "todo_count"), INT_MAX));
-    data->word_due_count = static_cast<int>(
-        std::min<uint64_t>(U64Field(summaries, "word_due_count"), INT_MAX));
+        std::min<uint64_t>(auto_sync_interval_minutes, UINT32_MAX));
+    data->todo_count = static_cast<int>(std::min<uint64_t>(todo_count, INT_MAX));
+    data->word_due_count = static_cast<int>(std::min<uint64_t>(word_due_count, INT_MAX));
     const int count = cJSON_GetArraySize(due);
     data->due_problem_ids.reserve(count);
     for (int index = 0; index < count; ++index) {

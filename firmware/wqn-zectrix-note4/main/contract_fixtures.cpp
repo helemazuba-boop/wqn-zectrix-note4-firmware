@@ -8,6 +8,7 @@
 #include "esp_log.h"
 #include "text_render.h"
 #include "wqn_api.h"
+#include "wqn_api_stream_internal.h"
 
 namespace {
 
@@ -42,6 +43,21 @@ const char kV3Sync[] = R"json({
       "word_due_count": 5
     },
     "content_manifest": []
+  }
+})json";
+
+const char kV3UnsafeCounter[] = R"json({
+  "ok": true,
+  "request_id": "req_bootstrap_0002",
+  "server_time_ms": 1784426400000,
+  "data": {
+    "device_id": "22222222-2222-4222-8222-222222222222",
+    "config_revision": 9007199254740992,
+    "sync_cursor": 42,
+    "media_protocols": {
+      "ai_sse": "v2-streaming",
+      "flash": "wqn-flash-v2"
+    }
   }
 })json";
 
@@ -856,6 +872,24 @@ bool CheckV3ControlContract()
         return false;
     }
 
+    wqn::protocol::v3::BootstrapData unsafe_counter;
+    if (!Require(
+            wqn::protocol::v3::ParseBootstrapResponse(
+                kV3UnsafeCounter,
+                "req_bootstrap_0002",
+                &unsafe_counter,
+                &error) == ESP_ERR_INVALID_RESPONSE,
+            "v3 rejects counters above JSON safe integer")) {
+        return false;
+    }
+    metadata.config_revision = wqn::protocol::v3::kMaxSafeJsonInteger + 1;
+    if (!Require(
+            wqn::protocol::v3::BuildBootstrapRequest(metadata, &request_body) ==
+                ESP_ERR_INVALID_ARG,
+            "v3 refuses unsafe request counters")) {
+        return false;
+    }
+
     wqn::protocol::v3::SyncData sync;
     if (!Require(
             wqn::protocol::v3::ParseSyncResponse(
@@ -873,6 +907,25 @@ bool CheckV3ControlContract()
            Require(error.code == "TEMPORARILY_UNAVAILABLE", "v3 error code") &&
            Require(error.retryable, "v3 error retryable") &&
            Require(error.retry_after_ms == 10000, "v3 retry delay");
+}
+
+bool CheckAiStreamHttpFailures()
+{
+    return Require(
+               std::strcmp(wqn::internal::AiStreamHttpErrorCode(401), "unauthorized") == 0,
+               "SSE 401 classification") &&
+           Require(
+               std::strcmp(wqn::internal::AiStreamHttpErrorCode(429), "rate_limited") == 0,
+               "SSE 429 classification") &&
+           Require(
+               std::strcmp(wqn::internal::AiStreamHttpErrorCode(500), "model_failed") == 0,
+               "SSE 500 classification") &&
+           Require(
+               wqn::internal::FinalizeAiStreamResult(true, ESP_OK) == ESP_FAIL,
+               "fatal SSE HTTP status cannot complete successfully") &&
+           Require(
+               wqn::internal::FinalizeAiStreamResult(false, ESP_OK) == ESP_OK,
+               "successful SSE stream remains successful");
 }
 
 }  // namespace
@@ -898,7 +951,8 @@ bool RunContractFixtureSelfTest()
         CheckWordSearch() &&
         CheckAiWordActions() &&
         CheckUnauthorizedError() &&
-        CheckV3ControlContract();
+        CheckV3ControlContract() &&
+        CheckAiStreamHttpFailures();
 
     if (ok) {
         ESP_LOGI(kTag, "contract fixture self-test passed");
