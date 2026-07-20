@@ -3,6 +3,7 @@
 
 #include "ui_internal.h"
 
+#include <algorithm>
 #include <string>
 
 #include "display_service.h"
@@ -14,11 +15,50 @@ namespace device_ui_internal {
 
 constexpr char kTag[] = "wqn_ui";
 
+void DrawWordStatusBar(const wqn::UiFrame& frame)
+{
+    const bool editing =
+        frame.status_edit.active &&
+        frame.status_edit.provider == wqn::StatusControlProvider::kWord;
+    if (!editing) {
+        DrawStatusBar("单词", frame.home);
+        return;
+    }
+
+    DrawHorizontalLine(0, 27, wqn::kEpdWidth);
+    const std::string scope = wqn::TruncateUtf8TextToWidth(
+        "范围 " + frame.word_app.scope_control_label,
+        240);
+    const std::string sync = wqn::TruncateUtf8TextToWidth(
+        frame.word_app.sync_control_label.empty()
+            ? "立即同步"
+            : frame.word_app.sync_control_label,
+        112);
+    constexpr int kScopeX = 6;
+    constexpr int kScopeW = 252;
+    constexpr int kSyncX = 266;
+    constexpr int kSyncW = 128;
+    if (frame.status_edit.selected == 0) {
+        DrawRoundedRect(kScopeX, 2, kScopeW, 23, 5);
+        DrawRoundedRect(kScopeX + 2, 4, kScopeW - 4, 19, 3);
+    } else {
+        DrawRoundedRect(kSyncX, 2, kSyncW, 23, 5);
+        DrawRoundedRect(kSyncX + 2, 4, kSyncW - 4, 19, 3);
+    }
+    wqn::DrawUtf8Text(kScopeX + 8, 6, scope.c_str(), true);
+    const int sync_width = wqn::MeasureUtf8TextWidth(sync.c_str());
+    wqn::DrawUtf8Text(
+        kSyncX + std::max(5, (kSyncW - sync_width) / 2),
+        6,
+        sync.c_str(),
+        true);
+}
+
 esp_err_t RenderWordToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
 {
     const wqn::WordAppSnapshot& word = frame.word_app;
     wqn::ClearEpdFramebuffer(true);
-    DrawStatusBar("单词", frame.home);
+    DrawWordStatusBar(frame);
 
     ESP_RETURN_ON_ERROR(DrawClippedText(10, 36, 250, word.status_line), kTag, "draw word status");
     ESP_RETURN_ON_ERROR(DrawClippedText(282, 36, 108, word.progress_line), kTag, "draw word progress");

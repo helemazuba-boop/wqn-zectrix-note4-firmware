@@ -168,7 +168,8 @@ esp_err_t RefreshFrame(const wqn::UiFrame& frame, RefreshSchedule schedule)
              static_cast<int>(g_last_rendered_screen));
     const bool allow_local_partial =
         schedule == RefreshSchedule::kClock || schedule == RefreshSchedule::kTimer ||
-        schedule == RefreshSchedule::kSelection || schedule == RefreshSchedule::kConfig;
+        schedule == RefreshSchedule::kSelection || schedule == RefreshSchedule::kConfig ||
+        schedule == RefreshSchedule::kStatus;
     // [power-fix] Force a full refresh when:
     //   (a) the panel is being shown a genuinely different screen, OR
     //   (b) the producer asked for kCommit (used for screen transitions,

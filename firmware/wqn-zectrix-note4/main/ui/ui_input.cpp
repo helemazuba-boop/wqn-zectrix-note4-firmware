@@ -9,6 +9,7 @@
 #include "ai_session.h"
 #include "esp_log.h"
 #include "flash_session.h"
+#include "ui/status_control.h"
 
 namespace device_ui_internal {
 
@@ -191,136 +192,6 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
     }
 }
 
-// [shell] Cycle the AI status-bar toggle at `index`. Index 0=tier (handled in
-// ApplyStatusBarEditEvent as an immediate switch), 1=thinking, 2=tts, 3=expand,
-// 4=trash (also immediate, in ApplyStatusBarEditEvent). This fn only cycles 1-3.
-static void CycleAiStatusBarToggle(wqn::UiState* state, uint8_t index)
-{
-    wqn::AiSessionState& ai = state->ai;
-    switch (index) {
-        case 1: {  // thinking: off->low->med->high->off
-            int v = (static_cast<int>(ai.thinking_level) + 1) % static_cast<int>(wqn::ThinkingLevel::kCount);
-            ai.thinking_level = static_cast<wqn::ThinkingLevel>(v);
-            wqn::SetAiThinkingLevel(ai.thinking_level);
-            break;
-        }
-        case 2: ai.tts_on = !ai.tts_on; wqn::SetAiTtsOn(ai.tts_on); break;
-        case 3: ai.expand_content = !ai.expand_content; wqn::SetAiExpandContent(ai.expand_content); break;
-        default: break;
-    }
-}
-
-// [shell] Reverse of CycleAiStatusBarToggle (undo the last forward cycle). Used
-// when a double-confirm turns the last single-cycle into a "save & exit" instead
-// (the optimistic forward cycle is rolled back so the saved value is the one the
-// user was looking at before the double-click).
-static void CycleAiStatusBarToggleReverse(wqn::UiState* state, uint8_t index)
-{
-    wqn::AiSessionState& ai = state->ai;
-    switch (index) {
-        case 1: {  // thinking reverse (wrap high->med->low->off)
-            int cnt = static_cast<int>(wqn::ThinkingLevel::kCount);
-            int v = (static_cast<int>(ai.thinking_level) - 1 + cnt) % cnt;
-            ai.thinking_level = static_cast<wqn::ThinkingLevel>(v);
-            wqn::SetAiThinkingLevel(ai.thinking_level);
-            break;
-        }
-        case 2: ai.tts_on = !ai.tts_on; wqn::SetAiTtsOn(ai.tts_on); break;
-        case 3: ai.expand_content = !ai.expand_content; wqn::SetAiExpandContent(ai.expand_content); break;
-        default: break;
-    }
-}
-
-// [shell] Status-bar edit mode owns all button input on the AI page while active.
-// short-confirm = cycle selected toggle; up/down = move selection (wrap 0..2);
-// long-confirm (release) = exit. Edge events (Press/Release) are consumed so
-// Flash PTT never fires mid-edit (though edit mode is only entered on Std/Pro).
-static RefreshSchedule ApplyStatusBarEditEvent(
-    const wqn::ButtonEvent& event,
-    int64_t now_ms,
-    wqn::UiState* state)
-{
-    if (event.button == wqn::ButtonId::kConfirm) {
-        if (event.type == wqn::ButtonEventType::kShortPress) {
-            // [tier] index 0 = cycle tier (immediate switch + exit, no double-click).
-            if (state->status_edit.selected == 0) {
-                wqn::AiTier prev_tier = state->ai.tier;
-                wqn::AiTier next = wqn::NextAiTier(prev_tier);
-                state->ai.tier = next;
-                wqn::SetAiTier(next);  // swaps dual history + MarkChanged
-                // [i2s-handoff] Leaving Flash tier must tear down its WS +
-                // AudioStreamingTask + 常驻 I2S duplex channels, otherwise they
-                // keep I2S_NUM_0 occupied and STD/Pro's InitI2s fails with
-                // ESP_ERR_NOT_FOUND (-> 0 ms stale-listening submit). Mirrors
-                // the screen-leave teardown in ui_model.cpp. STD/Pro->Flash
-                // needs nothing: Flash starts lazily on first PTT and already
-                // calls StopAudioPlayback to release the TX slot.
-                if (prev_tier == wqn::AiTier::kFlash && next != wqn::AiTier::kFlash) {
-                    wqn::StopFlashSession();
-                }
-                state->status_edit.active = false;
-                state->status_edit.last_cycle_ms = 0;
-                wqn::RequestForceFullRefresh();
-                ESP_LOGI(kTag, "AI status-bar: tier switch -> %d", static_cast<int>(next));
-                return RefreshSchedule::kAi;
-            }
-            // [trash] index 4 = clear-context action: clear + exit immediately.
-            if (state->status_edit.selected == 4) {
-                wqn::ClearAiConversationContext();
-                state->status_edit.active = false;
-                state->status_edit.last_cycle_ms = 0;
-                wqn::RequestForceFullRefresh();
-                ESP_LOGI(kTag, "AI status-bar: trash (clear context) + exit");
-                return RefreshSchedule::kSelection;
-            }
-            constexpr int64_t kStatusBarEditDblMs = 400;
-            // Double-confirm (2nd short-press within window of the last forward
-            // cycle) = save & exit: undo the last cycle so the value saved is the
-            // one BEFORE this double, then leave edit mode. Single short-press =
-            // cycle forward (optimistic). Applies to toggles (1-3) only.
-            if (state->status_edit.last_cycle_ms > 0 &&
-                now_ms - state->status_edit.last_cycle_ms <= kStatusBarEditDblMs) {
-                CycleAiStatusBarToggleReverse(state, state->status_edit.selected);
-                state->status_edit.active = false;
-                state->status_edit.last_cycle_ms = 0;
-                ESP_LOGI(kTag, "AI status-bar edit: save & exit (double-confirm)");
-                return RefreshSchedule::kSelection;
-            }
-            CycleAiStatusBarToggle(state, state->status_edit.selected);
-            state->status_edit.last_cycle_ms = now_ms;
-            state->status_edit.last_action_ms = now_ms;
-            return RefreshSchedule::kSelection;
-        }
-        if (event.type == wqn::ButtonEventType::kLongRelease) {
-            state->status_edit.active = false;
-            state->status_edit.last_cycle_ms = 0;
-            ESP_LOGI(kTag, "AI status-bar edit: exit (long-confirm)");
-            return RefreshSchedule::kSelection;
-        }
-        return RefreshSchedule::kNone;  // consume kPress/kRelease/kLongPress
-    }
-    if (event.button == wqn::ButtonId::kUp || event.button == wqn::ButtonId::kDownPower) {
-        if (event.type == wqn::ButtonEventType::kShortPress ||
-            event.type == wqn::ButtonEventType::kLongPress) {
-            const int dir = (event.button == wqn::ButtonId::kUp) ? -1 : 1;
-            // Flash edit mode has only the tier button (index 0); STD/Pro have 0..4.
-            const int max_idx = (state->ai.tier == wqn::AiTier::kFlash) ? 0 : 4;
-            int s = static_cast<int>(state->status_edit.selected) + dir;
-            if (s < 0) { s = max_idx; }
-            if (s > max_idx) { s = 0; }
-            state->status_edit.selected = static_cast<uint8_t>(s);
-            state->status_edit.last_action_ms = now_ms;
-            // A double-confirm is only meaningful for two presses on the
-            // same toggle. Do not let a recent cycle on the previous icon
-            // reverse a value that was never changed on the new selection.
-            state->status_edit.last_cycle_ms = 0;
-            return RefreshSchedule::kSelection;
-        }
-        return RefreshSchedule::kNone;
-    }
-    return RefreshSchedule::kNone;
-}
-
 RefreshSchedule ApplyButtonEvent(
     const wqn::ButtonEvent& event,
     int64_t event_time_ms,
@@ -330,9 +201,9 @@ RefreshSchedule ApplyButtonEvent(
         return RefreshSchedule::kNone;
     }
 
-    // [shell] Status-bar edit mode intercepts all input on the AI page.
-    if (state->screen == wqn::UiScreen::kAi && state->status_edit.active) {
-        return ApplyStatusBarEditEvent(event, event_time_ms, state);
+    // The shell owns all derived controls while active, independent of page.
+    if (state->status_edit.active) {
+        return ApplyStatusControlEvent(event, event_time_ms, state);
     }
 
     const size_t old_page = state->ai.page;
@@ -437,41 +308,17 @@ RefreshSchedule ApplyButtonEvent(
         return ApplySettingsButtonEvent(event, state);
     }
 
-    // [tier] Tier switch moved to the status-bar edit mode (tier icon, button 0,
-    // confirm cycles tier). The old double-press Up/Down tier switch is removed.
-
-    // [shell] Double-press confirm on AI -> enter status-bar edit mode. Flash
-    // works too: the mis-touch filter (<200ms) discards the PTT captures of the
-    // two short taps, so no voice is submitted. Fast double-press (<500ms) is
-    // caught as kDoublePress directly; slow (two kShortPress within 1s) below.
-    constexpr int64_t kAiStatusBarEditWindowMs = 1000;
-    if (state->screen == wqn::UiScreen::kAi &&
-        event.button == wqn::ButtonId::kConfirm &&
+    // The arbiter guarantees that a double arrives without a preceding
+    // business single. Pages with a provider open the same global shell;
+    // pages without one consume the double without invoking their reducer.
+    if (event.button == wqn::ButtonId::kConfirm &&
         event.type == wqn::ButtonEventType::kDoublePress) {
-        state->status_edit.active = true;
-        state->status_edit.selected = 0;
-        state->status_edit.last_action_ms = event_time_ms;
-        state->status_edit.last_cycle_ms = 0;
-        state->gestures.last_ai_confirm_tap_ms = 0;
-        ESP_LOGI(kTag, "AI status-bar edit: enter (fast double-press)");
-        return RefreshSchedule::kSelection;
-    }
-    if (state->screen == wqn::UiScreen::kAi &&
-        event.type == wqn::ButtonEventType::kShortPress &&
-        event.button == wqn::ButtonId::kConfirm) {
-        if (state->gestures.last_ai_confirm_tap_ms > 0 &&
-            event_time_ms - state->gestures.last_ai_confirm_tap_ms <=
-            kAiStatusBarEditWindowMs) {
-            state->status_edit.active = true;
-            state->status_edit.selected = 0;
-            state->status_edit.last_action_ms = event_time_ms;
-            state->status_edit.last_cycle_ms = 0;
-            state->gestures.last_ai_confirm_tap_ms = 0;
-            ESP_LOGI(kTag, "AI status-bar edit: enter (double-confirm)");
-            return RefreshSchedule::kSelection;
+        if (!OpenStatusControls(event_time_ms, state)) {
+            return RefreshSchedule::kNone;
         }
-        state->gestures.last_ai_confirm_tap_ms = event_time_ms;
-        // fall through: first tap acts normally
+        return state->status_edit.provider == wqn::StatusControlProvider::kWord
+            ? RefreshSchedule::kStatus
+            : RefreshSchedule::kSelection;
     }
 
     // Flash PTT already started at kHoldPress (200ms); swallow legacy 1s
@@ -529,7 +376,7 @@ RefreshSchedule ApplyButtonEvent(
     // v2 AI scroll: short-press Up/Down on AI page drives the chat
     // viewport instead of paging through the assistant text. We do this
     // explicitly here (instead of letting it fall through to HandleUiInput)
-    // so tier switch (kDoublePress) remains untouched and idle stays clean.
+    // so the status-shell gesture stays isolated and idle stays clean.
     //
     // Recording / waiting state must NOT scroll — the page is reserved for
     // the recording surface.
@@ -654,7 +501,7 @@ RefreshSchedule ApplyButtonEvent(
 
     if (state->screen != old_screen) {
         state->gestures.flash_ptt_started = false;
-        state->gestures.last_ai_confirm_tap_ms = 0;
+        CloseStatusControls(state);
         if (state->screen == wqn::UiScreen::kTodo) {
             RefreshTodosFromCloud(state);
         } else if (state->screen == wqn::UiScreen::kWord && state->word_app.cloud_sync_requested) {

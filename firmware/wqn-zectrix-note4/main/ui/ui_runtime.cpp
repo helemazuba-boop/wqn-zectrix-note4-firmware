@@ -3,6 +3,7 @@
 #include <utility>
 
 #include "esp_log.h"
+#include "ui/status_control.h"
 #include "ui_internal.h"
 
 namespace device_ui_internal {
@@ -284,16 +285,22 @@ UiUpdate UiRuntime::DispatchClockMinute(bool panel_needs_refresh)
 UiUpdate UiRuntime::DispatchStatusEditTimeout(int64_t now_ms)
 {
     const bool expired =
-        state_.status_edit.active && state_.screen == wqn::UiScreen::kAi &&
+        state_.status_edit.active &&
         state_.status_edit.last_action_ms > 0 &&
         now_ms - state_.status_edit.last_action_ms >= 3000;
     if (expired) {
-        state_.status_edit.active = false;
+        const bool word_provider =
+            state_.status_edit.provider == wqn::StatusControlProvider::kWord;
+        CloseStatusControls(&state_);
+        return FinishEvent(
+            AppEventKind::kStatusEditTimeout,
+            word_provider ? RefreshSchedule::kStatus : RefreshSchedule::kSelection,
+            true);
     }
     return FinishEvent(
         AppEventKind::kStatusEditTimeout,
-        expired ? RefreshSchedule::kSelection : RefreshSchedule::kNone,
-        expired);
+        RefreshSchedule::kNone,
+        false);
 }
 
 UiUpdate UiRuntime::DispatchStatusReload(wqn::AppState&& snapshot)
@@ -351,12 +358,17 @@ UiUpdate UiRuntime::DispatchSyncResult(const wqn::services::SyncEvent& event)
     }
     const bool visible =
         state_.screen == wqn::UiScreen::kSettings ||
-        state_.screen == wqn::UiScreen::kHome;
+        state_.screen == wqn::UiScreen::kHome ||
+        (state_.screen == wqn::UiScreen::kWord &&
+         state_.status_edit.active &&
+         state_.status_edit.provider == wqn::StatusControlProvider::kWord);
     const RefreshSchedule refresh =
         changed && visible
             ? (state_.screen == wqn::UiScreen::kSettings && claim_state_changed
                    ? RefreshSchedule::kCommit
-                   : RefreshSchedule::kSelection)
+                   : (state_.screen == wqn::UiScreen::kWord
+                          ? RefreshSchedule::kStatus
+                          : RefreshSchedule::kSelection))
             : RefreshSchedule::kNone;
     return FinishEvent(
         AppEventKind::kSyncResult,

@@ -68,6 +68,7 @@ struct WordPackIndexEntry {
 
 struct WordPackIdentity {
     char deck_id[37] = {};
+    char title[65] = {};
     uint64_t content_revision = 0;
     uint64_t pack_revision = 0;
     char sha256[65] = {};

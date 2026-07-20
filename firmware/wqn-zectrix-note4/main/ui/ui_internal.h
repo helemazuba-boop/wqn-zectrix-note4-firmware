@@ -45,6 +45,7 @@ constexpr std::time_t kMinReasonableUnixTime = 1704067200;  // 2024-01-01 UTC
 enum class RefreshSchedule {
     kNone,
     kConfig,
+    kStatus,
     kAi,
     kClock,
     kSelection,
@@ -76,6 +77,7 @@ constexpr TickType_t kClockRefreshDelay = pdMS_TO_TICKS(80);
 constexpr TickType_t kTimerRefreshDelay = pdMS_TO_TICKS(80);
 constexpr TickType_t kSelectionRefreshDelay = pdMS_TO_TICKS(180);
 constexpr TickType_t kConfigRefreshDelay = pdMS_TO_TICKS(120);
+constexpr TickType_t kStatusControlRefreshDelay = pdMS_TO_TICKS(100);
 constexpr TickType_t kAiRefreshDelay = pdMS_TO_TICKS(120);
 
 constexpr size_t kSettingsItemCount = 7;

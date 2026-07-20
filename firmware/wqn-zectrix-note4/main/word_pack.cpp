@@ -943,6 +943,11 @@ esp_err_t LoadWordPackIndexInternal(
             sizeof(identity.deck_id),
             "%s",
             item.deck_id.c_str());
+        std::snprintf(
+            identity.title,
+            sizeof(identity.title),
+            "%s",
+            item.title.c_str());
         identity.content_revision = item.content_revision;
         identity.pack_revision = item.pack_revision;
         std::snprintf(

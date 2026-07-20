@@ -126,7 +126,9 @@ void DrawAiStatusBar(const wqn::AiSessionState& ai, const wqn::HomeSummary& home
     // Left: page title + tier chip.
     // [tier-icon] Tier indicator + edit-mode button 0 (replaces "AI" + tier text):
     // Flash=lightning, STD=hourglass, Pro=brain. confirm cycles tier (all tiers).
-    const bool tier_sel = status_edit.active && status_edit.selected == 0;
+    const bool editing = status_edit.active &&
+        status_edit.provider == wqn::StatusControlProvider::kAi;
+    const bool tier_sel = editing && status_edit.selected == 0;
     switch (ai.tier) {
         case wqn::AiTier::kFlash: DrawLightningIcon(6, kAiToggleY, tier_sel); break;
         case wqn::AiTier::kPro:   DrawBrainIcon(6, kAiToggleY, tier_sel); break;
@@ -137,13 +139,13 @@ void DrawAiStatusBar(const wqn::AiSessionState& ai, const wqn::HomeSummary& home
     // [shell] Toggle zone (STD/Pro only): thinking(1)/TTS(2)/expand(3)/trash(4).
     // Flash hides the whole zone (only the tier icon, button 0, is editable).
     if (ai.tier != wqn::AiTier::kFlash) {
-        if (status_edit.active) {
+        if (editing) {
             DrawRect(kAiToggleX - 4, kAiToggleY - 2, kAiToggleStep * 4 + 2, 20);
         }
-        DrawThinkingIcon(kAiToggleX + 0 * kAiToggleStep, kAiToggleY, ai.thinking_level, status_edit.active && status_edit.selected == 1);
-        DrawTtsIcon(kAiToggleX + 1 * kAiToggleStep, kAiToggleY, ai.tts_on, status_edit.active && status_edit.selected == 2);
-        DrawExpandIcon(kAiToggleX + 2 * kAiToggleStep, kAiToggleY, ai.expand_content, status_edit.active && status_edit.selected == 3);
-        DrawTrashIcon(kAiToggleX + 3 * kAiToggleStep, kAiToggleY, status_edit.active && status_edit.selected == 4);
+        DrawThinkingIcon(kAiToggleX + 0 * kAiToggleStep, kAiToggleY, ai.thinking_level, editing && status_edit.selected == 1);
+        DrawTtsIcon(kAiToggleX + 1 * kAiToggleStep, kAiToggleY, ai.tts_on, editing && status_edit.selected == 2);
+        DrawExpandIcon(kAiToggleX + 2 * kAiToggleStep, kAiToggleY, ai.expand_content, editing && status_edit.selected == 3);
+        DrawTrashIcon(kAiToggleX + 3 * kAiToggleStep, kAiToggleY, editing && status_edit.selected == 4);
     }
 
     // Center column: when the toast is visible, replace the clock with the

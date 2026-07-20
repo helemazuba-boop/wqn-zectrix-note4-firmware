@@ -51,6 +51,8 @@ int RefreshRank(RefreshSchedule schedule)
     switch (schedule) {
         case RefreshSchedule::kConfig:
             return 1;
+        case RefreshSchedule::kStatus:
+            return 2;
         case RefreshSchedule::kAi:
             return 2;
         case RefreshSchedule::kClock:
@@ -76,6 +78,8 @@ const char* RefreshScheduleName(RefreshSchedule schedule)
     switch (schedule) {
         case RefreshSchedule::kConfig:
             return "config";
+        case RefreshSchedule::kStatus:
+            return "status";
         case RefreshSchedule::kAi:
             return "ai";
         case RefreshSchedule::kSelection:
@@ -103,6 +107,8 @@ TickType_t RefreshDelay(RefreshSchedule schedule)
             return 0;
         case RefreshSchedule::kConfig:
             return kConfigRefreshDelay;
+        case RefreshSchedule::kStatus:
+            return kStatusControlRefreshDelay;
         case RefreshSchedule::kAi:
             return kAiRefreshDelay;
         case RefreshSchedule::kSelection:
@@ -484,6 +490,16 @@ std::string FrameSignature(const wqn::UiFrame& frame)
         signature.append(std::to_string(frame.word_app.dictionary_match_selected));
         signature.push_back('/');
         signature.append(frame.word_app.hint);
+        signature.push_back('/');
+        signature.append(frame.status_edit.active ? "1" : "0");
+        signature.push_back('/');
+        signature.append(std::to_string(static_cast<int>(frame.status_edit.provider)));
+        signature.push_back('/');
+        signature.append(std::to_string(frame.status_edit.selected));
+        signature.push_back('/');
+        signature.append(frame.word_app.scope_control_label);
+        signature.push_back('/');
+        signature.append(frame.word_app.sync_control_label);
     }
     if (frame.screen == wqn::UiScreen::kSettings) {
         const wqn::SettingsDiagnosticsSnapshot& diag = frame.settings.diagnostics;

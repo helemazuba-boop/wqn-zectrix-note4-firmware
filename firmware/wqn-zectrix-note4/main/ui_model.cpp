@@ -336,6 +336,9 @@ void RenderWord(const wqn::UiState& state, wqn::UiFrame* frame)
         return;
     }
     frame->word_app = wqn::BuildWordAppSnapshot(state.word_app);
+    frame->word_app.sync_control_label = state.status.last_sync_status.empty()
+        ? "立即同步"
+        : state.status.last_sync_status;
 }
 
 void RenderLibrary(const wqn::UiState& state, wqn::UiFrame* frame)
@@ -778,6 +781,9 @@ UiFrame RenderUiFrame(const UiState& state)
     frame.status_edit = state.status_edit;  // [shell] status-bar edit mode
     frame.todo = state.todo;
     frame.word_app = BuildWordAppSnapshot(state.word_app);
+    frame.word_app.sync_control_label = state.status.last_sync_status.empty()
+        ? "立即同步"
+        : state.status.last_sync_status;
     frame.settings = state.settings;
     frame.selected_home_task = state.selected_home_task;
     // [force-full-fix] Check the one-shot flag but do NOT consume it here.

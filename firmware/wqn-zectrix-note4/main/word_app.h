@@ -86,6 +86,11 @@ struct WordAppState {
     // to the word home screen.
     WordPackIndex pending_pack_index;
     bool pending_pack_index_ready = false;
+    // Empty means all visible decks. Changing this while a session is active
+    // only affects the next session; the current server-issued scope remains
+    // pinned in session.persisted.remote.
+    std::string preferred_scope_deck_id;
+    bool scope_change_pending = false;
     WqnWordEntry current_word;
 
     std::string dictionary_prefix;
@@ -142,6 +147,8 @@ struct WordAppSnapshot {
     std::string progress_line;
     std::string status_line;
     std::string hint;
+    std::string scope_control_label;
+    std::string sync_control_label;
 };
 
 esp_err_t InitWordApp(WordAppState* state);
@@ -178,6 +185,8 @@ void RefreshWordOutboxState(WordAppState* state);
 WordAppSnapshot BuildWordAppSnapshot(const WordAppState& state);
 std::string WordAppProgressLabel(const WordAppState& state);
 std::string WordAppStatusLine(const WordAppState& state);
+std::string WordScopeControlLabel(const WordAppState& state);
+void CycleWordScopeForNextSession(WordAppState* state);
 std::string WordAppSignature(const WordAppState& state);
 
 }  // namespace wqn
