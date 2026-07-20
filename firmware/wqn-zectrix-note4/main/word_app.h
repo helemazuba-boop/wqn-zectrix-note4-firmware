@@ -22,12 +22,24 @@ enum class WordInput {
 enum class WordAppMode : uint8_t {
     kHome,
     kSessionStarting,
-    kReviewFront,
-    kReviewBack,
+    kDictionaryPicker,
+    kWordCard,
+};
+
+enum class WordCardPhase : uint8_t {
+    kFront,
+    kRevealed,
+    kPersisting,
+};
+
+enum class WordCardSource : uint8_t {
+    kStudy,
     kDictionary,
-    kDictionaryDetail,
+};
+
+enum class WordDictionaryStage : uint8_t {
+    kLetters,
     kLookupChoice,
-    kLookupResult,
 };
 
 enum class WordHomeSelection : uint8_t {
@@ -52,6 +64,7 @@ enum class WordObservationCommitState : uint8_t {
 
 struct WordSessionState {
     bool start_requested = false;
+    bool start_result_expected = false;
     protocol::word_study_v1::Mode requested_mode =
         protocol::word_study_v1::Mode::kSequential;
     std::string create_request_id;
@@ -72,6 +85,9 @@ struct WordOutboxState {
 struct WordAppState {
     bool initialized = false;
     WordAppMode mode = WordAppMode::kHome;
+    WordCardPhase card_phase = WordCardPhase::kFront;
+    WordCardSource card_source = WordCardSource::kStudy;
+    WordDictionaryStage dictionary_stage = WordDictionaryStage::kLetters;
     WordHomeSelection home_selection = WordHomeSelection::kSequential;
     WordLookupSelection lookup_selection = WordLookupSelection::kOnlineSearch;
     uint16_t reviewed_today = 0;
@@ -103,13 +119,20 @@ struct WordAppState {
     bool cloud_loaded_once = false;
     bool search_pending = false;
     bool ai_lookup_pending = false;
+    bool lookup_result_expected = false;
     std::string pending_search_query;
     std::string pending_ai_query;
+    std::string active_lookup_query;
+    bool sequential_session_resumable = false;
+    bool random_session_resumable = false;
     std::string message;
 };
 
 struct WordAppSnapshot {
     WordAppMode mode = WordAppMode::kHome;
+    WordCardPhase card_phase = WordCardPhase::kFront;
+    WordCardSource card_source = WordCardSource::kStudy;
+    WordDictionaryStage dictionary_stage = WordDictionaryStage::kLetters;
     WordHomeSelection home_selection = WordHomeSelection::kSequential;
     WordLookupSelection lookup_selection = WordLookupSelection::kOnlineSearch;
     bool has_card = false;
@@ -117,10 +140,10 @@ struct WordAppSnapshot {
     bool pack_ready = false;
     bool pack_truncated = false;
     bool cloud_sync_failed = false;
+    bool sequential_session_resumable = false;
+    bool random_session_resumable = false;
     uint16_t reviewed_today = 0;
     uint16_t correct_today = 0;
-    uint16_t daily_target = 20;
-    uint16_t due_count = 0;
     uint16_t total_count = 0;
     uint16_t card_position = 0;
     uint16_t card_count = 0;
@@ -147,17 +170,29 @@ struct WordAppSnapshot {
 esp_err_t InitWordApp(WordAppState* state);
 esp_err_t HandleWordAppInput(WordAppState* state, WordInput input);
 void ApplyWordPackIndex(WordAppState* state, WordPackIndex index, const std::string& message);
-void ApplyWordSearchResult(WordAppState* state, const WqnWordSearchResult& result);
-void ApplyWordAiLookupResult(WordAppState* state, const WqnWordAiLookupResult& result);
+bool ApplyWordSearchResult(
+    WordAppState* state,
+    const std::string& query,
+    const WqnWordSearchResult& result);
+bool ApplyWordAiLookupResult(
+    WordAppState* state,
+    const std::string& query,
+    const WqnWordAiLookupResult& result);
+bool ApplyWordLookupFailure(
+    WordAppState* state,
+    const std::string& query,
+    const std::string& message);
+void CancelWordLookupResult(WordAppState* state);
 bool TakeWordSearchRequest(WordAppState* state, WqnWordSearchRequest* request);
 bool TakeWordAiLookupRequest(WordAppState* state, WqnWordAiLookupRequest* request);
 bool TakeWordSessionStartRequest(
     WordAppState* state,
     protocol::word_study_v1::CreateSessionRequest* request);
-void ApplyWordSessionStartResult(
+bool ApplyWordSessionStartResult(
     WordAppState* state,
     esp_err_t result,
     protocol::word_study_v1::SessionData session);
+void CancelWordSessionStartResult(WordAppState* state);
 bool TakeWordCandidatePageRequest(
     WordAppState* state,
     protocol::word_study_v1::CandidatePageRequest* request,
@@ -179,5 +214,6 @@ WordAppSnapshot BuildWordAppSnapshot(const WordAppState& state);
 std::string WordAppProgressLabel(const WordAppState& state);
 std::string WordAppStatusLine(const WordAppState& state);
 std::string WordAppSignature(const WordAppState& state);
+bool RunWordPageStateSelfTest();
 
 }  // namespace wqn

@@ -179,6 +179,7 @@ struct WordCloudResult {
     wqn::protocol::v3::Error protocol_error;
     wqn::WqnWordSearchResult search;
     wqn::WqnWordAiLookupResult lookup;
+    std::string query;
     std::string message;
 };
 

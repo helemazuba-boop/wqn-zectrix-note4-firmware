@@ -1,4 +1,4 @@
-// Word review page rendering: home, dictionary, lookup choice, card front/back.
+// Word page rendering: home, dictionary picker and one shared card surface.
 // Extracted from device_ui.cpp.
 
 #include "ui_internal.h"
@@ -83,8 +83,11 @@ esp_err_t RenderWordToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
         ESP_RETURN_ON_ERROR(
             draw_card(kCardY0,
                       w01_word_review_sequential_24_asset,
-                      "顺序复习",
-                      ready ? "从词库开始" : "需同步词库",
+                      "顺序",
+                      ready ? (word.sequential_session_resumable
+                                   ? "可继续上次会话"
+                                   : "按词库顺序浏览")
+                            : "需同步词库",
                       ready ? count_chip : "未同步",
                       word.home_selection == wqn::WordHomeSelection::kSequential),
             kTag,
@@ -92,8 +95,11 @@ esp_err_t RenderWordToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
         ESP_RETURN_ON_ERROR(
             draw_card(kCardY0 + (kCardH + kCardGap),
                       w02_word_review_random_24_asset,
-                      "随机复习",
-                      ready ? "打乱今日词" : "需同步词库",
+                      "随机",
+                      ready ? (word.random_session_resumable
+                                   ? "可继续上次会话"
+                                   : "随机浏览词库")
+                            : "需同步词库",
                       ready ? count_chip : "未同步",
                       word.home_selection == wqn::WordHomeSelection::kRandom),
             kTag,
@@ -114,7 +120,37 @@ esp_err_t RenderWordToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
         return RefreshFrame(frame, schedule);
     }
 
-    if (word.mode == wqn::WordAppMode::kDictionary) {
+    if (word.mode == wqn::WordAppMode::kDictionaryPicker) {
+        if (word.dictionary_stage ==
+            wqn::WordDictionaryStage::kLookupChoice) {
+            ESP_RETURN_ON_ERROR(
+                DrawCenteredText(20, 76, 360, word.dictionary_prefix),
+                kTag,
+                "draw lookup query");
+            ESP_RETURN_ON_ERROR(
+                draw_choice(128, "在线搜索", "查 WQN 服务器",
+                            word.lookup_selection ==
+                                wqn::WordLookupSelection::kOnlineSearch),
+                kTag,
+                "draw online lookup choice");
+            ESP_RETURN_ON_ERROR(
+                draw_choice(182, "询问 AI", "跳转到 AI",
+                            word.lookup_selection ==
+                                wqn::WordLookupSelection::kAiLookup),
+                kTag,
+                "draw ai lookup choice");
+            ESP_RETURN_ON_ERROR(
+                DrawClippedText(12, 278, 376, word.hint),
+                kTag,
+                "draw word hint");
+            if (schedule == RefreshSchedule::kSelection ||
+                schedule == RefreshSchedule::kConfig) {
+                return RefreshRegion(
+                    {0, 64, wqn::kEpdWidth, 236, "word-dictionary-picker"},
+                    schedule);
+            }
+            return RefreshFrame(frame, schedule);
+        }
         const std::string prefix = word.dictionary_prefix.empty() ? "选择首字母" : word.dictionary_prefix;
         ESP_RETURN_ON_ERROR(DrawCenteredText(20, 70, 360, prefix), kTag, "draw dictionary prefix");
         const int start_x = 28;
@@ -139,20 +175,12 @@ esp_err_t RenderWordToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
             y += 22;
         }
         ESP_RETURN_ON_ERROR(DrawClippedText(12, 278, 376, word.hint), kTag, "draw word hint");
-        return RefreshFrame(frame, schedule);
-    }
-
-    if (word.mode == wqn::WordAppMode::kLookupChoice) {
-        ESP_RETURN_ON_ERROR(DrawCenteredText(20, 76, 360, word.dictionary_prefix), kTag, "draw lookup query");
-        ESP_RETURN_ON_ERROR(
-            draw_choice(128, "在线搜索", "查 WQN 服务器", word.lookup_selection == wqn::WordLookupSelection::kOnlineSearch),
-            kTag,
-            "draw online lookup choice");
-        ESP_RETURN_ON_ERROR(
-            draw_choice(182, "询问 AI", "临时释义", word.lookup_selection == wqn::WordLookupSelection::kAiLookup),
-            kTag,
-            "draw ai lookup choice");
-        ESP_RETURN_ON_ERROR(DrawClippedText(12, 278, 376, word.hint), kTag, "draw word hint");
+        if (schedule == RefreshSchedule::kSelection ||
+            schedule == RefreshSchedule::kConfig) {
+            return RefreshRegion(
+                {0, 64, wqn::kEpdWidth, 236, "word-dictionary-picker"},
+                schedule);
+        }
         return RefreshFrame(frame, schedule);
     }
 
@@ -174,14 +202,28 @@ esp_err_t RenderWordToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
         ESP_RETURN_ON_ERROR(DrawCenteredText(20, 118, 360, word.phonetic), kTag, "draw word phonetic");
     }
 
-    if (word.mode == wqn::WordAppMode::kReviewFront) {
+    if (word.card_phase == wqn::WordCardPhase::kFront) {
         DrawRect(74, 164, 252, 48);
         ESP_RETURN_ON_ERROR(DrawCenteredText(74, 181, 252, "先回忆释义"), kTag, "draw recall prompt");
     } else {
         ESP_RETURN_ON_ERROR(draw_word_back(), kTag, "draw word back");
     }
 
+    if (word.card_phase == wqn::WordCardPhase::kPersisting) {
+        DrawRoundedRect(122, 250, 156, 24, 5);
+        ESP_RETURN_ON_ERROR(
+            DrawCenteredText(122, 256, 156, "正在保存"),
+            kTag,
+            "draw word persisting");
+    }
+
     ESP_RETURN_ON_ERROR(DrawClippedText(12, 278, 376, word.hint), kTag, "draw word hint");
+    if (schedule == RefreshSchedule::kSelection ||
+        schedule == RefreshSchedule::kConfig) {
+        return RefreshRegion(
+            {0, 64, wqn::kEpdWidth, 236, "word-card"},
+            schedule);
+    }
     return RefreshFrame(frame, schedule);
 }
 

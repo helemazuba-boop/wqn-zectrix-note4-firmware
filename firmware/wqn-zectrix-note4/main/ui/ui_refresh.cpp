@@ -465,7 +465,18 @@ std::string FrameSignature(const wqn::UiFrame& frame)
         signature.append("|word:");
         signature.append(std::to_string(static_cast<int>(frame.word_app.mode)));
         signature.push_back('/');
+        signature.append(std::to_string(static_cast<int>(frame.word_app.card_phase)));
+        signature.push_back('/');
+        signature.append(std::to_string(static_cast<int>(frame.word_app.card_source)));
+        signature.push_back('/');
+        signature.append(std::to_string(static_cast<int>(frame.word_app.dictionary_stage)));
+        signature.push_back('/');
         signature.append(std::to_string(static_cast<int>(frame.word_app.home_selection)));
+        signature.push_back('/');
+        signature.append(
+            frame.word_app.sequential_session_resumable ? "1" : "0");
+        signature.append(
+            frame.word_app.random_session_resumable ? "1" : "0");
         signature.push_back('/');
         signature.append(std::to_string(frame.word_app.card_position));
         signature.push_back('/');

@@ -689,10 +689,19 @@ RefreshSchedule ApplyButtonEvent(
         session_request.metadata = wqn::services::MakeDeviceRequestMetadata();
         if (wqn::TakeWordSessionStartRequest(&state->word_app, &session_request) &&
             !QueueWordSessionStart(session_request)) {
-            state->word_app.mode = wqn::WordAppMode::kHome;
-            state->word_app.message = IsWordCloudBusy()
-                ? "单词服务忙，请重试"
-                : "本轮准备失败，请重试";
+            wqn::CancelWordSessionStartResult(&state->word_app);
+            if (session_request.mode ==
+                wqn::protocol::word_study_v1::Mode::kDictionary) {
+                state->word_app.session.requested_mode =
+                    wqn::protocol::word_study_v1::Mode::kDictionary;
+                state->word_app.session.start_requested = true;
+                state->word_app.message = "词典可浏览，记录稍后准备";
+            } else {
+                state->word_app.mode = wqn::WordAppMode::kHome;
+                state->word_app.message = IsWordCloudBusy()
+                    ? "单词服务忙，请重试"
+                    : "本轮准备失败，请重试";
+            }
         }
         wqn::DurableWordObservation observation;
         wqn::PersistedWordSession advanced_session;

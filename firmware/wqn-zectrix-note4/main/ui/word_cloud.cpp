@@ -207,10 +207,17 @@ bool ApplyWordCloudResult(wqn::UiState* state, WordCloudResult& result)
     }
 
     if (result.op == WordCloudOp::kStartSession) {
-        wqn::ApplyWordSessionStartResult(
+        if (state->screen != wqn::UiScreen::kWord) {
+            wqn::CancelWordSessionStartResult(&state->word_app);
+            state->word_app.mode = wqn::WordAppMode::kHome;
+            state->word_app.message = "已取消本轮准备";
+            return false;
+        }
+        const bool applied = wqn::ApplyWordSessionStartResult(
             &state->word_app,
             result.result,
             std::move(result.session));
+        if (!applied) return false;
         BuildHomeSummary(state);
         return true;
     }
@@ -223,20 +230,34 @@ bool ApplyWordCloudResult(wqn::UiState* state, WordCloudResult& result)
         return true;
     }
     if (result.op == WordCloudOp::kSearch) {
-        if (result.result == ESP_OK) {
-            wqn::ApplyWordSearchResult(&state->word_app, result.search);
-        } else {
-            state->word_app.message = result.auth_required ? "请重新配对" : "在线搜索失败";
+        if (state->screen != wqn::UiScreen::kWord) {
+            wqn::CancelWordLookupResult(&state->word_app);
+            return false;
         }
+        const bool applied = result.result == ESP_OK
+            ? wqn::ApplyWordSearchResult(
+                  &state->word_app, result.query, result.search)
+            : wqn::ApplyWordLookupFailure(
+                  &state->word_app,
+                  result.query,
+                  result.auth_required ? "请重新配对" : "在线搜索失败");
+        if (!applied) return false;
         BuildHomeSummary(state);
         return true;
     }
     if (result.op == WordCloudOp::kAiLookup) {
-        if (result.result == ESP_OK) {
-            wqn::ApplyWordAiLookupResult(&state->word_app, result.lookup);
-        } else {
-            state->word_app.message = result.auth_required ? "请重新配对" : "AI 查词失败";
+        if (state->screen != wqn::UiScreen::kWord) {
+            wqn::CancelWordLookupResult(&state->word_app);
+            return false;
         }
+        const bool applied = result.result == ESP_OK
+            ? wqn::ApplyWordAiLookupResult(
+                  &state->word_app, result.query, result.lookup)
+            : wqn::ApplyWordLookupFailure(
+                  &state->word_app,
+                  result.query,
+                  result.auth_required ? "请重新配对" : "AI 查词失败");
+        if (!applied) return false;
         BuildHomeSummary(state);
         return true;
     }
@@ -259,6 +280,7 @@ void WordCloudTask(void*)
         }
         WordCloudResult& result = g_word_result_slot;
         result.op = request.op;
+        result.query = request.query;
         result.message.clear();
 
         std::string token;
