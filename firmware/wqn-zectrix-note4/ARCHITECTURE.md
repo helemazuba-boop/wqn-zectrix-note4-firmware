@@ -52,6 +52,13 @@ Features also remain in `main` until their interfaces are equally stable.
 `platform_note4` may drive rails low before services start. This is a
 bootstrap-only safety exception; after bring-up it does not run again.
 
+Storage media are deliberately tiered. NVS is reserved for bounded control
+state such as identity, Wi-Fi, schema markers, revisions, cursors and settings.
+SPIFFS stores reconstructable content, word packs and durable outboxes. Problem
+content uses WQPC v1 (compact CBOR records, 32 KiB-target DEFLATE blocks, CRC and
+atomic temp/backup/rename). PSRAM may hold the active decoded snapshot but is
+never a persistence or sync-checkpoint source.
+
 ## Startup and sleep
 
 `app_main` performs only assembly:

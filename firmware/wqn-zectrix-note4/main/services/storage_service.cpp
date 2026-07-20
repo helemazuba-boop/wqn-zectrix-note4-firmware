@@ -11,7 +11,10 @@ namespace {
 constexpr char kTag[] = "storage_service";
 constexpr UBaseType_t kQueueDepth = 8;
 constexpr UBaseType_t kReplyQueueDepth = 4;
-constexpr uint32_t kTaskStackBytes = 4096;
+// ESP-IDF's ROM miniz test requires an 8 KiB task stack. Problem-cache WQPC
+// transactions run DEFLATE inside this sole-writer task, so retaining the old
+// 4 KiB stack would turn a storage-capacity fix into a stack-corruption risk.
+constexpr uint32_t kTaskStackBytes = 8192;
 constexpr UBaseType_t kTaskPriority = 6;
 
 struct StorageCommand {

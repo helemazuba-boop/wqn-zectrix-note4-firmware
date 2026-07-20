@@ -14,6 +14,7 @@ idf_component_register(
         "power_manager.cpp"
         "power/wake_controller.cpp"
         "pcf8563.cpp"
+        "problem_cache.cpp"
         "provision_manager.cpp"
         "runtime/storage_schema.cpp"
         "services/connectivity_service.cpp"
@@ -64,6 +65,7 @@ idf_component_register(
         esp_event
         esp_netif
         esp_psram
+        esp_rom
         esp_driver_usb_serial_jtag
         esp_wifi
         wqn_wifi_provision

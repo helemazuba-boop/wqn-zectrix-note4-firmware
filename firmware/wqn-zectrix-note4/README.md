@@ -38,8 +38,10 @@ on the server.
   with cooldown and idle power-off controls.
 - AI audio path: long-press confirm to record, release to upload 16 kHz mono PCM
   to the WQN server, then display transcript, reply text, and action summaries.
-- Local storage: NVS-backed pairing token and small device-side caches used for
-  offline display and retry behavior.
+- Local storage: NVS holds only small control state (pairing/WiFi credentials,
+  revisions, cursors and settings). Durable content lives on SPIFFS; the problem
+  cache uses the versioned, block-compressed WQPC format with atomic temp/rename
+  commits, while PSRAM is used only for volatile decode/UI snapshots.
 
 ## Security Boundary
 

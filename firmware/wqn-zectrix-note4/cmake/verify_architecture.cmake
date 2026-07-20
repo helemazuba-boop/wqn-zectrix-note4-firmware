@@ -122,6 +122,11 @@ foreach(source IN LISTS firmware_sources)
     endif()
 endforeach()
 
+wqn_reject(
+    "main/storage.cpp"
+    "SaveBlobToNvs[ \t\r\n]*\\([ \t\r\n]*kProblemsKey"
+    "problem content cache must use the bounded WQPC SPIFFS transaction, never NVS")
+
 set(removed_legacy_paths
     main/epd_display.cpp
     main/epd_display.h

@@ -21,6 +21,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "nvs.h"
 #include "runtime/sleep_coordinator.h"
 #include "storage.h"
 #include "wqn_api.h"
@@ -48,6 +49,7 @@ constexpr uint32_t kClaimPollFloorMs = 10000;
 constexpr uint32_t kClaimPollJitterMaxMs = 2000;
 constexpr uint32_t kClaimRetryBaseMs = 15000;
 constexpr uint32_t kClaimRetryMaxMs = 5 * 60 * 1000;
+constexpr uint32_t kStorageCapacityRetryMs = 5 * 60 * 1000;
 constexpr uint8_t kClaimRetryMaxShift = 4;
 std::string g_bootstrap_request_id;
 std::string g_sync_request_id;
@@ -57,6 +59,28 @@ std::string g_claim_id;
 uint32_t g_claim_poll_interval_ms = kClaimPollFloorMs;
 uint8_t g_claim_retry_attempts = 0;
 bool g_claim_active = false;
+
+bool IsStorageCapacityError(esp_err_t error)
+{
+    return error == ESP_ERR_NO_MEM || error == ESP_ERR_INVALID_SIZE ||
+        error == ESP_ERR_NVS_NOT_ENOUGH_SPACE;
+}
+
+void ApplyStorageCapacityBackoff(esp_err_t error, const char* stage)
+{
+    if (!IsStorageCapacityError(error)) {
+        return;
+    }
+    g_control_retry_after_ms = std::max(
+        g_control_retry_after_ms,
+        kStorageCapacityRetryMs);
+    ESP_LOGW(
+        kTag,
+        "sync storage-full: stage=%s error=%s retry_after_ms=%lu",
+        stage,
+        esp_err_to_name(error),
+        static_cast<unsigned long>(g_control_retry_after_ms));
+}
 
 uint32_t AddClaimJitter(uint32_t base_ms)
 {
@@ -674,10 +698,14 @@ esp_err_t SyncDueProblemsAndCacheV3(const std::string& token)
             wqn::FetchProblems(token, sync.due_problem_ids, &problems),
             kTag,
             "fetch v3 manifest problems");
-        ESP_RETURN_ON_ERROR(
-            MergeProblemCache(problems, "v3 due problems"),
-            kTag,
-            "commit v3 manifest problems");
+        const esp_err_t cache_result = MergeProblemCache(problems, "v3 due problems");
+        if (cache_result != ESP_OK) {
+            ApplyStorageCapacityBackoff(cache_result, "problem-cache");
+            ESP_RETURN_ON_ERROR(
+                cache_result,
+                kTag,
+                "commit v3 manifest problems");
+        }
     }
 
     const wqn::DeviceControlState checkpoint = {
@@ -762,6 +790,9 @@ bool RunSyncRound()
 
     result = RefreshProblemIndexIfAvailable(token);
     if (result != ESP_OK) {
+#if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
+        ApplyStorageCapacityBackoff(result, "problem-index-cache");
+#endif
         ESP_LOGW(kTag, "problem index refresh round failed: %s", esp_err_to_name(result));
         return false;
     }
