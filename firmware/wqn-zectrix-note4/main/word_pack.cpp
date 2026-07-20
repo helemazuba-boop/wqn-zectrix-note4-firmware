@@ -37,6 +37,11 @@ constexpr size_t kMaxPackBytes = wqn::protocol::word_study_v1::kMaxPackBytes;
 constexpr size_t kMaxLineBytes = wqn::protocol::word_study_v1::kMaxPackLineBytes;
 constexpr size_t kPackIdStemChars = 6;
 constexpr size_t kPackHashStemChars = 12;
+constexpr wqn::protocol::word_study_v1::Mode kPersistedSessionModes[] = {
+    wqn::protocol::word_study_v1::Mode::kSequential,
+    wqn::protocol::word_study_v1::Mode::kRandom,
+    wqn::protocol::word_study_v1::Mode::kDictionary,
+};
 // SPIFFS counts the leading slash in its object name and reserves one byte for
 // NUL. Keep the longest final suffix (.wqwp) strictly within that budget.
 constexpr size_t kMaxPackObjectNameBytes =
@@ -307,14 +312,16 @@ void PruneUnreferencedPackFiles(const wqn::WqnWordPackManifest& current)
     std::vector<std::string> pinned_hash_prefixes;
     AddManifestPackStems(current, &retained_stems);
 
-    wqn::PersistedWordSession pinned_session;
-    if (wqn::LoadPersistedWordSession(&pinned_session) == ESP_OK &&
-        pinned_session.active) {
-        for (const auto& snapshot : pinned_session.remote.snapshot) {
-            const std::string sha256 = snapshot.sha256;
-            if (sha256.size() >= kPackHashStemChars) {
-                pinned_hash_prefixes.push_back(
-                    sha256.substr(0, kPackHashStemChars));
+    for (const auto mode : kPersistedSessionModes) {
+        wqn::PersistedWordSession pinned_session;
+        if (wqn::LoadPersistedWordSession(mode, &pinned_session) == ESP_OK &&
+            pinned_session.active) {
+            for (const auto& snapshot : pinned_session.remote.snapshot) {
+                const std::string sha256 = snapshot.sha256;
+                if (sha256.size() >= kPackHashStemChars) {
+                    pinned_hash_prefixes.push_back(
+                        sha256.substr(0, kPackHashStemChars));
+                }
             }
         }
     }
@@ -863,7 +870,9 @@ esp_err_t SaveWordPackManifest(const WqnWordPackManifest& manifest)
         const_cast<WqnWordPackManifest*>(&manifest));
 }
 
-esp_err_t LoadWordPackIndex(WordPackIndex* index)
+esp_err_t LoadWordPackIndexInternal(
+    const PersistedWordSession* pinned_session,
+    WordPackIndex* index)
 {
     if (index == nullptr) {
         return ESP_ERR_INVALID_ARG;
@@ -888,10 +897,8 @@ esp_err_t LoadWordPackIndex(WordPackIndex* index)
     }
 
     bool pinned_pack_missing = false;
-    PersistedWordSession pinned_session;
-    if (LoadPersistedWordSession(&pinned_session) == ESP_OK &&
-        pinned_session.active) {
-        for (const auto& snapshot : pinned_session.remote.snapshot) {
+    if (pinned_session != nullptr && pinned_session->active) {
+        for (const auto& snapshot : pinned_session->remote.snapshot) {
             auto existing = std::find_if(
                 manifest.packs.begin(),
                 manifest.packs.end(),
@@ -1006,6 +1013,25 @@ esp_err_t LoadWordPackIndex(WordPackIndex* index)
         static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)),
         index->truncated ? 1 : 0);
     return ESP_OK;
+}
+
+esp_err_t LoadWordPackIndex(WordPackIndex* index)
+{
+    for (const auto mode : kPersistedSessionModes) {
+        PersistedWordSession session;
+        if (LoadPersistedWordSession(mode, &session) == ESP_OK &&
+            session.active && !session.paused) {
+            return LoadWordPackIndexInternal(&session, index);
+        }
+    }
+    return LoadWordPackIndexInternal(nullptr, index);
+}
+
+esp_err_t LoadWordPackIndexForSession(
+    const PersistedWordSession& session,
+    WordPackIndex* index)
+{
+    return LoadWordPackIndexInternal(&session, index);
 }
 
 enum class WordPackStreamOperation : uint8_t {

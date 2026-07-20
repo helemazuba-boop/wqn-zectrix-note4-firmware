@@ -14,6 +14,11 @@ namespace {
 constexpr char kTag[] = "wqn_word";
 constexpr size_t kDictionaryPreviewLimit = 8;
 constexpr size_t kWordHomeSelectionCount = 3;
+constexpr wqn::protocol::word_study_v1::Mode kPersistedSessionModes[] = {
+    wqn::protocol::word_study_v1::Mode::kSequential,
+    wqn::protocol::word_study_v1::Mode::kRandom,
+    wqn::protocol::word_study_v1::Mode::kDictionary,
+};
 
 size_t SelectionIndex(wqn::WordHomeSelection selection)
 {
@@ -157,7 +162,7 @@ void InstallWordPackIndex(
 void ActivatePendingWordPackIndex(wqn::WordAppState* state)
 {
     if (state == nullptr || state->mode != wqn::WordAppMode::kHome ||
-        state->session.persisted.active ||
+        (state->session.persisted.active && !state->session.persisted.paused) ||
         !state->pending_pack_index_ready) {
         return;
     }
@@ -264,24 +269,56 @@ esp_err_t InitWordApp(WordAppState* state)
         state->outbox.pending_count = outbox.pending_count;
         state->outbox.capacity = outbox.capacity;
     }
-    PersistedWordSession persisted;
-    const esp_err_t session_result = LoadPersistedWordSession(&persisted);
-    if (session_result == ESP_OK && persisted.active &&
-        persisted.position < persisted.remote.items.size()) {
-        state->session.persisted = std::move(persisted);
-        if (!state->session.persisted.paused && LoadCurrentReviewWord(state) == ESP_OK) {
-            state->mode = state->session.persisted.phase == WordPresentationPhase::kBack
-                ? WordAppMode::kReviewBack
-                : WordAppMode::kReviewFront;
-            state->message = "已恢复上次会话";
-        } else {
-            state->mode = WordAppMode::kHome;
-            state->message = "上次会话可继续";
+    bool found_paused_session = false;
+    bool found_corrupt_session = false;
+    for (const auto mode : kPersistedSessionModes) {
+        PersistedWordSession persisted;
+        const esp_err_t session_result = LoadPersistedWordSession(mode, &persisted);
+        if (session_result == ESP_OK && persisted.active &&
+            persisted.position < persisted.remote.items.size()) {
+            // At most one session should be unpaused. Prefer it so a reset
+            // restores the exact card and presentation phase.
+            if (!persisted.paused) {
+                state->session.persisted = std::move(persisted);
+                if (LoadCurrentReviewWord(state) == ESP_OK) {
+                    state->mode = state->session.persisted.phase == WordPresentationPhase::kBack
+                        ? WordAppMode::kReviewBack
+                        : WordAppMode::kReviewFront;
+                    state->message = "已恢复上次会话";
+                } else {
+                    state->mode = WordAppMode::kHome;
+                    state->message = "上次会话可继续";
+                }
+                break;
+            }
+            if (!found_paused_session) {
+                state->session.persisted = std::move(persisted);
+                found_paused_session = true;
+            }
+        } else if (session_result != ESP_OK && session_result != ESP_ERR_NOT_FOUND) {
+            found_corrupt_session = true;
+            ESP_LOGW(
+                kTag,
+                "load persisted word session failed: mode=%u error=%s",
+                static_cast<unsigned>(mode),
+                esp_err_to_name(session_result));
         }
-    } else if (session_result != ESP_OK && session_result != ESP_ERR_NOT_FOUND) {
-        ESP_LOGW(kTag, "load persisted word session failed: %s", esp_err_to_name(session_result));
+    }
+    if (state->mode == WordAppMode::kHome && found_paused_session) {
+        state->message = "上次会话可继续";
+    } else if (state->mode == WordAppMode::kHome && found_corrupt_session) {
         state->message = "会话记录损坏";
     }
+
+    ESP_LOGI(
+        kTag,
+        "word runtime restored: mode=%u session=%s position=%u phase=%u pending=%u",
+        static_cast<unsigned>(state->mode),
+        state->session.persisted.remote.session_id.empty() ? "none" :
+            state->session.persisted.remote.session_id.c_str(),
+        static_cast<unsigned>(state->session.persisted.position),
+        static_cast<unsigned>(state->session.persisted.phase),
+        static_cast<unsigned>(state->outbox.pending_count));
 
     state->initialized = true;
     state->cloud_sync_requested = !state->cloud_loaded_once || state->pack_index.pack_error;
@@ -335,6 +372,21 @@ esp_err_t HandleWordAppInput(WordAppState* state, WordInput input)
             const auto requested_mode = state->home_selection == WordHomeSelection::kRandom
                 ? protocol::word_study_v1::Mode::kRandom
                 : protocol::word_study_v1::Mode::kSequential;
+            PersistedWordSession stored_session;
+            if (LoadPersistedWordSession(requested_mode, &stored_session) == ESP_OK &&
+                stored_session.active && stored_session.paused &&
+                stored_session.position < stored_session.remote.items.size()) {
+                state->session.persisted = std::move(stored_session);
+                WordPackIndex pinned_index;
+                const esp_err_t pinned_result = LoadWordPackIndexForSession(
+                    state->session.persisted, &pinned_index);
+                if (pinned_result != ESP_OK || pinned_index.pack_error) {
+                    state->message = "会话词包不可用";
+                    return ESP_OK;
+                }
+                InstallWordPackIndex(
+                    state, std::move(pinned_index), "已载入会话词包");
+            }
             if (state->session.persisted.active &&
                 state->session.persisted.paused &&
                 state->session.persisted.remote.mode == requested_mode &&
@@ -549,7 +601,8 @@ void ApplyWordPackIndex(WordAppState* state, WordPackIndex index, const std::str
     if (state == nullptr) {
         return;
     }
-    if (state->mode != WordAppMode::kHome || state->session.persisted.active) {
+    if (state->mode != WordAppMode::kHome ||
+        (state->session.persisted.active && !state->session.persisted.paused)) {
         state->pending_pack_index = std::move(index);
         state->pending_pack_index_ready = true;
         state->cloud_loaded_once = state->pending_pack_index.has_manifest;

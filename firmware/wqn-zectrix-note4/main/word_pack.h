@@ -12,6 +12,8 @@
 
 namespace wqn {
 
+struct PersistedWordSession;
+
 // [mem-fix] The word index is large (3500+ entries, each with several short
 // strings -> ~1.4 MB). CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=512 forces every
 // small malloc into the ~298 KB internal RAM, so std::string-backed entries
@@ -85,6 +87,9 @@ esp_err_t MergeWordPackManifestDelta(
     WqnWordPackManifest* merged);
 esp_err_t SaveWordPackManifest(const WqnWordPackManifest& manifest);
 esp_err_t LoadWordPackIndex(WordPackIndex* index);
+esp_err_t LoadWordPackIndexForSession(
+    const PersistedWordSession& session,
+    WordPackIndex* index);
 esp_err_t DownloadWordPackToStorage(
     const std::string& token,
     const protocol::v3::RequestMetadata& metadata,

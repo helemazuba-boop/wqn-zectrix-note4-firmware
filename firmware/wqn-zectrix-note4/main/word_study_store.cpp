@@ -20,9 +20,12 @@
 namespace {
 
 constexpr char kTag[] = "word_store";
-constexpr char kSessionPath[] = "/storage/wsess.v1";
-constexpr char kSessionTempPath[] = "/storage/wsess.tmp";
-constexpr char kSessionBackupPath[] = "/storage/wsess.bak";
+// wsess.* was the short-lived single-slot W4 development format. Keep it as
+// a read-only migration source so devices flashed with 509e785 do not lose an
+// in-progress session. The stable layout has one slot per entry mode.
+constexpr char kLegacySessionPath[] = "/storage/wsess.v1";
+constexpr char kLegacySessionTempPath[] = "/storage/wsess.tmp";
+constexpr char kLegacySessionBackupPath[] = "/storage/wsess.bak";
 constexpr char kOutboxPath[] = "/storage/wout.v1";
 constexpr char kOutboxTempPath[] = "/storage/wout.tmp";
 constexpr char kOutboxBackupPath[] = "/storage/wout.bak";
@@ -74,6 +77,31 @@ struct OutboxScan {
     bool partial_tail = false;
     bool backup_source = false;
 };
+
+struct SessionPaths {
+    const char* primary;
+    const char* temporary;
+    const char* backup;
+};
+
+bool GetSessionPaths(
+    wqn::protocol::word_study_v1::Mode mode,
+    SessionPaths* paths)
+{
+    if (paths == nullptr) return false;
+    switch (mode) {
+        case wqn::protocol::word_study_v1::Mode::kSequential:
+            *paths = {"/storage/wsq.v1", "/storage/wsq.tmp", "/storage/wsq.bak"};
+            return true;
+        case wqn::protocol::word_study_v1::Mode::kRandom:
+            *paths = {"/storage/wsr.v1", "/storage/wsr.tmp", "/storage/wsr.bak"};
+            return true;
+        case wqn::protocol::word_study_v1::Mode::kDictionary:
+            *paths = {"/storage/wsd.v1", "/storage/wsd.tmp", "/storage/wsd.bak"};
+            return true;
+    }
+    return false;
+}
 
 uint32_t Crc32(const void* bytes, size_t size)
 {
@@ -310,7 +338,8 @@ esp_err_t AtomicWrite(
     const char* temporary,
     const char* backup,
     const void* bytes,
-    size_t size)
+    size_t size,
+    bool preserve_backup = false)
 {
     FILE* file = std::fopen(temporary, "wb");
     if (file == nullptr) return ESP_FAIL;
@@ -322,6 +351,17 @@ esp_err_t AtomicWrite(
         return ESP_FAIL;
     }
     const bool had_primary = FileExists(primary);
+    if (preserve_backup) {
+        if (had_primary && std::remove(primary) != 0 && errno != ENOENT) {
+            std::remove(temporary);
+            return ESP_FAIL;
+        }
+        if (std::rename(temporary, primary) != 0) {
+            std::remove(temporary);
+            return ESP_FAIL;
+        }
+        return ESP_OK;
+    }
     if (had_primary) {
         if (std::remove(backup) != 0 && errno != ENOENT) {
             std::remove(temporary);
@@ -340,8 +380,14 @@ esp_err_t AtomicWrite(
     return ESP_OK;
 }
 
-esp_err_t SaveSessionRaw(const wqn::PersistedWordSession& session)
+esp_err_t SaveSessionRaw(
+    const wqn::PersistedWordSession& session,
+    bool preserve_backup = false)
 {
+    SessionPaths paths = {};
+    if (!GetSessionPaths(session.remote.mode, &paths)) {
+        return ESP_ERR_INVALID_ARG;
+    }
     std::vector<uint8_t> payload;
     if (!EncodeSession(session, &payload)) return ESP_ERR_INVALID_ARG;
     SessionHeader header = {};
@@ -353,11 +399,12 @@ esp_err_t SaveSessionRaw(const wqn::PersistedWordSession& session)
     std::memcpy(file_bytes.data(), &header, sizeof(header));
     std::memcpy(file_bytes.data() + sizeof(header), payload.data(), payload.size());
     return AtomicWrite(
-        kSessionPath,
-        kSessionTempPath,
-        kSessionBackupPath,
+        paths.primary,
+        paths.temporary,
+        paths.backup,
         file_bytes.data(),
-        file_bytes.size());
+        file_bytes.size(),
+        preserve_backup);
 }
 
 esp_err_t LoadSessionFile(const char* path, wqn::PersistedWordSession* session)
@@ -383,16 +430,53 @@ esp_err_t LoadSessionFile(const char* path, wqn::PersistedWordSession* session)
     return DecodeSession(payload, session) ? ESP_OK : ESP_ERR_INVALID_RESPONSE;
 }
 
-esp_err_t LoadSessionRaw(wqn::PersistedWordSession* session)
+esp_err_t LoadSessionSlotRaw(
+    wqn::protocol::word_study_v1::Mode mode,
+    wqn::PersistedWordSession* session)
 {
-    esp_err_t result = LoadSessionFile(kSessionPath, session);
-    if (result == ESP_OK || !FileExists(kSessionBackupPath)) return result;
-    const esp_err_t backup_result = LoadSessionFile(kSessionBackupPath, session);
+    SessionPaths paths = {};
+    if (session == nullptr || !GetSessionPaths(mode, &paths)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    esp_err_t result = LoadSessionFile(paths.primary, session);
+    if (result == ESP_OK) {
+        return session->remote.mode == mode ? ESP_OK : ESP_ERR_INVALID_RESPONSE;
+    }
+    if (!FileExists(paths.backup)) return result;
+    const esp_err_t backup_result = LoadSessionFile(paths.backup, session);
     if (backup_result == ESP_OK) {
+        if (session->remote.mode != mode) return ESP_ERR_INVALID_RESPONSE;
         ESP_LOGW(kTag, "recovered word session from backup");
-        return SaveSessionRaw(*session);
+        return SaveSessionRaw(*session, true);
     }
     return result;
+}
+
+esp_err_t LoadSessionRaw(
+    wqn::protocol::word_study_v1::Mode mode,
+    wqn::PersistedWordSession* session)
+{
+    esp_err_t result = LoadSessionSlotRaw(mode, session);
+    if (result != ESP_ERR_NOT_FOUND) return result;
+
+    // Migrate the development single-slot file only when it belongs to the
+    // requested mode. A sequential probe must not discard a random session.
+    wqn::PersistedWordSession legacy;
+    esp_err_t legacy_result = LoadSessionFile(kLegacySessionPath, &legacy);
+    if (legacy_result != ESP_OK && FileExists(kLegacySessionBackupPath)) {
+        legacy_result = LoadSessionFile(kLegacySessionBackupPath, &legacy);
+    }
+    if (legacy_result != ESP_OK || legacy.remote.mode != mode) {
+        return result;
+    }
+    ESP_RETURN_ON_ERROR(SaveSessionRaw(legacy), kTag, "migrate word session slot");
+    std::remove(kLegacySessionPath);
+    std::remove(kLegacySessionTempPath);
+    std::remove(kLegacySessionBackupPath);
+    *session = std::move(legacy);
+    ESP_LOGI(kTag, "migrated word session to mode-specific slot: mode=%u",
+             static_cast<unsigned>(mode));
+    return ESP_OK;
 }
 
 uint32_t RecordCrc(const OutboxRecord& record)
@@ -469,16 +553,12 @@ esp_err_t BuildObservationRecord(
     return ESP_OK;
 }
 
-esp_err_t ScanOutbox(OutboxScan* scan)
+esp_err_t ScanOutboxFile(const char* path, OutboxScan* scan)
 {
-    if (scan == nullptr) return ESP_ERR_INVALID_ARG;
+    if (path == nullptr || scan == nullptr) return ESP_ERR_INVALID_ARG;
     *scan = {};
-    FILE* file = std::fopen(kOutboxPath, "rb");
-    if (file == nullptr && errno == ENOENT && FileExists(kOutboxBackupPath)) {
-        file = std::fopen(kOutboxBackupPath, "rb");
-        scan->backup_source = file != nullptr;
-    }
-    if (file == nullptr) return errno == ENOENT ? ESP_OK : ESP_FAIL;
+    FILE* file = std::fopen(path, "rb");
+    if (file == nullptr) return errno == ENOENT ? ESP_ERR_NOT_FOUND : ESP_FAIL;
     while (true) {
         OutboxRecord record = {};
         const size_t read = std::fread(&record, 1, sizeof(record), file);
@@ -534,6 +614,34 @@ esp_err_t ScanOutbox(OutboxScan* scan)
         : ESP_ERR_INVALID_SIZE;
 }
 
+esp_err_t ScanOutbox(OutboxScan* scan)
+{
+    if (scan == nullptr) return ESP_ERR_INVALID_ARG;
+    esp_err_t primary_result = ScanOutboxFile(kOutboxPath, scan);
+    if (primary_result == ESP_OK) return ESP_OK;
+    if (!FileExists(kOutboxBackupPath)) {
+        if (primary_result == ESP_ERR_NOT_FOUND) {
+            *scan = {};
+            return ESP_OK;
+        }
+        return primary_result;
+    }
+
+    OutboxScan backup;
+    const esp_err_t backup_result = ScanOutboxFile(kOutboxBackupPath, &backup);
+    if (backup_result != ESP_OK) {
+        return primary_result == ESP_ERR_NOT_FOUND ? backup_result : primary_result;
+    }
+    backup.backup_source = true;
+    *scan = std::move(backup);
+    ESP_LOGW(
+        kTag,
+        "recovered word outbox from backup: primary_error=%s pending=%u",
+        esp_err_to_name(primary_result),
+        static_cast<unsigned>(scan->pending.size()));
+    return ESP_OK;
+}
+
 esp_err_t AppendOutboxRecord(const OutboxRecord& record)
 {
     FILE* file = std::fopen(kOutboxPath, "ab");
@@ -545,7 +653,8 @@ esp_err_t AppendOutboxRecord(const OutboxRecord& record)
 }
 
 esp_err_t CompactOutbox(
-    const std::vector<OutboxRecord, wqn::WordStorePsramAllocator<OutboxRecord>>& pending)
+    const std::vector<OutboxRecord, wqn::WordStorePsramAllocator<OutboxRecord>>& pending,
+    bool preserve_backup = false)
 {
     FILE* file = std::fopen(kOutboxTempPath, "wb");
     if (file == nullptr) return ESP_FAIL;
@@ -563,6 +672,19 @@ esp_err_t CompactOutbox(
         return ESP_FAIL;
     }
     const bool had_primary = FileExists(kOutboxPath);
+    if (preserve_backup) {
+        // The scan came from the last known-good backup. Never replace that
+        // backup with the corrupt primary during recovery.
+        if (had_primary && std::remove(kOutboxPath) != 0 && errno != ENOENT) {
+            std::remove(kOutboxTempPath);
+            return ESP_FAIL;
+        }
+        if (std::rename(kOutboxTempPath, kOutboxPath) != 0) {
+            std::remove(kOutboxTempPath);
+            return ESP_FAIL;
+        }
+        return ESP_OK;
+    }
     if (had_primary) {
         if (std::remove(kOutboxBackupPath) != 0 && errno != ENOENT) {
             std::remove(kOutboxTempPath);
@@ -599,10 +721,20 @@ void ReconcileSession(
     }
 }
 
-esp_err_t LoadSessionTransaction(void* context)
+struct LoadSessionContext {
+    wqn::protocol::word_study_v1::Mode mode;
+    wqn::PersistedWordSession* session;
+};
+
+esp_err_t LoadSessionTransaction(void* opaque)
 {
-    auto* session = static_cast<wqn::PersistedWordSession*>(context);
-    ESP_RETURN_ON_ERROR(LoadSessionRaw(session), kTag, "load word session");
+    auto* context = static_cast<LoadSessionContext*>(opaque);
+    if (context == nullptr || context->session == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    auto* session = context->session;
+    ESP_RETURN_ON_ERROR(
+        LoadSessionRaw(context->mode, session), kTag, "load word session");
     OutboxScan scan;
     ESP_RETURN_ON_ERROR(ScanOutbox(&scan), kTag, "scan word outbox");
     bool changed = false;
@@ -611,7 +743,10 @@ esp_err_t LoadSessionTransaction(void* context)
         ESP_RETURN_ON_ERROR(SaveSessionRaw(*session), kTag, "repair word session cursor");
     }
     if (scan.partial_tail || scan.backup_source) {
-        ESP_RETURN_ON_ERROR(CompactOutbox(scan.pending), kTag, "repair word outbox tail");
+        ESP_RETURN_ON_ERROR(
+            CompactOutbox(scan.pending, scan.backup_source),
+            kTag,
+            "repair word outbox tail");
     }
     return ESP_OK;
 }
@@ -621,11 +756,20 @@ esp_err_t SaveSessionTransaction(void* context)
     return SaveSessionRaw(*static_cast<const wqn::PersistedWordSession*>(context));
 }
 
-esp_err_t ClearSessionTransaction(void*)
+struct ClearSessionContext {
+    wqn::protocol::word_study_v1::Mode mode;
+};
+
+esp_err_t ClearSessionTransaction(void* opaque)
 {
-    if (std::remove(kSessionPath) != 0 && errno != ENOENT) return ESP_FAIL;
-    if (std::remove(kSessionTempPath) != 0 && errno != ENOENT) return ESP_FAIL;
-    if (std::remove(kSessionBackupPath) != 0 && errno != ENOENT) return ESP_FAIL;
+    auto* context = static_cast<ClearSessionContext*>(opaque);
+    SessionPaths paths = {};
+    if (context == nullptr || !GetSessionPaths(context->mode, &paths)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (std::remove(paths.primary) != 0 && errno != ENOENT) return ESP_FAIL;
+    if (std::remove(paths.temporary) != 0 && errno != ENOENT) return ESP_FAIL;
+    if (std::remove(paths.backup) != 0 && errno != ENOENT) return ESP_FAIL;
     return ESP_OK;
 }
 
@@ -668,7 +812,10 @@ esp_err_t CommitObservationTransaction(void* opaque)
         return ESP_ERR_NO_MEM;
     }
     if (scan.partial_tail || scan.backup_source) {
-        ESP_RETURN_ON_ERROR(CompactOutbox(scan.pending), kTag, "repair before append");
+        ESP_RETURN_ON_ERROR(
+            CompactOutbox(scan.pending, scan.backup_source),
+            kTag,
+            "repair before append");
     }
     OutboxRecord record = {};
     ESP_RETURN_ON_ERROR(
@@ -686,7 +833,10 @@ esp_err_t PeekObservationTransaction(void* context)
     OutboxScan scan;
     ESP_RETURN_ON_ERROR(ScanOutbox(&scan), kTag, "scan word outbox");
     if (scan.partial_tail || scan.backup_source) {
-        ESP_RETURN_ON_ERROR(CompactOutbox(scan.pending), kTag, "repair word outbox tail");
+        ESP_RETURN_ON_ERROR(
+            CompactOutbox(scan.pending, scan.backup_source),
+            kTag,
+            "repair word outbox tail");
     }
     if (scan.pending.empty()) return ESP_ERR_NOT_FOUND;
     *observation = ObservationFromRecord(scan.pending.front());
@@ -716,7 +866,9 @@ esp_err_t AckObservationTransaction(void* opaque)
     }
 
     wqn::PersistedWordSession session;
-    if (LoadSessionRaw(&session) == ESP_OK &&
+    const auto pending_mode = static_cast<wqn::protocol::word_study_v1::Mode>(
+        pending->mode);
+    if (LoadSessionRaw(pending_mode, &session) == ESP_OK &&
         session.remote.session_id == pending->session_id &&
         pending->sequence >= session.remote.next_sequence) {
         session.position = pending->next_position;
@@ -735,7 +887,10 @@ esp_err_t AckObservationTransaction(void* opaque)
     scan.pending.erase(pending);
     if (scan.partial_tail || scan.backup_source ||
         scan.ack_records + 1 >= kAckCompactionThreshold) {
-        ESP_RETURN_ON_ERROR(CompactOutbox(scan.pending), kTag, "compact word outbox");
+        ESP_RETURN_ON_ERROR(
+            CompactOutbox(scan.pending, scan.backup_source),
+            kTag,
+            "compact word outbox");
     }
     return ESP_OK;
 }
@@ -823,11 +978,15 @@ esp_err_t CompactWordSessionData(
     return ESP_OK;
 }
 
-esp_err_t LoadPersistedWordSession(PersistedWordSession* session)
+esp_err_t LoadPersistedWordSession(
+    protocol::word_study_v1::Mode mode,
+    PersistedWordSession* session)
 {
     if (session == nullptr) return ESP_ERR_INVALID_ARG;
     *session = {};
-    return ExecuteWithStorageLease("word-session-load", LoadSessionTransaction, session);
+    LoadSessionContext context{mode, session};
+    return ExecuteWithStorageLease(
+        "word-session-load", LoadSessionTransaction, &context);
 }
 
 esp_err_t SavePersistedWordSession(const PersistedWordSession& session)
@@ -838,9 +997,11 @@ esp_err_t SavePersistedWordSession(const PersistedWordSession& session)
         const_cast<PersistedWordSession*>(&session));
 }
 
-esp_err_t ClearPersistedWordSession()
+esp_err_t ClearPersistedWordSession(protocol::word_study_v1::Mode mode)
 {
-    return ExecuteWithStorageLease("word-session-clear", ClearSessionTransaction, nullptr);
+    ClearSessionContext context{mode};
+    return ExecuteWithStorageLease(
+        "word-session-clear", ClearSessionTransaction, &context);
 }
 
 esp_err_t CommitWordObservation(

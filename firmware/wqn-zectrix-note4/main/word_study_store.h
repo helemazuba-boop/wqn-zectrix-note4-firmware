@@ -116,9 +116,14 @@ struct WordOutboxSnapshot {
 
 inline constexpr size_t kWordObservationOutboxCapacity = 1000;
 
-esp_err_t LoadPersistedWordSession(PersistedWordSession* session);
+// Sequential, random, and dictionary sessions have independent durable
+// slots. This is part of the product contract: changing entry mode must not
+// destroy the user's paused session in another mode.
+esp_err_t LoadPersistedWordSession(
+    protocol::word_study_v1::Mode mode,
+    PersistedWordSession* session);
 esp_err_t SavePersistedWordSession(const PersistedWordSession& session);
-esp_err_t ClearPersistedWordSession();
+esp_err_t ClearPersistedWordSession(protocol::word_study_v1::Mode mode);
 
 // Commits the observation first, then the advanced session cursor. Retrying
 // the same request_id is idempotent. If the second write is interrupted, load
