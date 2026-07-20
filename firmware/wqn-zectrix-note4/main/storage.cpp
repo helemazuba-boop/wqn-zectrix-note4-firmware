@@ -18,6 +18,7 @@
 #include "runtime/storage_schema.h"
 #include "services/storage_service.h"
 #include "sdkconfig.h"
+#include "word_study_store.h"
 
 namespace {
 
@@ -1156,9 +1157,10 @@ esp_err_t PrepareStorageForSleep(int64_t deadline_us)
     if (deadline_us > 0 && esp_timer_get_time() >= deadline_us) {
         return ESP_ERR_TIMEOUT;
     }
-    return runtime::ActiveSleepBlockerCount(runtime::SleepBlocker::kStorage) == 0
-        ? ESP_OK
-        : ESP_ERR_INVALID_STATE;
+    if (runtime::ActiveSleepBlockerCount(runtime::SleepBlocker::kStorage) != 0) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    return PrepareWordObservationOutboxForSleep(deadline_us);
 }
 
 void RollbackStorageAfterSleepAbort()

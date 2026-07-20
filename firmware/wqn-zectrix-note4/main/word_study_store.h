@@ -137,5 +137,6 @@ esp_err_t CommitWordObservation(
 esp_err_t PeekPendingWordObservation(DurableWordObservation* observation);
 esp_err_t AcknowledgeWordObservation(const std::string& request_id);
 esp_err_t ReadWordOutboxSnapshot(WordOutboxSnapshot* snapshot);
+esp_err_t PrepareWordObservationOutboxForSleep(int64_t deadline_us);
 
 }  // namespace wqn

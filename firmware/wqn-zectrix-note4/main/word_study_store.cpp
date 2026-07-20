@@ -36,7 +36,11 @@ constexpr uint16_t kLegacySessionSchemaVersion = 1;
 constexpr uint16_t kSessionSchemaVersion = 2;
 constexpr uint16_t kOutboxSchemaVersion = 1;
 constexpr size_t kMaxSessionPayloadBytes = 96U * 1024U;
-constexpr size_t kAckCompactionThreshold = 32;
+constexpr wqn::protocol::word_study_v1::Mode kPersistedSessionModes[] = {
+    wqn::protocol::word_study_v1::Mode::kSequential,
+    wqn::protocol::word_study_v1::Mode::kRandom,
+    wqn::protocol::word_study_v1::Mode::kDictionary,
+};
 
 #pragma pack(push, 1)
 struct SessionHeader {
@@ -74,7 +78,9 @@ static_assert(sizeof(OutboxRecord) == 200);
 
 struct OutboxScan {
     std::vector<OutboxRecord, wqn::WordStorePsramAllocator<OutboxRecord>> pending;
-    std::vector<std::string> acknowledged;
+    // Preserve the observation paired with each ACK. ACK records only carry
+    // request_id; their preceding observation carries the durable cursor.
+    std::vector<OutboxRecord, wqn::WordStorePsramAllocator<OutboxRecord>> acknowledged;
     size_t total_records = 0;
     size_t ack_records = 0;
     bool partial_tail = false;
@@ -608,14 +614,20 @@ esp_err_t ScanOutboxFile(const char* path, OutboxScan* scan)
             }
         } else if (record.kind == static_cast<uint8_t>(OutboxRecordKind::kAck)) {
             ++scan->ack_records;
-            scan->pending.erase(
-                std::remove_if(
-                    scan->pending.begin(), scan->pending.end(),
-                    [&](const auto& value) { return request_id == value.request_id; }),
-                scan->pending.end());
-            if (std::find(scan->acknowledged.begin(), scan->acknowledged.end(), request_id) ==
-                scan->acknowledged.end()) {
-                scan->acknowledged.push_back(request_id);
+            const auto pending = std::find_if(
+                scan->pending.begin(), scan->pending.end(),
+                [&](const auto& value) { return request_id == value.request_id; });
+            const auto acknowledged = std::find_if(
+                scan->acknowledged.begin(), scan->acknowledged.end(),
+                [&](const auto& value) { return request_id == value.request_id; });
+            if (pending != scan->pending.end()) {
+                if (acknowledged == scan->acknowledged.end()) {
+                    scan->acknowledged.push_back(*pending);
+                }
+                scan->pending.erase(pending);
+            } else if (acknowledged == scan->acknowledged.end()) {
+                std::fclose(file);
+                return ESP_ERR_INVALID_STATE;
             }
         } else {
             std::fclose(file);
@@ -765,12 +777,12 @@ bool SessionCursorOrdinal(
 }
 
 void ReconcileSession(
-    const std::vector<OutboxRecord, wqn::WordStorePsramAllocator<OutboxRecord>>& pending,
+    const std::vector<OutboxRecord, wqn::WordStorePsramAllocator<OutboxRecord>>& records,
     wqn::PersistedWordSession* session,
     bool* changed)
 {
     if (session == nullptr || changed == nullptr) return;
-    for (const OutboxRecord& observation : pending) {
+    for (const OutboxRecord& observation : records) {
         if (session->remote.session_id != observation.session_id ||
             observation.sequence < session->remote.next_sequence) {
             continue;
@@ -782,6 +794,31 @@ void ReconcileSession(
         session->remote.next_sequence = observation.sequence + 1;
         *changed = true;
     }
+}
+
+esp_err_t CheckpointSessionsFromOutbox(const OutboxScan& scan)
+{
+    for (const auto mode : kPersistedSessionModes) {
+        wqn::PersistedWordSession session;
+        const esp_err_t load_result = LoadSessionRaw(mode, &session);
+        if (load_result == ESP_ERR_NOT_FOUND) {
+            continue;
+        }
+        ESP_RETURN_ON_ERROR(
+            load_result,
+            kTag,
+            "load session for outbox checkpoint");
+        bool changed = false;
+        ReconcileSession(scan.acknowledged, &session, &changed);
+        ReconcileSession(scan.pending, &session, &changed);
+        if (changed) {
+            ESP_RETURN_ON_ERROR(
+                SaveSessionRaw(session),
+                kTag,
+                "checkpoint session before outbox compaction");
+        }
+    }
+    return ESP_OK;
 }
 
 struct LoadSessionContext {
@@ -805,11 +842,16 @@ esp_err_t LoadSessionTransaction(void* opaque)
     OutboxScan scan;
     ESP_RETURN_ON_ERROR(ScanOutbox(&scan), kTag, "scan word outbox");
     bool changed = false;
+    ReconcileSession(scan.acknowledged, session, &changed);
     ReconcileSession(scan.pending, session, &changed);
     if (changed) {
         ESP_RETURN_ON_ERROR(SaveSessionRaw(*session), kTag, "repair word session cursor");
     }
     if (scan.partial_tail || scan.backup_source) {
+        ESP_RETURN_ON_ERROR(
+            CheckpointSessionsFromOutbox(scan),
+            kTag,
+            "checkpoint before word outbox repair");
         ESP_RETURN_ON_ERROR(
             CompactOutbox(scan.pending, scan.backup_source),
             kTag,
@@ -875,14 +917,22 @@ esp_err_t CommitObservationTransaction(void* opaque)
         }
         return SaveSessionRaw(session);
     }
-    if (std::find(scan.acknowledged.begin(), scan.acknowledged.end(), observation.request_id) !=
-        scan.acknowledged.end()) {
+    if (std::find_if(
+            scan.acknowledged.begin(),
+            scan.acknowledged.end(),
+            [&](const auto& value) {
+                return observation.request_id == value.request_id;
+            }) != scan.acknowledged.end()) {
         return SaveSessionRaw(session);
     }
     if (scan.pending.size() >= wqn::kWordObservationOutboxCapacity) {
         return ESP_ERR_NO_MEM;
     }
     if (scan.partial_tail || scan.backup_source) {
+        ESP_RETURN_ON_ERROR(
+            CheckpointSessionsFromOutbox(scan),
+            kTag,
+            "checkpoint before append repair");
         ESP_RETURN_ON_ERROR(
             CompactOutbox(scan.pending, scan.backup_source),
             kTag,
@@ -903,10 +953,10 @@ esp_err_t CommitObservationTransaction(void* opaque)
         static_cast<long long>((appended_us - scanned_us) / 1000),
         static_cast<long long>((appended_us - started_us) / 1000));
     // The durable record includes next_position, next_phase, and sequence.
-    // LoadSessionTransaction and AckObservationTransaction already reconcile
-    // an older session file from these records. Rewriting and fsyncing the
-    // complete session here added ~2 seconds to every card action without
-    // increasing power-loss safety.
+    // LoadSessionTransaction and sleep preparation reconcile an older session
+    // file from these records. Rewriting and fsyncing the complete session
+    // here added ~2 seconds to every card action without increasing power-loss
+    // safety.
     return ESP_OK;
 }
 
@@ -917,6 +967,10 @@ esp_err_t PeekObservationTransaction(void* context)
     OutboxScan scan;
     ESP_RETURN_ON_ERROR(ScanOutbox(&scan), kTag, "scan word outbox");
     if (scan.partial_tail || scan.backup_source) {
+        ESP_RETURN_ON_ERROR(
+            CheckpointSessionsFromOutbox(scan),
+            kTag,
+            "checkpoint before outbox peek repair");
         ESP_RETURN_ON_ERROR(
             CompactOutbox(scan.pending, scan.backup_source),
             kTag,
@@ -943,24 +997,14 @@ esp_err_t AckObservationTransaction(void* opaque)
         scan.pending.begin(), scan.pending.end(),
         [&](const auto& value) { return *context->request_id == value.request_id; });
     if (pending == scan.pending.end()) {
-        return std::find(scan.acknowledged.begin(), scan.acknowledged.end(), *context->request_id) !=
-                scan.acknowledged.end()
+        return std::find_if(
+                   scan.acknowledged.begin(),
+                   scan.acknowledged.end(),
+                   [&](const auto& value) {
+                       return *context->request_id == value.request_id;
+                   }) != scan.acknowledged.end()
             ? ESP_OK
             : ESP_ERR_NOT_FOUND;
-    }
-
-    wqn::PersistedWordSession session;
-    const auto pending_mode = static_cast<wqn::protocol::word_study_v1::Mode>(
-        pending->mode);
-    if (LoadSessionRaw(pending_mode, &session) == ESP_OK &&
-        session.remote.session_id == pending->session_id &&
-        pending->sequence >= session.remote.next_sequence) {
-        if (!SetSessionCursorOrdinal(&session, pending->next_position)) {
-            return ESP_ERR_INVALID_STATE;
-        }
-        session.phase = static_cast<wqn::WordPresentationPhase>(pending->next_phase);
-        session.remote.next_sequence = pending->sequence + 1;
-        ESP_RETURN_ON_ERROR(SaveSessionRaw(session), kTag, "reconcile before word ack");
     }
 
     OutboxRecord record = {};
@@ -970,15 +1014,47 @@ esp_err_t AckObservationTransaction(void* opaque)
         kTag,
         "encode word ack");
     ESP_RETURN_ON_ERROR(AppendOutboxRecord(record), kTag, "append word ack");
-    scan.pending.erase(pending);
-    if (scan.partial_tail || scan.backup_source ||
-        scan.ack_records + 1 >= kAckCompactionThreshold) {
-        ESP_RETURN_ON_ERROR(
-            CompactOutbox(scan.pending, scan.backup_source),
-            kTag,
-            "compact word outbox");
-    }
+    // Keep ACK latency bounded. The observation+ACK pair is already a durable
+    // cursor checkpoint; boot/load reconciliation consumes it. Full session
+    // checkpointing and journal compaction happen only during sleep quiesce.
     return ESP_OK;
+}
+
+struct PrepareOutboxContext {
+    int64_t deadline_us;
+};
+
+esp_err_t PrepareOutboxForSleepTransaction(void* opaque)
+{
+    auto* context = static_cast<PrepareOutboxContext*>(opaque);
+    if (context == nullptr) return ESP_ERR_INVALID_ARG;
+    if (context->deadline_us > 0 && esp_timer_get_time() >= context->deadline_us) {
+        return ESP_ERR_TIMEOUT;
+    }
+    OutboxScan scan;
+    ESP_RETURN_ON_ERROR(ScanOutbox(&scan), kTag, "scan outbox before sleep");
+    if (scan.ack_records == 0 && !scan.partial_tail && !scan.backup_source) {
+        return ESP_OK;
+    }
+    ESP_RETURN_ON_ERROR(
+        CheckpointSessionsFromOutbox(scan),
+        kTag,
+        "checkpoint outbox before sleep");
+    if (context->deadline_us > 0 && esp_timer_get_time() >= context->deadline_us) {
+        return ESP_ERR_TIMEOUT;
+    }
+    ESP_RETURN_ON_ERROR(
+        CompactOutbox(scan.pending, scan.backup_source),
+        kTag,
+        "compact outbox before sleep");
+    ESP_LOGI(
+        kTag,
+        "word outbox prepared for sleep: acknowledged=%u pending=%u",
+        static_cast<unsigned>(scan.ack_records),
+        static_cast<unsigned>(scan.pending.size()));
+    return context->deadline_us > 0 && esp_timer_get_time() >= context->deadline_us
+        ? ESP_ERR_TIMEOUT
+        : ESP_OK;
 }
 
 esp_err_t SnapshotTransaction(void* context)
@@ -1127,6 +1203,18 @@ esp_err_t ReadWordOutboxSnapshot(WordOutboxSnapshot* snapshot)
     if (snapshot == nullptr) return ESP_ERR_INVALID_ARG;
     *snapshot = {};
     return ExecuteWithStorageLease("word-outbox-snapshot", SnapshotTransaction, snapshot);
+}
+
+esp_err_t PrepareWordObservationOutboxForSleep(int64_t deadline_us)
+{
+    PrepareOutboxContext context{deadline_us};
+    // Sleep quiescing rejects new SleepLeases. PowerCoordinator calls this
+    // only after existing storage blockers are drained, so submit directly to
+    // the sole storage owner.
+    return services::ExecuteStorageTransactionNamed(
+        PrepareOutboxForSleepTransaction,
+        &context,
+        "word-outbox-sleep-compact");
 }
 
 }  // namespace wqn
