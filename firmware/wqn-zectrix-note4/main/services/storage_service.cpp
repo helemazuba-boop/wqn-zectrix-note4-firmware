@@ -13,9 +13,10 @@ constexpr UBaseType_t kQueueDepth = 8;
 constexpr UBaseType_t kReplyQueueDepth = 4;
 // ESP-IDF's ROM miniz test alone requires an 8 KiB task stack. WQPC runs it
 // below the storage transaction, SPIFFS and C++ serialization call chains, and
-// the first COM7 HIL run proved that 8 KiB overflows. Keep this bounded but
-// leave enough measured headroom for the complete production call chain.
-constexpr uint32_t kTaskStackBytes = 16 * 1024;
+// the first COM7 HIL run proved that 8 KiB overflows. A second HIL run measured
+// only 3296 bytes free at 16 KiB, below the 4 KiB safety floor, so retain the
+// measured production call chain plus explicit bounded headroom.
+constexpr uint32_t kTaskStackBytes = 20 * 1024;
 constexpr UBaseType_t kStackWarningBytes = 4 * 1024;
 constexpr UBaseType_t kTaskPriority = 6;
 

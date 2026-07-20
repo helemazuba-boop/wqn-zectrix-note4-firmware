@@ -445,38 +445,52 @@ std::vector<wqn::CachedProblem> ToCachedProblems(const std::vector<wqn::WqnProbl
     return cached;
 }
 
-void UpsertProblem(std::vector<wqn::CachedProblem>* cached, wqn::CachedProblem problem)
+bool UpsertProblem(std::vector<wqn::CachedProblem>* cached, wqn::CachedProblem problem)
 {
     if (cached == nullptr || problem.id.empty()) {
-        return;
+        return false;
     }
 
     for (wqn::CachedProblem& item : *cached) {
         if (item.id == problem.id) {
-            if (!problem.title.empty()) {
+            bool changed = false;
+            if (!problem.title.empty() && item.title != problem.title) {
                 item.title = std::move(problem.title);
+                changed = true;
             }
-            if (!problem.type.empty()) {
+            if (!problem.type.empty() && item.type != problem.type) {
                 item.type = std::move(problem.type);
+                changed = true;
             }
-            if (!problem.status.empty()) {
+            if (!problem.status.empty() && item.status != problem.status) {
                 item.status = std::move(problem.status);
+                changed = true;
             }
-            if (!problem.content_text.empty()) {
+            if (!problem.content_text.empty() && item.content_text != problem.content_text) {
                 item.content_text = std::move(problem.content_text);
+                changed = true;
             }
-            if (!problem.solution_text.empty()) {
+            if (!problem.solution_text.empty() && item.solution_text != problem.solution_text) {
                 item.solution_text = std::move(problem.solution_text);
+                changed = true;
             }
-            item.asset_count = problem.asset_count;
-            item.solution_asset_count = problem.solution_asset_count;
-            if (!problem.updated_at.empty()) {
+            if (item.asset_count != problem.asset_count) {
+                item.asset_count = problem.asset_count;
+                changed = true;
+            }
+            if (item.solution_asset_count != problem.solution_asset_count) {
+                item.solution_asset_count = problem.solution_asset_count;
+                changed = true;
+            }
+            if (!problem.updated_at.empty() && item.updated_at != problem.updated_at) {
                 item.updated_at = std::move(problem.updated_at);
+                changed = true;
             }
-            return;
+            return changed;
         }
     }
     cached->push_back(std::move(problem));
+    return true;
 }
 
 esp_err_t MergeProblemCache(const std::vector<wqn::WqnProblem>& fresh, const char* source)
@@ -493,8 +507,18 @@ esp_err_t MergeProblemCache(const std::vector<wqn::WqnProblem>& fresh, const cha
     }
 
     std::vector<wqn::CachedProblem> incoming = ToCachedProblems(fresh);
+    bool changed = false;
     for (wqn::CachedProblem& problem : incoming) {
-        UpsertProblem(&cached, std::move(problem));
+        changed = UpsertProblem(&cached, std::move(problem)) || changed;
+    }
+    if (!changed) {
+        ESP_LOGI(
+            kTag,
+            "%s cache unchanged: fresh=%u total_cached=%u; write skipped",
+            source,
+            static_cast<unsigned>(fresh.size()),
+            static_cast<unsigned>(cached.size()));
+        return ESP_OK;
     }
 
     const esp_err_t save_result = wqn::SaveProblems(cached);
