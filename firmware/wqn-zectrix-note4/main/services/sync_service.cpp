@@ -864,6 +864,19 @@ bool HasUsableStoredToken()
     return LoadUsableToken(&token);
 }
 
+wqn::protocol::v3::RequestMetadata MakeDeviceRequestMetadata()
+{
+#if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
+    wqn::protocol::v3::RequestMetadata metadata;
+    metadata.request_id = RandomControlId("req_");
+    metadata.boot_id = ControlBootId();
+    metadata.firmware_version = WQN_FIRMWARE_VERSION;
+    return metadata;
+#else
+    return {};
+#endif
+}
+
 #if CONFIG_WQN_WIFI_STA_ENABLE
 
 TaskHandle_t g_sync_service_task = nullptr;

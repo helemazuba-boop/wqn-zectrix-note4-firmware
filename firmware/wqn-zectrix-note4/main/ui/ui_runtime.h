@@ -59,7 +59,7 @@ public:
 
     UiUpdate DispatchButton(const wqn::ButtonEvent& event, int64_t event_time_ms);
     UiUpdate DispatchTodoCloudResult(const TodoCloudResult& result);
-    UiUpdate DispatchWordCloudResult(const WordCloudResult& result);
+    UiUpdate DispatchWordCloudResult(WordCloudResult& result);
     UiUpdate DispatchTimeTick(int64_t now_ms);
     UiUpdate DispatchAiTick(int64_t now_ms);
     UiUpdate DispatchAiStreamingSnapshot(const wqn::AiStreamingStatusView& view);

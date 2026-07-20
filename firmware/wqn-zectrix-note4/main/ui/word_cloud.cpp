@@ -7,9 +7,11 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <utility>
 
 #include "esp_log.h"
 #include "runtime/sleep_coordinator.h"
+#include "services/sync_service.h"
 #include "storage.h"
 #include "word_pack.h"
 #include "wqn_api.h"
@@ -106,7 +108,7 @@ bool QueueWordAiLookup(const wqn::WqnWordAiLookupRequest& lookup)
     return QueueWordCloudRequest(request);
 }
 
-const WordCloudResult* PeekWordCloudResult(uint32_t generation)
+WordCloudResult* PeekWordCloudResult(uint32_t generation)
 {
     if (generation == 0 || generation != g_word_result_generation) {
         return nullptr;
@@ -124,14 +126,17 @@ void SendWordCloudResult()
     }
 }
 
-bool ApplyWordCloudResult(wqn::UiState* state, const WordCloudResult& result)
+bool ApplyWordCloudResult(wqn::UiState* state, WordCloudResult& result)
 {
     if (state == nullptr) {
         return false;
     }
     if (result.op == WordCloudOp::kPackSync) {
         if (result.result == ESP_OK) {
-            wqn::ApplyWordPackIndex(&state->word_app, result.pack_index, result.message);
+            wqn::ApplyWordPackIndex(
+                &state->word_app,
+                std::move(result.pack_index),
+                result.message);
         } else {
             state->word_app.cloud_sync_failed = true;
             state->word_app.cloud_loaded_once = true;
@@ -208,12 +213,48 @@ void WordCloudTask(void*)
         }
 
         if (request.op == WordCloudOp::kPackSync) {
-            wqn::WqnWordPackManifest manifest;
-            result.result = wqn::FetchWordPackManifest(token, &manifest);
-            if (result.result == ESP_OK) {
+            wqn::WqnWordPackManifest local_manifest;
+            result.result = wqn::LoadWordPackManifest(&local_manifest);
+            if (result.result == ESP_ERR_NOT_FOUND) {
+                result.result = wqn::ResetWordPackStorageCache();
+                if (result.result == ESP_OK) {
+                    local_manifest = {};
+                }
+            } else if (result.result != ESP_OK) {
+                ESP_LOGW(
+                    kTag,
+                    "local word pack manifest is incompatible; reset cache: %s",
+                    esp_err_to_name(result.result));
+                result.result = wqn::ResetWordPackStorageCache();
+                if (result.result == ESP_OK) {
+                    local_manifest = {};
+                }
+            }
+            constexpr size_t kMaxManifestPagesPerSync = 32;
+            size_t page_count = 0;
+            bool has_more = result.result == ESP_OK;
+            while (result.result == ESP_OK && has_more &&
+                   page_count < kMaxManifestPagesPerSync) {
+                ++page_count;
+                wqn::WqnWordPackManifest manifest_delta;
+                const auto metadata = wqn::services::MakeDeviceRequestMetadata();
+                result.result = wqn::FetchWordPackManifest(
+                    token,
+                    metadata,
+                    local_manifest.cursor,
+                    &manifest_delta);
+                if (result.result != ESP_OK) {
+                    break;
+                }
+                if (manifest_delta.has_more &&
+                    manifest_delta.cursor <= local_manifest.cursor) {
+                    result.result = ESP_ERR_INVALID_RESPONSE;
+                    result.message = "词库游标未推进";
+                    break;
+                }
                 size_t total_needed = 0;
-                for (const auto& item : manifest.packs) {
-                    if (wqn::WordPackNeedsDownload(item) && item.byte_size > 0) {
+                for (const auto& item : manifest_delta.packs) {
+                    if (!item.deleted && wqn::WordPackNeedsDownload(item)) {
                         total_needed += item.byte_size;
                     }
                 }
@@ -233,23 +274,38 @@ void WordCloudTask(void*)
                     }
                 }
 
-                for (const wqn::WqnWordPackManifestItem& item : manifest.packs) {
-                    if (!wqn::WordPackNeedsDownload(item)) {
-                        continue;
-                    }
-                    std::string pack_body;
-                    result.result = wqn::DownloadWordPack(token, item, &pack_body);
+                for (const wqn::WqnWordPackManifestItem& item : manifest_delta.packs) {
                     if (result.result != ESP_OK) {
                         break;
                     }
-                    result.result = wqn::SaveWordPackFromBytes(item, pack_body);
+                    if (item.deleted || !wqn::WordPackNeedsDownload(item)) {
+                        continue;
+                    }
+                    result.result = wqn::DownloadWordPackToStorage(
+                        token,
+                        wqn::services::MakeDeviceRequestMetadata(),
+                        item);
                     if (result.result != ESP_OK) {
                         break;
                     }
                 }
+                if (result.result != ESP_OK) {
+                    break;
+                }
+                wqn::WqnWordPackManifest merged;
+                result.result = wqn::MergeWordPackManifestDelta(
+                    manifest_delta, &merged);
+                if (result.result == ESP_OK) {
+                    result.result = wqn::SaveWordPackManifest(merged);
+                }
+                if (result.result == ESP_OK) {
+                    local_manifest = std::move(merged);
+                    has_more = manifest_delta.has_more;
+                }
             }
-            if (result.result == ESP_OK) {
-                result.result = wqn::SaveWordPackManifest(manifest);
+            if (result.result == ESP_OK && has_more) {
+                result.result = ESP_ERR_INVALID_SIZE;
+                result.message = "词库变更过多，请重试";
             }
             if (result.result == ESP_OK) {
                 result.result = wqn::LoadWordPackIndex(&result.pack_index);

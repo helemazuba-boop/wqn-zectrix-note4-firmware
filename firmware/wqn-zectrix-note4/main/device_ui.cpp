@@ -536,7 +536,7 @@ void DeviceUiTask(void*)
             device_ui_internal::WordCloudResultReady ready;
             while (xQueueReceive(g_word_result_queue, &ready, 0) == pdTRUE) {
                 word_cloud_completed = true;
-                const device_ui_internal::WordCloudResult* word_result =
+                device_ui_internal::WordCloudResult* word_result =
                     device_ui_internal::PeekWordCloudResult(ready.generation);
                 if (word_result != nullptr) {
                     const device_ui_internal::UiUpdate update =

@@ -51,6 +51,11 @@ struct WordAppState {
     uint16_t correct_today = 0;
 
     WordPackIndex pack_index;
+    // A cloud refresh never mutates the content snapshot used by an active
+    // review or dictionary session. It becomes current only after returning
+    // to the word home screen.
+    WordPackIndex pending_pack_index;
+    bool pending_pack_index_ready = false;
     std::vector<size_t> review_indices;
     size_t review_position = 0;
     WqnWordEntry current_word;
@@ -116,7 +121,7 @@ struct WordAppSnapshot {
 
 esp_err_t InitWordApp(WordAppState* state);
 esp_err_t HandleWordAppInput(WordAppState* state, WordInput input);
-void ApplyWordPackIndex(WordAppState* state, const WordPackIndex& index, const std::string& message);
+void ApplyWordPackIndex(WordAppState* state, WordPackIndex index, const std::string& message);
 void ApplyWordSearchResult(WordAppState* state, const WqnWordSearchResult& result);
 void ApplyWordAiLookupResult(WordAppState* state, const WqnWordAiLookupResult& result);
 bool TakeWordSearchRequest(WordAppState* state, WqnWordSearchRequest* request);

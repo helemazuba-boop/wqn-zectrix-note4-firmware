@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <ctime>
 #include <string>
+#include <utility>
 
 #include "esp_check.h"
 #include "esp_log.h"
@@ -132,6 +133,44 @@ void QueueReviewSubmission(wqn::WordAppState* state, const wqn::WqnWordEntry& wo
     state->pending_submit_word = word.word;
 }
 
+uint16_t ClampUint16(size_t value)
+{
+    return static_cast<uint16_t>(std::min<size_t>(value, UINT16_MAX));
+}
+
+void InstallWordPackIndex(
+    wqn::WordAppState* state,
+    wqn::WordPackIndex index,
+    const std::string& message)
+{
+    const bool has_manifest = index.has_manifest;
+    const bool pack_error = index.pack_error;
+    const size_t entry_count = index.entries.size();
+    const std::string status_message = index.status_message;
+    state->pack_index = std::move(index);
+    state->cloud_loaded_once = has_manifest;
+    state->cloud_sync_failed = pack_error;
+    state->cloud_sync_requested = !has_manifest || pack_error;
+    state->daily_target = ClampUint16(entry_count);
+    state->message = !message.empty() ? message : status_message;
+    if (state->message.empty()) {
+        state->message = HasPackWords(*state) ? "词库已就绪" : "词库未同步";
+    }
+    RefreshDictionaryState(state);
+}
+
+void ActivatePendingWordPackIndex(wqn::WordAppState* state)
+{
+    if (state == nullptr || state->mode != wqn::WordAppMode::kHome ||
+        !state->pending_pack_index_ready) {
+        return;
+    }
+    wqn::WordPackIndex pending = std::move(state->pending_pack_index);
+    state->pending_pack_index = {};
+    state->pending_pack_index_ready = false;
+    InstallWordPackIndex(state, std::move(pending), "词库更新已启用");
+}
+
 void AdvanceReview(wqn::WordAppState* state)
 {
     if (state == nullptr || state->review_indices.empty()) {
@@ -148,6 +187,7 @@ void AdvanceReview(wqn::WordAppState* state)
     state->review_position = 0;
     state->current_word = wqn::WqnWordEntry{};
     state->message = "本轮复习完成";
+    ActivatePendingWordPackIndex(state);
 }
 
 void RequestOnlineLookup(wqn::WordAppState* state)
@@ -179,11 +219,6 @@ void MarkCurrentAsUnknown(wqn::WordAppState* state)
     state->message = state->current_word.id.empty() ? "临时词无法加入错词本" : "已标记不认识";
 }
 
-uint16_t ClampUint16(size_t value)
-{
-    return static_cast<uint16_t>(std::min<size_t>(value, UINT16_MAX));
-}
-
 }  // namespace
 
 namespace wqn {
@@ -209,7 +244,8 @@ esp_err_t InitWordApp(WordAppState* state)
     } else {
         WordPackIndex index;
         const esp_err_t index_result = LoadWordPackIndex(&index);
-        ApplyWordPackIndex(state, index, index.status_message);
+        const std::string index_message = index.status_message;
+        ApplyWordPackIndex(state, std::move(index), index_message);
         // [target-fix] daily_target follows the actual pack size, not a
         // hardcoded 20. BuildReviewQueue already covers the whole pack;
         // this just makes the snapshot field consistent for any UI that
@@ -233,6 +269,7 @@ esp_err_t HandleWordAppInput(WordAppState* state, WordInput input)
     if (!state->initialized) {
         ESP_RETURN_ON_ERROR(InitWordApp(state), kTag, "init word app");
     }
+    ActivatePendingWordPackIndex(state);
 
     switch (state->mode) {
         case WordAppMode::kHome: {
@@ -285,6 +322,7 @@ esp_err_t HandleWordAppInput(WordAppState* state, WordInput input)
             } else if (input == WordInput::kLongConfirm) {
                 state->mode = WordAppMode::kHome;
                 state->message = "已返回单词主页";
+                ActivatePendingWordPackIndex(state);
             }
             return ESP_OK;
 
@@ -306,6 +344,7 @@ esp_err_t HandleWordAppInput(WordAppState* state, WordInput input)
             } else if (input == WordInput::kLongConfirm) {
                 state->mode = WordAppMode::kHome;
                 state->message = "已返回单词主页";
+                ActivatePendingWordPackIndex(state);
             }
             return ESP_OK;
 
@@ -320,6 +359,7 @@ esp_err_t HandleWordAppInput(WordAppState* state, WordInput input)
                 } else {
                     state->mode = WordAppMode::kHome;
                     state->message = "已返回单词主页";
+                    ActivatePendingWordPackIndex(state);
                 }
                 return ESP_OK;
             }
@@ -416,23 +456,24 @@ esp_err_t HandleWordAppInput(WordAppState* state, WordInput input)
     return ESP_OK;
 }
 
-void ApplyWordPackIndex(WordAppState* state, const WordPackIndex& index, const std::string& message)
+void ApplyWordPackIndex(WordAppState* state, WordPackIndex index, const std::string& message)
 {
     if (state == nullptr) {
         return;
     }
-    state->pack_index = index;
-    state->cloud_loaded_once = index.has_manifest;
-    state->cloud_sync_failed = index.pack_error;
-    state->cloud_sync_requested = !index.has_manifest || index.pack_error;
-    // [target-fix] Keep daily_target in sync with the actual pack size
-    // whenever the index is refreshed (initial load + cloud sync).
-    state->daily_target = ClampUint16(index.entries.size());
-    state->message = !message.empty() ? message : index.status_message;
-    if (state->message.empty()) {
-        state->message = HasPackWords(*state) ? "词库已就绪" : "词库未同步";
+    if (state->mode != WordAppMode::kHome) {
+        state->pending_pack_index = std::move(index);
+        state->pending_pack_index_ready = true;
+        state->cloud_loaded_once = state->pending_pack_index.has_manifest;
+        state->cloud_sync_failed = state->pending_pack_index.pack_error;
+        state->cloud_sync_requested = !state->pending_pack_index.has_manifest ||
+            state->pending_pack_index.pack_error;
+        state->message = state->pending_pack_index.pack_error
+            ? "词库更新校验失败"
+            : "词库已更新，下轮启用";
+        return;
     }
-    RefreshDictionaryState(state);
+    InstallWordPackIndex(state, std::move(index), message);
 }
 
 void ApplyWordSearchResult(WordAppState* state, const WqnWordSearchResult& result)

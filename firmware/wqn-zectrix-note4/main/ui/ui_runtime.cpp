@@ -115,7 +115,7 @@ UiUpdate UiRuntime::DispatchTodoCloudResult(const TodoCloudResult& result)
     return FinishEvent(AppEventKind::kTodoCloudResult, refresh, changed);
 }
 
-UiUpdate UiRuntime::DispatchWordCloudResult(const WordCloudResult& result)
+UiUpdate UiRuntime::DispatchWordCloudResult(WordCloudResult& result)
 {
     const bool changed = ApplyWordCloudResult(&state_, result);
     const RefreshSchedule refresh =

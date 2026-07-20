@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstddef>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -200,18 +202,24 @@ struct WqnWordPackManifestItem {
     std::string pack_id;
     std::string deck_id;
     std::string title;
-    std::string revision;
-    std::string schema_version;
+    uint64_t revision = 0;
+    uint64_t content_revision = 0;
+    uint64_t pack_revision = 0;
+    uint64_t change_sequence = 0;
+    uint32_t schema_version = 0;
     std::string format;
     std::string compression;
     std::string sha256;
     std::string download_url;
-    int entry_count = 0;
-    int byte_size = 0;
+    uint32_t entry_count = 0;
+    uint32_t byte_size = 0;
+    bool deleted = false;
 };
 
 struct WqnWordPackManifest {
     std::string server_time;
+    uint64_t cursor = 0;
+    bool has_more = false;
     std::vector<WqnWordPackManifestItem> packs;
 };
 
@@ -314,8 +322,21 @@ esp_err_t FetchWordSync(const std::string& token, const WqnWordSyncRequest& requ
 esp_err_t FetchWordReviewQueue(const std::string& token, const WqnWordReviewQueueRequest& request, WqnWordReviewQueue* queue);
 esp_err_t SubmitWordReview(const std::string& token, const WqnWordReviewSubmission& submission, WqnWordReviewSubmitResult* result);
 esp_err_t SearchWords(const std::string& token, const WqnWordSearchRequest& request, WqnWordSearchResult* result);
-esp_err_t FetchWordPackManifest(const std::string& token, WqnWordPackManifest* manifest);
-esp_err_t DownloadWordPack(const std::string& token, const WqnWordPackManifestItem& item, std::string* body);
+esp_err_t FetchWordPackManifest(
+    const std::string& token,
+    const protocol::v3::RequestMetadata& metadata,
+    uint64_t cursor,
+    WqnWordPackManifest* manifest);
+using WqnHttpChunkSink = esp_err_t (*)(
+    void* context,
+    const uint8_t* bytes,
+    size_t size);
+esp_err_t DownloadWordPackStream(
+    const std::string& token,
+    const protocol::v3::RequestMetadata& metadata,
+    const WqnWordPackManifestItem& item,
+    WqnHttpChunkSink sink,
+    void* context);
 esp_err_t LookupWordWithAi(const std::string& token, const WqnWordAiLookupRequest& request, WqnWordAiLookupResult* result);
 esp_err_t SyncDueProblemsAndLog(const std::string& token);
 

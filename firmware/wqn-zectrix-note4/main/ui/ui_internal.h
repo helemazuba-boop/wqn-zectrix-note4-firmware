@@ -191,7 +191,7 @@ static_assert(std::is_trivially_copyable_v<WordCloudResultReady>);
 void SendTodoCloudResult();
 void SendWordCloudResult();
 const TodoCloudResult* PeekTodoCloudResult(uint32_t generation);
-const WordCloudResult* PeekWordCloudResult(uint32_t generation);
+WordCloudResult* PeekWordCloudResult(uint32_t generation);
 
 bool IsTodoCloudBusy();
 bool IsWordCloudBusy();
@@ -211,7 +211,7 @@ bool QueueWordSearch(const wqn::WqnWordSearchRequest& search);
 bool QueueWordAiLookup(const wqn::WqnWordAiLookupRequest& lookup);
 
 bool ApplyTodoCloudResult(wqn::UiState* state, const TodoCloudResult& result);
-bool ApplyWordCloudResult(wqn::UiState* state, const WordCloudResult& result);
+bool ApplyWordCloudResult(wqn::UiState* state, WordCloudResult& result);
 
 bool RefreshTodosFromCloud(wqn::UiState* state);
 RefreshSchedule CompleteSelectedTodo(wqn::UiState* state);

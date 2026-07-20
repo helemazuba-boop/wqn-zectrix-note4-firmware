@@ -3,6 +3,7 @@
 #include <cstdint>
 
 #include "esp_err.h"
+#include "device_protocol/v3.h"
 #include "freertos/FreeRTOS.h"
 
 namespace wqn::services {
@@ -45,5 +46,9 @@ void RequestSyncNow();
 void GetSyncSnapshot(SyncSnapshot* snapshot);
 TickType_t GetConfiguredSyncDelayTicks();
 bool HasUsableStoredToken();
+
+// Returns metadata sharing the same per-boot identity as the control-plane
+// bootstrap/sync requests. Callers own the fresh request_id.
+wqn::protocol::v3::RequestMetadata MakeDeviceRequestMetadata();
 
 }  // namespace wqn::services

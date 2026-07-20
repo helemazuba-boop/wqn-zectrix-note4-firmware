@@ -3,15 +3,18 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <limits>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "cJSON.h"
 #include "config.h"
+#include "device_protocol/word_study.h"
 #include "esp_check.h"
 #include "esp_crt_bundle.h"
 #include "esp_http_client.h"
@@ -36,6 +39,43 @@ constexpr TickType_t kPollDelay = pdMS_TO_TICKS(2000);
 constexpr int kPollAttempts = 60;
 constexpr size_t kProblemPreviewChars = 240;
 constexpr std::time_t kMinReasonableUnixTime = 1704067200;  // 2024-01-01 UTC
+
+bool GetRequiredSafeUint64(cJSON* object, const char* key, uint64_t* value)
+{
+    if (!cJSON_IsObject(object) || key == nullptr || value == nullptr) {
+        return false;
+    }
+    cJSON* item = cJSON_GetObjectItemCaseSensitive(object, key);
+    if (!cJSON_IsNumber(item) || !std::isfinite(item->valuedouble) ||
+        item->valuedouble < 0 ||
+        item->valuedouble > static_cast<double>(wqn::protocol::v3::kMaxSafeJsonInteger) ||
+        std::floor(item->valuedouble) != item->valuedouble) {
+        return false;
+    }
+    *value = static_cast<uint64_t>(item->valuedouble);
+    return true;
+}
+
+bool GetRequiredSafeUint32(cJSON* object, const char* key, uint32_t* value)
+{
+    uint64_t parsed = 0;
+    if (!GetRequiredSafeUint64(object, key, &parsed) ||
+        parsed > std::numeric_limits<uint32_t>::max()) {
+        return false;
+    }
+    *value = static_cast<uint32_t>(parsed);
+    return true;
+}
+
+bool IsLowercaseSha256(const std::string& value)
+{
+    if (value.size() != 64) {
+        return false;
+    }
+    return std::all_of(value.begin(), value.end(), [](unsigned char ch) {
+        return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f');
+    });
+}
 
 std::string StableRequestIdForBody(const std::string& body)
 {
@@ -825,42 +865,40 @@ esp_err_t ParseWordPackManifestItem(cJSON* item, int index, wqn::WqnWordPackMani
     }
     parsed.deck_id = GetOptionalString(item, "deck_id");
     parsed.title = GetOptionalString(item, "title");
-    parsed.revision = GetOptionalString(item, "revision");
-    if (parsed.revision.empty()) {
-        const int revision = GetOptionalInt(item, "revision");
-        if (revision > 0) {
-            parsed.revision = std::to_string(revision);
-        }
-    }
-    parsed.schema_version = GetOptionalString(item, "schema_version");
-    if (parsed.schema_version.empty()) {
-        const int schema_version = GetOptionalInt(item, "schema_version");
-        if (schema_version > 0) {
-            parsed.schema_version = std::to_string(schema_version);
-        }
-    }
     parsed.format = GetOptionalString(item, "format");
     parsed.compression = GetOptionalString(item, "compression");
     parsed.sha256 = GetOptionalString(item, "sha256");
     parsed.download_url = GetOptionalString(item, "download_url");
-    parsed.entry_count = GetOptionalInt(item, "entry_count");
-    parsed.byte_size = GetOptionalInt(item, "byte_size");
-    if (parsed.byte_size <= 0) {
-        parsed.byte_size = GetOptionalInt(item, "bytes");
+
+    if (!GetRequiredSafeUint64(item, "revision", &parsed.revision)) {
+        ESP_LOGW(kTag, "word pack revision is not an exact safe integer at index=%d", index);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    if (!GetRequiredSafeUint64(item, "content_revision", &parsed.content_revision)) {
+        parsed.content_revision = parsed.revision;
+    }
+    if (!GetRequiredSafeUint64(item, "pack_revision", &parsed.pack_revision)) {
+        parsed.pack_revision = parsed.revision;
+    }
+    if (!GetRequiredSafeUint64(item, "change_sequence", &parsed.change_sequence)) {
+        parsed.change_sequence = 0;
+    }
+    if (!GetRequiredSafeUint32(item, "schema_version", &parsed.schema_version) ||
+        !GetRequiredSafeUint32(item, "entry_count", &parsed.entry_count) ||
+        !GetRequiredSafeUint32(item, "byte_size", &parsed.byte_size)) {
+        ESP_LOGW(kTag, "word pack manifest has invalid bounded counters at index=%d", index);
+        return ESP_ERR_INVALID_RESPONSE;
     }
 
-    if (parsed.pack_id.empty() || parsed.deck_id.empty() || parsed.sha256.empty() || parsed.download_url.empty()) {
-        ESP_LOGW(kTag, "word pack manifest item missing required fields at index=%d", index);
-        return ESP_FAIL;
-    }
-    if (parsed.format.empty()) {
-        parsed.format = "jsonl";
-    }
-    if (parsed.compression.empty()) {
-        parsed.compression = "none";
-    }
-    if (parsed.schema_version.empty()) {
-        parsed.schema_version = "1";
+    if (parsed.pack_id.empty() || parsed.deck_id.empty() ||
+        !IsLowercaseSha256(parsed.sha256) || parsed.download_url.empty() ||
+        parsed.schema_version != wqn::protocol::word_study_v1::kPackSchemaVersion ||
+        parsed.format != "jsonl" || parsed.compression != "none" ||
+        parsed.entry_count > wqn::protocol::word_study_v1::kMaxPackEntries ||
+        parsed.byte_size == 0 ||
+        parsed.byte_size > wqn::protocol::word_study_v1::kMaxPackBytes) {
+        ESP_LOGW(kTag, "word pack manifest item violates v2 contract at index=%d", index);
+        return ESP_ERR_INVALID_RESPONSE;
     }
 
     *pack = std::move(parsed);
@@ -1449,14 +1487,26 @@ esp_err_t ParseWordPackManifestResponseImpl(const std::string& body, wqn::WqnWor
     }
 
     manifest->server_time = GetOptionalString(data, "server_time");
+    cJSON* cursor = cJSON_GetObjectItemCaseSensitive(data, "cursor");
+    if (cursor != nullptr &&
+        !GetRequiredSafeUint64(data, "cursor", &manifest->cursor)) {
+        ESP_LOGW(kTag, "word pack manifest cursor is invalid");
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    cJSON* has_more = cJSON_GetObjectItemCaseSensitive(data, "has_more");
+    if (has_more != nullptr && !cJSON_IsBool(has_more)) {
+        ESP_LOGW(kTag, "word pack manifest has_more is invalid");
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    manifest->has_more = cJSON_IsTrue(has_more);
     const int count = cJSON_GetArraySize(packs);
     manifest->packs.reserve(count);
     for (int i = 0; i < count; ++i) {
         wqn::WqnWordPackManifestItem item;
         const esp_err_t parsed = ParseWordPackManifestItem(cJSON_GetArrayItem(packs, i), i, &item);
         if (parsed != ESP_OK) {
-            ESP_LOGW(kTag, "skip invalid word pack manifest item at index=%d", i);
-            continue;
+            ESP_LOGW(kTag, "reject invalid word pack manifest item at index=%d", i);
+            return parsed;
         }
         manifest->packs.push_back(std::move(item));
     }
@@ -2472,7 +2522,11 @@ esp_err_t SearchWords(const std::string& token, const WqnWordSearchRequest& requ
     return ParseWordSearchResponse(body, result);
 }
 
-esp_err_t FetchWordPackManifest(const std::string& token, WqnWordPackManifest* manifest)
+esp_err_t FetchWordPackManifest(
+    const std::string& token,
+    const protocol::v3::RequestMetadata& metadata,
+    uint64_t cursor,
+    WqnWordPackManifest* manifest)
 {
     if (manifest == nullptr) {
         return ESP_ERR_INVALID_ARG;
@@ -2488,10 +2542,24 @@ esp_err_t FetchWordPackManifest(const std::string& token, WqnWordPackManifest* m
 
     ESP_RETURN_ON_ERROR(WaitForNetworkReadyForHttps(), kTag, "prepare network for word-pack-manifest");
 
-    const std::string url = BuildUrl("/words/packs/manifest");
+    std::string request_body;
+    ESP_RETURN_ON_ERROR(
+        protocol::word_study_v1::BuildManifestRequest(
+            metadata, cursor, 100, &request_body),
+        kTag,
+        "build word-study manifest request");
+    const std::string url = BuildUrl("/v3/words/manifest");
     int status_code = 0;
     std::string body;
-    esp_err_t http_result = HttpRequest("GET", url, &token, nullptr, &status_code, &body);
+    esp_err_t http_result = HttpRequest(
+        "POST",
+        url,
+        &token,
+        &request_body,
+        &status_code,
+        &body,
+        protocol::v3::kProtocolHeader,
+        &metadata.request_id);
     if (http_result != ESP_OK) {
         ESP_LOGW(kTag, "word-pack-manifest failed: %s", esp_err_to_name(http_result));
         return http_result;
@@ -2499,27 +2567,67 @@ esp_err_t FetchWordPackManifest(const std::string& token, WqnWordPackManifest* m
     if (status_code == 401) {
         return ClearTokenOnUnauthorized("word-pack-manifest");
     }
-    if (status_code != 200) {
-        ESP_LOGW(kTag, "word-pack-manifest HTTP status=%d", status_code);
-        return ESP_FAIL;
+    protocol::word_study_v1::ManifestData data;
+    protocol::v3::Error error;
+    const esp_err_t parse_result = protocol::word_study_v1::ParseManifestResponse(
+        body, metadata.request_id, &data, &error);
+    if (status_code != 200 || parse_result != ESP_OK) {
+        ESP_LOGW(
+            kTag,
+            "word-study manifest failed: status=%d code=%s retryable=%d",
+            status_code,
+            error.code.c_str(),
+            error.retryable ? 1 : 0);
+        return parse_result == ESP_OK ? ESP_FAIL : parse_result;
     }
 
-    const esp_err_t parse_result = ParseWordPackManifestResponse(body, manifest);
-    if (parse_result == ESP_OK) {
-        ESP_LOGI(kTag, "word-pack-manifest ok: packs=%u",
-                 static_cast<unsigned>(manifest->packs.size()));
+    manifest->cursor = data.cursor;
+    manifest->has_more = data.has_more;
+    manifest->packs.reserve(data.decks.size());
+    for (const protocol::word_study_v1::ManifestDeck& deck : data.decks) {
+        WqnWordPackManifestItem item;
+        item.deck_id = deck.deck_id;
+        item.title = deck.title;
+        item.content_revision = deck.content_revision;
+        item.change_sequence = deck.change_sequence;
+        item.deleted = deck.deleted;
+        if (!deck.deleted && deck.has_pack) {
+            item.pack_id = deck.pack.pack_id;
+            item.revision = deck.pack.pack_revision;
+            item.pack_revision = deck.pack.pack_revision;
+            item.schema_version = deck.pack.schema_version;
+            item.format = "jsonl";
+            item.compression = "none";
+            item.sha256 = deck.pack.sha256;
+            item.download_url = deck.pack.download_url;
+            item.entry_count = deck.pack.entry_count;
+            item.byte_size = deck.pack.byte_size;
+        }
+        manifest->packs.push_back(std::move(item));
     }
-    return parse_result;
+    ESP_LOGI(
+        kTag,
+        "word-study manifest ok: cursor=%llu changes=%u has_more=%d",
+        static_cast<unsigned long long>(manifest->cursor),
+        static_cast<unsigned>(manifest->packs.size()),
+        manifest->has_more ? 1 : 0);
+    return ESP_OK;
 }
 
-esp_err_t DownloadWordPack(const std::string& token, const WqnWordPackManifestItem& item, std::string* body)
+esp_err_t DownloadWordPackStream(
+    const std::string& token,
+    const protocol::v3::RequestMetadata& metadata,
+    const WqnWordPackManifestItem& item,
+    WqnHttpChunkSink sink,
+    void* context)
 {
-    if (body == nullptr || item.download_url.empty()) {
+    if (sink == nullptr || metadata.request_id.empty() ||
+        item.download_url.empty() || item.byte_size == 0 ||
+        item.byte_size > protocol::word_study_v1::kMaxPackBytes) {
         return ESP_ERR_INVALID_ARG;
     }
-    body->clear();
     if (token.empty()) {
-        return ESP_OK;
+        return ESP_ERR_INVALID_STATE;
     }
     const esp_err_t token_result = ValidateTokenOrClear(token, "word-pack-download");
     if (token_result != ESP_OK) {
@@ -2529,14 +2637,86 @@ esp_err_t DownloadWordPack(const std::string& token, const WqnWordPackManifestIt
     ESP_RETURN_ON_ERROR(WaitForNetworkReadyForHttps(), kTag, "prepare network for word-pack-download");
 
     const std::string url = BuildWordPackDownloadUrl(item.download_url);
-    ESP_LOGI(kTag, "word-pack-download: pack_id=%s url=%s bytes_expected=%d",
-             item.pack_id.c_str(), url.c_str(), item.byte_size);
-    int status_code = 0;
-    esp_err_t http_result = HttpRequest("GET", url, &token, nullptr, &status_code, body);
-    if (http_result != ESP_OK) {
-        ESP_LOGW(kTag, "word-pack-download failed: %s url=%s", esp_err_to_name(http_result), url.c_str());
-        return http_result;
+    ESP_LOGI(kTag, "word-pack-download: pack_id=%s url=%s bytes_expected=%lu",
+             item.pack_id.c_str(), url.c_str(), static_cast<unsigned long>(item.byte_size));
+    esp_http_client_config_t config = {};
+    config.url = url.c_str();
+    config.method = HTTP_METHOD_GET;
+    config.timeout_ms = kHttpTimeoutMs;
+    config.crt_bundle_attach = esp_crt_bundle_attach;
+    config.buffer_size = 2048;
+
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (client == nullptr) {
+        return ESP_ERR_NO_MEM;
     }
+    const std::string authorization = "Bearer " + token;
+    esp_err_t result = esp_http_client_set_header(
+        client, "Accept", "application/x-ndjson");
+    if (result == ESP_OK) {
+        result = esp_http_client_set_header(
+            client, "Authorization", authorization.c_str());
+    }
+    if (result == ESP_OK) {
+        result = esp_http_client_set_header(
+            client, "X-WQN-Protocol", protocol::v3::kProtocolHeader);
+    }
+    if (result == ESP_OK) {
+        result = esp_http_client_set_header(
+            client, "X-WQN-Request-Id", metadata.request_id.c_str());
+    }
+    if (result == ESP_OK) {
+        result = esp_http_client_open(client, 0);
+    }
+    int content_length = -1;
+    int status_code = 0;
+    if (result == ESP_OK) {
+        content_length = esp_http_client_fetch_headers(client);
+        status_code = esp_http_client_get_status_code(client);
+    }
+    if (result == ESP_OK && content_length >= 0 &&
+        static_cast<uint64_t>(content_length) != item.byte_size) {
+        ESP_LOGW(
+            kTag,
+            "word-pack-download Content-Length mismatch: expected=%lu actual=%d",
+            static_cast<unsigned long>(item.byte_size),
+            content_length);
+        result = ESP_ERR_INVALID_SIZE;
+    }
+    size_t received = 0;
+    std::array<uint8_t, 2048> buffer = {};
+    while (result == ESP_OK && status_code == 200) {
+        const int read = esp_http_client_read(
+            client,
+            reinterpret_cast<char*>(buffer.data()),
+            buffer.size());
+        FeedTaskWatchdogIfSubscribed();
+        if (read < 0) {
+            result = ESP_FAIL;
+            break;
+        }
+        if (read == 0) {
+            break;
+        }
+        if (received + static_cast<size_t>(read) > item.byte_size ||
+            received + static_cast<size_t>(read) >
+                protocol::word_study_v1::kMaxPackBytes) {
+            result = ESP_ERR_INVALID_SIZE;
+            break;
+        }
+        result = sink(context, buffer.data(), static_cast<size_t>(read));
+        if (result == ESP_OK) {
+            received += static_cast<size_t>(read);
+        }
+    }
+    if (result == ESP_OK && status_code == 200 &&
+        (received != item.byte_size ||
+         !esp_http_client_is_complete_data_received(client))) {
+        result = ESP_ERR_INVALID_SIZE;
+    }
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+
     if (status_code == 401) {
         return ClearTokenOnUnauthorized("word-pack-download");
     }
@@ -2544,7 +2724,15 @@ esp_err_t DownloadWordPack(const std::string& token, const WqnWordPackManifestIt
         ESP_LOGW(kTag, "word-pack-download HTTP status=%d", status_code);
         return ESP_FAIL;
     }
-    return ESP_OK;
+    if (result != ESP_OK) {
+        ESP_LOGW(
+            kTag,
+            "word-pack-download failed: %s url=%s received=%u",
+            esp_err_to_name(result),
+            url.c_str(),
+            static_cast<unsigned>(received));
+    }
+    return result;
 }
 
 esp_err_t LookupWordWithAi(const std::string& token, const WqnWordAiLookupRequest& request, WqnWordAiLookupResult* result)
