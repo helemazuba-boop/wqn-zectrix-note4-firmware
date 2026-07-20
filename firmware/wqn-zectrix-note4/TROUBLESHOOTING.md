@@ -82,6 +82,25 @@ network loss or server error, verify a terminal result and lease release. I2S,
 ES8311 and amplifier GPIO access must exist only in `AudioService`; the M8 build
 gate enforces this.
 
+## Word card stalls or advances incorrectly
+
+- Match the button log to `word observation durable`. The card must remain in
+  `Persisting` until the foreground storage transaction succeeds.
+- Use `owner`, `queue_wait_ms` and `elapsed_ms` to distinguish queue contention
+  from SPIFFS work. Word observation commits use the foreground queue; outbox
+  upload/ACK must yield after the current idempotent item when interaction
+  generation changes.
+- A network timeout must leave the same request id in the outbox. Repeated
+  observations with a new request id are a defect.
+- A resumed random session must retain its original session id, seed, snapshot,
+  cursor and position. If order changes after reset, preserve `wsr.v1`, the boot
+  log and the matching ELF.
+- A dictionary card is read-only until an explicit known/unknown/skipped action.
+  A late lookup or session result must not replace the active picker/card.
+- New word-pack manifests are staged for the next session. If an active card
+  changes after sync, compare the persisted session snapshot against the loaded
+  pack SHA and stop using that build.
+
 ## Useful local checks
 
 ```bash

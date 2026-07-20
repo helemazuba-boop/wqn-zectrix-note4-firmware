@@ -90,22 +90,6 @@ struct WqnTodoTimelineRequest {
     int limit = 24;
 };
 
-struct WqnWordDeck {
-    std::string id;
-    std::string title;
-    std::string description;
-    std::string source;
-    std::string language;
-    std::string target_language;
-    std::string updated_at;
-    bool is_system = false;
-    bool deleted = false;
-    int revision = 0;
-    int word_count = 0;
-    int due_count = 0;
-    int mastered_count = 0;
-};
-
 struct WqnWordEntry {
     std::string id;
     std::string deck_id;
@@ -120,71 +104,6 @@ struct WqnWordEntry {
     std::string due_at;
     bool deleted = false;
     int revision = 0;
-};
-
-struct WqnWordProgress {
-    std::string word_id;
-    std::string status;
-    std::string due_at;
-    int interval_days = 0;
-    int correct_streak = 0;
-    int lapses = 0;
-    int reviewed_count = 0;
-    int known_count = 0;
-    int unknown_count = 0;
-    int revision = 0;
-};
-
-struct WqnWordSyncRequest {
-    std::string cursor;
-    int limit = 200;
-};
-
-struct WqnWordSyncPage {
-    std::string cursor;
-    std::string server_time;
-    std::vector<WqnWordDeck> decks;
-    std::vector<WqnWordEntry> entries;
-    std::vector<WqnWordProgress> progress;
-};
-
-struct WqnWordReviewQueueRequest {
-    std::string mode = "sequential";
-    int limit = 20;
-};
-
-struct WqnWordReviewQueue {
-    std::string mode;
-    int daily_target = 0;
-    int reviewed_today = 0;
-    int due_count = 0;
-    std::vector<WqnWordEntry> words;
-};
-
-struct WqnWordReviewResultAction {
-    std::string type;
-    std::string word_id;
-    std::string word;
-    std::string problem_set_id;
-    std::string problem_id;
-    std::string deck_id;
-    std::string title;
-    std::string status;
-    std::string outcome;
-    std::string due_at;
-};
-
-struct WqnWordReviewSubmission {
-    std::string word_id;
-    std::string outcome;
-    std::string mode = "sequential";
-};
-
-struct WqnWordReviewSubmitResult {
-    std::string word_id;
-    std::string status;
-    std::string due_at;
-    std::vector<WqnWordReviewResultAction> actions;
 };
 
 struct WqnWordSearchRequest {
@@ -319,9 +238,6 @@ esp_err_t FetchTodoTimeline(const std::string& token, const WqnTodoTimelineReque
 esp_err_t FetchTodoTimeline(const std::string& token, WqnTodoListPage* page);
 esp_err_t FetchTodayPendingTodos(const std::string& token, WqnTodoListPage* page);
 esp_err_t CompleteTodo(const std::string& token, const std::string& todo_id, WqnTodoItem* todo);
-esp_err_t FetchWordSync(const std::string& token, const WqnWordSyncRequest& request, WqnWordSyncPage* page);
-esp_err_t FetchWordReviewQueue(const std::string& token, const WqnWordReviewQueueRequest& request, WqnWordReviewQueue* queue);
-esp_err_t SubmitWordReview(const std::string& token, const WqnWordReviewSubmission& submission, WqnWordReviewSubmitResult* result);
 esp_err_t SearchWords(const std::string& token, const WqnWordSearchRequest& request, WqnWordSearchResult* result);
 esp_err_t FetchWordPackManifest(
     const std::string& token,
@@ -455,9 +371,6 @@ esp_err_t UploadAiAudioChat(
 
 esp_err_t ParseTodoListResponse(const std::string& body, WqnTodoListPage* page);
 esp_err_t ParseTodoCompleteResponse(const std::string& body, WqnTodoItem* todo);
-esp_err_t ParseWordSyncResponse(const std::string& body, WqnWordSyncPage* page);
-esp_err_t ParseWordReviewQueueResponse(const std::string& body, WqnWordReviewQueue* queue);
-esp_err_t ParseWordReviewSubmitResponse(const std::string& body, WqnWordReviewSubmitResult* result);
 esp_err_t ParseWordSearchResponse(const std::string& body, WqnWordSearchResult* result);
 esp_err_t ParseWordPackManifestResponse(const std::string& body, WqnWordPackManifest* manifest);
 esp_err_t ParseWordAiLookupResponse(const std::string& body, WqnWordAiLookupResult* result);

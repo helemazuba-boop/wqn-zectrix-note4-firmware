@@ -21,18 +21,11 @@
 namespace {
 
 constexpr char kTag[] = "word_store";
-// wsess.* was the short-lived single-slot W4 development format. Keep it as
-// a read-only migration source so devices flashed with 509e785 do not lose an
-// in-progress session. The stable layout has one slot per entry mode.
-constexpr char kLegacySessionPath[] = "/storage/wsess.v1";
-constexpr char kLegacySessionTempPath[] = "/storage/wsess.tmp";
-constexpr char kLegacySessionBackupPath[] = "/storage/wsess.bak";
 constexpr char kOutboxPath[] = "/storage/wout.v1";
 constexpr char kOutboxTempPath[] = "/storage/wout.tmp";
 constexpr char kOutboxBackupPath[] = "/storage/wout.bak";
 constexpr uint32_t kSessionMagic = UINT32_C(0x53535157);  // WQSS
 constexpr uint32_t kOutboxMagic = UINT32_C(0x424f5157);  // WQOB
-constexpr uint16_t kLegacySessionSchemaVersion = 1;
 constexpr uint16_t kSessionSchemaVersion = 2;
 constexpr uint16_t kOutboxSchemaVersion = 1;
 constexpr size_t kMaxSessionPayloadBytes = 96U * 1024U;
@@ -256,7 +249,6 @@ bool EncodeSession(
 
 bool DecodeSession(
     const std::vector<uint8_t>& payload,
-    uint16_t version,
     wqn::PersistedWordSession* session)
 {
     using namespace wqn::protocol::word_study_v1;
@@ -339,8 +331,7 @@ bool DecodeSession(
         }
         parsed.remote.items.push_back(std::move(item));
     }
-    if (version >= kSessionSchemaVersion &&
-        !reader.Scalar(&parsed.remote.progress_revision)) {
+    if (!reader.Scalar(&parsed.remote.progress_revision)) {
         return false;
     }
     if (!reader.finished() || parsed.position > parsed.remote.items.size()) return false;
@@ -430,8 +421,7 @@ esp_err_t LoadSessionFile(const char* path, wqn::PersistedWordSession* session)
     SessionHeader header = {};
     const bool header_ok = std::fread(&header, 1, sizeof(header), file) == sizeof(header);
     if (!header_ok || header.magic != kSessionMagic ||
-        (header.version != kLegacySessionSchemaVersion &&
-         header.version != kSessionSchemaVersion) ||
+        header.version != kSessionSchemaVersion ||
         header.payload_size > kMaxSessionPayloadBytes) {
         std::fclose(file);
         return ESP_ERR_INVALID_VERSION;
@@ -444,7 +434,7 @@ esp_err_t LoadSessionFile(const char* path, wqn::PersistedWordSession* session)
     if (!payload_ok || trailing != EOF || Crc32(payload.data(), payload.size()) != header.payload_crc) {
         return ESP_ERR_INVALID_CRC;
     }
-    return DecodeSession(payload, header.version, session)
+    return DecodeSession(payload, session)
         ? ESP_OK
         : ESP_ERR_INVALID_RESPONSE;
 }
@@ -475,27 +465,7 @@ esp_err_t LoadSessionRaw(
     wqn::protocol::word_study_v1::Mode mode,
     wqn::PersistedWordSession* session)
 {
-    esp_err_t result = LoadSessionSlotRaw(mode, session);
-    if (result != ESP_ERR_NOT_FOUND) return result;
-
-    // Migrate the development single-slot file only when it belongs to the
-    // requested mode. A sequential probe must not discard a random session.
-    wqn::PersistedWordSession legacy;
-    esp_err_t legacy_result = LoadSessionFile(kLegacySessionPath, &legacy);
-    if (legacy_result != ESP_OK && FileExists(kLegacySessionBackupPath)) {
-        legacy_result = LoadSessionFile(kLegacySessionBackupPath, &legacy);
-    }
-    if (legacy_result != ESP_OK || legacy.remote.mode != mode) {
-        return result;
-    }
-    ESP_RETURN_ON_ERROR(SaveSessionRaw(legacy), kTag, "migrate word session slot");
-    std::remove(kLegacySessionPath);
-    std::remove(kLegacySessionTempPath);
-    std::remove(kLegacySessionBackupPath);
-    *session = std::move(legacy);
-    ESP_LOGI(kTag, "migrated word session to mode-specific slot: mode=%u",
-             static_cast<unsigned>(mode));
-    return ESP_OK;
+    return LoadSessionSlotRaw(mode, session);
 }
 
 uint32_t RecordCrc(const OutboxRecord& record)

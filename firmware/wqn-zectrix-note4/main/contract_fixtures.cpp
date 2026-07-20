@@ -442,112 +442,6 @@ const char kAiTodoActions[] = R"json({
   }
 })json";
 
-const char kWordSync[] = R"json({
-  "success": true,
-  "data": {
-    "cursor": "cursor-2",
-    "server_time": "2026-06-06T00:00:00.000Z",
-    "decks": [
-      {
-        "id": "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
-        "title": "Core Words",
-        "source": "system",
-        "language": "en",
-        "target_language": "zh-CN",
-        "is_system": true,
-        "revision": 3,
-        "deleted": false,
-        "ignored_future_field": true
-      },
-      {
-        "title": "Missing id"
-      }
-    ],
-    "entries": [
-      {
-        "id": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
-        "deck_id": "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
-        "word": "confirm",
-        "phonetic": "/confirm/",
-        "meaning": "verify",
-        "example": "Please confirm your choice.",
-        "example_translation": "Confirm it.",
-        "revision": 2,
-        "deleted": false
-      },
-      {
-        "id": "ffffffff-ffff-4fff-8fff-ffffffffffff",
-        "word": "broken"
-      }
-    ],
-    "progress": [
-      {
-        "word_id": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
-        "status": "learning",
-        "due_at": "2026-06-06T00:00:00.000Z",
-        "correct_streak": 0,
-        "lapses": 1,
-        "revision": 4
-      },
-      {
-        "status": "new"
-      }
-    ]
-  }
-})json";
-
-const char kWordReviewQueue[] = R"json({
-  "success": true,
-  "data": {
-    "mode": "sequential",
-    "daily_target": 20,
-    "reviewed_today": 8,
-    "due_count": 12,
-    "words": [
-      {
-        "id": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
-        "word": "consistent",
-        "phonetic": "/consistent/",
-        "meaning": "steady",
-        "example": "Keep a consistent study habit.",
-        "example_translation": "Keep it steady.",
-        "status": "new"
-      },
-      {
-        "word": "missing-id",
-        "meaning": "bad item"
-      }
-    ]
-  }
-})json";
-
-const char kWordReviewSubmit[] = R"json({
-  "success": true,
-  "data": {
-    "word_id": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
-    "status": "learning",
-    "due_at": "2026-06-06T00:00:00.000Z",
-    "actions": [
-      {
-        "type": "word_review_recorded",
-        "word_id": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
-        "word": "consistent",
-        "status": "learning",
-        "outcome": "unknown",
-        "due_at": "2026-06-06T00:00:00.000Z"
-      },
-      {
-        "type": "word_added_to_mistakes",
-        "word_id": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
-        "word": "consistent",
-        "problem_set_id": "99999999-9999-4999-8999-999999999999",
-        "problem_id": "88888888-8888-4888-8888-888888888888",
-        "title": "consistent"
-      }
-    ]
-  }
-})json";
-
 const char kWordSearch[] = R"json({
   "success": true,
   "data": {
@@ -812,53 +706,6 @@ bool CheckAiTodoActions()
            Require(response.actions[2].status == "pending", "AI restored status") &&
            Require(response.actions[3].status == "cancelled", "AI cancelled status") &&
            Require(response.actions[4].type == "future_action", "AI unknown action preserved");
-}
-
-bool CheckWordSync()
-{
-    wqn::WqnWordSyncPage page;
-    const esp_err_t result = wqn::ParseWordSyncResponse(kWordSync, &page);
-    return Require(result == ESP_OK, "word sync parse result") &&
-           Require(page.cursor == "cursor-2", "word sync cursor") &&
-           Require(page.server_time == "2026-06-06T00:00:00.000Z", "word sync server time") &&
-           Require(page.decks.size() == 1, "word sync skips invalid deck") &&
-           Require(page.entries.size() == 1, "word sync skips invalid entry") &&
-           Require(page.progress.size() == 1, "word sync skips invalid progress") &&
-           Require(page.decks[0].id == "dddddddd-dddd-4ddd-8ddd-dddddddddddd", "word deck id") &&
-           Require(page.decks[0].is_system, "word deck system flag") &&
-           Require(page.entries[0].word == "confirm", "word entry word") &&
-           Require(page.entries[0].meaning == "verify", "word entry meaning") &&
-           Require(page.progress[0].status == "learning", "word progress status") &&
-           Require(page.progress[0].lapses == 1, "word progress lapses");
-}
-
-bool CheckWordReviewQueue()
-{
-    wqn::WqnWordReviewQueue queue;
-    const esp_err_t result = wqn::ParseWordReviewQueueResponse(kWordReviewQueue, &queue);
-    return Require(result == ESP_OK, "word review queue parse result") &&
-           Require(queue.mode == "sequential", "word review mode") &&
-           Require(queue.daily_target == 20, "word review daily target") &&
-           Require(queue.reviewed_today == 8, "word review reviewed today") &&
-           Require(queue.due_count == 12, "word review due count") &&
-           Require(queue.words.size() == 1, "word review skips invalid word") &&
-           Require(queue.words[0].word == "consistent", "word review word") &&
-           Require(queue.words[0].status == "new", "word review status");
-}
-
-bool CheckWordReviewSubmit()
-{
-    wqn::WqnWordReviewSubmitResult review;
-    const esp_err_t result = wqn::ParseWordReviewSubmitResponse(kWordReviewSubmit, &review);
-    return Require(result == ESP_OK, "word review submit parse result") &&
-           Require(review.word_id == "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee", "word review submit word_id") &&
-           Require(review.status == "learning", "word review submit status") &&
-           Require(review.due_at == "2026-06-06T00:00:00.000Z", "word review submit due_at") &&
-           Require(review.actions.size() == 2, "word review submit action count") &&
-           Require(review.actions[0].type == "word_review_recorded", "word review submit primary action type") &&
-           Require(review.actions[0].outcome == "unknown", "word review submit outcome") &&
-           Require(review.actions[1].type == "word_added_to_mistakes", "word review submit extra action type") &&
-           Require(review.actions[1].problem_id == "88888888-8888-4888-8888-888888888888", "word review problem id");
 }
 
 bool CheckWordSearch()
@@ -1241,9 +1088,6 @@ bool RunContractFixtureSelfTest()
         CheckTodoList() &&
         CheckTodoComplete() &&
         CheckAiTodoActions() &&
-        CheckWordSync() &&
-        CheckWordReviewQueue() &&
-        CheckWordReviewSubmit() &&
         CheckWordSearch() &&
         CheckAiWordActions() &&
         CheckUnauthorizedError() &&

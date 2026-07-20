@@ -91,6 +91,15 @@ Development builds can override it:
 idf.py -B build-ai-local-s3 -DWQN_API_BASE=https://your-host.example.com/api/esp32 build
 ```
 
+## Word reference baseline
+
+- [Product and runtime baseline](WORD_BASELINE.md)
+- [StudySession lifecycle](STUDY_SESSION_PROTOCOL.md)
+- [Deterministic Word Pack v2](WORD_PACK_V2.md)
+- [Durable offline outbox](WORD_OFFLINE_OUTBOX.md)
+- [Word cutover checklist](WORD_RELEASE_CHECKLIST.md)
+- [Reuse guide for problems and notes](STUDY_RUNTIME_REUSE.md)
+
 ## Main Configuration Switches
 
 Configure features through `idf.py menuconfig` under `WQN firmware`:
