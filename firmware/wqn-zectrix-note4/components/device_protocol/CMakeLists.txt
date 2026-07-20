@@ -2,6 +2,7 @@ idf_component_register(
     SRCS
         "claim_crypto.cpp"
         "v3.cpp"
+        "word_study.cpp"
     INCLUDE_DIRS "include"
     REQUIRES
         esp_system
@@ -28,4 +29,25 @@ endif()
 target_compile_definitions(
     ${COMPONENT_LIB}
     PUBLIC WQN_DEVICE_CONTROL_SCHEMA_SHA256="${WQN_DEVICE_CONTROL_SCHEMA_SHA256}"
+)
+
+set(WQN_WORD_STUDY_CONTRACT_DIR
+    "${CMAKE_CURRENT_LIST_DIR}/../../contracts/word-study-v1")
+set(WQN_WORD_STUDY_SCHEMA
+    "${WQN_WORD_STUDY_CONTRACT_DIR}/word-study-v1.schema.json")
+set(WQN_WORD_STUDY_MANIFEST
+    "${WQN_WORD_STUDY_CONTRACT_DIR}/manifest.json")
+file(SHA256 "${WQN_WORD_STUDY_SCHEMA}" WQN_WORD_STUDY_SCHEMA_SHA256)
+file(READ "${WQN_WORD_STUDY_MANIFEST}" WQN_WORD_STUDY_MANIFEST_JSON)
+string(JSON WQN_WORD_STUDY_MANIFEST_SHA256
+    GET "${WQN_WORD_STUDY_MANIFEST_JSON}" schema_sha256)
+if(NOT WQN_WORD_STUDY_SCHEMA_SHA256 STREQUAL WQN_WORD_STUDY_MANIFEST_SHA256)
+    message(FATAL_ERROR
+        "word-study-v1 schema hash mismatch: actual=${WQN_WORD_STUDY_SCHEMA_SHA256} "
+        "manifest=${WQN_WORD_STUDY_MANIFEST_SHA256}")
+endif()
+
+target_compile_definitions(
+    ${COMPONENT_LIB}
+    PUBLIC WQN_WORD_STUDY_SCHEMA_SHA256="${WQN_WORD_STUDY_SCHEMA_SHA256}"
 )

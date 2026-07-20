@@ -79,7 +79,8 @@ esp_err_t AddRequestMetadata(
     cJSON_AddStringToObject(root, "boot_id", metadata.boot_id.c_str());
     cJSON_AddStringToObject(root, "firmware_version", metadata.firmware_version.c_str());
     cJSON_AddItemToObject(root, "capabilities", capabilities);
-    const char* values[] = {"display.epd", "sync.v3", "ai.sse.v2", "flash.v2"};
+    const char* values[] = {
+        "display.epd", "sync.v3", "word.study.v1", "ai.sse.v2", "flash.v2"};
     for (const char* value : values) {
         cJSON_AddItemToArray(capabilities, cJSON_CreateString(value));
     }

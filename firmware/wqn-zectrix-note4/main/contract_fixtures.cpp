@@ -5,6 +5,7 @@
 
 #include "cJSON.h"
 #include "device_protocol/v3.h"
+#include "device_protocol/word_study.h"
 #include "esp_log.h"
 #include "text_render.h"
 #include "wqn_api.h"
@@ -69,6 +70,95 @@ const char kV3Error[] = R"json({
     "retryable": true,
     "retry_after_ms": 10000
   }
+})json";
+
+const char kWordSessionV1[] = R"json({
+  "ok": true,
+  "request_id": "req_word_session_0001",
+  "server_time_ms": 1784512800000,
+  "data": {
+    "session_id": "22222222-2222-4222-8222-222222222222",
+    "domain": "word",
+    "mode": "random",
+    "purpose": "study",
+    "ordering": "guided_random_v1",
+    "seed": "seed_contract_001",
+    "scope": {
+      "deck_ids": ["11111111-1111-4111-8111-111111111111"],
+      "include_mastered": false
+    },
+    "optional_count": 20,
+    "next_sequence": 0,
+    "snapshot": [{
+      "deck_id": "11111111-1111-4111-8111-111111111111",
+      "content_revision": 9,
+      "pack_revision": 9,
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }],
+    "items": [{
+      "item_id": "33333333-3333-4333-8333-333333333333",
+      "deck_id": "11111111-1111-4111-8111-111111111111",
+      "ordinal": 0
+    }],
+    "cursor": "1",
+    "has_more": false
+  }
+})json";
+
+const char kWordObservationV1[] = R"json({
+  "ok": true,
+  "request_id": "req_word_observe_0001",
+  "server_time_ms": 1784512801000,
+  "data": {
+    "observation_id": "44444444-4444-4444-8444-444444444444",
+    "session_id": "22222222-2222-4222-8222-222222222222",
+    "sequence": 0,
+    "item_id": "33333333-3333-4333-8333-333333333333",
+    "action": "unknown",
+    "progress": {
+      "status": "learning",
+      "due_at": "2026-07-20T03:20:00.000Z",
+      "reviewed_count": 1,
+      "known_count": 0,
+      "unknown_count": 1
+    },
+    "replayed": false
+  }
+})json";
+
+const char kWordManifestV1[] = R"json({
+  "ok": true,
+  "request_id": "req_word_manifest_001",
+  "server_time_ms": 1784512802000,
+  "data": {
+    "cursor": "17",
+    "has_more": false,
+    "decks": [{
+      "deck_id": "11111111-1111-4111-8111-111111111111",
+      "title": "WQN 预设词库",
+      "change_sequence": 17,
+      "content_revision": 9,
+      "deleted": false,
+      "pack": {
+        "pack_id": "55555555-5555-4555-8555-555555555555",
+        "pack_revision": 9,
+        "schema_version": 2,
+        "format": "jsonl",
+        "compression": "none",
+        "entry_count": 1,
+        "byte_size": 512,
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "download_url": "/api/esp32/v3/words/packs/55555555-5555-4555-8555-555555555555"
+      }
+    }]
+  }
+})json";
+
+const char kWordManifestUnsafeCursorV1[] = R"json({
+  "ok": true,
+  "request_id": "req_word_manifest_002",
+  "server_time_ms": 1784512802000,
+  "data": {"cursor":"9007199254740992","has_more":false,"decks":[]}
 })json";
 
 const char kV3ClaimStart[] = R"json({
@@ -909,6 +999,145 @@ bool CheckV3ControlContract()
            Require(error.retry_after_ms == 10000, "v3 retry delay");
 }
 
+bool CheckWordStudyV1Contract()
+{
+    namespace words = wqn::protocol::word_study_v1;
+    wqn::protocol::v3::Error error;
+    words::SessionData session;
+    if (!Require(
+            words::ParseSessionResponse(
+                kWordSessionV1, "req_word_session_0001", &session, &error) == ESP_OK,
+            "word-study session fixture") ||
+        !Require(session.mode == words::Mode::kRandom, "word-study visible mode") ||
+        !Require(
+            session.ordering == words::Ordering::kGuidedRandomV1,
+            "word-study random ordering") ||
+        !Require(session.snapshot.size() == 1, "word-study snapshot count") ||
+        !Require(session.items.size() == 1, "word-study item count")) {
+        return false;
+    }
+
+    words::ObservationData observation;
+    if (!Require(
+            words::ParseObservationResponse(
+                kWordObservationV1,
+                "req_word_observe_0001",
+                &observation,
+                &error) == ESP_OK,
+            "word-study observation fixture") ||
+        !Require(
+            observation.action == words::ObservationAction::kUnknown,
+            "word-study observation action") ||
+        !Require(observation.progress.present, "word-study progress projection") ||
+        !Require(observation.progress.unknown_count == 1, "word-study unknown count")) {
+        return false;
+    }
+
+    words::ManifestData manifest;
+    if (!Require(
+            words::ParseManifestResponse(
+                kWordManifestV1,
+                "req_word_manifest_001",
+                &manifest,
+                &error) == ESP_OK,
+            "word-study manifest fixture") ||
+        !Require(manifest.cursor == 17, "word-study exact manifest cursor") ||
+        !Require(manifest.decks.size() == 1, "word-study manifest deck count") ||
+        !Require(manifest.decks[0].has_pack, "word-study live pack") ||
+        !Require(
+            manifest.decks[0].pack.schema_version == 2,
+            "word-study pack schema")) {
+        return false;
+    }
+    if (!Require(
+            words::ParseManifestResponse(
+                kWordManifestUnsafeCursorV1,
+                "req_word_manifest_002",
+                &manifest,
+                &error) == ESP_ERR_INVALID_RESPONSE,
+            "word-study rejects unsafe decimal cursor")) {
+        return false;
+    }
+
+    wqn::protocol::v3::RequestMetadata metadata;
+    metadata.request_id = "req_word_manifest_001";
+    metadata.boot_id = "boot_word_study_001";
+    metadata.firmware_version = "0.1.0-contract";
+    std::string body;
+    if (!Require(
+            words::BuildManifestRequest(metadata, 17, 20, &body) == ESP_OK,
+            "word-study manifest request build") ||
+        !Require(
+            body.find("\"cursor\":\"17\"") != std::string::npos,
+            "word-study cursor encoded exactly") ||
+        !Require(
+            body.find("word.study.v1") != std::string::npos,
+            "word-study capability advertised")) {
+        return false;
+    }
+
+    const char* ids[] = {
+        "00000000-0000-4000-8000-000000000001",
+        "00000000-0000-4000-8000-000000000002",
+        "00000000-0000-4000-8000-000000000003",
+        "00000000-0000-4000-8000-000000000004",
+        "00000000-0000-4000-8000-000000000005",
+        "00000000-0000-4000-8000-000000000006",
+        "00000000-0000-4000-8000-000000000007",
+    };
+    const uint64_t hashes[] = {
+        UINT64_C(0x11423e284650d546), UINT64_C(0x11423d284650d393),
+        UINT64_C(0x11423c284650d1e0), UINT64_C(0x114243284650ddc5),
+        UINT64_C(0x114242284650dc12), UINT64_C(0x114241284650da5f),
+        UINT64_C(0x114240284650d8ac),
+    };
+    for (size_t index = 0; index < 7; ++index) {
+        if (!Require(
+                words::GuidedRandomHash("seed_contract_001", ids[index]) ==
+                    hashes[index],
+                "word-study FNV fixture")) {
+            return false;
+        }
+    }
+
+    const int32_t sort_indices[] = {1, 2, 3, 0, 0, 1, 2};
+    const uint32_t deck_orders[] = {0, 0, 0, 0, 1, 1, 1};
+    const words::CandidateStatus statuses[] = {
+        words::CandidateStatus::kLearning,
+        words::CandidateStatus::kReview,
+        words::CandidateStatus::kNew,
+        words::CandidateStatus::kReview,
+        words::CandidateStatus::kMastered,
+        words::CandidateStatus::kLearning,
+        words::CandidateStatus::kNew,
+    };
+    const int64_t due[] = {0, 1000, -1, 2000, 3000, -1, -1};
+    const char* normalized[] = {
+        "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta"};
+    std::vector<words::Candidate> candidates;
+    for (size_t index = 0; index < 7; ++index) {
+        words::Candidate candidate;
+        candidate.item_id = ids[index];
+        candidate.normalized_word = normalized[index];
+        candidate.deck_order = deck_orders[index];
+        candidate.sort_index = sort_indices[index];
+        candidate.status = statuses[index];
+        candidate.due_at_ms = due[index];
+        candidates.push_back(candidate);
+    }
+    words::OrderCandidates(
+        &candidates, words::Ordering::kGuidedRandomV1, "seed_contract_001", 1000);
+    const size_t expected[] = {0, 5, 1, 2, 6, 3, 4};
+    for (size_t index = 0; index < 7; ++index) {
+        if (!Require(
+                candidates[index].item_id == ids[expected[index]],
+                "word-study guided random fixture")) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool CheckAiStreamHttpFailures()
 {
     return Require(
@@ -952,6 +1181,7 @@ bool RunContractFixtureSelfTest()
         CheckAiWordActions() &&
         CheckUnauthorizedError() &&
         CheckV3ControlContract() &&
+        CheckWordStudyV1Contract() &&
         CheckAiStreamHttpFailures();
 
     if (ok) {
