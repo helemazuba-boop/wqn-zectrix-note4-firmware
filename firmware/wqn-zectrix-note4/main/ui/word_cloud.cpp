@@ -183,6 +183,15 @@ bool ApplyWordCloudResult(wqn::UiState* state, WordCloudResult& result)
     }
     if (result.op == WordCloudOp::kPackSync) {
         if (result.result == ESP_OK) {
+            if (!result.pack_index_ready) {
+                // The remote cursor contained no content changes. Keep the
+                // current session/index and do not manufacture a visible
+                // word-result revision or a full EPD refresh.
+                state->word_app.cloud_sync_failed = false;
+                state->word_app.cloud_loaded_once = true;
+                state->word_app.cloud_sync_requested = false;
+                return false;
+            }
             wqn::ApplyWordPackIndex(
                 &state->word_app,
                 std::move(result.pack_index),
@@ -262,8 +271,11 @@ void WordCloudTask(void*)
 
         if (request.op == WordCloudOp::kPackSync) {
             wqn::WqnWordPackManifest local_manifest;
+            bool had_local_manifest = true;
+            bool manifest_content_changed = false;
             result.result = wqn::LoadWordPackManifest(&local_manifest);
             if (result.result == ESP_ERR_NOT_FOUND) {
+                had_local_manifest = false;
                 result.result = wqn::ResetWordPackStorageCache();
                 if (result.result == ESP_OK) {
                     local_manifest = {};
@@ -273,6 +285,7 @@ void WordCloudTask(void*)
                     kTag,
                     "local word pack manifest is incompatible; reset cache: %s",
                     esp_err_to_name(result.result));
+                had_local_manifest = false;
                 result.result = wqn::ResetWordPackStorageCache();
                 if (result.result == ESP_OK) {
                     local_manifest = {};
@@ -300,6 +313,8 @@ void WordCloudTask(void*)
                     result.message = "词库游标未推进";
                     break;
                 }
+                manifest_content_changed =
+                    manifest_content_changed || !manifest_delta.packs.empty();
                 size_t total_needed = 0;
                 for (const auto& item : manifest_delta.packs) {
                     if (!item.deleted && wqn::WordPackNeedsDownload(item)) {
@@ -340,24 +355,34 @@ void WordCloudTask(void*)
                 if (result.result != ESP_OK) {
                     break;
                 }
-                wqn::WqnWordPackManifest merged;
-                result.result = wqn::MergeWordPackManifestDelta(
-                    manifest_delta, &merged);
-                if (result.result == ESP_OK) {
-                    result.result = wqn::SaveWordPackManifest(merged);
+                const bool manifest_page_changed =
+                    !manifest_delta.packs.empty() ||
+                    manifest_delta.cursor != local_manifest.cursor;
+                if (manifest_page_changed) {
+                    wqn::WqnWordPackManifest merged;
+                    result.result = wqn::MergeWordPackManifestDelta(
+                        manifest_delta, &merged);
+                    if (result.result == ESP_OK) {
+                        result.result = wqn::SaveWordPackManifest(merged);
+                    }
+                    if (result.result == ESP_OK) {
+                        local_manifest = std::move(merged);
+                    }
                 }
-                if (result.result == ESP_OK) {
-                    local_manifest = std::move(merged);
-                    has_more = manifest_delta.has_more;
-                }
+                has_more = manifest_delta.has_more;
             }
             if (result.result == ESP_OK && has_more) {
                 result.result = ESP_ERR_INVALID_SIZE;
                 result.message = "词库变更过多，请重试";
             }
-            if (result.result == ESP_OK) {
+            if (result.result == ESP_OK &&
+                (manifest_content_changed || !had_local_manifest)) {
                 result.result = wqn::LoadWordPackIndex(&result.pack_index);
                 result.message = result.pack_index.status_message;
+                result.pack_index_ready = result.result == ESP_OK;
+            } else if (result.result == ESP_OK) {
+                result.message = "词库无变更";
+                ESP_LOGI(kTag, "word pack manifest unchanged; index rebuild skipped");
             }
         } else if (request.op == WordCloudOp::kStartSession) {
             wqn::protocol::word_study_v1::CreateSessionRequest session;

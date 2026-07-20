@@ -1275,6 +1275,9 @@ esp_err_t ReadWordPackEntry(const WordPackIndexEntry& index_entry, WqnWordEntry*
     if (entry == nullptr || index_entry.pack_stem[0] == '\0') {
         return ESP_ERR_INVALID_ARG;
     }
+    // A card turn performs a bounded SPIFFS seek, JSONL read and cJSON parse.
+    // Keep that foreground work off the 40 MHz DFS floor as well.
+    auto cpu_lease = runtime::CpuPerformanceLease::TryAcquire();
     *entry = WqnWordEntry{};
 
     const std::string path = PackPathForStem(index_entry.pack_stem);

@@ -477,7 +477,9 @@ void DeviceUiTask(void*)
                 refresh_schedule =
                     StrongerSchedule(refresh_schedule, update.refresh);
                 if (sync_event.status ==
-                    wqn::services::SyncEventStatus::kSucceeded) {
+                        wqn::services::SyncEventStatus::kSucceeded &&
+                    sync_event.scope ==
+                        wqn::services::SyncEventScope::kFull) {
                     // Sync notifications can arrive while a session page,
                     // search, or an earlier pack refresh owns WordCloud. Keep
                     // one coalesced refresh request instead of misreporting

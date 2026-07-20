@@ -27,8 +27,14 @@ enum class SyncEventStatus : uint8_t {
     kAwaitingClaim,
 };
 
+enum class SyncEventScope : uint8_t {
+    kFull,
+    kWordOutbox,
+};
+
 struct SyncEvent {
     SyncEventStatus status = SyncEventStatus::kFailed;
+    SyncEventScope scope = SyncEventScope::kFull;
     uint32_t sequence = 0;
     int64_t finished_ms = 0;
     char claim_code[9] = {};
@@ -43,6 +49,9 @@ void SetSyncEventSink(SyncEventSink sink);
 
 esp_err_t StartSyncService();
 void RequestSyncNow();
+// Coalesces repeated word observations and uploads them after a short quiet
+// period. This never requests the full control/problem/content sync round.
+void RequestWordOutboxUpload();
 void GetSyncSnapshot(SyncSnapshot* snapshot);
 TickType_t GetConfiguredSyncDelayTicks();
 bool HasUsableStoredToken();

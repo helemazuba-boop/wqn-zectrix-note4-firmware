@@ -21,6 +21,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/timers.h"
 #include "nvs.h"
 #include "runtime/sleep_coordinator.h"
 #include "storage.h"
@@ -38,6 +39,20 @@ std::atomic<wqn::services::SyncEventSink> g_sync_event_sink{nullptr};
 uint32_t g_sync_event_sequence = 1;
 constexpr TickType_t kSyncRetryDelay = pdMS_TO_TICKS(10000);
 bool LoadUsableToken(std::string* token);
+TaskHandle_t g_sync_service_task = nullptr;
+std::atomic<bool> g_full_sync_requested{false};
+std::atomic<bool> g_word_outbox_sync_requested{false};
+constexpr uint32_t kWordOutboxQuietPeriodMs = 5000;
+StaticTimer_t g_word_outbox_timer_storage;
+TimerHandle_t g_word_outbox_timer = nullptr;
+
+void WordOutboxTimerCallback(TimerHandle_t)
+{
+    g_word_outbox_sync_requested.store(true, std::memory_order_release);
+    if (g_sync_service_task != nullptr) {
+        xTaskNotifyGive(g_sync_service_task);
+    }
+}
 #endif
 
 #if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
@@ -67,6 +82,15 @@ bool g_claim_active = false;
 std::string g_word_outbox_retry_request_id;
 int64_t g_word_outbox_retry_not_before_ms = 0;
 uint8_t g_word_outbox_retry_attempts = 0;
+
+enum class WordOutboxUploadState : uint8_t {
+    kDrained,
+    kPending,
+    kFailed,
+};
+
+WordOutboxUploadState g_last_word_outbox_upload_state =
+    WordOutboxUploadState::kDrained;
 
 void ResetWordOutboxRetryBackoff()
 {
@@ -452,10 +476,12 @@ void CompleteSyncRound(int64_t finished_ms, bool synced)
 
 void PublishSyncEvent(
     wqn::services::SyncEventStatus status,
-    int64_t finished_ms)
+    int64_t finished_ms,
+    wqn::services::SyncEventScope scope)
 {
     wqn::services::SyncEvent event;
     event.status = status;
+    event.scope = scope;
     event.sequence = g_sync_event_sequence++;
     if (event.sequence == 0) {
         event.sequence = g_sync_event_sequence++;
@@ -828,6 +854,112 @@ esp_err_t SyncDueProblemsAndCacheV3(const std::string& token)
 }
 #endif
 
+#if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
+WordOutboxUploadState UploadPendingWordObservations(const std::string& token)
+{
+    constexpr size_t kMaxWordObservationsPerRound = 64;
+    size_t uploaded = 0;
+    for (; uploaded < kMaxWordObservationsPerRound;) {
+        wqn::DurableWordObservation pending;
+        esp_err_t result = wqn::PeekPendingWordObservation(&pending);
+        if (result == ESP_ERR_NOT_FOUND) {
+            ResetWordOutboxRetryBackoff();
+            if (uploaded > 0) {
+                ESP_LOGI(
+                    kTag,
+                    "word outbox drained: uploaded=%u",
+                    static_cast<unsigned>(uploaded));
+            }
+            return WordOutboxUploadState::kDrained;
+        }
+        if (result != ESP_OK) {
+            ESP_LOGW(kTag, "word outbox read failed: %s", esp_err_to_name(result));
+            return WordOutboxUploadState::kFailed;
+        }
+        const int64_t now_ms = esp_timer_get_time() / 1000;
+        if (WordOutboxRetryDeferred(pending.request_id, now_ms)) {
+            ESP_LOGI(
+                kTag,
+                "word outbox head deferred: request=%s remaining_ms=%lld",
+                pending.request_id.c_str(),
+                static_cast<long long>(
+                    g_word_outbox_retry_not_before_ms - now_ms));
+            return WordOutboxUploadState::kPending;
+        }
+
+        wqn::protocol::word_study_v1::ObservationRequest request;
+        request.metadata = MakeControlMetadata();
+        request.metadata.request_id = pending.request_id;
+        request.session_id = pending.session_id;
+        request.sequence = pending.sequence;
+        request.item_id = pending.item_id;
+        request.action = pending.action;
+        request.mode = pending.mode;
+        request.occurred_at = pending.occurred_at;
+        wqn::protocol::word_study_v1::ObservationData response;
+        wqn::protocol::v3::Error word_error;
+        result = wqn::SubmitWordStudyObservationV1(
+            token, request, &response, &word_error);
+        if (result != ESP_OK) {
+            ESP_LOGW(
+                kTag,
+                "word outbox upload deferred: request=%s sequence=%llu code=%s error=%s",
+                pending.request_id.c_str(),
+                static_cast<unsigned long long>(pending.sequence),
+                word_error.code.empty() ? "TRANSPORT" : word_error.code.c_str(),
+                esp_err_to_name(result));
+            ScheduleWordOutboxRetry(
+                pending.request_id,
+                word_error.retryable ? word_error.retry_after_ms : 0);
+            return WordOutboxUploadState::kPending;
+        }
+        result = wqn::AcknowledgeWordObservation(pending.request_id);
+        if (result != ESP_OK) {
+            ESP_LOGW(
+                kTag,
+                "word outbox ack failed: request=%s error=%s",
+                pending.request_id.c_str(),
+                esp_err_to_name(result));
+            ScheduleWordOutboxRetry(pending.request_id, 0);
+            return WordOutboxUploadState::kPending;
+        }
+        ResetWordOutboxRetryBackoff();
+        ++uploaded;
+    }
+
+    wqn::DurableWordObservation remaining;
+    const esp_err_t remaining_result =
+        wqn::PeekPendingWordObservation(&remaining);
+    if (uploaded > 0) {
+        ESP_LOGI(
+            kTag,
+            "word outbox batch uploaded: uploaded=%u pending=%d",
+            static_cast<unsigned>(uploaded),
+            remaining_result == ESP_OK ? 1 : 0);
+    }
+    if (remaining_result == ESP_ERR_NOT_FOUND) {
+        return WordOutboxUploadState::kDrained;
+    }
+    return remaining_result == ESP_OK
+        ? WordOutboxUploadState::kPending
+        : WordOutboxUploadState::kFailed;
+}
+
+bool RunWordOutboxOnlyRound()
+{
+    std::string token;
+    if (!LoadUsableToken(&token)) {
+        // Pairing/bootstrap owns identity recovery. Escalate the next round
+        // instead of making the outbox-only path imitate the control plane.
+        g_full_sync_requested.store(true, std::memory_order_release);
+        g_last_word_outbox_upload_state = WordOutboxUploadState::kPending;
+        return false;
+    }
+    g_last_word_outbox_upload_state = UploadPendingWordObservations(token);
+    return g_last_word_outbox_upload_state != WordOutboxUploadState::kFailed;
+}
+#endif
+
 bool RunSyncRound()
 {
 #if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
@@ -874,75 +1006,7 @@ bool RunSyncRound()
     }
 
 #if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
-    constexpr size_t kMaxWordObservationsPerRound = 64;
-    size_t word_observations_uploaded = 0;
-    for (; word_observations_uploaded < kMaxWordObservationsPerRound;
-         ++word_observations_uploaded) {
-        wqn::DurableWordObservation pending;
-        result = wqn::PeekPendingWordObservation(&pending);
-        if (result == ESP_ERR_NOT_FOUND) {
-            ResetWordOutboxRetryBackoff();
-            result = ESP_OK;
-            break;
-        }
-        if (result != ESP_OK) {
-            ESP_LOGW(kTag, "word outbox read failed: %s", esp_err_to_name(result));
-            return false;
-        }
-        const int64_t now_ms = esp_timer_get_time() / 1000;
-        if (WordOutboxRetryDeferred(pending.request_id, now_ms)) {
-            ESP_LOGI(
-                kTag,
-                "word outbox head deferred: request=%s remaining_ms=%lld",
-                pending.request_id.c_str(),
-                static_cast<long long>(
-                    g_word_outbox_retry_not_before_ms - now_ms));
-            break;
-        }
-        wqn::protocol::word_study_v1::ObservationRequest request;
-        request.metadata = MakeControlMetadata();
-        request.metadata.request_id = pending.request_id;
-        request.session_id = pending.session_id;
-        request.sequence = pending.sequence;
-        request.item_id = pending.item_id;
-        request.action = pending.action;
-        request.mode = pending.mode;
-        request.occurred_at = pending.occurred_at;
-        wqn::protocol::word_study_v1::ObservationData response;
-        wqn::protocol::v3::Error word_error;
-        result = wqn::SubmitWordStudyObservationV1(
-            token, request, &response, &word_error);
-        if (result != ESP_OK) {
-            ESP_LOGW(
-                kTag,
-                "word outbox upload deferred: request=%s sequence=%llu code=%s error=%s",
-                pending.request_id.c_str(),
-                static_cast<unsigned long long>(pending.sequence),
-                word_error.code.empty() ? "TRANSPORT" : word_error.code.c_str(),
-                esp_err_to_name(result));
-            ScheduleWordOutboxRetry(
-                pending.request_id,
-                word_error.retryable ? word_error.retry_after_ms : 0);
-            break;
-        }
-        result = wqn::AcknowledgeWordObservation(pending.request_id);
-        if (result != ESP_OK) {
-            ESP_LOGW(
-                kTag,
-                "word outbox ack failed: request=%s error=%s",
-                pending.request_id.c_str(),
-                esp_err_to_name(result));
-            ScheduleWordOutboxRetry(pending.request_id, 0);
-            break;
-        }
-        ResetWordOutboxRetryBackoff();
-    }
-    if (word_observations_uploaded > 0) {
-        ESP_LOGI(
-            kTag,
-            "word outbox drained: uploaded=%u",
-            static_cast<unsigned>(word_observations_uploaded));
-    }
+    g_last_word_outbox_upload_state = UploadPendingWordObservations(token);
 #endif
 
     if (!LoadUsableToken(&token)) {
@@ -1032,6 +1096,17 @@ void SyncServiceTask(void*)
         }
         first_round = false;
 
+        const bool full_requested =
+            g_full_sync_requested.exchange(false, std::memory_order_acq_rel);
+        const bool word_outbox_requested =
+            g_word_outbox_sync_requested.exchange(false, std::memory_order_acq_rel);
+#if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
+        const bool outbox_only = word_outbox_requested && !full_requested;
+#else
+        const bool outbox_only = false;
+        (void)word_outbox_requested;
+#endif
+
         wqn::runtime::SleepLease sleep_lease =
             wqn::runtime::SleepLease::TryAcquire(
                 wqn::runtime::SleepBlocker::kOnlineSync, "sync-service", __FILE__, __LINE__);
@@ -1042,8 +1117,14 @@ void SyncServiceTask(void*)
         }
 
         SetSyncRoundStarted(esp_timer_get_time() / 1000);
-        SetSyncStatus("syncing");
+        SetSyncStatus(outbox_only ? "word-outbox" : "syncing");
+#if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
+        const bool synced = outbox_only
+            ? RunWordOutboxOnlyRound()
+            : RunSyncRound();
+#else
         const bool synced = RunSyncRound();
+#endif
         const int64_t finished_ms = esp_timer_get_time() / 1000;
         CompleteSyncRound(finished_ms, synced);
         const bool has_token_after_round = wqn::services::HasUsableStoredToken();
@@ -1051,17 +1132,32 @@ void SyncServiceTask(void*)
             SetSyncStatus("success");
             PublishSyncEvent(
                 wqn::services::SyncEventStatus::kSucceeded,
-                finished_ms);
+                finished_ms,
+                outbox_only
+                    ? wqn::services::SyncEventScope::kWordOutbox
+                    : wqn::services::SyncEventScope::kFull);
         } else {
             SetSyncStatus(has_token_after_round ? "failed" : "waiting-pair");
             PublishSyncEvent(
                 has_token_after_round
                     ? wqn::services::SyncEventStatus::kFailed
                     : wqn::services::SyncEventStatus::kAwaitingClaim,
-                finished_ms);
+                finished_ms,
+                outbox_only
+                    ? wqn::services::SyncEventScope::kWordOutbox
+                    : wqn::services::SyncEventScope::kFull);
         }
         sleep_lease.Reset();
-        const TickType_t delay = NextSyncWaitDelay(synced, has_token_after_round);
+        TickType_t delay = NextSyncWaitDelay(synced, has_token_after_round);
+#if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
+        if (g_last_word_outbox_upload_state == WordOutboxUploadState::kPending) {
+            g_word_outbox_sync_requested.store(true, std::memory_order_release);
+            const TickType_t retry_delay = WordOutboxRetryWaitDelay();
+            delay = std::min(
+                delay,
+                retry_delay == portMAX_DELAY ? pdMS_TO_TICKS(100) : retry_delay);
+        }
+#endif
         if (delay == portMAX_DELAY) {
             ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
         } else {
@@ -1097,10 +1193,20 @@ wqn::protocol::v3::RequestMetadata MakeDeviceRequestMetadata()
 
 #if CONFIG_WQN_WIFI_STA_ENABLE
 
-TaskHandle_t g_sync_service_task = nullptr;
-
 esp_err_t StartSyncService()
 {
+    if (g_word_outbox_timer == nullptr) {
+        g_word_outbox_timer = xTimerCreateStatic(
+            "word_outbox",
+            pdMS_TO_TICKS(kWordOutboxQuietPeriodMs),
+            pdFALSE,
+            nullptr,
+            WordOutboxTimerCallback,
+            &g_word_outbox_timer_storage);
+        if (g_word_outbox_timer == nullptr) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
     const BaseType_t created = xTaskCreate(
         SyncServiceTask,
         "sync_service",
@@ -1120,6 +1226,23 @@ esp_err_t StartSyncService()
 void RequestSyncNow()
 {
 #if CONFIG_WQN_WIFI_STA_ENABLE
+    g_full_sync_requested.store(true, std::memory_order_release);
+    if (g_sync_service_task != nullptr) {
+        xTaskNotifyGive(g_sync_service_task);
+    }
+#endif
+}
+
+void RequestWordOutboxUpload()
+{
+#if CONFIG_WQN_WIFI_STA_ENABLE && CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
+    if (g_word_outbox_timer != nullptr &&
+        xTimerReset(g_word_outbox_timer, 0) == pdPASS) {
+        return;
+    }
+    // Timer command queue pressure must not strand a durable observation.
+    // Fall back to an immediate outbox-only notification.
+    g_word_outbox_sync_requested.store(true, std::memory_order_release);
     if (g_sync_service_task != nullptr) {
         xTaskNotifyGive(g_sync_service_task);
     }

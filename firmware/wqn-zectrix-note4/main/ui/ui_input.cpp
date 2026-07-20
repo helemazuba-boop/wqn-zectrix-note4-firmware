@@ -714,7 +714,10 @@ RefreshSchedule ApplyButtonEvent(
             wqn::ApplyWordObservationCommitResult(
                 &state->word_app, commit_result);
             if (commit_result == ESP_OK) {
-                wqn::services::RequestSyncNow();
+                // The durable outbox is the interaction boundary. Upload it
+                // after a quiet period; a card action must never launch the
+                // full bootstrap/problem/content sync pipeline.
+                wqn::services::RequestWordOutboxUpload();
             } else {
                 ESP_LOGW(
                     kTag,

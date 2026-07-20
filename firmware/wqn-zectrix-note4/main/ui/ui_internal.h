@@ -172,6 +172,7 @@ struct WordCloudResult {
     WordCloudOp op = WordCloudOp::kPackSync;
     esp_err_t result = ESP_FAIL;
     bool auth_required = false;
+    bool pack_index_ready = false;
     wqn::WordPackIndex pack_index;
     wqn::protocol::word_study_v1::SessionData session;
     wqn::protocol::word_study_v1::CandidatePageData candidate_page;
