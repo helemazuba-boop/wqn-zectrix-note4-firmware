@@ -719,6 +719,11 @@ esp_err_t SyncDueProblemsAndCacheV3(const std::string& token)
     g_config_revision = checkpoint.config_revision;
     g_sync_cursor = checkpoint.sync_cursor;
     g_sync_request_id.clear();
+    ESP_LOGI(
+        kTag,
+        "v3 sync checkpoint committed: config_revision=%llu sync_cursor=%llu",
+        static_cast<unsigned long long>(g_config_revision),
+        static_cast<unsigned long long>(g_sync_cursor));
     return ESP_OK;
 }
 #endif

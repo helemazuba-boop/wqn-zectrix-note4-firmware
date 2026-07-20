@@ -11,10 +11,12 @@ namespace {
 constexpr char kTag[] = "storage_service";
 constexpr UBaseType_t kQueueDepth = 8;
 constexpr UBaseType_t kReplyQueueDepth = 4;
-// ESP-IDF's ROM miniz test requires an 8 KiB task stack. Problem-cache WQPC
-// transactions run DEFLATE inside this sole-writer task, so retaining the old
-// 4 KiB stack would turn a storage-capacity fix into a stack-corruption risk.
-constexpr uint32_t kTaskStackBytes = 8192;
+// ESP-IDF's ROM miniz test alone requires an 8 KiB task stack. WQPC runs it
+// below the storage transaction, SPIFFS and C++ serialization call chains, and
+// the first COM7 HIL run proved that 8 KiB overflows. Keep this bounded but
+// leave enough measured headroom for the complete production call chain.
+constexpr uint32_t kTaskStackBytes = 16 * 1024;
+constexpr UBaseType_t kStackWarningBytes = 4 * 1024;
 constexpr UBaseType_t kTaskPriority = 6;
 
 struct StorageCommand {
@@ -56,6 +58,24 @@ void StorageServiceTask(void*)
         reply.result = command.transaction == nullptr
             ? ESP_ERR_INVALID_ARG
             : command.transaction(command.context);
+        // ESP-IDF reports this high-water mark in bytes, unlike upstream
+        // FreeRTOS which documents stack words.
+        const UBaseType_t free_stack_bytes = uxTaskGetStackHighWaterMark(nullptr);
+        if (free_stack_bytes < kStackWarningBytes) {
+            ESP_LOGW(
+                kTag,
+                "storage task stack low: request=%lu free_bytes=%u configured_bytes=%lu",
+                static_cast<unsigned long>(reply.request_id),
+                static_cast<unsigned>(free_stack_bytes),
+                static_cast<unsigned long>(kTaskStackBytes));
+        } else {
+            ESP_LOGI(
+                kTag,
+                "storage transaction complete: request=%lu result=%s stack_free_bytes=%u",
+                static_cast<unsigned long>(reply.request_id),
+                esp_err_to_name(reply.result),
+                static_cast<unsigned>(free_stack_bytes));
+        }
         if (xQueueSend(g_reply_queue, &reply, portMAX_DELAY) != pdTRUE) {
             ESP_LOGE(kTag, "failed to publish storage reply: request=%lu",
                 static_cast<unsigned long>(reply.request_id));
