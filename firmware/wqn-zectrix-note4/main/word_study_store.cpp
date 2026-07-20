@@ -31,7 +31,9 @@ constexpr char kOutboxTempPath[] = "/storage/wout.tmp";
 constexpr char kOutboxBackupPath[] = "/storage/wout.bak";
 constexpr uint32_t kSessionMagic = UINT32_C(0x53535157);  // WQSS
 constexpr uint32_t kOutboxMagic = UINT32_C(0x424f5157);  // WQOB
-constexpr uint16_t kSchemaVersion = 1;
+constexpr uint16_t kLegacySessionSchemaVersion = 1;
+constexpr uint16_t kSessionSchemaVersion = 2;
+constexpr uint16_t kOutboxSchemaVersion = 1;
 constexpr size_t kMaxSessionPayloadBytes = 96U * 1024U;
 constexpr size_t kAckCompactionThreshold = 32;
 
@@ -241,11 +243,13 @@ bool EncodeSession(
         }
         AppendScalar<uint64_t>(payload, item.ordinal);
     }
+    AppendScalar<uint64_t>(payload, session.remote.progress_revision);
     return payload->size() <= kMaxSessionPayloadBytes;
 }
 
 bool DecodeSession(
     const std::vector<uint8_t>& payload,
+    uint16_t version,
     wqn::PersistedWordSession* session)
 {
     using namespace wqn::protocol::word_study_v1;
@@ -328,6 +332,10 @@ bool DecodeSession(
         }
         parsed.remote.items.push_back(std::move(item));
     }
+    if (version >= kSessionSchemaVersion &&
+        !reader.Scalar(&parsed.remote.progress_revision)) {
+        return false;
+    }
     if (!reader.finished() || parsed.position > parsed.remote.items.size()) return false;
     *session = std::move(parsed);
     return true;
@@ -392,7 +400,7 @@ esp_err_t SaveSessionRaw(
     if (!EncodeSession(session, &payload)) return ESP_ERR_INVALID_ARG;
     SessionHeader header = {};
     header.magic = kSessionMagic;
-    header.version = kSchemaVersion;
+    header.version = kSessionSchemaVersion;
     header.payload_size = static_cast<uint32_t>(payload.size());
     header.payload_crc = Crc32(payload.data(), payload.size());
     std::vector<uint8_t> file_bytes(sizeof(header) + payload.size());
@@ -414,7 +422,9 @@ esp_err_t LoadSessionFile(const char* path, wqn::PersistedWordSession* session)
     if (file == nullptr) return errno == ENOENT ? ESP_ERR_NOT_FOUND : ESP_FAIL;
     SessionHeader header = {};
     const bool header_ok = std::fread(&header, 1, sizeof(header), file) == sizeof(header);
-    if (!header_ok || header.magic != kSessionMagic || header.version != kSchemaVersion ||
+    if (!header_ok || header.magic != kSessionMagic ||
+        (header.version != kLegacySessionSchemaVersion &&
+         header.version != kSessionSchemaVersion) ||
         header.payload_size > kMaxSessionPayloadBytes) {
         std::fclose(file);
         return ESP_ERR_INVALID_VERSION;
@@ -427,7 +437,9 @@ esp_err_t LoadSessionFile(const char* path, wqn::PersistedWordSession* session)
     if (!payload_ok || trailing != EOF || Crc32(payload.data(), payload.size()) != header.payload_crc) {
         return ESP_ERR_INVALID_CRC;
     }
-    return DecodeSession(payload, session) ? ESP_OK : ESP_ERR_INVALID_RESPONSE;
+    return DecodeSession(payload, header.version, session)
+        ? ESP_OK
+        : ESP_ERR_INVALID_RESPONSE;
 }
 
 esp_err_t LoadSessionSlotRaw(
@@ -533,7 +545,7 @@ esp_err_t BuildObservationRecord(
     }
     *record = {};
     record->magic = kOutboxMagic;
-    record->version = kSchemaVersion;
+    record->version = kOutboxSchemaVersion;
     record->kind = static_cast<uint8_t>(kind);
     record->action = static_cast<uint8_t>(observation.action);
     record->mode = static_cast<uint8_t>(observation.mode);
@@ -567,7 +579,8 @@ esp_err_t ScanOutboxFile(const char* path, OutboxScan* scan)
             scan->partial_tail = true;
             break;
         }
-        if (record.magic != kOutboxMagic || record.version != kSchemaVersion ||
+        if (record.magic != kOutboxMagic ||
+            record.version != kOutboxSchemaVersion ||
             record.crc != RecordCrc(record) || record.request_id[64] != '\0') {
             std::fclose(file);
             return ESP_ERR_INVALID_CRC;
@@ -703,6 +716,53 @@ esp_err_t CompactOutbox(
     return ESP_OK;
 }
 
+bool SetSessionCursorOrdinal(
+    wqn::PersistedWordSession* session,
+    uint32_t ordinal)
+{
+    if (session == nullptr) return false;
+    const auto& items = session->remote.items;
+    const auto match = std::find_if(
+        items.begin(), items.end(),
+        [&](const auto& item) { return item.ordinal == ordinal; });
+    if (match != items.end()) {
+        session->position = static_cast<uint32_t>(match - items.begin());
+        return true;
+    }
+    if (items.empty()) {
+        if (ordinal != 0) return false;
+        session->position = 0;
+        return true;
+    }
+    if (ordinal == items.back().ordinal + 1) {
+        session->position = static_cast<uint32_t>(items.size());
+        return true;
+    }
+    return false;
+}
+
+bool SessionCursorOrdinal(
+    const wqn::PersistedWordSession& session,
+    uint32_t* ordinal)
+{
+    if (ordinal == nullptr) return false;
+    if (session.position < session.remote.items.size()) {
+        const uint64_t value = session.remote.items[session.position].ordinal;
+        if (value > UINT32_MAX) return false;
+        *ordinal = static_cast<uint32_t>(value);
+        return true;
+    }
+    if (session.position == session.remote.items.size()) {
+        const uint64_t value = session.remote.items.empty()
+            ? 0
+            : session.remote.items.back().ordinal + 1;
+        if (value > UINT32_MAX) return false;
+        *ordinal = static_cast<uint32_t>(value);
+        return true;
+    }
+    return false;
+}
+
 void ReconcileSession(
     const std::vector<OutboxRecord, wqn::WordStorePsramAllocator<OutboxRecord>>& pending,
     wqn::PersistedWordSession* session,
@@ -714,7 +774,9 @@ void ReconcileSession(
             observation.sequence < session->remote.next_sequence) {
             continue;
         }
-        session->position = observation.next_position;
+        if (!SetSessionCursorOrdinal(session, observation.next_position)) {
+            continue;
+        }
         session->phase = static_cast<wqn::WordPresentationPhase>(observation.next_phase);
         session->remote.next_sequence = observation.sequence + 1;
         *changed = true;
@@ -791,9 +853,11 @@ esp_err_t CommitObservationTransaction(void* opaque)
     }
     const auto& observation = *context->observation;
     const auto& session = *context->advanced_session;
+    uint32_t session_ordinal = 0;
     if (session.remote.session_id != observation.session_id ||
         session.remote.next_sequence != observation.sequence + 1 ||
-        session.position != observation.next_position ||
+        !SessionCursorOrdinal(session, &session_ordinal) ||
+        session_ordinal != observation.next_position ||
         session.phase != observation.next_phase) {
         return ESP_ERR_INVALID_ARG;
     }
@@ -875,7 +939,9 @@ esp_err_t AckObservationTransaction(void* opaque)
     if (LoadSessionRaw(pending_mode, &session) == ESP_OK &&
         session.remote.session_id == pending->session_id &&
         pending->sequence >= session.remote.next_sequence) {
-        session.position = pending->next_position;
+        if (!SetSessionCursorOrdinal(&session, pending->next_position)) {
+            return ESP_ERR_INVALID_STATE;
+        }
         session.phase = static_cast<wqn::WordPresentationPhase>(pending->next_phase);
         session.remote.next_sequence = pending->sequence + 1;
         ESP_RETURN_ON_ERROR(SaveSessionRaw(session), kTag, "reconcile before word ack");
@@ -945,6 +1011,7 @@ esp_err_t CompactWordSessionData(
     compact.include_mastered = source.scope.include_mastered;
     compact.optional_count = source.optional_count;
     compact.next_sequence = source.next_sequence;
+    compact.progress_revision = source.progress_revision;
     compact.cursor = source.cursor;
     compact.has_more = source.has_more;
     compact.deck_ids.reserve(source.scope.deck_ids.size());

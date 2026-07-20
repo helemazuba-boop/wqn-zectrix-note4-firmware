@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdio>
 #include <cstring>
 #include <string>
 #include <utility>
@@ -14,6 +15,8 @@ namespace {
 constexpr char kTag[] = "wqn_word";
 constexpr size_t kDictionaryPreviewLimit = 8;
 constexpr size_t kWordHomeSelectionCount = 3;
+constexpr size_t kCandidatePrefetchThreshold =
+    wqn::protocol::word_study_v1::kInitialCandidatePageSize;
 constexpr wqn::protocol::word_study_v1::Mode kPersistedSessionModes[] = {
     wqn::protocol::word_study_v1::Mode::kSequential,
     wqn::protocol::word_study_v1::Mode::kRandom,
@@ -128,11 +131,82 @@ void PrepareObservation(
         state->session.persisted.remote.items[state->session.persisted.position].item_id;
     observation.action = action;
     observation.mode = state->session.persisted.remote.mode;
-    observation.next_position = next_position;
+    const uint64_t current_ordinal =
+        state->session.persisted.remote.items[
+            state->session.persisted.position].ordinal;
+    const bool advances = next_position > state->session.persisted.position;
+    const uint64_t next_ordinal = current_ordinal + (advances ? 1U : 0U);
+    if (next_ordinal > UINT32_MAX) {
+        state->message = "会话游标超限";
+        return;
+    }
+    observation.next_position = static_cast<uint32_t>(next_ordinal);
     observation.next_phase = next_phase;
     state->session.commit_state = wqn::WordObservationCommitState::kPersisting;
     state->session.observation_effect_ready = true;
     state->message = "正在保存";
+}
+
+size_t RemainingCandidateItems(const wqn::PersistedWordSession& session)
+{
+    return session.position < session.remote.items.size()
+        ? session.remote.items.size() - session.position
+        : 0;
+}
+
+void RequestCandidatePageIfNeeded(wqn::WordAppState* state)
+{
+    if (state == nullptr || !state->session.persisted.active ||
+        state->session.persisted.paused ||
+        !state->session.persisted.remote.has_more ||
+        state->session.page_in_flight || state->session.page_requested) {
+        return;
+    }
+    if (RemainingCandidateItems(state->session.persisted) <=
+        kCandidatePrefetchThreshold) {
+        state->session.page_requested = true;
+    }
+}
+
+bool SetSessionCursorOrdinal(
+    wqn::PersistedWordSession* session,
+    uint32_t ordinal)
+{
+    if (session == nullptr) return false;
+    const auto match = std::find_if(
+        session->remote.items.begin(), session->remote.items.end(),
+        [&](const auto& item) { return item.ordinal == ordinal; });
+    if (match != session->remote.items.end()) {
+        session->position = static_cast<uint32_t>(
+            match - session->remote.items.begin());
+        return true;
+    }
+    const uint64_t end_ordinal = session->remote.items.empty()
+        ? 0
+        : session->remote.items.back().ordinal + 1;
+    if (ordinal == end_ordinal) {
+        session->position = static_cast<uint32_t>(session->remote.items.size());
+        return true;
+    }
+    return false;
+}
+
+bool SnapshotMatches(
+    const wqn::StoredWordSessionData& session,
+    const wqn::protocol::word_study_v1::CandidatePageData& page)
+{
+    if (session.snapshot.size() != page.snapshot.size()) return false;
+    for (size_t index = 0; index < session.snapshot.size(); ++index) {
+        const auto& stored = session.snapshot[index];
+        const auto& remote = page.snapshot[index];
+        if (remote.deck_id != stored.deck_id ||
+            remote.content_revision != stored.content_revision ||
+            remote.pack_revision != stored.pack_revision ||
+            remote.sha256 != stored.sha256) {
+            return false;
+        }
+    }
+    return true;
 }
 
 uint16_t ClampUint16(size_t value)
@@ -187,6 +261,13 @@ void FinishOrLoadAdvancedReview(wqn::WordAppState* state)
             return;
         }
         state->message = "会话词包不可用";
+    }
+    if (session.active && session.position == session.remote.items.size() &&
+        session.remote.has_more) {
+        state->mode = wqn::WordAppMode::kSessionStarting;
+        state->session.page_requested = true;
+        state->message = "正在加载后续单词";
+        return;
     }
     session.active = false;
     session.paused = false;
@@ -274,13 +355,21 @@ esp_err_t InitWordApp(WordAppState* state)
     for (const auto mode : kPersistedSessionModes) {
         PersistedWordSession persisted;
         const esp_err_t session_result = LoadPersistedWordSession(mode, &persisted);
-        if (session_result == ESP_OK && persisted.active &&
-            persisted.position < persisted.remote.items.size()) {
+        const bool resumable = persisted.active &&
+            (persisted.position < persisted.remote.items.size() ||
+             (persisted.position == persisted.remote.items.size() &&
+              persisted.remote.has_more));
+        if (session_result == ESP_OK && resumable) {
             // At most one session should be unpaused. Prefer it so a reset
             // restores the exact card and presentation phase.
             if (!persisted.paused) {
                 state->session.persisted = std::move(persisted);
-                if (LoadCurrentReviewWord(state) == ESP_OK) {
+                if (state->session.persisted.position ==
+                    state->session.persisted.remote.items.size()) {
+                    state->mode = WordAppMode::kSessionStarting;
+                    state->session.page_requested = true;
+                    state->message = "正在恢复后续单词";
+                } else if (LoadCurrentReviewWord(state) == ESP_OK) {
                     state->mode = state->session.persisted.phase == WordPresentationPhase::kBack
                         ? WordAppMode::kReviewBack
                         : WordAppMode::kReviewFront;
@@ -304,6 +393,7 @@ esp_err_t InitWordApp(WordAppState* state)
                 esp_err_to_name(session_result));
         }
     }
+    RequestCandidatePageIfNeeded(state);
     if (state->mode == WordAppMode::kHome && found_paused_session) {
         state->message = "上次会话可继续";
     } else if (state->mode == WordAppMode::kHome && found_corrupt_session) {
@@ -375,7 +465,9 @@ esp_err_t HandleWordAppInput(WordAppState* state, WordInput input)
             PersistedWordSession stored_session;
             if (LoadPersistedWordSession(requested_mode, &stored_session) == ESP_OK &&
                 stored_session.active && stored_session.paused &&
-                stored_session.position < stored_session.remote.items.size()) {
+                (stored_session.position < stored_session.remote.items.size() ||
+                 (stored_session.position == stored_session.remote.items.size() &&
+                  stored_session.remote.has_more))) {
                 state->session.persisted = std::move(stored_session);
                 WordPackIndex pinned_index;
                 const esp_err_t pinned_result = LoadWordPackIndexForSession(
@@ -390,18 +482,29 @@ esp_err_t HandleWordAppInput(WordAppState* state, WordInput input)
             if (state->session.persisted.active &&
                 state->session.persisted.paused &&
                 state->session.persisted.remote.mode == requested_mode &&
-                state->session.persisted.position <
-                    state->session.persisted.remote.items.size()) {
+                (state->session.persisted.position <
+                     state->session.persisted.remote.items.size() ||
+                 (state->session.persisted.position ==
+                      state->session.persisted.remote.items.size() &&
+                  state->session.persisted.remote.has_more))) {
                 state->session.persisted.paused = false;
                 ESP_RETURN_ON_ERROR(
                     SavePersistedWordSession(state->session.persisted),
                     kTag,
                     "resume word session");
-                ESP_RETURN_ON_ERROR(LoadCurrentReviewWord(state), kTag, "load resumed word");
-                state->mode = state->session.persisted.phase == WordPresentationPhase::kBack
-                    ? WordAppMode::kReviewBack
-                    : WordAppMode::kReviewFront;
-                state->message = "已继续上次会话";
+                if (state->session.persisted.position ==
+                    state->session.persisted.remote.items.size()) {
+                    state->mode = WordAppMode::kSessionStarting;
+                    state->session.page_requested = true;
+                    state->message = "正在加载后续单词";
+                } else {
+                    ESP_RETURN_ON_ERROR(LoadCurrentReviewWord(state), kTag, "load resumed word");
+                    state->mode = state->session.persisted.phase == WordPresentationPhase::kBack
+                        ? WordAppMode::kReviewBack
+                        : WordAppMode::kReviewFront;
+                    state->message = "已继续上次会话";
+                    RequestCandidatePageIfNeeded(state);
+                }
                 return ESP_OK;
             }
             if (state->session.requested_mode != requested_mode) {
@@ -415,10 +518,26 @@ esp_err_t HandleWordAppInput(WordAppState* state, WordInput input)
         }
 
         case WordAppMode::kSessionStarting:
+            if (input == WordInput::kConfirm &&
+                state->session.persisted.active &&
+                state->session.persisted.position ==
+                    state->session.persisted.remote.items.size() &&
+                state->session.persisted.remote.has_more) {
+                state->session.page_requested = true;
+                state->message = "正在重试加载";
+                return ESP_OK;
+            }
             if (input == WordInput::kLongConfirm) {
                 state->session.start_requested = false;
+                if (state->session.persisted.active) {
+                    state->session.persisted.paused = true;
+                    ESP_ERROR_CHECK_WITHOUT_ABORT(
+                        SavePersistedWordSession(state->session.persisted));
+                }
                 state->mode = WordAppMode::kHome;
-                state->message = "已取消";
+                state->message = state->session.persisted.active
+                    ? "本轮已暂停"
+                    : "已取消";
             }
             return ESP_OK;
 
@@ -726,6 +845,8 @@ void ApplyWordSessionStartResult(
     }
     state->session.persisted = std::move(persisted);
     state->session.commit_state = WordObservationCommitState::kIdle;
+    state->session.page_in_flight = false;
+    state->session.page_requested = false;
     state->session.create_request_id.clear();
     result = LoadCurrentReviewWord(state);
     if (result != ESP_OK) {
@@ -737,6 +858,125 @@ void ApplyWordSessionStartResult(
     }
     state->mode = WordAppMode::kReviewFront;
     state->message = "确认翻面";
+    RequestCandidatePageIfNeeded(state);
+}
+
+bool TakeWordCandidatePageRequest(
+    WordAppState* state,
+    protocol::word_study_v1::CandidatePageRequest* request,
+    std::string* session_id)
+{
+    if (state == nullptr || request == nullptr || session_id == nullptr ||
+        !state->session.page_requested || state->session.page_in_flight ||
+        !state->session.persisted.active ||
+        state->session.persisted.paused ||
+        !state->session.persisted.remote.has_more ||
+        state->session.persisted.remote.cursor.empty()) {
+        return false;
+    }
+    request->cursor = state->session.persisted.remote.cursor;
+    request->limit = static_cast<int>(
+        protocol::word_study_v1::kCandidatePrefetchPageSize);
+    *session_id = state->session.persisted.remote.session_id;
+    state->session.page_requested = false;
+    state->session.page_in_flight = true;
+    return true;
+}
+
+void RestoreWordCandidatePageRequest(WordAppState* state)
+{
+    if (state == nullptr) return;
+    state->session.page_in_flight = false;
+    if (state->session.persisted.active &&
+        !state->session.persisted.paused &&
+        state->session.persisted.remote.has_more) {
+        state->session.page_requested = true;
+    }
+}
+
+void ApplyWordCandidatePageResult(
+    WordAppState* state,
+    esp_err_t result,
+    protocol::word_study_v1::CandidatePageData page)
+{
+    if (state == nullptr) return;
+    state->session.page_in_flight = false;
+    auto& persisted = state->session.persisted;
+    auto& remote = persisted.remote;
+    if (result != ESP_OK) {
+        state->session.page_requested = false;
+        state->message = "后续单词加载失败，继续时重试";
+        return;
+    }
+    if (!persisted.active || persisted.paused ||
+        page.session_id != remote.session_id || page.ordering != remote.ordering ||
+        page.candidate_policy_version !=
+            protocol::word_study_v1::CandidatePolicyVersionName(remote.ordering) ||
+        page.seed != remote.seed || page.progress_revision != remote.progress_revision ||
+        page.cursor != remote.cursor || !SnapshotMatches(remote, page)) {
+        state->message = "后续单词快照不一致";
+        return;
+    }
+
+    if (persisted.position > remote.items.size()) {
+        state->message = "会话游标损坏";
+        return;
+    }
+    PersistedWordSession updated = persisted;
+    auto& updated_remote = updated.remote;
+    if (updated.position > 0) {
+        updated_remote.items.erase(
+            updated_remote.items.begin(),
+            updated_remote.items.begin() + updated.position);
+        updated.position = 0;
+    }
+    if (updated_remote.items.size() + page.items.size() >
+        protocol::word_study_v1::kCandidateWindowSize) {
+        state->message = "候选窗口超限";
+        return;
+    }
+    uint64_t expected_ordinal = updated_remote.items.empty()
+        ? (page.items.empty() ? 0 : page.items.front().ordinal)
+        : updated_remote.items.back().ordinal + 1;
+    for (const auto& source : page.items) {
+        if (source.ordinal != expected_ordinal || source.item_id.size() != 36 ||
+            source.deck_id.size() != 36) {
+            state->message = "候选页顺序无效";
+            return;
+        }
+        StoredWordSessionItem item;
+        std::snprintf(item.item_id, sizeof(item.item_id), "%s", source.item_id.c_str());
+        std::snprintf(item.deck_id, sizeof(item.deck_id), "%s", source.deck_id.c_str());
+        item.ordinal = source.ordinal;
+        updated_remote.items.push_back(item);
+        ++expected_ordinal;
+    }
+    updated_remote.cursor = page.next_cursor;
+    updated_remote.has_more = page.has_more;
+    result = SavePersistedWordSession(updated);
+    if (result != ESP_OK) {
+        state->message = "后续单词未保存";
+        return;
+    }
+    persisted = std::move(updated);
+    auto& committed_remote = persisted.remote;
+    if (persisted.position < committed_remote.items.size()) {
+        result = LoadCurrentReviewWord(state);
+        if (result != ESP_OK) {
+            state->message = "会话词包不可用";
+            return;
+        }
+        state->mode = persisted.phase == WordPresentationPhase::kBack
+            ? WordAppMode::kReviewBack
+            : WordAppMode::kReviewFront;
+        state->message = "后续单词已就绪";
+    } else if (!committed_remote.has_more) {
+        persisted.active = false;
+        state->mode = WordAppMode::kHome;
+        state->message = "本轮复习完成";
+        ESP_ERROR_CHECK_WITHOUT_ABORT(SavePersistedWordSession(persisted));
+    }
+    RequestCandidatePageIfNeeded(state);
 }
 
 bool TakeWordObservationEffect(
@@ -757,10 +997,16 @@ bool TakeWordObservationEffect(
         pending.occurred_at = occurred_at;
     }
     PersistedWordSession advanced = state->session.persisted;
-    advanced.position = pending.next_position;
+    if (!SetSessionCursorOrdinal(&advanced, pending.next_position)) {
+        state->session.observation_effect_ready = false;
+        state->session.commit_state = WordObservationCommitState::kFailed;
+        state->message = "会话游标无效";
+        return false;
+    }
     advanced.phase = pending.next_phase;
     advanced.remote.next_sequence = pending.sequence + 1;
-    if (advanced.position >= advanced.remote.items.size()) {
+    if (advanced.position >= advanced.remote.items.size() &&
+        !advanced.remote.has_more) {
         advanced.active = false;
         advanced.paused = false;
     }
@@ -801,6 +1047,7 @@ void ApplyWordObservationCommitResult(WordAppState* state, esp_err_t result)
     } else {
         state->message = "已保存，待同步";
     }
+    RequestCandidatePageIfNeeded(state);
     FinishOrLoadAdvancedReview(state);
 }
 

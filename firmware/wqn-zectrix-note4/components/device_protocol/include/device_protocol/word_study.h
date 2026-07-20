@@ -17,7 +17,14 @@ namespace wqn::protocol::word_study_v1 {
 inline constexpr char kSchemaSha256[] = WQN_WORD_STUDY_SCHEMA_SHA256;
 inline constexpr uint32_t kPackSchemaVersion = 2;
 inline constexpr size_t kMaxDecks = 32;
+// Session parsing retains the short-lived 500-item response for rollback
+// compatibility. New candidate transport pages are bounded independently.
 inline constexpr size_t kMaxSessionItems = 500;
+inline constexpr size_t kMaxCandidatePageItems = 100;
+inline constexpr size_t kInitialCandidatePageSize = 32;
+inline constexpr size_t kCandidatePrefetchPageSize = 64;
+inline constexpr size_t kCandidateWindowSize =
+    kInitialCandidatePageSize + kCandidatePrefetchPageSize;
 inline constexpr size_t kMaxManifestDecks = 100;
 inline constexpr size_t kMaxPackEntries = 10000;
 inline constexpr size_t kMaxPackBytes = 4U * 1024U * 1024U;
@@ -79,13 +86,34 @@ struct SessionData {
     Mode mode = Mode::kSequential;
     Purpose purpose = Purpose::kStudy;
     Ordering ordering = Ordering::kSequential;
+    std::string candidate_policy_version;
     std::string seed;
     Scope scope;
     int optional_count = 0;  // zero means no explicit bound
     uint64_t next_sequence = 0;
+    uint64_t progress_revision = 0;
     std::vector<PackSnapshot> snapshot;
     std::vector<SessionItem> items;
     std::string cursor;
+    bool has_more = false;
+};
+
+struct CandidatePageRequest {
+    v3::RequestMetadata metadata;
+    std::string cursor;
+    int limit = static_cast<int>(kCandidatePrefetchPageSize);
+};
+
+struct CandidatePageData {
+    std::string session_id;
+    Ordering ordering = Ordering::kSequential;
+    std::string candidate_policy_version;
+    std::string seed;
+    std::vector<PackSnapshot> snapshot;
+    uint64_t progress_revision = 0;
+    std::string cursor;
+    std::string next_cursor;
+    std::vector<SessionItem> items;
     bool has_more = false;
 };
 
@@ -162,6 +190,7 @@ struct ObservationRequest {
 };
 
 const char* ModeName(Mode mode);
+const char* CandidatePolicyVersionName(Ordering ordering);
 const char* ObservationActionName(ObservationAction action);
 uint64_t GuidedRandomHash(const std::string& seed, const std::string& item_id);
 void OrderCandidates(
@@ -175,6 +204,9 @@ esp_err_t BuildCreateSessionRequest(
     std::string* body);
 esp_err_t BuildObservationRequest(
     const ObservationRequest& request,
+    std::string* body);
+esp_err_t BuildCandidatePageRequest(
+    const CandidatePageRequest& request,
     std::string* body);
 esp_err_t BuildManifestRequest(
     const v3::RequestMetadata& metadata,
@@ -190,6 +222,11 @@ esp_err_t ParseObservationResponse(
     const std::string& body,
     const std::string& expected_request_id,
     ObservationData* data,
+    v3::Error* error);
+esp_err_t ParseCandidatePageResponse(
+    const std::string& body,
+    const std::string& expected_request_id,
+    CandidatePageData* data,
     v3::Error* error);
 esp_err_t ParseManifestResponse(
     const std::string& body,

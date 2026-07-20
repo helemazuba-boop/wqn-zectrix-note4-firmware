@@ -125,6 +125,19 @@ UiUpdate UiRuntime::DispatchWordCloudResult(WordCloudResult& result)
     return FinishEvent(AppEventKind::kWordCloudResult, refresh, changed);
 }
 
+bool UiRuntime::TakeWordCandidatePageRequest(
+    wqn::protocol::word_study_v1::CandidatePageRequest* request,
+    std::string* session_id)
+{
+    return wqn::TakeWordCandidatePageRequest(
+        &state_.word_app, request, session_id);
+}
+
+void UiRuntime::RestoreWordCandidatePageRequest()
+{
+    wqn::RestoreWordCandidatePageRequest(&state_.word_app);
+}
+
 UiUpdate UiRuntime::DispatchTimeTick(int64_t now_ms)
 {
     const bool changed = wqn::TickTimeApp(&state_.time_app, now_ms);

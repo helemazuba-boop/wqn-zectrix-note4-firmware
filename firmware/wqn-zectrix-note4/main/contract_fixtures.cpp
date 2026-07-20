@@ -82,6 +82,7 @@ const char kWordSessionV1[] = R"json({
     "mode": "random",
     "purpose": "study",
     "ordering": "guided_random_v1",
+    "candidate_policy_version": "guided_random_v1",
     "seed": "seed_contract_001",
     "scope": {
       "deck_ids": ["11111111-1111-4111-8111-111111111111"],
@@ -89,6 +90,7 @@ const char kWordSessionV1[] = R"json({
     },
     "optional_count": 20,
     "next_sequence": 0,
+    "progress_revision": 17,
     "snapshot": [{
       "deck_id": "11111111-1111-4111-8111-111111111111",
       "content_revision": 9,
@@ -102,6 +104,33 @@ const char kWordSessionV1[] = R"json({
     }],
     "cursor": "1",
     "has_more": false
+  }
+})json";
+
+const char kWordCandidatePageV1[] = R"json({
+  "ok": true,
+  "request_id": "req_word_candidates_0001",
+  "server_time_ms": 1784512800000,
+  "data": {
+    "session_id": "22222222-2222-4222-8222-222222222222",
+    "ordering": "guided_random_v1",
+    "candidate_policy_version": "guided_random_v1",
+    "seed": "seed_contract_001",
+    "snapshot": [{
+      "deck_id": "11111111-1111-4111-8111-111111111111",
+      "content_revision": 9,
+      "pack_revision": 9,
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }],
+    "progress_revision": 17,
+    "cursor": "32",
+    "next_cursor": "33",
+    "items": [{
+      "item_id": "44444444-4444-4444-8444-444444444444",
+      "deck_id": "11111111-1111-4111-8111-111111111111",
+      "ordinal": 32
+    }],
+    "has_more": true
   }
 })json";
 
@@ -1012,8 +1041,28 @@ bool CheckWordStudyV1Contract()
         !Require(
             session.ordering == words::Ordering::kGuidedRandomV1,
             "word-study random ordering") ||
+        !Require(
+            session.candidate_policy_version == "guided_random_v1",
+            "word-study candidate policy") ||
+        !Require(session.progress_revision == 17, "word-study progress revision") ||
         !Require(session.snapshot.size() == 1, "word-study snapshot count") ||
         !Require(session.items.size() == 1, "word-study item count")) {
+        return false;
+    }
+
+    words::CandidatePageData candidate_page;
+    if (!Require(
+            words::ParseCandidatePageResponse(
+                kWordCandidatePageV1,
+                "req_word_candidates_0001",
+                &candidate_page,
+                &error) == ESP_OK,
+            "word-study candidate page fixture") ||
+        !Require(candidate_page.cursor == "32", "word-study candidate cursor") ||
+        !Require(candidate_page.next_cursor == "33", "word-study candidate next cursor") ||
+        !Require(candidate_page.items.size() == 1, "word-study candidate count") ||
+        !Require(candidate_page.items[0].ordinal == 32, "word-study candidate ordinal") ||
+        !Require(candidate_page.has_more, "word-study candidate has more")) {
         return false;
     }
 
@@ -1073,6 +1122,23 @@ bool CheckWordStudyV1Contract()
         !Require(
             body.find("word.study.v1") != std::string::npos,
             "word-study capability advertised")) {
+        return false;
+    }
+
+    words::CandidatePageRequest candidate_request;
+    candidate_request.metadata = metadata;
+    candidate_request.metadata.request_id = "req_word_candidates_0001";
+    candidate_request.cursor = "32";
+    candidate_request.limit = 64;
+    if (!Require(
+            words::BuildCandidatePageRequest(candidate_request, &body) == ESP_OK,
+            "word-study candidate request build") ||
+        !Require(
+            body.find("\"cursor\":\"32\"") != std::string::npos,
+            "word-study candidate cursor encoded exactly") ||
+        !Require(
+            body.find("\"limit\":64") != std::string::npos,
+            "word-study candidate limit")) {
         return false;
     }
 

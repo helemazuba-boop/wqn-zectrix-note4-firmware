@@ -55,6 +55,8 @@ struct WordSessionState {
     protocol::word_study_v1::Mode requested_mode =
         protocol::word_study_v1::Mode::kSequential;
     std::string create_request_id;
+    bool page_requested = false;
+    bool page_in_flight = false;
     PersistedWordSession persisted;
     WordObservationCommitState commit_state = WordObservationCommitState::kIdle;
     bool observation_effect_ready = false;
@@ -156,6 +158,15 @@ void ApplyWordSessionStartResult(
     WordAppState* state,
     esp_err_t result,
     protocol::word_study_v1::SessionData session);
+bool TakeWordCandidatePageRequest(
+    WordAppState* state,
+    protocol::word_study_v1::CandidatePageRequest* request,
+    std::string* session_id);
+void RestoreWordCandidatePageRequest(WordAppState* state);
+void ApplyWordCandidatePageResult(
+    WordAppState* state,
+    esp_err_t result,
+    protocol::word_study_v1::CandidatePageData page);
 bool TakeWordObservationEffect(
     WordAppState* state,
     const std::string& request_id,

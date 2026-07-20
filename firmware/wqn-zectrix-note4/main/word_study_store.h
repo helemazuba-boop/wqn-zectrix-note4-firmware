@@ -73,6 +73,7 @@ struct StoredWordSessionData {
     bool include_mastered = false;
     int optional_count = 0;
     uint64_t next_sequence = 0;
+    uint64_t progress_revision = 0;
     std::vector<StoredWordDeckId, WordStorePsramAllocator<StoredWordDeckId>> deck_ids;
     std::vector<StoredWordPackSnapshot, WordStorePsramAllocator<StoredWordPackSnapshot>> snapshot;
     std::vector<StoredWordSessionItem, WordStorePsramAllocator<StoredWordSessionItem>> items;
@@ -105,6 +106,8 @@ struct DurableWordObservation {
     protocol::word_study_v1::Mode mode =
         protocol::word_study_v1::Mode::kSequential;
     std::string occurred_at;
+    // Absolute candidate ordinal.  The on-disk field kept its original name
+    // so v1 outbox records remain readable after the local window rolls.
     uint32_t next_position = 0;
     WordPresentationPhase next_phase = WordPresentationPhase::kFront;
 };

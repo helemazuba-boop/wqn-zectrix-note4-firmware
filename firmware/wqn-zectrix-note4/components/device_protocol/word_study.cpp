@@ -293,6 +293,16 @@ const char* ModeName(Mode mode)
     return "";
 }
 
+const char* CandidatePolicyVersionName(Ordering ordering)
+{
+    switch (ordering) {
+        case Ordering::kSequential: return "sequential_v1";
+        case Ordering::kGuidedRandomV1: return "guided_random_v1";
+        case Ordering::kLexicographic: return "lexicographic_v1";
+    }
+    return "";
+}
+
 const char* ObservationActionName(ObservationAction action)
 {
     switch (action) {
@@ -415,6 +425,27 @@ esp_err_t BuildObservationRequest(
     return Render(document.root(), body);
 }
 
+esp_err_t BuildCandidatePageRequest(
+    const CandidatePageRequest& request,
+    std::string* body)
+{
+    uint64_t cursor = 0;
+    if (body == nullptr || !ParseSafeDecimal(request.cursor, &cursor) ||
+        request.limit < 1 ||
+        request.limit > static_cast<int>(kMaxCandidatePageItems)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    JsonDocument document(cJSON_CreateObject());
+    if (document.root() == nullptr) return ESP_ERR_NO_MEM;
+    ESP_RETURN_ON_ERROR(
+        AddMetadata(document.root(), request.metadata),
+        "word_study",
+        "candidate metadata");
+    cJSON_AddStringToObject(document.root(), "cursor", request.cursor.c_str());
+    cJSON_AddNumberToObject(document.root(), "limit", request.limit);
+    return Render(document.root(), body);
+}
+
 esp_err_t BuildManifestRequest(
     const v3::RequestMetadata& metadata,
     uint64_t cursor,
@@ -450,15 +481,20 @@ esp_err_t ParseSessionResponse(
 
     data->session_id = StringField(payload, "session_id");
     data->seed = StringField(payload, "seed");
+    data->candidate_policy_version =
+        StringField(payload, "candidate_policy_version");
     cJSON* optional_count = cJSON_GetObjectItemCaseSensitive(payload, "optional_count");
     if (!IsUuid(data->session_id) || StringField(payload, "domain") != "word" ||
         !ParseMode(StringField(payload, "mode"), &data->mode) ||
         !ParsePurpose(StringField(payload, "purpose"), &data->purpose) ||
         !ParseOrdering(StringField(payload, "ordering"), &data->ordering) ||
         !SemanticsMatch(data->mode, data->purpose, data->ordering) ||
+        data->candidate_policy_version !=
+            CandidatePolicyVersionName(data->ordering) ||
         !IsUrlSafe(data->seed, 1, 64) ||
         !ParseScope(cJSON_GetObjectItemCaseSensitive(payload, "scope"), &data->scope) ||
-        !U64Field(payload, "next_sequence", &data->next_sequence)) {
+        !U64Field(payload, "next_sequence", &data->next_sequence) ||
+        !U64Field(payload, "progress_revision", &data->progress_revision)) {
         return ESP_ERR_INVALID_RESPONSE;
     }
     if (cJSON_IsNumber(optional_count)) {
@@ -517,6 +553,92 @@ esp_err_t ParseSessionResponse(
     if (cursor != nullptr) {
         data->cursor = StringField(payload, "cursor");
         if (data->cursor.size() > 256) return ESP_ERR_INVALID_RESPONSE;
+    }
+    return ESP_OK;
+}
+
+esp_err_t ParseCandidatePageResponse(
+    const std::string& body,
+    const std::string& expected_request_id,
+    CandidatePageData* data,
+    v3::Error* error)
+{
+    if (data == nullptr || error == nullptr) return ESP_ERR_INVALID_ARG;
+    *data = {};
+    JsonDocument document(body);
+    cJSON* payload = nullptr;
+    ESP_RETURN_ON_ERROR(
+        ParseEnvelope(document.root(), expected_request_id, &payload, error),
+        "word_study",
+        "candidate page envelope");
+
+    data->session_id = StringField(payload, "session_id");
+    data->candidate_policy_version =
+        StringField(payload, "candidate_policy_version");
+    data->seed = StringField(payload, "seed");
+    data->cursor = StringField(payload, "cursor");
+    data->next_cursor = StringField(payload, "next_cursor");
+    uint64_t cursor = 0;
+    uint64_t next_cursor = 0;
+    if (!IsUuid(data->session_id) ||
+        !ParseOrdering(StringField(payload, "ordering"), &data->ordering) ||
+        data->candidate_policy_version !=
+            CandidatePolicyVersionName(data->ordering) ||
+        !IsUrlSafe(data->seed, 1, 64) ||
+        !U64Field(payload, "progress_revision", &data->progress_revision) ||
+        !ParseSafeDecimal(data->cursor, &cursor) ||
+        !ParseSafeDecimal(data->next_cursor, &next_cursor) ||
+        next_cursor < cursor) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    cJSON* snapshots = cJSON_GetObjectItemCaseSensitive(payload, "snapshot");
+    const int snapshot_count = cJSON_GetArraySize(snapshots);
+    if (!cJSON_IsArray(snapshots) || snapshot_count < 0 ||
+        static_cast<size_t>(snapshot_count) > kMaxDecks) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    data->snapshot.reserve(static_cast<size_t>(snapshot_count));
+    for (int index = 0; index < snapshot_count; ++index) {
+        cJSON* object = cJSON_GetArrayItem(snapshots, index);
+        PackSnapshot item;
+        item.deck_id = StringField(object, "deck_id");
+        item.sha256 = StringField(object, "sha256");
+        if (!cJSON_IsObject(object) || !IsUuid(item.deck_id) ||
+            !IsSha256(item.sha256) ||
+            !U64Field(object, "content_revision", &item.content_revision) ||
+            !U64Field(object, "pack_revision", &item.pack_revision)) {
+            return ESP_ERR_INVALID_RESPONSE;
+        }
+        data->snapshot.push_back(std::move(item));
+    }
+
+    cJSON* items = cJSON_GetObjectItemCaseSensitive(payload, "items");
+    const int item_count = cJSON_GetArraySize(items);
+    if (!cJSON_IsArray(items) || item_count < 0 ||
+        static_cast<size_t>(item_count) > kMaxCandidatePageItems ||
+        next_cursor - cursor != static_cast<uint64_t>(item_count)) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    data->items.reserve(static_cast<size_t>(item_count));
+    for (int index = 0; index < item_count; ++index) {
+        cJSON* object = cJSON_GetArrayItem(items, index);
+        SessionItem item;
+        item.item_id = StringField(object, "item_id");
+        item.deck_id = StringField(object, "deck_id");
+        if (!cJSON_IsObject(object) || !IsUuid(item.item_id) ||
+            !IsUuid(item.deck_id) || !U64Field(object, "ordinal", &item.ordinal) ||
+            item.ordinal != cursor + static_cast<uint64_t>(index)) {
+            return ESP_ERR_INVALID_RESPONSE;
+        }
+        data->items.push_back(std::move(item));
+    }
+    cJSON* has_more = cJSON_GetObjectItemCaseSensitive(payload, "has_more");
+    if (!cJSON_IsBool(has_more)) return ESP_ERR_INVALID_RESPONSE;
+    data->has_more = cJSON_IsTrue(has_more);
+    if ((data->has_more && data->items.empty()) ||
+        (!data->has_more && next_cursor < cursor)) {
+        return ESP_ERR_INVALID_RESPONSE;
     }
     return ESP_OK;
 }

@@ -70,6 +70,10 @@ public:
     UiUpdate DispatchStatusReload(wqn::AppState&& snapshot);
     UiUpdate DispatchSyncResult(const wqn::services::SyncEvent& event);
     UiUpdate DispatchDisplayResult(const wqn::display::DisplayResult& result);
+    bool TakeWordCandidatePageRequest(
+        wqn::protocol::word_study_v1::CandidatePageRequest* request,
+        std::string* session_id);
+    void RestoreWordCandidatePageRequest();
 
 private:
     UiUpdate FinishEvent(

@@ -2,6 +2,7 @@
 // Extracted from device_ui.cpp.
 
 #include "ui_internal.h"
+#include "ui_runtime.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -88,6 +89,51 @@ bool QueueWordSessionStart(
     return QueueWordCloudRequest(request);
 }
 
+bool QueueWordCandidatePage(
+    const std::string& session_id,
+    const wqn::protocol::word_study_v1::CandidatePageRequest& page)
+{
+    if (session_id.size() != 36 || page.metadata.request_id.empty() ||
+        page.cursor.empty() || page.limit < 1 ||
+        page.limit > static_cast<int>(
+            wqn::protocol::word_study_v1::kMaxCandidatePageItems)) {
+        return false;
+    }
+    WordCloudRequest request;
+    request.op = WordCloudOp::kFetchSessionPage;
+    std::snprintf(
+        request.request_id,
+        sizeof(request.request_id),
+        "%s",
+        page.metadata.request_id.c_str());
+    std::snprintf(
+        request.session_id,
+        sizeof(request.session_id),
+        "%s",
+        session_id.c_str());
+    std::snprintf(
+        request.cursor,
+        sizeof(request.cursor),
+        "%s",
+        page.cursor.c_str());
+    request.limit = static_cast<uint16_t>(page.limit);
+    return QueueWordCloudRequest(request);
+}
+
+void PumpWordCandidatePrefetch(UiRuntime* runtime)
+{
+    if (runtime == nullptr || IsWordCloudBusy()) return;
+    wqn::protocol::word_study_v1::CandidatePageRequest request;
+    request.metadata = wqn::services::MakeDeviceRequestMetadata();
+    std::string session_id;
+    if (!runtime->TakeWordCandidatePageRequest(&request, &session_id)) {
+        return;
+    }
+    if (!QueueWordCandidatePage(session_id, request)) {
+        runtime->RestoreWordCandidatePageRequest();
+    }
+}
+
 bool QueueWordSearch(const wqn::WqnWordSearchRequest& search)
 {
     if (search.query.empty() && search.prefix.empty()) {
@@ -156,6 +202,14 @@ bool ApplyWordCloudResult(wqn::UiState* state, WordCloudResult& result)
             &state->word_app,
             result.result,
             std::move(result.session));
+        BuildHomeSummary(state);
+        return true;
+    }
+    if (result.op == WordCloudOp::kFetchSessionPage) {
+        wqn::ApplyWordCandidatePageResult(
+            &state->word_app,
+            result.result,
+            std::move(result.candidate_page));
         BuildHomeSummary(state);
         return true;
     }
@@ -315,6 +369,18 @@ void WordCloudTask(void*)
                 token,
                 session,
                 &result.session,
+                &result.protocol_error);
+        } else if (request.op == WordCloudOp::kFetchSessionPage) {
+            wqn::protocol::word_study_v1::CandidatePageRequest page;
+            page.metadata = wqn::services::MakeDeviceRequestMetadata();
+            page.metadata.request_id = request.request_id;
+            page.cursor = request.cursor;
+            page.limit = request.limit;
+            result.result = wqn::FetchWordStudyCandidatePageV1(
+                token,
+                request.session_id,
+                page,
+                &result.candidate_page,
                 &result.protocol_error);
         } else if (request.op == WordCloudOp::kSearch) {
             wqn::WqnWordSearchRequest search;

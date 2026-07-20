@@ -734,6 +734,7 @@ wqn::AiStreamingStatusView streaming_view{};
         if (word_cloud_completed) {
             FinishWordCloudRequest();
         }
+        device_ui_internal::PumpWordCandidatePrefetch(&ui_runtime);
 
         wqn::PowerOffEpdAfterIdleIfNeeded();
 

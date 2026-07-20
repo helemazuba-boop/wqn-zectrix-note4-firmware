@@ -36,6 +36,8 @@
 
 namespace device_ui_internal {
 
+class UiRuntime;
+
 constexpr std::time_t kMinReasonableUnixTime = 1704067200;  // 2024-01-01 UTC
 
 // ---- Schedule enum and helpers ---------------------------------------------
@@ -151,6 +153,7 @@ struct TodoCloudResult {
 enum class WordCloudOp {
     kPackSync,
     kStartSession,
+    kFetchSessionPage,
     kSearch,
     kAiLookup,
 };
@@ -158,6 +161,9 @@ enum class WordCloudOp {
 struct WordCloudRequest {
     WordCloudOp op = WordCloudOp::kPackSync;
     char request_id[65] = {};
+    char session_id[37] = {};
+    char cursor[65] = {};
+    uint16_t limit = 0;
     uint8_t study_mode = 0;
     char query[96] = {};
 };
@@ -168,6 +174,7 @@ struct WordCloudResult {
     bool auth_required = false;
     wqn::WordPackIndex pack_index;
     wqn::protocol::word_study_v1::SessionData session;
+    wqn::protocol::word_study_v1::CandidatePageData candidate_page;
     wqn::protocol::v3::Error protocol_error;
     wqn::WqnWordSearchResult search;
     wqn::WqnWordAiLookupResult lookup;
@@ -205,6 +212,10 @@ bool QueueTodoComplete(const std::string& todo_id);
 bool QueueWordReviewRefresh();
 bool QueueWordSessionStart(
     const wqn::protocol::word_study_v1::CreateSessionRequest& request);
+bool QueueWordCandidatePage(
+    const std::string& session_id,
+    const wqn::protocol::word_study_v1::CandidatePageRequest& request);
+void PumpWordCandidatePrefetch(UiRuntime* runtime);
 bool QueueWordSearch(const wqn::WqnWordSearchRequest& search);
 bool QueueWordAiLookup(const wqn::WqnWordAiLookupRequest& lookup);
 

@@ -333,6 +333,12 @@ esp_err_t CreateWordStudySessionV1(
     const protocol::word_study_v1::CreateSessionRequest& request,
     protocol::word_study_v1::SessionData* session,
     protocol::v3::Error* error);
+esp_err_t FetchWordStudyCandidatePageV1(
+    const std::string& token,
+    const std::string& session_id,
+    const protocol::word_study_v1::CandidatePageRequest& request,
+    protocol::word_study_v1::CandidatePageData* page,
+    protocol::v3::Error* error);
 esp_err_t SubmitWordStudyObservationV1(
     const std::string& token,
     const protocol::word_study_v1::ObservationRequest& request,
