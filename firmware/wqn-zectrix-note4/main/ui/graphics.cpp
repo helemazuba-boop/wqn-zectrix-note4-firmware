@@ -5,7 +5,7 @@
 
 #include <algorithm>
 
-#include "epd_display.h"
+#include "display_service.h"
 
 namespace device_ui_internal {
 
@@ -41,6 +41,17 @@ void FillRect(int x, int y, int width, int height, bool black)
     for (int yy = 0; yy < height; ++yy) {
         for (int xx = 0; xx < width; ++xx) {
             wqn::DrawEpdPixel(x + xx, y + yy, black);
+        }
+    }
+}
+
+void DrawWqnBitmapAsset(int x, int y, const WqnBitmapAsset& asset, bool black)
+{
+    for (uint8_t yy = 0; yy < asset.height; ++yy) {
+        for (uint8_t xx = 0; xx < asset.width; ++xx) {
+            if (WqnBitmapPixel(asset, xx, yy)) {
+                wqn::DrawEpdPixel(x + xx, y + yy, black);
+            }
         }
     }
 }
@@ -105,11 +116,6 @@ void ClearRect(const UiRect& rect)
         return;
     }
     FillRect(x0, y0, x1 - x0, y1 - y0, false);
-}
-
-void DrawSegment(int x, int y, int width, int height)
-{
-    FillRect(x, y, width, height, true);
 }
 
 // [L3-semantics] Named wrappers for FillRect(..., black=true) so the 4 distinct

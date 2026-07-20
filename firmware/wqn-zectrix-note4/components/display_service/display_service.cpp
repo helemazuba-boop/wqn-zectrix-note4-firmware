@@ -1,4 +1,4 @@
-#include "epd_display.h"
+#include "display_service.h"
 
 #include <algorithm>
 #include <cstring>
@@ -17,7 +17,14 @@
 #include "runtime/wake_context.h"
 #include "sdkconfig.h"
 
+#ifndef CONFIG_WQN_EPD_IDLE_POWER_OFF_MS
+#define CONFIG_WQN_EPD_IDLE_POWER_OFF_MS 1500
+#endif
+
 namespace wqn {
+
+static void PowerOffEpd();
+
 namespace {
 
 constexpr char kTag[] = "wqn_epd";
@@ -79,6 +86,8 @@ bool g_previous_framebuffer_synced = false;
 bool g_hot_refresh_ok = false;
 uint32_t g_partial_refreshes_since_full = 0;
 int64_t g_last_epd_refresh_us = 0;
+int64_t g_last_epd_activity_ms = 0;
+bool g_epd_idle_cut = false;
 
 // [power-fix] Persisted across deep-sleep resets so the EPD refresh task
 // can skip redundant panel updates after an RTC-timer wakeup.  Without this,
@@ -1015,21 +1024,6 @@ esp_err_t InitEpdDisplay()
     return ESP_OK;
 }
 
-uint8_t* GetEpdFramebuffer()
-{
-    return g_framebuffer;
-}
-
-const uint8_t* GetEpdFramebufferConst()
-{
-    return g_framebuffer;
-}
-
-size_t GetEpdFramebufferSize()
-{
-    return kEpdFramebufferSize;
-}
-
 void ClearEpdFramebuffer(bool white)
 {
     if (g_framebuffer == nullptr) {
@@ -1561,7 +1555,7 @@ esp_err_t RefreshEpdFull(bool allow_local_partial, bool force_full_refresh)
     return ESP_OK;
 }
 
-void PowerOffEpd()
+static void PowerOffEpd()
 {
     EpdOperationGuard operation(portMAX_DELAY);
     if (!operation.locked()) {
@@ -1604,7 +1598,7 @@ void PowerOffEpd()
     }
 }
 
-esp_err_t TryPowerOffEpd(uint32_t timeout_ms)
+static esp_err_t TryPowerOffEpd(uint32_t timeout_ms)
 {
     EpdOperationGuard operation(pdMS_TO_TICKS(timeout_ms));
     if (!operation.locked()) {
@@ -1617,35 +1611,35 @@ esp_err_t TryPowerOffEpd(uint32_t timeout_ms)
 
 } // namespace wqn
 
-// Helpers outside the main `wqn` namespace block (which closed at the end of
-// PowerOffEpd above) so we don't reopen the same namespace. The flag itself
-// lives in the device_ui_internal translation unit (ui_refresh.cpp);
-// forward-declare here to read it without dragging in ui_internal.h.
-namespace device_ui_internal {
-bool IsEpdRefreshPipelineBusy();
-}  // namespace device_ui_internal
-
-bool wqn::IsEpdBusy()
+void wqn::NoteEpdActivity()
 {
-    if (::device_ui_internal::IsEpdRefreshPipelineBusy()) {
-        return true;
+    g_last_epd_activity_ms = esp_timer_get_time() / 1000;
+    g_epd_idle_cut = false;
+}
+
+void wqn::PowerOffEpdAfterIdleIfNeeded()
+{
+    const int idle_ms = CONFIG_WQN_EPD_IDLE_POWER_OFF_MS;
+    if (idle_ms <= 0 || g_epd_idle_cut || g_last_epd_activity_ms == 0) {
+        return;
     }
-    EpdOperationGuard operation(0);
-    return !operation.locked();
+    if ((esp_timer_get_time() / 1000 - g_last_epd_activity_ms) < idle_ms) {
+        return;
+    }
+    const esp_err_t result = TryPowerOffEpd(0);
+    if (result == ESP_OK) {
+        ESP_LOGI(kTag, "EPD idle power-off after %d ms", idle_ms);
+        g_epd_idle_cut = true;
+    } else if (result != ESP_ERR_TIMEOUT) {
+        ESP_LOGW(kTag, "EPD idle power-off failed: %s", esp_err_to_name(result));
+    }
 }
 
 esp_err_t wqn::PrepareDisplayForSleep(int64_t deadline_us)
 {
-    // Quiesce closes display-lease acquisition before this is called. Drain an
-    // already accepted frame/result first; powering down ahead of a pending
-    // refresh would turn an accepted revision into an invisible success.
-    while (::device_ui_internal::IsEpdRefreshPipelineBusy()) {
-        if (deadline_us > 0 && esp_timer_get_time() >= deadline_us) {
-            return ESP_ERR_TIMEOUT;
-        }
-        vTaskDelay(pdMS_TO_TICKS(10));
-    }
-
+    // PowerCoordinator may begin quiesce only when no SleepLease exists. Every
+    // accepted UI frame owns kDisplay until its terminal result, so reaching
+    // this service boundary proves there is no upstream frame left to drain.
     const int64_t remaining_us = deadline_us > 0
         ? deadline_us - esp_timer_get_time()
         : 0;
@@ -1663,13 +1657,4 @@ void wqn::RollbackDisplayAfterSleepAbort()
     // Power-off is a valid Ready state during ordinary runtime. The next
     // accepted DisplayIntent owns wake/re-init, so rollback must not touch
     // GPIO6 behind DisplayService's state machine.
-}
-
-void wqn::ReleaseEpdDeepSleepHolds()
-{
-    constexpr gpio_num_t kSpiPins[] = {kEpdSck, kEpdMosi, kEpdCs, kEpdDc, kEpdReset};
-    gpio_hold_dis(kEpdPower);
-    for (gpio_num_t pin : kSpiPins) {
-        gpio_hold_dis(pin);
-    }
 }

@@ -73,41 +73,6 @@ bool Pcf8563InitWithBus(i2c_master_bus_handle_t bus)
     return true;
 }
 
-bool Pcf8563Init(i2c_port_t port, gpio_num_t sda, gpio_num_t scl, int clk_hz)
-{
-    if (g_initialized) {
-        return true;
-    }
-
-    if (port != I2C_NUM_0 && port != I2C_NUM_1) {
-        port = I2C_NUM_0;
-    }
-
-    i2c_master_bus_config_t bus_cfg = {};
-    bus_cfg.i2c_port = port;
-    bus_cfg.sda_io_num = sda;
-    bus_cfg.scl_io_num = scl;
-    bus_cfg.clk_source = I2C_CLK_SRC_DEFAULT;
-    bus_cfg.glitch_ignore_cnt = 7;
-    bus_cfg.flags.enable_internal_pullup = 1;
-
-    esp_err_t err = i2c_new_master_bus(&bus_cfg, &g_bus);
-    if (err != ESP_OK) {
-        ESP_LOGE(kTag, "new master bus failed: %s", esp_err_to_name(err));
-        return false;
-    }
-
-    if (!Pcf8563InitWithBus(g_bus)) {
-        i2c_del_master_bus(g_bus);
-        g_bus = nullptr;
-        return false;
-    }
-
-    ESP_LOGI(kTag, "PCF8563 initialized with own bus: port=%d SDA=%d SCL=%d clk=%d",
-             static_cast<int>(port), static_cast<int>(sda), static_cast<int>(scl), clk_hz);
-    return true;
-}
-
 bool Pcf8563ReadTime(int* year, int* month, int* day, int* hour, int* min, int* sec)
 {
     if (!g_initialized) {

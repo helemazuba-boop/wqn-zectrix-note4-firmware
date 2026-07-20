@@ -293,6 +293,8 @@ struct UiLine {
 struct UiFrame {
     UiScreen screen = UiScreen::kHome;
     bool prefer_full_refresh = false;
+    bool paired = false;
+    std::string claim_code;
     StatusBarEditState status_edit;  // [shell] status-bar edit mode for render
     HomeSummary home;
     AiSessionState ai;

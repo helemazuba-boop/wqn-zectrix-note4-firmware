@@ -124,7 +124,6 @@ esp_err_t ResetAudioTxChannel(
 esp_err_t PrepareAudioServiceForSleep(
     const power::PrepareSleepCommand& command);
 void RollbackAudioServiceAfterSleepAbort(uint32_t generation);
-void ReleaseAudioServiceDeepSleepHolds();
 
 AudioSnapshot GetAudioSnapshot();
 const char* AudioActivityName(AudioActivity activity);

@@ -4,7 +4,7 @@
 #include <cstdint>
 
 #include "ai_session.h"
-#include "epd_display.h"
+#include "display_service.h"
 #include "flash_session.h"
 #include "provision_manager.h"
 
@@ -762,6 +762,8 @@ UiFrame RenderUiFrame(const UiState& state)
     }
 
     frame.screen = state.screen;
+    frame.paired = state.status.paired;
+    frame.claim_code = state.status.claim_code;
     frame.home = state.home;
     frame.ai = state.ai;
     if (state.screen == UiScreen::kAi) {

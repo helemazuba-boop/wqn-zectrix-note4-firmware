@@ -13,3 +13,12 @@ list(APPEND SDKCONFIG_DEFAULTS "sdkconfig.defaults" "sdkconfig.ai-local.defaults
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(wqn-zectrix-note4)
+
+add_custom_target(
+    wqn_architecture_check ALL
+    COMMAND
+        ${CMAKE_COMMAND}
+        -DWQN_PROJECT_DIR=${CMAKE_CURRENT_LIST_DIR}
+        -P ${CMAKE_CURRENT_LIST_DIR}/cmake/verify_architecture.cmake
+    COMMENT "Verifying M8 resource ownership and layer boundaries"
+    VERBATIM)

@@ -5,29 +5,17 @@ idf_component_register(
         "ai_session.cpp"
         "audio_capture.cpp"
         "audio_player.cpp"
-        "audio_sleep.cpp"
         "audio_volume.cpp"
         "audio_selftest.cpp"
-        "board_zectrix_note4.cpp"
         "button_input.cpp"
         "contract_fixtures.cpp"
         "device_ui.cpp"
-        "device_protocol/claim_crypto.cpp"
-        "device_protocol/v3.cpp"
         "diagnostics.cpp"
-        "epd_display.cpp"
-        "fonts/SourceHanSansSC_Regular_slim.c"
-        "fonts/font_zectrix_16_1.c"
-        "fonts/font_zectrix_48_1.c"
         "power_manager.cpp"
-        "power/sleep_protocol.cpp"
         "power/wake_controller.cpp"
         "pcf8563.cpp"
         "provision_manager.cpp"
-        "runtime/sleep_coordinator.cpp"
-        "runtime/sleep_snapshot.cpp"
         "runtime/storage_schema.cpp"
-        "runtime/wake_context.cpp"
         "services/connectivity_service.cpp"
         "services/audio_service.cpp"
         "services/storage_service.cpp"
@@ -76,6 +64,7 @@ idf_component_register(
         esp_event
         esp_netif
         esp_psram
+        esp_driver_usb_serial_jtag
         esp_wifi
         wqn_wifi_provision
         freertos
@@ -83,50 +72,18 @@ idf_component_register(
         lwip
         mbedtls
         nvs_flash
+        platform_note4
+        power_runtime
+        display_service
+        device_protocol
         spi_flash
         spiffs
 )
 
-set(WQN_DEVICE_CONTROL_CONTRACT_DIR
-    "${CMAKE_CURRENT_LIST_DIR}/../contracts/device-control-v3")
-set(WQN_DEVICE_CONTROL_SCHEMA
-    "${WQN_DEVICE_CONTROL_CONTRACT_DIR}/device-control-v3.schema.json")
-set(WQN_DEVICE_CONTROL_MANIFEST
-    "${WQN_DEVICE_CONTROL_CONTRACT_DIR}/manifest.json")
-file(SHA256 "${WQN_DEVICE_CONTROL_SCHEMA}" WQN_DEVICE_CONTROL_SCHEMA_SHA256)
-file(READ "${WQN_DEVICE_CONTROL_MANIFEST}" WQN_DEVICE_CONTROL_MANIFEST_JSON)
-string(JSON WQN_DEVICE_CONTROL_MANIFEST_SHA256
-    GET "${WQN_DEVICE_CONTROL_MANIFEST_JSON}" schema_sha256)
-if(NOT WQN_DEVICE_CONTROL_SCHEMA_SHA256 STREQUAL WQN_DEVICE_CONTROL_MANIFEST_SHA256)
+if(CONFIG_WQN_WIFI_STA_ENABLE AND NOT CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE)
     message(FATAL_ERROR
-        "device-control-v3 schema hash mismatch: actual=${WQN_DEVICE_CONTROL_SCHEMA_SHA256} "
-        "manifest=${WQN_DEVICE_CONTROL_MANIFEST_SHA256}")
+        "WiFi-enabled firmware must use device-control v3; legacy /poll pairing returns HTTP 426")
 endif()
-
-# M6 ownership gate: feature/session modules only see opaque AudioService
-# handles. Note4 bootstrap and AudioService are the two deliberate low-level
-# exceptions (pre-service safe pins, then the sole runtime owner).
-set(WQN_AUDIO_CLIENT_SOURCES
-    "audio_capture.cpp"
-    "audio_player.cpp"
-    "audio_selftest.cpp"
-    "audio_sleep.cpp"
-    "audio_volume.cpp"
-    "flash_session.cpp")
-foreach(WQN_AUDIO_CLIENT IN LISTS WQN_AUDIO_CLIENT_SOURCES)
-    file(READ "${CMAKE_CURRENT_LIST_DIR}/${WQN_AUDIO_CLIENT}"
-        WQN_AUDIO_CLIENT_SOURCE)
-    if(WQN_AUDIO_CLIENT_SOURCE MATCHES
-        "#[ \t]*include[ \t]*[<\"]driver/(gpio|i2c_master|i2s_std)\\.h")
-        message(FATAL_ERROR
-            "M6 audio ownership violation: ${WQN_AUDIO_CLIENT} includes an ESP-IDF audio driver")
-    endif()
-    if(WQN_AUDIO_CLIENT_SOURCE MATCHES
-        "GPIO_NUM_(42|46)|GetSharedI2cBusHandle")
-        message(FATAL_ERROR
-            "M6 audio ownership violation: ${WQN_AUDIO_CLIENT} bypasses AudioService")
-    endif()
-endforeach()
 
 set(WQN_API_BASE "" CACHE STRING "Override the WQN ESP32 API base URL")
 set(WQN_DEBUG_PROBLEM_IDS "" CACHE STRING "Local-only comma-separated ESP32 debug problem IDs")
@@ -136,7 +93,6 @@ target_compile_definitions(
     PRIVATE
         BOARD_TYPE=\"zectrix-s3-epaper-4.2\"
         BOARD_NAME=\"ZecTrix_Note4\"
-        WQN_DEVICE_CONTROL_SCHEMA_SHA256=\"${WQN_DEVICE_CONTROL_SCHEMA_SHA256}\"
 )
 
 if(WQN_API_BASE)

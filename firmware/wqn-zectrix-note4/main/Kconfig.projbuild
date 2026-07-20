@@ -36,12 +36,12 @@ menu "WQN firmware"
             or when the device is always offline.
 
     config WQN_DEVICE_CONTROL_V3_ENABLE
-        bool "Use isolated device-control v3 bootstrap/sync"
-        default n
+        bool "Use device-control v3 claim/bootstrap/sync"
+        default y
         depends on WQN_WIFI_STA_ENABLE
         help
-            Route authenticated control-plane bootstrap and summary sync through
-            /api/esp32/v3. Keep disabled in production until the coordinated M7
+            Route device claim, authenticated bootstrap and summary sync through
+            /api/esp32/v3. Production WiFi builds require this after the M7
             cutover; AI SSE remains v2-streaming and Flash remains wqn-flash-v2.
 
     config WQN_EPD_UI_ENABLE

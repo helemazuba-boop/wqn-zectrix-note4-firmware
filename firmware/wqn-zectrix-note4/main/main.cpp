@@ -18,7 +18,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "online_sync.h"
+#include "services/sync_service.h"
 #include "power_manager.h"
 #include "power/wake_controller.h"
 #include "runtime/sleep_coordinator.h"
@@ -28,7 +28,6 @@
 #include "services/connectivity_service.h"
 #include "storage.h"
 #include "wqn_api.h"
-#include "ui/ui_internal.h"
 
 namespace {
 
@@ -119,6 +118,11 @@ void ConfirmRunningApp()
 extern "C" void app_main(void)
 {
     ESP_ERROR_CHECK(wqn::InitZectrixNote4SafePins());
+    ESP_ERROR_CHECK(wqn::InitPowerHardware(
+        wqn::kNote4I2cPort,
+        wqn::kNote4I2cSda,
+        wqn::kNote4I2cScl,
+        wqn::kNote4I2cClockHz));
     wqn::power::CaptureWakeContext();
     wqn::LogWakeupCause();
     wqn::PrintBootDiagnostics();
@@ -205,7 +209,7 @@ extern "C" void app_main(void)
     ESP_ERROR_CHECK_WITHOUT_ABORT(wqn::RunAudioSelfTestIfEnabled());
 
 #if CONFIG_WQN_WIFI_STA_ENABLE
-    ESP_ERROR_CHECK_WITHOUT_ABORT(wqn::StartWqnOnlineTask());
+    ESP_ERROR_CHECK_WITHOUT_ABORT(wqn::services::StartSyncService());
 #else
     ESP_LOGI(kTag, "pairing flow disabled because WiFi STA is disabled");
 #endif

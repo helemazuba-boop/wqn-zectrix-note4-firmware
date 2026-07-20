@@ -8,7 +8,7 @@
 #include <vector>
 
 #include "esp_log.h"
-#include "online_sync.h"
+#include "services/sync_service.h"
 #include "services/connectivity_service.h"
 #include "storage.h"
 #include "word_app.h"
@@ -141,8 +141,8 @@ bool LoadUiState(wqn::UiState* state)
     } else {
         state->status.paired = false;
         state->status.token_mask.clear();
-        wqn::OnlineSyncSnapshot sync_snapshot;
-        wqn::GetOnlineSyncSnapshot(&sync_snapshot);
+        wqn::services::SyncSnapshot sync_snapshot;
+        wqn::services::GetSyncSnapshot(&sync_snapshot);
         state->status.claim_code = sync_snapshot.claim_code;
     }
 
@@ -202,7 +202,7 @@ RefreshSchedule QueueSelectedReview(wqn::UiState* state)
         problem.id.c_str(),
         review.selected_status.c_str(),
         state->status.pending_reviews);
-    wqn::NotifyOnlineSyncRequested();
+    wqn::services::RequestSyncNow();
     BuildHomeSummary(state);  // [home-stats-fix] refresh home stats so pending/today counts update immediately (was stale until 60s poll)
     return RefreshSchedule::kCommit;
 }

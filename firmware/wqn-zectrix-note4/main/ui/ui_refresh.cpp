@@ -9,9 +9,8 @@
 #include <cstdio>
 #include <string>
 
-#include "epd_display.h"
+#include "display_service.h"
 #include "esp_log.h"
-#include "esp_rom_sys.h"
 #include "esp_task_wdt.h"
 #include "esp_timer.h"
 #include "runtime/sleep_coordinator.h"
@@ -505,7 +504,9 @@ std::string FrameSignature(const wqn::UiFrame& frame)
         signature.push_back('/');
         signature.append(frame.settings.notice);
         signature.push_back('/');
-        signature.append(diag.mac_label);
+        signature.append(frame.paired ? "paired" : "unpaired");
+        signature.push_back('/');
+        signature.append(frame.claim_code);
         signature.push_back('/');
         signature.append(std::to_string(diag.flash_size));
         signature.push_back('/');
@@ -689,27 +690,29 @@ void AcknowledgeDisplayResult(wqn::display::DisplayRevision revision)
 
 void EpdRefreshTask(void*)
 {
-    esp_rom_printf("I (%u) wqn_ui: EPD refresh task started\n", (unsigned)xTaskGetTickCount());
+    ESP_LOGI(kTag, "EPD refresh task started");
 
 #if CONFIG_ESP_TASK_WDT_EN
     // Try add then delete: if the task was subscribed to TWDT at creation (FreeRTOS default),
     // delete here takes effect. If add fails the task is not subscribed; delete also fails — fine either way.
     esp_task_wdt_add(xTaskGetCurrentTaskHandle());
     esp_task_wdt_delete(xTaskGetCurrentTaskHandle());
-    esp_rom_printf("I (%u) wqn_ui: EPD refresh task unsubscribed from task watchdog\n", (unsigned)xTaskGetTickCount());
+    ESP_LOGI(kTag, "EPD refresh task unsubscribed from task watchdog");
 #endif
 
     {
         const UBaseType_t stack_high_water = uxTaskGetStackHighWaterMark(nullptr);
-        esp_rom_printf("I (%u) wqn_ui: EPD refresh task initial stack HWM: %u bytes free\n",
-                       (unsigned)xTaskGetTickCount(), (unsigned)(stack_high_water * sizeof(StackType_t)));
+        ESP_LOGI(
+            kTag,
+            "EPD refresh task initial stack HWM: %u bytes free",
+            static_cast<unsigned>(stack_high_water * sizeof(StackType_t)));
     }
 
     std::string displayed_signature;
     while (true) {
-        esp_rom_printf("I (%u) wqn_ui: EPD refresh: waiting on notify\n", (unsigned)xTaskGetTickCount());
+        ESP_LOGD(kTag, "EPD refresh waiting on notify");
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-        esp_rom_printf("I (%u) wqn_ui: EPD refresh: notify received\n", (unsigned)xTaskGetTickCount());
+        ESP_LOGD(kTag, "EPD refresh notify received");
 
         while (true) {
             TickType_t wait_ticks = 0;
@@ -769,21 +772,24 @@ void EpdRefreshTask(void*)
                 displayed_signature = local_sig;
                 g_last_rendered_screen = frame.screen;
                 wqn::NoteEpdActivity();
-                esp_rom_printf("I (%u) wqn_ui: display presented: revision=%llu schedule=%s elapsed_ms=%lld\n",
-                               (unsigned)xTaskGetTickCount(),
-                               static_cast<unsigned long long>(local_intent.revision),
-                               RefreshScheduleName(schedule),
-                               static_cast<long long>(refresh_elapsed_ms));
+                ESP_LOGI(
+                    kTag,
+                    "display presented: revision=%llu schedule=%s elapsed_ms=%lld",
+                    static_cast<unsigned long long>(local_intent.revision),
+                    RefreshScheduleName(schedule),
+                    static_cast<long long>(refresh_elapsed_ms));
             } else {
-                esp_rom_printf("W (%u) wqn_ui: display failed: revision=%llu error=%s\n",
-                               (unsigned)xTaskGetTickCount(),
-                               static_cast<unsigned long long>(local_intent.revision),
-                               esp_err_to_name(render_result));
+                ESP_LOGW(
+                    kTag,
+                    "display failed: revision=%llu error=%s",
+                    static_cast<unsigned long long>(local_intent.revision),
+                    esp_err_to_name(render_result));
             }
         } else {
-            esp_rom_printf("I (%u) wqn_ui: display presented by dedup: revision=%llu\n",
-                           (unsigned)xTaskGetTickCount(),
-                           static_cast<unsigned long long>(local_intent.revision));
+            ESP_LOGI(
+                kTag,
+                "display presented by dedup: revision=%llu",
+                static_cast<unsigned long long>(local_intent.revision));
         }
 
         wqn::display::DisplayResult terminal_result;
@@ -836,23 +842,14 @@ void EpdRefreshTask(void*)
         }
         xSemaphoreGive(g_refresh_mutex);
         if (do_promote) {
-            esp_rom_printf("I (%u) wqn_ui: EPD refresh: promoting secondary to primary slot=%d schedule=%s\n",
-                           (unsigned)xTaskGetTickCount(),
-                           new_slot, RefreshScheduleName(promote_sched));
+            ESP_LOGI(
+                kTag,
+                "EPD refresh promoting secondary: primary_slot=%d schedule=%s",
+                new_slot,
+                RefreshScheduleName(promote_sched));
             xTaskNotifyGive(g_refresh_task);
         }
     }
-}
-
-bool IsEpdRefreshPipelineBusy()
-{
-    if (g_refresh_mutex == nullptr) {
-        return false;
-    }
-    xSemaphoreTake(g_refresh_mutex, portMAX_DELAY);
-    const bool busy = g_refresh_busy || g_refresh_pending || g_secondary.pending;
-    xSemaphoreGive(g_refresh_mutex);
-    return busy;
 }
 
 }  // namespace device_ui_internal

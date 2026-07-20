@@ -85,12 +85,15 @@ silently drops the PM/deep-sleep config and the device "becomes a 100 mA heater.
 
 ### Tests
 
-There is **no host-side test framework**. "Tests" are boot-time device self-tests,
-gated by Kconfig and read over serial:
+There is no general host-side test runner. The build itself runs the M8 ownership
+gate, and boot-time device self-tests are read over serial:
+
+- `cmake/verify_architecture.cmake` runs on every build and enforces feature/HAL
+  layering plus unique EPD, WiFi, storage, audio and deep-sleep entry points.
 
 - `wqn::RunContractFixtureSelfTest()` (`contract_fixtures.cpp`) runs every boot and
   validates the WQN API JSON parsing fixtures. Failure is logged, not fatal.
-- `CONFIG_WQN_AUDIO_SELFTEST_ENABLE` captures a short mic sample at boot and prints
+- `CONFIG_WQN_AI_AUDIO_SELFTEST_ENABLE` captures a short mic sample at boot and prints
   RMS/peak stats; it never uploads.
 
 To exercise a feature: enable its Kconfig flag, build, flash, read `wqn.log`. A
@@ -98,77 +101,70 @@ diagnostic should not require a reflash to confirm.
 
 ## Architecture
 
-`app_main` (`main.cpp`) runs a fixed bring-up sequence, then loops calling
-`EnterDeepSleepIfEnabled()` once a second. All other work is FreeRTOS tasks. Layers,
-hardware up:
+`app_main` (`main.cpp`) performs startup assembly only. It establishes safe pins and
+shared buses, captures `WakeContext`, enforces storage schema generation 3, starts
+services/features, then starts `PowerCoordinator`; it does not poll business state or
+enter sleep itself.
 
-**Board / power** — `board_zectrix_note4.cpp::InitZectrixNote4SafePins()` is the single
-GPIO entry point: powers off EPD/audio/amp/NFC, latches board power (GPIO17 HIGH),
-configures inputs, then calls `power_manager.cpp::InitPowerHardware()`, which owns the
-**one** I2C bus and the ADC. `power_manager` also handles light/deep-sleep entry,
-wake-cause logging, and battery protection. `diagnostics.cpp` prints boot
-chip/flash/MAC/reset info.
+The enforced dependency direction is features → service interfaces → services →
+runtime primitives → Note4 HAL/ESP-IDF. See
+`firmware/wqn-zectrix-note4/ARCHITECTURE.md` for the full ownership map. Every build
+runs `cmake/verify_architecture.cmake` and rejects driver/HAL access from features,
+second hardware owners, or a second deep-sleep call site.
 
-**Connectivity** — `wifi_manager.cpp` (station connect + backoff) and
-`provision_manager.cpp` (SoftAP captive portal when no NVS WiFi creds). `wqn_api.cpp`
-(+ `wqn_api_stream.cpp`) is the large transport + JSON layer: pairing (`/poll`),
-Bearer-token auth, problem sync / `/problems` / `/review-complete`, Todo timeline,
-word sync/review/search/packs, and AI audio chat (v2 SSE streaming + legacy v1
-one-shot). Every fetch has a paired `Parse…Response`. `flash_session.cpp` implements
-the `wqn-flash-v2` realtime voice WebSocket session. A vendored
-`components/esp_websocket_client/` provides the WS transport.
+**Extracted IDF components** — `platform_note4` owns boot safe pins;
+`power_runtime` contains `SleepLease`, `WakeContext`, snapshots and sleep protocol;
+`device_protocol` contains v3 contract/claim crypto; `display_service` owns the EPD
+framebuffer, SPI, BUSY and GPIO6. `display_service` depends only on `power_runtime`;
+the other three are independent. High-level `PowerCoordinator` remains in `main`
+because it coordinates service interfaces and extracting it would create a cycle.
 
-**Storage** — `storage.cpp` wraps NVS namespace `wqn`: access token, problem cache,
-pending-review queue, AI session cache, WiFi creds, settings (auto-sync interval,
-volume). Tokens are masked in logs. Word packs (`.wpack`) live in the SPIFFS `storage`
-partition (`partitions/16m.csv`: 16 MiB, two OTA slots + 8 MiB SPIFFS at 0x800000).
+**Services** — `ConnectivityService` owns station/provision/reconnect policy;
+`StorageService` serializes NVS/SPIFFS writes; `AudioService` owns I2S, ES8311 and the
+amplifier; `SyncService` owns claim/bootstrap/sync lifecycle and publishes fixed-size
+domain events. `wifi_manager`, the provisioning component, `storage.cpp` and
+`word_pack.cpp` are low-level adapters used behind those services, not feature-owned
+tasks.
 
-**EPD driver** — `epd_display.cpp` drives the Note4 controller over SPI with a 1bpp
-framebuffer (`GetEpdFramebuffer()`): **1 = white, 0 = black, MSB-first, row-major.**
-Full refresh + Note4 local partial-window path (`0x83`), plus EPD-rail power-down on
-GPIO6 after idle (`PowerOffEpdAfterIdleIfNeeded`).
+**UI subsystem (`main/ui/`)** — `device_ui.cpp` starts a single-owner `UiRuntime`.
+Button, timer, cloud and display results are events reduced into `AppState`; effects
+produce bounded refresh/cloud commands. `ui_refresh.cpp` has two fixed frame slots and
+submits versioned intents to `DisplayService`. Screen renderers live in `page_*.cpp`;
+`ui_layout.h` remains the geometry source of truth. UI reads immutable power, storage,
+connectivity and sync snapshots and must not include ESP-IDF driver headers.
 
-**UI subsystem (`main/ui/`)** — `device_ui.cpp` is the public entry
-(`StartDeviceUiIfEnabled()`); implementation is split across `ui/`. **`ui/ui_internal.h`
-is the shared header that ties the translation units together — read it first.**
-`ui_model.{h,cpp}` defines the central `UiState` (current `UiScreen`, plus
-time/todo/word/AI/settings sub-state). The loop is `ui_input.cpp` (button →
-`ApplyButtonEvent`) → `ui_state.cpp` (mutate state) → `ui_render.cpp` + `page_*.cpp`
-(draw to framebuffer) → `ui_refresh.cpp` (coalesce + dispatch). Screen renderers:
-`page_home`, `page_time`, `page_todo`, `page_word`, `page_ai`, `page_settings`.
-`ui_layout.h` is the single source of truth for screen geometry — prefer its tokens
-over magic numbers.
-
-**Apps** — `time_app.{cpp}` (clock/countdown/pomodoro), `word_app.cpp` +
-`word_pack.cpp` (vocabulary SRS with local `.wpack` packs), `ai_session.cpp` +
-`audio_capture.cpp` (long-press-to-record → upload 16 kHz mono PCM → render
-transcript/reply), `audio_player.cpp` / `audio_volume.cpp` (ES8311 playback + persisted
-volume), `pcf8563.cpp` (RTC, I2C 0x51).
+**Transport and media** — control plane uses `/api/esp32/v3/*` and protocol header 3.
+AI SSE and `wqn-flash-v2` retain their existing wire layouts but use the common
+authentication/session/cancel lifecycle. Firmware never connects to Supabase directly.
 
 ### Key runtime concepts
 
-- **Refresh scheduling.** UI code requests EPD refreshes through a `RefreshSchedule`
-  priority enum (`kClock`, `kTimer`, `kSelection`, `kConfig`, `kAi`, `kCommit`,
-  `kImmediate`). `ui_refresh.cpp` coalesces overlapping requests, ranks them, and waits
-  the per-schedule cooldown before sending the next `0x83` window. When adding UI,
-  request the weakest schedule that looks acceptable — the framework upgrades to a full
-  refresh only when needed.
+- **Refresh terminal results.** Every accepted display revision ends in exactly one
+  `Presented`, `Superseded` or `Failed`. The service keeps one active and one merged
+  pending intent, strengthens waveform requirements, unions dirty regions and commits
+  RTC panel state only after BUSY completes. One reset/re-init/full retry is allowed;
+  cold/untrusted wake and every 20th partial force a full refresh.
+- **Sleep transaction.** Work holds move-only `SleepLease` objects. After 60 seconds
+  idle with no lease, `PowerCoordinator` closes admission and runs generation-tagged
+  prepare/rollback across display, storage, audio, connectivity and wake controller.
+  It is the only caller of `esp_deep_sleep_start()`. USB/charger presence intentionally
+  holds a lease and blocks automatic light/deep sleep while monitoring.
 - **Cloud async pattern.** Todo/word screens never block the UI: `Queue…Request()`
   posts to a FreeRTOS queue, a dedicated `TodoCloudTask`/`WordCloudTask` does the
   `wqn_api` call off-thread, and `Apply…Result()` folds the result back into `UiState`.
   Mirror this for any new network-backed screen.
-- **Online sync task** (`WqnOnlineTask`, `main.cpp`) runs pairing → upload-pending →
-  sync-due → refresh-index on a configurable interval, and parks on `portMAX_DELAY`
-  while unpaired to save power. Wake it with `RequestOnlineSyncNow()` (`xTaskNotifyGive`)
-  whenever a token is saved or provisioning completes.
+- **Sync service.** `services::StartSyncService()` owns claim → bootstrap → sync and
+  parks on `portMAX_DELAY` when appropriate. Wake it through
+  `services::RequestSyncNow()`; consumers receive fixed-size `SyncEvent` values or an
+  immutable `SyncSnapshot`.
 - **Security boundary.** HTTP **401 is the only condition that clears the stored token**
   and returns the device to pairing. Any other server/provider error is surfaced to the
   user without destroying pairing state. Never embed provider keys in firmware.
 
 ## Hardware constraints (read before touching pins or power)
 
-Pin map is defined in `board_zectrix_note4.cpp` (constants `kEpdPower`, `kBoardPowerLatch`,
-etc.) and `power_manager.cpp` (`kConfirmWake`, `kBatAdc`, …). The load-bearing rules:
+Bootstrap pin mapping lives in `components/platform_note4`; runtime EPD/audio/wake
+pins live only in their owning services. The load-bearing rules:
 
 - **GPIO 17 board-power latch** (`kBoardPowerLatch`) must stay HIGH through light/deep
   sleep (`gpio_hold_en` + `gpio_sleep_sel_dis`); if it releases during sleep the board
@@ -177,19 +173,19 @@ etc.) and `power_manager.cpp` (`kConfirmWake`, `kBatAdc`, …). The load-bearing
   ST25DV NFC (0x55), ES8311 audio (0x18) all share it. Get the handle via
   `wqn::GetSharedI2cBusHandle()` — never call `i2c_new_master_bus` from a peripheral
   driver, or the second caller panics with `ESP_ERR_INVALID_STATE`.
-- **Deep-sleep wake sources are RTC-capable GPIO 0 (confirm), 18 (page-down), 5 (RTC
-  INT)** via ext1. GPIO 39 (page-up) **cannot** wake from deep sleep on S3, so it is
-  deliberately not in the wake mask.
+- **Deep-sleep wake sources are active-low GPIO 0 (confirm), 18 (page-down), 5 (RTC
+  INT), 2 (charge) and 1 (full)** via ext1. GPIO 39 (page-up) cannot wake from deep
+  sleep on S3 and is deliberately absent.
 - **GPIO 18 is the page-down / KEY_DET key with an external pull-up** — despite the
-  source name `kPageDownAndPowerDetect`, it is *not* a USB-power-detect pin. USB power
-  is inferred from `IsCharging() || IsFullyCharged()` (GPIO 2 = `CHRG_L` low-active;
-  GPIO 1 = `STDBY_H` high-active).
+  source name `kPageDownAndPowerDetect`, it is *not* a USB-power-detect pin. A PC
+  connection is detected from USB Serial/JTAG SOF frames; charger-only power is
+  inferred from GPIO 2 `CHRG_L` or GPIO 1 `/STDBY` (both active-low). Do not use
+  charger state alone to decide whether native USB may sleep.
 - **GPIO 19 / 20 are USB D− / D+.** Never repurpose them as GPIO/I2C — doing so kills
   the USB link to the PC. Leave them to the USB controller.
-- The **EPD rail (GPIO 6)** is cut after idle; before power-off, send the panel
-  deep-sleep command to stop leakage. Battery is read via the shared ADC (GPIO 4 /
-  ADC1_CH3). `InitPowerHardware()` **must** run, or voltage reads 0 and low-battery
-  shutdown misfires.
+- The **EPD rail (GPIO 6)** is controlled only by `DisplayService`; before cutting it,
+  send the panel deep-sleep command. Battery ADC/GPIO values are exposed only as
+  `PowerStatusSnapshot`, never as driver handles to UI.
 
 ## Conventions
 
@@ -217,10 +213,11 @@ live in the maintainer's broader workspace (not in this checkout): the **WQN clo
 (Next.js + Supabase, original `wqn.magicworks.app` product; hosts `/api/esp32/*` route
 handlers, ASR/LLM providers, notebook permissions, AI function-call execution) and an
 **official-firmware reference** (`ESP32DOC`: official ZecTrix dumps, schematic PDF,
-Ghidra project, RE reports). When a request/response shape changes, update it in both
-the firmware (`wqn_api.cpp` + fixtures in `contract_fixtures.cpp`) and the cloud route
-handler. The device↔cloud contract: `GET /poll` pairing returns `status` ∈
-{`paired`,`already_paired`,`no_pending`,`expired`,`pending`}; runtime auth is
-`Authorization: Bearer <token>` (64-char hex, MAC-bound, in NVS); envelope is
-`{success,data,timestamp}` / `{success:false,error:{code,message},status,timestamp}`;
-**401 = clear token, 500/other = keep pairing state**.
+Ghidra project, RE reports). When a request/response shape changes, update the
+authoritative JSON Schema and golden fixtures in WQN, its pinned firmware copy/hash,
+C++ parsers and TypeScript validation together. The control contract is
+`/api/esp32/v3/*`, `X-WQN-Protocol: 3`, with `request_id`, `boot_id`, capabilities and
+`{ok,...}` success/error envelopes. Device claim uses ephemeral P-256
+ECDH/HKDF/AES-GCM; MAC only locates a candidate and never recovers a credential.
+Runtime auth remains `Authorization: Bearer <token>` and cloud storage retains only
+its hash. **401 = clear token; timeout/429/5xx = keep identity.**

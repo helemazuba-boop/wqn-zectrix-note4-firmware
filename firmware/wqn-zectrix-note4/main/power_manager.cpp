@@ -4,14 +4,11 @@
 #include <atomic>
 #include <utility>
 
-#include "ai_session.h"
-#include "audio_sleep.h"
-#include "audio_capture.h"
-#include "audio_player.h"
-#include "driver/adc.h"
+#include "display_service.h"
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
 #include "driver/uart.h"
+#include "driver/usb_serial_jtag.h"
 #include "esp_adc/adc_cali.h"
 #include "esp_adc/adc_cali_scheme.h"
 #include "esp_adc/adc_oneshot.h"
@@ -22,23 +19,17 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "epd_display.h"
-#include "flash_session.h"
-#include "online_sync.h"
+#include "services/sync_service.h"
 #include "pcf8563.h"
 #include "power/sleep_protocol.h"
 #include "power/wake_controller.h"
-#include "provision_manager.h"
 #include "runtime/sleep_coordinator.h"
 #include "runtime/sleep_snapshot.h"
 #include "runtime/wake_context.h"
 #include "sdkconfig.h"
 #include "storage.h"
 #include "services/connectivity_service.h"
-
-#ifndef CONFIG_WQN_EPD_IDLE_POWER_OFF_MS
-#define CONFIG_WQN_EPD_IDLE_POWER_OFF_MS 1500
-#endif
+#include "services/audio_service.h"
 
 #ifndef CONFIG_WQN_DEEP_SLEEP_IDLE_MS
 #define CONFIG_WQN_DEEP_SLEEP_IDLE_MS 300000
@@ -117,9 +108,6 @@ RTC_DATA_ATTR int64_t g_last_user_activity_ms = 0;
 RTC_DATA_ATTR uint32_t g_consecutive_sleep_cycles = 0;
 static bool g_user_interacted_current_boot = false;
 
-int64_t g_last_epd_activity_ms = 0;
-bool g_epd_idle_cut = false;
-
 adc_oneshot_unit_handle_t g_adc_handle = nullptr;
 adc_cali_handle_t g_adc_cali_handle = nullptr;
 bool g_adc_initialized = false;
@@ -139,13 +127,6 @@ constexpr int64_t kSleepRetryBackoffUs = 30 * 1000 * 1000;
 constexpr int64_t kEmergencyStorageTimeoutUs = 2 * 1000 * 1000;
 constexpr int64_t kEmergencyHardwareTimeoutUs = 2 * 1000 * 1000;
 constexpr int64_t kLeaseWarningAfterUs = 60 * 1000 * 1000;
-
-bool HasUnregisteredRuntimeActivity()
-{
-    return wqn::IsProvisioningActive() || wqn::IsAudioCaptureRunning() ||
-        wqn::IsAudioPlayerPlaying() || wqn::IsAiSessionActive() ||
-        wqn::IsFlashSessionActive();
-}
 
 }  // namespace
 
@@ -171,14 +152,6 @@ void LogWakeupCause()
              wake.panel_cache_trusted ? "trusted" : "untrusted");
 }
 
-void ReleaseDeepSleepHolds()
-{
-    gpio_deep_sleep_hold_dis();
-    gpio_hold_dis(kNfcPower);
-    gpio_hold_dis(kLed);
-    gpio_hold_dis(kBoardPowerLatch);
-}
-
 void NoteUserActivity()
 {
     g_user_interacted_current_boot = true;
@@ -189,12 +162,6 @@ void NoteUserActivity()
         ESP_LOGW(kTag, "battery critically low during user activity, initiating shutdown");
         ShutdownForBatteryDepleted();
     }
-}
-
-void NoteEpdActivity()
-{
-    g_last_epd_activity_ms = NowMs();
-    g_epd_idle_cut = false;
 }
 
 bool IsUiIdleForSleep()
@@ -301,22 +268,19 @@ i2c_master_bus_handle_t GetSharedI2cBusHandle()
     return g_i2c_bus;
 }
 
-adc_oneshot_unit_handle_t GetSharedAdcHandle()
+bool ReadPowerStatus(PowerStatusSnapshot* snapshot)
 {
-    return g_adc_handle;
-}
-
-adc_cali_handle_t GetSharedAdcCaliHandle()
-{
-    return g_adc_cali_handle;
-}
-
-uint16_t GetBatteryVoltageMv()
-{
+    if (snapshot == nullptr) {
+        return false;
+    }
+    *snapshot = {};
+    snapshot->charging = gpio_get_level(kChargeDetect) == 0;
+    snapshot->fully_charged = gpio_get_level(kChargeFull) == 0;
     if (!g_adc_initialized) {
-        return 0;
+        return false;
     }
 
+    int sum_raw = 0;
     int sum_mv = 0;
     int valid_samples = 0;
 
@@ -337,34 +301,39 @@ uint16_t GetBatteryVoltageMv()
             mv = (raw * max_voltage_mv) / max_raw;
         }
 
-        sum_mv += mv * 2;
+        sum_raw += raw;
+        sum_mv += mv;
         ++valid_samples;
 
         vTaskDelay(pdMS_TO_TICKS(1));
     }
 
     if (valid_samples == 0) {
-        return 0;
+        return false;
     }
 
-    return static_cast<uint16_t>(sum_mv / valid_samples);
+    snapshot->adc_raw = sum_raw / valid_samples;
+    snapshot->adc_mv = sum_mv / valid_samples;
+    snapshot->battery_mv = snapshot->adc_mv * 2;
+    const int64_t mv = snapshot->battery_mv;
+    const int64_t percent = (-mv * mv + 9016LL * mv - 19189000LL) / 10000LL;
+    snapshot->battery_percent = std::clamp(static_cast<int>(percent), 0, 100);
+    snapshot->valid = snapshot->battery_mv > 0;
+    return snapshot->valid;
+}
+
+uint16_t GetBatteryVoltageMv()
+{
+    PowerStatusSnapshot snapshot;
+    return ReadPowerStatus(&snapshot)
+        ? static_cast<uint16_t>(snapshot.battery_mv)
+        : 0;
 }
 
 int GetBatteryPercent()
 {
-    const uint16_t mv = GetBatteryVoltageMv();
-    if (mv == 0) {
-        return 0;
-    }
-
-    const int64_t mv_sq = static_cast<int64_t>(mv) * static_cast<int64_t>(mv);
-    const int64_t raw = (-mv_sq + 9016LL * mv - 19189000LL) / 10000LL;
-
-    int percent = static_cast<int>(raw);
-    percent = std::max(0, percent);
-    percent = std::min(100, percent);
-
-    return percent;
+    PowerStatusSnapshot snapshot;
+    return ReadPowerStatus(&snapshot) ? snapshot.battery_percent : 0;
 }
 
 bool IsCharging()
@@ -374,7 +343,16 @@ bool IsCharging()
 
 bool IsUsbPowered()
 {
-    return IsCharging() || IsFullyCharged();
+    return IsUsbHostConnected() || IsCharging() || IsFullyCharged();
+}
+
+bool IsUsbHostConnected()
+{
+    // ESP-IDF's connection monitor samples USB SOF packets from the host.
+    // CHRG_L and /STDBY describe charger state, not whether a PC is attached;
+    // both may be high on a physically connected Note4, which previously let
+    // the 60-second deep-sleep policy tear down native USB and reset Flash.
+    return usb_serial_jtag_is_connected();
 }
 
 // kChargeFull (GPIO1) is the /STDBY pin of the charge IC (e.g. TP4056).
@@ -388,9 +366,10 @@ bool IsFullyCharged()
 
 void RefreshUsbPowerSleepPolicy()
 {
+    const bool host_connected = IsUsbHostConnected();
     const bool charging = IsCharging();
     const bool full = IsFullyCharged();
-    const bool usb_powered = charging || full;
+    const bool usb_powered = host_connected || charging || full;
 
     if (usb_powered && !g_usb_power_lease) {
         runtime::SleepLease lease = runtime::SleepLease::TryAcquire(
@@ -401,7 +380,8 @@ void RefreshUsbPowerSleepPolicy()
         if (!lease) {
             ESP_LOGW(
                 kTag,
-                "USB power detected but sleep lease acquisition was denied: charging=%d full=%d",
+                "USB/charger detected but sleep lease acquisition was denied: host=%d charging=%d full=%d",
+                host_connected ? 1 : 0,
                 charging ? 1 : 0,
                 full ? 1 : 0);
             return;
@@ -409,14 +389,17 @@ void RefreshUsbPowerSleepPolicy()
         g_usb_power_lease = std::move(lease);
         ESP_LOGI(
             kTag,
-            "USB power detected: charging=%d full=%d; light/deep sleep blocked",
+            "USB/charger detected: host=%d charging=%d full=%d; light/deep sleep blocked",
+            host_connected ? 1 : 0,
             charging ? 1 : 0,
             full ? 1 : 0);
     } else if (!usb_powered && g_usb_power_lease) {
         g_usb_power_lease.Reset();
-        ESP_LOGI(kTag, "USB power removed; light/deep sleep policy restored");
+        ESP_LOGI(kTag, "USB/charger removed; light/deep sleep policy restored");
     } else if (!g_usb_power_policy_sampled && !usb_powered) {
-        ESP_LOGI(kTag, "USB power not detected; normal sleep policy active");
+        ESP_LOGI(
+            kTag,
+            "USB/charger not detected: host=0 charging=0 full=0; normal sleep policy active");
     }
     g_usb_power_policy_sampled = true;
 }
@@ -497,7 +480,7 @@ static power::PrepareSleepResults BroadcastPrepareSleep(const power::PrepareSlee
 
     error = deadline_result();
     if (error == ESP_OK) {
-        error = PrepareAudioForSleep(command);
+        error = services::PrepareAudioServiceForSleep(command);
     }
     results[static_cast<size_t>(power::SleepService::kAudio)] =
         MakePrepareResult(command, power::SleepService::kAudio, error);
@@ -553,7 +536,7 @@ static void RollbackSleepPreparation(uint32_t generation, const char* reason)
     // its lease as part of the synchronous rollback.
     runtime::CancelSleepQuiesce(generation);
     services::RollbackConnectivityAfterSleepAbort();
-    RollbackAudioAfterSleepAbort(generation);
+    services::RollbackAudioServiceAfterSleepAbort(generation);
     RollbackStorageAfterSleepAbort();
     RollbackDisplayAfterSleepAbort();
     RollbackBoardPowerState();
@@ -649,8 +632,7 @@ static void EnterDeepSleepIfEnabled(bool enable_timer_wakeup)
         return;
     }
     if (esp_timer_get_time() < g_sleep_retry_not_before_us ||
-        !HasUsableStoredToken() || !IsUiIdleForSleep() ||
-        HasUnregisteredRuntimeActivity() || IsEpdBusy()) {
+        !services::HasUsableStoredToken() || !IsUiIdleForSleep()) {
         return;
     }
 
@@ -743,25 +725,6 @@ void ShutdownForBatteryDepleted()
     }
     if (g_power_coordinator_task != nullptr) {
         xTaskNotifyGive(g_power_coordinator_task);
-    }
-}
-
-void PowerOffEpdAfterIdleIfNeeded()
-{
-    const int idle_ms = CONFIG_WQN_EPD_IDLE_POWER_OFF_MS;
-    if (idle_ms <= 0 || g_epd_idle_cut || g_last_epd_activity_ms == 0) {
-        return;
-    }
-    if ((NowMs() - g_last_epd_activity_ms) < idle_ms) {
-        return;
-    }
-
-    const esp_err_t result = TryPowerOffEpd(0);
-    if (result == ESP_OK) {
-        ESP_LOGI(kTag, "EPD idle power-off after %d ms", idle_ms);
-        g_epd_idle_cut = true;
-    } else if (result != ESP_ERR_TIMEOUT) {
-        ESP_LOGW(kTag, "EPD idle power-off failed: %s", esp_err_to_name(result));
     }
 }
 

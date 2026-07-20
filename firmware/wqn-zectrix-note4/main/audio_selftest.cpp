@@ -1,6 +1,6 @@
 #include "audio_selftest.h"
 
-#if CONFIG_WQN_AUDIO_SELFTEST_ENABLE
+#if CONFIG_WQN_AI_AUDIO_SELFTEST_ENABLE
 
 #include <algorithm>
 #include <cstdint>
@@ -442,4 +442,4 @@ esp_err_t RunAudioSelfTestIfEnabled()
 
 }  // namespace wqn
 
-#endif  // CONFIG_WQN_AUDIO_SELFTEST_ENABLE
+#endif  // CONFIG_WQN_AI_AUDIO_SELFTEST_ENABLE

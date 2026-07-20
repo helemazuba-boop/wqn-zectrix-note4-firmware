@@ -5,9 +5,8 @@
 
 #include <algorithm>
 
-#include "epd_display.h"
+#include "display_service.h"
 #include "esp_log.h"
-#include "font_zectrix.h"
 
 namespace device_ui_internal {
 
@@ -54,9 +53,8 @@ void DrawConfigBox(int x, int y, int width, int height, const std::string& value
         DrawRect(x, y, width, height);
     }
     const bool black_text = !selected;
-    // Value rendered with the 16px artistic digit font; label stays CJK.
-    const std::string zvalue = ZectrixArtText(value);
-    wqn::DrawTextWithFontCentered(x, y + 7, width, &font_zectrix_16_1, zvalue.c_str(), black_text);
+    // Value rendered from the shared 1bpp 16px digit assets; label stays CJK.
+    DrawConfigDigitsCentered(x, y + 7, width, value, black_text);
     DrawCenteredText(x, y + height - 20, width, label, black_text);
 }
 
@@ -90,9 +88,9 @@ esp_err_t RenderCountdownConfigToEpd(const wqn::TimeAppState& time_app)
     ESP_RETURN_ON_ERROR(DrawCenteredText(0, 83, wqn::kEpdWidth, "倒计时设置"), kTag, "draw countdown config title");
     const int y = 116;
     DrawConfigBox(102, y, 56, 62, TwoDigit(time_app.countdown_hours), "时", time_app.active_field == 0);
-    ESP_RETURN_ON_ERROR(wqn::DrawUtf8Text(166, y + 22, ":", true), kTag, "draw countdown colon 1");
+    DrawConfigDigitsCentered(164, y + 22, 10, ":", true);
     DrawConfigBox(178, y, 56, 62, TwoDigit(time_app.countdown_minutes), "分", time_app.active_field == 1);
-    ESP_RETURN_ON_ERROR(wqn::DrawUtf8Text(242, y + 22, ":", true), kTag, "draw countdown colon 2");
+    DrawConfigDigitsCentered(240, y + 22, 10, ":", true);
     DrawConfigBox(254, y, 56, 62, TwoDigit(time_app.countdown_seconds), "秒", time_app.active_field == 2);
     DrawActionBox(130, 205, 68, "开始", time_app.active_field == CountdownStartField());
     DrawActionBox(212, 205, 68, "退出", time_app.active_field == CountdownStartField() + 1);

@@ -1,11 +1,22 @@
 #pragma once
 
+#include <cstddef>
 #include <string>
 #include <vector>
 
 #include "esp_err.h"
 
 namespace wqn {
+
+struct StorageCapacitySnapshot {
+    bool spiffs_valid = false;
+    size_t spiffs_total_bytes = 0;
+    size_t spiffs_used_bytes = 0;
+    bool nvs_valid = false;
+    size_t nvs_used_entries = 0;
+    size_t nvs_free_entries = 0;
+    size_t nvs_total_entries = 0;
+};
 
 struct CachedProblem {
     std::string id;
@@ -43,6 +54,7 @@ struct DeviceControlState {
 };
 
 esp_err_t InitStorage();
+bool ReadStorageCapacitySnapshot(StorageCapacitySnapshot* snapshot);
 esp_err_t LoadAccessToken(std::string* token);
 esp_err_t SaveAccessToken(const std::string& token);
 esp_err_t ClearAccessToken();
@@ -77,8 +89,8 @@ esp_err_t SaveWifiCredentials(const std::string& ssid, const std::string& passwo
 esp_err_t ClearWifiCredentials();
 bool HasWifiCredentials();
 
-// M3 compatibility boundary. Writes are synchronous and each public write
-// transaction holds kStorage, so Ready means every accepted commit is durable.
+// PowerCoordinator boundary. Writes are serialized by StorageService and each
+// accepted transaction holds kStorage, so Ready means every commit is durable.
 esp_err_t PrepareStorageForSleep(int64_t deadline_us);
 void RollbackStorageAfterSleepAbort();
 

@@ -12,7 +12,7 @@
 #include "esp_timer.h"
 #include "nvs.h"
 #include "nvs_flash.h"
-#include "online_sync.h"
+#include "services/sync_service.h"
 #include "runtime/sleep_coordinator.h"
 #include "runtime/storage_schema.h"
 #include "services/storage_service.h"
@@ -458,6 +458,29 @@ esp_err_t InitStorage()
     return services::StartStorageService();
 }
 
+bool ReadStorageCapacitySnapshot(StorageCapacitySnapshot* snapshot)
+{
+    if (snapshot == nullptr) {
+        return false;
+    }
+    *snapshot = {};
+
+    snapshot->spiffs_valid =
+        esp_spiffs_info(
+            kStoragePartitionLabel,
+            &snapshot->spiffs_total_bytes,
+            &snapshot->spiffs_used_bytes) == ESP_OK;
+
+    nvs_stats_t stats = {};
+    snapshot->nvs_valid = nvs_get_stats(nullptr, &stats) == ESP_OK;
+    if (snapshot->nvs_valid) {
+        snapshot->nvs_used_entries = stats.used_entries;
+        snapshot->nvs_free_entries = stats.free_entries;
+        snapshot->nvs_total_entries = stats.total_entries;
+    }
+    return snapshot->spiffs_valid || snapshot->nvs_valid;
+}
+
 esp_err_t LoadAccessToken(std::string* token)
 {
     return LoadStringFromNvs(WQN_NVS_ACCESS_TOKEN_KEY, token);
@@ -483,7 +506,7 @@ esp_err_t SaveAccessToken(const std::string& token)
     // the device is unpaired. Waking it here lets it run the first real
     // sync round immediately after pairing instead of waiting for the
     // next user action or scheduled interval.
-    RequestOnlineSyncNow();
+    services::RequestSyncNow();
     return result;
 }
 
@@ -495,10 +518,10 @@ esp_err_t ClearAccessToken()
     }
     // [power-fix] If clearing the token was triggered by some external
     // event (e.g. the server returning 401 during sync), we want the
-    // online task to re-evaluate its delay immediately rather than stay
+    // SyncService to re-evaluate its delay immediately rather than stay
     // parked on whatever value it was using.
     const esp_err_t result = ClearAccessTokenKeys();
-    wqn::RequestOnlineSyncNow();
+    wqn::services::RequestSyncNow();
     return result;
 }
 

@@ -6,7 +6,7 @@
 #include <string>
 #include <vector>
 
-#include "epd_display.h"
+#include "display_service.h"
 #include "esp_log.h"
 #include "esp_rom_sys.h"
 

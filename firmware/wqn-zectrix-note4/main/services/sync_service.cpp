@@ -1,9 +1,11 @@
-#include "online_sync.h"
+#include "services/sync_service.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <array>
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <utility>
 #include <vector>
@@ -20,7 +22,6 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "runtime/sleep_coordinator.h"
-#include "services/sync_service.h"
 #include "storage.h"
 #include "wqn_api.h"
 
@@ -29,11 +30,11 @@ namespace {
 constexpr char kTag[] = "sync_service";
 
 #if CONFIG_WQN_WIFI_STA_ENABLE
-wqn::OnlineSyncSnapshot g_online_sync_snapshot = {};
-portMUX_TYPE g_online_sync_snapshot_lock = portMUX_INITIALIZER_UNLOCKED;
+wqn::services::SyncSnapshot g_sync_snapshot = {};
+portMUX_TYPE g_sync_snapshot_lock = portMUX_INITIALIZER_UNLOCKED;
 std::atomic<wqn::services::SyncEventSink> g_sync_event_sink{nullptr};
 uint32_t g_sync_event_sequence = 1;
-constexpr TickType_t kOnlineSyncRetryDelay = pdMS_TO_TICKS(10000);
+constexpr TickType_t kSyncRetryDelay = pdMS_TO_TICKS(10000);
 bool LoadUsableToken(std::string* token);
 #endif
 
@@ -43,13 +44,52 @@ uint64_t g_sync_cursor = 0;
 bool g_bootstrap_complete = false;
 bool g_control_state_loaded = false;
 uint32_t g_control_retry_after_ms = 0;
+constexpr uint32_t kClaimPollFloorMs = 10000;
+constexpr uint32_t kClaimPollJitterMaxMs = 2000;
+constexpr uint32_t kClaimRetryBaseMs = 15000;
+constexpr uint32_t kClaimRetryMaxMs = 5 * 60 * 1000;
+constexpr uint8_t kClaimRetryMaxShift = 4;
 std::string g_bootstrap_request_id;
 std::string g_sync_request_id;
 wqn::protocol::v3::ClaimKeyPair g_claim_key_pair;
 std::string g_claim_start_request_id;
 std::string g_claim_id;
-uint32_t g_claim_poll_interval_ms = 3000;
+uint32_t g_claim_poll_interval_ms = kClaimPollFloorMs;
+uint8_t g_claim_retry_attempts = 0;
 bool g_claim_active = false;
+
+uint32_t AddClaimJitter(uint32_t base_ms)
+{
+    const uint32_t jitter = esp_random() % (kClaimPollJitterMaxMs + 1);
+    return base_ms > std::numeric_limits<uint32_t>::max() - jitter
+        ? std::numeric_limits<uint32_t>::max()
+        : base_ms + jitter;
+}
+
+uint32_t ClaimPollDelayMs()
+{
+    return AddClaimJitter(
+        std::max(g_claim_poll_interval_ms, kClaimPollFloorMs));
+}
+
+uint32_t NextClaimRetryDelayMs(uint32_t server_retry_after_ms)
+{
+    const uint8_t shift =
+        std::min(g_claim_retry_attempts, kClaimRetryMaxShift);
+    const uint32_t local_backoff_ms = std::min(
+        kClaimRetryBaseMs << shift,
+        kClaimRetryMaxMs);
+    if (g_claim_retry_attempts < std::numeric_limits<uint8_t>::max()) {
+        ++g_claim_retry_attempts;
+    }
+    return AddClaimJitter(
+        std::max(server_retry_after_ms, local_backoff_ms));
+}
+
+void ResetClaimRetryBackoff()
+{
+    g_claim_retry_attempts = 0;
+}
 
 esp_err_t EnsureControlStateLoaded()
 {
@@ -122,14 +162,14 @@ std::string DeviceHardwareId()
 
 void PublishClaimCode(const wqn::protocol::v3::ClaimStartData& claim)
 {
-    taskENTER_CRITICAL(&g_online_sync_snapshot_lock);
+    taskENTER_CRITICAL(&g_sync_snapshot_lock);
     std::snprintf(
-        g_online_sync_snapshot.claim_code,
-        sizeof(g_online_sync_snapshot.claim_code),
+        g_sync_snapshot.claim_code,
+        sizeof(g_sync_snapshot.claim_code),
         "%s",
         claim.display_code.c_str());
-    g_online_sync_snapshot.claim_expires_at_ms = claim.expires_at_ms;
-    taskEXIT_CRITICAL(&g_online_sync_snapshot_lock);
+    g_sync_snapshot.claim_expires_at_ms = claim.expires_at_ms;
+    taskEXIT_CRITICAL(&g_sync_snapshot_lock);
 }
 
 void ResetClaimSession()
@@ -137,12 +177,13 @@ void ResetClaimSession()
     g_claim_key_pair.Clear();
     g_claim_start_request_id.clear();
     g_claim_id.clear();
-    g_claim_poll_interval_ms = 3000;
+    g_claim_poll_interval_ms = kClaimPollFloorMs;
+    ResetClaimRetryBackoff();
     g_claim_active = false;
-    taskENTER_CRITICAL(&g_online_sync_snapshot_lock);
-    g_online_sync_snapshot.claim_code[0] = '\0';
-    g_online_sync_snapshot.claim_expires_at_ms = 0;
-    taskEXIT_CRITICAL(&g_online_sync_snapshot_lock);
+    taskENTER_CRITICAL(&g_sync_snapshot_lock);
+    g_sync_snapshot.claim_code[0] = '\0';
+    g_sync_snapshot.claim_expires_at_ms = 0;
+    taskEXIT_CRITICAL(&g_sync_snapshot_lock);
 }
 
 esp_err_t StartClaimSession()
@@ -170,9 +211,13 @@ esp_err_t StartClaimSession()
         &claim,
         &error);
     if (result != ESP_OK) {
-        if (error.retryable) {
-            g_control_retry_after_ms = error.retry_after_ms;
-        }
+        g_control_retry_after_ms = NextClaimRetryDelayMs(
+            error.retryable ? error.retry_after_ms : 0);
+        ESP_LOGW(
+            kTag,
+            "v3 claim start retry scheduled: delay_ms=%u code=%s",
+            static_cast<unsigned>(g_control_retry_after_ms),
+            error.code.empty() ? "TRANSPORT" : error.code.c_str());
         if (!error.retryable && error.code == "REQUEST_ID_REUSED") {
             ESP_LOGW(kTag, "expired claim/start id rejected; rotating ephemeral claim session");
             ResetClaimSession();
@@ -180,16 +225,19 @@ esp_err_t StartClaimSession()
         return result;
     }
     g_control_retry_after_ms = 0;
+    ResetClaimRetryBackoff();
 
     g_claim_id = claim.claim_id;
-    g_claim_poll_interval_ms = claim.poll_interval_ms;
+    g_claim_poll_interval_ms =
+        std::max(claim.poll_interval_ms, kClaimPollFloorMs);
     g_claim_active = true;
     PublishClaimCode(claim);
     ESP_LOGI(
         kTag,
-        "v3 claim started: expires_at_ms=%llu poll_interval_ms=%u",
+        "v3 claim started: expires_at_ms=%llu server_poll_ms=%u effective_poll_ms=%u",
         static_cast<unsigned long long>(claim.expires_at_ms),
-        static_cast<unsigned>(claim.poll_interval_ms));
+        static_cast<unsigned>(claim.poll_interval_ms),
+        static_cast<unsigned>(g_claim_poll_interval_ms));
     return ESP_ERR_NOT_FINISHED;
 }
 
@@ -201,9 +249,13 @@ esp_err_t PollClaimSession()
     const esp_err_t result =
         wqn::PollDeviceClaimV3(metadata, g_claim_id, &poll, &error);
     if (result != ESP_OK) {
-        if (error.retryable) {
-            g_control_retry_after_ms = error.retry_after_ms;
-        }
+        g_control_retry_after_ms = NextClaimRetryDelayMs(
+            error.retryable ? error.retry_after_ms : 0);
+        ESP_LOGW(
+            kTag,
+            "v3 claim poll retry scheduled: delay_ms=%u code=%s",
+            static_cast<unsigned>(g_control_retry_after_ms),
+            error.code.empty() ? "TRANSPORT" : error.code.c_str());
         if (!error.retryable &&
             (error.code == "CLAIM_NOT_FOUND" || error.code == "CLAIM_CONSUMED")) {
             ResetClaimSession();
@@ -211,9 +263,11 @@ esp_err_t PollClaimSession()
         return result;
     }
     g_control_retry_after_ms = 0;
+    ResetClaimRetryBackoff();
     if (poll.status == wqn::protocol::v3::ClaimStatus::kPending) {
         if (poll.poll_interval_ms >= 1000 && poll.poll_interval_ms <= 30000) {
-            g_claim_poll_interval_ms = poll.poll_interval_ms;
+            g_claim_poll_interval_ms =
+                std::max(poll.poll_interval_ms, kClaimPollFloorMs);
         }
         return ESP_ERR_NOT_FINISHED;
     }
@@ -262,38 +316,38 @@ esp_err_t RunDeviceClaimRoundV3()
 
 #if CONFIG_WQN_WIFI_STA_ENABLE
 
-void SetOnlineSyncStatus(const char* status)
+void SetSyncStatus(const char* status)
 {
-    taskENTER_CRITICAL(&g_online_sync_snapshot_lock);
-    std::snprintf(g_online_sync_snapshot.status, sizeof(g_online_sync_snapshot.status), "%s", status == nullptr ? "" : status);
-    taskEXIT_CRITICAL(&g_online_sync_snapshot_lock);
+    taskENTER_CRITICAL(&g_sync_snapshot_lock);
+    std::snprintf(g_sync_snapshot.status, sizeof(g_sync_snapshot.status), "%s", status == nullptr ? "" : status);
+    taskEXIT_CRITICAL(&g_sync_snapshot_lock);
 }
 
-void SetOnlineSyncTaskRunning()
+void SetSyncTaskRunning()
 {
-    taskENTER_CRITICAL(&g_online_sync_snapshot_lock);
-    g_online_sync_snapshot.task_running = true;
-    taskEXIT_CRITICAL(&g_online_sync_snapshot_lock);
+    taskENTER_CRITICAL(&g_sync_snapshot_lock);
+    g_sync_snapshot.task_running = true;
+    taskEXIT_CRITICAL(&g_sync_snapshot_lock);
 }
 
-void SetOnlineSyncRoundStarted(int64_t started_ms)
+void SetSyncRoundStarted(int64_t started_ms)
 {
-    taskENTER_CRITICAL(&g_online_sync_snapshot_lock);
-    g_online_sync_snapshot.last_started_ms = started_ms;
-    taskEXIT_CRITICAL(&g_online_sync_snapshot_lock);
+    taskENTER_CRITICAL(&g_sync_snapshot_lock);
+    g_sync_snapshot.last_started_ms = started_ms;
+    taskEXIT_CRITICAL(&g_sync_snapshot_lock);
 }
 
-void CompleteOnlineSyncRound(int64_t finished_ms, bool synced)
+void CompleteSyncRound(int64_t finished_ms, bool synced)
 {
-    taskENTER_CRITICAL(&g_online_sync_snapshot_lock);
-    g_online_sync_snapshot.last_finished_ms = finished_ms;
-    g_online_sync_snapshot.last_round_success = synced;
+    taskENTER_CRITICAL(&g_sync_snapshot_lock);
+    g_sync_snapshot.last_finished_ms = finished_ms;
+    g_sync_snapshot.last_round_success = synced;
     if (synced) {
-        ++g_online_sync_snapshot.success_count;
+        ++g_sync_snapshot.success_count;
     } else {
-        ++g_online_sync_snapshot.failure_count;
+        ++g_sync_snapshot.failure_count;
     }
-    taskEXIT_CRITICAL(&g_online_sync_snapshot_lock);
+    taskEXIT_CRITICAL(&g_sync_snapshot_lock);
 }
 
 void PublishSyncEvent(
@@ -307,14 +361,14 @@ void PublishSyncEvent(
         event.sequence = g_sync_event_sequence++;
     }
     event.finished_ms = finished_ms;
-    taskENTER_CRITICAL(&g_online_sync_snapshot_lock);
+    taskENTER_CRITICAL(&g_sync_snapshot_lock);
     std::snprintf(
         event.claim_code,
         sizeof(event.claim_code),
         "%s",
-        g_online_sync_snapshot.claim_code);
-    event.claim_expires_at_ms = g_online_sync_snapshot.claim_expires_at_ms;
-    taskEXIT_CRITICAL(&g_online_sync_snapshot_lock);
+        g_sync_snapshot.claim_code);
+    event.claim_expires_at_ms = g_sync_snapshot.claim_expires_at_ms;
+    taskEXIT_CRITICAL(&g_sync_snapshot_lock);
 
     const wqn::services::SyncEventSink sink =
         g_sync_event_sink.load(std::memory_order_acquire);
@@ -641,7 +695,7 @@ esp_err_t SyncDueProblemsAndCacheV3(const std::string& token)
 }
 #endif
 
-bool RunWqnOnlineRound()
+bool RunSyncRound()
 {
 #if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
     esp_err_t result = EnsureControlStateLoaded();
@@ -715,7 +769,7 @@ bool RunWqnOnlineRound()
     return true;
 }
 
-TickType_t NextOnlineSyncWaitDelay(bool round_synced, bool has_token_after_round)
+TickType_t NextSyncWaitDelay(bool round_synced, bool has_token_after_round)
 {
 #if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
     if (g_control_retry_after_ms > 0) {
@@ -726,7 +780,9 @@ TickType_t NextOnlineSyncWaitDelay(bool round_synced, bool has_token_after_round
 #endif
     if (!has_token_after_round) {
 #if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
-        const uint32_t wait_ms = g_claim_active ? g_claim_poll_interval_ms : 5000;
+        const uint32_t wait_ms = g_claim_active
+            ? ClaimPollDelayMs()
+            : AddClaimJitter(kClaimRetryBaseMs);
         return pdMS_TO_TICKS(wait_ms);
 #else
         // [power-fix] Once the device has lost (or never had) an access
@@ -739,47 +795,47 @@ TickType_t NextOnlineSyncWaitDelay(bool round_synced, bool has_token_after_round
 #endif
     }
     if (round_synced) {
-        return wqn::GetConfiguredOnlineSyncDelayTicks();
+        return wqn::services::GetConfiguredSyncDelayTicks();
     }
 
-    const TickType_t configured_delay = wqn::GetConfiguredOnlineSyncDelayTicks();
-    return configured_delay == portMAX_DELAY ? portMAX_DELAY : kOnlineSyncRetryDelay;
+    const TickType_t configured_delay = wqn::services::GetConfiguredSyncDelayTicks();
+    return configured_delay == portMAX_DELAY ? portMAX_DELAY : kSyncRetryDelay;
 }
 
-void WqnOnlineTask(void*)
+void SyncServiceTask(void*)
 {
-    ESP_LOGI(kTag, "WQN online task started");
-    SetOnlineSyncTaskRunning();
-    SetOnlineSyncStatus("idle");
+    ESP_LOGI(kTag, "SyncService task started");
+    SetSyncTaskRunning();
+    SetSyncStatus("idle");
     bool first_round = true;
     while (true) {
-        if (first_round && wqn::GetConfiguredOnlineSyncDelayTicks() == portMAX_DELAY && wqn::HasUsableStoredToken()) {
+        if (first_round && wqn::services::GetConfiguredSyncDelayTicks() == portMAX_DELAY && wqn::services::HasUsableStoredToken()) {
             ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
         }
         first_round = false;
 
         wqn::runtime::SleepLease sleep_lease =
             wqn::runtime::SleepLease::TryAcquire(
-                wqn::runtime::SleepBlocker::kOnlineSync, "online-sync", __FILE__, __LINE__);
+                wqn::runtime::SleepBlocker::kOnlineSync, "sync-service", __FILE__, __LINE__);
         if (!sleep_lease) {
-            SetOnlineSyncStatus("sleep-quiescing");
+            SetSyncStatus("sleep-quiescing");
             ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000));
             continue;
         }
 
-        SetOnlineSyncRoundStarted(esp_timer_get_time() / 1000);
-        SetOnlineSyncStatus("syncing");
-        const bool synced = RunWqnOnlineRound();
+        SetSyncRoundStarted(esp_timer_get_time() / 1000);
+        SetSyncStatus("syncing");
+        const bool synced = RunSyncRound();
         const int64_t finished_ms = esp_timer_get_time() / 1000;
-        CompleteOnlineSyncRound(finished_ms, synced);
-        const bool has_token_after_round = wqn::HasUsableStoredToken();
+        CompleteSyncRound(finished_ms, synced);
+        const bool has_token_after_round = wqn::services::HasUsableStoredToken();
         if (synced) {
-            SetOnlineSyncStatus("success");
+            SetSyncStatus("success");
             PublishSyncEvent(
                 wqn::services::SyncEventStatus::kSucceeded,
                 finished_ms);
         } else {
-            SetOnlineSyncStatus(has_token_after_round ? "failed" : "waiting-pair");
+            SetSyncStatus(has_token_after_round ? "failed" : "waiting-pair");
             PublishSyncEvent(
                 has_token_after_round
                     ? wqn::services::SyncEventStatus::kFailed
@@ -787,7 +843,7 @@ void WqnOnlineTask(void*)
                 finished_ms);
         }
         sleep_lease.Reset();
-        const TickType_t delay = NextOnlineSyncWaitDelay(synced, has_token_after_round);
+        const TickType_t delay = NextSyncWaitDelay(synced, has_token_after_round);
         if (delay == portMAX_DELAY) {
             ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
         } else {
@@ -800,7 +856,7 @@ void WqnOnlineTask(void*)
 
 }  // namespace
 
-namespace wqn {
+namespace wqn::services {
 
 bool HasUsableStoredToken()
 {
@@ -810,13 +866,19 @@ bool HasUsableStoredToken()
 
 #if CONFIG_WQN_WIFI_STA_ENABLE
 
-TaskHandle_t g_wqn_online_task = nullptr;
+TaskHandle_t g_sync_service_task = nullptr;
 
-esp_err_t StartWqnOnlineTask()
+esp_err_t StartSyncService()
 {
-    const BaseType_t created = xTaskCreate(WqnOnlineTask, "wqn_online", 12288, nullptr, 5, &g_wqn_online_task);
+    const BaseType_t created = xTaskCreate(
+        SyncServiceTask,
+        "sync_service",
+        12288,
+        nullptr,
+        5,
+        &g_sync_service_task);
     if (created != pdPASS) {
-        g_wqn_online_task = nullptr;
+        g_sync_service_task = nullptr;
         return ESP_ERR_NO_MEM;
     }
     return ESP_OK;
@@ -824,29 +886,24 @@ esp_err_t StartWqnOnlineTask()
 
 #endif  // CONFIG_WQN_WIFI_STA_ENABLE
 
-void NotifyOnlineSyncRequested()
-{
-    RequestOnlineSyncNow();
-}
-
-void RequestOnlineSyncNow()
+void RequestSyncNow()
 {
 #if CONFIG_WQN_WIFI_STA_ENABLE
-    if (g_wqn_online_task != nullptr) {
-        xTaskNotifyGive(g_wqn_online_task);
+    if (g_sync_service_task != nullptr) {
+        xTaskNotifyGive(g_sync_service_task);
     }
 #endif
 }
 
-void GetOnlineSyncSnapshot(OnlineSyncSnapshot* snapshot)
+void GetSyncSnapshot(SyncSnapshot* snapshot)
 {
     if (snapshot == nullptr) {
         return;
     }
 #if CONFIG_WQN_WIFI_STA_ENABLE
-    taskENTER_CRITICAL(&g_online_sync_snapshot_lock);
-    *snapshot = g_online_sync_snapshot;
-    taskEXIT_CRITICAL(&g_online_sync_snapshot_lock);
+    taskENTER_CRITICAL(&g_sync_snapshot_lock);
+    *snapshot = g_sync_snapshot;
+    taskEXIT_CRITICAL(&g_sync_snapshot_lock);
 #else
     *snapshot = {};
     std::snprintf(snapshot->status, sizeof(snapshot->status), "%s", "wifi-disabled");
@@ -857,7 +914,7 @@ void GetOnlineSyncSnapshot(OnlineSyncSnapshot* snapshot)
     }
 }
 
-TickType_t GetConfiguredOnlineSyncDelayTicks()
+TickType_t GetConfiguredSyncDelayTicks()
 {
     uint32_t minutes = 0;
     if (LoadAutoSyncIntervalMinutes(&minutes) != ESP_OK || minutes == 0) {
@@ -868,7 +925,7 @@ TickType_t GetConfiguredOnlineSyncDelayTicks()
     return ticks > static_cast<uint64_t>(portMAX_DELAY - 1) ? portMAX_DELAY - 1 : static_cast<TickType_t>(ticks);
 }
 
-}  // namespace wqn
+}  // namespace wqn::services
 
 namespace wqn::services {
 

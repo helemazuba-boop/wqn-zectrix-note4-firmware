@@ -53,7 +53,7 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
             if (result == ESP_OK) {
                 state->settings.auto_sync_interval_min = minutes;
                 state->settings.notice = "自动同步已保存：" + wqn::AutoSyncIntervalLabel(minutes);
-                wqn::RequestOnlineSyncNow();
+                wqn::services::RequestSyncNow();
             } else {
                 state->settings.notice = "自动同步保存失败";
                 ESP_LOGW(kTag, "save auto sync interval failed: %s", esp_err_to_name(result));
@@ -163,7 +163,7 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
 
     switch (state->settings.selected) {
         case 0:
-            wqn::RequestOnlineSyncNow();
+            wqn::services::RequestSyncNow();
             state->settings.sync_status = "已请求同步";
             state->settings.notice = "已请求同步";
             return RefreshSchedule::kConfig;

@@ -6,7 +6,7 @@
 #include <algorithm>
 #include <string>
 
-#include "epd_display.h"
+#include "display_service.h"
 #include "esp_log.h"
 
 namespace device_ui_internal {
@@ -175,8 +175,12 @@ esp_err_t RenderSettingsToEpd(const wqn::UiFrame& frame, RefreshSchedule schedul
     if (!partial_settings) {
         DrawHorizontalLine(0, 27, wqn::kEpdWidth);
         std::string title = "设置";
-        if (!diag.mac_label.empty()) {
-            title += " (MAC: " + diag.mac_label + ")";
+        if (!frame.claim_code.empty()) {
+            title += " (授权码: " + frame.claim_code + ")";
+        } else if (frame.paired) {
+            title += " (已配对)";
+        } else {
+            title += " (授权码获取中)";
         }
         ESP_RETURN_ON_ERROR(DrawClippedText(10, 6, 250, title), kTag, "draw settings title");
         // Right-edge icon cluster (wifi + battery); time right-aligned to its left.

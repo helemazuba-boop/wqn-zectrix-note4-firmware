@@ -1218,16 +1218,6 @@ void RollbackAudioServiceAfterSleepAbort(uint32_t generation)
     }
 }
 
-void ReleaseAudioServiceDeepSleepHolds()
-{
-    // Called from Note4 bootstrap before the service task exists. Keeping this
-    // low-level operation here preserves AudioService as the runtime owner.
-    gpio_hold_dis(kCodecPower);
-    gpio_hold_dis(kAmplifierEnable);
-    g_codec_powered.store(true, std::memory_order_release);
-    g_amplifier_enabled.store(false, std::memory_order_release);
-}
-
 AudioSnapshot GetAudioSnapshot()
 {
     AudioSnapshot snapshot;

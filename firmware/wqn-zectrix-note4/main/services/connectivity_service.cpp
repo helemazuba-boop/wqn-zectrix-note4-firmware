@@ -13,7 +13,7 @@
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
-#include "online_sync.h"
+#include "services/sync_service.h"
 #include "provision_manager.h"
 #include "runtime/sleep_coordinator.h"
 #include "wifi_manager.h"
@@ -409,7 +409,7 @@ esp_err_t HandleCommand(const ConnectivityCommand& command)
             g_next_action_us = 0;
             SetOnline(true, wqn::GetWifiRssi());
             SetState(wqn::services::ConnectivityState::kOnline);
-            wqn::RequestOnlineSyncNow();
+            wqn::services::RequestSyncNow();
             return ESP_OK;
         case CommandType::kWifiDisconnected:
             SetOnline(false);

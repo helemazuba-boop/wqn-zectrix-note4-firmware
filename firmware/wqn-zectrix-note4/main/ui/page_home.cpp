@@ -5,7 +5,7 @@
 
 #include <algorithm>
 
-#include "epd_display.h"
+#include "display_service.h"
 #include "esp_log.h"
 
 namespace device_ui_internal {

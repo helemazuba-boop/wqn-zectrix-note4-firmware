@@ -7,13 +7,10 @@
 #include <cstring>
 
 #include "config.h"
-#include "esp_flash.h"
-#include "esp_heap_caps.h"
 #include "esp_log.h"
-#include "esp_mac.h"
-#include "esp_psram.h"
-#include "nvs.h"
-#include "online_sync.h"
+#include "diagnostics.h"
+#include "services/sync_service.h"
+#include "storage.h"
 
 namespace device_ui_internal {
 
@@ -110,50 +107,52 @@ void UpdateSettingsDiagnostics(wqn::UiState* state)
         snapshot.full = battery.full;
     }
 
-    uint32_t flash_size = 0;
-    if (esp_flash_get_size(nullptr, &flash_size) == ESP_OK) {
-        snapshot.flash_size = flash_size;
+    wqn::PlatformDiagnosticsSnapshot platform;
+    if (wqn::ReadPlatformDiagnosticsSnapshot(&platform)) {
+        if (platform.flash_valid) {
+            snapshot.flash_size = platform.flash_size;
+        }
+        if (platform.psram_valid) {
+            snapshot.psram_total = platform.psram_total;
+            snapshot.psram_free = platform.psram_free;
+            snapshot.psram_used =
+                snapshot.psram_total >= snapshot.psram_free
+                    ? snapshot.psram_total - snapshot.psram_free
+                    : 0;
+        } else {
+            snapshot.psram_total = 0;
+            snapshot.psram_free = 0;
+            snapshot.psram_used = 0;
+        }
+        if (platform.wifi_mac_valid) {
+            char buffer[24] = {};
+            std::snprintf(
+                buffer,
+                sizeof(buffer),
+                "%02X:%02X:%02X:%02X:%02X:%02X",
+                platform.wifi_mac[0],
+                platform.wifi_mac[1],
+                platform.wifi_mac[2],
+                platform.wifi_mac[3],
+                platform.wifi_mac[4],
+                platform.wifi_mac[5]);
+            snapshot.mac_label = buffer;
+        }
     }
 
-    nvs_stats_t nvs_stats = {};
-    if (nvs_get_stats(nullptr, &nvs_stats) == ESP_OK) {
-        snapshot.nvs_used_entries = nvs_stats.used_entries;
-        snapshot.nvs_free_entries = nvs_stats.free_entries;
-        snapshot.nvs_total_entries = nvs_stats.total_entries;
-    }
-
-    if (esp_psram_is_initialized()) {
-        snapshot.psram_total = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
-        snapshot.psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
-        snapshot.psram_used = snapshot.psram_total >= snapshot.psram_free ? snapshot.psram_total - snapshot.psram_free : 0;
-    } else {
-        snapshot.psram_total = 0;
-        snapshot.psram_free = 0;
-        snapshot.psram_used = 0;
-    }
-
-    uint8_t mac[6] = {};
-    if (esp_read_mac(mac, ESP_MAC_WIFI_STA) == ESP_OK) {
-        char buffer[24] = {};
-        std::snprintf(
-            buffer,
-            sizeof(buffer),
-            "%02X:%02X:%02X:%02X:%02X:%02X",
-            mac[0],
-            mac[1],
-            mac[2],
-            mac[3],
-            mac[4],
-            mac[5]);
-        snapshot.mac_label = buffer;
+    wqn::StorageCapacitySnapshot storage;
+    if (wqn::ReadStorageCapacitySnapshot(&storage) && storage.nvs_valid) {
+        snapshot.nvs_used_entries = storage.nvs_used_entries;
+        snapshot.nvs_free_entries = storage.nvs_free_entries;
+        snapshot.nvs_total_entries = storage.nvs_total_entries;
     }
 
     snapshot.firmware_version = WQN_FIRMWARE_VERSION;
     snapshot.board_id = WQN_BOARD_ID;
     snapshot.idf_target = CONFIG_IDF_TARGET;
 
-    wqn::OnlineSyncSnapshot online = {};
-    wqn::GetOnlineSyncSnapshot(&online);
+    wqn::services::SyncSnapshot online = {};
+    wqn::services::GetSyncSnapshot(&online);
     if (online.status[0] != '\0') {
         state->settings.sync_status = OnlineSyncStatusLabel(online.status);
     }

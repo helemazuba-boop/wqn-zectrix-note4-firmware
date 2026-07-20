@@ -3,11 +3,11 @@
 // See ESP32DOC/wqn-cloud-relay/docs/13-ui-design-language.md §13.4.1.
 //
 // Pure constants only (no externs), safe to include from any translation unit
-// that already pulls in epd_display.h.
+// that already pulls in display_service.h.
 
 #pragma once
 
-#include "epd_display.h"  // wqn::kEpdWidth / kEpdHeight
+#include "display_service.h"  // wqn::kEpdWidth / kEpdHeight
 
 namespace device_ui_internal {
 

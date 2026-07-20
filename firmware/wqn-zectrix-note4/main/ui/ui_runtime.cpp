@@ -316,11 +316,13 @@ UiUpdate UiRuntime::DispatchSyncResult(const wqn::services::SyncEvent& event)
     const std::string claim_code = event.claim_code;
     const bool paired =
         event.status != wqn::services::SyncEventStatus::kAwaitingClaim;
+    const bool claim_state_changed =
+        state_.status.claim_code != claim_code ||
+        state_.status.paired != paired;
     const bool changed =
         state_.settings.sync_status != status ||
         state_.status.last_sync_status != status ||
-        state_.status.claim_code != claim_code ||
-        state_.status.paired != paired;
+        claim_state_changed;
     state_.settings.sync_status = status;
     state_.status.last_sync_status = status;
     state_.status.claim_code = claim_code;
@@ -336,10 +338,15 @@ UiUpdate UiRuntime::DispatchSyncResult(const wqn::services::SyncEvent& event)
     const bool visible =
         state_.screen == wqn::UiScreen::kSettings ||
         state_.screen == wqn::UiScreen::kHome;
+    const RefreshSchedule refresh =
+        changed && visible
+            ? (state_.screen == wqn::UiScreen::kSettings && claim_state_changed
+                   ? RefreshSchedule::kCommit
+                   : RefreshSchedule::kSelection)
+            : RefreshSchedule::kNone;
     return FinishEvent(
         AppEventKind::kSyncResult,
-        changed && visible ? RefreshSchedule::kSelection
-                           : RefreshSchedule::kNone,
+        refresh,
         changed);
 }
 

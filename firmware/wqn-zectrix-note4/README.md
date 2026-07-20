@@ -105,7 +105,7 @@ Configure features through `idf.py menuconfig` under `WQN firmware`:
 - `CONFIG_WQN_DEEP_SLEEP_ENABLE`: optional experimental deep sleep path.
 - `CONFIG_WQN_AI_ENABLE`: enables AI firmware modules; provider secrets still
   stay server-side.
-- `CONFIG_WQN_AUDIO_SELFTEST_ENABLE`: captures and logs audio statistics at boot
+- `CONFIG_WQN_AI_AUDIO_SELFTEST_ENABLE`: captures and logs audio statistics at boot
   without uploading audio.
 
 ## Local Flashing
@@ -150,6 +150,12 @@ python -m esptool --chip esp32s3 -p COMx -b 460800 write_flash --flash_mode dio 
 ```
 
 ## Development Notes
+
+Current runtime and release references:
+
+- [Architecture and resource ownership](ARCHITECTURE.md)
+- [Coordinated firmware/cloud release checklist](RELEASE_CHECKLIST.md)
+- [Firmware troubleshooting](TROUBLESHOOTING.md)
 
 - Keep firmware-side changes focused on device behavior, transport contracts,
   power control, local rendering, and local caches.

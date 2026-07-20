@@ -9,8 +9,8 @@
 #include <string>
 
 #include "esp_log.h"
-#include "esp_spiffs.h"
 #include "runtime/sleep_coordinator.h"
+#include "storage.h"
 #include "word_pack.h"
 #include "wqn_api.h"
 
@@ -218,9 +218,12 @@ void WordCloudTask(void*)
                     }
                 }
                 if (total_needed > 0) {
-                    size_t total_bytes = 0, used_bytes = 0;
-                    if (esp_spiffs_info("storage", &total_bytes, &used_bytes) == ESP_OK) {
-                        const size_t available = total_bytes > used_bytes ? total_bytes - used_bytes : 0;
+                    wqn::StorageCapacitySnapshot storage;
+                    if (wqn::ReadStorageCapacitySnapshot(&storage) && storage.spiffs_valid) {
+                        const size_t available =
+                            storage.spiffs_total_bytes > storage.spiffs_used_bytes
+                                ? storage.spiffs_total_bytes - storage.spiffs_used_bytes
+                                : 0;
                         if (available < total_needed) {
                             ESP_LOGW(kTag, "SPIFFS space insufficient: need=%u avail=%u",
                                      static_cast<unsigned>(total_needed), static_cast<unsigned>(available));

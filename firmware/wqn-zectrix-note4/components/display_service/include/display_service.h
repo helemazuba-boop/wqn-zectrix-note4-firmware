@@ -19,11 +19,8 @@ constexpr int kEpdFramebufferSize = kEpdBytesPerRow * kEpdHeight;
 // Initializes the Note4 4.2" EPD backend and allocates the 1bpp framebuffer.
 esp_err_t InitEpdDisplay();
 
-// Framebuffer format is row-major 1bpp, MSB first, where 1 is white and 0 is black.
-uint8_t* GetEpdFramebuffer();
-const uint8_t* GetEpdFramebufferConst();
-size_t GetEpdFramebufferSize();
-
+// Rendering executes on DisplayService's task. The framebuffer remains
+// private to the service; clients receive drawing operations, not a pointer.
 void ClearEpdFramebuffer(bool white = true);
 void DrawEpdPixel(int x, int y, bool black);
 
@@ -43,18 +40,9 @@ std::vector<std::string> WrapUtf8TextToWidth(const std::string& text, int max_wi
 // broad for the panel's hot partial path.
 esp_err_t RefreshEpdFull(bool allow_local_partial = true, bool force_full_refresh = false);
 
-// Powers down only the EPD rail on GPIO6. Board-level GPIO17 is intentionally untouched.
-void PowerOffEpd();
-
-// Attempts the same serialized power-off without cutting the rail while a
-// refresh owns the driver. Returns ESP_ERR_TIMEOUT when the operation is busy.
-esp_err_t TryPowerOffEpd(uint32_t timeout_ms = 0);
 esp_err_t PrepareDisplayForSleep(int64_t deadline_us);
 void RollbackDisplayAfterSleepAbort();
-void ReleaseEpdDeepSleepHolds();
-
-// Returns true if the EPD is currently being initialized or is mid-refresh.
-// Used by the power manager to prevent cutting EPD power during active SPI traffic.
-bool IsEpdBusy();
+void NoteEpdActivity();
+void PowerOffEpdAfterIdleIfNeeded();
 
 }  // namespace wqn

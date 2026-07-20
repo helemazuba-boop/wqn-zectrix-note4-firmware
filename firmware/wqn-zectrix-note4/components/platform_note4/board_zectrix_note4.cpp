@@ -1,11 +1,8 @@
 #include "board_zectrix_note4.h"
 
 #include "driver/gpio.h"
-#include "audio_sleep.h"
 #include "esp_check.h"
 #include "esp_log.h"
-#include "epd_display.h"
-#include "power_manager.h"
 
 namespace {
 
@@ -61,9 +58,28 @@ namespace wqn {
 
 esp_err_t InitZectrixNote4SafePins()
 {
-    wqn::ReleaseDeepSleepHolds();
-    wqn::ReleaseEpdDeepSleepHolds();
-    wqn::ReleaseAudioDeepSleepHolds();
+    // Bootstrap is the only platform-level exception to runtime resource
+    // ownership. Release every hold left by a committed deep-sleep
+    // transaction before configuring deterministic safe levels; after this
+    // function returns, DisplayService/AudioService/PowerCoordinator are the
+    // sole runtime owners of their respective pins.
+    gpio_deep_sleep_hold_dis();
+    constexpr gpio_num_t held_pins[] = {
+        kEpdPower,
+        kEpdReset,
+        kEpdDc,
+        kEpdCs,
+        kEpdSck,
+        kEpdMosi,
+        kAudioPower,
+        kAudioAmp,
+        kNfcPower,
+        kLed,
+        kBoardPowerLatch,
+    };
+    for (gpio_num_t pin : held_pins) {
+        gpio_hold_dis(pin);
+    }
 
     const uint64_t disabled_power_outputs =
         (1ULL << kEpdPower) |
@@ -116,14 +132,6 @@ esp_err_t InitZectrixNote4SafePins()
     ESP_RETURN_ON_ERROR(ConfigureInputs(button_and_status_inputs), kTag, "configure input pins");
 
     ESP_LOGI(kTag, "safe pins ready: PWR_ON latch on, EPD/audio/amp/NFC off, LED off");
-
-    constexpr gpio_num_t kI2cSda = GPIO_NUM_47;
-    constexpr gpio_num_t kI2cScl = GPIO_NUM_48;
-    constexpr int kI2cClkHz = 100000;
-    ESP_RETURN_ON_ERROR(
-        wqn::InitPowerHardware(I2C_NUM_0, kI2cSda, kI2cScl, kI2cClkHz),
-        kTag,
-        "init power hardware (ADC, I2C, RTC)");
 
     return ESP_OK;
 }
