@@ -2,8 +2,7 @@
 
 #include <algorithm>
 #include <cstddef>
-#include <cstdlib>
-#include <ctime>
+#include <cstring>
 #include <string>
 #include <utility>
 
@@ -13,7 +12,6 @@
 namespace {
 
 constexpr char kTag[] = "wqn_word";
-constexpr uint16_t kDefaultDailyTarget = 20;
 constexpr size_t kDictionaryPreviewLimit = 8;
 constexpr size_t kWordHomeSelectionCount = 3;
 
@@ -73,14 +71,21 @@ esp_err_t LoadCurrentReviewWord(wqn::WordAppState* state)
         return ESP_ERR_INVALID_ARG;
     }
     state->current_word = wqn::WqnWordEntry{};
-    if (state->review_indices.empty() || state->review_position >= state->review_indices.size()) {
+    const auto& session = state->session.persisted;
+    if (!session.active || session.position >= session.remote.items.size()) {
         return ESP_OK;
     }
-    const size_t index = state->review_indices[state->review_position];
-    if (index >= state->pack_index.entries.size()) {
-        return ESP_ERR_INVALID_ARG;
+    const char* item_id = session.remote.items[session.position].item_id;
+    const auto entry = std::find_if(
+        state->pack_index.entries.begin(),
+        state->pack_index.entries.end(),
+        [&](const wqn::WordPackIndexEntry& value) {
+            return std::strcmp(item_id, value.word_id) == 0;
+        });
+    if (entry == state->pack_index.entries.end()) {
+        return ESP_ERR_NOT_FOUND;
     }
-    return wqn::ReadWordPackEntry(state->pack_index.entries[index], &state->current_word);
+    return wqn::ReadWordPackEntry(*entry, &state->current_word);
 }
 
 esp_err_t LoadCurrentDictionaryWord(wqn::WordAppState* state)
@@ -99,38 +104,30 @@ esp_err_t LoadCurrentDictionaryWord(wqn::WordAppState* state)
     return wqn::ReadWordPackEntry(state->pack_index.entries[index], &state->current_word);
 }
 
-void BuildReviewQueue(wqn::WordAppState* state, bool random)
+void PrepareObservation(
+    wqn::WordAppState* state,
+    wqn::protocol::word_study_v1::ObservationAction action,
+    uint32_t next_position,
+    wqn::WordPresentationPhase next_phase)
 {
-    if (state == nullptr) {
+    if (state == nullptr || !state->session.persisted.active ||
+        state->session.persisted.position >=
+            state->session.persisted.remote.items.size()) {
         return;
     }
-    state->review_indices.clear();
-    state->review_position = 0;
-    state->random_review = random;
-    // Review the whole pack, not just daily_target. The index already lives in
-    // PSRAM, and review_indices is just ~size_t per word (~14 KB for 3500).
-    const size_t limit = state->pack_index.entries.size();
-    state->review_indices.reserve(limit);
-    for (size_t i = 0; i < state->pack_index.entries.size(); ++i) {
-        state->review_indices.push_back(i);
-    }
-    if (random && state->review_indices.size() > 1) {
-        std::srand(static_cast<unsigned>(std::time(nullptr)));
-        for (size_t i = state->review_indices.size() - 1; i > 0; --i) {
-            const size_t j = static_cast<size_t>(std::rand()) % (i + 1);
-            std::swap(state->review_indices[i], state->review_indices[j]);
-        }
-    }
-}
-
-void QueueReviewSubmission(wqn::WordAppState* state, const wqn::WqnWordEntry& word, const char* outcome)
-{
-    if (state == nullptr || outcome == nullptr || outcome[0] == '\0' || word.id.empty()) {
-        return;
-    }
-    state->pending_submit_word_id = word.id;
-    state->pending_submit_outcome = outcome;
-    state->pending_submit_word = word.word;
+    auto& observation = state->session.pending_observation;
+    observation = {};
+    observation.session_id = state->session.persisted.remote.session_id;
+    observation.sequence = state->session.persisted.remote.next_sequence;
+    observation.item_id =
+        state->session.persisted.remote.items[state->session.persisted.position].item_id;
+    observation.action = action;
+    observation.mode = state->session.persisted.remote.mode;
+    observation.next_position = next_position;
+    observation.next_phase = next_phase;
+    state->session.commit_state = wqn::WordObservationCommitState::kPersisting;
+    state->session.observation_effect_ready = true;
+    state->message = "正在保存";
 }
 
 uint16_t ClampUint16(size_t value)
@@ -145,13 +142,11 @@ void InstallWordPackIndex(
 {
     const bool has_manifest = index.has_manifest;
     const bool pack_error = index.pack_error;
-    const size_t entry_count = index.entries.size();
     const std::string status_message = index.status_message;
     state->pack_index = std::move(index);
     state->cloud_loaded_once = has_manifest;
     state->cloud_sync_failed = pack_error;
     state->cloud_sync_requested = !has_manifest || pack_error;
-    state->daily_target = ClampUint16(entry_count);
     state->message = !message.empty() ? message : status_message;
     if (state->message.empty()) {
         state->message = HasPackWords(*state) ? "词库已就绪" : "词库未同步";
@@ -162,6 +157,7 @@ void InstallWordPackIndex(
 void ActivatePendingWordPackIndex(wqn::WordAppState* state)
 {
     if (state == nullptr || state->mode != wqn::WordAppMode::kHome ||
+        state->session.persisted.active ||
         !state->pending_pack_index_ready) {
         return;
     }
@@ -171,23 +167,35 @@ void ActivatePendingWordPackIndex(wqn::WordAppState* state)
     InstallWordPackIndex(state, std::move(pending), "词库更新已启用");
 }
 
-void AdvanceReview(wqn::WordAppState* state)
+void FinishOrLoadAdvancedReview(wqn::WordAppState* state)
 {
-    if (state == nullptr || state->review_indices.empty()) {
+    if (state == nullptr) {
         return;
     }
-    if (state->review_position + 1 < state->review_indices.size()) {
-        ++state->review_position;
-        ESP_ERROR_CHECK_WITHOUT_ABORT(LoadCurrentReviewWord(state));
-        state->mode = wqn::WordAppMode::kReviewFront;
-        return;
+    auto& session = state->session.persisted;
+    if (session.active && session.position < session.remote.items.size()) {
+        const esp_err_t load_result = LoadCurrentReviewWord(state);
+        if (load_result == ESP_OK) {
+            state->mode = session.phase == wqn::WordPresentationPhase::kBack
+                ? wqn::WordAppMode::kReviewBack
+                : wqn::WordAppMode::kReviewFront;
+            return;
+        }
+        state->message = "会话词包不可用";
     }
+    session.active = false;
+    session.paused = false;
     state->mode = wqn::WordAppMode::kHome;
-    state->review_indices.clear();
-    state->review_position = 0;
     state->current_word = wqn::WqnWordEntry{};
+    if (state->pending_pack_index_ready) {
+        ActivatePendingWordPackIndex(state);
+    } else {
+        wqn::WordPackIndex current;
+        if (wqn::LoadWordPackIndex(&current) == ESP_OK) {
+            InstallWordPackIndex(state, std::move(current), "");
+        }
+    }
     state->message = "本轮复习完成";
-    ActivatePendingWordPackIndex(state);
 }
 
 void RequestOnlineLookup(wqn::WordAppState* state)
@@ -215,8 +223,9 @@ void MarkCurrentAsUnknown(wqn::WordAppState* state)
     if (state == nullptr) {
         return;
     }
-    QueueReviewSubmission(state, state->current_word, "unknown");
-    state->message = state->current_word.id.empty() ? "临时词无法加入错词本" : "已标记不认识";
+    state->message = state->current_word.id.empty()
+        ? "临时词无法加入错词本"
+        : "请在复习中标记不认识";
 }
 
 }  // namespace
@@ -232,7 +241,6 @@ esp_err_t InitWordApp(WordAppState* state)
         return ESP_OK;
     }
 
-    state->daily_target = kDefaultDailyTarget;
     state->mode = WordAppMode::kHome;
     state->home_selection = WordHomeSelection::kSequential;
     state->lookup_selection = WordLookupSelection::kOnlineSearch;
@@ -246,14 +254,33 @@ esp_err_t InitWordApp(WordAppState* state)
         const esp_err_t index_result = LoadWordPackIndex(&index);
         const std::string index_message = index.status_message;
         ApplyWordPackIndex(state, std::move(index), index_message);
-        // [target-fix] daily_target follows the actual pack size, not a
-        // hardcoded 20. BuildReviewQueue already covers the whole pack;
-        // this just makes the snapshot field consistent for any UI that
-        // reads it (progress_label already uses review_indices.size()).
-        state->daily_target = ClampUint16(state->pack_index.entries.size());
         if (index_result != ESP_OK) {
             ESP_LOGW(kTag, "load local word pack index failed: %s", esp_err_to_name(index_result));
         }
+    }
+
+    WordOutboxSnapshot outbox;
+    if (ReadWordOutboxSnapshot(&outbox) == ESP_OK) {
+        state->outbox.pending_count = outbox.pending_count;
+        state->outbox.capacity = outbox.capacity;
+    }
+    PersistedWordSession persisted;
+    const esp_err_t session_result = LoadPersistedWordSession(&persisted);
+    if (session_result == ESP_OK && persisted.active &&
+        persisted.position < persisted.remote.items.size()) {
+        state->session.persisted = std::move(persisted);
+        if (!state->session.persisted.paused && LoadCurrentReviewWord(state) == ESP_OK) {
+            state->mode = state->session.persisted.phase == WordPresentationPhase::kBack
+                ? WordAppMode::kReviewBack
+                : WordAppMode::kReviewFront;
+            state->message = "已恢复上次会话";
+        } else {
+            state->mode = WordAppMode::kHome;
+            state->message = "上次会话可继续";
+        }
+    } else if (session_result != ESP_OK && session_result != ESP_ERR_NOT_FOUND) {
+        ESP_LOGW(kTag, "load persisted word session failed: %s", esp_err_to_name(session_result));
+        state->message = "会话记录损坏";
     }
 
     state->initialized = true;
@@ -305,45 +332,106 @@ esp_err_t HandleWordAppInput(WordAppState* state, WordInput input)
                 state->cloud_sync_requested = true;
                 return ESP_OK;
             }
-            BuildReviewQueue(state, state->home_selection == WordHomeSelection::kRandom);
-            ESP_RETURN_ON_ERROR(LoadCurrentReviewWord(state), kTag, "load current review word");
-            state->mode = WordAppMode::kReviewFront;
-            state->message = "确认翻面";
+            const auto requested_mode = state->home_selection == WordHomeSelection::kRandom
+                ? protocol::word_study_v1::Mode::kRandom
+                : protocol::word_study_v1::Mode::kSequential;
+            if (state->session.persisted.active &&
+                state->session.persisted.paused &&
+                state->session.persisted.remote.mode == requested_mode &&
+                state->session.persisted.position <
+                    state->session.persisted.remote.items.size()) {
+                state->session.persisted.paused = false;
+                ESP_RETURN_ON_ERROR(
+                    SavePersistedWordSession(state->session.persisted),
+                    kTag,
+                    "resume word session");
+                ESP_RETURN_ON_ERROR(LoadCurrentReviewWord(state), kTag, "load resumed word");
+                state->mode = state->session.persisted.phase == WordPresentationPhase::kBack
+                    ? WordAppMode::kReviewBack
+                    : WordAppMode::kReviewFront;
+                state->message = "已继续上次会话";
+                return ESP_OK;
+            }
+            if (state->session.requested_mode != requested_mode) {
+                state->session.create_request_id.clear();
+            }
+            state->session.requested_mode = requested_mode;
+            state->session.start_requested = true;
+            state->mode = WordAppMode::kSessionStarting;
+            state->message = "正在准备本轮单词";
             return ESP_OK;
         }
 
-        case WordAppMode::kReviewFront:
-            if (input == WordInput::kConfirm) {
-                state->mode = WordAppMode::kReviewBack;
-                state->message = "确认认识，上键不认识，下键跳过";
-            } else if (input == WordInput::kDown) {
-                AdvanceReview(state);
-                state->message = "已跳过";
-            } else if (input == WordInput::kLongConfirm) {
+        case WordAppMode::kSessionStarting:
+            if (input == WordInput::kLongConfirm) {
+                state->session.start_requested = false;
                 state->mode = WordAppMode::kHome;
-                state->message = "已返回单词主页";
+                state->message = "已取消";
+            }
+            return ESP_OK;
+
+        case WordAppMode::kReviewFront:
+            if (state->session.commit_state == WordObservationCommitState::kFailed) {
+                if (input == WordInput::kConfirm) {
+                    state->session.commit_state = WordObservationCommitState::kPersisting;
+                    state->session.observation_effect_ready = true;
+                    state->message = "正在重试保存";
+                }
+                return ESP_OK;
+            }
+            if (input == WordInput::kConfirm) {
+                PrepareObservation(
+                    state,
+                    protocol::word_study_v1::ObservationAction::kRevealed,
+                    state->session.persisted.position,
+                    WordPresentationPhase::kBack);
+            } else if (input == WordInput::kDown) {
+                PrepareObservation(
+                    state,
+                    protocol::word_study_v1::ObservationAction::kSkipped,
+                    state->session.persisted.position + 1,
+                    WordPresentationPhase::kFront);
+            } else if (input == WordInput::kLongConfirm) {
+                state->session.persisted.paused = true;
+                ESP_ERROR_CHECK_WITHOUT_ABORT(SavePersistedWordSession(state->session.persisted));
+                state->mode = WordAppMode::kHome;
+                state->message = "本轮已暂停";
                 ActivatePendingWordPackIndex(state);
             }
             return ESP_OK;
 
         case WordAppMode::kReviewBack:
+            if (state->session.commit_state == WordObservationCommitState::kFailed) {
+                if (input == WordInput::kConfirm) {
+                    state->session.commit_state = WordObservationCommitState::kPersisting;
+                    state->session.observation_effect_ready = true;
+                    state->message = "正在重试保存";
+                }
+                return ESP_OK;
+            }
             if (input == WordInput::kConfirm) {
-                QueueReviewSubmission(state, state->current_word, "known");
-                ++state->reviewed_today;
-                ++state->correct_today;
-                state->message = "已记录认识";
-                AdvanceReview(state);
+                PrepareObservation(
+                    state,
+                    protocol::word_study_v1::ObservationAction::kKnown,
+                    state->session.persisted.position + 1,
+                    WordPresentationPhase::kFront);
             } else if (input == WordInput::kUp) {
-                QueueReviewSubmission(state, state->current_word, "unknown");
-                ++state->reviewed_today;
-                state->message = "已加入遗忘的单词";
-                AdvanceReview(state);
+                PrepareObservation(
+                    state,
+                    protocol::word_study_v1::ObservationAction::kUnknown,
+                    state->session.persisted.position + 1,
+                    WordPresentationPhase::kFront);
             } else if (input == WordInput::kDown) {
-                AdvanceReview(state);
-                state->message = "已跳过";
+                PrepareObservation(
+                    state,
+                    protocol::word_study_v1::ObservationAction::kSkipped,
+                    state->session.persisted.position + 1,
+                    WordPresentationPhase::kFront);
             } else if (input == WordInput::kLongConfirm) {
+                state->session.persisted.paused = true;
+                ESP_ERROR_CHECK_WITHOUT_ABORT(SavePersistedWordSession(state->session.persisted));
                 state->mode = WordAppMode::kHome;
-                state->message = "已返回单词主页";
+                state->message = "本轮已暂停";
                 ActivatePendingWordPackIndex(state);
             }
             return ESP_OK;
@@ -461,7 +549,7 @@ void ApplyWordPackIndex(WordAppState* state, WordPackIndex index, const std::str
     if (state == nullptr) {
         return;
     }
-    if (state->mode != WordAppMode::kHome) {
+    if (state->mode != WordAppMode::kHome || state->session.persisted.active) {
         state->pending_pack_index = std::move(index);
         state->pending_pack_index_ready = true;
         state->cloud_loaded_once = state->pending_pack_index.has_manifest;
@@ -528,24 +616,156 @@ bool TakeWordAiLookupRequest(WordAppState* state, WqnWordAiLookupRequest* reques
     return true;
 }
 
-bool TakeWordReviewSubmission(WordAppState* state, WqnWordReviewSubmission* submission, std::string* word)
+bool TakeWordSessionStartRequest(
+    WordAppState* state,
+    protocol::word_study_v1::CreateSessionRequest* request)
 {
-    if (state == nullptr || submission == nullptr) {
+    if (state == nullptr || request == nullptr || !state->session.start_requested) {
         return false;
     }
-    if (state->pending_submit_word_id.empty() || state->pending_submit_outcome.empty()) {
-        return false;
+    if (state->session.create_request_id.empty()) {
+        state->session.create_request_id = request->metadata.request_id;
+    } else {
+        request->metadata.request_id = state->session.create_request_id;
     }
-    submission->word_id = state->pending_submit_word_id;
-    submission->outcome = state->pending_submit_outcome;
-    submission->mode = state->random_review ? "random" : "sequential";
-    if (word != nullptr) {
-        *word = state->pending_submit_word;
-    }
-    state->pending_submit_word_id.clear();
-    state->pending_submit_outcome.clear();
-    state->pending_submit_word.clear();
+    request->mode = state->session.requested_mode;
+    request->scope = {};
+    request->optional_count = 0;
+    request->seed.clear();
+    state->session.start_requested = false;
     return true;
+}
+
+void ApplyWordSessionStartResult(
+    WordAppState* state,
+    esp_err_t result,
+    protocol::word_study_v1::SessionData session)
+{
+    if (state == nullptr) return;
+    if (result != ESP_OK) {
+        state->mode = WordAppMode::kHome;
+        state->message = result == ESP_ERR_INVALID_STATE
+            ? "请先完成配对"
+            : "本轮准备失败，可重试";
+        return;
+    }
+    PersistedWordSession persisted;
+    persisted.active = !session.items.empty();
+    persisted.paused = false;
+    persisted.position = 0;
+    persisted.phase = WordPresentationPhase::kFront;
+    result = CompactWordSessionData(session, &persisted.remote);
+    if (result != ESP_OK) {
+        state->mode = WordAppMode::kHome;
+        state->message = "会话数据过大";
+        return;
+    }
+    if (!persisted.active) {
+        state->mode = WordAppMode::kHome;
+        state->message = "暂时没有建议复习的单词";
+        return;
+    }
+    result = SavePersistedWordSession(persisted);
+    if (result != ESP_OK) {
+        state->mode = WordAppMode::kHome;
+        state->message = "会话未保存，请重试";
+        return;
+    }
+    state->session.persisted = std::move(persisted);
+    state->session.commit_state = WordObservationCommitState::kIdle;
+    state->session.create_request_id.clear();
+    result = LoadCurrentReviewWord(state);
+    if (result != ESP_OK) {
+        state->session.persisted.active = false;
+        ESP_ERROR_CHECK_WITHOUT_ABORT(SavePersistedWordSession(state->session.persisted));
+        state->mode = WordAppMode::kHome;
+        state->message = "会话词包尚未就绪";
+        return;
+    }
+    state->mode = WordAppMode::kReviewFront;
+    state->message = "确认翻面";
+}
+
+bool TakeWordObservationEffect(
+    WordAppState* state,
+    const std::string& request_id,
+    const std::string& occurred_at,
+    DurableWordObservation* observation,
+    PersistedWordSession* advanced_session)
+{
+    if (state == nullptr || observation == nullptr || advanced_session == nullptr ||
+        !state->session.observation_effect_ready || request_id.empty() ||
+        occurred_at.empty()) {
+        return false;
+    }
+    auto& pending = state->session.pending_observation;
+    if (pending.request_id.empty()) {
+        pending.request_id = request_id;
+        pending.occurred_at = occurred_at;
+    }
+    PersistedWordSession advanced = state->session.persisted;
+    advanced.position = pending.next_position;
+    advanced.phase = pending.next_phase;
+    advanced.remote.next_sequence = pending.sequence + 1;
+    if (advanced.position >= advanced.remote.items.size()) {
+        advanced.active = false;
+        advanced.paused = false;
+    }
+    state->session.pending_advanced_session = advanced;
+    state->session.observation_effect_ready = false;
+    *observation = pending;
+    *advanced_session = std::move(advanced);
+    return true;
+}
+
+void ApplyWordObservationCommitResult(WordAppState* state, esp_err_t result)
+{
+    if (state == nullptr) return;
+    if (result != ESP_OK) {
+        state->session.commit_state = WordObservationCommitState::kFailed;
+        state->message = result == ESP_ERR_NO_MEM
+            ? "记录空间已满，确认重试"
+            : "未保存，确认重试";
+        return;
+    }
+    const auto action = state->session.pending_observation.action;
+    state->session.persisted = std::move(state->session.pending_advanced_session);
+    state->session.pending_advanced_session = {};
+    state->session.pending_observation = {};
+    state->session.commit_state = WordObservationCommitState::kCloudPending;
+    if (state->outbox.pending_count < state->outbox.capacity) {
+        ++state->outbox.pending_count;
+    }
+    if (action == protocol::word_study_v1::ObservationAction::kKnown) {
+        ++state->reviewed_today;
+        ++state->correct_today;
+        state->message = "已保存，待同步";
+    } else if (action == protocol::word_study_v1::ObservationAction::kUnknown) {
+        ++state->reviewed_today;
+        state->message = "已保存到遗忘单词，待同步";
+    } else if (action == protocol::word_study_v1::ObservationAction::kSkipped) {
+        state->message = "已记录跳过，待同步";
+    } else {
+        state->message = "已保存，待同步";
+    }
+    FinishOrLoadAdvancedReview(state);
+}
+
+void RefreshWordOutboxState(WordAppState* state)
+{
+    if (state == nullptr) return;
+    WordOutboxSnapshot snapshot;
+    if (ReadWordOutboxSnapshot(&snapshot) != ESP_OK) return;
+    state->outbox.pending_count = snapshot.pending_count;
+    state->outbox.capacity = snapshot.capacity;
+    if (snapshot.pending_count == 0 &&
+        state->session.commit_state == WordObservationCommitState::kCloudPending) {
+        state->session.commit_state = WordObservationCommitState::kCloudAcknowledged;
+        if (state->mode == WordAppMode::kReviewFront ||
+            state->mode == WordAppMode::kReviewBack) {
+            state->message = "已同步";
+        }
+    }
 }
 
 WordAppSnapshot BuildWordAppSnapshot(const WordAppState& state)
@@ -559,12 +779,15 @@ WordAppSnapshot BuildWordAppSnapshot(const WordAppState& state)
     snapshot.cloud_sync_failed = state.cloud_sync_failed;
     snapshot.reviewed_today = state.reviewed_today;
     snapshot.correct_today = state.correct_today;
-    snapshot.daily_target = state.daily_target;
+    snapshot.daily_target = ClampUint16(state.session.persisted.remote.items.size());
     snapshot.due_count = ClampUint16(state.pack_index.entries.size());
     snapshot.total_count = ClampUint16(state.pack_index.entries.size());
-    snapshot.card_count = ClampUint16(state.review_indices.size());
-    snapshot.card_position = state.review_indices.empty() ? 0 : ClampUint16(state.review_position + 1);
-    snapshot.finished_today = state.review_indices.empty() && (state.mode == WordAppMode::kReviewFront || state.mode == WordAppMode::kReviewBack);
+    snapshot.card_count = ClampUint16(state.session.persisted.remote.items.size());
+    snapshot.card_position = state.session.persisted.remote.items.empty()
+        ? 0
+        : ClampUint16(state.session.persisted.position + 1);
+    snapshot.finished_today = !state.session.persisted.active &&
+        !state.session.persisted.remote.session_id.empty();
     snapshot.pack_count = state.pack_index.pack_count;
     snapshot.pack_bytes = state.pack_index.pack_bytes;
     snapshot.dictionary_prefix = state.dictionary_prefix;
@@ -601,13 +824,14 @@ WordAppSnapshot BuildWordAppSnapshot(const WordAppState& state)
 
 std::string WordAppProgressLabel(const WordAppState& state)
 {
-    // Progress through the current review queue (whole pack), shown as
-    // "current/total" rather than a daily-target percentage.
-    if (state.review_indices.empty()) {
+    if (state.session.persisted.remote.items.empty()) {
         return "";
     }
-    return std::to_string(state.review_position + 1) + "/" +
-           std::to_string(state.review_indices.size());
+    const size_t visible_position = std::min(
+        static_cast<size_t>(state.session.persisted.position) + 1,
+        state.session.persisted.remote.items.size());
+    return std::to_string(visible_position) + "/" +
+           std::to_string(state.session.persisted.remote.items.size());
 }
 
 std::string WordAppStatusLine(const WordAppState& state)
@@ -621,6 +845,9 @@ std::string WordAppStatusLine(const WordAppState& state)
     if (!HasPackWords(state)) {
         return state.pack_index.status_message.empty() ? "词库未同步" : state.pack_index.status_message;
     }
+    if (state.outbox.pending_count > 0) {
+        return "待同步 " + std::to_string(state.outbox.pending_count) + " 条";
+    }
     return "本地词库 " + std::to_string(state.pack_index.entries.size()) + " 词";
 }
 
@@ -632,9 +859,13 @@ std::string WordAppSignature(const WordAppState& state)
     signature.push_back('/');
     signature.append(std::to_string(static_cast<int>(state.home_selection)));
     signature.push_back('/');
-    signature.append(std::to_string(state.review_position));
+    signature.append(std::to_string(state.session.persisted.position));
     signature.push_back('/');
-    signature.append(std::to_string(state.review_indices.size()));
+    signature.append(std::to_string(state.session.persisted.remote.items.size()));
+    signature.push_back('/');
+    signature.append(std::to_string(state.session.persisted.remote.next_sequence));
+    signature.push_back('/');
+    signature.append(std::to_string(state.outbox.pending_count));
     signature.push_back('/');
     signature.append(state.current_word.id);
     signature.push_back('/');

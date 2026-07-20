@@ -7,6 +7,7 @@
 
 #include "esp_err.h"
 #include "word_pack.h"
+#include "word_study_store.h"
 #include "wqn_api.h"
 
 namespace wqn {
@@ -20,6 +21,7 @@ enum class WordInput {
 
 enum class WordAppMode : uint8_t {
     kHome,
+    kSessionStarting,
     kReviewFront,
     kReviewBack,
     kDictionary,
@@ -39,16 +41,42 @@ enum class WordLookupSelection : uint8_t {
     kAiLookup,
 };
 
+enum class WordObservationCommitState : uint8_t {
+    kIdle,
+    kPersisting,
+    kLocalCommitted,
+    kCloudPending,
+    kCloudAcknowledged,
+    kFailed,
+};
+
+struct WordSessionState {
+    bool start_requested = false;
+    protocol::word_study_v1::Mode requested_mode =
+        protocol::word_study_v1::Mode::kSequential;
+    std::string create_request_id;
+    PersistedWordSession persisted;
+    WordObservationCommitState commit_state = WordObservationCommitState::kIdle;
+    bool observation_effect_ready = false;
+    DurableWordObservation pending_observation;
+    PersistedWordSession pending_advanced_session;
+};
+
+struct WordOutboxState {
+    size_t pending_count = 0;
+    size_t capacity = kWordObservationOutboxCapacity;
+};
+
 struct WordAppState {
     bool initialized = false;
     WordAppMode mode = WordAppMode::kHome;
     WordHomeSelection home_selection = WordHomeSelection::kSequential;
     WordLookupSelection lookup_selection = WordLookupSelection::kOnlineSearch;
-    bool random_review = false;
-
-    uint16_t daily_target = 20;
     uint16_t reviewed_today = 0;
     uint16_t correct_today = 0;
+
+    WordSessionState session;
+    WordOutboxState outbox;
 
     WordPackIndex pack_index;
     // A cloud refresh never mutates the content snapshot used by an active
@@ -56,8 +84,6 @@ struct WordAppState {
     // to the word home screen.
     WordPackIndex pending_pack_index;
     bool pending_pack_index_ready = false;
-    std::vector<size_t> review_indices;
-    size_t review_position = 0;
     WqnWordEntry current_word;
 
     std::string dictionary_prefix;
@@ -77,9 +103,6 @@ struct WordAppState {
     bool ai_lookup_pending = false;
     std::string pending_search_query;
     std::string pending_ai_query;
-    std::string pending_submit_word_id;
-    std::string pending_submit_outcome;
-    std::string pending_submit_word;
     std::string message;
 };
 
@@ -126,7 +149,21 @@ void ApplyWordSearchResult(WordAppState* state, const WqnWordSearchResult& resul
 void ApplyWordAiLookupResult(WordAppState* state, const WqnWordAiLookupResult& result);
 bool TakeWordSearchRequest(WordAppState* state, WqnWordSearchRequest* request);
 bool TakeWordAiLookupRequest(WordAppState* state, WqnWordAiLookupRequest* request);
-bool TakeWordReviewSubmission(WordAppState* state, WqnWordReviewSubmission* submission, std::string* word);
+bool TakeWordSessionStartRequest(
+    WordAppState* state,
+    protocol::word_study_v1::CreateSessionRequest* request);
+void ApplyWordSessionStartResult(
+    WordAppState* state,
+    esp_err_t result,
+    protocol::word_study_v1::SessionData session);
+bool TakeWordObservationEffect(
+    WordAppState* state,
+    const std::string& request_id,
+    const std::string& occurred_at,
+    DurableWordObservation* observation,
+    PersistedWordSession* advanced_session);
+void ApplyWordObservationCommitResult(WordAppState* state, esp_err_t result);
+void RefreshWordOutboxState(WordAppState* state);
 WordAppSnapshot BuildWordAppSnapshot(const WordAppState& state);
 std::string WordAppProgressLabel(const WordAppState& state);
 std::string WordAppStatusLine(const WordAppState& state);

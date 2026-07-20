@@ -24,6 +24,7 @@
 #include "nvs.h"
 #include "runtime/sleep_coordinator.h"
 #include "storage.h"
+#include "word_study_store.h"
 #include "wqn_api.h"
 
 namespace {
@@ -796,6 +797,62 @@ bool RunSyncRound()
         ESP_LOGW(kTag, "pending review upload round failed: %s", esp_err_to_name(result));
         return false;
     }
+
+#if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
+    constexpr size_t kMaxWordObservationsPerRound = 64;
+    size_t word_observations_uploaded = 0;
+    for (; word_observations_uploaded < kMaxWordObservationsPerRound;
+         ++word_observations_uploaded) {
+        wqn::DurableWordObservation pending;
+        result = wqn::PeekPendingWordObservation(&pending);
+        if (result == ESP_ERR_NOT_FOUND) {
+            result = ESP_OK;
+            break;
+        }
+        if (result != ESP_OK) {
+            ESP_LOGW(kTag, "word outbox read failed: %s", esp_err_to_name(result));
+            return false;
+        }
+        wqn::protocol::word_study_v1::ObservationRequest request;
+        request.metadata = MakeControlMetadata();
+        request.metadata.request_id = pending.request_id;
+        request.session_id = pending.session_id;
+        request.sequence = pending.sequence;
+        request.item_id = pending.item_id;
+        request.action = pending.action;
+        request.mode = pending.mode;
+        request.occurred_at = pending.occurred_at;
+        wqn::protocol::word_study_v1::ObservationData response;
+        wqn::protocol::v3::Error word_error;
+        result = wqn::SubmitWordStudyObservationV1(
+            token, request, &response, &word_error);
+        if (result != ESP_OK) {
+            ESP_LOGW(
+                kTag,
+                "word outbox upload deferred: request=%s sequence=%llu code=%s error=%s",
+                pending.request_id.c_str(),
+                static_cast<unsigned long long>(pending.sequence),
+                word_error.code.empty() ? "TRANSPORT" : word_error.code.c_str(),
+                esp_err_to_name(result));
+            return false;
+        }
+        result = wqn::AcknowledgeWordObservation(pending.request_id);
+        if (result != ESP_OK) {
+            ESP_LOGW(
+                kTag,
+                "word outbox ack failed: request=%s error=%s",
+                pending.request_id.c_str(),
+                esp_err_to_name(result));
+            return false;
+        }
+    }
+    if (word_observations_uploaded > 0) {
+        ESP_LOGI(
+            kTag,
+            "word outbox drained: uploaded=%u",
+            static_cast<unsigned>(word_observations_uploaded));
+    }
+#endif
 
     if (!LoadUsableToken(&token)) {
         ESP_LOGI(kTag, "token cleared during review upload round");

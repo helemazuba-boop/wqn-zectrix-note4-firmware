@@ -71,16 +71,20 @@ bool QueueWordReviewRefresh()
     return QueueWordCloudRequest(request);
 }
 
-bool QueueWordReviewSubmit(const wqn::WqnWordReviewSubmission& submission, const std::string& word)
+bool QueueWordSessionStart(
+    const wqn::protocol::word_study_v1::CreateSessionRequest& session)
 {
-    if (submission.word_id.empty() || submission.outcome.empty()) {
+    if (session.metadata.request_id.empty()) {
         return false;
     }
     WordCloudRequest request;
-    request.op = WordCloudOp::kSubmit;
-    std::snprintf(request.word_id, sizeof(request.word_id), "%s", submission.word_id.c_str());
-    std::snprintf(request.outcome, sizeof(request.outcome), "%s", submission.outcome.c_str());
-    std::snprintf(request.word, sizeof(request.word), "%s", word.c_str());
+    request.op = WordCloudOp::kStartSession;
+    std::snprintf(
+        request.request_id,
+        sizeof(request.request_id),
+        "%s",
+        session.metadata.request_id.c_str());
+    request.study_mode = static_cast<uint8_t>(session.mode);
     return QueueWordCloudRequest(request);
 }
 
@@ -147,18 +151,11 @@ bool ApplyWordCloudResult(wqn::UiState* state, WordCloudResult& result)
         return true;
     }
 
-    if (result.op == WordCloudOp::kSubmit) {
-        if (result.result == ESP_OK) {
-            if (std::strcmp(result.outcome, "unknown") == 0) {
-                state->word_app.message = "已加入遗忘的单词";
-            } else if (std::strcmp(result.outcome, "known") == 0) {
-                state->word_app.message = "已记录";
-            } else {
-                state->word_app.message = "已同步";
-            }
-        } else {
-            state->word_app.message = result.auth_required ? "请重新配对" : "单词同步失败";
-        }
+    if (result.op == WordCloudOp::kStartSession) {
+        wqn::ApplyWordSessionStartResult(
+            &state->word_app,
+            result.result,
+            std::move(result.session));
         BuildHomeSummary(state);
         return true;
     }
@@ -199,9 +196,6 @@ void WordCloudTask(void*)
         }
         WordCloudResult& result = g_word_result_slot;
         result.op = request.op;
-        std::snprintf(result.word_id, sizeof(result.word_id), "%s", request.word_id);
-        std::snprintf(result.outcome, sizeof(result.outcome), "%s", request.outcome);
-        std::snprintf(result.word, sizeof(result.word), "%s", request.word);
         result.message.clear();
 
         std::string token;
@@ -311,12 +305,17 @@ void WordCloudTask(void*)
                 result.result = wqn::LoadWordPackIndex(&result.pack_index);
                 result.message = result.pack_index.status_message;
             }
-        } else if (request.op == WordCloudOp::kSubmit) {
-            wqn::WqnWordReviewSubmission submission;
-            submission.word_id = request.word_id;
-            submission.outcome = request.outcome;
-            submission.mode = "sequential";
-            result.result = wqn::SubmitWordReview(token, submission, &result.submit);
+        } else if (request.op == WordCloudOp::kStartSession) {
+            wqn::protocol::word_study_v1::CreateSessionRequest session;
+            session.metadata = wqn::services::MakeDeviceRequestMetadata();
+            session.metadata.request_id = request.request_id;
+            session.mode = static_cast<wqn::protocol::word_study_v1::Mode>(
+                request.study_mode);
+            result.result = wqn::CreateWordStudySessionV1(
+                token,
+                session,
+                &result.session,
+                &result.protocol_error);
         } else if (request.op == WordCloudOp::kSearch) {
             wqn::WqnWordSearchRequest search;
             search.query = request.query;

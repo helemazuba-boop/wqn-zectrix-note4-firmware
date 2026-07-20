@@ -685,14 +685,41 @@ RefreshSchedule ApplyButtonEvent(
     }
     if (state->screen == wqn::UiScreen::kWord &&
         wqn::WordAppSignature(state->word_app) != old_word_signature) {
-        wqn::WqnWordReviewSubmission submission;
-        std::string word;
-        if (wqn::TakeWordReviewSubmission(&state->word_app, &submission, &word)) {
-            if (!QueueWordReviewSubmit(submission, word)) {
-                state->word_app.pending_submit_word_id = submission.word_id;
-                state->word_app.pending_submit_outcome = submission.outcome;
-                state->word_app.pending_submit_word = word;
-                state->word_app.message = IsWordCloudBusy() ? "单词同步中" : "单词同步失败";
+        wqn::protocol::word_study_v1::CreateSessionRequest session_request;
+        session_request.metadata = wqn::services::MakeDeviceRequestMetadata();
+        if (wqn::TakeWordSessionStartRequest(&state->word_app, &session_request) &&
+            !QueueWordSessionStart(session_request)) {
+            state->word_app.mode = wqn::WordAppMode::kHome;
+            state->word_app.message = IsWordCloudBusy()
+                ? "单词服务忙，请重试"
+                : "本轮准备失败，请重试";
+        }
+        wqn::DurableWordObservation observation;
+        wqn::PersistedWordSession advanced_session;
+        const auto observation_metadata = wqn::services::MakeDeviceRequestMetadata();
+        std::string occurred_at = CurrentIsoTimestamp();
+        if (occurred_at.empty()) {
+            // The event must remain durable even before SNTP is available.
+            // The server clamps implausible/future times when projecting it.
+            occurred_at = "2024-01-01T00:00:00Z";
+        }
+        if (wqn::TakeWordObservationEffect(
+                &state->word_app,
+                observation_metadata.request_id,
+                occurred_at,
+                &observation,
+                &advanced_session)) {
+            const esp_err_t commit_result = wqn::CommitWordObservation(
+                observation, advanced_session);
+            wqn::ApplyWordObservationCommitResult(
+                &state->word_app, commit_result);
+            if (commit_result == ESP_OK) {
+                wqn::services::RequestSyncNow();
+            } else {
+                ESP_LOGW(
+                    kTag,
+                    "word observation local commit failed: %s",
+                    esp_err_to_name(commit_result));
             }
         }
         wqn::WqnWordSearchRequest search_request;

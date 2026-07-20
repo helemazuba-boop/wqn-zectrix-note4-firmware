@@ -150,16 +150,15 @@ struct TodoCloudResult {
 
 enum class WordCloudOp {
     kPackSync,
-    kSubmit,
+    kStartSession,
     kSearch,
     kAiLookup,
 };
 
 struct WordCloudRequest {
     WordCloudOp op = WordCloudOp::kPackSync;
-    char word_id[64] = {};
-    char outcome[16] = {};
-    char word[80] = {};
+    char request_id[65] = {};
+    uint8_t study_mode = 0;
     char query[96] = {};
 };
 
@@ -167,11 +166,9 @@ struct WordCloudResult {
     WordCloudOp op = WordCloudOp::kPackSync;
     esp_err_t result = ESP_FAIL;
     bool auth_required = false;
-    char word_id[64] = {};
-    char outcome[16] = {};
-    char word[80] = {};
     wqn::WordPackIndex pack_index;
-    wqn::WqnWordReviewSubmitResult submit;
+    wqn::protocol::word_study_v1::SessionData session;
+    wqn::protocol::v3::Error protocol_error;
     wqn::WqnWordSearchResult search;
     wqn::WqnWordAiLookupResult lookup;
     std::string message;
@@ -206,7 +203,8 @@ bool QueueTodoRefreshCursor(const std::string& cursor);
 bool QueueTodoComplete(const std::string& todo_id);
 
 bool QueueWordReviewRefresh();
-bool QueueWordReviewSubmit(const wqn::WqnWordReviewSubmission& submission, const std::string& word);
+bool QueueWordSessionStart(
+    const wqn::protocol::word_study_v1::CreateSessionRequest& request);
 bool QueueWordSearch(const wqn::WqnWordSearchRequest& search);
 bool QueueWordAiLookup(const wqn::WqnWordAiLookupRequest& lookup);
 

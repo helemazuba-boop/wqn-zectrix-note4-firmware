@@ -1,0 +1,876 @@
+#include "word_study_store.h"
+
+#include <algorithm>
+#include <cerrno>
+#include <cstddef>
+#include <cstdio>
+#include <cstring>
+#include <string>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <utility>
+#include <vector>
+
+#include "esp_check.h"
+#include "esp_log.h"
+#include "esp_rom_crc.h"
+#include "runtime/sleep_coordinator.h"
+#include "services/storage_service.h"
+
+namespace {
+
+constexpr char kTag[] = "word_store";
+constexpr char kSessionPath[] = "/storage/wsess.v1";
+constexpr char kSessionTempPath[] = "/storage/wsess.tmp";
+constexpr char kSessionBackupPath[] = "/storage/wsess.bak";
+constexpr char kOutboxPath[] = "/storage/wout.v1";
+constexpr char kOutboxTempPath[] = "/storage/wout.tmp";
+constexpr char kOutboxBackupPath[] = "/storage/wout.bak";
+constexpr uint32_t kSessionMagic = UINT32_C(0x53535157);  // WQSS
+constexpr uint32_t kOutboxMagic = UINT32_C(0x424f5157);  // WQOB
+constexpr uint16_t kSchemaVersion = 1;
+constexpr size_t kMaxSessionPayloadBytes = 96U * 1024U;
+constexpr size_t kAckCompactionThreshold = 32;
+
+#pragma pack(push, 1)
+struct SessionHeader {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t reserved;
+    uint32_t payload_size;
+    uint32_t payload_crc;
+};
+
+enum class OutboxRecordKind : uint8_t {
+    kObservation = 1,
+    kAck = 2,
+};
+
+struct OutboxRecord {
+    uint32_t magic;
+    uint16_t version;
+    uint8_t kind;
+    uint8_t action;
+    uint8_t mode;
+    uint8_t next_phase;
+    uint16_t reserved;
+    uint64_t sequence;
+    uint32_t next_position;
+    char request_id[65];
+    char session_id[37];
+    char item_id[37];
+    char occurred_at[33];
+    uint32_t crc;
+};
+#pragma pack(pop)
+
+static_assert(sizeof(OutboxRecord) == 200);
+
+struct OutboxScan {
+    std::vector<OutboxRecord, wqn::WordStorePsramAllocator<OutboxRecord>> pending;
+    std::vector<std::string> acknowledged;
+    size_t total_records = 0;
+    size_t ack_records = 0;
+    bool partial_tail = false;
+    bool backup_source = false;
+};
+
+uint32_t Crc32(const void* bytes, size_t size)
+{
+    return esp_rom_crc32_le(
+        UINT32_MAX,
+        static_cast<const uint8_t*>(bytes),
+        static_cast<uint32_t>(size)) ^ UINT32_MAX;
+}
+
+bool CopyFixedText(char* output, size_t output_size, const std::string& value)
+{
+    if (output == nullptr || output_size == 0 || value.size() >= output_size) {
+        return false;
+    }
+    std::memset(output, 0, output_size);
+    std::memcpy(output, value.data(), value.size());
+    return true;
+}
+
+bool FileExists(const char* path)
+{
+    struct stat status = {};
+    return path != nullptr && stat(path, &status) == 0 && S_ISREG(status.st_mode);
+}
+
+template <typename T>
+void AppendScalar(std::vector<uint8_t>* output, T value)
+{
+    const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&value);
+    output->insert(output->end(), bytes, bytes + sizeof(value));
+}
+
+bool AppendString(std::vector<uint8_t>* output, const std::string& value, size_t maximum)
+{
+    if (output == nullptr || value.size() > maximum || value.size() > UINT16_MAX) {
+        return false;
+    }
+    AppendScalar<uint16_t>(output, static_cast<uint16_t>(value.size()));
+    output->insert(output->end(), value.begin(), value.end());
+    return output->size() <= kMaxSessionPayloadBytes;
+}
+
+class PayloadReader {
+public:
+    PayloadReader(const uint8_t* bytes, size_t size) : bytes_(bytes), size_(size) {}
+
+    template <typename T>
+    bool Scalar(T* value)
+    {
+        if (value == nullptr || offset_ + sizeof(T) > size_) return false;
+        std::memcpy(value, bytes_ + offset_, sizeof(T));
+        offset_ += sizeof(T);
+        return true;
+    }
+
+    bool String(std::string* value, size_t maximum)
+    {
+        uint16_t length = 0;
+        if (value == nullptr || !Scalar(&length) || length > maximum ||
+            offset_ + length > size_) {
+            return false;
+        }
+        value->assign(reinterpret_cast<const char*>(bytes_ + offset_), length);
+        offset_ += length;
+        return true;
+    }
+
+    bool finished() const { return offset_ == size_; }
+
+private:
+    const uint8_t* bytes_ = nullptr;
+    size_t size_ = 0;
+    size_t offset_ = 0;
+};
+
+bool ValidMode(uint8_t value)
+{
+    return value <= static_cast<uint8_t>(wqn::protocol::word_study_v1::Mode::kDictionary);
+}
+
+bool ValidPurpose(uint8_t value)
+{
+    return value <= static_cast<uint8_t>(wqn::protocol::word_study_v1::Purpose::kLookup);
+}
+
+bool ValidOrdering(uint8_t value)
+{
+    return value <= static_cast<uint8_t>(wqn::protocol::word_study_v1::Ordering::kLexicographic);
+}
+
+bool EncodeSession(
+    const wqn::PersistedWordSession& session,
+    std::vector<uint8_t>* payload)
+{
+    using namespace wqn::protocol::word_study_v1;
+    if (payload == nullptr || session.remote.snapshot.size() > kMaxDecks ||
+        session.remote.deck_ids.size() > kMaxDecks ||
+        session.remote.items.size() > kMaxSessionItems ||
+        session.position > session.remote.items.size() ||
+        session.remote.optional_count < 0 || session.remote.optional_count > 500) {
+        return false;
+    }
+    payload->clear();
+    payload->reserve(4096);
+    AppendScalar<uint8_t>(payload, session.active ? 1 : 0);
+    AppendScalar<uint8_t>(payload, session.paused ? 1 : 0);
+    AppendScalar<uint8_t>(payload, static_cast<uint8_t>(session.phase));
+    AppendScalar<uint8_t>(payload, static_cast<uint8_t>(session.remote.mode));
+    AppendScalar<uint8_t>(payload, static_cast<uint8_t>(session.remote.purpose));
+    AppendScalar<uint8_t>(payload, static_cast<uint8_t>(session.remote.ordering));
+    AppendScalar<uint8_t>(payload, session.remote.include_mastered ? 1 : 0);
+    AppendScalar<uint8_t>(payload, session.remote.has_more ? 1 : 0);
+    AppendScalar<uint32_t>(payload, session.position);
+    AppendScalar<uint32_t>(payload, static_cast<uint32_t>(session.remote.optional_count));
+    AppendScalar<uint64_t>(payload, session.remote.next_sequence);
+    if (!AppendString(payload, session.remote.session_id, 36) ||
+        !AppendString(payload, session.remote.seed, 64) ||
+        !AppendString(payload, session.remote.cursor, 64)) {
+        return false;
+    }
+    AppendScalar<uint16_t>(payload, static_cast<uint16_t>(session.remote.deck_ids.size()));
+    for (const wqn::StoredWordDeckId& deck_id : session.remote.deck_ids) {
+        if (!AppendString(payload, deck_id.value, 36)) return false;
+    }
+    AppendScalar<uint16_t>(payload, static_cast<uint16_t>(session.remote.snapshot.size()));
+    for (const wqn::StoredWordPackSnapshot& snapshot : session.remote.snapshot) {
+        if (!AppendString(payload, snapshot.deck_id, 36)) return false;
+        AppendScalar<uint64_t>(payload, snapshot.content_revision);
+        AppendScalar<uint64_t>(payload, snapshot.pack_revision);
+        if (!AppendString(payload, snapshot.sha256, 64)) return false;
+    }
+    AppendScalar<uint16_t>(payload, static_cast<uint16_t>(session.remote.items.size()));
+    for (const wqn::StoredWordSessionItem& item : session.remote.items) {
+        if (!AppendString(payload, item.item_id, 36) ||
+            !AppendString(payload, item.deck_id, 36)) {
+            return false;
+        }
+        AppendScalar<uint64_t>(payload, item.ordinal);
+    }
+    return payload->size() <= kMaxSessionPayloadBytes;
+}
+
+bool DecodeSession(
+    const std::vector<uint8_t>& payload,
+    wqn::PersistedWordSession* session)
+{
+    using namespace wqn::protocol::word_study_v1;
+    if (session == nullptr) return false;
+    PayloadReader reader(payload.data(), payload.size());
+    uint8_t active = 0;
+    uint8_t paused = 0;
+    uint8_t phase = 0;
+    uint8_t mode = 0;
+    uint8_t purpose = 0;
+    uint8_t ordering = 0;
+    uint8_t include_mastered = 0;
+    uint8_t has_more = 0;
+    uint32_t optional_count = 0;
+    wqn::PersistedWordSession parsed;
+    if (!reader.Scalar(&active) || !reader.Scalar(&paused) ||
+        !reader.Scalar(&phase) || !reader.Scalar(&mode) ||
+        !reader.Scalar(&purpose) || !reader.Scalar(&ordering) ||
+        !reader.Scalar(&include_mastered) || !reader.Scalar(&has_more) ||
+        !reader.Scalar(&parsed.position) || !reader.Scalar(&optional_count) ||
+        !reader.Scalar(&parsed.remote.next_sequence) ||
+        !reader.String(&parsed.remote.session_id, 36) ||
+        !reader.String(&parsed.remote.seed, 64) ||
+        !reader.String(&parsed.remote.cursor, 64) || phase > 1 ||
+        !ValidMode(mode) || !ValidPurpose(purpose) || !ValidOrdering(ordering) ||
+        optional_count > 500) {
+        return false;
+    }
+    parsed.active = active == 1;
+    parsed.paused = paused == 1;
+    parsed.phase = static_cast<wqn::WordPresentationPhase>(phase);
+    parsed.remote.mode = static_cast<Mode>(mode);
+    parsed.remote.purpose = static_cast<Purpose>(purpose);
+    parsed.remote.ordering = static_cast<Ordering>(ordering);
+    if (active > 1 || paused > 1 || include_mastered > 1 || has_more > 1) {
+        return false;
+    }
+    parsed.remote.include_mastered = include_mastered == 1;
+    parsed.remote.has_more = has_more == 1;
+    parsed.remote.optional_count = static_cast<int>(optional_count);
+
+    uint16_t count = 0;
+    if (!reader.Scalar(&count) || count > kMaxDecks) return false;
+    parsed.remote.deck_ids.reserve(count);
+    for (uint16_t index = 0; index < count; ++index) {
+        std::string value;
+        if (!reader.String(&value, 36)) return false;
+        wqn::StoredWordDeckId deck;
+        if (!CopyFixedText(deck.value, sizeof(deck.value), value)) return false;
+        parsed.remote.deck_ids.push_back(deck);
+    }
+    if (!reader.Scalar(&count) || count > kMaxDecks) return false;
+    parsed.remote.snapshot.reserve(count);
+    for (uint16_t index = 0; index < count; ++index) {
+        wqn::StoredWordPackSnapshot snapshot;
+        std::string deck_id;
+        std::string sha256;
+        if (!reader.String(&deck_id, 36) ||
+            !reader.Scalar(&snapshot.content_revision) ||
+            !reader.Scalar(&snapshot.pack_revision) ||
+            !reader.String(&sha256, 64) ||
+            !CopyFixedText(snapshot.deck_id, sizeof(snapshot.deck_id), deck_id) ||
+            !CopyFixedText(snapshot.sha256, sizeof(snapshot.sha256), sha256)) {
+            return false;
+        }
+        parsed.remote.snapshot.push_back(std::move(snapshot));
+    }
+    if (!reader.Scalar(&count) || count > kMaxSessionItems) return false;
+    parsed.remote.items.reserve(count);
+    for (uint16_t index = 0; index < count; ++index) {
+        wqn::StoredWordSessionItem item;
+        std::string item_id;
+        std::string deck_id;
+        if (!reader.String(&item_id, 36) ||
+            !reader.String(&deck_id, 36) ||
+            !CopyFixedText(item.item_id, sizeof(item.item_id), item_id) ||
+            !CopyFixedText(item.deck_id, sizeof(item.deck_id), deck_id) ||
+            !reader.Scalar(&item.ordinal)) {
+            return false;
+        }
+        parsed.remote.items.push_back(std::move(item));
+    }
+    if (!reader.finished() || parsed.position > parsed.remote.items.size()) return false;
+    *session = std::move(parsed);
+    return true;
+}
+
+esp_err_t AtomicWrite(
+    const char* primary,
+    const char* temporary,
+    const char* backup,
+    const void* bytes,
+    size_t size)
+{
+    FILE* file = std::fopen(temporary, "wb");
+    if (file == nullptr) return ESP_FAIL;
+    const bool written = std::fwrite(bytes, 1, size, file) == size;
+    const bool durable = written && std::fflush(file) == 0 && ::fsync(fileno(file)) == 0;
+    const bool closed = std::fclose(file) == 0;
+    if (!durable || !closed) {
+        std::remove(temporary);
+        return ESP_FAIL;
+    }
+    const bool had_primary = FileExists(primary);
+    if (had_primary) {
+        if (std::remove(backup) != 0 && errno != ENOENT) {
+            std::remove(temporary);
+            return ESP_FAIL;
+        }
+        if (std::rename(primary, backup) != 0) {
+            std::remove(temporary);
+            return ESP_FAIL;
+        }
+    }
+    if (std::rename(temporary, primary) != 0) {
+        if (had_primary) std::rename(backup, primary);
+        std::remove(temporary);
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
+esp_err_t SaveSessionRaw(const wqn::PersistedWordSession& session)
+{
+    std::vector<uint8_t> payload;
+    if (!EncodeSession(session, &payload)) return ESP_ERR_INVALID_ARG;
+    SessionHeader header = {};
+    header.magic = kSessionMagic;
+    header.version = kSchemaVersion;
+    header.payload_size = static_cast<uint32_t>(payload.size());
+    header.payload_crc = Crc32(payload.data(), payload.size());
+    std::vector<uint8_t> file_bytes(sizeof(header) + payload.size());
+    std::memcpy(file_bytes.data(), &header, sizeof(header));
+    std::memcpy(file_bytes.data() + sizeof(header), payload.data(), payload.size());
+    return AtomicWrite(
+        kSessionPath,
+        kSessionTempPath,
+        kSessionBackupPath,
+        file_bytes.data(),
+        file_bytes.size());
+}
+
+esp_err_t LoadSessionFile(const char* path, wqn::PersistedWordSession* session)
+{
+    if (session == nullptr) return ESP_ERR_INVALID_ARG;
+    FILE* file = std::fopen(path, "rb");
+    if (file == nullptr) return errno == ENOENT ? ESP_ERR_NOT_FOUND : ESP_FAIL;
+    SessionHeader header = {};
+    const bool header_ok = std::fread(&header, 1, sizeof(header), file) == sizeof(header);
+    if (!header_ok || header.magic != kSessionMagic || header.version != kSchemaVersion ||
+        header.payload_size > kMaxSessionPayloadBytes) {
+        std::fclose(file);
+        return ESP_ERR_INVALID_VERSION;
+    }
+    std::vector<uint8_t> payload(header.payload_size);
+    const bool payload_ok = payload.empty() ||
+        std::fread(payload.data(), 1, payload.size(), file) == payload.size();
+    const int trailing = std::fgetc(file);
+    std::fclose(file);
+    if (!payload_ok || trailing != EOF || Crc32(payload.data(), payload.size()) != header.payload_crc) {
+        return ESP_ERR_INVALID_CRC;
+    }
+    return DecodeSession(payload, session) ? ESP_OK : ESP_ERR_INVALID_RESPONSE;
+}
+
+esp_err_t LoadSessionRaw(wqn::PersistedWordSession* session)
+{
+    esp_err_t result = LoadSessionFile(kSessionPath, session);
+    if (result == ESP_OK || !FileExists(kSessionBackupPath)) return result;
+    const esp_err_t backup_result = LoadSessionFile(kSessionBackupPath, session);
+    if (backup_result == ESP_OK) {
+        ESP_LOGW(kTag, "recovered word session from backup");
+        return SaveSessionRaw(*session);
+    }
+    return result;
+}
+
+uint32_t RecordCrc(const OutboxRecord& record)
+{
+    return Crc32(&record, offsetof(OutboxRecord, crc));
+}
+
+bool CopyField(char* output, size_t output_size, const std::string& value)
+{
+    if (value.empty()) {
+        return false;
+    }
+    return CopyFixedText(output, output_size, value);
+}
+
+wqn::DurableWordObservation ObservationFromRecord(const OutboxRecord& record)
+{
+    wqn::DurableWordObservation observation;
+    observation.request_id = record.request_id;
+    observation.session_id = record.session_id;
+    observation.sequence = record.sequence;
+    observation.item_id = record.item_id;
+    observation.action = static_cast<wqn::protocol::word_study_v1::ObservationAction>(record.action);
+    observation.mode = static_cast<wqn::protocol::word_study_v1::Mode>(record.mode);
+    observation.occurred_at = record.occurred_at;
+    observation.next_position = record.next_position;
+    observation.next_phase = static_cast<wqn::WordPresentationPhase>(record.next_phase);
+    return observation;
+}
+
+bool SameObservation(
+    const wqn::DurableWordObservation& left,
+    const wqn::DurableWordObservation& right)
+{
+    return left.request_id == right.request_id &&
+        left.session_id == right.session_id && left.sequence == right.sequence &&
+        left.item_id == right.item_id && left.action == right.action &&
+        left.mode == right.mode && left.occurred_at == right.occurred_at &&
+        left.next_position == right.next_position && left.next_phase == right.next_phase;
+}
+
+esp_err_t BuildObservationRecord(
+    const wqn::DurableWordObservation& observation,
+    OutboxRecordKind kind,
+    OutboxRecord* record)
+{
+    using wqn::protocol::word_study_v1::Mode;
+    using wqn::protocol::word_study_v1::ObservationAction;
+    if (record == nullptr || observation.sequence > wqn::protocol::v3::kMaxSafeJsonInteger ||
+        static_cast<uint8_t>(observation.action) > static_cast<uint8_t>(ObservationAction::kLookedUp) ||
+        static_cast<uint8_t>(observation.mode) > static_cast<uint8_t>(Mode::kDictionary) ||
+        static_cast<uint8_t>(observation.next_phase) > 1) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *record = {};
+    record->magic = kOutboxMagic;
+    record->version = kSchemaVersion;
+    record->kind = static_cast<uint8_t>(kind);
+    record->action = static_cast<uint8_t>(observation.action);
+    record->mode = static_cast<uint8_t>(observation.mode);
+    record->next_phase = static_cast<uint8_t>(observation.next_phase);
+    record->sequence = observation.sequence;
+    record->next_position = observation.next_position;
+    if (!CopyField(record->request_id, sizeof(record->request_id), observation.request_id)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (kind == OutboxRecordKind::kObservation &&
+        (!CopyField(record->session_id, sizeof(record->session_id), observation.session_id) ||
+         !CopyField(record->item_id, sizeof(record->item_id), observation.item_id) ||
+         !CopyField(record->occurred_at, sizeof(record->occurred_at), observation.occurred_at))) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    record->crc = RecordCrc(*record);
+    return ESP_OK;
+}
+
+esp_err_t ScanOutbox(OutboxScan* scan)
+{
+    if (scan == nullptr) return ESP_ERR_INVALID_ARG;
+    *scan = {};
+    FILE* file = std::fopen(kOutboxPath, "rb");
+    if (file == nullptr && errno == ENOENT && FileExists(kOutboxBackupPath)) {
+        file = std::fopen(kOutboxBackupPath, "rb");
+        scan->backup_source = file != nullptr;
+    }
+    if (file == nullptr) return errno == ENOENT ? ESP_OK : ESP_FAIL;
+    while (true) {
+        OutboxRecord record = {};
+        const size_t read = std::fread(&record, 1, sizeof(record), file);
+        if (read == 0 && std::feof(file)) break;
+        if (read != sizeof(record)) {
+            scan->partial_tail = true;
+            break;
+        }
+        if (record.magic != kOutboxMagic || record.version != kSchemaVersion ||
+            record.crc != RecordCrc(record) || record.request_id[64] != '\0') {
+            std::fclose(file);
+            return ESP_ERR_INVALID_CRC;
+        }
+        ++scan->total_records;
+        const std::string request_id(record.request_id);
+        if (record.kind == static_cast<uint8_t>(OutboxRecordKind::kObservation)) {
+            if (record.session_id[36] != '\0' || record.item_id[36] != '\0' ||
+                record.occurred_at[32] != '\0' || record.next_phase > 1 ||
+                !ValidMode(record.mode) ||
+                record.action > static_cast<uint8_t>(
+                    wqn::protocol::word_study_v1::ObservationAction::kLookedUp)) {
+                std::fclose(file);
+                return ESP_ERR_INVALID_RESPONSE;
+            }
+            const auto existing = std::find_if(
+                scan->pending.begin(), scan->pending.end(),
+                [&](const auto& value) { return request_id == value.request_id; });
+            if (existing == scan->pending.end()) {
+                scan->pending.push_back(record);
+            } else if (std::memcmp(&*existing, &record, sizeof(record)) != 0) {
+                std::fclose(file);
+                return ESP_ERR_INVALID_STATE;
+            }
+        } else if (record.kind == static_cast<uint8_t>(OutboxRecordKind::kAck)) {
+            ++scan->ack_records;
+            scan->pending.erase(
+                std::remove_if(
+                    scan->pending.begin(), scan->pending.end(),
+                    [&](const auto& value) { return request_id == value.request_id; }),
+                scan->pending.end());
+            if (std::find(scan->acknowledged.begin(), scan->acknowledged.end(), request_id) ==
+                scan->acknowledged.end()) {
+                scan->acknowledged.push_back(request_id);
+            }
+        } else {
+            std::fclose(file);
+            return ESP_ERR_INVALID_RESPONSE;
+        }
+    }
+    std::fclose(file);
+    return scan->pending.size() <= wqn::kWordObservationOutboxCapacity
+        ? ESP_OK
+        : ESP_ERR_INVALID_SIZE;
+}
+
+esp_err_t AppendOutboxRecord(const OutboxRecord& record)
+{
+    FILE* file = std::fopen(kOutboxPath, "ab");
+    if (file == nullptr) return ESP_FAIL;
+    const bool written = std::fwrite(&record, 1, sizeof(record), file) == sizeof(record);
+    const bool durable = written && std::fflush(file) == 0 && ::fsync(fileno(file)) == 0;
+    const bool closed = std::fclose(file) == 0;
+    return durable && closed ? ESP_OK : ESP_FAIL;
+}
+
+esp_err_t CompactOutbox(
+    const std::vector<OutboxRecord, wqn::WordStorePsramAllocator<OutboxRecord>>& pending)
+{
+    FILE* file = std::fopen(kOutboxTempPath, "wb");
+    if (file == nullptr) return ESP_FAIL;
+    bool ok = true;
+    for (const OutboxRecord& record : pending) {
+        if (std::fwrite(&record, 1, sizeof(record), file) != sizeof(record)) {
+            ok = false;
+            break;
+        }
+    }
+    const bool durable = ok && std::fflush(file) == 0 && ::fsync(fileno(file)) == 0;
+    const bool closed = std::fclose(file) == 0;
+    if (!durable || !closed) {
+        std::remove(kOutboxTempPath);
+        return ESP_FAIL;
+    }
+    const bool had_primary = FileExists(kOutboxPath);
+    if (had_primary) {
+        if (std::remove(kOutboxBackupPath) != 0 && errno != ENOENT) {
+            std::remove(kOutboxTempPath);
+            return ESP_FAIL;
+        }
+        if (std::rename(kOutboxPath, kOutboxBackupPath) != 0) {
+            std::remove(kOutboxTempPath);
+            return ESP_FAIL;
+        }
+    }
+    if (std::rename(kOutboxTempPath, kOutboxPath) != 0) {
+        if (had_primary) std::rename(kOutboxBackupPath, kOutboxPath);
+        std::remove(kOutboxTempPath);
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
+void ReconcileSession(
+    const std::vector<OutboxRecord, wqn::WordStorePsramAllocator<OutboxRecord>>& pending,
+    wqn::PersistedWordSession* session,
+    bool* changed)
+{
+    if (session == nullptr || changed == nullptr) return;
+    for (const OutboxRecord& observation : pending) {
+        if (session->remote.session_id != observation.session_id ||
+            observation.sequence < session->remote.next_sequence) {
+            continue;
+        }
+        session->position = observation.next_position;
+        session->phase = static_cast<wqn::WordPresentationPhase>(observation.next_phase);
+        session->remote.next_sequence = observation.sequence + 1;
+        *changed = true;
+    }
+}
+
+esp_err_t LoadSessionTransaction(void* context)
+{
+    auto* session = static_cast<wqn::PersistedWordSession*>(context);
+    ESP_RETURN_ON_ERROR(LoadSessionRaw(session), kTag, "load word session");
+    OutboxScan scan;
+    ESP_RETURN_ON_ERROR(ScanOutbox(&scan), kTag, "scan word outbox");
+    bool changed = false;
+    ReconcileSession(scan.pending, session, &changed);
+    if (changed) {
+        ESP_RETURN_ON_ERROR(SaveSessionRaw(*session), kTag, "repair word session cursor");
+    }
+    if (scan.partial_tail || scan.backup_source) {
+        ESP_RETURN_ON_ERROR(CompactOutbox(scan.pending), kTag, "repair word outbox tail");
+    }
+    return ESP_OK;
+}
+
+esp_err_t SaveSessionTransaction(void* context)
+{
+    return SaveSessionRaw(*static_cast<const wqn::PersistedWordSession*>(context));
+}
+
+esp_err_t ClearSessionTransaction(void*)
+{
+    if (std::remove(kSessionPath) != 0 && errno != ENOENT) return ESP_FAIL;
+    if (std::remove(kSessionTempPath) != 0 && errno != ENOENT) return ESP_FAIL;
+    if (std::remove(kSessionBackupPath) != 0 && errno != ENOENT) return ESP_FAIL;
+    return ESP_OK;
+}
+
+struct CommitContext {
+    const wqn::DurableWordObservation* observation;
+    const wqn::PersistedWordSession* advanced_session;
+};
+
+esp_err_t CommitObservationTransaction(void* opaque)
+{
+    auto* context = static_cast<CommitContext*>(opaque);
+    if (context == nullptr || context->observation == nullptr ||
+        context->advanced_session == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    const auto& observation = *context->observation;
+    const auto& session = *context->advanced_session;
+    if (session.remote.session_id != observation.session_id ||
+        session.remote.next_sequence != observation.sequence + 1 ||
+        session.position != observation.next_position ||
+        session.phase != observation.next_phase) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    OutboxScan scan;
+    ESP_RETURN_ON_ERROR(ScanOutbox(&scan), kTag, "scan before word observation");
+    const auto existing = std::find_if(
+        scan.pending.begin(), scan.pending.end(),
+        [&](const auto& value) { return observation.request_id == value.request_id; });
+    if (existing != scan.pending.end()) {
+        if (!SameObservation(ObservationFromRecord(*existing), observation)) {
+            return ESP_ERR_INVALID_STATE;
+        }
+        return SaveSessionRaw(session);
+    }
+    if (std::find(scan.acknowledged.begin(), scan.acknowledged.end(), observation.request_id) !=
+        scan.acknowledged.end()) {
+        return SaveSessionRaw(session);
+    }
+    if (scan.pending.size() >= wqn::kWordObservationOutboxCapacity) {
+        return ESP_ERR_NO_MEM;
+    }
+    if (scan.partial_tail || scan.backup_source) {
+        ESP_RETURN_ON_ERROR(CompactOutbox(scan.pending), kTag, "repair before append");
+    }
+    OutboxRecord record = {};
+    ESP_RETURN_ON_ERROR(
+        BuildObservationRecord(observation, OutboxRecordKind::kObservation, &record),
+        kTag,
+        "encode word observation");
+    ESP_RETURN_ON_ERROR(AppendOutboxRecord(record), kTag, "append word observation");
+    return SaveSessionRaw(session);
+}
+
+esp_err_t PeekObservationTransaction(void* context)
+{
+    auto* observation = static_cast<wqn::DurableWordObservation*>(context);
+    if (observation == nullptr) return ESP_ERR_INVALID_ARG;
+    OutboxScan scan;
+    ESP_RETURN_ON_ERROR(ScanOutbox(&scan), kTag, "scan word outbox");
+    if (scan.partial_tail || scan.backup_source) {
+        ESP_RETURN_ON_ERROR(CompactOutbox(scan.pending), kTag, "repair word outbox tail");
+    }
+    if (scan.pending.empty()) return ESP_ERR_NOT_FOUND;
+    *observation = ObservationFromRecord(scan.pending.front());
+    return ESP_OK;
+}
+
+struct AckContext {
+    const std::string* request_id;
+};
+
+esp_err_t AckObservationTransaction(void* opaque)
+{
+    auto* context = static_cast<AckContext*>(opaque);
+    if (context == nullptr || context->request_id == nullptr || context->request_id->empty()) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    OutboxScan scan;
+    ESP_RETURN_ON_ERROR(ScanOutbox(&scan), kTag, "scan before word ack");
+    const auto pending = std::find_if(
+        scan.pending.begin(), scan.pending.end(),
+        [&](const auto& value) { return *context->request_id == value.request_id; });
+    if (pending == scan.pending.end()) {
+        return std::find(scan.acknowledged.begin(), scan.acknowledged.end(), *context->request_id) !=
+                scan.acknowledged.end()
+            ? ESP_OK
+            : ESP_ERR_NOT_FOUND;
+    }
+
+    wqn::PersistedWordSession session;
+    if (LoadSessionRaw(&session) == ESP_OK &&
+        session.remote.session_id == pending->session_id &&
+        pending->sequence >= session.remote.next_sequence) {
+        session.position = pending->next_position;
+        session.phase = static_cast<wqn::WordPresentationPhase>(pending->next_phase);
+        session.remote.next_sequence = pending->sequence + 1;
+        ESP_RETURN_ON_ERROR(SaveSessionRaw(session), kTag, "reconcile before word ack");
+    }
+
+    OutboxRecord record = {};
+    wqn::DurableWordObservation ack = ObservationFromRecord(*pending);
+    ESP_RETURN_ON_ERROR(
+        BuildObservationRecord(ack, OutboxRecordKind::kAck, &record),
+        kTag,
+        "encode word ack");
+    ESP_RETURN_ON_ERROR(AppendOutboxRecord(record), kTag, "append word ack");
+    scan.pending.erase(pending);
+    if (scan.partial_tail || scan.backup_source ||
+        scan.ack_records + 1 >= kAckCompactionThreshold) {
+        ESP_RETURN_ON_ERROR(CompactOutbox(scan.pending), kTag, "compact word outbox");
+    }
+    return ESP_OK;
+}
+
+esp_err_t SnapshotTransaction(void* context)
+{
+    auto* snapshot = static_cast<wqn::WordOutboxSnapshot*>(context);
+    if (snapshot == nullptr) return ESP_ERR_INVALID_ARG;
+    OutboxScan scan;
+    ESP_RETURN_ON_ERROR(ScanOutbox(&scan), kTag, "scan word outbox snapshot");
+    snapshot->pending_count = scan.pending.size();
+    snapshot->capacity = wqn::kWordObservationOutboxCapacity;
+    return ESP_OK;
+}
+
+template <typename Transaction>
+esp_err_t ExecuteWithStorageLease(
+    const char* holder,
+    Transaction transaction,
+    void* context)
+{
+    wqn::runtime::SleepLease lease = wqn::runtime::SleepLease::TryAcquire(
+        wqn::runtime::SleepBlocker::kStorage, holder, __FILE__, __LINE__);
+    if (!lease) return ESP_ERR_INVALID_STATE;
+    return wqn::services::ExecuteStorageTransaction(transaction, context);
+}
+
+}  // namespace
+
+namespace wqn {
+
+esp_err_t CompactWordSessionData(
+    const protocol::word_study_v1::SessionData& source,
+    StoredWordSessionData* destination)
+{
+    if (destination == nullptr || source.scope.deck_ids.size() >
+            protocol::word_study_v1::kMaxDecks ||
+        source.snapshot.size() > protocol::word_study_v1::kMaxDecks ||
+        source.items.size() > protocol::word_study_v1::kMaxSessionItems) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    StoredWordSessionData compact;
+    compact.session_id = source.session_id;
+    compact.mode = source.mode;
+    compact.purpose = source.purpose;
+    compact.ordering = source.ordering;
+    compact.seed = source.seed;
+    compact.include_mastered = source.scope.include_mastered;
+    compact.optional_count = source.optional_count;
+    compact.next_sequence = source.next_sequence;
+    compact.cursor = source.cursor;
+    compact.has_more = source.has_more;
+    compact.deck_ids.reserve(source.scope.deck_ids.size());
+    for (const std::string& source_id : source.scope.deck_ids) {
+        StoredWordDeckId deck;
+        if (!CopyFixedText(deck.value, sizeof(deck.value), source_id)) {
+            return ESP_ERR_INVALID_ARG;
+        }
+        compact.deck_ids.push_back(deck);
+    }
+    compact.snapshot.reserve(source.snapshot.size());
+    for (const auto& source_snapshot : source.snapshot) {
+        StoredWordPackSnapshot snapshot;
+        if (!CopyFixedText(
+                snapshot.deck_id, sizeof(snapshot.deck_id), source_snapshot.deck_id) ||
+            !CopyFixedText(
+                snapshot.sha256, sizeof(snapshot.sha256), source_snapshot.sha256)) {
+            return ESP_ERR_INVALID_ARG;
+        }
+        snapshot.content_revision = source_snapshot.content_revision;
+        snapshot.pack_revision = source_snapshot.pack_revision;
+        compact.snapshot.push_back(snapshot);
+    }
+    compact.items.reserve(source.items.size());
+    for (const auto& source_item : source.items) {
+        StoredWordSessionItem item;
+        if (!CopyFixedText(item.item_id, sizeof(item.item_id), source_item.item_id) ||
+            !CopyFixedText(item.deck_id, sizeof(item.deck_id), source_item.deck_id)) {
+            return ESP_ERR_INVALID_ARG;
+        }
+        item.ordinal = source_item.ordinal;
+        compact.items.push_back(item);
+    }
+    *destination = std::move(compact);
+    return ESP_OK;
+}
+
+esp_err_t LoadPersistedWordSession(PersistedWordSession* session)
+{
+    if (session == nullptr) return ESP_ERR_INVALID_ARG;
+    *session = {};
+    return ExecuteWithStorageLease("word-session-load", LoadSessionTransaction, session);
+}
+
+esp_err_t SavePersistedWordSession(const PersistedWordSession& session)
+{
+    return ExecuteWithStorageLease(
+        "word-session-save",
+        SaveSessionTransaction,
+        const_cast<PersistedWordSession*>(&session));
+}
+
+esp_err_t ClearPersistedWordSession()
+{
+    return ExecuteWithStorageLease("word-session-clear", ClearSessionTransaction, nullptr);
+}
+
+esp_err_t CommitWordObservation(
+    const DurableWordObservation& observation,
+    const PersistedWordSession& advanced_session)
+{
+    CommitContext context{&observation, &advanced_session};
+    return ExecuteWithStorageLease(
+        "word-observation-commit", CommitObservationTransaction, &context);
+}
+
+esp_err_t PeekPendingWordObservation(DurableWordObservation* observation)
+{
+    if (observation == nullptr) return ESP_ERR_INVALID_ARG;
+    *observation = {};
+    return ExecuteWithStorageLease(
+        "word-outbox-peek", PeekObservationTransaction, observation);
+}
+
+esp_err_t AcknowledgeWordObservation(const std::string& request_id)
+{
+    AckContext context{&request_id};
+    return ExecuteWithStorageLease("word-outbox-ack", AckObservationTransaction, &context);
+}
+
+esp_err_t ReadWordOutboxSnapshot(WordOutboxSnapshot* snapshot)
+{
+    if (snapshot == nullptr) return ESP_ERR_INVALID_ARG;
+    *snapshot = {};
+    return ExecuteWithStorageLease("word-outbox-snapshot", SnapshotTransaction, snapshot);
+}
+
+}  // namespace wqn

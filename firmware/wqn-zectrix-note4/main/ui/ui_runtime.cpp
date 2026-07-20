@@ -303,6 +303,7 @@ UiUpdate UiRuntime::DispatchSyncResult(const wqn::services::SyncEvent& event)
     switch (event.status) {
         case wqn::services::SyncEventStatus::kSucceeded:
             status = "同步完成";
+            wqn::RefreshWordOutboxState(&state_.word_app);
             break;
         case wqn::services::SyncEventStatus::kAwaitingClaim:
             status = "等待配对";

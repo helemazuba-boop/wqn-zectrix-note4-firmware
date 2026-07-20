@@ -48,6 +48,7 @@ idf_component_register(
         "wifi_manager.cpp"
         "word_pack.cpp"
         "word_app.cpp"
+        "word_study_store.cpp"
         "wqn_api.cpp"
         "wqn_api_stream.cpp"
         "flash_session.cpp"

@@ -22,6 +22,7 @@
 #include "mbedtls/sha256.h"
 #include "runtime/sleep_coordinator.h"
 #include "services/storage_service.h"
+#include "word_study_store.h"
 
 namespace {
 
@@ -303,7 +304,20 @@ esp_err_t ParsePackManifestFile(wqn::WqnWordPackManifest* manifest)
 void PruneUnreferencedPackFiles(const wqn::WqnWordPackManifest& current)
 {
     std::vector<std::string> retained_stems;
+    std::vector<std::string> pinned_hash_prefixes;
     AddManifestPackStems(current, &retained_stems);
+
+    wqn::PersistedWordSession pinned_session;
+    if (wqn::LoadPersistedWordSession(&pinned_session) == ESP_OK &&
+        pinned_session.active) {
+        for (const auto& snapshot : pinned_session.remote.snapshot) {
+            const std::string sha256 = snapshot.sha256;
+            if (sha256.size() >= kPackHashStemChars) {
+                pinned_hash_prefixes.push_back(
+                    sha256.substr(0, kPackHashStemChars));
+            }
+        }
+    }
 
     if (FileExists(kManifestBackupPath)) {
         std::string backup_payload;
@@ -334,6 +348,16 @@ void PruneUnreferencedPackFiles(const wqn::WqnWordPackManifest& current)
             sizeof(kPrefix) - 1,
             name.size() - (sizeof(kPrefix) - 1) - (sizeof(kSuffix) - 1));
         if (std::find(retained_stems.begin(), retained_stems.end(), stem) != retained_stems.end()) {
+            continue;
+        }
+        const bool pinned = std::any_of(
+            pinned_hash_prefixes.begin(),
+            pinned_hash_prefixes.end(),
+            [&](const std::string& hash) {
+                return stem.size() > hash.size() &&
+                    stem.compare(stem.size() - hash.size(), hash.size(), hash) == 0;
+            });
+        if (pinned) {
             continue;
         }
         const std::string path = std::string(kStorageRoot) + "/" + name;
@@ -555,6 +579,81 @@ esp_err_t ScanPackFile(
         return ESP_ERR_INVALID_SIZE;
     }
     rollback.committed = true;
+    return ESP_OK;
+}
+
+esp_err_t FindPinnedPackItem(
+    const wqn::StoredWordPackSnapshot& snapshot,
+    wqn::WqnWordPackManifestItem* item)
+{
+    const std::string sha256 = snapshot.sha256;
+    if (item == nullptr || sha256.size() < kPackHashStemChars) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    const std::string suffix = "_" + sha256.substr(0, kPackHashStemChars) + ".wqwp";
+    DIR* directory = opendir(kStorageRoot);
+    if (directory == nullptr) return ESP_FAIL;
+    std::string matched_name;
+    while (dirent* entry = readdir(directory)) {
+        const std::string name = entry->d_name;
+        if (name.size() > suffix.size() + 3 && name.compare(0, 3, "wp_") == 0 &&
+            name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0) {
+            matched_name = name;
+            break;
+        }
+    }
+    closedir(directory);
+    if (matched_name.empty()) return ESP_ERR_NOT_FOUND;
+
+    const std::string path = std::string(kStorageRoot) + "/" + matched_name;
+    FILE* file = std::fopen(path.c_str(), "rb");
+    if (file == nullptr) return ESP_ERR_NOT_FOUND;
+    std::vector<char> line_buffer(kLineBufferSize, 0);
+    std::string line;
+    esp_err_t result = ReadBoundedPackLine(file, &line_buffer, &line);
+    if (result != ESP_OK || line != kPackMagic) {
+        std::fclose(file);
+        return result == ESP_OK ? ESP_ERR_INVALID_RESPONSE : result;
+    }
+    result = ReadBoundedPackLine(file, &line_buffer, &line);
+    std::fclose(file);
+    if (result != ESP_OK) return result;
+
+    JsonDocument metadata(line.c_str());
+    uint64_t revision = 0;
+    uint64_t schema_version = 0;
+    uint64_t entry_count = 0;
+    if (!metadata.ok() ||
+        GetOptionalString(metadata.root(), "deck_id") != snapshot.deck_id ||
+        !GetExactUint64(metadata.root(), "revision", &revision) ||
+        revision != snapshot.content_revision ||
+        !GetExactUint64(metadata.root(), "schema_version", &schema_version) ||
+        schema_version != wqn::protocol::word_study_v1::kPackSchemaVersion ||
+        !GetExactUint64(metadata.root(), "entry_count", &entry_count) ||
+        entry_count > kMaxIndexEntries) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    const std::string stem = matched_name.substr(3, matched_name.size() - 3 - 5);
+    const size_t separator = stem.find('_');
+    if (separator == std::string::npos || separator == 0) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    wqn::WqnWordPackManifestItem parsed;
+    parsed.pack_id = stem.substr(0, separator);
+    parsed.deck_id = snapshot.deck_id;
+    parsed.revision = snapshot.pack_revision;
+    parsed.pack_revision = snapshot.pack_revision;
+    parsed.content_revision = snapshot.content_revision;
+    parsed.schema_version = static_cast<uint32_t>(schema_version);
+    parsed.format = "jsonl";
+    parsed.compression = "none";
+    parsed.sha256 = sha256;
+    parsed.entry_count = static_cast<uint32_t>(entry_count);
+    struct stat status = {};
+    if (stat(path.c_str(), &status) == 0 && S_ISREG(status.st_mode)) {
+        parsed.byte_size = static_cast<uint32_t>(status.st_size);
+    }
+    *item = std::move(parsed);
     return ESP_OK;
 }
 
@@ -787,6 +886,37 @@ esp_err_t LoadWordPackIndex(WordPackIndex* index)
         index->status_message = "词库清单损坏";
         return ESP_OK;
     }
+
+    bool pinned_pack_missing = false;
+    PersistedWordSession pinned_session;
+    if (LoadPersistedWordSession(&pinned_session) == ESP_OK &&
+        pinned_session.active) {
+        for (const auto& snapshot : pinned_session.remote.snapshot) {
+            auto existing = std::find_if(
+                manifest.packs.begin(),
+                manifest.packs.end(),
+                [&](const WqnWordPackManifestItem& value) {
+                    return value.deck_id == snapshot.deck_id;
+                });
+            if (existing != manifest.packs.end() &&
+                existing->sha256 == snapshot.sha256) {
+                continue;
+            }
+            WqnWordPackManifestItem pinned;
+            if (FindPinnedPackItem(snapshot, &pinned) == ESP_OK) {
+                if (existing == manifest.packs.end()) {
+                    manifest.packs.push_back(std::move(pinned));
+                } else {
+                    *existing = std::move(pinned);
+                }
+            } else {
+                pinned_pack_missing = true;
+                if (existing != manifest.packs.end()) {
+                    manifest.packs.erase(existing);
+                }
+            }
+        }
+    }
     index->has_manifest = true;
     index->pack_count = manifest.packs.size();
 
@@ -859,6 +989,9 @@ esp_err_t LoadWordPackIndex(WordPackIndex* index)
 
     if (index->entries.empty() && index->status_message.empty()) {
         index->status_message = "词库为空";
+    } else if (pinned_pack_missing) {
+        index->pack_error = true;
+        index->status_message = "会话词包缺失";
     } else if (index->status_message.empty()) {
         index->status_message = "词库已就绪";
     }

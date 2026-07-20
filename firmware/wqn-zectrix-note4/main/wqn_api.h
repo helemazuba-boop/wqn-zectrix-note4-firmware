@@ -7,6 +7,7 @@
 
 #include "esp_err.h"
 #include "device_protocol/v3.h"
+#include "device_protocol/word_study.h"
 
 namespace wqn {
 
@@ -327,6 +328,16 @@ esp_err_t FetchWordPackManifest(
     const protocol::v3::RequestMetadata& metadata,
     uint64_t cursor,
     WqnWordPackManifest* manifest);
+esp_err_t CreateWordStudySessionV1(
+    const std::string& token,
+    const protocol::word_study_v1::CreateSessionRequest& request,
+    protocol::word_study_v1::SessionData* session,
+    protocol::v3::Error* error);
+esp_err_t SubmitWordStudyObservationV1(
+    const std::string& token,
+    const protocol::word_study_v1::ObservationRequest& request,
+    protocol::word_study_v1::ObservationData* observation,
+    protocol::v3::Error* error);
 using WqnHttpChunkSink = esp_err_t (*)(
     void* context,
     const uint8_t* bytes,
