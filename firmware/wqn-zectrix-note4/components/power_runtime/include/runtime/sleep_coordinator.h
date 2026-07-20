@@ -27,6 +27,31 @@ const char* SleepBlockerName(SleepBlocker blocker);
 // The shared ESP_PM_NO_LIGHT_SLEEP lock is held while at least one lease exists.
 esp_err_t InitSleepCoordinator();
 
+// Short-lived ownership token for CPU-bound foreground work. This requests
+// the configured maximum CPU frequency without disabling DFS globally. Keep
+// its scope narrow; work that must also block sleep still needs a SleepLease.
+class CpuPerformanceLease {
+public:
+    CpuPerformanceLease() = default;
+    ~CpuPerformanceLease();
+
+    CpuPerformanceLease(const CpuPerformanceLease&) = delete;
+    CpuPerformanceLease& operator=(const CpuPerformanceLease&) = delete;
+
+    CpuPerformanceLease(CpuPerformanceLease&& other) noexcept;
+    CpuPerformanceLease& operator=(CpuPerformanceLease&& other) noexcept;
+
+    static CpuPerformanceLease TryAcquire();
+
+    explicit operator bool() const { return active_; }
+    void Reset();
+
+private:
+    explicit CpuPerformanceLease(bool active) : active_(active) {}
+
+    bool active_ = false;
+};
+
 // Move-only ownership token for work that must finish before deep sleep.
 // Acquisition fails once the power coordinator starts quiescing the system.
 class SleepLease {

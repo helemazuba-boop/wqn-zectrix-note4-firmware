@@ -877,6 +877,9 @@ esp_err_t LoadWordPackIndexInternal(
     if (index == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
+    // SHA verification, JSONL scanning and dictionary sorting are CPU-bound.
+    // Keep maximum frequency scoped to this rebuild instead of disabling DFS.
+    auto cpu_lease = runtime::CpuPerformanceLease::TryAcquire();
     *index = WordPackIndex{};
     index->mounted = InitWordPackStorage() == ESP_OK;
     if (!index->mounted) {

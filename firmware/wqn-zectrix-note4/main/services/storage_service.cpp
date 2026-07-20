@@ -5,6 +5,7 @@
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "runtime/sleep_coordinator.h"
 
 namespace {
 
@@ -56,9 +57,15 @@ void StorageServiceTask(void*)
         }
         StorageReply reply;
         reply.request_id = command.request_id;
-        reply.result = command.transaction == nullptr
-            ? ESP_ERR_INVALID_ARG
-            : command.transaction(command.context);
+        {
+            // Serialization, checksums and SPIFFS/NVS bookkeeping otherwise
+            // run at the 40 MHz DFS floor. Boost only for the bounded
+            // transaction; idle operation remains free to downclock.
+            auto cpu_lease = wqn::runtime::CpuPerformanceLease::TryAcquire();
+            reply.result = command.transaction == nullptr
+                ? ESP_ERR_INVALID_ARG
+                : command.transaction(command.context);
+        }
         // ESP-IDF reports this high-water mark in bytes, unlike upstream
         // FreeRTOS which documents stack words.
         const UBaseType_t free_stack_bytes = uxTaskGetStackHighWaterMark(nullptr);
