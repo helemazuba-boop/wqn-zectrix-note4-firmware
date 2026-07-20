@@ -34,6 +34,15 @@ constexpr char kPackMagic[] = "WQN_WORD_PACK_V2";
 constexpr size_t kMaxIndexEntries = wqn::protocol::word_study_v1::kMaxPackEntries;
 constexpr size_t kMaxPackBytes = wqn::protocol::word_study_v1::kMaxPackBytes;
 constexpr size_t kMaxLineBytes = wqn::protocol::word_study_v1::kMaxPackLineBytes;
+constexpr size_t kPackIdStemChars = 6;
+constexpr size_t kPackHashStemChars = 12;
+// SPIFFS counts the leading slash in its object name and reserves one byte for
+// NUL. Keep the longest final suffix (.wqwp) strictly within that budget.
+constexpr size_t kMaxPackObjectNameBytes =
+    1 + 3 + kPackIdStemChars + 1 + kPackHashStemChars + 5;
+static_assert(
+    kMaxPackObjectNameBytes <= CONFIG_SPIFFS_OBJ_NAME_LEN - 1,
+    "word pack filename exceeds SPIFFS object-name budget");
 // Maximum contract line, its required LF, and the terminating NUL for fgets.
 constexpr size_t kLineBufferSize = kMaxLineBytes + 2;
 
@@ -127,13 +136,13 @@ namespace wqn {
 std::string SafePackStem(const WqnWordPackManifestItem& item)
 {
     std::string stem;
-    stem.reserve(25);
+    stem.reserve(kPackIdStemChars + 1 + kPackHashStemChars);
     for (const char ch : item.pack_id) {
         const bool keep = (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z');
         if (keep) {
             stem.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
         }
-        if (stem.size() >= 8) {
+        if (stem.size() >= kPackIdStemChars) {
             break;
         }
     }
@@ -149,7 +158,7 @@ std::string SafePackStem(const WqnWordPackManifestItem& item)
                               (ch >= 'A' && ch <= 'F');
             if (keep) {
                 stem.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
-                if (++hash_chars >= 16) {
+                if (++hash_chars >= kPackHashStemChars) {
                     break;
                 }
             }
@@ -897,6 +906,11 @@ esp_err_t WordPackStreamTransaction(void* opaque)
             std::remove(temp_path.c_str());
             context->file = std::fopen(temp_path.c_str(), "wb");
             if (context->file == nullptr) {
+                ESP_LOGW(
+                    kTag,
+                    "word pack temp open failed: path=%s errno=%d",
+                    temp_path.c_str(),
+                    errno);
                 return ESP_FAIL;
             }
             if (mbedtls_sha256_starts(&context->sha, 0) != 0) {
