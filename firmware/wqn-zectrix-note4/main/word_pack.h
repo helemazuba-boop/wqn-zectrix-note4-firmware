@@ -66,6 +66,13 @@ struct WordPackIndexEntry {
     int32_t sort_index;
 };
 
+struct WordPackIdentity {
+    char deck_id[37] = {};
+    uint64_t content_revision = 0;
+    uint64_t pack_revision = 0;
+    char sha256[65] = {};
+};
+
 struct WordPackIndex {
     bool mounted = false;
     bool has_manifest = false;
@@ -77,6 +84,7 @@ struct WordPackIndex {
     uint64_t manifest_revision = 0;
     std::vector<WordPackIndexEntry, PsramAllocator<WordPackIndexEntry>> entries;
     std::vector<uint32_t, PsramAllocator<uint32_t>> dictionary_order;
+    std::vector<WordPackIdentity, PsramAllocator<WordPackIdentity>> pack_identities;
 };
 
 esp_err_t InitWordPackStorage();
@@ -90,6 +98,9 @@ esp_err_t LoadWordPackIndex(WordPackIndex* index);
 esp_err_t LoadWordPackIndexForSession(
     const PersistedWordSession& session,
     WordPackIndex* index);
+bool WordPackIndexMatchesSession(
+    const WordPackIndex& index,
+    const PersistedWordSession& session);
 esp_err_t DownloadWordPackToStorage(
     const std::string& token,
     const protocol::v3::RequestMetadata& metadata,

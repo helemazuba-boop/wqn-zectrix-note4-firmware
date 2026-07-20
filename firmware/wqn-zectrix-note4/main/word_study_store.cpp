@@ -14,6 +14,7 @@
 #include "esp_check.h"
 #include "esp_log.h"
 #include "esp_rom_crc.h"
+#include "esp_timer.h"
 #include "runtime/sleep_coordinator.h"
 #include "services/storage_service.h"
 
@@ -861,8 +862,10 @@ esp_err_t CommitObservationTransaction(void* opaque)
         session.phase != observation.next_phase) {
         return ESP_ERR_INVALID_ARG;
     }
+    const int64_t started_us = esp_timer_get_time();
     OutboxScan scan;
     ESP_RETURN_ON_ERROR(ScanOutbox(&scan), kTag, "scan before word observation");
+    const int64_t scanned_us = esp_timer_get_time();
     const auto existing = std::find_if(
         scan.pending.begin(), scan.pending.end(),
         [&](const auto& value) { return observation.request_id == value.request_id; });
@@ -891,7 +894,20 @@ esp_err_t CommitObservationTransaction(void* opaque)
         kTag,
         "encode word observation");
     ESP_RETURN_ON_ERROR(AppendOutboxRecord(record), kTag, "append word observation");
-    return SaveSessionRaw(session);
+    const int64_t appended_us = esp_timer_get_time();
+    ESP_LOGI(
+        kTag,
+        "word observation durable: sequence=%llu scan_ms=%lld append_ms=%lld total_ms=%lld",
+        static_cast<unsigned long long>(observation.sequence),
+        static_cast<long long>((scanned_us - started_us) / 1000),
+        static_cast<long long>((appended_us - scanned_us) / 1000),
+        static_cast<long long>((appended_us - started_us) / 1000));
+    // The durable record includes next_position, next_phase, and sequence.
+    // LoadSessionTransaction and AckObservationTransaction already reconcile
+    // an older session file from these records. Rewriting and fsyncing the
+    // complete session here added ~2 seconds to every card action without
+    // increasing power-loss safety.
+    return ESP_OK;
 }
 
 esp_err_t PeekObservationTransaction(void* context)

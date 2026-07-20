@@ -926,6 +926,28 @@ esp_err_t LoadWordPackIndexInternal(
     }
     index->has_manifest = true;
     index->pack_count = manifest.packs.size();
+    index->pack_identities.reserve(manifest.packs.size());
+    for (const WqnWordPackManifestItem& item : manifest.packs) {
+        if (item.deck_id.size() != 36 || item.sha256.size() != 64) {
+            index->pack_error = true;
+            index->status_message = "词库清单无效";
+            return ESP_OK;
+        }
+        WordPackIdentity identity;
+        std::snprintf(
+            identity.deck_id,
+            sizeof(identity.deck_id),
+            "%s",
+            item.deck_id.c_str());
+        identity.content_revision = item.content_revision;
+        identity.pack_revision = item.pack_revision;
+        std::snprintf(
+            identity.sha256,
+            sizeof(identity.sha256),
+            "%s",
+            item.sha256.c_str());
+        index->pack_identities.push_back(identity);
+    }
 
     size_t expected_entries = 0;
     for (const WqnWordPackManifestItem& item : manifest.packs) {
@@ -1032,6 +1054,31 @@ esp_err_t LoadWordPackIndexForSession(
     WordPackIndex* index)
 {
     return LoadWordPackIndexInternal(&session, index);
+}
+
+bool WordPackIndexMatchesSession(
+    const WordPackIndex& index,
+    const PersistedWordSession& session)
+{
+    if (!index.mounted || !index.has_manifest || index.pack_error ||
+        !session.active || session.remote.snapshot.empty()) {
+        return false;
+    }
+    for (const StoredWordPackSnapshot& snapshot : session.remote.snapshot) {
+        const auto identity = std::find_if(
+            index.pack_identities.begin(),
+            index.pack_identities.end(),
+            [&](const WordPackIdentity& value) {
+                return std::strcmp(value.deck_id, snapshot.deck_id) == 0;
+            });
+        if (identity == index.pack_identities.end() ||
+            identity->content_revision != snapshot.content_revision ||
+            identity->pack_revision != snapshot.pack_revision ||
+            std::strcmp(identity->sha256, snapshot.sha256) != 0) {
+            return false;
+        }
+    }
+    return true;
 }
 
 enum class WordPackStreamOperation : uint8_t {

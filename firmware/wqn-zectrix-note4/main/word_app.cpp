@@ -467,17 +467,25 @@ esp_err_t HandleWordAppInput(WordAppState* state, WordInput input)
                 stored_session.active && stored_session.paused &&
                 (stored_session.position < stored_session.remote.items.size() ||
                  (stored_session.position == stored_session.remote.items.size() &&
-                  stored_session.remote.has_more))) {
+                stored_session.remote.has_more))) {
                 state->session.persisted = std::move(stored_session);
-                WordPackIndex pinned_index;
-                const esp_err_t pinned_result = LoadWordPackIndexForSession(
-                    state->session.persisted, &pinned_index);
-                if (pinned_result != ESP_OK || pinned_index.pack_error) {
-                    state->message = "会话词包不可用";
-                    return ESP_OK;
+                if (!WordPackIndexMatchesSession(
+                        state->pack_index,
+                        state->session.persisted)) {
+                    WordPackIndex pinned_index;
+                    const esp_err_t pinned_result = LoadWordPackIndexForSession(
+                        state->session.persisted, &pinned_index);
+                    if (pinned_result != ESP_OK || pinned_index.pack_error) {
+                        state->message = "会话词包不可用";
+                        return ESP_OK;
+                    }
+                    InstallWordPackIndex(
+                        state, std::move(pinned_index), "已载入会话词包");
+                } else {
+                    ESP_LOGI(
+                        kTag,
+                        "reuse in-memory word pack index for pinned session");
                 }
-                InstallWordPackIndex(
-                    state, std::move(pinned_index), "已载入会话词包");
             }
             if (state->session.persisted.active &&
                 state->session.persisted.paused &&
