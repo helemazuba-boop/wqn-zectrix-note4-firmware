@@ -6,6 +6,7 @@
 #include "config.h"
 #include "esp_chip_info.h"
 #include "esp_flash.h"
+#include "esp_heap_caps.h"
 #include "esp_idf_version.h"
 #include "esp_log.h"
 #include "esp_mac.h"
@@ -57,6 +58,23 @@ const char* ResetReasonToString(esp_reset_reason_t reason)
 }  // namespace
 
 namespace wqn {
+
+bool ReadPlatformDiagnosticsSnapshot(PlatformDiagnosticsSnapshot* snapshot)
+{
+    if (snapshot == nullptr) {
+        return false;
+    }
+    *snapshot = {};
+    snapshot->flash_valid = esp_flash_get_size(nullptr, &snapshot->flash_size) == ESP_OK;
+    snapshot->psram_valid = esp_psram_is_initialized();
+    if (snapshot->psram_valid) {
+        snapshot->psram_total = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
+        snapshot->psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    }
+    snapshot->wifi_mac_valid =
+        esp_read_mac(snapshot->wifi_mac.data(), ESP_MAC_WIFI_STA) == ESP_OK;
+    return snapshot->flash_valid || snapshot->psram_valid || snapshot->wifi_mac_valid;
+}
 
 void PrintBootDiagnostics()
 {

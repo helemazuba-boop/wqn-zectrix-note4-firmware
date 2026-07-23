@@ -7,42 +7,28 @@
 #include <limits>
 #include <utility>
 
-#include "driver/gpio.h"
-#include "driver/i2c_master.h"
-#include "driver/i2s_std.h"
 #include "esp_check.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
-#include "power_manager.h"
+#include "services/audio_service.h"
 
 namespace {
 
 constexpr char kTag[] = "wqn_audio_capture";
 
-constexpr gpio_num_t kAudioPower = GPIO_NUM_42;
-constexpr gpio_num_t kAudioAmp = GPIO_NUM_46;
-
-constexpr gpio_num_t kI2sMclk = GPIO_NUM_14;
-constexpr gpio_num_t kI2sBclk = GPIO_NUM_15;
-constexpr gpio_num_t kI2sWs = GPIO_NUM_38;
-constexpr gpio_num_t kI2sDin = GPIO_NUM_16;
-
-constexpr gpio_num_t kCodecSda = GPIO_NUM_47;
-constexpr gpio_num_t kCodecScl = GPIO_NUM_48;
-constexpr i2c_port_num_t kCodecI2cPort = I2C_NUM_0;
-constexpr uint8_t kEs8311Address = 0x18;
-
 constexpr int kStereoChannels = 2;
 constexpr int kMaxCaptureMs = 20000;
+constexpr size_t kMaxCaptureSamples =
+    static_cast<size_t>(wqn::kAudioCaptureSampleRate) *
+    (kMaxCaptureMs / 1000);
 constexpr size_t kReadFrames = 240;
 constexpr size_t kReadSamples = kReadFrames * kStereoChannels;
 constexpr uint32_t kI2sDmaFrameNum = 256;
 constexpr int kMaxConsecutiveReadTimeouts = 5;
 constexpr int kAudioPowerWarmupMs = 250;
-constexpr int64_t kAudioPowerIdleOffDelayUs = 15 * 1000 * 1000;
 
 constexpr uint8_t ES8311_RESET_REG00 = 0x00;
 constexpr uint8_t ES8311_CLK_MANAGER_REG01 = 0x01;
@@ -80,12 +66,12 @@ struct AudioServiceState {
     bool initialized = false;
     bool rx_enabled = false;
     bool audio_powered = false;
-    bool power_off_pending = false;
+    esp_err_t terminal_result = ESP_OK;
     TaskHandle_t task = nullptr;
-    i2c_master_bus_handle_t i2c_bus = nullptr;
-    i2s_chan_handle_t rx = nullptr;
-    esp_timer_handle_t power_timer = nullptr;
+    wqn::services::AudioBusHandle i2c_bus = nullptr;
+    wqn::services::AudioChannelHandle rx = nullptr;
     wqn::AudioCaptureChunk chunk;
+    wqn::services::AudioSession session;
 };
 
 AudioServiceState g_audio;
@@ -104,31 +90,24 @@ int64_t IntegerSqrt(int64_t value)
     return result;
 }
 
-void SetAudioPowerUnlocked(bool /*enabled*/)
+esp_err_t SetAudioPowerUnlocked(bool /*enabled*/)
 {
     // [inflight-fix] GPIO42 (codec power) is boot-常通 - do not toggle here
     // (was causing pop + cold-start recording garbage). Only manage the PA
     // (GPIO46): off during capture to avoid feedback.
-    gpio_hold_dis(kAudioAmp);
-    gpio_set_level(kAudioAmp, 0);
-    gpio_hold_en(kAudioAmp);
+    const esp_err_t result = wqn::services::SetAudioAmplifier(
+        g_audio.session, false);
+    if (result != ESP_OK) {
+        ESP_LOGW(kTag, "disable amplifier failed: %s", esp_err_to_name(result));
+    }
+    return result;
 }
 
-void AudioPowerOffTimerCallback(void*)
+void RecordFirstError(esp_err_t candidate, esp_err_t* result)
 {
-    if (g_audio.mutex == nullptr) {
-        return;
+    if (result != nullptr && *result == ESP_OK && candidate != ESP_OK) {
+        *result = candidate;
     }
-    xSemaphoreTake(g_audio.mutex, portMAX_DELAY);
-    if (!g_audio.power_off_pending || g_audio.running) {
-        xSemaphoreGive(g_audio.mutex);
-        return;
-    }
-    g_audio.power_off_pending = false;
-    g_audio.audio_powered = false;
-    SetAudioPowerUnlocked(false);
-    xSemaphoreGive(g_audio.mutex);
-    ESP_LOGI(kTag, "audio power off after idle delay");
 }
 
 esp_err_t EnsureAudioService()
@@ -139,49 +118,7 @@ esp_err_t EnsureAudioService()
             return ESP_ERR_NO_MEM;
         }
     }
-    if (g_audio.power_timer != nullptr) {
-        return ESP_OK;
-    }
-    esp_timer_create_args_t args = {};
-    args.callback = AudioPowerOffTimerCallback;
-    args.arg = nullptr;
-    args.dispatch_method = ESP_TIMER_TASK;
-    args.name = "wqn_audio_power";
-    args.skip_unhandled_events = true;
-    return esp_timer_create(&args, &g_audio.power_timer);
-}
-
-void CancelAudioPowerOffTimerUnlocked()
-{
-    if (g_audio.power_timer != nullptr) {
-        // esp_timer_stop returns ESP_ERR_INVALID_STATE if the timer was never
-        // started or already expired - both are benign here. Using
-        // ESP_ERROR_CHECK_WITHOUT_ABORT would log a scary abort when Flash
-        // mode (which never starts this timer) transitions to STD/Pro.
-        const esp_err_t ret = esp_timer_stop(g_audio.power_timer);
-        if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
-            ESP_LOGW(kTag, "esp_timer_stop unexpected: %s", esp_err_to_name(ret));
-        }
-    }
-}
-
-void ScheduleAudioPowerOff()
-{
-    if (EnsureAudioService() != ESP_OK) {
-        SetAudioPowerUnlocked(false);
-        return;
-    }
-    xSemaphoreTake(g_audio.mutex, portMAX_DELAY);
-    CancelAudioPowerOffTimerUnlocked();
-    g_audio.power_off_pending = true;
-    const esp_err_t result = esp_timer_start_once(g_audio.power_timer, kAudioPowerIdleOffDelayUs);
-    if (result != ESP_OK) {
-        ESP_LOGW(kTag, "schedule audio power off failed: %s", esp_err_to_name(result));
-        g_audio.power_off_pending = false;
-        g_audio.audio_powered = false;
-        SetAudioPowerUnlocked(false);
-    }
-    xSemaphoreGive(g_audio.mutex);
+    return ESP_OK;
 }
 
 esp_err_t PrepareAudioPowerForCapture()
@@ -189,12 +126,16 @@ esp_err_t PrepareAudioPowerForCapture()
     ESP_RETURN_ON_ERROR(EnsureAudioService(), kTag, "create audio service");
 
     xSemaphoreTake(g_audio.mutex, portMAX_DELAY);
-    CancelAudioPowerOffTimerUnlocked();
-    g_audio.power_off_pending = false;
     const bool was_powered = g_audio.audio_powered;
-    g_audio.audio_powered = true;
-    SetAudioPowerUnlocked(true);
+    const esp_err_t power_result = SetAudioPowerUnlocked(true);
+    if (power_result == ESP_OK) {
+        g_audio.audio_powered = true;
+    }
     xSemaphoreGive(g_audio.mutex);
+
+    if (power_result != ESP_OK) {
+        return power_result;
+    }
 
     if (!was_powered) {
         vTaskDelay(pdMS_TO_TICKS(kAudioPowerWarmupMs));
@@ -202,7 +143,7 @@ esp_err_t PrepareAudioPowerForCapture()
     return ESP_OK;
 }
 
-esp_err_t InitI2c(i2c_master_bus_handle_t* bus)
+esp_err_t InitI2c(wqn::services::AudioBusHandle* bus)
 {
     if (bus == nullptr) {
         return ESP_ERR_INVALID_ARG;
@@ -210,50 +151,39 @@ esp_err_t InitI2c(i2c_master_bus_handle_t* bus)
     if (*bus != nullptr) {
         return ESP_OK;
     }
-    *bus = wqn::GetSharedI2cBusHandle();
-    if (*bus == nullptr) {
-        ESP_LOGW(kTag, "shared I2C bus not available, creating own");
-        i2c_master_bus_config_t config = {};
-        config.i2c_port = kCodecI2cPort;
-        config.sda_io_num = kCodecSda;
-        config.scl_io_num = kCodecScl;
-        config.clk_source = I2C_CLK_SRC_DEFAULT;
-        config.glitch_ignore_cnt = 7;
-        config.flags.enable_internal_pullup = 1;
-        return i2c_new_master_bus(&config, bus);
-    }
-    return ESP_OK;
+    return wqn::services::GetSharedAudioBus(g_audio.session, bus);
 }
 
-esp_err_t AddCodecDevice(i2c_master_bus_handle_t bus, i2c_master_dev_handle_t* dev)
+esp_err_t AddCodecDevice(
+    wqn::services::AudioBusHandle bus,
+    wqn::services::AudioCodecHandle* dev)
 {
     if (bus == nullptr || dev == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
-    i2c_device_config_t config = {};
-    config.dev_addr_length = I2C_ADDR_BIT_LEN_7;
-    config.device_address = kEs8311Address;
-    config.scl_speed_hz = 100000;
-    return i2c_master_bus_add_device(bus, &config, dev);
+    return wqn::services::AddAudioCodec(g_audio.session, bus, dev);
 }
 
-esp_err_t WriteCodecReg(i2c_master_dev_handle_t dev, uint8_t reg, uint8_t value)
+esp_err_t WriteCodecReg(
+    wqn::services::AudioCodecHandle dev, uint8_t reg, uint8_t value)
 {
-    const uint8_t data[] = {reg, value};
-    return i2c_master_transmit(dev, data, sizeof(data), 100);
+    return wqn::services::WriteAudioCodecRegister(
+        g_audio.session, dev, reg, value);
 }
 
-esp_err_t ReadCodecReg(i2c_master_dev_handle_t dev, uint8_t reg, uint8_t* value)
+esp_err_t ReadCodecReg(
+    wqn::services::AudioCodecHandle dev, uint8_t reg, uint8_t* value)
 {
     if (value == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
-    return i2c_master_transmit_receive(dev, &reg, sizeof(reg), value, sizeof(*value), 100);
+    return wqn::services::ReadAudioCodecRegister(
+        g_audio.session, dev, reg, value);
 }
 
-esp_err_t InitEs8311Adc(i2c_master_bus_handle_t bus)
+esp_err_t InitEs8311Adc(wqn::services::AudioBusHandle bus)
 {
-    i2c_master_dev_handle_t dev = nullptr;
+    wqn::services::AudioCodecHandle dev = nullptr;
     ESP_RETURN_ON_ERROR(AddCodecDevice(bus, &dev), kTag, "add ES8311 device");
 
     auto write = [&](uint8_t reg, uint8_t value) -> esp_err_t {
@@ -327,66 +257,44 @@ esp_err_t InitEs8311Adc(i2c_master_bus_handle_t bus)
     ret |= write(ES8311_DAC_REG37, 0x08);
     ret |= write(ES8311_GP_REG45, 0x00);
 
-    ESP_ERROR_CHECK_WITHOUT_ABORT(i2c_master_bus_rm_device(dev));
+    RecordFirstError(
+        wqn::services::RemoveAudioCodec(g_audio.session, &dev), &ret);
     return ret;
 }
 
-esp_err_t InitI2s(i2s_chan_handle_t* rx_handle)
+esp_err_t InitI2s(wqn::services::AudioChannelHandle* rx_handle)
 {
     if (rx_handle == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
     if (*rx_handle != nullptr) {
         if (!g_audio.rx_enabled) {
-            ESP_RETURN_ON_ERROR(i2s_channel_enable(*rx_handle), kTag, "enable I2S RX");
+            ESP_RETURN_ON_ERROR(
+                wqn::services::EnableAudioChannel(g_audio.session, *rx_handle),
+                kTag, "enable I2S RX");
             g_audio.rx_enabled = true;
         }
         return ESP_OK;
     }
-    i2s_chan_config_t channel_config = {};
-    channel_config.id = I2S_NUM_0;
-    channel_config.role = I2S_ROLE_MASTER;
-    channel_config.dma_desc_num = 6;
-    channel_config.dma_frame_num = kI2sDmaFrameNum;
-    channel_config.auto_clear_after_cb = true;
-    channel_config.auto_clear_before_cb = false;
-    channel_config.intr_priority = 0;
-    ESP_RETURN_ON_ERROR(i2s_new_channel(&channel_config, nullptr, rx_handle), kTag, "create I2S RX channel");
-
-    i2s_std_config_t std_config = {};
-    std_config.clk_cfg.sample_rate_hz = wqn::kAudioCaptureSampleRate;
-    std_config.clk_cfg.clk_src = I2S_CLK_SRC_DEFAULT;
-    std_config.clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_256;
-    std_config.slot_cfg.data_bit_width = I2S_DATA_BIT_WIDTH_16BIT;
-    std_config.slot_cfg.slot_bit_width = I2S_SLOT_BIT_WIDTH_AUTO;
-    std_config.slot_cfg.slot_mode = I2S_SLOT_MODE_STEREO;
-    std_config.slot_cfg.slot_mask = I2S_STD_SLOT_BOTH;
-    std_config.slot_cfg.ws_width = I2S_DATA_BIT_WIDTH_16BIT;
-    std_config.slot_cfg.ws_pol = false;
-    std_config.slot_cfg.bit_shift = true;
-    std_config.slot_cfg.left_align = true;
-    std_config.slot_cfg.big_endian = false;
-    std_config.slot_cfg.bit_order_lsb = false;
-    std_config.gpio_cfg.mclk = kI2sMclk;
-    std_config.gpio_cfg.bclk = kI2sBclk;
-    std_config.gpio_cfg.ws = kI2sWs;
-    std_config.gpio_cfg.dout = I2S_GPIO_UNUSED;
-    std_config.gpio_cfg.din = kI2sDin;
-    std_config.gpio_cfg.invert_flags.mclk_inv = false;
-    std_config.gpio_cfg.invert_flags.bclk_inv = false;
-    std_config.gpio_cfg.invert_flags.ws_inv = false;
-
-    ESP_RETURN_ON_ERROR(i2s_channel_init_std_mode(*rx_handle, &std_config), kTag, "init I2S RX std mode");
-    ESP_RETURN_ON_ERROR(i2s_channel_enable(*rx_handle), kTag, "enable I2S RX");
+    ESP_RETURN_ON_ERROR(
+        wqn::services::CreateAudioRxChannel(
+            g_audio.session, wqn::kAudioCaptureSampleRate,
+            kI2sDmaFrameNum, true, rx_handle),
+        kTag, "create I2S RX channel");
     g_audio.rx_enabled = true;
     return ESP_OK;
 }
 
-void CleanupCaptureHardware(bool keep_power)
+esp_err_t CleanupCaptureHardware(bool keep_power)
 {
+    esp_err_t result = ESP_OK;
     if (g_audio.rx != nullptr && g_audio.rx_enabled) {
-        ESP_ERROR_CHECK_WITHOUT_ABORT(i2s_channel_disable(g_audio.rx));
-        g_audio.rx_enabled = false;
+        const esp_err_t disable_result =
+            wqn::services::DisableAudioChannel(g_audio.session, g_audio.rx);
+        RecordFirstError(disable_result, &result);
+        if (disable_result == ESP_OK) {
+            g_audio.rx_enabled = false;
+        }
     }
     // [i2s-handoff] Always delete the RX channel (not just disable) so the
     // I2S_NUM_0 RX slot is released for Flash's duplex channels. A disabled
@@ -395,27 +303,30 @@ void CleanupCaptureHardware(bool keep_power)
     // after a STD recording. Mirrors audio_player.cpp StopAudioPlayback (which
     // deletes g_player.tx). InitI2s recreates the channel on next start.
     if (g_audio.rx != nullptr) {
-        ESP_ERROR_CHECK_WITHOUT_ABORT(i2s_del_channel(g_audio.rx));
-        g_audio.rx = nullptr;
+        const esp_err_t delete_result =
+            wqn::services::DeleteAudioChannel(g_audio.session, &g_audio.rx);
+        RecordFirstError(delete_result, &result);
+        if (delete_result == ESP_OK) {
+            g_audio.rx_enabled = false;
+        }
     }
     if (!keep_power && g_audio.i2c_bus != nullptr) {
-        if (g_audio.i2c_bus != wqn::GetSharedI2cBusHandle()) {
-            ESP_ERROR_CHECK_WITHOUT_ABORT(i2c_del_master_bus(g_audio.i2c_bus));
-        }
         g_audio.i2c_bus = nullptr;
     }
     if (!keep_power) {
         if (EnsureAudioService() != ESP_OK) {
-            SetAudioPowerUnlocked(false);
-            return;
+            RecordFirstError(SetAudioPowerUnlocked(false), &result);
+            return result;
         }
         xSemaphoreTake(g_audio.mutex, portMAX_DELAY);
-        CancelAudioPowerOffTimerUnlocked();
-        g_audio.power_off_pending = false;
-        g_audio.audio_powered = false;
-        SetAudioPowerUnlocked(false);
+        const esp_err_t power_result = SetAudioPowerUnlocked(false);
+        RecordFirstError(power_result, &result);
+        if (power_result == ESP_OK) {
+            g_audio.audio_powered = false;
+        }
         xSemaphoreGive(g_audio.mutex);
     }
+    return result;
 }
 
 bool StopRequested()
@@ -445,10 +356,18 @@ void CaptureTask(void*)
 
     if (result != ESP_OK) {
         ESP_LOGE(kTag, "audio capture init failed: %s", esp_err_to_name(result));
-        CleanupCaptureHardware(false);
+        esp_err_t terminal_result = result;
+        RecordFirstError(
+            CleanupCaptureHardware(false), &terminal_result);
+        if (g_audio.rx == nullptr) {
+            RecordFirstError(
+                wqn::services::EndAudioActivity(&g_audio.session),
+                &terminal_result);
+        }
         xSemaphoreTake(g_audio.mutex, portMAX_DELAY);
         g_audio.running = false;
         g_audio.task = nullptr;
+        g_audio.terminal_result = terminal_result;
         xSemaphoreGive(g_audio.mutex);
         vTaskDelete(nullptr);
         return;
@@ -465,6 +384,7 @@ void CaptureTask(void*)
     size_t stereo_frames = 0;
     int consecutive_timeouts = 0;
     bool read_failed = false;
+    bool sample_capacity_reached = false;
     while (!StopRequested()) {
         const int elapsed_ms = static_cast<int>((esp_timer_get_time() - start_us) / 1000);
         if (elapsed_ms >= kMaxCaptureMs) {
@@ -473,7 +393,9 @@ void CaptureTask(void*)
         }
 
         size_t bytes_read = 0;
-        result = i2s_channel_read(g_audio.rx, buffer, sizeof(buffer), &bytes_read, pdMS_TO_TICKS(1000));
+        result = wqn::services::ReadAudioChannel(
+            g_audio.session, g_audio.rx, buffer, sizeof(buffer),
+            &bytes_read, pdMS_TO_TICKS(1000));
         if (result != ESP_OK) {
             ESP_LOGW(kTag, "I2S read failed: %s", esp_err_to_name(result));
             if (++consecutive_timeouts >= kMaxConsecutiveReadTimeouts) {
@@ -486,6 +408,10 @@ void CaptureTask(void*)
 
         const size_t samples_read = bytes_read / sizeof(int16_t);
         for (size_t i = 0; i + 1 < samples_read; i += 2) {
+            if (g_audio.chunk.samples.size() >= kMaxCaptureSamples) {
+                sample_capacity_reached = true;
+                break;
+            }
             const int left = static_cast<int>(buffer[i]);
             const int right = static_cast<int>(buffer[i + 1]);
             const int mixed = (left + right) / 2;
@@ -508,9 +434,20 @@ void CaptureTask(void*)
                 static_cast<int16_t>(std::min(abs_value, static_cast<int>(std::numeric_limits<int16_t>::max()))));
         }
         g_audio.chunk.duration_ms = static_cast<int>((esp_timer_get_time() - start_us) / 1000);
+        if (sample_capacity_reached) {
+            ESP_LOGI(kTag, "capture reached fixed sample capacity: %u",
+                     static_cast<unsigned>(kMaxCaptureSamples));
+            break;
+        }
     }
 
-    CleanupCaptureHardware(true);
+    esp_err_t terminal_result = read_failed ? result : ESP_OK;
+    RecordFirstError(CleanupCaptureHardware(true), &terminal_result);
+    if (g_audio.rx == nullptr) {
+        RecordFirstError(
+            wqn::services::EndAudioActivity(&g_audio.session),
+            &terminal_result);
+    }
     if (!g_audio.chunk.samples.empty()) {
         g_audio.chunk.rms = static_cast<int>(IntegerSqrt(sum_squares / g_audio.chunk.samples.size()));
     }
@@ -524,6 +461,7 @@ void CaptureTask(void*)
     const int logged_rms = g_audio.chunk.rms;
     g_audio.running = false;
     g_audio.task = nullptr;
+    g_audio.terminal_result = terminal_result;
     xSemaphoreGive(g_audio.mutex);
     ESP_LOGI(
         kTag,
@@ -547,16 +485,23 @@ esp_err_t StartAudioCapture()
 {
     ESP_RETURN_ON_ERROR(EnsureAudioService(), kTag, "init audio service");
     AudioCaptureChunk next_chunk;
-    next_chunk.samples.reserve(static_cast<size_t>(kAudioCaptureSampleRate) * (kMaxCaptureMs / 1000));
+    next_chunk.samples.reserve(kMaxCaptureSamples);
 
     xSemaphoreTake(g_audio.mutex, portMAX_DELAY);
     if (g_audio.running) {
         xSemaphoreGive(g_audio.mutex);
         return ESP_ERR_INVALID_STATE;
     }
+    const esp_err_t session_result = wqn::services::BeginAudioActivity(
+        wqn::services::AudioActivity::kCapture, &g_audio.session);
+    if (session_result != ESP_OK) {
+        xSemaphoreGive(g_audio.mutex);
+        return session_result;
+    }
     g_audio.running = true;
     g_audio.stop_requested = false;
     g_audio.initialized = false;
+    g_audio.terminal_result = ESP_OK;
     g_audio.chunk = std::move(next_chunk);
     xSemaphoreGive(g_audio.mutex);
 
@@ -566,6 +511,8 @@ esp_err_t StartAudioCapture()
     if (created != pdPASS) {
         g_audio.running = false;
         g_audio.task = nullptr;
+        ESP_ERROR_CHECK_WITHOUT_ABORT(
+            wqn::services::EndAudioActivity(&g_audio.session));
         xSemaphoreGive(g_audio.mutex);
         return ESP_ERR_NO_MEM;
     }
@@ -580,6 +527,7 @@ esp_err_t StopAudioCapture(AudioCaptureChunk* chunk)
     xSemaphoreTake(g_audio.mutex, portMAX_DELAY);
     if (!g_audio.running && g_audio.task == nullptr) {
         const bool has_samples = !g_audio.chunk.samples.empty();
+        const esp_err_t terminal_result = g_audio.terminal_result;
         if (chunk != nullptr) {
             *chunk = g_audio.chunk;
         }
@@ -589,6 +537,9 @@ esp_err_t StopAudioCapture(AudioCaptureChunk* chunk)
         // init failed but AI status stayed kListening) - returning ESP_OK
         // would submit a 0-duration clip as success. Surface it as an error
         // so the caller reports 录音太短/失败 instead of a silent 0/0 submit.
+        if (terminal_result != ESP_OK) {
+            return terminal_result;
+        }
         return has_samples ? ESP_OK : ESP_ERR_INVALID_STATE;
     }
     g_audio.stop_requested = true;
@@ -604,12 +555,16 @@ esp_err_t StopAudioCapture(AudioCaptureChunk* chunk)
     xSemaphoreTake(g_audio.mutex, portMAX_DELAY);
     const bool stopped = !g_audio.running;
     const bool has_samples = stopped && !g_audio.chunk.samples.empty();
+    const esp_err_t terminal_result = g_audio.terminal_result;
     if (stopped && chunk != nullptr) {
         *chunk = g_audio.chunk;
     }
     xSemaphoreGive(g_audio.mutex);
     if (!stopped) {
         return ESP_ERR_TIMEOUT;
+    }
+    if (terminal_result != ESP_OK) {
+        return terminal_result;
     }
     return has_samples ? ESP_OK : ESP_FAIL;
 }
@@ -627,7 +582,9 @@ bool IsAudioCaptureRunning()
 
 void ReleaseAudioCapturePower()
 {
-    ScheduleAudioPowerOff();
+    // GPIO42 remains warm during runtime and capture already keeps the PA
+    // disabled. Do not arm a stale timer: it could otherwise fire after Flash
+    // acquires the next audio session and cut that session's amplifier.
 }
 
 }  // namespace wqn

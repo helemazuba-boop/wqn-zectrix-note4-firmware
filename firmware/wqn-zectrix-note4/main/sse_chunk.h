@@ -1,5 +1,4 @@
-// sse_chunk.h - small SSE frame parser and multipart builders used by the v2
-// AI streaming client (wqn_api.cpp::UploadAiAudioChatStream).
+// sse_chunk.h - small SSE frame parser used by the v2 AI streaming client.
 //
 // Kept as a separate header so ai_session.cpp and flash_session.cpp can share
 // the parser without dragging in cJSON at every call site. Designed for the
@@ -13,36 +12,6 @@
 #include <vector>
 
 namespace wqn {
-
-// Multipart encoder for `multipart/form-data` bodies.
-//
-// We feed `out` with a single contiguous buffer (no streaming writeback), then
-// hand it to esp_http_client. Each part has the same Content-Disposition shape
-// produced by curl/Firefox so SSE proxies that sniff the body type still work.
-class MultipartEncoder {
-public:
-  void begin(const std::string& hint);
-
-  void part_json(const std::string& name, const std::string& body);
-  void part_string(const std::string& name, const std::string& body);
-  void part_binary(const std::string& name, const std::string& filename,
-                   const void* data, size_t size);
-
-  void end();
-
-  const std::string& buffer() const { return buffer_; }
-  const std::string& boundary() const { return boundary_; }
-
-  // Returns the Content-Type header value, e.g. "multipart/form-data; boundary=----WQN-AI-...".
-  std::string boundary_for_header() const
-  {
-    return "multipart/form-data; boundary=" + boundary_;
-  }
-
-private:
-  std::string boundary_;
-  std::string buffer_;
-};
 
 // LineStreamingBuffer accumulates bytes from many esp_http_client_read()
 // calls and yields one line at a time to the SSE parser.  Lines are split on

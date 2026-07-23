@@ -17,9 +17,11 @@
 
 #include "ai_history.h"
 #include "ai_session.h"
-#include "epd_display.h"
+#include "display_service.h"
 #include "esp_log.h"
 #include "flash_session.h"
+#include "ui/assets/font_wqn_inline_12_1.h"
+#include "ui/assets/font_wqn_ui_16_1.h"
 
 namespace device_ui_internal {
 
@@ -71,88 +73,46 @@ const char* AiStatusLabel(wqn::AiSessionStatus status)
 
 #define DRC(...) do { (void)wqn::DrawUtf8Text(__VA_ARGS__); } while (0)
 
-// [shell] 16px status-bar toggle icons (thinking/TTS/expand). x,y = top-left of
-// the 16x16 cell. selected = 反白 (ink bg + paper glyph). Crude pixel art via
-// FillRect/DrawEpdPixel; good enough for the shell, refine in L2.
-// See docs/13-ui-design-language.md.
-static void DrawSlash16(int x, int y, bool black) {
-    for (int i = 0; i < 12; ++i) {
-        wqn::DrawEpdPixel(x + 2 + i, y + 13 - i, black);
+// Shared 1bpp status-bar assets. selected = 反白 (ink bg + paper glyph).
+static void DrawStatusAsset(int x, int y, const WqnBitmapAsset& asset, bool selected) {
+    if (selected) {
+        FillRect(x, y, 16, 16, true);
     }
+    DrawWqnBitmapAsset(x, y, asset, !selected);
 }
+
 static void DrawThinkingIcon(int x, int y, wqn::ThinkingLevel level, bool selected) {
-    const bool c = !selected;  // icon pixel color: black normally, paper when反白
-    if (selected) { FillRect(x, y, 16, 16, true); }
-    FillRect(x + 4, y + 4, 8, 5, c);  // glass
-    FillRect(x + 6, y + 9, 4, 3, c);  // base
-    const int rays = static_cast<int>(level);  // off=0, low=1, med=2, high=3
-    if (rays >= 1) { FillRect(x + 7, y + 1, 2, 2, c); }   // top ray
-    if (rays >= 2) { FillRect(x + 2, y + 4, 2, 2, c); }   // left ray
-    if (rays >= 3) { FillRect(x + 12, y + 4, 2, 2, c); }  // right ray
+    const WqnBitmapAsset* asset = &a04_ai_thinking_off_16_asset;
+    switch (level) {
+        case wqn::ThinkingLevel::kLow: asset = &a05_ai_thinking_low_16_asset; break;
+        case wqn::ThinkingLevel::kMed: asset = &a06_ai_thinking_medium_16_asset; break;
+        case wqn::ThinkingLevel::kHigh: asset = &a07_ai_thinking_high_16_asset; break;
+        case wqn::ThinkingLevel::kOff:
+        default: break;
+    }
+    DrawStatusAsset(x, y, *asset, selected);
 }
 static void DrawTtsIcon(int x, int y, bool on, bool selected) {
-    const bool c = !selected;
-    if (selected) { FillRect(x, y, 16, 16, true); }
-    FillRect(x + 2, y + 6, 3, 4, c);  // stem
-    FillRect(x + 5, y + 4, 3, 8, c);  // cone
-    if (on) {
-        FillRect(x + 10, y + 6, 1, 4, c);  // wave 1
-        FillRect(x + 12, y + 4, 1, 8, c);  // wave 2
-    } else {
-        DrawSlash16(x, y, c);
-    }
+    DrawStatusAsset(x, y, on ? a08_ai_tts_on_16_asset : a09_ai_tts_off_16_asset, selected);
 }
 static void DrawExpandIcon(int x, int y, bool on, bool selected) {
-    const bool c = !selected;
-    if (selected) { FillRect(x, y, 16, 16, true); }
-    FillRect(x + 3, y + 4, 10, 3, c);  // bar 1
-    FillRect(x + 3, y + 9, 10, 3, c);  // bar 2
-    if (!on) { DrawSlash16(x, y, c); }
+    DrawStatusAsset(x, y, on ? a10_ai_detail_expand_on_16_asset : a11_ai_detail_expand_off_16_asset, selected);
 }
 
 // [tier-icon] Status-bar tier indicator (16px, display only - tier switch is
 // double-press Up/Down). Flash=lightning, STD=hourglass, Pro=brain.
 static void DrawLightningIcon(int x, int y, bool selected) {
-    const bool c = !selected;
-    if (selected) { FillRect(x, y, 16, 16, true); }
-    FillRect(x + 9, y + 2, 2, 3, c);
-    FillRect(x + 7, y + 5, 3, 2, c);
-    FillRect(x + 9, y + 6, 2, 3, c);
-    FillRect(x + 5, y + 8, 4, 2, c);
-    FillRect(x + 7, y + 10, 2, 4, c);
+    DrawStatusAsset(x, y, a01_ai_tier_flash_16_asset, selected);
 }
 static void DrawHourglassIcon(int x, int y, bool selected) {
-    const bool c = !selected;
-    if (selected) { FillRect(x, y, 16, 16, true); }
-    FillRect(x + 3, y + 3, 10, 2, c);   // top bar
-    FillRect(x + 4, y + 5, 8, 1, c);
-    FillRect(x + 6, y + 6, 4, 1, c);
-    FillRect(x + 7, y + 7, 2, 1, c);    // apex
-    FillRect(x + 6, y + 9, 4, 1, c);
-    FillRect(x + 4, y + 10, 8, 1, c);
-    FillRect(x + 3, y + 11, 10, 2, c);  // bottom bar
+    DrawStatusAsset(x, y, a02_ai_tier_standard_16_asset, selected);
 }
 static void DrawBrainIcon(int x, int y, bool selected) {
-    const bool c = !selected;
-    if (selected) { FillRect(x, y, 16, 16, true); }
-    FillRect(x + 4, y + 4, 8, 8, c);    // body
-    FillRect(x + 3, y + 6, 1, 3, c);    // left bump
-    FillRect(x + 12, y + 6, 1, 3, c);   // right bump
-    FillRect(x + 5, y + 3, 2, 1, c);    // top-left bump
-    FillRect(x + 9, y + 3, 2, 1, c);    // top-right bump
-    FillRect(x + 5, y + 12, 2, 1, c);   // bottom-left bump
-    FillRect(x + 9, y + 12, 2, 1, c);   // bottom-right bump
+    DrawStatusAsset(x, y, a03_ai_tier_pro_16_asset, selected);
 }
 // [trash] Clear-context action button (edit-mode index 3, STD/Pro only).
 static void DrawTrashIcon(int x, int y, bool selected) {
-    const bool c = !selected;
-    if (selected) { FillRect(x, y, 16, 16, true); }
-    FillRect(x + 4, y + 3, 8, 2, c);    // lid
-    FillRect(x + 3, y + 5, 10, 1, c);   // lid base
-    FillRect(x + 5, y + 6, 1, 8, c);    // left wall
-    FillRect(x + 10, y + 6, 1, 8, c);   // right wall
-    FillRect(x + 5, y + 13, 6, 1, c);   // bottom
-    FillRect(x + 7, y + 7, 1, 6, c);    // mid rib
+    DrawStatusAsset(x, y, a12_ai_clear_context_16_asset, selected);
 }
 
 constexpr int kAiToggleX = 62;
@@ -197,7 +157,7 @@ void DrawAiStatusBar(const wqn::AiSessionState& ai, const wqn::HomeSummary& home
         const int cx = std::max(70, (wqn::kEpdWidth - w) / 2);
         DRC(cx, 6, ai.toast_label.c_str(), true);
         // Blinker square on the right side when active.
-        FillRect(wqn::kEpdWidth - 12, 8, 4, 4, true);
+        FillRect(wqn::kEpdWidth - 34, 8, 4, 4, true);
     } else if (!home.primary_time_line.empty()) {
         const int w = wqn::MeasureUtf8TextWidth(home.primary_time_line.c_str());
         DRC(160 - w / 2, 6, home.primary_time_line.c_str(), true);
@@ -217,10 +177,8 @@ void DrawAiStatusBar(const wqn::AiSessionState& ai, const wqn::HomeSummary& home
         }
     }
 
-    // WiFi icon column at the very right edge.
-    const std::string& wifi = home.wifi_label.empty() ? std::string("WiFi") : home.wifi_label;
-    const int ww = wqn::MeasureUtf8TextWidth(wifi.c_str());
-    DRC(wqn::kEpdWidth - ww - 6, 6, wifi.c_str(), true);
+    // Reuse the same four-state WiFi glyph as the other pages; AI omits battery.
+    DrawWifiStatusIcon(wqn::kEpdWidth - 6, 6, home);
 }
 
 void DrawHistoryClear(int y0, int y1)
@@ -307,14 +265,24 @@ int DrawAssistantBlock(int x, int y, int max_w, const std::string& text)
 
 std::vector<std::string> BuildThinkingLines(const std::string& text, int max_w, bool expanded)
 {
+    constexpr int kThinkingTextInset = 28;  // border + 12px marker + gap
     if (expanded) {
-        return WrapForViewport(text, max_w - 14, 1024);
+        return text.empty() ? std::vector<std::string>{""}
+                            : WrapForViewport(text, max_w - kThinkingTextInset, 1024);
     }
-    std::string one = wqn::TruncateUtf8TextToWidth(text, max_w - 14);
+    std::string one = wqn::TruncateUtf8TextToWidth(text, max_w - kThinkingTextInset);
     if (one.size() < text.size() && one.find("...") == std::string::npos) {
-        one = wqn::TruncateUtf8TextToWidth(text, max_w - 14 - 18) + "...";
+        one = wqn::TruncateUtf8TextToWidth(text, max_w - kThinkingTextInset - 18) + "...";
     }
-    return {one.empty() ? std::string("💭") : one};
+    return {one};
+}
+
+std::vector<std::string> BuildToolResultLines(const wqn::ChatMessageSnapshot& tool, int max_w)
+{
+    if (tool.tool_result_json.empty()) {
+        return {};
+    }
+    return WrapForViewport("result: " + tool.tool_result_json, max_w - 34, 2);
 }
 
 int ToolBlockHeight(const wqn::ChatMessageSnapshot& tool, int max_w, bool expanded)
@@ -326,11 +294,7 @@ int ToolBlockHeight(const wqn::ChatMessageSnapshot& tool, int max_w, bool expand
             expected_h += static_cast<int>(WrapForViewport(
                 "args: " + tool.tool_args_json, max_w - 12, 2).size()) * row_h;
         }
-        if (!tool.tool_result_json.empty()) {
-            std::string result = tool.tool_ok ? "✅ result: " : "❌ result: ";
-            result += tool.tool_result_json;
-            expected_h += static_cast<int>(WrapForViewport(result, max_w - 12, 2).size()) * row_h;
-        }
+        expected_h += static_cast<int>(BuildToolResultLines(tool, max_w).size()) * row_h;
         expected_h += row_h;
     }
     return expected_h + 6;
@@ -349,10 +313,13 @@ int DrawThinkingBlock(int x, int y, int max_w, const std::string& text, bool exp
     if (visible_top < visible_bottom) {
         DrawVerticalLine(x, visible_top, visible_bottom - visible_top);
     }
-    const int text_x = x + 6;
+    const int text_x = x + 22;
     for (int r = 0; r < row_count; ++r) {
         const int line_y = y + r * row_h + 4;
         if (line_y >= kAiViewportY && line_y + row_h <= wqn::kEpdHeight) {
+            if (r == 0) {
+                DrawWqnBitmapAsset(x + 6, line_y + 2, m01_ai_thinking_marker_12_asset, true);
+            }
             DRC(text_x, line_y, lines[r].c_str(), true);
         }
     }
@@ -361,9 +328,8 @@ int DrawThinkingBlock(int x, int y, int max_w, const std::string& text, bool exp
 
 int DrawToolBlock(int x, int y, int max_w, const wqn::ChatMessageSnapshot& tool, bool expanded)
 {
-    const char* marker = expanded ? "▾" : "▸";
     char header[64];
-    std::snprintf(header, sizeof(header), "%s [Tool: %s]", marker,
+    std::snprintf(header, sizeof(header), "[Tool: %s]",
                   tool.tool_name.c_str()[0] ? tool.tool_name.c_str() : "tool");
     char elapsed[32] = {};
     std::snprintf(elapsed, sizeof(elapsed), "elapsed: %ld ms", static_cast<long>(tool.tool_elapsed_ms));
@@ -377,11 +343,7 @@ int DrawToolBlock(int x, int y, int max_w, const wqn::ChatMessageSnapshot& tool,
         if (!tool.tool_args_json.empty()) {
             args_lines = WrapForViewport("args: " + tool.tool_args_json, max_w - 12, 2);
         }
-        if (!tool.tool_result_json.empty()) {
-            std::string r_line = tool.tool_ok ? "✅ result: " : "❌ result: ";
-            r_line += tool.tool_result_json;
-            result_lines = WrapForViewport(r_line, max_w - 12, 2);
-        }
+        result_lines = BuildToolResultLines(tool, max_w);
     }
 
     const int visible_top = std::max(kAiViewportY, y);
@@ -401,7 +363,10 @@ int DrawToolBlock(int x, int y, int max_w, const wqn::ChatMessageSnapshot& tool,
 
     // Header row.
     if (y + 4 >= kAiViewportY && y + 4 + row_h <= wqn::kEpdHeight) {
-        DRC(x + 4, y + 4, header, true);
+        DrawWqnBitmapAsset(x + 4, y + 6,
+                           expanded ? m06_chevron_down_12_asset : m05_chevron_right_12_asset, true);
+        DrawWqnBitmapAsset(x + 18, y + 6, m02_ai_tool_running_12_asset, true);
+        DRC(x + 34, y + 4, header, true);
     }
 
     if (expanded) {
@@ -415,9 +380,14 @@ int DrawToolBlock(int x, int y, int max_w, const wqn::ChatMessageSnapshot& tool,
         }
 
         // Result row.
-        for (const auto& l : result_lines) {
+        for (size_t i = 0; i < result_lines.size(); ++i) {
             if (cur_y >= kAiViewportY && cur_y + row_h <= wqn::kEpdHeight) {
-                DRC(x + 8, cur_y, l.c_str(), true);
+                if (i == 0) {
+                    DrawWqnBitmapAsset(
+                        x + 8, cur_y + 2,
+                        tool.tool_ok ? m03_status_success_12_asset : m04_status_error_12_asset, true);
+                }
+                DRC(x + 24, cur_y, result_lines[i].c_str(), true);
             }
             cur_y += row_h;
         }
@@ -620,27 +590,30 @@ void RenderAiHistoryViewport(const wqn::AiSessionState& ai,
     if (messages.size() > 1) {
         const bool more_above = !oldest_fully_visible;
         const bool more_below = (window_top < max_window_top);
-        // Reserve a 22x18 px region at the bottom-right; clear it before
+        // Reserve a right-edge indicator region; clear it before
         // drawing so a disappearing indicator does not leave a phantom.
-        FillRect(wqn::kEpdWidth - 28, wqn::kEpdHeight - kAiViewportBottomPad + 2,
-                 24, kAiViewportBottomPad - 4, false);
-        FillRect(wqn::kEpdWidth - 14, kAiViewportY + 1, 12, 14, false);
+        FillRect(wqn::kEpdWidth - 40, wqn::kEpdHeight - kAiViewportBottomPad + 2,
+                 36, kAiViewportBottomPad - 4, false);
+        FillRect(wqn::kEpdWidth - 40, kAiViewportY + 1, 36, 14, false);
         if (more_below) {
-            char indicator[16];
-            std::snprintf(indicator, sizeof(indicator), "\xe2\x96\xbc%ld",
+            char count[12];
+            std::snprintf(count, sizeof(count), "%ld",
                           static_cast<long>((max_window_top - window_top + line_h - 1) / line_h));
-            const int w = wqn::MeasureUtf8TextWidth(indicator);
+            const int count_w = wqn::MeasureUtf8TextWidth(count);
+            const int x = wqn::kEpdWidth - count_w - 18;
             // Bottom-right, 2 px above the panel bottom.
-            DRC(wqn::kEpdWidth - w - 4, wqn::kEpdHeight - 18, indicator, true);
+            DrawWqnBitmapAsset(x, wqn::kEpdHeight - 16, m06_chevron_down_12_asset, true);
+            DRC(x + 14, wqn::kEpdHeight - 18, count, true);
         }
         if (more_above) {
             // Show the index of the oldest message that's hidden above so
             // the user has a rough sense of how many turns are above.
-            char indicator[16];
-            std::snprintf(indicator, sizeof(indicator), "\xe2\x96\xb2%ld",
-                          static_cast<long>(window_top / line_h));
-            const int w = wqn::MeasureUtf8TextWidth(indicator);
-            DRC(wqn::kEpdWidth - w - 4, kAiViewportY + 4, indicator, true);
+            char count[12];
+            std::snprintf(count, sizeof(count), "%ld", static_cast<long>(window_top / line_h));
+            const int count_w = wqn::MeasureUtf8TextWidth(count);
+            const int x = wqn::kEpdWidth - count_w - 18;
+            DrawWqnBitmapAsset(x, kAiViewportY + 3, m07_chevron_up_12_asset, true);
+            DRC(x + 14, kAiViewportY + 4, count, true);
         }
     }
 

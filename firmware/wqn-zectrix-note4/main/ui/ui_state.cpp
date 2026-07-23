@@ -8,9 +8,9 @@
 #include <vector>
 
 #include "esp_log.h"
-#include "online_sync.h"
+#include "services/sync_service.h"
+#include "services/connectivity_service.h"
 #include "storage.h"
-#include "wifi_manager.h"
 #include "word_app.h"
 #include "wqn_api.h"
 
@@ -46,8 +46,17 @@ void BuildHomeSummary(wqn::UiState* state)
 
     wqn::HomeSummary home;
     home.wifi_label = state->status.wifi_connected ? "WiFi" : "离线";
+    home.wifi_connected = state->status.wifi_connected;
+    home.wifi_rssi = wqn::services::GetConnectivityRssi();
     BatteryReading battery = {};
-    home.battery_label = ReadBatteryStatus(&battery) ? BatteryLabel(battery) : "--%";
+    if (ReadBatteryStatus(&battery)) {
+        home.battery_label = BatteryLabel(battery);
+        home.battery_percent = battery.percent;
+        home.charging = battery.charging;
+        home.full = battery.full;
+    } else {
+        home.battery_label = "--%";
+    }
 
     // UI contract: one line only. Source priority is pomodoro > countdown > clock.
     home.primary_time_line = ChooseHomePrimaryTimeLine(state->time_app);
@@ -59,9 +68,13 @@ void BuildHomeSummary(wqn::UiState* state)
     home.todo_metric.label = "今日 Todo";
     home.word_metric.value = wqn::WordAppProgressLabel(state->word_app);
     home.word_metric.label = "单词进度";
-    home.current_status =
-        "本地 " + std::to_string(state->problems.size()) + " 题 · 待上传 " +
-        std::to_string(state->status.pending_reviews);
+    if (!state->status.paired && !state->status.claim_code.empty()) {
+        home.current_status = "配对码 " + state->status.claim_code + " · 请在网页确认";
+    } else {
+        home.current_status =
+            "本地 " + std::to_string(state->problems.size()) + " 题 · 待上传 " +
+            std::to_string(state->status.pending_reviews);
+    }
 
     home.tasks.clear();
     if (!state->problems.empty()) {
@@ -124,14 +137,18 @@ bool LoadUiState(wqn::UiState* state)
     if (result == ESP_OK && !token.empty() && wqn::IsValidAccessToken(token)) {
         state->status.paired = true;
         state->status.token_mask = wqn::MaskTokenForLog(token);
+        state->status.claim_code.clear();
     } else {
         state->status.paired = false;
         state->status.token_mask.clear();
+        wqn::services::SyncSnapshot sync_snapshot;
+        wqn::services::GetSyncSnapshot(&sync_snapshot);
+        state->status.claim_code = sync_snapshot.claim_code;
     }
 
 #if CONFIG_WQN_WIFI_STA_ENABLE
     state->status.wifi_enabled = true;
-    state->status.wifi_connected = wqn::IsWifiStationConnected();
+    state->status.wifi_connected = wqn::services::IsConnectivityOnline();
 #else
     state->status.wifi_enabled = false;
     state->status.wifi_connected = false;
@@ -185,7 +202,7 @@ RefreshSchedule QueueSelectedReview(wqn::UiState* state)
         problem.id.c_str(),
         review.selected_status.c_str(),
         state->status.pending_reviews);
-    wqn::NotifyOnlineSyncRequested();
+    wqn::services::RequestSyncNow();
     BuildHomeSummary(state);  // [home-stats-fix] refresh home stats so pending/today counts update immediately (was stale until 60s poll)
     return RefreshSchedule::kCommit;
 }

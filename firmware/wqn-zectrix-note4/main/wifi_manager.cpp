@@ -1,5 +1,6 @@
 #include "wifi_manager.h"
 
+#include <atomic>
 #include <cstring>
 
 #include "esp_check.h"
@@ -7,7 +8,7 @@
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_netif_sntp.h"
-#include "esp_pm.h"
+#include "esp_timer.h"
 #include "esp_wifi.h"
 #include "freertos/event_groups.h"
 #include "freertos/FreeRTOS.h"
@@ -21,20 +22,16 @@
 namespace {
 
 constexpr char kTag[] = "wqn_wifi";
-constexpr TickType_t kReconnectDelay = pdMS_TO_TICKS(5000);
-
 #if CONFIG_WQN_WIFI_STA_ENABLE
 constexpr EventBits_t kWifiConnectedBit = BIT0;
 
-bool g_initialized = false;
-bool g_reconnect_pending = false;
-bool g_wifi_connected = false;
+std::atomic<bool> g_initialized{false};
+std::atomic<bool> g_wifi_connected{false};
 bool g_sntp_started = false;
+std::atomic<bool> g_sleep_quiescing{false};
+std::atomic<bool> g_resume_after_sleep_abort{false};
+std::atomic<wqn::WifiStationEventSink> g_event_sink{nullptr};
 EventGroupHandle_t g_wifi_event_group = nullptr;
-TaskHandle_t g_reconnect_task_handle = nullptr;
-
-// [power-fix] Used to interrupt the 60-second backoff delay when a user
-// action or external request needs WiFi to reconnect immediately.
 
 const char* DisconnectReasonName(uint8_t reason)
 {
@@ -62,95 +59,12 @@ const char* DisconnectReasonName(uint8_t reason)
     }
 }
 
-void WifiReconnectTask(void*)
+void PublishStationEvent(wqn::WifiStationEvent event, int reason = 0, int rssi = 0)
 {
-    // [power-fix] Mirrors the official firmware's bounded retry + power-down
-    // backoff: attempt 5 fast reconnects (5s apart), then stop the radio,
-    // sleep 60s to save power, and start the radio again for the next batch.
-    // Previously the loop just re-issued esp_wifi_connect() every 5s
-    // forever, keeping the WiFi modem (~100mA+) continuously hot.
-    constexpr int kFastRetryMax = 5;
-    constexpr int kBackoffSec = 60;
-    constexpr int kBackoffSliceMs = 1000;
-
-    int retry = 0;
-    while (!g_wifi_connected) {
-        vTaskDelay(kReconnectDelay);
-        if (g_wifi_connected) {
-            break;
-        }
-
-        ESP_LOGI(kTag, "retrying WiFi station connection (attempt %d/%d)", retry + 1, kFastRetryMax);
-        const esp_err_t result = esp_wifi_connect();
-        if (result != ESP_OK && result != ESP_ERR_WIFI_CONN) {
-            ESP_LOGW(kTag, "WiFi reconnect request failed: %s", esp_err_to_name(result));
-        }
-
-        if (++retry < kFastRetryMax) {
-            continue;
-        }
-
-        // 5 fast retries exhausted. Stop the radio to drop the ~100mA
-        // modem current, then back off for kBackoffSec before trying again.
-        ESP_LOGW(kTag, "WiFi fast-retry exhausted (%d), stopping radio and backing off %d s", kFastRetryMax, kBackoffSec);
-        if (esp_wifi_stop() != ESP_OK) {
-            ESP_LOGW(kTag, "esp_wifi_stop() failed during backoff");
-        }
-        // [power-fix debug] Confirm no PM locks are held at this point so
-        // Light Sleep is actually available during the 60s backoff.
-        ESP_LOGI(kTag, "=== PM locks before WiFi backoff ===");
-        esp_pm_dump_locks(stdout);
-        ESP_LOGI(kTag, "=== end PM lock dump ===");
-
-        // Sleep in 1s slices so an external QueueReconnect() can still wake
-        // us up promptly when something else (e.g. a button press that
-        // wants to re-provision) requests a new connection.
-        for (int slept = 0; slept < kBackoffSec && !g_wifi_connected; ++slept) {
-            // [power-fix] Use task notification instead of vTaskDelay so
-            // QueueReconnect() can interrupt the backoff immediately by
-            // calling xTaskNotifyGive on this task's handle.
-            ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(kBackoffSliceMs));
-        }
-        if (g_wifi_connected) {
-            break;
-        }
-        if (esp_wifi_start() != ESP_OK) {
-            ESP_LOGW(kTag, "esp_wifi_start() failed after backoff, will retry anyway");
-        }
-        retry = 0;
-    }
-
-    g_reconnect_pending = false;
-    g_reconnect_task_handle = nullptr;
-    vTaskDelete(nullptr);
-}
-
-void QueueReconnect()
-{
-    if (g_reconnect_pending) {
-        // [power-fix] A reconnect task is already running (possibly in the
-        // 60-second backoff phase). Instead of ignoring the request, send it
-        // a notification so it immediately breaks out of the backoff delay
-        // and reconnects without waiting.
-        // [isr-fix] QueueReconnect is called from the WiFi event handler which
-        // runs in the event loop TASK, not an ISR. Using vTaskNotifyGiveFromISR
-        // here corrupts FreeRTOS scheduler state. Use the task-level API.
-        if (g_reconnect_task_handle != nullptr) {
-            xTaskNotifyGive(g_reconnect_task_handle);
-        }
-        return;
-    }
-
-    g_reconnect_pending = true;
-    // [fix] Stack was 4096 which overflowed (panic "stack overflow in task
-    // wqn_wifi_reconn") during provisioning, causing a boot loop that kept the
-    // SoftAP alive only ~30s. 8192 matches wqn_prov/wqn_dns. Name shortened to
-    // <=16 chars so FreeRTOS doesn't truncate it (was wqn_wifi_reconnect -> wqn_wifi_reconn).
-    const BaseType_t created = xTaskCreate(WifiReconnectTask, "wqn_wifi_rec", 8192, nullptr, 4, &g_reconnect_task_handle);
-    if (created != pdPASS) {
-        g_reconnect_pending = false;
-        g_reconnect_task_handle = nullptr;
-        ESP_LOGW(kTag, "failed to create WiFi reconnect task");
+    const wqn::WifiStationEventSink sink =
+        g_event_sink.load(std::memory_order_acquire);
+    if (sink != nullptr) {
+        sink(event, reason, rssi);
     }
 }
 
@@ -188,14 +102,14 @@ void StartSntpOnce()
 void WifiEventHandler(void*, esp_event_base_t event_base, int32_t event_id, void* event_data)
 {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
-        ESP_LOGI(kTag, "WiFi station started, connecting to configured SSID");
-        ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_connect());
+        ESP_LOGI(kTag, "WiFi station started");
+        PublishStationEvent(wqn::WifiStationEvent::kStarted);
         return;
     }
 
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         const auto* event = static_cast<wifi_event_sta_disconnected_t*>(event_data);
-        g_wifi_connected = false;
+        g_wifi_connected.store(false, std::memory_order_release);
         if (g_wifi_event_group != nullptr) {
             xEventGroupClearBits(g_wifi_event_group, kWifiConnectedBit);
         }
@@ -205,7 +119,10 @@ void WifiEventHandler(void*, esp_event_base_t event_base, int32_t event_id, void
             event ? event->reason : -1,
             event ? DisconnectReasonName(event->reason) : "NO_EVENT",
             event ? event->rssi : 0);
-        QueueReconnect();
+        PublishStationEvent(
+            wqn::WifiStationEvent::kDisconnected,
+            event ? event->reason : 0,
+            event ? event->rssi : 0);
         return;
     }
 
@@ -222,11 +139,12 @@ void WifiEventHandler(void*, esp_event_base_t event_base, int32_t event_id, void
             IP2STR(&event->ip_info.ip),
             IP2STR(&event->ip_info.netmask),
             IP2STR(&event->ip_info.gw));
-        g_wifi_connected = true;
+        g_wifi_connected.store(true, std::memory_order_release);
         if (g_wifi_event_group != nullptr) {
             xEventGroupSetBits(g_wifi_event_group, kWifiConnectedBit);
         }
         StartSntpOnce();
+        PublishStationEvent(wqn::WifiStationEvent::kConnected);
     }
 }
 
@@ -251,12 +169,16 @@ namespace wqn {
 esp_err_t StartWifiWithCredentials(const char* ssid, const char* password)
 {
 #if CONFIG_WQN_WIFI_STA_ENABLE
+    if (g_sleep_quiescing.load(std::memory_order_acquire)) {
+        ESP_LOGW(kTag, "WiFi start rejected during sleep quiesce");
+        return ESP_ERR_INVALID_STATE;
+    }
     if (ssid == nullptr || ssid[0] == '\0') {
         ESP_LOGW(kTag, "cannot start WiFi: empty SSID");
         return ESP_ERR_INVALID_ARG;
     }
 
-    if (g_initialized) {
+    if (g_initialized.load(std::memory_order_acquire)) {
         ESP_LOGI(kTag, "WiFi already initialized, switching to new credentials");
         ESP_RETURN_ON_ERROR(esp_wifi_disconnect(), kTag, "disconnect before reconfigure");
         // [reconfig-fix] delete old event group to avoid leak on recreate below
@@ -277,7 +199,15 @@ esp_err_t StartWifiWithCredentials(const char* ssid, const char* password)
             return ESP_ERR_NO_MEM;
         }
         wifi_init_config_t init_config = WIFI_INIT_CONFIG_DEFAULT();
-        ESP_RETURN_ON_ERROR(esp_wifi_init(&init_config), kTag, "init WiFi");
+        // [prov-handoff] WiFi 驱动全程只 init 一次、常驻不 deinit（官方
+        // esp-wifi-connect 范式）。配网（provision_manager::StartSoftAp）已
+        // 在 APSTA 模式下调过 esp_wifi_init()，这里会返回
+        // ESP_ERR_INVALID_STATE —— 复用活着的驱动即可，不要重 init。
+        // 无配网路径下返回 ESP_OK，行为不变。
+        const esp_err_t init_ret = esp_wifi_init(&init_config);
+        if (init_ret != ESP_OK && init_ret != ESP_ERR_INVALID_STATE) {
+            ESP_RETURN_ON_ERROR(init_ret, kTag, "init WiFi");
+        }
         ESP_RETURN_ON_ERROR(RegisterHandlers(), kTag, "register WiFi handlers");
         ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_STA), kTag, "set WiFi STA mode");
     }
@@ -302,7 +232,7 @@ esp_err_t StartWifiWithCredentials(const char* ssid, const char* password)
     ESP_RETURN_ON_ERROR(esp_wifi_set_ps(WIFI_PS_MIN_MODEM), kTag, "set WiFi power save");
     ESP_RETURN_ON_ERROR(esp_wifi_start(), kTag, "start WiFi");
 
-    g_initialized = true;
+    g_initialized.store(true, std::memory_order_release);
     ESP_LOGI(kTag, "WiFi station started with SSID: %s", ssid);
     return ESP_OK;
 #else
@@ -316,7 +246,10 @@ esp_err_t StartWifiWithCredentials(const char* ssid, const char* password)
 esp_err_t StartWifiStationIfEnabled()
 {
 #if CONFIG_WQN_WIFI_STA_ENABLE
-    if (g_initialized) {
+    if (g_sleep_quiescing.load(std::memory_order_acquire)) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (g_initialized.load(std::memory_order_acquire)) {
         return ESP_OK;
     }
 
@@ -344,6 +277,58 @@ esp_err_t StartWifiStationIfEnabled()
 #endif
 }
 
+esp_err_t ConnectWifiStationNow()
+{
+#if CONFIG_WQN_WIFI_STA_ENABLE
+    if (g_sleep_quiescing.load(std::memory_order_acquire)) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!g_initialized.load(std::memory_order_acquire)) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    const esp_err_t result = esp_wifi_connect();
+    return result == ESP_ERR_WIFI_CONN ? ESP_OK : result;
+#else
+    return ESP_ERR_INVALID_STATE;
+#endif
+}
+
+esp_err_t StopWifiStationRadio()
+{
+#if CONFIG_WQN_WIFI_STA_ENABLE
+    if (!g_initialized.load(std::memory_order_acquire)) {
+        return ESP_OK;
+    }
+    const esp_err_t result = esp_wifi_stop();
+    if (result == ESP_OK || result == ESP_ERR_WIFI_NOT_STARTED ||
+        result == ESP_ERR_WIFI_NOT_INIT) {
+        g_wifi_connected.store(false, std::memory_order_release);
+        if (g_wifi_event_group != nullptr) {
+            xEventGroupClearBits(g_wifi_event_group, kWifiConnectedBit);
+        }
+        return ESP_OK;
+    }
+    return result;
+#else
+    return ESP_OK;
+#endif
+}
+
+esp_err_t StartWifiStationRadio()
+{
+#if CONFIG_WQN_WIFI_STA_ENABLE
+    if (g_sleep_quiescing.load(std::memory_order_acquire)) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!g_initialized.load(std::memory_order_acquire)) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    return esp_wifi_start();
+#else
+    return ESP_ERR_INVALID_STATE;
+#endif
+}
+
 esp_err_t WaitForWifiStationConnected(TickType_t timeout)
 {
 #if CONFIG_WQN_WIFI_STA_ENABLE
@@ -362,9 +347,94 @@ esp_err_t WaitForWifiStationConnected(TickType_t timeout)
 bool IsWifiStationConnected()
 {
 #if CONFIG_WQN_WIFI_STA_ENABLE
-    return g_wifi_connected;
+    return g_wifi_connected.load(std::memory_order_acquire);
 #else
     return false;
+#endif
+}
+
+bool IsWifiStationInitialized()
+{
+#if CONFIG_WQN_WIFI_STA_ENABLE
+    return g_initialized.load(std::memory_order_acquire);
+#else
+    return false;
+#endif
+}
+
+void SetWifiStationEventSink(WifiStationEventSink sink)
+{
+#if CONFIG_WQN_WIFI_STA_ENABLE
+    g_event_sink.store(sink, std::memory_order_release);
+#else
+    (void)sink;
+#endif
+}
+
+int GetWifiRssi()
+{
+#if CONFIG_WQN_WIFI_STA_ENABLE
+    if (!g_wifi_connected.load(std::memory_order_acquire)) {
+        return 0;
+    }
+    wifi_ap_record_t ap;
+    if (esp_wifi_sta_get_ap_info(&ap) != ESP_OK) {
+        return 0;
+    }
+    return ap.rssi;
+#else
+    return 0;
+#endif
+}
+
+esp_err_t PrepareConnectivityForSleep(const power::PrepareSleepCommand& command)
+{
+#if CONFIG_WQN_WIFI_STA_ENABLE
+    if (command.deadline_us > 0 && esp_timer_get_time() >= command.deadline_us) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    g_sleep_quiescing.store(true, std::memory_order_release);
+    g_resume_after_sleep_abort.store(
+        g_initialized.load(std::memory_order_acquire),
+        std::memory_order_release);
+    if (!g_initialized.load(std::memory_order_acquire)) {
+        return ESP_OK;
+    }
+
+    const esp_err_t result = esp_wifi_stop();
+    if (result != ESP_OK && result != ESP_ERR_WIFI_NOT_STARTED &&
+        result != ESP_ERR_WIFI_NOT_INIT) {
+        ESP_LOGW(kTag, "WiFi stop for sleep failed: %s", esp_err_to_name(result));
+        return result;
+    }
+    g_wifi_connected.store(false, std::memory_order_release);
+    if (g_wifi_event_group != nullptr) {
+        xEventGroupClearBits(g_wifi_event_group, kWifiConnectedBit);
+    }
+    ESP_LOGI(kTag, "connectivity prepared for sleep: generation=%u",
+             static_cast<unsigned>(command.generation));
+    return ESP_OK;
+#else
+    (void)command;
+    return ESP_OK;
+#endif
+}
+
+void RollbackConnectivityAfterSleepAbort()
+{
+#if CONFIG_WQN_WIFI_STA_ENABLE
+    const bool resume = g_resume_after_sleep_abort.exchange(false, std::memory_order_acq_rel);
+    g_sleep_quiescing.store(false, std::memory_order_release);
+    if (!resume || !g_initialized.load(std::memory_order_acquire)) {
+        return;
+    }
+    const esp_err_t result = esp_wifi_start();
+    if (result != ESP_OK) {
+        ESP_LOGW(kTag, "WiFi restart after sleep rollback failed: %s", esp_err_to_name(result));
+        return;
+    }
+    ESP_LOGI(kTag, "connectivity sleep preparation rolled back");
 #endif
 }
 

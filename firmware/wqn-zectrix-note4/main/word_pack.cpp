@@ -8,18 +8,23 @@
 #include <cstring>
 #include <string>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include "cJSON.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_spiffs.h"
 #include "mbedtls/sha256.h"
+#include "runtime/sleep_coordinator.h"
+#include "services/storage_service.h"
 
 namespace {
 
 constexpr char kTag[] = "word_pack";
 constexpr char kStorageRoot[] = "/storage";
 constexpr char kManifestPath[] = "/storage/wp_manifest.json";
+constexpr char kManifestTempPath[] = "/storage/wp_manifest.tmp";
+constexpr char kManifestBackupPath[] = "/storage/wp_manifest.bak";
 constexpr char kPackMagic[] = "WQN_WORD_PACK_V1";
 constexpr size_t kMaxIndexEntries = 10000;
 constexpr size_t kLineBufferSize = 4096;
@@ -70,29 +75,39 @@ namespace wqn {
 
 std::string SafePackStem(const WqnWordPackManifestItem& item)
 {
-    std::string source = !item.pack_id.empty() ? item.pack_id : item.sha256;
     std::string stem;
-    stem.reserve(16);
-    for (const char ch : source) {
+    stem.reserve(25);
+    for (const char ch : item.pack_id) {
         const bool keep = (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z');
         if (keep) {
             stem.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
         }
-        if (stem.size() >= 16) {
+        if (stem.size() >= 8) {
             break;
         }
     }
     if (stem.empty()) {
-        stem = "default";
+        stem = "pack";
+    }
+    if (!item.sha256.empty()) {
+        stem.push_back('_');
+        size_t hash_chars = 0;
+        for (const char ch : item.sha256) {
+            const bool keep = (ch >= '0' && ch <= '9') ||
+                              (ch >= 'a' && ch <= 'f') ||
+                              (ch >= 'A' && ch <= 'F');
+            if (keep) {
+                stem.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
+                if (++hash_chars >= 16) {
+                    break;
+                }
+            }
+        }
+        if (hash_chars == 0) {
+            stem.resize(stem.size() - 1);
+        }
     }
     return stem;
-}
-
-std::string SafePackStemFromId(const std::string& pack_id)
-{
-    WqnWordPackManifestItem item;
-    item.pack_id = pack_id;
-    return SafePackStem(item);
 }
 
 }  // namespace wqn
@@ -211,9 +226,21 @@ esp_err_t ReadWholeFile(const char* path, std::string* out)
 esp_err_t ParsePackManifestFile(wqn::WqnWordPackManifest* manifest)
 {
     std::string payload;
-    const esp_err_t result = ReadWholeFile(kManifestPath, &payload);
-    if (result != ESP_OK) {
-        return result;
+    esp_err_t result = ReadWholeFile(kManifestPath, &payload);
+    if (result == ESP_OK) {
+        result = wqn::ParseWordPackManifestResponse(payload, manifest);
+        if (result == ESP_OK) {
+            return ESP_OK;
+        }
+        ESP_LOGW(kTag, "primary word-pack manifest invalid; trying backup");
+    } else if (result != ESP_ERR_NOT_FOUND) {
+        ESP_LOGW(kTag, "primary word-pack manifest unreadable; trying backup");
+    }
+
+    payload.clear();
+    const esp_err_t backup_result = ReadWholeFile(kManifestBackupPath, &payload);
+    if (backup_result != ESP_OK) {
+        return result == ESP_ERR_NOT_FOUND ? backup_result : result;
     }
     return wqn::ParseWordPackManifestResponse(payload, manifest);
 }
@@ -301,7 +328,7 @@ esp_err_t ScanPackFile(
     }
 
     // Pack stem is identical for every entry in this file; compute once.
-    const std::string pack_stem = wqn::SafePackStemFromId(item.pack_id);
+    const std::string pack_stem = wqn::SafePackStem(item);
 
     while (index->entries.size() < kMaxIndexEntries) {
         const long offset = std::ftell(file);
@@ -348,7 +375,7 @@ esp_err_t InitWordPackStorage()
     return ESP_OK;
 }
 
-esp_err_t SaveWordPackManifest(const WqnWordPackManifest& manifest)
+esp_err_t SaveWordPackManifestRaw(const WqnWordPackManifest& manifest)
 {
     cJSON* root = cJSON_CreateObject();
     cJSON* data = cJSON_CreateObject();
@@ -391,22 +418,64 @@ esp_err_t SaveWordPackManifest(const WqnWordPackManifest& manifest)
         return ESP_ERR_NO_MEM;
     }
 
-    FILE* file = std::fopen(kManifestPath, "wb");
+    FILE* file = std::fopen(kManifestTempPath, "wb");
     if (file == nullptr) {
-        ESP_LOGW(kTag, "word pack manifest save fopen failed: %s", kManifestPath);
+        ESP_LOGW(kTag, "word pack manifest save fopen failed: %s", kManifestTempPath);
         cJSON_free(rendered);
         return ESP_FAIL;
     }
     const size_t length = std::strlen(rendered);
     const size_t written = std::fwrite(rendered, 1, length, file);
-    std::fclose(file);
+    const bool flushed = std::fflush(file) == 0 && ::fsync(fileno(file)) == 0;
+    const bool closed = std::fclose(file) == 0;
     cJSON_free(rendered);
-    if (written != length) {
-        ESP_LOGW(kTag, "word pack manifest short write: want=%u got=%u",
+    if (written != length || !flushed || !closed) {
+        ESP_LOGW(kTag, "word pack manifest durable write failed: want=%u got=%u",
                  static_cast<unsigned>(length), static_cast<unsigned>(written));
+        std::remove(kManifestTempPath);
+        return ESP_FAIL;
+    }
+
+    const bool had_primary = FileExists(kManifestPath);
+    if (had_primary) {
+        if (std::remove(kManifestBackupPath) != 0 && errno != ENOENT) {
+            ESP_LOGW(kTag, "word pack manifest stale backup remove failed");
+            std::remove(kManifestTempPath);
+            return ESP_FAIL;
+        }
+        if (std::rename(kManifestPath, kManifestBackupPath) != 0) {
+            ESP_LOGW(kTag, "word pack manifest backup commit failed");
+            std::remove(kManifestTempPath);
+            return ESP_FAIL;
+        }
+    }
+    if (std::rename(kManifestTempPath, kManifestPath) != 0) {
+        ESP_LOGW(kTag, "word pack manifest commit rename failed");
+        if (had_primary && std::rename(kManifestBackupPath, kManifestPath) != 0) {
+            ESP_LOGE(kTag, "word pack manifest rollback rename failed; backup remains readable");
+        }
+        std::remove(kManifestTempPath);
         return ESP_FAIL;
     }
     return ESP_OK;
+}
+
+esp_err_t SaveWordPackManifestTransaction(void* opaque)
+{
+    return SaveWordPackManifestRaw(
+        *static_cast<const WqnWordPackManifest*>(opaque));
+}
+
+esp_err_t SaveWordPackManifest(const WqnWordPackManifest& manifest)
+{
+    runtime::SleepLease storage_lease = runtime::SleepLease::TryAcquire(
+        runtime::SleepBlocker::kStorage, "word-pack-manifest", __FILE__, __LINE__);
+    if (!storage_lease) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    return services::ExecuteStorageTransaction(
+        SaveWordPackManifestTransaction,
+        const_cast<WqnWordPackManifest*>(&manifest));
 }
 
 esp_err_t LoadWordPackIndex(WordPackIndex* index)
@@ -483,7 +552,7 @@ esp_err_t LoadWordPackIndex(WordPackIndex* index)
     return ESP_OK;
 }
 
-esp_err_t SaveWordPackFromBytes(const WqnWordPackManifestItem& item, const std::string& bytes)
+esp_err_t SaveWordPackFromBytesRaw(const WqnWordPackManifestItem& item, const std::string& bytes)
 {
     if (item.pack_id.empty() || item.sha256.empty() || bytes.empty()) {
         return ESP_ERR_INVALID_ARG;
@@ -498,6 +567,11 @@ esp_err_t SaveWordPackFromBytes(const WqnWordPackManifestItem& item, const std::
         return ESP_ERR_INVALID_CRC;
     }
 
+    const std::string final_path = PackPathForItem(item);
+    if (VerifyFileSha256(final_path, item.sha256)) {
+        return ESP_OK;
+    }
+
     const std::string tmp_path = TempPackPathForItem(item);
     FILE* file = std::fopen(tmp_path.c_str(), "wb");
     if (file == nullptr) {
@@ -505,16 +579,20 @@ esp_err_t SaveWordPackFromBytes(const WqnWordPackManifestItem& item, const std::
         return ESP_FAIL;
     }
     const size_t written = std::fwrite(bytes.data(), 1, bytes.size(), file);
-    std::fclose(file);
-    if (written != bytes.size()) {
-        ESP_LOGW(kTag, "word pack save short write: pack_id=%s want=%u got=%u",
+    const bool flushed = std::fflush(file) == 0 && ::fsync(fileno(file)) == 0;
+    const bool closed = std::fclose(file) == 0;
+    if (written != bytes.size() || !flushed || !closed) {
+        ESP_LOGW(kTag, "word pack durable write failed: pack_id=%s want=%u got=%u",
                  item.pack_id.c_str(), static_cast<unsigned>(bytes.size()), static_cast<unsigned>(written));
         std::remove(tmp_path.c_str());
         return ESP_FAIL;
     }
 
-    const std::string final_path = PackPathForItem(item);
-    std::remove(final_path.c_str());
+    if (FileExists(final_path) && std::remove(final_path.c_str()) != 0) {
+        ESP_LOGW(kTag, "word pack invalid destination remove failed: pack_id=%s", item.pack_id.c_str());
+        std::remove(tmp_path.c_str());
+        return ESP_FAIL;
+    }
     if (std::rename(tmp_path.c_str(), final_path.c_str()) != 0) {
         ESP_LOGW(kTag, "word pack rename failed: pack_id=%s %s -> %s",
                  item.pack_id.c_str(), tmp_path.c_str(), final_path.c_str());
@@ -522,6 +600,30 @@ esp_err_t SaveWordPackFromBytes(const WqnWordPackManifestItem& item, const std::
         return ESP_FAIL;
     }
     return ESP_OK;
+}
+
+struct WordPackWriteContext {
+    const WqnWordPackManifestItem* item;
+    const std::string* bytes;
+};
+
+esp_err_t SaveWordPackBytesTransaction(void* opaque)
+{
+    const auto* context = static_cast<const WordPackWriteContext*>(opaque);
+    return SaveWordPackFromBytesRaw(*context->item, *context->bytes);
+}
+
+esp_err_t SaveWordPackFromBytes(const WqnWordPackManifestItem& item, const std::string& bytes)
+{
+    runtime::SleepLease storage_lease = runtime::SleepLease::TryAcquire(
+        runtime::SleepBlocker::kStorage, "word-pack-file", __FILE__, __LINE__);
+    if (!storage_lease) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    WordPackWriteContext context = {&item, &bytes};
+    return services::ExecuteStorageTransaction(
+        SaveWordPackBytesTransaction,
+        &context);
 }
 
 bool WordPackNeedsDownload(const WqnWordPackManifestItem& item)

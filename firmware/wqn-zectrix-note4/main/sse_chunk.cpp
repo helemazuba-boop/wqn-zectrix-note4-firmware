@@ -1,82 +1,9 @@
 #include "sse_chunk.h"
 
-#include <algorithm>
-#include <cstdio>
 #include <cstdlib>
-#include <cstring>
-
-#include "esp_timer.h"
+#include <utility>
 
 namespace wqn {
-
-namespace {
-
-constexpr char kHex[] = "0123456789abcdef";
-
-std::string MakeBoundary(const std::string& hint)
-{
-  // RFC 2046 says boundary tokens may include alphanumerics and a handful of
-  // punctuation. We generate something curl-like to make server-side sniffing
-  // sane even though we always set Content-Type.
-  char buf[64];
-  std::snprintf(buf, sizeof(buf), "----WQN-AI-%s-%08x",
-                hint.empty() ? "x" : hint.c_str(),
-                static_cast<unsigned>(esp_timer_get_time()) & 0xFFFFFFFF);
-  return std::string(buf);
-}
-
-}  // namespace
-
-void MultipartEncoder::begin(const std::string& hint)
-{
-  buffer_.clear();
-  boundary_ = MakeBoundary(hint);
-}
-
-void MultipartEncoder::part_json(const std::string& name, const std::string& body)
-{
-  buffer_ += "--";
-  buffer_ += boundary_;
-  buffer_ += "\r\nContent-Disposition: form-data; name=\"";
-  buffer_ += name;
-  buffer_ += "\"\r\nContent-Type: application/json\r\n\r\n";
-  buffer_ += body;
-  buffer_ += "\r\n";
-}
-
-void MultipartEncoder::part_string(const std::string& name, const std::string& body)
-{
-  buffer_ += "--";
-  buffer_ += boundary_;
-  buffer_ += "\r\nContent-Disposition: form-data; name=\"";
-  buffer_ += name;
-  buffer_ += "\"\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n";
-  buffer_ += body;
-  buffer_ += "\r\n";
-}
-
-void MultipartEncoder::part_binary(const std::string& name, const std::string& filename,
-                                   const void* data, size_t size)
-{
-  buffer_ += "--";
-  buffer_ += boundary_;
-  buffer_ += "\r\nContent-Disposition: form-data; name=\"";
-  buffer_ += name;
-  buffer_ += "\"; filename=\"";
-  buffer_ += filename;
-  buffer_ += "\"\r\nContent-Type: application/octet-stream\r\n\r\n";
-  if (data != nullptr && size > 0) {
-    buffer_.append(static_cast<const char*>(data), size);
-  }
-  buffer_ += "\r\n";
-}
-
-void MultipartEncoder::end()
-{
-  buffer_ += "--";
-  buffer_ += boundary_;
-  buffer_ += "--\r\n";
-}
 
 void LineStreamingBuffer::feed(const char* data, size_t len)
 {

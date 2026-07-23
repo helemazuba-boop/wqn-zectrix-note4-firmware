@@ -9,6 +9,7 @@
 #include <memory>
 #include <memory_resource>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "esp_err.h"
@@ -34,6 +35,15 @@ enum class AiHistoryChannel : uint8_t {
 };
 
 struct ChatMessage {
+    explicit ChatMessage(
+        std::pmr::memory_resource* resource = std::pmr::get_default_resource())
+        : text(resource),
+          tool_name(resource),
+          tool_args_json(resource),
+          tool_result_json(resource)
+    {
+    }
+
     ChatMessageId id = kInvalidChatMessageId;
     ChatMessageKind kind = ChatMessageKind::kUser;
     int64_t timestamp_ms = 0;
@@ -66,21 +76,24 @@ struct AiHistorySnapshot {
 
 class AiHistory {
 public:
+    AiHistory();
+
     esp_err_t Init(size_t cap_bytes);
     void Clear();
 
-    ChatMessageId AppendUser(std::pmr::string text, int64_t now_ms);
-    ChatMessageId AppendAssistant(std::pmr::string text, int64_t now_ms);
-    ChatMessageId AppendThinking(std::pmr::string text, int64_t now_ms);
-    ChatMessageId AppendToolStart(std::pmr::string name, std::pmr::string args, int64_t now_ms);
-    ChatMessageId AppendToolResult(std::pmr::string name, std::pmr::string args,
-                                   std::pmr::string result, bool ok, int32_t elapsed_ms,
+    ChatMessageId AppendUser(std::string_view text, int64_t now_ms);
+    ChatMessageId AppendAssistant(std::string_view text, int64_t now_ms);
+    ChatMessageId AppendThinking(std::string_view text, int64_t now_ms);
+    ChatMessageId AppendToolStart(std::string_view name, std::string_view args,
+                                  int64_t now_ms);
+    ChatMessageId AppendToolResult(std::string_view name, std::string_view args,
+                                   std::string_view result, bool ok, int32_t elapsed_ms,
                                    int64_t now_ms);
 
     // Replace a known message without changing order. The kind guard prevents a
     // late event from overwriting a different message after eviction/clear.
     bool ReplaceText(ChatMessageId id, ChatMessageKind expected_kind,
-                     std::pmr::string text, int64_t now_ms);
+                     std::string_view text, int64_t now_ms);
 
     bool PopLastIf(ChatMessageKind kind);
     std::shared_ptr<const AiHistorySnapshot> Snapshot() const;
@@ -96,31 +109,25 @@ private:
     size_t CostOf(const ChatMessage& m) const;
     void TrimLocked();
 
-    std::pmr::monotonic_buffer_resource pool_;
-    std::pmr::memory_resource* heap_ = nullptr;
+    class PsramMemoryResource : public std::pmr::memory_resource {
+    public:
+        bool using_psram() const;
+
+    private:
+        void* do_allocate(size_t bytes, size_t alignment) override;
+        void do_deallocate(void* p, size_t bytes, size_t alignment) override;
+        bool do_is_equal(const memory_resource& other) const noexcept override;
+    };
+
+    PsramMemoryResource heap_;
     std::deque<ChatMessage> messages_;
+    mutable StaticSemaphore_t mutex_storage_{};
     mutable SemaphoreHandle_t mutex_ = nullptr;
     size_t byte_size_ = 0;
     size_t cap_bytes_ = 0;
     ChatMessageId next_message_id_ = 1;
     uint64_t revision_ = 0;
     bool initialized_ = false;
-};
-
-class PsramBufferResource : public std::pmr::memory_resource {
-public:
-    explicit PsramBufferResource(size_t bytes);
-    ~PsramBufferResource() override;
-    bool using_psram() const { return using_psram_; }
-
-private:
-    void* do_allocate(size_t bytes, size_t alignment) override;
-    void do_deallocate(void* p, size_t bytes, size_t alignment) override;
-    bool do_is_equal(const memory_resource& other) const noexcept override;
-
-    void* chunk_ = nullptr;
-    size_t chunk_size_ = 0;
-    bool using_psram_ = false;
 };
 
 // Explicit channel selection prevents a late background stream from writing to

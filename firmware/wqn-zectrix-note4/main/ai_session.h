@@ -40,6 +40,10 @@ struct AiStreamingStatusView {
 
 bool CopyAiStreamingStatus(AiStreamingStatusView* view);
 
+// Power-transition guard. True while preparation, capture submission or SSE
+// response processing owns AI session state.
+bool IsAiSessionActive();
+
 // ---- v2 chat surface (top toast + scrollable viewport) ----------------------
 //
 // The AI page renders a viewport at y=51..299 with the status-bar above it.

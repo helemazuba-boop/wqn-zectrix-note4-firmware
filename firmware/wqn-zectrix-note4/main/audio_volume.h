@@ -1,6 +1,6 @@
 #pragma once
 
-#include "driver/i2c_master.h"
+#include "services/audio_service.h"
 
 namespace wqn {
 
@@ -15,6 +15,9 @@ namespace wqn {
 //                    step +0.5 dB. Values above 0xBF add gain and are not used.
 //
 // Call after ES8311 DAC init, before the I2C device handle is released.
-void SetEs8311Volume(i2c_master_dev_handle_t dev, int percent);
+void SetEs8311Volume(
+    const services::AudioSession& session,
+    services::AudioCodecHandle dev,
+    int percent);
 
 }  // namespace wqn

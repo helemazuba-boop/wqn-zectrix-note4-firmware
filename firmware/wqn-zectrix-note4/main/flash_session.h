@@ -39,6 +39,7 @@ FlashStatus GetFlashStatus();
 bool IsFlashConnected();
 bool CopyFlashStateToUi(FlashUiState* state);
 bool IsFlashTranscribing();
+bool IsFlashSessionActive();
 
 // Periodically called from the UI task; closes the audio amp after the configured
 // idle tail so long pauses between server audio deltas don't leave the speaker

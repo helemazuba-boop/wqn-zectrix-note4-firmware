@@ -46,18 +46,19 @@ WQN ZecTrix Note4 Firmware 是“错题本”（WQN）面向 ZecTrix Note4 设�
 
 ## 构建
 
-先激活 ESP-IDF 环境，然后运行：
+WSL 主开发环境使用 ESP-IDF 5.5.4。先激活环境，然后运行：
 
-```powershell
-cd D:\projects\wqn-zectrix-note4-firmware\firmware\wqn-zectrix-note4
-idf.py set-target esp32s3
-idf.py build
+```bash
+cd /home/unknow/projects/firmware/firmware/wqn-zectrix-note4
+source /home/unknow/esp/esp-idf-v5.5/export.sh
+idf.py -B build-ai-local-s3 set-target esp32s3
+idf.py -B build-ai-local-s3 build
 ```
 
 开发环境需要显式指定 WQN API 地址。ESP32 不能访问电脑上的 `localhost`，请使用局域网 IP、域名或隧道地址：
 
-```powershell
-idf.py -DWQN_API_BASE=https://your-host.example.com/api/esp32 build
+```bash
+idf.py -B build-ai-local-s3 -DWQN_API_BASE=https://your-host.example.com/api/esp32 build
 ```
 
 ## 安全提醒

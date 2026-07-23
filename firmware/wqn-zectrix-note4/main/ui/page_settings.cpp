@@ -6,7 +6,7 @@
 #include <algorithm>
 #include <string>
 
-#include "epd_display.h"
+#include "display_service.h"
 #include "esp_log.h"
 
 namespace device_ui_internal {
@@ -175,20 +175,21 @@ esp_err_t RenderSettingsToEpd(const wqn::UiFrame& frame, RefreshSchedule schedul
     if (!partial_settings) {
         DrawHorizontalLine(0, 27, wqn::kEpdWidth);
         std::string title = "设置";
-        if (!diag.mac_label.empty()) {
-            title += " (MAC: " + diag.mac_label + ")";
+        if (!frame.claim_code.empty()) {
+            title += " (授权码: " + frame.claim_code + ")";
+        } else if (frame.paired) {
+            title += " (已配对)";
+        } else {
+            title += " (授权码获取中)";
         }
         ESP_RETURN_ON_ERROR(DrawClippedText(10, 6, 250, title), kTag, "draw settings title");
-        std::string status = CurrentClockLabel();
-        if (!frame.home.wifi_label.empty()) {
-            status += "  " + frame.home.wifi_label;
-        }
-        if (!frame.home.battery_label.empty()) {
-            status += "  " + frame.home.battery_label;
-        }
-        const int status_width = wqn::MeasureUtf8TextWidth(status.c_str());
+        // Right-edge icon cluster (wifi + battery); time right-aligned to its left.
+        const int icons_left = DrawStatusBarIcons(wqn::kEpdWidth - 10, 6, frame.home);
+        const std::string time_str = CurrentClockLabel();
+        const int time_w = wqn::MeasureUtf8TextWidth(time_str.c_str());
+        const int time_x = std::max(10, icons_left - 6 - time_w);
         ESP_RETURN_ON_ERROR(
-            DrawClippedText(std::max(10, wqn::kEpdWidth - status_width - 10), 6, std::min(180, status_width + 4), status),
+            DrawClippedText(time_x, 6, std::min(180, time_w + 4), time_str),
             kTag,
             "draw settings status");
     }

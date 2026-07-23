@@ -4,6 +4,7 @@
 #include <vector>
 
 #include "esp_err.h"
+#include "device_protocol/v3.h"
 
 namespace wqn {
 
@@ -279,6 +280,27 @@ struct WqnAiChatResponse {
 };
 
 esp_err_t RunPairingFlowIfNeeded();
+esp_err_t StartDeviceClaimV3(
+    const protocol::v3::RequestMetadata& metadata,
+    const std::string& hardware_id,
+    const std::string& device_public_key,
+    protocol::v3::ClaimStartData* data,
+    protocol::v3::Error* error);
+esp_err_t PollDeviceClaimV3(
+    const protocol::v3::RequestMetadata& metadata,
+    const std::string& claim_id,
+    protocol::v3::ClaimPollData* data,
+    protocol::v3::Error* error);
+esp_err_t BootstrapDeviceControlV3(
+    const std::string& token,
+    const protocol::v3::RequestMetadata& metadata,
+    protocol::v3::BootstrapData* data,
+    protocol::v3::Error* error);
+esp_err_t SyncDeviceControlV3(
+    const std::string& token,
+    const protocol::v3::RequestMetadata& metadata,
+    protocol::v3::SyncData* data,
+    protocol::v3::Error* error);
 esp_err_t ProbeSyncAndClearTokenOnUnauthorized(const std::string& token);
 esp_err_t SyncDueProblemIds(const std::string& token, std::vector<std::string>* due_problem_ids, int* total);
 esp_err_t FetchProblems(const std::string& token, const std::vector<std::string>& problem_ids, std::vector<WqnProblem>* problems);
@@ -366,13 +388,11 @@ struct WqnAiStreamRequest {
     int timeout_ms = 0;              // 0 = use WQN_AI_SSE_TIMEOUT_MS
     WqnAiSseCallback callback = nullptr;
     void* user_ctx = nullptr;
-    // [shell->wire] Thinking controls sent in session_meta. reasoning_effort is
-    // sent for BOTH tiers (STD/StepFun uses it; PRO/Qwen ignores for now, sent
-    // for future model upgrades). enable_thinking + system_prompt_extra are
-    // PRO-only (Qwen enable_thinking bool + xhigh prompt at the high level).
+    // Thinking controls sent as validated X-WQN headers on the raw PCM request.
+    // The cloud owns any system-prompt augmentation and maps these bounded
+    // values to provider-specific parameters.
     std::string reasoning_effort;    // "low"|"medium"|"high"; empty = don't send
-    bool enable_thinking = true;     // PRO only: false disables thinking
-    std::string system_prompt_extra; // PRO high level: xhigh reasoning prompt
+    bool enable_thinking = true;
 };
 
 // Streams a SSE response from POST {WQN_API_BASE}{WQN_AI_SSE_REQUEST_PATH}.

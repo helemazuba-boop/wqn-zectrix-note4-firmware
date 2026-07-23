@@ -5,7 +5,7 @@
 
 #include <vector>
 
-#include "epd_display.h"
+#include "display_service.h"
 
 namespace device_ui_internal {
 

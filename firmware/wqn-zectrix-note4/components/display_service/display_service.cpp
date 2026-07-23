@@ -1,4 +1,4 @@
-#include "epd_display.h"
+#include "display_service.h"
 
 #include <algorithm>
 #include <cstring>
@@ -11,11 +11,20 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "font_fmt.h"
+#include "runtime/wake_context.h"
 #include "sdkconfig.h"
 
+#ifndef CONFIG_WQN_EPD_IDLE_POWER_OFF_MS
+#define CONFIG_WQN_EPD_IDLE_POWER_OFF_MS 1500
+#endif
+
 namespace wqn {
+
+static void PowerOffEpd();
+
 namespace {
 
 constexpr char kTag[] = "wqn_epd";
@@ -77,6 +86,8 @@ bool g_previous_framebuffer_synced = false;
 bool g_hot_refresh_ok = false;
 uint32_t g_partial_refreshes_since_full = 0;
 int64_t g_last_epd_refresh_us = 0;
+int64_t g_last_epd_activity_ms = 0;
+bool g_epd_idle_cut = false;
 
 // [power-fix] Persisted across deep-sleep resets so the EPD refresh task
 // can skip redundant panel updates after an RTC-timer wakeup.  Without this,
@@ -84,6 +95,39 @@ int64_t g_last_epd_refresh_us = 0;
 // refresh, causing visible flicker on every clock tick.
 RTC_DATA_ATTR uint32_t g_rtc_last_frame_crc = 0;
 RTC_DATA_ATTR bool g_rtc_last_frame_crc_valid = false;
+
+SemaphoreHandle_t EpdOperationMutex()
+{
+    // Recursive because a full refresh powers the panel off from inside the
+    // already-serialized refresh operation.
+    static SemaphoreHandle_t mutex = xSemaphoreCreateRecursiveMutex();
+    return mutex;
+}
+
+class EpdOperationGuard {
+public:
+    explicit EpdOperationGuard(TickType_t timeout)
+        : mutex_(EpdOperationMutex())
+    {
+        locked_ = mutex_ != nullptr && xSemaphoreTakeRecursive(mutex_, timeout) == pdTRUE;
+    }
+
+    ~EpdOperationGuard()
+    {
+        if (locked_) {
+            xSemaphoreGiveRecursive(mutex_);
+        }
+    }
+
+    EpdOperationGuard(const EpdOperationGuard&) = delete;
+    EpdOperationGuard& operator=(const EpdOperationGuard&) = delete;
+
+    bool locked() const { return locked_; }
+
+private:
+    SemaphoreHandle_t mutex_ = nullptr;
+    bool locked_ = false;
+};
 
 extern "C" const lv_font_t SourceHanSansSC_Regular_slim;
 
@@ -764,10 +808,13 @@ void DrawGlyph(int x, int y, unsigned char ch, bool black)
     }
 }
 
-const lv_font_fmt_txt_glyph_dsc_t* FindCjkGlyph(uint32_t codepoint)
+const lv_font_fmt_txt_glyph_dsc_t* FindGlyphInFont(const lv_font_t* font, uint32_t codepoint)
 {
-    const lv_font_fmt_txt_dsc_t* font_dsc = SourceHanSansSC_Regular_slim.dsc;
-    if (font_dsc == nullptr || codepoint == 0) {
+    if (font == nullptr || codepoint == 0) {
+        return nullptr;
+    }
+    const lv_font_fmt_txt_dsc_t* font_dsc = font->dsc;
+    if (font_dsc == nullptr) {
         return nullptr;
     }
 
@@ -889,6 +936,16 @@ uint32_t NormalizeCodepointForDisplay(uint32_t cp)
     }
 }
 
+int MeasureGlyphWidthInFont(const lv_font_t* font, uint32_t codepoint)
+{
+    const lv_font_fmt_txt_glyph_dsc_t* glyph = FindGlyphInFont(font, codepoint);
+    if (glyph == nullptr) {
+        // [font-fix] No glyph (e.g. IPA phonetics): zero width, matches DrawGlyphFromFont.
+        return 0;
+    }
+    return std::max<int>(1, (glyph->adv_w + 8) >> 4);
+}
+
 int MeasureCodepointWidth(uint32_t codepoint)
 {
     if (codepoint == '\n' || codepoint == '\r') {
@@ -897,20 +954,16 @@ int MeasureCodepointWidth(uint32_t codepoint)
     if (codepoint >= 0x20 && codepoint <= 0x7E) {
         return kTextCellWidth;
     }
-
-    const lv_font_fmt_txt_glyph_dsc_t* glyph = FindCjkGlyph(codepoint);
-    if (glyph == nullptr) {
-        // [font-fix] No glyph (e.g. IPA phonetics): skip (zero width) instead
-        // of a placeholder cell. Matches DrawCjkGlyph which draws nothing here.
-        return 0;
-    }
-    return std::max<int>(1, (glyph->adv_w + 8) >> 4);
+    return MeasureGlyphWidthInFont(&SourceHanSansSC_Regular_slim, codepoint);
 }
 
-void DrawCjkGlyph(int x, int y, uint32_t codepoint, bool black)
+void DrawGlyphFromFont(int x, int y, const lv_font_t* font, uint32_t codepoint, bool black)
 {
-    const lv_font_fmt_txt_dsc_t* font_dsc = SourceHanSansSC_Regular_slim.dsc;
-    const lv_font_fmt_txt_glyph_dsc_t* glyph = FindCjkGlyph(codepoint);
+    if (font == nullptr) {
+        return;
+    }
+    const lv_font_fmt_txt_dsc_t* font_dsc = font->dsc;
+    const lv_font_fmt_txt_glyph_dsc_t* glyph = FindGlyphInFont(font, codepoint);
     if (font_dsc == nullptr || glyph == nullptr || glyph->box_w == 0 || glyph->box_h == 0) {
         // [font-fix] Missing glyph: draw nothing (skip) instead of a hollow box.
         return;
@@ -918,7 +971,7 @@ void DrawCjkGlyph(int x, int y, uint32_t codepoint, bool black)
 
     const uint8_t* bitmap = &font_dsc->glyph_bitmap[glyph->bitmap_index];
     const int draw_x = x + glyph->ofs_x;
-    const int draw_y = y + (kCjkFontHeight - kCjkFontBaseLine) - glyph->box_h - glyph->ofs_y;
+    const int draw_y = y + (font->line_height - font->base_line) - glyph->box_h - glyph->ofs_y;
     int bit_index = 0;
     for (int row = 0; row < glyph->box_h; ++row) {
         for (int col = 0; col < glyph->box_w; ++col, ++bit_index) {
@@ -931,10 +984,17 @@ void DrawCjkGlyph(int x, int y, uint32_t codepoint, bool black)
     }
 }
 
+void DrawCjkGlyph(int x, int y, uint32_t codepoint, bool black)
+{
+    DrawGlyphFromFont(x, y, &SourceHanSansSC_Regular_slim, codepoint, black);
+}
+
 }  // namespace
 
 esp_err_t InitEpdDisplay()
 {
+    EpdOperationGuard operation(portMAX_DELAY);
+    ESP_RETURN_ON_FALSE(operation.locked(), ESP_ERR_NO_MEM, kTag, "create/take EPD operation mutex");
     if (g_initialized) {
         return ESP_OK;
     }
@@ -962,21 +1022,6 @@ esp_err_t InitEpdDisplay()
     ESP_RETURN_ON_ERROR(InitPanelSequence(), kTag, "init EPD panel");
     g_initialized = true;
     return ESP_OK;
-}
-
-uint8_t* GetEpdFramebuffer()
-{
-    return g_framebuffer;
-}
-
-const uint8_t* GetEpdFramebufferConst()
-{
-    return g_framebuffer;
-}
-
-size_t GetEpdFramebufferSize()
-{
-    return kEpdFramebufferSize;
 }
 
 void ClearEpdFramebuffer(bool white)
@@ -1074,6 +1119,81 @@ int MeasureUtf8TextWidth(const char* text)
         current_width += MeasureCodepointWidth(codepoint);
     }
     return std::max(max_width, current_width);
+}
+
+void DrawTextWithFont(int x, int y, const lv_font_t* font, const char* text, bool black)
+{
+    if (text == nullptr || font == nullptr) {
+        return;
+    }
+    int cursor_x = x;
+    int cursor_y = y;
+    const char* cursor = text;
+    while (*cursor != '\0') {
+        uint32_t codepoint = 0;
+        const char* before = cursor;
+        if (!DecodeUtf8(cursor, &codepoint)) {
+            break;
+        }
+        if (cursor == before) {
+            break;
+        }
+        if (codepoint == '\r') {
+            continue;
+        }
+        if (codepoint == '\n') {
+            cursor_y += font->line_height;
+            cursor_x = x;
+            continue;
+        }
+
+        const int glyph_width = MeasureGlyphWidthInFont(font, codepoint);
+        if (cursor_x + glyph_width > kEpdWidth) {
+            break;
+        }
+        DrawGlyphFromFont(cursor_x, cursor_y, font, codepoint, black);
+        cursor_x += glyph_width;
+    }
+}
+
+int MeasureTextWithFont(const lv_font_t* font, const char* text)
+{
+    if (font == nullptr || text == nullptr) {
+        return 0;
+    }
+    int max_width = 0;
+    int current_width = 0;
+    const char* cursor = text;
+    while (*cursor != '\0') {
+        uint32_t codepoint = 0;
+        const char* before = cursor;
+        if (!DecodeUtf8(cursor, &codepoint)) {
+            break;
+        }
+        if (cursor == before) {
+            break;
+        }
+        if (codepoint == '\r') {
+            continue;
+        }
+        if (codepoint == '\n') {
+            max_width = std::max(max_width, current_width);
+            current_width = 0;
+            continue;
+        }
+        current_width += MeasureGlyphWidthInFont(font, codepoint);
+    }
+    return std::max(max_width, current_width);
+}
+
+void DrawTextWithFontCentered(int x, int y, int width, const lv_font_t* font, const char* text, bool black)
+{
+    if (font == nullptr || text == nullptr) {
+        return;
+    }
+    const int text_width = MeasureTextWithFont(font, text);
+    const int draw_x = x + std::max(0, (width - text_width) / 2);
+    DrawTextWithFont(draw_x, y, font, text, black);
 }
 
 std::string TruncateUtf8TextToWidth(const std::string& text, int max_width_px)
@@ -1321,6 +1441,8 @@ esp_err_t SendDirtyRectToPanel(const DirtyRect& rect)
 
 esp_err_t RefreshEpdFull(bool allow_local_partial, bool force_full_refresh)
 {
+    EpdOperationGuard operation(portMAX_DELAY);
+    ESP_RETURN_ON_FALSE(operation.locked(), ESP_ERR_NO_MEM, kTag, "take EPD refresh operation mutex");
     ESP_LOGI(kTag, "EPD RefreshEpdFull: enter partial=%d full=%d fb=%p prev=%p synced=%d",
         allow_local_partial, force_full_refresh, g_framebuffer, g_previous_framebuffer, g_previous_framebuffer_synced);
     constexpr float kMaxLocalPartialAreaRatio = 0.45f;
@@ -1344,7 +1466,8 @@ esp_err_t RefreshEpdFull(bool allow_local_partial, bool force_full_refresh)
     // CRC stored in RTC memory from the last real refresh, the panel already
     // shows this frame and we can skip the entire SPI transaction.
     const uint32_t current_crc = esp_crc32_le(~0U, g_framebuffer, kEpdFramebufferSize) ^ ~0U;
-    if (!force_full_refresh && g_rtc_last_frame_crc_valid && current_crc == g_rtc_last_frame_crc) {
+    if (!force_full_refresh && wqn::runtime::GetWakeContext().panel_cache_trusted &&
+        g_rtc_last_frame_crc_valid && current_crc == g_rtc_last_frame_crc) {
         // Panel already shows this content -- restore RAM state to match and
         // skip the refresh to eliminate flicker and save ~200ms of CPU time.
         g_previous_framebuffer_synced = true;
@@ -1432,8 +1555,13 @@ esp_err_t RefreshEpdFull(bool allow_local_partial, bool force_full_refresh)
     return ESP_OK;
 }
 
-void PowerOffEpd()
+static void PowerOffEpd()
 {
+    EpdOperationGuard operation(portMAX_DELAY);
+    if (!operation.locked()) {
+        ESP_LOGE(kTag, "EPD power-off skipped: operation mutex unavailable");
+        return;
+    }
     // [epd-leak-fix] Spec book §5.3 requires sending SSD1683 deep-sleep command
     // 0x07/0xA5 before cutting GPIO 6, otherwise the controller remains in an
     // active state and current backflows through protection diodes when the
@@ -1470,18 +1598,63 @@ void PowerOffEpd()
     }
 }
 
-} // namespace wqn
-
-// Helpers outside the main `wqn` namespace block (which closed at the end of
-// PowerOffEpd above) so we don't reopen the same namespace. The flag itself
-// lives in the device_ui_internal translation unit (ui_refresh.cpp);
-// forward-declare here to read it without dragging in ui_internal.h.
-namespace device_ui_internal {
-extern bool g_refresh_busy;
-}  // namespace device_ui_internal
-
-bool wqn::IsEpdBusy()
+static esp_err_t TryPowerOffEpd(uint32_t timeout_ms)
 {
-    return ::device_ui_internal::g_refresh_busy;
+    EpdOperationGuard operation(pdMS_TO_TICKS(timeout_ms));
+    if (!operation.locked()) {
+        return ESP_ERR_TIMEOUT;
+    }
+    // Recursive acquisition keeps every power-off path on the same lock.
+    PowerOffEpd();
+    return ESP_OK;
 }
 
+} // namespace wqn
+
+void wqn::NoteEpdActivity()
+{
+    g_last_epd_activity_ms = esp_timer_get_time() / 1000;
+    g_epd_idle_cut = false;
+}
+
+void wqn::PowerOffEpdAfterIdleIfNeeded()
+{
+    const int idle_ms = CONFIG_WQN_EPD_IDLE_POWER_OFF_MS;
+    if (idle_ms <= 0 || g_epd_idle_cut || g_last_epd_activity_ms == 0) {
+        return;
+    }
+    if ((esp_timer_get_time() / 1000 - g_last_epd_activity_ms) < idle_ms) {
+        return;
+    }
+    const esp_err_t result = TryPowerOffEpd(0);
+    if (result == ESP_OK) {
+        ESP_LOGI(kTag, "EPD idle power-off after %d ms", idle_ms);
+        g_epd_idle_cut = true;
+    } else if (result != ESP_ERR_TIMEOUT) {
+        ESP_LOGW(kTag, "EPD idle power-off failed: %s", esp_err_to_name(result));
+    }
+}
+
+esp_err_t wqn::PrepareDisplayForSleep(int64_t deadline_us)
+{
+    // PowerCoordinator may begin quiesce only when no SleepLease exists. Every
+    // accepted UI frame owns kDisplay until its terminal result, so reaching
+    // this service boundary proves there is no upstream frame left to drain.
+    const int64_t remaining_us = deadline_us > 0
+        ? deadline_us - esp_timer_get_time()
+        : 0;
+    if (deadline_us > 0 && remaining_us <= 0) {
+        return ESP_ERR_TIMEOUT;
+    }
+    const uint32_t timeout_ms = deadline_us > 0
+        ? static_cast<uint32_t>((remaining_us + 999) / 1000)
+        : 0;
+    return TryPowerOffEpd(timeout_ms);
+}
+
+void wqn::RollbackDisplayAfterSleepAbort()
+{
+    // Power-off is a valid Ready state during ordinary runtime. The next
+    // accepted DisplayIntent owns wake/re-init, so rollback must not touch
+    // GPIO6 behind DisplayService's state machine.
+}

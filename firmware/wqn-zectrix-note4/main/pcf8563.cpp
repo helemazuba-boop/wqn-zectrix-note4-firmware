@@ -13,6 +13,15 @@ namespace {
 
 constexpr char kTag[] = "wqn_pcf8563";
 
+constexpr uint8_t kControlStatus2Reg = 0x01;
+constexpr uint8_t kTimerControlReg = 0x0E;
+constexpr uint8_t kTimerValueReg = 0x0F;
+constexpr uint8_t kTimerEnable = 0x80;
+constexpr uint8_t kTimerClock1Hz = 0x02;
+constexpr uint8_t kAlarmFlag = 0x08;
+constexpr uint8_t kTimerFlag = 0x04;
+constexpr uint8_t kTimerInterruptEnable = 0x01;
+
 i2c_master_bus_handle_t g_bus = nullptr;
 i2c_master_dev_handle_t g_dev = nullptr;
 bool g_initialized = false;
@@ -64,41 +73,6 @@ bool Pcf8563InitWithBus(i2c_master_bus_handle_t bus)
     return true;
 }
 
-bool Pcf8563Init(i2c_port_t port, gpio_num_t sda, gpio_num_t scl, int clk_hz)
-{
-    if (g_initialized) {
-        return true;
-    }
-
-    if (port != I2C_NUM_0 && port != I2C_NUM_1) {
-        port = I2C_NUM_0;
-    }
-
-    i2c_master_bus_config_t bus_cfg = {};
-    bus_cfg.i2c_port = port;
-    bus_cfg.sda_io_num = sda;
-    bus_cfg.scl_io_num = scl;
-    bus_cfg.clk_source = I2C_CLK_SRC_DEFAULT;
-    bus_cfg.glitch_ignore_cnt = 7;
-    bus_cfg.flags.enable_internal_pullup = 1;
-
-    esp_err_t err = i2c_new_master_bus(&bus_cfg, &g_bus);
-    if (err != ESP_OK) {
-        ESP_LOGE(kTag, "new master bus failed: %s", esp_err_to_name(err));
-        return false;
-    }
-
-    if (!Pcf8563InitWithBus(g_bus)) {
-        i2c_del_master_bus(g_bus);
-        g_bus = nullptr;
-        return false;
-    }
-
-    ESP_LOGI(kTag, "PCF8563 initialized with own bus: port=%d SDA=%d SCL=%d clk=%d",
-             static_cast<int>(port), static_cast<int>(sda), static_cast<int>(scl), clk_hz);
-    return true;
-}
-
 bool Pcf8563ReadTime(int* year, int* month, int* day, int* hour, int* min, int* sec)
 {
     if (!g_initialized) {
@@ -137,26 +111,72 @@ bool Pcf8563ConfigureTimerWake(uint8_t seconds)
         return false;
     }
 
-    if (I2cWriteReg(0x0F, seconds) != ESP_OK) {
+    // Stop the countdown before changing its value. Control_status_2 is
+    // deliberately written as a complete value: AF/TF clear when written as
+    // zero, unused bits must be zero, and this firmware does not use alarms.
+    if (I2cWriteReg(kTimerControlReg, kTimerClock1Hz) != ESP_OK) {
         return false;
     }
-
-    if (I2cWriteReg(0x0E, 0x82) != ESP_OK) {
+    if (I2cWriteReg(kControlStatus2Reg, 0x00) != ESP_OK) {
+        return false;
+    }
+    if (I2cWriteReg(kTimerValueReg, seconds) != ESP_OK) {
+        return false;
+    }
+    if (I2cWriteReg(kControlStatus2Reg, kTimerInterruptEnable) != ESP_OK) {
+        return false;
+    }
+    if (I2cWriteReg(kTimerControlReg, kTimerEnable | kTimerClock1Hz) != ESP_OK) {
         return false;
     }
 
     uint8_t ctrl2 = 0;
-    if (I2cReadReg(0x01, &ctrl2, 1) != ESP_OK) {
-        return false;
-    }
-
-    ctrl2 = (ctrl2 & 0x1F) | 0x01;
-    if (I2cWriteReg(0x01, ctrl2) != ESP_OK) {
+    if (I2cReadReg(kControlStatus2Reg, &ctrl2, 1) != ESP_OK ||
+        (ctrl2 & (kAlarmFlag | kTimerFlag)) != 0 ||
+        (ctrl2 & kTimerInterruptEnable) == 0) {
+        ESP_LOGW(kTag, "timer wake arm verification failed: ctrl2=0x%02x", ctrl2);
         return false;
     }
 
     ESP_LOGI(kTag, "PCF8563 timer wake configured: %u seconds", static_cast<unsigned>(seconds));
     return true;
+}
+
+bool Pcf8563ReadInterruptFlags(Pcf8563InterruptFlags* flags)
+{
+    if (!g_initialized || flags == nullptr) {
+        return false;
+    }
+
+    uint8_t ctrl2 = 0;
+    if (I2cReadReg(kControlStatus2Reg, &ctrl2, 1) != ESP_OK) {
+        return false;
+    }
+    flags->alarm = (ctrl2 & kAlarmFlag) != 0;
+    flags->timer = (ctrl2 & kTimerFlag) != 0;
+    return true;
+}
+
+bool Pcf8563DisableTimerWakeAndClearFlags()
+{
+    if (!g_initialized) {
+        return false;
+    }
+
+    if (I2cWriteReg(kTimerControlReg, kTimerClock1Hz) != ESP_OK ||
+        I2cWriteReg(kControlStatus2Reg, 0x00) != ESP_OK) {
+        return false;
+    }
+
+    uint8_t ctrl2 = 0;
+    if (I2cReadReg(kControlStatus2Reg, &ctrl2, 1) != ESP_OK) {
+        return false;
+    }
+    const bool cleared = (ctrl2 & (kAlarmFlag | kTimerFlag | kTimerInterruptEnable)) == 0;
+    if (!cleared) {
+        ESP_LOGW(kTag, "timer wake clear verification failed: ctrl2=0x%02x", ctrl2);
+    }
+    return cleared;
 }
 
 }  // namespace wqn

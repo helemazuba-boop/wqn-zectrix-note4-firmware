@@ -7,16 +7,19 @@ idf_component_register(
         "audio_player.cpp"
         "audio_volume.cpp"
         "audio_selftest.cpp"
-        "board_zectrix_note4.cpp"
         "button_input.cpp"
         "contract_fixtures.cpp"
         "device_ui.cpp"
         "diagnostics.cpp"
-        "epd_display.cpp"
-        "fonts/SourceHanSansSC_Regular_slim.c"
         "power_manager.cpp"
+        "power/wake_controller.cpp"
         "pcf8563.cpp"
         "provision_manager.cpp"
+        "runtime/storage_schema.cpp"
+        "services/connectivity_service.cpp"
+        "services/audio_service.cpp"
+        "services/storage_service.cpp"
+        "services/sync_service.cpp"
         "sse_chunk.cpp"
         "storage.cpp"
         "text_render.cpp"
@@ -37,6 +40,7 @@ idf_component_register(
         "ui/ui_input.cpp"
         "ui/ui_refresh.cpp"
         "ui/ui_render.cpp"
+        "ui/ui_runtime.cpp"
         "ui/ui_state.cpp"
         "ui/word_cloud.cpp"
         "ui_model.cpp"
@@ -60,15 +64,26 @@ idf_component_register(
         esp_event
         esp_netif
         esp_psram
+        esp_driver_usb_serial_jtag
         esp_wifi
+        wqn_wifi_provision
         freertos
         json
         lwip
         mbedtls
         nvs_flash
+        platform_note4
+        power_runtime
+        display_service
+        device_protocol
         spi_flash
         spiffs
 )
+
+if(CONFIG_WQN_WIFI_STA_ENABLE AND NOT CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE)
+    message(FATAL_ERROR
+        "WiFi-enabled firmware must use device-control v3; legacy /poll pairing returns HTTP 426")
+endif()
 
 set(WQN_API_BASE "" CACHE STRING "Override the WQN ESP32 API base URL")
 set(WQN_DEBUG_PROBLEM_IDS "" CACHE STRING "Local-only comma-separated ESP32 debug problem IDs")

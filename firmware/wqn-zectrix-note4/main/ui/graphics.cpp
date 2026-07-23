@@ -5,7 +5,7 @@
 
 #include <algorithm>
 
-#include "epd_display.h"
+#include "display_service.h"
 
 namespace device_ui_internal {
 
@@ -45,6 +45,67 @@ void FillRect(int x, int y, int width, int height, bool black)
     }
 }
 
+void DrawWqnBitmapAsset(int x, int y, const WqnBitmapAsset& asset, bool black)
+{
+    for (uint8_t yy = 0; yy < asset.height; ++yy) {
+        for (uint8_t xx = 0; xx < asset.width; ++xx) {
+            if (WqnBitmapPixel(asset, xx, yy)) {
+                wqn::DrawEpdPixel(x + xx, y + yy, black);
+            }
+        }
+    }
+}
+
+// [rounded] 1bpp rounded-rect outline. Corners use the midpoint-circle octant
+// walk mirrored to all four corners (same idea as DrawTimelineNode's disc, but
+// boundary-only 1px arcs); straight spans connect them. radius<=0 degrades to
+// DrawRect; radius is clamped to half the smaller dimension. This is the
+// product-wide card/dialog boundary style (user decision: rounded + 2px
+// concentric double-line = persistent selection, overriding the §13.4 default
+// sharp-corner language). Typical use: DrawRoundedRect(x,y,w,h,6) for a card,
+// plus DrawRoundedRect(x+2,y+2,w-4,h-4,4) when selected.
+void DrawRoundedRect(int x, int y, int width, int height, int radius)
+{
+    if (width <= 0 || height <= 0) {
+        return;
+    }
+    if (radius <= 0) {
+        DrawRect(x, y, width, height);
+        return;
+    }
+    const int r = std::min(radius, std::min(width, height) / 2);
+    // Straight spans between the corner arcs (1px each).
+    DrawHorizontalLine(x + r, y, width - 2 * r);              // top
+    DrawHorizontalLine(x + r, y + height - 1, width - 2 * r); // bottom
+    DrawVerticalLine(x, y + r, height - 2 * r);               // left
+    DrawVerticalLine(x + width - 1, y + r, height - 2 * r);   // right
+    // Corner arcs: midpoint circle over one octant, mirrored to four corners.
+    const int cx_l = x + r;
+    const int cx_r = x + width - 1 - r;
+    const int cy_t = y + r;
+    const int cy_b = y + height - 1 - r;
+    int dx = r;
+    int dy = 0;
+    int err = 1 - dx;
+    while (dx >= dy) {
+        wqn::DrawEpdPixel(cx_r + dx, cy_t - dy, true);  // top-right
+        wqn::DrawEpdPixel(cx_r + dy, cy_t - dx, true);
+        wqn::DrawEpdPixel(cx_l - dx, cy_t - dy, true);  // top-left
+        wqn::DrawEpdPixel(cx_l - dy, cy_t - dx, true);
+        wqn::DrawEpdPixel(cx_l - dx, cy_b + dy, true);  // bottom-left
+        wqn::DrawEpdPixel(cx_l - dy, cy_b + dx, true);
+        wqn::DrawEpdPixel(cx_r + dx, cy_b + dy, true);  // bottom-right
+        wqn::DrawEpdPixel(cx_r + dy, cy_b + dx, true);
+        ++dy;
+        if (err < 0) {
+            err += 2 * dy + 1;
+        } else {
+            --dx;
+            err += 2 * (dy - dx) + 1;
+        }
+    }
+}
+
 void ClearRect(const UiRect& rect)
 {
     const int x0 = std::max(0, rect.x);
@@ -55,11 +116,6 @@ void ClearRect(const UiRect& rect)
         return;
     }
     FillRect(x0, y0, x1 - x0, y1 - y0, false);
-}
-
-void DrawSegment(int x, int y, int width, int height)
-{
-    FillRect(x, y, width, height, true);
 }
 
 // [L3-semantics] Named wrappers for FillRect(..., black=true) so the 4 distinct
@@ -133,14 +189,18 @@ esp_err_t RefreshFrame(const wqn::UiFrame& frame, RefreshSchedule schedule)
         ESP_LOGI(kTag, "EPD: screen change detected (%d -> %d), forcing full refresh",
                  static_cast<int>(g_last_rendered_screen), static_cast<int>(frame.screen));
     }
-    g_last_rendered_screen = frame.screen;
     ESP_LOGI(kTag,
              "RefreshFrame: schedule=%s allow_local=%d force_full=%d screen=%d tier=%d",
              RefreshScheduleName(schedule), allow_local_partial ? 1 : 0,
              force_full_refresh ? 1 : 0,
              static_cast<int>(frame.screen),
              static_cast<int>(frame.ai.tier));
-    return wqn::RefreshEpdFull(allow_local_partial, force_full_refresh);
+    const esp_err_t result =
+        wqn::RefreshEpdFull(allow_local_partial, force_full_refresh);
+    if (result == ESP_OK) {
+        g_last_rendered_screen = frame.screen;
+    }
+    return result;
 }
 
 }  // namespace device_ui_internal

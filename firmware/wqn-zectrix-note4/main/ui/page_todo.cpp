@@ -9,7 +9,7 @@
 #include <ctime>
 #include <string>
 
-#include "epd_display.h"
+#include "display_service.h"
 #include "esp_log.h"
 
 namespace device_ui_internal {
@@ -244,25 +244,18 @@ esp_err_t DrawTodoStatusBar(const wqn::TodoUiState& todo, const wqn::HomeSummary
     DrawHorizontalLine(0, 27, wqn::kEpdWidth);
     ESP_RETURN_ON_ERROR(wqn::DrawUtf8Text(10, 6, "Todo", true), kTag, "draw todo title");
 
+    // Right-edge icon cluster (wifi + battery); text status right-aligned to its left.
+    const int icons_left = DrawStatusBarIcons(wqn::kEpdWidth - 10, 6, home);
     std::string status = "今日 " + std::to_string(TodoPendingCount(todo));
-    status += "  逾期 ";
-    status += std::to_string(TodoOverdueCount(todo));
+    status += "  逾期 " + std::to_string(TodoOverdueCount(todo));
     status += "  ";
     status += TodoSyncStatusText(todo.sync_status);
-    status += "  ";
-    status += CurrentClockLabel();
-    status += "  ";
-    status += home.wifi_label.empty() ? "WiFi" : home.wifi_label;
-    if (!home.battery_label.empty()) {
-        status += "  ";
-        status += home.battery_label;
-    }
-
-    constexpr int kStatusMaxWidth = wqn::kEpdWidth - 74;
-    const std::string clipped = wqn::TruncateUtf8TextToWidth(status, kStatusMaxWidth);
+    status += "  " + CurrentClockLabel();
+    const int max_width = std::max(0, icons_left - 6 - 74);
+    const std::string clipped = wqn::TruncateUtf8TextToWidth(status, max_width);
     const int status_width = wqn::MeasureUtf8TextWidth(clipped.c_str());
     ESP_RETURN_ON_ERROR(
-        wqn::DrawUtf8Text(std::max(74, wqn::kEpdWidth - status_width - 10), 6, clipped.c_str(), true),
+        wqn::DrawUtf8Text(std::max(74, icons_left - 6 - status_width), 6, clipped.c_str(), true),
         kTag,
         "draw todo status");
     return ESP_OK;

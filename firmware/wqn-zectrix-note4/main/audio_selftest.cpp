@@ -1,39 +1,23 @@
 #include "audio_selftest.h"
 
-#if CONFIG_WQN_AUDIO_SELFTEST_ENABLE
+#if CONFIG_WQN_AI_AUDIO_SELFTEST_ENABLE
 
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <limits>
 
-#include "driver/gpio.h"
-#include "driver/i2c_master.h"
-#include "driver/i2s_std.h"
 #include "esp_check.h"
 #include "esp_err.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "power_manager.h"
+#include "services/audio_service.h"
 
 namespace {
 
 constexpr char kTag[] = "wqn_audio_selftest";
-
-constexpr gpio_num_t kAudioPower = GPIO_NUM_42;
-constexpr gpio_num_t kAudioAmp = GPIO_NUM_46;
-
-constexpr gpio_num_t kI2sMclk = GPIO_NUM_14;
-constexpr gpio_num_t kI2sBclk = GPIO_NUM_15;
-constexpr gpio_num_t kI2sWs = GPIO_NUM_38;
-constexpr gpio_num_t kI2sDin = GPIO_NUM_16;
-constexpr gpio_num_t kI2sDout = GPIO_NUM_45;
-
-constexpr gpio_num_t kCodecSda = GPIO_NUM_47;
-constexpr gpio_num_t kCodecScl = GPIO_NUM_48;
-constexpr i2c_port_num_t kCodecI2cPort = I2C_NUM_0;
-constexpr uint8_t kEs8311Address = 0x18;
+wqn::services::AudioSession g_selftest_session;
 
 constexpr int kSampleRate = 24000;
 constexpr int kChannels = 2;
@@ -134,92 +118,88 @@ void LogChannelStats(const char* name, const ChannelStats& stats)
         static_cast<int>(stats.peak));
 }
 
-void SetAudioPower(bool /*enabled*/)
+esp_err_t SetAudioPower(bool /*enabled*/)
 {
     // [inflight-fix] GPIO42 (codec power) is boot-常通 - do not toggle.
     // Only manage the PA (GPIO46): off (selftest keeps amp off).
-    gpio_hold_dis(kAudioAmp);
-    gpio_set_level(kAudioAmp, 0);
-    gpio_hold_en(kAudioAmp);
-}
-
-esp_err_t InitI2c(i2c_master_bus_handle_t* bus)
-{
-    if (bus == nullptr) {
-        return ESP_ERR_INVALID_ARG;
+    const esp_err_t result = wqn::services::SetAudioAmplifier(
+        g_selftest_session, false);
+    if (result != ESP_OK) {
+        ESP_LOGW(kTag, "disable amplifier failed: %s", esp_err_to_name(result));
     }
-    i2c_master_bus_handle_t shared = wqn::GetSharedI2cBusHandle();
-    if (shared != nullptr) {
-        *bus = shared;
-        return ESP_OK;
-    }
-    i2c_master_bus_config_t config = {};
-    config.i2c_port = kCodecI2cPort;
-    config.sda_io_num = kCodecSda;
-    config.scl_io_num = kCodecScl;
-    config.clk_source = I2C_CLK_SRC_DEFAULT;
-    config.glitch_ignore_cnt = 7;
-    config.intr_priority = 0;
-    config.trans_queue_depth = 0;
-    config.flags.enable_internal_pullup = 1;
-    return i2c_new_master_bus(&config, bus);
-}
-
-esp_err_t ProbeEs8311(i2c_master_bus_handle_t bus)
-{
-    if (bus == nullptr) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    i2c_device_config_t config = {};
-    config.dev_addr_length = I2C_ADDR_BIT_LEN_7;
-    config.device_address = kEs8311Address;
-    config.scl_speed_hz = 100000;
-
-    i2c_master_dev_handle_t dev = nullptr;
-    ESP_RETURN_ON_ERROR(i2c_master_bus_add_device(bus, &config, &dev), kTag, "add ES8311 I2C device");
-
-    uint8_t reg = 0x00;
-    uint8_t value = 0;
-    const esp_err_t result = i2c_master_transmit_receive(dev, &reg, sizeof(reg), &value, sizeof(value), 100);
-    if (result == ESP_OK) {
-        ESP_LOGI(kTag, "ES8311 I2C probe ok: addr=0x%02x reg00=0x%02x", kEs8311Address, value);
-    } else {
-        ESP_LOGW(kTag, "ES8311 I2C probe failed: addr=0x%02x err=%s", kEs8311Address, esp_err_to_name(result));
-    }
-
-    ESP_ERROR_CHECK_WITHOUT_ABORT(i2c_master_bus_rm_device(dev));
     return result;
 }
 
-esp_err_t WriteCodecReg(i2c_master_dev_handle_t dev, uint8_t reg, uint8_t value)
+void RecordFirstError(esp_err_t candidate, esp_err_t* result)
 {
-    const uint8_t data[] = {reg, value};
-    return i2c_master_transmit(dev, data, sizeof(data), 100);
+    if (result != nullptr && *result == ESP_OK && candidate != ESP_OK) {
+        *result = candidate;
+    }
 }
 
-esp_err_t ReadCodecReg(i2c_master_dev_handle_t dev, uint8_t reg, uint8_t* value)
+esp_err_t InitI2c(wqn::services::AudioBusHandle* bus)
+{
+    if (bus == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    return wqn::services::GetSharedAudioBus(g_selftest_session, bus);
+}
+
+esp_err_t ProbeEs8311(wqn::services::AudioBusHandle bus)
+{
+    if (bus == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    wqn::services::AudioCodecHandle dev = nullptr;
+    ESP_RETURN_ON_ERROR(
+        wqn::services::AddAudioCodec(g_selftest_session, bus, &dev),
+        kTag, "add ES8311 I2C device");
+
+    uint8_t reg = 0x00;
+    uint8_t value = 0;
+    esp_err_t result = wqn::services::ReadAudioCodecRegister(
+        g_selftest_session, dev, reg, &value);
+    if (result == ESP_OK) {
+        ESP_LOGI(kTag, "ES8311 I2C probe ok: reg00=0x%02x", value);
+    } else {
+        ESP_LOGW(kTag, "ES8311 I2C probe failed: %s", esp_err_to_name(result));
+    }
+
+    RecordFirstError(
+        wqn::services::RemoveAudioCodec(g_selftest_session, &dev), &result);
+    return result;
+}
+
+esp_err_t WriteCodecReg(
+    wqn::services::AudioCodecHandle dev, uint8_t reg, uint8_t value)
+{
+    return wqn::services::WriteAudioCodecRegister(
+        g_selftest_session, dev, reg, value);
+}
+
+esp_err_t ReadCodecReg(
+    wqn::services::AudioCodecHandle dev, uint8_t reg, uint8_t* value)
 {
     if (value == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
-    return i2c_master_transmit_receive(dev, &reg, sizeof(reg), value, sizeof(*value), 100);
+    return wqn::services::ReadAudioCodecRegister(
+        g_selftest_session, dev, reg, value);
 }
 
-esp_err_t AddCodecDevice(i2c_master_bus_handle_t bus, i2c_master_dev_handle_t* dev)
+esp_err_t AddCodecDevice(
+    wqn::services::AudioBusHandle bus,
+    wqn::services::AudioCodecHandle* dev)
 {
     if (bus == nullptr || dev == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
-    i2c_device_config_t config = {};
-    config.dev_addr_length = I2C_ADDR_BIT_LEN_7;
-    config.device_address = kEs8311Address;
-    config.scl_speed_hz = 100000;
-    return i2c_master_bus_add_device(bus, &config, dev);
+    return wqn::services::AddAudioCodec(g_selftest_session, bus, dev);
 }
 
-esp_err_t InitEs8311Adc(i2c_master_bus_handle_t bus)
+esp_err_t InitEs8311Adc(wqn::services::AudioBusHandle bus)
 {
-    i2c_master_dev_handle_t dev = nullptr;
+    wqn::services::AudioCodecHandle dev = nullptr;
     ESP_RETURN_ON_ERROR(AddCodecDevice(bus, &dev), kTag, "add ES8311 init device");
 
     auto write = [&](uint8_t reg, uint8_t value) -> esp_err_t {
@@ -314,7 +294,8 @@ esp_err_t InitEs8311Adc(i2c_master_bus_handle_t bus)
     ret |= write(ES8311_DAC_REG37, 0x08);
     ret |= write(ES8311_GP_REG45, 0x00);
 
-    ESP_ERROR_CHECK_WITHOUT_ABORT(i2c_master_bus_rm_device(dev));
+    RecordFirstError(
+        wqn::services::RemoveAudioCodec(g_selftest_session, &dev), &ret);
     if (ret == ESP_OK) {
         ESP_LOGI(kTag, "ES8311 ADC init ok: input_gain=30db sample_rate=%d", kSampleRate);
     } else {
@@ -323,50 +304,19 @@ esp_err_t InitEs8311Adc(i2c_master_bus_handle_t bus)
     return ret;
 }
 
-esp_err_t InitI2s(i2s_chan_handle_t* rx_handle)
+esp_err_t InitI2s(wqn::services::AudioChannelHandle* rx_handle)
 {
     if (rx_handle == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    i2s_chan_config_t channel_config = {};
-    channel_config.id = I2S_NUM_0;
-    channel_config.role = I2S_ROLE_MASTER;
-    channel_config.dma_desc_num = 6;
-    channel_config.dma_frame_num = 240;
-    channel_config.auto_clear_after_cb = true;
-    channel_config.auto_clear_before_cb = false;
-    channel_config.intr_priority = 0;
-    ESP_RETURN_ON_ERROR(i2s_new_channel(&channel_config, nullptr, rx_handle), kTag, "create I2S RX channel");
-
-    i2s_std_config_t std_config = {};
-    std_config.clk_cfg.sample_rate_hz = kSampleRate;
-    std_config.clk_cfg.clk_src = I2S_CLK_SRC_DEFAULT;
-    std_config.clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_256;
-    std_config.slot_cfg.data_bit_width = I2S_DATA_BIT_WIDTH_16BIT;
-    std_config.slot_cfg.slot_bit_width = I2S_SLOT_BIT_WIDTH_AUTO;
-    std_config.slot_cfg.slot_mode = I2S_SLOT_MODE_STEREO;
-    std_config.slot_cfg.slot_mask = I2S_STD_SLOT_BOTH;
-    std_config.slot_cfg.ws_width = I2S_DATA_BIT_WIDTH_16BIT;
-    std_config.slot_cfg.ws_pol = false;
-    std_config.slot_cfg.bit_shift = true;
-    std_config.gpio_cfg.mclk = kI2sMclk;
-    std_config.gpio_cfg.bclk = kI2sBclk;
-    std_config.gpio_cfg.ws = kI2sWs;
-    std_config.gpio_cfg.dout = I2S_GPIO_UNUSED;
-    std_config.gpio_cfg.din = kI2sDin;
-    std_config.gpio_cfg.invert_flags.mclk_inv = false;
-    std_config.gpio_cfg.invert_flags.bclk_inv = false;
-    std_config.gpio_cfg.invert_flags.ws_inv = false;
-
-    ESP_RETURN_ON_ERROR(i2s_channel_init_std_mode(*rx_handle, &std_config), kTag, "init I2S RX std mode");
-    ESP_RETURN_ON_ERROR(i2s_channel_enable(*rx_handle), kTag, "enable I2S RX");
-    return ESP_OK;
+    return wqn::services::CreateAudioRxChannel(
+        g_selftest_session, kSampleRate, 240, false, rx_handle);
 }
 
 esp_err_t CaptureI2sStats()
 {
-    i2s_chan_handle_t rx_handle = nullptr;
+    wqn::services::AudioChannelHandle rx_handle = nullptr;
     esp_err_t result = InitI2s(&rx_handle);
     if (result != ESP_OK) {
         ESP_LOGE(kTag, "I2S init failed: %s", esp_err_to_name(result));
@@ -388,7 +338,9 @@ esp_err_t CaptureI2sStats()
 
     while (captured_frames < target_frames) {
         size_t bytes_read = 0;
-        result = i2s_channel_read(rx_handle, buffer, sizeof(buffer), &bytes_read, pdMS_TO_TICKS(1000));
+        result = wqn::services::ReadAudioChannel(
+            g_selftest_session, rx_handle, buffer, sizeof(buffer),
+            &bytes_read, pdMS_TO_TICKS(1000));
         if (result != ESP_OK) {
             ESP_LOGE(kTag, "I2S read failed: %s", esp_err_to_name(result));
             break;
@@ -411,22 +363,28 @@ esp_err_t CaptureI2sStats()
     ESP_LOGI(kTag, "selected mono channel candidate: %s", selected);
 
     if (rx_handle != nullptr) {
-        ESP_ERROR_CHECK_WITHOUT_ABORT(i2s_channel_disable(rx_handle));
-        ESP_ERROR_CHECK_WITHOUT_ABORT(i2s_del_channel(rx_handle));
+        RecordFirstError(
+            wqn::services::DisableAudioChannel(
+                g_selftest_session, rx_handle),
+            &result);
+        RecordFirstError(
+            wqn::services::DeleteAudioChannel(
+                g_selftest_session, &rx_handle),
+            &result);
     }
     return result;
 }
 
 esp_err_t RunProbeAndCapture()
 {
-    SetAudioPower(true);
+    ESP_RETURN_ON_ERROR(SetAudioPower(true), kTag, "disable self-test PA");
     vTaskDelay(pdMS_TO_TICKS(100));
 
-    i2c_master_bus_handle_t i2c_bus = nullptr;
+    wqn::services::AudioBusHandle i2c_bus = nullptr;
     esp_err_t result = InitI2c(&i2c_bus);
     if (result != ESP_OK) {
         ESP_LOGE(kTag, "I2C init failed: %s", esp_err_to_name(result));
-        SetAudioPower(false);
+        ESP_ERROR_CHECK_WITHOUT_ABORT(SetAudioPower(false));
         return result;
     }
 
@@ -442,13 +400,8 @@ esp_err_t RunProbeAndCapture()
 
     result = CaptureI2sStats();
 
-    // [shared-i2c-fix] Only delete the bus if selftest created it. InitI2c
-    // reuses wqn::GetSharedI2cBusHandle() when available; deleting that shared
-    // bus here would kill RTC (pcf8563) + NFC + power-mgr I2C access -> panic.
-    if (i2c_bus != nullptr && i2c_bus != wqn::GetSharedI2cBusHandle()) {
-        ESP_ERROR_CHECK_WITHOUT_ABORT(i2c_del_master_bus(i2c_bus));
-    }
-    SetAudioPower(false);
+    // The board owns the shared bus for the process lifetime.
+    RecordFirstError(SetAudioPower(false), &result);
     ESP_LOGI(kTag, "audio power off");
     if (result != ESP_OK) {
         return result;
@@ -466,7 +419,14 @@ namespace wqn {
 esp_err_t RunAudioSelfTestIfEnabled()
 {
     ESP_LOGI(kTag, "audio self-test enabled");
-    return RunProbeAndCapture();
+    const esp_err_t begin_result = services::BeginAudioActivity(
+        services::AudioActivity::kSelfTest, &g_selftest_session);
+    if (begin_result != ESP_OK) {
+        return begin_result;
+    }
+    const esp_err_t result = RunProbeAndCapture();
+    const esp_err_t end_result = services::EndAudioActivity(&g_selftest_session);
+    return result == ESP_OK ? end_result : result;
 }
 
 }  // namespace wqn
@@ -482,4 +442,4 @@ esp_err_t RunAudioSelfTestIfEnabled()
 
 }  // namespace wqn
 
-#endif  // CONFIG_WQN_AUDIO_SELFTEST_ENABLE
+#endif  // CONFIG_WQN_AI_AUDIO_SELFTEST_ENABLE

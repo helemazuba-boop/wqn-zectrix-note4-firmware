@@ -55,28 +55,26 @@ audio captures, or user data.
 
 ## Build
 
-Use ESP-IDF 5.5.x for this project. On this Windows workstation the known ESP-IDF
-root is:
+Use ESP-IDF 5.5.4 for this project. The primary WSL environment is:
+
+```txt
+/home/unknow/esp/esp-idf-v5.5
+```
+
+Build from WSL with:
+
+```bash
+cd /home/unknow/projects/firmware/firmware/wqn-zectrix-note4
+source /home/unknow/esp/esp-idf-v5.5/export.sh
+idf.py -B build-ai-local-s3 set-target esp32s3
+idf.py -B build-ai-local-s3 build
+```
+
+The previous Windows checkout remains available for recovery/reference at
+`D:\projects\wqn-zectrix-note4-firmware`. Its ESP-IDF root is:
 
 ```txt
 D:\Program\Espressif\frameworks\esp-idf-v5.5.4
-```
-
-From a PowerShell or Command Prompt with ESP-IDF loaded:
-
-```powershell
-cd D:\projects\wqn-zectrix-note4-firmware\firmware\wqn-zectrix-note4
-idf.py --no-ccache -B build-ai-local-s3 set-target esp32s3
-idf.py --no-ccache -B build-ai-local-s3 build
-```
-
-If the shell has not loaded ESP-IDF yet, use:
-
-```cmd
-set IDF_TOOLS_PATH=D:\Program\Espressif
-set IDF_PATH=D:\Program\Espressif\frameworks\esp-idf-v5.5.4
-call D:\Program\Espressif\idf_cmd_init.bat
-idf.py --no-ccache -B build-ai-local-s3 build
 ```
 
 The default WQN ESP32 API base is:
@@ -87,7 +85,7 @@ https://wqn.helema.cn/api/esp32
 
 Development builds can override it:
 
-```powershell
+```bash
 idf.py -B build-ai-local-s3 -DWQN_API_BASE=https://your-host.example.com/api/esp32 build
 ```
 
@@ -107,7 +105,7 @@ Configure features through `idf.py menuconfig` under `WQN firmware`:
 - `CONFIG_WQN_DEEP_SLEEP_ENABLE`: optional experimental deep sleep path.
 - `CONFIG_WQN_AI_ENABLE`: enables AI firmware modules; provider secrets still
   stay server-side.
-- `CONFIG_WQN_AUDIO_SELFTEST_ENABLE`: captures and logs audio statistics at boot
+- `CONFIG_WQN_AI_AUDIO_SELFTEST_ENABLE`: captures and logs audio statistics at boot
   without uploading audio.
 
 ## Local Flashing
@@ -152,6 +150,12 @@ python -m esptool --chip esp32s3 -p COMx -b 460800 write_flash --flash_mode dio 
 ```
 
 ## Development Notes
+
+Current runtime and release references:
+
+- [Architecture and resource ownership](ARCHITECTURE.md)
+- [Coordinated firmware/cloud release checklist](RELEASE_CHECKLIST.md)
+- [Firmware troubleshooting](TROUBLESHOOTING.md)
 
 - Keep firmware-side changes focused on device behavior, transport contracts,
   power control, local rendering, and local caches.

@@ -4,15 +4,16 @@
 
 #include "ui_internal.h"
 
+#include <array>
 #include <atomic>
 #include <cstdio>
 #include <string>
 
-#include "epd_display.h"
+#include "display_service.h"
 #include "esp_log.h"
-#include "esp_rom_sys.h"
 #include "esp_task_wdt.h"
 #include "esp_timer.h"
+#include "runtime/sleep_coordinator.h"
 
 namespace device_ui_internal {
 
@@ -25,15 +26,23 @@ constexpr int64_t kStatusRefreshDelay = pdMS_TO_TICKS(60000);
 
 SemaphoreHandle_t g_refresh_mutex = nullptr;
 TaskHandle_t g_refresh_task = nullptr;
+QueueHandle_t g_display_result_queue = nullptr;
 wqn::UiFrame g_pending_frames[2];
 std::string g_pending_signatures[2];
+wqn::display::DisplayIntent g_pending_intents[2];
 std::atomic<int> g_consumer_index{0};
 bool g_refresh_pending = false;
-bool g_refresh_busy = false;
+static bool g_refresh_busy = false;
 TickType_t g_refresh_due_tick = 0;
 RefreshSchedule g_refresh_schedule = RefreshSchedule::kNone;
 SecondarySlot g_secondary;
 volatile wqn::UiScreen g_last_rendered_screen = wqn::UiScreen::kHome;
+wqn::runtime::SleepLease g_display_sleep_lease;
+uint32_t g_outstanding_display_intents = 0;
+std::array<wqn::display::DisplayRevision, wqn::display::kDisplayResultQueueDepth>
+    g_outstanding_display_revisions{};
+wqn::display::DisplayRevision g_last_presented_revision =
+    wqn::display::kInvalidDisplayRevision;
 
 // ---- Schedule helpers -------------------------------------------------------
 
@@ -49,6 +58,8 @@ int RefreshRank(RefreshSchedule schedule)
         case RefreshSchedule::kSelection:
             return 2;
         case RefreshSchedule::kTimer:
+            return 2;
+        case RefreshSchedule::kCoalesced:
             return 2;
         case RefreshSchedule::kCommit:
             return 3;
@@ -73,6 +84,8 @@ const char* RefreshScheduleName(RefreshSchedule schedule)
             return "clock";
         case RefreshSchedule::kTimer:
             return "timer";
+        case RefreshSchedule::kCoalesced:
+            return "coalesced";
         case RefreshSchedule::kCommit:
             return "commit";
         case RefreshSchedule::kImmediate:
@@ -98,6 +111,8 @@ TickType_t RefreshDelay(RefreshSchedule schedule)
             return kClockRefreshDelay;
         case RefreshSchedule::kTimer:
             return kTimerRefreshDelay;
+        case RefreshSchedule::kCoalesced:
+            return 0;
         case RefreshSchedule::kCommit:
             return kCommitRefreshDelay;
         case RefreshSchedule::kNone:
@@ -124,6 +139,169 @@ RefreshSchedule StrongerSchedule(RefreshSchedule a, RefreshSchedule b)
 {
     return RefreshRank(a) >= RefreshRank(b) ? a : b;
 }
+
+namespace {
+
+using wqn::display::DisplayIntent;
+using wqn::display::DisplayResult;
+using wqn::display::DisplayRevision;
+using wqn::display::DisplayStatus;
+using wqn::display::WaveformRequirement;
+
+void MaybeReleaseDisplayLeaseLocked()
+{
+    if (!g_refresh_busy && !g_refresh_pending && !g_secondary.pending &&
+        g_outstanding_display_intents == 0) {
+        g_display_sleep_lease.Reset();
+    }
+}
+
+bool HasOutstandingRevisionLocked(wqn::display::DisplayRevision revision)
+{
+    for (const wqn::display::DisplayRevision active : g_outstanding_display_revisions) {
+        if (active == revision) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool TrackOutstandingRevisionLocked(wqn::display::DisplayRevision revision)
+{
+    if (revision == wqn::display::kInvalidDisplayRevision ||
+        HasOutstandingRevisionLocked(revision)) {
+        return false;
+    }
+    for (wqn::display::DisplayRevision& active : g_outstanding_display_revisions) {
+        if (active == wqn::display::kInvalidDisplayRevision) {
+            active = revision;
+            ++g_outstanding_display_intents;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool UntrackOutstandingRevisionLocked(wqn::display::DisplayRevision revision)
+{
+    for (wqn::display::DisplayRevision& active : g_outstanding_display_revisions) {
+        if (active == revision) {
+            active = wqn::display::kInvalidDisplayRevision;
+            if (g_outstanding_display_intents > 0) {
+                --g_outstanding_display_intents;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+uint32_t RefreshReasonMask(RefreshSchedule schedule)
+{
+    if (schedule == RefreshSchedule::kNone) {
+        return 0;
+    }
+    return 1U << static_cast<uint8_t>(schedule);
+}
+
+constexpr WaveformRequirement StrongerWaveform(WaveformRequirement a, WaveformRequirement b)
+{
+    return static_cast<uint8_t>(a) >= static_cast<uint8_t>(b) ? a : b;
+}
+
+constexpr TickType_t EarlierDeadline(TickType_t a, TickType_t b)
+{
+    return static_cast<int32_t>(a - b) <= 0 ? a : b;
+}
+
+constexpr bool HasMultipleReasons(uint32_t reasons)
+{
+    return reasons != 0 && (reasons & (reasons - 1U)) != 0;
+}
+
+static_assert(sizeof(TickType_t) == sizeof(uint32_t),
+              "display deadlines require 32-bit FreeRTOS ticks");
+static_assert(StrongerWaveform(WaveformRequirement::kPartial,
+                              WaveformRequirement::kFull) ==
+                  WaveformRequirement::kFull,
+              "coalescing must never weaken the waveform");
+static_assert(EarlierDeadline(static_cast<TickType_t>(100),
+                              static_cast<TickType_t>(120)) == 100,
+              "coalescing must retain the earlier deadline");
+static_assert(EarlierDeadline(static_cast<TickType_t>(0xfffffff0U),
+                              static_cast<TickType_t>(0x10U)) == 0xfffffff0U,
+              "deadline ordering must remain correct across tick wrap");
+
+bool PublishDisplayResult(const DisplayResult& result, TickType_t timeout)
+{
+    if (g_display_result_queue == nullptr ||
+        xQueueSend(g_display_result_queue, &result, timeout) != pdTRUE) {
+        ESP_LOGE(kTag,
+                 "display result delivery failed: revision=%llu status=%d",
+                 static_cast<unsigned long long>(result.revision),
+                 static_cast<int>(result.status));
+        return false;
+    }
+    return true;
+}
+
+DisplayResult SupersededResult(DisplayRevision revision, DisplayRevision replacement)
+{
+    DisplayResult result;
+    result.revision = revision;
+    result.status = DisplayStatus::kSuperseded;
+    result.presented_revision = g_last_presented_revision;
+    result.replacement_revision = replacement;
+    result.error = ESP_OK;
+    return result;
+}
+
+DisplayIntent NewDisplayIntent(
+    DisplayRevision revision,
+    RefreshSchedule schedule,
+    TickType_t deadline,
+    WaveformRequirement waveform)
+{
+    DisplayIntent intent;
+    intent.revision = revision;
+    intent.waveform = waveform;
+    intent.deadline_tick = static_cast<uint32_t>(deadline);
+    intent.reason_mask = RefreshReasonMask(schedule);
+    return intent;
+}
+
+void MergeDisplayPolicy(
+    const DisplayIntent& old_intent,
+    wqn::UiFrame* latest_frame,
+    DisplayIntent* latest_intent,
+    TickType_t* latest_deadline)
+{
+    latest_intent->waveform = StrongerWaveform(old_intent.waveform, latest_intent->waveform);
+    latest_intent->reason_mask |= old_intent.reason_mask;
+    *latest_deadline = EarlierDeadline(static_cast<TickType_t>(old_intent.deadline_tick),
+                                       *latest_deadline);
+    latest_intent->deadline_tick = static_cast<uint32_t>(*latest_deadline);
+    if (latest_intent->waveform == WaveformRequirement::kFull) {
+        latest_frame->prefer_full_refresh = true;
+    }
+}
+
+RefreshSchedule EffectiveSchedule(RefreshSchedule latest_schedule, const DisplayIntent& intent)
+{
+    // Local render paths return before RefreshFrame() sees frame.prefer_full_refresh.
+    // Normalize a retained full-waveform requirement to kCommit so a newer
+    // clock/config/selection intent cannot weaken an older safety requirement.
+    if (intent.waveform == WaveformRequirement::kFull) {
+        return RefreshSchedule::kCommit;
+    }
+    const uint32_t reasons = intent.reason_mask;
+    if (HasMultipleReasons(reasons)) {
+        return RefreshSchedule::kCoalesced;
+    }
+    return latest_schedule;
+}
+
+}  // namespace
 
 // ---- Frame signature (used to dedup) ---------------------------------------
 
@@ -326,7 +504,9 @@ std::string FrameSignature(const wqn::UiFrame& frame)
         signature.push_back('/');
         signature.append(frame.settings.notice);
         signature.push_back('/');
-        signature.append(diag.mac_label);
+        signature.append(frame.paired ? "paired" : "unpaired");
+        signature.push_back('/');
+        signature.append(frame.claim_code);
         signature.push_back('/');
         signature.append(std::to_string(diag.flash_size));
         signature.push_back('/');
@@ -351,90 +531,195 @@ std::string FrameSignature(const wqn::UiFrame& frame)
 
 // ---- Producer-side: enqueue a new frame -------------------------------------
 
-bool RequestEpdUiRefresh(const wqn::UiFrame& frame, const std::string& signature, RefreshSchedule schedule)
+wqn::display::DisplaySubmission RequestEpdUiRefresh(
+    const wqn::UiFrame& frame,
+    const std::string& signature,
+    wqn::display::DisplayRevision revision,
+    RefreshSchedule schedule,
+    wqn::display::WaveformRequirement waveform)
 {
-    if (g_refresh_mutex == nullptr || g_refresh_task == nullptr || schedule == RefreshSchedule::kNone) {
-        ESP_LOGW(kTag, "RequestEpdUiRefresh rejected: prereqs (mutex=%p task=%p schedule=%s)",
-                 g_refresh_mutex, g_refresh_task, RefreshScheduleName(schedule));
-        return false;
+    wqn::display::DisplaySubmission submission;
+    if (g_refresh_mutex == nullptr || g_refresh_task == nullptr ||
+        g_display_result_queue == nullptr || schedule == RefreshSchedule::kNone ||
+        revision == wqn::display::kInvalidDisplayRevision) {
+        ESP_LOGW(kTag, "RequestEpdUiRefresh rejected: prereqs (mutex=%p task=%p schedule=%s revision=%llu)",
+                 g_refresh_mutex, g_refresh_task, RefreshScheduleName(schedule),
+                 static_cast<unsigned long long>(revision));
+        return submission;
     }
 
     const TickType_t now = xTaskGetTickCount();
-    const TickType_t due_tick = now + RefreshDelay(schedule);
+    TickType_t due_tick = now + RefreshDelay(schedule);
 
     xSemaphoreTake(g_refresh_mutex, portMAX_DELAY);
-    if (g_refresh_busy) {
-        // Consumer is rendering: the main path buffer cannot be written without breaking
-        // the in-flight frame. Deep-copy once into the secondary slot (rare in steady state).
-        if (g_secondary.pending && RefreshRank(schedule) < RefreshRank(g_secondary.schedule)) {
-            xSemaphoreGive(g_refresh_mutex);
-            ESP_LOGW(kTag,
-                     "RequestEpdUiRefresh dropped: schedule=%s rank<secondary=%s sig_len=%zu",
-                     RefreshScheduleName(schedule),
-                     RefreshScheduleName(g_secondary.schedule), signature.size());
-            return false;
-        }
-        ESP_LOGI(kTag, "RequestEpdUiRefresh: busy, queuing into secondary slot schedule=%s sig_len=%zu",
-                 RefreshScheduleName(schedule), signature.size());
-        g_secondary.frame = frame;
-        g_secondary.signature = signature;
-        g_secondary.schedule = schedule;
-        g_secondary.due_tick = due_tick;
-        g_secondary.pending = true;
+    if (HasOutstandingRevisionLocked(revision)) {
         xSemaphoreGive(g_refresh_mutex);
-        return true;
+        ESP_LOGE(kTag, "RequestEpdUiRefresh rejected: duplicate revision=%llu",
+                 static_cast<unsigned long long>(revision));
+        return submission;
+    }
+    if (g_outstanding_display_intents >= wqn::display::kDisplayResultQueueDepth) {
+        xSemaphoreGive(g_refresh_mutex);
+        ESP_LOGW(kTag, "RequestEpdUiRefresh deferred: result ledger full (%u)",
+                 static_cast<unsigned>(g_outstanding_display_intents));
+        return submission;
+    }
+    if (!g_display_sleep_lease) {
+        wqn::runtime::SleepLease lease =
+            wqn::runtime::SleepLease::TryAcquire(
+                wqn::runtime::SleepBlocker::kDisplay, "display-refresh", __FILE__, __LINE__);
+        if (!lease) {
+            xSemaphoreGive(g_refresh_mutex);
+            ESP_LOGI(kTag, "RequestEpdUiRefresh deferred: sleep quiesce in progress");
+            return submission;
+        }
+        g_display_sleep_lease = std::move(lease);
     }
 
-    // Main path: lock-free write into the producer-owned buffer, then flip the consumer index.
+    wqn::UiFrame merged_frame = frame;
+    wqn::display::DisplayIntent merged_intent =
+        NewDisplayIntent(revision, schedule, due_tick, waveform);
+
+    if (g_refresh_busy) {
+        // Consumer is rendering: the main path buffer cannot be written without breaking
+        // the in-flight frame. The newest pixels replace the secondary intent, while safety
+        // policy is monotonic: never weaken its waveform and never postpone its deadline.
+        if (g_secondary.pending) {
+            MergeDisplayPolicy(g_secondary.intent,
+                               &merged_frame, &merged_intent, &due_tick);
+            if (!PublishDisplayResult(
+                    SupersededResult(g_secondary.intent.revision, revision), 0)) {
+                xSemaphoreGive(g_refresh_mutex);
+                return submission;
+            }
+        }
+        const RefreshSchedule effective_schedule =
+            EffectiveSchedule(schedule, merged_intent);
+        ESP_LOGI(kTag,
+                 "display intent accepted: revision=%llu path=secondary requested=%s effective=%s deadline=%u reasons=0x%lx waveform=%d sig_len=%zu",
+                 static_cast<unsigned long long>(revision), RefreshScheduleName(schedule),
+                 RefreshScheduleName(effective_schedule),
+                 static_cast<unsigned>(due_tick),
+                 static_cast<unsigned long>(merged_intent.reason_mask),
+                 static_cast<int>(merged_intent.waveform), signature.size());
+        g_secondary.frame = std::move(merged_frame);
+        g_secondary.signature = signature;
+        g_secondary.intent = merged_intent;
+        g_secondary.schedule = effective_schedule;
+        g_secondary.due_tick = due_tick;
+        g_secondary.pending = true;
+        if (!TrackOutstandingRevisionLocked(revision)) {
+            g_secondary.pending = false;
+            xSemaphoreGive(g_refresh_mutex);
+            ESP_LOGE(kTag, "display outstanding ledger full: revision=%llu",
+                     static_cast<unsigned long long>(revision));
+            return submission;
+        }
+        xSemaphoreGive(g_refresh_mutex);
+        submission.accepted = true;
+        submission.revision = revision;
+        submission.waveform = merged_intent.waveform;
+        submission.deadline_tick = merged_intent.deadline_tick;
+        return submission;
+    }
+
+    // Main path: if a not-yet-started primary intent exists, it is superseded. Keep the
+    // newest pixels and drawing schedule, but merge the old safety/latency constraints.
     const int consumer_holds = g_consumer_index.load(std::memory_order_acquire);
     const int producer_slot = 1 - consumer_holds;
-    ESP_LOGI(kTag, "RequestEpdUiRefresh: primary path schedule=%s sig_len=%zu slot=%d",
-             RefreshScheduleName(schedule), signature.size(), producer_slot);
-    g_pending_frames[producer_slot] = frame;       // deep-copy once (independent of consumer render path)
+    if (g_refresh_pending) {
+        MergeDisplayPolicy(g_pending_intents[consumer_holds],
+                           &merged_frame, &merged_intent, &due_tick);
+        if (!PublishDisplayResult(
+                SupersededResult(g_pending_intents[consumer_holds].revision, revision), 0)) {
+            xSemaphoreGive(g_refresh_mutex);
+            return submission;
+        }
+    }
+    const RefreshSchedule effective_schedule =
+        EffectiveSchedule(schedule, merged_intent);
+    ESP_LOGI(kTag,
+             "display intent accepted: revision=%llu path=primary requested=%s effective=%s deadline=%u reasons=0x%lx waveform=%d sig_len=%zu slot=%d",
+             static_cast<unsigned long long>(revision), RefreshScheduleName(schedule),
+             RefreshScheduleName(effective_schedule),
+             static_cast<unsigned>(due_tick),
+             static_cast<unsigned long>(merged_intent.reason_mask),
+             static_cast<int>(merged_intent.waveform), signature.size(), producer_slot);
+    g_pending_frames[producer_slot] = std::move(merged_frame);
     g_pending_signatures[producer_slot] = signature;
+    g_pending_intents[producer_slot] = merged_intent;
     g_refresh_pending = true;
-    g_refresh_schedule = schedule;
+    g_refresh_schedule = effective_schedule;
     g_refresh_due_tick = due_tick;
+    if (!TrackOutstandingRevisionLocked(revision)) {
+        g_refresh_pending = false;
+        xSemaphoreGive(g_refresh_mutex);
+        ESP_LOGE(kTag, "display outstanding ledger full: revision=%llu",
+                 static_cast<unsigned long long>(revision));
+        return submission;
+    }
     // Index flip must happen inside the lock, atomic with pending/schedule, to avoid
     // an idx vs busy reorder race with the consumer promotion critical section.
     g_consumer_index.store(producer_slot, std::memory_order_release);
     xSemaphoreGive(g_refresh_mutex);
     xTaskNotifyGive(g_refresh_task);
     taskYIELD();
-    return true;
+    submission.accepted = true;
+    submission.revision = revision;
+    submission.waveform = merged_intent.waveform;
+    submission.deadline_tick = merged_intent.deadline_tick;
+    return submission;
+}
+
+void AcknowledgeDisplayResult(wqn::display::DisplayRevision revision)
+{
+    if (g_refresh_mutex == nullptr) {
+        return;
+    }
+    xSemaphoreTake(g_refresh_mutex, portMAX_DELAY);
+    if (!UntrackOutstandingRevisionLocked(revision)) {
+        ESP_LOGE(kTag, "display result ack for unknown revision=%llu outstanding=%u",
+                 static_cast<unsigned long long>(revision),
+                 static_cast<unsigned>(g_outstanding_display_intents));
+    }
+    MaybeReleaseDisplayLeaseLocked();
+    xSemaphoreGive(g_refresh_mutex);
 }
 
 // ---- Consumer-side: EPD render task -----------------------------------------
 
 void EpdRefreshTask(void*)
 {
-    esp_rom_printf("I (%u) wqn_ui: EPD refresh task started\n", (unsigned)xTaskGetTickCount());
+    ESP_LOGI(kTag, "EPD refresh task started");
 
 #if CONFIG_ESP_TASK_WDT_EN
     // Try add then delete: if the task was subscribed to TWDT at creation (FreeRTOS default),
     // delete here takes effect. If add fails the task is not subscribed; delete also fails — fine either way.
     esp_task_wdt_add(xTaskGetCurrentTaskHandle());
     esp_task_wdt_delete(xTaskGetCurrentTaskHandle());
-    esp_rom_printf("I (%u) wqn_ui: EPD refresh task unsubscribed from task watchdog\n", (unsigned)xTaskGetTickCount());
+    ESP_LOGI(kTag, "EPD refresh task unsubscribed from task watchdog");
 #endif
 
     {
         const UBaseType_t stack_high_water = uxTaskGetStackHighWaterMark(nullptr);
-        esp_rom_printf("I (%u) wqn_ui: EPD refresh task initial stack HWM: %u bytes free\n",
-                       (unsigned)xTaskGetTickCount(), (unsigned)(stack_high_water * sizeof(StackType_t)));
+        ESP_LOGI(
+            kTag,
+            "EPD refresh task initial stack HWM: %u bytes free",
+            static_cast<unsigned>(stack_high_water * sizeof(StackType_t)));
     }
 
     std::string displayed_signature;
     while (true) {
-        esp_rom_printf("I (%u) wqn_ui: EPD refresh: waiting on notify\n", (unsigned)xTaskGetTickCount());
+        ESP_LOGD(kTag, "EPD refresh waiting on notify");
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-        esp_rom_printf("I (%u) wqn_ui: EPD refresh: notify received\n", (unsigned)xTaskGetTickCount());
+        ESP_LOGD(kTag, "EPD refresh notify received");
 
         while (true) {
             TickType_t wait_ticks = 0;
             xSemaphoreTake(g_refresh_mutex, portMAX_DELAY);
             if (!g_refresh_pending) {
                 g_refresh_schedule = RefreshSchedule::kNone;
+                MaybeReleaseDisplayLeaseLocked();
                 xSemaphoreGive(g_refresh_mutex);
                 wait_ticks = portMAX_DELAY;
             } else {
@@ -453,16 +738,19 @@ void EpdRefreshTask(void*)
         // outside the lock (because g_consumer_index.store is inside the lock, the frame is
         // guaranteed not to be overwritten while the consumer renders it).
         std::string local_sig;
+        wqn::display::DisplayIntent local_intent;
         RefreshSchedule schedule = RefreshSchedule::kNone;
         int consume_idx = 0;
         xSemaphoreTake(g_refresh_mutex, portMAX_DELAY);
         if (!g_refresh_pending) {
+            MaybeReleaseDisplayLeaseLocked();
             xSemaphoreGive(g_refresh_mutex);
             continue;
         }
         consume_idx = g_consumer_index.load(std::memory_order_acquire);
         schedule = g_refresh_schedule;
         local_sig = g_pending_signatures[consume_idx];
+        local_intent = g_pending_intents[consume_idx];
         g_refresh_pending = false;
         g_refresh_schedule = RefreshSchedule::kNone;
         g_refresh_due_tick = 0;
@@ -472,39 +760,54 @@ void EpdRefreshTask(void*)
         // const-ref outside the lock (producer can only write secondary; promotion only touches the opposite slot)
         const wqn::UiFrame& frame = g_pending_frames[consume_idx];
 
-        // [fix epd-hang] Even when primary dedup hits, if the secondary slot still holds a frame
-        // we must take the promote path. Otherwise a frame that the producer pushed into
-        // secondary during our render gets permanently lost and the screen stays stale.
-        // Trigger: EPD render is slow (1-3s) and the user presses a button mid-render →
-        //   producer writes secondary → consumer finishes and short-circuits on dedup
-        //   → skips promote → subsequent button events get swallowed by the still-pending
-        //   secondary slot.
-        bool has_secondary = false;
-        xSemaphoreTake(g_refresh_mutex, portMAX_DELAY);
-        has_secondary = g_secondary.pending;
-        xSemaphoreGive(g_refresh_mutex);
-
-        if (local_sig == displayed_signature && !has_secondary) {
-            xSemaphoreTake(g_refresh_mutex, portMAX_DELAY);
-            g_refresh_busy = false;
-            xSemaphoreGive(g_refresh_mutex);
-            continue;
-        }
-
-        if (local_sig != displayed_signature) {
+        esp_err_t render_result = ESP_OK;
+        const bool can_deduplicate =
+            local_sig == displayed_signature &&
+            local_intent.waveform != wqn::display::WaveformRequirement::kFull;
+        if (!can_deduplicate) {
             const int64_t refresh_start_us = esp_timer_get_time();
-            const esp_err_t result = RenderFrameToEpd(frame, schedule);
+            render_result = RenderFrameToEpd(frame, schedule);
             const int64_t refresh_elapsed_ms = (esp_timer_get_time() - refresh_start_us) / 1000;
-            if (result == ESP_OK) {
+            if (render_result == ESP_OK) {
                 displayed_signature = local_sig;
+                g_last_rendered_screen = frame.screen;
                 wqn::NoteEpdActivity();
-                esp_rom_printf("I (%u) wqn_ui: EPD UI refresh done: schedule=%s elapsed_ms=%lld\n",
-                               (unsigned)xTaskGetTickCount(), RefreshScheduleName(schedule), static_cast<long long>(refresh_elapsed_ms));
+                ESP_LOGI(
+                    kTag,
+                    "display presented: revision=%llu schedule=%s elapsed_ms=%lld",
+                    static_cast<unsigned long long>(local_intent.revision),
+                    RefreshScheduleName(schedule),
+                    static_cast<long long>(refresh_elapsed_ms));
             } else {
-                esp_rom_printf("W (%u) wqn_ui: EPD UI render failed: %s\n",
-                               (unsigned)xTaskGetTickCount(), esp_err_to_name(result));
+                ESP_LOGW(
+                    kTag,
+                    "display failed: revision=%llu error=%s",
+                    static_cast<unsigned long long>(local_intent.revision),
+                    esp_err_to_name(render_result));
             }
+        } else {
+            ESP_LOGI(
+                kTag,
+                "display presented by dedup: revision=%llu",
+                static_cast<unsigned long long>(local_intent.revision));
         }
+
+        wqn::display::DisplayResult terminal_result;
+        terminal_result.revision = local_intent.revision;
+        terminal_result.error = render_result;
+        xSemaphoreTake(g_refresh_mutex, portMAX_DELAY);
+        if (render_result == ESP_OK) {
+            g_last_presented_revision = local_intent.revision;
+            terminal_result.status = wqn::display::DisplayStatus::kPresented;
+        } else {
+            terminal_result.status = wqn::display::DisplayStatus::kFailed;
+        }
+        terminal_result.presented_revision = g_last_presented_revision;
+        xSemaphoreGive(g_refresh_mutex);
+        // A result slot was reserved when the intent was accepted. The refresh
+        // task may wait for the UI to drain it, preserving the exactly-once
+        // terminal-result invariant instead of silently dropping failures.
+        PublishDisplayResult(terminal_result, portMAX_DELAY);
 
         // After render: check secondary slot (producer may have submitted during render).
         // Move it into the opposite primary slot and self-notify.
@@ -522,8 +825,10 @@ void EpdRefreshTask(void*)
             promote_sched = g_secondary.schedule;
             g_pending_frames[new_slot] = std::move(g_secondary.frame);
             g_pending_signatures[new_slot] = std::move(g_secondary.signature);
+            g_pending_intents[new_slot] = g_secondary.intent;
             g_refresh_schedule = g_secondary.schedule;
             g_refresh_due_tick = g_secondary.due_tick;
+            g_secondary.intent = {};
             g_secondary.schedule = RefreshSchedule::kNone;
             g_secondary.due_tick = 0;
             g_secondary.pending = false;
@@ -533,12 +838,15 @@ void EpdRefreshTask(void*)
             g_consumer_index.store(new_slot, std::memory_order_release);
         } else {
             g_refresh_busy = false;
+            MaybeReleaseDisplayLeaseLocked();
         }
         xSemaphoreGive(g_refresh_mutex);
         if (do_promote) {
-            esp_rom_printf("I (%u) wqn_ui: EPD refresh: promoting secondary to primary slot=%d schedule=%s\n",
-                           (unsigned)xTaskGetTickCount(),
-                           new_slot, RefreshScheduleName(promote_sched));
+            ESP_LOGI(
+                kTag,
+                "EPD refresh promoting secondary: primary_slot=%d schedule=%s",
+                new_slot,
+                RefreshScheduleName(promote_sched));
             xTaskNotifyGive(g_refresh_task);
         }
     }

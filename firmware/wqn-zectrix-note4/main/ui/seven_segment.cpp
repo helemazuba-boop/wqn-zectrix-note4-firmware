@@ -1,123 +1,115 @@
-// Seven-segment digit rendering for the standby clock and timer pages.
+// Shared bitmap digits plus WiFi/battery status rendering.
 // Extracted from device_ui.cpp.
 
 #include "ui_internal.h"
 
 #include <algorithm>
 
-#include "epd_display.h"
+#include "display_service.h"
+#include "font_zectrix.h"
+#include "ui/assets/font_wqn_digits_16_1.h"
+#include "ui/assets/font_wqn_digits_48_1.h"
+#include "ui/assets/font_wqn_ui_16_1.h"
 
 namespace device_ui_internal {
 
-int SevenSegmentDigitWidth(int scale)
-{
-    return 6 * scale;
-}
+namespace {
 
-int SevenSegmentDigitHeight(int scale)
-{
-    return 10 * scale;
-}
+using DigitLookup = const WqnBitmapAsset* (*)(char);
 
-int SevenSegmentTextWidth(const std::string& text, int scale)
+int MeasureBitmapDigits(const std::string& text, DigitLookup lookup)
 {
     int width = 0;
+    int glyphs = 0;
     for (char c : text) {
-        width += c == ':' ? 2 * scale : SevenSegmentDigitWidth(scale);
-        width += scale;
-    }
-    return std::max(0, width - scale);
-}
-
-void DrawSevenSegmentDigit(int x, int y, int scale, char digit)
-{
-    static constexpr uint8_t kSegments[10] = {
-        0b1111110,  // 0
-        0b0110000,  // 1
-        0b1101101,  // 2
-        0b1111001,  // 3
-        0b0110011,  // 4
-        0b1011011,  // 5
-        0b1011111,  // 6
-        0b1110000,  // 7
-        0b1111111,  // 8
-        0b1111011,  // 9
-    };
-    if (digit < '0' || digit > '9') {
-        return;
-    }
-    const uint8_t segments = kSegments[digit - '0'];
-    const int width = SevenSegmentDigitWidth(scale);
-    const int height = SevenSegmentDigitHeight(scale);
-    const int t = std::max(2, scale);
-    if (segments & 0b1000000) {
-        DrawSegment(x + t, y, width - 2 * t, t);
-    }
-    if (segments & 0b0100000) {
-        DrawSegment(x + width - t, y + t, t, height / 2 - t);
-    }
-    if (segments & 0b0010000) {
-        DrawSegment(x + width - t, y + height / 2, t, height / 2 - t);
-    }
-    if (segments & 0b0001000) {
-        DrawSegment(x + t, y + height - t, width - 2 * t, t);
-    }
-    if (segments & 0b0000100) {
-        DrawSegment(x, y + height / 2, t, height / 2 - t);
-    }
-    if (segments & 0b0000010) {
-        DrawSegment(x, y + t, t, height / 2 - t);
-    }
-    if (segments & 0b0000001) {
-        DrawSegment(x + t, y + height / 2 - t / 2, width - 2 * t, t);
-    }
-}
-
-void DrawSevenSegmentTextCentered(int y, const std::string& text, int scale)
-{
-    int x = std::max(0, (wqn::kEpdWidth - SevenSegmentTextWidth(text, scale)) / 2);
-    for (char c : text) {
-        if (c == ':') {
-            const int dot = std::max(2, scale);
-            const int colon_x = x + scale / 2;
-            FillRect(colon_x, y + 3 * scale, dot, dot, true);
-            FillRect(colon_x, y + 7 * scale, dot, dot, true);
-            x += 3 * scale;
-        } else {
-            DrawSevenSegmentDigit(x, y, scale, c);
-            x += SevenSegmentDigitWidth(scale) + scale;
+        const WqnBitmapAsset* asset = lookup(c);
+        if (asset == nullptr) {
+            continue;
         }
+        width += asset->width;
+        ++glyphs;
+    }
+    return width + std::max(0, glyphs - 1);
+}
+
+void DrawBitmapDigits(int x, int y, const std::string& text, DigitLookup lookup, bool black)
+{
+    bool first = true;
+    for (char c : text) {
+        const WqnBitmapAsset* asset = lookup(c);
+        if (asset == nullptr) {
+            continue;
+        }
+        if (!first) {
+            ++x;
+        }
+        DrawWqnBitmapAsset(x, y, *asset, black);
+        x += asset->width;
+        first = false;
     }
 }
+
+void DrawBitmapDigitsCentered(
+    int x, int y, int width, const std::string& text, DigitLookup lookup, bool black)
+{
+    const int text_width = MeasureBitmapDigits(text, lookup);
+    DrawBitmapDigits(x + std::max(0, (width - text_width) / 2), y, text, lookup, black);
+}
+
+const WqnBitmapAsset& BatteryIconAsset(const wqn::HomeSummary& home)
+{
+    if (home.charging) return b05_battery_charging_16_asset;
+    if (home.full || home.battery_percent >= 95) return b04_battery_full_16_asset;
+    if (home.battery_percent >= 75) return b03_battery_75_16_asset;
+    if (home.battery_percent >= 50) return b02_battery_50_16_asset;
+    if (home.battery_percent >= 25) return b01_battery_25_16_asset;
+    return b00_battery_empty_16_asset;
+}
+
+}  // namespace
 
 void DrawStandbyClockDigits(int y, const std::string& text)
 {
-    static constexpr int kScale = 10;
-    static constexpr int kGap = 8;
-    static constexpr int kColonWidth = 20;
-    const int digit_width = SevenSegmentDigitWidth(kScale);
-    const int total_width = digit_width * 4 + kColonWidth + kGap * 4;
-    int x = (wqn::kEpdWidth - total_width) / 2;
-    int digit_index = 0;
+    DrawBitmapDigitsCentered(0, y, wqn::kEpdWidth, text, WqnDigit48, true);
+}
 
-    for (char c : text) {
-        if (c == ':') {
-            const int dot = 8;
-            const int colon_x = x + (kColonWidth - dot) / 2;
-            FillRect(colon_x, y + 32, dot, dot, true);
-            FillRect(colon_x, y + 68, dot, dot, true);
-            x += kColonWidth + kGap;
-            continue;
-        }
-        if (c >= '0' && c <= '9') {
-            DrawSevenSegmentDigit(x, y, kScale, c);
-        } else {
-            FillRect(x + 2, y + 44, digit_width - 4, 8, true);
-        }
-        x += digit_width;
-        ++digit_index;
-        x += kGap;
+void DrawConfigDigitsCentered(int x, int y, int width, const std::string& ascii, bool black)
+{
+    DrawBitmapDigitsCentered(x, y, width, ascii, WqnDigit16, black);
+}
+
+void DrawTimerDigitsArt(int y, const std::string& ascii_duration)
+{
+    DrawBitmapDigitsCentered(0, y, wqn::kEpdWidth, ascii_duration, WqnDigit48, true);
+}
+
+int DrawWifiStatusIcon(int right_edge, int y, const wqn::HomeSummary& home)
+{
+    // WiFi icon (3-level signal when connected, slash when not).
+    const char* wifi;
+    if (!home.wifi_connected) {
+        wifi = FONT_ZECTRIX_WIFI_SLASH;
+    } else if (home.wifi_rssi >= -55) {
+        wifi = FONT_ZECTRIX_WIFI_FULL;
+    } else if (home.wifi_rssi >= -70) {
+        wifi = FONT_ZECTRIX_WIFI_FAIR;
+    } else {
+        wifi = FONT_ZECTRIX_WIFI_WEAK;
     }
+    const int wifi_w = wqn::MeasureTextWithFont(&font_zectrix_16_1, wifi);
+    const int x = right_edge - wifi_w;
+    wqn::DrawTextWithFont(x, y, &font_zectrix_16_1, wifi, true);
+    return x;
+}
+
+int DrawStatusBarIcons(int right_edge, int y, const wqn::HomeSummary& home)
+{
+    int x = right_edge;
+    const WqnBitmapAsset& battery = BatteryIconAsset(home);
+    x -= battery.width;
+    DrawWqnBitmapAsset(x, y, battery, true);
+    x -= 6;
+    return DrawWifiStatusIcon(x, y, home);
 }
 
 }  // namespace device_ui_internal

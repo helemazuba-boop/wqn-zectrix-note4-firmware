@@ -5,10 +5,10 @@
 
 #include <algorithm>
 #include <cstdio>
-#include <new>
 #include <string>
 
 #include "esp_log.h"
+#include "runtime/sleep_coordinator.h"
 #include "wqn_api.h"
 
 namespace device_ui_internal {
@@ -18,7 +18,18 @@ constexpr char kTag[] = "wqn_ui";
 QueueHandle_t g_todo_request_queue = nullptr;
 QueueHandle_t g_todo_result_queue = nullptr;
 TaskHandle_t g_todo_task = nullptr;
-volatile bool g_todo_cloud_busy = false;
+static std::atomic<bool> g_todo_cloud_busy{false};
+wqn::runtime::SleepLease g_todo_sleep_lease;
+TodoCloudResult g_todo_result_slot;
+uint32_t g_todo_result_generation = 0;
+
+void FinishTodoCloudRequest()
+{
+    // Release the lease before publishing idle. A producer that observes
+    // idle can then safely acquire a fresh lease without racing this reset.
+    g_todo_sleep_lease.Reset();
+    g_todo_cloud_busy.store(false, std::memory_order_release);
+}
 
 bool LoadValidTokenForTodo(std::string* token)
 {
@@ -32,18 +43,31 @@ bool LoadValidTokenForTodo(std::string* token)
 
 bool IsTodoCloudBusy()
 {
-    return g_todo_cloud_busy;
+    return g_todo_cloud_busy.load(std::memory_order_acquire);
 }
 
 bool QueueTodoCloudRequest(const TodoCloudRequest& request)
 {
-    if (g_todo_request_queue == nullptr || IsTodoCloudBusy()) {
+    if (g_todo_request_queue == nullptr) {
         return false;
     }
+    bool expected = false;
+    if (!g_todo_cloud_busy.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        return false;
+    }
+    wqn::runtime::SleepLease lease =
+        wqn::runtime::SleepLease::TryAcquire(
+            wqn::runtime::SleepBlocker::kTodoCloud, "todo-cloud", __FILE__, __LINE__);
+    if (!lease) {
+        g_todo_cloud_busy.store(false, std::memory_order_release);
+        return false;
+    }
+    g_todo_sleep_lease = std::move(lease);
     if (xQueueSend(g_todo_request_queue, &request, 0) != pdTRUE) {
+        FinishTodoCloudRequest();
         return false;
     }
-    g_todo_cloud_busy = true;
     return true;
 }
 
@@ -76,14 +100,21 @@ bool QueueTodoComplete(const std::string& todo_id)
     return QueueTodoCloudRequest(request);
 }
 
-void SendTodoCloudResult(TodoCloudResult* result)
+const TodoCloudResult* PeekTodoCloudResult(uint32_t generation)
 {
-    if (result == nullptr) {
-        return;
+    if (generation == 0 || generation != g_todo_result_generation) {
+        return nullptr;
     }
-    if (g_todo_result_queue == nullptr || xQueueSend(g_todo_result_queue, &result, pdMS_TO_TICKS(100)) != pdTRUE) {
-        g_todo_cloud_busy = false;
-        delete result;
+    return &g_todo_result_slot;
+}
+
+void SendTodoCloudResult()
+{
+    TodoCloudResultReady ready;
+    ready.generation = g_todo_result_generation;
+    if (g_todo_result_queue == nullptr ||
+        xQueueSend(g_todo_result_queue, &ready, pdMS_TO_TICKS(100)) != pdTRUE) {
+        FinishTodoCloudRequest();
     }
 }
 
@@ -241,20 +272,20 @@ void TodoCloudTask(void*)
             continue;
         }
 
-        TodoCloudResult* result = new (std::nothrow) TodoCloudResult();
-        if (result == nullptr) {
-            g_todo_cloud_busy = false;
-            ESP_LOGW(kTag, "alloc Todo cloud result failed");
-            continue;
+        g_todo_result_slot = TodoCloudResult{};
+        ++g_todo_result_generation;
+        if (g_todo_result_generation == 0) {
+            ++g_todo_result_generation;
         }
-        result->op = request.op;
-        std::snprintf(result->todo_id, sizeof(result->todo_id), "%s", request.todo_id);
+        TodoCloudResult& result = g_todo_result_slot;
+        result.op = request.op;
+        std::snprintf(result.todo_id, sizeof(result.todo_id), "%s", request.todo_id);
 
         std::string token;
         if (!LoadValidTokenForTodo(&token)) {
-            result->auth_required = true;
-            result->result = ESP_ERR_INVALID_STATE;
-            SendTodoCloudResult(result);
+            result.auth_required = true;
+            result.result = ESP_ERR_INVALID_STATE;
+            SendTodoCloudResult();
             continue;
         }
 
@@ -262,18 +293,18 @@ void TodoCloudTask(void*)
             wqn::WqnTodoTimelineRequest timeline_request;
             timeline_request.cursor = request.cursor;
             timeline_request.limit = 24;
-            result->result = wqn::FetchTodoTimeline(token, timeline_request, &result->page);
+            result.result = wqn::FetchTodoTimeline(token, timeline_request, &result.page);
         } else if (request.op == TodoCloudOp::kComplete) {
-            result->result = wqn::CompleteTodo(token, request.todo_id, &result->todo);
+            result.result = wqn::CompleteTodo(token, request.todo_id, &result.todo);
         } else {
-            result->result = ESP_ERR_INVALID_ARG;
+            result.result = ESP_ERR_INVALID_ARG;
         }
 
-        if (result->result != ESP_OK) {
+        if (result.result != ESP_OK) {
             std::string after_token;
-            result->auth_required = !LoadValidTokenForTodo(&after_token);
+            result.auth_required = !LoadValidTokenForTodo(&after_token);
         }
-        SendTodoCloudResult(result);
+        SendTodoCloudResult();
     }
 }
 
