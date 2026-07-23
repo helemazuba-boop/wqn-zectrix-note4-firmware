@@ -208,9 +208,15 @@ UiUpdate UiRuntime::DispatchAiStreamingSnapshot(const wqn::AiStreamingStatusView
 UiUpdate UiRuntime::DispatchAiSessionSnapshot(const wqn::AiSessionState& snapshot)
 {
     state_.ai = snapshot;
+    // Keep the logical state in "preparing" immediately, but do not wake the
+    // EPD while the ES8311 is being configured.  A physical panel refresh was
+    // overlapping every failing codec transaction seen in the capture logs.
+    // The following listening or error snapshot will render the final state.
+    const bool defer_refresh_for_audio_init =
+        snapshot.status == wqn::AiSessionStatus::kPreparingCapture;
     return FinishEvent(
         AppEventKind::kAiSessionSnapshot,
-        state_.screen == wqn::UiScreen::kAi
+        state_.screen == wqn::UiScreen::kAi && !defer_refresh_for_audio_init
             ? RefreshSchedule::kAi
             : RefreshSchedule::kNone,
         true);

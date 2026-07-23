@@ -250,6 +250,10 @@ esp_err_t InitPowerHardware(i2c_port_t i2c_port, gpio_num_t i2c_sda, gpio_num_t 
         }
         ESP_LOGI(kTag, "shared I2C bus created: port=%d SDA=%d SCL=%d clk=%d",
                  static_cast<int>(i2c_port), static_cast<int>(i2c_sda), static_cast<int>(i2c_scl), i2c_clk_hz);
+    } else {
+        ESP_LOGI(kTag, "shared I2C bus reused: bus=%p port=%d SDA=%d SCL=%d",
+                 g_i2c_bus, static_cast<int>(i2c_port),
+                 static_cast<int>(i2c_sda), static_cast<int>(i2c_scl));
     }
 
     if (Pcf8563InitWithBus(g_i2c_bus)) {

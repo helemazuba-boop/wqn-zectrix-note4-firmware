@@ -31,6 +31,7 @@
 #include "power_manager.h"
 #include "ui_layout.h"
 #include "typography.h"
+#include "ui/ui_widgets.h"
 #include "ui/assets/wqn_bitmap_asset.h"
 #include "display/display_types.h"
 
@@ -63,13 +64,8 @@ RefreshSchedule StrongerSchedule(RefreshSchedule a, RefreshSchedule b);
 
 // ---- Shared types -----------------------------------------------------------
 
-struct UiRect {
-    int x;
-    int y;
-    int width;
-    int height;
-    const char* name;
-};
+// UiRect is now defined in ui_layout.h (geometry owned alongside layout
+// tokens so ui_widgets.h can reference it without including ui_internal.h).
 
 constexpr TickType_t kCommitRefreshDelay = pdMS_TO_TICKS(120);
 constexpr TickType_t kClockRefreshDelay = pdMS_TO_TICKS(80);

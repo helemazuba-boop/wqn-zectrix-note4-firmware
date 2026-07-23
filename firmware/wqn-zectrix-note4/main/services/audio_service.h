@@ -60,6 +60,11 @@ esp_err_t EndAudioActivity(AudioSession* session);
 // the sole bootstrap exception before this task starts.
 esp_err_t SetAudioAmplifier(const AudioSession& session, bool enabled);
 
+// Recover the codec rail after a failed/aborted initialization. This is an
+// AudioService operation because GPIO42 is service-owned; callers must not
+// toggle the codec power pin directly.
+esp_err_t RecoverAudioCodec(const AudioSession& session);
+
 esp_err_t GetSharedAudioBus(
     const AudioSession& session, AudioBusHandle* bus);
 esp_err_t AddAudioCodec(
@@ -119,7 +124,10 @@ esp_err_t WriteAudioChannel(
     size_t* bytes_written,
     TickType_t timeout);
 esp_err_t ResetAudioTxChannel(
-    const AudioSession& session, AudioChannelHandle channel);
+    const AudioSession& session,
+    AudioChannelHandle channel,
+    // Number of bytes to preload into the channel's complete DMA ring.
+    size_t silence_bytes);
 
 esp_err_t PrepareAudioServiceForSleep(
     const power::PrepareSleepCommand& command);

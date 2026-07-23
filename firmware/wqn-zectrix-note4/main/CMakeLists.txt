@@ -43,6 +43,7 @@ idf_component_register(
         "ui/ui_render.cpp"
         "ui/ui_runtime.cpp"
         "ui/ui_state.cpp"
+        "ui/ui_widgets.cpp"
         "ui/word_cloud.cpp"
         "ui_model.cpp"
         "wifi_manager.cpp"

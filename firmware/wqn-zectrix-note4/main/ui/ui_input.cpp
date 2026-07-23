@@ -496,6 +496,7 @@ RefreshSchedule ApplyButtonEvent(
             return RefreshSchedule::kAi;
         }
         if (state->ai.status == wqn::AiSessionStatus::kListening ||
+            state->ai.status == wqn::AiSessionStatus::kPreparingCapture ||
             state->ai.status == wqn::AiSessionStatus::kWaitingReply) {
             const esp_err_t ret = wqn::StopAiRecordingAndSubmit();
             wqn::AiSessionState ai_state;
@@ -537,6 +538,7 @@ RefreshSchedule ApplyButtonEvent(
     if (state->screen == wqn::UiScreen::kAi && !long_press &&
         (event.type == wqn::ButtonEventType::kShortPress) &&
         (event.button == wqn::ButtonId::kUp || event.button == wqn::ButtonId::kDownPower) &&
+        state->ai.status != wqn::AiSessionStatus::kPreparingCapture &&
         state->ai.status != wqn::AiSessionStatus::kListening &&
         state->ai.status != wqn::AiSessionStatus::kWaitingReply &&
         state->ai.status != wqn::AiSessionStatus::kStreaming) {
@@ -576,6 +578,7 @@ RefreshSchedule ApplyButtonEvent(
         (event.type == wqn::ButtonEventType::kShortPress) &&
         (event.button == wqn::ButtonId::kUp || event.button == wqn::ButtonId::kDownPower) &&
         (state->ai.status == wqn::AiSessionStatus::kListening ||
+         state->ai.status == wqn::AiSessionStatus::kPreparingCapture ||
          state->ai.status == wqn::AiSessionStatus::kWaitingReply ||
          state->ai.status == wqn::AiSessionStatus::kStreaming)) {
         return RefreshSchedule::kNone;

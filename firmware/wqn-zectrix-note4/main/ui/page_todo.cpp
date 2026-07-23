@@ -2,6 +2,7 @@
 // Extracted from device_ui.cpp.
 
 #include "ui_internal.h"
+#include "ui_widgets.h"
 
 #include <algorithm>
 #include <cctype>
@@ -263,9 +264,14 @@ esp_err_t DrawTodoStatusBar(const wqn::TodoUiState& todo, const wqn::HomeSummary
 
 esp_err_t DrawTodoCard(const wqn::WqnTodoItem& item, bool selected, wqn::TodoSyncStatus sync_status, int x, int y, int width, int height)
 {
-    DrawRect(x, y, width, height);
+    // Card outline: drawn by the focus decoration when selected (rounded outer
+    // r6 + 2px-inset concentric inner), or as a plain rounded outline when not,
+    // so the todo cards share the product's rounded-card visual language with
+    // the word home cards. One path owns the outline.
     if (selected) {
-        DrawRect(x + 3, y + 3, width - 6, height - 6);
+        DrawSelectionDecoration(x, y, width, height, SelectionStyle::kRoundedInnerBorder);
+    } else {
+        DrawRoundedRect(x, y, width, height, kRoundedOuterRadius);
     }
 
     const std::string title = item.title.empty() ? "未命名 Todo" : item.title;
@@ -293,7 +299,7 @@ esp_err_t DrawTodoEmptyState(const wqn::TodoUiState& todo)
         body = "正在从云端获取今天的待办";
     }
 
-    DrawRect(28, 72, 344, 128);
+    DrawRoundedRect(28, 72, 344, 128, kRoundedOuterRadius);
     ESP_RETURN_ON_ERROR(DrawCenteredText(36, 106, 328, title), kTag, "draw todo empty title");
     ESP_RETURN_ON_ERROR(DrawCenteredText(36, 136, 328, body), kTag, "draw todo empty body");
     ESP_RETURN_ON_ERROR(DrawCenteredText(36, 174, 328, TodoSyncStatusText(todo.sync_status)), kTag, "draw todo empty status");

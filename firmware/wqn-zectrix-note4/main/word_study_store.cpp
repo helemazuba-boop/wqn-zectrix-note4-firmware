@@ -24,11 +24,17 @@ constexpr char kTag[] = "word_store";
 constexpr char kOutboxPath[] = "/storage/wout.v1";
 constexpr char kOutboxTempPath[] = "/storage/wout.tmp";
 constexpr char kOutboxBackupPath[] = "/storage/wout.bak";
+constexpr char kRejectedOutboxPath[] = "/storage/wrej.v1";
+constexpr char kRejectedOutboxTempPath[] = "/storage/wrej.tmp";
+constexpr char kRejectedOutboxBackupPath[] = "/storage/wrej.bak";
 constexpr uint32_t kSessionMagic = UINT32_C(0x53535157);  // WQSS
 constexpr uint32_t kOutboxMagic = UINT32_C(0x424f5157);  // WQOB
 constexpr uint16_t kSessionSchemaVersion = 2;
 constexpr uint16_t kOutboxSchemaVersion = 1;
 constexpr size_t kMaxSessionPayloadBytes = 96U * 1024U;
+constexpr size_t kMaxSessionCursorBytes = 256;
+constexpr size_t kRuntimeCompactAckThreshold = 32;
+constexpr size_t kRejectedOutboxCapacity = 256;
 constexpr wqn::protocol::word_study_v1::Mode kPersistedSessionModes[] = {
     wqn::protocol::word_study_v1::Mode::kSequential,
     wqn::protocol::word_study_v1::Mode::kRandom,
@@ -76,9 +82,17 @@ struct OutboxScan {
     std::vector<OutboxRecord, wqn::WordStorePsramAllocator<OutboxRecord>> acknowledged;
     size_t total_records = 0;
     size_t ack_records = 0;
+    size_t orphan_ack_records = 0;
     bool partial_tail = false;
     bool backup_source = false;
 };
+
+// Every public operation below runs on StorageService's sole owner task. Keep
+// the parsed journal resident there so card actions do not re-read and CRC the
+// complete SPIFFS file. The cache is rebuilt after boot and updated only after
+// the corresponding append/compaction has become durable.
+OutboxScan g_outbox_cache;
+bool g_outbox_cache_loaded = false;
 
 struct SessionPaths {
     const char* primary;
@@ -221,7 +235,7 @@ bool EncodeSession(
     AppendScalar<uint64_t>(payload, session.remote.next_sequence);
     if (!AppendString(payload, session.remote.session_id, 36) ||
         !AppendString(payload, session.remote.seed, 64) ||
-        !AppendString(payload, session.remote.cursor, 64)) {
+        !AppendString(payload, session.remote.cursor, kMaxSessionCursorBytes)) {
         return false;
     }
     AppendScalar<uint16_t>(payload, static_cast<uint16_t>(session.remote.deck_ids.size()));
@@ -272,7 +286,7 @@ bool DecodeSession(
         !reader.Scalar(&parsed.remote.next_sequence) ||
         !reader.String(&parsed.remote.session_id, 36) ||
         !reader.String(&parsed.remote.seed, 64) ||
-        !reader.String(&parsed.remote.cursor, 64) || phase > 1 ||
+        !reader.String(&parsed.remote.cursor, kMaxSessionCursorBytes) || phase > 1 ||
         !ValidMode(mode) || !ValidPurpose(purpose) || !ValidOrdering(ordering) ||
         optional_count > 500) {
         return false;
@@ -596,8 +610,17 @@ esp_err_t ScanOutboxFile(const char* path, OutboxScan* scan)
                 }
                 scan->pending.erase(pending);
             } else if (acknowledged == scan->acknowledged.end()) {
-                std::fclose(file);
-                return ESP_ERR_INVALID_STATE;
+                // ACKs are idempotent tombstones. A crash between journal
+                // replacement steps can leave a valid ACK whose observation
+                // was already removed by an earlier compaction. There is no
+                // state left to reconcile, so retain the diagnostic and
+                // ignore it instead of treating the complete journal as
+                // corrupt and entering a repair loop.
+                ++scan->orphan_ack_records;
+                ESP_LOGW(
+                    kTag,
+                    "ignoring orphan word outbox ACK: request=%s",
+                    request_id.c_str());
             }
         } else {
             std::fclose(file);
@@ -638,14 +661,117 @@ esp_err_t ScanOutbox(OutboxScan* scan)
     return ESP_OK;
 }
 
-esp_err_t AppendOutboxRecord(const OutboxRecord& record)
+esp_err_t EnsureOutboxCache(OutboxScan** scan)
 {
-    FILE* file = std::fopen(kOutboxPath, "ab");
+    if (scan == nullptr) return ESP_ERR_INVALID_ARG;
+    if (!g_outbox_cache_loaded) {
+        OutboxScan loaded;
+        ESP_RETURN_ON_ERROR(
+            ScanOutbox(&loaded), kTag, "load word outbox cache");
+        g_outbox_cache = std::move(loaded);
+        g_outbox_cache_loaded = true;
+        ESP_LOGI(
+            kTag,
+            "word outbox cache loaded: total=%u pending=%u ack=%u orphan_ack=%u",
+            static_cast<unsigned>(g_outbox_cache.total_records),
+            static_cast<unsigned>(g_outbox_cache.pending.size()),
+            static_cast<unsigned>(g_outbox_cache.ack_records),
+            static_cast<unsigned>(g_outbox_cache.orphan_ack_records));
+    }
+    *scan = &g_outbox_cache;
+    return ESP_OK;
+}
+
+esp_err_t AppendOutboxRecordTo(const char* path, const OutboxRecord& record)
+{
+    if (path == nullptr) return ESP_ERR_INVALID_ARG;
+    FILE* file = std::fopen(path, "ab");
     if (file == nullptr) return ESP_FAIL;
     const bool written = std::fwrite(&record, 1, sizeof(record), file) == sizeof(record);
     const bool durable = written && std::fflush(file) == 0 && ::fsync(fileno(file)) == 0;
     const bool closed = std::fclose(file) == 0;
     return durable && closed ? ESP_OK : ESP_FAIL;
+}
+
+// The rejected journal is forensic data, not another upload queue. Keep it as
+// a bounded rolling file so a long run of terminal server errors cannot make
+// quarantine itself the reason the durable upload head stops progressing.
+esp_err_t AppendRejectedOutboxRecord(const OutboxRecord& record)
+{
+    size_t complete_records = 0;
+    bool discarded_partial_tail = false;
+    struct stat existing = {};
+    if (stat(kRejectedOutboxPath, &existing) == 0 &&
+        S_ISREG(existing.st_mode) && existing.st_size >= 0) {
+        const size_t bytes = static_cast<size_t>(existing.st_size);
+        complete_records = bytes / sizeof(OutboxRecord);
+        discarded_partial_tail = bytes % sizeof(OutboxRecord) != 0;
+    }
+    const size_t keep_existing = std::min(
+        complete_records, kRejectedOutboxCapacity - static_cast<size_t>(1));
+    const size_t skip_records = complete_records - keep_existing;
+
+    FILE* source = nullptr;
+    if (keep_existing > 0) {
+        source = std::fopen(kRejectedOutboxPath, "rb");
+        if (source == nullptr ||
+            std::fseek(
+                source,
+                static_cast<long>(skip_records * sizeof(OutboxRecord)),
+                SEEK_SET) != 0) {
+            if (source != nullptr) std::fclose(source);
+            return ESP_FAIL;
+        }
+    }
+    FILE* output = std::fopen(kRejectedOutboxTempPath, "wb");
+    if (output == nullptr) {
+        if (source != nullptr) std::fclose(source);
+        return ESP_FAIL;
+    }
+    bool ok = true;
+    OutboxRecord copied = {};
+    for (size_t i = 0; ok && i < keep_existing; ++i) {
+        ok = std::fread(&copied, 1, sizeof(copied), source) == sizeof(copied) &&
+             std::fwrite(&copied, 1, sizeof(copied), output) == sizeof(copied);
+    }
+    if (source != nullptr) std::fclose(source);
+    ok = ok && std::fwrite(&record, 1, sizeof(record), output) == sizeof(record);
+    const bool durable =
+        ok && std::fflush(output) == 0 && ::fsync(fileno(output)) == 0;
+    const bool closed = std::fclose(output) == 0;
+    if (!durable || !closed) {
+        std::remove(kRejectedOutboxTempPath);
+        return ESP_FAIL;
+    }
+
+    const bool had_existing = FileExists(kRejectedOutboxPath);
+    if (had_existing) {
+        std::remove(kRejectedOutboxBackupPath);
+        if (std::rename(kRejectedOutboxPath, kRejectedOutboxBackupPath) != 0) {
+            std::remove(kRejectedOutboxTempPath);
+            return ESP_FAIL;
+        }
+    }
+    if (std::rename(kRejectedOutboxTempPath, kRejectedOutboxPath) != 0) {
+        if (had_existing) std::rename(kRejectedOutboxBackupPath, kRejectedOutboxPath);
+        std::remove(kRejectedOutboxTempPath);
+        return ESP_FAIL;
+    }
+    if (had_existing) std::remove(kRejectedOutboxBackupPath);
+    if (skip_records > 0 || discarded_partial_tail) {
+        ESP_LOGW(
+            kTag,
+            "word observation quarantine rolled over: discarded=%u partial_tail=%d capacity=%u",
+            static_cast<unsigned>(skip_records),
+            discarded_partial_tail ? 1 : 0,
+            static_cast<unsigned>(kRejectedOutboxCapacity));
+    }
+    return ESP_OK;
+}
+
+esp_err_t AppendOutboxRecord(const OutboxRecord& record)
+{
+    return AppendOutboxRecordTo(kOutboxPath, record);
 }
 
 esp_err_t CompactOutbox(
@@ -696,6 +822,22 @@ esp_err_t CompactOutbox(
         std::remove(kOutboxTempPath);
         return ESP_FAIL;
     }
+    return ESP_OK;
+}
+
+esp_err_t CompactCachedOutbox(OutboxScan* scan)
+{
+    if (scan == nullptr) return ESP_ERR_INVALID_ARG;
+    ESP_RETURN_ON_ERROR(
+        CompactOutbox(scan->pending, scan->backup_source),
+        kTag,
+        "compact cached word outbox");
+    scan->acknowledged.clear();
+    scan->total_records = scan->pending.size();
+    scan->ack_records = 0;
+    scan->orphan_ack_records = 0;
+    scan->partial_tail = false;
+    scan->backup_source = false;
     return ESP_OK;
 }
 
@@ -791,6 +933,26 @@ esp_err_t CheckpointSessionsFromOutbox(const OutboxScan& scan)
     return ESP_OK;
 }
 
+esp_err_t MaybeCompactCachedOutbox(OutboxScan* scan)
+{
+    if (scan == nullptr || scan->ack_records < kRuntimeCompactAckThreshold) {
+        return ESP_OK;
+    }
+    ESP_RETURN_ON_ERROR(
+        CheckpointSessionsFromOutbox(*scan),
+        kTag,
+        "checkpoint runtime word outbox");
+    ESP_RETURN_ON_ERROR(
+        CompactCachedOutbox(scan),
+        kTag,
+        "compact runtime word outbox");
+    ESP_LOGI(
+        kTag,
+        "word outbox runtime compaction complete: pending=%u",
+        static_cast<unsigned>(scan->pending.size()));
+    return ESP_OK;
+}
+
 struct LoadSessionContext {
     wqn::protocol::word_study_v1::Mode mode;
     wqn::PersistedWordSession* session;
@@ -809,21 +971,22 @@ esp_err_t LoadSessionTransaction(void* opaque)
         // NOT_FOUND without emitting an error-level log on every index load.
         return session_result;
     }
-    OutboxScan scan;
-    ESP_RETURN_ON_ERROR(ScanOutbox(&scan), kTag, "scan word outbox");
+    OutboxScan* scan = nullptr;
+    ESP_RETURN_ON_ERROR(
+        EnsureOutboxCache(&scan), kTag, "load word outbox");
     bool changed = false;
-    ReconcileSession(scan.acknowledged, session, &changed);
-    ReconcileSession(scan.pending, session, &changed);
+    ReconcileSession(scan->acknowledged, session, &changed);
+    ReconcileSession(scan->pending, session, &changed);
     if (changed) {
         ESP_RETURN_ON_ERROR(SaveSessionRaw(*session), kTag, "repair word session cursor");
     }
-    if (scan.partial_tail || scan.backup_source) {
+    if (scan->partial_tail || scan->backup_source) {
         ESP_RETURN_ON_ERROR(
-            CheckpointSessionsFromOutbox(scan),
+            CheckpointSessionsFromOutbox(*scan),
             kTag,
             "checkpoint before word outbox repair");
         ESP_RETURN_ON_ERROR(
-            CompactOutbox(scan.pending, scan.backup_source),
+            CompactCachedOutbox(scan),
             kTag,
             "repair word outbox tail");
     }
@@ -875,36 +1038,37 @@ esp_err_t CommitObservationTransaction(void* opaque)
         return ESP_ERR_INVALID_ARG;
     }
     const int64_t started_us = esp_timer_get_time();
-    OutboxScan scan;
-    ESP_RETURN_ON_ERROR(ScanOutbox(&scan), kTag, "scan before word observation");
+    OutboxScan* scan = nullptr;
+    ESP_RETURN_ON_ERROR(
+        EnsureOutboxCache(&scan), kTag, "load outbox before word observation");
     const int64_t scanned_us = esp_timer_get_time();
     const auto existing = std::find_if(
-        scan.pending.begin(), scan.pending.end(),
+        scan->pending.begin(), scan->pending.end(),
         [&](const auto& value) { return observation.request_id == value.request_id; });
-    if (existing != scan.pending.end()) {
+    if (existing != scan->pending.end()) {
         if (!SameObservation(ObservationFromRecord(*existing), observation)) {
             return ESP_ERR_INVALID_STATE;
         }
         return SaveSessionRaw(session);
     }
     if (std::find_if(
-            scan.acknowledged.begin(),
-            scan.acknowledged.end(),
+            scan->acknowledged.begin(),
+            scan->acknowledged.end(),
             [&](const auto& value) {
                 return observation.request_id == value.request_id;
-            }) != scan.acknowledged.end()) {
+            }) != scan->acknowledged.end()) {
         return SaveSessionRaw(session);
     }
-    if (scan.pending.size() >= wqn::kWordObservationOutboxCapacity) {
+    if (scan->pending.size() >= wqn::kWordObservationOutboxCapacity) {
         return ESP_ERR_NO_MEM;
     }
-    if (scan.partial_tail || scan.backup_source) {
+    if (scan->partial_tail || scan->backup_source) {
         ESP_RETURN_ON_ERROR(
-            CheckpointSessionsFromOutbox(scan),
+            CheckpointSessionsFromOutbox(*scan),
             kTag,
             "checkpoint before append repair");
         ESP_RETURN_ON_ERROR(
-            CompactOutbox(scan.pending, scan.backup_source),
+            CompactCachedOutbox(scan),
             kTag,
             "repair before append");
     }
@@ -914,10 +1078,12 @@ esp_err_t CommitObservationTransaction(void* opaque)
         kTag,
         "encode word observation");
     ESP_RETURN_ON_ERROR(AppendOutboxRecord(record), kTag, "append word observation");
+    scan->pending.push_back(record);
+    ++scan->total_records;
     const int64_t appended_us = esp_timer_get_time();
     ESP_LOGI(
         kTag,
-        "word observation durable: sequence=%llu scan_ms=%lld append_ms=%lld total_ms=%lld",
+        "word observation durable: sequence=%llu lookup_ms=%lld append_ms=%lld total_ms=%lld",
         static_cast<unsigned long long>(observation.sequence),
         static_cast<long long>((scanned_us - started_us) / 1000),
         static_cast<long long>((appended_us - scanned_us) / 1000),
@@ -934,20 +1100,21 @@ esp_err_t PeekObservationTransaction(void* context)
 {
     auto* observation = static_cast<wqn::DurableWordObservation*>(context);
     if (observation == nullptr) return ESP_ERR_INVALID_ARG;
-    OutboxScan scan;
-    ESP_RETURN_ON_ERROR(ScanOutbox(&scan), kTag, "scan word outbox");
-    if (scan.partial_tail || scan.backup_source) {
+    OutboxScan* scan = nullptr;
+    ESP_RETURN_ON_ERROR(
+        EnsureOutboxCache(&scan), kTag, "load word outbox");
+    if (scan->partial_tail || scan->backup_source) {
         ESP_RETURN_ON_ERROR(
-            CheckpointSessionsFromOutbox(scan),
+            CheckpointSessionsFromOutbox(*scan),
             kTag,
             "checkpoint before outbox peek repair");
         ESP_RETURN_ON_ERROR(
-            CompactOutbox(scan.pending, scan.backup_source),
+            CompactCachedOutbox(scan),
             kTag,
             "repair word outbox tail");
     }
-    if (scan.pending.empty()) return ESP_ERR_NOT_FOUND;
-    *observation = ObservationFromRecord(scan.pending.front());
+    if (scan->pending.empty()) return ESP_ERR_NOT_FOUND;
+    *observation = ObservationFromRecord(scan->pending.front());
     return ESP_OK;
 }
 
@@ -961,33 +1128,101 @@ esp_err_t AckObservationTransaction(void* opaque)
     if (context == nullptr || context->request_id == nullptr || context->request_id->empty()) {
         return ESP_ERR_INVALID_ARG;
     }
-    OutboxScan scan;
-    ESP_RETURN_ON_ERROR(ScanOutbox(&scan), kTag, "scan before word ack");
+    OutboxScan* scan = nullptr;
+    ESP_RETURN_ON_ERROR(
+        EnsureOutboxCache(&scan), kTag, "load outbox before word ack");
     const auto pending = std::find_if(
-        scan.pending.begin(), scan.pending.end(),
+        scan->pending.begin(), scan->pending.end(),
         [&](const auto& value) { return *context->request_id == value.request_id; });
-    if (pending == scan.pending.end()) {
+    if (pending == scan->pending.end()) {
         return std::find_if(
-                   scan.acknowledged.begin(),
-                   scan.acknowledged.end(),
+                   scan->acknowledged.begin(),
+                   scan->acknowledged.end(),
                    [&](const auto& value) {
                        return *context->request_id == value.request_id;
-                   }) != scan.acknowledged.end()
+                   }) != scan->acknowledged.end()
             ? ESP_OK
             : ESP_ERR_NOT_FOUND;
     }
 
     OutboxRecord record = {};
     wqn::DurableWordObservation ack = ObservationFromRecord(*pending);
+    const OutboxRecord acknowledged = *pending;
     ESP_RETURN_ON_ERROR(
         BuildObservationRecord(ack, OutboxRecordKind::kAck, &record),
         kTag,
         "encode word ack");
     ESP_RETURN_ON_ERROR(AppendOutboxRecord(record), kTag, "append word ack");
-    // Keep ACK latency bounded. The observation+ACK pair is already a durable
-    // cursor checkpoint; boot/load reconciliation consumes it. Full session
-    // checkpointing and journal compaction happen only during sleep quiesce.
-    return ESP_OK;
+    scan->acknowledged.push_back(acknowledged);
+    scan->pending.erase(pending);
+    ++scan->ack_records;
+    ++scan->total_records;
+    // Keep normal ACK latency bounded, but compact periodically even while USB
+    // or settings prevent deep sleep. This bounds both journal size and the
+    // one boot-time scan without putting compaction on every card action.
+    return MaybeCompactCachedOutbox(scan);
+}
+
+struct QuarantineContext {
+    const std::string* request_id;
+};
+
+esp_err_t QuarantineObservationTransaction(void* opaque)
+{
+    auto* context = static_cast<QuarantineContext*>(opaque);
+    if (context == nullptr || context->request_id == nullptr ||
+        context->request_id->empty()) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    OutboxScan* scan = nullptr;
+    ESP_RETURN_ON_ERROR(
+        EnsureOutboxCache(&scan), kTag, "load outbox before quarantine");
+    const auto pending = std::find_if(
+        scan->pending.begin(), scan->pending.end(),
+        [&](const auto& value) {
+            return *context->request_id == value.request_id;
+        });
+    if (pending == scan->pending.end()) {
+        return std::find_if(
+                   scan->acknowledged.begin(),
+                   scan->acknowledged.end(),
+                   [&](const auto& value) {
+                       return *context->request_id == value.request_id;
+                   }) != scan->acknowledged.end()
+            ? ESP_OK
+            : ESP_ERR_NOT_FOUND;
+    }
+
+    // Preserve the complete observation in a separate durable journal before
+    // removing it from the upload head. If the ACK append fails, a retry may
+    // duplicate this forensic record, but it can never lose the observation.
+    const OutboxRecord rejected_record = *pending;
+    ESP_RETURN_ON_ERROR(
+        AppendRejectedOutboxRecord(rejected_record),
+        kTag,
+        "append rejected word observation");
+    OutboxRecord ack_record = {};
+    ESP_RETURN_ON_ERROR(
+        BuildObservationRecord(
+            ObservationFromRecord(rejected_record),
+            OutboxRecordKind::kAck,
+            &ack_record),
+        kTag,
+        "encode quarantined word ack");
+    ESP_RETURN_ON_ERROR(
+        AppendOutboxRecord(ack_record),
+        kTag,
+        "append quarantined word ack");
+
+    scan->acknowledged.push_back(rejected_record);
+    scan->pending.erase(pending);
+    ++scan->ack_records;
+    ++scan->total_records;
+    ESP_LOGW(
+        kTag,
+        "word observation quarantined: request=%s",
+        context->request_id->c_str());
+    return MaybeCompactCachedOutbox(scan);
 }
 
 struct PrepareOutboxContext {
@@ -999,41 +1234,50 @@ esp_err_t PrepareOutboxForSleepTransaction(void* opaque)
     auto* context = static_cast<PrepareOutboxContext*>(opaque);
     if (context == nullptr) return ESP_ERR_INVALID_ARG;
     if (context->deadline_us > 0 && esp_timer_get_time() >= context->deadline_us) {
-        return ESP_ERR_TIMEOUT;
+        // Journal entries are already fsync'd. Compaction is maintenance, not
+        // a durability prerequisite, so a missed maintenance window must not
+        // veto deep sleep and create a retry/power-drain loop.
+        ESP_LOGW(kTag, "word outbox sleep maintenance deferred: deadline reached");
+        return ESP_OK;
     }
-    OutboxScan scan;
-    ESP_RETURN_ON_ERROR(ScanOutbox(&scan), kTag, "scan outbox before sleep");
-    if (scan.ack_records == 0 && !scan.partial_tail && !scan.backup_source) {
+    OutboxScan* scan = nullptr;
+    ESP_RETURN_ON_ERROR(
+        EnsureOutboxCache(&scan), kTag, "load outbox before sleep");
+    if (scan->ack_records == 0 && !scan->partial_tail &&
+        !scan->backup_source) {
         return ESP_OK;
     }
     ESP_RETURN_ON_ERROR(
-        CheckpointSessionsFromOutbox(scan),
+        CheckpointSessionsFromOutbox(*scan),
         kTag,
         "checkpoint outbox before sleep");
     if (context->deadline_us > 0 && esp_timer_get_time() >= context->deadline_us) {
-        return ESP_ERR_TIMEOUT;
+        ESP_LOGW(
+            kTag,
+            "word outbox compaction deferred after checkpoint: pending=%u ack=%u",
+            static_cast<unsigned>(scan->pending.size()),
+            static_cast<unsigned>(scan->ack_records));
+        return ESP_OK;
     }
     ESP_RETURN_ON_ERROR(
-        CompactOutbox(scan.pending, scan.backup_source),
+        CompactCachedOutbox(scan),
         kTag,
         "compact outbox before sleep");
     ESP_LOGI(
         kTag,
-        "word outbox prepared for sleep: acknowledged=%u pending=%u",
-        static_cast<unsigned>(scan.ack_records),
-        static_cast<unsigned>(scan.pending.size()));
-    return context->deadline_us > 0 && esp_timer_get_time() >= context->deadline_us
-        ? ESP_ERR_TIMEOUT
-        : ESP_OK;
+        "word outbox prepared for sleep: pending=%u",
+        static_cast<unsigned>(scan->pending.size()));
+    return ESP_OK;
 }
 
 esp_err_t SnapshotTransaction(void* context)
 {
     auto* snapshot = static_cast<wqn::WordOutboxSnapshot*>(context);
     if (snapshot == nullptr) return ESP_ERR_INVALID_ARG;
-    OutboxScan scan;
-    ESP_RETURN_ON_ERROR(ScanOutbox(&scan), kTag, "scan word outbox snapshot");
-    snapshot->pending_count = scan.pending.size();
+    OutboxScan* scan = nullptr;
+    ESP_RETURN_ON_ERROR(
+        EnsureOutboxCache(&scan), kTag, "load word outbox snapshot");
+    snapshot->pending_count = scan->pending.size();
     snapshot->capacity = wqn::kWordObservationOutboxCapacity;
     return ESP_OK;
 }
@@ -1166,6 +1410,15 @@ esp_err_t AcknowledgeWordObservation(const std::string& request_id)
 {
     AckContext context{&request_id};
     return ExecuteWithStorageLease("word-outbox-ack", AckObservationTransaction, &context);
+}
+
+esp_err_t QuarantinePendingWordObservation(const std::string& request_id)
+{
+    QuarantineContext context{&request_id};
+    return ExecuteWithStorageLease(
+        "word-outbox-quarantine",
+        QuarantineObservationTransaction,
+        &context);
 }
 
 esp_err_t ReadWordOutboxSnapshot(WordOutboxSnapshot* snapshot)

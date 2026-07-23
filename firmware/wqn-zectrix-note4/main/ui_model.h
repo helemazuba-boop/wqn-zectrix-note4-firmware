@@ -56,6 +56,10 @@ enum class ReviewChoice {
 
 enum class AiSessionStatus {
     kIdle,
+    // WiFi/audio hardware preparation is in progress. Keep this separate
+    // from kWaitingReply so the UI does not show the misleading "识别"
+    // status before a recording buffer exists.
+    kPreparingCapture,
     kListening,
     kWaitingReply,
     kStreaming,         // v2 SSE: connected, server is producing events

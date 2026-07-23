@@ -152,6 +152,7 @@ const char kWordObservationV1[] = R"json({
       "known_count": 0,
       "unknown_count": 1
     },
+    "projection_applied": true,
     "replayed": false
   }
 })json";
@@ -926,6 +927,7 @@ bool CheckWordStudyV1Contract()
             observation.action == words::ObservationAction::kUnknown,
             "word-study observation action") ||
         !Require(observation.progress.present, "word-study progress projection") ||
+        !Require(observation.projection_applied, "word-study projection applied") ||
         !Require(observation.progress.unknown_count == 1, "word-study unknown count")) {
         return false;
     }
@@ -1048,6 +1050,26 @@ bool CheckWordStudyV1Contract()
                 "word-study guided random fixture")) {
             return false;
         }
+    }
+
+    // Cloud and firmware must compare the UTF-8 bytes, not JavaScript UTF-16
+    // code units. U+E000 (EE 80 80) therefore sorts before U+10000 (F0 90 80
+    // 80), even though their UTF-16 ordering would be reversed.
+    std::vector<words::Candidate> unicode_candidates(2);
+    unicode_candidates[0].item_id = ids[1];
+    unicode_candidates[0].normalized_word = "\xEE\x80\x80";
+    unicode_candidates[1].item_id = ids[2];
+    unicode_candidates[1].normalized_word = "\xF0\x90\x80\x80";
+    words::OrderCandidates(
+        &unicode_candidates,
+        words::Ordering::kLexicographic,
+        "seed_contract_001",
+        1000);
+    if (!Require(
+            unicode_candidates[0].item_id == ids[1] &&
+                unicode_candidates[1].item_id == ids[2],
+            "word-study UTF-8 lexicographic fixture")) {
+        return false;
     }
     return true;
 }

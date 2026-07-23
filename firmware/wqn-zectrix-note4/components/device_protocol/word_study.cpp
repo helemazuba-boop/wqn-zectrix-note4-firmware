@@ -370,7 +370,7 @@ esp_err_t BuildCreateSessionRequest(
     std::string* body)
 {
     if (body == nullptr || request.scope.deck_ids.size() > kMaxDecks ||
-        request.optional_count < 0 || request.optional_count > 500 ||
+        request.optional_count < 1 || request.optional_count > 500 ||
         (!request.seed.empty() && !IsUrlSafe(request.seed, 1, 64))) {
         return ESP_ERR_INVALID_ARG;
     }
@@ -393,9 +393,7 @@ esp_err_t BuildCreateSessionRequest(
         cJSON_AddItemToArray(deck_ids, cJSON_CreateString(id.c_str()));
     }
     cJSON_AddBoolToObject(scope, "include_mastered", request.scope.include_mastered);
-    if (request.optional_count > 0) {
-        cJSON_AddNumberToObject(document.root(), "optional_count", request.optional_count);
-    }
+    cJSON_AddNumberToObject(document.root(), "optional_count", request.optional_count);
     if (!request.seed.empty()) {
         cJSON_AddStringToObject(document.root(), "seed", request.seed.c_str());
     }
@@ -503,7 +501,7 @@ esp_err_t ParseSessionResponse(
             return ESP_ERR_INVALID_RESPONSE;
         }
         data->optional_count = optional_count->valueint;
-    } else if (!cJSON_IsNull(optional_count)) {
+    } else {
         return ESP_ERR_INVALID_RESPONSE;
     }
 
@@ -661,14 +659,17 @@ esp_err_t ParseObservationResponse(
     data->session_id = StringField(payload, "session_id");
     data->item_id = StringField(payload, "item_id");
     cJSON* replayed = cJSON_GetObjectItemCaseSensitive(payload, "replayed");
+    cJSON* projection_applied =
+        cJSON_GetObjectItemCaseSensitive(payload, "projection_applied");
     if (!IsUuid(data->observation_id) || !IsUuid(data->session_id) ||
         !IsUuid(data->item_id) ||
         !U64Field(payload, "sequence", &data->sequence) ||
         !ParseAction(StringField(payload, "action"), &data->action) ||
-        !cJSON_IsBool(replayed)) {
+        !cJSON_IsBool(projection_applied) || !cJSON_IsBool(replayed)) {
         return ESP_ERR_INVALID_RESPONSE;
     }
     data->replayed = cJSON_IsTrue(replayed);
+    data->projection_applied = cJSON_IsTrue(projection_applied);
 
     cJSON* progress = cJSON_GetObjectItemCaseSensitive(payload, "progress");
     if (cJSON_IsNull(progress)) return ESP_OK;

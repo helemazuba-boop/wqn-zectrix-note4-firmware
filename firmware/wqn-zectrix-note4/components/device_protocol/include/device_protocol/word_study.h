@@ -17,8 +17,7 @@ namespace wqn::protocol::word_study_v1 {
 inline constexpr char kSchemaSha256[] = WQN_WORD_STUDY_SCHEMA_SHA256;
 inline constexpr uint32_t kPackSchemaVersion = 2;
 inline constexpr size_t kMaxDecks = 32;
-// Session parsing retains the short-lived 500-item response for rollback
-// compatibility. New candidate transport pages are bounded independently.
+// Candidate snapshots are bounded at the contract boundary.
 inline constexpr size_t kMaxSessionItems = 500;
 inline constexpr size_t kMaxCandidatePageItems = 100;
 inline constexpr size_t kInitialCandidatePageSize = 32;
@@ -89,7 +88,7 @@ struct SessionData {
     std::string candidate_policy_version;
     std::string seed;
     Scope scope;
-    int optional_count = 0;  // zero means no explicit bound
+    int optional_count = 500;
     uint64_t next_sequence = 0;
     uint64_t progress_revision = 0;
     std::vector<PackSnapshot> snapshot;
@@ -133,6 +132,7 @@ struct ObservationData {
     std::string item_id;
     ObservationAction action = ObservationAction::kShown;
     ProgressProjection progress;
+    bool projection_applied = false;
     bool replayed = false;
 };
 
@@ -175,7 +175,7 @@ struct CreateSessionRequest {
     v3::RequestMetadata metadata;
     Mode mode = Mode::kSequential;
     Scope scope;
-    int optional_count = 0;
+    int optional_count = 500;
     std::string seed;
 };
 

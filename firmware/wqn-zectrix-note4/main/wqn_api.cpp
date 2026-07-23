@@ -2311,35 +2311,37 @@ esp_err_t FetchWordStudyCandidatePageV1(
     return ESP_OK;
 }
 
-esp_err_t SubmitWordStudyObservationV1(
+esp_err_t SubmitWordStudyObservationV1AtPath(
     const std::string& token,
     const protocol::word_study_v1::ObservationRequest& request,
     protocol::word_study_v1::ObservationData* observation,
-    protocol::v3::Error* error)
+    protocol::v3::Error* error,
+    bool* transport_failure,
+    const char* path,
+    const char* operation)
 {
-    if (observation == nullptr || error == nullptr || token.empty()) {
+    if (observation == nullptr || error == nullptr || transport_failure == nullptr ||
+        token.empty() || path == nullptr || operation == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
     *observation = {};
     *error = {};
-    ESP_RETURN_ON_ERROR(
-        ValidateTokenOrClear(token, "word-study-observation"),
-        kTag,
-        "validate word observation token");
-    ESP_RETURN_ON_ERROR(
-        WaitForNetworkReadyForHttps(),
-        kTag,
-        "prepare network for word observation");
+    *transport_failure = false;
+    esp_err_t result = ValidateTokenOrClear(token, operation);
+    if (result != ESP_OK) return result;
+    result = WaitForNetworkReadyForHttps();
+    if (result != ESP_OK) {
+        *transport_failure = true;
+        return result;
+    }
 
     std::string request_body;
-    ESP_RETURN_ON_ERROR(
-        protocol::word_study_v1::BuildObservationRequest(request, &request_body),
-        kTag,
-        "build word observation request");
-    const std::string url = BuildUrl("/v3/words/observations");
+    result = protocol::word_study_v1::BuildObservationRequest(request, &request_body);
+    if (result != ESP_OK) return result;
+    const std::string url = BuildUrl(path);
     int status_code = 0;
     std::string body;
-    const esp_err_t http_result = HttpRequest(
+    result = HttpRequest(
         "POST",
         url,
         &token,
@@ -2348,20 +2350,58 @@ esp_err_t SubmitWordStudyObservationV1(
         &body,
         protocol::v3::kProtocolHeader,
         &request.metadata.request_id);
-    if (http_result != ESP_OK) return http_result;
-    if (status_code == 401) return ClearTokenOnUnauthorized("word-study-observation");
+    if (result != ESP_OK) {
+        *transport_failure = true;
+        return result;
+    }
+    if (status_code == 401) return ClearTokenOnUnauthorized(operation);
     const esp_err_t parse_result = protocol::word_study_v1::ParseObservationResponse(
         body, request.metadata.request_id, observation, error);
     if (status_code != 200 || parse_result != ESP_OK) {
         ESP_LOGW(
             kTag,
-            "word observation failed: status=%d code=%s retryable=%d",
+            "%s failed: status=%d code=%s retryable=%d",
+            operation,
             status_code,
             error->code.c_str(),
             error->retryable ? 1 : 0);
         return parse_result == ESP_OK ? ESP_FAIL : parse_result;
     }
     return ESP_OK;
+}
+
+esp_err_t SubmitWordStudyObservationV1(
+    const std::string& token,
+    const protocol::word_study_v1::ObservationRequest& request,
+    protocol::word_study_v1::ObservationData* observation,
+    protocol::v3::Error* error,
+    bool* transport_failure)
+{
+    return SubmitWordStudyObservationV1AtPath(
+        token,
+        request,
+        observation,
+        error,
+        transport_failure,
+        "/v3/words/observations",
+        "word-study-observation");
+}
+
+esp_err_t SkipWordStudyObservationV1(
+    const std::string& token,
+    const protocol::word_study_v1::ObservationRequest& request,
+    protocol::word_study_v1::ObservationData* observation,
+    protocol::v3::Error* error,
+    bool* transport_failure)
+{
+    return SubmitWordStudyObservationV1AtPath(
+        token,
+        request,
+        observation,
+        error,
+        transport_failure,
+        "/v3/words/observations/skip",
+        "word-study-observation-skip");
 }
 
 esp_err_t DownloadWordPackStream(

@@ -991,7 +991,7 @@ bool TakeWordSessionStartRequest(
     }
     request->mode = state->session.requested_mode;
     request->scope = {};
-    request->optional_count = 0;
+    request->optional_count = 500;
     request->seed.clear();
     state->session.start_requested = false;
     state->session.start_result_expected = true;

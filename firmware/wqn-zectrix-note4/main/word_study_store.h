@@ -71,7 +71,7 @@ struct StoredWordSessionData {
         protocol::word_study_v1::Ordering::kSequential;
     std::string seed;
     bool include_mastered = false;
-    int optional_count = 0;
+    int optional_count = 500;
     uint64_t next_sequence = 0;
     uint64_t progress_revision = 0;
     std::vector<StoredWordDeckId, WordStorePsramAllocator<StoredWordDeckId>> deck_ids;
@@ -136,6 +136,10 @@ esp_err_t CommitWordObservation(
     const PersistedWordSession& advanced_session);
 esp_err_t PeekPendingWordObservation(DurableWordObservation* observation);
 esp_err_t AcknowledgeWordObservation(const std::string& request_id);
+// Moves one permanently rejected observation to the bounded forensic journal
+// before removing it from the upload queue. Other sessions and observations
+// remain available and no restart is required.
+esp_err_t QuarantinePendingWordObservation(const std::string& request_id);
 esp_err_t ReadWordOutboxSnapshot(WordOutboxSnapshot* snapshot);
 esp_err_t PrepareWordObservationOutboxForSleep(int64_t deadline_us);
 

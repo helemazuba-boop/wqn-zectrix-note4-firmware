@@ -458,6 +458,11 @@ void BuildV2AudioFrame(std::vector<uint8_t>* frame, const uint8_t* pcm,
 void ParseAndHandleEvent(const char* data, size_t len);
 
 constexpr uint32_t kStreamDmaFrameNum = 256;
+// The duplex stream is stereo 16-bit, so one DMA frame is four bytes.  Keep
+// this alongside the channel configuration: ResetAudioTxChannel preloads the
+// complete TX descriptor ring with silence after a barge-in/abort.
+constexpr size_t kStreamTxDmaBytes =
+    6U * static_cast<size_t>(kStreamDmaFrameNum) * sizeof(int16_t) * 2U;
 constexpr int kStreamChunkFrames = 360;    // 15 ms at 24 kHz
 constexpr int kStreamChunkBytes = kStreamChunkFrames * 2;  // 16-bit mono
 constexpr int64_t kAmpIdleTailMs = 600;    // turn amp off this long after last audio-delta write
@@ -629,6 +634,12 @@ void FlashPlaybackTask(void* /*param*/)
         // If playback was explicitly interrupted, do not leave the PA state
         // marked active while discarding the current and queued PCM.
         if (g_flash.drain_playback.load(std::memory_order_relaxed)) {
+            // A byte-mode RingBuffer item remains owned by the receiver until
+            // it is returned.  Do that before receiving any more items: the
+            // FreeRTOS ringbuffer does not permit a second receive while an
+            // item is outstanding, and doing so can stall/corrupt the drain.
+            vRingbufferReturnItem(g_flash.playback_ringbuf, item);
+            item = nullptr;
             size_t drain_size = 0;
             char* drain_item = nullptr;
             while ((drain_item = static_cast<char*>(xRingbufferReceive(
@@ -642,8 +653,6 @@ void FlashPlaybackTask(void* /*param*/)
             g_flash.playback_abort_requested = false;
             g_flash.amp_idle_armed = false;
             xSemaphoreGive(g_flash.mutex);
-            // Also discard the item we just received - it is part of the drain.
-            vRingbufferReturnItem(g_flash.playback_ringbuf, item);
             continue;
         }
 
@@ -2365,7 +2374,8 @@ void OnFlashButtonPressed()
             // ResetDecoder clearing audio_playback_queue.
             if (g_flash.stream_tx != nullptr) {
                 wqn::services::ResetAudioTxChannel(
-                    g_flash_audio_session, g_flash.stream_tx);
+                    g_flash_audio_session, g_flash.stream_tx,
+                    kStreamTxDmaBytes);
             }
             // Remote side: ask the proxy to cancel the in-progress response.
             const char* cancel = "{\"type\":\"response.cancel\"}";
@@ -2494,7 +2504,7 @@ void AbortFlashPlayback()
     SetStreamAudioAmp(false);
     if (g_flash.stream_tx != nullptr) {
         wqn::services::ResetAudioTxChannel(
-            g_flash_audio_session, g_flash.stream_tx);
+            g_flash_audio_session, g_flash.stream_tx, kStreamTxDmaBytes);
     }
     // Remote: ask the proxy to cancel the in-flight response so the server
     // stops sending more TTS audio. Without this, audio.delta frames already

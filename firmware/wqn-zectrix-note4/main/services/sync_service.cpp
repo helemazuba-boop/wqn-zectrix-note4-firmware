@@ -17,7 +17,6 @@
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_random.h"
-#include "esp_system.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -862,25 +861,29 @@ WordOutboxUploadState UploadPendingWordObservations(const std::string& token)
     constexpr size_t kMaxWordObservationsPerRound = 64;
     const uint32_t interaction_generation =
         g_word_interaction_generation.load(std::memory_order_acquire);
+    size_t processed = 0;
     size_t uploaded = 0;
-    for (; uploaded < kMaxWordObservationsPerRound;) {
+    size_t quarantined = 0;
+    for (; processed < kMaxWordObservationsPerRound;) {
         if (g_word_interaction_generation.load(std::memory_order_acquire) !=
             interaction_generation) {
             ESP_LOGI(
                 kTag,
-                "word outbox batch yielded to interaction: uploaded=%u",
-                static_cast<unsigned>(uploaded));
+                "word outbox batch yielded to interaction: uploaded=%u quarantined=%u",
+                static_cast<unsigned>(uploaded),
+                static_cast<unsigned>(quarantined));
             return WordOutboxUploadState::kYielded;
         }
         wqn::DurableWordObservation pending;
         esp_err_t result = wqn::PeekPendingWordObservation(&pending);
         if (result == ESP_ERR_NOT_FOUND) {
             ResetWordOutboxRetryBackoff();
-            if (uploaded > 0) {
+            if (processed > 0) {
                 ESP_LOGI(
                     kTag,
-                    "word outbox drained: uploaded=%u",
-                    static_cast<unsigned>(uploaded));
+                    "word outbox drained: uploaded=%u quarantined=%u",
+                    static_cast<unsigned>(uploaded),
+                    static_cast<unsigned>(quarantined));
             }
             return WordOutboxUploadState::kDrained;
         }
@@ -910,9 +913,74 @@ WordOutboxUploadState UploadPendingWordObservations(const std::string& token)
         request.occurred_at = pending.occurred_at;
         wqn::protocol::word_study_v1::ObservationData response;
         wqn::protocol::v3::Error word_error;
+        bool transport_failure = false;
         result = wqn::SubmitWordStudyObservationV1(
-            token, request, &response, &word_error);
+            token, request, &response, &word_error, &transport_failure);
         if (result != ESP_OK) {
+            if (!transport_failure && !word_error.retryable) {
+                ESP_LOGW(
+                    kTag,
+                    "terminal word observation rejected; advancing sequence before quarantine: request=%s sequence=%llu code=%s",
+                    pending.request_id.c_str(),
+                    static_cast<unsigned long long>(pending.sequence),
+                    word_error.code.c_str());
+
+                // A local quarantine removes the record from the device, but
+                // the server's monotonic next_sequence must advance too.
+                // Otherwise the following record is rejected forever with
+                // STUDY_SEQUENCE_GAP. The skip endpoint writes a durable,
+                // non-projecting tombstone for this sequence.
+                wqn::protocol::word_study_v1::ObservationData skip_response;
+                wqn::protocol::v3::Error skip_error;
+                bool skip_transport_failure = false;
+                const esp_err_t skip_result =
+                    wqn::SkipWordStudyObservationV1(
+                        token,
+                        request,
+                        &skip_response,
+                        &skip_error,
+                        &skip_transport_failure);
+                const bool sequence_consumed =
+                    skip_result == ESP_OK ||
+                    skip_error.code == "SEQUENCE_ALREADY_APPLIED" ||
+                    skip_error.code == "SESSION_NOT_ACTIVE";
+                if (!sequence_consumed) {
+                    ESP_LOGW(
+                        kTag,
+                        "word observation skip deferred: request=%s sequence=%llu code=%s error=%s",
+                        pending.request_id.c_str(),
+                        static_cast<unsigned long long>(pending.sequence),
+                        skip_error.code.empty() ? "TRANSPORT" : skip_error.code.c_str(),
+                        esp_err_to_name(skip_result));
+                    if (skip_transport_failure || skip_error.retryable ||
+                        skip_error.code == "SEQUENCE_GAP") {
+                        ScheduleWordOutboxRetry(
+                            pending.request_id,
+                            skip_error.retryable ? skip_error.retry_after_ms : 0);
+                        return WordOutboxUploadState::kPending;
+                    }
+                    ESP_LOGE(
+                        kTag,
+                        "word observation skip failed terminally; leaving head for inspection: request=%s code=%s",
+                        pending.request_id.c_str(),
+                        skip_error.code.c_str());
+                    return WordOutboxUploadState::kFailed;
+                }
+                const esp_err_t quarantine_result =
+                    wqn::QuarantinePendingWordObservation(pending.request_id);
+                ResetWordOutboxRetryBackoff();
+                if (quarantine_result != ESP_OK) {
+                    ESP_LOGE(
+                        kTag,
+                        "word observation quarantine failed: request=%s error=%s",
+                        pending.request_id.c_str(),
+                        esp_err_to_name(quarantine_result));
+                    return WordOutboxUploadState::kFailed;
+                }
+                ++processed;
+                ++quarantined;
+                continue;
+            }
             ESP_LOGW(
                 kTag,
                 "word outbox upload deferred: request=%s sequence=%llu code=%s error=%s",
@@ -936,17 +1004,19 @@ WordOutboxUploadState UploadPendingWordObservations(const std::string& token)
             return WordOutboxUploadState::kPending;
         }
         ResetWordOutboxRetryBackoff();
+        ++processed;
         ++uploaded;
     }
 
     wqn::DurableWordObservation remaining;
     const esp_err_t remaining_result =
         wqn::PeekPendingWordObservation(&remaining);
-    if (uploaded > 0) {
+    if (processed > 0) {
         ESP_LOGI(
             kTag,
-            "word outbox batch uploaded: uploaded=%u pending=%d",
+            "word outbox batch complete: uploaded=%u quarantined=%u pending=%d",
             static_cast<unsigned>(uploaded),
+            static_cast<unsigned>(quarantined),
             remaining_result == ESP_OK ? 1 : 0);
     }
     if (remaining_result == ESP_ERR_NOT_FOUND) {

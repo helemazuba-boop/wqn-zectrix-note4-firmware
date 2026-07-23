@@ -109,6 +109,25 @@ bool FileExists(const std::string& path)
     return stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode);
 }
 
+void ReleaseWordPackIndexAllocations(wqn::WordPackIndex* index)
+{
+    if (index == nullptr) return;
+    // swap with empty vectors so the PSRAM allocator releases capacity even
+    // when index construction exits with pack_error.  Clearing alone keeps
+    // capacity attached to the global index and makes every retry start with
+    // less memory than the previous attempt.
+    std::vector<
+        wqn::WordPackIndexEntry,
+        wqn::PsramAllocator<wqn::WordPackIndexEntry>> empty_entries;
+    index->entries.swap(empty_entries);
+    std::vector<uint32_t, wqn::PsramAllocator<uint32_t>> empty_dictionary;
+    index->dictionary_order.swap(empty_dictionary);
+    std::vector<
+        wqn::WordPackIdentity,
+        wqn::PsramAllocator<wqn::WordPackIdentity>> empty_identities;
+    index->pack_identities.swap(empty_identities);
+}
+
 esp_err_t ReadBoundedPackLine(FILE* file, std::vector<char>* buffer, std::string* line)
 {
     if (file == nullptr || buffer == nullptr || line == nullptr ||
@@ -935,6 +954,7 @@ esp_err_t LoadWordPackIndexInternal(
         if (item.deck_id.size() != 36 || item.sha256.size() != 64) {
             index->pack_error = true;
             index->status_message = "词库清单无效";
+            ReleaseWordPackIndexAllocations(index);
             return ESP_OK;
         }
         WordPackIdentity identity;
@@ -958,28 +978,63 @@ esp_err_t LoadWordPackIndexInternal(
         if (item.entry_count > kMaxIndexEntries - expected_entries) {
             index->pack_error = true;
             index->status_message = "词库条目过多";
+            ReleaseWordPackIndexAllocations(index);
             return ESP_OK;
         }
         expected_entries += item.entry_count;
     }
-    const size_t required_psram =
-        expected_entries * sizeof(WordPackIndexEntry) +
+    const size_t entry_index_bytes =
+        expected_entries * sizeof(WordPackIndexEntry);
+    const size_t dictionary_index_bytes =
         expected_entries * sizeof(uint32_t);
+    const size_t required_psram = entry_index_bytes + dictionary_index_bytes;
     constexpr size_t kIndexAllocationReserveBytes = 64U * 1024U;
     const size_t free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    const size_t largest_psram =
+        heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
     if (required_psram > free_psram ||
-        free_psram - required_psram < kIndexAllocationReserveBytes) {
+        free_psram - required_psram < kIndexAllocationReserveBytes ||
+        entry_index_bytes > largest_psram) {
         index->pack_error = true;
         index->status_message = "词库索引内存不足";
         ESP_LOGW(
             kTag,
-            "word pack index PSRAM preflight failed: need=%u free=%u reserve=%u",
+            "word pack index PSRAM preflight failed: need=%u entries=%u dictionary=%u free=%u largest=%u reserve=%u",
             static_cast<unsigned>(required_psram),
+            static_cast<unsigned>(entry_index_bytes),
+            static_cast<unsigned>(dictionary_index_bytes),
             static_cast<unsigned>(free_psram),
+            static_cast<unsigned>(largest_psram),
             static_cast<unsigned>(kIndexAllocationReserveBytes));
+        ReleaseWordPackIndexAllocations(index);
         return ESP_OK;
     }
     index->entries.reserve(expected_entries);
+
+    // The entries allocation can split the largest free block. Re-check the
+    // exact second allocation instead of assuming that the remaining total is
+    // contiguous. WordStorePsramAllocator deliberately aborts on allocation
+    // failure, so this guard must run immediately before reserve().
+    const size_t remaining_psram =
+        heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    const size_t remaining_largest_psram =
+        heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
+    if (dictionary_index_bytes > remaining_largest_psram ||
+        dictionary_index_bytes > remaining_psram ||
+        remaining_psram - dictionary_index_bytes <
+            kIndexAllocationReserveBytes) {
+        index->pack_error = true;
+        index->status_message = "词库索引内存不足";
+        ESP_LOGW(
+            kTag,
+            "word pack dictionary PSRAM preflight failed: need=%u free=%u largest=%u reserve=%u",
+            static_cast<unsigned>(dictionary_index_bytes),
+            static_cast<unsigned>(remaining_psram),
+            static_cast<unsigned>(remaining_largest_psram),
+            static_cast<unsigned>(kIndexAllocationReserveBytes));
+        ReleaseWordPackIndexAllocations(index);
+        return ESP_OK;
+    }
     index->dictionary_order.reserve(expected_entries);
 
     for (const WqnWordPackManifestItem& item : manifest.packs) {

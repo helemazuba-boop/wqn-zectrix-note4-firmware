@@ -259,7 +259,14 @@ esp_err_t SubmitWordStudyObservationV1(
     const std::string& token,
     const protocol::word_study_v1::ObservationRequest& request,
     protocol::word_study_v1::ObservationData* observation,
-    protocol::v3::Error* error);
+    protocol::v3::Error* error,
+    bool* transport_failure);
+esp_err_t SkipWordStudyObservationV1(
+    const std::string& token,
+    const protocol::word_study_v1::ObservationRequest& request,
+    protocol::word_study_v1::ObservationData* observation,
+    protocol::v3::Error* error,
+    bool* transport_failure);
 using WqnHttpChunkSink = esp_err_t (*)(
     void* context,
     const uint8_t* bytes,

@@ -94,6 +94,9 @@ std::string AiPagedTextSource(const wqn::AiSessionState& ai)
     if (!ai.pending_text.empty()) {
         return ai.pending_text;
     }
+    if (ai.status == wqn::AiSessionStatus::kPreparingCapture) {
+        return "正在准备录音...";
+    }
     if (ai.status == wqn::AiSessionStatus::kListening) {
         return "正在录音，松手后上传识别。";
     }
@@ -656,6 +659,7 @@ void HandleUiInput(UiState* state, UiInput input)
                 break;
             } else if (state->screen == UiScreen::kAi) {
                 if (state->ai.status != AiSessionStatus::kListening &&
+                    state->ai.status != AiSessionStatus::kPreparingCapture &&
                     state->ai.status != AiSessionStatus::kWaitingReply) {
 #if CONFIG_WQN_AI_ENABLE
                     // [ptt-fix] Flash tier uses instant kPress/kRelease events
