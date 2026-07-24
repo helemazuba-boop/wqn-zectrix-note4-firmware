@@ -106,6 +106,9 @@ struct NoteAppSnapshot {
     std::vector<NoteTitleRow> titles;
     std::string note_title;
     std::string note_body;
+    // Identity of the currently-open note; the render layer keys its wrapped-line
+    // cache on this so scrolling does not re-wrap the body every frame.
+    std::string note_id;
     std::string status_line;
     std::string hint;
 };

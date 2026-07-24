@@ -107,6 +107,9 @@ struct NotePackIndex {
     uint64_t manifest_revision = 0;
     std::vector<NotePackNotebook> notebooks;
     std::vector<NotePackIndexEntry, NotePsramAllocator<NotePackIndexEntry>> entries;
+    // Indices into `entries` sorted by note_id (a globally-unique UUID) so a
+    // note lookup is O(log N). `entries` itself stays in display order.
+    std::vector<uint32_t, NotePsramAllocator<uint32_t>> note_order;
     std::vector<NotePackIdentity, NotePsramAllocator<NotePackIdentity>> pack_identities;
 };
 

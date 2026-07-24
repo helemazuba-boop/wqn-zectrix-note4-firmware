@@ -38,16 +38,21 @@ const wqn::NotePackIndexEntry* FindPackEntry(
     const std::string& notebook_id,
     const std::string& note_id)
 {
-    const size_t row = FindNotebookRow(state, notebook_id);
-    if (row == static_cast<size_t>(-1)) return nullptr;
-    const wqn::NotePackNotebook& notebook = state.pack_index.notebooks[row];
-    const size_t end = std::min(
-        notebook.entry_begin + notebook.entry_count, state.pack_index.entries.size());
-    for (size_t index = notebook.entry_begin; index < end; ++index) {
-        const wqn::NotePackIndexEntry& entry = state.pack_index.entries[index];
-        if (note_id == entry.note_id) return &entry;
-    }
-    return nullptr;
+    // note_order indexes entries sorted by note_id (a globally-unique UUID), so
+    // this is O(log N) instead of scanning the notebook's entries per lookup --
+    // BuildNoteAppSnapshot calls it once per candidate item.
+    const auto& index = state.pack_index;
+    const auto it = std::lower_bound(
+        index.note_order.begin(), index.note_order.end(), note_id,
+        [&index](uint32_t entry_index, const std::string& target) {
+            return std::strcmp(index.entries[entry_index].note_id, target.c_str()) < 0;
+        });
+    if (it == index.note_order.end()) return nullptr;
+    const wqn::NotePackIndexEntry& entry = index.entries[*it];
+    if (note_id != entry.note_id) return nullptr;
+    // note_id is unique; guard only against a caller passing a mismatched pair.
+    if (!notebook_id.empty() && notebook_id != entry.notebook_id) return nullptr;
+    return &entry;
 }
 
 // Best-effort body load for the selected title. Only touches storage when a
@@ -637,6 +642,7 @@ NoteAppSnapshot BuildNoteAppSnapshot(const NoteAppState& state)
         snapshot.has_body = state.current_note_loaded;
         snapshot.note_title = state.current_note.title;
         snapshot.note_body = state.current_note.content;
+        snapshot.note_id = state.current_note.note_id;
     }
     snapshot.status_line = NoteAppStatusLine(state);
     switch (state.mode) {

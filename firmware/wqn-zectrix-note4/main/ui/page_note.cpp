@@ -120,8 +120,16 @@ esp_err_t RenderNoteBody(const wqn::NoteAppSnapshot& note)
     }
     const int body_top = kContentTop + 24;
     const int visible = std::max(1, (kBodyBottom - body_top) / kBodyLineH);
-    const std::vector<std::string> lines =
-        wqn::WrapUtf8TextToWidth(note.note_body, kContentW - 14, 4096);
+    // Wrap the body once per opened note. Re-running WrapUtf8TextToWidth over a
+    // body of up to 16 KB on every frame pegged the CPU while scrolling; cache the
+    // wrapped lines keyed by note_id so scrolling only re-reads them.
+    static std::string s_wrapped_note_id;
+    static std::vector<std::string> s_wrapped_lines;
+    if (note.note_id != s_wrapped_note_id) {
+        s_wrapped_lines = wqn::WrapUtf8TextToWidth(note.note_body, kContentW - 14, 4096);
+        s_wrapped_note_id = note.note_id;
+    }
+    const std::vector<std::string>& lines = s_wrapped_lines;
     const int total = static_cast<int>(lines.size());
     const int max_top = total > visible ? total - visible : 0;
     int top = static_cast<int>(note.note_scroll_offset_lines);

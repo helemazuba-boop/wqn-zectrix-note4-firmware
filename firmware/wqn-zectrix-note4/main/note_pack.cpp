@@ -125,6 +125,8 @@ void ReleaseNotePackIndexAllocations(wqn::NotePackIndex* index)
         wqn::NotePackIndexEntry,
         wqn::NotePsramAllocator<wqn::NotePackIndexEntry>> empty_entries;
     index->entries.swap(empty_entries);
+    std::vector<uint32_t, wqn::NotePsramAllocator<uint32_t>> empty_order;
+    index->note_order.swap(empty_order);
     std::vector<
         wqn::NotePackIdentity,
         wqn::NotePsramAllocator<wqn::NotePackIdentity>> empty_identities;
@@ -1025,6 +1027,19 @@ esp_err_t LoadNotePackIndex(NotePackIndex* index)
         }
         index->notebooks.push_back(std::move(notebook));
     }
+
+    // Build the note_id-sorted lookup once, after every notebook is scanned.
+    // entries stay in display order; note_order holds indices sorted by note_id
+    // so FindPackEntry can binary-search instead of scanning O(N) per lookup.
+    index->note_order.reserve(index->entries.size());
+    for (size_t i = 0; i < index->entries.size(); ++i) {
+        index->note_order.push_back(static_cast<uint32_t>(i));
+    }
+    std::sort(
+        index->note_order.begin(), index->note_order.end(),
+        [&index](uint32_t a, uint32_t b) {
+            return std::strcmp(index->entries[a].note_id, index->entries[b].note_id) < 0;
+        });
 
     if (index->notebooks.empty() && index->status_message.empty()) {
         index->status_message = "暂无笔记本";
