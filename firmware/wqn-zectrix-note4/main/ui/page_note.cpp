@@ -18,7 +18,7 @@ constexpr int kNoteMarginX = 8;
 constexpr int kContentW = wqn::kEpdWidth - 2 * kNoteMarginX;
 constexpr int kHeaderY = 38;
 constexpr int kDividerY = 58;
-constexpr int kContentTop = 66;
+constexpr int kContentTop = 32;
 constexpr int kHintY = wqn::kEpdHeight - 16;
 constexpr int kListRowH = 30;
 constexpr int kBodyLineH = 20;
@@ -114,11 +114,8 @@ esp_err_t RenderNoteBody(const wqn::NoteAppSnapshot& note)
     if (!note.has_body) {
         return DrawCenteredText(kNoteMarginX, 160, kContentW, "内容未同步，请稍后再试");
     }
-    if (!note.note_title.empty()) {
-        ESP_RETURN_ON_ERROR(
-            DrawClippedText(kNoteMarginX, kContentTop, kContentW, note.note_title), kTag, "note body title");
-    }
-    const int body_top = kContentTop + 24;
+    // The note title now lives in the status bar, so the body uses full height.
+    const int body_top = kContentTop;
     const int visible = std::max(1, (kBodyBottom - body_top) / kBodyLineH);
     // Wrap the body once per opened note. Re-running WrapUtf8TextToWidth over a
     // body of up to 16 KB on every frame pegged the CPU while scrolling; cache the
@@ -158,17 +155,23 @@ esp_err_t RenderNoteToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
 {
     const wqn::NoteAppSnapshot& note = frame.note_app;
     wqn::ClearEpdFramebuffer(true);
-    DrawStatusBar("笔记", frame.home);
 
-    std::string header = note.status_line;
+    // The status-bar title carries the page context (priority: note title >
+    // notebook name > "笔记"), so there is no separate header row. Truncate to the
+    // left half of the bar -- DrawStatusBar draws the clock/battery on the right
+    // without clipping the title, so an untrimmed title would overrun them.
+    std::string bar_title = "笔记";
     if ((note.mode == wqn::NoteAppMode::kNoteList ||
          note.mode == wqn::NoteAppMode::kNoteView) &&
         !note.notebook_title.empty()) {
-        header = note.notebook_title;
+        bar_title = note.notebook_title;
     }
-    ESP_RETURN_ON_ERROR(
-        DrawClippedText(kNoteMarginX, kHeaderY, kContentW, header), kTag, "draw note header");
-    DrawHorizontalLine(kNoteMarginX, kDividerY, kContentW);
+    if (note.mode == wqn::NoteAppMode::kNoteView && !note.note_title.empty()) {
+        bar_title = note.note_title;
+    }
+    const auto bar_lines = wqn::WrapUtf8TextToWidth(bar_title, wqn::kEpdWidth / 2, 1);
+    DrawStatusBar(
+        bar_lines.empty() ? bar_title.c_str() : bar_lines.front().c_str(), frame.home);
 
     switch (note.mode) {
         case wqn::NoteAppMode::kNotebookList:

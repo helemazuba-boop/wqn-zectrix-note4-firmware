@@ -266,11 +266,12 @@ void HandleNoteViewInput(wqn::NoteAppState* state, wqn::NoteInput input)
         }
         case wqn::NoteInput::kDown:
         case wqn::NoteInput::kConfirm: {
-            // Scroll a fixed 4 lines, clamped to the last page (RenderNoteBody
-            // shows 9 body lines) so over-scroll can't inflate the offset and
-            // leave Up-scroll with nothing to repaint.
+            // Scroll a fixed 4 lines, clamped to the last page. RenderNoteBody
+            // now shows 12 body lines (kContentTop=32, no in-body title), so the
+            // max useful offset is total_lines - 12; this keeps over-scroll from
+            // inflating the offset and leaving Up-scroll with nothing to repaint.
             constexpr uint32_t kNoteBodyScrollStep = 4;
-            constexpr uint32_t kNoteBodyVisibleLines = 9;
+            constexpr uint32_t kNoteBodyVisibleLines = 12;
             const uint32_t max_scroll =
                 state->note_body_total_lines > kNoteBodyVisibleLines
                     ? state->note_body_total_lines - kNoteBodyVisibleLines
