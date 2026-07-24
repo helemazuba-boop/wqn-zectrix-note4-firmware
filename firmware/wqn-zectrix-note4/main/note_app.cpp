@@ -256,23 +256,31 @@ void HandleNoteListInput(wqn::NoteAppState* state, wqn::NoteInput input)
 void HandleNoteViewInput(wqn::NoteAppState* state, wqn::NoteInput input)
 {
     switch (input) {
-        case wqn::NoteInput::kUp:
-            if (state->note_scroll_offset_lines > 0) --state->note_scroll_offset_lines;
+        case wqn::NoteInput::kUp: {
+            // Page-step (keep 1 line of overlap) so reading a long note needs far
+            // fewer of the ~1.3s full refreshes than line-by-line scrolling.
+            constexpr uint32_t kNoteBodyScrollStep = 8;  // kNoteBodyVisibleLines - 1
+            state->note_scroll_offset_lines =
+                state->note_scroll_offset_lines > kNoteBodyScrollStep
+                    ? state->note_scroll_offset_lines - kNoteBodyScrollStep
+                    : 0;
             break;
+        }
         case wqn::NoteInput::kDown:
         case wqn::NoteInput::kConfirm: {
-            // Clamp to the last page. RenderNoteBody shows 9 body lines (must
-            // match ui/page_note.cpp), so the max useful offset is
-            // total_lines - 9. Without this, over-scrolling inflated the offset
-            // and Up-scroll then had nothing new to repaint (looked frozen).
+            // Page-step down, clamped to the last page. RenderNoteBody shows 9
+            // body lines (must match ui/page_note.cpp); paging (step = 9 - 1)
+            // keeps 1 line of overlap and minimizes slow full refreshes. Clamping
+            // to total_lines - 9 stops over-scroll from inflating the offset
+            // (which left Up-scroll with nothing new to repaint -> looked frozen).
             constexpr uint32_t kNoteBodyVisibleLines = 9;
+            constexpr uint32_t kNoteBodyScrollStep = kNoteBodyVisibleLines - 1;
             const uint32_t max_scroll =
                 state->note_body_total_lines > kNoteBodyVisibleLines
                     ? state->note_body_total_lines - kNoteBodyVisibleLines
                     : 0;
-            if (state->note_scroll_offset_lines < max_scroll) {
-                ++state->note_scroll_offset_lines;
-            }
+            state->note_scroll_offset_lines = std::min<uint32_t>(
+                state->note_scroll_offset_lines + kNoteBodyScrollStep, max_scroll);
             break;
         }
         case wqn::NoteInput::kLongConfirm:
