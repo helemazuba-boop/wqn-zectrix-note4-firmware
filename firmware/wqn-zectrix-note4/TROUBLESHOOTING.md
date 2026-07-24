@@ -128,6 +128,28 @@ gate enforces this.
   the storage queue and can block the UI thread. Moving that blocking I/O off the
   UI thread is a planned unified async pass, not yet done.
 
+## Note `opened` not syncing (last-viewed / recommendation stale)
+
+- Opening a note from the title list writes one durable `opened` observation to
+  the note outbox, then triggers `RequestNoteOutboxUpload()`. Uploads coalesce
+  behind the same 5s quiet-window timer as word and ride the shared outbox-only
+  round; opening a note must never launch the full control/problem/content sync.
+- Device v1 emits only `opened` (no read_completed / known-unknown). Any other
+  note action reaching the server is a regression.
+- Log owners: a successful round logs `note outbox drained` / `note outbox batch
+  complete`; a deferral logs `note outbox upload deferred` with the server code.
+- A terminal (non-retryable) rejection is skipped-then-quarantined: the device
+  POSTs `/v3/notes/observations/skip` first so the server's monotonic
+  next_sequence advances, then drops the poison head locally. Without the skip the
+  next record would be rejected forever with `STUDY_SEQUENCE_GAP`.
+- Note and word keep independent retry cursors, so a stuck note head never defers
+  word uploads (and vice versa). `opened` is durable on flash, so it survives
+  disconnect / reboot / sleep and uploads on the next quiet round.
+- If `last_opened_at` / “上次看过” never updates from device use, confirm the session
+  is valid (a server-invalid session is discarded by the circuit-breaker; the
+  observation uploads once a fresh session exists) and that
+  `/v3/notes/observations` returns 200.
+
 ## Useful local checks
 
 ```bash
