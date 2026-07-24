@@ -806,14 +806,12 @@ RefreshSchedule ApplyButtonEvent(
             }
         }
         BuildHomeSummary(state);
-        // Mode transition (notebook<->title<->body) OR any update while reading a
-        // note body: force a full refresh. The body view scrolls a large text
-        // region; a partial waveform leaves stale pixels when reversing scroll
-        // direction (the same bug the AI page hit -> AI forces full) and also
-        // accumulates ghosting. Full refresh clears the panel. List navigation
-        // keeps the fast partial path.
-        if (state->note_app.mode != old_note_mode ||
-            state->note_app.mode == wqn::NoteAppMode::kNoteView) {
+        // A note mode transition (notebook<->title<->body) repaints most of the
+        // screen; do a full refresh so the panel is cleared (large partial
+        // waveforms ghost). Same-mode navigation -- including body scroll -- uses
+        // the fast partial path; body over-scroll is bounded by the reducer clamp
+        // so reverse-scroll always reveals new content.
+        if (state->note_app.mode != old_note_mode) {
             return RefreshSchedule::kCommit;
         }
         return RefreshSchedule::kSelection;

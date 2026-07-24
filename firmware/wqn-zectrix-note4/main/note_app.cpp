@@ -257,9 +257,7 @@ void HandleNoteViewInput(wqn::NoteAppState* state, wqn::NoteInput input)
 {
     switch (input) {
         case wqn::NoteInput::kUp: {
-            // Page-step (keep 1 line of overlap) so reading a long note needs far
-            // fewer of the ~1.3s full refreshes than line-by-line scrolling.
-            constexpr uint32_t kNoteBodyScrollStep = 8;  // kNoteBodyVisibleLines - 1
+            constexpr uint32_t kNoteBodyScrollStep = 4;
             state->note_scroll_offset_lines =
                 state->note_scroll_offset_lines > kNoteBodyScrollStep
                     ? state->note_scroll_offset_lines - kNoteBodyScrollStep
@@ -268,13 +266,11 @@ void HandleNoteViewInput(wqn::NoteAppState* state, wqn::NoteInput input)
         }
         case wqn::NoteInput::kDown:
         case wqn::NoteInput::kConfirm: {
-            // Page-step down, clamped to the last page. RenderNoteBody shows 9
-            // body lines (must match ui/page_note.cpp); paging (step = 9 - 1)
-            // keeps 1 line of overlap and minimizes slow full refreshes. Clamping
-            // to total_lines - 9 stops over-scroll from inflating the offset
-            // (which left Up-scroll with nothing new to repaint -> looked frozen).
+            // Scroll a fixed 4 lines, clamped to the last page (RenderNoteBody
+            // shows 9 body lines) so over-scroll can't inflate the offset and
+            // leave Up-scroll with nothing to repaint.
+            constexpr uint32_t kNoteBodyScrollStep = 4;
             constexpr uint32_t kNoteBodyVisibleLines = 9;
-            constexpr uint32_t kNoteBodyScrollStep = kNoteBodyVisibleLines - 1;
             const uint32_t max_scroll =
                 state->note_body_total_lines > kNoteBodyVisibleLines
                     ? state->note_body_total_lines - kNoteBodyVisibleLines
