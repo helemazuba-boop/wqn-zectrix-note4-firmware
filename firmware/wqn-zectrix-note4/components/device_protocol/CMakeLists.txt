@@ -3,6 +3,7 @@ idf_component_register(
         "claim_crypto.cpp"
         "v3.cpp"
         "word_study.cpp"
+        "note_study.cpp"
     INCLUDE_DIRS "include"
     REQUIRES
         esp_system
@@ -50,4 +51,25 @@ endif()
 target_compile_definitions(
     ${COMPONENT_LIB}
     PUBLIC WQN_WORD_STUDY_SCHEMA_SHA256="${WQN_WORD_STUDY_SCHEMA_SHA256}"
+)
+
+set(WQN_NOTE_STUDY_CONTRACT_DIR
+    "${CMAKE_CURRENT_LIST_DIR}/../../contracts/note-study-v1")
+set(WQN_NOTE_STUDY_SCHEMA
+    "${WQN_NOTE_STUDY_CONTRACT_DIR}/note-study-v1.schema.json")
+set(WQN_NOTE_STUDY_MANIFEST
+    "${WQN_NOTE_STUDY_CONTRACT_DIR}/manifest.json")
+file(SHA256 "${WQN_NOTE_STUDY_SCHEMA}" WQN_NOTE_STUDY_SCHEMA_SHA256)
+file(READ "${WQN_NOTE_STUDY_MANIFEST}" WQN_NOTE_STUDY_MANIFEST_JSON)
+string(JSON WQN_NOTE_STUDY_MANIFEST_SHA256
+    GET "${WQN_NOTE_STUDY_MANIFEST_JSON}" schema_sha256)
+if(NOT WQN_NOTE_STUDY_SCHEMA_SHA256 STREQUAL WQN_NOTE_STUDY_MANIFEST_SHA256)
+    message(FATAL_ERROR
+        "note-study-v1 schema hash mismatch: actual=${WQN_NOTE_STUDY_SCHEMA_SHA256} "
+        "manifest=${WQN_NOTE_STUDY_MANIFEST_SHA256}")
+endif()
+
+target_compile_definitions(
+    ${COMPONENT_LIB}
+    PUBLIC WQN_NOTE_STUDY_SCHEMA_SHA256="${WQN_NOTE_STUDY_SCHEMA_SHA256}"
 )
