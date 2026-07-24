@@ -891,14 +891,17 @@ esp_err_t CommitObservationTransaction(void* opaque)
     ESP_RETURN_ON_ERROR(AppendOutboxRecord(record), kTag, "append note observation");
     scan->pending.push_back(record);
     ++scan->total_records;
-    // The advanced session cursor is reconstructable from the durable record on
-    // the next load, so a session rewrite here is optional (and skipped to keep
-    // opening a note fast). SaveSessionRaw is still done for prompt resume.
     ESP_LOGI(
         kTag,
         "note observation durable: sequence=%llu",
         static_cast<unsigned long long>(observation.sequence));
-    return SaveSessionRaw(session);
+    // The durable record carries next_sequence and next_position, so
+    // LoadSessionTransaction and sleep checkpointing reconstruct the advanced
+    // cursor via ReconcileSession. Rewriting and fsyncing the full session
+    // snapshot here added ~2 s to every note open on SPIFFS (owner
+    // note-observation-commit) without improving power-loss safety, so the
+    // fresh-append path skips it -- mirroring the word observation commit.
+    return ESP_OK;
 }
 
 esp_err_t PeekObservationTransaction(void* context)
