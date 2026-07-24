@@ -143,6 +143,32 @@ struct WqnWordPackManifest {
     std::vector<WqnWordPackManifestItem> packs;
 };
 
+// One notebook row of the note-study manifest. A pack is exactly one notebook's
+// note set, so pack_id equals notebook_id. `has_pack` is false when the server
+// returned a null pack (a notebook with no note content yet); `deleted` only
+// appears in manifest deltas and is resolved away when the aggregate is merged.
+struct WqnNotePackManifestNotebook {
+    std::string notebook_id;
+    std::string title;
+    uint64_t change_sequence = 0;
+    uint64_t content_revision = 0;
+    bool deleted = false;
+    bool has_pack = false;
+    std::string pack_id;
+    uint64_t pack_revision = 0;
+    uint32_t schema_version = 0;
+    uint32_t entry_count = 0;
+    uint32_t byte_size = 0;
+    std::string sha256;
+    std::string download_url;
+};
+
+struct WqnNotePackManifest {
+    uint64_t cursor = 0;
+    bool has_more = false;
+    std::vector<WqnNotePackManifestNotebook> notebooks;
+};
+
 struct WqnWordAiLookupRequest {
     std::string query;
     std::string prefix;
@@ -275,6 +301,22 @@ esp_err_t DownloadWordPackStream(
     const std::string& token,
     const protocol::v3::RequestMetadata& metadata,
     const WqnWordPackManifestItem& item,
+    WqnHttpChunkSink sink,
+    void* context);
+// Fetches one page of the note-study manifest starting at `cursor`. Reuses the
+// note-study-v1 protocol builder/parser and flattens the result into the
+// storage-facing WqnNotePackManifest.
+esp_err_t FetchNoteStudyManifest(
+    const std::string& token,
+    const protocol::v3::RequestMetadata& metadata,
+    uint64_t cursor,
+    WqnNotePackManifest* manifest);
+// Streams one notebook's note pack (application/x-ndjson) into `sink`. Bounded by
+// the manifest byte_size and the note-study-v1 pack cap.
+esp_err_t DownloadNotePackStream(
+    const std::string& token,
+    const protocol::v3::RequestMetadata& metadata,
+    const WqnNotePackManifestNotebook& notebook,
     WqnHttpChunkSink sink,
     void* context);
 esp_err_t LookupWordWithAi(const std::string& token, const WqnWordAiLookupRequest& request, WqnWordAiLookupResult* result);

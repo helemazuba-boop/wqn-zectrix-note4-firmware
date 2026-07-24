@@ -14,6 +14,7 @@
 
 #include "cJSON.h"
 #include "config.h"
+#include "device_protocol/note_study.h"
 #include "device_protocol/word_study.h"
 #include "esp_check.h"
 #include "esp_crt_bundle.h"
@@ -2518,6 +2519,218 @@ esp_err_t DownloadWordPackStream(
         ESP_LOGW(
             kTag,
             "word-pack-download failed: %s url=%s received=%u",
+            esp_err_to_name(result),
+            url.c_str(),
+            static_cast<unsigned>(received));
+    }
+    return result;
+}
+
+esp_err_t FetchNoteStudyManifest(
+    const std::string& token,
+    const protocol::v3::RequestMetadata& metadata,
+    uint64_t cursor,
+    WqnNotePackManifest* manifest)
+{
+    if (manifest == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *manifest = WqnNotePackManifest{};
+    if (token.empty()) {
+        return ESP_OK;
+    }
+    const esp_err_t token_result = ValidateTokenOrClear(token, "note-pack-manifest");
+    if (token_result != ESP_OK) {
+        return token_result;
+    }
+
+    ESP_RETURN_ON_ERROR(WaitForNetworkReadyForHttps(), kTag, "prepare network for note-pack-manifest");
+
+    std::string request_body;
+    ESP_RETURN_ON_ERROR(
+        protocol::note_study_v1::BuildManifestRequest(
+            metadata, cursor, 100, &request_body),
+        kTag,
+        "build note-study manifest request");
+    const std::string url = BuildUrl("/v3/notes/manifest");
+    int status_code = 0;
+    std::string body;
+    esp_err_t http_result = HttpRequest(
+        "POST",
+        url,
+        &token,
+        &request_body,
+        &status_code,
+        &body,
+        protocol::v3::kProtocolHeader,
+        &metadata.request_id);
+    if (http_result != ESP_OK) {
+        ESP_LOGW(kTag, "note-pack-manifest failed: %s", esp_err_to_name(http_result));
+        return http_result;
+    }
+    if (status_code == 401) {
+        return ClearTokenOnUnauthorized("note-pack-manifest");
+    }
+    protocol::note_study_v1::ManifestData data;
+    protocol::v3::Error error;
+    const esp_err_t parse_result = protocol::note_study_v1::ParseManifestResponse(
+        body, metadata.request_id, &data, &error);
+    if (status_code != 200 || parse_result != ESP_OK) {
+        ESP_LOGW(
+            kTag,
+            "note-study manifest failed: status=%d code=%s retryable=%d",
+            status_code,
+            error.code.c_str(),
+            error.retryable ? 1 : 0);
+        return parse_result == ESP_OK ? ESP_FAIL : parse_result;
+    }
+
+    manifest->cursor = data.cursor;
+    manifest->has_more = data.has_more;
+    manifest->notebooks.reserve(data.notebooks.size());
+    for (const protocol::note_study_v1::ManifestNotebook& source : data.notebooks) {
+        WqnNotePackManifestNotebook notebook;
+        notebook.notebook_id = source.notebook_id;
+        notebook.title = source.title;
+        notebook.change_sequence = source.change_sequence;
+        notebook.content_revision = source.content_revision;
+        notebook.deleted = source.deleted;
+        if (!source.deleted && source.has_pack) {
+            notebook.has_pack = true;
+            notebook.pack_id = source.pack.pack_id;
+            notebook.pack_revision = source.pack.pack_revision;
+            notebook.schema_version = source.pack.schema_version;
+            notebook.entry_count = source.pack.entry_count;
+            notebook.byte_size = source.pack.byte_size;
+            notebook.sha256 = source.pack.sha256;
+            notebook.download_url = source.pack.download_url;
+        }
+        manifest->notebooks.push_back(std::move(notebook));
+    }
+    ESP_LOGI(
+        kTag,
+        "note-study manifest ok: cursor=%llu changes=%u has_more=%d",
+        static_cast<unsigned long long>(manifest->cursor),
+        static_cast<unsigned>(manifest->notebooks.size()),
+        manifest->has_more ? 1 : 0);
+    return ESP_OK;
+}
+
+esp_err_t DownloadNotePackStream(
+    const std::string& token,
+    const protocol::v3::RequestMetadata& metadata,
+    const WqnNotePackManifestNotebook& notebook,
+    WqnHttpChunkSink sink,
+    void* context)
+{
+    if (sink == nullptr || metadata.request_id.empty() ||
+        notebook.download_url.empty() || notebook.byte_size == 0 ||
+        notebook.byte_size > protocol::note_study_v1::kMaxPackBytes) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (token.empty()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    const esp_err_t token_result = ValidateTokenOrClear(token, "note-pack-download");
+    if (token_result != ESP_OK) {
+        return token_result;
+    }
+
+    ESP_RETURN_ON_ERROR(WaitForNetworkReadyForHttps(), kTag, "prepare network for note-pack-download");
+
+    const std::string url = BuildWordPackDownloadUrl(notebook.download_url);
+    ESP_LOGI(kTag, "note-pack-download: pack_id=%s url=%s bytes_expected=%lu",
+             notebook.pack_id.c_str(), url.c_str(),
+             static_cast<unsigned long>(notebook.byte_size));
+    esp_http_client_config_t config = {};
+    config.url = url.c_str();
+    config.method = HTTP_METHOD_GET;
+    config.timeout_ms = kHttpTimeoutMs;
+    config.crt_bundle_attach = esp_crt_bundle_attach;
+    config.buffer_size = 2048;
+
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (client == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
+    const std::string authorization = "Bearer " + token;
+    esp_err_t result = esp_http_client_set_header(
+        client, "Accept", "application/x-ndjson");
+    if (result == ESP_OK) {
+        result = esp_http_client_set_header(
+            client, "Authorization", authorization.c_str());
+    }
+    if (result == ESP_OK) {
+        result = esp_http_client_set_header(
+            client, "X-WQN-Protocol", protocol::v3::kProtocolHeader);
+    }
+    if (result == ESP_OK) {
+        result = esp_http_client_set_header(
+            client, "X-WQN-Request-Id", metadata.request_id.c_str());
+    }
+    if (result == ESP_OK) {
+        result = esp_http_client_open(client, 0);
+    }
+    int content_length = -1;
+    int status_code = 0;
+    if (result == ESP_OK) {
+        content_length = esp_http_client_fetch_headers(client);
+        status_code = esp_http_client_get_status_code(client);
+    }
+    if (result == ESP_OK && content_length >= 0 &&
+        static_cast<uint64_t>(content_length) != notebook.byte_size) {
+        ESP_LOGW(
+            kTag,
+            "note-pack-download Content-Length mismatch: expected=%lu actual=%d",
+            static_cast<unsigned long>(notebook.byte_size),
+            content_length);
+        result = ESP_ERR_INVALID_SIZE;
+    }
+    size_t received = 0;
+    std::array<uint8_t, 2048> buffer = {};
+    while (result == ESP_OK && status_code == 200) {
+        const int read = esp_http_client_read(
+            client,
+            reinterpret_cast<char*>(buffer.data()),
+            buffer.size());
+        FeedTaskWatchdogIfSubscribed();
+        if (read < 0) {
+            result = ESP_FAIL;
+            break;
+        }
+        if (read == 0) {
+            break;
+        }
+        if (received + static_cast<size_t>(read) > notebook.byte_size ||
+            received + static_cast<size_t>(read) >
+                protocol::note_study_v1::kMaxPackBytes) {
+            result = ESP_ERR_INVALID_SIZE;
+            break;
+        }
+        result = sink(context, buffer.data(), static_cast<size_t>(read));
+        if (result == ESP_OK) {
+            received += static_cast<size_t>(read);
+        }
+    }
+    if (result == ESP_OK && status_code == 200 &&
+        (received != notebook.byte_size ||
+         !esp_http_client_is_complete_data_received(client))) {
+        result = ESP_ERR_INVALID_SIZE;
+    }
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+
+    if (status_code == 401) {
+        return ClearTokenOnUnauthorized("note-pack-download");
+    }
+    if (status_code != 200) {
+        ESP_LOGW(kTag, "note-pack-download HTTP status=%d", status_code);
+        return ESP_FAIL;
+    }
+    if (result != ESP_OK) {
+        ESP_LOGW(
+            kTag,
+            "note-pack-download failed: %s url=%s received=%u",
             esp_err_to_name(result),
             url.c_str(),
             static_cast<unsigned>(received));

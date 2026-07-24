@@ -47,6 +47,8 @@ idf_component_register(
         "ui/word_cloud.cpp"
         "ui_model.cpp"
         "wifi_manager.cpp"
+        "note_pack.cpp"
+        "note_cloud.cpp"
         "word_pack.cpp"
         "word_app.cpp"
         "word_study_store.cpp"
