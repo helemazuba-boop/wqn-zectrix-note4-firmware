@@ -825,6 +825,51 @@ bool RunNotePageStateSelfTest()
         !require(!a.current_note_loaded, "abandon clears loaded note")) {
         return false;
     }
+
+    // Stale-result isolation: a session-start result that arrives when none is
+    // expected (the open was abandoned before the cloud replied) is discarded
+    // without activating a session or leaving the notebook list.
+    NotePageFixture stale;
+    if (!stale) return require(false, "allocate stale fixture");
+    NoteAppState& st = stale.get();
+    st.initialized = true;
+    st.mode = NoteAppMode::kNotebookList;
+    st.session.start_result_expected = false;
+    protocol::note_study_v1::SessionData stale_session;
+    stale_session.session_id = "00000000-0000-4000-8000-000000000004";
+    if (!require(!ApplyNoteSessionStartResult(&st, ESP_OK, stale_session),
+                 "stale session result discarded") ||
+        !require(st.mode == NoteAppMode::kNotebookList, "stale result keeps screen") ||
+        !require(!st.session.persisted.active, "stale result does not activate session")) {
+        return false;
+    }
+
+    // Snapshot-consistency guard: a candidate page whose session_id does not
+    // match the pinned snapshot is rejected without growing the item window.
+    NotePageFixture snap;
+    if (!snap) return require(false, "allocate snapshot fixture");
+    NoteAppState& sn = snap.get();
+    sn.initialized = true;
+    sn.mode = NoteAppMode::kNoteList;
+    sn.session.persisted.active = true;
+    sn.session.persisted.remote.session_id = "00000000-0000-4000-8000-000000000005";
+    sn.session.persisted.remote.mode = Mode::kRecent;
+    sn.session.persisted.remote.items.push_back(MakeItem(0));
+    sn.session.page_in_flight = true;
+    const size_t snapshot_before = sn.session.persisted.remote.items.size();
+    protocol::note_study_v1::CandidatePageData mismatched;
+    mismatched.session_id = "ffffffff-ffff-4fff-8fff-ffffffffffff";
+    protocol::note_study_v1::SessionItem stray;
+    stray.item_id = "22222222-2222-4222-8222-222222222222";
+    stray.notebook_id = "11111111-1111-4111-8111-111111111111";
+    stray.ordinal = 1;
+    mismatched.items.push_back(stray);
+    ApplyNoteCandidatePageResult(&sn, ESP_OK, mismatched);
+    if (!require(sn.session.persisted.remote.items.size() == snapshot_before,
+                 "snapshot mismatch rejects candidate page") ||
+        !require(!sn.session.page_in_flight, "candidate result clears in-flight")) {
+        return false;
+    }
     return true;
 }
 
