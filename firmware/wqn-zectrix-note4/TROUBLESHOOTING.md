@@ -139,6 +139,21 @@ gate enforces this.
   they are infrequent -- they belong to that same deferred async pass, not the
   per-open hot path.
 
+## Note page frozen / does not repaint on navigation
+
+- Symptom: the note page shows once on entry, then no button (notebook/title
+  navigation, open, body scroll) changes the screen; logs show every note
+  dispatch as `desired_len=<const>` + `display submission skipped: desired state
+  already represented`, while `app event ... kind=button changed=1` still fires.
+- Root cause class: `FrameSignature()` (ui_refresh.cpp) must have a branch for the
+  screen. `RenderNote` populates `frame.note_app` (not `frame.lines`), so without a
+  `kNote` branch the dedup signature is constant and the refresh pipeline skips
+  every repaint -- indistinguishable from a hang on e-paper. Any new screen that
+  renders from its own snapshot needs a matching `FrameSignature` branch.
+- The note branch must include mode, both selection indices, body scroll offset,
+  note_id, list sizes/rows, status/hint -- but NOT battery/clock (those change on
+  timers and would force periodic full refreshes).
+
 ## Note `opened` not syncing (last-viewed / recommendation stale)
 
 - Opening a note from the title list writes one durable `opened` observation to
