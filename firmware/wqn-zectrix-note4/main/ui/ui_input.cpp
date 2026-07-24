@@ -600,6 +600,7 @@ RefreshSchedule ApplyButtonEvent(
     const wqn::TimeAppState old_time_app = state->time_app;
     const std::string old_word_signature = wqn::WordAppSignature(state->word_app);
     const std::string old_note_signature = wqn::NoteAppSignature(state->note_app);
+    const wqn::NoteAppMode old_note_mode = state->note_app.mode;
     ESP_LOGI(
         kTag,
         "button event: id=%d type=%d duration_ms=%lld",
@@ -805,6 +806,14 @@ RefreshSchedule ApplyButtonEvent(
             }
         }
         BuildHomeSummary(state);
+        // A note mode transition (notebook<->title<->body) repaints most of the
+        // screen. Sending that as a large partial waveform ("full-frame-partial",
+        // dirty rect > kLocalPartialMaxHeight) accumulates e-paper ghosting ->
+        // 花屏 after a few steps. Use a full refresh for transitions so the panel
+        // is cleared; keep the fast partial path for same-mode navigation.
+        if (state->note_app.mode != old_note_mode) {
+            return RefreshSchedule::kCommit;
+        }
         return RefreshSchedule::kSelection;
     }
     if (state->selected_home_task != old_home_task ||
