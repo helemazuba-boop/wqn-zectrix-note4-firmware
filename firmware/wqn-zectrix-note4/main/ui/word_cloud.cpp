@@ -176,6 +176,15 @@ void SendWordCloudResult()
     }
 }
 
+bool IsWordSessionInvalidError(const wqn::protocol::v3::Error& error)
+{
+    // Codes that mean the pinned session is unusable server-side. These are not
+    // transient, so the device must drop the session instead of retrying it.
+    return error.code == "SESSION_NOT_FOUND" ||
+           error.code == "SESSION_NOT_ACTIVE" ||
+           error.code == "WORD_SESSION_SNAPSHOT_INCOMPLETE";
+}
+
 bool ApplyWordCloudResult(wqn::UiState* state, WordCloudResult& result)
 {
     if (state == nullptr) {
@@ -222,10 +231,14 @@ bool ApplyWordCloudResult(wqn::UiState* state, WordCloudResult& result)
         return true;
     }
     if (result.op == WordCloudOp::kFetchSessionPage) {
-        wqn::ApplyWordCandidatePageResult(
-            &state->word_app,
-            result.result,
-            std::move(result.candidate_page));
+        if (result.result != ESP_OK && IsWordSessionInvalidError(result.protocol_error)) {
+            wqn::ResetWordSessionForServerInvalid(&state->word_app);
+        } else {
+            wqn::ApplyWordCandidatePageResult(
+                &state->word_app,
+                result.result,
+                std::move(result.candidate_page));
+        }
         BuildHomeSummary(state);
         return true;
     }

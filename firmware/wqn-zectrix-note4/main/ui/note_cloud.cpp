@@ -145,6 +145,15 @@ void SendNoteCloudResult()
     }
 }
 
+bool IsNoteSessionInvalidError(const wqn::protocol::v3::Error& error)
+{
+    // Non-transient codes meaning the pinned session is unusable; drop it rather
+    // than reuse the same session_id.
+    return error.code == "SESSION_NOT_FOUND" ||
+           error.code == "SESSION_NOT_ACTIVE" ||
+           error.code == "NOTE_SESSION_SNAPSHOT_INCOMPLETE";
+}
+
 bool ApplyNoteCloudResult(wqn::UiState* state, NoteCloudResult& result)
 {
     if (state == nullptr) {
@@ -185,8 +194,12 @@ bool ApplyNoteCloudResult(wqn::UiState* state, NoteCloudResult& result)
         return true;
     }
     if (result.op == NoteCloudOp::kFetchSessionPage) {
-        wqn::ApplyNoteCandidatePageResult(
-            &state->note_app, result.result, std::move(result.candidate_page));
+        if (result.result != ESP_OK && IsNoteSessionInvalidError(result.protocol_error)) {
+            wqn::ResetNoteSessionForServerInvalid(&state->note_app);
+        } else {
+            wqn::ApplyNoteCandidatePageResult(
+                &state->note_app, result.result, std::move(result.candidate_page));
+        }
         BuildHomeSummary(state);
         return true;
     }

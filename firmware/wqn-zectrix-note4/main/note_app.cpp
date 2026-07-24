@@ -428,6 +428,22 @@ void CancelNoteSessionStartResult(NoteAppState* state)
     state->session.create_request_id.clear();
 }
 
+void ResetNoteSessionForServerInvalid(NoteAppState* state)
+{
+    if (state == nullptr) return;
+    // The server rejected this session as unusable; reusing the same session_id
+    // cannot repair it. Drop the durable record and return to the notebook list
+    // so re-opening creates a fresh session. The pack index stays mounted.
+    ESP_ERROR_CHECK_WITHOUT_ABORT(ClearPersistedNoteSession());
+    state->session = NoteSessionState{};
+    state->note_list_selected = 0;
+    state->note_scroll_offset_lines = 0;
+    state->current_note = WqnNoteEntry{};
+    state->current_note_loaded = false;
+    state->mode = NoteAppMode::kNotebookList;
+    state->message = "会话已重置，请重新打开";
+}
+
 bool TakeNoteCandidatePageRequest(
     NoteAppState* state,
     protocol::note_study_v1::CandidatePageRequest* request,

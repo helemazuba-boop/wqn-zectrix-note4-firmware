@@ -193,6 +193,10 @@ bool ApplyWordSessionStartResult(
     esp_err_t result,
     protocol::word_study_v1::SessionData session);
 void CancelWordSessionStartResult(WordAppState* state);
+// Discards a server-invalid session (snapshot corrupt / not found / not active)
+// so the device stops reusing the same bad session_id, then returns to the word
+// home where a fresh session can be created.
+void ResetWordSessionForServerInvalid(WordAppState* state);
 bool TakeWordCandidatePageRequest(
     WordAppState* state,
     protocol::word_study_v1::CandidatePageRequest* request,

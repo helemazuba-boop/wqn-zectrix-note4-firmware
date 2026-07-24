@@ -122,6 +122,10 @@ bool ApplyNoteSessionStartResult(
     esp_err_t result,
     protocol::note_study_v1::SessionData session);
 void CancelNoteSessionStartResult(NoteAppState* state);
+// Discards a server-invalid session (snapshot corrupt / not found / not active)
+// and returns to the notebook list so the device stops reusing a bad session_id;
+// re-opening a notebook creates a fresh session. Pack content stays mounted.
+void ResetNoteSessionForServerInvalid(NoteAppState* state);
 bool TakeNoteCandidatePageRequest(
     NoteAppState* state,
     protocol::note_study_v1::CandidatePageRequest* request,

@@ -1090,6 +1090,26 @@ void CancelWordSessionStartResult(WordAppState* state)
     state->session.create_request_id.clear();
 }
 
+void ResetWordSessionForServerInvalid(WordAppState* state)
+{
+    if (state == nullptr) return;
+    // The server rejected this session as unusable (corrupt snapshot / gone /
+    // inactive). Retrying the same session_id can never repair it, so drop the
+    // durable record and every derived flag; the next entry creates a fresh
+    // session. The local pack index is untouched, so the word library stays
+    // usable.
+    const protocol::word_study_v1::Mode mode = state->session.persisted.remote.mode;
+    ESP_ERROR_CHECK_WITHOUT_ABORT(ClearPersistedWordSession(mode));
+    state->session = WordSessionState{};
+    state->sequential_session_resumable = false;
+    state->random_session_resumable = false;
+    state->card_phase = WordCardPhase::kFront;
+    state->card_source = WordCardSource::kStudy;
+    state->current_word = WqnWordEntry{};
+    state->mode = WordAppMode::kHome;
+    state->message = "上次会话已失效，请重新开始";
+}
+
 bool TakeWordCandidatePageRequest(
     WordAppState* state,
     protocol::word_study_v1::CandidatePageRequest* request,
