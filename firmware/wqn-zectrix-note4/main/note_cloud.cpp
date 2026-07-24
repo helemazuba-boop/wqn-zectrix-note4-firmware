@@ -78,9 +78,15 @@ esp_err_t SyncNotePacks(const std::string& token, NotePackSyncResult* out)
         manifest_content_changed =
             manifest_content_changed || !delta.notebooks.empty();
 
+        // Evaluate each pack's download decision exactly once. NotePackNeedsDownload
+        // hashes the entire local file, so calling it for both the capacity estimate
+        // and the download loop re-hashed every unchanged pack twice on every sync.
+        std::vector<uint8_t> needs_download(delta.notebooks.size(), 0);
         size_t total_needed = 0;
-        for (const auto& item : delta.notebooks) {
+        for (size_t i = 0; i < delta.notebooks.size(); ++i) {
+            const WqnNotePackManifestNotebook& item = delta.notebooks[i];
             if (!item.deleted && NotePackNeedsDownload(item)) {
+                needs_download[i] = 1;
                 total_needed += item.byte_size;
             }
         }
@@ -101,18 +107,12 @@ esp_err_t SyncNotePacks(const std::string& token, NotePackSyncResult* out)
             }
         }
 
-        for (const WqnNotePackManifestNotebook& item : delta.notebooks) {
-            if (out->result != ESP_OK) {
-                break;
-            }
-            if (item.deleted || !NotePackNeedsDownload(item)) {
+        for (size_t i = 0; i < delta.notebooks.size() && out->result == ESP_OK; ++i) {
+            if (!needs_download[i]) {
                 continue;
             }
             out->result = DownloadNotePackToStorage(
-                token, services::MakeDeviceRequestMetadata(), item);
-            if (out->result != ESP_OK) {
-                break;
-            }
+                token, services::MakeDeviceRequestMetadata(), delta.notebooks[i]);
         }
         if (out->result != ESP_OK) {
             break;

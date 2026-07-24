@@ -542,7 +542,7 @@ esp_err_t ResetNotePackStorageCacheRaw(void*)
     return result;
 }
 
-esp_err_t ParseNoteRecordLine(const char* line, wqn::WqnNoteEntry* entry)
+esp_err_t ParseNoteRecordLine(const char* line, wqn::WqnNoteEntry* entry, bool include_content)
 {
     if (line == nullptr || entry == nullptr) {
         return ESP_ERR_INVALID_ARG;
@@ -555,12 +555,19 @@ esp_err_t ParseNoteRecordLine(const char* line, wqn::WqnNoteEntry* entry)
     entry->note_id = GetOptionalString(document.root(), "note_id");
     entry->notebook_id = GetOptionalString(document.root(), "notebook_id");
     entry->title = GetOptionalString(document.root(), "title");
-    entry->content = GetOptionalString(document.root(), "content");
+    // Index scans only need metadata + offset, so skip materialising the note
+    // body (up to 16 KB). Copying it into a std::string for every record just to
+    // discard it churned the heap and stretched index builds to seconds; the
+    // body is parsed on demand when a note is actually opened.
+    if (include_content) {
+        entry->content = GetOptionalString(document.root(), "content");
+    }
     uint64_t revision = 0;
     int32_t sort_index = 0;
     if (entry->note_id.size() != 36 || entry->notebook_id.size() != 36 ||
         entry->title.empty() || entry->title.size() > kMaxNoteTitleBytes ||
-        entry->content.empty() || entry->content.size() > kMaxNoteContentBytes ||
+        (include_content &&
+         (entry->content.empty() || entry->content.size() > kMaxNoteContentBytes)) ||
         !GetExactInt32(document.root(), "sort_index", &sort_index) ||
         !GetExactUint64(document.root(), "revision", &revision) ||
         revision == 0 || revision > std::numeric_limits<int>::max()) {
@@ -648,7 +655,7 @@ esp_err_t ScanNotePackFile(
             return result == ESP_OK ? ESP_ERR_INVALID_SIZE : result;
         }
         wqn::WqnNoteEntry entry;
-        result = ParseNoteRecordLine(line.c_str(), &entry);
+        result = ParseNoteRecordLine(line.c_str(), &entry, /*include_content=*/false);
         if (result != ESP_OK) {
             std::fclose(file);
             return result;
@@ -1242,7 +1249,7 @@ esp_err_t ReadNotePackEntry(const NotePackIndexEntry& index_entry, WqnNoteEntry*
     if (line_result != ESP_OK) {
         return line_result;
     }
-    const esp_err_t parse_result = ParseNoteRecordLine(line.c_str(), entry);
+    const esp_err_t parse_result = ParseNoteRecordLine(line.c_str(), entry, /*include_content=*/true);
     if (parse_result != ESP_OK) {
         return parse_result;
     }
