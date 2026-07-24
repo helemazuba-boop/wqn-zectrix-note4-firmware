@@ -9,6 +9,8 @@
 #include "esp_check.h"
 #include "esp_log.h"
 
+#include "display_service.h"
+
 namespace {
 
 constexpr char kTag[] = "note_app";
@@ -69,6 +71,13 @@ void LoadCurrentNoteBody(wqn::NoteAppState* state)
     if (entry == nullptr) return;
     if (wqn::ReadNotePackEntry(*entry, &state->current_note) == ESP_OK) {
         state->current_note_loaded = true;
+        // Precompute the wrapped line count with the SAME width as RenderNoteBody
+        // (ui/page_note.cpp: kContentW - 14 = kEpdWidth - 30 = 370 px) so the
+        // scroll handler can clamp Down to the last page.
+        state->note_body_total_lines = static_cast<uint32_t>(
+            wqn::WrapUtf8TextToWidth(state->current_note.content, 370, 4096).size());
+    } else {
+        state->note_body_total_lines = 0;
     }
 }
 
@@ -251,11 +260,21 @@ void HandleNoteViewInput(wqn::NoteAppState* state, wqn::NoteInput input)
             if (state->note_scroll_offset_lines > 0) --state->note_scroll_offset_lines;
             break;
         case wqn::NoteInput::kDown:
-        case wqn::NoteInput::kConfirm:
-            // The renderer clamps window_top to the wrapped line count; a soft
-            // cap here keeps the offset from drifting far past the body.
-            if (state->note_scroll_offset_lines < 4096) ++state->note_scroll_offset_lines;
+        case wqn::NoteInput::kConfirm: {
+            // Clamp to the last page. RenderNoteBody shows 9 body lines (must
+            // match ui/page_note.cpp), so the max useful offset is
+            // total_lines - 9. Without this, over-scrolling inflated the offset
+            // and Up-scroll then had nothing new to repaint (looked frozen).
+            constexpr uint32_t kNoteBodyVisibleLines = 9;
+            const uint32_t max_scroll =
+                state->note_body_total_lines > kNoteBodyVisibleLines
+                    ? state->note_body_total_lines - kNoteBodyVisibleLines
+                    : 0;
+            if (state->note_scroll_offset_lines < max_scroll) {
+                ++state->note_scroll_offset_lines;
+            }
             break;
+        }
         case wqn::NoteInput::kLongConfirm:
             state->current_note = wqn::WqnNoteEntry{};
             state->current_note_loaded = false;

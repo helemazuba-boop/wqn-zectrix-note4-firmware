@@ -62,6 +62,10 @@ struct NoteAppState {
     size_t notebook_selected = 0;
     size_t note_list_selected = 0;
     uint32_t note_scroll_offset_lines = 0;
+    // Total wrapped body lines for the open note (computed at load with the same
+    // wrap width as RenderNoteBody). Bounds Down-scroll so over-scrolling past the
+    // end cannot inflate the offset and leave Up-scroll with nothing to repaint.
+    uint32_t note_body_total_lines = 0;
 
     NoteSessionState session;
     NoteOutboxState outbox;

@@ -806,12 +806,14 @@ RefreshSchedule ApplyButtonEvent(
             }
         }
         BuildHomeSummary(state);
-        // A note mode transition (notebook<->title<->body) repaints most of the
-        // screen. Sending that as a large partial waveform ("full-frame-partial",
-        // dirty rect > kLocalPartialMaxHeight) accumulates e-paper ghosting ->
-        // 花屏 after a few steps. Use a full refresh for transitions so the panel
-        // is cleared; keep the fast partial path for same-mode navigation.
-        if (state->note_app.mode != old_note_mode) {
+        // Mode transition (notebook<->title<->body) OR any update while reading a
+        // note body: force a full refresh. The body view scrolls a large text
+        // region; a partial waveform leaves stale pixels when reversing scroll
+        // direction (the same bug the AI page hit -> AI forces full) and also
+        // accumulates ghosting. Full refresh clears the panel. List navigation
+        // keeps the fast partial path.
+        if (state->note_app.mode != old_note_mode ||
+            state->note_app.mode == wqn::NoteAppMode::kNoteView) {
             return RefreshSchedule::kCommit;
         }
         return RefreshSchedule::kSelection;
