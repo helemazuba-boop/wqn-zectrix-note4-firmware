@@ -498,7 +498,10 @@ void DeviceUiTask(void*)
         if (event.HasEvent()) {
             wqn::NoteUserActivity();
             wqn::NoteEpdActivity();
-            if (state.screen == wqn::UiScreen::kWord) {
+            if (state.screen == wqn::UiScreen::kWord ||
+                state.screen == wqn::UiScreen::kNote) {
+                // Both study screens feed a durable outbox; an in-flight upload
+                // batch yields to active input, then resumes after a quiet gap.
                 wqn::services::NoteWordInteraction();
             }
             poll_delay = kUiPollDelayTicks;

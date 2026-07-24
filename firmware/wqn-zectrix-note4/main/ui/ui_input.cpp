@@ -792,9 +792,12 @@ RefreshSchedule ApplyButtonEvent(
             const esp_err_t commit_result =
                 wqn::CommitNoteObservation(note_observation, note_advanced);
             wqn::ApplyNoteObservationCommitResult(&state->note_app, commit_result);
-            // The durable opened record is the interaction boundary; M-E wires
-            // the quiet-window outbox upload. A local commit failure only logs.
-            if (commit_result != ESP_OK) {
+            if (commit_result == ESP_OK) {
+                // The durable opened record is the interaction boundary. Upload
+                // it after a quiet period; opening a note must never launch the
+                // full bootstrap/problem/content sync pipeline.
+                wqn::services::RequestNoteOutboxUpload();
+            } else {
                 ESP_LOGW(
                     kTag,
                     "note observation local commit failed: %s",

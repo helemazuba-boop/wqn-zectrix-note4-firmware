@@ -2852,6 +2852,99 @@ esp_err_t FetchNoteStudyCandidatePageV1(
     return ESP_OK;
 }
 
+esp_err_t SubmitNoteStudyObservationV1AtPath(
+    const std::string& token,
+    const protocol::note_study_v1::ObservationRequest& request,
+    protocol::note_study_v1::ObservationData* observation,
+    protocol::v3::Error* error,
+    bool* transport_failure,
+    const char* path,
+    const char* operation)
+{
+    if (observation == nullptr || error == nullptr || transport_failure == nullptr ||
+        token.empty() || path == nullptr || operation == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *observation = {};
+    *error = {};
+    *transport_failure = false;
+    esp_err_t result = ValidateTokenOrClear(token, operation);
+    if (result != ESP_OK) return result;
+    result = WaitForNetworkReadyForHttps();
+    if (result != ESP_OK) {
+        *transport_failure = true;
+        return result;
+    }
+
+    std::string request_body;
+    result = protocol::note_study_v1::BuildObservationRequest(request, &request_body);
+    if (result != ESP_OK) return result;
+    const std::string url = BuildUrl(path);
+    int status_code = 0;
+    std::string body;
+    result = HttpRequest(
+        "POST",
+        url,
+        &token,
+        &request_body,
+        &status_code,
+        &body,
+        protocol::v3::kProtocolHeader,
+        &request.metadata.request_id);
+    if (result != ESP_OK) {
+        *transport_failure = true;
+        return result;
+    }
+    if (status_code == 401) return ClearTokenOnUnauthorized(operation);
+    const esp_err_t parse_result = protocol::note_study_v1::ParseObservationResponse(
+        body, request.metadata.request_id, observation, error);
+    if (status_code != 200 || parse_result != ESP_OK) {
+        ESP_LOGW(
+            kTag,
+            "%s failed: status=%d code=%s retryable=%d",
+            operation,
+            status_code,
+            error->code.c_str(),
+            error->retryable ? 1 : 0);
+        return parse_result == ESP_OK ? ESP_FAIL : parse_result;
+    }
+    return ESP_OK;
+}
+
+esp_err_t SubmitNoteStudyObservationV1(
+    const std::string& token,
+    const protocol::note_study_v1::ObservationRequest& request,
+    protocol::note_study_v1::ObservationData* observation,
+    protocol::v3::Error* error,
+    bool* transport_failure)
+{
+    return SubmitNoteStudyObservationV1AtPath(
+        token,
+        request,
+        observation,
+        error,
+        transport_failure,
+        "/v3/notes/observations",
+        "note-study-observation");
+}
+
+esp_err_t SkipNoteStudyObservationV1(
+    const std::string& token,
+    const protocol::note_study_v1::ObservationRequest& request,
+    protocol::note_study_v1::ObservationData* observation,
+    protocol::v3::Error* error,
+    bool* transport_failure)
+{
+    return SubmitNoteStudyObservationV1AtPath(
+        token,
+        request,
+        observation,
+        error,
+        transport_failure,
+        "/v3/notes/observations/skip",
+        "note-study-observation-skip");
+}
+
 esp_err_t LookupWordWithAi(const std::string& token, const WqnWordAiLookupRequest& request, WqnWordAiLookupResult* result)
 {
     if (result == nullptr) {

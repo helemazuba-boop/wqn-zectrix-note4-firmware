@@ -331,6 +331,24 @@ esp_err_t FetchNoteStudyCandidatePageV1(
     const protocol::note_study_v1::CandidatePageRequest& request,
     protocol::note_study_v1::CandidatePageData* page,
     protocol::v3::Error* error);
+// Uploads one durable `opened` observation (device v1 emits only kOpened).
+// `transport_failure` distinguishes a network fault (retry) from a server
+// rejection (inspect error.retryable / error.code).
+esp_err_t SubmitNoteStudyObservationV1(
+    const std::string& token,
+    const protocol::note_study_v1::ObservationRequest& request,
+    protocol::note_study_v1::ObservationData* observation,
+    protocol::v3::Error* error,
+    bool* transport_failure);
+// Writes a durable, non-projecting tombstone for a sequence so the server's
+// monotonic next_sequence advances past a locally-quarantined record; otherwise
+// the following observation is rejected forever with STUDY_SEQUENCE_GAP.
+esp_err_t SkipNoteStudyObservationV1(
+    const std::string& token,
+    const protocol::note_study_v1::ObservationRequest& request,
+    protocol::note_study_v1::ObservationData* observation,
+    protocol::v3::Error* error,
+    bool* transport_failure);
 esp_err_t LookupWordWithAi(const std::string& token, const WqnWordAiLookupRequest& request, WqnWordAiLookupResult* result);
 esp_err_t SyncDueProblemsAndLog(const std::string& token);
 

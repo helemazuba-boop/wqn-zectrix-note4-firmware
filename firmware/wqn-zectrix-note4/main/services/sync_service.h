@@ -56,6 +56,9 @@ void NoteWordInteraction();
 // Coalesces repeated word observations and uploads them after a short quiet
 // period. This never requests the full control/problem/content sync round.
 void RequestWordOutboxUpload();
+// Uploads durable `opened` note observations after the same quiet period. Note
+// and word share one outbox round; this is the trigger for the note-open path.
+void RequestNoteOutboxUpload();
 void GetSyncSnapshot(SyncSnapshot* snapshot);
 TickType_t GetConfiguredSyncDelayTicks();
 bool HasUsableStoredToken();
