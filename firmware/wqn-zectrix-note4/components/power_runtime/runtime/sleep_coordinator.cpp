@@ -184,6 +184,8 @@ const char* SleepBlockerName(SleepBlocker blocker)
             return "todo-cloud";
         case SleepBlocker::kWordCloud:
             return "word-cloud";
+        case SleepBlocker::kNoteCloud:
+            return "note-cloud";
         case SleepBlocker::kOnlineSync:
             return "online-sync";
         case SleepBlocker::kProvisioning:

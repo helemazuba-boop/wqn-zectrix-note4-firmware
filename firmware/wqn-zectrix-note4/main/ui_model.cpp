@@ -124,6 +124,8 @@ const char* ScreenName(wqn::UiScreen screen)
             return "时间";
         case wqn::UiScreen::kWord:
             return "单词";
+        case wqn::UiScreen::kNote:
+            return "笔记";
         case wqn::UiScreen::kLibrary:
             return "题库";
         case wqn::UiScreen::kProblem:
@@ -162,8 +164,10 @@ wqn::UiScreen PreviousTopScreen(wqn::UiScreen screen)
             return wqn::UiScreen::kHome;
         case wqn::UiScreen::kWord:
             return wqn::UiScreen::kTime;
-        case wqn::UiScreen::kTodo:
+        case wqn::UiScreen::kNote:
             return wqn::UiScreen::kWord;
+        case wqn::UiScreen::kTodo:
+            return wqn::UiScreen::kNote;
         case wqn::UiScreen::kProvisioning:
             return wqn::UiScreen::kHome;
     }
@@ -189,6 +193,8 @@ wqn::UiScreen NextTopScreen(wqn::UiScreen screen)
         case wqn::UiScreen::kTime:
             return wqn::UiScreen::kWord;
         case wqn::UiScreen::kWord:
+            return wqn::UiScreen::kNote;
+        case wqn::UiScreen::kNote:
             return wqn::UiScreen::kTodo;
         case wqn::UiScreen::kTodo:
             return wqn::UiScreen::kAi;
@@ -339,6 +345,14 @@ void RenderWord(const wqn::UiState& state, wqn::UiFrame* frame)
         return;
     }
     frame->word_app = wqn::BuildWordAppSnapshot(state.word_app);
+}
+
+void RenderNote(const wqn::UiState& state, wqn::UiFrame* frame)
+{
+    if (frame == nullptr) {
+        return;
+    }
+    frame->note_app = wqn::BuildNoteAppSnapshot(state.note_app);
 }
 
 void RenderLibrary(const wqn::UiState& state, wqn::UiFrame* frame)
@@ -565,6 +579,9 @@ void HandleUiInput(UiState* state, UiInput input)
             } else if (state->screen == UiScreen::kWord) {
                 HandleWordAppInput(&state->word_app, WordInput::kUp);
                 break;
+            } else if (state->screen == UiScreen::kNote) {
+                HandleNoteAppInput(&state->note_app, NoteInput::kUp);
+                break;
             } else if (state->screen == UiScreen::kAi) {
                 if (state->ai.page > 0) {
                     --state->ai.page;
@@ -595,6 +612,9 @@ void HandleUiInput(UiState* state, UiInput input)
             } else if (state->screen == UiScreen::kWord) {
                 HandleWordAppInput(&state->word_app, WordInput::kDown);
                 break;
+            } else if (state->screen == UiScreen::kNote) {
+                HandleNoteAppInput(&state->note_app, NoteInput::kDown);
+                break;
             } else if (state->screen == UiScreen::kAi) {
                 if (state->ai.page + 1 < AiSessionPageCount(state->ai)) {
                     ++state->ai.page;
@@ -622,6 +642,9 @@ void HandleUiInput(UiState* state, UiInput input)
                 break;
             } else if (state->screen == UiScreen::kWord) {
                 HandleWordAppInput(&state->word_app, WordInput::kConfirm);
+                break;
+            } else if (state->screen == UiScreen::kNote) {
+                HandleNoteAppInput(&state->note_app, NoteInput::kConfirm);
                 break;
             } else if (state->screen == UiScreen::kHome) {
                 if (state->selected_home_task == 1) {
@@ -655,6 +678,15 @@ void HandleUiInput(UiState* state, UiInput input)
                     state->screen = UiScreen::kHome;
                 } else {
                     HandleWordAppInput(&state->word_app, WordInput::kLongConfirm);
+                }
+                break;
+            } else if (state->screen == UiScreen::kNote) {
+                // Long-press = universal back. At the notebook list (top level)
+                // exit to the device home; deeper levels pop one level.
+                if (state->note_app.mode == NoteAppMode::kNotebookList) {
+                    state->screen = UiScreen::kHome;
+                } else {
+                    HandleNoteAppInput(&state->note_app, NoteInput::kLongConfirm);
                 }
                 break;
             } else if (state->screen == UiScreen::kAi) {
@@ -812,6 +844,9 @@ UiFrame RenderUiFrame(const UiState& state)
             break;
         case UiScreen::kWord:
             RenderWord(state, &frame);
+            break;
+        case UiScreen::kNote:
+            RenderNote(state, &frame);
             break;
         case UiScreen::kLibrary:
             RenderLibrary(state, &frame);

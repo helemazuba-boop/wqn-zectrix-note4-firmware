@@ -38,6 +38,8 @@ idf_component_register(
         "ui/seven_segment.cpp"
         "ui/text_wrappers.cpp"
         "ui/todo_cloud.cpp"
+        "ui/note_cloud.cpp"
+        "ui/page_note.cpp"
         "ui/ui_input.cpp"
         "ui/ui_refresh.cpp"
         "ui/ui_render.cpp"

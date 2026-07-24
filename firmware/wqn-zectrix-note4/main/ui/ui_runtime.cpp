@@ -23,6 +23,8 @@ const char* AppEventKindName(AppEventKind event)
             return "todo-result";
         case AppEventKind::kWordCloudResult:
             return "word-result";
+        case AppEventKind::kNoteCloudResult:
+            return "note-result";
         case AppEventKind::kTimeTick:
             return "time-tick";
         case AppEventKind::kAiTick:
@@ -136,6 +138,29 @@ bool UiRuntime::TakeWordCandidatePageRequest(
 void UiRuntime::RestoreWordCandidatePageRequest()
 {
     wqn::RestoreWordCandidatePageRequest(&state_.word_app);
+}
+
+UiUpdate UiRuntime::DispatchNoteCloudResult(NoteCloudResult& result)
+{
+    const bool changed = ApplyNoteCloudResult(&state_, result);
+    const RefreshSchedule refresh =
+        changed && state_.screen == wqn::UiScreen::kNote
+            ? RefreshSchedule::kCommit
+            : RefreshSchedule::kNone;
+    return FinishEvent(AppEventKind::kNoteCloudResult, refresh, changed);
+}
+
+bool UiRuntime::TakeNoteCandidatePageRequest(
+    wqn::protocol::note_study_v1::CandidatePageRequest* request,
+    std::string* session_id)
+{
+    return wqn::TakeNoteCandidatePageRequest(
+        &state_.note_app, request, session_id);
+}
+
+void UiRuntime::RestoreNoteCandidatePageRequest()
+{
+    wqn::RestoreNoteCandidatePageRequest(&state_.note_app);
 }
 
 UiUpdate UiRuntime::DispatchTimeTick(int64_t now_ms)
@@ -323,6 +348,7 @@ UiUpdate UiRuntime::DispatchSyncResult(const wqn::services::SyncEvent& event)
         case wqn::services::SyncEventStatus::kSucceeded:
             status = "同步完成";
             wqn::RefreshWordOutboxState(&state_.word_app);
+            wqn::RefreshNoteOutboxState(&state_.note_app);
             break;
         case wqn::services::SyncEventStatus::kAwaitingClaim:
             status = "等待配对";

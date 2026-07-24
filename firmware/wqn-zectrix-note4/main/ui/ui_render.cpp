@@ -58,6 +58,9 @@ esp_err_t RenderFrameToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
     if (frame.screen == wqn::UiScreen::kWord) {
         return RenderWordToEpd(frame, schedule);
     }
+    if (frame.screen == wqn::UiScreen::kNote) {
+        return RenderNoteToEpd(frame, schedule);
+    }
     if (frame.screen == wqn::UiScreen::kSettings) {
         return RenderSettingsToEpd(frame, schedule);
     }

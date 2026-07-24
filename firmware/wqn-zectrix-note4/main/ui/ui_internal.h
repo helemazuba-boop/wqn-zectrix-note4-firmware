@@ -187,21 +187,58 @@ struct WordCloudResultReady {
     uint32_t generation = 0;
 };
 
+enum class NoteCloudOp {
+    kPackSync,
+    kStartSession,
+    kFetchSessionPage,
+};
+
+struct NoteCloudRequest {
+    NoteCloudOp op = NoteCloudOp::kPackSync;
+    char request_id[65] = {};
+    char session_id[37] = {};
+    char cursor[65] = {};
+    char notebook_id[37] = {};
+    uint16_t limit = 0;
+};
+
+struct NoteCloudResult {
+    NoteCloudOp op = NoteCloudOp::kPackSync;
+    esp_err_t result = ESP_FAIL;
+    bool auth_required = false;
+    bool pack_index_ready = false;
+    wqn::NotePackIndex pack_index;
+    wqn::protocol::note_study_v1::SessionData session;
+    wqn::protocol::note_study_v1::CandidatePageData candidate_page;
+    wqn::protocol::v3::Error protocol_error;
+    std::string message;
+};
+
+struct NoteCloudResultReady {
+    uint32_t generation = 0;
+};
+
 static_assert(std::is_trivially_copyable_v<TodoCloudResultReady>);
 static_assert(std::is_trivially_copyable_v<WordCloudResultReady>);
+static_assert(std::is_trivially_copyable_v<NoteCloudResultReady>);
 
 void SendTodoCloudResult();
 void SendWordCloudResult();
+void SendNoteCloudResult();
 const TodoCloudResult* PeekTodoCloudResult(uint32_t generation);
 WordCloudResult* PeekWordCloudResult(uint32_t generation);
+NoteCloudResult* PeekNoteCloudResult(uint32_t generation);
 
 bool IsTodoCloudBusy();
 bool IsWordCloudBusy();
+bool IsNoteCloudBusy();
 void FinishTodoCloudRequest();
 void FinishWordCloudRequest();
+void FinishNoteCloudRequest();
 
 bool QueueTodoCloudRequest(const TodoCloudRequest& request);
 bool QueueWordCloudRequest(const WordCloudRequest& request);
+bool QueueNoteCloudRequest(const NoteCloudRequest& request);
 
 bool QueueTodoRefresh();
 bool QueueTodoRefreshCursor(const std::string& cursor);
@@ -217,14 +254,24 @@ void PumpWordCandidatePrefetch(UiRuntime* runtime);
 bool QueueWordSearch(const wqn::WqnWordSearchRequest& search);
 bool QueueWordAiLookup(const wqn::WqnWordAiLookupRequest& lookup);
 
+bool QueueNotePackSync();
+bool QueueNoteSessionStart(
+    const wqn::protocol::note_study_v1::CreateSessionRequest& request);
+bool QueueNoteCandidatePage(
+    const std::string& session_id,
+    const wqn::protocol::note_study_v1::CandidatePageRequest& request);
+void PumpNoteCandidatePrefetch(UiRuntime* runtime);
+
 bool ApplyTodoCloudResult(wqn::UiState* state, const TodoCloudResult& result);
 bool ApplyWordCloudResult(wqn::UiState* state, WordCloudResult& result);
+bool ApplyNoteCloudResult(wqn::UiState* state, NoteCloudResult& result);
 
 bool RefreshTodosFromCloud(wqn::UiState* state);
 RefreshSchedule CompleteSelectedTodo(wqn::UiState* state);
 
 void TodoCloudTask(void*);
 void WordCloudTask(void*);
+void NoteCloudTask(void*);
 
 bool LoadValidTokenForTodo(std::string* token);
 
@@ -343,6 +390,10 @@ const char* AiStatusLabel(wqn::AiSessionStatus status);
 
 esp_err_t RenderWordToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule);
 
+// ---- Note page --------------------------------------------------------------
+
+esp_err_t RenderNoteToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule);
+
 // ---- Settings page ----------------------------------------------------------
 
 esp_err_t DrawSettingsRow(size_t row_index, int y, const std::string& title, const std::string& value, bool selected);
@@ -381,6 +432,9 @@ extern TaskHandle_t g_todo_task;
 extern QueueHandle_t g_word_request_queue;
 extern QueueHandle_t g_word_result_queue;
 extern TaskHandle_t g_word_task;
+extern QueueHandle_t g_note_request_queue;
+extern QueueHandle_t g_note_result_queue;
+extern TaskHandle_t g_note_task;
 extern QueueHandle_t g_display_result_queue;
 extern wqn::UiFrame g_pending_frames[2];
 extern std::string g_pending_signatures[2];

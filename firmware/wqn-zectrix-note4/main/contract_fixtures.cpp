@@ -7,6 +7,7 @@
 #include "device_protocol/v3.h"
 #include "device_protocol/word_study.h"
 #include "esp_log.h"
+#include "note_app.h"
 #include "text_render.h"
 #include "word_app.h"
 #include "wqn_api.h"
@@ -1116,7 +1117,8 @@ bool RunContractFixtureSelfTest()
         CheckV3ControlContract() &&
         CheckWordStudyV1Contract() &&
         CheckAiStreamHttpFailures() &&
-        RunWordPageStateSelfTest();
+        RunWordPageStateSelfTest() &&
+        RunNotePageStateSelfTest();
 
     if (ok) {
         ESP_LOGI(kTag, "contract fixture self-test passed");

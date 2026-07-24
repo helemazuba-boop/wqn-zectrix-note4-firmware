@@ -10,6 +10,7 @@ enum class SleepBlocker : uint8_t {
     kDisplay = 0,
     kTodoCloud,
     kWordCloud,
+    kNoteCloud,
     kOnlineSync,
     kProvisioning,
     kAudio,

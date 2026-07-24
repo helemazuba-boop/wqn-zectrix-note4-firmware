@@ -599,6 +599,7 @@ RefreshSchedule ApplyButtonEvent(
     const wqn::ReviewChoice old_review = state->selected_review;
     const wqn::TimeAppState old_time_app = state->time_app;
     const std::string old_word_signature = wqn::WordAppSignature(state->word_app);
+    const std::string old_note_signature = wqn::NoteAppSignature(state->note_app);
     ESP_LOGI(
         kTag,
         "button event: id=%d type=%d duration_ms=%lld",
@@ -665,6 +666,13 @@ RefreshSchedule ApplyButtonEvent(
                 state->word_app.message = IsWordCloudBusy() ? "单词同步中" : "单词同步失败";
             } else {
                 state->word_app.message = "单词同步中";
+            }
+        } else if (state->screen == wqn::UiScreen::kNote &&
+                   state->note_app.cloud_sync_requested) {
+            if (!QueueNotePackSync()) {
+                state->note_app.message = IsNoteCloudBusy() ? "笔记同步中" : "笔记同步失败";
+            } else {
+                state->note_app.message = "笔记同步中";
             }
         }
         BuildHomeSummary(state);
@@ -751,6 +759,46 @@ RefreshSchedule ApplyButtonEvent(
                 state->word_app.ai_lookup_pending = true;
                 state->word_app.pending_ai_query = lookup_request.query.empty() ? lookup_request.prefix : lookup_request.query;
                 state->word_app.message = IsWordCloudBusy() ? "单词同步中" : "AI 查词失败";
+            }
+        }
+        BuildHomeSummary(state);
+        return RefreshSchedule::kSelection;
+    }
+    if (state->screen == wqn::UiScreen::kNote &&
+        wqn::NoteAppSignature(state->note_app) != old_note_signature) {
+        wqn::protocol::note_study_v1::CreateSessionRequest note_session_request;
+        note_session_request.metadata = wqn::services::MakeDeviceRequestMetadata();
+        if (wqn::TakeNoteSessionStartRequest(&state->note_app, &note_session_request) &&
+            !QueueNoteSessionStart(note_session_request)) {
+            wqn::CancelNoteSessionStartResult(&state->note_app);
+            state->note_app.mode = wqn::NoteAppMode::kNotebookList;
+            state->note_app.message = IsNoteCloudBusy()
+                ? "笔记服务忙，请重试"
+                : "打开失败，请重试";
+        }
+        wqn::DurableNoteObservation note_observation;
+        wqn::PersistedNoteSession note_advanced;
+        const auto note_metadata = wqn::services::MakeDeviceRequestMetadata();
+        std::string note_occurred_at = CurrentIsoTimestamp();
+        if (note_occurred_at.empty()) {
+            note_occurred_at = "2024-01-01T00:00:00Z";
+        }
+        if (wqn::TakeNoteObservationEffect(
+                &state->note_app,
+                note_metadata.request_id,
+                note_occurred_at,
+                &note_observation,
+                &note_advanced)) {
+            const esp_err_t commit_result =
+                wqn::CommitNoteObservation(note_observation, note_advanced);
+            wqn::ApplyNoteObservationCommitResult(&state->note_app, commit_result);
+            // The durable opened record is the interaction boundary; M-E wires
+            // the quiet-window outbox upload. A local commit failure only logs.
+            if (commit_result != ESP_OK) {
+                ESP_LOGW(
+                    kTag,
+                    "note observation local commit failed: %s",
+                    esp_err_to_name(commit_result));
             }
         }
         BuildHomeSummary(state);

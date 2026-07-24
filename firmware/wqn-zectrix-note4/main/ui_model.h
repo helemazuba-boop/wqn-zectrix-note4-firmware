@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "ai_history.h"
+#include "note_app.h"
 #include "storage.h"
 #include "time_app.h"
 #include "word_app.h"
@@ -21,6 +22,7 @@ enum class UiScreen {
     kHome,
     kTime,
     kWord,
+    kNote,
     kLibrary,
     kProblem,
     kSolution,
@@ -281,6 +283,7 @@ struct AppState {
     AiSessionState ai;
     TimeAppState time_app;
     WordAppState word_app;
+    NoteAppState note_app;
     TodoUiState todo;
     SettingsAppState settings;
     HomeSummary home;
@@ -307,6 +310,7 @@ struct UiFrame {
     TodoUiState todo;
     TimeAppState time_app;
     WordAppSnapshot word_app;
+    NoteAppSnapshot note_app;
     SettingsAppState settings;
     size_t selected_home_task = 0;
     std::vector<UiLine> lines;
