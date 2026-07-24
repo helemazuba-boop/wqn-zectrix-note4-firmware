@@ -11,6 +11,7 @@
 #include "services/sync_service.h"
 #include "services/connectivity_service.h"
 #include "storage.h"
+#include "note_app.h"
 #include "word_app.h"
 #include "wqn_api.h"
 
@@ -122,6 +123,15 @@ bool LoadUiState(wqn::UiState* state)
     result = wqn::InitWordApp(&state->word_app);
     if (result != ESP_OK) {
         ESP_LOGW(kTag, "init word app failed: %s", esp_err_to_name(result));
+    }
+
+    // Initialize Note eagerly at boot (mirrors Word above). Otherwise the first
+    // note interaction pays the synchronous pack-index build (SHA verify + JSONL
+    // scan + sort) + outbox snapshot + session load on the UI thread, stalling
+    // the first Up/Down/Confirm after entering the note page for seconds.
+    result = wqn::InitNoteApp(&state->note_app);
+    if (result != ESP_OK) {
+        ESP_LOGW(kTag, "init note app failed: %s", esp_err_to_name(result));
     }
 
     std::vector<wqn::PendingReviewResult> pending;
