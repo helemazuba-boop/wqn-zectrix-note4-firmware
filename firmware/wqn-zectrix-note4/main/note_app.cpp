@@ -805,6 +805,26 @@ bool RunNotePageStateSelfTest()
         !require(e.session.persisted.remote.next_sequence == 1, "commit advances session")) {
         return false;
     }
+
+    // Abandoning from the title list returns to the notebook list (the plan's
+    // "结束/放弃会话" affordance) and drops the loaded note, without touching
+    // storage; re-entering a notebook starts a fresh session.
+    NotePageFixture abandon;
+    if (!abandon) return require(false, "allocate abandon fixture");
+    NoteAppState& a = abandon.get();
+    a.initialized = true;
+    a.mode = NoteAppMode::kNoteList;
+    a.session.persisted.active = true;
+    a.session.persisted.remote.session_id = "00000000-0000-4000-8000-000000000003";
+    a.session.persisted.remote.mode = Mode::kRecent;
+    a.session.persisted.remote.items.push_back(MakeItem(0));
+    a.current_note_loaded = true;
+    a.note_list_selected = 0;
+    if (HandleNoteAppInput(&a, NoteInput::kLongConfirm) != ESP_OK ||
+        !require(a.mode == NoteAppMode::kNotebookList, "abandon returns to notebook list") ||
+        !require(!a.current_note_loaded, "abandon clears loaded note")) {
+        return false;
+    }
     return true;
 }
 
