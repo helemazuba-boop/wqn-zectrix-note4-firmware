@@ -219,6 +219,15 @@ void HandleNoteListInput(wqn::NoteAppState* state, wqn::NoteInput input)
         case wqn::NoteInput::kDown:
             if (!items.empty() && state->note_list_selected + 1 < items.size()) {
                 ++state->note_list_selected;
+            } else {
+                // [note-scroll-diag] Down could not advance -- either the real
+                // bottom (has_more=0) or waiting on a prefetch (has_more=1).
+                ESP_LOGW(
+                    kTag,
+                    "note list bottom: selected=%u candidates=%u has_more=%d",
+                    static_cast<unsigned>(state->note_list_selected),
+                    static_cast<unsigned>(items.size()),
+                    state->session.persisted.remote.has_more ? 1 : 0);
             }
             RequestNoteCandidatePageIfNeeded(state);
             break;
@@ -442,6 +451,25 @@ bool ApplyNoteSessionStartResult(
         ? "该笔记本暂无笔记"
         : "选择要看的笔记";
     RequestNoteCandidatePageIfNeeded(state);
+    // [note-scroll-diag] Reveals whether the candidate window is complete on
+    // entry. candidates < notebook_notes with has_more=0 means the server
+    // returned a partial set (no pages left to pull) -- the likely cause of
+    // "can't scroll to the bottom"; has_more=1 means the rest arrive via prefetch.
+    {
+        const size_t diag_row =
+            FindNotebookRow(*state, state->session.persisted.remote.notebook_id);
+        const unsigned diag_notebook_notes =
+            diag_row != static_cast<size_t>(-1)
+                ? static_cast<unsigned>(state->pack_index.notebooks[diag_row].entry_count)
+                : 0u;
+        ESP_LOGI(
+            kTag,
+            "note session ready: candidates=%u notebook_notes=%u has_more=%d cursor=%s",
+            static_cast<unsigned>(state->session.persisted.remote.items.size()),
+            diag_notebook_notes,
+            state->session.persisted.remote.has_more ? 1 : 0,
+            state->session.persisted.remote.cursor.c_str());
+    }
     return true;
 }
 
