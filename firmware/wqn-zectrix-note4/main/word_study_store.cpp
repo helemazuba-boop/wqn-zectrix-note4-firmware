@@ -427,6 +427,91 @@ esp_err_t SaveSessionRaw(
         preserve_backup);
 }
 
+// Small mutable companion to the per-mode session snapshot. Pause/resume only
+// flip PersistedWordSession::paused, but rewriting the whole candidate snapshot
+// (up to 500 items) to persist that one bit cost ~2-3 s on the UI thread. The
+// cursor records just the flag; LoadSessionTransaction overlays it after outbox
+// reconciliation, so pause/resume no longer rewrite the snapshot.
+constexpr uint32_t kSessionCursorMagic = 0x57435552;  // 'WCUR'
+constexpr uint16_t kSessionCursorVersion = 1;
+
+struct SessionCursorRecord {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t paused;
+    char session_id[37];
+    char reserved[3];
+    uint32_t crc;
+};
+static_assert(sizeof(SessionCursorRecord) == 52, "cursor record must be tightly packed");
+
+bool GetSessionCursorPaths(
+    wqn::protocol::word_study_v1::Mode mode,
+    SessionPaths* paths)
+{
+    if (paths == nullptr) return false;
+    switch (mode) {
+        case wqn::protocol::word_study_v1::Mode::kSequential:
+            *paths = {"/storage/wsq.cur", "/storage/wsq.ctp", "/storage/wsq.cbk"};
+            return true;
+        case wqn::protocol::word_study_v1::Mode::kRandom:
+            *paths = {"/storage/wsr.cur", "/storage/wsr.ctp", "/storage/wsr.cbk"};
+            return true;
+        case wqn::protocol::word_study_v1::Mode::kDictionary:
+            *paths = {"/storage/wsd.cur", "/storage/wsd.ctp", "/storage/wsd.cbk"};
+            return true;
+    }
+    return false;
+}
+
+esp_err_t WriteSessionCursor(const wqn::PersistedWordSession& session)
+{
+    SessionPaths paths = {};
+    if (!GetSessionCursorPaths(session.remote.mode, &paths)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    SessionCursorRecord record = {};
+    record.magic = kSessionCursorMagic;
+    record.version = kSessionCursorVersion;
+    record.paused = session.paused ? 1 : 0;
+    std::snprintf(
+        record.session_id,
+        sizeof(record.session_id),
+        "%s",
+        session.remote.session_id.c_str());
+    record.crc = Crc32(&record, sizeof(record) - sizeof(record.crc));
+    // A torn cursor write is detected by the CRC on load and ignored, so the
+    // snapshot's own paused flag stands. preserve_backup keeps this to a single
+    // tiny file instead of a rotation.
+    return AtomicWrite(
+        paths.primary, paths.temporary, paths.backup, &record, sizeof(record), true);
+}
+
+bool ReadSessionCursorPaused(
+    wqn::protocol::word_study_v1::Mode mode,
+    const std::string& session_id,
+    bool* paused)
+{
+    SessionPaths paths = {};
+    if (paused == nullptr || !GetSessionCursorPaths(mode, &paths)) return false;
+    FILE* file = std::fopen(paths.primary, "rb");
+    if (file == nullptr) return false;
+    SessionCursorRecord record = {};
+    const bool read_ok =
+        std::fread(&record, 1, sizeof(record), file) == sizeof(record);
+    std::fclose(file);
+    if (!read_ok || record.magic != kSessionCursorMagic ||
+        record.version != kSessionCursorVersion ||
+        Crc32(&record, sizeof(record) - sizeof(record.crc)) != record.crc) {
+        return false;
+    }
+    // Reject a leftover cursor from a previous session in the same mode slot.
+    record.session_id[sizeof(record.session_id) - 1] = '\0';
+    if (session_id != record.session_id) return false;
+    *paused = record.paused != 0;
+    return true;
+}
+
 esp_err_t LoadSessionFile(const char* path, wqn::PersistedWordSession* session)
 {
     if (session == nullptr) return ESP_ERR_INVALID_ARG;
@@ -990,12 +1075,30 @@ esp_err_t LoadSessionTransaction(void* opaque)
             kTag,
             "repair word outbox tail");
     }
+    // Overlay the cheap cursor. Pause/resume persist only this flag, so the
+    // snapshot on disk may still read unpaused; position/phase/sequence were
+    // already reconciled from the outbox above.
+    bool cursor_paused = false;
+    if (ReadSessionCursorPaused(
+            context->mode, session->remote.session_id, &cursor_paused)) {
+        session->paused = cursor_paused;
+    }
     return ESP_OK;
 }
 
 esp_err_t SaveSessionTransaction(void* context)
 {
-    return SaveSessionRaw(*static_cast<const wqn::PersistedWordSession*>(context));
+    const auto& session = *static_cast<const wqn::PersistedWordSession*>(context);
+    ESP_RETURN_ON_ERROR(SaveSessionRaw(session), kTag, "save word session snapshot");
+    // Refresh the cursor so it always agrees with the snapshot's paused flag,
+    // preventing a stale cursor from a prior session in this slot.
+    return WriteSessionCursor(session);
+}
+
+esp_err_t SaveCursorTransaction(void* context)
+{
+    return WriteSessionCursor(
+        *static_cast<const wqn::PersistedWordSession*>(context));
 }
 
 struct ClearSessionContext {
@@ -1012,6 +1115,12 @@ esp_err_t ClearSessionTransaction(void* opaque)
     if (std::remove(paths.primary) != 0 && errno != ENOENT) return ESP_FAIL;
     if (std::remove(paths.temporary) != 0 && errno != ENOENT) return ESP_FAIL;
     if (std::remove(paths.backup) != 0 && errno != ENOENT) return ESP_FAIL;
+    SessionPaths cursor_paths = {};
+    if (GetSessionCursorPaths(context->mode, &cursor_paths)) {
+        std::remove(cursor_paths.primary);
+        std::remove(cursor_paths.temporary);
+        std::remove(cursor_paths.backup);
+    }
     return ESP_OK;
 }
 
@@ -1377,6 +1486,19 @@ esp_err_t SavePersistedWordSession(const PersistedWordSession& session)
         "word-session-save",
         SaveSessionTransaction,
         const_cast<PersistedWordSession*>(&session));
+}
+
+esp_err_t SaveWordSessionCursor(const PersistedWordSession& session)
+{
+    // Pause/resume flip only PersistedWordSession::paused. Persist that single
+    // flag (~52 bytes) instead of rewriting the whole candidate snapshot, which
+    // blocked the UI thread for 2-3 s. Foreground so the tiny write is not
+    // queued behind background storage work.
+    return ExecuteWithStorageLease(
+        "word-session-cursor",
+        SaveCursorTransaction,
+        const_cast<PersistedWordSession*>(&session),
+        true);
 }
 
 esp_err_t ClearPersistedWordSession(protocol::word_study_v1::Mode mode)

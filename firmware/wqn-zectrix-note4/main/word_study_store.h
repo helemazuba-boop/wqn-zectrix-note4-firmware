@@ -126,6 +126,10 @@ esp_err_t LoadPersistedWordSession(
     protocol::word_study_v1::Mode mode,
     PersistedWordSession* session);
 esp_err_t SavePersistedWordSession(const PersistedWordSession& session);
+// Persists only the mutable paused flag for an existing session (a tiny write),
+// instead of rewriting the full candidate snapshot. Use for pause/resume; the
+// value is overlaid on load after outbox reconciliation.
+esp_err_t SaveWordSessionCursor(const PersistedWordSession& session);
 esp_err_t ClearPersistedWordSession(protocol::word_study_v1::Mode mode);
 
 // Commits the observation first, then the advanced session cursor. Retrying

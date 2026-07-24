@@ -442,7 +442,7 @@ esp_err_t InitWordApp(WordAppState* state)
             if (!persisted.paused) {
                 persisted.paused = true;
                 ESP_ERROR_CHECK_WITHOUT_ABORT(
-                    SavePersistedWordSession(persisted));
+                    SaveWordSessionCursor(persisted));
             }
             continue;
         }
@@ -617,7 +617,7 @@ esp_err_t HandleWordAppInput(WordAppState* state, WordInput input)
                 SetStudySessionResumable(
                     state, state->session.persisted.remote.mode, false);
                 ESP_RETURN_ON_ERROR(
-                    SavePersistedWordSession(state->session.persisted),
+                    SaveWordSessionCursor(state->session.persisted),
                     kTag,
                     "resume word session");
                 if (state->session.persisted.position ==
@@ -661,7 +661,7 @@ esp_err_t HandleWordAppInput(WordAppState* state, WordInput input)
                     SetStudySessionResumable(
                         state, state->session.persisted.remote.mode, true);
                     ESP_ERROR_CHECK_WITHOUT_ABORT(
-                        SavePersistedWordSession(state->session.persisted));
+                        SaveWordSessionCursor(state->session.persisted));
                 }
                 state->mode = WordAppMode::kHome;
                 state->message = state->session.persisted.active
@@ -725,7 +725,7 @@ esp_err_t HandleWordAppInput(WordAppState* state, WordInput input)
                     SetStudySessionResumable(
                         state, state->session.persisted.remote.mode, true);
                     ESP_ERROR_CHECK_WITHOUT_ABORT(
-                        SavePersistedWordSession(state->session.persisted));
+                        SaveWordSessionCursor(state->session.persisted));
                     state->mode = WordAppMode::kHome;
                     state->message = "本轮已暂停";
                     ActivatePendingWordPackIndex(state);
@@ -755,7 +755,7 @@ esp_err_t HandleWordAppInput(WordAppState* state, WordInput input)
                 SetStudySessionResumable(
                     state, state->session.persisted.remote.mode, true);
                 ESP_ERROR_CHECK_WITHOUT_ABORT(
-                    SavePersistedWordSession(state->session.persisted));
+                    SaveWordSessionCursor(state->session.persisted));
                 state->mode = WordAppMode::kHome;
                 state->message = "本轮已暂停";
                 ActivatePendingWordPackIndex(state);
@@ -803,7 +803,7 @@ esp_err_t HandleWordAppInput(WordAppState* state, WordInput input)
                             protocol::word_study_v1::Mode::kDictionary) {
                         state->session.persisted.paused = true;
                         ESP_ERROR_CHECK_WITHOUT_ABORT(
-                            SavePersistedWordSession(
+                            SaveWordSessionCursor(
                                 state->session.persisted));
                     }
                     state->mode = WordAppMode::kHome;
