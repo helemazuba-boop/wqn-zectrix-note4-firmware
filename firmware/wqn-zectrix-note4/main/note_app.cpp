@@ -339,6 +339,18 @@ esp_err_t InitNoteApp(NoteAppState* state)
         state->mode = NoteAppMode::kNoteList;
         state->message = "已恢复上次浏览";
         RequestNoteCandidatePageIfNeeded(state);
+        // [note-scroll-diag] Same visibility for the restored-session path: a
+        // stale persisted window with has_more=0 cannot grow, which would cap
+        // the title list below the notebook's real note count.
+        ESP_LOGI(
+            kTag,
+            "note session restored: candidates=%u notebook_notes=%u has_more=%d cursor=%s",
+            static_cast<unsigned>(state->session.persisted.remote.items.size()),
+            row != static_cast<size_t>(-1)
+                ? static_cast<unsigned>(state->pack_index.notebooks[row].entry_count)
+                : 0u,
+            state->session.persisted.remote.has_more ? 1 : 0,
+            state->session.persisted.remote.cursor.c_str());
     } else if (session_result != ESP_OK && session_result != ESP_ERR_NOT_FOUND) {
         ESP_LOGW(kTag, "load persisted note session failed: %s", esp_err_to_name(session_result));
     }
