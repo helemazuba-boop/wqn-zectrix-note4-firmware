@@ -49,6 +49,7 @@ idf_component_register(
         "wifi_manager.cpp"
         "note_pack.cpp"
         "note_cloud.cpp"
+        "note_store.cpp"
         "word_pack.cpp"
         "word_app.cpp"
         "word_study_store.cpp"

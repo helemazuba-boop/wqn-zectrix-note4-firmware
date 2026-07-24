@@ -7,6 +7,7 @@
 
 #include "esp_err.h"
 #include "device_protocol/v3.h"
+#include "device_protocol/note_study.h"
 #include "device_protocol/word_study.h"
 
 namespace wqn {
@@ -319,6 +320,17 @@ esp_err_t DownloadNotePackStream(
     const WqnNotePackManifestNotebook& notebook,
     WqnHttpChunkSink sink,
     void* context);
+esp_err_t CreateNoteStudySessionV1(
+    const std::string& token,
+    const protocol::note_study_v1::CreateSessionRequest& request,
+    protocol::note_study_v1::SessionData* session,
+    protocol::v3::Error* error);
+esp_err_t FetchNoteStudyCandidatePageV1(
+    const std::string& token,
+    const std::string& session_id,
+    const protocol::note_study_v1::CandidatePageRequest& request,
+    protocol::note_study_v1::CandidatePageData* page,
+    protocol::v3::Error* error);
 esp_err_t LookupWordWithAi(const std::string& token, const WqnWordAiLookupRequest& request, WqnWordAiLookupResult* result);
 esp_err_t SyncDueProblemsAndLog(const std::string& token);
 

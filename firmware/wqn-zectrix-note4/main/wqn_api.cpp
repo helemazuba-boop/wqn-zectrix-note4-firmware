@@ -2738,6 +2738,120 @@ esp_err_t DownloadNotePackStream(
     return result;
 }
 
+esp_err_t CreateNoteStudySessionV1(
+    const std::string& token,
+    const protocol::note_study_v1::CreateSessionRequest& request,
+    protocol::note_study_v1::SessionData* session,
+    protocol::v3::Error* error)
+{
+    if (session == nullptr || error == nullptr || token.empty()) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *session = {};
+    *error = {};
+    ESP_RETURN_ON_ERROR(
+        ValidateTokenOrClear(token, "note-study-session"),
+        kTag,
+        "validate note-study token");
+    ESP_RETURN_ON_ERROR(
+        WaitForNetworkReadyForHttps(),
+        kTag,
+        "prepare network for note-study session");
+
+    std::string request_body;
+    ESP_RETURN_ON_ERROR(
+        protocol::note_study_v1::BuildCreateSessionRequest(request, &request_body),
+        kTag,
+        "build note-study session request");
+    const std::string url = BuildUrl("/v3/notes/sessions");
+    int status_code = 0;
+    std::string body;
+    const esp_err_t http_result = HttpRequest(
+        "POST",
+        url,
+        &token,
+        &request_body,
+        &status_code,
+        &body,
+        protocol::v3::kProtocolHeader,
+        &request.metadata.request_id,
+        kWordSessionHttpTimeoutMs);
+    if (http_result != ESP_OK) return http_result;
+    if (status_code == 401) return ClearTokenOnUnauthorized("note-study-session");
+    const esp_err_t parse_result = protocol::note_study_v1::ParseSessionResponse(
+        body, request.metadata.request_id, session, error);
+    if (status_code != 200 || parse_result != ESP_OK) {
+        ESP_LOGW(
+            kTag,
+            "note-study session failed: status=%d code=%s retryable=%d",
+            status_code,
+            error->code.c_str(),
+            error->retryable ? 1 : 0);
+        return parse_result == ESP_OK ? ESP_FAIL : parse_result;
+    }
+    return ESP_OK;
+}
+
+esp_err_t FetchNoteStudyCandidatePageV1(
+    const std::string& token,
+    const std::string& session_id,
+    const protocol::note_study_v1::CandidatePageRequest& request,
+    protocol::note_study_v1::CandidatePageData* page,
+    protocol::v3::Error* error)
+{
+    if (page == nullptr || error == nullptr || token.empty() ||
+        session_id.size() != 36) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *page = {};
+    *error = {};
+    ESP_RETURN_ON_ERROR(
+        ValidateTokenOrClear(token, "note-study-candidates"),
+        kTag,
+        "validate note candidate token");
+    ESP_RETURN_ON_ERROR(
+        WaitForNetworkReadyForHttps(),
+        kTag,
+        "prepare network for note candidates");
+
+    std::string request_body;
+    ESP_RETURN_ON_ERROR(
+        protocol::note_study_v1::BuildCandidatePageRequest(
+            request, &request_body),
+        kTag,
+        "build note candidate page request");
+    const std::string url = BuildUrl(
+        "/v3/notes/sessions/" + session_id + "/candidates");
+    int status_code = 0;
+    std::string body;
+    const esp_err_t http_result = HttpRequest(
+        "POST",
+        url,
+        &token,
+        &request_body,
+        &status_code,
+        &body,
+        protocol::v3::kProtocolHeader,
+        &request.metadata.request_id);
+    if (http_result != ESP_OK) return http_result;
+    if (status_code == 401) {
+        return ClearTokenOnUnauthorized("note-study-candidates");
+    }
+    const esp_err_t parse_result =
+        protocol::note_study_v1::ParseCandidatePageResponse(
+            body, request.metadata.request_id, page, error);
+    if (status_code != 200 || parse_result != ESP_OK) {
+        ESP_LOGW(
+            kTag,
+            "note candidate page failed: status=%d code=%s retryable=%d",
+            status_code,
+            error->code.c_str(),
+            error->retryable ? 1 : 0);
+        return parse_result == ESP_OK ? ESP_FAIL : parse_result;
+    }
+    return ESP_OK;
+}
+
 esp_err_t LookupWordWithAi(const std::string& token, const WqnWordAiLookupRequest& request, WqnWordAiLookupResult* result)
 {
     if (result == nullptr) {
