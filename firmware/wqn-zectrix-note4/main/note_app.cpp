@@ -81,13 +81,6 @@ void LoadCurrentNoteBody(wqn::NoteAppState* state)
     }
 }
 
-size_t RemainingCandidateItems(const wqn::PersistedNoteSession& session, size_t selected)
-{
-    return session.remote.items.size() > selected
-        ? session.remote.items.size() - selected
-        : 0;
-}
-
 void RequestNoteCandidatePageIfNeeded(wqn::NoteAppState* state)
 {
     if (state == nullptr || !state->session.persisted.active ||
@@ -97,10 +90,13 @@ void RequestNoteCandidatePageIfNeeded(wqn::NoteAppState* state)
         state->session.commit_state == wqn::NoteObservationCommitState::kPersisting) {
         return;
     }
-    if (RemainingCandidateItems(state->session.persisted, state->note_list_selected) <=
-        kCandidatePrefetchThreshold) {
-        state->session.page_requested = true;
-    }
+    // Eagerly pull the rest of the notebook's candidates (one page per pump,
+    // chained via ApplyNoteCandidatePageResult) so the title list can always
+    // scroll to the very end. The old threshold-based prefetch only started when
+    // the selection was within a few rows of the loaded end, so scrolling faster
+    // than the network round-trip left the list stuck before the last note
+    // ("无法翻到底"). Bounded by the server's has_more and kMaxSessionItems.
+    state->session.page_requested = true;
 }
 
 bool SnapshotMatches(
