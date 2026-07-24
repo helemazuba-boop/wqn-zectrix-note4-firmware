@@ -100,6 +100,33 @@ gate enforces this.
 - New word-pack manifests are staged for the next session. If an active card
   changes after sync, compare the persisted session snapshot against the loaded
   pack SHA and stop using that build.
+- Pause/resume only flips the `paused` flag. It writes the tiny per-mode cursor
+  file (`wsq.cur`/`wsr.cur`/`wsd.cur`, owner `word-session-cursor`), not the full
+  candidate snapshot; a multi-second `word-session-save` on pause/resume is a
+  regression. The cursor is overlaid on the snapshot after outbox reconciliation
+  on load. Full snapshot writes remain only on session create and candidate-page
+  append.
+
+## Note page slow to open, sync, or scroll
+
+- Note packs carry a body up to 16 KB per note, so the word patterns had to be
+  reworked for volume. Watch for these regressions:
+- Index build (`note pack index: ... notes=N`) should be milliseconds, not
+  seconds. `ScanNotePackFile` parses metadata only (`ParseNoteRecordLine` with
+  `include_content=false`); the body is read on demand in `ReadNotePackEntry`.
+  If scans slow down, confirm the body is not being materialised per record.
+- Title-list rendering uses `note_order`, a `note_id`-sorted index built once in
+  `LoadNotePackIndex`; `FindPackEntry` binary-searches it. A per-render O(N x M)
+  scan (one linear `FindPackEntry` per candidate item) is a regression.
+- Body scrolling must reuse cached wrapped lines. `RenderNoteBody` caches
+  `WrapUtf8TextToWidth` output keyed by `note_id`; re-wrapping the full body
+  every frame pegs the CPU.
+- Sync must hash each local pack at most once. `SyncNotePacks` evaluates
+  `NotePackNeedsDownload` (full-file SHA-256) once into a vector; re-hashing every
+  unchanged pack per sync is a regression.
+- Known deferred item: pack SHA verification and large-pack installs still run on
+  the storage queue and can block the UI thread. Moving that blocking I/O off the
+  UI thread is a planned unified async pass, not yet done.
 
 ## Useful local checks
 
