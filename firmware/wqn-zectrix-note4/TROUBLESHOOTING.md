@@ -121,12 +121,23 @@ gate enforces this.
 - Body scrolling must reuse cached wrapped lines. `RenderNoteBody` caches
   `WrapUtf8TextToWidth` output keyed by `note_id`; re-wrapping the full body
   every frame pegs the CPU.
+- Opening a note must not rewrite the session snapshot. `CommitObservationTransaction`
+  appends the durable `opened` record to the outbox and returns `ESP_OK`; the
+  advanced cursor (`next_sequence` + `position`) is reconciled from that record by
+  `ReconcileSession` on load. A multi-second `note-observation-commit` (owner in
+  the storage log) means the full-snapshot `SaveSessionRaw` was reintroduced into
+  the fresh-append path -- that froze the UI ~2-3 s on every note open.
 - Sync must hash each local pack at most once. `SyncNotePacks` evaluates
   `NotePackNeedsDownload` (full-file SHA-256) once into a vector; re-hashing every
   unchanged pack per sync is a regression.
 - Known deferred item: pack SHA verification and large-pack installs still run on
   the storage queue and can block the UI thread. Moving that blocking I/O off the
-  UI thread is a planned unified async pass, not yet done.
+  UI thread is a planned unified async pass, not yet done. The remaining note
+  session-snapshot writes (session create in `ApplyNoteSessionStartResult`,
+  candidate-page append in `ApplyNoteCandidatePageResult`) are also synchronous,
+  but they persist genuinely new data and only run after a network round-trip, so
+  they are infrequent -- they belong to that same deferred async pass, not the
+  per-open hot path.
 
 ## Note `opened` not syncing (last-viewed / recommendation stale)
 
