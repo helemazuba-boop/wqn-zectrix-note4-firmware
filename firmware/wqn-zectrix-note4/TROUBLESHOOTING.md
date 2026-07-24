@@ -139,6 +139,26 @@ gate enforces this.
   they are infrequent -- they belong to that same deferred async pass, not the
   per-open hot path.
 
+## Note page 花屏 / ghosting after a few steps
+
+- Symptom: after the repaint fix, navigating the note page a few steps shows
+  garbage/ghosting (花屏), often intermittently around a mode transition.
+- Root cause class: e-paper accumulates charge from partial waveforms. The
+  driver only promotes to a clean full refresh after `kMaxPartialRefreshesBeforeFull`
+  (=20) partials, and a change whose dirty bounding box is taller than
+  `kLocalPartialMaxHeight` (=170) or wider than 45% area is sent as a
+  "full-frame-partial" (whole frame via partial waveform) -- fast but ghost-prone.
+  Note mode transitions (notebook<->title<->body) repaint ~79% of the panel, so
+  as partials they ghost badly.
+- Fix in place: note mode transitions return `RefreshSchedule::kCommit` (full
+  refresh) so the panel is cleared; same-mode navigation keeps the fast partial
+  path. If 花屏 still appears during pure list up/down (no open), the title-list
+  render is producing a tall dirty bounding box (selection change spread between
+  the top status line and bottom hint) -> full-frame-partial; the remedy is to
+  tighten the list render so only changed rows are dirtied, or to promote note
+  full-frame-partials to full at the driver boundary (do NOT do this globally --
+  the AI page relies on fast full-frame-partial scrolling).
+
 ## Note page frozen / does not repaint on navigation
 
 - Symptom: the note page shows once on entry, then no button (notebook/title
