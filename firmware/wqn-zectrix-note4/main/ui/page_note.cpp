@@ -6,6 +6,9 @@
 #include "ui_widgets.h"
 
 #include <algorithm>
+#include <cstdint>
+#include <cstdio>
+#include <ctime>
 #include <string>
 #include <vector>
 
@@ -42,10 +45,51 @@ size_t ClampListWindowStart(size_t start, size_t selected, size_t count, size_t 
     return start;
 }
 
-// A note's last-viewed cell: the stored ISO date, or 未读 when never opened.
+// Converts a UTC ISO-8601 instant ("...Z" or "...+00:00") to the Beijing
+// (UTC+8) calendar date. The pin stays UTC in storage and on the wire (the
+// server orders by it), so the calendar-day shift belongs to the display
+// layer -- otherwise a note read after midnight Beijing shows yesterday's
+// date. Uses the days-from-civil algorithm instead of relying on newlib
+// shipping timegm().
+std::string BeijingDateFromUtcIso(const std::string& iso)
+{
+    int year = 0;
+    int month = 0;
+    int day = 0;
+    int hour = 0;
+    int minute = 0;
+    int second = 0;
+    if (std::sscanf(
+            iso.c_str(), "%d-%d-%dT%d:%d:%d", &year, &month, &day, &hour, &minute, &second) != 6 ||
+        month < 1 || month > 12 || day < 1 || day > 31) {
+        return std::string();
+    }
+    const int adjusted_year = year - (month <= 2 ? 1 : 0);
+    const int era = (adjusted_year >= 0 ? adjusted_year : adjusted_year - 399) / 400;
+    const unsigned yoe = static_cast<unsigned>(adjusted_year - era * 400);
+    const unsigned doy = (153u * static_cast<unsigned>(month + (month > 2 ? -3 : 9)) + 2u) / 5u +
+        static_cast<unsigned>(day) - 1u;
+    const unsigned doe = yoe * 365u + yoe / 4u - yoe / 100u + doy;
+    const int64_t days =
+        static_cast<int64_t>(era) * 146097 + static_cast<int64_t>(doe) - 719468;
+    const std::time_t epoch = static_cast<std::time_t>(
+        days * 86400 + hour * 3600 + minute * 60 + second + 8 * 3600);
+    std::tm beijing = {};
+    gmtime_r(&epoch, &beijing);
+    char buffer[12] = {};
+    if (std::strftime(buffer, sizeof(buffer), "%Y-%m-%d", &beijing) == 0) {
+        return std::string();
+    }
+    return buffer;
+}
+
+// A note's last-viewed cell: the pinned date in Beijing time, or 未读 when
+// never opened.
 std::string LastViewedLabel(const std::string& last_opened_at)
 {
     if (last_opened_at.empty()) return "未读";
+    const std::string beijing_date = BeijingDateFromUtcIso(last_opened_at);
+    if (!beijing_date.empty()) return "看过 " + beijing_date;
     return "看过 " + last_opened_at.substr(0, std::min<size_t>(10, last_opened_at.size()));
 }
 

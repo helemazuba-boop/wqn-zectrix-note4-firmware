@@ -699,6 +699,23 @@ bool TakeNoteObservationEffect(
     }
     advanced.remote.next_sequence = pending.sequence + 1;
     advanced.position = pending.next_position;
+    // [last-viewed-pin] Project the opened action into the session's pinned
+    // last-viewed label right away. The pin is otherwise frozen at
+    // session-creation time, so a notebook entered before any reading kept
+    // showing 未读 for every note all day even though the observations reached
+    // the cloud -- the fresh label only arrived with the NEXT session.
+    if (pending.action == protocol::note_study_v1::ObservationAction::kOpened) {
+        for (auto& item : advanced.remote.items) {
+            if (pending.item_id == item.item_id) {
+                std::snprintf(
+                    item.last_opened_at,
+                    sizeof(item.last_opened_at),
+                    "%s",
+                    pending.occurred_at.c_str());
+                break;
+            }
+        }
+    }
     state->session.pending_advanced_session = advanced;
     state->session.observation_effect_ready = false;
     *observation = pending;

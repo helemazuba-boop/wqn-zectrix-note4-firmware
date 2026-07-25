@@ -761,8 +761,29 @@ void ReconcileSession(
 {
     if (session == nullptr || changed == nullptr) return;
     for (const OutboxRecord& observation : records) {
-        if (session->remote.session_id != observation.session_id ||
-            observation.sequence < session->remote.next_sequence) {
+        if (session->remote.session_id != observation.session_id) {
+            continue;
+        }
+        // [last-viewed-pin] Replay opened actions into the pinned last-viewed
+        // label regardless of cursor progress: the observation commit hot path
+        // does not rewrite the session snapshot, so after a reboot the pins
+        // only exist in these outbox records until a checkpoint persists them.
+        if (observation.action ==
+            static_cast<uint8_t>(wqn::protocol::note_study_v1::ObservationAction::kOpened)) {
+            for (auto& item : session->remote.items) {
+                if (std::strcmp(item.item_id, observation.item_id) != 0) continue;
+                if (std::strcmp(item.last_opened_at, observation.occurred_at) != 0) {
+                    std::snprintf(
+                        item.last_opened_at,
+                        sizeof(item.last_opened_at),
+                        "%s",
+                        observation.occurred_at);
+                    *changed = true;
+                }
+                break;
+            }
+        }
+        if (observation.sequence < session->remote.next_sequence) {
             continue;
         }
         session->remote.next_sequence = observation.sequence + 1;
