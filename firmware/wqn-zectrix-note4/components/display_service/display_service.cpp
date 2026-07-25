@@ -67,11 +67,15 @@ constexpr uint32_t kMaxPartialRefreshesBeforeFull = 20;
 // ~5-6%) stress the panel far more than a timer's once-per-second tick
 // (~0.02%). Field logs show the panel drifting from the framebuffer (stale
 // highlight rows on screen while the framebuffer had moved on) after ~11
-// consecutive heavy partials, and BUSY-pin timeouts (~2.7 s recovery stalls)
-// around 13-16. Cap heavy runs separately and low; light ticks keep the
-// 20-run budget above so a running timer stays flash-free.
+// consecutive heavy partials. Routine cleanup happens at idle (see
+// PowerOffEpdAfterIdleIfNeeded) so scrolling never eats a 1.2 s flash
+// mid-flow; this cap is only the in-flow safety net just under the observed
+// drift onset for uninterrupted 10+ step scrolls.
 constexpr float kHeavyPartialDiffRatio = 0.02f;
-constexpr uint32_t kMaxHeavyPartialsBeforeFull = 6;
+constexpr uint32_t kMaxHeavyPartialsBeforeFull = 10;
+// Run the deferred cleanup full refresh at idle once at least this many heavy
+// partials accumulated since the last full.
+constexpr uint32_t kIdleCleanupHeavyPartials = 2;
 constexpr int kTextGlyphWidth = 5;
 constexpr int kTextGlyphHeight = 7;
 constexpr int kTextCellWidth = 6;
@@ -1651,6 +1655,27 @@ void wqn::PowerOffEpdAfterIdleIfNeeded()
     }
     if ((esp_timer_get_time() / 1000 - g_last_epd_activity_ms) < idle_ms) {
         return;
+    }
+    // [epd-health] Deferred heavy-partial cleanup: forcing the full refresh
+    // mid-scroll read as a 1.2 s freeze every few steps, so scrolling stays on
+    // partials and the accumulated charge is cleared here instead, once the
+    // user has stopped interacting and just before the rail drops.
+    if (g_heavy_partials_since_full >= kIdleCleanupHeavyPartials &&
+        g_initialized && g_framebuffer != nullptr) {
+        EpdOperationGuard operation(0);
+        if (operation.locked() &&
+            g_heavy_partials_since_full >= kIdleCleanupHeavyPartials) {
+            ESP_LOGI(kTag, "EPD idle cleanup full refresh: heavy=%u",
+                     static_cast<unsigned>(g_heavy_partials_since_full));
+            // Defeat the unchanged-framebuffer skip; the panel content is what
+            // needs the clean waveform, not the pixels.
+            g_previous_framebuffer_synced = false;
+            const esp_err_t cleanup_ret = RefreshEpdFull(false, true);
+            if (cleanup_ret != ESP_OK) {
+                ESP_LOGW(kTag, "EPD idle cleanup full refresh failed: %s",
+                         esp_err_to_name(cleanup_ret));
+            }
+        }
     }
     const esp_err_t result = TryPowerOffEpd(0);
     if (result == ESP_OK) {
