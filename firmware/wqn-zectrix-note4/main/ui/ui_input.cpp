@@ -808,14 +808,17 @@ RefreshSchedule ApplyButtonEvent(
             }
         }
         BuildHomeSummary(state);
-        // A note mode transition (notebook<->title<->body) or a list viewport
-        // jump repaints most of the screen; do a full refresh so the panel is
-        // cleared (large partial waveforms ghost, and HIL logs show a windowed
-        // local partial issued right after such a full-frame partial wedges the
-        // SSD1683 BUSY line for 4+ s). Same-window navigation -- including body
-        // scroll -- uses the fast partial path; body over-scroll is bounded by
-        // the reducer clamp so reverse-scroll always reveals new content.
+        // A note mode transition (notebook<->title<->body<->image) or a list
+        // viewport jump repaints most of the screen; do a full refresh so the
+        // panel is cleared (large partial waveforms ghost, and HIL logs show a
+        // windowed local partial issued right after such a full-frame partial
+        // wedges the SSD1683 BUSY line for 4+ s). Every step inside the image
+        // layer is a whole-frame change too, so it always commits. Same-window
+        // navigation -- including body scroll -- uses the fast partial path;
+        // body over-scroll is bounded by the reducer clamp so reverse-scroll
+        // always reveals new content.
         if (state->note_app.mode != old_note_mode ||
+            state->note_app.mode == wqn::NoteAppMode::kNoteImageView ||
             state->note_app.notebook_window_start != old_notebook_window ||
             state->note_app.note_list_window_start != old_note_list_window) {
             return RefreshSchedule::kCommit;

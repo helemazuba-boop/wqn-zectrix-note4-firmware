@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <ctime>
+#include <memory>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -191,6 +192,7 @@ enum class NoteCloudOp {
     kPackSync,
     kStartSession,
     kFetchSessionPage,
+    kFetchImage,
 };
 
 struct NoteCloudRequest {
@@ -200,6 +202,10 @@ struct NoteCloudRequest {
     char cursor[65] = {};
     char notebook_id[37] = {};
     uint16_t limit = 0;
+    // kFetchImage: which note/attachment and the content hash to verify.
+    char note_id[37] = {};
+    char image_id[65] = {};
+    uint8_t image_index = 0;
 };
 
 struct NoteCloudResult {
@@ -212,6 +218,9 @@ struct NoteCloudResult {
     wqn::protocol::note_study_v1::CandidatePageData candidate_page;
     wqn::protocol::v3::Error protocol_error;
     std::string message;
+    // kFetchImage: validated WQNI bytes (header + payload) and their id.
+    std::string image_id;
+    std::shared_ptr<const std::vector<uint8_t>> image_wqni;
 };
 
 struct NoteCloudResultReady {
@@ -261,6 +270,9 @@ bool QueueNoteCandidatePage(
     const std::string& session_id,
     const wqn::protocol::note_study_v1::CandidatePageRequest& request);
 void PumpNoteCandidatePrefetch(UiRuntime* runtime);
+bool QueueNoteImageFetch(
+    const std::string& note_id, uint8_t image_index, const std::string& image_id);
+void PumpNoteImageFetch(UiRuntime* runtime);
 
 bool ApplyTodoCloudResult(wqn::UiState* state, const TodoCloudResult& result);
 bool ApplyWordCloudResult(wqn::UiState* state, WordCloudResult& result);

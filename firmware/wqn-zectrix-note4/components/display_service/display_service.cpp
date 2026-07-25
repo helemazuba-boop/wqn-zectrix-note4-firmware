@@ -1062,6 +1062,15 @@ void ClearEpdFramebuffer(bool white)
     std::memset(g_framebuffer, white ? 0xFF : 0x00, kEpdFramebufferSize);
 }
 
+void BlitEpdFramebuffer(const uint8_t* bitmap, size_t size)
+{
+    if (g_framebuffer == nullptr || bitmap == nullptr ||
+        size != static_cast<size_t>(kEpdFramebufferSize)) {
+        return;
+    }
+    std::memcpy(g_framebuffer, bitmap, kEpdFramebufferSize);
+}
+
 void DrawEpdPixel(int x, int y, bool black)
 {
     if (g_framebuffer == nullptr || x < 0 || x >= kEpdWidth || y < 0 || y >= kEpdHeight) {

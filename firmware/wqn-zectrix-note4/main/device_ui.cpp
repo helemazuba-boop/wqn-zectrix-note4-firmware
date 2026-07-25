@@ -784,6 +784,7 @@ wqn::AiStreamingStatusView streaming_view{};
         }
         device_ui_internal::PumpWordCandidatePrefetch(&ui_runtime);
         device_ui_internal::PumpNoteCandidatePrefetch(&ui_runtime);
+        device_ui_internal::PumpNoteImageFetch(&ui_runtime);
         if (word_pack_refresh_pending &&
             !device_ui_internal::IsWordCloudBusy() &&
             device_ui_internal::QueueWordReviewRefresh()) {

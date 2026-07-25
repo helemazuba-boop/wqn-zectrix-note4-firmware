@@ -18,6 +18,7 @@
 #include "device_protocol/note_study.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_rom_crc.h"
 #include "esp_spiffs.h"
 #include "esp_timer.h"
 #include "mbedtls/sha256.h"
@@ -577,6 +578,22 @@ esp_err_t ParseNoteRecordLine(const char* line, wqn::WqnNoteEntry* entry, bool i
     }
     entry->sort_index = sort_index;
     entry->revision = static_cast<int>(revision);
+    // Optional e-ink image attachments. Absent on packs built before the image
+    // feature; when present it must be a well-formed array of <= 4 SHA-256 ids.
+    cJSON* image_ids = cJSON_GetObjectItemCaseSensitive(document.root(), "image_ids");
+    if (image_ids != nullptr && !cJSON_IsNull(image_ids)) {
+        if (!cJSON_IsArray(image_ids) || cJSON_GetArraySize(image_ids) > 4) {
+            return ESP_ERR_INVALID_RESPONSE;
+        }
+        cJSON* image_id = nullptr;
+        cJSON_ArrayForEach(image_id, image_ids) {
+            if (!cJSON_IsString(image_id) || image_id->valuestring == nullptr ||
+                std::strlen(image_id->valuestring) != 64) {
+                return ESP_ERR_INVALID_RESPONSE;
+            }
+            entry->image_ids.emplace_back(image_id->valuestring);
+        }
+    }
     return ESP_OK;
 }
 
@@ -674,6 +691,7 @@ esp_err_t ScanNotePackFile(
         indexed.file_offset = static_cast<uint32_t>(offset);
         indexed.notebook_order = notebook_order;
         indexed.sort_index = entry.sort_index;
+        indexed.image_count = static_cast<uint8_t>(entry.image_ids.size());
         index->entries.push_back(indexed);
         ++scanned_entries;
         if (index->entries.size() > kMaxIndexEntries || scanned_entries > notebook.entry_count) {
@@ -1270,6 +1288,147 @@ esp_err_t ReadNotePackEntry(const NotePackIndexEntry& index_entry, WqnNoteEntry*
     }
     entry->note_id = index_entry.note_id;
     entry->notebook_id = index_entry.notebook_id;
+    return ESP_OK;
+}
+
+namespace {
+
+std::string NoteImageCachePath(const std::string& image_id)
+{
+    return std::string(kStorageRoot) + "/ni_" + image_id.substr(0, 12) + ".wqni";
+}
+
+bool IsNoteImageId(const std::string& image_id)
+{
+    if (image_id.size() != 64) return false;
+    for (char c : image_id) {
+        if (!std::isxdigit(static_cast<unsigned char>(c))) return false;
+    }
+    return true;
+}
+
+// Keeps the image cache bounded: when at/over the cap, delete the
+// oldest-mtime ni_*.wqni files until one slot is free. SPIFFS mtimes are
+// second-granular; ties just pick an arbitrary victim, which is fine for a
+// best-effort LRU.
+void EvictNoteImageCacheIfNeeded()
+{
+    struct Candidate {
+        std::string path;
+        time_t mtime;
+    };
+    std::vector<Candidate> files;
+    DIR* directory = opendir(kStorageRoot);
+    if (directory == nullptr) return;
+    struct dirent* item = nullptr;
+    while ((item = readdir(directory)) != nullptr) {
+        const std::string name = item->d_name;
+        if (name.rfind("ni_", 0) != 0 || name.size() < 8 ||
+            name.substr(name.size() - 5) != ".wqni") {
+            continue;
+        }
+        const std::string path = std::string(kStorageRoot) + "/" + name;
+        struct stat info = {};
+        files.push_back({path, stat(path.c_str(), &info) == 0 ? info.st_mtime : 0});
+    }
+    closedir(directory);
+    if (files.size() < wqn::kNoteImageCacheMaxFiles) return;
+    std::sort(files.begin(), files.end(), [](const Candidate& a, const Candidate& b) {
+        return a.mtime < b.mtime;
+    });
+    const size_t to_delete = files.size() + 1 - wqn::kNoteImageCacheMaxFiles;
+    for (size_t i = 0; i < to_delete && i < files.size(); ++i) {
+        if (unlink(files[i].path.c_str()) != 0) {
+            ESP_LOGW(kTag, "note image cache eviction failed: %s", files[i].path.c_str());
+        }
+    }
+}
+
+}  // namespace
+
+esp_err_t ValidateNoteImageWqni(const uint8_t* data, size_t size)
+{
+    if (data == nullptr || size != kNoteImageFileBytes) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    if (std::memcmp(data, "WQNI", 4) != 0) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    const uint8_t version = data[4];
+    const uint8_t pixel_format = data[5];
+    const uint16_t flags = static_cast<uint16_t>(data[6]) | (static_cast<uint16_t>(data[7]) << 8);
+    const uint16_t width = static_cast<uint16_t>(data[8]) | (static_cast<uint16_t>(data[9]) << 8);
+    const uint16_t height = static_cast<uint16_t>(data[10]) | (static_cast<uint16_t>(data[11]) << 8);
+    uint32_t payload_length = 0;
+    uint32_t crc = 0;
+    std::memcpy(&payload_length, data + 12, sizeof(payload_length));
+    std::memcpy(&crc, data + 16, sizeof(crc));
+    // flags 0x0003 = MSB-first bit order + 1-renders-white: the exact wqn_epd
+    // framebuffer convention. Anything else would need a transform we do not do.
+    if (version != 1 || pixel_format != 1 || flags != 0x0003 || width != 400 ||
+        height != 300 || payload_length != kNoteImagePayloadBytes) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    const uint32_t actual = esp_rom_crc32_le(
+        0, data + kNoteImageHeaderBytes, kNoteImagePayloadBytes);
+    if (actual != crc) {
+        return ESP_ERR_INVALID_CRC;
+    }
+    return ESP_OK;
+}
+
+esp_err_t LoadCachedNoteImage(const std::string& image_id, std::vector<uint8_t>* wqni)
+{
+    if (wqni == nullptr || !IsNoteImageId(image_id)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    const std::string path = NoteImageCachePath(image_id);
+    FILE* file = std::fopen(path.c_str(), "rb");
+    if (file == nullptr) {
+        return ESP_ERR_NOT_FOUND;
+    }
+    wqni->assign(kNoteImageFileBytes, 0);
+    const size_t read = std::fread(wqni->data(), 1, kNoteImageFileBytes, file);
+    const bool extra = std::fgetc(file) != EOF;
+    std::fclose(file);
+    if (read != kNoteImageFileBytes || extra ||
+        ValidateNoteImageWqni(wqni->data(), wqni->size()) != ESP_OK) {
+        // Corrupt cache entries are dropped so the next request re-downloads.
+        unlink(path.c_str());
+        wqni->clear();
+        return ESP_ERR_INVALID_CRC;
+    }
+    return ESP_OK;
+}
+
+esp_err_t StoreCachedNoteImage(const std::string& image_id, const uint8_t* data, size_t size)
+{
+    if (!IsNoteImageId(image_id)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    const esp_err_t valid = ValidateNoteImageWqni(data, size);
+    if (valid != ESP_OK) {
+        return valid;
+    }
+    EvictNoteImageCacheIfNeeded();
+    const std::string path = NoteImageCachePath(image_id);
+    const std::string temp = path + ".tmp";
+    FILE* file = std::fopen(temp.c_str(), "wb");
+    if (file == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
+    const size_t written = std::fwrite(data, 1, size, file);
+    const bool flushed = std::fflush(file) == 0;
+    std::fclose(file);
+    if (written != size || !flushed) {
+        unlink(temp.c_str());
+        return ESP_FAIL;
+    }
+    unlink(path.c_str());
+    if (rename(temp.c_str(), path.c_str()) != 0) {
+        unlink(temp.c_str());
+        return ESP_FAIL;
+    }
     return ESP_OK;
 }
 

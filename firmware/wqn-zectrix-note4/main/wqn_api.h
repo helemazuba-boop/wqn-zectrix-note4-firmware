@@ -320,6 +320,18 @@ esp_err_t DownloadNotePackStream(
     const WqnNotePackManifestNotebook& notebook,
     WqnHttpChunkSink sink,
     void* context);
+// Downloads one note image as a WQNI file (20-byte header + 15000-byte 1-bpp
+// payload) from /v3/notes/images/{note_id}/{image_index}. Verifies the exact
+// file size and that sha256(bytes) == expected_image_id (the content address
+// carried by the pack line); WQNI header/CRC validation is the caller's job
+// via wqn::ValidateNoteImageWqni.
+esp_err_t DownloadNoteImageV1(
+    const std::string& token,
+    const protocol::v3::RequestMetadata& metadata,
+    const std::string& note_id,
+    uint8_t image_index,
+    const std::string& expected_image_id,
+    std::vector<uint8_t>* wqni);
 esp_err_t CreateNoteStudySessionV1(
     const std::string& token,
     const protocol::note_study_v1::CreateSessionRequest& request,

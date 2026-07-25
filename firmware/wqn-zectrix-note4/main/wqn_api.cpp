@@ -2738,6 +2738,139 @@ esp_err_t DownloadNotePackStream(
     return result;
 }
 
+esp_err_t DownloadNoteImageV1(
+    const std::string& token,
+    const protocol::v3::RequestMetadata& metadata,
+    const std::string& note_id,
+    uint8_t image_index,
+    const std::string& expected_image_id,
+    std::vector<uint8_t>* wqni)
+{
+    // WQNI file size is fixed by the contract: 20-byte header + 400x300/8.
+    constexpr size_t kWqniFileBytes = 20 + 15000;
+    if (wqni == nullptr || metadata.request_id.empty() || note_id.size() != 36 ||
+        image_index > 3 || expected_image_id.size() != 64) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (token.empty()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    const esp_err_t token_result = ValidateTokenOrClear(token, "note-image-download");
+    if (token_result != ESP_OK) {
+        return token_result;
+    }
+
+    ESP_RETURN_ON_ERROR(WaitForNetworkReadyForHttps(), kTag, "prepare network for note-image-download");
+
+    const std::string url = BuildUrl(
+        "/v3/notes/images/" + note_id + "/" + std::to_string(image_index));
+    esp_http_client_config_t config = {};
+    config.url = url.c_str();
+    config.method = HTTP_METHOD_GET;
+    config.timeout_ms = kHttpTimeoutMs;
+    config.crt_bundle_attach = esp_crt_bundle_attach;
+    config.buffer_size = 2048;
+
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (client == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
+    const std::string authorization = "Bearer " + token;
+    esp_err_t result = esp_http_client_set_header(
+        client, "Accept", "application/octet-stream");
+    if (result == ESP_OK) {
+        result = esp_http_client_set_header(
+            client, "Authorization", authorization.c_str());
+    }
+    if (result == ESP_OK) {
+        result = esp_http_client_set_header(
+            client, "X-WQN-Protocol", protocol::v3::kProtocolHeader);
+    }
+    if (result == ESP_OK) {
+        result = esp_http_client_set_header(
+            client, "X-WQN-Request-Id", metadata.request_id.c_str());
+    }
+    if (result == ESP_OK) {
+        result = esp_http_client_open(client, 0);
+    }
+    int content_length = -1;
+    int status_code = 0;
+    if (result == ESP_OK) {
+        content_length = esp_http_client_fetch_headers(client);
+        status_code = esp_http_client_get_status_code(client);
+    }
+    if (result == ESP_OK && status_code == 200 && content_length >= 0 &&
+        static_cast<size_t>(content_length) != kWqniFileBytes) {
+        ESP_LOGW(kTag, "note-image-download Content-Length mismatch: expected=%u actual=%d",
+                 static_cast<unsigned>(kWqniFileBytes), content_length);
+        result = ESP_ERR_INVALID_SIZE;
+    }
+    wqni->clear();
+    wqni->reserve(kWqniFileBytes);
+    std::array<uint8_t, 2048> buffer = {};
+    while (result == ESP_OK && status_code == 200) {
+        const int read = esp_http_client_read(
+            client, reinterpret_cast<char*>(buffer.data()), buffer.size());
+        FeedTaskWatchdogIfSubscribed();
+        if (read < 0) {
+            result = ESP_FAIL;
+            break;
+        }
+        if (read == 0) {
+            break;
+        }
+        if (wqni->size() + static_cast<size_t>(read) > kWqniFileBytes) {
+            result = ESP_ERR_INVALID_SIZE;
+            break;
+        }
+        wqni->insert(wqni->end(), buffer.data(), buffer.data() + read);
+    }
+    if (result == ESP_OK && status_code == 200 &&
+        (wqni->size() != kWqniFileBytes ||
+         !esp_http_client_is_complete_data_received(client))) {
+        result = ESP_ERR_INVALID_SIZE;
+    }
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+
+    if (status_code == 401) {
+        wqni->clear();
+        return ClearTokenOnUnauthorized("note-image-download");
+    }
+    if (status_code != 200) {
+        ESP_LOGW(kTag, "note-image-download HTTP status=%d note=%s index=%u",
+                 status_code, note_id.c_str(), static_cast<unsigned>(image_index));
+        wqni->clear();
+        return status_code == 404 ? ESP_ERR_NOT_FOUND : ESP_FAIL;
+    }
+    if (result != ESP_OK) {
+        wqni->clear();
+        return result;
+    }
+
+    // Content addressing: the pack line pinned the image id, so the bytes must
+    // hash to it or the panel would show something the user never attached.
+    std::array<unsigned char, 32> digest = {};
+    if (mbedtls_sha256(wqni->data(), wqni->size(), digest.data(), 0) != 0) {
+        wqni->clear();
+        return ESP_FAIL;
+    }
+    constexpr char kHexDigits[] = "0123456789abcdef";
+    std::string actual_id;
+    actual_id.reserve(64);
+    for (unsigned char byte : digest) {
+        actual_id.push_back(kHexDigits[byte >> 4]);
+        actual_id.push_back(kHexDigits[byte & 0x0f]);
+    }
+    if (actual_id != expected_image_id) {
+        ESP_LOGW(kTag, "note-image-download hash mismatch: expected=%.12s actual=%.12s",
+                 expected_image_id.c_str(), actual_id.c_str());
+        wqni->clear();
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    return ESP_OK;
+}
+
 esp_err_t CreateNoteStudySessionV1(
     const std::string& token,
     const protocol::note_study_v1::CreateSessionRequest& request,

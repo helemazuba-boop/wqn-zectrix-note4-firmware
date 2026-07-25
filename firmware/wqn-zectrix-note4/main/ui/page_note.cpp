@@ -165,8 +165,20 @@ esp_err_t RenderNoteBody(const wqn::NoteAppSnapshot& note)
     if (!note.has_body) {
         return DrawCenteredText(kNoteMarginX, 160, kContentW, "内容未同步，请稍后再试");
     }
-    // The note title now lives in the status bar, so the body uses full height.
-    const int body_top = kContentTop;
+    // The note title lives in the status bar, so the body uses full height.
+    // Notes with images dedicate the first row to the image entry (按上进入
+    // 全屏图片)；the body clamp in note_app.cpp mirrors the reduced line budget.
+    int body_top = kContentTop;
+    if (note.note_image_count > 0) {
+        char entry[64];
+        std::snprintf(
+            entry, sizeof(entry), "↑ 查看图片(%u)",
+            static_cast<unsigned>(note.note_image_count));
+        ESP_RETURN_ON_ERROR(
+            DrawClippedText(kNoteMarginX + 2, body_top, kContentW - 14, entry),
+            kTag, "draw note image entry");
+        body_top += kBodyLineH;
+    }
     const int visible = std::max(1, (kBodyBottom - body_top) / kBodyLineH);
     // Wrap the body once per opened note. Re-running WrapUtf8TextToWidth over a
     // body of up to 16 KB on every frame pegged the CPU while scrolling; cache the
@@ -205,6 +217,19 @@ esp_err_t RenderNoteBody(const wqn::NoteAppSnapshot& note)
 esp_err_t RenderNoteToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
 {
     const wqn::NoteAppSnapshot& note = frame.note_app;
+
+    // Full-screen image: the WQNI payload IS the frame (no status bar, no
+    // margins), so blit it straight into the framebuffer and refresh.
+    if (note.mode == wqn::NoteAppMode::kNoteImageView && note.note_image_ready &&
+        note.note_image_wqni != nullptr &&
+        note.note_image_wqni->size() ==
+            wqn::kNoteImageHeaderBytes + static_cast<size_t>(wqn::kEpdFramebufferSize)) {
+        wqn::BlitEpdFramebuffer(
+            note.note_image_wqni->data() + wqn::kNoteImageHeaderBytes,
+            static_cast<size_t>(wqn::kEpdFramebufferSize));
+        return RefreshFrame(frame, schedule);
+    }
+
     wqn::ClearEpdFramebuffer(true);
 
     // The status-bar title carries the page context (priority: note title >
@@ -213,11 +238,14 @@ esp_err_t RenderNoteToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
     // without clipping the title, so an untrimmed title would overrun them.
     std::string bar_title = "笔记";
     if ((note.mode == wqn::NoteAppMode::kNoteList ||
-         note.mode == wqn::NoteAppMode::kNoteView) &&
+         note.mode == wqn::NoteAppMode::kNoteView ||
+         note.mode == wqn::NoteAppMode::kNoteImageView) &&
         !note.notebook_title.empty()) {
         bar_title = note.notebook_title;
     }
-    if (note.mode == wqn::NoteAppMode::kNoteView && !note.note_title.empty()) {
+    if ((note.mode == wqn::NoteAppMode::kNoteView ||
+         note.mode == wqn::NoteAppMode::kNoteImageView) &&
+        !note.note_title.empty()) {
         bar_title = note.note_title;
     }
     const auto bar_lines = wqn::WrapUtf8TextToWidth(bar_title, wqn::kEpdWidth / 2, 1);
@@ -238,6 +266,19 @@ esp_err_t RenderNoteToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
             break;
         case wqn::NoteAppMode::kNoteView:
             ESP_RETURN_ON_ERROR(RenderNoteBody(note), kTag, "render note body");
+            break;
+        case wqn::NoteAppMode::kNoteImageView:
+            // Ready images returned above; this is the loading / error page.
+            ESP_RETURN_ON_ERROR(
+                DrawCenteredText(
+                    kNoteMarginX, 148, kContentW,
+                    note.note_image_error ? "图片加载失败" : "正在加载图片…"),
+                kTag, "render note image status");
+            ESP_RETURN_ON_ERROR(
+                DrawCenteredText(
+                    kNoteMarginX, 176, kContentW,
+                    note.note_image_error ? "长按返回正文" : "长按可取消"),
+                kTag, "render note image status hint");
             break;
     }
 

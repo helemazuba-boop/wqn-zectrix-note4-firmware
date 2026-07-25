@@ -127,6 +127,34 @@ void PumpNoteCandidatePrefetch(UiRuntime* runtime)
     }
 }
 
+bool QueueNoteImageFetch(
+    const std::string& note_id, uint8_t image_index, const std::string& image_id)
+{
+    if (note_id.size() != 36 || image_index > 3 || image_id.size() != 64) {
+        return false;
+    }
+    NoteCloudRequest request;
+    request.op = NoteCloudOp::kFetchImage;
+    std::snprintf(request.note_id, sizeof(request.note_id), "%s", note_id.c_str());
+    std::snprintf(request.image_id, sizeof(request.image_id), "%s", image_id.c_str());
+    request.image_index = image_index;
+    return QueueNoteCloudRequest(request);
+}
+
+void PumpNoteImageFetch(UiRuntime* runtime)
+{
+    if (runtime == nullptr || IsNoteCloudBusy()) return;
+    std::string note_id;
+    uint8_t image_index = 0;
+    std::string image_id;
+    if (!runtime->TakeNoteImageRequest(&note_id, &image_index, &image_id)) {
+        return;
+    }
+    if (!QueueNoteImageFetch(note_id, image_index, image_id)) {
+        runtime->RestoreNoteImageRequest();
+    }
+}
+
 NoteCloudResult* PeekNoteCloudResult(uint32_t generation)
 {
     if (generation == 0 || generation != g_note_result_generation) {
@@ -203,6 +231,14 @@ bool ApplyNoteCloudResult(wqn::UiState* state, NoteCloudResult& result)
         BuildHomeSummary(state);
         return true;
     }
+    if (result.op == NoteCloudOp::kFetchImage) {
+        wqn::ApplyNoteImageResult(
+            &state->note_app, result.result, result.image_id,
+            std::move(result.image_wqni));
+        // Repaint only when the image layer is actually on screen.
+        return state->screen == wqn::UiScreen::kNote &&
+               state->note_app.mode == wqn::NoteAppMode::kNoteImageView;
+    }
     return false;
 }
 
@@ -258,6 +294,37 @@ void NoteCloudTask(void*)
             result.result = wqn::FetchNoteStudyCandidatePageV1(
                 token, request.session_id, page, &result.candidate_page,
                 &result.protocol_error);
+        } else if (request.op == NoteCloudOp::kFetchImage) {
+            // Cache first: image ids are content hashes, so a hit needs no
+            // network at all. Misses download, verify (size + sha256 in
+            // wqn_api, WQNI header + CRC here) and then persist for next time.
+            const std::string image_id = request.image_id;
+            result.image_id = image_id;
+            auto wqni = std::make_shared<std::vector<uint8_t>>();
+            result.result = wqn::LoadCachedNoteImage(image_id, wqni.get());
+            if (result.result != ESP_OK) {
+                result.result = wqn::DownloadNoteImageV1(
+                    token,
+                    wqn::services::MakeDeviceRequestMetadata(),
+                    request.note_id,
+                    request.image_index,
+                    image_id,
+                    wqni.get());
+                if (result.result == ESP_OK) {
+                    result.result =
+                        wqn::ValidateNoteImageWqni(wqni->data(), wqni->size());
+                }
+                if (result.result == ESP_OK &&
+                    wqn::StoreCachedNoteImage(image_id, wqni->data(), wqni->size()) !=
+                        ESP_OK) {
+                    // Cache persistence is best-effort; showing the image wins.
+                    ESP_LOGW(kNoteTag, "note image cache store failed: %.12s",
+                             image_id.c_str());
+                }
+            }
+            if (result.result == ESP_OK) {
+                result.image_wqni = std::move(wqni);
+            }
         } else {
             result.result = ESP_ERR_INVALID_ARG;
         }

@@ -81,6 +81,9 @@ public:
         wqn::protocol::note_study_v1::CandidatePageRequest* request,
         std::string* session_id);
     void RestoreNoteCandidatePageRequest();
+    bool TakeNoteImageRequest(
+        std::string* note_id, uint8_t* image_index, std::string* image_id);
+    void RestoreNoteImageRequest();
 
 private:
     UiUpdate FinishEvent(

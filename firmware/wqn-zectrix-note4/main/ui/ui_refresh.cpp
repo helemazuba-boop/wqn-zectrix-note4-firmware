@@ -527,6 +527,19 @@ std::string FrameSignature(const wqn::UiFrame& frame)
         signature.append(note.note_title);
         signature.push_back('/');
         signature.append(note.note_id);
+        // Image layer state: index/id/ready/error all repaint (download
+        // completion flips ready with no other field changing -- the classic
+        // "missing signature field freezes the page" trap).
+        signature.push_back('/');
+        signature.append(std::to_string(note.note_image_index));
+        signature.push_back(':');
+        signature.append(std::to_string(note.note_image_count));
+        signature.push_back(':');
+        signature.append(note.note_image_ready ? "1" : "0");
+        signature.push_back(':');
+        signature.append(note.note_image_error ? "1" : "0");
+        signature.push_back(':');
+        signature.append(note.note_image_id);
         // status_line/hint are deliberately NOT part of the signature: the note
         // page draws no footer, so transient boundary messages (已到顶部...)
         // must not trigger a refresh that changes nothing visible.

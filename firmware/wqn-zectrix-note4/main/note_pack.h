@@ -53,6 +53,9 @@ struct WqnNoteEntry {
     std::string notebook_id;
     std::string title;
     std::string content;
+    // SHA-256 ids of the note's e-ink images (WQNI files) in display order,
+    // straight from the pack line; empty for image-less notes.
+    std::vector<std::string> image_ids;
     int32_t sort_index = 0;
     int revision = 0;
 };
@@ -72,6 +75,10 @@ struct NotePackIndexEntry {
     uint32_t file_offset;
     uint32_t notebook_order;
     int32_t sort_index;
+    // Number of attached e-ink images (<= 4). The ids themselves stay in the
+    // pack line and are materialised by ReadNotePackEntry on demand, keeping
+    // the PSRAM index entry small.
+    uint8_t image_count;
 };
 
 // A notebook row of the built index. There are few notebooks so std::string is
@@ -128,5 +135,26 @@ esp_err_t DownloadNotePackToStorage(
 bool NotePackNeedsDownload(const WqnNotePackManifestNotebook& notebook);
 esp_err_t ReadNotePackEntry(const NotePackIndexEntry& index_entry, WqnNoteEntry* entry);
 std::string SafeNotePackStem(const WqnNotePackManifestNotebook& notebook);
+
+// --- Note image (WQNI) container + SPIFFS cache -----------------------------
+// WQNI file: 20-byte little-endian header (magic "WQNI", version u8,
+// pixel_format u8, flags u16, width u16, height u16, payload_length u32,
+// crc32 u32) followed by the raw 1-bpp framebuffer payload. The payload uses
+// the exact wqn_epd layout (row-major, 50 bytes/row, MSB-first, 1 = white),
+// so display is a straight memcpy into the framebuffer.
+inline constexpr size_t kNoteImageHeaderBytes = 20;
+inline constexpr size_t kNoteImagePayloadBytes = 15000;  // 400x300 / 8
+inline constexpr size_t kNoteImageFileBytes =
+    kNoteImageHeaderBytes + kNoteImagePayloadBytes;
+inline constexpr size_t kNoteImageCacheMaxFiles = 64;
+
+// Validates magic/version/format/flags/geometry/length and the payload CRC32.
+esp_err_t ValidateNoteImageWqni(const uint8_t* data, size_t size);
+// Cache files live at /storage/ni_<image_id[0..12)>.wqni; the id is the
+// SHA-256 of the whole file, so cached bytes are immutable.
+esp_err_t LoadCachedNoteImage(
+    const std::string& image_id, std::vector<uint8_t>* wqni);
+esp_err_t StoreCachedNoteImage(
+    const std::string& image_id, const uint8_t* data, size_t size);
 
 }  // namespace wqn

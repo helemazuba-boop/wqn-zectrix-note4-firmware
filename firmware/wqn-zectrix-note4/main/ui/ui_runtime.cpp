@@ -163,6 +163,18 @@ void UiRuntime::RestoreNoteCandidatePageRequest()
     wqn::RestoreNoteCandidatePageRequest(&state_.note_app);
 }
 
+bool UiRuntime::TakeNoteImageRequest(
+    std::string* note_id, uint8_t* image_index, std::string* image_id)
+{
+    return wqn::TakeNoteImageRequest(
+        &state_.note_app, note_id, image_index, image_id);
+}
+
+void UiRuntime::RestoreNoteImageRequest()
+{
+    wqn::RestoreNoteImageRequest(&state_.note_app);
+}
+
 UiUpdate UiRuntime::DispatchTimeTick(int64_t now_ms)
 {
     const bool changed = wqn::TickTimeApp(&state_.time_app, now_ms);

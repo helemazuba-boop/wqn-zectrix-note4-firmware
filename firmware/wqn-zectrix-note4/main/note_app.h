@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -22,11 +23,14 @@ enum class NoteInput {
 
 // 笔记本 -> 标题 -> 笔记, with long-press Confirm returning one level. There is no
 // card flip and no known/unknown: browsing is the whole interaction.
+// kNoteImageView is a full-screen image layer above the body: entered by
+// pressing Up at the top of the body when the note carries images.
 enum class NoteAppMode : uint8_t {
     kNotebookList,
     kSessionStarting,
     kNoteList,
     kNoteView,
+    kNoteImageView,
 };
 
 enum class NoteObservationCommitState : uint8_t {
@@ -84,6 +88,19 @@ struct NoteAppState {
     WqnNoteEntry current_note;
     bool current_note_loaded = false;
 
+    // Full-screen image viewing (kNoteImageView). The WQNI bytes live behind a
+    // shared_ptr so snapshots share them without copying 15 KB per frame and a
+    // late replacement cannot tear a render in progress.
+    uint8_t image_index = 0;
+    bool image_request = false;
+    bool image_in_flight = false;
+    bool image_error = false;
+    // Id the viewer currently wants; results for anything else are dropped.
+    std::string image_expected_id;
+    // Id of the payload currently held in image_wqni (may lag expected).
+    std::string image_loaded_id;
+    std::shared_ptr<const std::vector<uint8_t>> image_wqni;
+
     bool cloud_sync_requested = false;
     bool cloud_sync_failed = false;
     bool cloud_loaded_once = false;
@@ -122,6 +139,14 @@ struct NoteAppSnapshot {
     // Identity of the currently-open note; the render layer keys its wrapped-line
     // cache on this so scrolling does not re-wrap the body every frame.
     std::string note_id;
+    // Image layer: count enables the body entry line; the payload pointer is
+    // only set when ready and matching note_image_id.
+    uint8_t note_image_index = 0;
+    uint8_t note_image_count = 0;
+    bool note_image_ready = false;
+    bool note_image_error = false;
+    std::string note_image_id;
+    std::shared_ptr<const std::vector<uint8_t>> note_image_wqni;
     std::string status_line;
     std::string hint;
 };
@@ -151,6 +176,19 @@ void ApplyNoteCandidatePageResult(
     NoteAppState* state,
     esp_err_t result,
     protocol::note_study_v1::CandidatePageData page);
+// Image download request/result plumbing; same take/restore/apply shape as the
+// candidate page path, executed by the note cloud task.
+bool TakeNoteImageRequest(
+    NoteAppState* state,
+    std::string* note_id,
+    uint8_t* image_index,
+    std::string* image_id);
+void RestoreNoteImageRequest(NoteAppState* state);
+void ApplyNoteImageResult(
+    NoteAppState* state,
+    esp_err_t result,
+    const std::string& image_id,
+    std::shared_ptr<const std::vector<uint8_t>> wqni);
 bool TakeNoteObservationEffect(
     NoteAppState* state,
     const std::string& request_id,

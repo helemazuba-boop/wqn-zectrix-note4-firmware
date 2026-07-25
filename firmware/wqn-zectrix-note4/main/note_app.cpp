@@ -252,6 +252,9 @@ void ArmOpenObservation(wqn::NoteAppState* state)
     session.commit_state = wqn::NoteObservationCommitState::kPersisting;
 }
 
+void HandleNoteListInput(wqn::NoteAppState* state, wqn::NoteInput input);
+void ResetNoteImageViewer(wqn::NoteAppState* state);
+
 void HandleNoteListInput(wqn::NoteAppState* state, wqn::NoteInput input)
 {
     const auto& items = state->session.persisted.remote.items;
@@ -301,6 +304,7 @@ void HandleNoteListInput(wqn::NoteAppState* state, wqn::NoteInput input)
             ArmOpenObservation(state);
             LoadCurrentNoteBody(state);
             state->note_scroll_offset_lines = 0;
+            ResetNoteImageViewer(state);
             state->mode = wqn::NoteAppMode::kNoteView;
             state->message = state->current_note_loaded ? "阅读中" : "内容未同步";
             break;
@@ -314,13 +318,60 @@ void HandleNoteListInput(wqn::NoteAppState* state, wqn::NoteInput input)
     }
 }
 
+void HandleNoteViewInput(wqn::NoteAppState* state, wqn::NoteInput input);
+
+// Clears the image viewer whenever the underlying note changes or the body
+// view is left for good; the loaded payload is kept while merely toggling
+// between body and image so re-entry is instant.
+void ResetNoteImageViewer(wqn::NoteAppState* state)
+{
+    state->image_index = 0;
+    state->image_request = false;
+    state->image_in_flight = false;
+    state->image_error = false;
+    state->image_expected_id.clear();
+    state->image_loaded_id.clear();
+    state->image_wqni.reset();
+}
+
+// Points the viewer at current_note.image_ids[image_index]: cache hit on the
+// in-memory payload is immediate; otherwise the pump hands the id to the note
+// cloud task (SPIFFS cache first, then download).
+void RequestCurrentNoteImage(wqn::NoteAppState* state)
+{
+    const auto& ids = state->current_note.image_ids;
+    if (state->image_index >= ids.size()) {
+        state->image_error = true;
+        return;
+    }
+    const std::string& id = ids[state->image_index];
+    state->image_expected_id = id;
+    state->image_error = false;
+    if (state->image_loaded_id == id && state->image_wqni != nullptr) {
+        state->image_request = false;
+        return;
+    }
+    if (!state->image_in_flight) {
+        state->image_request = true;
+    }
+}
+
 void HandleNoteViewInput(wqn::NoteAppState* state, wqn::NoteInput input)
 {
     switch (input) {
         case wqn::NoteInput::kUp: {
             constexpr uint32_t kNoteBodyScrollStep = 4;
             if (state->note_scroll_offset_lines == 0) {
-                state->message = "已到顶部";
+                if (!state->current_note.image_ids.empty()) {
+                    // The image layer sits above the body: Up at the very top
+                    // opens it (mode change -> full refresh via ui_input).
+                    state->mode = wqn::NoteAppMode::kNoteImageView;
+                    state->image_index = 0;
+                    RequestCurrentNoteImage(state);
+                    state->message.clear();
+                } else {
+                    state->message = "已到顶部";
+                }
             } else {
                 state->note_scroll_offset_lines =
                     state->note_scroll_offset_lines > kNoteBodyScrollStep
@@ -333,14 +384,16 @@ void HandleNoteViewInput(wqn::NoteAppState* state, wqn::NoteInput input)
         case wqn::NoteInput::kDown:
         case wqn::NoteInput::kConfirm: {
             // Scroll a fixed 4 lines, clamped to the last page. RenderNoteBody
-            // shows 13 body lines (kContentTop=32, no footer line), so the
-            // max useful offset is total_lines - 13; this keeps over-scroll from
+            // shows 13 body lines (kContentTop=32, no footer line) or 12 when
+            // the image entry line occupies the first row, so the max useful
+            // offset is total_lines - visible; this keeps over-scroll from
             // inflating the offset and leaving Up-scroll with nothing to repaint.
             constexpr uint32_t kNoteBodyScrollStep = 4;
-            constexpr uint32_t kNoteBodyVisibleLines = 13;
+            const uint32_t visible_lines =
+                state->current_note.image_ids.empty() ? 13 : 12;
             const uint32_t max_scroll =
-                state->note_body_total_lines > kNoteBodyVisibleLines
-                    ? state->note_body_total_lines - kNoteBodyVisibleLines
+                state->note_body_total_lines > visible_lines
+                    ? state->note_body_total_lines - visible_lines
                     : 0;
             if (state->note_scroll_offset_lines >= max_scroll) {
                 state->message = "已到底部";
@@ -355,7 +408,35 @@ void HandleNoteViewInput(wqn::NoteAppState* state, wqn::NoteInput input)
             state->current_note = wqn::WqnNoteEntry{};
             state->current_note_loaded = false;
             state->note_scroll_offset_lines = 0;
+            ResetNoteImageViewer(state);
             state->mode = wqn::NoteAppMode::kNoteList;
+            state->message.clear();
+            break;
+    }
+}
+
+void HandleNoteImageViewInput(wqn::NoteAppState* state, wqn::NoteInput input)
+{
+    const size_t count = state->current_note.image_ids.size();
+    switch (input) {
+        case wqn::NoteInput::kUp:
+            if (state->image_index > 0) {
+                --state->image_index;
+                RequestCurrentNoteImage(state);
+            }
+            break;
+        case wqn::NoteInput::kDown:
+        case wqn::NoteInput::kConfirm:
+            if (count > 0 && static_cast<size_t>(state->image_index) + 1 < count) {
+                ++state->image_index;
+                RequestCurrentNoteImage(state);
+            }
+            break;
+        case wqn::NoteInput::kLongConfirm:
+            // Back to the body; keep the loaded payload for instant re-entry.
+            state->mode = wqn::NoteAppMode::kNoteView;
+            state->image_request = false;
+            state->image_error = false;
             state->message.clear();
             break;
     }
@@ -450,6 +531,9 @@ esp_err_t HandleNoteAppInput(NoteAppState* state, NoteInput input)
             break;
         case NoteAppMode::kNoteView:
             HandleNoteViewInput(state, input);
+            break;
+        case NoteAppMode::kNoteImageView:
+            HandleNoteImageViewInput(state, input);
             break;
     }
     return ESP_OK;
@@ -671,6 +755,60 @@ void ApplyNoteCandidatePageResult(
     RequestNoteCandidatePageIfNeeded(state);
 }
 
+bool TakeNoteImageRequest(
+    NoteAppState* state,
+    std::string* note_id,
+    uint8_t* image_index,
+    std::string* image_id)
+{
+    if (state == nullptr || note_id == nullptr || image_index == nullptr ||
+        image_id == nullptr || !state->image_request || state->image_in_flight ||
+        state->mode != NoteAppMode::kNoteImageView ||
+        state->image_expected_id.empty() ||
+        state->current_note.note_id.size() != 36) {
+        return false;
+    }
+    *note_id = state->current_note.note_id;
+    *image_index = state->image_index;
+    *image_id = state->image_expected_id;
+    state->image_request = false;
+    state->image_in_flight = true;
+    return true;
+}
+
+void RestoreNoteImageRequest(NoteAppState* state)
+{
+    if (state == nullptr || !state->image_in_flight) return;
+    state->image_in_flight = false;
+    state->image_request = true;
+}
+
+void ApplyNoteImageResult(
+    NoteAppState* state,
+    esp_err_t result,
+    const std::string& image_id,
+    std::shared_ptr<const std::vector<uint8_t>> wqni)
+{
+    if (state == nullptr) return;
+    state->image_in_flight = false;
+    if (result == ESP_OK && wqni != nullptr) {
+        // Keep the payload even if the user already flipped elsewhere; it only
+        // becomes visible when the ids line up again.
+        state->image_loaded_id = image_id;
+        state->image_wqni = std::move(wqni);
+        if (state->image_expected_id == image_id) {
+            state->image_error = false;
+        }
+        return;
+    }
+    if (state->image_expected_id == image_id &&
+        state->mode == NoteAppMode::kNoteImageView) {
+        state->image_error = true;
+        ESP_LOGW(kTag, "note image fetch failed: %s id=%.12s",
+                 esp_err_to_name(result), image_id.c_str());
+    }
+}
+
 bool TakeNoteObservationEffect(
     NoteAppState* state,
     const std::string& request_id,
@@ -773,7 +911,8 @@ NoteAppSnapshot BuildNoteAppSnapshot(const NoteAppState& state)
         snapshot.notebooks.push_back(std::move(row));
     }
 
-    if (state.mode == NoteAppMode::kNoteList || state.mode == NoteAppMode::kNoteView) {
+    if (state.mode == NoteAppMode::kNoteList || state.mode == NoteAppMode::kNoteView ||
+        state.mode == NoteAppMode::kNoteImageView) {
         const std::string& notebook_id = state.session.persisted.remote.notebook_id;
         const size_t row = FindNotebookRow(state, notebook_id);
         if (row != static_cast<size_t>(-1)) {
@@ -789,11 +928,25 @@ NoteAppSnapshot BuildNoteAppSnapshot(const NoteAppState& state)
             snapshot.titles.push_back(std::move(title_row));
         }
     }
-    if (state.mode == NoteAppMode::kNoteView) {
+    if (state.mode == NoteAppMode::kNoteView || state.mode == NoteAppMode::kNoteImageView) {
         snapshot.has_body = state.current_note_loaded;
         snapshot.note_title = state.current_note.title;
         snapshot.note_body = state.current_note.content;
         snapshot.note_id = state.current_note.note_id;
+        snapshot.note_image_count =
+            static_cast<uint8_t>(std::min<size_t>(state.current_note.image_ids.size(), 4));
+    }
+    if (state.mode == NoteAppMode::kNoteImageView) {
+        snapshot.note_image_index = state.image_index;
+        snapshot.note_image_id = state.image_expected_id;
+        snapshot.note_image_error = state.image_error;
+        snapshot.note_image_ready = !state.image_error &&
+            state.image_wqni != nullptr &&
+            state.image_loaded_id == state.image_expected_id &&
+            !state.image_expected_id.empty();
+        if (snapshot.note_image_ready) {
+            snapshot.note_image_wqni = state.image_wqni;
+        }
     }
     snapshot.status_line = NoteAppStatusLine(state);
     switch (state.mode) {
@@ -808,6 +961,9 @@ NoteAppSnapshot BuildNoteAppSnapshot(const NoteAppState& state)
             break;
         case NoteAppMode::kNoteView:
             snapshot.hint = "上下滚动 · 长按返回";
+            break;
+        case NoteAppMode::kNoteImageView:
+            snapshot.hint = "上下翻图 · 长按返回";
             break;
     }
     return snapshot;
@@ -825,6 +981,8 @@ std::string NoteAppStatusLine(const NoteAppState& state)
             return "选择要看的笔记";
         case NoteAppMode::kNoteView:
             return state.current_note_loaded ? "阅读中" : "内容未同步";
+        case NoteAppMode::kNoteImageView:
+            return state.image_error ? "图片加载失败" : "查看图片";
     }
     return "";
 }
@@ -832,17 +990,21 @@ std::string NoteAppStatusLine(const NoteAppState& state)
 std::string NoteAppSignature(const NoteAppState& state)
 {
     // Compact identity for the render layer to detect meaningful frame changes.
-    char buffer[96] = {};
+    // image_index/error must participate: flipping images or a failed fetch
+    // changes the frame with every other field identical.
+    char buffer[112] = {};
     std::snprintf(
         buffer,
         sizeof(buffer),
-        "%u:%u:%u:%u:%u:%u",
+        "%u:%u:%u:%u:%u:%u:%u:%u",
         static_cast<unsigned>(state.mode),
         static_cast<unsigned>(state.notebook_selected),
         static_cast<unsigned>(state.note_list_selected),
         static_cast<unsigned>(state.note_scroll_offset_lines),
         static_cast<unsigned>(state.pack_index.notebooks.size()),
-        static_cast<unsigned>(state.session.commit_state));
+        static_cast<unsigned>(state.session.commit_state),
+        static_cast<unsigned>(state.image_index),
+        static_cast<unsigned>(state.image_error ? 1 : 0));
     return std::string(buffer);
 }
 
