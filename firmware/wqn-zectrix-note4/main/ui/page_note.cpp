@@ -29,11 +29,18 @@ int VisibleListRows()
     return std::max(1, (kHintY - 4 - kContentTop) / kListRowH);
 }
 
-// Window start so the selected row stays visible and roughly centered.
+// Page-based window: the window only jumps when the selection crosses a page
+// boundary. The previous centered-scroll (start = selected - visible/2) shifted
+// the whole window by one row on EVERY step once the selection passed row
+// visible/2, so each mid-list step repainted all visible rows -- a heavy
+// full-frame-partial (~50% area) that ghosted the panel and, under rapid input,
+// stuck the BUSY line (2.7s recovery stalls). Users felt it exactly when
+// crossing the 4th<->5th row. With paging, in-page steps repaint just two rows
+// (fast local-partial) and only one whole-window redraw happens per page.
 size_t ListWindowStart(size_t selected, size_t count, size_t visible)
 {
-    if (count <= visible) return 0;
-    size_t start = selected > visible / 2 ? selected - visible / 2 : 0;
+    if (visible == 0 || count <= visible) return 0;
+    size_t start = (selected / visible) * visible;
     if (start + visible > count) start = count - visible;
     return start;
 }
