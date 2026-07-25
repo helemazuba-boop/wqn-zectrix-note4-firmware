@@ -57,6 +57,15 @@ constexpr int kLocalPartialMaxHeight = 170;
 // refresh, and a 6-min countdown still gets an interleaved full refresh
 // every 21 partials.
 constexpr uint32_t kMaxPartialRefreshesBeforeFull = 20;
+// Heavy partials (large diffs: list-row highlight flips ~17%, body scrolls
+// ~5-6%) stress the panel far more than a timer's once-per-second tick
+// (~0.02%). Field logs show the panel drifting from the framebuffer (stale
+// highlight rows on screen while the framebuffer had moved on) after ~11
+// consecutive heavy partials, and BUSY-pin timeouts (~2.7 s recovery stalls)
+// around 13-16. Cap heavy runs separately and low; light ticks keep the
+// 20-run budget above so a running timer stays flash-free.
+constexpr float kHeavyPartialDiffRatio = 0.02f;
+constexpr uint32_t kMaxHeavyPartialsBeforeFull = 6;
 constexpr int kTextGlyphWidth = 5;
 constexpr int kTextGlyphHeight = 7;
 constexpr int kTextCellWidth = 6;
@@ -85,6 +94,7 @@ bool g_epd_powered = false;
 bool g_previous_framebuffer_synced = false;
 bool g_hot_refresh_ok = false;
 uint32_t g_partial_refreshes_since_full = 0;
+uint32_t g_heavy_partials_since_full = 0;
 int64_t g_last_epd_refresh_us = 0;
 int64_t g_last_epd_activity_ms = 0;
 bool g_epd_idle_cut = false;
@@ -478,6 +488,7 @@ void DropEpdHotState(bool cut_rail, bool invalidate_framebuffer)
     if (invalidate_framebuffer) {
         g_previous_framebuffer_synced = false;
         g_partial_refreshes_since_full = 0;
+        g_heavy_partials_since_full = 0;
     }
     g_hot_refresh_ok = false;
     g_last_epd_refresh_us = 0;
@@ -1018,6 +1029,7 @@ esp_err_t InitEpdDisplay()
     std::memset(g_previous_framebuffer, 0xFF, kEpdFramebufferSize);
     g_previous_framebuffer_synced = false;
     g_partial_refreshes_since_full = 0;
+    g_heavy_partials_since_full = 0;
 
     ESP_RETURN_ON_ERROR(InitPanelSequence(), kTag, "init EPD panel");
     g_initialized = true;
@@ -1487,7 +1499,9 @@ esp_err_t RefreshEpdFull(bool allow_local_partial, bool force_full_refresh)
     const DirtyRect dirty_rect = FindDirtyRect(g_previous_framebuffer, g_framebuffer);
     const float dirty_area_ratio = DirtyRectAreaRatio(dirty_rect);
     bool full_refresh = force_full_refresh || !g_previous_framebuffer_synced;
-    if (!full_refresh && g_partial_refreshes_since_full >= kMaxPartialRefreshesBeforeFull) {
+    if (!full_refresh &&
+        (g_partial_refreshes_since_full >= kMaxPartialRefreshesBeforeFull ||
+         g_heavy_partials_since_full >= kMaxHeavyPartialsBeforeFull)) {
         // [epd-stale-fix] Promote to a full refresh so accumulated partial-waveform
         // charge on the panel gets cleared before the next local-partial window
         // would risk a BUSY-pin timeout (EPD controller enters an unhealthy state
@@ -1495,9 +1509,12 @@ esp_err_t RefreshEpdFull(bool allow_local_partial, bool force_full_refresh)
         // promotion the device gets stuck waiting for the BUSY pin to fall (1500 ms
         // probe timeout) followed by an automatic full-refresh recovery (~2 s),
         // which the user perceives as "卡顿".
-        ESP_LOGI(kTag, "EPD forcing full refresh: partial_since_full=%u reached limit=%u",
+        ESP_LOGI(kTag,
+                 "EPD forcing full refresh: partial_since_full=%u heavy=%u limits=%u/%u",
                  static_cast<unsigned>(g_partial_refreshes_since_full),
-                 static_cast<unsigned>(kMaxPartialRefreshesBeforeFull));
+                 static_cast<unsigned>(g_heavy_partials_since_full),
+                 static_cast<unsigned>(kMaxPartialRefreshesBeforeFull),
+                 static_cast<unsigned>(kMaxHeavyPartialsBeforeFull));
         full_refresh = true;
     }
     const bool hot_update = !full_refresh && g_epd_rail_powered && g_epd_powered && g_hot_refresh_ok;
@@ -1548,6 +1565,9 @@ esp_err_t RefreshEpdFull(bool allow_local_partial, bool force_full_refresh)
     std::memcpy(g_previous_framebuffer, g_framebuffer, kEpdFramebufferSize);
     g_previous_framebuffer_synced = true;
     g_partial_refreshes_since_full = full_refresh ? 0 : g_partial_refreshes_since_full + 1;
+    g_heavy_partials_since_full = full_refresh
+        ? 0
+        : g_heavy_partials_since_full + (diff_ratio >= kHeavyPartialDiffRatio ? 1 : 0);
     // [power-fix] Record the CRC so deep-sleep wakeups can skip the next
     // refresh if the frame content hasn't changed.
     g_rtc_last_frame_crc = current_crc;
