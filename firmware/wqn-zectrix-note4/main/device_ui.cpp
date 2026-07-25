@@ -464,6 +464,7 @@ void DeviceUiTask(void*)
     g_last_active_us_local = esp_timer_get_time();
     TickType_t poll_delay = kUiPollDelayTicks;
     bool word_pack_refresh_pending = false;
+    bool note_pack_refresh_pending = false;
 
     while (true) {
         RefreshSchedule refresh_schedule = pending_refresh_schedule;
@@ -488,6 +489,13 @@ void DeviceUiTask(void*)
                     // one coalesced refresh request instead of misreporting
                     // the busy owner as a full queue.
                     word_pack_refresh_pending = true;
+                    // Notes used to sync only when the local cache was missing
+                    // or broken, so an attach/edit on the web never reached a
+                    // device that already held a pack (HIL: image_ids stuck at
+                    // 0 while the cloud change_log had advanced). Mirror the
+                    // word lane: one coalesced manifest check per sync cycle;
+                    // an unchanged manifest ends the round trip immediately.
+                    note_pack_refresh_pending = true;
                 }
             }
         }
@@ -805,6 +813,12 @@ wqn::AiStreamingStatusView streaming_view{};
             device_ui_internal::QueueWordReviewRefresh()) {
             word_pack_refresh_pending = false;
             ESP_LOGI(kTag, "queued coalesced word pack refresh after sync");
+        }
+        if (note_pack_refresh_pending &&
+            !device_ui_internal::IsNoteCloudBusy() &&
+            device_ui_internal::QueueNotePackSync()) {
+            note_pack_refresh_pending = false;
+            ESP_LOGI(kTag, "queued coalesced note pack refresh after sync");
         }
 
         wqn::PowerOffEpdAfterIdleIfNeeded();
