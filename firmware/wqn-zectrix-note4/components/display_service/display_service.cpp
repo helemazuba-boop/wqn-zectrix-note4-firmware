@@ -40,7 +40,13 @@ constexpr spi_host_device_t kEpdSpiHost = SPI3_HOST;
 
 constexpr int kSpiClockHz = 40 * 1000 * 1000;
 constexpr int kBusyTimeoutMs = 30000;
-constexpr int kPartialRefreshBusyTimeoutMs = 1500;
+// Partial-waveform completion wait. Under sustained rapid partial sequences
+// (list scrolling) the SSD1683 legitimately stretches a partial waveform past
+// 1.5 s; declaring it dead at 1500 ms converted a slow-but-successful refresh
+// into "drop hot state + full-refresh recovery" (2.6-3.1 s stall + flash) on
+// every remaining step of the scroll. Field logs show the BUSY pin simply
+// still low (busy) at timeout and every recovery succeeding, so wait it out.
+constexpr int kPartialRefreshBusyTimeoutMs = 4000;
 constexpr int kPartialCommandBusyTimeoutMs = 1500;
 constexpr int kLocalPartialMaxHeight = 170;
 // [epd-health] SSDs (SSD1683 / WaveShare 4.2") accumulate DC bias after
