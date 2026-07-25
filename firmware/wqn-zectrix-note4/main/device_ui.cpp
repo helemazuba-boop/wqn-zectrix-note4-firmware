@@ -149,11 +149,8 @@ using device_ui_internal::AcknowledgeDisplayResult;
 using device_ui_internal::FinishTodoCloudRequest;
 using device_ui_internal::FinishWordCloudRequest;
 using device_ui_internal::FinishNoteCloudRequest;
-using device_ui_internal::g_todo_result_queue;
 using device_ui_internal::g_display_result_queue;
 using device_ui_internal::g_rtc_screen_val;
-using device_ui_internal::g_word_result_queue;
-using device_ui_internal::g_note_result_queue;
 
 // Local copy — only DeviceUiTask reads/writes this; ui_refresh.cpp's
 // g_last_active_us is the cross-file symbol declared in ui_internal.h
@@ -533,51 +530,58 @@ void DeviceUiTask(void*)
             refresh_schedule = after_sched;
         }
 
-        if (g_todo_result_queue != nullptr) {
-            device_ui_internal::TodoCloudResultReady ready;
-            while (xQueueReceive(g_todo_result_queue, &ready, 0) == pdTRUE) {
-                todo_cloud_completed = true;
-                const device_ui_internal::TodoCloudResult* todo_result =
-                    device_ui_internal::PeekTodoCloudResult(ready.generation);
-                if (todo_result != nullptr) {
-                    const device_ui_internal::UiUpdate update =
-                        ui_runtime.DispatchTodoCloudResult(*todo_result);
-                    refresh_schedule = StrongerSchedule(refresh_schedule, update.refresh);
-                } else {
-                    ESP_LOGE(kTag, "stale Todo result signal: generation=%lu",
-                             static_cast<unsigned long>(ready.generation));
-                }
-            }
-        }
-        if (g_word_result_queue != nullptr) {
-            device_ui_internal::WordCloudResultReady ready;
-            while (xQueueReceive(g_word_result_queue, &ready, 0) == pdTRUE) {
-                word_cloud_completed = true;
-                device_ui_internal::WordCloudResult* word_result =
-                    device_ui_internal::PeekWordCloudResult(ready.generation);
-                if (word_result != nullptr) {
-                    const device_ui_internal::UiUpdate update =
-                        ui_runtime.DispatchWordCloudResult(*word_result);
-                    refresh_schedule = StrongerSchedule(refresh_schedule, update.refresh);
-                } else {
-                    ESP_LOGE(kTag, "stale Word result signal: generation=%lu",
-                             static_cast<unsigned long>(ready.generation));
-                }
-            }
-        }
-        if (g_note_result_queue != nullptr) {
-            device_ui_internal::NoteCloudResultReady ready;
-            while (xQueueReceive(g_note_result_queue, &ready, 0) == pdTRUE) {
-                note_cloud_completed = true;
-                device_ui_internal::NoteCloudResult* note_result =
-                    device_ui_internal::PeekNoteCloudResult(ready.generation);
-                if (note_result != nullptr) {
-                    const device_ui_internal::UiUpdate update =
-                        ui_runtime.DispatchNoteCloudResult(*note_result);
-                    refresh_schedule = StrongerSchedule(refresh_schedule, update.refresh);
-                } else {
-                    ESP_LOGE(kTag, "stale Note result signal: generation=%lu",
-                             static_cast<unsigned long>(ready.generation));
+        if (device_ui_internal::g_cloud_result_queue != nullptr) {
+            device_ui_internal::CloudResultReady ready;
+            while (xQueueReceive(
+                       device_ui_internal::g_cloud_result_queue, &ready, 0) == pdTRUE) {
+                switch (ready.domain) {
+                    case device_ui_internal::CloudDomain::kTodo: {
+                        todo_cloud_completed = true;
+                        const device_ui_internal::TodoCloudResult* todo_result =
+                            device_ui_internal::PeekTodoCloudResult(ready.generation);
+                        if (todo_result != nullptr) {
+                            const device_ui_internal::UiUpdate update =
+                                ui_runtime.DispatchTodoCloudResult(*todo_result);
+                            refresh_schedule =
+                                StrongerSchedule(refresh_schedule, update.refresh);
+                        } else {
+                            ESP_LOGE(kTag, "stale Todo result signal: generation=%lu",
+                                     static_cast<unsigned long>(ready.generation));
+                        }
+                        break;
+                    }
+                    case device_ui_internal::CloudDomain::kWord: {
+                        word_cloud_completed = true;
+                        device_ui_internal::WordCloudResult* word_result =
+                            device_ui_internal::PeekWordCloudResult(ready.generation);
+                        if (word_result != nullptr) {
+                            const device_ui_internal::UiUpdate update =
+                                ui_runtime.DispatchWordCloudResult(*word_result);
+                            refresh_schedule =
+                                StrongerSchedule(refresh_schedule, update.refresh);
+                        } else {
+                            ESP_LOGE(kTag, "stale Word result signal: generation=%lu",
+                                     static_cast<unsigned long>(ready.generation));
+                        }
+                        break;
+                    }
+                    case device_ui_internal::CloudDomain::kNote: {
+                        note_cloud_completed = true;
+                        device_ui_internal::NoteCloudResult* note_result =
+                            device_ui_internal::PeekNoteCloudResult(ready.generation);
+                        if (note_result != nullptr) {
+                            const device_ui_internal::UiUpdate update =
+                                ui_runtime.DispatchNoteCloudResult(*note_result);
+                            refresh_schedule =
+                                StrongerSchedule(refresh_schedule, update.refresh);
+                        } else {
+                            ESP_LOGE(kTag, "stale Note result signal: generation=%lu",
+                                     static_cast<unsigned long>(ready.generation));
+                        }
+                        break;
+                    }
+                    default:
+                        break;
                 }
             }
         }
@@ -879,76 +883,11 @@ esp_err_t StartDeviceUiIfEnabled()
         wqn::services::SetSyncEventSink(UiSyncEventSink);
     }
 
-    if (device_ui_internal::g_todo_request_queue == nullptr) {
-        device_ui_internal::g_todo_request_queue = xQueueCreate(2, sizeof(device_ui_internal::TodoCloudRequest));
-        if (device_ui_internal::g_todo_request_queue == nullptr) {
-            return ESP_ERR_NO_MEM;
-        }
-    }
-
-    if (device_ui_internal::g_todo_result_queue == nullptr) {
-        device_ui_internal::g_todo_result_queue =
-            xQueueCreate(1, sizeof(device_ui_internal::TodoCloudResultReady));
-        if (device_ui_internal::g_todo_result_queue == nullptr) {
-            return ESP_ERR_NO_MEM;
-        }
-    }
-
-    if (device_ui_internal::g_word_request_queue == nullptr) {
-        device_ui_internal::g_word_request_queue = xQueueCreate(3, sizeof(device_ui_internal::WordCloudRequest));
-        if (device_ui_internal::g_word_request_queue == nullptr) {
-            return ESP_ERR_NO_MEM;
-        }
-    }
-
-    if (device_ui_internal::g_word_result_queue == nullptr) {
-        device_ui_internal::g_word_result_queue =
-            xQueueCreate(1, sizeof(device_ui_internal::WordCloudResultReady));
-        if (device_ui_internal::g_word_result_queue == nullptr) {
-            return ESP_ERR_NO_MEM;
-        }
-    }
-
-    if (device_ui_internal::g_note_request_queue == nullptr) {
-        device_ui_internal::g_note_request_queue = xQueueCreate(3, sizeof(device_ui_internal::NoteCloudRequest));
-        if (device_ui_internal::g_note_request_queue == nullptr) {
-            return ESP_ERR_NO_MEM;
-        }
-    }
-
-    if (device_ui_internal::g_note_result_queue == nullptr) {
-        device_ui_internal::g_note_result_queue =
-            xQueueCreate(1, sizeof(device_ui_internal::NoteCloudResultReady));
-        if (device_ui_internal::g_note_result_queue == nullptr) {
-            return ESP_ERR_NO_MEM;
-        }
-    }
-
-    if (device_ui_internal::g_todo_task == nullptr) {
-        const BaseType_t todo_created =
-            xTaskCreate(device_ui_internal::TodoCloudTask, "wqn_todo_cloud", 8192, nullptr, 3, &device_ui_internal::g_todo_task);
-        if (todo_created != pdPASS) {
-            device_ui_internal::g_todo_task = nullptr;
-            return ESP_ERR_NO_MEM;
-        }
-    }
-
-    if (device_ui_internal::g_word_task == nullptr) {
-        const BaseType_t word_created =
-            xTaskCreate(device_ui_internal::WordCloudTask, "wqn_word_cloud", 8192, nullptr, 3, &device_ui_internal::g_word_task);
-        if (word_created != pdPASS) {
-            device_ui_internal::g_word_task = nullptr;
-            return ESP_ERR_NO_MEM;
-        }
-    }
-
-    if (device_ui_internal::g_note_task == nullptr) {
-        const BaseType_t note_created =
-            xTaskCreate(device_ui_internal::NoteCloudTask, "wqn_note_cloud", 8192, nullptr, 3, &device_ui_internal::g_note_task);
-        if (note_created != pdPASS) {
-            device_ui_internal::g_note_task = nullptr;
-            return ESP_ERR_NO_MEM;
-        }
+    // One two-lane runner replaces the three per-domain cloud tasks; see
+    // ui/cloud_runner.cpp for the lane policy.
+    const esp_err_t runner_result = device_ui_internal::StartCloudRunner();
+    if (runner_result != ESP_OK) {
+        return runner_result;
     }
 
     // UI state loading verifies word-pack files with a 1 KiB local read buffer,

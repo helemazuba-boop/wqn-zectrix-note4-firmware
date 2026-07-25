@@ -21,9 +21,6 @@ namespace device_ui_internal {
 
 constexpr char kTag[] = "wqn_ui";
 
-QueueHandle_t g_word_request_queue = nullptr;
-QueueHandle_t g_word_result_queue = nullptr;
-TaskHandle_t g_word_task = nullptr;
 static std::atomic<bool> g_word_cloud_busy{false};
 wqn::runtime::SleepLease g_word_sleep_lease;
 WordCloudResult g_word_result_slot;
@@ -42,9 +39,6 @@ bool IsWordCloudBusy()
 
 bool QueueWordCloudRequest(const WordCloudRequest& request)
 {
-    if (g_word_request_queue == nullptr) {
-        return false;
-    }
     bool expected = false;
     if (!g_word_cloud_busy.compare_exchange_strong(
             expected, true, std::memory_order_acq_rel, std::memory_order_acquire)) {
@@ -58,7 +52,10 @@ bool QueueWordCloudRequest(const WordCloudRequest& request)
         return false;
     }
     g_word_sleep_lease = std::move(lease);
-    if (xQueueSend(g_word_request_queue, &request, 0) != pdTRUE) {
+    CloudJob job;
+    job.domain = CloudDomain::kWord;
+    job.word = request;
+    if (!EnqueueCloudJob(job)) {
         FinishWordCloudRequest();
         return false;
     }
@@ -168,10 +165,11 @@ WordCloudResult* PeekWordCloudResult(uint32_t generation)
 
 void SendWordCloudResult()
 {
-    WordCloudResultReady ready;
+    CloudResultReady ready;
+    ready.domain = CloudDomain::kWord;
     ready.generation = g_word_result_generation;
-    if (g_word_result_queue == nullptr ||
-        xQueueSend(g_word_result_queue, &ready, pdMS_TO_TICKS(100)) != pdTRUE) {
+    if (g_cloud_result_queue == nullptr ||
+        xQueueSend(g_cloud_result_queue, &ready, pdMS_TO_TICKS(100)) != pdTRUE) {
         FinishWordCloudRequest();
     }
 }
@@ -277,190 +275,182 @@ bool ApplyWordCloudResult(wqn::UiState* state, WordCloudResult& result)
     return false;
 }
 
-void WordCloudTask(void*)
+void ExecuteWordCloudRequest(const WordCloudRequest& request)
 {
-    ESP_LOGI(kTag, "Word cloud task started");
-    while (true) {
-        WordCloudRequest request;
-        if (xQueueReceive(g_word_request_queue, &request, portMAX_DELAY) != pdTRUE) {
-            continue;
-        }
-
-        g_word_result_slot = WordCloudResult{};
+    g_word_result_slot = WordCloudResult{};
+    ++g_word_result_generation;
+    if (g_word_result_generation == 0) {
         ++g_word_result_generation;
-        if (g_word_result_generation == 0) {
-            ++g_word_result_generation;
-        }
-        WordCloudResult& result = g_word_result_slot;
-        result.op = request.op;
-        result.query = request.query;
-        result.message.clear();
-
-        std::string token;
-        if (!LoadValidTokenForTodo(&token)) {
-            result.auth_required = true;
-            result.result = ESP_ERR_INVALID_STATE;
-            SendWordCloudResult();
-            continue;
-        }
-
-        if (request.op == WordCloudOp::kPackSync) {
-            wqn::WqnWordPackManifest local_manifest;
-            bool had_local_manifest = true;
-            bool manifest_content_changed = false;
-            result.result = wqn::LoadWordPackManifest(&local_manifest);
-            if (result.result == ESP_ERR_NOT_FOUND) {
-                had_local_manifest = false;
-                result.result = wqn::ResetWordPackStorageCache();
-                if (result.result == ESP_OK) {
-                    local_manifest = {};
-                }
-            } else if (result.result != ESP_OK) {
-                ESP_LOGW(
-                    kTag,
-                    "local word pack manifest is incompatible; reset cache: %s",
-                    esp_err_to_name(result.result));
-                had_local_manifest = false;
-                result.result = wqn::ResetWordPackStorageCache();
-                if (result.result == ESP_OK) {
-                    local_manifest = {};
-                }
-            }
-            constexpr size_t kMaxManifestPagesPerSync = 32;
-            size_t page_count = 0;
-            bool has_more = result.result == ESP_OK;
-            while (result.result == ESP_OK && has_more &&
-                   page_count < kMaxManifestPagesPerSync) {
-                ++page_count;
-                wqn::WqnWordPackManifest manifest_delta;
-                const auto metadata = wqn::services::MakeDeviceRequestMetadata();
-                result.result = wqn::FetchWordPackManifest(
-                    token,
-                    metadata,
-                    local_manifest.cursor,
-                    &manifest_delta);
-                if (result.result != ESP_OK) {
-                    break;
-                }
-                if (manifest_delta.has_more &&
-                    manifest_delta.cursor <= local_manifest.cursor) {
-                    result.result = ESP_ERR_INVALID_RESPONSE;
-                    result.message = "词库游标未推进";
-                    break;
-                }
-                manifest_content_changed =
-                    manifest_content_changed || !manifest_delta.packs.empty();
-                size_t total_needed = 0;
-                for (const auto& item : manifest_delta.packs) {
-                    if (!item.deleted && wqn::WordPackNeedsDownload(item)) {
-                        total_needed += item.byte_size;
-                    }
-                }
-                if (total_needed > 0) {
-                    wqn::StorageCapacitySnapshot storage;
-                    if (wqn::ReadStorageCapacitySnapshot(&storage) && storage.spiffs_valid) {
-                        const size_t available =
-                            storage.spiffs_total_bytes > storage.spiffs_used_bytes
-                                ? storage.spiffs_total_bytes - storage.spiffs_used_bytes
-                                : 0;
-                        if (available < total_needed) {
-                            ESP_LOGW(kTag, "SPIFFS space insufficient: need=%u avail=%u",
-                                     static_cast<unsigned>(total_needed), static_cast<unsigned>(available));
-                            result.result = ESP_ERR_NO_MEM;
-                            result.message = "存储空间不足";
-                        }
-                    }
-                }
-
-                for (const wqn::WqnWordPackManifestItem& item : manifest_delta.packs) {
-                    if (result.result != ESP_OK) {
-                        break;
-                    }
-                    if (item.deleted || !wqn::WordPackNeedsDownload(item)) {
-                        continue;
-                    }
-                    result.result = wqn::DownloadWordPackToStorage(
-                        token,
-                        wqn::services::MakeDeviceRequestMetadata(),
-                        item);
-                    if (result.result != ESP_OK) {
-                        break;
-                    }
-                }
-                if (result.result != ESP_OK) {
-                    break;
-                }
-                const bool manifest_page_changed =
-                    !manifest_delta.packs.empty() ||
-                    manifest_delta.cursor != local_manifest.cursor;
-                if (manifest_page_changed) {
-                    wqn::WqnWordPackManifest merged;
-                    result.result = wqn::MergeWordPackManifestDelta(
-                        manifest_delta, &merged);
-                    if (result.result == ESP_OK) {
-                        result.result = wqn::SaveWordPackManifest(merged);
-                    }
-                    if (result.result == ESP_OK) {
-                        local_manifest = std::move(merged);
-                    }
-                }
-                has_more = manifest_delta.has_more;
-            }
-            if (result.result == ESP_OK && has_more) {
-                result.result = ESP_ERR_INVALID_SIZE;
-                result.message = "词库变更过多，请重试";
-            }
-            if (result.result == ESP_OK &&
-                (manifest_content_changed || !had_local_manifest)) {
-                result.result = wqn::LoadWordPackIndex(&result.pack_index);
-                result.message = result.pack_index.status_message;
-                result.pack_index_ready = result.result == ESP_OK;
-            } else if (result.result == ESP_OK) {
-                result.message = "词库无变更";
-                ESP_LOGI(kTag, "word pack manifest unchanged; index rebuild skipped");
-            }
-        } else if (request.op == WordCloudOp::kStartSession) {
-            wqn::protocol::word_study_v1::CreateSessionRequest session;
-            session.metadata = wqn::services::MakeDeviceRequestMetadata();
-            session.metadata.request_id = request.request_id;
-            session.mode = static_cast<wqn::protocol::word_study_v1::Mode>(
-                request.study_mode);
-            result.result = wqn::CreateWordStudySessionV1(
-                token,
-                session,
-                &result.session,
-                &result.protocol_error);
-        } else if (request.op == WordCloudOp::kFetchSessionPage) {
-            wqn::protocol::word_study_v1::CandidatePageRequest page;
-            page.metadata = wqn::services::MakeDeviceRequestMetadata();
-            page.metadata.request_id = request.request_id;
-            page.cursor = request.cursor;
-            page.limit = request.limit;
-            result.result = wqn::FetchWordStudyCandidatePageV1(
-                token,
-                request.session_id,
-                page,
-                &result.candidate_page,
-                &result.protocol_error);
-        } else if (request.op == WordCloudOp::kSearch) {
-            wqn::WqnWordSearchRequest search;
-            search.query = request.query;
-            search.limit = 8;
-            result.result = wqn::SearchWords(token, search, &result.search);
-        } else if (request.op == WordCloudOp::kAiLookup) {
-            wqn::WqnWordAiLookupRequest lookup;
-            lookup.query = request.query;
-            result.result = wqn::LookupWordWithAi(token, lookup, &result.lookup);
-        } else {
-            result.result = ESP_ERR_INVALID_ARG;
-        }
-
-        if (result.result != ESP_OK) {
-            std::string after_token;
-            result.auth_required = !LoadValidTokenForTodo(&after_token);
-        }
-        SendWordCloudResult();
     }
+    WordCloudResult& result = g_word_result_slot;
+    result.op = request.op;
+    result.query = request.query;
+    result.message.clear();
+
+    std::string token;
+    if (!LoadValidTokenForTodo(&token)) {
+        result.auth_required = true;
+        result.result = ESP_ERR_INVALID_STATE;
+        SendWordCloudResult();
+        return;
+    }
+
+    if (request.op == WordCloudOp::kPackSync) {
+        wqn::WqnWordPackManifest local_manifest;
+        bool had_local_manifest = true;
+        bool manifest_content_changed = false;
+        result.result = wqn::LoadWordPackManifest(&local_manifest);
+        if (result.result == ESP_ERR_NOT_FOUND) {
+            had_local_manifest = false;
+            result.result = wqn::ResetWordPackStorageCache();
+            if (result.result == ESP_OK) {
+                local_manifest = {};
+            }
+        } else if (result.result != ESP_OK) {
+            ESP_LOGW(
+                kTag,
+                "local word pack manifest is incompatible; reset cache: %s",
+                esp_err_to_name(result.result));
+            had_local_manifest = false;
+            result.result = wqn::ResetWordPackStorageCache();
+            if (result.result == ESP_OK) {
+                local_manifest = {};
+            }
+        }
+        constexpr size_t kMaxManifestPagesPerSync = 32;
+        size_t page_count = 0;
+        bool has_more = result.result == ESP_OK;
+        while (result.result == ESP_OK && has_more &&
+               page_count < kMaxManifestPagesPerSync) {
+            ++page_count;
+            wqn::WqnWordPackManifest manifest_delta;
+            const auto metadata = wqn::services::MakeDeviceRequestMetadata();
+            result.result = wqn::FetchWordPackManifest(
+                token,
+                metadata,
+                local_manifest.cursor,
+                &manifest_delta);
+            if (result.result != ESP_OK) {
+                break;
+            }
+            if (manifest_delta.has_more &&
+                manifest_delta.cursor <= local_manifest.cursor) {
+                result.result = ESP_ERR_INVALID_RESPONSE;
+                result.message = "词库游标未推进";
+                break;
+            }
+            manifest_content_changed =
+                manifest_content_changed || !manifest_delta.packs.empty();
+            size_t total_needed = 0;
+            for (const auto& item : manifest_delta.packs) {
+                if (!item.deleted && wqn::WordPackNeedsDownload(item)) {
+                    total_needed += item.byte_size;
+                }
+            }
+            if (total_needed > 0) {
+                wqn::StorageCapacitySnapshot storage;
+                if (wqn::ReadStorageCapacitySnapshot(&storage) && storage.spiffs_valid) {
+                    const size_t available =
+                        storage.spiffs_total_bytes > storage.spiffs_used_bytes
+                            ? storage.spiffs_total_bytes - storage.spiffs_used_bytes
+                            : 0;
+                    if (available < total_needed) {
+                        ESP_LOGW(kTag, "SPIFFS space insufficient: need=%u avail=%u",
+                                 static_cast<unsigned>(total_needed), static_cast<unsigned>(available));
+                        result.result = ESP_ERR_NO_MEM;
+                        result.message = "存储空间不足";
+                    }
+                }
+            }
+
+            for (const wqn::WqnWordPackManifestItem& item : manifest_delta.packs) {
+                if (result.result != ESP_OK) {
+                    break;
+                }
+                if (item.deleted || !wqn::WordPackNeedsDownload(item)) {
+                    continue;
+                }
+                result.result = wqn::DownloadWordPackToStorage(
+                    token,
+                    wqn::services::MakeDeviceRequestMetadata(),
+                    item);
+                if (result.result != ESP_OK) {
+                    break;
+                }
+            }
+            if (result.result != ESP_OK) {
+                break;
+            }
+            const bool manifest_page_changed =
+                !manifest_delta.packs.empty() ||
+                manifest_delta.cursor != local_manifest.cursor;
+            if (manifest_page_changed) {
+                wqn::WqnWordPackManifest merged;
+                result.result = wqn::MergeWordPackManifestDelta(
+                    manifest_delta, &merged);
+                if (result.result == ESP_OK) {
+                    result.result = wqn::SaveWordPackManifest(merged);
+                }
+                if (result.result == ESP_OK) {
+                    local_manifest = std::move(merged);
+                }
+            }
+            has_more = manifest_delta.has_more;
+        }
+        if (result.result == ESP_OK && has_more) {
+            result.result = ESP_ERR_INVALID_SIZE;
+            result.message = "词库变更过多，请重试";
+        }
+        if (result.result == ESP_OK &&
+            (manifest_content_changed || !had_local_manifest)) {
+            result.result = wqn::LoadWordPackIndex(&result.pack_index);
+            result.message = result.pack_index.status_message;
+            result.pack_index_ready = result.result == ESP_OK;
+        } else if (result.result == ESP_OK) {
+            result.message = "词库无变更";
+            ESP_LOGI(kTag, "word pack manifest unchanged; index rebuild skipped");
+        }
+    } else if (request.op == WordCloudOp::kStartSession) {
+        wqn::protocol::word_study_v1::CreateSessionRequest session;
+        session.metadata = wqn::services::MakeDeviceRequestMetadata();
+        session.metadata.request_id = request.request_id;
+        session.mode = static_cast<wqn::protocol::word_study_v1::Mode>(
+            request.study_mode);
+        result.result = wqn::CreateWordStudySessionV1(
+            token,
+            session,
+            &result.session,
+            &result.protocol_error);
+    } else if (request.op == WordCloudOp::kFetchSessionPage) {
+        wqn::protocol::word_study_v1::CandidatePageRequest page;
+        page.metadata = wqn::services::MakeDeviceRequestMetadata();
+        page.metadata.request_id = request.request_id;
+        page.cursor = request.cursor;
+        page.limit = request.limit;
+        result.result = wqn::FetchWordStudyCandidatePageV1(
+            token,
+            request.session_id,
+            page,
+            &result.candidate_page,
+            &result.protocol_error);
+    } else if (request.op == WordCloudOp::kSearch) {
+        wqn::WqnWordSearchRequest search;
+        search.query = request.query;
+        search.limit = 8;
+        result.result = wqn::SearchWords(token, search, &result.search);
+    } else if (request.op == WordCloudOp::kAiLookup) {
+        wqn::WqnWordAiLookupRequest lookup;
+        lookup.query = request.query;
+        result.result = wqn::LookupWordWithAi(token, lookup, &result.lookup);
+    } else {
+        result.result = ESP_ERR_INVALID_ARG;
+    }
+
+    if (result.result != ESP_OK) {
+        std::string after_token;
+        result.auth_required = !LoadValidTokenForTodo(&after_token);
+    }
+    SendWordCloudResult();
 }
 
 }  // namespace device_ui_internal

@@ -227,9 +227,52 @@ struct NoteCloudResultReady {
     uint32_t generation = 0;
 };
 
+// --- Unified cloud runner ---------------------------------------------------
+// One executor replaces the three per-domain cloud tasks. Two lanes so bulk
+// transfers (pack sync: multi-MB downloads + index rebuilds) can never sit in
+// front of interactive work the user is actively waiting on (session start,
+// candidate pages, images, todo refresh) -- the "late candidate result blocks
+// the word page" class of stalls. Per-domain busy flags, sleep leases, result
+// slots and generations keep their existing semantics; only the task/queue
+// plumbing is shared.
+enum class CloudDomain : uint8_t {
+    kTodo,
+    kWord,
+    kNote,
+    // Reserved sync domain for the problem (错题) feature; no executor yet.
+    kProblem,
+};
+
+enum class CloudLane : uint8_t {
+    kInteractive,
+    kBulk,
+};
+
+struct CloudJob {
+    CloudDomain domain = CloudDomain::kTodo;
+    // Requests are PODs, so one job slot carries any domain's request.
+    union {
+        TodoCloudRequest todo;
+        WordCloudRequest word;
+        NoteCloudRequest note;
+    };
+    CloudJob() : todo() {}
+};
+
+struct CloudResultReady {
+    CloudDomain domain = CloudDomain::kTodo;
+    uint32_t generation = 0;
+};
+
+esp_err_t StartCloudRunner();
+bool EnqueueCloudJob(const CloudJob& job);
+extern QueueHandle_t g_cloud_result_queue;
+
 static_assert(std::is_trivially_copyable_v<TodoCloudResultReady>);
 static_assert(std::is_trivially_copyable_v<WordCloudResultReady>);
 static_assert(std::is_trivially_copyable_v<NoteCloudResultReady>);
+static_assert(std::is_trivially_copyable_v<CloudJob>);
+static_assert(std::is_trivially_copyable_v<CloudResultReady>);
 
 void SendTodoCloudResult();
 void SendWordCloudResult();
@@ -281,9 +324,9 @@ bool ApplyNoteCloudResult(wqn::UiState* state, NoteCloudResult& result);
 bool RefreshTodosFromCloud(wqn::UiState* state);
 RefreshSchedule CompleteSelectedTodo(wqn::UiState* state);
 
-void TodoCloudTask(void*);
-void WordCloudTask(void*);
-void NoteCloudTask(void*);
+void ExecuteTodoCloudRequest(const TodoCloudRequest& request);
+void ExecuteWordCloudRequest(const WordCloudRequest& request);
+void ExecuteNoteCloudRequest(const NoteCloudRequest& request);
 
 bool LoadValidTokenForTodo(std::string* token);
 
@@ -438,15 +481,6 @@ size_t TodoVisibleStart(const wqn::TodoUiState& todo, size_t selected, size_t vi
 
 extern SemaphoreHandle_t g_refresh_mutex;
 extern TaskHandle_t g_refresh_task;
-extern QueueHandle_t g_todo_request_queue;
-extern QueueHandle_t g_todo_result_queue;
-extern TaskHandle_t g_todo_task;
-extern QueueHandle_t g_word_request_queue;
-extern QueueHandle_t g_word_result_queue;
-extern TaskHandle_t g_word_task;
-extern QueueHandle_t g_note_request_queue;
-extern QueueHandle_t g_note_result_queue;
-extern TaskHandle_t g_note_task;
 extern QueueHandle_t g_display_result_queue;
 extern wqn::UiFrame g_pending_frames[2];
 extern std::string g_pending_signatures[2];

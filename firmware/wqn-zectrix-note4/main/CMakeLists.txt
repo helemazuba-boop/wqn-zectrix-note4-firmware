@@ -27,6 +27,7 @@ idf_component_register(
         "time_app.cpp"
         "ui/battery.cpp"
         "ui/clock.cpp"
+        "ui/cloud_runner.cpp"
         "ui/diagnostics.cpp"
         "ui/graphics.cpp"
         "ui/page_ai.cpp"

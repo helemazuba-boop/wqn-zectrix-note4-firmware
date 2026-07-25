@@ -24,9 +24,6 @@ namespace {
 constexpr char kNoteTag[] = "wqn_note_ui";
 }
 
-QueueHandle_t g_note_request_queue = nullptr;
-QueueHandle_t g_note_result_queue = nullptr;
-TaskHandle_t g_note_task = nullptr;
 static std::atomic<bool> g_note_cloud_busy{false};
 wqn::runtime::SleepLease g_note_sleep_lease;
 NoteCloudResult g_note_result_slot;
@@ -45,9 +42,6 @@ bool IsNoteCloudBusy()
 
 bool QueueNoteCloudRequest(const NoteCloudRequest& request)
 {
-    if (g_note_request_queue == nullptr) {
-        return false;
-    }
     bool expected = false;
     if (!g_note_cloud_busy.compare_exchange_strong(
             expected, true, std::memory_order_acq_rel, std::memory_order_acquire)) {
@@ -60,7 +54,10 @@ bool QueueNoteCloudRequest(const NoteCloudRequest& request)
         return false;
     }
     g_note_sleep_lease = std::move(lease);
-    if (xQueueSend(g_note_request_queue, &request, 0) != pdTRUE) {
+    CloudJob job;
+    job.domain = CloudDomain::kNote;
+    job.note = request;
+    if (!EnqueueCloudJob(job)) {
         FinishNoteCloudRequest();
         return false;
     }
@@ -167,10 +164,11 @@ NoteCloudResult* PeekNoteCloudResult(uint32_t generation)
 
 void SendNoteCloudResult()
 {
-    NoteCloudResultReady ready;
+    CloudResultReady ready;
+    ready.domain = CloudDomain::kNote;
     ready.generation = g_note_result_generation;
-    if (g_note_result_queue == nullptr ||
-        xQueueSend(g_note_result_queue, &ready, pdMS_TO_TICKS(100)) != pdTRUE) {
+    if (g_cloud_result_queue == nullptr ||
+        xQueueSend(g_cloud_result_queue, &ready, pdMS_TO_TICKS(100)) != pdTRUE) {
         FinishNoteCloudRequest();
     }
 }
@@ -244,107 +242,99 @@ bool ApplyNoteCloudResult(wqn::UiState* state, NoteCloudResult& result)
     return false;
 }
 
-void NoteCloudTask(void*)
+void ExecuteNoteCloudRequest(const NoteCloudRequest& request)
 {
-    ESP_LOGI(kNoteTag, "Note cloud task started");
-    while (true) {
-        NoteCloudRequest request;
-        if (xQueueReceive(g_note_request_queue, &request, portMAX_DELAY) != pdTRUE) {
-            continue;
-        }
-
-        g_note_result_slot = NoteCloudResult{};
+    g_note_result_slot = NoteCloudResult{};
+    ++g_note_result_generation;
+    if (g_note_result_generation == 0) {
         ++g_note_result_generation;
-        if (g_note_result_generation == 0) {
-            ++g_note_result_generation;
-        }
-        NoteCloudResult& result = g_note_result_slot;
-        result.op = request.op;
-        result.message.clear();
-
-        std::string token;
-        if (!LoadValidTokenForTodo(&token)) {
-            result.auth_required = true;
-            result.result = ESP_ERR_INVALID_STATE;
-            SendNoteCloudResult();
-            continue;
-        }
-
-        if (request.op == NoteCloudOp::kPackSync) {
-            wqn::NotePackSyncResult sync;
-            result.result = wqn::SyncNotePacks(token, &sync);
-            result.pack_index = std::move(sync.index);
-            result.pack_index_ready = sync.index_ready;
-            result.message = sync.message;
-            result.auth_required = sync.auth_required;
-        } else if (request.op == NoteCloudOp::kStartSession) {
-            wqn::protocol::note_study_v1::CreateSessionRequest session;
-            session.metadata = wqn::services::MakeDeviceRequestMetadata();
-            session.metadata.request_id = request.request_id;
-            session.mode = wqn::protocol::note_study_v1::Mode::kRecent;
-            session.scope.notebook_ids.push_back(request.notebook_id);
-            session.scope.include_archived = false;
-            session.optional_count = 500;
-            result.result = wqn::CreateNoteStudySessionV1(
-                token, session, &result.session, &result.protocol_error);
-        } else if (request.op == NoteCloudOp::kFetchSessionPage) {
-            wqn::protocol::note_study_v1::CandidatePageRequest page;
-            page.metadata = wqn::services::MakeDeviceRequestMetadata();
-            page.metadata.request_id = request.request_id;
-            page.cursor = request.cursor;
-            page.limit = request.limit;
-            result.result = wqn::FetchNoteStudyCandidatePageV1(
-                token, request.session_id, page, &result.candidate_page,
-                &result.protocol_error);
-        } else if (request.op == NoteCloudOp::kFetchImage) {
-            // Cache first: image ids are content hashes, so a hit needs no
-            // network at all. Misses download, verify (size + sha256 in
-            // wqn_api, WQNI header + CRC here) and then persist for next time.
-            const std::string image_id = request.image_id;
-            result.image_id = image_id;
-            auto wqni = std::make_shared<std::vector<uint8_t>>();
-            result.result = wqn::LoadCachedNoteImage(image_id, wqni.get());
-            if (result.result == ESP_OK) {
-                ESP_LOGI(kNoteTag, "note image cache hit: %.12s", image_id.c_str());
-            } else {
-                ESP_LOGI(kNoteTag, "note image cache miss (%s), downloading %.12s index=%u",
-                         esp_err_to_name(result.result), image_id.c_str(),
-                         static_cast<unsigned>(request.image_index));
-                result.result = wqn::DownloadNoteImageV1(
-                    token,
-                    wqn::services::MakeDeviceRequestMetadata(),
-                    request.note_id,
-                    request.image_index,
-                    image_id,
-                    wqni.get());
-                if (result.result == ESP_OK) {
-                    result.result =
-                        wqn::ValidateNoteImageWqni(wqni->data(), wqni->size());
-                }
-                ESP_LOGI(kNoteTag, "note image download result: %s bytes=%u",
-                         esp_err_to_name(result.result),
-                         static_cast<unsigned>(wqni->size()));
-                if (result.result == ESP_OK &&
-                    wqn::StoreCachedNoteImage(image_id, wqni->data(), wqni->size()) !=
-                        ESP_OK) {
-                    // Cache persistence is best-effort; showing the image wins.
-                    ESP_LOGW(kNoteTag, "note image cache store failed: %.12s",
-                             image_id.c_str());
-                }
-            }
-            if (result.result == ESP_OK) {
-                result.image_wqni = std::move(wqni);
-            }
-        } else {
-            result.result = ESP_ERR_INVALID_ARG;
-        }
-
-        if (result.result != ESP_OK) {
-            std::string after_token;
-            result.auth_required = !LoadValidTokenForTodo(&after_token);
-        }
-        SendNoteCloudResult();
     }
+    NoteCloudResult& result = g_note_result_slot;
+    result.op = request.op;
+    result.message.clear();
+
+    std::string token;
+    if (!LoadValidTokenForTodo(&token)) {
+        result.auth_required = true;
+        result.result = ESP_ERR_INVALID_STATE;
+        SendNoteCloudResult();
+        return;
+    }
+
+    if (request.op == NoteCloudOp::kPackSync) {
+        wqn::NotePackSyncResult sync;
+        result.result = wqn::SyncNotePacks(token, &sync);
+        result.pack_index = std::move(sync.index);
+        result.pack_index_ready = sync.index_ready;
+        result.message = sync.message;
+        result.auth_required = sync.auth_required;
+    } else if (request.op == NoteCloudOp::kStartSession) {
+        wqn::protocol::note_study_v1::CreateSessionRequest session;
+        session.metadata = wqn::services::MakeDeviceRequestMetadata();
+        session.metadata.request_id = request.request_id;
+        session.mode = wqn::protocol::note_study_v1::Mode::kRecent;
+        session.scope.notebook_ids.push_back(request.notebook_id);
+        session.scope.include_archived = false;
+        session.optional_count = 500;
+        result.result = wqn::CreateNoteStudySessionV1(
+            token, session, &result.session, &result.protocol_error);
+    } else if (request.op == NoteCloudOp::kFetchSessionPage) {
+        wqn::protocol::note_study_v1::CandidatePageRequest page;
+        page.metadata = wqn::services::MakeDeviceRequestMetadata();
+        page.metadata.request_id = request.request_id;
+        page.cursor = request.cursor;
+        page.limit = request.limit;
+        result.result = wqn::FetchNoteStudyCandidatePageV1(
+            token, request.session_id, page, &result.candidate_page,
+            &result.protocol_error);
+    } else if (request.op == NoteCloudOp::kFetchImage) {
+        // Cache first: image ids are content hashes, so a hit needs no
+        // network at all. Misses download, verify (size + sha256 in
+        // wqn_api, WQNI header + CRC here) and then persist for next time.
+        const std::string image_id = request.image_id;
+        result.image_id = image_id;
+        auto wqni = std::make_shared<std::vector<uint8_t>>();
+        result.result = wqn::LoadCachedNoteImage(image_id, wqni.get());
+        if (result.result == ESP_OK) {
+            ESP_LOGI(kNoteTag, "note image cache hit: %.12s", image_id.c_str());
+        } else {
+            ESP_LOGI(kNoteTag, "note image cache miss (%s), downloading %.12s index=%u",
+                     esp_err_to_name(result.result), image_id.c_str(),
+                     static_cast<unsigned>(request.image_index));
+            result.result = wqn::DownloadNoteImageV1(
+                token,
+                wqn::services::MakeDeviceRequestMetadata(),
+                request.note_id,
+                request.image_index,
+                image_id,
+                wqni.get());
+            if (result.result == ESP_OK) {
+                result.result =
+                    wqn::ValidateNoteImageWqni(wqni->data(), wqni->size());
+            }
+            ESP_LOGI(kNoteTag, "note image download result: %s bytes=%u",
+                     esp_err_to_name(result.result),
+                     static_cast<unsigned>(wqni->size()));
+            if (result.result == ESP_OK &&
+                wqn::StoreCachedNoteImage(image_id, wqni->data(), wqni->size()) !=
+                    ESP_OK) {
+                // Cache persistence is best-effort; showing the image wins.
+                ESP_LOGW(kNoteTag, "note image cache store failed: %.12s",
+                         image_id.c_str());
+            }
+        }
+        if (result.result == ESP_OK) {
+            result.image_wqni = std::move(wqni);
+        }
+    } else {
+        result.result = ESP_ERR_INVALID_ARG;
+    }
+
+    if (result.result != ESP_OK) {
+        std::string after_token;
+        result.auth_required = !LoadValidTokenForTodo(&after_token);
+    }
+    SendNoteCloudResult();
 }
 
 }  // namespace device_ui_internal
