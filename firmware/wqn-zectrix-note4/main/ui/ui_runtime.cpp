@@ -109,10 +109,14 @@ UiUpdate UiRuntime::DispatchButton(
 
 UiUpdate UiRuntime::DispatchTodoCloudResult(const TodoCloudResult& result)
 {
-    const bool changed = ApplyTodoCloudResult(&state_, result);
+    bool content_changed = true;
+    const bool changed = ApplyTodoCloudResult(&state_, result, &content_changed);
+    // Unchanged refreshes only need to clear the "syncing" hint: a partial
+    // repaint, not the 1.3s full-refresh flash a content change warrants.
     const RefreshSchedule refresh =
         changed && state_.screen == wqn::UiScreen::kTodo
-            ? RefreshSchedule::kCommit
+            ? (content_changed ? RefreshSchedule::kCommit
+                               : RefreshSchedule::kSelection)
             : RefreshSchedule::kNone;
     return FinishEvent(AppEventKind::kTodoCloudResult, refresh, changed);
 }

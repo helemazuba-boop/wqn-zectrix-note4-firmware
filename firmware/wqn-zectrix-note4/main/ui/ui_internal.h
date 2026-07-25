@@ -328,7 +328,10 @@ bool QueueNoteImageFetch(
     const std::string& note_id, uint8_t image_index, const std::string& image_id);
 void PumpNoteImageFetch(UiRuntime* runtime);
 
-bool ApplyTodoCloudResult(wqn::UiState* state, const TodoCloudResult& result);
+bool ApplyTodoCloudResult(
+    wqn::UiState* state,
+    const TodoCloudResult& result,
+    bool* content_changed = nullptr);
 bool ApplyWordCloudResult(wqn::UiState* state, WordCloudResult& result);
 bool ApplyNoteCloudResult(wqn::UiState* state, NoteCloudResult& result);
 

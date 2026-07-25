@@ -141,14 +141,59 @@ void ApplyTodoList(wqn::UiState* state, wqn::WqnTodoListPage page)
     wqn::ClampUiSelection(state);
 }
 
-bool ApplyTodoCloudResult(wqn::UiState* state, const TodoCloudResult& result)
+// True when a refreshed page would change nothing the user can see: same
+// items in the same order (id + rendered fields), same totals and paging.
+// Refreshing an unchanged timeline then only needs to clear the "syncing"
+// status line instead of flashing a full commit refresh.
+bool TodoPageMatchesState(const wqn::UiState& state, const wqn::WqnTodoListPage& page)
 {
+    const auto& todos = state.todo.todos;
+    if (page.todos.size() != todos.size()) return false;
+    for (size_t i = 0; i < todos.size(); ++i) {
+        const wqn::WqnTodoItem& a = todos[i];
+        const wqn::WqnTodoItem& b = page.todos[i];
+        if (a.id != b.id || a.title != b.title || a.status != b.status ||
+            a.priority != b.priority || a.due_at != b.due_at ||
+            a.updated_at != b.updated_at) {
+            return false;
+        }
+    }
+    const int page_total =
+        page.total > 0 ? page.total : static_cast<int>(page.todos.size());
+    return page_total == state.todo.total_pending &&
+        page.previous_cursor == state.todo.previous_cursor &&
+        page.next_cursor == state.todo.next_cursor &&
+        page.has_earlier == state.todo.has_earlier &&
+        page.has_later == state.todo.has_later;
+}
+
+bool ApplyTodoCloudResult(
+    wqn::UiState* state, const TodoCloudResult& result, bool* content_changed)
+{
+    if (content_changed != nullptr) {
+        *content_changed = true;
+    }
     if (state == nullptr) {
         return false;
     }
 
     if (result.op == TodoCloudOp::kRefresh) {
         if (result.result == ESP_OK) {
+            if (state->todo.loaded_once &&
+                TodoPageMatchesState(*state, result.page)) {
+                // Nothing the user can see changed; just retire the "syncing"
+                // hint. The dispatcher downgrades this to a partial repaint
+                // instead of the old unconditional full-refresh flash.
+                const bool hint_was_visible =
+                    state->todo.sync_status != wqn::TodoSyncStatus::kReady ||
+                    !state->todo.status_message.empty();
+                state->todo.sync_status = wqn::TodoSyncStatus::kReady;
+                state->todo.status_message.clear();
+                if (content_changed != nullptr) {
+                    *content_changed = false;
+                }
+                return hint_was_visible;
+            }
             ApplyTodoList(state, result.page);
         } else if (result.auth_required) {
             state->todo.sync_status = wqn::TodoSyncStatus::kAuthRequired;

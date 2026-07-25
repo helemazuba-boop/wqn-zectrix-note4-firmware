@@ -922,7 +922,12 @@ esp_err_t ParseWordPackManifestItem(cJSON* item, int index, wqn::WqnWordPackMani
     if (parsed.pack_id.empty() || parsed.deck_id.empty() ||
         !IsLowercaseSha256(parsed.sha256) || parsed.download_url.empty() ||
         parsed.schema_version != wqn::protocol::word_study_v1::kPackSchemaVersion ||
-        parsed.format != "jsonl" || parsed.compression != "zlib" ||
+        parsed.format != "jsonl" ||
+        // Transport coding: the server always sends zlib, but this parser also
+        // validates locally persisted manifests, and items rebuilt from on-disk
+        // packs report none (bytes at rest are plaintext). Rejecting none here
+        // turned every manifest load into a cache reset + full re-sync loop.
+        (parsed.compression != "zlib" && parsed.compression != "none") ||
         parsed.entry_count > wqn::protocol::word_study_v1::kMaxPackEntries ||
         parsed.byte_size == 0 ||
         parsed.byte_size > wqn::protocol::word_study_v1::kMaxPackBytes) {
