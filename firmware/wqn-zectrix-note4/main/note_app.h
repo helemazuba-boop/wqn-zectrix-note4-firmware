@@ -158,10 +158,15 @@ void ApplyNotePackIndex(NoteAppState* state, NotePackIndex index, const std::str
 bool TakeNoteSessionStartRequest(
     NoteAppState* state,
     protocol::note_study_v1::CreateSessionRequest* request);
+// The runner thread already compacted (compact_result) and persisted
+// (persist_result) the session snapshot; apply only installs it in memory so
+// the UI task never runs the multi-second snapshot fsync.
 bool ApplyNoteSessionStartResult(
     NoteAppState* state,
     esp_err_t result,
-    protocol::note_study_v1::SessionData session);
+    esp_err_t compact_result,
+    esp_err_t persist_result,
+    PersistedNoteSession persisted);
 void CancelNoteSessionStartResult(NoteAppState* state);
 // Discards a server-invalid session (snapshot corrupt / not found / not active)
 // and returns to the notebook list so the device stops reusing a bad session_id;

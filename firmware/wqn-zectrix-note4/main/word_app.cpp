@@ -1001,7 +1001,9 @@ bool TakeWordSessionStartRequest(
 bool ApplyWordSessionStartResult(
     WordAppState* state,
     esp_err_t result,
-    protocol::word_study_v1::SessionData session)
+    esp_err_t compact_result,
+    esp_err_t persist_result,
+    PersistedWordSession persisted)
 {
     if (state == nullptr || !state->session.start_result_expected) return false;
     state->session.start_result_expected = false;
@@ -1018,15 +1020,11 @@ bool ApplyWordSessionStartResult(
                   : "本轮准备失败，可重试");
         return true;
     }
-    PersistedWordSession persisted;
-    const bool dictionary_session = session.mode ==
+    // The runner thread already compacted and (for active sessions) persisted
+    // the snapshot; only the in-memory install happens here.
+    const bool dictionary_session = persisted.remote.mode ==
         protocol::word_study_v1::Mode::kDictionary;
-    persisted.active = !session.items.empty();
-    persisted.paused = false;
-    persisted.position = 0;
-    persisted.phase = WordPresentationPhase::kFront;
-    result = CompactWordSessionData(session, &persisted.remote);
-    if (result != ESP_OK) {
+    if (compact_result != ESP_OK) {
         state->mode = WordAppMode::kHome;
         state->message = "会话数据过大";
         return true;
@@ -1041,8 +1039,7 @@ bool ApplyWordSessionStartResult(
         }
         return true;
     }
-    result = SavePersistedWordSession(persisted);
-    if (result != ESP_OK) {
+    if (persist_result != ESP_OK) {
         state->mode = WordAppMode::kHome;
         state->message = "会话未保存，请重试";
         return true;
@@ -1750,9 +1747,11 @@ bool RunWordPageStateSelfTest()
     stale->initialized = true;
     stale->mode = WordAppMode::kHome;
     stale->home_selection = WordHomeSelection::kRandom;
-    protocol::word_study_v1::SessionData stale_session;
+    PersistedWordSession stale_persisted;
+    stale_persisted.active = true;
     if (!require(!ApplyWordSessionStartResult(
-                     &stale.get(), ESP_OK, std::move(stale_session)),
+                     &stale.get(), ESP_OK, ESP_OK, ESP_OK,
+                     std::move(stale_persisted)),
                  "cancelled session result is ignored") ||
         !require(stale->mode == WordAppMode::kHome &&
                      stale->home_selection == WordHomeSelection::kRandom,

@@ -223,7 +223,9 @@ bool ApplyWordCloudResult(wqn::UiState* state, WordCloudResult& result)
         const bool applied = wqn::ApplyWordSessionStartResult(
             &state->word_app,
             result.result,
-            std::move(result.session));
+            result.session_compact_result,
+            result.session_persist_result,
+            std::move(result.persisted_session));
         if (!applied) return false;
         BuildHomeSummary(state);
         return true;
@@ -421,6 +423,22 @@ void ExecuteWordCloudRequest(const WordCloudRequest& request)
             session,
             &result.session,
             &result.protocol_error);
+        if (result.result == ESP_OK) {
+            // Compact + persist on the runner thread; the snapshot fsync used
+            // to run inside the UI task's apply step. Inactive sessions are
+            // never persisted (mirrors the old apply-side order).
+            result.persisted_session.active = !result.session.items.empty();
+            result.persisted_session.paused = false;
+            result.persisted_session.position = 0;
+            result.persisted_session.phase = wqn::WordPresentationPhase::kFront;
+            result.session_compact_result = wqn::CompactWordSessionData(
+                result.session, &result.persisted_session.remote);
+            if (result.session_compact_result == ESP_OK &&
+                result.persisted_session.active) {
+                result.session_persist_result =
+                    wqn::SavePersistedWordSession(result.persisted_session);
+            }
+        }
     } else if (request.op == WordCloudOp::kFetchSessionPage) {
         wqn::protocol::word_study_v1::CandidatePageRequest page;
         page.metadata = wqn::services::MakeDeviceRequestMetadata();

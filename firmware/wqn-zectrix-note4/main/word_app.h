@@ -188,10 +188,15 @@ bool TakeWordAiLookupRequest(WordAppState* state, WqnWordAiLookupRequest* reques
 bool TakeWordSessionStartRequest(
     WordAppState* state,
     protocol::word_study_v1::CreateSessionRequest* request);
+// The runner thread already compacted (compact_result) and, for active
+// sessions, persisted (persist_result) the snapshot; apply only installs it in
+// memory so the UI task never runs the snapshot fsync.
 bool ApplyWordSessionStartResult(
     WordAppState* state,
     esp_err_t result,
-    protocol::word_study_v1::SessionData session);
+    esp_err_t compact_result,
+    esp_err_t persist_result,
+    PersistedWordSession persisted);
 void CancelWordSessionStartResult(WordAppState* state);
 // Discards a server-invalid session (snapshot corrupt / not found / not active)
 // so the device stops reusing the same bad session_id, then returns to the word

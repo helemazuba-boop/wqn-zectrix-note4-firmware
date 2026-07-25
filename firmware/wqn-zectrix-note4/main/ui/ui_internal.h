@@ -178,6 +178,12 @@ struct WordCloudResult {
     wqn::WqnWordAiLookupResult lookup;
     std::string query;
     std::string message;
+    // kStartSession: the compacted session snapshot, already persisted on the
+    // runner thread so the 36 KB fsync never runs on the UI task. The apply
+    // step only installs it in memory.
+    wqn::PersistedWordSession persisted_session;
+    esp_err_t session_compact_result = ESP_OK;
+    esp_err_t session_persist_result = ESP_OK;
 };
 
 struct TodoCloudResultReady {
@@ -221,6 +227,11 @@ struct NoteCloudResult {
     // kFetchImage: validated WQNI bytes (header + payload) and their id.
     std::string image_id;
     std::shared_ptr<const std::vector<uint8_t>> image_wqni;
+    // kStartSession: compacted + already-persisted session snapshot (see
+    // WordCloudResult); apply installs it without touching storage.
+    wqn::PersistedNoteSession persisted_session;
+    esp_err_t session_compact_result = ESP_OK;
+    esp_err_t session_persist_result = ESP_OK;
 };
 
 struct NoteCloudResultReady {

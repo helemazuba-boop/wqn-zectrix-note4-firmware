@@ -216,7 +216,8 @@ bool ApplyNoteCloudResult(wqn::UiState* state, NoteCloudResult& result)
             return false;
         }
         const bool applied = wqn::ApplyNoteSessionStartResult(
-            &state->note_app, result.result, std::move(result.session));
+            &state->note_app, result.result, result.session_compact_result,
+            result.session_persist_result, std::move(result.persisted_session));
         if (!applied) return false;
         BuildHomeSummary(state);
         return true;
@@ -278,6 +279,20 @@ void ExecuteNoteCloudRequest(const NoteCloudRequest& request)
         session.optional_count = 500;
         result.result = wqn::CreateNoteStudySessionV1(
             token, session, &result.session, &result.protocol_error);
+        if (result.result == ESP_OK) {
+            // Compact + persist here on the runner thread: the session snapshot
+            // write is a multi-second-class SPIFFS fsync that used to run inside
+            // the UI task's apply step (the "entering a notebook stalls" debt).
+            result.persisted_session.active = !result.session.items.empty();
+            result.persisted_session.paused = false;
+            result.persisted_session.position = 0;
+            result.session_compact_result = wqn::CompactNoteSessionData(
+                result.session, &result.persisted_session.remote);
+            if (result.session_compact_result == ESP_OK) {
+                result.session_persist_result =
+                    wqn::SavePersistedNoteSession(result.persisted_session);
+            }
+        }
     } else if (request.op == NoteCloudOp::kFetchSessionPage) {
         wqn::protocol::note_study_v1::CandidatePageRequest page;
         page.metadata = wqn::services::MakeDeviceRequestMetadata();

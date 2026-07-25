@@ -580,7 +580,9 @@ bool TakeNoteSessionStartRequest(
 bool ApplyNoteSessionStartResult(
     NoteAppState* state,
     esp_err_t result,
-    protocol::note_study_v1::SessionData session)
+    esp_err_t compact_result,
+    esp_err_t persist_result,
+    PersistedNoteSession persisted)
 {
     if (state == nullptr || !state->session.start_result_expected) return false;
     state->session.start_result_expected = false;
@@ -591,18 +593,12 @@ bool ApplyNoteSessionStartResult(
             : "打开失败，可重试";
         return true;
     }
-    PersistedNoteSession persisted;
-    persisted.active = !session.items.empty();
-    persisted.paused = false;
-    persisted.position = 0;
-    result = CompactNoteSessionData(session, &persisted.remote);
-    if (result != ESP_OK) {
+    if (compact_result != ESP_OK) {
         state->mode = NoteAppMode::kNotebookList;
         state->message = "会话数据过大";
         return true;
     }
-    result = SavePersistedNoteSession(persisted);
-    if (result != ESP_OK) {
+    if (persist_result != ESP_OK) {
         state->mode = NoteAppMode::kNotebookList;
         state->message = "会话未保存，请重试";
         return true;
@@ -1188,9 +1184,10 @@ bool RunNotePageStateSelfTest()
     st.initialized = true;
     st.mode = NoteAppMode::kNotebookList;
     st.session.start_result_expected = false;
-    protocol::note_study_v1::SessionData stale_session;
-    stale_session.session_id = "00000000-0000-4000-8000-000000000004";
-    if (!require(!ApplyNoteSessionStartResult(&st, ESP_OK, stale_session),
+    PersistedNoteSession stale_persisted;
+    stale_persisted.active = true;
+    if (!require(!ApplyNoteSessionStartResult(
+                     &st, ESP_OK, ESP_OK, ESP_OK, stale_persisted),
                  "stale session result discarded") ||
         !require(st.mode == NoteAppMode::kNotebookList, "stale result keeps screen") ||
         !require(!st.session.persisted.active, "stale result does not activate session")) {
