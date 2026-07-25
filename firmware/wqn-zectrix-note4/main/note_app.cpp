@@ -99,8 +99,16 @@ void LoadCurrentNoteBody(wqn::NoteAppState* state)
     const wqn::StoredNoteSessionItem& item = items[state->note_list_selected];
     const wqn::NotePackIndexEntry* entry =
         FindPackEntry(*state, item.notebook_id, item.item_id);
-    if (entry == nullptr) return;
-    if (wqn::ReadNotePackEntry(*entry, &state->current_note) == ESP_OK) {
+    if (entry == nullptr) {
+        // [note-image-diag] The session references a note the mounted index
+        // cannot resolve -- typically a stale index after packs changed on disk.
+        ESP_LOGW(
+            "note_app", "note open unresolved: id=%.8s not in pack index",
+            item.item_id);
+        return;
+    }
+    const esp_err_t read_result = wqn::ReadNotePackEntry(*entry, &state->current_note);
+    if (read_result == ESP_OK) {
         state->current_note_loaded = true;
         // [note-image-diag] Settles "UP does nothing": images only exist for
         // the viewer if the pack line carried ids.
@@ -115,6 +123,9 @@ void LoadCurrentNoteBody(wqn::NoteAppState* state)
         state->note_body_total_lines = static_cast<uint32_t>(
             wqn::WrapUtf8TextToWidth(state->current_note.content, 370, 4096).size());
     } else {
+        ESP_LOGW(
+            "note_app", "note open read failed: id=%.8s err=%s",
+            item.item_id, esp_err_to_name(read_result));
         state->note_body_total_lines = 0;
     }
 }

@@ -26,6 +26,14 @@ constexpr size_t kMaxManifestPagesPerSync = 32;
 
 esp_err_t SyncNotePacks(const std::string& token, NotePackSyncResult* out)
 {
+    // Sticky repair marker: set once pack files on disk may differ from the
+    // index the app is holding (a download landed, or a required rebuild did
+    // not complete). Without it, a sync that failed AFTER downloading packs
+    // left every later round in "nothing changed; rebuild skipped" while the
+    // stale in-memory index kept dereferencing old offsets into the new files
+    // (HIL: packs re-downloaded fine, yet every note open failed silently).
+    static bool s_index_stale = false;
+
     if (out == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
@@ -131,6 +139,7 @@ esp_err_t SyncNotePacks(const std::string& token, NotePackSyncResult* out)
                 token, services::MakeDeviceRequestMetadata(), delta.notebooks[i]);
             if (out->result == ESP_OK) {
                 manifest_content_changed = true;
+                s_index_stale = true;
             }
         }
         if (out->result != ESP_OK) {
@@ -157,14 +166,29 @@ esp_err_t SyncNotePacks(const std::string& token, NotePackSyncResult* out)
     }
 
     if (out->result == ESP_OK &&
-        (manifest_content_changed || !had_local_manifest)) {
+        (manifest_content_changed || !had_local_manifest || s_index_stale)) {
         out->result = LoadNotePackIndex(&out->index);
         out->message = out->index.status_message;
         out->index_ready = out->result == ESP_OK;
         out->content_changed = true;
+        if (out->result == ESP_OK) {
+            s_index_stale = false;
+        } else {
+            s_index_stale = true;
+        }
     } else if (out->result == ESP_OK) {
         out->message = "笔记无变更";
         ESP_LOGI(kTag, "note pack manifest unchanged; index rebuild skipped");
+    }
+    if (out->result != ESP_OK) {
+        // Name the failing stage: the UI only surfaces a generic message, and
+        // HIL had to reverse-engineer the break point from server logs.
+        ESP_LOGW(
+            kTag,
+            "note pack sync failed: %s stage_message=%s index_stale=%d",
+            esp_err_to_name(out->result),
+            out->message.empty() ? "-" : out->message.c_str(),
+            s_index_stale ? 1 : 0);
     }
     return out->result;
 }
