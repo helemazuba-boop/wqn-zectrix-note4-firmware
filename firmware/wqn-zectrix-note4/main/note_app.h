@@ -61,6 +61,11 @@ struct NoteAppState {
     NoteAppMode mode = NoteAppMode::kNotebookList;
     size_t notebook_selected = 0;
     size_t note_list_selected = 0;
+    // Edge-triggered list viewports: first visible row of the notebook/title
+    // lists. note_app.cpp moves them only when the selection walks off a window
+    // edge, so in-window steps repaint just two rows on the panel.
+    size_t notebook_window_start = 0;
+    size_t note_list_window_start = 0;
     uint32_t note_scroll_offset_lines = 0;
     // Total wrapped body lines for the open note (computed at load with the same
     // wrap width as RenderNoteBody). Bounds Down-scroll so over-scrolling past the
@@ -101,6 +106,10 @@ struct NoteAppSnapshot {
     NoteAppMode mode = NoteAppMode::kNotebookList;
     size_t notebook_selected = 0;
     size_t note_list_selected = 0;
+    // Mirrors of the edge-triggered viewports; the render layer draws exactly
+    // this window instead of recomputing one from the selection.
+    size_t notebook_window_start = 0;
+    size_t note_list_window_start = 0;
     uint32_t note_scroll_offset_lines = 0;
     bool has_body = false;
     bool cloud_sync_failed = false;
