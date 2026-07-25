@@ -102,6 +102,13 @@ void LoadCurrentNoteBody(wqn::NoteAppState* state)
     if (entry == nullptr) return;
     if (wqn::ReadNotePackEntry(*entry, &state->current_note) == ESP_OK) {
         state->current_note_loaded = true;
+        // [note-image-diag] Settles "UP does nothing": images only exist for
+        // the viewer if the pack line carried ids.
+        ESP_LOGI(
+            "note_app", "note opened: id=%.8s images=%u body_bytes=%u",
+            state->current_note.note_id.c_str(),
+            static_cast<unsigned>(state->current_note.image_ids.size()),
+            static_cast<unsigned>(state->current_note.content.size()));
         // Precompute the wrapped line count with the SAME width as RenderNoteBody
         // (ui/page_note.cpp: kContentW - 14 = kEpdWidth - 30 = 370 px) so the
         // scroll handler can clamp Down to the last page.

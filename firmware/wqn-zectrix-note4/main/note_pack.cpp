@@ -1073,6 +1073,18 @@ esp_err_t LoadNotePackIndex(NotePackIndex* index)
         static_cast<unsigned>(index->pack_bytes),
         static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
         static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)));
+    // [note-image-diag] Image ids only reach the viewer through pack lines, so
+    // report how many indexed notes carry attachments; with_images=0 while the
+    // web shows attachments means the device pack predates the attach (sync
+    // gap), not a UI bug.
+    {
+        unsigned with_images = 0;
+        for (const auto& entry : index->entries) {
+            if (entry.image_count > 0) ++with_images;
+        }
+        ESP_LOGI(
+            kTag, "note pack index images: notes_with_images=%u", with_images);
+    }
     return ESP_OK;
 }
 
