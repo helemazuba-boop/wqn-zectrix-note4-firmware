@@ -755,6 +755,10 @@ void ApplyNoteCandidatePageResult(
     RequestNoteCandidatePageIfNeeded(state);
 }
 
+// Defined below ApplyNoteImageResult; the pump-side take path uses it to heal
+// dropped or mismatched fetch results.
+void EnsureNoteImageRequest(NoteAppState* state);
+
 bool TakeNoteImageRequest(
     NoteAppState* state,
     std::string* note_id,
@@ -762,7 +766,13 @@ bool TakeNoteImageRequest(
     std::string* image_id)
 {
     if (state == nullptr || note_id == nullptr || image_index == nullptr ||
-        image_id == nullptr || !state->image_request || state->image_in_flight ||
+        image_id == nullptr) {
+        return false;
+    }
+    // Heal a dropped/mismatched result before checking the flag, so the pump
+    // retries instead of leaving the viewer on a forever-loading page.
+    EnsureNoteImageRequest(state);
+    if (!state->image_request || state->image_in_flight ||
         state->mode != NoteAppMode::kNoteImageView ||
         state->image_expected_id.empty() ||
         state->current_note.note_id.size() != 36) {
@@ -773,6 +783,9 @@ bool TakeNoteImageRequest(
     *image_id = state->image_expected_id;
     state->image_request = false;
     state->image_in_flight = true;
+    ESP_LOGI(kTag, "note image fetch dispatched: id=%.12s index=%u note=%.8s",
+             image_id->c_str(), static_cast<unsigned>(*image_index),
+             note_id->c_str());
     return true;
 }
 
@@ -801,12 +814,39 @@ void ApplyNoteImageResult(
         }
         return;
     }
-    if (state->image_expected_id == image_id &&
-        state->mode == NoteAppMode::kNoteImageView) {
+    // Only one fetch is ever in flight, so any failure that arrives while the
+    // viewer is waiting terminates the wait -- even when the result carries no
+    // image id (early exits like an invalid token never reached the download).
+    // The old id-match guard turned those into a silent forever-loading page.
+    // A stale failure for an image the viewer no longer wants (flipped while
+    // in flight) is not an error; the take-side self-heal re-requests.
+    if (state->mode == NoteAppMode::kNoteImageView && !state->image_request &&
+        (image_id.empty() || image_id == state->image_expected_id)) {
         state->image_error = true;
         ESP_LOGW(kTag, "note image fetch failed: %s id=%.12s",
                  esp_err_to_name(result), image_id.c_str());
     }
+}
+
+// Self-healing for the image viewer: if the page sits in "loading" with no
+// request, no in-flight fetch and no error (a dropped/mismatched result), re-arm
+// the request so the pump retries instead of hanging forever. Failed fetches
+// set image_error and are NOT re-armed (the user backs out or re-enters).
+void EnsureNoteImageRequest(NoteAppState* state)
+{
+    if (state == nullptr || state->mode != NoteAppMode::kNoteImageView ||
+        state->image_request || state->image_in_flight || state->image_error ||
+        state->image_expected_id.empty()) {
+        return;
+    }
+    if (state->image_loaded_id == state->image_expected_id &&
+        state->image_wqni != nullptr) {
+        return;  // already showing
+    }
+    ESP_LOGW(kTag, "note image request re-armed: id=%.12s index=%u",
+             state->image_expected_id.c_str(),
+             static_cast<unsigned>(state->image_index));
+    state->image_request = true;
 }
 
 bool TakeNoteObservationEffect(

@@ -151,6 +151,8 @@ void PumpNoteImageFetch(UiRuntime* runtime)
         return;
     }
     if (!QueueNoteImageFetch(note_id, image_index, image_id)) {
+        ESP_LOGW(kNoteTag, "note image queue rejected (busy=%d); will retry",
+                 IsNoteCloudBusy() ? 1 : 0);
         runtime->RestoreNoteImageRequest();
     }
 }
@@ -302,7 +304,12 @@ void NoteCloudTask(void*)
             result.image_id = image_id;
             auto wqni = std::make_shared<std::vector<uint8_t>>();
             result.result = wqn::LoadCachedNoteImage(image_id, wqni.get());
-            if (result.result != ESP_OK) {
+            if (result.result == ESP_OK) {
+                ESP_LOGI(kNoteTag, "note image cache hit: %.12s", image_id.c_str());
+            } else {
+                ESP_LOGI(kNoteTag, "note image cache miss (%s), downloading %.12s index=%u",
+                         esp_err_to_name(result.result), image_id.c_str(),
+                         static_cast<unsigned>(request.image_index));
                 result.result = wqn::DownloadNoteImageV1(
                     token,
                     wqn::services::MakeDeviceRequestMetadata(),
@@ -314,6 +321,9 @@ void NoteCloudTask(void*)
                     result.result =
                         wqn::ValidateNoteImageWqni(wqni->data(), wqni->size());
                 }
+                ESP_LOGI(kNoteTag, "note image download result: %s bytes=%u",
+                         esp_err_to_name(result.result),
+                         static_cast<unsigned>(wqni->size()));
                 if (result.result == ESP_OK &&
                     wqn::StoreCachedNoteImage(image_id, wqni->data(), wqni->size()) !=
                         ESP_OK) {
