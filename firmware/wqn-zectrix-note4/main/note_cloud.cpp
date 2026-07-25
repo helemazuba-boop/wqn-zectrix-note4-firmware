@@ -58,6 +58,16 @@ esp_err_t SyncNotePacks(const std::string& token, NotePackSyncResult* out)
         }
     }
 
+    // The server's note manifest cursor is a NOTEBOOK LIST OFFSET: the
+    // manifest relists every notebook with its current pack sha, unlike the
+    // word manifest whose cursor is a change_seq feed. Persisting the offset
+    // made every later sync resume listing past the end (cursor == notebook
+    // count -> changes=0 forever), so web-side attaches/edits never reached a
+    // device that had synced once (HIL: cursor=3 changes=0 while the cloud
+    // note_change_log sat at seq 5). Relist from 0 on every sync; the
+    // per-notebook sha comparison below keeps unchanged packs download-free.
+    local_manifest.cursor = 0;
+
     size_t page_count = 0;
     bool has_more = out->result == ESP_OK;
     while (out->result == ESP_OK && has_more &&
@@ -75,8 +85,14 @@ esp_err_t SyncNotePacks(const std::string& token, NotePackSyncResult* out)
             out->message = "笔记游标未推进";
             break;
         }
-        manifest_content_changed =
-            manifest_content_changed || !delta.notebooks.empty();
+        // A relisted page alone is not a content change; only an applied
+        // tombstone or an actual pack download below flips the flag, so an
+        // all-unchanged sync still skips the expensive index rebuild.
+        for (const WqnNotePackManifestNotebook& item : delta.notebooks) {
+            if (item.deleted) {
+                manifest_content_changed = true;
+            }
+        }
 
         // Evaluate each pack's download decision exactly once. NotePackNeedsDownload
         // hashes the entire local file, so calling it for both the capacity estimate
@@ -113,6 +129,9 @@ esp_err_t SyncNotePacks(const std::string& token, NotePackSyncResult* out)
             }
             out->result = DownloadNotePackToStorage(
                 token, services::MakeDeviceRequestMetadata(), delta.notebooks[i]);
+            if (out->result == ESP_OK) {
+                manifest_content_changed = true;
+            }
         }
         if (out->result != ESP_OK) {
             break;

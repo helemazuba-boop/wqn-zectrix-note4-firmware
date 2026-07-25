@@ -765,9 +765,9 @@ esp_err_t MergeNotePackManifestDelta(
     if (load_result == ESP_ERR_NOT_FOUND) {
         current = {};
     }
-    if (delta.cursor < current.cursor) {
-        return ESP_ERR_INVALID_STATE;
-    }
+    // No monotonic guard on the cursor: it is a notebook-list offset (the sync
+    // relists from 0 every cycle), not a change feed, so it legitimately moves
+    // backwards between syncs and shrinks when notebooks are archived.
 
     for (const WqnNotePackManifestNotebook& change : delta.notebooks) {
         auto existing = std::find_if(
