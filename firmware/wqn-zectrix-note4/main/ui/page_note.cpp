@@ -190,9 +190,17 @@ esp_err_t RenderNoteToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
             break;
     }
 
+    // Bottom line = status message + button hints. The header row that used to
+    // carry status_line was folded into the status bar, so transient feedback
+    // ("已到顶部/已到底部/已恢复上次浏览"...) must surface here or boundary presses
+    // look like a frozen device.
+    std::string footer = note.status_line;
     if (!note.hint.empty()) {
+        footer = footer.empty() ? note.hint : footer + " · " + note.hint;
+    }
+    if (!footer.empty()) {
         ESP_RETURN_ON_ERROR(
-            DrawClippedText(kNoteMarginX, kHintY, kContentW, note.hint), kTag, "draw note hint");
+            DrawClippedText(kNoteMarginX, kHintY, kContentW, footer), kTag, "draw note footer");
     }
     return RefreshFrame(frame, schedule);
 }

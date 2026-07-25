@@ -156,10 +156,20 @@ void HandleNotebookListInput(wqn::NoteAppState* state, wqn::NoteInput input)
     const size_t count = state->pack_index.notebooks.size();
     switch (input) {
         case wqn::NoteInput::kUp:
-            if (state->notebook_selected > 0) --state->notebook_selected;
+            if (state->notebook_selected > 0) {
+                --state->notebook_selected;
+                state->message.clear();
+            } else {
+                state->message = "已到顶部";
+            }
             break;
         case wqn::NoteInput::kDown:
-            if (count > 0 && state->notebook_selected + 1 < count) ++state->notebook_selected;
+            if (count > 0 && state->notebook_selected + 1 < count) {
+                ++state->notebook_selected;
+                state->message.clear();
+            } else {
+                state->message = "已到底部";
+            }
             break;
         case wqn::NoteInput::kConfirm: {
             if (count == 0 || state->notebook_selected >= count) {
@@ -214,11 +224,17 @@ void HandleNoteListInput(wqn::NoteAppState* state, wqn::NoteInput input)
     const auto& items = state->session.persisted.remote.items;
     switch (input) {
         case wqn::NoteInput::kUp:
-            if (state->note_list_selected > 0) --state->note_list_selected;
+            if (state->note_list_selected > 0) {
+                --state->note_list_selected;
+                state->message.clear();
+            } else {
+                state->message = "已到顶部";
+            }
             break;
         case wqn::NoteInput::kDown:
             if (!items.empty() && state->note_list_selected + 1 < items.size()) {
                 ++state->note_list_selected;
+                state->message.clear();
             } else {
                 // [note-scroll-diag] Down could not advance -- either the real
                 // bottom (has_more=0) or waiting on a prefetch (has_more=1).
@@ -228,6 +244,9 @@ void HandleNoteListInput(wqn::NoteAppState* state, wqn::NoteInput input)
                     static_cast<unsigned>(state->note_list_selected),
                     static_cast<unsigned>(items.size()),
                     state->session.persisted.remote.has_more ? 1 : 0);
+                state->message = state->session.persisted.remote.has_more
+                    ? "正在加载更多…"
+                    : "已到底部";
             }
             RequestNoteCandidatePageIfNeeded(state);
             break;
@@ -263,10 +282,15 @@ void HandleNoteViewInput(wqn::NoteAppState* state, wqn::NoteInput input)
     switch (input) {
         case wqn::NoteInput::kUp: {
             constexpr uint32_t kNoteBodyScrollStep = 4;
-            state->note_scroll_offset_lines =
-                state->note_scroll_offset_lines > kNoteBodyScrollStep
-                    ? state->note_scroll_offset_lines - kNoteBodyScrollStep
-                    : 0;
+            if (state->note_scroll_offset_lines == 0) {
+                state->message = "已到顶部";
+            } else {
+                state->note_scroll_offset_lines =
+                    state->note_scroll_offset_lines > kNoteBodyScrollStep
+                        ? state->note_scroll_offset_lines - kNoteBodyScrollStep
+                        : 0;
+                state->message.clear();
+            }
             break;
         }
         case wqn::NoteInput::kDown:
@@ -281,8 +305,13 @@ void HandleNoteViewInput(wqn::NoteAppState* state, wqn::NoteInput input)
                 state->note_body_total_lines > kNoteBodyVisibleLines
                     ? state->note_body_total_lines - kNoteBodyVisibleLines
                     : 0;
-            state->note_scroll_offset_lines = std::min<uint32_t>(
-                state->note_scroll_offset_lines + kNoteBodyScrollStep, max_scroll);
+            if (state->note_scroll_offset_lines >= max_scroll) {
+                state->message = "已到底部";
+            } else {
+                state->note_scroll_offset_lines = std::min<uint32_t>(
+                    state->note_scroll_offset_lines + kNoteBodyScrollStep, max_scroll);
+                state->message.clear();
+            }
             break;
         }
         case wqn::NoteInput::kLongConfirm:
