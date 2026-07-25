@@ -105,6 +105,13 @@ bool g_previous_framebuffer_synced = false;
 bool g_hot_refresh_ok = false;
 uint32_t g_partial_refreshes_since_full = 0;
 uint32_t g_heavy_partials_since_full = 0;
+// [epd-wedge-fix] True when the most recent successful refresh was a
+// full-frame partial. HIL logs show a windowed local partial issued right
+// after a full-frame partial wedges the SSD1683: BUSY stays low past the 4 s
+// probe (entry=0 exit=0 trans=no) and only a full-refresh recovery revives the
+// panel (three-for-three reproduction in one session, while LP->LP, FFP->FFP
+// and FULL->LP sequences all run clean).
+bool g_last_partial_was_full_frame = false;
 int64_t g_last_epd_refresh_us = 0;
 int64_t g_last_epd_activity_ms = 0;
 bool g_epd_idle_cut = false;
@@ -499,6 +506,7 @@ void DropEpdHotState(bool cut_rail, bool invalidate_framebuffer)
         g_previous_framebuffer_synced = false;
         g_partial_refreshes_since_full = 0;
         g_heavy_partials_since_full = 0;
+        g_last_partial_was_full_frame = false;
     }
     g_hot_refresh_ok = false;
     g_last_epd_refresh_us = 0;
@@ -1040,6 +1048,7 @@ esp_err_t InitEpdDisplay()
     g_previous_framebuffer_synced = false;
     g_partial_refreshes_since_full = 0;
     g_heavy_partials_since_full = 0;
+    g_last_partial_was_full_frame = false;
 
     ESP_RETURN_ON_ERROR(InitPanelSequence(), kTag, "init EPD panel");
     g_initialized = true;
@@ -1534,6 +1543,16 @@ esp_err_t RefreshEpdFull(bool allow_local_partial, bool force_full_refresh)
     if (local_partial && DirtyRectHeight(dirty_rect) > kLocalPartialMaxHeight) {
         local_partial = false;
     }
+    if (local_partial && g_last_partial_was_full_frame) {
+        // [epd-wedge-fix] Never chase a full-frame partial with a windowed
+        // local partial; escalate to a clean full refresh instead. This both
+        // avoids the 4 s BUSY wedge and clears the ghosting the full-frame
+        // partial just built up.
+        ESP_LOGI(kTag,
+                 "EPD escalating to full refresh: windowed partial after full-frame partial");
+        local_partial = false;
+        full_refresh = true;
+    }
 
     ESP_LOGI(
         kTag,
@@ -1567,6 +1586,9 @@ esp_err_t RefreshEpdFull(bool allow_local_partial, bool force_full_refresh)
                 return refresh_ret;
             }
             ESP_LOGI(kTag, "EPD full refresh recovery succeeded");
+            // The panel content now comes from a genuine full refresh: reset
+            // the partial bookkeeping below accordingly.
+            full_refresh = true;
         } else {
             return refresh_ret;
         }
@@ -1578,6 +1600,7 @@ esp_err_t RefreshEpdFull(bool allow_local_partial, bool force_full_refresh)
     g_heavy_partials_since_full = full_refresh
         ? 0
         : g_heavy_partials_since_full + (diff_ratio >= kHeavyPartialDiffRatio ? 1 : 0);
+    g_last_partial_was_full_frame = !full_refresh && !local_partial;
     // [power-fix] Record the CRC so deep-sleep wakeups can skip the next
     // refresh if the frame content hasn't changed.
     g_rtc_last_frame_crc = current_crc;
