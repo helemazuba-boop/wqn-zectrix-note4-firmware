@@ -2953,16 +2953,34 @@ esp_err_t DownloadNoteImageV1(
         return result;
     }
 
-    // zlib transport coding: inflate the body (ROM tinfl, one shot) before any
-    // verification -- image_id is the sha256 of the uncompressed WQNI file.
+    // zlib transport coding: inflate the body before any verification --
+    // image_id is the sha256 of the uncompressed WQNI file. NOT
+    // tinfl_decompress_mem_to_mem: that convenience wrapper declares the ~11 KB
+    // tinfl_decompressor ON THE STACK and overflowed the 8 KB cloud lane task
+    // the moment the download completed (HIL: clean download of 15020 bytes,
+    // then 'stack overflow in task wqn_cloud_int'). Reuse the pack path's
+    // heap/PSRAM-backed streaming inflater instead: one Feed with the whole
+    // body, sink appends into the output vector.
     {
-        std::vector<uint8_t> inflated(kWqniFileBytes);
-        const size_t out = tinfl_decompress_mem_to_mem(
-            inflated.data(), inflated.size(), wqni->data(), wqni->size(),
-            TINFL_FLAG_PARSE_ZLIB_HEADER);
-        if (out != kWqniFileBytes) {
-            ESP_LOGW(kTag, "note-image-download inflate failed: out=%u",
-                     static_cast<unsigned>(out));
+        std::vector<uint8_t> inflated;
+        inflated.reserve(kWqniFileBytes);
+        TinflStreamInflater inflater;
+        esp_err_t inflate_result = inflater.Init(kWqniFileBytes);
+        if (inflate_result == ESP_OK) {
+            const auto append_sink = [](void* context, const uint8_t* data,
+                                        size_t size) -> esp_err_t {
+                auto* target = static_cast<std::vector<uint8_t>*>(context);
+                target->insert(target->end(), data, data + size);
+                return ESP_OK;
+            };
+            inflate_result = inflater.Feed(
+                wqni->data(), wqni->size(), true, append_sink, &inflated);
+        }
+        if (inflate_result != ESP_OK || !inflater.done() ||
+            inflated.size() != kWqniFileBytes) {
+            ESP_LOGW(kTag, "note-image-download inflate failed: %s out=%u",
+                     esp_err_to_name(inflate_result),
+                     static_cast<unsigned>(inflated.size()));
             wqni->clear();
             return ESP_ERR_INVALID_RESPONSE;
         }
