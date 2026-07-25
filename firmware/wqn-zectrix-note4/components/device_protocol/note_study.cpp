@@ -686,7 +686,7 @@ esp_err_t ParseManifestResponse(
                 notebook.pack.download_url.empty() ||
                 notebook.pack.download_url.size() > 512 ||
                 StringField(pack, "format") != "jsonl" ||
-                StringField(pack, "compression") != "none" ||
+                StringField(pack, "compression") != "zlib" ||
                 !U64Field(pack, "pack_revision", &notebook.pack.pack_revision) ||
                 !U64Field(pack, "schema_version", &schema_version) ||
                 !U64Field(pack, "entry_count", &entry_count) ||

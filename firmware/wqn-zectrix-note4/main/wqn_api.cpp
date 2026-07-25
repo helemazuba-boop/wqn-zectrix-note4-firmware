@@ -18,6 +18,7 @@
 #include "device_protocol/word_study.h"
 #include "esp_check.h"
 #include "esp_crt_bundle.h"
+#include "esp_heap_caps.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
 #include "esp_mac.h"
@@ -26,9 +27,110 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "mbedtls/sha256.h"
+#include "miniz.h"
 #include "services/connectivity_service.h"
 #include "storage.h"
 #include "text_render.h"
+
+namespace {
+
+// Streaming zlib inflater bridging compressed HTTP chunks to a plaintext
+// sink. Pack downloads are zlib transport-coded (the manifest advertises
+// compression=zlib); the SHA/byte_size contract stays on the uncompressed
+// JSONL, so this inflates in front of the existing sink (which hashes and
+// writes plaintext exactly as before). Uses the ESP32-S3 ROM tinfl (miniz)
+// decompressor: zero flash cost, a ~11 KB state + 32 KB dictionary in PSRAM.
+class TinflStreamInflater {
+public:
+    ~TinflStreamInflater()
+    {
+        heap_caps_free(decompressor_);
+        heap_caps_free(dictionary_);
+    }
+
+    esp_err_t Init(uint64_t max_out)
+    {
+        decompressor_ = static_cast<tinfl_decompressor*>(heap_caps_malloc(
+            sizeof(tinfl_decompressor), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        if (decompressor_ == nullptr) {
+            decompressor_ = static_cast<tinfl_decompressor*>(
+                heap_caps_malloc(sizeof(tinfl_decompressor), MALLOC_CAP_8BIT));
+        }
+        dictionary_ = static_cast<uint8_t*>(heap_caps_malloc(
+            TINFL_LZ_DICT_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        if (dictionary_ == nullptr) {
+            dictionary_ = static_cast<uint8_t*>(
+                heap_caps_malloc(TINFL_LZ_DICT_SIZE, MALLOC_CAP_8BIT));
+        }
+        if (decompressor_ == nullptr || dictionary_ == nullptr) {
+            return ESP_ERR_NO_MEM;
+        }
+        tinfl_init(decompressor_);
+        max_out_ = max_out;
+        return ESP_OK;
+    }
+
+    // Feeds one compressed chunk; emits every produced plaintext span to the
+    // sink. `final_chunk` clears TINFL_FLAG_HAS_MORE_INPUT for the tail call.
+    esp_err_t Feed(
+        const uint8_t* data,
+        size_t size,
+        bool final_chunk,
+        wqn::WqnHttpChunkSink sink,
+        void* context)
+    {
+        size_t in_ofs = 0;
+        while (true) {
+            size_t in_bytes = size - in_ofs;
+            size_t out_bytes = TINFL_LZ_DICT_SIZE - dict_ofs_;
+            const int flags = TINFL_FLAG_PARSE_ZLIB_HEADER |
+                (final_chunk ? 0 : TINFL_FLAG_HAS_MORE_INPUT);
+            const tinfl_status status = tinfl_decompress(
+                decompressor_, data + in_ofs, &in_bytes, dictionary_,
+                dictionary_ + dict_ofs_, &out_bytes, flags);
+            in_ofs += in_bytes;
+            if (out_bytes > 0) {
+                total_out_ += out_bytes;
+                if (total_out_ > max_out_) {
+                    return ESP_ERR_INVALID_SIZE;
+                }
+                const esp_err_t sink_result =
+                    sink(context, dictionary_ + dict_ofs_, out_bytes);
+                if (sink_result != ESP_OK) {
+                    return sink_result;
+                }
+                dict_ofs_ = (dict_ofs_ + out_bytes) & (TINFL_LZ_DICT_SIZE - 1);
+            }
+            if (status == TINFL_STATUS_DONE) {
+                done_ = true;
+                return ESP_OK;
+            }
+            if (status < TINFL_STATUS_DONE) {
+                return ESP_ERR_INVALID_RESPONSE;
+            }
+            if (status == TINFL_STATUS_NEEDS_MORE_INPUT && in_ofs >= size) {
+                return ESP_OK;
+            }
+            if (in_ofs >= size && out_bytes == 0) {
+                // No forward progress possible without more input.
+                return final_chunk ? ESP_ERR_INVALID_RESPONSE : ESP_OK;
+            }
+        }
+    }
+
+    bool done() const { return done_; }
+    uint64_t total_out() const { return total_out_; }
+
+private:
+    tinfl_decompressor* decompressor_ = nullptr;
+    uint8_t* dictionary_ = nullptr;
+    size_t dict_ofs_ = 0;
+    uint64_t total_out_ = 0;
+    uint64_t max_out_ = 0;
+    bool done_ = false;
+};
+
+}  // namespace
 
 namespace {
 
@@ -820,7 +922,7 @@ esp_err_t ParseWordPackManifestItem(cJSON* item, int index, wqn::WqnWordPackMani
     if (parsed.pack_id.empty() || parsed.deck_id.empty() ||
         !IsLowercaseSha256(parsed.sha256) || parsed.download_url.empty() ||
         parsed.schema_version != wqn::protocol::word_study_v1::kPackSchemaVersion ||
-        parsed.format != "jsonl" || parsed.compression != "none" ||
+        parsed.format != "jsonl" || parsed.compression != "zlib" ||
         parsed.entry_count > wqn::protocol::word_study_v1::kMaxPackEntries ||
         parsed.byte_size == 0 ||
         parsed.byte_size > wqn::protocol::word_study_v1::kMaxPackBytes) {
@@ -2465,14 +2567,13 @@ esp_err_t DownloadWordPackStream(
         content_length = esp_http_client_fetch_headers(client);
         status_code = esp_http_client_get_status_code(client);
     }
-    if (result == ESP_OK && content_length >= 0 &&
-        static_cast<uint64_t>(content_length) != item.byte_size) {
-        ESP_LOGW(
-            kTag,
-            "word-pack-download Content-Length mismatch: expected=%lu actual=%d",
-            static_cast<unsigned long>(item.byte_size),
-            content_length);
-        result = ESP_ERR_INVALID_SIZE;
+    // zlib transport coding: Content-Length is the compressed size, so it no
+    // longer equals byte_size; completeness is enforced by the inflater
+    // reaching DONE at exactly byte_size plaintext bytes.
+    (void)content_length;
+    TinflStreamInflater inflater;
+    if (result == ESP_OK && status_code == 200) {
+        result = inflater.Init(item.byte_size);
     }
     size_t received = 0;
     std::array<uint8_t, 2048> buffer = {};
@@ -2489,19 +2590,19 @@ esp_err_t DownloadWordPackStream(
         if (read == 0) {
             break;
         }
-        if (received + static_cast<size_t>(read) > item.byte_size ||
-            received + static_cast<size_t>(read) >
-                protocol::word_study_v1::kMaxPackBytes) {
+        if (received + static_cast<size_t>(read) >
+            protocol::word_study_v1::kMaxPackBytes) {
             result = ESP_ERR_INVALID_SIZE;
             break;
         }
-        result = sink(context, buffer.data(), static_cast<size_t>(read));
+        result = inflater.Feed(
+            buffer.data(), static_cast<size_t>(read), false, sink, context);
         if (result == ESP_OK) {
             received += static_cast<size_t>(read);
         }
     }
     if (result == ESP_OK && status_code == 200 &&
-        (received != item.byte_size ||
+        (!inflater.done() || inflater.total_out() != item.byte_size ||
          !esp_http_client_is_complete_data_received(client))) {
         result = ESP_ERR_INVALID_SIZE;
     }
@@ -2677,14 +2778,13 @@ esp_err_t DownloadNotePackStream(
         content_length = esp_http_client_fetch_headers(client);
         status_code = esp_http_client_get_status_code(client);
     }
-    if (result == ESP_OK && content_length >= 0 &&
-        static_cast<uint64_t>(content_length) != notebook.byte_size) {
-        ESP_LOGW(
-            kTag,
-            "note-pack-download Content-Length mismatch: expected=%lu actual=%d",
-            static_cast<unsigned long>(notebook.byte_size),
-            content_length);
-        result = ESP_ERR_INVALID_SIZE;
+    // zlib transport coding: Content-Length is the compressed size, so a
+    // byte_size equality check no longer applies; the inflater below enforces
+    // exact plaintext size + completion instead.
+    (void)content_length;
+    TinflStreamInflater inflater;
+    if (result == ESP_OK && status_code == 200) {
+        result = inflater.Init(notebook.byte_size);
     }
     size_t received = 0;
     std::array<uint8_t, 2048> buffer = {};
@@ -2701,19 +2801,19 @@ esp_err_t DownloadNotePackStream(
         if (read == 0) {
             break;
         }
-        if (received + static_cast<size_t>(read) > notebook.byte_size ||
-            received + static_cast<size_t>(read) >
-                protocol::note_study_v1::kMaxPackBytes) {
+        if (received + static_cast<size_t>(read) >
+            protocol::note_study_v1::kMaxPackBytes) {
             result = ESP_ERR_INVALID_SIZE;
             break;
         }
-        result = sink(context, buffer.data(), static_cast<size_t>(read));
+        result = inflater.Feed(
+            buffer.data(), static_cast<size_t>(read), false, sink, context);
         if (result == ESP_OK) {
             received += static_cast<size_t>(read);
         }
     }
     if (result == ESP_OK && status_code == 200 &&
-        (received != notebook.byte_size ||
+        (!inflater.done() || inflater.total_out() != notebook.byte_size ||
          !esp_http_client_is_complete_data_received(client))) {
         result = ESP_ERR_INVALID_SIZE;
     }
@@ -2800,9 +2900,10 @@ esp_err_t DownloadNoteImageV1(
         status_code = esp_http_client_get_status_code(client);
     }
     if (result == ESP_OK && status_code == 200 && content_length >= 0 &&
-        static_cast<size_t>(content_length) != kWqniFileBytes) {
-        ESP_LOGW(kTag, "note-image-download Content-Length mismatch: expected=%u actual=%d",
-                 static_cast<unsigned>(kWqniFileBytes), content_length);
+        static_cast<size_t>(content_length) > kWqniFileBytes + 512) {
+        // Compressed transport: the body must be no larger than the plaintext
+        // WQNI plus zlib overhead.
+        ESP_LOGW(kTag, "note-image-download Content-Length oversized: %d", content_length);
         result = ESP_ERR_INVALID_SIZE;
     }
     wqni->clear();
@@ -2819,15 +2920,14 @@ esp_err_t DownloadNoteImageV1(
         if (read == 0) {
             break;
         }
-        if (wqni->size() + static_cast<size_t>(read) > kWqniFileBytes) {
+        if (wqni->size() + static_cast<size_t>(read) > kWqniFileBytes + 512) {
             result = ESP_ERR_INVALID_SIZE;
             break;
         }
         wqni->insert(wqni->end(), buffer.data(), buffer.data() + read);
     }
     if (result == ESP_OK && status_code == 200 &&
-        (wqni->size() != kWqniFileBytes ||
-         !esp_http_client_is_complete_data_received(client))) {
+        (wqni->empty() || !esp_http_client_is_complete_data_received(client))) {
         result = ESP_ERR_INVALID_SIZE;
     }
     esp_http_client_close(client);
@@ -2846,6 +2946,22 @@ esp_err_t DownloadNoteImageV1(
     if (result != ESP_OK) {
         wqni->clear();
         return result;
+    }
+
+    // zlib transport coding: inflate the body (ROM tinfl, one shot) before any
+    // verification -- image_id is the sha256 of the uncompressed WQNI file.
+    {
+        std::vector<uint8_t> inflated(kWqniFileBytes);
+        const size_t out = tinfl_decompress_mem_to_mem(
+            inflated.data(), inflated.size(), wqni->data(), wqni->size(),
+            TINFL_FLAG_PARSE_ZLIB_HEADER);
+        if (out != kWqniFileBytes) {
+            ESP_LOGW(kTag, "note-image-download inflate failed: out=%u",
+                     static_cast<unsigned>(out));
+            wqni->clear();
+            return ESP_ERR_INVALID_RESPONSE;
+        }
+        *wqni = std::move(inflated);
     }
 
     // Content addressing: the pack line pinned the image id, so the bytes must
