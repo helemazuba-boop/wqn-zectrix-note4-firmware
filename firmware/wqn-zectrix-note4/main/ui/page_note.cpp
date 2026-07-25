@@ -29,16 +29,12 @@ int VisibleListRows()
     return std::max(1, (kHintY - 4 - kContentTop) / kListRowH);
 }
 
-// Viewport start comes from app state (edge-triggered; see note_app.cpp
-// UpdateListViewport). Clamp defensively so the selected row is always
-// on-screen even if counts changed after the viewport was last updated.
-size_t ClampListWindowStart(size_t start, size_t selected, size_t count, size_t visible)
+// Window start so the selected row stays visible and roughly centered.
+size_t ListWindowStart(size_t selected, size_t count, size_t visible)
 {
-    if (visible == 0 || count <= visible) return 0;
-    const size_t max_start = count - visible;
-    if (start > max_start) start = max_start;
-    if (selected < start) start = selected;
-    else if (selected >= start + visible) start = selected + 1 - visible;
+    if (count <= visible) return 0;
+    size_t start = selected > visible / 2 ? selected - visible / 2 : 0;
+    if (start + visible > count) start = count - visible;
     return start;
 }
 
@@ -76,8 +72,7 @@ esp_err_t RenderNotebookList(const wqn::NoteAppSnapshot& note)
         return DrawCenteredText(kNoteMarginX, 178, kContentW, "请在网页添加笔记后同步");
     }
     const size_t visible = static_cast<size_t>(VisibleListRows());
-    const size_t start = ClampListWindowStart(
-        note.notebook_window_start, note.notebook_selected, note.notebooks.size(), visible);
+    const size_t start = ListWindowStart(note.notebook_selected, note.notebooks.size(), visible);
     for (size_t i = 0; i < visible && start + i < note.notebooks.size(); ++i) {
         const size_t index = start + i;
         const wqn::NoteNotebookRow& row = note.notebooks[index];
@@ -99,8 +94,7 @@ esp_err_t RenderNoteList(const wqn::NoteAppSnapshot& note)
         return DrawCenteredText(kNoteMarginX, 160, kContentW, "该笔记本暂无笔记");
     }
     const size_t visible = static_cast<size_t>(VisibleListRows());
-    const size_t start = ClampListWindowStart(
-        note.note_list_window_start, note.note_list_selected, note.titles.size(), visible);
+    const size_t start = ListWindowStart(note.note_list_selected, note.titles.size(), visible);
     for (size_t i = 0; i < visible && start + i < note.titles.size(); ++i) {
         const size_t index = start + i;
         const wqn::NoteTitleRow& row = note.titles[index];

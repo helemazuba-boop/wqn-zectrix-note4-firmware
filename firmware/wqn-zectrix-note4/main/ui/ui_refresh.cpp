@@ -510,10 +510,6 @@ std::string FrameSignature(const wqn::UiFrame& frame)
         signature.push_back('/');
         signature.append(std::to_string(note.note_list_selected));
         signature.push_back('/');
-        signature.append(std::to_string(note.notebook_window_start));
-        signature.push_back('/');
-        signature.append(std::to_string(note.note_list_window_start));
-        signature.push_back('/');
         signature.append(std::to_string(note.note_scroll_offset_lines));
         signature.push_back('/');
         signature.append(note.has_body ? "1" : "0");

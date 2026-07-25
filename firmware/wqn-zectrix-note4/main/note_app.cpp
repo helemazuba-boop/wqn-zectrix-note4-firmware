@@ -33,37 +33,6 @@ size_t FindNotebookRow(const wqn::NoteAppState& state, const std::string& notebo
     return static_cast<size_t>(-1);
 }
 
-// Visible rows on the notebook/title lists; mirrors page_note.cpp geometry
-// ((kHintY - 4 - kContentTop) / kListRowH = (284 - 4 - 32) / 30 = 8).
-constexpr size_t kNoteListVisibleRows = 8;
-
-// Edge-triggered viewport: the window moves only when the selection walks off
-// an edge, and then jumps so the selection lands on the opposite edge. The
-// previous centered window (start = selected - visible/2) shifted the whole
-// window one row on EVERY step past row visible/2, repainting all 8 rows as a
-// heavy full-frame partial per step -- the 4th<->5th row stutter and the long
-// BUSY stretches. With this rule, in-window steps flip just two rows (fast
-// local partial) and sustained scrolling costs one whole-window repaint per 8
-// steps in either direction.
-void UpdateListViewport(size_t selected, size_t count, size_t* start)
-{
-    constexpr size_t visible = kNoteListVisibleRows;
-    if (count <= visible) {
-        *start = 0;
-        return;
-    }
-    const size_t max_start = count - visible;
-    if (*start > max_start) *start = max_start;
-    if (selected < *start) {
-        // Walked off the top: park the selection on the bottom row so the next
-        // 7 up-steps stay in-window.
-        *start = selected + 1 >= visible ? selected + 1 - visible : 0;
-    } else if (selected >= *start + visible) {
-        // Walked off the bottom: park the selection on the top row.
-        *start = std::min(selected, max_start);
-    }
-}
-
 // Finds the mounted pack entry for a note id, scanning only its notebook's
 // contiguous entry range. Returns nullptr when the content is not mounted.
 const wqn::NotePackIndexEntry* FindPackEntry(
@@ -193,7 +162,6 @@ void HandleNotebookListInput(wqn::NoteAppState* state, wqn::NoteInput input)
             } else {
                 state->message = "已到顶部";
             }
-            UpdateListViewport(state->notebook_selected, count, &state->notebook_window_start);
             break;
         case wqn::NoteInput::kDown:
             if (count > 0 && state->notebook_selected + 1 < count) {
@@ -202,7 +170,6 @@ void HandleNotebookListInput(wqn::NoteAppState* state, wqn::NoteInput input)
             } else {
                 state->message = "已到底部";
             }
-            UpdateListViewport(state->notebook_selected, count, &state->notebook_window_start);
             break;
         case wqn::NoteInput::kConfirm: {
             if (count == 0 || state->notebook_selected >= count) {
@@ -263,8 +230,6 @@ void HandleNoteListInput(wqn::NoteAppState* state, wqn::NoteInput input)
             } else {
                 state->message = "已到顶部";
             }
-            UpdateListViewport(state->note_list_selected, items.size(),
-                               &state->note_list_window_start);
             break;
         case wqn::NoteInput::kDown:
             if (!items.empty() && state->note_list_selected + 1 < items.size()) {
@@ -283,8 +248,6 @@ void HandleNoteListInput(wqn::NoteAppState* state, wqn::NoteInput input)
                     ? "正在加载更多…"
                     : "已到底部";
             }
-            UpdateListViewport(state->note_list_selected, items.size(),
-                               &state->note_list_window_start);
             RequestNoteCandidatePageIfNeeded(state);
             break;
         case wqn::NoteInput::kConfirm: {
@@ -400,13 +363,8 @@ esp_err_t InitNoteApp(NoteAppState* state)
         state->note_list_selected = std::min<size_t>(
             state->session.persisted.position,
             state->session.persisted.remote.items.size() - 1);
-        UpdateListViewport(state->note_list_selected,
-                           state->session.persisted.remote.items.size(),
-                           &state->note_list_window_start);
         const size_t row = FindNotebookRow(*state, state->session.persisted.remote.notebook_id);
         if (row != static_cast<size_t>(-1)) state->notebook_selected = row;
-        UpdateListViewport(state->notebook_selected, state->pack_index.notebooks.size(),
-                           &state->notebook_window_start);
         state->mode = NoteAppMode::kNoteList;
         state->message = "已恢复上次浏览";
         RequestNoteCandidatePageIfNeeded(state);
@@ -529,7 +487,6 @@ bool ApplyNoteSessionStartResult(
     state->session.page_requested = false;
     state->session.create_request_id.clear();
     state->note_list_selected = 0;
-    state->note_list_window_start = 0;
     state->mode = NoteAppMode::kNoteList;
     state->message = state->session.persisted.remote.items.empty()
         ? "该笔记本暂无笔记"
@@ -742,8 +699,6 @@ NoteAppSnapshot BuildNoteAppSnapshot(const NoteAppState& state)
     snapshot.mode = state.mode;
     snapshot.notebook_selected = state.notebook_selected;
     snapshot.note_list_selected = state.note_list_selected;
-    snapshot.notebook_window_start = state.notebook_window_start;
-    snapshot.note_list_window_start = state.note_list_window_start;
     snapshot.note_scroll_offset_lines = state.note_scroll_offset_lines;
     snapshot.cloud_sync_failed = state.cloud_sync_failed;
     snapshot.notebook_count = state.pack_index.notebooks.size();
