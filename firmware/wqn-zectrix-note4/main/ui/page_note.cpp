@@ -19,17 +19,18 @@ namespace {
 constexpr char kTag[] = "wqn_note_page";
 constexpr int kNoteMarginX = 8;
 constexpr int kContentW = wqn::kEpdWidth - 2 * kNoteMarginX;
-constexpr int kHeaderY = 38;
-constexpr int kDividerY = 58;
 constexpr int kContentTop = 32;
-constexpr int kHintY = wqn::kEpdHeight - 16;
+// No footer line: lists and the body run down to the panel edge. The body
+// line budget ((kContentBottom - kContentTop) / kBodyLineH = 13) must stay in
+// sync with kNoteBodyVisibleLines in note_app.cpp.
+constexpr int kContentBottom = wqn::kEpdHeight - 4;
 constexpr int kListRowH = 30;
 constexpr int kBodyLineH = 20;
-constexpr int kBodyBottom = kHintY - 6;
+constexpr int kBodyBottom = kContentBottom;
 
 int VisibleListRows()
 {
-    return std::max(1, (kHintY - 4 - kContentTop) / kListRowH);
+    return std::max(1, (kContentBottom - kContentTop) / kListRowH);
 }
 
 // Viewport start comes from app state (edge-triggered; see note_app.cpp
@@ -240,18 +241,6 @@ esp_err_t RenderNoteToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
             break;
     }
 
-    // Bottom line = status message + button hints. The header row that used to
-    // carry status_line was folded into the status bar, so transient feedback
-    // ("已到顶部/已到底部/已恢复上次浏览"...) must surface here or boundary presses
-    // look like a frozen device.
-    std::string footer = note.status_line;
-    if (!note.hint.empty()) {
-        footer = footer.empty() ? note.hint : footer + " · " + note.hint;
-    }
-    if (!footer.empty()) {
-        ESP_RETURN_ON_ERROR(
-            DrawClippedText(kNoteMarginX, kHintY, kContentW, footer), kTag, "draw note footer");
-    }
     return RefreshFrame(frame, schedule);
 }
 

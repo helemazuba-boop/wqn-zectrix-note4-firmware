@@ -157,7 +157,6 @@ esp_err_t RenderWordToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
                       word.home_selection == wqn::WordHomeSelection::kDictionary),
             kTag,
             "draw dictionary card");
-        ESP_RETURN_ON_ERROR(DrawPageFooterHint(word.hint), kTag, "draw word hint");
         if (schedule == RefreshSchedule::kSelection || schedule == RefreshSchedule::kConfig) {
             return RefreshStableRegion({0, 64, wqn::kEpdWidth, 220, "word-home"}, schedule);
         }
@@ -183,10 +182,6 @@ esp_err_t RenderWordToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
                                 wqn::WordLookupSelection::kAiLookup),
                 kTag,
                 "draw ai lookup choice");
-            ESP_RETURN_ON_ERROR(
-                DrawPageFooterHint(word.hint),
-                kTag,
-                "draw word hint");
             if (schedule == RefreshSchedule::kSelection ||
                 schedule == RefreshSchedule::kConfig) {
                 return RefreshRegion(
@@ -219,7 +214,6 @@ esp_err_t RenderWordToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
             ESP_RETURN_ON_ERROR(DrawClippedText(42, y, 300, marker + word.dictionary_preview_words[i]), kTag, "draw dictionary preview");
             y += 22;
         }
-        ESP_RETURN_ON_ERROR(DrawPageFooterHint(word.hint), kTag, "draw word hint");
         if (schedule == RefreshSchedule::kSelection ||
             schedule == RefreshSchedule::kConfig) {
             return RefreshRegion(
@@ -262,7 +256,6 @@ esp_err_t RenderWordToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
             "draw word persisting");
     }
 
-    ESP_RETURN_ON_ERROR(DrawPageFooterHint(word.hint), kTag, "draw word hint");
     if (schedule == RefreshSchedule::kSelection ||
         schedule == RefreshSchedule::kConfig) {
         return RefreshRegion(

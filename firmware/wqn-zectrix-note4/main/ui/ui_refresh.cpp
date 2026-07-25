@@ -527,10 +527,9 @@ std::string FrameSignature(const wqn::UiFrame& frame)
         signature.append(note.note_title);
         signature.push_back('/');
         signature.append(note.note_id);
-        signature.push_back('/');
-        signature.append(note.status_line);
-        signature.push_back('/');
-        signature.append(note.hint);
+        // status_line/hint are deliberately NOT part of the signature: the note
+        // page draws no footer, so transient boundary messages (已到顶部...)
+        // must not trigger a refresh that changes nothing visible.
         for (const wqn::NoteNotebookRow& row : note.notebooks) {
             signature.push_back('/');
             signature.append(row.title);
