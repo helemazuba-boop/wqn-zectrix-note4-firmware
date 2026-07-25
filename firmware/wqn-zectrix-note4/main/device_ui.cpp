@@ -663,8 +663,19 @@ wqn::AiStreamingStatusView streaming_view{};
         const bool interaction_quiet =
             esp_timer_get_time() - g_last_active_us_local >=
             kStatusReloadInteractionQuietUs;
+        // The periodic reload reads storage on THIS task (including per-file
+        // word-pack verification). During a pack sync the storage service runs
+        // back-to-back ~0.5-1s background writes, so those reads serialize
+        // behind the write storm and blocked the UI task for 12+s in HIL --
+        // and button gesture sampling lives on this task, so presses were
+        // silently dropped. Skip the reload while any cloud domain is busy:
+        // its inputs are mid-churn anyway and the sync completion event
+        // refreshes the UI when the data is actually stable.
+        const bool cloud_quiet = !device_ui_internal::IsTodoCloudBusy() &&
+            !device_ui_internal::IsWordCloudBusy() &&
+            !device_ui_internal::IsNoteCloudBusy();
         if (status_reload_due && refresh_schedule == RefreshSchedule::kNone &&
-            !event.HasEvent() && interaction_quiet) {
+            !event.HasEvent() && interaction_quiet && cloud_quiet) {
             if (state.screen != wqn::UiScreen::kWord) {
                 // Storage/Wi-Fi reads are an effect. Build the typed snapshot
                 // outside UiRuntime, then reduce that immutable observation
