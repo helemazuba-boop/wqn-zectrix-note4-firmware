@@ -5,9 +5,13 @@
 
 #include "cJSON.h"
 #include "device_protocol/v3.h"
+#include "device_protocol/word_study.h"
 #include "esp_log.h"
+#include "note_app.h"
 #include "text_render.h"
+#include "word_app.h"
 #include "wqn_api.h"
+#include "wqn_api_stream_internal.h"
 
 namespace {
 
@@ -45,6 +49,21 @@ const char kV3Sync[] = R"json({
   }
 })json";
 
+const char kV3UnsafeCounter[] = R"json({
+  "ok": true,
+  "request_id": "req_bootstrap_0002",
+  "server_time_ms": 1784426400000,
+  "data": {
+    "device_id": "22222222-2222-4222-8222-222222222222",
+    "config_revision": 9007199254740992,
+    "sync_cursor": 42,
+    "media_protocols": {
+      "ai_sse": "v2-streaming",
+      "flash": "wqn-flash-v2"
+    }
+  }
+})json";
+
 const char kV3Error[] = R"json({
   "ok": false,
   "request_id": "req_sync_000000002",
@@ -53,6 +72,125 @@ const char kV3Error[] = R"json({
     "retryable": true,
     "retry_after_ms": 10000
   }
+})json";
+
+const char kWordSessionV1[] = R"json({
+  "ok": true,
+  "request_id": "req_word_session_0001",
+  "server_time_ms": 1784512800000,
+  "data": {
+    "session_id": "22222222-2222-4222-8222-222222222222",
+    "domain": "word",
+    "mode": "random",
+    "purpose": "study",
+    "ordering": "guided_random_v1",
+    "candidate_policy_version": "guided_random_v1",
+    "seed": "seed_contract_001",
+    "scope": {
+      "deck_ids": ["11111111-1111-4111-8111-111111111111"],
+      "include_mastered": false
+    },
+    "optional_count": 20,
+    "next_sequence": 0,
+    "progress_revision": 17,
+    "snapshot": [{
+      "deck_id": "11111111-1111-4111-8111-111111111111",
+      "content_revision": 9,
+      "pack_revision": 9,
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }],
+    "items": [{
+      "item_id": "33333333-3333-4333-8333-333333333333",
+      "deck_id": "11111111-1111-4111-8111-111111111111",
+      "ordinal": 0
+    }],
+    "cursor": "1",
+    "has_more": false
+  }
+})json";
+
+const char kWordCandidatePageV1[] = R"json({
+  "ok": true,
+  "request_id": "req_word_candidates_0001",
+  "server_time_ms": 1784512800000,
+  "data": {
+    "session_id": "22222222-2222-4222-8222-222222222222",
+    "ordering": "guided_random_v1",
+    "candidate_policy_version": "guided_random_v1",
+    "seed": "seed_contract_001",
+    "snapshot": [{
+      "deck_id": "11111111-1111-4111-8111-111111111111",
+      "content_revision": 9,
+      "pack_revision": 9,
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }],
+    "progress_revision": 17,
+    "cursor": "32",
+    "next_cursor": "33",
+    "items": [{
+      "item_id": "44444444-4444-4444-8444-444444444444",
+      "deck_id": "11111111-1111-4111-8111-111111111111",
+      "ordinal": 32
+    }],
+    "has_more": true
+  }
+})json";
+
+const char kWordObservationV1[] = R"json({
+  "ok": true,
+  "request_id": "req_word_observe_0001",
+  "server_time_ms": 1784512801000,
+  "data": {
+    "observation_id": "44444444-4444-4444-8444-444444444444",
+    "session_id": "22222222-2222-4222-8222-222222222222",
+    "sequence": 0,
+    "item_id": "33333333-3333-4333-8333-333333333333",
+    "action": "unknown",
+    "progress": {
+      "status": "learning",
+      "due_at": "2026-07-20T03:20:00.000Z",
+      "reviewed_count": 1,
+      "known_count": 0,
+      "unknown_count": 1
+    },
+    "projection_applied": true,
+    "replayed": false
+  }
+})json";
+
+const char kWordManifestV1[] = R"json({
+  "ok": true,
+  "request_id": "req_word_manifest_001",
+  "server_time_ms": 1784512802000,
+  "data": {
+    "cursor": "17",
+    "has_more": false,
+    "decks": [{
+      "deck_id": "11111111-1111-4111-8111-111111111111",
+      "title": "WQN 预设词库",
+      "change_sequence": 17,
+      "content_revision": 9,
+      "deleted": false,
+      "pack": {
+        "pack_id": "55555555-5555-4555-8555-555555555555",
+        "pack_revision": 9,
+        "schema_version": 2,
+        "format": "jsonl",
+        "compression": "zlib",
+        "entry_count": 1,
+        "byte_size": 512,
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "download_url": "/api/esp32/v3/words/packs/55555555-5555-4555-8555-555555555555"
+      }
+    }]
+  }
+})json";
+
+const char kWordManifestUnsafeCursorV1[] = R"json({
+  "ok": true,
+  "request_id": "req_word_manifest_002",
+  "server_time_ms": 1784512802000,
+  "data": {"cursor":"9007199254740992","has_more":false,"decks":[]}
 })json";
 
 const char kV3ClaimStart[] = R"json({
@@ -301,112 +439,6 @@ const char kAiTodoActions[] = R"json({
       {
         "type": "future_action",
         "title": "Ignored but parsed"
-      }
-    ]
-  }
-})json";
-
-const char kWordSync[] = R"json({
-  "success": true,
-  "data": {
-    "cursor": "cursor-2",
-    "server_time": "2026-06-06T00:00:00.000Z",
-    "decks": [
-      {
-        "id": "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
-        "title": "Core Words",
-        "source": "system",
-        "language": "en",
-        "target_language": "zh-CN",
-        "is_system": true,
-        "revision": 3,
-        "deleted": false,
-        "ignored_future_field": true
-      },
-      {
-        "title": "Missing id"
-      }
-    ],
-    "entries": [
-      {
-        "id": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
-        "deck_id": "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
-        "word": "confirm",
-        "phonetic": "/confirm/",
-        "meaning": "verify",
-        "example": "Please confirm your choice.",
-        "example_translation": "Confirm it.",
-        "revision": 2,
-        "deleted": false
-      },
-      {
-        "id": "ffffffff-ffff-4fff-8fff-ffffffffffff",
-        "word": "broken"
-      }
-    ],
-    "progress": [
-      {
-        "word_id": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
-        "status": "learning",
-        "due_at": "2026-06-06T00:00:00.000Z",
-        "correct_streak": 0,
-        "lapses": 1,
-        "revision": 4
-      },
-      {
-        "status": "new"
-      }
-    ]
-  }
-})json";
-
-const char kWordReviewQueue[] = R"json({
-  "success": true,
-  "data": {
-    "mode": "sequential",
-    "daily_target": 20,
-    "reviewed_today": 8,
-    "due_count": 12,
-    "words": [
-      {
-        "id": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
-        "word": "consistent",
-        "phonetic": "/consistent/",
-        "meaning": "steady",
-        "example": "Keep a consistent study habit.",
-        "example_translation": "Keep it steady.",
-        "status": "new"
-      },
-      {
-        "word": "missing-id",
-        "meaning": "bad item"
-      }
-    ]
-  }
-})json";
-
-const char kWordReviewSubmit[] = R"json({
-  "success": true,
-  "data": {
-    "word_id": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
-    "status": "learning",
-    "due_at": "2026-06-06T00:00:00.000Z",
-    "actions": [
-      {
-        "type": "word_review_recorded",
-        "word_id": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
-        "word": "consistent",
-        "status": "learning",
-        "outcome": "unknown",
-        "due_at": "2026-06-06T00:00:00.000Z"
-      },
-      {
-        "type": "word_added_to_mistakes",
-        "word_id": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
-        "word": "consistent",
-        "problem_set_id": "99999999-9999-4999-8999-999999999999",
-        "problem_id": "88888888-8888-4888-8888-888888888888",
-        "title": "consistent"
       }
     ]
   }
@@ -678,53 +710,6 @@ bool CheckAiTodoActions()
            Require(response.actions[4].type == "future_action", "AI unknown action preserved");
 }
 
-bool CheckWordSync()
-{
-    wqn::WqnWordSyncPage page;
-    const esp_err_t result = wqn::ParseWordSyncResponse(kWordSync, &page);
-    return Require(result == ESP_OK, "word sync parse result") &&
-           Require(page.cursor == "cursor-2", "word sync cursor") &&
-           Require(page.server_time == "2026-06-06T00:00:00.000Z", "word sync server time") &&
-           Require(page.decks.size() == 1, "word sync skips invalid deck") &&
-           Require(page.entries.size() == 1, "word sync skips invalid entry") &&
-           Require(page.progress.size() == 1, "word sync skips invalid progress") &&
-           Require(page.decks[0].id == "dddddddd-dddd-4ddd-8ddd-dddddddddddd", "word deck id") &&
-           Require(page.decks[0].is_system, "word deck system flag") &&
-           Require(page.entries[0].word == "confirm", "word entry word") &&
-           Require(page.entries[0].meaning == "verify", "word entry meaning") &&
-           Require(page.progress[0].status == "learning", "word progress status") &&
-           Require(page.progress[0].lapses == 1, "word progress lapses");
-}
-
-bool CheckWordReviewQueue()
-{
-    wqn::WqnWordReviewQueue queue;
-    const esp_err_t result = wqn::ParseWordReviewQueueResponse(kWordReviewQueue, &queue);
-    return Require(result == ESP_OK, "word review queue parse result") &&
-           Require(queue.mode == "sequential", "word review mode") &&
-           Require(queue.daily_target == 20, "word review daily target") &&
-           Require(queue.reviewed_today == 8, "word review reviewed today") &&
-           Require(queue.due_count == 12, "word review due count") &&
-           Require(queue.words.size() == 1, "word review skips invalid word") &&
-           Require(queue.words[0].word == "consistent", "word review word") &&
-           Require(queue.words[0].status == "new", "word review status");
-}
-
-bool CheckWordReviewSubmit()
-{
-    wqn::WqnWordReviewSubmitResult review;
-    const esp_err_t result = wqn::ParseWordReviewSubmitResponse(kWordReviewSubmit, &review);
-    return Require(result == ESP_OK, "word review submit parse result") &&
-           Require(review.word_id == "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee", "word review submit word_id") &&
-           Require(review.status == "learning", "word review submit status") &&
-           Require(review.due_at == "2026-06-06T00:00:00.000Z", "word review submit due_at") &&
-           Require(review.actions.size() == 2, "word review submit action count") &&
-           Require(review.actions[0].type == "word_review_recorded", "word review submit primary action type") &&
-           Require(review.actions[0].outcome == "unknown", "word review submit outcome") &&
-           Require(review.actions[1].type == "word_added_to_mistakes", "word review submit extra action type") &&
-           Require(review.actions[1].problem_id == "88888888-8888-4888-8888-888888888888", "word review problem id");
-}
-
 bool CheckWordSearch()
 {
     wqn::WqnWordSearchResult search;
@@ -856,6 +841,24 @@ bool CheckV3ControlContract()
         return false;
     }
 
+    wqn::protocol::v3::BootstrapData unsafe_counter;
+    if (!Require(
+            wqn::protocol::v3::ParseBootstrapResponse(
+                kV3UnsafeCounter,
+                "req_bootstrap_0002",
+                &unsafe_counter,
+                &error) == ESP_ERR_INVALID_RESPONSE,
+            "v3 rejects counters above JSON safe integer")) {
+        return false;
+    }
+    metadata.config_revision = wqn::protocol::v3::kMaxSafeJsonInteger + 1;
+    if (!Require(
+            wqn::protocol::v3::BuildBootstrapRequest(metadata, &request_body) ==
+                ESP_ERR_INVALID_ARG,
+            "v3 refuses unsafe request counters")) {
+        return false;
+    }
+
     wqn::protocol::v3::SyncData sync;
     if (!Require(
             wqn::protocol::v3::ParseSyncResponse(
@@ -875,6 +878,222 @@ bool CheckV3ControlContract()
            Require(error.retry_after_ms == 10000, "v3 retry delay");
 }
 
+bool CheckWordStudyV1Contract()
+{
+    namespace words = wqn::protocol::word_study_v1;
+    wqn::protocol::v3::Error error;
+    words::SessionData session;
+    if (!Require(
+            words::ParseSessionResponse(
+                kWordSessionV1, "req_word_session_0001", &session, &error) == ESP_OK,
+            "word-study session fixture") ||
+        !Require(session.mode == words::Mode::kRandom, "word-study visible mode") ||
+        !Require(
+            session.ordering == words::Ordering::kGuidedRandomV1,
+            "word-study random ordering") ||
+        !Require(
+            session.candidate_policy_version == "guided_random_v1",
+            "word-study candidate policy") ||
+        !Require(session.progress_revision == 17, "word-study progress revision") ||
+        !Require(session.snapshot.size() == 1, "word-study snapshot count") ||
+        !Require(session.items.size() == 1, "word-study item count")) {
+        return false;
+    }
+
+    words::CandidatePageData candidate_page;
+    if (!Require(
+            words::ParseCandidatePageResponse(
+                kWordCandidatePageV1,
+                "req_word_candidates_0001",
+                &candidate_page,
+                &error) == ESP_OK,
+            "word-study candidate page fixture") ||
+        !Require(candidate_page.cursor == "32", "word-study candidate cursor") ||
+        !Require(candidate_page.next_cursor == "33", "word-study candidate next cursor") ||
+        !Require(candidate_page.items.size() == 1, "word-study candidate count") ||
+        !Require(candidate_page.items[0].ordinal == 32, "word-study candidate ordinal") ||
+        !Require(candidate_page.has_more, "word-study candidate has more")) {
+        return false;
+    }
+
+    words::ObservationData observation;
+    if (!Require(
+            words::ParseObservationResponse(
+                kWordObservationV1,
+                "req_word_observe_0001",
+                &observation,
+                &error) == ESP_OK,
+            "word-study observation fixture") ||
+        !Require(
+            observation.action == words::ObservationAction::kUnknown,
+            "word-study observation action") ||
+        !Require(observation.progress.present, "word-study progress projection") ||
+        !Require(observation.projection_applied, "word-study projection applied") ||
+        !Require(observation.progress.unknown_count == 1, "word-study unknown count")) {
+        return false;
+    }
+
+    words::ManifestData manifest;
+    if (!Require(
+            words::ParseManifestResponse(
+                kWordManifestV1,
+                "req_word_manifest_001",
+                &manifest,
+                &error) == ESP_OK,
+            "word-study manifest fixture") ||
+        !Require(manifest.cursor == 17, "word-study exact manifest cursor") ||
+        !Require(manifest.decks.size() == 1, "word-study manifest deck count") ||
+        !Require(manifest.decks[0].has_pack, "word-study live pack") ||
+        !Require(
+            manifest.decks[0].pack.schema_version == 2,
+            "word-study pack schema")) {
+        return false;
+    }
+    if (!Require(
+            words::ParseManifestResponse(
+                kWordManifestUnsafeCursorV1,
+                "req_word_manifest_002",
+                &manifest,
+                &error) == ESP_ERR_INVALID_RESPONSE,
+            "word-study rejects unsafe decimal cursor")) {
+        return false;
+    }
+
+    wqn::protocol::v3::RequestMetadata metadata;
+    metadata.request_id = "req_word_manifest_001";
+    metadata.boot_id = "boot_word_study_001";
+    metadata.firmware_version = "0.1.0-contract";
+    std::string body;
+    if (!Require(
+            words::BuildManifestRequest(metadata, 17, 20, &body) == ESP_OK,
+            "word-study manifest request build") ||
+        !Require(
+            body.find("\"cursor\":\"17\"") != std::string::npos,
+            "word-study cursor encoded exactly") ||
+        !Require(
+            body.find("word.study.v1") != std::string::npos,
+            "word-study capability advertised")) {
+        return false;
+    }
+
+    words::CandidatePageRequest candidate_request;
+    candidate_request.metadata = metadata;
+    candidate_request.metadata.request_id = "req_word_candidates_0001";
+    candidate_request.cursor = "32";
+    candidate_request.limit = 64;
+    if (!Require(
+            words::BuildCandidatePageRequest(candidate_request, &body) == ESP_OK,
+            "word-study candidate request build") ||
+        !Require(
+            body.find("\"cursor\":\"32\"") != std::string::npos,
+            "word-study candidate cursor encoded exactly") ||
+        !Require(
+            body.find("\"limit\":64") != std::string::npos,
+            "word-study candidate limit")) {
+        return false;
+    }
+
+    const char* ids[] = {
+        "00000000-0000-4000-8000-000000000001",
+        "00000000-0000-4000-8000-000000000002",
+        "00000000-0000-4000-8000-000000000003",
+        "00000000-0000-4000-8000-000000000004",
+        "00000000-0000-4000-8000-000000000005",
+        "00000000-0000-4000-8000-000000000006",
+        "00000000-0000-4000-8000-000000000007",
+    };
+    const uint64_t hashes[] = {
+        UINT64_C(0x11423e284650d546), UINT64_C(0x11423d284650d393),
+        UINT64_C(0x11423c284650d1e0), UINT64_C(0x114243284650ddc5),
+        UINT64_C(0x114242284650dc12), UINT64_C(0x114241284650da5f),
+        UINT64_C(0x114240284650d8ac),
+    };
+    for (size_t index = 0; index < 7; ++index) {
+        if (!Require(
+                words::GuidedRandomHash("seed_contract_001", ids[index]) ==
+                    hashes[index],
+                "word-study FNV fixture")) {
+            return false;
+        }
+    }
+
+    const int32_t sort_indices[] = {1, 2, 3, 0, 0, 1, 2};
+    const uint32_t deck_orders[] = {0, 0, 0, 0, 1, 1, 1};
+    const words::CandidateStatus statuses[] = {
+        words::CandidateStatus::kLearning,
+        words::CandidateStatus::kReview,
+        words::CandidateStatus::kNew,
+        words::CandidateStatus::kReview,
+        words::CandidateStatus::kMastered,
+        words::CandidateStatus::kLearning,
+        words::CandidateStatus::kNew,
+    };
+    const int64_t due[] = {0, 1000, -1, 2000, 3000, -1, -1};
+    const char* normalized[] = {
+        "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta"};
+    std::vector<words::Candidate> candidates;
+    for (size_t index = 0; index < 7; ++index) {
+        words::Candidate candidate;
+        candidate.item_id = ids[index];
+        candidate.normalized_word = normalized[index];
+        candidate.deck_order = deck_orders[index];
+        candidate.sort_index = sort_indices[index];
+        candidate.status = statuses[index];
+        candidate.due_at_ms = due[index];
+        candidates.push_back(candidate);
+    }
+    words::OrderCandidates(
+        &candidates, words::Ordering::kGuidedRandomV1, "seed_contract_001", 1000);
+    const size_t expected[] = {0, 5, 1, 2, 6, 3, 4};
+    for (size_t index = 0; index < 7; ++index) {
+        if (!Require(
+                candidates[index].item_id == ids[expected[index]],
+                "word-study guided random fixture")) {
+            return false;
+        }
+    }
+
+    // Cloud and firmware must compare the UTF-8 bytes, not JavaScript UTF-16
+    // code units. U+E000 (EE 80 80) therefore sorts before U+10000 (F0 90 80
+    // 80), even though their UTF-16 ordering would be reversed.
+    std::vector<words::Candidate> unicode_candidates(2);
+    unicode_candidates[0].item_id = ids[1];
+    unicode_candidates[0].normalized_word = "\xEE\x80\x80";
+    unicode_candidates[1].item_id = ids[2];
+    unicode_candidates[1].normalized_word = "\xF0\x90\x80\x80";
+    words::OrderCandidates(
+        &unicode_candidates,
+        words::Ordering::kLexicographic,
+        "seed_contract_001",
+        1000);
+    if (!Require(
+            unicode_candidates[0].item_id == ids[1] &&
+                unicode_candidates[1].item_id == ids[2],
+            "word-study UTF-8 lexicographic fixture")) {
+        return false;
+    }
+    return true;
+}
+
+bool CheckAiStreamHttpFailures()
+{
+    return Require(
+               std::strcmp(wqn::internal::AiStreamHttpErrorCode(401), "unauthorized") == 0,
+               "SSE 401 classification") &&
+           Require(
+               std::strcmp(wqn::internal::AiStreamHttpErrorCode(429), "rate_limited") == 0,
+               "SSE 429 classification") &&
+           Require(
+               std::strcmp(wqn::internal::AiStreamHttpErrorCode(500), "model_failed") == 0,
+               "SSE 500 classification") &&
+           Require(
+               wqn::internal::FinalizeAiStreamResult(true, ESP_OK) == ESP_FAIL,
+               "fatal SSE HTTP status cannot complete successfully") &&
+           Require(
+               wqn::internal::FinalizeAiStreamResult(false, ESP_OK) == ESP_OK,
+               "successful SSE stream remains successful");
+}
+
 }  // namespace
 
 namespace wqn {
@@ -892,13 +1111,14 @@ bool RunContractFixtureSelfTest()
         CheckTodoList() &&
         CheckTodoComplete() &&
         CheckAiTodoActions() &&
-        CheckWordSync() &&
-        CheckWordReviewQueue() &&
-        CheckWordReviewSubmit() &&
         CheckWordSearch() &&
         CheckAiWordActions() &&
         CheckUnauthorizedError() &&
-        CheckV3ControlContract();
+        CheckV3ControlContract() &&
+        CheckWordStudyV1Contract() &&
+        CheckAiStreamHttpFailures() &&
+        RunWordPageStateSelfTest() &&
+        RunNotePageStateSelfTest();
 
     if (ok) {
         ESP_LOGI(kTag, "contract fixture self-test passed");

@@ -7,6 +7,7 @@
 
 #include "esp_err.h"
 #include "word_pack.h"
+#include "word_study_store.h"
 #include "wqn_api.h"
 
 namespace wqn {
@@ -20,12 +21,25 @@ enum class WordInput {
 
 enum class WordAppMode : uint8_t {
     kHome,
-    kReviewFront,
-    kReviewBack,
+    kSessionStarting,
+    kDictionaryPicker,
+    kWordCard,
+};
+
+enum class WordCardPhase : uint8_t {
+    kFront,
+    kRevealed,
+    kPersisting,
+};
+
+enum class WordCardSource : uint8_t {
+    kStudy,
     kDictionary,
-    kDictionaryDetail,
+};
+
+enum class WordDictionaryStage : uint8_t {
+    kLetters,
     kLookupChoice,
-    kLookupResult,
 };
 
 enum class WordHomeSelection : uint8_t {
@@ -39,20 +53,55 @@ enum class WordLookupSelection : uint8_t {
     kAiLookup,
 };
 
+enum class WordObservationCommitState : uint8_t {
+    kIdle,
+    kPersisting,
+    kLocalCommitted,
+    kCloudPending,
+    kCloudAcknowledged,
+    kFailed,
+};
+
+struct WordSessionState {
+    bool start_requested = false;
+    bool start_result_expected = false;
+    protocol::word_study_v1::Mode requested_mode =
+        protocol::word_study_v1::Mode::kSequential;
+    std::string create_request_id;
+    bool page_requested = false;
+    bool page_in_flight = false;
+    PersistedWordSession persisted;
+    WordObservationCommitState commit_state = WordObservationCommitState::kIdle;
+    bool observation_effect_ready = false;
+    DurableWordObservation pending_observation;
+    PersistedWordSession pending_advanced_session;
+};
+
+struct WordOutboxState {
+    size_t pending_count = 0;
+    size_t capacity = kWordObservationOutboxCapacity;
+};
+
 struct WordAppState {
     bool initialized = false;
     WordAppMode mode = WordAppMode::kHome;
+    WordCardPhase card_phase = WordCardPhase::kFront;
+    WordCardSource card_source = WordCardSource::kStudy;
+    WordDictionaryStage dictionary_stage = WordDictionaryStage::kLetters;
     WordHomeSelection home_selection = WordHomeSelection::kSequential;
     WordLookupSelection lookup_selection = WordLookupSelection::kOnlineSearch;
-    bool random_review = false;
-
-    uint16_t daily_target = 20;
     uint16_t reviewed_today = 0;
     uint16_t correct_today = 0;
 
+    WordSessionState session;
+    WordOutboxState outbox;
+
     WordPackIndex pack_index;
-    std::vector<size_t> review_indices;
-    size_t review_position = 0;
+    // A cloud refresh never mutates the content snapshot used by an active
+    // review or dictionary session. It becomes current only after returning
+    // to the word home screen.
+    WordPackIndex pending_pack_index;
+    bool pending_pack_index_ready = false;
     WqnWordEntry current_word;
 
     std::string dictionary_prefix;
@@ -70,16 +119,20 @@ struct WordAppState {
     bool cloud_loaded_once = false;
     bool search_pending = false;
     bool ai_lookup_pending = false;
+    bool lookup_result_expected = false;
     std::string pending_search_query;
     std::string pending_ai_query;
-    std::string pending_submit_word_id;
-    std::string pending_submit_outcome;
-    std::string pending_submit_word;
+    std::string active_lookup_query;
+    bool sequential_session_resumable = false;
+    bool random_session_resumable = false;
     std::string message;
 };
 
 struct WordAppSnapshot {
     WordAppMode mode = WordAppMode::kHome;
+    WordCardPhase card_phase = WordCardPhase::kFront;
+    WordCardSource card_source = WordCardSource::kStudy;
+    WordDictionaryStage dictionary_stage = WordDictionaryStage::kLetters;
     WordHomeSelection home_selection = WordHomeSelection::kSequential;
     WordLookupSelection lookup_selection = WordLookupSelection::kOnlineSearch;
     bool has_card = false;
@@ -87,10 +140,10 @@ struct WordAppSnapshot {
     bool pack_ready = false;
     bool pack_truncated = false;
     bool cloud_sync_failed = false;
+    bool sequential_session_resumable = false;
+    bool random_session_resumable = false;
     uint16_t reviewed_today = 0;
     uint16_t correct_today = 0;
-    uint16_t daily_target = 20;
-    uint16_t due_count = 0;
     uint16_t total_count = 0;
     uint16_t card_position = 0;
     uint16_t card_count = 0;
@@ -116,15 +169,60 @@ struct WordAppSnapshot {
 
 esp_err_t InitWordApp(WordAppState* state);
 esp_err_t HandleWordAppInput(WordAppState* state, WordInput input);
-void ApplyWordPackIndex(WordAppState* state, const WordPackIndex& index, const std::string& message);
-void ApplyWordSearchResult(WordAppState* state, const WqnWordSearchResult& result);
-void ApplyWordAiLookupResult(WordAppState* state, const WqnWordAiLookupResult& result);
+void ApplyWordPackIndex(WordAppState* state, WordPackIndex index, const std::string& message);
+bool ApplyWordSearchResult(
+    WordAppState* state,
+    const std::string& query,
+    const WqnWordSearchResult& result);
+bool ApplyWordAiLookupResult(
+    WordAppState* state,
+    const std::string& query,
+    const WqnWordAiLookupResult& result);
+bool ApplyWordLookupFailure(
+    WordAppState* state,
+    const std::string& query,
+    const std::string& message);
+void CancelWordLookupResult(WordAppState* state);
 bool TakeWordSearchRequest(WordAppState* state, WqnWordSearchRequest* request);
 bool TakeWordAiLookupRequest(WordAppState* state, WqnWordAiLookupRequest* request);
-bool TakeWordReviewSubmission(WordAppState* state, WqnWordReviewSubmission* submission, std::string* word);
+bool TakeWordSessionStartRequest(
+    WordAppState* state,
+    protocol::word_study_v1::CreateSessionRequest* request);
+// The runner thread already compacted (compact_result) and, for active
+// sessions, persisted (persist_result) the snapshot; apply only installs it in
+// memory so the UI task never runs the snapshot fsync.
+bool ApplyWordSessionStartResult(
+    WordAppState* state,
+    esp_err_t result,
+    esp_err_t compact_result,
+    esp_err_t persist_result,
+    PersistedWordSession persisted);
+void CancelWordSessionStartResult(WordAppState* state);
+// Discards a server-invalid session (snapshot corrupt / not found / not active)
+// so the device stops reusing the same bad session_id, then returns to the word
+// home where a fresh session can be created.
+void ResetWordSessionForServerInvalid(WordAppState* state);
+bool TakeWordCandidatePageRequest(
+    WordAppState* state,
+    protocol::word_study_v1::CandidatePageRequest* request,
+    std::string* session_id);
+void RestoreWordCandidatePageRequest(WordAppState* state);
+void ApplyWordCandidatePageResult(
+    WordAppState* state,
+    esp_err_t result,
+    protocol::word_study_v1::CandidatePageData page);
+bool TakeWordObservationEffect(
+    WordAppState* state,
+    const std::string& request_id,
+    const std::string& occurred_at,
+    DurableWordObservation* observation,
+    PersistedWordSession* advanced_session);
+void ApplyWordObservationCommitResult(WordAppState* state, esp_err_t result);
+void RefreshWordOutboxState(WordAppState* state);
 WordAppSnapshot BuildWordAppSnapshot(const WordAppState& state);
 std::string WordAppProgressLabel(const WordAppState& state);
 std::string WordAppStatusLine(const WordAppState& state);
 std::string WordAppSignature(const WordAppState& state);
+bool RunWordPageStateSelfTest();
 
 }  // namespace wqn

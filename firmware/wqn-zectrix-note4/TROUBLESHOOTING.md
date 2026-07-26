@@ -82,6 +82,120 @@ network loss or server error, verify a terminal result and lease release. I2S,
 ES8311 and amplifier GPIO access must exist only in `AudioService`; the M8 build
 gate enforces this.
 
+## Word card stalls or advances incorrectly
+
+- Match the button log to `word observation durable`. The card must remain in
+  `Persisting` until the foreground storage transaction succeeds.
+- Use `owner`, `queue_wait_ms` and `elapsed_ms` to distinguish queue contention
+  from SPIFFS work. Word observation commits use the foreground queue; outbox
+  upload/ACK must yield after the current idempotent item when interaction
+  generation changes.
+- A network timeout must leave the same request id in the outbox. Repeated
+  observations with a new request id are a defect.
+- A resumed random session must retain its original session id, seed, snapshot,
+  cursor and position. If order changes after reset, preserve `wsr.v1`, the boot
+  log and the matching ELF.
+- A dictionary card is read-only until an explicit known/unknown/skipped action.
+  A late lookup or session result must not replace the active picker/card.
+- New word-pack manifests are staged for the next session. If an active card
+  changes after sync, compare the persisted session snapshot against the loaded
+  pack SHA and stop using that build.
+- Pause/resume only flips the `paused` flag. It writes the tiny per-mode cursor
+  file (`wsq.cur`/`wsr.cur`/`wsd.cur`, owner `word-session-cursor`), not the full
+  candidate snapshot; a multi-second `word-session-save` on pause/resume is a
+  regression. The cursor is overlaid on the snapshot after outbox reconciliation
+  on load. Full snapshot writes remain only on session create and candidate-page
+  append.
+
+## Note page slow to open, sync, or scroll
+
+- Note packs carry a body up to 16 KB per note, so the word patterns had to be
+  reworked for volume. Watch for these regressions:
+- Index build (`note pack index: ... notes=N`) should be milliseconds, not
+  seconds. `ScanNotePackFile` parses metadata only (`ParseNoteRecordLine` with
+  `include_content=false`); the body is read on demand in `ReadNotePackEntry`.
+  If scans slow down, confirm the body is not being materialised per record.
+- Title-list rendering uses `note_order`, a `note_id`-sorted index built once in
+  `LoadNotePackIndex`; `FindPackEntry` binary-searches it. A per-render O(N x M)
+  scan (one linear `FindPackEntry` per candidate item) is a regression.
+- Body scrolling must reuse cached wrapped lines. `RenderNoteBody` caches
+  `WrapUtf8TextToWidth` output keyed by `note_id`; re-wrapping the full body
+  every frame pegs the CPU.
+- Opening a note must not rewrite the session snapshot. `CommitObservationTransaction`
+  appends the durable `opened` record to the outbox and returns `ESP_OK`; the
+  advanced cursor (`next_sequence` + `position`) is reconciled from that record by
+  `ReconcileSession` on load. A multi-second `note-observation-commit` (owner in
+  the storage log) means the full-snapshot `SaveSessionRaw` was reintroduced into
+  the fresh-append path -- that froze the UI ~2-3 s on every note open.
+- Sync must hash each local pack at most once. `SyncNotePacks` evaluates
+  `NotePackNeedsDownload` (full-file SHA-256) once into a vector; re-hashing every
+  unchanged pack per sync is a regression.
+- Known deferred item: pack SHA verification and large-pack installs still run on
+  the storage queue and can block the UI thread. Moving that blocking I/O off the
+  UI thread is a planned unified async pass, not yet done. The remaining note
+  session-snapshot writes (session create in `ApplyNoteSessionStartResult`,
+  candidate-page append in `ApplyNoteCandidatePageResult`) are also synchronous,
+  but they persist genuinely new data and only run after a network round-trip, so
+  they are infrequent -- they belong to that same deferred async pass, not the
+  per-open hot path.
+
+## Note page 花屏 / ghosting after a few steps
+
+- Symptom: after the repaint fix, navigating the note page a few steps shows
+  garbage/ghosting (花屏), often intermittently around a mode transition.
+- Root cause class: e-paper accumulates charge from partial waveforms. The
+  driver only promotes to a clean full refresh after `kMaxPartialRefreshesBeforeFull`
+  (=20) partials, and a change whose dirty bounding box is taller than
+  `kLocalPartialMaxHeight` (=170) or wider than 45% area is sent as a
+  "full-frame-partial" (whole frame via partial waveform) -- fast but ghost-prone.
+  Note mode transitions (notebook<->title<->body) repaint ~79% of the panel, so
+  as partials they ghost badly.
+- Fix in place: note mode transitions return `RefreshSchedule::kCommit` (full
+  refresh) so the panel is cleared; same-mode navigation keeps the fast partial
+  path. If 花屏 still appears during pure list up/down (no open), the title-list
+  render is producing a tall dirty bounding box (selection change spread between
+  the top status line and bottom hint) -> full-frame-partial; the remedy is to
+  tighten the list render so only changed rows are dirtied, or to promote note
+  full-frame-partials to full at the driver boundary (do NOT do this globally --
+  the AI page relies on fast full-frame-partial scrolling).
+
+## Note page frozen / does not repaint on navigation
+
+- Symptom: the note page shows once on entry, then no button (notebook/title
+  navigation, open, body scroll) changes the screen; logs show every note
+  dispatch as `desired_len=<const>` + `display submission skipped: desired state
+  already represented`, while `app event ... kind=button changed=1` still fires.
+- Root cause class: `FrameSignature()` (ui_refresh.cpp) must have a branch for the
+  screen. `RenderNote` populates `frame.note_app` (not `frame.lines`), so without a
+  `kNote` branch the dedup signature is constant and the refresh pipeline skips
+  every repaint -- indistinguishable from a hang on e-paper. Any new screen that
+  renders from its own snapshot needs a matching `FrameSignature` branch.
+- The note branch must include mode, both selection indices, body scroll offset,
+  note_id, list sizes/rows, status/hint -- but NOT battery/clock (those change on
+  timers and would force periodic full refreshes).
+
+## Note `opened` not syncing (last-viewed / recommendation stale)
+
+- Opening a note from the title list writes one durable `opened` observation to
+  the note outbox, then triggers `RequestNoteOutboxUpload()`. Uploads coalesce
+  behind the same 5s quiet-window timer as word and ride the shared outbox-only
+  round; opening a note must never launch the full control/problem/content sync.
+- Device v1 emits only `opened` (no read_completed / known-unknown). Any other
+  note action reaching the server is a regression.
+- Log owners: a successful round logs `note outbox drained` / `note outbox batch
+  complete`; a deferral logs `note outbox upload deferred` with the server code.
+- A terminal (non-retryable) rejection is skipped-then-quarantined: the device
+  POSTs `/v3/notes/observations/skip` first so the server's monotonic
+  next_sequence advances, then drops the poison head locally. Without the skip the
+  next record would be rejected forever with `STUDY_SEQUENCE_GAP`.
+- Note and word keep independent retry cursors, so a stuck note head never defers
+  word uploads (and vice versa). `opened` is durable on flash, so it survives
+  disconnect / reboot / sleep and uploads on the next quiet round.
+- If `last_opened_at` / “上次看过” never updates from device use, confirm the session
+  is valid (a server-invalid session is discarded by the circuit-breaker; the
+  observation uploads once a fresh session exists) and that
+  `/v3/notes/observations` returns 200.
+
 ## Useful local checks
 
 ```bash

@@ -1,6 +1,7 @@
 #include "services/audio_service.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <utility>
 
@@ -37,11 +38,22 @@ constexpr int64_t kCallTimeoutUs = 5 * 1000 * 1000;
 constexpr int64_t kEmergencyForceCallBudgetUs = 500 * 1000;
 constexpr size_t kMaxCodecHandles = 2;
 constexpr size_t kMaxChannelHandles = 2;
+// The board currently relies on the ESP32-S3's internal I2C pull-ups. They
+// are much weaker than the recommended external 2-5 kOhm pull-ups, so the
+// ES8311's two-byte register transactions are marginal at 100 kHz even when
+// the address-only probe succeeds. Keep the shared RTC/PMU devices at their
+// normal speed, but run codec transactions more conservatively.
+constexpr uint32_t kCodecI2cClockHz = 50000;
+constexpr int kCodecI2cMaxAttempts = 5;
+constexpr TickType_t kCodecI2cRetryDelay = pdMS_TO_TICKS(5);
+constexpr TickType_t kCodecPowerOffSettle = pdMS_TO_TICKS(20);
+constexpr TickType_t kCodecPowerOnWarmup = pdMS_TO_TICKS(250);
 
 enum class CommandType : uint8_t {
     kBegin,
     kEnd,
     kSetAmplifier,
+    kRecoverCodec,
     kPrepareSleep,
     kRollbackSleep,
 };
@@ -129,6 +141,16 @@ bool IsValidActivity(wqn::services::AudioActivity activity)
     }
 }
 
+bool IsRetryableCodecI2cError(esp_err_t result)
+{
+    // ESP-IDF 5.5 reports a synchronous I2C NACK as INVALID_STATE; newer
+    // releases use INVALID_RESPONSE. TIMEOUT is also recoverable because the
+    // driver resets its hardware FSM before the next synchronous transaction.
+    return result == ESP_ERR_INVALID_STATE ||
+        result == ESP_ERR_INVALID_RESPONSE ||
+        result == ESP_ERR_TIMEOUT;
+}
+
 class DriverOperation {
 public:
     enum class Kind : uint8_t { kSession, kCodec, kChannel };
@@ -140,9 +162,22 @@ public:
         : kind_(kind)
     {
         taskENTER_CRITICAL(&g_resource_lock);
-        if (!g_accept_operations.load(std::memory_order_acquire) ||
-            !SessionMatches(session)) {
+        const bool accepts_operations =
+            g_accept_operations.load(std::memory_order_acquire);
+        const uint32_t active_session =
+            g_session_id.load(std::memory_order_acquire);
+        const wqn::services::AudioState active_state =
+            g_state.load(std::memory_order_acquire);
+        if (!accepts_operations || !SessionMatches(session)) {
             taskEXIT_CRITICAL(&g_resource_lock);
+            ESP_LOGE(kTag,
+                     "driver op rejected: kind=%u session=%lu active_session=%lu activity=%s state=%s accept=%d",
+                     static_cast<unsigned>(kind_),
+                     static_cast<unsigned long>(session.id),
+                     static_cast<unsigned long>(active_session),
+                     wqn::services::AudioActivityName(session.activity),
+                     wqn::services::AudioStateName(active_state),
+                     accepts_operations ? 1 : 0);
             return;
         }
         if (kind_ != Kind::kSession) {
@@ -161,6 +196,10 @@ public:
             }
             if (slot_ == nullptr) {
                 taskEXIT_CRITICAL(&g_resource_lock);
+                ESP_LOGE(kTag,
+                         "driver op rejected: unregistered handle kind=%u session=%lu handle=%p",
+                         static_cast<unsigned>(kind_),
+                         static_cast<unsigned long>(session.id), handle);
                 return;
             }
         }
@@ -220,6 +259,15 @@ esp_err_t RegisterResource(
         result = ESP_ERR_INVALID_STATE;
     }
     taskEXIT_CRITICAL(&g_resource_lock);
+    if (result != ESP_OK) {
+        ESP_LOGE(kTag,
+                 "resource register failed: session=%lu handle=%p result=%s (%d) accept=%d state=%s",
+                 static_cast<unsigned long>(session.id), handle,
+                 esp_err_to_name(result), static_cast<int>(result),
+                 g_accept_operations.load(std::memory_order_acquire) ? 1 : 0,
+                 wqn::services::AudioStateName(
+                     g_state.load(std::memory_order_acquire)));
+    }
     return result;
 }
 
@@ -359,6 +407,51 @@ esp_err_t ApplyCodecPower(bool enabled)
         HoldOutput(kCodecPower, enabled), kTag, "set codec power GPIO");
     g_codec_powered.store(enabled, std::memory_order_release);
     return ESP_OK;
+}
+
+esp_err_t RecoverCodecPower(const AudioCommand& command)
+{
+    if (command.session_id == 0 ||
+        command.session_id != g_session_id.load(std::memory_order_acquire) ||
+        command.activity != g_activity.load(std::memory_order_acquire) ||
+        !g_accept_operations.load(std::memory_order_acquire) ||
+        g_state.load(std::memory_order_acquire) !=
+            StateForActivity(command.activity)) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    // A power recovery must not race an active I2C/I2S transaction. Capture
+    // calls this before registering the next codec/channel, but keep the
+    // guard here as the final owner-side safety check.
+    if (HasRegisteredResources(command.session_id)) {
+        ESP_LOGW(kTag,
+                 "codec power recovery rejected: session=%lu resources still registered",
+                 static_cast<unsigned long>(command.session_id));
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    esp_err_t result = ApplyAmplifier(false);
+    if (result == ESP_OK) {
+        result = ApplyCodecPower(false);
+    }
+    ESP_LOGI(kTag, "codec power recovery: session=%lu power_off=%s (%d)",
+             static_cast<unsigned long>(command.session_id),
+             esp_err_to_name(result), static_cast<int>(result));
+    if (result != ESP_OK) {
+        return result;
+    }
+
+    vTaskDelay(kCodecPowerOffSettle);
+    result = ApplyCodecPower(true);
+    ESP_LOGI(kTag, "codec power recovery: session=%lu power_on=%s (%d)",
+             static_cast<unsigned long>(command.session_id),
+             esp_err_to_name(result), static_cast<int>(result));
+    if (result == ESP_OK) {
+        // ES8311's analog/reference rail needs a full warm-up after a real
+        // power cycle. The delay is paid only after a cold start or a prior
+        // failed capture; normal consecutive turns keep the warm rail.
+        vTaskDelay(kCodecPowerOnWarmup);
+    }
+    return result;
 }
 
 void SetState(wqn::services::AudioState state)
@@ -601,6 +694,8 @@ esp_err_t HandleCommand(const AudioCommand& command, AudioReply* reply)
                 return ESP_ERR_INVALID_STATE;
             }
             return ApplyAmplifier(command.enabled);
+        case CommandType::kRecoverCodec:
+            return RecoverCodecPower(command);
         case CommandType::kPrepareSleep:
             return PrepareForSleep(command);
         case CommandType::kRollbackSleep:
@@ -857,19 +952,46 @@ esp_err_t SetAudioAmplifier(const AudioSession& session, bool enabled)
     return Call(&command, &reply);
 }
 
+esp_err_t RecoverAudioCodec(const AudioSession& session)
+{
+    if (!session) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    AudioCommand command;
+    command.type = CommandType::kRecoverCodec;
+    command.session_id = session.id;
+    command.activity = session.activity;
+    AudioReply reply;
+    return Call(&command, &reply);
+}
+
 esp_err_t GetSharedAudioBus(
     const AudioSession& session, AudioBusHandle* bus)
 {
+    ESP_LOGI(kTag, "get shared I2C bus: session=%lu bus_in=%p state=%s accept=%d",
+             static_cast<unsigned long>(session.id),
+             bus == nullptr ? nullptr : *bus,
+             wqn::services::AudioStateName(
+                 g_state.load(std::memory_order_acquire)),
+             g_accept_operations.load(std::memory_order_acquire) ? 1 : 0);
     DriverOperation operation(session);
     if (!operation || bus == nullptr) {
+        ESP_LOGE(kTag, "get shared I2C bus rejected: session=%lu result=%s (%d)",
+                 static_cast<unsigned long>(session.id),
+                 esp_err_to_name(ESP_ERR_INVALID_STATE),
+                 static_cast<int>(ESP_ERR_INVALID_STATE));
         return ESP_ERR_INVALID_STATE;
     }
     i2c_master_bus_handle_t shared = wqn::GetSharedI2cBusHandle();
     if (shared == nullptr) {
         *bus = nullptr;
+        ESP_LOGE(kTag, "get shared I2C bus returned null: session=%lu",
+                 static_cast<unsigned long>(session.id));
         return ESP_ERR_INVALID_STATE;
     }
     *bus = reinterpret_cast<AudioBusHandle>(shared);
+    ESP_LOGI(kTag, "get shared I2C bus ok: session=%lu bus=%p",
+             static_cast<unsigned long>(session.id), *bus);
     return ESP_OK;
 }
 
@@ -878,14 +1000,37 @@ esp_err_t AddAudioCodec(
     AudioBusHandle bus,
     AudioCodecHandle* codec)
 {
+    ESP_LOGI(kTag, "add ES8311: session=%lu bus=%p codec_in=%p state=%s accept=%d",
+             static_cast<unsigned long>(session.id), bus,
+             codec == nullptr ? nullptr : *codec,
+             wqn::services::AudioStateName(
+                 g_state.load(std::memory_order_acquire)),
+             g_accept_operations.load(std::memory_order_acquire) ? 1 : 0);
     DriverOperation operation(session);
     if (!operation || bus == nullptr || codec == nullptr || *codec != nullptr) {
+        ESP_LOGE(kTag, "add ES8311 rejected: session=%lu result=%s (%d)",
+                 static_cast<unsigned long>(session.id),
+                 esp_err_to_name(ESP_ERR_INVALID_STATE),
+                 static_cast<int>(ESP_ERR_INVALID_STATE));
         return ESP_ERR_INVALID_STATE;
+    }
+    // `i2c_master_bus_add_device` only allocates and attaches a software
+    // device object; it does not verify that the codec ACKs on the wires.
+    // Probe while the AudioService operation is held so a stale/unpowered
+    // ES8311 is reported before any register sequence is attempted.
+    const esp_err_t probe_result =
+        i2c_master_probe(AsBus(bus), kEs8311Address, 100);
+    ESP_LOGI(kTag, "probe ES8311: session=%lu bus=%p addr=0x%02x result=%s (%d)",
+             static_cast<unsigned long>(session.id), bus,
+             static_cast<unsigned>(kEs8311Address),
+             esp_err_to_name(probe_result), static_cast<int>(probe_result));
+    if (probe_result != ESP_OK) {
+        return probe_result;
     }
     i2c_device_config_t config = {};
     config.dev_addr_length = I2C_ADDR_BIT_LEN_7;
     config.device_address = kEs8311Address;
-    config.scl_speed_hz = 100000;
+    config.scl_speed_hz = kCodecI2cClockHz;
     i2c_master_dev_handle_t device = nullptr;
     esp_err_t result = i2c_master_bus_add_device(
         AsBus(bus), &config, &device);
@@ -898,6 +1043,10 @@ esp_err_t AddAudioCodec(
     } else if (device != nullptr) {
         i2c_master_bus_rm_device(device);
     }
+    ESP_LOGI(kTag, "add ES8311 result: session=%lu result=%s (%d) device=%p scl_hz=%lu",
+             static_cast<unsigned long>(session.id),
+             esp_err_to_name(result), static_cast<int>(result), device,
+             static_cast<unsigned long>(kCodecI2cClockHz));
     return result;
 }
 
@@ -936,8 +1085,39 @@ esp_err_t WriteAudioCodecRegister(
         return ESP_ERR_INVALID_STATE;
     }
     const uint8_t data[] = {reg, value};
-    return i2c_master_transmit(
-        AsCodec(codec), data, sizeof(data), pdMS_TO_TICKS(100));
+    esp_err_t result = ESP_FAIL;
+    int attempts_used = 0;
+    for (int attempt = 1; attempt <= kCodecI2cMaxAttempts; ++attempt) {
+        attempts_used = attempt;
+        result = i2c_master_transmit(
+            AsCodec(codec), data, sizeof(data), pdMS_TO_TICKS(100));
+        if (result == ESP_OK) {
+            if (attempt > 1) {
+                ESP_LOGI(kTag,
+                         "codec write recovered: session=%lu dev=%p reg=0x%02x attempt=%d",
+                         static_cast<unsigned long>(session.id), codec, reg,
+                         attempt);
+            }
+            return ESP_OK;
+        }
+        if (!IsRetryableCodecI2cError(result) ||
+            attempt == kCodecI2cMaxAttempts) {
+            break;
+        }
+        ESP_LOGW(kTag,
+                 "codec write retry: session=%lu dev=%p reg=0x%02x attempt=%d/%d result=%s (%d)",
+                 static_cast<unsigned long>(session.id), codec, reg, attempt,
+                 kCodecI2cMaxAttempts, esp_err_to_name(result),
+                 static_cast<int>(result));
+        vTaskDelay(kCodecI2cRetryDelay);
+    }
+    ESP_LOGE(kTag,
+             "codec write API=i2c_master_transmit session=%lu dev=%p addr=0x%02x reg=0x%02x value=0x%02x attempts=%d result=%s (%d)",
+             static_cast<unsigned long>(session.id), codec,
+             static_cast<unsigned>(kEs8311Address), reg, value,
+             attempts_used, esp_err_to_name(result),
+             static_cast<int>(result));
+    return result;
 }
 
 esp_err_t ReadAudioCodecRegister(
@@ -951,9 +1131,40 @@ esp_err_t ReadAudioCodecRegister(
     if (!operation || codec == nullptr || value == nullptr) {
         return ESP_ERR_INVALID_STATE;
     }
-    return i2c_master_transmit_receive(
-        AsCodec(codec), &reg, sizeof(reg), value, sizeof(*value),
-        pdMS_TO_TICKS(100));
+    esp_err_t result = ESP_FAIL;
+    int attempts_used = 0;
+    for (int attempt = 1; attempt <= kCodecI2cMaxAttempts; ++attempt) {
+        attempts_used = attempt;
+        result = i2c_master_transmit_receive(
+            AsCodec(codec), &reg, sizeof(reg), value, sizeof(*value),
+            pdMS_TO_TICKS(100));
+        if (result == ESP_OK) {
+            if (attempt > 1) {
+                ESP_LOGI(kTag,
+                         "codec read recovered: session=%lu dev=%p reg=0x%02x attempt=%d",
+                         static_cast<unsigned long>(session.id), codec, reg,
+                         attempt);
+            }
+            return ESP_OK;
+        }
+        if (!IsRetryableCodecI2cError(result) ||
+            attempt == kCodecI2cMaxAttempts) {
+            break;
+        }
+        ESP_LOGW(kTag,
+                 "codec read retry: session=%lu dev=%p reg=0x%02x attempt=%d/%d result=%s (%d)",
+                 static_cast<unsigned long>(session.id), codec, reg, attempt,
+                 kCodecI2cMaxAttempts, esp_err_to_name(result),
+                 static_cast<int>(result));
+        vTaskDelay(kCodecI2cRetryDelay);
+    }
+    ESP_LOGE(kTag,
+             "codec read API=i2c_master_transmit_receive session=%lu dev=%p addr=0x%02x reg=0x%02x attempts=%d result=%s (%d)",
+             static_cast<unsigned long>(session.id), codec,
+             static_cast<unsigned>(kEs8311Address), reg,
+             attempts_used, esp_err_to_name(result),
+             static_cast<int>(result));
+    return result;
 }
 
 esp_err_t CreateAudioRxChannel(
@@ -963,36 +1174,67 @@ esp_err_t CreateAudioRxChannel(
     bool left_aligned,
     AudioChannelHandle* rx)
 {
+    ESP_LOGI(kTag,
+             "create I2S RX: session=%lu rx_in=%p rate=%lu dma=%lu left_aligned=%d state=%s accept=%d",
+             static_cast<unsigned long>(session.id),
+             rx == nullptr ? nullptr : *rx,
+             static_cast<unsigned long>(sample_rate_hz),
+             static_cast<unsigned long>(dma_frame_count),
+             left_aligned ? 1 : 0,
+             wqn::services::AudioStateName(
+                 g_state.load(std::memory_order_acquire)),
+             g_accept_operations.load(std::memory_order_acquire) ? 1 : 0);
     DriverOperation operation(session);
     if (!operation || rx == nullptr || *rx != nullptr) {
+        ESP_LOGE(kTag, "create I2S RX rejected: session=%lu result=%s (%d)",
+                 static_cast<unsigned long>(session.id),
+                 esp_err_to_name(ESP_ERR_INVALID_STATE),
+                 static_cast<int>(ESP_ERR_INVALID_STATE));
         return ESP_ERR_INVALID_STATE;
     }
     i2s_chan_handle_t channel = nullptr;
     i2s_chan_config_t channel_config = MakeChannelConfig(dma_frame_count);
     esp_err_t result = i2s_new_channel(
         &channel_config, nullptr, &channel);
+    ESP_LOGI(kTag, "create I2S RX: i2s_new_channel result=%s (%d) channel=%p",
+             esp_err_to_name(result), static_cast<int>(result), channel);
     if (result == ESP_OK) {
         i2s_std_config_t standard = MakeStandardConfig(
             sample_rate_hz, left_aligned, true);
         result = i2s_channel_init_std_mode(channel, &standard);
+        ESP_LOGI(kTag,
+                 "create I2S RX: i2s_channel_init_std_mode result=%s (%d) channel=%p",
+                 esp_err_to_name(result), static_cast<int>(result), channel);
     }
     if (result == ESP_OK) {
         result = i2s_channel_enable(channel);
+        ESP_LOGI(kTag, "create I2S RX: i2s_channel_enable result=%s (%d) channel=%p",
+                 esp_err_to_name(result), static_cast<int>(result), channel);
     }
     if (result != ESP_OK) {
         if (channel != nullptr) {
-            i2s_del_channel(channel);
+            const esp_err_t cleanup_result = i2s_del_channel(channel);
+            ESP_LOGI(kTag,
+                     "create I2S RX: cleanup i2s_del_channel result=%s (%d) channel=%p",
+                     esp_err_to_name(cleanup_result),
+                     static_cast<int>(cleanup_result), channel);
         }
         return result;
     }
     result = RegisterResource(
         g_channel_slots, kMaxChannelHandles, session, channel);
     if (result != ESP_OK) {
-        i2s_channel_disable(channel);
-        i2s_del_channel(channel);
+        const esp_err_t disable_result = i2s_channel_disable(channel);
+        const esp_err_t delete_result = i2s_del_channel(channel);
+        ESP_LOGE(kTag,
+                 "create I2S RX: register resource failed=%s (%d), disable=%s, delete=%s",
+                 esp_err_to_name(result), static_cast<int>(result),
+                 esp_err_to_name(disable_result), esp_err_to_name(delete_result));
         return result;
     }
     *rx = reinterpret_cast<AudioChannelHandle>(channel);
+    ESP_LOGI(kTag, "create I2S RX ok: session=%lu rx=%p",
+             static_cast<unsigned long>(session.id), *rx);
     return ESP_OK;
 }
 
@@ -1183,11 +1425,61 @@ esp_err_t WriteAudioChannel(
 }
 
 esp_err_t ResetAudioTxChannel(
-    const AudioSession& session, AudioChannelHandle channel)
+    const AudioSession& session,
+    AudioChannelHandle channel,
+    size_t silence_bytes)
 {
-    ESP_RETURN_ON_ERROR(
-        DisableAudioChannel(session, channel), kTag, "disable audio TX");
-    return EnableAudioChannel(session, channel);
+    if (channel == nullptr || silence_bytes == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    // Keep one resource operation across disable, preload and enable. Calling
+    // the public helpers separately would leave a window in which the session
+    // teardown task could delete the channel between the two operations.
+    DriverOperation operation(
+        session, DriverOperation::Kind::kChannel, channel);
+    if (!operation) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    esp_err_t result = i2s_channel_disable(AsChannel(channel));
+    if (result != ESP_OK) {
+        ESP_LOGE(kTag, "reset audio TX: disable failed result=%s (%d)",
+                 esp_err_to_name(result), static_cast<int>(result));
+        return result;
+    }
+
+    // i2s_channel_disable resets the TX queue/current descriptor, but it does
+    // not clear the descriptor payloads.  Preload the entire ring while the
+    // channel is READY so a subsequent enable cannot replay samples already
+    // fetched by DMA before a barge-in/abort.
+    std::array<uint8_t, 256> silence = {};
+    size_t total_loaded = 0;
+    while (total_loaded < silence_bytes) {
+        const size_t remaining = silence_bytes - total_loaded;
+        const size_t request = std::min(remaining, silence.size());
+        size_t loaded = 0;
+        const esp_err_t preload_result = i2s_channel_preload_data(
+            AsChannel(channel), silence.data(), request, &loaded);
+        if (preload_result != ESP_OK) {
+            ESP_LOGE(kTag,
+                     "reset audio TX: preload silence failed after %u/%u bytes result=%s (%d)",
+                     static_cast<unsigned>(total_loaded),
+                     static_cast<unsigned>(silence_bytes),
+                     esp_err_to_name(preload_result),
+                     static_cast<int>(preload_result));
+            return preload_result;
+        }
+        if (loaded == 0) {
+            ESP_LOGE(kTag,
+                     "reset audio TX: preload made no progress at %u/%u bytes",
+                     static_cast<unsigned>(total_loaded),
+                     static_cast<unsigned>(silence_bytes));
+            return ESP_ERR_INVALID_STATE;
+        }
+        total_loaded += loaded;
+    }
+    ESP_LOGD(kTag, "reset audio TX: preloaded %u bytes of silence",
+             static_cast<unsigned>(total_loaded));
+    return i2s_channel_enable(AsChannel(channel));
 }
 
 esp_err_t PrepareAudioServiceForSleep(

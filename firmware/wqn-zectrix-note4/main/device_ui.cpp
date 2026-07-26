@@ -132,6 +132,9 @@ constexpr char kTag[] = "wqn_ui";
 constexpr TickType_t kUiPollDelayTicks = pdMS_TO_TICKS(50);
 constexpr TickType_t kUiIdlePollDelayTicks = pdMS_TO_TICKS(500);
 constexpr TickType_t kStatusRefreshDelayTicks = pdMS_TO_TICKS(60000);
+// Full UI snapshot reloads touch several persistent domains. Keep them out of
+// the word interaction window; typed sync events already update live status.
+constexpr int64_t kStatusReloadInteractionQuietUs = 5LL * 1000LL * 1000LL;
 constexpr UBaseType_t kSyncEventQueueDepth = 4;
 
 using device_ui_internal::BuildHomeSummary;
@@ -145,10 +148,9 @@ using device_ui_internal::StrongerSchedule;
 using device_ui_internal::AcknowledgeDisplayResult;
 using device_ui_internal::FinishTodoCloudRequest;
 using device_ui_internal::FinishWordCloudRequest;
-using device_ui_internal::g_todo_result_queue;
+using device_ui_internal::FinishNoteCloudRequest;
 using device_ui_internal::g_display_result_queue;
 using device_ui_internal::g_rtc_screen_val;
-using device_ui_internal::g_word_result_queue;
 
 // Local copy — only DeviceUiTask reads/writes this; ui_refresh.cpp's
 // g_last_active_us is the cross-file symbol declared in ui_internal.h
@@ -461,6 +463,8 @@ void DeviceUiTask(void*)
     TickType_t last_status_refresh = xTaskGetTickCount();
     g_last_active_us_local = esp_timer_get_time();
     TickType_t poll_delay = kUiPollDelayTicks;
+    bool word_pack_refresh_pending = false;
+    bool note_pack_refresh_pending = false;
 
     while (true) {
         RefreshSchedule refresh_schedule = pending_refresh_schedule;
@@ -468,6 +472,7 @@ void DeviceUiTask(void*)
         DrainDisplayResults(&ui_runtime, &display_tracking, &refresh_schedule);
         bool todo_cloud_completed = false;
         bool word_cloud_completed = false;
+        bool note_cloud_completed = false;
         if (g_sync_event_queue != nullptr) {
             wqn::services::SyncEvent sync_event;
             while (xQueueReceive(g_sync_event_queue, &sync_event, 0) == pdTRUE) {
@@ -477,9 +482,20 @@ void DeviceUiTask(void*)
                     StrongerSchedule(refresh_schedule, update.refresh);
                 if (sync_event.status ==
                         wqn::services::SyncEventStatus::kSucceeded &&
-                    !device_ui_internal::QueueWordReviewRefresh()) {
-                    ESP_LOGW(kTag, "word refresh queue full after sync: sequence=%lu",
-                             static_cast<unsigned long>(sync_event.sequence));
+                    sync_event.scope ==
+                        wqn::services::SyncEventScope::kFull) {
+                    // Sync notifications can arrive while a session page,
+                    // search, or an earlier pack refresh owns WordCloud. Keep
+                    // one coalesced refresh request instead of misreporting
+                    // the busy owner as a full queue.
+                    word_pack_refresh_pending = true;
+                    // Notes used to sync only when the local cache was missing
+                    // or broken, so an attach/edit on the web never reached a
+                    // device that already held a pack (HIL: image_ids stuck at
+                    // 0 while the cloud change_log had advanced). Mirror the
+                    // word lane: one coalesced manifest check per sync cycle;
+                    // an unchanged manifest ends the round trip immediately.
+                    note_pack_refresh_pending = true;
                 }
             }
         }
@@ -487,6 +503,12 @@ void DeviceUiTask(void*)
         if (event.HasEvent()) {
             wqn::NoteUserActivity();
             wqn::NoteEpdActivity();
+            if (state.screen == wqn::UiScreen::kWord ||
+                state.screen == wqn::UiScreen::kNote) {
+                // Both study screens feed a durable outbox; an in-flight upload
+                // batch yields to active input, then resumes after a quiet gap.
+                wqn::services::NoteWordInteraction();
+            }
             poll_delay = kUiPollDelayTicks;
             g_last_active_us_local = esp_timer_get_time();
         }
@@ -516,35 +538,58 @@ void DeviceUiTask(void*)
             refresh_schedule = after_sched;
         }
 
-        if (g_todo_result_queue != nullptr) {
-            device_ui_internal::TodoCloudResultReady ready;
-            while (xQueueReceive(g_todo_result_queue, &ready, 0) == pdTRUE) {
-                todo_cloud_completed = true;
-                const device_ui_internal::TodoCloudResult* todo_result =
-                    device_ui_internal::PeekTodoCloudResult(ready.generation);
-                if (todo_result != nullptr) {
-                    const device_ui_internal::UiUpdate update =
-                        ui_runtime.DispatchTodoCloudResult(*todo_result);
-                    refresh_schedule = StrongerSchedule(refresh_schedule, update.refresh);
-                } else {
-                    ESP_LOGE(kTag, "stale Todo result signal: generation=%lu",
-                             static_cast<unsigned long>(ready.generation));
-                }
-            }
-        }
-        if (g_word_result_queue != nullptr) {
-            device_ui_internal::WordCloudResultReady ready;
-            while (xQueueReceive(g_word_result_queue, &ready, 0) == pdTRUE) {
-                word_cloud_completed = true;
-                const device_ui_internal::WordCloudResult* word_result =
-                    device_ui_internal::PeekWordCloudResult(ready.generation);
-                if (word_result != nullptr) {
-                    const device_ui_internal::UiUpdate update =
-                        ui_runtime.DispatchWordCloudResult(*word_result);
-                    refresh_schedule = StrongerSchedule(refresh_schedule, update.refresh);
-                } else {
-                    ESP_LOGE(kTag, "stale Word result signal: generation=%lu",
-                             static_cast<unsigned long>(ready.generation));
+        if (device_ui_internal::g_cloud_result_queue != nullptr) {
+            device_ui_internal::CloudResultReady ready;
+            while (xQueueReceive(
+                       device_ui_internal::g_cloud_result_queue, &ready, 0) == pdTRUE) {
+                switch (ready.domain) {
+                    case device_ui_internal::CloudDomain::kTodo: {
+                        todo_cloud_completed = true;
+                        const device_ui_internal::TodoCloudResult* todo_result =
+                            device_ui_internal::PeekTodoCloudResult(ready.generation);
+                        if (todo_result != nullptr) {
+                            const device_ui_internal::UiUpdate update =
+                                ui_runtime.DispatchTodoCloudResult(*todo_result);
+                            refresh_schedule =
+                                StrongerSchedule(refresh_schedule, update.refresh);
+                        } else {
+                            ESP_LOGE(kTag, "stale Todo result signal: generation=%lu",
+                                     static_cast<unsigned long>(ready.generation));
+                        }
+                        break;
+                    }
+                    case device_ui_internal::CloudDomain::kWord: {
+                        word_cloud_completed = true;
+                        device_ui_internal::WordCloudResult* word_result =
+                            device_ui_internal::PeekWordCloudResult(ready.generation);
+                        if (word_result != nullptr) {
+                            const device_ui_internal::UiUpdate update =
+                                ui_runtime.DispatchWordCloudResult(*word_result);
+                            refresh_schedule =
+                                StrongerSchedule(refresh_schedule, update.refresh);
+                        } else {
+                            ESP_LOGE(kTag, "stale Word result signal: generation=%lu",
+                                     static_cast<unsigned long>(ready.generation));
+                        }
+                        break;
+                    }
+                    case device_ui_internal::CloudDomain::kNote: {
+                        note_cloud_completed = true;
+                        device_ui_internal::NoteCloudResult* note_result =
+                            device_ui_internal::PeekNoteCloudResult(ready.generation);
+                        if (note_result != nullptr) {
+                            const device_ui_internal::UiUpdate update =
+                                ui_runtime.DispatchNoteCloudResult(*note_result);
+                            refresh_schedule =
+                                StrongerSchedule(refresh_schedule, update.refresh);
+                        } else {
+                            ESP_LOGE(kTag, "stale Note result signal: generation=%lu",
+                                     static_cast<unsigned long>(ready.generation));
+                        }
+                        break;
+                    }
+                    default:
+                        break;
                 }
             }
         }
@@ -621,19 +666,55 @@ wqn::AiStreamingStatusView streaming_view{};
         }
 
         const TickType_t now = xTaskGetTickCount();
-        if (now - last_status_refresh >= kStatusRefreshDelayTicks) {
-            // Storage/Wi-Fi reads are an effect. Build the typed snapshot
-            // outside UiRuntime, then reduce that immutable observation into
-            // the single owned AppState.
-            g_ui_reload_snapshot = state;
-            device_ui_internal::LoadUiState(&g_ui_reload_snapshot);
-            const device_ui_internal::UiUpdate update =
-                ui_runtime.DispatchStatusReload(std::move(g_ui_reload_snapshot));
+        const bool status_reload_due =
+            now - last_status_refresh >= kStatusRefreshDelayTicks;
+        const bool interaction_quiet =
+            esp_timer_get_time() - g_last_active_us_local >=
+            kStatusReloadInteractionQuietUs;
+        // The periodic reload reads storage on THIS task (including per-file
+        // word-pack verification). During a pack sync the storage service runs
+        // back-to-back ~0.5-1s background writes, so those reads serialize
+        // behind the write storm and blocked the UI task for 12+s in HIL --
+        // and button gesture sampling lives on this task, so presses were
+        // silently dropped. Skip the reload while any cloud domain is busy:
+        // its inputs are mid-churn anyway and the sync completion event
+        // refreshes the UI when the data is actually stable.
+        const bool cloud_quiet = !device_ui_internal::IsTodoCloudBusy() &&
+            !device_ui_internal::IsWordCloudBusy() &&
+            !device_ui_internal::IsNoteCloudBusy();
+        if (status_reload_due && refresh_schedule == RefreshSchedule::kNone &&
+            !event.HasEvent() && interaction_quiet && cloud_quiet) {
+            if (state.screen != wqn::UiScreen::kWord) {
+                // Storage/Wi-Fi reads are an effect. Build the typed snapshot
+                // outside UiRuntime, then reduce that immutable observation
+                // into the single owned AppState. The word page is excluded:
+                // its session has one live owner and receives typed sync
+                // events, so reloading every persistent domain is stale work.
+                g_ui_reload_snapshot = state;
+                device_ui_internal::LoadUiState(&g_ui_reload_snapshot);
+                const device_ui_internal::UiUpdate update =
+                    ui_runtime.DispatchStatusReload(
+                        std::move(g_ui_reload_snapshot));
+                refresh_schedule =
+                    StrongerSchedule(refresh_schedule, update.refresh);
+            }
             CheckBatteryProtection();
-            refresh_schedule = StrongerSchedule(refresh_schedule, update.refresh);
             last_status_refresh = now;
         }
 
+        if (refresh_schedule != RefreshSchedule::kNone &&
+            state.screen == wqn::UiScreen::kNote &&
+            wqn::NoteImageLoadingGraceActive(
+                state.note_app, esp_timer_get_time())) {
+            // Image viewer just entered loading: hold the loading-page commit
+            // briefly. A cache hit lands within the grace window and the image
+            // paints with ONE full refresh instead of loading-page + image
+            // back to back (~2.3s of extra e-ink flashing per entry). Slow
+            // fetches fall out of the window and show the loading page.
+            pending_refresh_schedule = device_ui_internal::StrongerSchedule(
+                pending_refresh_schedule, refresh_schedule);
+            refresh_schedule = RefreshSchedule::kNone;
+        }
         if (refresh_schedule != RefreshSchedule::kNone) {
             wqn::UiFrame frame = wqn::RenderUiFrame(state);
             // [force-full-fix] Consume the one-shot flag HERE, after the final
@@ -734,6 +815,25 @@ wqn::AiStreamingStatusView streaming_view{};
         if (word_cloud_completed) {
             FinishWordCloudRequest();
         }
+        if (note_cloud_completed) {
+            FinishNoteCloudRequest();
+        }
+        device_ui_internal::PumpWordCandidatePrefetch(&ui_runtime);
+        device_ui_internal::PumpNoteCandidatePrefetch(&ui_runtime);
+        device_ui_internal::PumpNoteImageFetch(&ui_runtime);
+        device_ui_internal::PumpNoteObservationCommit(&ui_runtime);
+        if (word_pack_refresh_pending &&
+            !device_ui_internal::IsWordCloudBusy() &&
+            device_ui_internal::QueueWordReviewRefresh()) {
+            word_pack_refresh_pending = false;
+            ESP_LOGI(kTag, "queued coalesced word pack refresh after sync");
+        }
+        if (note_pack_refresh_pending &&
+            !device_ui_internal::IsNoteCloudBusy() &&
+            device_ui_internal::QueueNotePackSync()) {
+            note_pack_refresh_pending = false;
+            ESP_LOGI(kTag, "queued coalesced note pack refresh after sync");
+        }
 
         wqn::PowerOffEpdAfterIdleIfNeeded();
 
@@ -822,52 +922,11 @@ esp_err_t StartDeviceUiIfEnabled()
         wqn::services::SetSyncEventSink(UiSyncEventSink);
     }
 
-    if (device_ui_internal::g_todo_request_queue == nullptr) {
-        device_ui_internal::g_todo_request_queue = xQueueCreate(2, sizeof(device_ui_internal::TodoCloudRequest));
-        if (device_ui_internal::g_todo_request_queue == nullptr) {
-            return ESP_ERR_NO_MEM;
-        }
-    }
-
-    if (device_ui_internal::g_todo_result_queue == nullptr) {
-        device_ui_internal::g_todo_result_queue =
-            xQueueCreate(1, sizeof(device_ui_internal::TodoCloudResultReady));
-        if (device_ui_internal::g_todo_result_queue == nullptr) {
-            return ESP_ERR_NO_MEM;
-        }
-    }
-
-    if (device_ui_internal::g_word_request_queue == nullptr) {
-        device_ui_internal::g_word_request_queue = xQueueCreate(3, sizeof(device_ui_internal::WordCloudRequest));
-        if (device_ui_internal::g_word_request_queue == nullptr) {
-            return ESP_ERR_NO_MEM;
-        }
-    }
-
-    if (device_ui_internal::g_word_result_queue == nullptr) {
-        device_ui_internal::g_word_result_queue =
-            xQueueCreate(1, sizeof(device_ui_internal::WordCloudResultReady));
-        if (device_ui_internal::g_word_result_queue == nullptr) {
-            return ESP_ERR_NO_MEM;
-        }
-    }
-
-    if (device_ui_internal::g_todo_task == nullptr) {
-        const BaseType_t todo_created =
-            xTaskCreate(device_ui_internal::TodoCloudTask, "wqn_todo_cloud", 8192, nullptr, 3, &device_ui_internal::g_todo_task);
-        if (todo_created != pdPASS) {
-            device_ui_internal::g_todo_task = nullptr;
-            return ESP_ERR_NO_MEM;
-        }
-    }
-
-    if (device_ui_internal::g_word_task == nullptr) {
-        const BaseType_t word_created =
-            xTaskCreate(device_ui_internal::WordCloudTask, "wqn_word_cloud", 8192, nullptr, 3, &device_ui_internal::g_word_task);
-        if (word_created != pdPASS) {
-            device_ui_internal::g_word_task = nullptr;
-            return ESP_ERR_NO_MEM;
-        }
+    // One two-lane runner replaces the three per-domain cloud tasks; see
+    // ui/cloud_runner.cpp for the lane policy.
+    const esp_err_t runner_result = device_ui_internal::StartCloudRunner();
+    if (runner_result != ESP_OK) {
+        return runner_result;
     }
 
     // UI state loading verifies word-pack files with a 1 KiB local read buffer,

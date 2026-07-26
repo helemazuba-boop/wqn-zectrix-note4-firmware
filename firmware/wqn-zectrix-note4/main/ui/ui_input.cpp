@@ -496,6 +496,7 @@ RefreshSchedule ApplyButtonEvent(
             return RefreshSchedule::kAi;
         }
         if (state->ai.status == wqn::AiSessionStatus::kListening ||
+            state->ai.status == wqn::AiSessionStatus::kPreparingCapture ||
             state->ai.status == wqn::AiSessionStatus::kWaitingReply) {
             const esp_err_t ret = wqn::StopAiRecordingAndSubmit();
             wqn::AiSessionState ai_state;
@@ -537,6 +538,7 @@ RefreshSchedule ApplyButtonEvent(
     if (state->screen == wqn::UiScreen::kAi && !long_press &&
         (event.type == wqn::ButtonEventType::kShortPress) &&
         (event.button == wqn::ButtonId::kUp || event.button == wqn::ButtonId::kDownPower) &&
+        state->ai.status != wqn::AiSessionStatus::kPreparingCapture &&
         state->ai.status != wqn::AiSessionStatus::kListening &&
         state->ai.status != wqn::AiSessionStatus::kWaitingReply &&
         state->ai.status != wqn::AiSessionStatus::kStreaming) {
@@ -576,6 +578,7 @@ RefreshSchedule ApplyButtonEvent(
         (event.type == wqn::ButtonEventType::kShortPress) &&
         (event.button == wqn::ButtonId::kUp || event.button == wqn::ButtonId::kDownPower) &&
         (state->ai.status == wqn::AiSessionStatus::kListening ||
+         state->ai.status == wqn::AiSessionStatus::kPreparingCapture ||
          state->ai.status == wqn::AiSessionStatus::kWaitingReply ||
          state->ai.status == wqn::AiSessionStatus::kStreaming)) {
         return RefreshSchedule::kNone;
@@ -596,6 +599,10 @@ RefreshSchedule ApplyButtonEvent(
     const wqn::ReviewChoice old_review = state->selected_review;
     const wqn::TimeAppState old_time_app = state->time_app;
     const std::string old_word_signature = wqn::WordAppSignature(state->word_app);
+    const std::string old_note_signature = wqn::NoteAppSignature(state->note_app);
+    const wqn::NoteAppMode old_note_mode = state->note_app.mode;
+    const size_t old_notebook_window = state->note_app.notebook_window_start;
+    const size_t old_note_list_window = state->note_app.note_list_window_start;
     ESP_LOGI(
         kTag,
         "button event: id=%d type=%d duration_ms=%lld",
@@ -663,6 +670,13 @@ RefreshSchedule ApplyButtonEvent(
             } else {
                 state->word_app.message = "单词同步中";
             }
+        } else if (state->screen == wqn::UiScreen::kNote &&
+                   state->note_app.cloud_sync_requested) {
+            if (!QueueNotePackSync()) {
+                state->note_app.message = IsNoteCloudBusy() ? "笔记同步中" : "笔记同步失败";
+            } else {
+                state->note_app.message = "笔记同步中";
+            }
         }
         BuildHomeSummary(state);
         return RefreshSchedule::kCommit;
@@ -685,14 +699,53 @@ RefreshSchedule ApplyButtonEvent(
     }
     if (state->screen == wqn::UiScreen::kWord &&
         wqn::WordAppSignature(state->word_app) != old_word_signature) {
-        wqn::WqnWordReviewSubmission submission;
-        std::string word;
-        if (wqn::TakeWordReviewSubmission(&state->word_app, &submission, &word)) {
-            if (!QueueWordReviewSubmit(submission, word)) {
-                state->word_app.pending_submit_word_id = submission.word_id;
-                state->word_app.pending_submit_outcome = submission.outcome;
-                state->word_app.pending_submit_word = word;
-                state->word_app.message = IsWordCloudBusy() ? "单词同步中" : "单词同步失败";
+        wqn::protocol::word_study_v1::CreateSessionRequest session_request;
+        session_request.metadata = wqn::services::MakeDeviceRequestMetadata();
+        if (wqn::TakeWordSessionStartRequest(&state->word_app, &session_request) &&
+            !QueueWordSessionStart(session_request)) {
+            wqn::CancelWordSessionStartResult(&state->word_app);
+            if (session_request.mode ==
+                wqn::protocol::word_study_v1::Mode::kDictionary) {
+                state->word_app.session.requested_mode =
+                    wqn::protocol::word_study_v1::Mode::kDictionary;
+                state->word_app.session.start_requested = true;
+                state->word_app.message = "词典可浏览，记录稍后准备";
+            } else {
+                state->word_app.mode = wqn::WordAppMode::kHome;
+                state->word_app.message = IsWordCloudBusy()
+                    ? "单词服务忙，请重试"
+                    : "本轮准备失败，请重试";
+            }
+        }
+        wqn::DurableWordObservation observation;
+        wqn::PersistedWordSession advanced_session;
+        const auto observation_metadata = wqn::services::MakeDeviceRequestMetadata();
+        std::string occurred_at = CurrentIsoTimestamp();
+        if (occurred_at.empty()) {
+            // The event must remain durable even before SNTP is available.
+            // The server clamps implausible/future times when projecting it.
+            occurred_at = "2024-01-01T00:00:00Z";
+        }
+        if (wqn::TakeWordObservationEffect(
+                &state->word_app,
+                observation_metadata.request_id,
+                occurred_at,
+                &observation,
+                &advanced_session)) {
+            const esp_err_t commit_result = wqn::CommitWordObservation(
+                observation, advanced_session);
+            wqn::ApplyWordObservationCommitResult(
+                &state->word_app, commit_result);
+            if (commit_result == ESP_OK) {
+                // The durable outbox is the interaction boundary. Upload it
+                // after a quiet period; a card action must never launch the
+                // full bootstrap/problem/content sync pipeline.
+                wqn::services::RequestWordOutboxUpload();
+            } else {
+                ESP_LOGW(
+                    kTag,
+                    "word observation local commit failed: %s",
+                    esp_err_to_name(commit_result));
             }
         }
         wqn::WqnWordSearchRequest search_request;
@@ -712,6 +765,40 @@ RefreshSchedule ApplyButtonEvent(
             }
         }
         BuildHomeSummary(state);
+        return RefreshSchedule::kSelection;
+    }
+    if (state->screen == wqn::UiScreen::kNote &&
+        wqn::NoteAppSignature(state->note_app) != old_note_signature) {
+        wqn::protocol::note_study_v1::CreateSessionRequest note_session_request;
+        note_session_request.metadata = wqn::services::MakeDeviceRequestMetadata();
+        if (wqn::TakeNoteSessionStartRequest(&state->note_app, &note_session_request) &&
+            !QueueNoteSessionStart(note_session_request)) {
+            wqn::CancelNoteSessionStartResult(&state->note_app);
+            state->note_app.mode = wqn::NoteAppMode::kNotebookList;
+            state->note_app.message = IsNoteCloudBusy()
+                ? "笔记服务忙，请重试"
+                : "打开失败，请重试";
+        }
+        // The note-open observation commit (outbox append + session snapshot,
+        // a ~0.9s foreground storage transaction) no longer runs here on the
+        // UI task: PumpNoteObservationCommit hands it to the note cloud lane
+        // and the kPersisting gate covers the in-flight window.
+        BuildHomeSummary(state);
+        // A note mode transition (notebook<->title<->body<->image) or a list
+        // viewport jump repaints most of the screen; do a full refresh so the
+        // panel is cleared (large partial waveforms ghost, and HIL logs show a
+        // windowed local partial issued right after such a full-frame partial
+        // wedges the SSD1683 BUSY line for 4+ s). Every step inside the image
+        // layer is a whole-frame change too, so it always commits. Same-window
+        // navigation -- including body scroll -- uses the fast partial path;
+        // body over-scroll is bounded by the reducer clamp so reverse-scroll
+        // always reveals new content.
+        if (state->note_app.mode != old_note_mode ||
+            state->note_app.mode == wqn::NoteAppMode::kNoteImageView ||
+            state->note_app.notebook_window_start != old_notebook_window ||
+            state->note_app.note_list_window_start != old_note_list_window) {
+            return RefreshSchedule::kCommit;
+        }
         return RefreshSchedule::kSelection;
     }
     if (state->selected_home_task != old_home_task ||

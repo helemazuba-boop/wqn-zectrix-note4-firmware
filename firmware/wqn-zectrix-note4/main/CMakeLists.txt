@@ -14,6 +14,7 @@ idf_component_register(
         "power_manager.cpp"
         "power/wake_controller.cpp"
         "pcf8563.cpp"
+        "problem_cache.cpp"
         "provision_manager.cpp"
         "runtime/storage_schema.cpp"
         "services/connectivity_service.cpp"
@@ -26,6 +27,7 @@ idf_component_register(
         "time_app.cpp"
         "ui/battery.cpp"
         "ui/clock.cpp"
+        "ui/cloud_runner.cpp"
         "ui/diagnostics.cpp"
         "ui/graphics.cpp"
         "ui/page_ai.cpp"
@@ -37,16 +39,24 @@ idf_component_register(
         "ui/seven_segment.cpp"
         "ui/text_wrappers.cpp"
         "ui/todo_cloud.cpp"
+        "ui/note_cloud.cpp"
+        "ui/page_note.cpp"
         "ui/ui_input.cpp"
         "ui/ui_refresh.cpp"
         "ui/ui_render.cpp"
         "ui/ui_runtime.cpp"
         "ui/ui_state.cpp"
+        "ui/ui_widgets.cpp"
         "ui/word_cloud.cpp"
         "ui_model.cpp"
         "wifi_manager.cpp"
+        "note_pack.cpp"
+        "note_cloud.cpp"
+        "note_store.cpp"
+        "note_app.cpp"
         "word_pack.cpp"
         "word_app.cpp"
+        "word_study_store.cpp"
         "wqn_api.cpp"
         "wqn_api_stream.cpp"
         "flash_session.cpp"
@@ -64,6 +74,7 @@ idf_component_register(
         esp_event
         esp_netif
         esp_psram
+        esp_rom
         esp_driver_usb_serial_jtag
         esp_wifi
         wqn_wifi_provision

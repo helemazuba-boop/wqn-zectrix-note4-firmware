@@ -2,6 +2,7 @@
 // Extracted from device_ui.cpp.
 
 #include "ui_internal.h"
+#include "ui_widgets.h"
 
 #include <algorithm>
 
@@ -47,8 +48,9 @@ void DrawProgressBar(int x, int y, int width, int height, int current, int total
 
 void DrawConfigBox(int x, int y, int width, int height, const std::string& value, const std::string& label, bool selected)
 {
+    // Focus decoration: invert (ink-filled) when selected, plain outline when not.
     if (selected) {
-        FillRect(x, y, width, height, true);
+        DrawSelectionDecoration(x, y, width, height, SelectionStyle::kInvert);
     } else {
         DrawRect(x, y, width, height);
     }
@@ -60,10 +62,12 @@ void DrawConfigBox(int x, int y, int width, int height, const std::string& value
 
 void DrawActionBox(int x, int y, int width, const std::string& label, bool selected)
 {
+    constexpr int kActionBoxHeight = 28;
+    // Focus decoration: invert when selected, plain outline when not.
     if (selected) {
-        FillRect(x, y, width, 28, true);
+        DrawSelectionDecoration(x, y, width, kActionBoxHeight, SelectionStyle::kInvert);
     } else {
-        DrawRect(x, y, width, 28);
+        DrawRect(x, y, width, kActionBoxHeight);
     }
     DrawCenteredText(x, y + 6, width, label, !selected);
 }

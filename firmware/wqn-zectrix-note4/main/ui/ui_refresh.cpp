@@ -465,7 +465,18 @@ std::string FrameSignature(const wqn::UiFrame& frame)
         signature.append("|word:");
         signature.append(std::to_string(static_cast<int>(frame.word_app.mode)));
         signature.push_back('/');
+        signature.append(std::to_string(static_cast<int>(frame.word_app.card_phase)));
+        signature.push_back('/');
+        signature.append(std::to_string(static_cast<int>(frame.word_app.card_source)));
+        signature.push_back('/');
+        signature.append(std::to_string(static_cast<int>(frame.word_app.dictionary_stage)));
+        signature.push_back('/');
         signature.append(std::to_string(static_cast<int>(frame.word_app.home_selection)));
+        signature.push_back('/');
+        signature.append(
+            frame.word_app.sequential_session_resumable ? "1" : "0");
+        signature.append(
+            frame.word_app.random_session_resumable ? "1" : "0");
         signature.push_back('/');
         signature.append(std::to_string(frame.word_app.card_position));
         signature.push_back('/');
@@ -484,6 +495,68 @@ std::string FrameSignature(const wqn::UiFrame& frame)
         signature.append(std::to_string(frame.word_app.dictionary_match_selected));
         signature.push_back('/');
         signature.append(frame.word_app.hint);
+    }
+    if (frame.screen == wqn::UiScreen::kNote) {
+        // The note page renders entirely from frame.note_app (RenderNote adds no
+        // frame.lines), so every field that changes the drawn view must be in the
+        // signature or the dedup pipeline skips the repaint and the page looks
+        // frozen. Body text is identified by note_id (+ scroll offset) rather than
+        // hashing the full 16 KB body each frame.
+        const wqn::NoteAppSnapshot& note = frame.note_app;
+        signature.append("|note:");
+        signature.append(std::to_string(static_cast<int>(note.mode)));
+        signature.push_back('/');
+        signature.append(std::to_string(note.notebook_selected));
+        signature.push_back('/');
+        signature.append(std::to_string(note.note_list_selected));
+        signature.push_back('/');
+        signature.append(std::to_string(note.notebook_window_start));
+        signature.push_back('/');
+        signature.append(std::to_string(note.note_list_window_start));
+        signature.push_back('/');
+        signature.append(std::to_string(note.note_scroll_offset_lines));
+        signature.push_back('/');
+        signature.append(note.has_body ? "1" : "0");
+        signature.push_back('/');
+        signature.append(note.cloud_sync_failed ? "1" : "0");
+        signature.push_back('/');
+        signature.append(std::to_string(note.notebook_count));
+        signature.push_back('/');
+        signature.append(note.notebook_title);
+        signature.push_back('/');
+        signature.append(note.note_title);
+        signature.push_back('/');
+        signature.append(note.note_id);
+        // Image layer state: index/id/ready/error all repaint (download
+        // completion flips ready with no other field changing -- the classic
+        // "missing signature field freezes the page" trap).
+        signature.push_back('/');
+        signature.append(std::to_string(note.note_image_index));
+        signature.push_back(':');
+        signature.append(std::to_string(note.note_image_count));
+        signature.push_back(':');
+        signature.append(note.note_image_ready ? "1" : "0");
+        signature.push_back(':');
+        signature.append(note.note_image_error ? "1" : "0");
+        signature.push_back(':');
+        signature.append(note.note_image_id);
+        // status_line/hint are deliberately NOT part of the signature: the note
+        // page draws no footer, so transient boundary messages (已到顶部...)
+        // must not trigger a refresh that changes nothing visible.
+        for (const wqn::NoteNotebookRow& row : note.notebooks) {
+            signature.push_back('/');
+            signature.append(row.title);
+            signature.push_back(':');
+            signature.append(std::to_string(row.note_count));
+            signature.push_back(':');
+            signature.append(row.has_pack ? "1" : "0");
+        }
+        for (const wqn::NoteTitleRow& row : note.titles) {
+            signature.push_back('|');
+            signature.append(row.title);
+            signature.push_back(':');
+            signature.append(row.last_opened_at);
+        }
     }
     if (frame.screen == wqn::UiScreen::kSettings) {
         const wqn::SettingsDiagnosticsSnapshot& diag = frame.settings.diagnostics;

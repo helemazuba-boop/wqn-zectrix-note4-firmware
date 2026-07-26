@@ -2,6 +2,7 @@
 // Extracted from device_ui.cpp.
 
 #include "ui_internal.h"
+#include "ui_widgets.h"
 
 #include <algorithm>
 
@@ -15,7 +16,8 @@ constexpr char kTag[] = "wqn_ui";
 esp_err_t DrawMetricCard(int x, int y, int width, const wqn::HomeMetric& metric)
 {
     constexpr int kCardHeight = 55;
-    DrawRect(x, y, width, kCardHeight);
+    // Metric card uses the rounded container language (same r6 as todo/word cards).
+    DrawRoundedRect(x, y, width, kCardHeight, kRoundedOuterRadius);
     ESP_RETURN_ON_ERROR(DrawCenteredText(x, y + 8, width, metric.value), kTag, "draw home metric value");
     ESP_RETURN_ON_ERROR(DrawCenteredText(x, y + 31, width, metric.label), kTag, "draw home metric label");
     return ESP_OK;
@@ -24,25 +26,38 @@ esp_err_t DrawMetricCard(int x, int y, int width, const wqn::HomeMetric& metric)
 esp_err_t DrawHomeTaskRow(int x, int y, int width, int index, const wqn::HomeTask& task, bool selected)
 {
     constexpr int kRowHeight = 47;
+    // Index gutter: the task number is also the selection marker (same language
+    // as settings rows). Selected -> number sits on a reverse-filled rounded
+    // block; unselected -> plain number, no block.
+    constexpr int kIndexBlockW = 18;
+    constexpr int kIndexBlockH = 24;
+    constexpr int kIndexBlockYOff = (kRowHeight - kIndexBlockH) / 2;  // 11, vertically centered
     if (selected) {
-        FillRect(x - 4, y - 2, width + 8, kRowHeight, true);
+        DrawSelectionDecoration(x, y, width, kRowHeight, SelectionStyle::kInnerBorder);
+        // Index block: reverse-fill rounded chip behind the task number.
+        DrawSelectionDecoration(x, y + kIndexBlockYOff, kIndexBlockW, kIndexBlockH, SelectionStyle::kInvert);
+        // Index number in paper (white) on the block, centered in it.
+        ESP_RETURN_ON_ERROR(
+            DrawCenteredText(x, y + kIndexBlockYOff + 4, kIndexBlockW, std::to_string(index), false),
+            kTag,
+            "draw home task index");
+    } else {
+        // Unselected: plain ink number in its original position (left-aligned).
+        ESP_RETURN_ON_ERROR(
+            wqn::DrawUtf8Text(x, y + 4, std::to_string(index).c_str(), true),
+            kTag,
+            "draw home task index");
     }
-    const bool black_text = !selected;
-    const int text_width = width - 58;
+    ESP_RETURN_ON_ERROR(DrawClippedText(x + 20, y + 3, width - 58, task.title, true), kTag, "draw home task title");
     ESP_RETURN_ON_ERROR(
-        wqn::DrawUtf8Text(x, y + 4, std::to_string(index).c_str(), black_text),
-        kTag,
-        "draw home task index");
-    ESP_RETURN_ON_ERROR(DrawClippedText(x + 20, y + 3, text_width, task.title, black_text), kTag, "draw home task title");
-    ESP_RETURN_ON_ERROR(
-        DrawClippedText(x + 20, y + 24, text_width, task.subtitle, black_text),
+        DrawClippedText(x + 20, y + 24, width - 58, task.subtitle, true),
         kTag,
         "draw home task subtitle");
     if (!task.tag.empty()) {
         const int tag_width = std::min(48, std::max(32, wqn::MeasureUtf8TextWidth(task.tag.c_str()) + 8));
-        DrawRect(x + width - tag_width, y + 4, tag_width, 18);
+        DrawRoundedRect(x + width - tag_width, y + 4, tag_width, 18, kChipRadius);
         ESP_RETURN_ON_ERROR(
-            DrawCenteredText(x + width - tag_width, y + 5, tag_width, task.tag, black_text),
+            DrawCenteredText(x + width - tag_width, y + 5, tag_width, task.tag, true),
             kTag,
             "draw home task tag");
     }
@@ -52,7 +67,7 @@ esp_err_t DrawHomeTaskRow(int x, int y, int width, int index, const wqn::HomeTas
 esp_err_t RenderHomePrimaryRegion(const wqn::HomeSummary& home, RefreshSchedule schedule)
 {
     ClearRect(kHomePrimaryRect);
-    DrawRect(10, 35, 380, 26);
+    DrawRoundedRect(10, 35, 380, 26, kRoundedOuterRadius);
     ESP_RETURN_ON_ERROR(DrawCenteredText(10, 39, 380, home.primary_time_line), kTag, "draw home primary time region");
     return RefreshRegion(kHomePrimaryRect, schedule);
 }
@@ -68,11 +83,9 @@ esp_err_t RenderHomeToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
     const wqn::HomeSummary& home = frame.home;
     wqn::ClearEpdFramebuffer(true);
 
-    DrawHorizontalLine(0, 27, wqn::kEpdWidth);
-    ESP_RETURN_ON_ERROR(wqn::DrawUtf8Text(10, 6, "首页", true), kTag, "draw home title");
-    DrawStatusBarIcons(wqn::kEpdWidth - 10, 6, home);
+    DrawStatusBar("首页", home);
 
-    DrawRect(10, 35, 380, 26);
+    DrawRoundedRect(10, 35, 380, 26, kRoundedOuterRadius);
     ESP_RETURN_ON_ERROR(DrawCenteredText(10, 39, 380, home.primary_time_line), kTag, "draw home primary time");
 
     constexpr int kCardY = 69;

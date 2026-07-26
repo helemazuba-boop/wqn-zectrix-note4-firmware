@@ -2,6 +2,7 @@
 // Extracted from device_ui.cpp.
 
 #include "ui_internal.h"
+#include "ui_widgets.h"
 
 #include <algorithm>
 #include <string>
@@ -16,18 +17,36 @@ constexpr char kTag[] = "wqn_ui";
 esp_err_t DrawSettingsRow(size_t row_index, int y, const std::string& title, const std::string& value, bool selected)
 {
     constexpr int kX = 12;
+    constexpr int kContentX = kX + 7;            // row body starts after the index gutter
     constexpr int kWidth = 376;
+    constexpr int kContentWidth = kWidth - 7;
     constexpr int kHeight = 36;
+    // Index gutter: the row's 2-digit index is also the selection marker. When
+    // selected the index sits in a reverse-filled rounded block (the unified
+    // kInvert focus language, rounded chip shape) so the left gutter is no
+    // longer empty and the active row is obvious; unselected shows the plain
+    // index with no block.
+    constexpr int kIndexBlockX = kContentX + 4;  // 4px inside the row body
+    constexpr int kIndexBlockYOff = 6;            // offset from row top, centered in 36h
+    constexpr int kIndexBlockW = 36;
+    constexpr int kIndexBlockH = 24;
+    // Row outline: kInnerBorder when selected, plain DrawRect otherwise.
     if (selected) {
-        FillRect(kX, y, 4, kHeight, true);
-        DrawRect(kX + 7, y, kWidth - 7, kHeight);
-        DrawRect(kX + 9, y + 2, kWidth - 11, kHeight - 4);
+        DrawSelectionDecoration(kContentX, y, kContentWidth, kHeight, SelectionStyle::kInnerBorder);
+        // Index block: reverse-fill rounded chip behind the index number.
+        DrawSelectionDecoration(kIndexBlockX, y + kIndexBlockYOff, kIndexBlockW, kIndexBlockH, SelectionStyle::kInvert);
     } else {
-        DrawRect(kX + 7, y, kWidth - 7, kHeight);
+        DrawRect(kContentX, y, kContentWidth, kHeight);
     }
     char index_label[4] = {};
     std::snprintf(index_label, sizeof(index_label), "%02u", static_cast<unsigned>(row_index + 1));
-    ESP_RETURN_ON_ERROR(DrawClippedText(kX + 17, y + 10, 28, index_label), kTag, "draw settings index");
+    if (selected) {
+        // Index number in paper (white) on the reverse-fill block, centered in it.
+        ESP_RETURN_ON_ERROR(DrawCenteredText(kIndexBlockX, y + kIndexBlockYOff + 4, kIndexBlockW, index_label, false), kTag, "draw settings index");
+    } else {
+        // Unselected: plain ink index in its original position (left-aligned).
+        ESP_RETURN_ON_ERROR(DrawClippedText(kX + 17, y + 10, 28, index_label), kTag, "draw settings index");
+    }
     ESP_RETURN_ON_ERROR(DrawClippedText(kX + 52, y + 4, 174, title), kTag, "draw settings title");
     if (!value.empty()) {
         ESP_RETURN_ON_ERROR(DrawClippedText(kX + 52, y + 20, 214, value), kTag, "draw settings value");
@@ -44,7 +63,7 @@ esp_err_t DrawSettingsRow(size_t row_index, int y, const std::string& title, con
     } else if (row_index == 6) {
         tag = "重置";  // factory reset
     }
-    DrawRect(kX + 298, y + 8, 54, 20);
+    DrawRoundedRect(kX + 298, y + 8, 54, 20, kChipRadius);
     ESP_RETURN_ON_ERROR(DrawCenteredText(kX + 298, y + 10, 54, tag), kTag, "draw settings tag");
     return ESP_OK;
 }
@@ -52,8 +71,10 @@ esp_err_t DrawSettingsRow(size_t row_index, int y, const std::string& title, con
 esp_err_t DrawSettingsDialogBox(const std::string& title)
 {
     FillRect(68, 48, 264, 206, false);
-    DrawRect(68, 48, 264, 206);
-    DrawRect(70, 50, 260, 202);
+    // Dialog container: rounded double outline (the product's rounded dialog
+    // language, same r6 as cards/containers).
+    DrawRoundedRect(68, 48, 264, 206, kRoundedOuterRadius);
+    DrawRoundedRect(70, 50, 260, 202, kRoundedOuterRadius);
     DrawHorizontalLine(86, 80, 228);
     DrawHorizontalLine(86, 220, 228);
     ESP_RETURN_ON_ERROR(DrawCenteredText(86, 60, 228, title), kTag, "draw settings dialog title");
@@ -63,9 +84,13 @@ esp_err_t DrawSettingsDialogBox(const std::string& title)
 esp_err_t DrawSettingsOptionCard(int x, int y, int width, const std::string& label, bool selected)
 {
     constexpr int kHeight = 32;
-    DrawRect(x, y, width, kHeight);
+    // Focus: kRoundedInnerBorder (rounded chip-like card, low flicker) when
+    // selected, plain rounded outline otherwise. These are the small 96x32
+    // dialog option chips, so they follow the chip/card rounded language.
     if (selected) {
-        DrawRect(x + 2, y + 2, width - 4, kHeight - 4);
+        DrawSelectionDecoration(x, y, width, kHeight, SelectionStyle::kRoundedInnerBorder);
+    } else {
+        DrawRoundedRect(x, y, width, kHeight, kChipRadius);
     }
     return DrawCenteredText(x, y + 9, width, label);
 }

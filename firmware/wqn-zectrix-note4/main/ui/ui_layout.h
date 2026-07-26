@@ -32,11 +32,33 @@ constexpr int kContentTopY = 35;                // first content row below statu
 constexpr int kContentWidth = kScreenWidth - 2 * kMarginX;  // 380
 constexpr int kBottomHintY = 278;               // y of bottom hint / footer line
 
-// ---- Selection style (see §13.4.3 - by interaction semantics) ----
+// ---- Selection style (focus decoration, not interaction timing) ----
+//
+// The enum only describes HOW a focused control is decorated visually.
+// Whether an input fires immediately or persists is the interaction model's
+// concern and MUST NOT be encoded here. The choice between styles is by
+// control shape + e-paper flicker cost:
+//   kInvert              — high-salience focus for small, compact, operable
+//                          targets (status-bar editable controls, time config
+//                          fields, action buttons, dictionary lookup choices)
+//   kInnerBorder         — low-flicker focus for square rows / grid cells /
+//                          list options (2px-inset double border)
+//   kRoundedInnerBorder  — low-flicker focus for rounded cards (outer r6 +
+//                          selected r4 concentric). Card shape owns the round.
 enum class SelectionStyle {
     kNone,
-    kInvert,        // reverse-fill: transient / about-to-execute (action buttons, editing fields)
-    kInnerBorder,   // 2px-inset double border: persistent selection (list rows, cards, dialog options)
+    kInvert,
+    kInnerBorder,
+    kRoundedInnerBorder,
+};
+
+// ---- Geometry rect (owned here so decoration/UI layers share one type) ----
+struct UiRect {
+    int x;
+    int y;
+    int width;
+    int height;
+    const char* name;
 };
 
 }  // namespace device_ui_internal

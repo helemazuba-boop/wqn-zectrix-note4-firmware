@@ -166,9 +166,15 @@ esp_err_t RefreshFrame(const wqn::UiFrame& frame, RefreshSchedule schedule)
     ESP_LOGI(kTag, "RefreshFrame: enter schedule=%s screen=%d last_rendered_screen=%d",
              RefreshScheduleName(schedule), static_cast<int>(frame.screen),
              static_cast<int>(g_last_rendered_screen));
+    // [epd-wedge-fix] kSelection deliberately does NOT allow the windowed
+    // local partial: every BUSY wedge across all HIL sessions (5+ multi-second
+    // stalls) was an 'EPD local partial failed' on a selection flip, while
+    // full-frame partials never wedged -- and both cost the same on this panel
+    // (LP 366-772ms vs FFP 408-772ms; the DRF waveform dominates). Clock/timer
+    // ticks keep the local path: tiny diffs, power-sensitive, never wedged.
     const bool allow_local_partial =
         schedule == RefreshSchedule::kClock || schedule == RefreshSchedule::kTimer ||
-        schedule == RefreshSchedule::kSelection || schedule == RefreshSchedule::kConfig;
+        schedule == RefreshSchedule::kConfig;
     // [power-fix] Force a full refresh when:
     //   (a) the panel is being shown a genuinely different screen, OR
     //   (b) the producer asked for kCommit (used for screen transitions,

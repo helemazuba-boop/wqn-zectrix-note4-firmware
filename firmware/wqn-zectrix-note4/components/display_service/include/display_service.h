@@ -23,6 +23,10 @@ esp_err_t InitEpdDisplay();
 // private to the service; clients receive drawing operations, not a pointer.
 void ClearEpdFramebuffer(bool white = true);
 void DrawEpdPixel(int x, int y, bool black);
+// Copies a full pre-rendered 1bpp frame (kEpdFramebufferSize bytes, same
+// row-major/MSB-first/1=white layout as the framebuffer) in one memcpy.
+// Server-rendered note images (WQNI payloads) display through this.
+void BlitEpdFramebuffer(const uint8_t* bitmap, size_t size);
 
 esp_err_t DrawUtf8Text(int x, int y, const char* text, bool black = true);
 int MeasureUtf8TextWidth(const char* text);

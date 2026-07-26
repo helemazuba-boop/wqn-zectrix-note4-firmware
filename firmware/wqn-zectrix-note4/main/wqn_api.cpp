@@ -3,17 +3,22 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <limits>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "cJSON.h"
 #include "config.h"
+#include "device_protocol/note_study.h"
+#include "device_protocol/word_study.h"
 #include "esp_check.h"
 #include "esp_crt_bundle.h"
+#include "esp_heap_caps.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
 #include "esp_mac.h"
@@ -22,20 +27,159 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "mbedtls/sha256.h"
+#include "miniz.h"
 #include "services/connectivity_service.h"
 #include "storage.h"
 #include "text_render.h"
 
 namespace {
 
+// Streaming zlib inflater bridging compressed HTTP chunks to a plaintext
+// sink. Pack downloads are zlib transport-coded (the manifest advertises
+// compression=zlib); the SHA/byte_size contract stays on the uncompressed
+// JSONL, so this inflates in front of the existing sink (which hashes and
+// writes plaintext exactly as before). Uses the ESP32-S3 ROM tinfl (miniz)
+// decompressor: zero flash cost, a ~11 KB state + 32 KB dictionary in PSRAM.
+class TinflStreamInflater {
+public:
+    ~TinflStreamInflater()
+    {
+        heap_caps_free(decompressor_);
+        heap_caps_free(dictionary_);
+    }
+
+    esp_err_t Init(uint64_t max_out)
+    {
+        decompressor_ = static_cast<tinfl_decompressor*>(heap_caps_malloc(
+            sizeof(tinfl_decompressor), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        if (decompressor_ == nullptr) {
+            decompressor_ = static_cast<tinfl_decompressor*>(
+                heap_caps_malloc(sizeof(tinfl_decompressor), MALLOC_CAP_8BIT));
+        }
+        dictionary_ = static_cast<uint8_t*>(heap_caps_malloc(
+            TINFL_LZ_DICT_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        if (dictionary_ == nullptr) {
+            dictionary_ = static_cast<uint8_t*>(
+                heap_caps_malloc(TINFL_LZ_DICT_SIZE, MALLOC_CAP_8BIT));
+        }
+        if (decompressor_ == nullptr || dictionary_ == nullptr) {
+            return ESP_ERR_NO_MEM;
+        }
+        tinfl_init(decompressor_);
+        max_out_ = max_out;
+        return ESP_OK;
+    }
+
+    // Feeds one compressed chunk; emits every produced plaintext span to the
+    // sink. `final_chunk` clears TINFL_FLAG_HAS_MORE_INPUT for the tail call.
+    esp_err_t Feed(
+        const uint8_t* data,
+        size_t size,
+        bool final_chunk,
+        wqn::WqnHttpChunkSink sink,
+        void* context)
+    {
+        size_t in_ofs = 0;
+        while (true) {
+            size_t in_bytes = size - in_ofs;
+            size_t out_bytes = TINFL_LZ_DICT_SIZE - dict_ofs_;
+            const int flags = TINFL_FLAG_PARSE_ZLIB_HEADER |
+                (final_chunk ? 0 : TINFL_FLAG_HAS_MORE_INPUT);
+            const tinfl_status status = tinfl_decompress(
+                decompressor_, data + in_ofs, &in_bytes, dictionary_,
+                dictionary_ + dict_ofs_, &out_bytes, flags);
+            in_ofs += in_bytes;
+            if (out_bytes > 0) {
+                total_out_ += out_bytes;
+                if (total_out_ > max_out_) {
+                    return ESP_ERR_INVALID_SIZE;
+                }
+                const esp_err_t sink_result =
+                    sink(context, dictionary_ + dict_ofs_, out_bytes);
+                if (sink_result != ESP_OK) {
+                    return sink_result;
+                }
+                dict_ofs_ = (dict_ofs_ + out_bytes) & (TINFL_LZ_DICT_SIZE - 1);
+            }
+            if (status == TINFL_STATUS_DONE) {
+                done_ = true;
+                return ESP_OK;
+            }
+            if (status < TINFL_STATUS_DONE) {
+                return ESP_ERR_INVALID_RESPONSE;
+            }
+            if (status == TINFL_STATUS_NEEDS_MORE_INPUT && in_ofs >= size) {
+                return ESP_OK;
+            }
+            if (in_ofs >= size && out_bytes == 0) {
+                // No forward progress possible without more input.
+                return final_chunk ? ESP_ERR_INVALID_RESPONSE : ESP_OK;
+            }
+        }
+    }
+
+    bool done() const { return done_; }
+    uint64_t total_out() const { return total_out_; }
+
+private:
+    tinfl_decompressor* decompressor_ = nullptr;
+    uint8_t* dictionary_ = nullptr;
+    size_t dict_ofs_ = 0;
+    uint64_t total_out_ = 0;
+    uint64_t max_out_ = 0;
+    bool done_ = false;
+};
+
+}  // namespace
+
+namespace {
+
 constexpr char kTag[] = "wqn_api";
 constexpr int kHttpTimeoutMs = 10000;
+constexpr int kWordSessionHttpTimeoutMs = 30000;
 constexpr TickType_t kWifiConnectTimeout = pdMS_TO_TICKS(30000);
 constexpr TickType_t kSntpSyncTimeout = pdMS_TO_TICKS(15000);
 constexpr TickType_t kPollDelay = pdMS_TO_TICKS(2000);
 constexpr int kPollAttempts = 60;
 constexpr size_t kProblemPreviewChars = 240;
 constexpr std::time_t kMinReasonableUnixTime = 1704067200;  // 2024-01-01 UTC
+
+bool GetRequiredSafeUint64(cJSON* object, const char* key, uint64_t* value)
+{
+    if (!cJSON_IsObject(object) || key == nullptr || value == nullptr) {
+        return false;
+    }
+    cJSON* item = cJSON_GetObjectItemCaseSensitive(object, key);
+    if (!cJSON_IsNumber(item) || !std::isfinite(item->valuedouble) ||
+        item->valuedouble < 0 ||
+        item->valuedouble > static_cast<double>(wqn::protocol::v3::kMaxSafeJsonInteger) ||
+        std::floor(item->valuedouble) != item->valuedouble) {
+        return false;
+    }
+    *value = static_cast<uint64_t>(item->valuedouble);
+    return true;
+}
+
+bool GetRequiredSafeUint32(cJSON* object, const char* key, uint32_t* value)
+{
+    uint64_t parsed = 0;
+    if (!GetRequiredSafeUint64(object, key, &parsed) ||
+        parsed > std::numeric_limits<uint32_t>::max()) {
+        return false;
+    }
+    *value = static_cast<uint32_t>(parsed);
+    return true;
+}
+
+bool IsLowercaseSha256(const std::string& value)
+{
+    if (value.size() != 64) {
+        return false;
+    }
+    return std::all_of(value.begin(), value.end(), [](unsigned char ch) {
+        return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f');
+    });
+}
 
 std::string StableRequestIdForBody(const std::string& body)
 {
@@ -195,7 +339,8 @@ esp_err_t HttpRequest(
     int* status_code,
     std::string* response_body,
     const char* protocol = nullptr,
-    const std::string* request_id = nullptr)
+    const std::string* request_id = nullptr,
+    int timeout_ms = kHttpTimeoutMs)
 {
     if (status_code == nullptr || response_body == nullptr) {
         return ESP_ERR_INVALID_ARG;
@@ -209,7 +354,7 @@ esp_err_t HttpRequest(
     esp_http_client_config_t config = {};
     config.url = url.c_str();
     config.method = is_post ? HTTP_METHOD_POST : HTTP_METHOD_GET;
-    config.timeout_ms = kHttpTimeoutMs;
+    config.timeout_ms = timeout_ms;
     config.crt_bundle_attach = esp_crt_bundle_attach;
     config.buffer_size = 2048;
     config.buffer_size_tx = 1024;
@@ -696,44 +841,6 @@ bool IsValidWordStatus(const std::string& status)
            status == "mastered";
 }
 
-esp_err_t ParseWordDeckObject(cJSON* item, int index, wqn::WqnWordDeck* deck)
-{
-    if (!cJSON_IsObject(item) || deck == nullptr) {
-        ESP_LOGW(kTag, "word deck response contains non-object at index=%d", index);
-        return ESP_FAIL;
-    }
-
-    wqn::WqnWordDeck parsed;
-    parsed.id = GetOptionalString(item, "id");
-    parsed.title = GetOptionalString(item, "title");
-    parsed.description = GetOptionalString(item, "description");
-    parsed.source = GetOptionalString(item, "source");
-    parsed.language = GetOptionalString(item, "language");
-    parsed.target_language = GetOptionalString(item, "target_language");
-    parsed.updated_at = GetOptionalString(item, "updated_at");
-    parsed.is_system = GetOptionalBool(item, "is_system");
-    parsed.deleted = GetOptionalBool(item, "deleted");
-    parsed.revision = GetOptionalInt(item, "revision");
-    parsed.word_count = GetOptionalInt(item, "word_count");
-    parsed.due_count = GetOptionalInt(item, "due_count");
-    parsed.mastered_count = GetOptionalInt(item, "mastered_count");
-
-    if (parsed.id.empty()) {
-        ESP_LOGW(kTag, "word deck missing id at index=%d", index);
-        return ESP_FAIL;
-    }
-    if (!parsed.deleted && parsed.title.empty()) {
-        ESP_LOGW(kTag, "word deck missing title at index=%d", index);
-        return ESP_FAIL;
-    }
-    if (parsed.source.empty()) {
-        parsed.source = parsed.is_system ? "system" : "user";
-    }
-
-    *deck = std::move(parsed);
-    return ESP_OK;
-}
-
 esp_err_t ParseWordEntryObject(cJSON* item, int index, wqn::WqnWordEntry* entry)
 {
     if (!cJSON_IsObject(item) || entry == nullptr) {
@@ -773,44 +880,6 @@ esp_err_t ParseWordEntryObject(cJSON* item, int index, wqn::WqnWordEntry* entry)
     return ESP_OK;
 }
 
-esp_err_t ParseWordProgressObject(cJSON* item, int index, wqn::WqnWordProgress* progress)
-{
-    if (!cJSON_IsObject(item) || progress == nullptr) {
-        ESP_LOGW(kTag, "word progress response contains non-object at index=%d", index);
-        return ESP_FAIL;
-    }
-
-    wqn::WqnWordProgress parsed;
-    parsed.word_id = GetOptionalString(item, "word_id");
-    if (parsed.word_id.empty()) {
-        parsed.word_id = GetOptionalString(item, "word_entry_id");
-    }
-    if (parsed.word_id.empty()) {
-        parsed.word_id = GetOptionalString(item, "id");
-    }
-    parsed.status = GetOptionalString(item, "status");
-    parsed.due_at = GetOptionalString(item, "due_at");
-    parsed.interval_days = GetOptionalInt(item, "interval_days");
-    parsed.correct_streak = GetOptionalInt(item, "correct_streak");
-    parsed.lapses = GetOptionalInt(item, "lapses");
-    parsed.reviewed_count = GetOptionalInt(item, "reviewed_count");
-    parsed.known_count = GetOptionalInt(item, "known_count");
-    parsed.unknown_count = GetOptionalInt(item, "unknown_count");
-    parsed.revision = GetOptionalInt(item, "revision");
-
-    if (parsed.word_id.empty()) {
-        ESP_LOGW(kTag, "word progress missing word_id at index=%d", index);
-        return ESP_FAIL;
-    }
-    if (!IsValidWordStatus(parsed.status)) {
-        ESP_LOGW(kTag, "word progress unsupported status=%s at index=%d", parsed.status.c_str(), index);
-        return ESP_FAIL;
-    }
-
-    *progress = std::move(parsed);
-    return ESP_OK;
-}
-
 esp_err_t ParseWordPackManifestItem(cJSON* item, int index, wqn::WqnWordPackManifestItem* pack)
 {
     if (!cJSON_IsObject(item) || pack == nullptr) {
@@ -825,42 +894,45 @@ esp_err_t ParseWordPackManifestItem(cJSON* item, int index, wqn::WqnWordPackMani
     }
     parsed.deck_id = GetOptionalString(item, "deck_id");
     parsed.title = GetOptionalString(item, "title");
-    parsed.revision = GetOptionalString(item, "revision");
-    if (parsed.revision.empty()) {
-        const int revision = GetOptionalInt(item, "revision");
-        if (revision > 0) {
-            parsed.revision = std::to_string(revision);
-        }
-    }
-    parsed.schema_version = GetOptionalString(item, "schema_version");
-    if (parsed.schema_version.empty()) {
-        const int schema_version = GetOptionalInt(item, "schema_version");
-        if (schema_version > 0) {
-            parsed.schema_version = std::to_string(schema_version);
-        }
-    }
     parsed.format = GetOptionalString(item, "format");
     parsed.compression = GetOptionalString(item, "compression");
     parsed.sha256 = GetOptionalString(item, "sha256");
     parsed.download_url = GetOptionalString(item, "download_url");
-    parsed.entry_count = GetOptionalInt(item, "entry_count");
-    parsed.byte_size = GetOptionalInt(item, "byte_size");
-    if (parsed.byte_size <= 0) {
-        parsed.byte_size = GetOptionalInt(item, "bytes");
+
+    if (!GetRequiredSafeUint64(item, "revision", &parsed.revision)) {
+        ESP_LOGW(kTag, "word pack revision is not an exact safe integer at index=%d", index);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    if (!GetRequiredSafeUint64(item, "content_revision", &parsed.content_revision)) {
+        parsed.content_revision = parsed.revision;
+    }
+    if (!GetRequiredSafeUint64(item, "pack_revision", &parsed.pack_revision)) {
+        parsed.pack_revision = parsed.revision;
+    }
+    if (!GetRequiredSafeUint64(item, "change_sequence", &parsed.change_sequence)) {
+        parsed.change_sequence = 0;
+    }
+    if (!GetRequiredSafeUint32(item, "schema_version", &parsed.schema_version) ||
+        !GetRequiredSafeUint32(item, "entry_count", &parsed.entry_count) ||
+        !GetRequiredSafeUint32(item, "byte_size", &parsed.byte_size)) {
+        ESP_LOGW(kTag, "word pack manifest has invalid bounded counters at index=%d", index);
+        return ESP_ERR_INVALID_RESPONSE;
     }
 
-    if (parsed.pack_id.empty() || parsed.deck_id.empty() || parsed.sha256.empty() || parsed.download_url.empty()) {
-        ESP_LOGW(kTag, "word pack manifest item missing required fields at index=%d", index);
-        return ESP_FAIL;
-    }
-    if (parsed.format.empty()) {
-        parsed.format = "jsonl";
-    }
-    if (parsed.compression.empty()) {
-        parsed.compression = "none";
-    }
-    if (parsed.schema_version.empty()) {
-        parsed.schema_version = "1";
+    if (parsed.pack_id.empty() || parsed.deck_id.empty() ||
+        !IsLowercaseSha256(parsed.sha256) || parsed.download_url.empty() ||
+        parsed.schema_version != wqn::protocol::word_study_v1::kPackSchemaVersion ||
+        parsed.format != "jsonl" ||
+        // Transport coding: the server always sends zlib, but this parser also
+        // validates locally persisted manifests, and items rebuilt from on-disk
+        // packs report none (bytes at rest are plaintext). Rejecting none here
+        // turned every manifest load into a cache reset + full re-sync loop.
+        (parsed.compression != "zlib" && parsed.compression != "none") ||
+        parsed.entry_count > wqn::protocol::word_study_v1::kMaxPackEntries ||
+        parsed.byte_size == 0 ||
+        parsed.byte_size > wqn::protocol::word_study_v1::kMaxPackBytes) {
+        ESP_LOGW(kTag, "word pack manifest item violates v2 contract at index=%d", index);
+        return ESP_ERR_INVALID_RESPONSE;
     }
 
     *pack = std::move(parsed);
@@ -890,45 +962,6 @@ void ParseLooseWordEntry(cJSON* item, wqn::WqnWordEntry* word)
     word->status = GetOptionalString(item, "status");
     word->due_at = GetOptionalString(item, "due_at");
     word->revision = GetOptionalInt(item, "revision");
-}
-
-void ParseWordReviewActions(cJSON* array, std::vector<wqn::WqnWordReviewResultAction>* actions)
-{
-    if (actions == nullptr) {
-        return;
-    }
-    actions->clear();
-    if (!cJSON_IsArray(array)) {
-        return;
-    }
-
-    const int count = cJSON_GetArraySize(array);
-    actions->reserve(count);
-    for (int i = 0; i < count; ++i) {
-        cJSON* item = cJSON_GetArrayItem(array, i);
-        if (!cJSON_IsObject(item)) {
-            ESP_LOGW(kTag, "word review action contains non-object at index=%d", i);
-            continue;
-        }
-
-        wqn::WqnWordReviewResultAction action;
-        action.type = GetOptionalString(item, "type");
-        action.word_id = GetOptionalString(item, "word_id");
-        if (action.word_id.empty()) {
-            action.word_id = GetOptionalString(item, "word_entry_id");
-        }
-        action.word = GetOptionalString(item, "word");
-        action.problem_set_id = GetOptionalString(item, "problem_set_id");
-        action.problem_id = GetOptionalString(item, "problem_id");
-        action.deck_id = GetOptionalString(item, "deck_id");
-        action.title = GetOptionalString(item, "title");
-        action.status = GetOptionalString(item, "status");
-        action.outcome = GetOptionalString(item, "outcome");
-        action.due_at = GetOptionalString(item, "due_at");
-        if (!action.type.empty()) {
-            actions->push_back(std::move(action));
-        }
-    }
 }
 
 esp_err_t ParseProblemObject(cJSON* item, int index, wqn::WqnProblem* problem)
@@ -1226,156 +1259,6 @@ esp_err_t ParseTodoCompleteResponseImpl(const std::string& body, wqn::WqnTodoIte
     return ESP_OK;
 }
 
-esp_err_t ParseWordSyncResponseImpl(const std::string& body, wqn::WqnWordSyncPage* page)
-{
-    if (page == nullptr) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    *page = wqn::WqnWordSyncPage{};
-
-    JsonDocument document(body);
-    if (!document.ok()) {
-        ESP_LOGW(kTag, "word sync response is not valid JSON");
-        return ESP_FAIL;
-    }
-
-    cJSON* data = cJSON_GetObjectItemCaseSensitive(document.root(), "data");
-    if (!GetSuccess(document.root()) || !cJSON_IsObject(data)) {
-        ESP_LOGW(kTag, "word sync response missing success/data");
-        return ESP_FAIL;
-    }
-
-    page->cursor = GetOptionalString(data, "cursor");
-    page->server_time = GetOptionalString(data, "server_time");
-
-    cJSON* decks = cJSON_GetObjectItemCaseSensitive(data, "decks");
-    cJSON* entries = cJSON_GetObjectItemCaseSensitive(data, "entries");
-    cJSON* progress = cJSON_GetObjectItemCaseSensitive(data, "progress");
-    if ((decks != nullptr && !cJSON_IsArray(decks)) ||
-        (entries != nullptr && !cJSON_IsArray(entries)) ||
-        (progress != nullptr && !cJSON_IsArray(progress))) {
-        ESP_LOGW(kTag, "word sync response has invalid array fields");
-        return ESP_FAIL;
-    }
-
-    if (cJSON_IsArray(decks)) {
-        const int count = cJSON_GetArraySize(decks);
-        page->decks.reserve(count);
-        for (int i = 0; i < count; ++i) {
-            wqn::WqnWordDeck deck;
-            const esp_err_t parsed = ParseWordDeckObject(cJSON_GetArrayItem(decks, i), i, &deck);
-            if (parsed != ESP_OK) {
-                ESP_LOGW(kTag, "skip invalid word deck at index=%d", i);
-                continue;
-            }
-            page->decks.push_back(std::move(deck));
-        }
-    }
-
-    if (cJSON_IsArray(entries)) {
-        const int count = cJSON_GetArraySize(entries);
-        page->entries.reserve(count);
-        for (int i = 0; i < count; ++i) {
-            wqn::WqnWordEntry entry;
-            const esp_err_t parsed = ParseWordEntryObject(cJSON_GetArrayItem(entries, i), i, &entry);
-            if (parsed != ESP_OK) {
-                ESP_LOGW(kTag, "skip invalid word entry at index=%d", i);
-                continue;
-            }
-            page->entries.push_back(std::move(entry));
-        }
-    }
-
-    if (cJSON_IsArray(progress)) {
-        const int count = cJSON_GetArraySize(progress);
-        page->progress.reserve(count);
-        for (int i = 0; i < count; ++i) {
-            wqn::WqnWordProgress item;
-            const esp_err_t parsed = ParseWordProgressObject(cJSON_GetArrayItem(progress, i), i, &item);
-            if (parsed != ESP_OK) {
-                ESP_LOGW(kTag, "skip invalid word progress at index=%d", i);
-                continue;
-            }
-            page->progress.push_back(std::move(item));
-        }
-    }
-
-    return ESP_OK;
-}
-
-esp_err_t ParseWordReviewQueueResponseImpl(const std::string& body, wqn::WqnWordReviewQueue* queue)
-{
-    if (queue == nullptr) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    *queue = wqn::WqnWordReviewQueue{};
-
-    JsonDocument document(body);
-    if (!document.ok()) {
-        ESP_LOGW(kTag, "word review queue response is not valid JSON");
-        return ESP_FAIL;
-    }
-
-    cJSON* data = cJSON_GetObjectItemCaseSensitive(document.root(), "data");
-    cJSON* words = cJSON_GetObjectItemCaseSensitive(data, "words");
-    if (!GetSuccess(document.root()) || !cJSON_IsObject(data) || !cJSON_IsArray(words)) {
-        ESP_LOGW(kTag, "word review queue response missing success/data/words");
-        return ESP_FAIL;
-    }
-
-    queue->mode = GetOptionalString(data, "mode");
-    queue->daily_target = GetOptionalInt(data, "daily_target");
-    queue->reviewed_today = GetOptionalInt(data, "reviewed_today");
-    queue->due_count = GetOptionalInt(data, "due_count");
-
-    const int count = cJSON_GetArraySize(words);
-    queue->words.reserve(count);
-    for (int i = 0; i < count; ++i) {
-        wqn::WqnWordEntry word;
-        const esp_err_t parsed = ParseWordEntryObject(cJSON_GetArrayItem(words, i), i, &word);
-        if (parsed != ESP_OK) {
-            ESP_LOGW(kTag, "skip invalid review word at index=%d", i);
-            continue;
-        }
-        queue->words.push_back(std::move(word));
-    }
-
-    return ESP_OK;
-}
-
-esp_err_t ParseWordReviewSubmitResponseImpl(const std::string& body, wqn::WqnWordReviewSubmitResult* result)
-{
-    if (result == nullptr) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    *result = wqn::WqnWordReviewSubmitResult{};
-
-    JsonDocument document(body);
-    if (!document.ok()) {
-        ESP_LOGW(kTag, "word review submit response is not valid JSON");
-        return ESP_FAIL;
-    }
-
-    cJSON* data = cJSON_GetObjectItemCaseSensitive(document.root(), "data");
-    if (!GetSuccess(document.root()) || !cJSON_IsObject(data)) {
-        ESP_LOGW(kTag, "word review submit response missing success/data");
-        return ESP_FAIL;
-    }
-
-    result->word_id = GetOptionalString(data, "word_id");
-    if (result->word_id.empty()) {
-        result->word_id = GetOptionalString(data, "word_entry_id");
-    }
-    result->status = GetOptionalString(data, "status");
-    result->due_at = GetOptionalString(data, "due_at");
-    if (result->word_id.empty() || !IsValidWordStatus(result->status)) {
-        ESP_LOGW(kTag, "word review submit response missing word_id or has invalid status");
-        return ESP_FAIL;
-    }
-    ParseWordReviewActions(cJSON_GetObjectItemCaseSensitive(data, "actions"), &result->actions);
-    return ESP_OK;
-}
-
 esp_err_t ParseWordSearchResponseImpl(const std::string& body, wqn::WqnWordSearchResult* result)
 {
     if (result == nullptr) {
@@ -1449,14 +1332,26 @@ esp_err_t ParseWordPackManifestResponseImpl(const std::string& body, wqn::WqnWor
     }
 
     manifest->server_time = GetOptionalString(data, "server_time");
+    cJSON* cursor = cJSON_GetObjectItemCaseSensitive(data, "cursor");
+    if (cursor != nullptr &&
+        !GetRequiredSafeUint64(data, "cursor", &manifest->cursor)) {
+        ESP_LOGW(kTag, "word pack manifest cursor is invalid");
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    cJSON* has_more = cJSON_GetObjectItemCaseSensitive(data, "has_more");
+    if (has_more != nullptr && !cJSON_IsBool(has_more)) {
+        ESP_LOGW(kTag, "word pack manifest has_more is invalid");
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    manifest->has_more = cJSON_IsTrue(has_more);
     const int count = cJSON_GetArraySize(packs);
     manifest->packs.reserve(count);
     for (int i = 0; i < count; ++i) {
         wqn::WqnWordPackManifestItem item;
         const esp_err_t parsed = ParseWordPackManifestItem(cJSON_GetArrayItem(packs, i), i, &item);
         if (parsed != ESP_OK) {
-            ESP_LOGW(kTag, "skip invalid word pack manifest item at index=%d", i);
-            continue;
+            ESP_LOGW(kTag, "reject invalid word pack manifest item at index=%d", i);
+            return parsed;
         }
         manifest->packs.push_back(std::move(item));
     }
@@ -1531,24 +1426,6 @@ std::string BuildTodoListPath(const wqn::WqnTodoTimelineRequest& request)
 int ClampRequestLimit(int value, int fallback, int maximum)
 {
     return std::clamp(value > 0 ? value : fallback, 1, maximum);
-}
-
-std::string BuildWordSyncPath(const wqn::WqnWordSyncRequest& request)
-{
-    const int limit = ClampRequestLimit(request.limit, 200, 200);
-    std::string path = "/words/sync?";
-    if (!request.cursor.empty()) {
-        path += "since=" + UrlEncode(request.cursor) + "&";
-    }
-    path += "limit=" + std::to_string(limit);
-    return path;
-}
-
-std::string BuildWordReviewQueuePath(const wqn::WqnWordReviewQueueRequest& request)
-{
-    const std::string mode = request.mode.empty() ? "sequential" : request.mode;
-    const int limit = ClampRequestLimit(request.limit, 20, 50);
-    return "/words/review?mode=" + UrlEncode(mode) + "&limit=" + std::to_string(limit);
 }
 
 std::string BuildWordSearchPath(const wqn::WqnWordSearchRequest& request)
@@ -1665,32 +1542,6 @@ esp_err_t BuildTodoCompleteBody(const std::string& todo_id, std::string* body)
     }
 
     cJSON_AddStringToObject(root, "todo_id", todo_id.c_str());
-
-    char* rendered = cJSON_PrintUnformatted(root);
-    cJSON_Delete(root);
-    if (rendered == nullptr) {
-        return ESP_ERR_NO_MEM;
-    }
-    *body = rendered;
-    cJSON_free(rendered);
-    return ESP_OK;
-}
-
-esp_err_t BuildWordReviewBody(const wqn::WqnWordReviewSubmission& submission, std::string* body)
-{
-    if (body == nullptr || submission.word_id.empty() || submission.outcome.empty()) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    body->clear();
-
-    cJSON* root = cJSON_CreateObject();
-    if (root == nullptr) {
-        return ESP_ERR_NO_MEM;
-    }
-
-    cJSON_AddStringToObject(root, "word_id", submission.word_id.c_str());
-    cJSON_AddStringToObject(root, "outcome", submission.outcome.c_str());
-    cJSON_AddStringToObject(root, "mode", submission.mode.empty() ? "sequential" : submission.mode.c_str());
 
     char* rendered = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
@@ -2324,116 +2175,6 @@ esp_err_t CompleteTodo(const std::string& token, const std::string& todo_id, Wqn
     return ESP_OK;
 }
 
-esp_err_t FetchWordSync(const std::string& token, const WqnWordSyncRequest& request, WqnWordSyncPage* page)
-{
-    if (page == nullptr) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    *page = WqnWordSyncPage{};
-    if (token.empty()) {
-        return ESP_OK;
-    }
-    const esp_err_t token_result = ValidateTokenOrClear(token, "word-sync");
-    if (token_result != ESP_OK) {
-        return token_result;
-    }
-
-    ESP_RETURN_ON_ERROR(WaitForNetworkReadyForHttps(), kTag, "prepare network for word-sync");
-
-    const std::string url = BuildUrl(BuildWordSyncPath(request));
-    int status_code = 0;
-    std::string body;
-    esp_err_t result = HttpRequest("GET", url, &token, nullptr, &status_code, &body);
-    if (result != ESP_OK) {
-        ESP_LOGW(kTag, "word-sync failed: %s", esp_err_to_name(result));
-        return result;
-    }
-    if (status_code == 401) {
-        return ClearTokenOnUnauthorized("word-sync");
-    }
-    if (status_code != 200) {
-        ESP_LOGW(kTag, "word-sync HTTP status=%d", status_code);
-        return ESP_FAIL;
-    }
-
-    return ParseWordSyncResponse(body, page);
-}
-
-esp_err_t FetchWordReviewQueue(const std::string& token, const WqnWordReviewQueueRequest& request, WqnWordReviewQueue* queue)
-{
-    if (queue == nullptr) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    *queue = WqnWordReviewQueue{};
-    if (token.empty()) {
-        return ESP_OK;
-    }
-    const esp_err_t token_result = ValidateTokenOrClear(token, "word-review-list");
-    if (token_result != ESP_OK) {
-        return token_result;
-    }
-
-    ESP_RETURN_ON_ERROR(WaitForNetworkReadyForHttps(), kTag, "prepare network for word-review-list");
-
-    const std::string url = BuildUrl(BuildWordReviewQueuePath(request));
-    int status_code = 0;
-    std::string body;
-    esp_err_t result = HttpRequest("GET", url, &token, nullptr, &status_code, &body);
-    if (result != ESP_OK) {
-        ESP_LOGW(kTag, "word-review-list failed: %s", esp_err_to_name(result));
-        return result;
-    }
-    if (status_code == 401) {
-        return ClearTokenOnUnauthorized("word-review-list");
-    }
-    if (status_code != 200) {
-        ESP_LOGW(kTag, "word-review-list HTTP status=%d", status_code);
-        return ESP_FAIL;
-    }
-
-    return ParseWordReviewQueueResponse(body, queue);
-}
-
-esp_err_t SubmitWordReview(const std::string& token, const WqnWordReviewSubmission& submission, WqnWordReviewSubmitResult* result)
-{
-    if (result != nullptr) {
-        *result = WqnWordReviewSubmitResult{};
-    }
-    if (token.empty() || submission.word_id.empty() || submission.outcome.empty()) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    const esp_err_t token_result = ValidateTokenOrClear(token, "word-review");
-    if (token_result != ESP_OK) {
-        return token_result;
-    }
-
-    ESP_RETURN_ON_ERROR(WaitForNetworkReadyForHttps(), kTag, "prepare network for word-review");
-
-    std::string request_body;
-    ESP_RETURN_ON_ERROR(BuildWordReviewBody(submission, &request_body), kTag, "build word-review request");
-
-    const std::string url = BuildUrl("/words/review");
-    int status_code = 0;
-    std::string body;
-    esp_err_t http_result = HttpRequest("POST", url, &token, &request_body, &status_code, &body);
-    if (http_result != ESP_OK) {
-        ESP_LOGW(kTag, "word-review failed: %s", esp_err_to_name(http_result));
-        return http_result;
-    }
-    if (status_code == 401) {
-        return ClearTokenOnUnauthorized("word-review");
-    }
-    if (status_code < 200 || status_code >= 300) {
-        ESP_LOGW(kTag, "word-review HTTP status=%d", status_code);
-        return ESP_FAIL;
-    }
-
-    if (result == nullptr) {
-        return ESP_OK;
-    }
-    return ParseWordReviewSubmitResponse(body, result);
-}
-
 esp_err_t SearchWords(const std::string& token, const WqnWordSearchRequest& request, WqnWordSearchResult* result)
 {
     if (result == nullptr) {
@@ -2472,7 +2213,11 @@ esp_err_t SearchWords(const std::string& token, const WqnWordSearchRequest& requ
     return ParseWordSearchResponse(body, result);
 }
 
-esp_err_t FetchWordPackManifest(const std::string& token, WqnWordPackManifest* manifest)
+esp_err_t FetchWordPackManifest(
+    const std::string& token,
+    const protocol::v3::RequestMetadata& metadata,
+    uint64_t cursor,
+    WqnWordPackManifest* manifest)
 {
     if (manifest == nullptr) {
         return ESP_ERR_INVALID_ARG;
@@ -2488,10 +2233,24 @@ esp_err_t FetchWordPackManifest(const std::string& token, WqnWordPackManifest* m
 
     ESP_RETURN_ON_ERROR(WaitForNetworkReadyForHttps(), kTag, "prepare network for word-pack-manifest");
 
-    const std::string url = BuildUrl("/words/packs/manifest");
+    std::string request_body;
+    ESP_RETURN_ON_ERROR(
+        protocol::word_study_v1::BuildManifestRequest(
+            metadata, cursor, 100, &request_body),
+        kTag,
+        "build word-study manifest request");
+    const std::string url = BuildUrl("/v3/words/manifest");
     int status_code = 0;
     std::string body;
-    esp_err_t http_result = HttpRequest("GET", url, &token, nullptr, &status_code, &body);
+    esp_err_t http_result = HttpRequest(
+        "POST",
+        url,
+        &token,
+        &request_body,
+        &status_code,
+        &body,
+        protocol::v3::kProtocolHeader,
+        &metadata.request_id);
     if (http_result != ESP_OK) {
         ESP_LOGW(kTag, "word-pack-manifest failed: %s", esp_err_to_name(http_result));
         return http_result;
@@ -2499,27 +2258,274 @@ esp_err_t FetchWordPackManifest(const std::string& token, WqnWordPackManifest* m
     if (status_code == 401) {
         return ClearTokenOnUnauthorized("word-pack-manifest");
     }
-    if (status_code != 200) {
-        ESP_LOGW(kTag, "word-pack-manifest HTTP status=%d", status_code);
-        return ESP_FAIL;
+    protocol::word_study_v1::ManifestData data;
+    protocol::v3::Error error;
+    const esp_err_t parse_result = protocol::word_study_v1::ParseManifestResponse(
+        body, metadata.request_id, &data, &error);
+    if (status_code != 200 || parse_result != ESP_OK) {
+        ESP_LOGW(
+            kTag,
+            "word-study manifest failed: status=%d code=%s retryable=%d",
+            status_code,
+            error.code.c_str(),
+            error.retryable ? 1 : 0);
+        return parse_result == ESP_OK ? ESP_FAIL : parse_result;
     }
 
-    const esp_err_t parse_result = ParseWordPackManifestResponse(body, manifest);
-    if (parse_result == ESP_OK) {
-        ESP_LOGI(kTag, "word-pack-manifest ok: packs=%u",
-                 static_cast<unsigned>(manifest->packs.size()));
+    manifest->cursor = data.cursor;
+    manifest->has_more = data.has_more;
+    manifest->packs.reserve(data.decks.size());
+    for (const protocol::word_study_v1::ManifestDeck& deck : data.decks) {
+        WqnWordPackManifestItem item;
+        item.deck_id = deck.deck_id;
+        item.title = deck.title;
+        item.content_revision = deck.content_revision;
+        item.change_sequence = deck.change_sequence;
+        item.deleted = deck.deleted;
+        if (!deck.deleted && deck.has_pack) {
+            item.pack_id = deck.pack.pack_id;
+            item.revision = deck.pack.pack_revision;
+            item.pack_revision = deck.pack.pack_revision;
+            item.schema_version = deck.pack.schema_version;
+            item.format = "jsonl";
+            item.compression = "none";
+            item.sha256 = deck.pack.sha256;
+            item.download_url = deck.pack.download_url;
+            item.entry_count = deck.pack.entry_count;
+            item.byte_size = deck.pack.byte_size;
+        }
+        manifest->packs.push_back(std::move(item));
     }
-    return parse_result;
+    ESP_LOGI(
+        kTag,
+        "word-study manifest ok: cursor=%llu changes=%u has_more=%d",
+        static_cast<unsigned long long>(manifest->cursor),
+        static_cast<unsigned>(manifest->packs.size()),
+        manifest->has_more ? 1 : 0);
+    return ESP_OK;
 }
 
-esp_err_t DownloadWordPack(const std::string& token, const WqnWordPackManifestItem& item, std::string* body)
+esp_err_t CreateWordStudySessionV1(
+    const std::string& token,
+    const protocol::word_study_v1::CreateSessionRequest& request,
+    protocol::word_study_v1::SessionData* session,
+    protocol::v3::Error* error)
 {
-    if (body == nullptr || item.download_url.empty()) {
+    if (session == nullptr || error == nullptr || token.empty()) {
         return ESP_ERR_INVALID_ARG;
     }
-    body->clear();
+    *session = {};
+    *error = {};
+    ESP_RETURN_ON_ERROR(
+        ValidateTokenOrClear(token, "word-study-session"),
+        kTag,
+        "validate word-study token");
+    ESP_RETURN_ON_ERROR(
+        WaitForNetworkReadyForHttps(),
+        kTag,
+        "prepare network for word-study session");
+
+    std::string request_body;
+    ESP_RETURN_ON_ERROR(
+        protocol::word_study_v1::BuildCreateSessionRequest(request, &request_body),
+        kTag,
+        "build word-study session request");
+    const std::string url = BuildUrl("/v3/words/sessions");
+    int status_code = 0;
+    std::string body;
+    const esp_err_t http_result = HttpRequest(
+        "POST",
+        url,
+        &token,
+        &request_body,
+        &status_code,
+        &body,
+        protocol::v3::kProtocolHeader,
+        &request.metadata.request_id,
+        kWordSessionHttpTimeoutMs);
+    if (http_result != ESP_OK) return http_result;
+    if (status_code == 401) return ClearTokenOnUnauthorized("word-study-session");
+    const esp_err_t parse_result = protocol::word_study_v1::ParseSessionResponse(
+        body, request.metadata.request_id, session, error);
+    if (status_code != 200 || parse_result != ESP_OK) {
+        ESP_LOGW(
+            kTag,
+            "word-study session failed: status=%d code=%s retryable=%d",
+            status_code,
+            error->code.c_str(),
+            error->retryable ? 1 : 0);
+        return parse_result == ESP_OK ? ESP_FAIL : parse_result;
+    }
+    return ESP_OK;
+}
+
+esp_err_t FetchWordStudyCandidatePageV1(
+    const std::string& token,
+    const std::string& session_id,
+    const protocol::word_study_v1::CandidatePageRequest& request,
+    protocol::word_study_v1::CandidatePageData* page,
+    protocol::v3::Error* error)
+{
+    if (page == nullptr || error == nullptr || token.empty() ||
+        session_id.size() != 36) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *page = {};
+    *error = {};
+    ESP_RETURN_ON_ERROR(
+        ValidateTokenOrClear(token, "word-study-candidates"),
+        kTag,
+        "validate word candidate token");
+    ESP_RETURN_ON_ERROR(
+        WaitForNetworkReadyForHttps(),
+        kTag,
+        "prepare network for word candidates");
+
+    std::string request_body;
+    ESP_RETURN_ON_ERROR(
+        protocol::word_study_v1::BuildCandidatePageRequest(
+            request, &request_body),
+        kTag,
+        "build word candidate page request");
+    const std::string url = BuildUrl(
+        "/v3/words/sessions/" + session_id + "/candidates");
+    int status_code = 0;
+    std::string body;
+    const esp_err_t http_result = HttpRequest(
+        "POST",
+        url,
+        &token,
+        &request_body,
+        &status_code,
+        &body,
+        protocol::v3::kProtocolHeader,
+        &request.metadata.request_id);
+    if (http_result != ESP_OK) return http_result;
+    if (status_code == 401) {
+        return ClearTokenOnUnauthorized("word-study-candidates");
+    }
+    const esp_err_t parse_result =
+        protocol::word_study_v1::ParseCandidatePageResponse(
+            body, request.metadata.request_id, page, error);
+    if (status_code != 200 || parse_result != ESP_OK) {
+        ESP_LOGW(
+            kTag,
+            "word candidate page failed: status=%d code=%s retryable=%d",
+            status_code,
+            error->code.c_str(),
+            error->retryable ? 1 : 0);
+        return parse_result == ESP_OK ? ESP_FAIL : parse_result;
+    }
+    return ESP_OK;
+}
+
+esp_err_t SubmitWordStudyObservationV1AtPath(
+    const std::string& token,
+    const protocol::word_study_v1::ObservationRequest& request,
+    protocol::word_study_v1::ObservationData* observation,
+    protocol::v3::Error* error,
+    bool* transport_failure,
+    const char* path,
+    const char* operation)
+{
+    if (observation == nullptr || error == nullptr || transport_failure == nullptr ||
+        token.empty() || path == nullptr || operation == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *observation = {};
+    *error = {};
+    *transport_failure = false;
+    esp_err_t result = ValidateTokenOrClear(token, operation);
+    if (result != ESP_OK) return result;
+    result = WaitForNetworkReadyForHttps();
+    if (result != ESP_OK) {
+        *transport_failure = true;
+        return result;
+    }
+
+    std::string request_body;
+    result = protocol::word_study_v1::BuildObservationRequest(request, &request_body);
+    if (result != ESP_OK) return result;
+    const std::string url = BuildUrl(path);
+    int status_code = 0;
+    std::string body;
+    result = HttpRequest(
+        "POST",
+        url,
+        &token,
+        &request_body,
+        &status_code,
+        &body,
+        protocol::v3::kProtocolHeader,
+        &request.metadata.request_id);
+    if (result != ESP_OK) {
+        *transport_failure = true;
+        return result;
+    }
+    if (status_code == 401) return ClearTokenOnUnauthorized(operation);
+    const esp_err_t parse_result = protocol::word_study_v1::ParseObservationResponse(
+        body, request.metadata.request_id, observation, error);
+    if (status_code != 200 || parse_result != ESP_OK) {
+        ESP_LOGW(
+            kTag,
+            "%s failed: status=%d code=%s retryable=%d",
+            operation,
+            status_code,
+            error->code.c_str(),
+            error->retryable ? 1 : 0);
+        return parse_result == ESP_OK ? ESP_FAIL : parse_result;
+    }
+    return ESP_OK;
+}
+
+esp_err_t SubmitWordStudyObservationV1(
+    const std::string& token,
+    const protocol::word_study_v1::ObservationRequest& request,
+    protocol::word_study_v1::ObservationData* observation,
+    protocol::v3::Error* error,
+    bool* transport_failure)
+{
+    return SubmitWordStudyObservationV1AtPath(
+        token,
+        request,
+        observation,
+        error,
+        transport_failure,
+        "/v3/words/observations",
+        "word-study-observation");
+}
+
+esp_err_t SkipWordStudyObservationV1(
+    const std::string& token,
+    const protocol::word_study_v1::ObservationRequest& request,
+    protocol::word_study_v1::ObservationData* observation,
+    protocol::v3::Error* error,
+    bool* transport_failure)
+{
+    return SubmitWordStudyObservationV1AtPath(
+        token,
+        request,
+        observation,
+        error,
+        transport_failure,
+        "/v3/words/observations/skip",
+        "word-study-observation-skip");
+}
+
+esp_err_t DownloadWordPackStream(
+    const std::string& token,
+    const protocol::v3::RequestMetadata& metadata,
+    const WqnWordPackManifestItem& item,
+    WqnHttpChunkSink sink,
+    void* context)
+{
+    if (sink == nullptr || metadata.request_id.empty() ||
+        item.download_url.empty() || item.byte_size == 0 ||
+        item.byte_size > protocol::word_study_v1::kMaxPackBytes) {
+        return ESP_ERR_INVALID_ARG;
+    }
     if (token.empty()) {
-        return ESP_OK;
+        return ESP_ERR_INVALID_STATE;
     }
     const esp_err_t token_result = ValidateTokenOrClear(token, "word-pack-download");
     if (token_result != ESP_OK) {
@@ -2529,14 +2535,85 @@ esp_err_t DownloadWordPack(const std::string& token, const WqnWordPackManifestIt
     ESP_RETURN_ON_ERROR(WaitForNetworkReadyForHttps(), kTag, "prepare network for word-pack-download");
 
     const std::string url = BuildWordPackDownloadUrl(item.download_url);
-    ESP_LOGI(kTag, "word-pack-download: pack_id=%s url=%s bytes_expected=%d",
-             item.pack_id.c_str(), url.c_str(), item.byte_size);
-    int status_code = 0;
-    esp_err_t http_result = HttpRequest("GET", url, &token, nullptr, &status_code, body);
-    if (http_result != ESP_OK) {
-        ESP_LOGW(kTag, "word-pack-download failed: %s url=%s", esp_err_to_name(http_result), url.c_str());
-        return http_result;
+    ESP_LOGI(kTag, "word-pack-download: pack_id=%s url=%s bytes_expected=%lu",
+             item.pack_id.c_str(), url.c_str(), static_cast<unsigned long>(item.byte_size));
+    esp_http_client_config_t config = {};
+    config.url = url.c_str();
+    config.method = HTTP_METHOD_GET;
+    config.timeout_ms = kHttpTimeoutMs;
+    config.crt_bundle_attach = esp_crt_bundle_attach;
+    config.buffer_size = 2048;
+
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (client == nullptr) {
+        return ESP_ERR_NO_MEM;
     }
+    const std::string authorization = "Bearer " + token;
+    esp_err_t result = esp_http_client_set_header(
+        client, "Accept", "application/x-ndjson");
+    if (result == ESP_OK) {
+        result = esp_http_client_set_header(
+            client, "Authorization", authorization.c_str());
+    }
+    if (result == ESP_OK) {
+        result = esp_http_client_set_header(
+            client, "X-WQN-Protocol", protocol::v3::kProtocolHeader);
+    }
+    if (result == ESP_OK) {
+        result = esp_http_client_set_header(
+            client, "X-WQN-Request-Id", metadata.request_id.c_str());
+    }
+    if (result == ESP_OK) {
+        result = esp_http_client_open(client, 0);
+    }
+    int content_length = -1;
+    int status_code = 0;
+    if (result == ESP_OK) {
+        content_length = esp_http_client_fetch_headers(client);
+        status_code = esp_http_client_get_status_code(client);
+    }
+    // zlib transport coding: Content-Length is the compressed size, so it no
+    // longer equals byte_size; completeness is enforced by the inflater
+    // reaching DONE at exactly byte_size plaintext bytes.
+    (void)content_length;
+    TinflStreamInflater inflater;
+    if (result == ESP_OK && status_code == 200) {
+        result = inflater.Init(item.byte_size);
+    }
+    size_t received = 0;
+    std::array<uint8_t, 2048> buffer = {};
+    while (result == ESP_OK && status_code == 200) {
+        const int read = esp_http_client_read(
+            client,
+            reinterpret_cast<char*>(buffer.data()),
+            buffer.size());
+        FeedTaskWatchdogIfSubscribed();
+        if (read < 0) {
+            result = ESP_FAIL;
+            break;
+        }
+        if (read == 0) {
+            break;
+        }
+        if (received + static_cast<size_t>(read) >
+            protocol::word_study_v1::kMaxPackBytes) {
+            result = ESP_ERR_INVALID_SIZE;
+            break;
+        }
+        result = inflater.Feed(
+            buffer.data(), static_cast<size_t>(read), false, sink, context);
+        if (result == ESP_OK) {
+            received += static_cast<size_t>(read);
+        }
+    }
+    if (result == ESP_OK && status_code == 200 &&
+        (!inflater.done() || inflater.total_out() != item.byte_size ||
+         !esp_http_client_is_complete_data_received(client))) {
+        result = ESP_ERR_INVALID_SIZE;
+    }
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+
     if (status_code == 401) {
         return ClearTokenOnUnauthorized("word-pack-download");
     }
@@ -2544,7 +2621,614 @@ esp_err_t DownloadWordPack(const std::string& token, const WqnWordPackManifestIt
         ESP_LOGW(kTag, "word-pack-download HTTP status=%d", status_code);
         return ESP_FAIL;
     }
+    if (result != ESP_OK) {
+        ESP_LOGW(
+            kTag,
+            "word-pack-download failed: %s url=%s received=%u",
+            esp_err_to_name(result),
+            url.c_str(),
+            static_cast<unsigned>(received));
+    }
+    return result;
+}
+
+esp_err_t FetchNoteStudyManifest(
+    const std::string& token,
+    const protocol::v3::RequestMetadata& metadata,
+    uint64_t cursor,
+    WqnNotePackManifest* manifest)
+{
+    if (manifest == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *manifest = WqnNotePackManifest{};
+    if (token.empty()) {
+        return ESP_OK;
+    }
+    const esp_err_t token_result = ValidateTokenOrClear(token, "note-pack-manifest");
+    if (token_result != ESP_OK) {
+        return token_result;
+    }
+
+    ESP_RETURN_ON_ERROR(WaitForNetworkReadyForHttps(), kTag, "prepare network for note-pack-manifest");
+
+    std::string request_body;
+    ESP_RETURN_ON_ERROR(
+        protocol::note_study_v1::BuildManifestRequest(
+            metadata, cursor, 100, &request_body),
+        kTag,
+        "build note-study manifest request");
+    const std::string url = BuildUrl("/v3/notes/manifest");
+    int status_code = 0;
+    std::string body;
+    esp_err_t http_result = HttpRequest(
+        "POST",
+        url,
+        &token,
+        &request_body,
+        &status_code,
+        &body,
+        protocol::v3::kProtocolHeader,
+        &metadata.request_id);
+    if (http_result != ESP_OK) {
+        ESP_LOGW(kTag, "note-pack-manifest failed: %s", esp_err_to_name(http_result));
+        return http_result;
+    }
+    if (status_code == 401) {
+        return ClearTokenOnUnauthorized("note-pack-manifest");
+    }
+    protocol::note_study_v1::ManifestData data;
+    protocol::v3::Error error;
+    const esp_err_t parse_result = protocol::note_study_v1::ParseManifestResponse(
+        body, metadata.request_id, &data, &error);
+    if (status_code != 200 || parse_result != ESP_OK) {
+        ESP_LOGW(
+            kTag,
+            "note-study manifest failed: status=%d code=%s retryable=%d",
+            status_code,
+            error.code.c_str(),
+            error.retryable ? 1 : 0);
+        return parse_result == ESP_OK ? ESP_FAIL : parse_result;
+    }
+
+    manifest->cursor = data.cursor;
+    manifest->has_more = data.has_more;
+    manifest->notebooks.reserve(data.notebooks.size());
+    for (const protocol::note_study_v1::ManifestNotebook& source : data.notebooks) {
+        WqnNotePackManifestNotebook notebook;
+        notebook.notebook_id = source.notebook_id;
+        notebook.title = source.title;
+        notebook.change_sequence = source.change_sequence;
+        notebook.content_revision = source.content_revision;
+        notebook.deleted = source.deleted;
+        if (!source.deleted && source.has_pack) {
+            notebook.has_pack = true;
+            notebook.pack_id = source.pack.pack_id;
+            notebook.pack_revision = source.pack.pack_revision;
+            notebook.schema_version = source.pack.schema_version;
+            notebook.entry_count = source.pack.entry_count;
+            notebook.byte_size = source.pack.byte_size;
+            notebook.sha256 = source.pack.sha256;
+            notebook.download_url = source.pack.download_url;
+        }
+        manifest->notebooks.push_back(std::move(notebook));
+    }
+    ESP_LOGI(
+        kTag,
+        "note-study manifest ok: cursor=%llu changes=%u has_more=%d",
+        static_cast<unsigned long long>(manifest->cursor),
+        static_cast<unsigned>(manifest->notebooks.size()),
+        manifest->has_more ? 1 : 0);
     return ESP_OK;
+}
+
+esp_err_t DownloadNotePackStream(
+    const std::string& token,
+    const protocol::v3::RequestMetadata& metadata,
+    const WqnNotePackManifestNotebook& notebook,
+    WqnHttpChunkSink sink,
+    void* context)
+{
+    if (sink == nullptr || metadata.request_id.empty() ||
+        notebook.download_url.empty() || notebook.byte_size == 0 ||
+        notebook.byte_size > protocol::note_study_v1::kMaxPackBytes) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (token.empty()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    const esp_err_t token_result = ValidateTokenOrClear(token, "note-pack-download");
+    if (token_result != ESP_OK) {
+        return token_result;
+    }
+
+    ESP_RETURN_ON_ERROR(WaitForNetworkReadyForHttps(), kTag, "prepare network for note-pack-download");
+
+    const std::string url = BuildWordPackDownloadUrl(notebook.download_url);
+    ESP_LOGI(kTag, "note-pack-download: pack_id=%s url=%s bytes_expected=%lu",
+             notebook.pack_id.c_str(), url.c_str(),
+             static_cast<unsigned long>(notebook.byte_size));
+    esp_http_client_config_t config = {};
+    config.url = url.c_str();
+    config.method = HTTP_METHOD_GET;
+    config.timeout_ms = kHttpTimeoutMs;
+    config.crt_bundle_attach = esp_crt_bundle_attach;
+    config.buffer_size = 2048;
+
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (client == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
+    const std::string authorization = "Bearer " + token;
+    esp_err_t result = esp_http_client_set_header(
+        client, "Accept", "application/x-ndjson");
+    if (result == ESP_OK) {
+        result = esp_http_client_set_header(
+            client, "Authorization", authorization.c_str());
+    }
+    if (result == ESP_OK) {
+        result = esp_http_client_set_header(
+            client, "X-WQN-Protocol", protocol::v3::kProtocolHeader);
+    }
+    if (result == ESP_OK) {
+        result = esp_http_client_set_header(
+            client, "X-WQN-Request-Id", metadata.request_id.c_str());
+    }
+    if (result == ESP_OK) {
+        result = esp_http_client_open(client, 0);
+    }
+    int content_length = -1;
+    int status_code = 0;
+    if (result == ESP_OK) {
+        content_length = esp_http_client_fetch_headers(client);
+        status_code = esp_http_client_get_status_code(client);
+    }
+    // zlib transport coding: Content-Length is the compressed size, so a
+    // byte_size equality check no longer applies; the inflater below enforces
+    // exact plaintext size + completion instead.
+    (void)content_length;
+    TinflStreamInflater inflater;
+    if (result == ESP_OK && status_code == 200) {
+        result = inflater.Init(notebook.byte_size);
+    }
+    size_t received = 0;
+    std::array<uint8_t, 2048> buffer = {};
+    while (result == ESP_OK && status_code == 200) {
+        const int read = esp_http_client_read(
+            client,
+            reinterpret_cast<char*>(buffer.data()),
+            buffer.size());
+        FeedTaskWatchdogIfSubscribed();
+        if (read < 0) {
+            result = ESP_FAIL;
+            break;
+        }
+        if (read == 0) {
+            break;
+        }
+        if (received + static_cast<size_t>(read) >
+            protocol::note_study_v1::kMaxPackBytes) {
+            result = ESP_ERR_INVALID_SIZE;
+            break;
+        }
+        result = inflater.Feed(
+            buffer.data(), static_cast<size_t>(read), false, sink, context);
+        if (result == ESP_OK) {
+            received += static_cast<size_t>(read);
+        }
+    }
+    if (result == ESP_OK && status_code == 200 &&
+        (!inflater.done() || inflater.total_out() != notebook.byte_size ||
+         !esp_http_client_is_complete_data_received(client))) {
+        result = ESP_ERR_INVALID_SIZE;
+    }
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+
+    if (status_code == 401) {
+        return ClearTokenOnUnauthorized("note-pack-download");
+    }
+    if (status_code != 200) {
+        ESP_LOGW(kTag, "note-pack-download HTTP status=%d", status_code);
+        return ESP_FAIL;
+    }
+    if (result != ESP_OK) {
+        ESP_LOGW(
+            kTag,
+            "note-pack-download failed: %s url=%s received=%u",
+            esp_err_to_name(result),
+            url.c_str(),
+            static_cast<unsigned>(received));
+    }
+    return result;
+}
+
+esp_err_t DownloadNoteImageV1(
+    const std::string& token,
+    const protocol::v3::RequestMetadata& metadata,
+    const std::string& note_id,
+    uint8_t image_index,
+    const std::string& expected_image_id,
+    std::vector<uint8_t>* wqni)
+{
+    // WQNI file size is fixed by the contract: 20-byte header + 400x300/8.
+    constexpr size_t kWqniFileBytes = 20 + 15000;
+    if (wqni == nullptr || metadata.request_id.empty() || note_id.size() != 36 ||
+        image_index > 3 || expected_image_id.size() != 64) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (token.empty()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    const esp_err_t token_result = ValidateTokenOrClear(token, "note-image-download");
+    if (token_result != ESP_OK) {
+        return token_result;
+    }
+
+    ESP_RETURN_ON_ERROR(WaitForNetworkReadyForHttps(), kTag, "prepare network for note-image-download");
+
+    const std::string url = BuildUrl(
+        "/v3/notes/images/" + note_id + "/" + std::to_string(image_index));
+    esp_http_client_config_t config = {};
+    config.url = url.c_str();
+    config.method = HTTP_METHOD_GET;
+    config.timeout_ms = kHttpTimeoutMs;
+    config.crt_bundle_attach = esp_crt_bundle_attach;
+    config.buffer_size = 2048;
+
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (client == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
+    const std::string authorization = "Bearer " + token;
+    esp_err_t result = esp_http_client_set_header(
+        client, "Accept", "application/octet-stream");
+    if (result == ESP_OK) {
+        result = esp_http_client_set_header(
+            client, "Authorization", authorization.c_str());
+    }
+    if (result == ESP_OK) {
+        result = esp_http_client_set_header(
+            client, "X-WQN-Protocol", protocol::v3::kProtocolHeader);
+    }
+    if (result == ESP_OK) {
+        result = esp_http_client_set_header(
+            client, "X-WQN-Request-Id", metadata.request_id.c_str());
+    }
+    if (result == ESP_OK) {
+        result = esp_http_client_open(client, 0);
+    }
+    int content_length = -1;
+    int status_code = 0;
+    if (result == ESP_OK) {
+        content_length = esp_http_client_fetch_headers(client);
+        status_code = esp_http_client_get_status_code(client);
+    }
+    if (result == ESP_OK && status_code == 200 && content_length >= 0 &&
+        static_cast<size_t>(content_length) > kWqniFileBytes + 512) {
+        // Compressed transport: the body must be no larger than the plaintext
+        // WQNI plus zlib overhead.
+        ESP_LOGW(kTag, "note-image-download Content-Length oversized: %d", content_length);
+        result = ESP_ERR_INVALID_SIZE;
+    }
+    wqni->clear();
+    // Compressed body: typically a few KB, never the full plaintext size.
+    // Reserving kWqniFileBytes here kept two 15 KB blocks alive at once (this
+    // one was then discarded unread when the inflated buffer replaced it).
+    wqni->reserve(4096);
+    std::array<uint8_t, 2048> buffer = {};
+    while (result == ESP_OK && status_code == 200) {
+        const int read = esp_http_client_read(
+            client, reinterpret_cast<char*>(buffer.data()), buffer.size());
+        FeedTaskWatchdogIfSubscribed();
+        if (read < 0) {
+            result = ESP_FAIL;
+            break;
+        }
+        if (read == 0) {
+            break;
+        }
+        if (wqni->size() + static_cast<size_t>(read) > kWqniFileBytes + 512) {
+            result = ESP_ERR_INVALID_SIZE;
+            break;
+        }
+        wqni->insert(wqni->end(), buffer.data(), buffer.data() + read);
+    }
+    if (result == ESP_OK && status_code == 200 &&
+        (wqni->empty() || !esp_http_client_is_complete_data_received(client))) {
+        result = ESP_ERR_INVALID_SIZE;
+    }
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+
+    if (status_code == 401) {
+        wqni->clear();
+        return ClearTokenOnUnauthorized("note-image-download");
+    }
+    if (status_code != 200) {
+        ESP_LOGW(kTag, "note-image-download HTTP status=%d note=%s index=%u",
+                 status_code, note_id.c_str(), static_cast<unsigned>(image_index));
+        wqni->clear();
+        return status_code == 404 ? ESP_ERR_NOT_FOUND : ESP_FAIL;
+    }
+    if (result != ESP_OK) {
+        wqni->clear();
+        return result;
+    }
+
+    // A gateway or captive portal can answer 200 with HTML/JSON; our zlib
+    // bodies always start with CMF 0x78 (deflate, 32K window). Rejecting
+    // early gives a precise log instead of a generic inflate failure.
+    if (wqni->empty() || (*wqni)[0] != 0x78) {
+        ESP_LOGW(kTag, "note-image-download body is not zlib (first=0x%02x size=%u)",
+                 wqni->empty() ? 0 : (*wqni)[0],
+                 static_cast<unsigned>(wqni->size()));
+        wqni->clear();
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    // zlib transport coding: inflate the body before any verification --
+    // image_id is the sha256 of the uncompressed WQNI file. NOT
+    // tinfl_decompress_mem_to_mem: that convenience wrapper declares the ~11 KB
+    // tinfl_decompressor ON THE STACK and overflowed the 8 KB cloud lane task
+    // the moment the download completed (HIL: clean download of 15020 bytes,
+    // then 'stack overflow in task wqn_cloud_int'). Reuse the pack path's
+    // heap/PSRAM-backed streaming inflater instead: one Feed with the whole
+    // body, sink appends into the output vector.
+    {
+        std::vector<uint8_t> inflated;
+        inflated.reserve(kWqniFileBytes);
+        TinflStreamInflater inflater;
+        esp_err_t inflate_result = inflater.Init(kWqniFileBytes);
+        if (inflate_result == ESP_OK) {
+            const auto append_sink = [](void* context, const uint8_t* data,
+                                        size_t size) -> esp_err_t {
+                auto* target = static_cast<std::vector<uint8_t>*>(context);
+                target->insert(target->end(), data, data + size);
+                return ESP_OK;
+            };
+            inflate_result = inflater.Feed(
+                wqni->data(), wqni->size(), true, append_sink, &inflated);
+        }
+        if (inflate_result != ESP_OK || !inflater.done() ||
+            inflated.size() != kWqniFileBytes) {
+            ESP_LOGW(kTag, "note-image-download inflate failed: %s out=%u",
+                     esp_err_to_name(inflate_result),
+                     static_cast<unsigned>(inflated.size()));
+            wqni->clear();
+            return ESP_ERR_INVALID_RESPONSE;
+        }
+        *wqni = std::move(inflated);
+    }
+
+    // Content addressing: the pack line pinned the image id, so the bytes must
+    // hash to it or the panel would show something the user never attached.
+    std::array<unsigned char, 32> digest = {};
+    if (mbedtls_sha256(wqni->data(), wqni->size(), digest.data(), 0) != 0) {
+        wqni->clear();
+        return ESP_FAIL;
+    }
+    constexpr char kHexDigits[] = "0123456789abcdef";
+    std::string actual_id;
+    actual_id.reserve(64);
+    for (unsigned char byte : digest) {
+        actual_id.push_back(kHexDigits[byte >> 4]);
+        actual_id.push_back(kHexDigits[byte & 0x0f]);
+    }
+    if (actual_id != expected_image_id) {
+        ESP_LOGW(kTag, "note-image-download hash mismatch: expected=%.12s actual=%.12s",
+                 expected_image_id.c_str(), actual_id.c_str());
+        wqni->clear();
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    return ESP_OK;
+}
+
+esp_err_t CreateNoteStudySessionV1(
+    const std::string& token,
+    const protocol::note_study_v1::CreateSessionRequest& request,
+    protocol::note_study_v1::SessionData* session,
+    protocol::v3::Error* error)
+{
+    if (session == nullptr || error == nullptr || token.empty()) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *session = {};
+    *error = {};
+    ESP_RETURN_ON_ERROR(
+        ValidateTokenOrClear(token, "note-study-session"),
+        kTag,
+        "validate note-study token");
+    ESP_RETURN_ON_ERROR(
+        WaitForNetworkReadyForHttps(),
+        kTag,
+        "prepare network for note-study session");
+
+    std::string request_body;
+    ESP_RETURN_ON_ERROR(
+        protocol::note_study_v1::BuildCreateSessionRequest(request, &request_body),
+        kTag,
+        "build note-study session request");
+    const std::string url = BuildUrl("/v3/notes/sessions");
+    int status_code = 0;
+    std::string body;
+    const esp_err_t http_result = HttpRequest(
+        "POST",
+        url,
+        &token,
+        &request_body,
+        &status_code,
+        &body,
+        protocol::v3::kProtocolHeader,
+        &request.metadata.request_id,
+        kWordSessionHttpTimeoutMs);
+    if (http_result != ESP_OK) return http_result;
+    if (status_code == 401) return ClearTokenOnUnauthorized("note-study-session");
+    const esp_err_t parse_result = protocol::note_study_v1::ParseSessionResponse(
+        body, request.metadata.request_id, session, error);
+    if (status_code != 200 || parse_result != ESP_OK) {
+        ESP_LOGW(
+            kTag,
+            "note-study session failed: status=%d code=%s retryable=%d",
+            status_code,
+            error->code.c_str(),
+            error->retryable ? 1 : 0);
+        return parse_result == ESP_OK ? ESP_FAIL : parse_result;
+    }
+    return ESP_OK;
+}
+
+esp_err_t FetchNoteStudyCandidatePageV1(
+    const std::string& token,
+    const std::string& session_id,
+    const protocol::note_study_v1::CandidatePageRequest& request,
+    protocol::note_study_v1::CandidatePageData* page,
+    protocol::v3::Error* error)
+{
+    if (page == nullptr || error == nullptr || token.empty() ||
+        session_id.size() != 36) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *page = {};
+    *error = {};
+    ESP_RETURN_ON_ERROR(
+        ValidateTokenOrClear(token, "note-study-candidates"),
+        kTag,
+        "validate note candidate token");
+    ESP_RETURN_ON_ERROR(
+        WaitForNetworkReadyForHttps(),
+        kTag,
+        "prepare network for note candidates");
+
+    std::string request_body;
+    ESP_RETURN_ON_ERROR(
+        protocol::note_study_v1::BuildCandidatePageRequest(
+            request, &request_body),
+        kTag,
+        "build note candidate page request");
+    const std::string url = BuildUrl(
+        "/v3/notes/sessions/" + session_id + "/candidates");
+    int status_code = 0;
+    std::string body;
+    const esp_err_t http_result = HttpRequest(
+        "POST",
+        url,
+        &token,
+        &request_body,
+        &status_code,
+        &body,
+        protocol::v3::kProtocolHeader,
+        &request.metadata.request_id);
+    if (http_result != ESP_OK) return http_result;
+    if (status_code == 401) {
+        return ClearTokenOnUnauthorized("note-study-candidates");
+    }
+    const esp_err_t parse_result =
+        protocol::note_study_v1::ParseCandidatePageResponse(
+            body, request.metadata.request_id, page, error);
+    if (status_code != 200 || parse_result != ESP_OK) {
+        ESP_LOGW(
+            kTag,
+            "note candidate page failed: status=%d code=%s retryable=%d",
+            status_code,
+            error->code.c_str(),
+            error->retryable ? 1 : 0);
+        return parse_result == ESP_OK ? ESP_FAIL : parse_result;
+    }
+    return ESP_OK;
+}
+
+esp_err_t SubmitNoteStudyObservationV1AtPath(
+    const std::string& token,
+    const protocol::note_study_v1::ObservationRequest& request,
+    protocol::note_study_v1::ObservationData* observation,
+    protocol::v3::Error* error,
+    bool* transport_failure,
+    const char* path,
+    const char* operation)
+{
+    if (observation == nullptr || error == nullptr || transport_failure == nullptr ||
+        token.empty() || path == nullptr || operation == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *observation = {};
+    *error = {};
+    *transport_failure = false;
+    esp_err_t result = ValidateTokenOrClear(token, operation);
+    if (result != ESP_OK) return result;
+    result = WaitForNetworkReadyForHttps();
+    if (result != ESP_OK) {
+        *transport_failure = true;
+        return result;
+    }
+
+    std::string request_body;
+    result = protocol::note_study_v1::BuildObservationRequest(request, &request_body);
+    if (result != ESP_OK) return result;
+    const std::string url = BuildUrl(path);
+    int status_code = 0;
+    std::string body;
+    result = HttpRequest(
+        "POST",
+        url,
+        &token,
+        &request_body,
+        &status_code,
+        &body,
+        protocol::v3::kProtocolHeader,
+        &request.metadata.request_id);
+    if (result != ESP_OK) {
+        *transport_failure = true;
+        return result;
+    }
+    if (status_code == 401) return ClearTokenOnUnauthorized(operation);
+    const esp_err_t parse_result = protocol::note_study_v1::ParseObservationResponse(
+        body, request.metadata.request_id, observation, error);
+    if (status_code != 200 || parse_result != ESP_OK) {
+        ESP_LOGW(
+            kTag,
+            "%s failed: status=%d code=%s retryable=%d",
+            operation,
+            status_code,
+            error->code.c_str(),
+            error->retryable ? 1 : 0);
+        return parse_result == ESP_OK ? ESP_FAIL : parse_result;
+    }
+    return ESP_OK;
+}
+
+esp_err_t SubmitNoteStudyObservationV1(
+    const std::string& token,
+    const protocol::note_study_v1::ObservationRequest& request,
+    protocol::note_study_v1::ObservationData* observation,
+    protocol::v3::Error* error,
+    bool* transport_failure)
+{
+    return SubmitNoteStudyObservationV1AtPath(
+        token,
+        request,
+        observation,
+        error,
+        transport_failure,
+        "/v3/notes/observations",
+        "note-study-observation");
+}
+
+esp_err_t SkipNoteStudyObservationV1(
+    const std::string& token,
+    const protocol::note_study_v1::ObservationRequest& request,
+    protocol::note_study_v1::ObservationData* observation,
+    protocol::v3::Error* error,
+    bool* transport_failure)
+{
+    return SubmitNoteStudyObservationV1AtPath(
+        token,
+        request,
+        observation,
+        error,
+        transport_failure,
+        "/v3/notes/observations/skip",
+        "note-study-observation-skip");
 }
 
 esp_err_t LookupWordWithAi(const std::string& token, const WqnWordAiLookupRequest& request, WqnWordAiLookupResult* result)
@@ -2596,21 +3280,6 @@ esp_err_t ParseTodoListResponse(const std::string& body, WqnTodoListPage* page)
 esp_err_t ParseTodoCompleteResponse(const std::string& body, WqnTodoItem* todo)
 {
     return ParseTodoCompleteResponseImpl(body, todo);
-}
-
-esp_err_t ParseWordSyncResponse(const std::string& body, WqnWordSyncPage* page)
-{
-    return ParseWordSyncResponseImpl(body, page);
-}
-
-esp_err_t ParseWordReviewQueueResponse(const std::string& body, WqnWordReviewQueue* queue)
-{
-    return ParseWordReviewQueueResponseImpl(body, queue);
-}
-
-esp_err_t ParseWordReviewSubmitResponse(const std::string& body, WqnWordReviewSubmitResult* result)
-{
-    return ParseWordReviewSubmitResponseImpl(body, result);
 }
 
 esp_err_t ParseWordSearchResponse(const std::string& body, WqnWordSearchResult* result)

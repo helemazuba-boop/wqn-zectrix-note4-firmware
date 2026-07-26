@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <ctime>
+#include <memory>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -31,10 +32,13 @@
 #include "power_manager.h"
 #include "ui_layout.h"
 #include "typography.h"
+#include "ui/ui_widgets.h"
 #include "ui/assets/wqn_bitmap_asset.h"
 #include "display/display_types.h"
 
 namespace device_ui_internal {
+
+class UiRuntime;
 
 constexpr std::time_t kMinReasonableUnixTime = 1704067200;  // 2024-01-01 UTC
 
@@ -61,13 +65,8 @@ RefreshSchedule StrongerSchedule(RefreshSchedule a, RefreshSchedule b);
 
 // ---- Shared types -----------------------------------------------------------
 
-struct UiRect {
-    int x;
-    int y;
-    int width;
-    int height;
-    const char* name;
-};
+// UiRect is now defined in ui_layout.h (geometry owned alongside layout
+// tokens so ui_widgets.h can reference it without including ui_internal.h).
 
 constexpr TickType_t kCommitRefreshDelay = pdMS_TO_TICKS(120);
 constexpr TickType_t kClockRefreshDelay = pdMS_TO_TICKS(80);
@@ -150,16 +149,19 @@ struct TodoCloudResult {
 
 enum class WordCloudOp {
     kPackSync,
-    kSubmit,
+    kStartSession,
+    kFetchSessionPage,
     kSearch,
     kAiLookup,
 };
 
 struct WordCloudRequest {
     WordCloudOp op = WordCloudOp::kPackSync;
-    char word_id[64] = {};
-    char outcome[16] = {};
-    char word[80] = {};
+    char request_id[65] = {};
+    char session_id[37] = {};
+    char cursor[65] = {};
+    uint16_t limit = 0;
+    uint8_t study_mode = 0;
     char query[96] = {};
 };
 
@@ -167,14 +169,21 @@ struct WordCloudResult {
     WordCloudOp op = WordCloudOp::kPackSync;
     esp_err_t result = ESP_FAIL;
     bool auth_required = false;
-    char word_id[64] = {};
-    char outcome[16] = {};
-    char word[80] = {};
+    bool pack_index_ready = false;
     wqn::WordPackIndex pack_index;
-    wqn::WqnWordReviewSubmitResult submit;
+    wqn::protocol::word_study_v1::SessionData session;
+    wqn::protocol::word_study_v1::CandidatePageData candidate_page;
+    wqn::protocol::v3::Error protocol_error;
     wqn::WqnWordSearchResult search;
     wqn::WqnWordAiLookupResult lookup;
+    std::string query;
     std::string message;
+    // kStartSession: the compacted session snapshot, already persisted on the
+    // runner thread so the 36 KB fsync never runs on the UI task. The apply
+    // step only installs it in memory.
+    wqn::PersistedWordSession persisted_session;
+    esp_err_t session_compact_result = ESP_OK;
+    esp_err_t session_persist_result = ESP_OK;
 };
 
 struct TodoCloudResultReady {
@@ -185,39 +194,158 @@ struct WordCloudResultReady {
     uint32_t generation = 0;
 };
 
+enum class NoteCloudOp {
+    kPackSync,
+    kStartSession,
+    kFetchSessionPage,
+    kFetchImage,
+    // Local storage write (observation outbox + session snapshot); needs no
+    // network/token. Runs on the interactive lane so the note-open bookkeeping
+    // leaves the UI task (the ~0.9s foreground commit stall).
+    kCommitObservation,
+};
+
+struct NoteCloudRequest {
+    NoteCloudOp op = NoteCloudOp::kPackSync;
+    char request_id[65] = {};
+    char session_id[37] = {};
+    char cursor[65] = {};
+    char notebook_id[37] = {};
+    uint16_t limit = 0;
+    // kFetchImage: which note/attachment and the content hash to verify.
+    char note_id[37] = {};
+    char image_id[65] = {};
+    uint8_t image_index = 0;
+};
+
+struct NoteCloudResult {
+    NoteCloudOp op = NoteCloudOp::kPackSync;
+    esp_err_t result = ESP_FAIL;
+    bool auth_required = false;
+    bool pack_index_ready = false;
+    wqn::NotePackIndex pack_index;
+    wqn::protocol::note_study_v1::SessionData session;
+    wqn::protocol::note_study_v1::CandidatePageData candidate_page;
+    wqn::protocol::v3::Error protocol_error;
+    std::string message;
+    // kFetchImage: validated WQNI bytes (header + payload) and their id.
+    std::string image_id;
+    std::shared_ptr<const std::vector<uint8_t>> image_wqni;
+    // kStartSession: compacted + already-persisted session snapshot (see
+    // WordCloudResult); apply installs it without touching storage.
+    wqn::PersistedNoteSession persisted_session;
+    esp_err_t session_compact_result = ESP_OK;
+    esp_err_t session_persist_result = ESP_OK;
+};
+
+struct NoteCloudResultReady {
+    uint32_t generation = 0;
+};
+
+// --- Unified cloud runner ---------------------------------------------------
+// One executor replaces the three per-domain cloud tasks. Two lanes so bulk
+// transfers (pack sync: multi-MB downloads + index rebuilds) can never sit in
+// front of interactive work the user is actively waiting on (session start,
+// candidate pages, images, todo refresh) -- the "late candidate result blocks
+// the word page" class of stalls. Per-domain busy flags, sleep leases, result
+// slots and generations keep their existing semantics; only the task/queue
+// plumbing is shared.
+enum class CloudDomain : uint8_t {
+    kTodo,
+    kWord,
+    kNote,
+    // Reserved sync domain for the problem (错题) feature; no executor yet.
+    kProblem,
+};
+
+enum class CloudLane : uint8_t {
+    kInteractive,
+    kBulk,
+};
+
+struct CloudJob {
+    CloudDomain domain = CloudDomain::kTodo;
+    // Requests are PODs, so one job slot carries any domain's request.
+    union {
+        TodoCloudRequest todo;
+        WordCloudRequest word;
+        NoteCloudRequest note;
+    };
+    CloudJob() : todo() {}
+};
+
+struct CloudResultReady {
+    CloudDomain domain = CloudDomain::kTodo;
+    uint32_t generation = 0;
+};
+
+esp_err_t StartCloudRunner();
+bool EnqueueCloudJob(const CloudJob& job);
+extern QueueHandle_t g_cloud_result_queue;
+
 static_assert(std::is_trivially_copyable_v<TodoCloudResultReady>);
 static_assert(std::is_trivially_copyable_v<WordCloudResultReady>);
+static_assert(std::is_trivially_copyable_v<NoteCloudResultReady>);
+static_assert(std::is_trivially_copyable_v<CloudJob>);
+static_assert(std::is_trivially_copyable_v<CloudResultReady>);
 
 void SendTodoCloudResult();
 void SendWordCloudResult();
+void SendNoteCloudResult();
 const TodoCloudResult* PeekTodoCloudResult(uint32_t generation);
-const WordCloudResult* PeekWordCloudResult(uint32_t generation);
+WordCloudResult* PeekWordCloudResult(uint32_t generation);
+NoteCloudResult* PeekNoteCloudResult(uint32_t generation);
 
 bool IsTodoCloudBusy();
 bool IsWordCloudBusy();
+bool IsNoteCloudBusy();
 void FinishTodoCloudRequest();
 void FinishWordCloudRequest();
+void FinishNoteCloudRequest();
 
 bool QueueTodoCloudRequest(const TodoCloudRequest& request);
 bool QueueWordCloudRequest(const WordCloudRequest& request);
+bool QueueNoteCloudRequest(const NoteCloudRequest& request);
 
 bool QueueTodoRefresh();
 bool QueueTodoRefreshCursor(const std::string& cursor);
 bool QueueTodoComplete(const std::string& todo_id);
 
 bool QueueWordReviewRefresh();
-bool QueueWordReviewSubmit(const wqn::WqnWordReviewSubmission& submission, const std::string& word);
+bool QueueWordSessionStart(
+    const wqn::protocol::word_study_v1::CreateSessionRequest& request);
+bool QueueWordCandidatePage(
+    const std::string& session_id,
+    const wqn::protocol::word_study_v1::CandidatePageRequest& request);
+void PumpWordCandidatePrefetch(UiRuntime* runtime);
 bool QueueWordSearch(const wqn::WqnWordSearchRequest& search);
 bool QueueWordAiLookup(const wqn::WqnWordAiLookupRequest& lookup);
 
-bool ApplyTodoCloudResult(wqn::UiState* state, const TodoCloudResult& result);
-bool ApplyWordCloudResult(wqn::UiState* state, const WordCloudResult& result);
+bool QueueNotePackSync();
+bool QueueNoteSessionStart(
+    const wqn::protocol::note_study_v1::CreateSessionRequest& request);
+bool QueueNoteCandidatePage(
+    const std::string& session_id,
+    const wqn::protocol::note_study_v1::CandidatePageRequest& request);
+void PumpNoteCandidatePrefetch(UiRuntime* runtime);
+bool QueueNoteImageFetch(
+    const std::string& note_id, uint8_t image_index, const std::string& image_id);
+void PumpNoteImageFetch(UiRuntime* runtime);
+void PumpNoteObservationCommit(UiRuntime* runtime);
+
+bool ApplyTodoCloudResult(
+    wqn::UiState* state,
+    const TodoCloudResult& result,
+    bool* content_changed = nullptr);
+bool ApplyWordCloudResult(wqn::UiState* state, WordCloudResult& result);
+bool ApplyNoteCloudResult(wqn::UiState* state, NoteCloudResult& result);
 
 bool RefreshTodosFromCloud(wqn::UiState* state);
 RefreshSchedule CompleteSelectedTodo(wqn::UiState* state);
 
-void TodoCloudTask(void*);
-void WordCloudTask(void*);
+void ExecuteTodoCloudRequest(const TodoCloudRequest& request);
+void ExecuteWordCloudRequest(const WordCloudRequest& request);
+void ExecuteNoteCloudRequest(const NoteCloudRequest& request);
 
 bool LoadValidTokenForTodo(std::string* token);
 
@@ -336,6 +464,10 @@ const char* AiStatusLabel(wqn::AiSessionStatus status);
 
 esp_err_t RenderWordToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule);
 
+// ---- Note page --------------------------------------------------------------
+
+esp_err_t RenderNoteToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule);
+
 // ---- Settings page ----------------------------------------------------------
 
 esp_err_t DrawSettingsRow(size_t row_index, int y, const std::string& title, const std::string& value, bool selected);
@@ -368,12 +500,6 @@ size_t TodoVisibleStart(const wqn::TodoUiState& todo, size_t selected, size_t vi
 
 extern SemaphoreHandle_t g_refresh_mutex;
 extern TaskHandle_t g_refresh_task;
-extern QueueHandle_t g_todo_request_queue;
-extern QueueHandle_t g_todo_result_queue;
-extern TaskHandle_t g_todo_task;
-extern QueueHandle_t g_word_request_queue;
-extern QueueHandle_t g_word_result_queue;
-extern TaskHandle_t g_word_task;
 extern QueueHandle_t g_display_result_queue;
 extern wqn::UiFrame g_pending_frames[2];
 extern std::string g_pending_signatures[2];

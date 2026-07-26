@@ -122,6 +122,31 @@ foreach(source IN LISTS firmware_sources)
     endif()
 endforeach()
 
+wqn_reject(
+    "main/storage.cpp"
+    "SaveBlobToNvs[ \t\r\n]*\\([ \t\r\n]*kProblemsKey"
+    "problem content cache must use the bounded WQPC SPIFFS transaction, never NVS")
+
+set(removed_word_client_patterns
+    "WqnWord(Sync|Review)"
+    "(Fetch|Parse|Submit)Word(Sync|Review)"
+    "[/]words[/](sync|review)"
+    "daily_target"
+    "review_indices"
+    "pending_submit"
+    "random_review"
+    "wsess[.]"
+    "WordAppMode::k(ReviewFront|ReviewBack|DictionaryDetail|LookupResult)")
+foreach(source IN LISTS firmware_sources)
+    wqn_read("${source}" contents)
+    foreach(pattern IN LISTS removed_word_client_patterns)
+        if(contents MATCHES "${pattern}")
+            message(FATAL_ERROR
+                "M8 architecture gate: ${source}: removed legacy word path matched ${pattern}")
+        endif()
+    endforeach()
+endforeach()
+
 set(removed_legacy_paths
     main/epd_display.cpp
     main/epd_display.h

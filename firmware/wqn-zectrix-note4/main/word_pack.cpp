@@ -4,19 +4,26 @@
 #include <array>
 #include <cerrno>
 #include <cctype>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <dirent.h>
+#include <limits>
 #include <string>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <utility>
 
 #include "cJSON.h"
+#include "device_protocol/word_study.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_spiffs.h"
+#include "esp_timer.h"
 #include "mbedtls/sha256.h"
 #include "runtime/sleep_coordinator.h"
 #include "services/storage_service.h"
+#include "word_study_store.h"
 
 namespace {
 
@@ -25,9 +32,26 @@ constexpr char kStorageRoot[] = "/storage";
 constexpr char kManifestPath[] = "/storage/wp_manifest.json";
 constexpr char kManifestTempPath[] = "/storage/wp_manifest.tmp";
 constexpr char kManifestBackupPath[] = "/storage/wp_manifest.bak";
-constexpr char kPackMagic[] = "WQN_WORD_PACK_V1";
-constexpr size_t kMaxIndexEntries = 10000;
-constexpr size_t kLineBufferSize = 4096;
+constexpr char kPackMagic[] = "WQN_WORD_PACK_V2";
+constexpr size_t kMaxIndexEntries = wqn::protocol::word_study_v1::kMaxPackEntries;
+constexpr size_t kMaxPackBytes = wqn::protocol::word_study_v1::kMaxPackBytes;
+constexpr size_t kMaxLineBytes = wqn::protocol::word_study_v1::kMaxPackLineBytes;
+constexpr size_t kPackIdStemChars = 6;
+constexpr size_t kPackHashStemChars = 12;
+constexpr wqn::protocol::word_study_v1::Mode kPersistedSessionModes[] = {
+    wqn::protocol::word_study_v1::Mode::kSequential,
+    wqn::protocol::word_study_v1::Mode::kRandom,
+    wqn::protocol::word_study_v1::Mode::kDictionary,
+};
+// SPIFFS counts the leading slash in its object name and reserves one byte for
+// NUL. Keep the longest final suffix (.wqwp) strictly within that budget.
+constexpr size_t kMaxPackObjectNameBytes =
+    1 + 3 + kPackIdStemChars + 1 + kPackHashStemChars + 5;
+static_assert(
+    kMaxPackObjectNameBytes <= CONFIG_SPIFFS_OBJ_NAME_LEN - 1,
+    "word pack filename exceeds SPIFFS object-name budget");
+// Maximum contract line, its required LF, and the terminating NUL for fgets.
+constexpr size_t kLineBufferSize = kMaxLineBytes + 2;
 
 class JsonDocument {
 public:
@@ -47,26 +71,88 @@ std::string GetOptionalString(cJSON* object, const char* key)
     return cJSON_IsString(item) && item->valuestring != nullptr ? item->valuestring : "";
 }
 
-int GetOptionalInt(cJSON* object, const char* key)
+bool GetExactUint64(cJSON* object, const char* key, uint64_t* value)
 {
+    if (!cJSON_IsObject(object) || key == nullptr || value == nullptr) {
+        return false;
+    }
     cJSON* item = cJSON_GetObjectItemCaseSensitive(object, key);
-    return cJSON_IsNumber(item) ? item->valueint : 0;
+    if (!cJSON_IsNumber(item) || !std::isfinite(item->valuedouble) ||
+        item->valuedouble < 0 ||
+        item->valuedouble > static_cast<double>(wqn::protocol::v3::kMaxSafeJsonInteger) ||
+        std::floor(item->valuedouble) != item->valuedouble) {
+        return false;
+    }
+    *value = static_cast<uint64_t>(item->valuedouble);
+    return true;
 }
 
-void TrimLineEnding(std::string* value)
+bool GetExactInt32(cJSON* object, const char* key, int32_t* value)
 {
-    if (value == nullptr) {
-        return;
+    if (!cJSON_IsObject(object) || key == nullptr || value == nullptr) {
+        return false;
     }
-    while (!value->empty() && (value->back() == '\n' || value->back() == '\r')) {
-        value->pop_back();
+    cJSON* item = cJSON_GetObjectItemCaseSensitive(object, key);
+    if (!cJSON_IsNumber(item) || !std::isfinite(item->valuedouble) ||
+        std::floor(item->valuedouble) != item->valuedouble ||
+        item->valuedouble < std::numeric_limits<int32_t>::min() ||
+        item->valuedouble > std::numeric_limits<int32_t>::max()) {
+        return false;
     }
+    *value = static_cast<int32_t>(item->valuedouble);
+    return true;
 }
 
 bool FileExists(const std::string& path)
 {
     struct stat st = {};
     return stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode);
+}
+
+void ReleaseWordPackIndexAllocations(wqn::WordPackIndex* index)
+{
+    if (index == nullptr) return;
+    // swap with empty vectors so the PSRAM allocator releases capacity even
+    // when index construction exits with pack_error.  Clearing alone keeps
+    // capacity attached to the global index and makes every retry start with
+    // less memory than the previous attempt.
+    std::vector<
+        wqn::WordPackIndexEntry,
+        wqn::PsramAllocator<wqn::WordPackIndexEntry>> empty_entries;
+    index->entries.swap(empty_entries);
+    std::vector<uint32_t, wqn::PsramAllocator<uint32_t>> empty_dictionary;
+    index->dictionary_order.swap(empty_dictionary);
+    std::vector<
+        wqn::WordPackIdentity,
+        wqn::PsramAllocator<wqn::WordPackIdentity>> empty_identities;
+    index->pack_identities.swap(empty_identities);
+}
+
+esp_err_t ReadBoundedPackLine(FILE* file, std::vector<char>* buffer, std::string* line)
+{
+    if (file == nullptr || buffer == nullptr || line == nullptr ||
+        buffer->size() != kLineBufferSize) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    line->clear();
+    if (std::fgets(buffer->data(), buffer->size(), file) == nullptr) {
+        return std::feof(file) ? ESP_ERR_NOT_FOUND : ESP_FAIL;
+    }
+    const size_t length = std::strlen(buffer->data());
+    if (length == 0 || (*buffer)[length - 1] != '\n') {
+        // Every v2 line is LF-terminated. Missing LF also detects an overlong
+        // line before cJSON sees a truncated prefix.
+        return ESP_ERR_INVALID_SIZE;
+    }
+    size_t content_length = length - 1;
+    if (content_length > 0 && (*buffer)[content_length - 1] == '\r') {
+        --content_length;
+    }
+    if (content_length > kMaxLineBytes) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    line->assign(buffer->data(), content_length);
+    return ESP_OK;
 }
 
 }  // namespace
@@ -76,13 +162,13 @@ namespace wqn {
 std::string SafePackStem(const WqnWordPackManifestItem& item)
 {
     std::string stem;
-    stem.reserve(25);
+    stem.reserve(kPackIdStemChars + 1 + kPackHashStemChars);
     for (const char ch : item.pack_id) {
         const bool keep = (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z');
         if (keep) {
             stem.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
         }
-        if (stem.size() >= 8) {
+        if (stem.size() >= kPackIdStemChars) {
             break;
         }
     }
@@ -98,7 +184,7 @@ std::string SafePackStem(const WqnWordPackManifestItem& item)
                               (ch >= 'A' && ch <= 'F');
             if (keep) {
                 stem.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
-                if (++hash_chars >= 16) {
+                if (++hash_chars >= kPackHashStemChars) {
                     break;
                 }
             }
@@ -129,24 +215,19 @@ std::string TempPackPathForItem(const wqn::WqnWordPackManifestItem& item)
     return std::string(kStorageRoot) + "/wp_" + wqn::SafePackStem(item) + ".tmp";
 }
 
-std::string HexSha256(const uint8_t* data, size_t size)
+void AddManifestPackStems(
+    const wqn::WqnWordPackManifest& manifest,
+    std::vector<std::string>* stems)
 {
-    std::array<unsigned char, 32> digest = {};
-    mbedtls_sha256(data, size, digest.data(), 0);
-
-    constexpr char kHex[] = "0123456789abcdef";
-    std::string out;
-    out.reserve(64);
-    for (const unsigned char byte : digest) {
-        out.push_back(kHex[byte >> 4]);
-        out.push_back(kHex[byte & 0x0F]);
+    if (stems == nullptr) {
+        return;
     }
-    return out;
-}
-
-std::string HexSha256(const std::string& bytes)
-{
-    return HexSha256(reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size());
+    for (const wqn::WqnWordPackManifestItem& item : manifest.packs) {
+        const std::string stem = wqn::SafePackStem(item);
+        if (std::find(stems->begin(), stems->end(), stem) == stems->end()) {
+            stems->push_back(stem);
+        }
+    }
 }
 
 bool VerifyFileSha256(const std::string& path, const std::string& expected)
@@ -245,14 +326,123 @@ esp_err_t ParsePackManifestFile(wqn::WqnWordPackManifest* manifest)
     return wqn::ParseWordPackManifestResponse(payload, manifest);
 }
 
-void ParsePackEntryLine(const char* line, wqn::WqnWordEntry* entry)
+void PruneUnreferencedPackFiles(const wqn::WqnWordPackManifest& current)
 {
-    if (line == nullptr || entry == nullptr) {
+    std::vector<std::string> retained_stems;
+    std::vector<std::string> pinned_hash_prefixes;
+    AddManifestPackStems(current, &retained_stems);
+
+    for (const auto mode : kPersistedSessionModes) {
+        wqn::PersistedWordSession pinned_session;
+        if (wqn::LoadPersistedWordSession(mode, &pinned_session) == ESP_OK &&
+            pinned_session.active) {
+            for (const auto& snapshot : pinned_session.remote.snapshot) {
+                const std::string sha256 = snapshot.sha256;
+                if (sha256.size() >= kPackHashStemChars) {
+                    pinned_hash_prefixes.push_back(
+                        sha256.substr(0, kPackHashStemChars));
+                }
+            }
+        }
+    }
+
+    if (FileExists(kManifestBackupPath)) {
+        std::string backup_payload;
+        wqn::WqnWordPackManifest backup;
+        if (ReadWholeFile(kManifestBackupPath, &backup_payload) != ESP_OK ||
+            wqn::ParseWordPackManifestResponse(backup_payload, &backup) != ESP_OK) {
+            ESP_LOGW(kTag, "word pack backup manifest invalid; skip pruning rollback files");
+            return;
+        }
+        AddManifestPackStems(backup, &retained_stems);
+    }
+
+    DIR* directory = opendir(kStorageRoot);
+    if (directory == nullptr) {
+        ESP_LOGW(kTag, "word pack prune opendir failed");
         return;
     }
+    while (dirent* entry = readdir(directory)) {
+        const std::string name = entry->d_name;
+        constexpr char kPrefix[] = "wp_";
+        constexpr char kSuffix[] = ".wqwp";
+        if (name.size() <= sizeof(kPrefix) - 1 + sizeof(kSuffix) - 1 ||
+            name.compare(0, sizeof(kPrefix) - 1, kPrefix) != 0 ||
+            name.compare(name.size() - (sizeof(kSuffix) - 1), sizeof(kSuffix) - 1, kSuffix) != 0) {
+            continue;
+        }
+        const std::string stem = name.substr(
+            sizeof(kPrefix) - 1,
+            name.size() - (sizeof(kPrefix) - 1) - (sizeof(kSuffix) - 1));
+        if (std::find(retained_stems.begin(), retained_stems.end(), stem) != retained_stems.end()) {
+            continue;
+        }
+        const bool pinned = std::any_of(
+            pinned_hash_prefixes.begin(),
+            pinned_hash_prefixes.end(),
+            [&](const std::string& hash) {
+                return stem.size() > hash.size() &&
+                    stem.compare(stem.size() - hash.size(), hash.size(), hash) == 0;
+            });
+        if (pinned) {
+            continue;
+        }
+        const std::string path = std::string(kStorageRoot) + "/" + name;
+        if (std::remove(path.c_str()) == 0) {
+            ESP_LOGI(kTag, "pruned stale word pack: %s", name.c_str());
+        } else {
+            ESP_LOGW(kTag, "failed to prune stale word pack: %s", name.c_str());
+        }
+    }
+    closedir(directory);
+}
+
+esp_err_t ResetWordPackStorageCacheRaw(void*)
+{
+    const char* manifest_paths[] = {
+        kManifestPath,
+        kManifestTempPath,
+        kManifestBackupPath,
+    };
+    for (const char* path : manifest_paths) {
+        if (std::remove(path) != 0 && errno != ENOENT) {
+            return ESP_FAIL;
+        }
+    }
+
+    DIR* directory = opendir(kStorageRoot);
+    if (directory == nullptr) {
+        return ESP_FAIL;
+    }
+    esp_err_t result = ESP_OK;
+    while (dirent* entry = readdir(directory)) {
+        const std::string name = entry->d_name;
+        const bool managed_pack =
+            name.size() > 8 && name.compare(0, 3, "wp_") == 0 &&
+            (name.compare(name.size() - 5, 5, ".wqwp") == 0 ||
+             name.compare(name.size() - 4, 4, ".tmp") == 0);
+        if (!managed_pack) {
+            continue;
+        }
+        const std::string path = std::string(kStorageRoot) + "/" + name;
+        if (std::remove(path.c_str()) != 0 && errno != ENOENT) {
+            result = ESP_FAIL;
+            ESP_LOGW(kTag, "failed to clear word pack cache file: %s", name.c_str());
+        }
+    }
+    closedir(directory);
+    return result;
+}
+
+esp_err_t ParsePackEntryLine(const char* line, wqn::WqnWordEntry* entry, int32_t* sort_index)
+{
+    if (line == nullptr || entry == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *entry = {};
     JsonDocument document(line);
     if (!document.ok() || !cJSON_IsObject(document.root())) {
-        return;
+        return ESP_ERR_INVALID_RESPONSE;
     }
 
     entry->id = GetOptionalString(document.root(), "id");
@@ -269,7 +459,20 @@ void ParsePackEntryLine(const char* line, wqn::WqnWordEntry* entry)
     entry->part_of_speech = GetOptionalString(document.root(), "part_of_speech");
     entry->status = GetOptionalString(document.root(), "status");
     entry->due_at = GetOptionalString(document.root(), "due_at");
-    entry->revision = GetOptionalInt(document.root(), "revision");
+    uint64_t parsed_revision = 0;
+    int32_t parsed_sort_index = 0;
+    if (entry->id.size() != 36 || entry->word.empty() || entry->word.size() > 80 ||
+        entry->normalized_word.empty() || entry->normalized_word.size() > 80 ||
+        !GetExactUint64(document.root(), "revision", &parsed_revision) ||
+        parsed_revision == 0 || parsed_revision > std::numeric_limits<int>::max() ||
+        !GetExactInt32(document.root(), "sort_index", &parsed_sort_index)) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    entry->revision = static_cast<int>(parsed_revision);
+    if (sort_index != nullptr) {
+        *sort_index = parsed_sort_index;
+    }
+    return ESP_OK;
 }
 
 void CopyField(char* dst, size_t dst_size, const std::string& src)
@@ -284,28 +487,40 @@ void CopyField(char* dst, size_t dst_size, const std::string& src)
 
 esp_err_t ScanPackFile(
     const wqn::WqnWordPackManifestItem& item,
+    uint32_t deck_order,
     wqn::WordPackIndex* index)
 {
+    if (index == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
     const std::string path = PackPathForItem(item);
     FILE* file = std::fopen(path.c_str(), "rb");
     if (file == nullptr) {
         return ESP_ERR_NOT_FOUND;
     }
+    const size_t initial_entry_count = index->entries.size();
+    struct EntryRollback {
+        wqn::WordPackIndex* index;
+        size_t initial_size;
+        bool committed = false;
+        ~EntryRollback()
+        {
+            if (!committed && index != nullptr) {
+                index->entries.resize(initial_size);
+            }
+        }
+    } rollback{index, initial_entry_count};
 
     // [stack-fix] 4 KB on the stack + the deep fgets->SPIFFS->esp_partition_read
     // ->tlsf_walk_pool call chain overflowed the 8 KB task stack and corrupted
     // the adjacent heap (crash in tlsf_walk_pool reading a smashed block header).
     // Keep this large buffer off the stack.
-    std::vector<char> line(kLineBufferSize, 0);
-    if (std::fgets(line.data(), line.size(), file) == nullptr) {
+    std::vector<char> line_buffer(kLineBufferSize, 0);
+    std::string line;
+    esp_err_t result = ReadBoundedPackLine(file, &line_buffer, &line);
+    if (result != ESP_OK || line != kPackMagic) {
         std::fclose(file);
-        return ESP_FAIL;
-    }
-    std::string header = line.data();
-    TrimLineEnding(&header);
-    if (header != kPackMagic) {
-        std::fclose(file);
-        return ESP_ERR_INVALID_STATE;
+        return result == ESP_OK ? ESP_ERR_INVALID_STATE : result;
     }
 
     // [mem-fix] Reserve up front so the PSRAM-backed vector doesn't realloc +
@@ -313,49 +528,159 @@ esp_err_t ScanPackFile(
     // from the manifest; add it to the existing size (multiple packs accumulate
     // into one index) and clamp to the hard cap.
     if (item.entry_count > 0) {
-        size_t target = index->entries.size() + static_cast<size_t>(item.entry_count);
+        const size_t target = index->entries.size() + static_cast<size_t>(item.entry_count);
         if (target > kMaxIndexEntries) {
-            target = kMaxIndexEntries;
+            std::fclose(file);
+            return ESP_ERR_INVALID_SIZE;
         }
         if (target > index->entries.capacity()) {
             index->entries.reserve(target);
         }
     }
 
-    if (std::fgets(line.data(), line.size(), file) == nullptr) {
+    result = ReadBoundedPackLine(file, &line_buffer, &line);
+    if (result != ESP_OK) {
         std::fclose(file);
-        return ESP_FAIL;
+        return result;
+    }
+    JsonDocument metadata(line.c_str());
+    uint64_t metadata_revision = 0;
+    uint64_t metadata_schema = 0;
+    uint64_t metadata_entries = 0;
+    if (!metadata.ok() || !cJSON_IsObject(metadata.root()) ||
+        GetOptionalString(metadata.root(), "deck_id") != item.deck_id ||
+        !GetExactUint64(metadata.root(), "revision", &metadata_revision) ||
+        metadata_revision != item.content_revision ||
+        !GetExactUint64(metadata.root(), "schema_version", &metadata_schema) ||
+        metadata_schema != wqn::protocol::word_study_v1::kPackSchemaVersion ||
+        GetOptionalString(metadata.root(), "format") != "jsonl" ||
+        GetOptionalString(metadata.root(), "compression") != "none" ||
+        GetOptionalString(metadata.root(), "lexicon_type") != "english_word" ||
+        !GetExactUint64(metadata.root(), "entry_count", &metadata_entries) ||
+        metadata_entries != item.entry_count) {
+        std::fclose(file);
+        return ESP_ERR_INVALID_RESPONSE;
     }
 
     // Pack stem is identical for every entry in this file; compute once.
     const std::string pack_stem = wqn::SafePackStem(item);
 
-    while (index->entries.size() < kMaxIndexEntries) {
+    uint32_t scanned_entries = 0;
+    while (true) {
         const long offset = std::ftell(file);
-        if (std::fgets(line.data(), line.size(), file) == nullptr) {
+        result = ReadBoundedPackLine(file, &line_buffer, &line);
+        if (result == ESP_ERR_NOT_FOUND) {
             break;
         }
+        if (result != ESP_OK || offset < 0 ||
+            static_cast<unsigned long>(offset) > std::numeric_limits<uint32_t>::max()) {
+            std::fclose(file);
+            return result == ESP_OK ? ESP_ERR_INVALID_SIZE : result;
+        }
         wqn::WqnWordEntry entry;
-        ParsePackEntryLine(line.data(), &entry);
-        if (entry.word.empty()) {
-            continue;
+        int32_t sort_index = 0;
+        result = ParsePackEntryLine(line.c_str(), &entry, &sort_index);
+        if (result != ESP_OK) {
+            std::fclose(file);
+            return result;
         }
 
         wqn::WordPackIndexEntry indexed = {};
+        CopyField(indexed.word_id, sizeof(indexed.word_id), entry.id);
+        CopyField(indexed.deck_id, sizeof(indexed.deck_id), item.deck_id);
         CopyField(indexed.word, sizeof(indexed.word), entry.word);
-        const std::string& normalized =
-            !entry.normalized_word.empty() ? entry.normalized_word : wqn::NormalizeWordLookupText(entry.word);
-        CopyField(indexed.normalized_word, sizeof(indexed.normalized_word), normalized);
+        CopyField(indexed.normalized_word, sizeof(indexed.normalized_word), entry.normalized_word);
         CopyField(indexed.pack_stem, sizeof(indexed.pack_stem), pack_stem);
         indexed.file_offset = static_cast<uint32_t>(offset);
+        indexed.deck_order = deck_order;
+        indexed.sort_index = sort_index;
         index->entries.push_back(indexed);
-    }
-    if (!std::feof(file)) {
-        index->truncated = true;
-        // [trunc-warn] Log when the pack exceeds the hard cap so it's not silent
-        ESP_LOGW(kTag, "word pack truncated at kMaxIndexEntries=%zu (pack=%s) - excess entries dropped", kMaxIndexEntries, item.pack_id.c_str());
+        ++scanned_entries;
+        if (index->entries.size() > kMaxIndexEntries || scanned_entries > item.entry_count) {
+            std::fclose(file);
+            return ESP_ERR_INVALID_SIZE;
+        }
     }
     std::fclose(file);
+    if (scanned_entries != item.entry_count) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    rollback.committed = true;
+    return ESP_OK;
+}
+
+esp_err_t FindPinnedPackItem(
+    const wqn::StoredWordPackSnapshot& snapshot,
+    wqn::WqnWordPackManifestItem* item)
+{
+    const std::string sha256 = snapshot.sha256;
+    if (item == nullptr || sha256.size() < kPackHashStemChars) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    const std::string suffix = "_" + sha256.substr(0, kPackHashStemChars) + ".wqwp";
+    DIR* directory = opendir(kStorageRoot);
+    if (directory == nullptr) return ESP_FAIL;
+    std::string matched_name;
+    while (dirent* entry = readdir(directory)) {
+        const std::string name = entry->d_name;
+        if (name.size() > suffix.size() + 3 && name.compare(0, 3, "wp_") == 0 &&
+            name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0) {
+            matched_name = name;
+            break;
+        }
+    }
+    closedir(directory);
+    if (matched_name.empty()) return ESP_ERR_NOT_FOUND;
+
+    const std::string path = std::string(kStorageRoot) + "/" + matched_name;
+    FILE* file = std::fopen(path.c_str(), "rb");
+    if (file == nullptr) return ESP_ERR_NOT_FOUND;
+    std::vector<char> line_buffer(kLineBufferSize, 0);
+    std::string line;
+    esp_err_t result = ReadBoundedPackLine(file, &line_buffer, &line);
+    if (result != ESP_OK || line != kPackMagic) {
+        std::fclose(file);
+        return result == ESP_OK ? ESP_ERR_INVALID_RESPONSE : result;
+    }
+    result = ReadBoundedPackLine(file, &line_buffer, &line);
+    std::fclose(file);
+    if (result != ESP_OK) return result;
+
+    JsonDocument metadata(line.c_str());
+    uint64_t revision = 0;
+    uint64_t schema_version = 0;
+    uint64_t entry_count = 0;
+    if (!metadata.ok() ||
+        GetOptionalString(metadata.root(), "deck_id") != snapshot.deck_id ||
+        !GetExactUint64(metadata.root(), "revision", &revision) ||
+        revision != snapshot.content_revision ||
+        !GetExactUint64(metadata.root(), "schema_version", &schema_version) ||
+        schema_version != wqn::protocol::word_study_v1::kPackSchemaVersion ||
+        !GetExactUint64(metadata.root(), "entry_count", &entry_count) ||
+        entry_count > kMaxIndexEntries) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    const std::string stem = matched_name.substr(3, matched_name.size() - 3 - 5);
+    const size_t separator = stem.find('_');
+    if (separator == std::string::npos || separator == 0) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    wqn::WqnWordPackManifestItem parsed;
+    parsed.pack_id = stem.substr(0, separator);
+    parsed.deck_id = snapshot.deck_id;
+    parsed.revision = snapshot.pack_revision;
+    parsed.pack_revision = snapshot.pack_revision;
+    parsed.content_revision = snapshot.content_revision;
+    parsed.schema_version = static_cast<uint32_t>(schema_version);
+    parsed.format = "jsonl";
+    parsed.compression = "none";
+    parsed.sha256 = sha256;
+    parsed.entry_count = static_cast<uint32_t>(entry_count);
+    struct stat status = {};
+    if (stat(path.c_str(), &status) == 0 && S_ISREG(status.st_mode)) {
+        parsed.byte_size = static_cast<uint32_t>(status.st_size);
+    }
+    *item = std::move(parsed);
     return ESP_OK;
 }
 
@@ -375,6 +700,87 @@ esp_err_t InitWordPackStorage()
     return ESP_OK;
 }
 
+esp_err_t ResetWordPackStorageCache()
+{
+    runtime::SleepLease storage_lease = runtime::SleepLease::TryAcquire(
+        runtime::SleepBlocker::kStorage,
+        "word-pack-cache-reset",
+        __FILE__,
+        __LINE__);
+    if (!storage_lease) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    const esp_err_t result = services::ExecuteStorageTransaction(
+        ResetWordPackStorageCacheRaw, nullptr);
+    if (result == ESP_OK) {
+        ESP_LOGW(kTag, "cleared incompatible word pack cache; cloud content is recoverable");
+    }
+    return result;
+}
+
+esp_err_t LoadWordPackManifest(WqnWordPackManifest* manifest)
+{
+    if (manifest == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *manifest = {};
+    return ParsePackManifestFile(manifest);
+}
+
+esp_err_t MergeWordPackManifestDelta(
+    const WqnWordPackManifest& delta,
+    WqnWordPackManifest* merged)
+{
+    if (merged == nullptr || delta.cursor > protocol::v3::kMaxSafeJsonInteger) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    WqnWordPackManifest current;
+    const esp_err_t load_result = LoadWordPackManifest(&current);
+    if (load_result != ESP_OK && load_result != ESP_ERR_NOT_FOUND) {
+        return load_result;
+    }
+    if (load_result == ESP_ERR_NOT_FOUND) {
+        current = {};
+    }
+    if (delta.cursor < current.cursor) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    for (const WqnWordPackManifestItem& change : delta.packs) {
+        auto existing = std::find_if(
+            current.packs.begin(),
+            current.packs.end(),
+            [&](const WqnWordPackManifestItem& item) {
+                return item.deck_id == change.deck_id;
+            });
+        if (change.deleted) {
+            if (existing != current.packs.end()) {
+                current.packs.erase(existing);
+            }
+            continue;
+        }
+        if (change.deck_id.empty() || change.pack_id.empty()) {
+            return ESP_ERR_INVALID_RESPONSE;
+        }
+        if (existing == current.packs.end()) {
+            current.packs.push_back(change);
+        } else {
+            *existing = change;
+        }
+    }
+    std::sort(
+        current.packs.begin(),
+        current.packs.end(),
+        [](const WqnWordPackManifestItem& left, const WqnWordPackManifestItem& right) {
+            return left.deck_id < right.deck_id;
+        });
+    current.cursor = delta.cursor;
+    current.has_more = delta.has_more;
+    current.server_time = delta.server_time;
+    *merged = std::move(current);
+    return ESP_OK;
+}
+
 esp_err_t SaveWordPackManifestRaw(const WqnWordPackManifest& manifest)
 {
     cJSON* root = cJSON_CreateObject();
@@ -390,6 +796,8 @@ esp_err_t SaveWordPackManifestRaw(const WqnWordPackManifest& manifest)
     cJSON_AddBoolToObject(root, "success", true);
     cJSON_AddItemToObject(root, "data", data);
     cJSON_AddStringToObject(data, "server_time", manifest.server_time.c_str());
+    cJSON_AddNumberToObject(data, "cursor", static_cast<double>(manifest.cursor));
+    cJSON_AddBoolToObject(data, "has_more", manifest.has_more);
     cJSON_AddItemToObject(data, "packs", packs);
 
     for (const WqnWordPackManifestItem& item : manifest.packs) {
@@ -401,8 +809,11 @@ esp_err_t SaveWordPackManifestRaw(const WqnWordPackManifest& manifest)
         cJSON_AddStringToObject(pack, "pack_id", item.pack_id.c_str());
         cJSON_AddStringToObject(pack, "deck_id", item.deck_id.c_str());
         cJSON_AddStringToObject(pack, "title", item.title.c_str());
-        cJSON_AddStringToObject(pack, "revision", item.revision.c_str());
-        cJSON_AddStringToObject(pack, "schema_version", item.schema_version.c_str());
+        cJSON_AddNumberToObject(pack, "revision", static_cast<double>(item.revision));
+        cJSON_AddNumberToObject(pack, "content_revision", static_cast<double>(item.content_revision));
+        cJSON_AddNumberToObject(pack, "pack_revision", static_cast<double>(item.pack_revision));
+        cJSON_AddNumberToObject(pack, "change_sequence", static_cast<double>(item.change_sequence));
+        cJSON_AddNumberToObject(pack, "schema_version", item.schema_version);
         cJSON_AddStringToObject(pack, "format", item.format.c_str());
         cJSON_AddStringToObject(pack, "compression", item.compression.c_str());
         cJSON_AddStringToObject(pack, "sha256", item.sha256.c_str());
@@ -457,6 +868,7 @@ esp_err_t SaveWordPackManifestRaw(const WqnWordPackManifest& manifest)
         std::remove(kManifestTempPath);
         return ESP_FAIL;
     }
+    PruneUnreferencedPackFiles(manifest);
     return ESP_OK;
 }
 
@@ -478,11 +890,16 @@ esp_err_t SaveWordPackManifest(const WqnWordPackManifest& manifest)
         const_cast<WqnWordPackManifest*>(&manifest));
 }
 
-esp_err_t LoadWordPackIndex(WordPackIndex* index)
+esp_err_t LoadWordPackIndexInternal(
+    const PersistedWordSession* pinned_session,
+    WordPackIndex* index)
 {
     if (index == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
+    // SHA verification, JSONL scanning and dictionary sorting are CPU-bound.
+    // Keep maximum frequency scoped to this rebuild instead of disabling DFS.
+    auto cpu_lease = runtime::CpuPerformanceLease::TryAcquire();
     *index = WordPackIndex{};
     index->mounted = InitWordPackStorage() == ESP_OK;
     if (!index->mounted) {
@@ -501,8 +918,124 @@ esp_err_t LoadWordPackIndex(WordPackIndex* index)
         index->status_message = "词库清单损坏";
         return ESP_OK;
     }
+
+    bool pinned_pack_missing = false;
+    if (pinned_session != nullptr && pinned_session->active) {
+        for (const auto& snapshot : pinned_session->remote.snapshot) {
+            auto existing = std::find_if(
+                manifest.packs.begin(),
+                manifest.packs.end(),
+                [&](const WqnWordPackManifestItem& value) {
+                    return value.deck_id == snapshot.deck_id;
+                });
+            if (existing != manifest.packs.end() &&
+                existing->sha256 == snapshot.sha256) {
+                continue;
+            }
+            WqnWordPackManifestItem pinned;
+            if (FindPinnedPackItem(snapshot, &pinned) == ESP_OK) {
+                if (existing == manifest.packs.end()) {
+                    manifest.packs.push_back(std::move(pinned));
+                } else {
+                    *existing = std::move(pinned);
+                }
+            } else {
+                pinned_pack_missing = true;
+                if (existing != manifest.packs.end()) {
+                    manifest.packs.erase(existing);
+                }
+            }
+        }
+    }
     index->has_manifest = true;
     index->pack_count = manifest.packs.size();
+    index->pack_identities.reserve(manifest.packs.size());
+    for (const WqnWordPackManifestItem& item : manifest.packs) {
+        if (item.deck_id.size() != 36 || item.sha256.size() != 64) {
+            index->pack_error = true;
+            index->status_message = "词库清单无效";
+            ReleaseWordPackIndexAllocations(index);
+            return ESP_OK;
+        }
+        WordPackIdentity identity;
+        std::snprintf(
+            identity.deck_id,
+            sizeof(identity.deck_id),
+            "%s",
+            item.deck_id.c_str());
+        identity.content_revision = item.content_revision;
+        identity.pack_revision = item.pack_revision;
+        std::snprintf(
+            identity.sha256,
+            sizeof(identity.sha256),
+            "%s",
+            item.sha256.c_str());
+        index->pack_identities.push_back(identity);
+    }
+
+    size_t expected_entries = 0;
+    for (const WqnWordPackManifestItem& item : manifest.packs) {
+        if (item.entry_count > kMaxIndexEntries - expected_entries) {
+            index->pack_error = true;
+            index->status_message = "词库条目过多";
+            ReleaseWordPackIndexAllocations(index);
+            return ESP_OK;
+        }
+        expected_entries += item.entry_count;
+    }
+    const size_t entry_index_bytes =
+        expected_entries * sizeof(WordPackIndexEntry);
+    const size_t dictionary_index_bytes =
+        expected_entries * sizeof(uint32_t);
+    const size_t required_psram = entry_index_bytes + dictionary_index_bytes;
+    constexpr size_t kIndexAllocationReserveBytes = 64U * 1024U;
+    const size_t free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    const size_t largest_psram =
+        heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
+    if (required_psram > free_psram ||
+        free_psram - required_psram < kIndexAllocationReserveBytes ||
+        entry_index_bytes > largest_psram) {
+        index->pack_error = true;
+        index->status_message = "词库索引内存不足";
+        ESP_LOGW(
+            kTag,
+            "word pack index PSRAM preflight failed: need=%u entries=%u dictionary=%u free=%u largest=%u reserve=%u",
+            static_cast<unsigned>(required_psram),
+            static_cast<unsigned>(entry_index_bytes),
+            static_cast<unsigned>(dictionary_index_bytes),
+            static_cast<unsigned>(free_psram),
+            static_cast<unsigned>(largest_psram),
+            static_cast<unsigned>(kIndexAllocationReserveBytes));
+        ReleaseWordPackIndexAllocations(index);
+        return ESP_OK;
+    }
+    index->entries.reserve(expected_entries);
+
+    // The entries allocation can split the largest free block. Re-check the
+    // exact second allocation instead of assuming that the remaining total is
+    // contiguous. WordStorePsramAllocator deliberately aborts on allocation
+    // failure, so this guard must run immediately before reserve().
+    const size_t remaining_psram =
+        heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    const size_t remaining_largest_psram =
+        heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
+    if (dictionary_index_bytes > remaining_largest_psram ||
+        dictionary_index_bytes > remaining_psram ||
+        remaining_psram - dictionary_index_bytes <
+            kIndexAllocationReserveBytes) {
+        index->pack_error = true;
+        index->status_message = "词库索引内存不足";
+        ESP_LOGW(
+            kTag,
+            "word pack dictionary PSRAM preflight failed: need=%u free=%u largest=%u reserve=%u",
+            static_cast<unsigned>(dictionary_index_bytes),
+            static_cast<unsigned>(remaining_psram),
+            static_cast<unsigned>(remaining_largest_psram),
+            static_cast<unsigned>(kIndexAllocationReserveBytes));
+        ReleaseWordPackIndexAllocations(index);
+        return ESP_OK;
+    }
+    index->dictionary_order.reserve(expected_entries);
 
     for (const WqnWordPackManifestItem& item : manifest.packs) {
         const std::string path = PackPathForItem(item);
@@ -515,27 +1048,38 @@ esp_err_t LoadWordPackIndex(WordPackIndex* index)
             index->status_message = "词库校验失败";
             continue;
         }
-        const esp_err_t scan_result = ScanPackFile(item, index);
+        index->manifest_revision = std::max(index->manifest_revision, item.change_sequence);
+        const esp_err_t scan_result = ScanPackFile(
+            item,
+            static_cast<uint32_t>(&item - manifest.packs.data()),
+            index);
         if (scan_result != ESP_OK) {
             index->pack_error = true;
             index->status_message = "词库读取失败";
         }
     }
 
-    // [sort-fix] Sort entries globally by normalized_word. Each pack file is
-    // individually sorted, but multi-pack concatenation breaks the global
-    // ordering that FindWordPackPrefixMatches / WordPackNextLetters rely on
-    // for their early-break optimization (strncmp > 0 -> break). Without
-    // this sort, the dictionary may silently miss matches from later packs.
-    if (index->entries.size() > 1) {
-        std::sort(index->entries.begin(), index->entries.end(),
-                  [](const WordPackIndexEntry& a, const WordPackIndexEntry& b) {
-                      return std::strcmp(a.normalized_word, b.normalized_word) < 0;
-                  });
+    // Preserve entries in stable deck/import order for sequential study. The
+    // dictionary gets its own compact indirection array so lookup never
+    // rewrites the study order.
+    for (size_t entry_index = 0; entry_index < index->entries.size(); ++entry_index) {
+        index->dictionary_order.push_back(static_cast<uint32_t>(entry_index));
     }
+    std::sort(
+        index->dictionary_order.begin(),
+        index->dictionary_order.end(),
+        [&](uint32_t left, uint32_t right) {
+            const WordPackIndexEntry& a = index->entries[left];
+            const WordPackIndexEntry& b = index->entries[right];
+            const int word_compare = std::strcmp(a.normalized_word, b.normalized_word);
+            return word_compare != 0 ? word_compare < 0 : std::strcmp(a.word_id, b.word_id) < 0;
+        });
 
     if (index->entries.empty() && index->status_message.empty()) {
         index->status_message = "词库为空";
+    } else if (pinned_pack_missing) {
+        index->pack_error = true;
+        index->status_message = "会话词包缺失";
     } else if (index->status_message.empty()) {
         index->status_message = "词库已就绪";
     }
@@ -552,78 +1096,228 @@ esp_err_t LoadWordPackIndex(WordPackIndex* index)
     return ESP_OK;
 }
 
-esp_err_t SaveWordPackFromBytesRaw(const WqnWordPackManifestItem& item, const std::string& bytes)
+esp_err_t LoadWordPackIndex(WordPackIndex* index)
 {
-    if (item.pack_id.empty() || item.sha256.empty() || bytes.empty()) {
-        return ESP_ERR_INVALID_ARG;
+    for (const auto mode : kPersistedSessionModes) {
+        PersistedWordSession session;
+        if (LoadPersistedWordSession(mode, &session) == ESP_OK &&
+            session.active && !session.paused) {
+            return LoadWordPackIndexInternal(&session, index);
+        }
     }
-    if (item.byte_size > 0 && static_cast<int>(bytes.size()) != item.byte_size) {
-        ESP_LOGW(kTag, "word pack size mismatch: expected=%d actual=%u", item.byte_size, static_cast<unsigned>(bytes.size()));
-        return ESP_ERR_INVALID_SIZE;
-    }
-    const std::string actual_sha = HexSha256(bytes);
-    if (actual_sha != item.sha256) {
-        ESP_LOGW(kTag, "word pack sha mismatch: pack_id=%s", item.pack_id.c_str());
-        return ESP_ERR_INVALID_CRC;
-    }
-
-    const std::string final_path = PackPathForItem(item);
-    if (VerifyFileSha256(final_path, item.sha256)) {
-        return ESP_OK;
-    }
-
-    const std::string tmp_path = TempPackPathForItem(item);
-    FILE* file = std::fopen(tmp_path.c_str(), "wb");
-    if (file == nullptr) {
-        ESP_LOGW(kTag, "word pack save fopen failed: pack_id=%s path=%s", item.pack_id.c_str(), tmp_path.c_str());
-        return ESP_FAIL;
-    }
-    const size_t written = std::fwrite(bytes.data(), 1, bytes.size(), file);
-    const bool flushed = std::fflush(file) == 0 && ::fsync(fileno(file)) == 0;
-    const bool closed = std::fclose(file) == 0;
-    if (written != bytes.size() || !flushed || !closed) {
-        ESP_LOGW(kTag, "word pack durable write failed: pack_id=%s want=%u got=%u",
-                 item.pack_id.c_str(), static_cast<unsigned>(bytes.size()), static_cast<unsigned>(written));
-        std::remove(tmp_path.c_str());
-        return ESP_FAIL;
-    }
-
-    if (FileExists(final_path) && std::remove(final_path.c_str()) != 0) {
-        ESP_LOGW(kTag, "word pack invalid destination remove failed: pack_id=%s", item.pack_id.c_str());
-        std::remove(tmp_path.c_str());
-        return ESP_FAIL;
-    }
-    if (std::rename(tmp_path.c_str(), final_path.c_str()) != 0) {
-        ESP_LOGW(kTag, "word pack rename failed: pack_id=%s %s -> %s",
-                 item.pack_id.c_str(), tmp_path.c_str(), final_path.c_str());
-        std::remove(tmp_path.c_str());
-        return ESP_FAIL;
-    }
-    return ESP_OK;
+    return LoadWordPackIndexInternal(nullptr, index);
 }
 
-struct WordPackWriteContext {
-    const WqnWordPackManifestItem* item;
-    const std::string* bytes;
+esp_err_t LoadWordPackIndexForSession(
+    const PersistedWordSession& session,
+    WordPackIndex* index)
+{
+    return LoadWordPackIndexInternal(&session, index);
+}
+
+bool WordPackIndexMatchesSession(
+    const WordPackIndex& index,
+    const PersistedWordSession& session)
+{
+    if (!index.mounted || !index.has_manifest || index.pack_error ||
+        !session.active || session.remote.snapshot.empty()) {
+        return false;
+    }
+    for (const StoredWordPackSnapshot& snapshot : session.remote.snapshot) {
+        const auto identity = std::find_if(
+            index.pack_identities.begin(),
+            index.pack_identities.end(),
+            [&](const WordPackIdentity& value) {
+                return std::strcmp(value.deck_id, snapshot.deck_id) == 0;
+            });
+        if (identity == index.pack_identities.end() ||
+            identity->content_revision != snapshot.content_revision ||
+            identity->pack_revision != snapshot.pack_revision ||
+            std::strcmp(identity->sha256, snapshot.sha256) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+enum class WordPackStreamOperation : uint8_t {
+    kBegin,
+    kAppend,
+    kCommit,
+    kAbort,
 };
 
-esp_err_t SaveWordPackBytesTransaction(void* opaque)
+struct WordPackStreamContext {
+    const WqnWordPackManifestItem* item = nullptr;
+    FILE* file = nullptr;
+    mbedtls_sha256_context sha = {};
+    bool sha_started = false;
+    size_t bytes_written = 0;
+    const uint8_t* chunk = nullptr;
+    size_t chunk_size = 0;
+    WordPackStreamOperation operation = WordPackStreamOperation::kBegin;
+};
+
+esp_err_t WordPackStreamTransaction(void* opaque)
 {
-    const auto* context = static_cast<const WordPackWriteContext*>(opaque);
-    return SaveWordPackFromBytesRaw(*context->item, *context->bytes);
+    auto* context = static_cast<WordPackStreamContext*>(opaque);
+    if (context == nullptr || context->item == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    const std::string temp_path = TempPackPathForItem(*context->item);
+    const std::string final_path = PackPathForItem(*context->item);
+    switch (context->operation) {
+        case WordPackStreamOperation::kBegin:
+            std::remove(temp_path.c_str());
+            context->file = std::fopen(temp_path.c_str(), "wb");
+            if (context->file == nullptr) {
+                ESP_LOGW(
+                    kTag,
+                    "word pack temp open failed: path=%s errno=%d",
+                    temp_path.c_str(),
+                    errno);
+                return ESP_FAIL;
+            }
+            if (mbedtls_sha256_starts(&context->sha, 0) != 0) {
+                std::fclose(context->file);
+                context->file = nullptr;
+                std::remove(temp_path.c_str());
+                return ESP_FAIL;
+            }
+            context->sha_started = true;
+            context->bytes_written = 0;
+            return ESP_OK;
+
+        case WordPackStreamOperation::kAppend:
+            if (context->file == nullptr || !context->sha_started ||
+                context->chunk == nullptr || context->chunk_size == 0 ||
+                context->bytes_written + context->chunk_size > context->item->byte_size ||
+                context->bytes_written + context->chunk_size > kMaxPackBytes) {
+                return ESP_ERR_INVALID_SIZE;
+            }
+            if (std::fwrite(
+                    context->chunk, 1, context->chunk_size, context->file) !=
+                context->chunk_size) {
+                return ESP_FAIL;
+            }
+            if (mbedtls_sha256_update(
+                    &context->sha, context->chunk, context->chunk_size) != 0) {
+                return ESP_FAIL;
+            }
+            context->bytes_written += context->chunk_size;
+            return ESP_OK;
+
+        case WordPackStreamOperation::kCommit: {
+            if (context->file == nullptr || !context->sha_started ||
+                context->bytes_written != context->item->byte_size) {
+                return ESP_ERR_INVALID_SIZE;
+            }
+            std::array<unsigned char, 32> digest = {};
+            if (mbedtls_sha256_finish(&context->sha, digest.data()) != 0) {
+                return ESP_FAIL;
+            }
+            context->sha_started = false;
+            constexpr char kHex[] = "0123456789abcdef";
+            std::string actual_sha;
+            actual_sha.reserve(64);
+            for (const unsigned char byte : digest) {
+                actual_sha.push_back(kHex[byte >> 4]);
+                actual_sha.push_back(kHex[byte & 0x0f]);
+            }
+            if (actual_sha != context->item->sha256) {
+                std::fclose(context->file);
+                context->file = nullptr;
+                std::remove(temp_path.c_str());
+                return ESP_ERR_INVALID_CRC;
+            }
+            const bool flushed = std::fflush(context->file) == 0 &&
+                ::fsync(fileno(context->file)) == 0;
+            const bool closed = std::fclose(context->file) == 0;
+            context->file = nullptr;
+            if (!flushed || !closed) {
+                std::remove(temp_path.c_str());
+                return ESP_FAIL;
+            }
+            if (FileExists(final_path) && std::remove(final_path.c_str()) != 0) {
+                std::remove(temp_path.c_str());
+                return ESP_FAIL;
+            }
+            if (std::rename(temp_path.c_str(), final_path.c_str()) != 0) {
+                std::remove(temp_path.c_str());
+                return ESP_FAIL;
+            }
+            return ESP_OK;
+        }
+
+        case WordPackStreamOperation::kAbort:
+            if (context->file != nullptr) {
+                std::fclose(context->file);
+                context->file = nullptr;
+            }
+            std::remove(temp_path.c_str());
+            return ESP_OK;
+    }
+    return ESP_ERR_INVALID_ARG;
 }
 
-esp_err_t SaveWordPackFromBytes(const WqnWordPackManifestItem& item, const std::string& bytes)
+esp_err_t AppendWordPackStream(
+    void* opaque,
+    const uint8_t* bytes,
+    size_t size)
 {
+    auto* context = static_cast<WordPackStreamContext*>(opaque);
+    if (context == nullptr || bytes == nullptr || size == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    context->operation = WordPackStreamOperation::kAppend;
+    context->chunk = bytes;
+    context->chunk_size = size;
+    return services::ExecuteStorageTransaction(
+        WordPackStreamTransaction, context);
+}
+
+esp_err_t DownloadWordPackToStorage(
+    const std::string& token,
+    const protocol::v3::RequestMetadata& metadata,
+    const WqnWordPackManifestItem& item)
+{
+    if (item.pack_id.empty() || item.sha256.size() != 64 ||
+        item.schema_version != protocol::word_study_v1::kPackSchemaVersion ||
+        item.entry_count > kMaxIndexEntries || item.byte_size == 0 ||
+        item.byte_size > kMaxPackBytes) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!WordPackNeedsDownload(item)) {
+        return ESP_OK;
+    }
     runtime::SleepLease storage_lease = runtime::SleepLease::TryAcquire(
-        runtime::SleepBlocker::kStorage, "word-pack-file", __FILE__, __LINE__);
+        runtime::SleepBlocker::kStorage, "word-pack-stream", __FILE__, __LINE__);
     if (!storage_lease) {
         return ESP_ERR_INVALID_STATE;
     }
-    WordPackWriteContext context = {&item, &bytes};
-    return services::ExecuteStorageTransaction(
-        SaveWordPackBytesTransaction,
-        &context);
+    WordPackStreamContext context;
+    context.item = &item;
+    mbedtls_sha256_init(&context.sha);
+    context.operation = WordPackStreamOperation::kBegin;
+    esp_err_t result = services::ExecuteStorageTransaction(
+        WordPackStreamTransaction, &context);
+    if (result == ESP_OK) {
+        result = DownloadWordPackStream(
+            token, metadata, item, AppendWordPackStream, &context);
+    }
+    if (result == ESP_OK) {
+        context.operation = WordPackStreamOperation::kCommit;
+        result = services::ExecuteStorageTransaction(
+            WordPackStreamTransaction, &context);
+    }
+    if (result != ESP_OK) {
+        context.operation = WordPackStreamOperation::kAbort;
+        ESP_ERROR_CHECK_WITHOUT_ABORT(
+            services::ExecuteStorageTransaction(
+                WordPackStreamTransaction, &context));
+    }
+    mbedtls_sha256_free(&context.sha);
+    return result;
 }
 
 bool WordPackNeedsDownload(const WqnWordPackManifestItem& item)
@@ -637,6 +1331,10 @@ esp_err_t ReadWordPackEntry(const WordPackIndexEntry& index_entry, WqnWordEntry*
     if (entry == nullptr || index_entry.pack_stem[0] == '\0') {
         return ESP_ERR_INVALID_ARG;
     }
+    // A card turn performs a bounded SPIFFS seek, JSONL read and cJSON parse.
+    // Keep that foreground work off the 40 MHz DFS floor as well.
+    auto cpu_lease = runtime::CpuPerformanceLease::TryAcquire();
+    const int64_t started_us = esp_timer_get_time();
     *entry = WqnWordEntry{};
 
     const std::string path = PackPathForStem(index_entry.pack_stem);
@@ -648,19 +1346,35 @@ esp_err_t ReadWordPackEntry(const WordPackIndexEntry& index_entry, WqnWordEntry*
         std::fclose(file);
         return ESP_FAIL;
     }
+    const int64_t opened_us = esp_timer_get_time();
     // [stack-fix] 4 KB on the stack + the deep fgets->SPIFFS->esp_partition_read
     // ->tlsf_walk_pool call chain overflowed the 8 KB task stack and corrupted
     // the adjacent heap (crash in tlsf_walk_pool reading a smashed block header).
     // Keep this large buffer off the stack.
-    std::vector<char> line(kLineBufferSize, 0);
-    if (std::fgets(line.data(), line.size(), file) == nullptr) {
-        std::fclose(file);
-        return ESP_FAIL;
-    }
+    std::vector<char> line_buffer(kLineBufferSize, 0);
+    std::string line;
+    const esp_err_t line_result = ReadBoundedPackLine(file, &line_buffer, &line);
     std::fclose(file);
+    const int64_t read_us = esp_timer_get_time();
+    if (line_result != ESP_OK) {
+        return line_result;
+    }
 
-    ParsePackEntryLine(line.data(), entry);
-    return entry->word.empty() ? ESP_FAIL : ESP_OK;
+    const esp_err_t parse_result = ParsePackEntryLine(line.c_str(), entry, nullptr);
+    if (parse_result != ESP_OK) {
+        return parse_result;
+    }
+    entry->id = index_entry.word_id;
+    entry->deck_id = index_entry.deck_id;
+    const int64_t finished_us = esp_timer_get_time();
+    ESP_LOGI(
+        kTag,
+        "word card loaded: open_seek_ms=%lld read_close_ms=%lld parse_ms=%lld total_ms=%lld",
+        static_cast<long long>((opened_us - started_us) / 1000),
+        static_cast<long long>((read_us - opened_us) / 1000),
+        static_cast<long long>((finished_us - read_us) / 1000),
+        static_cast<long long>((finished_us - started_us) / 1000));
+    return ESP_OK;
 }
 
 void FindWordPackPrefixMatches(const WordPackIndex& index, const std::string& prefix, size_t limit, std::vector<size_t>* matches)
@@ -670,22 +1384,24 @@ void FindWordPackPrefixMatches(const WordPackIndex& index, const std::string& pr
     }
     matches->clear();
     const std::string normalized = NormalizeWordLookupText(prefix);
-    // [dict-perf] Pack entries are sorted by normalized_word (cloud-side
-    // loadDeckEntries orders by sort_index, normalized_word). Once we pass
-    // the prefix range (strncmp > 0), all subsequent entries are also past
-    // the range, so we can break early instead of scanning all 3500+.
-    for (size_t i = 0; i < index.entries.size(); ++i) {
+    for (const uint32_t entry_index : index.dictionary_order) {
+        if (entry_index >= index.entries.size()) {
+            continue;
+        }
+        const WordPackIndexEntry& entry = index.entries[entry_index];
         if (!normalized.empty()) {
-            const int cmp = std::strncmp(index.entries[i].normalized_word,
-                                         normalized.c_str(), normalized.size());
+            const int cmp = std::strncmp(
+                entry.normalized_word,
+                normalized.c_str(),
+                normalized.size());
             if (cmp < 0) {
-                continue;  // before prefix range
+                continue;
             }
             if (cmp > 0) {
-                break;  // past prefix range, done
+                break;
             }
         }
-        matches->push_back(i);
+        matches->push_back(static_cast<size_t>(entry_index));
         if (matches->size() >= limit) {
             break;
         }
@@ -696,9 +1412,11 @@ std::vector<char> WordPackNextLetters(const WordPackIndex& index, const std::str
 {
     const std::string normalized = NormalizeWordLookupText(prefix);
     std::vector<char> letters;
-    // [dict-perf] Same early-break optimization as FindWordPackPrefixMatches:
-    // entries are sorted, so once strncmp > 0 we've passed the prefix range.
-    for (const WordPackIndexEntry& entry : index.entries) {
+    for (const uint32_t entry_index : index.dictionary_order) {
+        if (entry_index >= index.entries.size()) {
+            continue;
+        }
+        const WordPackIndexEntry& entry = index.entries[entry_index];
         const size_t nw_len = std::strlen(entry.normalized_word);
         if (nw_len <= normalized.size()) {
             // Entry is shorter than prefix; if sorted, skip (don't break

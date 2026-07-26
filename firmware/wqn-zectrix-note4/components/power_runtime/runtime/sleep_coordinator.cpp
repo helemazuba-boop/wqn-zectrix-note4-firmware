@@ -46,6 +46,7 @@ std::array<LeaseRecord, kMaxLeaseRecords> g_lease_records{};
 portMUX_TYPE g_lease_lock = portMUX_INITIALIZER_UNLOCKED;
 uint32_t g_next_lease_id = 1;
 esp_pm_lock_handle_t g_no_light_sleep_lock = nullptr;
+esp_pm_lock_handle_t g_cpu_freq_max_lock = nullptr;
 
 size_t BlockerIndex(wqn::runtime::SleepBlocker blocker)
 {
@@ -105,13 +106,72 @@ namespace wqn::runtime {
 esp_err_t InitSleepCoordinator()
 {
 #if CONFIG_PM_ENABLE
-    if (g_no_light_sleep_lock != nullptr) {
-        return ESP_OK;
+    if (g_no_light_sleep_lock == nullptr) {
+        const esp_err_t result = esp_pm_lock_create(
+            ESP_PM_NO_LIGHT_SLEEP, 0, "wqn_sleep_lease", &g_no_light_sleep_lock);
+        if (result != ESP_OK) {
+            return result;
+        }
     }
-    return esp_pm_lock_create(
-        ESP_PM_NO_LIGHT_SLEEP, 0, "wqn_sleep_lease", &g_no_light_sleep_lock);
+    if (g_cpu_freq_max_lock == nullptr) {
+        return esp_pm_lock_create(
+            ESP_PM_CPU_FREQ_MAX, 0, "wqn_cpu_work", &g_cpu_freq_max_lock);
+    }
+    return ESP_OK;
 #else
     return ESP_OK;
+#endif
+}
+
+CpuPerformanceLease::~CpuPerformanceLease()
+{
+    Reset();
+}
+
+CpuPerformanceLease::CpuPerformanceLease(CpuPerformanceLease&& other) noexcept
+    : active_(std::exchange(other.active_, false))
+{
+}
+
+CpuPerformanceLease& CpuPerformanceLease::operator=(
+    CpuPerformanceLease&& other) noexcept
+{
+    if (this != &other) {
+        Reset();
+        active_ = std::exchange(other.active_, false);
+    }
+    return *this;
+}
+
+CpuPerformanceLease CpuPerformanceLease::TryAcquire()
+{
+#if CONFIG_PM_ENABLE
+    if (g_cpu_freq_max_lock == nullptr) {
+        ESP_LOGE(kTag, "CPU performance lock is not initialized");
+        return {};
+    }
+    const esp_err_t result = esp_pm_lock_acquire(g_cpu_freq_max_lock);
+    if (result != ESP_OK) {
+        ESP_LOGE(kTag, "acquire CPU_FREQ_MAX lock failed: %s", esp_err_to_name(result));
+        return {};
+    }
+#endif
+    return CpuPerformanceLease(true);
+}
+
+void CpuPerformanceLease::Reset()
+{
+    if (!active_) {
+        return;
+    }
+    active_ = false;
+#if CONFIG_PM_ENABLE
+    if (g_cpu_freq_max_lock != nullptr) {
+        const esp_err_t result = esp_pm_lock_release(g_cpu_freq_max_lock);
+        if (result != ESP_OK) {
+            ESP_LOGE(kTag, "release CPU_FREQ_MAX lock failed: %s", esp_err_to_name(result));
+        }
+    }
 #endif
 }
 
@@ -124,6 +184,8 @@ const char* SleepBlockerName(SleepBlocker blocker)
             return "todo-cloud";
         case SleepBlocker::kWordCloud:
             return "word-cloud";
+        case SleepBlocker::kNoteCloud:
+            return "note-cloud";
         case SleepBlocker::kOnlineSync:
             return "online-sync";
         case SleepBlocker::kProvisioning:

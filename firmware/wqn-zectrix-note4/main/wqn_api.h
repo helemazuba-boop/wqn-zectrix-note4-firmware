@@ -1,10 +1,14 @@
 #pragma once
 
+#include <cstddef>
+#include <cstdint>
 #include <string>
 #include <vector>
 
 #include "esp_err.h"
 #include "device_protocol/v3.h"
+#include "device_protocol/note_study.h"
+#include "device_protocol/word_study.h"
 
 namespace wqn {
 
@@ -87,22 +91,6 @@ struct WqnTodoTimelineRequest {
     int limit = 24;
 };
 
-struct WqnWordDeck {
-    std::string id;
-    std::string title;
-    std::string description;
-    std::string source;
-    std::string language;
-    std::string target_language;
-    std::string updated_at;
-    bool is_system = false;
-    bool deleted = false;
-    int revision = 0;
-    int word_count = 0;
-    int due_count = 0;
-    int mastered_count = 0;
-};
-
 struct WqnWordEntry {
     std::string id;
     std::string deck_id;
@@ -117,71 +105,6 @@ struct WqnWordEntry {
     std::string due_at;
     bool deleted = false;
     int revision = 0;
-};
-
-struct WqnWordProgress {
-    std::string word_id;
-    std::string status;
-    std::string due_at;
-    int interval_days = 0;
-    int correct_streak = 0;
-    int lapses = 0;
-    int reviewed_count = 0;
-    int known_count = 0;
-    int unknown_count = 0;
-    int revision = 0;
-};
-
-struct WqnWordSyncRequest {
-    std::string cursor;
-    int limit = 200;
-};
-
-struct WqnWordSyncPage {
-    std::string cursor;
-    std::string server_time;
-    std::vector<WqnWordDeck> decks;
-    std::vector<WqnWordEntry> entries;
-    std::vector<WqnWordProgress> progress;
-};
-
-struct WqnWordReviewQueueRequest {
-    std::string mode = "sequential";
-    int limit = 20;
-};
-
-struct WqnWordReviewQueue {
-    std::string mode;
-    int daily_target = 0;
-    int reviewed_today = 0;
-    int due_count = 0;
-    std::vector<WqnWordEntry> words;
-};
-
-struct WqnWordReviewResultAction {
-    std::string type;
-    std::string word_id;
-    std::string word;
-    std::string problem_set_id;
-    std::string problem_id;
-    std::string deck_id;
-    std::string title;
-    std::string status;
-    std::string outcome;
-    std::string due_at;
-};
-
-struct WqnWordReviewSubmission {
-    std::string word_id;
-    std::string outcome;
-    std::string mode = "sequential";
-};
-
-struct WqnWordReviewSubmitResult {
-    std::string word_id;
-    std::string status;
-    std::string due_at;
-    std::vector<WqnWordReviewResultAction> actions;
 };
 
 struct WqnWordSearchRequest {
@@ -200,19 +123,51 @@ struct WqnWordPackManifestItem {
     std::string pack_id;
     std::string deck_id;
     std::string title;
-    std::string revision;
-    std::string schema_version;
+    uint64_t revision = 0;
+    uint64_t content_revision = 0;
+    uint64_t pack_revision = 0;
+    uint64_t change_sequence = 0;
+    uint32_t schema_version = 0;
     std::string format;
     std::string compression;
     std::string sha256;
     std::string download_url;
-    int entry_count = 0;
-    int byte_size = 0;
+    uint32_t entry_count = 0;
+    uint32_t byte_size = 0;
+    bool deleted = false;
 };
 
 struct WqnWordPackManifest {
     std::string server_time;
+    uint64_t cursor = 0;
+    bool has_more = false;
     std::vector<WqnWordPackManifestItem> packs;
+};
+
+// One notebook row of the note-study manifest. A pack is exactly one notebook's
+// note set, so pack_id equals notebook_id. `has_pack` is false when the server
+// returned a null pack (a notebook with no note content yet); `deleted` only
+// appears in manifest deltas and is resolved away when the aggregate is merged.
+struct WqnNotePackManifestNotebook {
+    std::string notebook_id;
+    std::string title;
+    uint64_t change_sequence = 0;
+    uint64_t content_revision = 0;
+    bool deleted = false;
+    bool has_pack = false;
+    std::string pack_id;
+    uint64_t pack_revision = 0;
+    uint32_t schema_version = 0;
+    uint32_t entry_count = 0;
+    uint32_t byte_size = 0;
+    std::string sha256;
+    std::string download_url;
+};
+
+struct WqnNotePackManifest {
+    uint64_t cursor = 0;
+    bool has_more = false;
+    std::vector<WqnNotePackManifestNotebook> notebooks;
 };
 
 struct WqnWordAiLookupRequest {
@@ -310,12 +265,102 @@ esp_err_t FetchTodoTimeline(const std::string& token, const WqnTodoTimelineReque
 esp_err_t FetchTodoTimeline(const std::string& token, WqnTodoListPage* page);
 esp_err_t FetchTodayPendingTodos(const std::string& token, WqnTodoListPage* page);
 esp_err_t CompleteTodo(const std::string& token, const std::string& todo_id, WqnTodoItem* todo);
-esp_err_t FetchWordSync(const std::string& token, const WqnWordSyncRequest& request, WqnWordSyncPage* page);
-esp_err_t FetchWordReviewQueue(const std::string& token, const WqnWordReviewQueueRequest& request, WqnWordReviewQueue* queue);
-esp_err_t SubmitWordReview(const std::string& token, const WqnWordReviewSubmission& submission, WqnWordReviewSubmitResult* result);
 esp_err_t SearchWords(const std::string& token, const WqnWordSearchRequest& request, WqnWordSearchResult* result);
-esp_err_t FetchWordPackManifest(const std::string& token, WqnWordPackManifest* manifest);
-esp_err_t DownloadWordPack(const std::string& token, const WqnWordPackManifestItem& item, std::string* body);
+esp_err_t FetchWordPackManifest(
+    const std::string& token,
+    const protocol::v3::RequestMetadata& metadata,
+    uint64_t cursor,
+    WqnWordPackManifest* manifest);
+esp_err_t CreateWordStudySessionV1(
+    const std::string& token,
+    const protocol::word_study_v1::CreateSessionRequest& request,
+    protocol::word_study_v1::SessionData* session,
+    protocol::v3::Error* error);
+esp_err_t FetchWordStudyCandidatePageV1(
+    const std::string& token,
+    const std::string& session_id,
+    const protocol::word_study_v1::CandidatePageRequest& request,
+    protocol::word_study_v1::CandidatePageData* page,
+    protocol::v3::Error* error);
+esp_err_t SubmitWordStudyObservationV1(
+    const std::string& token,
+    const protocol::word_study_v1::ObservationRequest& request,
+    protocol::word_study_v1::ObservationData* observation,
+    protocol::v3::Error* error,
+    bool* transport_failure);
+esp_err_t SkipWordStudyObservationV1(
+    const std::string& token,
+    const protocol::word_study_v1::ObservationRequest& request,
+    protocol::word_study_v1::ObservationData* observation,
+    protocol::v3::Error* error,
+    bool* transport_failure);
+using WqnHttpChunkSink = esp_err_t (*)(
+    void* context,
+    const uint8_t* bytes,
+    size_t size);
+esp_err_t DownloadWordPackStream(
+    const std::string& token,
+    const protocol::v3::RequestMetadata& metadata,
+    const WqnWordPackManifestItem& item,
+    WqnHttpChunkSink sink,
+    void* context);
+// Fetches one page of the note-study manifest starting at `cursor`. Reuses the
+// note-study-v1 protocol builder/parser and flattens the result into the
+// storage-facing WqnNotePackManifest.
+esp_err_t FetchNoteStudyManifest(
+    const std::string& token,
+    const protocol::v3::RequestMetadata& metadata,
+    uint64_t cursor,
+    WqnNotePackManifest* manifest);
+// Streams one notebook's note pack (application/x-ndjson) into `sink`. Bounded by
+// the manifest byte_size and the note-study-v1 pack cap.
+esp_err_t DownloadNotePackStream(
+    const std::string& token,
+    const protocol::v3::RequestMetadata& metadata,
+    const WqnNotePackManifestNotebook& notebook,
+    WqnHttpChunkSink sink,
+    void* context);
+// Downloads one note image as a WQNI file (20-byte header + 15000-byte 1-bpp
+// payload) from /v3/notes/images/{note_id}/{image_index}. Verifies the exact
+// file size and that sha256(bytes) == expected_image_id (the content address
+// carried by the pack line); WQNI header/CRC validation is the caller's job
+// via wqn::ValidateNoteImageWqni.
+esp_err_t DownloadNoteImageV1(
+    const std::string& token,
+    const protocol::v3::RequestMetadata& metadata,
+    const std::string& note_id,
+    uint8_t image_index,
+    const std::string& expected_image_id,
+    std::vector<uint8_t>* wqni);
+esp_err_t CreateNoteStudySessionV1(
+    const std::string& token,
+    const protocol::note_study_v1::CreateSessionRequest& request,
+    protocol::note_study_v1::SessionData* session,
+    protocol::v3::Error* error);
+esp_err_t FetchNoteStudyCandidatePageV1(
+    const std::string& token,
+    const std::string& session_id,
+    const protocol::note_study_v1::CandidatePageRequest& request,
+    protocol::note_study_v1::CandidatePageData* page,
+    protocol::v3::Error* error);
+// Uploads one durable `opened` observation (device v1 emits only kOpened).
+// `transport_failure` distinguishes a network fault (retry) from a server
+// rejection (inspect error.retryable / error.code).
+esp_err_t SubmitNoteStudyObservationV1(
+    const std::string& token,
+    const protocol::note_study_v1::ObservationRequest& request,
+    protocol::note_study_v1::ObservationData* observation,
+    protocol::v3::Error* error,
+    bool* transport_failure);
+// Writes a durable, non-projecting tombstone for a sequence so the server's
+// monotonic next_sequence advances past a locally-quarantined record; otherwise
+// the following observation is rejected forever with STUDY_SEQUENCE_GAP.
+esp_err_t SkipNoteStudyObservationV1(
+    const std::string& token,
+    const protocol::note_study_v1::ObservationRequest& request,
+    protocol::note_study_v1::ObservationData* observation,
+    protocol::v3::Error* error,
+    bool* transport_failure);
 esp_err_t LookupWordWithAi(const std::string& token, const WqnWordAiLookupRequest& request, WqnWordAiLookupResult* result);
 esp_err_t SyncDueProblemsAndLog(const std::string& token);
 
@@ -417,9 +462,6 @@ esp_err_t UploadAiAudioChat(
 
 esp_err_t ParseTodoListResponse(const std::string& body, WqnTodoListPage* page);
 esp_err_t ParseTodoCompleteResponse(const std::string& body, WqnTodoItem* todo);
-esp_err_t ParseWordSyncResponse(const std::string& body, WqnWordSyncPage* page);
-esp_err_t ParseWordReviewQueueResponse(const std::string& body, WqnWordReviewQueue* queue);
-esp_err_t ParseWordReviewSubmitResponse(const std::string& body, WqnWordReviewSubmitResult* result);
 esp_err_t ParseWordSearchResponse(const std::string& body, WqnWordSearchResult* result);
 esp_err_t ParseWordPackManifestResponse(const std::string& body, WqnWordPackManifest* manifest);
 esp_err_t ParseWordAiLookupResponse(const std::string& body, WqnWordAiLookupResult* result);

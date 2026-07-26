@@ -12,6 +12,8 @@
 
 namespace wqn {
 
+struct PersistedWordSession;
+
 // [mem-fix] The word index is large (3500+ entries, each with several short
 // strings -> ~1.4 MB). CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=512 forces every
 // small malloc into the ~298 KB internal RAM, so std::string-backed entries
@@ -50,16 +52,25 @@ bool operator!=(const PsramAllocator<A>&, const PsramAllocator<B>&) noexcept {
 // PSRAM-backed, fixed-size POD index entry. Deliberately NOT std::string:
 // a std::basic_string with a custom PSRAM allocator corrupted the heap during
 // vector growth/move (SSO interactions), crashing in tlsf_walk_pool. A trivially
-// copyable POD is memcpy/realloc-safe in the PSRAM vector and also far smaller
-// (~128 B/entry vs ~400 B). Fields the review/dictionary flow doesn't need
-// (word_id / deck_id / status) are dropped; ReadWordPackEntry re-parses the full
-// entry from the pack file anyway. Strings are length-capped; over-long words are
-// truncated (rare; only affects display/prefix-match of >47-byte tokens).
+// copyable POD is memcpy/realloc-safe in the PSRAM vector. W3 retains stable
+// item/deck IDs and import ordering so sessions can pin exact content while a
+// separate compact dictionary index provides lexicographic lookup.
 struct WordPackIndexEntry {
-    char word[48];
-    char normalized_word[48];
+    char word_id[37];
+    char deck_id[37];
+    char word[81];
+    char normalized_word[81];
     char pack_stem[28];
     uint32_t file_offset;
+    uint32_t deck_order;
+    int32_t sort_index;
+};
+
+struct WordPackIdentity {
+    char deck_id[37] = {};
+    uint64_t content_revision = 0;
+    uint64_t pack_revision = 0;
+    char sha256[65] = {};
 };
 
 struct WordPackIndex {
@@ -70,13 +81,30 @@ struct WordPackIndex {
     std::string status_message;
     size_t pack_count = 0;
     size_t pack_bytes = 0;
+    uint64_t manifest_revision = 0;
     std::vector<WordPackIndexEntry, PsramAllocator<WordPackIndexEntry>> entries;
+    std::vector<uint32_t, PsramAllocator<uint32_t>> dictionary_order;
+    std::vector<WordPackIdentity, PsramAllocator<WordPackIdentity>> pack_identities;
 };
 
 esp_err_t InitWordPackStorage();
+esp_err_t ResetWordPackStorageCache();
+esp_err_t LoadWordPackManifest(WqnWordPackManifest* manifest);
+esp_err_t MergeWordPackManifestDelta(
+    const WqnWordPackManifest& delta,
+    WqnWordPackManifest* merged);
 esp_err_t SaveWordPackManifest(const WqnWordPackManifest& manifest);
 esp_err_t LoadWordPackIndex(WordPackIndex* index);
-esp_err_t SaveWordPackFromBytes(const WqnWordPackManifestItem& item, const std::string& bytes);
+esp_err_t LoadWordPackIndexForSession(
+    const PersistedWordSession& session,
+    WordPackIndex* index);
+bool WordPackIndexMatchesSession(
+    const WordPackIndex& index,
+    const PersistedWordSession& session);
+esp_err_t DownloadWordPackToStorage(
+    const std::string& token,
+    const protocol::v3::RequestMetadata& metadata,
+    const WqnWordPackManifestItem& item);
 bool WordPackNeedsDownload(const WqnWordPackManifestItem& item);
 esp_err_t ReadWordPackEntry(const WordPackIndexEntry& index_entry, WqnWordEntry* entry);
 void FindWordPackPrefixMatches(const WordPackIndex& index, const std::string& prefix, size_t limit, std::vector<size_t>* matches);

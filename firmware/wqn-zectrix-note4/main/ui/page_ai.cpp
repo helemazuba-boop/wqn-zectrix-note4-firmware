@@ -9,6 +9,7 @@
 // result + elapsed.
 
 #include "ui_internal.h"
+#include "ui_widgets.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -51,6 +52,8 @@ constexpr int kAiViewportBottomPad = 22;
 const char* AiStatusLabel(wqn::AiSessionStatus status)
 {
     switch (status) {
+        case wqn::AiSessionStatus::kPreparingCapture:
+            return "准备录音";
         case wqn::AiSessionStatus::kListening:
             return "录音";
         case wqn::AiSessionStatus::kWaitingReply:
@@ -74,11 +77,11 @@ const char* AiStatusLabel(wqn::AiSessionStatus status)
 #define DRC(...) do { (void)wqn::DrawUtf8Text(__VA_ARGS__); } while (0)
 
 // Shared 1bpp status-bar assets. selected = 反白 (ink bg + paper glyph).
+// Delegated to DrawSelectableIcon (ui_widgets) so the reverse-fill focus
+// language is owned by the decoration layer. padding=0 keeps the legacy
+// 16x16 cell semantics (background square == asset size, glyph at (x,y)).
 static void DrawStatusAsset(int x, int y, const WqnBitmapAsset& asset, bool selected) {
-    if (selected) {
-        FillRect(x, y, 16, 16, true);
-    }
-    DrawWqnBitmapAsset(x, y, asset, !selected);
+    DrawSelectableIcon(x, y, asset, selected, /*padding=*/0);
 }
 
 static void DrawThinkingIcon(int x, int y, wqn::ThinkingLevel level, bool selected) {
@@ -115,9 +118,14 @@ static void DrawTrashIcon(int x, int y, bool selected) {
     DrawStatusAsset(x, y, a12_ai_clear_context_16_asset, selected);
 }
 
-constexpr int kAiToggleX = 62;
+// [toggle-cluster] The four status-bar toggles (thinking/TTS/expand/trash)
+// pack tightly right after the tier icon. tier occupies x=6..22 (16px); the
+// toggle cluster starts at kAiToggleX with a small gap, and consecutive
+// toggles are kAiToggleStep apart (18 = 16px icon + 2px gap). The edit-mode
+// zone rect spans exactly the four icons plus a 2px pad on each side.
+constexpr int kAiToggleX = 30;
 constexpr int kAiToggleY = 5;
-constexpr int kAiToggleStep = 21;
+constexpr int kAiToggleStep = 18;
 
 void DrawAiStatusBar(const wqn::AiSessionState& ai, const wqn::HomeSummary& home, const wqn::StatusBarEditState& status_edit)
 {
@@ -138,7 +146,8 @@ void DrawAiStatusBar(const wqn::AiSessionState& ai, const wqn::HomeSummary& home
     // Flash hides the whole zone (only the tier icon, button 0, is editable).
     if (ai.tier != wqn::AiTier::kFlash) {
         if (status_edit.active) {
-            DrawRect(kAiToggleX - 4, kAiToggleY - 2, kAiToggleStep * 4 + 2, 20);
+            // Zone rect hugs the four tightly-packed toggle icons (2px pad).
+            DrawRect(kAiToggleX - 2, kAiToggleY - 2, kAiToggleStep * 3 + 16 + 4, 20);
         }
         DrawThinkingIcon(kAiToggleX + 0 * kAiToggleStep, kAiToggleY, ai.thinking_level, status_edit.active && status_edit.selected == 1);
         DrawTtsIcon(kAiToggleX + 1 * kAiToggleStep, kAiToggleY, ai.tts_on, status_edit.active && status_edit.selected == 2);
@@ -146,21 +155,19 @@ void DrawAiStatusBar(const wqn::AiSessionState& ai, const wqn::HomeSummary& home
         DrawTrashIcon(kAiToggleX + 3 * kAiToggleStep, kAiToggleY, status_edit.active && status_edit.selected == 4);
     }
 
-    // Center column: when the toast is visible, replace the clock with the
-    // toast label so the user still has a top-level status readout without
-    // burning an extra 24 px of vertical space. The status label "录音 /
-    // 识别 / 流式 / 完成 / 错误" is shown on the right just to the left of
-    // the WiFi chip.
+    // Center column: reserved for the toast label. When the toast is visible
+    // the label is centred horizontally and the status readout moves out of the
+    // status bar; when the toast is absent the centre column is left empty
+    // (the idle status label lives on the right, joining the WiFi glyph there).
+    // The clock is intentionally not shown on the AI status bar -- AI omits the
+    // time column the other pages show, so the three-way (toast/clock/status)
+    // contest for the centre column shrinks to just toast here.
     if (ai.toast_visible && !ai.toast_label.empty()) {
-        // Centre the toast label horizontally.
         const int w = wqn::MeasureUtf8TextWidth(ai.toast_label.c_str());
         const int cx = std::max(70, (wqn::kEpdWidth - w) / 2);
         DRC(cx, 6, ai.toast_label.c_str(), true);
         // Blinker square on the right side when active.
         FillRect(wqn::kEpdWidth - 34, 8, 4, 4, true);
-    } else if (!home.primary_time_line.empty()) {
-        const int w = wqn::MeasureUtf8TextWidth(home.primary_time_line.c_str());
-        DRC(160 - w / 2, 6, home.primary_time_line.c_str(), true);
     }
 
     // Right-of-status: idle-state status label only (skipped while toast

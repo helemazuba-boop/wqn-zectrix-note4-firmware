@@ -12,11 +12,13 @@
 #include "esp_timer.h"
 #include "nvs.h"
 #include "nvs_flash.h"
+#include "problem_cache.h"
 #include "services/sync_service.h"
 #include "runtime/sleep_coordinator.h"
 #include "runtime/storage_schema.h"
 #include "services/storage_service.h"
 #include "sdkconfig.h"
+#include "word_study_store.h"
 
 namespace {
 
@@ -421,6 +423,164 @@ esp_err_t ParseArrayPayload(const std::string& payload, cJSON** array)
     return *array != nullptr ? ESP_OK : ESP_ERR_NO_MEM;
 }
 
+esp_err_t ParseLegacyProblemsJson(
+    const std::string& payload,
+    std::vector<wqn::CachedProblem>* problems)
+{
+    if (problems == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    problems->clear();
+    if (payload.empty()) {
+        return ESP_OK;
+    }
+
+    cJSON* array = nullptr;
+    ESP_RETURN_ON_ERROR(ParseArrayPayload(payload, &array), kTag, "parse legacy problem cache");
+    JsonDocument document(array);
+    const int count = cJSON_GetArraySize(document.root());
+    if (count < 0) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    problems->reserve(static_cast<size_t>(count));
+    for (int i = 0; i < count; ++i) {
+        cJSON* item = cJSON_GetArrayItem(document.root(), i);
+        if (!cJSON_IsObject(item)) {
+            return ESP_ERR_INVALID_STATE;
+        }
+        wqn::CachedProblem problem;
+        problem.id = GetOptionalString(item, "id");
+        problem.title = GetOptionalString(item, "title");
+        problem.type = GetOptionalString(item, "type");
+        problem.status = GetOptionalString(item, "status");
+        problem.content_text = GetOptionalString(item, "content_text");
+        problem.solution_text = GetOptionalString(item, "solution_text");
+        problem.asset_count = GetOptionalInt(item, "asset_count");
+        problem.solution_asset_count = GetOptionalInt(item, "solution_asset_count");
+        problem.updated_at = GetOptionalString(item, "updated_at");
+        if (problem.id.empty()) {
+            return ESP_ERR_INVALID_STATE;
+        }
+        problems->push_back(std::move(problem));
+    }
+    return ESP_OK;
+}
+
+struct ProblemCacheWriteContext {
+    const std::vector<wqn::CachedProblem>* problems = nullptr;
+};
+
+esp_err_t SaveProblemCacheTransaction(void* opaque)
+{
+    const auto* context = static_cast<const ProblemCacheWriteContext*>(opaque);
+    return context == nullptr || context->problems == nullptr
+        ? ESP_ERR_INVALID_ARG
+        : wqn::problem_cache::Save(*context->problems);
+}
+
+esp_err_t ClearProblemCacheTransaction(void*)
+{
+    esp_err_t result = wqn::problem_cache::Clear();
+    const esp_err_t legacy_result = ClearNvsKeyRaw(kProblemsKey);
+    if (result == ESP_OK) {
+        result = legacy_result;
+    }
+    return result;
+}
+
+esp_err_t ClearProblemFilesTransaction(void*)
+{
+    return wqn::problem_cache::Clear();
+}
+
+esp_err_t MigrateLegacyProblemCache()
+{
+    std::vector<wqn::CachedProblem> existing;
+    const esp_err_t existing_result = wqn::problem_cache::Load(&existing);
+    if (existing_result == ESP_OK) {
+        const esp_err_t clear_result = ClearNvsKey(kProblemsKey);
+        if (clear_result == ESP_OK) {
+            ESP_LOGI(kTag, "legacy NVS problem cache key absent or removed");
+        }
+        return clear_result;
+    }
+    if (existing_result != ESP_ERR_NOT_FOUND) {
+        ESP_LOGW(
+            kTag,
+            "discarding invalid regenerable WQPC before legacy migration: %s",
+            esp_err_to_name(existing_result));
+        ESP_RETURN_ON_ERROR(
+            wqn::services::ExecuteStorageTransaction(
+                ClearProblemFilesTransaction,
+                nullptr),
+            kTag,
+            "clear invalid WQPC files");
+    }
+
+    std::string payload;
+    ESP_RETURN_ON_ERROR(
+        LoadBlobFromNvs(kProblemsKey, &payload),
+        kTag,
+        "load legacy NVS problem cache");
+    if (payload.empty()) {
+        return ClearNvsKey(kProblemsKey);
+    }
+
+    std::vector<wqn::CachedProblem> problems;
+    const esp_err_t parse_result = ParseLegacyProblemsJson(payload, &problems);
+    if (parse_result != ESP_OK) {
+        ESP_LOGW(
+            kTag,
+            "dropping unreadable regenerable NVS problem cache: bytes=%u error=%s",
+            static_cast<unsigned>(payload.size()),
+            esp_err_to_name(parse_result));
+        return ClearNvsKey(kProblemsKey);
+    }
+
+    ProblemCacheWriteContext context = {&problems};
+    const esp_err_t save_result =
+        wqn::services::ExecuteStorageTransaction(SaveProblemCacheTransaction, &context);
+    if (save_result != ESP_OK) {
+        // The cache is cloud-reconstructable. Reclaim scarce NVS even if the
+        // SPIFFS migration cannot preserve this old snapshot; the next sync
+        // will rebuild it through the same atomic file path.
+        ESP_LOGW(
+            kTag,
+            "legacy problem cache migration failed; dropping regenerable cache: bytes=%u error=%s",
+            static_cast<unsigned>(payload.size()),
+            esp_err_to_name(save_result));
+        return ClearNvsKey(kProblemsKey);
+    }
+
+    ESP_RETURN_ON_ERROR(
+        ClearNvsKey(kProblemsKey),
+        kTag,
+        "remove migrated NVS problem cache");
+    ESP_LOGI(
+        kTag,
+        "legacy problem cache migrated: records=%u nvs_bytes_reclaimed=%u",
+        static_cast<unsigned>(problems.size()),
+        static_cast<unsigned>(payload.size()));
+    return ESP_OK;
+}
+
+esp_err_t MigrateLegacyProblemCacheTransaction(void*)
+{
+    return MigrateLegacyProblemCache();
+}
+
+struct ProblemCacheReadContext {
+    std::vector<wqn::CachedProblem>* problems = nullptr;
+};
+
+esp_err_t LoadProblemCacheTransaction(void* opaque)
+{
+    auto* context = static_cast<ProblemCacheReadContext*>(opaque);
+    return context == nullptr || context->problems == nullptr
+        ? ESP_ERR_INVALID_ARG
+        : wqn::problem_cache::Load(context->problems);
+}
+
 }  // namespace
 
 namespace wqn {
@@ -455,7 +615,21 @@ esp_err_t InitStorage()
 #endif
     ESP_LOGI(kTag, "NVS ready");
     ESP_RETURN_ON_ERROR(InitStoragePartition(), kTag, "init storage partition");
-    return services::StartStorageService();
+    ESP_RETURN_ON_ERROR(services::StartStorageService(), kTag, "start storage service");
+    // Legacy JSON parsing, WQPC inflate/deflate and file validation are all
+    // deliberately executed on StorageService. Besides preserving single
+    // ownership, this prevents their deeper bounded stack from consuming the
+    // 8 KiB IDF main task during boot.
+    const esp_err_t migration_result = services::ExecuteStorageTransaction(
+        MigrateLegacyProblemCacheTransaction,
+        nullptr);
+    if (migration_result != ESP_OK) {
+        ESP_LOGW(
+            kTag,
+            "legacy problem cache cleanup deferred: %s",
+            esp_err_to_name(migration_result));
+    }
+    return ESP_OK;
 }
 
 bool ReadStorageCapacitySnapshot(StorageCapacitySnapshot* snapshot)
@@ -573,32 +747,8 @@ esp_err_t SaveProblems(const std::vector<CachedProblem>& problems)
     if (!write) {
         return ESP_ERR_INVALID_STATE;
     }
-    JsonDocument document(cJSON_CreateArray());
-    if (document.root() == nullptr) {
-        return ESP_ERR_NO_MEM;
-    }
-
-    for (const CachedProblem& problem : problems) {
-        cJSON* item = cJSON_CreateObject();
-        if (item == nullptr ||
-            !cJSON_AddStringToObject(item, "id", problem.id.c_str()) ||
-            !cJSON_AddStringToObject(item, "title", problem.title.c_str()) ||
-            !cJSON_AddStringToObject(item, "type", problem.type.c_str()) ||
-            !cJSON_AddStringToObject(item, "status", problem.status.c_str()) ||
-            !cJSON_AddStringToObject(item, "content_text", problem.content_text.c_str()) ||
-            !cJSON_AddStringToObject(item, "solution_text", problem.solution_text.c_str()) ||
-            cJSON_AddNumberToObject(item, "asset_count", problem.asset_count) == nullptr ||
-            cJSON_AddNumberToObject(item, "solution_asset_count", problem.solution_asset_count) == nullptr ||
-            !cJSON_AddStringToObject(item, "updated_at", problem.updated_at.c_str())) {
-            cJSON_Delete(item);
-            return ESP_ERR_NO_MEM;
-        }
-        cJSON_AddItemToArray(document.root(), item);
-    }
-
-    std::string payload;
-    ESP_RETURN_ON_ERROR(JsonToString(document.root(), &payload), kTag, "serialize problem cache");
-    return SaveBlobToNvs(kProblemsKey, payload);
+    ProblemCacheWriteContext context = {&problems};
+    return services::ExecuteStorageTransaction(SaveProblemCacheTransaction, &context);
 }
 
 esp_err_t LoadProblems(std::vector<CachedProblem>* problems)
@@ -607,38 +757,15 @@ esp_err_t LoadProblems(std::vector<CachedProblem>* problems)
         return ESP_ERR_INVALID_ARG;
     }
 
-    std::string payload;
-    ESP_RETURN_ON_ERROR(LoadBlobFromNvs(kProblemsKey, &payload), kTag, "load problem cache");
-    problems->clear();
-    if (payload.empty()) {
+    ProblemCacheReadContext context = {problems};
+    const esp_err_t result = services::ExecuteStorageTransaction(
+        LoadProblemCacheTransaction,
+        &context);
+    if (result == ESP_ERR_NOT_FOUND) {
+        problems->clear();
         return ESP_OK;
     }
-
-    cJSON* array = nullptr;
-    ESP_RETURN_ON_ERROR(ParseArrayPayload(payload, &array), kTag, "parse problem cache");
-    JsonDocument document(array);
-
-    const int count = cJSON_GetArraySize(document.root());
-    problems->reserve(count);
-    for (int i = 0; i < count; ++i) {
-        cJSON* item = cJSON_GetArrayItem(document.root(), i);
-        if (!cJSON_IsObject(item)) {
-            continue;
-        }
-
-        CachedProblem problem;
-        problem.id = GetOptionalString(item, "id");
-        problem.title = GetOptionalString(item, "title");
-        problem.type = GetOptionalString(item, "type");
-        problem.status = GetOptionalString(item, "status");
-        problem.content_text = GetOptionalString(item, "content_text");
-        problem.solution_text = GetOptionalString(item, "solution_text");
-        problem.asset_count = GetOptionalInt(item, "asset_count");
-        problem.solution_asset_count = GetOptionalInt(item, "solution_asset_count");
-        problem.updated_at = GetOptionalString(item, "updated_at");
-        problems->push_back(problem);
-    }
-    return ESP_OK;
+    return result;
 }
 
 esp_err_t ClearProblems()
@@ -647,7 +774,7 @@ esp_err_t ClearProblems()
     if (!write) {
         return ESP_ERR_INVALID_STATE;
     }
-    return ClearNvsKey(kProblemsKey);
+    return services::ExecuteStorageTransaction(ClearProblemCacheTransaction, nullptr);
 }
 
 esp_err_t EnqueueReviewResult(const PendingReviewResult& result)
@@ -1030,9 +1157,10 @@ esp_err_t PrepareStorageForSleep(int64_t deadline_us)
     if (deadline_us > 0 && esp_timer_get_time() >= deadline_us) {
         return ESP_ERR_TIMEOUT;
     }
-    return runtime::ActiveSleepBlockerCount(runtime::SleepBlocker::kStorage) == 0
-        ? ESP_OK
-        : ESP_ERR_INVALID_STATE;
+    if (runtime::ActiveSleepBlockerCount(runtime::SleepBlocker::kStorage) != 0) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    return PrepareWordObservationOutboxForSleep(deadline_us);
 }
 
 void RollbackStorageAfterSleepAbort()

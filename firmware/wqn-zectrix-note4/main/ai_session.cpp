@@ -26,7 +26,10 @@
 namespace {
 
 constexpr char kTag[] = "wqn_ai";
-constexpr int kMinAudioDurationMs = 300;
+constexpr int kMinAudioDurationMs = 1000;
+constexpr size_t kMinAudioSamples =
+    static_cast<size_t>(wqn::kAudioCaptureSampleRate) *
+    static_cast<size_t>(kMinAudioDurationMs) / 1000U;
 constexpr int kMaxAudioDurationMs = 20000;
 constexpr int kMinAudioPeak = 80;
 constexpr int kMinAudioRms = 8;
@@ -120,6 +123,7 @@ void MarkChanged()
 void ReleaseAiSleepLeaseIfIdleLocked()
 {
     const bool state_active =
+        g_state.status == wqn::AiSessionStatus::kPreparingCapture ||
         g_state.status == wqn::AiSessionStatus::kListening ||
         g_state.status == wqn::AiSessionStatus::kWaitingReply ||
         g_state.status == wqn::AiSessionStatus::kStreaming;
@@ -430,7 +434,8 @@ void FinishPrepareTaskLocked(uint32_t generation)
 
 bool HasEffectiveSpeech(const wqn::AudioCaptureChunk& audio)
 {
-    return audio.duration_ms >= kMinAudioDurationMs && !audio.samples.empty() && audio.peak >= kMinAudioPeak &&
+    return audio.duration_ms >= kMinAudioDurationMs && audio.samples.size() >= kMinAudioSamples &&
+           audio.peak >= kMinAudioPeak &&
            audio.rms >= kMinAudioRms;
 }
 
@@ -636,7 +641,7 @@ void SubmitTask(void*)
              static_cast<int>(audio.peak),
              audio.rms);
 
-    if (audio.duration_ms < kMinAudioDurationMs || audio.samples.empty()) {
+    if (audio.duration_ms < kMinAudioDurationMs || audio.samples.size() < kMinAudioSamples) {
         wqn::ReleaseAudioCapturePower();
         SetErrorLocked("录音太短");
         FinishSubmitTaskLocked();
@@ -875,7 +880,7 @@ void PrepareRecordingTask(void* parameter)
     if (result == ESP_OK) {
         xSemaphoreTake(g_lock, portMAX_DELAY);
         should_start_capture = g_recording_requested && IsCurrentPrepareTaskLocked(generation) &&
-                               g_state.status == wqn::AiSessionStatus::kWaitingReply && g_submit_task == nullptr;
+                               g_state.status == wqn::AiSessionStatus::kPreparingCapture && g_submit_task == nullptr;
         if (should_start_capture) {
             g_state.pending_text = "正在启动录音...";
             g_state.status_since_ms = esp_timer_get_time() / 1000;
@@ -888,7 +893,7 @@ void PrepareRecordingTask(void* parameter)
         xSemaphoreTake(g_lock, portMAX_DELAY);
         const bool current = IsCurrentPrepareTaskLocked(generation);
         if (current && result != ESP_OK && g_recording_requested &&
-            g_state.status == wqn::AiSessionStatus::kWaitingReply) {
+            g_state.status == wqn::AiSessionStatus::kPreparingCapture) {
             if (failure == PrepareFailure::kInvalidToken) {
                 SetErrorLocked("设备授权已失效，请重新配对");
                 ESP_LOGW(kTag, "AI recording blocked: invalid token");
@@ -899,7 +904,7 @@ void PrepareRecordingTask(void* parameter)
                 SetErrorLocked("WiFi 未连接或未配置");
                 ESP_LOGW(kTag, "AI recording blocked: WiFi unavailable: %s", esp_err_to_name(result));
             }
-        } else if (current && !g_recording_requested && g_state.status == wqn::AiSessionStatus::kWaitingReply) {
+        } else if (current && !g_recording_requested && g_state.status == wqn::AiSessionStatus::kPreparingCapture) {
             SetCancelledBeforeRecordingLocked();
         }
         if (current) {
@@ -916,7 +921,7 @@ void PrepareRecordingTask(void* parameter)
     bool stop_started_capture = false;
     xSemaphoreTake(g_lock, portMAX_DELAY);
     const bool still_requested = g_recording_requested && IsCurrentPrepareTaskLocked(generation) &&
-                                 g_state.status == wqn::AiSessionStatus::kWaitingReply && g_submit_task == nullptr;
+                                 g_state.status == wqn::AiSessionStatus::kPreparingCapture && g_submit_task == nullptr;
     if (result == ESP_OK && still_requested) {
         g_recording_requested = false;
         g_state.status = wqn::AiSessionStatus::kListening;
@@ -944,7 +949,7 @@ void PrepareRecordingTask(void* parameter)
     const bool current = IsCurrentPrepareTaskLocked(generation);
     if (result != ESP_OK && still_requested) {
         SetErrorLocked(std::string("录音启动失败: ") + esp_err_to_name(result));
-    } else if (current && !still_requested && g_state.status == wqn::AiSessionStatus::kWaitingReply) {
+    } else if (current && !still_requested && g_state.status == wqn::AiSessionStatus::kPreparingCapture) {
         SetCancelledBeforeRecordingLocked();
     }
     stop_started_capture = result == ESP_OK;
@@ -985,7 +990,8 @@ esp_err_t StartAiRecordingSession()
     ESP_RETURN_ON_ERROR(InitAiSession(), kTag, "init AI session");
 
     xSemaphoreTake(g_lock, portMAX_DELAY);
-    if (g_state.status == AiSessionStatus::kListening || g_state.status == AiSessionStatus::kWaitingReply ||
+    if (g_state.status == AiSessionStatus::kPreparingCapture ||
+        g_state.status == AiSessionStatus::kListening || g_state.status == AiSessionStatus::kWaitingReply ||
         g_submit_task != nullptr || g_prepare_task != nullptr || g_prepare_active) {
         xSemaphoreGive(g_lock);
         return ESP_ERR_INVALID_STATE;
@@ -998,7 +1004,7 @@ esp_err_t StartAiRecordingSession()
         return ESP_ERR_INVALID_STATE;
     }
     g_ai_sleep_lease = std::move(sleep_lease);
-    g_state.status = AiSessionStatus::kWaitingReply;
+    g_state.status = AiSessionStatus::kPreparingCapture;
     g_state.user_text.clear();
     g_state.assistant_text.clear();
     g_state.pending_text = "正在连接 WiFi...";
@@ -1045,11 +1051,16 @@ esp_err_t StopAiRecordingAndSubmit()
         xSemaphoreGive(g_lock);
         return ESP_OK;
     }
-    if (g_state.status == AiSessionStatus::kWaitingReply && g_prepare_active) {
+    if (g_state.status == AiSessionStatus::kPreparingCapture && g_prepare_active) {
         g_recording_requested = false;
         ++g_prepare_generation;
         g_prepare_active = false;
         SetCancelledBeforeRecordingLocked();
+        xSemaphoreGive(g_lock);
+        return ESP_OK;
+    }
+    if (g_state.status == AiSessionStatus::kPreparingCapture) {
+        // The preparation task has not created a capture buffer yet.
         xSemaphoreGive(g_lock);
         return ESP_OK;
     }
@@ -1223,7 +1234,8 @@ bool IsAiSessionActive()
     xSemaphoreTake(g_lock, portMAX_DELAY);
     const bool active =
         g_prepare_active || g_prepare_task != nullptr || g_submit_task != nullptr ||
-        g_streaming_active || g_state.status == AiSessionStatus::kListening ||
+        g_streaming_active || g_state.status == AiSessionStatus::kPreparingCapture ||
+        g_state.status == AiSessionStatus::kListening ||
         g_state.status == AiSessionStatus::kWaitingReply;
     xSemaphoreGive(g_lock);
     return active;

@@ -94,6 +94,9 @@ std::string AiPagedTextSource(const wqn::AiSessionState& ai)
     if (!ai.pending_text.empty()) {
         return ai.pending_text;
     }
+    if (ai.status == wqn::AiSessionStatus::kPreparingCapture) {
+        return "正在准备录音...";
+    }
     if (ai.status == wqn::AiSessionStatus::kListening) {
         return "正在录音，松手后上传识别。";
     }
@@ -121,6 +124,8 @@ const char* ScreenName(wqn::UiScreen screen)
             return "时间";
         case wqn::UiScreen::kWord:
             return "单词";
+        case wqn::UiScreen::kNote:
+            return "笔记";
         case wqn::UiScreen::kLibrary:
             return "题库";
         case wqn::UiScreen::kProblem:
@@ -159,8 +164,10 @@ wqn::UiScreen PreviousTopScreen(wqn::UiScreen screen)
             return wqn::UiScreen::kHome;
         case wqn::UiScreen::kWord:
             return wqn::UiScreen::kTime;
-        case wqn::UiScreen::kTodo:
+        case wqn::UiScreen::kNote:
             return wqn::UiScreen::kWord;
+        case wqn::UiScreen::kTodo:
+            return wqn::UiScreen::kNote;
         case wqn::UiScreen::kProvisioning:
             return wqn::UiScreen::kHome;
     }
@@ -186,6 +193,8 @@ wqn::UiScreen NextTopScreen(wqn::UiScreen screen)
         case wqn::UiScreen::kTime:
             return wqn::UiScreen::kWord;
         case wqn::UiScreen::kWord:
+            return wqn::UiScreen::kNote;
+        case wqn::UiScreen::kNote:
             return wqn::UiScreen::kTodo;
         case wqn::UiScreen::kTodo:
             return wqn::UiScreen::kAi;
@@ -336,6 +345,14 @@ void RenderWord(const wqn::UiState& state, wqn::UiFrame* frame)
         return;
     }
     frame->word_app = wqn::BuildWordAppSnapshot(state.word_app);
+}
+
+void RenderNote(const wqn::UiState& state, wqn::UiFrame* frame)
+{
+    if (frame == nullptr) {
+        return;
+    }
+    frame->note_app = wqn::BuildNoteAppSnapshot(state.note_app);
 }
 
 void RenderLibrary(const wqn::UiState& state, wqn::UiFrame* frame)
@@ -562,6 +579,9 @@ void HandleUiInput(UiState* state, UiInput input)
             } else if (state->screen == UiScreen::kWord) {
                 HandleWordAppInput(&state->word_app, WordInput::kUp);
                 break;
+            } else if (state->screen == UiScreen::kNote) {
+                HandleNoteAppInput(&state->note_app, NoteInput::kUp);
+                break;
             } else if (state->screen == UiScreen::kAi) {
                 if (state->ai.page > 0) {
                     --state->ai.page;
@@ -592,6 +612,9 @@ void HandleUiInput(UiState* state, UiInput input)
             } else if (state->screen == UiScreen::kWord) {
                 HandleWordAppInput(&state->word_app, WordInput::kDown);
                 break;
+            } else if (state->screen == UiScreen::kNote) {
+                HandleNoteAppInput(&state->note_app, NoteInput::kDown);
+                break;
             } else if (state->screen == UiScreen::kAi) {
                 if (state->ai.page + 1 < AiSessionPageCount(state->ai)) {
                     ++state->ai.page;
@@ -619,6 +642,9 @@ void HandleUiInput(UiState* state, UiInput input)
                 break;
             } else if (state->screen == UiScreen::kWord) {
                 HandleWordAppInput(&state->word_app, WordInput::kConfirm);
+                break;
+            } else if (state->screen == UiScreen::kNote) {
+                HandleNoteAppInput(&state->note_app, NoteInput::kConfirm);
                 break;
             } else if (state->screen == UiScreen::kHome) {
                 if (state->selected_home_task == 1) {
@@ -654,8 +680,18 @@ void HandleUiInput(UiState* state, UiInput input)
                     HandleWordAppInput(&state->word_app, WordInput::kLongConfirm);
                 }
                 break;
+            } else if (state->screen == UiScreen::kNote) {
+                // Long-press = universal back. At the notebook list (top level)
+                // exit to the device home; deeper levels pop one level.
+                if (state->note_app.mode == NoteAppMode::kNotebookList) {
+                    state->screen = UiScreen::kHome;
+                } else {
+                    HandleNoteAppInput(&state->note_app, NoteInput::kLongConfirm);
+                }
+                break;
             } else if (state->screen == UiScreen::kAi) {
                 if (state->ai.status != AiSessionStatus::kListening &&
+                    state->ai.status != AiSessionStatus::kPreparingCapture &&
                     state->ai.status != AiSessionStatus::kWaitingReply) {
 #if CONFIG_WQN_AI_ENABLE
                     // [ptt-fix] Flash tier uses instant kPress/kRelease events
@@ -695,6 +731,13 @@ void HandleUiInput(UiState* state, UiInput input)
             break;
     }
     ClampUiSelection(state);
+    // Leaving the note screen drops the 15 KB image payload: internal SRAM is
+    // too scarce to park it behind an invisible page. Re-entry reloads it
+    // from the SPIFFS cache via the viewer's normal request path.
+    if (screen_before == wqn::UiScreen::kNote &&
+        state->screen != wqn::UiScreen::kNote) {
+        ReleaseNoteImagePayload(&state->note_app);
+    }
 #if CONFIG_WQN_AI_ENABLE
     // Leaving the AI screen while in Flash tier must tear down the WebSocket
     // and the audio streaming task — otherwise they keep running in the
@@ -808,6 +851,9 @@ UiFrame RenderUiFrame(const UiState& state)
             break;
         case UiScreen::kWord:
             RenderWord(state, &frame);
+            break;
+        case UiScreen::kNote:
+            RenderNote(state, &frame);
             break;
         case UiScreen::kLibrary:
             RenderLibrary(state, &frame);

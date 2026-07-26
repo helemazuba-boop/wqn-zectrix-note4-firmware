@@ -38,8 +38,10 @@ on the server.
   with cooldown and idle power-off controls.
 - AI audio path: long-press confirm to record, release to upload 16 kHz mono PCM
   to the WQN server, then display transcript, reply text, and action summaries.
-- Local storage: NVS-backed pairing token and small device-side caches used for
-  offline display and retry behavior.
+- Local storage: NVS holds only small control state (pairing/WiFi credentials,
+  revisions, cursors and settings). Durable content lives on SPIFFS; the problem
+  cache uses the versioned, block-compressed WQPC format with atomic temp/rename
+  commits, while PSRAM is used only for volatile decode/UI snapshots.
 
 ## Security Boundary
 
@@ -88,6 +90,15 @@ Development builds can override it:
 ```bash
 idf.py -B build-ai-local-s3 -DWQN_API_BASE=https://your-host.example.com/api/esp32 build
 ```
+
+## Word reference baseline
+
+- [Product and runtime baseline](WORD_BASELINE.md)
+- [StudySession lifecycle](STUDY_SESSION_PROTOCOL.md)
+- [Deterministic Word Pack v2](WORD_PACK_V2.md)
+- [Durable offline outbox](WORD_OFFLINE_OUTBOX.md)
+- [Word cutover checklist](WORD_RELEASE_CHECKLIST.md)
+- [Reuse guide for problems and notes](STUDY_RUNTIME_REUSE.md)
 
 ## Main Configuration Switches
 

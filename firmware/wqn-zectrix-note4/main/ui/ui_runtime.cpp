@@ -23,6 +23,8 @@ const char* AppEventKindName(AppEventKind event)
             return "todo-result";
         case AppEventKind::kWordCloudResult:
             return "word-result";
+        case AppEventKind::kNoteCloudResult:
+            return "note-result";
         case AppEventKind::kTimeTick:
             return "time-tick";
         case AppEventKind::kAiTick:
@@ -107,15 +109,19 @@ UiUpdate UiRuntime::DispatchButton(
 
 UiUpdate UiRuntime::DispatchTodoCloudResult(const TodoCloudResult& result)
 {
-    const bool changed = ApplyTodoCloudResult(&state_, result);
+    bool content_changed = true;
+    const bool changed = ApplyTodoCloudResult(&state_, result, &content_changed);
+    // Unchanged refreshes only need to clear the "syncing" hint: a partial
+    // repaint, not the 1.3s full-refresh flash a content change warrants.
     const RefreshSchedule refresh =
         changed && state_.screen == wqn::UiScreen::kTodo
-            ? RefreshSchedule::kCommit
+            ? (content_changed ? RefreshSchedule::kCommit
+                               : RefreshSchedule::kSelection)
             : RefreshSchedule::kNone;
     return FinishEvent(AppEventKind::kTodoCloudResult, refresh, changed);
 }
 
-UiUpdate UiRuntime::DispatchWordCloudResult(const WordCloudResult& result)
+UiUpdate UiRuntime::DispatchWordCloudResult(WordCloudResult& result)
 {
     const bool changed = ApplyWordCloudResult(&state_, result);
     const RefreshSchedule refresh =
@@ -123,6 +129,72 @@ UiUpdate UiRuntime::DispatchWordCloudResult(const WordCloudResult& result)
             ? RefreshSchedule::kCommit
             : RefreshSchedule::kNone;
     return FinishEvent(AppEventKind::kWordCloudResult, refresh, changed);
+}
+
+bool UiRuntime::TakeWordCandidatePageRequest(
+    wqn::protocol::word_study_v1::CandidatePageRequest* request,
+    std::string* session_id)
+{
+    return wqn::TakeWordCandidatePageRequest(
+        &state_.word_app, request, session_id);
+}
+
+void UiRuntime::RestoreWordCandidatePageRequest()
+{
+    wqn::RestoreWordCandidatePageRequest(&state_.word_app);
+}
+
+UiUpdate UiRuntime::DispatchNoteCloudResult(NoteCloudResult& result)
+{
+    const bool changed = ApplyNoteCloudResult(&state_, result);
+    // Observation commits are bookkeeping (commit_state/outbox counters);
+    // flashing a full refresh for them would punish every note open.
+    const RefreshSchedule refresh =
+        changed && state_.screen == wqn::UiScreen::kNote &&
+            result.op != NoteCloudOp::kCommitObservation
+            ? RefreshSchedule::kCommit
+            : RefreshSchedule::kNone;
+    return FinishEvent(AppEventKind::kNoteCloudResult, refresh, changed);
+}
+
+bool UiRuntime::TakeNoteCandidatePageRequest(
+    wqn::protocol::note_study_v1::CandidatePageRequest* request,
+    std::string* session_id)
+{
+    return wqn::TakeNoteCandidatePageRequest(
+        &state_.note_app, request, session_id);
+}
+
+void UiRuntime::RestoreNoteCandidatePageRequest()
+{
+    wqn::RestoreNoteCandidatePageRequest(&state_.note_app);
+}
+
+bool UiRuntime::TakeNoteImageRequest(
+    std::string* note_id, uint8_t* image_index, std::string* image_id)
+{
+    return wqn::TakeNoteImageRequest(
+        &state_.note_app, note_id, image_index, image_id);
+}
+
+void UiRuntime::RestoreNoteImageRequest()
+{
+    wqn::RestoreNoteImageRequest(&state_.note_app);
+}
+
+bool UiRuntime::TakeNoteObservationEffect(
+    const std::string& request_id,
+    const std::string& occurred_at,
+    wqn::DurableNoteObservation* observation,
+    wqn::PersistedNoteSession* advanced_session)
+{
+    return wqn::TakeNoteObservationEffect(
+        &state_.note_app, request_id, occurred_at, observation, advanced_session);
+}
+
+void UiRuntime::RestoreNoteObservationEffect()
+{
+    wqn::RestoreNoteObservationEffect(&state_.note_app);
 }
 
 UiUpdate UiRuntime::DispatchTimeTick(int64_t now_ms)
@@ -195,9 +267,15 @@ UiUpdate UiRuntime::DispatchAiStreamingSnapshot(const wqn::AiStreamingStatusView
 UiUpdate UiRuntime::DispatchAiSessionSnapshot(const wqn::AiSessionState& snapshot)
 {
     state_.ai = snapshot;
+    // Keep the logical state in "preparing" immediately, but do not wake the
+    // EPD while the ES8311 is being configured.  A physical panel refresh was
+    // overlapping every failing codec transaction seen in the capture logs.
+    // The following listening or error snapshot will render the final state.
+    const bool defer_refresh_for_audio_init =
+        snapshot.status == wqn::AiSessionStatus::kPreparingCapture;
     return FinishEvent(
         AppEventKind::kAiSessionSnapshot,
-        state_.screen == wqn::UiScreen::kAi
+        state_.screen == wqn::UiScreen::kAi && !defer_refresh_for_audio_init
             ? RefreshSchedule::kAi
             : RefreshSchedule::kNone,
         true);
@@ -303,6 +381,8 @@ UiUpdate UiRuntime::DispatchSyncResult(const wqn::services::SyncEvent& event)
     switch (event.status) {
         case wqn::services::SyncEventStatus::kSucceeded:
             status = "同步完成";
+            wqn::RefreshWordOutboxState(&state_.word_app);
+            wqn::RefreshNoteOutboxState(&state_.note_app);
             break;
         case wqn::services::SyncEventStatus::kAwaitingClaim:
             status = "等待配对";

@@ -17,12 +17,15 @@
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_random.h"
-#include "esp_system.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/timers.h"
+#include "nvs.h"
 #include "runtime/sleep_coordinator.h"
 #include "storage.h"
+#include "note_store.h"
+#include "word_study_store.h"
 #include "wqn_api.h"
 
 namespace {
@@ -36,6 +39,21 @@ std::atomic<wqn::services::SyncEventSink> g_sync_event_sink{nullptr};
 uint32_t g_sync_event_sequence = 1;
 constexpr TickType_t kSyncRetryDelay = pdMS_TO_TICKS(10000);
 bool LoadUsableToken(std::string* token);
+TaskHandle_t g_sync_service_task = nullptr;
+std::atomic<bool> g_full_sync_requested{false};
+std::atomic<bool> g_word_outbox_sync_requested{false};
+std::atomic<uint32_t> g_word_interaction_generation{0};
+constexpr uint32_t kWordOutboxQuietPeriodMs = 5000;
+StaticTimer_t g_word_outbox_timer_storage;
+TimerHandle_t g_word_outbox_timer = nullptr;
+
+void WordOutboxTimerCallback(TimerHandle_t)
+{
+    g_word_outbox_sync_requested.store(true, std::memory_order_release);
+    if (g_sync_service_task != nullptr) {
+        xTaskNotifyGive(g_sync_service_task);
+    }
+}
 #endif
 
 #if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
@@ -48,7 +66,12 @@ constexpr uint32_t kClaimPollFloorMs = 10000;
 constexpr uint32_t kClaimPollJitterMaxMs = 2000;
 constexpr uint32_t kClaimRetryBaseMs = 15000;
 constexpr uint32_t kClaimRetryMaxMs = 5 * 60 * 1000;
+constexpr uint32_t kStorageCapacityRetryMs = 5 * 60 * 1000;
 constexpr uint8_t kClaimRetryMaxShift = 4;
+constexpr uint32_t kWordOutboxRetryBaseMs = 30000;
+constexpr uint32_t kWordOutboxRetryMaxMs = 5 * 60 * 1000;
+constexpr uint32_t kWordOutboxRetryJitterMaxMs = 2000;
+constexpr uint8_t kWordOutboxRetryMaxShift = 4;
 std::string g_bootstrap_request_id;
 std::string g_sync_request_id;
 wqn::protocol::v3::ClaimKeyPair g_claim_key_pair;
@@ -57,6 +80,187 @@ std::string g_claim_id;
 uint32_t g_claim_poll_interval_ms = kClaimPollFloorMs;
 uint8_t g_claim_retry_attempts = 0;
 bool g_claim_active = false;
+std::string g_word_outbox_retry_request_id;
+int64_t g_word_outbox_retry_not_before_ms = 0;
+uint8_t g_word_outbox_retry_attempts = 0;
+
+enum class WordOutboxUploadState : uint8_t {
+    kDrained,
+    kPending,
+    kYielded,
+    kFailed,
+};
+
+WordOutboxUploadState g_last_word_outbox_upload_state =
+    WordOutboxUploadState::kDrained;
+
+// Note observations ride the same quiet-window timer and interaction-yield
+// signal as word, but keep an independent retry cursor so a deferred note head
+// never blocks word progress (and vice versa). WordOutboxUploadState is reused
+// verbatim; the semantics are identical.
+std::string g_note_outbox_retry_request_id;
+int64_t g_note_outbox_retry_not_before_ms = 0;
+uint8_t g_note_outbox_retry_attempts = 0;
+WordOutboxUploadState g_last_note_outbox_upload_state =
+    WordOutboxUploadState::kDrained;
+
+void ResetWordOutboxRetryBackoff()
+{
+    g_word_outbox_retry_request_id.clear();
+    g_word_outbox_retry_not_before_ms = 0;
+    g_word_outbox_retry_attempts = 0;
+}
+
+bool WordOutboxRetryDeferred(
+    const std::string& request_id,
+    int64_t now_ms)
+{
+    if (g_word_outbox_retry_request_id != request_id) {
+        ResetWordOutboxRetryBackoff();
+        return false;
+    }
+    return g_word_outbox_retry_not_before_ms > now_ms;
+}
+
+void ScheduleWordOutboxRetry(
+    const std::string& request_id,
+    uint32_t server_retry_after_ms)
+{
+    if (g_word_outbox_retry_request_id != request_id) {
+        ResetWordOutboxRetryBackoff();
+        g_word_outbox_retry_request_id = request_id;
+    }
+    const uint8_t shift =
+        std::min(g_word_outbox_retry_attempts, kWordOutboxRetryMaxShift);
+    const uint32_t local_delay_ms = std::min(
+        kWordOutboxRetryBaseMs << shift,
+        kWordOutboxRetryMaxMs);
+    const uint32_t requested_delay_ms =
+        std::min(server_retry_after_ms, kWordOutboxRetryMaxMs);
+    const uint32_t base_delay_ms =
+        std::max(local_delay_ms, requested_delay_ms);
+    const uint32_t available_jitter_ms =
+        kWordOutboxRetryMaxMs - base_delay_ms;
+    const uint32_t jitter_ms = esp_random() %
+        (std::min(available_jitter_ms, kWordOutboxRetryJitterMaxMs) + 1);
+    const uint32_t delay_ms = base_delay_ms + jitter_ms;
+    if (g_word_outbox_retry_attempts < std::numeric_limits<uint8_t>::max()) {
+        ++g_word_outbox_retry_attempts;
+    }
+    g_word_outbox_retry_not_before_ms =
+        esp_timer_get_time() / 1000 + static_cast<int64_t>(delay_ms);
+    ESP_LOGW(
+        kTag,
+        "word outbox retry scheduled: request=%s attempt=%u retry_after_ms=%lu",
+        request_id.c_str(),
+        static_cast<unsigned>(g_word_outbox_retry_attempts),
+        static_cast<unsigned long>(delay_ms));
+}
+
+TickType_t WordOutboxRetryWaitDelay()
+{
+    if (g_word_outbox_retry_request_id.empty()) {
+        return portMAX_DELAY;
+    }
+    const int64_t remaining_ms =
+        g_word_outbox_retry_not_before_ms - esp_timer_get_time() / 1000;
+    if (remaining_ms <= 0) {
+        return 1;
+    }
+    return pdMS_TO_TICKS(
+        static_cast<uint32_t>(
+            std::min<int64_t>(remaining_ms, kWordOutboxRetryMaxMs)));
+}
+
+void ResetNoteOutboxRetryBackoff()
+{
+    g_note_outbox_retry_request_id.clear();
+    g_note_outbox_retry_not_before_ms = 0;
+    g_note_outbox_retry_attempts = 0;
+}
+
+bool NoteOutboxRetryDeferred(
+    const std::string& request_id,
+    int64_t now_ms)
+{
+    if (g_note_outbox_retry_request_id != request_id) {
+        ResetNoteOutboxRetryBackoff();
+        return false;
+    }
+    return g_note_outbox_retry_not_before_ms > now_ms;
+}
+
+void ScheduleNoteOutboxRetry(
+    const std::string& request_id,
+    uint32_t server_retry_after_ms)
+{
+    if (g_note_outbox_retry_request_id != request_id) {
+        ResetNoteOutboxRetryBackoff();
+        g_note_outbox_retry_request_id = request_id;
+    }
+    const uint8_t shift =
+        std::min(g_note_outbox_retry_attempts, kWordOutboxRetryMaxShift);
+    const uint32_t local_delay_ms = std::min(
+        kWordOutboxRetryBaseMs << shift,
+        kWordOutboxRetryMaxMs);
+    const uint32_t requested_delay_ms =
+        std::min(server_retry_after_ms, kWordOutboxRetryMaxMs);
+    const uint32_t base_delay_ms =
+        std::max(local_delay_ms, requested_delay_ms);
+    const uint32_t available_jitter_ms =
+        kWordOutboxRetryMaxMs - base_delay_ms;
+    const uint32_t jitter_ms = esp_random() %
+        (std::min(available_jitter_ms, kWordOutboxRetryJitterMaxMs) + 1);
+    const uint32_t delay_ms = base_delay_ms + jitter_ms;
+    if (g_note_outbox_retry_attempts < std::numeric_limits<uint8_t>::max()) {
+        ++g_note_outbox_retry_attempts;
+    }
+    g_note_outbox_retry_not_before_ms =
+        esp_timer_get_time() / 1000 + static_cast<int64_t>(delay_ms);
+    ESP_LOGW(
+        kTag,
+        "note outbox retry scheduled: request=%s attempt=%u retry_after_ms=%lu",
+        request_id.c_str(),
+        static_cast<unsigned>(g_note_outbox_retry_attempts),
+        static_cast<unsigned long>(delay_ms));
+}
+
+TickType_t NoteOutboxRetryWaitDelay()
+{
+    if (g_note_outbox_retry_request_id.empty()) {
+        return portMAX_DELAY;
+    }
+    const int64_t remaining_ms =
+        g_note_outbox_retry_not_before_ms - esp_timer_get_time() / 1000;
+    if (remaining_ms <= 0) {
+        return 1;
+    }
+    return pdMS_TO_TICKS(
+        static_cast<uint32_t>(
+            std::min<int64_t>(remaining_ms, kWordOutboxRetryMaxMs)));
+}
+
+bool IsStorageCapacityError(esp_err_t error)
+{
+    return error == ESP_ERR_NO_MEM || error == ESP_ERR_INVALID_SIZE ||
+        error == ESP_ERR_NVS_NOT_ENOUGH_SPACE;
+}
+
+void ApplyStorageCapacityBackoff(esp_err_t error, const char* stage)
+{
+    if (!IsStorageCapacityError(error)) {
+        return;
+    }
+    g_control_retry_after_ms = std::max(
+        g_control_retry_after_ms,
+        kStorageCapacityRetryMs);
+    ESP_LOGW(
+        kTag,
+        "sync storage-full: stage=%s error=%s retry_after_ms=%lu",
+        stage,
+        esp_err_to_name(error),
+        static_cast<unsigned long>(g_control_retry_after_ms));
+}
 
 uint32_t AddClaimJitter(uint32_t base_ms)
 {
@@ -352,10 +556,12 @@ void CompleteSyncRound(int64_t finished_ms, bool synced)
 
 void PublishSyncEvent(
     wqn::services::SyncEventStatus status,
-    int64_t finished_ms)
+    int64_t finished_ms,
+    wqn::services::SyncEventScope scope)
 {
     wqn::services::SyncEvent event;
     event.status = status;
+    event.scope = scope;
     event.sequence = g_sync_event_sequence++;
     if (event.sequence == 0) {
         event.sequence = g_sync_event_sequence++;
@@ -421,38 +627,52 @@ std::vector<wqn::CachedProblem> ToCachedProblems(const std::vector<wqn::WqnProbl
     return cached;
 }
 
-void UpsertProblem(std::vector<wqn::CachedProblem>* cached, wqn::CachedProblem problem)
+bool UpsertProblem(std::vector<wqn::CachedProblem>* cached, wqn::CachedProblem problem)
 {
     if (cached == nullptr || problem.id.empty()) {
-        return;
+        return false;
     }
 
     for (wqn::CachedProblem& item : *cached) {
         if (item.id == problem.id) {
-            if (!problem.title.empty()) {
+            bool changed = false;
+            if (!problem.title.empty() && item.title != problem.title) {
                 item.title = std::move(problem.title);
+                changed = true;
             }
-            if (!problem.type.empty()) {
+            if (!problem.type.empty() && item.type != problem.type) {
                 item.type = std::move(problem.type);
+                changed = true;
             }
-            if (!problem.status.empty()) {
+            if (!problem.status.empty() && item.status != problem.status) {
                 item.status = std::move(problem.status);
+                changed = true;
             }
-            if (!problem.content_text.empty()) {
+            if (!problem.content_text.empty() && item.content_text != problem.content_text) {
                 item.content_text = std::move(problem.content_text);
+                changed = true;
             }
-            if (!problem.solution_text.empty()) {
+            if (!problem.solution_text.empty() && item.solution_text != problem.solution_text) {
                 item.solution_text = std::move(problem.solution_text);
+                changed = true;
             }
-            item.asset_count = problem.asset_count;
-            item.solution_asset_count = problem.solution_asset_count;
-            if (!problem.updated_at.empty()) {
+            if (item.asset_count != problem.asset_count) {
+                item.asset_count = problem.asset_count;
+                changed = true;
+            }
+            if (item.solution_asset_count != problem.solution_asset_count) {
+                item.solution_asset_count = problem.solution_asset_count;
+                changed = true;
+            }
+            if (!problem.updated_at.empty() && item.updated_at != problem.updated_at) {
                 item.updated_at = std::move(problem.updated_at);
+                changed = true;
             }
-            return;
+            return changed;
         }
     }
     cached->push_back(std::move(problem));
+    return true;
 }
 
 esp_err_t MergeProblemCache(const std::vector<wqn::WqnProblem>& fresh, const char* source)
@@ -469,8 +689,18 @@ esp_err_t MergeProblemCache(const std::vector<wqn::WqnProblem>& fresh, const cha
     }
 
     std::vector<wqn::CachedProblem> incoming = ToCachedProblems(fresh);
+    bool changed = false;
     for (wqn::CachedProblem& problem : incoming) {
-        UpsertProblem(&cached, std::move(problem));
+        changed = UpsertProblem(&cached, std::move(problem)) || changed;
+    }
+    if (!changed) {
+        ESP_LOGI(
+            kTag,
+            "%s cache unchanged: fresh=%u total_cached=%u; write skipped",
+            source,
+            static_cast<unsigned>(fresh.size()),
+            static_cast<unsigned>(cached.size()));
+        return ESP_OK;
     }
 
     const esp_err_t save_result = wqn::SaveProblems(cached);
@@ -674,10 +904,14 @@ esp_err_t SyncDueProblemsAndCacheV3(const std::string& token)
             wqn::FetchProblems(token, sync.due_problem_ids, &problems),
             kTag,
             "fetch v3 manifest problems");
-        ESP_RETURN_ON_ERROR(
-            MergeProblemCache(problems, "v3 due problems"),
-            kTag,
-            "commit v3 manifest problems");
+        const esp_err_t cache_result = MergeProblemCache(problems, "v3 due problems");
+        if (cache_result != ESP_OK) {
+            ApplyStorageCapacityBackoff(cache_result, "problem-cache");
+            ESP_RETURN_ON_ERROR(
+                cache_result,
+                kTag,
+                "commit v3 manifest problems");
+        }
     }
 
     const wqn::DeviceControlState checkpoint = {
@@ -691,7 +925,371 @@ esp_err_t SyncDueProblemsAndCacheV3(const std::string& token)
     g_config_revision = checkpoint.config_revision;
     g_sync_cursor = checkpoint.sync_cursor;
     g_sync_request_id.clear();
+    ESP_LOGI(
+        kTag,
+        "v3 sync checkpoint committed: config_revision=%llu sync_cursor=%llu",
+        static_cast<unsigned long long>(g_config_revision),
+        static_cast<unsigned long long>(g_sync_cursor));
     return ESP_OK;
+}
+#endif
+
+#if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
+WordOutboxUploadState UploadPendingWordObservations(const std::string& token)
+{
+    constexpr size_t kMaxWordObservationsPerRound = 64;
+    const uint32_t interaction_generation =
+        g_word_interaction_generation.load(std::memory_order_acquire);
+    size_t processed = 0;
+    size_t uploaded = 0;
+    size_t quarantined = 0;
+    for (; processed < kMaxWordObservationsPerRound;) {
+        if (g_word_interaction_generation.load(std::memory_order_acquire) !=
+            interaction_generation) {
+            ESP_LOGI(
+                kTag,
+                "word outbox batch yielded to interaction: uploaded=%u quarantined=%u",
+                static_cast<unsigned>(uploaded),
+                static_cast<unsigned>(quarantined));
+            return WordOutboxUploadState::kYielded;
+        }
+        wqn::DurableWordObservation pending;
+        esp_err_t result = wqn::PeekPendingWordObservation(&pending);
+        if (result == ESP_ERR_NOT_FOUND) {
+            ResetWordOutboxRetryBackoff();
+            if (processed > 0) {
+                ESP_LOGI(
+                    kTag,
+                    "word outbox drained: uploaded=%u quarantined=%u",
+                    static_cast<unsigned>(uploaded),
+                    static_cast<unsigned>(quarantined));
+            }
+            return WordOutboxUploadState::kDrained;
+        }
+        if (result != ESP_OK) {
+            ESP_LOGW(kTag, "word outbox read failed: %s", esp_err_to_name(result));
+            return WordOutboxUploadState::kFailed;
+        }
+        const int64_t now_ms = esp_timer_get_time() / 1000;
+        if (WordOutboxRetryDeferred(pending.request_id, now_ms)) {
+            ESP_LOGI(
+                kTag,
+                "word outbox head deferred: request=%s remaining_ms=%lld",
+                pending.request_id.c_str(),
+                static_cast<long long>(
+                    g_word_outbox_retry_not_before_ms - now_ms));
+            return WordOutboxUploadState::kPending;
+        }
+
+        wqn::protocol::word_study_v1::ObservationRequest request;
+        request.metadata = MakeControlMetadata();
+        request.metadata.request_id = pending.request_id;
+        request.session_id = pending.session_id;
+        request.sequence = pending.sequence;
+        request.item_id = pending.item_id;
+        request.action = pending.action;
+        request.mode = pending.mode;
+        request.occurred_at = pending.occurred_at;
+        wqn::protocol::word_study_v1::ObservationData response;
+        wqn::protocol::v3::Error word_error;
+        bool transport_failure = false;
+        result = wqn::SubmitWordStudyObservationV1(
+            token, request, &response, &word_error, &transport_failure);
+        if (result != ESP_OK) {
+            if (!transport_failure && !word_error.retryable) {
+                ESP_LOGW(
+                    kTag,
+                    "terminal word observation rejected; advancing sequence before quarantine: request=%s sequence=%llu code=%s",
+                    pending.request_id.c_str(),
+                    static_cast<unsigned long long>(pending.sequence),
+                    word_error.code.c_str());
+
+                // A local quarantine removes the record from the device, but
+                // the server's monotonic next_sequence must advance too.
+                // Otherwise the following record is rejected forever with
+                // STUDY_SEQUENCE_GAP. The skip endpoint writes a durable,
+                // non-projecting tombstone for this sequence.
+                wqn::protocol::word_study_v1::ObservationData skip_response;
+                wqn::protocol::v3::Error skip_error;
+                bool skip_transport_failure = false;
+                const esp_err_t skip_result =
+                    wqn::SkipWordStudyObservationV1(
+                        token,
+                        request,
+                        &skip_response,
+                        &skip_error,
+                        &skip_transport_failure);
+                const bool sequence_consumed =
+                    skip_result == ESP_OK ||
+                    skip_error.code == "SEQUENCE_ALREADY_APPLIED" ||
+                    skip_error.code == "SESSION_NOT_ACTIVE";
+                if (!sequence_consumed) {
+                    ESP_LOGW(
+                        kTag,
+                        "word observation skip deferred: request=%s sequence=%llu code=%s error=%s",
+                        pending.request_id.c_str(),
+                        static_cast<unsigned long long>(pending.sequence),
+                        skip_error.code.empty() ? "TRANSPORT" : skip_error.code.c_str(),
+                        esp_err_to_name(skip_result));
+                    if (skip_transport_failure || skip_error.retryable ||
+                        skip_error.code == "SEQUENCE_GAP") {
+                        ScheduleWordOutboxRetry(
+                            pending.request_id,
+                            skip_error.retryable ? skip_error.retry_after_ms : 0);
+                        return WordOutboxUploadState::kPending;
+                    }
+                    ESP_LOGE(
+                        kTag,
+                        "word observation skip failed terminally; leaving head for inspection: request=%s code=%s",
+                        pending.request_id.c_str(),
+                        skip_error.code.c_str());
+                    return WordOutboxUploadState::kFailed;
+                }
+                const esp_err_t quarantine_result =
+                    wqn::QuarantinePendingWordObservation(pending.request_id);
+                ResetWordOutboxRetryBackoff();
+                if (quarantine_result != ESP_OK) {
+                    ESP_LOGE(
+                        kTag,
+                        "word observation quarantine failed: request=%s error=%s",
+                        pending.request_id.c_str(),
+                        esp_err_to_name(quarantine_result));
+                    return WordOutboxUploadState::kFailed;
+                }
+                ++processed;
+                ++quarantined;
+                continue;
+            }
+            ESP_LOGW(
+                kTag,
+                "word outbox upload deferred: request=%s sequence=%llu code=%s error=%s",
+                pending.request_id.c_str(),
+                static_cast<unsigned long long>(pending.sequence),
+                word_error.code.empty() ? "TRANSPORT" : word_error.code.c_str(),
+                esp_err_to_name(result));
+            ScheduleWordOutboxRetry(
+                pending.request_id,
+                word_error.retryable ? word_error.retry_after_ms : 0);
+            return WordOutboxUploadState::kPending;
+        }
+        result = wqn::AcknowledgeWordObservation(pending.request_id);
+        if (result != ESP_OK) {
+            ESP_LOGW(
+                kTag,
+                "word outbox ack failed: request=%s error=%s",
+                pending.request_id.c_str(),
+                esp_err_to_name(result));
+            ScheduleWordOutboxRetry(pending.request_id, 0);
+            return WordOutboxUploadState::kPending;
+        }
+        ResetWordOutboxRetryBackoff();
+        ++processed;
+        ++uploaded;
+    }
+
+    wqn::DurableWordObservation remaining;
+    const esp_err_t remaining_result =
+        wqn::PeekPendingWordObservation(&remaining);
+    if (processed > 0) {
+        ESP_LOGI(
+            kTag,
+            "word outbox batch complete: uploaded=%u quarantined=%u pending=%d",
+            static_cast<unsigned>(uploaded),
+            static_cast<unsigned>(quarantined),
+            remaining_result == ESP_OK ? 1 : 0);
+    }
+    if (remaining_result == ESP_ERR_NOT_FOUND) {
+        return WordOutboxUploadState::kDrained;
+    }
+    return remaining_result == ESP_OK
+        ? WordOutboxUploadState::kPending
+        : WordOutboxUploadState::kFailed;
+}
+
+WordOutboxUploadState UploadPendingNoteObservations(const std::string& token)
+{
+    constexpr size_t kMaxNoteObservationsPerRound = 64;
+    const uint32_t interaction_generation =
+        g_word_interaction_generation.load(std::memory_order_acquire);
+    size_t processed = 0;
+    size_t uploaded = 0;
+    size_t quarantined = 0;
+    for (; processed < kMaxNoteObservationsPerRound;) {
+        if (g_word_interaction_generation.load(std::memory_order_acquire) !=
+            interaction_generation) {
+            ESP_LOGI(
+                kTag,
+                "note outbox batch yielded to interaction: uploaded=%u quarantined=%u",
+                static_cast<unsigned>(uploaded),
+                static_cast<unsigned>(quarantined));
+            return WordOutboxUploadState::kYielded;
+        }
+        wqn::DurableNoteObservation pending;
+        esp_err_t result = wqn::PeekPendingNoteObservation(&pending);
+        if (result == ESP_ERR_NOT_FOUND) {
+            ResetNoteOutboxRetryBackoff();
+            if (processed > 0) {
+                ESP_LOGI(
+                    kTag,
+                    "note outbox drained: uploaded=%u quarantined=%u",
+                    static_cast<unsigned>(uploaded),
+                    static_cast<unsigned>(quarantined));
+            }
+            return WordOutboxUploadState::kDrained;
+        }
+        if (result != ESP_OK) {
+            ESP_LOGW(kTag, "note outbox read failed: %s", esp_err_to_name(result));
+            return WordOutboxUploadState::kFailed;
+        }
+        const int64_t now_ms = esp_timer_get_time() / 1000;
+        if (NoteOutboxRetryDeferred(pending.request_id, now_ms)) {
+            ESP_LOGI(
+                kTag,
+                "note outbox head deferred: request=%s remaining_ms=%lld",
+                pending.request_id.c_str(),
+                static_cast<long long>(
+                    g_note_outbox_retry_not_before_ms - now_ms));
+            return WordOutboxUploadState::kPending;
+        }
+
+        wqn::protocol::note_study_v1::ObservationRequest request;
+        request.metadata = MakeControlMetadata();
+        request.metadata.request_id = pending.request_id;
+        request.session_id = pending.session_id;
+        request.sequence = pending.sequence;
+        request.item_id = pending.item_id;
+        request.action = pending.action;
+        request.mode = pending.mode;
+        request.occurred_at = pending.occurred_at;
+        wqn::protocol::note_study_v1::ObservationData response;
+        wqn::protocol::v3::Error note_error;
+        bool transport_failure = false;
+        result = wqn::SubmitNoteStudyObservationV1(
+            token, request, &response, &note_error, &transport_failure);
+        if (result != ESP_OK) {
+            if (!transport_failure && !note_error.retryable) {
+                ESP_LOGW(
+                    kTag,
+                    "terminal note observation rejected; advancing sequence before quarantine: request=%s sequence=%llu code=%s",
+                    pending.request_id.c_str(),
+                    static_cast<unsigned long long>(pending.sequence),
+                    note_error.code.c_str());
+
+                // Mirror word: a local quarantine removes the record, but the
+                // server's monotonic next_sequence must advance too or the next
+                // record is rejected forever with STUDY_SEQUENCE_GAP. The skip
+                // endpoint writes a durable, non-projecting tombstone.
+                wqn::protocol::note_study_v1::ObservationData skip_response;
+                wqn::protocol::v3::Error skip_error;
+                bool skip_transport_failure = false;
+                const esp_err_t skip_result =
+                    wqn::SkipNoteStudyObservationV1(
+                        token,
+                        request,
+                        &skip_response,
+                        &skip_error,
+                        &skip_transport_failure);
+                const bool sequence_consumed =
+                    skip_result == ESP_OK ||
+                    skip_error.code == "SEQUENCE_ALREADY_APPLIED" ||
+                    skip_error.code == "SESSION_NOT_ACTIVE";
+                if (!sequence_consumed) {
+                    ESP_LOGW(
+                        kTag,
+                        "note observation skip deferred: request=%s sequence=%llu code=%s error=%s",
+                        pending.request_id.c_str(),
+                        static_cast<unsigned long long>(pending.sequence),
+                        skip_error.code.empty() ? "TRANSPORT" : skip_error.code.c_str(),
+                        esp_err_to_name(skip_result));
+                    if (skip_transport_failure || skip_error.retryable ||
+                        skip_error.code == "SEQUENCE_GAP") {
+                        ScheduleNoteOutboxRetry(
+                            pending.request_id,
+                            skip_error.retryable ? skip_error.retry_after_ms : 0);
+                        return WordOutboxUploadState::kPending;
+                    }
+                    ESP_LOGE(
+                        kTag,
+                        "note observation skip failed terminally; leaving head for inspection: request=%s code=%s",
+                        pending.request_id.c_str(),
+                        skip_error.code.c_str());
+                    return WordOutboxUploadState::kFailed;
+                }
+                const esp_err_t quarantine_result =
+                    wqn::QuarantinePendingNoteObservation(pending.request_id);
+                ResetNoteOutboxRetryBackoff();
+                if (quarantine_result != ESP_OK) {
+                    ESP_LOGE(
+                        kTag,
+                        "note observation quarantine failed: request=%s error=%s",
+                        pending.request_id.c_str(),
+                        esp_err_to_name(quarantine_result));
+                    return WordOutboxUploadState::kFailed;
+                }
+                ++processed;
+                ++quarantined;
+                continue;
+            }
+            ESP_LOGW(
+                kTag,
+                "note outbox upload deferred: request=%s sequence=%llu code=%s error=%s",
+                pending.request_id.c_str(),
+                static_cast<unsigned long long>(pending.sequence),
+                note_error.code.empty() ? "TRANSPORT" : note_error.code.c_str(),
+                esp_err_to_name(result));
+            ScheduleNoteOutboxRetry(
+                pending.request_id,
+                note_error.retryable ? note_error.retry_after_ms : 0);
+            return WordOutboxUploadState::kPending;
+        }
+        result = wqn::AcknowledgeNoteObservation(pending.request_id);
+        if (result != ESP_OK) {
+            ESP_LOGW(
+                kTag,
+                "note outbox ack failed: request=%s error=%s",
+                pending.request_id.c_str(),
+                esp_err_to_name(result));
+            ScheduleNoteOutboxRetry(pending.request_id, 0);
+            return WordOutboxUploadState::kPending;
+        }
+        ResetNoteOutboxRetryBackoff();
+        ++processed;
+        ++uploaded;
+    }
+
+    wqn::DurableNoteObservation remaining;
+    const esp_err_t remaining_result =
+        wqn::PeekPendingNoteObservation(&remaining);
+    if (processed > 0) {
+        ESP_LOGI(
+            kTag,
+            "note outbox batch complete: uploaded=%u quarantined=%u pending=%d",
+            static_cast<unsigned>(uploaded),
+            static_cast<unsigned>(quarantined),
+            remaining_result == ESP_OK ? 1 : 0);
+    }
+    if (remaining_result == ESP_ERR_NOT_FOUND) {
+        return WordOutboxUploadState::kDrained;
+    }
+    return remaining_result == ESP_OK
+        ? WordOutboxUploadState::kPending
+        : WordOutboxUploadState::kFailed;
+}
+
+bool RunWordOutboxOnlyRound()
+{
+    std::string token;
+    if (!LoadUsableToken(&token)) {
+        // Pairing/bootstrap owns identity recovery. Escalate the next round
+        // instead of making the outbox-only path imitate the control plane.
+        g_full_sync_requested.store(true, std::memory_order_release);
+        g_last_word_outbox_upload_state = WordOutboxUploadState::kPending;
+        return false;
+    }
+    g_last_word_outbox_upload_state = UploadPendingWordObservations(token);
+    g_last_note_outbox_upload_state = UploadPendingNoteObservations(token);
+    return g_last_word_outbox_upload_state != WordOutboxUploadState::kFailed &&
+        g_last_note_outbox_upload_state != WordOutboxUploadState::kFailed;
 }
 #endif
 
@@ -740,6 +1338,11 @@ bool RunSyncRound()
         return false;
     }
 
+#if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
+    g_last_word_outbox_upload_state = UploadPendingWordObservations(token);
+    g_last_note_outbox_upload_state = UploadPendingNoteObservations(token);
+#endif
+
     if (!LoadUsableToken(&token)) {
         ESP_LOGI(kTag, "token cleared during review upload round");
         return false;
@@ -762,6 +1365,9 @@ bool RunSyncRound()
 
     result = RefreshProblemIndexIfAvailable(token);
     if (result != ESP_OK) {
+#if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
+        ApplyStorageCapacityBackoff(result, "problem-index-cache");
+#endif
         ESP_LOGW(kTag, "problem index refresh round failed: %s", esp_err_to_name(result));
         return false;
     }
@@ -771,19 +1377,20 @@ bool RunSyncRound()
 
 TickType_t NextSyncWaitDelay(bool round_synced, bool has_token_after_round)
 {
+    TickType_t wait_delay = portMAX_DELAY;
 #if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
     if (g_control_retry_after_ms > 0) {
         const uint32_t retry_after_ms = g_control_retry_after_ms;
         g_control_retry_after_ms = 0;
-        return pdMS_TO_TICKS(retry_after_ms);
-    }
+        wait_delay = pdMS_TO_TICKS(retry_after_ms);
+    } else
 #endif
     if (!has_token_after_round) {
 #if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
         const uint32_t wait_ms = g_claim_active
             ? ClaimPollDelayMs()
             : AddClaimJitter(kClaimRetryBaseMs);
-        return pdMS_TO_TICKS(wait_ms);
+        wait_delay = pdMS_TO_TICKS(wait_ms);
 #else
         // [power-fix] Once the device has lost (or never had) an access
         // token it is in provisioning mode. Polling the server every 2s
@@ -791,15 +1398,25 @@ TickType_t NextSyncWaitDelay(bool round_synced, bool has_token_after_round)
         // keeps the CPU + radio hot for no benefit. Block on the
         // notification until something (e.g. a fresh token save in
         // wqn::SaveAccessToken) wakes us back up.
-        return portMAX_DELAY;
+        wait_delay = portMAX_DELAY;
 #endif
-    }
-    if (round_synced) {
-        return wqn::services::GetConfiguredSyncDelayTicks();
+    } else if (round_synced) {
+        wait_delay = wqn::services::GetConfiguredSyncDelayTicks();
+    } else {
+        const TickType_t configured_delay =
+            wqn::services::GetConfiguredSyncDelayTicks();
+        wait_delay = configured_delay == portMAX_DELAY
+            ? portMAX_DELAY
+            : kSyncRetryDelay;
     }
 
-    const TickType_t configured_delay = wqn::services::GetConfiguredSyncDelayTicks();
-    return configured_delay == portMAX_DELAY ? portMAX_DELAY : kSyncRetryDelay;
+#if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
+    if (has_token_after_round) {
+        wait_delay = std::min(wait_delay, WordOutboxRetryWaitDelay());
+        wait_delay = std::min(wait_delay, NoteOutboxRetryWaitDelay());
+    }
+#endif
+    return wait_delay;
 }
 
 void SyncServiceTask(void*)
@@ -814,6 +1431,17 @@ void SyncServiceTask(void*)
         }
         first_round = false;
 
+        const bool full_requested =
+            g_full_sync_requested.exchange(false, std::memory_order_acq_rel);
+        const bool word_outbox_requested =
+            g_word_outbox_sync_requested.exchange(false, std::memory_order_acq_rel);
+#if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
+        const bool outbox_only = word_outbox_requested && !full_requested;
+#else
+        const bool outbox_only = false;
+        (void)word_outbox_requested;
+#endif
+
         wqn::runtime::SleepLease sleep_lease =
             wqn::runtime::SleepLease::TryAcquire(
                 wqn::runtime::SleepBlocker::kOnlineSync, "sync-service", __FILE__, __LINE__);
@@ -824,8 +1452,14 @@ void SyncServiceTask(void*)
         }
 
         SetSyncRoundStarted(esp_timer_get_time() / 1000);
-        SetSyncStatus("syncing");
+        SetSyncStatus(outbox_only ? "word-outbox" : "syncing");
+#if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
+        const bool synced = outbox_only
+            ? RunWordOutboxOnlyRound()
+            : RunSyncRound();
+#else
         const bool synced = RunSyncRound();
+#endif
         const int64_t finished_ms = esp_timer_get_time() / 1000;
         CompleteSyncRound(finished_ms, synced);
         const bool has_token_after_round = wqn::services::HasUsableStoredToken();
@@ -833,17 +1467,44 @@ void SyncServiceTask(void*)
             SetSyncStatus("success");
             PublishSyncEvent(
                 wqn::services::SyncEventStatus::kSucceeded,
-                finished_ms);
+                finished_ms,
+                outbox_only
+                    ? wqn::services::SyncEventScope::kWordOutbox
+                    : wqn::services::SyncEventScope::kFull);
         } else {
             SetSyncStatus(has_token_after_round ? "failed" : "waiting-pair");
             PublishSyncEvent(
                 has_token_after_round
                     ? wqn::services::SyncEventStatus::kFailed
                     : wqn::services::SyncEventStatus::kAwaitingClaim,
-                finished_ms);
+                finished_ms,
+                outbox_only
+                    ? wqn::services::SyncEventScope::kWordOutbox
+                    : wqn::services::SyncEventScope::kFull);
         }
         sleep_lease.Reset();
-        const TickType_t delay = NextSyncWaitDelay(synced, has_token_after_round);
+        TickType_t delay = NextSyncWaitDelay(synced, has_token_after_round);
+#if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
+        if (g_last_word_outbox_upload_state == WordOutboxUploadState::kYielded ||
+            g_last_note_outbox_upload_state == WordOutboxUploadState::kYielded) {
+            // Do not turn a user-induced yield into the old 100 ms upload
+            // loop. Resume only after another complete quiet period.
+            if (g_word_outbox_timer == nullptr ||
+                xTimerReset(g_word_outbox_timer, 0) != pdPASS) {
+                g_word_outbox_sync_requested.store(true, std::memory_order_release);
+                delay = std::min(delay, pdMS_TO_TICKS(100));
+            }
+        } else if (
+            g_last_word_outbox_upload_state == WordOutboxUploadState::kPending ||
+            g_last_note_outbox_upload_state == WordOutboxUploadState::kPending) {
+            g_word_outbox_sync_requested.store(true, std::memory_order_release);
+            const TickType_t retry_delay = std::min(
+                WordOutboxRetryWaitDelay(), NoteOutboxRetryWaitDelay());
+            delay = std::min(
+                delay,
+                retry_delay == portMAX_DELAY ? pdMS_TO_TICKS(100) : retry_delay);
+        }
+#endif
         if (delay == portMAX_DELAY) {
             ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
         } else {
@@ -864,12 +1525,35 @@ bool HasUsableStoredToken()
     return LoadUsableToken(&token);
 }
 
-#if CONFIG_WQN_WIFI_STA_ENABLE
+wqn::protocol::v3::RequestMetadata MakeDeviceRequestMetadata()
+{
+#if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
+    wqn::protocol::v3::RequestMetadata metadata;
+    metadata.request_id = RandomControlId("req_");
+    metadata.boot_id = ControlBootId();
+    metadata.firmware_version = WQN_FIRMWARE_VERSION;
+    return metadata;
+#else
+    return {};
+#endif
+}
 
-TaskHandle_t g_sync_service_task = nullptr;
+#if CONFIG_WQN_WIFI_STA_ENABLE
 
 esp_err_t StartSyncService()
 {
+    if (g_word_outbox_timer == nullptr) {
+        g_word_outbox_timer = xTimerCreateStatic(
+            "word_outbox",
+            pdMS_TO_TICKS(kWordOutboxQuietPeriodMs),
+            pdFALSE,
+            nullptr,
+            WordOutboxTimerCallback,
+            &g_word_outbox_timer_storage);
+        if (g_word_outbox_timer == nullptr) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
     const BaseType_t created = xTaskCreate(
         SyncServiceTask,
         "sync_service",
@@ -889,6 +1573,48 @@ esp_err_t StartSyncService()
 void RequestSyncNow()
 {
 #if CONFIG_WQN_WIFI_STA_ENABLE
+    g_full_sync_requested.store(true, std::memory_order_release);
+    if (g_sync_service_task != nullptr) {
+        xTaskNotifyGive(g_sync_service_task);
+    }
+#endif
+}
+
+void NoteWordInteraction()
+{
+#if CONFIG_WQN_WIFI_STA_ENABLE && CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
+    g_word_interaction_generation.fetch_add(1, std::memory_order_acq_rel);
+#endif
+}
+
+void RequestWordOutboxUpload()
+{
+#if CONFIG_WQN_WIFI_STA_ENABLE && CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
+    if (g_word_outbox_timer != nullptr &&
+        xTimerReset(g_word_outbox_timer, 0) == pdPASS) {
+        return;
+    }
+    // Timer command queue pressure must not strand a durable observation.
+    // Fall back to an immediate outbox-only notification.
+    g_word_outbox_sync_requested.store(true, std::memory_order_release);
+    if (g_sync_service_task != nullptr) {
+        xTaskNotifyGive(g_sync_service_task);
+    }
+#endif
+}
+
+void RequestNoteOutboxUpload()
+{
+    // Note observations share word's quiet-window timer and outbox-only round
+    // (the round uploads both queues), so this reuses the same trigger path.
+#if CONFIG_WQN_WIFI_STA_ENABLE && CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
+    if (g_word_outbox_timer != nullptr &&
+        xTimerReset(g_word_outbox_timer, 0) == pdPASS) {
+        return;
+    }
+    // Timer command queue pressure must not strand a durable observation.
+    // Fall back to an immediate outbox-only notification.
+    g_word_outbox_sync_requested.store(true, std::memory_order_release);
     if (g_sync_service_task != nullptr) {
         xTaskNotifyGive(g_sync_service_task);
     }

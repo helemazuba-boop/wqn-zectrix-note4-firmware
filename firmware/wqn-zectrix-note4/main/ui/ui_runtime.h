@@ -14,6 +14,7 @@ namespace device_ui_internal {
 enum class RefreshSchedule;
 struct TodoCloudResult;
 struct WordCloudResult;
+struct NoteCloudResult;
 
 // Every source which is allowed to mutate AppState has a typed entry point in
 // UiRuntime.  The enum is also emitted in structured logs so event/revision
@@ -23,6 +24,7 @@ enum class AppEventKind : uint8_t {
     kButton,
     kTodoCloudResult,
     kWordCloudResult,
+    kNoteCloudResult,
     kTimeTick,
     kAiTick,
     kAiStreamingSnapshot,
@@ -59,7 +61,8 @@ public:
 
     UiUpdate DispatchButton(const wqn::ButtonEvent& event, int64_t event_time_ms);
     UiUpdate DispatchTodoCloudResult(const TodoCloudResult& result);
-    UiUpdate DispatchWordCloudResult(const WordCloudResult& result);
+    UiUpdate DispatchWordCloudResult(WordCloudResult& result);
+    UiUpdate DispatchNoteCloudResult(NoteCloudResult& result);
     UiUpdate DispatchTimeTick(int64_t now_ms);
     UiUpdate DispatchAiTick(int64_t now_ms);
     UiUpdate DispatchAiStreamingSnapshot(const wqn::AiStreamingStatusView& view);
@@ -70,6 +73,23 @@ public:
     UiUpdate DispatchStatusReload(wqn::AppState&& snapshot);
     UiUpdate DispatchSyncResult(const wqn::services::SyncEvent& event);
     UiUpdate DispatchDisplayResult(const wqn::display::DisplayResult& result);
+    bool TakeWordCandidatePageRequest(
+        wqn::protocol::word_study_v1::CandidatePageRequest* request,
+        std::string* session_id);
+    void RestoreWordCandidatePageRequest();
+    bool TakeNoteCandidatePageRequest(
+        wqn::protocol::note_study_v1::CandidatePageRequest* request,
+        std::string* session_id);
+    void RestoreNoteCandidatePageRequest();
+    bool TakeNoteImageRequest(
+        std::string* note_id, uint8_t* image_index, std::string* image_id);
+    void RestoreNoteImageRequest();
+    bool TakeNoteObservationEffect(
+        const std::string& request_id,
+        const std::string& occurred_at,
+        wqn::DurableNoteObservation* observation,
+        wqn::PersistedNoteSession* advanced_session);
+    void RestoreNoteObservationEffect();
 
 private:
     UiUpdate FinishEvent(

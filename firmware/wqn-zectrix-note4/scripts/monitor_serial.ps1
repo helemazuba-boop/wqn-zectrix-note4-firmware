@@ -6,7 +6,8 @@
 [CmdletBinding()]
 param(
     [string]$Port = 'COM7',
-    [int]$Baud = 115200
+    [int]$Baud = 115200,
+    [switch]$ResetOnStart
 )
 
 # UTF-8 so Chinese log strings render correctly in the console.
@@ -15,6 +16,8 @@ param(
 Write-Host "Monitoring $Port @ $Baud bps. Press Ctrl+C to quit." -ForegroundColor Cyan
 Write-Host "(Port will auto-reopen if the device resets.)" -ForegroundColor DarkGray
 Write-Host ""
+
+$resetPending = $ResetOnStart.IsPresent
 
 while ($true) {
     $sp = $null
@@ -32,6 +35,17 @@ while ($true) {
 
         $ts = Get-Date -Format 'HH:mm:ss'
         Write-Host "[$ts] opened $Port" -ForegroundColor Green
+
+        if ($resetPending) {
+            # With DTR held inactive, a short RTS pulse performs the same
+            # application reset used by esptool without selecting download
+            # mode. Keep the port open so the complete boot log is captured.
+            $resetPending = $false
+            $sp.RtsEnable = $true
+            Start-Sleep -Milliseconds 100
+            $sp.RtsEnable = $false
+            Write-Host "[$ts] reset pulse sent" -ForegroundColor DarkGray
+        }
 
         while ($sp.IsOpen) {
             try {
