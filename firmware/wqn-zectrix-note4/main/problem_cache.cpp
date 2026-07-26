@@ -736,7 +736,12 @@ esp_err_t DecodeProblem(CborReader* reader, wqn::CachedProblem* problem)
                 break;
         }
     }
-    return problem->id.empty() || problem->type.empty() || problem->status.empty()
+    // type is allowed to be empty: the gaokao shell model removed
+    // problem_type from the cloud index, so every post-migration record
+    // arrives without it (the UI already renders an empty type as no line).
+    // Requiring it here failed the post-write validation of every save and
+    // burned a multi-second storage transaction per sync round.
+    return problem->id.empty() || problem->status.empty()
         ? ESP_ERR_INVALID_STATE
         : ESP_OK;
 }
