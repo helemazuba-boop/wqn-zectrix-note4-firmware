@@ -380,6 +380,42 @@ void RequestCurrentNoteImage(wqn::NoteAppState* state)
     }
 }
 
+// The note is one vertical ring: [image 1 .. image N] above the body, ends
+// joined. UP always moves up, DOWN always moves down, both wrap around --
+// no dead ends, and leaving the image layer needs no long-press.
+
+uint32_t NoteBodyMaxScroll(const wqn::NoteAppState& state)
+{
+    // RenderNoteBody shows 13 body lines (kContentTop=32, no footer line) or
+    // 12 when the image entry line occupies the first row; clamping to the
+    // last page keeps over-scroll from inflating the offset.
+    const uint32_t visible_lines =
+        state.current_note.image_ids.empty() ? 13 : 12;
+    return state.note_body_total_lines > visible_lines
+        ? state.note_body_total_lines - visible_lines
+        : 0;
+}
+
+void EnterNoteImageView(wqn::NoteAppState* state, uint8_t index)
+{
+    state->mode = wqn::NoteAppMode::kNoteImageView;
+    state->image_index = index;
+    state->image_view_entered_us = esp_timer_get_time();
+    RequestCurrentNoteImage(state);
+    state->message.clear();
+}
+
+void ExitNoteImageViewToBody(wqn::NoteAppState* state, uint32_t scroll_lines)
+{
+    // Keep the loaded payload for instant re-entry (same as the long-press
+    // exit); only the transient request/error state is cleared.
+    state->mode = wqn::NoteAppMode::kNoteView;
+    state->note_scroll_offset_lines = scroll_lines;
+    state->image_request = false;
+    state->image_error = false;
+    state->message.clear();
+}
+
 void HandleNoteViewInput(wqn::NoteAppState* state, wqn::NoteInput input)
 {
     switch (input) {
@@ -387,15 +423,16 @@ void HandleNoteViewInput(wqn::NoteAppState* state, wqn::NoteInput input)
             constexpr uint32_t kNoteBodyScrollStep = 4;
             if (state->note_scroll_offset_lines == 0) {
                 if (!state->current_note.image_ids.empty()) {
-                    // The image layer sits above the body: Up at the very top
-                    // opens it (mode change -> full refresh via ui_input).
-                    state->mode = wqn::NoteAppMode::kNoteImageView;
-                    state->image_index = 0;
-                    state->image_view_entered_us = esp_timer_get_time();
-                    RequestCurrentNoteImage(state);
-                    state->message.clear();
+                    // Up from the body top reaches the image directly above
+                    // it: the LAST attachment.
+                    EnterNoteImageView(
+                        state,
+                        static_cast<uint8_t>(
+                            state->current_note.image_ids.size() - 1));
                 } else {
-                    state->message = "已到顶部";
+                    // No images: the ring is just the body; wrap to its end.
+                    state->note_scroll_offset_lines = NoteBodyMaxScroll(*state);
+                    state->message.clear();
                 }
             } else {
                 state->note_scroll_offset_lines =
@@ -408,20 +445,17 @@ void HandleNoteViewInput(wqn::NoteAppState* state, wqn::NoteInput input)
         }
         case wqn::NoteInput::kDown:
         case wqn::NoteInput::kConfirm: {
-            // Scroll a fixed 4 lines, clamped to the last page. RenderNoteBody
-            // shows 13 body lines (kContentTop=32, no footer line) or 12 when
-            // the image entry line occupies the first row, so the max useful
-            // offset is total_lines - visible; this keeps over-scroll from
-            // inflating the offset and leaving Up-scroll with nothing to repaint.
             constexpr uint32_t kNoteBodyScrollStep = 4;
-            const uint32_t visible_lines =
-                state->current_note.image_ids.empty() ? 13 : 12;
-            const uint32_t max_scroll =
-                state->note_body_total_lines > visible_lines
-                    ? state->note_body_total_lines - visible_lines
-                    : 0;
+            const uint32_t max_scroll = NoteBodyMaxScroll(*state);
             if (state->note_scroll_offset_lines >= max_scroll) {
-                state->message = "已到底部";
+                if (!state->current_note.image_ids.empty()) {
+                    // Down past the body end wraps around the ring to the
+                    // first image at the very top.
+                    EnterNoteImageView(state, 0);
+                } else {
+                    state->note_scroll_offset_lines = 0;
+                    state->message.clear();
+                }
             } else {
                 state->note_scroll_offset_lines = std::min<uint32_t>(
                     state->note_scroll_offset_lines + kNoteBodyScrollStep, max_scroll);
@@ -449,6 +483,10 @@ void HandleNoteImageViewInput(wqn::NoteAppState* state, wqn::NoteInput input)
                 --state->image_index;
                 state->image_view_entered_us = esp_timer_get_time();
                 RequestCurrentNoteImage(state);
+            } else {
+                // Up past the first image wraps around the ring to the body
+                // end.
+                ExitNoteImageViewToBody(state, NoteBodyMaxScroll(*state));
             }
             break;
         case wqn::NoteInput::kDown:
@@ -457,10 +495,13 @@ void HandleNoteImageViewInput(wqn::NoteAppState* state, wqn::NoteInput input)
                 ++state->image_index;
                 state->image_view_entered_us = esp_timer_get_time();
                 RequestCurrentNoteImage(state);
+            } else {
+                // Down past the last image lands on the body top right below.
+                ExitNoteImageViewToBody(state, 0);
             }
             break;
         case wqn::NoteInput::kLongConfirm:
-            // Back to the body; keep the loaded payload for instant re-entry.
+            // Escape hatch kept for muscle memory: straight back to the body.
             state->mode = wqn::NoteAppMode::kNoteView;
             state->image_request = false;
             state->image_error = false;
