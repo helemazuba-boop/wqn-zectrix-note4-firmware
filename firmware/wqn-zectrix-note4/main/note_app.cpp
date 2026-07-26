@@ -349,8 +349,10 @@ void ResetNoteImageViewer(wqn::NoteAppState* state)
     state->image_in_flight = false;
     state->image_error = false;
     state->image_expected_id.clear();
+    state->image_dispatched_id.clear();
     state->image_loaded_id.clear();
     state->image_wqni.reset();
+    state->image_dispatch_us = 0;
 }
 
 // Points the viewer at current_note.image_ids[image_index]: cache hit on the
@@ -799,6 +801,7 @@ bool TakeNoteImageRequest(
     state->image_request = false;
     state->image_in_flight = true;
     state->image_dispatch_us = esp_timer_get_time();
+    state->image_dispatched_id = *image_id;
     ESP_LOGI(kTag, "note image fetch dispatched: id=%.12s index=%u note=%.8s",
              image_id->c_str(), static_cast<unsigned>(*image_index),
              note_id->c_str());
@@ -830,17 +833,19 @@ void ApplyNoteImageResult(
         }
         return;
     }
-    // Only one fetch is ever in flight, so any failure that arrives while the
-    // viewer is waiting terminates the wait -- even when the result carries no
-    // image id (early exits like an invalid token never reached the download).
-    // The old id-match guard turned those into a silent forever-loading page.
-    // A stale failure for an image the viewer no longer wants (flipped while
-    // in flight) is not an error; the take-side self-heal re-requests.
+    // Only one fetch is ever in flight, so a failure terminates the wait for
+    // the image it belongs to. Early exits (invalid token, DNS failure) carry
+    // no image id; attribute those to the id recorded at dispatch instead of
+    // blindly poisoning whatever the viewer wants NOW -- if the user flipped
+    // while the doomed fetch was in flight, image_error would block the
+    // self-heal and lock the new image on the loading page forever.
+    const std::string& failed_id =
+        image_id.empty() ? state->image_dispatched_id : image_id;
     if (state->mode == NoteAppMode::kNoteImageView && !state->image_request &&
-        (image_id.empty() || image_id == state->image_expected_id)) {
+        failed_id == state->image_expected_id) {
         state->image_error = true;
         ESP_LOGW(kTag, "note image fetch failed: %s id=%.12s",
-                 esp_err_to_name(result), image_id.c_str());
+                 esp_err_to_name(result), failed_id.c_str());
     }
 }
 

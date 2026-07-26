@@ -2912,7 +2912,10 @@ esp_err_t DownloadNoteImageV1(
         result = ESP_ERR_INVALID_SIZE;
     }
     wqni->clear();
-    wqni->reserve(kWqniFileBytes);
+    // Compressed body: typically a few KB, never the full plaintext size.
+    // Reserving kWqniFileBytes here kept two 15 KB blocks alive at once (this
+    // one was then discarded unread when the inflated buffer replaced it).
+    wqni->reserve(4096);
     std::array<uint8_t, 2048> buffer = {};
     while (result == ESP_OK && status_code == 200) {
         const int read = esp_http_client_read(

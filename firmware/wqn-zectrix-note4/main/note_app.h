@@ -97,6 +97,10 @@ struct NoteAppState {
     bool image_error = false;
     // Id the viewer currently wants; results for anything else are dropped.
     std::string image_expected_id;
+    // Id handed to the fetcher on the last dispatch: failures that arrive with
+    // an empty id (early exits before the download) are attributed to it, so a
+    // stale failure cannot poison an image the user flipped to meanwhile.
+    std::string image_dispatched_id;
     // Id of the payload currently held in image_wqni (may lag expected).
     std::string image_loaded_id;
     std::shared_ptr<const std::vector<uint8_t>> image_wqni;
