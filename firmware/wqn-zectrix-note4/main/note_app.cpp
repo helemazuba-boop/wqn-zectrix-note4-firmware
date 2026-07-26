@@ -103,9 +103,12 @@ void LoadCurrentNoteBody(wqn::NoteAppState* state)
     if (entry == nullptr) {
         // [note-image-diag] The session references a note the mounted index
         // cannot resolve -- typically a stale index after packs changed on disk.
-        ESP_LOGW(
-            "note_app", "note open unresolved: id=%.8s not in pack index",
-            item.item_id);
+        // An EMPTY index is not an anomaly (self-test / pre-mount), keep quiet.
+        if (!state->pack_index.entries.empty()) {
+            ESP_LOGW(
+                "note_app", "note open unresolved: id=%.8s not in pack index",
+                item.item_id);
+        }
         return;
     }
     const esp_err_t read_result = wqn::ReadNotePackEntry(*entry, &state->current_note);
