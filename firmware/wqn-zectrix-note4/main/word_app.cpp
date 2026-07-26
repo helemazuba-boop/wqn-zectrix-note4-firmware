@@ -12,6 +12,8 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 
+#include "storage.h"
+
 namespace {
 
 constexpr char kTag[] = "wqn_word";
@@ -424,6 +426,15 @@ esp_err_t InitWordApp(WordAppState* state)
         state->outbox.pending_count = outbox.pending_count;
         state->outbox.capacity = outbox.capacity;
     }
+
+    if (LoadDefaultWordDeckId(&state->default_deck_id) != ESP_OK) {
+        state->default_deck_id.clear();
+    }
+    std::vector<WordDeckInfo> catalog;
+    if (BuildWordDeckCatalog(&catalog) == ESP_OK) {
+        InstallWordDeckCatalog(state, std::move(catalog));
+    }
+
     bool found_paused_session = false;
     bool found_corrupt_session = false;
     for (const auto mode : kPersistedSessionModes) {
@@ -867,6 +878,68 @@ esp_err_t HandleWordAppInput(WordAppState* state, WordInput input)
     return ESP_OK;
 }
 
+esp_err_t BuildWordDeckCatalog(std::vector<WordDeckInfo>* catalog)
+{
+    if (catalog == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    catalog->clear();
+    WqnWordPackManifest manifest;
+    const esp_err_t result = LoadWordPackManifest(&manifest);
+    if (result == ESP_ERR_NOT_FOUND) {
+        return ESP_OK;  // not synced yet: empty catalog
+    }
+    if (result != ESP_OK) {
+        return result;
+    }
+    catalog->reserve(manifest.packs.size());
+    for (const WqnWordPackManifestItem& item : manifest.packs) {
+        if (item.deleted || item.deck_id.size() != 36) {
+            continue;
+        }
+        WordDeckInfo deck;
+        deck.deck_id = item.deck_id;
+        deck.title = item.title;
+        deck.entry_count = item.entry_count;
+        catalog->push_back(std::move(deck));
+    }
+    return ESP_OK;
+}
+
+void InstallWordDeckCatalog(WordAppState* state, std::vector<WordDeckInfo> catalog)
+{
+    if (state == nullptr) {
+        return;
+    }
+    state->deck_catalog = std::move(catalog);
+    state->default_deck_title.clear();
+    if (state->default_deck_id.empty()) {
+        return;
+    }
+    for (const WordDeckInfo& deck : state->deck_catalog) {
+        if (deck.deck_id == state->default_deck_id) {
+            state->default_deck_title = deck.title;
+            return;
+        }
+    }
+    if (!state->deck_catalog.empty()) {
+        // The default deck disappeared from the cloud: fall back to all decks
+        // in memory (NVS keeps the id; re-picking in settings overwrites it).
+        ESP_LOGW(kTag, "default word deck missing from catalog; falling back to all decks");
+        state->default_deck_id.clear();
+    }
+}
+
+void SetDefaultWordDeck(
+    WordAppState* state, const std::string& deck_id, const std::string& title)
+{
+    if (state == nullptr) {
+        return;
+    }
+    state->default_deck_id = deck_id;
+    state->default_deck_title = deck_id.empty() ? std::string() : title;
+}
+
 void ApplyWordPackIndex(WordAppState* state, WordPackIndex index, const std::string& message)
 {
     if (state == nullptr) {
@@ -991,6 +1064,16 @@ bool TakeWordSessionStartRequest(
     }
     request->mode = state->session.requested_mode;
     request->scope = {};
+    // Study sessions honour the deck scope ([词] row override first, then the
+    // NVS default); the dictionary stays cross-deck (a lookup is global).
+    if (request->mode != protocol::word_study_v1::Mode::kDictionary) {
+        const std::string& scope_deck_id = !state->scoped_deck_id.empty()
+            ? state->scoped_deck_id
+            : state->default_deck_id;
+        if (scope_deck_id.size() == 36) {
+            request->scope.deck_ids.push_back(scope_deck_id);
+        }
+    }
     request->optional_count = 500;
     request->seed.clear();
     state->session.start_requested = false;
@@ -1445,6 +1528,14 @@ std::string WordAppStatusLine(const WordAppState& state)
     if (state.outbox.pending_count > 0) {
         return "待同步 " + std::to_string(state.outbox.pending_count) + " 条";
     }
+    // Surface the active study scope so "why is this word here" is answerable
+    // at a glance; scoped ([词] row) wins over the settings default.
+    const std::string& scope_title = !state.scoped_deck_title.empty()
+        ? state.scoped_deck_title
+        : state.default_deck_title;
+    if (!scope_title.empty()) {
+        return "当前词库 " + scope_title;
+    }
     return "本地词库 " + std::to_string(state.pack_index.entries.size()) + " 词";
 }
 
@@ -1464,6 +1555,10 @@ std::string WordAppSignature(const WordAppState& state)
     signature.push_back('/');
     signature.append(state.sequential_session_resumable ? "1" : "0");
     signature.append(state.random_session_resumable ? "1" : "0");
+    signature.push_back('/');
+    signature.append(state.scoped_deck_id);
+    signature.push_back(':');
+    signature.append(state.default_deck_id);
     signature.push_back('/');
     signature.append(std::to_string(state.session.persisted.position));
     signature.push_back('/');

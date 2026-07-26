@@ -183,6 +183,30 @@ bool IsWordSessionInvalidError(const wqn::protocol::v3::Error& error)
            error.code == "WORD_SESSION_SNAPSHOT_INCOMPLETE";
 }
 
+// Rebuilds the note screen's [词] rows from the mounted deck catalog. The
+// current default deck is excluded: it lives on the word page itself, the
+// mixed list only carries the extra decks.
+void RebuildNoteWordDeckRows(wqn::UiState* state)
+{
+    if (state == nullptr) {
+        return;
+    }
+    std::vector<wqn::NoteWordDeckRow> rows;
+    rows.reserve(state->word_app.deck_catalog.size());
+    for (const wqn::WordDeckInfo& deck : state->word_app.deck_catalog) {
+        if (!state->word_app.default_deck_id.empty() &&
+            deck.deck_id == state->word_app.default_deck_id) {
+            continue;
+        }
+        wqn::NoteWordDeckRow row;
+        row.deck_id = deck.deck_id;
+        row.title = deck.title;
+        row.entry_count = deck.entry_count;
+        rows.push_back(std::move(row));
+    }
+    wqn::ApplyNoteWordDeckRows(&state->note_app, std::move(rows));
+}
+
 bool ApplyWordCloudResult(wqn::UiState* state, WordCloudResult& result)
 {
     if (state == nullptr) {
@@ -203,6 +227,17 @@ bool ApplyWordCloudResult(wqn::UiState* state, WordCloudResult& result)
                 &state->word_app,
                 std::move(result.pack_index),
                 result.message);
+            // Content changed: refresh the deck catalog (manifest titles +
+            // counts) and the note screen's [词] rows that mirror it.
+            std::vector<wqn::WordDeckInfo> catalog;
+            if (wqn::BuildWordDeckCatalog(&catalog) == ESP_OK) {
+                wqn::InstallWordDeckCatalog(&state->word_app, std::move(catalog));
+            }
+            RebuildNoteWordDeckRows(state);
+            // Keep the settings row value in step (a cloud-deleted default
+            // falls back to 全部词库 inside InstallWordDeckCatalog).
+            state->settings.default_word_deck_title =
+                state->word_app.default_deck_title;
         } else {
             state->word_app.cloud_sync_failed = true;
             state->word_app.cloud_loaded_once = true;

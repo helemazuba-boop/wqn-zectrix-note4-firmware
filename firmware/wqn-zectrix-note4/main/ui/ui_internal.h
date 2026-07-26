@@ -75,7 +75,10 @@ constexpr TickType_t kSelectionRefreshDelay = pdMS_TO_TICKS(180);
 constexpr TickType_t kConfigRefreshDelay = pdMS_TO_TICKS(120);
 constexpr TickType_t kAiRefreshDelay = pdMS_TO_TICKS(120);
 
-constexpr size_t kSettingsItemCount = 7;
+constexpr size_t kSettingsItemCount = 8;
+// Settings rows overflow the panel at 38px pitch; the list renders a
+// selection-following window of this many rows.
+constexpr size_t kSettingsVisibleRows = 6;
 constexpr uint32_t kAutoSyncOptions[] = {0, 15, 30, 60, 240};
 constexpr std::size_t kAutoSyncOptionsCount = sizeof(kAutoSyncOptions) / sizeof(kAutoSyncOptions[0]);
 constexpr int kVolumeOptions[] = {0, 25, 50, 75, 100};
@@ -359,6 +362,9 @@ bool QueueWordCandidatePage(
 void PumpWordCandidatePrefetch(UiRuntime* runtime);
 bool QueueWordSearch(const wqn::WqnWordSearchRequest& search);
 bool QueueWordAiLookup(const wqn::WqnWordAiLookupRequest& lookup);
+// Rebuilds the note screen's [词] rows from word_app.deck_catalog, excluding
+// the current default deck (it lives on the word page itself).
+void RebuildNoteWordDeckRows(wqn::UiState* state);
 
 bool QueueNotePackSync();
 bool QueueNoteSessionStart(

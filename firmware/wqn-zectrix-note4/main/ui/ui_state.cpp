@@ -153,6 +153,11 @@ bool LoadUiState(wqn::UiState* state)
         wqn::ApplyNoteProblemSetRows(&state->note_app, std::move(rows));
     }
 
+    // Mixed [词] rows + the settings row value both mirror the word deck
+    // catalog loaded by InitWordApp above.
+    RebuildNoteWordDeckRows(state);
+    state->settings.default_word_deck_title = state->word_app.default_deck_title;
+
     std::vector<wqn::PendingReviewResult> pending;
     result = wqn::LoadPendingReviewResults(&pending);
     if (result == ESP_OK) {

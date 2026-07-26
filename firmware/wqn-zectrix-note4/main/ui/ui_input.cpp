@@ -95,6 +95,48 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
         return RefreshSchedule::kNone;
     }
 
+    if (state->settings.dialog == wqn::SettingsDialog::kDefaultWordDeck) {
+        auto& settings = state->settings;
+        if (short_press && event.button == wqn::ButtonId::kUp) {
+            if (settings.word_deck_selected == 0) {
+                return RefreshSchedule::kNone;
+            }
+            --settings.word_deck_selected;
+            return RefreshSchedule::kConfig;
+        }
+        if (short_press && event.button == wqn::ButtonId::kDownPower) {
+            if (settings.word_deck_selected + 1 >= settings.word_deck_options.size()) {
+                return RefreshSchedule::kNone;
+            }
+            ++settings.word_deck_selected;
+            return RefreshSchedule::kConfig;
+        }
+        if (short_press && event.button == wqn::ButtonId::kConfirm) {
+            if (settings.word_deck_selected < settings.word_deck_options.size()) {
+                const wqn::WordDeckInfo& option =
+                    settings.word_deck_options[settings.word_deck_selected];
+                const esp_err_t result = wqn::SaveDefaultWordDeckId(option.deck_id);
+                if (result == ESP_OK) {
+                    wqn::SetDefaultWordDeck(&state->word_app, option.deck_id, option.title);
+                    settings.default_word_deck_title =
+                        state->word_app.default_deck_title;
+                    // The default deck leaves (or rejoins) the note screen's
+                    // mixed [词] rows immediately.
+                    RebuildNoteWordDeckRows(state);
+                    settings.notice = option.deck_id.empty()
+                        ? "默认词库：全部词库"
+                        : "默认词库：" + option.title;
+                } else {
+                    settings.notice = "默认词库保存失败";
+                    ESP_LOGW(kTag, "save default word deck failed: %s", esp_err_to_name(result));
+                }
+            }
+            settings.dialog = wqn::SettingsDialog::kNone;
+            return RefreshSchedule::kConfig;
+        }
+        return RefreshSchedule::kNone;
+    }
+
     if (state->settings.dialog == wqn::SettingsDialog::kBattery ||
         state->settings.dialog == wqn::SettingsDialog::kStorage) {
         if (event.button == wqn::ButtonId::kConfirm && (short_press || long_press)) {
@@ -180,10 +222,13 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
             OpenSettingsDialog(state, wqn::SettingsDialog::kVolume);
             return RefreshSchedule::kConfig;
         case 5:
+            OpenSettingsDialog(state, wqn::SettingsDialog::kDefaultWordDeck);
+            return RefreshSchedule::kConfig;
+        case 6:
             UpdateSettingsDiagnostics(state);
             state->settings.notice = "固件 " + state->settings.diagnostics.firmware_version;
             return RefreshSchedule::kConfig;
-        case 6:
+        case 7:
             OpenSettingsDialog(state, wqn::SettingsDialog::kFactoryReset);
             return RefreshSchedule::kConfig;
         default:

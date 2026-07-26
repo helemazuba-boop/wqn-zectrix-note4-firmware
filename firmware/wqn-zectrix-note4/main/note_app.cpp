@@ -206,10 +206,12 @@ void ActivatePendingNotePackIndex(wqn::NoteAppState* state)
 
 void HandleNotebookListInput(wqn::NoteAppState* state, wqn::NoteInput input)
 {
-    // The list mixes notebooks with the [题] problem-set rows appended after
-    // them; navigation spans both, Confirm dispatches on the row kind.
+    // The list mixes notebooks with the [题] problem-set rows and the [词]
+    // word-deck rows appended after them; navigation spans all three
+    // segments, Confirm dispatches on the row kind.
     const size_t notebook_count = state->pack_index.notebooks.size();
-    const size_t count = notebook_count + state->problem_sets.size();
+    const size_t problem_count = state->problem_sets.size();
+    const size_t count = notebook_count + problem_count + state->word_decks.size();
     switch (input) {
         case wqn::NoteInput::kUp:
             if (state->notebook_selected > 0) {
@@ -232,6 +234,14 @@ void HandleNotebookListInput(wqn::NoteAppState* state, wqn::NoteInput input)
         case wqn::NoteInput::kConfirm: {
             if (count == 0 || state->notebook_selected >= count) {
                 state->message = "暂无笔记本，稍后同步";
+                break;
+            }
+            if (state->notebook_selected >= notebook_count + problem_count) {
+                const wqn::NoteWordDeckRow& row = state->word_decks
+                    [state->notebook_selected - notebook_count - problem_count];
+                state->word_deck_open_requested = true;
+                state->requested_word_deck_id = row.deck_id;
+                state->message.clear();
                 break;
             }
             if (state->notebook_selected >= notebook_count) {
@@ -631,13 +641,13 @@ void ApplyNotePackIndex(NoteAppState* state, NotePackIndex index, const std::str
     InstallNotePackIndex(state, std::move(index), message);
 }
 
-void ApplyNoteProblemSetRows(NoteAppState* state, std::vector<NoteProblemSetRow> rows)
+// The mixed list may have shrunk under the selection (rows re-applied after
+// a sync or a default-deck change); clamp against the combined row count so
+// the highlight stays on-screen.
+static void ClampNoteMixedListSelection(NoteAppState* state)
 {
-    if (state == nullptr) return;
-    state->problem_sets = std::move(rows);
-    // The mixed list may have shrunk under the selection; clamp against the
-    // combined row count so the highlight stays on-screen.
-    const size_t count = state->pack_index.notebooks.size() + state->problem_sets.size();
+    const size_t count = state->pack_index.notebooks.size() +
+        state->problem_sets.size() + state->word_decks.size();
     if (count == 0) {
         state->notebook_selected = 0;
         state->notebook_window_start = 0;
@@ -645,6 +655,20 @@ void ApplyNoteProblemSetRows(NoteAppState* state, std::vector<NoteProblemSetRow>
         state->notebook_selected = count - 1;
         UpdateListViewport(state->notebook_selected, count, &state->notebook_window_start);
     }
+}
+
+void ApplyNoteProblemSetRows(NoteAppState* state, std::vector<NoteProblemSetRow> rows)
+{
+    if (state == nullptr) return;
+    state->problem_sets = std::move(rows);
+    ClampNoteMixedListSelection(state);
+}
+
+void ApplyNoteWordDeckRows(NoteAppState* state, std::vector<NoteWordDeckRow> rows)
+{
+    if (state == nullptr) return;
+    state->word_decks = std::move(rows);
+    ClampNoteMixedListSelection(state);
 }
 
 bool TakeNoteProblemSetOpenRequest(NoteAppState* state, std::string* set_id)
@@ -660,6 +684,20 @@ bool TakeNoteProblemSetOpenRequest(NoteAppState* state, std::string* set_id)
     *set_id = state->requested_problem_set_id;
     state->problem_set_open_requested = false;
     state->requested_problem_set_id.clear();
+    return true;
+}
+
+bool TakeNoteWordDeckOpenRequest(NoteAppState* state, std::string* deck_id)
+{
+    if (state == nullptr || deck_id == nullptr) return false;
+    if (!state->word_deck_open_requested ||
+        state->requested_word_deck_id.size() != 36) {
+        state->word_deck_open_requested = false;
+        return false;
+    }
+    *deck_id = state->requested_word_deck_id;
+    state->word_deck_open_requested = false;
+    state->requested_word_deck_id.clear();
     return true;
 }
 
@@ -1126,6 +1164,14 @@ NoteAppSnapshot BuildNoteAppSnapshot(const NoteAppState& state)
         row.has_pack = true;
         snapshot.notebooks.push_back(std::move(row));
     }
+    // Non-default word decks follow as [词] rows (word counts trailing).
+    for (const NoteWordDeckRow& deck : state.word_decks) {
+        NoteNotebookRow row;
+        row.title = "[词] " + deck.title;
+        row.note_count = deck.entry_count;
+        row.has_pack = true;
+        snapshot.notebooks.push_back(std::move(row));
+    }
 
     if (state.mode == NoteAppMode::kNoteList || state.mode == NoteAppMode::kNoteView ||
         state.mode == NoteAppMode::kNoteImageView) {
@@ -1208,17 +1254,18 @@ std::string NoteAppSignature(const NoteAppState& state)
     // Compact identity for the render layer to detect meaningful frame changes.
     // image_index/error must participate: flipping images or a failed fetch
     // changes the frame with every other field identical.
-    char buffer[112] = {};
+    char buffer[128] = {};
     std::snprintf(
         buffer,
         sizeof(buffer),
-        "%u:%u:%u:%u:%u:%u:%u:%u:%u",
+        "%u:%u:%u:%u:%u:%u:%u:%u:%u:%u",
         static_cast<unsigned>(state.mode),
         static_cast<unsigned>(state.notebook_selected),
         static_cast<unsigned>(state.note_list_selected),
         static_cast<unsigned>(state.note_scroll_offset_lines),
         static_cast<unsigned>(state.pack_index.notebooks.size()),
         static_cast<unsigned>(state.problem_sets.size()),
+        static_cast<unsigned>(state.word_decks.size()),
         static_cast<unsigned>(state.session.commit_state),
         static_cast<unsigned>(state.image_index),
         static_cast<unsigned>(state.image_error ? 1 : 0));

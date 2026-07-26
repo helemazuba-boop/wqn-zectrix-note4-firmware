@@ -547,8 +547,8 @@ void ClampUiSelection(UiState* state)
     } else if (state->todo.selected >= state->todo.todos.size()) {
         state->todo.selected = state->todo.todos.size() - 1;
     }
-    if (state->settings.selected >= 6) {
-        state->settings.selected = 5;
+    if (state->settings.selected >= 8) {
+        state->settings.selected = 7;
     }
     const size_t ai_pages = AiSessionPageCount(state->ai);
     if (state->ai.page >= ai_pages) {
@@ -633,7 +633,7 @@ void HandleUiInput(UiState* state, UiInput input)
             } else if (state->screen == UiScreen::kTodo && state->todo.selected + 1 < state->todo.todos.size()) {
                 ++state->todo.selected;
             } else if (state->screen == UiScreen::kSettings) {
-                if (state->settings.selected + 1 < 6) {
+                if (state->settings.selected + 1 < 8) {
                     ++state->settings.selected;
                 }
             } else if (state->screen == UiScreen::kReviewScore) {
@@ -665,6 +665,20 @@ void HandleUiInput(UiState* state, UiInput input)
                     if (!ActivateProblemBrowse(&state->problem_app, requested_set_id)) {
                         state->note_app.message = state->problem_app.message;
                     }
+                }
+                // Selecting a [词] row scopes the word page to that deck and
+                // switches screens; the word page's own UI takes over.
+                std::string requested_deck_id;
+                if (TakeNoteWordDeckOpenRequest(&state->note_app, &requested_deck_id)) {
+                    state->word_app.scoped_deck_id = requested_deck_id;
+                    state->word_app.scoped_deck_title.clear();
+                    for (const WordDeckInfo& deck : state->word_app.deck_catalog) {
+                        if (deck.deck_id == requested_deck_id) {
+                            state->word_app.scoped_deck_title = deck.title;
+                            break;
+                        }
+                    }
+                    state->screen = UiScreen::kWord;
                 }
                 break;
             } else if (state->screen == UiScreen::kHome) {
@@ -763,6 +777,13 @@ void HandleUiInput(UiState* state, UiInput input)
         state->screen != wqn::UiScreen::kNote) {
         ReleaseNoteImagePayload(&state->note_app);
         ReleaseProblemImagePayload(&state->problem_app);
+    }
+    // Leaving the word screen drops the [词]-row deck override so the next
+    // direct entry studies the settings default again.
+    if (screen_before == wqn::UiScreen::kWord &&
+        state->screen != wqn::UiScreen::kWord) {
+        state->word_app.scoped_deck_id.clear();
+        state->word_app.scoped_deck_title.clear();
     }
 #if CONFIG_WQN_AI_ENABLE
     // Leaving the AI screen while in Flash tier must tear down the WebSocket
