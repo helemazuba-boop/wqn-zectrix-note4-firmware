@@ -132,7 +132,14 @@ esp_err_t DownloadNotePackToStorage(
     const std::string& token,
     const protocol::v3::RequestMetadata& metadata,
     const WqnNotePackManifestNotebook& notebook);
-bool NotePackNeedsDownload(const WqnNotePackManifestNotebook& notebook);
+// verified_sha: sha recorded in the local manifest when this pack was last
+// downloaded (already verified end to end). When it matches the listing and
+// the file size is intact, the full-file re-hash is skipped -- under the
+// relist-every-sync cadence that hash was a multi-second CPU/storage burst
+// per cycle.
+bool NotePackNeedsDownload(
+    const WqnNotePackManifestNotebook& notebook,
+    const std::string* verified_sha = nullptr);
 esp_err_t ReadNotePackEntry(const NotePackIndexEntry& index_entry, WqnNoteEntry* entry);
 std::string SafeNotePackStem(const WqnNotePackManifestNotebook& notebook);
 

@@ -22,6 +22,42 @@ constexpr char kTag[] = "note_cloud";
 // cursor cannot spin the task forever; the caller re-runs to continue.
 constexpr size_t kMaxManifestPagesPerSync = 32;
 
+const WqnNotePackManifestNotebook* FindManifestNotebook(
+    const WqnNotePackManifest& manifest, const std::string& notebook_id)
+{
+    for (const WqnNotePackManifestNotebook& item : manifest.notebooks) {
+        if (item.notebook_id == notebook_id) {
+            return &item;
+        }
+    }
+    return nullptr;
+}
+
+// Content equality of two manifests (cursor/has_more excluded: they are paging
+// state, not content). Both sides are sorted by notebook_id.
+bool SameManifestNotebooks(
+    const WqnNotePackManifest& a, const WqnNotePackManifest& b)
+{
+    if (a.notebooks.size() != b.notebooks.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < a.notebooks.size(); ++i) {
+        const WqnNotePackManifestNotebook& x = a.notebooks[i];
+        const WqnNotePackManifestNotebook& y = b.notebooks[i];
+        if (x.notebook_id != y.notebook_id || x.title != y.title ||
+            x.change_sequence != y.change_sequence ||
+            x.content_revision != y.content_revision ||
+            x.has_pack != y.has_pack || x.pack_id != y.pack_id ||
+            x.pack_revision != y.pack_revision ||
+            x.schema_version != y.schema_version ||
+            x.entry_count != y.entry_count || x.byte_size != y.byte_size ||
+            x.sha256 != y.sha256 || x.download_url != y.download_url) {
+            return false;
+        }
+    }
+    return true;
+}
+
 }  // namespace
 
 esp_err_t SyncNotePacks(const std::string& token, NotePackSyncResult* out)
@@ -109,7 +145,13 @@ esp_err_t SyncNotePacks(const std::string& token, NotePackSyncResult* out)
         size_t total_needed = 0;
         for (size_t i = 0; i < delta.notebooks.size(); ++i) {
             const WqnNotePackManifestNotebook& item = delta.notebooks[i];
-            if (!item.deleted && NotePackNeedsDownload(item)) {
+            // Under relist-every-sync, the recorded sha lets unchanged packs
+            // skip the full-file re-hash (see NotePackNeedsDownload).
+            const WqnNotePackManifestNotebook* known =
+                FindManifestNotebook(local_manifest, item.notebook_id);
+            const std::string* verified_sha =
+                known != nullptr && known->has_pack ? &known->sha256 : nullptr;
+            if (!item.deleted && NotePackNeedsDownload(item, verified_sha)) {
                 needs_download[i] = 1;
                 total_needed += item.byte_size;
             }
@@ -151,7 +193,13 @@ esp_err_t SyncNotePacks(const std::string& token, NotePackSyncResult* out)
         if (page_changed) {
             WqnNotePackManifest merged;
             out->result = MergeNotePackManifestDelta(delta, &merged);
-            if (out->result == ESP_OK) {
+            if (out->result == ESP_OK &&
+                (!SameManifestNotebooks(merged, local_manifest) ||
+                 !had_local_manifest)) {
+                // Persist only real content changes: relisting produces an
+                // identical merge every idle cycle, and the unconditional save
+                // was a recurring multi-second storage transaction that
+                // foreground UI writes had to queue behind.
                 out->result = SaveNotePackManifest(merged);
             }
             if (out->result == ESP_OK) {

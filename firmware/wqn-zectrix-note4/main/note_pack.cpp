@@ -1258,13 +1258,25 @@ esp_err_t DownloadNotePackToStorage(
     return result;
 }
 
-bool NotePackNeedsDownload(const WqnNotePackManifestNotebook& notebook)
+bool NotePackNeedsDownload(
+    const WqnNotePackManifestNotebook& notebook,
+    const std::string* verified_sha)
 {
     if (!notebook.has_pack) {
         return false;
     }
     const std::string path = PackPathForNotebook(notebook);
-    return !FileExists(path) || !VerifyFileSha256(path, notebook.sha256);
+    struct stat status = {};
+    if (stat(path.c_str(), &status) != 0 || !S_ISREG(status.st_mode)) {
+        return true;
+    }
+    if (verified_sha != nullptr && *verified_sha == notebook.sha256 &&
+        static_cast<uint64_t>(status.st_size) == notebook.byte_size) {
+        // The listing matches the sha we verified at download time and the
+        // file is size-intact: skip the full-file re-hash.
+        return false;
+    }
+    return !VerifyFileSha256(path, notebook.sha256);
 }
 
 esp_err_t ReadNotePackEntry(const NotePackIndexEntry& index_entry, WqnNoteEntry* entry)
