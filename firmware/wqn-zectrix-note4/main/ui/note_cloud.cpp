@@ -141,6 +141,10 @@ bool QueueNoteImageFetch(
 void PumpNoteImageFetch(UiRuntime* runtime)
 {
     if (runtime == nullptr || IsNoteCloudBusy()) return;
+    // Only fetch while the note screen is visible. After a top-screen switch
+    // the released payload would otherwise be fetched right back into memory
+    // behind an invisible page (HIL: 're-armed' + cache hit on screen 5).
+    if (runtime->state().screen != wqn::UiScreen::kNote) return;
     std::string note_id;
     uint8_t image_index = 0;
     std::string image_id;
