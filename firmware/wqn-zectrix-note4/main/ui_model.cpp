@@ -731,6 +731,13 @@ void HandleUiInput(UiState* state, UiInput input)
             break;
     }
     ClampUiSelection(state);
+    // Leaving the note screen drops the 15 KB image payload: internal SRAM is
+    // too scarce to park it behind an invisible page. Re-entry reloads it
+    // from the SPIFFS cache via the viewer's normal request path.
+    if (screen_before == wqn::UiScreen::kNote &&
+        state->screen != wqn::UiScreen::kNote) {
+        ReleaseNoteImagePayload(&state->note_app);
+    }
 #if CONFIG_WQN_AI_ENABLE
     // Leaving the AI screen while in Flash tier must tear down the WebSocket
     // and the audio streaming task — otherwise they keep running in the

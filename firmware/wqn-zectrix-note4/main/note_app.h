@@ -100,6 +100,9 @@ struct NoteAppState {
     // Id of the payload currently held in image_wqni (may lag expected).
     std::string image_loaded_id;
     std::shared_ptr<const std::vector<uint8_t>> image_wqni;
+    // Dispatch time of the in-flight fetch (us); lets the pump time out a
+    // request wedged in the network stack and re-arm it.
+    int64_t image_dispatch_us = 0;
 
     bool cloud_sync_requested = false;
     bool cloud_sync_failed = false;
@@ -189,6 +192,9 @@ bool TakeNoteImageRequest(
     uint8_t* image_index,
     std::string* image_id);
 void RestoreNoteImageRequest(NoteAppState* state);
+// Frees the held WQNI payload (used when the user leaves the note screen);
+// keeps request/in-flight bookkeeping intact.
+void ReleaseNoteImagePayload(NoteAppState* state);
 void ApplyNoteImageResult(
     NoteAppState* state,
     esp_err_t result,

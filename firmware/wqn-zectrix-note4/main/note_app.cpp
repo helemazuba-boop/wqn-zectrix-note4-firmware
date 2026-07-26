@@ -8,6 +8,7 @@
 
 #include "esp_check.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 
 #include "display_service.h"
 
@@ -797,6 +798,7 @@ bool TakeNoteImageRequest(
     *image_id = state->image_expected_id;
     state->image_request = false;
     state->image_in_flight = true;
+    state->image_dispatch_us = esp_timer_get_time();
     ESP_LOGI(kTag, "note image fetch dispatched: id=%.12s index=%u note=%.8s",
              image_id->c_str(), static_cast<unsigned>(*image_index),
              note_id->c_str());
@@ -849,8 +851,27 @@ void ApplyNoteImageResult(
 void EnsureNoteImageRequest(NoteAppState* state)
 {
     if (state == nullptr || state->mode != NoteAppMode::kNoteImageView ||
-        state->image_request || state->image_in_flight || state->image_error ||
+        state->image_request || state->image_error ||
         state->image_expected_id.empty()) {
+        return;
+    }
+    if (state->image_in_flight) {
+        // A fetch wedged in the network stack (weak Wi-Fi, half-open TCP)
+        // never delivers a result, and in_flight would block the self-heal
+        // forever. Past the outer timeout, drop the claim and re-arm; a late
+        // result is ignored by ApplyNoteImageResult's in_flight guard, and
+        // the re-armed request cannot double-dispatch while the note cloud
+        // domain is still busy.
+        constexpr int64_t kImageFetchTimeoutUs = 20LL * 1000 * 1000;
+        if (state->image_dispatch_us <= 0 ||
+            esp_timer_get_time() - state->image_dispatch_us <
+                kImageFetchTimeoutUs) {
+            return;
+        }
+        ESP_LOGW(kTag, "note image fetch timed out; re-arming: id=%.12s",
+                 state->image_expected_id.c_str());
+        state->image_in_flight = false;
+        state->image_request = true;
         return;
     }
     if (state->image_loaded_id == state->image_expected_id &&
@@ -861,6 +882,18 @@ void EnsureNoteImageRequest(NoteAppState* state)
              state->image_expected_id.c_str(),
              static_cast<unsigned>(state->image_index));
     state->image_request = true;
+}
+
+// Drops the 15 KB image payload when the user leaves the note screen; SRAM is
+// too scarce to keep it parked behind an invisible page. Re-entry goes through
+// the loading page + SPIFFS cache, so the cost of coming back is one cache
+// read, not a download. In-flight state stays untouched: a live fetch result
+// is still applied (and simply held until the ids line up again).
+void ReleaseNoteImagePayload(NoteAppState* state)
+{
+    if (state == nullptr) return;
+    state->image_wqni.reset();
+    state->image_loaded_id.clear();
 }
 
 bool TakeNoteObservationEffect(

@@ -2953,6 +2953,17 @@ esp_err_t DownloadNoteImageV1(
         return result;
     }
 
+    // A gateway or captive portal can answer 200 with HTML/JSON; our zlib
+    // bodies always start with CMF 0x78 (deflate, 32K window). Rejecting
+    // early gives a precise log instead of a generic inflate failure.
+    if (wqni->empty() || (*wqni)[0] != 0x78) {
+        ESP_LOGW(kTag, "note-image-download body is not zlib (first=0x%02x size=%u)",
+                 wqni->empty() ? 0 : (*wqni)[0],
+                 static_cast<unsigned>(wqni->size()));
+        wqni->clear();
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
     // zlib transport coding: inflate the body before any verification --
     // image_id is the sha256 of the uncompressed WQNI file. NOT
     // tinfl_decompress_mem_to_mem: that convenience wrapper declares the ~11 KB

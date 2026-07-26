@@ -1337,11 +1337,10 @@ bool IsNoteImageId(const std::string& image_id)
 // best-effort LRU.
 void EvictNoteImageCacheIfNeeded()
 {
-    struct Candidate {
-        std::string path;
-        time_t mtime;
-    };
-    std::vector<Candidate> files;
+    // First pass: names only. stat() on SPIFFS is a full node lookup, so the
+    // common case (cache below the cap) must not pay 64 of them on the
+    // storage task while foreground transactions queue behind it.
+    std::vector<std::string> names;
     DIR* directory = opendir(kStorageRoot);
     if (directory == nullptr) return;
     struct dirent* item = nullptr;
@@ -1351,12 +1350,21 @@ void EvictNoteImageCacheIfNeeded()
             name.substr(name.size() - 5) != ".wqni") {
             continue;
         }
-        const std::string path = std::string(kStorageRoot) + "/" + name;
+        names.push_back(std::string(kStorageRoot) + "/" + name);
+    }
+    closedir(directory);
+    if (names.size() < wqn::kNoteImageCacheMaxFiles) return;
+
+    struct Candidate {
+        std::string path;
+        time_t mtime;
+    };
+    std::vector<Candidate> files;
+    files.reserve(names.size());
+    for (const std::string& path : names) {
         struct stat info = {};
         files.push_back({path, stat(path.c_str(), &info) == 0 ? info.st_mtime : 0});
     }
-    closedir(directory);
-    if (files.size() < wqn::kNoteImageCacheMaxFiles) return;
     std::sort(files.begin(), files.end(), [](const Candidate& a, const Candidate& b) {
         return a.mtime < b.mtime;
     });
