@@ -242,6 +242,40 @@ struct NoteCloudResultReady {
     uint32_t generation = 0;
 };
 
+enum class ProblemCloudOp {
+    kPackSync,
+    kFetchImage,
+    // Local storage write (verdict outbox append); needs no network/token.
+    // Runs on the interactive lane so the durable append leaves the UI task.
+    kCommitObservation,
+};
+
+struct ProblemCloudRequest {
+    ProblemCloudOp op = ProblemCloudOp::kPackSync;
+    // kFetchImage: which problem/attachment and the content hash to verify.
+    char problem_id[37] = {};
+    char image_id[65] = {};
+    uint8_t image_index = 0;
+    // 0 = assets, 1 = solution (the /v3 image route path segment).
+    uint8_t image_kind = 0;
+};
+
+struct ProblemCloudResult {
+    ProblemCloudOp op = ProblemCloudOp::kPackSync;
+    esp_err_t result = ESP_FAIL;
+    bool auth_required = false;
+    bool pack_index_ready = false;
+    wqn::ProblemPackIndex pack_index;
+    std::string message;
+    // kFetchImage: validated WQNI bytes (header + payload) and their id.
+    std::string image_id;
+    std::shared_ptr<const std::vector<uint8_t>> image_wqni;
+};
+
+struct ProblemCloudResultReady {
+    uint32_t generation = 0;
+};
+
 // --- Unified cloud runner ---------------------------------------------------
 // One executor replaces the three per-domain cloud tasks. Two lanes so bulk
 // transfers (pack sync: multi-MB downloads + index rebuilds) can never sit in
@@ -254,7 +288,6 @@ enum class CloudDomain : uint8_t {
     kTodo,
     kWord,
     kNote,
-    // Reserved sync domain for the problem (错题) feature; no executor yet.
     kProblem,
 };
 
@@ -270,6 +303,7 @@ struct CloudJob {
         TodoCloudRequest todo;
         WordCloudRequest word;
         NoteCloudRequest note;
+        ProblemCloudRequest problem;
     };
     CloudJob() : todo() {}
 };
@@ -292,20 +326,25 @@ static_assert(std::is_trivially_copyable_v<CloudResultReady>);
 void SendTodoCloudResult();
 void SendWordCloudResult();
 void SendNoteCloudResult();
+void SendProblemCloudResult();
 const TodoCloudResult* PeekTodoCloudResult(uint32_t generation);
 WordCloudResult* PeekWordCloudResult(uint32_t generation);
 NoteCloudResult* PeekNoteCloudResult(uint32_t generation);
+ProblemCloudResult* PeekProblemCloudResult(uint32_t generation);
 
 bool IsTodoCloudBusy();
 bool IsWordCloudBusy();
 bool IsNoteCloudBusy();
+bool IsProblemCloudBusy();
 void FinishTodoCloudRequest();
 void FinishWordCloudRequest();
 void FinishNoteCloudRequest();
+void FinishProblemCloudRequest();
 
 bool QueueTodoCloudRequest(const TodoCloudRequest& request);
 bool QueueWordCloudRequest(const WordCloudRequest& request);
 bool QueueNoteCloudRequest(const NoteCloudRequest& request);
+bool QueueProblemCloudRequest(const ProblemCloudRequest& request);
 
 bool QueueTodoRefresh();
 bool QueueTodoRefreshCursor(const std::string& cursor);
@@ -333,12 +372,22 @@ bool QueueNoteImageFetch(
 void PumpNoteImageFetch(UiRuntime* runtime);
 void PumpNoteObservationCommit(UiRuntime* runtime);
 
+bool QueueProblemPackSync();
+bool QueueProblemImageFetch(
+    const std::string& problem_id,
+    bool is_solution,
+    uint8_t image_index,
+    const std::string& image_id);
+void PumpProblemImageFetch(UiRuntime* runtime);
+void PumpProblemVerdictCommit(UiRuntime* runtime);
+
 bool ApplyTodoCloudResult(
     wqn::UiState* state,
     const TodoCloudResult& result,
     bool* content_changed = nullptr);
 bool ApplyWordCloudResult(wqn::UiState* state, WordCloudResult& result);
 bool ApplyNoteCloudResult(wqn::UiState* state, NoteCloudResult& result);
+bool ApplyProblemCloudResult(wqn::UiState* state, ProblemCloudResult& result);
 
 bool RefreshTodosFromCloud(wqn::UiState* state);
 RefreshSchedule CompleteSelectedTodo(wqn::UiState* state);
@@ -346,6 +395,7 @@ RefreshSchedule CompleteSelectedTodo(wqn::UiState* state);
 void ExecuteTodoCloudRequest(const TodoCloudRequest& request);
 void ExecuteWordCloudRequest(const WordCloudRequest& request);
 void ExecuteNoteCloudRequest(const NoteCloudRequest& request);
+void ExecuteProblemCloudRequest(const ProblemCloudRequest& request);
 
 bool LoadValidTokenForTodo(std::string* token);
 
@@ -467,6 +517,10 @@ esp_err_t RenderWordToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule);
 // ---- Note page --------------------------------------------------------------
 
 esp_err_t RenderNoteToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule);
+
+// ---- Problem browse (hosted by the note page) -------------------------------
+
+esp_err_t RenderProblemBrowseToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule);
 
 // ---- Settings page ----------------------------------------------------------
 

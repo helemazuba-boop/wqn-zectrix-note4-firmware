@@ -557,6 +557,53 @@ std::string FrameSignature(const wqn::UiFrame& frame)
             signature.push_back(':');
             signature.append(row.last_opened_at);
         }
+        // Problem browse layer (rides on the note screen). Everything that
+        // changes the drawn view must land here: face/scroll transitions,
+        // unlock, verdict selection, image readiness -- the note domain's
+        // "missing signature field freezes the page" trap applies verbatim.
+        const wqn::ProblemAppSnapshot& problem = frame.problem_app;
+        signature.append("|problem:");
+        signature.append(problem.active ? "1" : "0");
+        if (problem.active) {
+            signature.push_back('/');
+            signature.append(std::to_string(static_cast<int>(problem.mode)));
+            signature.push_back('/');
+            signature.append(std::to_string(problem.list_selected));
+            signature.push_back('/');
+            signature.append(std::to_string(problem.list_window_start));
+            signature.push_back('/');
+            signature.append(std::to_string(static_cast<int>(problem.face)));
+            signature.push_back('/');
+            signature.append(std::to_string(problem.body_scroll_lines));
+            signature.push_back('/');
+            signature.append(std::to_string(problem.answer_scroll_lines));
+            signature.push_back('/');
+            signature.append(problem.answer_unlocked ? "1" : "0");
+            signature.push_back('/');
+            signature.append(std::to_string(problem.verdict_selected));
+            signature.push_back('/');
+            signature.append(std::to_string(static_cast<int>(problem.commit_state)));
+            signature.push_back('/');
+            signature.append(problem.problem_id);
+            signature.push_back('/');
+            signature.append(std::to_string(problem.position));
+            signature.push_back(':');
+            signature.append(std::to_string(problem.total));
+            signature.push_back('/');
+            signature.append(std::to_string(problem.image_ordinal));
+            signature.push_back(':');
+            signature.append(problem.image_ready ? "1" : "0");
+            signature.push_back(':');
+            signature.append(problem.image_error ? "1" : "0");
+            signature.push_back(':');
+            signature.append(problem.image_id);
+            for (const wqn::ProblemListRow& row : problem.rows) {
+                signature.push_back('|');
+                signature.append(row.title);
+                signature.push_back(':');
+                signature.append(row.status_label);
+            }
+        }
     }
     if (frame.screen == wqn::UiScreen::kSettings) {
         const wqn::SettingsDiagnosticsSnapshot& diag = frame.settings.diagnostics;

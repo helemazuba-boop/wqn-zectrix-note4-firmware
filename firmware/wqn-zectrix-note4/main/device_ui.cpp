@@ -149,6 +149,7 @@ using device_ui_internal::AcknowledgeDisplayResult;
 using device_ui_internal::FinishTodoCloudRequest;
 using device_ui_internal::FinishWordCloudRequest;
 using device_ui_internal::FinishNoteCloudRequest;
+using device_ui_internal::FinishProblemCloudRequest;
 using device_ui_internal::g_display_result_queue;
 using device_ui_internal::g_rtc_screen_val;
 
@@ -465,6 +466,7 @@ void DeviceUiTask(void*)
     TickType_t poll_delay = kUiPollDelayTicks;
     bool word_pack_refresh_pending = false;
     bool note_pack_refresh_pending = false;
+    bool problem_pack_refresh_pending = false;
 
     while (true) {
         RefreshSchedule refresh_schedule = pending_refresh_schedule;
@@ -473,6 +475,7 @@ void DeviceUiTask(void*)
         bool todo_cloud_completed = false;
         bool word_cloud_completed = false;
         bool note_cloud_completed = false;
+        bool problem_cloud_completed = false;
         if (g_sync_event_queue != nullptr) {
             wqn::services::SyncEvent sync_event;
             while (xQueueReceive(g_sync_event_queue, &sync_event, 0) == pdTRUE) {
@@ -496,6 +499,9 @@ void DeviceUiTask(void*)
                     // word lane: one coalesced manifest check per sync cycle;
                     // an unchanged manifest ends the round trip immediately.
                     note_pack_refresh_pending = true;
+                    // Problem sets ride the same cadence: the manifest sha
+                    // comparison keeps unchanged packs download-free.
+                    problem_pack_refresh_pending = true;
                 }
             }
         }
@@ -584,6 +590,21 @@ void DeviceUiTask(void*)
                                 StrongerSchedule(refresh_schedule, update.refresh);
                         } else {
                             ESP_LOGE(kTag, "stale Note result signal: generation=%lu",
+                                     static_cast<unsigned long>(ready.generation));
+                        }
+                        break;
+                    }
+                    case device_ui_internal::CloudDomain::kProblem: {
+                        problem_cloud_completed = true;
+                        device_ui_internal::ProblemCloudResult* problem_result =
+                            device_ui_internal::PeekProblemCloudResult(ready.generation);
+                        if (problem_result != nullptr) {
+                            const device_ui_internal::UiUpdate update =
+                                ui_runtime.DispatchProblemCloudResult(*problem_result);
+                            refresh_schedule =
+                                StrongerSchedule(refresh_schedule, update.refresh);
+                        } else {
+                            ESP_LOGE(kTag, "stale Problem result signal: generation=%lu",
                                      static_cast<unsigned long>(ready.generation));
                         }
                         break;
@@ -681,7 +702,8 @@ wqn::AiStreamingStatusView streaming_view{};
         // refreshes the UI when the data is actually stable.
         const bool cloud_quiet = !device_ui_internal::IsTodoCloudBusy() &&
             !device_ui_internal::IsWordCloudBusy() &&
-            !device_ui_internal::IsNoteCloudBusy();
+            !device_ui_internal::IsNoteCloudBusy() &&
+            !device_ui_internal::IsProblemCloudBusy();
         if (status_reload_due && refresh_schedule == RefreshSchedule::kNone &&
             !event.HasEvent() && interaction_quiet && cloud_quiet) {
             if (state.screen != wqn::UiScreen::kWord) {
@@ -704,8 +726,10 @@ wqn::AiStreamingStatusView streaming_view{};
 
         if (refresh_schedule != RefreshSchedule::kNone &&
             state.screen == wqn::UiScreen::kNote &&
-            wqn::NoteImageLoadingGraceActive(
-                state.note_app, esp_timer_get_time())) {
+            (wqn::NoteImageLoadingGraceActive(
+                 state.note_app, esp_timer_get_time()) ||
+             wqn::ProblemImageLoadingGraceActive(
+                 state.problem_app, esp_timer_get_time()))) {
             // Image viewer just entered loading: hold the loading-page commit
             // briefly. A cache hit lands within the grace window and the image
             // paints with ONE full refresh instead of loading-page + image
@@ -818,10 +842,15 @@ wqn::AiStreamingStatusView streaming_view{};
         if (note_cloud_completed) {
             FinishNoteCloudRequest();
         }
+        if (problem_cloud_completed) {
+            FinishProblemCloudRequest();
+        }
         device_ui_internal::PumpWordCandidatePrefetch(&ui_runtime);
         device_ui_internal::PumpNoteCandidatePrefetch(&ui_runtime);
         device_ui_internal::PumpNoteImageFetch(&ui_runtime);
         device_ui_internal::PumpNoteObservationCommit(&ui_runtime);
+        device_ui_internal::PumpProblemImageFetch(&ui_runtime);
+        device_ui_internal::PumpProblemVerdictCommit(&ui_runtime);
         if (word_pack_refresh_pending &&
             !device_ui_internal::IsWordCloudBusy() &&
             device_ui_internal::QueueWordReviewRefresh()) {
@@ -833,6 +862,12 @@ wqn::AiStreamingStatusView streaming_view{};
             device_ui_internal::QueueNotePackSync()) {
             note_pack_refresh_pending = false;
             ESP_LOGI(kTag, "queued coalesced note pack refresh after sync");
+        }
+        if (problem_pack_refresh_pending &&
+            !device_ui_internal::IsProblemCloudBusy() &&
+            device_ui_internal::QueueProblemPackSync()) {
+            problem_pack_refresh_pending = false;
+            ESP_LOGI(kTag, "queued coalesced problem pack refresh after sync");
         }
 
         wqn::PowerOffEpdAfterIdleIfNeeded();

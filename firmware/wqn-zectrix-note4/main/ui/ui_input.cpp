@@ -603,6 +603,12 @@ RefreshSchedule ApplyButtonEvent(
     const wqn::NoteAppMode old_note_mode = state->note_app.mode;
     const size_t old_notebook_window = state->note_app.notebook_window_start;
     const size_t old_note_list_window = state->note_app.note_list_window_start;
+    const std::string old_problem_signature =
+        wqn::ProblemAppSignature(state->problem_app);
+    const bool old_problem_active = state->problem_app.active;
+    const wqn::ProblemAppMode old_problem_mode = state->problem_app.mode;
+    const size_t old_problem_segment = state->problem_app.ring_segment;
+    const size_t old_problem_list_window = state->problem_app.list_window_start;
     ESP_LOGI(
         kTag,
         "button event: id=%d type=%d duration_ms=%lld",
@@ -676,6 +682,11 @@ RefreshSchedule ApplyButtonEvent(
                 state->note_app.message = IsNoteCloudBusy() ? "笔记同步中" : "笔记同步失败";
             } else {
                 state->note_app.message = "笔记同步中";
+            }
+            // The mixed list also carries the [题] rows: give the problem
+            // packs the same entry refresh (coalesced by the busy CAS).
+            if (state->problem_app.cloud_sync_requested) {
+                QueueProblemPackSync();
             }
         }
         BuildHomeSummary(state);
@@ -765,6 +776,22 @@ RefreshSchedule ApplyButtonEvent(
             }
         }
         BuildHomeSummary(state);
+        return RefreshSchedule::kSelection;
+    }
+    if (state->screen == wqn::UiScreen::kNote &&
+        wqn::ProblemAppSignature(state->problem_app) != old_problem_signature) {
+        BuildHomeSummary(state);
+        // Layer activation, mode transitions (列表<->题目<->弹窗), ring segment
+        // hops (题面<->图<->答案) and list viewport jumps repaint most of the
+        // panel; commit them so the full refresh clears large-partial ghosting
+        // (the note domain's SSD1683 lesson). In-face scrolling and verdict
+        // highlight moves ride the fast partial path.
+        if (state->problem_app.active != old_problem_active ||
+            state->problem_app.mode != old_problem_mode ||
+            state->problem_app.ring_segment != old_problem_segment ||
+            state->problem_app.list_window_start != old_problem_list_window) {
+            return RefreshSchedule::kCommit;
+        }
         return RefreshSchedule::kSelection;
     }
     if (state->screen == wqn::UiScreen::kNote &&

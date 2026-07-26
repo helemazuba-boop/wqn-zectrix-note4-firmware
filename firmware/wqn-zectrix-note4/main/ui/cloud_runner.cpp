@@ -13,8 +13,6 @@ namespace device_ui_internal {
 
 namespace {
 
-constexpr char kRunnerTag[] = "wqn_cloud";
-
 QueueHandle_t g_lane_queue[2] = {nullptr, nullptr};
 TaskHandle_t g_lane_task[2] = {nullptr, nullptr};
 
@@ -31,7 +29,11 @@ CloudLane LaneForJob(const CloudJob& job)
             return job.note.op == NoteCloudOp::kPackSync ? CloudLane::kBulk
                                                          : CloudLane::kInteractive;
         case CloudDomain::kProblem:
-            break;
+            // Pack sync moves multi-MB content; image fetches and the verdict
+            // commit are things the user is actively waiting on.
+            return job.problem.op == ProblemCloudOp::kPackSync
+                ? CloudLane::kBulk
+                : CloudLane::kInteractive;
     }
     return CloudLane::kBulk;
 }
@@ -55,7 +57,7 @@ void CloudLaneTask(void* arg)
                 ExecuteNoteCloudRequest(job.note);
                 break;
             case CloudDomain::kProblem:
-                ESP_LOGW(kRunnerTag, "problem domain has no executor yet");
+                ExecuteProblemCloudRequest(job.problem);
                 break;
         }
     }

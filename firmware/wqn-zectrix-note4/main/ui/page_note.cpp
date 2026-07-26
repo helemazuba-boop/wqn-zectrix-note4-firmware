@@ -216,6 +216,11 @@ esp_err_t RenderNoteBody(const wqn::NoteAppSnapshot& note)
 
 esp_err_t RenderNoteToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
 {
+    // The problem layer ([题] rows) owns the whole screen while active.
+    if (frame.problem_app.active) {
+        return RenderProblemBrowseToEpd(frame, schedule);
+    }
+
     const wqn::NoteAppSnapshot& note = frame.note_app;
 
     // Full-screen image: the WQNI payload IS the frame (no status bar, no

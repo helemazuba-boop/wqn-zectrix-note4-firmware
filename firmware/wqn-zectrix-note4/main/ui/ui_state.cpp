@@ -134,6 +134,25 @@ bool LoadUiState(wqn::UiState* state)
         ESP_LOGW(kTag, "init note app failed: %s", esp_err_to_name(result));
     }
 
+    // The problem layer rides on the note screen; init it eagerly for the
+    // same first-interaction-stall reason (index build + outbox snapshot).
+    result = wqn::InitProblemApp(&state->problem_app);
+    if (result != ESP_OK) {
+        ESP_LOGW(kTag, "init problem app failed: %s", esp_err_to_name(result));
+    }
+    if (!state->problem_app.pack_index.sets.empty()) {
+        std::vector<wqn::NoteProblemSetRow> rows;
+        rows.reserve(state->problem_app.pack_index.sets.size());
+        for (const wqn::ProblemPackSet& set : state->problem_app.pack_index.sets) {
+            wqn::NoteProblemSetRow row;
+            row.set_id = set.set_id;
+            row.name = set.name;
+            row.entry_count = set.entry_count;
+            rows.push_back(std::move(row));
+        }
+        wqn::ApplyNoteProblemSetRows(&state->note_app, std::move(rows));
+    }
+
     std::vector<wqn::PendingReviewResult> pending;
     result = wqn::LoadPendingReviewResults(&pending);
     if (result == ESP_OK) {

@@ -60,6 +60,15 @@ struct NoteOutboxState {
     size_t capacity = kNoteObservationOutboxCapacity;
 };
 
+// One problem set mixed into the notebook list (rendered with a [题] prefix
+// after every notebook). Plain data mirrored from the problem pack index so
+// note_app carries no dependency on the problem layer.
+struct NoteProblemSetRow {
+    std::string set_id;
+    std::string name;
+    size_t entry_count = 0;
+};
+
 struct NoteAppState {
     bool initialized = false;
     NoteAppMode mode = NoteAppMode::kNotebookList;
@@ -84,6 +93,13 @@ struct NoteAppState {
     // becomes current only after returning to the notebook list.
     NotePackIndex pending_pack_index;
     bool pending_pack_index_ready = false;
+
+    // Problem sets appended to the notebook list ([题] rows). Selecting one
+    // raises problem_set_open_requested instead of a note session; the UI
+    // layer hands the id to the problem browse layer.
+    std::vector<NoteProblemSetRow> problem_sets;
+    bool problem_set_open_requested = false;
+    std::string requested_problem_set_id;
 
     WqnNoteEntry current_note;
     bool current_note_loaded = false;
@@ -164,6 +180,10 @@ struct NoteAppSnapshot {
 esp_err_t InitNoteApp(NoteAppState* state);
 esp_err_t HandleNoteAppInput(NoteAppState* state, NoteInput input);
 void ApplyNotePackIndex(NoteAppState* state, NotePackIndex index, const std::string& message);
+// Installs the mixed-list problem set rows (from the problem pack index).
+void ApplyNoteProblemSetRows(NoteAppState* state, std::vector<NoteProblemSetRow> rows);
+// Consumes a pending [题] row selection; returns false when none is armed.
+bool TakeNoteProblemSetOpenRequest(NoteAppState* state, std::string* set_id);
 
 bool TakeNoteSessionStartRequest(
     NoteAppState* state,

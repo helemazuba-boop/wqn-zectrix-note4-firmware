@@ -206,7 +206,10 @@ void ActivatePendingNotePackIndex(wqn::NoteAppState* state)
 
 void HandleNotebookListInput(wqn::NoteAppState* state, wqn::NoteInput input)
 {
-    const size_t count = state->pack_index.notebooks.size();
+    // The list mixes notebooks with the [题] problem-set rows appended after
+    // them; navigation spans both, Confirm dispatches on the row kind.
+    const size_t notebook_count = state->pack_index.notebooks.size();
+    const size_t count = notebook_count + state->problem_sets.size();
     switch (input) {
         case wqn::NoteInput::kUp:
             if (state->notebook_selected > 0) {
@@ -229,6 +232,14 @@ void HandleNotebookListInput(wqn::NoteAppState* state, wqn::NoteInput input)
         case wqn::NoteInput::kConfirm: {
             if (count == 0 || state->notebook_selected >= count) {
                 state->message = "暂无笔记本，稍后同步";
+                break;
+            }
+            if (state->notebook_selected >= notebook_count) {
+                const wqn::NoteProblemSetRow& row =
+                    state->problem_sets[state->notebook_selected - notebook_count];
+                state->problem_set_open_requested = true;
+                state->requested_problem_set_id = row.set_id;
+                state->message.clear();
                 break;
             }
             const wqn::NotePackNotebook& notebook =
@@ -618,6 +629,38 @@ void ApplyNotePackIndex(NoteAppState* state, NotePackIndex index, const std::str
         return;
     }
     InstallNotePackIndex(state, std::move(index), message);
+}
+
+void ApplyNoteProblemSetRows(NoteAppState* state, std::vector<NoteProblemSetRow> rows)
+{
+    if (state == nullptr) return;
+    state->problem_sets = std::move(rows);
+    // The mixed list may have shrunk under the selection; clamp against the
+    // combined row count so the highlight stays on-screen.
+    const size_t count = state->pack_index.notebooks.size() + state->problem_sets.size();
+    if (count == 0) {
+        state->notebook_selected = 0;
+        state->notebook_window_start = 0;
+    } else if (state->notebook_selected >= count) {
+        state->notebook_selected = count - 1;
+        UpdateListViewport(state->notebook_selected, count, &state->notebook_window_start);
+    }
+}
+
+bool TakeNoteProblemSetOpenRequest(NoteAppState* state, std::string* set_id)
+{
+    if (state == nullptr || set_id == nullptr) return false;
+    if (!state->problem_set_open_requested ||
+        state->requested_problem_set_id.size() != 36) {
+        // A malformed request cannot be dispatched; drop it so the flag does
+        // not re-fire every tick.
+        state->problem_set_open_requested = false;
+        return false;
+    }
+    *set_id = state->requested_problem_set_id;
+    state->problem_set_open_requested = false;
+    state->requested_problem_set_id.clear();
+    return true;
 }
 
 bool TakeNoteSessionStartRequest(
@@ -1065,12 +1108,22 @@ NoteAppSnapshot BuildNoteAppSnapshot(const NoteAppState& state)
     snapshot.note_scroll_offset_lines = state.note_scroll_offset_lines;
     snapshot.cloud_sync_failed = state.cloud_sync_failed;
     snapshot.notebook_count = state.pack_index.notebooks.size();
-    snapshot.notebooks.reserve(state.pack_index.notebooks.size());
+    snapshot.notebooks.reserve(
+        state.pack_index.notebooks.size() + state.problem_sets.size());
     for (const NotePackNotebook& notebook : state.pack_index.notebooks) {
         NoteNotebookRow row;
         row.title = notebook.title;
         row.note_count = notebook.entry_count;
         row.has_pack = notebook.has_pack;
+        snapshot.notebooks.push_back(std::move(row));
+    }
+    // Problem sets render as [题] rows after every notebook; the row count
+    // column shows their problem count so the mixed list stays scannable.
+    for (const NoteProblemSetRow& set : state.problem_sets) {
+        NoteNotebookRow row;
+        row.title = "[题] " + set.name;
+        row.note_count = set.entry_count;
+        row.has_pack = true;
         snapshot.notebooks.push_back(std::move(row));
     }
 
@@ -1159,12 +1212,13 @@ std::string NoteAppSignature(const NoteAppState& state)
     std::snprintf(
         buffer,
         sizeof(buffer),
-        "%u:%u:%u:%u:%u:%u:%u:%u",
+        "%u:%u:%u:%u:%u:%u:%u:%u:%u",
         static_cast<unsigned>(state.mode),
         static_cast<unsigned>(state.notebook_selected),
         static_cast<unsigned>(state.note_list_selected),
         static_cast<unsigned>(state.note_scroll_offset_lines),
         static_cast<unsigned>(state.pack_index.notebooks.size()),
+        static_cast<unsigned>(state.problem_sets.size()),
         static_cast<unsigned>(state.session.commit_state),
         static_cast<unsigned>(state.image_index),
         static_cast<unsigned>(state.image_error ? 1 : 0));

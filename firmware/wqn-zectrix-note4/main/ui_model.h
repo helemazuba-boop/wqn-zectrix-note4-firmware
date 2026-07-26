@@ -8,6 +8,7 @@
 
 #include "ai_history.h"
 #include "note_app.h"
+#include "problem_app.h"
 #include "storage.h"
 #include "time_app.h"
 #include "word_app.h"
@@ -284,6 +285,8 @@ struct AppState {
     TimeAppState time_app;
     WordAppState word_app;
     NoteAppState note_app;
+    // Problem browse layer hosted by the note screen ([题] mixed rows).
+    ProblemAppState problem_app;
     TodoUiState todo;
     SettingsAppState settings;
     HomeSummary home;
@@ -311,6 +314,7 @@ struct UiFrame {
     TimeAppState time_app;
     WordAppSnapshot word_app;
     NoteAppSnapshot note_app;
+    ProblemAppSnapshot problem_app;
     SettingsAppState settings;
     size_t selected_home_task = 0;
     std::vector<UiLine> lines;

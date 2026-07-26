@@ -25,6 +25,7 @@
 #include "runtime/sleep_coordinator.h"
 #include "storage.h"
 #include "note_store.h"
+#include "problem_store.h"
 #include "word_study_store.h"
 #include "wqn_api.h"
 
@@ -102,6 +103,15 @@ std::string g_note_outbox_retry_request_id;
 int64_t g_note_outbox_retry_not_before_ms = 0;
 uint8_t g_note_outbox_retry_attempts = 0;
 WordOutboxUploadState g_last_note_outbox_upload_state =
+    WordOutboxUploadState::kDrained;
+
+// Problem verdicts: same quiet-window trigger, independent retry cursor.
+// There is no per-session sequence, so terminal rejections quarantine
+// directly without a skip tombstone.
+std::string g_problem_outbox_retry_request_id;
+int64_t g_problem_outbox_retry_not_before_ms = 0;
+uint8_t g_problem_outbox_retry_attempts = 0;
+WordOutboxUploadState g_last_problem_outbox_upload_state =
     WordOutboxUploadState::kDrained;
 
 void ResetWordOutboxRetryBackoff()
@@ -232,6 +242,74 @@ TickType_t NoteOutboxRetryWaitDelay()
     }
     const int64_t remaining_ms =
         g_note_outbox_retry_not_before_ms - esp_timer_get_time() / 1000;
+    if (remaining_ms <= 0) {
+        return 1;
+    }
+    return pdMS_TO_TICKS(
+        static_cast<uint32_t>(
+            std::min<int64_t>(remaining_ms, kWordOutboxRetryMaxMs)));
+}
+
+void ResetProblemOutboxRetryBackoff()
+{
+    g_problem_outbox_retry_request_id.clear();
+    g_problem_outbox_retry_not_before_ms = 0;
+    g_problem_outbox_retry_attempts = 0;
+}
+
+bool ProblemOutboxRetryDeferred(
+    const std::string& request_id,
+    int64_t now_ms)
+{
+    if (g_problem_outbox_retry_request_id != request_id) {
+        ResetProblemOutboxRetryBackoff();
+        return false;
+    }
+    return g_problem_outbox_retry_not_before_ms > now_ms;
+}
+
+void ScheduleProblemOutboxRetry(
+    const std::string& request_id,
+    uint32_t server_retry_after_ms)
+{
+    if (g_problem_outbox_retry_request_id != request_id) {
+        ResetProblemOutboxRetryBackoff();
+        g_problem_outbox_retry_request_id = request_id;
+    }
+    const uint8_t shift =
+        std::min(g_problem_outbox_retry_attempts, kWordOutboxRetryMaxShift);
+    const uint32_t local_delay_ms = std::min(
+        kWordOutboxRetryBaseMs << shift,
+        kWordOutboxRetryMaxMs);
+    const uint32_t requested_delay_ms =
+        std::min(server_retry_after_ms, kWordOutboxRetryMaxMs);
+    const uint32_t base_delay_ms =
+        std::max(local_delay_ms, requested_delay_ms);
+    const uint32_t available_jitter_ms =
+        kWordOutboxRetryMaxMs - base_delay_ms;
+    const uint32_t jitter_ms = esp_random() %
+        (std::min(available_jitter_ms, kWordOutboxRetryJitterMaxMs) + 1);
+    const uint32_t delay_ms = base_delay_ms + jitter_ms;
+    if (g_problem_outbox_retry_attempts < std::numeric_limits<uint8_t>::max()) {
+        ++g_problem_outbox_retry_attempts;
+    }
+    g_problem_outbox_retry_not_before_ms =
+        esp_timer_get_time() / 1000 + static_cast<int64_t>(delay_ms);
+    ESP_LOGW(
+        kTag,
+        "problem outbox retry scheduled: request=%s attempt=%u retry_after_ms=%lu",
+        request_id.c_str(),
+        static_cast<unsigned>(g_problem_outbox_retry_attempts),
+        static_cast<unsigned long>(delay_ms));
+}
+
+TickType_t ProblemOutboxRetryWaitDelay()
+{
+    if (g_problem_outbox_retry_request_id.empty()) {
+        return portMAX_DELAY;
+    }
+    const int64_t remaining_ms =
+        g_problem_outbox_retry_not_before_ms - esp_timer_get_time() / 1000;
     if (remaining_ms <= 0) {
         return 1;
     }
@@ -1106,6 +1184,134 @@ WordOutboxUploadState UploadPendingWordObservations(const std::string& token)
         : WordOutboxUploadState::kFailed;
 }
 
+// Uploads pending problem verdicts (32-record batches, interaction-yield,
+// same head-retry backoff as note). Each verdict is a standalone idempotent
+// observation: a terminal server rejection quarantines it directly -- there
+// is no session sequence to advance first.
+WordOutboxUploadState UploadPendingProblemObservations(const std::string& token)
+{
+    constexpr size_t kMaxProblemObservationsPerRound = 32;
+    const uint32_t interaction_generation =
+        g_word_interaction_generation.load(std::memory_order_acquire);
+    size_t processed = 0;
+    size_t uploaded = 0;
+    size_t quarantined = 0;
+    for (; processed < kMaxProblemObservationsPerRound;) {
+        if (g_word_interaction_generation.load(std::memory_order_acquire) !=
+            interaction_generation) {
+            ESP_LOGI(
+                kTag,
+                "problem outbox batch yielded to interaction: uploaded=%u quarantined=%u",
+                static_cast<unsigned>(uploaded),
+                static_cast<unsigned>(quarantined));
+            return WordOutboxUploadState::kYielded;
+        }
+        wqn::DurableProblemObservation pending;
+        esp_err_t result = wqn::PeekPendingProblemObservation(&pending);
+        if (result == ESP_ERR_NOT_FOUND) {
+            ResetProblemOutboxRetryBackoff();
+            if (processed > 0) {
+                ESP_LOGI(
+                    kTag,
+                    "problem outbox drained: uploaded=%u quarantined=%u",
+                    static_cast<unsigned>(uploaded),
+                    static_cast<unsigned>(quarantined));
+            }
+            return WordOutboxUploadState::kDrained;
+        }
+        if (result != ESP_OK) {
+            ESP_LOGW(kTag, "problem outbox read failed: %s", esp_err_to_name(result));
+            return WordOutboxUploadState::kFailed;
+        }
+        const int64_t now_ms = esp_timer_get_time() / 1000;
+        if (ProblemOutboxRetryDeferred(pending.request_id, now_ms)) {
+            ESP_LOGI(
+                kTag,
+                "problem outbox head deferred: request=%s remaining_ms=%lld",
+                pending.request_id.c_str(),
+                static_cast<long long>(
+                    g_problem_outbox_retry_not_before_ms - now_ms));
+            return WordOutboxUploadState::kPending;
+        }
+
+        wqn::protocol::problem_study_v1::ObservationRequest request;
+        request.metadata = MakeControlMetadata();
+        request.metadata.request_id = pending.request_id;
+        request.problem_id = pending.problem_id;
+        request.action = pending.action;
+        request.occurred_at = pending.occurred_at;
+        wqn::protocol::problem_study_v1::ObservationData response;
+        wqn::protocol::v3::Error problem_error;
+        bool transport_failure = false;
+        result = wqn::SubmitProblemReviewObservationV1(
+            token, request, &response, &problem_error, &transport_failure);
+        if (result != ESP_OK) {
+            if (!transport_failure && !problem_error.retryable) {
+                ESP_LOGW(
+                    kTag,
+                    "terminal problem verdict rejected; quarantining: request=%s code=%s",
+                    pending.request_id.c_str(),
+                    problem_error.code.c_str());
+                const esp_err_t quarantine_result =
+                    wqn::QuarantinePendingProblemObservation(pending.request_id);
+                ResetProblemOutboxRetryBackoff();
+                if (quarantine_result != ESP_OK) {
+                    ESP_LOGE(
+                        kTag,
+                        "problem verdict quarantine failed: request=%s error=%s",
+                        pending.request_id.c_str(),
+                        esp_err_to_name(quarantine_result));
+                    return WordOutboxUploadState::kFailed;
+                }
+                ++processed;
+                ++quarantined;
+                continue;
+            }
+            ESP_LOGW(
+                kTag,
+                "problem outbox upload deferred: request=%s code=%s error=%s",
+                pending.request_id.c_str(),
+                problem_error.code.empty() ? "TRANSPORT" : problem_error.code.c_str(),
+                esp_err_to_name(result));
+            ScheduleProblemOutboxRetry(
+                pending.request_id,
+                problem_error.retryable ? problem_error.retry_after_ms : 0);
+            return WordOutboxUploadState::kPending;
+        }
+        result = wqn::AcknowledgeProblemObservation(pending.request_id);
+        if (result != ESP_OK) {
+            ESP_LOGW(
+                kTag,
+                "problem outbox ack failed: request=%s error=%s",
+                pending.request_id.c_str(),
+                esp_err_to_name(result));
+            ScheduleProblemOutboxRetry(pending.request_id, 0);
+            return WordOutboxUploadState::kPending;
+        }
+        ResetProblemOutboxRetryBackoff();
+        ++processed;
+        ++uploaded;
+    }
+
+    wqn::DurableProblemObservation remaining;
+    const esp_err_t remaining_result =
+        wqn::PeekPendingProblemObservation(&remaining);
+    if (processed > 0) {
+        ESP_LOGI(
+            kTag,
+            "problem outbox batch complete: uploaded=%u quarantined=%u pending=%d",
+            static_cast<unsigned>(uploaded),
+            static_cast<unsigned>(quarantined),
+            remaining_result == ESP_OK ? 1 : 0);
+    }
+    if (remaining_result == ESP_ERR_NOT_FOUND) {
+        return WordOutboxUploadState::kDrained;
+    }
+    return remaining_result == ESP_OK
+        ? WordOutboxUploadState::kPending
+        : WordOutboxUploadState::kFailed;
+}
+
 WordOutboxUploadState UploadPendingNoteObservations(const std::string& token)
 {
     constexpr size_t kMaxNoteObservationsPerRound = 64;
@@ -1288,8 +1494,10 @@ bool RunWordOutboxOnlyRound()
     }
     g_last_word_outbox_upload_state = UploadPendingWordObservations(token);
     g_last_note_outbox_upload_state = UploadPendingNoteObservations(token);
+    g_last_problem_outbox_upload_state = UploadPendingProblemObservations(token);
     return g_last_word_outbox_upload_state != WordOutboxUploadState::kFailed &&
-        g_last_note_outbox_upload_state != WordOutboxUploadState::kFailed;
+        g_last_note_outbox_upload_state != WordOutboxUploadState::kFailed &&
+        g_last_problem_outbox_upload_state != WordOutboxUploadState::kFailed;
 }
 #endif
 
@@ -1341,6 +1549,7 @@ bool RunSyncRound()
 #if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
     g_last_word_outbox_upload_state = UploadPendingWordObservations(token);
     g_last_note_outbox_upload_state = UploadPendingNoteObservations(token);
+    g_last_problem_outbox_upload_state = UploadPendingProblemObservations(token);
 #endif
 
     if (!LoadUsableToken(&token)) {
@@ -1414,6 +1623,7 @@ TickType_t NextSyncWaitDelay(bool round_synced, bool has_token_after_round)
     if (has_token_after_round) {
         wait_delay = std::min(wait_delay, WordOutboxRetryWaitDelay());
         wait_delay = std::min(wait_delay, NoteOutboxRetryWaitDelay());
+        wait_delay = std::min(wait_delay, ProblemOutboxRetryWaitDelay());
     }
 #endif
     return wait_delay;
@@ -1486,7 +1696,8 @@ void SyncServiceTask(void*)
         TickType_t delay = NextSyncWaitDelay(synced, has_token_after_round);
 #if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
         if (g_last_word_outbox_upload_state == WordOutboxUploadState::kYielded ||
-            g_last_note_outbox_upload_state == WordOutboxUploadState::kYielded) {
+            g_last_note_outbox_upload_state == WordOutboxUploadState::kYielded ||
+            g_last_problem_outbox_upload_state == WordOutboxUploadState::kYielded) {
             // Do not turn a user-induced yield into the old 100 ms upload
             // loop. Resume only after another complete quiet period.
             if (g_word_outbox_timer == nullptr ||
@@ -1496,10 +1707,12 @@ void SyncServiceTask(void*)
             }
         } else if (
             g_last_word_outbox_upload_state == WordOutboxUploadState::kPending ||
-            g_last_note_outbox_upload_state == WordOutboxUploadState::kPending) {
+            g_last_note_outbox_upload_state == WordOutboxUploadState::kPending ||
+            g_last_problem_outbox_upload_state == WordOutboxUploadState::kPending) {
             g_word_outbox_sync_requested.store(true, std::memory_order_release);
             const TickType_t retry_delay = std::min(
-                WordOutboxRetryWaitDelay(), NoteOutboxRetryWaitDelay());
+                std::min(WordOutboxRetryWaitDelay(), NoteOutboxRetryWaitDelay()),
+                ProblemOutboxRetryWaitDelay());
             delay = std::min(
                 delay,
                 retry_delay == portMAX_DELAY ? pdMS_TO_TICKS(100) : retry_delay);
@@ -1607,6 +1820,24 @@ void RequestNoteOutboxUpload()
 {
     // Note observations share word's quiet-window timer and outbox-only round
     // (the round uploads both queues), so this reuses the same trigger path.
+#if CONFIG_WQN_WIFI_STA_ENABLE && CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
+    if (g_word_outbox_timer != nullptr &&
+        xTimerReset(g_word_outbox_timer, 0) == pdPASS) {
+        return;
+    }
+    // Timer command queue pressure must not strand a durable observation.
+    // Fall back to an immediate outbox-only notification.
+    g_word_outbox_sync_requested.store(true, std::memory_order_release);
+    if (g_sync_service_task != nullptr) {
+        xTaskNotifyGive(g_sync_service_task);
+    }
+#endif
+}
+
+void RequestProblemOutboxUpload()
+{
+    // Problem verdicts share the same quiet-window timer and outbox-only
+    // round (the round uploads all three queues).
 #if CONFIG_WQN_WIFI_STA_ENABLE && CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
     if (g_word_outbox_timer != nullptr &&
         xTimerReset(g_word_outbox_timer, 0) == pdPASS) {
