@@ -199,6 +199,10 @@ enum class NoteCloudOp {
     kStartSession,
     kFetchSessionPage,
     kFetchImage,
+    // Local storage write (observation outbox + session snapshot); needs no
+    // network/token. Runs on the interactive lane so the note-open bookkeeping
+    // leaves the UI task (the ~0.9s foreground commit stall).
+    kCommitObservation,
 };
 
 struct NoteCloudRequest {
@@ -327,6 +331,7 @@ void PumpNoteCandidatePrefetch(UiRuntime* runtime);
 bool QueueNoteImageFetch(
     const std::string& note_id, uint8_t image_index, const std::string& image_id);
 void PumpNoteImageFetch(UiRuntime* runtime);
+void PumpNoteObservationCommit(UiRuntime* runtime);
 
 bool ApplyTodoCloudResult(
     wqn::UiState* state,

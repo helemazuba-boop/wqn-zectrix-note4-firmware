@@ -779,34 +779,10 @@ RefreshSchedule ApplyButtonEvent(
                 ? "笔记服务忙，请重试"
                 : "打开失败，请重试";
         }
-        wqn::DurableNoteObservation note_observation;
-        wqn::PersistedNoteSession note_advanced;
-        const auto note_metadata = wqn::services::MakeDeviceRequestMetadata();
-        std::string note_occurred_at = CurrentIsoTimestamp();
-        if (note_occurred_at.empty()) {
-            note_occurred_at = "2024-01-01T00:00:00Z";
-        }
-        if (wqn::TakeNoteObservationEffect(
-                &state->note_app,
-                note_metadata.request_id,
-                note_occurred_at,
-                &note_observation,
-                &note_advanced)) {
-            const esp_err_t commit_result =
-                wqn::CommitNoteObservation(note_observation, note_advanced);
-            wqn::ApplyNoteObservationCommitResult(&state->note_app, commit_result);
-            if (commit_result == ESP_OK) {
-                // The durable opened record is the interaction boundary. Upload
-                // it after a quiet period; opening a note must never launch the
-                // full bootstrap/problem/content sync pipeline.
-                wqn::services::RequestNoteOutboxUpload();
-            } else {
-                ESP_LOGW(
-                    kTag,
-                    "note observation local commit failed: %s",
-                    esp_err_to_name(commit_result));
-            }
-        }
+        // The note-open observation commit (outbox append + session snapshot,
+        // a ~0.9s foreground storage transaction) no longer runs here on the
+        // UI task: PumpNoteObservationCommit hands it to the note cloud lane
+        // and the kPersisting gate covers the in-flight window.
         BuildHomeSummary(state);
         // A note mode transition (notebook<->title<->body<->image) or a list
         // viewport jump repaints most of the screen; do a full refresh so the

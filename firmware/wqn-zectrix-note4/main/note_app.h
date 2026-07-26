@@ -107,6 +107,9 @@ struct NoteAppState {
     // Dispatch time of the in-flight fetch (us); lets the pump time out a
     // request wedged in the network stack and re-arm it.
     int64_t image_dispatch_us = 0;
+    // When the viewer entered loading (entry or flip); drives the one-refresh
+    // grace window for cache hits.
+    int64_t image_view_entered_us = 0;
 
     bool cloud_sync_requested = false;
     bool cloud_sync_failed = false;
@@ -211,6 +214,13 @@ bool TakeNoteObservationEffect(
     DurableNoteObservation* observation,
     PersistedNoteSession* advanced_session);
 void ApplyNoteObservationCommitResult(NoteAppState* state, esp_err_t result);
+// Re-arms a taken-but-not-dispatched observation effect (queue full/busy) so
+// the pump retries; the recorded request_id keeps the retry idempotent.
+void RestoreNoteObservationEffect(NoteAppState* state);
+// True while the image viewer is freshly loading and still inside the grace
+// window: the display loop holds the loading-page commit briefly so a fast
+// cache hit paints the image with ONE full refresh instead of two.
+bool NoteImageLoadingGraceActive(const NoteAppState& state, int64_t now_us);
 void RefreshNoteOutboxState(NoteAppState* state);
 NoteAppSnapshot BuildNoteAppSnapshot(const NoteAppState& state);
 std::string NoteAppStatusLine(const NoteAppState& state);

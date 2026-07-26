@@ -702,6 +702,19 @@ wqn::AiStreamingStatusView streaming_view{};
             last_status_refresh = now;
         }
 
+        if (refresh_schedule != RefreshSchedule::kNone &&
+            state.screen == wqn::UiScreen::kNote &&
+            wqn::NoteImageLoadingGraceActive(
+                state.note_app, esp_timer_get_time())) {
+            // Image viewer just entered loading: hold the loading-page commit
+            // briefly. A cache hit lands within the grace window and the image
+            // paints with ONE full refresh instead of loading-page + image
+            // back to back (~2.3s of extra e-ink flashing per entry). Slow
+            // fetches fall out of the window and show the loading page.
+            pending_refresh_schedule = device_ui_internal::StrongerSchedule(
+                pending_refresh_schedule, refresh_schedule);
+            refresh_schedule = RefreshSchedule::kNone;
+        }
         if (refresh_schedule != RefreshSchedule::kNone) {
             wqn::UiFrame frame = wqn::RenderUiFrame(state);
             // [force-full-fix] Consume the one-shot flag HERE, after the final
@@ -808,6 +821,7 @@ wqn::AiStreamingStatusView streaming_view{};
         device_ui_internal::PumpWordCandidatePrefetch(&ui_runtime);
         device_ui_internal::PumpNoteCandidatePrefetch(&ui_runtime);
         device_ui_internal::PumpNoteImageFetch(&ui_runtime);
+        device_ui_internal::PumpNoteObservationCommit(&ui_runtime);
         if (word_pack_refresh_pending &&
             !device_ui_internal::IsWordCloudBusy() &&
             device_ui_internal::QueueWordReviewRefresh()) {

@@ -147,8 +147,11 @@ void UiRuntime::RestoreWordCandidatePageRequest()
 UiUpdate UiRuntime::DispatchNoteCloudResult(NoteCloudResult& result)
 {
     const bool changed = ApplyNoteCloudResult(&state_, result);
+    // Observation commits are bookkeeping (commit_state/outbox counters);
+    // flashing a full refresh for them would punish every note open.
     const RefreshSchedule refresh =
-        changed && state_.screen == wqn::UiScreen::kNote
+        changed && state_.screen == wqn::UiScreen::kNote &&
+            result.op != NoteCloudOp::kCommitObservation
             ? RefreshSchedule::kCommit
             : RefreshSchedule::kNone;
     return FinishEvent(AppEventKind::kNoteCloudResult, refresh, changed);
@@ -177,6 +180,21 @@ bool UiRuntime::TakeNoteImageRequest(
 void UiRuntime::RestoreNoteImageRequest()
 {
     wqn::RestoreNoteImageRequest(&state_.note_app);
+}
+
+bool UiRuntime::TakeNoteObservationEffect(
+    const std::string& request_id,
+    const std::string& occurred_at,
+    wqn::DurableNoteObservation* observation,
+    wqn::PersistedNoteSession* advanced_session)
+{
+    return wqn::TakeNoteObservationEffect(
+        &state_.note_app, request_id, occurred_at, observation, advanced_session);
+}
+
+void UiRuntime::RestoreNoteObservationEffect()
+{
+    wqn::RestoreNoteObservationEffect(&state_.note_app);
 }
 
 UiUpdate UiRuntime::DispatchTimeTick(int64_t now_ms)

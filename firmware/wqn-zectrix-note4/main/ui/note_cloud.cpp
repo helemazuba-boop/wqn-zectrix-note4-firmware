@@ -14,6 +14,7 @@
 #include "esp_log.h"
 #include "note_app.h"
 #include "note_cloud.h"
+#include "note_store.h"
 #include "runtime/sleep_coordinator.h"
 #include "services/sync_service.h"
 #include "wqn_api.h"
@@ -158,6 +159,40 @@ void PumpNoteImageFetch(UiRuntime* runtime)
     }
 }
 
+// Staged payload for kCommitObservation. Non-POD, so it cannot ride the
+// CloudJob union; a single slot is safe because the note domain admits one
+// in-flight request at a time (busy CAS in QueueNoteCloudRequest).
+struct StagedNoteObservationCommit {
+    wqn::DurableNoteObservation observation;
+    wqn::PersistedNoteSession advanced;
+};
+StagedNoteObservationCommit g_staged_note_commit;
+
+// Moves the note-open observation commit (outbox append + session snapshot,
+// a ~0.9s foreground storage transaction) off the UI task. The reducer
+// already installs the open optimistically (kPersisting gates double-opens
+// and candidate paging until the result lands).
+void PumpNoteObservationCommit(UiRuntime* runtime)
+{
+    if (runtime == nullptr || IsNoteCloudBusy()) return;
+    const auto metadata = wqn::services::MakeDeviceRequestMetadata();
+    std::string occurred_at = CurrentIsoTimestamp();
+    if (occurred_at.empty()) {
+        occurred_at = "2024-01-01T00:00:00Z";
+    }
+    if (!runtime->TakeNoteObservationEffect(
+            metadata.request_id, occurred_at, &g_staged_note_commit.observation,
+            &g_staged_note_commit.advanced)) {
+        return;
+    }
+    NoteCloudRequest request;
+    request.op = NoteCloudOp::kCommitObservation;
+    if (!QueueNoteCloudRequest(request)) {
+        ESP_LOGW(kNoteTag, "note observation commit queue rejected; will retry");
+        runtime->RestoreNoteObservationEffect();
+    }
+}
+
 NoteCloudResult* PeekNoteCloudResult(uint32_t generation)
 {
     if (generation == 0 || generation != g_note_result_generation) {
@@ -190,6 +225,20 @@ bool ApplyNoteCloudResult(wqn::UiState* state, NoteCloudResult& result)
 {
     if (state == nullptr) {
         return false;
+    }
+    if (result.op == NoteCloudOp::kCommitObservation) {
+        wqn::ApplyNoteObservationCommitResult(&state->note_app, result.result);
+        if (result.result == ESP_OK) {
+            // The durable opened record is the interaction boundary. Upload it
+            // after a quiet period; opening a note must never launch the full
+            // bootstrap/problem/content sync pipeline.
+            wqn::services::RequestNoteOutboxUpload();
+        } else {
+            ESP_LOGW(kNoteTag, "note observation local commit failed: %s",
+                     esp_err_to_name(result.result));
+        }
+        BuildHomeSummary(state);
+        return true;
     }
     if (result.op == NoteCloudOp::kPackSync) {
         if (result.result == ESP_OK) {
@@ -257,6 +306,15 @@ void ExecuteNoteCloudRequest(const NoteCloudRequest& request)
     NoteCloudResult& result = g_note_result_slot;
     result.op = request.op;
     result.message.clear();
+
+    if (request.op == NoteCloudOp::kCommitObservation) {
+        // Pure local storage write (outbox append + session snapshot); no
+        // token or network involved, so it runs before the token gate.
+        result.result = wqn::CommitNoteObservation(
+            g_staged_note_commit.observation, g_staged_note_commit.advanced);
+        SendNoteCloudResult();
+        return;
+    }
 
     std::string token;
     if (!LoadValidTokenForTodo(&token)) {

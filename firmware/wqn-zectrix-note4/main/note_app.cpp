@@ -388,6 +388,7 @@ void HandleNoteViewInput(wqn::NoteAppState* state, wqn::NoteInput input)
                     // opens it (mode change -> full refresh via ui_input).
                     state->mode = wqn::NoteAppMode::kNoteImageView;
                     state->image_index = 0;
+                    state->image_view_entered_us = esp_timer_get_time();
                     RequestCurrentNoteImage(state);
                     state->message.clear();
                 } else {
@@ -443,6 +444,7 @@ void HandleNoteImageViewInput(wqn::NoteAppState* state, wqn::NoteInput input)
         case wqn::NoteInput::kUp:
             if (state->image_index > 0) {
                 --state->image_index;
+                state->image_view_entered_us = esp_timer_get_time();
                 RequestCurrentNoteImage(state);
             }
             break;
@@ -450,6 +452,7 @@ void HandleNoteImageViewInput(wqn::NoteAppState* state, wqn::NoteInput input)
         case wqn::NoteInput::kConfirm:
             if (count > 0 && static_cast<size_t>(state->image_index) + 1 < count) {
                 ++state->image_index;
+                state->image_view_entered_us = esp_timer_get_time();
                 RequestCurrentNoteImage(state);
             }
             break;
@@ -968,6 +971,30 @@ void ApplyNoteObservationCommitResult(NoteAppState* state, esp_err_t result)
     if (state->outbox.pending_count < state->outbox.capacity) {
         ++state->outbox.pending_count;
     }
+}
+
+void RestoreNoteObservationEffect(NoteAppState* state)
+{
+    if (state == nullptr) return;
+    // Only a taken-but-undispatched effect may be re-armed; a terminal
+    // cursor-invalid failure (kFailed) stays failed.
+    if (state->session.commit_state == NoteObservationCommitState::kPersisting) {
+        state->session.observation_effect_ready = true;
+    }
+}
+
+bool NoteImageLoadingGraceActive(const NoteAppState& state, int64_t now_us)
+{
+    if (state.mode != NoteAppMode::kNoteImageView || state.image_error) {
+        return false;
+    }
+    if (state.image_loaded_id == state.image_expected_id &&
+        state.image_wqni != nullptr) {
+        return false;  // payload ready: paint it now
+    }
+    constexpr int64_t kNoteImageGraceUs = 400LL * 1000;
+    return state.image_view_entered_us > 0 &&
+        now_us - state.image_view_entered_us < kNoteImageGraceUs;
 }
 
 void RefreshNoteOutboxState(NoteAppState* state)

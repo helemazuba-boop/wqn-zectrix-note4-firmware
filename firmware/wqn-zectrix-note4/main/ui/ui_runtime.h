@@ -84,6 +84,12 @@ public:
     bool TakeNoteImageRequest(
         std::string* note_id, uint8_t* image_index, std::string* image_id);
     void RestoreNoteImageRequest();
+    bool TakeNoteObservationEffect(
+        const std::string& request_id,
+        const std::string& occurred_at,
+        wqn::DurableNoteObservation* observation,
+        wqn::PersistedNoteSession* advanced_session);
+    void RestoreNoteObservationEffect();
 
 private:
     UiUpdate FinishEvent(
