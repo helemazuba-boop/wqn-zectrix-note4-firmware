@@ -54,6 +54,8 @@ idf_component_register(
         "note_cloud.cpp"
         "note_store.cpp"
         "note_app.cpp"
+        "problem_pack.cpp"
+        "problem_cloud.cpp"
         "word_pack.cpp"
         "word_app.cpp"
         "word_study_store.cpp"

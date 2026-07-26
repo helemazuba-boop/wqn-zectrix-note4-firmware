@@ -8,6 +8,7 @@
 #include "esp_err.h"
 #include "device_protocol/v3.h"
 #include "device_protocol/note_study.h"
+#include "device_protocol/problem_study.h"
 #include "device_protocol/word_study.h"
 
 namespace wqn {
@@ -168,6 +169,39 @@ struct WqnNotePackManifest {
     uint64_t cursor = 0;
     bool has_more = false;
     std::vector<WqnNotePackManifestNotebook> notebooks;
+};
+
+// One problem-set row of the problem-study manifest. A pack is exactly one
+// set's member problems, so pack_id equals problem_set_id. `deleted` only
+// appears in manifest deltas and is resolved away when the aggregate is
+// merged; unlike notebooks there is no change_sequence -- freshness rides
+// entirely on the pack sha256.
+struct WqnProblemPackManifestSet {
+    std::string problem_set_id;
+    std::string name;
+    bool is_smart = false;
+    bool deleted = false;
+    bool has_pack = false;
+    std::string pack_id;
+    uint64_t pack_revision = 0;
+    uint32_t schema_version = 0;
+    uint32_t entry_count = 0;
+    uint32_t byte_size = 0;
+    std::string sha256;
+    std::string download_url;
+};
+
+struct WqnProblemPackManifest {
+    uint64_t cursor = 0;
+    bool has_more = false;
+    std::vector<WqnProblemPackManifestSet> problem_sets;
+};
+
+// Which assets column of the problem a WQNI image belongs to (the /v3
+// problems image route path segment).
+enum class WqnProblemImageKind : uint8_t {
+    kAssets,
+    kSolution,
 };
 
 struct WqnWordAiLookupRequest {
@@ -359,6 +393,44 @@ esp_err_t SkipNoteStudyObservationV1(
     const std::string& token,
     const protocol::note_study_v1::ObservationRequest& request,
     protocol::note_study_v1::ObservationData* observation,
+    protocol::v3::Error* error,
+    bool* transport_failure);
+// Fetches one page of the problem-study manifest starting at `cursor` and
+// flattens it into the storage-facing WqnProblemPackManifest (offset-relist
+// semantics, same as notes).
+esp_err_t FetchProblemStudyManifest(
+    const std::string& token,
+    const protocol::v3::RequestMetadata& metadata,
+    uint64_t cursor,
+    WqnProblemPackManifest* manifest);
+// Streams one problem set's pack (zlib transport, sha256 over the plaintext)
+// into `sink`. Bounded by the manifest byte_size and the contract pack cap.
+esp_err_t DownloadProblemPackStream(
+    const std::string& token,
+    const protocol::v3::RequestMetadata& metadata,
+    const WqnProblemPackManifestSet& set,
+    WqnHttpChunkSink sink,
+    void* context);
+// Downloads one problem image as a WQNI file from
+// /v3/problems/images/{problem_id}/{assets|solution}/{image_index}. Inflates
+// the zlib body with the heap-backed inflater and verifies sha256(bytes) ==
+// expected_image_id; WQNI header/CRC validation is the caller's job via
+// wqn::ValidateNoteImageWqni.
+esp_err_t DownloadProblemImageV1(
+    const std::string& token,
+    const protocol::v3::RequestMetadata& metadata,
+    const std::string& problem_id,
+    WqnProblemImageKind kind,
+    uint8_t image_index,
+    const std::string& expected_image_id,
+    std::vector<uint8_t>* wqni);
+// Uploads one durable self-assessment verdict (correct/hesitant/wrong/skip).
+// `transport_failure` distinguishes a network fault (retry) from a server
+// rejection (inspect error.retryable / error.code).
+esp_err_t SubmitProblemReviewObservationV1(
+    const std::string& token,
+    const protocol::problem_study_v1::ObservationRequest& request,
+    protocol::problem_study_v1::ObservationData* observation,
     protocol::v3::Error* error,
     bool* transport_failure);
 esp_err_t LookupWordWithAi(const std::string& token, const WqnWordAiLookupRequest& request, WqnWordAiLookupResult* result);
