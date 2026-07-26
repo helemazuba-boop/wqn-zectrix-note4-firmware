@@ -76,6 +76,9 @@ struct ProblemAppState {
 
     WqnProblemEntry current;
     bool current_loaded = false;
+    // Composed 题面 text: shell content followed by every part's own body
+    // (the gaokao shell model keeps the real question text in parts[]).
+    std::string body_text;
     // Composed 答案面 text (per part: label · 分值 · 正确答案).
     std::string answer_text;
 

@@ -103,6 +103,45 @@ const char* ProblemStatusLabel(uint8_t status)
     return "";
 }
 
+// 题面: the gaokao shell model splits the text across the shell's shared
+// stem (content_text, may be empty) and every part's own body. Rendering only
+// the shell stem dropped the actual questions -- single-part problems (whose
+// stem is usually empty) showed nothing at all. A lone part without label or
+// marks degrades to plain stem + body with no "第N问" heading.
+std::string ComposeBodyText(const wqn::WqnProblemEntry& entry)
+{
+    std::string text;
+    if (!entry.content_text.empty()) {
+        text = entry.content_text;
+    }
+    const bool single_plain_part = entry.parts.size() == 1 &&
+        entry.parts.front().label.empty() && entry.parts.front().full_marks == 0;
+    for (const wqn::WqnProblemPackPart& part : entry.parts) {
+        std::string section;
+        if (!single_plain_part) {
+            section = "第" + std::to_string(part.index) + "问";
+            if (!part.label.empty()) {
+                section += " · " + part.label;
+            }
+            if (part.full_marks > 0) {
+                section += " · " + std::to_string(part.full_marks) + "分";
+            }
+            if (!part.content_text.empty()) {
+                section.push_back('\n');
+                section += part.content_text;
+            }
+        } else {
+            section = part.content_text;
+        }
+        if (section.empty()) continue;
+        if (!text.empty()) {
+            text += "\n\n";
+        }
+        text += section;
+    }
+    return text;
+}
+
 // 答案面: 逐问 label · 分值 · 正确答案, one blank line between parts.
 std::string ComposeAnswerText(const wqn::WqnProblemEntry& entry)
 {
@@ -207,6 +246,7 @@ void LoadCurrentProblem(wqn::ProblemAppState* state)
 {
     state->current = wqn::WqnProblemEntry{};
     state->current_loaded = false;
+    state->body_text.clear();
     state->answer_text.clear();
     state->answer_unlocked = false;
     state->body_scroll_lines = 0;
@@ -231,8 +271,9 @@ void LoadCurrentProblem(wqn::ProblemAppState* state)
         state->current_loaded = true;
         // Precompute wrapped line counts with the SAME width as the renderer
         // (page_problem.cpp: kContentW - 14 = 370 px) so scroll clamps match.
+        state->body_text = ComposeBodyText(state->current);
         state->body_total_lines = static_cast<uint32_t>(
-            wqn::WrapUtf8TextToWidth(state->current.content_text, 370, 4096).size());
+            wqn::WrapUtf8TextToWidth(state->body_text, 370, 4096).size());
         state->answer_text = ComposeAnswerText(state->current);
         state->answer_total_lines = static_cast<uint32_t>(
             wqn::WrapUtf8TextToWidth(state->answer_text, 370, 4096).size());
@@ -285,6 +326,7 @@ void ExitToProblemList(wqn::ProblemAppState* state)
 {
     state->current = wqn::WqnProblemEntry{};
     state->current_loaded = false;
+    state->body_text.clear();
     state->answer_text.clear();
     state->answer_unlocked = false;
     ResetProblemImageViewer(state);
@@ -867,7 +909,7 @@ ProblemAppSnapshot BuildProblemAppSnapshot(const ProblemAppState& state)
         snapshot.has_body = state.current_loaded;
         snapshot.problem_id = state.current.problem_id;
         snapshot.problem_title = state.current.title;
-        snapshot.body_text = state.current.content_text;
+        snapshot.body_text = state.body_text;
         snapshot.answer_text = state.answer_text;
         snapshot.body_scroll_lines = state.body_scroll_lines;
         snapshot.answer_scroll_lines = state.answer_scroll_lines;
