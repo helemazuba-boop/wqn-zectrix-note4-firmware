@@ -620,6 +620,13 @@ std::string FrameSignature(const wqn::UiFrame& frame)
         signature.push_back('/');
         signature.append(std::to_string(frame.settings.volume_selected));
         signature.push_back('/');
+        // Default-word-deck dialog: the moving selection and the row value
+        // must repaint (missing them froze the dialog cursor -- every UP/DOWN
+        // was deduped as "desired state already represented").
+        signature.append(std::to_string(frame.settings.word_deck_selected));
+        signature.push_back('/');
+        signature.append(frame.settings.default_word_deck_title);
+        signature.push_back('/');
         signature.append(frame.settings.sync_status);
         signature.push_back('/');
         signature.append(frame.settings.notice);

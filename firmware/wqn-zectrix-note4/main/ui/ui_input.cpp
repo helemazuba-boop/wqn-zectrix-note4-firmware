@@ -117,9 +117,15 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
                     settings.word_deck_options[settings.word_deck_selected];
                 const esp_err_t result = wqn::SaveDefaultWordDeckId(option.deck_id);
                 if (result == ESP_OK) {
+                    ESP_LOGI(kTag, "wordbook change committed: id=%s",
+                             option.deck_id.empty() ? "all" : option.deck_id.c_str());
                     wqn::SetDefaultWordDeck(&state->word_app, option.deck_id, option.title);
                     settings.default_word_deck_title =
                         state->word_app.default_deck_title;
+                    // The old study session is pinned to the previous scope;
+                    // drop it so the next study entry rebuilds a session for
+                    // the new deck instead of resuming the old cards.
+                    wqn::ResetWordSessionsForScopeChange(&state->word_app, true);
                     // The default deck leaves (or rejoins) the note screen's
                     // mixed [词] rows immediately.
                     RebuildNoteWordDeckRows(state);

@@ -197,6 +197,13 @@ void InstallWordDeckCatalog(WordAppState* state, std::vector<WordDeckInfo> catal
 // is empty (全部词库).
 void SetDefaultWordDeck(
     WordAppState* state, const std::string& deck_id, const std::string& title);
+// Invalidates the study sessions after the deck scope changed (settings
+// default switch or a [词]-row entry): the old session is pinned to the old
+// scope, so resuming it would keep studying the previous deck set. Returns
+// to the word home; clear_persisted also drops the durable
+// sequential/random records (the dictionary session is cross-deck and
+// survives).
+void ResetWordSessionsForScopeChange(WordAppState* state, bool clear_persisted);
 bool ApplyWordSearchResult(
     WordAppState* state,
     const std::string& query,

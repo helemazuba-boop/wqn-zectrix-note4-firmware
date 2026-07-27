@@ -678,6 +678,9 @@ void HandleUiInput(UiState* state, UiInput input)
                             break;
                         }
                     }
+                    // The restored session is pinned to the previous scope;
+                    // starting the deck study must not resume it.
+                    ResetWordSessionsForScopeChange(&state->word_app, true);
                     state->screen = UiScreen::kWord;
                 }
                 break;
@@ -779,11 +782,15 @@ void HandleUiInput(UiState* state, UiInput input)
         ReleaseProblemImagePayload(&state->problem_app);
     }
     // Leaving the word screen drops the [词]-row deck override so the next
-    // direct entry studies the settings default again.
+    // direct entry studies the settings default again. The session built for
+    // the scoped deck is dropped with it (progress lives in the observation
+    // outbox; the session is only a browse cursor).
     if (screen_before == wqn::UiScreen::kWord &&
-        state->screen != wqn::UiScreen::kWord) {
+        state->screen != wqn::UiScreen::kWord &&
+        !state->word_app.scoped_deck_id.empty()) {
         state->word_app.scoped_deck_id.clear();
         state->word_app.scoped_deck_title.clear();
+        ResetWordSessionsForScopeChange(&state->word_app, true);
     }
 #if CONFIG_WQN_AI_ENABLE
     // Leaving the AI screen while in Flash tier must tear down the WebSocket

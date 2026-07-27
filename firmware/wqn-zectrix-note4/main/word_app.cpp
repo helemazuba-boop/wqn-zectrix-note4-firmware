@@ -940,6 +940,34 @@ void SetDefaultWordDeck(
     state->default_deck_title = deck_id.empty() ? std::string() : title;
 }
 
+void ResetWordSessionsForScopeChange(WordAppState* state, bool clear_persisted)
+{
+    if (state == nullptr) {
+        return;
+    }
+    ESP_LOGI(
+        kTag,
+        "word session reset after deck scope change: old_session=%s clear_persisted=%d",
+        state->session.persisted.remote.session_id.empty()
+            ? "none"
+            : state->session.persisted.remote.session_id.c_str(),
+        clear_persisted ? 1 : 0);
+    if (clear_persisted) {
+        ESP_ERROR_CHECK_WITHOUT_ABORT(
+            ClearPersistedWordSession(protocol::word_study_v1::Mode::kSequential));
+        ESP_ERROR_CHECK_WITHOUT_ABORT(
+            ClearPersistedWordSession(protocol::word_study_v1::Mode::kRandom));
+    }
+    state->session = WordSessionState{};
+    state->sequential_session_resumable = false;
+    state->random_session_resumable = false;
+    state->card_phase = WordCardPhase::kFront;
+    state->card_source = WordCardSource::kStudy;
+    state->current_word = WqnWordEntry{};
+    state->mode = WordAppMode::kHome;
+    state->message = "词库范围已切换";
+}
+
 void ApplyWordPackIndex(WordAppState* state, WordPackIndex index, const std::string& message)
 {
     if (state == nullptr) {
