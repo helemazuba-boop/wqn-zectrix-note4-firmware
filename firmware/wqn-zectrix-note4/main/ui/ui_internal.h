@@ -71,7 +71,11 @@ RefreshSchedule StrongerSchedule(RefreshSchedule a, RefreshSchedule b);
 constexpr TickType_t kCommitRefreshDelay = pdMS_TO_TICKS(120);
 constexpr TickType_t kClockRefreshDelay = pdMS_TO_TICKS(80);
 constexpr TickType_t kTimerRefreshDelay = pdMS_TO_TICKS(80);
-constexpr TickType_t kSelectionRefreshDelay = pdMS_TO_TICKS(180);
+// [feel] Coalescing window for selection moves. 180 ms rarely merged anything
+// (real key intervals sit above the ~400-700 ms refresh time) but added its
+// full length to EVERY single press; 100 ms keeps burst coalescing while
+// cutting ~80 ms off each visible cursor step.
+constexpr TickType_t kSelectionRefreshDelay = pdMS_TO_TICKS(100);
 constexpr TickType_t kConfigRefreshDelay = pdMS_TO_TICKS(120);
 constexpr TickType_t kAiRefreshDelay = pdMS_TO_TICKS(120);
 
