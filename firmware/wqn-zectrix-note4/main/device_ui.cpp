@@ -15,6 +15,7 @@
 #include "display_service.h"
 #include "esp_attr.h"
 #include "esp_log.h"
+#include "esp_task_wdt.h"
 #include "esp_timer.h"
 #include "flash_session.h"
 #include "power_manager.h"
@@ -704,6 +705,9 @@ wqn::AiStreamingStatusView streaming_view{};
             !device_ui_internal::IsWordCloudBusy() &&
             !device_ui_internal::IsNoteCloudBusy() &&
             !device_ui_internal::IsProblemCloudBusy();
+        // [hang-fix] Surface domains stuck busy past their lane budget; a
+        // silent stuck domain looks identical to "cloud slow" from the UI.
+        device_ui_internal::WarnStuckCloudDomains();
         if (status_reload_due && refresh_schedule == RefreshSchedule::kNone &&
             !event.HasEvent() && interaction_quiet && cloud_quiet) {
             if (state.screen != wqn::UiScreen::kWord) {
@@ -870,7 +874,27 @@ wqn::AiStreamingStatusView streaming_view{};
             ESP_LOGI(kTag, "queued coalesced problem pack refresh after sync");
         }
 
+        // [hang-fix] The idle power-off path runs a full cleanup refresh and
+        // the panel power-down ON THIS TASK, i.e. the same SPI/BUSY code the
+        // EPD refresh task guards with a scoped TWDT subscription. HIL showed
+        // a silent hard hang inside this call (log ends at "EPD idle cleanup
+        // full refresh", buttons dead, no watchdog output): cover the window
+        // so a wedge panics with a backtrace after CONFIG_ESP_TASK_WDT_TIMEOUT_S
+        // instead of freezing the UI task forever. display_service feeds the
+        // TWDT from its BUSY-wait and row-write loops, so a healthy cleanup
+        // (~1-3 s) never trips it.
+#if CONFIG_ESP_TASK_WDT_EN
+        {
+            const bool idle_wdt_subscribed =
+                esp_task_wdt_add(xTaskGetCurrentTaskHandle()) == ESP_OK;
+            wqn::PowerOffEpdAfterIdleIfNeeded();
+            if (idle_wdt_subscribed) {
+                esp_task_wdt_delete(xTaskGetCurrentTaskHandle());
+            }
+        }
+#else
         wqn::PowerOffEpdAfterIdleIfNeeded();
+#endif
 
         // Automatic light sleep is owned by ESP-IDF tickless idle. SleepLease
         // maps active service work to ESP_PM_NO_LIGHT_SLEEP; GPIO17 sleep-mode

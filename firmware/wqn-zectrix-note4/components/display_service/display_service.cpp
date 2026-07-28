@@ -10,6 +10,7 @@
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_task_wdt.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -39,7 +40,15 @@ constexpr gpio_num_t kEpdMosi = GPIO_NUM_13;
 constexpr spi_host_device_t kEpdSpiHost = SPI3_HOST;
 
 constexpr int kSpiClockHz = 40 * 1000 * 1000;
-constexpr int kBusyTimeoutMs = 30000;
+// [hang-fix] Full-refresh DRF waveform completion wait. Healthy full
+// refreshes complete in 2-3 s across HIL sessions; the old 30 s budget only
+// stretched the stall (with the EPD operation mutex held) when the panel was
+// wedged, disconnected or unpowered. 8 s keeps cold-temperature headroom.
+constexpr int kBusyTimeoutMs = 8000;
+// Non-waveform command completion waits (reset, OTP, temperature read,
+// booster, power-off). These finish in tens of milliseconds when the panel is
+// alive; 5 s only bounds the broken-hardware case.
+constexpr int kCommandBusyTimeoutMs = 5000;
 // Partial-waveform completion wait. Detection threshold for a wedged panel:
 // across every HIL session healthy partial waveforms complete in <=800 ms and
 // wedged ones never complete -- nothing has ever finished in the 1.5-4 s band
@@ -280,6 +289,18 @@ void SetReset(bool high)
     gpio_set_level(kEpdReset, high ? 1 : 0);
 }
 
+// [hang-fix] The EPD refresh task subscribes to the task watchdog for the
+// duration of a render (see EpdRefreshTask); feed it from the long-running
+// wait/write loops so healthy multi-second refreshes never trip the TWDT
+// while a wedged SPI transmit (no feed point) still panics and self-heals.
+// No-op for callers that are not subscribed.
+void FeedTwdtIfSubscribed()
+{
+    if (esp_task_wdt_status(nullptr) == ESP_OK) {
+        esp_task_wdt_reset();
+    }
+}
+
 esp_err_t WaitBusyTimeout(int timeout_ms)
 {
     const TickType_t start = xTaskGetTickCount();
@@ -302,6 +323,7 @@ esp_err_t WaitBusyTimeout(int timeout_ms)
                      static_cast<int>(pdTICKS_TO_MS(xTaskGetTickCount() - start)));
             return ESP_ERR_TIMEOUT;
         }
+        FeedTwdtIfSubscribed();
         vTaskDelay(pdMS_TO_TICKS(1));
     }
     ESP_LOGD(kTag, "[BUSY-PROBE] OK to=%dms entry=%d exit=%d trans=%s first_trans_lvl=%d trans_at=%dms elapsed=%dms",
@@ -314,7 +336,7 @@ esp_err_t WaitBusyTimeout(int timeout_ms)
 
 esp_err_t WaitBusy()
 {
-    return WaitBusyTimeout(kBusyTimeoutMs);
+    return WaitBusyTimeout(kCommandBusyTimeoutMs);
 }
 
 esp_err_t SendByte(uint8_t data)
@@ -760,7 +782,7 @@ esp_err_t TriggerDisplayUpdate(bool is_partial, bool keep_powered)
             DropEpdHotState(true, true);
             return ret;
         }
-        ret = WaitBusyTimeout(is_partial ? kPartialRefreshBusyTimeoutMs : kBusyTimeoutMs);
+        ret = WaitBusyTimeout(is_partial ? kPartialRefreshBusyTimeoutMs : kCommandBusyTimeoutMs);
         if (ret != ESP_OK) {
             ESP_LOGW(kTag, "EPD power-on wait timed out; dropping hot refresh state");
             DropEpdHotState(true, true);
@@ -1402,6 +1424,7 @@ esp_err_t SendFramebufferToPanel(bool partial, bool hot_update)
         }
         ESP_RETURN_ON_ERROR(WriteBytes(line, sizeof(line)), kTag, "write EPD line");
         if ((y & 0x3F) == 0) {
+            FeedTwdtIfSubscribed();
             vTaskDelay(1);
         }
     }
@@ -1469,6 +1492,7 @@ esp_err_t SendDirtyRectToPanel(const DirtyRect& rect)
         }
         ESP_RETURN_ON_ERROR(WriteBytes(line, static_cast<size_t>(window_bytes * 2)), kTag, "write EPD partial line");
         if ((y & 0x3F) == 0) {
+            FeedTwdtIfSubscribed();
             vTaskDelay(1);
         }
     }
@@ -1702,6 +1726,11 @@ void wqn::PowerOffEpdAfterIdleIfNeeded()
             // needs the clean waveform, not the pixels.
             g_previous_framebuffer_synced = false;
             const esp_err_t cleanup_ret = RefreshEpdFull(false, true);
+            // [hang-fix] Unconditional completion log: the HIL hang trace ends
+            // right after the "idle cleanup" line above, so this bracket log
+            // tells the next capture whether RefreshEpdFull returned at all.
+            ESP_LOGI(kTag, "EPD idle cleanup full refresh done: %s",
+                     esp_err_to_name(cleanup_ret));
             if (cleanup_ret != ESP_OK) {
                 ESP_LOGW(kTag, "EPD idle cleanup full refresh failed: %s",
                          esp_err_to_name(cleanup_ret));

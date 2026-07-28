@@ -8,6 +8,11 @@ CONFIG_PARTITION_TABLE_OFFSET=0x8000
 
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
 CONFIG_ESP_TASK_WDT_TIMEOUT_S=10
+# [hang-fix] A TWDT-subscribed task that stops feeding (wedged SPI transmit,
+# stuck bus lock) must panic with a backtrace and reset, not just print a
+# warning forever: the EPD render window and the UI task's idle power-off
+# window rely on this for self-healing.
+CONFIG_ESP_TASK_WDT_PANIC=y
 
 CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=6
 CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=8
