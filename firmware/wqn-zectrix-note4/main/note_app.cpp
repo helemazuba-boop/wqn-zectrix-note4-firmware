@@ -89,6 +89,34 @@ const wqn::NotePackIndexEntry* FindPackEntry(
     return &entry;
 }
 
+// [transfer-progress] Dispatch identity for the runner-side progress mailbox.
+// UI task only; 0 is reserved for "no dispatch".
+uint32_t NextTransferProgressGeneration()
+{
+    static uint32_t counter = 0;
+    if (++counter == 0) {
+        ++counter;
+    }
+    return counter;
+}
+
+// [body-fetch] Arms the targeted single-notebook pack fetch for an opened
+// note whose pack is missing on disk; the pump dispatches it on the
+// interactive lane. Clears a previous terminal error so Confirm retries.
+void ArmNoteBodyFetch(wqn::NoteAppState* state, const char* notebook_id)
+{
+    const size_t length = notebook_id != nullptr ? std::strlen(notebook_id) : 0;
+    if (length != 36) return;
+    state->body_fetch_notebook_id.assign(notebook_id, length);
+    state->body_fetch_request = true;
+    state->body_fetch_error = false;
+    // [progress-fix] Show the empty bar the moment the request is armed (the
+    // pump may sit behind a busy domain for a while; the user pressed a
+    // button NOW and the bar is the acknowledgement).
+    state->transfer_progress_bucket = 0;
+    state->transfer_progress_repaint_us = esp_timer_get_time();
+}
+
 // Best-effort body load for the selected title. Only touches storage when a
 // matching pack entry exists, so the reducer stays testable with an empty index.
 void LoadCurrentNoteBody(wqn::NoteAppState* state)
@@ -343,18 +371,38 @@ void HandleNoteListInput(wqn::NoteAppState* state, wqn::NoteInput input)
                 // A previous open is still committing; ignore the brief window.
                 break;
             }
-            // Record the explicit gate-0 `opened` action, then show the note.
-            ArmOpenObservation(state);
             LoadCurrentNoteBody(state);
-            state->note_scroll_offset_lines = 0;
-            ResetNoteImageViewer(state);
-            state->mode = wqn::NoteAppMode::kNoteView;
-            state->message = state->current_note_loaded ? "阅读中" : "内容未同步";
+            if (state->current_note_loaded) {
+                // Record the explicit gate-0 `opened` action, then show it.
+                ArmOpenObservation(state);
+                state->note_scroll_offset_lines = 0;
+                ResetNoteImageViewer(state);
+                state->mode = wqn::NoteAppMode::kNoteView;
+                state->message = "阅读中";
+                break;
+            }
+            // [status-bar-progress] Content not on disk: STAY ON THE LIST so
+            // the user keeps browsing while the targeted single-notebook sync
+            // runs behind the status-bar progress strip. The open intent is
+            // recorded and honored when the pack lands (item_id must still be
+            // selected); the opened-observation is deferred until the note is
+            // actually shown.
+            ArmNoteBodyFetch(
+                state, items[state->note_list_selected].notebook_id);
+            state->body_fetch_pending_open = true;
+            state->body_fetch_pending_item_id =
+                items[state->note_list_selected].item_id;
+            state->message = "正在同步内容";
             break;
         }
         case wqn::NoteInput::kLongConfirm:
             state->current_note = wqn::WqnNoteEntry{};
             state->current_note_loaded = false;
+            // Leaving the list abandons the auto-open intent; an in-flight
+            // fetch still lands in the index for the next visit.
+            state->body_fetch_pending_open = false;
+            state->body_fetch_request = false;
+            state->body_fetch_error = false;
             state->mode = wqn::NoteAppMode::kNotebookList;
             state->message.clear();
             break;
@@ -399,6 +447,12 @@ void RequestCurrentNoteImage(wqn::NoteAppState* state)
     if (!state->image_in_flight) {
         state->image_request = true;
     }
+    // [progress-fix] The bar appears at request time (empty), not at first
+    // byte: the flip itself is what the user wants acknowledged.
+    if (state->transfer_progress_bucket < 0) {
+        state->transfer_progress_bucket = 0;
+        state->transfer_progress_repaint_us = esp_timer_get_time();
+    }
 }
 
 // The note is one vertical ring: [image 1 .. image N] above the body, ends
@@ -439,6 +493,39 @@ void ExitNoteImageViewToBody(wqn::NoteAppState* state, uint32_t scroll_lines)
 
 void HandleNoteViewInput(wqn::NoteAppState* state, wqn::NoteInput input)
 {
+    if (!state->current_note_loaded) {
+        // [body-fetch] Placeholder page (syncing / failed / missing). Confirm
+        // retries a failed or lost fetch; long-confirm backs out and cancels
+        // the wait; scroll inputs are no-ops on placeholder text.
+        switch (input) {
+            case wqn::NoteInput::kConfirm:
+                if (!state->body_fetch_request && !state->body_fetch_in_flight) {
+                    const auto& items = state->session.persisted.remote.items;
+                    if (state->note_list_selected < items.size()) {
+                        ArmNoteBodyFetch(
+                            state,
+                            items[state->note_list_selected].notebook_id);
+                        state->message = "正在同步内容";
+                    }
+                }
+                break;
+            case wqn::NoteInput::kLongConfirm:
+                state->body_fetch_request = false;
+                state->body_fetch_error = false;
+                // in_flight stays: a live fetch result still installs the
+                // fresher index; the mode guard keeps view state untouched.
+                state->current_note = wqn::WqnNoteEntry{};
+                state->current_note_loaded = false;
+                state->note_scroll_offset_lines = 0;
+                ResetNoteImageViewer(state);
+                state->mode = wqn::NoteAppMode::kNoteList;
+                state->message.clear();
+                break;
+            default:
+                break;
+        }
+        return;
+    }
     switch (input) {
         case wqn::NoteInput::kUp: {
             constexpr uint32_t kNoteBodyScrollStep = 4;
@@ -908,10 +995,11 @@ bool TakeNoteImageRequest(
     NoteAppState* state,
     std::string* note_id,
     uint8_t* image_index,
-    std::string* image_id)
+    std::string* image_id,
+    uint32_t* progress_generation)
 {
     if (state == nullptr || note_id == nullptr || image_index == nullptr ||
-        image_id == nullptr) {
+        image_id == nullptr || progress_generation == nullptr) {
         return false;
     }
     // Heal a dropped/mismatched result before checking the flag, so the pump
@@ -930,6 +1018,15 @@ bool TakeNoteImageRequest(
     state->image_in_flight = true;
     state->image_dispatch_us = esp_timer_get_time();
     state->image_dispatched_id = *image_id;
+    state->transfer_progress_generation = NextTransferProgressGeneration();
+    *progress_generation = state->transfer_progress_generation;
+    // [progress-fix] Show the empty bar the moment the download is dispatched.
+    // HIL: a 15 KB image spends ~1.2 s in TLS setup with zero bytes flowing
+    // while the loading frame renders, and the ~600 ms body window hides
+    // behind an in-flight full refresh -- waiting for the first byte meant
+    // the bar never had a frame to ride on.
+    state->transfer_progress_bucket = 0;
+    state->transfer_progress_repaint_us = esp_timer_get_time();
     ESP_LOGI(kTag, "note image fetch dispatched: id=%.12s index=%u note=%.8s",
              image_id->c_str(), static_cast<unsigned>(*image_index),
              note_id->c_str());
@@ -941,6 +1038,188 @@ void RestoreNoteImageRequest(NoteAppState* state)
     if (state == nullptr || !state->image_in_flight) return;
     state->image_in_flight = false;
     state->image_request = true;
+}
+
+bool TakeNoteBodyFetchRequest(NoteAppState* state, std::string* notebook_id,
+                              uint32_t* progress_generation)
+{
+    if (state == nullptr || notebook_id == nullptr ||
+        progress_generation == nullptr) {
+        return false;
+    }
+    // The list is the home of the waiting user now (confirm on a missing
+    // note stays there); kNoteView remains for the defensive placeholder.
+    if ((state->mode != NoteAppMode::kNoteList &&
+         state->mode != NoteAppMode::kNoteView) ||
+        state->current_note_loaded) {
+        return false;
+    }
+    if (state->body_fetch_in_flight) {
+        // Outer self-heal, same shape as the image fetch: a dispatch whose
+        // result was dropped or wedged past every inner timeout re-arms here
+        // instead of leaving the page on "正在同步内容" forever.
+        constexpr int64_t kBodyFetchTimeoutUs = 20LL * 1000 * 1000;
+        if (state->body_fetch_dispatch_us > 0 &&
+            esp_timer_get_time() - state->body_fetch_dispatch_us >=
+                kBodyFetchTimeoutUs) {
+            ESP_LOGW(kTag, "note body pack fetch timed out; re-arming: nb=%.8s",
+                     state->body_fetch_notebook_id.c_str());
+            state->body_fetch_in_flight = false;
+            state->body_fetch_request = true;
+        }
+        return false;
+    }
+    if (!state->body_fetch_request || state->body_fetch_error ||
+        state->body_fetch_notebook_id.size() != 36) {
+        return false;
+    }
+    *notebook_id = state->body_fetch_notebook_id;
+    state->body_fetch_request = false;
+    state->body_fetch_in_flight = true;
+    state->body_fetch_dispatch_us = esp_timer_get_time();
+    state->transfer_progress_generation = NextTransferProgressGeneration();
+    *progress_generation = state->transfer_progress_generation;
+    // [progress-fix] Same dispatch-time empty bar as the image path.
+    state->transfer_progress_bucket = 0;
+    state->transfer_progress_repaint_us = esp_timer_get_time();
+    ESP_LOGI(kTag, "note body pack fetch dispatched: nb=%.8s",
+             notebook_id->c_str());
+    return true;
+}
+
+void RestoreNoteBodyFetchRequest(NoteAppState* state)
+{
+    if (state == nullptr || !state->body_fetch_in_flight) return;
+    state->body_fetch_in_flight = false;
+    state->body_fetch_request = true;
+}
+
+void ApplyNoteBodyFetchResult(
+    NoteAppState* state,
+    esp_err_t result,
+    NotePackIndex index,
+    bool index_ready,
+    bool auth_required,
+    const std::string& message)
+{
+    if (state == nullptr) return;
+    state->body_fetch_in_flight = false;
+    const bool pending_open = state->body_fetch_pending_open;
+    state->body_fetch_pending_open = false;
+    if (result == ESP_OK && index_ready) {
+        // Install in place, even mid-browse: unlike the full-catalog sync
+        // (which staged as pending until the notebook list), this index only
+        // advances the notebook the user is actively waiting on.
+        InstallNotePackIndex(state, std::move(index), message);
+        // Honor the deferred open intent -- but only if the user's selection
+        // still points at the note they asked for, and no observation commit
+        // is mid-flight. Otherwise the pack simply lands and the list keeps
+        // browsing undisturbed.
+        if (pending_open && state->mode == NoteAppMode::kNoteList &&
+            state->session.commit_state !=
+                NoteObservationCommitState::kPersisting) {
+            const auto& items = state->session.persisted.remote.items;
+            if (state->note_list_selected < items.size() &&
+                state->body_fetch_pending_item_id ==
+                    items[state->note_list_selected].item_id) {
+                LoadCurrentNoteBody(state);
+                if (state->current_note_loaded) {
+                    ArmOpenObservation(state);
+                    state->note_scroll_offset_lines = 0;
+                    ResetNoteImageViewer(state);
+                    state->mode = NoteAppMode::kNoteView;
+                    state->message = "阅读中";
+                } else {
+                    state->body_fetch_error = true;
+                    state->message = "云端暂无该笔记内容";
+                }
+                return;
+            }
+            state->message = "内容已就绪";
+            return;
+        }
+        if (state->mode == NoteAppMode::kNoteView && !state->current_note_loaded) {
+            // Defensive placeholder path (should not be reachable now that
+            // confirm stays on the list, but a completed fetch must still
+            // resolve it in place).
+            LoadCurrentNoteBody(state);
+            state->note_scroll_offset_lines = 0;
+            if (state->current_note_loaded) {
+                state->message = "阅读中";
+            } else {
+                state->body_fetch_error = true;
+                state->message = "云端暂无该笔记内容";
+            }
+        }
+        return;
+    }
+    if ((state->mode == NoteAppMode::kNoteList && pending_open) ||
+        (state->mode == NoteAppMode::kNoteView && !state->current_note_loaded)) {
+        state->body_fetch_error = true;
+        state->message = auth_required
+            ? "请重新配对"
+            : (!message.empty() ? message : "内容同步失败");
+        ESP_LOGW(kTag, "note body pack fetch failed: %s nb=%.8s",
+                 esp_err_to_name(result), state->body_fetch_notebook_id.c_str());
+    }
+}
+
+bool UpdateNoteTransferProgress(
+    NoteAppState* state,
+    uint8_t kind,
+    uint32_t generation,
+    uint32_t done_bytes,
+    uint32_t total_bytes,
+    int64_t now_us)
+{
+    if (state == nullptr) return false;
+    // Is this UI still waiting on a download at all? Independent of the
+    // mailbox: the bar appears at request time and must survive the no-bytes
+    // phases (queue behind a busy domain, TLS setup, result-in-queue).
+    // Image: an in-flight download for the PREVIOUS image still counts while
+    // the user has flipped onward -- it must finish before the new target
+    // can start, so the bar honestly tracks "time until your image".
+    const bool waiting_image =
+        state->mode == NoteAppMode::kNoteImageView && !state->image_error &&
+        (state->image_request || state->image_in_flight);
+    const bool waiting_pack =
+        (state->mode == NoteAppMode::kNoteList ||
+         state->mode == NoteAppMode::kNoteView) &&
+        !state->current_note_loaded && !state->body_fetch_error &&
+        (state->body_fetch_request || state->body_fetch_in_flight);
+    if (!waiting_image && !waiting_pack) {
+        if (state->transfer_progress_bucket < 0) {
+            return false;
+        }
+        state->transfer_progress_bucket = -1;
+        state->transfer_progress_repaint_us = now_us;
+        return true;
+    }
+    // Consume only bytes that belong to the dispatch THIS UI is waiting on
+    // (generation) AND whose kind matches the page (the dispatched-id defense
+    // above already rules out a stale image download painting under a newer
+    // image's loading page). Anything else: keep showing what we have.
+    const bool kind_matches =
+        (waiting_image && kind == 1) || (waiting_pack && kind == 2);
+    if (!kind_matches || generation == 0 ||
+        generation != state->transfer_progress_generation || total_bytes == 0) {
+        return false;
+    }
+    const uint64_t scaled = static_cast<uint64_t>(done_bytes) * 5U / total_bytes;
+    const int next = static_cast<int>(std::min<uint64_t>(scaled, 5));
+    if (next == state->transfer_progress_bucket) {
+        return false;
+    }
+    // Throttle forward segment steps to one e-ink repaint per ~800 ms;
+    // appear/disappear transitions above stay immediate.
+    if (next > state->transfer_progress_bucket &&
+        state->transfer_progress_bucket >= 0 &&
+        now_us - state->transfer_progress_repaint_us < 800000) {
+        return false;
+    }
+    state->transfer_progress_bucket = static_cast<int8_t>(next);
+    state->transfer_progress_repaint_us = now_us;
+    return true;
 }
 
 void ApplyNoteImageResult(
@@ -1192,6 +1471,10 @@ NoteAppSnapshot BuildNoteAppSnapshot(const NoteAppState& state)
     }
     if (state.mode == NoteAppMode::kNoteView || state.mode == NoteAppMode::kNoteImageView) {
         snapshot.has_body = state.current_note_loaded;
+        snapshot.body_fetch_active = !state.current_note_loaded &&
+            (state.body_fetch_request || state.body_fetch_in_flight);
+        snapshot.body_fetch_failed =
+            !state.current_note_loaded && state.body_fetch_error;
         snapshot.note_title = state.current_note.title;
         snapshot.note_body = state.current_note.content;
         snapshot.note_id = state.current_note.note_id;
@@ -1206,10 +1489,17 @@ NoteAppSnapshot BuildNoteAppSnapshot(const NoteAppState& state)
             state.image_wqni != nullptr &&
             state.image_loaded_id == state.image_expected_id &&
             !state.image_expected_id.empty();
-        if (snapshot.note_image_ready) {
+        // [status-bar-progress] Carry the payload whenever one exists, ready
+        // or not: a flip to a not-yet-downloaded image keeps SHOWING the
+        // previous image (with the progress banner) instead of a blocking
+        // loading page. shared_ptr: no copy.
+        if (state.image_wqni != nullptr) {
             snapshot.note_image_wqni = state.image_wqni;
         }
     }
+    // Progress presentation is not mode-gated: the list shows the status-bar
+    // strip while a body pack downloads behind it.
+    snapshot.transfer_progress_bucket = state.transfer_progress_bucket;
     snapshot.status_line = NoteAppStatusLine(state);
     switch (state.mode) {
         case NoteAppMode::kNotebookList:
@@ -1242,7 +1532,11 @@ std::string NoteAppStatusLine(const NoteAppState& state)
         case NoteAppMode::kNoteList:
             return "选择要看的笔记";
         case NoteAppMode::kNoteView:
-            return state.current_note_loaded ? "阅读中" : "内容未同步";
+            if (state.current_note_loaded) return "阅读中";
+            if (state.body_fetch_request || state.body_fetch_in_flight) {
+                return "正在同步内容";
+            }
+            return state.body_fetch_error ? "内容同步失败" : "内容未同步";
         case NoteAppMode::kNoteImageView:
             return state.image_error ? "图片加载失败" : "查看图片";
     }
@@ -1253,12 +1547,14 @@ std::string NoteAppSignature(const NoteAppState& state)
 {
     // Compact identity for the render layer to detect meaningful frame changes.
     // image_index/error must participate: flipping images or a failed fetch
-    // changes the frame with every other field identical.
-    char buffer[128] = {};
+    // changes the frame with every other field identical. The body-fetch
+    // flags likewise: syncing->loaded/failed transitions repaint the body
+    // placeholder with every other field unchanged.
+    char buffer[144] = {};
     std::snprintf(
         buffer,
         sizeof(buffer),
-        "%u:%u:%u:%u:%u:%u:%u:%u:%u:%u",
+        "%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%d",
         static_cast<unsigned>(state.mode),
         static_cast<unsigned>(state.notebook_selected),
         static_cast<unsigned>(state.note_list_selected),
@@ -1268,7 +1564,11 @@ std::string NoteAppSignature(const NoteAppState& state)
         static_cast<unsigned>(state.word_decks.size()),
         static_cast<unsigned>(state.session.commit_state),
         static_cast<unsigned>(state.image_index),
-        static_cast<unsigned>(state.image_error ? 1 : 0));
+        static_cast<unsigned>(state.image_error ? 1 : 0),
+        static_cast<unsigned>(
+            (state.body_fetch_request || state.body_fetch_in_flight) ? 1 : 0),
+        static_cast<unsigned>(state.body_fetch_error ? 1 : 0),
+        static_cast<int>(state.transfer_progress_bucket));
     return std::string(buffer);
 }
 
@@ -1314,7 +1614,10 @@ bool RunNotePageStateSelfTest()
         return false;
     }
 
-    // Opening a title arms exactly one durable `opened` and enters the reader.
+    // Opening a title whose pack is NOT on disk stays on the list, arms the
+    // targeted body fetch and records the auto-open intent; the durable
+    // `opened` observation is deferred until the content actually shows
+    // (status-bar progress model).
     NotePageFixture browse;
     if (!browse) return require(false, "allocate browse fixture");
     NoteAppState& b = browse.get();
@@ -1330,13 +1633,14 @@ bool RunNotePageStateSelfTest()
         b.session.persisted.remote.items.push_back(MakeItem(static_cast<unsigned>(index)));
     }
     if (HandleNoteAppInput(&b, NoteInput::kConfirm) != ESP_OK ||
-        !require(b.mode == NoteAppMode::kNoteView, "confirm opens the reader") ||
-        !require(b.session.commit_state == NoteObservationCommitState::kPersisting,
-                 "open arms a durable commit") ||
-        !require(b.session.observation_effect_ready, "open arms observation effect") ||
-        !require(b.session.pending_observation.action == ObservationAction::kOpened,
-                 "open records opened") ||
-        !require(b.session.pending_observation.sequence == 5, "open uses next_sequence")) {
+        !require(b.mode == NoteAppMode::kNoteList,
+                 "confirm on missing pack stays on the list") ||
+        !require(b.body_fetch_request, "confirm arms the body fetch") ||
+        !require(b.body_fetch_pending_open, "confirm records the open intent") ||
+        !require(b.session.commit_state == NoteObservationCommitState::kIdle,
+                 "observation deferred until content shows") ||
+        !require(!b.session.observation_effect_ready,
+                 "no observation effect before content shows")) {
         return false;
     }
 
@@ -1366,6 +1670,10 @@ bool RunNotePageStateSelfTest()
     e.session.persisted.remote.next_sequence = 0;
     e.session.persisted.remote.items.push_back(MakeItem(0));
     if (HandleNoteAppInput(&e, NoteInput::kConfirm) != ESP_OK) return false;
+    // The fixture has no pack on disk, so confirm parked the open intent on
+    // the list; arm the observation directly, exactly as the auto-open path
+    // does once the fetched content is shown.
+    ArmOpenObservation(&e);
     DurableNoteObservation observation;
     PersistedNoteSession advanced;
     if (!require(

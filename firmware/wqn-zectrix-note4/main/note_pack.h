@@ -131,7 +131,8 @@ esp_err_t LoadNotePackIndex(NotePackIndex* index);
 esp_err_t DownloadNotePackToStorage(
     const std::string& token,
     const protocol::v3::RequestMetadata& metadata,
-    const WqnNotePackManifestNotebook& notebook);
+    const WqnNotePackManifestNotebook& notebook,
+    WqnTransferProgressSink progress = nullptr);
 // verified_sha: sha recorded in the local manifest when this pack was last
 // downloaded (already verified end to end). When it matches the listing and
 // the file size is intact, the full-file re-hash is skipped -- under the

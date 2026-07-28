@@ -47,6 +47,8 @@ const char* AppEventKindName(AppEventKind event)
             return "sync-result";
         case AppEventKind::kDisplayResult:
             return "display-result";
+        case AppEventKind::kTransferProgress:
+            return "transfer-progress";
         default:
             return "unknown";
     }
@@ -173,15 +175,46 @@ void UiRuntime::RestoreNoteCandidatePageRequest()
 }
 
 bool UiRuntime::TakeNoteImageRequest(
-    std::string* note_id, uint8_t* image_index, std::string* image_id)
+    std::string* note_id, uint8_t* image_index, std::string* image_id,
+    uint32_t* progress_generation)
 {
     return wqn::TakeNoteImageRequest(
-        &state_.note_app, note_id, image_index, image_id);
+        &state_.note_app, note_id, image_index, image_id, progress_generation);
 }
 
 void UiRuntime::RestoreNoteImageRequest()
 {
     wqn::RestoreNoteImageRequest(&state_.note_app);
+}
+
+bool UiRuntime::TakeNoteBodyFetchRequest(std::string* notebook_id,
+                                         uint32_t* progress_generation)
+{
+    return wqn::TakeNoteBodyFetchRequest(
+        &state_.note_app, notebook_id, progress_generation);
+}
+
+void UiRuntime::RestoreNoteBodyFetchRequest()
+{
+    wqn::RestoreNoteBodyFetchRequest(&state_.note_app);
+}
+
+UiUpdate UiRuntime::DispatchTransferProgress(
+    uint8_t kind,
+    uint32_t generation,
+    uint32_t done_bytes,
+    uint32_t total_bytes,
+    int64_t now_us)
+{
+    const bool changed = wqn::UpdateNoteTransferProgress(
+        &state_.note_app, kind, generation, done_bytes, total_bytes, now_us);
+    // kTimer keeps the small status-strip repaint on the local-partial path
+    // (clock-tick precedent: tiny diffs, never wedged the SSD1683).
+    const RefreshSchedule refresh =
+        changed && state_.screen == wqn::UiScreen::kNote
+            ? RefreshSchedule::kTimer
+            : RefreshSchedule::kNone;
+    return FinishEvent(AppEventKind::kTransferProgress, refresh, changed);
 }
 
 bool UiRuntime::TakeNoteObservationEffect(

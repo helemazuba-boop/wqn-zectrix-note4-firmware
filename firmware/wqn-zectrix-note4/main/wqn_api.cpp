@@ -2752,7 +2752,8 @@ esp_err_t DownloadNotePackStream(
     const protocol::v3::RequestMetadata& metadata,
     const WqnNotePackManifestNotebook& notebook,
     WqnHttpChunkSink sink,
-    void* context)
+    void* context,
+    WqnTransferProgressSink progress)
 {
     if (sink == nullptr || metadata.request_id.empty() ||
         notebook.download_url.empty() || notebook.byte_size == 0 ||
@@ -2840,6 +2841,12 @@ esp_err_t DownloadNotePackStream(
             buffer.data(), static_cast<size_t>(read), false, sink, context);
         if (result == ESP_OK) {
             received += static_cast<size_t>(read);
+            if (progress != nullptr) {
+                // Plaintext progress: total_out advances against the exact
+                // byte_size from the manifest, so the bar cannot overshoot.
+                progress(static_cast<uint32_t>(inflater.total_out()),
+                         static_cast<uint32_t>(notebook.byte_size));
+            }
         }
     }
     if (result == ESP_OK && status_code == 200 &&
@@ -2874,7 +2881,8 @@ esp_err_t DownloadNoteImageV1(
     const std::string& note_id,
     uint8_t image_index,
     const std::string& expected_image_id,
-    std::vector<uint8_t>* wqni)
+    std::vector<uint8_t>* wqni,
+    WqnTransferProgressSink progress)
 {
     // WQNI file size is fixed by the contract: 20-byte header + 400x300/8.
     constexpr size_t kWqniFileBytes = 20 + 15000;
@@ -2958,6 +2966,12 @@ esp_err_t DownloadNoteImageV1(
             break;
         }
         wqni->insert(wqni->end(), buffer.data(), buffer.data() + read);
+        if (progress != nullptr && content_length > 0) {
+            // Compressed-transport progress: Content-Length is the compressed
+            // body size, matching the bytes accumulated here.
+            progress(static_cast<uint32_t>(wqni->size()),
+                     static_cast<uint32_t>(content_length));
+        }
     }
     if (result == ESP_OK && status_code == 200 &&
         (wqni->empty() || !esp_http_client_is_complete_data_received(client))) {

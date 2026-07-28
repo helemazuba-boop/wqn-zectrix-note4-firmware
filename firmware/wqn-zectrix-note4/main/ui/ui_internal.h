@@ -206,6 +206,10 @@ enum class NoteCloudOp {
     kStartSession,
     kFetchSessionPage,
     kFetchImage,
+    // Targeted single-notebook pack fetch: the user opened a note whose pack
+    // is not on disk and is actively waiting, so it rides the interactive
+    // lane (kPackSync stays the bulk full-catalog walk).
+    kFetchNotebookPack,
     // Local storage write (observation outbox + session snapshot); needs no
     // network/token. Runs on the interactive lane so the note-open bookkeeping
     // leaves the UI task (the ~0.9s foreground commit stall).
@@ -223,6 +227,10 @@ struct NoteCloudRequest {
     char note_id[37] = {};
     char image_id[65] = {};
     uint8_t image_index = 0;
+    // kFetchImage / kFetchNotebookPack: identity of this dispatch in the
+    // transfer-progress mailbox; the UI only consumes progress whose
+    // generation matches its own record (stale-download defense).
+    uint32_t progress_generation = 0;
 };
 
 struct NoteCloudResult {
@@ -327,6 +335,28 @@ bool EnqueueCloudJob(const CloudJob& job);
 // stuck busy past its lane budget is loudly logged instead of dying silent.
 void ClearCloudDomainBusyWatch(CloudDomain domain);
 void WarnStuckCloudDomains();
+
+// [transfer-progress] Single-writer atomic mailbox for interactive-lane
+// downloads (note image / targeted notebook pack). The runner writes freely
+// from the HTTP read loop; the UI task polls, quantizes and throttles before
+// any e-ink repaint. Latest-value-wins semantics: no queue, no lock, torn
+// reads are harmless after quantization. INTERACTIVE LANE ONLY -- the bulk
+// lane runs concurrently and must never write here.
+enum class CloudTransferKind : uint8_t {
+    kNone = 0,
+    kNoteImage = 1,
+    kNotebookPack = 2,
+};
+struct CloudTransferSnapshot {
+    CloudTransferKind kind = CloudTransferKind::kNone;
+    uint32_t generation = 0;
+    uint32_t done_bytes = 0;
+    uint32_t total_bytes = 0;
+};
+void BeginCloudTransferProgress(CloudTransferKind kind, uint32_t generation);
+void ReportCloudTransferBytes(uint32_t done_bytes, uint32_t total_bytes);
+void EndCloudTransferProgress();
+CloudTransferSnapshot ReadCloudTransferProgress();
 extern QueueHandle_t g_cloud_result_queue;
 
 static_assert(std::is_trivially_copyable_v<TodoCloudResultReady>);
@@ -383,8 +413,12 @@ bool QueueNoteCandidatePage(
     const wqn::protocol::note_study_v1::CandidatePageRequest& request);
 void PumpNoteCandidatePrefetch(UiRuntime* runtime);
 bool QueueNoteImageFetch(
-    const std::string& note_id, uint8_t image_index, const std::string& image_id);
+    const std::string& note_id, uint8_t image_index, const std::string& image_id,
+    uint32_t progress_generation);
 void PumpNoteImageFetch(UiRuntime* runtime);
+bool QueueNoteBodyPackFetch(
+    const std::string& notebook_id, uint32_t progress_generation);
+void PumpNoteBodyPackFetch(UiRuntime* runtime);
 void PumpNoteObservationCommit(UiRuntime* runtime);
 
 bool QueueProblemPackSync();

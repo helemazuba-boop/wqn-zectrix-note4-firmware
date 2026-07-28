@@ -241,4 +241,116 @@ esp_err_t SyncNotePacks(const std::string& token, NotePackSyncResult* out)
     return out->result;
 }
 
+esp_err_t SyncSingleNotebookPack(
+    const std::string& token,
+    const std::string& notebook_id,
+    NotePackSyncResult* out,
+    WqnTransferProgressSink progress)
+{
+    if (out == nullptr || notebook_id.size() != 36) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *out = NotePackSyncResult{};
+    if (token.empty()) {
+        out->auth_required = true;
+        out->result = ESP_ERR_INVALID_STATE;
+        return out->result;
+    }
+
+    // Page the manifest only until the target notebook appears. The listing is
+    // notebook-offset paged (relist semantics, see SyncNotePacks), so a bounded
+    // walk finds it or proves it is gone.
+    WqnNotePackManifestNotebook target;
+    bool target_found = false;
+    uint64_t cursor = 0;
+    bool has_more = true;
+    size_t page_count = 0;
+    out->result = ESP_OK;
+    while (out->result == ESP_OK && has_more && !target_found &&
+           page_count < kMaxManifestPagesPerSync) {
+        ++page_count;
+        WqnNotePackManifest delta;
+        const auto metadata = services::MakeDeviceRequestMetadata();
+        out->result = FetchNoteStudyManifest(token, metadata, cursor, &delta);
+        if (out->result != ESP_OK) {
+            break;
+        }
+        if (delta.has_more && delta.cursor <= cursor) {
+            out->result = ESP_ERR_INVALID_RESPONSE;
+            out->message = "笔记游标未推进";
+            break;
+        }
+        for (const WqnNotePackManifestNotebook& item : delta.notebooks) {
+            if (item.notebook_id == notebook_id) {
+                target = item;
+                target_found = true;
+                break;
+            }
+        }
+        cursor = delta.cursor;
+        has_more = delta.has_more;
+    }
+    if (out->result != ESP_OK) {
+        ESP_LOGW(kTag, "single notebook sync manifest walk failed: %s",
+                 esp_err_to_name(out->result));
+        return out->result;
+    }
+    if (!target_found || target.deleted || !target.has_pack) {
+        // The cloud genuinely has no pack for this notebook (deleted, archived
+        // or never packed): nothing to download, and no local state to touch.
+        out->result = ESP_ERR_NOT_FOUND;
+        out->message = "云端暂无该笔记本内容";
+        return out->result;
+    }
+
+    WqnNotePackManifest local_manifest;
+    const esp_err_t manifest_result = LoadNotePackManifest(&local_manifest);
+    if (manifest_result != ESP_OK && manifest_result != ESP_ERR_NOT_FOUND) {
+        // Broken local manifest is full-sync territory; do not half-repair it
+        // here (ResetNotePackStorageCache would drop every other pack).
+        out->result = manifest_result;
+        out->message = "笔记清单损坏";
+        return out->result;
+    }
+    const WqnNotePackManifestNotebook* known =
+        FindManifestNotebook(local_manifest, notebook_id);
+    const std::string* verified_sha =
+        known != nullptr && known->has_pack ? &known->sha256 : nullptr;
+    if (NotePackNeedsDownload(target, verified_sha)) {
+        out->result = DownloadNotePackToStorage(
+            token, services::MakeDeviceRequestMetadata(), target, progress);
+        if (out->result != ESP_OK) {
+            ESP_LOGW(kTag, "single notebook pack download failed: %s id=%.8s",
+                     esp_err_to_name(out->result), notebook_id.c_str());
+            return out->result;
+        }
+    }
+
+    // Merge ONLY the target row. A full-delta merge would advance other rows
+    // to shas whose pack files are still the old ones on disk, and the next
+    // index rebuild would fail their verification wholesale.
+    WqnNotePackManifest single_delta;
+    single_delta.cursor = local_manifest.cursor;
+    single_delta.has_more = local_manifest.has_more;
+    single_delta.notebooks.push_back(target);
+    WqnNotePackManifest merged;
+    out->result = MergeNotePackManifestDelta(single_delta, &merged);
+    if (out->result == ESP_OK) {
+        out->result = SaveNotePackManifest(merged);
+    }
+    if (out->result != ESP_OK) {
+        ESP_LOGW(kTag, "single notebook manifest merge failed: %s",
+                 esp_err_to_name(out->result));
+        return out->result;
+    }
+
+    out->result = LoadNotePackIndex(&out->index);
+    out->message = out->index.status_message;
+    out->index_ready = out->result == ESP_OK;
+    out->content_changed = true;
+    ESP_LOGI(kTag, "single notebook pack synced: id=%.8s index_ready=%d",
+             notebook_id.c_str(), out->index_ready ? 1 : 0);
+    return out->result;
+}
+
 }  // namespace wqn

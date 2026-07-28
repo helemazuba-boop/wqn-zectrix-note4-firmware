@@ -852,7 +852,24 @@ wqn::AiStreamingStatusView streaming_view{};
         device_ui_internal::PumpWordCandidatePrefetch(&ui_runtime);
         device_ui_internal::PumpNoteCandidatePrefetch(&ui_runtime);
         device_ui_internal::PumpNoteImageFetch(&ui_runtime);
+        device_ui_internal::PumpNoteBodyPackFetch(&ui_runtime);
         device_ui_internal::PumpNoteObservationCommit(&ui_runtime);
+        // [transfer-progress] Poll the runner-side download mailbox; note_app
+        // quantizes/throttles so this only schedules a repaint on a real
+        // segment step of a download this page is actually waiting on.
+        if (state.screen == wqn::UiScreen::kNote) {
+            const device_ui_internal::CloudTransferSnapshot transfer =
+                device_ui_internal::ReadCloudTransferProgress();
+            const device_ui_internal::UiUpdate transfer_update =
+                ui_runtime.DispatchTransferProgress(
+                    static_cast<uint8_t>(transfer.kind),
+                    transfer.generation,
+                    transfer.done_bytes,
+                    transfer.total_bytes,
+                    esp_timer_get_time());
+            refresh_schedule =
+                StrongerSchedule(refresh_schedule, transfer_update.refresh);
+        }
         device_ui_internal::PumpProblemImageFetch(&ui_runtime);
         device_ui_internal::PumpProblemVerdictCommit(&ui_runtime);
         if (word_pack_refresh_pending &&

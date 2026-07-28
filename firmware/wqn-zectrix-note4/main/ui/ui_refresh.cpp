@@ -542,6 +542,14 @@ std::string FrameSignature(const wqn::UiFrame& frame)
         signature.append(std::to_string(note.note_scroll_offset_lines));
         signature.push_back('/');
         signature.append(note.has_body ? "1" : "0");
+        // Body-pack fetch placeholder states: syncing -> loaded/failed flips
+        // repaint the placeholder text with every other field unchanged.
+        signature.push_back(note.body_fetch_active ? 'S' : '-');
+        signature.push_back(note.body_fetch_failed ? 'F' : '-');
+        // Quantized download progress: each segment step repaints the bar on
+        // the image-loading / body-syncing page.
+        signature.push_back('/');
+        signature.append(std::to_string(note.transfer_progress_bucket));
         signature.push_back('/');
         signature.append(note.cloud_sync_failed ? "1" : "0");
         signature.push_back('/');

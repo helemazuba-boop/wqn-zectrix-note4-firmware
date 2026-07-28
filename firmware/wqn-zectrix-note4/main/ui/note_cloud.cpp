@@ -33,6 +33,7 @@ uint32_t g_note_result_generation = 0;
 void FinishNoteCloudRequest()
 {
     g_note_sleep_lease.Reset();
+    ClearCloudDomainBusyWatch(CloudDomain::kNote);
     g_note_cloud_busy.store(false, std::memory_order_release);
 }
 
@@ -126,7 +127,8 @@ void PumpNoteCandidatePrefetch(UiRuntime* runtime)
 }
 
 bool QueueNoteImageFetch(
-    const std::string& note_id, uint8_t image_index, const std::string& image_id)
+    const std::string& note_id, uint8_t image_index, const std::string& image_id,
+    uint32_t progress_generation)
 {
     if (note_id.size() != 36 || image_index > 3 || image_id.size() != 64) {
         return false;
@@ -136,6 +138,7 @@ bool QueueNoteImageFetch(
     std::snprintf(request.note_id, sizeof(request.note_id), "%s", note_id.c_str());
     std::snprintf(request.image_id, sizeof(request.image_id), "%s", image_id.c_str());
     request.image_index = image_index;
+    request.progress_generation = progress_generation;
     return QueueNoteCloudRequest(request);
 }
 
@@ -149,13 +152,47 @@ void PumpNoteImageFetch(UiRuntime* runtime)
     std::string note_id;
     uint8_t image_index = 0;
     std::string image_id;
-    if (!runtime->TakeNoteImageRequest(&note_id, &image_index, &image_id)) {
+    uint32_t progress_generation = 0;
+    if (!runtime->TakeNoteImageRequest(
+            &note_id, &image_index, &image_id, &progress_generation)) {
         return;
     }
-    if (!QueueNoteImageFetch(note_id, image_index, image_id)) {
+    if (!QueueNoteImageFetch(note_id, image_index, image_id, progress_generation)) {
         ESP_LOGW(kNoteTag, "note image queue rejected (busy=%d); will retry",
                  IsNoteCloudBusy() ? 1 : 0);
         runtime->RestoreNoteImageRequest();
+    }
+}
+
+bool QueueNoteBodyPackFetch(
+    const std::string& notebook_id, uint32_t progress_generation)
+{
+    if (notebook_id.size() != 36) {
+        return false;
+    }
+    NoteCloudRequest request;
+    request.op = NoteCloudOp::kFetchNotebookPack;
+    std::snprintf(
+        request.notebook_id, sizeof(request.notebook_id), "%s", notebook_id.c_str());
+    request.progress_generation = progress_generation;
+    return QueueNoteCloudRequest(request);
+}
+
+void PumpNoteBodyPackFetch(UiRuntime* runtime)
+{
+    if (runtime == nullptr || IsNoteCloudBusy()) return;
+    // Same visibility gate as the image pump: nobody is waiting for this
+    // content once the note screen is gone.
+    if (runtime->state().screen != wqn::UiScreen::kNote) return;
+    std::string notebook_id;
+    uint32_t progress_generation = 0;
+    if (!runtime->TakeNoteBodyFetchRequest(&notebook_id, &progress_generation)) {
+        return;
+    }
+    if (!QueueNoteBodyPackFetch(notebook_id, progress_generation)) {
+        ESP_LOGW(kNoteTag, "note body pack queue rejected (busy=%d); will retry",
+                 IsNoteCloudBusy() ? 1 : 0);
+        runtime->RestoreNoteBodyFetchRequest();
     }
 }
 
@@ -261,6 +298,13 @@ bool ApplyNoteCloudResult(wqn::UiState* state, NoteCloudResult& result)
         BuildHomeSummary(state);
         return true;
     }
+    if (result.op == NoteCloudOp::kFetchNotebookPack) {
+        wqn::ApplyNoteBodyFetchResult(
+            &state->note_app, result.result, std::move(result.pack_index),
+            result.pack_index_ready, result.auth_required, result.message);
+        BuildHomeSummary(state);
+        return true;
+    }
     if (result.op == NoteCloudOp::kStartSession) {
         if (state->screen != wqn::UiScreen::kNote) {
             wqn::CancelNoteSessionStartResult(&state->note_app);
@@ -331,6 +375,17 @@ void ExecuteNoteCloudRequest(const NoteCloudRequest& request)
         result.pack_index_ready = sync.index_ready;
         result.message = sync.message;
         result.auth_required = sync.auth_required;
+    } else if (request.op == NoteCloudOp::kFetchNotebookPack) {
+        wqn::NotePackSyncResult sync;
+        BeginCloudTransferProgress(
+            CloudTransferKind::kNotebookPack, request.progress_generation);
+        result.result = wqn::SyncSingleNotebookPack(
+            token, request.notebook_id, &sync, &ReportCloudTransferBytes);
+        EndCloudTransferProgress();
+        result.pack_index = std::move(sync.index);
+        result.pack_index_ready = sync.index_ready;
+        result.message = sync.message;
+        result.auth_required = sync.auth_required;
     } else if (request.op == NoteCloudOp::kStartSession) {
         wqn::protocol::note_study_v1::CreateSessionRequest session;
         session.metadata = wqn::services::MakeDeviceRequestMetadata();
@@ -378,13 +433,17 @@ void ExecuteNoteCloudRequest(const NoteCloudRequest& request)
             ESP_LOGI(kNoteTag, "note image cache miss (%s), downloading %.12s index=%u",
                      esp_err_to_name(result.result), image_id.c_str(),
                      static_cast<unsigned>(request.image_index));
+            BeginCloudTransferProgress(
+                CloudTransferKind::kNoteImage, request.progress_generation);
             result.result = wqn::DownloadNoteImageV1(
                 token,
                 wqn::services::MakeDeviceRequestMetadata(),
                 request.note_id,
                 request.image_index,
                 image_id,
-                wqni.get());
+                wqni.get(),
+                &ReportCloudTransferBytes);
+            EndCloudTransferProgress();
             if (result.result == ESP_OK) {
                 result.result =
                     wqn::ValidateNoteImageWqni(wqni->data(), wqni->size());

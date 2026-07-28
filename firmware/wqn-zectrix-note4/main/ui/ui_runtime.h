@@ -37,6 +37,7 @@ enum class AppEventKind : uint8_t {
     kStatusReload,
     kSyncResult,
     kDisplayResult,
+    kTransferProgress,
 };
 
 struct UiUpdate {
@@ -76,6 +77,14 @@ public:
     UiUpdate DispatchStatusReload(wqn::AppState&& snapshot);
     UiUpdate DispatchSyncResult(const wqn::services::SyncEvent& event);
     UiUpdate DispatchDisplayResult(const wqn::display::DisplayResult& result);
+    // Folds the runner-side transfer-progress mailbox into the note domain's
+    // waiting-page presentation (quantize + throttle live in note_app).
+    UiUpdate DispatchTransferProgress(
+        uint8_t kind,
+        uint32_t generation,
+        uint32_t done_bytes,
+        uint32_t total_bytes,
+        int64_t now_us);
     bool TakeWordCandidatePageRequest(
         wqn::protocol::word_study_v1::CandidatePageRequest* request,
         std::string* session_id);
@@ -85,8 +94,12 @@ public:
         std::string* session_id);
     void RestoreNoteCandidatePageRequest();
     bool TakeNoteImageRequest(
-        std::string* note_id, uint8_t* image_index, std::string* image_id);
+        std::string* note_id, uint8_t* image_index, std::string* image_id,
+        uint32_t* progress_generation);
     void RestoreNoteImageRequest();
+    bool TakeNoteBodyFetchRequest(std::string* notebook_id,
+                                  uint32_t* progress_generation);
+    void RestoreNoteBodyFetchRequest();
     bool TakeNoteObservationEffect(
         const std::string& request_id,
         const std::string& occurred_at,

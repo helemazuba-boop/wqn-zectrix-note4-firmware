@@ -332,6 +332,13 @@ using WqnHttpChunkSink = esp_err_t (*)(
     void* context,
     const uint8_t* bytes,
     size_t size);
+// Optional download-progress sink. Called from the HTTP read loop on the
+// runner task; implementations must be lock-free and cheap (the UI-facing
+// mailbox in ui/cloud_runner.cpp is the intended target). total_bytes may be
+// 0 when the transfer size is unknown; consumers hide progress then.
+using WqnTransferProgressSink = void (*)(
+    uint32_t done_bytes,
+    uint32_t total_bytes);
 esp_err_t DownloadWordPackStream(
     const std::string& token,
     const protocol::v3::RequestMetadata& metadata,
@@ -353,7 +360,8 @@ esp_err_t DownloadNotePackStream(
     const protocol::v3::RequestMetadata& metadata,
     const WqnNotePackManifestNotebook& notebook,
     WqnHttpChunkSink sink,
-    void* context);
+    void* context,
+    WqnTransferProgressSink progress = nullptr);
 // Downloads one note image as a WQNI file (20-byte header + 15000-byte 1-bpp
 // payload) from /v3/notes/images/{note_id}/{image_index}. Verifies the exact
 // file size and that sha256(bytes) == expected_image_id (the content address
@@ -365,7 +373,8 @@ esp_err_t DownloadNoteImageV1(
     const std::string& note_id,
     uint8_t image_index,
     const std::string& expected_image_id,
-    std::vector<uint8_t>* wqni);
+    std::vector<uint8_t>* wqni,
+    WqnTransferProgressSink progress = nullptr);
 esp_err_t CreateNoteStudySessionV1(
     const std::string& token,
     const protocol::note_study_v1::CreateSessionRequest& request,

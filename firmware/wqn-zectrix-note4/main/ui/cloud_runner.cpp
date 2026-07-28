@@ -32,6 +32,15 @@ std::atomic<int64_t> g_domain_busy_warn_deadline_us[4] = {};
 constexpr int64_t kInteractiveBusyWarnUs = 60LL * 1000 * 1000;
 constexpr int64_t kBulkBusyWarnUs = 600LL * 1000 * 1000;
 
+// [transfer-progress] Mailbox storage (see ui_internal.h for the contract).
+// generation is written last on Begin / first on read so a consumer that
+// matched the generation is looking at bytes from the right transfer; torn
+// done/total pairs only wobble the quantized bucket by one step.
+std::atomic<uint8_t> g_transfer_kind{0};
+std::atomic<uint32_t> g_transfer_generation{0};
+std::atomic<uint32_t> g_transfer_done_bytes{0};
+std::atomic<uint32_t> g_transfer_total_bytes{0};
+
 const char* CloudDomainName(CloudDomain domain)
 {
     switch (domain) {
@@ -169,6 +178,39 @@ void ClearCloudDomainBusyWatch(CloudDomain domain)
 {
     g_domain_busy_warn_deadline_us[static_cast<size_t>(domain)].store(
         0, std::memory_order_release);
+}
+
+void BeginCloudTransferProgress(CloudTransferKind kind, uint32_t generation)
+{
+    g_transfer_done_bytes.store(0, std::memory_order_relaxed);
+    g_transfer_total_bytes.store(0, std::memory_order_relaxed);
+    g_transfer_kind.store(static_cast<uint8_t>(kind), std::memory_order_relaxed);
+    g_transfer_generation.store(generation, std::memory_order_release);
+}
+
+void ReportCloudTransferBytes(uint32_t done_bytes, uint32_t total_bytes)
+{
+    g_transfer_done_bytes.store(done_bytes, std::memory_order_relaxed);
+    g_transfer_total_bytes.store(total_bytes, std::memory_order_relaxed);
+}
+
+void EndCloudTransferProgress()
+{
+    g_transfer_generation.store(0, std::memory_order_release);
+    g_transfer_kind.store(0, std::memory_order_relaxed);
+    g_transfer_done_bytes.store(0, std::memory_order_relaxed);
+    g_transfer_total_bytes.store(0, std::memory_order_relaxed);
+}
+
+CloudTransferSnapshot ReadCloudTransferProgress()
+{
+    CloudTransferSnapshot snapshot;
+    snapshot.generation = g_transfer_generation.load(std::memory_order_acquire);
+    snapshot.kind =
+        static_cast<CloudTransferKind>(g_transfer_kind.load(std::memory_order_relaxed));
+    snapshot.done_bytes = g_transfer_done_bytes.load(std::memory_order_relaxed);
+    snapshot.total_bytes = g_transfer_total_bytes.load(std::memory_order_relaxed);
+    return snapshot;
 }
 
 void WarnStuckCloudDomains()
