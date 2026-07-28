@@ -29,6 +29,7 @@ uint32_t g_word_result_generation = 0;
 void FinishWordCloudRequest()
 {
     g_word_sleep_lease.Reset();
+    ClearCloudDomainBusyWatch(CloudDomain::kWord);
     g_word_cloud_busy.store(false, std::memory_order_release);
 }
 

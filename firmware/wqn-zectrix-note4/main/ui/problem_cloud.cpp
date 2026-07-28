@@ -38,6 +38,7 @@ uint32_t g_problem_result_generation = 0;
 void FinishProblemCloudRequest()
 {
     g_problem_sleep_lease.Reset();
+    ClearCloudDomainBusyWatch(CloudDomain::kProblem);
     g_problem_cloud_busy.store(false, std::memory_order_release);
 }
 

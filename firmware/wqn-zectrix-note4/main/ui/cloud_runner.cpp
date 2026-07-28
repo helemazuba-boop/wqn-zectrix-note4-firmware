@@ -7,14 +7,60 @@
 
 #include "ui_internal.h"
 
+#include <atomic>
+
 #include "esp_log.h"
+#include "esp_timer.h"
 
 namespace device_ui_internal {
 
 namespace {
 
+constexpr char kTag[] = "wqn_cloud";
+
 QueueHandle_t g_lane_queue[2] = {nullptr, nullptr};
 TaskHandle_t g_lane_task[2] = {nullptr, nullptr};
+
+// [hang-fix] Busy-watch. Each domain admits one in-flight request gated by
+// its busy CAS; if an Execute* path ever fails to reach Send*Result, or a
+// network call overruns every inner timeout, that domain stays busy forever
+// and all of its UI entry points silently go dead. Stage one is detection:
+// log loudly past a hard per-lane budget so field logs pin the stuck domain.
+// Forced recovery is deliberately not attempted -- resetting the busy flag
+// under a still-running job would race the shared result slot.
+std::atomic<int64_t> g_domain_busy_warn_deadline_us[4] = {};
+constexpr int64_t kInteractiveBusyWarnUs = 60LL * 1000 * 1000;
+constexpr int64_t kBulkBusyWarnUs = 600LL * 1000 * 1000;
+
+const char* CloudDomainName(CloudDomain domain)
+{
+    switch (domain) {
+        case CloudDomain::kTodo:
+            return "todo";
+        case CloudDomain::kWord:
+            return "word";
+        case CloudDomain::kNote:
+            return "note";
+        case CloudDomain::kProblem:
+            return "problem";
+    }
+    return "unknown";
+}
+
+bool CloudDomainBusy(CloudDomain domain)
+{
+    switch (domain) {
+        case CloudDomain::kTodo:
+            return IsTodoCloudBusy();
+        case CloudDomain::kWord:
+            return IsWordCloudBusy();
+        case CloudDomain::kNote:
+            return IsNoteCloudBusy();
+        case CloudDomain::kProblem:
+            return IsProblemCloudBusy();
+    }
+    return false;
+}
 
 CloudLane LaneForJob(const CloudJob& job)
 {
@@ -101,11 +147,49 @@ esp_err_t StartCloudRunner()
 
 bool EnqueueCloudJob(const CloudJob& job)
 {
-    const int lane = static_cast<int>(LaneForJob(job));
+    const CloudLane lane_kind = LaneForJob(job);
+    const int lane = static_cast<int>(lane_kind);
     if (g_lane_queue[lane] == nullptr) {
         return false;
     }
-    return xQueueSend(g_lane_queue[lane], &job, 0) == pdTRUE;
+    if (xQueueSend(g_lane_queue[lane], &job, 0) != pdTRUE) {
+        return false;
+    }
+    // Arm the busy-watch only for jobs that actually entered a lane; rejected
+    // jobs roll their domain's busy flag back via Finish*CloudRequest.
+    const int64_t budget_us = lane_kind == CloudLane::kBulk
+        ? kBulkBusyWarnUs
+        : kInteractiveBusyWarnUs;
+    g_domain_busy_warn_deadline_us[static_cast<size_t>(job.domain)].store(
+        esp_timer_get_time() + budget_us, std::memory_order_release);
+    return true;
+}
+
+void ClearCloudDomainBusyWatch(CloudDomain domain)
+{
+    g_domain_busy_warn_deadline_us[static_cast<size_t>(domain)].store(
+        0, std::memory_order_release);
+}
+
+void WarnStuckCloudDomains()
+{
+    const int64_t now_us = esp_timer_get_time();
+    for (size_t i = 0; i < 4; ++i) {
+        const int64_t deadline = g_domain_busy_warn_deadline_us[i].load(
+            std::memory_order_acquire);
+        if (deadline <= 0 || now_us < deadline) {
+            continue;
+        }
+        const CloudDomain domain = static_cast<CloudDomain>(i);
+        // Warn once per stuck episode; re-armed by the next request.
+        g_domain_busy_warn_deadline_us[i].store(0, std::memory_order_release);
+        if (CloudDomainBusy(domain)) {
+            ESP_LOGE(kTag,
+                     "cloud domain '%s' busy past hard budget; request likely stuck "
+                     "(runner lane blocked or Execute path never reached Send)",
+                     CloudDomainName(domain));
+        }
+    }
 }
 
 }  // namespace device_ui_internal

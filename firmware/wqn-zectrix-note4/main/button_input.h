@@ -36,6 +36,13 @@ struct ButtonEvent {
     ButtonId button = ButtonId::kNone;
     ButtonEventType type = ButtonEventType::kNone;
     int64_t duration_ms = 0;
+    // [longpress-fix] True for the 2nd+ kLongPress while the button is still
+    // held (the driver auto-repeats every kLongPressRepeatMs). Consumers that
+    // want one action per physical hold must gate on this flag -- inferring
+    // it from duration_ms broke silently when kLongPressMs changed (650+260
+    // = 910 ms slipped under the old 1150 ms duration gate and every hold
+    // past ~910 ms fired the long-press action twice).
+    bool repeat = false;
 
     bool HasEvent() const { return type != ButtonEventType::kNone; }
 };

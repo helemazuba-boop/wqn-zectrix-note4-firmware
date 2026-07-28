@@ -183,12 +183,17 @@ ButtonEvent PollButtonInput()
 
         if (button.raw_pressed && button.stable_pressed && now_ms - button.stable_changed_at_ms >= kLongPressMs &&
             (!button.long_press_reported || now_ms - button.last_long_press_event_at_ms >= kLongPressRepeatMs)) {
+            // [longpress-fix] Mark auto-repeats explicitly; duration-based
+            // inference at the consumer broke when this threshold changed.
+            const bool is_repeat = button.long_press_reported;
             button.long_press_reported = true;
             button.last_long_press_event_at_ms = now_ms;
-            return MakeEvent(
+            wqn::ButtonEvent event = MakeEvent(
                 button.id,
                 ButtonEventType::kLongPress,
                 now_ms - button.stable_changed_at_ms);
+            event.repeat = is_repeat;
+            return event;
         }
     }
 

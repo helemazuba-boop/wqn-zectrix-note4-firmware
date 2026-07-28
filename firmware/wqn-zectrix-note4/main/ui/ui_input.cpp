@@ -13,7 +13,6 @@
 namespace device_ui_internal {
 
 constexpr char kTag[] = "wqn_ui";
-constexpr int64_t kRepeatedLongPressMinDurationMs = 1150;
 
 RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiState* state)
 {
@@ -23,7 +22,10 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
 
     const bool short_press = event.type == wqn::ButtonEventType::kShortPress;
     const bool long_press = event.type == wqn::ButtonEventType::kLongPress;
-    const bool repeated_long_press = long_press && event.duration_ms >= kRepeatedLongPressMinDurationMs;
+    // [longpress-fix] Driver-marked auto-repeat; the old duration-based gate
+    // (>=1150ms) let the 2nd repeat (650+260=910ms) through as a fresh long
+    // press, so holds past ~910ms backed out two levels at once.
+    const bool repeated_long_press = long_press && event.repeat;
     if (repeated_long_press) {
         return RefreshSchedule::kNone;
     }
@@ -476,7 +478,7 @@ RefreshSchedule ApplyButtonEvent(
 
     const bool long_press = event.type == wqn::ButtonEventType::kLongPress;
     const bool long_release = event.type == wqn::ButtonEventType::kLongRelease;
-    const bool repeated_long_press = long_press && event.duration_ms >= kRepeatedLongPressMinDurationMs;
+    const bool repeated_long_press = long_press && event.repeat;
     const bool time_value_edit_repeat =
         repeated_long_press && state->screen == wqn::UiScreen::kTime &&
         wqn::TimeAppIsEditingValue(state->time_app) &&

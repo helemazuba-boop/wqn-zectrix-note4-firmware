@@ -322,6 +322,11 @@ struct CloudResultReady {
 
 esp_err_t StartCloudRunner();
 bool EnqueueCloudJob(const CloudJob& job);
+// [hang-fix] Busy-watch (see cloud_runner.cpp): armed on enqueue, cleared by
+// Finish*CloudRequest; the UI loop polls WarnStuckCloudDomains so a domain
+// stuck busy past its lane budget is loudly logged instead of dying silent.
+void ClearCloudDomainBusyWatch(CloudDomain domain);
+void WarnStuckCloudDomains();
 extern QueueHandle_t g_cloud_result_queue;
 
 static_assert(std::is_trivially_copyable_v<TodoCloudResultReady>);
