@@ -307,6 +307,31 @@ RefreshSchedule EffectiveSchedule(RefreshSchedule latest_schedule, const Display
 
 std::string FrameSignature(const wqn::UiFrame& frame)
 {
+    // [hang-fix] Screen coverage guard. Every screen whose state changes the
+    // drawn view MUST contribute its fields below, or the dedup pipeline
+    // silently skips repaints and the page looks frozen (the trap this file
+    // has hit repeatedly: note image-ready bit, settings word-deck dialog).
+    // The default-less switch turns "added a UiScreen, forgot the signature"
+    // into a -Werror=switch build break instead of a field freeze. Screens
+    // listed with no dedicated block render purely from frame.lines, which
+    // the shared loop at the end of this function already covers.
+    switch (frame.screen) {
+        case wqn::UiScreen::kAi:
+        case wqn::UiScreen::kTodo:
+        case wqn::UiScreen::kSettings:
+        case wqn::UiScreen::kHome:
+        case wqn::UiScreen::kTime:
+        case wqn::UiScreen::kWord:
+        case wqn::UiScreen::kNote:
+        case wqn::UiScreen::kLibrary:
+        case wqn::UiScreen::kProblem:
+        case wqn::UiScreen::kSolution:
+        case wqn::UiScreen::kReviewQueue:
+        case wqn::UiScreen::kReviewScore:
+        case wqn::UiScreen::kReviewQueued:
+        case wqn::UiScreen::kProvisioning:
+            break;
+    }
     std::string signature = std::to_string(static_cast<int>(frame.screen));
     const bool time_config_mode = frame.screen == wqn::UiScreen::kTime && frame.time_app.config_mode;
     if (frame.screen == wqn::UiScreen::kHome) {
@@ -557,6 +582,53 @@ std::string FrameSignature(const wqn::UiFrame& frame)
             signature.push_back(':');
             signature.append(row.last_opened_at);
         }
+        // Problem browse layer (rides on the note screen). Everything that
+        // changes the drawn view must land here: face/scroll transitions,
+        // unlock, verdict selection, image readiness -- the note domain's
+        // "missing signature field freezes the page" trap applies verbatim.
+        const wqn::ProblemAppSnapshot& problem = frame.problem_app;
+        signature.append("|problem:");
+        signature.append(problem.active ? "1" : "0");
+        if (problem.active) {
+            signature.push_back('/');
+            signature.append(std::to_string(static_cast<int>(problem.mode)));
+            signature.push_back('/');
+            signature.append(std::to_string(problem.list_selected));
+            signature.push_back('/');
+            signature.append(std::to_string(problem.list_window_start));
+            signature.push_back('/');
+            signature.append(std::to_string(static_cast<int>(problem.face)));
+            signature.push_back('/');
+            signature.append(std::to_string(problem.body_scroll_lines));
+            signature.push_back('/');
+            signature.append(std::to_string(problem.answer_scroll_lines));
+            signature.push_back('/');
+            signature.append(problem.answer_unlocked ? "1" : "0");
+            signature.push_back('/');
+            signature.append(std::to_string(problem.verdict_selected));
+            signature.push_back('/');
+            signature.append(std::to_string(static_cast<int>(problem.commit_state)));
+            signature.push_back('/');
+            signature.append(problem.problem_id);
+            signature.push_back('/');
+            signature.append(std::to_string(problem.position));
+            signature.push_back(':');
+            signature.append(std::to_string(problem.total));
+            signature.push_back('/');
+            signature.append(std::to_string(problem.image_ordinal));
+            signature.push_back(':');
+            signature.append(problem.image_ready ? "1" : "0");
+            signature.push_back(':');
+            signature.append(problem.image_error ? "1" : "0");
+            signature.push_back(':');
+            signature.append(problem.image_id);
+            for (const wqn::ProblemListRow& row : problem.rows) {
+                signature.push_back('|');
+                signature.append(row.title);
+                signature.push_back(':');
+                signature.append(row.status_label);
+            }
+        }
     }
     if (frame.screen == wqn::UiScreen::kSettings) {
         const wqn::SettingsDiagnosticsSnapshot& diag = frame.settings.diagnostics;
@@ -572,6 +644,13 @@ std::string FrameSignature(const wqn::UiFrame& frame)
         signature.append(std::to_string(frame.settings.volume_percent));
         signature.push_back('/');
         signature.append(std::to_string(frame.settings.volume_selected));
+        signature.push_back('/');
+        // Default-word-deck dialog: the moving selection and the row value
+        // must repaint (missing them froze the dialog cursor -- every UP/DOWN
+        // was deduped as "desired state already represented").
+        signature.append(std::to_string(frame.settings.word_deck_selected));
+        signature.push_back('/');
+        signature.append(frame.settings.default_word_deck_title);
         signature.push_back('/');
         signature.append(frame.settings.sync_status);
         signature.push_back('/');
@@ -765,13 +844,14 @@ void EpdRefreshTask(void*)
 {
     ESP_LOGI(kTag, "EPD refresh task started");
 
-#if CONFIG_ESP_TASK_WDT_EN
-    // Try add then delete: if the task was subscribed to TWDT at creation (FreeRTOS default),
-    // delete here takes effect. If add fails the task is not subscribed; delete also fails — fine either way.
-    esp_task_wdt_add(xTaskGetCurrentTaskHandle());
-    esp_task_wdt_delete(xTaskGetCurrentTaskHandle());
-    ESP_LOGI(kTag, "EPD refresh task unsubscribed from task watchdog");
-#endif
+    // [hang-fix] TWDT coverage is scoped to the render window below instead of
+    // unsubscribing for the whole task lifetime: the idle notify wait may
+    // legitimately block forever, but a render that stops feeding (SPI
+    // transmit wedged, BUSY loop stuck past its own timeout logic) must
+    // panic-reset after CONFIG_ESP_TASK_WDT_TIMEOUT_S instead of leaving the
+    // display pipeline silently dead. display_service feeds the TWDT from its
+    // BUSY-wait and row-write loops, so healthy multi-second refreshes never
+    // trip it.
 
     {
         const UBaseType_t stack_high_water = uxTaskGetStackHighWaterMark(nullptr);
@@ -839,7 +919,16 @@ void EpdRefreshTask(void*)
             local_intent.waveform != wqn::display::WaveformRequirement::kFull;
         if (!can_deduplicate) {
             const int64_t refresh_start_us = esp_timer_get_time();
+#if CONFIG_ESP_TASK_WDT_EN
+            const bool wdt_subscribed =
+                esp_task_wdt_add(xTaskGetCurrentTaskHandle()) == ESP_OK;
+#endif
             render_result = RenderFrameToEpd(frame, schedule);
+#if CONFIG_ESP_TASK_WDT_EN
+            if (wdt_subscribed) {
+                esp_task_wdt_delete(xTaskGetCurrentTaskHandle());
+            }
+#endif
             const int64_t refresh_elapsed_ms = (esp_timer_get_time() - refresh_start_us) / 1000;
             if (render_result == ESP_OK) {
                 displayed_signature = local_sig;
@@ -877,10 +966,17 @@ void EpdRefreshTask(void*)
         }
         terminal_result.presented_revision = g_last_presented_revision;
         xSemaphoreGive(g_refresh_mutex);
-        // A result slot was reserved when the intent was accepted. The refresh
-        // task may wait for the UI to drain it, preserving the exactly-once
-        // terminal-result invariant instead of silently dropping failures.
-        PublishDisplayResult(terminal_result, portMAX_DELAY);
+        // A result slot was reserved when the intent was accepted. Wait a
+        // bounded time for the UI to drain the queue; if it never does (UI
+        // task wedged in storage I/O or worse), drop the result and release
+        // the ledger slot ourselves so the refresh pipeline keeps serving
+        // frames instead of deadlocking on a consumer that may never return.
+        if (!PublishDisplayResult(terminal_result, pdMS_TO_TICKS(10000))) {
+            xSemaphoreTake(g_refresh_mutex, portMAX_DELAY);
+            UntrackOutstandingRevisionLocked(local_intent.revision);
+            MaybeReleaseDisplayLeaseLocked();
+            xSemaphoreGive(g_refresh_mutex);
+        }
 
         // After render: check secondary slot (producer may have submitted during render).
         // Move it into the opposite primary slot and self-notify.

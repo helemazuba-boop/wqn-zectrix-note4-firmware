@@ -59,8 +59,10 @@ esp_err_t DrawSettingsRow(size_t row_index, int y, const std::string& title, con
     } else if (row_index == 4) {
         tag = "设置";  // volume
     } else if (row_index == 5) {
-        tag = "系统";  // firmware version
+        tag = "设置";  // default word deck
     } else if (row_index == 6) {
+        tag = "系统";  // firmware version
+    } else if (row_index == 7) {
         tag = "重置";  // factory reset
     }
     DrawRoundedRect(kX + 298, y + 8, 54, 20, kChipRadius);
@@ -173,6 +175,41 @@ esp_err_t RenderSettingsDialog(const wqn::SettingsAppState& settings)
             ESP_RETURN_ON_ERROR(DrawCenteredText(86, 202, 228, "上下选择  确认保存"), kTag, "draw volume help");
             break;
         }
+        case wqn::SettingsDialog::kDefaultWordDeck: {
+            ESP_RETURN_ON_ERROR(DrawSettingsDialogBox("Word 默认词库"), kTag, "draw word deck dialog");
+            const auto& options = settings.word_deck_options;
+            if (options.empty()) {
+                ESP_RETURN_ON_ERROR(
+                    DrawCenteredText(86, 140, 228, "词库尚未同步"), kTag, "draw word deck empty");
+                break;
+            }
+            // Scrollable single-select list: the deck count is unbounded, so a
+            // selection-following 5-row window instead of fixed option cards.
+            constexpr size_t kVisible = 5;
+            constexpr int kRowH = 26;
+            size_t start = 0;
+            if (options.size() > kVisible && settings.word_deck_selected >= kVisible) {
+                start = std::min(
+                    settings.word_deck_selected + 1 - kVisible,
+                    options.size() - kVisible);
+            }
+            for (size_t i = 0; i < kVisible && start + i < options.size(); ++i) {
+                const size_t index = start + i;
+                const bool selected = index == settings.word_deck_selected;
+                const int y = 92 + static_cast<int>(i) * kRowH;
+                if (selected) {
+                    DrawSelectedFill(84, y, 232, kRowH - 4);
+                }
+                const std::string& label = options[index].deck_id.empty()
+                    ? std::string("全部词库")
+                    : options[index].title;
+                ESP_RETURN_ON_ERROR(
+                    DrawClippedText(92, y + 4, 216, label.empty() ? "(未命名词库)" : label, !selected),
+                    kTag, "draw word deck option");
+            }
+            ESP_RETURN_ON_ERROR(DrawCenteredText(86, 226, 228, "上下选择  确认保存"), kTag, "draw word deck help");
+            break;
+        }
         case wqn::SettingsDialog::kFactoryReset:
             ESP_RETURN_ON_ERROR(DrawSettingsDialogBox("恢复出厂"), kTag, "draw factory reset dialog");
             ESP_RETURN_ON_ERROR(DrawWrappedText(54, 98, 292, "将清除 NVS 中的配对、缓存、待上传、AI 会话、单词进度和设置。", 3), kTag, "draw reset body");
@@ -232,6 +269,7 @@ esp_err_t RenderSettingsToEpd(const wqn::UiFrame& frame, RefreshSchedule schedul
         "电量",
         "存储详情",
         "音量",
+        "Word 默认词库",
         "固件版本",
         "恢复出厂",
     };
@@ -241,13 +279,26 @@ esp_err_t RenderSettingsToEpd(const wqn::UiFrame& frame, RefreshSchedule schedul
         battery_value,
         storage_value,
         volume_label,
+        settings.default_word_deck_title.empty() ? "全部词库" : settings.default_word_deck_title,
         version_value,
         "",
     };
 
+    // Eight rows no longer fit the 300px panel at the 38px pitch; draw a
+    // selection-following window instead (deterministic from the selection so
+    // partial refreshes repaint consistently).
+    size_t window_start = 0;
+    if (settings.selected >= kSettingsVisibleRows) {
+        window_start = std::min(
+            settings.selected + 1 - kSettingsVisibleRows,
+            kSettingsItemCount - kSettingsVisibleRows);
+    }
     int y = 42;
-    for (size_t i = 0; i < kSettingsItemCount; ++i) {
-        ESP_RETURN_ON_ERROR(DrawSettingsRow(i, y, titles[i], values[i], i == settings.selected), kTag, "draw settings row");
+    for (size_t i = 0; i < kSettingsVisibleRows && window_start + i < kSettingsItemCount; ++i) {
+        const size_t index = window_start + i;
+        ESP_RETURN_ON_ERROR(
+            DrawSettingsRow(index, y, titles[index], values[index], index == settings.selected),
+            kTag, "draw settings row");
         y += 38;
     }
     ESP_RETURN_ON_ERROR(
@@ -278,6 +329,19 @@ void OpenSettingsDialog(wqn::UiState* state, wqn::SettingsDialog dialog)
         state->settings.auto_sync_selected = AutoSyncOptionIndex(state->settings.auto_sync_interval_min);
     } else if (dialog == wqn::SettingsDialog::kVolume) {
         state->settings.volume_selected = VolumeOptionIndex(state->settings.volume_percent);
+    } else if (dialog == wqn::SettingsDialog::kDefaultWordDeck) {
+        // Option 0 is the fixed 全部词库; the rest mirror the mounted deck
+        // catalog. Preselect the current default when it is still mounted.
+        auto& settings = state->settings;
+        settings.word_deck_options.clear();
+        settings.word_deck_options.push_back(wqn::WordDeckInfo{});
+        settings.word_deck_selected = 0;
+        for (const wqn::WordDeckInfo& deck : state->word_app.deck_catalog) {
+            if (deck.deck_id == state->word_app.default_deck_id) {
+                settings.word_deck_selected = settings.word_deck_options.size();
+            }
+            settings.word_deck_options.push_back(deck);
+        }
     }
 }
 

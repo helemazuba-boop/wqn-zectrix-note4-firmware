@@ -71,11 +71,18 @@ RefreshSchedule StrongerSchedule(RefreshSchedule a, RefreshSchedule b);
 constexpr TickType_t kCommitRefreshDelay = pdMS_TO_TICKS(120);
 constexpr TickType_t kClockRefreshDelay = pdMS_TO_TICKS(80);
 constexpr TickType_t kTimerRefreshDelay = pdMS_TO_TICKS(80);
-constexpr TickType_t kSelectionRefreshDelay = pdMS_TO_TICKS(180);
+// [feel] Coalescing window for selection moves. 180 ms rarely merged anything
+// (real key intervals sit above the ~400-700 ms refresh time) but added its
+// full length to EVERY single press; 100 ms keeps burst coalescing while
+// cutting ~80 ms off each visible cursor step.
+constexpr TickType_t kSelectionRefreshDelay = pdMS_TO_TICKS(100);
 constexpr TickType_t kConfigRefreshDelay = pdMS_TO_TICKS(120);
 constexpr TickType_t kAiRefreshDelay = pdMS_TO_TICKS(120);
 
-constexpr size_t kSettingsItemCount = 7;
+constexpr size_t kSettingsItemCount = 8;
+// Settings rows overflow the panel at 38px pitch; the list renders a
+// selection-following window of this many rows.
+constexpr size_t kSettingsVisibleRows = 6;
 constexpr uint32_t kAutoSyncOptions[] = {0, 15, 30, 60, 240};
 constexpr std::size_t kAutoSyncOptionsCount = sizeof(kAutoSyncOptions) / sizeof(kAutoSyncOptions[0]);
 constexpr int kVolumeOptions[] = {0, 25, 50, 75, 100};
@@ -242,6 +249,40 @@ struct NoteCloudResultReady {
     uint32_t generation = 0;
 };
 
+enum class ProblemCloudOp {
+    kPackSync,
+    kFetchImage,
+    // Local storage write (verdict outbox append); needs no network/token.
+    // Runs on the interactive lane so the durable append leaves the UI task.
+    kCommitObservation,
+};
+
+struct ProblemCloudRequest {
+    ProblemCloudOp op = ProblemCloudOp::kPackSync;
+    // kFetchImage: which problem/attachment and the content hash to verify.
+    char problem_id[37] = {};
+    char image_id[65] = {};
+    uint8_t image_index = 0;
+    // 0 = assets, 1 = solution (the /v3 image route path segment).
+    uint8_t image_kind = 0;
+};
+
+struct ProblemCloudResult {
+    ProblemCloudOp op = ProblemCloudOp::kPackSync;
+    esp_err_t result = ESP_FAIL;
+    bool auth_required = false;
+    bool pack_index_ready = false;
+    wqn::ProblemPackIndex pack_index;
+    std::string message;
+    // kFetchImage: validated WQNI bytes (header + payload) and their id.
+    std::string image_id;
+    std::shared_ptr<const std::vector<uint8_t>> image_wqni;
+};
+
+struct ProblemCloudResultReady {
+    uint32_t generation = 0;
+};
+
 // --- Unified cloud runner ---------------------------------------------------
 // One executor replaces the three per-domain cloud tasks. Two lanes so bulk
 // transfers (pack sync: multi-MB downloads + index rebuilds) can never sit in
@@ -254,7 +295,6 @@ enum class CloudDomain : uint8_t {
     kTodo,
     kWord,
     kNote,
-    // Reserved sync domain for the problem (错题) feature; no executor yet.
     kProblem,
 };
 
@@ -270,6 +310,7 @@ struct CloudJob {
         TodoCloudRequest todo;
         WordCloudRequest word;
         NoteCloudRequest note;
+        ProblemCloudRequest problem;
     };
     CloudJob() : todo() {}
 };
@@ -281,6 +322,11 @@ struct CloudResultReady {
 
 esp_err_t StartCloudRunner();
 bool EnqueueCloudJob(const CloudJob& job);
+// [hang-fix] Busy-watch (see cloud_runner.cpp): armed on enqueue, cleared by
+// Finish*CloudRequest; the UI loop polls WarnStuckCloudDomains so a domain
+// stuck busy past its lane budget is loudly logged instead of dying silent.
+void ClearCloudDomainBusyWatch(CloudDomain domain);
+void WarnStuckCloudDomains();
 extern QueueHandle_t g_cloud_result_queue;
 
 static_assert(std::is_trivially_copyable_v<TodoCloudResultReady>);
@@ -292,20 +338,25 @@ static_assert(std::is_trivially_copyable_v<CloudResultReady>);
 void SendTodoCloudResult();
 void SendWordCloudResult();
 void SendNoteCloudResult();
+void SendProblemCloudResult();
 const TodoCloudResult* PeekTodoCloudResult(uint32_t generation);
 WordCloudResult* PeekWordCloudResult(uint32_t generation);
 NoteCloudResult* PeekNoteCloudResult(uint32_t generation);
+ProblemCloudResult* PeekProblemCloudResult(uint32_t generation);
 
 bool IsTodoCloudBusy();
 bool IsWordCloudBusy();
 bool IsNoteCloudBusy();
+bool IsProblemCloudBusy();
 void FinishTodoCloudRequest();
 void FinishWordCloudRequest();
 void FinishNoteCloudRequest();
+void FinishProblemCloudRequest();
 
 bool QueueTodoCloudRequest(const TodoCloudRequest& request);
 bool QueueWordCloudRequest(const WordCloudRequest& request);
 bool QueueNoteCloudRequest(const NoteCloudRequest& request);
+bool QueueProblemCloudRequest(const ProblemCloudRequest& request);
 
 bool QueueTodoRefresh();
 bool QueueTodoRefreshCursor(const std::string& cursor);
@@ -320,6 +371,9 @@ bool QueueWordCandidatePage(
 void PumpWordCandidatePrefetch(UiRuntime* runtime);
 bool QueueWordSearch(const wqn::WqnWordSearchRequest& search);
 bool QueueWordAiLookup(const wqn::WqnWordAiLookupRequest& lookup);
+// Rebuilds the note screen's [词] rows from word_app.deck_catalog, excluding
+// the current default deck (it lives on the word page itself).
+void RebuildNoteWordDeckRows(wqn::UiState* state);
 
 bool QueueNotePackSync();
 bool QueueNoteSessionStart(
@@ -333,12 +387,22 @@ bool QueueNoteImageFetch(
 void PumpNoteImageFetch(UiRuntime* runtime);
 void PumpNoteObservationCommit(UiRuntime* runtime);
 
+bool QueueProblemPackSync();
+bool QueueProblemImageFetch(
+    const std::string& problem_id,
+    bool is_solution,
+    uint8_t image_index,
+    const std::string& image_id);
+void PumpProblemImageFetch(UiRuntime* runtime);
+void PumpProblemVerdictCommit(UiRuntime* runtime);
+
 bool ApplyTodoCloudResult(
     wqn::UiState* state,
     const TodoCloudResult& result,
     bool* content_changed = nullptr);
 bool ApplyWordCloudResult(wqn::UiState* state, WordCloudResult& result);
 bool ApplyNoteCloudResult(wqn::UiState* state, NoteCloudResult& result);
+bool ApplyProblemCloudResult(wqn::UiState* state, ProblemCloudResult& result);
 
 bool RefreshTodosFromCloud(wqn::UiState* state);
 RefreshSchedule CompleteSelectedTodo(wqn::UiState* state);
@@ -346,6 +410,7 @@ RefreshSchedule CompleteSelectedTodo(wqn::UiState* state);
 void ExecuteTodoCloudRequest(const TodoCloudRequest& request);
 void ExecuteWordCloudRequest(const WordCloudRequest& request);
 void ExecuteNoteCloudRequest(const NoteCloudRequest& request);
+void ExecuteProblemCloudRequest(const ProblemCloudRequest& request);
 
 bool LoadValidTokenForTodo(std::string* token);
 
@@ -467,6 +532,10 @@ esp_err_t RenderWordToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule);
 // ---- Note page --------------------------------------------------------------
 
 esp_err_t RenderNoteToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule);
+
+// ---- Problem browse (hosted by the note page) -------------------------------
+
+esp_err_t RenderProblemBrowseToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule);
 
 // ---- Settings page ----------------------------------------------------------
 

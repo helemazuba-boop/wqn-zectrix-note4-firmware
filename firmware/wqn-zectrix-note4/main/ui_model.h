@@ -8,6 +8,7 @@
 
 #include "ai_history.h"
 #include "note_app.h"
+#include "problem_app.h"
 #include "storage.h"
 #include "time_app.h"
 #include "word_app.h"
@@ -199,6 +200,7 @@ enum class SettingsDialog {
     kBattery,
     kStorage,
     kVolume,
+    kDefaultWordDeck,
     kFactoryReset,
 };
 
@@ -229,6 +231,12 @@ struct SettingsAppState {
     uint32_t auto_sync_interval_min = 0;
     int volume_percent = 100;
     size_t volume_selected = 0;
+    // 「WQN Word 默认词库」单选对话框: option 0 is the fixed 「全部词库」
+    // (empty id), the rest mirror the mounted word deck catalog.
+    std::vector<WordDeckInfo> word_deck_options;
+    size_t word_deck_selected = 0;
+    // Display value of the settings row (empty = 全部词库).
+    std::string default_word_deck_title;
     std::string sync_status;
     std::string notice;
     SettingsDiagnosticsSnapshot diagnostics;
@@ -284,6 +292,8 @@ struct AppState {
     TimeAppState time_app;
     WordAppState word_app;
     NoteAppState note_app;
+    // Problem browse layer hosted by the note screen ([题] mixed rows).
+    ProblemAppState problem_app;
     TodoUiState todo;
     SettingsAppState settings;
     HomeSummary home;
@@ -311,6 +321,7 @@ struct UiFrame {
     TimeAppState time_app;
     WordAppSnapshot word_app;
     NoteAppSnapshot note_app;
+    ProblemAppSnapshot problem_app;
     SettingsAppState settings;
     size_t selected_home_task = 0;
     std::vector<UiLine> lines;

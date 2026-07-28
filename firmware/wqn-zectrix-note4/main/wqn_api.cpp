@@ -24,6 +24,7 @@
 #include "esp_mac.h"
 #include "esp_netif_sntp.h"
 #include "esp_task_wdt.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "mbedtls/sha256.h"
@@ -405,6 +406,14 @@ esp_err_t HttpRequest(
         ESP_LOGW(kTag, "HTTP response has unknown content length");
     }
 
+    // [hang-fix] Overall read deadline. esp_http_client_read only bounds a
+    // single socket read (timeout_ms); a slow-drip peer or hijacking gateway
+    // that keeps trickling bytes could otherwise stretch one call
+    // indefinitely -- and every cloud domain shares the runner lane behind
+    // this call. 3x the per-read timeout comfortably covers the largest
+    // legitimate JSON payloads at ~2 KB per read.
+    const int64_t read_deadline_us =
+        esp_timer_get_time() + static_cast<int64_t>(timeout_ms) * 3 * 1000;
     std::array<char, 512> buffer = {};
     while (true) {
         const int read = esp_http_client_read(client, buffer.data(), buffer.size() - 1);
@@ -416,6 +425,11 @@ esp_err_t HttpRequest(
             break;
         }
         response_body->append(buffer.data(), read);
+        if (esp_timer_get_time() >= read_deadline_us) {
+            ESP_LOGW(kTag, "HTTP read exceeded overall deadline (%d ms x3)", timeout_ms);
+            result = ESP_ERR_TIMEOUT;
+            break;
+        }
     }
 
     esp_http_client_close(client);
@@ -515,6 +529,12 @@ esp_err_t HttpBinaryPost(
         ESP_LOGW(kTag, "AI HTTP response has unknown content length");
     }
 
+    // [hang-fix] Same overall-deadline guard as HttpCall. 120 s bounds the
+    // read phase: the ASR+LLM pipeline streams its answer well within two
+    // minutes once headers arrive; the 10-minute timeout_ms only budgets the
+    // server-side processing gap before the first byte.
+    const int64_t read_deadline_us =
+        esp_timer_get_time() + 120LL * 1000 * 1000;
     std::array<char, 512> buffer = {};
     while (true) {
         const int read = esp_http_client_read(client, buffer.data(), buffer.size() - 1);
@@ -527,6 +547,11 @@ esp_err_t HttpBinaryPost(
         }
         response_body->append(buffer.data(), read);
         FeedTaskWatchdogIfSubscribed();
+        if (esp_timer_get_time() >= read_deadline_us) {
+            ESP_LOGW(kTag, "AI HTTP read exceeded overall deadline (120 s)");
+            result = ESP_ERR_TIMEOUT;
+            break;
+        }
     }
 
     esp_http_client_close(client);
@@ -3229,6 +3254,446 @@ esp_err_t SkipNoteStudyObservationV1(
         transport_failure,
         "/v3/notes/observations/skip",
         "note-study-observation-skip");
+}
+
+esp_err_t FetchProblemStudyManifest(
+    const std::string& token,
+    const protocol::v3::RequestMetadata& metadata,
+    uint64_t cursor,
+    WqnProblemPackManifest* manifest)
+{
+    if (manifest == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *manifest = WqnProblemPackManifest{};
+    if (token.empty()) {
+        return ESP_OK;
+    }
+    const esp_err_t token_result = ValidateTokenOrClear(token, "problem-pack-manifest");
+    if (token_result != ESP_OK) {
+        return token_result;
+    }
+
+    ESP_RETURN_ON_ERROR(WaitForNetworkReadyForHttps(), kTag, "prepare network for problem-pack-manifest");
+
+    std::string request_body;
+    ESP_RETURN_ON_ERROR(
+        protocol::problem_study_v1::BuildManifestRequest(
+            metadata, cursor, 100, &request_body),
+        kTag,
+        "build problem-study manifest request");
+    const std::string url = BuildUrl("/v3/problems/manifest");
+    int status_code = 0;
+    std::string body;
+    esp_err_t http_result = HttpRequest(
+        "POST",
+        url,
+        &token,
+        &request_body,
+        &status_code,
+        &body,
+        protocol::v3::kProtocolHeader,
+        &metadata.request_id);
+    if (http_result != ESP_OK) {
+        ESP_LOGW(kTag, "problem-pack-manifest failed: %s", esp_err_to_name(http_result));
+        return http_result;
+    }
+    if (status_code == 401) {
+        return ClearTokenOnUnauthorized("problem-pack-manifest");
+    }
+    protocol::problem_study_v1::ManifestData data;
+    protocol::v3::Error error;
+    const esp_err_t parse_result = protocol::problem_study_v1::ParseManifestResponse(
+        body, metadata.request_id, &data, &error);
+    if (status_code != 200 || parse_result != ESP_OK) {
+        ESP_LOGW(
+            kTag,
+            "problem-study manifest failed: status=%d code=%s retryable=%d",
+            status_code,
+            error.code.c_str(),
+            error.retryable ? 1 : 0);
+        return parse_result == ESP_OK ? ESP_FAIL : parse_result;
+    }
+
+    manifest->cursor = data.cursor;
+    manifest->has_more = data.has_more;
+    manifest->problem_sets.reserve(data.problem_sets.size());
+    for (const protocol::problem_study_v1::ManifestSet& source : data.problem_sets) {
+        WqnProblemPackManifestSet set;
+        set.problem_set_id = source.problem_set_id;
+        set.name = source.name;
+        set.is_smart = source.is_smart;
+        set.deleted = source.deleted;
+        if (!source.deleted && source.has_pack) {
+            set.has_pack = true;
+            set.pack_id = source.pack.pack_id;
+            set.pack_revision = source.pack.pack_revision;
+            set.schema_version = source.pack.schema_version;
+            set.entry_count = source.pack.entry_count;
+            set.byte_size = source.pack.byte_size;
+            set.sha256 = source.pack.sha256;
+            set.download_url = source.pack.download_url;
+        }
+        manifest->problem_sets.push_back(std::move(set));
+    }
+    ESP_LOGI(
+        kTag,
+        "problem-study manifest ok: cursor=%llu changes=%u has_more=%d",
+        static_cast<unsigned long long>(manifest->cursor),
+        static_cast<unsigned>(manifest->problem_sets.size()),
+        manifest->has_more ? 1 : 0);
+    return ESP_OK;
+}
+
+esp_err_t DownloadProblemPackStream(
+    const std::string& token,
+    const protocol::v3::RequestMetadata& metadata,
+    const WqnProblemPackManifestSet& set,
+    WqnHttpChunkSink sink,
+    void* context)
+{
+    if (sink == nullptr || metadata.request_id.empty() ||
+        set.download_url.empty() || set.byte_size == 0 ||
+        set.byte_size > protocol::problem_study_v1::kMaxPackBytes) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (token.empty()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    const esp_err_t token_result = ValidateTokenOrClear(token, "problem-pack-download");
+    if (token_result != ESP_OK) {
+        return token_result;
+    }
+
+    ESP_RETURN_ON_ERROR(WaitForNetworkReadyForHttps(), kTag, "prepare network for problem-pack-download");
+
+    const std::string url = BuildWordPackDownloadUrl(set.download_url);
+    ESP_LOGI(kTag, "problem-pack-download: pack_id=%s url=%s bytes_expected=%lu",
+             set.pack_id.c_str(), url.c_str(),
+             static_cast<unsigned long>(set.byte_size));
+    esp_http_client_config_t config = {};
+    config.url = url.c_str();
+    config.method = HTTP_METHOD_GET;
+    config.timeout_ms = kHttpTimeoutMs;
+    config.crt_bundle_attach = esp_crt_bundle_attach;
+    config.buffer_size = 2048;
+
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (client == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
+    const std::string authorization = "Bearer " + token;
+    esp_err_t result = esp_http_client_set_header(
+        client, "Accept", "application/x-ndjson");
+    if (result == ESP_OK) {
+        result = esp_http_client_set_header(
+            client, "Authorization", authorization.c_str());
+    }
+    if (result == ESP_OK) {
+        result = esp_http_client_set_header(
+            client, "X-WQN-Protocol", protocol::v3::kProtocolHeader);
+    }
+    if (result == ESP_OK) {
+        result = esp_http_client_set_header(
+            client, "X-WQN-Request-Id", metadata.request_id.c_str());
+    }
+    if (result == ESP_OK) {
+        result = esp_http_client_open(client, 0);
+    }
+    int status_code = 0;
+    if (result == ESP_OK) {
+        // zlib transport coding: Content-Length is the compressed size; the
+        // inflater below enforces exact plaintext size + completion instead.
+        esp_http_client_fetch_headers(client);
+        status_code = esp_http_client_get_status_code(client);
+    }
+    TinflStreamInflater inflater;
+    if (result == ESP_OK && status_code == 200) {
+        result = inflater.Init(set.byte_size);
+    }
+    size_t received = 0;
+    std::array<uint8_t, 2048> buffer = {};
+    while (result == ESP_OK && status_code == 200) {
+        const int read = esp_http_client_read(
+            client,
+            reinterpret_cast<char*>(buffer.data()),
+            buffer.size());
+        FeedTaskWatchdogIfSubscribed();
+        if (read < 0) {
+            result = ESP_FAIL;
+            break;
+        }
+        if (read == 0) {
+            break;
+        }
+        if (received + static_cast<size_t>(read) >
+            protocol::problem_study_v1::kMaxPackBytes) {
+            result = ESP_ERR_INVALID_SIZE;
+            break;
+        }
+        result = inflater.Feed(
+            buffer.data(), static_cast<size_t>(read), false, sink, context);
+        if (result == ESP_OK) {
+            received += static_cast<size_t>(read);
+        }
+    }
+    if (result == ESP_OK && status_code == 200 &&
+        (!inflater.done() || inflater.total_out() != set.byte_size ||
+         !esp_http_client_is_complete_data_received(client))) {
+        result = ESP_ERR_INVALID_SIZE;
+    }
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+
+    if (status_code == 401) {
+        return ClearTokenOnUnauthorized("problem-pack-download");
+    }
+    if (status_code != 200) {
+        ESP_LOGW(kTag, "problem-pack-download HTTP status=%d", status_code);
+        return ESP_FAIL;
+    }
+    if (result != ESP_OK) {
+        ESP_LOGW(
+            kTag,
+            "problem-pack-download failed: %s url=%s received=%u",
+            esp_err_to_name(result),
+            url.c_str(),
+            static_cast<unsigned>(received));
+    }
+    return result;
+}
+
+esp_err_t DownloadProblemImageV1(
+    const std::string& token,
+    const protocol::v3::RequestMetadata& metadata,
+    const std::string& problem_id,
+    WqnProblemImageKind kind,
+    uint8_t image_index,
+    const std::string& expected_image_id,
+    std::vector<uint8_t>* wqni)
+{
+    // WQNI file size is fixed by the contract: 20-byte header + 400x300/8.
+    constexpr size_t kWqniFileBytes = 20 + 15000;
+    if (wqni == nullptr || metadata.request_id.empty() || problem_id.size() != 36 ||
+        image_index > 7 || expected_image_id.size() != 64) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (token.empty()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    const esp_err_t token_result = ValidateTokenOrClear(token, "problem-image-download");
+    if (token_result != ESP_OK) {
+        return token_result;
+    }
+
+    ESP_RETURN_ON_ERROR(WaitForNetworkReadyForHttps(), kTag, "prepare network for problem-image-download");
+
+    const char* kind_segment =
+        kind == WqnProblemImageKind::kSolution ? "solution" : "assets";
+    const std::string url = BuildUrl(
+        "/v3/problems/images/" + problem_id + "/" + kind_segment + "/" +
+        std::to_string(image_index));
+    esp_http_client_config_t config = {};
+    config.url = url.c_str();
+    config.method = HTTP_METHOD_GET;
+    config.timeout_ms = kHttpTimeoutMs;
+    config.crt_bundle_attach = esp_crt_bundle_attach;
+    config.buffer_size = 2048;
+
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (client == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
+    const std::string authorization = "Bearer " + token;
+    esp_err_t result = esp_http_client_set_header(
+        client, "Accept", "application/octet-stream");
+    if (result == ESP_OK) {
+        result = esp_http_client_set_header(
+            client, "Authorization", authorization.c_str());
+    }
+    if (result == ESP_OK) {
+        result = esp_http_client_set_header(
+            client, "X-WQN-Protocol", protocol::v3::kProtocolHeader);
+    }
+    if (result == ESP_OK) {
+        result = esp_http_client_set_header(
+            client, "X-WQN-Request-Id", metadata.request_id.c_str());
+    }
+    if (result == ESP_OK) {
+        result = esp_http_client_open(client, 0);
+    }
+    int content_length = -1;
+    int status_code = 0;
+    if (result == ESP_OK) {
+        content_length = esp_http_client_fetch_headers(client);
+        status_code = esp_http_client_get_status_code(client);
+    }
+    if (result == ESP_OK && status_code == 200 && content_length >= 0 &&
+        static_cast<size_t>(content_length) > kWqniFileBytes + 512) {
+        ESP_LOGW(kTag, "problem-image-download Content-Length oversized: %d", content_length);
+        result = ESP_ERR_INVALID_SIZE;
+    }
+    wqni->clear();
+    // Compressed body: typically a few KB, never the full plaintext size.
+    wqni->reserve(4096);
+    std::array<uint8_t, 2048> buffer = {};
+    while (result == ESP_OK && status_code == 200) {
+        const int read = esp_http_client_read(
+            client, reinterpret_cast<char*>(buffer.data()), buffer.size());
+        FeedTaskWatchdogIfSubscribed();
+        if (read < 0) {
+            result = ESP_FAIL;
+            break;
+        }
+        if (read == 0) {
+            break;
+        }
+        if (wqni->size() + static_cast<size_t>(read) > kWqniFileBytes + 512) {
+            result = ESP_ERR_INVALID_SIZE;
+            break;
+        }
+        wqni->insert(wqni->end(), buffer.data(), buffer.data() + read);
+    }
+    if (result == ESP_OK && status_code == 200 &&
+        (wqni->empty() || !esp_http_client_is_complete_data_received(client))) {
+        result = ESP_ERR_INVALID_SIZE;
+    }
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+
+    if (status_code == 401) {
+        wqni->clear();
+        return ClearTokenOnUnauthorized("problem-image-download");
+    }
+    if (status_code != 200) {
+        ESP_LOGW(kTag, "problem-image-download HTTP status=%d problem=%s kind=%s index=%u",
+                 status_code, problem_id.c_str(), kind_segment,
+                 static_cast<unsigned>(image_index));
+        wqni->clear();
+        return status_code == 404 ? ESP_ERR_NOT_FOUND : ESP_FAIL;
+    }
+    if (result != ESP_OK) {
+        wqni->clear();
+        return result;
+    }
+
+    // A gateway or captive portal can answer 200 with HTML/JSON; our zlib
+    // bodies always start with CMF 0x78 (deflate, 32K window).
+    if (wqni->empty() || (*wqni)[0] != 0x78) {
+        ESP_LOGW(kTag, "problem-image-download body is not zlib (first=0x%02x size=%u)",
+                 wqni->empty() ? 0 : (*wqni)[0],
+                 static_cast<unsigned>(wqni->size()));
+        wqni->clear();
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    // zlib transport coding: inflate before verification -- image_id is the
+    // sha256 of the uncompressed WQNI file. Heap-backed streaming inflater,
+    // never tinfl_decompress_mem_to_mem (its ~11 KB decompressor lives on the
+    // stack and overflowed the 8 KB cloud lane task; see DownloadNoteImageV1).
+    {
+        std::vector<uint8_t> inflated;
+        inflated.reserve(kWqniFileBytes);
+        TinflStreamInflater inflater;
+        esp_err_t inflate_result = inflater.Init(kWqniFileBytes);
+        if (inflate_result == ESP_OK) {
+            const auto append_sink = [](void* context, const uint8_t* data,
+                                        size_t size) -> esp_err_t {
+                auto* target = static_cast<std::vector<uint8_t>*>(context);
+                target->insert(target->end(), data, data + size);
+                return ESP_OK;
+            };
+            inflate_result = inflater.Feed(
+                wqni->data(), wqni->size(), true, append_sink, &inflated);
+        }
+        if (inflate_result != ESP_OK || !inflater.done() ||
+            inflated.size() != kWqniFileBytes) {
+            ESP_LOGW(kTag, "problem-image-download inflate failed: %s out=%u",
+                     esp_err_to_name(inflate_result),
+                     static_cast<unsigned>(inflated.size()));
+            wqni->clear();
+            return ESP_ERR_INVALID_RESPONSE;
+        }
+        *wqni = std::move(inflated);
+    }
+
+    // Content addressing: the pack line pinned the image id, so the bytes
+    // must hash to it or the panel would show something the user never attached.
+    std::array<unsigned char, 32> digest = {};
+    if (mbedtls_sha256(wqni->data(), wqni->size(), digest.data(), 0) != 0) {
+        wqni->clear();
+        return ESP_FAIL;
+    }
+    constexpr char kHexDigits[] = "0123456789abcdef";
+    std::string actual_id;
+    actual_id.reserve(64);
+    for (unsigned char byte : digest) {
+        actual_id.push_back(kHexDigits[byte >> 4]);
+        actual_id.push_back(kHexDigits[byte & 0x0f]);
+    }
+    if (actual_id != expected_image_id) {
+        ESP_LOGW(kTag, "problem-image-download hash mismatch: expected=%.12s actual=%.12s",
+                 expected_image_id.c_str(), actual_id.c_str());
+        wqni->clear();
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    return ESP_OK;
+}
+
+esp_err_t SubmitProblemReviewObservationV1(
+    const std::string& token,
+    const protocol::problem_study_v1::ObservationRequest& request,
+    protocol::problem_study_v1::ObservationData* observation,
+    protocol::v3::Error* error,
+    bool* transport_failure)
+{
+    if (observation == nullptr || error == nullptr || transport_failure == nullptr ||
+        token.empty()) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *observation = {};
+    *error = {};
+    *transport_failure = false;
+    esp_err_t result = ValidateTokenOrClear(token, "problem-review-observation");
+    if (result != ESP_OK) return result;
+    result = WaitForNetworkReadyForHttps();
+    if (result != ESP_OK) {
+        *transport_failure = true;
+        return result;
+    }
+
+    std::string request_body;
+    result = protocol::problem_study_v1::BuildObservationRequest(request, &request_body);
+    if (result != ESP_OK) return result;
+    const std::string url = BuildUrl("/v3/problems/observations");
+    int status_code = 0;
+    std::string body;
+    result = HttpRequest(
+        "POST",
+        url,
+        &token,
+        &request_body,
+        &status_code,
+        &body,
+        protocol::v3::kProtocolHeader,
+        &request.metadata.request_id);
+    if (result != ESP_OK) {
+        *transport_failure = true;
+        return result;
+    }
+    if (status_code == 401) return ClearTokenOnUnauthorized("problem-review-observation");
+    const esp_err_t parse_result = protocol::problem_study_v1::ParseObservationResponse(
+        body, request.metadata.request_id, observation, error);
+    if (status_code != 200 || parse_result != ESP_OK) {
+        ESP_LOGW(
+            kTag,
+            "problem-review-observation failed: status=%d code=%s retryable=%d",
+            status_code,
+            error->code.c_str(),
+            error->retryable ? 1 : 0);
+        return parse_result == ESP_OK ? ESP_FAIL : parse_result;
+    }
+    return ESP_OK;
 }
 
 esp_err_t LookupWordWithAi(const std::string& token, const WqnWordAiLookupRequest& request, WqnWordAiLookupResult* result)

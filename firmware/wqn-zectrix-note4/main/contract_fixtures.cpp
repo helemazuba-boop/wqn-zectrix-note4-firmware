@@ -5,9 +5,12 @@
 
 #include "cJSON.h"
 #include "device_protocol/v3.h"
+#include "device_protocol/problem_study.h"
 #include "device_protocol/word_study.h"
 #include "esp_log.h"
 #include "note_app.h"
+#include "problem_app.h"
+#include "problem_pack.h"
 #include "text_render.h"
 #include "word_app.h"
 #include "wqn_api.h"
@@ -191,6 +194,144 @@ const char kWordManifestUnsafeCursorV1[] = R"json({
   "request_id": "req_word_manifest_002",
   "server_time_ms": 1784512802000,
   "data": {"cursor":"9007199254740992","has_more":false,"decks":[]}
+})json";
+
+const char kProblemManifestV1[] = R"json({
+  "ok": true,
+  "request_id": "req_problem_manifest_01",
+  "server_time_ms": 1784512800000,
+  "data": {
+    "cursor": "2",
+    "has_more": false,
+    "problem_sets": [
+      {
+        "problem_set_id": "11111111-1111-4111-8111-111111111111",
+        "name": "圆锥曲线专项",
+        "is_smart": false,
+        "deleted": false,
+        "pack": {
+          "pack_id": "11111111-1111-4111-8111-111111111111",
+          "pack_revision": 1784512700,
+          "schema_version": 1,
+          "format": "jsonl",
+          "compression": "zlib",
+          "entry_count": 12,
+          "byte_size": 20480,
+          "sha256": "9e00e194c412bff778bfd1235b3b2b25a4f7f8b1d3ef1c72fca11d21b36d1e05",
+          "download_url": "https://example.com/api/esp32/v3/problems/packs/11111111-1111-4111-8111-111111111111"
+        }
+      },
+      {
+        "problem_set_id": "22222222-2222-4222-8222-222222222222",
+        "name": "全部错题",
+        "is_smart": true,
+        "deleted": false,
+        "pack": {
+          "pack_id": "22222222-2222-4222-8222-222222222222",
+          "pack_revision": 1784512750,
+          "schema_version": 1,
+          "format": "jsonl",
+          "compression": "zlib",
+          "entry_count": 48,
+          "byte_size": 96031,
+          "sha256": "1b1f4d9c22cf8d0b6cf6a52ad4a3f2e8809d15b9a7f96ff2f4bf1cf3a2b4c6d8",
+          "download_url": "https://example.com/api/esp32/v3/problems/packs/22222222-2222-4222-8222-222222222222"
+        }
+      }
+    ]
+  }
+})json";
+
+const char kProblemObservationV1[] = R"json({
+  "ok": true,
+  "request_id": "req_problem_observe_01",
+  "server_time_ms": 1784512801000,
+  "data": {
+    "observation_id": "44444444-4444-4444-8444-444444444444",
+    "problem_id": "33333333-3333-4333-8333-333333333333",
+    "action": "correct",
+    "status": "mastered",
+    "schedule": {
+      "next_review_at": "2026-07-31T16:00:00+00:00",
+      "interval_days": 3,
+      "ease_factor": 2.6,
+      "repetition_number": 2
+    },
+    "projection_applied": true,
+    "replayed": false
+  }
+})json";
+
+const char kProblemObservationSkipV1[] = R"json({
+  "ok": true,
+  "request_id": "req_problem_observe_02",
+  "server_time_ms": 1784512802000,
+  "data": {
+    "observation_id": "55555555-5555-4555-8555-555555555555",
+    "problem_id": "33333333-3333-4333-8333-333333333333",
+    "action": "skip",
+    "status": "needs_review",
+    "schedule": null,
+    "projection_applied": false,
+    "replayed": false
+  }
+})json";
+
+const char kProblemObservationBadActionV1[] = R"json({
+  "ok": true,
+  "request_id": "req_problem_observe_03",
+  "server_time_ms": 1784512803000,
+  "data": {
+    "observation_id": "55555555-5555-4555-8555-555555555555",
+    "problem_id": "33333333-3333-4333-8333-333333333333",
+    "action": "partially_correct",
+    "status": "needs_review",
+    "schedule": null,
+    "projection_applied": false,
+    "replayed": false
+  }
+})json";
+
+// One pack JSONL record (contracts/problem-study-v1 fixtures/valid/pack-row).
+const char kProblemPackRowV1[] = R"json({
+  "problem_id": "33333333-3333-4333-8333-333333333333",
+  "title": "生物遗传综合题",
+  "content_text": "某二倍体植物的花色由两对等位基因控制，请回答下列问题。",
+  "parts": [
+    {
+      "index": 1,
+      "label": "选择",
+      "type": "single_choice",
+      "full_marks": 6,
+      "content_text": "该植物花色遗传遵循的规律是？",
+      "answer_text": "B"
+    },
+    {
+      "index": 2,
+      "label": "填空",
+      "type": "fill_blank",
+      "full_marks": 4,
+      "content_text": "F2 中白花植株的基因型共有____种。",
+      "answer_text": "5"
+    },
+    {
+      "index": 3,
+      "label": "简答",
+      "type": "essay",
+      "full_marks": 10,
+      "content_text": "请用遗传图解说明 F1 自交得到 F2 的过程。",
+      "answer_text": ""
+    }
+  ],
+  "source": { "type": "textbook", "label": "人教版必修二" },
+  "status": "wrong",
+  "is_optional": false,
+  "image_ids": [
+    "9e00e194c412bff778bfd1235b3b2b25a4f7f8b1d3ef1c72fca11d21b36d1e05"
+  ],
+  "solution_image_ids": [
+    "1b1f4d9c22cf8d0b6cf6a52ad4a3f2e8809d15b9a7f96ff2f4bf1cf3a2b4c6d8"
+  ]
 })json";
 
 const char kV3ClaimStart[] = R"json({
@@ -1075,6 +1216,158 @@ bool CheckWordStudyV1Contract()
     return true;
 }
 
+bool CheckProblemStudyV1Contract()
+{
+    namespace problems = wqn::protocol::problem_study_v1;
+    wqn::protocol::v3::Error error;
+    problems::ManifestData manifest;
+    if (!Require(
+            problems::ParseManifestResponse(
+                kProblemManifestV1,
+                "req_problem_manifest_01",
+                &manifest,
+                &error) == ESP_OK,
+            "problem-study manifest fixture") ||
+        !Require(manifest.cursor == 2, "problem-study manifest cursor") ||
+        !Require(!manifest.has_more, "problem-study manifest has_more") ||
+        !Require(manifest.problem_sets.size() == 2, "problem-study manifest set count") ||
+        !Require(!manifest.problem_sets[0].is_smart, "problem-study manual set") ||
+        !Require(manifest.problem_sets[1].is_smart, "problem-study smart set") ||
+        !Require(manifest.problem_sets[0].has_pack, "problem-study live pack") ||
+        !Require(
+            manifest.problem_sets[1].pack.entry_count == 48,
+            "problem-study pack entry count") ||
+        !Require(
+            manifest.problem_sets[0].pack.schema_version == 1,
+            "problem-study pack schema")) {
+        return false;
+    }
+
+    problems::ObservationData observation;
+    if (!Require(
+            problems::ParseObservationResponse(
+                kProblemObservationV1,
+                "req_problem_observe_01",
+                &observation,
+                &error) == ESP_OK,
+            "problem-study observation fixture") ||
+        !Require(
+            observation.action == problems::ReviewAction::kCorrect,
+            "problem-study observation action") ||
+        !Require(
+            observation.status == problems::ProblemStatus::kMastered,
+            "problem-study observation status") ||
+        !Require(observation.schedule.present, "problem-study schedule projection") ||
+        !Require(observation.schedule.interval_days == 3, "problem-study interval") ||
+        !Require(observation.schedule.repetition_number == 2, "problem-study repetition") ||
+        !Require(observation.projection_applied, "problem-study projection applied") ||
+        !Require(!observation.replayed, "problem-study not replayed")) {
+        return false;
+    }
+    if (!Require(
+            problems::ParseObservationResponse(
+                kProblemObservationSkipV1,
+                "req_problem_observe_02",
+                &observation,
+                &error) == ESP_OK,
+            "problem-study skip fixture") ||
+        !Require(
+            observation.action == problems::ReviewAction::kSkip,
+            "problem-study skip action") ||
+        !Require(!observation.schedule.present, "problem-study skip null schedule") ||
+        !Require(!observation.projection_applied, "problem-study skip no projection")) {
+        return false;
+    }
+    if (!Require(
+            problems::ParseObservationResponse(
+                kProblemObservationBadActionV1,
+                "req_problem_observe_03",
+                &observation,
+                &error) == ESP_ERR_INVALID_RESPONSE,
+            "problem-study rejects unknown action")) {
+        return false;
+    }
+
+    wqn::protocol::v3::RequestMetadata metadata;
+    metadata.request_id = "req_problem_manifest_01";
+    metadata.boot_id = "boot_problem_study_01";
+    metadata.firmware_version = "0.1.0-contract";
+    std::string body;
+    if (!Require(
+            problems::BuildManifestRequest(metadata, 0, 50, &body) == ESP_OK,
+            "problem-study manifest request build") ||
+        !Require(
+            body.find("\"cursor\":\"0\"") != std::string::npos,
+            "problem-study cursor encoded exactly") ||
+        !Require(
+            body.find("problem.study.v1") != std::string::npos,
+            "problem-study capability advertised")) {
+        return false;
+    }
+
+    problems::ObservationRequest observe_request;
+    observe_request.metadata = metadata;
+    observe_request.metadata.request_id = "req_problem_observe_01";
+    observe_request.problem_id = "33333333-3333-4333-8333-333333333333";
+    observe_request.action = problems::ReviewAction::kHesitant;
+    observe_request.occurred_at = "2026-07-28T03:20:00.000Z";
+    if (!Require(
+            problems::BuildObservationRequest(observe_request, &body) == ESP_OK,
+            "problem-study observation request build") ||
+        !Require(
+            body.find("\"action\":\"hesitant\"") != std::string::npos,
+            "problem-study action encoded") ||
+        !Require(
+            body.find("\"problem_id\":\"33333333-3333-4333-8333-333333333333\"") !=
+                std::string::npos,
+            "problem-study problem id encoded")) {
+        return false;
+    }
+    observe_request.problem_id = "not-a-uuid";
+    if (!Require(
+            problems::BuildObservationRequest(observe_request, &body) ==
+                ESP_ERR_INVALID_ARG,
+            "problem-study refuses invalid problem id")) {
+        return false;
+    }
+
+    // Pack row parsing: the same JSONL record the cloud freezes in
+    // contracts/problem-study-v1 fixtures, both scan and body modes.
+    wqn::WqnProblemEntry entry;
+    if (!Require(
+            wqn::ParseProblemRecordLine(kProblemPackRowV1, &entry, true) == ESP_OK,
+            "problem pack row parses") ||
+        !Require(entry.problem_id == "33333333-3333-4333-8333-333333333333", "pack row id") ||
+        !Require(entry.title == "生物遗传综合题", "pack row title") ||
+        !Require(
+            entry.status == problems::ProblemStatus::kWrong,
+            "pack row status") ||
+        !Require(!entry.is_optional, "pack row optional flag") ||
+        !Require(entry.parts.size() == 3, "pack row part count") ||
+        !Require(entry.parts[0].index == 1, "pack row part index") ||
+        !Require(entry.parts[0].type == "single_choice", "pack row part type") ||
+        !Require(entry.parts[0].full_marks == 6, "pack row part marks") ||
+        !Require(entry.parts[0].answer_text == "B", "pack row flattened answer") ||
+        !Require(entry.parts[2].answer_text.empty(), "pack row essay empty answer") ||
+        !Require(entry.image_ids.size() == 1, "pack row image ids") ||
+        !Require(entry.solution_image_ids.size() == 1, "pack row solution image ids") ||
+        !Require(
+            entry.image_ids[0] ==
+                "9e00e194c412bff778bfd1235b3b2b25a4f7f8b1d3ef1c72fca11d21b36d1e05",
+            "pack row image id value")) {
+        return false;
+    }
+    if (!Require(
+            wqn::ParseProblemRecordLine(kProblemPackRowV1, &entry, false) == ESP_OK,
+            "problem pack row scan parses") ||
+        !Require(entry.parts.empty(), "pack row scan skips part bodies") ||
+        !Require(entry.content_text.empty(), "pack row scan skips content") ||
+        !Require(entry.image_ids.size() == 1, "pack row scan keeps image counts")) {
+        return false;
+    }
+    return true;
+}
+
 bool CheckAiStreamHttpFailures()
 {
     return Require(
@@ -1116,9 +1409,11 @@ bool RunContractFixtureSelfTest()
         CheckUnauthorizedError() &&
         CheckV3ControlContract() &&
         CheckWordStudyV1Contract() &&
+        CheckProblemStudyV1Contract() &&
         CheckAiStreamHttpFailures() &&
         RunWordPageStateSelfTest() &&
-        RunNotePageStateSelfTest();
+        RunNotePageStateSelfTest() &&
+        RunProblemPageStateSelfTest();
 
     if (ok) {
         ESP_LOGI(kTag, "contract fixture self-test passed");

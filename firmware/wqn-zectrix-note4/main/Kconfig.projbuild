@@ -73,7 +73,7 @@ menu "WQN firmware"
 
     config WQN_EPD_IDLE_POWER_OFF_MS
         int "Power off EPD rail after UI idle milliseconds"
-        default 1500
+        default 5000
         range 0 600000
         depends on WQN_EPD_UI_ENABLE
         help

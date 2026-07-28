@@ -15,6 +15,7 @@ enum class RefreshSchedule;
 struct TodoCloudResult;
 struct WordCloudResult;
 struct NoteCloudResult;
+struct ProblemCloudResult;
 
 // Every source which is allowed to mutate AppState has a typed entry point in
 // UiRuntime.  The enum is also emitted in structured logs so event/revision
@@ -25,6 +26,7 @@ enum class AppEventKind : uint8_t {
     kTodoCloudResult,
     kWordCloudResult,
     kNoteCloudResult,
+    kProblemCloudResult,
     kTimeTick,
     kAiTick,
     kAiStreamingSnapshot,
@@ -63,6 +65,7 @@ public:
     UiUpdate DispatchTodoCloudResult(const TodoCloudResult& result);
     UiUpdate DispatchWordCloudResult(WordCloudResult& result);
     UiUpdate DispatchNoteCloudResult(NoteCloudResult& result);
+    UiUpdate DispatchProblemCloudResult(ProblemCloudResult& result);
     UiUpdate DispatchTimeTick(int64_t now_ms);
     UiUpdate DispatchAiTick(int64_t now_ms);
     UiUpdate DispatchAiStreamingSnapshot(const wqn::AiStreamingStatusView& view);
@@ -90,6 +93,17 @@ public:
         wqn::DurableNoteObservation* observation,
         wqn::PersistedNoteSession* advanced_session);
     void RestoreNoteObservationEffect();
+    bool TakeProblemImageRequest(
+        std::string* problem_id,
+        bool* is_solution,
+        uint8_t* image_index,
+        std::string* image_id);
+    void RestoreProblemImageRequest();
+    bool TakeProblemVerdictEffect(
+        const std::string& request_id,
+        const std::string& occurred_at,
+        wqn::DurableProblemObservation* observation);
+    void RestoreProblemVerdictEffect();
 
 private:
     UiUpdate FinishEvent(

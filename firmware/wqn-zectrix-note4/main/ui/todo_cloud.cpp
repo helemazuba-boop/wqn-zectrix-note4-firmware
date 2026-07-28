@@ -25,6 +25,7 @@ void FinishTodoCloudRequest()
     // Release the lease before publishing idle. A producer that observes
     // idle can then safely acquire a fresh lease without racing this reset.
     g_todo_sleep_lease.Reset();
+    ClearCloudDomainBusyWatch(CloudDomain::kTodo);
     g_todo_cloud_busy.store(false, std::memory_order_release);
 }
 

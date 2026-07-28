@@ -25,6 +25,8 @@ const char* AppEventKindName(AppEventKind event)
             return "word-result";
         case AppEventKind::kNoteCloudResult:
             return "note-result";
+        case AppEventKind::kProblemCloudResult:
+            return "problem-result";
         case AppEventKind::kTimeTick:
             return "time-tick";
         case AppEventKind::kAiTick:
@@ -195,6 +197,47 @@ bool UiRuntime::TakeNoteObservationEffect(
 void UiRuntime::RestoreNoteObservationEffect()
 {
     wqn::RestoreNoteObservationEffect(&state_.note_app);
+}
+
+UiUpdate UiRuntime::DispatchProblemCloudResult(ProblemCloudResult& result)
+{
+    const bool changed = ApplyProblemCloudResult(&state_, result);
+    // Mode/content transitions repaint most of the panel; commit here so the
+    // full refresh clears any large-partial ghosting (same rule as note).
+    const RefreshSchedule refresh =
+        changed && state_.screen == wqn::UiScreen::kNote
+            ? RefreshSchedule::kCommit
+            : RefreshSchedule::kNone;
+    return FinishEvent(AppEventKind::kProblemCloudResult, refresh, changed);
+}
+
+bool UiRuntime::TakeProblemImageRequest(
+    std::string* problem_id,
+    bool* is_solution,
+    uint8_t* image_index,
+    std::string* image_id)
+{
+    return wqn::TakeProblemImageRequest(
+        &state_.problem_app, problem_id, is_solution, image_index, image_id);
+}
+
+void UiRuntime::RestoreProblemImageRequest()
+{
+    wqn::RestoreProblemImageRequest(&state_.problem_app);
+}
+
+bool UiRuntime::TakeProblemVerdictEffect(
+    const std::string& request_id,
+    const std::string& occurred_at,
+    wqn::DurableProblemObservation* observation)
+{
+    return wqn::TakeProblemVerdictEffect(
+        &state_.problem_app, request_id, occurred_at, observation);
+}
+
+void UiRuntime::RestoreProblemVerdictEffect()
+{
+    wqn::RestoreProblemVerdictEffect(&state_.problem_app);
 }
 
 UiUpdate UiRuntime::DispatchTimeTick(int64_t now_ms)
@@ -383,6 +426,7 @@ UiUpdate UiRuntime::DispatchSyncResult(const wqn::services::SyncEvent& event)
             status = "同步完成";
             wqn::RefreshWordOutboxState(&state_.word_app);
             wqn::RefreshNoteOutboxState(&state_.note_app);
+            wqn::RefreshProblemOutboxState(&state_.problem_app);
             break;
         case wqn::services::SyncEventStatus::kAwaitingClaim:
             status = "等待配对";

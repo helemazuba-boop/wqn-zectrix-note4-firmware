@@ -28,6 +28,7 @@ constexpr char kProblemsKey[] = "problems";
 constexpr char kPendingReviewsKey[] = "pending_reviews";
 constexpr char kAiSessionKey[] = "ai_session_day";
 constexpr char kAutoSyncIntervalMinKey[] = "sync_min";
+constexpr char kDefaultWordDeckKey[] = "word_deck";
 constexpr char kWifiSsidKey[] = "wifi_ssid";
 constexpr char kWifiPasswordKey[] = "wifi_pass";
 constexpr char kControlConfigRevisionKey[] = "v3_cfg_rev";
@@ -989,6 +990,39 @@ esp_err_t SaveAutoSyncIntervalMinutes(uint32_t minutes)
         return ESP_ERR_INVALID_ARG;
     }
     return SaveU64ToNvs(kAutoSyncIntervalMinKey, minutes);
+}
+
+esp_err_t LoadDefaultWordDeckId(std::string* deck_id)
+{
+    if (deck_id == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    deck_id->clear();
+    // LoadStringFromNvs maps a missing key to ESP_OK + empty (unset = all
+    // decks).
+    const esp_err_t result = LoadStringFromNvs(kDefaultWordDeckKey, deck_id);
+    if (result == ESP_OK && !deck_id->empty() && deck_id->size() != 36) {
+        // Anything but a UUID is treated as unset rather than poisoning the
+        // word scope forever.
+        deck_id->clear();
+    }
+    return result;
+}
+
+esp_err_t SaveDefaultWordDeckId(const std::string& deck_id)
+{
+    StorageWriteGuard write("save-word-deck", __FILE__, __LINE__);
+    if (!write) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (deck_id.empty()) {
+        // Empty selection = all decks; drop the key entirely.
+        return ClearNvsKey(kDefaultWordDeckKey);
+    }
+    if (deck_id.size() != 36) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    return SaveStringToNvs(kDefaultWordDeckKey, deck_id);
 }
 
 std::string AutoSyncIntervalLabel(uint32_t minutes)

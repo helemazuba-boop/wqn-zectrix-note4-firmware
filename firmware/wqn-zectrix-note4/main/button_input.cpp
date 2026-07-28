@@ -13,7 +13,12 @@ constexpr gpio_num_t kConfirmPin = GPIO_NUM_0;
 
 constexpr int64_t kDebounceMs = 40;
 constexpr int64_t kHoldPressMs = 200;  // [mistouch] Flash PTT start threshold
-constexpr int64_t kLongPressMs = 1000;
+// [feel] Long presses fire while the button is still held (no release wait),
+// so this threshold is the whole long-press latency. 1000 ms read as "is it
+// broken?": HIL logs show users giving up mid-hold at ~930 ms and getting a
+// stray short press instead. 650 ms catches those holds while staying above
+// the slowest observed intentional short press (~630 ms).
+constexpr int64_t kLongPressMs = 650;
 constexpr int64_t kLongPressRepeatMs = 260;
 constexpr int64_t kDoublePressWindowMs = 300;
 
@@ -178,12 +183,17 @@ ButtonEvent PollButtonInput()
 
         if (button.raw_pressed && button.stable_pressed && now_ms - button.stable_changed_at_ms >= kLongPressMs &&
             (!button.long_press_reported || now_ms - button.last_long_press_event_at_ms >= kLongPressRepeatMs)) {
+            // [longpress-fix] Mark auto-repeats explicitly; duration-based
+            // inference at the consumer broke when this threshold changed.
+            const bool is_repeat = button.long_press_reported;
             button.long_press_reported = true;
             button.last_long_press_event_at_ms = now_ms;
-            return MakeEvent(
+            wqn::ButtonEvent event = MakeEvent(
                 button.id,
                 ButtonEventType::kLongPress,
                 now_ms - button.stable_changed_at_ms);
+            event.repeat = is_repeat;
+            return event;
         }
     }
 

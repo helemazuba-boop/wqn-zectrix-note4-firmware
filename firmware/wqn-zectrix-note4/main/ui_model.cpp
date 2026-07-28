@@ -353,6 +353,7 @@ void RenderNote(const wqn::UiState& state, wqn::UiFrame* frame)
         return;
     }
     frame->note_app = wqn::BuildNoteAppSnapshot(state.note_app);
+    frame->problem_app = wqn::BuildProblemAppSnapshot(state.problem_app);
 }
 
 void RenderLibrary(const wqn::UiState& state, wqn::UiFrame* frame)
@@ -546,8 +547,8 @@ void ClampUiSelection(UiState* state)
     } else if (state->todo.selected >= state->todo.todos.size()) {
         state->todo.selected = state->todo.todos.size() - 1;
     }
-    if (state->settings.selected >= 6) {
-        state->settings.selected = 5;
+    if (state->settings.selected >= 8) {
+        state->settings.selected = 7;
     }
     const size_t ai_pages = AiSessionPageCount(state->ai);
     if (state->ai.page >= ai_pages) {
@@ -580,7 +581,11 @@ void HandleUiInput(UiState* state, UiInput input)
                 HandleWordAppInput(&state->word_app, WordInput::kUp);
                 break;
             } else if (state->screen == UiScreen::kNote) {
-                HandleNoteAppInput(&state->note_app, NoteInput::kUp);
+                if (state->problem_app.active) {
+                    HandleProblemAppInput(&state->problem_app, ProblemInput::kUp);
+                } else {
+                    HandleNoteAppInput(&state->note_app, NoteInput::kUp);
+                }
                 break;
             } else if (state->screen == UiScreen::kAi) {
                 if (state->ai.page > 0) {
@@ -613,7 +618,11 @@ void HandleUiInput(UiState* state, UiInput input)
                 HandleWordAppInput(&state->word_app, WordInput::kDown);
                 break;
             } else if (state->screen == UiScreen::kNote) {
-                HandleNoteAppInput(&state->note_app, NoteInput::kDown);
+                if (state->problem_app.active) {
+                    HandleProblemAppInput(&state->problem_app, ProblemInput::kDown);
+                } else {
+                    HandleNoteAppInput(&state->note_app, NoteInput::kDown);
+                }
                 break;
             } else if (state->screen == UiScreen::kAi) {
                 if (state->ai.page + 1 < AiSessionPageCount(state->ai)) {
@@ -624,7 +633,7 @@ void HandleUiInput(UiState* state, UiInput input)
             } else if (state->screen == UiScreen::kTodo && state->todo.selected + 1 < state->todo.todos.size()) {
                 ++state->todo.selected;
             } else if (state->screen == UiScreen::kSettings) {
-                if (state->settings.selected + 1 < 6) {
+                if (state->settings.selected + 1 < 8) {
                     ++state->settings.selected;
                 }
             } else if (state->screen == UiScreen::kReviewScore) {
@@ -644,7 +653,36 @@ void HandleUiInput(UiState* state, UiInput input)
                 HandleWordAppInput(&state->word_app, WordInput::kConfirm);
                 break;
             } else if (state->screen == UiScreen::kNote) {
+                if (state->problem_app.active) {
+                    HandleProblemAppInput(&state->problem_app, ProblemInput::kConfirm);
+                    break;
+                }
                 HandleNoteAppInput(&state->note_app, NoteInput::kConfirm);
+                // Selecting a [题] row opens the problem layer synchronously:
+                // it browses the local pack index, no network involved.
+                std::string requested_set_id;
+                if (TakeNoteProblemSetOpenRequest(&state->note_app, &requested_set_id)) {
+                    if (!ActivateProblemBrowse(&state->problem_app, requested_set_id)) {
+                        state->note_app.message = state->problem_app.message;
+                    }
+                }
+                // Selecting a [词] row scopes the word page to that deck and
+                // switches screens; the word page's own UI takes over.
+                std::string requested_deck_id;
+                if (TakeNoteWordDeckOpenRequest(&state->note_app, &requested_deck_id)) {
+                    state->word_app.scoped_deck_id = requested_deck_id;
+                    state->word_app.scoped_deck_title.clear();
+                    for (const WordDeckInfo& deck : state->word_app.deck_catalog) {
+                        if (deck.deck_id == requested_deck_id) {
+                            state->word_app.scoped_deck_title = deck.title;
+                            break;
+                        }
+                    }
+                    // The restored session is pinned to the previous scope;
+                    // starting the deck study must not resume it.
+                    ResetWordSessionsForScopeChange(&state->word_app, true);
+                    state->screen = UiScreen::kWord;
+                }
                 break;
             } else if (state->screen == UiScreen::kHome) {
                 if (state->selected_home_task == 1) {
@@ -681,9 +719,13 @@ void HandleUiInput(UiState* state, UiInput input)
                 }
                 break;
             } else if (state->screen == UiScreen::kNote) {
-                // Long-press = universal back. At the notebook list (top level)
-                // exit to the device home; deeper levels pop one level.
-                if (state->note_app.mode == NoteAppMode::kNotebookList) {
+                // Long-press = universal back. The problem layer owns its own
+                // escape chain (弹窗→题目→标题列表→混排列表); at the notebook
+                // list (top level) exit to the device home; deeper note levels
+                // pop one level.
+                if (state->problem_app.active) {
+                    HandleProblemAppInput(&state->problem_app, ProblemInput::kLongConfirm);
+                } else if (state->note_app.mode == NoteAppMode::kNotebookList) {
                     state->screen = UiScreen::kHome;
                 } else {
                     HandleNoteAppInput(&state->note_app, NoteInput::kLongConfirm);
@@ -737,6 +779,18 @@ void HandleUiInput(UiState* state, UiInput input)
     if (screen_before == wqn::UiScreen::kNote &&
         state->screen != wqn::UiScreen::kNote) {
         ReleaseNoteImagePayload(&state->note_app);
+        ReleaseProblemImagePayload(&state->problem_app);
+    }
+    // Leaving the word screen drops the [词]-row deck override so the next
+    // direct entry studies the settings default again. The session built for
+    // the scoped deck is dropped with it (progress lives in the observation
+    // outbox; the session is only a browse cursor).
+    if (screen_before == wqn::UiScreen::kWord &&
+        state->screen != wqn::UiScreen::kWord &&
+        !state->word_app.scoped_deck_id.empty()) {
+        state->word_app.scoped_deck_id.clear();
+        state->word_app.scoped_deck_title.clear();
+        ResetWordSessionsForScopeChange(&state->word_app, true);
     }
 #if CONFIG_WQN_AI_ENABLE
     // Leaving the AI screen while in Flash tier must tear down the WebSocket

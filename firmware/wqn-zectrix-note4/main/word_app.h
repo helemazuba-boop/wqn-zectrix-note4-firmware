@@ -82,6 +82,14 @@ struct WordOutboxState {
     size_t capacity = kWordObservationOutboxCapacity;
 };
 
+// One mounted deck (manifest title + entry count). The settings dialog and
+// the note screen's mixed [词] rows both render from this catalog.
+struct WordDeckInfo {
+    std::string deck_id;
+    std::string title;
+    size_t entry_count = 0;
+};
+
 struct WordAppState {
     bool initialized = false;
     WordAppMode mode = WordAppMode::kHome;
@@ -126,6 +134,15 @@ struct WordAppState {
     bool sequential_session_resumable = false;
     bool random_session_resumable = false;
     std::string message;
+
+    // Study scope: the NVS-backed default deck (empty = all decks) and the
+    // transient override set when a [词] row on the note screen opens a
+    // specific deck. scoped wins over default; dictionary stays cross-deck.
+    std::string default_deck_id;
+    std::string default_deck_title;
+    std::string scoped_deck_id;
+    std::string scoped_deck_title;
+    std::vector<WordDeckInfo> deck_catalog;
 };
 
 struct WordAppSnapshot {
@@ -170,6 +187,23 @@ struct WordAppSnapshot {
 esp_err_t InitWordApp(WordAppState* state);
 esp_err_t HandleWordAppInput(WordAppState* state, WordInput input);
 void ApplyWordPackIndex(WordAppState* state, WordPackIndex index, const std::string& message);
+// Loads the mounted deck catalog (manifest titles + entry counts, deleted
+// decks skipped). Safe on any task; a missing manifest yields an empty list.
+esp_err_t BuildWordDeckCatalog(std::vector<WordDeckInfo>* catalog);
+// Installs a catalog and re-resolves the default deck title; a default that
+// no longer exists in a non-empty catalog falls back to all decks in memory.
+void InstallWordDeckCatalog(WordAppState* state, std::vector<WordDeckInfo> catalog);
+// Applies a settings change: remembers id/title and clears both when the id
+// is empty (全部词库).
+void SetDefaultWordDeck(
+    WordAppState* state, const std::string& deck_id, const std::string& title);
+// Invalidates the study sessions after the deck scope changed (settings
+// default switch or a [词]-row entry): the old session is pinned to the old
+// scope, so resuming it would keep studying the previous deck set. Returns
+// to the word home; clear_persisted also drops the durable
+// sequential/random records (the dictionary session is cross-deck and
+// survives).
+void ResetWordSessionsForScopeChange(WordAppState* state, bool clear_persisted);
 bool ApplyWordSearchResult(
     WordAppState* state,
     const std::string& query,

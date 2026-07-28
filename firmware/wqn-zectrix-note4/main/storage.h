@@ -78,6 +78,11 @@ esp_err_t ClearAiSession();
 esp_err_t LoadAutoSyncIntervalMinutes(uint32_t* minutes);
 esp_err_t SaveAutoSyncIntervalMinutes(uint32_t minutes);
 std::string AutoSyncIntervalLabel(uint32_t minutes);
+// Default word deck for the device (empty = all decks). The word page's
+// study sessions scope to it; the other decks enter via the note screen's
+// mixed [词] rows.
+esp_err_t LoadDefaultWordDeckId(std::string* deck_id);
+esp_err_t SaveDefaultWordDeckId(const std::string& deck_id);
 esp_err_t LoadVolumePercent(int* percent);
 esp_err_t SaveVolumePercent(int percent);
 std::string VolumeLabel(int percent);

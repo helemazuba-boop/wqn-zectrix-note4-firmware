@@ -8,6 +8,7 @@ idf_component_register(
     REQUIRES
         driver
         esp_hw_support
+        esp_system
         esp_timer
         freertos
         power_runtime

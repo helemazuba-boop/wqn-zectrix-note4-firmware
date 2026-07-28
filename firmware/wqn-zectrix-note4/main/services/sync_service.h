@@ -59,6 +59,9 @@ void RequestWordOutboxUpload();
 // Uploads durable `opened` note observations after the same quiet period. Note
 // and word share one outbox round; this is the trigger for the note-open path.
 void RequestNoteOutboxUpload();
+// Requests an upload of pending problem verdicts (same quiet-window trigger;
+// all three durable queues drain in one outbox-only round).
+void RequestProblemOutboxUpload();
 void GetSyncSnapshot(SyncSnapshot* snapshot);
 TickType_t GetConfiguredSyncDelayTicks();
 bool HasUsableStoredToken();
