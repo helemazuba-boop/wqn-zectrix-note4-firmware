@@ -29,6 +29,12 @@ constexpr int kFastRetryLimit = 5;
 constexpr int64_t kFastRetryDelayUs = 5LL * 1000 * 1000;
 constexpr int64_t kBackoffDelayUs = 60LL * 1000 * 1000;
 constexpr size_t kMaxSsidBytes = 32;
+// [hang-fix] Bound for callers that submit commands from the UI or sync
+// tasks. If ConnectivityTask wedges inside the Wi-Fi driver or LwIP, the
+// submitting thread must get ESP_ERR_TIMEOUT back instead of hanging
+// forever on g_call_mutex / the reply queue. 30 s matches the STA connect
+// budget (kWifiConnectTimeout in wqn_api.cpp).
+constexpr TickType_t kSubmitCommandTimeout = pdMS_TO_TICKS(30000);
 constexpr size_t kMaxPasswordBytes = 64;
 constexpr EventBits_t kOnlineBit = BIT0;
 
@@ -647,7 +653,7 @@ esp_err_t StartConnectivity()
 {
     ConnectivityCommand command;
     command.type = CommandType::kStart;
-    return SubmitCommand(command, portMAX_DELAY);
+    return SubmitCommand(command, kSubmitCommandTimeout);
 }
 
 esp_err_t StartConnectivityWithCredentials(const char* ssid, const char* password)
@@ -660,7 +666,7 @@ esp_err_t StartConnectivityWithCredentials(const char* ssid, const char* passwor
     command.type = CommandType::kStartWithCredentials;
     CopyCredential(command.ssid, sizeof(command.ssid), ssid);
     CopyCredential(command.password, sizeof(command.password), password);
-    return SubmitCommand(command, portMAX_DELAY);
+    return SubmitCommand(command, kSubmitCommandTimeout);
 }
 
 esp_err_t WaitForConnectivity(TickType_t timeout)
@@ -696,7 +702,7 @@ void SetConnectivityProvisioning()
 {
     ConnectivityCommand command;
     command.type = CommandType::kBeginProvisioning;
-    ESP_ERROR_CHECK_WITHOUT_ABORT(SubmitCommand(command, portMAX_DELAY));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(SubmitCommand(command, kSubmitCommandTimeout));
 }
 
 ConnectivitySnapshot GetConnectivitySnapshot()

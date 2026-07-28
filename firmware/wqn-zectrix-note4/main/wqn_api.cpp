@@ -24,6 +24,7 @@
 #include "esp_mac.h"
 #include "esp_netif_sntp.h"
 #include "esp_task_wdt.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "mbedtls/sha256.h"
@@ -405,6 +406,14 @@ esp_err_t HttpRequest(
         ESP_LOGW(kTag, "HTTP response has unknown content length");
     }
 
+    // [hang-fix] Overall read deadline. esp_http_client_read only bounds a
+    // single socket read (timeout_ms); a slow-drip peer or hijacking gateway
+    // that keeps trickling bytes could otherwise stretch one call
+    // indefinitely -- and every cloud domain shares the runner lane behind
+    // this call. 3x the per-read timeout comfortably covers the largest
+    // legitimate JSON payloads at ~2 KB per read.
+    const int64_t read_deadline_us =
+        esp_timer_get_time() + static_cast<int64_t>(timeout_ms) * 3 * 1000;
     std::array<char, 512> buffer = {};
     while (true) {
         const int read = esp_http_client_read(client, buffer.data(), buffer.size() - 1);
@@ -416,6 +425,11 @@ esp_err_t HttpRequest(
             break;
         }
         response_body->append(buffer.data(), read);
+        if (esp_timer_get_time() >= read_deadline_us) {
+            ESP_LOGW(kTag, "HTTP read exceeded overall deadline (%d ms x3)", timeout_ms);
+            result = ESP_ERR_TIMEOUT;
+            break;
+        }
     }
 
     esp_http_client_close(client);
@@ -515,6 +529,12 @@ esp_err_t HttpBinaryPost(
         ESP_LOGW(kTag, "AI HTTP response has unknown content length");
     }
 
+    // [hang-fix] Same overall-deadline guard as HttpCall. 120 s bounds the
+    // read phase: the ASR+LLM pipeline streams its answer well within two
+    // minutes once headers arrive; the 10-minute timeout_ms only budgets the
+    // server-side processing gap before the first byte.
+    const int64_t read_deadline_us =
+        esp_timer_get_time() + 120LL * 1000 * 1000;
     std::array<char, 512> buffer = {};
     while (true) {
         const int read = esp_http_client_read(client, buffer.data(), buffer.size() - 1);
@@ -527,6 +547,11 @@ esp_err_t HttpBinaryPost(
         }
         response_body->append(buffer.data(), read);
         FeedTaskWatchdogIfSubscribed();
+        if (esp_timer_get_time() >= read_deadline_us) {
+            ESP_LOGW(kTag, "AI HTTP read exceeded overall deadline (120 s)");
+            result = ESP_ERR_TIMEOUT;
+            break;
+        }
     }
 
     esp_http_client_close(client);

@@ -361,8 +361,16 @@ bool HasRegisteredResources(uint32_t session_id)
 
 esp_err_t DrainDriverOperations(int64_t deadline_us)
 {
+    // [hang-fix] A non-positive deadline would disable the timeout check and
+    // turn this into an unbounded spin if an aborted channel close ever
+    // leaves g_inflight_operations nonzero. No current caller passes 0, but
+    // the sleep path must never be able to spin forever, so clamp instead of
+    // trusting every future caller.
+    if (deadline_us <= 0) {
+        deadline_us = esp_timer_get_time() + kCallTimeoutUs;
+    }
     while (g_inflight_operations.load(std::memory_order_acquire) != 0) {
-        if (deadline_us > 0 && esp_timer_get_time() >= deadline_us) {
+        if (esp_timer_get_time() >= deadline_us) {
             return ESP_ERR_TIMEOUT;
         }
         vTaskDelay(1);
