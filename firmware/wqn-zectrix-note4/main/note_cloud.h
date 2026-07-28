@@ -28,4 +28,16 @@ struct NotePackSyncResult {
 // leases internally.
 esp_err_t SyncNotePacks(const std::string& token, NotePackSyncResult* out);
 
+// Targeted variant for a user who is actively waiting: opening a note whose
+// pack is not on disk. Pages the manifest only until `notebook_id` is found,
+// downloads that single pack, merges ONLY that notebook's manifest row (other
+// rows must keep their on-disk sha or the next index rebuild would fail their
+// verification), and rebuilds the index. Full-catalog convergence stays with
+// SyncNotePacks on its background cadence.
+esp_err_t SyncSingleNotebookPack(
+    const std::string& token,
+    const std::string& notebook_id,
+    NotePackSyncResult* out,
+    WqnTransferProgressSink progress = nullptr);
+
 }  // namespace wqn

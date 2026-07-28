@@ -1217,7 +1217,8 @@ esp_err_t AppendNotePackStream(void* opaque, const uint8_t* bytes, size_t size)
 esp_err_t DownloadNotePackToStorage(
     const std::string& token,
     const protocol::v3::RequestMetadata& metadata,
-    const WqnNotePackManifestNotebook& notebook)
+    const WqnNotePackManifestNotebook& notebook,
+    WqnTransferProgressSink progress)
 {
     if (!notebook.has_pack || notebook.pack_id.size() != 36 ||
         notebook.sha256.size() != 64 ||
@@ -1242,7 +1243,7 @@ esp_err_t DownloadNotePackToStorage(
         NotePackStreamTransaction, &context);
     if (result == ESP_OK) {
         result = DownloadNotePackStream(
-            token, metadata, notebook, AppendNotePackStream, &context);
+            token, metadata, notebook, AppendNotePackStream, &context, progress);
     }
     if (result == ESP_OK) {
         context.operation = NotePackStreamOperation::kCommit;

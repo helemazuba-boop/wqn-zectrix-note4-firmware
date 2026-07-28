@@ -160,9 +160,42 @@ esp_err_t RenderNoteList(const wqn::NoteAppSnapshot& note)
     return ESP_OK;
 }
 
+// [transfer-progress] Segmented download bar (5 cells, quantized upstream in
+// note_app). Style mirrors the settings volume bar: 1px outline + inner fill.
+// bucket <0 hides the bar entirely (cache hits, request not on the wire yet).
+void DrawTransferProgressBar(int y, int8_t bucket)
+{
+    if (bucket < 0) {
+        return;
+    }
+    constexpr int kBarWidth = 240;
+    constexpr int kBarHeight = 10;
+    const int x = kNoteMarginX + (kContentW - kBarWidth) / 2;
+    DrawRect(x, y, kBarWidth, kBarHeight);
+    const int clamped = bucket > 5 ? 5 : bucket;
+    const int filled = (kBarWidth - 2) * clamped / 5;
+    if (filled > 0) {
+        FillRect(x + 1, y + 1, filled, kBarHeight - 2, true);
+    }
+}
+
 esp_err_t RenderNoteBody(const wqn::NoteAppSnapshot& note)
 {
     if (!note.has_body) {
+        // [body-fetch] Opening a note whose pack is missing now dispatches a
+        // targeted single-notebook sync; mirror its state instead of the old
+        // dead-end "稍后再试" (which never resolved without leaving the page).
+        if (note.body_fetch_active) {
+            ESP_RETURN_ON_ERROR(
+                DrawCenteredText(kNoteMarginX, 160, kContentW, "正在同步内容…"),
+                kTag, "draw body sync text");
+            DrawTransferProgressBar(196, note.transfer_progress_bucket);
+            return ESP_OK;
+        }
+        if (note.body_fetch_failed) {
+            return DrawCenteredText(
+                kNoteMarginX, 160, kContentW, "同步失败，按确认重试");
+        }
         return DrawCenteredText(kNoteMarginX, 160, kContentW, "内容未同步，请稍后再试");
     }
     // The note title lives in the status bar, so the body uses full height.
@@ -225,13 +258,25 @@ esp_err_t RenderNoteToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
 
     // Full-screen image: the WQNI payload IS the frame (no status bar, no
     // margins), so blit it straight into the framebuffer and refresh.
-    if (note.mode == wqn::NoteAppMode::kNoteImageView && note.note_image_ready &&
+    // [status-bar-progress] A flip to a not-yet-downloaded image keeps the
+    // PREVIOUS image on screen (payload carried stale) with a slim top
+    // banner tracking the download, instead of a blocking loading page.
+    if (note.mode == wqn::NoteAppMode::kNoteImageView && !note.note_image_error &&
         note.note_image_wqni != nullptr &&
         note.note_image_wqni->size() ==
             wqn::kNoteImageHeaderBytes + static_cast<size_t>(wqn::kEpdFramebufferSize)) {
         wqn::BlitEpdFramebuffer(
             note.note_image_wqni->data() + wqn::kNoteImageHeaderBytes,
             static_cast<size_t>(wqn::kEpdFramebufferSize));
+        if (!note.note_image_ready) {
+            // White strip + segmented bar over the top edge of the stale
+            // image; the completed download repaints the full frame anyway.
+            FillRect(0, 0, wqn::kEpdWidth, 18, false);
+            FillRect(0, 18, wqn::kEpdWidth, 1, true);
+            DrawTransferProgressBar(4, note.transfer_progress_bucket >= 0
+                                           ? note.transfer_progress_bucket
+                                           : static_cast<int8_t>(0));
+        }
         return RefreshFrame(frame, schedule);
     }
 
@@ -256,6 +301,19 @@ esp_err_t RenderNoteToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
     const auto bar_lines = wqn::WrapUtf8TextToWidth(bar_title, wqn::kEpdWidth / 2, 1);
     DrawStatusBar(
         bar_lines.empty() ? bar_title.c_str() : bar_lines.front().c_str(), frame.home);
+    // [status-bar-progress] Download progress lives IN the status bar (the
+    // 4px slack under the text, above the separator at y=27): the user keeps
+    // reading/browsing the content below while the strip fills up.
+    if (note.transfer_progress_bucket >= 0 &&
+        note.mode != wqn::NoteAppMode::kNoteImageView) {
+        const int clamped = note.transfer_progress_bucket > 5
+                                ? 5
+                                : note.transfer_progress_bucket;
+        // Floor of 12px: the empty-bar phase (request armed, no bytes yet)
+        // must still be visible as the button acknowledgement.
+        const int filled = std::max(wqn::kEpdWidth * clamped / 5, 12);
+        FillRect(0, 22, filled, 4, true);
+    }
 
     switch (note.mode) {
         case wqn::NoteAppMode::kNotebookList:
@@ -284,6 +342,11 @@ esp_err_t RenderNoteToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
                     kNoteMarginX, 176, kContentW,
                     note.note_image_error ? "长按返回正文" : "长按可取消"),
                 kTag, "render note image status hint");
+            if (!note.note_image_error) {
+                // Segmented download progress; hidden (-1) on cache hits and
+                // while the request has not reached the wire yet.
+                DrawTransferProgressBar(208, note.transfer_progress_bucket);
+            }
             break;
     }
 

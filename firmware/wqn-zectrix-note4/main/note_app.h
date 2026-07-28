@@ -119,6 +119,24 @@ struct NoteAppState {
     WqnNoteEntry current_note;
     bool current_note_loaded = false;
 
+    // Targeted body-pack fetch (kNoteView opened a note whose pack is not on
+    // disk). Same take/restore/apply shape as the image fetch below: the user
+    // explicitly asked for this content, so the open turns into a foreground
+    // single-notebook sync instead of a passive "try again later" page.
+    bool body_fetch_request = false;
+    bool body_fetch_in_flight = false;
+    bool body_fetch_error = false;
+    std::string body_fetch_notebook_id;
+    // Confirm on a missing note stays on the LIST (the user keeps browsing
+    // instead of staring at a blocking wait page); these record the intent so
+    // a completed fetch auto-opens the note -- but only if the selection
+    // still points at it (item_id match, not index: pages append).
+    bool body_fetch_pending_open = false;
+    std::string body_fetch_pending_item_id;
+    // Dispatch time (us); the take path times out a fetch wedged in the
+    // network stack and re-arms it (mirrors image_dispatch_us).
+    int64_t body_fetch_dispatch_us = 0;
+
     // Full-screen image viewing (kNoteImageView). The WQNI bytes live behind a
     // shared_ptr so snapshots share them without copying 15 KB per frame and a
     // late replacement cannot tear a render in progress.
@@ -145,6 +163,14 @@ struct NoteAppState {
     bool cloud_sync_requested = false;
     bool cloud_sync_failed = false;
     bool cloud_loaded_once = false;
+    // [transfer-progress] Download-progress presentation for the two waiting
+    // pages (image loading / body-pack syncing). generation identifies the
+    // dispatch this UI is willing to consume from the runner-side mailbox;
+    // bucket is the quantized 0..5 fill (-1 hidden); repaint_us throttles
+    // e-ink repaints to one forward step per ~800 ms.
+    uint32_t transfer_progress_generation = 0;
+    int8_t transfer_progress_bucket = -1;
+    int64_t transfer_progress_repaint_us = 0;
     std::string message;
 };
 
@@ -170,6 +196,11 @@ struct NoteAppSnapshot {
     size_t note_list_window_start = 0;
     uint32_t note_scroll_offset_lines = 0;
     bool has_body = false;
+    // Body-pack fetch presentation: active shows "正在同步内容", failed shows
+    // the retry hint. Both must reach FrameSignature or the page freezes on
+    // the loading text (the classic missing-signature-field trap).
+    bool body_fetch_active = false;
+    bool body_fetch_failed = false;
     bool cloud_sync_failed = false;
     size_t notebook_count = 0;
     std::vector<NoteNotebookRow> notebooks;
@@ -188,6 +219,9 @@ struct NoteAppSnapshot {
     bool note_image_error = false;
     std::string note_image_id;
     std::shared_ptr<const std::vector<uint8_t>> note_image_wqni;
+    // Quantized download progress (-1 hidden, 0..5 segments) for the image
+    // loading page and the body "正在同步内容" page.
+    int8_t transfer_progress_bucket = -1;
     std::string status_line;
     std::string hint;
 };
@@ -237,8 +271,22 @@ bool TakeNoteImageRequest(
     NoteAppState* state,
     std::string* note_id,
     uint8_t* image_index,
-    std::string* image_id);
+    std::string* image_id,
+    uint32_t* progress_generation);
 void RestoreNoteImageRequest(NoteAppState* state);
+// Targeted single-notebook pack fetch for an opened-but-missing note body;
+// same take/restore/apply shape as the image path. Apply installs the rebuilt
+// index in place (even mid-browse) and reloads the open note's body.
+bool TakeNoteBodyFetchRequest(NoteAppState* state, std::string* notebook_id,
+                              uint32_t* progress_generation);
+void RestoreNoteBodyFetchRequest(NoteAppState* state);
+void ApplyNoteBodyFetchResult(
+    NoteAppState* state,
+    esp_err_t result,
+    NotePackIndex index,
+    bool index_ready,
+    bool auth_required,
+    const std::string& message);
 // Frees the held WQNI payload (used when the user leaves the note screen);
 // keeps request/in-flight bookkeeping intact.
 void ReleaseNoteImagePayload(NoteAppState* state);
@@ -254,6 +302,17 @@ bool TakeNoteObservationEffect(
     DurableNoteObservation* observation,
     PersistedNoteSession* advanced_session);
 void ApplyNoteObservationCommitResult(NoteAppState* state, esp_err_t result);
+// [transfer-progress] Folds one mailbox snapshot into the presentation state.
+// kind mirrors the ui-layer CloudTransferKind (0 none, 1 note image, 2
+// notebook pack). Returns true when the quantized bucket changed and the
+// waiting page should repaint (caller schedules a kTimer refresh).
+bool UpdateNoteTransferProgress(
+    NoteAppState* state,
+    uint8_t kind,
+    uint32_t generation,
+    uint32_t done_bytes,
+    uint32_t total_bytes,
+    int64_t now_us);
 // Re-arms a taken-but-not-dispatched observation effect (queue full/busy) so
 // the pump retries; the recorded request_id keeps the retry idempotent.
 void RestoreNoteObservationEffect(NoteAppState* state);
