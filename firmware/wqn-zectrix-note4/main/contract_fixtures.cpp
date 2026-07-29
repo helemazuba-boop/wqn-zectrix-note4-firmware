@@ -12,6 +12,7 @@
 #include "problem_app.h"
 #include "problem_pack.h"
 #include "text_render.h"
+#include "ui/markdown_layout.h"
 #include "word_app.h"
 #include "wqn_api.h"
 #include "wqn_api_stream_internal.h"
@@ -1387,6 +1388,96 @@ bool CheckAiStreamHttpFailures()
                "successful SSE stream remains successful");
 }
 
+// Exercises the note-body Markdown layout engine (ui/markdown_layout) over a
+// showcase covering every stage-1 element, asserting each adornment class is
+// produced and that the render/scroll-count paths agree. Runs on the UI-free
+// boot self-test so a layout regression fails fast instead of on-panel.
+bool CheckMarkdownLayout()
+{
+    using namespace device_ui_internal;
+    static const char kShowcase[] =
+        "# Heading 1\n"
+        "## Heading 2\n"
+        "### Heading 3\n"
+        "Normal **bold** and *italic* and ~~strike~~ text.\n"
+        "Inline `code` and a [link](https://example.com).\n"
+        "An image ![diagram](http://img/x.png) inline.\n"
+        "- item one\n"
+        "- item two\n"
+        "  - nested item\n"
+        "1. first\n"
+        "2. second\n"
+        "> quoted line\n"
+        ">> nested quote\n"
+        "---\n"
+        "```\ncode block\nsecond code line\n```\n"
+        "| A | B | C |\n|---|---|---|\n| 1 | 2 | 3 |\n";
+
+    const std::vector<MdLine> lines = LayoutMarkdown(kShowcase, 370);
+    if (!Require(!lines.empty(), "markdown layout produced rows") ||
+        !Require(
+            CountMarkdownLines(kShowcase, 370) == lines.size(),
+            "markdown count matches layout size")) {
+        return false;
+    }
+
+    bool has_rule = false, has_heading_underline = false, has_bullet = false;
+    bool has_code = false, has_quote = false, has_table = false, has_table_border = false;
+    bool has_underline = false, has_codebox = false, has_strike = false;
+    for (const MdLine& line : lines) {
+        has_rule |= line.kind == MdLineKind::kRule;
+        has_table |= line.kind == MdLineKind::kTableRow;
+        has_table_border |= line.kind == MdLineKind::kTableRow && line.border_top;
+        has_heading_underline |= line.rule_below;
+        has_bullet |= line.bullet != MdBullet::kNone;
+        has_code |= line.code;
+        has_quote |= line.quote_depth > 0;
+        for (const MdDecoration& deco : line.decorations) {
+            has_underline |= deco.kind == MdDecoKind::kUnderline;
+            has_codebox |= deco.kind == MdDecoKind::kCodeBox;
+            has_strike |= deco.kind == MdDecoKind::kStrike;
+        }
+    }
+
+    // A table wider than the native cap must degrade to plain text rows, never
+    // kTableRow (the renderer only draws <=4 column grids).
+    static const char kWideTable[] =
+        "| a | b | c | d | e |\n|---|---|---|---|---|\n| 1 | 2 | 3 | 4 | 5 |\n";
+    bool wide_downgraded = true;
+    for (const MdLine& line : LayoutMarkdown(kWideTable, 370)) {
+        if (line.kind == MdLineKind::kTableRow) wide_downgraded = false;
+    }
+
+    // A 4-column table of long cells still renders as a real grid (cells wrap,
+    // columns scale down) -- it must NOT be demoted to source-like text rows.
+    static const char kDenseTable[] =
+        "| 语法类别 | Markdown 源码示例 | 实际渲染效果说明 | 边界极端情况测试 |\n"
+        "| --- | --- | --- | --- |\n"
+        "| 基础文本样式演示 | 粗体斜体删除线组合 | 显示的渲染结果 | 各种极端组合测试 |\n";
+    bool dense_is_grid = false;
+    for (const MdLine& line : LayoutMarkdown(kDenseTable, 370)) {
+        if (line.kind == MdLineKind::kTableRow) dense_is_grid = true;
+    }
+
+    // Triple emphasis must strip completely; the old pairwise probe leaked a
+    // literal '*' on each side ("*粗斜体*").
+    const std::vector<MdLine> triple = LayoutMarkdown("***粗斜体***", 370);
+    const bool triple_clean = triple.size() == 1 && triple[0].text == "粗斜体";
+
+    return Require(has_rule, "markdown horizontal rule") &&
+           Require(has_heading_underline, "markdown heading underline") &&
+           Require(has_bullet, "markdown list bullet") &&
+           Require(has_code, "markdown code block") &&
+           Require(has_quote, "markdown blockquote bar") &&
+           Require(has_table && has_table_border, "markdown table with border") &&
+           Require(has_underline, "markdown link underline") &&
+           Require(has_codebox, "markdown inline code box") &&
+           Require(has_strike, "markdown strikethrough") &&
+           Require(wide_downgraded, "markdown wide table downgraded to text") &&
+           Require(dense_is_grid, "markdown dense 4-col table renders as grid") &&
+           Require(triple_clean, "markdown triple emphasis fully stripped");
+}
+
 }  // namespace
 
 namespace wqn {
@@ -1411,6 +1502,7 @@ bool RunContractFixtureSelfTest()
         CheckWordStudyV1Contract() &&
         CheckProblemStudyV1Contract() &&
         CheckAiStreamHttpFailures() &&
+        CheckMarkdownLayout() &&
         RunWordPageStateSelfTest() &&
         RunNotePageStateSelfTest() &&
         RunProblemPageStateSelfTest();

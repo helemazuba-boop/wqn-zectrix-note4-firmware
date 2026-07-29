@@ -5,6 +5,8 @@
 #include "ui_internal.h"
 #include "ui_widgets.h"
 
+#include "markdown_layout.h"
+
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
@@ -179,6 +181,78 @@ void DrawTransferProgressBar(int y, int8_t bucket)
     }
 }
 
+// Draws one laid-out Markdown row at y. All style is adornment (bars, bullets,
+// boxes, rules) over the single fixed-width face -- no font variation. The row
+// height is kBodyLineH; decorations are placed relative to the ~16px glyph box.
+esp_err_t DrawMarkdownLine(const MdLine& line, int y)
+{
+    const int base_x = kNoteMarginX + 2;
+    const int content_w = kContentW - 14;
+
+    if (line.kind == MdLineKind::kRule) {
+        DrawHorizontalLine(base_x, y + kBodyLineH / 2, content_w);
+        return ESP_OK;
+    }
+
+    if (line.kind == MdLineKind::kTableRow) {
+        if (line.border_top) {
+            DrawHorizontalLine(base_x, y, line.table_width);
+        }
+        for (const int16_t sx : line.col_seps) {
+            DrawVerticalLine(base_x + sx, y, kBodyLineH);
+        }
+        esp_err_t rc = ESP_OK;
+        for (const MdTableCell& cell : line.cells) {
+            if (cell.text.empty()) continue;
+            const esp_err_t r = DrawClippedText(
+                base_x + cell.x, y + 2, line.table_width - cell.x, cell.text);
+            if (r != ESP_OK) rc = r;
+        }
+        if (line.border_bottom) {
+            DrawHorizontalLine(base_x, y + kBodyLineH - 1, line.table_width);
+        }
+        return rc;
+    }
+
+    // kText: left rails (quote bars / code rule), then bullet, text, inline
+    // decorations, and an optional heading underline.
+    for (int d = 0; d < line.quote_depth; ++d) {
+        FillRect(base_x + d * 6, y, 2, kBodyLineH, true);
+    }
+    if (line.code) {
+        FillRect(base_x + 2, y, 1, kBodyLineH, true);
+    }
+    if (line.bullet == MdBullet::kFilledSquare) {
+        FillRect(base_x + line.bullet_x, y + 6, 5, 5, true);
+    } else if (line.bullet == MdBullet::kHollowSquare) {
+        DrawRect(base_x + line.bullet_x, y + 6, 5, 5);
+    }
+
+    const int text_x = base_x + line.indent_px;
+    esp_err_t rc = ESP_OK;
+    if (!line.text.empty()) {
+        rc = DrawClippedText(text_x, y, content_w - line.indent_px, line.text);
+    }
+    for (const MdDecoration& deco : line.decorations) {
+        const int dx = text_x + deco.x;
+        switch (deco.kind) {
+            case MdDecoKind::kUnderline:
+                DrawHorizontalLine(dx, y + 17, deco.w);
+                break;
+            case MdDecoKind::kStrike:
+                DrawHorizontalLine(dx, y + 8, deco.w);
+                break;
+            case MdDecoKind::kCodeBox:
+                DrawRect(dx - 1, y - 1, deco.w + 2, 18);
+                break;
+        }
+    }
+    if (line.rule_below) {
+        DrawHorizontalLine(text_x, y + 17, content_w - line.indent_px);
+    }
+    return rc;
+}
+
 esp_err_t RenderNoteBody(const wqn::NoteAppSnapshot& note)
 {
     if (!note.has_body) {
@@ -213,16 +287,17 @@ esp_err_t RenderNoteBody(const wqn::NoteAppSnapshot& note)
         body_top += kBodyLineH;
     }
     const int visible = std::max(1, (kBodyBottom - body_top) / kBodyLineH);
-    // Wrap the body once per opened note. Re-running WrapUtf8TextToWidth over a
-    // body of up to 16 KB on every frame pegged the CPU while scrolling; cache the
-    // wrapped lines keyed by note_id so scrolling only re-reads them.
-    static std::string s_wrapped_note_id;
-    static std::vector<std::string> s_wrapped_lines;
-    if (note.note_id != s_wrapped_note_id) {
-        s_wrapped_lines = wqn::WrapUtf8TextToWidth(note.note_body, kContentW - 14, 4096);
-        s_wrapped_note_id = note.note_id;
+    // Lay the body out (Markdown subset) once per opened note; scrolling only
+    // re-reads the cached rows. LayoutMarkdown is a pure fixed-width pass and
+    // MUST use the same width as note_app.cpp's scroll-clamp count (370 px), or
+    // Down-scroll clamps to the wrong last page.
+    static std::string s_layout_note_id;
+    static std::vector<MdLine> s_md_lines;
+    if (note.note_id != s_layout_note_id) {
+        s_md_lines = LayoutMarkdown(note.note_body, kContentW - 14);
+        s_layout_note_id = note.note_id;
     }
-    const std::vector<std::string>& lines = s_wrapped_lines;
+    const std::vector<MdLine>& lines = s_md_lines;
     const int total = static_cast<int>(lines.size());
     const int max_top = total > visible ? total - visible : 0;
     int top = static_cast<int>(note.note_scroll_offset_lines);
@@ -230,7 +305,7 @@ esp_err_t RenderNoteBody(const wqn::NoteAppSnapshot& note)
     if (top < 0) top = 0;
     for (int i = 0; i < visible && top + i < total; ++i) {
         ESP_RETURN_ON_ERROR(
-            DrawClippedText(kNoteMarginX + 2, body_top + i * kBodyLineH, kContentW - 14, lines[top + i]),
+            DrawMarkdownLine(lines[top + i], body_top + i * kBodyLineH),
             kTag, "draw note body line");
     }
     // Proportional scrollbar (font-independent) when the body overflows.

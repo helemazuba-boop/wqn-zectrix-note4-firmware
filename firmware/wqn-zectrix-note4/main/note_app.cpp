@@ -11,6 +11,7 @@
 #include "esp_timer.h"
 
 #include "display_service.h"
+#include "ui/markdown_layout.h"
 
 namespace {
 
@@ -149,11 +150,12 @@ void LoadCurrentNoteBody(wqn::NoteAppState* state)
             state->current_note.note_id.c_str(),
             static_cast<unsigned>(state->current_note.image_ids.size()),
             static_cast<unsigned>(state->current_note.content.size()));
-        // Precompute the wrapped line count with the SAME width as RenderNoteBody
-        // (ui/page_note.cpp: kContentW - 14 = kEpdWidth - 30 = 370 px) so the
-        // scroll handler can clamp Down to the last page.
+        // Precompute the Markdown row count with the SAME width and layout as
+        // RenderNoteBody (ui/page_note.cpp: kContentW - 14 = kEpdWidth - 30 =
+        // 370 px) so the scroll handler can clamp Down to the last page. Both
+        // sides MUST route through LayoutMarkdown or the offsets desync.
         state->note_body_total_lines = static_cast<uint32_t>(
-            wqn::WrapUtf8TextToWidth(state->current_note.content, 370, 4096).size());
+            device_ui_internal::CountMarkdownLines(state->current_note.content, 370));
     } else {
         ESP_LOGW(
             "note_app", "note open read failed: id=%.8s err=%s",
