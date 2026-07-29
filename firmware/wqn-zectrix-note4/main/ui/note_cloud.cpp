@@ -301,7 +301,8 @@ bool ApplyNoteCloudResult(wqn::UiState* state, NoteCloudResult& result)
     if (result.op == NoteCloudOp::kFetchNotebookPack) {
         wqn::ApplyNoteBodyFetchResult(
             &state->note_app, result.result, std::move(result.pack_index),
-            result.pack_index_ready, result.auth_required, result.message);
+            result.pack_index_ready, result.auth_required,
+            result.fetched_notebook_id, result.message);
         BuildHomeSummary(state);
         return true;
     }
@@ -377,6 +378,7 @@ void ExecuteNoteCloudRequest(const NoteCloudRequest& request)
         result.auth_required = sync.auth_required;
     } else if (request.op == NoteCloudOp::kFetchNotebookPack) {
         wqn::NotePackSyncResult sync;
+        result.fetched_notebook_id = request.notebook_id;
         BeginCloudTransferProgress(
             CloudTransferKind::kNotebookPack, request.progress_generation);
         result.result = wqn::SyncSingleNotebookPack(
