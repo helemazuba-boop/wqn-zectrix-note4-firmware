@@ -1100,12 +1100,24 @@ void ApplyNoteBodyFetchResult(
     NotePackIndex index,
     bool index_ready,
     bool auth_required,
+    const std::string& fetched_notebook_id,
     const std::string& message)
 {
     if (state == nullptr) return;
     state->body_fetch_in_flight = false;
-    const bool pending_open = state->body_fetch_pending_open;
-    state->body_fetch_pending_open = false;
+    // [crosswire-fix] This result may belong to a PREVIOUS notebook: the user
+    // can re-arm for notebook B while A's fetch is still in flight (browse on,
+    // confirm elsewhere). Only a matching result may consume the open intent
+    // or flip the error state -- a mismatched one still installs its index
+    // (A's pack landed, keep it durable) and then lets the pump dispatch the
+    // freshest request (body_fetch_request is still armed for B).
+    const bool matches_current =
+        !fetched_notebook_id.empty() &&
+        fetched_notebook_id == state->body_fetch_notebook_id;
+    const bool pending_open = matches_current && state->body_fetch_pending_open;
+    if (matches_current) {
+        state->body_fetch_pending_open = false;
+    }
     if (result == ESP_OK && index_ready) {
         // Install in place, even mid-browse: unlike the full-catalog sync
         // (which staged as pending until the notebook list), this index only
@@ -1138,7 +1150,8 @@ void ApplyNoteBodyFetchResult(
             state->message = "内容已就绪";
             return;
         }
-        if (state->mode == NoteAppMode::kNoteView && !state->current_note_loaded) {
+        if (matches_current && state->mode == NoteAppMode::kNoteView &&
+            !state->current_note_loaded) {
             // Defensive placeholder path (should not be reachable now that
             // confirm stays on the list, but a completed fetch must still
             // resolve it in place).
@@ -1151,6 +1164,13 @@ void ApplyNoteBodyFetchResult(
                 state->message = "云端暂无该笔记内容";
             }
         }
+        return;
+    }
+    if (!matches_current) {
+        ESP_LOGW(kTag,
+                 "stale note body fetch result dropped: %s nb=%.8s (now waiting %.8s)",
+                 esp_err_to_name(result), fetched_notebook_id.c_str(),
+                 state->body_fetch_notebook_id.c_str());
         return;
     }
     if ((state->mode == NoteAppMode::kNoteList && pending_open) ||

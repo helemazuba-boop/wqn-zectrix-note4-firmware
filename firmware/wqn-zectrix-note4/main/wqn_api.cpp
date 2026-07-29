@@ -2607,7 +2607,16 @@ esp_err_t DownloadWordPackStream(
     }
     size_t received = 0;
     std::array<uint8_t, 2048> buffer = {};
+    // [stream-deadline] Overall transfer budget: a slow-drip peer that
+    // sends one byte per socket timeout could otherwise pin the cloud
+    // lane indefinitely (per-read timeout_ms never fires).
+    const int64_t stream_deadline_us =
+        esp_timer_get_time() + 120LL * 1000 * 1000;
     while (result == ESP_OK && status_code == 200) {
+        if (esp_timer_get_time() >= stream_deadline_us) {
+            result = ESP_ERR_TIMEOUT;
+            break;
+        }
         const int read = esp_http_client_read(
             client,
             reinterpret_cast<char*>(buffer.data()),
@@ -2819,7 +2828,16 @@ esp_err_t DownloadNotePackStream(
     }
     size_t received = 0;
     std::array<uint8_t, 2048> buffer = {};
+    // [stream-deadline] Overall transfer budget: a slow-drip peer that
+    // sends one byte per socket timeout could otherwise pin the cloud
+    // lane indefinitely (per-read timeout_ms never fires).
+    const int64_t stream_deadline_us =
+        esp_timer_get_time() + 120LL * 1000 * 1000;
     while (result == ESP_OK && status_code == 200) {
+        if (esp_timer_get_time() >= stream_deadline_us) {
+            result = ESP_ERR_TIMEOUT;
+            break;
+        }
         const int read = esp_http_client_read(
             client,
             reinterpret_cast<char*>(buffer.data()),
@@ -2950,7 +2968,16 @@ esp_err_t DownloadNoteImageV1(
     // one was then discarded unread when the inflated buffer replaced it).
     wqni->reserve(4096);
     std::array<uint8_t, 2048> buffer = {};
+    // [stream-deadline] Overall transfer budget: a slow-drip peer that
+    // sends one byte per socket timeout could otherwise pin the cloud
+    // lane indefinitely (per-read timeout_ms never fires).
+    const int64_t stream_deadline_us =
+        esp_timer_get_time() + 30LL * 1000 * 1000;
     while (result == ESP_OK && status_code == 200) {
+        if (esp_timer_get_time() >= stream_deadline_us) {
+            result = ESP_ERR_TIMEOUT;
+            break;
+        }
         const int read = esp_http_client_read(
             client, reinterpret_cast<char*>(buffer.data()), buffer.size());
         FeedTaskWatchdogIfSubscribed();
@@ -3427,7 +3454,16 @@ esp_err_t DownloadProblemPackStream(
     }
     size_t received = 0;
     std::array<uint8_t, 2048> buffer = {};
+    // [stream-deadline] Overall transfer budget: a slow-drip peer that
+    // sends one byte per socket timeout could otherwise pin the cloud
+    // lane indefinitely (per-read timeout_ms never fires).
+    const int64_t stream_deadline_us =
+        esp_timer_get_time() + 120LL * 1000 * 1000;
     while (result == ESP_OK && status_code == 200) {
+        if (esp_timer_get_time() >= stream_deadline_us) {
+            result = ESP_ERR_TIMEOUT;
+            break;
+        }
         const int read = esp_http_client_read(
             client,
             reinterpret_cast<char*>(buffer.data()),
@@ -3551,7 +3587,16 @@ esp_err_t DownloadProblemImageV1(
     // Compressed body: typically a few KB, never the full plaintext size.
     wqni->reserve(4096);
     std::array<uint8_t, 2048> buffer = {};
+    // [stream-deadline] Overall transfer budget: a slow-drip peer that
+    // sends one byte per socket timeout could otherwise pin the cloud
+    // lane indefinitely (per-read timeout_ms never fires).
+    const int64_t stream_deadline_us =
+        esp_timer_get_time() + 30LL * 1000 * 1000;
     while (result == ESP_OK && status_code == 200) {
+        if (esp_timer_get_time() >= stream_deadline_us) {
+            result = ESP_ERR_TIMEOUT;
+            break;
+        }
         const int read = esp_http_client_read(
             client, reinterpret_cast<char*>(buffer.data()), buffer.size());
         FeedTaskWatchdogIfSubscribed();
