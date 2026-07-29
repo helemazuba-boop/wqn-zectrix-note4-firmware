@@ -37,12 +37,20 @@ if /I "%COM_PORT%"=="COM5" (
     exit /b 1
 )
 
-:: Step 0: Kill any existing monitor_serial.bat / monitor_serial.ps1
-::          so the COM port is free for flashing.
+:: Step 0: Kill any existing serial monitor so the COM port is free for flashing.
+::          The monitor is a "monitor_serial" cmd window whose CHILD PowerShell
+::          actually holds COM open, so we must terminate the whole tree:
+::            - taskkill /T matches the window title and kills its children too
+::              (plain /F without /T left the port-holding child alive).
+::            - The CIM sweep is a fallback that matches cmd.exe/powershell.exe by
+::              command line (excluding this script's own PowerShell via $PID).
+::          NOTE: the pipes below MUST stay as literal '|' inside the quoted
+::          -Command string. A caret '^|' is not an escape inside cmd double
+::          quotes; it would be passed verbatim to PowerShell and abort the whole
+::          command with a parse error (that was the previous bug).
 echo [Step 0] Stopping existing serial monitor...
-taskkill /F /FI "WINDOWTITLE eq monitor_serial*" >nul 2>&1
-powershell.exe -NoProfile -Command ^
-    "Get-CimInstance Win32_Process ^| Where-Object { $_.CommandLine -like '*monitor_serial*' -and $_.ProcessId -ne $PID } ^| ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }" >nul 2>&1
+taskkill /F /T /FI "WINDOWTITLE eq monitor_serial*" >nul 2>&1
+powershell.exe -NoProfile -Command "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*monitor_serial*' -and $_.ProcessId -ne $PID -and @('cmd.exe','powershell.exe','pwsh.exe') -contains $_.Name } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }" >nul 2>&1
 echo   Done.
 
 :: Step 1: Build in WSL. Incremental builds are fast and guarantee the flashed
