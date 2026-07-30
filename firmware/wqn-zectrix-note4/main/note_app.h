@@ -53,6 +53,11 @@ struct NoteSessionState {
     bool observation_effect_ready = false;
     DurableNoteObservation pending_observation;
     PersistedNoteSession pending_advanced_session;
+    // [persist-worker] operation_id of the in-flight persist submit. The worker
+    // result is applied only if this still matches (and commit_state is still
+    // kPersisting), so a late result cannot install a stale or reset session.
+    // NoteSessionState{} resets naturally invalidate it (mirrors word).
+    uint32_t pending_persist_operation_id = 0;
 };
 
 struct NoteOutboxState {
@@ -300,6 +305,7 @@ bool TakeNoteObservationEffect(
     NoteAppState* state,
     const std::string& request_id,
     const std::string& occurred_at,
+    uint32_t operation_id,
     DurableNoteObservation* observation,
     PersistedNoteSession* advanced_session);
 void ApplyNoteObservationCommitResult(NoteAppState* state, esp_err_t result);
@@ -314,9 +320,6 @@ bool UpdateNoteTransferProgress(
     uint32_t done_bytes,
     uint32_t total_bytes,
     int64_t now_us);
-// Re-arms a taken-but-not-dispatched observation effect (queue full/busy) so
-// the pump retries; the recorded request_id keeps the retry idempotent.
-void RestoreNoteObservationEffect(NoteAppState* state);
 // True while the image viewer is freshly loading and still inside the grace
 // window: the display loop holds the loading-page commit briefly so a fast
 // cache hit paints the image with ONE full refresh instead of two.

@@ -53,6 +53,8 @@ const char* AppEventKindName(AppEventKind event)
             return "transfer-progress";
         case AppEventKind::kWordObservationPersist:
             return "word-persist";
+        case AppEventKind::kNoteObservationPersist:
+            return "note-persist";
         default:
             return "unknown";
     }
@@ -155,11 +157,11 @@ void UiRuntime::RestoreWordCandidatePageRequest()
 UiUpdate UiRuntime::DispatchNoteCloudResult(NoteCloudResult& result)
 {
     const bool changed = ApplyNoteCloudResult(&state_, result);
-    // Observation commits are bookkeeping (commit_state/outbox counters);
-    // flashing a full refresh for them would punish every note open.
+    // Note cloud results (pack sync / session start / candidate page / image)
+    // repaint the note screen when they change visible state; the observation
+    // commit no longer rides this path (it went to the persist worker in c3).
     const RefreshSchedule refresh =
-        changed && state_.screen == wqn::UiScreen::kNote &&
-            result.op != NoteCloudOp::kCommitObservation
+        changed && state_.screen == wqn::UiScreen::kNote
             ? RefreshSchedule::kCommit
             : RefreshSchedule::kNone;
     return FinishEvent(AppEventKind::kNoteCloudResult, refresh, changed);
@@ -224,16 +226,57 @@ UiUpdate UiRuntime::DispatchTransferProgress(
 bool UiRuntime::TakeNoteObservationEffect(
     const std::string& request_id,
     const std::string& occurred_at,
+    uint32_t operation_id,
     wqn::DurableNoteObservation* observation,
     wqn::PersistedNoteSession* advanced_session)
 {
     return wqn::TakeNoteObservationEffect(
-        &state_.note_app, request_id, occurred_at, observation, advanced_session);
+        &state_.note_app, request_id, occurred_at, operation_id, observation,
+        advanced_session);
 }
 
-void UiRuntime::RestoreNoteObservationEffect()
+UiUpdate UiRuntime::DispatchNoteObservationPersistResult(
+    esp_err_t result, uint32_t operation_id)
 {
-    wqn::RestoreNoteObservationEffect(&state_.note_app);
+    // [persist-worker] Bind the result to the note session it was taken from
+    // (mirrors word). A late result after a session reset / newer submit is
+    // dropped, not applied; the caller still acks the mailbox.
+    const wqn::NoteSessionState& session = state_.note_app.session;
+    if (session.commit_state != wqn::NoteObservationCommitState::kPersisting ||
+        session.pending_persist_operation_id != operation_id) {
+        ESP_LOGW(kTag,
+                 "stale note persist result: op=%lu expected=%lu state=%d",
+                 static_cast<unsigned long>(operation_id),
+                 static_cast<unsigned long>(session.pending_persist_operation_id),
+                 static_cast<int>(session.commit_state));
+        return FinishEvent(AppEventKind::kNoteObservationPersist, RefreshSchedule::kNone, false);
+    }
+    wqn::ApplyNoteObservationCommitResult(&state_.note_app, result);
+    if (result == ESP_OK) {
+        wqn::services::RequestNoteOutboxUpload();
+    } else {
+        ESP_LOGW(kTag, "note observation persist failed: %s", esp_err_to_name(result));
+    }
+    BuildHomeSummary(&state_);
+    // A successful note commit is invisible bookkeeping -> no refresh. A FAILURE
+    // sets a status message (记录未保存 / 记录空间已满) that must reach the screen,
+    // so repaint the note page (never flashing a refresh for normal opens).
+    const RefreshSchedule refresh =
+        (result != ESP_OK && state_.screen == wqn::UiScreen::kNote)
+            ? RefreshSchedule::kSelection
+            : RefreshSchedule::kNone;
+    return FinishEvent(AppEventKind::kNoteObservationPersist, refresh, true);
+}
+
+UiUpdate UiRuntime::DispatchNoteObservationTakeFailed()
+{
+    // wqn::TakeNoteObservationEffect already moved the session to kFailed and
+    // set "会话游标无效"; advance the revision AND repaint the note page so the
+    // failure surfaces instead of a stuck "阅读中".
+    const RefreshSchedule refresh = state_.screen == wqn::UiScreen::kNote
+        ? RefreshSchedule::kSelection
+        : RefreshSchedule::kNone;
+    return FinishEvent(AppEventKind::kNoteObservationPersist, refresh, true);
 }
 
 bool UiRuntime::TakeWordObservationEffect(

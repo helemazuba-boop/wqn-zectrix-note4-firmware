@@ -1332,6 +1332,7 @@ bool TakeNoteObservationEffect(
     NoteAppState* state,
     const std::string& request_id,
     const std::string& occurred_at,
+    uint32_t operation_id,
     DurableNoteObservation* observation,
     PersistedNoteSession* advanced_session)
 {
@@ -1375,6 +1376,9 @@ bool TakeNoteObservationEffect(
     }
     state->session.pending_advanced_session = advanced;
     state->session.observation_effect_ready = false;
+    // Bind this dispatch so a late worker result arriving after a session
+    // reset / newer submit is rejected instead of applied (mirrors word).
+    state->session.pending_persist_operation_id = operation_id;
     *observation = pending;
     *advanced_session = std::move(advanced);
     return true;
@@ -1383,6 +1387,10 @@ bool TakeNoteObservationEffect(
 void ApplyNoteObservationCommitResult(NoteAppState* state, esp_err_t result)
 {
     if (state == nullptr) return;
+    // The bound dispatch is consumed either way; clearing keeps the
+    // expected-id invariant tight (the kPersisting guard at the caller is the
+    // primary defense).
+    state->session.pending_persist_operation_id = 0;
     if (result != ESP_OK) {
         state->session.commit_state = NoteObservationCommitState::kFailed;
         state->message = result == ESP_ERR_NO_MEM ? "记录空间已满" : "记录未保存";
@@ -1394,16 +1402,6 @@ void ApplyNoteObservationCommitResult(NoteAppState* state, esp_err_t result)
     state->session.commit_state = NoteObservationCommitState::kCloudPending;
     if (state->outbox.pending_count < state->outbox.capacity) {
         ++state->outbox.pending_count;
-    }
-}
-
-void RestoreNoteObservationEffect(NoteAppState* state)
-{
-    if (state == nullptr) return;
-    // Only a taken-but-undispatched effect may be re-armed; a terminal
-    // cursor-invalid failure (kFailed) stays failed.
-    if (state->session.commit_state == NoteObservationCommitState::kPersisting) {
-        state->session.observation_effect_ready = true;
     }
 }
 
@@ -1698,7 +1696,7 @@ bool RunNotePageStateSelfTest()
     PersistedNoteSession advanced;
     if (!require(
             TakeNoteObservationEffect(
-                &e, "req_note_selftest_0001", "2026-07-20T00:00:00.000Z", &observation, &advanced),
+                &e, "req_note_selftest_0001", "2026-07-20T00:00:00.000Z", 1u, &observation, &advanced),
             "take observation effect") ||
         !require(advanced.remote.next_sequence == 1, "advanced sequence increments") ||
         !require(observation.action == ObservationAction::kOpened, "effect action opened")) {

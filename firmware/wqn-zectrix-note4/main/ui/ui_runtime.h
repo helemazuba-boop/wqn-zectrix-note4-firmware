@@ -39,6 +39,7 @@ enum class AppEventKind : uint8_t {
     kDisplayResult,
     kTransferProgress,
     kWordObservationPersist,
+    kNoteObservationPersist,
 };
 
 struct UiUpdate {
@@ -104,9 +105,9 @@ public:
     bool TakeNoteObservationEffect(
         const std::string& request_id,
         const std::string& occurred_at,
+        uint32_t operation_id,
         wqn::DurableNoteObservation* observation,
         wqn::PersistedNoteSession* advanced_session);
-    void RestoreNoteObservationEffect();
     bool TakeProblemImageRequest(
         std::string* problem_id,
         bool* is_solution,
@@ -134,6 +135,14 @@ public:
     // kFailed). Route it through FinishEvent so the revision advances and the
     // failure frame is not deduped against the "正在保存" frame's revision.
     UiUpdate DispatchWordObservationTakeFailed();
+
+    // [persist-worker] Note observation commit moved to the persist worker
+    // (c3). Same shape as word: bound operation_id, applied only when it still
+    // matches the pending commit; Take-failure advances the revision. A success
+    // does not refresh (invisible bookkeeping); a failure / Take-failure returns
+    // kSelection so the error status reaches the note screen.
+    UiUpdate DispatchNoteObservationPersistResult(esp_err_t result, uint32_t operation_id);
+    UiUpdate DispatchNoteObservationTakeFailed();
 
 private:
     UiUpdate FinishEvent(

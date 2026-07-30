@@ -846,7 +846,7 @@ RefreshSchedule ApplyButtonEvent(
         }
         // The note-open observation commit (outbox append + session snapshot,
         // a ~0.9s foreground storage transaction) no longer runs here on the
-        // UI task: PumpNoteObservationCommit hands it to the note cloud lane
+        // UI task: PumpNoteObservationCommit hands it to the persist worker
         // and the kPersisting gate covers the in-flight window.
         BuildHomeSummary(state);
         // A note mode transition (notebook<->title<->body<->image) or a list

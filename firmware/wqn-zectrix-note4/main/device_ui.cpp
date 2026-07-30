@@ -526,8 +526,8 @@ void DeviceUiTask(void*)
             wqn::services::SyncEvent sync_event;
             while (xQueuePeek(g_sync_event_queue, &sync_event, 0) == pdTRUE) {
                 // [persist-worker] A succeeded sync reads the three outboxes
-                // synchronously in DispatchSyncResult; while a word commit is
-                // pending or any persist is in flight, that read would queue
+                // synchronously in DispatchSyncResult; while a word/note commit
+                // is pending or any persist is in flight, that read would queue
                 // behind the observation transaction and re-freeze the UI. Leave
                 // the event queued (peek, do not receive) and consume it a later
                 // iteration once persistence is idle. Failed / AwaitingClaim
@@ -537,6 +537,8 @@ void DeviceUiTask(void*)
                         wqn::services::SyncEventStatus::kSucceeded &&
                     (state.word_app.session.commit_state ==
                          wqn::WordObservationCommitState::kPersisting ||
+                     state.note_app.session.commit_state ==
+                         wqn::NoteObservationCommitState::kPersisting ||
                      device_ui_internal::IsAnyPersistBusy())) {
                     break;
                 }
@@ -639,17 +641,28 @@ void DeviceUiTask(void*)
             const bool word_commit_pending =
                 state.word_app.session.commit_state ==
                 wqn::WordObservationCommitState::kPersisting;
+            // [persist-worker] Same guard for note (c3): ApplyNoteCandidatePage
+            // Result rebuilds+saves the session, so a note cloud result applied
+            // while a note observation commit is pending would roll back the
+            // worker's advanced cursor and re-block the UI on storage.
+            const bool note_commit_pending =
+                state.note_app.session.commit_state ==
+                wqn::NoteObservationCommitState::kPersisting;
             for (device_ui_internal::CloudDomain result_domain : kResultDomains) {
-                // [persist-worker] Defer ALL Word cloud results while a word
-                // observation is pending. Applying one now (candidate page and
-                // the server-invalid branch both rebuild+save the session) would
-                // use the pre-advance snapshot, roll back the worker's cursor,
-                // and re-block the UI on the storage queue. Leave it pending +
-                // Word busy (word_cloud_completed stays false, so no Finish);
+                // [persist-worker] Defer ALL Word/Note cloud results while that
+                // domain's observation is pending. Applying one now (candidate
+                // page / server-invalid both rebuild+save the session) would use
+                // the pre-advance snapshot, roll back the worker's cursor, and
+                // re-block the UI on the storage queue. Leave it pending + that
+                // domain busy (xxx_cloud_completed stays false, so no Finish);
                 // the persist result is applied+acked just below this scan, so
                 // next iteration this result merges onto the advanced session.
                 if (result_domain == device_ui_internal::CloudDomain::kWord &&
                     word_commit_pending) {
+                    continue;
+                }
+                if (result_domain == device_ui_internal::CloudDomain::kNote &&
+                    note_commit_pending) {
                     continue;
                 }
                 device_ui_internal::CloudResultReady ready;
@@ -746,6 +759,26 @@ void DeviceUiTask(void*)
             }
         }
 
+        // [persist-worker] Drain the note observation commit result (moved off
+        // the cloud lane in c3). Apply on the UI task and ack with
+        // generation+op_id; the dispatch returns kNone on success (invisible
+        // bookkeeping) and kSelection on failure so the error surfaces.
+        {
+            device_ui_internal::PersistResultReceipt note_persist;
+            if (device_ui_internal::TakePersistResultToApply(
+                    device_ui_internal::PersistKind::kNoteObservation,
+                    &note_persist)) {
+                const device_ui_internal::UiUpdate persist_update =
+                    ui_runtime.DispatchNoteObservationPersistResult(
+                        note_persist.result, note_persist.operation_id);
+                refresh_schedule =
+                    StrongerSchedule(refresh_schedule, persist_update.refresh);
+                device_ui_internal::AckPersistResult(
+                    device_ui_internal::PersistKind::kNoteObservation,
+                    note_persist.generation, note_persist.operation_id);
+            }
+        }
+
         const int64_t now_ms = esp_timer_get_time() / 1000;
         const device_ui_internal::UiUpdate time_update =
             ui_runtime.DispatchTimeTick(now_ms);
@@ -838,12 +871,15 @@ wqn::AiStreamingStatusView streaming_view{};
         // [persist-worker] The periodic reload reads storage on THIS task; a
         // word/settings commit in the persist worker holds a foreground storage
         // transaction, so a reload here would queue behind it and re-stall the
-        // UI. Skip while any persist is in flight, and also while a word answer
-        // is Prepared-but-not-yet-applied (the wider kPersisting window: its
-        // session read/write would otherwise race the pending commit).
+        // UI. Skip while any persist is in flight, and also while a word OR note
+        // answer is Prepared-but-not-yet-applied (the wider kPersisting window,
+        // covering the Prepare->reserve gap: its session read/write -- reload
+        // even runs InitNoteApp() -- would otherwise race the pending commit).
         const bool persist_quiet = !device_ui_internal::IsAnyPersistBusy() &&
             state.word_app.session.commit_state !=
-                wqn::WordObservationCommitState::kPersisting;
+                wqn::WordObservationCommitState::kPersisting &&
+            state.note_app.session.commit_state !=
+                wqn::NoteObservationCommitState::kPersisting;
         // [hang-fix] Surface domains stuck busy past their lane budget; a
         // silent stuck domain looks identical to "cloud slow" from the UI.
         device_ui_internal::WarnStuckCloudDomains();
@@ -996,7 +1032,9 @@ wqn::AiStreamingStatusView streaming_view{};
         device_ui_internal::PumpNoteCandidatePrefetch(&ui_runtime);
         device_ui_internal::PumpNoteImageFetch(&ui_runtime);
         device_ui_internal::PumpNoteBodyPackFetch(&ui_runtime);
-        device_ui_internal::PumpNoteObservationCommit(&ui_runtime);
+        pending_refresh_schedule = device_ui_internal::StrongerSchedule(
+            pending_refresh_schedule,
+            device_ui_internal::PumpNoteObservationCommit(&ui_runtime));
         // [transfer-progress] Poll the runner-side download mailbox; note_app
         // quantizes/throttles so this only schedules a repaint on a real
         // segment step of a download this page is actually waiting on.

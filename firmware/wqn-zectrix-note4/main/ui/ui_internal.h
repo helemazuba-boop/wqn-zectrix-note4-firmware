@@ -210,10 +210,6 @@ enum class NoteCloudOp {
     // is not on disk and is actively waiting, so it rides the interactive
     // lane (kPackSync stays the bulk full-catalog walk).
     kFetchNotebookPack,
-    // Local storage write (observation outbox + session snapshot); needs no
-    // network/token. Runs on the interactive lane so the note-open bookkeeping
-    // leaves the UI task (the ~0.9s foreground commit stall).
-    kCommitObservation,
 };
 
 struct NoteCloudRequest {
@@ -433,7 +429,11 @@ void PumpNoteImageFetch(UiRuntime* runtime);
 bool QueueNoteBodyPackFetch(
     const std::string& notebook_id, uint32_t progress_generation);
 void PumpNoteBodyPackFetch(UiRuntime* runtime);
-void PumpNoteObservationCommit(UiRuntime* runtime);
+// [persist-worker] Note observation commit pump (c3). Reserves a persist slot,
+// takes the armed effect and enqueues it to the worker (was the cloud lane).
+// Returns a refresh to fold into the next iteration's pending schedule for the
+// Take-failure path (mirrors word).
+RefreshSchedule PumpNoteObservationCommit(UiRuntime* runtime);
 // [persist-worker] Word observation commit pump (commit #2). Reserves a persist
 // slot, then takes the armed effect and enqueues it to the worker; the card
 // stays in kPersisting until the worker result is applied on the UI task.
