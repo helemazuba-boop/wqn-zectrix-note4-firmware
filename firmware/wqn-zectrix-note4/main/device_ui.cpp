@@ -524,7 +524,23 @@ void DeviceUiTask(void*)
         bool problem_cloud_completed = false;
         if (g_sync_event_queue != nullptr) {
             wqn::services::SyncEvent sync_event;
-            while (xQueueReceive(g_sync_event_queue, &sync_event, 0) == pdTRUE) {
+            while (xQueuePeek(g_sync_event_queue, &sync_event, 0) == pdTRUE) {
+                // [persist-worker] A succeeded sync reads the three outboxes
+                // synchronously in DispatchSyncResult; while a word commit is
+                // pending or any persist is in flight, that read would queue
+                // behind the observation transaction and re-freeze the UI. Leave
+                // the event queued (peek, do not receive) and consume it a later
+                // iteration once persistence is idle. Failed / AwaitingClaim
+                // touch no storage, so process them now. Peeking rather than
+                // receive-then-discard preserves the terminal event.
+                if (sync_event.status ==
+                        wqn::services::SyncEventStatus::kSucceeded &&
+                    (state.word_app.session.commit_state ==
+                         wqn::WordObservationCommitState::kPersisting ||
+                     device_ui_internal::IsAnyPersistBusy())) {
+                    break;
+                }
+                xQueueReceive(g_sync_event_queue, &sync_event, 0);
                 const device_ui_internal::UiUpdate update =
                     ui_runtime.DispatchSyncResult(sync_event);
                 refresh_schedule =
@@ -615,7 +631,27 @@ void DeviceUiTask(void*)
                 device_ui_internal::CloudDomain::kNote,
                 device_ui_internal::CloudDomain::kProblem,
             };
+            // [persist-worker] Unified pending gate: commit_state == kPersisting
+            // spans the whole answer (button Prepare -> worker Apply), so it
+            // also covers the Prepare->reserve gap where persist-busy is briefly
+            // false but the effect is still armed. Read fresh here, after the
+            // button drain that may have just armed a new answer.
+            const bool word_commit_pending =
+                state.word_app.session.commit_state ==
+                wqn::WordObservationCommitState::kPersisting;
             for (device_ui_internal::CloudDomain result_domain : kResultDomains) {
+                // [persist-worker] Defer ALL Word cloud results while a word
+                // observation is pending. Applying one now (candidate page and
+                // the server-invalid branch both rebuild+save the session) would
+                // use the pre-advance snapshot, roll back the worker's cursor,
+                // and re-block the UI on the storage queue. Leave it pending +
+                // Word busy (word_cloud_completed stays false, so no Finish);
+                // the persist result is applied+acked just below this scan, so
+                // next iteration this result merges onto the advanced session.
+                if (result_domain == device_ui_internal::CloudDomain::kWord &&
+                    word_commit_pending) {
+                    continue;
+                }
                 device_ui_internal::CloudResultReady ready;
                 ready.domain = result_domain;
                 if (!device_ui_internal::TakeCloudResultToApply(
@@ -687,6 +723,26 @@ void DeviceUiTask(void*)
                         break;
                 }
                 device_ui_internal::AckCloudResult(result_domain, ready.generation);
+            }
+        }
+
+        // [persist-worker] Drain the word observation commit result (moved off
+        // the UI task in commit #2). Apply on the UI task, ack with
+        // generation+operation_id (only a matching ack frees the slot), and
+        // fold in the card-advance refresh the dispatch returns.
+        {
+            device_ui_internal::PersistResultReceipt word_persist;
+            if (device_ui_internal::TakePersistResultToApply(
+                    device_ui_internal::PersistKind::kWordObservation,
+                    &word_persist)) {
+                const device_ui_internal::UiUpdate persist_update =
+                    ui_runtime.DispatchWordObservationPersistResult(
+                        word_persist.result, word_persist.operation_id);
+                refresh_schedule =
+                    StrongerSchedule(refresh_schedule, persist_update.refresh);
+                device_ui_internal::AckPersistResult(
+                    device_ui_internal::PersistKind::kWordObservation,
+                    word_persist.generation, word_persist.operation_id);
             }
         }
 
@@ -779,11 +835,21 @@ wqn::AiStreamingStatusView streaming_view{};
             !device_ui_internal::IsWordCloudBusy() &&
             !device_ui_internal::IsNoteCloudBusy() &&
             !device_ui_internal::IsProblemCloudBusy();
+        // [persist-worker] The periodic reload reads storage on THIS task; a
+        // word/settings commit in the persist worker holds a foreground storage
+        // transaction, so a reload here would queue behind it and re-stall the
+        // UI. Skip while any persist is in flight, and also while a word answer
+        // is Prepared-but-not-yet-applied (the wider kPersisting window: its
+        // session read/write would otherwise race the pending commit).
+        const bool persist_quiet = !device_ui_internal::IsAnyPersistBusy() &&
+            state.word_app.session.commit_state !=
+                wqn::WordObservationCommitState::kPersisting;
         // [hang-fix] Surface domains stuck busy past their lane budget; a
         // silent stuck domain looks identical to "cloud slow" from the UI.
         device_ui_internal::WarnStuckCloudDomains();
         if (status_reload_due && refresh_schedule == RefreshSchedule::kNone &&
-            !button_consumed_this_iter && interaction_quiet && cloud_quiet) {
+            !button_consumed_this_iter && interaction_quiet && cloud_quiet &&
+            persist_quiet) {
             if (state.screen != wqn::UiScreen::kWord) {
                 // Storage/Wi-Fi reads are an effect. Build the typed snapshot
                 // outside UiRuntime, then reduce that immutable observation
@@ -924,6 +990,9 @@ wqn::AiStreamingStatusView streaming_view{};
             FinishProblemCloudRequest();
         }
         device_ui_internal::PumpWordCandidatePrefetch(&ui_runtime);
+        pending_refresh_schedule = device_ui_internal::StrongerSchedule(
+            pending_refresh_schedule,
+            device_ui_internal::PumpWordObservationCommit(&ui_runtime));
         device_ui_internal::PumpNoteCandidatePrefetch(&ui_runtime);
         device_ui_internal::PumpNoteImageFetch(&ui_runtime);
         device_ui_internal::PumpNoteBodyPackFetch(&ui_runtime);

@@ -1344,6 +1344,7 @@ bool TakeWordObservationEffect(
     WordAppState* state,
     const std::string& request_id,
     const std::string& occurred_at,
+    uint32_t operation_id,
     DurableWordObservation* observation,
     PersistedWordSession* advanced_session)
 {
@@ -1383,6 +1384,9 @@ bool TakeWordObservationEffect(
     }
     state->session.pending_advanced_session = advanced;
     state->session.observation_effect_ready = false;
+    // Bind this dispatch so a late worker result that arrives after a scope
+    // reset / newer submit is rejected instead of applied.
+    state->session.pending_persist_operation_id = operation_id;
     *observation = pending;
     *advanced_session = std::move(advanced);
     return true;
@@ -1391,6 +1395,10 @@ bool TakeWordObservationEffect(
 void ApplyWordObservationCommitResult(WordAppState* state, esp_err_t result)
 {
     if (state == nullptr) return;
+    // The bound dispatch has now been consumed; clear it so a duplicate/late
+    // result cannot re-apply (the commit_state guard at the caller also blocks
+    // this, but clearing keeps the expected-id invariant tight).
+    state->session.pending_persist_operation_id = 0;
     if (result != ESP_OK) {
         state->session.commit_state = WordObservationCommitState::kFailed;
         state->card_phase = CardPhaseFromSession(state->session.persisted);
@@ -1786,6 +1794,7 @@ bool RunWordPageStateSelfTest()
                 &mixed.get(),
                 request_id,
                 "2026-07-20T12:00:00Z",
+                1u,
                 &observation,
                 &advanced) ||
             observation.sequence != index ||
@@ -1856,6 +1865,7 @@ bool RunWordPageStateSelfTest()
                      &dictionary.get(),
                      "req_word_dictionary_0001",
                      "2026-07-20T12:00:00Z",
+                     1u,
                      &dictionary_observation,
                      &dictionary_advanced),
                  "dictionary observation enters durable effect") ||

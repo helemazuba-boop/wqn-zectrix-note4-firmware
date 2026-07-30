@@ -4,6 +4,8 @@
 
 #include "esp_log.h"
 #include "ui_internal.h"
+#include "services/sync_service.h"
+#include "word_app.h"
 
 namespace device_ui_internal {
 namespace {
@@ -49,6 +51,8 @@ const char* AppEventKindName(AppEventKind event)
             return "display-result";
         case AppEventKind::kTransferProgress:
             return "transfer-progress";
+        case AppEventKind::kWordObservationPersist:
+            return "word-persist";
         default:
             return "unknown";
     }
@@ -230,6 +234,71 @@ bool UiRuntime::TakeNoteObservationEffect(
 void UiRuntime::RestoreNoteObservationEffect()
 {
     wqn::RestoreNoteObservationEffect(&state_.note_app);
+}
+
+bool UiRuntime::TakeWordObservationEffect(
+    const std::string& request_id,
+    const std::string& occurred_at,
+    uint32_t operation_id,
+    wqn::DurableWordObservation* observation,
+    wqn::PersistedWordSession* advanced_session)
+{
+    return wqn::TakeWordObservationEffect(
+        &state_.word_app, request_id, occurred_at, operation_id, observation,
+        advanced_session);
+}
+
+UiUpdate UiRuntime::DispatchWordObservationPersistResult(
+    esp_err_t result, uint32_t operation_id)
+{
+    // [persist-worker] Bind the result to the word state it was taken from.
+    // The worker ran async; the user may have left the scoped page or switched
+    // decks (ResetWordSessionsForScopeChange resets the session, clearing the
+    // expected id and commit_state). Applying then would install a stale/empty
+    // advanced session over freshly-reset state. Drop it (log), but the caller
+    // still acks the mailbox so the pool slot frees.
+    const wqn::WordSessionState& session = state_.word_app.session;
+    if (session.commit_state != wqn::WordObservationCommitState::kPersisting ||
+        session.pending_persist_operation_id != operation_id) {
+        ESP_LOGW(kTag,
+                 "stale word persist result: op=%lu expected=%lu state=%d",
+                 static_cast<unsigned long>(operation_id),
+                 static_cast<unsigned long>(session.pending_persist_operation_id),
+                 static_cast<int>(session.commit_state));
+        return FinishEvent(
+            AppEventKind::kWordObservationPersist, RefreshSchedule::kNone, false);
+    }
+    // Worker-side storage has completed; apply it on the UI task (the worker
+    // never touches AppState). The card leaves kPersisting: on success the
+    // advanced session installs and the next card shows; on failure it moves to
+    // a Confirm-to-retry state. Either way it is a content change on the word
+    // screen -> selection-level partial (never a full refresh for bookkeeping),
+    // matching the old synchronous path.
+    wqn::ApplyWordObservationCommitResult(&state_.word_app, result);
+    if (result == ESP_OK) {
+        // Outbox is the interaction boundary; upload after a quiet period only
+        // once the record is durable.
+        wqn::services::RequestWordOutboxUpload();
+    } else {
+        ESP_LOGW(kTag, "word observation persist failed: %s", esp_err_to_name(result));
+    }
+    BuildHomeSummary(&state_);
+    const RefreshSchedule refresh = state_.screen == wqn::UiScreen::kWord
+        ? RefreshSchedule::kSelection
+        : RefreshSchedule::kNone;
+    return FinishEvent(AppEventKind::kWordObservationPersist, refresh, true);
+}
+
+UiUpdate UiRuntime::DispatchWordObservationTakeFailed()
+{
+    // wqn::TakeWordObservationEffect already moved the session to kFailed and
+    // cleared the armed effect; this only advances the revision (via
+    // FinishEvent) so the failure frame is not treated as a duplicate of the
+    // "正在保存" frame still in the display ledger.
+    const RefreshSchedule refresh = state_.screen == wqn::UiScreen::kWord
+        ? RefreshSchedule::kSelection
+        : RefreshSchedule::kNone;
+    return FinishEvent(AppEventKind::kWordObservationPersist, refresh, true);
 }
 
 UiUpdate UiRuntime::DispatchProblemCloudResult(ProblemCloudResult& result)

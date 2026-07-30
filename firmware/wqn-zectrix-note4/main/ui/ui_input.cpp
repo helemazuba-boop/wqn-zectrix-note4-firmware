@@ -114,7 +114,17 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
             return RefreshSchedule::kConfig;
         }
         if (short_press && event.button == wqn::ButtonId::kConfirm) {
-            if (settings.word_deck_selected < settings.word_deck_options.size()) {
+            if (settings.word_deck_selected < settings.word_deck_options.size() &&
+                state->word_app.session.commit_state ==
+                    wqn::WordObservationCommitState::kPersisting) {
+                // A word answer is still pending (kPersisting spans Prepare ->
+                // worker Apply, so it also covers the Prepare->reserve gap where
+                // persist-busy is briefly false but the effect is still armed):
+                // the scope reset below synchronously clears two session files
+                // and would both stall the UI behind the persist transaction
+                // and drop the not-yet-enqueued effect. Defer; user retries.
+                settings.notice = "正在保存，请稍后切换";
+            } else if (settings.word_deck_selected < settings.word_deck_options.size()) {
                 const wqn::WordDeckInfo& option =
                     settings.word_deck_options[settings.word_deck_selected];
                 const esp_err_t result = wqn::SaveDefaultWordDeckId(option.deck_id);
@@ -781,37 +791,12 @@ RefreshSchedule ApplyButtonEvent(
                     : "本轮准备失败，请重试";
             }
         }
-        wqn::DurableWordObservation observation;
-        wqn::PersistedWordSession advanced_session;
-        const auto observation_metadata = wqn::services::MakeDeviceRequestMetadata();
-        std::string occurred_at = CurrentIsoTimestamp();
-        if (occurred_at.empty()) {
-            // The event must remain durable even before SNTP is available.
-            // The server clamps implausible/future times when projecting it.
-            occurred_at = "2024-01-01T00:00:00Z";
-        }
-        if (wqn::TakeWordObservationEffect(
-                &state->word_app,
-                observation_metadata.request_id,
-                occurred_at,
-                &observation,
-                &advanced_session)) {
-            const esp_err_t commit_result = wqn::CommitWordObservation(
-                observation, advanced_session);
-            wqn::ApplyWordObservationCommitResult(
-                &state->word_app, commit_result);
-            if (commit_result == ESP_OK) {
-                // The durable outbox is the interaction boundary. Upload it
-                // after a quiet period; a card action must never launch the
-                // full bootstrap/problem/content sync pipeline.
-                wqn::services::RequestWordOutboxUpload();
-            } else {
-                ESP_LOGW(
-                    kTag,
-                    "word observation local commit failed: %s",
-                    esp_err_to_name(commit_result));
-            }
-        }
+        // [persist-worker] The word observation commit (durable outbox append +
+        // session-cursor snapshot) no longer runs synchronously here -- it used
+        // to block the UI task on foreground storage. PumpWordObservationCommit
+        // now hands it to the persist worker; the card stays in kPersisting
+        // ("正在保存") until the worker's result is applied (advance card / retry)
+        // on the UI task via DispatchWordObservationPersistResult.
         wqn::WqnWordSearchRequest search_request;
         if (wqn::TakeWordSearchRequest(&state->word_app, &search_request)) {
             if (!QueueWordSearch(search_request)) {

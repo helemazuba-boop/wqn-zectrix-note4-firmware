@@ -434,6 +434,13 @@ bool QueueNoteBodyPackFetch(
     const std::string& notebook_id, uint32_t progress_generation);
 void PumpNoteBodyPackFetch(UiRuntime* runtime);
 void PumpNoteObservationCommit(UiRuntime* runtime);
+// [persist-worker] Word observation commit pump (commit #2). Reserves a persist
+// slot, then takes the armed effect and enqueues it to the worker; the card
+// stays in kPersisting until the worker result is applied on the UI task.
+// Returns a refresh to fold into the NEXT iteration's pending schedule: the
+// Take-failure path (cursor desync) mutates state to kFailed after this
+// iteration's display commit, so it must request its own repaint.
+RefreshSchedule PumpWordObservationCommit(UiRuntime* runtime);
 
 bool QueueProblemPackSync();
 bool QueueProblemImageFetch(

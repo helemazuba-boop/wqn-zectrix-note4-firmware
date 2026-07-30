@@ -38,6 +38,7 @@ enum class AppEventKind : uint8_t {
     kSyncResult,
     kDisplayResult,
     kTransferProgress,
+    kWordObservationPersist,
 };
 
 struct UiUpdate {
@@ -117,6 +118,22 @@ public:
         const std::string& occurred_at,
         wqn::DurableProblemObservation* observation);
     void RestoreProblemVerdictEffect();
+
+    // [persist-worker] Word observation commit moved to the persist worker
+    // (see ui/persist_worker.h). Take mirrors the note/problem effect wrappers;
+    // the persist result is applied on the UI task here and returns the
+    // card-advance refresh (the worker never touches AppState).
+    bool TakeWordObservationEffect(
+        const std::string& request_id,
+        const std::string& occurred_at,
+        uint32_t operation_id,
+        wqn::DurableWordObservation* observation,
+        wqn::PersistedWordSession* advanced_session);
+    UiUpdate DispatchWordObservationPersistResult(esp_err_t result, uint32_t operation_id);
+    // Take failed inside the pump (cursor desync -> session already moved to
+    // kFailed). Route it through FinishEvent so the revision advances and the
+    // failure frame is not deduped against the "正在保存" frame's revision.
+    UiUpdate DispatchWordObservationTakeFailed();
 
 private:
     UiUpdate FinishEvent(

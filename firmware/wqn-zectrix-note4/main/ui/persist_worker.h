@@ -102,5 +102,9 @@ bool AckPersistResult(PersistKind kind, uint32_t generation, uint32_t operation_
 // True while a command for `kind` is accepted-but-not-yet-acked (submit gate +
 // duplicate-Confirm guard for settings).
 bool IsPersistKindBusy(PersistKind kind);
+// True while ANY kind is in flight. The periodic UI state reload and the
+// synchronous scope-reset paths gate on this so they never queue a UI-thread
+// storage read/clear behind an in-flight persist transaction.
+bool IsAnyPersistBusy();
 
 }  // namespace device_ui_internal

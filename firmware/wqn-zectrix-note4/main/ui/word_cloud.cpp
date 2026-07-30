@@ -3,6 +3,8 @@
 
 #include "ui_internal.h"
 #include "ui_runtime.h"
+#include "persist_worker.h"
+#include "word_app.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -31,6 +33,55 @@ void FinishWordCloudRequest()
     g_word_sleep_lease.Reset();
     ClearCloudDomainBusyWatch(CloudDomain::kWord);
     g_word_cloud_busy.store(false, std::memory_order_release);
+}
+
+RefreshSchedule PumpWordObservationCommit(UiRuntime* runtime)
+{
+    if (runtime == nullptr) {
+        return RefreshSchedule::kNone;
+    }
+    // One word commit in flight at a time; wait for the UI to ack the last one
+    // (the card stays in kPersisting until then, so no second effect is armed).
+    if (IsPersistKindBusy(PersistKind::kWordObservation)) {
+        return RefreshSchedule::kNone;
+    }
+    // Cheap readiness pre-check: reservation takes a SleepLease + pool slot, so
+    // an idle pump must not reserve just to cancel. Reserve happens BEFORE the
+    // effect is pulled from UI state (that mutates it), so we must first know
+    // there is something to commit.
+    if (!runtime->state().word_app.session.observation_effect_ready) {
+        return RefreshSchedule::kNone;
+    }
+    // Phase 1: reserve busy + slot + storage lease. On failure the UI state is
+    // untouched (effect still armed) -- just retry next pump.
+    PersistTicket ticket = TryReservePersist(PersistKind::kWordObservation);
+    if (!ticket.valid()) {
+        return RefreshSchedule::kNone;
+    }
+    const auto metadata = wqn::services::MakeDeviceRequestMetadata();
+    std::string occurred_at = CurrentIsoTimestamp();
+    if (occurred_at.empty()) {
+        // Durable even before SNTP; the server clamps implausible times.
+        occurred_at = "2024-01-01T00:00:00Z";
+    }
+    wqn::DurableWordObservation observation;
+    wqn::PersistedWordSession advanced_session;
+    // Phase 2: only now pull the effect from UI state, binding this dispatch's
+    // operation_id so a late result after a scope reset is rejected.
+    if (!runtime->TakeWordObservationEffect(
+            metadata.request_id, occurred_at, ticket.operation_id,
+            &observation, &advanced_session)) {
+        // Take mutated state to kFailed ("会话游标无效") and cleared the effect;
+        // release the reservation and route the failure through a typed event
+        // so the revision advances (this runs after the display commit, so the
+        // caller folds the returned refresh into the next iteration's pending
+        // schedule instead of leaving a stuck "正在保存").
+        CancelPersistReservation(ticket);
+        return runtime->DispatchWordObservationTakeFailed().refresh;
+    }
+    EnqueueReservedWordObservation(
+        ticket, std::move(observation), std::move(advanced_session));
+    return RefreshSchedule::kNone;
 }
 
 bool IsWordCloudBusy()

@@ -436,4 +436,14 @@ bool IsPersistKindBusy(PersistKind kind)
     return g_kind_busy[KindIndex(kind)].load(std::memory_order_acquire);
 }
 
+bool IsAnyPersistBusy()
+{
+    for (size_t i = 0; i < static_cast<size_t>(PersistKind::kCount); ++i) {
+        if (g_kind_busy[i].load(std::memory_order_acquire)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 }  // namespace device_ui_internal
