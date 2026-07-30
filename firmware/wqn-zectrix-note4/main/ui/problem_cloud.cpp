@@ -163,10 +163,8 @@ void SendProblemCloudResult()
     CloudResultReady ready;
     ready.domain = CloudDomain::kProblem;
     ready.generation = g_problem_result_generation;
-    if (g_cloud_result_queue == nullptr ||
-        xQueueSend(g_cloud_result_queue, &ready, pdMS_TO_TICKS(100)) != pdTRUE) {
-        FinishProblemCloudRequest();
-    }
+    PublishCloudResult(CloudDomain::kProblem, g_problem_result_generation);
+    (void)ready;
 }
 
 // Mirrors the problem sets into the note screen's mixed notebook list.

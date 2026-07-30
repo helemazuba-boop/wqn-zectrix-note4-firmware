@@ -232,6 +232,10 @@ void UiSyncEventSink(const wqn::services::SyncEvent& event)
         xQueueSend(g_sync_event_queue, &event, 0) != pdTRUE) {
         ESP_LOGW(kTag, "drop sync event: sequence=%lu",
                  static_cast<unsigned long>(event.sequence));
+    } else {
+        // [input-capture] Wake the UI so a sync completion is applied promptly
+        // instead of waiting for the next idle poll.
+        device_ui_internal::NotifyUiTask();
     }
 }
 
@@ -422,6 +426,8 @@ void DeviceUiTask(void*)
         vTaskDelete(nullptr);
         return;
     }
+    // [input-capture] Cloud results and sync events wake this same task.
+    device_ui_internal::SetUiTaskToNotify(xTaskGetCurrentTaskHandle());
 
     result = wqn::InitEpdDisplay();
     if (result != ESP_OK) {
@@ -551,8 +557,6 @@ void DeviceUiTask(void*)
         bool button_consumed_this_iter = false;
         for (int consumed = 0; consumed < 4; ++consumed) {
         wqn::ButtonEvent event;
-        bool button_consumed_this_iter = false;
-        (void)button_consumed_this_iter;
         if (!wqn::ReceiveButtonEvent(&event)) {
             break;
         }
@@ -599,10 +603,24 @@ void DeviceUiTask(void*)
         }
         }  // for (consumed) button-event drain
 
-        if (device_ui_internal::g_cloud_result_queue != nullptr) {
-            device_ui_internal::CloudResultReady ready;
-            while (xQueueReceive(
-                       device_ui_internal::g_cloud_result_queue, &ready, 0) == pdTRUE) {
+        // [ack-mailbox] Scan each domain's terminal-result mailbox. Applying
+        // then acking (below the switch) keeps busy held until the UI has
+        // consumed the result, so nothing is lost even if a new request is
+        // ready to fire the instant Finish* clears busy.
+        {
+            static const device_ui_internal::CloudDomain kResultDomains[4] = {
+                device_ui_internal::CloudDomain::kTodo,
+                device_ui_internal::CloudDomain::kWord,
+                device_ui_internal::CloudDomain::kNote,
+                device_ui_internal::CloudDomain::kProblem,
+            };
+            for (device_ui_internal::CloudDomain result_domain : kResultDomains) {
+                device_ui_internal::CloudResultReady ready;
+                ready.domain = result_domain;
+                if (!device_ui_internal::TakeCloudResultToApply(
+                        result_domain, &ready.generation)) {
+                    continue;
+                }
                 switch (ready.domain) {
                     case device_ui_internal::CloudDomain::kTodo: {
                         todo_cloud_completed = true;
@@ -667,6 +685,7 @@ void DeviceUiTask(void*)
                     default:
                         break;
                 }
+                device_ui_internal::AckCloudResult(result_domain, ready.generation);
             }
         }
 

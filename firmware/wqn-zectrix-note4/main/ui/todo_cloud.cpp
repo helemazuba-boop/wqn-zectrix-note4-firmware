@@ -111,10 +111,10 @@ void SendTodoCloudResult()
     CloudResultReady ready;
     ready.domain = CloudDomain::kTodo;
     ready.generation = g_todo_result_generation;
-    if (g_cloud_result_queue == nullptr ||
-        xQueueSend(g_cloud_result_queue, &ready, pdMS_TO_TICKS(100)) != pdTRUE) {
-        FinishTodoCloudRequest();
-    }
+    // [ack-mailbox] Publish never fails; busy is held until the UI applies and
+    // acks, so the terminal result cannot be silently dropped.
+    PublishCloudResult(CloudDomain::kTodo, g_todo_result_generation);
+    (void)ready;
 }
 
 void ApplyTodoList(wqn::UiState* state, wqn::WqnTodoListPage page)

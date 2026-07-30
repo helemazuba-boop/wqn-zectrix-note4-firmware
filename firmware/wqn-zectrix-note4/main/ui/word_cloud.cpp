@@ -169,10 +169,8 @@ void SendWordCloudResult()
     CloudResultReady ready;
     ready.domain = CloudDomain::kWord;
     ready.generation = g_word_result_generation;
-    if (g_cloud_result_queue == nullptr ||
-        xQueueSend(g_cloud_result_queue, &ready, pdMS_TO_TICKS(100)) != pdTRUE) {
-        FinishWordCloudRequest();
-    }
+    PublishCloudResult(CloudDomain::kWord, g_word_result_generation);
+    (void)ready;
 }
 
 bool IsWordSessionInvalidError(const wqn::protocol::v3::Error& error)

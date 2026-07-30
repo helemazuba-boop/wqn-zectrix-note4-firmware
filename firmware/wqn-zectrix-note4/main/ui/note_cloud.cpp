@@ -243,10 +243,8 @@ void SendNoteCloudResult()
     CloudResultReady ready;
     ready.domain = CloudDomain::kNote;
     ready.generation = g_note_result_generation;
-    if (g_cloud_result_queue == nullptr ||
-        xQueueSend(g_cloud_result_queue, &ready, pdMS_TO_TICKS(100)) != pdTRUE) {
-        FinishNoteCloudRequest();
-    }
+    PublishCloudResult(CloudDomain::kNote, g_note_result_generation);
+    (void)ready;
 }
 
 bool IsNoteSessionInvalidError(const wqn::protocol::v3::Error& error)
