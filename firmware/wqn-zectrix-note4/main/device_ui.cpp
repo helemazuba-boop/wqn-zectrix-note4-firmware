@@ -44,6 +44,36 @@ RTC_DATA_ATTR char g_rtc_last_rendered_clock[8] = {};
 
 namespace {
 
+// [input-capture] Reject button events whose production time is too old to act
+// on safely after the UI task was blocked and the ring replayed a backlog.
+// Navigation events (nav/short/double) replay fine -- the user still wants
+// them. But a completed PTT gesture (a Confirm hold: kHoldPress .. kRelease)
+// must NOT fire audio side effects seconds after the user let go, so a stale
+// Confirm press/hold/release is dropped wholesale. kLongPress repeats are
+// already coalesced in the ring; a straggler older than the repeat cadence is
+// also dropped so menus do not lurch on unblock.
+bool ShouldDropStaleButtonEvent(const wqn::ButtonEvent& event, int64_t now_ms)
+{
+    const int64_t age_ms = now_ms - event.occurred_at_ms;
+    if (age_ms <= 0) {
+        return false;
+    }
+    // Confirm is the PTT key; its raw press/hold/release drive audio capture.
+    // Drop the whole gesture if it aged past the capture-relevant window.
+    if (event.button == wqn::ButtonId::kConfirm &&
+        (event.type == wqn::ButtonEventType::kPress ||
+         event.type == wqn::ButtonEventType::kHoldPress ||
+         event.type == wqn::ButtonEventType::kRelease)) {
+        constexpr int64_t kStalePttMs = 2000;
+        return age_ms > kStalePttMs;
+    }
+    if (event.type == wqn::ButtonEventType::kLongPress && event.repeat) {
+        constexpr int64_t kStaleRepeatMs = 500;
+        return age_ms > kStaleRepeatMs;
+    }
+    return false;
+}
+
 // [timer-skip] Compute the screen-id that should participate in the
 // timer-wakeup skip decision. Configurable / editing screens must never be
 // skipped because their state can change between refreshes without touching
@@ -384,6 +414,14 @@ void DeviceUiTask(void*)
         vTaskDelete(nullptr);
         return;
     }
+    // [input-capture] Dedicated ISR-driven sampler; this task only consumes
+    // classified events from the ring and gets notified on arrival.
+    result = wqn::StartButtonInputTask(xTaskGetCurrentTaskHandle());
+    if (result != ESP_OK) {
+        ESP_LOGE(kTag, "button task start failed: %s", esp_err_to_name(result));
+        vTaskDelete(nullptr);
+        return;
+    }
 
     result = wqn::InitEpdDisplay();
     if (result != ESP_OK) {
@@ -506,8 +544,23 @@ void DeviceUiTask(void*)
                 }
             }
         }
-        const wqn::ButtonEvent event = wqn::PollButtonInput();
+        // [input-capture] Consume up to a small batch of ring events per loop
+        // iteration; each one runs the full dispatch path below. Stale-gesture
+        // filtering uses PRODUCTION time: after the UI was blocked for seconds
+        // the ring replays, and consumption time would corrupt every window.
+        bool button_consumed_this_iter = false;
+        for (int consumed = 0; consumed < 4; ++consumed) {
+        wqn::ButtonEvent event;
+        bool button_consumed_this_iter = false;
+        (void)button_consumed_this_iter;
+        if (!wqn::ReceiveButtonEvent(&event)) {
+            break;
+        }
+        if (ShouldDropStaleButtonEvent(event, esp_timer_get_time() / 1000)) {
+            continue;
+        }
         if (event.HasEvent()) {
+            button_consumed_this_iter = true;
             wqn::NoteUserActivity();
             wqn::NoteEpdActivity();
             if (state.screen == wqn::UiScreen::kWord ||
@@ -517,7 +570,7 @@ void DeviceUiTask(void*)
                 wqn::services::NoteWordInteraction();
             }
             poll_delay = kUiPollDelayTicks;
-            g_last_active_us_local = esp_timer_get_time();
+            g_last_active_us_local = event.occurred_at_ms * 1000;
         }
         // Apply the button event regardless of EPD refresh state. The previous
         // "skip while refreshing" guard silently dropped press/release events
@@ -531,7 +584,7 @@ void DeviceUiTask(void*)
         if (event.HasEvent()) {
             const RefreshSchedule before_sched = refresh_schedule;
             const device_ui_internal::UiUpdate update =
-                ui_runtime.DispatchButton(event, esp_timer_get_time() / 1000);
+                ui_runtime.DispatchButton(event, event.occurred_at_ms);
             const RefreshSchedule after_sched =
                 StrongerSchedule(refresh_schedule, update.refresh);
             if (after_sched != before_sched && after_sched == RefreshSchedule::kAi) {
@@ -544,6 +597,7 @@ void DeviceUiTask(void*)
             }
             refresh_schedule = after_sched;
         }
+        }  // for (consumed) button-event drain
 
         if (device_ui_internal::g_cloud_result_queue != nullptr) {
             device_ui_internal::CloudResultReady ready;
@@ -709,7 +763,7 @@ wqn::AiStreamingStatusView streaming_view{};
         // silent stuck domain looks identical to "cloud slow" from the UI.
         device_ui_internal::WarnStuckCloudDomains();
         if (status_reload_due && refresh_schedule == RefreshSchedule::kNone &&
-            !event.HasEvent() && interaction_quiet && cloud_quiet) {
+            !button_consumed_this_iter && interaction_quiet && cloud_quiet) {
             if (state.screen != wqn::UiScreen::kWord) {
                 // Storage/Wi-Fi reads are an effect. Build the typed snapshot
                 // outside UiRuntime, then reduce that immutable observation
@@ -935,7 +989,12 @@ wqn::AiStreamingStatusView streaming_view{};
             poll_delay = kUiIdlePollDelayTicks;
         }
 
-        vTaskDelay(poll_delay);
+        // [input-capture] Wait for the next button/cloud/sync notify or the
+        // poll deadline, whichever comes first. The button task, Send*Result
+        // and the sync-event sink all NotifyUiTask on arrival, so a queued
+        // event is consumed within one scheduler hop instead of up to the
+        // 500 ms idle poll period.
+        ulTaskNotifyTake(pdTRUE, poll_delay);
     }
 }
 
