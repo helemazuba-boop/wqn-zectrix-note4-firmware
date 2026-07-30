@@ -55,6 +55,8 @@ const char* AppEventKindName(AppEventKind event)
             return "word-persist";
         case AppEventKind::kNoteObservationPersist:
             return "note-persist";
+        case AppEventKind::kProblemVerdictPersist:
+            return "problem-persist";
         default:
             return "unknown";
     }
@@ -374,15 +376,57 @@ void UiRuntime::RestoreProblemImageRequest()
 bool UiRuntime::TakeProblemVerdictEffect(
     const std::string& request_id,
     const std::string& occurred_at,
+    uint32_t operation_id,
     wqn::DurableProblemObservation* observation)
 {
     return wqn::TakeProblemVerdictEffect(
-        &state_.problem_app, request_id, occurred_at, observation);
+        &state_.problem_app, request_id, occurred_at, operation_id, observation);
 }
 
-void UiRuntime::RestoreProblemVerdictEffect()
+UiUpdate UiRuntime::DispatchProblemVerdictPersistResult(
+    esp_err_t result, uint32_t operation_id)
 {
-    wqn::RestoreProblemVerdictEffect(&state_.problem_app);
+    // [persist-worker] Bind the result to the problem view it was taken from.
+    // A late result after a reset / newer verdict is dropped, not applied; the
+    // caller still acks the mailbox.
+    wqn::ProblemAppState& problem = state_.problem_app;
+    if (problem.commit_state != wqn::ProblemVerdictCommitState::kPersisting ||
+        problem.pending_persist_operation_id != operation_id) {
+        ESP_LOGW(kTag,
+                 "stale problem persist result: op=%lu expected=%lu state=%d",
+                 static_cast<unsigned long>(operation_id),
+                 static_cast<unsigned long>(problem.pending_persist_operation_id),
+                 static_cast<int>(problem.commit_state));
+        return FinishEvent(AppEventKind::kProblemVerdictPersist, RefreshSchedule::kNone, false);
+    }
+    wqn::ApplyProblemVerdictCommitResult(&problem, result);
+    if (result == ESP_OK) {
+        wqn::services::RequestProblemOutboxUpload();
+    } else {
+        ESP_LOGW(kTag, "problem verdict persist failed: %s", esp_err_to_name(result));
+    }
+    // Success advances to the next problem (a full-face change on the SSD1683
+    // -> kCommit clears large-partial ghosting, the old cloud-result policy);
+    // failure only flips the status message -> kSelection is enough.
+    const bool problem_on_screen =
+        state_.screen == wqn::UiScreen::kNote && problem.active;
+    const RefreshSchedule refresh = !problem_on_screen
+        ? RefreshSchedule::kNone
+        : (result == ESP_OK ? RefreshSchedule::kCommit
+                            : RefreshSchedule::kSelection);
+    return FinishEvent(AppEventKind::kProblemVerdictPersist, refresh, true);
+}
+
+UiUpdate UiRuntime::DispatchProblemVerdictTakeFailed()
+{
+    // wqn::TakeProblemVerdictEffect already moved the state to kFailed and set
+    // "记录无效"; advance the revision and repaint the status line so the
+    // failure surfaces instead of a stale view.
+    const RefreshSchedule refresh =
+        (state_.screen == wqn::UiScreen::kNote && state_.problem_app.active)
+            ? RefreshSchedule::kSelection
+            : RefreshSchedule::kNone;
+    return FinishEvent(AppEventKind::kProblemVerdictPersist, refresh, true);
 }
 
 UiUpdate UiRuntime::DispatchTimeTick(int64_t now_ms)

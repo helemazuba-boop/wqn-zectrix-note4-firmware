@@ -40,6 +40,7 @@ enum class AppEventKind : uint8_t {
     kTransferProgress,
     kWordObservationPersist,
     kNoteObservationPersist,
+    kProblemVerdictPersist,
 };
 
 struct UiUpdate {
@@ -117,8 +118,8 @@ public:
     bool TakeProblemVerdictEffect(
         const std::string& request_id,
         const std::string& occurred_at,
+        uint32_t operation_id,
         wqn::DurableProblemObservation* observation);
-    void RestoreProblemVerdictEffect();
 
     // [persist-worker] Word observation commit moved to the persist worker
     // (see ui/persist_worker.h). Take mirrors the note/problem effect wrappers;
@@ -143,6 +144,12 @@ public:
     // kSelection so the error status reaches the note screen.
     UiUpdate DispatchNoteObservationPersistResult(esp_err_t result, uint32_t operation_id);
     UiUpdate DispatchNoteObservationTakeFailed();
+
+    // [persist-worker] Problem verdict commit moved to the persist worker (c3).
+    // Success advances the problem view -> kCommit when on screen; a storage
+    // failure / Take-failure only flips the status message -> kSelection.
+    UiUpdate DispatchProblemVerdictPersistResult(esp_err_t result, uint32_t operation_id);
+    UiUpdate DispatchProblemVerdictTakeFailed();
 
 private:
     UiUpdate FinishEvent(

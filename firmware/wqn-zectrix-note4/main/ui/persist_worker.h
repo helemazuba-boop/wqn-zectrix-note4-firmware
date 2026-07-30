@@ -8,10 +8,9 @@
 #include "problem_store.h"
 #include "word_study_store.h"
 
-// [persist-worker] Dedicated local-write worker. Commit #1 is infrastructure
-// only: no call site uses the submit APIs yet (word/note/problem/settings are
-// migrated in later commits). It moves durable observation/verdict commits and
-// settings saves OFF the UI task and OFF the cloud interactive lane.
+// [persist-worker] Dedicated local-write worker. Word/note observation commits
+// and the problem verdict commit run here; settings saves follow (c4). It moves
+// durable local writes OFF the UI task and OFF the cloud interactive lane.
 //
 // Ratified contract (do not weaken without re-review):
 //  - The worker ONLY: pops an owned command, runs its storage transaction,
@@ -91,6 +90,9 @@ void EnqueueReservedNoteObservation(
     const PersistTicket& ticket,
     wqn::DurableNoteObservation observation,
     wqn::PersistedNoteSession advanced_session);
+void EnqueueReservedProblemVerdict(
+    const PersistTicket& ticket,
+    wqn::DurableProblemObservation observation);
 
 // --- Consumer side (UI task). ---
 // True when an unapplied terminal result is waiting for `kind`; copies it out.

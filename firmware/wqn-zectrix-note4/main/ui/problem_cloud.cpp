@@ -1,10 +1,12 @@
-// Problem cloud task: pack content sync, WQNI image fetch, verdict commit.
-// Mirrors ui/note_cloud.cpp for the problem domain (no sessions, no candidate
-// paging: packs are browsed offline in fixed order). kPackSync rides the bulk
-// lane; image fetches and the local verdict commit ride the interactive lane.
+// Problem cloud task: pack content sync and WQNI image fetch. Mirrors
+// ui/note_cloud.cpp for the problem domain (no sessions, no candidate paging:
+// packs are browsed offline in fixed order). kPackSync rides the bulk lane;
+// image fetches ride the interactive lane. The verdict commit runs on the
+// dedicated persist worker (c3), not on a cloud lane.
 
 #include "ui_internal.h"
 #include "ui_runtime.h"
+#include "persist_worker.h"
 
 #include <atomic>
 #include <cstdio>
@@ -121,33 +123,42 @@ void PumpProblemImageFetch(UiRuntime* runtime)
     }
 }
 
-// Staged payload for kCommitObservation. Non-POD, so it cannot ride the
-// CloudJob union; a single slot is safe because the problem domain admits one
-// in-flight request at a time (busy CAS in QueueProblemCloudRequest).
-wqn::DurableProblemObservation g_staged_problem_verdict;
-
-// Moves the verdict commit (a durable outbox append) off the UI task. The
-// reducer already advanced optimistically behind the kPersisting gate.
-void PumpProblemVerdictCommit(UiRuntime* runtime)
+// [persist-worker] Verdict commit (durable outbox append). Moved off the cloud
+// lane to the dedicated persist worker (c3): the user stays on the problem view
+// ("正在记录…") behind the kPersisting gate, and the NEXT problem only shows
+// once the durable result is applied and acked on the UI task. Two-phase
+// reserve so a failed reservation never costs the armed verdict (mirrors
+// word/note). The verdict carries no session snapshot, so unlike note there is
+// no candidate-page rollback to guard -- problem cloud results are never
+// deferred.
+RefreshSchedule PumpProblemVerdictCommit(UiRuntime* runtime)
 {
-    if (runtime == nullptr || IsProblemCloudBusy()) return;
+    if (runtime == nullptr) {
+        return RefreshSchedule::kNone;
+    }
+    if (IsPersistKindBusy(PersistKind::kProblemVerdict)) {
+        return RefreshSchedule::kNone;
+    }
+    if (!runtime->state().problem_app.verdict_effect_ready) {
+        return RefreshSchedule::kNone;
+    }
+    PersistTicket ticket = TryReservePersist(PersistKind::kProblemVerdict);
+    if (!ticket.valid()) {
+        return RefreshSchedule::kNone;
+    }
     const auto metadata = wqn::services::MakeDeviceRequestMetadata();
     std::string occurred_at = CurrentIsoTimestamp();
     if (occurred_at.empty()) {
-        // The verdict must stay durable even before SNTP; the server clamps
-        // implausible times when projecting it.
         occurred_at = "2024-01-01T00:00:00Z";
     }
+    wqn::DurableProblemObservation observation;
     if (!runtime->TakeProblemVerdictEffect(
-            metadata.request_id, occurred_at, &g_staged_problem_verdict)) {
-        return;
+            metadata.request_id, occurred_at, ticket.operation_id, &observation)) {
+        CancelPersistReservation(ticket);
+        return runtime->DispatchProblemVerdictTakeFailed().refresh;
     }
-    ProblemCloudRequest request;
-    request.op = ProblemCloudOp::kCommitObservation;
-    if (!QueueProblemCloudRequest(request)) {
-        ESP_LOGW(kProblemTag, "problem verdict commit queue rejected; will retry");
-        runtime->RestoreProblemVerdictEffect();
-    }
+    EnqueueReservedProblemVerdict(ticket, std::move(observation));
+    return RefreshSchedule::kNone;
 }
 
 ProblemCloudResult* PeekProblemCloudResult(uint32_t generation)
@@ -187,19 +198,6 @@ bool ApplyProblemCloudResult(wqn::UiState* state, ProblemCloudResult& result)
 {
     if (state == nullptr) {
         return false;
-    }
-    if (result.op == ProblemCloudOp::kCommitObservation) {
-        wqn::ApplyProblemVerdictCommitResult(&state->problem_app, result.result);
-        if (result.result == ESP_OK) {
-            // The durable verdict is the interaction boundary. Upload after a
-            // quiet period; a verdict must never launch the full sync pipeline.
-            wqn::services::RequestProblemOutboxUpload();
-        } else {
-            ESP_LOGW(kProblemTag, "problem verdict local commit failed: %s",
-                     esp_err_to_name(result.result));
-        }
-        // The verdict advance repaints the problem page.
-        return state->screen == wqn::UiScreen::kNote && state->problem_app.active;
     }
     if (result.op == ProblemCloudOp::kPackSync) {
         if (result.result == ESP_OK) {
@@ -247,14 +245,6 @@ void ExecuteProblemCloudRequest(const ProblemCloudRequest& request)
     ProblemCloudResult& result = g_problem_result_slot;
     result.op = request.op;
     result.message.clear();
-
-    if (request.op == ProblemCloudOp::kCommitObservation) {
-        // Pure local storage write (outbox append); no token or network
-        // involved, so it runs before the token gate.
-        result.result = wqn::CommitProblemObservation(g_staged_problem_verdict);
-        SendProblemCloudResult();
-        return;
-    }
 
     std::string token;
     if (!LoadValidTokenForTodo(&token)) {

@@ -262,9 +262,6 @@ struct NoteCloudResultReady {
 enum class ProblemCloudOp {
     kPackSync,
     kFetchImage,
-    // Local storage write (verdict outbox append); needs no network/token.
-    // Runs on the interactive lane so the durable append leaves the UI task.
-    kCommitObservation,
 };
 
 struct ProblemCloudRequest {
@@ -449,7 +446,10 @@ bool QueueProblemImageFetch(
     uint8_t image_index,
     const std::string& image_id);
 void PumpProblemImageFetch(UiRuntime* runtime);
-void PumpProblemVerdictCommit(UiRuntime* runtime);
+// [persist-worker] Problem verdict commit pump (c3). Reserves a persist slot,
+// takes the armed verdict and enqueues it to the worker (was the cloud lane).
+// Returns a refresh to fold into the next iteration's pending schedule.
+RefreshSchedule PumpProblemVerdictCommit(UiRuntime* runtime);
 
 bool ApplyTodoCloudResult(
     wqn::UiState* state,

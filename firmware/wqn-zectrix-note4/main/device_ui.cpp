@@ -526,19 +526,21 @@ void DeviceUiTask(void*)
             wqn::services::SyncEvent sync_event;
             while (xQueuePeek(g_sync_event_queue, &sync_event, 0) == pdTRUE) {
                 // [persist-worker] A succeeded sync reads the three outboxes
-                // synchronously in DispatchSyncResult; while a word/note commit
-                // is pending or any persist is in flight, that read would queue
-                // behind the observation transaction and re-freeze the UI. Leave
-                // the event queued (peek, do not receive) and consume it a later
-                // iteration once persistence is idle. Failed / AwaitingClaim
-                // touch no storage, so process them now. Peeking rather than
-                // receive-then-discard preserves the terminal event.
+                // synchronously in DispatchSyncResult; while a word/note/problem
+                // commit is pending or any persist is in flight, that read would
+                // queue behind the observation transaction and re-freeze the UI.
+                // Leave the event queued (peek, do not receive) and consume it a
+                // later iteration once persistence is idle. Failed /
+                // AwaitingClaim touch no storage, so process them now. Peeking
+                // rather than receive-then-discard preserves the terminal event.
                 if (sync_event.status ==
                         wqn::services::SyncEventStatus::kSucceeded &&
                     (state.word_app.session.commit_state ==
                          wqn::WordObservationCommitState::kPersisting ||
                      state.note_app.session.commit_state ==
                          wqn::NoteObservationCommitState::kPersisting ||
+                     state.problem_app.commit_state ==
+                         wqn::ProblemVerdictCommitState::kPersisting ||
                      device_ui_internal::IsAnyPersistBusy())) {
                     break;
                 }
@@ -779,6 +781,26 @@ void DeviceUiTask(void*)
             }
         }
 
+        // [persist-worker] Drain the problem verdict commit result (moved off
+        // the cloud lane in c3). Unlike note, a successful verdict advances the
+        // problem view, so the dispatch returns a refresh on both success and
+        // failure when the problem page is on screen.
+        {
+            device_ui_internal::PersistResultReceipt problem_persist;
+            if (device_ui_internal::TakePersistResultToApply(
+                    device_ui_internal::PersistKind::kProblemVerdict,
+                    &problem_persist)) {
+                const device_ui_internal::UiUpdate persist_update =
+                    ui_runtime.DispatchProblemVerdictPersistResult(
+                        problem_persist.result, problem_persist.operation_id);
+                refresh_schedule =
+                    StrongerSchedule(refresh_schedule, persist_update.refresh);
+                device_ui_internal::AckPersistResult(
+                    device_ui_internal::PersistKind::kProblemVerdict,
+                    problem_persist.generation, problem_persist.operation_id);
+            }
+        }
+
         const int64_t now_ms = esp_timer_get_time() / 1000;
         const device_ui_internal::UiUpdate time_update =
             ui_runtime.DispatchTimeTick(now_ms);
@@ -871,15 +893,18 @@ wqn::AiStreamingStatusView streaming_view{};
         // [persist-worker] The periodic reload reads storage on THIS task; a
         // word/settings commit in the persist worker holds a foreground storage
         // transaction, so a reload here would queue behind it and re-stall the
-        // UI. Skip while any persist is in flight, and also while a word OR note
-        // answer is Prepared-but-not-yet-applied (the wider kPersisting window,
-        // covering the Prepare->reserve gap: its session read/write -- reload
-        // even runs InitNoteApp() -- would otherwise race the pending commit).
+        // UI. Skip while any persist is in flight, and also while a word, note
+        // or problem answer is Prepared-but-not-yet-applied (the wider
+        // kPersisting window, covering the Prepare->reserve gap: its session
+        // read/write -- reload even runs InitNoteApp() -- would otherwise race
+        // the pending commit).
         const bool persist_quiet = !device_ui_internal::IsAnyPersistBusy() &&
             state.word_app.session.commit_state !=
                 wqn::WordObservationCommitState::kPersisting &&
             state.note_app.session.commit_state !=
-                wqn::NoteObservationCommitState::kPersisting;
+                wqn::NoteObservationCommitState::kPersisting &&
+            state.problem_app.commit_state !=
+                wqn::ProblemVerdictCommitState::kPersisting;
         // [hang-fix] Surface domains stuck busy past their lane budget; a
         // silent stuck domain looks identical to "cloud slow" from the UI.
         device_ui_internal::WarnStuckCloudDomains();
@@ -1052,7 +1077,9 @@ wqn::AiStreamingStatusView streaming_view{};
                 StrongerSchedule(refresh_schedule, transfer_update.refresh);
         }
         device_ui_internal::PumpProblemImageFetch(&ui_runtime);
-        device_ui_internal::PumpProblemVerdictCommit(&ui_runtime);
+        pending_refresh_schedule = device_ui_internal::StrongerSchedule(
+            pending_refresh_schedule,
+            device_ui_internal::PumpProblemVerdictCommit(&ui_runtime));
         if (word_pack_refresh_pending &&
             !device_ui_internal::IsWordCloudBusy() &&
             device_ui_internal::QueueWordReviewRefresh()) {
@@ -1191,9 +1218,9 @@ esp_err_t StartDeviceUiIfEnabled()
         return runner_result;
     }
 
-    // [persist-worker] Local-write worker (see ui/persist_worker.cpp). Commit #1
-    // starts it; no domain submits to it yet (word/note/problem/settings are
-    // migrated in later commits).
+    // [persist-worker] Local-write worker (see ui/persist_worker.cpp): word,
+    // note and problem observation/verdict commits run on it (settings follow
+    // in c4).
     const esp_err_t persist_result = device_ui_internal::StartPersistWorker();
     if (persist_result != ESP_OK) {
         return persist_result;

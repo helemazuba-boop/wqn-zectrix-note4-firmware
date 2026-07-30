@@ -613,6 +613,17 @@ esp_err_t HandleProblemAppInput(ProblemAppState* state, ProblemInput input)
         ESP_RETURN_ON_ERROR(InitProblemApp(state), kTag, "init problem app");
     }
     if (!state->active) return ESP_OK;
+    // [persist-worker] While a verdict is committing (kPersisting covers the
+    // whole Prepare -> worker-apply window, wider than persist busy), leaving
+    // the current view could drop the problem layer or switch sets; the late
+    // result would then AdvanceAfterVerdict() against the wrong set/list. Block
+    // the escape until the terminal result is applied; every other input stays
+    // responsive.
+    if (input == ProblemInput::kLongConfirm &&
+        state->commit_state == ProblemVerdictCommitState::kPersisting) {
+        state->message = "正在保存，请稍后离开";
+        return ESP_OK;
+    }
     switch (state->mode) {
         case ProblemAppMode::kProblemList:
             HandleProblemListInput(state, input);
@@ -643,6 +654,14 @@ void ApplyProblemPackIndex(
 bool ActivateProblemBrowse(ProblemAppState* state, const std::string& set_id)
 {
     if (state == nullptr || set_id.size() != 36) return false;
+    // [persist-worker] Second line of defense behind the LongConfirm gate: an
+    // unexpected entry path must not switch sets (resetting set_order and
+    // list_selected) while a verdict commit is still in flight, or the late
+    // result would advance the wrong set.
+    if (state->commit_state == ProblemVerdictCommitState::kPersisting) {
+        state->message = "正在保存，请稍后";
+        return false;
+    }
     if (!state->initialized) {
         ESP_ERROR_CHECK_WITHOUT_ABORT(InitProblemApp(state));
     }
@@ -809,6 +828,7 @@ bool TakeProblemVerdictEffect(
     ProblemAppState* state,
     const std::string& request_id,
     const std::string& occurred_at,
+    uint32_t operation_id,
     DurableProblemObservation* observation)
 {
     if (state == nullptr || observation == nullptr ||
@@ -829,6 +849,9 @@ bool TakeProblemVerdictEffect(
         return false;
     }
     state->verdict_effect_ready = false;
+    // Bind this dispatch so a late worker result after a reset / newer submit
+    // is rejected instead of applied (mirrors word/note).
+    state->pending_persist_operation_id = operation_id;
     *observation = pending;
     return true;
 }
@@ -836,6 +859,9 @@ bool TakeProblemVerdictEffect(
 void ApplyProblemVerdictCommitResult(ProblemAppState* state, esp_err_t result)
 {
     if (state == nullptr) return;
+    // The bound dispatch is consumed either way; clearing keeps the expected-id
+    // invariant tight (the kPersisting guard at the caller is the primary one).
+    state->pending_persist_operation_id = 0;
     if (result != ESP_OK) {
         state->commit_state = ProblemVerdictCommitState::kFailed;
         state->advance_after_commit = false;
@@ -850,16 +876,6 @@ void ApplyProblemVerdictCommitResult(ProblemAppState* state, esp_err_t result)
     if (state->advance_after_commit) {
         state->advance_after_commit = false;
         AdvanceAfterVerdict(state);
-    }
-}
-
-void RestoreProblemVerdictEffect(ProblemAppState* state)
-{
-    if (state == nullptr) return;
-    // Only a taken-but-undispatched effect may be re-armed; a terminal
-    // failure (kFailed) stays failed.
-    if (state->commit_state == ProblemVerdictCommitState::kPersisting) {
-        state->verdict_effect_ready = true;
     }
 }
 
@@ -1113,34 +1129,41 @@ bool RunProblemPageStateSelfTest()
         return false;
     }
 
-    // Take assigns the request id exactly once; commit success advances to
-    // the next problem in fixed pack order.
+    // Take assigns the request id exactly once and binds the dispatch's
+    // operation id; while the commit is persisting, LongConfirm must not leave
+    // the view (a late result would advance the wrong set) and set switches
+    // are refused.
     DurableProblemObservation observation;
     if (!require(
             TakeProblemVerdictEffect(
-                &a, "req_problem_selftest_01", "2026-07-26T00:00:00.000Z",
+                &a, "req_problem_selftest_01", "2026-07-26T00:00:00.000Z", 1u,
                 &observation),
             "take verdict effect") ||
         !require(observation.action == ReviewAction::kHesitant, "effect action") ||
         !require(
             observation.problem_id == "00000000-0000-4000-8000-000000000100",
-            "effect problem id")) {
+            "effect problem id") ||
+        !require(a.pending_persist_operation_id == 1u,
+                 "take binds the dispatch operation id")) {
         return false;
     }
-    RestoreProblemVerdictEffect(&a);
-    DurableProblemObservation replay;
-    if (!require(
-            TakeProblemVerdictEffect(
-                &a, "req_problem_selftest_02", "2026-07-26T00:00:01.000Z", &replay),
-            "re-take after restore") ||
-        !require(replay.request_id == "req_problem_selftest_01",
-                 "retry keeps the first request id")) {
+    const size_t set_before = a.set_order;
+    if (HandleProblemAppInput(&a, ProblemInput::kLongConfirm) != ESP_OK ||
+        !require(a.mode == ProblemAppMode::kProblemView,
+                 "long-press is blocked while persisting") ||
+        !require(a.active, "problem layer stays active while persisting") ||
+        !require(a.set_order == set_before, "set unchanged while persisting") ||
+        !require(!ActivateProblemBrowse(&a, "00000000-0000-4000-8000-0000000000aa"),
+                 "set switch refused while persisting") ||
+        !require(a.set_order == set_before, "set unchanged after refused switch")) {
         return false;
     }
     const size_t before = a.list_selected;
     ApplyProblemVerdictCommitResult(&a, ESP_OK);
     if (!require(a.commit_state == ProblemVerdictCommitState::kCloudPending,
                  "commit result moves to cloud pending") ||
+        !require(a.pending_persist_operation_id == 0,
+                 "apply clears the bound operation id") ||
         !require(a.list_selected == before + 1, "commit advances to the next problem") ||
         !require(a.mode == ProblemAppMode::kProblemView, "advance stays in the view") ||
         !require(!a.answer_unlocked, "next problem opens locked")) {

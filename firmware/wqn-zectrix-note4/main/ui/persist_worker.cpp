@@ -167,10 +167,10 @@ void EnqueueReserved(PersistCommand& command, uint8_t slot_index, PersistKind ki
     }
 }
 
-// Runs the owned storage transaction. WORKER TASK ONLY. Word/note have
-// foreground commit entries today; problem/settings are wired in their own
-// commits once they gain a foreground/worker-dedicated storage entry, and no
-// submit API enqueues them in commit #1.
+// Runs the owned storage transaction. WORKER TASK ONLY. Word/note/problem all
+// call their foreground commit entries; settings kinds are wired in c4 once
+// they gain a foreground/worker-dedicated storage entry, and no submit API
+// enqueues them until then.
 esp_err_t ExecutePersistCommand(PersistCommand& command)
 {
     switch (command.kind) {
@@ -179,6 +179,7 @@ esp_err_t ExecutePersistCommand(PersistCommand& command)
         case PersistKind::kNoteObservation:
             return wqn::CommitNoteObservation(command.note_obs, command.note_advanced);
         case PersistKind::kProblemVerdict:
+            return wqn::CommitProblemObservation(command.problem_obs);
         case PersistKind::kSettingsAutoSync:
         case PersistKind::kSettingsVolume:
         case PersistKind::kSettingsDefaultDeck:
@@ -358,6 +359,19 @@ void EnqueueReservedNoteObservation(
     }
     command->note_obs = std::move(observation);
     command->note_advanced = std::move(advanced_session);
+    EnqueueReserved(*command, ticket.slot_index, ticket.kind);
+}
+
+void EnqueueReservedProblemVerdict(
+    const PersistTicket& ticket,
+    wqn::DurableProblemObservation observation)
+{
+    PersistCommand* command = ReservedCommand(ticket);
+    if (command == nullptr || ticket.kind != PersistKind::kProblemVerdict) {
+        ESP_LOGE(kTag, "enqueue problem: stale/mismatched ticket");
+        return;
+    }
+    command->problem_obs = std::move(observation);
     EnqueueReserved(*command, ticket.slot_index, ticket.kind);
 }
 
