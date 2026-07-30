@@ -21,6 +21,7 @@
 #include "power_manager.h"
 #include "runtime/wake_context.h"
 #include "services/sync_service.h"
+#include "ui/persist_worker.h"
 #include "ui/ui_internal.h"
 #include "ui/ui_runtime.h"
 #include "ui_model.h"
@@ -1081,6 +1082,14 @@ esp_err_t StartDeviceUiIfEnabled()
     const esp_err_t runner_result = device_ui_internal::StartCloudRunner();
     if (runner_result != ESP_OK) {
         return runner_result;
+    }
+
+    // [persist-worker] Local-write worker (see ui/persist_worker.cpp). Commit #1
+    // starts it; no domain submits to it yet (word/note/problem/settings are
+    // migrated in later commits).
+    const esp_err_t persist_result = device_ui_internal::StartPersistWorker();
+    if (persist_result != ESP_OK) {
+        return persist_result;
     }
 
     // UI state loading verifies word-pack files with a 1 KiB local read buffer,
