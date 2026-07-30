@@ -3,6 +3,7 @@
 // Extracted from device_ui.cpp.
 
 #include "ui_internal.h"
+#include "persist_worker.h"
 
 #include <string>
 
@@ -51,14 +52,23 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
         }
         if (short_press && event.button == wqn::ButtonId::kConfirm) {
             const uint32_t minutes = kAutoSyncOptions[state->settings.auto_sync_selected];
-            const esp_err_t result = wqn::SaveAutoSyncIntervalMinutes(minutes);
-            if (result == ESP_OK) {
-                state->settings.auto_sync_interval_min = minutes;
-                state->settings.notice = "自动同步已保存：" + wqn::AutoSyncIntervalLabel(minutes);
-                wqn::services::RequestSyncNow();
+            // [persist-worker] Async save (c4): the NVS commit used to run
+            // synchronously here and could stall the UI behind a background
+            // write storm. Arm the value first so a rejected submit or a write
+            // failure keeps it for a re-Confirm; the displayed value and
+            // RequestSyncNow() wait for the durable ACK. The per-kind busy
+            // rejects a duplicate Confirm while one save is in flight.
+            state->settings.pending_auto_sync_minutes = minutes;
+            state->settings.auto_sync_pending_valid = true;
+            const uint32_t op_id = SubmitAutoSyncIntervalSave(minutes);
+            if (op_id != 0) {
+                state->settings.auto_sync_save_op_id = op_id;
+                state->settings.notice = "正在保存…";
             } else {
-                state->settings.notice = "自动同步保存失败";
-                ESP_LOGW(kTag, "save auto sync interval failed: %s", esp_err_to_name(result));
+                state->settings.auto_sync_save_op_id = 0;
+                state->settings.notice = IsPersistKindBusy(PersistKind::kSettingsAutoSync)
+                    ? "正在保存，请稍后"
+                    : "保存繁忙，请重试";
             }
             state->settings.dialog = wqn::SettingsDialog::kNone;
             return RefreshSchedule::kConfig;
@@ -83,13 +93,18 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
         }
         if (short_press && event.button == wqn::ButtonId::kConfirm) {
             const int percent = kVolumeOptions[state->settings.volume_selected];
-            const esp_err_t result = wqn::SaveVolumePercent(percent);
-            if (result == ESP_OK) {
-                state->settings.volume_percent = percent;
-                state->settings.notice = "音量已保存：" + wqn::VolumeLabel(percent);
+            // [persist-worker] Async save (c4), mirrors the auto-sync dialog.
+            state->settings.pending_volume_percent = percent;
+            state->settings.volume_pending_valid = true;
+            const uint32_t op_id = SubmitVolumeSave(percent);
+            if (op_id != 0) {
+                state->settings.volume_save_op_id = op_id;
+                state->settings.notice = "正在保存…";
             } else {
-                state->settings.notice = "音量保存失败";
-                ESP_LOGW(kTag, "save volume failed: %s", esp_err_to_name(result));
+                state->settings.volume_save_op_id = 0;
+                state->settings.notice = IsPersistKindBusy(PersistKind::kSettingsVolume)
+                    ? "正在保存，请稍后"
+                    : "保存繁忙，请重试";
             }
             state->settings.dialog = wqn::SettingsDialog::kNone;
             return RefreshSchedule::kConfig;
@@ -166,6 +181,13 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
 
     if (state->settings.dialog == wqn::SettingsDialog::kFactoryReset) {
         if (long_press && event.button == wqn::ButtonId::kConfirm) {
+            // [persist-worker] Defensive second line behind the main-page gate:
+            // a factory reset erases NVS and reboots -- never do it while a
+            // durable local write is still in flight on the persist worker.
+            if (device_ui_internal::IsAnyPersistBusy()) {
+                state->settings.notice = "正在保存，请稍后";
+                return RefreshSchedule::kConfig;
+            }
             state->settings.notice = "正在恢复出厂";
             ESP_LOGW(kTag, "factory reset requested from settings page");
             const esp_err_t reset_result = wqn::FactoryResetNvsAndRestart();
@@ -219,6 +241,27 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
     }
     if (event.button != wqn::ButtonId::kConfirm) {
         return RefreshSchedule::kNone;
+    }
+
+    // [persist-worker] Every main-page Confirm below either reads storage on the
+    // UI task (OpenSettingsDialog -> UpdateSettingsDiagnostics, the firmware-
+    // version row) or writes it synchronously (default word deck, factory
+    // reset). While any local write is in flight -- IsAnyPersistBusy(), or the
+    // wider commit_state==kPersisting window that also covers a domain's
+    // Prepare->reserve gap -- that work would contend with or queue behind the
+    // persist worker's transaction and re-stall the UI. Refuse the action with
+    // a notice; nothing is opened, read or written.
+    const bool persist_pending =
+        device_ui_internal::IsAnyPersistBusy() ||
+        state->word_app.session.commit_state ==
+            wqn::WordObservationCommitState::kPersisting ||
+        state->note_app.session.commit_state ==
+            wqn::NoteObservationCommitState::kPersisting ||
+        state->problem_app.commit_state ==
+            wqn::ProblemVerdictCommitState::kPersisting;
+    if (persist_pending) {
+        state->settings.notice = "正在保存，请稍后";
+        return RefreshSchedule::kConfig;
     }
 
     switch (state->settings.selected) {

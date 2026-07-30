@@ -326,9 +326,18 @@ void OpenSettingsDialog(wqn::UiState* state, wqn::SettingsDialog dialog)
     UpdateSettingsDiagnostics(state);
     state->settings.dialog = dialog;
     if (dialog == wqn::SettingsDialog::kAutoSync) {
-        state->settings.auto_sync_selected = AutoSyncOptionIndex(state->settings.auto_sync_interval_min);
+        // [persist-worker] Preselect an armed-but-unsaved value (submit rejected
+        // or write failed) over the durable one so a re-Confirm retries the
+        // intended interval; 0 is valid, hence the *_pending_valid flag.
+        const uint32_t seed = state->settings.auto_sync_pending_valid
+            ? state->settings.pending_auto_sync_minutes
+            : state->settings.auto_sync_interval_min;
+        state->settings.auto_sync_selected = AutoSyncOptionIndex(seed);
     } else if (dialog == wqn::SettingsDialog::kVolume) {
-        state->settings.volume_selected = VolumeOptionIndex(state->settings.volume_percent);
+        const int seed = state->settings.volume_pending_valid
+            ? state->settings.pending_volume_percent
+            : state->settings.volume_percent;
+        state->settings.volume_selected = VolumeOptionIndex(seed);
     } else if (dialog == wqn::SettingsDialog::kDefaultWordDeck) {
         // Option 0 is the fixed 全部词库; the rest mirror the mounted deck
         // catalog. Preselect the current default when it is still mounted.

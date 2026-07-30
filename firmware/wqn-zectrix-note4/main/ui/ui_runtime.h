@@ -41,6 +41,7 @@ enum class AppEventKind : uint8_t {
     kWordObservationPersist,
     kNoteObservationPersist,
     kProblemVerdictPersist,
+    kSettingsPersist,
 };
 
 struct UiUpdate {
@@ -150,6 +151,13 @@ public:
     // failure / Take-failure only flips the status message -> kSelection.
     UiUpdate DispatchProblemVerdictPersistResult(esp_err_t result, uint32_t operation_id);
     UiUpdate DispatchProblemVerdictTakeFailed();
+
+    // [persist-worker] Async settings saves (c4). op_id must match the pending
+    // record armed at Confirm; success installs the value ("已保存", auto-sync
+    // additionally triggers RequestSyncNow), failure keeps the displayed value
+    // untouched and asks for a re-Confirm. Settings-area refresh either way.
+    UiUpdate DispatchAutoSyncSaveResult(esp_err_t result, uint32_t operation_id);
+    UiUpdate DispatchVolumeSaveResult(esp_err_t result, uint32_t operation_id);
 
 private:
     UiUpdate FinishEvent(

@@ -239,6 +239,21 @@ struct SettingsAppState {
     std::string default_word_deck_title;
     std::string sync_status;
     std::string notice;
+    // [persist-worker] In-flight/failed async settings saves (c4). Confirm arms
+    // the chosen value here (pending_* + *_pending_valid) and, on a successful
+    // submit, its dispatch operation id. The UI shows "正在保存" and only installs
+    // the value ("已保存", auto-sync also kicks RequestSyncNow) when the durable
+    // result comes back with a matching id. A submit reject or a write failure
+    // KEEPS the armed value (*_pending_valid stays true, op id back to 0) so a
+    // re-open preselects it and the user re-Confirms; only success/cancel
+    // clears it. 0 is a valid interval/volume, so the *_valid flag -- not a zero
+    // sentinel -- marks "armed".
+    uint32_t pending_auto_sync_minutes = 0;
+    bool auto_sync_pending_valid = false;
+    uint32_t auto_sync_save_op_id = 0;
+    int pending_volume_percent = 0;
+    bool volume_pending_valid = false;
+    uint32_t volume_save_op_id = 0;
     SettingsDiagnosticsSnapshot diagnostics;
 };
 

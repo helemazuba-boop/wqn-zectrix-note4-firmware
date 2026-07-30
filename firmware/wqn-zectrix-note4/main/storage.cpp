@@ -1,5 +1,6 @@
 #include "storage.h"
 
+#include <atomic>
 #include <cstdint>
 #include <vector>
 
@@ -992,6 +993,20 @@ esp_err_t SaveAutoSyncIntervalMinutes(uint32_t minutes)
     return SaveU64ToNvs(kAutoSyncIntervalMinKey, minutes);
 }
 
+esp_err_t SaveAutoSyncIntervalMinutesForeground(uint32_t minutes)
+{
+    StorageWriteGuard write("save-sync-interval", __FILE__, __LINE__);
+    if (!write) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!IsValidAutoSyncInterval(minutes)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    U64WriteContext context = {kAutoSyncIntervalMinKey, minutes};
+    return services::ExecuteForegroundStorageTransaction(
+        SaveU64Transaction, &context, "save-sync-interval");
+}
+
 esp_err_t LoadDefaultWordDeckId(std::string* deck_id)
 {
     if (deck_id == nullptr) {
@@ -1052,7 +1067,12 @@ std::string AutoSyncIntervalLabel(uint32_t minutes)
 constexpr int kVolumeDefaultPercent = 100;
 constexpr const char* kAudioNamespace = "audio";
 constexpr const char* kVolumeNvsKey = "output_volume";
-int g_volume_percent_cache = kVolumeDefaultPercent;
+// [persist-worker] Read by the audio task, written by the UI task (the sync
+// SaveVolumePercent and SubmitVolumeSave's post-reserve update via
+// SetPlaybackVolumeCache) plus the boot restore in main.cpp. Atomic + relaxed
+// removes the cross-task data race; the value is a self-contained scalar so no
+// ordering with other state is needed.
+std::atomic<int> g_volume_percent_cache{kVolumeDefaultPercent};
 
 esp_err_t SaveVolumeTransaction(void* opaque)
 {
@@ -1108,7 +1128,12 @@ esp_err_t LoadVolumePercent(int* percent)
     if (v < 0) v = 0;
     if (v > 100) v = 100;
     *percent = v;
-    g_volume_percent_cache = v;
+    // Pure persistent read: deliberately does NOT touch the runtime playback
+    // cache. Callers such as the settings diagnostics and the periodic status
+    // reload re-read NVS while an async volume save may still be pending or
+    // failed-awaiting-retry; writing the old durable value back here silently
+    // rolled the audible volume back under the user. Boot explicitly seeds the
+    // cache via SetPlaybackVolumeCache (main.cpp).
     return ret;
 }
 
@@ -1121,8 +1146,25 @@ esp_err_t SaveVolumePercent(int percent)
     if (percent < 0 || percent > 100) {
         return ESP_ERR_INVALID_ARG;
     }
-    g_volume_percent_cache = percent;
+    g_volume_percent_cache.store(percent, std::memory_order_relaxed);
     return services::ExecuteStorageTransaction(SaveVolumeTransaction, &percent);
+}
+
+esp_err_t SaveVolumePercentForeground(int percent)
+{
+    StorageWriteGuard write("save-volume", __FILE__, __LINE__);
+    if (!write) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (percent < 0 || percent > 100) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    // The runtime cache is NOT touched here: the UI thread updates it right
+    // after a successful reserve/enqueue (SetPlaybackVolumeCache), so playback
+    // uses the new level immediately regardless of how long the durable NVS
+    // write waits behind other worker commands.
+    return services::ExecuteForegroundStorageTransaction(
+        SaveVolumeTransaction, &percent, "save-volume");
 }
 
 std::string VolumeLabel(int percent)
@@ -1135,7 +1177,14 @@ std::string VolumeLabel(int percent)
 
 int GetPlaybackVolumePercent()
 {
-    return g_volume_percent_cache;
+    return g_volume_percent_cache.load(std::memory_order_relaxed);
+}
+
+void SetPlaybackVolumeCache(int percent)
+{
+    if (percent < 0) percent = 0;
+    if (percent > 100) percent = 100;
+    g_volume_percent_cache.store(percent, std::memory_order_relaxed);
 }
 
 esp_err_t FactoryResetNvsAndRestart()

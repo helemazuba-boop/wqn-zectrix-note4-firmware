@@ -801,6 +801,37 @@ void DeviceUiTask(void*)
             }
         }
 
+        // [persist-worker] Drain the async settings save results (c4). Success
+        // installs the value + "已保存" (auto-sync also kicks RequestSyncNow);
+        // failure keeps the displayed value and asks for a re-Confirm.
+        {
+            device_ui_internal::PersistResultReceipt settings_persist;
+            if (device_ui_internal::TakePersistResultToApply(
+                    device_ui_internal::PersistKind::kSettingsAutoSync,
+                    &settings_persist)) {
+                const device_ui_internal::UiUpdate persist_update =
+                    ui_runtime.DispatchAutoSyncSaveResult(
+                        settings_persist.result, settings_persist.operation_id);
+                refresh_schedule =
+                    StrongerSchedule(refresh_schedule, persist_update.refresh);
+                device_ui_internal::AckPersistResult(
+                    device_ui_internal::PersistKind::kSettingsAutoSync,
+                    settings_persist.generation, settings_persist.operation_id);
+            }
+            if (device_ui_internal::TakePersistResultToApply(
+                    device_ui_internal::PersistKind::kSettingsVolume,
+                    &settings_persist)) {
+                const device_ui_internal::UiUpdate persist_update =
+                    ui_runtime.DispatchVolumeSaveResult(
+                        settings_persist.result, settings_persist.operation_id);
+                refresh_schedule =
+                    StrongerSchedule(refresh_schedule, persist_update.refresh);
+                device_ui_internal::AckPersistResult(
+                    device_ui_internal::PersistKind::kSettingsVolume,
+                    settings_persist.generation, settings_persist.operation_id);
+            }
+        }
+
         const int64_t now_ms = esp_timer_get_time() / 1000;
         const device_ui_internal::UiUpdate time_update =
             ui_runtime.DispatchTimeTick(now_ms);

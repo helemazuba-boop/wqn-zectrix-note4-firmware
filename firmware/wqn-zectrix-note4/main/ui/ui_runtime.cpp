@@ -5,6 +5,7 @@
 #include "esp_log.h"
 #include "ui_internal.h"
 #include "services/sync_service.h"
+#include "storage.h"
 #include "word_app.h"
 
 namespace device_ui_internal {
@@ -57,6 +58,8 @@ const char* AppEventKindName(AppEventKind event)
             return "note-persist";
         case AppEventKind::kProblemVerdictPersist:
             return "problem-persist";
+        case AppEventKind::kSettingsPersist:
+            return "settings-persist";
         default:
             return "unknown";
     }
@@ -427,6 +430,67 @@ UiUpdate UiRuntime::DispatchProblemVerdictTakeFailed()
             ? RefreshSchedule::kSelection
             : RefreshSchedule::kNone;
     return FinishEvent(AppEventKind::kProblemVerdictPersist, refresh, true);
+}
+
+UiUpdate UiRuntime::DispatchAutoSyncSaveResult(esp_err_t result, uint32_t operation_id)
+{
+    // [persist-worker] Bind to the record armed at Confirm; a mismatched id
+    // means the pending save was superseded/cleared -- drop it (caller still
+    // acks the mailbox so the slot frees).
+    wqn::SettingsAppState& settings = state_.settings;
+    if (settings.auto_sync_save_op_id == 0 ||
+        settings.auto_sync_save_op_id != operation_id) {
+        ESP_LOGW(kTag, "stale auto-sync save result: op=%lu expected=%lu",
+                 static_cast<unsigned long>(operation_id),
+                 static_cast<unsigned long>(settings.auto_sync_save_op_id));
+        return FinishEvent(AppEventKind::kSettingsPersist, RefreshSchedule::kNone, false);
+    }
+    settings.auto_sync_save_op_id = 0;
+    if (result == ESP_OK) {
+        settings.auto_sync_interval_min = settings.pending_auto_sync_minutes;
+        settings.auto_sync_pending_valid = false;  // durably saved: nothing to retry
+        settings.notice =
+            "自动同步已保存：" + wqn::AutoSyncIntervalLabel(settings.auto_sync_interval_min);
+        // Only a durably saved interval may kick a sync round.
+        wqn::services::RequestSyncNow();
+    } else {
+        // Keep the displayed (old) value AND the armed pending value so a
+        // re-open preselects the intended interval and the user re-Confirms.
+        settings.notice = "自动同步保存失败，请重试";
+        ESP_LOGW(kTag, "auto-sync save failed: %s", esp_err_to_name(result));
+    }
+    const RefreshSchedule refresh = state_.screen == wqn::UiScreen::kSettings
+        ? RefreshSchedule::kConfig
+        : RefreshSchedule::kNone;
+    return FinishEvent(AppEventKind::kSettingsPersist, refresh, true);
+}
+
+UiUpdate UiRuntime::DispatchVolumeSaveResult(esp_err_t result, uint32_t operation_id)
+{
+    wqn::SettingsAppState& settings = state_.settings;
+    if (settings.volume_save_op_id == 0 ||
+        settings.volume_save_op_id != operation_id) {
+        ESP_LOGW(kTag, "stale volume save result: op=%lu expected=%lu",
+                 static_cast<unsigned long>(operation_id),
+                 static_cast<unsigned long>(settings.volume_save_op_id));
+        return FinishEvent(AppEventKind::kSettingsPersist, RefreshSchedule::kNone, false);
+    }
+    settings.volume_save_op_id = 0;
+    if (result == ESP_OK) {
+        settings.volume_percent = settings.pending_volume_percent;
+        settings.volume_pending_valid = false;  // durably saved: nothing to retry
+        settings.notice = "音量已保存：" + wqn::VolumeLabel(settings.volume_percent);
+    } else {
+        // The runtime playback cache already holds pending_volume_percent (set
+        // at submit); keep the armed value so a re-open preselects it. Make the
+        // status explicit that it is not durably saved yet.
+        settings.notice = "音量未保存，请重试";
+        ESP_LOGW(kTag, "volume save failed: %s", esp_err_to_name(result));
+    }
+    const RefreshSchedule refresh = state_.screen == wqn::UiScreen::kSettings
+        ? RefreshSchedule::kConfig
+        : RefreshSchedule::kNone;
+    return FinishEvent(AppEventKind::kSettingsPersist, refresh, true);
 }
 
 UiUpdate UiRuntime::DispatchTimeTick(int64_t now_ms)

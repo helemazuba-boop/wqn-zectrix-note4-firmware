@@ -11,6 +11,7 @@
 #include "freertos/task.h"
 
 #include "runtime/sleep_coordinator.h"
+#include "storage.h"
 #include "ui_internal.h"  // NotifyUiTask
 
 namespace device_ui_internal {
@@ -167,10 +168,8 @@ void EnqueueReserved(PersistCommand& command, uint8_t slot_index, PersistKind ki
     }
 }
 
-// Runs the owned storage transaction. WORKER TASK ONLY. Word/note/problem all
-// call their foreground commit entries; settings kinds are wired in c4 once
-// they gain a foreground/worker-dedicated storage entry, and no submit API
-// enqueues them until then.
+// Runs the owned storage transaction. WORKER TASK ONLY. Every kind calls a
+// foreground/worker-dedicated storage entry so the queue wait stays bounded.
 esp_err_t ExecutePersistCommand(PersistCommand& command)
 {
     switch (command.kind) {
@@ -181,7 +180,10 @@ esp_err_t ExecutePersistCommand(PersistCommand& command)
         case PersistKind::kProblemVerdict:
             return wqn::CommitProblemObservation(command.problem_obs);
         case PersistKind::kSettingsAutoSync:
+            return wqn::SaveAutoSyncIntervalMinutesForeground(
+                static_cast<uint32_t>(command.settings_int));
         case PersistKind::kSettingsVolume:
+            return wqn::SaveVolumePercentForeground(command.settings_int);
         case PersistKind::kSettingsDefaultDeck:
         case PersistKind::kCount:
             return ESP_ERR_NOT_SUPPORTED;
@@ -373,6 +375,34 @@ void EnqueueReservedProblemVerdict(
     }
     command->problem_obs = std::move(observation);
     EnqueueReserved(*command, ticket.slot_index, ticket.kind);
+}
+
+uint32_t SubmitAutoSyncIntervalSave(uint32_t minutes)
+{
+    PersistTicket ticket = TryReservePersist(PersistKind::kSettingsAutoSync);
+    if (!ticket.valid()) {
+        return 0;
+    }
+    PersistCommand& command = g_pool[ticket.slot_index];
+    command.settings_int = static_cast<int>(minutes);
+    EnqueueReserved(command, ticket.slot_index, ticket.kind);
+    return ticket.operation_id;
+}
+
+uint32_t SubmitVolumeSave(int percent)
+{
+    PersistTicket ticket = TryReservePersist(PersistKind::kSettingsVolume);
+    if (!ticket.valid()) {
+        return 0;
+    }
+    PersistCommand& command = g_pool[ticket.slot_index];
+    command.settings_int = percent;
+    // Update the runtime playback cache immediately (this is the UI thread), so
+    // playback uses the new level regardless of how long the durable NVS write
+    // waits behind other worker commands.
+    wqn::SetPlaybackVolumeCache(percent);
+    EnqueueReserved(command, ticket.slot_index, ticket.kind);
+    return ticket.operation_id;
 }
 
 bool TakePersistResultToApply(PersistKind kind, PersistResultReceipt* out)

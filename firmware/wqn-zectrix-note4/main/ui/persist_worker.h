@@ -94,6 +94,15 @@ void EnqueueReservedProblemVerdict(
     const PersistTicket& ticket,
     wqn::DurableProblemObservation observation);
 
+// --- Settings saves (c4). Unlike the observation kinds, the payload is a
+//     plain value known at Confirm time -- nothing is pulled from UI state, so
+//     a failed submit loses nothing (the caller keeps its value and the user
+//     retries). One-shot: reserve + fill + enqueue. Returns the operation id,
+//     or 0 when the kind is busy / the pool is full / the lease is
+//     unavailable. The per-kind busy doubles as the duplicate-Confirm guard.
+uint32_t SubmitAutoSyncIntervalSave(uint32_t minutes);
+uint32_t SubmitVolumeSave(int percent);
+
 // --- Consumer side (UI task). ---
 // True when an unapplied terminal result is waiting for `kind`; copies it out.
 bool TakePersistResultToApply(PersistKind kind, PersistResultReceipt* out);
