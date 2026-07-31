@@ -286,6 +286,7 @@ void ApplyNoteBodyFetchResult(
     NotePackIndex index,
     bool index_ready,
     bool auth_required,
+    const std::string& fetched_notebook_id,
     const std::string& message);
 // Frees the held WQNI payload (used when the user leaves the note screen);
 // keeps request/in-flight bookkeeping intact.

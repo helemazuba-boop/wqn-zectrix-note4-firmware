@@ -5,6 +5,8 @@
 
 #include "note_cloud.h"
 
+#include <algorithm>
+#include <set>
 #include <utility>
 
 #include "esp_log.h"
@@ -113,6 +115,12 @@ esp_err_t SyncNotePacks(const std::string& token, NotePackSyncResult* out)
     local_manifest.cursor = 0;
 
     size_t page_count = 0;
+    // [archive-prune] Every notebook id listed by this walk. The manifest
+    // is a full relist from offset 0, so a COMPLETED walk is a snapshot:
+    // anything locally known but absent from it was archived/deleted on
+    // the web (the feed never emits tombstones for archives).
+    std::set<std::string> seen_notebooks;
+    bool listing_complete = false;
     bool has_more = out->result == ESP_OK;
     while (out->result == ESP_OK && has_more &&
            page_count < kMaxManifestPagesPerSync) {
@@ -135,6 +143,8 @@ esp_err_t SyncNotePacks(const std::string& token, NotePackSyncResult* out)
         for (const WqnNotePackManifestNotebook& item : delta.notebooks) {
             if (item.deleted) {
                 manifest_content_changed = true;
+            } else {
+                seen_notebooks.insert(item.notebook_id);
             }
         }
 
@@ -211,6 +221,32 @@ esp_err_t SyncNotePacks(const std::string& token, NotePackSyncResult* out)
     if (out->result == ESP_OK && has_more) {
         out->result = ESP_ERR_INVALID_SIZE;
         out->message = "笔记变更过多，请重试";
+    } else if (out->result == ESP_OK) {
+        listing_complete = true;
+    }
+    if (listing_complete) {
+        // Snapshot semantics: drop local rows the completed walk never
+        // listed. SaveNotePackManifest's prune deletes the orphaned pack
+        // files and the index rebuild below drops their entries, so an
+        // archived notebook finally disappears from the device (privacy:
+        // shared/lost student hardware kept showing archived content).
+        const size_t before = local_manifest.notebooks.size();
+        local_manifest.notebooks.erase(
+            std::remove_if(
+                local_manifest.notebooks.begin(),
+                local_manifest.notebooks.end(),
+                [&seen_notebooks](const WqnNotePackManifestNotebook& item) {
+                    return seen_notebooks.count(item.notebook_id) == 0;
+                }),
+            local_manifest.notebooks.end());
+        if (local_manifest.notebooks.size() != before) {
+            manifest_content_changed = true;
+            s_index_stale = true;
+            out->result = SaveNotePackManifest(local_manifest);
+            ESP_LOGI(kTag, "note manifest snapshot prune: removed=%u",
+                     static_cast<unsigned>(
+                         before - local_manifest.notebooks.size()));
+        }
     }
 
     if (out->result == ESP_OK &&

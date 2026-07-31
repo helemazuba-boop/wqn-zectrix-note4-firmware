@@ -238,6 +238,12 @@ struct NoteCloudResult {
     esp_err_t result = ESP_FAIL;
     bool auth_required = false;
     bool pack_index_ready = false;
+    // kFetchNotebookPack: which notebook this result actually belongs to.
+    // The UI may have re-armed for a DIFFERENT notebook while this fetch was
+    // in flight (browse A -> open B); the apply step must only consume the
+    // open intent when these match, otherwise A's result masquerades as B's
+    // (false "云端暂无该笔记内容" + a manual retry).
+    std::string fetched_notebook_id;
     wqn::NotePackIndex pack_index;
     wqn::protocol::note_study_v1::SessionData session;
     wqn::protocol::note_study_v1::CandidatePageData candidate_page;
