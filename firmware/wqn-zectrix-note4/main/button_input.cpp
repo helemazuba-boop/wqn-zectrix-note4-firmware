@@ -9,6 +9,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include "power_manager.h"  // NoteUserActivityAtMs (sleep-race linearization)
+
 namespace {
 
 constexpr char kTag[] = "wqn_buttons";
@@ -160,6 +162,18 @@ void PushButtonEvent(wqn::ButtonEvent event)
     ++g_ring_count;
     if (g_ring_count > g_ring_high_water) {
         g_ring_high_water = static_cast<uint32_t>(g_ring_count);
+    }
+    // [sleep-race] Publish user activity the instant a critical event becomes
+    // visible in the ring, still holding g_ring_lock, and BEFORE the UI
+    // dequeues it. This is the linearization point the deep-sleep commit gate
+    // validates against: the power task cannot both pass its final generation
+    // check and sleep while a dequeued-but-unreduced release/short-press is
+    // pending (that GPIO is no longer held low, so EXT1 can't re-wake it).
+    // Repeats are not interactions worth blocking sleep for (they only occur
+    // while a key is physically held, which itself keeps the wake source
+    // asserted), and they get coalesced/dropped anyway.
+    if (!IsRepeatEvent(event)) {
+        wqn::NoteUserActivityAtMs(event.occurred_at_ms);
     }
     taskEXIT_CRITICAL(&g_ring_lock);
 }

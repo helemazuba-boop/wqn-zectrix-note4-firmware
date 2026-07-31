@@ -177,22 +177,38 @@ void LogWakeupCause()
              wake.panel_cache_trusted ? "trusted" : "untrusted");
 }
 
-void NoteUserActivity()
+// Publishes an interaction: timestamp + generation bump + cycle reset, all
+// inside g_activity_gate so the deep-sleep commit's final check (same gate)
+// can never interleave with a half-published interaction, and the cycle reset
+// cannot be lost against a concurrent sleep. Bump is release-ordered; the
+// sleep gate reads generation with acquire.
+void PublishUserActivity(int64_t occurred_at_ms)
 {
     g_user_interacted_current_boot.store(true, std::memory_order_relaxed);
-    // The timestamp+generation pair updates inside the activity gate so the
-    // deep-sleep commit's final check (same gate) can never interleave with a
-    // half-published interaction; see CommitDeepSleep.
     taskENTER_CRITICAL(&g_activity_gate);
-    UserActivityMsRef().store(NowMs(), std::memory_order_relaxed);
+    UserActivityMsRef().store(occurred_at_ms, std::memory_order_relaxed);
+    // A physical interaction starts a new HIL/product idle sequence; reset
+    // inside the gate so it is not lost against a concurrent sleep commit.
+    ConsecutiveSleepCyclesRef().store(0, std::memory_order_relaxed);
     g_user_activity_generation.fetch_add(1, std::memory_order_release);
     taskEXIT_CRITICAL(&g_activity_gate);
-    // A physical interaction starts a new HIL/product idle sequence.
-    ConsecutiveSleepCyclesRef().store(0, std::memory_order_relaxed);
+}
+
+void NoteUserActivity()
+{
+    PublishUserActivity(NowMs());
     if (IsBatteryVeryLow() && !IsCharging() && !IsUsbPowered()) {
         ESP_LOGW(kTag, "battery critically low during user activity, initiating shutdown");
         ShutdownForBatteryDepleted();
     }
+}
+
+void NoteUserActivityAtMs(int64_t occurred_at_ms)
+{
+    // Button-task entry: publish only. The battery check in NoteUserActivity
+    // touches I2C and must stay on the UI task; the UI still calls
+    // NoteUserActivity when it consumes the event, which re-runs that check.
+    PublishUserActivity(occurred_at_ms);
 }
 
 bool IsUiIdleForSleep()

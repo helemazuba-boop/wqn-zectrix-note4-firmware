@@ -10,6 +10,14 @@ namespace wqn {
 
 void LogWakeupCause();
 void NoteUserActivity();
+// [sleep-race] Publishes user activity with an explicit event timestamp, called
+// by the button task the instant a critical (non-repeat) event becomes visible
+// in the input ring -- BEFORE the UI dequeues it. This is the linearization
+// point the deep-sleep commit gate validates against, so an already-queued
+// release/short-press (whose GPIO is no longer held low and thus cannot re-arm
+// EXT1 wake) can never be lost to sleep. Safe from the button task: it touches
+// only the activity gate + atomics, never I2C/battery hardware.
+void NoteUserActivityAtMs(int64_t occurred_at_ms);
 bool IsUiIdleForSleep();
 bool IsUiIdleForSleepEx(int extra_idle_ms);
 
