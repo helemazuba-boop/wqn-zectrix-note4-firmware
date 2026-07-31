@@ -158,6 +158,11 @@ public:
     // untouched and asks for a re-Confirm. Settings-area refresh either way.
     UiUpdate DispatchAutoSyncSaveResult(esp_err_t result, uint32_t operation_id);
     UiUpdate DispatchVolumeSaveResult(esp_err_t result, uint32_t operation_id);
+    // [deck-scope] Default-deck switch result (c5). Success installs the deck,
+    // resets the in-memory word session (the durable clears already happened
+    // inside the worker's marker transaction) and rebuilds the [词] rows;
+    // failure keeps the displayed deck and the armed pending pair for retry.
+    UiUpdate DispatchDefaultDeckChangeResult(esp_err_t result, uint32_t operation_id);
 
 private:
     UiUpdate FinishEvent(

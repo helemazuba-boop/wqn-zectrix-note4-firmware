@@ -135,33 +135,32 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
                 // A word answer is still pending (kPersisting spans Prepare ->
                 // worker Apply, so it also covers the Prepare->reserve gap where
                 // persist-busy is briefly false but the effect is still armed):
-                // the scope reset below synchronously clears two session files
-                // and would both stall the UI behind the persist transaction
-                // and drop the not-yet-enqueued effect. Defer; user retries.
+                // the deck switch clears both session files inside its worker
+                // transaction and must not race the in-flight commit's session
+                // save. Defer; user retries.
                 settings.notice = "正在保存，请稍后切换";
             } else if (settings.word_deck_selected < settings.word_deck_options.size()) {
                 const wqn::WordDeckInfo& option =
                     settings.word_deck_options[settings.word_deck_selected];
-                const esp_err_t result = wqn::SaveDefaultWordDeckId(option.deck_id);
-                if (result == ESP_OK) {
-                    ESP_LOGI(kTag, "wordbook change committed: id=%s",
-                             option.deck_id.empty() ? "all" : option.deck_id.c_str());
-                    wqn::SetDefaultWordDeck(&state->word_app, option.deck_id, option.title);
-                    settings.default_word_deck_title =
-                        state->word_app.default_deck_title;
-                    // The old study session is pinned to the previous scope;
-                    // drop it so the next study entry rebuilds a session for
-                    // the new deck instead of resuming the old cards.
-                    wqn::ResetWordSessionsForScopeChange(&state->word_app, true);
-                    // The default deck leaves (or rejoins) the note screen's
-                    // mixed [词] rows immediately.
-                    RebuildNoteWordDeckRows(state);
-                    settings.notice = option.deck_id.empty()
-                        ? "默认词库：全部词库"
-                        : "默认词库：" + option.title;
+                // [deck-scope] Async switch via the worker's recoverable marker
+                // protocol (c5). Arm the choice first (a rejected submit or a
+                // failed transaction keeps it for a re-Confirm); NOTHING is
+                // installed until the durable ACK -- the displayed deck, the
+                // in-memory session reset and the [词] rows all follow in
+                // DispatchDefaultDeckChangeResult.
+                settings.pending_word_deck_id = option.deck_id;
+                settings.pending_word_deck_title = option.title;
+                settings.word_deck_pending_valid = true;
+                const uint32_t op_id = SubmitDefaultDeckChange(option.deck_id);
+                if (op_id != 0) {
+                    settings.word_deck_save_op_id = op_id;
+                    settings.notice = "正在保存…";
                 } else {
-                    settings.notice = "默认词库保存失败";
-                    ESP_LOGW(kTag, "save default word deck failed: %s", esp_err_to_name(result));
+                    settings.word_deck_save_op_id = 0;
+                    settings.notice =
+                        IsPersistKindBusy(PersistKind::kSettingsDefaultDeck)
+                            ? "正在保存，请稍后"
+                            : "保存繁忙，请重试";
                 }
             }
             settings.dialog = wqn::SettingsDialog::kNone;

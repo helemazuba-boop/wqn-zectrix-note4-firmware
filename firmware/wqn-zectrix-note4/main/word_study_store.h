@@ -89,6 +89,13 @@ struct PersistedWordSession {
     bool paused = false;
     uint32_t position = 0;
     WordPresentationPhase phase = WordPresentationPhase::kFront;
+    // [deck-scope] Generation of the default-deck scope this session was built
+    // under. Stamped automatically on save (from GetDeckScopeGeneration) and
+    // validated on load: a mismatch means the deck scope changed after this
+    // snapshot was written, so the load reports NOT_FOUND instead of resuming
+    // a session pinned to the old scope (second line of defense behind the
+    // recoverable-marker protocol in storage.cpp).
+    uint32_t deck_scope_generation = 0;
     StoredWordSessionData remote;
 };
 

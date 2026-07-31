@@ -185,6 +185,9 @@ esp_err_t ExecutePersistCommand(PersistCommand& command)
         case PersistKind::kSettingsVolume:
             return wqn::SaveVolumePercentForeground(command.settings_int);
         case PersistKind::kSettingsDefaultDeck:
+            // Recoverable marker protocol; one foreground storage transaction
+            // (marker -> session clears -> deck+generation -> marker clear).
+            return wqn::ChangeDefaultWordDeckForeground(command.settings_str);
         case PersistKind::kCount:
             return ESP_ERR_NOT_SUPPORTED;
     }
@@ -419,6 +422,21 @@ uint32_t SubmitVolumeSave(int percent)
     // playback uses the new level regardless of how long the durable NVS write
     // waits behind other worker commands.
     wqn::SetPlaybackVolumeCache(percent);
+    EnqueueReserved(command, ticket.slot_index, ticket.kind);
+    return ticket.operation_id;
+}
+
+uint32_t SubmitDefaultDeckChange(const std::string& deck_id)
+{
+    if (!deck_id.empty() && deck_id.size() != 36) {
+        return 0;
+    }
+    PersistTicket ticket = TryReservePersist(PersistKind::kSettingsDefaultDeck);
+    if (!ticket.valid()) {
+        return 0;
+    }
+    PersistCommand& command = g_pool[ticket.slot_index];
+    command.settings_str = deck_id;
     EnqueueReserved(command, ticket.slot_index, ticket.kind);
     return ticket.operation_id;
 }

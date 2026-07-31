@@ -170,6 +170,11 @@ struct WordCloudRequest {
     uint16_t limit = 0;
     uint8_t study_mode = 0;
     char query[96] = {};
+    // [deck-scope] Scope epoch sampled when the request was QUEUED (session
+    // ops only). The runner stamps it into the persisted session (the store
+    // rejects a save whose epoch is stale) and echoes it in the result so the
+    // apply side drops results that straddled a default-deck switch.
+    uint32_t scope_generation = 0;
 };
 
 struct WordCloudResult {
@@ -191,6 +196,8 @@ struct WordCloudResult {
     wqn::PersistedWordSession persisted_session;
     esp_err_t session_compact_result = ESP_OK;
     esp_err_t session_persist_result = ESP_OK;
+    // [deck-scope] Echo of the request's scope epoch (see WordCloudRequest).
+    uint32_t scope_generation = 0;
 };
 
 struct TodoCloudResultReady {

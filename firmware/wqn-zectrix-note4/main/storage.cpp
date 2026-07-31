@@ -1,7 +1,9 @@
 #include "storage.h"
 
 #include <atomic>
+#include <cerrno>
 #include <cstdint>
+#include <cstdlib>
 #include <vector>
 
 #include "cJSON.h"
@@ -618,6 +620,13 @@ esp_err_t InitStorage()
     ESP_LOGI(kTag, "NVS ready");
     ESP_RETURN_ON_ERROR(InitStoragePartition(), kTag, "init storage partition");
     ESP_RETURN_ON_ERROR(services::StartStorageService(), kTag, "start storage service");
+    // [deck-scope] Replay an interrupted default-deck change and seed the
+    // scope-generation cache BEFORE any word session can be loaded. A failure
+    // here MUST abort startup into the existing storage recovery mode: the
+    // marker may still be set with the deck/sessions/generation half-applied,
+    // and business services must not run against that state.
+    ESP_RETURN_ON_ERROR(RecoverDefaultDeckScopeChange(), kTag,
+                        "recover deck scope change");
     // Legacy JSON parsing, WQPC inflate/deflate and file validation are all
     // deliberately executed on StorageService. Besides preserving single
     // ownership, this prevents their deeper bounded stack from consuming the
@@ -1038,6 +1047,160 @@ esp_err_t SaveDefaultWordDeckId(const std::string& deck_id)
         return ESP_ERR_INVALID_ARG;
     }
     return SaveStringToNvs(kDefaultWordDeckKey, deck_id);
+}
+
+namespace {
+
+// [deck-scope] Recoverable default-deck change (c5). NVS keys:
+//  - kDeckScopeMarkerKey: "<target_gen>|<deck_id>" while a change is in
+//    flight (deck_id empty = all decks). Present marker = the session clears
+//    and/or the deck+generation save may not have completed.
+//  - kDeckScopeGenKey: committed scope generation (u64 slot, u32 values).
+// The RAM cache lets session save/load stamp & validate without a storage
+// transaction (word_study_store reads it via GetDeckScopeGeneration).
+constexpr const char* kDeckScopeMarkerKey = "word_deck_chg";
+constexpr const char* kDeckScopeGenKey = "word_deck_gen";
+std::atomic<uint32_t> g_deck_scope_generation{0};
+
+// Replays the tail of the change protocol. Idempotent: session-file removal
+// tolerates ENOENT, NVS writes overwrite. STORAGE TASK ONLY (the direct
+// ClearPersistedWordSession calls rely on the service-task passthrough).
+esp_err_t ApplyDeckScopeChangeLocked(uint32_t target_generation, const std::string& deck_id)
+{
+    ESP_RETURN_ON_ERROR(
+        ClearPersistedWordSession(protocol::word_study_v1::Mode::kSequential),
+        kTag, "deck change: clear sequential session");
+    ESP_RETURN_ON_ERROR(
+        ClearPersistedWordSession(protocol::word_study_v1::Mode::kRandom),
+        kTag, "deck change: clear random session");
+    if (deck_id.empty()) {
+        ESP_RETURN_ON_ERROR(ClearNvsKeyRaw(kDefaultWordDeckKey), kTag,
+                            "deck change: clear deck key");
+    } else {
+        ESP_RETURN_ON_ERROR(SaveStringToNvsRaw(kDefaultWordDeckKey, deck_id),
+                            kTag, "deck change: save deck key");
+    }
+    ESP_RETURN_ON_ERROR(SaveU64ToNvsRaw(kDeckScopeGenKey, target_generation),
+                        kTag, "deck change: save scope generation");
+    ESP_RETURN_ON_ERROR(ClearNvsKeyRaw(kDeckScopeMarkerKey), kTag,
+                        "deck change: clear marker");
+    g_deck_scope_generation.store(target_generation, std::memory_order_release);
+    return ESP_OK;
+}
+
+struct DeckScopeChangeContext {
+    const std::string* deck_id;
+};
+
+esp_err_t DeckScopeChangeTransaction(void* opaque)
+{
+    auto* context = static_cast<DeckScopeChangeContext*>(opaque);
+    if (context == nullptr || context->deck_id == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    const uint32_t committed_generation =
+        g_deck_scope_generation.load(std::memory_order_acquire);
+    uint32_t target_generation = committed_generation + 1;
+    if (target_generation == 0) {
+        // uint32 wrap: 0 is the "never initialized" sentinel, skip it.
+        target_generation = 1;
+    }
+    // Step 1: marker first. If power dies anywhere past this commit, boot
+    // recovery replays the tail from the marker.
+    ESP_RETURN_ON_ERROR(
+        SaveStringToNvsRaw(
+            kDeckScopeMarkerKey,
+            std::to_string(target_generation) + "|" + *context->deck_id),
+        kTag, "deck change: write marker");
+    return ApplyDeckScopeChangeLocked(target_generation, *context->deck_id);
+}
+
+esp_err_t RecoverDeckScopeTransaction(void*)
+{
+    // Seed the generation cache from the committed value first.
+    uint64_t committed = 0;
+    bool found = false;
+    ESP_RETURN_ON_ERROR(LoadU64FromNvs(kDeckScopeGenKey, &committed, &found),
+                        kTag, "deck recover: load generation");
+    g_deck_scope_generation.store(
+        found ? static_cast<uint32_t>(committed) : 0, std::memory_order_release);
+
+    std::string marker;
+    ESP_RETURN_ON_ERROR(LoadStringFromNvs(kDeckScopeMarkerKey, &marker),
+                        kTag, "deck recover: load marker");
+    if (marker.empty()) {
+        return ESP_OK;  // no interrupted change
+    }
+    const size_t split = marker.find('|');
+    uint32_t target_generation = 0;
+    bool parsed_ok = false;
+    if (split != std::string::npos && split > 0) {
+        const std::string generation_text = marker.substr(0, split);
+        errno = 0;
+        char* end = nullptr;
+        const unsigned long parsed =
+            std::strtoul(generation_text.c_str(), &end, 10);
+        // Full consumption and no overflow (ERANGE surfaces via errno; on this
+        // 32-bit target unsigned long IS uint32). 0 stays the sentinel.
+        if (errno == 0 && end != nullptr && *end == '\0' &&
+            end != generation_text.c_str() && parsed != 0) {
+            target_generation = static_cast<uint32_t>(parsed);
+            parsed_ok = true;
+        }
+    }
+    const std::string deck_id =
+        split == std::string::npos ? std::string() : marker.substr(split + 1);
+    // The deck must be empty (all decks) or a UUID, and the target generation
+    // must be the committed one (crash after the generation save) or its
+    // successor (crash before it, accounting for the wrap-skip over 0).
+    uint32_t successor =
+        g_deck_scope_generation.load(std::memory_order_acquire) + 1;
+    if (successor == 0) {
+        successor = 1;
+    }
+    const bool deck_ok = deck_id.empty() || deck_id.size() == 36;
+    const bool generation_ok = parsed_ok &&
+        (target_generation == g_deck_scope_generation.load(std::memory_order_acquire) ||
+         target_generation == successor);
+    if (!deck_ok || !generation_ok) {
+        // Corrupt marker: drop it rather than replaying garbage as a switch.
+        // The committed deck/generation stay as-is; sessions may already be
+        // cleared, which is safe (they are only browse cursors).
+        ESP_LOGW(kTag, "deck recover: malformed marker '%s' dropped", marker.c_str());
+        return ClearNvsKeyRaw(kDeckScopeMarkerKey);
+    }
+    ESP_LOGW(kTag,
+             "deck recover: replaying interrupted change: gen=%u deck=%s",
+             static_cast<unsigned>(target_generation),
+             deck_id.empty() ? "all" : deck_id.c_str());
+    return ApplyDeckScopeChangeLocked(target_generation, deck_id);
+}
+
+}  // namespace
+
+esp_err_t ChangeDefaultWordDeckForeground(const std::string& deck_id)
+{
+    StorageWriteGuard write("word-deck-change", __FILE__, __LINE__);
+    if (!write) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!deck_id.empty() && deck_id.size() != 36) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    DeckScopeChangeContext context{&deck_id};
+    return services::ExecuteForegroundStorageTransaction(
+        DeckScopeChangeTransaction, &context, "word-deck-change");
+}
+
+esp_err_t RecoverDefaultDeckScopeChange()
+{
+    return services::ExecuteStorageTransactionNamed(
+        RecoverDeckScopeTransaction, nullptr, "word-deck-recover");
+}
+
+uint32_t GetDeckScopeGeneration()
+{
+    return g_deck_scope_generation.load(std::memory_order_acquire);
 }
 
 std::string AutoSyncIntervalLabel(uint32_t minutes)

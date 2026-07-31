@@ -493,6 +493,53 @@ UiUpdate UiRuntime::DispatchVolumeSaveResult(esp_err_t result, uint32_t operatio
     return FinishEvent(AppEventKind::kSettingsPersist, refresh, true);
 }
 
+UiUpdate UiRuntime::DispatchDefaultDeckChangeResult(
+    esp_err_t result, uint32_t operation_id)
+{
+    wqn::SettingsAppState& settings = state_.settings;
+    if (settings.word_deck_save_op_id == 0 ||
+        settings.word_deck_save_op_id != operation_id) {
+        ESP_LOGW(kTag, "stale deck change result: op=%lu expected=%lu",
+                 static_cast<unsigned long>(operation_id),
+                 static_cast<unsigned long>(settings.word_deck_save_op_id));
+        return FinishEvent(AppEventKind::kSettingsPersist, RefreshSchedule::kNone, false);
+    }
+    settings.word_deck_save_op_id = 0;
+    if (result == ESP_OK) {
+        // Durable state is committed (marker cleared, sessions wiped, deck +
+        // scope generation saved). NOW install the in-memory half: the deck,
+        // the session/card reset (clear_persisted=false -- the durable clears
+        // were part of the worker transaction) and the note screen's [词] rows.
+        wqn::SetDefaultWordDeck(
+            &state_.word_app, settings.pending_word_deck_id,
+            settings.pending_word_deck_title);
+        settings.default_word_deck_title = state_.word_app.default_deck_title;
+        wqn::ResetWordSessionsForScopeChange(&state_.word_app, false);
+        RebuildNoteWordDeckRows(&state_);
+        settings.notice = settings.pending_word_deck_id.empty()
+            ? "默认词库：全部词库"
+            : "默认词库：" + settings.pending_word_deck_title;
+        settings.pending_word_deck_id.clear();
+        settings.pending_word_deck_title.clear();
+        settings.word_deck_pending_valid = false;
+        ESP_LOGI(kTag, "wordbook change committed: id=%s",
+                 state_.word_app.default_deck_id.empty()
+                     ? "all"
+                     : state_.word_app.default_deck_id.c_str());
+    } else {
+        // Keep the displayed (old) deck AND the armed pending pair so a
+        // re-open preselects the intended deck and re-Confirm retries. If the
+        // transaction died mid-way, the NVS marker makes boot recovery replay
+        // it -- the UI never shows a half-switched state.
+        settings.notice = "默认词库未保存，请重试";
+        ESP_LOGW(kTag, "deck change failed: %s", esp_err_to_name(result));
+    }
+    const RefreshSchedule refresh = state_.screen == wqn::UiScreen::kSettings
+        ? RefreshSchedule::kConfig
+        : RefreshSchedule::kNone;
+    return FinishEvent(AppEventKind::kSettingsPersist, refresh, true);
+}
+
 UiUpdate UiRuntime::DispatchTimeTick(int64_t now_ms)
 {
     const bool changed = wqn::TickTimeApp(&state_.time_app, now_ms);

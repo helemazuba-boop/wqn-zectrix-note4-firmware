@@ -88,6 +88,23 @@ std::string AutoSyncIntervalLabel(uint32_t minutes);
 // mixed [词] rows.
 esp_err_t LoadDefaultWordDeckId(std::string* deck_id);
 esp_err_t SaveDefaultWordDeckId(const std::string& deck_id);
+// [deck-scope] Recoverable default-deck change protocol (c5). A deck switch
+// must clear both persisted word sessions (SPIFFS) and save the new deck +
+// scope generation (NVS); there is no cross-NVS/SPIFFS atomicity, so a marker
+// makes the sequence recoverable instead: write marker -> clear sessions ->
+// save deck+generation -> clear marker. A power cut leaves the marker behind
+// and boot replays the (idempotent) tail. Runs the whole sequence as ONE
+// foreground storage transaction on the persist worker (never call from the
+// UI task synchronously).
+esp_err_t ChangeDefaultWordDeckForeground(const std::string& deck_id);
+// Boot-time recovery + generation-cache seeding. Call once in InitStorage
+// (after StartStorageService, before any word session loads). Idempotent.
+esp_err_t RecoverDefaultDeckScopeChange();
+// Current deck-scope generation (RAM cache of the NVS value, seeded at boot,
+// bumped when a deck change commits). Sessions stamp it on save and are
+// rejected on load when it no longer matches (second line of defense behind
+// the marker protocol). Atomic; safe from any task.
+uint32_t GetDeckScopeGeneration();
 esp_err_t LoadVolumePercent(int* percent);
 esp_err_t SaveVolumePercent(int percent);
 // [persist-worker] Worker-dedicated variant (see SaveAutoSyncIntervalMinutesForeground).

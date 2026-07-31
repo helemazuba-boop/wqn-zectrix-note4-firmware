@@ -340,13 +340,18 @@ void OpenSettingsDialog(wqn::UiState* state, wqn::SettingsDialog dialog)
         state->settings.volume_selected = VolumeOptionIndex(seed);
     } else if (dialog == wqn::SettingsDialog::kDefaultWordDeck) {
         // Option 0 is the fixed 全部词库; the rest mirror the mounted deck
-        // catalog. Preselect the current default when it is still mounted.
+        // catalog. Preselect an armed-but-unsaved switch (submit rejected or
+        // transaction failed) over the installed default so a re-Confirm
+        // retries the intended deck.
         auto& settings = state->settings;
+        const std::string& preselect_id = settings.word_deck_pending_valid
+            ? settings.pending_word_deck_id
+            : state->word_app.default_deck_id;
         settings.word_deck_options.clear();
         settings.word_deck_options.push_back(wqn::WordDeckInfo{});
         settings.word_deck_selected = 0;
         for (const wqn::WordDeckInfo& deck : state->word_app.deck_catalog) {
-            if (deck.deck_id == state->word_app.default_deck_id) {
+            if (deck.deck_id == preselect_id) {
                 settings.word_deck_selected = settings.word_deck_options.size();
             }
             settings.word_deck_options.push_back(deck);

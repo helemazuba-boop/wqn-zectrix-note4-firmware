@@ -102,6 +102,10 @@ void EnqueueReservedProblemVerdict(
 //     unavailable. The per-kind busy doubles as the duplicate-Confirm guard.
 uint32_t SubmitAutoSyncIntervalSave(uint32_t minutes);
 uint32_t SubmitVolumeSave(int percent);
+// Default-deck switch (c5): runs the recoverable marker protocol
+// (ChangeDefaultWordDeckForeground) on the worker. deck_id empty = all decks.
+// The UI installs the new deck ONLY after the durable ACK.
+uint32_t SubmitDefaultDeckChange(const std::string& deck_id);
 
 // --- Consumer side (UI task). ---
 // True when an unapplied terminal result is waiting for `kind`; copies it out.

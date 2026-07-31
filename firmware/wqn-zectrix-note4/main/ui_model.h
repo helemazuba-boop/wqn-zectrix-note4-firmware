@@ -254,6 +254,15 @@ struct SettingsAppState {
     int pending_volume_percent = 0;
     bool volume_pending_valid = false;
     uint32_t volume_save_op_id = 0;
+    // [deck-scope] In-flight/failed default-deck switch (c5). NOTHING is
+    // installed optimistically: the deck, the session reset and the [词] rows
+    // all wait for the durable ACK of the worker's marker-protocol
+    // transaction. On failure the pending pair stays armed (re-open preselects
+    // it, re-Confirm retries) and the displayed deck remains the old one.
+    std::string pending_word_deck_id;
+    std::string pending_word_deck_title;
+    bool word_deck_pending_valid = false;
+    uint32_t word_deck_save_op_id = 0;
     SettingsDiagnosticsSnapshot diagnostics;
 };
 

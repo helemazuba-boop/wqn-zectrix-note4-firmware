@@ -647,7 +647,14 @@ void DeviceUiTask(void*)
             // button drain that may have just armed a new answer.
             const bool word_commit_pending =
                 state.word_app.session.commit_state ==
-                wqn::WordObservationCommitState::kPersisting;
+                wqn::WordObservationCommitState::kPersisting ||
+                // [deck-scope] A default-deck switch in flight wipes and
+                // re-scopes the word sessions; hold Word cloud results until
+                // its ACK so a stale session/page result cannot apply against
+                // the mid-switch state (the store+epoch guards are the second
+                // and third lines of defense).
+                device_ui_internal::IsPersistKindBusy(
+                    device_ui_internal::PersistKind::kSettingsDefaultDeck);
             // [persist-worker] Same guard for note (c3): ApplyNoteCandidatePage
             // Result rebuilds+saves the session, so a note cloud result applied
             // while a note observation commit is pending would roll back the
@@ -833,6 +840,18 @@ void DeviceUiTask(void*)
                     StrongerSchedule(refresh_schedule, persist_update.refresh);
                 device_ui_internal::AckPersistResult(
                     device_ui_internal::PersistKind::kSettingsVolume,
+                    settings_persist.generation, settings_persist.operation_id);
+            }
+            if (device_ui_internal::TakePersistResultToApply(
+                    device_ui_internal::PersistKind::kSettingsDefaultDeck,
+                    &settings_persist)) {
+                const device_ui_internal::UiUpdate persist_update =
+                    ui_runtime.DispatchDefaultDeckChangeResult(
+                        settings_persist.result, settings_persist.operation_id);
+                refresh_schedule =
+                    StrongerSchedule(refresh_schedule, persist_update.refresh);
+                device_ui_internal::AckPersistResult(
+                    device_ui_internal::PersistKind::kSettingsDefaultDeck,
                     settings_persist.generation, settings_persist.operation_id);
             }
         }
