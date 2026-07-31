@@ -46,6 +46,20 @@ esp_err_t RefreshEpdFull(bool allow_local_partial = true, bool force_full_refres
 
 esp_err_t PrepareDisplayForSleep(int64_t deadline_us);
 void RollbackDisplayAfterSleepAbort();
+// [epd-owner] The EPD refresh task registers itself as the panel owner at
+// startup. PrepareDisplayForSleep then runs the power-off ON THAT TASK: when a
+// different task (the power coordinator) calls it, the request is posted to a
+// Pending/Claimed state machine and the owner services it from its command
+// point; when the owner itself calls (defensive: e.g. an emergency raised on
+// the EPD task), it executes locally. Pass nullptr to clear (task deleted).
+void RegisterEpdOwnerTask(void* owner_task_handle);
+// [epd-owner] Called by the EPD owner task at its idle command point. Claims a
+// Pending sleep-prep request (Pending->Claimed CAS), runs the power-off, and
+// publishes the generation-tagged result. Returns true iff a request was
+// claimed this call (the caller then skips idle maintenance this round so a
+// 1-3 s cleanup cannot make the power side miss its deadline). Must run only
+// outside an EpdFrameTransaction (the idle command point guarantees this).
+bool ServiceDisplaySleepPrepCommand();
 void NoteEpdActivity();
 // [epd-owner] Monotonic counter bumped by NoteEpdActivity. The idle-maintenance
 // command samples it before yielding to the EPD task and the EPD task re-checks

@@ -928,6 +928,9 @@ void RunIdleMaintenanceIfStillValid()
 void EpdRefreshTask(void*)
 {
     ESP_LOGI(kTag, "EPD refresh task started");
+    // [epd-owner] Register as the panel owner so PrepareDisplayForSleep routes
+    // the rail power-off here instead of running on the power coordinator task.
+    wqn::RegisterEpdOwnerTask(xTaskGetCurrentTaskHandle());
 
     // [hang-fix] TWDT coverage is scoped to the render window below instead of
     // unsubscribing for the whole task lifetime: the idle notify wait may
@@ -978,9 +981,16 @@ void EpdRefreshTask(void*)
             // the 1-3 s cleanup full refresh never lands on top of fresh
             // content. TWDT-wrapped like the render window: a wedged cleanup
             // panics with a backtrace instead of freezing the pipeline.
-            if (idle &&
-                g_idle_maintenance_requested.exchange(false, std::memory_order_acquire)) {
-                RunIdleMaintenanceIfStillValid();
+            // [epd-owner] Sleep-prep is serviced BEFORE idle maintenance: a
+            // deadline-bound power-off must not queue behind a 1-3 s cleanup
+            // full refresh. If a sleep-prep command was claimed this round,
+            // skip maintenance entirely so the two never run back-to-back.
+            if (idle) {
+                const bool sleep_claimed = wqn::ServiceDisplaySleepPrepCommand();
+                if (!sleep_claimed &&
+                    g_idle_maintenance_requested.exchange(false, std::memory_order_acquire)) {
+                    RunIdleMaintenanceIfStillValid();
+                }
             }
 
             ulTaskNotifyTake(pdTRUE, wait_ticks);

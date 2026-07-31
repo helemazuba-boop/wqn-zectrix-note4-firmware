@@ -1798,11 +1798,52 @@ void wqn::PowerOffEpdAfterIdleIfNeeded()
     }
 }
 
-esp_err_t wqn::PrepareDisplayForSleep(int64_t deadline_us)
+namespace {
+
+// [epd-owner] Sleep-prep command channel. PrepareDisplayForSleep is called by
+// the power coordinator, but the actual rail power-off must run on the EPD
+// owner task (single owner). The owner registers its handle; a non-owner
+// caller posts a request and blocks on a completion semaphore, an owner caller
+// runs it locally. The Pending/Claimed state machine makes cancellation safe:
+// a power-side timeout can only cancel a request the owner has NOT started
+// (Pending->Idle CAS); once the owner claims it (Pending->Claimed) the
+// power-off runs to completion and the late timeout cannot masquerade as a
+// cancel of an in-progress hardware op.
+enum SleepPrepState : uint32_t {
+    kSleepPrepIdle = 0,
+    kSleepPrepPending,
+    kSleepPrepClaimed,
+};
+std::atomic<uint32_t> g_sleep_prep_state{kSleepPrepIdle};
+std::atomic<uint32_t> g_sleep_prep_generation{0};
+TaskHandle_t g_epd_owner_task = nullptr;
+// Result is written by the owner before giving the semaphore and read by the
+// requester after taking it; atomic (not plain scalars) because the two tasks
+// touch them without a shared lock. The generation guards against a stale give
+// from a previously-timed-out request.
+std::atomic<esp_err_t> g_sleep_prep_result{ESP_FAIL};
+std::atomic<uint32_t> g_sleep_prep_result_generation{0};
+
+SemaphoreHandle_t SleepPrepDoneSemaphore()
 {
-    // PowerCoordinator may begin quiesce only when no SleepLease exists. Every
-    // accepted UI frame owns kDisplay until its terminal result, so reaching
-    // this service boundary proves there is no upstream frame left to drain.
+    static SemaphoreHandle_t sem = xSemaphoreCreateBinary();
+    return sem;
+}
+
+uint32_t NextSleepPrepGeneration()
+{
+    static std::atomic<uint32_t> counter{0};
+    uint32_t g = counter.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (g == 0) {
+        g = counter.fetch_add(1, std::memory_order_relaxed) + 1;
+    }
+    return g;
+}
+
+// Runs the power-off directly. Caller must be the owner task (or hold no frame
+// transaction). Mirrors the old PrepareDisplayForSleep deadline math.
+esp_err_t RunSleepPrepLocal(int64_t deadline_us)
+{
     const int64_t remaining_us = deadline_us > 0
         ? deadline_us - esp_timer_get_time()
         : 0;
@@ -1812,7 +1853,128 @@ esp_err_t wqn::PrepareDisplayForSleep(int64_t deadline_us)
     const uint32_t timeout_ms = deadline_us > 0
         ? static_cast<uint32_t>((remaining_us + 999) / 1000)
         : 0;
-    return TryPowerOffEpd(timeout_ms);
+    return wqn::TryPowerOffEpd(timeout_ms);
+}
+
+}  // namespace
+
+void wqn::RegisterEpdOwnerTask(void* owner_task_handle)
+{
+    g_epd_owner_task = static_cast<TaskHandle_t>(owner_task_handle);
+}
+
+bool wqn::ServiceDisplaySleepPrepCommand()
+{
+    // Claim a pending request. If it is not Pending (idle, or already cancelled
+    // by a power-side timeout), do nothing.
+    uint32_t expected = kSleepPrepPending;
+    if (!g_sleep_prep_state.compare_exchange_strong(
+            expected, kSleepPrepClaimed,
+            std::memory_order_acq_rel, std::memory_order_acquire)) {
+        return false;
+    }
+    const uint32_t generation =
+        g_sleep_prep_generation.load(std::memory_order_acquire);
+    // The request carries no deadline to the owner: the power side owns the
+    // timeout via the completion wait. Run with 0 (no internal wait) so the
+    // owner never blocks its command loop; a busy panel simply reports the
+    // guard timeout and the power side treats it as a display-prep failure.
+    // This runs at the idle command point, which never holds an
+    // EpdFrameTransaction, so the recursive guard inside TryPowerOffEpd is
+    // uncontended on this task.
+    const esp_err_t result = RunSleepPrepLocal(0);
+    // Publish order (mirror of the requester's drain-then-post): write the
+    // result, GIVE the semaphore, and only THEN drop to Idle. If Idle were
+    // published before the give, a new request could enter Pending and then be
+    // satisfied by this stale give (generation mismatch -> it would cancel the
+    // fresh command). Giving before Idle guarantees the stale signal exists
+    // strictly before the next request's pre-post drain.
+    g_sleep_prep_result.store(result, std::memory_order_relaxed);
+    g_sleep_prep_result_generation.store(generation, std::memory_order_release);
+    xSemaphoreGive(SleepPrepDoneSemaphore());
+    g_sleep_prep_state.store(kSleepPrepIdle, std::memory_order_release);
+    return true;
+}
+
+esp_err_t wqn::PrepareDisplayForSleep(int64_t deadline_us)
+{
+    // PowerCoordinator may begin quiesce only when no SleepLease exists. Every
+    // accepted UI frame owns kDisplay until its terminal result, so reaching
+    // this service boundary proves there is no upstream frame left to drain.
+
+    // Owner fast-path: if the caller IS the EPD owner task (defensive -- e.g.
+    // an emergency shutdown raised on that task), run locally; posting to
+    // ourselves would deadlock on the completion wait.
+    if (g_epd_owner_task != nullptr &&
+        xTaskGetCurrentTaskHandle() == g_epd_owner_task) {
+        return RunSleepPrepLocal(deadline_us);
+    }
+    // No owner registered yet (early boot / EPD UI disabled): run locally.
+    if (g_epd_owner_task == nullptr) {
+        return RunSleepPrepLocal(deadline_us);
+    }
+
+    SemaphoreHandle_t done = SleepPrepDoneSemaphore();
+    if (done == nullptr) {
+        return RunSleepPrepLocal(deadline_us);  // allocation failed; degrade safely
+    }
+    // Drain any stale give left by a previously timed-out request so this
+    // wait cannot be satisfied by an old completion.
+    xSemaphoreTake(done, 0);
+
+    const uint32_t generation = NextSleepPrepGeneration();
+    g_sleep_prep_generation.store(generation, std::memory_order_release);
+    // Idle -> Pending. If somehow not Idle (a prior request still Claimed),
+    // fail closed: the power side treats it as a display-prep failure.
+    uint32_t expected = kSleepPrepIdle;
+    if (!g_sleep_prep_state.compare_exchange_strong(
+            expected, kSleepPrepPending,
+            std::memory_order_acq_rel, std::memory_order_acquire)) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    xTaskNotifyGive(g_epd_owner_task);
+
+    // Remaining budget recomputed from the ABSOLUTE deadline before every wait:
+    // a first wait that consumes most of the budget must not grant a second
+    // full budget, or the power side (esp. emergency) would blow past its
+    // deadline. deadline_us <= 0 means "no deadline" -> block indefinitely.
+    const auto remaining_ticks = [deadline_us]() -> TickType_t {
+        if (deadline_us <= 0) {
+            return portMAX_DELAY;
+        }
+        const int64_t remaining_us = deadline_us - esp_timer_get_time();
+        if (remaining_us <= 0) {
+            return 0;
+        }
+        return pdMS_TO_TICKS(remaining_us / 1000 + 1);
+    };
+
+    SemaphoreHandle_t sem = done;
+    TickType_t wait = remaining_ticks();
+    if (wait != 0 && xSemaphoreTake(sem, wait) == pdTRUE &&
+        g_sleep_prep_result_generation.load(std::memory_order_acquire) == generation) {
+        return g_sleep_prep_result.load(std::memory_order_relaxed);
+    }
+    // Timed out (or a stale give slipped through the generation check). Cancel
+    // ONLY if still Pending -- if the owner already Claimed it, the power-off
+    // is running/complete and we must not pretend to cancel it; report timeout
+    // and let it finish (its late give is drained by the next request).
+    uint32_t pending = kSleepPrepPending;
+    if (g_sleep_prep_state.compare_exchange_strong(
+            pending, kSleepPrepIdle,
+            std::memory_order_acq_rel, std::memory_order_acquire)) {
+        return ESP_ERR_TIMEOUT;
+    }
+    // Owner claimed it: Claimed only means the hardware op cannot be cancelled,
+    // NOT that the caller may block a second full budget. Wait only the time
+    // still left against the absolute deadline; if none remains, return now and
+    // let the owner's late give be drained by the next request.
+    wait = remaining_ticks();
+    if (wait != 0 && xSemaphoreTake(sem, wait) == pdTRUE &&
+        g_sleep_prep_result_generation.load(std::memory_order_acquire) == generation) {
+        return g_sleep_prep_result.load(std::memory_order_relaxed);
+    }
+    return ESP_ERR_TIMEOUT;
 }
 
 void wqn::RollbackDisplayAfterSleepAbort()
