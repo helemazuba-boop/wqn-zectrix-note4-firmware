@@ -107,6 +107,20 @@ void HoldOutput(gpio_num_t pin, int level)
 RTC_DATA_ATTR int64_t g_last_user_activity_ms = 0;
 RTC_DATA_ATTR uint32_t g_consecutive_sleep_cycles = 0;
 static bool g_user_interacted_current_boot = false;
+// [sleep-race] Monotonic count of user interactions. The power task samples it
+// before TryBeginSleepQuiesce and re-checks right after quiesce succeeds and
+// again before the final sleep commit: an interaction landing in that window
+// (e.g. an answer whose persist reserve now fails because quiesce closed lease
+// acquisition) cancels the sleep instead of losing the RAM-staged input.
+// g_last_user_activity_ms itself is written by the UI task and read by the
+// power task; accesses go through std::atomic_ref so the int64 cannot tear on
+// this 32-bit core (the variable stays a plain RTC_DATA_ATTR int64_t).
+static std::atomic<uint32_t> g_user_activity_generation{0};
+
+inline std::atomic_ref<int64_t> UserActivityMsRef()
+{
+    return std::atomic_ref<int64_t>(g_last_user_activity_ms);
+}
 
 adc_oneshot_unit_handle_t g_adc_handle = nullptr;
 adc_cali_handle_t g_adc_cali_handle = nullptr;
@@ -155,7 +169,10 @@ void LogWakeupCause()
 void NoteUserActivity()
 {
     g_user_interacted_current_boot = true;
-    g_last_user_activity_ms = NowMs();
+    UserActivityMsRef().store(NowMs(), std::memory_order_relaxed);
+    // Bump AFTER the timestamp so a generation observer that re-reads the
+    // timestamp sees a value at least as fresh as the bump it noticed.
+    g_user_activity_generation.fetch_add(1, std::memory_order_release);
     // A physical interaction starts a new HIL/product idle sequence.
     g_consecutive_sleep_cycles = 0;
     if (IsBatteryVeryLow() && !IsCharging() && !IsUsbPowered()) {
@@ -187,13 +204,15 @@ bool IsUiIdleForSleepEx(int extra_idle_ms)
     threshold_ms += extra_idle_ms;
 
     const int64_t now_ms = NowMs();
+    const int64_t last_activity_ms =
+        UserActivityMsRef().load(std::memory_order_relaxed);
     // [power-fix] Only the last user activity drives the deep-sleep idle
     // timer. NoteEpdActivity() is called on every partial refresh (e.g. the
     // clock screen's minute-rollover), so including it in `std::max(user,
     // epd)` made the threshold unreachable and permanently pinned the
     // device in active mode. EPD activity is still tracked separately for
     // the EPD rail power-off path.
-    return g_last_user_activity_ms > 0 && (now_ms - g_last_user_activity_ms) >= threshold_ms;
+    return last_activity_ms > 0 && (now_ms - last_activity_ms) >= threshold_ms;
 }
 
 esp_err_t InitPowerHardware(i2c_port_t i2c_port, gpio_num_t i2c_sda, gpio_num_t i2c_scl, int i2c_clk_hz)
@@ -640,8 +659,21 @@ static void EnterDeepSleepIfEnabled(bool enable_timer_wakeup)
         return;
     }
 
+    // [sleep-race] Sample the interaction generation BEFORE closing lease
+    // acquisition. A button consumed between the idle check and quiesce can
+    // arm a persist effect whose reserve then fails (quiesce rejects new
+    // leases), leaving the input staged in RAM only -- sleeping now would
+    // silently drop it. Re-check after quiesce and before the final commit.
+    const uint32_t activity_generation_before =
+        g_user_activity_generation.load(std::memory_order_acquire);
+
     const uint32_t generation = NextSleepGeneration();
     if (!runtime::TryBeginSleepQuiesce(generation)) {
+        return;
+    }
+    if (g_user_activity_generation.load(std::memory_order_acquire) !=
+        activity_generation_before) {
+        RollbackSleepPreparation(generation, "user-activity-during-quiesce");
         return;
     }
 
@@ -669,6 +701,15 @@ static void EnterDeepSleepIfEnabled(bool enable_timer_wakeup)
     }
 
     PrepareBoardPowerState(power::SleepMode::kIdle);
+    // [sleep-race] Final gate before the point of no return: every service is
+    // quiesced and wake sources are armed, but an interaction that slipped in
+    // during PrepareSleep/ArmWakeSources may have staged state that would die
+    // with this RAM image. Abort; the retry path re-runs the idle checks.
+    if (g_user_activity_generation.load(std::memory_order_acquire) !=
+        activity_generation_before) {
+        RollbackSleepPreparation(generation, "user-activity-before-commit");
+        return;
+    }
     ++g_consecutive_sleep_cycles;
     runtime::SleepSnapshot snapshot;
     snapshot.generation = generation;

@@ -581,6 +581,17 @@ void HandleUiInput(UiState* state, UiInput input)
                 state->word_app.message = "正在保存，请稍后离开";
                 break;
             }
+            // Same contract for a problem verdict: the in-layer LongConfirm
+            // gate blocks the escape chain, but a long UP/DOWN maps straight to
+            // top-screen navigation and would bypass it, hiding the saving
+            // status mid-commit.
+            if (state->screen == wqn::UiScreen::kNote &&
+                state->problem_app.active &&
+                state->problem_app.commit_state ==
+                    wqn::ProblemVerdictCommitState::kPersisting) {
+                state->problem_app.message = "正在保存，请稍后离开";
+                break;
+            }
             state->screen = PreviousTopScreen(state->screen);
             break;
 
@@ -590,6 +601,13 @@ void HandleUiInput(UiState* state, UiInput input)
                 state->word_app.session.commit_state ==
                     wqn::WordObservationCommitState::kPersisting) {
                 state->word_app.message = "正在保存，请稍后离开";
+                break;
+            }
+            if (state->screen == wqn::UiScreen::kNote &&
+                state->problem_app.active &&
+                state->problem_app.commit_state ==
+                    wqn::ProblemVerdictCommitState::kPersisting) {
+                state->problem_app.message = "正在保存，请稍后离开";
                 break;
             }
             state->screen = NextTopScreen(state->screen);
