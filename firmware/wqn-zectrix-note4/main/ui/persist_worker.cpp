@@ -206,6 +206,23 @@ void PublishPersistResult(PersistCommand& command, uint8_t slot_index)
     NotifyUiTask();
 }
 
+// [pool-hygiene] Release the dynamic payload capacity once the storage call
+// has consumed it. A slot can otherwise pin a full Word/Note session (up to
+// ~500 candidate items of strings) until the same kind happens to reuse that
+// exact slot; across 8 slots and interleaved domains that is hundreds of KB of
+// heap/PSRAM held for nothing. The result mailbox carries only
+// result/op_id/slot, so clearing before publishing is safe.
+void ClearCommandPayload(PersistCommand& command)
+{
+    command.word_obs = {};
+    command.word_advanced = {};
+    command.note_obs = {};
+    command.note_advanced = {};
+    command.problem_obs = {};
+    command.settings_int = 0;
+    command.settings_str = std::string();
+}
+
 void PersistWorkerTask(void*)
 {
     ESP_LOGI(kTag, "persist worker started: pool_depth=%u stack=%lu",
@@ -233,6 +250,7 @@ void PersistWorkerTask(void*)
         // Storage has ended: the SleepLease lifetime ends with the write, NOT
         // with the UI ack. Release it here; the busy gate stays set until ack.
         command.lease.Reset();
+        ClearCommandPayload(command);
         const UBaseType_t stack_free = uxTaskGetStackHighWaterMark(nullptr);
         ESP_LOGI(kTag, "persist done: kind=%u op=%lu result=%s stack_free=%u",
                  static_cast<unsigned>(command.kind),
