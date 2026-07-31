@@ -111,6 +111,20 @@ size_t RingIndexFromNewest(size_t offset_from_newest)
 // Push with the documented loss policy. Runs on the button task only.
 void PushButtonEvent(wqn::ButtonEvent event)
 {
+    // [sleep-race] Publish user activity BEFORE the event can become visible
+    // in the ring. The power task's final sleep gate only takes
+    // g_activity_gate (never g_ring_lock), so publishing after the ring write
+    // -- even inside the same g_ring_lock section -- left a window where the
+    // gate read the old generation while the event was already queued, and
+    // deep sleep dropped it (a released key no longer holds its GPIO low, so
+    // EXT1 cannot re-wake). This order can only over-cancel: "generation
+    // bumped, event not yet queued (or dropped by the full-ring policy)"
+    // costs one aborted sleep, never a silently lost input. Repeats do not
+    // publish: they only occur while a key is physically held (the wake
+    // source stays asserted) and are coalesced/dropped anyway.
+    if (!IsRepeatEvent(event)) {
+        wqn::NoteUserActivityAtMs(event.occurred_at_ms);
+    }
     taskENTER_CRITICAL(&g_ring_lock);
     event.seq = ++g_event_seq;
     // Tail coalescing: a repeat directly following a repeat of the same key
@@ -162,18 +176,6 @@ void PushButtonEvent(wqn::ButtonEvent event)
     ++g_ring_count;
     if (g_ring_count > g_ring_high_water) {
         g_ring_high_water = static_cast<uint32_t>(g_ring_count);
-    }
-    // [sleep-race] Publish user activity the instant a critical event becomes
-    // visible in the ring, still holding g_ring_lock, and BEFORE the UI
-    // dequeues it. This is the linearization point the deep-sleep commit gate
-    // validates against: the power task cannot both pass its final generation
-    // check and sleep while a dequeued-but-unreduced release/short-press is
-    // pending (that GPIO is no longer held low, so EXT1 can't re-wake it).
-    // Repeats are not interactions worth blocking sleep for (they only occur
-    // while a key is physically held, which itself keeps the wake source
-    // asserted), and they get coalesced/dropped anyway.
-    if (!IsRepeatEvent(event)) {
-        wqn::NoteUserActivityAtMs(event.occurred_at_ms);
     }
     taskEXIT_CRITICAL(&g_ring_lock);
 }

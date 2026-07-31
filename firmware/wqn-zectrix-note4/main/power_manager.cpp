@@ -197,18 +197,23 @@ void PublishUserActivity(int64_t occurred_at_ms)
 void NoteUserActivity()
 {
     PublishUserActivity(NowMs());
-    if (IsBatteryVeryLow() && !IsCharging() && !IsUsbPowered()) {
-        ESP_LOGW(kTag, "battery critically low during user activity, initiating shutdown");
-        ShutdownForBatteryDepleted();
-    }
+    CheckBatteryAfterUserActivity();
 }
 
 void NoteUserActivityAtMs(int64_t occurred_at_ms)
 {
-    // Button-task entry: publish only. The battery check in NoteUserActivity
-    // touches I2C and must stay on the UI task; the UI still calls
-    // NoteUserActivity when it consumes the event, which re-runs that check.
+    // Button-task entry: publish only. The battery check touches I2C and must
+    // stay on the UI task; it runs there when the event is consumed
+    // (CheckBatteryAfterUserActivity).
     PublishUserActivity(occurred_at_ms);
+}
+
+void CheckBatteryAfterUserActivity()
+{
+    if (IsBatteryVeryLow() && !IsCharging() && !IsUsbPowered()) {
+        ESP_LOGW(kTag, "battery critically low during user activity, initiating shutdown");
+        ShutdownForBatteryDepleted();
+    }
 }
 
 bool IsUiIdleForSleep()

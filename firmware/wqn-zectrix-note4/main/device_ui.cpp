@@ -586,7 +586,12 @@ void DeviceUiTask(void*)
         }
         if (event.HasEvent()) {
             button_consumed_this_iter = true;
-            wqn::NoteUserActivity();
+            // [sleep-race] The activity generation/timestamp were already
+            // published at PRODUCTION (PushButtonEvent -> NoteUserActivityAtMs,
+            // before the event entered the ring); consuming must not publish
+            // again (double-bump + consume-time timestamp). Only the UI-task
+            // battery guard runs here.
+            wqn::CheckBatteryAfterUserActivity();
             wqn::NoteEpdActivity();
             if (state.screen == wqn::UiScreen::kWord ||
                 state.screen == wqn::UiScreen::kNote) {
