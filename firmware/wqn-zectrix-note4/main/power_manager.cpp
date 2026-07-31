@@ -649,14 +649,8 @@ static bool CommitDeepSleep(
         // itself an armed wake source.
     }
     if (proceed) {
+        // noreturn: nothing after this call is reachable.
         esp_deep_sleep_start();
-        // Only reached if deep sleep was rejected by the SoC. Release the gate
-        // (idle path) and fall through to rollback.
-        if (gate_on_activity_baseline != nullptr) {
-            taskEXIT_CRITICAL(&g_activity_gate);
-        }
-        RollbackSleepPreparation(command.generation, "deep-sleep-returned");
-        return false;
     }
     return true;
 }
@@ -798,6 +792,10 @@ static void EnterDeepSleepIfEnabled(bool enable_timer_wakeup)
     snapshot.wake_gpio_mask = wake.wake_gpio_mask;
     runtime::CommitSleepSnapshot(snapshot);
     if (CommitDeepSleep(command, &activity_generation_before)) {
+        // The interaction landed after the pre-commit check, i.e. possibly
+        // after this cycle's fetch_add: re-zero so a correctly-cancelled sleep
+        // never leaves the consecutive counter at 1.
+        ConsecutiveSleepCyclesRef().store(0, std::memory_order_relaxed);
         RollbackSleepPreparation(generation, "user-activity-at-commit");
     }
 #else
