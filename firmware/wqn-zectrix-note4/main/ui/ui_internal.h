@@ -363,12 +363,12 @@ void BeginCloudTransferProgress(CloudTransferKind kind, uint32_t generation);
 void ReportCloudTransferBytes(uint32_t done_bytes, uint32_t total_bytes);
 void EndCloudTransferProgress();
 CloudTransferSnapshot ReadCloudTransferProgress();
-extern QueueHandle_t g_cloud_result_queue;
 // [input-capture] Register the UI task and wake it on result/sync arrival.
 void SetUiTaskToNotify(TaskHandle_t ui_task);
 void NotifyUiTask();
-// [ack-mailbox] Terminal-result handshake (replaces g_cloud_result_queue).
-// Producer publishes; UI scans, applies, then acks; busy clears after ack.
+// [ack-mailbox] Terminal-result handshake (replaces the retired cloud result
+// queue). Producer publishes; UI scans, applies, then acks; busy clears after
+// ack.
 void PublishCloudResult(CloudDomain domain, uint32_t generation);
 bool TakeCloudResultToApply(CloudDomain domain, uint32_t* generation);
 void AckCloudResult(CloudDomain domain, uint32_t generation);

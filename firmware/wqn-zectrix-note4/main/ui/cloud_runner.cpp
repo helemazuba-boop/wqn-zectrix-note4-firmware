@@ -120,8 +120,6 @@ void CloudLaneTask(void* arg)
 
 }  // namespace
 
-QueueHandle_t g_cloud_result_queue = nullptr;  // [ack-mailbox] retired; kept as an unused extern until step 6 removes the symbol.
-
 namespace {
 // [input-capture] UI task handle for prompt result/sync consumption. Cloud
 // results and sync events used to only sit in a queue until the UI's next
