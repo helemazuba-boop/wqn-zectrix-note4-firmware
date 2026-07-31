@@ -1734,6 +1734,23 @@ void wqn::NoteEpdActivity()
     g_epd_activity_generation.fetch_add(1, std::memory_order_release);
 }
 
+uint32_t wqn::GetEpdActivityGeneration()
+{
+    return g_epd_activity_generation.load(std::memory_order_acquire);
+}
+
+bool wqn::IsEpdIdleMaintenanceDue()
+{
+    const int idle_ms = CONFIG_WQN_EPD_IDLE_POWER_OFF_MS;
+    const int64_t last_activity_ms =
+        g_last_epd_activity_ms.load(std::memory_order_relaxed);
+    if (idle_ms <= 0 || g_epd_idle_cut.load(std::memory_order_relaxed) ||
+        last_activity_ms == 0) {
+        return false;
+    }
+    return (esp_timer_get_time() / 1000 - last_activity_ms) >= idle_ms;
+}
+
 void wqn::PowerOffEpdAfterIdleIfNeeded()
 {
     const int idle_ms = CONFIG_WQN_EPD_IDLE_POWER_OFF_MS;

@@ -504,6 +504,12 @@ wqn::display::DisplaySubmission RequestEpdUiRefresh(
     RefreshSchedule schedule,
     wqn::display::WaveformRequirement waveform);
 void AcknowledgeDisplayResult(wqn::display::DisplayRevision revision);
+// [epd-owner] Ask the EPD refresh task (the sole panel owner) to run idle
+// maintenance (heavy-partial cleanup full refresh + rail power-off). The UI
+// task must NOT touch the panel directly: it only sets the request flag and
+// notifies. The EPD task runs it from its idle wait, after re-checking that no
+// frame is pending and no activity happened since the request.
+void RequestEpdIdleMaintenance();
 void EpdRefreshTask(void*);
 void DeviceUiTask(void*);
 

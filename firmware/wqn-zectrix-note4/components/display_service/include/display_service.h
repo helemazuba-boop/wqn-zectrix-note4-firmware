@@ -47,6 +47,18 @@ esp_err_t RefreshEpdFull(bool allow_local_partial = true, bool force_full_refres
 esp_err_t PrepareDisplayForSleep(int64_t deadline_us);
 void RollbackDisplayAfterSleepAbort();
 void NoteEpdActivity();
+// [epd-owner] Monotonic counter bumped by NoteEpdActivity. The idle-maintenance
+// command samples it before yielding to the EPD task and the EPD task re-checks
+// it just before running maintenance: a change means activity happened in
+// between, so the (1-3 s) cleanup full refresh is skipped rather than run on
+// top of a fresh frame. Acquire-load pairs with the release bump.
+uint32_t GetEpdActivityGeneration();
+// [epd-owner] True when idle maintenance is actually due: the idle-off feature
+// is enabled, activity exists, the idle deadline has elapsed, and the rail has
+// NOT already been cut. RequestEpdIdleMaintenance gates on this so an idle UI
+// poll does not wake the EPD task every cycle (edge-trigger the request only
+// when it flips to due).
+bool IsEpdIdleMaintenanceDue();
 void PowerOffEpdAfterIdleIfNeeded();
 
 // [epd-owner] RAII lock over the WHOLE clear->draw->refresh sequence of one

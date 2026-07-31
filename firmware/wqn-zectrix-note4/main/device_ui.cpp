@@ -15,7 +15,6 @@
 #include "display_service.h"
 #include "esp_attr.h"
 #include "esp_log.h"
-#include "esp_task_wdt.h"
 #include "esp_timer.h"
 #include "flash_session.h"
 #include "power_manager.h"
@@ -1154,27 +1153,13 @@ wqn::AiStreamingStatusView streaming_view{};
             ESP_LOGI(kTag, "queued coalesced problem pack refresh after sync");
         }
 
-        // [hang-fix] The idle power-off path runs a full cleanup refresh and
-        // the panel power-down ON THIS TASK, i.e. the same SPI/BUSY code the
-        // EPD refresh task guards with a scoped TWDT subscription. HIL showed
-        // a silent hard hang inside this call (log ends at "EPD idle cleanup
-        // full refresh", buttons dead, no watchdog output): cover the window
-        // so a wedge panics with a backtrace after CONFIG_ESP_TASK_WDT_TIMEOUT_S
-        // instead of freezing the UI task forever. display_service feeds the
-        // TWDT from its BUSY-wait and row-write loops, so a healthy cleanup
-        // (~1-3 s) never trips it.
-#if CONFIG_ESP_TASK_WDT_EN
-        {
-            const bool idle_wdt_subscribed =
-                esp_task_wdt_add(xTaskGetCurrentTaskHandle()) == ESP_OK;
-            wqn::PowerOffEpdAfterIdleIfNeeded();
-            if (idle_wdt_subscribed) {
-                esp_task_wdt_delete(xTaskGetCurrentTaskHandle());
-            }
-        }
-#else
-        wqn::PowerOffEpdAfterIdleIfNeeded();
-#endif
+        // [epd-owner] Idle power-off / heavy-partial cleanup is the EPD refresh
+        // task's job now (it is the sole panel owner). The UI task only asks;
+        // the EPD task runs it from its idle wait after re-checking no frame is
+        // pending and no activity happened since. This removes the UI task's
+        // direct SPI/BUSY call and its scoped-TWDT workaround, and the ~1-3 s
+        // cleanup full refresh no longer blocks the UI task.
+        device_ui_internal::RequestEpdIdleMaintenance();
 
         // Automatic light sleep is owned by ESP-IDF tickless idle. SleepLease
         // maps active service work to ESP_PM_NO_LIGHT_SLEEP; GPIO17 sleep-mode
@@ -1345,11 +1330,12 @@ esp_err_t ShowStorageRecoveryUi(esp_err_t storage_error)
         return result.error == ESP_OK ? ESP_FAIL : result.error;
     }
 
-    // Give the panel controller its configured cooling interval, then use the
-    // same display-owner idle path as the normal UI before entering the inert
-    // recovery loop in app_main.
+    // Give the panel controller its configured cooling interval, then ask the
+    // EPD task (still running) to power the rail down through the same idle
+    // maintenance command as the normal UI, before entering the inert recovery
+    // loop in app_main.
     vTaskDelay(pdMS_TO_TICKS(CONFIG_WQN_EPD_IDLE_POWER_OFF_MS + 100));
-    wqn::PowerOffEpdAfterIdleIfNeeded();
+    device_ui_internal::RequestEpdIdleMaintenance();
     return ESP_OK;
 #else
     ESP_LOGE(kTag, "storage recovery UI unavailable because EPD UI is disabled");
