@@ -49,4 +49,28 @@ void RollbackDisplayAfterSleepAbort();
 void NoteEpdActivity();
 void PowerOffEpdAfterIdleIfNeeded();
 
+// [epd-owner] RAII lock over the WHOLE clear->draw->refresh sequence of one
+// frame. RefreshEpdFull() only serializes the transmit; a caller that clears
+// and draws the framebuffer across several service calls (RenderFrameToEpd)
+// must hold this for the entire sequence so idle cleanup or another render
+// cannot interleave on the shared framebuffer. Recursive: the inner
+// RefreshEpdFull re-enters the same mutex on this task harmlessly. Construct
+// on the stack; the destructor releases on every early return.
+class EpdFrameTransaction {
+public:
+    EpdFrameTransaction();
+    ~EpdFrameTransaction();
+    EpdFrameTransaction(const EpdFrameTransaction&) = delete;
+    EpdFrameTransaction& operator=(const EpdFrameTransaction&) = delete;
+    // True only when the mutex existed AND was acquired. Callers MUST check
+    // this before drawing: the mutex handle can be null on allocation failure.
+    bool locked() const { return locked_; }
+
+private:
+    // Opaque SemaphoreHandle_t captured at construction (void* to keep FreeRTOS
+    // types out of this public header); released by the destructor iff locked.
+    void* mutex_ = nullptr;
+    bool locked_ = false;
+};
+
 }  // namespace wqn

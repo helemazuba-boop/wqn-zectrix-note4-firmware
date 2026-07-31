@@ -1,6 +1,7 @@
 #include "display_service.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 
 #include "driver/gpio.h"
@@ -121,8 +122,15 @@ uint32_t g_heavy_partials_since_full = 0;
 // and FULL->LP sequences all run clean).
 bool g_last_partial_was_full_frame = false;
 int64_t g_last_epd_refresh_us = 0;
-int64_t g_last_epd_activity_ms = 0;
-bool g_epd_idle_cut = false;
+// [epd-owner] Written by both the EPD refresh task (on present) and the UI
+// task (on button consume); read by the UI task's idle-off path. Atomic
+// removes the multi-writer race on these plain scalars. activity_generation
+// bumps on every NoteEpdActivity so the idle path (and, later, the
+// command-model maintenance re-check) can detect "activity happened since I
+// sampled" without comparing timestamps.
+std::atomic<int64_t> g_last_epd_activity_ms{0};
+std::atomic<uint32_t> g_epd_activity_generation{0};
+std::atomic<bool> g_epd_idle_cut{false};
 
 // [power-fix] Persisted across deep-sleep resets so the EPD refresh task
 // can skip redundant panel updates after an RTC-timer wakeup.  Without this,
@@ -1696,19 +1704,46 @@ static esp_err_t TryPowerOffEpd(uint32_t timeout_ms)
 
 } // namespace wqn
 
+wqn::EpdFrameTransaction::EpdFrameTransaction()
+{
+    // Whole-frame lock: taken once around clear->draw->refresh so no other
+    // EPD operation (idle cleanup, a second render) interleaves on the shared
+    // framebuffer. Recursive mutex -> the inner RefreshEpdFull re-enters
+    // harmlessly on this task. portMAX_DELAY: a frame render must not silently
+    // skip drawing, and the operation is TWDT-fed on its long waits.
+    SemaphoreHandle_t mutex = EpdOperationMutex();
+    mutex_ = mutex;
+    // Mirror EpdOperationGuard: the handle can be null if the static
+    // allocation failed. locked() stays false and the caller must bail out
+    // rather than draw unprotected or call FreeRTOS with a null handle.
+    locked_ = mutex != nullptr &&
+        xSemaphoreTakeRecursive(mutex, portMAX_DELAY) == pdTRUE;
+}
+
+wqn::EpdFrameTransaction::~EpdFrameTransaction()
+{
+    if (locked_) {
+        xSemaphoreGiveRecursive(static_cast<SemaphoreHandle_t>(mutex_));
+    }
+}
+
 void wqn::NoteEpdActivity()
 {
-    g_last_epd_activity_ms = esp_timer_get_time() / 1000;
-    g_epd_idle_cut = false;
+    g_last_epd_activity_ms.store(esp_timer_get_time() / 1000, std::memory_order_relaxed);
+    g_epd_idle_cut.store(false, std::memory_order_relaxed);
+    g_epd_activity_generation.fetch_add(1, std::memory_order_release);
 }
 
 void wqn::PowerOffEpdAfterIdleIfNeeded()
 {
     const int idle_ms = CONFIG_WQN_EPD_IDLE_POWER_OFF_MS;
-    if (idle_ms <= 0 || g_epd_idle_cut || g_last_epd_activity_ms == 0) {
+    const int64_t last_activity_ms =
+        g_last_epd_activity_ms.load(std::memory_order_relaxed);
+    if (idle_ms <= 0 || g_epd_idle_cut.load(std::memory_order_relaxed) ||
+        last_activity_ms == 0) {
         return;
     }
-    if ((esp_timer_get_time() / 1000 - g_last_epd_activity_ms) < idle_ms) {
+    if ((esp_timer_get_time() / 1000 - last_activity_ms) < idle_ms) {
         return;
     }
     // [epd-health] Deferred heavy-partial cleanup: forcing the full refresh
@@ -1740,7 +1775,7 @@ void wqn::PowerOffEpdAfterIdleIfNeeded()
     const esp_err_t result = TryPowerOffEpd(0);
     if (result == ESP_OK) {
         ESP_LOGI(kTag, "EPD idle power-off after %d ms", idle_ms);
-        g_epd_idle_cut = true;
+        g_epd_idle_cut.store(true, std::memory_order_relaxed);
     } else if (result != ESP_ERR_TIMEOUT) {
         ESP_LOGW(kTag, "EPD idle power-off failed: %s", esp_err_to_name(result));
     }
