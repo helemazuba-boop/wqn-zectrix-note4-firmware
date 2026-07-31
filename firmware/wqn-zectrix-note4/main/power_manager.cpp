@@ -106,20 +106,31 @@ void HoldOutput(gpio_num_t pin, int level)
 
 RTC_DATA_ATTR int64_t g_last_user_activity_ms = 0;
 RTC_DATA_ATTR uint32_t g_consecutive_sleep_cycles = 0;
-static bool g_user_interacted_current_boot = false;
+// [sleep-race] Written by the UI task (first interaction of this boot) and
+// read by the power task's timer-wake fast path; atomic removes the
+// unsynchronized cross-task access.
+static std::atomic<bool> g_user_interacted_current_boot{false};
 // [sleep-race] Monotonic count of user interactions. The power task samples it
-// before TryBeginSleepQuiesce and re-checks right after quiesce succeeds and
-// again before the final sleep commit: an interaction landing in that window
-// (e.g. an answer whose persist reserve now fails because quiesce closed lease
-// acquisition) cancels the sleep instead of losing the RAM-staged input.
-// g_last_user_activity_ms itself is written by the UI task and read by the
-// power task; accesses go through std::atomic_ref so the int64 cannot tear on
-// this 32-bit core (the variable stays a plain RTC_DATA_ATTR int64_t).
+// BEFORE the idle/token/USB checks, re-validates before and after quiesce, and
+// performs the final check inside CommitDeepSleep after the UART flush +50 ms
+// settle, serialized with NoteUserActivity through g_activity_gate so no bump
+// can land between that last check and the deep-sleep entry. An interaction
+// in any earlier window cancels the sleep instead of losing RAM-staged input.
+// g_last_user_activity_ms / g_consecutive_sleep_cycles stay plain
+// RTC_DATA_ATTR variables; cross-task accesses go through std::atomic_ref so
+// the int64 cannot tear on this 32-bit core and the UI-task reset of the
+// cycle counter is not a data race.
 static std::atomic<uint32_t> g_user_activity_generation{0};
+static portMUX_TYPE g_activity_gate = portMUX_INITIALIZER_UNLOCKED;
 
 inline std::atomic_ref<int64_t> UserActivityMsRef()
 {
     return std::atomic_ref<int64_t>(g_last_user_activity_ms);
+}
+
+inline std::atomic_ref<uint32_t> ConsecutiveSleepCyclesRef()
+{
+    return std::atomic_ref<uint32_t>(g_consecutive_sleep_cycles);
 }
 
 adc_oneshot_unit_handle_t g_adc_handle = nullptr;
@@ -168,13 +179,16 @@ void LogWakeupCause()
 
 void NoteUserActivity()
 {
-    g_user_interacted_current_boot = true;
+    g_user_interacted_current_boot.store(true, std::memory_order_relaxed);
+    // The timestamp+generation pair updates inside the activity gate so the
+    // deep-sleep commit's final check (same gate) can never interleave with a
+    // half-published interaction; see CommitDeepSleep.
+    taskENTER_CRITICAL(&g_activity_gate);
     UserActivityMsRef().store(NowMs(), std::memory_order_relaxed);
-    // Bump AFTER the timestamp so a generation observer that re-reads the
-    // timestamp sees a value at least as fresh as the bump it noticed.
     g_user_activity_generation.fetch_add(1, std::memory_order_release);
+    taskEXIT_CRITICAL(&g_activity_gate);
     // A physical interaction starts a new HIL/product idle sequence.
-    g_consecutive_sleep_cycles = 0;
+    ConsecutiveSleepCyclesRef().store(0, std::memory_order_relaxed);
     if (IsBatteryVeryLow() && !IsCharging() && !IsUsbPowered()) {
         ESP_LOGW(kTag, "battery critically low during user activity, initiating shutdown");
         ShutdownForBatteryDepleted();
@@ -191,7 +205,7 @@ bool IsUiIdleForSleepEx(int extra_idle_ms)
     // If we woke up by a timer and there has been no user interaction in this boot session,
     // we should sleep immediately.
     if (runtime::GetWakeContext().kind == runtime::WakeKind::kScheduledTimer &&
-        !g_user_interacted_current_boot) {
+        !g_user_interacted_current_boot.load(std::memory_order_relaxed)) {
         return true;
     }
 
@@ -576,19 +590,54 @@ static uint32_t NextSleepGeneration()
     return generation;
 }
 
-static void CommitDeepSleep(const power::PrepareSleepCommand& command)
+// Commits the prepared deep sleep. For the idle path, gate_on_activity_baseline
+// points at the activity generation sampled before the idle checks: the FINAL
+// validation runs after the UART flush + 50 ms settle, inside g_activity_gate
+// (the same critical section NoteUserActivity publishes through), so no bump
+// can land between the check and the deep-sleep entry. Returns only when the
+// sleep was aborted (late activity) -- the caller must roll back. The battery-
+// emergency path passes nullptr: it must power down regardless of input.
+static bool CommitDeepSleep(
+    const power::PrepareSleepCommand& command,
+    const uint32_t* gate_on_activity_baseline)
 {
     ESP_LOGI(kTag, "deep-sleep commit: generation=%u mode=%s consecutive=%u stack_free=%u",
              static_cast<unsigned>(command.generation),
              power::SleepModeName(command.mode),
-             static_cast<unsigned>(g_consecutive_sleep_cycles),
+             static_cast<unsigned>(ConsecutiveSleepCyclesRef().load(std::memory_order_relaxed)),
              static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
     uart_wait_tx_idle_polling(static_cast<uart_port_t>(CONFIG_ESP_CONSOLE_UART_NUM));
     vTaskDelay(pdMS_TO_TICKS(50));
 
-    // This is intentionally the only deep-sleep call site in the firmware.
-    esp_deep_sleep_start();
-    RollbackSleepPreparation(command.generation, "deep-sleep-returned");
+    // The idle path validates the interaction generation one last time under
+    // g_activity_gate so no NoteUserActivity can publish between the check and
+    // the sleep; the emergency path (nullptr baseline) sleeps unconditionally.
+    // Both converge on the SINGLE deep-sleep entry below (the M8
+    // architecture gate enforces exactly one deep-sleep entry firmware-wide).
+    bool proceed = true;
+    if (gate_on_activity_baseline != nullptr) {
+        taskENTER_CRITICAL(&g_activity_gate);
+        proceed = g_user_activity_generation.load(std::memory_order_acquire) ==
+            *gate_on_activity_baseline;
+        if (!proceed) {
+            taskEXIT_CRITICAL(&g_activity_gate);
+        }
+        // When proceeding, the gate is held THROUGH the deep-sleep entry (which
+        // never returns): a racing NoteUserActivity spins on the gate and can
+        // only publish after we are asleep, at which point its key press is
+        // itself an armed wake source.
+    }
+    if (proceed) {
+        esp_deep_sleep_start();
+        // Only reached if deep sleep was rejected by the SoC. Release the gate
+        // (idle path) and fall through to rollback.
+        if (gate_on_activity_baseline != nullptr) {
+            taskEXIT_CRITICAL(&g_activity_gate);
+        }
+        RollbackSleepPreparation(command.generation, "deep-sleep-returned");
+        return false;
+    }
+    return true;
 }
 
 static void RunBatteryEmergencyShutdown()
@@ -624,9 +673,9 @@ static void RunBatteryEmergencyShutdown()
     runtime::SleepSnapshot snapshot;
     snapshot.generation = generation;
     snapshot.mode = power::SleepMode::kBatteryEmergency;
-    snapshot.consecutive_cycles = g_consecutive_sleep_cycles;
+    snapshot.consecutive_cycles = ConsecutiveSleepCyclesRef().load(std::memory_order_relaxed);
     runtime::CommitSleepSnapshot(snapshot);
-    CommitDeepSleep(command);
+    CommitDeepSleep(command, nullptr);
 }
 
 static bool PreemptIdleSleepForBatteryEmergency(uint32_t generation)
@@ -651,6 +700,15 @@ static void EnterDeepSleepIfEnabled(bool enable_timer_wakeup)
     // guard prevents beginning quiesce while USB is already present; the USB
     // SleepLease additionally keeps automatic light sleep out of serial and
     // charging sessions.
+    // [sleep-race] Sample the interaction generation BEFORE the idle checks:
+    // an interaction landing after IsUiIdleForSleep() but before the sample
+    // would otherwise become the baseline and slip through every later
+    // validation. A button consumed after the idle check can arm a persist
+    // effect whose reserve then fails (quiesce rejects new leases), leaving
+    // the input staged in RAM only -- sleeping would silently drop it.
+    const uint32_t activity_generation_before =
+        g_user_activity_generation.load(std::memory_order_acquire);
+
     if (IsUsbPowered()) {
         return;
     }
@@ -658,19 +716,18 @@ static void EnterDeepSleepIfEnabled(bool enable_timer_wakeup)
         !services::HasUsableStoredToken() || !IsUiIdleForSleep()) {
         return;
     }
-
-    // [sleep-race] Sample the interaction generation BEFORE closing lease
-    // acquisition. A button consumed between the idle check and quiesce can
-    // arm a persist effect whose reserve then fails (quiesce rejects new
-    // leases), leaving the input staged in RAM only -- sleeping now would
-    // silently drop it. Re-check after quiesce and before the final commit.
-    const uint32_t activity_generation_before =
-        g_user_activity_generation.load(std::memory_order_acquire);
+    // Validate before closing lease acquisition...
+    if (g_user_activity_generation.load(std::memory_order_acquire) !=
+        activity_generation_before) {
+        return;
+    }
 
     const uint32_t generation = NextSleepGeneration();
     if (!runtime::TryBeginSleepQuiesce(generation)) {
         return;
     }
+    // ...and again right after: a bump inside this window means an armed
+    // effect may just have failed its reserve against the closed gate.
     if (g_user_activity_generation.load(std::memory_order_acquire) !=
         activity_generation_before) {
         RollbackSleepPreparation(generation, "user-activity-during-quiesce");
@@ -701,24 +758,27 @@ static void EnterDeepSleepIfEnabled(bool enable_timer_wakeup)
     }
 
     PrepareBoardPowerState(power::SleepMode::kIdle);
-    // [sleep-race] Final gate before the point of no return: every service is
-    // quiesced and wake sources are armed, but an interaction that slipped in
-    // during PrepareSleep/ArmWakeSources may have staged state that would die
-    // with this RAM image. Abort; the retry path re-runs the idle checks.
+    // [sleep-race] Late gate: every service is quiesced and wake sources are
+    // armed, but an interaction that slipped in during PrepareSleep/
+    // ArmWakeSources may have staged state that would die with this RAM
+    // image. The FINAL check runs inside CommitDeepSleep, after the UART
+    // flush + 50 ms settle, under g_activity_gate.
     if (g_user_activity_generation.load(std::memory_order_acquire) !=
         activity_generation_before) {
         RollbackSleepPreparation(generation, "user-activity-before-commit");
         return;
     }
-    ++g_consecutive_sleep_cycles;
+    ConsecutiveSleepCyclesRef().fetch_add(1, std::memory_order_relaxed);
     runtime::SleepSnapshot snapshot;
     snapshot.generation = generation;
     snapshot.mode = power::SleepMode::kIdle;
     snapshot.timer_wakeup_enabled = enable_timer_wakeup;
-    snapshot.consecutive_cycles = g_consecutive_sleep_cycles;
+    snapshot.consecutive_cycles = ConsecutiveSleepCyclesRef().load(std::memory_order_relaxed);
     snapshot.wake_gpio_mask = wake.wake_gpio_mask;
     runtime::CommitSleepSnapshot(snapshot);
-    CommitDeepSleep(command);
+    if (CommitDeepSleep(command, &activity_generation_before)) {
+        RollbackSleepPreparation(generation, "user-activity-at-commit");
+    }
 #else
     (void)enable_timer_wakeup;
 #endif
@@ -752,7 +812,8 @@ esp_err_t StartPowerCoordinator()
         if (g_next_sleep_generation == 0) {
             g_next_sleep_generation = 1;
         }
-        g_consecutive_sleep_cycles = snapshot.consecutive_cycles;
+        ConsecutiveSleepCyclesRef().store(
+            snapshot.consecutive_cycles, std::memory_order_relaxed);
     }
     const BaseType_t created =
         xTaskCreate(PowerCoordinatorTask, "wqn_power_coord", 8192, nullptr, 4, &g_power_coordinator_task);
