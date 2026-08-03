@@ -25,31 +25,40 @@ constexpr int kStatusBarTitleX = 10;            // left x of the status bar titl
 constexpr int kStatusBarTitleY = 6;             // text baseline y of the status bar title
 constexpr int kStatusBarRightInset = 10;        // right inset for status text (x = kScreenWidth - inset)
 
-// ---- Content margins ----
-constexpr int kMarginX = 10;                    // global horizontal content margin
-constexpr int kEdgeFlushX = 6;                  // AI assistant role-bar: flush to bezel shadow (NOT general-purpose)
-constexpr int kContentTopY = 35;                // first content row below status bar (divider 27 + 8px gap)
-constexpr int kContentWidth = kScreenWidth - 2 * kMarginX;  // 380
-constexpr int kBottomHintY = 278;               // y of bottom hint / footer line
+// ---- Content margins (two tiers, by page density) ----
+// 标准页(卡片/对话框/配置): 视觉宽松.
+// 密度页(AI/note/problem/word 正文): 信息密度优先, 边距收窄到 6.
+constexpr int kMarginX = 10;                    // 全局标准水平边距(卡片/对话框页)
+constexpr int kMarginPage = kMarginX;           // 标准页边距别名 (=10)
+constexpr int kMarginDense = 6;                 // 密度页边距 (note/problem/word/AI 正文)
+constexpr int kEdgeFlushX = 6;                  // [legacy] AI 助手 role-bar 贴边框阴影专用, == kMarginDense
+constexpr int kContentTopY = 35;                // 状态栏下第一内容行 (divider 27 + 8px gap)
+constexpr int kContentWidth = kScreenWidth - 2 * kMarginX;  // 380 (标准页内容宽)
+constexpr int kContentWidthDense = kScreenWidth - 2 * kMarginDense;  // 388 (密度页内容宽)
+constexpr int kBottomHintY = 278;               // 底部提示/脚注行 y
+
+// ---- 组件间距 (gutter) ----
+constexpr int kGutterCard = 12;                 // 卡片垂直间距
+constexpr int kGutterRow = 8;                   // 列表行垂直间距
 
 // ---- Selection style (focus decoration, not interaction timing) ----
 //
 // The enum only describes HOW a focused control is decorated visually.
 // Whether an input fires immediately or persists is the interaction model's
 // concern and MUST NOT be encoded here. The choice between styles is by
-// control shape + e-paper flicker cost:
-//   kInvert              — high-salience focus for small, compact, operable
-//                          targets (status-bar editable controls, time config
-//                          fields, action buttons, dictionary lookup choices)
-//   kInnerBorder         — low-flicker focus for square rows / grid cells /
-//                          list options (2px-inset double border)
-//   kRoundedInnerBorder  — low-flicker focus for rounded cards (outer r6 +
-//                          selected r4 concentric). Card shape owns the round.
+// 交互语义 + e-paper flicker cost (v2 设计语言, 见对话决议):
+//   kInvert              — 将执行动作的瞬时焦点: 反白(黑底白字). 用于动作按钮、
+//                          正在编辑的配置字段、对话框选项、自评选项、查词字母.
+//   kRoundedInnerBorder  — 持久浏览选中的低闪烁焦点: 圆角双边框(外 r6 + 内缩2px r4).
+//                          用于所有卡片式行 (todo/word/home/settings 行/卡片).
+//   kRowFill             — 密度长列表的行选中: 圆角反白实块 + 纸色字. 醒目、移动
+//                          浏览成本低. 用于 note/problem/settings 词库等 30px 级行.
+// [retired] kInnerBorder(方角双边框) 语义二义(既表行选中又被对话框当装饰), 已退役.
 enum class SelectionStyle {
     kNone,
     kInvert,
-    kInnerBorder,
     kRoundedInnerBorder,
+    kRowFill,
 };
 
 // ---- Geometry rect (owned here so decoration/UI layers share one type) ----

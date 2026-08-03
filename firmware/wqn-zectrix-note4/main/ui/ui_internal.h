@@ -22,6 +22,7 @@
 #include "freertos/task.h"
 
 #include "ui_model.h"
+#include "markdown_layout.h"
 #include "wqn_api.h"
 #include "config.h"
 #include "display_service.h"
@@ -503,6 +504,9 @@ void DrawHorizontalLine(int x, int y, int width);
 void DrawVerticalLine(int x, int y, int height);
 void DrawRect(int x, int y, int width, int height);
 void DrawRoundedRect(int x, int y, int width, int height, int radius);
+// [rowfill] Filled rounded rect: the density-list row selection block and the
+// rounded reverse-fill action block (SelectionStyle::kRowFill / kInvert).
+void FillRoundedRect(int x, int y, int width, int height, int radius);
 void FillRect(int x, int y, int width, int height, bool black);
 void ClearRect(const UiRect& rect);
 // [L3-semantics] Named black-fill wrappers (defined in graphics.cpp). L2 migrates call sites.
@@ -518,6 +522,9 @@ esp_err_t RefreshFrame(const wqn::UiFrame& frame, RefreshSchedule schedule);
 esp_err_t DrawClippedText(int x, int y, int max_width, const std::string& text, bool black = true);
 esp_err_t DrawCenteredText(int x, int y, int width, const std::string& text, bool black = true);
 esp_err_t DrawWrappedText(int x, int y, int width, const std::string& text, int max_lines, bool black = true);
+// Shared Markdown row renderer (markdown_render.cpp). The MdLine must come
+// from LayoutMarkdown at the same content_w or geometry desyncs.
+esp_err_t DrawMarkdownLine(const MdLine& line, int x, int y, int content_w, int line_h);
 std::string LimitForEpd(const std::string& text);
 std::string Utf8PageSlice(const std::string& text, size_t page, size_t chars_per_page);
 std::string JoinAiFunctionCallSummaries(const std::vector<std::string>& summaries);
@@ -576,7 +583,6 @@ esp_err_t RenderProblemBrowseToEpd(const wqn::UiFrame& frame, RefreshSchedule sc
 esp_err_t DrawSettingsRow(size_t row_index, int y, const std::string& title, const std::string& value, bool selected);
 esp_err_t DrawSettingsDialogBox(const std::string& title);
 esp_err_t DrawSettingsOptionCard(int x, int y, int width, const std::string& label, bool selected);
-void DrawSettingsProgressBar(int x, int y, int width, int current, int total);
 esp_err_t RenderSettingsDialog(const wqn::SettingsAppState& settings);
 esp_err_t RenderSettingsToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule);
 

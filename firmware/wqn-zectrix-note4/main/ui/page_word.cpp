@@ -227,8 +227,8 @@ esp_err_t RenderWordToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
         const std::string empty_title = word.mode == wqn::WordAppMode::kSessionStarting
             ? "正在准备"
             : "词库未同步";
-        ESP_RETURN_ON_ERROR(DrawCenteredText(20, 118, 360, empty_title), kTag, "draw word empty title");
-        ESP_RETURN_ON_ERROR(DrawCenteredText(20, 148, 360, word.hint), kTag, "draw word empty body");
+        // [v2] Unified empty-state surface (was bare centered text).
+        ESP_RETURN_ON_ERROR(DrawEmptyState(empty_title, word.hint), kTag, "draw word empty state");
         return RefreshFrame(frame, schedule);
     }
 

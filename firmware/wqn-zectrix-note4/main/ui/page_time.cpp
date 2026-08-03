@@ -36,7 +36,9 @@ void DrawClockStatusBar(const wqn::HomeSummary& home)
 
 void DrawProgressBar(int x, int y, int width, int height, int current, int total)
 {
-    DrawRect(x, y, width, height);
+    // [v2] Rounded container outline (progress bar is a content container).
+    // Shared by the timer page and the settings storage/NVS/PSRAM bars.
+    DrawRoundedRect(x, y, width, height, kChipRadius);
     if (total <= 0) {
         return;
     }
@@ -48,11 +50,13 @@ void DrawProgressBar(int x, int y, int width, int height, int current, int total
 
 void DrawConfigBox(int x, int y, int width, int height, const std::string& value, const std::string& label, bool selected)
 {
-    // Focus decoration: invert (ink-filled) when selected, plain outline when not.
+    // [v2] Focus decoration: rounded reverse-fill (kInvert) when selected --
+    // config fields are will-execute/instant-edit targets. Unselected is a
+    // rounded container outline (the square DrawRect box is retired).
     if (selected) {
         DrawSelectionDecoration(x, y, width, height, SelectionStyle::kInvert);
     } else {
-        DrawRect(x, y, width, height);
+        DrawRoundedRect(x, y, width, height, kChipRadius);
     }
     const bool black_text = !selected;
     // Value rendered from the shared 1bpp 16px digit assets; label stays CJK.
@@ -63,11 +67,12 @@ void DrawConfigBox(int x, int y, int width, int height, const std::string& value
 void DrawActionBox(int x, int y, int width, const std::string& label, bool selected)
 {
     constexpr int kActionBoxHeight = 28;
-    // Focus decoration: invert when selected, plain outline when not.
+    // [v2] Focus: rounded reverse-fill (kInvert) when selected (action buttons
+    // execute-on-confirm); plain rounded outline otherwise.
     if (selected) {
         DrawSelectionDecoration(x, y, width, kActionBoxHeight, SelectionStyle::kInvert);
     } else {
-        DrawRect(x, y, width, kActionBoxHeight);
+        DrawRoundedRect(x, y, width, kActionBoxHeight, kChipRadius);
     }
     DrawCenteredText(x, y + 6, width, label, !selected);
 }

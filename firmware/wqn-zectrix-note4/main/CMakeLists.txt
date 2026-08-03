@@ -31,6 +31,7 @@ idf_component_register(
         "ui/diagnostics.cpp"
         "ui/graphics.cpp"
         "ui/markdown_layout.cpp"
+        "ui/markdown_render.cpp"
         "ui/page_ai.cpp"
         "ui/page_home.cpp"
         "ui/page_settings.cpp"

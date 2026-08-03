@@ -84,12 +84,24 @@ struct MdLine {
     bool border_bottom = false;           // horizontal rule at the row's bottom
 };
 
+// Layout option flags (bitmask).
+//
+// kMdNoSingleEmphasis: single '*' / '_' runs stay literal instead of pairing
+// as italic. Math-heavy plain text (problem bodies come from HtmlToPlainText)
+// writes "x*y" and "x_1"; stripping those markers corrupts the formula.
+// Double markers (**, __), strike, code, links and all block elements are
+// unaffected -- they do not occur in math plain text.
+constexpr uint8_t kMdNoSingleEmphasis = 0x01;
+
 // Lay a Markdown body out into fixed-height rows for a content_width_px-wide
-// viewport. Deterministic for a given (body, width): the render path and the
-// scroll-clamp count path MUST pass the same width so their row counts agree.
-std::vector<MdLine> LayoutMarkdown(const std::string& body, int content_width_px);
+// viewport. Deterministic for a given (body, width, opts): the render path and
+// the scroll-clamp count path MUST pass the same width and opts so their row
+// counts agree.
+std::vector<MdLine> LayoutMarkdown(
+    const std::string& body, int content_width_px, uint8_t opts = 0);
 
 // Row count only (scroll clamp). Equivalent to LayoutMarkdown(...).size().
-std::size_t CountMarkdownLines(const std::string& body, int content_width_px);
+std::size_t CountMarkdownLines(
+    const std::string& body, int content_width_px, uint8_t opts = 0);
 
 }  // namespace device_ui_internal

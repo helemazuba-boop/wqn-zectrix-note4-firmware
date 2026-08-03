@@ -242,21 +242,21 @@ void DrawTimelineNode(int cx, int cy, bool selected)
 
 esp_err_t DrawTodoStatusBar(const wqn::TodoUiState& todo, const wqn::HomeSummary& home)
 {
-    DrawHorizontalLine(0, 27, wqn::kEpdWidth);
-    ESP_RETURN_ON_ERROR(wqn::DrawUtf8Text(10, 6, "Todo", true), kTag, "draw todo title");
+    DrawHorizontalLine(0, kStatusBarDividerY, wqn::kEpdWidth);
+    ESP_RETURN_ON_ERROR(wqn::DrawUtf8Text(kMarginX, 6, "Todo", true), kTag, "draw todo title");
 
-    // Right-edge icon cluster (wifi + battery); text status right-aligned to its left.
-    const int icons_left = DrawStatusBarIcons(wqn::kEpdWidth - 10, 6, home);
-    std::string status = "今日 " + std::to_string(TodoPendingCount(todo));
-    status += "  逾期 " + std::to_string(TodoOverdueCount(todo));
-    status += "  ";
-    status += TodoSyncStatusText(todo.sync_status);
+    // [v2] Status bar carries only the global four-piece set (title + clock +
+    // wifi + battery). The 今日/逾期 counts that used to crowd here (and get
+    // truncated) move into the content area as a summary line under the cards;
+    // the sync status stays visible there too. Right inset aligned to kMarginX.
+    const int icons_left = DrawStatusBarIcons(wqn::kEpdWidth - kMarginX, 6, home);
+    std::string status = TodoSyncStatusText(todo.sync_status);
     status += "  " + CurrentClockLabel();
-    const int max_width = std::max(0, icons_left - 6 - 74);
+    const int max_width = std::max(0, icons_left - 6 - kMarginX);
     const std::string clipped = wqn::TruncateUtf8TextToWidth(status, max_width);
     const int status_width = wqn::MeasureUtf8TextWidth(clipped.c_str());
     ESP_RETURN_ON_ERROR(
-        wqn::DrawUtf8Text(std::max(74, icons_left - 6 - status_width), 6, clipped.c_str(), true),
+        wqn::DrawUtf8Text(std::max(kMarginX, icons_left - 6 - status_width), 6, clipped.c_str(), true),
         kTag,
         "draw todo status");
     return ESP_OK;
@@ -298,12 +298,8 @@ esp_err_t DrawTodoEmptyState(const wqn::TodoUiState& todo)
         title = "正在同步 Todo";
         body = "正在从云端获取今天的待办";
     }
-
-    DrawRoundedRect(28, 72, 344, 128, kRoundedOuterRadius);
-    ESP_RETURN_ON_ERROR(DrawCenteredText(36, 106, 328, title), kTag, "draw todo empty title");
-    ESP_RETURN_ON_ERROR(DrawCenteredText(36, 136, 328, body), kTag, "draw todo empty body");
-    ESP_RETURN_ON_ERROR(DrawCenteredText(36, 174, 328, TodoSyncStatusText(todo.sync_status)), kTag, "draw todo empty status");
-    return ESP_OK;
+    // [v2] Unified empty-state surface (rounded container, title/body/hint).
+    return DrawEmptyState(title, body, TodoSyncStatusText(todo.sync_status));
 }
 
 esp_err_t RenderTodoToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
@@ -343,10 +339,15 @@ esp_err_t RenderTodoToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
             "draw todo card");
     }
 
+    // [v2] Footer summary line: the 今日/逾期 counts moved out of the status bar
+    // live here, joined with any transient sync note.
+    std::string footer = "今日 " + std::to_string(TodoPendingCount(todo));
+    footer += " · 逾期 " + std::to_string(TodoOverdueCount(todo));
     const std::string note = TodoStatusNote(todo);
     if (!note.empty()) {
-        ESP_RETURN_ON_ERROR(DrawClippedText(kCardX, 282, kCardWidth, note), kTag, "draw todo message");
+        footer += " · " + note;
     }
+    ESP_RETURN_ON_ERROR(DrawClippedText(kCardX, 282, kCardWidth, footer), kTag, "draw todo footer");
     return RefreshFrame(frame, schedule);
 }
 

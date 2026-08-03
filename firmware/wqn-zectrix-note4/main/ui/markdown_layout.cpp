@@ -97,13 +97,13 @@ size_t FindSub(const std::string& s, size_t from, const char* sub, size_t sublen
     return s.find(sub, from, sublen);
 }
 
-void ParseInlineInto(const std::string& raw, StyledText* out);
+void ParseInlineInto(const std::string& raw, uint8_t opts, StyledText* out);
 
 // Handle a paired emphasis/strike marker of `mlen` chars starting at i. On a
 // matched close, recurses over the inner text and (for strike) records a span.
 // Returns the index just past the close, or npos if unmatched.
 size_t TryPaired(const std::string& raw, size_t i, const char* mark, size_t mlen,
-                 bool strike, StyledText* out)
+                 bool strike, uint8_t opts, StyledText* out)
 {
     const size_t close = FindSub(raw, i + mlen, mark, mlen);
     if (close == std::string::npos || close == i + mlen) {
@@ -111,14 +111,14 @@ size_t TryPaired(const std::string& raw, size_t i, const char* mark, size_t mlen
     }
     const std::string inner = raw.substr(i + mlen, close - (i + mlen));
     const size_t span_start = out->plain.size();
-    ParseInlineInto(inner, out);
+    ParseInlineInto(inner, opts, out);
     if (strike) {
         out->spans.push_back({span_start, out->plain.size(), MdDecoKind::kStrike});
     }
     return close + mlen;
 }
 
-void ParseInlineInto(const std::string& raw, StyledText* out)
+void ParseInlineInto(const std::string& raw, uint8_t opts, StyledText* out)
 {
     size_t i = 0;
     while (i < raw.size()) {
@@ -158,7 +158,7 @@ void ParseInlineInto(const std::string& raw, StyledText* out)
                 if (rp != std::string::npos) {
                     const std::string text = raw.substr(i + 1, rb - (i + 1));
                     const size_t s = out->plain.size();
-                    ParseInlineInto(text, out);
+                    ParseInlineInto(text, opts, out);
                     out->spans.push_back({s, out->plain.size(), MdDecoKind::kUnderline});
                     i = rp + 1;
                     continue;
@@ -166,7 +166,7 @@ void ParseInlineInto(const std::string& raw, StyledText* out)
             }
         }
         if (c == '~' && i + 1 < raw.size() && raw[i + 1] == '~') {  // strike
-            const size_t next = TryPaired(raw, i, "~~", 2, true, out);
+            const size_t next = TryPaired(raw, i, "~~", 2, true, opts, out);
             if (next != std::string::npos) { i = next; continue; }
         }
         if (c == '*' || c == '_') {  // emphasis: try ***/___, then **/__, then */_
@@ -175,11 +175,14 @@ void ParseInlineInto(const std::string& raw, StyledText* out)
             // into the output as a literal asterisk.
             size_t run = 1;
             while (i + run < raw.size() && raw[i + run] == c && run < 3) ++run;
+            // Math-protection mode: a lone * / _ is multiplication or a
+            // subscript, never emphasis.
+            const size_t min_run = (opts & kMdNoSingleEmphasis) ? 2 : 1;
             size_t next = std::string::npos;
-            for (size_t m = run; m >= 1 && next == std::string::npos; --m) {
+            for (size_t m = run; m >= min_run && next == std::string::npos; --m) {
                 char mk[4] = {c, c, c, '\0'};
                 mk[m] = '\0';
-                next = TryPaired(raw, i, mk, m, false, out);
+                next = TryPaired(raw, i, mk, m, false, opts, out);
             }
             if (next != std::string::npos) {
                 i = next;
@@ -195,11 +198,11 @@ void ParseInlineInto(const std::string& raw, StyledText* out)
     }
 }
 
-StyledText ParseInline(const std::string& raw)
+StyledText ParseInline(const std::string& raw, uint8_t opts)
 {
     StyledText st;
     st.plain.reserve(raw.size());
-    ParseInlineInto(raw, &st);
+    ParseInlineInto(raw, opts, &st);
     return st;
 }
 
@@ -399,7 +402,7 @@ bool IsDelimiterRow(const std::string& raw)
 
 }  // namespace
 
-std::vector<MdLine> LayoutMarkdown(const std::string& body, int content_width_px)
+std::vector<MdLine> LayoutMarkdown(const std::string& body, int content_width_px, uint8_t opts)
 {
     std::vector<MdLine> out;
     const int width = std::max(40, content_width_px);
@@ -518,7 +521,7 @@ std::vector<MdLine> LayoutMarkdown(const std::string& body, int content_width_px
                         if (c) joined += " | ";
                         joined += rows[r][c];
                     }
-                    for (const WrappedLine& wl : WrapStyled(ParseInline(joined), width)) {
+                    for (const WrappedLine& wl : WrapStyled(ParseInline(joined, opts), width)) {
                         push_text(wl, 0);
                     }
                 }
@@ -558,7 +561,7 @@ std::vector<MdLine> LayoutMarkdown(const std::string& body, int content_width_px
                 size_t row_h = 1;
                 for (size_t c = 0; c < ncols; ++c) {
                     const std::string cell = c < rows[r].size() ? rows[r][c] : std::string();
-                    for (const WrappedLine& wl : WrapStyled(ParseInline(cell), colw[c])) {
+                    for (const WrappedLine& wl : WrapStyled(ParseInline(cell, opts), colw[c])) {
                         cell_lines[c].push_back(wl.text);
                     }
                     row_h = std::max(row_h, cell_lines[c].size());
@@ -594,7 +597,7 @@ std::vector<MdLine> LayoutMarkdown(const std::string& body, int content_width_px
         if (IsHeading(trimmed, &level, &htext)) {
             push_blank();  // headings breathe
             const int indent = level >= 3 ? kHeadingMarkPx : 0;
-            const std::vector<WrappedLine> wl = WrapStyled(ParseInline(htext), width - indent);
+            const std::vector<WrappedLine> wl = WrapStyled(ParseInline(htext, opts), width - indent);
             for (size_t k = 0; k < wl.size(); ++k) {
                 MdLine ml;
                 ml.text = wl[k].text;
@@ -617,7 +620,7 @@ std::vector<MdLine> LayoutMarkdown(const std::string& body, int content_width_px
         std::string inner;
         if (ParseQuote(raw, &depth, &inner)) {
             const int indent = depth * kQuoteStepPx + kQuoteTextPad;
-            const std::vector<WrappedLine> wl = WrapStyled(ParseInline(LStrip(inner)), width - indent);
+            const std::vector<WrappedLine> wl = WrapStyled(ParseInline(LStrip(inner), opts), width - indent);
             if (wl.empty()) {  // "> " with no text still shows the bar
                 MdLine ml;
                 ml.indent_px = static_cast<int16_t>(indent);
@@ -642,7 +645,7 @@ std::vector<MdLine> LayoutMarkdown(const std::string& body, int content_width_px
         std::string marker;
         if (ParseUnordered(raw, &list_level, &content)) {
             const int indent = kListBasePx + list_level * kListStepPx + kBulletAreaPx;
-            const std::vector<WrappedLine> wl = WrapStyled(ParseInline(content), width - indent);
+            const std::vector<WrappedLine> wl = WrapStyled(ParseInline(content, opts), width - indent);
             for (size_t k = 0; k < wl.size(); ++k) {
                 MdLine ml;
                 ml.text = wl[k].text;
@@ -661,7 +664,7 @@ std::vector<MdLine> LayoutMarkdown(const std::string& body, int content_width_px
         }
         if (ParseOrdered(raw, &list_level, &marker, &content)) {
             const int indent = kListBasePx + list_level * kListStepPx + kBulletAreaPx;
-            StyledText st = ParseInline(content);
+            StyledText st = ParseInline(content, opts);
             st.plain.insert(0, marker);  // "N. " rides in the text; spans shift
             for (InlineSpan& sp : st.spans) {
                 sp.start += marker.size();
@@ -676,7 +679,7 @@ std::vector<MdLine> LayoutMarkdown(const std::string& body, int content_width_px
             continue;
         }
 
-        for (const WrappedLine& wl : WrapStyled(ParseInline(LStrip(raw)), width)) {
+        for (const WrappedLine& wl : WrapStyled(ParseInline(LStrip(raw), opts), width)) {
             push_text(wl, 0);
         }
         ++i;
@@ -689,9 +692,9 @@ std::vector<MdLine> LayoutMarkdown(const std::string& body, int content_width_px
     return out;
 }
 
-std::size_t CountMarkdownLines(const std::string& body, int content_width_px)
+std::size_t CountMarkdownLines(const std::string& body, int content_width_px, uint8_t opts)
 {
-    return LayoutMarkdown(body, content_width_px).size();
+    return LayoutMarkdown(body, content_width_px, opts).size();
 }
 
 }  // namespace device_ui_internal

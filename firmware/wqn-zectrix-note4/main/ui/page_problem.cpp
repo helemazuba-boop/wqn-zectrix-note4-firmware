@@ -17,7 +17,7 @@ namespace device_ui_internal {
 namespace {
 
 constexpr char kTag[] = "wqn_problem_page";
-constexpr int kProblemMarginX = 8;
+constexpr int kProblemMarginX = kMarginDense;  // [v2] density-page margin (was 8)
 constexpr int kContentW = wqn::kEpdWidth - 2 * kProblemMarginX;
 constexpr int kContentTop = 32;
 // No footer line (device pages keep no bottom status row); the 13-line face
@@ -44,7 +44,8 @@ size_t ClampListWindowStart(size_t start, size_t selected, size_t count, size_t 
 esp_err_t DrawListRow(int y, const std::string& primary, const std::string& trailing, bool selected)
 {
     if (selected) {
-        DrawSelectedFill(kProblemMarginX, y, kContentW, kListRowH - 4);
+        // [v2] density-list row selection: rounded reverse-fill block.
+        DrawSelectionDecoration(kProblemMarginX, y, kContentW, kListRowH - 4, SelectionStyle::kRowFill);
     }
     const bool black = !selected;
     const int trailing_w = 88;
@@ -82,8 +83,11 @@ esp_err_t RenderProblemList(const wqn::ProblemAppSnapshot& problem)
     return ESP_OK;
 }
 
-// Wrapped scroll viewport shared by the 题面 and 答案面. The wrapped lines are
-// cached per problem+face so scrolling never re-wraps a multi-KB body.
+// Wrapped scroll viewport shared by the 题面 and 答案面. The Markdown rows are
+// cached per problem+face so scrolling never re-lays a multi-KB body. Layout
+// runs with kMdNoSingleEmphasis (math plain text keeps single * / _ literal)
+// and MUST match problem_app.cpp's scroll-clamp count: same width 370, same
+// opts, same LayoutMarkdown.
 esp_err_t RenderProblemTextFace(
     const wqn::ProblemAppSnapshot& problem,
     bool answer_face)
@@ -102,14 +106,14 @@ esp_err_t RenderProblemTextFace(
     }
     const int body_top = kContentTop;
     const int visible = std::max(1, (kContentBottom - body_top) / kBodyLineH);
-    static std::string s_wrapped_key;
-    static std::vector<std::string> s_wrapped_lines;
+    static std::string s_layout_key;
+    static std::vector<MdLine> s_md_lines;
     const std::string key = problem.problem_id + (answer_face ? "#a" : "#b");
-    if (key != s_wrapped_key) {
-        s_wrapped_lines = wqn::WrapUtf8TextToWidth(text, kContentW - 14, 4096);
-        s_wrapped_key = key;
+    if (key != s_layout_key) {
+        s_md_lines = LayoutMarkdown(text, kContentW - 14, kMdNoSingleEmphasis);
+        s_layout_key = key;
     }
-    const std::vector<std::string>& lines = s_wrapped_lines;
+    const std::vector<MdLine>& lines = s_md_lines;
     const int total = static_cast<int>(lines.size());
     const int max_top = total > visible ? total - visible : 0;
     int top = static_cast<int>(scroll);
@@ -117,8 +121,9 @@ esp_err_t RenderProblemTextFace(
     if (top < 0) top = 0;
     for (int i = 0; i < visible && top + i < total; ++i) {
         ESP_RETURN_ON_ERROR(
-            DrawClippedText(
-                kProblemMarginX + 2, body_top + i * kBodyLineH, kContentW - 14, lines[top + i]),
+            DrawMarkdownLine(
+                lines[top + i], kProblemMarginX + 2, body_top + i * kBodyLineH,
+                kContentW - 14, kBodyLineH),
             kTag, "draw problem face line");
     }
     if (total > visible) {
@@ -176,7 +181,8 @@ esp_err_t RenderVerdictDialog(const wqn::ProblemAppSnapshot& problem)
         const int y = first_y + static_cast<int>(index) * row_h;
         const bool selected = index == problem.verdict_selected;
         if (selected) {
-            DrawSelectedFill(box_x + 10, y, box_w - 20, row_h - 6);
+            // [v2] verdict option executes-on-confirm: rounded reverse-fill (kInvert).
+            DrawSelectionDecoration(box_x + 10, y, box_w - 20, row_h - 6, SelectionStyle::kInvert);
         }
         ESP_RETURN_ON_ERROR(
             DrawClippedText(box_x + 24, y + 6, box_w - 48, kOptions[index], !selected),

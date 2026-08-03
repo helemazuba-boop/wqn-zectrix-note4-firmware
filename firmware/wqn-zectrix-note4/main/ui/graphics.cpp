@@ -4,6 +4,7 @@
 #include "ui_internal.h"
 
 #include <algorithm>
+#include <cmath>
 
 #include "display_service.h"
 
@@ -103,6 +104,40 @@ void DrawRoundedRect(int x, int y, int width, int height, int radius)
             --dx;
             err += 2 * (dy - dx) + 1;
         }
+    }
+}
+
+// [rowfill] Filled rounded rect (reverse-fill with rounded corners). This is
+// the density-list row selection block (SelectionStyle::kRowFill): the row is
+// ink-filled, the caller draws its content in paper color on top. Corners use
+// the same midpoint-circle walk as DrawRoundedRect but fill the interior rows
+// between the left/right arc spans. radius<=0 degrades to FillRect.
+void FillRoundedRect(int x, int y, int width, int height, int radius)
+{
+    if (width <= 0 || height <= 0) {
+        return;
+    }
+    if (radius <= 0) {
+        FillRect(x, y, width, height, true);
+        return;
+    }
+    const int r = std::min(radius, std::min(width, height) / 2);
+    // For each scanline row, compute the horizontal extent of the rounded
+    // shape and fill it. Straight middle rows fill full width; the top/bottom
+    // r rows are clipped by the corner circle.
+    for (int yy = 0; yy < height; ++yy) {
+        int inset = 0;
+        // Distance of this row from the nearest top/bottom edge (0-based).
+        const int edge = std::min(yy, height - 1 - yy);
+        if (edge < r) {
+            // Row inside a corner arc: how far the circle pulls the edge in.
+            // (r - edge) is the vertical distance from the arc center row.
+            const int dy = r - edge;
+            // inset = r - round(sqrt(r^2 - dy^2)); classic circle clip.
+            const int span = static_cast<int>(std::sqrt(static_cast<double>(r * r - dy * dy)) + 0.5);
+            inset = r - span;
+        }
+        DrawHorizontalLine(x + inset, y + yy, width - 2 * inset);
     }
 }
 

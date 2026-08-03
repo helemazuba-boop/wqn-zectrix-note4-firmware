@@ -11,6 +11,7 @@
 #include "esp_timer.h"
 
 #include "display_service.h"
+#include "ui/markdown_layout.h"
 
 namespace {
 
@@ -269,14 +270,18 @@ void LoadCurrentProblem(wqn::ProblemAppState* state)
     const esp_err_t read_result = wqn::ReadProblemPackEntry(entry, &state->current);
     if (read_result == ESP_OK) {
         state->current_loaded = true;
-        // Precompute wrapped line counts with the SAME width as the renderer
-        // (page_problem.cpp: kContentW - 14 = 370 px) so scroll clamps match.
+        // Precompute Markdown row counts with the SAME width, layout and opts
+        // as the renderer (page_problem.cpp: kContentW - 14 = 370 px,
+        // kMdNoSingleEmphasis) so scroll clamps match. Single * / _ stay
+        // literal: problem bodies are math-heavy plain text.
         state->body_text = ComposeBodyText(state->current);
         state->body_total_lines = static_cast<uint32_t>(
-            wqn::WrapUtf8TextToWidth(state->body_text, 370, 4096).size());
+            device_ui_internal::CountMarkdownLines(
+                state->body_text, 370, device_ui_internal::kMdNoSingleEmphasis));
         state->answer_text = ComposeAnswerText(state->current);
         state->answer_total_lines = static_cast<uint32_t>(
-            wqn::WrapUtf8TextToWidth(state->answer_text, 370, 4096).size());
+            device_ui_internal::CountMarkdownLines(
+                state->answer_text, 370, device_ui_internal::kMdNoSingleEmphasis));
         ESP_LOGI(
             kTag, "problem opened: id=%.8s images=%u/%u parts=%u body_bytes=%u",
             state->current.problem_id.c_str(),

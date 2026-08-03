@@ -1464,6 +1464,19 @@ bool CheckMarkdownLayout()
     const std::vector<MdLine> triple = LayoutMarkdown("***粗斜体***", 370);
     const bool triple_clean = triple.size() == 1 && triple[0].text == "粗斜体";
 
+    // kMdNoSingleEmphasis (problem-face mode): math plain text keeps single
+    // * / _ literal while double-marker bold still strips.
+    const std::vector<MdLine> math =
+        LayoutMarkdown("x*y*z 与 x_1 加 **粗体**", 370, kMdNoSingleEmphasis);
+    const bool math_clean =
+        math.size() == 1 && math[0].text == "x*y*z 与 x_1 加 粗体";
+
+    // AI assistant width (378 px): the showcase lays out and the row-count
+    // path agrees, mirroring the measure/draw split in page_ai.cpp.
+    const std::vector<MdLine> ai_rows = LayoutMarkdown(kShowcase, 378);
+    const bool ai_width_ok =
+        !ai_rows.empty() && CountMarkdownLines(kShowcase, 378) == ai_rows.size();
+
     return Require(has_rule, "markdown horizontal rule") &&
            Require(has_heading_underline, "markdown heading underline") &&
            Require(has_bullet, "markdown list bullet") &&
@@ -1475,7 +1488,9 @@ bool CheckMarkdownLayout()
            Require(has_strike, "markdown strikethrough") &&
            Require(wide_downgraded, "markdown wide table downgraded to text") &&
            Require(dense_is_grid, "markdown dense 4-col table renders as grid") &&
-           Require(triple_clean, "markdown triple emphasis fully stripped");
+           Require(triple_clean, "markdown triple emphasis fully stripped") &&
+           Require(math_clean, "markdown math mode keeps single emphasis literal") &&
+           Require(ai_width_ok, "markdown AI width layout and count agree");
 }
 
 }  // namespace

@@ -16,27 +16,31 @@ constexpr char kTag[] = "wqn_ui";
 
 esp_err_t DrawSettingsRow(size_t row_index, int y, const std::string& title, const std::string& value, bool selected)
 {
-    constexpr int kX = 12;
-    constexpr int kContentX = kX + 7;            // row body starts after the index gutter
-    constexpr int kWidth = 376;
-    constexpr int kContentWidth = kWidth - 7;
+    // [v2] Row horizontal bounds aligned to the AI page's flush 6px edges
+    // (kMarginDense): left x=6, width 388 (6..394). Vertical geometry (y, 36px
+    // row height, 38px pitch) is unchanged per the agreed left/right-only fix.
+    constexpr int kX = kMarginDense;
+    constexpr int kContentX = kX;               // row body starts at the flush edge
+    constexpr int kWidth = wqn::kEpdWidth - 2 * kMarginDense;  // 388
+    constexpr int kContentWidth = kWidth;
     constexpr int kHeight = 36;
     // Index gutter: the row's 2-digit index is also the selection marker. When
-    // selected the index sits in a reverse-filled rounded block (the unified
-    // kInvert focus language, rounded chip shape) so the left gutter is no
-    // longer empty and the active row is obvious; unselected shows the plain
-    // index with no block.
-    constexpr int kIndexBlockX = kContentX + 4;  // 4px inside the row body
+    // selected the index sits in a rounded reverse-fill block (the kInvert
+    // will-execute language, rounded chip shape) so the active row is obvious;
+    // unselected shows the plain index with no block.
+    constexpr int kIndexBlockX = kContentX + 6;  // 6px inside the row body
     constexpr int kIndexBlockYOff = 6;            // offset from row top, centered in 36h
     constexpr int kIndexBlockW = 36;
     constexpr int kIndexBlockH = 24;
-    // Row outline: kInnerBorder when selected, plain DrawRect otherwise.
+    // [v2] Row outline: rounded double border (kRoundedInnerBorder) when selected,
+    // plain rounded outline otherwise -- the whole settings page uses the rounded
+    // container language; the square kInnerBorder/DrawRect mix is retired.
     if (selected) {
-        DrawSelectionDecoration(kContentX, y, kContentWidth, kHeight, SelectionStyle::kInnerBorder);
-        // Index block: reverse-fill rounded chip behind the index number.
+        DrawSelectionDecoration(kContentX, y, kContentWidth, kHeight, SelectionStyle::kRoundedInnerBorder);
+        // Index block: rounded reverse-fill chip behind the index number.
         DrawSelectionDecoration(kIndexBlockX, y + kIndexBlockYOff, kIndexBlockW, kIndexBlockH, SelectionStyle::kInvert);
     } else {
-        DrawRect(kContentX, y, kContentWidth, kHeight);
+        DrawRoundedRect(kContentX, y, kContentWidth, kHeight, kRoundedOuterRadius);
     }
     char index_label[4] = {};
     std::snprintf(index_label, sizeof(index_label), "%02u", static_cast<unsigned>(row_index + 1));
@@ -44,12 +48,14 @@ esp_err_t DrawSettingsRow(size_t row_index, int y, const std::string& title, con
         // Index number in paper (white) on the reverse-fill block, centered in it.
         ESP_RETURN_ON_ERROR(DrawCenteredText(kIndexBlockX, y + kIndexBlockYOff + 4, kIndexBlockW, index_label, false), kTag, "draw settings index");
     } else {
-        // Unselected: plain ink index in its original position (left-aligned).
-        ESP_RETURN_ON_ERROR(DrawClippedText(kX + 17, y + 10, 28, index_label), kTag, "draw settings index");
+        // Unselected: plain ink index, left-aligned in the index gutter.
+        ESP_RETURN_ON_ERROR(DrawClippedText(kContentX + 12, y + 10, 28, index_label), kTag, "draw settings index");
     }
-    ESP_RETURN_ON_ERROR(DrawClippedText(kX + 52, y + 4, 174, title), kTag, "draw settings title");
+    // Title / value sit right of the 48px index gutter; tag is pinned to the
+    // row's right edge (right-aligned at kContentX + kContentWidth - 6 inset).
+    ESP_RETURN_ON_ERROR(DrawClippedText(kContentX + 48, y + 4, 220, title), kTag, "draw settings title");
     if (!value.empty()) {
-        ESP_RETURN_ON_ERROR(DrawClippedText(kX + 52, y + 20, 214, value), kTag, "draw settings value");
+        ESP_RETURN_ON_ERROR(DrawClippedText(kContentX + 48, y + 20, 250, value), kTag, "draw settings value");
     }
     const char* tag = "菜单";
     if (row_index == 0) {
@@ -65,18 +71,17 @@ esp_err_t DrawSettingsRow(size_t row_index, int y, const std::string& title, con
     } else if (row_index == 7) {
         tag = "重置";  // factory reset
     }
-    DrawRoundedRect(kX + 298, y + 8, 54, 20, kChipRadius);
-    ESP_RETURN_ON_ERROR(DrawCenteredText(kX + 298, y + 10, 54, tag), kTag, "draw settings tag");
+    DrawChip(kContentX + kContentWidth - 6 - 54, y + 8, 54, 20, tag);
     return ESP_OK;
 }
 
 esp_err_t DrawSettingsDialogBox(const std::string& title)
 {
     FillRect(68, 48, 264, 206, false);
-    // Dialog container: rounded double outline (the product's rounded dialog
-    // language, same r6 as cards/containers).
+    // [v2] Dialog container: single rounded outline. The double-outline was the
+    // 双线二义 source (双线 both decorated dialogs AND signalled selection);
+    // double border is now reserved for selection only, dialogs use one line.
     DrawRoundedRect(68, 48, 264, 206, kRoundedOuterRadius);
-    DrawRoundedRect(70, 50, 260, 202, kRoundedOuterRadius);
     DrawHorizontalLine(86, 80, 228);
     DrawHorizontalLine(86, 220, 228);
     ESP_RETURN_ON_ERROR(DrawCenteredText(86, 60, 228, title), kTag, "draw settings dialog title");
@@ -86,26 +91,16 @@ esp_err_t DrawSettingsDialogBox(const std::string& title)
 esp_err_t DrawSettingsOptionCard(int x, int y, int width, const std::string& label, bool selected)
 {
     constexpr int kHeight = 32;
-    // Focus: kRoundedInnerBorder (rounded chip-like card, low flicker) when
-    // selected, plain rounded outline otherwise. These are the small 96x32
-    // dialog option chips, so they follow the chip/card rounded language.
+    // [v2] Focus: rounded reverse-fill (kInvert) when selected -- these dialog
+    // options execute-on-confirm (上下选择 确认保存), which is the will-execute
+    // action language, not the persistent-browse double border. Unselected is a
+    // plain rounded chip outline.
     if (selected) {
-        DrawSelectionDecoration(x, y, width, kHeight, SelectionStyle::kRoundedInnerBorder);
+        DrawSelectionDecoration(x, y, width, kHeight, SelectionStyle::kInvert);
     } else {
         DrawRoundedRect(x, y, width, kHeight, kChipRadius);
     }
-    return DrawCenteredText(x, y + 9, width, label);
-}
-
-void DrawSettingsProgressBar(int x, int y, int width, int current, int total)
-{
-    constexpr int kHeight = 9;
-    DrawRect(x, y, width, kHeight);
-    if (total <= 0 || current <= 0) {
-        return;
-    }
-    const int filled = std::clamp((width - 2) * current / total, 0, width - 2);
-    FillRect(x + 1, y + 1, filled, kHeight - 2, true);
+    return DrawCenteredText(x, y + 9, width, label, !selected);
 }
 
 esp_err_t RenderSettingsDialog(const wqn::SettingsAppState& settings)
@@ -142,7 +137,7 @@ esp_err_t RenderSettingsDialog(const wqn::SettingsAppState& settings)
         case wqn::SettingsDialog::kStorage: {
             ESP_RETURN_ON_ERROR(DrawSettingsDialogBox("存储详情"), kTag, "draw storage dialog");
             ESP_RETURN_ON_ERROR(DrawClippedText(88, 94, 224, "Flash: " + BytesLabel(diag.flash_size)), kTag, "draw flash size");
-            DrawRect(88, 114, 224, 9);
+            DrawProgressBar(88, 114, 224, 9, 0, 1);  // flash usage bar (empty track; size shown as text)
             ESP_RETURN_ON_ERROR(
                 DrawClippedText(
                     88,
@@ -153,11 +148,11 @@ esp_err_t RenderSettingsDialog(const wqn::SettingsAppState& settings)
                 "draw nvs entries");
             const int nvs_used = static_cast<int>(diag.nvs_used_entries);
             const int nvs_total = static_cast<int>(std::max<size_t>(1, diag.nvs_total_entries));
-            DrawSettingsProgressBar(88, 152, 224, nvs_used, nvs_total);
+            DrawProgressBar(88, 152, 224, 9, nvs_used, nvs_total);
             ESP_RETURN_ON_ERROR(DrawClippedText(88, 168, 224, "PSRAM used: " + BytesLabel(diag.psram_used)), kTag, "draw psram used");
             const int psram_used_kb = static_cast<int>(diag.psram_used / 1024);
             const int psram_total_kb = static_cast<int>(std::max<size_t>(1, diag.psram_total / 1024));
-            DrawSettingsProgressBar(88, 188, 224, psram_used_kb, psram_total_kb);
+            DrawProgressBar(88, 188, 224, 9, psram_used_kb, psram_total_kb);
             ESP_RETURN_ON_ERROR(DrawClippedText(88, 202, 224, "PSRAM free: " + BytesLabel(diag.psram_free)), kTag, "draw psram free");
             break;
         }
@@ -198,7 +193,8 @@ esp_err_t RenderSettingsDialog(const wqn::SettingsAppState& settings)
                 const bool selected = index == settings.word_deck_selected;
                 const int y = 92 + static_cast<int>(i) * kRowH;
                 if (selected) {
-                    DrawSelectedFill(84, y, 232, kRowH - 4);
+                    // [v2] density word-deck list row selection: rounded reverse-fill.
+                    DrawSelectionDecoration(84, y, 232, kRowH - 4, SelectionStyle::kRowFill);
                 }
                 const std::string& label = options[index].deck_id.empty()
                     ? std::string("全部词库")
@@ -302,7 +298,7 @@ esp_err_t RenderSettingsToEpd(const wqn::UiFrame& frame, RefreshSchedule schedul
         y += 38;
     }
     ESP_RETURN_ON_ERROR(
-        DrawClippedText(14, 274, 372, settings.notice.empty() ? "上下选择，确认操作，长按确认返回首页" : settings.notice),
+        DrawClippedText(kMarginDense, 274, wqn::kEpdWidth - 2 * kMarginDense, settings.notice.empty() ? "上下选择，确认操作，长按确认返回首页" : settings.notice),
         kTag,
         "draw settings help");
 

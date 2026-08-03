@@ -29,7 +29,10 @@ namespace device_ui_internal {
 constexpr char kTag[] = "wqn_ui";
 
 constexpr int kAiStatusBarY = 0;
-constexpr int kAiStatusBarH = 27;
+// [v2] Status bar height aligned to the global kStatusBarHeight(28) so the
+// bottom divider lands on the shared kStatusBarDividerY(27) like every other
+// page (was 27, putting the line at 26 -- the 1px outlier).
+constexpr int kAiStatusBarH = 28;
 // [v2.1] No more dedicated toast region. The status-bar bottom rule still
 // draws, but the viewport starts immediately after it, recovering 24 px of
 // vertical space we previously lost to the redundant toast strip.
@@ -221,7 +224,10 @@ int DrawUserPill(int x, int y, int max_w, const std::string& text)
     const int visible_bottom = std::min(wqn::kEpdHeight, y + total_h);
 
     if (visible_top < visible_bottom) {
-        DrawRect(x, visible_top, max_w, visible_bottom - visible_top);
+        // [v2] User pill uses the rounded container language (r4) like every
+        // other container; the square DrawRect outline was the last square
+        // container in the product. Inner paper fill keeps the text legible.
+        DrawRoundedRect(x, visible_top, max_w, visible_bottom - visible_top, 4);
         FillRect(x + 1, visible_top + 1, max_w - 2, visible_bottom - visible_top - 2, false);
     }
     for (int r = 0; r < row_count; ++r) {
@@ -233,21 +239,48 @@ int DrawUserPill(int x, int y, int max_w, const std::string& text)
     return total_h;
 }
 
+// [md-rows] Assistant markdown row-count cache for the measure pass. Old
+// messages never change, so after the first frame the layout loop costs O(1)
+// per message; the streaming reply invalidates via its growing byte length.
+// Bounded memory (two words per message); reset when the history shrinks (new
+// session) so stale indices cannot alias. A same-index same-length different
+// text would briefly reuse a stale count -- it self-heals on the next size
+// change and can only happen across a session swap that kept message count.
+int CachedAssistantMdRows(size_t msg_idx, const std::string& text, size_t total_msgs)
+{
+    struct Entry {
+        size_t text_size = SIZE_MAX;
+        int rows = 1;
+    };
+    static std::vector<Entry> s_rows;
+    if (s_rows.size() > total_msgs) {
+        s_rows.clear();
+    }
+    if (msg_idx >= s_rows.size()) {
+        s_rows.resize(msg_idx + 1);
+    }
+    Entry& entry = s_rows[msg_idx];
+    if (entry.text_size != text.size()) {
+        entry.rows = std::max<int>(
+            1,
+            static_cast<int>(CountMarkdownLines(
+                text, kAiAssistantW - kAiAssistantLeftBorder - 6)));
+        entry.text_size = text.size();
+    }
+    return entry.rows;
+}
+
 int DrawAssistantBlock(int x, int y, int max_w, const std::string& text)
 {
-    // [wrap-fix] The previous 8-row hard cap was inherited from the
-    // pre-scroll single-bubble UI. With multi-turn scrolling the user can
-    // pan to read the rest, so the cap is now well above the viewport
-    // height (~273 px / 18 px ≈ 15 rows). 32 keeps the block bounded for
-    // pathological inputs without truncating readable replies.
-    // [trunc-fix] Must match kAssistantLayoutRowCap in RenderAiHistoryViewport
-    // (line ~329). Previously this was 32 while the layout pass used 64, so the
-    // layout measured a block as 64 rows tall but only 32 rows were actually
-    // drawn — the remaining text was silently dropped and subsequent messages
-    // were positioned based on a height that didn't match what was rendered.
-    constexpr size_t kAssistantRowCap = 1024;  // [expand] was 64; raised to effectively remove the reply display cap (full reply, scrollable)
-    const auto lines = WrapForViewport(text, max_w - kAiAssistantLeftBorder - 6, kAssistantRowCap);
-    const int row_count = static_cast<int>(lines.size());
+    // [markdown] Assistant replies render through the shared Markdown row
+    // pipeline (headings, lists, tables, inline adornments -- same engine as
+    // the note body). Only viewport-intersecting blocks reach this function,
+    // so the per-call layout stays bounded; the measure pass counts rows via
+    // CachedAssistantMdRows at the SAME width, keeping this block's height
+    // equal to its virtual-canvas slot.
+    const int content_w = max_w - kAiAssistantLeftBorder - 6;
+    const std::vector<MdLine> md_lines = LayoutMarkdown(text, content_w);
+    const int row_count = std::max(1, static_cast<int>(md_lines.size()));
     const int row_h = kAiLineH;
     const int total_h = row_count * row_h + 6;
 
@@ -257,10 +290,11 @@ int DrawAssistantBlock(int x, int y, int max_w, const std::string& text)
     if (visible_top < visible_bottom) {
         FillRect(x, visible_top, kAiAssistantLeftBorder, visible_bottom - visible_top, true);
     }
-    for (int r = 0; r < row_count; ++r) {
-        const int line_y = y + r * row_h + 4;
+    const int text_x = x + kAiAssistantLeftBorder + 6;
+    for (size_t r = 0; r < md_lines.size(); ++r) {
+        const int line_y = y + static_cast<int>(r) * row_h + 4;
         if (line_y >= kAiViewportY && line_y + row_h <= wqn::kEpdHeight) {
-            DRC(x + kAiAssistantLeftBorder + 6, line_y, lines[r].c_str(), true);
+            DrawMarkdownLine(md_lines[r], text_x, line_y, content_w, row_h);
         }
     }
     const int rule_y = y + total_h - 2;
@@ -451,12 +485,12 @@ void RenderAiHistoryViewport(const wqn::AiSessionState& ai,
             h = static_cast<int>(lines.size()) * line_h + 4;
             rows_consumed = static_cast<int>(lines.size());
         } else if (msg.kind == wqn::ChatMessageKind::kAssistant) {
-            // Layout pass — keep the row cap generous so a long reply still
-            // measures its true height before we hit the viewport clip.
-            constexpr size_t kAssistantLayoutRowCap = 1024;  // [expand] must match kAssistantRowCap (was 64)
-            const auto lines = WrapForViewport(body, kAiAssistantW - kAiAssistantLeftBorder - 6, kAssistantLayoutRowCap);
-            h = static_cast<int>(lines.size()) * line_h + 6;
-            rows_consumed = static_cast<int>(lines.size());
+            // Layout pass -- markdown row count, cached per message so only
+            // the streaming reply is re-laid out while it grows. MUST use the
+            // same width as DrawAssistantBlock or block heights drift.
+            const int rows = CachedAssistantMdRows(msg_idx, body, n);
+            h = rows * line_h + 6;
+            rows_consumed = rows;
         } else if (msg.kind == wqn::ChatMessageKind::kThinking) {
             const auto lines = BuildThinkingLines(body, kAiAssistantW, ai.expand_content);
             h = static_cast<int>(lines.size()) * line_h + 6;
