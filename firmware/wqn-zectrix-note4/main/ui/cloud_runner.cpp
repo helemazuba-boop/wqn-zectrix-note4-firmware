@@ -120,18 +120,70 @@ void CloudLaneTask(void* arg)
 
 }  // namespace
 
-QueueHandle_t g_cloud_result_queue = nullptr;
+namespace {
+// [input-capture] UI task handle for prompt result/sync consumption. Cloud
+// results and sync events used to only sit in a queue until the UI's next
+// idle poll (up to 500 ms); notifying wakes it within one scheduler hop.
+TaskHandle_t g_ui_task_to_notify = nullptr;
+}  // namespace
+
+void SetUiTaskToNotify(TaskHandle_t ui_task)
+{
+    g_ui_task_to_notify = ui_task;
+}
+
+void NotifyUiTask()
+{
+    if (g_ui_task_to_notify != nullptr) {
+        xTaskNotifyGive(g_ui_task_to_notify);
+    }
+}
+
+namespace {
+// [ack-mailbox] Per-domain terminal-result mailbox. The producer writes the
+// domain's result slot then publishes pending_generation here; the UI scans
+// every domain, applies the matching slot, and writes acked_generation.
+// Only after the ACK does the domain clear busy (Finish*) and reuse its slot,
+// so a terminal result can never be silently lost the way the old
+// xQueueSend-then-Finish-on-failure branch could when the depth-4 queue was
+// full. generation is monotonic per domain (0 = none); pending!=acked means
+// "unapplied result waiting".
+struct DomainResultMailbox {
+    std::atomic<uint32_t> pending_generation{0};
+    std::atomic<uint32_t> acked_generation{0};
+};
+DomainResultMailbox g_result_mailbox[4];
+}  // namespace
+
+void PublishCloudResult(CloudDomain domain, uint32_t generation)
+{
+    g_result_mailbox[static_cast<size_t>(domain)].pending_generation.store(
+        generation, std::memory_order_release);
+    NotifyUiTask();
+}
+
+bool TakeCloudResultToApply(CloudDomain domain, uint32_t* generation)
+{
+    DomainResultMailbox& box = g_result_mailbox[static_cast<size_t>(domain)];
+    const uint32_t pending = box.pending_generation.load(std::memory_order_acquire);
+    if (pending == 0 ||
+        pending == box.acked_generation.load(std::memory_order_relaxed)) {
+        return false;
+    }
+    if (generation != nullptr) {
+        *generation = pending;
+    }
+    return true;
+}
+
+void AckCloudResult(CloudDomain domain, uint32_t generation)
+{
+    g_result_mailbox[static_cast<size_t>(domain)].acked_generation.store(
+        generation, std::memory_order_release);
+}
 
 esp_err_t StartCloudRunner()
 {
-    if (g_cloud_result_queue == nullptr) {
-        // One slot per domain: the per-domain busy CAS guarantees at most one
-        // outstanding result each.
-        g_cloud_result_queue = xQueueCreate(4, sizeof(CloudResultReady));
-        if (g_cloud_result_queue == nullptr) {
-            return ESP_ERR_NO_MEM;
-        }
-    }
     static constexpr const char* kLaneNames[2] = {"wqn_cloud_int", "wqn_cloud_blk"};
     for (int lane = 0; lane < 2; ++lane) {
         if (g_lane_queue[lane] == nullptr) {

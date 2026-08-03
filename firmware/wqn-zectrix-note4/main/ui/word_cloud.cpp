@@ -3,6 +3,8 @@
 
 #include "ui_internal.h"
 #include "ui_runtime.h"
+#include "persist_worker.h"
+#include "word_app.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -31,6 +33,55 @@ void FinishWordCloudRequest()
     g_word_sleep_lease.Reset();
     ClearCloudDomainBusyWatch(CloudDomain::kWord);
     g_word_cloud_busy.store(false, std::memory_order_release);
+}
+
+RefreshSchedule PumpWordObservationCommit(UiRuntime* runtime)
+{
+    if (runtime == nullptr) {
+        return RefreshSchedule::kNone;
+    }
+    // One word commit in flight at a time; wait for the UI to ack the last one
+    // (the card stays in kPersisting until then, so no second effect is armed).
+    if (IsPersistKindBusy(PersistKind::kWordObservation)) {
+        return RefreshSchedule::kNone;
+    }
+    // Cheap readiness pre-check: reservation takes a SleepLease + pool slot, so
+    // an idle pump must not reserve just to cancel. Reserve happens BEFORE the
+    // effect is pulled from UI state (that mutates it), so we must first know
+    // there is something to commit.
+    if (!runtime->state().word_app.session.observation_effect_ready) {
+        return RefreshSchedule::kNone;
+    }
+    // Phase 1: reserve busy + slot + storage lease. On failure the UI state is
+    // untouched (effect still armed) -- just retry next pump.
+    PersistTicket ticket = TryReservePersist(PersistKind::kWordObservation);
+    if (!ticket.valid()) {
+        return RefreshSchedule::kNone;
+    }
+    const auto metadata = wqn::services::MakeDeviceRequestMetadata();
+    std::string occurred_at = CurrentIsoTimestamp();
+    if (occurred_at.empty()) {
+        // Durable even before SNTP; the server clamps implausible times.
+        occurred_at = "2024-01-01T00:00:00Z";
+    }
+    wqn::DurableWordObservation observation;
+    wqn::PersistedWordSession advanced_session;
+    // Phase 2: only now pull the effect from UI state, binding this dispatch's
+    // operation_id so a late result after a scope reset is rejected.
+    if (!runtime->TakeWordObservationEffect(
+            metadata.request_id, occurred_at, ticket.operation_id,
+            &observation, &advanced_session)) {
+        // Take mutated state to kFailed ("会话游标无效") and cleared the effect;
+        // release the reservation and route the failure through a typed event
+        // so the revision advances (this runs after the display commit, so the
+        // caller folds the returned refresh into the next iteration's pending
+        // schedule instead of leaving a stuck "正在保存").
+        CancelPersistReservation(ticket);
+        return runtime->DispatchWordObservationTakeFailed().refresh;
+    }
+    EnqueueReservedWordObservation(
+        ticket, std::move(observation), std::move(advanced_session));
+    return RefreshSchedule::kNone;
 }
 
 bool IsWordCloudBusy()
@@ -78,6 +129,10 @@ bool QueueWordSessionStart(
     }
     WordCloudRequest request;
     request.op = WordCloudOp::kStartSession;
+    // [deck-scope] Epoch at queue time: a deck switch completing while this
+    // request is in flight must invalidate both the runner-side session save
+    // and the apply of the result.
+    request.scope_generation = wqn::GetDeckScopeGeneration();
     std::snprintf(
         request.request_id,
         sizeof(request.request_id),
@@ -99,6 +154,7 @@ bool QueueWordCandidatePage(
     }
     WordCloudRequest request;
     request.op = WordCloudOp::kFetchSessionPage;
+    request.scope_generation = wqn::GetDeckScopeGeneration();
     std::snprintf(
         request.request_id,
         sizeof(request.request_id),
@@ -169,10 +225,8 @@ void SendWordCloudResult()
     CloudResultReady ready;
     ready.domain = CloudDomain::kWord;
     ready.generation = g_word_result_generation;
-    if (g_cloud_result_queue == nullptr ||
-        xQueueSend(g_cloud_result_queue, &ready, pdMS_TO_TICKS(100)) != pdTRUE) {
-        FinishWordCloudRequest();
-    }
+    PublishCloudResult(CloudDomain::kWord, g_word_result_generation);
+    (void)ready;
 }
 
 bool IsWordSessionInvalidError(const wqn::protocol::v3::Error& error)
@@ -250,6 +304,19 @@ bool ApplyWordCloudResult(wqn::UiState* state, WordCloudResult& result)
     }
 
     if (result.op == WordCloudOp::kStartSession) {
+        // [deck-scope] A default-deck switch committed while this request was
+        // in flight: the runner-side save was already rejected by the store;
+        // drop the result too so a stale session never installs over the
+        // fresh scope. The user re-enters the word page to start a new round.
+        if (result.scope_generation != wqn::GetDeckScopeGeneration()) {
+            ESP_LOGW(kTag, "word session start dropped: scope epoch %lu != %lu",
+                     static_cast<unsigned long>(result.scope_generation),
+                     static_cast<unsigned long>(wqn::GetDeckScopeGeneration()));
+            wqn::CancelWordSessionStartResult(&state->word_app);
+            state->word_app.mode = wqn::WordAppMode::kHome;
+            state->word_app.message = "词库已切换，请重新进入";
+            return state->screen == wqn::UiScreen::kWord;
+        }
         if (state->screen != wqn::UiScreen::kWord) {
             wqn::CancelWordSessionStartResult(&state->word_app);
             state->word_app.mode = wqn::WordAppMode::kHome;
@@ -267,6 +334,17 @@ bool ApplyWordCloudResult(wqn::UiState* state, WordCloudResult& result)
         return true;
     }
     if (result.op == WordCloudOp::kFetchSessionPage) {
+        // [deck-scope] Same stale-epoch drop as kStartSession: route it through
+        // the existing failure path so page_in_flight resets without touching
+        // the (already reset) session.
+        if (result.scope_generation != wqn::GetDeckScopeGeneration()) {
+            ESP_LOGW(kTag, "word candidate page dropped: scope epoch %lu != %lu",
+                     static_cast<unsigned long>(result.scope_generation),
+                     static_cast<unsigned long>(wqn::GetDeckScopeGeneration()));
+            wqn::ApplyWordCandidatePageResult(
+                &state->word_app, ESP_ERR_INVALID_STATE, {});
+            return false;
+        }
         if (result.result != ESP_OK && IsWordSessionInvalidError(result.protocol_error)) {
             wqn::ResetWordSessionForServerInvalid(&state->word_app);
         } else {
@@ -323,6 +401,7 @@ void ExecuteWordCloudRequest(const WordCloudRequest& request)
     WordCloudResult& result = g_word_result_slot;
     result.op = request.op;
     result.query = request.query;
+    result.scope_generation = request.scope_generation;
     result.message.clear();
 
     std::string token;
@@ -467,6 +546,10 @@ void ExecuteWordCloudRequest(const WordCloudRequest& request)
             result.persisted_session.paused = false;
             result.persisted_session.position = 0;
             result.persisted_session.phase = wqn::WordPresentationPhase::kFront;
+            // [deck-scope] Pin the session to the epoch it was REQUESTED under;
+            // the store rejects the save below if a deck switch landed since.
+            result.persisted_session.deck_scope_generation =
+                request.scope_generation;
             result.session_compact_result = wqn::CompactWordSessionData(
                 result.session, &result.persisted_session.remote);
             if (result.session_compact_result == ESP_OK &&

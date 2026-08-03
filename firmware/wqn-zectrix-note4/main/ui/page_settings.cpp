@@ -322,18 +322,32 @@ void OpenSettingsDialog(wqn::UiState* state, wqn::SettingsDialog dialog)
     UpdateSettingsDiagnostics(state);
     state->settings.dialog = dialog;
     if (dialog == wqn::SettingsDialog::kAutoSync) {
-        state->settings.auto_sync_selected = AutoSyncOptionIndex(state->settings.auto_sync_interval_min);
+        // [persist-worker] Preselect an armed-but-unsaved value (submit rejected
+        // or write failed) over the durable one so a re-Confirm retries the
+        // intended interval; 0 is valid, hence the *_pending_valid flag.
+        const uint32_t seed = state->settings.auto_sync_pending_valid
+            ? state->settings.pending_auto_sync_minutes
+            : state->settings.auto_sync_interval_min;
+        state->settings.auto_sync_selected = AutoSyncOptionIndex(seed);
     } else if (dialog == wqn::SettingsDialog::kVolume) {
-        state->settings.volume_selected = VolumeOptionIndex(state->settings.volume_percent);
+        const int seed = state->settings.volume_pending_valid
+            ? state->settings.pending_volume_percent
+            : state->settings.volume_percent;
+        state->settings.volume_selected = VolumeOptionIndex(seed);
     } else if (dialog == wqn::SettingsDialog::kDefaultWordDeck) {
         // Option 0 is the fixed 全部词库; the rest mirror the mounted deck
-        // catalog. Preselect the current default when it is still mounted.
+        // catalog. Preselect an armed-but-unsaved switch (submit rejected or
+        // transaction failed) over the installed default so a re-Confirm
+        // retries the intended deck.
         auto& settings = state->settings;
+        const std::string& preselect_id = settings.word_deck_pending_valid
+            ? settings.pending_word_deck_id
+            : state->word_app.default_deck_id;
         settings.word_deck_options.clear();
         settings.word_deck_options.push_back(wqn::WordDeckInfo{});
         settings.word_deck_selected = 0;
         for (const wqn::WordDeckInfo& deck : state->word_app.deck_catalog) {
-            if (deck.deck_id == state->word_app.default_deck_id) {
+            if (deck.deck_id == preselect_id) {
                 settings.word_deck_selected = settings.word_deck_options.size();
             }
             settings.word_deck_options.push_back(deck);

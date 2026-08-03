@@ -16,6 +16,17 @@ constexpr char kTag[] = "wqn_ui";
 
 esp_err_t RenderFrameToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
 {
+    // [epd-owner] Hold the whole-frame lock across the entire clear->draw->
+    // refresh sequence below. The individual RefreshEpdFull/RefreshFrame calls
+    // only serialize their own transmit; without this outer transaction, idle
+    // cleanup or another render could interleave between our draws and the
+    // refresh on the shared framebuffer. The recursive mutex lets the inner
+    // refresh re-enter on this task; the RAII destructor releases on every
+    // early return below.
+    wqn::EpdFrameTransaction frame_txn;
+    ESP_RETURN_ON_FALSE(
+        frame_txn.locked(), ESP_ERR_NO_MEM, kTag,
+        "take EPD frame transaction");
     ESP_LOGI(kTag, "RenderFrameToEpd: enter schedule=%s screen=%d", RefreshScheduleName(schedule), static_cast<int>(frame.screen));
     const UBaseType_t hwm_before_render = uxTaskGetStackHighWaterMark(nullptr);
     ESP_LOGI(kTag, "RenderFrameToEpd: stack HWM before render: %u bytes free", static_cast<unsigned>(hwm_before_render * sizeof(StackType_t)));

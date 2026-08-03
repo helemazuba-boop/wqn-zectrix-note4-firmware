@@ -15,12 +15,12 @@
 #include "display_service.h"
 #include "esp_attr.h"
 #include "esp_log.h"
-#include "esp_task_wdt.h"
 #include "esp_timer.h"
 #include "flash_session.h"
 #include "power_manager.h"
 #include "runtime/wake_context.h"
 #include "services/sync_service.h"
+#include "ui/persist_worker.h"
 #include "ui/ui_internal.h"
 #include "ui/ui_runtime.h"
 #include "ui_model.h"
@@ -43,6 +43,36 @@ RTC_DATA_ATTR char g_rtc_last_rendered_clock[8] = {};
 } // namespace device_ui_internal
 
 namespace {
+
+// [input-capture] Reject button events whose production time is too old to act
+// on safely after the UI task was blocked and the ring replayed a backlog.
+// Navigation events (nav/short/double) replay fine -- the user still wants
+// them. But a completed PTT gesture (a Confirm hold: kHoldPress .. kRelease)
+// must NOT fire audio side effects seconds after the user let go, so a stale
+// Confirm press/hold/release is dropped wholesale. kLongPress repeats are
+// already coalesced in the ring; a straggler older than the repeat cadence is
+// also dropped so menus do not lurch on unblock.
+bool ShouldDropStaleButtonEvent(const wqn::ButtonEvent& event, int64_t now_ms)
+{
+    const int64_t age_ms = now_ms - event.occurred_at_ms;
+    if (age_ms <= 0) {
+        return false;
+    }
+    // Confirm is the PTT key; its raw press/hold/release drive audio capture.
+    // Drop the whole gesture if it aged past the capture-relevant window.
+    if (event.button == wqn::ButtonId::kConfirm &&
+        (event.type == wqn::ButtonEventType::kPress ||
+         event.type == wqn::ButtonEventType::kHoldPress ||
+         event.type == wqn::ButtonEventType::kRelease)) {
+        constexpr int64_t kStalePttMs = 2000;
+        return age_ms > kStalePttMs;
+    }
+    if (event.type == wqn::ButtonEventType::kLongPress && event.repeat) {
+        constexpr int64_t kStaleRepeatMs = 500;
+        return age_ms > kStaleRepeatMs;
+    }
+    return false;
+}
 
 // [timer-skip] Compute the screen-id that should participate in the
 // timer-wakeup skip decision. Configurable / editing screens must never be
@@ -202,6 +232,10 @@ void UiSyncEventSink(const wqn::services::SyncEvent& event)
         xQueueSend(g_sync_event_queue, &event, 0) != pdTRUE) {
         ESP_LOGW(kTag, "drop sync event: sequence=%lu",
                  static_cast<unsigned long>(event.sequence));
+    } else {
+        // [input-capture] Wake the UI so a sync completion is applied promptly
+        // instead of waiting for the next idle poll.
+        device_ui_internal::NotifyUiTask();
     }
 }
 
@@ -384,6 +418,16 @@ void DeviceUiTask(void*)
         vTaskDelete(nullptr);
         return;
     }
+    // [input-capture] Dedicated ISR-driven sampler; this task only consumes
+    // classified events from the ring and gets notified on arrival.
+    result = wqn::StartButtonInputTask(xTaskGetCurrentTaskHandle());
+    if (result != ESP_OK) {
+        ESP_LOGE(kTag, "button task start failed: %s", esp_err_to_name(result));
+        vTaskDelete(nullptr);
+        return;
+    }
+    // [input-capture] Cloud results and sync events wake this same task.
+    device_ui_internal::SetUiTaskToNotify(xTaskGetCurrentTaskHandle());
 
     result = wqn::InitEpdDisplay();
     if (result != ESP_OK) {
@@ -479,7 +523,27 @@ void DeviceUiTask(void*)
         bool problem_cloud_completed = false;
         if (g_sync_event_queue != nullptr) {
             wqn::services::SyncEvent sync_event;
-            while (xQueueReceive(g_sync_event_queue, &sync_event, 0) == pdTRUE) {
+            while (xQueuePeek(g_sync_event_queue, &sync_event, 0) == pdTRUE) {
+                // [persist-worker] A succeeded sync reads the three outboxes
+                // synchronously in DispatchSyncResult; while a word/note/problem
+                // commit is pending or any persist is in flight, that read would
+                // queue behind the observation transaction and re-freeze the UI.
+                // Leave the event queued (peek, do not receive) and consume it a
+                // later iteration once persistence is idle. Failed /
+                // AwaitingClaim touch no storage, so process them now. Peeking
+                // rather than receive-then-discard preserves the terminal event.
+                if (sync_event.status ==
+                        wqn::services::SyncEventStatus::kSucceeded &&
+                    (state.word_app.session.commit_state ==
+                         wqn::WordObservationCommitState::kPersisting ||
+                     state.note_app.session.commit_state ==
+                         wqn::NoteObservationCommitState::kPersisting ||
+                     state.problem_app.commit_state ==
+                         wqn::ProblemVerdictCommitState::kPersisting ||
+                     device_ui_internal::IsAnyPersistBusy())) {
+                    break;
+                }
+                xQueueReceive(g_sync_event_queue, &sync_event, 0);
                 const device_ui_internal::UiUpdate update =
                     ui_runtime.DispatchSyncResult(sync_event);
                 refresh_schedule =
@@ -506,9 +570,27 @@ void DeviceUiTask(void*)
                 }
             }
         }
-        const wqn::ButtonEvent event = wqn::PollButtonInput();
+        // [input-capture] Consume up to a small batch of ring events per loop
+        // iteration; each one runs the full dispatch path below. Stale-gesture
+        // filtering uses PRODUCTION time: after the UI was blocked for seconds
+        // the ring replays, and consumption time would corrupt every window.
+        bool button_consumed_this_iter = false;
+        for (int consumed = 0; consumed < 4; ++consumed) {
+        wqn::ButtonEvent event;
+        if (!wqn::ReceiveButtonEvent(&event)) {
+            break;
+        }
+        if (ShouldDropStaleButtonEvent(event, esp_timer_get_time() / 1000)) {
+            continue;
+        }
         if (event.HasEvent()) {
-            wqn::NoteUserActivity();
+            button_consumed_this_iter = true;
+            // [sleep-race] The activity generation/timestamp were already
+            // published at PRODUCTION (PushButtonEvent -> NoteUserActivityAtMs,
+            // before the event entered the ring); consuming must not publish
+            // again (double-bump + consume-time timestamp). Only the UI-task
+            // battery guard runs here.
+            wqn::CheckBatteryAfterUserActivity();
             wqn::NoteEpdActivity();
             if (state.screen == wqn::UiScreen::kWord ||
                 state.screen == wqn::UiScreen::kNote) {
@@ -517,7 +599,7 @@ void DeviceUiTask(void*)
                 wqn::services::NoteWordInteraction();
             }
             poll_delay = kUiPollDelayTicks;
-            g_last_active_us_local = esp_timer_get_time();
+            g_last_active_us_local = event.occurred_at_ms * 1000;
         }
         // Apply the button event regardless of EPD refresh state. The previous
         // "skip while refreshing" guard silently dropped press/release events
@@ -531,7 +613,7 @@ void DeviceUiTask(void*)
         if (event.HasEvent()) {
             const RefreshSchedule before_sched = refresh_schedule;
             const device_ui_internal::UiUpdate update =
-                ui_runtime.DispatchButton(event, esp_timer_get_time() / 1000);
+                ui_runtime.DispatchButton(event, event.occurred_at_ms);
             const RefreshSchedule after_sched =
                 StrongerSchedule(refresh_schedule, update.refresh);
             if (after_sched != before_sched && after_sched == RefreshSchedule::kAi) {
@@ -544,11 +626,64 @@ void DeviceUiTask(void*)
             }
             refresh_schedule = after_sched;
         }
+        }  // for (consumed) button-event drain
 
-        if (device_ui_internal::g_cloud_result_queue != nullptr) {
-            device_ui_internal::CloudResultReady ready;
-            while (xQueueReceive(
-                       device_ui_internal::g_cloud_result_queue, &ready, 0) == pdTRUE) {
+        // [ack-mailbox] Scan each domain's terminal-result mailbox. Applying
+        // then acking (below the switch) keeps busy held until the UI has
+        // consumed the result, so nothing is lost even if a new request is
+        // ready to fire the instant Finish* clears busy.
+        {
+            static const device_ui_internal::CloudDomain kResultDomains[4] = {
+                device_ui_internal::CloudDomain::kTodo,
+                device_ui_internal::CloudDomain::kWord,
+                device_ui_internal::CloudDomain::kNote,
+                device_ui_internal::CloudDomain::kProblem,
+            };
+            // [persist-worker] Unified pending gate: commit_state == kPersisting
+            // spans the whole answer (button Prepare -> worker Apply), so it
+            // also covers the Prepare->reserve gap where persist-busy is briefly
+            // false but the effect is still armed. Read fresh here, after the
+            // button drain that may have just armed a new answer.
+            const bool word_commit_pending =
+                state.word_app.session.commit_state ==
+                wqn::WordObservationCommitState::kPersisting ||
+                // [deck-scope] A default-deck switch in flight wipes and
+                // re-scopes the word sessions; hold Word cloud results until
+                // its ACK so a stale session/page result cannot apply against
+                // the mid-switch state (the store+epoch guards are the second
+                // and third lines of defense).
+                device_ui_internal::IsPersistKindBusy(
+                    device_ui_internal::PersistKind::kSettingsDefaultDeck);
+            // [persist-worker] Same guard for note (c3): ApplyNoteCandidatePage
+            // Result rebuilds+saves the session, so a note cloud result applied
+            // while a note observation commit is pending would roll back the
+            // worker's advanced cursor and re-block the UI on storage.
+            const bool note_commit_pending =
+                state.note_app.session.commit_state ==
+                wqn::NoteObservationCommitState::kPersisting;
+            for (device_ui_internal::CloudDomain result_domain : kResultDomains) {
+                // [persist-worker] Defer ALL Word/Note cloud results while that
+                // domain's observation is pending. Applying one now (candidate
+                // page / server-invalid both rebuild+save the session) would use
+                // the pre-advance snapshot, roll back the worker's cursor, and
+                // re-block the UI on the storage queue. Leave it pending + that
+                // domain busy (xxx_cloud_completed stays false, so no Finish);
+                // the persist result is applied+acked just below this scan, so
+                // next iteration this result merges onto the advanced session.
+                if (result_domain == device_ui_internal::CloudDomain::kWord &&
+                    word_commit_pending) {
+                    continue;
+                }
+                if (result_domain == device_ui_internal::CloudDomain::kNote &&
+                    note_commit_pending) {
+                    continue;
+                }
+                device_ui_internal::CloudResultReady ready;
+                ready.domain = result_domain;
+                if (!device_ui_internal::TakeCloudResultToApply(
+                        result_domain, &ready.generation)) {
+                    continue;
+                }
                 switch (ready.domain) {
                     case device_ui_internal::CloudDomain::kTodo: {
                         todo_cloud_completed = true;
@@ -613,6 +748,110 @@ void DeviceUiTask(void*)
                     default:
                         break;
                 }
+                device_ui_internal::AckCloudResult(result_domain, ready.generation);
+            }
+        }
+
+        // [persist-worker] Drain the word observation commit result (moved off
+        // the UI task in commit #2). Apply on the UI task, ack with
+        // generation+operation_id (only a matching ack frees the slot), and
+        // fold in the card-advance refresh the dispatch returns.
+        {
+            device_ui_internal::PersistResultReceipt word_persist;
+            if (device_ui_internal::TakePersistResultToApply(
+                    device_ui_internal::PersistKind::kWordObservation,
+                    &word_persist)) {
+                const device_ui_internal::UiUpdate persist_update =
+                    ui_runtime.DispatchWordObservationPersistResult(
+                        word_persist.result, word_persist.operation_id);
+                refresh_schedule =
+                    StrongerSchedule(refresh_schedule, persist_update.refresh);
+                device_ui_internal::AckPersistResult(
+                    device_ui_internal::PersistKind::kWordObservation,
+                    word_persist.generation, word_persist.operation_id);
+            }
+        }
+
+        // [persist-worker] Drain the note observation commit result (moved off
+        // the cloud lane in c3). Apply on the UI task and ack with
+        // generation+op_id; the dispatch returns kNone on success (invisible
+        // bookkeeping) and kSelection on failure so the error surfaces.
+        {
+            device_ui_internal::PersistResultReceipt note_persist;
+            if (device_ui_internal::TakePersistResultToApply(
+                    device_ui_internal::PersistKind::kNoteObservation,
+                    &note_persist)) {
+                const device_ui_internal::UiUpdate persist_update =
+                    ui_runtime.DispatchNoteObservationPersistResult(
+                        note_persist.result, note_persist.operation_id);
+                refresh_schedule =
+                    StrongerSchedule(refresh_schedule, persist_update.refresh);
+                device_ui_internal::AckPersistResult(
+                    device_ui_internal::PersistKind::kNoteObservation,
+                    note_persist.generation, note_persist.operation_id);
+            }
+        }
+
+        // [persist-worker] Drain the problem verdict commit result (moved off
+        // the cloud lane in c3). Unlike note, a successful verdict advances the
+        // problem view, so the dispatch returns a refresh on both success and
+        // failure when the problem page is on screen.
+        {
+            device_ui_internal::PersistResultReceipt problem_persist;
+            if (device_ui_internal::TakePersistResultToApply(
+                    device_ui_internal::PersistKind::kProblemVerdict,
+                    &problem_persist)) {
+                const device_ui_internal::UiUpdate persist_update =
+                    ui_runtime.DispatchProblemVerdictPersistResult(
+                        problem_persist.result, problem_persist.operation_id);
+                refresh_schedule =
+                    StrongerSchedule(refresh_schedule, persist_update.refresh);
+                device_ui_internal::AckPersistResult(
+                    device_ui_internal::PersistKind::kProblemVerdict,
+                    problem_persist.generation, problem_persist.operation_id);
+            }
+        }
+
+        // [persist-worker] Drain the async settings save results (c4). Success
+        // installs the value + "已保存" (auto-sync also kicks RequestSyncNow);
+        // failure keeps the displayed value and asks for a re-Confirm.
+        {
+            device_ui_internal::PersistResultReceipt settings_persist;
+            if (device_ui_internal::TakePersistResultToApply(
+                    device_ui_internal::PersistKind::kSettingsAutoSync,
+                    &settings_persist)) {
+                const device_ui_internal::UiUpdate persist_update =
+                    ui_runtime.DispatchAutoSyncSaveResult(
+                        settings_persist.result, settings_persist.operation_id);
+                refresh_schedule =
+                    StrongerSchedule(refresh_schedule, persist_update.refresh);
+                device_ui_internal::AckPersistResult(
+                    device_ui_internal::PersistKind::kSettingsAutoSync,
+                    settings_persist.generation, settings_persist.operation_id);
+            }
+            if (device_ui_internal::TakePersistResultToApply(
+                    device_ui_internal::PersistKind::kSettingsVolume,
+                    &settings_persist)) {
+                const device_ui_internal::UiUpdate persist_update =
+                    ui_runtime.DispatchVolumeSaveResult(
+                        settings_persist.result, settings_persist.operation_id);
+                refresh_schedule =
+                    StrongerSchedule(refresh_schedule, persist_update.refresh);
+                device_ui_internal::AckPersistResult(
+                    device_ui_internal::PersistKind::kSettingsVolume,
+                    settings_persist.generation, settings_persist.operation_id);
+            }
+            if (device_ui_internal::TakePersistResultToApply(
+                    device_ui_internal::PersistKind::kSettingsDefaultDeck,
+                    &settings_persist)) {
+                const device_ui_internal::UiUpdate persist_update =
+                    ui_runtime.DispatchDefaultDeckChangeResult(
+                        settings_persist.result, settings_persist.operation_id);
+                refresh_schedule =
+                    StrongerSchedule(refresh_schedule, persist_update.refresh);
+                device_ui_internal::AckPersistResult(
+                    device_ui_internal::PersistKind::kSettingsDefaultDeck,
+                    settings_persist.generation, settings_persist.operation_id);
             }
         }
 
@@ -705,11 +944,27 @@ wqn::AiStreamingStatusView streaming_view{};
             !device_ui_internal::IsWordCloudBusy() &&
             !device_ui_internal::IsNoteCloudBusy() &&
             !device_ui_internal::IsProblemCloudBusy();
+        // [persist-worker] The periodic reload reads storage on THIS task; a
+        // word/settings commit in the persist worker holds a foreground storage
+        // transaction, so a reload here would queue behind it and re-stall the
+        // UI. Skip while any persist is in flight, and also while a word, note
+        // or problem answer is Prepared-but-not-yet-applied (the wider
+        // kPersisting window, covering the Prepare->reserve gap: its session
+        // read/write -- reload even runs InitNoteApp() -- would otherwise race
+        // the pending commit).
+        const bool persist_quiet = !device_ui_internal::IsAnyPersistBusy() &&
+            state.word_app.session.commit_state !=
+                wqn::WordObservationCommitState::kPersisting &&
+            state.note_app.session.commit_state !=
+                wqn::NoteObservationCommitState::kPersisting &&
+            state.problem_app.commit_state !=
+                wqn::ProblemVerdictCommitState::kPersisting;
         // [hang-fix] Surface domains stuck busy past their lane budget; a
         // silent stuck domain looks identical to "cloud slow" from the UI.
         device_ui_internal::WarnStuckCloudDomains();
         if (status_reload_due && refresh_schedule == RefreshSchedule::kNone &&
-            !event.HasEvent() && interaction_quiet && cloud_quiet) {
+            !button_consumed_this_iter && interaction_quiet && cloud_quiet &&
+            persist_quiet) {
             if (state.screen != wqn::UiScreen::kWord) {
                 // Storage/Wi-Fi reads are an effect. Build the typed snapshot
                 // outside UiRuntime, then reduce that immutable observation
@@ -850,10 +1105,15 @@ wqn::AiStreamingStatusView streaming_view{};
             FinishProblemCloudRequest();
         }
         device_ui_internal::PumpWordCandidatePrefetch(&ui_runtime);
+        pending_refresh_schedule = device_ui_internal::StrongerSchedule(
+            pending_refresh_schedule,
+            device_ui_internal::PumpWordObservationCommit(&ui_runtime));
         device_ui_internal::PumpNoteCandidatePrefetch(&ui_runtime);
         device_ui_internal::PumpNoteImageFetch(&ui_runtime);
         device_ui_internal::PumpNoteBodyPackFetch(&ui_runtime);
-        device_ui_internal::PumpNoteObservationCommit(&ui_runtime);
+        pending_refresh_schedule = device_ui_internal::StrongerSchedule(
+            pending_refresh_schedule,
+            device_ui_internal::PumpNoteObservationCommit(&ui_runtime));
         // [transfer-progress] Poll the runner-side download mailbox; note_app
         // quantizes/throttles so this only schedules a repaint on a real
         // segment step of a download this page is actually waiting on.
@@ -871,7 +1131,9 @@ wqn::AiStreamingStatusView streaming_view{};
                 StrongerSchedule(refresh_schedule, transfer_update.refresh);
         }
         device_ui_internal::PumpProblemImageFetch(&ui_runtime);
-        device_ui_internal::PumpProblemVerdictCommit(&ui_runtime);
+        pending_refresh_schedule = device_ui_internal::StrongerSchedule(
+            pending_refresh_schedule,
+            device_ui_internal::PumpProblemVerdictCommit(&ui_runtime));
         if (word_pack_refresh_pending &&
             !device_ui_internal::IsWordCloudBusy() &&
             device_ui_internal::QueueWordReviewRefresh()) {
@@ -891,27 +1153,13 @@ wqn::AiStreamingStatusView streaming_view{};
             ESP_LOGI(kTag, "queued coalesced problem pack refresh after sync");
         }
 
-        // [hang-fix] The idle power-off path runs a full cleanup refresh and
-        // the panel power-down ON THIS TASK, i.e. the same SPI/BUSY code the
-        // EPD refresh task guards with a scoped TWDT subscription. HIL showed
-        // a silent hard hang inside this call (log ends at "EPD idle cleanup
-        // full refresh", buttons dead, no watchdog output): cover the window
-        // so a wedge panics with a backtrace after CONFIG_ESP_TASK_WDT_TIMEOUT_S
-        // instead of freezing the UI task forever. display_service feeds the
-        // TWDT from its BUSY-wait and row-write loops, so a healthy cleanup
-        // (~1-3 s) never trips it.
-#if CONFIG_ESP_TASK_WDT_EN
-        {
-            const bool idle_wdt_subscribed =
-                esp_task_wdt_add(xTaskGetCurrentTaskHandle()) == ESP_OK;
-            wqn::PowerOffEpdAfterIdleIfNeeded();
-            if (idle_wdt_subscribed) {
-                esp_task_wdt_delete(xTaskGetCurrentTaskHandle());
-            }
-        }
-#else
-        wqn::PowerOffEpdAfterIdleIfNeeded();
-#endif
+        // [epd-owner] Idle power-off / heavy-partial cleanup is the EPD refresh
+        // task's job now (it is the sole panel owner). The UI task only asks;
+        // the EPD task runs it from its idle wait after re-checking no frame is
+        // pending and no activity happened since. This removes the UI task's
+        // direct SPI/BUSY call and its scoped-TWDT workaround, and the ~1-3 s
+        // cleanup full refresh no longer blocks the UI task.
+        device_ui_internal::RequestEpdIdleMaintenance();
 
         // Automatic light sleep is owned by ESP-IDF tickless idle. SleepLease
         // maps active service work to ESP_PM_NO_LIGHT_SLEEP; GPIO17 sleep-mode
@@ -935,7 +1183,12 @@ wqn::AiStreamingStatusView streaming_view{};
             poll_delay = kUiIdlePollDelayTicks;
         }
 
-        vTaskDelay(poll_delay);
+        // [input-capture] Wait for the next button/cloud/sync notify or the
+        // poll deadline, whichever comes first. The button task, Send*Result
+        // and the sync-event sink all NotifyUiTask on arrival, so a queued
+        // event is consumed within one scheduler hop instead of up to the
+        // 500 ms idle poll period.
+        ulTaskNotifyTake(pdTRUE, poll_delay);
     }
 }
 
@@ -1005,6 +1258,14 @@ esp_err_t StartDeviceUiIfEnabled()
         return runner_result;
     }
 
+    // [persist-worker] Local-write worker (see ui/persist_worker.cpp): word,
+    // note and problem observation/verdict commits run on it (settings follow
+    // in c4).
+    const esp_err_t persist_result = device_ui_internal::StartPersistWorker();
+    if (persist_result != ESP_OK) {
+        return persist_result;
+    }
+
     // UI state loading verifies word-pack files with a 1 KiB local read buffer,
     // while page rendering has several deep C++ call chains. Keep explicit
     // headroom and monitor it through the HWM logs above.
@@ -1069,11 +1330,12 @@ esp_err_t ShowStorageRecoveryUi(esp_err_t storage_error)
         return result.error == ESP_OK ? ESP_FAIL : result.error;
     }
 
-    // Give the panel controller its configured cooling interval, then use the
-    // same display-owner idle path as the normal UI before entering the inert
-    // recovery loop in app_main.
+    // Give the panel controller its configured cooling interval, then ask the
+    // EPD task (still running) to power the rail down through the same idle
+    // maintenance command as the normal UI, before entering the inert recovery
+    // loop in app_main.
     vTaskDelay(pdMS_TO_TICKS(CONFIG_WQN_EPD_IDLE_POWER_OFF_MS + 100));
-    wqn::PowerOffEpdAfterIdleIfNeeded();
+    device_ui_internal::RequestEpdIdleMaintenance();
     return ESP_OK;
 #else
     ESP_LOGE(kTag, "storage recovery UI unavailable because EPD UI is disabled");

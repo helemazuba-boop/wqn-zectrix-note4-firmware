@@ -10,6 +10,22 @@ namespace wqn {
 
 void LogWakeupCause();
 void NoteUserActivity();
+// [sleep-race] Publishes user activity with an explicit event timestamp, called
+// by the button task BEFORE a critical (non-repeat) event enters the input
+// ring. Publish-then-enqueue is the safe order: the sleep commit gate only
+// observes g_activity_gate, so "event queued but generation stale" must be
+// impossible, while "generation bumped but event dropped by the full-ring
+// policy" merely over-cancels one sleep. An already-queued release/short-press
+// (whose GPIO is no longer held low and thus cannot re-arm EXT1 wake) can
+// therefore never be lost to sleep. Safe from the button task: it touches
+// only the activity gate + atomics, never I2C/battery hardware.
+void NoteUserActivityAtMs(int64_t occurred_at_ms);
+// [sleep-race] UI-task battery guard formerly bundled into NoteUserActivity.
+// Button-event consumption calls ONLY this (the activity generation was
+// already published at production by NoteUserActivityAtMs; re-publishing at
+// consume time would double-bump the generation and overwrite the event
+// timestamp with the consume time). Touches I2C -- UI/power task only.
+void CheckBatteryAfterUserActivity();
 bool IsUiIdleForSleep();
 bool IsUiIdleForSleepEx(int extra_idle_ms);
 

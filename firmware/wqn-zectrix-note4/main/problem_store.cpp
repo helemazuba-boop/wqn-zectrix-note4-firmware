@@ -284,14 +284,17 @@ esp_err_t SnapshotTransaction(void* opaque)
 }
 
 esp_err_t ExecuteWithStorageLease(
-    const char* label, esp_err_t (*transaction)(void*), void* context)
+    const char* label, esp_err_t (*transaction)(void*), void* context,
+    bool foreground = false)
 {
     wqn::runtime::SleepLease storage_lease = wqn::runtime::SleepLease::TryAcquire(
         wqn::runtime::SleepBlocker::kStorage, label, __FILE__, __LINE__);
     if (!storage_lease) {
         return ESP_ERR_INVALID_STATE;
     }
-    return wqn::services::ExecuteStorageTransaction(transaction, context);
+    return foreground
+        ? wqn::services::ExecuteForegroundStorageTransaction(transaction, context, label)
+        : wqn::services::ExecuteStorageTransaction(transaction, context);
 }
 
 }  // namespace
@@ -304,8 +307,11 @@ esp_err_t CommitProblemObservation(const DurableProblemObservation& observation)
         return ESP_ERR_INVALID_ARG;
     }
     CommitContext context{&observation};
+    // Foreground: bounds the QUEUE wait behind background pack writes for the
+    // persist worker; once the transaction has started it may still wait
+    // without a fixed deadline (storage_service degrades to portMAX_DELAY).
     return ExecuteWithStorageLease(
-        "problem-observation-commit", CommitTransaction, &context);
+        "problem-observation-commit", CommitTransaction, &context, true);
 }
 
 esp_err_t PeekPendingProblemObservation(DurableProblemObservation* observation)

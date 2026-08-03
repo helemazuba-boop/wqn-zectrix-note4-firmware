@@ -28,6 +28,7 @@ idf_component_register(
         "ui/battery.cpp"
         "ui/clock.cpp"
         "ui/cloud_runner.cpp"
+        "ui/persist_worker.cpp"
         "ui/diagnostics.cpp"
         "ui/graphics.cpp"
         "ui/markdown_layout.cpp"

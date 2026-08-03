@@ -3,6 +3,7 @@
 // Extracted from device_ui.cpp.
 
 #include "ui_internal.h"
+#include "persist_worker.h"
 
 #include <string>
 
@@ -51,14 +52,23 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
         }
         if (short_press && event.button == wqn::ButtonId::kConfirm) {
             const uint32_t minutes = kAutoSyncOptions[state->settings.auto_sync_selected];
-            const esp_err_t result = wqn::SaveAutoSyncIntervalMinutes(minutes);
-            if (result == ESP_OK) {
-                state->settings.auto_sync_interval_min = minutes;
-                state->settings.notice = "自动同步已保存：" + wqn::AutoSyncIntervalLabel(minutes);
-                wqn::services::RequestSyncNow();
+            // [persist-worker] Async save (c4): the NVS commit used to run
+            // synchronously here and could stall the UI behind a background
+            // write storm. Arm the value first so a rejected submit or a write
+            // failure keeps it for a re-Confirm; the displayed value and
+            // RequestSyncNow() wait for the durable ACK. The per-kind busy
+            // rejects a duplicate Confirm while one save is in flight.
+            state->settings.pending_auto_sync_minutes = minutes;
+            state->settings.auto_sync_pending_valid = true;
+            const uint32_t op_id = SubmitAutoSyncIntervalSave(minutes);
+            if (op_id != 0) {
+                state->settings.auto_sync_save_op_id = op_id;
+                state->settings.notice = "正在保存…";
             } else {
-                state->settings.notice = "自动同步保存失败";
-                ESP_LOGW(kTag, "save auto sync interval failed: %s", esp_err_to_name(result));
+                state->settings.auto_sync_save_op_id = 0;
+                state->settings.notice = IsPersistKindBusy(PersistKind::kSettingsAutoSync)
+                    ? "正在保存，请稍后"
+                    : "保存繁忙，请重试";
             }
             state->settings.dialog = wqn::SettingsDialog::kNone;
             return RefreshSchedule::kConfig;
@@ -83,13 +93,18 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
         }
         if (short_press && event.button == wqn::ButtonId::kConfirm) {
             const int percent = kVolumeOptions[state->settings.volume_selected];
-            const esp_err_t result = wqn::SaveVolumePercent(percent);
-            if (result == ESP_OK) {
-                state->settings.volume_percent = percent;
-                state->settings.notice = "音量已保存：" + wqn::VolumeLabel(percent);
+            // [persist-worker] Async save (c4), mirrors the auto-sync dialog.
+            state->settings.pending_volume_percent = percent;
+            state->settings.volume_pending_valid = true;
+            const uint32_t op_id = SubmitVolumeSave(percent);
+            if (op_id != 0) {
+                state->settings.volume_save_op_id = op_id;
+                state->settings.notice = "正在保存…";
             } else {
-                state->settings.notice = "音量保存失败";
-                ESP_LOGW(kTag, "save volume failed: %s", esp_err_to_name(result));
+                state->settings.volume_save_op_id = 0;
+                state->settings.notice = IsPersistKindBusy(PersistKind::kSettingsVolume)
+                    ? "正在保存，请稍后"
+                    : "保存繁忙，请重试";
             }
             state->settings.dialog = wqn::SettingsDialog::kNone;
             return RefreshSchedule::kConfig;
@@ -114,29 +129,38 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
             return RefreshSchedule::kConfig;
         }
         if (short_press && event.button == wqn::ButtonId::kConfirm) {
-            if (settings.word_deck_selected < settings.word_deck_options.size()) {
+            if (settings.word_deck_selected < settings.word_deck_options.size() &&
+                state->word_app.session.commit_state ==
+                    wqn::WordObservationCommitState::kPersisting) {
+                // A word answer is still pending (kPersisting spans Prepare ->
+                // worker Apply, so it also covers the Prepare->reserve gap where
+                // persist-busy is briefly false but the effect is still armed):
+                // the deck switch clears both session files inside its worker
+                // transaction and must not race the in-flight commit's session
+                // save. Defer; user retries.
+                settings.notice = "正在保存，请稍后切换";
+            } else if (settings.word_deck_selected < settings.word_deck_options.size()) {
                 const wqn::WordDeckInfo& option =
                     settings.word_deck_options[settings.word_deck_selected];
-                const esp_err_t result = wqn::SaveDefaultWordDeckId(option.deck_id);
-                if (result == ESP_OK) {
-                    ESP_LOGI(kTag, "wordbook change committed: id=%s",
-                             option.deck_id.empty() ? "all" : option.deck_id.c_str());
-                    wqn::SetDefaultWordDeck(&state->word_app, option.deck_id, option.title);
-                    settings.default_word_deck_title =
-                        state->word_app.default_deck_title;
-                    // The old study session is pinned to the previous scope;
-                    // drop it so the next study entry rebuilds a session for
-                    // the new deck instead of resuming the old cards.
-                    wqn::ResetWordSessionsForScopeChange(&state->word_app, true);
-                    // The default deck leaves (or rejoins) the note screen's
-                    // mixed [词] rows immediately.
-                    RebuildNoteWordDeckRows(state);
-                    settings.notice = option.deck_id.empty()
-                        ? "默认词库：全部词库"
-                        : "默认词库：" + option.title;
+                // [deck-scope] Async switch via the worker's recoverable marker
+                // protocol (c5). Arm the choice first (a rejected submit or a
+                // failed transaction keeps it for a re-Confirm); NOTHING is
+                // installed until the durable ACK -- the displayed deck, the
+                // in-memory session reset and the [词] rows all follow in
+                // DispatchDefaultDeckChangeResult.
+                settings.pending_word_deck_id = option.deck_id;
+                settings.pending_word_deck_title = option.title;
+                settings.word_deck_pending_valid = true;
+                const uint32_t op_id = SubmitDefaultDeckChange(option.deck_id);
+                if (op_id != 0) {
+                    settings.word_deck_save_op_id = op_id;
+                    settings.notice = "正在保存…";
                 } else {
-                    settings.notice = "默认词库保存失败";
-                    ESP_LOGW(kTag, "save default word deck failed: %s", esp_err_to_name(result));
+                    settings.word_deck_save_op_id = 0;
+                    settings.notice =
+                        IsPersistKindBusy(PersistKind::kSettingsDefaultDeck)
+                            ? "正在保存，请稍后"
+                            : "保存繁忙，请重试";
                 }
             }
             settings.dialog = wqn::SettingsDialog::kNone;
@@ -156,6 +180,13 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
 
     if (state->settings.dialog == wqn::SettingsDialog::kFactoryReset) {
         if (long_press && event.button == wqn::ButtonId::kConfirm) {
+            // [persist-worker] Defensive second line behind the main-page gate:
+            // a factory reset erases NVS and reboots -- never do it while a
+            // durable local write is still in flight on the persist worker.
+            if (device_ui_internal::IsAnyPersistBusy()) {
+                state->settings.notice = "正在保存，请稍后";
+                return RefreshSchedule::kConfig;
+            }
             state->settings.notice = "正在恢复出厂";
             ESP_LOGW(kTag, "factory reset requested from settings page");
             const esp_err_t reset_result = wqn::FactoryResetNvsAndRestart();
@@ -209,6 +240,27 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
     }
     if (event.button != wqn::ButtonId::kConfirm) {
         return RefreshSchedule::kNone;
+    }
+
+    // [persist-worker] Every main-page Confirm below either reads storage on the
+    // UI task (OpenSettingsDialog -> UpdateSettingsDiagnostics, the firmware-
+    // version row) or writes it synchronously (default word deck, factory
+    // reset). While any local write is in flight -- IsAnyPersistBusy(), or the
+    // wider commit_state==kPersisting window that also covers a domain's
+    // Prepare->reserve gap -- that work would contend with or queue behind the
+    // persist worker's transaction and re-stall the UI. Refuse the action with
+    // a notice; nothing is opened, read or written.
+    const bool persist_pending =
+        device_ui_internal::IsAnyPersistBusy() ||
+        state->word_app.session.commit_state ==
+            wqn::WordObservationCommitState::kPersisting ||
+        state->note_app.session.commit_state ==
+            wqn::NoteObservationCommitState::kPersisting ||
+        state->problem_app.commit_state ==
+            wqn::ProblemVerdictCommitState::kPersisting;
+    if (persist_pending) {
+        state->settings.notice = "正在保存，请稍后";
+        return RefreshSchedule::kConfig;
     }
 
     switch (state->settings.selected) {
@@ -781,37 +833,12 @@ RefreshSchedule ApplyButtonEvent(
                     : "本轮准备失败，请重试";
             }
         }
-        wqn::DurableWordObservation observation;
-        wqn::PersistedWordSession advanced_session;
-        const auto observation_metadata = wqn::services::MakeDeviceRequestMetadata();
-        std::string occurred_at = CurrentIsoTimestamp();
-        if (occurred_at.empty()) {
-            // The event must remain durable even before SNTP is available.
-            // The server clamps implausible/future times when projecting it.
-            occurred_at = "2024-01-01T00:00:00Z";
-        }
-        if (wqn::TakeWordObservationEffect(
-                &state->word_app,
-                observation_metadata.request_id,
-                occurred_at,
-                &observation,
-                &advanced_session)) {
-            const esp_err_t commit_result = wqn::CommitWordObservation(
-                observation, advanced_session);
-            wqn::ApplyWordObservationCommitResult(
-                &state->word_app, commit_result);
-            if (commit_result == ESP_OK) {
-                // The durable outbox is the interaction boundary. Upload it
-                // after a quiet period; a card action must never launch the
-                // full bootstrap/problem/content sync pipeline.
-                wqn::services::RequestWordOutboxUpload();
-            } else {
-                ESP_LOGW(
-                    kTag,
-                    "word observation local commit failed: %s",
-                    esp_err_to_name(commit_result));
-            }
-        }
+        // [persist-worker] The word observation commit (durable outbox append +
+        // session-cursor snapshot) no longer runs synchronously here -- it used
+        // to block the UI task on foreground storage. PumpWordObservationCommit
+        // now hands it to the persist worker; the card stays in kPersisting
+        // ("正在保存") until the worker's result is applied (advance card / retry)
+        // on the UI task via DispatchWordObservationPersistResult.
         wqn::WqnWordSearchRequest search_request;
         if (wqn::TakeWordSearchRequest(&state->word_app, &search_request)) {
             if (!QueueWordSearch(search_request)) {
@@ -861,7 +888,7 @@ RefreshSchedule ApplyButtonEvent(
         }
         // The note-open observation commit (outbox append + session snapshot,
         // a ~0.9s foreground storage transaction) no longer runs here on the
-        // UI task: PumpNoteObservationCommit hands it to the note cloud lane
+        // UI task: PumpNoteObservationCommit hands it to the persist worker
         // and the kPersisting gate covers the in-flight window.
         BuildHomeSummary(state);
         // A note mode transition (notebook<->title<->body<->image) or a list

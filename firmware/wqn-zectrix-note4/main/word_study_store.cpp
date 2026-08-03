@@ -14,6 +14,7 @@
 #include "esp_check.h"
 #include "esp_log.h"
 #include "esp_rom_crc.h"
+#include "storage.h"  // GetDeckScopeGeneration (deck-scope session validation)
 #include "esp_timer.h"
 #include "runtime/sleep_coordinator.h"
 #include "services/storage_service.h"
@@ -29,7 +30,12 @@ constexpr char kRejectedOutboxTempPath[] = "/storage/wrej.tmp";
 constexpr char kRejectedOutboxBackupPath[] = "/storage/wrej.bak";
 constexpr uint32_t kSessionMagic = UINT32_C(0x53535157);  // WQSS
 constexpr uint32_t kOutboxMagic = UINT32_C(0x424f5157);  // WQOB
-constexpr uint16_t kSessionSchemaVersion = 2;
+// v3 appends deck_scope_generation after next_sequence: sessions are pinned to
+// the default-deck scope they were built under, and a load whose stamp no
+// longer matches the committed scope generation reports NOT_FOUND. Bumping the
+// version discards v2 snapshots once at upgrade -- acceptable, they are only
+// browse cursors (the observation outbox is a separate, versioned store).
+constexpr uint16_t kSessionSchemaVersion = 3;
 constexpr uint16_t kOutboxSchemaVersion = 1;
 constexpr size_t kMaxSessionPayloadBytes = 96U * 1024U;
 constexpr size_t kMaxSessionCursorBytes = 256;
@@ -233,6 +239,11 @@ bool EncodeSession(
     AppendScalar<uint32_t>(payload, session.position);
     AppendScalar<uint32_t>(payload, static_cast<uint32_t>(session.remote.optional_count));
     AppendScalar<uint64_t>(payload, session.remote.next_sequence);
+    // [deck-scope] The session's OWN scope stamp (assigned when the session
+    // was created, inherited by every advanced copy). Deliberately NOT the
+    // current global generation: a stale runner-side save must fail the
+    // SaveSessionRaw validation below, not get re-stamped as current.
+    AppendScalar<uint32_t>(payload, session.deck_scope_generation);
     if (!AppendString(payload, session.remote.session_id, 36) ||
         !AppendString(payload, session.remote.seed, 64) ||
         !AppendString(payload, session.remote.cursor, kMaxSessionCursorBytes)) {
@@ -284,6 +295,7 @@ bool DecodeSession(
         !reader.Scalar(&include_mastered) || !reader.Scalar(&has_more) ||
         !reader.Scalar(&parsed.position) || !reader.Scalar(&optional_count) ||
         !reader.Scalar(&parsed.remote.next_sequence) ||
+        !reader.Scalar(&parsed.deck_scope_generation) ||
         !reader.String(&parsed.remote.session_id, 36) ||
         !reader.String(&parsed.remote.seed, 64) ||
         !reader.String(&parsed.remote.cursor, kMaxSessionCursorBytes) || phase > 1 ||
@@ -408,6 +420,17 @@ esp_err_t SaveSessionRaw(
     if (!GetSessionPaths(session.remote.mode, &paths)) {
         return ESP_ERR_INVALID_ARG;
     }
+    // [deck-scope] Refuse to persist a session built under a different scope.
+    // A deck switch can land between a session request being queued and the
+    // runner-side save executing; without this gate the stale session would
+    // re-materialize on disk right after the switch wiped it.
+    if (session.deck_scope_generation != wqn::GetDeckScopeGeneration()) {
+        ESP_LOGW(kTag,
+                 "word session save rejected: scope generation %u != committed %u",
+                 static_cast<unsigned>(session.deck_scope_generation),
+                 static_cast<unsigned>(wqn::GetDeckScopeGeneration()));
+        return ESP_ERR_INVALID_STATE;
+    }
     std::vector<uint8_t> payload;
     if (!EncodeSession(session, &payload)) return ESP_ERR_INVALID_ARG;
     SessionHeader header = {};
@@ -469,6 +492,15 @@ esp_err_t WriteSessionCursor(const wqn::PersistedWordSession& session)
     SessionPaths paths = {};
     if (!GetSessionCursorPaths(session.remote.mode, &paths)) {
         return ESP_ERR_INVALID_ARG;
+    }
+    // [deck-scope] Same guard as SaveSessionRaw: a stale pause/resume cursor
+    // for an old-scope session must not be written after a deck switch.
+    if (session.deck_scope_generation != wqn::GetDeckScopeGeneration()) {
+        ESP_LOGW(kTag,
+                 "word session cursor rejected: scope generation %u != committed %u",
+                 static_cast<unsigned>(session.deck_scope_generation),
+                 static_cast<unsigned>(wqn::GetDeckScopeGeneration()));
+        return ESP_ERR_INVALID_STATE;
     }
     SessionCursorRecord record = {};
     record.magic = kSessionCursorMagic;
@@ -533,9 +565,21 @@ esp_err_t LoadSessionFile(const char* path, wqn::PersistedWordSession* session)
     if (!payload_ok || trailing != EOF || Crc32(payload.data(), payload.size()) != header.payload_crc) {
         return ESP_ERR_INVALID_CRC;
     }
-    return DecodeSession(payload, session)
-        ? ESP_OK
-        : ESP_ERR_INVALID_RESPONSE;
+    if (!DecodeSession(payload, session)) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    // [deck-scope] Second line of defense behind the marker protocol: a
+    // snapshot stamped under an older scope generation must not resume after
+    // a deck switch (e.g. a switch replayed by boot recovery while this file
+    // survived a torn clear). NOT_FOUND matches the "unused mode" contract.
+    if (session->deck_scope_generation != wqn::GetDeckScopeGeneration()) {
+        ESP_LOGW(kTag,
+                 "word session rejected: scope generation %u != committed %u",
+                 static_cast<unsigned>(session->deck_scope_generation),
+                 static_cast<unsigned>(wqn::GetDeckScopeGeneration()));
+        return ESP_ERR_NOT_FOUND;
+    }
+    return ESP_OK;
 }
 
 esp_err_t LoadSessionSlotRaw(

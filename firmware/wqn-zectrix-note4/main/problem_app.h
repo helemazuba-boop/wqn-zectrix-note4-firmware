@@ -87,6 +87,10 @@ struct ProblemAppState {
     DurableProblemObservation pending_verdict;
     bool advance_after_commit = false;
     ProblemVerdictCommitState commit_state = ProblemVerdictCommitState::kIdle;
+    // [persist-worker] operation_id of the in-flight verdict persist submit; the
+    // worker result is applied only if it still matches (and commit_state is
+    // kPersisting), so a late result cannot mis-advance a reset/changed view.
+    uint32_t pending_persist_operation_id = 0;
     ProblemOutboxState outbox;
 
     // Full-screen image plumbing (mirrors note_app's viewer; see note_app.h
@@ -188,9 +192,9 @@ bool TakeProblemVerdictEffect(
     ProblemAppState* state,
     const std::string& request_id,
     const std::string& occurred_at,
+    uint32_t operation_id,
     DurableProblemObservation* observation);
 void ApplyProblemVerdictCommitResult(ProblemAppState* state, esp_err_t result);
-void RestoreProblemVerdictEffect(ProblemAppState* state);
 
 void RefreshProblemOutboxState(ProblemAppState* state);
 ProblemAppSnapshot BuildProblemAppSnapshot(const ProblemAppState& state);
