@@ -1317,56 +1317,25 @@ void ResetAiScroll()
     xSemaphoreGive(g_lock);
 }
 
-void RequestAiScrollUp(int32_t lines)
-{
-    if (g_lock == nullptr || lines <= 0) {
-        return;
-    }
-    xSemaphoreTake(g_lock, portMAX_DELAY);
-    int32_t target = g_state.scroll_offset_lines + lines;
-    constexpr int32_t kMaxScrollRows = 256;
-    if (target > kMaxScrollRows) {
-        target = kMaxScrollRows;
-    }
-    if (target < -kMaxScrollRows) {
-        target = -kMaxScrollRows;
-    }
-    if (target != g_state.scroll_offset_lines) {
-        g_state.scroll_offset_lines = target;
-        MarkChanged();
-    }
-    xSemaphoreGive(g_lock);
-}
-
-void RequestAiScrollDown(int32_t lines)
-{
-    if (g_lock == nullptr || lines <= 0) {
-        return;
-    }
-    xSemaphoreTake(g_lock, portMAX_DELAY);
-    int32_t target = g_state.scroll_offset_lines - lines;
-    constexpr int32_t kMaxScrollRows = 256;
-    if (target > kMaxScrollRows) {
-        target = kMaxScrollRows;
-    }
-    if (target < -kMaxScrollRows) {
-        target = -kMaxScrollRows;
-    }
-    if (target != g_state.scroll_offset_lines) {
-        g_state.scroll_offset_lines = target;
-        MarkChanged();
-    }
-    xSemaphoreGive(g_lock);
-}
-
-void SetAiScrollOffsetLines(int32_t val)
+void SetAiScrollOffsetLinesClamped(int32_t target, int32_t min_scroll, int32_t max_scroll)
 {
     if (g_lock == nullptr) {
         return;
     }
+    if (min_scroll > max_scroll) {
+        return;  // degenerate bounds: fail open, leave the offset untouched
+    }
     xSemaphoreTake(g_lock, portMAX_DELAY);
-    constexpr int32_t kMaxScrollRows = 256;
-    int32_t target = val;
+    // Read-clamp-write stays inside ONE lock hold so a streaming auto-follow
+    // cannot interleave between reading and writing the offset (a split
+    // Get/Set across locks reintroduces a TOCTOU on the scroll state).
+    if (target > max_scroll) {
+        target = max_scroll;
+    }
+    if (target < min_scroll) {
+        target = min_scroll;
+    }
+    constexpr int32_t kMaxScrollRows = 4096;
     if (target > kMaxScrollRows) {
         target = kMaxScrollRows;
     }
@@ -1481,9 +1450,7 @@ void ShowAiToast(const std::string&) {}
 void HideAiToast() {}
 void SetAiRecordingLabel(int32_t) {}
 void ResetAiScroll() {}
-void RequestAiScrollUp(int32_t) {}
-void RequestAiScrollDown(int32_t) {}
-void SetAiScrollOffsetLines(int32_t) {}
+void SetAiScrollOffsetLinesClamped(int32_t, int32_t, int32_t) {}
 void StampScrollNoOpHint() {}
 bool IsAiToastVisible() { return false; }
 const std::string& CurrentAiToastLabel()

@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -239,35 +240,53 @@ int DrawUserPill(int x, int y, int max_w, const std::string& text)
     return total_h;
 }
 
-// [md-rows] Assistant markdown row-count cache for the measure pass. Old
-// messages never change, so after the first frame the layout loop costs O(1)
-// per message; the streaming reply invalidates via its growing byte length.
-// Bounded memory (two words per message); reset when the history shrinks (new
-// session) so stale indices cannot alias. A same-index same-length different
-// text would briefly reuse a stale count -- it self-heals on the next size
-// change and can only happen across a session swap that kept message count.
-int CachedAssistantMdRows(size_t msg_idx, const std::string& text, size_t total_msgs)
+// [md-rows] Assistant markdown row-count cache for the measure pass.
+// Keyed on msg_id + text size + hash to ensure correctness across
+// session/tier swaps (hash alone is collision-prone; size is a cheap extra
+// discriminator).
+int CachedAssistantMdRows(uint64_t msg_id, const std::string& text)
 {
     struct Entry {
-        size_t text_size = SIZE_MAX;
+        uint64_t msg_id = 0;
+        size_t text_size = 0;
+        size_t text_hash = 0;
         int rows = 1;
     };
-    static std::vector<Entry> s_rows;
-    if (s_rows.size() > total_msgs) {
-        s_rows.clear();
+    static std::vector<Entry> s_cache;
+
+    const size_t hash = std::hash<std::string>{}(text);
+
+    for (auto& entry : s_cache) {
+        if (entry.msg_id == msg_id && entry.text_size == text.size() &&
+            entry.text_hash == hash) {
+            return entry.rows;
+        }
     }
-    if (msg_idx >= s_rows.size()) {
-        s_rows.resize(msg_idx + 1);
+
+    int rows = std::max<int>(
+        1,
+        static_cast<int>(CountMarkdownLines(
+            text, kAiAssistantW - kAiAssistantLeftBorder - 6)));
+
+    bool found = false;
+    for (auto& entry : s_cache) {
+        if (entry.msg_id == msg_id) {
+            entry.text_size = text.size();
+            entry.text_hash = hash;
+            entry.rows = rows;
+            found = true;
+            break;
+        }
     }
-    Entry& entry = s_rows[msg_idx];
-    if (entry.text_size != text.size()) {
-        entry.rows = std::max<int>(
-            1,
-            static_cast<int>(CountMarkdownLines(
-                text, kAiAssistantW - kAiAssistantLeftBorder - 6)));
-        entry.text_size = text.size();
+    if (!found) {
+        s_cache.push_back({msg_id, text.size(), hash, rows});
     }
-    return entry.rows;
+
+    if (s_cache.size() > 100) {
+        s_cache.erase(s_cache.begin(), s_cache.begin() + 50);
+    }
+
+    return rows;
 }
 
 int DrawAssistantBlock(int x, int y, int max_w, const std::string& text)
@@ -442,6 +461,63 @@ int DrawToolBlock(int x, int y, int max_w, const wqn::ChatMessageSnapshot& tool,
     return expected_h;
 }
 
+// Single source of truth for the AI history vertical geometry. Both the
+// renderer (RenderAiHistoryViewport) and the input-path scroll bounds
+// (GetAiScrollBounds) MUST consume this pass, or the scroll clamp desyncs
+// from what is actually drawn (same invariant as kMarkdownWidthDense on the
+// note/problem pages).
+struct AiHistoryLayout {
+    std::vector<int> heights;       // chronological, per message
+    std::vector<int> virtual_tops;  // chronological, includes kAiLineGap
+    int total_content_h = 0;
+    int anchor_top = 0;  // virtual top of the newest user message (0 if none)
+};
+
+AiHistoryLayout ComputeAiHistoryLayout(
+    const std::vector<wqn::ChatMessageSnapshot>& messages, bool expand_content)
+{
+    AiHistoryLayout out;
+    const int line_h = kAiLineH;
+    const size_t n = messages.size();
+    out.heights.assign(n, 0);
+    out.virtual_tops.assign(n, 0);
+    int newest_user_idx = -1;
+    int y = 0;
+    for (size_t i = 0; i < n; ++i) {
+        const wqn::ChatMessageSnapshot& msg = messages[i];
+        int h = 0;
+        const std::string body(msg.text.empty() ? std::string("-")
+                                               : std::string(msg.text.data(), msg.text.size()));
+        if (msg.kind == wqn::ChatMessageKind::kUser) {
+            const auto lines = WrapForViewport(body, kAiUserPillMaxW - 16, 4);
+            h = static_cast<int>(lines.size()) * line_h + 4;
+            newest_user_idx = static_cast<int>(i);
+        } else if (msg.kind == wqn::ChatMessageKind::kAssistant) {
+            // Markdown row count, cached per message so only the streaming
+            // reply is re-laid out while it grows. MUST use the same width as
+            // DrawAssistantBlock or block heights drift.
+            const int rows = CachedAssistantMdRows(msg.id, body);
+            h = rows * line_h + 6;
+        } else if (msg.kind == wqn::ChatMessageKind::kThinking) {
+            const auto lines = BuildThinkingLines(body, kAiAssistantW, expand_content);
+            h = static_cast<int>(lines.size()) * line_h + 6;
+        } else {
+            h = ToolBlockHeight(msg, kAiAssistantW, expand_content);
+        }
+        out.heights[i] = h;
+        out.virtual_tops[i] = y;
+        y += h + kAiLineGap;
+    }
+    out.total_content_h = (n > 0) ? y - kAiLineGap : 0;
+    if (out.total_content_h < 0) {
+        out.total_content_h = 0;
+    }
+    if (newest_user_idx >= 0) {
+        out.anchor_top = out.virtual_tops[newest_user_idx];
+    }
+    return out;
+}
+
 void RenderAiHistoryViewport(const wqn::AiSessionState& ai,
                             const std::shared_ptr<const wqn::AiHistorySnapshot>& snapshot,
                             int32_t scroll_offset_lines)
@@ -463,44 +539,12 @@ void RenderAiHistoryViewport(const wqn::AiSessionState& ai,
         return;
     }
 
-    // 1. Calculate heights and layout of all messages
-    struct Layout {
-        int height;
-        size_t msg_idx;
-        int rows_consumed;
-    };
-    std::vector<Layout> layout;
-    const size_t n = messages.size();
-    
-    // Index 0 is oldest, n-1 is newest. We build layout from newest (n-1) to oldest (0).
-    for (size_t i = 0; i < n; ++i) {
-        const size_t msg_idx = n - 1 - i;
-        const wqn::ChatMessageSnapshot& msg = messages[msg_idx];
-        int h = 0;
-        int rows_consumed = 0;
-        const std::string body(msg.text.empty() ? std::string("-")
-                                               : std::string(msg.text.data(), msg.text.size()));
-        if (msg.kind == wqn::ChatMessageKind::kUser) {
-            const auto lines = WrapForViewport(body, kAiUserPillMaxW - 16, 4);
-            h = static_cast<int>(lines.size()) * line_h + 4;
-            rows_consumed = static_cast<int>(lines.size());
-        } else if (msg.kind == wqn::ChatMessageKind::kAssistant) {
-            // Layout pass -- markdown row count, cached per message so only
-            // the streaming reply is re-laid out while it grows. MUST use the
-            // same width as DrawAssistantBlock or block heights drift.
-            const int rows = CachedAssistantMdRows(msg_idx, body, n);
-            h = rows * line_h + 6;
-            rows_consumed = rows;
-        } else if (msg.kind == wqn::ChatMessageKind::kThinking) {
-            const auto lines = BuildThinkingLines(body, kAiAssistantW, ai.expand_content);
-            h = static_cast<int>(lines.size()) * line_h + 6;
-            rows_consumed = static_cast<int>(lines.size());
-        } else {
-            h = ToolBlockHeight(msg, kAiAssistantW, ai.expand_content);
-            rows_consumed = h / line_h;
-        }
-        layout.push_back({h, msg_idx, rows_consumed});
-    }
+    // 1. Lay out all messages through the shared geometry pass. It is the
+    // single source of truth for GetAiScrollBounds as well: the input-path
+    // scroll clamp MUST agree with what is actually drawn, or the viewport
+    // desyncs from its own bounds.
+    const AiHistoryLayout layout = ComputeAiHistoryLayout(messages, ai.expand_content);
+    const int layout_size = static_cast<int>(messages.size());
 
     // 2. Determine the visible subset of messages and place them inside the
     // viewport.
@@ -516,52 +560,18 @@ void RenderAiHistoryViewport(const wqn::AiSessionState& ai,
     // scroll_offset_lines is then a relative adjustment on top of this
     // anchor: positive means "scroll up into older history", negative means
     // "scroll down past the latest content" (clamped at 0).
-    // (line_h already declared above.)
-
-    // 2. Determine the visible subset of messages and place them inside the
-    // viewport.
-    //
-    // Layout strategy: chat conversation reads top→bottom in chronological
-    // order (oldest at top, newest at bottom — standard chat convention).
     // All messages are laid out in a virtual canvas from oldest to newest.
-    const int layout_size = static_cast<int>(layout.size());
-    std::vector<int> virtual_tops(layout_size);
-    int current_y = 0;
-    for (int i = layout_size - 1; i >= 0; --i) {
-        virtual_tops[i] = current_y;
-        current_y += layout[i].height + kAiLineGap;
-    }
-    int total_content_h = current_y - kAiLineGap;
-    if (total_content_h < 0) {
-        total_content_h = 0;
-    }
-
     const int effective_bottom = wqn::kEpdHeight - kAiViewportBottomPad;
     const int viewport_h = effective_bottom - kAiViewportY;
 
-    // Locate the most-recent user message for default top-viewport anchoring.
-    int newest_user_idx = -1;
-    for (size_t i = 0; i < layout.size(); ++i) {
-        const Layout& L = layout[i];
-        if (messages[L.msg_idx].kind == wqn::ChatMessageKind::kUser) {
-            newest_user_idx = static_cast<int>(i);
-            break;
-        }
-    }
-
-    int anchor_top = 0;
-    if (newest_user_idx >= 0) {
-        anchor_top = virtual_tops[newest_user_idx];
-    }
-
-    int max_window_top = total_content_h - viewport_h;
+    int max_window_top = layout.total_content_h - viewport_h;
     if (max_window_top < 0) {
         max_window_top = 0;
     }
 
-    // Scroll limits in line units
-    int max_scroll = anchor_top / line_h;
-    int min_scroll = (anchor_top - max_window_top) / line_h;
+    // Scroll limits in line units (anchor = newest user message top).
+    int max_scroll = layout.anchor_top / line_h;
+    int min_scroll = (layout.anchor_top - max_window_top) / line_h;
     if (min_scroll > 0) {
         min_scroll = 0;
     }
@@ -574,11 +584,8 @@ void RenderAiHistoryViewport(const wqn::AiSessionState& ai,
     if (clamped_scroll > max_scroll) {
         clamped_scroll = max_scroll;
     }
-    if (clamped_scroll != scroll_offset_lines) {
-        wqn::SetAiScrollOffsetLines(clamped_scroll);
-    }
 
-    int window_top = anchor_top - clamped_scroll * line_h;
+    int window_top = layout.anchor_top - clamped_scroll * line_h;
     if (window_top < 0) {
         window_top = 0;
     } else if (window_top > max_window_top) {
@@ -589,12 +596,11 @@ void RenderAiHistoryViewport(const wqn::AiSessionState& ai,
 
     // Draw all messages that intersect with the viewport
     for (int i = layout_size - 1; i >= 0; --i) {
-        const Layout& L = layout[i];
-        const wqn::ChatMessageSnapshot& msg = messages[L.msg_idx];
-        const int block_top = kAiViewportY + (virtual_tops[i] - window_top);
+        const wqn::ChatMessageSnapshot& msg = messages[i];
+        const int block_top = kAiViewportY + (layout.virtual_tops[i] - window_top);
 
         // Clip completely above viewport
-        if (block_top + L.height <= kAiViewportY) {
+        if (block_top + layout.heights[i] <= kAiViewportY) {
             continue;
         }
         // Clip completely below viewport
@@ -670,6 +676,36 @@ void RenderAiHistoryViewport(const wqn::AiSessionState& ai,
             DRC(cx, wqn::kEpdHeight - kAiViewportBottomPad - 18, hint, true);
         }
     }
+}
+
+void GetAiScrollBounds(
+    std::shared_ptr<const wqn::AiHistorySnapshot> snapshot,
+    bool expand_content,
+    int32_t* out_min_scroll,
+    int32_t* out_max_scroll)
+{
+    if (out_min_scroll) *out_min_scroll = 0;
+    if (out_max_scroll) *out_max_scroll = 0;
+    if (!snapshot || snapshot->messages.empty()) return;
+
+    // Same geometry pass as the renderer -- never re-measure here.
+    const AiHistoryLayout layout = ComputeAiHistoryLayout(snapshot->messages, expand_content);
+
+    const int line_h = kAiLineH;
+    const int viewport_h = wqn::kEpdHeight - kAiViewportY - kAiViewportBottomPad;
+    int max_window_top = layout.total_content_h - viewport_h;
+    if (max_window_top < 0) {
+        max_window_top = 0;
+    }
+
+    int max_scroll = layout.anchor_top / line_h;
+    int min_scroll = (layout.anchor_top - max_window_top) / line_h;
+    if (min_scroll > 0) {
+        min_scroll = 0;
+    }
+
+    if (out_min_scroll) *out_min_scroll = min_scroll;
+    if (out_max_scroll) *out_max_scroll = max_scroll;
 }
 
 esp_err_t RenderAiToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)

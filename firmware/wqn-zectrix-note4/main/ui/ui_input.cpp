@@ -648,20 +648,33 @@ RefreshSchedule ApplyButtonEvent(
         state->ai.status != wqn::AiSessionStatus::kWaitingReply &&
         state->ai.status != wqn::AiSessionStatus::kStreaming) {
         constexpr int32_t kScrollStepRows = 4;  // [scroll-2x] was 2; doubled per request
-        if (event.button == wqn::ButtonId::kUp) {
-            // Up = "older" content above. Scroll band shifts content down.
-            wqn::RequestAiScrollUp(kScrollStepRows);
-        } else {
-            // Down = "newer". Scroll band shifts content up.
-            const int32_t before = state->ai.scroll_offset_lines;
-            wqn::RequestAiScrollDown(kScrollStepRows);
-            // [scroll-hint] If the user is already at the limit the scroll
-            // is a no-op. Stamp a transient hint so the E-ink panel gives
-            // visible feedback ("已最新") instead of looking frozen.
-            state->ai.scroll_offset_lines = wqn::GetAiScrollOffsetLines();
-            if (state->ai.scroll_offset_lines == before) {
-                wqn::StampScrollNoOpHint();
+        const wqn::AiHistoryChannel channel = state->ai.tier == wqn::AiTier::kFlash
+            ? wqn::AiHistoryChannel::kFlash
+            : wqn::AiHistoryChannel::kStdPro;
+        auto snapshot = wqn::GetAiHistorySnapshot(channel);
+
+        // Fail open: without history there are no trustworthy bounds, so the
+        // offset stays untouched (an empty snapshot must never reset scroll).
+        if (snapshot != nullptr && !snapshot->messages.empty()) {
+            int32_t min_scroll = 0;
+            int32_t max_scroll = 0;
+            device_ui_internal::GetAiScrollBounds(
+                snapshot, state->ai.expand_content, &min_scroll, &max_scroll);
+            const int32_t current = wqn::GetAiScrollOffsetLines();
+            if (event.button == wqn::ButtonId::kUp) {
+                // Up = "older" content above. Scroll band shifts content down.
+                wqn::SetAiScrollOffsetLinesClamped(
+                    current + kScrollStepRows, min_scroll, max_scroll);
+            } else {
+                // Down = "newer". Scroll band shifts content up.
+                if (current <= min_scroll) {
+                    wqn::StampScrollNoOpHint();
+                }
+                wqn::SetAiScrollOffsetLinesClamped(
+                    current - kScrollStepRows, min_scroll, max_scroll);
             }
+        } else if (event.button != wqn::ButtonId::kUp) {
+            wqn::StampScrollNoOpHint();
         }
         state->ai.scroll_offset_lines = wqn::GetAiScrollOffsetLines();
         wqn::AiSessionState updated;

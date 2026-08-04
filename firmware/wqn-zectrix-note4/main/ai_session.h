@@ -60,9 +60,9 @@ void ShowAiToast(const std::string& label);                   // e.g. "● 上�
 void HideAiToast();                                            // for ready / idle
 void SetAiRecordingLabel(int32_t elapsed_ms);                  // updates recording toast
 void ResetAiScroll();                                          // recenter on newest
-void RequestAiScrollUp(int32_t lines);                         // key-driven
-void RequestAiScrollDown(int32_t lines);
-void SetAiScrollOffsetLines(int32_t val);
+// Single-lock read-clamp-write of the scroll offset. Bounds come from the
+// shared AI layout pass (GetAiScrollBounds); degenerate bounds fail open.
+void SetAiScrollOffsetLinesClamped(int32_t target, int32_t min_scroll, int32_t max_scroll);
 void StampScrollNoOpHint();                                    // flash "已最新" hint at bottom
 int32_t GetAiScrollOffsetLines();
 
