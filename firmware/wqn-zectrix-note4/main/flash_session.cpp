@@ -624,6 +624,33 @@ void FlashPlaybackTask(void* /*param*/)
             xSemaphoreGive(g_flash.mutex);
             vTaskDelete(nullptr);
         }
+        // Interrupts must be honored even while the duplex TX channel does
+        // not exist yet (warmup): dropping queued PCM and resetting the
+        // PA/amp bookkeeping needs no I2S handle. Keeping this above the
+        // stream_tx guard means a stop pressed during first-turn codec init
+        // drains the queue instead of waiting for audio to come up.
+        if (g_flash.drain_playback.load(std::memory_order_relaxed)) {
+            size_t drain_size = 0;
+            char* drain_item = nullptr;
+            while ((drain_item = static_cast<char*>(xRingbufferReceive(
+                           g_flash.playback_ringbuf, &drain_size, 0))) != nullptr) {
+                vRingbufferReturnItem(g_flash.playback_ringbuf, drain_item);
+            }
+            g_flash.playback_queued_bytes.store(0, std::memory_order_release);
+            g_flash.drain_playback.store(false, std::memory_order_relaxed);
+            xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+            g_flash.playback_write_active = false;
+            g_flash.playback_abort_requested = false;
+            g_flash.amp_idle_armed = false;
+            xSemaphoreGive(g_flash.mutex);
+            continue;
+        }
+        if (g_flash.stream_tx == nullptr) {
+            // PCM cannot be played until the duplex TX channel exists.
+            // Wait and retry, leaving items in the ring buffer.
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
         size_t item_size = 0;
         char* item = static_cast<char*>(xRingbufferReceiveUpTo(
             g_flash.playback_ringbuf, &item_size, pdMS_TO_TICKS(100),
@@ -679,15 +706,6 @@ void FlashPlaybackTask(void* /*param*/)
             // rms/max<0.3 -> clean speech (DAC analog issue).
             ESP_LOGI(kTag, "downlink pcm diag: frames=%u max=%d rms=%d",
                      static_cast<unsigned>(sample_count), max_sample, rms);
-        }
-
-        if (g_flash.stream_tx == nullptr) {
-            // PCM cannot be played until the duplex TX channel exists. Put the
-            // block back after a short delay instead of dropping response audio
-            // during first-turn codec/I2S initialization.
-            vRingbufferReturnItem(g_flash.playback_ringbuf, item);
-            vTaskDelay(pdMS_TO_TICKS(10));
-            continue;
         }
 
         // Mark the full blocking write as active before opening the PA. Do not
