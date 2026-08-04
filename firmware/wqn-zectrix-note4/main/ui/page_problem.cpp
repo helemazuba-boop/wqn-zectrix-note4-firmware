@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -106,12 +107,22 @@ esp_err_t RenderProblemTextFace(
     }
     const int body_top = kContentTop;
     const int visible = std::max(1, (kContentBottom - body_top) / kBodyLineH);
+    // Identity is keyed on face key + text size + hash: the cache must notice
+    // a same-key content change WITHOUT pinning a second full copy of the
+    // face text in static storage.
     static std::string s_layout_key;
+    static size_t s_layout_text_size = 0;
+    static size_t s_layout_text_hash = 0;
     static std::vector<MdLine> s_md_lines;
     const std::string key = problem.problem_id + (answer_face ? "#a" : "#b");
-    if (key != s_layout_key) {
-        s_md_lines = LayoutMarkdown(text, kContentW - 14, kMdNoSingleEmphasis);
+    const size_t text_hash = std::hash<std::string>{}(text);
+    if (key != s_layout_key ||
+        text.size() != s_layout_text_size ||
+        text_hash != s_layout_text_hash) {
+        s_md_lines = LayoutMarkdown(text, kMarkdownWidthDense, kMdNoSingleEmphasis);
         s_layout_key = key;
+        s_layout_text_size = text.size();
+        s_layout_text_hash = text_hash;
     }
     const std::vector<MdLine>& lines = s_md_lines;
     const int total = static_cast<int>(lines.size());
@@ -123,7 +134,7 @@ esp_err_t RenderProblemTextFace(
         ESP_RETURN_ON_ERROR(
             DrawMarkdownLine(
                 lines[top + i], kProblemMarginX + 2, body_top + i * kBodyLineH,
-                kContentW - 14, kBodyLineH),
+                kMarkdownWidthDense, kBodyLineH),
             kTag, "draw problem face line");
     }
     if (total > visible) {

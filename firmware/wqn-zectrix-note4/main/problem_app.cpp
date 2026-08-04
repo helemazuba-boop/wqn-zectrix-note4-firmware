@@ -12,6 +12,7 @@
 
 #include "display_service.h"
 #include "ui/markdown_layout.h"
+#include "ui/ui_layout.h"
 
 namespace {
 
@@ -271,17 +272,17 @@ void LoadCurrentProblem(wqn::ProblemAppState* state)
     if (read_result == ESP_OK) {
         state->current_loaded = true;
         // Precompute Markdown row counts with the SAME width, layout and opts
-        // as the renderer (page_problem.cpp: kContentW - 14 = 370 px,
+        // as the renderer (page_problem.cpp: kMarkdownWidthDense,
         // kMdNoSingleEmphasis) so scroll clamps match. Single * / _ stay
         // literal: problem bodies are math-heavy plain text.
         state->body_text = ComposeBodyText(state->current);
         state->body_total_lines = static_cast<uint32_t>(
             device_ui_internal::CountMarkdownLines(
-                state->body_text, 370, device_ui_internal::kMdNoSingleEmphasis));
+                state->body_text, device_ui_internal::kMarkdownWidthDense, device_ui_internal::kMdNoSingleEmphasis));
         state->answer_text = ComposeAnswerText(state->current);
         state->answer_total_lines = static_cast<uint32_t>(
             device_ui_internal::CountMarkdownLines(
-                state->answer_text, 370, device_ui_internal::kMdNoSingleEmphasis));
+                state->answer_text, device_ui_internal::kMarkdownWidthDense, device_ui_internal::kMdNoSingleEmphasis));
         ESP_LOGI(
             kTag, "problem opened: id=%.8s images=%u/%u parts=%u body_bytes=%u",
             state->current.problem_id.c_str(),

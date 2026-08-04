@@ -35,6 +35,7 @@ constexpr int kEdgeFlushX = 6;                  // [legacy] AI 助手 role-bar �
 constexpr int kContentTopY = 35;                // 状态栏下第一内容行 (divider 27 + 8px gap)
 constexpr int kContentWidth = kScreenWidth - 2 * kMarginX;  // 380 (标准页内容宽)
 constexpr int kContentWidthDense = kScreenWidth - 2 * kMarginDense;  // 388 (密度页内容宽)
+constexpr int kMarkdownWidthDense = kContentWidthDense - 14;  // 374 (密度页 Markdown 绘制宽度)
 constexpr int kBottomHintY = 278;               // 底部提示/脚注行 y
 
 // ---- 组件间距 (gutter) ----

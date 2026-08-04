@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <ctime>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -218,13 +219,24 @@ esp_err_t RenderNoteBody(const wqn::NoteAppSnapshot& note)
     const int visible = std::max(1, (kBodyBottom - body_top) / kBodyLineH);
     // Lay the body out (Markdown subset) once per opened note; scrolling only
     // re-reads the cached rows. LayoutMarkdown is a pure fixed-width pass and
-    // MUST use the same width as note_app.cpp's scroll-clamp count (370 px), or
+    // MUST use the same width as note_app.cpp's scroll-clamp count (kMarkdownWidthDense), or
     // Down-scroll clamps to the wrong last page.
+    //
+    // Identity is keyed on note_id + body size + hash: the cache must notice
+    // a same-id content update (cloud sync) WITHOUT pinning a second full
+    // copy of the body text in static storage.
     static std::string s_layout_note_id;
+    static size_t s_layout_body_size = 0;
+    static size_t s_layout_body_hash = 0;
     static std::vector<MdLine> s_md_lines;
-    if (note.note_id != s_layout_note_id) {
-        s_md_lines = LayoutMarkdown(note.note_body, kContentW - 14);
+    const size_t body_hash = std::hash<std::string>{}(note.note_body);
+    if (note.note_id != s_layout_note_id ||
+        note.note_body.size() != s_layout_body_size ||
+        body_hash != s_layout_body_hash) {
+        s_md_lines = LayoutMarkdown(note.note_body, kMarkdownWidthDense);
         s_layout_note_id = note.note_id;
+        s_layout_body_size = note.note_body.size();
+        s_layout_body_hash = body_hash;
     }
     const std::vector<MdLine>& lines = s_md_lines;
     const int total = static_cast<int>(lines.size());
@@ -236,7 +248,7 @@ esp_err_t RenderNoteBody(const wqn::NoteAppSnapshot& note)
         ESP_RETURN_ON_ERROR(
             DrawMarkdownLine(
                 lines[top + i], kNoteMarginX + 2, body_top + i * kBodyLineH,
-                kContentW - 14, kBodyLineH),
+                kMarkdownWidthDense, kBodyLineH),
             kTag, "draw note body line");
     }
     // Proportional scrollbar (font-independent) when the body overflows.
