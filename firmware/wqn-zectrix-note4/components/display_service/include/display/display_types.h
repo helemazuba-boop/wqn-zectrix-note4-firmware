@@ -37,12 +37,16 @@ enum class DisplayStatus : uint8_t {
 // Trivially copyable: values are transported through a bounded FreeRTOS queue.
 // presented_revision identifies the pixels believed to be on the panel when
 // this terminal result was emitted. replacement_revision is only populated for
-// kSuperseded.
+// kSuperseded. dropped_below_revision is the authoritative watermark from the
+// EPD owner: every accepted revision <= it lost its terminal result (e.g. the
+// result queue was full or the bounded wait timed out) and consumers must
+// evict matching ledger entries. kInvalidDisplayRevision means "no loss".
 struct DisplayResult {
     DisplayRevision revision = kInvalidDisplayRevision;
     DisplayStatus status = DisplayStatus::kFailed;
     DisplayRevision presented_revision = kInvalidDisplayRevision;
     DisplayRevision replacement_revision = kInvalidDisplayRevision;
+    DisplayRevision dropped_below_revision = kInvalidDisplayRevision;
     esp_err_t error = ESP_FAIL;
 };
 

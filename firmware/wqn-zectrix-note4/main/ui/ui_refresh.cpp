@@ -49,6 +49,13 @@ std::array<wqn::display::DisplayRevision, wqn::display::kDisplayResultQueueDepth
     g_outstanding_display_revisions{};
 wqn::display::DisplayRevision g_last_presented_revision =
     wqn::display::kInvalidDisplayRevision;
+// Authoritative drop watermark: every accepted revision <= this value lost its
+// terminal result (the bounded publish wait expired). Only the EPD task
+// mutates it, always under g_refresh_mutex; the next successfully published
+// result carries it to the consumer ledger so eviction is factual, not a
+// guess based on which result happened to arrive.
+wqn::display::DisplayRevision g_dropped_below_revision =
+    wqn::display::kInvalidDisplayRevision;
 
 // ---- Schedule helpers -------------------------------------------------------
 
@@ -1074,6 +1081,9 @@ void EpdRefreshTask(void*)
             terminal_result.status = wqn::display::DisplayStatus::kFailed;
         }
         terminal_result.presented_revision = g_last_presented_revision;
+        // Carry the pending drop watermark on this result so the consumer can
+        // evict ledger entries whose terminal results were lost.
+        terminal_result.dropped_below_revision = g_dropped_below_revision;
         xSemaphoreGive(g_refresh_mutex);
         // A result slot was reserved when the intent was accepted. Wait a
         // bounded time for the UI to drain the queue; if it never does (UI
@@ -1082,8 +1092,21 @@ void EpdRefreshTask(void*)
         // frames instead of deadlocking on a consumer that may never return.
         if (!PublishDisplayResult(terminal_result, pdMS_TO_TICKS(10000))) {
             xSemaphoreTake(g_refresh_mutex, portMAX_DELAY);
+            // The watermark carried on this result never reached the consumer;
+            // keep it and extend it with the revision we release now, so the
+            // next successful result reports both losses (monotonic).
+            if (local_intent.revision > g_dropped_below_revision) {
+                g_dropped_below_revision = local_intent.revision;
+            }
             UntrackOutstandingRevisionLocked(local_intent.revision);
             MaybeReleaseDisplayLeaseLocked();
+            xSemaphoreGive(g_refresh_mutex);
+        } else if (terminal_result.dropped_below_revision !=
+                   wqn::display::kInvalidDisplayRevision) {
+            // Watermark delivered: clear it. Only the EPD task writes it and
+            // this code runs in the EPD task, so no newer loss was missed.
+            xSemaphoreTake(g_refresh_mutex, portMAX_DELAY);
+            g_dropped_below_revision = wqn::display::kInvalidDisplayRevision;
             xSemaphoreGive(g_refresh_mutex);
         }
 

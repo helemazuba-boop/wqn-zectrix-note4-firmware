@@ -360,6 +360,31 @@ void DrainDisplayResults(
         const device_ui_internal::UiUpdate update =
             runtime->DispatchDisplayResult(result);
         *refresh_schedule = StrongerSchedule(*refresh_schedule, update.refresh);
+
+        // Authoritative ledger eviction: the EPD owner reports a watermark of
+        // revisions whose terminal results were dropped (bounded publish wait
+        // expired). Evict exactly those records. Never evict by guessing that
+        // "anything older than this result is stale" -- a slow Presented for
+        // an older revision would then destroy newer in-flight entries.
+        if (result.dropped_below_revision != wqn::display::kInvalidDisplayRevision) {
+            for (SubmittedDisplayRecord& rec : tracking->records) {
+                if (rec.occupied &&
+                    rec.revision != wqn::display::kInvalidDisplayRevision &&
+                    rec.revision <= result.dropped_below_revision) {
+                    ESP_LOGW(kTag,
+                             "Evicting display record below drop watermark: revision=%llu watermark=%llu",
+                             static_cast<unsigned long long>(rec.revision),
+                             static_cast<unsigned long long>(result.dropped_below_revision));
+                    rec.occupied = false;
+                    rec.revision = wqn::display::kInvalidDisplayRevision;
+                    rec.signature.clear();
+                    rec.schedule = RefreshSchedule::kNone;
+                    rec.full_refresh = false;
+                }
+            }
+            RecomputeLatestSubmission(tracking);
+        }
+
         SubmittedDisplayRecord* record = FindSubmittedRecord(tracking, result.revision);
         if (record == nullptr) {
             ESP_LOGE(kTag, "display result has no submission record: revision=%llu status=%s",
