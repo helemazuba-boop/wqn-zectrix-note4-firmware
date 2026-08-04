@@ -1635,11 +1635,28 @@ void SyncServiceTask(void*)
     SetSyncTaskRunning();
     SetSyncStatus("idle");
     bool first_round = true;
+    // Debounce the quiescing status: the retry loop below can spin once per
+    // second while sleep is blocked, and republishing the identical status
+    // every iteration wakes UI observers for no visible change.
+    bool was_quiescing = false;
     while (true) {
         if (first_round && wqn::services::GetConfiguredSyncDelayTicks() == portMAX_DELAY && wqn::services::HasUsableStoredToken()) {
             ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
         }
         first_round = false;
+
+        wqn::runtime::SleepLease sleep_lease =
+            wqn::runtime::SleepLease::TryAcquire(
+                wqn::runtime::SleepBlocker::kOnlineSync, "sync-service", __FILE__, __LINE__);
+        if (!sleep_lease) {
+            if (!was_quiescing) {
+                SetSyncStatus("sleep-quiescing");
+                was_quiescing = true;
+            }
+            ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000));
+            continue;
+        }
+        was_quiescing = false;
 
         const bool full_requested =
             g_full_sync_requested.exchange(false, std::memory_order_acq_rel);
@@ -1651,15 +1668,6 @@ void SyncServiceTask(void*)
         const bool outbox_only = false;
         (void)word_outbox_requested;
 #endif
-
-        wqn::runtime::SleepLease sleep_lease =
-            wqn::runtime::SleepLease::TryAcquire(
-                wqn::runtime::SleepBlocker::kOnlineSync, "sync-service", __FILE__, __LINE__);
-        if (!sleep_lease) {
-            SetSyncStatus("sleep-quiescing");
-            ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000));
-            continue;
-        }
 
         SetSyncRoundStarted(esp_timer_get_time() / 1000);
         SetSyncStatus(outbox_only ? "word-outbox" : "syncing");
