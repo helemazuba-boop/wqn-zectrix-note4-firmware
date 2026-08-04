@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-ESP-IDF firmware for the **WQN ZecTrix Note4** — an ESP32-S3, 400×300 e-paper study
+ESP-IDF firmware for the **WQN Note4** — an ESP32-S3, 400×300 e-paper study
 terminal built on the `zectrix-s3-epaper-4.2` board. The device connects to the WQN
 cloud over WiFi, caches due problems / todos / word decks locally, renders them to
 e-paper, and uploads review results. Provider secrets (Supabase, ASR/LLM providers,
