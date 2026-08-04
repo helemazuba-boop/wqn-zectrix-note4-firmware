@@ -566,10 +566,50 @@ void HandleUiInput(UiState* state, UiInput input)
 
     switch (input) {
         case UiInput::kTopPrevious:
+            // [persist-worker] Do not leave a scoped word page while its
+            // observation is still persisting: leaving triggers a synchronous
+            // ResetWordSessionsForScopeChange (two session-file clears) that
+            // would queue behind the in-flight persist transaction and stall
+            // the UI, and drop session ownership out from under the worker.
+            // Within-word input stays responsive; only the top-screen switch
+            // waits. Uses commit_state so the model layer stays unaware of the
+            // task infrastructure.
+            if (state->screen == wqn::UiScreen::kWord &&
+                !state->word_app.scoped_deck_id.empty() &&
+                state->word_app.session.commit_state ==
+                    wqn::WordObservationCommitState::kPersisting) {
+                state->word_app.message = "正在保存，请稍后离开";
+                break;
+            }
+            // Same contract for a problem verdict: the in-layer LongConfirm
+            // gate blocks the escape chain, but a long UP/DOWN maps straight to
+            // top-screen navigation and would bypass it, hiding the saving
+            // status mid-commit.
+            if (state->screen == wqn::UiScreen::kNote &&
+                state->problem_app.active &&
+                state->problem_app.commit_state ==
+                    wqn::ProblemVerdictCommitState::kPersisting) {
+                state->problem_app.message = "正在保存，请稍后离开";
+                break;
+            }
             state->screen = PreviousTopScreen(state->screen);
             break;
 
         case UiInput::kTopNext:
+            if (state->screen == wqn::UiScreen::kWord &&
+                !state->word_app.scoped_deck_id.empty() &&
+                state->word_app.session.commit_state ==
+                    wqn::WordObservationCommitState::kPersisting) {
+                state->word_app.message = "正在保存，请稍后离开";
+                break;
+            }
+            if (state->screen == wqn::UiScreen::kNote &&
+                state->problem_app.active &&
+                state->problem_app.commit_state ==
+                    wqn::ProblemVerdictCommitState::kPersisting) {
+                state->problem_app.message = "正在保存，请稍后离开";
+                break;
+            }
             state->screen = NextTopScreen(state->screen);
             break;
 
@@ -670,18 +710,28 @@ void HandleUiInput(UiState* state, UiInput input)
                 // switches screens; the word page's own UI takes over.
                 std::string requested_deck_id;
                 if (TakeNoteWordDeckOpenRequest(&state->note_app, &requested_deck_id)) {
-                    state->word_app.scoped_deck_id = requested_deck_id;
-                    state->word_app.scoped_deck_title.clear();
-                    for (const WordDeckInfo& deck : state->word_app.deck_catalog) {
-                        if (deck.deck_id == requested_deck_id) {
-                            state->word_app.scoped_deck_title = deck.title;
-                            break;
+                    if (state->word_app.session.commit_state ==
+                        wqn::WordObservationCommitState::kPersisting) {
+                        // A previous word answer is still persisting; scoping now
+                        // runs ResetWordSessionsForScopeChange synchronously and
+                        // would queue behind the in-flight persist transaction.
+                        // Consume the request (so it does not re-fire) and ask
+                        // the user to retry after the save completes.
+                        state->note_app.message = "正在保存，请稍后";
+                    } else {
+                        state->word_app.scoped_deck_id = requested_deck_id;
+                        state->word_app.scoped_deck_title.clear();
+                        for (const WordDeckInfo& deck : state->word_app.deck_catalog) {
+                            if (deck.deck_id == requested_deck_id) {
+                                state->word_app.scoped_deck_title = deck.title;
+                                break;
+                            }
                         }
+                        // The restored session is pinned to the previous scope;
+                        // starting the deck study must not resume it.
+                        ResetWordSessionsForScopeChange(&state->word_app, true);
+                        state->screen = UiScreen::kWord;
                     }
-                    // The restored session is pinned to the previous scope;
-                    // starting the deck study must not resume it.
-                    ResetWordSessionsForScopeChange(&state->word_app, true);
-                    state->screen = UiScreen::kWord;
                 }
                 break;
             } else if (state->screen == UiScreen::kHome) {
@@ -788,6 +838,10 @@ void HandleUiInput(UiState* state, UiInput input)
     if (screen_before == wqn::UiScreen::kWord &&
         state->screen != wqn::UiScreen::kWord &&
         !state->word_app.scoped_deck_id.empty()) {
+        // The kTopPrevious/kTopNext guards block leaving a scoped word page
+        // while a commit is persisting, so this cleanup only runs once the
+        // session is safe to drop -- there is no in-flight persist transaction
+        // for the synchronous clears to queue behind.
         state->word_app.scoped_deck_id.clear();
         state->word_app.scoped_deck_title.clear();
         ResetWordSessionsForScopeChange(&state->word_app, true);

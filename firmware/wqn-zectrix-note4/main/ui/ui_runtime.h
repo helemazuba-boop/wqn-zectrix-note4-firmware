@@ -38,6 +38,10 @@ enum class AppEventKind : uint8_t {
     kSyncResult,
     kDisplayResult,
     kTransferProgress,
+    kWordObservationPersist,
+    kNoteObservationPersist,
+    kProblemVerdictPersist,
+    kSettingsPersist,
 };
 
 struct UiUpdate {
@@ -103,9 +107,9 @@ public:
     bool TakeNoteObservationEffect(
         const std::string& request_id,
         const std::string& occurred_at,
+        uint32_t operation_id,
         wqn::DurableNoteObservation* observation,
         wqn::PersistedNoteSession* advanced_session);
-    void RestoreNoteObservationEffect();
     bool TakeProblemImageRequest(
         std::string* problem_id,
         bool* is_solution,
@@ -115,8 +119,50 @@ public:
     bool TakeProblemVerdictEffect(
         const std::string& request_id,
         const std::string& occurred_at,
+        uint32_t operation_id,
         wqn::DurableProblemObservation* observation);
-    void RestoreProblemVerdictEffect();
+
+    // [persist-worker] Word observation commit moved to the persist worker
+    // (see ui/persist_worker.h). Take mirrors the note/problem effect wrappers;
+    // the persist result is applied on the UI task here and returns the
+    // card-advance refresh (the worker never touches AppState).
+    bool TakeWordObservationEffect(
+        const std::string& request_id,
+        const std::string& occurred_at,
+        uint32_t operation_id,
+        wqn::DurableWordObservation* observation,
+        wqn::PersistedWordSession* advanced_session);
+    UiUpdate DispatchWordObservationPersistResult(esp_err_t result, uint32_t operation_id);
+    // Take failed inside the pump (cursor desync -> session already moved to
+    // kFailed). Route it through FinishEvent so the revision advances and the
+    // failure frame is not deduped against the "正在保存" frame's revision.
+    UiUpdate DispatchWordObservationTakeFailed();
+
+    // [persist-worker] Note observation commit moved to the persist worker
+    // (c3). Same shape as word: bound operation_id, applied only when it still
+    // matches the pending commit; Take-failure advances the revision. A success
+    // does not refresh (invisible bookkeeping); a failure / Take-failure returns
+    // kSelection so the error status reaches the note screen.
+    UiUpdate DispatchNoteObservationPersistResult(esp_err_t result, uint32_t operation_id);
+    UiUpdate DispatchNoteObservationTakeFailed();
+
+    // [persist-worker] Problem verdict commit moved to the persist worker (c3).
+    // Success advances the problem view -> kCommit when on screen; a storage
+    // failure / Take-failure only flips the status message -> kSelection.
+    UiUpdate DispatchProblemVerdictPersistResult(esp_err_t result, uint32_t operation_id);
+    UiUpdate DispatchProblemVerdictTakeFailed();
+
+    // [persist-worker] Async settings saves (c4). op_id must match the pending
+    // record armed at Confirm; success installs the value ("已保存", auto-sync
+    // additionally triggers RequestSyncNow), failure keeps the displayed value
+    // untouched and asks for a re-Confirm. Settings-area refresh either way.
+    UiUpdate DispatchAutoSyncSaveResult(esp_err_t result, uint32_t operation_id);
+    UiUpdate DispatchVolumeSaveResult(esp_err_t result, uint32_t operation_id);
+    // [deck-scope] Default-deck switch result (c5). Success installs the deck,
+    // resets the in-memory word session (the durable clears already happened
+    // inside the worker's marker transaction) and rebuilds the [词] rows;
+    // failure keeps the displayed deck and the armed pending pair for retry.
+    UiUpdate DispatchDefaultDeckChangeResult(esp_err_t result, uint32_t operation_id);
 
 private:
     UiUpdate FinishEvent(

@@ -186,11 +186,15 @@ extern "C" void app_main(void)
 
     // [volume] Restore persisted playback volume into the process-wide cache so
     // the first playback after boot uses the user's level, not the 100% default.
+    // LoadVolumePercent is a pure read (it must not touch the cache: settings
+    // diagnostics and the periodic reload re-read NVS while an async save may
+    // be pending); boot is the one place that explicitly seeds the cache.
     {
         int boot_volume = 100;
         if (wqn::LoadVolumePercent(&boot_volume) == ESP_OK) {
             ESP_LOGI(kTag, "playback volume restored: %d%%", boot_volume);
         }
+        wqn::SetPlaybackVolumeCache(boot_volume);
     }
 
     const bool contract_ok = wqn::RunContractFixtureSelfTest();

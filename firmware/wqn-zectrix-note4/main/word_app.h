@@ -75,6 +75,12 @@ struct WordSessionState {
     bool observation_effect_ready = false;
     DurableWordObservation pending_observation;
     PersistedWordSession pending_advanced_session;
+    // [persist-worker] operation_id of the in-flight persist submit. The worker
+    // result is applied only if this still matches: a scope reset
+    // (ResetWordSessionsForScopeChange resets the whole struct to 0) or a newer
+    // submit invalidates a late result, preventing it from installing a stale
+    // or empty advanced session over freshly-reset state.
+    uint32_t pending_persist_operation_id = 0;
 };
 
 struct WordOutboxState {
@@ -249,6 +255,7 @@ bool TakeWordObservationEffect(
     WordAppState* state,
     const std::string& request_id,
     const std::string& occurred_at,
+    uint32_t operation_id,
     DurableWordObservation* observation,
     PersistedWordSession* advanced_session);
 void ApplyWordObservationCommitResult(WordAppState* state, esp_err_t result);

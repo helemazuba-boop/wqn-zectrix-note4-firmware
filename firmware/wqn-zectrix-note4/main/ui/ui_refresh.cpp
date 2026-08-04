@@ -38,6 +38,12 @@ RefreshSchedule g_refresh_schedule = RefreshSchedule::kNone;
 SecondarySlot g_secondary;
 volatile wqn::UiScreen g_last_rendered_screen = wqn::UiScreen::kHome;
 wqn::runtime::SleepLease g_display_sleep_lease;
+// [epd-owner] Set by the UI task via RequestEpdIdleMaintenance, cleared by the
+// EPD task when it services the request. The EPD task samples the activity
+// generation here so it can skip a stale maintenance whose window was
+// interrupted by a fresh frame.
+std::atomic<bool> g_idle_maintenance_requested{false};
+std::atomic<uint32_t> g_idle_maintenance_activity_generation{0};
 uint32_t g_outstanding_display_intents = 0;
 std::array<wqn::display::DisplayRevision, wqn::display::kDisplayResultQueueDepth>
     g_outstanding_display_revisions{};
@@ -776,6 +782,10 @@ wqn::display::DisplaySubmission RequestEpdUiRefresh(
             return submission;
         }
         xSemaphoreGive(g_refresh_mutex);
+        // [epd-owner] An accepted intent IS EPD activity: bump the generation
+        // so an idle-maintenance request armed before this cancels itself
+        // (the cleanup full refresh must never run just before a fresh frame).
+        wqn::NoteEpdActivity();
         submission.accepted = true;
         submission.revision = revision;
         submission.waveform = merged_intent.waveform;
@@ -822,6 +832,9 @@ wqn::display::DisplaySubmission RequestEpdUiRefresh(
     // an idx vs busy reorder race with the consumer promotion critical section.
     g_consumer_index.store(producer_slot, std::memory_order_release);
     xSemaphoreGive(g_refresh_mutex);
+    // [epd-owner] See the secondary path: an accepted intent counts as EPD
+    // activity and cancels a stale idle-maintenance request.
+    wqn::NoteEpdActivity();
     xTaskNotifyGive(g_refresh_task);
     taskYIELD();
     submission.accepted = true;
@@ -848,9 +861,76 @@ void AcknowledgeDisplayResult(wqn::display::DisplayRevision revision)
 
 // ---- Consumer-side: EPD render task -----------------------------------------
 
+void RequestEpdIdleMaintenance()
+{
+    if (g_refresh_task == nullptr) {
+        return;
+    }
+    // Edge-trigger: the UI calls this on every idle poll, but the EPD task must
+    // stay parked on portMAX_DELAY until maintenance is actually due. Skip when
+    // the idle deadline has not elapsed / the rail is already cut, and only
+    // notify on the false->true transition of the request flag so an in-flight
+    // (or repeated) request never re-wakes the task. A skipped maintenance
+    // re-arms naturally on the next poll once it is genuinely due.
+    if (!wqn::IsEpdIdleMaintenanceDue()) {
+        return;
+    }
+    // Publish order: write the generation payload FIRST, then release the
+    // request flag. The consumer's acquire-exchange of the flag then
+    // guarantees it sees this generation. Doing it the other way lets an EPD
+    // task already running (from an unrelated notify) exchange the flag and
+    // read a stale generation before this store lands.
+    g_idle_maintenance_activity_generation.store(
+        wqn::GetEpdActivityGeneration(), std::memory_order_relaxed);
+    bool expected = false;
+    if (!g_idle_maintenance_requested.compare_exchange_strong(
+            expected, true, std::memory_order_release, std::memory_order_relaxed)) {
+        return;  // already armed; do not re-notify
+    }
+    xTaskNotifyGive(g_refresh_task);
+}
+
+// [epd-owner] Runs idle maintenance on the EPD task. Re-validates first: skip
+// if a frame is pending/secondary-queued or activity happened since the
+// request was armed (generation moved). PowerOffEpdAfterIdleIfNeeded owns the
+// heavy-partial cleanup full refresh + rail power-off and takes the frame
+// mutex internally. Wrapped in a scoped TWDT subscription just like the render
+// window: a wedged cleanup panics after CONFIG_ESP_TASK_WDT_TIMEOUT_S with a
+// backtrace instead of silently hanging the task (display_service feeds the
+// TWDT from its BUSY-wait / row-write loops).
+void RunIdleMaintenanceIfStillValid()
+{
+    if (wqn::GetEpdActivityGeneration() !=
+        g_idle_maintenance_activity_generation.load(std::memory_order_relaxed)) {
+        return;
+    }
+    {
+        xSemaphoreTake(g_refresh_mutex, portMAX_DELAY);
+        const bool busy_or_pending =
+            g_refresh_pending || g_refresh_busy || g_secondary.pending;
+        xSemaphoreGive(g_refresh_mutex);
+        if (busy_or_pending) {
+            return;
+        }
+    }
+#if CONFIG_ESP_TASK_WDT_EN
+    const bool wdt_subscribed =
+        esp_task_wdt_add(xTaskGetCurrentTaskHandle()) == ESP_OK;
+#endif
+    wqn::PowerOffEpdAfterIdleIfNeeded();
+#if CONFIG_ESP_TASK_WDT_EN
+    if (wdt_subscribed) {
+        esp_task_wdt_delete(xTaskGetCurrentTaskHandle());
+    }
+#endif
+}
+
 void EpdRefreshTask(void*)
 {
     ESP_LOGI(kTag, "EPD refresh task started");
+    // [epd-owner] Register as the panel owner so PrepareDisplayForSleep routes
+    // the rail power-off here instead of running on the power coordinator task.
+    wqn::RegisterEpdOwnerTask(xTaskGetCurrentTaskHandle());
 
     // [hang-fix] TWDT coverage is scoped to the render window below instead of
     // unsubscribing for the whole task lifetime: the idle notify wait may
@@ -877,12 +957,14 @@ void EpdRefreshTask(void*)
 
         while (true) {
             TickType_t wait_ticks = 0;
+            bool idle = false;
             xSemaphoreTake(g_refresh_mutex, portMAX_DELAY);
             if (!g_refresh_pending) {
                 g_refresh_schedule = RefreshSchedule::kNone;
                 MaybeReleaseDisplayLeaseLocked();
                 xSemaphoreGive(g_refresh_mutex);
                 wait_ticks = portMAX_DELAY;
+                idle = true;
             } else {
                 wait_ticks = TicksUntil(xTaskGetTickCount(), g_refresh_due_tick);
                 xSemaphoreGive(g_refresh_mutex);
@@ -890,6 +972,25 @@ void EpdRefreshTask(void*)
 
             if (wait_ticks == 0) {
                 break;
+            }
+
+            // [epd-owner] Idle maintenance runs ONLY here: fully idle (no
+            // pending frame), mutex released, on the EPD task -- the sole panel
+            // owner. It is skipped if a frame arrived since the request (the
+            // activity generation moved) or a new frame is already pending, so
+            // the 1-3 s cleanup full refresh never lands on top of fresh
+            // content. TWDT-wrapped like the render window: a wedged cleanup
+            // panics with a backtrace instead of freezing the pipeline.
+            // [epd-owner] Sleep-prep is serviced BEFORE idle maintenance: a
+            // deadline-bound power-off must not queue behind a 1-3 s cleanup
+            // full refresh. If a sleep-prep command was claimed this round,
+            // skip maintenance entirely so the two never run back-to-back.
+            if (idle) {
+                const bool sleep_claimed = wqn::ServiceDisplaySleepPrepCommand();
+                if (!sleep_claimed &&
+                    g_idle_maintenance_requested.exchange(false, std::memory_order_acquire)) {
+                    RunIdleMaintenanceIfStillValid();
+                }
             }
 
             ulTaskNotifyTake(pdTRUE, wait_ticks);
