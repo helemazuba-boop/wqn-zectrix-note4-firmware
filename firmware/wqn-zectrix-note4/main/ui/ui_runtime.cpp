@@ -594,17 +594,26 @@ UiUpdate UiRuntime::DispatchAiStreamingSnapshot(const wqn::AiStreamingStatusView
         visible_change = true;
         changed = true;
     }
+    // Scoped full-refresh request: handed back via UiUpdate.force_full so the
+    // UI task applies it to the AI frame built this tick. NOT the global
+    // RequestForceFullRefresh() one-shot -- that flag can be consumed by
+    // whichever page renders next (e.g. after the user leaves AI), spending a
+    // heavy SSD1683 full refresh on the wrong screen.
+    bool ai_force_full = false;
     if (state_.screen == wqn::UiScreen::kAi && view.force_full_render) {
         visible_change = true;
+        ai_force_full = true;
     }
     if (state_.screen == wqn::UiScreen::kAi) {
         changed = changed || state_.ai.status_detail != view.tool_label;
         state_.ai.status_detail = view.tool_label;
     }
-    return FinishEvent(
+    UiUpdate update = FinishEvent(
         AppEventKind::kAiStreamingSnapshot,
         visible_change ? RefreshSchedule::kAi : RefreshSchedule::kNone,
         changed);
+    update.force_full = ai_force_full;
+    return update;
 }
 
 UiUpdate UiRuntime::DispatchAiSessionSnapshot(const wqn::AiSessionState& snapshot)

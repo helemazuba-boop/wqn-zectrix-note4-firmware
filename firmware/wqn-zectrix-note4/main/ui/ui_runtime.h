@@ -51,6 +51,10 @@ struct UiUpdate {
     uint64_t revision = 0;
     bool state_changed = false;
     bool revision_advanced = false;
+    // One-tick request to drive the NEXT built frame as a full refresh.
+    // Scoped by the consumer (applies only to the page that produced it),
+    // unlike the global RequestForceFullRefresh() one-shot.
+    bool force_full = false;
 };
 
 // Single-task state owner. All methods must be called from DeviceUiTask; worker

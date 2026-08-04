@@ -907,15 +907,19 @@ void DeviceUiTask(void*)
             }
         }
 
-wqn::AiStreamingStatusView streaming_view{};
+        wqn::AiStreamingStatusView streaming_view{};
         bool streaming_changed = false;
 #if CONFIG_WQN_AI_ENABLE
         streaming_changed = wqn::CopyAiStreamingStatus(&streaming_view);
 #endif
+        // Scoped force-full request from AI streaming; applied below only to
+        // an AI frame (never leaks onto whichever page renders next).
+        bool ai_streaming_force_full = false;
         if (streaming_changed) {
             const device_ui_internal::UiUpdate update =
                 ui_runtime.DispatchAiStreamingSnapshot(streaming_view);
             refresh_schedule = StrongerSchedule(refresh_schedule, update.refresh);
+            ai_streaming_force_full = update.force_full;
         }
 
 #if CONFIG_WQN_AI_ENABLE
@@ -1031,7 +1035,11 @@ wqn::AiStreamingStatusView streaming_view{};
             // this tick also saw it. Now we apply it to the actual frame that
             // will be pushed to the EPD, and clear it for the next tick.
             const bool consumed_force_full = wqn::ConsumeForceFullRefresh();
-            if (consumed_force_full || display_tracking.force_next_submission) {
+            // AI streaming force-full stays scoped to the AI frame.
+            const bool scoped_force_full =
+                ai_streaming_force_full && frame.screen == wqn::UiScreen::kAi;
+            if (consumed_force_full || scoped_force_full ||
+                display_tracking.force_next_submission) {
                 frame.prefer_full_refresh = true;
             }
             const std::string frame_signature = FrameSignature(frame);
@@ -1043,7 +1051,8 @@ wqn::AiStreamingStatusView streaming_view{};
             const bool same_as_presented =
                 frame_signature == display_tracking.presented_signature;
             const bool force_submission =
-                consumed_force_full || display_tracking.force_next_submission ||
+                consumed_force_full || scoped_force_full ||
+                display_tracking.force_next_submission ||
                 refresh_schedule == RefreshSchedule::kCommit;
             const wqn::display::WaveformRequirement waveform =
                 RequestedWaveform(frame, refresh_schedule, force_submission);
