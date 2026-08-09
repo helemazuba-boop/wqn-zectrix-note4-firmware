@@ -165,17 +165,6 @@ int PomodoroStartField()
     return 4;
 }
 
-int CountReviewDueLikeProblems(const std::vector<wqn::CachedProblem>& problems)
-{
-    int count = 0;
-    for (const wqn::CachedProblem& problem : problems) {
-        if (problem.status != "mastered") {
-            ++count;
-        }
-    }
-    return count;
-}
-
 std::string ChooseHomePrimaryTimeLine(const wqn::TimeAppState& time_app)
 {
     const std::string active_timer = wqn::TimeAppPrimaryLine(time_app);

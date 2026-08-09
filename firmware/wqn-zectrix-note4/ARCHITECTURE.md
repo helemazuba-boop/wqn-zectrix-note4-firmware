@@ -54,10 +54,12 @@ bootstrap-only safety exception; after bring-up it does not run again.
 
 Storage media are deliberately tiered. NVS is reserved for bounded control
 state such as identity, Wi-Fi, schema markers, revisions, cursors and settings.
-SPIFFS stores reconstructable content, word packs and durable outboxes. Problem
-content uses WQPC v1 (compact CBOR records, 32 KiB-target DEFLATE blocks, CRC and
-atomic temp/backup/rename). PSRAM may hold the active decoded snapshot but is
-never a persistence or sync-checkpoint source.
+SPIFFS stores reconstructable content, study packs and durable outboxes. The
+problem-study-v1 path persists a manifest plus per-problem-set WQNP packs,
+builds a fixed-size catalog index in PSRAM, and reads problem bodies from their
+pack on demand. Problem sets appear as `[题]` rows in the Note list; review
+observations enter the durable problem outbox before `/v3/problems/observations`
+upload. PSRAM is never a persistence or sync-checkpoint source.
 
 ## Startup and sleep
 
@@ -106,6 +108,7 @@ Every build runs `cmake/verify_architecture.cmake`. It rejects:
 - EPD SPI/GPIO6 access outside `display_service` and safe-pin bootstrap;
 - I2S/codec/amplifier access outside `AudioService` and safe-pin bootstrap;
 - NVS writes outside `storage.cpp` and the generation-3 boot schema gate;
+- reintroduction of the removed flattened problem cache/API/UI prototype;
 - reintroduction of removed pre-M8 implementation paths.
 
 The gate is an architectural test, not a replacement for the build, contract

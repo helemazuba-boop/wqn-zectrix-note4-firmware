@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <cerrno>
+#include <cstdio>
 #include <cstdint>
 #include <cstdlib>
 #include <vector>
@@ -15,7 +16,6 @@
 #include "esp_timer.h"
 #include "nvs.h"
 #include "nvs_flash.h"
-#include "problem_cache.h"
 #include "services/sync_service.h"
 #include "runtime/sleep_coordinator.h"
 #include "runtime/storage_schema.h"
@@ -91,12 +91,6 @@ std::string GetOptionalString(cJSON* object, const char* key)
 {
     cJSON* item = cJSON_GetObjectItemCaseSensitive(object, key);
     return cJSON_IsString(item) && item->valuestring != nullptr ? item->valuestring : "";
-}
-
-bool GetOptionalBool(cJSON* object, const char* key)
-{
-    cJSON* item = cJSON_GetObjectItemCaseSensitive(object, key);
-    return cJSON_IsBool(item) && cJSON_IsTrue(item);
 }
 
 int GetOptionalInt(cJSON* object, const char* key)
@@ -412,177 +406,61 @@ esp_err_t JsonToString(cJSON* root, std::string* output)
     return ESP_OK;
 }
 
-esp_err_t ParseArrayPayload(const std::string& payload, cJSON** array)
+esp_err_t RemovePrototypeProblemFile(const char* path)
 {
-    if (array == nullptr) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    JsonDocument document(payload);
-    if (!cJSON_IsArray(document.root())) {
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    *array = cJSON_Duplicate(document.root(), true);
-    return *array != nullptr ? ESP_OK : ESP_ERR_NO_MEM;
-}
-
-esp_err_t ParseLegacyProblemsJson(
-    const std::string& payload,
-    std::vector<wqn::CachedProblem>* problems)
-{
-    if (problems == nullptr) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    problems->clear();
-    if (payload.empty()) {
+    if (std::remove(path) == 0 || errno == ENOENT) {
         return ESP_OK;
     }
-
-    cJSON* array = nullptr;
-    ESP_RETURN_ON_ERROR(ParseArrayPayload(payload, &array), kTag, "parse legacy problem cache");
-    JsonDocument document(array);
-    const int count = cJSON_GetArraySize(document.root());
-    if (count < 0) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    problems->reserve(static_cast<size_t>(count));
-    for (int i = 0; i < count; ++i) {
-        cJSON* item = cJSON_GetArrayItem(document.root(), i);
-        if (!cJSON_IsObject(item)) {
-            return ESP_ERR_INVALID_STATE;
-        }
-        wqn::CachedProblem problem;
-        problem.id = GetOptionalString(item, "id");
-        problem.title = GetOptionalString(item, "title");
-        problem.type = GetOptionalString(item, "type");
-        problem.status = GetOptionalString(item, "status");
-        problem.content_text = GetOptionalString(item, "content_text");
-        problem.solution_text = GetOptionalString(item, "solution_text");
-        problem.asset_count = GetOptionalInt(item, "asset_count");
-        problem.solution_asset_count = GetOptionalInt(item, "solution_asset_count");
-        problem.updated_at = GetOptionalString(item, "updated_at");
-        if (problem.id.empty()) {
-            return ESP_ERR_INVALID_STATE;
-        }
-        problems->push_back(std::move(problem));
-    }
-    return ESP_OK;
+    ESP_LOGW(kTag, "remove obsolete problem file failed: path=%s errno=%d", path, errno);
+    return ESP_FAIL;
 }
 
-struct ProblemCacheWriteContext {
-    const std::vector<wqn::CachedProblem>* problems = nullptr;
-};
-
-esp_err_t SaveProblemCacheTransaction(void* opaque)
+esp_err_t CleanupPrototypeProblemStorageTransaction(void*)
 {
-    const auto* context = static_cast<const ProblemCacheWriteContext*>(opaque);
-    return context == nullptr || context->problems == nullptr
-        ? ESP_ERR_INVALID_ARG
-        : wqn::problem_cache::Save(*context->problems);
-}
+    constexpr const char* kObsoleteFiles[] = {
+        "/storage/problems.v1",
+        "/storage/problems.tmp",
+        "/storage/problems.bak",
+    };
+    constexpr const char* kObsoleteKeys[] = {
+        kProblemsKey,
+        kPendingReviewsKey,
+    };
 
-esp_err_t ClearProblemCacheTransaction(void*)
-{
-    esp_err_t result = wqn::problem_cache::Clear();
-    const esp_err_t legacy_result = ClearNvsKeyRaw(kProblemsKey);
+    esp_err_t first_error = ESP_OK;
+    for (const char* path : kObsoleteFiles) {
+        const esp_err_t result = RemovePrototypeProblemFile(path);
+        if (first_error == ESP_OK && result != ESP_OK) {
+            first_error = result;
+        }
+    }
+    NvsHandle nvs;
+    esp_err_t result = nvs_open(WQN_NVS_NAMESPACE, NVS_READWRITE, &nvs.handle);
+    if (result != ESP_OK && result != ESP_ERR_NVS_NOT_FOUND) {
+        if (first_error == ESP_OK) {
+            first_error = result;
+        }
+        ESP_LOGW(kTag, "open obsolete problem NVS cleanup failed: %s",
+                 esp_err_to_name(result));
+        return first_error;
+    }
     if (result == ESP_OK) {
-        result = legacy_result;
-    }
-    return result;
-}
-
-esp_err_t ClearProblemFilesTransaction(void*)
-{
-    return wqn::problem_cache::Clear();
-}
-
-esp_err_t MigrateLegacyProblemCache()
-{
-    std::vector<wqn::CachedProblem> existing;
-    const esp_err_t existing_result = wqn::problem_cache::Load(&existing);
-    if (existing_result == ESP_OK) {
-        const esp_err_t clear_result = ClearNvsKey(kProblemsKey);
-        if (clear_result == ESP_OK) {
-            ESP_LOGI(kTag, "legacy NVS problem cache key absent or removed");
+        for (const char* key : kObsoleteKeys) {
+            result = nvs_erase_key(nvs.handle, key);
+            if (result != ESP_OK && result != ESP_ERR_NVS_NOT_FOUND) {
+                if (first_error == ESP_OK) {
+                    first_error = result;
+                }
+                ESP_LOGW(kTag, "erase obsolete problem key failed: key=%s error=%s",
+                         key, esp_err_to_name(result));
+            }
         }
-        return clear_result;
+        result = nvs_commit(nvs.handle);
+        if (first_error == ESP_OK && result != ESP_OK) {
+            first_error = result;
+        }
     }
-    if (existing_result != ESP_ERR_NOT_FOUND) {
-        ESP_LOGW(
-            kTag,
-            "discarding invalid regenerable WQPC before legacy migration: %s",
-            esp_err_to_name(existing_result));
-        ESP_RETURN_ON_ERROR(
-            wqn::services::ExecuteStorageTransaction(
-                ClearProblemFilesTransaction,
-                nullptr),
-            kTag,
-            "clear invalid WQPC files");
-    }
-
-    std::string payload;
-    ESP_RETURN_ON_ERROR(
-        LoadBlobFromNvs(kProblemsKey, &payload),
-        kTag,
-        "load legacy NVS problem cache");
-    if (payload.empty()) {
-        return ClearNvsKey(kProblemsKey);
-    }
-
-    std::vector<wqn::CachedProblem> problems;
-    const esp_err_t parse_result = ParseLegacyProblemsJson(payload, &problems);
-    if (parse_result != ESP_OK) {
-        ESP_LOGW(
-            kTag,
-            "dropping unreadable regenerable NVS problem cache: bytes=%u error=%s",
-            static_cast<unsigned>(payload.size()),
-            esp_err_to_name(parse_result));
-        return ClearNvsKey(kProblemsKey);
-    }
-
-    ProblemCacheWriteContext context = {&problems};
-    const esp_err_t save_result =
-        wqn::services::ExecuteStorageTransaction(SaveProblemCacheTransaction, &context);
-    if (save_result != ESP_OK) {
-        // The cache is cloud-reconstructable. Reclaim scarce NVS even if the
-        // SPIFFS migration cannot preserve this old snapshot; the next sync
-        // will rebuild it through the same atomic file path.
-        ESP_LOGW(
-            kTag,
-            "legacy problem cache migration failed; dropping regenerable cache: bytes=%u error=%s",
-            static_cast<unsigned>(payload.size()),
-            esp_err_to_name(save_result));
-        return ClearNvsKey(kProblemsKey);
-    }
-
-    ESP_RETURN_ON_ERROR(
-        ClearNvsKey(kProblemsKey),
-        kTag,
-        "remove migrated NVS problem cache");
-    ESP_LOGI(
-        kTag,
-        "legacy problem cache migrated: records=%u nvs_bytes_reclaimed=%u",
-        static_cast<unsigned>(problems.size()),
-        static_cast<unsigned>(payload.size()));
-    return ESP_OK;
-}
-
-esp_err_t MigrateLegacyProblemCacheTransaction(void*)
-{
-    return MigrateLegacyProblemCache();
-}
-
-struct ProblemCacheReadContext {
-    std::vector<wqn::CachedProblem>* problems = nullptr;
-};
-
-esp_err_t LoadProblemCacheTransaction(void* opaque)
-{
-    auto* context = static_cast<ProblemCacheReadContext*>(opaque);
-    return context == nullptr || context->problems == nullptr
-        ? ESP_ERR_INVALID_ARG
-        : wqn::problem_cache::Load(context->problems);
+    return first_error;
 }
 
 }  // namespace
@@ -627,18 +505,18 @@ esp_err_t InitStorage()
     // and business services must not run against that state.
     ESP_RETURN_ON_ERROR(RecoverDefaultDeckScopeChange(), kTag,
                         "recover deck scope change");
-    // Legacy JSON parsing, WQPC inflate/deflate and file validation are all
-    // deliberately executed on StorageService. Besides preserving single
-    // ownership, this prevents their deeper bounded stack from consuming the
-    // 8 KiB IDF main task during boot.
-    const esp_err_t migration_result = services::ExecuteStorageTransaction(
-        MigrateLegacyProblemCacheTransaction,
+    // The removed prototype used three compressed files and two NVS blobs. Reclaim
+    // those exact artifacts on StorageService so cleanup is serialized with
+    // all current pack/outbox writes. It is intentionally idempotent and does
+    // not touch problem-study-v1 pp_* / po_* files.
+    const esp_err_t cleanup_result = services::ExecuteStorageTransaction(
+        CleanupPrototypeProblemStorageTransaction,
         nullptr);
-    if (migration_result != ESP_OK) {
+    if (cleanup_result != ESP_OK) {
         ESP_LOGW(
             kTag,
-            "legacy problem cache cleanup deferred: %s",
-            esp_err_to_name(migration_result));
+            "obsolete problem storage cleanup deferred: %s",
+            esp_err_to_name(cleanup_result));
     }
     return ESP_OK;
 }
@@ -750,135 +628,6 @@ esp_err_t SaveDeviceControlState(const DeviceControlState& state)
     return services::ExecuteStorageTransaction(
         SaveDeviceControlStateTransaction,
         const_cast<DeviceControlState*>(&state));
-}
-
-esp_err_t SaveProblems(const std::vector<CachedProblem>& problems)
-{
-    StorageWriteGuard write("save-problems", __FILE__, __LINE__);
-    if (!write) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    ProblemCacheWriteContext context = {&problems};
-    return services::ExecuteStorageTransaction(SaveProblemCacheTransaction, &context);
-}
-
-esp_err_t LoadProblems(std::vector<CachedProblem>* problems)
-{
-    if (problems == nullptr) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    ProblemCacheReadContext context = {problems};
-    const esp_err_t result = services::ExecuteStorageTransaction(
-        LoadProblemCacheTransaction,
-        &context);
-    if (result == ESP_ERR_NOT_FOUND) {
-        problems->clear();
-        return ESP_OK;
-    }
-    return result;
-}
-
-esp_err_t ClearProblems()
-{
-    StorageWriteGuard write("clear-problems", __FILE__, __LINE__);
-    if (!write) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    return services::ExecuteStorageTransaction(ClearProblemCacheTransaction, nullptr);
-}
-
-esp_err_t EnqueueReviewResult(const PendingReviewResult& result)
-{
-    StorageWriteGuard write("enqueue-review", __FILE__, __LINE__);
-    if (!write) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    if (result.problem_id.empty() || result.selected_status.empty()) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    std::vector<PendingReviewResult> results;
-    ESP_RETURN_ON_ERROR(LoadPendingReviewResults(&results), kTag, "load pending reviews");
-    bool replaced = false;
-    for (PendingReviewResult& pending : results) {
-        if (pending.problem_id == result.problem_id) {
-            pending = result;
-            replaced = true;
-            break;
-        }
-    }
-    if (!replaced) {
-        results.push_back(result);
-    }
-
-    JsonDocument document(cJSON_CreateArray());
-    if (document.root() == nullptr) {
-        return ESP_ERR_NO_MEM;
-    }
-
-    for (const PendingReviewResult& pending : results) {
-        cJSON* item = cJSON_CreateObject();
-        if (item == nullptr ||
-            !cJSON_AddStringToObject(item, "problem_id", pending.problem_id.c_str()) ||
-            !cJSON_AddStringToObject(item, "selected_status", pending.selected_status.c_str()) ||
-            cJSON_AddBoolToObject(item, "is_correct", pending.is_correct) == nullptr ||
-            !cJSON_AddStringToObject(item, "submitted_answer", pending.submitted_answer.c_str()) ||
-            !cJSON_AddStringToObject(item, "created_at", pending.created_at.c_str())) {
-            cJSON_Delete(item);
-            return ESP_ERR_NO_MEM;
-        }
-        cJSON_AddItemToArray(document.root(), item);
-    }
-
-    std::string payload;
-    ESP_RETURN_ON_ERROR(JsonToString(document.root(), &payload), kTag, "serialize pending reviews");
-    return SaveBlobToNvs(kPendingReviewsKey, payload);
-}
-
-esp_err_t LoadPendingReviewResults(std::vector<PendingReviewResult>* results)
-{
-    if (results == nullptr) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    std::string payload;
-    ESP_RETURN_ON_ERROR(LoadBlobFromNvs(kPendingReviewsKey, &payload), kTag, "load pending reviews");
-    results->clear();
-    if (payload.empty()) {
-        return ESP_OK;
-    }
-
-    cJSON* array = nullptr;
-    ESP_RETURN_ON_ERROR(ParseArrayPayload(payload, &array), kTag, "parse pending reviews");
-    JsonDocument document(array);
-
-    const int count = cJSON_GetArraySize(document.root());
-    results->reserve(count);
-    for (int i = 0; i < count; ++i) {
-        cJSON* item = cJSON_GetArrayItem(document.root(), i);
-        if (!cJSON_IsObject(item)) {
-            continue;
-        }
-
-        PendingReviewResult pending;
-        pending.problem_id = GetOptionalString(item, "problem_id");
-        pending.selected_status = GetOptionalString(item, "selected_status");
-        pending.is_correct = GetOptionalBool(item, "is_correct");
-        pending.submitted_answer = GetOptionalString(item, "submitted_answer");
-        pending.created_at = GetOptionalString(item, "created_at");
-        results->push_back(pending);
-    }
-    return ESP_OK;
-}
-
-esp_err_t ClearPendingReviewResults()
-{
-    StorageWriteGuard write("clear-pending-reviews", __FILE__, __LINE__);
-    if (!write) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    return ClearNvsKey(kPendingReviewsKey);
 }
 
 esp_err_t SaveAiSessionForDay(const CachedAiSession& session)

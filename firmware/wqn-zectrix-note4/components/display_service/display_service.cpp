@@ -84,7 +84,7 @@ constexpr float kHeavyPartialDiffRatio = 0.02f;
 constexpr uint32_t kMaxHeavyPartialsBeforeFull = 10;
 // Run the deferred cleanup full refresh at idle once at least this many heavy
 // partials accumulated since the last full.
-constexpr uint32_t kIdleCleanupHeavyPartials = 2;
+constexpr uint32_t kIdleCleanupHeavyPartials = 6;
 constexpr int kTextGlyphWidth = 5;
 constexpr int kTextGlyphHeight = 7;
 constexpr int kTextCellWidth = 6;
@@ -506,15 +506,35 @@ void FreeFramebuffer(uint8_t*& fb)
 
 void PowerOnEpd()
 {
-    // [epd-leak-fix] Release hold on SPI pins before driving the rail up.
-    // PowerOffEpd() holds kEpd{Sck,Mosi,Cs,Dc,Reset} low to block diode
-    // backflow into the de-powered EPD module. That hold survives deep sleep,
-    // so on the next refresh we must explicitly release it or the panel
-    // remains hardware-reset and SPI never reaches the controller.
-    constexpr gpio_num_t kSpiPins[] = {kEpdSck, kEpdMosi, kEpdCs, kEpdDc, kEpdReset};
-    for (gpio_num_t pin : kSpiPins) {
+    // [epd-leak-fix] Release hold on EPD pins before driving the rail up.
+    constexpr gpio_num_t kPinsToRelease[] = {kEpdSck, kEpdMosi, kEpdCs, kEpdDc, kEpdReset, kEpdBusy};
+    for (gpio_num_t pin : kPinsToRelease) {
         gpio_hold_dis(pin);
     }
+
+    // Restore GPIO configuration for EPD pins (excluding pull-ups/modes of kEpdPower)
+    gpio_config_t outputs = {};
+    outputs.intr_type = GPIO_INTR_DISABLE;
+    outputs.mode = GPIO_MODE_OUTPUT;
+    outputs.pin_bit_mask = (1ULL << kEpdReset) | (1ULL << kEpdDc) | (1ULL << kEpdCs);
+    outputs.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    outputs.pull_up_en = GPIO_PULLUP_ENABLE;
+    gpio_config(&outputs);
+
+    gpio_config_t busy = {};
+    busy.intr_type = GPIO_INTR_DISABLE;
+    busy.mode = GPIO_MODE_INPUT;
+    busy.pin_bit_mask = (1ULL << kEpdBusy);
+    busy.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    busy.pull_up_en = GPIO_PULLUP_ENABLE;
+    gpio_config(&busy);
+
+    SetCs(true);
+    SetDc(true);
+    SetReset(true);
+
+    // Re-initialize SPI bus configurations to restore SPI pins
+    InitSpiBus(false);
 
     gpio_hold_dis(kEpdPower);
     gpio_set_level(kEpdPower, 1);
@@ -1680,15 +1700,33 @@ static void PowerOffEpd()
 
     DropEpdHotState(true, false);
 
-    // [epd-leak-fix] Spec book §5.3 step 3: reconfigure SPI pins to low-output
-    // or high-impedance after the rail drops, to prevent diode backflow into
-    // the de-powered EPD module. gpio_hold_en keeps them there through deep sleep.
-    constexpr gpio_num_t kSpiPins[] = {kEpdSck, kEpdMosi, kEpdCs, kEpdDc, kEpdReset};
-    for (gpio_num_t pin : kSpiPins) {
+    // [epd-leak-fix] Reconfigure SPI pins to GPIO mode and drive them low to
+    // prevent diode backflow into the de-powered EPD module.
+    gpio_config_t out_cfg = {};
+    out_cfg.intr_type = GPIO_INTR_DISABLE;
+    out_cfg.mode = GPIO_MODE_OUTPUT;
+    out_cfg.pin_bit_mask = (1ULL << kEpdSck) | (1ULL << kEpdMosi) | (1ULL << kEpdCs) | (1ULL << kEpdDc) | (1ULL << kEpdReset);
+    out_cfg.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    out_cfg.pull_up_en = GPIO_PULLUP_DISABLE;
+    gpio_config(&out_cfg);
+
+    constexpr gpio_num_t kPinsToHoldLow[] = {kEpdSck, kEpdMosi, kEpdCs, kEpdDc, kEpdReset};
+    for (gpio_num_t pin : kPinsToHoldLow) {
         gpio_hold_dis(pin);
         gpio_set_level(pin, 0);
         gpio_hold_en(pin);
     }
+
+    // [epd-leak-fix] Reconfigure BUSY pin to input with pull-up disabled to prevent leakage.
+    gpio_hold_dis(kEpdBusy);
+    gpio_config_t busy_cfg = {};
+    busy_cfg.intr_type = GPIO_INTR_DISABLE;
+    busy_cfg.mode = GPIO_MODE_INPUT;
+    busy_cfg.pin_bit_mask = (1ULL << kEpdBusy);
+    busy_cfg.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    busy_cfg.pull_up_en = GPIO_PULLUP_DISABLE;
+    gpio_config(&busy_cfg);
+    gpio_hold_en(kEpdBusy);
 }
 
 static esp_err_t TryPowerOffEpd(uint32_t timeout_ms)

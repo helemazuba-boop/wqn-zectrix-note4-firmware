@@ -30,18 +30,20 @@ on the server.
 - Board bring-up and diagnostics: safe GPIO initialization, chip/flash/PSRAM
   diagnostics, reset reason, WiFi MAC, battery diagnostics, and serial logs.
 - WQN cloud connection: optional WiFi station mode, pairing token storage,
-  masked token logging, due problem sync, problem index refresh, review upload
-  retry, Todo sync, and AI request upload.
-- E-paper UI: local device pages for home/time, countdown, pomodoro, cached
-  problems, Todo, word/notebook-facing study flows, and AI conversation status.
+  masked token logging, problem-study manifest/pack sync, durable observation
+  upload, Todo sync, and AI request upload.
+- E-paper UI: local device pages for home/time, countdown, pomodoro, Todo,
+  word/notebook-facing study flows, Note-integrated problem sets, and AI
+  conversation status.
 - E-paper refresh control: full refresh and local partial-window refresh support
   with cooldown and idle power-off controls.
 - AI audio path: long-press confirm to record, release to upload 16 kHz mono PCM
   to the WQN server, then display transcript, reply text, and action summaries.
 - Local storage: NVS holds only small control state (pairing/WiFi credentials,
-  revisions, cursors and settings). Durable content lives on SPIFFS; the problem
-  cache uses the versioned, block-compressed WQPC format with atomic temp/rename
-  commits, while PSRAM is used only for volatile decode/UI snapshots.
+  revisions, cursors and settings). Durable content lives on SPIFFS. The current
+  problem-study-v1 path stores its manifest and per-problem-set WQNP packs there,
+  builds a fixed-size index in PSRAM, reads problem bodies on demand, and records
+  review observations in a durable outbox until upload succeeds.
 
 ## Security Boundary
 

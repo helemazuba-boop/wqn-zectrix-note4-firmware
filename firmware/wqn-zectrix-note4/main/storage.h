@@ -18,26 +18,6 @@ struct StorageCapacitySnapshot {
     size_t nvs_total_entries = 0;
 };
 
-struct CachedProblem {
-    std::string id;
-    std::string title;
-    std::string type;
-    std::string status;
-    std::string content_text;
-    std::string solution_text;
-    int asset_count = 0;
-    int solution_asset_count = 0;
-    std::string updated_at;
-};
-
-struct PendingReviewResult {
-    std::string problem_id;
-    std::string selected_status;
-    bool is_correct = false;
-    std::string submitted_answer;
-    std::string created_at;
-};
-
 struct CachedAiSession {
     std::string day;
     std::string conversation_id;
@@ -62,14 +42,6 @@ bool IsValidAccessToken(const std::string& token);
 std::string MaskTokenForLog(const std::string& token);
 esp_err_t LoadDeviceControlState(DeviceControlState* state);
 esp_err_t SaveDeviceControlState(const DeviceControlState& state);
-
-esp_err_t SaveProblems(const std::vector<CachedProblem>& problems);
-esp_err_t LoadProblems(std::vector<CachedProblem>* problems);
-esp_err_t ClearProblems();
-
-esp_err_t EnqueueReviewResult(const PendingReviewResult& result);
-esp_err_t LoadPendingReviewResults(std::vector<PendingReviewResult>* results);
-esp_err_t ClearPendingReviewResults();
 
 esp_err_t SaveAiSessionForDay(const CachedAiSession& session);
 esp_err_t LoadAiSessionForDay(const std::string& day, CachedAiSession* session);

@@ -16,21 +16,18 @@
 
 namespace wqn {
 
-enum class UiScreen {
-    kAi,
-    kTodo,
-    kSettings,
-    kHome,
-    kTime,
-    kWord,
-    kNote,
-    kLibrary,
-    kProblem,
-    kSolution,
-    kReviewQueue,
-    kReviewScore,
-    kReviewQueued,
-    kProvisioning,
+enum class UiScreen : uint8_t {
+    // Values are persisted in RTC slow memory across deep sleep. Keep retained
+    // IDs stable so firmware updates can reject removed prototype screens 7-12
+    // instead of reinterpreting them as another page.
+    kAi = 0,
+    kTodo = 1,
+    kSettings = 2,
+    kHome = 3,
+    kTime = 4,
+    kWord = 5,
+    kNote = 6,
+    kProvisioning = 13,
 };
 
 enum class UiInput {
@@ -49,12 +46,6 @@ enum class UiTextStyle {
     kSelected,
     kWarning,
     kWrappedBody,
-};
-
-enum class ReviewChoice {
-    kWrong,
-    kNeedsReview,
-    kMastered,
 };
 
 enum class AiSessionStatus {
@@ -271,7 +262,6 @@ struct UiRuntimeStatus {
     bool wifi_connected = false;
     bool paired = false;
     bool syncing = false;
-    int pending_reviews = 0;
     std::string token_mask;
     std::string claim_code;
     std::string last_sync_status;
@@ -308,9 +298,6 @@ struct AppState {
     StatusBarEditState status_edit;
     UiGestureState gestures;
     size_t selected_home_task = 0;
-    size_t selected_problem = 0;
-    ReviewChoice selected_review = ReviewChoice::kNeedsReview;
-    std::string last_review_message;
     UiRuntimeStatus status;
     AiSessionState ai;
     TimeAppState time_app;
@@ -321,7 +308,6 @@ struct AppState {
     TodoUiState todo;
     SettingsAppState settings;
     HomeSummary home;
-    std::vector<CachedProblem> problems;
 };
 
 using UiState = AppState;
@@ -359,7 +345,5 @@ bool TickAiSession(UiState* state, int64_t now_ms);
 UiFrame RenderUiFrame(const UiState& state);
 void RequestForceFullRefresh();  // one-shot: next RenderUiFrame forces full refresh
 bool ConsumeForceFullRefresh();  // returns true if flag was set, then clears it
-const char* ReviewChoiceLabel(ReviewChoice choice);
-const char* ReviewChoiceStatus(ReviewChoice choice);
 
 }  // namespace wqn

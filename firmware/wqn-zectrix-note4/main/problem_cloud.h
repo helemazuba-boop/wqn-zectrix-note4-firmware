@@ -21,7 +21,7 @@ struct ProblemPackSyncResult {
 
 // Runs one problem-pack content sync: relists the problem-study manifest from
 // offset 0, downloads changed/new packs (sha-driven), merges + durably
-// persists the manifest, and rebuilds the problem index when content changed.
+// persists the manifest, and rebuilds the problem catalog when content changed.
 // Content only; self-assessment observations flow through the outbox path.
 //
 // The caller supplies a validated bearer token and is expected to hold the

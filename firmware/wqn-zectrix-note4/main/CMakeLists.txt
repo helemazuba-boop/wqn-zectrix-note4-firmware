@@ -14,7 +14,6 @@ idf_component_register(
         "power_manager.cpp"
         "power/wake_controller.cpp"
         "pcf8563.cpp"
-        "problem_cache.cpp"
         "provision_manager.cpp"
         "runtime/storage_schema.cpp"
         "services/connectivity_service.cpp"
@@ -106,7 +105,6 @@ if(CONFIG_WQN_WIFI_STA_ENABLE AND NOT CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE)
 endif()
 
 set(WQN_API_BASE "" CACHE STRING "Override the WQN ESP32 API base URL")
-set(WQN_DEBUG_PROBLEM_IDS "" CACHE STRING "Local-only comma-separated ESP32 debug problem IDs")
 
 target_compile_definitions(
     ${COMPONENT_LIB}
@@ -120,13 +118,5 @@ if(WQN_API_BASE)
         ${COMPONENT_LIB}
         PRIVATE
             WQN_API_BASE=\"${WQN_API_BASE}\"
-    )
-endif()
-
-if(WQN_DEBUG_PROBLEM_IDS)
-    target_compile_definitions(
-        ${COMPONENT_LIB}
-        PRIVATE
-            WQN_DEBUG_PROBLEM_IDS=\"${WQN_DEBUG_PROBLEM_IDS}\"
     )
 endif()

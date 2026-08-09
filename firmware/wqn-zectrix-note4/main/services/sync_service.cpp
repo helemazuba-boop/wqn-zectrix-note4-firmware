@@ -67,7 +67,6 @@ constexpr uint32_t kClaimPollFloorMs = 10000;
 constexpr uint32_t kClaimPollJitterMaxMs = 2000;
 constexpr uint32_t kClaimRetryBaseMs = 15000;
 constexpr uint32_t kClaimRetryMaxMs = 5 * 60 * 1000;
-constexpr uint32_t kStorageCapacityRetryMs = 5 * 60 * 1000;
 constexpr uint8_t kClaimRetryMaxShift = 4;
 constexpr uint32_t kWordOutboxRetryBaseMs = 30000;
 constexpr uint32_t kWordOutboxRetryMaxMs = 5 * 60 * 1000;
@@ -316,28 +315,6 @@ TickType_t ProblemOutboxRetryWaitDelay()
     return pdMS_TO_TICKS(
         static_cast<uint32_t>(
             std::min<int64_t>(remaining_ms, kWordOutboxRetryMaxMs)));
-}
-
-bool IsStorageCapacityError(esp_err_t error)
-{
-    return error == ESP_ERR_NO_MEM || error == ESP_ERR_INVALID_SIZE ||
-        error == ESP_ERR_NVS_NOT_ENOUGH_SPACE;
-}
-
-void ApplyStorageCapacityBackoff(esp_err_t error, const char* stage)
-{
-    if (!IsStorageCapacityError(error)) {
-        return;
-    }
-    g_control_retry_after_ms = std::max(
-        g_control_retry_after_ms,
-        kStorageCapacityRetryMs);
-    ESP_LOGW(
-        kTag,
-        "sync storage-full: stage=%s error=%s retry_after_ms=%lu",
-        stage,
-        esp_err_to_name(error),
-        static_cast<unsigned long>(g_control_retry_after_ms));
 }
 
 uint32_t AddClaimJitter(uint32_t base_ms)
@@ -685,212 +662,6 @@ bool LoadUsableToken(std::string* token)
     return true;
 }
 
-std::vector<wqn::CachedProblem> ToCachedProblems(const std::vector<wqn::WqnProblem>& problems)
-{
-    std::vector<wqn::CachedProblem> cached;
-    cached.reserve(problems.size());
-    for (const wqn::WqnProblem& problem : problems) {
-        wqn::CachedProblem item;
-        item.id = problem.id;
-        item.title = problem.title;
-        item.type = problem.problem_type;
-        item.status = problem.status;
-        item.content_text = problem.content_text;
-        item.solution_text = problem.solution_text;
-        item.asset_count = problem.asset_count;
-        item.solution_asset_count = problem.solution_asset_count;
-        item.updated_at = problem.updated_at;
-        cached.push_back(std::move(item));
-    }
-    return cached;
-}
-
-bool UpsertProblem(std::vector<wqn::CachedProblem>* cached, wqn::CachedProblem problem)
-{
-    if (cached == nullptr || problem.id.empty()) {
-        return false;
-    }
-
-    for (wqn::CachedProblem& item : *cached) {
-        if (item.id == problem.id) {
-            bool changed = false;
-            if (!problem.title.empty() && item.title != problem.title) {
-                item.title = std::move(problem.title);
-                changed = true;
-            }
-            if (!problem.type.empty() && item.type != problem.type) {
-                item.type = std::move(problem.type);
-                changed = true;
-            }
-            if (!problem.status.empty() && item.status != problem.status) {
-                item.status = std::move(problem.status);
-                changed = true;
-            }
-            if (!problem.content_text.empty() && item.content_text != problem.content_text) {
-                item.content_text = std::move(problem.content_text);
-                changed = true;
-            }
-            if (!problem.solution_text.empty() && item.solution_text != problem.solution_text) {
-                item.solution_text = std::move(problem.solution_text);
-                changed = true;
-            }
-            if (item.asset_count != problem.asset_count) {
-                item.asset_count = problem.asset_count;
-                changed = true;
-            }
-            if (item.solution_asset_count != problem.solution_asset_count) {
-                item.solution_asset_count = problem.solution_asset_count;
-                changed = true;
-            }
-            if (!problem.updated_at.empty() && item.updated_at != problem.updated_at) {
-                item.updated_at = std::move(problem.updated_at);
-                changed = true;
-            }
-            return changed;
-        }
-    }
-    cached->push_back(std::move(problem));
-    return true;
-}
-
-esp_err_t MergeProblemCache(const std::vector<wqn::WqnProblem>& fresh, const char* source)
-{
-    if (fresh.empty()) {
-        return ESP_OK;
-    }
-
-    std::vector<wqn::CachedProblem> cached;
-    const esp_err_t load_result = wqn::LoadProblems(&cached);
-    if (load_result != ESP_OK) {
-        ESP_LOGW(kTag, "dropping unreadable problem cache before merge: %s", esp_err_to_name(load_result));
-        cached.clear();
-    }
-
-    std::vector<wqn::CachedProblem> incoming = ToCachedProblems(fresh);
-    bool changed = false;
-    for (wqn::CachedProblem& problem : incoming) {
-        changed = UpsertProblem(&cached, std::move(problem)) || changed;
-    }
-    if (!changed) {
-        ESP_LOGI(
-            kTag,
-            "%s cache unchanged: fresh=%u total_cached=%u; write skipped",
-            source,
-            static_cast<unsigned>(fresh.size()),
-            static_cast<unsigned>(cached.size()));
-        return ESP_OK;
-    }
-
-    const esp_err_t save_result = wqn::SaveProblems(cached);
-    if (save_result != ESP_OK) {
-        ESP_LOGW(kTag, "save problem cache failed: %s", esp_err_to_name(save_result));
-        return save_result;
-    }
-
-    ESP_LOGI(
-        kTag,
-        "%s cached: fresh=%u total_cached=%u",
-        source,
-        static_cast<unsigned>(fresh.size()),
-        static_cast<unsigned>(cached.size()));
-    return ESP_OK;
-}
-
-esp_err_t UploadPendingReviewsIfAny(const std::string& token)
-{
-    std::vector<wqn::PendingReviewResult> pending;
-    esp_err_t result = wqn::LoadPendingReviewResults(&pending);
-    if (result != ESP_OK) {
-        return result;
-    }
-    if (pending.empty()) {
-        ESP_LOGI(kTag, "no pending review uploads");
-        return ESP_OK;
-    }
-
-    std::vector<wqn::WqnReviewResult> uploads;
-    uploads.reserve(pending.size());
-    for (const wqn::PendingReviewResult& item : pending) {
-        if (item.problem_id.empty() || item.selected_status.empty()) {
-            ESP_LOGW(kTag, "pending review queue contains an invalid item; keeping queue");
-            return ESP_ERR_INVALID_STATE;
-        }
-
-        wqn::WqnReviewResult upload;
-        upload.problem_id = item.problem_id;
-        upload.selected_status = item.selected_status;
-        upload.reviewed_at = item.created_at;
-        uploads.push_back(std::move(upload));
-    }
-
-    result = wqn::UploadReviewComplete(token, uploads);
-    if (result != ESP_OK) {
-        ESP_LOGW(kTag, "pending review upload kept for retry: %s", esp_err_to_name(result));
-        return result;
-    }
-
-    result = wqn::ClearPendingReviewResults();
-    if (result != ESP_OK) {
-        ESP_LOGW(kTag, "clear uploaded review queue failed: %s", esp_err_to_name(result));
-        return result;
-    }
-
-    ESP_LOGI(kTag, "pending review uploads complete: count=%u", static_cast<unsigned>(uploads.size()));
-    return ESP_OK;
-}
-
-#if !CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
-esp_err_t SyncDueProblemsAndCache(const std::string& token)
-{
-    std::vector<std::string> due_problem_ids;
-    int total = 0;
-    esp_err_t result = wqn::SyncDueProblemIds(token, &due_problem_ids, &total);
-    if (result != ESP_OK) {
-        return result;
-    }
-
-    ESP_LOGI(kTag, "due problem sync: returned=%u total=%d", static_cast<unsigned>(due_problem_ids.size()), total);
-    if (due_problem_ids.empty()) {
-        return ESP_OK;
-    }
-
-    std::vector<wqn::WqnProblem> problems;
-    result = wqn::FetchProblems(token, due_problem_ids, &problems);
-    if (result != ESP_OK) {
-        return result;
-    }
-
-    for (const wqn::WqnProblem& problem : problems) {
-        ESP_LOGI(kTag, "due problem ready: id=%s title=%s", problem.id.c_str(), problem.title.c_str());
-    }
-    return MergeProblemCache(problems, "due problems");
-}
-#endif
-
-esp_err_t RefreshProblemIndexIfAvailable(const std::string& token)
-{
-    wqn::WqnProblemIndexRequest request;
-    request.limit = WQN_SYNC_LIMIT;
-
-    wqn::WqnProblemIndexPage page;
-    const esp_err_t result = wqn::FetchProblemIndex(token, request, &page);
-    if (result == ESP_ERR_NOT_SUPPORTED) {
-        ESP_LOGI(kTag, "problem index endpoint is not available yet; will retry next sync round");
-        return ESP_OK;
-    }
-    if (result != ESP_OK) {
-        return result;
-    }
-
-    ESP_LOGI(
-        kTag,
-        "problem index fetched: count=%u total=%d has_more=%s",
-        static_cast<unsigned>(page.problems.size()),
-        page.total,
-        page.has_more ? "true" : "false");
-    return MergeProblemCache(page.problems, "problem index");
-}
-
 #if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
 esp_err_t BootstrapControlV3(const std::string& token)
 {
@@ -933,7 +704,7 @@ esp_err_t BootstrapControlV3(const std::string& token)
     return ESP_OK;
 }
 
-esp_err_t SyncDueProblemsAndCacheV3(const std::string& token)
+esp_err_t SyncControlPlaneV3(const std::string& token)
 {
     if (g_sync_request_id.empty()) {
         g_sync_request_id = RandomControlId("req_sync_");
@@ -976,22 +747,6 @@ esp_err_t SyncDueProblemsAndCacheV3(const std::string& token)
         sync.todo_count,
         sync.word_due_count,
         static_cast<unsigned long long>(sync.sync_cursor));
-    if (!sync.due_problem_ids.empty()) {
-        std::vector<wqn::WqnProblem> problems;
-        ESP_RETURN_ON_ERROR(
-            wqn::FetchProblems(token, sync.due_problem_ids, &problems),
-            kTag,
-            "fetch v3 manifest problems");
-        const esp_err_t cache_result = MergeProblemCache(problems, "v3 due problems");
-        if (cache_result != ESP_OK) {
-            ApplyStorageCapacityBackoff(cache_result, "problem-cache");
-            ESP_RETURN_ON_ERROR(
-                cache_result,
-                kTag,
-                "commit v3 manifest problems");
-        }
-    }
-
     const wqn::DeviceControlState checkpoint = {
         sync.config_revision,
         sync.sync_cursor,
@@ -1540,12 +1295,6 @@ bool RunSyncRound()
     }
 #endif
 
-    result = UploadPendingReviewsIfAny(token);
-    if (result != ESP_OK) {
-        ESP_LOGW(kTag, "pending review upload round failed: %s", esp_err_to_name(result));
-        return false;
-    }
-
 #if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
     g_last_word_outbox_upload_state = UploadPendingWordObservations(token);
     g_last_note_outbox_upload_state = UploadPendingNoteObservations(token);
@@ -1553,33 +1302,17 @@ bool RunSyncRound()
 #endif
 
     if (!LoadUsableToken(&token)) {
-        ESP_LOGI(kTag, "token cleared during review upload round");
+        ESP_LOGI(kTag, "token cleared during observation upload round");
         return false;
     }
 
 #if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
-    result = SyncDueProblemsAndCacheV3(token);
-#else
-    result = SyncDueProblemsAndCache(token);
-#endif
+    result = SyncControlPlaneV3(token);
     if (result != ESP_OK) {
-        ESP_LOGW(kTag, "due problem sync round failed: %s", esp_err_to_name(result));
+        ESP_LOGW(kTag, "control sync round failed: %s", esp_err_to_name(result));
         return false;
     }
-
-    if (!LoadUsableToken(&token)) {
-        ESP_LOGI(kTag, "token cleared during due problem sync round");
-        return false;
-    }
-
-    result = RefreshProblemIndexIfAvailable(token);
-    if (result != ESP_OK) {
-#if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
-        ApplyStorageCapacityBackoff(result, "problem-index-cache");
 #endif
-        ESP_LOGW(kTag, "problem index refresh round failed: %s", esp_err_to_name(result));
-        return false;
-    }
 
     return true;
 }

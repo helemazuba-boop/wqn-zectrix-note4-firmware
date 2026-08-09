@@ -1,6 +1,4 @@
 #include <string>
-#include <utility>
-#include <vector>
 
 #include "ai_session.h"
 #include "audio_selftest.h"
@@ -32,28 +30,6 @@
 namespace {
 
 constexpr char kTag[] = "wqn_main";
-
-void LogCachedProblemState()
-{
-    std::vector<wqn::CachedProblem> problems;
-    const esp_err_t result = wqn::LoadProblems(&problems);
-    if (result == ESP_OK) {
-        ESP_LOGI(kTag, "cached problems: count=%u", static_cast<unsigned>(problems.size()));
-    } else {
-        ESP_LOGW(kTag, "problem cache load failed: %s", esp_err_to_name(result));
-    }
-}
-
-void LogPendingReviewState()
-{
-    std::vector<wqn::PendingReviewResult> reviews;
-    const esp_err_t result = wqn::LoadPendingReviewResults(&reviews);
-    if (result == ESP_OK) {
-        ESP_LOGI(kTag, "pending review uploads: count=%u", static_cast<unsigned>(reviews.size()));
-    } else {
-        ESP_LOGW(kTag, "pending review queue load failed: %s", esp_err_to_name(result));
-    }
-}
 
 void LogTokenState()
 {
@@ -181,8 +157,6 @@ extern "C" void app_main(void)
     ESP_ERROR_CHECK(wqn::services::StartAudioService());
     LogTokenState();
     LogWifiCredentialState();
-    LogCachedProblemState();
-    LogPendingReviewState();
 
     // [volume] Restore persisted playback volume into the process-wide cache so
     // the first playback after boot uses the user's level, not the 100% default.

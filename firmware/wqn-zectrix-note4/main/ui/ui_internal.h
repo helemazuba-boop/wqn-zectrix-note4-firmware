@@ -481,7 +481,6 @@ bool LoadValidTokenForTodo(std::string* token);
 
 bool LoadUiState(wqn::UiState* state);
 void BuildHomeSummary(wqn::UiState* state);
-RefreshSchedule QueueSelectedReview(wqn::UiState* state);
 
 bool SameTimeAppState(const wqn::TimeAppState& a, const wqn::TimeAppState& b);
 bool TimeAppStructureChanged(const wqn::TimeAppState& before, const wqn::TimeAppState& after);
@@ -527,7 +526,6 @@ void SeedClockFromBuildTimeIfNeeded();
 const char* TimeTileTitle(wqn::TimeTile tile);
 std::string ChooseHomePrimaryTimeLine(const wqn::TimeAppState& time_app);
 void UpdateHomePrimaryTimeLine(wqn::UiState* state);
-int CountReviewDueLikeProblems(const std::vector<wqn::CachedProblem>& problems);
 int CountdownStartField();
 int PomodoroStartField();
 std::string TwoDigit(int value);

@@ -213,6 +213,7 @@ bool ApplyProblemCloudResult(wqn::UiState* state, ProblemCloudResult& result)
                 &state->note_app, BuildProblemSetRows(result.pack_index));
             wqn::ApplyProblemPackIndex(
                 &state->problem_app, std::move(result.pack_index), result.message);
+            BuildHomeSummary(state);
         } else {
             state->problem_app.cloud_sync_failed = true;
             state->problem_app.cloud_loaded_once = true;
@@ -220,8 +221,11 @@ bool ApplyProblemCloudResult(wqn::UiState* state, ProblemCloudResult& result)
             state->problem_app.message =
                 result.auth_required ? "请重新配对" : "错题同步失败";
         }
-        // The mixed list only repaints when the note screen shows it.
-        return state->screen == wqn::UiScreen::kNote;
+        // A new catalog changes both the mixed Note list and the Home counts.
+        // Failures only change the Note-hosted problem status.
+        return state->screen == wqn::UiScreen::kNote ||
+               (result.result == ESP_OK && result.pack_index_ready &&
+                state->screen == wqn::UiScreen::kHome);
     }
     if (result.op == ProblemCloudOp::kFetchImage) {
         wqn::ApplyProblemImageResult(

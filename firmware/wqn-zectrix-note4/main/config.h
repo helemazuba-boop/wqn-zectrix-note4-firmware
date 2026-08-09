@@ -20,10 +20,6 @@
 
 #define WQN_SYNC_LIMIT 20
 
-#ifndef WQN_DEBUG_PROBLEM_IDS
-#define WQN_DEBUG_PROBLEM_IDS ""
-#endif
-
 // ============================================================================
 // AI v2 SSE streaming protocol (STD/PRO tier) — see docs/04-std-pro-streaming-protocol.md
 // ============================================================================

@@ -122,10 +122,29 @@ foreach(source IN LISTS firmware_sources)
     endif()
 endforeach()
 
-wqn_reject(
-    "main/storage.cpp"
-    "SaveBlobToNvs[ \t\r\n]*\\([ \t\r\n]*kProblemsKey"
-    "problem content cache must use the bounded WQPC SPIFFS transaction, never NVS")
+set(removed_problem_prototype_patterns
+    "CachedProblem"
+    "PendingReviewResult"
+    "ReviewChoice"
+    "FetchProblems"
+    "FetchProblemIndex"
+    "UploadReviewComplete"
+    "SyncDueProblemIds"
+    "SyncDueProblemsAndLog"
+    "WQN_DEBUG_PROBLEM_IDS"
+    "[/]problem-index"
+    "[/]review-complete"
+    "problems[?]ids="
+    "UiScreen::k(Library|Problem|Solution|ReviewQueue|ReviewScore|ReviewQueued)")
+foreach(source IN LISTS firmware_sources)
+    wqn_read("${source}" contents)
+    foreach(pattern IN LISTS removed_problem_prototype_patterns)
+        if(contents MATCHES "${pattern}")
+            message(FATAL_ERROR
+                "M8 architecture gate: ${source}: removed problem prototype matched ${pattern}")
+        endif()
+    endforeach()
+endforeach()
 
 set(removed_word_client_patterns
     "WqnWord(Sync|Review)"
@@ -148,6 +167,8 @@ foreach(source IN LISTS firmware_sources)
 endforeach()
 
 set(removed_legacy_paths
+    main/problem_cache.cpp
+    main/problem_cache.h
     main/epd_display.cpp
     main/epd_display.h
     main/online_sync.h

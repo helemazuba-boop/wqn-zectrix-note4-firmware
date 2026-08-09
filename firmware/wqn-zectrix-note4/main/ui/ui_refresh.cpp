@@ -329,12 +329,6 @@ std::string FrameSignature(const wqn::UiFrame& frame)
         case wqn::UiScreen::kTime:
         case wqn::UiScreen::kWord:
         case wqn::UiScreen::kNote:
-        case wqn::UiScreen::kLibrary:
-        case wqn::UiScreen::kProblem:
-        case wqn::UiScreen::kSolution:
-        case wqn::UiScreen::kReviewQueue:
-        case wqn::UiScreen::kReviewScore:
-        case wqn::UiScreen::kReviewQueued:
         case wqn::UiScreen::kProvisioning:
             break;
     }

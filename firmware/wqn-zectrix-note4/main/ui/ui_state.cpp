@@ -1,9 +1,10 @@
-// UI state management: load from NVS/storage, build home summary, queue review result,
+// UI state management: load current study state, build the Home summary, and
 // detect time-app structural changes.
 // Extracted from device_ui.cpp.
 
 #include "ui_internal.h"
 
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -62,7 +63,16 @@ void BuildHomeSummary(wqn::UiState* state)
     // UI contract: one line only. Source priority is pomodoro > countdown > clock.
     home.primary_time_line = ChooseHomePrimaryTimeLine(state->time_app);
 
-    const int review_count = CountReviewDueLikeProblems(state->problems);
+    const size_t problem_count = state->problem_app.pack_index.entries.size();
+    const uint8_t mastered = static_cast<uint8_t>(
+        wqn::protocol::problem_study_v1::ProblemStatus::kMastered);
+    const size_t review_count = static_cast<size_t>(std::count_if(
+        state->problem_app.pack_index.entries.begin(),
+        state->problem_app.pack_index.entries.end(),
+        [mastered](const wqn::ProblemPackIndexEntry& entry) {
+            return entry.status != mastered;
+        }));
+    const size_t problem_set_count = state->problem_app.pack_index.sets.size();
     home.review_metric.value = std::to_string(review_count);
     home.review_metric.label = "今日复习";
     home.todo_metric.value = std::to_string(std::max(0, state->todo.total_pending));
@@ -73,20 +83,20 @@ void BuildHomeSummary(wqn::UiState* state)
         home.current_status = "配对码 " + state->status.claim_code + " · 请在网页确认";
     } else {
         home.current_status =
-            "本地 " + std::to_string(state->problems.size()) + " 题 · 待上传 " +
-            std::to_string(state->status.pending_reviews);
+            "本地 " + std::to_string(problem_count) + " 题 · 待上传 " +
+            std::to_string(state->problem_app.outbox.pending_count);
     }
 
     home.tasks.clear();
-    if (!state->problems.empty()) {
-        const wqn::CachedProblem& problem = state->problems[std::min(state->selected_problem, state->problems.size() - 1)];
-        wqn::HomeTask task;
-        task.title = problem.title.empty() ? problem.id : problem.title;
-        task.subtitle = "错题复习" + std::string(problem.status == "mastered" ? "，已掌握" : "，待复习");
-        task.tag = "错题";
-        home.tasks.push_back(std::move(task));
+    if (problem_count > 0) {
+        home.tasks.push_back(wqn::HomeTask{
+            "错题复习",
+            std::to_string(problem_set_count) + " 个错题集 · " +
+                std::to_string(review_count) + " 题待复习",
+            "错题"});
     } else {
-        home.tasks.push_back(wqn::HomeTask{"同步错题后开始复习", "当前没有本地题目缓存", "错题"});
+        home.tasks.push_back(wqn::HomeTask{
+            "同步错题后开始复习", "当前没有本地错题集", "错题"});
     }
     home.tasks.push_back(wqn::HomeTask{"单词复习", wqn::WordAppStatusLine(state->word_app), "单词"});
 
@@ -103,24 +113,27 @@ bool LoadUiState(wqn::UiState* state)
     // Restore last screen from RTC slow memory (survives deep sleep). On cold boot
     // or RTC corruption, g_rtc_screen_val may be 0 (= kAi) which is unsafe, or
     // contain an out-of-range value; fall back to kHome in either case.
-    constexpr int kScreenFallback = static_cast<int>(wqn::UiScreen::kHome);
+    auto is_restorable_screen = [](int value) {
+        switch (static_cast<wqn::UiScreen>(value)) {
+            case wqn::UiScreen::kTodo:
+            case wqn::UiScreen::kSettings:
+            case wqn::UiScreen::kHome:
+            case wqn::UiScreen::kTime:
+            case wqn::UiScreen::kWord:
+            case wqn::UiScreen::kNote:
+                return true;
+            case wqn::UiScreen::kAi:
+            case wqn::UiScreen::kProvisioning:
+                return false;
+        }
+        return false;
+    };
     const int saved_screen = g_rtc_screen_val;
-    if (saved_screen >= static_cast<int>(wqn::UiScreen::kAi) &&
-        saved_screen <= static_cast<int>(wqn::UiScreen::kProvisioning)) {
-        state->screen = static_cast<wqn::UiScreen>(saved_screen);
-    } else {
-        state->screen = static_cast<wqn::UiScreen>(kScreenFallback);
-    }
+    state->screen = is_restorable_screen(saved_screen)
+        ? static_cast<wqn::UiScreen>(saved_screen)
+        : wqn::UiScreen::kHome;
 
-    std::vector<wqn::CachedProblem> problems;
-    esp_err_t result = wqn::LoadProblems(&problems);
-    if (result == ESP_OK) {
-        state->problems = std::move(problems);
-    } else {
-        ESP_LOGW(kTag, "load UI problem cache failed: %s", esp_err_to_name(result));
-    }
-
-    result = wqn::InitWordApp(&state->word_app);
+    esp_err_t result = wqn::InitWordApp(&state->word_app);
     if (result != ESP_OK) {
         ESP_LOGW(kTag, "init word app failed: %s", esp_err_to_name(result));
     }
@@ -158,14 +171,6 @@ bool LoadUiState(wqn::UiState* state)
     RebuildNoteWordDeckRows(state);
     state->settings.default_word_deck_title = state->word_app.default_deck_title;
 
-    std::vector<wqn::PendingReviewResult> pending;
-    result = wqn::LoadPendingReviewResults(&pending);
-    if (result == ESP_OK) {
-        state->status.pending_reviews = static_cast<int>(pending.size());
-    } else {
-        ESP_LOGW(kTag, "load UI pending queue failed: %s", esp_err_to_name(result));
-    }
-
     std::string token;
     result = wqn::LoadAccessToken(&token);
     if (result == ESP_OK && !token.empty() && wqn::IsValidAccessToken(token)) {
@@ -192,53 +197,6 @@ bool LoadUiState(wqn::UiState* state)
     wqn::ClampUiSelection(state);
     BuildHomeSummary(state);
     return true;
-}
-
-RefreshSchedule QueueSelectedReview(wqn::UiState* state)
-{
-    if (state == nullptr || state->problems.empty() || state->selected_problem >= state->problems.size()) {
-        return RefreshSchedule::kNone;
-    }
-
-    const wqn::CachedProblem& problem = state->problems[state->selected_problem];
-    wqn::PendingReviewResult review;
-    review.problem_id = problem.id;
-    review.selected_status = wqn::ReviewChoiceStatus(state->selected_review);
-    review.is_correct = state->selected_review == wqn::ReviewChoice::kMastered;
-    review.created_at = CurrentIsoTimestamp();
-
-    const esp_err_t result = wqn::EnqueueReviewResult(review);
-    if (result != ESP_OK) {
-        ESP_LOGW(kTag, "enqueue review failed: %s", esp_err_to_name(result));
-        state->last_review_message = "保存失败";
-        state->screen = wqn::UiScreen::kReviewQueued;
-        return RefreshSchedule::kCommit;
-    }
-
-    std::vector<wqn::PendingReviewResult> pending;
-    if (wqn::LoadPendingReviewResults(&pending) == ESP_OK) {
-        state->status.pending_reviews = static_cast<int>(pending.size());
-    } else {
-        ++state->status.pending_reviews;
-    }
-
-    state->last_review_message = std::string("已保存：") + wqn::ReviewChoiceLabel(state->selected_review);
-    state->status.last_sync_status = "复习结果待上传";
-    state->problems[state->selected_problem].status = review.selected_status;
-    const esp_err_t cache_result = wqn::SaveProblems(state->problems);
-    if (cache_result != ESP_OK) {
-        ESP_LOGW(kTag, "save reviewed problem cache failed: %s", esp_err_to_name(cache_result));
-    }
-    state->screen = wqn::UiScreen::kReviewQueued;
-    ESP_LOGI(
-        kTag,
-        "queued review result: problem_id=%s status=%s pending=%d",
-        problem.id.c_str(),
-        review.selected_status.c_str(),
-        state->status.pending_reviews);
-    wqn::services::RequestSyncNow();
-    BuildHomeSummary(state);  // [home-stats-fix] refresh home stats so pending/today counts update immediately (was stale until 60s poll)
-    return RefreshSchedule::kCommit;
 }
 
 }  // namespace device_ui_internal

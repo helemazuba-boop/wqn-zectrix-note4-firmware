@@ -41,8 +41,8 @@ guidance written for the maintainer's Windows workspace).
 
 ESP-IDF firmware for the **WQN Note4** — an ESP32-S3, 400×300 e-paper
 study terminal on the `zectrix-s3-epaper-4.2` board. It connects to the WQN
-cloud over WiFi, caches due problems / todos / word decks locally, renders them
-to e-paper, and uploads review results. Provider secrets (Supabase, ASR/LLM,
+cloud over WiFi, stores problem-study packs / todos / word decks locally, renders
+them to e-paper, and uploads durable study observations. Provider secrets (Supabase, ASR/LLM,
 notebook permissions, AI function-call execution) stay server-side; the firmware
 only talks to the **WQN ESP32 API** with a device-pairing token.
 

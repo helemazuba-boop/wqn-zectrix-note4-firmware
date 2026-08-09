@@ -712,9 +712,7 @@ RefreshSchedule ApplyButtonEvent(
 
     const wqn::UiScreen old_screen = state->screen;
     const size_t old_home_task = state->selected_home_task;
-    const size_t old_problem = state->selected_problem;
     const size_t old_todo = state->todo.selected;
-    const wqn::ReviewChoice old_review = state->selected_review;
     const wqn::TimeAppState old_time_app = state->time_app;
     const std::string old_word_signature = wqn::WordAppSignature(state->word_app);
     const std::string old_note_signature = wqn::NoteAppSignature(state->note_app);
@@ -733,9 +731,6 @@ RefreshSchedule ApplyButtonEvent(
         static_cast<int>(event.button),
         static_cast<int>(event.type),
         static_cast<long long>(event.duration_ms));
-    if (!long_press && !long_release && event.button == wqn::ButtonId::kConfirm && state->screen == wqn::UiScreen::kReviewScore) {
-        return QueueSelectedReview(state);
-    }
     if (!long_press && !long_release && event.button == wqn::ButtonId::kConfirm && state->screen == wqn::UiScreen::kTodo) {
         return CompleteSelectedTodo(state);
     }
@@ -922,9 +917,7 @@ RefreshSchedule ApplyButtonEvent(
         return RefreshSchedule::kSelection;
     }
     if (state->selected_home_task != old_home_task ||
-        state->selected_problem != old_problem ||
-        state->todo.selected != old_todo ||
-        state->selected_review != old_review) {
+        state->todo.selected != old_todo) {
         return RefreshSchedule::kSelection;
     }
     return RefreshSchedule::kNone;

@@ -352,12 +352,14 @@ UiUpdate UiRuntime::DispatchWordObservationTakeFailed()
 UiUpdate UiRuntime::DispatchProblemCloudResult(ProblemCloudResult& result)
 {
     const bool changed = ApplyProblemCloudResult(&state_, result);
-    // Mode/content transitions repaint most of the panel; commit here so the
-    // full refresh clears any large-partial ghosting (same rule as note).
-    const RefreshSchedule refresh =
-        changed && state_.screen == wqn::UiScreen::kNote
-            ? RefreshSchedule::kCommit
-            : RefreshSchedule::kNone;
+    // Catalog transitions cover most of Note, while Home only needs its summary
+    // cards repainted.
+    RefreshSchedule refresh = RefreshSchedule::kNone;
+    if (changed && state_.screen == wqn::UiScreen::kNote) {
+        refresh = RefreshSchedule::kCommit;
+    } else if (changed && state_.screen == wqn::UiScreen::kHome) {
+        refresh = RefreshSchedule::kSelection;
+    }
     return FinishEvent(AppEventKind::kProblemCloudResult, refresh, changed);
 }
 
@@ -720,6 +722,8 @@ UiUpdate UiRuntime::DispatchStatusReload(wqn::AppState&& snapshot)
 
 UiUpdate UiRuntime::DispatchSyncResult(const wqn::services::SyncEvent& event)
 {
+    const size_t problem_pending_before =
+        state_.problem_app.outbox.pending_count;
     std::string status;
     switch (event.status) {
         case wqn::services::SyncEventStatus::kSucceeded:
@@ -746,19 +750,13 @@ UiUpdate UiRuntime::DispatchSyncResult(const wqn::services::SyncEvent& event)
     const bool changed =
         state_.settings.sync_status != status ||
         state_.status.last_sync_status != status ||
+        state_.problem_app.outbox.pending_count != problem_pending_before ||
         claim_state_changed;
     state_.settings.sync_status = status;
     state_.status.last_sync_status = status;
     state_.status.claim_code = claim_code;
     state_.status.paired = paired;
-    if (!paired && !claim_code.empty()) {
-        state_.home.current_status =
-            "配对码 " + claim_code + " · 请在网页确认";
-    } else {
-        state_.home.current_status =
-            "本地 " + std::to_string(state_.problems.size()) + " 题 · 待上传 " +
-            std::to_string(state_.status.pending_reviews);
-    }
+    BuildHomeSummary(&state_);
     const bool visible =
         state_.screen == wqn::UiScreen::kSettings ||
         state_.screen == wqn::UiScreen::kHome;
