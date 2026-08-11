@@ -99,6 +99,7 @@ public:
     void RestoreNoteCandidatePageRequest();
     bool TakeNoteImageRequest(
         std::string* note_id, uint8_t* image_index, std::string* image_id,
+        bool* gray4,
         uint32_t* progress_generation);
     void RestoreNoteImageRequest();
     bool TakeNoteBodyFetchRequest(std::string* notebook_id,
@@ -114,7 +115,8 @@ public:
         std::string* problem_id,
         bool* is_solution,
         uint8_t* image_index,
-        std::string* image_id);
+        std::string* image_id,
+        bool* gray4);
     void RestoreProblemImageRequest();
     bool TakeProblemVerdictEffect(
         const std::string& request_id,
@@ -157,6 +159,7 @@ public:
     // additionally triggers RequestSyncNow), failure keeps the displayed value
     // untouched and asks for a re-Confirm. Settings-area refresh either way.
     UiUpdate DispatchAutoSyncSaveResult(esp_err_t result, uint32_t operation_id);
+    UiUpdate DispatchImageRenderSaveResult(esp_err_t result, uint32_t operation_id);
     UiUpdate DispatchVolumeSaveResult(esp_err_t result, uint32_t operation_id);
     // [deck-scope] Default-deck switch result (c5). Success installs the deck,
     // resets the in-memory word session (the durable clears already happened

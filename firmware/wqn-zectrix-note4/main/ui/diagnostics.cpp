@@ -96,6 +96,14 @@ void UpdateSettingsDiagnostics(wqn::UiState* state)
         state->settings.volume_selected = VolumeOptionIndex(100);
     }
 
+    wqn::ImageRenderMode image_mode = wqn::ImageRenderMode::kGray16;
+    if (wqn::LoadImageRenderMode(&image_mode) != ESP_OK) {
+        image_mode = wqn::ImageRenderMode::kGray16;
+    }
+    state->settings.image_render_mode = image_mode;
+    state->settings.image_render_selected =
+        image_mode == wqn::ImageRenderMode::kBlackWhite ? 0 : 1;
+
     wqn::SettingsDiagnosticsSnapshot& snapshot = state->settings.diagnostics;
     BatteryReading battery = {};
     if (ReadBatteryStatus(&battery)) {
@@ -153,6 +161,18 @@ void UpdateSettingsDiagnostics(wqn::UiState* state)
 
     wqn::services::SyncSnapshot online = {};
     wqn::services::GetSyncSnapshot(&online);
+    char content_label[96] = {};
+    std::snprintf(
+        content_label,
+        sizeof(content_label),
+        "W %llu/%llu  N %llu/%llu  P %llu/%llu",
+        static_cast<unsigned long long>(online.word_packs.applied_revision),
+        static_cast<unsigned long long>(online.word_packs.desired_revision),
+        static_cast<unsigned long long>(online.note_packs.applied_revision),
+        static_cast<unsigned long long>(online.note_packs.desired_revision),
+        static_cast<unsigned long long>(online.problem_packs.applied_revision),
+        static_cast<unsigned long long>(online.problem_packs.desired_revision));
+    snapshot.content_sync_label = content_label;
     if (online.status[0] != '\0') {
         state->settings.sync_status = OnlineSyncStatusLabel(online.status);
     }

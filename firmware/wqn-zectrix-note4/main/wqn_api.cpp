@@ -2177,7 +2177,8 @@ esp_err_t FetchNoteStudyManifest(
     const std::string& token,
     const protocol::v3::RequestMetadata& metadata,
     uint64_t cursor,
-    WqnNotePackManifest* manifest)
+    WqnNotePackManifest* manifest,
+    const std::string& snapshot_id)
 {
     if (manifest == nullptr) {
         return ESP_ERR_INVALID_ARG;
@@ -2196,7 +2197,7 @@ esp_err_t FetchNoteStudyManifest(
     std::string request_body;
     ESP_RETURN_ON_ERROR(
         protocol::note_study_v1::BuildManifestRequest(
-            metadata, cursor, 100, &request_body),
+            metadata, cursor, 100, &request_body, snapshot_id),
         kTag,
         "build note-study manifest request");
     const std::string url = BuildUrl("/v3/notes/manifest");
@@ -2234,6 +2235,8 @@ esp_err_t FetchNoteStudyManifest(
 
     manifest->cursor = data.cursor;
     manifest->has_more = data.has_more;
+    manifest->revision = data.revision;
+    manifest->snapshot_id = data.snapshot_id;
     manifest->notebooks.reserve(data.notebooks.size());
     for (const protocol::note_study_v1::ManifestNotebook& source : data.notebooks) {
         WqnNotePackManifestNotebook notebook;
@@ -2407,10 +2410,11 @@ esp_err_t DownloadNoteImageV1(
     uint8_t image_index,
     const std::string& expected_image_id,
     std::vector<uint8_t>* wqni,
-    WqnTransferProgressSink progress)
+    WqnTransferProgressSink progress,
+    WqnImagePixelFormat pixel_format)
 {
-    // WQNI file size is fixed by the contract: 20-byte header + 400x300/8.
-    constexpr size_t kWqniFileBytes = 20 + 15000;
+    const size_t kWqniFileBytes =
+        20 + (pixel_format == WqnImagePixelFormat::kGray4 ? 60000 : 15000);
     if (wqni == nullptr || metadata.request_id.empty() || note_id.size() != 36 ||
         image_index > 3 || expected_image_id.size() != 64) {
         return ESP_ERR_INVALID_ARG;
@@ -2425,8 +2429,10 @@ esp_err_t DownloadNoteImageV1(
 
     ESP_RETURN_ON_ERROR(WaitForNetworkReadyForHttps(), kTag, "prepare network for note-image-download");
 
-    const std::string url = BuildUrl(
-        "/v3/notes/images/" + note_id + "/" + std::to_string(image_index));
+    // The pack already pins the exact WQNI content hash. Downloading by that
+    // identity survives attachment reorder/replacement; note_id/index remain
+    // API compatibility/context validation only.
+    const std::string url = BuildUrl("/v3/images/" + expected_image_id);
     esp_http_client_config_t config = {};
     config.url = url.c_str();
     config.method = HTTP_METHOD_GET;
@@ -2808,7 +2814,8 @@ esp_err_t FetchProblemStudyManifest(
     const std::string& token,
     const protocol::v3::RequestMetadata& metadata,
     uint64_t cursor,
-    WqnProblemPackManifest* manifest)
+    WqnProblemPackManifest* manifest,
+    const std::string& snapshot_id)
 {
     if (manifest == nullptr) {
         return ESP_ERR_INVALID_ARG;
@@ -2827,7 +2834,7 @@ esp_err_t FetchProblemStudyManifest(
     std::string request_body;
     ESP_RETURN_ON_ERROR(
         protocol::problem_study_v1::BuildManifestRequest(
-            metadata, cursor, 100, &request_body),
+            metadata, cursor, 100, &request_body, snapshot_id),
         kTag,
         "build problem-study manifest request");
     const std::string url = BuildUrl("/v3/problems/manifest");
@@ -2865,6 +2872,8 @@ esp_err_t FetchProblemStudyManifest(
 
     manifest->cursor = data.cursor;
     manifest->has_more = data.has_more;
+    manifest->revision = data.revision;
+    manifest->snapshot_id = data.snapshot_id;
     manifest->problem_sets.reserve(data.problem_sets.size());
     for (const protocol::problem_study_v1::ManifestSet& source : data.problem_sets) {
         WqnProblemPackManifestSet set;
@@ -3027,10 +3036,12 @@ esp_err_t DownloadProblemImageV1(
     WqnProblemImageKind kind,
     uint8_t image_index,
     const std::string& expected_image_id,
-    std::vector<uint8_t>* wqni)
+    std::vector<uint8_t>* wqni,
+    WqnImagePixelFormat pixel_format)
 {
-    // WQNI file size is fixed by the contract: 20-byte header + 400x300/8.
-    constexpr size_t kWqniFileBytes = 20 + 15000;
+    (void)kind;
+    const size_t kWqniFileBytes =
+        20 + (pixel_format == WqnImagePixelFormat::kGray4 ? 60000 : 15000);
     if (wqni == nullptr || metadata.request_id.empty() || problem_id.size() != 36 ||
         image_index > 7 || expected_image_id.size() != 64) {
         return ESP_ERR_INVALID_ARG;
@@ -3045,11 +3056,9 @@ esp_err_t DownloadProblemImageV1(
 
     ESP_RETURN_ON_ERROR(WaitForNetworkReadyForHttps(), kTag, "prepare network for problem-image-download");
 
-    const char* kind_segment =
-        kind == WqnProblemImageKind::kSolution ? "solution" : "assets";
-    const std::string url = BuildUrl(
-        "/v3/problems/images/" + problem_id + "/" + kind_segment + "/" +
-        std::to_string(image_index));
+    // problem_id/kind/index identify the UI slot, but the pack's image hash
+    // identifies the immutable bytes and is therefore the transport address.
+    const std::string url = BuildUrl("/v3/images/" + expected_image_id);
     esp_http_client_config_t config = {};
     config.url = url.c_str();
     config.method = HTTP_METHOD_GET;
@@ -3132,8 +3141,8 @@ esp_err_t DownloadProblemImageV1(
         return ClearTokenOnUnauthorized("problem-image-download");
     }
     if (status_code != 200) {
-        ESP_LOGW(kTag, "problem-image-download HTTP status=%d problem=%s kind=%s index=%u",
-                 status_code, problem_id.c_str(), kind_segment,
+        ESP_LOGW(kTag, "problem-image-download HTTP status=%d problem=%s kind=%d index=%u",
+                 status_code, problem_id.c_str(), static_cast<int>(kind),
                  static_cast<unsigned>(image_index));
         wqni->clear();
         return status_code == 404 ? ESP_ERR_NOT_FOUND : ESP_FAIL;

@@ -2,6 +2,7 @@
 // All other responsibilities (rendering, refresh, cloud, state, input) live in main/ui/.
 
 #include <array>
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -166,7 +167,6 @@ constexpr TickType_t kStatusRefreshDelayTicks = pdMS_TO_TICKS(60000);
 // Full UI snapshot reloads touch several persistent domains. Keep them out of
 // the word interaction window; typed sync events already update live status.
 constexpr int64_t kStatusReloadInteractionQuietUs = 5LL * 1000LL * 1000LL;
-constexpr UBaseType_t kSyncEventQueueDepth = 4;
 
 using device_ui_internal::BuildHomeSummary;
 using device_ui_internal::CheckBatteryProtection;
@@ -221,24 +221,6 @@ struct DisplayTrackingState {
 DisplayTrackingState g_display_tracking;
 device_ui_internal::UiRuntime g_ui_runtime;
 wqn::AppState g_ui_reload_snapshot;
-StaticQueue_t g_sync_event_queue_storage;
-uint8_t g_sync_event_queue_buffer[
-    kSyncEventQueueDepth * sizeof(wqn::services::SyncEvent)] = {};
-QueueHandle_t g_sync_event_queue = nullptr;
-
-void UiSyncEventSink(const wqn::services::SyncEvent& event)
-{
-    if (g_sync_event_queue == nullptr ||
-        xQueueSend(g_sync_event_queue, &event, 0) != pdTRUE) {
-        ESP_LOGW(kTag, "drop sync event: sequence=%lu",
-                 static_cast<unsigned long>(event.sequence));
-    } else {
-        // [input-capture] Wake the UI so a sync completion is applied promptly
-        // instead of waiting for the next idle poll.
-        device_ui_internal::NotifyUiTask();
-    }
-}
-
 void LogUiStackHighWater(const char* phase)
 {
     const UBaseType_t high_water_words = uxTaskGetStackHighWaterMark(nullptr);
@@ -509,9 +491,11 @@ void DeviceUiTask(void*)
     TickType_t last_status_refresh = xTaskGetTickCount();
     g_last_active_us_local = esp_timer_get_time();
     TickType_t poll_delay = kUiPollDelayTicks;
-    bool word_pack_refresh_pending = false;
-    bool note_pack_refresh_pending = false;
-    bool problem_pack_refresh_pending = false;
+    uint32_t last_sync_event_sequence = 0;
+    uint64_t todo_desired_revision = 0;
+    uint64_t todo_applied_revision = 0;
+    int64_t todo_retry_not_before_ms = 0;
+    uint8_t todo_retry_attempt = 0;
 
     while (true) {
         RefreshSchedule refresh_schedule = pending_refresh_schedule;
@@ -519,56 +503,21 @@ void DeviceUiTask(void*)
         DrainDisplayResults(&ui_runtime, &display_tracking, &refresh_schedule);
         bool todo_cloud_completed = false;
         bool word_cloud_completed = false;
+        bool word_bulk_completed = false;
         bool note_cloud_completed = false;
+        bool note_bulk_completed = false;
         bool problem_cloud_completed = false;
-        if (g_sync_event_queue != nullptr) {
-            wqn::services::SyncEvent sync_event;
-            while (xQueuePeek(g_sync_event_queue, &sync_event, 0) == pdTRUE) {
-                // [persist-worker] A succeeded sync reads the three outboxes
-                // synchronously in DispatchSyncResult; while a word/note/problem
-                // commit is pending or any persist is in flight, that read would
-                // queue behind the observation transaction and re-freeze the UI.
-                // Leave the event queued (peek, do not receive) and consume it a
-                // later iteration once persistence is idle. Failed /
-                // AwaitingClaim touch no storage, so process them now. Peeking
-                // rather than receive-then-discard preserves the terminal event.
-                if (sync_event.status ==
-                        wqn::services::SyncEventStatus::kSucceeded &&
-                    (state.word_app.session.commit_state ==
-                         wqn::WordObservationCommitState::kPersisting ||
-                     state.note_app.session.commit_state ==
-                         wqn::NoteObservationCommitState::kPersisting ||
-                     state.problem_app.commit_state ==
-                         wqn::ProblemVerdictCommitState::kPersisting ||
-                     device_ui_internal::IsAnyPersistBusy())) {
-                    break;
-                }
-                xQueueReceive(g_sync_event_queue, &sync_event, 0);
-                const device_ui_internal::UiUpdate update =
-                    ui_runtime.DispatchSyncResult(sync_event);
-                refresh_schedule =
-                    StrongerSchedule(refresh_schedule, update.refresh);
-                if (sync_event.status ==
-                        wqn::services::SyncEventStatus::kSucceeded &&
-                    sync_event.scope ==
-                        wqn::services::SyncEventScope::kFull) {
-                    // Sync notifications can arrive while a session page,
-                    // search, or an earlier pack refresh owns WordCloud. Keep
-                    // one coalesced refresh request instead of misreporting
-                    // the busy owner as a full queue.
-                    word_pack_refresh_pending = true;
-                    // Notes used to sync only when the local cache was missing
-                    // or broken, so an attach/edit on the web never reached a
-                    // device that already held a pack (HIL: image_ids stuck at
-                    // 0 while the cloud change_log had advanced). Mirror the
-                    // word lane: one coalesced manifest check per sync cycle;
-                    // an unchanged manifest ends the round trip immediately.
-                    note_pack_refresh_pending = true;
-                    // Problem sets ride the same cadence: the manifest sha
-                    // comparison keeps unchanged packs download-free.
-                    problem_pack_refresh_pending = true;
-                }
-            }
+        bool problem_bulk_completed = false;
+        wqn::services::SyncEvent sync_event;
+        wqn::services::GetLatestSyncEvent(&sync_event);
+        if (sync_event.sequence != 0 &&
+            sync_event.sequence != last_sync_event_sequence) {
+            last_sync_event_sequence = sync_event.sequence;
+            todo_desired_revision = std::max(
+                todo_desired_revision, sync_event.todo_revision);
+            const device_ui_internal::UiUpdate update =
+                ui_runtime.DispatchSyncResult(sync_event);
+            refresh_schedule = StrongerSchedule(refresh_schedule, update.refresh);
         }
         // [input-capture] Consume up to a small batch of ring events per loop
         // iteration; each one runs the full dispatch path below. Stale-gesture
@@ -633,11 +582,14 @@ void DeviceUiTask(void*)
         // consumed the result, so nothing is lost even if a new request is
         // ready to fire the instant Finish* clears busy.
         {
-            static const device_ui_internal::CloudDomain kResultDomains[4] = {
+            static const device_ui_internal::CloudDomain kResultDomains[7] = {
                 device_ui_internal::CloudDomain::kTodo,
                 device_ui_internal::CloudDomain::kWord,
                 device_ui_internal::CloudDomain::kNote,
                 device_ui_internal::CloudDomain::kProblem,
+                device_ui_internal::CloudDomain::kWordBulk,
+                device_ui_internal::CloudDomain::kNoteBulk,
+                device_ui_internal::CloudDomain::kProblemBulk,
             };
             // [persist-worker] Unified pending gate: commit_state == kPersisting
             // spans the whole answer (button Prepare -> worker Apply), so it
@@ -670,11 +622,13 @@ void DeviceUiTask(void*)
                 // domain busy (xxx_cloud_completed stays false, so no Finish);
                 // the persist result is applied+acked just below this scan, so
                 // next iteration this result merges onto the advanced session.
-                if (result_domain == device_ui_internal::CloudDomain::kWord &&
+                if ((result_domain == device_ui_internal::CloudDomain::kWord ||
+                     result_domain == device_ui_internal::CloudDomain::kWordBulk) &&
                     word_commit_pending) {
                     continue;
                 }
-                if (result_domain == device_ui_internal::CloudDomain::kNote &&
+                if ((result_domain == device_ui_internal::CloudDomain::kNote ||
+                     result_domain == device_ui_internal::CloudDomain::kNoteBulk) &&
                     note_commit_pending) {
                     continue;
                 }
@@ -690,6 +644,27 @@ void DeviceUiTask(void*)
                         const device_ui_internal::TodoCloudResult* todo_result =
                             device_ui_internal::PeekTodoCloudResult(ready.generation);
                         if (todo_result != nullptr) {
+                            if (todo_result->content_target_revision != 0) {
+                                if (todo_result->result == ESP_OK) {
+                                    todo_applied_revision = std::max(
+                                        todo_applied_revision,
+                                        todo_result->content_target_revision);
+                                    todo_retry_attempt = 0;
+                                    todo_retry_not_before_ms = 0;
+                                } else {
+                                    if (todo_retry_attempt < 7) {
+                                        ++todo_retry_attempt;
+                                    }
+                                    const uint8_t shift =
+                                        todo_retry_attempt == 0
+                                            ? 0
+                                            : todo_retry_attempt - 1;
+                                    const uint32_t delay_ms = std::min<uint32_t>(
+                                        5000u << shift, 300000u);
+                                    todo_retry_not_before_ms =
+                                        esp_timer_get_time() / 1000 + delay_ms;
+                                }
+                            }
                             const device_ui_internal::UiUpdate update =
                                 ui_runtime.DispatchTodoCloudResult(*todo_result);
                             refresh_schedule =
@@ -700,10 +675,16 @@ void DeviceUiTask(void*)
                         }
                         break;
                     }
-                    case device_ui_internal::CloudDomain::kWord: {
-                        word_cloud_completed = true;
+                    case device_ui_internal::CloudDomain::kWord:
+                    case device_ui_internal::CloudDomain::kWordBulk: {
+                        if (ready.domain == device_ui_internal::CloudDomain::kWord) {
+                            word_cloud_completed = true;
+                        } else {
+                            word_bulk_completed = true;
+                        }
                         device_ui_internal::WordCloudResult* word_result =
-                            device_ui_internal::PeekWordCloudResult(ready.generation);
+                            device_ui_internal::PeekWordCloudResult(
+                                ready.domain, ready.generation);
                         if (word_result != nullptr) {
                             const device_ui_internal::UiUpdate update =
                                 ui_runtime.DispatchWordCloudResult(*word_result);
@@ -715,10 +696,16 @@ void DeviceUiTask(void*)
                         }
                         break;
                     }
-                    case device_ui_internal::CloudDomain::kNote: {
-                        note_cloud_completed = true;
+                    case device_ui_internal::CloudDomain::kNote:
+                    case device_ui_internal::CloudDomain::kNoteBulk: {
+                        if (ready.domain == device_ui_internal::CloudDomain::kNote) {
+                            note_cloud_completed = true;
+                        } else {
+                            note_bulk_completed = true;
+                        }
                         device_ui_internal::NoteCloudResult* note_result =
-                            device_ui_internal::PeekNoteCloudResult(ready.generation);
+                            device_ui_internal::PeekNoteCloudResult(
+                                ready.domain, ready.generation);
                         if (note_result != nullptr) {
                             const device_ui_internal::UiUpdate update =
                                 ui_runtime.DispatchNoteCloudResult(*note_result);
@@ -730,10 +717,16 @@ void DeviceUiTask(void*)
                         }
                         break;
                     }
-                    case device_ui_internal::CloudDomain::kProblem: {
-                        problem_cloud_completed = true;
+                    case device_ui_internal::CloudDomain::kProblem:
+                    case device_ui_internal::CloudDomain::kProblemBulk: {
+                        if (ready.domain == device_ui_internal::CloudDomain::kProblem) {
+                            problem_cloud_completed = true;
+                        } else {
+                            problem_bulk_completed = true;
+                        }
                         device_ui_internal::ProblemCloudResult* problem_result =
-                            device_ui_internal::PeekProblemCloudResult(ready.generation);
+                            device_ui_internal::PeekProblemCloudResult(
+                                ready.domain, ready.generation);
                         if (problem_result != nullptr) {
                             const device_ui_internal::UiUpdate update =
                                 ui_runtime.DispatchProblemCloudResult(*problem_result);
@@ -827,6 +820,18 @@ void DeviceUiTask(void*)
                     StrongerSchedule(refresh_schedule, persist_update.refresh);
                 device_ui_internal::AckPersistResult(
                     device_ui_internal::PersistKind::kSettingsAutoSync,
+                    settings_persist.generation, settings_persist.operation_id);
+            }
+            if (device_ui_internal::TakePersistResultToApply(
+                    device_ui_internal::PersistKind::kSettingsImageRender,
+                    &settings_persist)) {
+                const device_ui_internal::UiUpdate persist_update =
+                    ui_runtime.DispatchImageRenderSaveResult(
+                        settings_persist.result, settings_persist.operation_id);
+                refresh_schedule =
+                    StrongerSchedule(refresh_schedule, persist_update.refresh);
+                device_ui_internal::AckPersistResult(
+                    device_ui_internal::PersistKind::kSettingsImageRender,
                     settings_persist.generation, settings_persist.operation_id);
             }
             if (device_ui_internal::TakePersistResultToApply(
@@ -1098,11 +1103,20 @@ wqn::AiStreamingStatusView streaming_view{};
         if (word_cloud_completed) {
             FinishWordCloudRequest();
         }
+        if (word_bulk_completed) {
+            FinishWordCloudRequest(device_ui_internal::CloudDomain::kWordBulk);
+        }
         if (note_cloud_completed) {
             FinishNoteCloudRequest();
         }
+        if (note_bulk_completed) {
+            FinishNoteCloudRequest(device_ui_internal::CloudDomain::kNoteBulk);
+        }
         if (problem_cloud_completed) {
             FinishProblemCloudRequest();
+        }
+        if (problem_bulk_completed) {
+            FinishProblemCloudRequest(device_ui_internal::CloudDomain::kProblemBulk);
         }
         device_ui_internal::PumpWordCandidatePrefetch(&ui_runtime);
         pending_refresh_schedule = device_ui_internal::StrongerSchedule(
@@ -1134,24 +1148,19 @@ wqn::AiStreamingStatusView streaming_view{};
         pending_refresh_schedule = device_ui_internal::StrongerSchedule(
             pending_refresh_schedule,
             device_ui_internal::PumpProblemVerdictCommit(&ui_runtime));
-        if (word_pack_refresh_pending &&
-            !device_ui_internal::IsWordCloudBusy() &&
-            device_ui_internal::QueueWordReviewRefresh()) {
-            word_pack_refresh_pending = false;
-            ESP_LOGI(kTag, "queued coalesced word pack refresh after sync");
+        // Content convergence is level-triggered by SyncCoordinator's durable
+        // desired/applied journal. Bulk has independent admission/result
+        // slots, so an image/session request cannot suppress convergence and
+        // a multi-MB pack transfer cannot block interactive work.
+        const int64_t todo_now_ms = esp_timer_get_time() / 1000;
+        if (todo_desired_revision > todo_applied_revision &&
+            todo_now_ms >= todo_retry_not_before_ms) {
+            device_ui_internal::QueueTodoRefreshForRevision(
+                todo_desired_revision);
         }
-        if (note_pack_refresh_pending &&
-            !device_ui_internal::IsNoteCloudBusy() &&
-            device_ui_internal::QueueNotePackSync()) {
-            note_pack_refresh_pending = false;
-            ESP_LOGI(kTag, "queued coalesced note pack refresh after sync");
-        }
-        if (problem_pack_refresh_pending &&
-            !device_ui_internal::IsProblemCloudBusy() &&
-            device_ui_internal::QueueProblemPackSync()) {
-            problem_pack_refresh_pending = false;
-            ESP_LOGI(kTag, "queued coalesced problem pack refresh after sync");
-        }
+        device_ui_internal::QueueWordReviewRefresh();
+        device_ui_internal::QueueNotePackSync();
+        device_ui_internal::QueueProblemPackSync();
 
         // [epd-owner] Idle power-off / heavy-partial cleanup is the EPD refresh
         // task's job now (it is the sole panel owner). The UI task only asks;
@@ -1237,18 +1246,6 @@ esp_err_t StartDeviceUiIfEnabled()
     const esp_err_t display_result = EnsureDisplayPipelineStarted();
     if (display_result != ESP_OK) {
         return display_result;
-    }
-
-    if (g_sync_event_queue == nullptr) {
-        g_sync_event_queue = xQueueCreateStatic(
-            kSyncEventQueueDepth,
-            sizeof(wqn::services::SyncEvent),
-            g_sync_event_queue_buffer,
-            &g_sync_event_queue_storage);
-        if (g_sync_event_queue == nullptr) {
-            return ESP_ERR_NO_MEM;
-        }
-        wqn::services::SetSyncEventSink(UiSyncEventSink);
     }
 
     // One two-lane runner replaces the three per-domain cloud tasks; see

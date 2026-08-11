@@ -190,6 +190,7 @@ enum class SettingsDialog {
     kAutoSync,
     kBattery,
     kStorage,
+    kImageRendering,
     kVolume,
     kDefaultWordDeck,
     kFactoryReset,
@@ -213,6 +214,7 @@ struct SettingsDiagnosticsSnapshot {
     std::string firmware_version;
     std::string board_id;
     std::string idf_target;
+    std::string content_sync_label;
 };
 
 struct SettingsAppState {
@@ -222,6 +224,8 @@ struct SettingsAppState {
     uint32_t auto_sync_interval_min = 0;
     int volume_percent = 100;
     size_t volume_selected = 0;
+    ImageRenderMode image_render_mode = ImageRenderMode::kGray16;
+    size_t image_render_selected = 1;
     // 「WQN Word 默认词库」单选对话框: option 0 is the fixed 「全部词库」
     // (empty id), the rest mirror the mounted word deck catalog.
     std::vector<WordDeckInfo> word_deck_options;
@@ -245,6 +249,9 @@ struct SettingsAppState {
     int pending_volume_percent = 0;
     bool volume_pending_valid = false;
     uint32_t volume_save_op_id = 0;
+    ImageRenderMode pending_image_render_mode = ImageRenderMode::kGray16;
+    bool image_render_pending_valid = false;
+    uint32_t image_render_save_op_id = 0;
     // [deck-scope] In-flight/failed default-deck switch (c5). NOTHING is
     // installed optimistically: the deck, the session reset and the [词] rows
     // all wait for the durable ACK of the worker's marker-protocol

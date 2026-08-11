@@ -5,6 +5,8 @@
 
 #include "problem_cloud.h"
 
+#include <algorithm>
+#include <set>
 #include <utility>
 #include <vector>
 
@@ -110,6 +112,9 @@ esp_err_t SyncProblemPacks(const std::string& token, ProblemPackSyncResult* out)
     local_manifest.cursor = 0;
 
     size_t page_count = 0;
+    std::string manifest_snapshot_id;
+    std::set<std::string> seen_problem_sets;
+    bool listing_complete = false;
     bool has_more = out->result == ESP_OK;
     while (out->result == ESP_OK && has_more &&
            page_count < kMaxManifestPagesPerSync) {
@@ -117,9 +122,18 @@ esp_err_t SyncProblemPacks(const std::string& token, ProblemPackSyncResult* out)
         WqnProblemPackManifest delta;
         const auto metadata = services::MakeDeviceRequestMetadata();
         out->result = FetchProblemStudyManifest(
-            token, metadata, local_manifest.cursor, &delta);
+            token, metadata, local_manifest.cursor, &delta, manifest_snapshot_id);
         if (out->result != ESP_OK) {
             break;
+        }
+        if (!delta.snapshot_id.empty()) {
+            if (!manifest_snapshot_id.empty() &&
+                manifest_snapshot_id != delta.snapshot_id) {
+                out->result = ESP_ERR_INVALID_STATE;
+                out->message = "错题快照已变化，请重试";
+                break;
+            }
+            manifest_snapshot_id = delta.snapshot_id;
         }
         if (delta.has_more && delta.cursor <= local_manifest.cursor) {
             out->result = ESP_ERR_INVALID_RESPONSE;
@@ -132,6 +146,8 @@ esp_err_t SyncProblemPacks(const std::string& token, ProblemPackSyncResult* out)
         for (const WqnProblemPackManifestSet& item : delta.problem_sets) {
             if (item.deleted) {
                 manifest_content_changed = true;
+            } else {
+                seen_problem_sets.insert(item.problem_set_id);
             }
         }
 
@@ -207,6 +223,31 @@ esp_err_t SyncProblemPacks(const std::string& token, ProblemPackSyncResult* out)
     if (out->result == ESP_OK && has_more) {
         out->result = ESP_ERR_INVALID_SIZE;
         out->message = "错题变更过多，请重试";
+    } else if (out->result == ESP_OK) {
+        listing_complete = true;
+    }
+    if (listing_complete) {
+        // The manifest is a complete offset-relisted snapshot. Sets absent
+        // from the completed walk were deleted, archived, or are no longer
+        // visible to this user; retaining them would let applied_revision
+        // claim convergence while stale/private content remains on-device.
+        const size_t before = local_manifest.problem_sets.size();
+        local_manifest.problem_sets.erase(
+            std::remove_if(
+                local_manifest.problem_sets.begin(),
+                local_manifest.problem_sets.end(),
+                [&seen_problem_sets](const WqnProblemPackManifestSet& item) {
+                    return seen_problem_sets.count(item.problem_set_id) == 0;
+                }),
+            local_manifest.problem_sets.end());
+        if (local_manifest.problem_sets.size() != before) {
+            manifest_content_changed = true;
+            s_index_stale = true;
+            out->result = SaveProblemPackManifest(local_manifest);
+            ESP_LOGI(kTag, "problem manifest snapshot prune: removed=%u",
+                     static_cast<unsigned>(
+                         before - local_manifest.problem_sets.size()));
+        }
     }
 
     if (out->result == ESP_OK &&
@@ -232,6 +273,8 @@ esp_err_t SyncProblemPacks(const std::string& token, ProblemPackSyncResult* out)
             esp_err_to_name(out->result),
             out->message.empty() ? "-" : out->message.c_str(),
             s_index_stale ? 1 : 0);
+    } else {
+        out->snapshot_id = manifest_snapshot_id;
     }
     return out->result;
 }

@@ -8,6 +8,38 @@
 
 namespace wqn::services {
 
+enum class SyncContentDomain : uint8_t {
+    kWordPacks,
+    kNotePacks,
+    kProblemPacks,
+};
+
+enum class SyncContentPhase : uint8_t {
+    kClean,
+    kPending,
+    kFetching,
+    kInstalling,
+    kBackoff,
+    kBlocked,
+};
+
+struct SyncContentSnapshot {
+    uint64_t desired_revision = 0;
+    uint64_t applied_revision = 0;
+    SyncContentPhase phase = SyncContentPhase::kClean;
+    uint8_t retry_attempt = 0;
+    int64_t next_retry_ms = 0;
+    char snapshot_id[65] = {};
+    char last_error[64] = {};
+};
+
+struct SyncContentTicket {
+    SyncContentDomain domain = SyncContentDomain::kWordPacks;
+    uint32_t generation = 0;
+    uint64_t target_revision = 0;
+    explicit operator bool() const { return generation != 0; }
+};
+
 struct SyncSnapshot {
     bool task_running = false;
     bool last_round_success = false;
@@ -19,6 +51,11 @@ struct SyncSnapshot {
     char status[64] = {};
     char claim_code[9] = {};
     uint64_t claim_expires_at_ms = 0;
+    uint32_t state_sequence = 0;
+    uint64_t todo_revision = 0;
+    SyncContentSnapshot word_packs = {};
+    SyncContentSnapshot note_packs = {};
+    SyncContentSnapshot problem_packs = {};
 };
 
 enum class SyncEventStatus : uint8_t {
@@ -39,16 +76,32 @@ struct SyncEvent {
     int64_t finished_ms = 0;
     char claim_code[9] = {};
     uint64_t claim_expires_at_ms = 0;
+    // Live-only Todo target. Todo deliberately has no offline pack journal;
+    // the UI uses this monotonic target to schedule an interactive refresh.
+    uint64_t todo_revision = 0;
 };
 
-using SyncEventSink = void (*)(const SyncEvent& event);
-
-// Installs the consumer for immutable sync-domain events. The callback runs on
-// SyncService's task and must only copy or enqueue the fixed-size event.
-void SetSyncEventSink(SyncEventSink sink);
+// Returns the newest terminal/control-plane status event. The mailbox is
+// overwrite-safe: callers compare sequence and never depend on a bounded
+// queue preserving every intermediate status.
+void GetLatestSyncEvent(SyncEvent* event);
 
 esp_err_t StartSyncService();
 void RequestSyncNow();
+// Arms a durable content convergence intent. The coordinator coalesces this
+// with control-sync results; callers never need to relay a completion event.
+void RequestContentRefresh(SyncContentDomain domain);
+// Bulk-worker dispatch handshake. Claim moves Pending/Backoff -> Fetching;
+// completion is called by the bulk worker before it publishes its UI result,
+// so durable applied state never depends on the UI event loop.
+SyncContentTicket TryClaimContentRefresh(SyncContentDomain domain);
+void CancelContentRefreshClaim(const SyncContentTicket& ticket);
+esp_err_t BeginContentInstall(const SyncContentTicket& ticket);
+void CompleteContentRefresh(
+    const SyncContentTicket& ticket,
+    esp_err_t result,
+    const char* snapshot_id = nullptr,
+    const char* error = nullptr);
 // Marks the beginning of an interactive word action. An in-flight outbox
 // batch finishes its current idempotent item, then yields until the user has
 // been quiet again.

@@ -44,6 +44,13 @@ std::vector<std::string> WrapUtf8TextToWidth(const std::string& text, int max_wi
 // broad for the panel's hot partial path.
 esp_err_t RefreshEpdFull(bool allow_local_partial = true, bool force_full_refresh = false);
 
+// Full-screen 4bpp WQNI image refresh using the SSD2683 vendor-calibrated
+// sixteen-level waveform. This is a full refresh only; callers must provide
+// exactly kEpdGray4PayloadSize bytes (two pixels per source byte).
+constexpr size_t kEpdGray4RowBytes = kEpdWidth / 2;
+constexpr size_t kEpdGray4PayloadSize = kEpdGray4RowBytes * kEpdHeight;
+esp_err_t RefreshEpdGray16(const uint8_t* gray4, size_t size);
+
 esp_err_t PrepareDisplayForSleep(int64_t deadline_us);
 void RollbackDisplayAfterSleepAbort();
 // [epd-owner] The EPD refresh task registers itself as the panel owner at

@@ -281,6 +281,23 @@ esp_err_t RenderNoteToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
     // banner tracking the download, instead of a blocking loading page.
     if (note.mode == wqn::NoteAppMode::kNoteImageView && !note.note_image_error &&
         note.note_image_wqni != nullptr &&
+        note.note_image_wqni->size() >= wqn::kNoteImageHeaderBytes &&
+        note.note_image_wqni->data()[5] == 2 &&
+        note.note_image_wqni->size() ==
+            wqn::kNoteImageHeaderBytes + wqn::kNoteImageGray4PayloadBytes) {
+        // A gray download may expose the previous payload while progress is
+        // being reported. Re-running four waveform passes for every progress
+        // bucket would flash the panel and waste minutes of battery; keep the
+        // previous physical image until the variant is complete.
+        if (!note.note_image_ready) {
+            return ESP_OK;
+        }
+        return wqn::RefreshEpdGray16(
+            note.note_image_wqni->data() + wqn::kNoteImageHeaderBytes,
+            wqn::kNoteImageGray4PayloadBytes);
+    }
+    if (note.mode == wqn::NoteAppMode::kNoteImageView && !note.note_image_error &&
+        note.note_image_wqni != nullptr &&
         note.note_image_wqni->size() ==
             wqn::kNoteImageHeaderBytes + static_cast<size_t>(wqn::kEpdFramebufferSize)) {
         wqn::BlitEpdFramebuffer(

@@ -33,15 +33,21 @@ constexpr char kProblemTag[] = "wqn_problem_ui";
 }
 
 static std::atomic<bool> g_problem_cloud_busy{false};
+static std::atomic<bool> g_problem_pack_cloud_busy{false};
 wqn::runtime::SleepLease g_problem_sleep_lease;
+wqn::runtime::SleepLease g_problem_pack_sleep_lease;
 ProblemCloudResult g_problem_result_slot;
 uint32_t g_problem_result_generation = 0;
+ProblemCloudResult g_problem_pack_result_slot;
+uint32_t g_problem_pack_result_generation = 0;
 
-void FinishProblemCloudRequest()
+void FinishProblemCloudRequest(CloudDomain domain)
 {
-    g_problem_sleep_lease.Reset();
-    ClearCloudDomainBusyWatch(CloudDomain::kProblem);
-    g_problem_cloud_busy.store(false, std::memory_order_release);
+    const bool bulk = domain == CloudDomain::kProblemBulk;
+    (bulk ? g_problem_pack_sleep_lease : g_problem_sleep_lease).Reset();
+    ClearCloudDomainBusyWatch(domain);
+    (bulk ? g_problem_pack_cloud_busy : g_problem_cloud_busy).store(
+        false, std::memory_order_release);
 }
 
 bool IsProblemCloudBusy()
@@ -49,10 +55,17 @@ bool IsProblemCloudBusy()
     return g_problem_cloud_busy.load(std::memory_order_acquire);
 }
 
+bool IsProblemPackCloudBusy()
+{
+    return g_problem_pack_cloud_busy.load(std::memory_order_acquire);
+}
+
 bool QueueProblemCloudRequest(const ProblemCloudRequest& request)
 {
+    const bool bulk = request.op == ProblemCloudOp::kPackSync;
+    std::atomic<bool>& busy = bulk ? g_problem_pack_cloud_busy : g_problem_cloud_busy;
     bool expected = false;
-    if (!g_problem_cloud_busy.compare_exchange_strong(
+    if (!busy.compare_exchange_strong(
             expected, true, std::memory_order_acq_rel, std::memory_order_acquire)) {
         return false;
     }
@@ -62,15 +75,15 @@ bool QueueProblemCloudRequest(const ProblemCloudRequest& request)
     wqn::runtime::SleepLease lease = wqn::runtime::SleepLease::TryAcquire(
         wqn::runtime::SleepBlocker::kNoteCloud, "problem-cloud", __FILE__, __LINE__);
     if (!lease) {
-        g_problem_cloud_busy.store(false, std::memory_order_release);
+        busy.store(false, std::memory_order_release);
         return false;
     }
-    g_problem_sleep_lease = std::move(lease);
+    (bulk ? g_problem_pack_sleep_lease : g_problem_sleep_lease) = std::move(lease);
     CloudJob job;
-    job.domain = CloudDomain::kProblem;
+    job.domain = bulk ? CloudDomain::kProblemBulk : CloudDomain::kProblem;
     job.problem = request;
     if (!EnqueueCloudJob(job)) {
-        FinishProblemCloudRequest();
+        FinishProblemCloudRequest(job.domain);
         return false;
     }
     return true;
@@ -78,16 +91,29 @@ bool QueueProblemCloudRequest(const ProblemCloudRequest& request)
 
 bool QueueProblemPackSync()
 {
+    const wqn::services::SyncContentTicket ticket =
+        wqn::services::TryClaimContentRefresh(
+            wqn::services::SyncContentDomain::kProblemPacks);
+    if (!ticket) {
+        return false;
+    }
     ProblemCloudRequest request;
     request.op = ProblemCloudOp::kPackSync;
-    return QueueProblemCloudRequest(request);
+    request.content_sync_generation = ticket.generation;
+    request.content_target_revision = ticket.target_revision;
+    if (!QueueProblemCloudRequest(request)) {
+        wqn::services::CancelContentRefreshClaim(ticket);
+        return false;
+    }
+    return true;
 }
 
 bool QueueProblemImageFetch(
     const std::string& problem_id,
     bool is_solution,
     uint8_t image_index,
-    const std::string& image_id)
+    const std::string& image_id,
+    bool gray4)
 {
     if (problem_id.size() != 36 || image_index > 7 || image_id.size() != 64) {
         return false;
@@ -99,6 +125,7 @@ bool QueueProblemImageFetch(
     std::snprintf(request.image_id, sizeof(request.image_id), "%s", image_id.c_str());
     request.image_index = image_index;
     request.image_kind = is_solution ? 1 : 0;
+    request.image_gray4 = gray4;
     return QueueProblemCloudRequest(request);
 }
 
@@ -112,11 +139,13 @@ void PumpProblemImageFetch(UiRuntime* runtime)
     bool is_solution = false;
     uint8_t image_index = 0;
     std::string image_id;
+    bool gray4 = false;
     if (!runtime->TakeProblemImageRequest(
-            &problem_id, &is_solution, &image_index, &image_id)) {
+            &problem_id, &is_solution, &image_index, &image_id, &gray4)) {
         return;
     }
-    if (!QueueProblemImageFetch(problem_id, is_solution, image_index, image_id)) {
+    if (!QueueProblemImageFetch(
+            problem_id, is_solution, image_index, image_id, gray4)) {
         ESP_LOGW(kProblemTag, "problem image queue rejected (busy=%d); will retry",
                  IsProblemCloudBusy() ? 1 : 0);
         runtime->RestoreProblemImageRequest();
@@ -161,20 +190,26 @@ RefreshSchedule PumpProblemVerdictCommit(UiRuntime* runtime)
     return RefreshSchedule::kNone;
 }
 
-ProblemCloudResult* PeekProblemCloudResult(uint32_t generation)
+ProblemCloudResult* PeekProblemCloudResult(CloudDomain domain, uint32_t generation)
 {
-    if (generation == 0 || generation != g_problem_result_generation) {
+    const bool bulk = domain == CloudDomain::kProblemBulk;
+    const uint32_t current = bulk ? g_problem_pack_result_generation
+                                  : g_problem_result_generation;
+    if (generation == 0 || generation != current) {
         return nullptr;
     }
-    return &g_problem_result_slot;
+    return bulk ? &g_problem_pack_result_slot : &g_problem_result_slot;
 }
 
-void SendProblemCloudResult()
+void SendProblemCloudResult(CloudDomain domain)
 {
+    const uint32_t generation = domain == CloudDomain::kProblemBulk
+        ? g_problem_pack_result_generation
+        : g_problem_result_generation;
     CloudResultReady ready;
-    ready.domain = CloudDomain::kProblem;
-    ready.generation = g_problem_result_generation;
-    PublishCloudResult(CloudDomain::kProblem, g_problem_result_generation);
+    ready.domain = domain;
+    ready.generation = generation;
+    PublishCloudResult(domain, generation);
     (void)ready;
 }
 
@@ -241,30 +276,55 @@ bool ApplyProblemCloudResult(wqn::UiState* state, ProblemCloudResult& result)
 
 void ExecuteProblemCloudRequest(const ProblemCloudRequest& request)
 {
-    g_problem_result_slot = ProblemCloudResult{};
-    ++g_problem_result_generation;
-    if (g_problem_result_generation == 0) {
-        ++g_problem_result_generation;
+    const CloudDomain result_domain = request.op == ProblemCloudOp::kPackSync
+        ? CloudDomain::kProblemBulk
+        : CloudDomain::kProblem;
+    const wqn::services::SyncContentTicket content_ticket = {
+        wqn::services::SyncContentDomain::kProblemPacks,
+        request.content_sync_generation,
+        request.content_target_revision,
+    };
+    ProblemCloudResult& result_slot = result_domain == CloudDomain::kProblemBulk
+        ? g_problem_pack_result_slot
+        : g_problem_result_slot;
+    uint32_t& result_generation = result_domain == CloudDomain::kProblemBulk
+        ? g_problem_pack_result_generation
+        : g_problem_result_generation;
+    result_slot = ProblemCloudResult{};
+    ++result_generation;
+    if (result_generation == 0) {
+        ++result_generation;
     }
-    ProblemCloudResult& result = g_problem_result_slot;
+    ProblemCloudResult& result = result_slot;
     result.op = request.op;
     result.message.clear();
+    std::string content_snapshot_id;
 
     std::string token;
     if (!LoadValidTokenForTodo(&token)) {
         result.auth_required = true;
         result.result = ESP_ERR_INVALID_STATE;
-        SendProblemCloudResult();
+        if (request.op == ProblemCloudOp::kPackSync) {
+            wqn::services::CompleteContentRefresh(
+                content_ticket, result.result, nullptr, "auth-required");
+        }
+        SendProblemCloudResult(result_domain);
         return;
     }
 
     if (request.op == ProblemCloudOp::kPackSync) {
         wqn::ProblemPackSyncResult sync;
-        result.result = wqn::SyncProblemPacks(token, &sync);
+        result.result = wqn::services::BeginContentInstall(content_ticket);
+        if (result.result == ESP_OK) {
+            result.result = wqn::SyncProblemPacks(token, &sync);
+        } else {
+            sync.message = "错题安装标记失败";
+        }
         result.pack_index = std::move(sync.index);
         result.pack_index_ready = sync.index_ready;
         result.message = sync.message;
         result.auth_required = sync.auth_required;
+        content_snapshot_id = sync.snapshot_id;
     } else if (request.op == ProblemCloudOp::kFetchImage) {
         // Cache first: image ids are content hashes shared with the note
         // domain's ni_ pool, so a hit needs no network at all.
@@ -288,7 +348,9 @@ void ExecuteProblemCloudRequest(const ProblemCloudRequest& request)
                                         : wqn::WqnProblemImageKind::kAssets,
                 request.image_index,
                 image_id,
-                wqni.get());
+                wqni.get(),
+                request.image_gray4 ? wqn::WqnImagePixelFormat::kGray4
+                                     : wqn::WqnImagePixelFormat::kBw1);
             if (result.result == ESP_OK) {
                 result.result =
                     wqn::ValidateNoteImageWqni(wqni->data(), wqni->size());
@@ -315,7 +377,13 @@ void ExecuteProblemCloudRequest(const ProblemCloudRequest& request)
         std::string after_token;
         result.auth_required = !LoadValidTokenForTodo(&after_token);
     }
-    SendProblemCloudResult();
+    if (request.op == ProblemCloudOp::kPackSync) {
+        wqn::services::CompleteContentRefresh(
+            content_ticket, result.result,
+            content_snapshot_id.empty() ? nullptr : content_snapshot_id.c_str(),
+            result.result == ESP_OK ? nullptr : result.message.c_str());
+    }
+    SendProblemCloudResult(result_domain);
 }
 
 }  // namespace device_ui_internal

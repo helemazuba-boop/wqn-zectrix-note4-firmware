@@ -594,6 +594,29 @@ esp_err_t ParseNoteRecordLine(const char* line, wqn::WqnNoteEntry* entry, bool i
             entry->image_ids.emplace_back(image_id->valuestring);
         }
     }
+    cJSON* gray4_ids =
+        cJSON_GetObjectItemCaseSensitive(document.root(), "gray4_image_ids");
+    if (gray4_ids == nullptr || cJSON_IsNull(gray4_ids)) {
+        entry->gray4_image_ids.resize(entry->image_ids.size());
+    } else {
+        if (!cJSON_IsArray(gray4_ids) ||
+            cJSON_GetArraySize(gray4_ids) !=
+                static_cast<int>(entry->image_ids.size())) {
+            return ESP_ERR_INVALID_RESPONSE;
+        }
+        cJSON* gray4_id = nullptr;
+        cJSON_ArrayForEach(gray4_id, gray4_ids) {
+            if (cJSON_IsNull(gray4_id)) {
+                entry->gray4_image_ids.emplace_back();
+            } else if (cJSON_IsString(gray4_id) &&
+                       gray4_id->valuestring != nullptr &&
+                       std::strlen(gray4_id->valuestring) == 64) {
+                entry->gray4_image_ids.emplace_back(gray4_id->valuestring);
+            } else {
+                return ESP_ERR_INVALID_RESPONSE;
+            }
+        }
+    }
     return ESP_OK;
 }
 
@@ -1381,7 +1404,7 @@ void EvictNoteImageCacheIfNeeded()
 
 esp_err_t ValidateNoteImageWqni(const uint8_t* data, size_t size)
 {
-    if (data == nullptr || size != kNoteImageFileBytes) {
+    if (data == nullptr || size < kNoteImageHeaderBytes) {
         return ESP_ERR_INVALID_SIZE;
     }
     if (std::memcmp(data, "WQNI", 4) != 0) {
@@ -1398,12 +1421,16 @@ esp_err_t ValidateNoteImageWqni(const uint8_t* data, size_t size)
     std::memcpy(&crc, data + 16, sizeof(crc));
     // flags 0x0003 = MSB-first bit order + 1-renders-white: the exact wqn_epd
     // framebuffer convention. Anything else would need a transform we do not do.
-    if (version != 1 || pixel_format != 1 || flags != 0x0003 || width != 400 ||
-        height != 300 || payload_length != kNoteImagePayloadBytes) {
+    const size_t expected_payload = pixel_format == 1
+        ? kNoteImagePayloadBytes
+        : pixel_format == 2 ? kNoteImageGray4PayloadBytes : 0;
+    if (version != 1 || flags != 0x0003 || width != 400 || height != 300 ||
+        expected_payload == 0 || payload_length != expected_payload ||
+        size != kNoteImageHeaderBytes + expected_payload) {
         return ESP_ERR_INVALID_RESPONSE;
     }
     const uint32_t actual = esp_rom_crc32_le(
-        0, data + kNoteImageHeaderBytes, kNoteImagePayloadBytes);
+        0, data + kNoteImageHeaderBytes, expected_payload);
     if (actual != crc) {
         return ESP_ERR_INVALID_CRC;
     }
@@ -1420,11 +1447,30 @@ esp_err_t LoadCachedNoteImage(const std::string& image_id, std::vector<uint8_t>*
     if (file == nullptr) {
         return ESP_ERR_NOT_FOUND;
     }
-    wqni->assign(kNoteImageFileBytes, 0);
-    const size_t read = std::fread(wqni->data(), 1, kNoteImageFileBytes, file);
+    // Read the header first so the cache accepts either BW1 or GRAY4 without
+    // allocating a second fixed-size buffer.
+    std::array<uint8_t, kNoteImageHeaderBytes> header = {};
+    const size_t header_read = std::fread(header.data(), 1, header.size(), file);
+    if (header_read != header.size()) {
+        std::fclose(file);
+        unlink(path.c_str());
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    const uint8_t format = header[5];
+    const size_t payload = format == 1 ? kNoteImagePayloadBytes
+        : format == 2 ? kNoteImageGray4PayloadBytes : 0;
+    if (payload == 0) {
+        std::fclose(file);
+        unlink(path.c_str());
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    wqni->assign(kNoteImageHeaderBytes + payload, 0);
+    std::memcpy(wqni->data(), header.data(), header.size());
+    const size_t read = std::fread(
+        wqni->data() + kNoteImageHeaderBytes, 1, payload, file);
     const bool extra = std::fgetc(file) != EOF;
     std::fclose(file);
-    if (read != kNoteImageFileBytes || extra ||
+    if (read != payload || extra ||
         ValidateNoteImageWqni(wqni->data(), wqni->size()) != ESP_OK) {
         // Corrupt cache entries are dropped so the next request re-downloads.
         unlink(path.c_str());

@@ -63,12 +63,14 @@ esp_err_t DrawSettingsRow(size_t row_index, int y, const std::string& title, con
     } else if (row_index == 1) {
         tag = "设置";
     } else if (row_index == 4) {
-        tag = "设置";  // volume
+        tag = "设置";  // image rendering
     } else if (row_index == 5) {
-        tag = "设置";  // default word deck
+        tag = "设置";  // volume
     } else if (row_index == 6) {
-        tag = "系统";  // firmware version
+        tag = "设置";  // default word deck
     } else if (row_index == 7) {
+        tag = "系统";  // firmware version
+    } else if (row_index == 8) {
         tag = "重置";  // factory reset
     }
     DrawChip(kContentX + kContentWidth - 6 - 54, y + 8, 54, 20, tag);
@@ -137,7 +139,10 @@ esp_err_t RenderSettingsDialog(const wqn::SettingsAppState& settings)
         case wqn::SettingsDialog::kStorage: {
             ESP_RETURN_ON_ERROR(DrawSettingsDialogBox("存储详情"), kTag, "draw storage dialog");
             ESP_RETURN_ON_ERROR(DrawClippedText(88, 94, 224, "Flash: " + BytesLabel(diag.flash_size)), kTag, "draw flash size");
-            DrawProgressBar(88, 114, 224, 9, 0, 1);  // flash usage bar (empty track; size shown as text)
+            ESP_RETURN_ON_ERROR(
+                DrawClippedText(88, 112, 224, diag.content_sync_label),
+                kTag,
+                "draw content sync revisions");
             ESP_RETURN_ON_ERROR(
                 DrawClippedText(
                     88,
@@ -154,6 +159,25 @@ esp_err_t RenderSettingsDialog(const wqn::SettingsAppState& settings)
             const int psram_total_kb = static_cast<int>(std::max<size_t>(1, diag.psram_total / 1024));
             DrawProgressBar(88, 188, 224, 9, psram_used_kb, psram_total_kb);
             ESP_RETURN_ON_ERROR(DrawClippedText(88, 202, 224, "PSRAM free: " + BytesLabel(diag.psram_free)), kTag, "draw psram free");
+            break;
+        }
+        case wqn::SettingsDialog::kImageRendering: {
+            ESP_RETURN_ON_ERROR(
+                DrawSettingsDialogBox("图片渲染方式"), kTag,
+                "draw image rendering dialog");
+            ESP_RETURN_ON_ERROR(
+                DrawSettingsOptionCard(
+                    88, 112, 224, "黑白｜快速省电",
+                    settings.image_render_selected == 0),
+                kTag, "draw BW image option");
+            ESP_RETURN_ON_ERROR(
+                DrawSettingsOptionCard(
+                    88, 156, 224, "16阶灰度｜细节优先",
+                    settings.image_render_selected == 1),
+                kTag, "draw gray image option");
+            ESP_RETURN_ON_ERROR(
+                DrawCenteredText(86, 202, 228, "上下选择  确认保存"), kTag,
+                "draw image rendering help");
             break;
         }
         case wqn::SettingsDialog::kVolume: {
@@ -254,6 +278,8 @@ esp_err_t RenderSettingsToEpd(const wqn::UiFrame& frame, RefreshSchedule schedul
 
     const std::string auto_sync_label = wqn::AutoSyncIntervalLabel(settings.auto_sync_interval_min);
     const std::string volume_label = wqn::VolumeLabel(settings.volume_percent);
+    const std::string image_render_label =
+        wqn::ImageRenderModeLabel(settings.image_render_mode);
     const std::string battery_value =
         diag.full ? "满电" : (diag.charging ? "充电 " + std::to_string(diag.battery_percent) + "%" : std::to_string(diag.battery_percent) + "%");
     const std::string storage_value = "NVS " + std::to_string(diag.nvs_used_entries) + "/" + std::to_string(diag.nvs_total_entries);
@@ -264,6 +290,7 @@ esp_err_t RenderSettingsToEpd(const wqn::UiFrame& frame, RefreshSchedule schedul
         "自动同步间隔",
         "电量",
         "存储详情",
+        "图片渲染",
         "音量",
         "Word 默认词库",
         "固件版本",
@@ -274,13 +301,14 @@ esp_err_t RenderSettingsToEpd(const wqn::UiFrame& frame, RefreshSchedule schedul
         auto_sync_label,
         battery_value,
         storage_value,
+        image_render_label,
         volume_label,
         settings.default_word_deck_title.empty() ? "全部词库" : settings.default_word_deck_title,
         version_value,
         "",
     };
 
-    // Eight rows no longer fit the 300px panel at the 38px pitch; draw a
+    // Nine rows no longer fit the 300px panel at the 38px pitch; draw a
     // selection-following window instead (deterministic from the selection so
     // partial refreshes repaint consistently).
     size_t window_start = 0;
@@ -334,6 +362,13 @@ void OpenSettingsDialog(wqn::UiState* state, wqn::SettingsDialog dialog)
             ? state->settings.pending_volume_percent
             : state->settings.volume_percent;
         state->settings.volume_selected = VolumeOptionIndex(seed);
+    } else if (dialog == wqn::SettingsDialog::kImageRendering) {
+        const wqn::ImageRenderMode seed =
+            state->settings.image_render_pending_valid
+            ? state->settings.pending_image_render_mode
+            : state->settings.image_render_mode;
+        state->settings.image_render_selected =
+            seed == wqn::ImageRenderMode::kBlackWhite ? 0 : 1;
     } else if (dialog == wqn::SettingsDialog::kDefaultWordDeck) {
         // Option 0 is the fixed 全部词库; the rest mirror the mounted deck
         // catalog. Preselect an armed-but-unsaved switch (submit rejected or

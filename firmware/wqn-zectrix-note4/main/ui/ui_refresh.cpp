@@ -649,6 +649,11 @@ std::string FrameSignature(const wqn::UiFrame& frame)
         signature.push_back('/');
         signature.append(std::to_string(frame.settings.auto_sync_interval_min));
         signature.push_back('/');
+        signature.append(std::to_string(
+            static_cast<int>(frame.settings.image_render_mode)));
+        signature.push_back('/');
+        signature.append(std::to_string(frame.settings.image_render_selected));
+        signature.push_back('/');
         signature.append(std::to_string(frame.settings.volume_percent));
         signature.push_back('/');
         signature.append(std::to_string(frame.settings.volume_selected));

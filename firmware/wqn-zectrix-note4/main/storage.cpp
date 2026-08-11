@@ -1,10 +1,13 @@
 #include "storage.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <cmath>
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
+#include <unistd.h>
 #include <vector>
 
 #include "cJSON.h"
@@ -31,18 +34,23 @@ constexpr char kProblemsKey[] = "problems";
 constexpr char kPendingReviewsKey[] = "pending_reviews";
 constexpr char kAiSessionKey[] = "ai_session_day";
 constexpr char kAutoSyncIntervalMinKey[] = "sync_min";
+constexpr char kImageRenderModeKey[] = "img_render";
 constexpr char kDefaultWordDeckKey[] = "word_deck";
 constexpr char kWifiSsidKey[] = "wifi_ssid";
 constexpr char kWifiPasswordKey[] = "wifi_pass";
 constexpr char kControlConfigRevisionKey[] = "v3_cfg_rev";
 constexpr char kControlSyncCursorKey[] = "v3_cursor";
 static_assert(sizeof(kAutoSyncIntervalMinKey) <= 16, "NVS key must fit ESP-IDF's 15-character limit");
+static_assert(sizeof(kImageRenderModeKey) <= 16, "NVS key must fit ESP-IDF's 15-character limit");
 static_assert(sizeof(kWifiSsidKey) <= 16, "NVS key must fit ESP-IDF's 15-character limit");
 static_assert(sizeof(kWifiPasswordKey) <= 16, "NVS key must fit ESP-IDF's 15-character limit");
 static_assert(sizeof(kControlConfigRevisionKey) <= 16, "NVS key must fit ESP-IDF's 15-character limit");
 static_assert(sizeof(kControlSyncCursorKey) <= 16, "NVS key must fit ESP-IDF's 15-character limit");
 constexpr char kStoragePartitionLabel[] = "storage";
 constexpr char kStorageBasePath[] = "/storage";
+constexpr char kSyncJournalPath[] = "/storage/sync_journal.json";
+constexpr char kSyncJournalTempPath[] = "/storage/sync_journal.tmp";
+constexpr char kSyncJournalBackupPath[] = "/storage/sync_journal.bak";
 
 struct NvsHandle {
     ~NvsHandle()
@@ -406,6 +414,191 @@ esp_err_t JsonToString(cJSON* root, std::string* output)
     return ESP_OK;
 }
 
+esp_err_t ReadStorageTextFile(const char* path, std::string* output)
+{
+    if (path == nullptr || output == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    output->clear();
+    FILE* file = std::fopen(path, "rb");
+    if (file == nullptr) {
+        return errno == ENOENT ? ESP_ERR_NOT_FOUND : ESP_FAIL;
+    }
+    if (std::fseek(file, 0, SEEK_END) != 0) {
+        std::fclose(file);
+        return ESP_FAIL;
+    }
+    const long length = std::ftell(file);
+    if (length < 0 || std::fseek(file, 0, SEEK_SET) != 0) {
+        std::fclose(file);
+        return ESP_FAIL;
+    }
+    output->resize(static_cast<size_t>(length));
+    if (!output->empty() &&
+        std::fread(output->data(), 1, output->size(), file) != output->size()) {
+        std::fclose(file);
+        output->clear();
+        return ESP_FAIL;
+    }
+    return std::fclose(file) == 0 ? ESP_OK : ESP_FAIL;
+}
+
+esp_err_t WriteSyncJournalFileAtomic(const std::string& payload)
+{
+    FILE* file = std::fopen(kSyncJournalTempPath, "wb");
+    if (file == nullptr) {
+        return ESP_FAIL;
+    }
+    const bool complete = payload.empty() ||
+        std::fwrite(payload.data(), 1, payload.size(), file) == payload.size();
+    const bool flushed = complete && std::fflush(file) == 0 &&
+        ::fsync(fileno(file)) == 0;
+    const bool closed = std::fclose(file) == 0;
+    if (!complete || !flushed || !closed) {
+        std::remove(kSyncJournalTempPath);
+        return ESP_FAIL;
+    }
+    std::remove(kSyncJournalBackupPath);
+    if (std::rename(kSyncJournalPath, kSyncJournalBackupPath) != 0 && errno != ENOENT) {
+        std::remove(kSyncJournalTempPath);
+        return ESP_FAIL;
+    }
+    if (std::rename(kSyncJournalTempPath, kSyncJournalPath) != 0) {
+        std::rename(kSyncJournalBackupPath, kSyncJournalPath);
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
+void AddJournalContentState(cJSON* parent, const char* key,
+                            const wqn::SyncJournalContentState& state)
+{
+    cJSON* object = cJSON_CreateObject();
+    if (object == nullptr) {
+        return;
+    }
+    cJSON_AddNumberToObject(object, "desired_revision",
+                            static_cast<double>(state.desired_revision));
+    cJSON_AddNumberToObject(object, "applied_revision",
+                            static_cast<double>(state.applied_revision));
+    cJSON_AddNumberToObject(object, "phase",
+                            static_cast<double>(static_cast<uint8_t>(state.phase)));
+    cJSON_AddNumberToObject(object, "retry_attempt",
+                            static_cast<double>(state.retry_attempt));
+    cJSON_AddStringToObject(object, "desired_snapshot_id", state.desired_snapshot_id);
+    cJSON_AddStringToObject(object, "active_snapshot_id", state.active_snapshot_id);
+    cJSON_AddItemToObject(parent, key, object);
+}
+
+bool ReadJournalU64(cJSON* object, const char* key, uint64_t* value)
+{
+    if (object == nullptr || value == nullptr) {
+        return false;
+    }
+    cJSON* item = cJSON_GetObjectItemCaseSensitive(object, key);
+    if (!cJSON_IsNumber(item) || !std::isfinite(item->valuedouble) ||
+        item->valuedouble < 0 ||
+        item->valuedouble > 9007199254740991.0 ||
+        std::floor(item->valuedouble) != item->valuedouble) {
+        return false;
+    }
+    *value = static_cast<uint64_t>(item->valuedouble);
+    return true;
+}
+
+std::string ReadJournalString(cJSON* object, const char* key)
+{
+    cJSON* item = cJSON_GetObjectItemCaseSensitive(object, key);
+    return cJSON_IsString(item) && item->valuestring != nullptr
+        ? item->valuestring
+        : std::string();
+}
+
+bool ReadJournalContentState(cJSON* parent, const char* key,
+                             wqn::SyncJournalContentState* state)
+{
+    if (parent == nullptr || state == nullptr) {
+        return false;
+    }
+    cJSON* object = cJSON_GetObjectItemCaseSensitive(parent, key);
+    if (!cJSON_IsObject(object)) {
+        return false;
+    }
+    uint64_t desired = 0;
+    uint64_t applied = 0;
+    uint64_t phase = 0;
+    uint64_t retry = 0;
+    const auto valid_snapshot_id = [](const std::string& value) {
+        return value.empty() ||
+            (value.size() == 64 && std::all_of(
+                value.begin(), value.end(), [](char ch) {
+                    return (ch >= '0' && ch <= '9') ||
+                        (ch >= 'a' && ch <= 'f');
+                }));
+    };
+    if (!ReadJournalU64(object, "desired_revision", &desired) ||
+        !ReadJournalU64(object, "applied_revision", &applied) ||
+        !ReadJournalU64(object, "phase", &phase) ||
+        !ReadJournalU64(object, "retry_attempt", &retry) ||
+        phase > static_cast<uint64_t>(wqn::SyncJournalPhase::kBlocked) ||
+        retry > UINT8_MAX || applied > desired) {
+        return false;
+    }
+    const std::string desired_snapshot = ReadJournalString(object, "desired_snapshot_id");
+    const std::string active_snapshot = ReadJournalString(object, "active_snapshot_id");
+    if (!valid_snapshot_id(desired_snapshot) ||
+        !valid_snapshot_id(active_snapshot)) {
+        return false;
+    }
+    state->desired_revision = desired;
+    state->applied_revision = applied;
+    state->phase = static_cast<wqn::SyncJournalPhase>(phase);
+    state->retry_attempt = static_cast<uint8_t>(retry);
+    std::snprintf(state->desired_snapshot_id,
+                  sizeof(state->desired_snapshot_id), "%s", desired_snapshot.c_str());
+    std::snprintf(state->active_snapshot_id,
+                  sizeof(state->active_snapshot_id), "%s", active_snapshot.c_str());
+    return true;
+}
+
+esp_err_t ParseSyncJournalPayload(
+    const std::string& payload,
+    wqn::SyncJournal* journal)
+{
+    if (journal == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *journal = {};
+    if (payload.empty() || payload.find('\0') != std::string::npos) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    cJSON* root = cJSON_ParseWithOpts(payload.c_str(), nullptr, true);
+    if (!cJSON_IsObject(root)) {
+        cJSON_Delete(root);
+        return ESP_ERR_INVALID_STATE;
+    }
+    uint64_t schema = 0;
+    uint64_t config_revision = 0;
+    uint64_t sync_cursor = 0;
+    const bool valid =
+        ReadJournalU64(root, "schema_version", &schema) &&
+        ReadJournalU64(root, "config_revision", &config_revision) &&
+        ReadJournalU64(root, "sync_cursor", &sync_cursor) &&
+        schema == 1 &&
+        ReadJournalContentState(root, "word_packs", &journal->word_packs) &&
+        ReadJournalContentState(root, "note_packs", &journal->note_packs) &&
+        ReadJournalContentState(root, "problem_packs", &journal->problem_packs);
+    cJSON_Delete(root);
+    if (!valid) {
+        *journal = {};
+        return ESP_ERR_INVALID_STATE;
+    }
+    journal->schema_version = static_cast<uint32_t>(schema);
+    journal->config_revision = config_revision;
+    journal->sync_cursor = sync_cursor;
+    return ESP_OK;
+}
+
 esp_err_t RemovePrototypeProblemFile(const char* path)
 {
     if (std::remove(path) == 0 || errno == ENOENT) {
@@ -630,6 +823,72 @@ esp_err_t SaveDeviceControlState(const DeviceControlState& state)
         const_cast<DeviceControlState*>(&state));
 }
 
+esp_err_t LoadSyncJournal(SyncJournal* journal)
+{
+    if (journal == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    std::string payload;
+    esp_err_t primary_result = ReadStorageTextFile(kSyncJournalPath, &payload);
+    if (primary_result == ESP_OK) {
+        primary_result = ParseSyncJournalPayload(payload, journal);
+        if (primary_result == ESP_OK) {
+            return ESP_OK;
+        }
+        ESP_LOGW(kTag, "primary sync journal invalid; trying backup");
+    } else if (primary_result != ESP_ERR_NOT_FOUND) {
+        ESP_LOGW(kTag, "primary sync journal unreadable; trying backup");
+    }
+
+    payload.clear();
+    esp_err_t backup_result = ReadStorageTextFile(kSyncJournalBackupPath, &payload);
+    if (backup_result == ESP_OK) {
+        backup_result = ParseSyncJournalPayload(payload, journal);
+        if (backup_result == ESP_OK) {
+            ESP_LOGW(kTag, "recovered sync journal from backup");
+            return ESP_OK;
+        }
+    }
+    *journal = {};
+    if (primary_result == ESP_ERR_NOT_FOUND &&
+        backup_result == ESP_ERR_NOT_FOUND) {
+        return ESP_OK;
+    }
+    return backup_result != ESP_ERR_NOT_FOUND
+        ? backup_result
+        : primary_result;
+}
+
+esp_err_t SaveSyncJournal(const SyncJournal& journal)
+{
+    if (journal.schema_version != 1) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    StorageWriteGuard write("save-sync-journal", __FILE__, __LINE__);
+    if (!write) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    cJSON* root = cJSON_CreateObject();
+    if (root == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
+    cJSON_AddNumberToObject(root, "schema_version", journal.schema_version);
+    cJSON_AddNumberToObject(root, "config_revision",
+                            static_cast<double>(journal.config_revision));
+    cJSON_AddNumberToObject(root, "sync_cursor",
+                            static_cast<double>(journal.sync_cursor));
+    AddJournalContentState(root, "word_packs", journal.word_packs);
+    AddJournalContentState(root, "note_packs", journal.note_packs);
+    AddJournalContentState(root, "problem_packs", journal.problem_packs);
+    std::string payload;
+    const esp_err_t render_result = JsonToString(root, &payload);
+    cJSON_Delete(root);
+    if (render_result != ESP_OK) {
+        return render_result;
+    }
+    return WriteSyncJournalFileAtomic(payload);
+}
+
 esp_err_t SaveAiSessionForDay(const CachedAiSession& session)
 {
     StorageWriteGuard write("save-ai-session", __FILE__, __LINE__);
@@ -763,6 +1022,44 @@ esp_err_t SaveAutoSyncIntervalMinutesForeground(uint32_t minutes)
     U64WriteContext context = {kAutoSyncIntervalMinKey, minutes};
     return services::ExecuteForegroundStorageTransaction(
         SaveU64Transaction, &context, "save-sync-interval");
+}
+
+esp_err_t LoadImageRenderMode(ImageRenderMode* mode)
+{
+    if (mode == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    uint64_t raw = 0;
+    bool found = false;
+    ESP_RETURN_ON_ERROR(
+        LoadU64FromNvs(kImageRenderModeKey, &raw, &found), kTag,
+        "load image render mode");
+    // GRAY16 is the product default. Unknown future values degrade to the
+    // same safe full-refresh path rather than silently selecting BW1.
+    *mode = found && raw == static_cast<uint64_t>(ImageRenderMode::kBlackWhite)
+        ? ImageRenderMode::kBlackWhite
+        : ImageRenderMode::kGray16;
+    return ESP_OK;
+}
+
+esp_err_t SaveImageRenderModeForeground(ImageRenderMode mode)
+{
+    if (mode != ImageRenderMode::kBlackWhite && mode != ImageRenderMode::kGray16) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    StorageWriteGuard write("save-image-render", __FILE__, __LINE__);
+    if (!write) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    U64WriteContext context = {
+        kImageRenderModeKey, static_cast<uint64_t>(mode)};
+    return services::ExecuteForegroundStorageTransaction(
+        SaveU64Transaction, &context, "save-image-render");
+}
+
+std::string ImageRenderModeLabel(ImageRenderMode mode)
+{
+    return mode == ImageRenderMode::kBlackWhite ? "黑白" : "16阶灰度";
 }
 
 esp_err_t LoadDefaultWordDeckId(std::string* deck_id)

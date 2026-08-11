@@ -182,6 +182,9 @@ esp_err_t ExecutePersistCommand(PersistCommand& command)
         case PersistKind::kSettingsAutoSync:
             return wqn::SaveAutoSyncIntervalMinutesForeground(
                 static_cast<uint32_t>(command.settings_int));
+        case PersistKind::kSettingsImageRender:
+            return wqn::SaveImageRenderModeForeground(
+                static_cast<wqn::ImageRenderMode>(command.settings_int));
         case PersistKind::kSettingsVolume:
             return wqn::SaveVolumePercentForeground(command.settings_int);
         case PersistKind::kSettingsDefaultDeck:
@@ -406,6 +409,22 @@ uint32_t SubmitAutoSyncIntervalSave(uint32_t minutes)
     }
     PersistCommand& command = g_pool[ticket.slot_index];
     command.settings_int = static_cast<int>(minutes);
+    EnqueueReserved(command, ticket.slot_index, ticket.kind);
+    return ticket.operation_id;
+}
+
+uint32_t SubmitImageRenderModeSave(wqn::ImageRenderMode mode)
+{
+    if (mode != wqn::ImageRenderMode::kBlackWhite &&
+        mode != wqn::ImageRenderMode::kGray16) {
+        return 0;
+    }
+    PersistTicket ticket = TryReservePersist(PersistKind::kSettingsImageRender);
+    if (!ticket.valid()) {
+        return 0;
+    }
+    PersistCommand& command = g_pool[ticket.slot_index];
+    command.settings_int = static_cast<int>(mode);
     EnqueueReserved(command, ticket.slot_index, ticket.kind);
     return ticket.operation_id;
 }

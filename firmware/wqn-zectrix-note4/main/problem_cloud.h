@@ -17,6 +17,7 @@ struct ProblemPackSyncResult {
     bool auth_required = false;
     ProblemPackIndex index;
     std::string message;
+    std::string snapshot_id;
 };
 
 // Runs one problem-pack content sync: relists the problem-study manifest from

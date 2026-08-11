@@ -214,6 +214,18 @@ esp_err_t RenderProblemBrowseToEpd(const wqn::UiFrame& frame, RefreshSchedule sc
         (problem.face == wqn::ProblemFace::kProblemImage ||
          problem.face == wqn::ProblemFace::kSolutionImage) &&
         problem.image_ready && problem.image_wqni != nullptr &&
+        problem.image_wqni->size() >= wqn::kNoteImageHeaderBytes &&
+        problem.image_wqni->data()[5] == 2 &&
+        problem.image_wqni->size() ==
+            wqn::kNoteImageHeaderBytes + wqn::kNoteImageGray4PayloadBytes) {
+        return wqn::RefreshEpdGray16(
+            problem.image_wqni->data() + wqn::kNoteImageHeaderBytes,
+            wqn::kNoteImageGray4PayloadBytes);
+    }
+    if (problem.mode == wqn::ProblemAppMode::kProblemView &&
+        (problem.face == wqn::ProblemFace::kProblemImage ||
+         problem.face == wqn::ProblemFace::kSolutionImage) &&
+        problem.image_ready && problem.image_wqni != nullptr &&
         problem.image_wqni->size() ==
             wqn::kNoteImageHeaderBytes + static_cast<size_t>(wqn::kEpdFramebufferSize)) {
         wqn::BlitEpdFramebuffer(

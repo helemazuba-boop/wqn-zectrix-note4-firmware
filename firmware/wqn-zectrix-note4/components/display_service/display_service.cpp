@@ -1,4 +1,5 @@
 #include "display_service.h"
+#include "ssd2683_gray16_waveform.h"
 
 #include <algorithm>
 #include <atomic>
@@ -1738,6 +1739,201 @@ static esp_err_t TryPowerOffEpd(uint32_t timeout_ms)
     // Recursive acquisition keeps every power-off path on the same lock.
     PowerOffEpd();
     return ESP_OK;
+}
+
+// Gray16 is a separate full-screen pipeline. It starts from an OTP-white
+// base and uses the vendor-calibrated five-pass external waveform; it never
+// participates in the 1bpp previous-frame/partial-refresh state machine.
+static esp_err_t ResetGrayController()
+{
+    SetReset(true);
+    vTaskDelay(pdMS_TO_TICKS(10));
+    SetReset(false);
+    vTaskDelay(pdMS_TO_TICKS(20));
+    SetReset(true);
+    vTaskDelay(pdMS_TO_TICKS(10));
+    return WaitBusy();
+}
+
+static esp_err_t TriggerGrayBatch(bool power_on)
+{
+    if (power_on) {
+        ESP_RETURN_ON_ERROR(SendCommand(0x04), kTag, "gray16 internal power on");
+        ESP_RETURN_ON_ERROR(WaitBusyTimeout(kCommandBusyTimeoutMs), kTag, "wait gray16 power on");
+        g_epd_powered = true;
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    ESP_RETURN_ON_ERROR(SendCommand(0x12), kTag, "gray16 refresh trigger");
+    ESP_RETURN_ON_ERROR(SendData(0x00), kTag, "gray16 refresh trigger data");
+    vTaskDelay(pdMS_TO_TICKS(10));
+    return WaitBusyTimeout(kBusyTimeoutMs);
+}
+
+static esp_err_t TurnGrayInternalPowerOff()
+{
+    ESP_RETURN_ON_ERROR(SendCommand(0x02), kTag, "gray16 internal power off");
+    ESP_RETURN_ON_ERROR(SendData(0x00), kTag, "gray16 internal power off data");
+    ESP_RETURN_ON_ERROR(WaitBusy(), kTag, "wait gray16 internal power off");
+    g_epd_powered = false;
+    return ESP_OK;
+}
+
+static esp_err_t InitGrayExternalWaveform(const uint8_t* waveform)
+{
+    ESP_RETURN_ON_ERROR(ResetGrayController(), kTag, "reset before gray16 waveform");
+    ESP_RETURN_ON_ERROR(SendCommand(0x00), kTag, "gray16 panel setting");
+    ESP_RETURN_ON_ERROR(SendData(0x2F), kTag, "gray16 panel setting data0");
+    ESP_RETURN_ON_ERROR(SendData(0x8E), kTag, "gray16 panel setting data1");
+    ESP_RETURN_ON_ERROR(SendCommand(0x01), kTag, "gray16 power setting");
+    const uint8_t power_values[] = {0x07, waveform[0], waveform[1], waveform[2], waveform[3], waveform[4]};
+    for (uint8_t value : power_values) {
+        ESP_RETURN_ON_ERROR(SendData(value), kTag, "gray16 power data");
+    }
+    ESP_RETURN_ON_ERROR(SendCommand(0x30), kTag, "gray16 pll setting");
+    ESP_RETURN_ON_ERROR(SendData(waveform[6]), kTag, "gray16 pll data");
+    ESP_RETURN_ON_ERROR(SendCommand(0x82), kTag, "gray16 vcom setting");
+    ESP_RETURN_ON_ERROR(SendData(waveform[5]), kTag, "gray16 vcom data");
+    ESP_RETURN_ON_ERROR(SendCommand(0x06), kTag, "gray16 booster setting");
+    const uint8_t booster[] = {0x0F, 0x8B, 0x9C, 0xAA};
+    for (uint8_t value : booster) {
+        ESP_RETURN_ON_ERROR(SendData(value), kTag, "gray16 booster data");
+    }
+    ESP_RETURN_ON_ERROR(SendCommand(0xE7), kTag, "gray16 power optimization");
+    ESP_RETURN_ON_ERROR(SendData(0x98), kTag, "gray16 power optimization data");
+    ESP_RETURN_ON_ERROR(SendCommand(0x50), kTag, "gray16 border setting");
+    ESP_RETURN_ON_ERROR(SendData(0x37), kTag, "gray16 border data");
+    ESP_RETURN_ON_ERROR(SendCommand(0x61), kTag, "gray16 resolution");
+    const uint8_t resolution[] = {0x01, 0x90, 0x01, 0x2C};
+    for (uint8_t value : resolution) {
+        ESP_RETURN_ON_ERROR(SendData(value), kTag, "gray16 resolution data");
+    }
+    ESP_RETURN_ON_ERROR(SendCommand(0x62), kTag, "gray16 vcom sensing");
+    ESP_RETURN_ON_ERROR(SendData(0x64), kTag, "gray16 vcom sensing data0");
+    ESP_RETURN_ON_ERROR(SendData(0x53), kTag, "gray16 vcom sensing data1");
+    ESP_RETURN_ON_ERROR(SendCommand(0x65), kTag, "gray16 gate timing");
+    for (int i = 0; i < 4; ++i) {
+        ESP_RETURN_ON_ERROR(SendData(0x00), kTag, "gray16 gate timing data");
+    }
+    ESP_RETURN_ON_ERROR(SendCommand(0xE9), kTag, "gray16 external mode");
+    ESP_RETURN_ON_ERROR(SendData(0x01), kTag, "gray16 external mode data");
+    ESP_RETURN_ON_ERROR(WaitBusy(), kTag, "wait gray16 waveform mode");
+    ESP_RETURN_ON_ERROR(SendCommand(0x20), kTag, "gray16 waveform load");
+    return WriteBytes(waveform, ssd2683_waveform::kWaveformSize);
+}
+
+static esp_err_t LoadGrayExternalWaveform(const uint8_t* waveform)
+{
+    ESP_RETURN_ON_ERROR(WaitBusy(), kTag, "wait gray16 waveform reload");
+    ESP_RETURN_ON_ERROR(SendCommand(0x30), kTag, "gray16 pll reload");
+    ESP_RETURN_ON_ERROR(SendData(waveform[6]), kTag, "gray16 pll reload data");
+    ESP_RETURN_ON_ERROR(SendCommand(0x20), kTag, "gray16 waveform reload");
+    return WriteBytes(waveform, ssd2683_waveform::kWaveformSize);
+}
+
+static esp_err_t WriteGrayPass(int pass, const uint8_t* gray4)
+{
+    ESP_RETURN_ON_ERROR(SendCommand(0x10), kTag, "gray16 RAM write");
+    ESP_RETURN_ON_ERROR(WaitBusyTimeout(kPartialCommandBusyTimeoutMs), kTag, "wait gray16 RAM write");
+    uint8_t line[kEpdGray4RowBytes / 2] = {};
+    for (int y = 0; y < kEpdHeight; ++y) {
+        for (size_t output = 0; output < sizeof(line); ++output) {
+            const size_t first_pixel = static_cast<size_t>(y) * kEpdWidth + output * 4;
+            uint8_t packed = 0;
+            for (size_t pixel_in_byte = 0; pixel_in_byte < 4; ++pixel_in_byte) {
+                const size_t pixel = first_pixel + pixel_in_byte;
+                const uint8_t source = gray4[pixel / 2];
+                const size_t level = (pixel & 1U) != 0 ? source & 0x0F : source >> 4;
+                const uint8_t code =
+                    ssd2683_waveform::VendorGray16RenderPassOfLevel(level) == static_cast<size_t>(pass)
+                        ? ssd2683_waveform::VendorGray16RenderCodeOfLevel(level)
+                        : 0;
+                packed |= static_cast<uint8_t>(code << (6 - pixel_in_byte * 2));
+            }
+            line[output] = packed;
+        }
+        ESP_RETURN_ON_ERROR(WriteBytes(line, sizeof(line)), kTag, "write gray16 line");
+        if ((y & 0x3F) == 0) {
+            FeedTwdtIfSubscribed();
+            vTaskDelay(1);
+        }
+    }
+    return ESP_OK;
+}
+
+static esp_err_t WriteOtpWhiteBase()
+{
+    ESP_RETURN_ON_ERROR(PreparePanelForFramebufferWrite(), kTag, "prepare gray16 OTP base");
+    ESP_RETURN_ON_ERROR(SendCommand(0x10), kTag, "gray16 OTP base RAM write");
+    uint8_t white_line[kEpdGray4RowBytes / 2] = {};
+    std::memset(white_line, 0x55, sizeof(white_line));
+    for (int y = 0; y < kEpdHeight; ++y) {
+        ESP_RETURN_ON_ERROR(WriteBytes(white_line, sizeof(white_line)), kTag, "write gray16 OTP base line");
+        if ((y & 0x3F) == 0) {
+            FeedTwdtIfSubscribed();
+            vTaskDelay(1);
+        }
+    }
+    ESP_RETURN_ON_ERROR(TriggerGrayBatch(true), kTag, "gray16 OTP base refresh");
+    return TurnGrayInternalPowerOff();
+}
+
+esp_err_t RefreshEpdGray16(const uint8_t* gray4, size_t size)
+{
+    EpdOperationGuard operation(portMAX_DELAY);
+    ESP_RETURN_ON_FALSE(operation.locked(), ESP_ERR_NO_MEM, kTag, "take EPD gray16 operation mutex");
+    ESP_RETURN_ON_FALSE(gray4 != nullptr && size == kEpdGray4PayloadSize,
+                        ESP_ERR_INVALID_ARG, kTag, "invalid gray16 payload");
+    if (!g_initialized) {
+        ESP_RETURN_ON_ERROR(InitEpdDisplay(), kTag, "lazy init EPD for gray16");
+    }
+
+    // The reference gallery deliberately performs a genuine white 1bpp full
+    // refresh before every 4bpp scene. Keep that history-clearing pass here,
+    // in the shared gray entry point, so Note/Problem/Solution cannot skip it.
+    ClearEpdFramebuffer(true);
+    ESP_RETURN_ON_ERROR(
+        RefreshEpdFull(false, true), kTag,
+        "clear panel before gray16 refresh");
+
+    // RefreshEpdFull and a hot partial both leave controller state that the
+    // gray pipeline must not inherit. The demo's PrepareOtpRefresh resets and
+    // re-selects OTP before its second white base; preserve that invariant.
+    ESP_RETURN_ON_ERROR(InitPanelSequence(), kTag, "prepare gray16 OTP refresh");
+
+    esp_err_t result = WriteOtpWhiteBase();
+    bool waveform_session_open = false;
+    for (size_t pass = 0;
+         result == ESP_OK && pass < ssd2683_waveform::kVendorGray16RenderPassCount;
+         ++pass) {
+        const auto& waveform = ssd2683_waveform::kVendorGray16RenderWaveforms[pass];
+        result = waveform_session_open
+            ? LoadGrayExternalWaveform(waveform.data())
+            : InitGrayExternalWaveform(waveform.data());
+        waveform_session_open = waveform_session_open || result == ESP_OK;
+        if (result == ESP_OK) {
+            result = WriteGrayPass(static_cast<int>(pass), gray4);
+        }
+        if (result == ESP_OK) {
+            result = TriggerGrayBatch(pass == 0);
+        }
+    }
+    if (g_epd_powered) {
+        const esp_err_t off_result = TurnGrayInternalPowerOff();
+        if (result == ESP_OK) {
+            result = off_result;
+        }
+    }
+    const esp_err_t restore_result = InitPanelSequence();
+    if (result == ESP_OK) {
+        result = restore_result;
+    }
+    PowerOffEpd();
+    g_previous_framebuffer_synced = false;
+    g_partial_refreshes_since_full = 0;
+    g_heavy_partials_since_full = 0;
+    g_last_partial_was_full_frame = false;
+    g_rtc_last_frame_crc_valid = false;
+    return result;
 }
 
 } // namespace wqn

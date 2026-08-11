@@ -80,7 +80,7 @@ constexpr TickType_t kSelectionRefreshDelay = pdMS_TO_TICKS(100);
 constexpr TickType_t kConfigRefreshDelay = pdMS_TO_TICKS(120);
 constexpr TickType_t kAiRefreshDelay = pdMS_TO_TICKS(120);
 
-constexpr size_t kSettingsItemCount = 8;
+constexpr size_t kSettingsItemCount = 9;
 // Settings rows overflow the panel at 38px pitch; the list renders a
 // selection-following window of this many rows.
 constexpr size_t kSettingsVisibleRows = 6;
@@ -144,6 +144,7 @@ struct TodoCloudRequest {
     TodoCloudOp op = TodoCloudOp::kRefresh;
     char todo_id[64] = {};
     char cursor[160] = {};
+    uint64_t content_target_revision = 0;
 };
 
 struct TodoCloudResult {
@@ -151,6 +152,7 @@ struct TodoCloudResult {
     esp_err_t result = ESP_FAIL;
     bool auth_required = false;
     char todo_id[64] = {};
+    uint64_t content_target_revision = 0;
     wqn::WqnTodoListPage page;
     wqn::WqnTodoItem todo;
 };
@@ -176,6 +178,9 @@ struct WordCloudRequest {
     // rejects a save whose epoch is stale) and echoes it in the result so the
     // apply side drops results that straddled a default-deck switch.
     uint32_t scope_generation = 0;
+    // kPackSync only: coordinator claim bound to this bulk command.
+    uint32_t content_sync_generation = 0;
+    uint64_t content_target_revision = 0;
 };
 
 struct WordCloudResult {
@@ -231,10 +236,14 @@ struct NoteCloudRequest {
     char note_id[37] = {};
     char image_id[65] = {};
     uint8_t image_index = 0;
+    bool image_gray4 = false;
     // kFetchImage / kFetchNotebookPack: identity of this dispatch in the
     // transfer-progress mailbox; the UI only consumes progress whose
     // generation matches its own record (stale-download defense).
     uint32_t progress_generation = 0;
+    // kPackSync only: coordinator claim bound to this bulk command.
+    uint32_t content_sync_generation = 0;
+    uint64_t content_target_revision = 0;
 };
 
 struct NoteCloudResult {
@@ -280,6 +289,10 @@ struct ProblemCloudRequest {
     uint8_t image_index = 0;
     // 0 = assets, 1 = solution (the /v3 image route path segment).
     uint8_t image_kind = 0;
+    bool image_gray4 = false;
+    // kPackSync only: coordinator claim bound to this bulk command.
+    uint32_t content_sync_generation = 0;
+    uint64_t content_target_revision = 0;
 };
 
 struct ProblemCloudResult {
@@ -311,7 +324,11 @@ enum class CloudDomain : uint8_t {
     kWord,
     kNote,
     kProblem,
+    kWordBulk,
+    kNoteBulk,
+    kProblemBulk,
 };
+inline constexpr size_t kCloudDomainCount = 7;
 
 enum class CloudLane : uint8_t {
     kInteractive,
@@ -381,22 +398,25 @@ static_assert(std::is_trivially_copyable_v<CloudJob>);
 static_assert(std::is_trivially_copyable_v<CloudResultReady>);
 
 void SendTodoCloudResult();
-void SendWordCloudResult();
-void SendNoteCloudResult();
-void SendProblemCloudResult();
+void SendWordCloudResult(CloudDomain domain);
+void SendNoteCloudResult(CloudDomain domain);
+void SendProblemCloudResult(CloudDomain domain);
 const TodoCloudResult* PeekTodoCloudResult(uint32_t generation);
-WordCloudResult* PeekWordCloudResult(uint32_t generation);
-NoteCloudResult* PeekNoteCloudResult(uint32_t generation);
-ProblemCloudResult* PeekProblemCloudResult(uint32_t generation);
+WordCloudResult* PeekWordCloudResult(CloudDomain domain, uint32_t generation);
+NoteCloudResult* PeekNoteCloudResult(CloudDomain domain, uint32_t generation);
+ProblemCloudResult* PeekProblemCloudResult(CloudDomain domain, uint32_t generation);
 
 bool IsTodoCloudBusy();
 bool IsWordCloudBusy();
 bool IsNoteCloudBusy();
 bool IsProblemCloudBusy();
+bool IsWordPackCloudBusy();
+bool IsNotePackCloudBusy();
+bool IsProblemPackCloudBusy();
 void FinishTodoCloudRequest();
-void FinishWordCloudRequest();
-void FinishNoteCloudRequest();
-void FinishProblemCloudRequest();
+void FinishWordCloudRequest(CloudDomain domain = CloudDomain::kWord);
+void FinishNoteCloudRequest(CloudDomain domain = CloudDomain::kNote);
+void FinishProblemCloudRequest(CloudDomain domain = CloudDomain::kProblem);
 
 bool QueueTodoCloudRequest(const TodoCloudRequest& request);
 bool QueueWordCloudRequest(const WordCloudRequest& request);
@@ -404,6 +424,7 @@ bool QueueNoteCloudRequest(const NoteCloudRequest& request);
 bool QueueProblemCloudRequest(const ProblemCloudRequest& request);
 
 bool QueueTodoRefresh();
+bool QueueTodoRefreshForRevision(uint64_t target_revision);
 bool QueueTodoRefreshCursor(const std::string& cursor);
 bool QueueTodoComplete(const std::string& todo_id);
 
@@ -429,6 +450,7 @@ bool QueueNoteCandidatePage(
 void PumpNoteCandidatePrefetch(UiRuntime* runtime);
 bool QueueNoteImageFetch(
     const std::string& note_id, uint8_t image_index, const std::string& image_id,
+    bool gray4,
     uint32_t progress_generation);
 void PumpNoteImageFetch(UiRuntime* runtime);
 bool QueueNoteBodyPackFetch(
@@ -452,7 +474,8 @@ bool QueueProblemImageFetch(
     const std::string& problem_id,
     bool is_solution,
     uint8_t image_index,
-    const std::string& image_id);
+    const std::string& image_id,
+    bool gray4);
 void PumpProblemImageFetch(UiRuntime* runtime);
 // [persist-worker] Problem verdict commit pump (c3). Reserves a persist slot,
 // takes the armed verdict and enqueues it to the worker (was the cloud lane).

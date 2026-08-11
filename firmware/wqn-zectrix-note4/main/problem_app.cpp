@@ -174,6 +174,7 @@ void ResetProblemImageViewer(wqn::ProblemAppState* state)
     state->image_request = false;
     state->image_in_flight = false;
     state->image_error = false;
+    state->image_expected_gray4 = false;
     state->image_is_solution = false;
     state->image_index = 0;
     state->image_expected_id.clear();
@@ -188,14 +189,23 @@ void ResetProblemImageViewer(wqn::ProblemAppState* state)
 // problem cloud lane (shared ni_ SPIFFS cache first, then download).
 void RequestCurrentProblemImage(wqn::ProblemAppState* state)
 {
-    const auto& ids = state->image_is_solution
+    const auto& bw1_ids = state->image_is_solution
         ? state->current.solution_image_ids
         : state->current.image_ids;
-    if (state->image_index >= ids.size()) {
+    const auto& gray4_ids = state->image_is_solution
+        ? state->current.solution_gray4_image_ids
+        : state->current.gray4_image_ids;
+    if (state->image_index >= bw1_ids.size()) {
         state->image_error = true;
         return;
     }
-    const std::string& id = ids[state->image_index];
+    const bool has_gray4 = state->image_index < gray4_ids.size() &&
+        !gray4_ids[state->image_index].empty();
+    state->image_expected_gray4 =
+        state->image_render_mode == wqn::ImageRenderMode::kGray16 && has_gray4;
+    const std::string& id = state->image_expected_gray4
+        ? gray4_ids[state->image_index]
+        : bw1_ids[state->image_index];
     state->image_expected_id = id;
     state->image_error = false;
     if (state->image_loaded_id == id && state->image_wqni != nullptr) {
@@ -204,6 +214,23 @@ void RequestCurrentProblemImage(wqn::ProblemAppState* state)
     }
     if (!state->image_in_flight) {
         state->image_request = true;
+    }
+}
+
+void SetProblemImageRenderModeImpl(wqn::ProblemAppState* state, wqn::ImageRenderMode mode)
+{
+    if (state == nullptr || state->image_render_mode == mode) return;
+    state->image_render_mode = mode;
+    state->image_in_flight = false;
+    state->image_dispatched_id.clear();
+    state->image_loaded_id.clear();
+    state->image_wqni.reset();
+    if (state->active && state->mode == wqn::ProblemAppMode::kProblemView) {
+        const wqn::ProblemFace face = SegmentFace(*state, state->ring_segment);
+        if (face == wqn::ProblemFace::kProblemImage ||
+            face == wqn::ProblemFace::kSolutionImage) {
+            RequestCurrentProblemImage(state);
+        }
     }
 }
 
@@ -581,6 +608,11 @@ void AdvanceAfterVerdict(wqn::ProblemAppState* state)
 
 namespace wqn {
 
+void SetProblemImageRenderMode(ProblemAppState* state, ImageRenderMode mode)
+{
+    SetProblemImageRenderModeImpl(state, mode);
+}
+
 esp_err_t InitProblemApp(ProblemAppState* state)
 {
     if (state == nullptr) return ESP_ERR_INVALID_ARG;
@@ -702,10 +734,11 @@ bool TakeProblemImageRequest(
     std::string* problem_id,
     bool* is_solution,
     uint8_t* image_index,
-    std::string* image_id)
+    std::string* image_id,
+    bool* gray4)
 {
     if (state == nullptr || problem_id == nullptr || is_solution == nullptr ||
-        image_index == nullptr || image_id == nullptr) {
+        image_index == nullptr || image_id == nullptr || gray4 == nullptr) {
         return false;
     }
     EnsureProblemImageRequest(state);
@@ -722,6 +755,7 @@ bool TakeProblemImageRequest(
     *is_solution = state->image_is_solution;
     *image_index = state->image_index;
     *image_id = state->image_expected_id;
+    *gray4 = state->image_expected_gray4;
     state->image_request = false;
     state->image_in_flight = true;
     state->image_dispatch_us = esp_timer_get_time();
@@ -769,6 +803,20 @@ void ApplyProblemImageResult(
     const std::string& failed_id =
         image_id.empty() ? state->image_dispatched_id : image_id;
     if (!state->image_request && failed_id == state->image_expected_id) {
+        if (result == ESP_ERR_NOT_FOUND && state->image_expected_gray4) {
+            const auto& bw1_ids = state->image_is_solution
+                ? state->current.solution_image_ids
+                : state->current.image_ids;
+            if (state->image_index < bw1_ids.size()) {
+                state->image_expected_gray4 = false;
+                state->image_expected_id = bw1_ids[state->image_index];
+                state->image_dispatched_id.clear();
+                state->image_error = false;
+                state->image_request = true;
+                ESP_LOGW(kTag, "gray16 problem derivative missing; falling back to BW1");
+                return;
+            }
+        }
         state->image_error = true;
         ESP_LOGW(kTag, "problem image fetch failed: %s id=%.12s",
                  esp_err_to_name(result), failed_id.c_str());

@@ -56,6 +56,8 @@ struct WqnNoteEntry {
     // SHA-256 ids of the note's e-ink images (WQNI files) in display order,
     // straight from the pack line; empty for image-less notes.
     std::vector<std::string> image_ids;
+    // GRAY4 ids aligned with image_ids; an empty item means BW1 fallback.
+    std::vector<std::string> gray4_image_ids;
     int32_t sort_index = 0;
     int revision = 0;
 };
@@ -147,11 +149,11 @@ std::string SafeNotePackStem(const WqnNotePackManifestNotebook& notebook);
 // --- Note image (WQNI) container + SPIFFS cache -----------------------------
 // WQNI file: 20-byte little-endian header (magic "WQNI", version u8,
 // pixel_format u8, flags u16, width u16, height u16, payload_length u32,
-// crc32 u32) followed by the raw 1-bpp framebuffer payload. The payload uses
-// the exact wqn_epd layout (row-major, 50 bytes/row, MSB-first, 1 = white),
-// so display is a straight memcpy into the framebuffer.
+// crc32 u32) followed by either the raw BW1 framebuffer or packed GRAY4
+// pixels. GRAY4 uses two pixels per byte, high nibble first, 0=black/15=white.
 inline constexpr size_t kNoteImageHeaderBytes = 20;
 inline constexpr size_t kNoteImagePayloadBytes = 15000;  // 400x300 / 8
+inline constexpr size_t kNoteImageGray4PayloadBytes = 60000;  // 400x300 / 2
 inline constexpr size_t kNoteImageFileBytes =
     kNoteImageHeaderBytes + kNoteImagePayloadBytes;
 inline constexpr size_t kNoteImageCacheMaxFiles = 64;

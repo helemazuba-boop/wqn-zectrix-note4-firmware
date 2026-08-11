@@ -24,15 +24,21 @@ namespace device_ui_internal {
 constexpr char kTag[] = "wqn_ui";
 
 static std::atomic<bool> g_word_cloud_busy{false};
+static std::atomic<bool> g_word_pack_cloud_busy{false};
 wqn::runtime::SleepLease g_word_sleep_lease;
+wqn::runtime::SleepLease g_word_pack_sleep_lease;
 WordCloudResult g_word_result_slot;
 uint32_t g_word_result_generation = 0;
+WordCloudResult g_word_pack_result_slot;
+uint32_t g_word_pack_result_generation = 0;
 
-void FinishWordCloudRequest()
+void FinishWordCloudRequest(CloudDomain domain)
 {
-    g_word_sleep_lease.Reset();
-    ClearCloudDomainBusyWatch(CloudDomain::kWord);
-    g_word_cloud_busy.store(false, std::memory_order_release);
+    const bool bulk = domain == CloudDomain::kWordBulk;
+    (bulk ? g_word_pack_sleep_lease : g_word_sleep_lease).Reset();
+    ClearCloudDomainBusyWatch(domain);
+    (bulk ? g_word_pack_cloud_busy : g_word_cloud_busy).store(
+        false, std::memory_order_release);
 }
 
 RefreshSchedule PumpWordObservationCommit(UiRuntime* runtime)
@@ -89,10 +95,17 @@ bool IsWordCloudBusy()
     return g_word_cloud_busy.load(std::memory_order_acquire);
 }
 
+bool IsWordPackCloudBusy()
+{
+    return g_word_pack_cloud_busy.load(std::memory_order_acquire);
+}
+
 bool QueueWordCloudRequest(const WordCloudRequest& request)
 {
+    const bool bulk = request.op == WordCloudOp::kPackSync;
+    std::atomic<bool>& busy = bulk ? g_word_pack_cloud_busy : g_word_cloud_busy;
     bool expected = false;
-    if (!g_word_cloud_busy.compare_exchange_strong(
+    if (!busy.compare_exchange_strong(
             expected, true, std::memory_order_acq_rel, std::memory_order_acquire)) {
         return false;
     }
@@ -100,15 +113,15 @@ bool QueueWordCloudRequest(const WordCloudRequest& request)
         wqn::runtime::SleepLease::TryAcquire(
             wqn::runtime::SleepBlocker::kWordCloud, "word-cloud", __FILE__, __LINE__);
     if (!lease) {
-        g_word_cloud_busy.store(false, std::memory_order_release);
+        busy.store(false, std::memory_order_release);
         return false;
     }
-    g_word_sleep_lease = std::move(lease);
+    (bulk ? g_word_pack_sleep_lease : g_word_sleep_lease) = std::move(lease);
     CloudJob job;
-    job.domain = CloudDomain::kWord;
+    job.domain = bulk ? CloudDomain::kWordBulk : CloudDomain::kWord;
     job.word = request;
     if (!EnqueueCloudJob(job)) {
-        FinishWordCloudRequest();
+        FinishWordCloudRequest(job.domain);
         return false;
     }
     return true;
@@ -116,9 +129,21 @@ bool QueueWordCloudRequest(const WordCloudRequest& request)
 
 bool QueueWordReviewRefresh()
 {
+    const wqn::services::SyncContentTicket ticket =
+        wqn::services::TryClaimContentRefresh(
+            wqn::services::SyncContentDomain::kWordPacks);
+    if (!ticket) {
+        return false;
+    }
     WordCloudRequest request;
     request.op = WordCloudOp::kPackSync;
-    return QueueWordCloudRequest(request);
+    request.content_sync_generation = ticket.generation;
+    request.content_target_revision = ticket.target_revision;
+    if (!QueueWordCloudRequest(request)) {
+        wqn::services::CancelContentRefreshClaim(ticket);
+        return false;
+    }
+    return true;
 }
 
 bool QueueWordSessionStart(
@@ -212,20 +237,26 @@ bool QueueWordAiLookup(const wqn::WqnWordAiLookupRequest& lookup)
     return QueueWordCloudRequest(request);
 }
 
-WordCloudResult* PeekWordCloudResult(uint32_t generation)
+WordCloudResult* PeekWordCloudResult(CloudDomain domain, uint32_t generation)
 {
-    if (generation == 0 || generation != g_word_result_generation) {
+    const bool bulk = domain == CloudDomain::kWordBulk;
+    const uint32_t current = bulk ? g_word_pack_result_generation
+                                  : g_word_result_generation;
+    if (generation == 0 || generation != current) {
         return nullptr;
     }
-    return &g_word_result_slot;
+    return bulk ? &g_word_pack_result_slot : &g_word_result_slot;
 }
 
-void SendWordCloudResult()
+void SendWordCloudResult(CloudDomain domain)
 {
+    const uint32_t generation = domain == CloudDomain::kWordBulk
+        ? g_word_pack_result_generation
+        : g_word_result_generation;
     CloudResultReady ready;
-    ready.domain = CloudDomain::kWord;
-    ready.generation = g_word_result_generation;
-    PublishCloudResult(CloudDomain::kWord, g_word_result_generation);
+    ready.domain = domain;
+    ready.generation = generation;
+    PublishCloudResult(domain, generation);
     (void)ready;
 }
 
@@ -393,12 +424,26 @@ bool ApplyWordCloudResult(wqn::UiState* state, WordCloudResult& result)
 
 void ExecuteWordCloudRequest(const WordCloudRequest& request)
 {
-    g_word_result_slot = WordCloudResult{};
-    ++g_word_result_generation;
-    if (g_word_result_generation == 0) {
-        ++g_word_result_generation;
+    const CloudDomain result_domain = request.op == WordCloudOp::kPackSync
+        ? CloudDomain::kWordBulk
+        : CloudDomain::kWord;
+    const wqn::services::SyncContentTicket content_ticket = {
+        wqn::services::SyncContentDomain::kWordPacks,
+        request.content_sync_generation,
+        request.content_target_revision,
+    };
+    WordCloudResult& result_slot = result_domain == CloudDomain::kWordBulk
+        ? g_word_pack_result_slot
+        : g_word_result_slot;
+    uint32_t& result_generation = result_domain == CloudDomain::kWordBulk
+        ? g_word_pack_result_generation
+        : g_word_result_generation;
+    result_slot = WordCloudResult{};
+    ++result_generation;
+    if (result_generation == 0) {
+        ++result_generation;
     }
-    WordCloudResult& result = g_word_result_slot;
+    WordCloudResult& result = result_slot;
     result.op = request.op;
     result.query = request.query;
     result.scope_generation = request.scope_generation;
@@ -408,22 +453,32 @@ void ExecuteWordCloudRequest(const WordCloudRequest& request)
     if (!LoadValidTokenForTodo(&token)) {
         result.auth_required = true;
         result.result = ESP_ERR_INVALID_STATE;
-        SendWordCloudResult();
+        if (request.op == WordCloudOp::kPackSync) {
+            wqn::services::CompleteContentRefresh(
+                content_ticket, result.result, nullptr, "auth-required");
+        }
+        SendWordCloudResult(result_domain);
         return;
     }
 
     if (request.op == WordCloudOp::kPackSync) {
+        result.result = wqn::services::BeginContentInstall(content_ticket);
+        if (result.result != ESP_OK) {
+            result.message = "词库安装标记失败";
+        }
         wqn::WqnWordPackManifest local_manifest;
         bool had_local_manifest = true;
         bool manifest_content_changed = false;
-        result.result = wqn::LoadWordPackManifest(&local_manifest);
+        if (result.result == ESP_OK) {
+            result.result = wqn::LoadWordPackManifest(&local_manifest);
+        }
         if (result.result == ESP_ERR_NOT_FOUND) {
             had_local_manifest = false;
             result.result = wqn::ResetWordPackStorageCache();
             if (result.result == ESP_OK) {
                 local_manifest = {};
             }
-        } else if (result.result != ESP_OK) {
+        } else if (result.result != ESP_OK && result.message.empty()) {
             ESP_LOGW(
                 kTag,
                 "local word pack manifest is incompatible; reset cache: %s",
@@ -587,7 +642,12 @@ void ExecuteWordCloudRequest(const WordCloudRequest& request)
         std::string after_token;
         result.auth_required = !LoadValidTokenForTodo(&after_token);
     }
-    SendWordCloudResult();
+    if (request.op == WordCloudOp::kPackSync) {
+        wqn::services::CompleteContentRefresh(
+            content_ticket, result.result, nullptr,
+            result.result == ESP_OK ? nullptr : result.message.c_str());
+    }
+    SendWordCloudResult(result_domain);
 }
 
 }  // namespace device_ui_internal

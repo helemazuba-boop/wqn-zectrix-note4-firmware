@@ -187,10 +187,12 @@ void UiRuntime::RestoreNoteCandidatePageRequest()
 
 bool UiRuntime::TakeNoteImageRequest(
     std::string* note_id, uint8_t* image_index, std::string* image_id,
+    bool* gray4,
     uint32_t* progress_generation)
 {
     return wqn::TakeNoteImageRequest(
-        &state_.note_app, note_id, image_index, image_id, progress_generation);
+        &state_.note_app, note_id, image_index, image_id, gray4,
+        progress_generation);
 }
 
 void UiRuntime::RestoreNoteImageRequest()
@@ -367,10 +369,12 @@ bool UiRuntime::TakeProblemImageRequest(
     std::string* problem_id,
     bool* is_solution,
     uint8_t* image_index,
-    std::string* image_id)
+    std::string* image_id,
+    bool* gray4)
 {
     return wqn::TakeProblemImageRequest(
-        &state_.problem_app, problem_id, is_solution, image_index, image_id);
+        &state_.problem_app, problem_id, is_solution, image_index, image_id,
+        gray4);
 }
 
 void UiRuntime::RestoreProblemImageRequest()
@@ -488,6 +492,43 @@ UiUpdate UiRuntime::DispatchVolumeSaveResult(esp_err_t result, uint32_t operatio
         // status explicit that it is not durably saved yet.
         settings.notice = "音量未保存，请重试";
         ESP_LOGW(kTag, "volume save failed: %s", esp_err_to_name(result));
+    }
+    const RefreshSchedule refresh = state_.screen == wqn::UiScreen::kSettings
+        ? RefreshSchedule::kConfig
+        : RefreshSchedule::kNone;
+    return FinishEvent(AppEventKind::kSettingsPersist, refresh, true);
+}
+
+UiUpdate UiRuntime::DispatchImageRenderSaveResult(
+    esp_err_t result, uint32_t operation_id)
+{
+    wqn::SettingsAppState& settings = state_.settings;
+    if (settings.image_render_save_op_id == 0 ||
+        settings.image_render_save_op_id != operation_id) {
+        ESP_LOGW(kTag, "stale image render save result: op=%lu expected=%lu",
+                 static_cast<unsigned long>(operation_id),
+                 static_cast<unsigned long>(settings.image_render_save_op_id));
+        return FinishEvent(AppEventKind::kSettingsPersist,
+                           RefreshSchedule::kNone, false);
+    }
+    settings.image_render_save_op_id = 0;
+    if (result == ESP_OK) {
+        settings.image_render_mode = settings.pending_image_render_mode;
+        settings.image_render_selected =
+            settings.image_render_mode == wqn::ImageRenderMode::kBlackWhite
+            ? 0
+            : 1;
+        settings.image_render_pending_valid = false;
+        wqn::SetNoteImageRenderMode(
+            &state_.note_app, settings.image_render_mode);
+        wqn::SetProblemImageRenderMode(
+            &state_.problem_app, settings.image_render_mode);
+        settings.notice = "图片渲染已保存：" +
+            wqn::ImageRenderModeLabel(settings.image_render_mode);
+    } else {
+        settings.notice = "图片渲染未保存，请重试";
+        ESP_LOGW(kTag, "image render save failed: %s",
+                 esp_err_to_name(result));
     }
     const RefreshSchedule refresh = state_.screen == wqn::UiScreen::kSettings
         ? RefreshSchedule::kConfig
@@ -722,15 +763,10 @@ UiUpdate UiRuntime::DispatchStatusReload(wqn::AppState&& snapshot)
 
 UiUpdate UiRuntime::DispatchSyncResult(const wqn::services::SyncEvent& event)
 {
-    const size_t problem_pending_before =
-        state_.problem_app.outbox.pending_count;
     std::string status;
     switch (event.status) {
         case wqn::services::SyncEventStatus::kSucceeded:
             status = "同步完成";
-            wqn::RefreshWordOutboxState(&state_.word_app);
-            wqn::RefreshNoteOutboxState(&state_.note_app);
-            wqn::RefreshProblemOutboxState(&state_.problem_app);
             break;
         case wqn::services::SyncEventStatus::kAwaitingClaim:
             status = "等待配对";
@@ -750,7 +786,6 @@ UiUpdate UiRuntime::DispatchSyncResult(const wqn::services::SyncEvent& event)
     const bool changed =
         state_.settings.sync_status != status ||
         state_.status.last_sync_status != status ||
-        state_.problem_app.outbox.pending_count != problem_pending_before ||
         claim_state_changed;
     state_.settings.sync_status = status;
     state_.status.last_sync_status = status;

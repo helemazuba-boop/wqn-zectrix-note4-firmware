@@ -40,7 +40,9 @@ struct WqnProblemEntry {
     // SHA-256 ids of the problem/solution e-ink images (WQNI files) in
     // display order; empty when the problem has no attachments.
     std::vector<std::string> image_ids;
+    std::vector<std::string> gray4_image_ids;
     std::vector<std::string> solution_image_ids;
+    std::vector<std::string> solution_gray4_image_ids;
 };
 
 // Bytes of the problem title cached inline for fast title-list rendering.

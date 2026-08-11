@@ -229,9 +229,11 @@ esp_err_t BuildManifestRequest(
     const v3::RequestMetadata& metadata,
     uint64_t cursor,
     int limit,
-    std::string* body)
+    std::string* body,
+    const std::string& snapshot_id)
 {
-    if (body == nullptr || cursor > v3::kMaxSafeJsonInteger || limit < 1 || limit > 100) {
+    if (body == nullptr || cursor > v3::kMaxSafeJsonInteger || limit < 1 || limit > 100 ||
+        (!snapshot_id.empty() && !IsSha256(snapshot_id))) {
         return ESP_ERR_INVALID_ARG;
     }
     JsonDocument document(cJSON_CreateObject());
@@ -240,6 +242,9 @@ esp_err_t BuildManifestRequest(
     const std::string cursor_text = std::to_string(cursor);
     cJSON_AddStringToObject(document.root(), "cursor", cursor_text.c_str());
     cJSON_AddNumberToObject(document.root(), "limit", limit);
+    if (!snapshot_id.empty()) {
+        cJSON_AddStringToObject(document.root(), "snapshot_id", snapshot_id.c_str());
+    }
     return Render(document.root(), body);
 }
 
@@ -281,6 +286,14 @@ esp_err_t ParseManifestResponse(
         return ESP_ERR_INVALID_RESPONSE;
     }
     data->has_more = cJSON_IsTrue(has_more);
+    cJSON* revision = cJSON_GetObjectItemCaseSensitive(payload, "revision");
+    if (revision != nullptr && !U64Field(payload, "revision", &data->revision)) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    data->snapshot_id = StringField(payload, "snapshot_id");
+    if (!data->snapshot_id.empty() && !IsSha256(data->snapshot_id)) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
     cJSON* sets = cJSON_GetObjectItemCaseSensitive(payload, "problem_sets");
     const int count = cJSON_GetArraySize(sets);
     if (!cJSON_IsArray(sets) || count < 0 ||

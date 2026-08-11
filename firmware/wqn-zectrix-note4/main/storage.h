@@ -1,12 +1,18 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <string>
 #include <vector>
 
 #include "esp_err.h"
 
 namespace wqn {
+
+enum class ImageRenderMode : uint8_t {
+    kBlackWhite = 0,
+    kGray16 = 1,
+};
 
 struct StorageCapacitySnapshot {
     bool spiffs_valid = false;
@@ -33,6 +39,33 @@ struct DeviceControlState {
     uint64_t sync_cursor = 0;
 };
 
+enum class SyncJournalPhase : uint8_t {
+    kClean = 0,
+    kPending = 1,
+    kFetching = 2,
+    kInstalling = 3,
+    kBackoff = 4,
+    kBlocked = 5,
+};
+
+struct SyncJournalContentState {
+    uint64_t desired_revision = 0;
+    uint64_t applied_revision = 0;
+    SyncJournalPhase phase = SyncJournalPhase::kClean;
+    uint8_t retry_attempt = 0;
+    char desired_snapshot_id[65] = {};
+    char active_snapshot_id[65] = {};
+};
+
+struct SyncJournal {
+    uint32_t schema_version = 1;
+    uint64_t config_revision = 0;
+    uint64_t sync_cursor = 0;
+    SyncJournalContentState word_packs = {};
+    SyncJournalContentState note_packs = {};
+    SyncJournalContentState problem_packs = {};
+};
+
 esp_err_t InitStorage();
 bool ReadStorageCapacitySnapshot(StorageCapacitySnapshot* snapshot);
 esp_err_t LoadAccessToken(std::string* token);
@@ -42,6 +75,10 @@ bool IsValidAccessToken(const std::string& token);
 std::string MaskTokenForLog(const std::string& token);
 esp_err_t LoadDeviceControlState(DeviceControlState* state);
 esp_err_t SaveDeviceControlState(const DeviceControlState& state);
+// Durable coordinator checkpoint. The file is committed through a
+// temp/backup/rename sequence and is safe to replay after a power cut.
+esp_err_t LoadSyncJournal(SyncJournal* journal);
+esp_err_t SaveSyncJournal(const SyncJournal& journal);
 
 esp_err_t SaveAiSessionForDay(const CachedAiSession& session);
 esp_err_t LoadAiSessionForDay(const std::string& day, CachedAiSession* session);
@@ -55,6 +92,9 @@ esp_err_t SaveAutoSyncIntervalMinutes(uint32_t minutes);
 // fixed deadline). UI code must not call this synchronously.
 esp_err_t SaveAutoSyncIntervalMinutesForeground(uint32_t minutes);
 std::string AutoSyncIntervalLabel(uint32_t minutes);
+esp_err_t LoadImageRenderMode(ImageRenderMode* mode);
+esp_err_t SaveImageRenderModeForeground(ImageRenderMode mode);
+std::string ImageRenderModeLabel(ImageRenderMode mode);
 // Default word deck for the device (empty = all decks). The word page's
 // study sessions scope to it; the other decks enter via the note screen's
 // mixed [词] rows.

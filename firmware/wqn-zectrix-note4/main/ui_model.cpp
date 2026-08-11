@@ -331,8 +331,8 @@ void ClampUiSelection(UiState* state)
     } else if (state->todo.selected >= state->todo.todos.size()) {
         state->todo.selected = state->todo.todos.size() - 1;
     }
-    if (state->settings.selected >= 8) {
-        state->settings.selected = 7;
+    if (state->settings.selected >= 9) {
+        state->settings.selected = 8;
     }
     const size_t ai_pages = AiSessionPageCount(state->ai);
     if (state->ai.page >= ai_pages) {
@@ -449,7 +449,7 @@ void HandleUiInput(UiState* state, UiInput input)
             } else if (state->screen == UiScreen::kTodo && state->todo.selected + 1 < state->todo.todos.size()) {
                 ++state->todo.selected;
             } else if (state->screen == UiScreen::kSettings) {
-                if (state->settings.selected + 1 < 8) {
+                if (state->settings.selected + 1 < 9) {
                     ++state->settings.selected;
                 }
             }

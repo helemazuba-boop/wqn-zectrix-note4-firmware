@@ -194,6 +194,10 @@ bool LoadUiState(wqn::UiState* state)
 #endif
 
     UpdateSettingsDiagnostics(state);
+    wqn::SetNoteImageRenderMode(
+        &state->note_app, state->settings.image_render_mode);
+    wqn::SetProblemImageRenderMode(
+        &state->problem_app, state->settings.image_render_mode);
     wqn::ClampUiSelection(state);
     BuildHomeSummary(state);
     return true;

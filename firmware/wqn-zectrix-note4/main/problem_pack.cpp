@@ -887,6 +887,38 @@ esp_err_t ParseProblemRecordLine(const char* line, WqnProblemEntry* entry, bool 
     cJSON_ArrayForEach(image_id, solution_image_ids) {
         entry->solution_image_ids.emplace_back(image_id->valuestring);
     }
+    const auto parse_gray4_ids = [](cJSON* root, const char* key,
+                                     size_t expected,
+                                     std::vector<std::string>* out) -> bool {
+        cJSON* array = cJSON_GetObjectItemCaseSensitive(root, key);
+        if (array == nullptr || cJSON_IsNull(array)) {
+            out->resize(expected);
+            return true;
+        }
+        if (!cJSON_IsArray(array) ||
+            cJSON_GetArraySize(array) != static_cast<int>(expected)) {
+            return false;
+        }
+        cJSON* item = nullptr;
+        cJSON_ArrayForEach(item, array) {
+            if (cJSON_IsNull(item)) {
+                out->emplace_back();
+            } else if (cJSON_IsString(item) && item->valuestring != nullptr &&
+                       std::strlen(item->valuestring) == 64) {
+                out->emplace_back(item->valuestring);
+            } else {
+                return false;
+            }
+        }
+        return true;
+    };
+    if (!parse_gray4_ids(document.root(), "gray4_image_ids",
+                         image_count, &entry->gray4_image_ids) ||
+        !parse_gray4_ids(document.root(), "solution_gray4_image_ids",
+                         solution_image_count,
+                         &entry->solution_gray4_image_ids)) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
 
     // parts must be a well-formed 1..10 array even on index scans; the
     // per-part text is only materialised (and field-validated) on a body

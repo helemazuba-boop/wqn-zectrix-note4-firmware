@@ -27,15 +27,21 @@ constexpr char kNoteTag[] = "wqn_note_ui";
 }
 
 static std::atomic<bool> g_note_cloud_busy{false};
+static std::atomic<bool> g_note_pack_cloud_busy{false};
 wqn::runtime::SleepLease g_note_sleep_lease;
+wqn::runtime::SleepLease g_note_pack_sleep_lease;
 NoteCloudResult g_note_result_slot;
 uint32_t g_note_result_generation = 0;
+NoteCloudResult g_note_pack_result_slot;
+uint32_t g_note_pack_result_generation = 0;
 
-void FinishNoteCloudRequest()
+void FinishNoteCloudRequest(CloudDomain domain)
 {
-    g_note_sleep_lease.Reset();
-    ClearCloudDomainBusyWatch(CloudDomain::kNote);
-    g_note_cloud_busy.store(false, std::memory_order_release);
+    const bool bulk = domain == CloudDomain::kNoteBulk;
+    (bulk ? g_note_pack_sleep_lease : g_note_sleep_lease).Reset();
+    ClearCloudDomainBusyWatch(domain);
+    (bulk ? g_note_pack_cloud_busy : g_note_cloud_busy).store(
+        false, std::memory_order_release);
 }
 
 bool IsNoteCloudBusy()
@@ -43,25 +49,32 @@ bool IsNoteCloudBusy()
     return g_note_cloud_busy.load(std::memory_order_acquire);
 }
 
+bool IsNotePackCloudBusy()
+{
+    return g_note_pack_cloud_busy.load(std::memory_order_acquire);
+}
+
 bool QueueNoteCloudRequest(const NoteCloudRequest& request)
 {
+    const bool bulk = request.op == NoteCloudOp::kPackSync;
+    std::atomic<bool>& busy = bulk ? g_note_pack_cloud_busy : g_note_cloud_busy;
     bool expected = false;
-    if (!g_note_cloud_busy.compare_exchange_strong(
+    if (!busy.compare_exchange_strong(
             expected, true, std::memory_order_acq_rel, std::memory_order_acquire)) {
         return false;
     }
     wqn::runtime::SleepLease lease = wqn::runtime::SleepLease::TryAcquire(
         wqn::runtime::SleepBlocker::kNoteCloud, "note-cloud", __FILE__, __LINE__);
     if (!lease) {
-        g_note_cloud_busy.store(false, std::memory_order_release);
+        busy.store(false, std::memory_order_release);
         return false;
     }
-    g_note_sleep_lease = std::move(lease);
+    (bulk ? g_note_pack_sleep_lease : g_note_sleep_lease) = std::move(lease);
     CloudJob job;
-    job.domain = CloudDomain::kNote;
+    job.domain = bulk ? CloudDomain::kNoteBulk : CloudDomain::kNote;
     job.note = request;
     if (!EnqueueCloudJob(job)) {
-        FinishNoteCloudRequest();
+        FinishNoteCloudRequest(job.domain);
         return false;
     }
     return true;
@@ -69,9 +82,21 @@ bool QueueNoteCloudRequest(const NoteCloudRequest& request)
 
 bool QueueNotePackSync()
 {
+    const wqn::services::SyncContentTicket ticket =
+        wqn::services::TryClaimContentRefresh(
+            wqn::services::SyncContentDomain::kNotePacks);
+    if (!ticket) {
+        return false;
+    }
     NoteCloudRequest request;
     request.op = NoteCloudOp::kPackSync;
-    return QueueNoteCloudRequest(request);
+    request.content_sync_generation = ticket.generation;
+    request.content_target_revision = ticket.target_revision;
+    if (!QueueNoteCloudRequest(request)) {
+        wqn::services::CancelContentRefreshClaim(ticket);
+        return false;
+    }
+    return true;
 }
 
 bool QueueNoteSessionStart(
@@ -129,6 +154,7 @@ void PumpNoteCandidatePrefetch(UiRuntime* runtime)
 
 bool QueueNoteImageFetch(
     const std::string& note_id, uint8_t image_index, const std::string& image_id,
+    bool gray4,
     uint32_t progress_generation)
 {
     if (note_id.size() != 36 || image_index > 3 || image_id.size() != 64) {
@@ -139,6 +165,7 @@ bool QueueNoteImageFetch(
     std::snprintf(request.note_id, sizeof(request.note_id), "%s", note_id.c_str());
     std::snprintf(request.image_id, sizeof(request.image_id), "%s", image_id.c_str());
     request.image_index = image_index;
+    request.image_gray4 = gray4;
     request.progress_generation = progress_generation;
     return QueueNoteCloudRequest(request);
 }
@@ -153,12 +180,15 @@ void PumpNoteImageFetch(UiRuntime* runtime)
     std::string note_id;
     uint8_t image_index = 0;
     std::string image_id;
+    bool gray4 = false;
     uint32_t progress_generation = 0;
     if (!runtime->TakeNoteImageRequest(
-            &note_id, &image_index, &image_id, &progress_generation)) {
+            &note_id, &image_index, &image_id, &gray4,
+            &progress_generation)) {
         return;
     }
-    if (!QueueNoteImageFetch(note_id, image_index, image_id, progress_generation)) {
+    if (!QueueNoteImageFetch(
+            note_id, image_index, image_id, gray4, progress_generation)) {
         ESP_LOGW(kNoteTag, "note image queue rejected (busy=%d); will retry",
                  IsNoteCloudBusy() ? 1 : 0);
         runtime->RestoreNoteImageRequest();
@@ -235,20 +265,26 @@ RefreshSchedule PumpNoteObservationCommit(UiRuntime* runtime)
     return RefreshSchedule::kNone;
 }
 
-NoteCloudResult* PeekNoteCloudResult(uint32_t generation)
+NoteCloudResult* PeekNoteCloudResult(CloudDomain domain, uint32_t generation)
 {
-    if (generation == 0 || generation != g_note_result_generation) {
+    const bool bulk = domain == CloudDomain::kNoteBulk;
+    const uint32_t current = bulk ? g_note_pack_result_generation
+                                  : g_note_result_generation;
+    if (generation == 0 || generation != current) {
         return nullptr;
     }
-    return &g_note_result_slot;
+    return bulk ? &g_note_pack_result_slot : &g_note_result_slot;
 }
 
-void SendNoteCloudResult()
+void SendNoteCloudResult(CloudDomain domain)
 {
+    const uint32_t generation = domain == CloudDomain::kNoteBulk
+        ? g_note_pack_result_generation
+        : g_note_result_generation;
     CloudResultReady ready;
-    ready.domain = CloudDomain::kNote;
-    ready.generation = g_note_result_generation;
-    PublishCloudResult(CloudDomain::kNote, g_note_result_generation);
+    ready.domain = domain;
+    ready.generation = generation;
+    PublishCloudResult(domain, generation);
     (void)ready;
 }
 
@@ -332,30 +368,55 @@ bool ApplyNoteCloudResult(wqn::UiState* state, NoteCloudResult& result)
 
 void ExecuteNoteCloudRequest(const NoteCloudRequest& request)
 {
-    g_note_result_slot = NoteCloudResult{};
-    ++g_note_result_generation;
-    if (g_note_result_generation == 0) {
-        ++g_note_result_generation;
+    const CloudDomain result_domain = request.op == NoteCloudOp::kPackSync
+        ? CloudDomain::kNoteBulk
+        : CloudDomain::kNote;
+    const wqn::services::SyncContentTicket content_ticket = {
+        wqn::services::SyncContentDomain::kNotePacks,
+        request.content_sync_generation,
+        request.content_target_revision,
+    };
+    NoteCloudResult& result_slot = result_domain == CloudDomain::kNoteBulk
+        ? g_note_pack_result_slot
+        : g_note_result_slot;
+    uint32_t& result_generation = result_domain == CloudDomain::kNoteBulk
+        ? g_note_pack_result_generation
+        : g_note_result_generation;
+    result_slot = NoteCloudResult{};
+    ++result_generation;
+    if (result_generation == 0) {
+        ++result_generation;
     }
-    NoteCloudResult& result = g_note_result_slot;
+    NoteCloudResult& result = result_slot;
     result.op = request.op;
     result.message.clear();
+    std::string content_snapshot_id;
 
     std::string token;
     if (!LoadValidTokenForTodo(&token)) {
         result.auth_required = true;
         result.result = ESP_ERR_INVALID_STATE;
-        SendNoteCloudResult();
+        if (request.op == NoteCloudOp::kPackSync) {
+            wqn::services::CompleteContentRefresh(
+                content_ticket, result.result, nullptr, "auth-required");
+        }
+        SendNoteCloudResult(result_domain);
         return;
     }
 
     if (request.op == NoteCloudOp::kPackSync) {
         wqn::NotePackSyncResult sync;
-        result.result = wqn::SyncNotePacks(token, &sync);
+        result.result = wqn::services::BeginContentInstall(content_ticket);
+        if (result.result == ESP_OK) {
+            result.result = wqn::SyncNotePacks(token, &sync);
+        } else {
+            sync.message = "笔记安装标记失败";
+        }
         result.pack_index = std::move(sync.index);
         result.pack_index_ready = sync.index_ready;
         result.message = sync.message;
         result.auth_required = sync.auth_required;
+        content_snapshot_id = sync.snapshot_id;
     } else if (request.op == NoteCloudOp::kFetchNotebookPack) {
         wqn::NotePackSyncResult sync;
         result.fetched_notebook_id = request.notebook_id;
@@ -424,7 +485,9 @@ void ExecuteNoteCloudRequest(const NoteCloudRequest& request)
                 request.image_index,
                 image_id,
                 wqni.get(),
-                &ReportCloudTransferBytes);
+                &ReportCloudTransferBytes,
+                request.image_gray4 ? wqn::WqnImagePixelFormat::kGray4
+                                     : wqn::WqnImagePixelFormat::kBw1);
             EndCloudTransferProgress();
             if (result.result == ESP_OK) {
                 result.result =
@@ -452,7 +515,13 @@ void ExecuteNoteCloudRequest(const NoteCloudRequest& request)
         std::string after_token;
         result.auth_required = !LoadValidTokenForTodo(&after_token);
     }
-    SendNoteCloudResult();
+    if (request.op == NoteCloudOp::kPackSync) {
+        wqn::services::CompleteContentRefresh(
+            content_ticket, result.result,
+            content_snapshot_id.empty() ? nullptr : content_snapshot_id.c_str(),
+            result.result == ESP_OK ? nullptr : result.message.c_str());
+    }
+    SendNoteCloudResult(result_domain);
 }
 
 }  // namespace device_ui_internal

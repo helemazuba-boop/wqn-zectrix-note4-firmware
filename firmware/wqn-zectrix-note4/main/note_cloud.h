@@ -16,6 +16,7 @@ struct NotePackSyncResult {
     bool auth_required = false;
     NotePackIndex index;
     std::string message;
+    std::string snapshot_id;
 };
 
 // Runs one note-pack content sync: pages the note-study manifest from the given

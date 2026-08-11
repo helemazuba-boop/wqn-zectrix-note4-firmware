@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <array>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <string>
 #include <utility>
@@ -19,6 +20,7 @@
 #include "esp_random.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "freertos/timers.h"
 #include "nvs.h"
@@ -36,17 +38,163 @@ constexpr char kTag[] = "sync_service";
 #if CONFIG_WQN_WIFI_STA_ENABLE
 wqn::services::SyncSnapshot g_sync_snapshot = {};
 portMUX_TYPE g_sync_snapshot_lock = portMUX_INITIALIZER_UNLOCKED;
-std::atomic<wqn::services::SyncEventSink> g_sync_event_sink{nullptr};
 uint32_t g_sync_event_sequence = 1;
+wqn::services::SyncEvent g_latest_sync_event = {};
 constexpr TickType_t kSyncRetryDelay = pdMS_TO_TICKS(10000);
 bool LoadUsableToken(std::string* token);
 TaskHandle_t g_sync_service_task = nullptr;
 std::atomic<bool> g_full_sync_requested{false};
 std::atomic<bool> g_word_outbox_sync_requested{false};
+std::atomic<uint32_t> g_content_refresh_requested{0};
+constexpr uint32_t kWordPacksRefreshBit = 1u << 0;
+constexpr uint32_t kNotePacksRefreshBit = 1u << 1;
+constexpr uint32_t kProblemPacksRefreshBit = 1u << 2;
 std::atomic<uint32_t> g_word_interaction_generation{0};
 constexpr uint32_t kWordOutboxQuietPeriodMs = 5000;
 StaticTimer_t g_word_outbox_timer_storage;
 TimerHandle_t g_word_outbox_timer = nullptr;
+wqn::SyncJournal g_sync_journal = {};
+bool g_sync_journal_loaded = false;
+StaticSemaphore_t g_sync_journal_mutex_storage;
+SemaphoreHandle_t g_sync_journal_mutex = nullptr;
+uint32_t g_content_claim_generation[3] = {};
+uint32_t g_content_active_generation[3] = {};
+
+size_t ContentDomainIndex(wqn::services::SyncContentDomain domain)
+{
+    return static_cast<size_t>(domain);
+}
+
+uint32_t ContentRefreshBit(wqn::services::SyncContentDomain domain)
+{
+    switch (domain) {
+        case wqn::services::SyncContentDomain::kWordPacks:
+            return kWordPacksRefreshBit;
+        case wqn::services::SyncContentDomain::kNotePacks:
+            return kNotePacksRefreshBit;
+        case wqn::services::SyncContentDomain::kProblemPacks:
+            return kProblemPacksRefreshBit;
+        default:
+            return 0;
+    }
+}
+
+wqn::services::SyncContentSnapshot* ContentSnapshotForKind(
+    wqn::protocol::v3::SyncContentKind kind)
+{
+    switch (kind) {
+        case wqn::protocol::v3::SyncContentKind::kWordPacks:
+            return &g_sync_snapshot.word_packs;
+        case wqn::protocol::v3::SyncContentKind::kNotePacks:
+            return &g_sync_snapshot.note_packs;
+        case wqn::protocol::v3::SyncContentKind::kProblemPacks:
+            return &g_sync_snapshot.problem_packs;
+        default:
+            return nullptr;
+    }
+}
+
+wqn::SyncJournalContentState* JournalStateForKind(
+    wqn::protocol::v3::SyncContentKind kind)
+{
+    switch (kind) {
+        case wqn::protocol::v3::SyncContentKind::kWordPacks:
+            return &g_sync_journal.word_packs;
+        case wqn::protocol::v3::SyncContentKind::kNotePacks:
+            return &g_sync_journal.note_packs;
+        case wqn::protocol::v3::SyncContentKind::kProblemPacks:
+            return &g_sync_journal.problem_packs;
+        default:
+            return nullptr;
+    }
+}
+
+wqn::services::SyncContentSnapshot* ContentSnapshotForDomain(
+    wqn::services::SyncContentDomain domain)
+{
+    switch (domain) {
+        case wqn::services::SyncContentDomain::kWordPacks:
+            return &g_sync_snapshot.word_packs;
+        case wqn::services::SyncContentDomain::kNotePacks:
+            return &g_sync_snapshot.note_packs;
+        case wqn::services::SyncContentDomain::kProblemPacks:
+            return &g_sync_snapshot.problem_packs;
+        default:
+            return nullptr;
+    }
+}
+
+wqn::SyncJournalContentState* JournalStateForDomain(
+    wqn::services::SyncContentDomain domain)
+{
+    switch (domain) {
+        case wqn::services::SyncContentDomain::kWordPacks:
+            return &g_sync_journal.word_packs;
+        case wqn::services::SyncContentDomain::kNotePacks:
+            return &g_sync_journal.note_packs;
+        case wqn::services::SyncContentDomain::kProblemPacks:
+            return &g_sync_journal.problem_packs;
+        default:
+            return nullptr;
+    }
+}
+
+esp_err_t PersistLatestSyncJournal()
+{
+    if (g_sync_journal_mutex == nullptr ||
+        xSemaphoreTake(g_sync_journal_mutex, portMAX_DELAY) != pdTRUE) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    wqn::SyncJournal snapshot;
+    taskENTER_CRITICAL(&g_sync_snapshot_lock);
+    snapshot = g_sync_journal;
+    taskEXIT_CRITICAL(&g_sync_snapshot_lock);
+    const esp_err_t result = wqn::SaveSyncJournal(snapshot);
+    xSemaphoreGive(g_sync_journal_mutex);
+    return result;
+}
+
+void PublishContentTargets(
+    const std::vector<wqn::protocol::v3::SyncContentTarget>& targets)
+{
+    bool changed = false;
+    taskENTER_CRITICAL(&g_sync_snapshot_lock);
+    for (const auto& target : targets) {
+        if (target.kind == wqn::protocol::v3::SyncContentKind::kTodos) {
+            if (target.revision > g_sync_snapshot.todo_revision) {
+                g_sync_snapshot.todo_revision = target.revision;
+                ++g_sync_snapshot.state_sequence;
+            }
+            continue;
+        }
+        wqn::services::SyncContentSnapshot* snapshot =
+            ContentSnapshotForKind(target.kind);
+        if (snapshot == nullptr || target.revision == 0) {
+            continue;
+        }
+        if (target.revision > snapshot->desired_revision) {
+            snapshot->desired_revision = target.revision;
+            snapshot->phase = wqn::services::SyncContentPhase::kPending;
+            snapshot->retry_attempt = 0;
+            snapshot->next_retry_ms = 0;
+            snapshot->last_error[0] = '\0';
+            wqn::SyncJournalContentState* journal_state =
+                JournalStateForKind(target.kind);
+            if (journal_state != nullptr) {
+                journal_state->desired_revision = target.revision;
+                journal_state->phase = wqn::SyncJournalPhase::kPending;
+                journal_state->retry_attempt = 0;
+                journal_state->desired_snapshot_id[0] = '\0';
+            }
+            ++g_sync_snapshot.state_sequence;
+            changed = true;
+        }
+    }
+    taskEXIT_CRITICAL(&g_sync_snapshot_lock);
+    if (changed && PersistLatestSyncJournal() != ESP_OK) {
+        ESP_LOGW(kTag, "content target journal save failed");
+    }
+}
 
 void WordOutboxTimerCallback(TimerHandle_t)
 {
@@ -366,6 +514,58 @@ esp_err_t EnsureControlStateLoaded()
     return ESP_OK;
 }
 
+esp_err_t EnsureSyncJournalLoaded()
+{
+    if (g_sync_journal_loaded) {
+        return ESP_OK;
+    }
+    esp_err_t result = wqn::LoadSyncJournal(&g_sync_journal);
+    if (result != ESP_OK) {
+        ESP_LOGE(kTag, "sync journal invalid: %s", esp_err_to_name(result));
+        return result;
+    }
+    bool recovered_interrupted_install = false;
+    const auto recover = [&](wqn::SyncJournalContentState* state) {
+        if (state->phase == wqn::SyncJournalPhase::kFetching ||
+            state->phase == wqn::SyncJournalPhase::kInstalling) {
+            state->phase = wqn::SyncJournalPhase::kPending;
+            recovered_interrupted_install = true;
+        }
+    };
+    recover(&g_sync_journal.word_packs);
+    recover(&g_sync_journal.note_packs);
+    recover(&g_sync_journal.problem_packs);
+    const auto publish = [](const wqn::SyncJournalContentState& source,
+                            wqn::services::SyncContentSnapshot* target) {
+        target->desired_revision = source.desired_revision;
+        target->applied_revision = source.applied_revision;
+        target->phase = static_cast<wqn::services::SyncContentPhase>(source.phase);
+        target->retry_attempt = source.retry_attempt;
+        std::snprintf(target->snapshot_id, sizeof(target->snapshot_id), "%s",
+                      source.desired_snapshot_id);
+    };
+    taskENTER_CRITICAL(&g_sync_snapshot_lock);
+    publish(g_sync_journal.word_packs, &g_sync_snapshot.word_packs);
+    publish(g_sync_journal.note_packs, &g_sync_snapshot.note_packs);
+    publish(g_sync_journal.problem_packs, &g_sync_snapshot.problem_packs);
+    if (g_sync_snapshot.word_packs.desired_revision >
+            g_sync_snapshot.word_packs.applied_revision ||
+        g_sync_snapshot.note_packs.desired_revision >
+            g_sync_snapshot.note_packs.applied_revision ||
+        g_sync_snapshot.problem_packs.desired_revision >
+            g_sync_snapshot.problem_packs.applied_revision) {
+        g_sync_snapshot.state_sequence = 1;
+    }
+    taskEXIT_CRITICAL(&g_sync_snapshot_lock);
+    g_sync_journal_loaded = true;
+    if (recovered_interrupted_install) {
+        ESP_LOGW(kTag, "interrupted content install recovered as pending");
+        ESP_RETURN_ON_ERROR(
+            PersistLatestSyncJournal(), kTag, "persist recovered sync journal");
+    }
+    return ESP_OK;
+}
+
 std::string RandomControlId(const char* prefix)
 {
     char value[48] = {};
@@ -629,13 +829,10 @@ void PublishSyncEvent(
         "%s",
         g_sync_snapshot.claim_code);
     event.claim_expires_at_ms = g_sync_snapshot.claim_expires_at_ms;
+    event.todo_revision = g_sync_snapshot.todo_revision;
+    g_latest_sync_event = event;
     taskEXIT_CRITICAL(&g_sync_snapshot_lock);
 
-    const wqn::services::SyncEventSink sink =
-        g_sync_event_sink.load(std::memory_order_acquire);
-    if (sink != nullptr) {
-        sink(event);
-    }
 }
 
 bool LoadUsableToken(std::string* token)
@@ -694,6 +891,14 @@ esp_err_t BootstrapControlV3(const std::string& token)
     g_control_retry_after_ms = 0;
     g_config_revision = checkpoint.config_revision;
     g_sync_cursor = checkpoint.sync_cursor;
+    taskENTER_CRITICAL(&g_sync_snapshot_lock);
+    g_sync_journal.config_revision = checkpoint.config_revision;
+    g_sync_journal.sync_cursor = checkpoint.sync_cursor;
+    taskEXIT_CRITICAL(&g_sync_snapshot_lock);
+    ESP_RETURN_ON_ERROR(
+        PersistLatestSyncJournal(),
+        kTag,
+        "save bootstrap sync journal");
     g_bootstrap_complete = true;
     g_bootstrap_request_id.clear();
     ESP_LOGI(
@@ -723,6 +928,7 @@ esp_err_t SyncControlPlaneV3(const std::string& token)
         return sync_result;
     }
     g_control_retry_after_ms = 0;
+    PublishContentTargets(sync.content_targets);
     if (sync.auto_sync_interval_minutes == 0 ||
         sync.auto_sync_interval_minutes == 15 ||
         sync.auto_sync_interval_minutes == 30 ||
@@ -757,6 +963,14 @@ esp_err_t SyncControlPlaneV3(const std::string& token)
         "commit v3 sync checkpoint");
     g_config_revision = checkpoint.config_revision;
     g_sync_cursor = checkpoint.sync_cursor;
+    taskENTER_CRITICAL(&g_sync_snapshot_lock);
+    g_sync_journal.config_revision = checkpoint.config_revision;
+    g_sync_journal.sync_cursor = checkpoint.sync_cursor;
+    taskEXIT_CRITICAL(&g_sync_snapshot_lock);
+    ESP_RETURN_ON_ERROR(
+        PersistLatestSyncJournal(),
+        kTag,
+        "commit sync journal checkpoint");
     g_sync_request_id.clear();
     ESP_LOGI(
         kTag,
@@ -1374,6 +1588,19 @@ void SyncServiceTask(void*)
         }
         first_round = false;
 
+        wqn::runtime::SleepLease sleep_lease =
+            wqn::runtime::SleepLease::TryAcquire(
+                wqn::runtime::SleepBlocker::kOnlineSync, "sync-service", __FILE__, __LINE__);
+        if (!sleep_lease) {
+            SetSyncStatus("sleep-quiescing");
+            ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        // Claim request intents only after the online-sync lease is owned.
+        // A lease failure means the device is quiescing; consuming these
+        // flags before that point used to silently lose manual sync and
+        // outbox requests.
         const bool full_requested =
             g_full_sync_requested.exchange(false, std::memory_order_acq_rel);
         const bool word_outbox_requested =
@@ -1384,15 +1611,6 @@ void SyncServiceTask(void*)
         const bool outbox_only = false;
         (void)word_outbox_requested;
 #endif
-
-        wqn::runtime::SleepLease sleep_lease =
-            wqn::runtime::SleepLease::TryAcquire(
-                wqn::runtime::SleepBlocker::kOnlineSync, "sync-service", __FILE__, __LINE__);
-        if (!sleep_lease) {
-            SetSyncStatus("sleep-quiescing");
-            ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000));
-            continue;
-        }
 
         SetSyncRoundStarted(esp_timer_get_time() / 1000);
         SetSyncStatus(outbox_only ? "word-outbox" : "syncing");
@@ -1488,6 +1706,14 @@ wqn::protocol::v3::RequestMetadata MakeDeviceRequestMetadata()
 
 esp_err_t StartSyncService()
 {
+    if (g_sync_journal_mutex == nullptr) {
+        g_sync_journal_mutex =
+            xSemaphoreCreateMutexStatic(&g_sync_journal_mutex_storage);
+        if (g_sync_journal_mutex == nullptr) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    ESP_RETURN_ON_ERROR(EnsureSyncJournalLoaded(), kTag, "load sync journal");
     if (g_word_outbox_timer == nullptr) {
         g_word_outbox_timer = xTimerCreateStatic(
             "word_outbox",
@@ -1523,6 +1749,216 @@ void RequestSyncNow()
     if (g_sync_service_task != nullptr) {
         xTaskNotifyGive(g_sync_service_task);
     }
+#endif
+}
+
+void RequestContentRefresh(SyncContentDomain domain)
+{
+#if CONFIG_WQN_WIFI_STA_ENABLE
+    const uint32_t bit = ContentRefreshBit(domain);
+    if (bit == 0) {
+        return;
+    }
+    g_content_refresh_requested.fetch_or(bit, std::memory_order_release);
+    taskENTER_CRITICAL(&g_sync_snapshot_lock);
+    SyncContentSnapshot* snapshot = nullptr;
+    switch (domain) {
+        case SyncContentDomain::kWordPacks:
+            snapshot = &g_sync_snapshot.word_packs;
+            break;
+        case SyncContentDomain::kNotePacks:
+            snapshot = &g_sync_snapshot.note_packs;
+            break;
+        case SyncContentDomain::kProblemPacks:
+            snapshot = &g_sync_snapshot.problem_packs;
+            break;
+    }
+    if (snapshot != nullptr &&
+        snapshot->phase != SyncContentPhase::kFetching &&
+        snapshot->phase != SyncContentPhase::kInstalling) {
+        snapshot->phase = SyncContentPhase::kPending;
+        snapshot->next_retry_ms = 0;
+        ++g_sync_snapshot.state_sequence;
+    }
+    taskEXIT_CRITICAL(&g_sync_snapshot_lock);
+    if (g_sync_service_task != nullptr) {
+        xTaskNotifyGive(g_sync_service_task);
+    }
+#else
+    (void)domain;
+#endif
+}
+
+SyncContentTicket TryClaimContentRefresh(SyncContentDomain domain)
+{
+    SyncContentTicket ticket;
+    ticket.domain = domain;
+#if CONFIG_WQN_WIFI_STA_ENABLE
+    const uint32_t bit = ContentRefreshBit(domain);
+    if (bit == 0) {
+        return ticket;
+    }
+    const bool forced =
+        (g_content_refresh_requested.fetch_and(~bit, std::memory_order_acq_rel) & bit) != 0;
+    const int64_t now_ms = esp_timer_get_time() / 1000;
+    taskENTER_CRITICAL(&g_sync_snapshot_lock);
+    SyncContentSnapshot* snapshot = ContentSnapshotForDomain(domain);
+    const bool due = snapshot != nullptr &&
+        (snapshot->phase == SyncContentPhase::kPending ||
+         (snapshot->phase == SyncContentPhase::kBackoff &&
+          snapshot->next_retry_ms <= now_ms));
+    const bool needs_convergence = snapshot != nullptr &&
+        snapshot->desired_revision > snapshot->applied_revision;
+    const size_t index = ContentDomainIndex(domain);
+    if (snapshot != nullptr && g_content_active_generation[index] == 0 &&
+        (forced || (due && needs_convergence))) {
+        uint32_t generation = ++g_content_claim_generation[index];
+        if (generation == 0) {
+            generation = ++g_content_claim_generation[index];
+        }
+        g_content_active_generation[index] = generation;
+        snapshot->phase = SyncContentPhase::kFetching;
+        snapshot->next_retry_ms = 0;
+        ++g_sync_snapshot.state_sequence;
+        ticket.generation = generation;
+        ticket.target_revision = snapshot->desired_revision;
+    }
+    taskEXIT_CRITICAL(&g_sync_snapshot_lock);
+    if (!ticket && forced) {
+        g_content_refresh_requested.fetch_or(bit, std::memory_order_release);
+    }
+#else
+    (void)domain;
+#endif
+    return ticket;
+}
+
+void CancelContentRefreshClaim(const SyncContentTicket& ticket)
+{
+#if CONFIG_WQN_WIFI_STA_ENABLE
+    if (!ticket || ContentRefreshBit(ticket.domain) == 0) {
+        return;
+    }
+    const size_t index = ContentDomainIndex(ticket.domain);
+    taskENTER_CRITICAL(&g_sync_snapshot_lock);
+    if (g_content_active_generation[index] == ticket.generation) {
+        g_content_active_generation[index] = 0;
+        SyncContentSnapshot* snapshot = ContentSnapshotForDomain(ticket.domain);
+        if (snapshot != nullptr) {
+            snapshot->phase = SyncContentPhase::kPending;
+            ++g_sync_snapshot.state_sequence;
+        }
+    }
+    taskEXIT_CRITICAL(&g_sync_snapshot_lock);
+    g_content_refresh_requested.fetch_or(
+        ContentRefreshBit(ticket.domain), std::memory_order_release);
+#else
+    (void)ticket;
+#endif
+}
+
+esp_err_t BeginContentInstall(const SyncContentTicket& ticket)
+{
+#if CONFIG_WQN_WIFI_STA_ENABLE
+    if (!ticket || ContentRefreshBit(ticket.domain) == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    bool accepted = false;
+    const size_t index = ContentDomainIndex(ticket.domain);
+    taskENTER_CRITICAL(&g_sync_snapshot_lock);
+    if (g_content_active_generation[index] == ticket.generation) {
+        SyncContentSnapshot* snapshot = ContentSnapshotForDomain(ticket.domain);
+        wqn::SyncJournalContentState* journal = JournalStateForDomain(ticket.domain);
+        if (snapshot != nullptr && journal != nullptr) {
+            snapshot->phase = SyncContentPhase::kInstalling;
+            journal->phase = wqn::SyncJournalPhase::kInstalling;
+            ++g_sync_snapshot.state_sequence;
+            accepted = true;
+        }
+    }
+    taskEXIT_CRITICAL(&g_sync_snapshot_lock);
+    if (!accepted) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    return PersistLatestSyncJournal();
+#else
+    (void)ticket;
+    return ESP_ERR_NOT_SUPPORTED;
+#endif
+}
+
+void CompleteContentRefresh(
+    const SyncContentTicket& ticket,
+    esp_err_t result,
+    const char* snapshot_id,
+    const char* error)
+{
+#if CONFIG_WQN_WIFI_STA_ENABLE
+    if (!ticket || ContentRefreshBit(ticket.domain) == 0) {
+        return;
+    }
+    const size_t index = ContentDomainIndex(ticket.domain);
+    bool accepted = false;
+    taskENTER_CRITICAL(&g_sync_snapshot_lock);
+    if (g_content_active_generation[index] == ticket.generation) {
+        g_content_active_generation[index] = 0;
+        SyncContentSnapshot* snapshot = ContentSnapshotForDomain(ticket.domain);
+        wqn::SyncJournalContentState* journal = JournalStateForDomain(ticket.domain);
+        if (snapshot != nullptr && journal != nullptr) {
+            if (result == ESP_OK) {
+                snapshot->applied_revision = std::max(
+                    snapshot->applied_revision, ticket.target_revision);
+                snapshot->retry_attempt = 0;
+                snapshot->next_retry_ms = 0;
+                snapshot->last_error[0] = '\0';
+                if (snapshot_id != nullptr && std::strlen(snapshot_id) == 64) {
+                    std::snprintf(snapshot->snapshot_id,
+                                  sizeof(snapshot->snapshot_id), "%s", snapshot_id);
+                    std::snprintf(journal->desired_snapshot_id,
+                                  sizeof(journal->desired_snapshot_id), "%s", snapshot_id);
+                    std::snprintf(journal->active_snapshot_id,
+                                  sizeof(journal->active_snapshot_id), "%s", snapshot_id);
+                }
+                snapshot->phase = snapshot->desired_revision > snapshot->applied_revision
+                    ? SyncContentPhase::kPending
+                    : SyncContentPhase::kClean;
+                journal->applied_revision = snapshot->applied_revision;
+                journal->phase = snapshot->phase == SyncContentPhase::kClean
+                    ? wqn::SyncJournalPhase::kClean
+                    : wqn::SyncJournalPhase::kPending;
+                journal->retry_attempt = 0;
+            } else {
+                if (snapshot->retry_attempt < UINT8_MAX) {
+                    ++snapshot->retry_attempt;
+                }
+                const uint8_t shift = std::min<uint8_t>(snapshot->retry_attempt - 1, 7);
+                const uint32_t base_ms = std::min<uint32_t>(5000u << shift, 900000u);
+                const uint32_t low_ms = base_ms * 4u / 5u;
+                const uint32_t spread_ms = base_ms * 2u / 5u;
+                const uint32_t delay_ms = low_ms + esp_random() % (spread_ms + 1u);
+                snapshot->next_retry_ms =
+                    esp_timer_get_time() / 1000 + static_cast<int64_t>(delay_ms);
+                snapshot->phase = SyncContentPhase::kBackoff;
+                std::snprintf(snapshot->last_error,
+                              sizeof(snapshot->last_error), "%s",
+                              error == nullptr ? esp_err_to_name(result) : error);
+                journal->phase = wqn::SyncJournalPhase::kBackoff;
+                journal->retry_attempt = snapshot->retry_attempt;
+            }
+            ++g_sync_snapshot.state_sequence;
+            accepted = true;
+        }
+    }
+    taskEXIT_CRITICAL(&g_sync_snapshot_lock);
+    if (accepted && PersistLatestSyncJournal() != ESP_OK) {
+        ESP_LOGE(kTag, "content completion journal save failed: domain=%u",
+                 static_cast<unsigned>(ticket.domain));
+    }
+#else
+    (void)ticket;
+    (void)result;
+    (void)snapshot_id;
+    (void)error;
 #endif
 }
 
@@ -1619,12 +2055,17 @@ TickType_t GetConfiguredSyncDelayTicks()
 
 namespace wqn::services {
 
-void SetSyncEventSink(SyncEventSink sink)
+void GetLatestSyncEvent(SyncEvent* event)
 {
+    if (event == nullptr) {
+        return;
+    }
 #if CONFIG_WQN_WIFI_STA_ENABLE
-    g_sync_event_sink.store(sink, std::memory_order_release);
+    taskENTER_CRITICAL(&g_sync_snapshot_lock);
+    *event = g_latest_sync_event;
+    taskEXIT_CRITICAL(&g_sync_snapshot_lock);
 #else
-    (void)sink;
+    *event = SyncEvent{};
 #endif
 }
 

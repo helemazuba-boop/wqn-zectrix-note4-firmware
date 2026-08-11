@@ -10,6 +10,7 @@
 #include "esp_err.h"
 #include "note_pack.h"
 #include "note_store.h"
+#include "storage.h"
 #include "wqn_api.h"
 
 namespace wqn {
@@ -149,6 +150,8 @@ struct NoteAppState {
     bool image_request = false;
     bool image_in_flight = false;
     bool image_error = false;
+    ImageRenderMode image_render_mode = ImageRenderMode::kGray16;
+    bool image_expected_gray4 = false;
     // Id the viewer currently wants; results for anything else are dropped.
     std::string image_expected_id;
     // Id handed to the fetcher on the last dispatch: failures that arrive with
@@ -277,6 +280,7 @@ bool TakeNoteImageRequest(
     std::string* note_id,
     uint8_t* image_index,
     std::string* image_id,
+    bool* gray4,
     uint32_t* progress_generation);
 void RestoreNoteImageRequest(NoteAppState* state);
 // Targeted single-notebook pack fetch for an opened-but-missing note body;
@@ -296,6 +300,7 @@ void ApplyNoteBodyFetchResult(
 // Frees the held WQNI payload (used when the user leaves the note screen);
 // keeps request/in-flight bookkeeping intact.
 void ReleaseNoteImagePayload(NoteAppState* state);
+void SetNoteImageRenderMode(NoteAppState* state, ImageRenderMode mode);
 void ApplyNoteImageResult(
     NoteAppState* state,
     esp_err_t result,

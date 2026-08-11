@@ -10,6 +10,7 @@
 #include "ai_session.h"
 #include "esp_log.h"
 #include "flash_session.h"
+#include "services/sync_service.h"
 
 namespace device_ui_internal {
 
@@ -103,6 +104,45 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
             } else {
                 state->settings.volume_save_op_id = 0;
                 state->settings.notice = IsPersistKindBusy(PersistKind::kSettingsVolume)
+                    ? "正在保存，请稍后"
+                    : "保存繁忙，请重试";
+            }
+            state->settings.dialog = wqn::SettingsDialog::kNone;
+            return RefreshSchedule::kConfig;
+        }
+        return RefreshSchedule::kNone;
+    }
+
+    if (state->settings.dialog == wqn::SettingsDialog::kImageRendering) {
+        if (short_press && event.button == wqn::ButtonId::kUp) {
+            if (state->settings.image_render_selected == 0) {
+                return RefreshSchedule::kNone;
+            }
+            --state->settings.image_render_selected;
+            return RefreshSchedule::kConfig;
+        }
+        if (short_press && event.button == wqn::ButtonId::kDownPower) {
+            if (state->settings.image_render_selected >= 1) {
+                return RefreshSchedule::kNone;
+            }
+            ++state->settings.image_render_selected;
+            return RefreshSchedule::kConfig;
+        }
+        if (short_press && event.button == wqn::ButtonId::kConfirm) {
+            const wqn::ImageRenderMode mode =
+                state->settings.image_render_selected == 0
+                ? wqn::ImageRenderMode::kBlackWhite
+                : wqn::ImageRenderMode::kGray16;
+            state->settings.pending_image_render_mode = mode;
+            state->settings.image_render_pending_valid = true;
+            const uint32_t op_id = SubmitImageRenderModeSave(mode);
+            if (op_id != 0) {
+                state->settings.image_render_save_op_id = op_id;
+                state->settings.notice = "正在保存…";
+            } else {
+                state->settings.image_render_save_op_id = 0;
+                state->settings.notice =
+                    IsPersistKindBusy(PersistKind::kSettingsImageRender)
                     ? "正在保存，请稍后"
                     : "保存繁忙，请重试";
             }
@@ -279,16 +319,19 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
             OpenSettingsDialog(state, wqn::SettingsDialog::kStorage);
             return RefreshSchedule::kConfig;
         case 4:
-            OpenSettingsDialog(state, wqn::SettingsDialog::kVolume);
+            OpenSettingsDialog(state, wqn::SettingsDialog::kImageRendering);
             return RefreshSchedule::kConfig;
         case 5:
-            OpenSettingsDialog(state, wqn::SettingsDialog::kDefaultWordDeck);
+            OpenSettingsDialog(state, wqn::SettingsDialog::kVolume);
             return RefreshSchedule::kConfig;
         case 6:
+            OpenSettingsDialog(state, wqn::SettingsDialog::kDefaultWordDeck);
+            return RefreshSchedule::kConfig;
+        case 7:
             UpdateSettingsDiagnostics(state);
             state->settings.notice = "固件 " + state->settings.diagnostics.firmware_version;
             return RefreshSchedule::kConfig;
-        case 7:
+        case 8:
             OpenSettingsDialog(state, wqn::SettingsDialog::kFactoryReset);
             return RefreshSchedule::kConfig;
         default:
@@ -784,6 +827,8 @@ RefreshSchedule ApplyButtonEvent(
         if (state->screen == wqn::UiScreen::kTodo) {
             RefreshTodosFromCloud(state);
         } else if (state->screen == wqn::UiScreen::kWord && state->word_app.cloud_sync_requested) {
+            wqn::services::RequestContentRefresh(
+                wqn::services::SyncContentDomain::kWordPacks);
             if (!QueueWordReviewRefresh()) {
                 state->word_app.message = IsWordCloudBusy() ? "单词同步中" : "单词同步失败";
             } else {
@@ -791,6 +836,8 @@ RefreshSchedule ApplyButtonEvent(
             }
         } else if (state->screen == wqn::UiScreen::kNote &&
                    state->note_app.cloud_sync_requested) {
+            wqn::services::RequestContentRefresh(
+                wqn::services::SyncContentDomain::kNotePacks);
             if (!QueueNotePackSync()) {
                 state->note_app.message = IsNoteCloudBusy() ? "笔记同步中" : "笔记同步失败";
             } else {
@@ -799,6 +846,8 @@ RefreshSchedule ApplyButtonEvent(
             // The mixed list also carries the [题] rows: give the problem
             // packs the same entry refresh (coalesced by the busy CAS).
             if (state->problem_app.cloud_sync_requested) {
+                wqn::services::RequestContentRefresh(
+                    wqn::services::SyncContentDomain::kProblemPacks);
                 QueueProblemPackSync();
             }
         }

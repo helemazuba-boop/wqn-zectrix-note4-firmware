@@ -119,6 +119,8 @@ struct WqnNotePackManifestNotebook {
 struct WqnNotePackManifest {
     uint64_t cursor = 0;
     bool has_more = false;
+    uint64_t revision = 0;
+    std::string snapshot_id;
     std::vector<WqnNotePackManifestNotebook> notebooks;
 };
 
@@ -145,6 +147,8 @@ struct WqnProblemPackManifestSet {
 struct WqnProblemPackManifest {
     uint64_t cursor = 0;
     bool has_more = false;
+    uint64_t revision = 0;
+    std::string snapshot_id;
     std::vector<WqnProblemPackManifestSet> problem_sets;
 };
 
@@ -286,6 +290,10 @@ using WqnHttpChunkSink = esp_err_t (*)(
 using WqnTransferProgressSink = void (*)(
     uint32_t done_bytes,
     uint32_t total_bytes);
+enum class WqnImagePixelFormat : uint8_t {
+    kBw1 = 1,
+    kGray4 = 2,
+};
 esp_err_t DownloadWordPackStream(
     const std::string& token,
     const protocol::v3::RequestMetadata& metadata,
@@ -299,7 +307,8 @@ esp_err_t FetchNoteStudyManifest(
     const std::string& token,
     const protocol::v3::RequestMetadata& metadata,
     uint64_t cursor,
-    WqnNotePackManifest* manifest);
+    WqnNotePackManifest* manifest,
+    const std::string& snapshot_id = {});
 // Streams one notebook's note pack (application/x-ndjson) into `sink`. Bounded by
 // the manifest byte_size and the note-study-v1 pack cap.
 esp_err_t DownloadNotePackStream(
@@ -309,8 +318,8 @@ esp_err_t DownloadNotePackStream(
     WqnHttpChunkSink sink,
     void* context,
     WqnTransferProgressSink progress = nullptr);
-// Downloads one note image as a WQNI file (20-byte header + 15000-byte 1-bpp
-// payload) from /v3/notes/images/{note_id}/{image_index}. Verifies the exact
+// Downloads one note image as a WQNI file (20-byte header + payload) from the
+// content-addressed /v3/images/{expected_image_id} endpoint. Verifies the exact
 // file size and that sha256(bytes) == expected_image_id (the content address
 // carried by the pack line); WQNI header/CRC validation is the caller's job
 // via wqn::ValidateNoteImageWqni.
@@ -321,7 +330,8 @@ esp_err_t DownloadNoteImageV1(
     uint8_t image_index,
     const std::string& expected_image_id,
     std::vector<uint8_t>* wqni,
-    WqnTransferProgressSink progress = nullptr);
+    WqnTransferProgressSink progress = nullptr,
+    WqnImagePixelFormat pixel_format = WqnImagePixelFormat::kBw1);
 esp_err_t CreateNoteStudySessionV1(
     const std::string& token,
     const protocol::note_study_v1::CreateSessionRequest& request,
@@ -358,7 +368,8 @@ esp_err_t FetchProblemStudyManifest(
     const std::string& token,
     const protocol::v3::RequestMetadata& metadata,
     uint64_t cursor,
-    WqnProblemPackManifest* manifest);
+    WqnProblemPackManifest* manifest,
+    const std::string& snapshot_id = {});
 // Streams one problem set's pack (zlib transport, sha256 over the plaintext)
 // into `sink`. Bounded by the manifest byte_size and the contract pack cap.
 esp_err_t DownloadProblemPackStream(
@@ -367,8 +378,8 @@ esp_err_t DownloadProblemPackStream(
     const WqnProblemPackManifestSet& set,
     WqnHttpChunkSink sink,
     void* context);
-// Downloads one problem image as a WQNI file from
-// /v3/problems/images/{problem_id}/{assets|solution}/{image_index}. Inflates
+// Downloads one problem image as a WQNI file from the content-addressed
+// /v3/images/{expected_image_id} endpoint. Inflates
 // the zlib body with the heap-backed inflater and verifies sha256(bytes) ==
 // expected_image_id; WQNI header/CRC validation is the caller's job via
 // wqn::ValidateNoteImageWqni.
@@ -379,7 +390,8 @@ esp_err_t DownloadProblemImageV1(
     WqnProblemImageKind kind,
     uint8_t image_index,
     const std::string& expected_image_id,
-    std::vector<uint8_t>* wqni);
+    std::vector<uint8_t>* wqni,
+    WqnImagePixelFormat pixel_format = WqnImagePixelFormat::kBw1);
 // Uploads one durable self-assessment verdict (correct/hesitant/wrong/skip).
 // `transport_failure` distinguishes a network fault (retry) from a server
 // rejection (inspect error.retryable / error.code).

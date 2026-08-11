@@ -422,6 +422,7 @@ void ResetNoteImageViewer(wqn::NoteAppState* state)
     state->image_request = false;
     state->image_in_flight = false;
     state->image_error = false;
+    state->image_expected_gray4 = false;
     state->image_expected_id.clear();
     state->image_dispatched_id.clear();
     state->image_loaded_id.clear();
@@ -434,12 +435,19 @@ void ResetNoteImageViewer(wqn::NoteAppState* state)
 // cloud task (SPIFFS cache first, then download).
 void RequestCurrentNoteImage(wqn::NoteAppState* state)
 {
-    const auto& ids = state->current_note.image_ids;
-    if (state->image_index >= ids.size()) {
+    const auto& bw1_ids = state->current_note.image_ids;
+    if (state->image_index >= bw1_ids.size()) {
         state->image_error = true;
         return;
     }
-    const std::string& id = ids[state->image_index];
+    const bool has_gray4 =
+        state->image_index < state->current_note.gray4_image_ids.size() &&
+        !state->current_note.gray4_image_ids[state->image_index].empty();
+    state->image_expected_gray4 =
+        state->image_render_mode == wqn::ImageRenderMode::kGray16 && has_gray4;
+    const std::string& id = state->image_expected_gray4
+        ? state->current_note.gray4_image_ids[state->image_index]
+        : bw1_ids[state->image_index];
     state->image_expected_id = id;
     state->image_error = false;
     if (state->image_loaded_id == id && state->image_wqni != nullptr) {
@@ -454,6 +462,19 @@ void RequestCurrentNoteImage(wqn::NoteAppState* state)
     if (state->transfer_progress_bucket < 0) {
         state->transfer_progress_bucket = 0;
         state->transfer_progress_repaint_us = esp_timer_get_time();
+    }
+}
+
+void SetNoteImageRenderModeImpl(wqn::NoteAppState* state, wqn::ImageRenderMode mode)
+{
+    if (state == nullptr || state->image_render_mode == mode) return;
+    state->image_render_mode = mode;
+    state->image_in_flight = false;
+    state->image_dispatched_id.clear();
+    state->image_loaded_id.clear();
+    state->image_wqni.reset();
+    if (state->mode == wqn::NoteAppMode::kNoteImageView) {
+        RequestCurrentNoteImage(state);
     }
 }
 
@@ -623,6 +644,11 @@ void HandleNoteImageViewInput(wqn::NoteAppState* state, wqn::NoteInput input)
 }  // namespace
 
 namespace wqn {
+
+void SetNoteImageRenderMode(NoteAppState* state, ImageRenderMode mode)
+{
+    SetNoteImageRenderModeImpl(state, mode);
+}
 
 esp_err_t InitNoteApp(NoteAppState* state)
 {
@@ -998,10 +1024,11 @@ bool TakeNoteImageRequest(
     std::string* note_id,
     uint8_t* image_index,
     std::string* image_id,
+    bool* gray4,
     uint32_t* progress_generation)
 {
     if (state == nullptr || note_id == nullptr || image_index == nullptr ||
-        image_id == nullptr || progress_generation == nullptr) {
+        image_id == nullptr || gray4 == nullptr || progress_generation == nullptr) {
         return false;
     }
     // Heal a dropped/mismatched result before checking the flag, so the pump
@@ -1016,6 +1043,7 @@ bool TakeNoteImageRequest(
     *note_id = state->current_note.note_id;
     *image_index = state->image_index;
     *image_id = state->image_expected_id;
+    *gray4 = state->image_expected_gray4;
     state->image_request = false;
     state->image_in_flight = true;
     state->image_dispatch_us = esp_timer_get_time();
@@ -1272,6 +1300,20 @@ void ApplyNoteImageResult(
         image_id.empty() ? state->image_dispatched_id : image_id;
     if (state->mode == NoteAppMode::kNoteImageView && !state->image_request &&
         failed_id == state->image_expected_id) {
+        // Metadata may outlive a missing/corrupt derivative object. A real
+        // 404 means this image has no usable gray variant, so re-arm the same
+        // attachment against its pinned BW1 id instead of stranding the page.
+        if (result == ESP_ERR_NOT_FOUND && state->image_expected_gray4 &&
+            state->image_index < state->current_note.image_ids.size()) {
+            state->image_expected_gray4 = false;
+            state->image_expected_id =
+                state->current_note.image_ids[state->image_index];
+            state->image_dispatched_id.clear();
+            state->image_error = false;
+            state->image_request = true;
+            ESP_LOGW(kTag, "gray16 note derivative missing; falling back to BW1");
+            return;
+        }
         state->image_error = true;
         ESP_LOGW(kTag, "note image fetch failed: %s id=%.12s",
                  esp_err_to_name(result), failed_id.c_str());

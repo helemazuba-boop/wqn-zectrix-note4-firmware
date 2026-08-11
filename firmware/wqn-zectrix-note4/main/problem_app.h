@@ -9,6 +9,7 @@
 #include "esp_err.h"
 #include "problem_pack.h"
 #include "problem_store.h"
+#include "storage.h"
 
 namespace wqn {
 
@@ -98,6 +99,8 @@ struct ProblemAppState {
     bool image_request = false;
     bool image_in_flight = false;
     bool image_error = false;
+    ImageRenderMode image_render_mode = ImageRenderMode::kGray16;
+    bool image_expected_gray4 = false;
     // Which assets column and attachment the CURRENT image segment shows.
     bool image_is_solution = false;
     uint8_t image_index = 0;
@@ -177,9 +180,11 @@ bool TakeProblemImageRequest(
     std::string* problem_id,
     bool* is_solution,
     uint8_t* image_index,
-    std::string* image_id);
+    std::string* image_id,
+    bool* gray4);
 void RestoreProblemImageRequest(ProblemAppState* state);
 void ReleaseProblemImagePayload(ProblemAppState* state);
+void SetProblemImageRenderMode(ProblemAppState* state, ImageRenderMode mode);
 void ApplyProblemImageResult(
     ProblemAppState* state,
     esp_err_t result,
