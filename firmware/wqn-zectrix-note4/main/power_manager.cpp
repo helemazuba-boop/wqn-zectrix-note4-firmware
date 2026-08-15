@@ -1,6 +1,7 @@
 #include "power_manager.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <utility>
 
@@ -18,6 +19,7 @@
 #include "esp_sleep.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "services/sync_service.h"
 #include "pcf8563.h"
@@ -136,6 +138,8 @@ inline std::atomic_ref<uint32_t> ConsecutiveSleepCyclesRef()
 adc_oneshot_unit_handle_t g_adc_handle = nullptr;
 adc_cali_handle_t g_adc_cali_handle = nullptr;
 bool g_adc_initialized = false;
+StaticSemaphore_t g_adc_mutex_storage;
+SemaphoreHandle_t g_adc_mutex = nullptr;
 
 i2c_master_bus_handle_t g_i2c_bus = nullptr;
 
@@ -355,6 +359,9 @@ esp_err_t InitPowerHardware(i2c_port_t i2c_port, gpio_num_t i2c_sda, gpio_num_t 
         g_adc_cali_handle = nullptr;
     }
 
+    g_adc_mutex = xSemaphoreCreateMutexStatic(&g_adc_mutex_storage);
+    ESP_RETURN_ON_FALSE(g_adc_mutex != nullptr, ESP_ERR_NO_MEM, kTag,
+                        "create ADC mutex");
     g_adc_initialized = true;
     ESP_LOGI(kTag, "ADC initialized: channel=%d atten=%d bits=%d samples=%d",
              kBatAdcChannel, kBatAdcAtten, kBatAdcBitwidth, kBatAdcSamples);
@@ -404,7 +411,10 @@ bool ReadPowerStatus(PowerStatusSnapshot* snapshot)
     *snapshot = {};
     snapshot->charging = gpio_get_level(kChargeDetect) == 0;
     snapshot->fully_charged = gpio_get_level(kChargeFull) == 0;
-    if (!g_adc_initialized) {
+    if (!g_adc_initialized || g_adc_mutex == nullptr) {
+        return false;
+    }
+    if (xSemaphoreTake(g_adc_mutex, portMAX_DELAY) != pdTRUE) {
         return false;
     }
 
