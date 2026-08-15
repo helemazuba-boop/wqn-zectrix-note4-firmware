@@ -9,7 +9,6 @@
 #include "font_zectrix.h"
 #include "ui/assets/font_wqn_digits_16_1.h"
 #include "ui/assets/font_wqn_digits_48_1.h"
-#include "ui/assets/font_wqn_ui_16_1.h"
 
 namespace device_ui_internal {
 
@@ -56,14 +55,24 @@ void DrawBitmapDigitsCentered(
     DrawBitmapDigits(x + std::max(0, (width - text_width) / 2), y, text, lookup, black);
 }
 
-const WqnBitmapAsset& BatteryIconAsset(const wqn::HomeSummary& home)
+const char* BatteryIconGlyph(const wqn::HomeSummary& home)
 {
-    if (home.charging) return b05_battery_charging_16_asset;
-    if (home.full || home.battery_percent >= 95) return b04_battery_full_16_asset;
-    if (home.battery_percent >= 75) return b03_battery_75_16_asset;
-    if (home.battery_percent >= 50) return b02_battery_50_16_asset;
-    if (home.battery_percent >= 25) return b01_battery_25_16_asset;
-    return b00_battery_empty_16_asset;
+    if (home.charging) {
+        return FONT_ZECTRIX_BATTERY_CHARGING;
+    }
+    if (home.full || home.battery_percent >= 80) {
+        return FONT_ZECTRIX_BATTERY_FULL;
+    }
+    if (home.battery_percent >= 60) {
+        return FONT_ZECTRIX_BATTERY_75;
+    }
+    if (home.battery_percent >= 40) {
+        return FONT_ZECTRIX_BATTERY_50;
+    }
+    if (home.battery_percent >= 20) {
+        return FONT_ZECTRIX_BATTERY_25;
+    }
+    return FONT_ZECTRIX_BATTERY_EMPTY;
 }
 
 }  // namespace
@@ -102,12 +111,19 @@ int DrawWifiStatusIcon(int right_edge, int y, const wqn::HomeSummary& home)
     return x;
 }
 
+int DrawBatteryStatusIcon(int right_edge, int y, const wqn::HomeSummary& home)
+{
+    const char* battery = BatteryIconGlyph(home);
+    const int battery_w = wqn::MeasureTextWithFont(&font_zectrix_16_1, battery);
+    const int x = right_edge - battery_w;
+    wqn::DrawTextWithFont(x, y, &font_zectrix_16_1, battery, true);
+    return x;
+}
+
 int DrawStatusBarIcons(int right_edge, int y, const wqn::HomeSummary& home)
 {
     int x = right_edge;
-    const WqnBitmapAsset& battery = BatteryIconAsset(home);
-    x -= battery.width;
-    DrawWqnBitmapAsset(x, y, battery, true);
+    x = DrawBatteryStatusIcon(x, y, home);
     x -= 6;
     return DrawWifiStatusIcon(x, y, home);
 }

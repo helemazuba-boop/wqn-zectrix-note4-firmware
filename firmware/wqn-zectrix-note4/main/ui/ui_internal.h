@@ -595,6 +595,8 @@ void DrawConfigDigitsCentered(int x, int y, int width, const std::string& ascii,
 void DrawTimerDigitsArt(int y, const std::string& ascii_duration);
 // Draw the existing WiFi glyph only, right-aligned at right_edge.
 int DrawWifiStatusIcon(int right_edge, int y, const wqn::HomeSummary& home);
+// Draw the existing battery glyph only, right-aligned at right_edge.
+int DrawBatteryStatusIcon(int right_edge, int y, const wqn::HomeSummary& home);
 // Draw [wifi][battery] status icons right-aligned at right_edge.
 // Returns the x just left of the cluster (for drawing time/other text before it).
 int DrawStatusBarIcons(int right_edge, int y, const wqn::HomeSummary& home);
