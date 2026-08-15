@@ -2,6 +2,8 @@
 firmware/wqn-zectrix-note4/build/
 firmware/wqn-zectrix-note4/build-*/
 firmware/wqn-zectrix-note4/dist/
+firmware/wqn-zectrix-note4/backups/
+backups/
 firmware/wqn-zectrix-note4/tools/portable-flasher/.cache/
 firmware/wqn-zectrix-note4/tools/portable-flasher/.pyinstaller/
 firmware/wqn-zectrix-note4/sdkconfig
