@@ -14,16 +14,17 @@ set "BUILD_UNC=\\wsl.localhost\Ubuntu\home\unknow\projects\firmware\firmware\wqn
 set "BACKUP_DIR=\\wsl.localhost\Ubuntu\home\unknow\projects\firmware\firmware\wqn-zectrix-note4\backups"
 set "COM_PORT=COM5"
 set "BAUD=460800"
+set "BACKUP_BAUD=115200"
 set "FLASH_SIZE=0x1000000"
 set "RESET_BEFORE=default-reset"
 set "RESET_AFTER=hard-reset"
 
-echo.
+echo/
 echo ============================================================
 echo   WQN Note4 Flash Deploy (COM5 Dedicated) + Full Backup
 echo   Port: %COM_PORT%  ^|  Baud: %BAUD%  ^|  Flash: 16MB
 echo ============================================================
-echo.
+echo/
 
 :: Step 0: Stop existing serial monitor
 echo [Step 0] Stopping existing serial monitor...
@@ -32,7 +33,7 @@ powershell.exe -NoProfile -Command "Get-CimInstance Win32_Process | Where-Object
 echo   Done.
 
 :: Step 1: Build in WSL
-echo.
+echo/
 if "%SKIP_BUILD%"=="1" (
     if not exist "%BUILD_UNC%\flash_args" (
         echo [Step 1] ERROR: SKIP_BUILD=1 but flash_args does not exist.
@@ -69,7 +70,7 @@ echo   Done.
 :build_done
 
 :: Step 2: esptool preflight
-echo.
+echo/
 echo [Step 2] Checking esptool environment...
 where esptool >nul 2>nul
 if errorlevel 1 (
@@ -81,7 +82,7 @@ if errorlevel 1 (
 echo   Done.
 
 :: Step 2.5: Full Flash Backup before flashing
-echo.
+echo/
 if not exist "%BACKUP_DIR%" (
     mkdir "%BACKUP_DIR%" >nul 2>&1
 )
@@ -99,15 +100,24 @@ if "%SKIP_BACKUP%"=="1" (
 
     echo [Step 2.5] Performing full 16MB Flash backup for %COM_PORT%...
     echo            Target: !BACKUP_FILE!
-    echo            Reading 16MB flash at %BAUD% baud, please wait...
+    echo            Reading 16MB flash at %BACKUP_BAUD% baud (stable rate for USB-JTAG)...
 
     pushd "%BACKUP_DIR%" >nul 2>&1
-    esptool --chip esp32s3 --port %COM_PORT% --baud %BAUD% read_flash 0 %FLASH_SIZE% "!BACKUP_FILE!"
+    esptool --chip esp32s3 --port %COM_PORT% --baud %BACKUP_BAUD% read-flash 0 %FLASH_SIZE% "!BACKUP_FILE!"
     set "BACKUP_RC=!ERRORLEVEL!"
     popd >nul 2>&1
 
     if not "!BACKUP_RC!"=="0" (
-        echo.
+        echo/
+        echo [Step 2.5] Notice: Retrying with --no-stub for hardware compatibility...
+        pushd "%BACKUP_DIR%" >nul 2>&1
+        esptool --chip esp32s3 --port %COM_PORT% --no-stub read-flash 0 %FLASH_SIZE% "!BACKUP_FILE!"
+        set "BACKUP_RC=!ERRORLEVEL!"
+        popd >nul 2>&1
+    )
+
+    if not "!BACKUP_RC!"=="0" (
+        echo/
         echo ============================================================
         echo   [ERROR] Full Flash backup failed ^(exit code: !BACKUP_RC!^)^!
         echo   Flash deployment aborted to protect device data.
@@ -119,7 +129,7 @@ if "%SKIP_BACKUP%"=="1" (
 )
 
 :: Step 3: Flash all partitions
-echo.
+echo/
 echo [Step 3] Flashing all partitions via esptool to %COM_PORT%...
 pushd "%BUILD_UNC%"
 if errorlevel 1 (
@@ -127,7 +137,10 @@ if errorlevel 1 (
     pause
     exit /b 1
 )
-esptool --chip esp32s3 --port %COM_PORT% --baud %BAUD% --before %RESET_BEFORE% --after %RESET_AFTER% write_flash @flash_args
+esptool --chip esp32s3 --port %COM_PORT% --baud %BAUD% --before %RESET_BEFORE% --after %RESET_AFTER% write-flash @flash_args
+if not "%ERRORLEVEL%"=="0" (
+    esptool --chip esp32s3 --port %COM_PORT% --baud %BAUD% --before %RESET_BEFORE% --after %RESET_AFTER% write_flash @flash_args
+)
 set "FLASH_RC=%ERRORLEVEL%"
 popd
 if not "%FLASH_RC%"=="0" (
@@ -137,17 +150,17 @@ if not "%FLASH_RC%"=="0" (
 )
 echo   Done.
 
-echo.
+echo/
 echo ============================================================
 echo  Deploy and Flash complete^! (Port: %COM_PORT%)
 echo ============================================================
-echo.
+echo/
 
 :: Step 4: Open serial monitor
 echo [Step 4] Opening serial monitor on %COM_PORT%...
 start "monitor_serial" cmd /c ""%~dp0monitor_serial.bat" %COM_PORT%"
 echo   Monitor opened in new window.
-echo.
+echo/
 
 echo All steps complete. You can close this window.
 pause

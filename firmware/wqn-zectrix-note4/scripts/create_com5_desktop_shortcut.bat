@@ -2,10 +2,11 @@
 setlocal EnableExtensions
 chcp 65001 >nul
 
+echo/
 echo ============================================================
 echo  Creating Desktop Shortcut for WQN Note4 COM5 Deploy
 echo ============================================================
-echo.
+echo/
 
 powershell.exe -NoProfile -Command ^
     "$wsh = New-Object -ComObject WScript.Shell; " ^
@@ -19,6 +20,6 @@ powershell.exe -NoProfile -Command ^
     "$shortcut.Save(); " ^
     "Write-Host '[OK] Shortcut created successfully at:' $shortcutPath"
 
-echo.
+echo/
 pause
 endlocal
