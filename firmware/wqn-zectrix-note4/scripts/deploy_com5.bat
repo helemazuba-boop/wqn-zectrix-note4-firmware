@@ -1,9 +1,10 @@
 @echo off
 setlocal EnableExtensions EnableDelayedExpansion
+chcp 65001 >nul
 
 :: ============================================================
 ::  WQN Note4 Flash Deploy (COM5 Dedicated Script)
-::  Build: WSL  |  Flash+Monitor: Windows  |  Auto Full Backup
+::  Build: WSL  |  Flash+Monitor: Windows  |  Interactive Backup
 :: ============================================================
 
 set "WSL_DISTRO=Ubuntu"
@@ -14,14 +15,13 @@ set "BUILD_UNC=\\wsl.localhost\Ubuntu\home\unknow\projects\firmware\firmware\wqn
 set "BACKUP_DIR=\\wsl.localhost\Ubuntu\home\unknow\projects\firmware\firmware\wqn-zectrix-note4\backups"
 set "COM_PORT=COM5"
 set "BAUD=460800"
-set "BACKUP_BAUD=115200"
 set "FLASH_SIZE=0x1000000"
 set "RESET_BEFORE=default-reset"
 set "RESET_AFTER=hard-reset"
 
 echo/
 echo ============================================================
-echo   WQN Note4 Flash Deploy (COM5 Dedicated) + Full Backup
+echo   WQN Note4 Flash Deploy (COM5 Dedicated)
 echo   Port: %COM_PORT%  ^|  Baud: %BAUD%  ^|  Flash: 16MB
 echo ============================================================
 echo/
@@ -81,7 +81,7 @@ if errorlevel 1 (
 )
 echo   Done.
 
-:: Step 2.5: Full Flash Backup before flashing
+:: Step 2.5: Interactive Flash Backup
 echo/
 if not exist "%BACKUP_DIR%" (
     mkdir "%BACKUP_DIR%" >nul 2>&1
@@ -89,44 +89,57 @@ if not exist "%BACKUP_DIR%" (
 
 if "%SKIP_BACKUP%"=="1" (
     echo [Step 2.5] SKIP_BACKUP=1; skipping flash backup.
-) else (
-    for /f "usebackq tokens=*" %%i in (`powershell.exe -NoProfile -Command "Get-Date -Format 'yyyyMMdd_HHmmss'" 2^>nul`) do set "TIMESTAMP=%%i"
-    if "!TIMESTAMP!"=="" (
-        set "TIMESTAMP=%DATE:~0,4%%DATE:~5,2%%DATE:~8,2%_%TIME:~0,2%%TIME:~3,2%%TIME:~6,2%"
-        set "TIMESTAMP=!TIMESTAMP: =0!"
-        set "TIMESTAMP=!TIMESTAMP::=!"
-    )
-    set "BACKUP_FILE=%BACKUP_DIR%\backup_com5_full_!TIMESTAMP!.bin"
-
-    echo [Step 2.5] Performing full 16MB Flash backup for %COM_PORT%...
-    echo            Target: !BACKUP_FILE!
-    echo            Reading 16MB flash at %BACKUP_BAUD% baud (stable rate for USB-JTAG)...
-
-    pushd "%BACKUP_DIR%" >nul 2>&1
-    esptool --chip esp32s3 --port %COM_PORT% --baud %BACKUP_BAUD% read-flash 0 %FLASH_SIZE% "!BACKUP_FILE!"
-    set "BACKUP_RC=!ERRORLEVEL!"
-    popd >nul 2>&1
-
-    if not "!BACKUP_RC!"=="0" (
-        echo/
-        echo [Step 2.5] Notice: Retrying with --no-stub for hardware compatibility...
-        pushd "%BACKUP_DIR%" >nul 2>&1
-        esptool --chip esp32s3 --port %COM_PORT% --no-stub read-flash 0 %FLASH_SIZE% "!BACKUP_FILE!"
-        set "BACKUP_RC=!ERRORLEVEL!"
-        popd >nul 2>&1
-    )
-
-    if not "!BACKUP_RC!"=="0" (
-        echo/
-        echo ============================================================
-        echo   [ERROR] Full Flash backup failed ^(exit code: !BACKUP_RC!^)^!
-        echo   Flash deployment aborted to protect device data.
-        echo ============================================================
-        pause
-        exit /b 1
-    )
-    echo   [OK] Flash backup completed successfully: !BACKUP_FILE!
+    goto :skip_backup
 )
+
+set "DO_BACKUP="
+echo ============================================================
+echo   [备份询问] 是否需要对 %COM_PORT% 执行 16MB 全量 Flash 备份？
+echo   (首次刷写原厂设备建议备份，按 460800 波特率读取约需 4-6 分钟)
+echo ============================================================
+set /p DO_BACKUP="是否备份 %COM_PORT% 全量 Flash？[Y=备份 / N=跳过 / C=取消部署] (直接回车默认 Y): "
+
+if /I "%DO_BACKUP%"=="C" (
+    echo [Step 2.5] 用户取消部署。
+    pause
+    exit /b 0
+)
+if /I "%DO_BACKUP%"=="N" (
+    echo [Step 2.5] 用户选择跳过备份。
+    goto :skip_backup
+)
+
+:do_backup
+for /f "usebackq tokens=*" %%i in (`powershell.exe -NoProfile -Command "Get-Date -Format 'yyyyMMdd_HHmmss'" 2^>nul`) do set "TIMESTAMP=%%i"
+if "%TIMESTAMP%"=="" (
+    set "TIMESTAMP=%DATE:~0,4%%DATE:~5,2%%DATE:~8,2%_%TIME:~0,2%%TIME:~3,2%%TIME:~6,2%"
+    set "TIMESTAMP=%TIMESTAMP: =0%"
+    set "TIMESTAMP=%TIMESTAMP::=%"
+)
+set "BACKUP_FILE=%BACKUP_DIR%\backup_com5_full_%TIMESTAMP%.bin"
+
+echo/
+echo [Step 2.5] Performing full 16MB Flash backup for %COM_PORT%...
+echo            Target: %BACKUP_FILE%
+echo            Reading 16MB flash at %BAUD% baud, please wait...
+
+pushd "%BACKUP_DIR%" >nul 2>&1
+esptool --chip esp32s3 --port %COM_PORT% --baud %BAUD% read-flash 0 %FLASH_SIZE% "%BACKUP_FILE%"
+set "ESPRC=%ERRORLEVEL%"
+popd >nul 2>&1
+
+if not "%ESPRC%"=="0" (
+    echo/
+    echo ============================================================
+    echo   [ERROR] Full Flash backup failed ^(exit code: %ESPRC%^)^!
+    echo   Flash deployment aborted to protect device data.
+    echo ============================================================
+    pause
+    exit /b 1
+)
+
+echo   [OK] Flash backup completed successfully: %BACKUP_FILE%
+:skip_backup
 
 :: Step 3: Flash all partitions
 echo/
