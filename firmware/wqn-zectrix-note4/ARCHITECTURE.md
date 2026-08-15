@@ -102,8 +102,9 @@ Every accepted revision produces exactly one terminal result:
 At most one refresh and one merged pending intent exist. Dirty regions are
 unioned, the earliest deadline wins, reason masks are ORed, and waveform
 requirements only strengthen. A BUSY timeout permits one reset/reinitialize/
-forced-full retry. Cold or untrusted wake context forces a full refresh. Twenty
-consecutive partial refreshes also promote to full.
+forced-full retry. Cold or untrusted wake context forces a full refresh. Tiny
+clock-region partials may accumulate to 240; ten heavy partials still promote
+to full, and idle maintenance cleans heavy history before cutting the rail.
 
 ## Enforced boundaries
 

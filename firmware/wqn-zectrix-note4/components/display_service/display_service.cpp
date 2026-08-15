@@ -65,14 +65,14 @@ constexpr int kLocalPartialMaxHeight = 170;
 // and the only recovery is a full refresh (~2-3s), which the user feels as
 // a hard freeze. Forcing a full refresh every N partials is far less
 // disruptive than letting the panel stall in the middle of a UI flow.
-// [epd-tune] Bumped from 6 to 20 after observing SSD1683 stayed clean
-// through 10+ consecutive partial refreshes (UI smoke tests with a 10s
-// countdown). The timer-page once-per-second tick used to hit the old 6
-// threshold every 7s, producing a visible flash in the middle of a running
-// timer. 20 covers a 21-second timer run window without forcing a full
-// refresh, and a 6-min countdown still gets an interleaved full refresh
-// every 21 partials.
-constexpr uint32_t kMaxPartialRefreshesBeforeFull = 20;
+// [epd-tune] Tiny diffs such as the clock/timer alter well below 1% of the
+// framebuffer. Counting them exactly like a large list-row update forced a
+// 1.2 s full refresh after 20 minute ticks even when the final diff was only
+// ~0.36%. Keep a high absolute backstop for tiny updates; the independent
+// heavy-partial counter below still forces cleanup before measured drift.
+// At this cap a one-second timer gets a safety full roughly every four
+// minutes, while a once-per-minute clock does not flash for routine cleanup.
+constexpr uint32_t kMaxPartialRefreshesBeforeFull = 240;
 // Heavy partials (large diffs: list-row highlight flips ~17%, body scrolls
 // ~5-6%) stress the panel far more than a timer's once-per-second tick
 // (~0.02%). Field logs show the panel drifting from the framebuffer (stale
