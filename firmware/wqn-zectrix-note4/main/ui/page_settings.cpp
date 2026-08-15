@@ -59,25 +59,27 @@ esp_err_t DrawSettingsRow(size_t row_index, int y, const std::string& title, con
     }
     const char* tag = "菜单";
     if (row_index == 0) {
-        tag = "执行";
+        tag = "设置";  // WiFi manage
     } else if (row_index == 1) {
-        tag = "设置";
-    } else if (row_index == 4) {
-        tag = "设置";  // image rendering
+        tag = "执行";  // sync now
+    } else if (row_index == 2) {
+        tag = "设置";  // auto sync interval
     } else if (row_index == 5) {
-        tag = "设置";  // volume
+        tag = "设置";  // image rendering
     } else if (row_index == 6) {
-        tag = "设置";  // default word deck
+        tag = "设置";  // volume
     } else if (row_index == 7) {
-        tag = "系统";  // firmware version
+        tag = "设置";  // default word deck
     } else if (row_index == 8) {
+        tag = "系统";  // firmware version
+    } else if (row_index == 9) {
         tag = "重置";  // factory reset
     }
     DrawChip(kContentX + kContentWidth - 6 - 54, y + 8, 54, 20, tag);
     return ESP_OK;
 }
 
-esp_err_t DrawSettingsDialogBox(const std::string& title)
+esp_err_t DrawSettingsDialogBox(const std::string& title, const char* footer)
 {
     FillRect(68, 48, 264, 206, false);
     // [v2] Dialog container: single rounded outline. The double-outline was the
@@ -87,7 +89,7 @@ esp_err_t DrawSettingsDialogBox(const std::string& title)
     DrawHorizontalLine(86, 80, 228);
     DrawHorizontalLine(86, 220, 228);
     ESP_RETURN_ON_ERROR(DrawCenteredText(86, 60, 228, title), kTag, "draw settings dialog title");
-    return DrawCenteredText(86, 230, 228, "确认关闭");
+    return DrawCenteredText(86, 230, 228, footer);
 }
 
 esp_err_t DrawSettingsOptionCard(int x, int y, int width, const std::string& label, bool selected)
@@ -109,6 +111,33 @@ esp_err_t RenderSettingsDialog(const wqn::SettingsAppState& settings)
 {
     const wqn::SettingsDiagnosticsSnapshot& diag = settings.diagnostics;
     switch (settings.dialog) {
+        case wqn::SettingsDialog::kWifiManage: {
+            ESP_RETURN_ON_ERROR(DrawSettingsDialogBox("WiFi 管理", "确认进入配网"), kTag, "draw wifi dialog");
+            const bool has_primary = settings.wifi_primary_ssid[0] != '\0';
+            const bool has_backup = settings.wifi_backup_ssid[0] != '\0';
+            ESP_RETURN_ON_ERROR(
+                DrawClippedText(
+                    88, 94, 224,
+                    std::string("主网络: ") + (has_primary ? settings.wifi_primary_ssid : "未配置")),
+                kTag,
+                "draw wifi primary");
+            if (has_backup) {
+                ESP_RETURN_ON_ERROR(
+                    DrawClippedText(88, 116, 224, std::string("备用:   ") + settings.wifi_backup_ssid),
+                    kTag,
+                    "draw wifi backup");
+            }
+            // Single focused action: start the SoftAP provisioning portal.
+            ESP_RETURN_ON_ERROR(
+                DrawSettingsOptionCard(88, 150, 224, "重新配网", true),
+                kTag,
+                "draw wifi provision action");
+            ESP_RETURN_ON_ERROR(
+                DrawCenteredText(86, 196, 228, "确认启动配网  上下关闭"),
+                kTag,
+                "draw wifi help");
+            break;
+        }
         case wqn::SettingsDialog::kAutoSync: {
             ESP_RETURN_ON_ERROR(DrawSettingsDialogBox("自动同步间隔"), kTag, "draw auto sync dialog");
             for (size_t i = 0; i < kAutoSyncOptionsCount; ++i) {
@@ -286,6 +315,7 @@ esp_err_t RenderSettingsToEpd(const wqn::UiFrame& frame, RefreshSchedule schedul
     const std::string version_value = diag.firmware_version.empty() ? WQN_FIRMWARE_VERSION : diag.firmware_version;
 
     const std::string titles[kSettingsItemCount] = {
+        "WiFi 管理",
         "立即同步",
         "自动同步间隔",
         "电量",
@@ -297,6 +327,7 @@ esp_err_t RenderSettingsToEpd(const wqn::UiFrame& frame, RefreshSchedule schedul
         "恢复出厂",
     };
     const std::string values[kSettingsItemCount] = {
+        settings.wifi_primary_ssid[0] != '\0' ? settings.wifi_primary_ssid : "未配置",
         settings.sync_status.empty() ? "空闲" : settings.sync_status,
         auto_sync_label,
         battery_value,

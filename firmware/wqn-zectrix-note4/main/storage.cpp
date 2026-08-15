@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <unistd.h>
 #include <vector>
 
@@ -38,12 +39,17 @@ constexpr char kImageRenderModeKey[] = "img_render";
 constexpr char kDefaultWordDeckKey[] = "word_deck";
 constexpr char kWifiSsidKey[] = "wifi_ssid";
 constexpr char kWifiPasswordKey[] = "wifi_pass";
+// [wifi-redundancy] Versioned dual-slot credential blob (replaces the per-key
+// wifi_ssid/wifi_pass pair with a single atomic commit).
+constexpr char kWifiCredsBlobKey[] = "wifi_creds";
+constexpr uint8_t kWifiCredentialStoreVersion = 1;
 constexpr char kControlConfigRevisionKey[] = "v3_cfg_rev";
 constexpr char kControlSyncCursorKey[] = "v3_cursor";
 static_assert(sizeof(kAutoSyncIntervalMinKey) <= 16, "NVS key must fit ESP-IDF's 15-character limit");
 static_assert(sizeof(kImageRenderModeKey) <= 16, "NVS key must fit ESP-IDF's 15-character limit");
 static_assert(sizeof(kWifiSsidKey) <= 16, "NVS key must fit ESP-IDF's 15-character limit");
 static_assert(sizeof(kWifiPasswordKey) <= 16, "NVS key must fit ESP-IDF's 15-character limit");
+static_assert(sizeof(kWifiCredsBlobKey) <= 16, "NVS key must fit ESP-IDF's 15-character limit");
 static_assert(sizeof(kControlConfigRevisionKey) <= 16, "NVS key must fit ESP-IDF's 15-character limit");
 static_assert(sizeof(kControlSyncCursorKey) <= 16, "NVS key must fit ESP-IDF's 15-character limit");
 constexpr char kStoragePartitionLabel[] = "storage";
@@ -758,11 +764,10 @@ esp_err_t SaveAccessToken(const std::string& token)
         return result;
     }
 
-    // [power-fix] The online sync task is parked on portMAX_DELAY while
-    // the device is unpaired. Waking it here lets it run the first real
-    // sync round immediately after pairing instead of waiting for the
-    // next user action or scheduled interval.
-    services::RequestSyncNow();
+    // Credentials are an explicit full-sync reason. Publishing it here lets
+    // the scheduler run the first authenticated round immediately after
+    // pairing instead of waiting for the next periodic deadline.
+    services::NotifySyncCredentialsChanged();
     return result;
 }
 
@@ -772,12 +777,10 @@ esp_err_t ClearAccessToken()
     if (!write) {
         return ESP_ERR_INVALID_STATE;
     }
-    // [power-fix] If clearing the token was triggered by some external
-    // event (e.g. the server returning 401 during sync), we want the
-    // SyncService to re-evaluate its delay immediately rather than stay
-    // parked on whatever value it was using.
+    // If clearing the token was triggered by 401, make the scheduler enter
+    // the claim path immediately rather than wait on its prior deadline.
     const esp_err_t result = ClearAccessTokenKeys();
-    wqn::services::RequestSyncNow();
+    wqn::services::NotifySyncCredentialsChanged();
     return result;
 }
 
@@ -1405,23 +1408,227 @@ esp_err_t FactoryResetNvsAndRestart()
     return services::ExecuteStorageTransaction(FactoryResetTransaction, nullptr);
 }
 
+namespace {
+
+constexpr size_t kWifiSsidMaxLen = 32;
+constexpr size_t kWifiPasswordMaxLen = 64;
+
+// [wifi-redundancy] The blob is a raw memcpy of WifiCredentialStore; lock the
+// layout so an accidental field change is a build error, not silent corruption.
+static_assert(sizeof(wqn::WifiCredentialSlot) == 33 + 65,
+              "WifiCredentialSlot layout changed; bump kWifiCredentialStoreVersion");
+static_assert(sizeof(wqn::WifiCredentialStore) == 3 + 2 * (33 + 65),
+              "WifiCredentialStore layout changed; bump kWifiCredentialStoreVersion");
+
+void CopyWifiCredentialField(char* destination, size_t destination_size, const char* value)
+{
+    if (destination == nullptr || destination_size == 0) {
+        return;
+    }
+    std::snprintf(destination, destination_size, "%s", value == nullptr ? "" : value);
+}
+
+// [wifi-redundancy] Validates a store deserialized from the NVS blob. Returns
+// false when the blob is unusable (bad version / impossible count/preferred) so
+// the caller falls back to legacy migration. Otherwise normalizes in place:
+// forces NUL termination, drops empty-SSID slots, and merges duplicate SSIDs
+// keeping the preferred slot's password.
+bool ValidateWifiCredentialStore(wqn::WifiCredentialStore* store)
+{
+    if (store == nullptr || store->version != kWifiCredentialStoreVersion) {
+        return false;
+    }
+    if (store->count > 2 || store->preferred >= 2) {
+        return false;
+    }
+    for (auto& slot : store->slots) {
+        slot.ssid[sizeof(slot.ssid) - 1] = '\0';
+        slot.password[sizeof(slot.password) - 1] = '\0';
+    }
+
+    // Compact to occupied (non-empty-SSID) slots, tracking where the preferred
+    // entry lands. Identical SSIDs collapse to one slot; the preferred copy's
+    // password wins.
+    wqn::WifiCredentialStore compacted{};
+    compacted.version = kWifiCredentialStoreVersion;
+    const bool preferred_valid =
+        store->preferred < store->count && store->slots[store->preferred].ssid[0] != '\0';
+    for (uint8_t i = 0; i < store->count; ++i) {
+        const auto& slot = store->slots[i];
+        if (slot.ssid[0] == '\0') {
+            continue;
+        }
+        bool duplicate = false;
+        for (uint8_t j = 0; j < compacted.count; ++j) {
+            if (std::strcmp(compacted.slots[j].ssid, slot.ssid) == 0) {
+                duplicate = true;
+                if (preferred_valid && i == store->preferred) {
+                    CopyWifiCredentialField(
+                        compacted.slots[j].password, sizeof(compacted.slots[j].password), slot.password);
+                    compacted.preferred = j;
+                }
+                break;
+            }
+        }
+        if (duplicate) {
+            continue;
+        }
+        const uint8_t destination = compacted.count;
+        compacted.slots[destination] = slot;
+        if (preferred_valid && i == store->preferred) {
+            compacted.preferred = destination;
+        }
+        ++compacted.count;
+    }
+    if (!preferred_valid) {
+        compacted.preferred = 0;
+    }
+    *store = compacted;
+    return true;
+}
+
+}  // namespace
+
+esp_err_t LoadWifiCredentialStore(WifiCredentialStore* store)
+{
+    if (store == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *store = WifiCredentialStore{};
+
+    std::string blob;
+    ESP_RETURN_ON_ERROR(LoadBlobFromNvs(kWifiCredsBlobKey, &blob), kTag, "load wifi credential blob");
+    if (!blob.empty()) {
+        if (blob.size() != sizeof(WifiCredentialStore)) {
+            ESP_LOGW(
+                kTag,
+                "wifi credential blob size mismatch: %u != %u; ignoring",
+                static_cast<unsigned>(blob.size()),
+                static_cast<unsigned>(sizeof(WifiCredentialStore)));
+        } else {
+            WifiCredentialStore candidate;
+            std::memcpy(&candidate, blob.data(), sizeof(candidate));
+            if (ValidateWifiCredentialStore(&candidate)) {
+                *store = candidate;
+                return ESP_OK;
+            }
+            ESP_LOGW(kTag, "wifi credential blob failed validation; trying legacy migration");
+        }
+    }
+
+    // Legacy migration: synthesize slot 0 from the per-key wifi_ssid/wifi_pass,
+    // then persist as a blob and clear the legacy keys so the blob becomes the
+    // single source of truth.
+    std::string ssid;
+    std::string password;
+    ESP_RETURN_ON_ERROR(LoadStringFromNvs(kWifiSsidKey, &ssid), kTag, "load legacy wifi ssid");
+    if (ssid.empty()) {
+        return ESP_OK;
+    }
+    ESP_RETURN_ON_ERROR(LoadStringFromNvs(kWifiPasswordKey, &password), kTag, "load legacy wifi password");
+    store->version = kWifiCredentialStoreVersion;
+    store->preferred = 0;
+    store->count = 1;
+    CopyWifiCredentialField(store->slots[0].ssid, sizeof(store->slots[0].ssid), ssid.c_str());
+    CopyWifiCredentialField(store->slots[0].password, sizeof(store->slots[0].password), password.c_str());
+    ESP_LOGI(kTag, "migrated legacy wifi credentials into slot 0 (SSID=%s)", ssid.c_str());
+    if (SaveWifiCredentialStore(*store) == ESP_OK) {
+        ClearNvsKey(kWifiSsidKey);
+        ClearNvsKey(kWifiPasswordKey);
+    }
+    return ESP_OK;
+}
+
+esp_err_t SaveWifiCredentialStore(const WifiCredentialStore& store)
+{
+    if (store.count > 2) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    StorageWriteGuard write("save-wifi-credential-store", __FILE__, __LINE__);
+    if (!write) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    const std::string blob(reinterpret_cast<const char*>(&store), sizeof(store));
+    return SaveBlobToNvs(kWifiCredsBlobKey, blob);
+}
+
+esp_err_t UpsertWifiCredential(const std::string& ssid, const std::string& password)
+{
+    if (ssid.empty() || ssid.size() > kWifiSsidMaxLen || password.size() > kWifiPasswordMaxLen) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    WifiCredentialStore store;
+    ESP_RETURN_ON_ERROR(LoadWifiCredentialStore(&store), kTag, "load store for upsert");
+
+    bool hit = false;
+    bool changed = false;
+    for (uint8_t i = 0; i < store.count; ++i) {
+        if (std::strcmp(store.slots[i].ssid, ssid.c_str()) != 0) {
+            continue;
+        }
+        // Refresh every slot carrying this SSID so a stale password cannot
+        // survive on the other slot.
+        hit = true;
+        if (std::strcmp(store.slots[i].password, password.c_str()) != 0) {
+            CopyWifiCredentialField(store.slots[i].password, sizeof(store.slots[i].password), password.c_str());
+            changed = true;
+        }
+        if (store.preferred != i) {
+            store.preferred = i;
+            changed = true;
+        }
+    }
+    if (!hit) {
+        const uint8_t target = (store.count < 2) ? store.count++ : (store.preferred == 0 ? 1 : 0);
+        store.slots[target] = WifiCredentialSlot{};
+        CopyWifiCredentialField(store.slots[target].ssid, sizeof(store.slots[target].ssid), ssid.c_str());
+        CopyWifiCredentialField(store.slots[target].password, sizeof(store.slots[target].password), password.c_str());
+        store.preferred = target;
+        changed = true;
+    }
+    if (!changed) {
+        return ESP_OK;  // identical credential already preferred; skip the NVS commit
+    }
+    return SaveWifiCredentialStore(store);
+}
+
+esp_err_t MarkWifiSlotPreferred(uint8_t index)
+{
+    WifiCredentialStore store;
+    ESP_RETURN_ON_ERROR(LoadWifiCredentialStore(&store), kTag, "load store for mark preferred");
+    if (index >= store.count) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (store.preferred == index) {
+        return ESP_OK;  // unchanged; skip the NVS commit
+    }
+    store.preferred = index;
+    return SaveWifiCredentialStore(store);
+}
+
 esp_err_t LoadWifiCredentials(std::string* ssid, std::string* password)
 {
     if (ssid == nullptr || password == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
-    ESP_RETURN_ON_ERROR(LoadStringFromNvs(kWifiSsidKey, ssid), kTag, "load WiFi SSID");
-    return LoadStringFromNvs(kWifiPasswordKey, password);
+    // Back-compat shim over the slot store: returns the preferred slot. Empty
+    // store yields empty strings (matches the legacy LoadStringFromNvs contract
+    // callers already handle).
+    WifiCredentialStore store;
+    ESP_RETURN_ON_ERROR(LoadWifiCredentialStore(&store), kTag, "load wifi credential store");
+    if (store.count == 0) {
+        ssid->clear();
+        password->clear();
+        return ESP_OK;
+    }
+    *ssid = store.slots[store.preferred].ssid;
+    *password = store.slots[store.preferred].password;
+    return ESP_OK;
 }
 
 esp_err_t SaveWifiCredentials(const std::string& ssid, const std::string& password)
 {
-    StorageWriteGuard write("save-wifi-credentials", __FILE__, __LINE__);
-    if (!write) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    ESP_RETURN_ON_ERROR(SaveStringToNvs(kWifiSsidKey, ssid), kTag, "save WiFi SSID");
-    return SaveStringToNvs(kWifiPasswordKey, password);
+    return UpsertWifiCredential(ssid, password);
 }
 
 esp_err_t ClearWifiCredentials()
@@ -1430,18 +1637,22 @@ esp_err_t ClearWifiCredentials()
     if (!write) {
         return ESP_ERR_INVALID_STATE;
     }
-    esp_err_t result = ClearNvsKey(kWifiSsidKey);
-    const esp_err_t clear_pass = ClearNvsKey(kWifiPasswordKey);
+    esp_err_t result = ClearNvsKey(kWifiCredsBlobKey);
+    const esp_err_t legacy_ssid = ClearNvsKey(kWifiSsidKey);
+    const esp_err_t legacy_pass = ClearNvsKey(kWifiPasswordKey);
     if (result == ESP_OK) {
-        result = clear_pass;
+        result = legacy_ssid;
+    }
+    if (result == ESP_OK) {
+        result = legacy_pass;
     }
     return result;
 }
 
 bool HasWifiCredentials()
 {
-    std::string ssid;
-    return LoadStringFromNvs(kWifiSsidKey, &ssid) == ESP_OK && !ssid.empty();
+    WifiCredentialStore store;
+    return LoadWifiCredentialStore(&store) == ESP_OK && store.count > 0;
 }
 
 esp_err_t PrepareStorageForSleep(int64_t deadline_us)

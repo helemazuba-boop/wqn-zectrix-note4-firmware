@@ -135,6 +135,39 @@ esp_err_t SaveWifiCredentials(const std::string& ssid, const std::string& passwo
 esp_err_t ClearWifiCredentials();
 bool HasWifiCredentials();
 
+// [wifi-redundancy] Dual-slot WiFi credential store. The store is a versioned
+// NVS blob holding up to two (ssid, password) slots plus a `preferred` index
+// pointing at the last slot that connected successfully. Persistence is a
+// single atomic blob commit (the legacy per-key wifi_ssid/wifi_pass pair could
+// tear across power loss). Load migrates legacy keys on first read.
+struct WifiCredentialSlot {
+    char ssid[33];       // 32 + NUL
+    char password[65];   // 64 + NUL
+};
+struct WifiCredentialStore {
+    uint8_t version = 0;    // kWifiCredentialStoreVersion when valid
+    uint8_t preferred = 0;  // index of last successfully-connected slot
+    uint8_t count = 0;      // 0..2 occupied slots
+    WifiCredentialSlot slots[2] = {};
+};
+
+// Loads the store, validating the blob and migrating legacy wifi_ssid/wifi_pass
+// keys when the blob is absent. On success `store` always holds a coherent
+// (possibly empty) store with version == 1. Returns ESP_OK when a valid store
+// (blob or migrated) was loaded; legacy migration with no keys yields an empty
+// store and ESP_OK.
+esp_err_t LoadWifiCredentialStore(WifiCredentialStore* store);
+// Persists the whole store as one atomic NVS blob commit.
+esp_err_t SaveWifiCredentialStore(const WifiCredentialStore& store);
+// Insert or update a credential: same-SSID slots get their password refreshed,
+// a free slot is appended when available, otherwise the non-preferred slot is
+// replaced. The touched slot becomes preferred. No-op writes (identical
+// ssid+password already preferred) skip the NVS commit.
+esp_err_t UpsertWifiCredential(const std::string& ssid, const std::string& password);
+// Marks `index` as the preferred (last-good) slot. Writes only when the value
+// actually changes, to bound NVS wear.
+esp_err_t MarkWifiSlotPreferred(uint8_t index);
+
 // PowerCoordinator boundary. Writes are serialized by StorageService and each
 // accepted transaction holds kStorage, so Ready means every commit is durable.
 esp_err_t PrepareStorageForSleep(int64_t deadline_us);

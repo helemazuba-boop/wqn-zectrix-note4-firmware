@@ -104,6 +104,33 @@ void UpdateSettingsDiagnostics(wqn::UiState* state)
     state->settings.image_render_selected =
         image_mode == wqn::ImageRenderMode::kBlackWhite ? 0 : 1;
 
+    // [wifi-redundancy] Stored WiFi identity for the WiFi-manage row/dialog:
+    // the configured networks (preferred + backup), independent of the
+    // transient connection state.
+    {
+        wqn::WifiCredentialStore wifi_store;
+        if (wqn::LoadWifiCredentialStore(&wifi_store) == ESP_OK && wifi_store.count > 0) {
+            std::snprintf(
+                state->settings.wifi_primary_ssid,
+                sizeof(state->settings.wifi_primary_ssid),
+                "%s",
+                wifi_store.slots[wifi_store.preferred].ssid);
+            if (wifi_store.count >= 2) {
+                const uint8_t backup = 1 - wifi_store.preferred;
+                std::snprintf(
+                    state->settings.wifi_backup_ssid,
+                    sizeof(state->settings.wifi_backup_ssid),
+                    "%s",
+                    wifi_store.slots[backup].ssid);
+            } else {
+                state->settings.wifi_backup_ssid[0] = '\0';
+            }
+        } else {
+            state->settings.wifi_primary_ssid[0] = '\0';
+            state->settings.wifi_backup_ssid[0] = '\0';
+        }
+    }
+
     wqn::SettingsDiagnosticsSnapshot& snapshot = state->settings.diagnostics;
     BatteryReading battery = {};
     if (ReadBatteryStatus(&battery)) {

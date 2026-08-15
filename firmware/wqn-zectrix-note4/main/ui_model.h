@@ -187,6 +187,7 @@ struct HomeSummary {
 
 enum class SettingsDialog {
     kNone,
+    kWifiManage,
     kAutoSync,
     kBattery,
     kStorage,
@@ -237,7 +238,7 @@ struct SettingsAppState {
     // [persist-worker] In-flight/failed async settings saves (c4). Confirm arms
     // the chosen value here (pending_* + *_pending_valid) and, on a successful
     // submit, its dispatch operation id. The UI shows "正在保存" and only installs
-    // the value ("已保存", auto-sync also kicks RequestSyncNow) when the durable
+    // the value ("已保存" and re-arms auto-sync) when the durable
     // result comes back with a matching id. A submit reject or a write failure
     // KEEPS the armed value (*_pending_valid stays true, op id back to 0) so a
     // re-open preselects it and the user re-Confirms; only success/cancel
@@ -261,6 +262,10 @@ struct SettingsAppState {
     std::string pending_word_deck_title;
     bool word_deck_pending_valid = false;
     uint32_t word_deck_save_op_id = 0;
+    // [wifi-redundancy] Render-side cache of the stored WiFi identity, filled by
+    // UpdateSettingsDiagnostics for the WiFi-manage row/dialog. Empty = not set.
+    char wifi_primary_ssid[33] = {};
+    char wifi_backup_ssid[33] = {};
     SettingsDiagnosticsSnapshot diagnostics;
 };
 

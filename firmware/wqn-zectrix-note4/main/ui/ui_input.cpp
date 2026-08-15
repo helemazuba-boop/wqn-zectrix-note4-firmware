@@ -10,6 +10,7 @@
 #include "ai_session.h"
 #include "esp_log.h"
 #include "flash_session.h"
+#include "services/connectivity_service.h"
 #include "services/sync_service.h"
 
 namespace device_ui_internal {
@@ -57,7 +58,7 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
             // synchronously here and could stall the UI behind a background
             // write storm. Arm the value first so a rejected submit or a write
             // failure keeps it for a re-Confirm; the displayed value and
-            // RequestSyncNow() wait for the durable ACK. The per-kind busy
+            // schedule re-arm waits for the durable ACK. The per-kind busy
             // rejects a duplicate Confirm while one save is in flight.
             state->settings.pending_auto_sync_minutes = minutes;
             state->settings.auto_sync_pending_valid = true;
@@ -209,6 +210,24 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
         return RefreshSchedule::kNone;
     }
 
+    if (state->settings.dialog == wqn::SettingsDialog::kWifiManage) {
+        if (event.button == wqn::ButtonId::kConfirm && short_press) {
+            // [wifi-redundancy] Route through the connectivity service rather
+            // than the provisioning component directly, keeping the
+            // UI -> services dependency direction.
+            state->settings.dialog = wqn::SettingsDialog::kNone;
+            state->settings.notice = "正在启动配网…";
+            wqn::services::SetConnectivityProvisioning();
+            return RefreshSchedule::kConfig;
+        }
+        if ((event.button == wqn::ButtonId::kUp || event.button == wqn::ButtonId::kDownPower) &&
+            short_press) {
+            state->settings.dialog = wqn::SettingsDialog::kNone;
+            return RefreshSchedule::kConfig;
+        }
+        return RefreshSchedule::kNone;
+    }
+
     if (state->settings.dialog == wqn::SettingsDialog::kBattery ||
         state->settings.dialog == wqn::SettingsDialog::kStorage) {
         if (event.button == wqn::ButtonId::kConfirm && (short_press || long_press)) {
@@ -305,33 +324,36 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
 
     switch (state->settings.selected) {
         case 0:
+            OpenSettingsDialog(state, wqn::SettingsDialog::kWifiManage);
+            return RefreshSchedule::kConfig;
+        case 1:
             wqn::services::RequestSyncNow();
             state->settings.sync_status = "已请求同步";
             state->settings.notice = "已请求同步";
             return RefreshSchedule::kConfig;
-        case 1:
+        case 2:
             OpenSettingsDialog(state, wqn::SettingsDialog::kAutoSync);
             return RefreshSchedule::kConfig;
-        case 2:
+        case 3:
             OpenSettingsDialog(state, wqn::SettingsDialog::kBattery);
             return RefreshSchedule::kConfig;
-        case 3:
+        case 4:
             OpenSettingsDialog(state, wqn::SettingsDialog::kStorage);
             return RefreshSchedule::kConfig;
-        case 4:
+        case 5:
             OpenSettingsDialog(state, wqn::SettingsDialog::kImageRendering);
             return RefreshSchedule::kConfig;
-        case 5:
+        case 6:
             OpenSettingsDialog(state, wqn::SettingsDialog::kVolume);
             return RefreshSchedule::kConfig;
-        case 6:
+        case 7:
             OpenSettingsDialog(state, wqn::SettingsDialog::kDefaultWordDeck);
             return RefreshSchedule::kConfig;
-        case 7:
+        case 8:
             UpdateSettingsDiagnostics(state);
             state->settings.notice = "固件 " + state->settings.diagnostics.firmware_version;
             return RefreshSchedule::kConfig;
-        case 8:
+        case 9:
             OpenSettingsDialog(state, wqn::SettingsDialog::kFactoryReset);
             return RefreshSchedule::kConfig;
         default:

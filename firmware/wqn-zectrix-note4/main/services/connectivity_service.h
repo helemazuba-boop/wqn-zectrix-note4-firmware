@@ -21,6 +21,13 @@ struct ConnectivitySnapshot {
     ConnectivityState state = ConnectivityState::kOff;
     bool online = false;
     int rssi = 0;
+    // SSID of the slot currently connected or being attempted ("" when unknown,
+    // e.g. compile-time developer credentials).
+    char active_ssid[33] = {};
+    // SSID of the other stored credential ("" when there is no second slot).
+    char backup_ssid[33] = {};
+    // True when a second stored credential is available for failover.
+    bool has_backup = false;
 };
 
 esp_err_t StartConnectivity();

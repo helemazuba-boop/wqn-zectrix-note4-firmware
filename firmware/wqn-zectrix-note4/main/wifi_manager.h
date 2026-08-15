@@ -26,6 +26,12 @@ bool IsWifiStationConnected();
 bool IsWifiStationInitialized();
 void SetWifiStationEventSink(WifiStationEventSink sink);
 
+// True for disconnect reasons that mean the credential/AP itself is unusable
+// (auth failure, AP not found) rather than transient signal loss. The
+// connectivity service uses this to pivot to a backup credential immediately
+// instead of burning fast retries on a dead slot.
+bool IsWifiCredentialFailureReason(int reason);
+
 // Returns the connected AP's RSSI (dBm, e.g. -65), or 0 if not connected/WiFi disabled.
 int GetWifiRssi();
 

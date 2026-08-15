@@ -16,6 +16,7 @@
 #include "services/sync_service.h"
 #include "provision_manager.h"
 #include "runtime/sleep_coordinator.h"
+#include "storage.h"
 #include "wifi_manager.h"
 
 namespace {
@@ -25,9 +26,11 @@ constexpr UBaseType_t kCommandQueueDepth = 12;
 constexpr UBaseType_t kReplyQueueDepth = 8;
 constexpr uint32_t kTaskStackBytes = 8192;
 constexpr UBaseType_t kTaskPriority = 5;
-constexpr int kFastRetryLimit = 5;
 constexpr int64_t kFastRetryDelayUs = 5LL * 1000 * 1000;
 constexpr int64_t kBackoffDelayUs = 60LL * 1000 * 1000;
+// [wifi-redundancy] Per-slot fast-retry budget before pivoting to the backup
+// credential; when every stored slot is exhausted the radio goes to backoff.
+constexpr uint8_t kPerSlotFastRetryLimit = 2;
 constexpr size_t kMaxSsidBytes = 32;
 // [hang-fix] Bound for callers that submit commands from the UI or sync
 // tasks. If ConnectivityTask wedges inside the Wi-Fi driver or LwIP, the
@@ -89,10 +92,21 @@ std::atomic<wqn::services::ConnectivityState> g_state{
 std::atomic<bool> g_online{false};
 std::atomic<int> g_rssi{0};
 
-int g_fast_retry_count = 0;
 int64_t g_next_action_us = 0;
 bool g_resume_provisioning = false;
 wqn::runtime::SleepLease g_connectivity_lease;
+
+// [wifi-redundancy] Dual-slot credential state, owned by ConnectivityTask.
+wqn::WifiCredentialStore g_cred_store{};
+uint8_t g_active_slot = 0;
+uint8_t g_slot_fail_count[2] = {0, 0};
+// [wifi-redundancy] Snapshot identity read by GetConnectivitySnapshot from any
+// task. Written by ConnectivityTask under g_snapshot_lock; copies are short and
+// under the spinlock so a cross-core reader never sees a torn string.
+portMUX_TYPE g_snapshot_lock = portMUX_INITIALIZER_UNLOCKED;
+char g_snapshot_active_ssid[33] = {};
+char g_snapshot_backup_ssid[33] = {};
+bool g_snapshot_has_backup = false;
 
 const char* StateName(wqn::services::ConnectivityState state)
 {
@@ -165,6 +179,103 @@ void CopyCredential(char* destination, size_t destination_size, const char* valu
     std::snprintf(destination, destination_size, "%s", value == nullptr ? "" : value);
 }
 
+// [wifi-redundancy] Forward declaration: defined below alongside the other
+// retry/backoff schedulers, used by the slot-pivot helper.
+void ScheduleConnectRetry();
+
+// [wifi-redundancy] Publishes the active/backup SSID identity for snapshots.
+// Runs on ConnectivityTask; the copy is short and under a spinlock so a reader
+// on the other core (UI snapshot) never sees a torn string.
+void PublishSnapshotIdentity()
+{
+    taskENTER_CRITICAL(&g_snapshot_lock);
+    if (g_cred_store.count > 0 && g_active_slot < g_cred_store.count) {
+        CopyCredential(
+            g_snapshot_active_ssid,
+            sizeof(g_snapshot_active_ssid),
+            g_cred_store.slots[g_active_slot].ssid);
+    } else {
+        g_snapshot_active_ssid[0] = '\0';
+    }
+    if (g_cred_store.count >= 2) {
+        CopyCredential(
+            g_snapshot_backup_ssid,
+            sizeof(g_snapshot_backup_ssid),
+            g_cred_store.slots[1 - g_active_slot].ssid);
+        g_snapshot_has_backup = true;
+    } else {
+        g_snapshot_backup_ssid[0] = '\0';
+        g_snapshot_has_backup = false;
+    }
+    taskEXIT_CRITICAL(&g_snapshot_lock);
+}
+
+// [wifi-redundancy] Reloads the credential store from NVS into task state.
+void ReloadCredStoreFromNvs()
+{
+    const esp_err_t result = wqn::LoadWifiCredentialStore(&g_cred_store);
+    if (result != ESP_OK) {
+        ESP_LOGW(kTag, "load wifi credential store failed: %s", esp_err_to_name(result));
+        g_cred_store = wqn::WifiCredentialStore{};
+    }
+}
+
+// [wifi-redundancy] Starts a fresh connect cycle on the preferred slot and
+// resets the per-slot failure budget. The store must already be loaded via
+// ReloadCredStoreFromNvs. Returns ESP_ERR_NOT_FOUND when nothing is stored.
+esp_err_t KickConnectFromStore()
+{
+    if (g_cred_store.count == 0) {
+        return ESP_ERR_NOT_FOUND;
+    }
+    g_active_slot = g_cred_store.preferred;
+    g_slot_fail_count[0] = g_slot_fail_count[1] = 0;
+    PublishSnapshotIdentity();
+    const wqn::WifiCredentialSlot& slot = g_cred_store.slots[g_active_slot];
+    return wqn::StartWifiWithCredentials(slot.ssid, slot.password);
+}
+
+// [wifi-redundancy] Switches to the backup credential after the active slot
+// exhausted its budget or hit a credential-level failure. Returns true when a
+// usable backup slot was armed and its connect kicked off.
+bool TryPivotToBackupSlot()
+{
+    if (g_cred_store.count < 2) {
+        return false;
+    }
+    const uint8_t backup = 1 - g_active_slot;
+    const wqn::WifiCredentialSlot& slot = g_cred_store.slots[backup];
+    if (slot.ssid[0] == '\0' || g_slot_fail_count[backup] >= kPerSlotFastRetryLimit) {
+        return false;
+    }
+    // A slot pivot is a connectivity transition even when invoked outside the
+    // normal disconnect-event path. Publish offline before changing identity
+    // so readers never treat the old link as usable with the new slot.
+    SetOnline(false);
+    g_active_slot = backup;
+    ESP_LOGI(kTag, "pivot to backup WiFi slot %u (SSID=%s)", static_cast<unsigned>(backup), slot.ssid);
+    PublishSnapshotIdentity();
+    const esp_err_t result = wqn::StartWifiWithCredentials(slot.ssid, slot.password);
+    if (result != ESP_OK) {
+        ESP_LOGW(kTag, "pivot connect failed: %s", esp_err_to_name(result));
+        g_slot_fail_count[backup] = kPerSlotFastRetryLimit;
+        return false;
+    }
+    SetState(wqn::services::ConnectivityState::kConnecting);
+    // [pivot-fast] Reconfiguring credentials on an already-started radio does
+    // not emit another STA_START event. Kick the backup attempt immediately;
+    // the scheduled retry remains as the bounded fallback if this call fails.
+    const esp_err_t connect_result = wqn::ConnectWifiStationNow();
+    if (connect_result != ESP_OK) {
+        ESP_LOGW(
+            kTag,
+            "backup WiFi connect request failed: %s",
+            esp_err_to_name(connect_result));
+    }
+    ScheduleConnectRetry();
+    return true;
+}
+
 bool PostAsyncCommand(const ConnectivityCommand& command)
 {
     if (g_command_queue == nullptr ||
@@ -214,13 +325,15 @@ void ScheduleBackoff()
 {
     SetOnline(false);
     SetState(wqn::services::ConnectivityState::kBackoff);
-    g_fast_retry_count = 0;
+    // [wifi-redundancy] Fresh per-slot budget after the radio-off pause; the
+    // next cycle starts clean from the preferred slot.
+    g_slot_fail_count[0] = g_slot_fail_count[1] = 0;
     g_next_action_us = esp_timer_get_time() + kBackoffDelayUs;
     const esp_err_t stop_result = wqn::StopWifiStationRadio();
     if (stop_result != ESP_OK) {
         ESP_LOGW(kTag, "stop WiFi for backoff failed: %s", esp_err_to_name(stop_result));
     }
-    ESP_LOGW(kTag, "WiFi fast retries exhausted; radio off for 60 seconds");
+    ESP_LOGW(kTag, "WiFi retries exhausted; radio off for 60 seconds");
 }
 
 esp_err_t BeginProvisioning()
@@ -230,7 +343,7 @@ esp_err_t BeginProvisioning()
         return ESP_ERR_INVALID_STATE;
     }
     SetOnline(false);
-    g_fast_retry_count = 0;
+    g_slot_fail_count[0] = g_slot_fail_count[1] = 0;
     g_next_action_us = 0;
     SetState(wqn::services::ConnectivityState::kProvisioning);
     const esp_err_t result = wqn::StartProvisioningMode();
@@ -262,26 +375,25 @@ esp_err_t StartConfiguredConnectivity()
         return ESP_OK;
     }
 
-    if (g_state.load(std::memory_order_acquire) ==
-            wqn::services::ConnectivityState::kBackoff &&
-        wqn::IsWifiStationInitialized()) {
-        if (!HoldConnectivityLease()) {
-            return ESP_ERR_INVALID_STATE;
-        }
-        const esp_err_t restart_result = wqn::StartWifiStationRadio();
-        if (restart_result != ESP_OK) {
-            g_connectivity_lease.Reset();
-            return restart_result;
-        }
-        SetState(wqn::services::ConnectivityState::kConnecting);
-        ScheduleConnectRetry();
-        return ESP_OK;
-    }
-
     if (!HoldConnectivityLease()) {
         return ESP_ERR_INVALID_STATE;
     }
-    const esp_err_t result = wqn::StartWifiStationIfEnabled();
+
+    // [wifi-redundancy] Stored credentials first (preferred slot), then the
+    // compile-time developer fallback, then provisioning.
+    ReloadCredStoreFromNvs();
+    esp_err_t result = ESP_ERR_NOT_FOUND;
+    if (g_cred_store.count > 0) {
+        result = KickConnectFromStore();
+    } else if (g_state.load(std::memory_order_acquire) ==
+                   wqn::services::ConnectivityState::kBackoff &&
+               wqn::IsWifiStationInitialized()) {
+        // Developer fallback resume after a backoff: the driver still holds its
+        // config, so a bare radio restart resumes the retry cycle.
+        result = wqn::StartWifiStationRadio();
+    } else {
+        result = wqn::StartWifiStationIfEnabled();
+    }
     if (result == ESP_ERR_NOT_FOUND) {
         return BeginProvisioning();
     }
@@ -314,8 +426,28 @@ esp_err_t StartWithCredentials(const ConnectivityCommand& command)
         return ESP_ERR_INVALID_STATE;
     }
 
-    const esp_err_t result =
-        wqn::StartWifiWithCredentials(command.ssid, command.password);
+    // [wifi-redundancy] Persist first (dedup by SSID, the new credential becomes
+    // preferred), then connect from the refreshed store. If the upsert fails we
+    // still connect the raw credentials so the user gets online.
+    const esp_err_t upsert_result = wqn::UpsertWifiCredential(command.ssid, command.password);
+    if (upsert_result != ESP_OK) {
+        ESP_LOGW(kTag, "upsert wifi credential failed: %s", esp_err_to_name(upsert_result));
+    }
+    ReloadCredStoreFromNvs();
+    esp_err_t result = ESP_OK;
+    if (g_cred_store.count > 0) {
+        result = KickConnectFromStore();
+    } else {
+        g_slot_fail_count[0] = g_slot_fail_count[1] = 0;
+        result = wqn::StartWifiWithCredentials(command.ssid, command.password);
+        if (result == ESP_OK) {
+            taskENTER_CRITICAL(&g_snapshot_lock);
+            CopyCredential(g_snapshot_active_ssid, sizeof(g_snapshot_active_ssid), command.ssid);
+            g_snapshot_backup_ssid[0] = '\0';
+            g_snapshot_has_backup = false;
+            taskEXIT_CRITICAL(&g_snapshot_lock);
+        }
+    }
     if (result != ESP_OK) {
         g_connectivity_lease.Reset();
         SetState(wqn::services::ConnectivityState::kBackoff);
@@ -324,7 +456,6 @@ esp_err_t StartWithCredentials(const ConnectivityCommand& command)
     }
     SetOnline(false);
     SetState(wqn::services::ConnectivityState::kConnecting);
-    g_fast_retry_count = 0;
     ScheduleConnectRetry();
     return ESP_OK;
 #endif
@@ -370,7 +501,7 @@ esp_err_t RollbackAfterSleepAbort()
         }
         SetOnline(false);
         SetState(wqn::services::ConnectivityState::kConnecting);
-        g_fast_retry_count = 0;
+        g_slot_fail_count[0] = g_slot_fail_count[1] = 0;
         ScheduleConnectRetry();
         return ESP_OK;
     }
@@ -411,11 +542,18 @@ esp_err_t HandleCommand(const ConnectivityCommand& command)
             if (state == wqn::services::ConnectivityState::kQuiescing) {
                 return ESP_OK;
             }
-            g_fast_retry_count = 0;
+            g_slot_fail_count[0] = g_slot_fail_count[1] = 0;
             g_next_action_us = 0;
             SetOnline(true, wqn::GetWifiRssi());
             SetState(wqn::services::ConnectivityState::kOnline);
-            wqn::services::RequestSyncNow();
+            // [wifi-redundancy] The slot that just connected becomes the next
+            // cycle's first try; the NVS write is skipped when unchanged.
+            wqn::MarkWifiSlotPreferred(g_active_slot);
+            // Connectivity is readiness, not a synchronization intent. The
+            // sync scheduler wakes and runs only if a manual/periodic/retry/
+            // outbox reason is already pending; reconnecting by itself must
+            // not turn every 60-second RTC wake into a full sync.
+            wqn::services::NotifySyncConnectivityAvailable();
             return ESP_OK;
         case CommandType::kWifiDisconnected:
             SetOnline(false);
@@ -426,11 +564,24 @@ esp_err_t HandleCommand(const ConnectivityCommand& command)
             }
             ESP_LOGW(
                 kTag,
-                "WiFi disconnected: reason=%d rssi=%d",
+                "WiFi disconnected: reason=%d rssi=%d slot=%u",
                 command.reason,
-                command.rssi);
+                command.rssi,
+                static_cast<unsigned>(g_active_slot));
             if (!HoldConnectivityLease()) {
                 return ESP_ERR_INVALID_STATE;
+            }
+            // [wifi-redundancy] A credential-level failure (auth fail / AP not
+            // found) will not recover by retrying this slot: burn its budget and
+            // pivot to the backup immediately. Transient signal loss keeps the
+            // scheduled fast retry on the same slot.
+            if (wqn::IsWifiCredentialFailureReason(command.reason)) {
+                g_slot_fail_count[g_active_slot] = kPerSlotFastRetryLimit;
+                if (TryPivotToBackupSlot()) {
+                    return ESP_OK;
+                }
+                ScheduleBackoff();
+                return ESP_OK;
             }
             SetState(wqn::services::ConnectivityState::kConnecting);
             ScheduleConnectRetry();
@@ -453,15 +604,21 @@ void HandleScheduledAction()
             g_next_action_us = esp_timer_get_time() + 1000 * 1000;
             return;
         }
-        if (++g_fast_retry_count >= kFastRetryLimit) {
+        // [wifi-redundancy] Each timed-out attempt counts against the active
+        // slot; at its budget we pivot to the backup, otherwise back off.
+        if (++g_slot_fail_count[g_active_slot] >= kPerSlotFastRetryLimit) {
+            if (TryPivotToBackupSlot()) {
+                return;
+            }
             ScheduleBackoff();
             return;
         }
         ESP_LOGI(
             kTag,
-            "retry WiFi connection: attempt=%d/%d",
-            g_fast_retry_count,
-            kFastRetryLimit);
+            "retry WiFi connection: slot=%u attempt=%u/%u",
+            static_cast<unsigned>(g_active_slot),
+            static_cast<unsigned>(g_slot_fail_count[g_active_slot]),
+            static_cast<unsigned>(kPerSlotFastRetryLimit));
         const esp_err_t result = wqn::ConnectWifiStationNow();
         if (result != ESP_OK) {
             ESP_LOGW(kTag, "WiFi connect request failed: %s", esp_err_to_name(result));
@@ -475,8 +632,13 @@ void HandleScheduledAction()
             return;
         }
         ESP_LOGI(kTag, "WiFi backoff complete; restarting radio");
-        esp_err_t result = ESP_OK;
-        if (wqn::IsWifiStationInitialized()) {
+        // [wifi-redundancy] Reload the store (provisioning may have written new
+        // credentials during the backoff) and restart from the preferred slot.
+        ReloadCredStoreFromNvs();
+        esp_err_t result = ESP_ERR_NOT_FOUND;
+        if (g_cred_store.count > 0) {
+            result = KickConnectFromStore();
+        } else if (wqn::IsWifiStationInitialized()) {
             result = wqn::StartWifiStationRadio();
         } else {
             result = wqn::StartWifiStationIfEnabled();
@@ -491,7 +653,6 @@ void HandleScheduledAction()
             return;
         }
         SetState(wqn::services::ConnectivityState::kConnecting);
-        g_fast_retry_count = 0;
         ScheduleConnectRetry();
     }
 }
@@ -711,6 +872,13 @@ ConnectivitySnapshot GetConnectivitySnapshot()
     snapshot.state = g_state.load(std::memory_order_acquire);
     snapshot.online = g_online.load(std::memory_order_acquire);
     snapshot.rssi = snapshot.online ? GetConnectivityRssi() : 0;
+    // [wifi-redundancy] Copy the identity under the same spinlock the writer
+    // (ConnectivityTask) uses, so the SSID strings are never torn.
+    taskENTER_CRITICAL(&g_snapshot_lock);
+    CopyCredential(snapshot.active_ssid, sizeof(snapshot.active_ssid), g_snapshot_active_ssid);
+    CopyCredential(snapshot.backup_ssid, sizeof(snapshot.backup_ssid), g_snapshot_backup_ssid);
+    snapshot.has_backup = g_snapshot_has_backup;
+    taskEXIT_CRITICAL(&g_snapshot_lock);
     return snapshot;
 }
 

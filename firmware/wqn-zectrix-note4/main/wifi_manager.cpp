@@ -46,6 +46,12 @@ const char* DisconnectReasonName(uint8_t reason)
             return "NO_AP_FOUND";
         case WIFI_REASON_CONNECTION_FAIL:
             return "CONNECTION_FAIL";
+        case WIFI_REASON_MIC_FAILURE:
+            return "MIC_FAILURE";
+        case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT:
+            return "4WAY_HANDSHAKE_TIMEOUT";
+        case WIFI_REASON_ASSOC_FAIL:
+            return "ASSOC_FAIL";
         case WIFI_REASON_HANDSHAKE_TIMEOUT:
             return "HANDSHAKE_TIMEOUT";
         case WIFI_REASON_NO_AP_FOUND_W_COMPATIBLE_SECURITY:
@@ -180,11 +186,20 @@ esp_err_t StartWifiWithCredentials(const char* ssid, const char* password)
 
     if (g_initialized.load(std::memory_order_acquire)) {
         ESP_LOGI(kTag, "WiFi already initialized, switching to new credentials");
-        ESP_RETURN_ON_ERROR(esp_wifi_disconnect(), kTag, "disconnect before reconfigure");
-        // [reconfig-fix] delete old event group to avoid leak on recreate below
+        // [slot-pivot] The radio may be stopped when the connectivity service
+        // pivots slots right after a backoff (esp_wifi_stop leaves the driver
+        // initialized but not started). esp_wifi_disconnect then returns
+        // ESP_ERR_WIFI_NOT_STARTED, which is fine -- there is nothing to drop.
+        const esp_err_t disconnect_result = esp_wifi_disconnect();
+        if (disconnect_result != ESP_OK && disconnect_result != ESP_ERR_WIFI_NOT_STARTED) {
+            ESP_RETURN_ON_ERROR(disconnect_result, kTag, "disconnect before reconfigure");
+        }
+        g_wifi_connected.store(false, std::memory_order_release);
+        // [reconfig-fix] The event group has process lifetime: event-loop and
+        // external waiter tasks may still hold its handle during reconfigure.
+        // Reset connection state in place instead of deleting their object.
         if (g_wifi_event_group != nullptr) {
-            vEventGroupDelete(g_wifi_event_group);
-            g_wifi_event_group = nullptr;
+            xEventGroupClearBits(g_wifi_event_group, kWifiConnectedBit);
         }
     } else {
         // [reconfig-fix] first-time-only init. esp_netif_init/esp_wifi_init
@@ -358,6 +373,30 @@ bool IsWifiStationInitialized()
 #if CONFIG_WQN_WIFI_STA_ENABLE
     return g_initialized.load(std::memory_order_acquire);
 #else
+    return false;
+#endif
+}
+
+bool IsWifiCredentialFailureReason(int reason)
+{
+#if CONFIG_WQN_WIFI_STA_ENABLE
+    switch (reason) {
+        case WIFI_REASON_AUTH_FAIL:
+        case WIFI_REASON_AUTH_EXPIRE:
+        case WIFI_REASON_MIC_FAILURE:
+        case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT:
+        case WIFI_REASON_HANDSHAKE_TIMEOUT:
+        case WIFI_REASON_ASSOC_FAIL:
+        case WIFI_REASON_NO_AP_FOUND:
+        case WIFI_REASON_NO_AP_FOUND_W_COMPATIBLE_SECURITY:
+        case WIFI_REASON_NO_AP_FOUND_IN_AUTHMODE_THRESHOLD:
+        case WIFI_REASON_NO_AP_FOUND_IN_RSSI_THRESHOLD:
+            return true;
+        default:
+            return false;
+    }
+#else
+    (void)reason;
     return false;
 #endif
 }

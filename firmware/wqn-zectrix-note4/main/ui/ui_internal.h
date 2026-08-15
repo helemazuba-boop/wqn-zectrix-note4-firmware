@@ -80,7 +80,7 @@ constexpr TickType_t kSelectionRefreshDelay = pdMS_TO_TICKS(100);
 constexpr TickType_t kConfigRefreshDelay = pdMS_TO_TICKS(120);
 constexpr TickType_t kAiRefreshDelay = pdMS_TO_TICKS(120);
 
-constexpr size_t kSettingsItemCount = 9;
+constexpr size_t kSettingsItemCount = 10;
 // Settings rows overflow the panel at 38px pitch; the list renders a
 // selection-following window of this many rows.
 constexpr size_t kSettingsVisibleRows = 6;
@@ -641,7 +641,9 @@ esp_err_t RenderProblemBrowseToEpd(const wqn::UiFrame& frame, RefreshSchedule sc
 // ---- Settings page ----------------------------------------------------------
 
 esp_err_t DrawSettingsRow(size_t row_index, int y, const std::string& title, const std::string& value, bool selected);
-esp_err_t DrawSettingsDialogBox(const std::string& title);
+// Footer defaults to the dismiss hint ("确认关闭"); action dialogs pass their
+// own (e.g. "确认进入配网").
+esp_err_t DrawSettingsDialogBox(const std::string& title, const char* footer = "确认关闭");
 esp_err_t DrawSettingsOptionCard(int x, int y, int width, const std::string& label, bool selected);
 esp_err_t RenderSettingsDialog(const wqn::SettingsAppState& settings);
 esp_err_t RenderSettingsToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule);
