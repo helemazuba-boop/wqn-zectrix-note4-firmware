@@ -104,34 +104,37 @@ void BuildHomeSummary(wqn::UiState* state)
     wqn::ClampUiSelection(state);
 }
 
-bool LoadUiState(wqn::UiState* state)
+bool LoadUiState(wqn::UiState* state, bool restore_screen_from_rtc)
 {
     if (state == nullptr) {
         return false;
     }
 
-    // Restore last screen from RTC slow memory (survives deep sleep). On cold boot
-    // or RTC corruption, g_rtc_screen_val may be 0 (= kAi) which is unsafe, or
-    // contain an out-of-range value; fall back to kHome in either case.
-    auto is_restorable_screen = [](int value) {
-        switch (static_cast<wqn::UiScreen>(value)) {
-            case wqn::UiScreen::kTodo:
-            case wqn::UiScreen::kSettings:
-            case wqn::UiScreen::kHome:
-            case wqn::UiScreen::kTime:
-            case wqn::UiScreen::kWord:
-            case wqn::UiScreen::kNote:
-                return true;
-            case wqn::UiScreen::kAi:
-            case wqn::UiScreen::kProvisioning:
-                return false;
-        }
-        return false;
-    };
-    const int saved_screen = g_rtc_screen_val;
-    state->screen = is_restorable_screen(saved_screen)
-        ? static_cast<wqn::UiScreen>(saved_screen)
-        : wqn::UiScreen::kHome;
+    if (restore_screen_from_rtc) {
+        // Restore the last screen only during startup. A periodic status reload
+        // starts from the live AppState and must never navigate the user away.
+        // On cold boot or RTC corruption, g_rtc_screen_val may be 0 (= kAi),
+        // which is unsafe, or out of range; fall back to kHome in either case.
+        auto is_restorable_screen = [](int value) {
+            switch (static_cast<wqn::UiScreen>(value)) {
+                case wqn::UiScreen::kTodo:
+                case wqn::UiScreen::kSettings:
+                case wqn::UiScreen::kHome:
+                case wqn::UiScreen::kTime:
+                case wqn::UiScreen::kWord:
+                case wqn::UiScreen::kNote:
+                    return true;
+                case wqn::UiScreen::kAi:
+                case wqn::UiScreen::kProvisioning:
+                    return false;
+            }
+            return false;
+        };
+        const int saved_screen = g_rtc_screen_val;
+        state->screen = is_restorable_screen(saved_screen)
+            ? static_cast<wqn::UiScreen>(saved_screen)
+            : wqn::UiScreen::kHome;
+    }
 
     esp_err_t result = wqn::InitWordApp(&state->word_app);
     if (result != ESP_OK) {

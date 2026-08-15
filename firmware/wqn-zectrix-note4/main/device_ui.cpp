@@ -450,7 +450,8 @@ void DeviceUiTask(void*)
     device_ui_internal::UiRuntime& ui_runtime = g_ui_runtime;
     ESP_LOGI(kTag, "DeviceUiTask: calling LoadUiState");
     const bool state_loaded =
-        device_ui_internal::LoadUiState(&g_ui_reload_snapshot);
+        device_ui_internal::LoadUiState(
+            &g_ui_reload_snapshot, /*restore_screen_from_rtc=*/true);
     ui_runtime.Initialize(std::move(g_ui_reload_snapshot));
     const wqn::AppState& state = ui_runtime.state();
     ESP_LOGI(kTag, "DeviceUiTask: LoadUiState done");
@@ -1014,7 +1015,8 @@ wqn::AiStreamingStatusView streaming_view{};
                 // its session has one live owner and receives typed sync
                 // events, so reloading every persistent domain is stale work.
                 g_ui_reload_snapshot = state;
-                device_ui_internal::LoadUiState(&g_ui_reload_snapshot);
+                device_ui_internal::LoadUiState(
+                    &g_ui_reload_snapshot, /*restore_screen_from_rtc=*/false);
                 const device_ui_internal::UiUpdate update =
                     ui_runtime.DispatchStatusReload(
                         std::move(g_ui_reload_snapshot));

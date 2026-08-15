@@ -502,7 +502,9 @@ bool LoadValidTokenForTodo(std::string* token);
 
 // ---- State / input ----------------------------------------------------------
 
-bool LoadUiState(wqn::UiState* state);
+bool LoadUiState(
+    wqn::UiState* state,
+    bool restore_screen_from_rtc = false);
 void BuildHomeSummary(wqn::UiState* state);
 
 bool SameTimeAppState(const wqn::TimeAppState& a, const wqn::TimeAppState& b);

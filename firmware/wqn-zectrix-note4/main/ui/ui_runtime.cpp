@@ -752,6 +752,10 @@ UiUpdate UiRuntime::DispatchStatusEditTimeout(int64_t now_ms)
 
 UiUpdate UiRuntime::DispatchStatusReload(wqn::AppState&& snapshot)
 {
+    // A status reload updates background data; it is not a navigation event.
+    // Preserve the foreground screen even if a snapshot loader regresses and
+    // supplies a stale/default screen value.
+    snapshot.screen = state_.screen;
     const std::string before = FrameSignature(wqn::RenderUiFrame(state_));
     const uint64_t revision = state_.revision;
     state_ = std::move(snapshot);
