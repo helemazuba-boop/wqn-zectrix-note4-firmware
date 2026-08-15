@@ -457,8 +457,11 @@ UiUpdate UiRuntime::DispatchAutoSyncSaveResult(esp_err_t result, uint32_t operat
         settings.auto_sync_pending_valid = false;  // durably saved: nothing to retry
         settings.notice =
             "自动同步已保存：" + wqn::AutoSyncIntervalLabel(settings.auto_sync_interval_min);
-        // Only a durably saved interval may kick a sync round.
-        wqn::services::RequestSyncNow();
+        // The setting is local-authoritative. Re-arm its absolute deadline
+        // only after the NVS ACK; changing an interval is not itself a reason
+        // to spend radio energy on an immediate full sync.
+        wqn::services::NotifyAutoSyncIntervalChanged(
+            settings.auto_sync_interval_min);
     } else {
         // Keep the displayed (old) value AND the armed pending value so a
         // re-open preselects the intended interval and the user re-Confirms.

@@ -10,6 +10,7 @@ struct SleepSnapshot {
     uint32_t generation = 0;
     power::SleepMode mode = power::SleepMode::kIdle;
     bool timer_wakeup_enabled = false;
+    bool timer_wakeup_for_display = false;
     uint32_t consecutive_cycles = 0;
     uint64_t wake_gpio_mask = 0;
 };

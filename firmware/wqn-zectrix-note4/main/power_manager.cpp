@@ -142,8 +142,12 @@ i2c_master_bus_handle_t g_i2c_bus = nullptr;
 TaskHandle_t g_power_coordinator_task = nullptr;
 std::atomic<bool> g_timer_wakeup_preference{true};
 std::atomic<bool> g_battery_shutdown_requested{false};
+// Published by the power task after all non-display deep-sleep admission
+// checks pass. The UI task reads only this scalar; it must not call
+// HasUsableStoredToken(), which performs a synchronous storage read.
+std::atomic<bool> g_deep_sleep_clock_yield{false};
 uint32_t g_next_sleep_generation = 1;
-int64_t g_sleep_retry_not_before_us = 0;
+std::atomic<int64_t> g_sleep_retry_not_before_us{0};
 wqn::runtime::SleepLease g_usb_power_lease;
 bool g_usb_power_policy_sampled = false;
 
@@ -152,6 +156,44 @@ constexpr int64_t kSleepRetryBackoffUs = 30 * 1000 * 1000;
 constexpr int64_t kEmergencyStorageTimeoutUs = 2 * 1000 * 1000;
 constexpr int64_t kEmergencyHardwareTimeoutUs = 2 * 1000 * 1000;
 constexpr int64_t kLeaseWarningAfterUs = 60 * 1000 * 1000;
+
+struct BatteryCurvePoint {
+    int millivolts;
+    int percent;
+};
+
+// Resting-voltage approximation for the single-cell Li-ion battery. The old
+// quadratic returned >=100% through almost the entire useful range, so the UI
+// stayed at 100% after charge removal. Keep the calibration points explicit
+// and monotonic so later HIL measurements can tune this board's divider/load.
+constexpr std::array<BatteryCurvePoint, 16> kBatteryCurve{{
+    {3430, 0},  {3500, 3},  {3550, 7},  {3600, 12}, {3650, 20},
+    {3700, 30}, {3750, 40}, {3800, 50}, {3850, 57}, {3900, 65},
+    {3950, 72}, {4000, 80}, {4050, 85}, {4100, 90}, {4150, 95},
+    {4200, 100},
+}};
+
+constexpr int BatteryPercentFromMillivolts(int millivolts)
+{
+    if (millivolts <= kBatteryCurve.front().millivolts) {
+        return kBatteryCurve.front().percent;
+    }
+    for (size_t i = 1; i < kBatteryCurve.size(); ++i) {
+        if (millivolts <= kBatteryCurve[i].millivolts) {
+            const BatteryCurvePoint& lower = kBatteryCurve[i - 1];
+            const BatteryCurvePoint& upper = kBatteryCurve[i];
+            const int voltage_span = upper.millivolts - lower.millivolts;
+            const int percent_span = upper.percent - lower.percent;
+            return lower.percent +
+                ((millivolts - lower.millivolts) * percent_span) / voltage_span;
+        }
+    }
+    return kBatteryCurve.back().percent;
+}
+
+static_assert(BatteryPercentFromMillivolts(3492) < 10);
+static_assert(BatteryPercentFromMillivolts(4142) < 100);
+static_assert(BatteryPercentFromMillivolts(4176) < 100);
 
 }  // namespace
 
@@ -163,7 +205,7 @@ void LogWakeupCause()
     ESP_LOGI(kTag,
              "wake context: kind=%s raw=%s(%d) reset=%d ext1=0x%llx pcf_valid=%d "
              "pcf_af=%d pcf_tf=%d sleep_snapshot=%d sleep_generation=%u "
-             "sleep_cycles=%u timer_requested=%d panel_cache=%s",
+             "sleep_cycles=%u timer_requested=%d display_timer=%d panel_cache=%s",
              runtime::WakeKindName(wake.kind), WakeupCauseName(wake.raw_cause),
              static_cast<int>(wake.raw_cause), static_cast<int>(wake.reset_reason),
              static_cast<unsigned long long>(wake.ext1_status),
@@ -174,6 +216,7 @@ void LogWakeupCause()
              static_cast<unsigned>(wake.sleep_generation),
              static_cast<unsigned>(wake.consecutive_sleep_cycles),
              wake.requested_timer_wakeup ? 1 : 0,
+             wake.requested_display_timer_wakeup ? 1 : 0,
              wake.panel_cache_trusted ? "trusted" : "untrusted");
 }
 
@@ -185,6 +228,7 @@ void LogWakeupCause()
 void PublishUserActivity(int64_t occurred_at_ms)
 {
     g_user_interacted_current_boot.store(true, std::memory_order_relaxed);
+    g_deep_sleep_clock_yield.store(false, std::memory_order_release);
     taskENTER_CRITICAL(&g_activity_gate);
     UserActivityMsRef().store(occurred_at_ms, std::memory_order_relaxed);
     // A physical interaction starts a new HIL/product idle sequence; reset
@@ -242,12 +286,38 @@ bool IsUiIdleForSleepEx(int extra_idle_ms)
     const int64_t last_activity_ms =
         UserActivityMsRef().load(std::memory_order_relaxed);
     // [power-fix] Only the last user activity drives the deep-sleep idle
-    // timer. NoteEpdActivity() is called on every partial refresh (e.g. the
-    // clock screen's minute-rollover), so including it in `std::max(user,
-    // epd)` made the threshold unreachable and permanently pinned the
+    // timer. NoteEpdActivity() runs on the clock screen's minute rollover, so
+    // including it in `std::max(user, epd)` made the threshold unreachable and
+    // permanently pinned the
     // device in active mode. EPD activity is still tracked separately for
     // the EPD rail power-off path.
     return last_activity_ms > 0 && (now_ms - last_activity_ms) >= threshold_ms;
+}
+
+bool ShouldYieldClockRefreshToDeepSleep()
+{
+#if CONFIG_WQN_DEEP_SLEEP_ENABLE
+    return g_deep_sleep_clock_yield.load(std::memory_order_acquire);
+#else
+    return false;
+#endif
+}
+
+static bool DisplayIsOnlyActiveSleepBlocker()
+{
+    if (runtime::ActiveSleepBlockerCount(runtime::SleepBlocker::kDisplay) == 0) {
+        return false;
+    }
+    for (uint8_t value = 0;
+         value < static_cast<uint8_t>(runtime::SleepBlocker::kCount);
+         ++value) {
+        const auto blocker = static_cast<runtime::SleepBlocker>(value);
+        if (blocker != runtime::SleepBlocker::kDisplay &&
+            runtime::ActiveSleepBlockerCount(blocker) != 0) {
+            return false;
+        }
+    }
+    return true;
 }
 
 esp_err_t InitPowerHardware(i2c_port_t i2c_port, gpio_num_t i2c_sda, gpio_num_t i2c_scl, int i2c_clk_hz)
@@ -367,16 +437,18 @@ bool ReadPowerStatus(PowerStatusSnapshot* snapshot)
     }
 
     if (valid_samples == 0) {
+        xSemaphoreGive(g_adc_mutex);
         return false;
     }
 
     snapshot->adc_raw = sum_raw / valid_samples;
     snapshot->adc_mv = sum_mv / valid_samples;
     snapshot->battery_mv = snapshot->adc_mv * 2;
-    const int64_t mv = snapshot->battery_mv;
-    const int64_t percent = (-mv * mv + 9016LL * mv - 19189000LL) / 10000LL;
-    snapshot->battery_percent = std::clamp(static_cast<int>(percent), 0, 100);
+    snapshot->battery_percent = snapshot->fully_charged
+        ? 100
+        : BatteryPercentFromMillivolts(snapshot->battery_mv);
     snapshot->valid = snapshot->battery_mv > 0;
+    xSemaphoreGive(g_adc_mutex);
     return snapshot->valid;
 }
 
@@ -599,7 +671,10 @@ static void RollbackSleepPreparation(uint32_t generation, const char* reason)
     RollbackDisplayAfterSleepAbort();
     RollbackBoardPowerState();
     runtime::InvalidateSleepSnapshot();
-    g_sleep_retry_not_before_us = esp_timer_get_time() + kSleepRetryBackoffUs;
+    g_sleep_retry_not_before_us.store(
+        esp_timer_get_time() + kSleepRetryBackoffUs,
+        std::memory_order_relaxed);
+    g_deep_sleep_clock_yield.store(false, std::memory_order_release);
 }
 
 static uint32_t NextSleepGeneration()
@@ -725,18 +800,27 @@ static void EnterDeepSleepIfEnabled(bool enable_timer_wakeup)
         g_user_activity_generation.load(std::memory_order_acquire);
 
     if (IsUsbPowered()) {
+        g_deep_sleep_clock_yield.store(false, std::memory_order_release);
         return;
     }
-    if (esp_timer_get_time() < g_sleep_retry_not_before_us ||
+    if (esp_timer_get_time() <
+            g_sleep_retry_not_before_us.load(std::memory_order_relaxed) ||
         !services::HasUsableStoredToken() || !IsUiIdleForSleep()) {
+        g_deep_sleep_clock_yield.store(false, std::memory_order_release);
         return;
     }
     // Validate before closing lease acquisition...
     if (g_user_activity_generation.load(std::memory_order_acquire) !=
         activity_generation_before) {
+        g_deep_sleep_clock_yield.store(false, std::memory_order_release);
         return;
     }
 
+    // Publish only when display is the sole remaining blocker. A cloud/storage
+    // lease must never freeze the visible clock while unrelated work is still
+    // legitimately keeping the device awake.
+    g_deep_sleep_clock_yield.store(
+        DisplayIsOnlyActiveSleepBlocker(), std::memory_order_release);
     const uint32_t generation = NextSleepGeneration();
     if (!runtime::TryBeginSleepQuiesce(generation)) {
         return;
@@ -762,8 +846,25 @@ static void EnterDeepSleepIfEnabled(bool enable_timer_wakeup)
         return;
     }
 
+    // Re-evaluate after every service has quiesced. A sync failure can publish
+    // its retry deadline immediately before releasing the online-sync lease;
+    // relying only on the UI task's earlier preference sample could then sleep
+    // with no timer on a non-clock screen and strand the retry indefinitely.
+    const uint32_t display_wakeup_seconds = enable_timer_wakeup
+        ? CONFIG_WQN_DEEP_SLEEP_TIMER_WAKE_SEC
+        : 0;
+    uint32_t timer_wakeup_seconds = display_wakeup_seconds;
+    const uint32_t sync_wakeup_seconds =
+        services::SecondsUntilNextSyncWake();
+    if (sync_wakeup_seconds != 0 &&
+        (timer_wakeup_seconds == 0 ||
+         sync_wakeup_seconds < timer_wakeup_seconds)) {
+        timer_wakeup_seconds = sync_wakeup_seconds;
+    }
+    const bool timer_wakeup_for_display = display_wakeup_seconds != 0 &&
+        (sync_wakeup_seconds == 0 || display_wakeup_seconds <= sync_wakeup_seconds);
     const power::WakeArmResult wake =
-        power::ArmWakeSources(enable_timer_wakeup, command.deadline_us);
+        power::ArmWakeSources(timer_wakeup_seconds, command.deadline_us);
     if (wake.error != ESP_OK) {
         RollbackSleepPreparation(generation, esp_err_to_name(wake.error));
         return;
@@ -787,7 +888,8 @@ static void EnterDeepSleepIfEnabled(bool enable_timer_wakeup)
     runtime::SleepSnapshot snapshot;
     snapshot.generation = generation;
     snapshot.mode = power::SleepMode::kIdle;
-    snapshot.timer_wakeup_enabled = enable_timer_wakeup;
+    snapshot.timer_wakeup_enabled = timer_wakeup_seconds != 0;
+    snapshot.timer_wakeup_for_display = timer_wakeup_for_display;
     snapshot.consecutive_cycles = ConsecutiveSleepCyclesRef().load(std::memory_order_relaxed);
     snapshot.wake_gpio_mask = wake.wake_gpio_mask;
     runtime::CommitSleepSnapshot(snapshot);

@@ -243,6 +243,7 @@ esp_err_t BootstrapDeviceControlV3(
 esp_err_t SyncDeviceControlV3(
     const std::string& token,
     const protocol::v3::RequestMetadata& metadata,
+    uint32_t auto_sync_interval_minutes,
     protocol::v3::SyncData* data,
     protocol::v3::Error* error);
 esp_err_t ProbeSyncAndClearTokenOnUnauthorized(const std::string& token);

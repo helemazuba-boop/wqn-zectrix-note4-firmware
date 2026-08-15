@@ -31,6 +31,7 @@ struct WakeContext {
     uint32_t sleep_generation = 0;
     uint32_t consecutive_sleep_cycles = 0;
     bool requested_timer_wakeup = false;
+    bool requested_display_timer_wakeup = false;
     bool panel_cache_trusted = false;
 };
 

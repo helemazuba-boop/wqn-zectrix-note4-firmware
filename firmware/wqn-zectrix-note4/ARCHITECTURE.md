@@ -47,7 +47,7 @@ Features also remain in `main` until their interfaces are equally stable.
 | NVS/SPIFFS writes | `StorageService` | serialized transaction; immutable capacity snapshot for readers |
 | I2S, ES8311 and amplifier GPIO | `AudioService` | fixed command/result interfaces |
 | Application state and page transitions | `UiRuntime` | fixed-size events, reducer and effects |
-| v3 claim/bootstrap/sync lifecycle | `SyncService` | start, request-now, immutable snapshot and domain events |
+| v3 claim/bootstrap/sync lifecycle | `SyncService` | explicit reasons, RTC-retained schedule/retry, outbox triggers, immutable snapshot and domain events |
 
 `platform_note4` may drive rails low before services start. This is a
 bootstrap-only safety exception; after bring-up it does not run again.
@@ -69,13 +69,20 @@ upload. PSRAM is never a persistence or sync-checkpoint source.
 2. collect `WakeContext` and enable the validated PM profile;
 3. enforce storage schema generation 3 before starting business services;
 4. initialize storage and service tasks;
-5. start UI, connectivity, sync and `PowerCoordinator`.
+5. admit connectivity only when the wake has network work, then start UI,
+   sync and `PowerCoordinator` (interactive/cold boots retain normal
+   connectivity; background timer wakes may keep Wi-Fi and EPD off).
 
 Normal sleep is a two-phase transaction. With no active lease and after the
 idle threshold, `PowerCoordinator` closes lease admission, sends a generation
 and deadline to every service, prepares the wake line, writes the CRC-protected
 snapshot, then calls the sole `esp_deep_sleep_start()` site. Any denial or
 timeout rolls all prepared services back and retries no earlier than 30 seconds.
+Wake-source assembly takes the earliest of the display-clock deadline and the
+sync scheduler's periodic/retry/outbox/content deadline. The sleep snapshot
+records whether that timer belongs to display or background sync, so a
+sync-only wake does not initialize or refresh the panel unless new visible
+content is actually accepted later in the boot.
 
 USB/charger presence owns a sleep lease. PC attachment is detected from USB
 Serial/JTAG SOF traffic instead of charger-status GPIO; GPIO charging/full status

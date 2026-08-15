@@ -10,11 +10,6 @@
 #include "freertos/task.h"
 #include "pcf8563.h"
 #include "runtime/wake_context.h"
-#include "sdkconfig.h"
-
-#ifndef CONFIG_WQN_DEEP_SLEEP_TIMER_WAKE_SEC
-#define CONFIG_WQN_DEEP_SLEEP_TIMER_WAKE_SEC 0
-#endif
 
 namespace {
 
@@ -79,7 +74,7 @@ void CaptureWakeContext()
         valid && flags.timer);
 }
 
-WakeArmResult ArmWakeSources(bool enable_timer_wakeup, int64_t deadline_us)
+WakeArmResult ArmWakeSources(uint32_t timer_wakeup_seconds, int64_t deadline_us)
 {
     WakeArmResult result;
     result.wake_gpio_mask = kWakeMask;
@@ -107,10 +102,10 @@ WakeArmResult ArmWakeSources(bool enable_timer_wakeup, int64_t deadline_us)
         return result;
     }
 
-#if CONFIG_WQN_DEEP_SLEEP_TIMER_WAKE_SEC > 0
-    if (enable_timer_wakeup) {
-        if (pcf_available &&
-            Pcf8563ConfigureTimerWake(CONFIG_WQN_DEEP_SLEEP_TIMER_WAKE_SEC)) {
+    if (timer_wakeup_seconds > 0) {
+        if (pcf_available && timer_wakeup_seconds <= UINT8_MAX &&
+            Pcf8563ConfigureTimerWake(
+                static_cast<uint8_t>(timer_wakeup_seconds))) {
             result.timer_source = TimerWakeSource::kPcf8563;
         } else {
             if (pcf_available && !Pcf8563DisableTimerWakeAndClearFlags()) {
@@ -119,18 +114,18 @@ WakeArmResult ArmWakeSources(bool enable_timer_wakeup, int64_t deadline_us)
                 return result;
             }
             const esp_err_t timer_result = esp_sleep_enable_timer_wakeup(
-                static_cast<uint64_t>(CONFIG_WQN_DEEP_SLEEP_TIMER_WAKE_SEC) * 1000000ULL);
+                static_cast<uint64_t>(timer_wakeup_seconds) * 1000000ULL);
             if (timer_result != ESP_OK) {
                 result.error = timer_result;
                 return result;
             }
             result.timer_source = TimerWakeSource::kEsp32;
-            ESP_LOGW(kTag, "PCF8563 timer unavailable; using ESP32 timer wake");
+            ESP_LOGI(
+                kTag,
+                "using ESP32 timer wake: seconds=%u",
+                static_cast<unsigned>(timer_wakeup_seconds));
         }
     }
-#else
-    (void)enable_timer_wakeup;
-#endif
 
     // Arming the PCF timer is itself fallible. Verify that it did not assert
     // GPIO5 before the ESP32 EXT1 source is assembled.
@@ -154,10 +149,10 @@ WakeArmResult ArmWakeSources(bool enable_timer_wakeup, int64_t deadline_us)
         DisarmWakeSources();
         return result;
     }
-    ESP_LOGI(kTag, "wake sources armed: gpio_mask=0x%llx timer_source=%s timer_sec=%d",
+    ESP_LOGI(kTag, "wake sources armed: gpio_mask=0x%llx timer_source=%s timer_sec=%u",
              static_cast<unsigned long long>(kWakeMask),
              TimerWakeSourceName(result.timer_source),
-             CONFIG_WQN_DEEP_SLEEP_TIMER_WAKE_SEC);
+             static_cast<unsigned>(timer_wakeup_seconds));
     return result;
 }
 

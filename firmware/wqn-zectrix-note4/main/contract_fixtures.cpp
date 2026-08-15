@@ -866,6 +866,29 @@ bool CheckV3ControlContract()
         return false;
     }
 
+    metadata.config_revision = 99;
+    metadata.sync_cursor = 88;
+    if (!Require(
+            wqn::protocol::v3::BuildSyncRequest(metadata, 15, &request_body) ==
+                ESP_OK,
+            "v3 sync request reports local interval")) {
+        return false;
+    }
+    JsonDocument sync_request(request_body.c_str());
+    cJSON* sync_configuration = cJSON_GetObjectItemCaseSensitive(
+        sync_request.root(), "configuration");
+    cJSON* sync_interval = cJSON_GetObjectItemCaseSensitive(
+        sync_configuration, "auto_sync_interval_minutes");
+    if (!Require(sync_request.ok(), "v3 sync request parses") ||
+        !Require(cJSON_IsNumber(sync_interval) && sync_interval->valueint == 15,
+                 "v3 sync request interval value") ||
+        !Require(
+            wqn::protocol::v3::BuildSyncRequest(metadata, 10, &request_body) ==
+                ESP_ERR_INVALID_ARG,
+            "v3 sync request rejects unsupported interval")) {
+        return false;
+    }
+
     wqn::protocol::v3::SyncData sync;
     if (!Require(
             wqn::protocol::v3::ParseSyncResponse(

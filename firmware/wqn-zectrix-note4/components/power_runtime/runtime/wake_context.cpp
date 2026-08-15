@@ -39,6 +39,8 @@ void CaptureWakeContext(
         context.sleep_generation = sleep_snapshot.generation;
         context.consecutive_sleep_cycles = sleep_snapshot.consecutive_cycles;
         context.requested_timer_wakeup = sleep_snapshot.timer_wakeup_enabled;
+        context.requested_display_timer_wakeup =
+            sleep_snapshot.timer_wakeup_for_display;
     }
 
     if (context.raw_cause == ESP_SLEEP_WAKEUP_TIMER) {

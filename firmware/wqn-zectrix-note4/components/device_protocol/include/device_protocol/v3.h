@@ -95,7 +95,10 @@ struct SyncData {
 };
 
 esp_err_t BuildBootstrapRequest(const RequestMetadata& metadata, std::string* body);
-esp_err_t BuildSyncRequest(const RequestMetadata& metadata, std::string* body);
+esp_err_t BuildSyncRequest(
+    const RequestMetadata& metadata,
+    uint32_t auto_sync_interval_minutes,
+    std::string* body);
 esp_err_t BuildClaimStartRequest(
     const RequestMetadata& metadata,
     const std::string& hardware_id,

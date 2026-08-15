@@ -169,9 +169,34 @@ esp_err_t BuildBootstrapRequest(const RequestMetadata& metadata, std::string* bo
     return BuildRequest(metadata, false, body);
 }
 
-esp_err_t BuildSyncRequest(const RequestMetadata& metadata, std::string* body)
+esp_err_t BuildSyncRequest(
+    const RequestMetadata& metadata,
+    uint32_t auto_sync_interval_minutes,
+    std::string* body)
 {
-    return BuildRequest(metadata, true, body);
+    if (auto_sync_interval_minutes != 0 && auto_sync_interval_minutes != 15 &&
+        auto_sync_interval_minutes != 30 && auto_sync_interval_minutes != 60 &&
+        auto_sync_interval_minutes != 240) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    esp_err_t result = BuildRequest(metadata, true, body);
+    if (result != ESP_OK) {
+        return result;
+    }
+    JsonDocument document(*body);
+    if (document.root() == nullptr) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    cJSON* configuration = cJSON_CreateObject();
+    if (configuration == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
+    cJSON_AddNumberToObject(
+        configuration,
+        "auto_sync_interval_minutes",
+        static_cast<double>(auto_sync_interval_minutes));
+    cJSON_AddItemToObject(document.root(), "configuration", configuration);
+    return Render(document.root(), body);
 }
 
 esp_err_t BuildClaimStartRequest(
@@ -374,6 +399,11 @@ esp_err_t ParseSyncResponse(
     if (!U64Field(configuration, "auto_sync_interval_minutes", &auto_sync_interval_minutes) ||
         !U64Field(summaries, "todo_count", &todo_count) ||
         !U64Field(summaries, "word_due_count", &word_due_count)) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    if (auto_sync_interval_minutes != 0 && auto_sync_interval_minutes != 15 &&
+        auto_sync_interval_minutes != 30 && auto_sync_interval_minutes != 60 &&
+        auto_sync_interval_minutes != 240) {
         return ESP_ERR_INVALID_RESPONSE;
     }
     data->auto_sync_interval_minutes = static_cast<uint32_t>(

@@ -6,6 +6,7 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <ctime>
 #include <limits>
 #include <string>
 #include <utility>
@@ -13,6 +14,7 @@
 
 #include "config.h"
 #include "device_protocol/claim_crypto.h"
+#include "esp_attr.h"
 #include "esp_check.h"
 #include "esp_err.h"
 #include "esp_log.h"
@@ -25,6 +27,7 @@
 #include "freertos/timers.h"
 #include "nvs.h"
 #include "runtime/sleep_coordinator.h"
+#include "runtime/wake_context.h"
 #include "storage.h"
 #include "note_store.h"
 #include "problem_store.h"
@@ -43,8 +46,29 @@ wqn::services::SyncEvent g_latest_sync_event = {};
 constexpr TickType_t kSyncRetryDelay = pdMS_TO_TICKS(10000);
 bool LoadUsableToken(std::string* token);
 TaskHandle_t g_sync_service_task = nullptr;
-std::atomic<bool> g_full_sync_requested{false};
+enum FullSyncReason : uint32_t {
+    kFullSyncManual = 1u << 0,
+    kFullSyncBoot = 1u << 1,
+    kFullSyncCredentials = 1u << 2,
+    kFullSyncContentRefresh = 1u << 3,
+};
+std::atomic<uint32_t> g_full_sync_reasons{0};
 std::atomic<bool> g_word_outbox_sync_requested{false};
+std::atomic<bool> g_outbox_immediate_requested{false};
+std::atomic<uint32_t> g_auto_sync_interval_minutes{0};
+std::atomic<int64_t> g_next_periodic_sync_not_before_ms{0};
+std::atomic<bool> g_boot_outbox_pending{false};
+std::atomic<bool> g_boot_policy_evaluated{false};
+constexpr uint32_t kPeriodicScheduleMagic = 0x57514E53;  // "WQNS"
+constexpr uint32_t kFullRetryMagic = 0x57514E52;  // "WQNR"
+constexpr std::time_t kMinScheduleUnixTime = 1704067200;  // 2024-01-01 UTC
+RTC_DATA_ATTR uint32_t g_periodic_schedule_magic = 0;
+RTC_DATA_ATTR uint32_t g_periodic_schedule_interval_minutes = 0;
+RTC_DATA_ATTR int64_t g_next_periodic_sync_unix_seconds = 0;
+RTC_DATA_ATTR uint32_t g_full_sync_retry_magic = 0;
+RTC_DATA_ATTR int64_t g_full_sync_retry_unix_seconds = 0;
+std::atomic<int64_t> g_full_sync_retry_not_before_ms{0};
+portMUX_TYPE g_periodic_schedule_lock = portMUX_INITIALIZER_UNLOCKED;
 std::atomic<uint32_t> g_content_refresh_requested{0};
 constexpr uint32_t kWordPacksRefreshBit = 1u << 0;
 constexpr uint32_t kNotePacksRefreshBit = 1u << 1;
@@ -77,6 +101,231 @@ uint32_t ContentRefreshBit(wqn::services::SyncContentDomain domain)
         default:
             return 0;
     }
+}
+
+std::time_t CurrentUnixSeconds()
+{
+    std::time_t now = 0;
+    std::time(&now);
+    return now;
+}
+
+bool PeriodicScheduleDue(uint32_t interval_minutes)
+{
+    if (interval_minutes == 0) {
+        return false;
+    }
+    uint32_t magic = 0;
+    uint32_t scheduled_interval = 0;
+    int64_t due_seconds = 0;
+    taskENTER_CRITICAL(&g_periodic_schedule_lock);
+    magic = g_periodic_schedule_magic;
+    scheduled_interval = g_periodic_schedule_interval_minutes;
+    due_seconds = g_next_periodic_sync_unix_seconds;
+    taskEXIT_CRITICAL(&g_periodic_schedule_lock);
+    const std::time_t now = CurrentUnixSeconds();
+    // Missing/old schedule state is due once. A successful round writes the
+    // first valid absolute deadline, which then survives deep sleep.
+    if (magic != kPeriodicScheduleMagic ||
+        scheduled_interval != interval_minutes) {
+        return true;
+    }
+    if (due_seconds < static_cast<int64_t>(kMinScheduleUnixTime) ||
+        now < kMinScheduleUnixTime) {
+        return g_next_periodic_sync_not_before_ms.load(
+                   std::memory_order_acquire) <=
+            esp_timer_get_time() / 1000;
+    }
+    return static_cast<int64_t>(now) >= due_seconds;
+}
+
+void ScheduleNextPeriodicSync(uint32_t interval_minutes)
+{
+    const std::time_t now = CurrentUnixSeconds();
+    g_next_periodic_sync_not_before_ms.store(
+        interval_minutes == 0
+            ? 0
+            : esp_timer_get_time() / 1000 +
+                static_cast<int64_t>(interval_minutes) * 60 * 1000,
+        std::memory_order_release);
+    taskENTER_CRITICAL(&g_periodic_schedule_lock);
+    if (interval_minutes == 0) {
+        g_periodic_schedule_magic = 0;
+        g_periodic_schedule_interval_minutes = interval_minutes;
+        g_next_periodic_sync_unix_seconds = 0;
+    } else {
+        g_periodic_schedule_interval_minutes = interval_minutes;
+        // The UI seeds wall time after app_main starts the services. If a
+        // successful cold-boot sync wins that race, keep a valid relative
+        // schedule marker instead of clearing the schedule and immediately
+        // spinning another full round. Once wall time is valid, later rounds
+        // replace this zero sentinel with the absolute deadline.
+        g_next_periodic_sync_unix_seconds = now >= kMinScheduleUnixTime
+            ? static_cast<int64_t>(now) +
+                static_cast<int64_t>(interval_minutes) * 60
+            : 0;
+        g_periodic_schedule_magic = kPeriodicScheduleMagic;
+    }
+    taskEXIT_CRITICAL(&g_periodic_schedule_lock);
+}
+
+TickType_t PeriodicSyncWaitDelay(uint32_t interval_minutes)
+{
+    if (interval_minutes == 0) {
+        return portMAX_DELAY;
+    }
+    uint32_t magic = 0;
+    uint32_t scheduled_interval = 0;
+    int64_t due_seconds = 0;
+    taskENTER_CRITICAL(&g_periodic_schedule_lock);
+    magic = g_periodic_schedule_magic;
+    scheduled_interval = g_periodic_schedule_interval_minutes;
+    due_seconds = g_next_periodic_sync_unix_seconds;
+    taskEXIT_CRITICAL(&g_periodic_schedule_lock);
+    const std::time_t now = CurrentUnixSeconds();
+    if (magic != kPeriodicScheduleMagic ||
+        scheduled_interval != interval_minutes) {
+        return 0;
+    }
+    if (due_seconds < static_cast<int64_t>(kMinScheduleUnixTime) ||
+        now < kMinScheduleUnixTime) {
+        const int64_t remaining_ms =
+            g_next_periodic_sync_not_before_ms.load(
+                std::memory_order_acquire) -
+            esp_timer_get_time() / 1000;
+        if (remaining_ms <= 0) {
+            return 0;
+        }
+        const uint64_t fallback_ticks =
+            static_cast<uint64_t>(remaining_ms) / portTICK_PERIOD_MS;
+        return fallback_ticks >= static_cast<uint64_t>(portMAX_DELAY)
+            ? portMAX_DELAY - 1
+            : std::max<TickType_t>(1, static_cast<TickType_t>(fallback_ticks));
+    }
+    if (static_cast<int64_t>(now) >= due_seconds) {
+        return 0;
+    }
+    const uint64_t remaining_ms =
+        static_cast<uint64_t>(due_seconds - static_cast<int64_t>(now)) * 1000ULL;
+    const uint64_t ticks = remaining_ms / portTICK_PERIOD_MS;
+    return ticks >= static_cast<uint64_t>(portMAX_DELAY)
+        ? portMAX_DELAY - 1
+        : std::max<TickType_t>(1, static_cast<TickType_t>(ticks));
+}
+
+void ClearFullSyncRetry()
+{
+    taskENTER_CRITICAL(&g_periodic_schedule_lock);
+    g_full_sync_retry_magic = 0;
+    g_full_sync_retry_unix_seconds = 0;
+    taskEXIT_CRITICAL(&g_periodic_schedule_lock);
+    g_full_sync_retry_not_before_ms.store(0, std::memory_order_release);
+}
+
+void ScheduleFullSyncRetry(uint32_t delay_ms)
+{
+    const std::time_t now = CurrentUnixSeconds();
+    const int64_t delay_seconds = std::max<int64_t>(1, (delay_ms + 999) / 1000);
+    g_full_sync_retry_not_before_ms.store(
+        esp_timer_get_time() / 1000 + delay_seconds * 1000,
+        std::memory_order_release);
+    taskENTER_CRITICAL(&g_periodic_schedule_lock);
+    g_full_sync_retry_unix_seconds = now >= kMinScheduleUnixTime
+        ? static_cast<int64_t>(now) + delay_seconds
+        : 0;
+    // Keep the retry marker even before wall time is seeded. The in-boot
+    // monotonic deadline drives the wait; if deep sleep/restart resets that
+    // scalar, the retained zero wall deadline is conservatively due once.
+    g_full_sync_retry_magic = kFullRetryMagic;
+    taskEXIT_CRITICAL(&g_periodic_schedule_lock);
+}
+
+TickType_t FullSyncRetryWaitDelay()
+{
+    uint32_t retry_magic = 0;
+    int64_t due_seconds = 0;
+    taskENTER_CRITICAL(&g_periodic_schedule_lock);
+    retry_magic = g_full_sync_retry_magic;
+    due_seconds = g_full_sync_retry_unix_seconds;
+    taskEXIT_CRITICAL(&g_periodic_schedule_lock);
+    if (retry_magic != kFullRetryMagic) {
+        return portMAX_DELAY;
+    }
+    const std::time_t now = CurrentUnixSeconds();
+    if (due_seconds == 0 || now < kMinScheduleUnixTime) {
+        const int64_t remaining_ms =
+            g_full_sync_retry_not_before_ms.load(std::memory_order_acquire) -
+            esp_timer_get_time() / 1000;
+        if (remaining_ms <= 0) {
+            return 0;
+        }
+        const uint64_t ticks =
+            static_cast<uint64_t>(remaining_ms) / portTICK_PERIOD_MS;
+        return ticks >= static_cast<uint64_t>(portMAX_DELAY)
+            ? portMAX_DELAY - 1
+            : std::max<TickType_t>(1, static_cast<TickType_t>(ticks));
+    }
+    if (static_cast<int64_t>(now) >= due_seconds) {
+        return 0;
+    }
+    const uint64_t remaining_ms =
+        static_cast<uint64_t>(due_seconds - static_cast<int64_t>(now)) * 1000ULL;
+    const uint64_t ticks = remaining_ms / portTICK_PERIOD_MS;
+    return ticks >= static_cast<uint64_t>(portMAX_DELAY)
+        ? portMAX_DELAY - 1
+        : std::max<TickType_t>(1, static_cast<TickType_t>(ticks));
+}
+
+bool FullSyncRetryDue()
+{
+    return FullSyncRetryWaitDelay() == 0;
+}
+
+bool JournalHasPendingContent(const wqn::SyncJournal& journal)
+{
+    const auto pending = [](const wqn::SyncJournalContentState& state) {
+        return state.desired_revision > state.applied_revision &&
+            state.phase != wqn::SyncJournalPhase::kBlocked;
+    };
+    return pending(journal.word_packs) || pending(journal.note_packs) ||
+        pending(journal.problem_packs);
+}
+
+bool ProbeDurableOutboxWork()
+{
+#if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
+    wqn::DurableWordObservation word;
+    esp_err_t result = wqn::PeekPendingWordObservation(&word);
+    if (result == ESP_OK) {
+        return true;
+    }
+    if (result != ESP_ERR_NOT_FOUND) {
+        ESP_LOGW(kTag, "word outbox boot probe failed: %s",
+                 esp_err_to_name(result));
+        return true;
+    }
+    wqn::DurableNoteObservation note;
+    result = wqn::PeekPendingNoteObservation(&note);
+    if (result == ESP_OK) {
+        return true;
+    }
+    if (result != ESP_ERR_NOT_FOUND) {
+        ESP_LOGW(kTag, "note outbox boot probe failed: %s",
+                 esp_err_to_name(result));
+        return true;
+    }
+    wqn::DurableProblemObservation problem;
+    result = wqn::PeekPendingProblemObservation(&problem);
+    if (result == ESP_OK) {
+        return true;
+    }
+    if (result != ESP_ERR_NOT_FOUND) {
+        ESP_LOGW(kTag, "problem outbox boot probe failed: %s",
+                 esp_err_to_name(result));
+        return true;
+    }
+#endif
+    return false;
 }
 
 wqn::services::SyncContentSnapshot* ContentSnapshotForKind(
@@ -198,6 +447,7 @@ void PublishContentTargets(
 
 void WordOutboxTimerCallback(TimerHandle_t)
 {
+    g_outbox_immediate_requested.store(true, std::memory_order_relaxed);
     g_word_outbox_sync_requested.store(true, std::memory_order_release);
     if (g_sync_service_task != nullptr) {
         xTaskNotifyGive(g_sync_service_task);
@@ -222,6 +472,7 @@ constexpr uint32_t kWordOutboxRetryJitterMaxMs = 2000;
 constexpr uint8_t kWordOutboxRetryMaxShift = 4;
 std::string g_bootstrap_request_id;
 std::string g_sync_request_id;
+uint32_t g_sync_request_auto_interval_minutes = 0;
 wqn::protocol::v3::ClaimKeyPair g_claim_key_pair;
 std::string g_claim_start_request_id;
 std::string g_claim_id;
@@ -322,7 +573,7 @@ TickType_t WordOutboxRetryWaitDelay()
     const int64_t remaining_ms =
         g_word_outbox_retry_not_before_ms - esp_timer_get_time() / 1000;
     if (remaining_ms <= 0) {
-        return 1;
+        return 0;
     }
     return pdMS_TO_TICKS(
         static_cast<uint32_t>(
@@ -390,7 +641,7 @@ TickType_t NoteOutboxRetryWaitDelay()
     const int64_t remaining_ms =
         g_note_outbox_retry_not_before_ms - esp_timer_get_time() / 1000;
     if (remaining_ms <= 0) {
-        return 1;
+        return 0;
     }
     return pdMS_TO_TICKS(
         static_cast<uint32_t>(
@@ -458,7 +709,7 @@ TickType_t ProblemOutboxRetryWaitDelay()
     const int64_t remaining_ms =
         g_problem_outbox_retry_not_before_ms - esp_timer_get_time() / 1000;
     if (remaining_ms <= 0) {
-        return 1;
+        return 0;
     }
     return pdMS_TO_TICKS(
         static_cast<uint32_t>(
@@ -767,6 +1018,7 @@ esp_err_t RunDeviceClaimRoundV3()
     g_bootstrap_complete = false;
     g_bootstrap_request_id.clear();
     g_sync_request_id.clear();
+    g_sync_request_auto_interval_minutes = 0;
     g_config_revision = 0;
     g_sync_cursor = 0;
     return g_claim_active ? PollClaimSession() : StartClaimSession();
@@ -913,13 +1165,20 @@ esp_err_t SyncControlPlaneV3(const std::string& token)
 {
     if (g_sync_request_id.empty()) {
         g_sync_request_id = RandomControlId("req_sync_");
+        // The request id and its fingerprint are an immutable retry unit.
+        // Freeze the locally-authoritative setting with the id: changing the
+        // setting while a transport retry is pending must not reuse the same
+        // id with a different JSON body and trigger REQUEST_ID_REUSED.
+        g_sync_request_auto_interval_minutes =
+            g_auto_sync_interval_minutes.load(std::memory_order_acquire);
     }
     wqn::protocol::v3::RequestMetadata metadata = MakeControlMetadata();
     metadata.request_id = g_sync_request_id;
     wqn::protocol::v3::SyncData sync;
     wqn::protocol::v3::Error error;
     const esp_err_t sync_result =
-        wqn::SyncDeviceControlV3(token, metadata, &sync, &error);
+        wqn::SyncDeviceControlV3(
+            token, metadata, g_sync_request_auto_interval_minutes, &sync, &error);
     if (sync_result != ESP_OK) {
         if (error.retryable) {
             g_control_retry_after_ms = error.retry_after_ms;
@@ -929,22 +1188,16 @@ esp_err_t SyncControlPlaneV3(const std::string& token)
     }
     g_control_retry_after_ms = 0;
     PublishContentTargets(sync.content_targets);
-    if (sync.auto_sync_interval_minutes == 0 ||
-        sync.auto_sync_interval_minutes == 15 ||
-        sync.auto_sync_interval_minutes == 30 ||
-        sync.auto_sync_interval_minutes == 60 ||
-        sync.auto_sync_interval_minutes == 240) {
-        uint32_t current_interval = 0;
-        ESP_RETURN_ON_ERROR(
-            wqn::LoadAutoSyncIntervalMinutes(&current_interval),
+    // Device settings are local-authoritative. The server echoes the reported
+    // value for protocol observability but must never overwrite the NVS value
+    // selected on the device.
+    if (sync.auto_sync_interval_minutes !=
+        g_sync_request_auto_interval_minutes) {
+        ESP_LOGW(
             kTag,
-            "load v3 auto-sync configuration");
-        if (current_interval != sync.auto_sync_interval_minutes) {
-            ESP_RETURN_ON_ERROR(
-                wqn::SaveAutoSyncIntervalMinutes(sync.auto_sync_interval_minutes),
-                kTag,
-                "save v3 auto-sync configuration");
-        }
+            "server auto-sync echo mismatch: reported=%u echoed=%u (ignored)",
+            static_cast<unsigned>(g_sync_request_auto_interval_minutes),
+            static_cast<unsigned>(sync.auto_sync_interval_minutes));
     }
     ESP_LOGI(
         kTag,
@@ -972,6 +1225,7 @@ esp_err_t SyncControlPlaneV3(const std::string& token)
         kTag,
         "commit sync journal checkpoint");
     g_sync_request_id.clear();
+    g_sync_request_auto_interval_minutes = 0;
     ESP_LOGI(
         kTag,
         "v3 sync checkpoint committed: config_revision=%llu sync_cursor=%llu",
@@ -1457,8 +1711,16 @@ bool RunWordOutboxOnlyRound()
     if (!LoadUsableToken(&token)) {
         // Pairing/bootstrap owns identity recovery. Escalate the next round
         // instead of making the outbox-only path imitate the control plane.
-        g_full_sync_requested.store(true, std::memory_order_release);
-        g_last_word_outbox_upload_state = WordOutboxUploadState::kPending;
+        // Mark the upload pass drained-for-now so the generic outbox re-arm
+        // does not create an immediate no-token loop that bypasses claim
+        // polling backoff. The durable heads remain on flash; the escalated
+        // full round uploads them after identity recovery (and boot probes
+        // re-arm them if the device sleeps/restarts first).
+        g_full_sync_reasons.fetch_or(
+            kFullSyncCredentials, std::memory_order_release);
+        g_last_word_outbox_upload_state = WordOutboxUploadState::kDrained;
+        g_last_note_outbox_upload_state = WordOutboxUploadState::kDrained;
+        g_last_problem_outbox_upload_state = WordOutboxUploadState::kDrained;
         return false;
     }
     g_last_word_outbox_upload_state = UploadPendingWordObservations(token);
@@ -1531,49 +1793,55 @@ bool RunSyncRound()
     return true;
 }
 
-TickType_t NextSyncWaitDelay(bool round_synced, bool has_token_after_round)
+TickType_t OutboxWaitDelay()
 {
-    TickType_t wait_delay = portMAX_DELAY;
+#if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
+    if (!g_word_outbox_sync_requested.load(std::memory_order_acquire)) {
+        return portMAX_DELAY;
+    }
+    if (g_outbox_immediate_requested.load(std::memory_order_acquire)) {
+        return 0;
+    }
+    const TickType_t retry_delay = std::min(
+        std::min(WordOutboxRetryWaitDelay(), NoteOutboxRetryWaitDelay()),
+        ProblemOutboxRetryWaitDelay());
+    // A requested outbox round with no retry cursor is new work (or another
+    // batch behind the per-round cap), not an infinite wait. A finite cursor
+    // is a real transport/server backoff and remains authoritative.
+    return retry_delay == portMAX_DELAY ? 0 : retry_delay;
+#else
+    return portMAX_DELAY;
+#endif
+}
+
+TickType_t SchedulerWaitDelay()
+{
+    if (g_full_sync_reasons.load(std::memory_order_acquire) != 0) {
+        return 0;
+    }
+    const TickType_t retry_delay = FullSyncRetryWaitDelay();
+    const TickType_t full_delay = retry_delay != portMAX_DELAY
+        ? retry_delay
+        : PeriodicSyncWaitDelay(
+              g_auto_sync_interval_minutes.load(std::memory_order_acquire));
+    return std::min(full_delay, OutboxWaitDelay());
+}
+
+uint32_t FullSyncFailureRetryMs(bool has_token_after_round)
+{
 #if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
     if (g_control_retry_after_ms > 0) {
         const uint32_t retry_after_ms = g_control_retry_after_ms;
         g_control_retry_after_ms = 0;
-        wait_delay = pdMS_TO_TICKS(retry_after_ms);
-    } else
-#endif
+        return std::max<uint32_t>(1000, retry_after_ms);
+    }
     if (!has_token_after_round) {
-#if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
-        const uint32_t wait_ms = g_claim_active
+        return g_claim_active
             ? ClaimPollDelayMs()
             : AddClaimJitter(kClaimRetryBaseMs);
-        wait_delay = pdMS_TO_TICKS(wait_ms);
-#else
-        // [power-fix] Once the device has lost (or never had) an access
-        // token it is in provisioning mode. Polling the server every 2s
-        // serves no purpose -- the device cannot authenticate -- and it
-        // keeps the CPU + radio hot for no benefit. Block on the
-        // notification until something (e.g. a fresh token save in
-        // wqn::SaveAccessToken) wakes us back up.
-        wait_delay = portMAX_DELAY;
-#endif
-    } else if (round_synced) {
-        wait_delay = wqn::services::GetConfiguredSyncDelayTicks();
-    } else {
-        const TickType_t configured_delay =
-            wqn::services::GetConfiguredSyncDelayTicks();
-        wait_delay = configured_delay == portMAX_DELAY
-            ? portMAX_DELAY
-            : kSyncRetryDelay;
-    }
-
-#if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
-    if (has_token_after_round) {
-        wait_delay = std::min(wait_delay, WordOutboxRetryWaitDelay());
-        wait_delay = std::min(wait_delay, NoteOutboxRetryWaitDelay());
-        wait_delay = std::min(wait_delay, ProblemOutboxRetryWaitDelay());
     }
 #endif
-    return wait_delay;
+    return static_cast<uint32_t>(kSyncRetryDelay * portTICK_PERIOD_MS);
 }
 
 void SyncServiceTask(void*)
@@ -1581,12 +1849,13 @@ void SyncServiceTask(void*)
     ESP_LOGI(kTag, "SyncService task started");
     SetSyncTaskRunning();
     SetSyncStatus("idle");
-    bool first_round = true;
     while (true) {
-        if (first_round && wqn::services::GetConfiguredSyncDelayTicks() == portMAX_DELAY && wqn::services::HasUsableStoredToken()) {
-            ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        const TickType_t wait_delay = SchedulerWaitDelay();
+        if (wait_delay != 0) {
+            SetSyncStatus(wait_delay == portMAX_DELAY ? "idle" : "scheduled-wait");
+            ulTaskNotifyTake(pdTRUE, wait_delay);
+            continue;
         }
-        first_round = false;
 
         wqn::runtime::SleepLease sleep_lease =
             wqn::runtime::SleepLease::TryAcquire(
@@ -1601,10 +1870,43 @@ void SyncServiceTask(void*)
         // A lease failure means the device is quiescing; consuming these
         // flags before that point used to silently lose manual sync and
         // outbox requests.
-        const bool full_requested =
-            g_full_sync_requested.exchange(false, std::memory_order_acq_rel);
-        const bool word_outbox_requested =
-            g_word_outbox_sync_requested.exchange(false, std::memory_order_acq_rel);
+        const uint32_t full_reasons =
+            g_full_sync_reasons.exchange(0, std::memory_order_acq_rel);
+        const bool retry_due = FullSyncRetryDue();
+        const uint32_t interval_minutes =
+            g_auto_sync_interval_minutes.load(std::memory_order_acquire);
+        const bool periodic_due = !retry_due &&
+            FullSyncRetryWaitDelay() == portMAX_DELAY &&
+            PeriodicScheduleDue(interval_minutes);
+        const bool full_requested = full_reasons != 0 || retry_due || periodic_due;
+        if (full_requested) {
+            ClearFullSyncRetry();
+        }
+        bool word_outbox_requested = false;
+        if (full_requested || OutboxWaitDelay() == 0) {
+            // Consume the urgency payload before the release-published ready
+            // flag. If a producer lands between these exchanges, its ready
+            // flag is either consumed with urgency left armed for one harmless
+            // follow-up, or remains set for the next round; it is never lost.
+            g_outbox_immediate_requested.exchange(
+                false, std::memory_order_acq_rel);
+            word_outbox_requested =
+                g_word_outbox_sync_requested.exchange(
+                    false, std::memory_order_acq_rel);
+        }
+        if (!full_requested && !word_outbox_requested) {
+            sleep_lease.Reset();
+            continue;
+        }
+        ESP_LOGI(
+            kTag,
+            "sync dispatch: full=%d reasons=0x%lx periodic=%d retry=%d outbox=%d interval=%u",
+            full_requested ? 1 : 0,
+            static_cast<unsigned long>(full_reasons),
+            periodic_due ? 1 : 0,
+            retry_due ? 1 : 0,
+            word_outbox_requested ? 1 : 0,
+            static_cast<unsigned>(interval_minutes));
 #if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
         const bool outbox_only = word_outbox_requested && !full_requested;
 #else
@@ -1643,8 +1945,16 @@ void SyncServiceTask(void*)
                     ? wqn::services::SyncEventScope::kWordOutbox
                     : wqn::services::SyncEventScope::kFull);
         }
-        sleep_lease.Reset();
-        TickType_t delay = NextSyncWaitDelay(synced, has_token_after_round);
+        if (!outbox_only) {
+            if (synced) {
+                ClearFullSyncRetry();
+                ScheduleNextPeriodicSync(
+                    g_auto_sync_interval_minutes.load(std::memory_order_acquire));
+            } else {
+                ScheduleFullSyncRetry(
+                    FullSyncFailureRetryMs(has_token_after_round));
+            }
+        }
 #if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
         if (g_last_word_outbox_upload_state == WordOutboxUploadState::kYielded ||
             g_last_note_outbox_upload_state == WordOutboxUploadState::kYielded ||
@@ -1653,27 +1963,27 @@ void SyncServiceTask(void*)
             // loop. Resume only after another complete quiet period.
             if (g_word_outbox_timer == nullptr ||
                 xTimerReset(g_word_outbox_timer, 0) != pdPASS) {
+                g_outbox_immediate_requested.store(
+                    true, std::memory_order_relaxed);
                 g_word_outbox_sync_requested.store(true, std::memory_order_release);
-                delay = std::min(delay, pdMS_TO_TICKS(100));
+                if (g_sync_service_task != nullptr) {
+                    xTaskNotifyGive(g_sync_service_task);
+                }
             }
         } else if (
             g_last_word_outbox_upload_state == WordOutboxUploadState::kPending ||
             g_last_note_outbox_upload_state == WordOutboxUploadState::kPending ||
             g_last_problem_outbox_upload_state == WordOutboxUploadState::kPending) {
             g_word_outbox_sync_requested.store(true, std::memory_order_release);
-            const TickType_t retry_delay = std::min(
-                std::min(WordOutboxRetryWaitDelay(), NoteOutboxRetryWaitDelay()),
-                ProblemOutboxRetryWaitDelay());
-            delay = std::min(
-                delay,
-                retry_delay == portMAX_DELAY ? pdMS_TO_TICKS(100) : retry_delay);
+            if (g_sync_service_task != nullptr) {
+                xTaskNotifyGive(g_sync_service_task);
+            }
         }
 #endif
-        if (delay == portMAX_DELAY) {
-            ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-        } else {
-            ulTaskNotifyTake(pdTRUE, delay);
-        }
+        // Publish every retry/outbox/timer-wake obligation before releasing
+        // the online-sync SleepLease. Otherwise PowerCoordinator could close
+        // quiesce in the tiny gap and sleep without the wake reason installed.
+        sleep_lease.Reset();
     }
 }
 
@@ -1704,8 +2014,57 @@ wqn::protocol::v3::RequestMetadata MakeDeviceRequestMetadata()
 
 #if CONFIG_WQN_WIFI_STA_ENABLE
 
+bool ShouldStartConnectivityAtBoot()
+{
+    uint32_t interval_minutes = 0;
+    if (wqn::LoadAutoSyncIntervalMinutes(&interval_minutes) != ESP_OK) {
+        // A settings read failure is not a reason to make a timer wake go
+        // offline forever; connect once so diagnostics/control can recover.
+        interval_minutes = 0;
+        g_auto_sync_interval_minutes.store(0, std::memory_order_release);
+        g_boot_outbox_pending.store(true, std::memory_order_release);
+        g_boot_policy_evaluated.store(true, std::memory_order_release);
+        return true;
+    }
+    g_auto_sync_interval_minutes.store(interval_minutes, std::memory_order_release);
+    const bool outbox_pending = ProbeDurableOutboxWork();
+    g_boot_outbox_pending.store(outbox_pending, std::memory_order_release);
+
+    wqn::SyncJournal journal;
+    const esp_err_t journal_result = wqn::LoadSyncJournal(&journal);
+    const bool content_pending = journal_result != ESP_OK ||
+        JournalHasPendingContent(journal);
+    g_boot_policy_evaluated.store(true, std::memory_order_release);
+
+    const wqn::runtime::WakeContext& wake = wqn::runtime::GetWakeContext();
+    if (wake.kind != wqn::runtime::WakeKind::kScheduledTimer) {
+        return true;
+    }
+    if (!HasUsableStoredToken()) {
+        ESP_LOGI(kTag, "timer wake keeps WiFi off: device is not paired");
+        return false;
+    }
+    const bool periodic_due = PeriodicScheduleDue(interval_minutes);
+    const bool retry_due = FullSyncRetryDue();
+    const bool should_connect = periodic_due || retry_due || outbox_pending ||
+        content_pending;
+    ESP_LOGI(
+        kTag,
+        "timer-wake connectivity admission: connect=%d periodic=%d retry=%d outbox=%d content=%d interval=%u",
+        should_connect ? 1 : 0,
+        periodic_due ? 1 : 0,
+        retry_due ? 1 : 0,
+        outbox_pending ? 1 : 0,
+        content_pending ? 1 : 0,
+        static_cast<unsigned>(interval_minutes));
+    return should_connect;
+}
+
 esp_err_t StartSyncService()
 {
+    if (!g_boot_policy_evaluated.load(std::memory_order_acquire)) {
+        (void)ShouldStartConnectivityAtBoot();
+    }
     if (g_sync_journal_mutex == nullptr) {
         g_sync_journal_mutex =
             xSemaphoreCreateMutexStatic(&g_sync_journal_mutex_storage);
@@ -1714,6 +2073,13 @@ esp_err_t StartSyncService()
         }
     }
     ESP_RETURN_ON_ERROR(EnsureSyncJournalLoaded(), kTag, "load sync journal");
+    if (!wqn::runtime::GetWakeContext().deep_sleep_resume) {
+        g_full_sync_reasons.fetch_or(kFullSyncBoot, std::memory_order_release);
+    }
+    if (g_boot_outbox_pending.load(std::memory_order_acquire)) {
+        g_outbox_immediate_requested.store(true, std::memory_order_relaxed);
+        g_word_outbox_sync_requested.store(true, std::memory_order_release);
+    }
     if (g_word_outbox_timer == nullptr) {
         g_word_outbox_timer = xTimerCreateStatic(
             "word_outbox",
@@ -1745,10 +2111,161 @@ esp_err_t StartSyncService()
 void RequestSyncNow()
 {
 #if CONFIG_WQN_WIFI_STA_ENABLE
-    g_full_sync_requested.store(true, std::memory_order_release);
+    g_full_sync_reasons.fetch_or(kFullSyncManual, std::memory_order_release);
     if (g_sync_service_task != nullptr) {
         xTaskNotifyGive(g_sync_service_task);
     }
+#endif
+}
+
+void NotifySyncCredentialsChanged()
+{
+#if CONFIG_WQN_WIFI_STA_ENABLE
+    g_full_sync_reasons.fetch_or(
+        kFullSyncCredentials, std::memory_order_release);
+    if (g_sync_service_task != nullptr) {
+        xTaskNotifyGive(g_sync_service_task);
+    }
+#endif
+}
+
+void NotifySyncConnectivityAvailable()
+{
+#if CONFIG_WQN_WIFI_STA_ENABLE
+    if (g_sync_service_task != nullptr) {
+        xTaskNotifyGive(g_sync_service_task);
+    }
+#endif
+}
+
+void NotifyAutoSyncIntervalChanged(uint32_t minutes)
+{
+#if CONFIG_WQN_WIFI_STA_ENABLE
+    if (minutes != 0 && minutes != 15 && minutes != 30 && minutes != 60 &&
+        minutes != 240) {
+        ESP_LOGW(kTag, "ignore invalid auto-sync interval: %u",
+                 static_cast<unsigned>(minutes));
+        return;
+    }
+    g_auto_sync_interval_minutes.store(minutes, std::memory_order_release);
+    ScheduleNextPeriodicSync(minutes);
+    if (g_sync_service_task != nullptr) {
+        xTaskNotifyGive(g_sync_service_task);
+    }
+#else
+    (void)minutes;
+#endif
+}
+
+uint32_t SecondsUntilNextSyncWake()
+{
+#if CONFIG_WQN_WIFI_STA_ENABLE
+    if (g_full_sync_reasons.load(std::memory_order_acquire) != 0) {
+        return 1;
+    }
+    uint32_t next_seconds = UINT32_MAX;
+    if (g_word_outbox_sync_requested.load(std::memory_order_acquire)) {
+        const TickType_t outbox_ticks = OutboxWaitDelay();
+        next_seconds = outbox_ticks == 0
+            ? 1
+            : (outbox_ticks == portMAX_DELAY
+                   ? 60
+                   : std::max<uint32_t>(
+                         1,
+                         (static_cast<uint64_t>(outbox_ticks) *
+                              portTICK_PERIOD_MS +
+                          999) /
+                             1000));
+    }
+    uint32_t retry_magic = 0;
+    int64_t retry_due_seconds = 0;
+    uint32_t schedule_magic = 0;
+    uint32_t scheduled_interval = 0;
+    int64_t periodic_due_seconds = 0;
+    taskENTER_CRITICAL(&g_periodic_schedule_lock);
+    retry_magic = g_full_sync_retry_magic;
+    retry_due_seconds = g_full_sync_retry_unix_seconds;
+    schedule_magic = g_periodic_schedule_magic;
+    scheduled_interval = g_periodic_schedule_interval_minutes;
+    periodic_due_seconds = g_next_periodic_sync_unix_seconds;
+    taskEXIT_CRITICAL(&g_periodic_schedule_lock);
+    uint32_t content_seconds = UINT32_MAX;
+    const int64_t now_ms = esp_timer_get_time() / 1000;
+    taskENTER_CRITICAL(&g_sync_snapshot_lock);
+    const auto include_content =
+        [now_ms, &content_seconds](const SyncContentSnapshot& snapshot) {
+            if (snapshot.desired_revision <= snapshot.applied_revision ||
+                snapshot.phase == SyncContentPhase::kBlocked) {
+                return;
+            }
+            uint32_t seconds = 1;
+            if (snapshot.phase == SyncContentPhase::kBackoff &&
+                snapshot.next_retry_ms > now_ms) {
+                seconds = static_cast<uint32_t>(std::max<int64_t>(
+                    1, (snapshot.next_retry_ms - now_ms + 999) / 1000));
+            }
+            content_seconds = std::min(content_seconds, seconds);
+        };
+    include_content(g_sync_snapshot.word_packs);
+    include_content(g_sync_snapshot.note_packs);
+    include_content(g_sync_snapshot.problem_packs);
+    taskEXIT_CRITICAL(&g_sync_snapshot_lock);
+    next_seconds = std::min(next_seconds, content_seconds);
+
+    const std::time_t now = CurrentUnixSeconds();
+    const auto seconds_until = [now](int64_t due_seconds) -> uint32_t {
+        if (due_seconds == 0) {
+            return UINT32_MAX;
+        }
+        if (now < kMinScheduleUnixTime || static_cast<int64_t>(now) >= due_seconds) {
+            return 1;
+        }
+        return static_cast<uint32_t>(std::min<int64_t>(
+            UINT32_MAX,
+            due_seconds - static_cast<int64_t>(now)));
+    };
+    if (retry_magic == kFullRetryMagic) {
+        uint32_t retry_seconds = UINT32_MAX;
+        if (retry_due_seconds >= static_cast<int64_t>(kMinScheduleUnixTime) &&
+            now >= kMinScheduleUnixTime) {
+            retry_seconds = seconds_until(retry_due_seconds);
+        } else {
+            const int64_t remaining_ms =
+                g_full_sync_retry_not_before_ms.load(std::memory_order_acquire) -
+                esp_timer_get_time() / 1000;
+            retry_seconds = remaining_ms <= 0
+                ? 1
+                : static_cast<uint32_t>(std::min<int64_t>(
+                      UINT32_MAX, (remaining_ms + 999) / 1000));
+        }
+        next_seconds = std::min(next_seconds, retry_seconds);
+    }
+    const uint32_t interval_minutes =
+        g_auto_sync_interval_minutes.load(std::memory_order_acquire);
+    if (interval_minutes != 0) {
+        const bool schedule_matches =
+            schedule_magic == kPeriodicScheduleMagic &&
+            scheduled_interval == interval_minutes;
+        const uint32_t periodic_seconds = !schedule_matches
+            ? 1
+            : periodic_due_seconds >= static_cast<int64_t>(kMinScheduleUnixTime) &&
+                    now >= kMinScheduleUnixTime
+                ? seconds_until(periodic_due_seconds)
+                : [&]() -> uint32_t {
+                    const int64_t remaining_ms =
+                        g_next_periodic_sync_not_before_ms.load(
+                            std::memory_order_acquire) -
+                        esp_timer_get_time() / 1000;
+                    return remaining_ms <= 0
+                        ? 1
+                        : static_cast<uint32_t>(std::min<int64_t>(
+                              UINT32_MAX, (remaining_ms + 999) / 1000));
+                }();
+        next_seconds = std::min(next_seconds, periodic_seconds);
+    }
+    return next_seconds == UINT32_MAX ? 0 : next_seconds;
+#else
+    return 0;
 #endif
 }
 
@@ -1760,6 +2277,8 @@ void RequestContentRefresh(SyncContentDomain domain)
         return;
     }
     g_content_refresh_requested.fetch_or(bit, std::memory_order_release);
+    g_full_sync_reasons.fetch_or(
+        kFullSyncContentRefresh, std::memory_order_release);
     taskENTER_CRITICAL(&g_sync_snapshot_lock);
     SyncContentSnapshot* snapshot = nullptr;
     switch (domain) {
@@ -1978,6 +2497,7 @@ void RequestWordOutboxUpload()
     }
     // Timer command queue pressure must not strand a durable observation.
     // Fall back to an immediate outbox-only notification.
+    g_outbox_immediate_requested.store(true, std::memory_order_relaxed);
     g_word_outbox_sync_requested.store(true, std::memory_order_release);
     if (g_sync_service_task != nullptr) {
         xTaskNotifyGive(g_sync_service_task);
@@ -1996,6 +2516,7 @@ void RequestNoteOutboxUpload()
     }
     // Timer command queue pressure must not strand a durable observation.
     // Fall back to an immediate outbox-only notification.
+    g_outbox_immediate_requested.store(true, std::memory_order_relaxed);
     g_word_outbox_sync_requested.store(true, std::memory_order_release);
     if (g_sync_service_task != nullptr) {
         xTaskNotifyGive(g_sync_service_task);
@@ -2014,6 +2535,7 @@ void RequestProblemOutboxUpload()
     }
     // Timer command queue pressure must not strand a durable observation.
     // Fall back to an immediate outbox-only notification.
+    g_outbox_immediate_requested.store(true, std::memory_order_relaxed);
     g_word_outbox_sync_requested.store(true, std::memory_order_release);
     if (g_sync_service_task != nullptr) {
         xTaskNotifyGive(g_sync_service_task);
@@ -2030,25 +2552,12 @@ void GetSyncSnapshot(SyncSnapshot* snapshot)
     taskENTER_CRITICAL(&g_sync_snapshot_lock);
     *snapshot = g_sync_snapshot;
     taskEXIT_CRITICAL(&g_sync_snapshot_lock);
+    snapshot->interval_minutes =
+        g_auto_sync_interval_minutes.load(std::memory_order_acquire);
 #else
     *snapshot = {};
     std::snprintf(snapshot->status, sizeof(snapshot->status), "%s", "wifi-disabled");
 #endif
-    uint32_t minutes = 0;
-    if (LoadAutoSyncIntervalMinutes(&minutes) == ESP_OK) {
-        snapshot->interval_minutes = minutes;
-    }
-}
-
-TickType_t GetConfiguredSyncDelayTicks()
-{
-    uint32_t minutes = 0;
-    if (LoadAutoSyncIntervalMinutes(&minutes) != ESP_OK || minutes == 0) {
-        return portMAX_DELAY;
-    }
-    const uint64_t milliseconds = static_cast<uint64_t>(minutes) * 60ULL * 1000ULL;
-    const uint64_t ticks = milliseconds / portTICK_PERIOD_MS;
-    return ticks > static_cast<uint64_t>(portMAX_DELAY - 1) ? portMAX_DELAY - 1 : static_cast<TickType_t>(ticks);
 }
 
 }  // namespace wqn::services

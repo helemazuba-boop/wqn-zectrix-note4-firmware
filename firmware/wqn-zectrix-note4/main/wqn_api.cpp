@@ -1520,6 +1520,7 @@ esp_err_t BootstrapDeviceControlV3(
 esp_err_t SyncDeviceControlV3(
     const std::string& token,
     const protocol::v3::RequestMetadata& metadata,
+    uint32_t auto_sync_interval_minutes,
     protocol::v3::SyncData* data,
     protocol::v3::Error* error)
 {
@@ -1531,7 +1532,8 @@ esp_err_t SyncDeviceControlV3(
 
     std::string request_body;
     ESP_RETURN_ON_ERROR(
-        protocol::v3::BuildSyncRequest(metadata, &request_body),
+        protocol::v3::BuildSyncRequest(
+            metadata, auto_sync_interval_minutes, &request_body),
         kTag,
         "build v3 sync");
     int status_code = 0;

@@ -309,9 +309,15 @@ generation, valid id) — never replay a corrupt marker as a real change.
   busy clears only after the UI acks (no silent terminal-result loss). Mirror
   this for any new network-backed screen; do not reintroduce a shared result
   queue.
-- **Sync** (`services::StartSyncService`): owns claim → bootstrap → sync; parks
-  on `portMAX_DELAY`; wake via `services::RequestSyncNow()`; consumers get
-  fixed-size `SyncEvent` values or an immutable `SyncSnapshot`.
+- **Sync** (`services::StartSyncService`): owns claim → bootstrap → full sync
+  and the three durable observation outboxes. It dispatches only from an
+  explicit manual/boot/content reason, an RTC-retained periodic deadline, a
+  retained failure retry, or a due outbox; a connectivity notification is
+  readiness only and never invents a full-sync reason. The device setting is
+  locally authoritative and is reported/echoed by protocol v3. Before deep
+  sleep, `SecondsUntilNextSyncWake()` contributes the earliest sync deadline
+  to wake-source assembly. Consumers get fixed-size `SyncEvent` values or an
+  immutable `SyncSnapshot`; snapshot reads must not fall through to NVS.
 - **Refresh terminal results**: every accepted display revision ends in exactly
   one `Presented` / `Superseded` / `Failed`. One reset/re-init/full retry is
   allowed; cold/untrusted wake and every Nth partial force a full refresh.

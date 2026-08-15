@@ -87,6 +87,22 @@ bool ScreenSupportsTimerSkip(wqn::UiScreen screen)
            screen == wqn::UiScreen::kTodo;
 }
 
+bool IsBackgroundSyncTimerWake(
+    const wqn::runtime::WakeContext& wake)
+{
+    if (wake.kind != wqn::runtime::WakeKind::kScheduledTimer ||
+        !wake.panel_cache_trusted || !wake.requested_timer_wakeup ||
+        wake.requested_display_timer_wakeup) {
+        return false;
+    }
+    // A calendar alarm shares the RTC interrupt pin with the countdown timer.
+    // Only suppress the panel for the exact timer source armed by the sync
+    // scheduler; a coincident/independent alarm stays conservative and renders.
+    return wake.raw_cause == ESP_SLEEP_WAKEUP_TIMER ||
+        (wake.raw_cause == ESP_SLEEP_WAKEUP_EXT1 && wake.pcf_flags_valid &&
+         wake.pcf_timer && !wake.pcf_alarm);
+}
+
 bool TrySkipInitRefresh(wqn::UiScreen screen, const char* clock_label)
 {
     using device_ui_internal::g_rtc_last_rendered_screen_id;
@@ -101,6 +117,12 @@ bool TrySkipInitRefresh(wqn::UiScreen screen, const char* clock_label)
              g_rtc_last_rendered_screen_id, g_rtc_last_rendered_clock);
     if (wake.kind != wqn::runtime::WakeKind::kScheduledTimer || !wake.panel_cache_trusted) {
         return false;
+    }
+    if (IsBackgroundSyncTimerWake(wake)) {
+        ESP_LOGI(
+            "wqn_ui",
+            "Init refresh skipped: background sync timer wake keeps cached panel untouched");
+        return true;
     }
     if (!ScreenSupportsTimerSkip(screen)) {
         return false;
@@ -411,13 +433,19 @@ void DeviceUiTask(void*)
     // [input-capture] Cloud results and sync events wake this same task.
     device_ui_internal::SetUiTaskToNotify(xTaskGetCurrentTaskHandle());
 
-    result = wqn::InitEpdDisplay();
-    if (result != ESP_OK) {
-        ESP_LOGE(kTag, "EPD display init failed: %s", esp_err_to_name(result));
-        vTaskDelete(nullptr);
-        return;
+    const wqn::runtime::WakeContext& wake = wqn::runtime::GetWakeContext();
+    const bool background_timer_wake = IsBackgroundSyncTimerWake(wake);
+    if (!background_timer_wake) {
+        result = wqn::InitEpdDisplay();
+        if (result != ESP_OK) {
+            ESP_LOGE(kTag, "EPD display init failed: %s", esp_err_to_name(result));
+            vTaskDelete(nullptr);
+            return;
+        }
+    } else {
+        ESP_LOGI(kTag, "background sync timer wake: deferring EPD initialization");
     }
-    ESP_LOGI(kTag, "EPD display init OK, preparing first frame");
+    ESP_LOGI(kTag, "EPD display setup ready, preparing first frame");
 
     device_ui_internal::UiRuntime& ui_runtime = g_ui_runtime;
     ESP_LOGI(kTag, "DeviceUiTask: calling LoadUiState");
@@ -806,7 +834,7 @@ void DeviceUiTask(void*)
         }
 
         // [persist-worker] Drain the async settings save results (c4). Success
-        // installs the value + "已保存" (auto-sync also kicks RequestSyncNow);
+        // installs the value + "已保存" and re-arms the durable schedule;
         // failure keeps the displayed value and asks for a re-Confirm.
         {
             device_ui_internal::PersistResultReceipt settings_persist;
@@ -924,8 +952,17 @@ wqn::AiStreamingStatusView streaming_view{};
             // state.time_app / home.primary_time_line above, but the on-screen
             // pixels are already correct -- suppress the refresh request so we
             // don't fall into the deep-sleep-induced forced-full-refresh path.
+            // A minute tick and the default deep-sleep idle threshold both
+            // occur at 60 seconds. Letting this cosmetic refresh acquire the
+            // display SleepLease first can starve quiesce forever: every
+            // minute creates another render just as sleep becomes eligible.
+            // Keep state.time_app current, but yield the panel update once the
+            // battery-powered device is actually ready to sleep. A timer wake
+            // still renders the current minute through the initial-refresh
+            // path before this loop runs.
             const bool minute_changed_on_panel =
-                !ShouldSkipMinuteTickRefresh(state.screen, clock_label.c_str());
+                !ShouldSkipMinuteTickRefresh(state.screen, clock_label.c_str()) &&
+                !wqn::ShouldYieldClockRefreshToDeepSleep();
             const device_ui_internal::UiUpdate update =
                 ui_runtime.DispatchClockMinute(minute_changed_on_panel);
             refresh_schedule = StrongerSchedule(refresh_schedule, update.refresh);
@@ -1176,8 +1213,9 @@ wqn::AiStreamingStatusView streaming_view{};
         vTaskDelay(pdMS_TO_TICKS(10));
 
         g_rtc_screen_val = static_cast<int>(state.screen);
-        const bool enable_timer_wakeup = (state.screen == wqn::UiScreen::kHome ||
-                                          state.screen == wqn::UiScreen::kTime);
+        const bool enable_timer_wakeup =
+            state.screen == wqn::UiScreen::kHome ||
+            state.screen == wqn::UiScreen::kTime;
         wqn::SetDeepSleepTimerWakePreference(enable_timer_wakeup);
 
         const int64_t idle_ms = (esp_timer_get_time() - g_last_active_us_local) / 1000;

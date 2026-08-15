@@ -87,7 +87,23 @@ struct SyncEvent {
 void GetLatestSyncEvent(SyncEvent* event);
 
 esp_err_t StartSyncService();
+// Boot admission for ConnectivityService. Scheduled timer wakes keep WiFi off
+// unless a periodic sync is due, an outbox is durable, or content convergence
+// was interrupted. Non-timer boots keep normal interactive connectivity.
+bool ShouldStartConnectivityAtBoot();
 void RequestSyncNow();
+// Token save/clear is a distinct full-sync/claim reason, not a user manual
+// request. Storage publishes it after the credential mutation commits.
+void NotifySyncCredentialsChanged();
+// Connectivity is only a readiness signal. It wakes the scheduler but does
+// not itself create a full-sync reason.
+void NotifySyncConnectivityAvailable();
+// Called after the async settings write is durably acknowledged. Re-arms the
+// absolute RTC-retained periodic deadline without forcing an immediate sync.
+void NotifyAutoSyncIntervalChanged(uint32_t minutes);
+// Read-only power policy. Returns 0 when sync needs no timer, otherwise the
+// seconds until its next durable periodic/retry/outbox/content obligation.
+uint32_t SecondsUntilNextSyncWake();
 // Arms a durable content convergence intent. The coordinator coalesces this
 // with control-sync results; callers never need to relay a completion event.
 void RequestContentRefresh(SyncContentDomain domain);
@@ -116,7 +132,6 @@ void RequestNoteOutboxUpload();
 // all three durable queues drain in one outbox-only round).
 void RequestProblemOutboxUpload();
 void GetSyncSnapshot(SyncSnapshot* snapshot);
-TickType_t GetConfiguredSyncDelayTicks();
 bool HasUsableStoredToken();
 
 // Returns metadata sharing the same per-boot identity as the control-plane

@@ -28,6 +28,10 @@ void NoteUserActivityAtMs(int64_t occurred_at_ms);
 void CheckBatteryAfterUserActivity();
 bool IsUiIdleForSleep();
 bool IsUiIdleForSleepEx(int extra_idle_ms);
+// True when an idle, battery-powered device is ready to enter deep sleep and
+// a cosmetic minute refresh should yield instead of acquiring a display
+// lease at the same threshold.
+bool ShouldYieldClockRefreshToDeepSleep();
 
 esp_err_t StartPowerCoordinator();
 // Synchronizes USB/charger status with the global sleep policy. Call once
