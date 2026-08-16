@@ -13,6 +13,7 @@
 #include "ai_history.h"
 #include "audio_capture.h"
 #include "esp_check.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -64,6 +65,19 @@ struct StdProTurnAssembly {
     bool assistant_terminal = false;
 };
 StdProTurnAssembly g_turn;
+
+void LogAiMemory(const char* stage)
+{
+    ESP_LOGI(
+        kTag,
+        "memory stage=%s internal_free=%u internal_largest=%u psram_free=%u psram_largest=%u stack_hwm=%u",
+        stage,
+        static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
+        static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)),
+        static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)),
+        static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM)),
+        static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
+}
 
 std::string ThinkingLabel(const std::string& text)
 {
@@ -434,7 +448,7 @@ void FinishPrepareTaskLocked(uint32_t generation)
 
 bool HasEffectiveSpeech(const wqn::AudioCaptureChunk& audio)
 {
-    return audio.duration_ms >= kMinAudioDurationMs && audio.samples.size() >= kMinAudioSamples &&
+    return audio.duration_ms >= kMinAudioDurationMs && audio.sample_count >= kMinAudioSamples &&
            audio.peak >= kMinAudioPeak &&
            audio.rms >= kMinAudioRms;
 }
@@ -621,6 +635,7 @@ void LoadTodaySessionLocked()
 
 void SubmitTask(void*)
 {
+    LogAiMemory("submit-start");
     wqn::AudioCaptureChunk audio;
     esp_err_t result = wqn::StopAudioCapture(&audio);
 
@@ -637,11 +652,11 @@ void SubmitTask(void*)
     ESP_LOGI(kTag,
              "audio captured: duration_ms=%d mono_samples=%u peak=%d rms=%d",
              audio.duration_ms,
-             static_cast<unsigned>(audio.samples.size()),
+             static_cast<unsigned>(audio.sample_count),
              static_cast<int>(audio.peak),
              audio.rms);
 
-    if (audio.duration_ms < kMinAudioDurationMs || audio.samples.size() < kMinAudioSamples) {
+    if (audio.duration_ms < kMinAudioDurationMs || audio.sample_count < kMinAudioSamples) {
         wqn::ReleaseAudioCapturePower();
         SetErrorLocked("录音太短");
         FinishSubmitTaskLocked();
@@ -703,7 +718,8 @@ void SubmitTask(void*)
     // v2 SSE path
     wqn::WqnAiStreamRequest req;
     req.token = token;
-    req.pcm = audio.samples;             // vector<int16_t> copy; small relative to 80KB cap
+    req.pcm_data = audio.samples;
+    req.pcm_sample_count = audio.sample_count;
     req.duration_ms = audio.duration_ms;
     req.tier = tier_str;
     req.conversation_id = conversation_id;
@@ -724,14 +740,16 @@ void SubmitTask(void*)
     req.request_id = GenerateRequestId(); // helper below
     req.callback = &TrampolineSseEvent;
     req.user_ctx = nullptr;
+    LogAiMemory("before-sse-upload");
     submit_result = wqn::UploadAiAudioChatStream(req, &response);
+    LogAiMemory("after-sse-upload");
     used_streaming = true;
 #else
     // v1 fallback path (kept behind CONFIG_WQN_AI_V1_FALLBACK for debug compare).
     submit_result = wqn::UploadAiAudioChat(
         token,
-        reinterpret_cast<const uint8_t*>(audio.samples.data()),
-        audio.samples.size() * sizeof(int16_t),
+        reinterpret_cast<const uint8_t*>(audio.samples),
+        audio.sample_count * sizeof(int16_t),
         audio.duration_ms,
         conversation_id,
         tier_str,
@@ -973,6 +991,13 @@ namespace wqn {
 
 esp_err_t InitAiSession()
 {
+    const esp_err_t capture_buffer_result = InitAudioCaptureBuffer();
+    if (capture_buffer_result != ESP_OK) {
+        // Keep the rest of the device bootable. StartAudioCapture retries and
+        // reports a precise memory error if the early reservation ever fails.
+        ESP_LOGW(kTag, "early AI capture buffer reservation failed: %s",
+                 esp_err_to_name(capture_buffer_result));
+    }
     if (g_lock == nullptr) {
         g_lock = xSemaphoreCreateMutex();
         if (g_lock == nullptr) {
@@ -1075,6 +1100,7 @@ esp_err_t StopAiRecordingAndSubmit()
     SetStateLocked(AiSessionStatus::kWaitingReply, "正在停止录音...", "", "");
     xSemaphoreGive(g_lock);
 
+    LogAiMemory("before-submit-task-create");
     const BaseType_t created = xTaskCreate(SubmitTask, "wqn_ai_submit", 12288, nullptr, 5, &g_submit_task);
     if (created != pdPASS) {
         AudioCaptureChunk discarded;

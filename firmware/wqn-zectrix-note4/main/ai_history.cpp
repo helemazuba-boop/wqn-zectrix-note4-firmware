@@ -70,6 +70,8 @@ esp_err_t AiHistory::Init(size_t cap_bytes)
     messages_.clear();
     next_message_id_ = 1;
     revision_ = 0;
+    cached_snapshot_.reset();
+    cached_snapshot_revision_ = UINT64_MAX;
     initialized_ = true;
     ESP_LOGI(kTag, "Init cap=%zu bytes psram=%d", cap_bytes_, heap_.using_psram() ? 1 : 0);
     xSemaphoreGive(mutex_);
@@ -239,9 +241,17 @@ bool AiHistory::PopLastIf(ChatMessageKind kind)
 
 std::shared_ptr<const AiHistorySnapshot> AiHistory::Snapshot() const
 {
-    auto snapshot = std::make_shared<AiHistorySnapshot>();
-    if (mutex_ == nullptr) return snapshot;
+    if (mutex_ == nullptr) return std::make_shared<AiHistorySnapshot>();
     xSemaphoreTake(mutex_, portMAX_DELAY);
+    // [ai-memory-fix] RenderUiFrame can be called more than once while
+    // comparing signatures. Reuse the immutable DTO until history changes
+    // instead of rebuilding every string/vector on each comparison.
+    if (cached_snapshot_ != nullptr && cached_snapshot_revision_ == revision_) {
+        const std::shared_ptr<const AiHistorySnapshot> cached = cached_snapshot_;
+        xSemaphoreGive(mutex_);
+        return cached;
+    }
+    auto snapshot = std::make_shared<AiHistorySnapshot>();
     snapshot->revision = revision_;
     snapshot->messages.reserve(messages_.size());
     for (const ChatMessage& msg : messages_) {
@@ -257,6 +267,8 @@ std::shared_ptr<const AiHistorySnapshot> AiHistory::Snapshot() const
         out.tool_ok = msg.tool_ok;
         snapshot->messages.push_back(std::move(out));
     }
+    cached_snapshot_ = snapshot;
+    cached_snapshot_revision_ = revision_;
     xSemaphoreGive(mutex_);
     return snapshot;
 }

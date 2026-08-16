@@ -367,13 +367,14 @@ esp_err_t UploadAiAudioChatStream(const WqnAiStreamRequest& request,
   if (!wqn::IsValidAccessToken(request.token)) {
     return ESP_ERR_INVALID_STATE;
   }
-  if (request.pcm.empty() || request.duration_ms <= 0) {
+  if (request.pcm_data == nullptr || request.pcm_sample_count == 0 ||
+      request.duration_ms <= 0) {
     return ESP_ERR_INVALID_ARG;
   }
 
   const uint8_t* pcm_bytes =
-      reinterpret_cast<const uint8_t*>(request.pcm.data());
-  const size_t pcm_size = request.pcm.size() * sizeof(int16_t);
+      reinterpret_cast<const uint8_t*>(request.pcm_data);
+  const size_t pcm_size = request.pcm_sample_count * sizeof(int16_t);
 
   // Build the URL with the protocol query so v2 servers unambiguously switch.
   std::string url = std::string(WQN_API_BASE) + WQN_AI_SSE_REQUEST_PATH +

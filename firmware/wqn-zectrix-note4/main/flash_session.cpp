@@ -18,7 +18,9 @@
 #include "config.h"
 #include "esp_check.h"
 #include "esp_crt_bundle.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_websocket_client.h"
 #include "esp_tls.h"
@@ -30,6 +32,10 @@
 #include "services/connectivity_service.h"
 #include "storage.h"
 #include "audio_volume.h"
+
+namespace wqn {
+esp_err_t StopFlashSessionNow();
+}
 
 namespace {
 
@@ -178,6 +184,7 @@ wqn::services::AudioSession g_flash_audio_session;
 
 enum class FlashTerminalReason : uint8_t {
     kNone,
+    kIntentional,
     kDisconnected,
     kTransportError,
     kServerError,
@@ -190,6 +197,10 @@ TaskHandle_t g_lifecycle_task = nullptr;
 std::atomic<FlashTerminalReason> g_terminal_reason{
     FlashTerminalReason::kNone};
 std::atomic<bool> g_intentional_stop{false};
+std::atomic<bool> g_teardown_pending{false};
+std::atomic<bool> g_restart_after_teardown{false};
+std::atomic<uint32_t> g_session_generation{0};
+std::atomic<uint32_t> g_terminal_generation{0};
 
 void SetErrorLocked(const std::string& message);
 
@@ -219,15 +230,68 @@ void FlashLifecycleTask(void*)
         if (reason == FlashTerminalReason::kNone) {
             continue;
         }
-        const esp_err_t stop_result = wqn::StopFlashSession();
-        xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
-        SetErrorLocked(FlashTerminalMessage(reason));
+        const uint32_t generation =
+            g_terminal_generation.load(std::memory_order_acquire);
+        if (generation != g_session_generation.load(std::memory_order_acquire)) {
+            ESP_LOGW(kTag, "discard stale Flash teardown generation=%lu active=%lu",
+                     static_cast<unsigned long>(generation),
+                     static_cast<unsigned long>(
+                         g_session_generation.load(std::memory_order_relaxed)));
+            continue;
+        }
+
+        g_intentional_stop.store(true, std::memory_order_release);
+        const int64_t deadline_us = esp_timer_get_time() + 30LL * 1000 * 1000;
+        esp_err_t stop_result = ESP_FAIL;
+        uint32_t attempts = 0;
+        do {
+            ++attempts;
+            stop_result = wqn::StopFlashSessionNow();
+            if (stop_result == ESP_OK) {
+                break;
+            }
+            ESP_LOGW(kTag,
+                     "Flash teardown deferred: generation=%lu attempt=%lu error=%s",
+                     static_cast<unsigned long>(generation),
+                     static_cast<unsigned long>(attempts),
+                     esp_err_to_name(stop_result));
+            vTaskDelay(pdMS_TO_TICKS(250));
+        } while (esp_timer_get_time() < deadline_us &&
+                 generation == g_session_generation.load(std::memory_order_acquire));
+
         if (stop_result != ESP_OK) {
-            g_flash.error_message += "（清理失败：";
-            g_flash.error_message += esp_err_to_name(stop_result);
-            g_flash.error_message += "）";
+            // [audio-lease-fix] A live task may still enter a wrapper with its
+            // session token, so deleting its I2S handle would be a UAF. A
+            // controlled restart is the only bounded safe recovery after the
+            // lifecycle task has retried for 30 seconds.
+            ESP_LOGE(
+                kTag,
+                "Flash teardown stuck; controlled restart: generation=%lu attempts=%lu error=%s internal_free=%u psram_free=%u",
+                static_cast<unsigned long>(generation),
+                static_cast<unsigned long>(attempts),
+                esp_err_to_name(stop_result),
+                static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
+                static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)));
+            vTaskDelay(pdMS_TO_TICKS(100));
+            esp_restart();
+        }
+
+        g_teardown_pending.store(false, std::memory_order_release);
+        g_intentional_stop.store(false, std::memory_order_release);
+        const bool restart =
+            g_restart_after_teardown.exchange(false, std::memory_order_acq_rel);
+        xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+        if (reason != FlashTerminalReason::kIntentional) {
+            SetErrorLocked(FlashTerminalMessage(reason));
         }
         xSemaphoreGive(g_flash.mutex);
+        if (restart) {
+            const esp_err_t restart_result = wqn::StartFlashSession();
+            if (restart_result != ESP_OK) {
+                ESP_LOGW(kTag, "Flash reconnect after teardown failed: %s",
+                         esp_err_to_name(restart_result));
+            }
+        }
     }
 }
 
@@ -253,6 +317,15 @@ void RequestFlashTerminalStop(FlashTerminalReason reason)
         g_lifecycle_task == nullptr) {
         return;
     }
+    bool expected = false;
+    if (!g_teardown_pending.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
+        return;
+    }
+    g_terminal_generation.store(
+        g_session_generation.load(std::memory_order_acquire),
+        std::memory_order_relaxed);
     g_terminal_reason.store(reason, std::memory_order_release);
     xTaskNotifyGive(g_lifecycle_task);
 }
@@ -1974,6 +2047,10 @@ esp_err_t StartFlashSession()
             return init_result;
         }
     }
+    if (g_teardown_pending.load(std::memory_order_acquire)) {
+        ESP_LOGI(kTag, "Flash start deferred while prior teardown is pending");
+        return ESP_ERR_INVALID_STATE;
+    }
     ESP_RETURN_ON_ERROR(
         EnsurePlaybackRingbuf(), kTag, "prepare Flash playback buffer");
 
@@ -2001,6 +2078,12 @@ esp_err_t StartFlashSession()
     if (audio_result != ESP_OK) {
         xSemaphoreGive(g_flash.mutex);
         return audio_result;
+    }
+    uint32_t generation =
+        g_session_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
+    if (generation == 0) {
+        generation = 1;
+        g_session_generation.store(generation, std::memory_order_release);
     }
     g_flash.status = InternalStatus::kConnecting;
     g_flash.pending_text = "正在连接...";
@@ -2131,12 +2214,11 @@ esp_err_t StartFlashSession()
     return ESP_OK;
 }
 
-esp_err_t StopFlashSession()
+esp_err_t StopFlashSessionNow()
 {
     if (g_flash.mutex == nullptr) {
         return ESP_OK;
     }
-    g_intentional_stop.store(true, std::memory_order_release);
 
     // Signal streaming task to stop (outside mutex so task can read it)
     {
@@ -2212,8 +2294,31 @@ esp_err_t StopFlashSession()
     xSemaphoreGive(g_flash.mutex);
 
     ESP_LOGI(kTag, "flash session stopped");
-    g_intentional_stop.store(false, std::memory_order_release);
     return teardown_result;
+}
+
+esp_err_t StopFlashSession()
+{
+    if (g_flash.mutex == nullptr) {
+        return ESP_OK;
+    }
+    if (g_lifecycle_task == nullptr) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    bool expected = false;
+    if (!g_teardown_pending.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
+        return ESP_OK;
+    }
+    g_intentional_stop.store(true, std::memory_order_release);
+    g_terminal_generation.store(
+        g_session_generation.load(std::memory_order_acquire),
+        std::memory_order_relaxed);
+    g_terminal_reason.store(
+        FlashTerminalReason::kIntentional, std::memory_order_release);
+    xTaskNotifyGive(g_lifecycle_task);
+    return ESP_OK;
 }
 
 FlashStatus GetFlashStatus()
@@ -2344,9 +2449,10 @@ void OnFlashButtonPressed()
         // permanently locking the device in kError. Force-stop the old session
         // first so StartFlashSession creates a fresh client.
         if (g_flash.status == InternalStatus::kError) {
+            g_restart_after_teardown.store(true, std::memory_order_release);
             xSemaphoreGive(g_flash.mutex);
             StopFlashSession();
-            xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+            return;
         }
         xSemaphoreGive(g_flash.mutex);
         StartFlashSession();

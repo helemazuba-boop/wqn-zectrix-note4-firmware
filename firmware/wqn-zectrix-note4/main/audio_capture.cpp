@@ -8,6 +8,7 @@
 #include <utility>
 
 #include "esp_check.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -74,6 +75,7 @@ struct AudioServiceState {
     TaskHandle_t task = nullptr;
     wqn::services::AudioBusHandle i2c_bus = nullptr;
     wqn::services::AudioChannelHandle rx = nullptr;
+    int16_t* capture_buffer = nullptr;
     wqn::AudioCaptureChunk chunk;
     wqn::services::AudioSession session;
 };
@@ -122,6 +124,37 @@ esp_err_t EnsureAudioService()
             return ESP_ERR_NO_MEM;
         }
     }
+    return ESP_OK;
+}
+
+esp_err_t EnsureCaptureBuffer()
+{
+    if (g_audio.capture_buffer != nullptr) {
+        return ESP_OK;
+    }
+    // [ai-memory-fix] The 20 s PCM body is one fixed 640 KiB PSRAM allocation.
+    // Keeping it for the process lifetime avoids allocator churn and removes
+    // the old vector growth/copy chain that briefly kept several such blocks
+    // alive. Never fall back to internal SRAM: task stacks and TLS need it.
+    g_audio.capture_buffer = static_cast<int16_t*>(heap_caps_malloc(
+        kMaxCaptureSamples * sizeof(int16_t),
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (g_audio.capture_buffer == nullptr) {
+        ESP_LOGE(
+            kTag,
+            "capture PSRAM allocation failed: bytes=%u free=%u largest=%u internal_free=%u",
+            static_cast<unsigned>(kMaxCaptureSamples * sizeof(int16_t)),
+            static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)),
+            static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM)),
+            static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)));
+        return ESP_ERR_NO_MEM;
+    }
+    ESP_LOGI(
+        kTag,
+        "capture PSRAM buffer ready: bytes=%u free=%u largest=%u",
+        static_cast<unsigned>(kMaxCaptureSamples * sizeof(int16_t)),
+        static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)),
+        static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM)));
     return ESP_OK;
 }
 
@@ -565,14 +598,14 @@ void CaptureTask(void*)
 
         const size_t samples_read = bytes_read / sizeof(int16_t);
         for (size_t i = 0; i + 1 < samples_read; i += 2) {
-            if (g_audio.chunk.samples.size() >= kMaxCaptureSamples) {
+            if (g_audio.chunk.sample_count >= kMaxCaptureSamples) {
                 sample_capacity_reached = true;
                 break;
             }
             const int left = static_cast<int>(buffer[i]);
             const int right = static_cast<int>(buffer[i + 1]);
             const int16_t sample = buffer[i];
-            g_audio.chunk.samples.push_back(sample);
+            g_audio.capture_buffer[g_audio.chunk.sample_count++] = sample;
             const int abs_value = std::abs(static_cast<int>(sample));
             const int left_abs = std::abs(left);
             const int right_abs = std::abs(right);
@@ -603,18 +636,18 @@ void CaptureTask(void*)
             wqn::services::EndAudioActivity(&g_audio.session),
             &terminal_result);
     }
-    if (!g_audio.chunk.samples.empty()) {
-        g_audio.chunk.rms = static_cast<int>(IntegerSqrt(sum_squares / g_audio.chunk.samples.size()));
+    if (!g_audio.chunk.empty()) {
+        g_audio.chunk.rms = static_cast<int>(IntegerSqrt(sum_squares / g_audio.chunk.sample_count));
         g_audio.chunk.duration_ms = static_cast<int>(
-            (g_audio.chunk.samples.size() * 1000U) /
+            (g_audio.chunk.sample_count * 1000U) /
             static_cast<size_t>(wqn::kAudioCaptureSampleRate));
     }
     xSemaphoreTake(g_audio.mutex, portMAX_DELAY);
-    if (read_failed && g_audio.chunk.samples.empty()) {
+    if (read_failed && g_audio.chunk.empty()) {
         g_audio.chunk.duration_ms = 0;
     }
     const int logged_duration_ms = g_audio.chunk.duration_ms;
-    const size_t logged_sample_count = g_audio.chunk.samples.size();
+    const size_t logged_sample_count = g_audio.chunk.sample_count;
     const int16_t logged_peak = g_audio.chunk.peak;
     const int logged_rms = g_audio.chunk.rms;
     g_audio.running = false;
@@ -640,11 +673,15 @@ void CaptureTask(void*)
 
 namespace wqn {
 
+esp_err_t InitAudioCaptureBuffer()
+{
+    return EnsureCaptureBuffer();
+}
+
 esp_err_t StartAudioCapture()
 {
     ESP_RETURN_ON_ERROR(EnsureAudioService(), kTag, "init audio service");
-    AudioCaptureChunk next_chunk;
-    next_chunk.samples.reserve(kMaxCaptureSamples);
+    ESP_RETURN_ON_ERROR(EnsureCaptureBuffer(), kTag, "allocate capture PSRAM buffer");
 
     xSemaphoreTake(g_audio.mutex, portMAX_DELAY);
     if (g_audio.running) {
@@ -661,7 +698,8 @@ esp_err_t StartAudioCapture()
     g_audio.stop_requested = false;
     g_audio.initialized = false;
     g_audio.terminal_result = ESP_OK;
-    g_audio.chunk = std::move(next_chunk);
+    g_audio.chunk = {};
+    g_audio.chunk.samples = g_audio.capture_buffer;
     xSemaphoreGive(g_audio.mutex);
 
     TaskHandle_t task = nullptr;
@@ -711,7 +749,7 @@ esp_err_t StopAudioCapture(AudioCaptureChunk* chunk)
     ESP_RETURN_ON_ERROR(EnsureAudioService(), kTag, "init audio service");
     xSemaphoreTake(g_audio.mutex, portMAX_DELAY);
     if (!g_audio.running && g_audio.task == nullptr) {
-        const bool has_samples = !g_audio.chunk.samples.empty();
+        const bool has_samples = !g_audio.chunk.empty();
         const esp_err_t terminal_result = g_audio.terminal_result;
         if (chunk != nullptr) {
             *chunk = g_audio.chunk;
@@ -739,7 +777,7 @@ esp_err_t StopAudioCapture(AudioCaptureChunk* chunk)
 
     xSemaphoreTake(g_audio.mutex, portMAX_DELAY);
     const bool stopped = !g_audio.running;
-    const bool has_samples = stopped && !g_audio.chunk.samples.empty();
+    const bool has_samples = stopped && !g_audio.chunk.empty();
     const esp_err_t terminal_result = g_audio.terminal_result;
     if (stopped && chunk != nullptr) {
         *chunk = g_audio.chunk;
@@ -777,6 +815,11 @@ void ReleaseAudioCapturePower()
 #else
 
 namespace wqn {
+
+esp_err_t InitAudioCaptureBuffer()
+{
+    return ESP_ERR_NOT_SUPPORTED;
+}
 
 esp_err_t StartAudioCapture()
 {

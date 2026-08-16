@@ -121,6 +121,10 @@ private:
 
     PsramMemoryResource heap_;
     std::deque<ChatMessage> messages_;
+    // Built lazily and reused until revision_ changes. Protected by mutex_.
+    // UiFrame instances keep their own shared reference after the lock drops.
+    mutable std::shared_ptr<const AiHistorySnapshot> cached_snapshot_;
+    mutable uint64_t cached_snapshot_revision_ = UINT64_MAX;
     mutable StaticSemaphore_t mutex_storage_{};
     mutable SemaphoreHandle_t mutex_ = nullptr;
     size_t byte_size_ = 0;

@@ -465,7 +465,10 @@ typedef void (*WqnAiSseCallback)(const WqnAiSseEvent& event, void* user_ctx);
 
 struct WqnAiStreamRequest {
     std::string token;
-    std::vector<int16_t> pcm;        // mono s16le 16 kHz
+    // Borrowed mono s16le 16 kHz samples. UploadAiAudioChatStream is
+    // synchronous; the caller keeps this storage valid until it returns.
+    const int16_t* pcm_data = nullptr;
+    size_t pcm_sample_count = 0;
     int duration_ms = 0;
     std::string tier = "std";        // "std" | "pro"
     std::string conversation_id;     // optional
