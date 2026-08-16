@@ -775,6 +775,9 @@ UiUpdate UiRuntime::DispatchSyncResult(const wqn::services::SyncEvent& event)
         case wqn::services::SyncEventStatus::kSucceeded:
             status = "同步完成";
             break;
+        case wqn::services::SyncEventStatus::kPartial:
+            status = "部分完成，待重试";
+            break;
         case wqn::services::SyncEventStatus::kAwaitingClaim:
             status = "等待配对";
             break;

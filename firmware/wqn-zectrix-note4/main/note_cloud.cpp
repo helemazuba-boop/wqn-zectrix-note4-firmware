@@ -6,7 +6,6 @@
 #include "note_cloud.h"
 
 #include <algorithm>
-#include <set>
 #include <utility>
 
 #include "esp_log.h"
@@ -23,6 +22,8 @@ constexpr char kTag[] = "note_cloud";
 // A single sync drains a bounded number of manifest pages so a runaway server
 // cursor cannot spin the task forever; the caller re-runs to continue.
 constexpr size_t kMaxManifestPagesPerSync = 32;
+constexpr size_t kMaxManifestNotebooks = 200;
+constexpr size_t kMaxSnapshotRestarts = 2;
 
 const WqnNotePackManifestNotebook* FindManifestNotebook(
     const WqnNotePackManifest& manifest, const std::string& notebook_id)
@@ -58,6 +59,101 @@ bool SameManifestNotebooks(
         }
     }
     return true;
+}
+
+esp_err_t FetchStableNoteManifest(
+    const std::string& token,
+    WqnNotePackManifest* manifest,
+    std::string* message)
+{
+    if (manifest == nullptr || message == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    for (size_t restart = 0; restart <= kMaxSnapshotRestarts; ++restart) {
+        WqnNotePackManifest candidate;
+        uint64_t cursor = 0;
+        bool has_more = true;
+        bool snapshot_expired = false;
+        size_t page_count = 0;
+        while (has_more && page_count < kMaxManifestPagesPerSync) {
+            ++page_count;
+            WqnNotePackManifest page;
+            protocol::v3::Error error;
+            const esp_err_t result = FetchNoteStudyManifest(
+                token,
+                services::MakeDeviceRequestMetadata(),
+                cursor,
+                &page,
+                candidate.snapshot_id,
+                &error);
+            if (result != ESP_OK) {
+                if (error.code == "SNAPSHOT_EXPIRED" ||
+                    error.code == "snapshot_expired") {
+                    snapshot_expired = true;
+                    break;
+                }
+                *message = "笔记清单拉取失败";
+                return result;
+            }
+            if (!candidate.snapshot_id.empty() &&
+                candidate.snapshot_id != page.snapshot_id) {
+                snapshot_expired = true;
+                break;
+            }
+            if (candidate.snapshot_id.empty()) {
+                candidate.snapshot_id = page.snapshot_id;
+            }
+            if (page.has_more && page.cursor <= cursor) {
+                *message = "笔记游标未推进";
+                return ESP_ERR_INVALID_RESPONSE;
+            }
+            for (WqnNotePackManifestNotebook& item : page.notebooks) {
+                if (item.deleted) {
+                    continue;
+                }
+                const auto duplicate = std::find_if(
+                    candidate.notebooks.begin(),
+                    candidate.notebooks.end(),
+                    [&](const WqnNotePackManifestNotebook& existing) {
+                        return existing.notebook_id == item.notebook_id;
+                    });
+                if (duplicate != candidate.notebooks.end()) {
+                    *message = "笔记清单包含重复项";
+                    return ESP_ERR_INVALID_RESPONSE;
+                }
+                candidate.notebooks.push_back(std::move(item));
+                if (candidate.notebooks.size() > kMaxManifestNotebooks) {
+                    *message = "笔记数量超过设备上限";
+                    return ESP_ERR_INVALID_SIZE;
+                }
+            }
+            candidate.revision = std::max(candidate.revision, page.revision);
+            cursor = page.cursor;
+            has_more = page.has_more;
+        }
+        if (snapshot_expired) {
+            ESP_LOGW(kTag, "note manifest snapshot expired; attempt=%u/%u",
+                     static_cast<unsigned>(restart + 1),
+                     static_cast<unsigned>(kMaxSnapshotRestarts + 1));
+            continue;
+        }
+        if (has_more) {
+            *message = "笔记变更过多，请重试";
+            return ESP_ERR_INVALID_SIZE;
+        }
+        candidate.cursor = cursor;
+        candidate.has_more = false;
+        std::sort(
+            candidate.notebooks.begin(),
+            candidate.notebooks.end(),
+            [](const auto& left, const auto& right) {
+                return left.notebook_id < right.notebook_id;
+            });
+        *manifest = std::move(candidate);
+        return ESP_OK;
+    }
+    *message = "笔记快照持续变化，请稍后重试";
+    return ESP_ERR_INVALID_STATE;
 }
 
 }  // namespace
@@ -104,159 +200,67 @@ esp_err_t SyncNotePacks(const std::string& token, NotePackSyncResult* out)
         }
     }
 
-    // The server's note manifest cursor is a NOTEBOOK LIST OFFSET: the
-    // manifest relists every notebook with its current pack sha, unlike the
-    // word manifest whose cursor is a change_seq feed. Persisting the offset
-    // made every later sync resume listing past the end (cursor == notebook
-    // count -> changes=0 forever), so web-side attaches/edits never reached a
-    // device that had synced once (HIL: cursor=3 changes=0 while the cloud
-    // note_change_log sat at seq 5). Relist from 0 on every sync; the
-    // per-notebook sha comparison below keeps unchanged packs download-free.
-    local_manifest.cursor = 0;
-
-    size_t page_count = 0;
-    std::string manifest_snapshot_id;
-    // [archive-prune] Every notebook id listed by this walk. The manifest
-    // is a full relist from offset 0, so a COMPLETED walk is a snapshot:
-    // anything locally known but absent from it was archived/deleted on
-    // the web (the feed never emits tombstones for archives).
-    std::set<std::string> seen_notebooks;
-    bool listing_complete = false;
-    bool has_more = out->result == ESP_OK;
-    while (out->result == ESP_OK && has_more &&
-           page_count < kMaxManifestPagesPerSync) {
-        ++page_count;
-        WqnNotePackManifest delta;
-        const auto metadata = services::MakeDeviceRequestMetadata();
-        out->result = FetchNoteStudyManifest(
-            token, metadata, local_manifest.cursor, &delta, manifest_snapshot_id);
-        if (out->result != ESP_OK) {
-            break;
-        }
-        if (!delta.snapshot_id.empty()) {
-            if (!manifest_snapshot_id.empty() &&
-                manifest_snapshot_id != delta.snapshot_id) {
-                out->result = ESP_ERR_INVALID_STATE;
-                out->message = "笔记快照已变化，请重试";
-                break;
-            }
-            manifest_snapshot_id = delta.snapshot_id;
-        }
-        if (delta.has_more && delta.cursor <= local_manifest.cursor) {
-            out->result = ESP_ERR_INVALID_RESPONSE;
-            out->message = "笔记游标未推进";
-            break;
-        }
-        // A relisted page alone is not a content change; only an applied
-        // tombstone or an actual pack download below flips the flag, so an
-        // all-unchanged sync still skips the expensive index rebuild.
-        for (const WqnNotePackManifestNotebook& item : delta.notebooks) {
-            if (item.deleted) {
-                manifest_content_changed = true;
-            } else {
-                seen_notebooks.insert(item.notebook_id);
-            }
-        }
-
-        // Evaluate each pack's download decision exactly once. NotePackNeedsDownload
-        // hashes the entire local file, so calling it for both the capacity estimate
-        // and the download loop re-hashed every unchanged pack twice on every sync.
-        std::vector<uint8_t> needs_download(delta.notebooks.size(), 0);
-        size_t total_needed = 0;
-        for (size_t i = 0; i < delta.notebooks.size(); ++i) {
-            const WqnNotePackManifestNotebook& item = delta.notebooks[i];
-            // Under relist-every-sync, the recorded sha lets unchanged packs
-            // skip the full-file re-hash (see NotePackNeedsDownload).
+    // [snapshot-fix] Fetch and validate the complete offset-relisted snapshot
+    // before touching pack files or the persisted manifest. A 410 can now
+    // restart from cursor zero without leaving a mixed local generation.
+    WqnNotePackManifest remote_manifest;
+    if (out->result == ESP_OK) {
+        out->result = FetchStableNoteManifest(
+            token, &remote_manifest, &out->message);
+    }
+    std::vector<uint8_t> needs_download(remote_manifest.notebooks.size(), 0);
+    size_t total_needed = 0;
+    bool pack_downloaded = false;
+    if (out->result == ESP_OK) {
+        for (size_t i = 0; i < remote_manifest.notebooks.size(); ++i) {
+            const WqnNotePackManifestNotebook& item = remote_manifest.notebooks[i];
             const WqnNotePackManifestNotebook* known =
                 FindManifestNotebook(local_manifest, item.notebook_id);
             const std::string* verified_sha =
                 known != nullptr && known->has_pack ? &known->sha256 : nullptr;
-            if (!item.deleted && NotePackNeedsDownload(item, verified_sha)) {
+            if (NotePackNeedsDownload(item, verified_sha)) {
                 needs_download[i] = 1;
                 total_needed += item.byte_size;
             }
         }
         if (total_needed > 0) {
-            StorageCapacitySnapshot storage;
-            if (ReadStorageCapacitySnapshot(&storage) && storage.spiffs_valid) {
-                const size_t available =
-                    storage.spiffs_total_bytes > storage.spiffs_used_bytes
-                        ? storage.spiffs_total_bytes - storage.spiffs_used_bytes
-                        : 0;
-                if (available < total_needed) {
-                    ESP_LOGW(kTag, "SPIFFS space insufficient: need=%u avail=%u",
-                             static_cast<unsigned>(total_needed),
-                             static_cast<unsigned>(available));
-                    out->result = ESP_ERR_NO_MEM;
-                    out->message = "存储空间不足";
-                }
+            out->result = EnsurePackDownloadCapacity(total_needed);
+            if (out->result == ESP_ERR_NO_MEM) {
+                out->message = "存储空间不足，已保留现有笔记";
             }
         }
-
-        for (size_t i = 0; i < delta.notebooks.size() && out->result == ESP_OK; ++i) {
-            if (!needs_download[i]) {
-                continue;
-            }
-            out->result = DownloadNotePackToStorage(
-                token, services::MakeDeviceRequestMetadata(), delta.notebooks[i]);
-            if (out->result == ESP_OK) {
-                manifest_content_changed = true;
-                s_index_stale = true;
-            }
-        }
-        if (out->result != ESP_OK) {
-            break;
-        }
-
-        const bool page_changed =
-            !delta.notebooks.empty() || delta.cursor != local_manifest.cursor;
-        if (page_changed) {
-            WqnNotePackManifest merged;
-            out->result = MergeNotePackManifestDelta(delta, &merged);
-            if (out->result == ESP_OK &&
-                (!SameManifestNotebooks(merged, local_manifest) ||
-                 !had_local_manifest)) {
-                // Persist only real content changes: relisting produces an
-                // identical merge every idle cycle, and the unconditional save
-                // was a recurring multi-second storage transaction that
-                // foreground UI writes had to queue behind.
-                out->result = SaveNotePackManifest(merged);
-            }
-            if (out->result == ESP_OK) {
-                local_manifest = std::move(merged);
-            }
-        }
-        has_more = delta.has_more;
     }
-    if (out->result == ESP_OK && has_more) {
-        out->result = ESP_ERR_INVALID_SIZE;
-        out->message = "笔记变更过多，请重试";
-    } else if (out->result == ESP_OK) {
-        listing_complete = true;
-    }
-    if (listing_complete) {
-        // Snapshot semantics: drop local rows the completed walk never
-        // listed. SaveNotePackManifest's prune deletes the orphaned pack
-        // files and the index rebuild below drops their entries, so an
-        // archived notebook finally disappears from the device (privacy:
-        // shared/lost student hardware kept showing archived content).
-        const size_t before = local_manifest.notebooks.size();
-        local_manifest.notebooks.erase(
-            std::remove_if(
-                local_manifest.notebooks.begin(),
-                local_manifest.notebooks.end(),
-                [&seen_notebooks](const WqnNotePackManifestNotebook& item) {
-                    return seen_notebooks.count(item.notebook_id) == 0;
-                }),
-            local_manifest.notebooks.end());
-        if (local_manifest.notebooks.size() != before) {
-            manifest_content_changed = true;
+    for (size_t i = 0;
+         i < remote_manifest.notebooks.size() && out->result == ESP_OK;
+         ++i) {
+        if (!needs_download[i]) {
+            continue;
+        }
+        out->result = DownloadNotePackToStorage(
+            token,
+            services::MakeDeviceRequestMetadata(),
+            remote_manifest.notebooks[i]);
+        if (out->result == ESP_OK) {
+            pack_downloaded = true;
             s_index_stale = true;
-            out->result = SaveNotePackManifest(local_manifest);
-            ESP_LOGI(kTag, "note manifest snapshot prune: removed=%u",
-                     static_cast<unsigned>(
-                         before - local_manifest.notebooks.size()));
+        } else {
+            out->message = "笔记包下载失败，已保留旧清单";
         }
+    }
+    if (out->result == ESP_OK) {
+        manifest_content_changed =
+            !had_local_manifest ||
+            !SameManifestNotebooks(remote_manifest, local_manifest);
+        if (manifest_content_changed) {
+            out->result = SaveNotePackManifest(remote_manifest);
+            if (out->result == ESP_OK) {
+                local_manifest = remote_manifest;
+                s_index_stale = true;
+            } else {
+                out->message = "笔记清单保存失败";
+            }
+        }
+        manifest_content_changed = manifest_content_changed || pack_downloaded;
     }
 
     if (out->result == ESP_OK &&
@@ -284,7 +288,7 @@ esp_err_t SyncNotePacks(const std::string& token, NotePackSyncResult* out)
             out->message.empty() ? "-" : out->message.c_str(),
             s_index_stale ? 1 : 0);
     } else {
-        out->snapshot_id = manifest_snapshot_id;
+        out->snapshot_id = remote_manifest.snapshot_id;
     }
     return out->result;
 }
@@ -305,62 +309,27 @@ esp_err_t SyncSingleNotebookPack(
         return out->result;
     }
 
-    // Page the manifest only until the target notebook appears. The listing is
-    // notebook-offset paged (relist semantics, see SyncNotePacks), so a bounded
-    // walk finds it or proves it is gone.
-    WqnNotePackManifestNotebook target;
-    bool target_found = false;
-    uint64_t cursor = 0;
-    bool has_more = true;
-    size_t page_count = 0;
-    std::string manifest_snapshot_id;
-    out->result = ESP_OK;
-    while (out->result == ESP_OK && has_more && !target_found &&
-           page_count < kMaxManifestPagesPerSync) {
-        ++page_count;
-        WqnNotePackManifest delta;
-        const auto metadata = services::MakeDeviceRequestMetadata();
-        out->result = FetchNoteStudyManifest(
-            token, metadata, cursor, &delta, manifest_snapshot_id);
-        if (out->result != ESP_OK) {
-            break;
-        }
-        if (delta.has_more && delta.cursor <= cursor) {
-            out->result = ESP_ERR_INVALID_RESPONSE;
-            out->message = "笔记游标未推进";
-            break;
-        }
-        if (!delta.snapshot_id.empty()) {
-            if (!manifest_snapshot_id.empty() &&
-                manifest_snapshot_id != delta.snapshot_id) {
-                out->result = ESP_ERR_INVALID_STATE;
-                out->message = "笔记快照已变化，请重试";
-                break;
-            }
-            manifest_snapshot_id = delta.snapshot_id;
-        }
-        for (const WqnNotePackManifestNotebook& item : delta.notebooks) {
-            if (item.notebook_id == notebook_id) {
-                target = item;
-                target_found = true;
-                break;
-            }
-        }
-        cursor = delta.cursor;
-        has_more = delta.has_more;
-    }
+    // Reuse the same stable-snapshot walk as full sync. Stopping as soon as
+    // the target appears can accept a row from a generation that expires on a
+    // later page, so validate the complete listing before touching storage.
+    WqnNotePackManifest remote_manifest;
+    out->result = FetchStableNoteManifest(
+        token, &remote_manifest, &out->message);
     if (out->result != ESP_OK) {
         ESP_LOGW(kTag, "single notebook sync manifest walk failed: %s",
                  esp_err_to_name(out->result));
         return out->result;
     }
-    if (!target_found || target.deleted || !target.has_pack) {
+    const WqnNotePackManifestNotebook* remote_target =
+        FindManifestNotebook(remote_manifest, notebook_id);
+    if (remote_target == nullptr || !remote_target->has_pack) {
         // The cloud genuinely has no pack for this notebook (deleted, archived
         // or never packed): nothing to download, and no local state to touch.
         out->result = ESP_ERR_NOT_FOUND;
         out->message = "云端暂无该笔记本内容";
         return out->result;
     }
+    const WqnNotePackManifestNotebook target = *remote_target;
 
     WqnNotePackManifest local_manifest;
     const esp_err_t manifest_result = LoadNotePackManifest(&local_manifest);
@@ -376,6 +345,13 @@ esp_err_t SyncSingleNotebookPack(
     const std::string* verified_sha =
         known != nullptr && known->has_pack ? &known->sha256 : nullptr;
     if (NotePackNeedsDownload(target, verified_sha)) {
+        out->result = EnsurePackDownloadCapacity(target.byte_size);
+        if (out->result != ESP_OK) {
+            out->message = out->result == ESP_ERR_NO_MEM
+                ? "存储空间不足，已保留现有笔记"
+                : "存储空间检查失败";
+            return out->result;
+        }
         out->result = DownloadNotePackToStorage(
             token, services::MakeDeviceRequestMetadata(), target, progress);
         if (out->result != ESP_OK) {
@@ -408,7 +384,7 @@ esp_err_t SyncSingleNotebookPack(
     out->index_ready = out->result == ESP_OK;
     out->content_changed = true;
     if (out->result == ESP_OK) {
-        out->snapshot_id = manifest_snapshot_id;
+        out->snapshot_id = remote_manifest.snapshot_id;
     }
     ESP_LOGI(kTag, "single notebook pack synced: id=%.8s index_ready=%d",
              notebook_id.c_str(), out->index_ready ? 1 : 0);

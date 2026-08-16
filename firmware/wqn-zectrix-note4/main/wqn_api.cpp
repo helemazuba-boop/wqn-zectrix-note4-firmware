@@ -2180,12 +2180,16 @@ esp_err_t FetchNoteStudyManifest(
     const protocol::v3::RequestMetadata& metadata,
     uint64_t cursor,
     WqnNotePackManifest* manifest,
-    const std::string& snapshot_id)
+    const std::string& snapshot_id,
+    protocol::v3::Error* error_out)
 {
     if (manifest == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
     *manifest = WqnNotePackManifest{};
+    if (error_out != nullptr) {
+        *error_out = {};
+    }
     if (token.empty()) {
         return ESP_OK;
     }
@@ -2226,6 +2230,9 @@ esp_err_t FetchNoteStudyManifest(
     const esp_err_t parse_result = protocol::note_study_v1::ParseManifestResponse(
         body, metadata.request_id, &data, &error);
     if (status_code != 200 || parse_result != ESP_OK) {
+        if (error_out != nullptr) {
+            *error_out = error;
+        }
         ESP_LOGW(
             kTag,
             "note-study manifest failed: status=%d code=%s retryable=%d",
@@ -2817,12 +2824,16 @@ esp_err_t FetchProblemStudyManifest(
     const protocol::v3::RequestMetadata& metadata,
     uint64_t cursor,
     WqnProblemPackManifest* manifest,
-    const std::string& snapshot_id)
+    const std::string& snapshot_id,
+    protocol::v3::Error* error_out)
 {
     if (manifest == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
     *manifest = WqnProblemPackManifest{};
+    if (error_out != nullptr) {
+        *error_out = {};
+    }
     if (token.empty()) {
         return ESP_OK;
     }
@@ -2863,6 +2874,9 @@ esp_err_t FetchProblemStudyManifest(
     const esp_err_t parse_result = protocol::problem_study_v1::ParseManifestResponse(
         body, metadata.request_id, &data, &error);
     if (status_code != 200 || parse_result != ESP_OK) {
+        if (error_out != nullptr) {
+            *error_out = error;
+        }
         ESP_LOGW(
             kTag,
             "problem-study manifest failed: status=%d code=%s retryable=%d",

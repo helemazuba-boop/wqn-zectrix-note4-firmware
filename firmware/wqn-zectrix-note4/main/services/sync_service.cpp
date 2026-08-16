@@ -490,6 +490,13 @@ enum class WordOutboxUploadState : uint8_t {
     kFailed,
 };
 
+enum class SyncRoundOutcome : uint8_t {
+    kSucceeded,
+    kPartial,
+    kPartialNeedsFullRetry,
+    kFailed,
+};
+
 WordOutboxUploadState g_last_word_outbox_upload_state =
     WordOutboxUploadState::kDrained;
 
@@ -1048,18 +1055,109 @@ void SetSyncRoundStarted(int64_t started_ms)
     taskEXIT_CRITICAL(&g_sync_snapshot_lock);
 }
 
-void CompleteSyncRound(int64_t finished_ms, bool synced)
+void CompleteSyncRound(int64_t finished_ms, SyncRoundOutcome outcome)
 {
     taskENTER_CRITICAL(&g_sync_snapshot_lock);
     g_sync_snapshot.last_finished_ms = finished_ms;
-    g_sync_snapshot.last_round_success = synced;
-    if (synced) {
+    g_sync_snapshot.last_round_success = outcome == SyncRoundOutcome::kSucceeded;
+    if (outcome == SyncRoundOutcome::kSucceeded) {
         ++g_sync_snapshot.success_count;
+    } else if (outcome == SyncRoundOutcome::kPartial ||
+               outcome == SyncRoundOutcome::kPartialNeedsFullRetry) {
+        ++g_sync_snapshot.partial_count;
     } else {
         ++g_sync_snapshot.failure_count;
     }
     taskEXIT_CRITICAL(&g_sync_snapshot_lock);
 }
+
+#if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
+wqn::services::SyncOutboxPhase PublicOutboxPhase(WordOutboxUploadState state)
+{
+    switch (state) {
+        case WordOutboxUploadState::kDrained:
+            return wqn::services::SyncOutboxPhase::kDrained;
+        case WordOutboxUploadState::kPending:
+            return wqn::services::SyncOutboxPhase::kPending;
+        case WordOutboxUploadState::kYielded:
+            return wqn::services::SyncOutboxPhase::kYielded;
+        case WordOutboxUploadState::kFailed:
+        default:
+            return wqn::services::SyncOutboxPhase::kBlocked;
+    }
+}
+
+void FillOutboxSnapshot(
+    wqn::services::SyncOutboxSnapshot* snapshot,
+    WordOutboxUploadState state,
+    uint8_t retry_attempt,
+    int64_t next_retry_ms)
+{
+    if (snapshot == nullptr) {
+        return;
+    }
+    snapshot->phase = PublicOutboxPhase(state);
+    snapshot->retry_attempt = retry_attempt;
+    snapshot->next_retry_ms = next_retry_ms;
+    const char* detail = "";
+    switch (state) {
+        case WordOutboxUploadState::kPending:
+            detail = "retry pending";
+            break;
+        case WordOutboxUploadState::kYielded:
+            detail = "yielded for interaction";
+            break;
+        case WordOutboxUploadState::kFailed:
+            detail = "queue blocked";
+            break;
+        case WordOutboxUploadState::kDrained:
+        default:
+            break;
+    }
+    std::snprintf(snapshot->last_error, sizeof(snapshot->last_error), "%s", detail);
+}
+
+void PublishOutboxSnapshots()
+{
+    taskENTER_CRITICAL(&g_sync_snapshot_lock);
+    FillOutboxSnapshot(
+        &g_sync_snapshot.word_outbox,
+        g_last_word_outbox_upload_state,
+        g_word_outbox_retry_attempts,
+        g_word_outbox_retry_not_before_ms);
+    FillOutboxSnapshot(
+        &g_sync_snapshot.note_outbox,
+        g_last_note_outbox_upload_state,
+        g_note_outbox_retry_attempts,
+        g_note_outbox_retry_not_before_ms);
+    FillOutboxSnapshot(
+        &g_sync_snapshot.problem_outbox,
+        g_last_problem_outbox_upload_state,
+        g_problem_outbox_retry_attempts,
+        g_problem_outbox_retry_not_before_ms);
+    taskEXIT_CRITICAL(&g_sync_snapshot_lock);
+}
+
+bool AllOutboxesDrained()
+{
+    return g_last_word_outbox_upload_state == WordOutboxUploadState::kDrained &&
+        g_last_note_outbox_upload_state == WordOutboxUploadState::kDrained &&
+        g_last_problem_outbox_upload_state == WordOutboxUploadState::kDrained;
+}
+
+SyncRoundOutcome CurrentOutboxOutcome()
+{
+    if (AllOutboxesDrained()) {
+        return SyncRoundOutcome::kSucceeded;
+    }
+    if (g_last_word_outbox_upload_state == WordOutboxUploadState::kFailed ||
+        g_last_note_outbox_upload_state == WordOutboxUploadState::kFailed ||
+        g_last_problem_outbox_upload_state == WordOutboxUploadState::kFailed) {
+        return SyncRoundOutcome::kPartialNeedsFullRetry;
+    }
+    return SyncRoundOutcome::kPartial;
+}
+#endif
 
 void PublishSyncEvent(
     wqn::services::SyncEventStatus status,
@@ -1069,12 +1167,15 @@ void PublishSyncEvent(
     wqn::services::SyncEvent event;
     event.status = status;
     event.scope = scope;
+    event.finished_ms = finished_ms;
+    taskENTER_CRITICAL(&g_sync_snapshot_lock);
+    // SyncService and the independent bulk content lane can both publish.
+    // Assign the sequence under the same lock as the mailbox write so a later
+    // sequence can never be overwritten by an earlier publisher.
     event.sequence = g_sync_event_sequence++;
     if (event.sequence == 0) {
         event.sequence = g_sync_event_sequence++;
     }
-    event.finished_ms = finished_ms;
-    taskENTER_CRITICAL(&g_sync_snapshot_lock);
     std::snprintf(
         event.claim_code,
         sizeof(event.claim_code),
@@ -1705,7 +1806,7 @@ WordOutboxUploadState UploadPendingNoteObservations(const std::string& token)
         : WordOutboxUploadState::kFailed;
 }
 
-bool RunWordOutboxOnlyRound()
+SyncRoundOutcome RunWordOutboxOnlyRound()
 {
     std::string token;
     if (!LoadUsableToken(&token)) {
@@ -1721,53 +1822,51 @@ bool RunWordOutboxOnlyRound()
         g_last_word_outbox_upload_state = WordOutboxUploadState::kDrained;
         g_last_note_outbox_upload_state = WordOutboxUploadState::kDrained;
         g_last_problem_outbox_upload_state = WordOutboxUploadState::kDrained;
-        return false;
+        return SyncRoundOutcome::kFailed;
     }
     g_last_word_outbox_upload_state = UploadPendingWordObservations(token);
     g_last_note_outbox_upload_state = UploadPendingNoteObservations(token);
     g_last_problem_outbox_upload_state = UploadPendingProblemObservations(token);
-    return g_last_word_outbox_upload_state != WordOutboxUploadState::kFailed &&
-        g_last_note_outbox_upload_state != WordOutboxUploadState::kFailed &&
-        g_last_problem_outbox_upload_state != WordOutboxUploadState::kFailed;
+    return CurrentOutboxOutcome();
 }
 #endif
 
-bool RunSyncRound()
+SyncRoundOutcome RunSyncRound()
 {
 #if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
     esp_err_t result = EnsureControlStateLoaded();
     if (result != ESP_OK) {
         ESP_LOGW(kTag, "v3 control checkpoint unavailable: %s", esp_err_to_name(result));
-        return false;
+        return SyncRoundOutcome::kFailed;
     }
     result = RunDeviceClaimRoundV3();
     if (result == ESP_ERR_NOT_FINISHED) {
         ESP_LOGI(kTag, "v3 claim awaiting physical approval");
-        return false;
+        return SyncRoundOutcome::kFailed;
     }
     if (result != ESP_OK) {
         ESP_LOGW(kTag, "v3 claim round deferred: %s", esp_err_to_name(result));
-        return false;
+        return SyncRoundOutcome::kFailed;
     }
 #else
     esp_err_t result = wqn::RunPairingFlowIfNeeded();
     if (result != ESP_OK) {
         ESP_LOGW(kTag, "pairing round deferred: %s", esp_err_to_name(result));
-        return false;
+        return SyncRoundOutcome::kFailed;
     }
 #endif
 
     std::string token;
     if (!LoadUsableToken(&token)) {
         ESP_LOGI(kTag, "WQN online sync waiting for pairing");
-        return false;
+        return SyncRoundOutcome::kFailed;
     }
 
 #if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
     result = BootstrapControlV3(token);
     if (result != ESP_OK) {
         ESP_LOGW(kTag, "v3 bootstrap round failed: %s", esp_err_to_name(result));
-        return false;
+        return SyncRoundOutcome::kFailed;
     }
 #endif
 
@@ -1779,18 +1878,25 @@ bool RunSyncRound()
 
     if (!LoadUsableToken(&token)) {
         ESP_LOGI(kTag, "token cleared during observation upload round");
-        return false;
+        return SyncRoundOutcome::kFailed;
     }
 
 #if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
     result = SyncControlPlaneV3(token);
     if (result != ESP_OK) {
         ESP_LOGW(kTag, "control sync round failed: %s", esp_err_to_name(result));
-        return false;
+        // The three outboxes already ran independently. Preserve that
+        // progress and report partial completion, while retaining a full-sync
+        // retry obligation for the failed control plane.
+        return SyncRoundOutcome::kPartialNeedsFullRetry;
     }
 #endif
 
-    return true;
+#if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
+    return CurrentOutboxOutcome();
+#else
+    return SyncRoundOutcome::kSucceeded;
+#endif
 }
 
 TickType_t OutboxWaitDelay()
@@ -1917,19 +2023,31 @@ void SyncServiceTask(void*)
         SetSyncRoundStarted(esp_timer_get_time() / 1000);
         SetSyncStatus(outbox_only ? "word-outbox" : "syncing");
 #if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
-        const bool synced = outbox_only
+        const SyncRoundOutcome outcome = outbox_only
             ? RunWordOutboxOnlyRound()
             : RunSyncRound();
 #else
-        const bool synced = RunSyncRound();
+        const SyncRoundOutcome outcome = RunSyncRound();
 #endif
         const int64_t finished_ms = esp_timer_get_time() / 1000;
-        CompleteSyncRound(finished_ms, synced);
+        CompleteSyncRound(finished_ms, outcome);
+#if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
+        PublishOutboxSnapshots();
+#endif
         const bool has_token_after_round = wqn::services::HasUsableStoredToken();
-        if (synced) {
+        if (outcome == SyncRoundOutcome::kSucceeded) {
             SetSyncStatus("success");
             PublishSyncEvent(
                 wqn::services::SyncEventStatus::kSucceeded,
+                finished_ms,
+                outbox_only
+                    ? wqn::services::SyncEventScope::kWordOutbox
+                    : wqn::services::SyncEventScope::kFull);
+        } else if (outcome == SyncRoundOutcome::kPartial ||
+                   outcome == SyncRoundOutcome::kPartialNeedsFullRetry) {
+            SetSyncStatus("partial");
+            PublishSyncEvent(
+                wqn::services::SyncEventStatus::kPartial,
                 finished_ms,
                 outbox_only
                     ? wqn::services::SyncEventScope::kWordOutbox
@@ -1946,7 +2064,8 @@ void SyncServiceTask(void*)
                     : wqn::services::SyncEventScope::kFull);
         }
         if (!outbox_only) {
-            if (synced) {
+            if (outcome == SyncRoundOutcome::kSucceeded ||
+                outcome == SyncRoundOutcome::kPartial) {
                 ClearFullSyncRetry();
                 ScheduleNextPeriodicSync(
                     g_auto_sync_interval_minutes.load(std::memory_order_acquire));
@@ -1954,6 +2073,11 @@ void SyncServiceTask(void*)
                 ScheduleFullSyncRetry(
                     FullSyncFailureRetryMs(has_token_after_round));
             }
+        } else if (outcome == SyncRoundOutcome::kPartialNeedsFullRetry) {
+            // A local queue/storage failure has no per-item retry cursor.
+            // Escalate it to the bounded full-round backoff so the durable
+            // head cannot remain stranded when periodic sync is disabled.
+            ScheduleFullSyncRetry(FullSyncFailureRetryMs(has_token_after_round));
         }
 #if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
         if (g_last_word_outbox_upload_state == WordOutboxUploadState::kYielded ||
@@ -2472,6 +2596,15 @@ void CompleteContentRefresh(
     if (accepted && PersistLatestSyncJournal() != ESP_OK) {
         ESP_LOGE(kTag, "content completion journal save failed: domain=%u",
                  static_cast<unsigned>(ticket.domain));
+    }
+    if (accepted && result != ESP_OK) {
+        // Content lanes converge independently from the control plane and
+        // outboxes. Surface their durable backoff as partial completion; a
+        // single pack failure must not relabel already-synced domains as a
+        // failed global round.
+        const int64_t finished_ms = esp_timer_get_time() / 1000;
+        SetSyncStatus("partial");
+        PublishSyncEvent(SyncEventStatus::kPartial, finished_ms, SyncEventScope::kFull);
     }
 #else
     (void)ticket;

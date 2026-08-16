@@ -25,6 +25,9 @@ CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
 CONFIG_MBEDTLS_SSL_KEEP_PEER_CERTIFICATE=n
 
 CONFIG_SPI_FLASH_VERIFY_WRITE=y
+# Pack downloads may reclaim up to 1 MiB of deleted SPIFFS pages inside the
+# serialized storage worker before reporting a real capacity block.
+CONFIG_SPIFFS_GC_MAX_RUNS=256
 
 # WebSocket transport: nginx reverse proxy returns a large upgrade response
 # (INGRESSCOOKIE + many access-control-* + x-stainless-* headers) that exceeds

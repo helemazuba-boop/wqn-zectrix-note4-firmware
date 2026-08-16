@@ -40,11 +40,26 @@ struct SyncContentTicket {
     explicit operator bool() const { return generation != 0; }
 };
 
+enum class SyncOutboxPhase : uint8_t {
+    kDrained,
+    kPending,
+    kYielded,
+    kBlocked,
+};
+
+struct SyncOutboxSnapshot {
+    SyncOutboxPhase phase = SyncOutboxPhase::kDrained;
+    uint8_t retry_attempt = 0;
+    int64_t next_retry_ms = 0;
+    char last_error[48] = {};
+};
+
 struct SyncSnapshot {
     bool task_running = false;
     bool last_round_success = false;
     uint32_t interval_minutes = 0;
     uint32_t success_count = 0;
+    uint32_t partial_count = 0;
     uint32_t failure_count = 0;
     int64_t last_started_ms = 0;
     int64_t last_finished_ms = 0;
@@ -56,10 +71,14 @@ struct SyncSnapshot {
     SyncContentSnapshot word_packs = {};
     SyncContentSnapshot note_packs = {};
     SyncContentSnapshot problem_packs = {};
+    SyncOutboxSnapshot word_outbox = {};
+    SyncOutboxSnapshot note_outbox = {};
+    SyncOutboxSnapshot problem_outbox = {};
 };
 
 enum class SyncEventStatus : uint8_t {
     kSucceeded,
+    kPartial,
     kFailed,
     kAwaitingClaim,
 };

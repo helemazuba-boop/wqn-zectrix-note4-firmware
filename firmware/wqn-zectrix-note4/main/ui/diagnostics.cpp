@@ -47,6 +47,9 @@ std::string OnlineSyncStatusLabel(const char* status)
     if (std::strcmp(status, "success") == 0) {
         return "已同步";
     }
+    if (std::strcmp(status, "partial") == 0) {
+        return "部分完成，待重试";
+    }
     if (std::strcmp(status, "failed") == 0) {
         return "同步失败";
     }

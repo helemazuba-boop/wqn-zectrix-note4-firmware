@@ -68,6 +68,12 @@ struct SyncJournal {
 
 esp_err_t InitStorage();
 bool ReadStorageCapacitySnapshot(StorageCapacitySnapshot* snapshot);
+// Reclaims only disposable files (stale temps and the shared note/problem
+// image cache), runs bounded SPIFFS GC, then requires `required_bytes` plus a
+// fixed safety reserve. Referenced pack/manifests are never removed here.
+esp_err_t EnsurePackDownloadCapacity(
+    size_t required_bytes,
+    size_t safety_reserve_bytes = 256U * 1024U);
 esp_err_t LoadAccessToken(std::string* token);
 esp_err_t SaveAccessToken(const std::string& token);
 esp_err_t ClearAccessToken();

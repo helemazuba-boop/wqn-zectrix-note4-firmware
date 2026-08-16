@@ -7,10 +7,12 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <dirent.h>
 #include <limits>
 #include <string>
 #include <sys/stat.h>
+#include <utime.h>
 #include <unistd.h>
 #include <utility>
 
@@ -1400,6 +1402,99 @@ void EvictNoteImageCacheIfNeeded()
     }
 }
 
+struct StoreNoteImageContext {
+    const std::string* image_id = nullptr;
+    const uint8_t* data = nullptr;
+    size_t size = 0;
+};
+
+struct LoadNoteImageContext {
+    const std::string* image_id = nullptr;
+    std::vector<uint8_t>* wqni = nullptr;
+};
+
+esp_err_t LoadNoteImageTransaction(void* opaque)
+{
+    auto* context = static_cast<LoadNoteImageContext*>(opaque);
+    if (context == nullptr || context->image_id == nullptr ||
+        context->wqni == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    const std::string path = NoteImageCachePath(*context->image_id);
+    FILE* file = std::fopen(path.c_str(), "rb");
+    if (file == nullptr) {
+        return ESP_ERR_NOT_FOUND;
+    }
+    // Read the header first so the cache accepts either BW1 or GRAY4 without
+    // allocating a second fixed-size buffer.
+    std::array<uint8_t, kNoteImageHeaderBytes> header = {};
+    const size_t header_read = std::fread(header.data(), 1, header.size(), file);
+    if (header_read != header.size()) {
+        std::fclose(file);
+        unlink(path.c_str());
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    const uint8_t format = header[5];
+    const size_t payload = format == 1 ? kNoteImagePayloadBytes
+        : format == 2 ? kNoteImageGray4PayloadBytes : 0;
+    if (payload == 0) {
+        std::fclose(file);
+        unlink(path.c_str());
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    context->wqni->assign(kNoteImageHeaderBytes + payload, 0);
+    std::memcpy(context->wqni->data(), header.data(), header.size());
+    const size_t read = std::fread(
+        context->wqni->data() + kNoteImageHeaderBytes, 1, payload, file);
+    const bool extra = std::fgetc(file) != EOF;
+    std::fclose(file);
+    if (read != payload || extra ||
+        ValidateNoteImageWqni(context->wqni->data(), context->wqni->size()) != ESP_OK) {
+        // Corrupt cache entries are dropped so the next request re-downloads.
+        unlink(path.c_str());
+        context->wqni->clear();
+        return ESP_ERR_INVALID_CRC;
+    }
+    // Refresh mtime on a successful hit so capacity reclamation is genuinely
+    // least-recently-used rather than oldest-created.
+    struct utimbuf touched = {};
+    touched.actime = std::time(nullptr);
+    touched.modtime = touched.actime;
+    if (utime(path.c_str(), &touched) != 0) {
+        ESP_LOGD(kTag, "note image cache touch failed: %s", path.c_str());
+    }
+    return ESP_OK;
+}
+
+esp_err_t StoreNoteImageTransaction(void* opaque)
+{
+    const auto* context = static_cast<const StoreNoteImageContext*>(opaque);
+    if (context == nullptr || context->image_id == nullptr ||
+        context->data == nullptr || context->size == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    EvictNoteImageCacheIfNeeded();
+    const std::string path = NoteImageCachePath(*context->image_id);
+    const std::string temp = path + ".tmp";
+    FILE* file = std::fopen(temp.c_str(), "wb");
+    if (file == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
+    const size_t written = std::fwrite(context->data, 1, context->size, file);
+    const bool flushed = std::fflush(file) == 0 && ::fsync(fileno(file)) == 0;
+    const bool closed = std::fclose(file) == 0;
+    if (written != context->size || !flushed || !closed) {
+        unlink(temp.c_str());
+        return ESP_FAIL;
+    }
+    unlink(path.c_str());
+    if (rename(temp.c_str(), path.c_str()) != 0) {
+        unlink(temp.c_str());
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
 }  // namespace
 
 esp_err_t ValidateNoteImageWqni(const uint8_t* data, size_t size)
@@ -1442,42 +1537,16 @@ esp_err_t LoadCachedNoteImage(const std::string& image_id, std::vector<uint8_t>*
     if (wqni == nullptr || !IsNoteImageId(image_id)) {
         return ESP_ERR_INVALID_ARG;
     }
-    const std::string path = NoteImageCachePath(image_id);
-    FILE* file = std::fopen(path.c_str(), "rb");
-    if (file == nullptr) {
-        return ESP_ERR_NOT_FOUND;
+    runtime::SleepLease storage_lease = runtime::SleepLease::TryAcquire(
+        runtime::SleepBlocker::kStorage,
+        "note-image-read",
+        __FILE__,
+        __LINE__);
+    if (!storage_lease) {
+        return ESP_ERR_INVALID_STATE;
     }
-    // Read the header first so the cache accepts either BW1 or GRAY4 without
-    // allocating a second fixed-size buffer.
-    std::array<uint8_t, kNoteImageHeaderBytes> header = {};
-    const size_t header_read = std::fread(header.data(), 1, header.size(), file);
-    if (header_read != header.size()) {
-        std::fclose(file);
-        unlink(path.c_str());
-        return ESP_ERR_INVALID_RESPONSE;
-    }
-    const uint8_t format = header[5];
-    const size_t payload = format == 1 ? kNoteImagePayloadBytes
-        : format == 2 ? kNoteImageGray4PayloadBytes : 0;
-    if (payload == 0) {
-        std::fclose(file);
-        unlink(path.c_str());
-        return ESP_ERR_INVALID_RESPONSE;
-    }
-    wqni->assign(kNoteImageHeaderBytes + payload, 0);
-    std::memcpy(wqni->data(), header.data(), header.size());
-    const size_t read = std::fread(
-        wqni->data() + kNoteImageHeaderBytes, 1, payload, file);
-    const bool extra = std::fgetc(file) != EOF;
-    std::fclose(file);
-    if (read != payload || extra ||
-        ValidateNoteImageWqni(wqni->data(), wqni->size()) != ESP_OK) {
-        // Corrupt cache entries are dropped so the next request re-downloads.
-        unlink(path.c_str());
-        wqni->clear();
-        return ESP_ERR_INVALID_CRC;
-    }
-    return ESP_OK;
+    LoadNoteImageContext context = {&image_id, wqni};
+    return services::ExecuteStorageTransaction(LoadNoteImageTransaction, &context);
 }
 
 esp_err_t StoreCachedNoteImage(const std::string& image_id, const uint8_t* data, size_t size)
@@ -1489,26 +1558,18 @@ esp_err_t StoreCachedNoteImage(const std::string& image_id, const uint8_t* data,
     if (valid != ESP_OK) {
         return valid;
     }
-    EvictNoteImageCacheIfNeeded();
-    const std::string path = NoteImageCachePath(image_id);
-    const std::string temp = path + ".tmp";
-    FILE* file = std::fopen(temp.c_str(), "wb");
-    if (file == nullptr) {
-        return ESP_ERR_NO_MEM;
+    runtime::SleepLease storage_lease = runtime::SleepLease::TryAcquire(
+        runtime::SleepBlocker::kStorage,
+        "note-image-cache",
+        __FILE__,
+        __LINE__);
+    if (!storage_lease) {
+        return ESP_ERR_INVALID_STATE;
     }
-    const size_t written = std::fwrite(data, 1, size, file);
-    const bool flushed = std::fflush(file) == 0;
-    std::fclose(file);
-    if (written != size || !flushed) {
-        unlink(temp.c_str());
-        return ESP_FAIL;
-    }
-    unlink(path.c_str());
-    if (rename(temp.c_str(), path.c_str()) != 0) {
-        unlink(temp.c_str());
-        return ESP_FAIL;
-    }
-    return ESP_OK;
+    StoreNoteImageContext context = {&image_id, data, size};
+    return services::ExecuteStorageTransaction(
+        StoreNoteImageTransaction,
+        &context);
 }
 
 }  // namespace wqn

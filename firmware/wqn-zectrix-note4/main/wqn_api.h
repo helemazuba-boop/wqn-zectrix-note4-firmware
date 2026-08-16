@@ -309,7 +309,8 @@ esp_err_t FetchNoteStudyManifest(
     const protocol::v3::RequestMetadata& metadata,
     uint64_t cursor,
     WqnNotePackManifest* manifest,
-    const std::string& snapshot_id = {});
+    const std::string& snapshot_id = {},
+    protocol::v3::Error* error_out = nullptr);
 // Streams one notebook's note pack (application/x-ndjson) into `sink`. Bounded by
 // the manifest byte_size and the note-study-v1 pack cap.
 esp_err_t DownloadNotePackStream(
@@ -370,7 +371,8 @@ esp_err_t FetchProblemStudyManifest(
     const protocol::v3::RequestMetadata& metadata,
     uint64_t cursor,
     WqnProblemPackManifest* manifest,
-    const std::string& snapshot_id = {});
+    const std::string& snapshot_id = {},
+    protocol::v3::Error* error_out = nullptr);
 // Streams one problem set's pack (zlib transport, sha256 over the plaintext)
 // into `sink`. Bounded by the manifest byte_size and the contract pack cap.
 esp_err_t DownloadProblemPackStream(

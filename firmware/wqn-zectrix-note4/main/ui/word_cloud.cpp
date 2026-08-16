@@ -520,18 +520,9 @@ void ExecuteWordCloudRequest(const WordCloudRequest& request)
                 }
             }
             if (total_needed > 0) {
-                wqn::StorageCapacitySnapshot storage;
-                if (wqn::ReadStorageCapacitySnapshot(&storage) && storage.spiffs_valid) {
-                    const size_t available =
-                        storage.spiffs_total_bytes > storage.spiffs_used_bytes
-                            ? storage.spiffs_total_bytes - storage.spiffs_used_bytes
-                            : 0;
-                    if (available < total_needed) {
-                        ESP_LOGW(kTag, "SPIFFS space insufficient: need=%u avail=%u",
-                                 static_cast<unsigned>(total_needed), static_cast<unsigned>(available));
-                        result.result = ESP_ERR_NO_MEM;
-                        result.message = "存储空间不足";
-                    }
+                result.result = wqn::EnsurePackDownloadCapacity(total_needed);
+                if (result.result == ESP_ERR_NO_MEM) {
+                    result.message = "存储空间不足，已保留现有词库";
                 }
             }
 

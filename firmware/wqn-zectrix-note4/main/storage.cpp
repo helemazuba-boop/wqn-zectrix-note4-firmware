@@ -8,6 +8,9 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <dirent.h>
+#include <sys/stat.h>
+#include <ctime>
 #include <unistd.h>
 #include <vector>
 
@@ -57,6 +60,127 @@ constexpr char kStorageBasePath[] = "/storage";
 constexpr char kSyncJournalPath[] = "/storage/sync_journal.json";
 constexpr char kSyncJournalTempPath[] = "/storage/sync_journal.tmp";
 constexpr char kSyncJournalBackupPath[] = "/storage/sync_journal.bak";
+constexpr size_t kPackGcAttemptBytes = 1024U * 1024U;
+constexpr time_t kStaleTempAgeSeconds = 5 * 60;
+
+struct PackCapacityRequest {
+    size_t required_bytes = 0;
+    size_t safety_reserve_bytes = 0;
+};
+
+bool HasSuffix(const std::string& value, const char* suffix)
+{
+    const size_t suffix_length = std::strlen(suffix);
+    return value.size() >= suffix_length &&
+        value.compare(value.size() - suffix_length, suffix_length, suffix) == 0;
+}
+
+esp_err_t EnsurePackDownloadCapacityTransaction(void* opaque)
+{
+    const auto* request = static_cast<const PackCapacityRequest*>(opaque);
+    if (request == nullptr ||
+        request->required_bytes > SIZE_MAX - request->safety_reserve_bytes) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    const size_t target =
+        request->required_bytes + request->safety_reserve_bytes;
+    size_t total = 0;
+    size_t used = 0;
+    ESP_RETURN_ON_ERROR(
+        esp_spiffs_info(kStoragePartitionLabel, &total, &used),
+        kTag,
+        "read SPIFFS capacity before pack download");
+    size_t available = total > used ? total - used : 0;
+    if (available >= target) {
+        return ESP_OK;
+    }
+
+    // [storage-capacity-fix] StorageService serialization means no writer is
+    // inside a transaction while this runs. Remove interrupted transaction
+    // files first; final pack/manifests and their backups remain untouched.
+    DIR* directory = opendir(kStorageBasePath);
+    if (directory != nullptr) {
+        const time_t now = std::time(nullptr);
+        while (dirent* entry = readdir(directory)) {
+            const std::string name = entry->d_name;
+            if (!HasSuffix(name, ".tmp")) {
+                continue;
+            }
+            const std::string path = std::string(kStorageBasePath) + "/" + name;
+            struct stat info = {};
+            if (stat(path.c_str(), &info) != 0 || info.st_mtime <= 0 ||
+                now <= info.st_mtime ||
+                now - info.st_mtime < kStaleTempAgeSeconds) {
+                // Pack streams intentionally keep their temp file open across
+                // chunk transactions. Age-gating prevents a capacity check in
+                // another lane from unlinking an active download.
+                continue;
+            }
+            if (unlink(path.c_str()) == 0) {
+                ESP_LOGI(kTag, "removed stale storage temp: %s", name.c_str());
+            }
+        }
+        closedir(directory);
+    }
+
+    struct ImageCandidate {
+        std::string path;
+        time_t mtime = 0;
+    };
+    std::vector<ImageCandidate> images;
+    directory = opendir(kStorageBasePath);
+    if (directory != nullptr) {
+        while (dirent* entry = readdir(directory)) {
+            const std::string name = entry->d_name;
+            if (name.rfind("ni_", 0) != 0 || !HasSuffix(name, ".wqni")) {
+                continue;
+            }
+            const std::string path = std::string(kStorageBasePath) + "/" + name;
+            struct stat info = {};
+            images.push_back({path, stat(path.c_str(), &info) == 0 ? info.st_mtime : 0});
+        }
+        closedir(directory);
+    }
+    std::sort(images.begin(), images.end(), [](const auto& left, const auto& right) {
+        return left.mtime < right.mtime;
+    });
+    for (const ImageCandidate& image : images) {
+        if (esp_spiffs_info(kStoragePartitionLabel, &total, &used) != ESP_OK) {
+            return ESP_FAIL;
+        }
+        available = total > used ? total - used : 0;
+        if (available >= target) {
+            break;
+        }
+        if (unlink(image.path.c_str()) == 0) {
+            ESP_LOGI(kTag, "evicted image cache for pack capacity: %s",
+                     image.path.c_str());
+        }
+    }
+
+    const size_t gc_target = std::min(target, kPackGcAttemptBytes);
+    const esp_err_t gc_result = esp_spiffs_gc(kStoragePartitionLabel, gc_target);
+    if (gc_result != ESP_OK && gc_result != ESP_ERR_NOT_FINISHED) {
+        ESP_LOGW(kTag, "SPIFFS GC before pack download failed: %s",
+                 esp_err_to_name(gc_result));
+    }
+    ESP_RETURN_ON_ERROR(
+        esp_spiffs_info(kStoragePartitionLabel, &total, &used),
+        kTag,
+        "read SPIFFS capacity after reclaim");
+    available = total > used ? total - used : 0;
+    if (available < target) {
+        ESP_LOGW(
+            kTag,
+            "pack capacity blocked: required=%u reserve=%u available=%u total=%u",
+            static_cast<unsigned>(request->required_bytes),
+            static_cast<unsigned>(request->safety_reserve_bytes),
+            static_cast<unsigned>(available),
+            static_cast<unsigned>(total));
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
+}
 
 struct NvsHandle {
     ~NvsHandle()
@@ -741,6 +865,30 @@ bool ReadStorageCapacitySnapshot(StorageCapacitySnapshot* snapshot)
         snapshot->nvs_total_entries = stats.total_entries;
     }
     return snapshot->spiffs_valid || snapshot->nvs_valid;
+}
+
+esp_err_t EnsurePackDownloadCapacity(
+    size_t required_bytes,
+    size_t safety_reserve_bytes)
+{
+    if (required_bytes == 0) {
+        return ESP_OK;
+    }
+    runtime::SleepLease storage_lease = runtime::SleepLease::TryAcquire(
+        runtime::SleepBlocker::kStorage,
+        "pack-capacity-reclaim",
+        __FILE__,
+        __LINE__);
+    if (!storage_lease) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    PackCapacityRequest request = {
+        required_bytes,
+        safety_reserve_bytes,
+    };
+    return services::ExecuteStorageTransaction(
+        EnsurePackDownloadCapacityTransaction,
+        &request);
 }
 
 esp_err_t LoadAccessToken(std::string* token)
