@@ -374,18 +374,54 @@ esp_err_t SendData(uint8_t data)
     return ret;
 }
 
+// [gray16-dma-fix] ESP32-S3 SPI DMA cannot address Flash DROM, while the
+// 16-gray waveform table is constexpr and lives in .rodata. Copy every send
+// larger than the transaction's inline storage into internal DMA-capable SRAM
+// before transmitting, matching the reference demo's Transmit path.
+constexpr size_t kSpiDmaBounceSize = 1024;
+uint8_t* g_spi_dma_bounce = nullptr;
+
+esp_err_t EnsureSpiDmaBounce()
+{
+    if (g_spi_dma_bounce == nullptr) {
+        g_spi_dma_bounce = static_cast<uint8_t*>(heap_caps_malloc(
+            kSpiDmaBounceSize, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
+        if (g_spi_dma_bounce == nullptr) {
+            ESP_LOGE(kTag, "alloc SPI DMA bounce buffer failed");
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    return ESP_OK;
+}
+
 esp_err_t WriteBytes(const uint8_t* data, size_t len)
 {
     if (len == 0) {
         return ESP_OK;
     }
+    ESP_RETURN_ON_ERROR(EnsureSpiDmaBounce(), kTag, "SPI DMA bounce buffer");
 
     SetDc(true);
     SetCs(false);
-    spi_transaction_t transaction = {};
-    transaction.length = len * 8;
-    transaction.tx_buffer = data;
-    const esp_err_t ret = spi_device_polling_transmit(g_spi, &transaction);
+    esp_err_t ret = ESP_OK;
+    size_t offset = 0;
+    while (offset < len) {
+        const size_t chunk = std::min(len - offset, kSpiDmaBounceSize);
+        spi_transaction_t transaction = {};
+        transaction.length = chunk * 8;
+        if (chunk <= sizeof(transaction.tx_data)) {
+            transaction.flags = SPI_TRANS_USE_TXDATA;
+            std::memcpy(transaction.tx_data, data + offset, chunk);
+        } else {
+            std::memcpy(g_spi_dma_bounce, data + offset, chunk);
+            transaction.tx_buffer = g_spi_dma_bounce;
+        }
+        ret = spi_device_polling_transmit(g_spi, &transaction);
+        if (ret != ESP_OK) {
+            break;
+        }
+        offset += chunk;
+    }
     SetCs(true);
     return ret;
 }
@@ -1887,17 +1923,12 @@ esp_err_t RefreshEpdGray16(const uint8_t* gray4, size_t size)
         ESP_RETURN_ON_ERROR(InitEpdDisplay(), kTag, "lazy init EPD for gray16");
     }
 
-    // The reference gallery deliberately performs a genuine white 1bpp full
-    // refresh before every 4bpp scene. Keep that history-clearing pass here,
-    // in the shared gray entry point, so Note/Problem/Solution cannot skip it.
-    ClearEpdFramebuffer(true);
-    ESP_RETURN_ON_ERROR(
-        RefreshEpdFull(false, true), kTag,
-        "clear panel before gray16 refresh");
-
-    // RefreshEpdFull and a hot partial both leave controller state that the
-    // gray pipeline must not inherit. The demo's PrepareOtpRefresh resets and
-    // re-selects OTP before its second white base; preserve that invariant.
+    // Match zectrix_epd_refresh_full_4bpp: the only history-clearing pass is
+    // the OTP white base below. The reference demo's extra 1bpp full clear is
+    // an app-level gallery scene transition; putting it in this driver caused
+    // a black/white flash followed by a second white flash on every gray image.
+    // InitPanelSequence resets the controller and re-selects OTP, equivalent
+    // to the reference PrepareOtpRefresh, so no prior controller state leaks.
     ESP_RETURN_ON_ERROR(InitPanelSequence(), kTag, "prepare gray16 OTP refresh");
 
     esp_err_t result = WriteOtpWhiteBase();
