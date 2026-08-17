@@ -157,6 +157,14 @@ struct WifiCredentialStore {
     WifiCredentialSlot slots[2] = {};
 };
 
+// Stable roles exposed by the provisioning UI. `kPrimary` addresses the
+// preferred slot; `kBackup` addresses the other slot without changing which
+// network is preferred.
+enum class WifiCredentialRole : uint8_t {
+    kPrimary = 0,
+    kBackup,
+};
+
 // Loads the store, validating the blob and migrating legacy wifi_ssid/wifi_pass
 // keys when the blob is absent. On success `store` always holds a coherent
 // (possibly empty) store with version == 1. Returns ESP_OK when a valid store
@@ -170,6 +178,14 @@ esp_err_t SaveWifiCredentialStore(const WifiCredentialStore& store);
 // replaced. The touched slot becomes preferred. No-op writes (identical
 // ssid+password already preferred) skip the NVS commit.
 esp_err_t UpsertWifiCredential(const std::string& ssid, const std::string& password);
+// Updates one provisioning role explicitly. `keep_existing_password` is only
+// accepted when the submitted SSID still matches the credential currently in
+// that role. A backup cannot be created before a primary credential exists.
+esp_err_t SetWifiCredentialForRole(
+    WifiCredentialRole role,
+    const std::string& ssid,
+    const std::string& password,
+    bool keep_existing_password);
 // Marks `index` as the preferred (last-good) slot. Writes only when the value
 // actually changes, to bound NVS wear.
 esp_err_t MarkWifiSlotPreferred(uint8_t index);

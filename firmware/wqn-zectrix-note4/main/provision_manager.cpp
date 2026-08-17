@@ -76,20 +76,66 @@ void ProvisionTask(void*)
         }
 
         portal_ptr->SetSsidPrefix(kApSsidPrefix);
-        portal_ptr->SetCredentialsCallback([](const std::string& ssid, const std::string& password) {
-            const esp_err_t result = wqn::SaveWifiCredentials(ssid, password);
+        wqn::WifiCredentialStore initial_store;
+        const esp_err_t load_result = wqn::LoadWifiCredentialStore(&initial_store);
+        if (load_result != ESP_OK) {
+            ESP_LOGW(kTag, "load WiFi roles for portal failed: %s", esp_err_to_name(load_result));
+            initial_store = wqn::WifiCredentialStore{};
+        }
+        const bool has_primary = initial_store.count > 0 &&
+            initial_store.preferred < initial_store.count;
+        const uint8_t primary_index = has_primary ? initial_store.preferred : 0;
+        const bool has_backup = initial_store.count == 2;
+        const uint8_t backup_index = primary_index == 0 ? 1 : 0;
+        portal_ptr->SetStoredNetworks(
+            has_primary ? initial_store.slots[primary_index].ssid : "",
+            has_backup ? initial_store.slots[backup_index].ssid : "");
+        if (has_primary) {
+            std::lock_guard<std::mutex> lock(g_prov_mutex);
+            g_prov_ssid = initial_store.slots[primary_index].ssid;
+            g_prov_password = initial_store.slots[primary_index].password;
+            xEventGroupSetBits(g_prov_events, kCredentialsSavedBit);
+        }
+
+        portal_ptr->SetCredentialsCallback([](
+            wqn::provision::NetworkRole role,
+            const std::string& ssid,
+            const std::string& password,
+            bool keep_existing_password) {
+            const wqn::WifiCredentialRole storage_role =
+                role == wqn::provision::NetworkRole::kPrimary
+                ? wqn::WifiCredentialRole::kPrimary
+                : wqn::WifiCredentialRole::kBackup;
+            const esp_err_t result = wqn::SetWifiCredentialForRole(
+                storage_role, ssid, password, keep_existing_password);
             if (result != ESP_OK) {
                 ESP_LOGE(kTag, "save WiFi credentials failed: %s", esp_err_to_name(result));
                 return result;
             }
+
+            // Always refresh the eventual STA handoff from the durable primary
+            // slot. Saving a backup must not make it preferred or connect to it.
+            wqn::WifiCredentialStore updated_store;
+            const esp_err_t reload_result = wqn::LoadWifiCredentialStore(&updated_store);
+            if (reload_result != ESP_OK || updated_store.count == 0 ||
+                updated_store.preferred >= updated_store.count) {
+                ESP_LOGE(kTag, "reload WiFi roles after save failed: %s", esp_err_to_name(reload_result));
+                return reload_result == ESP_OK ? ESP_ERR_INVALID_STATE : reload_result;
+            }
             {
                 std::lock_guard<std::mutex> lock(g_prov_mutex);
-                g_prov_ssid = ssid;
-                g_prov_password = password;
+                g_prov_ssid = updated_store.slots[updated_store.preferred].ssid;
+                g_prov_password = updated_store.slots[updated_store.preferred].password;
             }
-            g_prov_state = wqn::ProvisionState::kConnecting;
+            g_prov_state = role == wqn::provision::NetworkRole::kPrimary
+                ? wqn::ProvisionState::kConnecting
+                : wqn::ProvisionState::kScanning;
             xEventGroupSetBits(g_prov_events, kCredentialsSavedBit);
-            ESP_LOGI(kTag, "WiFi credentials saved: SSID=%s", ssid.c_str());
+            ESP_LOGI(
+                kTag,
+                "%s WiFi credentials saved: SSID=%s",
+                role == wqn::provision::NetworkRole::kPrimary ? "primary" : "backup",
+                ssid.c_str());
             return ESP_OK;
         });
         portal_ptr->SetExitCallback([]() {

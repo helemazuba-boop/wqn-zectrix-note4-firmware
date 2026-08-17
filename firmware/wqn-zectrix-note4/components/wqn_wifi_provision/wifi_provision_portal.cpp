@@ -59,6 +59,15 @@ void WifiProvisionPortal::SetSsidPrefix(std::string prefix)
     ssid_prefix_ = std::move(prefix);
 }
 
+void WifiProvisionPortal::SetStoredNetworks(
+    std::string primary_ssid,
+    std::string backup_ssid)
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    primary_ssid_ = std::move(primary_ssid);
+    backup_ssid_ = std::move(backup_ssid);
+}
+
 void WifiProvisionPortal::SetCredentialsCallback(CredentialsCallback callback)
 {
     credentials_callback_ = std::move(callback);
@@ -81,7 +90,12 @@ esp_err_t WifiProvisionPortal::Start()
         return ESP_ERR_INVALID_STATE;
     }
 
-    credentials_saved_ = false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        // An existing primary is enough to leave the portal without changing
+        // it. This is needed when the user only adds or edits the backup.
+        credentials_saved_ = !primary_ssid_.empty();
+    }
     esp_err_t result = esp_netif_init();
     if (result != ESP_OK && result != ESP_ERR_INVALID_STATE) {
         running_ = false;
@@ -219,6 +233,14 @@ esp_err_t WifiProvisionPortal::StartWebServer()
         },
         .user_ctx = this,
     };
+    const httpd_uri_t networks = {
+        .uri = "/networks",
+        .method = HTTP_GET,
+        .handler = [](httpd_req_t* req) {
+            return static_cast<WifiProvisionPortal*>(req->user_ctx)->HandleNetworks(req);
+        },
+        .user_ctx = this,
+    };
     const httpd_uri_t submit = {
         .uri = "/submit",
         .method = HTTP_POST,
@@ -250,7 +272,7 @@ esp_err_t WifiProvisionPortal::StartWebServer()
         .user_ctx = this,
     };
 
-    for (const httpd_uri_t* handler : {&root, &scan, &submit, &done, &exit, &captive}) {
+    for (const httpd_uri_t* handler : {&root, &scan, &networks, &submit, &done, &exit, &captive}) {
         const esp_err_t result = RegisterHandler(server_, *handler);
         if (result != ESP_OK) {
             httpd_stop(server_);
@@ -454,6 +476,37 @@ esp_err_t WifiProvisionPortal::HandleScan(httpd_req_t* req)
     return httpd_resp_sendstr_chunk(req, nullptr);
 }
 
+esp_err_t WifiProvisionPortal::HandleNetworks(httpd_req_t* req)
+{
+    std::string primary_ssid;
+    std::string backup_ssid;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        primary_ssid = primary_ssid_;
+        backup_ssid = backup_ssid_;
+    }
+
+    cJSON* root = cJSON_CreateObject();
+    if (root == nullptr ||
+        !cJSON_AddStringToObject(root, "primary_ssid", primary_ssid.c_str()) ||
+        !cJSON_AddStringToObject(root, "backup_ssid", backup_ssid.c_str())) {
+        cJSON_Delete(root);
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
+    }
+    char* rendered = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (rendered == nullptr) {
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_set_hdr(req, "Connection", "close");
+    const esp_err_t result = httpd_resp_send(req, rendered, HTTPD_RESP_USE_STRLEN);
+    cJSON_free(rendered);
+    return result;
+}
+
 esp_err_t WifiProvisionPortal::HandleSubmit(httpd_req_t* req)
 {
     if (req->content_len == 0 || req->content_len > kMaxSubmitBodySize) {
@@ -486,12 +539,18 @@ esp_err_t WifiProvisionPortal::HandleSubmit(httpd_req_t* req)
 
     cJSON* ssid_item = cJSON_GetObjectItemCaseSensitive(json, "ssid");
     cJSON* password_item = cJSON_GetObjectItemCaseSensitive(json, "password");
+    cJSON* role_item = cJSON_GetObjectItemCaseSensitive(json, "role");
+    cJSON* keep_password_item = cJSON_GetObjectItemCaseSensitive(json, "keep_password");
     const bool ssid_valid = cJSON_IsString(ssid_item) && ssid_item->valuestring != nullptr &&
         std::strlen(ssid_item->valuestring) > 0 && std::strlen(ssid_item->valuestring) <= 32;
     const bool password_valid = password_item == nullptr ||
         (cJSON_IsString(password_item) && password_item->valuestring != nullptr &&
          std::strlen(password_item->valuestring) <= 64);
-    if (!ssid_valid || !password_valid) {
+    const bool role_valid = cJSON_IsString(role_item) && role_item->valuestring != nullptr &&
+        (std::strcmp(role_item->valuestring, "primary") == 0 ||
+         std::strcmp(role_item->valuestring, "backup") == 0);
+    const bool keep_password_valid = keep_password_item == nullptr || cJSON_IsBool(keep_password_item);
+    if (!ssid_valid || !password_valid || !role_valid || !keep_password_valid) {
         cJSON_Delete(json);
         httpd_resp_set_type(req, "application/json");
         return httpd_resp_send(req, "{\"success\":false,\"error\":\"Invalid credentials\"}", HTTPD_RESP_USE_STRLEN);
@@ -499,10 +558,14 @@ esp_err_t WifiProvisionPortal::HandleSubmit(httpd_req_t* req)
 
     const std::string ssid = ssid_item->valuestring;
     const std::string password = password_item == nullptr ? "" : password_item->valuestring;
+    const NetworkRole role = std::strcmp(role_item->valuestring, "primary") == 0
+        ? NetworkRole::kPrimary
+        : NetworkRole::kBackup;
+    const bool keep_existing_password = cJSON_IsTrue(keep_password_item);
     cJSON_Delete(json);
 
     const esp_err_t save_result = credentials_callback_
-        ? credentials_callback_(ssid, password)
+        ? credentials_callback_(role, ssid, password, keep_existing_password)
         : ESP_ERR_INVALID_STATE;
     if (save_result != ESP_OK) {
         ESP_LOGE(kTag, "credential callback failed: %s", esp_err_to_name(save_result));
@@ -510,16 +573,34 @@ esp_err_t WifiProvisionPortal::HandleSubmit(httpd_req_t* req)
         return httpd_resp_send(req, "{\"success\":false,\"error\":\"Save failed\"}", HTTPD_RESP_USE_STRLEN);
     }
 
-    credentials_saved_ = true;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (role == NetworkRole::kPrimary) {
+            primary_ssid_ = ssid;
+        } else {
+            backup_ssid_ = ssid;
+        }
+        credentials_saved_ = !primary_ssid_.empty();
+    }
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
     httpd_resp_set_hdr(req, "Connection", "close");
-    return httpd_resp_send(req, "{\"success\":true}", HTTPD_RESP_USE_STRLEN);
+    return httpd_resp_send(
+        req,
+        role == NetworkRole::kPrimary
+            ? "{\"success\":true,\"connect\":true}"
+            : "{\"success\":true,\"connect\":false}",
+        HTTPD_RESP_USE_STRLEN);
 }
 
 esp_err_t WifiProvisionPortal::HandleExit(httpd_req_t* req)
 {
-    if (!credentials_saved_) {
+    bool can_exit = false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        can_exit = credentials_saved_;
+    }
+    if (!can_exit) {
         httpd_resp_set_type(req, "application/json");
         return httpd_resp_send(req, "{\"success\":false,\"error\":\"No credentials saved\"}", HTTPD_RESP_USE_STRLEN);
     }

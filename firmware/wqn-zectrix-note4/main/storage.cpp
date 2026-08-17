@@ -1740,6 +1740,76 @@ esp_err_t UpsertWifiCredential(const std::string& ssid, const std::string& passw
     return SaveWifiCredentialStore(store);
 }
 
+esp_err_t SetWifiCredentialForRole(
+    WifiCredentialRole role,
+    const std::string& ssid,
+    const std::string& password,
+    bool keep_existing_password)
+{
+    if (ssid.empty() || ssid.size() > kWifiSsidMaxLen || password.size() > kWifiPasswordMaxLen) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    WifiCredentialStore store;
+    ESP_RETURN_ON_ERROR(LoadWifiCredentialStore(&store), kTag, "load store for role update");
+
+    uint8_t target = 0;
+    bool target_exists = false;
+    switch (role) {
+        case WifiCredentialRole::kPrimary:
+            target = store.count == 0 ? 0 : store.preferred;
+            target_exists = store.count > 0;
+            break;
+        case WifiCredentialRole::kBackup:
+            if (store.count == 0) {
+                return ESP_ERR_INVALID_STATE;
+            }
+            target = store.count == 1 ? 1 : static_cast<uint8_t>(store.preferred == 0 ? 1 : 0);
+            target_exists = store.count == 2;
+            break;
+        default:
+            return ESP_ERR_INVALID_ARG;
+    }
+
+    const bool same_ssid = target_exists &&
+        std::strcmp(store.slots[target].ssid, ssid.c_str()) == 0;
+    if (keep_existing_password && !same_ssid) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    // The two roles must remain distinct. Keeping duplicate SSIDs would make
+    // failover ambiguous and the store validator would collapse the slots.
+    for (uint8_t i = 0; i < store.count; ++i) {
+        if (i != target && std::strcmp(store.slots[i].ssid, ssid.c_str()) == 0) {
+            return ESP_ERR_INVALID_ARG;
+        }
+    }
+
+    const char* effective_password = keep_existing_password
+        ? store.slots[target].password
+        : password.c_str();
+    const bool unchanged = same_ssid &&
+        std::strcmp(store.slots[target].password, effective_password) == 0 &&
+        (role != WifiCredentialRole::kPrimary || store.preferred == target);
+    if (unchanged) {
+        return ESP_OK;
+    }
+
+    if (!target_exists) {
+        ++store.count;
+    }
+    WifiCredentialSlot replacement{};
+    CopyWifiCredentialField(replacement.ssid, sizeof(replacement.ssid), ssid.c_str());
+    CopyWifiCredentialField(
+        replacement.password, sizeof(replacement.password), effective_password);
+    store.slots[target] = replacement;
+    if (role == WifiCredentialRole::kPrimary) {
+        store.preferred = target;
+    }
+    store.version = kWifiCredentialStoreVersion;
+    return SaveWifiCredentialStore(store);
+}
+
 esp_err_t MarkWifiSlotPreferred(uint8_t index)
 {
     WifiCredentialStore store;
