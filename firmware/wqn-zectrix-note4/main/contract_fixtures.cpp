@@ -49,7 +49,14 @@ const char kV3Sync[] = R"json({
       "todo_count": 2,
       "word_due_count": 5
     },
-    "content_manifest": []
+    "content_manifest": [
+      { "kind": "problems", "revision": 12, "cursor": "problems:12" },
+      { "kind": "todos", "revision": 0, "cursor": "todos:0" },
+      { "kind": "words", "revision": 17 },
+      { "kind": "word_packs", "revision": 9, "cursor": "word_packs:9" },
+      { "kind": "note_packs", "revision": 0, "cursor": "note_packs:0" },
+      { "kind": "problem_packs", "revision": 0, "cursor": "problem_packs:0" }
+    ]
   }
 })json";
 
@@ -896,7 +903,43 @@ bool CheckV3ControlContract()
             "v3 sync parse") ||
         !Require(sync.due_problem_ids.size() == 1, "v3 sync due count") ||
         !Require(sync.todo_count == 2, "v3 sync todo count") ||
-        !Require(sync.word_due_count == 5, "v3 sync word count")) {
+        !Require(sync.word_due_count == 5, "v3 sync word count") ||
+        !Require(sync.content_targets.size() == 6, "v3 sync content target count") ||
+        !Require(sync.content_targets[1].revision == 0, "v3 sync accepts zero revision") ||
+        !Require(sync.content_targets[2].cursor.empty(), "v3 sync accepts missing cursor") ||
+        !Require(sync.content_targets[4].revision == 0, "v3 sync accepts empty note domain") ||
+        !Require(sync.content_targets[5].revision == 0, "v3 sync accepts empty problem domain")) {
+        return false;
+    }
+
+    std::string invalid_revision = kV3Sync;
+    const size_t revision_position = invalid_revision.find("\"revision\": 0");
+    if (!Require(revision_position != std::string::npos, "v3 zero revision fixture mutation")) {
+        return false;
+    }
+    invalid_revision.replace(revision_position, std::strlen("\"revision\": 0"), "\"revision\": -1");
+    if (!Require(
+            wqn::protocol::v3::ParseSyncResponse(
+                invalid_revision, "req_sync_000000001", &sync, &error) ==
+                ESP_ERR_INVALID_RESPONSE,
+            "v3 sync rejects negative revision")) {
+        return false;
+    }
+
+    std::string invalid_cursor = kV3Sync;
+    const size_t cursor_position = invalid_cursor.find("\"cursor\": \"todos:0\"");
+    if (!Require(cursor_position != std::string::npos, "v3 cursor fixture mutation")) {
+        return false;
+    }
+    invalid_cursor.replace(
+        cursor_position,
+        std::strlen("\"cursor\": \"todos:0\""),
+        "\"cursor\": 0");
+    if (!Require(
+            wqn::protocol::v3::ParseSyncResponse(
+                invalid_cursor, "req_sync_000000001", &sync, &error) ==
+                ESP_ERR_INVALID_RESPONSE,
+            "v3 sync rejects non-string cursor")) {
         return false;
     }
 

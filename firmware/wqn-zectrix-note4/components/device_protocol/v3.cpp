@@ -453,15 +453,24 @@ esp_err_t ParseSyncResponse(
                 return ESP_ERR_INVALID_RESPONSE;
             }
             uint64_t revision = 0;
-            if (!U64Field(entry, "revision", &revision) || revision == 0) {
+            // Revision zero is the protocol's valid "known empty" value. The
+            // authoritative JSON Schema permits non-negative counters and the
+            // server emits zero when a user has no content in a domain.
+            if (!U64Field(entry, "revision", &revision)) {
                 return ESP_ERR_INVALID_RESPONSE;
             }
             SyncContentTarget target;
             target.kind = parsed_kind;
             target.revision = revision;
-            target.cursor = StringField(entry, "cursor");
-            if (target.cursor.empty()) {
+            cJSON* cursor = cJSON_GetObjectItemCaseSensitive(entry, "cursor");
+            // Cursor is optional in device-control-v3. If a server supplies
+            // it, keep validating the declared string type strictly.
+            if (cursor != nullptr &&
+                (!cJSON_IsString(cursor) || cursor->valuestring == nullptr)) {
                 return ESP_ERR_INVALID_RESPONSE;
+            }
+            if (cursor != nullptr) {
+                target.cursor = cursor->valuestring;
             }
             seen[seen_index] = true;
             data->content_targets.push_back(std::move(target));
