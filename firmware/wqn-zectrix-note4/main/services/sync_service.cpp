@@ -55,6 +55,7 @@ enum FullSyncReason : uint32_t {
 std::atomic<uint32_t> g_full_sync_reasons{0};
 std::atomic<bool> g_word_outbox_sync_requested{false};
 std::atomic<bool> g_outbox_immediate_requested{false};
+std::atomic<bool> g_outbox_transport_resume_requested{false};
 std::atomic<uint32_t> g_auto_sync_interval_minutes{0};
 std::atomic<int64_t> g_next_periodic_sync_not_before_ms{0};
 std::atomic<bool> g_boot_outbox_pending{false};
@@ -75,8 +76,19 @@ constexpr uint32_t kNotePacksRefreshBit = 1u << 1;
 constexpr uint32_t kProblemPacksRefreshBit = 1u << 2;
 std::atomic<uint32_t> g_word_interaction_generation{0};
 constexpr uint32_t kWordOutboxQuietPeriodMs = 5000;
+// A steady stream of study input may keep resetting the 5-second debounce.
+// Bound the pre-upload sleep lease so active use still makes durable progress
+// without turning a non-empty outbox into a permanent sleep blocker.
+constexpr uint32_t kOutboxFlushLeaseMaxMs = 15000;
 StaticTimer_t g_word_outbox_timer_storage;
 TimerHandle_t g_word_outbox_timer = nullptr;
+portMUX_TYPE g_outbox_quiet_lock = portMUX_INITIALIZER_UNLOCKED;
+bool g_outbox_quiet_active = false;
+int64_t g_outbox_quiet_due_ms = 0;
+int64_t g_outbox_quiet_deadline_ms = 0;
+uint32_t g_outbox_quiet_generation = 0;
+uint32_t g_outbox_ready_generation = 0;
+bool g_outbox_lease_cycle_expired = false;
 wqn::SyncJournal g_sync_journal = {};
 bool g_sync_journal_loaded = false;
 StaticSemaphore_t g_sync_journal_mutex_storage;
@@ -328,6 +340,163 @@ bool ProbeDurableOutboxWork()
     return false;
 }
 
+uint32_t ArmOutboxQuietWindow()
+{
+    const int64_t now_ms = esp_timer_get_time() / 1000;
+    uint32_t generation = 0;
+    taskENTER_CRITICAL(&g_outbox_quiet_lock);
+    generation = ++g_outbox_quiet_generation;
+    if (generation == 0) {
+        generation = ++g_outbox_quiet_generation;
+    }
+    if (!g_outbox_quiet_active) {
+        g_outbox_quiet_deadline_ms =
+            now_ms + static_cast<int64_t>(kOutboxFlushLeaseMaxMs);
+    }
+    g_outbox_quiet_due_ms =
+        now_ms + static_cast<int64_t>(kWordOutboxQuietPeriodMs);
+    g_outbox_quiet_active = true;
+    taskEXIT_CRITICAL(&g_outbox_quiet_lock);
+    return generation;
+}
+
+void PublishOutboxReadyGeneration(uint32_t generation)
+{
+    taskENTER_CRITICAL(&g_outbox_quiet_lock);
+    g_outbox_ready_generation = generation;
+    taskEXIT_CRITICAL(&g_outbox_quiet_lock);
+    // Publish urgency before the ready flag. A consumer that observes the flag
+    // must also observe that this round is due now rather than retry-deferred.
+    g_outbox_immediate_requested.store(true, std::memory_order_relaxed);
+    g_word_outbox_sync_requested.store(true, std::memory_order_release);
+    if (g_sync_service_task != nullptr) {
+        xTaskNotifyGive(g_sync_service_task);
+    }
+}
+
+void PublishCurrentOutboxQuietWindowReady()
+{
+    uint32_t generation = 0;
+    bool ready = false;
+    taskENTER_CRITICAL(&g_outbox_quiet_lock);
+    if (g_outbox_quiet_active) {
+        generation = g_outbox_quiet_generation;
+        g_outbox_ready_generation = generation;
+        ready = true;
+    }
+    taskEXIT_CRITICAL(&g_outbox_quiet_lock);
+    if (!ready) {
+        return;
+    }
+    g_outbox_immediate_requested.store(true, std::memory_order_relaxed);
+    g_word_outbox_sync_requested.store(true, std::memory_order_release);
+    if (g_sync_service_task != nullptr) {
+        xTaskNotifyGive(g_sync_service_task);
+    }
+}
+
+bool OutboxQuietWindowActive()
+{
+    bool active = false;
+    taskENTER_CRITICAL(&g_outbox_quiet_lock);
+    active = g_outbox_quiet_active;
+    taskEXIT_CRITICAL(&g_outbox_quiet_lock);
+    return active;
+}
+
+TickType_t OutboxQuietLeaseWaitDelay()
+{
+    bool active = false;
+    int64_t deadline_ms = 0;
+    taskENTER_CRITICAL(&g_outbox_quiet_lock);
+    active = g_outbox_quiet_active;
+    deadline_ms = g_outbox_quiet_deadline_ms;
+    taskEXIT_CRITICAL(&g_outbox_quiet_lock);
+    if (!active) {
+        return portMAX_DELAY;
+    }
+    const int64_t remaining_ms = deadline_ms - esp_timer_get_time() / 1000;
+    if (remaining_ms <= 0) {
+        return 0;
+    }
+    return pdMS_TO_TICKS(static_cast<uint32_t>(std::min<int64_t>(
+        remaining_ms, kOutboxFlushLeaseMaxMs)));
+}
+
+uint32_t SecondsUntilOutboxQuietWake()
+{
+    bool active = false;
+    int64_t due_ms = 0;
+    taskENTER_CRITICAL(&g_outbox_quiet_lock);
+    active = g_outbox_quiet_active;
+    due_ms = g_outbox_quiet_due_ms;
+    taskEXIT_CRITICAL(&g_outbox_quiet_lock);
+    if (!active) {
+        return UINT32_MAX;
+    }
+    const int64_t remaining_ms = due_ms - esp_timer_get_time() / 1000;
+    return remaining_ms <= 0
+        ? 1
+        : static_cast<uint32_t>(std::max<int64_t>(
+              1, (remaining_ms + 999) / 1000));
+}
+
+void ForceExpiredOutboxQuietWindow()
+{
+    bool expired = false;
+    uint32_t generation = 0;
+    const int64_t now_ms = esp_timer_get_time() / 1000;
+    taskENTER_CRITICAL(&g_outbox_quiet_lock);
+    if (g_outbox_quiet_active && g_outbox_quiet_deadline_ms <= now_ms) {
+        generation = g_outbox_quiet_generation;
+        g_outbox_ready_generation = generation;
+        g_outbox_quiet_active = false;
+        g_outbox_quiet_due_ms = 0;
+        g_outbox_quiet_deadline_ms = 0;
+        g_outbox_lease_cycle_expired = true;
+        expired = true;
+    }
+    taskEXIT_CRITICAL(&g_outbox_quiet_lock);
+    if (!expired) {
+        return;
+    }
+    ESP_LOGI(
+        kTag,
+        "outbox quiet window capped; forcing bounded progress: generation=%lu",
+        static_cast<unsigned long>(generation));
+    g_outbox_immediate_requested.store(true, std::memory_order_relaxed);
+    g_word_outbox_sync_requested.store(true, std::memory_order_release);
+    if (g_sync_service_task != nullptr) {
+        xTaskNotifyGive(g_sync_service_task);
+    }
+}
+
+void ClaimOutboxReadyGeneration()
+{
+    taskENTER_CRITICAL(&g_outbox_quiet_lock);
+    const uint32_t ready_generation = g_outbox_ready_generation;
+    g_outbox_ready_generation = 0;
+    // A newer durable observation may have reset the timer after an older
+    // callback fired. Keep that newer quiet window (and its lease) armed.
+    if (ready_generation != 0 &&
+        ready_generation == g_outbox_quiet_generation) {
+        g_outbox_quiet_active = false;
+        g_outbox_quiet_due_ms = 0;
+        g_outbox_quiet_deadline_ms = 0;
+    }
+    taskEXIT_CRITICAL(&g_outbox_quiet_lock);
+}
+
+bool TakeOutboxLeaseCycleExpired()
+{
+    bool expired = false;
+    taskENTER_CRITICAL(&g_outbox_quiet_lock);
+    expired = g_outbox_lease_cycle_expired;
+    g_outbox_lease_cycle_expired = false;
+    taskEXIT_CRITICAL(&g_outbox_quiet_lock);
+    return expired;
+}
+
 wqn::services::SyncContentSnapshot* ContentSnapshotForKind(
     wqn::protocol::v3::SyncContentKind kind)
 {
@@ -447,11 +616,7 @@ void PublishContentTargets(
 
 void WordOutboxTimerCallback(TimerHandle_t)
 {
-    g_outbox_immediate_requested.store(true, std::memory_order_relaxed);
-    g_word_outbox_sync_requested.store(true, std::memory_order_release);
-    if (g_sync_service_task != nullptr) {
-        xTaskNotifyGive(g_sync_service_task);
-    }
+    PublishCurrentOutboxQuietWindowReady();
 }
 #endif
 
@@ -479,16 +644,101 @@ std::string g_claim_id;
 uint32_t g_claim_poll_interval_ms = kClaimPollFloorMs;
 uint8_t g_claim_retry_attempts = 0;
 bool g_claim_active = false;
-std::string g_word_outbox_retry_request_id;
-int64_t g_word_outbox_retry_not_before_ms = 0;
-uint8_t g_word_outbox_retry_attempts = 0;
 
 enum class WordOutboxUploadState : uint8_t {
     kDrained,
     kPending,
     kYielded,
+    kAuthenticationRequired,
     kFailed,
 };
+
+enum class OutboxRetryCause : uint8_t {
+    kNone,
+    kTransport,
+    kServer,
+    kLocalStorage,
+};
+
+enum class OutboxFailureDisposition : uint8_t {
+    kAuthenticationRequired,
+    kTransientTransport,
+    kTransientServer,
+    kTerminalRecord,
+};
+
+constexpr OutboxFailureDisposition ClassifyOutboxFailure(
+    bool authentication_required,
+    bool transport_failure,
+    bool server_retryable,
+    bool has_error_code)
+{
+    if (authentication_required) {
+        return OutboxFailureDisposition::kAuthenticationRequired;
+    }
+    if (transport_failure) {
+        return OutboxFailureDisposition::kTransientTransport;
+    }
+    // A missing/invalid response envelope is ambiguous: the server may have
+    // durably accepted the idempotency key before the response was damaged.
+    // Retry it; quarantine is reserved for an explicit non-retryable code.
+    if (server_retryable || !has_error_code) {
+        return OutboxFailureDisposition::kTransientServer;
+    }
+    return OutboxFailureDisposition::kTerminalRecord;
+}
+
+static_assert(
+    ClassifyOutboxFailure(true, false, false, true) ==
+        OutboxFailureDisposition::kAuthenticationRequired);
+static_assert(
+    ClassifyOutboxFailure(false, true, false, false) ==
+        OutboxFailureDisposition::kTransientTransport);
+static_assert(
+    ClassifyOutboxFailure(false, false, false, false) ==
+        OutboxFailureDisposition::kTransientServer);
+static_assert(
+    ClassifyOutboxFailure(false, false, false, true) ==
+        OutboxFailureDisposition::kTerminalRecord);
+
+OutboxFailureDisposition ClassifyOutboxFailure(
+    const wqn::protocol::v3::Error& error,
+    bool transport_failure,
+    bool force_retryable = false)
+{
+    return ClassifyOutboxFailure(
+        error.code == "UNAUTHORIZED",
+        transport_failure,
+        error.retryable || force_retryable,
+        !error.code.empty());
+}
+
+OutboxRetryCause RetryCauseFor(OutboxFailureDisposition disposition)
+{
+    return disposition == OutboxFailureDisposition::kTransientTransport
+        ? OutboxRetryCause::kTransport
+        : OutboxRetryCause::kServer;
+}
+
+const char* OutboxRetryCauseName(OutboxRetryCause cause)
+{
+    switch (cause) {
+        case OutboxRetryCause::kTransport:
+            return "transport";
+        case OutboxRetryCause::kServer:
+            return "server";
+        case OutboxRetryCause::kLocalStorage:
+            return "local-storage";
+        case OutboxRetryCause::kNone:
+        default:
+            return "none";
+    }
+}
+
+std::string g_word_outbox_retry_request_id;
+int64_t g_word_outbox_retry_not_before_ms = 0;
+uint8_t g_word_outbox_retry_attempts = 0;
+OutboxRetryCause g_word_outbox_retry_cause = OutboxRetryCause::kNone;
 
 enum class SyncRoundOutcome : uint8_t {
     kSucceeded,
@@ -507,6 +757,7 @@ WordOutboxUploadState g_last_word_outbox_upload_state =
 std::string g_note_outbox_retry_request_id;
 int64_t g_note_outbox_retry_not_before_ms = 0;
 uint8_t g_note_outbox_retry_attempts = 0;
+OutboxRetryCause g_note_outbox_retry_cause = OutboxRetryCause::kNone;
 WordOutboxUploadState g_last_note_outbox_upload_state =
     WordOutboxUploadState::kDrained;
 
@@ -516,6 +767,7 @@ WordOutboxUploadState g_last_note_outbox_upload_state =
 std::string g_problem_outbox_retry_request_id;
 int64_t g_problem_outbox_retry_not_before_ms = 0;
 uint8_t g_problem_outbox_retry_attempts = 0;
+OutboxRetryCause g_problem_outbox_retry_cause = OutboxRetryCause::kNone;
 WordOutboxUploadState g_last_problem_outbox_upload_state =
     WordOutboxUploadState::kDrained;
 
@@ -524,6 +776,7 @@ void ResetWordOutboxRetryBackoff()
     g_word_outbox_retry_request_id.clear();
     g_word_outbox_retry_not_before_ms = 0;
     g_word_outbox_retry_attempts = 0;
+    g_word_outbox_retry_cause = OutboxRetryCause::kNone;
 }
 
 bool WordOutboxRetryDeferred(
@@ -539,7 +792,8 @@ bool WordOutboxRetryDeferred(
 
 void ScheduleWordOutboxRetry(
     const std::string& request_id,
-    uint32_t server_retry_after_ms)
+    uint32_t server_retry_after_ms,
+    OutboxRetryCause cause)
 {
     if (g_word_outbox_retry_request_id != request_id) {
         ResetWordOutboxRetryBackoff();
@@ -564,10 +818,12 @@ void ScheduleWordOutboxRetry(
     }
     g_word_outbox_retry_not_before_ms =
         esp_timer_get_time() / 1000 + static_cast<int64_t>(delay_ms);
+    g_word_outbox_retry_cause = cause;
     ESP_LOGW(
         kTag,
-        "word outbox retry scheduled: request=%s attempt=%u retry_after_ms=%lu",
+        "word outbox retry scheduled: request=%s cause=%s attempt=%u retry_after_ms=%lu",
         request_id.c_str(),
+        OutboxRetryCauseName(cause),
         static_cast<unsigned>(g_word_outbox_retry_attempts),
         static_cast<unsigned long>(delay_ms));
 }
@@ -592,6 +848,7 @@ void ResetNoteOutboxRetryBackoff()
     g_note_outbox_retry_request_id.clear();
     g_note_outbox_retry_not_before_ms = 0;
     g_note_outbox_retry_attempts = 0;
+    g_note_outbox_retry_cause = OutboxRetryCause::kNone;
 }
 
 bool NoteOutboxRetryDeferred(
@@ -607,7 +864,8 @@ bool NoteOutboxRetryDeferred(
 
 void ScheduleNoteOutboxRetry(
     const std::string& request_id,
-    uint32_t server_retry_after_ms)
+    uint32_t server_retry_after_ms,
+    OutboxRetryCause cause)
 {
     if (g_note_outbox_retry_request_id != request_id) {
         ResetNoteOutboxRetryBackoff();
@@ -632,10 +890,12 @@ void ScheduleNoteOutboxRetry(
     }
     g_note_outbox_retry_not_before_ms =
         esp_timer_get_time() / 1000 + static_cast<int64_t>(delay_ms);
+    g_note_outbox_retry_cause = cause;
     ESP_LOGW(
         kTag,
-        "note outbox retry scheduled: request=%s attempt=%u retry_after_ms=%lu",
+        "note outbox retry scheduled: request=%s cause=%s attempt=%u retry_after_ms=%lu",
         request_id.c_str(),
+        OutboxRetryCauseName(cause),
         static_cast<unsigned>(g_note_outbox_retry_attempts),
         static_cast<unsigned long>(delay_ms));
 }
@@ -660,6 +920,7 @@ void ResetProblemOutboxRetryBackoff()
     g_problem_outbox_retry_request_id.clear();
     g_problem_outbox_retry_not_before_ms = 0;
     g_problem_outbox_retry_attempts = 0;
+    g_problem_outbox_retry_cause = OutboxRetryCause::kNone;
 }
 
 bool ProblemOutboxRetryDeferred(
@@ -675,7 +936,8 @@ bool ProblemOutboxRetryDeferred(
 
 void ScheduleProblemOutboxRetry(
     const std::string& request_id,
-    uint32_t server_retry_after_ms)
+    uint32_t server_retry_after_ms,
+    OutboxRetryCause cause)
 {
     if (g_problem_outbox_retry_request_id != request_id) {
         ResetProblemOutboxRetryBackoff();
@@ -700,10 +962,12 @@ void ScheduleProblemOutboxRetry(
     }
     g_problem_outbox_retry_not_before_ms =
         esp_timer_get_time() / 1000 + static_cast<int64_t>(delay_ms);
+    g_problem_outbox_retry_cause = cause;
     ESP_LOGW(
         kTag,
-        "problem outbox retry scheduled: request=%s attempt=%u retry_after_ms=%lu",
+        "problem outbox retry scheduled: request=%s cause=%s attempt=%u retry_after_ms=%lu",
         request_id.c_str(),
+        OutboxRetryCauseName(cause),
         static_cast<unsigned>(g_problem_outbox_retry_attempts),
         static_cast<unsigned long>(delay_ms));
 }
@@ -721,6 +985,32 @@ TickType_t ProblemOutboxRetryWaitDelay()
     return pdMS_TO_TICKS(
         static_cast<uint32_t>(
             std::min<int64_t>(remaining_ms, kWordOutboxRetryMaxMs)));
+}
+
+void ResumeTransportDeferredOutboxes()
+{
+    bool resumed = false;
+    if (!g_word_outbox_retry_request_id.empty() &&
+        g_word_outbox_retry_cause == OutboxRetryCause::kTransport) {
+        g_word_outbox_retry_not_before_ms = 0;
+        resumed = true;
+    }
+    if (!g_note_outbox_retry_request_id.empty() &&
+        g_note_outbox_retry_cause == OutboxRetryCause::kTransport) {
+        g_note_outbox_retry_not_before_ms = 0;
+        resumed = true;
+    }
+    if (!g_problem_outbox_retry_request_id.empty() &&
+        g_problem_outbox_retry_cause == OutboxRetryCause::kTransport) {
+        g_problem_outbox_retry_not_before_ms = 0;
+        resumed = true;
+    }
+    if (!resumed) {
+        return;
+    }
+    ESP_LOGI(kTag, "connectivity restored; resuming transport-deferred outboxes");
+    g_outbox_immediate_requested.store(true, std::memory_order_relaxed);
+    g_word_outbox_sync_requested.store(true, std::memory_order_release);
 }
 
 uint32_t AddClaimJitter(uint32_t base_ms)
@@ -1078,6 +1368,7 @@ wqn::services::SyncOutboxPhase PublicOutboxPhase(WordOutboxUploadState state)
         case WordOutboxUploadState::kDrained:
             return wqn::services::SyncOutboxPhase::kDrained;
         case WordOutboxUploadState::kPending:
+        case WordOutboxUploadState::kAuthenticationRequired:
             return wqn::services::SyncOutboxPhase::kPending;
         case WordOutboxUploadState::kYielded:
             return wqn::services::SyncOutboxPhase::kYielded;
@@ -1106,6 +1397,9 @@ void FillOutboxSnapshot(
             break;
         case WordOutboxUploadState::kYielded:
             detail = "yielded for interaction";
+            break;
+        case WordOutboxUploadState::kAuthenticationRequired:
+            detail = "authentication recovery";
             break;
         case WordOutboxUploadState::kFailed:
             detail = "queue blocked";
@@ -1152,7 +1446,13 @@ SyncRoundOutcome CurrentOutboxOutcome()
     }
     if (g_last_word_outbox_upload_state == WordOutboxUploadState::kFailed ||
         g_last_note_outbox_upload_state == WordOutboxUploadState::kFailed ||
-        g_last_problem_outbox_upload_state == WordOutboxUploadState::kFailed) {
+        g_last_problem_outbox_upload_state == WordOutboxUploadState::kFailed ||
+        g_last_word_outbox_upload_state ==
+            WordOutboxUploadState::kAuthenticationRequired ||
+        g_last_note_outbox_upload_state ==
+            WordOutboxUploadState::kAuthenticationRequired ||
+        g_last_problem_outbox_upload_state ==
+            WordOutboxUploadState::kAuthenticationRequired) {
         return SyncRoundOutcome::kPartialNeedsFullRetry;
     }
     return SyncRoundOutcome::kPartial;
@@ -1398,7 +1698,18 @@ WordOutboxUploadState UploadPendingWordObservations(const std::string& token)
         result = wqn::SubmitWordStudyObservationV1(
             token, request, &response, &word_error, &transport_failure);
         if (result != ESP_OK) {
-            if (!transport_failure && !word_error.retryable) {
+            const OutboxFailureDisposition disposition =
+                ClassifyOutboxFailure(word_error, transport_failure);
+            if (disposition ==
+                OutboxFailureDisposition::kAuthenticationRequired) {
+                ResetWordOutboxRetryBackoff();
+                ESP_LOGW(
+                    kTag,
+                    "word outbox paused for credential recovery: request=%s",
+                    pending.request_id.c_str());
+                return WordOutboxUploadState::kAuthenticationRequired;
+            }
+            if (disposition == OutboxFailureDisposition::kTerminalRecord) {
                 ESP_LOGW(
                     kTag,
                     "terminal word observation rejected; advancing sequence before quarantine: request=%s sequence=%llu code=%s",
@@ -1433,11 +1744,22 @@ WordOutboxUploadState UploadPendingWordObservations(const std::string& token)
                         static_cast<unsigned long long>(pending.sequence),
                         skip_error.code.empty() ? "TRANSPORT" : skip_error.code.c_str(),
                         esp_err_to_name(skip_result));
-                    if (skip_transport_failure || skip_error.retryable ||
-                        skip_error.code == "SEQUENCE_GAP") {
+                    const OutboxFailureDisposition skip_disposition =
+                        ClassifyOutboxFailure(
+                            skip_error,
+                            skip_transport_failure,
+                            skip_error.code == "SEQUENCE_GAP");
+                    if (skip_disposition ==
+                        OutboxFailureDisposition::kAuthenticationRequired) {
+                        ResetWordOutboxRetryBackoff();
+                        return WordOutboxUploadState::kAuthenticationRequired;
+                    }
+                    if (skip_disposition !=
+                        OutboxFailureDisposition::kTerminalRecord) {
                         ScheduleWordOutboxRetry(
                             pending.request_id,
-                            skip_error.retryable ? skip_error.retry_after_ms : 0);
+                            skip_error.retryable ? skip_error.retry_after_ms : 0,
+                            RetryCauseFor(skip_disposition));
                         return WordOutboxUploadState::kPending;
                     }
                     ESP_LOGE(
@@ -1471,7 +1793,8 @@ WordOutboxUploadState UploadPendingWordObservations(const std::string& token)
                 esp_err_to_name(result));
             ScheduleWordOutboxRetry(
                 pending.request_id,
-                word_error.retryable ? word_error.retry_after_ms : 0);
+                word_error.retryable ? word_error.retry_after_ms : 0,
+                RetryCauseFor(disposition));
             return WordOutboxUploadState::kPending;
         }
         result = wqn::AcknowledgeWordObservation(pending.request_id);
@@ -1481,7 +1804,8 @@ WordOutboxUploadState UploadPendingWordObservations(const std::string& token)
                 "word outbox ack failed: request=%s error=%s",
                 pending.request_id.c_str(),
                 esp_err_to_name(result));
-            ScheduleWordOutboxRetry(pending.request_id, 0);
+            ScheduleWordOutboxRetry(
+                pending.request_id, 0, OutboxRetryCause::kLocalStorage);
             return WordOutboxUploadState::kPending;
         }
         ResetWordOutboxRetryBackoff();
@@ -1570,7 +1894,18 @@ WordOutboxUploadState UploadPendingProblemObservations(const std::string& token)
         result = wqn::SubmitProblemReviewObservationV1(
             token, request, &response, &problem_error, &transport_failure);
         if (result != ESP_OK) {
-            if (!transport_failure && !problem_error.retryable) {
+            const OutboxFailureDisposition disposition =
+                ClassifyOutboxFailure(problem_error, transport_failure);
+            if (disposition ==
+                OutboxFailureDisposition::kAuthenticationRequired) {
+                ResetProblemOutboxRetryBackoff();
+                ESP_LOGW(
+                    kTag,
+                    "problem outbox paused for credential recovery: request=%s",
+                    pending.request_id.c_str());
+                return WordOutboxUploadState::kAuthenticationRequired;
+            }
+            if (disposition == OutboxFailureDisposition::kTerminalRecord) {
                 ESP_LOGW(
                     kTag,
                     "terminal problem verdict rejected; quarantining: request=%s code=%s",
@@ -1599,7 +1934,8 @@ WordOutboxUploadState UploadPendingProblemObservations(const std::string& token)
                 esp_err_to_name(result));
             ScheduleProblemOutboxRetry(
                 pending.request_id,
-                problem_error.retryable ? problem_error.retry_after_ms : 0);
+                problem_error.retryable ? problem_error.retry_after_ms : 0,
+                RetryCauseFor(disposition));
             return WordOutboxUploadState::kPending;
         }
         result = wqn::AcknowledgeProblemObservation(pending.request_id);
@@ -1609,7 +1945,8 @@ WordOutboxUploadState UploadPendingProblemObservations(const std::string& token)
                 "problem outbox ack failed: request=%s error=%s",
                 pending.request_id.c_str(),
                 esp_err_to_name(result));
-            ScheduleProblemOutboxRetry(pending.request_id, 0);
+            ScheduleProblemOutboxRetry(
+                pending.request_id, 0, OutboxRetryCause::kLocalStorage);
             return WordOutboxUploadState::kPending;
         }
         ResetProblemOutboxRetryBackoff();
@@ -1697,7 +2034,18 @@ WordOutboxUploadState UploadPendingNoteObservations(const std::string& token)
         result = wqn::SubmitNoteStudyObservationV1(
             token, request, &response, &note_error, &transport_failure);
         if (result != ESP_OK) {
-            if (!transport_failure && !note_error.retryable) {
+            const OutboxFailureDisposition disposition =
+                ClassifyOutboxFailure(note_error, transport_failure);
+            if (disposition ==
+                OutboxFailureDisposition::kAuthenticationRequired) {
+                ResetNoteOutboxRetryBackoff();
+                ESP_LOGW(
+                    kTag,
+                    "note outbox paused for credential recovery: request=%s",
+                    pending.request_id.c_str());
+                return WordOutboxUploadState::kAuthenticationRequired;
+            }
+            if (disposition == OutboxFailureDisposition::kTerminalRecord) {
                 ESP_LOGW(
                     kTag,
                     "terminal note observation rejected; advancing sequence before quarantine: request=%s sequence=%llu code=%s",
@@ -1731,11 +2079,22 @@ WordOutboxUploadState UploadPendingNoteObservations(const std::string& token)
                         static_cast<unsigned long long>(pending.sequence),
                         skip_error.code.empty() ? "TRANSPORT" : skip_error.code.c_str(),
                         esp_err_to_name(skip_result));
-                    if (skip_transport_failure || skip_error.retryable ||
-                        skip_error.code == "SEQUENCE_GAP") {
+                    const OutboxFailureDisposition skip_disposition =
+                        ClassifyOutboxFailure(
+                            skip_error,
+                            skip_transport_failure,
+                            skip_error.code == "SEQUENCE_GAP");
+                    if (skip_disposition ==
+                        OutboxFailureDisposition::kAuthenticationRequired) {
+                        ResetNoteOutboxRetryBackoff();
+                        return WordOutboxUploadState::kAuthenticationRequired;
+                    }
+                    if (skip_disposition !=
+                        OutboxFailureDisposition::kTerminalRecord) {
                         ScheduleNoteOutboxRetry(
                             pending.request_id,
-                            skip_error.retryable ? skip_error.retry_after_ms : 0);
+                            skip_error.retryable ? skip_error.retry_after_ms : 0,
+                            RetryCauseFor(skip_disposition));
                         return WordOutboxUploadState::kPending;
                     }
                     ESP_LOGE(
@@ -1769,7 +2128,8 @@ WordOutboxUploadState UploadPendingNoteObservations(const std::string& token)
                 esp_err_to_name(result));
             ScheduleNoteOutboxRetry(
                 pending.request_id,
-                note_error.retryable ? note_error.retry_after_ms : 0);
+                note_error.retryable ? note_error.retry_after_ms : 0,
+                RetryCauseFor(disposition));
             return WordOutboxUploadState::kPending;
         }
         result = wqn::AcknowledgeNoteObservation(pending.request_id);
@@ -1779,7 +2139,8 @@ WordOutboxUploadState UploadPendingNoteObservations(const std::string& token)
                 "note outbox ack failed: request=%s error=%s",
                 pending.request_id.c_str(),
                 esp_err_to_name(result));
-            ScheduleNoteOutboxRetry(pending.request_id, 0);
+            ScheduleNoteOutboxRetry(
+                pending.request_id, 0, OutboxRetryCause::kLocalStorage);
             return WordOutboxUploadState::kPending;
         }
         ResetNoteOutboxRetryBackoff();
@@ -1825,7 +2186,21 @@ SyncRoundOutcome RunWordOutboxOnlyRound()
         return SyncRoundOutcome::kFailed;
     }
     g_last_word_outbox_upload_state = UploadPendingWordObservations(token);
+    if (g_last_word_outbox_upload_state ==
+        WordOutboxUploadState::kAuthenticationRequired) {
+        g_last_note_outbox_upload_state =
+            WordOutboxUploadState::kAuthenticationRequired;
+        g_last_problem_outbox_upload_state =
+            WordOutboxUploadState::kAuthenticationRequired;
+        return CurrentOutboxOutcome();
+    }
     g_last_note_outbox_upload_state = UploadPendingNoteObservations(token);
+    if (g_last_note_outbox_upload_state ==
+        WordOutboxUploadState::kAuthenticationRequired) {
+        g_last_problem_outbox_upload_state =
+            WordOutboxUploadState::kAuthenticationRequired;
+        return CurrentOutboxOutcome();
+    }
     g_last_problem_outbox_upload_state = UploadPendingProblemObservations(token);
     return CurrentOutboxOutcome();
 }
@@ -1872,8 +2247,23 @@ SyncRoundOutcome RunSyncRound()
 
 #if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
     g_last_word_outbox_upload_state = UploadPendingWordObservations(token);
-    g_last_note_outbox_upload_state = UploadPendingNoteObservations(token);
-    g_last_problem_outbox_upload_state = UploadPendingProblemObservations(token);
+    if (g_last_word_outbox_upload_state !=
+        WordOutboxUploadState::kAuthenticationRequired) {
+        g_last_note_outbox_upload_state = UploadPendingNoteObservations(token);
+    } else {
+        g_last_note_outbox_upload_state =
+            WordOutboxUploadState::kAuthenticationRequired;
+    }
+    if (g_last_word_outbox_upload_state !=
+            WordOutboxUploadState::kAuthenticationRequired &&
+        g_last_note_outbox_upload_state !=
+            WordOutboxUploadState::kAuthenticationRequired) {
+        g_last_problem_outbox_upload_state =
+            UploadPendingProblemObservations(token);
+    } else {
+        g_last_problem_outbox_upload_state =
+            WordOutboxUploadState::kAuthenticationRequired;
+    }
 #endif
 
     if (!LoadUsableToken(&token)) {
@@ -1930,7 +2320,9 @@ TickType_t SchedulerWaitDelay()
         ? retry_delay
         : PeriodicSyncWaitDelay(
               g_auto_sync_interval_minutes.load(std::memory_order_acquire));
-    return std::min(full_delay, OutboxWaitDelay());
+    return std::min(
+        std::min(full_delay, OutboxWaitDelay()),
+        OutboxQuietLeaseWaitDelay());
 }
 
 uint32_t FullSyncFailureRetryMs(bool has_token_after_round)
@@ -1955,7 +2347,25 @@ void SyncServiceTask(void*)
     ESP_LOGI(kTag, "SyncService task started");
     SetSyncTaskRunning();
     SetSyncStatus("idle");
+    // Owned only by SyncServiceTask. Producers publish a quiet-window intent
+    // and notify this task; keeping the move-only lease here avoids sharing an
+    // RAII object across the UI, timer-service and sync tasks.
+    wqn::runtime::SleepLease outbox_quiet_lease;
     while (true) {
+        if (g_outbox_transport_resume_requested.exchange(
+                false, std::memory_order_acq_rel)) {
+#if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
+            ResumeTransportDeferredOutboxes();
+#endif
+        }
+        ForceExpiredOutboxQuietWindow();
+        if (OutboxQuietWindowActive() && !outbox_quiet_lease) {
+            outbox_quiet_lease = wqn::runtime::SleepLease::TryAcquire(
+                wqn::runtime::SleepBlocker::kOnlineSync,
+                "outbox-quiet",
+                __FILE__,
+                __LINE__);
+        }
         const TickType_t wait_delay = SchedulerWaitDelay();
         if (wait_delay != 0) {
             SetSyncStatus(wait_delay == portMAX_DELAY ? "idle" : "scheduled-wait");
@@ -1963,9 +2373,18 @@ void SyncServiceTask(void*)
             continue;
         }
 
-        wqn::runtime::SleepLease sleep_lease =
-            wqn::runtime::SleepLease::TryAcquire(
-                wqn::runtime::SleepBlocker::kOnlineSync, "sync-service", __FILE__, __LINE__);
+        wqn::runtime::SleepLease sleep_lease;
+        if (outbox_quiet_lease) {
+            // Transfer quiet-window ownership directly into the upload round;
+            // there is no lease-free gap in which PowerCoordinator can sleep.
+            sleep_lease = std::move(outbox_quiet_lease);
+        } else {
+            sleep_lease = wqn::runtime::SleepLease::TryAcquire(
+                wqn::runtime::SleepBlocker::kOnlineSync,
+                "sync-service",
+                __FILE__,
+                __LINE__);
+        }
         if (!sleep_lease) {
             SetSyncStatus("sleep-quiescing");
             ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000));
@@ -1999,6 +2418,9 @@ void SyncServiceTask(void*)
             word_outbox_requested =
                 g_word_outbox_sync_requested.exchange(
                     false, std::memory_order_acq_rel);
+            if (word_outbox_requested) {
+                ClaimOutboxReadyGeneration();
+            }
         }
         if (!full_requested && !word_outbox_requested) {
             sleep_lease.Reset();
@@ -2085,14 +2507,10 @@ void SyncServiceTask(void*)
             g_last_problem_outbox_upload_state == WordOutboxUploadState::kYielded) {
             // Do not turn a user-induced yield into the old 100 ms upload
             // loop. Resume only after another complete quiet period.
+            const uint32_t generation = ArmOutboxQuietWindow();
             if (g_word_outbox_timer == nullptr ||
                 xTimerReset(g_word_outbox_timer, 0) != pdPASS) {
-                g_outbox_immediate_requested.store(
-                    true, std::memory_order_relaxed);
-                g_word_outbox_sync_requested.store(true, std::memory_order_release);
-                if (g_sync_service_task != nullptr) {
-                    xTaskNotifyGive(g_sync_service_task);
-                }
+                PublishOutboxReadyGeneration(generation);
             }
         } else if (
             g_last_word_outbox_upload_state == WordOutboxUploadState::kPending ||
@@ -2107,7 +2525,18 @@ void SyncServiceTask(void*)
         // Publish every retry/outbox/timer-wake obligation before releasing
         // the online-sync SleepLease. Otherwise PowerCoordinator could close
         // quiesce in the tiny gap and sleep without the wake reason installed.
-        sleep_lease.Reset();
+        const bool lease_cycle_expired = TakeOutboxLeaseCycleExpired();
+        if (OutboxQuietWindowActive() && !lease_cycle_expired) {
+            // A newer observation landed while this round was running. Carry
+            // the same lease into its debounce window instead of releasing and
+            // immediately reacquiring it on the next loop iteration.
+            outbox_quiet_lease = std::move(sleep_lease);
+        } else {
+            // A max-duration quiet cycle releases at least once after its
+            // bounded upload attempt. If newer work is active, the next loop
+            // starts a fresh lease rather than extending this one forever.
+            sleep_lease.Reset();
+        }
     }
 }
 
@@ -2256,6 +2685,10 @@ void NotifySyncCredentialsChanged()
 void NotifySyncConnectivityAvailable()
 {
 #if CONFIG_WQN_WIFI_STA_ENABLE
+    // Readiness must not invent a full-sync reason, but it may release an
+    // outbox transport backoff that was created solely because WiFi was down.
+    // The sync task owns the non-atomic retry cursors and applies this intent.
+    g_outbox_transport_resume_requested.store(true, std::memory_order_release);
     if (g_sync_service_task != nullptr) {
         xTaskNotifyGive(g_sync_service_task);
     }
@@ -2287,7 +2720,11 @@ uint32_t SecondsUntilNextSyncWake()
     if (g_full_sync_reasons.load(std::memory_order_acquire) != 0) {
         return 1;
     }
-    uint32_t next_seconds = UINT32_MAX;
+    // Normally the task-owned quiet lease prevents sleep. This retained wake
+    // deadline closes the producer->task acquisition race: if quiesce wins,
+    // deep sleep wakes when the debounce would have fired and the boot outbox
+    // probe immediately resumes the durable records.
+    uint32_t next_seconds = SecondsUntilOutboxQuietWake();
     if (g_word_outbox_sync_requested.load(std::memory_order_acquire)) {
         const TickType_t outbox_ticks = OutboxWaitDelay();
         next_seconds = outbox_ticks == 0
@@ -2624,17 +3061,19 @@ void NoteWordInteraction()
 void RequestWordOutboxUpload()
 {
 #if CONFIG_WQN_WIFI_STA_ENABLE && CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
+    const uint32_t generation = ArmOutboxQuietWindow();
     if (g_word_outbox_timer != nullptr &&
         xTimerReset(g_word_outbox_timer, 0) == pdPASS) {
+        // Wake SyncService now so it acquires the bounded quiet-window lease;
+        // the timer callback still owns publication of the upload-ready flag.
+        if (g_sync_service_task != nullptr) {
+            xTaskNotifyGive(g_sync_service_task);
+        }
         return;
     }
     // Timer command queue pressure must not strand a durable observation.
     // Fall back to an immediate outbox-only notification.
-    g_outbox_immediate_requested.store(true, std::memory_order_relaxed);
-    g_word_outbox_sync_requested.store(true, std::memory_order_release);
-    if (g_sync_service_task != nullptr) {
-        xTaskNotifyGive(g_sync_service_task);
-    }
+    PublishOutboxReadyGeneration(generation);
 #endif
 }
 
@@ -2643,17 +3082,17 @@ void RequestNoteOutboxUpload()
     // Note observations share word's quiet-window timer and outbox-only round
     // (the round uploads both queues), so this reuses the same trigger path.
 #if CONFIG_WQN_WIFI_STA_ENABLE && CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
+    const uint32_t generation = ArmOutboxQuietWindow();
     if (g_word_outbox_timer != nullptr &&
         xTimerReset(g_word_outbox_timer, 0) == pdPASS) {
+        if (g_sync_service_task != nullptr) {
+            xTaskNotifyGive(g_sync_service_task);
+        }
         return;
     }
     // Timer command queue pressure must not strand a durable observation.
     // Fall back to an immediate outbox-only notification.
-    g_outbox_immediate_requested.store(true, std::memory_order_relaxed);
-    g_word_outbox_sync_requested.store(true, std::memory_order_release);
-    if (g_sync_service_task != nullptr) {
-        xTaskNotifyGive(g_sync_service_task);
-    }
+    PublishOutboxReadyGeneration(generation);
 #endif
 }
 
@@ -2662,17 +3101,17 @@ void RequestProblemOutboxUpload()
     // Problem verdicts share the same quiet-window timer and outbox-only
     // round (the round uploads all three queues).
 #if CONFIG_WQN_WIFI_STA_ENABLE && CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
+    const uint32_t generation = ArmOutboxQuietWindow();
     if (g_word_outbox_timer != nullptr &&
         xTimerReset(g_word_outbox_timer, 0) == pdPASS) {
+        if (g_sync_service_task != nullptr) {
+            xTaskNotifyGive(g_sync_service_task);
+        }
         return;
     }
     // Timer command queue pressure must not strand a durable observation.
     // Fall back to an immediate outbox-only notification.
-    g_outbox_immediate_requested.store(true, std::memory_order_relaxed);
-    g_word_outbox_sync_requested.store(true, std::memory_order_release);
-    if (g_sync_service_task != nullptr) {
-        xTaskNotifyGive(g_sync_service_task);
-    }
+    PublishOutboxReadyGeneration(generation);
 #endif
 }
 

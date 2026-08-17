@@ -267,6 +267,16 @@ std::string BuildUrl(const std::string& path)
     return url;
 }
 
+constexpr bool IsTransientHttpStatus(int status_code)
+{
+    return status_code == 408 || status_code == 425 || status_code == 429 ||
+        status_code >= 500;
+}
+
+static_assert(IsTransientHttpStatus(429));
+static_assert(IsTransientHttpStatus(503));
+static_assert(!IsTransientHttpStatus(400));
+
 bool IsClockReasonable()
 {
     std::time_t now = 0;
@@ -1970,7 +1980,10 @@ esp_err_t SubmitWordStudyObservationV1AtPath(
     *error = {};
     *transport_failure = false;
     esp_err_t result = ValidateTokenOrClear(token, operation);
-    if (result != ESP_OK) return result;
+    if (result != ESP_OK) {
+        error->code = "UNAUTHORIZED";
+        return result;
+    }
     result = WaitForNetworkReadyForHttps();
     if (result != ESP_OK) {
         *transport_failure = true;
@@ -1996,9 +2009,17 @@ esp_err_t SubmitWordStudyObservationV1AtPath(
         *transport_failure = true;
         return result;
     }
-    if (status_code == 401) return ClearTokenOnUnauthorized(operation);
+    if (status_code == 401) {
+        error->code = "UNAUTHORIZED";
+        return ClearTokenOnUnauthorized(operation);
+    }
     const esp_err_t parse_result = protocol::word_study_v1::ParseObservationResponse(
         body, request.metadata.request_id, observation, error);
+    if (IsTransientHttpStatus(status_code)) {
+        // Transport/proxy failures are retryable even if the returned body is
+        // malformed or a server accidentally marks its 5xx envelope terminal.
+        error->retryable = true;
+    }
     if (status_code != 200 || parse_result != ESP_OK) {
         ESP_LOGW(
             kTag,
@@ -2743,7 +2764,10 @@ esp_err_t SubmitNoteStudyObservationV1AtPath(
     *error = {};
     *transport_failure = false;
     esp_err_t result = ValidateTokenOrClear(token, operation);
-    if (result != ESP_OK) return result;
+    if (result != ESP_OK) {
+        error->code = "UNAUTHORIZED";
+        return result;
+    }
     result = WaitForNetworkReadyForHttps();
     if (result != ESP_OK) {
         *transport_failure = true;
@@ -2769,9 +2793,15 @@ esp_err_t SubmitNoteStudyObservationV1AtPath(
         *transport_failure = true;
         return result;
     }
-    if (status_code == 401) return ClearTokenOnUnauthorized(operation);
+    if (status_code == 401) {
+        error->code = "UNAUTHORIZED";
+        return ClearTokenOnUnauthorized(operation);
+    }
     const esp_err_t parse_result = protocol::note_study_v1::ParseObservationResponse(
         body, request.metadata.request_id, observation, error);
+    if (IsTransientHttpStatus(status_code)) {
+        error->retryable = true;
+    }
     if (status_code != 200 || parse_result != ESP_OK) {
         ESP_LOGW(
             kTag,
@@ -3246,7 +3276,10 @@ esp_err_t SubmitProblemReviewObservationV1(
     *error = {};
     *transport_failure = false;
     esp_err_t result = ValidateTokenOrClear(token, "problem-review-observation");
-    if (result != ESP_OK) return result;
+    if (result != ESP_OK) {
+        error->code = "UNAUTHORIZED";
+        return result;
+    }
     result = WaitForNetworkReadyForHttps();
     if (result != ESP_OK) {
         *transport_failure = true;
@@ -3272,9 +3305,15 @@ esp_err_t SubmitProblemReviewObservationV1(
         *transport_failure = true;
         return result;
     }
-    if (status_code == 401) return ClearTokenOnUnauthorized("problem-review-observation");
+    if (status_code == 401) {
+        error->code = "UNAUTHORIZED";
+        return ClearTokenOnUnauthorized("problem-review-observation");
+    }
     const esp_err_t parse_result = protocol::problem_study_v1::ParseObservationResponse(
         body, request.metadata.request_id, observation, error);
+    if (IsTransientHttpStatus(status_code)) {
+        error->retryable = true;
+    }
     if (status_code != 200 || parse_result != ESP_OK) {
         ESP_LOGW(
             kTag,
