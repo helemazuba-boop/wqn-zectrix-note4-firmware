@@ -10,7 +10,8 @@ namespace wqn {
 
 enum class WifiStationEvent : uint8_t {
     kStarted,
-    kConnected,
+    kAssociated,
+    kGotIp,
     kDisconnected,
 };
 
@@ -19,6 +20,7 @@ using WifiStationEventSink = void (*)(WifiStationEvent event, int reason, int rs
 esp_err_t StartWifiStationIfEnabled();
 esp_err_t StartWifiWithCredentials(const char* ssid, const char* password);
 esp_err_t ConnectWifiStationNow();
+esp_err_t DisconnectWifiStationNow();
 esp_err_t StopWifiStationRadio();
 esp_err_t StartWifiStationRadio();
 esp_err_t WaitForWifiStationConnected(TickType_t timeout);

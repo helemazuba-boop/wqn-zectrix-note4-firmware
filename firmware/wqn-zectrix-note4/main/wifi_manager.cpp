@@ -26,7 +26,12 @@ constexpr char kTag[] = "wqn_wifi";
 constexpr EventBits_t kWifiConnectedBit = BIT0;
 
 std::atomic<bool> g_initialized{false};
+std::atomic<bool> g_wifi_associated{false};
 std::atomic<bool> g_wifi_connected{false};
+// A credential switch deliberately leaves the current AP. Suppress only the
+// matching ASSOC_LEAVE event so the old link cannot consume the new slot's
+// retry budget after reconfiguration.
+std::atomic<bool> g_reconfigure_disconnect_pending{false};
 bool g_sntp_started = false;
 std::atomic<bool> g_sleep_quiescing{false};
 std::atomic<bool> g_resume_after_sleep_abort{false};
@@ -52,6 +57,8 @@ const char* DisconnectReasonName(uint8_t reason)
             return "4WAY_HANDSHAKE_TIMEOUT";
         case WIFI_REASON_ASSOC_FAIL:
             return "ASSOC_FAIL";
+        case WIFI_REASON_ASSOC_LEAVE:
+            return "ASSOC_LEAVE";
         case WIFI_REASON_HANDSHAKE_TIMEOUT:
             return "HANDSHAKE_TIMEOUT";
         case WIFI_REASON_NO_AP_FOUND_W_COMPATIBLE_SECURITY:
@@ -72,6 +79,22 @@ void PublishStationEvent(wqn::WifiStationEvent event, int reason = 0, int rssi =
     if (sink != nullptr) {
         sink(event, reason, rssi);
     }
+}
+
+bool MatchesConfiguredSsid(const uint8_t* ssid, uint8_t ssid_len)
+{
+    if (ssid == nullptr || ssid_len == 0 || ssid_len > 32) {
+        return true;
+    }
+    wifi_config_t configured = {};
+    if (esp_wifi_get_config(WIFI_IF_STA, &configured) != ESP_OK) {
+        return true;
+    }
+    const size_t configured_len = strnlen(
+        reinterpret_cast<const char*>(configured.sta.ssid),
+        sizeof(configured.sta.ssid));
+    return configured_len == ssid_len &&
+        std::memcmp(configured.sta.ssid, ssid, ssid_len) == 0;
 }
 
 void TimeSyncCallback(struct timeval*)
@@ -113,8 +136,31 @@ void WifiEventHandler(void*, esp_event_base_t event_base, int32_t event_id, void
         return;
     }
 
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_CONNECTED) {
+        const auto* event = static_cast<wifi_event_sta_connected_t*>(event_data);
+        if (event != nullptr &&
+            !MatchesConfiguredSsid(event->ssid, event->ssid_len)) {
+            ESP_LOGI(kTag, "ignore stale association from previous credential");
+            return;
+        }
+        g_reconfigure_disconnect_pending.store(false, std::memory_order_release);
+        g_wifi_associated.store(true, std::memory_order_release);
+        ESP_LOGI(
+            kTag,
+            "WiFi associated: channel=%u",
+            event == nullptr ? 0U : static_cast<unsigned>(event->channel));
+        PublishStationEvent(wqn::WifiStationEvent::kAssociated);
+        return;
+    }
+
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         const auto* event = static_cast<wifi_event_sta_disconnected_t*>(event_data);
+        if (event != nullptr &&
+            !MatchesConfiguredSsid(event->ssid, event->ssid_len)) {
+            ESP_LOGI(kTag, "ignore stale disconnect from previous credential");
+            return;
+        }
+        g_wifi_associated.store(false, std::memory_order_release);
         g_wifi_connected.store(false, std::memory_order_release);
         if (g_wifi_event_group != nullptr) {
             xEventGroupClearBits(g_wifi_event_group, kWifiConnectedBit);
@@ -125,6 +171,13 @@ void WifiEventHandler(void*, esp_event_base_t event_base, int32_t event_id, void
             event ? event->reason : -1,
             event ? DisconnectReasonName(event->reason) : "NO_EVENT",
             event ? event->rssi : 0);
+        const bool reconfigure_disconnect =
+            g_reconfigure_disconnect_pending.exchange(false, std::memory_order_acq_rel);
+        if (reconfigure_disconnect && event != nullptr &&
+            event->reason == WIFI_REASON_ASSOC_LEAVE) {
+            ESP_LOGI(kTag, "planned credential-switch disconnect ignored");
+            return;
+        }
         PublishStationEvent(
             wqn::WifiStationEvent::kDisconnected,
             event ? event->reason : 0,
@@ -150,7 +203,7 @@ void WifiEventHandler(void*, esp_event_base_t event_base, int32_t event_id, void
             xEventGroupSetBits(g_wifi_event_group, kWifiConnectedBit);
         }
         StartSntpOnce();
-        PublishStationEvent(wqn::WifiStationEvent::kConnected);
+        PublishStationEvent(wqn::WifiStationEvent::kGotIp);
     }
 }
 
@@ -190,10 +243,17 @@ esp_err_t StartWifiWithCredentials(const char* ssid, const char* password)
         // pivots slots right after a backoff (esp_wifi_stop leaves the driver
         // initialized but not started). esp_wifi_disconnect then returns
         // ESP_ERR_WIFI_NOT_STARTED, which is fine -- there is nothing to drop.
+        g_reconfigure_disconnect_pending.store(true, std::memory_order_release);
         const esp_err_t disconnect_result = esp_wifi_disconnect();
-        if (disconnect_result != ESP_OK && disconnect_result != ESP_ERR_WIFI_NOT_STARTED) {
+        if (disconnect_result != ESP_OK && disconnect_result != ESP_ERR_WIFI_NOT_STARTED &&
+            disconnect_result != ESP_ERR_WIFI_NOT_CONNECT) {
+            g_reconfigure_disconnect_pending.store(false, std::memory_order_release);
             ESP_RETURN_ON_ERROR(disconnect_result, kTag, "disconnect before reconfigure");
         }
+        if (disconnect_result != ESP_OK) {
+            g_reconfigure_disconnect_pending.store(false, std::memory_order_release);
+        }
+        g_wifi_associated.store(false, std::memory_order_release);
         g_wifi_connected.store(false, std::memory_order_release);
         // [reconfig-fix] The event group has process lifetime: event-loop and
         // external waiter tasks may still hold its handle during reconfigure.
@@ -301,8 +361,32 @@ esp_err_t ConnectWifiStationNow()
     if (!g_initialized.load(std::memory_order_acquire)) {
         return ESP_ERR_INVALID_STATE;
     }
+    // Defense in depth: ConnectivityService normally suppresses retries in its
+    // WaitingIp phase, but never ask ESP-IDF to connect an associated STA even
+    // if a stale timer or caller slips through.
+    if (g_wifi_associated.load(std::memory_order_acquire)) {
+        return ESP_OK;
+    }
     const esp_err_t result = esp_wifi_connect();
     return result == ESP_ERR_WIFI_CONN ? ESP_OK : result;
+#else
+    return ESP_ERR_INVALID_STATE;
+#endif
+}
+
+esp_err_t DisconnectWifiStationNow()
+{
+#if CONFIG_WQN_WIFI_STA_ENABLE
+    if (!g_initialized.load(std::memory_order_acquire)) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    const esp_err_t result = esp_wifi_disconnect();
+    if (result == ESP_OK || result == ESP_ERR_WIFI_NOT_CONNECT ||
+        result == ESP_ERR_WIFI_NOT_STARTED) {
+        g_wifi_associated.store(false, std::memory_order_release);
+        return ESP_OK;
+    }
+    return result;
 #else
     return ESP_ERR_INVALID_STATE;
 #endif
@@ -317,7 +401,9 @@ esp_err_t StopWifiStationRadio()
     const esp_err_t result = esp_wifi_stop();
     if (result == ESP_OK || result == ESP_ERR_WIFI_NOT_STARTED ||
         result == ESP_ERR_WIFI_NOT_INIT) {
+        g_wifi_associated.store(false, std::memory_order_release);
         g_wifi_connected.store(false, std::memory_order_release);
+        g_reconfigure_disconnect_pending.store(false, std::memory_order_release);
         if (g_wifi_event_group != nullptr) {
             xEventGroupClearBits(g_wifi_event_group, kWifiConnectedBit);
         }
@@ -448,6 +534,8 @@ esp_err_t PrepareConnectivityForSleep(const power::PrepareSleepCommand& command)
         return result;
     }
     g_wifi_connected.store(false, std::memory_order_release);
+    g_wifi_associated.store(false, std::memory_order_release);
+    g_reconfigure_disconnect_pending.store(false, std::memory_order_release);
     if (g_wifi_event_group != nullptr) {
         xEventGroupClearBits(g_wifi_event_group, kWifiConnectedBit);
     }

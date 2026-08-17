@@ -12,6 +12,7 @@ enum class ConnectivityState : uint8_t {
     kOff,
     kProvisioning,
     kConnecting,
+    kWaitingIp,
     kOnline,
     kBackoff,
     kQuiescing,

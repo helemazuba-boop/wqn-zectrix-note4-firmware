@@ -1576,29 +1576,43 @@ void CopyWifiCredentialField(char* destination, size_t destination_size, const c
     std::snprintf(destination, destination_size, "%s", value == nullptr ? "" : value);
 }
 
-// [wifi-redundancy] Validates a store deserialized from the NVS blob. Returns
-// false when the blob is unusable (bad version / impossible count/preferred) so
-// the caller falls back to legacy migration. Otherwise normalizes in place:
-// forces NUL termination, drops empty-SSID slots, and merges duplicate SSIDs
-// keeping the preferred slot's password.
-bool ValidateWifiCredentialStore(wqn::WifiCredentialStore* store)
+wqn::WifiCredentialStore EmptyWifiCredentialStore()
 {
-    if (store == nullptr || store->version != kWifiCredentialStoreVersion) {
+    wqn::WifiCredentialStore store{};
+    store.version = kWifiCredentialStoreVersion;
+    return store;
+}
+
+// [wifi-redundancy] Validates a store deserialized from the NVS blob. The
+// opt-in version-0 path recovers blobs written by the original dual-slot bug,
+// whose layout was already final but whose empty-store initializer omitted the
+// version. Other bad versions/structures fall back to legacy migration.
+// Valid stores are normalized to the current version and compacted in place.
+bool ValidateWifiCredentialStore(
+    wqn::WifiCredentialStore* store,
+    bool allow_buggy_unversioned_store = false)
+{
+    if (store == nullptr) {
+        return false;
+    }
+    if (store->version != kWifiCredentialStoreVersion &&
+        !(allow_buggy_unversioned_store && store->version == 0)) {
         return false;
     }
     if (store->count > 2 || store->preferred >= 2) {
         return false;
     }
     for (auto& slot : store->slots) {
-        slot.ssid[sizeof(slot.ssid) - 1] = '\0';
-        slot.password[sizeof(slot.password) - 1] = '\0';
+        if (std::memchr(slot.ssid, '\0', sizeof(slot.ssid)) == nullptr ||
+            std::memchr(slot.password, '\0', sizeof(slot.password)) == nullptr) {
+            return false;
+        }
     }
 
     // Compact to occupied (non-empty-SSID) slots, tracking where the preferred
     // entry lands. Identical SSIDs collapse to one slot; the preferred copy's
     // password wins.
-    wqn::WifiCredentialStore compacted{};
-    compacted.version = kWifiCredentialStoreVersion;
+    wqn::WifiCredentialStore compacted = EmptyWifiCredentialStore();
     const bool preferred_valid =
         store->preferred < store->count && store->slots[store->preferred].ssid[0] != '\0';
     for (uint8_t i = 0; i < store->count; ++i) {
@@ -1642,7 +1656,9 @@ esp_err_t LoadWifiCredentialStore(WifiCredentialStore* store)
     if (store == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
-    *store = WifiCredentialStore{};
+    // A valid empty store is versioned too. The old zero-initialized return
+    // path caused the first Upsert to persist version=0 forever.
+    *store = EmptyWifiCredentialStore();
 
     std::string blob;
     ESP_RETURN_ON_ERROR(LoadBlobFromNvs(kWifiCredsBlobKey, &blob), kTag, "load wifi credential blob");
@@ -1656,7 +1672,7 @@ esp_err_t LoadWifiCredentialStore(WifiCredentialStore* store)
         } else {
             WifiCredentialStore candidate;
             std::memcpy(&candidate, blob.data(), sizeof(candidate));
-            if (ValidateWifiCredentialStore(&candidate)) {
+            if (ValidateWifiCredentialStore(&candidate, true)) {
                 *store = candidate;
                 return ESP_OK;
             }
@@ -1689,14 +1705,16 @@ esp_err_t LoadWifiCredentialStore(WifiCredentialStore* store)
 
 esp_err_t SaveWifiCredentialStore(const WifiCredentialStore& store)
 {
-    if (store.count > 2) {
+    WifiCredentialStore normalized = store;
+    if (!ValidateWifiCredentialStore(&normalized)) {
         return ESP_ERR_INVALID_ARG;
     }
     StorageWriteGuard write("save-wifi-credential-store", __FILE__, __LINE__);
     if (!write) {
         return ESP_ERR_INVALID_STATE;
     }
-    const std::string blob(reinterpret_cast<const char*>(&store), sizeof(store));
+    const std::string blob(
+        reinterpret_cast<const char*>(&normalized), sizeof(normalized));
     return SaveBlobToNvs(kWifiCredsBlobKey, blob);
 }
 

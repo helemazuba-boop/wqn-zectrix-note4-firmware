@@ -1,5 +1,6 @@
 #include "services/connectivity_service.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstring>
@@ -26,11 +27,14 @@ constexpr UBaseType_t kCommandQueueDepth = 12;
 constexpr UBaseType_t kReplyQueueDepth = 8;
 constexpr uint32_t kTaskStackBytes = 8192;
 constexpr UBaseType_t kTaskPriority = 5;
-constexpr int64_t kFastRetryDelayUs = 5LL * 1000 * 1000;
+constexpr int64_t kAssociationTimeoutUs = 15LL * 1000 * 1000;
+constexpr int64_t kDhcpTimeoutUs = 15LL * 1000 * 1000;
+constexpr int64_t kRetryBaseDelayUs = 5LL * 1000 * 1000;
 constexpr int64_t kBackoffDelayUs = 60LL * 1000 * 1000;
-// [wifi-redundancy] Per-slot fast-retry budget before pivoting to the backup
-// credential; when every stored slot is exhausted the radio goes to backoff.
-constexpr uint8_t kPerSlotFastRetryLimit = 2;
+// [wifi-redundancy] Count complete failed connection attempts, not timer ticks.
+// Credential failures pivot immediately; transient failures get bounded 5 s,
+// 10 s retry delays before the third failure exhausts the slot.
+constexpr uint8_t kPerSlotAttemptLimit = 3;
 constexpr size_t kMaxSsidBytes = 32;
 // [hang-fix] Bound for callers that submit commands from the UI or sync
 // tasks. If ConnectivityTask wedges inside the Wi-Fi driver or LwIP, the
@@ -46,11 +50,20 @@ enum class CommandType : uint8_t {
     kStartWithCredentials,
     kBeginProvisioning,
     kWifiStarted,
-    kWifiConnected,
+    kWifiAssociated,
+    kWifiGotIp,
     kWifiDisconnected,
     kProvisioned,
     kPrepareSleep,
     kRollbackSleep,
+};
+
+enum class ScheduledAction : uint8_t {
+    kNone,
+    kAssociationTimeout,
+    kDhcpTimeout,
+    kRetrySlot,
+    kBackoffExpired,
 };
 
 struct ConnectivityCommand {
@@ -93,6 +106,8 @@ std::atomic<bool> g_online{false};
 std::atomic<int> g_rssi{0};
 
 int64_t g_next_action_us = 0;
+ScheduledAction g_scheduled_action = ScheduledAction::kNone;
+bool g_attempt_active = false;
 bool g_resume_provisioning = false;
 wqn::runtime::SleepLease g_connectivity_lease;
 
@@ -117,6 +132,8 @@ const char* StateName(wqn::services::ConnectivityState state)
             return "provisioning";
         case wqn::services::ConnectivityState::kConnecting:
             return "connecting";
+        case wqn::services::ConnectivityState::kWaitingIp:
+            return "waiting-ip";
         case wqn::services::ConnectivityState::kOnline:
             return "online";
         case wqn::services::ConnectivityState::kBackoff:
@@ -131,6 +148,7 @@ const char* StateName(wqn::services::ConnectivityState state)
 void SetState(wqn::services::ConnectivityState state)
 {
     if (state != wqn::services::ConnectivityState::kConnecting &&
+        state != wqn::services::ConnectivityState::kWaitingIp &&
         state != wqn::services::ConnectivityState::kProvisioning) {
         g_connectivity_lease.Reset();
     }
@@ -179,9 +197,10 @@ void CopyCredential(char* destination, size_t destination_size, const char* valu
     std::snprintf(destination, destination_size, "%s", value == nullptr ? "" : value);
 }
 
-// [wifi-redundancy] Forward declaration: defined below alongside the other
-// retry/backoff schedulers, used by the slot-pivot helper.
-void ScheduleConnectRetry();
+void ClearScheduledAction();
+void ScheduleAction(ScheduledAction action, int64_t delay_us);
+esp_err_t BeginConnectionAttempt();
+void ScheduleBackoff();
 
 // [wifi-redundancy] Publishes the active/backup SSID identity for snapshots.
 // Runs on ConnectivityTask; the copy is short and under a spinlock so a reader
@@ -245,7 +264,7 @@ bool TryPivotToBackupSlot()
     }
     const uint8_t backup = 1 - g_active_slot;
     const wqn::WifiCredentialSlot& slot = g_cred_store.slots[backup];
-    if (slot.ssid[0] == '\0' || g_slot_fail_count[backup] >= kPerSlotFastRetryLimit) {
+    if (slot.ssid[0] == '\0' || g_slot_fail_count[backup] >= kPerSlotAttemptLimit) {
         return false;
     }
     // A slot pivot is a connectivity transition even when invoked outside the
@@ -258,21 +277,19 @@ bool TryPivotToBackupSlot()
     const esp_err_t result = wqn::StartWifiWithCredentials(slot.ssid, slot.password);
     if (result != ESP_OK) {
         ESP_LOGW(kTag, "pivot connect failed: %s", esp_err_to_name(result));
-        g_slot_fail_count[backup] = kPerSlotFastRetryLimit;
+        g_slot_fail_count[backup] = kPerSlotAttemptLimit;
         return false;
     }
     SetState(wqn::services::ConnectivityState::kConnecting);
-    // [pivot-fast] Reconfiguring credentials on an already-started radio does
-    // not emit another STA_START event. Kick the backup attempt immediately;
-    // the scheduled retry remains as the bounded fallback if this call fails.
-    const esp_err_t connect_result = wqn::ConnectWifiStationNow();
+    const esp_err_t connect_result = BeginConnectionAttempt();
     if (connect_result != ESP_OK) {
         ESP_LOGW(
             kTag,
             "backup WiFi connect request failed: %s",
             esp_err_to_name(connect_result));
+        g_slot_fail_count[backup] = kPerSlotAttemptLimit;
+        return false;
     }
-    ScheduleConnectRetry();
     return true;
 }
 
@@ -295,8 +312,11 @@ void WifiEventSink(wqn::WifiStationEvent event, int reason, int rssi)
         case wqn::WifiStationEvent::kStarted:
             command.type = CommandType::kWifiStarted;
             break;
-        case wqn::WifiStationEvent::kConnected:
-            command.type = CommandType::kWifiConnected;
+        case wqn::WifiStationEvent::kAssociated:
+            command.type = CommandType::kWifiAssociated;
+            break;
+        case wqn::WifiStationEvent::kGotIp:
+            command.type = CommandType::kWifiGotIp;
             break;
         case wqn::WifiStationEvent::kDisconnected:
             command.type = CommandType::kWifiDisconnected;
@@ -316,24 +336,99 @@ void ProvisionDone(const std::string& ssid, const std::string& password)
 }
 #endif
 
-void ScheduleConnectRetry()
+void ClearScheduledAction()
 {
-    g_next_action_us = esp_timer_get_time() + kFastRetryDelayUs;
+    g_scheduled_action = ScheduledAction::kNone;
+    g_next_action_us = 0;
+}
+
+void ScheduleAction(ScheduledAction action, int64_t delay_us)
+{
+    g_scheduled_action = action;
+    g_next_action_us = esp_timer_get_time() + delay_us;
+}
+
+int64_t RetryDelayUs(uint8_t failed_attempts)
+{
+    if (failed_attempts <= 1) {
+        return kRetryBaseDelayUs;
+    }
+    const uint8_t shift = std::min<uint8_t>(failed_attempts - 1, 3);
+    return std::min<int64_t>(kRetryBaseDelayUs << shift, kBackoffDelayUs);
+}
+
+esp_err_t BeginConnectionAttempt()
+{
+    if (!HoldConnectivityLease()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    SetOnline(false);
+    SetState(wqn::services::ConnectivityState::kConnecting);
+    ClearScheduledAction();
+    const esp_err_t result = wqn::ConnectWifiStationNow();
+    if (result != ESP_OK) {
+        g_attempt_active = false;
+        return result;
+    }
+    g_attempt_active = true;
+    ScheduleAction(ScheduledAction::kAssociationTimeout, kAssociationTimeoutUs);
+    ESP_LOGI(
+        kTag,
+        "WiFi connection attempt started: slot=%u attempt=%u/%u",
+        static_cast<unsigned>(g_active_slot),
+        static_cast<unsigned>(g_slot_fail_count[g_active_slot] + 1),
+        static_cast<unsigned>(kPerSlotAttemptLimit));
+    return ESP_OK;
 }
 
 void ScheduleBackoff()
 {
     SetOnline(false);
+    g_attempt_active = false;
     SetState(wqn::services::ConnectivityState::kBackoff);
     // [wifi-redundancy] Fresh per-slot budget after the radio-off pause; the
     // next cycle starts clean from the preferred slot.
     g_slot_fail_count[0] = g_slot_fail_count[1] = 0;
-    g_next_action_us = esp_timer_get_time() + kBackoffDelayUs;
+    ScheduleAction(ScheduledAction::kBackoffExpired, kBackoffDelayUs);
     const esp_err_t stop_result = wqn::StopWifiStationRadio();
     if (stop_result != ESP_OK) {
         ESP_LOGW(kTag, "stop WiFi for backoff failed: %s", esp_err_to_name(stop_result));
     }
     ESP_LOGW(kTag, "WiFi retries exhausted; radio off for 60 seconds");
+}
+
+void RecordAttemptFailure(const char* cause, bool credential_failure)
+{
+    g_attempt_active = false;
+    SetOnline(false);
+    uint8_t& failures = g_slot_fail_count[g_active_slot];
+    if (credential_failure) {
+        failures = kPerSlotAttemptLimit;
+    } else if (failures < kPerSlotAttemptLimit) {
+        ++failures;
+    }
+    ESP_LOGW(
+        kTag,
+        "WiFi attempt failed: cause=%s slot=%u failures=%u/%u",
+        cause,
+        static_cast<unsigned>(g_active_slot),
+        static_cast<unsigned>(failures),
+        static_cast<unsigned>(kPerSlotAttemptLimit));
+    if (failures >= kPerSlotAttemptLimit) {
+        if (TryPivotToBackupSlot()) {
+            return;
+        }
+        ScheduleBackoff();
+        return;
+    }
+    SetState(wqn::services::ConnectivityState::kConnecting);
+    const int64_t retry_delay_us = RetryDelayUs(failures);
+    ScheduleAction(ScheduledAction::kRetrySlot, retry_delay_us);
+    ESP_LOGI(
+        kTag,
+        "WiFi retry scheduled: slot=%u delay_ms=%lld",
+        static_cast<unsigned>(g_active_slot),
+        static_cast<long long>(retry_delay_us / 1000));
 }
 
 esp_err_t BeginProvisioning()
@@ -344,7 +439,8 @@ esp_err_t BeginProvisioning()
     }
     SetOnline(false);
     g_slot_fail_count[0] = g_slot_fail_count[1] = 0;
-    g_next_action_us = 0;
+    g_attempt_active = false;
+    ClearScheduledAction();
     SetState(wqn::services::ConnectivityState::kProvisioning);
     const esp_err_t result = wqn::StartProvisioningMode();
     if (result != ESP_OK) {
@@ -363,12 +459,22 @@ esp_err_t StartConfiguredConnectivity()
     SetState(wqn::services::ConnectivityState::kOff);
     return ESP_OK;
 #else
-    if (g_state.load(std::memory_order_acquire) ==
-        wqn::services::ConnectivityState::kQuiescing) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    if (g_online.load(std::memory_order_acquire)) {
-        return ESP_OK;
+    const wqn::services::ConnectivityState state =
+        g_state.load(std::memory_order_acquire);
+    switch (state) {
+        case wqn::services::ConnectivityState::kQuiescing:
+            return ESP_ERR_INVALID_STATE;
+        case wqn::services::ConnectivityState::kProvisioning:
+        case wqn::services::ConnectivityState::kConnecting:
+        case wqn::services::ConnectivityState::kWaitingIp:
+        case wqn::services::ConnectivityState::kOnline:
+        case wqn::services::ConnectivityState::kBackoff:
+            // StartConnectivity is an idempotent readiness request. In
+            // particular, it must not tear down an in-flight association or
+            // bypass the radio-off backoff selected by this owner task.
+            return ESP_OK;
+        case wqn::services::ConnectivityState::kOff:
+            break;
     }
     if (wqn::IsProvisioningActive()) {
         SetState(wqn::services::ConnectivityState::kProvisioning);
@@ -385,11 +491,7 @@ esp_err_t StartConfiguredConnectivity()
     esp_err_t result = ESP_ERR_NOT_FOUND;
     if (g_cred_store.count > 0) {
         result = KickConnectFromStore();
-    } else if (g_state.load(std::memory_order_acquire) ==
-                   wqn::services::ConnectivityState::kBackoff &&
-               wqn::IsWifiStationInitialized()) {
-        // Developer fallback resume after a backoff: the driver still holds its
-        // config, so a bare radio restart resumes the retry cycle.
+    } else if (wqn::IsWifiStationInitialized()) {
         result = wqn::StartWifiStationRadio();
     } else {
         result = wqn::StartWifiStationIfEnabled();
@@ -398,14 +500,14 @@ esp_err_t StartConfiguredConnectivity()
         return BeginProvisioning();
     }
     if (result != ESP_OK) {
-        g_connectivity_lease.Reset();
-        SetState(wqn::services::ConnectivityState::kBackoff);
-        g_next_action_us = esp_timer_get_time() + kBackoffDelayUs;
+        ScheduleBackoff();
         return result;
     }
-    SetState(wqn::services::ConnectivityState::kConnecting);
-    ScheduleConnectRetry();
-    return ESP_OK;
+    result = BeginConnectionAttempt();
+    if (result != ESP_OK) {
+        RecordAttemptFailure("connect-request", false);
+    }
+    return result;
 #endif
 }
 
@@ -425,6 +527,8 @@ esp_err_t StartWithCredentials(const ConnectivityCommand& command)
     if (!HoldConnectivityLease()) {
         return ESP_ERR_INVALID_STATE;
     }
+    g_attempt_active = false;
+    ClearScheduledAction();
 
     // [wifi-redundancy] Persist first (dedup by SSID, the new credential becomes
     // preferred), then connect from the refreshed store. If the upsert fails we
@@ -435,7 +539,13 @@ esp_err_t StartWithCredentials(const ConnectivityCommand& command)
     }
     ReloadCredStoreFromNvs();
     esp_err_t result = ESP_OK;
-    if (g_cred_store.count > 0) {
+    const bool stored_new_credential =
+        upsert_result == ESP_OK && g_cred_store.count > 0 &&
+        g_cred_store.preferred < g_cred_store.count &&
+        std::strcmp(
+            g_cred_store.slots[g_cred_store.preferred].ssid,
+            command.ssid) == 0;
+    if (stored_new_credential) {
         result = KickConnectFromStore();
     } else {
         g_slot_fail_count[0] = g_slot_fail_count[1] = 0;
@@ -449,15 +559,14 @@ esp_err_t StartWithCredentials(const ConnectivityCommand& command)
         }
     }
     if (result != ESP_OK) {
-        g_connectivity_lease.Reset();
-        SetState(wqn::services::ConnectivityState::kBackoff);
-        g_next_action_us = esp_timer_get_time() + kBackoffDelayUs;
+        ScheduleBackoff();
         return result;
     }
-    SetOnline(false);
-    SetState(wqn::services::ConnectivityState::kConnecting);
-    ScheduleConnectRetry();
-    return ESP_OK;
+    result = BeginConnectionAttempt();
+    if (result != ESP_OK) {
+        RecordAttemptFailure("credential-connect-request", false);
+    }
+    return result;
 #endif
 }
 
@@ -467,8 +576,9 @@ esp_err_t PrepareForSleep(const wqn::power::PrepareSleepCommand& command)
         return ESP_ERR_TIMEOUT;
     }
     g_resume_provisioning = wqn::IsProvisioningActive();
+    g_attempt_active = false;
+    ClearScheduledAction();
     SetState(wqn::services::ConnectivityState::kQuiescing);
-    g_next_action_us = 0;
 
     if (g_resume_provisioning) {
         const esp_err_t provision_result = wqn::StopProvisioningMode();
@@ -491,6 +601,8 @@ esp_err_t RollbackAfterSleepAbort()
         return BeginProvisioning();
     }
     if (wqn::IsWifiStationConnected()) {
+        g_attempt_active = false;
+        ClearScheduledAction();
         SetOnline(true, wqn::GetWifiRssi());
         SetState(wqn::services::ConnectivityState::kOnline);
         return ESP_OK;
@@ -502,8 +614,11 @@ esp_err_t RollbackAfterSleepAbort()
         SetOnline(false);
         SetState(wqn::services::ConnectivityState::kConnecting);
         g_slot_fail_count[0] = g_slot_fail_count[1] = 0;
-        ScheduleConnectRetry();
-        return ESP_OK;
+        const esp_err_t result = BeginConnectionAttempt();
+        if (result != ESP_OK) {
+            RecordAttemptFailure("sleep-rollback-connect", false);
+        }
+        return result;
     }
     SetState(wqn::services::ConnectivityState::kOff);
     return ESP_OK;
@@ -527,28 +642,58 @@ esp_err_t HandleCommand(const ConnectivityCommand& command)
         case CommandType::kWifiStarted: {
             if (state == wqn::services::ConnectivityState::kQuiescing ||
                 state == wqn::services::ConnectivityState::kBackoff ||
-                state == wqn::services::ConnectivityState::kProvisioning) {
+                state == wqn::services::ConnectivityState::kProvisioning ||
+                state == wqn::services::ConnectivityState::kWaitingIp ||
+                state == wqn::services::ConnectivityState::kOnline ||
+                g_attempt_active) {
+                return ESP_OK;
+            }
+            const esp_err_t result = BeginConnectionAttempt();
+            if (result != ESP_OK) {
+                RecordAttemptFailure("station-start-connect", false);
+            }
+            return result;
+        }
+        case CommandType::kWifiAssociated:
+            if (state == wqn::services::ConnectivityState::kQuiescing ||
+                state == wqn::services::ConnectivityState::kBackoff ||
+                state == wqn::services::ConnectivityState::kProvisioning ||
+                state == wqn::services::ConnectivityState::kOnline) {
                 return ESP_OK;
             }
             if (!HoldConnectivityLease()) {
                 return ESP_ERR_INVALID_STATE;
             }
-            SetState(wqn::services::ConnectivityState::kConnecting);
-            const esp_err_t result = wqn::ConnectWifiStationNow();
-            ScheduleConnectRetry();
-            return result;
-        }
-        case CommandType::kWifiConnected:
-            if (state == wqn::services::ConnectivityState::kQuiescing) {
+            g_attempt_active = true;
+            SetState(wqn::services::ConnectivityState::kWaitingIp);
+            ScheduleAction(ScheduledAction::kDhcpTimeout, kDhcpTimeoutUs);
+            ESP_LOGI(
+                kTag,
+                "WiFi associated; waiting up to %lld ms for DHCP",
+                static_cast<long long>(kDhcpTimeoutUs / 1000));
+            return ESP_OK;
+        case CommandType::kWifiGotIp:
+            if (state == wqn::services::ConnectivityState::kQuiescing ||
+                state == wqn::services::ConnectivityState::kBackoff) {
                 return ESP_OK;
             }
+            g_attempt_active = false;
             g_slot_fail_count[0] = g_slot_fail_count[1] = 0;
-            g_next_action_us = 0;
+            ClearScheduledAction();
             SetOnline(true, wqn::GetWifiRssi());
             SetState(wqn::services::ConnectivityState::kOnline);
             // [wifi-redundancy] The slot that just connected becomes the next
             // cycle's first try; the NVS write is skipped when unchanged.
-            wqn::MarkWifiSlotPreferred(g_active_slot);
+            if (g_cred_store.count > 0 && g_active_slot < g_cred_store.count) {
+                const esp_err_t preferred_result =
+                    wqn::MarkWifiSlotPreferred(g_active_slot);
+                if (preferred_result != ESP_OK) {
+                    ESP_LOGW(
+                        kTag,
+                        "mark WiFi slot preferred failed: %s",
+                        esp_err_to_name(preferred_result));
+                }
+            }
             // Connectivity is readiness, not a synchronization intent. The
             // sync scheduler wakes and runs only if a manual/periodic/retry/
             // outbox reason is already pending; reconnecting by itself must
@@ -559,7 +704,8 @@ esp_err_t HandleCommand(const ConnectivityCommand& command)
             SetOnline(false);
             if (state == wqn::services::ConnectivityState::kQuiescing ||
                 state == wqn::services::ConnectivityState::kBackoff ||
-                state == wqn::services::ConnectivityState::kProvisioning) {
+                state == wqn::services::ConnectivityState::kProvisioning ||
+                state == wqn::services::ConnectivityState::kOff) {
                 return ESP_OK;
             }
             ESP_LOGW(
@@ -571,20 +717,14 @@ esp_err_t HandleCommand(const ConnectivityCommand& command)
             if (!HoldConnectivityLease()) {
                 return ESP_ERR_INVALID_STATE;
             }
-            // [wifi-redundancy] A credential-level failure (auth fail / AP not
-            // found) will not recover by retrying this slot: burn its budget and
-            // pivot to the backup immediately. Transient signal loss keeps the
-            // scheduled fast retry on the same slot.
-            if (wqn::IsWifiCredentialFailureReason(command.reason)) {
-                g_slot_fail_count[g_active_slot] = kPerSlotFastRetryLimit;
-                if (TryPivotToBackupSlot()) {
-                    return ESP_OK;
-                }
-                ScheduleBackoff();
+            if (!g_attempt_active &&
+                g_scheduled_action == ScheduledAction::kRetrySlot) {
+                ESP_LOGI(kTag, "ignore disconnect from completed/aborted attempt");
                 return ESP_OK;
             }
-            SetState(wqn::services::ConnectivityState::kConnecting);
-            ScheduleConnectRetry();
+            RecordAttemptFailure(
+                "disconnect",
+                wqn::IsWifiCredentialFailureReason(command.reason));
             return ESP_OK;
         case CommandType::kPrepareSleep:
             return PrepareForSleep(command.sleep);
@@ -599,61 +739,103 @@ void HandleScheduledAction()
 {
     const wqn::services::ConnectivityState state =
         g_state.load(std::memory_order_acquire);
-    if (state == wqn::services::ConnectivityState::kConnecting) {
-        if (!HoldConnectivityLease()) {
-            g_next_action_us = esp_timer_get_time() + 1000 * 1000;
-            return;
-        }
-        // [wifi-redundancy] Each timed-out attempt counts against the active
-        // slot; at its budget we pivot to the backup, otherwise back off.
-        if (++g_slot_fail_count[g_active_slot] >= kPerSlotFastRetryLimit) {
-            if (TryPivotToBackupSlot()) {
-                return;
-            }
-            ScheduleBackoff();
-            return;
-        }
-        ESP_LOGI(
-            kTag,
-            "retry WiFi connection: slot=%u attempt=%u/%u",
-            static_cast<unsigned>(g_active_slot),
-            static_cast<unsigned>(g_slot_fail_count[g_active_slot]),
-            static_cast<unsigned>(kPerSlotFastRetryLimit));
-        const esp_err_t result = wqn::ConnectWifiStationNow();
-        if (result != ESP_OK) {
-            ESP_LOGW(kTag, "WiFi connect request failed: %s", esp_err_to_name(result));
-        }
-        ScheduleConnectRetry();
+    const ScheduledAction action = g_scheduled_action;
+    if (action == ScheduledAction::kNone) {
+        ClearScheduledAction();
         return;
     }
-    if (state == wqn::services::ConnectivityState::kBackoff) {
-        if (!HoldConnectivityLease()) {
-            g_next_action_us = esp_timer_get_time() + 1000 * 1000;
+    const bool action_matches_state =
+        (action == ScheduledAction::kAssociationTimeout &&
+         state == wqn::services::ConnectivityState::kConnecting &&
+         g_attempt_active) ||
+        (action == ScheduledAction::kDhcpTimeout &&
+         state == wqn::services::ConnectivityState::kWaitingIp &&
+         g_attempt_active) ||
+        (action == ScheduledAction::kRetrySlot &&
+         state == wqn::services::ConnectivityState::kConnecting &&
+         !g_attempt_active) ||
+        (action == ScheduledAction::kBackoffExpired &&
+         state == wqn::services::ConnectivityState::kBackoff);
+    if (!action_matches_state) {
+        ClearScheduledAction();
+        return;
+    }
+    if (!HoldConnectivityLease()) {
+        ScheduleAction(action, 1000 * 1000);
+        return;
+    }
+
+    switch (action) {
+        case ScheduledAction::kAssociationTimeout:
+            if (state != wqn::services::ConnectivityState::kConnecting ||
+                !g_attempt_active) {
+                ClearScheduledAction();
+                return;
+            }
+            ClearScheduledAction();
+            g_attempt_active = false;
+            ESP_ERROR_CHECK_WITHOUT_ABORT(wqn::DisconnectWifiStationNow());
+            RecordAttemptFailure("association-timeout", false);
+            return;
+        case ScheduledAction::kDhcpTimeout:
+            if (state != wqn::services::ConnectivityState::kWaitingIp ||
+                !g_attempt_active) {
+                ClearScheduledAction();
+                return;
+            }
+            ClearScheduledAction();
+            g_attempt_active = false;
+            ESP_ERROR_CHECK_WITHOUT_ABORT(wqn::DisconnectWifiStationNow());
+            RecordAttemptFailure("dhcp-timeout", false);
+            return;
+        case ScheduledAction::kRetrySlot: {
+            if (state != wqn::services::ConnectivityState::kConnecting ||
+                g_attempt_active) {
+                ClearScheduledAction();
+                return;
+            }
+            ClearScheduledAction();
+            const esp_err_t result = BeginConnectionAttempt();
+            if (result != ESP_OK) {
+                RecordAttemptFailure("retry-connect-request", false);
+            }
             return;
         }
-        ESP_LOGI(kTag, "WiFi backoff complete; restarting radio");
-        // [wifi-redundancy] Reload the store (provisioning may have written new
-        // credentials during the backoff) and restart from the preferred slot.
-        ReloadCredStoreFromNvs();
-        esp_err_t result = ESP_ERR_NOT_FOUND;
-        if (g_cred_store.count > 0) {
-            result = KickConnectFromStore();
-        } else if (wqn::IsWifiStationInitialized()) {
-            result = wqn::StartWifiStationRadio();
-        } else {
-            result = wqn::StartWifiStationIfEnabled();
-        }
-        if (result == ESP_ERR_NOT_FOUND) {
-            ESP_ERROR_CHECK_WITHOUT_ABORT(BeginProvisioning());
+        case ScheduledAction::kBackoffExpired: {
+            if (state != wqn::services::ConnectivityState::kBackoff) {
+                ClearScheduledAction();
+                return;
+            }
+            ClearScheduledAction();
+            ESP_LOGI(kTag, "WiFi backoff complete; restarting radio");
+            // Reload the store because provisioning may have written new
+            // credentials while the radio was stopped.
+            ReloadCredStoreFromNvs();
+            esp_err_t result = ESP_ERR_NOT_FOUND;
+            if (g_cred_store.count > 0) {
+                result = KickConnectFromStore();
+            } else if (wqn::IsWifiStationInitialized()) {
+                result = wqn::StartWifiStationRadio();
+            } else {
+                result = wqn::StartWifiStationIfEnabled();
+            }
+            if (result == ESP_ERR_NOT_FOUND) {
+                ESP_ERROR_CHECK_WITHOUT_ABORT(BeginProvisioning());
+                return;
+            }
+            if (result != ESP_OK) {
+                ESP_LOGW(kTag, "WiFi restart failed: %s", esp_err_to_name(result));
+                ScheduleBackoff();
+                return;
+            }
+            result = BeginConnectionAttempt();
+            if (result != ESP_OK) {
+                RecordAttemptFailure("backoff-connect-request", false);
+            }
             return;
         }
-        if (result != ESP_OK) {
-            ESP_LOGW(kTag, "WiFi restart failed: %s", esp_err_to_name(result));
-            g_next_action_us = esp_timer_get_time() + kBackoffDelayUs;
+        case ScheduledAction::kNone:
             return;
-        }
-        SetState(wqn::services::ConnectivityState::kConnecting);
-        ScheduleConnectRetry();
     }
 }
 
