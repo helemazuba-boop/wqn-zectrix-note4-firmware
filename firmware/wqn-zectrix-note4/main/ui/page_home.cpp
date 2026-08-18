@@ -71,9 +71,27 @@ esp_err_t DrawHomeTaskRow(int x, int y, int width, int index, const wqn::HomeTas
 esp_err_t RenderHomePrimaryRegion(const wqn::HomeSummary& home, RefreshSchedule schedule)
 {
     ClearRect(kHomePrimaryRect);
-    DrawRoundedRect(kHomeContentX, 35, kHomeContentW, 26, kRoundedOuterRadius);
+    if (!home.timer_status_only) {
+        DrawRoundedRect(kHomeContentX, 35, kHomeContentW, 26, kRoundedOuterRadius);
+    }
     ESP_RETURN_ON_ERROR(DrawCenteredText(kHomeContentX, 39, kHomeContentW, home.primary_time_line), kTag, "draw home primary time region");
     return RefreshRegion(kHomePrimaryRect, schedule);
+}
+
+esp_err_t RenderHomeStatusBarRegion(const wqn::HomeSummary& home, RefreshSchedule schedule)
+{
+    // On a deep-sleep timer wake the retained timer may have crossed into its
+    // terminal state while the panel still shows “进行中”. Redraw both the
+    // minute clock and the plain timer sentence; ordinary minute ticks only
+    // dirty the status-bar pixels because the sentence is unchanged.
+    constexpr UiRect kHomeClockAndTimerRect = {0, 0, wqn::kEpdWidth, 64, "home-clock-and-timer"};
+    ClearRect(kHomeClockAndTimerRect);
+    DrawStatusBar("首页", home);
+    ESP_RETURN_ON_ERROR(
+        DrawCenteredText(kHomeContentX, 39, kHomeContentW, home.primary_time_line),
+        kTag,
+        "draw home timer status on clock tick");
+    return RefreshRegion(kHomeClockAndTimerRect, schedule);
 }
 
 UiRect ConfigRefreshRect(const wqn::TimeAppState& time_app)
@@ -89,7 +107,9 @@ esp_err_t RenderHomeToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
 
     DrawStatusBar("首页", home);
 
-    DrawRoundedRect(kHomeContentX, 35, kHomeContentW, 26, kRoundedOuterRadius);
+    if (!home.timer_status_only) {
+        DrawRoundedRect(kHomeContentX, 35, kHomeContentW, 26, kRoundedOuterRadius);
+    }
     ESP_RETURN_ON_ERROR(DrawCenteredText(kHomeContentX, 39, kHomeContentW, home.primary_time_line), kTag, "draw home primary time");
 
     // Three metric cards distributed across the 388px content width with a

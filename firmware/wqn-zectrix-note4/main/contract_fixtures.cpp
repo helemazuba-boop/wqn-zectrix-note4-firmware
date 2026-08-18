@@ -12,6 +12,7 @@
 #include "problem_app.h"
 #include "problem_pack.h"
 #include "text_render.h"
+#include "time_app.h"
 #include "ui/markdown_layout.h"
 #include "word_app.h"
 #include "wqn_api.h"
@@ -1445,6 +1446,7 @@ bool RunContractFixtureSelfTest()
         CheckProblemStudyV1Contract() &&
         CheckAiStreamHttpFailures() &&
         CheckMarkdownLayout() &&
+        RunTimeAppStateSelfTest() &&
         RunWordPageStateSelfTest() &&
         RunNotePageStateSelfTest() &&
         RunProblemPageStateSelfTest();

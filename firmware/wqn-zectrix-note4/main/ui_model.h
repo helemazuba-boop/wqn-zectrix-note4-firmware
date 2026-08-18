@@ -172,6 +172,7 @@ struct HomeSummary {
     std::string wifi_label = "WiFi";
     std::string battery_label = "--%";
     std::string primary_time_line = "--:--";
+    bool timer_status_only = false;
     // Raw state for status-bar icons (font_zectrix). Populated by BuildHomeSummary.
     int battery_percent = 0;
     bool charging = false;

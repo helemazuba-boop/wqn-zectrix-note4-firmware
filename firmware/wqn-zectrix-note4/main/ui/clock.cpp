@@ -193,7 +193,10 @@ bool ShouldRefreshTimeTick(const wqn::UiState& state)
 bool ScreenUsesClockMinute(const wqn::UiState& state)
 {
     if (state.screen == wqn::UiScreen::kHome) {
-        return !wqn::TimeAppHasActiveTimer(state.time_app);
+        // The home primary line becomes a static timer-status sentence while
+        // a timer runs, but the status-bar wall clock must keep its normal
+        // minute cadence.
+        return true;
     }
     if (state.screen == wqn::UiScreen::kTodo) {
         return true;

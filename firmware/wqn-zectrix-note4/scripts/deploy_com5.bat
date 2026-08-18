@@ -1,180 +1,224 @@
 @echo off
-setlocal EnableExtensions EnableDelayedExpansion
-chcp 65001 >nul
+setlocal EnableExtensions
 
-:: ============================================================
-::  WQN Note4 Flash Deploy (COM5 Dedicated Script)
-::  Build: WSL  |  Flash+Monitor: Windows  |  Interactive Backup
-:: ============================================================
-
+:: ========== Configuration ==========
+:: Firmware lives in WSL.
+:: Build runs in WSL (ESP-IDF is there);
+:: flash + monitor stay Windows-native (device on COM5).
+::
+:: Build uses `bash -c` (NOT bash -ic): `bash -ic` sources .bashrc which
+:: auto-activates conda base (python 3.13), but the IDF venv is
+:: idf5.5_py3.12_env -> export.sh would abort with "venv not found".
+:: `bash -c` keeps system python 3.12, which matches the venv.
 set "WSL_DISTRO=Ubuntu"
 set "WSL_FW_DIR=/home/unknow/projects/firmware/firmware/wqn-zectrix-note4"
 set "WSL_IDF_EXPORT=~/esp/esp-idf-v5.5/export.sh"
 set "BUILD_DIR=build-ai-local-s3"
 set "BUILD_UNC=\\wsl.localhost\Ubuntu\home\unknow\projects\firmware\firmware\wqn-zectrix-note4\build-ai-local-s3"
-set "BACKUP_DIR=\\wsl.localhost\Ubuntu\home\unknow\projects\firmware\firmware\wqn-zectrix-note4\backups"
+
 set "COM_PORT=COM5"
 set "BAUD=460800"
-set "FLASH_SIZE=0x1000000"
+
+:: esptool reset mode.
+:: default-reset is what ESP-IDF's own `idf.py flash`
+:: emits for this board.
 set "RESET_BEFORE=default-reset"
 set "RESET_AFTER=hard-reset"
+:: ===================================
 
-echo/
-echo ============================================================
-echo   WQN Note4 Flash Deploy (COM5 Dedicated)
-echo   Port: %COM_PORT%  ^|  Baud: %BAUD%  ^|  Flash: 16MB
-echo ============================================================
-echo/
 
-:: Step 0: Stop existing serial monitor
+echo.
+echo ========================================
+echo  WQN Note4 Flash Deploy
+echo  Build: WSL  ^|  Flash+Monitor: Windows
+echo  Port: %COM_PORT%
+echo ========================================
+echo.
+
+
+:: ============================================================
+:: Step 0
+:: Stop any existing serial monitor so COM5 is free.
+::
+:: The monitor cmd window may have a child PowerShell process
+:: which actually holds the COM port open.
+:: ============================================================
+
 echo [Step 0] Stopping existing serial monitor...
+
 taskkill /F /T /FI "WINDOWTITLE eq monitor_serial*" >nul 2>&1
+
 powershell.exe -NoProfile -Command "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*monitor_serial*' -and $_.ProcessId -ne $PID -and @('cmd.exe','powershell.exe','pwsh.exe') -contains $_.Name } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }" >nul 2>&1
+
 echo   Done.
 
-:: Step 1: Build in WSL
-echo/
+
+:: ============================================================
+:: Step 1
+:: Build in WSL.
+::
+:: Incremental builds are normally fast and guarantee that the
+:: flashed firmware matches the current working tree.
+::
+:: Set SKIP_BUILD=1 only when intentionally re-flashing the
+:: existing build artifacts.
+:: ============================================================
+
+echo.
+
 if "%SKIP_BUILD%"=="1" (
     if not exist "%BUILD_UNC%\flash_args" (
         echo [Step 1] ERROR: SKIP_BUILD=1 but flash_args does not exist.
         pause
         exit /b 1
     )
+
     echo [Step 1] SKIP_BUILD=1; reusing existing build artifacts.
     goto :build_done
 )
 
+
 :do_build
+
 echo [Step 1] Building in WSL ^(ESP-IDF %WSL_IDF_EXPORT%^)...
+
+
 if not exist "%BUILD_UNC%\CMakeCache.txt" (
     echo         Initializing clean build directory for ESP32-S3...
+
     wsl -d %WSL_DISTRO% -- bash -c "cd %WSL_FW_DIR% && . %WSL_IDF_EXPORT% && idf.py --no-ccache -B %BUILD_DIR% set-target esp32s3"
+
     if errorlevel 1 (
         echo   ERROR: WSL target initialization failed^!
         pause
         exit /b 1
     )
 )
+
+
 wsl -d %WSL_DISTRO% -- bash -c "cd %WSL_FW_DIR% && . %WSL_IDF_EXPORT% && idf.py --no-ccache -B %BUILD_DIR% build"
+
 if errorlevel 1 (
     echo   ERROR: WSL build failed^!
     pause
     exit /b 1
 )
+
+
 if not exist "%BUILD_UNC%\flash_args" (
-    echo   ERROR: build finished but flash_args not found at %BUILD_UNC%\flash_args
+    echo   ERROR: build finished but flash_args not found at:
+    echo          %BUILD_UNC%\flash_args
     pause
     exit /b 1
 )
+
+
 echo   Done.
+
+
 :build_done
 
-:: Step 2: esptool preflight
-echo/
-echo [Step 2] Checking esptool environment...
+
+:: ============================================================
+:: Step 2
+:: COM port + esptool preflight
+:: ============================================================
+
+echo.
+echo [Step 2] Using COM port: %COM_PORT% @ %BAUD% baud
+
+
 where esptool >nul 2>nul
+
 if errorlevel 1 (
     echo   ERROR: 'esptool' not found on Windows PATH.
     echo          Install with: pip install esptool
     pause
     exit /b 1
 )
-echo   Done.
 
-:: Step 2.5: Interactive Flash Backup
-echo/
-if not exist "%BACKUP_DIR%" (
-    mkdir "%BACKUP_DIR%" >nul 2>&1
-)
 
-if "%SKIP_BACKUP%"=="1" (
-    echo [Step 2.5] SKIP_BACKUP=1; skipping flash backup.
-    goto :skip_backup
-)
+echo   esptool found.
+echo.
 
-set "DO_BACKUP="
-echo ============================================================
-echo   [备份询问] 是否需要对 %COM_PORT% 执行 16MB 全量 Flash 备份？
-echo   (首次刷写原厂设备建议备份，按 460800 波特率读取约需 4-6 分钟)
-echo ============================================================
-set /p DO_BACKUP="是否备份 %COM_PORT% 全量 Flash？[Y=备份 / N=跳过 / C=取消部署] (直接回车默认 Y): "
 
-if /I "%DO_BACKUP%"=="C" (
-    echo [Step 2.5] 用户取消部署。
-    pause
-    exit /b 0
-)
-if /I "%DO_BACKUP%"=="N" (
-    echo [Step 2.5] 用户选择跳过备份。
-    goto :skip_backup
-)
+:: ============================================================
+:: Step 3
+:: Flash.
+::
+:: IMPORTANT:
+:: NO erase-all.
+::
+:: This writes the partitions described by flash_args without
+:: deliberately erasing unrelated NVS data first.
+:: ============================================================
 
-:do_backup
-for /f "usebackq tokens=*" %%i in (`powershell.exe -NoProfile -Command "Get-Date -Format 'yyyyMMdd_HHmmss'" 2^>nul`) do set "TIMESTAMP=%%i"
-if "%TIMESTAMP%"=="" (
-    set "TIMESTAMP=%DATE:~0,4%%DATE:~5,2%%DATE:~8,2%_%TIME:~0,2%%TIME:~3,2%%TIME:~6,2%"
-    set "TIMESTAMP=%TIMESTAMP: =0%"
-    set "TIMESTAMP=%TIMESTAMP::=%"
-)
-set "BACKUP_FILE=%BACKUP_DIR%\backup_com5_full_%TIMESTAMP%.bin"
-
-echo/
-echo [Step 2.5] Performing full 16MB Flash backup for %COM_PORT%...
-echo            Target: %BACKUP_FILE%
-echo            Reading 16MB flash at %BAUD% baud, please wait...
-
-pushd "%BACKUP_DIR%" >nul 2>&1
-esptool --chip esp32s3 --port %COM_PORT% --baud %BAUD% read-flash 0 %FLASH_SIZE% "%BACKUP_FILE%"
-set "ESPRC=%ERRORLEVEL%"
-popd >nul 2>&1
-
-if not "%ESPRC%"=="0" (
-    echo/
-    echo ============================================================
-    echo   [ERROR] Full Flash backup failed ^(exit code: %ESPRC%^)^!
-    echo   Flash deployment aborted to protect device data.
-    echo ============================================================
-    pause
-    exit /b 1
-)
-
-echo   [OK] Flash backup completed successfully: %BACKUP_FILE%
-:skip_backup
-
-:: Step 3: Flash all partitions
-echo/
 echo [Step 3] Flashing all partitions via esptool to %COM_PORT%...
+
+
 pushd "%BUILD_UNC%"
+
 if errorlevel 1 (
-    echo   ERROR: cannot access build dir %BUILD_UNC%
+    echo   ERROR: cannot access build dir:
+    echo          %BUILD_UNC%
     pause
     exit /b 1
 )
-esptool --chip esp32s3 --port %COM_PORT% --baud %BAUD% --before %RESET_BEFORE% --after %RESET_AFTER% write-flash @flash_args
-if not "%ERRORLEVEL%"=="0" (
-    esptool --chip esp32s3 --port %COM_PORT% --baud %BAUD% --before %RESET_BEFORE% --after %RESET_AFTER% write_flash @flash_args
-)
+
+
+esptool --chip esp32s3 --port %COM_PORT% --baud %BAUD% --before %RESET_BEFORE% --after %RESET_AFTER% write_flash @flash_args
+
 set "FLASH_RC=%ERRORLEVEL%"
+
+
 popd
+
+
 if not "%FLASH_RC%"=="0" (
     echo   ERROR: Flash failed ^(esptool exit %FLASH_RC%^)^!
     pause
     exit /b 1
 )
+
+
 echo   Done.
 
-echo/
-echo ============================================================
-echo  Deploy and Flash complete^! (Port: %COM_PORT%)
-echo ============================================================
-echo/
 
-:: Step 4: Open serial monitor
+echo.
+echo ========================================
+echo  Flash complete^!
+echo  Port: %COM_PORT%
+echo ========================================
+echo.
+
+
+:: ============================================================
+:: Step 4
+:: Open serial monitor in another window.
+:: ============================================================
+
 echo [Step 4] Opening serial monitor on %COM_PORT%...
-start "monitor_serial" cmd /c ""%~dp0monitor_serial.bat" %COM_PORT%"
-echo   Monitor opened in new window.
-echo/
 
-echo All steps complete. You can close this window.
+
+if not exist "%~dp0scripts\monitor_serial.bat" (
+    echo   WARNING: monitor script not found:
+    echo            %~dp0scripts\monitor_serial.bat
+    echo.
+    echo   Flash succeeded; monitor was not opened.
+    goto :deploy_done
+)
+
+
+start "monitor_serial" cmd /c ""%~dp0scripts\monitor_serial.bat" %COM_PORT%"
+
+
+echo   Monitor opened in new window.
+echo.
+
+
+:deploy_done
+
+echo Deploy complete. You can close this window.
 pause
+
 endlocal

@@ -5,6 +5,7 @@
 #include "ui_internal.h"
 
 #include <algorithm>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -31,7 +32,14 @@ bool SameTimeAppState(const wqn::TimeAppState& a, const wqn::TimeAppState& b)
            a.pomodoro_focus_minutes == b.pomodoro_focus_minutes &&
            a.pomodoro_break_minutes == b.pomodoro_break_minutes &&
            a.pomodoro_long_break_minutes == b.pomodoro_long_break_minutes &&
-           a.pomodoro_current_round == b.pomodoro_current_round;
+           a.pomodoro_current_round == b.pomodoro_current_round &&
+           a.session_started_unix_seconds == b.session_started_unix_seconds &&
+           a.phase_started_unix_seconds == b.phase_started_unix_seconds &&
+           a.phase_ends_unix_seconds == b.phase_ends_unix_seconds &&
+           a.paused_at_unix_seconds == b.paused_at_unix_seconds &&
+           a.action_armed == b.action_armed &&
+           a.action_armed_at_unix_seconds == b.action_armed_at_unix_seconds &&
+           std::strcmp(a.task_name, b.task_name) == 0;
 }
 
 bool TimeAppStructureChanged(const wqn::TimeAppState& before, const wqn::TimeAppState& after)
@@ -62,6 +70,7 @@ void BuildHomeSummary(wqn::UiState* state)
 
     // UI contract: one line only. Source priority is pomodoro > countdown > clock.
     home.primary_time_line = ChooseHomePrimaryTimeLine(state->time_app);
+    home.timer_status_only = wqn::TimeAppHasActiveTimer(state->time_app);
 
     const size_t problem_count = state->problem_app.pack_index.entries.size();
     const uint8_t mastered = static_cast<uint8_t>(
@@ -134,6 +143,7 @@ bool LoadUiState(wqn::UiState* state, bool restore_screen_from_rtc)
         state->screen = is_restorable_screen(saved_screen)
             ? static_cast<wqn::UiScreen>(saved_screen)
             : wqn::UiScreen::kHome;
+        RestoreRetainedTimeApp(&state->time_app);
     }
 
     esp_err_t result = wqn::InitWordApp(&state->word_app);

@@ -118,6 +118,7 @@ UiUpdate UiRuntime::DispatchButton(
     int64_t event_time_ms)
 {
     const RefreshSchedule refresh = ApplyButtonEvent(event, event_time_ms, &state_);
+    RetainTimeAppState(state_.time_app);
     return FinishEvent(
         AppEventKind::kButton, refresh, refresh != RefreshSchedule::kNone);
 }
@@ -588,11 +589,40 @@ UiUpdate UiRuntime::DispatchDefaultDeckChangeResult(
 
 UiUpdate UiRuntime::DispatchTimeTick(int64_t now_ms)
 {
+    const wqn::TimeAppState before = state_.time_app;
+    const int previous_progress_bucket = wqn::TimeAppVisualProgressBucket(before);
     const bool changed = wqn::TickTimeApp(&state_.time_app, now_ms);
     RefreshSchedule refresh = RefreshSchedule::kNone;
     if (changed) {
+        RetainTimeAppState(state_.time_app);
         UpdateHomePrimaryTimeLine(&state_);
-        if (ShouldRefreshTimeTick(state_)) {
+        const bool status_changed = state_.time_app.status != before.status;
+        const bool action_focus_changed =
+            state_.time_app.action_armed != before.action_armed;
+        const bool endpoint_changed =
+            state_.time_app.phase_ends_unix_seconds != before.phase_ends_unix_seconds ||
+            state_.time_app.phase_started_unix_seconds != before.phase_started_unix_seconds;
+        const bool progress_changed =
+            wqn::TimeAppVisualProgressBucket(state_.time_app) != previous_progress_bucket;
+        const bool visible_timer_page =
+            state_.screen == wqn::UiScreen::kTime &&
+            state_.time_app.tile != wqn::TimeTile::kClock &&
+            !state_.time_app.config_mode;
+
+        if (status_changed) {
+            // Home only changes one plain status sentence; the timer page
+            // changes its whole semantic composition at pause/end boundaries.
+            refresh = state_.screen == wqn::UiScreen::kHome
+                ? RefreshSchedule::kTimer
+                : visible_timer_page ? RefreshSchedule::kCommit : RefreshSchedule::kNone;
+        } else if (visible_timer_page && action_focus_changed &&
+                   (progress_changed || endpoint_changed)) {
+            // A focus timeout coinciding with a milestone redraw needs one
+            // stable whole composition, not two competing partial intents.
+            refresh = RefreshSchedule::kCommit;
+        } else if (visible_timer_page && action_focus_changed) {
+            refresh = RefreshSchedule::kSelection;
+        } else if (visible_timer_page && (progress_changed || endpoint_changed)) {
             refresh = RefreshSchedule::kTimer;
         }
     }

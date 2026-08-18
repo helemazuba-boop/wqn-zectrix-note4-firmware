@@ -93,7 +93,7 @@ constexpr std::size_t kVolumeOptionsCount = sizeof(kVolumeOptions) / sizeof(kVol
 // Use kStatusBarHeight / kStatusBarDividerY in ui_layout.h instead.
 constexpr UiRect kHomePrimaryRect = {8, 33, 384, 31, "home-primary-time"};
 constexpr UiRect kTimeStandbyRect = {0, 42, wqn::kEpdWidth, 172, "time-standby"};
-constexpr UiRect kTimerRunRect = {0, 58, wqn::kEpdWidth, 186, "timer-run"};
+constexpr UiRect kTimerRunRect = {0, 32, wqn::kEpdWidth, 268, "timer-run"};
 constexpr UiRect kCountdownConfigRect = {0, 70, wqn::kEpdWidth, 205, "countdown-config"};
 constexpr UiRect kPomodoroConfigRect = {0, 54, wqn::kEpdWidth, 218, "pomodoro-config"};
 constexpr UiRect kSettingsContentRect = {0, 32, wqn::kEpdWidth, 252, "settings-content"};
@@ -505,6 +505,9 @@ bool LoadValidTokenForTodo(std::string* token);
 bool LoadUiState(
     wqn::UiState* state,
     bool restore_screen_from_rtc = false);
+void RetainTimeAppState(const wqn::TimeAppState& state);
+bool RestoreRetainedTimeApp(wqn::TimeAppState* state);
+bool HasRetainedTimeApp();
 void BuildHomeSummary(wqn::UiState* state);
 
 bool SameTimeAppState(const wqn::TimeAppState& a, const wqn::TimeAppState& b);
@@ -607,6 +610,7 @@ esp_err_t DrawMetricCard(int x, int y, int width, const wqn::HomeMetric& metric)
 esp_err_t DrawHomeTaskRow(int x, int y, int width, int index, const wqn::HomeTask& task, bool selected);
 esp_err_t RenderHomeToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule);
 esp_err_t RenderHomePrimaryRegion(const wqn::HomeSummary& home, RefreshSchedule schedule);
+esp_err_t RenderHomeStatusBarRegion(const wqn::HomeSummary& home, RefreshSchedule schedule);
 
 // ---- Time page --------------------------------------------------------------
 
@@ -617,6 +621,7 @@ esp_err_t RenderPomodoroConfigToEpd(const wqn::TimeAppState& time_app);
 int TimerInitialSeconds(const wqn::TimeAppState& time_app);
 esp_err_t RenderTimerRunToEpd(const wqn::TimeAppState& time_app);
 esp_err_t RenderTimerRunRegion(const wqn::TimeAppState& time_app, RefreshSchedule schedule);
+esp_err_t RenderTimerActionRegion(const wqn::TimeAppState& time_app, RefreshSchedule schedule);
 esp_err_t RenderTimeConfigRegion(const wqn::TimeAppState& time_app, RefreshSchedule schedule);
 esp_err_t RenderTimeToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule);
 

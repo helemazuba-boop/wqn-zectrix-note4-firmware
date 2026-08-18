@@ -44,8 +44,13 @@ constexpr size_t kMaxChannelHandles = 2;
 // the address-only probe succeeds. Keep the shared RTC/PMU devices at their
 // normal speed, but run codec transactions more conservatively.
 constexpr uint32_t kCodecI2cClockHz = 50000;
-constexpr int kCodecI2cMaxAttempts = 5;
-constexpr TickType_t kCodecI2cRetryDelay = pdMS_TO_TICKS(5);
+constexpr int kCodecI2cMaxAttempts = 10;
+// The firmware runs FreeRTOS at 100 Hz. A 5 ms delay becomes zero ticks and
+// used to exhaust every retry back-to-back inside the ES8311 clock-switch
+// NACK window. One real tick between attempts gives the codec up to 90 ms to
+// recover while retaining a bounded initialization time.
+constexpr TickType_t kCodecI2cRetryDelay = pdMS_TO_TICKS(10);
+static_assert(kCodecI2cRetryDelay > 0, "codec retry delay must yield");
 constexpr TickType_t kCodecPowerOffSettle = pdMS_TO_TICKS(20);
 constexpr TickType_t kCodecPowerOnWarmup = pdMS_TO_TICKS(250);
 

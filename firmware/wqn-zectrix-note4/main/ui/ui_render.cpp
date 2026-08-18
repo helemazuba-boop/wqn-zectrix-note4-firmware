@@ -32,7 +32,9 @@ esp_err_t RenderFrameToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
     ESP_LOGI(kTag, "RenderFrameToEpd: stack HWM before render: %u bytes free", static_cast<unsigned>(hwm_before_render * sizeof(StackType_t)));
     if (schedule == RefreshSchedule::kClock) {
         if (frame.screen == wqn::UiScreen::kHome) {
-            return RenderHomePrimaryRegion(frame.home, schedule);
+            return wqn::TimeAppHasActiveTimer(frame.time_app)
+                ? RenderHomeStatusBarRegion(frame.home, schedule)
+                : RenderHomePrimaryRegion(frame.home, schedule);
         }
         if (frame.screen == wqn::UiScreen::kTime && frame.time_app.tile == wqn::TimeTile::kClock &&
             !frame.time_app.config_mode) {
@@ -48,6 +50,12 @@ esp_err_t RenderFrameToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
             frame.time_app.tile != wqn::TimeTile::kClock) {
             return RenderTimerRunRegion(frame.time_app, schedule);
         }
+    }
+
+    if (schedule == RefreshSchedule::kSelection &&
+        frame.screen == wqn::UiScreen::kTime && !frame.time_app.config_mode &&
+        frame.time_app.tile != wqn::TimeTile::kClock) {
+        return RenderTimerActionRegion(frame.time_app, schedule);
     }
 
     if (schedule == RefreshSchedule::kConfig && frame.screen == wqn::UiScreen::kTime && frame.time_app.config_mode) {

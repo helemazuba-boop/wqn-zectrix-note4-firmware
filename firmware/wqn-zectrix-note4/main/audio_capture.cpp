@@ -30,7 +30,11 @@ constexpr size_t kReadSamples = kReadFrames * kStereoChannels;
 constexpr int kAdcWarmupReadCount = 4;
 constexpr uint32_t kI2sDmaFrameNum = 256;
 constexpr int kMaxConsecutiveReadTimeouts = 5;
-constexpr int kI2sClockWarmupMs = 5;
+constexpr int kI2sClockWarmupMs = 20;
+// CONFIG_FREERTOS_HZ is 100, so waits shorter than 10 ms round down to zero
+// ticks. Give ES8311 one real scheduler tick to resynchronize its I2C logic
+// after the external clock path is selected.
+constexpr int kCodecClockSwitchSettleMs = 10;
 constexpr int kCodecResetSettleMs = 20;
 constexpr int kCaptureInitWaitAttempts = 120;
 constexpr int kCaptureInitWaitStepMs = 25;
@@ -291,6 +295,11 @@ esp_err_t InitEs8311Adc(wqn::services::AudioBusHandle bus)
     ret |= write(ES8311_ADC_REG16, 0x24);
     ret |= write(ES8311_CLK_MANAGER_REG04, 0x10);
     ret |= write(ES8311_CLK_MANAGER_REG05, 0x00);
+    if (first_error == ESP_OK) {
+        // REG04/REG05 switch the codec onto the external I2S clock domain.
+        // ES8311 may temporarily stop ACKing I2C while that clock settles.
+        vTaskDelay(pdMS_TO_TICKS(kCodecClockSwitchSettleMs));
+    }
     ret |= write(ES8311_SYSTEM_REG0B, 0x00);
     ret |= write(ES8311_SYSTEM_REG0C, 0x00);
     ret |= write(ES8311_SYSTEM_REG10, 0x1F);

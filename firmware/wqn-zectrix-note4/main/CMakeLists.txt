@@ -40,6 +40,7 @@ idf_component_register(
         "ui/page_word.cpp"
         "ui/seven_segment.cpp"
         "ui/text_wrappers.cpp"
+        "ui/time_app_retention.cpp"
         "ui/todo_cloud.cpp"
         "ui/note_cloud.cpp"
         "ui/page_note.cpp"

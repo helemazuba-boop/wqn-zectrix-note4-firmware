@@ -342,6 +342,10 @@ std::string FrameSignature(const wqn::UiFrame& frame)
         signature.push_back('/');
         signature.append(frame.home.primary_time_line);
         signature.push_back('/');
+        signature.append(frame.home.timer_status_only ? "1" : "0");
+        signature.push_back('/');
+        signature.append(CurrentClockLabel());
+        signature.push_back('/');
         signature.append(frame.home.review_metric.value);
         signature.push_back('/');
         signature.append(frame.home.todo_metric.value);
@@ -377,7 +381,20 @@ std::string FrameSignature(const wqn::UiFrame& frame)
         signature.push_back('/');
         signature.append(std::to_string(time_app.active_field));
         signature.push_back('/');
-        signature.append(std::to_string(time_app.remaining_seconds));
+        // A running timer renders its fixed endpoint, not a live countdown.
+        // Excluding the internal second counter keeps display dedup aligned
+        // with pixels; paused/terminal pages do render the frozen value.
+        if (time_app.status != wqn::TimerStatus::kRunning) {
+            signature.append(std::to_string(time_app.remaining_seconds));
+        }
+        signature.push_back('/');
+        const bool timer_progress_is_visible =
+            !time_config_mode && time_app.tile != wqn::TimeTile::kClock &&
+            wqn::TimeAppHasActiveTimer(time_app);
+        signature.append(std::to_string(
+            timer_progress_is_visible
+                ? wqn::TimeAppVisualProgressBucket(time_app)
+                : 0));
         signature.push_back('/');
         signature.append(std::to_string(time_app.countdown_hours));
         signature.push_back(':');
@@ -397,7 +414,19 @@ std::string FrameSignature(const wqn::UiFrame& frame)
         signature.push_back('/');
         signature.append(std::to_string(time_app.pomodoro_current_round));
         signature.push_back('/');
-        if (!time_config_mode) {
+        signature.append(std::to_string(time_app.session_started_unix_seconds));
+        signature.push_back(':');
+        signature.append(std::to_string(time_app.phase_started_unix_seconds));
+        signature.push_back(':');
+        signature.append(std::to_string(time_app.phase_ends_unix_seconds));
+        signature.push_back(':');
+        signature.append(std::to_string(time_app.paused_at_unix_seconds));
+        signature.push_back('/');
+        signature.append(time_app.action_armed ? "1" : "0");
+        signature.push_back('/');
+        signature.append(time_app.task_name);
+        signature.push_back('/');
+        if (!time_config_mode && time_app.tile == wqn::TimeTile::kClock) {
             signature.append(CurrentClockLabel());
         }
     }

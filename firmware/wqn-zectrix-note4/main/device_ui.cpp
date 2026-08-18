@@ -3,6 +3,7 @@
 
 #include <array>
 #include <algorithm>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -33,14 +34,15 @@ namespace device_ui_internal {
 // LoadUiState() validates the restored value before use.
 RTC_DATA_ATTR int g_rtc_screen_val = static_cast<int>(wqn::UiScreen::kHome);
 
-// [timer-skip] Last successfully-rendered (screen, clock-label) pair, stored
-// in RTC slow memory. On a timer wake-up we compare the freshly-rendered
-// frame's clock label + screen against these and skip the entire refresh
-// pipeline if both match -- the panel already shows this content.
+// [timer-skip] Last successfully-rendered screen, clock label and full frame
+// signature hash, stored in RTC slow memory. On a timer wake-up we compare the
+// freshly-rendered frame against this physical-display commit record and skip
+// the refresh pipeline only when the actual pixels are still represented.
 // Initialized to a sentinel screen value so the first wake-up after a cold
 // boot / RTC reset is never mistakenly skipped.
 RTC_DATA_ATTR int g_rtc_last_rendered_screen_id = -1;
 RTC_DATA_ATTR char g_rtc_last_rendered_clock[8] = {};
+RTC_DATA_ATTR uint32_t g_rtc_last_rendered_frame_hash = 0;
 } // namespace device_ui_internal
 
 namespace {
@@ -103,10 +105,25 @@ bool IsBackgroundSyncTimerWake(
          wake.pcf_timer && !wake.pcf_alarm);
 }
 
-bool TrySkipInitRefresh(wqn::UiScreen screen, const char* clock_label)
+uint32_t FrameSignatureHash(const std::string& signature)
+{
+    constexpr uint32_t kFnvOffset = 2166136261U;
+    constexpr uint32_t kFnvPrime = 16777619U;
+    uint32_t hash = kFnvOffset;
+    for (const unsigned char byte : signature) {
+        hash = (hash ^ byte) * kFnvPrime;
+    }
+    return hash;
+}
+
+bool TrySkipInitRefresh(
+    wqn::UiScreen screen,
+    const char* clock_label,
+    const std::string& frame_signature)
 {
     using device_ui_internal::g_rtc_last_rendered_screen_id;
     using device_ui_internal::g_rtc_last_rendered_clock;
+    using device_ui_internal::g_rtc_last_rendered_frame_hash;
     const wqn::runtime::WakeContext& wake = wqn::runtime::GetWakeContext();
     ESP_LOGI("wqn_ui",
              "TrySkipInitRefresh: wake=%s raw=%d ext1=0x%llx cache=%d screen=%d clock=%s "
@@ -118,7 +135,8 @@ bool TrySkipInitRefresh(wqn::UiScreen screen, const char* clock_label)
     if (wake.kind != wqn::runtime::WakeKind::kScheduledTimer || !wake.panel_cache_trusted) {
         return false;
     }
-    if (IsBackgroundSyncTimerWake(wake)) {
+    if (IsBackgroundSyncTimerWake(wake) &&
+        !device_ui_internal::HasRetainedTimeApp()) {
         ESP_LOGI(
             "wqn_ui",
             "Init refresh skipped: background sync timer wake keeps cached panel untouched");
@@ -137,7 +155,13 @@ bool TrySkipInitRefresh(wqn::UiScreen screen, const char* clock_label)
     if (static_cast<int>(screen) != g_rtc_last_rendered_screen_id) {
         return false;
     }
-    if (std::strcmp(clock_label, g_rtc_last_rendered_clock) != 0) {
+    // The frame signature already contains the clock on every page that
+    // actually renders it. Do not require the minute label separately here:
+    // an active timer page deliberately omits wall-clock minutes, so an
+    // unchanged progress bucket remains the exact same physical frame.
+    const uint32_t frame_hash = FrameSignatureHash(frame_signature);
+    if (g_rtc_last_rendered_frame_hash == 0 ||
+        frame_hash != g_rtc_last_rendered_frame_hash) {
         return false;
     }
     ESP_LOGI("wqn_ui", "Init refresh skipped: panel already shows this exact frame (screen=%d clock=%s wake=%s ext1=0x%llx)",
@@ -146,16 +170,21 @@ bool TrySkipInitRefresh(wqn::UiScreen screen, const char* clock_label)
     return true;
 }
 
-void RecordPresentedRefresh(wqn::UiScreen screen, const char* clock_label)
+void RecordPresentedRefresh(
+    wqn::UiScreen screen,
+    const char* clock_label,
+    const std::string& frame_signature)
 {
     using device_ui_internal::g_rtc_last_rendered_screen_id;
     using device_ui_internal::g_rtc_last_rendered_clock;
+    using device_ui_internal::g_rtc_last_rendered_frame_hash;
     if (!ScreenSupportsTimerSkip(screen) || clock_label == nullptr || clock_label[0] == '\0') {
         return;
     }
     g_rtc_last_rendered_screen_id = static_cast<int>(screen);
     std::strncpy(g_rtc_last_rendered_clock, clock_label, sizeof(g_rtc_last_rendered_clock) - 1);
     g_rtc_last_rendered_clock[sizeof(g_rtc_last_rendered_clock) - 1] = '\0';
+    g_rtc_last_rendered_frame_hash = FrameSignatureHash(frame_signature);
 }
 
 // [timer-skip] Main-loop minute-tick gate. Returns true when the minute has
@@ -385,7 +414,7 @@ void DrainDisplayResults(
             tracking->presented_signature = record->signature;
             // RTC state is a physical-display commit record. It must never be
             // advanced merely because a request entered the refresh pipeline.
-            RecordPresentedRefresh(record->screen, record->clock_label);
+            RecordPresentedRefresh(record->screen, record->clock_label, record->signature);
         } else if (result.status == wqn::display::DisplayStatus::kFailed) {
             tracking->force_next_submission = true;
         }
@@ -434,7 +463,12 @@ void DeviceUiTask(void*)
     device_ui_internal::SetUiTaskToNotify(xTaskGetCurrentTaskHandle());
 
     const wqn::runtime::WakeContext& wake = wqn::runtime::GetWakeContext();
-    const bool background_timer_wake = IsBackgroundSyncTimerWake(wake);
+    // An active retained timer may have crossed a visual milestone or its
+    // endpoint while asleep. In that case the frame hash, not the sync wake
+    // classification, decides whether the cached panel is still current.
+    const bool background_timer_wake =
+        IsBackgroundSyncTimerWake(wake) &&
+        !device_ui_internal::HasRetainedTimeApp();
     if (!background_timer_wake) {
         result = wqn::InitEpdDisplay();
         if (result != ESP_OK) {
@@ -491,7 +525,10 @@ void DeviceUiTask(void*)
         // skip the refresh pipeline entirely. The panel already shows this
         // content, so we avoid any SPI traffic and any flicker.
         const char* const init_clock = last_clock_label.c_str();
-        const bool skip_init_refresh = TrySkipInitRefresh(state.screen, init_clock);
+        const bool skip_init_refresh = TrySkipInitRefresh(
+            state.screen,
+            init_clock,
+            display_tracking.desired_signature);
         ESP_LOGI(kTag, "Requesting initial EPD refresh: signature_len=%zu schedule=%s skip=%d",
                  display_tracking.desired_signature.size(),
                  device_ui_internal::RefreshScheduleName(init_schedule),
@@ -1217,7 +1254,8 @@ wqn::AiStreamingStatusView streaming_view{};
         g_rtc_screen_val = static_cast<int>(state.screen);
         const bool enable_timer_wakeup =
             state.screen == wqn::UiScreen::kHome ||
-            state.screen == wqn::UiScreen::kTime;
+            state.screen == wqn::UiScreen::kTime ||
+            wqn::TimeAppHasActiveTimer(state.time_app);
         wqn::SetDeepSleepTimerWakePreference(enable_timer_wakeup);
 
         const int64_t idle_ms = (esp_timer_get_time() - g_last_active_us_local) / 1000;

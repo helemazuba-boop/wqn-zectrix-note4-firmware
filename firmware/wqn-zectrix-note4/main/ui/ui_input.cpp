@@ -844,6 +844,9 @@ RefreshSchedule ApplyButtonEvent(
     }
 
     if (state->screen != old_screen) {
+        if (old_screen == wqn::UiScreen::kTime) {
+            wqn::DisarmTimeAppAction(&state->time_app);
+        }
         state->gestures.flash_ptt_started = false;
         state->gestures.last_ai_confirm_tap_ms = 0;
         if (state->screen == wqn::UiScreen::kTodo) {
@@ -889,6 +892,9 @@ RefreshSchedule ApplyButtonEvent(
         }
         if (state->time_app.config_mode && old_time_app.config_mode) {
             return RefreshSchedule::kConfig;
+        }
+        if (state->time_app.action_armed != old_time_app.action_armed) {
+            return RefreshSchedule::kSelection;
         }
         return RefreshSchedule::kCommit;
     }
