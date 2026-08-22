@@ -131,7 +131,7 @@ void DrawStatusBar(const char* title, const wqn::HomeSummary& home);
 void DrawClockStatusBar(const wqn::HomeSummary& home);
 void DrawProgressBar(int x, int y, int width, int height, int current, int total);
 void DrawConfigBox(int x, int y, int width, int height, const std::string& value, const std::string& label, bool selected);
-void DrawActionBox(int x, int y, int width, const std::string& label, bool selected);
+void DrawActionBox(int x, int y, int width, int height, const std::string& label, bool selected);
 
 // ---- Todo/Word cloud request/result types ----------------------------------
 
@@ -594,8 +594,10 @@ std::string FormatAiFunctionCallSummaries(const std::vector<std::string>& summar
 
 void DrawStandbyClockDigits(int y, const std::string& text);
 void DrawConfigDigitsCentered(int x, int y, int width, const std::string& ascii, bool black = true);
-// Draw the running-timer duration with the 48px artistic digit font, centered.
-void DrawTimerDigitsArt(int y, const std::string& ascii_duration);
+// Left-aligned run of the 48px time digits ([0-9:] only) plus its width, for
+// hero lines that compose digits with a drawn sign and a CJK unit.
+void DrawDigit48Run(int x, int y, const std::string& text, bool black = true);
+int MeasureDigit48Run(const std::string& text);
 // Draw the existing WiFi glyph only, right-aligned at right_edge.
 int DrawWifiStatusIcon(int right_edge, int y, const wqn::HomeSummary& home);
 // Draw the existing battery glyph only, right-aligned at right_edge.

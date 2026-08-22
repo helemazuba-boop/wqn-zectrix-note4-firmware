@@ -87,9 +87,16 @@ void DrawConfigDigitsCentered(int x, int y, int width, const std::string& ascii,
     DrawBitmapDigitsCentered(x, y, width, ascii, WqnDigit16, black);
 }
 
-void DrawTimerDigitsArt(int y, const std::string& ascii_duration)
+// Left-aligned 48px digit run ([0-9:] only); the hero composer centers whole
+// lines itself, so this variant takes no container width.
+void DrawDigit48Run(int x, int y, const std::string& text, bool black)
 {
-    DrawBitmapDigitsCentered(0, y, wqn::kEpdWidth, ascii_duration, WqnDigit48, true);
+    DrawBitmapDigits(x, y, text, WqnDigit48, black);
+}
+
+int MeasureDigit48Run(const std::string& text)
+{
+    return MeasureBitmapDigits(text, WqnDigit48);
 }
 
 int DrawWifiStatusIcon(int right_edge, int y, const wqn::HomeSummary& home)

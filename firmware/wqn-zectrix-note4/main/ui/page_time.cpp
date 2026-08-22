@@ -77,17 +77,17 @@ void DrawConfigBox(int x, int y, int width, int height, const std::string& value
     DrawCenteredText(x, y + height - 20, width, label, black_text);
 }
 
-void DrawActionBox(int x, int y, int width, const std::string& label, bool selected)
+void DrawActionBox(int x, int y, int width, int height, const std::string& label, bool selected)
 {
-    constexpr int kActionBoxHeight = 28;
     // [v2] Focus: rounded reverse-fill (kInvert) when selected (action buttons
-    // execute-on-confirm); plain rounded outline otherwise.
+    // execute-on-confirm); plain rounded outline otherwise. Height is
+    // caller-chosen so action boxes and preset chips share one visual language.
     if (selected) {
-        DrawSelectionDecoration(x, y, width, kActionBoxHeight, SelectionStyle::kInvert);
+        DrawSelectionDecoration(x, y, width, height, SelectionStyle::kInvert);
     } else {
-        DrawRoundedRect(x, y, width, kActionBoxHeight, kChipRadius);
+        DrawRoundedRect(x, y, width, height, kChipRadius);
     }
-    DrawCenteredText(x, y + 6, width, label, !selected);
+    DrawCenteredText(x, y + (height - kCjkFontHeight) / 2, width, label, !selected);
 }
 
 esp_err_t RenderClockStandbyContent()
@@ -105,53 +105,128 @@ esp_err_t RenderTimeClockRegion(RefreshSchedule schedule, bool include_date)
     return RefreshRegion(kTimeStandbyRect, schedule);
 }
 
+// ---- Config-page geometry ----
+// Every drawn element must stay inside its partial-refresh rect
+// (kCountdownConfigRect y[70,275] / kPomodoroConfigRect y[54,272]); content
+// outside would go stale on region refreshes.
+constexpr int kCdTitleY = 76;
+constexpr int kCdBoxesY = 102;      // h/m/s boxes (58 tall -> 160)
+constexpr int kCdPresetsY = 172;    // quick presets (26 tall -> 198)
+constexpr int kCdActionsY = 210;    // start/exit (28 tall -> 238)
+constexpr int kCdMetaY = 252;       // end-time preview line
+
+constexpr int kPmTitleY = 62;
+constexpr int kPmGridTopY = 86;     // 2x2 grid rows (44 tall): 86..130 / 132..176
+constexpr int kPmRowPitch = 46;
+constexpr int kPmPresetsY = 186;    // combo presets (24 tall -> 210)
+constexpr int kPmActionsY = 220;    // start/exit (28 tall -> 248)
+constexpr int kPmMetaY = 254;       // group-end preview line (ends 270)
+
+// Defined below; the config renderers above it build endpoint previews.
+std::string FormatUnixClock(int64_t unix_seconds, bool include_seconds);
+
 esp_err_t RenderCountdownConfigToEpd(const wqn::TimeAppState& time_app)
 {
-    ESP_RETURN_ON_ERROR(DrawCenteredText(0, 83, wqn::kEpdWidth, "倒计时设置"), kTag, "draw countdown config title");
-    const int y = 116;
-    DrawConfigBox(102, y, 56, 62, TwoDigit(time_app.countdown_hours), "时", time_app.active_field == 0);
+    ESP_RETURN_ON_ERROR(DrawCenteredText(0, kCdTitleY, wqn::kEpdWidth, "倒计时设置"), kTag, "draw countdown config title");
+    const int y = kCdBoxesY;
+    DrawConfigBox(102, y, 56, 58, TwoDigit(time_app.countdown_hours), "时", time_app.active_field == 0);
     DrawConfigDigitsCentered(164, y + 22, 10, ":", true);
-    DrawConfigBox(178, y, 56, 62, TwoDigit(time_app.countdown_minutes), "分", time_app.active_field == 1);
+    DrawConfigBox(178, y, 56, 58, TwoDigit(time_app.countdown_minutes), "分", time_app.active_field == 1);
     DrawConfigDigitsCentered(240, y + 22, 10, ":", true);
-    DrawConfigBox(254, y, 56, 62, TwoDigit(time_app.countdown_seconds), "秒", time_app.active_field == 2);
-    DrawActionBox(130, 205, 68, "开始", time_app.active_field == CountdownStartField());
-    DrawActionBox(212, 205, 68, "退出", time_app.active_field == CountdownStartField() + 1);
-    if (time_app.is_editing) {
-        ESP_RETURN_ON_ERROR(DrawCenteredText(0, 248, wqn::kEpdWidth, "正在调整"), kTag, "draw editing hint");
+    DrawConfigBox(254, y, 56, 58, TwoDigit(time_app.countdown_seconds), "秒", time_app.active_field == 2);
+
+    // Quick presets: confirm fills the fields instantly and parks the cursor
+    // on Start (ApplyConfigPreset), so a common duration costs two confirms.
+    constexpr int kPresetXs[] = {46, 126, 206, 286};
+    const char* const kPresetLabels[] = {"5分", "10分", "25分", "45分"};
+    constexpr size_t kPresetCount = sizeof(kPresetXs) / sizeof(kPresetXs[0]);
+    const int preset_base = wqn::TimeAppPresetFieldBase(wqn::TimeTile::kCountdown);
+    for (size_t index = 0; index < kPresetCount; ++index) {
+        DrawActionBox(
+            kPresetXs[index],
+            kCdPresetsY,
+            68,
+            26,
+            kPresetLabels[index],
+            time_app.active_field == preset_base + static_cast<int>(index));
     }
+    DrawActionBox(130, kCdActionsY, 68, 28, "开始", time_app.active_field == CountdownStartField());
+    DrawActionBox(212, kCdActionsY, 68, 28, "退出", time_app.active_field == CountdownStartField() + 1);
+
+    // Live endpoint preview. Recomputed on every config repaint -- each field
+    // change is event-driven -- so wall-clock drift while the screen idles is
+    // acceptable and self-corrects on the next interaction.
+    std::string meta = "预计 ";
+    meta += FormatUnixClock(CurrentUnixTime() + time_app.countdown_total_seconds, false);
+    meta += " 结束";
+    if (wqn::TimeAppIsEditingValue(time_app)) {
+        meta = "正在调整 / " + meta;
+    }
+    ESP_RETURN_ON_ERROR(DrawCenteredText(0, kCdMetaY, wqn::kEpdWidth, meta), kTag, "draw countdown preview");
     return ESP_OK;
 }
 
 esp_err_t RenderPomodoroConfigToEpd(const wqn::TimeAppState& time_app)
 {
-    ESP_RETURN_ON_ERROR(DrawCenteredText(0, 66, wqn::kEpdWidth, "番茄钟设置"), kTag, "draw pomodoro config title");
-    DrawConfigBox(108, 95, 88, 52, std::to_string(time_app.pomodoro_rounds), "轮数", time_app.active_field == 0);
+    ESP_RETURN_ON_ERROR(DrawCenteredText(0, kPmTitleY, wqn::kEpdWidth, "番茄钟设置"), kTag, "draw pomodoro config title");
+    DrawConfigBox(
+        108,
+        kPmGridTopY,
+        88,
+        44,
+        std::to_string(time_app.pomodoro_rounds),
+        "轮数",
+        time_app.active_field == 0);
     DrawConfigBox(
         204,
-        95,
+        kPmGridTopY,
         88,
-        52,
+        44,
         std::to_string(time_app.pomodoro_focus_minutes),
         "专注",
         time_app.active_field == 1);
     DrawConfigBox(
         108,
-        155,
+        kPmGridTopY + kPmRowPitch,
         88,
-        52,
+        44,
         std::to_string(time_app.pomodoro_break_minutes),
         "休息",
         time_app.active_field == 2);
     DrawConfigBox(
         204,
-        155,
+        kPmGridTopY + kPmRowPitch,
         88,
-        52,
+        44,
         std::to_string(time_app.pomodoro_long_break_minutes),
         "长休息",
         time_app.active_field == 3);
-    DrawActionBox(130, 226, 68, "开始", time_app.active_field == PomodoroStartField());
-    DrawActionBox(212, 226, 68, "退出", time_app.active_field == PomodoroStartField() + 1);
+
+    // Group presets: confirm fills rounds/focus/break and parks the cursor on
+    // Start; long break keeps the user's own value.
+    constexpr int kComboXs[] = {70, 210};
+    const char* const kComboLabels[] = {"经典 4x25", "深度 2x50"};
+    constexpr size_t kComboCount = sizeof(kComboXs) / sizeof(kComboXs[0]);
+    const int combo_base = wqn::TimeAppPresetFieldBase(wqn::TimeTile::kPomodoro);
+    for (size_t index = 0; index < kComboCount; ++index) {
+        DrawActionBox(
+            kComboXs[index],
+            kPmPresetsY,
+            120,
+            24,
+            kComboLabels[index],
+            time_app.active_field == combo_base + static_cast<int>(index));
+    }
+    DrawActionBox(130, kPmActionsY, 68, 28, "开始", time_app.active_field == PomodoroStartField());
+    DrawActionBox(212, kPmActionsY, 68, 28, "退出", time_app.active_field == PomodoroStartField() + 1);
+
+    std::string meta = "预计 ";
+    meta += FormatUnixClock(CurrentUnixTime() + PomodoroGroupTotalSeconds(time_app), false);
+    meta += " 完成本组";
+    if (wqn::TimeAppIsEditingValue(time_app)) {
+        meta = "正在调整 / " + meta;
+    }
+    ESP_RETURN_ON_ERROR(DrawCenteredText(0, kPmMetaY, wqn::kEpdWidth, meta), kTag, "draw pomodoro preview");
     return ESP_OK;
 }
 
@@ -226,20 +301,14 @@ std::string FormatUnixDateClock(int64_t unix_seconds)
 
 std::string TimerStatusChipLabel(const wqn::TimeAppState& time_app)
 {
+    // Chip carries the run-state word only: round position lives once, on the
+    // pomodoro track's right label, and the phase lives in the hero state
+    // rendered beside this chip on the same row.
     if (time_app.status == wqn::TimerStatus::kPaused) {
         return "暂停";
     }
     if (time_app.status == wqn::TimerStatus::kAlerting) {
         return "完成";
-    }
-    if (time_app.active_mode == wqn::TimerMode::kPomodoro) {
-        if (time_app.pomodoro_phase == wqn::PomodoroPhase::kFocus) {
-            return "第 " + std::to_string(time_app.pomodoro_current_round) + " / " +
-                   std::to_string(time_app.pomodoro_rounds);
-        }
-        return time_app.pomodoro_phase == wqn::PomodoroPhase::kLongBreak
-            ? "长休息"
-            : "短休息";
     }
     return "进行中";
 }
@@ -275,26 +344,86 @@ std::string TimerHeroStateLabel(const wqn::TimeAppState& time_app)
     }
 }
 
-std::string TimerHeroValue(const wqn::TimeAppState& time_app)
+struct TimerHeroLine {
+    std::string digits_a;
+    std::string digits_b;   // second digit group drawn after an × sign
+    std::string cjk_unit;   // trailing unit rendered at 16px beside the digits
+};
+
+// The 48px digit asset carries only [0-9:], so paused/completion heroes cannot
+// embed "MIN"/"×" as glyph text -- the bitmap lookup silently drops those
+// characters ("4 × 25" collapsed to "425"). They are composed instead: digit
+// runs at 48px, a drawn multiplication sign, and a 16px CJK unit.
+TimerHeroLine BuildTimerHeroLine(const wqn::TimeAppState& time_app)
 {
+    TimerHeroLine line;
     if (time_app.status == wqn::TimerStatus::kPaused) {
         if (time_app.remaining_seconds >= 60) {
-            return std::to_string(std::max(1, (time_app.remaining_seconds + 59) / 60)) + " MIN";
+            line.digits_a = std::to_string(std::max(1, (time_app.remaining_seconds + 59) / 60));
+            line.cjk_unit = "分";
+        } else {
+            line.digits_a = std::to_string(std::max(0, time_app.remaining_seconds));
+            line.cjk_unit = "秒";
         }
-        return std::to_string(std::max(0, time_app.remaining_seconds)) + " SEC";
+        return line;
     }
     if (PomodoroGroupComplete(time_app)) {
-        return std::to_string(time_app.pomodoro_rounds) + " × " +
-               std::to_string(time_app.pomodoro_focus_minutes);
+        line.digits_a = std::to_string(time_app.pomodoro_rounds);
+        line.digits_b = std::to_string(time_app.pomodoro_focus_minutes);
+        line.cjk_unit = "分";
+        return line;
     }
-    if (time_app.status == wqn::TimerStatus::kAlerting) {
-        return FormatUnixClock(
-            time_app.phase_ends_unix_seconds,
-            TimerInitialSeconds(time_app) < 60);
-    }
-    return FormatUnixClock(
+    line.digits_a = FormatUnixClock(
         time_app.phase_ends_unix_seconds,
         TimerInitialSeconds(time_app) < 60);
+    return line;
+}
+
+void DrawTimesSign(int center_x, int center_y)
+{
+    // Diagonal cross stepped as small squares along both diagonals (no
+    // diagonal primitive exists at this layer); sized to sit next to the
+    // 48px digit stroke weight.
+    constexpr int kArmSteps = 11;
+    constexpr int kSquare = 4;
+    const int offset = -(kSquare / 2);
+    for (int step = -kArmSteps; step <= kArmSteps; ++step) {
+        FillRect(center_x + step + offset, center_y + step + offset, kSquare, kSquare, true);
+        FillRect(center_x - step + offset, center_y + step + offset, kSquare, kSquare, true);
+    }
+}
+
+void DrawTimerHeroLine(int y, const TimerHeroLine& line)
+{
+    constexpr int kSignGap = 10;       // gap between a digit run and the × footprint
+    constexpr int kUnitGap = 12;       // gap between digits and the CJK unit
+    constexpr int kSignHalfSpan = 15;  // half footprint of DrawTimesSign output
+    const bool has_times = !line.digits_b.empty();
+    const int a_width = MeasureDigit48Run(line.digits_a);
+    int b_width = 0;
+    int total = a_width;
+    if (has_times) {
+        b_width = MeasureDigit48Run(line.digits_b);
+        total += kSignGap * 2 + kSignHalfSpan * 2 + b_width;
+    }
+    int unit_width = 0;
+    if (!line.cjk_unit.empty()) {
+        unit_width = wqn::MeasureUtf8TextWidth(line.cjk_unit.c_str());
+        total += kUnitGap + unit_width;
+    }
+    int x = std::max(0, (wqn::kEpdWidth - total) / 2);
+    DrawDigit48Run(x, y, line.digits_a);
+    x += a_width;
+    if (has_times) {
+        x += kSignGap + kSignHalfSpan;
+        DrawTimesSign(x, y + 24);  // optical center of the 48px glyph cell
+        x += kSignHalfSpan + kSignGap;
+        DrawDigit48Run(x, y, line.digits_b);
+        x += b_width;
+    }
+    if (!line.cjk_unit.empty()) {
+        wqn::DrawUtf8Text(x + kUnitGap, y + 26, line.cjk_unit.c_str(), true);
+    }
 }
 
 std::string TimerHeroCaption(const wqn::TimeAppState& time_app)
@@ -840,7 +969,7 @@ esp_err_t RenderTimerRunToEpd(const wqn::TimeAppState& time_app)
         DrawCenteredText(80, 43, 240, TimerHeroStateLabel(time_app)),
         kTag,
         "draw timer hero state");
-    DrawTimerDigitsArt(68, TimerHeroValue(time_app));
+    DrawTimerHeroLine(68, BuildTimerHeroLine(time_app));
     ESP_RETURN_ON_ERROR(
         DrawCenteredText(0, 122, wqn::kEpdWidth, TimerHeroCaption(time_app)),
         kTag,

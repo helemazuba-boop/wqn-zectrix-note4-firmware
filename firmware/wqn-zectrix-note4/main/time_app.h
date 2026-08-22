@@ -87,6 +87,12 @@ int TimeAppVisualProgressBucket(const TimeAppState& state);
 int TimeAppVisualProgressSeconds(const TimeAppState& state);
 bool PomodoroGroupComplete(const TimeAppState& state);
 int PomodoroGroupTotalSeconds(const TimeAppState& state);
+// Config-screen field geometry: numeric fields first, then quick-preset
+// fields, then Start / Exit. The UI renderer and the input reducer share
+// these helpers so box selection and confirm routing never drift apart.
+int TimeAppPresetFieldBase(TimeTile tile);
+int TimeAppPresetFieldCount(TimeTile tile);
+int TimeAppStartField(TimeTile tile);
 void TimeAppVisibleRoundWindow(
     const TimeAppState& state,
     int max_visible_rounds,

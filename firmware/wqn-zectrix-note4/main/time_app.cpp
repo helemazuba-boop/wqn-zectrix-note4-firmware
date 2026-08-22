@@ -150,15 +150,70 @@ int ActionFieldCount()
     return 2;
 }
 
+int PresetFieldCount(wqn::TimeTile tile)
+{
+    switch (tile) {
+        case wqn::TimeTile::kCountdown:
+            return 4;
+        case wqn::TimeTile::kPomodoro:
+            return 2;
+        case wqn::TimeTile::kClock:
+        default:
+            return 0;
+    }
+}
+
 int MaxFieldIndex(wqn::TimeTile tile)
 {
-    const int numeric = NumericFieldCount(tile);
-    return numeric > 0 ? numeric + ActionFieldCount() - 1 : 0;
+    const int total = NumericFieldCount(tile) + PresetFieldCount(tile) + ActionFieldCount();
+    return total > 0 ? total - 1 : 0;
 }
 
 int StartFieldIndex(wqn::TimeTile tile)
 {
-    return NumericFieldCount(tile);
+    return NumericFieldCount(tile) + PresetFieldCount(tile);
+}
+
+// Confirm on a preset field fills the numeric fields instantly (no edit
+// mode) and parks the cursor on Start, so "pick a preset then start" is two
+// confirms. Long break keeps the user's own value for pomodoro presets.
+void ApplyConfigPreset(wqn::TimeAppState* state, int preset_index)
+{
+    if (state == nullptr || !state->config_mode || state->is_editing) {
+        return;
+    }
+    if (state->tile == wqn::TimeTile::kCountdown) {
+        static constexpr int kPresetMinutes[] = {5, 10, 25, 45};
+        if (preset_index < 0 ||
+            preset_index >= static_cast<int>(sizeof(kPresetMinutes) / sizeof(kPresetMinutes[0]))) {
+            return;
+        }
+        state->countdown_hours = 0;
+        state->countdown_minutes = kPresetMinutes[preset_index];
+        state->countdown_seconds = 0;
+        NormalizeCountdownFields(state);
+        return;
+    }
+    if (state->tile != wqn::TimeTile::kPomodoro) {
+        return;
+    }
+    switch (preset_index) {
+        case 0:
+            state->pomodoro_rounds = 4;
+            state->pomodoro_focus_minutes = 25;
+            state->pomodoro_break_minutes = 5;
+            break;
+        case 1:
+            state->pomodoro_rounds = 2;
+            state->pomodoro_focus_minutes = 50;
+            state->pomodoro_break_minutes = 10;
+            break;
+        default:
+            return;
+    }
+    state->pomodoro_rounds = ClampInt(state->pomodoro_rounds, kPomodoroMinValue, kPomodoroMaxValue);
+    state->pomodoro_focus_minutes = ClampInt(state->pomodoro_focus_minutes, kPomodoroMinValue, kPomodoroMaxValue);
+    state->pomodoro_break_minutes = ClampInt(state->pomodoro_break_minutes, kPomodoroMinValue, kPomodoroMaxValue);
 }
 
 int ExitFieldIndex(wqn::TimeTile tile)
@@ -491,6 +546,9 @@ bool HandleTimeAppInput(TimeAppState* state, TimeInput input)
                 state->is_editing = false;
             } else if (state->active_field < NumericFieldCount(state->tile)) {
                 state->is_editing = true;
+            } else if (state->active_field < StartFieldIndex(state->tile)) {
+                ApplyConfigPreset(state, state->active_field - NumericFieldCount(state->tile));
+                state->active_field = StartFieldIndex(state->tile);
             } else if (state->active_field == StartFieldIndex(state->tile)) {
                 if (state->tile == TimeTile::kCountdown) {
                     StartCountdown(state);
@@ -540,6 +598,21 @@ bool TimeAppHasActiveTimer(const TimeAppState& state)
     return state.active_mode != TimerMode::kNone &&
            (state.status == TimerStatus::kRunning || state.status == TimerStatus::kPaused ||
             state.status == TimerStatus::kAlerting);
+}
+
+int TimeAppPresetFieldBase(TimeTile tile)
+{
+    return NumericFieldCount(tile);
+}
+
+int TimeAppPresetFieldCount(TimeTile tile)
+{
+    return PresetFieldCount(tile);
+}
+
+int TimeAppStartField(TimeTile tile)
+{
+    return StartFieldIndex(tile);
 }
 
 bool TimeAppIsEditingValue(const TimeAppState& state)
@@ -806,6 +879,41 @@ bool RunTimeAppStateSelfTest()
     many_rounds.pomodoro_current_round = 99;
     TimeAppVisibleRoundWindow(many_rounds, 4, &first_round, &last_round);
     if (first_round != 96 || last_round != 99) {
+        return false;
+    }
+
+    // Preset fields fill instantly and park the cursor on Start.
+    TimeAppState preset_fill;
+    preset_fill.tile = TimeTile::kCountdown;
+    preset_fill.config_mode = true;
+    preset_fill.countdown_hours = 1;
+    preset_fill.countdown_minutes = 7;
+    preset_fill.countdown_seconds = 42;
+    preset_fill.active_field = TimeAppPresetFieldBase(TimeTile::kCountdown);
+    if (!HandleTimeAppInput(&preset_fill, TimeInput::kConfirm) ||
+        preset_fill.is_editing ||
+        preset_fill.countdown_hours != 0 ||
+        preset_fill.countdown_minutes != 5 ||
+        preset_fill.countdown_seconds != 0 ||
+        preset_fill.countdown_total_seconds != 300 ||
+        preset_fill.active_field != TimeAppStartField(TimeTile::kCountdown)) {
+        return false;
+    }
+
+    TimeAppState combo_fill;
+    combo_fill.tile = TimeTile::kPomodoro;
+    combo_fill.config_mode = true;
+    combo_fill.pomodoro_rounds = 1;
+    combo_fill.pomodoro_focus_minutes = 1;
+    combo_fill.pomodoro_break_minutes = 1;
+    combo_fill.pomodoro_long_break_minutes = 7;
+    combo_fill.active_field = TimeAppStartField(TimeTile::kPomodoro) - 1;
+    if (!HandleTimeAppInput(&combo_fill, TimeInput::kConfirm) ||
+        combo_fill.pomodoro_rounds != 2 ||
+        combo_fill.pomodoro_focus_minutes != 50 ||
+        combo_fill.pomodoro_break_minutes != 10 ||
+        combo_fill.pomodoro_long_break_minutes != 7 ||
+        combo_fill.active_field != TimeAppStartField(TimeTile::kPomodoro)) {
         return false;
     }
     return true;

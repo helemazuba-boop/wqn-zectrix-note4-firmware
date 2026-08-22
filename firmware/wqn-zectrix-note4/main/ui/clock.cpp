@@ -157,12 +157,12 @@ std::string TwoDigit(int value)
 
 int CountdownStartField()
 {
-    return 3;
+    return wqn::TimeAppStartField(wqn::TimeTile::kCountdown);
 }
 
 int PomodoroStartField()
 {
-    return 4;
+    return wqn::TimeAppStartField(wqn::TimeTile::kPomodoro);
 }
 
 std::string ChooseHomePrimaryTimeLine(const wqn::TimeAppState& time_app)
