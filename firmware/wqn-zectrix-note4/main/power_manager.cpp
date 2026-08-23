@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstring>
 #include <utility>
 
 #include "display_service.h"
@@ -158,7 +159,38 @@ wqn::runtime::SleepLease g_usb_power_lease;
 bool g_usb_power_policy_sampled = false;
 
 constexpr int64_t kPrepareSleepTimeoutUs = 5 * 1000 * 1000;
-constexpr int64_t kSleepRetryBackoffUs = 30 * 1000 * 1000;
+// [power-fix] Sleep-preparation failure backoff escalates per consecutive
+// system failure (30s -> 60s -> 120s -> 5m cap) so a wedged service cannot
+// pin the coordinator into a 30s retry storm. User-activity rollbacks reset
+// the escalation instead of growing it: the user is present, fast retries
+// are desirable. RTC retention keeps the curve alive across deep sleep.
+constexpr int64_t kSleepRetryBackoffLadderUs[] = {
+    30LL * 1000 * 1000,
+    60LL * 1000 * 1000,
+    120LL * 1000 * 1000,
+    300LL * 1000 * 1000};
+constexpr size_t kSleepRetryBackoffLadderSize =
+    sizeof(kSleepRetryBackoffLadderUs) / sizeof(kSleepRetryBackoffLadderUs[0]);
+RTC_DATA_ATTR uint8_t g_sleep_retry_escalation = 0;
+
+int64_t SleepRetryBackoffUs()
+{
+    const uint8_t index = std::min<uint8_t>(
+        g_sleep_retry_escalation,
+        static_cast<uint8_t>(kSleepRetryBackoffLadderSize - 1));
+    return kSleepRetryBackoffLadderUs[index];
+}
+
+// [gap-1] Background-maintenance wake escalation: sync-source timer wakes
+// with no user interaction in between are counted across deep-sleep cycles;
+// once this streak passes the threshold, the effective wake floor jumps to
+// 15 minutes so a stuck content/retry deadline can at most burn one
+// radio-on window per 15 minutes. Display/clock wakes never increment the
+// counter (the minute clock is an intended 60s consumer), and any user
+// interaction resets it alongside ConsecutiveSleepCycles.
+constexpr uint32_t kUnattendedSyncWakeEscalationAfter = 8;
+constexpr uint32_t kEscalatedSyncWakeFloorSec = 900;
+RTC_DATA_ATTR uint32_t g_unattended_sync_wakes = 0;
 constexpr int64_t kEmergencyStorageTimeoutUs = 2 * 1000 * 1000;
 constexpr int64_t kEmergencyHardwareTimeoutUs = 2 * 1000 * 1000;
 constexpr int64_t kLeaseWarningAfterUs = 60 * 1000 * 1000;
@@ -240,6 +272,7 @@ void PublishUserActivity(int64_t occurred_at_ms)
     // A physical interaction starts a new HIL/product idle sequence; reset
     // inside the gate so it is not lost against a concurrent sleep commit.
     ConsecutiveSleepCyclesRef().store(0, std::memory_order_relaxed);
+    g_unattended_sync_wakes = 0;
     g_user_activity_generation.fetch_add(1, std::memory_order_release);
     taskEXIT_CRITICAL(&g_activity_gate);
 }
@@ -670,8 +703,24 @@ static void RollbackBoardPowerState()
 
 static void RollbackSleepPreparation(uint32_t generation, const char* reason)
 {
-    ESP_LOGW(kTag, "sleep rollback: generation=%u reason=%s retry_ms=30000",
-             static_cast<unsigned>(generation), reason);
+    // User-activity rollbacks are healthy interactions, not system failures:
+    // reset the escalation ladder so retries stay fast while the user is
+    // present. Everything else (service denial/timeout, wake-arm errors)
+    // climbs the ladder.
+    const bool user_activity_rollback =
+        std::strncmp(reason, "user-activity", 13) == 0;
+    if (user_activity_rollback) {
+        g_sleep_retry_escalation = 0;
+    } else if (g_sleep_retry_escalation <
+               static_cast<uint8_t>(kSleepRetryBackoffLadderSize - 1)) {
+        ++g_sleep_retry_escalation;
+    }
+    const int64_t retry_backoff_us = SleepRetryBackoffUs();
+    ESP_LOGW(kTag,
+             "sleep rollback: generation=%u reason=%s retry_ms=%lld escalation=%u",
+             static_cast<unsigned>(generation), reason,
+             static_cast<long long>(retry_backoff_us / 1000),
+             static_cast<unsigned>(g_sleep_retry_escalation));
     power::DisarmWakeSources();
     // Reopen lease acquisition before services restore active hardware. A
     // service returning to Connecting/Provisioning must be able to reacquire
@@ -684,7 +733,7 @@ static void RollbackSleepPreparation(uint32_t generation, const char* reason)
     RollbackBoardPowerState();
     runtime::InvalidateSleepSnapshot();
     g_sleep_retry_not_before_us.store(
-        esp_timer_get_time() + kSleepRetryBackoffUs,
+        esp_timer_get_time() + retry_backoff_us,
         std::memory_order_relaxed);
     g_deep_sleep_clock_yield.store(false, std::memory_order_release);
 }
@@ -879,24 +928,38 @@ static void EnterDeepSleepIfEnabled(bool enable_timer_wakeup)
     // micro-wake loop with the radio on (the dominant battery drain in the
     // 2026-08-19 audit). A deadline landing inside the floor fires one
     // interval late; admission at boot still gates whether the radio starts.
-    const uint32_t wake_floor_seconds = CONFIG_WQN_SLEEP_TIMER_WAKE_FLOOR_SEC;
+    const bool timer_wakeup_for_display = display_wakeup_seconds != 0 &&
+        (sync_wakeup_seconds == 0 || display_wakeup_seconds <= sync_wakeup_seconds);
+    uint32_t wake_floor_seconds = CONFIG_WQN_SLEEP_TIMER_WAKE_FLOOR_SEC;
+    // [gap-1] Unattended background-maintenance wakes escalate: after enough
+    // consecutive sync-source cycles with zero user interaction, widen the
+    // floor so a stuck deadline can burn at most one radio window per 15
+    // minutes instead of one per interval. Display/clock wakes neither count
+    // nor reset the streak.
+    bool sync_wake_escalated = false;
+    if (!timer_wakeup_for_display && sync_wakeup_seconds != 0 &&
+        g_unattended_sync_wakes >= kUnattendedSyncWakeEscalationAfter &&
+        wake_floor_seconds != 0 &&
+        wake_floor_seconds < kEscalatedSyncWakeFloorSec) {
+        wake_floor_seconds = kEscalatedSyncWakeFloorSec;
+        sync_wake_escalated = true;
+    }
     bool wake_floor_applied = false;
     if (wake_floor_seconds != 0 && timer_wakeup_seconds != 0 &&
         timer_wakeup_seconds < wake_floor_seconds) {
         timer_wakeup_seconds = wake_floor_seconds;
         wake_floor_applied = true;
     }
-    const bool timer_wakeup_for_display = display_wakeup_seconds != 0 &&
-        (sync_wakeup_seconds == 0 || display_wakeup_seconds <= sync_wakeup_seconds);
     ESP_LOGI(kTag,
              "deep-sleep wake plan: display_sec=%u sync_sec=%u chosen=%u "
-             "source=%s%s",
+             "source=%s%s%s",
              static_cast<unsigned>(display_wakeup_seconds),
              static_cast<unsigned>(sync_wakeup_seconds),
              static_cast<unsigned>(timer_wakeup_seconds),
              timer_wakeup_for_display ? "display"
                  : (sync_wakeup_seconds != 0 ? "sync" : "off"),
-             wake_floor_applied ? " floor-clamped" : "");
+             wake_floor_applied ? " floor-clamped" : "",
+             sync_wake_escalated ? "+unattended-escalated" : "");
 #if CONFIG_WQN_RTC_TIMEKEEP_ENABLE
     // [rtc-timekeep] Persist the wall clock after every service has quiesced
     // (shared I2C bus idle) and before wake-source assembly reprograms the
@@ -929,6 +992,9 @@ static void EnterDeepSleepIfEnabled(bool enable_timer_wakeup)
         return;
     }
     ConsecutiveSleepCyclesRef().fetch_add(1, std::memory_order_relaxed);
+    if (timer_wakeup_seconds != 0 && !timer_wakeup_for_display) {
+        ++g_unattended_sync_wakes;
+    }
     runtime::SleepSnapshot snapshot;
     snapshot.generation = generation;
     snapshot.mode = power::SleepMode::kIdle;
