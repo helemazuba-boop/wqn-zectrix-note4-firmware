@@ -2658,9 +2658,26 @@ TickType_t OutboxWaitDelay()
     if (g_outbox_immediate_requested.load(std::memory_order_acquire)) {
         return 0;
     }
+    const TickType_t word_delay = WordOutboxRetryWaitDelay();
+    const TickType_t note_delay = NoteOutboxRetryWaitDelay();
+    const TickType_t problem_delay = ProblemOutboxRetryWaitDelay();
+    // [fix-b] A domain with backlog but NO armed backoff cursor is ready
+    // work: it must not inherit another domain's backoff as its own wake-up
+    // delay (audit FINDING B -- up to 300 s of cross-domain scheduling
+    // latency coupling). Ready domains contribute 0; cursorless-idle
+    // domains stay out of the minimum entirely.
+    const auto effective_delay =
+        [](TickType_t delay, WordOutboxUploadState last_state) {
+            if (delay != portMAX_DELAY) return delay;
+            return last_state == WordOutboxUploadState::kPending
+                ? static_cast<TickType_t>(0)
+                : portMAX_DELAY;
+        };
     const TickType_t retry_delay = std::min(
-        std::min(WordOutboxRetryWaitDelay(), NoteOutboxRetryWaitDelay()),
-        ProblemOutboxRetryWaitDelay());
+        std::min(
+            effective_delay(word_delay, g_last_word_outbox_upload_state),
+            effective_delay(note_delay, g_last_note_outbox_upload_state)),
+        effective_delay(problem_delay, g_last_problem_outbox_upload_state));
     // A requested outbox round with no retry cursor is new work (or another
     // batch behind the per-round cap), not an infinite wait. A finite cursor
     // is a real transport/server backoff and remains authoritative.
