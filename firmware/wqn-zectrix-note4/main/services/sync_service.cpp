@@ -1762,12 +1762,35 @@ WordOutboxUploadState UploadPendingWordObservations(const std::string& token)
                             RetryCauseFor(skip_disposition));
                         return WordOutboxUploadState::kPending;
                     }
+                    // [gap-1] A terminal skip rejection (identity-level codes:
+                    // STUDY_REQUEST_ID_REUSED / SESSION_ACTOR_MISMATCH /
+                    // INVALID_STUDY_OBSERVATION) can never succeed on retry,
+                    // so leaving the head stranded blocks every later record
+                    // forever. Quarantine locally and let the queue advance.
+                    // Sequences are session-scoped server-side and the skip
+                    // tombstone contract (study_skip_tombstone_relax_v1)
+                    // guarantees identity fields are the only strict part, so
+                    // a locally dropped record cannot wedge other sessions.
                     ESP_LOGE(
                         kTag,
-                        "word observation skip failed terminally; leaving head for inspection: request=%s code=%s",
+                        "word observation skip failed terminally; quarantining head to restore queue progress: request=%s code=%s",
                         pending.request_id.c_str(),
                         skip_error.code.c_str());
-                    return WordOutboxUploadState::kFailed;
+                    const esp_err_t forced_quarantine_result =
+                        wqn::QuarantinePendingWordObservation(
+                            pending.request_id);
+                    ResetWordOutboxRetryBackoff();
+                    if (forced_quarantine_result != ESP_OK) {
+                        ESP_LOGE(
+                            kTag,
+                            "word observation forced quarantine failed: request=%s error=%s",
+                            pending.request_id.c_str(),
+                            esp_err_to_name(forced_quarantine_result));
+                        return WordOutboxUploadState::kFailed;
+                    }
+                    ++processed;
+                    ++quarantined;
+                    continue;
                 }
                 const esp_err_t quarantine_result =
                     wqn::QuarantinePendingWordObservation(pending.request_id);
@@ -2097,12 +2120,30 @@ WordOutboxUploadState UploadPendingNoteObservations(const std::string& token)
                             RetryCauseFor(skip_disposition));
                         return WordOutboxUploadState::kPending;
                     }
+                    // [gap-1] Mirror of the word-domain forced quarantine: a
+                    // terminal skip rejection is unfixable by retry, so
+                    // quarantine the head and restore queue progress instead
+                    // of stranding every later note record behind it.
                     ESP_LOGE(
                         kTag,
-                        "note observation skip failed terminally; leaving head for inspection: request=%s code=%s",
+                        "note observation skip failed terminally; quarantining head to restore queue progress: request=%s code=%s",
                         pending.request_id.c_str(),
                         skip_error.code.c_str());
-                    return WordOutboxUploadState::kFailed;
+                    const esp_err_t forced_quarantine_result =
+                        wqn::QuarantinePendingNoteObservation(
+                            pending.request_id);
+                    ResetNoteOutboxRetryBackoff();
+                    if (forced_quarantine_result != ESP_OK) {
+                        ESP_LOGE(
+                            kTag,
+                            "note observation forced quarantine failed: request=%s error=%s",
+                            pending.request_id.c_str(),
+                            esp_err_to_name(forced_quarantine_result));
+                        return WordOutboxUploadState::kFailed;
+                    }
+                    ++processed;
+                    ++quarantined;
+                    continue;
                 }
                 const esp_err_t quarantine_result =
                     wqn::QuarantinePendingNoteObservation(pending.request_id);
