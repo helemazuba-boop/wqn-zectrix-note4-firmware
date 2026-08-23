@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstring>
 
+#include "esp_attr.h"
 #include "esp_check.h"
 #include "esp_event.h"
 #include "esp_log.h"
@@ -37,6 +38,41 @@ std::atomic<bool> g_sleep_quiescing{false};
 std::atomic<bool> g_resume_after_sleep_abort{false};
 std::atomic<wqn::WifiStationEventSink> g_event_sink{nullptr};
 EventGroupHandle_t g_wifi_event_group = nullptr;
+
+// [power-fix] Radio-on accounting survives deep sleep in RTC memory so the
+// PowerCoordinator can print a cumulative total at each deep-sleep commit.
+// Plain storage + atomic_ref per the RTC-persisted scalar convention. The
+// segment clock uses truncated ms-since-boot; unsigned subtraction stays
+// wrap-safe for any single radio-on segment (bounded well under 49 days).
+RTC_DATA_ATTR uint32_t g_wifi_radio_on_total_ms = 0;
+uint32_t g_wifi_radio_on_since_ms = 0;
+bool g_wifi_radio_on = false;
+
+inline std::atomic_ref<uint32_t> WifiRadioOnTotalMsRef()
+{
+    return std::atomic_ref<uint32_t>(g_wifi_radio_on_total_ms);
+}
+
+void NoteWifiRadioOn()
+{
+    if (g_wifi_radio_on) {
+        return;
+    }
+    g_wifi_radio_on = true;
+    g_wifi_radio_on_since_ms =
+        static_cast<uint32_t>(esp_timer_get_time() / 1000);
+}
+
+void NoteWifiRadioOff()
+{
+    if (!g_wifi_radio_on) {
+        return;
+    }
+    g_wifi_radio_on = false;
+    const uint32_t now_ms = static_cast<uint32_t>(esp_timer_get_time() / 1000);
+    const uint32_t segment_ms = now_ms - g_wifi_radio_on_since_ms;
+    WifiRadioOnTotalMsRef().fetch_add(segment_ms, std::memory_order_relaxed);
+}
 
 const char* DisconnectReasonName(uint8_t reason)
 {
@@ -305,7 +341,9 @@ esp_err_t StartWifiWithCredentials(const char* ssid, const char* password)
 
     ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_STA, &wifi_config), kTag, "set WiFi STA config");
     ESP_RETURN_ON_ERROR(esp_wifi_set_ps(WIFI_PS_MIN_MODEM), kTag, "set WiFi power save");
-    ESP_RETURN_ON_ERROR(esp_wifi_start(), kTag, "start WiFi");
+    const esp_err_t start_result = esp_wifi_start();
+    ESP_RETURN_ON_ERROR(start_result, kTag, "start WiFi");
+    NoteWifiRadioOn();
 
     g_initialized.store(true, std::memory_order_release);
     ESP_LOGI(kTag, "WiFi station started with SSID: %s", ssid);
@@ -401,6 +439,7 @@ esp_err_t StopWifiStationRadio()
     const esp_err_t result = esp_wifi_stop();
     if (result == ESP_OK || result == ESP_ERR_WIFI_NOT_STARTED ||
         result == ESP_ERR_WIFI_NOT_INIT) {
+        NoteWifiRadioOff();
         g_wifi_associated.store(false, std::memory_order_release);
         g_wifi_connected.store(false, std::memory_order_release);
         g_reconfigure_disconnect_pending.store(false, std::memory_order_release);
@@ -424,7 +463,11 @@ esp_err_t StartWifiStationRadio()
     if (!g_initialized.load(std::memory_order_acquire)) {
         return ESP_ERR_INVALID_STATE;
     }
-    return esp_wifi_start();
+    const esp_err_t start_result = esp_wifi_start();
+    if (start_result == ESP_OK) {
+        NoteWifiRadioOn();
+    }
+    return start_result;
 #else
     return ESP_ERR_INVALID_STATE;
 #endif
@@ -533,6 +576,7 @@ esp_err_t PrepareConnectivityForSleep(const power::PrepareSleepCommand& command)
         ESP_LOGW(kTag, "WiFi stop for sleep failed: %s", esp_err_to_name(result));
         return result;
     }
+    NoteWifiRadioOff();
     g_wifi_connected.store(false, std::memory_order_release);
     g_wifi_associated.store(false, std::memory_order_release);
     g_reconfigure_disconnect_pending.store(false, std::memory_order_release);
@@ -561,7 +605,17 @@ void RollbackConnectivityAfterSleepAbort()
         ESP_LOGW(kTag, "WiFi restart after sleep rollback failed: %s", esp_err_to_name(result));
         return;
     }
+    NoteWifiRadioOn();
     ESP_LOGI(kTag, "connectivity sleep preparation rolled back");
+#endif
+}
+
+uint32_t GetWifiRadioOnTotalMs()
+{
+#if CONFIG_WQN_WIFI_STA_ENABLE
+    return WifiRadioOnTotalMsRef().load(std::memory_order_relaxed);
+#else
+    return 0;
 #endif
 }
 

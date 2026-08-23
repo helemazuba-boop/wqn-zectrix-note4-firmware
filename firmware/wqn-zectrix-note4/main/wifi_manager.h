@@ -37,6 +37,11 @@ bool IsWifiCredentialFailureReason(int reason);
 // Returns the connected AP's RSSI (dBm, e.g. -65), or 0 if not connected/WiFi disabled.
 int GetWifiRssi();
 
+// Cumulative radio-on time in ms across deep-sleep cycles (RTC-retained).
+// The PowerCoordinator prints it at every deep-sleep commit so battery drain
+// can be attributed to radio-on time without external instrumentation.
+uint32_t GetWifiRadioOnTotalMs();
+
 esp_err_t PrepareConnectivityForSleep(const power::PrepareSleepCommand& command);
 void RollbackConnectivityAfterSleepAbort();
 

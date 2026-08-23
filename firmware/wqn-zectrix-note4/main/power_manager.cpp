@@ -30,6 +30,7 @@
 #include "runtime/wake_context.h"
 #include "sdkconfig.h"
 #include "storage.h"
+#include "wifi_manager.h"
 #include "services/connectivity_service.h"
 #include "services/audio_service.h"
 
@@ -707,11 +708,12 @@ static bool CommitDeepSleep(
     const power::PrepareSleepCommand& command,
     const uint32_t* gate_on_activity_baseline)
 {
-    ESP_LOGI(kTag, "deep-sleep commit: generation=%u mode=%s consecutive=%u stack_free=%u",
+    ESP_LOGI(kTag, "deep-sleep commit: generation=%u mode=%s consecutive=%u stack_free=%u radio_on_total_ms=%u",
              static_cast<unsigned>(command.generation),
              power::SleepModeName(command.mode),
              static_cast<unsigned>(ConsecutiveSleepCyclesRef().load(std::memory_order_relaxed)),
-             static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
+             static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)),
+             static_cast<unsigned>(wqn::GetWifiRadioOnTotalMs()));
     uart_wait_tx_idle_polling(static_cast<uart_port_t>(CONFIG_ESP_CONSOLE_UART_NUM));
     vTaskDelay(pdMS_TO_TICKS(50));
 
@@ -873,6 +875,13 @@ static void EnterDeepSleepIfEnabled(bool enable_timer_wakeup)
     }
     const bool timer_wakeup_for_display = display_wakeup_seconds != 0 &&
         (sync_wakeup_seconds == 0 || display_wakeup_seconds <= sync_wakeup_seconds);
+    ESP_LOGI(kTag,
+             "deep-sleep wake plan: display_sec=%u sync_sec=%u chosen=%u source=%s",
+             static_cast<unsigned>(display_wakeup_seconds),
+             static_cast<unsigned>(sync_wakeup_seconds),
+             static_cast<unsigned>(timer_wakeup_seconds),
+             timer_wakeup_for_display ? "display"
+                 : (sync_wakeup_seconds != 0 ? "sync" : "off"));
     const power::WakeArmResult wake =
         power::ArmWakeSources(timer_wakeup_seconds, command.deadline_us);
     if (wake.error != ESP_OK) {
