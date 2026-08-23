@@ -9,6 +9,7 @@
 #include "device_protocol/word_study.h"
 #include "esp_err.h"
 #include "esp_heap_caps.h"
+#include "outbox_suspend_reason.h"
 
 namespace wqn {
 
@@ -25,6 +26,9 @@ struct WordStorePsramAllocator {
     WordStorePsramAllocator(const WordStorePsramAllocator<U>&) noexcept {}
     T* allocate(std::size_t count)
     {
+        if (count == 0) {
+            return nullptr;
+        }
         void* memory = heap_caps_malloc(count * sizeof(T), MALLOC_CAP_SPIRAM);
         if (memory == nullptr) abort();
         return static_cast<T*>(memory);
@@ -121,6 +125,9 @@ struct DurableWordObservation {
 
 struct WordOutboxSnapshot {
     size_t pending_count = 0;
+    // Records parked by SuspendPendingWordObservation: excluded from the
+    // upload queue but still resident on device awaiting intervention.
+    size_t suspended_count = 0;
     size_t capacity = 0;
 };
 
@@ -151,6 +158,14 @@ esp_err_t AcknowledgeWordObservation(const std::string& request_id);
 // before removing it from the upload queue. Other sessions and observations
 // remain available and no restart is required.
 esp_err_t QuarantinePendingWordObservation(const std::string& request_id);
+// Parks one observation whose server-side disposition forbids unilateral
+// deletion (idempotency conflict, actor ownership conflict, corrupt
+// identity, protocol block). The head is durably marked and skipped by
+// PeekPendingWordObservation so the queue keeps advancing, but the payload
+// stays recoverable on device pending human intervention.
+esp_err_t SuspendPendingWordObservation(
+    const std::string& request_id,
+    OutboxSuspendReason reason);
 esp_err_t ReadWordOutboxSnapshot(WordOutboxSnapshot* snapshot);
 esp_err_t PrepareWordObservationOutboxForSleep(int64_t deadline_us);
 

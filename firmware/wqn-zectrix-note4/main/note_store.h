@@ -9,6 +9,7 @@
 #include "device_protocol/note_study.h"
 #include "esp_err.h"
 #include "esp_heap_caps.h"
+#include "outbox_suspend_reason.h"
 
 namespace wqn {
 
@@ -23,6 +24,9 @@ struct NoteStorePsramAllocator {
     NoteStorePsramAllocator(const NoteStorePsramAllocator<U>&) noexcept {}
     T* allocate(std::size_t count)
     {
+        if (count == 0) {
+            return nullptr;
+        }
         void* memory = heap_caps_malloc(count * sizeof(T), MALLOC_CAP_SPIRAM);
         if (memory == nullptr) abort();
         return static_cast<T*>(memory);
@@ -109,6 +113,9 @@ struct DurableNoteObservation {
 
 struct NoteOutboxSnapshot {
     size_t pending_count = 0;
+    // Records parked by SuspendPendingNoteObservation: excluded from the
+    // upload queue but still resident on device awaiting intervention.
+    size_t suspended_count = 0;
     size_t capacity = 0;
 };
 
@@ -132,6 +139,13 @@ esp_err_t AcknowledgeNoteObservation(const std::string& request_id);
 // removes it from the upload queue so a terminal server error cannot wedge the
 // durable head.
 esp_err_t QuarantinePendingNoteObservation(const std::string& request_id);
+// Parks one observation whose server-side disposition forbids unilateral
+// deletion. The head is durably marked and skipped by
+// PeekPendingNoteObservation so the queue keeps advancing, but the payload
+// stays recoverable on device pending human intervention.
+esp_err_t SuspendPendingNoteObservation(
+    const std::string& request_id,
+    OutboxSuspendReason reason);
 esp_err_t ReadNoteOutboxSnapshot(NoteOutboxSnapshot* snapshot);
 esp_err_t PrepareNoteObservationOutboxForSleep(int64_t deadline_us);
 
