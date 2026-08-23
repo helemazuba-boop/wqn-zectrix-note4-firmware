@@ -31,6 +31,22 @@ constexpr int64_t kAssociationTimeoutUs = 15LL * 1000 * 1000;
 constexpr int64_t kDhcpTimeoutUs = 15LL * 1000 * 1000;
 constexpr int64_t kRetryBaseDelayUs = 5LL * 1000 * 1000;
 constexpr int64_t kBackoffDelayUs = 60LL * 1000 * 1000;
+// [power-fix] Radio-off backoff ladder for consecutive EXHAUSTED retry
+// rounds: 60s -> 5min -> 15min cap. RTC retention keeps the round count
+// alive across deep-sleep cycles, otherwise every boot would restart the
+// storm from rung 0 against a dead AP. After kBackoffSuspendAfterRounds
+// failed rounds the automatic retry is suspended entirely: the radio stays
+// off until an explicit trigger (boot admission with a due sync deadline,
+// a user action, or new credentials) resumes it.
+constexpr int64_t kBackoffLadderUs[] = {
+    60LL * 1000 * 1000,
+    300LL * 1000 * 1000,
+    900LL * 1000 * 1000};
+constexpr size_t kBackoffLadderSize =
+    sizeof(kBackoffLadderUs) / sizeof(kBackoffLadderUs[0]);
+constexpr uint8_t kBackoffSuspendAfterRounds = 6;
+RTC_DATA_ATTR uint8_t g_backoff_rounds = 0;
+RTC_DATA_ATTR bool g_backoff_suspended = false;
 // [wifi-redundancy] Count complete failed connection attempts, not timer ticks.
 // Credential failures pivot immediately; transient failures get bounded 5 s,
 // 10 s retry delays before the third failure exhausts the slot.
@@ -389,12 +405,44 @@ void ScheduleBackoff()
     // [wifi-redundancy] Fresh per-slot budget after the radio-off pause; the
     // next cycle starts clean from the preferred slot.
     g_slot_fail_count[0] = g_slot_fail_count[1] = 0;
-    ScheduleAction(ScheduledAction::kBackoffExpired, kBackoffDelayUs);
+    if (g_backoff_rounds < UINT8_MAX) {
+        ++g_backoff_rounds;
+    }
+    if (!g_backoff_suspended &&
+        g_backoff_rounds > kBackoffSuspendAfterRounds) {
+        g_backoff_suspended = true;
+    }
     const esp_err_t stop_result = wqn::StopWifiStationRadio();
     if (stop_result != ESP_OK) {
         ESP_LOGW(kTag, "stop WiFi for backoff failed: %s", esp_err_to_name(stop_result));
     }
-    ESP_LOGW(kTag, "WiFi retries exhausted; radio off for 60 seconds");
+    if (g_backoff_suspended) {
+        // No timer: only an explicit trigger (due sync deadline at boot
+        // admission, user action, new credentials) restarts the radio. This
+        // is what keeps a dead AP from lighting the radio once per interval
+        // forever on a battery-powered device.
+        ESP_LOGW(
+            kTag,
+            "WiFi auto-retry suspended after %u exhausted rounds; radio off until explicit trigger",
+            static_cast<unsigned>(g_backoff_rounds));
+        return;
+    }
+    const uint8_t ladder_index = static_cast<uint8_t>(
+        std::min<uint8_t>(static_cast<uint8_t>(g_backoff_rounds - 1),
+                          static_cast<uint8_t>(kBackoffLadderSize - 1)));
+    const int64_t backoff_us = kBackoffLadderUs[ladder_index];
+    ScheduleAction(ScheduledAction::kBackoffExpired, backoff_us);
+    ESP_LOGW(
+        kTag,
+        "WiFi retries exhausted; radio off for %lld s (round %u)",
+        static_cast<long long>(backoff_us / (1000 * 1000)),
+        static_cast<unsigned>(g_backoff_rounds));
+}
+
+void ResetBackoffEscalation()
+{
+    g_backoff_rounds = 0;
+    g_backoff_suspended = false;
 }
 
 void RecordAttemptFailure(const char* cause, bool credential_failure)
@@ -468,11 +516,22 @@ esp_err_t StartConfiguredConnectivity()
         case wqn::services::ConnectivityState::kConnecting:
         case wqn::services::ConnectivityState::kWaitingIp:
         case wqn::services::ConnectivityState::kOnline:
-        case wqn::services::ConnectivityState::kBackoff:
             // StartConnectivity is an idempotent readiness request. In
             // particular, it must not tear down an in-flight association or
             // bypass the radio-off backoff selected by this owner task.
             return ESP_OK;
+        case wqn::services::ConnectivityState::kBackoff:
+            if (!g_backoff_suspended) {
+                // Mid-pause on the owner-task ladder: keep the pause.
+                return ESP_OK;
+            }
+            // [power-fix] Suspended auto-retry is resumed by an explicit
+            // readiness request (boot admission with a due sync deadline,
+            // manual sync, user action). The ladder round count survives so
+            // repeated explicit triggers against a dead AP re-escalate.
+            g_backoff_suspended = false;
+            ClearScheduledAction();
+            break;
         case wqn::services::ConnectivityState::kOff:
             break;
     }
@@ -529,6 +588,9 @@ esp_err_t StartWithCredentials(const ConnectivityCommand& command)
     }
     g_attempt_active = false;
     ClearScheduledAction();
+    // A credential change is an explicit user action: restart the backoff
+    // ladder from rung 0 and lift any auto-retry suspension.
+    ResetBackoffEscalation();
 
     // [wifi-redundancy] Persist first (dedup by SSID, the new credential becomes
     // preferred), then connect from the refreshed store. If the upsert fails we
@@ -603,6 +665,7 @@ esp_err_t RollbackAfterSleepAbort()
     if (wqn::IsWifiStationConnected()) {
         g_attempt_active = false;
         ClearScheduledAction();
+        ResetBackoffEscalation();
         SetOnline(true, wqn::GetWifiRssi());
         SetState(wqn::services::ConnectivityState::kOnline);
         return ESP_OK;
@@ -680,6 +743,7 @@ esp_err_t HandleCommand(const ConnectivityCommand& command)
             g_attempt_active = false;
             g_slot_fail_count[0] = g_slot_fail_count[1] = 0;
             ClearScheduledAction();
+            ResetBackoffEscalation();
             SetOnline(true, wqn::GetWifiRssi());
             SetState(wqn::services::ConnectivityState::kOnline);
             // [wifi-redundancy] The slot that just connected becomes the next
