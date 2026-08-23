@@ -190,6 +190,9 @@ int64_t SleepRetryBackoffUs()
 // interaction resets it alongside ConsecutiveSleepCycles.
 constexpr uint32_t kUnattendedSyncWakeEscalationAfter = 8;
 constexpr uint32_t kEscalatedSyncWakeFloorSec = 900;
+// [power-fix] Unpaired-on-battery maintenance wake cadence (see the token
+// policy note in EnterDeepSleepIfEnabled).
+constexpr uint32_t kUnpairedBatteryMaintenanceWakeSec = 900;
 RTC_DATA_ATTR uint32_t g_unattended_sync_wakes = 0;
 constexpr int64_t kEmergencyStorageTimeoutUs = 2 * 1000 * 1000;
 constexpr int64_t kEmergencyHardwareTimeoutUs = 2 * 1000 * 1000;
@@ -865,9 +868,17 @@ static void EnterDeepSleepIfEnabled(bool enable_timer_wakeup)
         g_deep_sleep_clock_yield.store(false, std::memory_order_release);
         return;
     }
+    // [power-fix] Unpaired (or 401-cleared) identity on battery no longer
+    // refuses deep sleep forever: it used to be an always-on brick draining
+    // the cell while showing the pairing screen. On battery it sleeps with a
+    // 15-minute quiet maintenance cadence; any button is an armed ext1 wake
+    // that returns to the pairing UI, and USB power keeps the old behavior so
+    // the SoftAP pairing portal stays reachable. While a provisioning portal
+    // is actually serving, its kConnectivity lease blocks quiesce anyway.
+    const bool has_usable_token = services::HasUsableStoredToken();
     if (esp_timer_get_time() <
             g_sleep_retry_not_before_us.load(std::memory_order_relaxed) ||
-        !services::HasUsableStoredToken() || !IsUiIdleForSleep()) {
+        !IsUiIdleForSleep()) {
         g_deep_sleep_clock_yield.store(false, std::memory_order_release);
         return;
     }
@@ -916,9 +927,15 @@ static void EnterDeepSleepIfEnabled(bool enable_timer_wakeup)
         ? CONFIG_WQN_DEEP_SLEEP_TIMER_WAKE_SEC
         : 0;
     uint32_t timer_wakeup_seconds = display_wakeup_seconds;
-    const uint32_t sync_wakeup_seconds =
-        services::SecondsUntilNextSyncWake();
-    if (sync_wakeup_seconds != 0 &&
+    uint32_t sync_wakeup_seconds = services::SecondsUntilNextSyncWake();
+    // [power-fix] Without a usable identity there is nothing to sync; ignore
+    // sync-derived deadlines (claim polling would otherwise pin the cadence
+    // at ~1s) and hold a slow 15-minute maintenance rhythm instead.
+    if (!has_usable_token) {
+        sync_wakeup_seconds = 0;
+        timer_wakeup_seconds =
+            kUnpairedBatteryMaintenanceWakeSec;
+    } else if (sync_wakeup_seconds != 0 &&
         (timer_wakeup_seconds == 0 ||
          sync_wakeup_seconds < timer_wakeup_seconds)) {
         timer_wakeup_seconds = sync_wakeup_seconds;
@@ -928,7 +945,12 @@ static void EnterDeepSleepIfEnabled(bool enable_timer_wakeup)
     // micro-wake loop with the radio on (the dominant battery drain in the
     // 2026-08-19 audit). A deadline landing inside the floor fires one
     // interval late; admission at boot still gates whether the radio starts.
-    const bool timer_wakeup_for_display = display_wakeup_seconds != 0 &&
+    // [power-fix] An unpaired maintenance wake is neither a display nor a
+    // sync wake: classify it as background so the boot path skips panel
+    // init for it (IsBackgroundSyncTimerWake) and the pairing screen stays
+    // exactly as the user left it.
+    const bool timer_wakeup_for_display = has_usable_token &&
+        display_wakeup_seconds != 0 &&
         (sync_wakeup_seconds == 0 || display_wakeup_seconds <= sync_wakeup_seconds);
     uint32_t wake_floor_seconds = CONFIG_WQN_SLEEP_TIMER_WAKE_FLOOR_SEC;
     // [gap-1] Unattended background-maintenance wakes escalate: after enough
@@ -937,7 +959,8 @@ static void EnterDeepSleepIfEnabled(bool enable_timer_wakeup)
     // minutes instead of one per interval. Display/clock wakes neither count
     // nor reset the streak.
     bool sync_wake_escalated = false;
-    if (!timer_wakeup_for_display && sync_wakeup_seconds != 0 &&
+    if (has_usable_token && !timer_wakeup_for_display &&
+        sync_wakeup_seconds != 0 &&
         g_unattended_sync_wakes >= kUnattendedSyncWakeEscalationAfter &&
         wake_floor_seconds != 0 &&
         wake_floor_seconds < kEscalatedSyncWakeFloorSec) {
@@ -956,8 +979,9 @@ static void EnterDeepSleepIfEnabled(bool enable_timer_wakeup)
              static_cast<unsigned>(display_wakeup_seconds),
              static_cast<unsigned>(sync_wakeup_seconds),
              static_cast<unsigned>(timer_wakeup_seconds),
-             timer_wakeup_for_display ? "display"
-                 : (sync_wakeup_seconds != 0 ? "sync" : "off"),
+             !has_usable_token ? "unpaired-maintenance"
+                 : (timer_wakeup_for_display ? "display"
+                 : (sync_wakeup_seconds != 0 ? "sync" : "off")),
              wake_floor_applied ? " floor-clamped" : "",
              sync_wake_escalated ? "+unattended-escalated" : "");
 #if CONFIG_WQN_RTC_TIMEKEEP_ENABLE
