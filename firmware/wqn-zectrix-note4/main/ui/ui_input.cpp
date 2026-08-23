@@ -10,6 +10,7 @@
 #include "ai_session.h"
 #include "esp_log.h"
 #include "flash_session.h"
+#include "power_manager.h"
 #include "services/connectivity_service.h"
 #include "services/sync_service.h"
 
@@ -261,6 +262,27 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
         return RefreshSchedule::kNone;
     }
 
+    if (state->settings.dialog == wqn::SettingsDialog::kPowerOff) {
+        if (long_press && event.button == wqn::ButtonId::kConfirm) {
+            // [power-fix] Hand off to the PowerCoordinator: it whites the
+            // panel on the EPD owner task, quiesces services and cuts the
+            // latch. The request re-arms itself while quiesce is busy, so
+            // there is no user-visible failure path here; the notice stays
+            // on the panel until the shutdown clear overwrites it.
+            state->settings.dialog = wqn::SettingsDialog::kNone;
+            state->settings.notice = "正在关机…";
+            ESP_LOGW(kTag, "power off requested from settings page");
+            wqn::RequestUserPowerOff();
+            return RefreshSchedule::kCommit;
+        }
+        if (short_press && event.button == wqn::ButtonId::kConfirm) {
+            state->settings.dialog = wqn::SettingsDialog::kNone;
+            state->settings.notice = "已取消关机";
+            return RefreshSchedule::kConfig;
+        }
+        return RefreshSchedule::kNone;
+    }
+
     if (long_press && event.button == wqn::ButtonId::kConfirm) {
         state->screen = wqn::UiScreen::kHome;
         BuildHomeSummary(state);
@@ -355,6 +377,9 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
             return RefreshSchedule::kConfig;
         case 9:
             OpenSettingsDialog(state, wqn::SettingsDialog::kFactoryReset);
+            return RefreshSchedule::kConfig;
+        case 10:
+            OpenSettingsDialog(state, wqn::SettingsDialog::kPowerOff);
             return RefreshSchedule::kConfig;
         default:
             return RefreshSchedule::kNone;

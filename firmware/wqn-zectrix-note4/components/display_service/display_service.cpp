@@ -1777,6 +1777,37 @@ static esp_err_t TryPowerOffEpd(uint32_t timeout_ms)
     return ESP_OK;
 }
 
+// [power-fix] User-shutdown variant: white the panel with a TRUE full-refresh
+// waveform so the blank frame overwrites ghosting history, then cut the rail.
+// Lives inside this namespace so it shares kTag/framebuffer state with the
+// other EPD primitives. A refresh failure is logged and NOT fatal: a shutdown
+// must not hang on a display fault, so the rail is still cut.
+static esp_err_t ShutdownClearAndPowerOffLocal(int64_t deadline_us)
+{
+    const int64_t remaining_us = deadline_us > 0
+        ? deadline_us - esp_timer_get_time()
+        : 0;
+    if (deadline_us > 0 && remaining_us <= 0) {
+        return ESP_ERR_TIMEOUT;
+    }
+    EpdFrameTransaction transaction;
+    if (!transaction.locked()) {
+        return ESP_ERR_NO_MEM;
+    }
+    ClearEpdFramebuffer(true);
+    g_previous_framebuffer_synced = false;
+    const esp_err_t refresh_result = RefreshEpdFull(false, true);
+    if (refresh_result != ESP_OK) {
+        ESP_LOGE(kTag,
+                 "shutdown clear refresh failed; continuing to rail power-off: %s",
+                 esp_err_to_name(refresh_result));
+    }
+    const uint32_t timeout_ms = deadline_us > 0
+        ? static_cast<uint32_t>((remaining_us + 999) / 1000)
+        : 0;
+    return TryPowerOffEpd(timeout_ms);
+}
+
 // Gray16 is a separate full-screen pipeline. It starts from an OTP-white
 // base and uses the vendor-calibrated five-pass external waveform; it never
 // participates in the 1bpp previous-frame/partial-refresh state machine.
@@ -2088,6 +2119,11 @@ TaskHandle_t g_epd_owner_task = nullptr;
 // from a previously-timed-out request.
 std::atomic<esp_err_t> g_sleep_prep_result{ESP_FAIL};
 std::atomic<uint32_t> g_sleep_prep_result_generation{0};
+// [power-fix] Operation selector for the sleep-prep channel: false = plain
+// rail power-off (sleep prep), true = white-clear + forced full refresh +
+// rail power-off (user shutdown). Single producer (PowerCoordinator) stores
+// it before posting; the owner consumes it right after claiming.
+std::atomic<bool> g_sleep_prep_clear{false};
 
 SemaphoreHandle_t SleepPrepDoneSemaphore()
 {
@@ -2121,6 +2157,16 @@ esp_err_t RunSleepPrepLocal(int64_t deadline_us)
     return wqn::TryPowerOffEpd(timeout_ms);
 }
 
+// [power-fix] User-shutdown variant: delegates to the wqn-internal
+// ShutdownClearAndPowerOffLocal (white clear + forced full refresh + rail
+// power-off). Runs on the owner task at the idle command point, where no
+// frame transaction can be held, so the recursive transaction inside is
+// uncontended.
+esp_err_t RunShutdownClearLocal(int64_t deadline_us)
+{
+    return wqn::ShutdownClearAndPowerOffLocal(deadline_us);
+}
+
 }  // namespace
 
 void wqn::RegisterEpdOwnerTask(void* owner_task_handle)
@@ -2147,7 +2193,11 @@ bool wqn::ServiceDisplaySleepPrepCommand()
     // This runs at the idle command point, which never holds an
     // EpdFrameTransaction, so the recursive guard inside TryPowerOffEpd is
     // uncontended on this task.
-    const esp_err_t result = RunSleepPrepLocal(0);
+    const bool clear_first =
+        g_sleep_prep_clear.exchange(false, std::memory_order_acq_rel);
+    const esp_err_t result = clear_first
+        ? RunShutdownClearLocal(0)
+        : RunSleepPrepLocal(0);
     // Publish order (mirror of the requester's drain-then-post): write the
     // result, GIVE the semaphore, and only THEN drop to Idle. If Idle were
     // published before the give, a new request could enter Pending and then be
@@ -2161,7 +2211,10 @@ bool wqn::ServiceDisplaySleepPrepCommand()
     return true;
 }
 
-esp_err_t wqn::PrepareDisplayForSleep(int64_t deadline_us)
+// Shared body of PrepareDisplayForSleep / PrepareDisplayForShutdown. The
+// owner fast-path and no-owner fallback dispatch on clear_first; the posted
+// path carries the flag in g_sleep_prep_clear for the owner to consume.
+static esp_err_t PrepareDisplayPowerOpInternal(int64_t deadline_us, bool clear_first)
 {
     // PowerCoordinator may begin quiesce only when no SleepLease exists. Every
     // accepted UI frame owns kDisplay until its terminal result, so reaching
@@ -2172,16 +2225,20 @@ esp_err_t wqn::PrepareDisplayForSleep(int64_t deadline_us)
     // ourselves would deadlock on the completion wait.
     if (g_epd_owner_task != nullptr &&
         xTaskGetCurrentTaskHandle() == g_epd_owner_task) {
-        return RunSleepPrepLocal(deadline_us);
+        return clear_first ? RunShutdownClearLocal(deadline_us)
+                           : RunSleepPrepLocal(deadline_us);
     }
     // No owner registered yet (early boot / EPD UI disabled): run locally.
     if (g_epd_owner_task == nullptr) {
-        return RunSleepPrepLocal(deadline_us);
+        return clear_first ? RunShutdownClearLocal(deadline_us)
+                           : RunSleepPrepLocal(deadline_us);
     }
 
     SemaphoreHandle_t done = SleepPrepDoneSemaphore();
     if (done == nullptr) {
-        return RunSleepPrepLocal(deadline_us);  // allocation failed; degrade safely
+        // allocation failed; degrade safely
+        return clear_first ? RunShutdownClearLocal(deadline_us)
+                           : RunSleepPrepLocal(deadline_us);
     }
     // Drain any stale give left by a previously timed-out request so this
     // wait cannot be satisfied by an old completion.
@@ -2189,12 +2246,14 @@ esp_err_t wqn::PrepareDisplayForSleep(int64_t deadline_us)
 
     const uint32_t generation = NextSleepPrepGeneration();
     g_sleep_prep_generation.store(generation, std::memory_order_release);
+    g_sleep_prep_clear.store(clear_first, std::memory_order_release);
     // Idle -> Pending. If somehow not Idle (a prior request still Claimed),
     // fail closed: the power side treats it as a display-prep failure.
     uint32_t expected = kSleepPrepIdle;
     if (!g_sleep_prep_state.compare_exchange_strong(
             expected, kSleepPrepPending,
             std::memory_order_acq_rel, std::memory_order_acquire)) {
+        g_sleep_prep_clear.store(false, std::memory_order_release);
         return ESP_ERR_INVALID_STATE;
     }
     xTaskNotifyGive(g_epd_owner_task);
@@ -2240,6 +2299,18 @@ esp_err_t wqn::PrepareDisplayForSleep(int64_t deadline_us)
         return g_sleep_prep_result.load(std::memory_order_relaxed);
     }
     return ESP_ERR_TIMEOUT;
+}
+
+esp_err_t wqn::PrepareDisplayForSleep(int64_t deadline_us)
+{
+    return PrepareDisplayPowerOpInternal(deadline_us, /*clear_first=*/false);
+}
+
+esp_err_t wqn::PrepareDisplayForShutdown(int64_t deadline_us)
+{
+    // User-initiated power-off: white the panel first (owner task), then cut
+    // the rail. See RunShutdownClearLocal for failure semantics.
+    return PrepareDisplayPowerOpInternal(deadline_us, /*clear_first=*/true);
 }
 
 void wqn::RollbackDisplayAfterSleepAbort()

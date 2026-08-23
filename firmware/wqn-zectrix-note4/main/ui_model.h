@@ -196,6 +196,7 @@ enum class SettingsDialog {
     kVolume,
     kDefaultWordDeck,
     kFactoryReset,
+    kPowerOff,
 };
 
 struct SettingsDiagnosticsSnapshot {

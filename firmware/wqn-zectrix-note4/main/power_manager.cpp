@@ -149,6 +149,9 @@ i2c_master_bus_handle_t g_i2c_bus = nullptr;
 TaskHandle_t g_power_coordinator_task = nullptr;
 std::atomic<bool> g_timer_wakeup_preference{true};
 std::atomic<bool> g_battery_shutdown_requested{false};
+// [power-fix] Set by the settings-page confirm; consumed (and re-set on a
+// busy quiesce) by the PowerCoordinator. See RunUserPowerOffShutdown.
+std::atomic<bool> g_user_poweroff_requested{false};
 // Published by the power task after all non-display deep-sleep admission
 // checks pass. The UI task reads only this scalar; it must not call
 // HasUsableStoredToken(), which performs a synchronous storage read.
@@ -833,6 +836,63 @@ static void RunBatteryEmergencyShutdown()
     CommitDeepSleep(command, nullptr);
 }
 
+// [power-fix] User-initiated power-off (settings page). Same hard power-cut
+// as the battery-emergency path, but the panel is whited FIRST so the device
+// visibly shuts down instead of freezing its last screen. The display clear
+// runs on the EPD owner task via PrepareDisplayForShutdown; a display fault
+// is logged and never blocks the shutdown. Runs with quiesce closed, so no
+// new leases (sync/audio/AI) can start mid-sequence.
+static void RunUserPowerOffShutdown()
+{
+    ESP_LOGW(kTag, "user power-off requested");
+    const uint32_t generation = NextSleepGeneration();
+    if (!runtime::BeginEmergencySleepQuiesce(generation)) {
+        // Something still holds a lease (AI session, sync round, portal).
+        // Re-arm and retry on the next coordinator tick rather than force-
+        // cutting under live work; the UI notice keeps the user informed.
+        g_user_poweroff_requested.store(true, std::memory_order_release);
+        return;
+    }
+
+    const int64_t storage_deadline_us = esp_timer_get_time() + kEmergencyStorageTimeoutUs;
+    while (runtime::ActiveSleepBlockerCount(runtime::SleepBlocker::kStorage) != 0 &&
+           esp_timer_get_time() < storage_deadline_us) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    // Full-refresh budget: white clear + BUSY wait + rail cut. Generous
+    // deadline -- the op is TWDT-fed and failure-tolerant by contract.
+    constexpr int64_t kShutdownClearDeadlineUs = 12LL * 1000 * 1000;
+    const esp_err_t clear_result =
+        wqn::PrepareDisplayForShutdown(esp_timer_get_time() + kShutdownClearDeadlineUs);
+    if (clear_result != ESP_OK) {
+        ESP_LOGW(kTag, "shutdown display clear failed; continuing: %s",
+                 esp_err_to_name(clear_result));
+    }
+
+    power::PrepareSleepCommand command;
+    command.generation = generation;
+    command.mode = power::SleepMode::kBatteryEmergency;
+    command.deadline_us = esp_timer_get_time() + kEmergencyHardwareTimeoutUs;
+    const power::PrepareSleepResults results = BroadcastPrepareSleep(command);
+    for (const power::PrepareSleepResult& result : results) {
+        if (result.status != power::SleepPrepareStatus::kReady) {
+            ESP_LOGW(kTag, "user power-off continuing after service failure: service=%s status=%s",
+                     power::SleepServiceName(result.service),
+                     power::SleepPrepareStatusName(result.status));
+        }
+    }
+
+    power::DisarmWakeSources();
+    PrepareBoardPowerState(power::SleepMode::kBatteryEmergency);
+    runtime::SleepSnapshot snapshot;
+    snapshot.generation = generation;
+    snapshot.mode = power::SleepMode::kBatteryEmergency;
+    snapshot.consecutive_cycles = ConsecutiveSleepCyclesRef().load(std::memory_order_relaxed);
+    runtime::CommitSleepSnapshot(snapshot);
+    CommitDeepSleep(command, nullptr);
+}
+
 static bool PreemptIdleSleepForBatteryEmergency(uint32_t generation)
 {
     if (!g_battery_shutdown_requested.exchange(false, std::memory_order_acq_rel)) {
@@ -1044,6 +1104,12 @@ void SetDeepSleepTimerWakePreference(bool enabled)
     g_timer_wakeup_preference.store(enabled, std::memory_order_release);
 }
 
+void RequestUserPowerOff()
+{
+    ESP_LOGI(kTag, "user power-off requested from UI");
+    g_user_poweroff_requested.store(true, std::memory_order_release);
+}
+
 static void PowerCoordinatorTask(void*)
 {
     ESP_LOGI(kTag, "power coordinator task started: stack_free=%u",
@@ -1051,6 +1117,12 @@ static void PowerCoordinatorTask(void*)
     while (true) {
         RefreshUsbPowerSleepPolicy();
         runtime::LogLongHeldSleepLeases(esp_timer_get_time(), kLeaseWarningAfterUs);
+        if (g_user_poweroff_requested.exchange(false, std::memory_order_acq_rel)) {
+            // Consumes the flag; RunUserPowerOffShutdown re-sets it and
+            // returns only when quiesce was busy, so the retry is one tick
+            // later and never spins hot.
+            RunUserPowerOffShutdown();
+        }
         EnterDeepSleepIfEnabled(g_timer_wakeup_preference.load(std::memory_order_acquire));
         ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000));
     }

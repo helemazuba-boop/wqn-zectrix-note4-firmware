@@ -39,6 +39,10 @@ esp_err_t StartPowerCoordinator();
 void RefreshUsbPowerSleepPolicy();
 void SetDeepSleepTimerWakePreference(bool enabled);
 void ShutdownForBatteryDepleted();
+// [power-fix] User-initiated power-off (settings page): the coordinator
+// clears the panel on the EPD owner task, quiesces services, then cuts the
+// board power latch. Safe to call from any task; re-request if busy.
+void RequestUserPowerOff();
 
 esp_err_t InitPowerHardware(i2c_port_t i2c_port, gpio_num_t i2c_sda, gpio_num_t i2c_scl, int i2c_clk_hz);
 

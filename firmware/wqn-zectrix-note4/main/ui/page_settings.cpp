@@ -265,6 +265,12 @@ esp_err_t RenderSettingsDialog(const wqn::SettingsAppState& settings)
             ESP_RETURN_ON_ERROR(DrawCenteredText(44, 176, 312, "这是不可撤销操作"), kTag, "draw reset warning");
             ESP_RETURN_ON_ERROR(DrawCenteredText(44, 200, 312, "长按确认执行，短按确认取消"), kTag, "draw reset help");
             break;
+        case wqn::SettingsDialog::kPowerOff:
+            ESP_RETURN_ON_ERROR(DrawSettingsDialogBox("关机"), kTag, "draw power off dialog");
+            ESP_RETURN_ON_ERROR(DrawWrappedText(54, 98, 292, "设备将清空屏幕并彻底断电。重新开机需长按侧键。", 3), kTag, "draw power off body");
+            ESP_RETURN_ON_ERROR(DrawCenteredText(44, 176, 312, "待上传的学习记录会在下次开机后同步"), kTag, "draw power off note");
+            ESP_RETURN_ON_ERROR(DrawCenteredText(44, 200, 312, "长按确认关机，短按确认取消"), kTag, "draw power off help");
+            break;
         case wqn::SettingsDialog::kNone:
         default:
             break;
@@ -325,6 +331,7 @@ esp_err_t RenderSettingsToEpd(const wqn::UiFrame& frame, RefreshSchedule schedul
         "Word 默认词库",
         "固件版本",
         "恢复出厂",
+        "关机",
     };
     const std::string values[kSettingsItemCount] = {
         settings.wifi_primary_ssid[0] != '\0' ? settings.wifi_primary_ssid : "未配置",
@@ -337,8 +344,8 @@ esp_err_t RenderSettingsToEpd(const wqn::UiFrame& frame, RefreshSchedule schedul
         settings.default_word_deck_title.empty() ? "全部词库" : settings.default_word_deck_title,
         version_value,
         "",
+        "",
     };
-
     // Nine rows no longer fit the 300px panel at the 38px pitch; draw a
     // selection-following window instead (deterministic from the selection so
     // partial refreshes repaint consistently).
