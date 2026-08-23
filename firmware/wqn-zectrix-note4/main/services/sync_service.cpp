@@ -43,7 +43,18 @@ wqn::services::SyncSnapshot g_sync_snapshot = {};
 portMUX_TYPE g_sync_snapshot_lock = portMUX_INITIALIZER_UNLOCKED;
 uint32_t g_sync_event_sequence = 1;
 wqn::services::SyncEvent g_latest_sync_event = {};
-constexpr TickType_t kSyncRetryDelay = pdMS_TO_TICKS(10000);
+// [gap-1] Nominal full-sync retry ladder: a persistent failure used to pin the
+// retry cadence at 10s forever, keeping the radio hot across deep-sleep cycles
+// (2026-08-19 sync liveness audit). Consecutive nominal-path failures escalate
+// through this ladder and cap at 15 minutes; ClearFullSyncRetry() resets the
+// attempt count on success or when an explicit manual/boot reason runs.
+constexpr uint32_t kFullSyncRetryLadderMs[] = {
+    10000, 30000, 60000, 300000, 900000};
+constexpr size_t kFullSyncRetryLadderSize =
+    sizeof(kFullSyncRetryLadderMs) / sizeof(kFullSyncRetryLadderMs[0]);
+// RTC retention keeps the escalation alive across deep-sleep wake cycles;
+// only the sync task touches it (schedule/retry decisions are single-tasked).
+RTC_DATA_ATTR uint8_t g_full_sync_retry_attempts = 0;
 bool LoadUsableToken(std::string* token);
 TaskHandle_t g_sync_service_task = nullptr;
 enum FullSyncReason : uint32_t {
@@ -232,6 +243,7 @@ void ClearFullSyncRetry()
     g_full_sync_retry_unix_seconds = 0;
     taskEXIT_CRITICAL(&g_periodic_schedule_lock);
     g_full_sync_retry_not_before_ms.store(0, std::memory_order_release);
+    g_full_sync_retry_attempts = 0;
 }
 
 void ScheduleFullSyncRetry(uint32_t delay_ms)
@@ -2380,7 +2392,16 @@ uint32_t FullSyncFailureRetryMs(bool has_token_after_round)
             : AddClaimJitter(kClaimRetryBaseMs);
     }
 #endif
-    return static_cast<uint32_t>(kSyncRetryDelay * portTICK_PERIOD_MS);
+    const uint8_t ladder_index = static_cast<uint8_t>(
+        std::min<uint8_t>(g_full_sync_retry_attempts,
+                          static_cast<uint8_t>(kFullSyncRetryLadderSize - 1)));
+    ++g_full_sync_retry_attempts;
+    ESP_LOGW(
+        kTag,
+        "full-sync nominal retry escalated: attempt=%u delay_ms=%lu",
+        static_cast<unsigned>(ladder_index),
+        static_cast<unsigned long>(kFullSyncRetryLadderMs[ladder_index]));
+    return kFullSyncRetryLadderMs[ladder_index];
 }
 
 void SyncServiceTask(void*)
