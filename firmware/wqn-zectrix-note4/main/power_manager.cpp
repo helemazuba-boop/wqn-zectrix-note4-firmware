@@ -23,6 +23,7 @@
 #include "freertos/task.h"
 #include "services/sync_service.h"
 #include "pcf8563.h"
+#include "power/rtc_timekeep.h"
 #include "power/sleep_protocol.h"
 #include "power/wake_controller.h"
 #include "runtime/sleep_coordinator.h"
@@ -873,15 +874,39 @@ static void EnterDeepSleepIfEnabled(bool enable_timer_wakeup)
          sync_wakeup_seconds < timer_wakeup_seconds)) {
         timer_wakeup_seconds = sync_wakeup_seconds;
     }
+    // [gap-1] Fold any sub-floor wake interval up to the floor. A sync retry
+    // or content deadline of a few seconds used to become a boot-per-cycle
+    // micro-wake loop with the radio on (the dominant battery drain in the
+    // 2026-08-19 audit). A deadline landing inside the floor fires one
+    // interval late; admission at boot still gates whether the radio starts.
+    const uint32_t wake_floor_seconds = CONFIG_WQN_SLEEP_TIMER_WAKE_FLOOR_SEC;
+    bool wake_floor_applied = false;
+    if (wake_floor_seconds != 0 && timer_wakeup_seconds != 0 &&
+        timer_wakeup_seconds < wake_floor_seconds) {
+        timer_wakeup_seconds = wake_floor_seconds;
+        wake_floor_applied = true;
+    }
     const bool timer_wakeup_for_display = display_wakeup_seconds != 0 &&
         (sync_wakeup_seconds == 0 || display_wakeup_seconds <= sync_wakeup_seconds);
     ESP_LOGI(kTag,
-             "deep-sleep wake plan: display_sec=%u sync_sec=%u chosen=%u source=%s",
+             "deep-sleep wake plan: display_sec=%u sync_sec=%u chosen=%u "
+             "source=%s%s",
              static_cast<unsigned>(display_wakeup_seconds),
              static_cast<unsigned>(sync_wakeup_seconds),
              static_cast<unsigned>(timer_wakeup_seconds),
              timer_wakeup_for_display ? "display"
-                 : (sync_wakeup_seconds != 0 ? "sync" : "off"));
+                 : (sync_wakeup_seconds != 0 ? "sync" : "off"),
+             wake_floor_applied ? " floor-clamped" : "");
+#if CONFIG_WQN_RTC_TIMEKEEP_ENABLE
+    // [rtc-timekeep] Persist the wall clock after every service has quiesced
+    // (shared I2C bus idle) and before wake-source assembly reprograms the
+    // PCF8563 timer. Deliberately fault-tolerant and non-rollbackable: a
+    // failed write only costs one sleep cycle of clock freshness, and a
+    // rollback that retries the sleep simply overwrites the record.
+    if (!power::timekeep::PersistSystemTimeToRtc(generation)) {
+        ESP_LOGW(kTag, "RTC time persist skipped; next boot falls back to build-time seeding");
+    }
+#endif
     const power::WakeArmResult wake =
         power::ArmWakeSources(timer_wakeup_seconds, command.deadline_us);
     if (wake.error != ESP_OK) {

@@ -109,6 +109,28 @@ menu "WQN firmware"
             Optional RTC timer wake interval. Set 0 to wake only from GPIO0,
             GPIO18, or GPIO5.
 
+    config WQN_SLEEP_TIMER_WAKE_FLOOR_SEC
+        int "Minimum deep sleep timer wake interval in seconds"
+        default 60
+        range 0 86400
+        depends on WQN_DEEP_SLEEP_ENABLE
+        help
+            Floor applied to any non-zero computed timer wake interval.
+            Sync retry/content deadlines shorter than this are folded into
+            one wake per interval instead of a boot-per-10s micro-wake loop;
+            a deadline that lands inside the floor simply fires one interval
+            late. 0 disables the floor.
+
+    config WQN_RTC_TIMEKEEP_ENABLE
+        bool "Keep wall-clock time across deep sleep via PCF8563"
+        default y
+        depends on WQN_DEEP_SLEEP_ENABLE
+        help
+            Before entering deep sleep, write the system wall clock into the
+            PCF8563 RTC; on a trusted deep-sleep resume, read it back and
+            calibrate the system clock before UI/sync consumers start. Any
+            failure degrades safely to the existing build-time seed.
+
     config WQN_AI_ENABLE
         bool "Enable WQN AI firmware modules"
         default n
