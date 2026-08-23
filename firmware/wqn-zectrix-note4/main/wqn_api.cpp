@@ -2020,6 +2020,13 @@ esp_err_t SubmitWordStudyObservationV1AtPath(
         // malformed or a server accidentally marks its 5xx envelope terminal.
         error->retryable = true;
     }
+    if (status_code == 426) {
+        // Protocol gate (X-WQN-Protocol mismatch). A proxy may answer 426
+        // without our error envelope; force the canonical code so the outbox
+        // classifier suspends instead of quarantining data.
+        error->code = "UPGRADE_REQUIRED";
+        error->retryable = false;
+    }
     if (status_code != 200 || parse_result != ESP_OK) {
         ESP_LOGW(
             kTag,
@@ -2802,6 +2809,12 @@ esp_err_t SubmitNoteStudyObservationV1AtPath(
     if (IsTransientHttpStatus(status_code)) {
         error->retryable = true;
     }
+    if (status_code == 426) {
+        // Protocol gate: force the canonical code so the outbox classifier
+        // suspends instead of quarantining data.
+        error->code = "UPGRADE_REQUIRED";
+        error->retryable = false;
+    }
     if (status_code != 200 || parse_result != ESP_OK) {
         ESP_LOGW(
             kTag,
@@ -3313,6 +3326,12 @@ esp_err_t SubmitProblemReviewObservationV1(
         body, request.metadata.request_id, observation, error);
     if (IsTransientHttpStatus(status_code)) {
         error->retryable = true;
+    }
+    if (status_code == 426) {
+        // Protocol gate: force the canonical code so the outbox classifier
+        // suspends instead of quarantining data.
+        error->code = "UPGRADE_REQUIRED";
+        error->retryable = false;
     }
     if (status_code != 200 || parse_result != ESP_OK) {
         ESP_LOGW(
