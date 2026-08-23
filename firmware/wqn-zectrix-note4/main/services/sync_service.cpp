@@ -30,7 +30,9 @@
 #include "runtime/wake_context.h"
 #include "storage.h"
 #include "note_store.h"
+#include "outbox_suspend_reason.h"
 #include "problem_store.h"
+#include "services/server_error_codes.h"
 #include "word_study_store.h"
 #include "wqn_api.h"
 
@@ -662,6 +664,9 @@ enum class WordOutboxUploadState : uint8_t {
     kPending,
     kYielded,
     kAuthenticationRequired,
+    // The server rejected the request at the protocol level (426
+    // UPGRADE_REQUIRED). Outbound polling suspends until OTA; records stay.
+    kProtocolBlocked,
     kFailed,
 };
 
@@ -676,42 +681,109 @@ enum class OutboxFailureDisposition : uint8_t {
     kAuthenticationRequired,
     kTransientTransport,
     kTransientServer,
-    kTerminalRecord,
+    // Terminal classes (audit §16.B). The first three can still make queue
+    // progress; the last two must not delete or wedge the head.
+    kTombstoneRecoverable,
+    kSequenceResolved,
+    kSessionTerminal,
+    kProtocolBlocked,
+    kProtocolIntegrity,
 };
 
+// Maps a raw failure onto the seven-class taxonomy. Transport/retryable
+// ambiguity is resolved before the code table: a damaged envelope retries
+// because the server may have consumed the idempotency key already. An
+// unrecognized non-retryable code is conservatively treated as protocol
+// integrity (park, never delete) until a firmware update teaches us better.
 constexpr OutboxFailureDisposition ClassifyOutboxFailure(
     bool authentication_required,
     bool transport_failure,
     bool server_retryable,
-    bool has_error_code)
+    wqn::services::ServerErrorClass code_class)
 {
-    if (authentication_required) {
+    using wqn::services::ServerErrorClass;
+    if (authentication_required ||
+        code_class == ServerErrorClass::kAuthRequired) {
         return OutboxFailureDisposition::kAuthenticationRequired;
     }
     if (transport_failure) {
         return OutboxFailureDisposition::kTransientTransport;
     }
-    // A missing/invalid response envelope is ambiguous: the server may have
-    // durably accepted the idempotency key before the response was damaged.
-    // Retry it; quarantine is reserved for an explicit non-retryable code.
-    if (server_retryable || !has_error_code) {
+    if (server_retryable) {
         return OutboxFailureDisposition::kTransientServer;
     }
-    return OutboxFailureDisposition::kTerminalRecord;
+    switch (code_class) {
+        case ServerErrorClass::kSequenceResolved:
+            return OutboxFailureDisposition::kSequenceResolved;
+        case ServerErrorClass::kSessionTerminal:
+            return OutboxFailureDisposition::kSessionTerminal;
+        case ServerErrorClass::kTombstoneRecoverable:
+            return OutboxFailureDisposition::kTombstoneRecoverable;
+        case ServerErrorClass::kProtocolBlocked:
+            return OutboxFailureDisposition::kProtocolBlocked;
+        case ServerErrorClass::kProtocolIntegrity:
+        case ServerErrorClass::kUnknownCode:
+            // Unrecognized non-empty terminal codes park conservatively
+            // until a firmware update teaches us the semantics.
+            return OutboxFailureDisposition::kProtocolIntegrity;
+        case ServerErrorClass::kAuthRequired:
+            return OutboxFailureDisposition::kAuthenticationRequired;
+        case ServerErrorClass::kUnrecognized:
+        case ServerErrorClass::kTransientRetry:
+            break;
+    }
+    return OutboxFailureDisposition::kTransientServer;
 }
 
 static_assert(
-    ClassifyOutboxFailure(true, false, false, true) ==
-        OutboxFailureDisposition::kAuthenticationRequired);
+    ClassifyOutboxFailure(
+        false,
+        false,
+        false,
+        wqn::services::ClassifyServerErrorCode("UNAUTHORIZED")) ==
+    OutboxFailureDisposition::kAuthenticationRequired);
 static_assert(
-    ClassifyOutboxFailure(false, true, false, false) ==
-        OutboxFailureDisposition::kTransientTransport);
+    ClassifyOutboxFailure(false, true, false,
+                          wqn::services::ServerErrorClass::kUnrecognized) ==
+    OutboxFailureDisposition::kTransientTransport);
 static_assert(
-    ClassifyOutboxFailure(false, false, false, false) ==
-        OutboxFailureDisposition::kTransientServer);
+    ClassifyOutboxFailure(false, false, true,
+                          wqn::services::ServerErrorClass::kUnrecognized) ==
+    OutboxFailureDisposition::kTransientServer);
 static_assert(
-    ClassifyOutboxFailure(false, false, false, true) ==
-        OutboxFailureDisposition::kTerminalRecord);
+    ClassifyOutboxFailure(
+        false,
+        false,
+        false,
+        wqn::services::ClassifyServerErrorCode("SEQUENCE_ALREADY_APPLIED")) ==
+    OutboxFailureDisposition::kSequenceResolved);
+static_assert(
+    ClassifyOutboxFailure(
+        false, false, false,
+        wqn::services::ClassifyServerErrorCode("SESSION_NOT_ACTIVE")) ==
+    OutboxFailureDisposition::kSessionTerminal);
+static_assert(
+    ClassifyOutboxFailure(
+        false, false, false,
+        wqn::services::ClassifyServerErrorCode("ITEM_NOT_VISIBLE")) ==
+    OutboxFailureDisposition::kTombstoneRecoverable);
+static_assert(
+    ClassifyOutboxFailure(
+        false, false, false,
+        wqn::services::ClassifyServerErrorCode("UPGRADE_REQUIRED")) ==
+    OutboxFailureDisposition::kProtocolBlocked);
+static_assert(
+    ClassifyOutboxFailure(
+        false, false, false,
+        wqn::services::ClassifyServerErrorCode("REQUEST_ID_REUSED")) ==
+    OutboxFailureDisposition::kProtocolIntegrity);
+static_assert(
+    ClassifyOutboxFailure(
+        false,
+        false,
+        false,
+        wqn::services::ClassifyServerErrorCode("SOME_FUTURE_CODE")) ==
+    OutboxFailureDisposition::kProtocolIntegrity);
 
 OutboxFailureDisposition ClassifyOutboxFailure(
     const wqn::protocol::v3::Error& error,
@@ -722,7 +794,7 @@ OutboxFailureDisposition ClassifyOutboxFailure(
         error.code == "UNAUTHORIZED",
         transport_failure,
         error.retryable || force_retryable,
-        !error.code.empty());
+        wqn::services::ClassifyServerErrorCode(error.code));
 }
 
 OutboxRetryCause RetryCauseFor(OutboxFailureDisposition disposition)
@@ -730,6 +802,25 @@ OutboxRetryCause RetryCauseFor(OutboxFailureDisposition disposition)
     return disposition == OutboxFailureDisposition::kTransientTransport
         ? OutboxRetryCause::kTransport
         : OutboxRetryCause::kServer;
+}
+
+// Picks the durable park reason recorded next to a suspended observation.
+wqn::OutboxSuspendReason SuspendReasonFor(const std::string& code)
+{
+    if (code == "REQUEST_ID_REUSED") {
+        return wqn::OutboxSuspendReason::kIdempotencyConflict;
+    }
+    if (code == "SESSION_ACTOR_MISMATCH") {
+        return wqn::OutboxSuspendReason::kActorOwnership;
+    }
+    if (code == "INVALID_STUDY_OBSERVATION" ||
+        code == "INVALID_REQUEST") {
+        return wqn::OutboxSuspendReason::kInvalidIdentity;
+    }
+    if (code == "UPGRADE_REQUIRED") {
+        return wqn::OutboxSuspendReason::kProtocolBlocked;
+    }
+    return wqn::OutboxSuspendReason::kUnknownTerminal;
 }
 
 const char* OutboxRetryCauseName(OutboxRetryCause cause)
@@ -756,8 +847,17 @@ enum class SyncRoundOutcome : uint8_t {
     kSucceeded,
     kPartial,
     kPartialNeedsFullRetry,
+    // The server rejected outbound traffic at the protocol level (426
+    // UPGRADE_REQUIRED): suspend retry polling until an OTA lands instead
+    // of burning the retry ladder against a contract we cannot satisfy.
+    kProtocolBlocked,
     kFailed,
 };
+
+// Sticky suspension latch for CLIENT_PROTOCOL_BLOCKED. RAM-resident by
+// design: an OTA reboot re-probes the server once and either clears it or
+// re-arms it with fresh information.
+bool g_outbox_protocol_suspended = false;
 
 WordOutboxUploadState g_last_word_outbox_upload_state =
     WordOutboxUploadState::kDrained;
@@ -1384,6 +1484,7 @@ wqn::services::SyncOutboxPhase PublicOutboxPhase(WordOutboxUploadState state)
             return wqn::services::SyncOutboxPhase::kPending;
         case WordOutboxUploadState::kYielded:
             return wqn::services::SyncOutboxPhase::kYielded;
+        case WordOutboxUploadState::kProtocolBlocked:
         case WordOutboxUploadState::kFailed:
         default:
             return wqn::services::SyncOutboxPhase::kBlocked;
@@ -1412,6 +1513,9 @@ void FillOutboxSnapshot(
             break;
         case WordOutboxUploadState::kAuthenticationRequired:
             detail = "authentication recovery";
+            break;
+        case WordOutboxUploadState::kProtocolBlocked:
+            detail = "firmware update required";
             break;
         case WordOutboxUploadState::kFailed:
             detail = "queue blocked";
@@ -1453,6 +1557,14 @@ bool AllOutboxesDrained()
 
 SyncRoundOutcome CurrentOutboxOutcome()
 {
+    if (g_last_word_outbox_upload_state ==
+            WordOutboxUploadState::kProtocolBlocked ||
+        g_last_note_outbox_upload_state ==
+            WordOutboxUploadState::kProtocolBlocked ||
+        g_last_problem_outbox_upload_state ==
+            WordOutboxUploadState::kProtocolBlocked) {
+        return SyncRoundOutcome::kProtocolBlocked;
+    }
     if (AllOutboxesDrained()) {
         return SyncRoundOutcome::kSucceeded;
     }
@@ -1721,10 +1833,76 @@ WordOutboxUploadState UploadPendingWordObservations(const std::string& token)
                     pending.request_id.c_str());
                 return WordOutboxUploadState::kAuthenticationRequired;
             }
-            if (disposition == OutboxFailureDisposition::kTerminalRecord) {
+            if (disposition == OutboxFailureDisposition::kProtocolBlocked) {
+                ESP_LOGE(
+                    kTag,
+                    "word outbox suspended: server requires newer firmware: request=%s",
+                    pending.request_id.c_str());
+                return WordOutboxUploadState::kProtocolBlocked;
+            }
+            if (disposition == OutboxFailureDisposition::kProtocolIntegrity) {
+                // Audit §16.D: identity-level failures (idempotency conflict,
+                // actor ownership, corrupt identity) forbid unilateral
+                // deletion -- the server never consumed this sequence, so a
+                // local drop would strand later same-session records in
+                // STUDY_SEQUENCE_GAP forever (Case B). Park durably instead.
+                ESP_LOGE(
+                    kTag,
+                    "word observation parked (%s): integrity failure forbids deletion: request=%s code=%s",
+                    wqn::OutboxSuspendReasonName(SuspendReasonFor(word_error.code)),
+                    pending.request_id.c_str(),
+                    word_error.code.c_str());
+                const esp_err_t suspend_result =
+                    wqn::SuspendPendingWordObservation(
+                        pending.request_id,
+                        SuspendReasonFor(word_error.code));
+                ResetWordOutboxRetryBackoff();
+                if (suspend_result != ESP_OK) {
+                    ESP_LOGE(
+                        kTag,
+                        "word observation park failed: request=%s error=%s",
+                        pending.request_id.c_str(),
+                        esp_err_to_name(suspend_result));
+                    ScheduleWordOutboxRetry(
+                        pending.request_id, 0, OutboxRetryCause::kLocalStorage);
+                    return WordOutboxUploadState::kPending;
+                }
+                ++processed;
+                continue;
+            }
+            if (disposition == OutboxFailureDisposition::kSequenceResolved ||
+                disposition == OutboxFailureDisposition::kSessionTerminal) {
+                // The server proved this sequence was already consumed (or
+                // its whole session is permanently gone): local quarantine
+                // is safe and restores queue progress without a tombstone
+                // round trip.
                 ESP_LOGW(
                     kTag,
-                    "terminal word observation rejected; advancing sequence before quarantine: request=%s sequence=%llu code=%s",
+                    "word observation %s; quarantining head: request=%s code=%s",
+                    disposition == OutboxFailureDisposition::kSessionTerminal
+                        ? "session terminally closed"
+                        : "sequence already resolved",
+                    pending.request_id.c_str(),
+                    word_error.code.c_str());
+                const esp_err_t resolved_quarantine_result =
+                    wqn::QuarantinePendingWordObservation(pending.request_id);
+                ResetWordOutboxRetryBackoff();
+                if (resolved_quarantine_result != ESP_OK) {
+                    ESP_LOGE(
+                        kTag,
+                        "word observation quarantine failed: request=%s error=%s",
+                        pending.request_id.c_str(),
+                        esp_err_to_name(resolved_quarantine_result));
+                    return WordOutboxUploadState::kFailed;
+                }
+                ++processed;
+                ++quarantined;
+                continue;
+            }
+            if (disposition == OutboxFailureDisposition::kTombstoneRecoverable) {
+                ESP_LOGW(
+                    kTag,
+                    "terminal word observation rejected; advancing sequence via tombstone: request=%s sequence=%llu code=%s",
                     pending.request_id.c_str(),
                     static_cast<unsigned long long>(pending.sequence),
                     word_error.code.c_str());
@@ -1744,11 +1922,64 @@ WordOutboxUploadState UploadPendingWordObservations(const std::string& token)
                         &skip_response,
                         &skip_error,
                         &skip_transport_failure);
+                const OutboxFailureDisposition skip_disposition =
+                    ClassifyOutboxFailure(skip_error, skip_transport_failure);
                 const bool sequence_consumed =
                     skip_result == ESP_OK ||
-                    skip_error.code == "SEQUENCE_ALREADY_APPLIED" ||
-                    skip_error.code == "SESSION_NOT_ACTIVE";
+                    skip_disposition ==
+                        OutboxFailureDisposition::kSequenceResolved ||
+                    skip_disposition ==
+                        OutboxFailureDisposition::kSessionTerminal;
                 if (!sequence_consumed) {
+                    if (skip_disposition ==
+                        OutboxFailureDisposition::kAuthenticationRequired) {
+                        ResetWordOutboxRetryBackoff();
+                        return WordOutboxUploadState::kAuthenticationRequired;
+                    }
+                    if (skip_disposition ==
+                        OutboxFailureDisposition::kProtocolBlocked) {
+                        ESP_LOGE(
+                            kTag,
+                            "word outbox suspended: server requires newer firmware: request=%s",
+                            pending.request_id.c_str());
+                        return WordOutboxUploadState::kProtocolBlocked;
+                    }
+                    if (skip_disposition ==
+                        OutboxFailureDisposition::kProtocolIntegrity) {
+                        // [gap-1] The tombstone itself was rejected at the
+                        // identity level: the sequence can never be consumed
+                        // by this device. Park the head durably so the queue
+                        // advances without deleting evidence.
+                        ESP_LOGE(
+                            kTag,
+                            "word observation parked (%s): tombstone rejected at identity level: request=%s code=%s",
+                            wqn::OutboxSuspendReasonName(
+                                SuspendReasonFor(skip_error.code)),
+                            pending.request_id.c_str(),
+                            skip_error.code.c_str());
+                        const esp_err_t suspend_result =
+                            wqn::SuspendPendingWordObservation(
+                                pending.request_id,
+                                SuspendReasonFor(skip_error.code));
+                        ResetWordOutboxRetryBackoff();
+                        if (suspend_result != ESP_OK) {
+                            ESP_LOGE(
+                                kTag,
+                                "word observation park failed: request=%s error=%s",
+                                pending.request_id.c_str(),
+                                esp_err_to_name(suspend_result));
+                            ScheduleWordOutboxRetry(
+                                pending.request_id,
+                                0,
+                                OutboxRetryCause::kLocalStorage);
+                            return WordOutboxUploadState::kPending;
+                        }
+                        ++processed;
+                        continue;
+                    }
+                    // Transport/server backoff, or a tombstone-recoverable
+                    // code on the tombstone endpoint itself (post-relaxation
+                    // drift): bounded exponential retry keeps attempting.
                     ESP_LOGW(
                         kTag,
                         "word observation skip deferred: request=%s sequence=%llu code=%s error=%s",
@@ -1756,53 +1987,11 @@ WordOutboxUploadState UploadPendingWordObservations(const std::string& token)
                         static_cast<unsigned long long>(pending.sequence),
                         skip_error.code.empty() ? "TRANSPORT" : skip_error.code.c_str(),
                         esp_err_to_name(skip_result));
-                    const OutboxFailureDisposition skip_disposition =
-                        ClassifyOutboxFailure(
-                            skip_error,
-                            skip_transport_failure,
-                            skip_error.code == "SEQUENCE_GAP");
-                    if (skip_disposition ==
-                        OutboxFailureDisposition::kAuthenticationRequired) {
-                        ResetWordOutboxRetryBackoff();
-                        return WordOutboxUploadState::kAuthenticationRequired;
-                    }
-                    if (skip_disposition !=
-                        OutboxFailureDisposition::kTerminalRecord) {
-                        ScheduleWordOutboxRetry(
-                            pending.request_id,
-                            skip_error.retryable ? skip_error.retry_after_ms : 0,
-                            RetryCauseFor(skip_disposition));
-                        return WordOutboxUploadState::kPending;
-                    }
-                    // [gap-1] A terminal skip rejection (identity-level codes:
-                    // STUDY_REQUEST_ID_REUSED / SESSION_ACTOR_MISMATCH /
-                    // INVALID_STUDY_OBSERVATION) can never succeed on retry,
-                    // so leaving the head stranded blocks every later record
-                    // forever. Quarantine locally and let the queue advance.
-                    // Sequences are session-scoped server-side and the skip
-                    // tombstone contract (study_skip_tombstone_relax_v1)
-                    // guarantees identity fields are the only strict part, so
-                    // a locally dropped record cannot wedge other sessions.
-                    ESP_LOGE(
-                        kTag,
-                        "word observation skip failed terminally; quarantining head to restore queue progress: request=%s code=%s",
-                        pending.request_id.c_str(),
-                        skip_error.code.c_str());
-                    const esp_err_t forced_quarantine_result =
-                        wqn::QuarantinePendingWordObservation(
-                            pending.request_id);
-                    ResetWordOutboxRetryBackoff();
-                    if (forced_quarantine_result != ESP_OK) {
-                        ESP_LOGE(
-                            kTag,
-                            "word observation forced quarantine failed: request=%s error=%s",
-                            pending.request_id.c_str(),
-                            esp_err_to_name(forced_quarantine_result));
-                        return WordOutboxUploadState::kFailed;
-                    }
-                    ++processed;
-                    ++quarantined;
-                    continue;
+                    ScheduleWordOutboxRetry(
+                        pending.request_id,
+                        skip_error.retryable ? skip_error.retry_after_ms : 0,
+                        RetryCauseFor(skip_disposition));
+                    return WordOutboxUploadState::kPending;
                 }
                 const esp_err_t quarantine_result =
                     wqn::QuarantinePendingWordObservation(pending.request_id);
@@ -1940,7 +2129,54 @@ WordOutboxUploadState UploadPendingProblemObservations(const std::string& token)
                     pending.request_id.c_str());
                 return WordOutboxUploadState::kAuthenticationRequired;
             }
-            if (disposition == OutboxFailureDisposition::kTerminalRecord) {
+            if (disposition == OutboxFailureDisposition::kProtocolBlocked) {
+                ESP_LOGE(
+                    kTag,
+                    "problem outbox suspended: server requires newer firmware: request=%s",
+                    pending.request_id.c_str());
+                return WordOutboxUploadState::kProtocolBlocked;
+            }
+            if (disposition == OutboxFailureDisposition::kProtocolIntegrity) {
+                // Verdicts have no session sequence, so a park here cannot
+                // wedge successors -- but an idempotency conflict still
+                // forbids unilateral deletion (audit §16.D): the server may
+                // hold a different payload under this key.
+                ESP_LOGE(
+                    kTag,
+                    "problem verdict parked (%s): integrity failure forbids deletion: request=%s code=%s",
+                    wqn::OutboxSuspendReasonName(SuspendReasonFor(problem_error.code)),
+                    pending.request_id.c_str(),
+                    problem_error.code.c_str());
+                const esp_err_t suspend_result =
+                    wqn::SuspendPendingProblemObservation(
+                        pending.request_id,
+                        SuspendReasonFor(problem_error.code));
+                ResetProblemOutboxRetryBackoff();
+                if (suspend_result != ESP_OK) {
+                    ESP_LOGE(
+                        kTag,
+                        "problem verdict park failed: request=%s error=%s",
+                        pending.request_id.c_str(),
+                        esp_err_to_name(suspend_result));
+                    ScheduleProblemOutboxRetry(
+                        pending.request_id, 0, OutboxRetryCause::kLocalStorage);
+                    return WordOutboxUploadState::kPending;
+                }
+                ++processed;
+                continue;
+            }
+            if (disposition ==
+                    OutboxFailureDisposition::kTombstoneRecoverable ||
+                disposition ==
+                    OutboxFailureDisposition::kSequenceResolved ||
+                disposition ==
+                    OutboxFailureDisposition::kSessionTerminal) {
+                // Standalone idempotent observation: business-level terminal
+                // rejections (not visible / malformed / already applied)
+                // cannot wedge any successor, so quarantine restores queue
+                // progress without losing the forensic copy. Unrecognized
+                // future terminal codes classify as protocol integrity and
+                // park above instead.
                 ESP_LOGW(
                     kTag,
                     "terminal problem verdict rejected; quarantining: request=%s code=%s",
@@ -2080,10 +2316,68 @@ WordOutboxUploadState UploadPendingNoteObservations(const std::string& token)
                     pending.request_id.c_str());
                 return WordOutboxUploadState::kAuthenticationRequired;
             }
-            if (disposition == OutboxFailureDisposition::kTerminalRecord) {
+            if (disposition == OutboxFailureDisposition::kProtocolBlocked) {
+                ESP_LOGE(
+                    kTag,
+                    "note outbox suspended: server requires newer firmware: request=%s",
+                    pending.request_id.c_str());
+                return WordOutboxUploadState::kProtocolBlocked;
+            }
+            if (disposition == OutboxFailureDisposition::kProtocolIntegrity) {
+                // Audit §16.D / Case B mirror of the word domain.
+                ESP_LOGE(
+                    kTag,
+                    "note observation parked (%s): integrity failure forbids deletion: request=%s code=%s",
+                    wqn::OutboxSuspendReasonName(SuspendReasonFor(note_error.code)),
+                    pending.request_id.c_str(),
+                    note_error.code.c_str());
+                const esp_err_t suspend_result =
+                    wqn::SuspendPendingNoteObservation(
+                        pending.request_id,
+                        SuspendReasonFor(note_error.code));
+                ResetNoteOutboxRetryBackoff();
+                if (suspend_result != ESP_OK) {
+                    ESP_LOGE(
+                        kTag,
+                        "note observation park failed: request=%s error=%s",
+                        pending.request_id.c_str(),
+                        esp_err_to_name(suspend_result));
+                    ScheduleNoteOutboxRetry(
+                        pending.request_id, 0, OutboxRetryCause::kLocalStorage);
+                    return WordOutboxUploadState::kPending;
+                }
+                ++processed;
+                continue;
+            }
+            if (disposition == OutboxFailureDisposition::kSequenceResolved ||
+                disposition == OutboxFailureDisposition::kSessionTerminal) {
                 ESP_LOGW(
                     kTag,
-                    "terminal note observation rejected; advancing sequence before quarantine: request=%s sequence=%llu code=%s",
+                    "note observation %s; quarantining head: request=%s code=%s",
+                    disposition == OutboxFailureDisposition::kSessionTerminal
+                        ? "session terminally closed"
+                        : "sequence already resolved",
+                    pending.request_id.c_str(),
+                    note_error.code.c_str());
+                const esp_err_t resolved_quarantine_result =
+                    wqn::QuarantinePendingNoteObservation(pending.request_id);
+                ResetNoteOutboxRetryBackoff();
+                if (resolved_quarantine_result != ESP_OK) {
+                    ESP_LOGE(
+                        kTag,
+                        "note observation quarantine failed: request=%s error=%s",
+                        pending.request_id.c_str(),
+                        esp_err_to_name(resolved_quarantine_result));
+                    return WordOutboxUploadState::kFailed;
+                }
+                ++processed;
+                ++quarantined;
+                continue;
+            }
+            if (disposition == OutboxFailureDisposition::kTombstoneRecoverable) {
+                ESP_LOGW(
+                    kTag,
+                    "terminal note observation rejected; advancing sequence via tombstone: request=%s sequence=%llu code=%s",
                     pending.request_id.c_str(),
                     static_cast<unsigned long long>(pending.sequence),
                     note_error.code.c_str());
@@ -2102,11 +2396,61 @@ WordOutboxUploadState UploadPendingNoteObservations(const std::string& token)
                         &skip_response,
                         &skip_error,
                         &skip_transport_failure);
+                const OutboxFailureDisposition skip_disposition =
+                    ClassifyOutboxFailure(skip_error, skip_transport_failure);
                 const bool sequence_consumed =
                     skip_result == ESP_OK ||
-                    skip_error.code == "SEQUENCE_ALREADY_APPLIED" ||
-                    skip_error.code == "SESSION_NOT_ACTIVE";
+                    skip_disposition ==
+                        OutboxFailureDisposition::kSequenceResolved ||
+                    skip_disposition ==
+                        OutboxFailureDisposition::kSessionTerminal;
                 if (!sequence_consumed) {
+                    if (skip_disposition ==
+                        OutboxFailureDisposition::kAuthenticationRequired) {
+                        ResetNoteOutboxRetryBackoff();
+                        return WordOutboxUploadState::kAuthenticationRequired;
+                    }
+                    if (skip_disposition ==
+                        OutboxFailureDisposition::kProtocolBlocked) {
+                        ESP_LOGE(
+                            kTag,
+                            "note outbox suspended: server requires newer firmware: request=%s",
+                            pending.request_id.c_str());
+                        return WordOutboxUploadState::kProtocolBlocked;
+                    }
+                    if (skip_disposition ==
+                        OutboxFailureDisposition::kProtocolIntegrity) {
+                        // [gap-1] Tombstone rejected at identity level: park
+                        // the head durably instead of deleting evidence.
+                        ESP_LOGE(
+                            kTag,
+                            "note observation parked (%s): tombstone rejected at identity level: request=%s code=%s",
+                            wqn::OutboxSuspendReasonName(
+                                SuspendReasonFor(skip_error.code)),
+                            pending.request_id.c_str(),
+                            skip_error.code.c_str());
+                        const esp_err_t suspend_result =
+                            wqn::SuspendPendingNoteObservation(
+                                pending.request_id,
+                                SuspendReasonFor(skip_error.code));
+                        ResetNoteOutboxRetryBackoff();
+                        if (suspend_result != ESP_OK) {
+                            ESP_LOGE(
+                                kTag,
+                                "note observation park failed: request=%s error=%s",
+                                pending.request_id.c_str(),
+                                esp_err_to_name(suspend_result));
+                            ScheduleNoteOutboxRetry(
+                                pending.request_id,
+                                0,
+                                OutboxRetryCause::kLocalStorage);
+                            return WordOutboxUploadState::kPending;
+                        }
+                        ++processed;
+                        continue;
+                    }
+                    // Transport/server backoff or post-relaxation drift on
+                    // the tombstone endpoint: bounded retry.
                     ESP_LOGW(
                         kTag,
                         "note observation skip deferred: request=%s sequence=%llu code=%s error=%s",
@@ -2114,48 +2458,11 @@ WordOutboxUploadState UploadPendingNoteObservations(const std::string& token)
                         static_cast<unsigned long long>(pending.sequence),
                         skip_error.code.empty() ? "TRANSPORT" : skip_error.code.c_str(),
                         esp_err_to_name(skip_result));
-                    const OutboxFailureDisposition skip_disposition =
-                        ClassifyOutboxFailure(
-                            skip_error,
-                            skip_transport_failure,
-                            skip_error.code == "SEQUENCE_GAP");
-                    if (skip_disposition ==
-                        OutboxFailureDisposition::kAuthenticationRequired) {
-                        ResetNoteOutboxRetryBackoff();
-                        return WordOutboxUploadState::kAuthenticationRequired;
-                    }
-                    if (skip_disposition !=
-                        OutboxFailureDisposition::kTerminalRecord) {
-                        ScheduleNoteOutboxRetry(
-                            pending.request_id,
-                            skip_error.retryable ? skip_error.retry_after_ms : 0,
-                            RetryCauseFor(skip_disposition));
-                        return WordOutboxUploadState::kPending;
-                    }
-                    // [gap-1] Mirror of the word-domain forced quarantine: a
-                    // terminal skip rejection is unfixable by retry, so
-                    // quarantine the head and restore queue progress instead
-                    // of stranding every later note record behind it.
-                    ESP_LOGE(
-                        kTag,
-                        "note observation skip failed terminally; quarantining head to restore queue progress: request=%s code=%s",
-                        pending.request_id.c_str(),
-                        skip_error.code.c_str());
-                    const esp_err_t forced_quarantine_result =
-                        wqn::QuarantinePendingNoteObservation(
-                            pending.request_id);
-                    ResetNoteOutboxRetryBackoff();
-                    if (forced_quarantine_result != ESP_OK) {
-                        ESP_LOGE(
-                            kTag,
-                            "note observation forced quarantine failed: request=%s error=%s",
-                            pending.request_id.c_str(),
-                            esp_err_to_name(forced_quarantine_result));
-                        return WordOutboxUploadState::kFailed;
-                    }
-                    ++processed;
-                    ++quarantined;
-                    continue;
+                    ScheduleNoteOutboxRetry(
+                        pending.request_id,
+                        skip_error.retryable ? skip_error.retry_after_ms : 0,
+                        RetryCauseFor(skip_disposition));
+                    return WordOutboxUploadState::kPending;
                 }
                 const esp_err_t quarantine_result =
                     wqn::QuarantinePendingNoteObservation(pending.request_id);
@@ -2368,6 +2675,11 @@ TickType_t SchedulerWaitDelay()
     if (g_full_sync_reasons.load(std::memory_order_acquire) != 0) {
         return 0;
     }
+    // Protocol suspension parks the whole scheduler: nothing time-based may
+    // wake it. Only a direct task notification (manual sync request) does.
+    if (g_outbox_protocol_suspended) {
+        return portMAX_DELAY;
+    }
     const TickType_t retry_delay = FullSyncRetryWaitDelay();
     const TickType_t full_delay = retry_delay != portMAX_DELAY
         ? retry_delay
@@ -2459,18 +2771,30 @@ void SyncServiceTask(void*)
         // outbox requests.
         const uint32_t full_reasons =
             g_full_sync_reasons.exchange(0, std::memory_order_acq_rel);
-        const bool retry_due = FullSyncRetryDue();
+        // CLIENT_PROTOCOL_BLOCKED latch: while suspended (and no explicit
+        // manual/boot reason says otherwise), retry/periodic/outbox dispatch
+        // is suppressed entirely -- probing a contract the firmware cannot
+        // satisfy just burns the radio. The flag lives in RAM, so an OTA
+        // reboot naturally re-probes once.
+        bool protocol_suppressed = g_outbox_protocol_suspended;
+        if (protocol_suppressed && full_reasons != 0) {
+            // An explicit user/boot reason overrides the latch once; if the
+            // server still answers 426 the round re-arms it below.
+            protocol_suppressed = false;
+        }
+        const bool retry_due = !protocol_suppressed && FullSyncRetryDue();
         const uint32_t interval_minutes =
             g_auto_sync_interval_minutes.load(std::memory_order_acquire);
-        const bool periodic_due = !retry_due &&
+        const bool periodic_due = !protocol_suppressed && !retry_due &&
             FullSyncRetryWaitDelay() == portMAX_DELAY &&
             PeriodicScheduleDue(interval_minutes);
-        const bool full_requested = full_reasons != 0 || retry_due || periodic_due;
+        bool full_requested =
+            full_reasons != 0 || retry_due || periodic_due;
         if (full_requested) {
             ClearFullSyncRetry();
         }
         bool word_outbox_requested = false;
-        if (full_requested || OutboxWaitDelay() == 0) {
+        if (!protocol_suppressed && (full_requested || OutboxWaitDelay() == 0)) {
             // Consume the urgency payload before the release-published ready
             // flag. If a producer lands between these exchanges, its ready
             // flag is either consumed with urgency left armed for one harmless
@@ -2519,7 +2843,22 @@ void SyncServiceTask(void*)
         PublishOutboxSnapshots();
 #endif
         const bool has_token_after_round = wqn::services::HasUsableStoredToken();
-        if (outcome == SyncRoundOutcome::kSucceeded) {
+        if (outcome == SyncRoundOutcome::kProtocolBlocked) {
+            // CLIENT_PROTOCOL_BLOCKED: latch suspension. No retry ladder,
+            // no periodic re-arm, no outbox self-wake -- only an explicit
+            // manual/boot reason may re-probe the server (and fail the same
+            // way until an OTA lands). Records stay parked in place.
+            g_outbox_protocol_suspended = true;
+            SetSyncStatus("protocol-blocked");
+            PublishSyncEvent(
+                wqn::services::SyncEventStatus::kFailed,
+                finished_ms,
+                outbox_only
+                    ? wqn::services::SyncEventScope::kWordOutbox
+                    : wqn::services::SyncEventScope::kFull);
+            ClearFullSyncRetry();
+        } else if (outcome == SyncRoundOutcome::kSucceeded) {
+            g_outbox_protocol_suspended = false;
             SetSyncStatus("success");
             PublishSyncEvent(
                 wqn::services::SyncEventStatus::kSucceeded,
@@ -2529,6 +2868,7 @@ void SyncServiceTask(void*)
                     : wqn::services::SyncEventScope::kFull);
         } else if (outcome == SyncRoundOutcome::kPartial ||
                    outcome == SyncRoundOutcome::kPartialNeedsFullRetry) {
+            g_outbox_protocol_suspended = false;
             SetSyncStatus("partial");
             PublishSyncEvent(
                 wqn::services::SyncEventStatus::kPartial,
@@ -2537,6 +2877,7 @@ void SyncServiceTask(void*)
                     ? wqn::services::SyncEventScope::kWordOutbox
                     : wqn::services::SyncEventScope::kFull);
         } else {
+            g_outbox_protocol_suspended = false;
             SetSyncStatus(has_token_after_round ? "failed" : "waiting-pair");
             PublishSyncEvent(
                 has_token_after_round
@@ -2553,7 +2894,7 @@ void SyncServiceTask(void*)
                 ClearFullSyncRetry();
                 ScheduleNextPeriodicSync(
                     g_auto_sync_interval_minutes.load(std::memory_order_acquire));
-            } else {
+            } else if (outcome != SyncRoundOutcome::kProtocolBlocked) {
                 ScheduleFullSyncRetry(
                     FullSyncFailureRetryMs(has_token_after_round));
             }
@@ -2564,7 +2905,13 @@ void SyncServiceTask(void*)
             ScheduleFullSyncRetry(FullSyncFailureRetryMs(has_token_after_round));
         }
 #if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
-        if (g_last_word_outbox_upload_state == WordOutboxUploadState::kYielded ||
+        if (g_outbox_protocol_suspended &&
+            !g_full_sync_reasons.load(std::memory_order_acquire)) {
+            // Suppressed: neither the retry deadline nor the outbox flag may
+            // wake the task while protocol-blocked. A manual/boot full-sync
+            // reason still dispatches (checked at the loop head).
+        } else if (
+            g_last_word_outbox_upload_state == WordOutboxUploadState::kYielded ||
             g_last_note_outbox_upload_state == WordOutboxUploadState::kYielded ||
             g_last_problem_outbox_upload_state == WordOutboxUploadState::kYielded) {
             // Do not turn a user-induced yield into the old 100 ms upload
