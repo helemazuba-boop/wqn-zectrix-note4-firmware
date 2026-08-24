@@ -25,6 +25,7 @@
 #include "services/sync_service.h"
 #include "pcf8563.h"
 #include "power/rtc_timekeep.h"
+#include "power/rtc_timekeep.h"
 #include "power/sleep_protocol.h"
 #include "power/wake_controller.h"
 #include "runtime/sleep_coordinator.h"
@@ -1046,6 +1047,16 @@ static void EnterDeepSleepIfEnabled(bool enable_timer_wakeup)
                  : (sync_wakeup_seconds != 0 ? "sync" : "off")),
              wake_floor_applied ? " floor-clamped" : "",
              sync_wake_escalated ? "+unattended-escalated" : "");
+#if CONFIG_WQN_RTC_TIMEKEEP_ENABLE
+    // [rtc-timekeep] Persist the wall clock after every service has quiesced
+    // (shared I2C bus idle) and before wake-source assembly reprograms the
+    // PCF8563 timer. Deliberately fault-tolerant and non-rollbackable: a
+    // failed write only costs one sleep cycle of clock freshness, and a
+    // rollback that retries the sleep simply overwrites the record.
+    if (!power::timekeep::PersistSystemTimeToRtc(generation)) {
+        ESP_LOGW(kTag, "RTC time persist skipped; next boot falls back to build-time seeding");
+    }
+#endif
 #if CONFIG_WQN_RTC_TIMEKEEP_ENABLE
     // [rtc-timekeep] Persist the wall clock after every service has quiesced
     // (shared I2C bus idle) and before wake-source assembly reprograms the

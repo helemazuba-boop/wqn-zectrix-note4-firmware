@@ -18,10 +18,12 @@
 #include "freertos/task.h"
 #include "services/sync_service.h"
 #include "power_manager.h"
+#include "power/rtc_timekeep.h"
 #include "power/wake_controller.h"
 #include "runtime/sleep_coordinator.h"
 #include "runtime/storage_schema.h"
 #include "runtime/wake_context.h"
+#include "sdkconfig.h"
 #include "services/audio_service.h"
 #include "services/connectivity_service.h"
 #include "storage.h"
@@ -100,6 +102,15 @@ extern "C" void app_main(void)
         wqn::kNote4I2cScl,
         wqn::kNote4I2cClockHz));
     wqn::power::CaptureWakeContext();
+#if CONFIG_WQN_RTC_TIMEKEEP_ENABLE
+    // [rtc-timekeep] Earliest safe wall-clock calibration point: the shared
+    // I2C bus and the PCF8563 are up, and nothing downstream (sync deadlines,
+    // outbox stamps, retained timer math, UI clock seeding, HTTPS clock
+    // gating) has read the system time yet. When this restores a trusted RTC
+    // value, SeedClockFromBuildTimeIfNeeded() later becomes a no-op because
+    // its reasonableness check passes.
+    wqn::power::timekeep::RestoreSystemTimeFromRtc();
+#endif
     wqn::LogWakeupCause();
     wqn::PrintBootDiagnostics();
 

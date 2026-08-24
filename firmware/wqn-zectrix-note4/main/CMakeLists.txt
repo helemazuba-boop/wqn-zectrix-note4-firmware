@@ -13,6 +13,7 @@ idf_component_register(
         "diagnostics.cpp"
         "i2c_bus_lock.cpp"
         "power_manager.cpp"
+        "power/rtc_timekeep.cpp"
         "power/wake_controller.cpp"
         "pcf8563.cpp"
         "provision_manager.cpp"

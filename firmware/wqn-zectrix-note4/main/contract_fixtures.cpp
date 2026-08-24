@@ -9,6 +9,7 @@
 #include "device_protocol/word_study.h"
 #include "esp_log.h"
 #include "note_app.h"
+#include "power/rtc_timekeep.h"
 #include "problem_app.h"
 #include "problem_pack.h"
 #include "text_render.h"
@@ -1425,6 +1426,80 @@ bool CheckMarkdownLayout()
            Require(ai_width_ok, "markdown AI width layout and count agree");
 }
 
+// Pure UTC calendar <-> epoch conversions behind the PCF8563 timekeeping
+// bridge. Injected values only; no RTC hardware is touched here.
+bool CheckRtcTimekeepConversions()
+{
+    using wqn::power::timekeep::CalendarFromUnixSeconds;
+    using wqn::power::timekeep::RtcCalendar;
+    using wqn::power::timekeep::UnixSecondsFromCalendar;
+
+    // Known anchor: 2024-01-01T00:00:00Z, the shared "reasonable clock" floor.
+    RtcCalendar anchor;
+    const bool anchor_ok =
+        CalendarFromUnixSeconds(1704067200, &anchor) &&
+        anchor.year == 124 && anchor.month == 0 && anchor.day == 1 &&
+        anchor.hour == 0 && anchor.min == 0 && anchor.sec == 0 &&
+        anchor.weekday == 1;  // Monday
+
+    // Leap day: 2024-01-01 was a Monday and January has 31 days, so
+    // 2024-02-29 fell on a Thursday (index 4).
+    int64_t leap_seconds = -1;
+    RtcCalendar leap;
+    const bool leap_ok =
+        UnixSecondsFromCalendar(RtcCalendar{124, 1, 29, 12, 34, 56, 4},
+                                &leap_seconds) &&
+        CalendarFromUnixSeconds(leap_seconds, &leap) &&
+        leap.year == 124 && leap.month == 1 && leap.day == 29 &&
+        leap.hour == 12 && leap.min == 34 && leap.sec == 56 && leap.weekday == 4;
+
+    // Century window: 2099-12-31T23:59:59Z is representable; 2100-01-01 is not.
+    int64_t last_second = 0;
+    const bool upper_ok =
+        UnixSecondsFromCalendar(RtcCalendar{199, 11, 31, 23, 59, 59, 5},
+                                &last_second) &&
+        last_second == 4102444799;
+    RtcCalendar beyond;
+    const bool beyond_rejected = !CalendarFromUnixSeconds(4102444800, &beyond);
+
+    // Round-trip identity across the representable range.
+    constexpr int64_t kProbeTimes[] = {
+        946684800,   // 2000-01-01T00:00:00Z
+        951782400,   // 2000-02-28T00:00:00Z
+        1704067200,
+        2051222400,
+        4102444799,  // last representable second
+    };
+    bool round_trip_ok = true;
+    for (const int64_t probe : kProbeTimes) {
+        RtcCalendar forward;
+        int64_t back = -1;
+        if (!CalendarFromUnixSeconds(probe, &forward) ||
+            !UnixSecondsFromCalendar(forward, &back) ||
+            back != probe) {
+            round_trip_ok = false;
+            break;
+        }
+    }
+
+    // Register-level range validation mirrors Pcf8563WriteTime rejections.
+    const bool range_ok =
+        !UnixSecondsFromCalendar(RtcCalendar{99, 0, 1, 0, 0, 0, 0}, &last_second) &&
+        !UnixSecondsFromCalendar(RtcCalendar{200, 0, 1, 0, 0, 0, 0}, &last_second) &&
+        !UnixSecondsFromCalendar(RtcCalendar{124, 12, 1, 0, 0, 0, 0}, &last_second) &&
+        !UnixSecondsFromCalendar(RtcCalendar{124, 0, 0, 0, 0, 0, 0}, &last_second) &&
+        !UnixSecondsFromCalendar(RtcCalendar{124, 0, 1, 24, 0, 0, 0}, &last_second) &&
+        !UnixSecondsFromCalendar(RtcCalendar{124, 0, 1, 0, 60, 0, 0}, &last_second) &&
+        !UnixSecondsFromCalendar(RtcCalendar{124, 0, 1, 0, 0, 60, 0}, &last_second) &&
+        !UnixSecondsFromCalendar(RtcCalendar{124, 0, 1, 0, 0, 0, 7}, &last_second);
+
+    return Require(anchor_ok, "rtc timekeep 2024-01-01 anchor") &&
+           Require(leap_ok, "rtc timekeep leap-day round trip") &&
+           Require(upper_ok && beyond_rejected, "rtc timekeep century window") &&
+           Require(round_trip_ok, "rtc timekeep round trip identity") &&
+           Require(range_ok, "rtc timekeep register range rejection");
+}
+
 }  // namespace
 
 namespace wqn {
@@ -1446,6 +1521,7 @@ bool RunContractFixtureSelfTest()
         CheckProblemStudyV1Contract() &&
         CheckAiStreamHttpFailures() &&
         CheckMarkdownLayout() &&
+        CheckRtcTimekeepConversions() &&
         RunTimeAppStateSelfTest() &&
         RunWordPageStateSelfTest() &&
         RunNotePageStateSelfTest() &&

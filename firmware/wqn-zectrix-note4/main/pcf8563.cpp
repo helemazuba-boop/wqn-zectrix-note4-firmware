@@ -14,9 +14,11 @@ namespace {
 
 constexpr char kTag[] = "wqn_pcf8563";
 
+constexpr uint8_t kControlStatus1Reg = 0x00;
 constexpr uint8_t kControlStatus2Reg = 0x01;
 constexpr uint8_t kTimerControlReg = 0x0E;
 constexpr uint8_t kTimerValueReg = 0x0F;
+constexpr uint8_t kStopBit = 0x20;
 constexpr uint8_t kTimerEnable = 0x80;
 constexpr uint8_t kTimerClock1Hz = 0x02;
 constexpr uint8_t kAlarmFlag = 0x08;
@@ -30,6 +32,13 @@ bool g_initialized = false;
 int DecodeBcd(uint8_t bcd)
 {
     return ((bcd >> 4) & 0x0F) * 10 + (bcd & 0x0F);
+}
+
+uint8_t EncodeBcd(int value)
+{
+    const int tens = value / 10;
+    const int ones = value % 10;
+    return static_cast<uint8_t>((tens << 4) | ones);
 }
 
 esp_err_t I2cWriteReg(uint8_t reg, uint8_t data)
@@ -108,6 +117,84 @@ bool Pcf8563ReadTime(int* year, int* month, int* day, int* hour, int* min, int* 
     if (month != nullptr) *month = DecodeBcd(regs[5] & 0x1F) - 1;
     if (year != nullptr) *year = DecodeBcd(regs[6]) + 100;
 
+    return true;
+}
+
+bool Pcf8563WriteTime(int year, int month, int day, int hour, int min,
+                      int sec, int weekday)
+{
+    if (!g_initialized) {
+        return false;
+    }
+    if (year < 100 || year > 199 || month < 0 || month > 11 ||
+        day < 1 || day > 31 || hour < 0 || hour > 23 ||
+        min < 0 || min > 59 || sec < 0 || sec > 59 ||
+        weekday < 0 || weekday > 6) {
+        ESP_LOGW(kTag,
+                 "rejecting out-of-range RTC write: year=%d month=%d day=%d "
+                 "hour=%d min=%d sec=%d wday=%d",
+                 year, month, day, hour, min, sec, weekday);
+        return false;
+    }
+
+    // Register payload for the burst starting at 0x02. Writing seconds with
+    // bit7 = 0 clears the VL integrity flag; the month byte keeps the century
+    // bit low so the stored year stays within 2000-2099.
+    const uint8_t time_regs[7] = {
+        EncodeBcd(sec),                          // 02 seconds, VL = 0
+        EncodeBcd(min),                          // 03 minutes
+        EncodeBcd(hour),                         // 04 hours, 24h mode
+        EncodeBcd(day),                          // 05 day of month
+        EncodeBcd(weekday),                      // 06 weekday, 0 = Sunday
+        EncodeBcd(month + 1),                    // 07 month, century = 0
+        EncodeBcd(year % 100),                   // 08 year
+    };
+
+    // One bus-lock hold covers STOP -> burst -> release so an audio transaction
+    // cannot interleave while the prescaler is halted.
+    ScopedI2cBusLock bus_lock("pcf8563_settime");
+    if (!bus_lock.locked()) {
+        return false;
+    }
+
+    uint8_t stop_on[2] = {kControlStatus1Reg, kStopBit};
+    esp_err_t err = i2c_master_transmit(g_dev, stop_on, sizeof(stop_on),
+                                        pdMS_TO_TICKS(100));
+    if (err != ESP_OK) {
+        ESP_LOGW(kTag, "RTC STOP set failed: %s", esp_err_to_name(err));
+        return false;
+    }
+
+    uint8_t burst[8] = {0x02};
+    std::memcpy(&burst[1], time_regs, sizeof(time_regs));
+    err = i2c_master_transmit(g_dev, burst, sizeof(burst), pdMS_TO_TICKS(100));
+    if (err != ESP_OK) {
+        ESP_LOGW(kTag, "RTC time burst write failed: %s", esp_err_to_name(err));
+        // Release STOP even on failure so the clock chain cannot stay frozen.
+        uint8_t stop_off[2] = {kControlStatus1Reg, 0x00};
+        i2c_master_transmit(g_dev, stop_off, sizeof(stop_off), pdMS_TO_TICKS(100));
+        return false;
+    }
+
+    uint8_t stop_off[2] = {kControlStatus1Reg, 0x00};
+    err = i2c_master_transmit(g_dev, stop_off, sizeof(stop_off), pdMS_TO_TICKS(100));
+    if (err != ESP_OK) {
+        ESP_LOGW(kTag, "RTC STOP release failed: %s", esp_err_to_name(err));
+        return false;
+    }
+
+    uint8_t readback[7] = {};
+    err = i2c_master_transmit_receive(g_dev, &burst[0], 1, readback,
+                                      sizeof(readback), pdMS_TO_TICKS(100));
+    if (err != ESP_OK || std::memcmp(readback, time_regs, sizeof(time_regs)) != 0) {
+        ESP_LOGW(kTag, "RTC write verify failed: err=%s regs=%02x%02x%02x%02x%02x%02x%02x",
+                 esp_err_to_name(err),
+                 readback[0], readback[1], readback[2],
+                 readback[3], readback[4], readback[5], readback[6]);
+        return false;
+    }
+
+    ESP_LOGI(kTag, "PCF8563 time written and verified");
     return true;
 }
 

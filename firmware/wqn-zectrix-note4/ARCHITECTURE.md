@@ -43,6 +43,7 @@ Features also remain in `main` until their interfaces are equally stable.
 | EPD framebuffer, SPI, BUSY, GPIO6 | `DisplayService` | drawing API, `DisplayIntent`, `DisplayResult`, prepare/rollback |
 | Deep sleep and global sleep generation | `PowerCoordinator` | `SleepLease`, activity notification |
 | Wake-source assembly and PCF8563 flag clearing | `WakeController` | called only during coordinator prepare |
+| PCF8563 wall-clock persistence and trusted restore | `RtcTimekeep` (`main/power/`) | persist during coordinator prepare; restore at boot before clock consumers start |
 | Wi-Fi station, provisioning and reconnect policy | `ConnectivityService` | connectivity state and capability requests |
 | NVS/SPIFFS writes | `StorageService` | serialized transaction; immutable capacity snapshot for readers |
 | I2S, ES8311 and amplifier GPIO | `AudioService` | fixed command/result interfaces |
