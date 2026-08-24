@@ -248,7 +248,8 @@ void LogWakeupCause()
     const runtime::WakeContext& wake = runtime::GetWakeContext();
     ESP_LOGI(kTag,
              "wake context: kind=%s raw=%s(%d) reset=%d ext1=0x%llx pcf_valid=%d "
-             "pcf_af=%d pcf_tf=%d sleep_snapshot=%d sleep_generation=%u "
+             "pcf_af=%d pcf_tf=%d sleep_snapshot=%d last_mode=%s "
+             "sleep_generation=%u "
              "sleep_cycles=%u timer_requested=%d display_timer=%d panel_cache=%s",
              runtime::WakeKindName(wake.kind), WakeupCauseName(wake.raw_cause),
              static_cast<int>(wake.raw_cause), static_cast<int>(wake.reset_reason),
@@ -257,6 +258,7 @@ void LogWakeupCause()
              wake.pcf_alarm ? 1 : 0,
              wake.pcf_timer ? 1 : 0,
              wake.sleep_snapshot_valid ? 1 : 0,
+             power::SleepModeName(wake.previous_sleep_mode),
              static_cast<unsigned>(wake.sleep_generation),
              static_cast<unsigned>(wake.consecutive_sleep_cycles),
              wake.requested_timer_wakeup ? 1 : 0,

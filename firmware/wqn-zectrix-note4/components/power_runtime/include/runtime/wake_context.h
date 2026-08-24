@@ -5,6 +5,8 @@
 #include "esp_sleep.h"
 #include "esp_system.h"
 
+#include "power/sleep_protocol.h"
+
 namespace wqn::runtime {
 
 enum class WakeKind : uint8_t {
@@ -29,6 +31,10 @@ struct WakeContext {
     bool pcf_timer = false;
     bool sleep_snapshot_valid = false;
     uint32_t sleep_generation = 0;
+    // [power-fix] Mode of the committed sleep snapshot (idle vs emergency vs
+    // user power-off), so a cold boot can be attributed to an orderly
+    // shutdown instead of a brownout/power fault in diagnostics.
+    power::SleepMode previous_sleep_mode = power::SleepMode::kIdle;
     uint32_t consecutive_sleep_cycles = 0;
     bool requested_timer_wakeup = false;
     bool requested_display_timer_wakeup = false;

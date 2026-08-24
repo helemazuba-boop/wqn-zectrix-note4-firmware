@@ -37,6 +37,7 @@ void CaptureWakeContext(
     context.sleep_snapshot_valid = LoadSleepSnapshot(&sleep_snapshot);
     if (context.sleep_snapshot_valid) {
         context.sleep_generation = sleep_snapshot.generation;
+        context.previous_sleep_mode = sleep_snapshot.mode;
         context.consecutive_sleep_cycles = sleep_snapshot.consecutive_cycles;
         context.requested_timer_wakeup = sleep_snapshot.timer_wakeup_enabled;
         context.requested_display_timer_wakeup =
