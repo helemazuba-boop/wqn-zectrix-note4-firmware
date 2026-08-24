@@ -267,8 +267,8 @@ esp_err_t RenderSettingsDialog(const wqn::SettingsAppState& settings)
             break;
         case wqn::SettingsDialog::kPowerOff:
             ESP_RETURN_ON_ERROR(DrawSettingsDialogBox("关机"), kTag, "draw power off dialog");
-            ESP_RETURN_ON_ERROR(DrawWrappedText(54, 98, 292, "设备将清空屏幕并彻底断电。重新开机需长按侧键。", 3), kTag, "draw power off body");
-            ESP_RETURN_ON_ERROR(DrawCenteredText(44, 176, 312, "待上传的学习记录会在下次开机后同步"), kTag, "draw power off note");
+            ESP_RETURN_ON_ERROR(DrawWrappedText(54, 98, 292, "将清屏并彻底断电，屏幕保留关机提示。重新开机：长按下方翻页键（下页/电源键）。", 3), kTag, "draw power off body");
+            ESP_RETURN_ON_ERROR(DrawCenteredText(44, 176, 312, "注意：确认键无法开机"), kTag, "draw power off note");
             ESP_RETURN_ON_ERROR(DrawCenteredText(44, 200, 312, "长按确认关机，短按确认取消"), kTag, "draw power off help");
             break;
         case wqn::SettingsDialog::kNone:

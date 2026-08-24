@@ -1795,6 +1795,20 @@ static esp_err_t ShutdownClearAndPowerOffLocal(int64_t deadline_us)
         return ESP_ERR_NO_MEM;
     }
     ClearEpdFramebuffer(true);
+    // [power-fix] Leave a zero-power hint on the panel instead of a blank
+    // screen: e-paper retains the image after the latch cut, so the user
+    // always knows how to power back on. Hardware fact (schematic
+    // SCH_ZecTrix_Note4_V1.0, Power sheet): only SW1 / KEY_DET/PGDN (the
+    // page-down key, GPIO18) re-latches Q1 through D2; the confirm key has
+    // no power-on path. Best effort -- a text failure never blocks shutdown.
+    {
+        constexpr const char* kTitle = "已关机";
+        constexpr const char* kHint = "长按下方键(下页)开机";
+        const int title_w = MeasureUtf8TextWidth(kTitle);
+        const int hint_w = MeasureUtf8TextWidth(kHint);
+        (void)DrawUtf8Text((kEpdWidth - title_w) / 2, 124, kTitle, true);
+        (void)DrawUtf8Text((kEpdWidth - hint_w) / 2, 164, kHint, true);
+    }
     g_previous_framebuffer_synced = false;
     const esp_err_t refresh_result = RefreshEpdFull(false, true);
     if (refresh_result != ESP_OK) {
