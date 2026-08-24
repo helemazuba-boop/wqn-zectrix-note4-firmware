@@ -8,6 +8,7 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "i2c_bus_lock.h"
 
 namespace {
 
@@ -34,11 +35,21 @@ int DecodeBcd(uint8_t bcd)
 esp_err_t I2cWriteReg(uint8_t reg, uint8_t data)
 {
     uint8_t buf[2] = {reg, data};
+    // [i2c-bus-lock] Shared with the ES8311 codec; serialize every
+    // synchronous transaction (see i2c_bus_lock.h).
+    ScopedI2cBusLock bus_lock("pcf8563_write");
+    if (!bus_lock.locked()) {
+        return bus_lock.status();
+    }
     return i2c_master_transmit(g_dev, buf, sizeof(buf), pdMS_TO_TICKS(100));
 }
 
 esp_err_t I2cReadReg(uint8_t reg, uint8_t* data, size_t len)
 {
+    ScopedI2cBusLock bus_lock("pcf8563_read");
+    if (!bus_lock.locked()) {
+        return bus_lock.status();
+    }
     return i2c_master_transmit_receive(g_dev, &reg, 1, data, len, pdMS_TO_TICKS(100));
 }
 
