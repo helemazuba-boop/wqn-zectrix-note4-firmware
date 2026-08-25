@@ -63,7 +63,7 @@ void BuildHomeSummary(wqn::UiState* state)
         home.battery_label = BatteryLabel(battery);
         home.battery_percent = battery.percent;
         home.charging = battery.charging;
-        home.full = battery.full;
+        home.full = battery.full && battery.external_power_present;
     } else {
         home.battery_label = "--%";
     }

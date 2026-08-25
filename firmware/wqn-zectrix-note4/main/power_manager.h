@@ -54,8 +54,11 @@ struct PowerStatusSnapshot {
     int adc_mv = 0;
     int battery_mv = 0;
     int battery_percent = 0;
+    bool usb_host_connected = false;
     bool charging = false;
     bool fully_charged = false;
+    // Unified policy result: USB SOF or CHRG_L, never /STDBY alone.
+    bool external_power_present = false;
 };
 
 // Returns a value snapshot; callers never receive ADC/GPIO driver handles.
@@ -68,6 +71,9 @@ bool IsFullyCharged();
 // True only while the ESP32-S3 USB Serial/JTAG peripheral is receiving host
 // SOF frames. This distinguishes a connected PC from charger-status GPIOs.
 bool IsUsbHostConnected();
+// True when USB SOF or active-low CHRG_L confirms external power. /STDBY is a
+// charge-complete status only and may remain asserted after cable removal, so
+// it does not independently block sleep.
 bool IsUsbPowered();
 bool IsBatteryLow();
 bool IsBatteryVeryLow();

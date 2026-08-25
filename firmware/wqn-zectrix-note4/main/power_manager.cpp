@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <ctime>
 #include <cstring>
 #include <utility>
 
@@ -25,10 +26,10 @@
 #include "services/sync_service.h"
 #include "pcf8563.h"
 #include "power/rtc_timekeep.h"
-#include "power/rtc_timekeep.h"
 #include "power/sleep_protocol.h"
 #include "power/wake_controller.h"
 #include "runtime/sleep_coordinator.h"
+#include "runtime/sleep_diagnostics.h"
 #include "runtime/sleep_snapshot.h"
 #include "runtime/wake_context.h"
 #include "sdkconfig.h"
@@ -161,8 +162,17 @@ uint32_t g_next_sleep_generation = 1;
 std::atomic<int64_t> g_sleep_retry_not_before_us{0};
 wqn::runtime::SleepLease g_usb_power_lease;
 bool g_usb_power_policy_sampled = false;
+bool g_usb_power_policy_invariant_failed = false;
+bool g_full_only_charge_status_logged = false;
+bool g_sleep_diag_policy_initialized = false;
+uint16_t g_sleep_diag_last_policy_flags = 0;
+bool g_sleep_diag_dumped_for_host = false;
+int64_t g_sleep_diag_dump_not_before_us = 0;
+bool g_sleep_diag_admission_blocked = false;
+uint32_t g_sleep_diag_last_blocker_mask = 0;
 
 constexpr int64_t kPrepareSleepTimeoutUs = 5 * 1000 * 1000;
+constexpr int64_t kSleepDiagnosticUsbDumpDelayUs = 2 * 1000 * 1000;
 // [power-fix] Sleep-preparation failure backoff escalates per consecutive
 // system failure (30s -> 60s -> 120s -> 5m cap) so a wedged service cannot
 // pin the coordinator into a 30s retry storm. User-activity rollbacks reset
@@ -202,6 +212,28 @@ constexpr int64_t kEmergencyStorageTimeoutUs = 2 * 1000 * 1000;
 constexpr int64_t kEmergencyHardwareTimeoutUs = 2 * 1000 * 1000;
 constexpr int64_t kLeaseWarningAfterUs = 60 * 1000 * 1000;
 
+enum class DeepSleepCommitAbortReason : uint8_t {
+    kUserActivity = 0,
+    kExternalPower,
+};
+
+// CHRG_L is evidence that a charger is actively supplying power. /STDBY is
+// only a charge-complete status: Note4 HIL shows that it can remain asserted
+// after USB removal, so it must not independently own the USB sleep lease.
+// A PC connection is detected separately from USB Serial/JTAG SOF traffic.
+constexpr bool ShouldBlockSleepForExternalPower(
+    bool host_connected,
+    bool charging,
+    bool /*fully_charged*/)
+{
+    return host_connected || charging;
+}
+
+static_assert(!ShouldBlockSleepForExternalPower(false, false, false));
+static_assert(!ShouldBlockSleepForExternalPower(false, false, true));
+static_assert(ShouldBlockSleepForExternalPower(true, false, false));
+static_assert(ShouldBlockSleepForExternalPower(false, true, false));
+
 struct BatteryCurvePoint {
     int millivolts;
     int percent;
@@ -240,6 +272,169 @@ static_assert(BatteryPercentFromMillivolts(3492) < 10);
 static_assert(BatteryPercentFromMillivolts(4142) < 100);
 static_assert(BatteryPercentFromMillivolts(4176) < 100);
 
+uint32_t ActiveSleepBlockerMask()
+{
+    uint32_t mask = 0;
+    for (uint8_t value = 0;
+         value < static_cast<uint8_t>(wqn::runtime::SleepBlocker::kCount);
+         ++value) {
+        const auto blocker = static_cast<wqn::runtime::SleepBlocker>(value);
+        if (wqn::runtime::ActiveSleepBlockerCount(blocker) != 0) {
+            mask |= 1U << value;
+        }
+    }
+    return mask;
+}
+
+uint16_t CurrentSleepDiagnosticFlags()
+{
+    uint16_t flags = 0;
+    if (wqn::IsUsbHostConnected()) {
+        flags |= wqn::runtime::kSleepDiagUsbHost;
+    }
+    if (wqn::IsCharging()) {
+        flags |= wqn::runtime::kSleepDiagCharging;
+    }
+    if (wqn::IsFullyCharged()) {
+        flags |= wqn::runtime::kSleepDiagFull;
+    }
+    if (g_usb_power_lease) {
+        flags |= wqn::runtime::kSleepDiagUsbLease;
+    }
+    if (wqn::runtime::GetWakeContext().deep_sleep_resume) {
+        flags |= wqn::runtime::kSleepDiagDeepResume;
+    }
+    if (wqn::runtime::IsSleepQuiescing()) {
+        flags |= wqn::runtime::kSleepDiagQuiescing;
+    }
+    return flags;
+}
+
+wqn::runtime::SleepDiagnosticEvent MakeSleepDiagnosticEvent(
+    wqn::runtime::SleepDiagnosticEventKind kind)
+{
+    const wqn::runtime::WakeContext& wake = wqn::runtime::GetWakeContext();
+    wqn::runtime::SleepDiagnosticEvent event;
+    event.kind = kind;
+    event.wake_kind = static_cast<uint8_t>(wake.kind);
+    event.reset_reason = static_cast<uint8_t>(wake.reset_reason);
+    event.sleep_mode = static_cast<uint8_t>(wake.previous_sleep_mode);
+    event.charge_full_gpio = static_cast<uint8_t>(gpio_get_level(kChargeFull));
+    event.charge_detect_gpio = static_cast<uint8_t>(gpio_get_level(kChargeDetect));
+    event.flags = CurrentSleepDiagnosticFlags();
+    event.app_uptime_ms = static_cast<uint32_t>(NowMs());
+    const std::time_t wall_time = std::time(nullptr);
+    if (wall_time > 0 && static_cast<uint64_t>(wall_time) <= UINT32_MAX) {
+        event.wall_time_sec = static_cast<uint32_t>(wall_time);
+    }
+    event.blocker_mask = ActiveSleepBlockerMask();
+    event.radio_on_total_ms = wqn::GetWifiRadioOnTotalMs();
+    event.consecutive_cycles =
+        ConsecutiveSleepCyclesRef().load(std::memory_order_relaxed);
+    return event;
+}
+
+void SetSleepDiagnosticReason(
+    wqn::runtime::SleepDiagnosticEvent* event,
+    const char* reason)
+{
+    if (event == nullptr || reason == nullptr) {
+        return;
+    }
+    std::strncpy(event->reason, reason, sizeof(event->reason) - 1);
+    event->reason[sizeof(event->reason) - 1] = '\0';
+}
+
+constexpr uint16_t kSleepDiagnosticPowerPolicyFlags =
+    wqn::runtime::kSleepDiagUsbHost |
+    wqn::runtime::kSleepDiagCharging |
+    wqn::runtime::kSleepDiagFull |
+    wqn::runtime::kSleepDiagUsbLease;
+
+void RefreshSleepDiagnosticPowerPolicy()
+{
+    wqn::runtime::SleepDiagnosticEvent event = MakeSleepDiagnosticEvent(
+        wqn::runtime::SleepDiagnosticEventKind::kPowerPolicy);
+    const uint16_t policy_flags =
+        event.flags & kSleepDiagnosticPowerPolicyFlags;
+    if (!g_sleep_diag_policy_initialized ||
+        policy_flags != g_sleep_diag_last_policy_flags) {
+        event.battery_mv = wqn::GetBatteryVoltageMv();
+        SetSleepDiagnosticReason(
+            &event, g_sleep_diag_policy_initialized ? "changed" : "initial");
+        wqn::runtime::RecordSleepDiagnosticEvent(event);
+        g_sleep_diag_last_policy_flags = policy_flags;
+        g_sleep_diag_policy_initialized = true;
+    }
+
+    const bool host_connected =
+        (event.flags & wqn::runtime::kSleepDiagUsbHost) != 0;
+    if (!host_connected) {
+        g_sleep_diag_dumped_for_host = false;
+        g_sleep_diag_dump_not_before_us = 0;
+        return;
+    }
+    if (g_sleep_diag_dumped_for_host) {
+        return;
+    }
+    const int64_t now_us = esp_timer_get_time();
+    if (g_sleep_diag_dump_not_before_us == 0) {
+        // Give the host listener time to open after USB enumeration; the USB
+        // policy lease already prevents a sleep during this short delay.
+        g_sleep_diag_dump_not_before_us =
+            now_us + kSleepDiagnosticUsbDumpDelayUs;
+        return;
+    }
+    if (now_us >= g_sleep_diag_dump_not_before_us) {
+        wqn::runtime::DumpSleepDiagnosticsToLog();
+        g_sleep_diag_dumped_for_host = true;
+    }
+}
+
+void ValidateUsbPowerSleepPolicy(
+    bool host_connected,
+    bool charging,
+    bool full)
+{
+    const bool external_power_present = ShouldBlockSleepForExternalPower(
+        host_connected, charging, full);
+    const bool lease_active = static_cast<bool>(g_usb_power_lease);
+    const uint32_t blocker_count = wqn::runtime::ActiveSleepBlockerCount(
+        wqn::runtime::SleepBlocker::kUsbPower);
+    const bool ownership_mismatch = lease_active
+        ? blocker_count != 1
+        : blocker_count != 0;
+    const bool stale_without_power =
+        !external_power_present && (lease_active || blocker_count != 0);
+    const bool invariant_failed = ownership_mismatch || stale_without_power;
+
+    if (invariant_failed && !g_usb_power_policy_invariant_failed) {
+        ESP_LOGE(
+            kTag,
+            "USB sleep policy invariant failed: host=%d charging=%d full=%d lease=%d usb_blockers=%u",
+            host_connected ? 1 : 0,
+            charging ? 1 : 0,
+            full ? 1 : 0,
+            lease_active ? 1 : 0,
+            static_cast<unsigned>(blocker_count));
+        wqn::runtime::SleepDiagnosticEvent event = MakeSleepDiagnosticEvent(
+            wqn::runtime::SleepDiagnosticEventKind::kPowerPolicy);
+        event.battery_mv = wqn::GetBatteryVoltageMv();
+        SetSleepDiagnosticReason(&event, "invariant-fail");
+        wqn::runtime::RecordSleepDiagnosticEvent(event);
+    } else if (!invariant_failed && g_usb_power_policy_invariant_failed) {
+        ESP_LOGI(
+            kTag,
+            "USB sleep policy invariant recovered: host=%d charging=%d full=%d lease=%d usb_blockers=%u",
+            host_connected ? 1 : 0,
+            charging ? 1 : 0,
+            full ? 1 : 0,
+            lease_active ? 1 : 0,
+            static_cast<unsigned>(blocker_count));
+    }
+    g_usb_power_policy_invariant_failed = invariant_failed;
+}
+
 }  // namespace
 
 namespace wqn {
@@ -265,6 +460,21 @@ void LogWakeupCause()
              wake.requested_timer_wakeup ? 1 : 0,
              wake.requested_display_timer_wakeup ? 1 : 0,
              wake.panel_cache_trusted ? "trusted" : "untrusted");
+
+    runtime::SleepDiagnosticEvent event = MakeSleepDiagnosticEvent(
+        runtime::SleepDiagnosticEventKind::kBoot);
+    event.generation = wake.sleep_generation;
+    event.battery_mv = GetBatteryVoltageMv();
+    if (wake.requested_timer_wakeup) {
+        event.flags |= runtime::kSleepDiagTimerRequested;
+    }
+    if (wake.requested_display_timer_wakeup) {
+        event.flags |= runtime::kSleepDiagDisplayTimer;
+    }
+    runtime::RecordSleepDiagnosticEvent(event);
+    g_sleep_diag_last_policy_flags =
+        event.flags & kSleepDiagnosticPowerPolicyFlags;
+    g_sleep_diag_policy_initialized = true;
 }
 
 // Publishes an interaction: timestamp + generation bump + cycle reset, all
@@ -453,8 +663,13 @@ bool ReadPowerStatus(PowerStatusSnapshot* snapshot)
         return false;
     }
     *snapshot = {};
+    snapshot->usb_host_connected = IsUsbHostConnected();
     snapshot->charging = gpio_get_level(kChargeDetect) == 0;
     snapshot->fully_charged = gpio_get_level(kChargeFull) == 0;
+    snapshot->external_power_present = ShouldBlockSleepForExternalPower(
+        snapshot->usb_host_connected,
+        snapshot->charging,
+        snapshot->fully_charged);
     if (!g_adc_initialized || g_adc_mutex == nullptr) {
         return false;
     }
@@ -498,7 +713,11 @@ bool ReadPowerStatus(PowerStatusSnapshot* snapshot)
     snapshot->adc_raw = sum_raw / valid_samples;
     snapshot->adc_mv = sum_mv / valid_samples;
     snapshot->battery_mv = snapshot->adc_mv * 2;
-    snapshot->battery_percent = snapshot->fully_charged
+    // /STDBY is trustworthy as charge-complete status only while another
+    // signal confirms external power. HIL shows it can remain asserted after
+    // cable removal; in that state the ADC curve must remain authoritative.
+    snapshot->battery_percent =
+        snapshot->fully_charged && snapshot->external_power_present
         ? 100
         : BatteryPercentFromMillivolts(snapshot->battery_mv);
     snapshot->valid = snapshot->battery_mv > 0;
@@ -527,7 +746,8 @@ bool IsCharging()
 
 bool IsUsbPowered()
 {
-    return IsUsbHostConnected() || IsCharging() || IsFullyCharged();
+    return ShouldBlockSleepForExternalPower(
+        IsUsbHostConnected(), IsCharging(), IsFullyCharged());
 }
 
 bool IsUsbHostConnected()
@@ -553,9 +773,18 @@ void RefreshUsbPowerSleepPolicy()
     const bool host_connected = IsUsbHostConnected();
     const bool charging = IsCharging();
     const bool full = IsFullyCharged();
-    const bool usb_powered = host_connected || charging || full;
+    const bool external_power_present = ShouldBlockSleepForExternalPower(
+        host_connected, charging, full);
 
-    if (usb_powered && !g_usb_power_lease) {
+    const bool full_only = full && !external_power_present;
+    if (full_only && !g_full_only_charge_status_logged) {
+        ESP_LOGW(
+            kTag,
+            "/STDBY asserted without USB SOF or active charging; treating full=1 as status-only and allowing sleep");
+    }
+    g_full_only_charge_status_logged = full_only;
+
+    if (external_power_present && !g_usb_power_lease) {
         runtime::SleepLease lease = runtime::SleepLease::TryAcquire(
             runtime::SleepBlocker::kUsbPower,
             "usb-power-present",
@@ -568,6 +797,7 @@ void RefreshUsbPowerSleepPolicy()
                 host_connected ? 1 : 0,
                 charging ? 1 : 0,
                 full ? 1 : 0);
+            RefreshSleepDiagnosticPowerPolicy();
             return;
         }
         g_usb_power_lease = std::move(lease);
@@ -577,15 +807,29 @@ void RefreshUsbPowerSleepPolicy()
             host_connected ? 1 : 0,
             charging ? 1 : 0,
             full ? 1 : 0);
-    } else if (!usb_powered && g_usb_power_lease) {
+    } else if (!external_power_present && g_usb_power_lease) {
+        const uint32_t blocker_count_before = runtime::ActiveSleepBlockerCount(
+            runtime::SleepBlocker::kUsbPower);
         g_usb_power_lease.Reset();
-        ESP_LOGI(kTag, "USB/charger removed; light/deep sleep policy restored");
-    } else if (!g_usb_power_policy_sampled && !usb_powered) {
+        const uint32_t blocker_count_after = runtime::ActiveSleepBlockerCount(
+            runtime::SleepBlocker::kUsbPower);
         ESP_LOGI(
             kTag,
-            "USB/charger not detected: host=0 charging=0 full=0; normal sleep policy active");
+            "USB/charger removed: host=%d charging=%d full=%d; lease released usb_blockers=%u->%u",
+            host_connected ? 1 : 0,
+            charging ? 1 : 0,
+            full ? 1 : 0,
+            static_cast<unsigned>(blocker_count_before),
+            static_cast<unsigned>(blocker_count_after));
+    } else if (!g_usb_power_policy_sampled && !external_power_present) {
+        ESP_LOGI(
+            kTag,
+            "USB/charger not detected: host=0 charging=0 full=%d; normal sleep policy active",
+            full ? 1 : 0);
     }
     g_usb_power_policy_sampled = true;
+    ValidateUsbPowerSleepPolicy(host_connected, charging, full);
+    RefreshSleepDiagnosticPowerPolicy();
 }
 
 bool IsBatteryLow()
@@ -725,6 +969,12 @@ static void RollbackSleepPreparation(uint32_t generation, const char* reason)
         ++g_sleep_retry_escalation;
     }
     const int64_t retry_backoff_us = SleepRetryBackoffUs();
+    runtime::SleepDiagnosticEvent diagnostic = MakeSleepDiagnosticEvent(
+        runtime::SleepDiagnosticEventKind::kRollback);
+    diagnostic.generation = generation;
+    diagnostic.retry_ms = static_cast<uint32_t>(retry_backoff_us / 1000);
+    SetSleepDiagnosticReason(&diagnostic, reason);
+    runtime::RecordSleepDiagnosticEvent(diagnostic);
     ESP_LOGW(kTag,
              "sleep rollback: generation=%u reason=%s retry_ms=%lld escalation=%u",
              static_cast<unsigned>(generation), reason,
@@ -759,14 +1009,21 @@ static uint32_t NextSleepGeneration()
 // Commits the prepared deep sleep. For the idle path, gate_on_activity_baseline
 // points at the activity generation sampled before the idle checks: the FINAL
 // validation runs after the UART flush + 50 ms settle, inside g_activity_gate
-// (the same critical section NoteUserActivity publishes through), so no bump
-// can land between the check and the deep-sleep entry. Returns only when the
-// sleep was aborted (late activity) -- the caller must roll back. The battery-
-// emergency path passes nullptr: it must power down regardless of input.
-static bool CommitDeepSleep(
+// (the same critical section NoteUserActivity publishes through). The idle
+// path also performs the last external-power sample in that final critical
+// section. Returns only when the sleep was aborted; the caller must roll back
+// according to the returned reason. The battery-emergency path passes nullptr:
+// it must power down regardless of input or external power.
+static DeepSleepCommitAbortReason CommitDeepSleep(
     const power::PrepareSleepCommand& command,
     const uint32_t* gate_on_activity_baseline)
 {
+    runtime::SleepDiagnosticEvent diagnostic = MakeSleepDiagnosticEvent(
+        runtime::SleepDiagnosticEventKind::kCommit);
+    diagnostic.generation = command.generation;
+    diagnostic.sleep_mode = static_cast<uint8_t>(command.mode);
+    diagnostic.battery_mv = GetBatteryVoltageMv();
+    runtime::RecordSleepDiagnosticEvent(diagnostic);
     ESP_LOGI(kTag, "deep-sleep commit: generation=%u mode=%s consecutive=%u stack_free=%u radio_on_total_ms=%u",
              static_cast<unsigned>(command.generation),
              power::SleepModeName(command.mode),
@@ -776,29 +1033,29 @@ static bool CommitDeepSleep(
     uart_wait_tx_idle_polling(static_cast<uart_port_t>(CONFIG_ESP_CONSOLE_UART_NUM));
     vTaskDelay(pdMS_TO_TICKS(50));
 
-    // The idle path validates the interaction generation one last time under
-    // g_activity_gate so no NoteUserActivity can publish between the check and
-    // the sleep; the emergency path (nullptr baseline) sleeps unconditionally.
-    // Both converge on the SINGLE deep-sleep entry below (the M8
-    // architecture gate enforces exactly one deep-sleep entry firmware-wide).
-    bool proceed = true;
+    // The idle path validates activity and external power one last time under
+    // g_activity_gate. usb_serial_jtag_is_connected() is a non-blocking read
+    // of the IDF connection monitor's volatile SOF state, so this check does
+    // not introduce a wait inside the critical section. The emergency path
+    // (nullptr baseline) sleeps unconditionally. Both converge on the SINGLE
+    // deep-sleep entry below (the M8 gate enforces this firmware-wide).
     if (gate_on_activity_baseline != nullptr) {
         taskENTER_CRITICAL(&g_activity_gate);
-        proceed = g_user_activity_generation.load(std::memory_order_acquire) ==
-            *gate_on_activity_baseline;
-        if (!proceed) {
+        if (g_user_activity_generation.load(std::memory_order_acquire) !=
+            *gate_on_activity_baseline) {
             taskEXIT_CRITICAL(&g_activity_gate);
+            return DeepSleepCommitAbortReason::kUserActivity;
         }
-        // When proceeding, the gate is held THROUGH the deep-sleep entry (which
-        // never returns): a racing NoteUserActivity spins on the gate and can
-        // only publish after we are asleep, at which point its key press is
-        // itself an armed wake source.
+        if (IsUsbPowered()) {
+            taskEXIT_CRITICAL(&g_activity_gate);
+            return DeepSleepCommitAbortReason::kExternalPower;
+        }
+        // The gate is held THROUGH the deep-sleep entry (which never returns):
+        // a racing NoteUserActivity can only publish after the key press has
+        // become an armed wake source.
     }
-    if (proceed) {
-        // noreturn: nothing after this call is reachable.
-        esp_deep_sleep_start();
-    }
-    return true;
+    // noreturn: nothing after this call is reachable.
+    esp_deep_sleep_start();
 }
 
 static void RunBatteryEmergencyShutdown()
@@ -959,8 +1216,23 @@ static void EnterDeepSleepIfEnabled(bool enable_timer_wakeup)
         DisplayIsOnlyActiveSleepBlocker(), std::memory_order_release);
     const uint32_t generation = NextSleepGeneration();
     if (!runtime::TryBeginSleepQuiesce(generation)) {
+        const uint32_t blocker_mask = ActiveSleepBlockerMask();
+        if (!g_sleep_diag_admission_blocked ||
+            blocker_mask != g_sleep_diag_last_blocker_mask) {
+            runtime::SleepDiagnosticEvent diagnostic = MakeSleepDiagnosticEvent(
+                runtime::SleepDiagnosticEventKind::kAdmissionBlocked);
+            diagnostic.generation = generation;
+            diagnostic.blocker_mask = blocker_mask;
+            SetSleepDiagnosticReason(
+                &diagnostic,
+                runtime::IsSleepQuiescing() ? "quiescing" : "active-leases");
+            runtime::RecordSleepDiagnosticEvent(diagnostic);
+            g_sleep_diag_admission_blocked = true;
+            g_sleep_diag_last_blocker_mask = blocker_mask;
+        }
         return;
     }
+    g_sleep_diag_admission_blocked = false;
     // ...and again right after: a bump inside this window means an armed
     // effect may just have failed its reserve against the closed gate.
     if (g_user_activity_generation.load(std::memory_order_acquire) !=
@@ -1047,16 +1319,34 @@ static void EnterDeepSleepIfEnabled(bool enable_timer_wakeup)
                  : (sync_wakeup_seconds != 0 ? "sync" : "off")),
              wake_floor_applied ? " floor-clamped" : "",
              sync_wake_escalated ? "+unattended-escalated" : "");
-#if CONFIG_WQN_RTC_TIMEKEEP_ENABLE
-    // [rtc-timekeep] Persist the wall clock after every service has quiesced
-    // (shared I2C bus idle) and before wake-source assembly reprograms the
-    // PCF8563 timer. Deliberately fault-tolerant and non-rollbackable: a
-    // failed write only costs one sleep cycle of clock freshness, and a
-    // rollback that retries the sleep simply overwrites the record.
-    if (!power::timekeep::PersistSystemTimeToRtc(generation)) {
-        ESP_LOGW(kTag, "RTC time persist skipped; next boot falls back to build-time seeding");
+    runtime::SleepDiagnosticEvent wake_diagnostic = MakeSleepDiagnosticEvent(
+        runtime::SleepDiagnosticEventKind::kWakePlan);
+    wake_diagnostic.generation = generation;
+    wake_diagnostic.sleep_mode = static_cast<uint8_t>(command.mode);
+    wake_diagnostic.display_wake_sec = display_wakeup_seconds;
+    wake_diagnostic.sync_wake_sec = sync_wakeup_seconds;
+    wake_diagnostic.chosen_wake_sec = timer_wakeup_seconds;
+    if (timer_wakeup_seconds != 0) {
+        wake_diagnostic.flags |= runtime::kSleepDiagTimerRequested;
     }
-#endif
+    if (timer_wakeup_for_display) {
+        wake_diagnostic.flags |= runtime::kSleepDiagDisplayTimer;
+    }
+    if (wake_floor_applied) {
+        wake_diagnostic.flags |= runtime::kSleepDiagWakeFloorApplied;
+    }
+    if (sync_wake_escalated) {
+        wake_diagnostic.flags |= runtime::kSleepDiagSyncEscalated;
+    }
+    if (has_usable_token) {
+        wake_diagnostic.flags |= runtime::kSleepDiagUsableToken;
+    }
+    SetSleepDiagnosticReason(
+        &wake_diagnostic,
+        !has_usable_token ? "unpaired"
+            : (timer_wakeup_for_display ? "display"
+            : (sync_wakeup_seconds != 0 ? "sync" : "off")));
+    runtime::RecordSleepDiagnosticEvent(wake_diagnostic);
 #if CONFIG_WQN_RTC_TIMEKEEP_ENABLE
     // [rtc-timekeep] Persist the wall clock after every service has quiesced
     // (shared I2C bus idle) and before wake-source assembly reprograms the
@@ -1074,6 +1364,13 @@ static void EnterDeepSleepIfEnabled(bool enable_timer_wakeup)
         return;
     }
     if (PreemptIdleSleepForBatteryEmergency(generation)) {
+        return;
+    }
+    // A USB host or active charger can arrive while services are preparing.
+    // The policy lease cannot be reacquired while quiesce admission is closed,
+    // so observe the physical source directly and roll the transaction back.
+    if (IsUsbPowered()) {
+        RollbackSleepPreparation(generation, "usb-power-during-prepare");
         return;
     }
 
@@ -1100,13 +1397,17 @@ static void EnterDeepSleepIfEnabled(bool enable_timer_wakeup)
     snapshot.consecutive_cycles = ConsecutiveSleepCyclesRef().load(std::memory_order_relaxed);
     snapshot.wake_gpio_mask = wake.wake_gpio_mask;
     runtime::CommitSleepSnapshot(snapshot);
-    if (CommitDeepSleep(command, &activity_generation_before)) {
-        // The interaction landed after the pre-commit check, i.e. possibly
-        // after this cycle's fetch_add: re-zero so a correctly-cancelled sleep
-        // never leaves the consecutive counter at 1.
-        ConsecutiveSleepCyclesRef().store(0, std::memory_order_relaxed);
-        RollbackSleepPreparation(generation, "user-activity-at-commit");
-    }
+    const DeepSleepCommitAbortReason abort_reason =
+        CommitDeepSleep(command, &activity_generation_before);
+    // An abort can land after this cycle's fetch_add and snapshot commit.
+    // Re-zero so a correctly-cancelled sleep never leaves the consecutive
+    // counter at 1; rollback also invalidates the staged snapshot.
+    ConsecutiveSleepCyclesRef().store(0, std::memory_order_relaxed);
+    RollbackSleepPreparation(
+        generation,
+        abort_reason == DeepSleepCommitAbortReason::kExternalPower
+            ? "usb-power-at-commit"
+            : "user-activity-at-commit");
 #else
     (void)enable_timer_wakeup;
 #endif

@@ -107,9 +107,10 @@ struct BatteryReading {
     int percent = 0;
     int chrg_l = 1;
     int stdby_h = 0;
+    bool usb_host_connected = false;
     bool charging = false;
     bool full = false;
-    bool power_present_or_status_known = false;
+    bool external_power_present = false;
     const char* pmu_status = "unknown";
     bool pmu_implemented = false;
 };
