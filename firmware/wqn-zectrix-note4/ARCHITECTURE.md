@@ -86,10 +86,23 @@ sync-only wake does not initialize or refresh the panel unless new visible
 content is actually accepted later in the boot.
 
 USB/charger presence owns a sleep lease. PC attachment is detected from USB
-Serial/JTAG SOF traffic instead of charger-status GPIO; GPIO charging/full status
-remains the fallback for charger-only power. Therefore a powered USB connection
-prevents both automatic light sleep and deep sleep while flashing, monitoring or
-using AI Flash. Battery-only HIL is required to validate sleep current.
+Serial/JTAG SOF traffic instead of charger-status GPIO; active-low `CHRG_L` is
+the fallback while a charger-only source is actively charging. `/STDBY` remains
+a charge-complete status but is not standalone proof of external power because
+Note4 hardware can keep it low after cable removal. Therefore a confirmed USB
+connection prevents both automatic light sleep and deep sleep while flashing,
+monitoring or using AI Flash. Battery-only HIL is required to validate sleep
+current. Wake-source assembly likewise omits `/STDBY` only when it is already
+low at arm time; EXT1 remains `ANY_LOW`, and `CHRG_L` remains armed to detect a
+charger insertion.
+
+The idle transaction rechecks confirmed external power after wake-source
+assembly and once more in the final commit critical section. A source arriving
+while service admission is closed therefore rolls preparation back instead of
+depending on a USB lease that cannot be reacquired until rollback completes.
+Battery percentage and depletion protection use the same confirmed-power bit;
+an unpowered residual `/STDBY` remains diagnostic data but cannot force 100% or
+veto the low-voltage shutdown debounce.
 
 ## Display terminal semantics
 

@@ -232,8 +232,10 @@ must cancel the sleep, not vanish with the RAM image. The linearization point is
 - An accepted display intent counts as EPD activity (bumps the EPD activity
   generation) — both the primary and secondary accept paths do it; rejected
   intents do not.
-- Repeat (held-key) events do not publish activity: the key is physically held,
-  so the wake source stays asserted anyway.
+- Repeat (held-key) events do not publish activity. A key already held low at
+  wake assembly is treated as an ordinary sleep denial and rollback; repeated
+  identical masks are escalated as a likely stuck line. The firmware does not
+  force sleep past an asserted input.
 
 ### 4.6 EPD is a single-owner resource
 
@@ -416,8 +418,9 @@ live only in their owning services. Load-bearing:
   low cannot re-arm ext1, which is *why* §4.5 matters.
 - **GPIO 18** is page-down / KEY_DET with an external pull-up — despite the
   source name it is *not* USB-power-detect. PC connection is detected from USB
-  Serial/JTAG SOF frames; charger-only power from GPIO 2 `CHRG_L` / GPIO 1
-  `/STDBY` (active-low).
+  Serial/JTAG SOF frames; active-low GPIO 2 `CHRG_L` confirms active charging.
+  GPIO 1 `/STDBY` is charge-complete status but is not standalone evidence of
+  external power: HIL shows it can stay low after USB removal.
 - **GPIO 19/20 are USB D−/D+.** Never repurpose them.
 - **EPD rail (GPIO 6)** is controlled only by `DisplayService`; before cutting
   it, send the panel deep-sleep command. Battery ADC is exposed only as
