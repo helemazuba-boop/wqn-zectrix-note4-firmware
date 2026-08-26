@@ -297,28 +297,55 @@ bool IsNoteSessionInvalidError(const wqn::protocol::v3::Error& error)
            error.code == "NOTE_SESSION_SNAPSHOT_INCOMPLETE";
 }
 
-bool ApplyNoteCloudResult(wqn::UiState* state, NoteCloudResult& result)
+bool ApplyNoteCloudResult(
+    wqn::UiState* state,
+    NoteCloudResult& result,
+    bool* content_changed)
 {
+    if (content_changed != nullptr) {
+        *content_changed = true;
+    }
     if (state == nullptr) {
         return false;
     }
     if (result.op == NoteCloudOp::kPackSync) {
+        // Pack retry state is metadata, not note content. Repeated identical
+        // failures must not manufacture a kCommit full refresh every time the
+        // retained sync deadline fires.
+        if (content_changed != nullptr) {
+            *content_changed = false;
+        }
         if (result.result == ESP_OK) {
             if (!result.pack_index_ready) {
-                // No content changed; keep the current index and do not
-                // manufacture a visible refresh.
+                const bool status_changed =
+                    state->note_app.cloud_sync_failed ||
+                    !state->note_app.cloud_loaded_once ||
+                    state->note_app.cloud_sync_requested;
                 state->note_app.cloud_sync_failed = false;
                 state->note_app.cloud_loaded_once = true;
                 state->note_app.cloud_sync_requested = false;
-                return false;
+                BuildHomeSummary(state);
+                return status_changed;
+            }
+            if (content_changed != nullptr) {
+                *content_changed = true;
             }
             wqn::ApplyNotePackIndex(
                 &state->note_app, std::move(result.pack_index), result.message);
         } else {
+            const std::string next_message =
+                result.auth_required ? "请重新配对" : "笔记同步失败";
+            const bool status_changed =
+                !state->note_app.cloud_sync_failed ||
+                !state->note_app.cloud_loaded_once ||
+                state->note_app.cloud_sync_requested ||
+                state->note_app.message != next_message;
             state->note_app.cloud_sync_failed = true;
             state->note_app.cloud_loaded_once = true;
             state->note_app.cloud_sync_requested = false;
-            state->note_app.message = result.auth_required ? "请重新配对" : "笔记同步失败";
+            state->note_app.message = next_message;
+            BuildHomeSummary(state);
+            return status_changed;
         }
         BuildHomeSummary(state);
         return true;

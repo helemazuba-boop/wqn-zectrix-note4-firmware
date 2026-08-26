@@ -162,13 +162,23 @@ void UiRuntime::RestoreWordCandidatePageRequest()
 
 UiUpdate UiRuntime::DispatchNoteCloudResult(NoteCloudResult& result)
 {
-    const bool changed = ApplyNoteCloudResult(&state_, result);
-    // Note cloud results (pack sync / session start / candidate page / image)
-    // repaint the note screen when they change visible state; the observation
-    // commit no longer rides this path (it went to the persist worker in c3).
+    const bool note_visible = state_.screen == wqn::UiScreen::kNote;
+    const std::string before_signature = note_visible
+        ? FrameSignature(wqn::RenderUiFrame(state_))
+        : std::string();
+    bool content_changed = true;
+    const bool changed = ApplyNoteCloudResult(
+        &state_, result, &content_changed);
+    const bool visible_changed = note_visible &&
+        before_signature != FrameSignature(wqn::RenderUiFrame(state_));
+    // Structural note changes require a commit waveform. Pack-sync status is
+    // a lightweight selection repaint, and an identical repeated result does
+    // not submit at all. This also avoids refreshing a hidden/staged pack
+    // index whose pixels are not represented on the current note subpage.
     const RefreshSchedule refresh =
-        changed && state_.screen == wqn::UiScreen::kNote
-            ? RefreshSchedule::kCommit
+        changed && visible_changed
+            ? (content_changed ? RefreshSchedule::kCommit
+                               : RefreshSchedule::kSelection)
             : RefreshSchedule::kNone;
     return FinishEvent(AppEventKind::kNoteCloudResult, refresh, changed);
 }

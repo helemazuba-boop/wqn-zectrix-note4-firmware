@@ -488,7 +488,10 @@ bool ApplyTodoCloudResult(
     const TodoCloudResult& result,
     bool* content_changed = nullptr);
 bool ApplyWordCloudResult(wqn::UiState* state, WordCloudResult& result);
-bool ApplyNoteCloudResult(wqn::UiState* state, NoteCloudResult& result);
+bool ApplyNoteCloudResult(
+    wqn::UiState* state,
+    NoteCloudResult& result,
+    bool* content_changed = nullptr);
 bool ApplyProblemCloudResult(wqn::UiState* state, ProblemCloudResult& result);
 
 bool RefreshTodosFromCloud(wqn::UiState* state);
