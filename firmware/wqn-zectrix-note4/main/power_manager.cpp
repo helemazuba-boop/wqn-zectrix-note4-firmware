@@ -56,6 +56,8 @@
 
 namespace {
 
+using wqn::DeepSleepUiPolicy;
+
 constexpr char kTag[] = "wqn_power";
 
 constexpr gpio_num_t kBoardPowerLatch = GPIO_NUM_17;
@@ -149,7 +151,8 @@ SemaphoreHandle_t g_adc_mutex = nullptr;
 i2c_master_bus_handle_t g_i2c_bus = nullptr;
 
 TaskHandle_t g_power_coordinator_task = nullptr;
-std::atomic<bool> g_timer_wakeup_preference{true};
+std::atomic<DeepSleepUiPolicy> g_deep_sleep_ui_policy{
+    DeepSleepUiPolicy::kLightSleepOnly};
 std::atomic<bool> g_battery_shutdown_requested{false};
 // [power-fix] Set by the settings-page confirm; consumed (and re-set on a
 // busy quiesce) by the PowerCoordinator. See RunUserPowerOffShutdown.
@@ -215,7 +218,47 @@ constexpr int64_t kLeaseWarningAfterUs = 60 * 1000 * 1000;
 enum class DeepSleepCommitAbortReason : uint8_t {
     kUserActivity = 0,
     kExternalPower,
+    kUiPolicy,
 };
+
+constexpr bool DeepSleepAllowedByUiPolicy(DeepSleepUiPolicy policy)
+{
+    return policy != DeepSleepUiPolicy::kLightSleepOnly;
+}
+
+constexpr bool UiPolicyUsesDisplayTimer(DeepSleepUiPolicy policy)
+{
+    return policy == DeepSleepUiPolicy::kDeepSleepWithDisplayTimer;
+}
+
+constexpr uint32_t ApplyMinimumWakeFloor(uint32_t seconds, uint32_t floor_seconds)
+{
+    return seconds != 0 && floor_seconds != 0 && seconds < floor_seconds
+        ? floor_seconds
+        : seconds;
+}
+
+constexpr bool DisplayDeadlineWins(uint32_t display_seconds, uint32_t sync_seconds)
+{
+    return display_seconds != 0 &&
+        (sync_seconds == 0 || display_seconds <= sync_seconds);
+}
+
+static_assert(DisplayDeadlineWins(60, ApplyMinimumWakeFloor(1, 60)));
+static_assert(!DisplayDeadlineWins(60, ApplyMinimumWakeFloor(1, 30)));
+
+const char* DeepSleepUiPolicyName(DeepSleepUiPolicy policy)
+{
+    switch (policy) {
+        case DeepSleepUiPolicy::kLightSleepOnly:
+            return "light-only";
+        case DeepSleepUiPolicy::kDeepSleepNoDisplayTimer:
+            return "deep-background";
+        case DeepSleepUiPolicy::kDeepSleepWithDisplayTimer:
+            return "deep-display";
+    }
+    return "unknown";
+}
 
 // CHRG_L is evidence that a charger is actively supplying power. /STDBY is
 // only a charge-complete status: Note4 HIL shows that it can remain asserted
@@ -961,7 +1004,8 @@ static void RollbackSleepPreparation(uint32_t generation, const char* reason)
     // present. Everything else (service denial/timeout, wake-arm errors)
     // climbs the ladder.
     const bool user_activity_rollback =
-        std::strncmp(reason, "user-activity", 13) == 0;
+        std::strncmp(reason, "user-activity", 13) == 0 ||
+        std::strncmp(reason, "ui-policy", 9) == 0;
     if (user_activity_rollback) {
         g_sleep_retry_escalation = 0;
     } else if (g_sleep_retry_escalation <
@@ -1010,10 +1054,10 @@ static uint32_t NextSleepGeneration()
 // points at the activity generation sampled before the idle checks: the FINAL
 // validation runs after the UART flush + 50 ms settle, inside g_activity_gate
 // (the same critical section NoteUserActivity publishes through). The idle
-// path also performs the last external-power sample in that final critical
-// section. Returns only when the sleep was aborted; the caller must roll back
-// according to the returned reason. The battery-emergency path passes nullptr:
-// it must power down regardless of input or external power.
+// path also performs the last external-power and UI-policy samples in that
+// final critical section. Returns only when the sleep was aborted; the caller
+// must roll back according to the returned reason. The battery-emergency path
+// passes nullptr: it must power down regardless of input, UI policy or power.
 static DeepSleepCommitAbortReason CommitDeepSleep(
     const power::PrepareSleepCommand& command,
     const uint32_t* gate_on_activity_baseline)
@@ -1049,6 +1093,11 @@ static DeepSleepCommitAbortReason CommitDeepSleep(
         if (IsUsbPowered()) {
             taskEXIT_CRITICAL(&g_activity_gate);
             return DeepSleepCommitAbortReason::kExternalPower;
+        }
+        if (!DeepSleepAllowedByUiPolicy(
+                g_deep_sleep_ui_policy.load(std::memory_order_acquire))) {
+            taskEXIT_CRITICAL(&g_activity_gate);
+            return DeepSleepCommitAbortReason::kUiPolicy;
         }
         // The gate is held THROUGH the deep-sleep entry (which never returns):
         // a racing NoteUserActivity can only publish after the key press has
@@ -1163,7 +1212,7 @@ static bool PreemptIdleSleepForBatteryEmergency(uint32_t generation)
     return true;
 }
 
-static void EnterDeepSleepIfEnabled(bool enable_timer_wakeup)
+static void EnterDeepSleepIfEnabled(DeepSleepUiPolicy ui_policy)
 {
 #if CONFIG_WQN_DEEP_SLEEP_ENABLE
     if (g_battery_shutdown_requested.exchange(false, std::memory_order_acq_rel) ||
@@ -1171,6 +1220,11 @@ static void EnterDeepSleepIfEnabled(bool enable_timer_wakeup)
         RunBatteryEmergencyShutdown();
         return;
     }
+    if (!DeepSleepAllowedByUiPolicy(ui_policy)) {
+        g_deep_sleep_clock_yield.store(false, std::memory_order_release);
+        return;
+    }
+    const bool enable_timer_wakeup = UiPolicyUsesDisplayTimer(ui_policy);
     // The charger status pins are also deep-sleep wake sources. This explicit
     // guard prevents beginning quiesce while USB is already present; the USB
     // SleepLease additionally keeps automatic light sleep out of serial and
@@ -1240,6 +1294,11 @@ static void EnterDeepSleepIfEnabled(bool enable_timer_wakeup)
         RollbackSleepPreparation(generation, "user-activity-during-quiesce");
         return;
     }
+    if (!DeepSleepAllowedByUiPolicy(
+            g_deep_sleep_ui_policy.load(std::memory_order_acquire))) {
+        RollbackSleepPreparation(generation, "ui-policy-during-quiesce");
+        return;
+    }
 
     power::PrepareSleepCommand command;
     command.generation = generation;
@@ -1261,19 +1320,17 @@ static void EnterDeepSleepIfEnabled(bool enable_timer_wakeup)
     const uint32_t display_wakeup_seconds = enable_timer_wakeup
         ? CONFIG_WQN_DEEP_SLEEP_TIMER_WAKE_SEC
         : 0;
-    uint32_t timer_wakeup_seconds = display_wakeup_seconds;
     uint32_t sync_wakeup_seconds = services::SecondsUntilNextSyncWake();
+    uint32_t effective_sync_wakeup_seconds = sync_wakeup_seconds;
+    uint32_t timer_wakeup_seconds = display_wakeup_seconds;
     // [power-fix] Without a usable identity there is nothing to sync; ignore
     // sync-derived deadlines (claim polling would otherwise pin the cadence
     // at ~1s) and hold a slow 15-minute maintenance rhythm instead.
     if (!has_usable_token) {
         sync_wakeup_seconds = 0;
+        effective_sync_wakeup_seconds = 0;
         timer_wakeup_seconds =
             kUnpairedBatteryMaintenanceWakeSec;
-    } else if (sync_wakeup_seconds != 0 &&
-        (timer_wakeup_seconds == 0 ||
-         sync_wakeup_seconds < timer_wakeup_seconds)) {
-        timer_wakeup_seconds = sync_wakeup_seconds;
     }
     // [gap-1] Fold any sub-floor wake interval up to the floor. A sync retry
     // or content deadline of a few seconds used to become a boot-per-cycle
@@ -1284,10 +1341,20 @@ static void EnterDeepSleepIfEnabled(bool enable_timer_wakeup)
     // sync wake: classify it as background so the boot path skips panel
     // init for it (IsBackgroundSyncTimerWake) and the pairing screen stays
     // exactly as the user left it.
-    const bool timer_wakeup_for_display = has_usable_token &&
-        display_wakeup_seconds != 0 &&
-        (sync_wakeup_seconds == 0 || display_wakeup_seconds <= sync_wakeup_seconds);
     uint32_t wake_floor_seconds = CONFIG_WQN_SLEEP_TIMER_WAKE_FLOOR_SEC;
+    bool wake_floor_applied = false;
+    if (has_usable_token) {
+        const uint32_t floored_sync = ApplyMinimumWakeFloor(
+            effective_sync_wakeup_seconds, wake_floor_seconds);
+        wake_floor_applied = floored_sync != effective_sync_wakeup_seconds;
+        effective_sync_wakeup_seconds = floored_sync;
+    }
+    // Compare display against the already floor-clamped sync deadline. A raw
+    // sync retry at 1 s and a display deadline at 60 s both become due at 60 s;
+    // display wins that tie and must never be counted as unattended sync.
+    bool timer_wakeup_for_display = has_usable_token &&
+        DisplayDeadlineWins(
+            display_wakeup_seconds, effective_sync_wakeup_seconds);
     // [gap-1] Unattended background-maintenance wakes escalate: after enough
     // consecutive sync-source cycles with zero user interaction, widen the
     // floor so a stuck deadline can burn at most one radio window per 15
@@ -1295,29 +1362,33 @@ static void EnterDeepSleepIfEnabled(bool enable_timer_wakeup)
     // nor reset the streak.
     bool sync_wake_escalated = false;
     if (has_usable_token && !timer_wakeup_for_display &&
-        sync_wakeup_seconds != 0 &&
+        effective_sync_wakeup_seconds != 0 &&
         g_unattended_sync_wakes >= kUnattendedSyncWakeEscalationAfter &&
         wake_floor_seconds != 0 &&
         wake_floor_seconds < kEscalatedSyncWakeFloorSec) {
-        wake_floor_seconds = kEscalatedSyncWakeFloorSec;
+        effective_sync_wakeup_seconds = std::max(
+            effective_sync_wakeup_seconds, kEscalatedSyncWakeFloorSec);
         sync_wake_escalated = true;
-    }
-    bool wake_floor_applied = false;
-    if (wake_floor_seconds != 0 && timer_wakeup_seconds != 0 &&
-        timer_wakeup_seconds < wake_floor_seconds) {
-        timer_wakeup_seconds = wake_floor_seconds;
         wake_floor_applied = true;
     }
+    if (has_usable_token) {
+        if (timer_wakeup_for_display) {
+            timer_wakeup_seconds = display_wakeup_seconds;
+        } else {
+            timer_wakeup_seconds = effective_sync_wakeup_seconds;
+        }
+    }
     ESP_LOGI(kTag,
-             "deep-sleep wake plan: display_sec=%u sync_sec=%u chosen=%u "
+             "deep-sleep wake plan: display_sec=%u sync_sec=%u sync_effective_sec=%u chosen=%u "
              "source=%s%s%s",
              static_cast<unsigned>(display_wakeup_seconds),
              static_cast<unsigned>(sync_wakeup_seconds),
+             static_cast<unsigned>(effective_sync_wakeup_seconds),
              static_cast<unsigned>(timer_wakeup_seconds),
              !has_usable_token ? "unpaired-maintenance"
                  : (timer_wakeup_for_display ? "display"
                  : (sync_wakeup_seconds != 0 ? "sync" : "off")),
-             wake_floor_applied ? " floor-clamped" : "",
+             wake_floor_applied && !timer_wakeup_for_display ? " floor-clamped" : "",
              sync_wake_escalated ? "+unattended-escalated" : "");
     runtime::SleepDiagnosticEvent wake_diagnostic = MakeSleepDiagnosticEvent(
         runtime::SleepDiagnosticEventKind::kWakePlan);
@@ -1332,7 +1403,7 @@ static void EnterDeepSleepIfEnabled(bool enable_timer_wakeup)
     if (timer_wakeup_for_display) {
         wake_diagnostic.flags |= runtime::kSleepDiagDisplayTimer;
     }
-    if (wake_floor_applied) {
+    if (wake_floor_applied && !timer_wakeup_for_display) {
         wake_diagnostic.flags |= runtime::kSleepDiagWakeFloorApplied;
     }
     if (sync_wake_escalated) {
@@ -1385,6 +1456,11 @@ static void EnterDeepSleepIfEnabled(bool enable_timer_wakeup)
         RollbackSleepPreparation(generation, "user-activity-before-commit");
         return;
     }
+    if (!DeepSleepAllowedByUiPolicy(
+            g_deep_sleep_ui_policy.load(std::memory_order_acquire))) {
+        RollbackSleepPreparation(generation, "ui-policy-before-commit");
+        return;
+    }
     ConsecutiveSleepCyclesRef().fetch_add(1, std::memory_order_relaxed);
     if (timer_wakeup_seconds != 0 && !timer_wakeup_for_display) {
         ++g_unattended_sync_wakes;
@@ -1407,15 +1483,32 @@ static void EnterDeepSleepIfEnabled(bool enable_timer_wakeup)
         generation,
         abort_reason == DeepSleepCommitAbortReason::kExternalPower
             ? "usb-power-at-commit"
-            : "user-activity-at-commit");
+            : (abort_reason == DeepSleepCommitAbortReason::kUiPolicy
+                ? "ui-policy-at-commit"
+                : "user-activity-at-commit"));
 #else
-    (void)enable_timer_wakeup;
+    (void)ui_policy;
 #endif
 }
 
-void SetDeepSleepTimerWakePreference(bool enabled)
+void SetDeepSleepUiPolicy(DeepSleepUiPolicy policy)
 {
-    g_timer_wakeup_preference.store(enabled, std::memory_order_release);
+    bool changed = false;
+    taskENTER_CRITICAL(&g_activity_gate);
+    const DeepSleepUiPolicy previous =
+        g_deep_sleep_ui_policy.load(std::memory_order_relaxed);
+    if (previous != policy) {
+        g_deep_sleep_ui_policy.store(policy, std::memory_order_release);
+        changed = true;
+    }
+    taskEXIT_CRITICAL(&g_activity_gate);
+    if (!changed) {
+        return;
+    }
+    ESP_LOGI(kTag, "UI sleep policy: %s", DeepSleepUiPolicyName(policy));
+    if (g_power_coordinator_task != nullptr) {
+        xTaskNotifyGive(g_power_coordinator_task);
+    }
 }
 
 void RequestUserPowerOff()
@@ -1437,7 +1530,8 @@ static void PowerCoordinatorTask(void*)
             // later and never spins hot.
             RunUserPowerOffShutdown();
         }
-        EnterDeepSleepIfEnabled(g_timer_wakeup_preference.load(std::memory_order_acquire));
+        EnterDeepSleepIfEnabled(
+            g_deep_sleep_ui_policy.load(std::memory_order_acquire));
         ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000));
     }
 }

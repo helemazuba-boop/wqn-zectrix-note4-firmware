@@ -33,11 +33,20 @@ bool IsUiIdleForSleepEx(int extra_idle_ms);
 // lease at the same threshold.
 bool ShouldYieldClockRefreshToDeepSleep();
 
+// Foreground UI policy for automatic idle deep sleep. Interactive pages use
+// ESP-PM light sleep only; standby pages may additionally arm a display timer.
+// Emergency/user-requested shutdown paths deliberately ignore this policy.
+enum class DeepSleepUiPolicy : uint8_t {
+    kLightSleepOnly = 0,
+    kDeepSleepNoDisplayTimer,
+    kDeepSleepWithDisplayTimer,
+};
+
 esp_err_t StartPowerCoordinator();
 // Synchronizes USB/charger status with the global sleep policy. Call once
 // after InitSleepCoordinator(), then periodically from PowerCoordinator.
 void RefreshUsbPowerSleepPolicy();
-void SetDeepSleepTimerWakePreference(bool enabled);
+void SetDeepSleepUiPolicy(DeepSleepUiPolicy policy);
 void ShutdownForBatteryDepleted();
 // [power-fix] User-initiated power-off (settings page): the coordinator
 // clears the panel on the EPD owner task, quiesces services, then cuts the

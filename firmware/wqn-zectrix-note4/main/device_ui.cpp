@@ -89,6 +89,32 @@ bool ScreenSupportsTimerSkip(wqn::UiScreen screen)
            screen == wqn::UiScreen::kTodo;
 }
 
+wqn::DeepSleepUiPolicy DeepSleepPolicyForUiState(const wqn::AppState& state)
+{
+    switch (state.screen) {
+        case wqn::UiScreen::kHome:
+            return wqn::DeepSleepUiPolicy::kDeepSleepWithDisplayTimer;
+        case wqn::UiScreen::kTime:
+            return state.time_app.config_mode
+                ? wqn::DeepSleepUiPolicy::kLightSleepOnly
+                : wqn::DeepSleepUiPolicy::kDeepSleepWithDisplayTimer;
+        case wqn::UiScreen::kProvisioning:
+            // An unpaired device on battery keeps the existing slow
+            // maintenance cadence; an active portal still owns a blocker.
+            return wqn::DeepSleepUiPolicy::kDeepSleepNoDisplayTimer;
+        case wqn::UiScreen::kAi:
+        case wqn::UiScreen::kTodo:
+        case wqn::UiScreen::kSettings:
+        case wqn::UiScreen::kWord:
+        case wqn::UiScreen::kNote:
+            // Interactive pages retain foreground/session state in RAM and
+            // page-up GPIO39 cannot wake the S3 from deep sleep. ESP-PM
+            // tickless light sleep remains available whenever leases clear.
+            return wqn::DeepSleepUiPolicy::kLightSleepOnly;
+    }
+    return wqn::DeepSleepUiPolicy::kLightSleepOnly;
+}
+
 bool IsBackgroundSyncTimerWake(
     const wqn::runtime::WakeContext& wake)
 {
@@ -1252,11 +1278,7 @@ wqn::AiStreamingStatusView streaming_view{};
         vTaskDelay(pdMS_TO_TICKS(10));
 
         g_rtc_screen_val = static_cast<int>(state.screen);
-        const bool enable_timer_wakeup =
-            state.screen == wqn::UiScreen::kHome ||
-            state.screen == wqn::UiScreen::kTime ||
-            wqn::TimeAppHasActiveTimer(state.time_app);
-        wqn::SetDeepSleepTimerWakePreference(enable_timer_wakeup);
+        wqn::SetDeepSleepUiPolicy(DeepSleepPolicyForUiState(state));
 
         const int64_t idle_ms = (esp_timer_get_time() - g_last_active_us_local) / 1000;
         const bool screen_active = (state.screen == wqn::UiScreen::kTime ||
