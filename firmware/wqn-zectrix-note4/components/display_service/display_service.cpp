@@ -1141,6 +1141,12 @@ esp_err_t InitEpdDisplay()
     return ESP_OK;
 }
 
+bool IsEpdFramebufferSynchronized()
+{
+    EpdOperationGuard operation(portMAX_DELAY);
+    return operation.locked() && g_previous_framebuffer_synced;
+}
+
 void ClearEpdFramebuffer(bool white)
 {
     if (g_framebuffer == nullptr) {

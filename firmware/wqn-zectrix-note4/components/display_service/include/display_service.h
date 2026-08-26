@@ -18,6 +18,10 @@ constexpr int kEpdFramebufferSize = kEpdBytesPerRow * kEpdHeight;
 
 // Initializes the Note4 4.2" EPD backend and allocates the 1bpp framebuffer.
 esp_err_t InitEpdDisplay();
+// True only when the RAM previous-frame mirror represents the physical panel.
+// Deep sleep/cold initialization clears this state; region-only drawing must
+// fall back to a complete frame until a successful refresh synchronizes it.
+bool IsEpdFramebufferSynchronized();
 
 // Rendering executes on DisplayService's task. The framebuffer remains
 // private to the service; clients receive drawing operations, not a pointer.

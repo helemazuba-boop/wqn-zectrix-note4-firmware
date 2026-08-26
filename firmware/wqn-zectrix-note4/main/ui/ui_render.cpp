@@ -27,10 +27,31 @@ esp_err_t RenderFrameToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
     ESP_RETURN_ON_FALSE(
         frame_txn.locked(), ESP_ERR_NO_MEM, kTag,
         "take EPD frame transaction");
+    // A background sync wake deliberately defers panel initialization until
+    // pixels actually need to change. Initialize before any draw operation;
+    // relying on RefreshEpdFull's later lazy init would clear the framebuffer
+    // after rendering and transmit a blank/incomplete page.
+    ESP_RETURN_ON_ERROR(
+        wqn::InitEpdDisplay(), kTag, "initialize EPD before frame render");
     ESP_LOGI(kTag, "RenderFrameToEpd: enter schedule=%s screen=%d", RefreshScheduleName(schedule), static_cast<int>(frame.screen));
     const UBaseType_t hwm_before_render = uxTaskGetStackHighWaterMark(nullptr);
     ESP_LOGI(kTag, "RenderFrameToEpd: stack HWM before render: %u bytes free", static_cast<unsigned>(hwm_before_render * sizeof(StackType_t)));
-    if (schedule == RefreshSchedule::kClock) {
+    const bool region_frame_available = wqn::IsEpdFramebufferSynchronized();
+    const bool region_schedule =
+        schedule == RefreshSchedule::kClock ||
+        schedule == RefreshSchedule::kTimer;
+    if (region_schedule && !region_frame_available) {
+        // [timer-skip] Deep sleep loses the PSRAM previous-frame mirror. A
+        // region renderer would otherwise draw onto the freshly-cleared white
+        // framebuffer, then the driver's conservative full refresh would
+        // erase every untouched part of the physical page. Fall through to
+        // the complete page renderer; the driver will establish a new mirror.
+        ESP_LOGI(
+            kTag,
+            "EPD region refresh promoted to complete frame: schedule=%s screen=%d previous-unsynced",
+            RefreshScheduleName(schedule), static_cast<int>(frame.screen));
+    }
+    if (region_frame_available && schedule == RefreshSchedule::kClock) {
         if (frame.screen == wqn::UiScreen::kHome) {
             return wqn::TimeAppHasActiveTimer(frame.time_app)
                 ? RenderHomeStatusBarRegion(frame.home, schedule)
@@ -42,7 +63,7 @@ esp_err_t RenderFrameToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
         }
     }
 
-    if (schedule == RefreshSchedule::kTimer) {
+    if (region_frame_available && schedule == RefreshSchedule::kTimer) {
         if (frame.screen == wqn::UiScreen::kHome) {
             return RenderHomePrimaryRegion(frame.home, schedule);
         }

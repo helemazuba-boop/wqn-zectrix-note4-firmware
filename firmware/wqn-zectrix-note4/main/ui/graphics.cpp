@@ -162,6 +162,16 @@ void DrawProgressFill(int x, int y, int width, int height) { FillRect(x, y, widt
 void DrawRoleBar(int x, int y, int width, int height) { FillRect(x, y, width, height, true); }       // role marker bar (AI assistant)
 void DrawActivityDot(int x, int y, int size) { FillRect(x, y, size, size, true); }                    // activity indicator dot
 
+constexpr bool ScheduleAllowsWindowedPartial(RefreshSchedule schedule)
+{
+    return schedule == RefreshSchedule::kClock ||
+           schedule == RefreshSchedule::kTimer ||
+           schedule == RefreshSchedule::kConfig;
+}
+
+static_assert(!ScheduleAllowsWindowedPartial(RefreshSchedule::kSelection));
+static_assert(ScheduleAllowsWindowedPartial(RefreshSchedule::kClock));
+
 // [L3-doc] RefreshRegion/RefreshStableRegion: the UiRect is logged + feeds
 // FrameSignature dedup, but the actual refresh scope is decided by
 // RefreshEpdFull's internal FindDirtyRect (dirty bits vs g_previous_framebuffer).
@@ -179,7 +189,12 @@ esp_err_t RefreshRegion(const UiRect& rect, RefreshSchedule schedule)
         rect.y,
         rect.width,
         rect.height);
-    return wqn::RefreshEpdFull(true, false);
+    // [epd-wedge-fix] Keep the same selection policy as RefreshFrame(). Word
+    // and settings renderers reach this wrapper directly, so hardcoding true
+    // here bypassed the selection guard and produced the measured
+    // selection -> local-partial -> BUSY timeout/recovery stall.
+    return wqn::RefreshEpdFull(
+        ScheduleAllowsWindowedPartial(schedule), false);
 }
 
 esp_err_t RefreshStableRegion(const UiRect& rect, RefreshSchedule schedule)
@@ -208,8 +223,7 @@ esp_err_t RefreshFrame(const wqn::UiFrame& frame, RefreshSchedule schedule)
     // (LP 366-772ms vs FFP 408-772ms; the DRF waveform dominates). Clock/timer
     // ticks keep the local path: tiny diffs, power-sensitive, never wedged.
     const bool allow_local_partial =
-        schedule == RefreshSchedule::kClock || schedule == RefreshSchedule::kTimer ||
-        schedule == RefreshSchedule::kConfig;
+        ScheduleAllowsWindowedPartial(schedule);
     // [power-fix] Force a full refresh when:
     //   (a) the panel is being shown a genuinely different screen, OR
     //   (b) the producer asked for kCommit (used for screen transitions,
@@ -222,10 +236,13 @@ esp_err_t RefreshFrame(const wqn::UiFrame& frame, RefreshSchedule schedule)
     //   The kImmediate branch is intentionally absent here -- on RTC wake the
     //   CRC fast path inside RefreshEpdFull() suppresses the SPI transfer
     //   when nothing changed.
+    const bool prefer_full_for_schedule = frame.prefer_full_refresh &&
+        schedule != RefreshSchedule::kClock &&
+        schedule != RefreshSchedule::kTimer;
     const bool force_full_refresh =
         frame.screen != g_last_rendered_screen ||
         schedule == RefreshSchedule::kCommit ||
-        frame.prefer_full_refresh;  // [full-refresh-fix] honor producer's full-refresh request (was dead code -> ghosting on tier switch / provision exit)
+        prefer_full_for_schedule;  // [full-refresh-fix] honor producer preference without overriding clock/timer partial intent
     if (frame.screen != g_last_rendered_screen) {
         ESP_LOGI(kTag, "EPD: screen change detected (%d -> %d), forcing full refresh",
                  static_cast<int>(g_last_rendered_screen), static_cast<int>(frame.screen));
