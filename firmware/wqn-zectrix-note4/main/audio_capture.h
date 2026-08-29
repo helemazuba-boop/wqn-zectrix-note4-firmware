@@ -32,4 +32,7 @@ esp_err_t StopAudioCapture(AudioCaptureChunk* chunk);
 void ReleaseAudioCapturePower();
 bool IsAudioCaptureRunning();
 
+typedef void (*AudioCaptureTapFn)(const int16_t* samples, size_t count, void* ctx);
+void SetAudioCaptureTap(AudioCaptureTapFn cb, void* ctx);
+
 }  // namespace wqn

@@ -457,6 +457,7 @@ struct WqnAiSseEvent {
     std::string error_message;
     std::string error_stage;
     std::string conversation_id;
+    std::string request_id;
     int latency_ms = 0;
     // final
     std::vector<WqnAiAction> actions;

@@ -65,6 +65,10 @@
 #define WQN_FLASH_WS_SUBPROTOCOL "wqn-flash-v2"
 #endif
 
+#ifndef WQN_VOICE_WS_SUBPROTOCOL
+#define WQN_VOICE_WS_SUBPROTOCOL "wqn-voice-v2"
+#endif
+
 #ifndef WQN_FLASH_VOICE
 #define WQN_FLASH_VOICE "qingchunshaonv"
 #endif

@@ -15,6 +15,7 @@
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "i2c_bus_lock.h"
 #include "power_manager.h"
 #include "runtime/sleep_coordinator.h"
 
@@ -442,6 +443,20 @@ esp_err_t RecoverCodecPower(const AudioCommand& command)
         return ESP_ERR_INVALID_STATE;
     }
 
+    // [lifecycle-align] Official ZecTrix firmware enables GPIO42 once at boot
+    // and keeps the audio rail powered through idle; captures configure the
+    // codec over the warm rail (the driver's REG00 software reset covers
+    // register state), so a live rail must never be cold-cycled around
+    // recordings. Reserve the full power recovery for a real rail loss:
+    // after deep-sleep preparation, a battery-emergency force-off, or a
+    // failed sleep-abort rollback.
+    if (g_codec_powered.load(std::memory_order_acquire)) {
+        ESP_LOGI(kTag,
+                 "codec power recovery skipped: session=%lu rail already powered",
+                 static_cast<unsigned long>(command.session_id));
+        return ESP_OK;
+    }
+
     esp_err_t result = ApplyAmplifier(false);
     if (result == ESP_OK) {
         result = ApplyCodecPower(false);
@@ -460,8 +475,8 @@ esp_err_t RecoverCodecPower(const AudioCommand& command)
              esp_err_to_name(result), static_cast<int>(result));
     if (result == ESP_OK) {
         // ES8311's analog/reference rail needs a full warm-up after a real
-        // power cycle. The delay is paid only after a cold start or a prior
-        // failed capture; normal consecutive turns keep the warm rail.
+        // power cycle. The delay is paid only on this cold-recovery path;
+        // captures over an already-powered rail skip it entirely.
         vTaskDelay(kCodecPowerOnWarmup);
     }
     return result;
@@ -1031,8 +1046,15 @@ esp_err_t AddAudioCodec(
     // device object; it does not verify that the codec ACKs on the wires.
     // Probe while the AudioService operation is held so a stale/unpowered
     // ES8311 is reported before any register sequence is attempted.
-    const esp_err_t probe_result =
-        i2c_master_probe(AsBus(bus), kEs8311Address, 100);
+    esp_err_t probe_result = ESP_FAIL;
+    {
+        ScopedI2cBusLock bus_lock("audio_codec_probe");
+        if (bus_lock.locked()) {
+            probe_result = i2c_master_probe(AsBus(bus), kEs8311Address, 100);
+        } else {
+            probe_result = bus_lock.status();
+        }
+    }
     ESP_LOGI(kTag, "probe ES8311: session=%lu bus=%p addr=0x%02x result=%s (%d)",
              static_cast<unsigned long>(session.id), bus,
              static_cast<unsigned>(kEs8311Address),
@@ -1102,8 +1124,18 @@ esp_err_t WriteAudioCodecRegister(
     int attempts_used = 0;
     for (int attempt = 1; attempt <= kCodecI2cMaxAttempts; ++attempt) {
         attempts_used = attempt;
-        result = i2c_master_transmit(
-            AsCodec(codec), data, sizeof(data), pdMS_TO_TICKS(100));
+        // [i2c-bus-lock] One locked transaction per attempt: the shared bus
+        // also serves the PCF8563 RTC from the power tasks, and an unserialized
+        // transmit from either side fails with ESP_ERR_INVALID_STATE while the
+        // other side is mid-transaction. Locking per attempt keeps the retry
+        // cadence and never starves the RTC owner.
+        ScopedI2cBusLock bus_lock("audio_codec_write");
+        if (bus_lock.locked()) {
+            result = i2c_master_transmit(
+                AsCodec(codec), data, sizeof(data), pdMS_TO_TICKS(100));
+        } else {
+            result = bus_lock.status();
+        }
         if (result == ESP_OK) {
             if (attempt > 1) {
                 ESP_LOGI(kTag,
@@ -1148,9 +1180,15 @@ esp_err_t ReadAudioCodecRegister(
     int attempts_used = 0;
     for (int attempt = 1; attempt <= kCodecI2cMaxAttempts; ++attempt) {
         attempts_used = attempt;
-        result = i2c_master_transmit_receive(
-            AsCodec(codec), &reg, sizeof(reg), value, sizeof(*value),
-            pdMS_TO_TICKS(100));
+        // [i2c-bus-lock] Same per-attempt serialization as the write path.
+        ScopedI2cBusLock bus_lock("audio_codec_read");
+        if (bus_lock.locked()) {
+            result = i2c_master_transmit_receive(
+                AsCodec(codec), &reg, sizeof(reg), value, sizeof(*value),
+                pdMS_TO_TICKS(100));
+        } else {
+            result = bus_lock.status();
+        }
         if (result == ESP_OK) {
             if (attempt > 1) {
                 ESP_LOGI(kTag,

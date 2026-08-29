@@ -28,13 +28,25 @@ constexpr size_t kMaxCaptureSamples =
 constexpr size_t kReadFrames = 240;
 constexpr size_t kReadSamples = kReadFrames * kStereoChannels;
 constexpr int kAdcWarmupReadCount = 4;
-constexpr uint32_t kI2sDmaFrameNum = 256;
+// [dma-footprint] The RX DMA pool is 6 descriptors x this frame count x 4 B.
+// 256 frames asked for ~6 KiB of DMA-capable internal memory per capture;
+// after the first AI turn fragments the heap (device-observed largest block
+// dropping to 4352 B) those allocations fail and every later recording dies
+// at init step=i2s. 128 frames keeps ~48 ms of buffering (the read cadence is
+// 15 ms) while shrinking each descriptor request to ~0.5 KiB / ~3 KiB total,
+// which stays placeable on a fragmented heap.
+constexpr uint32_t kI2sDmaFrameNum = 128;
 constexpr int kMaxConsecutiveReadTimeouts = 5;
 constexpr int kI2sClockWarmupMs = 20;
 // CONFIG_FREERTOS_HZ is 100, so waits shorter than 10 ms round down to zero
 // ticks. Give ES8311 one real scheduler tick to resynchronize its I2C logic
 // after the external clock path is selected.
-constexpr int kCodecClockSwitchSettleMs = 10;
+// [codec-nack] Field data (USB/charger powered runs): the ES8311 NACK window
+// around the REG04/REG05 external-clock switch widens with charger noise on
+// the rails, and 10 ms was exhausted on every pass (24/24 configure failures,
+// zero in-sequence recoveries). 25 ms keeps the same documented mechanism but
+// rides out the wider window without touching the register order.
+constexpr int kCodecClockSwitchSettleMs = 25;
 constexpr int kCodecResetSettleMs = 20;
 constexpr int kCaptureInitWaitAttempts = 120;
 constexpr int kCaptureInitWaitStepMs = 25;
@@ -77,14 +89,33 @@ struct AudioServiceState {
     bool audio_powered = false;
     esp_err_t terminal_result = ESP_OK;
     TaskHandle_t task = nullptr;
+    // True while the persistent capture worker is parked waiting for a start
+    // notification (no live capture session). Mirrors the old "task == nullptr"
+    // state that callers used to detect "nothing to stop".
+    bool worker_parked = true;
     wqn::services::AudioBusHandle i2c_bus = nullptr;
     wqn::services::AudioChannelHandle rx = nullptr;
     int16_t* capture_buffer = nullptr;
     wqn::AudioCaptureChunk chunk;
     wqn::services::AudioSession session;
+    wqn::AudioCaptureTapFn tap_cb = nullptr;
+    void* tap_ctx = nullptr;
 };
 
 AudioServiceState g_audio;
+
+// [capture-task-reserve] The capture worker's internal stack and TCB are
+// pinned here for the process lifetime, mirroring the PSRAM PCM buffer
+// reservation. After the first AI turn fragments the internal heap a
+// transient xTaskCreate of this size can never succeed again; a
+// statically-stored, permanently-parked worker makes capture start
+// independent of heap layout.
+// 6144 B: device-measured session peak is 4184 B (HWM 4008 incl. codec-retry
+// logging bursts); this leaves ~1.9 KiB margin while returning 2 KiB of SRAM
+// to the DMA-starved heap versus the original 8192.
+constexpr uint32_t kCaptureTaskStackBytes = 6144;
+StaticTask_t g_capture_task_tcb = {};
+StackType_t g_capture_task_stack[kCaptureTaskStackBytes / sizeof(StackType_t)] = {};
 
 int64_t IntegerSqrt(int64_t value)
 {
@@ -256,15 +287,19 @@ esp_err_t InitEs8311Adc(wqn::services::AudioBusHandle bus)
     ESP_RETURN_ON_ERROR(AddCodecDevice(bus, &dev), kTag, "add ES8311 device");
 
     esp_err_t first_error = ESP_OK;
+    int write_seq = 0;  // [codec-nack] index of the failing transaction within
+                        // the sequence: distinguishes clock-switch NACKs
+                        // (early indices) from late-sequence degradation.
     auto write = [&](uint8_t reg, uint8_t value) -> esp_err_t {
         if (first_error != ESP_OK) {
             return first_error;
         }
+        ++write_seq;
         const esp_err_t result = WriteCodecReg(dev, reg, value);
         if (result != ESP_OK) {
             first_error = result;
-            ESP_LOGE(kTag, "ES8311 write failed: reg=0x%02x value=0x%02x result=%s (%d)",
-                     reg, value, esp_err_to_name(result), static_cast<int>(result));
+            ESP_LOGE(kTag, "ES8311 write failed: seq=%d reg=0x%02x value=0x%02x result=%s (%d)",
+                     write_seq, reg, value, esp_err_to_name(result), static_cast<int>(result));
         }
         return result;
     };
@@ -349,14 +384,14 @@ esp_err_t InitEs8311Adc(wqn::services::AudioBusHandle bus)
     }
 
     ret |= write(ES8311_ADC_REG17, 0xBF);
-    ret |= write(ES8311_SYSTEM_REG0E, 0x02);
-    ret |= write(ES8311_SYSTEM_REG12, 0x00);
     ret |= write(ES8311_SYSTEM_REG14, 0x1A);
     if (read(ES8311_SYSTEM_REG14, &reg) == ESP_OK) {
         ret |= write(ES8311_SYSTEM_REG14, reg & ~0x40);
     } else {
         ret = ESP_FAIL;
     }
+    ret |= write(ES8311_SYSTEM_REG0E, 0x02);
+    ret |= write(ES8311_SYSTEM_REG12, 0x00);
     ret |= write(ES8311_SYSTEM_REG0D, 0x01);
     ret |= write(ES8311_ADC_REG15, 0x40);
     ret |= write(ES8311_DAC_REG37, 0x08);
@@ -436,6 +471,12 @@ esp_err_t CleanupCaptureHardware(bool keep_power)
         if (delete_result == ESP_OK) {
             g_audio.rx_enabled = false;
         }
+        // [dma-attrib] Confirms whether the I2S create/delete cycle returns
+        // its DMA pool (a falling dma_free here means the driver leaks).
+        ESP_LOGI(kTag,
+                 "[dma-attrib] after-i2s-delete dma_free=%u dma_largest=%u",
+                 static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_DMA)),
+                 static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_DMA)));
     }
     if (g_audio.i2c_bus != nullptr) {
         // The bus is owned by power_manager and must not be deleted here.
@@ -472,7 +513,10 @@ bool StopRequested()
     return stop;
 }
 
-void CaptureTask(void*)
+// One capture session: init codec/I2S, stream until stop_requested, clean up.
+// Runs on the persistent CaptureTask worker; returns when the session is fully
+// torn down and the state is published.
+void CaptureSession()
 {
     const auto snapshot = wqn::services::GetAudioSnapshot();
     ESP_LOGI(kTag,
@@ -493,8 +537,14 @@ void CaptureTask(void*)
     }
     if (result == ESP_OK) {
         result = InitI2s(&g_audio.rx);
-        ESP_LOGI(kTag, "capture init step=i2s result=%s (%d) RX=%p",
-                 esp_err_to_name(result), static_cast<int>(result), g_audio.rx);
+        ESP_LOGI(kTag, "capture init step=i2s result=%s (%d)",
+                 esp_err_to_name(result), static_cast<int>(result));
+        // [dma-attrib] Snapshot right after the I2S DMA pool is taken or
+        // refused, to separate I2S-cycle deltas from connect/teardown deltas.
+        ESP_LOGI(kTag,
+                 "[dma-attrib] after-i2s-create dma_free=%u dma_largest=%u",
+                 static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_DMA)),
+                 static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_DMA)));
     }
     if (result == ESP_OK) {
         // REG01..REG03 select the external audio clock path. Keep MCLK/BCLK/WS
@@ -504,6 +554,22 @@ void CaptureTask(void*)
         result = InitEs8311Adc(g_audio.i2c_bus);
         ESP_LOGI(kTag, "capture init step=es8311 result=%s (%d)",
                  esp_err_to_name(result), static_cast<int>(result));
+        if (result != ESP_OK) {
+            // [codec-retry] The codec intermittently NACKs a random register
+            // mid-sequence (REG05/06/08/12 observed) while its clock domain
+            // settles, then ACKs again on the next turn. InitEs8311Adc removes
+            // its own device on failure, so one full re-add + reconfigure pass
+            // recovers most of those turns without touching the sequence.
+            vTaskDelay(pdMS_TO_TICKS(50));
+            const esp_err_t retry_result = InitEs8311Adc(g_audio.i2c_bus);
+            ESP_LOGI(kTag,
+                     "capture init step=es8311 retry result=%s (%d)",
+                     esp_err_to_name(retry_result),
+                     static_cast<int>(retry_result));
+            if (retry_result == ESP_OK) {
+                result = ESP_OK;
+            }
+        }
     }
 
     if (result != ESP_OK) {
@@ -527,10 +593,9 @@ void CaptureTask(void*)
         }
         xSemaphoreTake(g_audio.mutex, portMAX_DELAY);
         g_audio.running = false;
-        g_audio.task = nullptr;
+        g_audio.worker_parked = true;
         g_audio.terminal_result = terminal_result;
         xSemaphoreGive(g_audio.mutex);
-        vTaskDelete(nullptr);
         return;
     }
 
@@ -562,10 +627,9 @@ void CaptureTask(void*)
         }
         xSemaphoreTake(g_audio.mutex, portMAX_DELAY);
         g_audio.running = false;
-        g_audio.task = nullptr;
+        g_audio.worker_parked = true;
         g_audio.terminal_result = terminal_result;
         xSemaphoreGive(g_audio.mutex);
-        vTaskDelete(nullptr);
         return;
     }
     xSemaphoreTake(g_audio.mutex, portMAX_DELAY);
@@ -605,6 +669,10 @@ void CaptureTask(void*)
         }
         consecutive_timeouts = 0;
 
+        constexpr size_t kMaxMonoFrames = 240;
+        int16_t mono_buf[kMaxMonoFrames];
+        size_t mono_count = 0;
+
         const size_t samples_read = bytes_read / sizeof(int16_t);
         for (size_t i = 0; i + 1 < samples_read; i += 2) {
             if (g_audio.chunk.sample_count >= kMaxCaptureSamples) {
@@ -615,6 +683,9 @@ void CaptureTask(void*)
             const int right = static_cast<int>(buffer[i + 1]);
             const int16_t sample = buffer[i];
             g_audio.capture_buffer[g_audio.chunk.sample_count++] = sample;
+            if (mono_count < kMaxMonoFrames) {
+                mono_buf[mono_count++] = sample;
+            }
             const int abs_value = std::abs(static_cast<int>(sample));
             const int left_abs = std::abs(left);
             const int right_abs = std::abs(right);
@@ -627,6 +698,9 @@ void CaptureTask(void*)
             g_audio.chunk.peak = std::max<int16_t>(
                 g_audio.chunk.peak,
                 static_cast<int16_t>(std::min(abs_value, static_cast<int>(std::numeric_limits<int16_t>::max()))));
+        }
+        if (mono_count > 0 && g_audio.tap_cb != nullptr) {
+            g_audio.tap_cb(mono_buf, mono_count, g_audio.tap_ctx);
         }
         g_audio.chunk.duration_ms = static_cast<int>((esp_timer_get_time() - start_us) / 1000);
         if (sample_capacity_reached) {
@@ -659,13 +733,16 @@ void CaptureTask(void*)
     const size_t logged_sample_count = g_audio.chunk.sample_count;
     const int16_t logged_peak = g_audio.chunk.peak;
     const int logged_rms = g_audio.chunk.rms;
+    // Stack HWM of this session: evidence for any future stack-size decision.
+    const unsigned logged_stack_hwm =
+        static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr));
     g_audio.running = false;
-    g_audio.task = nullptr;
+    g_audio.worker_parked = true;
     g_audio.terminal_result = terminal_result;
     xSemaphoreGive(g_audio.mutex);
     ESP_LOGI(
         kTag,
-        "capture stop: duration_ms=%d wall_duration_ms=%d mono_samples=%u peak=%d rms=%d left_peak=%d right_peak=%d left_mean_abs=%d right_mean_abs=%d",
+        "capture stop: duration_ms=%d wall_duration_ms=%d mono_samples=%u peak=%d rms=%d left_peak=%d right_peak=%d left_mean_abs=%d right_mean_abs=%d stack_hwm=%u",
         logged_duration_ms,
         wall_capture_duration_ms,
         static_cast<unsigned>(logged_sample_count),
@@ -674,8 +751,20 @@ void CaptureTask(void*)
         left_peak,
         right_peak,
         stereo_frames == 0 ? 0 : static_cast<int>(left_abs_sum / static_cast<int64_t>(stereo_frames)),
-        stereo_frames == 0 ? 0 : static_cast<int>(right_abs_sum / static_cast<int64_t>(stereo_frames)));
-    vTaskDelete(nullptr);
+        stereo_frames == 0 ? 0 : static_cast<int>(right_abs_sum / static_cast<int64_t>(stereo_frames)),
+        logged_stack_hwm);
+}
+
+void CaptureTask(void*)
+{
+    for (;;) {
+        // Parked between sessions; StartAudioCapture dispatches exactly one
+        // capture per notification. The worker never deletes itself, so its
+        // statically-stored stack/TCB are reused with no teardown race and no
+        // heap churn between turns.
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        CaptureSession();
+    }
 }
 
 }  // namespace
@@ -692,8 +781,43 @@ esp_err_t StartAudioCapture()
     ESP_RETURN_ON_ERROR(EnsureAudioService(), kTag, "init audio service");
     ESP_RETURN_ON_ERROR(EnsureCaptureBuffer(), kTag, "allocate capture PSRAM buffer");
 
+    // [dma-footprint] The I2S RX channel allocates its descriptors with
+    // MALLOC_CAP_INTERNAL|MALLOC_CAP_DMA. When the DMA-capable sub-pool is
+    // exhausted (WiFi dynamic buffers etc.) even a 0.5 KiB request fails while
+    // generic internal memory still shows tens of KiB free; log both views at
+    // every start so a failing init is attributable immediately.
+    ESP_LOGI(kTag,
+             "capture heap check: dma_free=%u dma_largest=%u internal_free=%u internal_largest=%u",
+             static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_DMA)),
+             static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_DMA)),
+             static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
+             static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)));
+
     xSemaphoreTake(g_audio.mutex, portMAX_DELAY);
     if (g_audio.running) {
+        xSemaphoreGive(g_audio.mutex);
+        return ESP_ERR_INVALID_STATE;
+    }
+    // [capture-task-reserve] Create the persistent worker once; its stack and
+    // TCB are statically stored so internal-heap fragmentation can never block
+    // a recording start again.
+    if (g_audio.task == nullptr) {
+        TaskHandle_t worker = xTaskCreateStatic(
+            CaptureTask, "wqn_audio_cap", kCaptureTaskStackBytes, nullptr, 6,
+            g_capture_task_stack, &g_capture_task_tcb);
+        if (worker == nullptr) {
+            // Unreachable with CONFIG_FREERTOS_SUPPORT_STATIC_ALLOCATION=y;
+            // kept for symmetry with the previous dynamic-creation rollback.
+            g_audio.running = false;
+            ESP_ERROR_CHECK_WITHOUT_ABORT(
+                wqn::services::EndAudioActivity(&g_audio.session));
+            xSemaphoreGive(g_audio.mutex);
+            return ESP_ERR_NO_MEM;
+        }
+        g_audio.task = worker;
+    }
+    if (!g_audio.worker_parked) {
+        // The previous session is still winding down on the worker context.
         xSemaphoreGive(g_audio.mutex);
         return ESP_ERR_INVALID_STATE;
     }
@@ -709,21 +833,10 @@ esp_err_t StartAudioCapture()
     g_audio.terminal_result = ESP_OK;
     g_audio.chunk = {};
     g_audio.chunk.samples = g_audio.capture_buffer;
+    g_audio.worker_parked = false;
     xSemaphoreGive(g_audio.mutex);
 
-    TaskHandle_t task = nullptr;
-    const BaseType_t created = xTaskCreate(CaptureTask, "wqn_audio_cap", 8192, nullptr, 6, &task);
-    xSemaphoreTake(g_audio.mutex, portMAX_DELAY);
-    if (created != pdPASS) {
-        g_audio.running = false;
-        g_audio.task = nullptr;
-        ESP_ERROR_CHECK_WITHOUT_ABORT(
-            wqn::services::EndAudioActivity(&g_audio.session));
-        xSemaphoreGive(g_audio.mutex);
-        return ESP_ERR_NO_MEM;
-    }
-    g_audio.task = g_audio.running ? task : nullptr;
-    xSemaphoreGive(g_audio.mutex);
+    xTaskNotifyGive(g_audio.task);
 
     // Do not report "recording started" to AiSession until the asynchronous
     // capture task has actually completed codec + I2S initialization. This
@@ -757,7 +870,7 @@ esp_err_t StopAudioCapture(AudioCaptureChunk* chunk)
 {
     ESP_RETURN_ON_ERROR(EnsureAudioService(), kTag, "init audio service");
     xSemaphoreTake(g_audio.mutex, portMAX_DELAY);
-    if (!g_audio.running && g_audio.task == nullptr) {
+    if (!g_audio.running && g_audio.worker_parked) {
         const bool has_samples = !g_audio.chunk.empty();
         const esp_err_t terminal_result = g_audio.terminal_result;
         if (chunk != nullptr) {
@@ -817,6 +930,18 @@ void ReleaseAudioCapturePower()
     // GPIO42 remains warm during runtime and capture already keeps the PA
     // disabled. Do not arm a stale timer: it could otherwise fire after Flash
     // acquires the next audio session and cut that session's amplifier.
+}
+
+void SetAudioCaptureTap(AudioCaptureTapFn cb, void* ctx)
+{
+    if (g_audio.mutex != nullptr) {
+        xSemaphoreTake(g_audio.mutex, portMAX_DELAY);
+    }
+    g_audio.tap_cb = cb;
+    g_audio.tap_ctx = ctx;
+    if (g_audio.mutex != nullptr) {
+        xSemaphoreGive(g_audio.mutex);
+    }
 }
 
 }  // namespace wqn

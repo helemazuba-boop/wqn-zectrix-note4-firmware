@@ -22,6 +22,10 @@ CONFIG_ESP_WIFI_ENTERPRISE_SUPPORT=n
 # internal heap before the 12 KiB AI submit task stack is created.
 # CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP is not set
 CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER=y
+# [dma-footprint] Dynamic TX buffers are DMA-capped internal RAM; 32 of them
+# can transiently hold ~50 KiB and starve I2S DMA descriptor placement during
+# AI turns. 16 halves that ceiling without affecting bulk sync throughput.
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=16
 
 CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
 CONFIG_MBEDTLS_SSL_KEEP_PEER_CERTIFICATE=n

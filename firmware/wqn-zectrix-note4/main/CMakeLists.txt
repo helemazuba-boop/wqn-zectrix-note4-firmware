@@ -71,6 +71,7 @@ idf_component_register(
         "wqn_api.cpp"
         "wqn_api_stream.cpp"
         "flash_session.cpp"
+        "stdpro_ws_transport.cpp"
     INCLUDE_DIRS "."
     REQUIRES
         driver

@@ -10,6 +10,9 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include "wqn_api.h"
+
+struct cJSON;
 
 namespace wqn {
 
@@ -57,5 +60,13 @@ private:
   std::string data_;
   bool id_seen_ = false;
 };
+
+// Decodes an SSE frame into WqnAiSseEvent.
+// Returns true on success. If out_root is provided, caller owns the returned cJSON* (must cJSON_Delete).
+bool DecodeSseEvent(const std::string& event_name,
+                    uint64_t event_id,
+                    const std::string& data_json,
+                    WqnAiSseEvent* out_ev,
+                    ::cJSON** out_root = nullptr);
 
 }  // namespace wqn

@@ -61,7 +61,7 @@ std::string BuildMacAddress()
   return std::string(buf);
 }
 
-void DispatchEvent(StreamContext* ctx, const wqn::SseFrameBuffer& frame,
+void DispatchEvent(StreamContext* ctx, const wqn::SseFrameBuffer& /*frame*/,
                    const std::string& event_name, uint64_t event_id,
                    const std::string& data_json)
 {
@@ -70,103 +70,14 @@ void DispatchEvent(StreamContext* ctx, const wqn::SseFrameBuffer& frame,
     return;
   }
   wqn::WqnAiSseEvent ev;
-  ev.event_id = event_id;
-  ev.raw_json = data_json;
-  cJSON* root = cJSON_ParseWithLength(data_json.c_str(), data_json.size());
-  if (root == nullptr) {
+  cJSON* root = nullptr;
+  if (!wqn::DecodeSseEvent(event_name, event_id, data_json, &ev, &root)) {
     ESP_LOGW(kTag, "SSE JSON parse failed: %s",
              data_json.size() > 80 ? "<large>" : data_json.c_str());
     return;
   }
 
-  const std::string ev_name = event_name;
-  using Kind = wqn::WqnAiSseEvent::Kind;
-  Kind k = Kind::kUnknown;
-  if      (ev_name == "ready")        k = Kind::kReady;
-  else if (ev_name == "stage")        k = Kind::kStage;
-  else if (ev_name == "asr.delta")    k = Kind::kAsrDelta;
-  else if (ev_name == "asr.complete") k = Kind::kAsrComplete;
-  else if (ev_name == "asr.failed")   k = Kind::kAsrFailed;
-  else if (ev_name == "thinking.start" || ev_name == "reasoning.start" ||
-           ev_name == "response.thinking.start" || ev_name == "response.reasoning.start")
-                                            k = Kind::kThinkingStart;
-  else if (ev_name == "thinking.delta" || ev_name == "reasoning.delta" ||
-           ev_name == "response.thinking.delta" || ev_name == "response.reasoning.delta" ||
-           ev_name == "response.reasoning_summary_text.delta")
-                                            k = Kind::kThinkingDelta;
-  else if (ev_name == "thinking.done" || ev_name == "thinking.end" ||
-           ev_name == "reasoning.done" || ev_name == "reasoning.end" ||
-           ev_name == "response.thinking.done" || ev_name == "response.reasoning.done" ||
-           ev_name == "response.reasoning_summary_text.done")
-                                            k = Kind::kThinkingDone;
-  else if (ev_name == "text.start")    k = Kind::kTextStart;
-  else if (ev_name == "text.delta")    k = Kind::kTextDelta;
-  else if (ev_name == "text.end")      k = Kind::kTextEnd;
-  else if (ev_name == "tool.start")    k = Kind::kToolStart;
-  else if (ev_name == "tool.result")   k = Kind::kToolResult;
-  else if (ev_name == "tool.error")    k = Kind::kToolError;
-  else if (ev_name == "state")         k = Kind::kState;
-  else if (ev_name == "turn.done" || ev_name == "response.done")
-                                            k = Kind::kTurnDone;
-  else if (ev_name == "error")         k = Kind::kError;
-  else if (ev_name == "final")         k = Kind::kFinal;
-  ev.kind = k;
-
-  // Now copy relevant fields.
-  cJSON* n = nullptr;
-
-  if ((n = cJSON_GetObjectItemCaseSensitive(root, "delta")) != nullptr && cJSON_IsString(n)) {
-    ev.delta = n->valuestring;
-  }
-  if ((n = cJSON_GetObjectItemCaseSensitive(root, "text")) != nullptr && cJSON_IsString(n)) {
-    ev.text = n->valuestring;
-  }
-  if ((n = cJSON_GetObjectItemCaseSensitive(root, "full_text")) != nullptr && cJSON_IsString(n)) {
-    ev.full_text = n->valuestring;
-  }
-  if ((n = cJSON_GetObjectItemCaseSensitive(root, "sentence_id")) != nullptr && cJSON_IsString(n)) {
-    ev.sentence_id = n->valuestring;
-  }
-  if ((n = cJSON_GetObjectItemCaseSensitive(root, "tool_call_id")) != nullptr && cJSON_IsString(n)) {
-    ev.tool_call_id = n->valuestring;
-  }
-  if ((n = cJSON_GetObjectItemCaseSensitive(root, "name")) != nullptr && cJSON_IsString(n)) {
-    ev.tool_name = n->valuestring;
-  }
-  if ((n = cJSON_GetObjectItemCaseSensitive(root, "display")) != nullptr && cJSON_IsString(n)) {
-    ev.tool_display = n->valuestring;
-  }
-  if ((n = cJSON_GetObjectItemCaseSensitive(root, "ok")) != nullptr && cJSON_IsBool(n)) {
-    ev.tool_ok = cJSON_IsTrue(n);
-  }
-  if ((n = cJSON_GetObjectItemCaseSensitive(root, "items_count")) != nullptr && cJSON_IsNumber(n)) {
-    ev.tool_items_count = n->valueint;
-  }
-  if ((n = cJSON_GetObjectItemCaseSensitive(root, "elapsed_ms")) != nullptr && cJSON_IsNumber(n)) {
-    ev.elapsed_ms = n->valueint;
-    ev.tool_elapsed_ms = n->valueint;
-  }
-  if ((n = cJSON_GetObjectItemCaseSensitive(root, "stage")) != nullptr && cJSON_IsString(n)) {
-    ev.stage = n->valuestring;
-  }
-  if ((n = cJSON_GetObjectItemCaseSensitive(root, "text_chars")) != nullptr && cJSON_IsNumber(n)) {
-    ev.text_chars = n->valueint;
-  }
-  if ((n = cJSON_GetObjectItemCaseSensitive(root, "error_code")) != nullptr && cJSON_IsString(n)) {
-    ev.error_code = n->valuestring;
-  }
-  if ((n = cJSON_GetObjectItemCaseSensitive(root, "message")) != nullptr && cJSON_IsString(n)) {
-    ev.error_message = n->valuestring;
-  }
-  if ((n = cJSON_GetObjectItemCaseSensitive(root, "stage")) != nullptr && cJSON_IsString(n) && k == wqn::WqnAiSseEvent::Kind::kError) {
-    ev.error_stage = n->valuestring;
-  }
-  if ((n = cJSON_GetObjectItemCaseSensitive(root, "conversation_id")) != nullptr && cJSON_IsString(n)) {
-    ev.conversation_id = n->valuestring;
-  }
-  if ((n = cJSON_GetObjectItemCaseSensitive(root, "latency_ms")) != nullptr && cJSON_IsNumber(n)) {
-    ev.latency_ms = n->valueint;
-  }
+  const auto k = ev.kind;
 
   // Snapshot conversation_id into the response (used by the final callback).
   if (!ev.conversation_id.empty() && ctx->response != nullptr) {
