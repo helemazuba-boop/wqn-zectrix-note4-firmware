@@ -1,8 +1,7 @@
-# Serial monitor for the Note4 USB-Serial-JTAG, intended as a replacement for
-# `idf.py monitor` (broken on this board's native USB-Serial-JTAG path per
-# BUILD_HERE.md) and the legacy `listen_usb.py`. Pure PowerShell, no Python
-# or ESP-IDF deps. Auto-reopens the port when the device resets and the JTAG
-# briefly vanishes.
+# No-reset serial monitor for the Note4 native USB-Serial-JTAG. It mirrors the
+# safe DTR/RTS open ordering used by `idf.py monitor --no-reset`, without Python
+# or ESP-IDF dependencies. It auto-reopens the port after a device-initiated
+# reset or USB re-enumeration without intentionally resetting the target.
 [CmdletBinding()]
 param(
     [string]$Port = 'COM7',
@@ -24,14 +23,22 @@ while ($true) {
     try {
         $sp = New-Object System.IO.Ports.SerialPort `
             $Port, $Baud, ([System.IO.Ports.Parity]::None), 8, ([System.IO.Ports.StopBits]::One)
-        # We only want to *read* — do not let DTR/RTS toggle the boot pins on
-        # open. ESP32-S3 USB-Serial-JTAG can re-enter download mode otherwise.
-        $sp.DtrEnable = $false
-        $sp.RtsEnable = $false
+        # Match ESP-IDF Monitor's --no-reset open sequence. On Windows native
+        # USB-Serial-JTAG, opening with both lines deasserted causes
+        # USB_UART_CHIP_RESET (0x15). Stage both asserted before Open(), then
+        # release RTS first and DTR second; --no-reset skips the later pulse.
+        $sp.DtrEnable = $true
+        $sp.RtsEnable = $true
         $sp.ReadTimeout = 500
         $sp.Encoding = [System.Text.Encoding]::UTF8
         $sp.NewLine = "`n"
         $sp.Open()
+
+        # usbser.sys applies DTR state when RTS changes. Re-apply DTR between
+        # the ordered releases, mirroring ESP-IDF's Windows workaround.
+        $sp.RtsEnable = $false
+        $sp.DtrEnable = $true
+        $sp.DtrEnable = $false
 
         $ts = Get-Date -Format 'HH:mm:ss'
         Write-Host "[$ts] opened $Port" -ForegroundColor Green

@@ -79,12 +79,13 @@ idf.py -B build-wsl -DWQN_API_BASE=https://your-host.example.com/api/esp32 build
 
 Default API base is `https://wqn.helema.cn/api/esp32` (`main/config.h`).
 
-Flash/monitor: `idf.py monitor` is **broken** over the chip's Native
-USB-Serial-JTAG. Use the serial listeners in `scripts/` (they write to
-`wqn.log`). On the Windows workspace `deploy.bat` runs the full cycle; **dev
-port is `COM7`, never flash `COM5`** (official-firmware checkpoint). Do not add
-new `.bat` files to the repo root — only `deploy.bat` belongs there; helpers go
-in `scripts/`.
+Flash/monitor: Native USB-Serial-JTAG monitoring **must** use the no-reset
+wrappers in `scripts/`; they apply IDF Monitor's safe DTR/RTS ordering without
+requiring a Windows IDF installation. A resetting listener produces
+`USB_UART_CHIP_RESET (0x15)` and destroys RTC slow-memory diagnostics. On the
+Windows workspace `deploy.bat` runs the full cycle; **dev port is `COM7`, never
+flash `COM5`** (official-firmware checkpoint). Do not add new `.bat` files to
+the repo root — only `deploy.bat` belongs there; helpers go in `scripts/`.
 
 ### Configuration (Kconfig, under "WQN firmware")
 
