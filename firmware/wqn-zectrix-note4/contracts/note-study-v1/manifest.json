@@ -1,7 +1,7 @@
 {
   "contract": "note-study-v1",
   "schema": "note-study-v1.schema.json",
-  "schema_sha256": "a6610bc5b39e6777c325dc948259b5c6d7b604dd8fe011f6495f5c8d7fbc9092",
+  "schema_sha256": "8349221e6be5c69858f1673f11e79aa5318ea07e020d96d1e0b27b9bb6960d32",
   "ordering_algorithm": "sequential_note_v1",
   "pack_schema_version": 1
 }
