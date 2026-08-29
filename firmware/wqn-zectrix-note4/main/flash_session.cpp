@@ -2345,6 +2345,8 @@ esp_err_t StopFlashSessionNow()
         g_flash.pending_text.clear();
         g_flash.tool_label.clear();
         g_flash.error_message.clear();
+        g_flash.audio_reassembly_buf.clear();
+        g_flash.audio_reassembly_buf.shrink_to_fit();
         g_flash.status_since_ms = esp_timer_get_time() / 1000;
         MarkChanged();
         xSemaphoreGive(g_flash.mutex);
