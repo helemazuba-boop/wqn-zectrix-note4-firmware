@@ -40,12 +40,17 @@ struct SleepDiagnosticEvent {
     uint8_t sleep_mode = 0;
     uint8_t charge_full_gpio = 0;
     uint8_t charge_detect_gpio = 0;
+    uint8_t connectivity_state = 0;
+    uint8_t connectivity_demand_count = 0;
+    uint8_t connectivity_demand_priority = 0;
+    uint8_t reserved = 0;
     uint16_t flags = 0;
     uint16_t battery_mv = 0;
     uint32_t generation = 0;
     uint32_t app_uptime_ms = 0;
     uint32_t wall_time_sec = 0;
     uint32_t blocker_mask = 0;
+    uint32_t connectivity_demand_mask = 0;
     uint32_t display_wake_sec = 0;
     uint32_t sync_wake_sec = 0;
     uint32_t chosen_wake_sec = 0;

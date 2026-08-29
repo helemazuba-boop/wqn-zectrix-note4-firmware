@@ -34,7 +34,7 @@ constexpr size_t kMinAudioSamples =
 constexpr int kMaxAudioDurationMs = 20000;
 constexpr int kMinAudioPeak = 80;
 constexpr int kMinAudioRms = 8;
-constexpr TickType_t kWifiReadyWait = pdMS_TO_TICKS(15000);
+constexpr TickType_t kWifiReadyWait = pdMS_TO_TICKS(35000);
 
 SemaphoreHandle_t g_lock = nullptr;
 TaskHandle_t g_submit_task = nullptr;
@@ -49,6 +49,7 @@ uint32_t g_prepare_generation = 0;
 bool g_streaming_active = false;        // true while SubmitTask is parsing SSE events
 bool g_streaming_force_full_render = false; // when true the next UI tick does a full refresh
 wqn::runtime::SleepLease g_ai_sleep_lease;
+wqn::services::ConnectivityDemand g_ai_connectivity_demand;
 std::string g_pending_tool_label;        // "🔧 create_todo…" or "✅ ..." for status bar
 int64_t g_tool_clear_at_ms = 0;          // scheduled status-bar clear
 
@@ -143,6 +144,7 @@ void ReleaseAiSleepLeaseIfIdleLocked()
         g_state.status == wqn::AiSessionStatus::kStreaming;
     if (!g_prepare_active && g_prepare_task == nullptr && g_submit_task == nullptr &&
         !g_streaming_active && !state_active) {
+        g_ai_connectivity_demand.Reset();
         g_ai_sleep_lease.Reset();
     }
 }
@@ -876,6 +878,8 @@ void PrepareRecordingTask(void* parameter)
         kWifi,
     };
     PrepareFailure failure = PrepareFailure::kNone;
+    wqn::services::ConnectivityWaitResult wifi_result =
+        wqn::services::ConnectivityWaitResult::kCancelled;
 
     esp_err_t result = wqn::LoadAccessToken(&token);
     if (result != ESP_OK || token.empty()) {
@@ -885,10 +889,22 @@ void PrepareRecordingTask(void* parameter)
         failure = PrepareFailure::kInvalidToken;
         result = ESP_ERR_INVALID_STATE;
     } else {
-        result = wqn::services::StartConnectivity();
-        if (result == ESP_OK && !wqn::services::IsConnectivityOnline()) {
-            result = wqn::services::WaitForConnectivity(kWifiReadyWait);
+        wqn::services::ConnectivityDemand connectivity_demand =
+            wqn::services::AcquireConnectivityDemand(
+                wqn::services::ConnectivityDemandReason::kAiInteractive,
+                "ai-session",
+                __FILE__,
+                __LINE__);
+        wqn::services::ConnectivityDemandTicket ticket;
+        xSemaphoreTake(g_lock, portMAX_DELAY);
+        if (connectivity_demand && IsCurrentPrepareTaskLocked(generation) &&
+            g_recording_requested) {
+            g_ai_connectivity_demand = std::move(connectivity_demand);
+            ticket = g_ai_connectivity_demand.ticket();
         }
+        xSemaphoreGive(g_lock);
+        wifi_result = wqn::services::WaitForConnectivity(ticket, kWifiReadyWait);
+        result = wqn::services::ConnectivityWaitResultToEspErr(wifi_result);
         if (result != ESP_OK) {
             failure = PrepareFailure::kWifi;
         }
@@ -919,8 +935,28 @@ void PrepareRecordingTask(void* parameter)
                 SetErrorLocked("设备未配对，请先在 Web 端创建配对");
                 ESP_LOGW(kTag, "AI recording blocked: no valid token");
             } else {
-                SetErrorLocked("WiFi 未连接或未配置");
-                ESP_LOGW(kTag, "AI recording blocked: WiFi unavailable: %s", esp_err_to_name(result));
+                switch (wifi_result) {
+                    case wqn::services::ConnectivityWaitResult::kNeedsProvisioning:
+                        SetErrorLocked("未配置 WiFi，请先在设置中配网");
+                        break;
+                    case wqn::services::ConnectivityWaitResult::kAuthFailed:
+                        SetErrorLocked("WiFi 密码错误，请重新配网");
+                        break;
+                    case wqn::services::ConnectivityWaitResult::kTimedOut:
+                        SetErrorLocked("WiFi 连接超时，请稍后重试");
+                        break;
+                    case wqn::services::ConnectivityWaitResult::kCancelled:
+                        SetCancelledBeforeRecordingLocked();
+                        break;
+                    default:
+                        SetErrorLocked("WiFi 暂时不可用，请稍后重试");
+                        break;
+                }
+                ESP_LOGW(
+                    kTag,
+                    "AI recording blocked: WiFi result=%s error=%s",
+                    wqn::services::ConnectivityWaitResultName(wifi_result),
+                    esp_err_to_name(result));
             }
         } else if (current && !g_recording_requested && g_state.status == wqn::AiSessionStatus::kPreparingCapture) {
             SetCancelledBeforeRecordingLocked();
@@ -1080,6 +1116,9 @@ esp_err_t StopAiRecordingAndSubmit()
         g_recording_requested = false;
         ++g_prepare_generation;
         g_prepare_active = false;
+        // Cancels the typed WiFi wait within its 200 ms wake bound without
+        // touching the prepare task handle from the UI task.
+        g_ai_connectivity_demand.Reset();
         SetCancelledBeforeRecordingLocked();
         xSemaphoreGive(g_lock);
         return ESP_OK;

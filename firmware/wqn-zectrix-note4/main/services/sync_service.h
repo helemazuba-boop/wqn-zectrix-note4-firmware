@@ -106,10 +106,9 @@ struct SyncEvent {
 void GetLatestSyncEvent(SyncEvent* event);
 
 esp_err_t StartSyncService();
-// Boot admission for ConnectivityService. Scheduled timer wakes keep WiFi off
-// unless a periodic sync is due, an outbox is durable, or content convergence
-// was interrupted. Non-timer boots keep normal interactive connectivity.
-bool ShouldStartConnectivityAtBoot();
+// Seeds the sync scheduler's durable boot admission cache. It never starts
+// WiFi; a dispatched sync round owns the corresponding ConnectivityDemand.
+bool EvaluateSyncWorkAtBoot();
 void RequestSyncNow();
 // Token save/clear is a distinct full-sync/claim reason, not a user manual
 // request. Storage publishes it after the credential mutation commits.

@@ -34,6 +34,7 @@
 #include "audio_volume.h"
 
 namespace wqn {
+esp_err_t StartFlashSessionNow(uint32_t generation);
 esp_err_t StopFlashSessionNow();
 }
 
@@ -92,7 +93,7 @@ constexpr int kChunkBytes = kChunkFrames * 2;
 constexpr int kChunkIntervalMs = 15;
 
 constexpr int kMaxReconnectAttempts = 3;
-constexpr TickType_t kWifiReadyWait = pdMS_TO_TICKS(15000);
+constexpr TickType_t kWifiReadyWait = pdMS_TO_TICKS(35000);
 constexpr TickType_t kWsConnectTimeout = pdMS_TO_TICKS(20000);
 constexpr uint32_t kLifecycleTaskStackBytes = 8192;
 constexpr UBaseType_t kLifecycleTaskPriority = 6;
@@ -181,6 +182,7 @@ struct FlashState {
 
 FlashState g_flash;
 wqn::services::AudioSession g_flash_audio_session;
+wqn::services::ConnectivityDemand g_flash_connectivity_demand;
 
 enum class FlashTerminalReason : uint8_t {
     kNone,
@@ -201,6 +203,8 @@ std::atomic<bool> g_teardown_pending{false};
 std::atomic<bool> g_restart_after_teardown{false};
 std::atomic<uint32_t> g_session_generation{0};
 std::atomic<uint32_t> g_terminal_generation{0};
+std::atomic<bool> g_start_pending{false};
+std::atomic<uint32_t> g_start_generation{0};
 
 void SetErrorLocked(const std::string& message);
 
@@ -228,6 +232,25 @@ void FlashLifecycleTask(void*)
             g_terminal_reason.exchange(
                 FlashTerminalReason::kNone, std::memory_order_acq_rel);
         if (reason == FlashTerminalReason::kNone) {
+            if (!g_start_pending.exchange(false, std::memory_order_acq_rel)) {
+                continue;
+            }
+            const uint32_t generation =
+                g_start_generation.load(std::memory_order_acquire);
+            const esp_err_t start_result =
+                wqn::StartFlashSessionNow(generation);
+            if (start_result != ESP_OK &&
+                !g_teardown_pending.load(std::memory_order_acquire)) {
+                xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+                if (generation ==
+                    g_session_generation.load(std::memory_order_acquire)) {
+                    if (g_flash.status != InternalStatus::kError) {
+                        SetErrorLocked("Flash 会话启动失败");
+                    }
+                    g_flash_connectivity_demand.Reset();
+                }
+                xSemaphoreGive(g_flash.mutex);
+            }
             continue;
         }
         const uint32_t generation =
@@ -2051,9 +2074,6 @@ esp_err_t StartFlashSession()
         ESP_LOGI(kTag, "Flash start deferred while prior teardown is pending");
         return ESP_ERR_INVALID_STATE;
     }
-    ESP_RETURN_ON_ERROR(
-        EnsurePlaybackRingbuf(), kTag, "prepare Flash playback buffer");
-
     xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
     if (g_flash.ws_client != nullptr) {
         xSemaphoreGive(g_flash.mutex);
@@ -2063,21 +2083,6 @@ esp_err_t StartFlashSession()
         g_flash.status == InternalStatus::kStreaming) {
         xSemaphoreGive(g_flash.mutex);
         return ESP_ERR_INVALID_STATE;
-    }
-
-    // A dormant one-shot player may still own I2S_NUM_0. Release it before
-    // claiming the single AudioService activity slot. Capture and another
-    // Flash session remain explicit conflicts.
-    const esp_err_t playback_stop_result = wqn::StopAudioPlayback();
-    if (playback_stop_result != ESP_OK) {
-        xSemaphoreGive(g_flash.mutex);
-        return playback_stop_result;
-    }
-    const esp_err_t audio_result = wqn::services::BeginAudioActivity(
-        wqn::services::AudioActivity::kFlash, &g_flash_audio_session);
-    if (audio_result != ESP_OK) {
-        xSemaphoreGive(g_flash.mutex);
-        return audio_result;
     }
     uint32_t generation =
         g_session_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
@@ -2095,41 +2100,131 @@ esp_err_t StartFlashSession()
     g_flash.response_started = false;
     g_flash.status_since_ms = esp_timer_get_time() / 1000;
     MarkChanged();
+    g_start_generation.store(generation, std::memory_order_relaxed);
+    g_start_pending.store(true, std::memory_order_release);
     xSemaphoreGive(g_flash.mutex);
+    xTaskNotifyGive(g_lifecycle_task);
+    return ESP_OK;
+}
 
-    esp_err_t result = services::StartConnectivity();
-    if (result != ESP_OK) {
-        result = services::WaitForConnectivity(kWifiReadyWait);
-        if (result != ESP_OK) {
-            xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
-            SetErrorLocked("WiFi 未就绪");
-            ESP_ERROR_CHECK_WITHOUT_ABORT(
-                services::EndAudioActivity(&g_flash_audio_session));
-            xSemaphoreGive(g_flash.mutex);
-            return result;
-        }
-    } else if (!services::IsConnectivityOnline()) {
-        result = services::WaitForConnectivity(kWifiReadyWait);
-        if (result != ESP_OK) {
-            xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
-            SetErrorLocked("WiFi 未连接");
-            ESP_ERROR_CHECK_WITHOUT_ABORT(
-                services::EndAudioActivity(&g_flash_audio_session));
-            xSemaphoreGive(g_flash.mutex);
-            return result;
-        }
+esp_err_t StartFlashSessionNow(uint32_t generation)
+{
+    if (generation == 0 ||
+        generation != g_session_generation.load(std::memory_order_acquire)) {
+        return ESP_ERR_INVALID_STATE;
     }
+    ESP_RETURN_ON_ERROR(
+        EnsurePlaybackRingbuf(), kTag, "prepare Flash playback buffer");
 
     std::string access_token;
     esp_err_t tok_err = wqn::LoadAccessToken(&access_token);
     if (tok_err != ESP_OK || access_token.empty()) {
         xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
         SetErrorLocked("未登录，请先完成账号配对");
-        ESP_ERROR_CHECK_WITHOUT_ABORT(
-            services::EndAudioActivity(&g_flash_audio_session));
+        g_flash_connectivity_demand.Reset();
         xSemaphoreGive(g_flash.mutex);
         return ESP_ERR_INVALID_STATE;
     }
+
+    services::ConnectivityDemand connectivity_demand =
+        services::AcquireConnectivityDemand(
+            services::ConnectivityDemandReason::kAiInteractive,
+            "flash-session",
+            __FILE__,
+            __LINE__);
+    if (!connectivity_demand) {
+        xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+        SetErrorLocked("网络任务繁忙，请稍后重试");
+        xSemaphoreGive(g_flash.mutex);
+        return ESP_ERR_INVALID_STATE;
+    }
+    services::ConnectivityDemandTicket ticket = connectivity_demand.ticket();
+    xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+    const bool admit_connect =
+        generation == g_session_generation.load(std::memory_order_acquire) &&
+        g_flash.status == InternalStatus::kConnecting &&
+        !g_teardown_pending.load(std::memory_order_acquire);
+    if (admit_connect) {
+        g_flash_connectivity_demand = std::move(connectivity_demand);
+        ticket = g_flash_connectivity_demand.ticket();
+    }
+    xSemaphoreGive(g_flash.mutex);
+    if (!admit_connect) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    const services::ConnectivityWaitResult wait_result =
+        services::WaitForConnectivity(ticket, kWifiReadyWait);
+    if (wait_result != services::ConnectivityWaitResult::kOnline) {
+        xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+        if (generation == g_session_generation.load(std::memory_order_acquire) &&
+            !g_teardown_pending.load(std::memory_order_acquire)) {
+            switch (wait_result) {
+                case services::ConnectivityWaitResult::kNeedsProvisioning:
+                    SetErrorLocked("未配置 WiFi，请先在设置中配网");
+                    break;
+                case services::ConnectivityWaitResult::kAuthFailed:
+                    SetErrorLocked("WiFi 密码错误，请重新配网");
+                    break;
+                case services::ConnectivityWaitResult::kTimedOut:
+                    SetErrorLocked("WiFi 连接超时，请稍后重试");
+                    break;
+                case services::ConnectivityWaitResult::kCancelled:
+                    break;
+                default:
+                    SetErrorLocked("WiFi 暂时不可用，请稍后重试");
+                    break;
+            }
+        }
+        g_flash_connectivity_demand.Reset();
+        xSemaphoreGive(g_flash.mutex);
+        ESP_LOGW(
+            kTag,
+            "Flash WiFi wait failed: result=%s generation=%lu",
+            services::ConnectivityWaitResultName(wait_result),
+            static_cast<unsigned long>(generation));
+        return services::ConnectivityWaitResultToEspErr(wait_result);
+    }
+
+    xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+    const bool still_current =
+        generation == g_session_generation.load(std::memory_order_acquire) &&
+        g_flash.status == InternalStatus::kConnecting &&
+        g_flash_connectivity_demand.ticket().id == ticket.id &&
+        !g_teardown_pending.load(std::memory_order_acquire);
+    xSemaphoreGive(g_flash.mutex);
+    if (!still_current) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    // Network association happens before I2S ownership. This keeps an absent
+    // AP from pinning AudioActivity for the entire connection budget and the
+    // lifecycle task, not the UI task, owns every blocking step.
+    const esp_err_t playback_stop_result = wqn::StopAudioPlayback();
+    if (playback_stop_result != ESP_OK) {
+        xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+        SetErrorLocked("音频资源释放失败");
+        g_flash_connectivity_demand.Reset();
+        xSemaphoreGive(g_flash.mutex);
+        return playback_stop_result;
+    }
+    const esp_err_t audio_result = wqn::services::BeginAudioActivity(
+        wqn::services::AudioActivity::kFlash, &g_flash_audio_session);
+    if (audio_result != ESP_OK) {
+        xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+        SetErrorLocked("音频资源繁忙");
+        g_flash_connectivity_demand.Reset();
+        xSemaphoreGive(g_flash.mutex);
+        return audio_result;
+    }
+    if (g_teardown_pending.load(std::memory_order_acquire) ||
+        generation != g_session_generation.load(std::memory_order_acquire)) {
+        ESP_ERROR_CHECK_WITHOUT_ABORT(
+            services::EndAudioActivity(&g_flash_audio_session));
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    esp_err_t result = ESP_OK;
 
     esp_websocket_client_config_t cfg = {};
 #if CONFIG_WQN_FLASH_PROTOCOL_V2
@@ -2291,6 +2386,9 @@ esp_err_t StopFlashSessionNow()
     } else {
         ESP_LOGE(kTag, "Flash audio teardown incomplete; retaining session lease");
     }
+    if (teardown_result == ESP_OK) {
+        g_flash_connectivity_demand.Reset();
+    }
     xSemaphoreGive(g_flash.mutex);
 
     ESP_LOGI(kTag, "flash session stopped");
@@ -2311,6 +2409,12 @@ esp_err_t StopFlashSession()
             std::memory_order_acquire)) {
         return ESP_OK;
     }
+    g_start_pending.store(false, std::memory_order_release);
+    xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+    // Cancels a lifecycle-task WiFi wait without blocking the UI task. The
+    // radio remains alive for the bounded idle tail while teardown completes.
+    g_flash_connectivity_demand.Reset();
+    xSemaphoreGive(g_flash.mutex);
     g_intentional_stop.store(true, std::memory_order_release);
     g_terminal_generation.store(
         g_session_generation.load(std::memory_order_acquire),
@@ -2532,6 +2636,9 @@ void OnFlashButtonReleased(bool submit)
     // Always stop streaming if it was started, regardless of WS connection state.
     // If WS disconnected mid-recording, we still need to release the I2S hardware.
     bool was_capturing = g_flash.capture_started;
+    const bool cancel_pending_connect =
+        !was_capturing && !g_flash.ws_connected &&
+        g_flash.status == InternalStatus::kConnecting;
     g_flash.capture_started = false;
     g_flash.button_pressed = false;
     g_flash.status_since_ms = esp_timer_get_time() / 1000;
@@ -2541,6 +2648,12 @@ void OnFlashButtonReleased(bool submit)
     }
     bool ws_connected = g_flash.ws_connected;
     xSemaphoreGive(g_flash.mutex);
+
+    if (cancel_pending_connect) {
+        ESP_LOGI(kTag, "Flash PTT released before online; cancelling connect");
+        ESP_ERROR_CHECK_WITHOUT_ABORT(StopFlashSession());
+        return;
+    }
 
     if (was_capturing) {
         StopAudioStreaming();

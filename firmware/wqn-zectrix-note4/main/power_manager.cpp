@@ -371,6 +371,14 @@ wqn::runtime::SleepDiagnosticEvent MakeSleepDiagnosticEvent(
         event.wall_time_sec = static_cast<uint32_t>(wall_time);
     }
     event.blocker_mask = ActiveSleepBlockerMask();
+    const wqn::services::ConnectivitySnapshot connectivity =
+        wqn::services::GetConnectivitySnapshot();
+    event.connectivity_state =
+        static_cast<uint8_t>(connectivity.state);
+    event.connectivity_demand_count = connectivity.demand_count;
+    event.connectivity_demand_priority =
+        static_cast<uint8_t>(connectivity.demand_priority);
+    event.connectivity_demand_mask = connectivity.demand_mask;
     event.radio_on_total_ms = wqn::GetWifiRadioOnTotalMs();
     event.consecutive_cycles =
         ConsecutiveSleepCyclesRef().load(std::memory_order_relaxed);

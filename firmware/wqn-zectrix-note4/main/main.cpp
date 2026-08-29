@@ -190,14 +190,11 @@ extern "C" void app_main(void)
     ConfirmRunningApp();
     ESP_ERROR_CHECK(wqn::InitAiSession());
 
-    // ConnectivityService is the sole owner of station/provisioning/reconnect
-    // policy. A scheduled timer wake keeps WiFi completely off unless the
-    // durable sync scheduler says periodic/retry/outbox/content work is due;
-    // all interactive and cold boots retain normal connectivity.
+    // Seed the durable sync admission cache, but do not start WiFi here.
+    // Connectivity is demand-owned: SyncService, AI and cloud lanes acquire
+    // the radio only around actual work, and the last release arms idle-off.
 #if CONFIG_WQN_WIFI_STA_ENABLE
-    if (wqn::services::ShouldStartConnectivityAtBoot()) {
-        ESP_ERROR_CHECK_WITHOUT_ABORT(wqn::services::StartConnectivity());
-    } else {
+    if (!wqn::services::EvaluateSyncWorkAtBoot()) {
         ESP_LOGI(kTag, "scheduled timer wake: connectivity deferred");
     }
 #endif

@@ -32,6 +32,7 @@
 #include "note_store.h"
 #include "outbox_suspend_reason.h"
 #include "problem_store.h"
+#include "services/connectivity_service.h"
 #include "services/server_error_codes.h"
 #include "word_study_store.h"
 #include "wqn_api.h"
@@ -2845,6 +2846,20 @@ void SyncServiceTask(void*)
         (void)word_outbox_requested;
 #endif
 
+        const bool interactive_sync =
+            (full_reasons & (kFullSyncManual | kFullSyncCredentials)) != 0;
+        wqn::services::ConnectivityDemand connectivity_demand =
+            wqn::services::AcquireConnectivityDemand(
+                interactive_sync
+                    ? wqn::services::ConnectivityDemandReason::kSyncInteractive
+                    : wqn::services::ConnectivityDemandReason::kSyncBackground,
+                interactive_sync ? "sync-interactive" : "sync-background",
+                __FILE__,
+                __LINE__);
+        if (!connectivity_demand) {
+            ESP_LOGW(kTag, "sync round could not acquire connectivity demand");
+        }
+
         SetSyncRoundStarted(esp_timer_get_time() / 1000);
         SetSyncStatus(outbox_only ? "word-outbox" : "syncing");
 #if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
@@ -2993,7 +3008,7 @@ wqn::protocol::v3::RequestMetadata MakeDeviceRequestMetadata()
 
 #if CONFIG_WQN_WIFI_STA_ENABLE
 
-bool ShouldStartConnectivityAtBoot()
+bool EvaluateSyncWorkAtBoot()
 {
     uint32_t interval_minutes = 0;
     if (wqn::LoadAutoSyncIntervalMinutes(&interval_minutes) != ESP_OK) {
@@ -3042,7 +3057,7 @@ bool ShouldStartConnectivityAtBoot()
 esp_err_t StartSyncService()
 {
     if (!g_boot_policy_evaluated.load(std::memory_order_acquire)) {
-        (void)ShouldStartConnectivityAtBoot();
+        (void)EvaluateSyncWorkAtBoot();
     }
     if (g_sync_journal_mutex == nullptr) {
         g_sync_journal_mutex =

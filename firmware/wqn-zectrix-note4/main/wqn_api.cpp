@@ -138,7 +138,10 @@ namespace {
 constexpr char kTag[] = "wqn_api";
 constexpr int kHttpTimeoutMs = 10000;
 constexpr int kWordSessionHttpTimeoutMs = 30000;
-constexpr TickType_t kWifiConnectTimeout = pdMS_TO_TICKS(30000);
+// One owner round may spend 15 s associating and another 15 s on DHCP. Leave
+// a bounded margin for ConnectivityTask dispatch so callers do not time out a
+// healthy connection just before GOT_IP is published.
+constexpr TickType_t kWifiConnectTimeout = pdMS_TO_TICKS(35000);
 constexpr TickType_t kSntpSyncTimeout = pdMS_TO_TICKS(15000);
 constexpr TickType_t kPollDelay = pdMS_TO_TICKS(2000);
 constexpr int kPollAttempts = 60;
@@ -312,7 +315,7 @@ esp_err_t EnsureClockSyncedForHttps()
 
 esp_err_t WaitForNetworkReadyForHttps()
 {
-    ESP_LOGI(kTag, "waiting for WiFi before WQN API request");
+    ESP_LOGI(kTag, "waiting on the caller's WiFi demand before WQN API request");
     FeedTaskWatchdogIfSubscribed();
     ESP_RETURN_ON_ERROR(wqn::services::WaitForConnectivity(kWifiConnectTimeout), kTag, "wait for WiFi");
     FeedTaskWatchdogIfSubscribed();

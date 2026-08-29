@@ -16,7 +16,7 @@ namespace {
 
 constexpr char kTag[] = "wqn_sleep_diag";
 constexpr uint32_t kEntryMagic = 0x57514447;  // WQDG
-constexpr uint16_t kEntryVersion = 2;
+constexpr uint16_t kEntryVersion = 3;
 
 struct RtcSleepDiagnosticEntry {
     uint32_t magic;
@@ -260,6 +260,11 @@ void DumpSleepDiagnosticsToLog()
         kTag,
         "sleep-diag blocker bits: display=0 todo=1 word=2 note=3 sync=4 provisioning=5 "
         "audio=6 ai=7 flash=8 storage=9 connectivity=10 usb=11");
+    ESP_LOGI(
+        kTag,
+        "sleep-diag wifi demand bits: ai=0 cloud=1 sync-interactive=2 sync-background=3 "
+        "bulk-background=4; states off=0 provisioning=1 connecting=2 waiting-ip=3 "
+        "online=4 idle-tail=5 backoff=6 quiescing=7");
 
     uint32_t previous_radio_ms = 0;
     bool have_previous_radio = false;
@@ -278,7 +283,8 @@ void DumpSleepDiagnosticsToLog()
             "sleep-diag seq=%u event=%s app_ms=%u wall=%u wake=%s(%u) reset=%s(%u) mode=%s(%u) "
             "gpio1=%u gpio2=%u batt_mv=%u flags=0x%03x host=%u charging=%u full=%u "
             "usb_lease=%u deep=%u timer=%u display_timer=%u floor=%u escalated=%u token=%u "
-            "quiescing=%u blockers=0x%03x gen=%u display_sec=%u sync_sec=%u chosen_sec=%u "
+            "quiescing=%u blockers=0x%03x wifi_state=%u wifi_demands=%u wifi_mask=0x%02x "
+            "wifi_priority=%u gen=%u display_sec=%u sync_sec=%u chosen_sec=%u "
             "radio_ms=%u radio_delta_ms=%u retry_ms=%u cycles=%u reason=%s",
             static_cast<unsigned>(entry.sequence),
             EventName(event.kind),
@@ -307,6 +313,10 @@ void DumpSleepDiagnosticsToLog()
             (event.flags & kSleepDiagUsableToken) != 0 ? 1U : 0U,
             (event.flags & kSleepDiagQuiescing) != 0 ? 1U : 0U,
             static_cast<unsigned>(event.blocker_mask),
+            static_cast<unsigned>(event.connectivity_state),
+            static_cast<unsigned>(event.connectivity_demand_count),
+            static_cast<unsigned>(event.connectivity_demand_mask),
+            static_cast<unsigned>(event.connectivity_demand_priority),
             static_cast<unsigned>(event.generation),
             static_cast<unsigned>(event.display_wake_sec),
             static_cast<unsigned>(event.sync_wake_sec),

@@ -11,6 +11,7 @@
 
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "services/connectivity_service.h"
 
 namespace device_ui_internal {
 
@@ -116,6 +117,22 @@ void CloudLaneTask(void* arg)
         CloudJob job;
         if (xQueueReceive(queue, &job, portMAX_DELAY) != pdTRUE) {
             continue;
+        }
+        const CloudLane lane = LaneForJob(job);
+        wqn::services::ConnectivityDemand connectivity_demand =
+            wqn::services::AcquireConnectivityDemand(
+                lane == CloudLane::kInteractive
+                    ? wqn::services::ConnectivityDemandReason::kCloudInteractive
+                    : wqn::services::ConnectivityDemandReason::kBulkBackground,
+                lane == CloudLane::kInteractive ? "cloud-interactive"
+                                                : "cloud-bulk",
+                __FILE__,
+                __LINE__);
+        if (!connectivity_demand) {
+            ESP_LOGW(
+                kTag,
+                "cloud job admitted without connectivity demand: domain=%s",
+                CloudDomainName(job.domain));
         }
         switch (job.domain) {
             case CloudDomain::kTodo:

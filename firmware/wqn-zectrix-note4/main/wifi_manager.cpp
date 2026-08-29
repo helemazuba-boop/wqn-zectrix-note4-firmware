@@ -45,8 +45,8 @@ EventGroupHandle_t g_wifi_event_group = nullptr;
 // segment clock uses truncated ms-since-boot; unsigned subtraction stays
 // wrap-safe for any single radio-on segment (bounded well under 49 days).
 RTC_DATA_ATTR uint32_t g_wifi_radio_on_total_ms = 0;
-uint32_t g_wifi_radio_on_since_ms = 0;
-bool g_wifi_radio_on = false;
+std::atomic<uint32_t> g_wifi_radio_on_since_ms{0};
+std::atomic<bool> g_wifi_radio_on{false};
 
 inline std::atomic_ref<uint32_t> WifiRadioOnTotalMsRef()
 {
@@ -55,22 +55,23 @@ inline std::atomic_ref<uint32_t> WifiRadioOnTotalMsRef()
 
 void NoteWifiRadioOn()
 {
-    if (g_wifi_radio_on) {
+    if (g_wifi_radio_on.load(std::memory_order_acquire)) {
         return;
     }
-    g_wifi_radio_on = true;
-    g_wifi_radio_on_since_ms =
-        static_cast<uint32_t>(esp_timer_get_time() / 1000);
+    g_wifi_radio_on_since_ms.store(
+        static_cast<uint32_t>(esp_timer_get_time() / 1000),
+        std::memory_order_relaxed);
+    g_wifi_radio_on.store(true, std::memory_order_release);
 }
 
 void NoteWifiRadioOff()
 {
-    if (!g_wifi_radio_on) {
+    if (!g_wifi_radio_on.exchange(false, std::memory_order_acq_rel)) {
         return;
     }
-    g_wifi_radio_on = false;
     const uint32_t now_ms = static_cast<uint32_t>(esp_timer_get_time() / 1000);
-    const uint32_t segment_ms = now_ms - g_wifi_radio_on_since_ms;
+    const uint32_t segment_ms = now_ms -
+        g_wifi_radio_on_since_ms.load(std::memory_order_acquire);
     WifiRadioOnTotalMsRef().fetch_add(segment_ms, std::memory_order_relaxed);
 }
 
@@ -564,7 +565,7 @@ esp_err_t PrepareConnectivityForSleep(const power::PrepareSleepCommand& command)
 
     g_sleep_quiescing.store(true, std::memory_order_release);
     g_resume_after_sleep_abort.store(
-        g_initialized.load(std::memory_order_acquire),
+        g_wifi_radio_on.load(std::memory_order_acquire),
         std::memory_order_release);
     if (!g_initialized.load(std::memory_order_acquire)) {
         return ESP_OK;
@@ -613,7 +614,14 @@ void RollbackConnectivityAfterSleepAbort()
 uint32_t GetWifiRadioOnTotalMs()
 {
 #if CONFIG_WQN_WIFI_STA_ENABLE
-    return WifiRadioOnTotalMsRef().load(std::memory_order_relaxed);
+    uint32_t total = WifiRadioOnTotalMsRef().load(std::memory_order_relaxed);
+    if (g_wifi_radio_on.load(std::memory_order_acquire)) {
+        const uint32_t now_ms =
+            static_cast<uint32_t>(esp_timer_get_time() / 1000);
+        total += now_ms -
+            g_wifi_radio_on_since_ms.load(std::memory_order_acquire);
+    }
+    return total;
 #else
     return 0;
 #endif
