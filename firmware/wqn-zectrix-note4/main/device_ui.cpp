@@ -635,8 +635,10 @@ void DeviceUiTask(void*)
             wqn::NoteEpdActivity();
             if (state.screen == wqn::UiScreen::kWord ||
                 state.screen == wqn::UiScreen::kNote) {
-                // Both study screens feed a durable outbox; an in-flight upload
-                // batch yields to active input, then resumes after a quiet gap.
+                // Word and Note feed durable outboxes. Problem is an embedded
+                // mode of the Note top-level screen (`problem_app.active`), so
+                // it intentionally shares this exact interaction generation:
+                // all three domains yield an upload batch on active input.
                 wqn::services::NoteWordInteraction();
             }
             poll_delay = kUiPollDelayTicks;

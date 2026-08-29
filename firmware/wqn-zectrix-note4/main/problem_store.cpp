@@ -34,8 +34,45 @@ constexpr char kRejectedPath[] = "/storage/po_rejected.jsonl";
 // the parked verdicts (server rejects them again) rather than lose data.
 constexpr char kParkedPath[] = "/storage/po_parked.jsonl";
 constexpr size_t kMaxRejectedRecords = 50;
-constexpr size_t kMaxParkedRecords = 50;
+constexpr size_t kMaxParkedRecords = wqn::kProblemObservationOutboxCapacity;
 constexpr size_t kMaxLineBytes = 512;
+constexpr size_t kMaxParkedLineBytes = 96;
+
+bool IsValidRequestId(const std::string& value)
+{
+    if (value.size() < 16 || value.size() > 64) return false;
+    return std::all_of(value.begin(), value.end(), [](char ch) {
+        return (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
+            (ch >= '0' && ch <= '9') || ch == '_' || ch == '-';
+    });
+}
+
+bool IsValidSuspendReasonName(const std::string& value)
+{
+    return value == "idempotency-conflict" || value == "actor-ownership" ||
+        value == "invalid-identity" || value == "protocol-blocked" ||
+        value == "unknown-terminal";
+}
+
+bool DecodeParkedLine(const std::string& line, std::string* request_id)
+{
+    if (request_id == nullptr || line.empty() ||
+        line.size() > kMaxParkedLineBytes) {
+        return false;
+    }
+    const size_t separator = line.find(' ');
+    if (separator == std::string::npos ||
+        line.find(' ', separator + 1) != std::string::npos) {
+        return false;
+    }
+    const std::string identity = line.substr(0, separator);
+    const std::string reason = line.substr(separator + 1);
+    if (!IsValidRequestId(identity) || !IsValidSuspendReasonName(reason)) {
+        return false;
+    }
+    *request_id = identity;
+    return true;
+}
 
 bool IsUuid(const std::string& value)
 {
@@ -54,8 +91,7 @@ bool IsUuid(const std::string& value)
 
 bool IsValidObservation(const wqn::DurableProblemObservation& observation)
 {
-    return observation.request_id.size() >= 16 &&
-        observation.request_id.size() <= 64 &&
+    return IsValidRequestId(observation.request_id) &&
         IsUuid(observation.problem_id) && !observation.occurred_at.empty() &&
         observation.occurred_at.size() <= 40;
 }
@@ -176,25 +212,43 @@ esp_err_t WriteOutboxLines(const std::vector<std::string>& lines)
 // file means nothing is parked.
 esp_err_t ReadParkedRequestIds(std::vector<std::string>* request_ids)
 {
+    if (request_ids == nullptr) return ESP_ERR_INVALID_ARG;
     request_ids->clear();
     FILE* file = std::fopen(kParkedPath, "rb");
     if (file == nullptr) {
         return errno == ENOENT ? ESP_OK : ESP_FAIL;
     }
-    std::vector<char> buffer(96, 0);
-    while (std::fgets(buffer.data(), buffer.size(), file) != nullptr) {
-        size_t length = std::strlen(buffer.data());
-        while (length > 0 &&
-               (buffer[length - 1] == '\n' || buffer[length - 1] == '\r')) {
-            --length;
+    while (true) {
+        std::string line;
+        bool overlong = false;
+        bool saw_byte = false;
+        int ch = 0;
+        while ((ch = std::fgetc(file)) != EOF) {
+            saw_byte = true;
+            if (ch == '\n') break;
+            if (ch == '\r') continue;
+            if (line.size() < kMaxParkedLineBytes) {
+                line.push_back(static_cast<char>(ch));
+            } else {
+                overlong = true;
+            }
         }
-        if (length == 0 || length >= 64) continue;
-        // Each line is "<request_id> <reason-name>"; the id is the first
-        // token and ids cannot contain spaces.
-        std::string line(buffer.data(), length);
-        const size_t space = line.find(' ');
-        request_ids->push_back(
-            space == std::string::npos ? line : line.substr(0, space));
+        if (!saw_byte && ch == EOF) break;
+        std::string request_id;
+        if (!overlong && DecodeParkedLine(line, &request_id) &&
+            std::find(request_ids->begin(), request_ids->end(), request_id) ==
+                request_ids->end()) {
+            // A valid EOF-terminated final record is accepted. An incomplete
+            // crash tail fails DecodeParkedLine and is ignored.
+            request_ids->push_back(request_id);
+        } else if (!line.empty()) {
+            ESP_LOGW(kTag, "ignoring malformed problem park marker");
+        }
+        if (request_ids->size() > kMaxParkedRecords) {
+            std::fclose(file);
+            return ESP_ERR_INVALID_SIZE;
+        }
+        if (ch == EOF) break;
     }
     std::fclose(file);
     return ESP_OK;
@@ -206,23 +260,53 @@ esp_err_t ReadParkedRequestIds(std::vector<std::string>* request_ids)
 esp_err_t AppendParkedEntry(
     const std::string& request_id, wqn::OutboxSuspendReason reason)
 {
+    const std::string reason_name = wqn::OutboxSuspendReasonName(reason);
+    if (!IsValidRequestId(request_id) || !IsValidSuspendReasonName(reason_name)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    std::vector<std::string> parked;
+    const esp_err_t read_result = ReadParkedRequestIds(&parked);
+    if (read_result != ESP_OK) return read_result;
+    if (std::find(parked.begin(), parked.end(), request_id) != parked.end()) {
+        return ESP_OK;
+    }
+    if (parked.size() >= kMaxParkedRecords) {
+        return ESP_ERR_NO_MEM;
+    }
+    bool needs_separator = false;
     FILE* probe = std::fopen(kParkedPath, "rb");
-    size_t parked_count = 0;
     if (probe != nullptr) {
-        int ch = 0;
-        while ((ch = std::fgetc(probe)) != EOF) {
-            if (ch == '\n') ++parked_count;
+        if (std::fseek(probe, 0, SEEK_END) != 0) {
+            std::fclose(probe);
+            return ESP_FAIL;
+        }
+        const long size = std::ftell(probe);
+        if (size < 0) {
+            std::fclose(probe);
+            return ESP_FAIL;
+        }
+        if (size > 0) {
+            if (std::fseek(probe, -1, SEEK_END) != 0) {
+                std::fclose(probe);
+                return ESP_FAIL;
+            }
+            const int last = std::fgetc(probe);
+            if (last == EOF && std::ferror(probe)) {
+                std::fclose(probe);
+                return ESP_FAIL;
+            }
+            needs_separator = last != '\n';
         }
         std::fclose(probe);
-    }
-    if (parked_count >= kMaxParkedRecords) {
-        return ESP_ERR_NO_MEM;
+    } else if (errno != ENOENT) {
+        return ESP_FAIL;
     }
     FILE* journal = std::fopen(kParkedPath, "ab");
     if (journal == nullptr) return ESP_FAIL;
-    const std::string entry = std::string(request_id) + ' ' +
-        wqn::OutboxSuspendReasonName(reason);
-    const bool ok = std::fwrite(entry.data(), 1, entry.size(), journal) ==
+    const std::string entry = request_id + ' ' + reason_name;
+    const bool separated = !needs_separator || std::fputc('\n', journal) != EOF;
+    const bool ok = separated &&
+        std::fwrite(entry.data(), 1, entry.size(), journal) ==
             entry.size() &&
         std::fputc('\n', journal) != EOF && std::fflush(journal) == 0 &&
         ::fsync(fileno(journal)) == 0;

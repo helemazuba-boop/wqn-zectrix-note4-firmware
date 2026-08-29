@@ -635,6 +635,7 @@ esp_err_t InitProblemApp(ProblemAppState* state)
     ProblemOutboxSnapshot outbox;
     if (ReadProblemOutboxSnapshot(&outbox) == ESP_OK) {
         state->outbox.pending_count = outbox.pending_count;
+        state->outbox.suspended_count = outbox.suspended_count;
         state->outbox.capacity = outbox.capacity;
     }
 
@@ -924,7 +925,8 @@ void ApplyProblemVerdictCommitResult(ProblemAppState* state, esp_err_t result)
     }
     state->pending_verdict = {};
     state->commit_state = ProblemVerdictCommitState::kCloudPending;
-    if (state->outbox.pending_count < state->outbox.capacity) {
+    if (state->outbox.pending_count + state->outbox.suspended_count <
+        state->outbox.capacity) {
         ++state->outbox.pending_count;
     }
     if (state->advance_after_commit) {
@@ -939,8 +941,9 @@ void RefreshProblemOutboxState(ProblemAppState* state)
     ProblemOutboxSnapshot snapshot;
     if (ReadProblemOutboxSnapshot(&snapshot) != ESP_OK) return;
     state->outbox.pending_count = snapshot.pending_count;
+    state->outbox.suspended_count = snapshot.suspended_count;
     state->outbox.capacity = snapshot.capacity;
-    if (snapshot.pending_count == 0 &&
+    if (snapshot.pending_count == 0 && snapshot.suspended_count == 0 &&
         state->commit_state == ProblemVerdictCommitState::kCloudPending) {
         state->commit_state = ProblemVerdictCommitState::kCloudAcknowledged;
     }
@@ -1025,6 +1028,9 @@ ProblemAppSnapshot BuildProblemAppSnapshot(const ProblemAppState& state)
 
 std::string ProblemAppStatusLine(const ProblemAppState& state)
 {
+    if (state.outbox.suspended_count > 0) {
+        return "同步挂起 " + std::to_string(state.outbox.suspended_count) + " 条";
+    }
     if (!state.message.empty()) return state.message;
     switch (state.mode) {
         case ProblemAppMode::kProblemList:
@@ -1042,11 +1048,11 @@ std::string ProblemAppSignature(const ProblemAppState& state)
     // Compact identity for the render layer to detect meaningful frame
     // changes; every navigation/unlock/verdict/image transition must land
     // here or the dedup pipeline freezes the page.
-    char buffer[128] = {};
+    char buffer[144] = {};
     std::snprintf(
         buffer,
         sizeof(buffer),
-        "%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u",
+        "%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u",
         static_cast<unsigned>(state.active ? 1 : 0),
         static_cast<unsigned>(state.mode),
         static_cast<unsigned>(state.list_selected),
@@ -1056,6 +1062,8 @@ std::string ProblemAppSignature(const ProblemAppState& state)
         static_cast<unsigned>(state.answer_unlocked ? 1 : 0),
         static_cast<unsigned>(state.verdict_selected),
         static_cast<unsigned>(state.commit_state),
+        static_cast<unsigned>(state.outbox.pending_count),
+        static_cast<unsigned>(state.outbox.suspended_count),
         static_cast<unsigned>(state.image_error ? 1 : 0),
         static_cast<unsigned>(state.pack_index.sets.size()));
     return std::string(buffer);

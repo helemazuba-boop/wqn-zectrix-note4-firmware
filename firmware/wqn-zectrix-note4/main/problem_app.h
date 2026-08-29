@@ -49,6 +49,7 @@ enum class ProblemVerdictCommitState : uint8_t {
 
 struct ProblemOutboxState {
     size_t pending_count = 0;
+    size_t suspended_count = 0;
     size_t capacity = kProblemObservationOutboxCapacity;
 };
 
