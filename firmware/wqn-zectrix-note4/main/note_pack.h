@@ -26,6 +26,9 @@ struct NotePsramAllocator {
     NotePsramAllocator(const NotePsramAllocator<U>&) noexcept {}
 
     T* allocate(std::size_t n) {
+        if (n == 0) {
+            return nullptr;
+        }
         void* p = heap_caps_malloc(n * sizeof(T), MALLOC_CAP_SPIRAM);
         if (p == nullptr) {
             // Project builds with -fno-exceptions; abort rather than corrupt.

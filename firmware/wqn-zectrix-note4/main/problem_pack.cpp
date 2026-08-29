@@ -1036,6 +1036,7 @@ esp_err_t LoadProblemPackIndex(ProblemPackIndex* index)
         return ESP_OK;
     }
     index->entries.reserve(expected_entries);
+    index->problem_order.reserve(expected_entries);
     index->sets.reserve(manifest.problem_sets.size());
 
     for (const WqnProblemPackManifestSet& item : manifest.problem_sets) {
