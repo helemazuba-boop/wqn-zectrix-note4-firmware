@@ -640,6 +640,9 @@ uint64_t g_config_revision = 0;
 uint64_t g_sync_cursor = 0;
 bool g_bootstrap_complete = false;
 bool g_control_state_loaded = false;
+// Per-dispatch signal from claim/bootstrap/sync. The scheduler converts it to
+// the same sticky protocol-blocked latch used by observation uploads.
+bool g_control_protocol_blocked_this_round = false;
 uint32_t g_control_retry_after_ms = 0;
 constexpr uint32_t kClaimPollFloorMs = 10000;
 constexpr uint32_t kClaimPollJitterMaxMs = 2000;
@@ -1331,6 +1334,9 @@ esp_err_t StartClaimSession()
         &claim,
         &error);
     if (result != ESP_OK) {
+        if (error.code == "UPGRADE_REQUIRED") {
+            g_control_protocol_blocked_this_round = true;
+        }
         g_control_retry_after_ms = NextClaimRetryDelayMs(
             error.retryable ? error.retry_after_ms : 0);
         ESP_LOGW(
@@ -1369,6 +1375,9 @@ esp_err_t PollClaimSession()
     const esp_err_t result =
         wqn::PollDeviceClaimV3(metadata, g_claim_id, &poll, &error);
     if (result != ESP_OK) {
+        if (error.code == "UPGRADE_REQUIRED") {
+            g_control_protocol_blocked_this_round = true;
+        }
         g_control_retry_after_ms = NextClaimRetryDelayMs(
             error.retryable ? error.retry_after_ms : 0);
         ESP_LOGW(
@@ -1653,6 +1662,9 @@ esp_err_t BootstrapControlV3(const std::string& token)
     const esp_err_t result = wqn::BootstrapDeviceControlV3(
         token, metadata, &bootstrap, &error);
     if (result != ESP_OK) {
+        if (error.code == "UPGRADE_REQUIRED") {
+            g_control_protocol_blocked_this_round = true;
+        }
         if (error.retryable) {
             g_control_retry_after_ms = error.retry_after_ms;
         }
@@ -1706,6 +1718,9 @@ esp_err_t SyncControlPlaneV3(const std::string& token)
         wqn::SyncDeviceControlV3(
             token, metadata, g_sync_request_auto_interval_minutes, &sync, &error);
     if (sync_result != ESP_OK) {
+        if (error.code == "UPGRADE_REQUIRED") {
+            g_control_protocol_blocked_this_round = true;
+        }
         if (error.retryable) {
             g_control_retry_after_ms = error.retry_after_ms;
         }
@@ -2548,6 +2563,10 @@ SyncRoundOutcome RunWordOutboxOnlyRound()
     }
     g_last_word_outbox_upload_state = UploadPendingWordObservations(token);
     if (g_last_word_outbox_upload_state ==
+        WordOutboxUploadState::kProtocolBlocked) {
+        return CurrentOutboxOutcome();
+    }
+    if (g_last_word_outbox_upload_state ==
         WordOutboxUploadState::kAuthenticationRequired) {
         g_last_note_outbox_upload_state =
             WordOutboxUploadState::kAuthenticationRequired;
@@ -2556,6 +2575,10 @@ SyncRoundOutcome RunWordOutboxOnlyRound()
         return CurrentOutboxOutcome();
     }
     g_last_note_outbox_upload_state = UploadPendingNoteObservations(token);
+    if (g_last_note_outbox_upload_state ==
+        WordOutboxUploadState::kProtocolBlocked) {
+        return CurrentOutboxOutcome();
+    }
     if (g_last_note_outbox_upload_state ==
         WordOutboxUploadState::kAuthenticationRequired) {
         g_last_problem_outbox_upload_state =
@@ -2570,6 +2593,7 @@ SyncRoundOutcome RunWordOutboxOnlyRound()
 SyncRoundOutcome RunSyncRound()
 {
 #if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
+    g_control_protocol_blocked_this_round = false;
     esp_err_t result = EnsureControlStateLoaded();
     if (result != ESP_OK) {
         ESP_LOGW(kTag, "v3 control checkpoint unavailable: %s", esp_err_to_name(result));
@@ -2582,7 +2606,9 @@ SyncRoundOutcome RunSyncRound()
     }
     if (result != ESP_OK) {
         ESP_LOGW(kTag, "v3 claim round deferred: %s", esp_err_to_name(result));
-        return SyncRoundOutcome::kFailed;
+        return g_control_protocol_blocked_this_round
+            ? SyncRoundOutcome::kProtocolBlocked
+            : SyncRoundOutcome::kFailed;
     }
 #else
     esp_err_t result = wqn::RunPairingFlowIfNeeded();
@@ -2602,18 +2628,28 @@ SyncRoundOutcome RunSyncRound()
     result = BootstrapControlV3(token);
     if (result != ESP_OK) {
         ESP_LOGW(kTag, "v3 bootstrap round failed: %s", esp_err_to_name(result));
-        return SyncRoundOutcome::kFailed;
+        return g_control_protocol_blocked_this_round
+            ? SyncRoundOutcome::kProtocolBlocked
+            : SyncRoundOutcome::kFailed;
     }
 #endif
 
 #if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
     g_last_word_outbox_upload_state = UploadPendingWordObservations(token);
+    if (g_last_word_outbox_upload_state ==
+        WordOutboxUploadState::kProtocolBlocked) {
+        return CurrentOutboxOutcome();
+    }
     if (g_last_word_outbox_upload_state !=
         WordOutboxUploadState::kAuthenticationRequired) {
         g_last_note_outbox_upload_state = UploadPendingNoteObservations(token);
     } else {
         g_last_note_outbox_upload_state =
             WordOutboxUploadState::kAuthenticationRequired;
+    }
+    if (g_last_note_outbox_upload_state ==
+        WordOutboxUploadState::kProtocolBlocked) {
+        return CurrentOutboxOutcome();
     }
     if (g_last_word_outbox_upload_state !=
             WordOutboxUploadState::kAuthenticationRequired &&
@@ -2624,6 +2660,10 @@ SyncRoundOutcome RunSyncRound()
     } else {
         g_last_problem_outbox_upload_state =
             WordOutboxUploadState::kAuthenticationRequired;
+    }
+    if (g_last_problem_outbox_upload_state ==
+        WordOutboxUploadState::kProtocolBlocked) {
+        return CurrentOutboxOutcome();
     }
 #endif
 
@@ -2639,7 +2679,9 @@ SyncRoundOutcome RunSyncRound()
         // The three outboxes already ran independently. Preserve that
         // progress and report partial completion, while retaining a full-sync
         // retry obligation for the failed control plane.
-        return SyncRoundOutcome::kPartialNeedsFullRetry;
+        return g_control_protocol_blocked_this_round
+            ? SyncRoundOutcome::kProtocolBlocked
+            : SyncRoundOutcome::kPartialNeedsFullRetry;
     }
 #endif
 

@@ -280,6 +280,23 @@ static_assert(IsTransientHttpStatus(429));
 static_assert(IsTransientHttpStatus(503));
 static_assert(!IsTransientHttpStatus(400));
 
+// HTTP intermediaries may answer before the application emits a v3 error
+// envelope. Normalize transport-level protocol gates for every v3 endpoint so
+// callers never mistake a bodyless 426 for an unknown terminal failure.
+void NormalizeProtocolHttpError(
+    int status_code, wqn::protocol::v3::Error* error)
+{
+    if (error == nullptr) return;
+    if (IsTransientHttpStatus(status_code)) {
+        error->retryable = true;
+    }
+    if (status_code == 426) {
+        error->code = "UPGRADE_REQUIRED";
+        error->retryable = false;
+        error->retry_after_ms = 0;
+    }
+}
+
 bool IsClockReasonable()
 {
     std::time_t now = 0;
@@ -1422,6 +1439,7 @@ esp_err_t StartDeviceClaimV3(
     }
     const esp_err_t parse_result = protocol::v3::ParseClaimStartResponse(
         response_body, metadata.request_id, data, error);
+    NormalizeProtocolHttpError(status_code, error);
     if (status_code != 200 || parse_result != ESP_OK) {
         ESP_LOGW(
             kTag,
@@ -1467,6 +1485,7 @@ esp_err_t PollDeviceClaimV3(
     }
     const esp_err_t parse_result = protocol::v3::ParseClaimPollResponse(
         response_body, metadata.request_id, data, error);
+    NormalizeProtocolHttpError(status_code, error);
     if (status_code != 200 || parse_result != ESP_OK) {
         ESP_LOGW(
             kTag,
@@ -1514,6 +1533,7 @@ esp_err_t BootstrapDeviceControlV3(
     }
     const esp_err_t parse_result = protocol::v3::ParseBootstrapResponse(
         response_body, metadata.request_id, data, error);
+    NormalizeProtocolHttpError(status_code, error);
     if (status_code == 401) {
         ESP_ERROR_CHECK_WITHOUT_ABORT(ClearAccessToken());
         return ESP_ERR_INVALID_STATE;
@@ -1566,6 +1586,7 @@ esp_err_t SyncDeviceControlV3(
     }
     const esp_err_t parse_result = protocol::v3::ParseSyncResponse(
         response_body, metadata.request_id, data, error);
+    NormalizeProtocolHttpError(status_code, error);
     if (status_code == 401) {
         ESP_ERROR_CHECK_WITHOUT_ABORT(ClearAccessToken());
         return ESP_ERR_INVALID_STATE;
@@ -1809,6 +1830,7 @@ esp_err_t FetchWordPackManifest(
     protocol::v3::Error error;
     const esp_err_t parse_result = protocol::word_study_v1::ParseManifestResponse(
         body, metadata.request_id, &data, &error);
+    NormalizeProtocolHttpError(status_code, &error);
     if (status_code != 200 || parse_result != ESP_OK) {
         ESP_LOGW(
             kTag,
@@ -1894,6 +1916,7 @@ esp_err_t CreateWordStudySessionV1(
     if (status_code == 401) return ClearTokenOnUnauthorized("word-study-session");
     const esp_err_t parse_result = protocol::word_study_v1::ParseSessionResponse(
         body, request.metadata.request_id, session, error);
+    NormalizeProtocolHttpError(status_code, error);
     if (status_code != 200 || parse_result != ESP_OK) {
         ESP_LOGW(
             kTag,
@@ -1954,6 +1977,7 @@ esp_err_t FetchWordStudyCandidatePageV1(
     const esp_err_t parse_result =
         protocol::word_study_v1::ParseCandidatePageResponse(
             body, request.metadata.request_id, page, error);
+    NormalizeProtocolHttpError(status_code, error);
     if (status_code != 200 || parse_result != ESP_OK) {
         ESP_LOGW(
             kTag,
@@ -2018,18 +2042,7 @@ esp_err_t SubmitWordStudyObservationV1AtPath(
     }
     const esp_err_t parse_result = protocol::word_study_v1::ParseObservationResponse(
         body, request.metadata.request_id, observation, error);
-    if (IsTransientHttpStatus(status_code)) {
-        // Transport/proxy failures are retryable even if the returned body is
-        // malformed or a server accidentally marks its 5xx envelope terminal.
-        error->retryable = true;
-    }
-    if (status_code == 426) {
-        // Protocol gate (X-WQN-Protocol mismatch). A proxy may answer 426
-        // without our error envelope; force the canonical code so the outbox
-        // classifier suspends instead of quarantining data.
-        error->code = "UPGRADE_REQUIRED";
-        error->retryable = false;
-    }
+    NormalizeProtocolHttpError(status_code, error);
     if (status_code != 200 || parse_result != ESP_OK) {
         ESP_LOGW(
             kTag,
@@ -2260,6 +2273,7 @@ esp_err_t FetchNoteStudyManifest(
     protocol::v3::Error error;
     const esp_err_t parse_result = protocol::note_study_v1::ParseManifestResponse(
         body, metadata.request_id, &data, &error);
+    NormalizeProtocolHttpError(status_code, &error);
     if (status_code != 200 || parse_result != ESP_OK) {
         if (error_out != nullptr) {
             *error_out = error;
@@ -2685,6 +2699,7 @@ esp_err_t CreateNoteStudySessionV1(
     if (status_code == 401) return ClearTokenOnUnauthorized("note-study-session");
     const esp_err_t parse_result = protocol::note_study_v1::ParseSessionResponse(
         body, request.metadata.request_id, session, error);
+    NormalizeProtocolHttpError(status_code, error);
     if (status_code != 200 || parse_result != ESP_OK) {
         ESP_LOGW(
             kTag,
@@ -2745,6 +2760,7 @@ esp_err_t FetchNoteStudyCandidatePageV1(
     const esp_err_t parse_result =
         protocol::note_study_v1::ParseCandidatePageResponse(
             body, request.metadata.request_id, page, error);
+    NormalizeProtocolHttpError(status_code, error);
     if (status_code != 200 || parse_result != ESP_OK) {
         ESP_LOGW(
             kTag,
@@ -2809,15 +2825,7 @@ esp_err_t SubmitNoteStudyObservationV1AtPath(
     }
     const esp_err_t parse_result = protocol::note_study_v1::ParseObservationResponse(
         body, request.metadata.request_id, observation, error);
-    if (IsTransientHttpStatus(status_code)) {
-        error->retryable = true;
-    }
-    if (status_code == 426) {
-        // Protocol gate: force the canonical code so the outbox classifier
-        // suspends instead of quarantining data.
-        error->code = "UPGRADE_REQUIRED";
-        error->retryable = false;
-    }
+    NormalizeProtocolHttpError(status_code, error);
     if (status_code != 200 || parse_result != ESP_OK) {
         ESP_LOGW(
             kTag,
@@ -2919,6 +2927,7 @@ esp_err_t FetchProblemStudyManifest(
     protocol::v3::Error error;
     const esp_err_t parse_result = protocol::problem_study_v1::ParseManifestResponse(
         body, metadata.request_id, &data, &error);
+    NormalizeProtocolHttpError(status_code, &error);
     if (status_code != 200 || parse_result != ESP_OK) {
         if (error_out != nullptr) {
             *error_out = error;
@@ -3327,15 +3336,7 @@ esp_err_t SubmitProblemReviewObservationV1(
     }
     const esp_err_t parse_result = protocol::problem_study_v1::ParseObservationResponse(
         body, request.metadata.request_id, observation, error);
-    if (IsTransientHttpStatus(status_code)) {
-        error->retryable = true;
-    }
-    if (status_code == 426) {
-        // Protocol gate: force the canonical code so the outbox classifier
-        // suspends instead of quarantining data.
-        error->code = "UPGRADE_REQUIRED";
-        error->retryable = false;
-    }
+    NormalizeProtocolHttpError(status_code, error);
     if (status_code != 200 || parse_result != ESP_OK) {
         ESP_LOGW(
             kTag,

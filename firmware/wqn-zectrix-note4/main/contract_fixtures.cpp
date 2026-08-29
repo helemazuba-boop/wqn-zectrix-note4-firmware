@@ -12,6 +12,7 @@
 #include "power/rtc_timekeep.h"
 #include "problem_app.h"
 #include "problem_pack.h"
+#include "services/server_error_codes.h"
 #include "text_render.h"
 #include "time_app.h"
 #include "ui/markdown_layout.h"
@@ -947,10 +948,51 @@ bool CheckV3ControlContract()
 
     const esp_err_t error_result = wqn::protocol::v3::ParseSyncResponse(
         kV3Error, "req_sync_000000002", &sync, &error);
-    return Require(error_result != ESP_OK, "v3 error returns failure") &&
-           Require(error.code == "TEMPORARILY_UNAVAILABLE", "v3 error code") &&
-           Require(error.retryable, "v3 error retryable") &&
-           Require(error.retry_after_ms == 10000, "v3 retry delay");
+    if (!Require(error_result != ESP_OK, "v3 error returns failure") ||
+        !Require(error.code == "TEMPORARILY_UNAVAILABLE", "v3 error code") ||
+        !Require(error.retryable, "v3 error retryable") ||
+        !Require(error.retry_after_ms == 10000, "v3 retry delay")) {
+        return false;
+    }
+
+    struct ErrorFixture {
+        const char* code;
+        bool retryable;
+        int64_t retry_after_ms;
+        wqn::services::ServerErrorClass expected_class;
+    };
+    constexpr ErrorFixture kErrorFixtures[] = {
+        {"UNAUTHORIZED", false, 0, wqn::services::ServerErrorClass::kAuthRequired},
+        {"SEQUENCE_GAP", true, 30000, wqn::services::ServerErrorClass::kTransientRetry},
+        {"SEQUENCE_ALREADY_APPLIED", false, 0, wqn::services::ServerErrorClass::kSequenceResolved},
+        {"SESSION_NOT_ACTIVE", false, 0, wqn::services::ServerErrorClass::kSessionTerminal},
+        {"ITEM_NOT_VISIBLE", false, 0, wqn::services::ServerErrorClass::kTombstoneRecoverable},
+        {"UPGRADE_REQUIRED", false, 0, wqn::services::ServerErrorClass::kProtocolBlocked},
+        {"REQUEST_ID_REUSED", false, 0, wqn::services::ServerErrorClass::kProtocolIntegrity},
+    };
+    for (const ErrorFixture& fixture : kErrorFixtures) {
+        const std::string json =
+            std::string("{\"ok\":false,\"request_id\":\"req_error_fixture_01\","
+                        "\"error\":{\"code\":\"") +
+            fixture.code + "\",\"retryable\":" +
+            (fixture.retryable ? "true" : "false") +
+            (fixture.retry_after_ms > 0
+                 ? ",\"retry_after_ms\":" + std::to_string(fixture.retry_after_ms)
+                 : "") +
+            "}}";
+        const esp_err_t result = wqn::protocol::v3::ParseSyncResponse(
+            json, "req_error_fixture_01", &sync, &error);
+        if (!Require(result != ESP_OK, "v3 classified error returns failure") ||
+            !Require(error.code == fixture.code, "v3 classified error code") ||
+            !Require(error.retryable == fixture.retryable, "v3 classified retryable") ||
+            !Require(error.retry_after_ms == fixture.retry_after_ms, "v3 classified retry delay") ||
+            !Require(
+                wqn::services::ClassifyServerErrorCode(error.code) == fixture.expected_class,
+                "v3 seven-class error taxonomy")) {
+            return false;
+        }
+    }
+    return true;
 }
 
 bool CheckWordStudyV1Contract()
