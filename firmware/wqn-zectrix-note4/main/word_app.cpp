@@ -424,6 +424,8 @@ esp_err_t InitWordApp(WordAppState* state)
     WordOutboxSnapshot outbox;
     if (ReadWordOutboxSnapshot(&outbox) == ESP_OK) {
         state->outbox.pending_count = outbox.pending_count;
+        state->outbox.suspended_count = outbox.suspended_count;
+        state->outbox.blocked_count = outbox.blocked_count;
         state->outbox.capacity = outbox.capacity;
     }
 
@@ -1413,7 +1415,8 @@ void ApplyWordObservationCommitResult(WordAppState* state, esp_err_t result)
     state->session.pending_advanced_session = {};
     state->session.pending_observation = {};
     state->session.commit_state = WordObservationCommitState::kCloudPending;
-    if (state->outbox.pending_count < state->outbox.capacity) {
+    if (state->outbox.pending_count + state->outbox.suspended_count <
+        state->outbox.capacity) {
         ++state->outbox.pending_count;
     }
     if (action == protocol::word_study_v1::ObservationAction::kKnown) {
@@ -1457,8 +1460,10 @@ void RefreshWordOutboxState(WordAppState* state)
     WordOutboxSnapshot snapshot;
     if (ReadWordOutboxSnapshot(&snapshot) != ESP_OK) return;
     state->outbox.pending_count = snapshot.pending_count;
+    state->outbox.suspended_count = snapshot.suspended_count;
+    state->outbox.blocked_count = snapshot.blocked_count;
     state->outbox.capacity = snapshot.capacity;
-    if (snapshot.pending_count == 0 &&
+    if (snapshot.pending_count == 0 && snapshot.suspended_count == 0 &&
         state->session.commit_state == WordObservationCommitState::kCloudPending) {
         state->session.commit_state = WordObservationCommitState::kCloudAcknowledged;
         if (state->mode == WordAppMode::kWordCard &&
@@ -1561,6 +1566,15 @@ std::string WordAppStatusLine(const WordAppState& state)
     if (!HasPackWords(state)) {
         return state.pack_index.status_message.empty() ? "词库未同步" : state.pack_index.status_message;
     }
+    if (state.outbox.suspended_count > 0) {
+        std::string status =
+            "同步挂起 " + std::to_string(state.outbox.suspended_count) + " 条";
+        if (state.outbox.blocked_count > 0) {
+            status += "，同会话待处理 " +
+                std::to_string(state.outbox.blocked_count) + " 条";
+        }
+        return status;
+    }
     if (state.outbox.pending_count > 0) {
         return "待同步 " + std::to_string(state.outbox.pending_count) + " 条";
     }
@@ -1603,6 +1617,10 @@ std::string WordAppSignature(const WordAppState& state)
     signature.append(std::to_string(state.session.persisted.remote.next_sequence));
     signature.push_back('/');
     signature.append(std::to_string(state.outbox.pending_count));
+    signature.push_back('/');
+    signature.append(std::to_string(state.outbox.suspended_count));
+    signature.push_back('/');
+    signature.append(std::to_string(state.outbox.blocked_count));
     signature.push_back('/');
     signature.append(state.current_word.id);
     signature.push_back('/');

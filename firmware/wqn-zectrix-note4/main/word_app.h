@@ -85,6 +85,8 @@ struct WordSessionState {
 
 struct WordOutboxState {
     size_t pending_count = 0;
+    size_t suspended_count = 0;
+    size_t blocked_count = 0;
     size_t capacity = kWordObservationOutboxCapacity;
 };
 
