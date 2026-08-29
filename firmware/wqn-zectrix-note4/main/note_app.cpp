@@ -674,6 +674,8 @@ esp_err_t InitNoteApp(NoteAppState* state)
     NoteOutboxSnapshot outbox;
     if (ReadNoteOutboxSnapshot(&outbox) == ESP_OK) {
         state->outbox.pending_count = outbox.pending_count;
+        state->outbox.suspended_count = outbox.suspended_count;
+        state->outbox.blocked_count = outbox.blocked_count;
         state->outbox.capacity = outbox.capacity;
     }
 
@@ -1444,7 +1446,8 @@ void ApplyNoteObservationCommitResult(NoteAppState* state, esp_err_t result)
     state->session.pending_advanced_session = {};
     state->session.pending_observation = {};
     state->session.commit_state = NoteObservationCommitState::kCloudPending;
-    if (state->outbox.pending_count < state->outbox.capacity) {
+    if (state->outbox.pending_count + state->outbox.suspended_count <
+        state->outbox.capacity) {
         ++state->outbox.pending_count;
     }
 }
@@ -1469,8 +1472,10 @@ void RefreshNoteOutboxState(NoteAppState* state)
     NoteOutboxSnapshot snapshot;
     if (ReadNoteOutboxSnapshot(&snapshot) != ESP_OK) return;
     state->outbox.pending_count = snapshot.pending_count;
+    state->outbox.suspended_count = snapshot.suspended_count;
+    state->outbox.blocked_count = snapshot.blocked_count;
     state->outbox.capacity = snapshot.capacity;
-    if (snapshot.pending_count == 0 &&
+    if (snapshot.pending_count == 0 && snapshot.suspended_count == 0 &&
         state->session.commit_state == NoteObservationCommitState::kCloudPending) {
         state->session.commit_state = NoteObservationCommitState::kCloudAcknowledged;
     }
@@ -1585,6 +1590,15 @@ NoteAppSnapshot BuildNoteAppSnapshot(const NoteAppState& state)
 
 std::string NoteAppStatusLine(const NoteAppState& state)
 {
+    if (state.outbox.suspended_count > 0) {
+        std::string status =
+            "同步挂起 " + std::to_string(state.outbox.suspended_count) + " 条";
+        if (state.outbox.blocked_count > 0) {
+            status += "，同会话待处理 " +
+                std::to_string(state.outbox.blocked_count) + " 条";
+        }
+        return status;
+    }
     if (!state.message.empty()) return state.message;
     switch (state.mode) {
         case NoteAppMode::kNotebookList:
@@ -1612,11 +1626,11 @@ std::string NoteAppSignature(const NoteAppState& state)
     // changes the frame with every other field identical. The body-fetch
     // flags likewise: syncing->loaded/failed transitions repaint the body
     // placeholder with every other field unchanged.
-    char buffer[144] = {};
+    char buffer[176] = {};
     std::snprintf(
         buffer,
         sizeof(buffer),
-        "%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%d",
+        "%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%d",
         static_cast<unsigned>(state.mode),
         static_cast<unsigned>(state.notebook_selected),
         static_cast<unsigned>(state.note_list_selected),
@@ -1625,6 +1639,9 @@ std::string NoteAppSignature(const NoteAppState& state)
         static_cast<unsigned>(state.problem_sets.size()),
         static_cast<unsigned>(state.word_decks.size()),
         static_cast<unsigned>(state.session.commit_state),
+        static_cast<unsigned>(state.outbox.pending_count),
+        static_cast<unsigned>(state.outbox.suspended_count),
+        static_cast<unsigned>(state.outbox.blocked_count),
         static_cast<unsigned>(state.image_index),
         static_cast<unsigned>(state.image_error ? 1 : 0),
         static_cast<unsigned>(

@@ -116,6 +116,9 @@ struct NoteOutboxSnapshot {
     // Records parked by SuspendPendingNoteObservation: excluded from the
     // upload queue but still resident on device awaiting intervention.
     size_t suspended_count = 0;
+    // Pending successors held because an earlier record in their session is
+    // suspended. Other sessions remain eligible for upload.
+    size_t blocked_count = 0;
     size_t capacity = 0;
 };
 

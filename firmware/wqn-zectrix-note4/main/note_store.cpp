@@ -88,6 +88,8 @@ struct OutboxScan {
     // Observations parked by a kSuspend marker: excluded from Peek/upload,
     // but still rewritten by compaction so the payload survives on device.
     std::vector<OutboxRecord, wqn::NoteStorePsramAllocator<OutboxRecord>> suspended;
+    // Parallel to `suspended`: preserves the marker reason across compaction.
+    std::vector<uint8_t, wqn::NoteStorePsramAllocator<uint8_t>> suspended_reasons;
     size_t total_records = 0;
     size_t ack_records = 0;
     size_t suspend_records = 0;
@@ -593,6 +595,7 @@ esp_err_t ScanOutboxFile(const char* path, OutboxScan* scan)
             if (pending != scan->pending.end()) {
                 if (suspended == scan->suspended.end()) {
                     scan->suspended.push_back(*pending);
+                    scan->suspended_reasons.push_back(record.reserved);
                 }
                 scan->pending.erase(pending);
             } else if (suspended == scan->suspended.end()) {
@@ -608,7 +611,8 @@ esp_err_t ScanOutboxFile(const char* path, OutboxScan* scan)
         }
     }
     std::fclose(file);
-    return scan->pending.size() <= wqn::kNoteObservationOutboxCapacity
+    return scan->pending.size() + scan->suspended.size() <=
+            wqn::kNoteObservationOutboxCapacity
         ? ESP_OK
         : ESP_ERR_INVALID_SIZE;
 }
@@ -801,14 +805,32 @@ esp_err_t CompactCachedOutbox(OutboxScan* scan)
     // replaces the whole journal, so dropping them here would silently
     // destroy parked payloads that still await intervention.
     std::vector<OutboxRecord, wqn::NoteStorePsramAllocator<OutboxRecord>> rewrite;
-    rewrite.reserve(scan->pending.size() + scan->suspended.size());
+    if (scan->suspended.size() != scan->suspended_reasons.size()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    rewrite.reserve(scan->pending.size() + 2 * scan->suspended.size());
     rewrite.insert(rewrite.end(), scan->pending.begin(), scan->pending.end());
-    rewrite.insert(rewrite.end(), scan->suspended.begin(), scan->suspended.end());
+    for (size_t i = 0; i < scan->suspended.size(); ++i) {
+        rewrite.push_back(scan->suspended[i]);
+        OutboxRecord marker = {};
+        ESP_RETURN_ON_ERROR(
+            BuildSuspendRecord(
+                scan->suspended[i].request_id,
+                static_cast<wqn::OutboxSuspendReason>(scan->suspended_reasons[i]),
+                &marker),
+            kTag,
+            "rebuild note suspend marker");
+        rewrite.push_back(marker);
+    }
     ESP_RETURN_ON_ERROR(
-        CompactOutbox(rewrite, scan->backup_source), kTag, "compact cached note outbox");
+        CompactOutbox(
+            rewrite, scan->backup_source || !scan->suspended.empty()),
+        kTag,
+        "compact cached note outbox");
     scan->acknowledged.clear();
     scan->total_records = rewrite.size();
     scan->ack_records = 0;
+    scan->suspend_records = scan->suspended.size();
     scan->orphan_ack_records = 0;
     scan->orphan_suspend_records = 0;
     scan->partial_tail = false;
@@ -868,6 +890,7 @@ esp_err_t CheckpointSessionFromOutbox(const OutboxScan& scan)
     bool changed = false;
     ReconcileSession(scan.acknowledged, &session, &changed);
     ReconcileSession(scan.pending, &session, &changed);
+    ReconcileSession(scan.suspended, &session, &changed);
     if (changed) {
         ESP_RETURN_ON_ERROR(
             SaveSessionRaw(session), kTag, "checkpoint session before outbox compaction");
@@ -877,9 +900,9 @@ esp_err_t CheckpointSessionFromOutbox(const OutboxScan& scan)
 
 esp_err_t MaybeCompactCachedOutbox(OutboxScan* scan)
 {
-    if (scan == nullptr ||
-        (scan->ack_records + scan->suspend_records) <
-            kRuntimeCompactAckThreshold) {
+    // Active suspend markers must survive every compaction, so they are not
+    // reclaimable records and must not continuously retrigger maintenance.
+    if (scan == nullptr || scan->ack_records < kRuntimeCompactAckThreshold) {
         return ESP_OK;
     }
     ESP_RETURN_ON_ERROR(CheckpointSessionFromOutbox(*scan), kTag, "checkpoint runtime note outbox");
@@ -902,6 +925,7 @@ esp_err_t LoadSessionTransaction(void* opaque)
     bool changed = false;
     ReconcileSession(scan->acknowledged, session, &changed);
     ReconcileSession(scan->pending, session, &changed);
+    ReconcileSession(scan->suspended, session, &changed);
     if (changed) {
         ESP_RETURN_ON_ERROR(SaveSessionRaw(*session), kTag, "repair note session cursor");
     }
@@ -963,7 +987,16 @@ esp_err_t CommitObservationTransaction(void* opaque)
         scan->acknowledged.end()) {
         return SaveSessionRaw(session);
     }
-    if (scan->pending.size() >= wqn::kNoteObservationOutboxCapacity) {
+    const auto suspended = std::find_if(
+        scan->suspended.begin(), scan->suspended.end(),
+        [&](const auto& value) { return observation.request_id == value.request_id; });
+    if (suspended != scan->suspended.end()) {
+        return SameObservation(ObservationFromRecord(*suspended), observation)
+            ? SaveSessionRaw(session)
+            : ESP_ERR_INVALID_STATE;
+    }
+    if (scan->pending.size() + scan->suspended.size() >=
+        wqn::kNoteObservationOutboxCapacity) {
         return ESP_ERR_NO_MEM;
     }
     if (scan->partial_tail || scan->backup_source) {
@@ -1003,8 +1036,17 @@ esp_err_t PeekObservationTransaction(void* context)
             CheckpointSessionFromOutbox(*scan), kTag, "checkpoint before note peek repair");
         ESP_RETURN_ON_ERROR(CompactCachedOutbox(scan), kTag, "repair note outbox tail");
     }
-    if (scan->pending.empty()) return ESP_ERR_NOT_FOUND;
-    *observation = ObservationFromRecord(scan->pending.front());
+    auto pending = std::find_if(
+        scan->pending.begin(), scan->pending.end(),
+        [&](const OutboxRecord& candidate) {
+            return std::none_of(
+                scan->suspended.begin(), scan->suspended.end(),
+                [&](const OutboxRecord& parked) {
+                    return std::strcmp(candidate.session_id, parked.session_id) == 0;
+                });
+        });
+    if (pending == scan->pending.end()) return ESP_ERR_NOT_FOUND;
+    *observation = ObservationFromRecord(*pending);
     return ESP_OK;
 }
 
@@ -1094,7 +1136,7 @@ esp_err_t SuspendObservationTransaction(void* opaque)
     }
     OutboxScan* scan = nullptr;
     ESP_RETURN_ON_ERROR(EnsureOutboxCache(&scan), kTag, "load outbox before note suspend");
-    const auto pending = std::find_if(
+    auto pending = std::find_if(
         scan->pending.begin(), scan->pending.end(),
         [&](const auto& value) { return *context->request_id == value.request_id; });
     if (pending == scan->pending.end()) {
@@ -1106,6 +1148,30 @@ esp_err_t SuspendObservationTransaction(void* opaque)
                    }) != scan->suspended.end()
                 ? ESP_OK
                 : ESP_ERR_NOT_FOUND;
+    }
+
+    if (scan->suspended.empty()) {
+        // Establish a marker-free fallback generation before introducing the
+        // first kind=3 record. Two rewrites also replace a stale backup that
+        // may contain an orphan marker from an interrupted earlier lifecycle.
+        ESP_RETURN_ON_ERROR(
+            CheckpointSessionFromOutbox(*scan),
+            kTag,
+            "checkpoint before first note suspend");
+        ESP_RETURN_ON_ERROR(
+            CompactCachedOutbox(scan),
+            kTag,
+            "prepare note suspend fallback");
+        ESP_RETURN_ON_ERROR(
+            CompactCachedOutbox(scan),
+            kTag,
+            "refresh note suspend fallback");
+        pending = std::find_if(
+            scan->pending.begin(), scan->pending.end(),
+            [&](const auto& value) {
+                return *context->request_id == value.request_id;
+            });
+        if (pending == scan->pending.end()) return ESP_ERR_NOT_FOUND;
     }
 
     // Park the head durably first: the marker append is fsync'd before the
@@ -1120,8 +1186,10 @@ esp_err_t SuspendObservationTransaction(void* opaque)
         AppendOutboxRecord(suspend_record), kTag, "append note suspend record");
 
     scan->suspended.push_back(*pending);
+    scan->suspended_reasons.push_back(static_cast<uint8_t>(context->reason));
     scan->pending.erase(pending);
     ++scan->total_records;
+    ++scan->suspend_records;
     ESP_LOGE(
         kTag,
         "note observation parked (%s): request=%s",
@@ -1169,6 +1237,15 @@ esp_err_t SnapshotTransaction(void* context)
     ESP_RETURN_ON_ERROR(EnsureOutboxCache(&scan), kTag, "load note outbox snapshot");
     snapshot->pending_count = scan->pending.size();
     snapshot->suspended_count = scan->suspended.size();
+    snapshot->blocked_count = static_cast<size_t>(std::count_if(
+        scan->pending.begin(), scan->pending.end(),
+        [&](const OutboxRecord& candidate) {
+            return std::any_of(
+                scan->suspended.begin(), scan->suspended.end(),
+                [&](const OutboxRecord& parked) {
+                    return std::strcmp(candidate.session_id, parked.session_id) == 0;
+                });
+        }));
     snapshot->capacity = wqn::kNoteObservationOutboxCapacity;
     return ESP_OK;
 }

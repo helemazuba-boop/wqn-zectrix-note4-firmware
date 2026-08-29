@@ -63,6 +63,8 @@ struct NoteSessionState {
 
 struct NoteOutboxState {
     size_t pending_count = 0;
+    size_t suspended_count = 0;
+    size_t blocked_count = 0;
     size_t capacity = kNoteObservationOutboxCapacity;
 };
 
