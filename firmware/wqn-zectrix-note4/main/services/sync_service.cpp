@@ -78,6 +78,7 @@ std::atomic<bool> g_boot_policy_evaluated{false};
 constexpr uint32_t kPeriodicScheduleMagic = 0x57514E53;  // "WQNS"
 constexpr uint32_t kFullRetryMagic = 0x57514E52;  // "WQNR"
 constexpr std::time_t kMinScheduleUnixTime = 1704067200;  // 2024-01-01 UTC
+constexpr int64_t kBootFullSyncMinIntervalSeconds = 5 * 60;
 RTC_DATA_ATTR uint32_t g_periodic_schedule_magic = 0;
 RTC_DATA_ATTR uint32_t g_periodic_schedule_interval_minutes = 0;
 RTC_DATA_ATTR int64_t g_next_periodic_sync_unix_seconds = 0;
@@ -307,6 +308,26 @@ TickType_t FullSyncRetryWaitDelay()
 bool FullSyncRetryDue()
 {
     return FullSyncRetryWaitDelay() == 0;
+}
+
+bool BootFullSyncDue()
+{
+    const std::time_t now = CurrentUnixSeconds();
+    if (now < kMinScheduleUnixTime) {
+        return true;
+    }
+    int64_t last_attempt = 0;
+    const esp_err_t result =
+        wqn::LoadBootFullSyncAttemptUnixSeconds(&last_attempt);
+    if (result != ESP_OK) {
+        ESP_LOGW(kTag, "boot full-sync throttle read failed: %s",
+                 esp_err_to_name(result));
+        return true;
+    }
+    return last_attempt < static_cast<int64_t>(kMinScheduleUnixTime) ||
+        static_cast<int64_t>(now) < last_attempt ||
+        static_cast<int64_t>(now) - last_attempt >=
+            kBootFullSyncMinIntervalSeconds;
 }
 
 bool JournalHasPendingContent(const wqn::SyncJournal& journal)
@@ -2880,6 +2901,18 @@ void SyncServiceTask(void*)
             sleep_lease.Reset();
             continue;
         }
+        if ((full_reasons & kFullSyncBoot) != 0) {
+            const std::time_t now = CurrentUnixSeconds();
+            if (now >= kMinScheduleUnixTime) {
+                const esp_err_t saved =
+                    wqn::SaveBootFullSyncAttemptUnixSeconds(
+                        static_cast<int64_t>(now));
+                if (saved != ESP_OK) {
+                    ESP_LOGW(kTag, "boot full-sync throttle write failed: %s",
+                             esp_err_to_name(saved));
+                }
+            }
+        }
         ESP_LOGI(
             kTag,
             "sync dispatch: full=%d reasons=0x%lx periodic=%d retry=%d outbox=%d interval=%u",
@@ -3117,7 +3150,8 @@ esp_err_t StartSyncService()
         }
     }
     ESP_RETURN_ON_ERROR(EnsureSyncJournalLoaded(), kTag, "load sync journal");
-    if (!wqn::runtime::GetWakeContext().deep_sleep_resume) {
+    if (!wqn::runtime::GetWakeContext().deep_sleep_resume &&
+        BootFullSyncDue()) {
         g_full_sync_reasons.fetch_or(kFullSyncBoot, std::memory_order_release);
     }
     if (g_boot_outbox_pending.load(std::memory_order_acquire)) {

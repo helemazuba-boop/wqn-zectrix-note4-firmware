@@ -97,6 +97,8 @@ esp_err_t SaveAutoSyncIntervalMinutes(uint32_t minutes);
 // writes is bounded (once a transaction starts it may still wait without a
 // fixed deadline). UI code must not call this synchronously.
 esp_err_t SaveAutoSyncIntervalMinutesForeground(uint32_t minutes);
+esp_err_t LoadBootFullSyncAttemptUnixSeconds(int64_t* seconds);
+esp_err_t SaveBootFullSyncAttemptUnixSeconds(int64_t seconds);
 std::string AutoSyncIntervalLabel(uint32_t minutes);
 esp_err_t LoadImageRenderMode(ImageRenderMode* mode);
 esp_err_t SaveImageRenderModeForeground(ImageRenderMode mode);

@@ -39,6 +39,7 @@ constexpr char kProblemsKey[] = "problems";
 constexpr char kPendingReviewsKey[] = "pending_reviews";
 constexpr char kAiSessionKey[] = "ai_session_day";
 constexpr char kAutoSyncIntervalMinKey[] = "sync_min";
+constexpr char kBootFullSyncAttemptKey[] = "boot_sync_at";
 constexpr char kImageRenderModeKey[] = "img_render";
 constexpr char kDefaultWordDeckKey[] = "word_deck";
 constexpr char kWifiSsidKey[] = "wifi_ssid";
@@ -50,6 +51,7 @@ constexpr uint8_t kWifiCredentialStoreVersion = 1;
 constexpr char kControlConfigRevisionKey[] = "v3_cfg_rev";
 constexpr char kControlSyncCursorKey[] = "v3_cursor";
 static_assert(sizeof(kAutoSyncIntervalMinKey) <= 16, "NVS key must fit ESP-IDF's 15-character limit");
+static_assert(sizeof(kBootFullSyncAttemptKey) <= 16, "NVS key must fit ESP-IDF's 15-character limit");
 static_assert(sizeof(kImageRenderModeKey) <= 16, "NVS key must fit ESP-IDF's 15-character limit");
 static_assert(sizeof(kWifiSsidKey) <= 16, "NVS key must fit ESP-IDF's 15-character limit");
 static_assert(sizeof(kWifiPasswordKey) <= 16, "NVS key must fit ESP-IDF's 15-character limit");
@@ -1181,6 +1183,37 @@ esp_err_t SaveAutoSyncIntervalMinutesForeground(uint32_t minutes)
     U64WriteContext context = {kAutoSyncIntervalMinKey, minutes};
     return services::ExecuteForegroundStorageTransaction(
         SaveU64Transaction, &context, "save-sync-interval");
+}
+
+esp_err_t LoadBootFullSyncAttemptUnixSeconds(int64_t* seconds)
+{
+    if (seconds == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    uint64_t raw = 0;
+    bool found = false;
+    ESP_RETURN_ON_ERROR(
+        LoadU64FromNvs(kBootFullSyncAttemptKey, &raw, &found), kTag,
+        "load boot full-sync attempt");
+    if (!found || raw > static_cast<uint64_t>(INT64_MAX)) {
+        *seconds = 0;
+        return ESP_OK;
+    }
+    *seconds = static_cast<int64_t>(raw);
+    return ESP_OK;
+}
+
+esp_err_t SaveBootFullSyncAttemptUnixSeconds(int64_t seconds)
+{
+    if (seconds < 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    StorageWriteGuard write("save-boot-sync-attempt", __FILE__, __LINE__);
+    if (!write) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    return SaveU64ToNvs(
+        kBootFullSyncAttemptKey, static_cast<uint64_t>(seconds));
 }
 
 esp_err_t LoadImageRenderMode(ImageRenderMode* mode)
