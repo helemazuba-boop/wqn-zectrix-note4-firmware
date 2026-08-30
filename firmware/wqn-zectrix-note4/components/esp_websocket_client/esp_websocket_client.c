@@ -36,6 +36,7 @@ static const char *TAG = "websocket_client";
 #define WEBSOCKET_PING_INTERVAL_SEC (10)
 #define WEBSOCKET_EVENT_QUEUE_SIZE (1)
 #define WEBSOCKET_PINGPONG_TIMEOUT_SEC (120)
+#define WEBSOCKET_CONTROL_PAYLOAD_MAX (125)
 #define WEBSOCKET_KEEP_ALIVE_IDLE (5)
 #define WEBSOCKET_KEEP_ALIVE_INTERVAL (5)
 #define WEBSOCKET_KEEP_ALIVE_COUNT (3)
@@ -1063,6 +1064,14 @@ static esp_err_t esp_websocket_client_recv(esp_websocket_client_handle_t client)
  client->payload_len = esp_transport_ws_get_read_payload_len(client->transport);
  client->last_fin = esp_transport_ws_get_fin_flag(client->transport);
  client->last_opcode = esp_transport_ws_get_read_opcode(client->transport);
+
+ if (client->last_opcode == WS_TRANSPORT_OPCODES_PING &&
+ client->payload_len > WEBSOCKET_CONTROL_PAYLOAD_MAX) {
+ ESP_LOGE(TAG, "Invalid PING payload_len=%d (maximum %d)",
+ client->payload_len, WEBSOCKET_CONTROL_PAYLOAD_MAX);
+ esp_websocket_free_buf(client, false);
+ return ESP_FAIL;
+ }
 
  if (rlen == 0 && client->last_opcode == WS_TRANSPORT_OPCODES_NONE) {
  ESP_LOGV(TAG, "esp_transport_read timeouts");
