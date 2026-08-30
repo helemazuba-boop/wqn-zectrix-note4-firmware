@@ -16,6 +16,7 @@
 #include "ai_history.h"
 #include "cJSON.h"
 #include "config.h"
+#include "device_protocol/json_depth_guard.h"
 #include "esp_check.h"
 #include "esp_crt_bundle.h"
 #include "esp_heap_caps.h"
@@ -1494,6 +1495,15 @@ void ParseAndHandleEvent(const char* data, size_t len)
     // JSON string escapes correctly and is what every other parser in this
     // project already uses (wqn_api.cpp, word_pack.cpp).
     if (g_flash.mutex == nullptr || data == nullptr || len == 0) {
+        return;
+    }
+
+    constexpr size_t kMaxJsonNestingDepth = 16;
+    if (!wqn::protocol::JsonNestingWithinLimit(
+            data, len, kMaxJsonNestingDepth)) {
+        ESP_LOGW(kTag, "WS event JSON nesting exceeds %u, dropping (len=%u)",
+                 static_cast<unsigned>(kMaxJsonNestingDepth),
+                 static_cast<unsigned>(len));
         return;
     }
 
