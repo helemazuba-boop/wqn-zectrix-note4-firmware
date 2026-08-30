@@ -117,7 +117,7 @@ void HoldOutput(gpio_num_t pin, int level)
     gpio_hold_en(pin);
 }
 
-RTC_DATA_ATTR int64_t g_last_user_activity_ms = 0;
+int64_t g_last_user_activity_ms = 0;
 RTC_DATA_ATTR uint32_t g_consecutive_sleep_cycles = 0;
 // [sleep-race] Written by the UI task (first interaction of this boot) and
 // read by the power task's timer-wake fast path; atomic removes the
@@ -129,10 +129,10 @@ static std::atomic<bool> g_user_interacted_current_boot{false};
 // settle, serialized with NoteUserActivity through g_activity_gate so no bump
 // can land between that last check and the deep-sleep entry. An interaction
 // in any earlier window cancels the sleep instead of losing RAM-staged input.
-// g_last_user_activity_ms / g_consecutive_sleep_cycles stay plain
-// RTC_DATA_ATTR variables; cross-task accesses go through std::atomic_ref so
-// the int64 cannot tear on this 32-bit core and the UI-task reset of the
-// cycle counter is not a data race.
+// g_last_user_activity_ms stays a current-boot monotonic value; retaining it
+// across reset would compare timestamps from different esp_timer epochs.
+// Both plain shared values use std::atomic_ref so the int64 cannot tear on
+// this 32-bit core and the UI-task reset of the RTC cycle counter is safe.
 static std::atomic<uint32_t> g_user_activity_generation{0};
 static portMUX_TYPE g_activity_gate = portMUX_INITIALIZER_UNLOCKED;
 
@@ -609,7 +609,8 @@ static bool IsUiIdleForThresholdMs(int threshold_ms)
     // permanently pinned the
     // device in active mode. EPD activity is still tracked separately for
     // the EPD rail power-off path.
-    return last_activity_ms > 0 && (now_ms - last_activity_ms) >= threshold_ms;
+    return now_ms >= last_activity_ms &&
+        (now_ms - last_activity_ms) >= threshold_ms;
 }
 
 bool IsUiIdleForSleepEx(int extra_idle_ms)
@@ -1606,6 +1607,10 @@ esp_err_t StartPowerCoordinator()
         ConsecutiveSleepCyclesRef().store(
             snapshot.consecutive_cycles, std::memory_order_relaxed);
     }
+    // A monotonic esp_timer timestamp is meaningful only within this boot.
+    // Treat startup as the initial activity epoch so an untouched device can
+    // enter retained standby after the normal idle threshold.
+    UserActivityMsRef().store(NowMs(), std::memory_order_relaxed);
     const BaseType_t created =
         xTaskCreate(PowerCoordinatorTask, "wqn_power_coord", 8192, nullptr, 4, &g_power_coordinator_task);
     if (created != pdPASS) {
