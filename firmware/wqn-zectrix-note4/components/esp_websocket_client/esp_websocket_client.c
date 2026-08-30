@@ -1075,8 +1075,13 @@ static esp_err_t esp_websocket_client_recv(esp_websocket_client_handle_t client)
  } while (client->payload_offset < client->payload_len);
 
  if (client->last_opcode == WS_TRANSPORT_OPCODES_PING) {
- const char *data = (client->payload_len == 0) ? NULL : client->rx_buffer;
- ESP_LOGD(TAG, "Sending PONG with payload len=%d", client->payload_len);
+ int pong_len = client->payload_len;
+ if (pong_len > client->buffer_size) {
+ ESP_LOGW(TAG, "PING payload_len=%d exceeds buffer_size=%d, truncating PONG echo", pong_len, client->buffer_size);
+ pong_len = client->buffer_size;
+ }
+ const char *data = (pong_len == 0) ? NULL : client->rx_buffer;
+ ESP_LOGD(TAG, "Sending PONG with payload len=%d", pong_len);
 #ifdef CONFIG_ESP_WS_CLIENT_SEPARATE_TX_LOCK
  xSemaphoreGiveRecursive(client->lock);
 
@@ -1097,11 +1102,11 @@ static esp_err_t esp_websocket_client_recv(esp_websocket_client_handle_t client)
  return ESP_OK;
  }
 
- esp_transport_ws_send_raw(client->transport, WS_TRANSPORT_OPCODES_PONG | WS_TRANSPORT_OPCODES_FIN, data, client->payload_len,
+ esp_transport_ws_send_raw(client->transport, WS_TRANSPORT_OPCODES_PONG | WS_TRANSPORT_OPCODES_FIN, data, pong_len,
  client->config->network_timeout_ms);
  xSemaphoreGiveRecursive(client->tx_lock);
 #else
- esp_transport_ws_send_raw(client->transport, WS_TRANSPORT_OPCODES_PONG | WS_TRANSPORT_OPCODES_FIN, data, client->payload_len,
+ esp_transport_ws_send_raw(client->transport, WS_TRANSPORT_OPCODES_PONG | WS_TRANSPORT_OPCODES_FIN, data, pong_len,
  client->config->network_timeout_ms);
 #endif
  } else if (client->last_opcode == WS_TRANSPORT_OPCODES_PONG) {
