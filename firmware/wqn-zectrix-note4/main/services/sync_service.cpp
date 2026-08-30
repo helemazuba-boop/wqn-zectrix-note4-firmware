@@ -3121,7 +3121,9 @@ esp_err_t StartSyncService()
         g_full_sync_reasons.fetch_or(kFullSyncBoot, std::memory_order_release);
     }
     if (g_boot_outbox_pending.load(std::memory_order_acquire)) {
-        g_outbox_immediate_requested.store(true, std::memory_order_relaxed);
+        // A durable record is pending work, not an instruction to bypass an
+        // existing transport/server retry cursor. OutboxWaitDelay owns due
+        // admission; explicit producers still use the immediate flag.
         g_word_outbox_sync_requested.store(true, std::memory_order_release);
     }
     if (g_word_outbox_timer == nullptr) {
