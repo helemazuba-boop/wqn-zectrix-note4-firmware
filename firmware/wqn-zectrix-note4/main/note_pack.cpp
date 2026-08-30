@@ -52,6 +52,7 @@ constexpr size_t kMaxNoteTitleBytes = 4 * 120;
 constexpr size_t kMaxNoteContentBytes = 16384;
 constexpr size_t kPackIdStemChars = 6;
 constexpr size_t kPackHashStemChars = 12;
+constexpr size_t kNoteImageHashStemChars = 18;
 // SPIFFS counts the leading slash in its object name and reserves one byte for
 // NUL. Keep the longest final suffix (.wqnp) strictly within that budget.
 constexpr size_t kMaxPackObjectNameBytes =
@@ -59,6 +60,13 @@ constexpr size_t kMaxPackObjectNameBytes =
 static_assert(
     kMaxPackObjectNameBytes <= CONFIG_SPIFFS_OBJ_NAME_LEN - 1,
     "note pack filename exceeds SPIFFS object-name budget");
+// Include the longer `.wqni.tmp` transaction name. Eighteen hex characters
+// raise the cache-key prefix from 48 to 72 bits while staying within SPIFFS.
+constexpr size_t kMaxNoteImageObjectNameBytes =
+    1 + 3 + kNoteImageHashStemChars + 5 + 4;
+static_assert(
+    kMaxNoteImageObjectNameBytes <= CONFIG_SPIFFS_OBJ_NAME_LEN - 1,
+    "note image cache filename exceeds SPIFFS object-name budget");
 // Maximum contract line, its optional LF, and the terminating NUL for fgets.
 constexpr size_t kLineBufferSize = kMaxLineBytes + 2;
 
@@ -236,6 +244,25 @@ bool VerifyFileSha256(const std::string& path, const std::string& expected)
         actual.push_back(kHex[byte & 0x0F]);
     }
     return actual == expected;
+}
+
+bool VerifyBufferSha256(
+    const uint8_t* data, size_t size, const std::string& expected)
+{
+    if (data == nullptr || size == 0 || expected.size() != 64) {
+        return false;
+    }
+    std::array<unsigned char, 32> digest = {};
+    if (mbedtls_sha256(data, size, digest.data(), 0) != 0) {
+        return false;
+    }
+    constexpr char kHex[] = "0123456789abcdef";
+    std::array<char, 64> actual = {};
+    for (size_t i = 0; i < digest.size(); ++i) {
+        actual[i * 2] = kHex[digest[i] >> 4];
+        actual[i * 2 + 1] = kHex[digest[i] & 0x0F];
+    }
+    return std::equal(actual.begin(), actual.end(), expected.begin());
 }
 
 void CopyField(char* dst, size_t dst_size, const std::string& src)
@@ -1345,14 +1372,15 @@ namespace {
 
 std::string NoteImageCachePath(const std::string& image_id)
 {
-    return std::string(kStorageRoot) + "/ni_" + image_id.substr(0, 12) + ".wqni";
+    return std::string(kStorageRoot) + "/ni_" +
+        image_id.substr(0, kNoteImageHashStemChars) + ".wqni";
 }
 
 bool IsNoteImageId(const std::string& image_id)
 {
     if (image_id.size() != 64) return false;
     for (char c : image_id) {
-        if (!std::isxdigit(static_cast<unsigned char>(c))) return false;
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
     }
     return true;
 }
@@ -1449,7 +1477,9 @@ esp_err_t LoadNoteImageTransaction(void* opaque)
     const bool extra = std::fgetc(file) != EOF;
     std::fclose(file);
     if (read != payload || extra ||
-        ValidateNoteImageWqni(context->wqni->data(), context->wqni->size()) != ESP_OK) {
+        ValidateNoteImageWqni(context->wqni->data(), context->wqni->size()) != ESP_OK ||
+        !VerifyBufferSha256(
+            context->wqni->data(), context->wqni->size(), *context->image_id)) {
         // Corrupt cache entries are dropped so the next request re-downloads.
         unlink(path.c_str());
         context->wqni->clear();
@@ -1557,6 +1587,9 @@ esp_err_t StoreCachedNoteImage(const std::string& image_id, const uint8_t* data,
     const esp_err_t valid = ValidateNoteImageWqni(data, size);
     if (valid != ESP_OK) {
         return valid;
+    }
+    if (!VerifyBufferSha256(data, size, image_id)) {
+        return ESP_ERR_INVALID_CRC;
     }
     runtime::SleepLease storage_lease = runtime::SleepLease::TryAcquire(
         runtime::SleepBlocker::kStorage,

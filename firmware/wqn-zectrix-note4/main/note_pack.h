@@ -163,8 +163,9 @@ inline constexpr size_t kNoteImageCacheMaxFiles = 64;
 
 // Validates magic/version/format/flags/geometry/length and the payload CRC32.
 esp_err_t ValidateNoteImageWqni(const uint8_t* data, size_t size);
-// Cache files live at /storage/ni_<image_id[0..12)>.wqni; the id is the
-// SHA-256 of the whole file, so cached bytes are immutable.
+// Cache files use a SPIFFS-safe 72-bit image-id prefix. Every write and hit is
+// still verified against the full SHA-256, so a prefix collision is a miss,
+// never an incorrect image.
 esp_err_t LoadCachedNoteImage(
     const std::string& image_id, std::vector<uint8_t>* wqni);
 esp_err_t StoreCachedNoteImage(
