@@ -40,4 +40,10 @@ bool PersistSystemTimeToRtc(uint32_t sleep_generation);
 // the system clock was actually calibrated.
 bool RestoreSystemTimeFromRtc();
 
+// Establishes the process timezone and, only when neither the platform nor
+// RestoreSystemTimeFromRtc supplied a reasonable wall clock, seeds a lower
+// bound from the firmware build timestamp. Call before any scheduler performs
+// wall-clock admission; later HTTPS/SNTP calibration may refine it.
+bool SeedSystemTimeFromBuildTimeIfNeeded();
+
 }  // namespace wqn::power::timekeep

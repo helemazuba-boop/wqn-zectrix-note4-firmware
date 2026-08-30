@@ -1,6 +1,8 @@
 #include "power/rtc_timekeep.h"
 
 #include <cstddef>
+#include <cstdio>
+#include <cstring>
 #include <ctime>
 #include <sys/time.h>
 
@@ -49,6 +51,20 @@ bool TrustRecordValid()
     return g_trust_record.magic == kTrustMagic &&
            g_trust_record.version == kTrustVersion &&
            g_trust_record.checksum == TrustChecksum(g_trust_record);
+}
+
+int MonthIndexFromBuildDate(const char* month)
+{
+    static constexpr const char* kMonths[] = {
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    };
+    for (int index = 0; index < 12; ++index) {
+        if (std::strncmp(month, kMonths[index], 3) == 0) {
+            return index;
+        }
+    }
+    return 0;
 }
 
 int64_t UtcDaysFromCivil(int64_t year, unsigned month, unsigned day)
@@ -213,6 +229,56 @@ bool RestoreSystemTimeFromRtc()
              static_cast<unsigned long>(g_trust_record.generation),
              static_cast<unsigned long>(wake.sleep_generation),
              static_cast<long long>(restored_seconds));
+    return true;
+}
+
+bool SeedSystemTimeFromBuildTimeIfNeeded()
+{
+    setenv("TZ", "CST-8", 1);
+    tzset();
+    if (std::time(nullptr) >= kMinReasonableUnixTime) {
+        return false;
+    }
+
+    char month[4] = {};
+    int day = 1;
+    int year = 2026;
+    int hour = 0;
+    int minute = 0;
+    int second = 0;
+    if (std::sscanf(__DATE__, "%3s %d %d", month, &day, &year) != 3 ||
+        std::sscanf(__TIME__, "%d:%d:%d", &hour, &minute, &second) != 3) {
+        ESP_LOGW(kTag, "build time parse failed; clock remains invalid");
+        return false;
+    }
+
+    std::tm build_tm = {};
+    build_tm.tm_year = year - 1900;
+    build_tm.tm_mon = MonthIndexFromBuildDate(month);
+    build_tm.tm_mday = day;
+    build_tm.tm_hour = hour;
+    build_tm.tm_min = minute;
+    build_tm.tm_sec = second;
+    build_tm.tm_isdst = -1;
+    const std::time_t build_time = std::mktime(&build_tm);
+    if (build_time < kMinReasonableUnixTime) {
+        ESP_LOGW(kTag, "build time is not reasonable; clock remains invalid");
+        return false;
+    }
+    const timeval tv = {
+        .tv_sec = build_time,
+        .tv_usec = 0,
+    };
+    settimeofday(&tv, nullptr);
+    ESP_LOGI(
+        kTag,
+        "clock seeded from build time: %04d-%02d-%02d %02d:%02d:%02d CST",
+        year,
+        build_tm.tm_mon + 1,
+        day,
+        hour,
+        minute,
+        second);
     return true;
 }
 

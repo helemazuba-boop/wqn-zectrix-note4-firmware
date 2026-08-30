@@ -111,6 +111,10 @@ extern "C" void app_main(void)
     // its reasonableness check passes.
     wqn::power::timekeep::RestoreSystemTimeFromRtc();
 #endif
+    // Sync admission runs before the UI task. Give every scheduler a
+    // reasonable wall-clock lower bound even when RTC restore is disabled or
+    // rejected; HTTPS/SNTP can refine it after connectivity is admitted.
+    wqn::power::timekeep::SeedSystemTimeFromBuildTimeIfNeeded();
     wqn::LogWakeupCause();
     wqn::PrintBootDiagnostics();
 
