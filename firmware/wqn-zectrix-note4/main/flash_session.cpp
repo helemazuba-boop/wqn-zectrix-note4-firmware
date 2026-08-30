@@ -128,6 +128,8 @@ struct FlashState {
     int reconnect_attempts = 0;
     int64_t status_since_ms = 0;
     esp_websocket_client_handle_t ws_client = nullptr;
+    esp_websocket_client_handle_t ws_client_to_destroy = nullptr;
+    std::atomic<uint32_t> active_ws_sends{0};
     bool changed = false;
     wqn::AiTier tier = wqn::AiTier::kFlash;
     // WebSocket frame reassembly buffer for fragmented payloads
@@ -185,6 +187,25 @@ struct FlashState {
 FlashState g_flash;
 wqn::services::AudioSession g_flash_audio_session;
 wqn::services::ConnectivityDemand g_flash_connectivity_demand;
+
+class FlashWsSendRegistration {
+public:
+    explicit FlashWsSendRegistration(esp_websocket_client_handle_t client)
+        : client_(client) {}
+
+    ~FlashWsSendRegistration()
+    {
+        if (client_ != nullptr) {
+            g_flash.active_ws_sends.fetch_sub(1, std::memory_order_release);
+        }
+    }
+
+    FlashWsSendRegistration(const FlashWsSendRegistration&) = delete;
+    FlashWsSendRegistration& operator=(const FlashWsSendRegistration&) = delete;
+
+private:
+    esp_websocket_client_handle_t client_;
+};
 
 enum class FlashTerminalReason : uint8_t {
     kNone,
@@ -1316,11 +1337,15 @@ void AudioStreamingTask(void* param)
         // Send via WebSocket if connected.
         // v2 uses binary frames (24-byte header + PCM); v1 fallback sends
         // {"type":"input_audio_buffer.append","audio":"<base64>"}.
-        bool ws_ok = false;
+        esp_websocket_client_handle_t send_client = nullptr;
         xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
-        ws_ok = g_flash.ws_connected && (g_flash.ws_client != nullptr);
+        if (g_flash.ws_connected && g_flash.ws_client != nullptr) {
+            send_client = g_flash.ws_client;
+            g_flash.active_ws_sends.fetch_add(1, std::memory_order_relaxed);
+        }
         xSemaphoreGive(g_flash.mutex);
-        if (ws_ok) {
+        FlashWsSendRegistration send_registration(send_client);
+        if (send_client != nullptr) {
 #if CONFIG_WQN_FLASH_PROTOCOL_V2
             uplink_frame.clear();
             const uint32_t seq = ++g_flash.uplink_seq;
@@ -1334,7 +1359,7 @@ void AudioStreamingTask(void* param)
             // number of bytes accepted; never report an append that failed.
             const int64_t send_started_us = esp_timer_get_time();
             const int sent = esp_websocket_client_send_bin(
-                g_flash.ws_client,
+                send_client,
                 reinterpret_cast<const char*>(uplink_frame.data()),
                 uplink_frame.size(), pdMS_TO_TICKS(2500));
             const int64_t send_elapsed_ms =
@@ -1383,7 +1408,7 @@ void AudioStreamingTask(void* param)
 #else
             std::string b64 = EncodeBase64(reinterpret_cast<const uint8_t*>(mono_buf), mono_bytes);
             std::string msg = R"({"type":"input_audio_buffer.append","audio":"}" + b64 + R"("})";
-            esp_websocket_client_send_text(g_flash.ws_client, msg.c_str(), msg.size(), pdMS_TO_TICKS(1000));
+            esp_websocket_client_send_text(send_client, msg.c_str(), msg.size(), pdMS_TO_TICKS(1000));
 #endif
         }
     }
@@ -1450,10 +1475,10 @@ void StopAudioStreaming()
         return;
     }
     // [panic-fix] Wait for the task to self-delete. The task can block in
-    // esp_websocket_client_send_bin (1 s timeout) or i2s_channel_read (200 ms),
-    // so it needs up to ~1.2 s after capture_started is cleared to exit. 3.0 s
-    // covers two send_bin timeouts + jitter. If it still doesn't exit, leave it
-    // alive (see below) - never vTaskDelete (corrupts FreeRTOS lists -> reboot).
+    // esp_websocket_client_send_bin (2.5 s timeout) or i2s_channel_read
+    // (200 ms), so 3.0 s covers the bounded call plus scheduling jitter. If it
+    // still doesn't exit, leave it alive; the lifecycle task will not destroy
+    // the registered WebSocket client while this sender remains active.
     for (int i = 0; i < 300; ++i) {  // 3.0s (was 2.0s)
         vTaskDelay(pdMS_TO_TICKS(10));
         xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
@@ -1464,8 +1489,8 @@ void StopAudioStreaming()
             return;
         }
     }
-    // Task still alive — force cleanup (rare fallback for hung task)
-    ESP_LOGE(kTag, "streaming task did not exit within 3s; leaving alive (will exit on WS destroy)");
+    // Task still alive — keep the task and its WebSocket lifetime registered.
+    ESP_LOGE(kTag, "streaming task did not exit within 3s; deferring client destroy");
     CleanupStreamHardware();
     // Do not query or delete `task` here: it may self-delete between the poll
     // and this point, making even eTaskGetState(task) a stale-handle access.
@@ -1852,7 +1877,11 @@ void WebsocketEventHandler(void* handler_args, esp_event_base_t, int32_t event_i
             g_flash.uplink_seq = 0;
             MarkChanged();
             esp_websocket_client_handle_t client = g_flash.ws_client;
+            if (client != nullptr) {
+                g_flash.active_ws_sends.fetch_add(1, std::memory_order_relaxed);
+            }
             xSemaphoreGive(g_flash.mutex);
+            FlashWsSendRegistration send_registration(client);
             if (client == nullptr) break;
 
             // PCM frames arrive every 15 ms and are smaller than one TCP MSS.
@@ -2410,10 +2439,11 @@ esp_err_t StopFlashSessionNow()
     {
         xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
         if (g_flash.ws_client != nullptr) {
-            client_to_destroy = g_flash.ws_client;
+            g_flash.ws_client_to_destroy = g_flash.ws_client;
             g_flash.ws_client = nullptr;
             g_flash.ws_connected = false;
         }
+        client_to_destroy = g_flash.ws_client_to_destroy;
         g_flash.status = InternalStatus::kIdle;
         g_flash.pending_text.clear();
         g_flash.tool_label.clear();
@@ -2425,18 +2455,39 @@ esp_err_t StopFlashSessionNow()
         xSemaphoreGive(g_flash.mutex);
     }
 
-    // Now destroy the client (no mutex held, so WebSocket event handler can complete)
+    // Every sender registers while holding g_flash.mutex before it snapshots
+    // the handle. With the global handle now null, no new sender can enter;
+    // wait for existing API calls to return before freeing the client.
     if (client_to_destroy != nullptr) {
-        esp_websocket_client_stop(client_to_destroy);
-        esp_websocket_client_destroy(client_to_destroy);
+        for (int i = 0; i < 600; ++i) {  // longest send timeout is 5 s
+            if (g_flash.active_ws_sends.load(std::memory_order_acquire) == 0) {
+                break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+        const uint32_t active_sends =
+            g_flash.active_ws_sends.load(std::memory_order_acquire);
+        if (active_sends != 0) {
+            ESP_LOGE(kTag, "WS senders did not drain before teardown: active=%u",
+                     static_cast<unsigned>(active_sends));
+            return ESP_ERR_TIMEOUT;
+        }
+        ESP_ERROR_CHECK_WITHOUT_ABORT(
+            esp_websocket_client_stop(client_to_destroy));
+        ESP_RETURN_ON_ERROR(
+            esp_websocket_client_destroy(client_to_destroy), kTag,
+            "destroy Flash WebSocket client");
+        xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+        if (g_flash.ws_client_to_destroy == client_to_destroy) {
+            g_flash.ws_client_to_destroy = nullptr;
+        }
+        xSemaphoreGive(g_flash.mutex);
     }
 
-    // [i2s-handoff] WS destroy unblocks any AudioStreamingTask stuck in
-    // esp_websocket_client_send_bin (the only thing StopAudioStreaming's 3 s
-    // wait couldn't break). Wait briefly for it to self-exit, then tear down
-    // the duplex I2S channels so STD/Pro can claim I2S_NUM_0. TearDownStream
-    // Channels also stops FlashPlaybackTask and verifies stream_task is gone
-    // before deleting stream_rx (UAF-safe).
+    // Wait briefly for the drained AudioStreamingTask to publish its terminal
+    // state, then tear down the duplex I2S channels so STD/Pro can claim
+    // I2S_NUM_0. TearDownStreamChannels verifies stream_task is gone before
+    // deleting stream_rx.
     {
         xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
         TaskHandle_t stuck = g_flash.stream_task;
@@ -2681,11 +2732,22 @@ void OnFlashButtonPressed()
                     kStreamTxDmaBytes);
             }
             // Remote side: ask the proxy to cancel the in-progress response.
-            const char* cancel = "{\"type\":\"response.cancel\"}";
-            esp_websocket_client_send_text(g_flash.ws_client, cancel,
-                                           std::strlen(cancel),
-                                           pdMS_TO_TICKS(1000));
-            ESP_LOGI(kTag, "barge-in: cancelled in-flight response");
+            esp_websocket_client_handle_t cancel_client = nullptr;
+            xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+            if (g_flash.ws_client != nullptr) {
+                cancel_client = g_flash.ws_client;
+                g_flash.active_ws_sends.fetch_add(
+                    1, std::memory_order_relaxed);
+            }
+            xSemaphoreGive(g_flash.mutex);
+            FlashWsSendRegistration send_registration(cancel_client);
+            if (cancel_client != nullptr) {
+                const char* cancel = "{\"type\":\"response.cancel\"}";
+                esp_websocket_client_send_text(
+                    cancel_client, cancel, std::strlen(cancel),
+                    pdMS_TO_TICKS(1000));
+                ESP_LOGI(kTag, "barge-in: cancelled in-flight response");
+            }
         }
 
         StartAudioStreaming();
@@ -2777,6 +2839,7 @@ void OnFlashButtonReleased(bool submit)
         // re-press after the prior response finishes).
         should_send = true;
         client = g_flash.ws_client;
+        g_flash.active_ws_sends.fetch_add(1, std::memory_order_relaxed);
         ++g_flash.uplink_seq;
         seq = g_flash.uplink_seq;
         g_flash.response_in_flight = true;  // in-flight until response.done/error
@@ -2786,6 +2849,7 @@ void OnFlashButtonReleased(bool submit)
     }
     xSemaphoreGive(g_flash.mutex);
 
+    FlashWsSendRegistration send_registration(should_send ? client : nullptr);
     if (should_send) {
 #if CONFIG_WQN_FLASH_PROTOCOL_V2
         std::vector<uint8_t> end;
@@ -2824,7 +2888,12 @@ void AbortFlashPlayback()
     xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
     const bool cancel = g_flash.ws_connected && g_flash.response_in_flight;
     esp_websocket_client_handle_t client = g_flash.ws_client;
+    if (cancel && client != nullptr) {
+        g_flash.active_ws_sends.fetch_add(1, std::memory_order_relaxed);
+    }
     xSemaphoreGive(g_flash.mutex);
+    FlashWsSendRegistration send_registration(
+        cancel && client != nullptr ? client : nullptr);
     if (cancel && client != nullptr) {
         const char* msg = "{\"type\":\"response.cancel\"}";
         esp_websocket_client_send_text(client, msg, std::strlen(msg), pdMS_TO_TICKS(1000));
