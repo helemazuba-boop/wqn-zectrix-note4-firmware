@@ -1700,9 +1700,12 @@ esp_err_t RefreshEpdFull(bool allow_local_partial, bool force_full_refresh)
     std::memcpy(g_previous_framebuffer, g_framebuffer, kEpdFramebufferSize);
     g_previous_framebuffer_synced = true;
     g_partial_refreshes_since_full = full_refresh ? 0 : g_partial_refreshes_since_full + 1;
+    // A full-frame partial drives the partial waveform over the whole panel;
+    // sparse changed pixels do not make that electrical stress local.
     g_heavy_partials_since_full = full_refresh
         ? 0
-        : g_heavy_partials_since_full + (diff_ratio >= kHeavyPartialDiffRatio ? 1 : 0);
+        : g_heavy_partials_since_full +
+            ((!local_partial || diff_ratio >= kHeavyPartialDiffRatio) ? 1 : 0);
     g_last_partial_was_full_frame = !full_refresh && !local_partial;
     // [power-fix] Record the CRC so deep-sleep wakeups can skip the next
     // refresh if the frame content hasn't changed.
