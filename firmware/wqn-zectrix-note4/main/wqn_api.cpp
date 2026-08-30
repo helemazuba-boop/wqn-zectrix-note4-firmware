@@ -14,6 +14,7 @@
 
 #include "cJSON.h"
 #include "config.h"
+#include "device_protocol/json_depth_guard.h"
 #include "device_protocol/note_study.h"
 #include "device_protocol/word_study.h"
 #include "esp_check.h"
@@ -186,7 +187,11 @@ bool IsLowercaseSha256(const std::string& value)
 
 class JsonDocument {
 public:
-    explicit JsonDocument(const std::string& payload) : root_(cJSON_Parse(payload.c_str())) {}
+    explicit JsonDocument(const std::string& payload)
+        : root_(wqn::protocol::JsonNestingWithinLimit(
+                    payload.data(), payload.size())
+                    ? cJSON_Parse(payload.c_str())
+                    : nullptr) {}
     ~JsonDocument() { cJSON_Delete(root_); }
 
     cJSON* root() const { return root_; }

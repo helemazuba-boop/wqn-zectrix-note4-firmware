@@ -5,6 +5,7 @@
 #include <cstring>
 #include "cJSON.h"
 #include "config.h"
+#include "device_protocol/json_depth_guard.h"
 #include "esp_crt_bundle.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
@@ -376,6 +377,14 @@ void ProcessTextStream()
                                              0)) > 0) {
         if (!g_session_ready.load(std::memory_order_acquire)) {
             g_control_reassembly_buf.append(buf, bytes_read);
+            if (!wqn::protocol::JsonNestingWithinLimit(
+                    g_control_reassembly_buf.data(),
+                    g_control_reassembly_buf.size())) {
+                ESP_LOGE(kTag, "session control JSON nesting too deep");
+                g_control_reassembly_buf.clear();
+                xTaskNotify(g_transport_task, kEvtBitResetRequired, eSetBits);
+                continue;
+            }
             cJSON* root = cJSON_ParseWithLength(
                 g_control_reassembly_buf.data(),
                 g_control_reassembly_buf.size());

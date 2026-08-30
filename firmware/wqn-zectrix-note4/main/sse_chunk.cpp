@@ -3,6 +3,7 @@
 #include <cstdlib>
 #include <utility>
 #include "cJSON.h"
+#include "device_protocol/json_depth_guard.h"
 
 namespace wqn {
 
@@ -126,7 +127,10 @@ bool DecodeSseEvent(const std::string& event_name,
   out_ev->event_id = event_id;
   out_ev->raw_json = data_json;
 
-  cJSON* root = cJSON_ParseWithLength(data_json.c_str(), data_json.size());
+  cJSON* root = protocol::JsonNestingWithinLimit(
+                    data_json.data(), data_json.size())
+      ? cJSON_ParseWithLength(data_json.c_str(), data_json.size())
+      : nullptr;
   if (root == nullptr) {
     return false;
   }

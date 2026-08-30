@@ -5,6 +5,7 @@
 #include <limits>
 
 #include "cJSON.h"
+#include "device_protocol/json_depth_guard.h"
 #include "esp_check.h"
 
 namespace {
@@ -15,7 +16,10 @@ using namespace wqn::protocol::problem_study_v1;
 class JsonDocument {
 public:
     explicit JsonDocument(cJSON* root) : root_(root) {}
-    explicit JsonDocument(const std::string& body) : root_(cJSON_Parse(body.c_str())) {}
+    explicit JsonDocument(const std::string& body)
+        : root_(JsonNestingWithinLimit(body.data(), body.size())
+                    ? cJSON_Parse(body.c_str())
+                    : nullptr) {}
     ~JsonDocument() { cJSON_Delete(root_); }
     cJSON* root() const { return root_; }
 

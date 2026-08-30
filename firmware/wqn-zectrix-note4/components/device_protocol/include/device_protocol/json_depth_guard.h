@@ -4,11 +4,13 @@
 
 namespace wqn::protocol {
 
+inline constexpr std::size_t kMaxJsonNestingDepth = 32;
+
 // cJSON's recursive parser permits much deeper documents than the firmware's
 // task stacks can safely parse. Count containers without treating brackets in
 // JSON strings as structure so callers can reject excessive depth first.
 inline bool JsonNestingWithinLimit(const char* data, std::size_t length,
-                                   std::size_t max_depth)
+                                   std::size_t max_depth = kMaxJsonNestingDepth)
 {
     if (data == nullptr) {
         return length == 0;
