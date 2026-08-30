@@ -581,13 +581,10 @@ void DeviceUiTask(void*)
         ESP_LOGW(kTag, "UI state loaded in degraded mode");
     }
     LogUiStackHighWater("state-loaded");
-    // [power-fix] Do NOT seed g_last_rendered_screen from state.screen here:
-    // a deep-sleep wake-up that goes through USB_UART_CHIP_RESET loses this
-    // RAM variable, and unconditionally re-writing it from the freshly loaded
-    // UI state would later trip the "screen change detected" branch in
-    // RefreshFrame() and force a full refresh on every wake-up. Treat -1 as
-    // "unknown", which forces the first refresh to be full but keeps subsequent
-    // wake-ups inside the same screen and clock label on the RTC-CRC fast path.
+    // Do not seed g_last_rendered_screen from freshly loaded logical state.
+    // The refresh task retains that value as a physical-display commit and
+    // advances it only after a successful panel update; overwriting it here
+    // would hide a real screen transition or manufacture one after deep sleep.
     CheckBatteryProtection();
     ESP_LOGI(kTag, "DeviceUiTask: CheckBatteryProtection done");
     std::string last_clock_label = CurrentClockLabel();

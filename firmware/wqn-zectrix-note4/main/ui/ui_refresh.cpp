@@ -10,6 +10,7 @@
 #include <string>
 
 #include "display_service.h"
+#include "esp_attr.h"
 #include "esp_log.h"
 #include "esp_task_wdt.h"
 #include "esp_timer.h"
@@ -36,7 +37,11 @@ static bool g_refresh_busy = false;
 TickType_t g_refresh_due_tick = 0;
 RefreshSchedule g_refresh_schedule = RefreshSchedule::kNone;
 SecondarySlot g_secondary;
-volatile wqn::UiScreen g_last_rendered_screen = wqn::UiScreen::kHome;
+// Physical-display commit metadata: update only after a successful refresh and
+// retain it across deep sleep so RefreshFrame does not manufacture a screen
+// transition before the driver's trusted RTC-CRC fast path can run.
+RTC_DATA_ATTR volatile wqn::UiScreen g_last_rendered_screen =
+    wqn::UiScreen::kHome;
 wqn::runtime::SleepLease g_display_sleep_lease;
 // [epd-owner] Set by the UI task via RequestEpdIdleMaintenance, cleared by the
 // EPD task when it services the request. The EPD task samples the activity
