@@ -622,8 +622,46 @@ void AddJournalContentState(cJSON* parent, const char* key,
                             static_cast<double>(static_cast<uint8_t>(state.phase)));
     cJSON_AddNumberToObject(object, "retry_attempt",
                             static_cast<double>(state.retry_attempt));
+    cJSON_AddNumberToObject(
+        object,
+        "retry_not_before_unix_seconds",
+        static_cast<double>(state.retry_not_before_unix_seconds));
     cJSON_AddStringToObject(object, "desired_snapshot_id", state.desired_snapshot_id);
     cJSON_AddStringToObject(object, "active_snapshot_id", state.active_snapshot_id);
+    cJSON_AddItemToObject(parent, key, object);
+}
+
+void AddJournalRetryState(cJSON* parent, const char* key,
+                          const wqn::SyncJournalRetryState& state)
+{
+    cJSON* object = cJSON_CreateObject();
+    if (object == nullptr) {
+        return;
+    }
+    cJSON_AddNumberToObject(
+        object,
+        "not_before_unix_seconds",
+        static_cast<double>(state.not_before_unix_seconds));
+    cJSON_AddNumberToObject(object, "attempt", state.attempt);
+    cJSON_AddItemToObject(parent, key, object);
+}
+
+void AddJournalOutboxRetryState(
+    cJSON* parent,
+    const char* key,
+    const wqn::SyncJournalOutboxRetryState& state)
+{
+    cJSON* object = cJSON_CreateObject();
+    if (object == nullptr) {
+        return;
+    }
+    cJSON_AddStringToObject(object, "request_id", state.request_id);
+    cJSON_AddNumberToObject(
+        object,
+        "not_before_unix_seconds",
+        static_cast<double>(state.not_before_unix_seconds));
+    cJSON_AddNumberToObject(object, "attempt", state.attempt);
+    cJSON_AddNumberToObject(object, "cause", state.cause);
     cJSON_AddItemToObject(parent, key, object);
 }
 
@@ -652,6 +690,7 @@ std::string ReadJournalString(cJSON* object, const char* key)
 }
 
 bool ReadJournalContentState(cJSON* parent, const char* key,
+                             uint64_t schema,
                              wqn::SyncJournalContentState* state)
 {
     if (parent == nullptr || state == nullptr) {
@@ -665,6 +704,7 @@ bool ReadJournalContentState(cJSON* parent, const char* key,
     uint64_t applied = 0;
     uint64_t phase = 0;
     uint64_t retry = 0;
+    uint64_t retry_not_before = 0;
     const auto valid_snapshot_id = [](const std::string& value) {
         return value.empty() ||
             (value.size() == 64 && std::all_of(
@@ -678,7 +718,11 @@ bool ReadJournalContentState(cJSON* parent, const char* key,
         !ReadJournalU64(object, "phase", &phase) ||
         !ReadJournalU64(object, "retry_attempt", &retry) ||
         phase > static_cast<uint64_t>(wqn::SyncJournalPhase::kBlocked) ||
-        retry > UINT8_MAX || applied > desired) {
+        retry > UINT8_MAX || applied > desired ||
+        (schema >= 2 && !ReadJournalU64(
+             object,
+             "retry_not_before_unix_seconds",
+             &retry_not_before))) {
         return false;
     }
     const std::string desired_snapshot = ReadJournalString(object, "desired_snapshot_id");
@@ -691,10 +735,59 @@ bool ReadJournalContentState(cJSON* parent, const char* key,
     state->applied_revision = applied;
     state->phase = static_cast<wqn::SyncJournalPhase>(phase);
     state->retry_attempt = static_cast<uint8_t>(retry);
+    state->retry_not_before_unix_seconds = retry_not_before;
     std::snprintf(state->desired_snapshot_id,
                   sizeof(state->desired_snapshot_id), "%s", desired_snapshot.c_str());
     std::snprintf(state->active_snapshot_id,
                   sizeof(state->active_snapshot_id), "%s", active_snapshot.c_str());
+    return true;
+}
+
+bool ReadJournalRetryState(cJSON* parent, const char* key,
+                           wqn::SyncJournalRetryState* state)
+{
+    if (parent == nullptr || state == nullptr) {
+        return false;
+    }
+    cJSON* object = cJSON_GetObjectItemCaseSensitive(parent, key);
+    uint64_t not_before = 0;
+    uint64_t attempt = 0;
+    if (!cJSON_IsObject(object) ||
+        !ReadJournalU64(object, "not_before_unix_seconds", &not_before) ||
+        !ReadJournalU64(object, "attempt", &attempt) || attempt > UINT8_MAX) {
+        return false;
+    }
+    state->not_before_unix_seconds = not_before;
+    state->attempt = static_cast<uint8_t>(attempt);
+    return true;
+}
+
+bool ReadJournalOutboxRetryState(
+    cJSON* parent,
+    const char* key,
+    wqn::SyncJournalOutboxRetryState* state)
+{
+    if (parent == nullptr || state == nullptr) {
+        return false;
+    }
+    cJSON* object = cJSON_GetObjectItemCaseSensitive(parent, key);
+    uint64_t not_before = 0;
+    uint64_t attempt = 0;
+    uint64_t cause = 0;
+    const std::string request_id = ReadJournalString(object, "request_id");
+    if (!cJSON_IsObject(object) || request_id.size() > 64 ||
+        !ReadJournalU64(object, "not_before_unix_seconds", &not_before) ||
+        !ReadJournalU64(object, "attempt", &attempt) ||
+        !ReadJournalU64(object, "cause", &cause) || attempt > UINT8_MAX ||
+        cause > 3 || (request_id.empty() &&
+                      (not_before != 0 || attempt != 0 || cause != 0))) {
+        return false;
+    }
+    std::snprintf(
+        state->request_id, sizeof(state->request_id), "%s", request_id.c_str());
+    state->not_before_unix_seconds = not_before;
+    state->attempt = static_cast<uint8_t>(attempt);
+    state->cause = static_cast<uint8_t>(cause);
     return true;
 }
 
@@ -724,16 +817,27 @@ esp_err_t ParseSyncJournalPayload(
         ReadJournalU64(root, "schema_version", &schema) &&
         ReadJournalU64(root, "config_revision", &config_revision) &&
         ReadJournalU64(root, "sync_cursor", &sync_cursor) &&
-        schema == 1 &&
-        ReadJournalContentState(root, "word_packs", &journal->word_packs) &&
-        ReadJournalContentState(root, "note_packs", &journal->note_packs) &&
-        ReadJournalContentState(root, "problem_packs", &journal->problem_packs);
+        (schema == 1 || schema == 2) &&
+        ReadJournalContentState(root, "word_packs", schema, &journal->word_packs) &&
+        ReadJournalContentState(root, "note_packs", schema, &journal->note_packs) &&
+        ReadJournalContentState(root, "problem_packs", schema, &journal->problem_packs) &&
+        (schema == 1 ||
+         (ReadJournalRetryState(
+              root, "full_sync_retry", &journal->full_sync_retry) &&
+          ReadJournalOutboxRetryState(
+              root, "word_outbox", &journal->word_outbox) &&
+          ReadJournalOutboxRetryState(
+              root, "note_outbox", &journal->note_outbox) &&
+          ReadJournalOutboxRetryState(
+              root, "problem_outbox", &journal->problem_outbox)));
     cJSON_Delete(root);
     if (!valid) {
         *journal = {};
         return ESP_ERR_INVALID_STATE;
     }
-    journal->schema_version = static_cast<uint32_t>(schema);
+    // In-memory state always uses the newest schema so the first subsequent
+    // save atomically migrates a valid v1 journal.
+    journal->schema_version = 2;
     journal->config_revision = config_revision;
     journal->sync_cursor = sync_cursor;
     return ESP_OK;
@@ -1022,7 +1126,7 @@ esp_err_t LoadSyncJournal(SyncJournal* journal)
 
 esp_err_t SaveSyncJournal(const SyncJournal& journal)
 {
-    if (journal.schema_version != 1) {
+    if (journal.schema_version != 2) {
         return ESP_ERR_INVALID_ARG;
     }
     StorageWriteGuard write("save-sync-journal", __FILE__, __LINE__);
@@ -1038,9 +1142,13 @@ esp_err_t SaveSyncJournal(const SyncJournal& journal)
                             static_cast<double>(journal.config_revision));
     cJSON_AddNumberToObject(root, "sync_cursor",
                             static_cast<double>(journal.sync_cursor));
+    AddJournalRetryState(root, "full_sync_retry", journal.full_sync_retry);
     AddJournalContentState(root, "word_packs", journal.word_packs);
     AddJournalContentState(root, "note_packs", journal.note_packs);
     AddJournalContentState(root, "problem_packs", journal.problem_packs);
+    AddJournalOutboxRetryState(root, "word_outbox", journal.word_outbox);
+    AddJournalOutboxRetryState(root, "note_outbox", journal.note_outbox);
+    AddJournalOutboxRetryState(root, "problem_outbox", journal.problem_outbox);
     std::string payload;
     const esp_err_t render_result = JsonToString(root, &payload);
     cJSON_Delete(root);

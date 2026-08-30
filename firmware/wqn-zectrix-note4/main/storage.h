@@ -53,17 +53,34 @@ struct SyncJournalContentState {
     uint64_t applied_revision = 0;
     SyncJournalPhase phase = SyncJournalPhase::kClean;
     uint8_t retry_attempt = 0;
+    uint64_t retry_not_before_unix_seconds = 0;
     char desired_snapshot_id[65] = {};
     char active_snapshot_id[65] = {};
 };
 
+struct SyncJournalRetryState {
+    uint64_t not_before_unix_seconds = 0;
+    uint8_t attempt = 0;
+};
+
+struct SyncJournalOutboxRetryState {
+    char request_id[65] = {};
+    uint64_t not_before_unix_seconds = 0;
+    uint8_t attempt = 0;
+    uint8_t cause = 0;
+};
+
 struct SyncJournal {
-    uint32_t schema_version = 1;
+    uint32_t schema_version = 2;
     uint64_t config_revision = 0;
     uint64_t sync_cursor = 0;
+    SyncJournalRetryState full_sync_retry = {};
     SyncJournalContentState word_packs = {};
     SyncJournalContentState note_packs = {};
     SyncJournalContentState problem_packs = {};
+    SyncJournalOutboxRetryState word_outbox = {};
+    SyncJournalOutboxRetryState note_outbox = {};
+    SyncJournalOutboxRetryState problem_outbox = {};
 };
 
 esp_err_t InitStorage();

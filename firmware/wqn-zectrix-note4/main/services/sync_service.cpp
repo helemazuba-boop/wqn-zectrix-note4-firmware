@@ -112,6 +112,8 @@ SemaphoreHandle_t g_sync_journal_mutex = nullptr;
 uint32_t g_content_claim_generation[3] = {};
 uint32_t g_content_active_generation[3] = {};
 
+esp_err_t PersistLatestSyncJournal();
+
 size_t ContentDomainIndex(wqn::services::SyncContentDomain domain)
 {
     return static_cast<size_t>(domain);
@@ -136,6 +138,60 @@ std::time_t CurrentUnixSeconds()
     std::time_t now = 0;
     std::time(&now);
     return now;
+}
+
+uint64_t DurableRetryDeadline(int64_t monotonic_deadline_ms)
+{
+    const std::time_t now = CurrentUnixSeconds();
+    if (monotonic_deadline_ms <= 0 || now < kMinScheduleUnixTime) {
+        return 0;
+    }
+    const int64_t remaining_ms = std::max<int64_t>(
+        0, monotonic_deadline_ms - esp_timer_get_time() / 1000);
+    return static_cast<uint64_t>(now) +
+        static_cast<uint64_t>((remaining_ms + 999) / 1000);
+}
+
+int64_t RestoreMonotonicRetryDeadline(
+    uint64_t unix_deadline_seconds,
+    uint32_t fallback_delay_ms,
+    uint32_t maximum_delay_ms)
+{
+    const int64_t now_ms = esp_timer_get_time() / 1000;
+    const std::time_t now = CurrentUnixSeconds();
+    if (unix_deadline_seconds >=
+            static_cast<uint64_t>(kMinScheduleUnixTime) &&
+        now >= kMinScheduleUnixTime) {
+        const uint64_t remaining_seconds = unix_deadline_seconds >
+                static_cast<uint64_t>(now)
+            ? unix_deadline_seconds - static_cast<uint64_t>(now)
+            : 0;
+        const uint64_t remaining_ms = std::min<uint64_t>(
+            remaining_seconds * 1000ULL, maximum_delay_ms);
+        return now_ms + static_cast<int64_t>(remaining_ms);
+    }
+    // A v1 checkpoint or an early-boot write has no usable wall deadline.
+    // Reapply one conservative local interval instead of bypassing backoff.
+    return now_ms + static_cast<int64_t>(fallback_delay_ms);
+}
+
+void PersistFullSyncRetryCheckpoint()
+{
+    if (!g_sync_journal_loaded) {
+        return;
+    }
+    int64_t retry_unix_seconds = 0;
+    taskENTER_CRITICAL(&g_periodic_schedule_lock);
+    retry_unix_seconds = g_full_sync_retry_unix_seconds;
+    taskEXIT_CRITICAL(&g_periodic_schedule_lock);
+    taskENTER_CRITICAL(&g_sync_snapshot_lock);
+    g_sync_journal.full_sync_retry.not_before_unix_seconds =
+        retry_unix_seconds > 0 ? static_cast<uint64_t>(retry_unix_seconds) : 0;
+    g_sync_journal.full_sync_retry.attempt = g_full_sync_retry_attempts;
+    taskEXIT_CRITICAL(&g_sync_snapshot_lock);
+    if (PersistLatestSyncJournal() != ESP_OK) {
+        ESP_LOGW(kTag, "full-sync retry journal save failed");
+    }
 }
 
 bool PeriodicScheduleDue(uint32_t interval_minutes)
@@ -249,6 +305,7 @@ void ClearFullSyncRetry()
     taskEXIT_CRITICAL(&g_periodic_schedule_lock);
     g_full_sync_retry_not_before_ms.store(0, std::memory_order_release);
     g_full_sync_retry_attempts = 0;
+    PersistFullSyncRetryCheckpoint();
 }
 
 void ScheduleFullSyncRetry(uint32_t delay_ms)
@@ -267,6 +324,7 @@ void ScheduleFullSyncRetry(uint32_t delay_ms)
     // scalar, the retained zero wall deadline is conservatively due once.
     g_full_sync_retry_magic = kFullRetryMagic;
     taskEXIT_CRITICAL(&g_periodic_schedule_lock);
+    PersistFullSyncRetryCheckpoint();
 }
 
 TickType_t FullSyncRetryWaitDelay()
@@ -639,6 +697,7 @@ void PublishContentTargets(
                 journal_state->desired_revision = target.revision;
                 journal_state->phase = wqn::SyncJournalPhase::kPending;
                 journal_state->retry_attempt = 0;
+                journal_state->retry_not_before_unix_seconds = 0;
                 journal_state->desired_snapshot_id[0] = '\0';
             }
             ++g_sync_snapshot.state_sequence;
@@ -909,12 +968,81 @@ OutboxRetryCause g_problem_outbox_retry_cause = OutboxRetryCause::kNone;
 WordOutboxUploadState g_last_problem_outbox_upload_state =
     WordOutboxUploadState::kDrained;
 
+static_assert(static_cast<uint8_t>(OutboxRetryCause::kNone) == 0);
+static_assert(static_cast<uint8_t>(OutboxRetryCause::kTransport) == 1);
+static_assert(static_cast<uint8_t>(OutboxRetryCause::kServer) == 2);
+static_assert(static_cast<uint8_t>(OutboxRetryCause::kLocalStorage) == 3);
+
+void CopyOutboxRetryCheckpoint(
+    wqn::SyncJournalOutboxRetryState* target,
+    const std::string& request_id,
+    int64_t not_before_ms,
+    uint8_t attempts,
+    OutboxRetryCause cause)
+{
+    if (target == nullptr) {
+        return;
+    }
+    std::snprintf(
+        target->request_id, sizeof(target->request_id), "%s", request_id.c_str());
+    target->not_before_unix_seconds = request_id.empty()
+        ? 0
+        : DurableRetryDeadline(not_before_ms);
+    target->attempt = request_id.empty() ? 0 : attempts;
+    target->cause = request_id.empty()
+        ? 0
+        : static_cast<uint8_t>(cause);
+}
+
+void PersistOutboxRetryCheckpoint()
+{
+    if (!g_sync_journal_loaded) {
+        return;
+    }
+    wqn::SyncJournalOutboxRetryState word;
+    wqn::SyncJournalOutboxRetryState note;
+    wqn::SyncJournalOutboxRetryState problem;
+    CopyOutboxRetryCheckpoint(
+        &word,
+        g_word_outbox_retry_request_id,
+        g_word_outbox_retry_not_before_ms,
+        g_word_outbox_retry_attempts,
+        g_word_outbox_retry_cause);
+    CopyOutboxRetryCheckpoint(
+        &note,
+        g_note_outbox_retry_request_id,
+        g_note_outbox_retry_not_before_ms,
+        g_note_outbox_retry_attempts,
+        g_note_outbox_retry_cause);
+    CopyOutboxRetryCheckpoint(
+        &problem,
+        g_problem_outbox_retry_request_id,
+        g_problem_outbox_retry_not_before_ms,
+        g_problem_outbox_retry_attempts,
+        g_problem_outbox_retry_cause);
+    taskENTER_CRITICAL(&g_sync_snapshot_lock);
+    g_sync_journal.word_outbox = word;
+    g_sync_journal.note_outbox = note;
+    g_sync_journal.problem_outbox = problem;
+    taskEXIT_CRITICAL(&g_sync_snapshot_lock);
+    if (PersistLatestSyncJournal() != ESP_OK) {
+        ESP_LOGW(kTag, "outbox retry journal save failed");
+    }
+}
+
 void ResetWordOutboxRetryBackoff()
 {
+    const bool changed = !g_word_outbox_retry_request_id.empty() ||
+        g_word_outbox_retry_not_before_ms != 0 ||
+        g_word_outbox_retry_attempts != 0 ||
+        g_word_outbox_retry_cause != OutboxRetryCause::kNone;
     g_word_outbox_retry_request_id.clear();
     g_word_outbox_retry_not_before_ms = 0;
     g_word_outbox_retry_attempts = 0;
     g_word_outbox_retry_cause = OutboxRetryCause::kNone;
+    if (changed) {
+        PersistOutboxRetryCheckpoint();
+    }
 }
 
 bool WordOutboxRetryDeferred(
@@ -934,7 +1062,9 @@ void ScheduleWordOutboxRetry(
     OutboxRetryCause cause)
 {
     if (g_word_outbox_retry_request_id != request_id) {
-        ResetWordOutboxRetryBackoff();
+        g_word_outbox_retry_not_before_ms = 0;
+        g_word_outbox_retry_attempts = 0;
+        g_word_outbox_retry_cause = OutboxRetryCause::kNone;
         g_word_outbox_retry_request_id = request_id;
     }
     const uint8_t shift =
@@ -957,6 +1087,7 @@ void ScheduleWordOutboxRetry(
     g_word_outbox_retry_not_before_ms =
         esp_timer_get_time() / 1000 + static_cast<int64_t>(delay_ms);
     g_word_outbox_retry_cause = cause;
+    PersistOutboxRetryCheckpoint();
     ESP_LOGW(
         kTag,
         "word outbox retry scheduled: request=%s cause=%s attempt=%u retry_after_ms=%lu",
@@ -983,10 +1114,17 @@ TickType_t WordOutboxRetryWaitDelay()
 
 void ResetNoteOutboxRetryBackoff()
 {
+    const bool changed = !g_note_outbox_retry_request_id.empty() ||
+        g_note_outbox_retry_not_before_ms != 0 ||
+        g_note_outbox_retry_attempts != 0 ||
+        g_note_outbox_retry_cause != OutboxRetryCause::kNone;
     g_note_outbox_retry_request_id.clear();
     g_note_outbox_retry_not_before_ms = 0;
     g_note_outbox_retry_attempts = 0;
     g_note_outbox_retry_cause = OutboxRetryCause::kNone;
+    if (changed) {
+        PersistOutboxRetryCheckpoint();
+    }
 }
 
 bool NoteOutboxRetryDeferred(
@@ -1006,7 +1144,9 @@ void ScheduleNoteOutboxRetry(
     OutboxRetryCause cause)
 {
     if (g_note_outbox_retry_request_id != request_id) {
-        ResetNoteOutboxRetryBackoff();
+        g_note_outbox_retry_not_before_ms = 0;
+        g_note_outbox_retry_attempts = 0;
+        g_note_outbox_retry_cause = OutboxRetryCause::kNone;
         g_note_outbox_retry_request_id = request_id;
     }
     const uint8_t shift =
@@ -1029,6 +1169,7 @@ void ScheduleNoteOutboxRetry(
     g_note_outbox_retry_not_before_ms =
         esp_timer_get_time() / 1000 + static_cast<int64_t>(delay_ms);
     g_note_outbox_retry_cause = cause;
+    PersistOutboxRetryCheckpoint();
     ESP_LOGW(
         kTag,
         "note outbox retry scheduled: request=%s cause=%s attempt=%u retry_after_ms=%lu",
@@ -1055,10 +1196,17 @@ TickType_t NoteOutboxRetryWaitDelay()
 
 void ResetProblemOutboxRetryBackoff()
 {
+    const bool changed = !g_problem_outbox_retry_request_id.empty() ||
+        g_problem_outbox_retry_not_before_ms != 0 ||
+        g_problem_outbox_retry_attempts != 0 ||
+        g_problem_outbox_retry_cause != OutboxRetryCause::kNone;
     g_problem_outbox_retry_request_id.clear();
     g_problem_outbox_retry_not_before_ms = 0;
     g_problem_outbox_retry_attempts = 0;
     g_problem_outbox_retry_cause = OutboxRetryCause::kNone;
+    if (changed) {
+        PersistOutboxRetryCheckpoint();
+    }
 }
 
 bool ProblemOutboxRetryDeferred(
@@ -1078,7 +1226,9 @@ void ScheduleProblemOutboxRetry(
     OutboxRetryCause cause)
 {
     if (g_problem_outbox_retry_request_id != request_id) {
-        ResetProblemOutboxRetryBackoff();
+        g_problem_outbox_retry_not_before_ms = 0;
+        g_problem_outbox_retry_attempts = 0;
+        g_problem_outbox_retry_cause = OutboxRetryCause::kNone;
         g_problem_outbox_retry_request_id = request_id;
     }
     const uint8_t shift =
@@ -1101,6 +1251,7 @@ void ScheduleProblemOutboxRetry(
     g_problem_outbox_retry_not_before_ms =
         esp_timer_get_time() / 1000 + static_cast<int64_t>(delay_ms);
     g_problem_outbox_retry_cause = cause;
+    PersistOutboxRetryCheckpoint();
     ESP_LOGW(
         kTag,
         "problem outbox retry scheduled: request=%s cause=%s attempt=%u retry_after_ms=%lu",
@@ -1146,6 +1297,7 @@ void ResumeTransportDeferredOutboxes()
     if (!resumed) {
         return;
     }
+    PersistOutboxRetryCheckpoint();
     ESP_LOGI(kTag, "connectivity restored; resuming transport-deferred outboxes");
     g_outbox_immediate_requested.store(true, std::memory_order_relaxed);
     g_word_outbox_sync_requested.store(true, std::memory_order_release);
@@ -1215,18 +1367,30 @@ esp_err_t EnsureSyncJournalLoaded()
         if (state->phase == wqn::SyncJournalPhase::kFetching ||
             state->phase == wqn::SyncJournalPhase::kInstalling) {
             state->phase = wqn::SyncJournalPhase::kPending;
+            state->retry_not_before_unix_seconds = 0;
             recovered_interrupted_install = true;
         }
     };
     recover(&g_sync_journal.word_packs);
     recover(&g_sync_journal.note_packs);
     recover(&g_sync_journal.problem_packs);
-    const auto publish = [](const wqn::SyncJournalContentState& source,
-                            wqn::services::SyncContentSnapshot* target) {
+    const auto publish = [&](const wqn::SyncJournalContentState& source,
+                             wqn::services::SyncContentSnapshot* target) {
         target->desired_revision = source.desired_revision;
         target->applied_revision = source.applied_revision;
         target->phase = static_cast<wqn::services::SyncContentPhase>(source.phase);
         target->retry_attempt = source.retry_attempt;
+        if (source.phase == wqn::SyncJournalPhase::kBackoff) {
+            const uint8_t shift = source.retry_attempt == 0
+                ? 0
+                : std::min<uint8_t>(source.retry_attempt - 1, 7);
+            const uint32_t fallback_ms =
+                std::min<uint32_t>(5000u << shift, 900000u);
+            target->next_retry_ms = RestoreMonotonicRetryDeadline(
+                source.retry_not_before_unix_seconds,
+                fallback_ms,
+                900000u);
+        }
         std::snprintf(target->snapshot_id, sizeof(target->snapshot_id), "%s",
                       source.desired_snapshot_id);
     };
@@ -1243,6 +1407,62 @@ esp_err_t EnsureSyncJournalLoaded()
         g_sync_snapshot.state_sequence = 1;
     }
     taskEXIT_CRITICAL(&g_sync_snapshot_lock);
+
+    const auto& full_retry = g_sync_journal.full_sync_retry;
+    if (full_retry.not_before_unix_seconds != 0 || full_retry.attempt != 0) {
+        const uint8_t fallback_index = full_retry.attempt == 0
+            ? 0
+            : static_cast<uint8_t>(std::min<size_t>(
+                  full_retry.attempt - 1, kFullSyncRetryLadderSize - 1));
+        g_full_sync_retry_attempts = full_retry.attempt;
+        g_full_sync_retry_not_before_ms.store(
+            RestoreMonotonicRetryDeadline(
+                full_retry.not_before_unix_seconds,
+                kFullSyncRetryLadderMs[fallback_index],
+                kFullSyncRetryLadderMs[kFullSyncRetryLadderSize - 1]),
+            std::memory_order_release);
+        taskENTER_CRITICAL(&g_periodic_schedule_lock);
+        g_full_sync_retry_magic = kFullRetryMagic;
+        g_full_sync_retry_unix_seconds = static_cast<int64_t>(
+            full_retry.not_before_unix_seconds);
+        taskEXIT_CRITICAL(&g_periodic_schedule_lock);
+    }
+
+    const auto restore_outbox = [](
+        const wqn::SyncJournalOutboxRetryState& source,
+        std::string* request_id,
+        int64_t* not_before_ms,
+        uint8_t* attempts,
+        OutboxRetryCause* cause) {
+        if (source.request_id[0] == '\0') {
+            return;
+        }
+        *request_id = source.request_id;
+        *not_before_ms = RestoreMonotonicRetryDeadline(
+            source.not_before_unix_seconds,
+            kWordOutboxRetryBaseMs,
+            kWordOutboxRetryMaxMs);
+        *attempts = source.attempt;
+        *cause = static_cast<OutboxRetryCause>(source.cause);
+    };
+    restore_outbox(
+        g_sync_journal.word_outbox,
+        &g_word_outbox_retry_request_id,
+        &g_word_outbox_retry_not_before_ms,
+        &g_word_outbox_retry_attempts,
+        &g_word_outbox_retry_cause);
+    restore_outbox(
+        g_sync_journal.note_outbox,
+        &g_note_outbox_retry_request_id,
+        &g_note_outbox_retry_not_before_ms,
+        &g_note_outbox_retry_attempts,
+        &g_note_outbox_retry_cause);
+    restore_outbox(
+        g_sync_journal.problem_outbox,
+        &g_problem_outbox_retry_request_id,
+        &g_problem_outbox_retry_not_before_ms,
+        &g_problem_outbox_retry_attempts,
+        &g_problem_outbox_retry_cause);
     g_sync_journal_loaded = true;
     if (recovered_interrupted_install) {
         ESP_LOGW(kTag, "interrupted content install recovered as pending");
@@ -3479,6 +3699,7 @@ esp_err_t BeginContentInstall(const SyncContentTicket& ticket)
         if (snapshot != nullptr && journal != nullptr) {
             snapshot->phase = SyncContentPhase::kInstalling;
             journal->phase = wqn::SyncJournalPhase::kInstalling;
+            journal->retry_not_before_unix_seconds = 0;
             ++g_sync_snapshot.state_sequence;
             accepted = true;
         }
@@ -3506,6 +3727,7 @@ void CompleteContentRefresh(
     }
     const size_t index = ContentDomainIndex(ticket.domain);
     bool accepted = false;
+    const std::time_t completion_unix_seconds = CurrentUnixSeconds();
     taskENTER_CRITICAL(&g_sync_snapshot_lock);
     if (g_content_active_generation[index] == ticket.generation) {
         g_content_active_generation[index] = 0;
@@ -3534,6 +3756,7 @@ void CompleteContentRefresh(
                     ? wqn::SyncJournalPhase::kClean
                     : wqn::SyncJournalPhase::kPending;
                 journal->retry_attempt = 0;
+                journal->retry_not_before_unix_seconds = 0;
             } else {
                 if (snapshot->retry_attempt < UINT8_MAX) {
                     ++snapshot->retry_attempt;
@@ -3551,6 +3774,11 @@ void CompleteContentRefresh(
                               error == nullptr ? esp_err_to_name(result) : error);
                 journal->phase = wqn::SyncJournalPhase::kBackoff;
                 journal->retry_attempt = snapshot->retry_attempt;
+                journal->retry_not_before_unix_seconds =
+                    completion_unix_seconds >= kMinScheduleUnixTime
+                    ? static_cast<uint64_t>(completion_unix_seconds) +
+                        static_cast<uint64_t>((delay_ms + 999) / 1000)
+                    : 0;
             }
             ++g_sync_snapshot.state_sequence;
             accepted = true;
