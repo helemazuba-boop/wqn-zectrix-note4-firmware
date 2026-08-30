@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "cJSON.h"
+#include "device_protocol/json_depth_guard.h"
 #include "config.h"
 #include "esp_check.h"
 #include "esp_log.h"
@@ -213,7 +214,11 @@ private:
 class JsonDocument {
 public:
     explicit JsonDocument(cJSON* root) : root_(root) {}
-    explicit JsonDocument(const std::string& payload) : root_(cJSON_Parse(payload.c_str())) {}
+    explicit JsonDocument(const std::string& payload)
+        : root_(wqn::protocol::JsonNestingWithinLimit(
+                    payload.data(), payload.size())
+                    ? cJSON_Parse(payload.c_str())
+                    : nullptr) {}
     ~JsonDocument() { cJSON_Delete(root_); }
 
     cJSON* root() const { return root_; }
@@ -702,7 +707,10 @@ esp_err_t ParseSyncJournalPayload(
     if (payload.empty() || payload.find('\0') != std::string::npos) {
         return ESP_ERR_INVALID_STATE;
     }
-    cJSON* root = cJSON_ParseWithOpts(payload.c_str(), nullptr, true);
+    cJSON* root = wqn::protocol::JsonNestingWithinLimit(
+                      payload.data(), payload.size())
+        ? cJSON_ParseWithOpts(payload.c_str(), nullptr, true)
+        : nullptr;
     if (!cJSON_IsObject(root)) {
         cJSON_Delete(root);
         return ESP_ERR_INVALID_STATE;

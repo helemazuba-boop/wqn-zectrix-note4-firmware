@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "cJSON.h"
+#include "device_protocol/json_depth_guard.h"
 #include "esp_log.h"
 #include "runtime/sleep_coordinator.h"
 #include "services/storage_service.h"
@@ -119,7 +120,10 @@ bool DecodeObservationLine(
 {
     if (observation == nullptr) return false;
     *observation = {};
-    cJSON* root = cJSON_Parse(line.c_str());
+    cJSON* root = wqn::protocol::JsonNestingWithinLimit(
+                      line.data(), line.size())
+        ? cJSON_Parse(line.c_str())
+        : nullptr;
     if (root == nullptr) return false;
     cJSON* request_id = cJSON_GetObjectItemCaseSensitive(root, "request_id");
     cJSON* problem_id = cJSON_GetObjectItemCaseSensitive(root, "problem_id");

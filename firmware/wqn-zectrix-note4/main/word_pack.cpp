@@ -15,6 +15,7 @@
 #include <utility>
 
 #include "cJSON.h"
+#include "device_protocol/json_depth_guard.h"
 #include "device_protocol/word_study.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
@@ -55,7 +56,11 @@ constexpr size_t kLineBufferSize = kMaxLineBytes + 2;
 
 class JsonDocument {
 public:
-    explicit JsonDocument(const char* payload) : root_(cJSON_Parse(payload)) {}
+    explicit JsonDocument(const char* payload)
+        : root_(payload != nullptr && wqn::protocol::JsonNestingWithinLimit(
+                    payload, std::strlen(payload))
+                    ? cJSON_Parse(payload)
+                    : nullptr) {}
     ~JsonDocument() { cJSON_Delete(root_); }
 
     cJSON* root() const { return root_; }
