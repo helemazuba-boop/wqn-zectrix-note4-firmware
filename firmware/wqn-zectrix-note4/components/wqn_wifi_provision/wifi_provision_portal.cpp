@@ -20,10 +20,41 @@ namespace {
 constexpr char kTag[] = "wqn_prov_portal";
 constexpr uint64_t kScanIntervalUs = 10ULL * 1000 * 1000;
 constexpr size_t kMaxSubmitBodySize = 512;
+constexpr size_t kMaxJsonNestingDepth = 16;
 constexpr char kPortalUrl[] = "http://192.168.4.1/";
 
 extern const char kIndexHtmlStart[] asm("_binary_wifi_configuration_html_start");
 extern const char kDoneHtmlStart[] asm("_binary_wifi_configuration_done_html_start");
+
+bool JsonNestingWithinLimit(const char* data, size_t length)
+{
+    size_t depth = 0;
+    bool in_string = false;
+    bool escaped = false;
+    for (size_t i = 0; i < length; ++i) {
+        const char c = data[i];
+        if (in_string) {
+            if (escaped) {
+                escaped = false;
+            } else if (c == '\\') {
+                escaped = true;
+            } else if (c == '"') {
+                in_string = false;
+            }
+            continue;
+        }
+        if (c == '"') {
+            in_string = true;
+        } else if (c == '[' || c == '{') {
+            if (++depth > kMaxJsonNestingDepth) {
+                return false;
+            }
+        } else if ((c == ']' || c == '}') && depth > 0) {
+            --depth;
+        }
+    }
+    return true;
+}
 
 esp_err_t SendEmbeddedHtml(httpd_req_t* req, const char* html)
 {
@@ -530,6 +561,12 @@ esp_err_t WifiProvisionPortal::HandleSubmit(httpd_req_t* req)
         offset += static_cast<size_t>(received);
     }
     body[offset] = '\0';
+
+    if (!JsonNestingWithinLimit(body, offset)) {
+        std::free(body);
+        return httpd_resp_send_err(
+            req, HTTPD_400_BAD_REQUEST, "JSON nesting too deep");
+    }
 
     cJSON* json = cJSON_Parse(body);
     std::free(body);
