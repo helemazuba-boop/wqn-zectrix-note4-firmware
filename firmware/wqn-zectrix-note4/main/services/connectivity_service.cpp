@@ -836,6 +836,21 @@ void HandleDemandPolicyChanged()
         static_cast<unsigned>(current.latest_generation),
         StateName(g_state.load(std::memory_order_acquire)));
 
+    const bool interactive =
+        current.priority ==
+        wqn::services::ConnectivityDemandPriority::kInteractive;
+    // A demand used to keep the radio on without changing the station's
+    // MIN_MODEM policy.  A realtime socket that sat idle for a few seconds
+    // could therefore enter modem sleep and fill its tiny TCP send queue on
+    // the next PTT turn.  Keep power save for background/idle work, but make
+    // every interactive lease a low-latency radio lease as well.
+    const esp_err_t ps_result =
+        wqn::SetWifiStationPowerSaveEnabled(!interactive);
+    if (ps_result != ESP_OK) {
+        ESP_LOGW(kTag, "WiFi power-save policy apply failed: interactive=%d result=%s",
+                 interactive, esp_err_to_name(ps_result));
+    }
+
     const wqn::services::ConnectivityState state =
         g_state.load(std::memory_order_acquire);
     if (current.count == 0) {
@@ -857,9 +872,6 @@ void HandleDemandPolicyChanged()
         return;
     }
 
-    const bool interactive =
-        current.priority ==
-        wqn::services::ConnectivityDemandPriority::kInteractive;
     const bool fresh_interactive = interactive &&
         GenerationAfter(
             current.latest_interactive_generation,

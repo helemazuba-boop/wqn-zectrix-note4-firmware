@@ -131,7 +131,7 @@ esp_err_t InitZectrixNote4SafePins()
         (1ULL << kNfcFd);
     ESP_RETURN_ON_ERROR(ConfigureInputs(button_and_status_inputs), kTag, "configure input pins");
 
-    ESP_LOGI(kTag, "safe pins ready: PWR_ON latch on, EPD/audio/amp/NFC off, LED off");
+    ESP_LOGI(kTag, "safe pins ready: PWR_ON latch on, audio rail on, EPD/amp/NFC off, LED off");
 
     return ESP_OK;
 }

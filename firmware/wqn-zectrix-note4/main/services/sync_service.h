@@ -100,10 +100,16 @@ struct SyncEvent {
     uint64_t todo_revision = 0;
 };
 
+using SyncEventSink = void (*)();
+
 // Returns the newest terminal/control-plane status event. The mailbox is
 // overwrite-safe: callers compare sequence and never depend on a bounded
 // queue preserving every intermediate status.
 void GetLatestSyncEvent(SyncEvent* event);
+// Registers a non-blocking wake callback invoked after a new mailbox value is
+// fully published. The service never depends on UI code; DeviceUiTask supplies
+// its task-notification thunk during startup.
+void SetSyncEventSink(SyncEventSink sink);
 
 esp_err_t StartSyncService();
 // Seeds the sync scheduler's durable boot admission cache. It never starts

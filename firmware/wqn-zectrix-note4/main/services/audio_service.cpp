@@ -3,13 +3,16 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cmath>
 #include <utility>
 
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
 #include "driver/i2s_std.h"
 #include "esp_check.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_rom_lldesc.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
@@ -29,6 +32,8 @@ constexpr gpio_num_t kI2sBclk = GPIO_NUM_15;
 constexpr gpio_num_t kI2sWordSelect = GPIO_NUM_38;
 constexpr gpio_num_t kI2sDataIn = GPIO_NUM_16;
 constexpr gpio_num_t kI2sDataOut = GPIO_NUM_45;
+constexpr gpio_num_t kI2cSda = GPIO_NUM_47;
+constexpr gpio_num_t kI2cScl = GPIO_NUM_48;
 constexpr uint8_t kEs8311Address = 0x18;
 constexpr UBaseType_t kCommandQueueDepth = 12;
 constexpr UBaseType_t kReplyQueueDepth = 8;
@@ -39,12 +44,19 @@ constexpr int64_t kCallTimeoutUs = 5 * 1000 * 1000;
 constexpr int64_t kEmergencyForceCallBudgetUs = 500 * 1000;
 constexpr size_t kMaxCodecHandles = 2;
 constexpr size_t kMaxChannelHandles = 2;
-// The board currently relies on the ESP32-S3's internal I2C pull-ups. They
-// are much weaker than the recommended external 2-5 kOhm pull-ups, so the
-// ES8311's two-byte register transactions are marginal at 100 kHz even when
-// the address-only probe succeeds. Keep the shared RTC/PMU devices at their
-// normal speed, but run codec transactions more conservatively.
-constexpr uint32_t kCodecI2cClockHz = 50000;
+constexpr uint32_t kI2sDmaDescNum = 6;
+constexpr size_t kDuplexBytesPerFrame = sizeof(int16_t) * 2U;
+static_assert(sizeof(lldesc_t) == 12, "ESP32-S3 DMA descriptor size changed");
+// Besides the explicitly DMA-capable descriptor and sample-buffer allocations,
+// i2s_new_channel/init_std_mode create the controller, two channel objects,
+// queues/semaphores, mode state, PM locks and two GDMA channels. Those default
+// allocations can also consume DMA-capable internal DRAM on this target. Keep a
+// conservative floor so admission fails before TX takes half of a ring that RX
+// cannot also obtain. A-H heap deltas report the real driver cost on-device.
+constexpr size_t kDuplexAdmissionInternalHeadroom = 4096;
+// Match the factory esp_codec_dev control interface. The shared bus remains
+// free to use a different per-device rate for the RTC.
+constexpr uint32_t kCodecI2cClockHz = 100000;
 constexpr int kCodecI2cMaxAttempts = 10;
 // The firmware runs FreeRTOS at 100 Hz. A 5 ms delay becomes zero ticks and
 // used to exhaust every retry back-to-back inside the ES8311 clock-switch
@@ -54,6 +66,101 @@ constexpr TickType_t kCodecI2cRetryDelay = pdMS_TO_TICKS(10);
 static_assert(kCodecI2cRetryDelay > 0, "codec retry delay must yield");
 constexpr TickType_t kCodecPowerOffSettle = pdMS_TO_TICKS(20);
 constexpr TickType_t kCodecPowerOnWarmup = pdMS_TO_TICKS(250);
+constexpr TickType_t kCodecClockSwitchSettle = pdMS_TO_TICKS(25);
+constexpr TickType_t kCodecResetSettle = pdMS_TO_TICKS(20);
+constexpr TickType_t kCodecProgramRetryDelay = pdMS_TO_TICKS(50);
+constexpr int kCodecProgramMaxAttempts = 2;
+
+struct AudioHeapSnapshot {
+    size_t dma_free = 0;
+    size_t dma_largest = 0;
+    size_t internal_free = 0;
+    size_t internal_largest = 0;
+};
+
+AudioHeapSnapshot CaptureAudioHeapSnapshot()
+{
+    return {
+        heap_caps_get_free_size(MALLOC_CAP_DMA),
+        heap_caps_get_largest_free_block(MALLOC_CAP_DMA),
+        heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+        heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+    };
+}
+
+void LogDuplexHeapPoint(
+    const char* point,
+    const wqn::services::AudioSession& session,
+    uint32_t dma_frame_count,
+    i2s_chan_handle_t tx,
+    i2s_chan_handle_t rx,
+    const AudioHeapSnapshot* before = nullptr)
+{
+    const AudioHeapSnapshot now = CaptureAudioHeapSnapshot();
+    const size_t bytes_per_desc =
+        static_cast<size_t>(dma_frame_count) * kDuplexBytesPerFrame;
+    const size_t explicit_dma_per_side = kI2sDmaDescNum *
+        (bytes_per_desc + sizeof(lldesc_t));
+    const long long dma_delta = before == nullptr
+        ? 0
+        : static_cast<long long>(now.dma_free) -
+            static_cast<long long>(before->dma_free);
+    const long long internal_delta = before == nullptr
+        ? 0
+        : static_cast<long long>(now.internal_free) -
+            static_cast<long long>(before->internal_free);
+    ESP_LOGI(
+        kTag,
+        "[flash-heap] point=%s session=%lu dma_free=%u dma_largest=%u "
+        "internal_free=%u internal_largest=%u dma_delta=%lld "
+        "internal_delta=%lld desc=%u frames=%u bytes_per_frame=%u "
+        "bytes_per_desc=%u explicit_dma_per_side=%u tx=%p rx=%p "
+        "tx_retained=0 rx_retained=0",
+        point, static_cast<unsigned long>(session.id),
+        static_cast<unsigned>(now.dma_free),
+        static_cast<unsigned>(now.dma_largest),
+        static_cast<unsigned>(now.internal_free),
+        static_cast<unsigned>(now.internal_largest),
+        dma_delta, internal_delta,
+        static_cast<unsigned>(kI2sDmaDescNum),
+        static_cast<unsigned>(dma_frame_count),
+        static_cast<unsigned>(kDuplexBytesPerFrame),
+        static_cast<unsigned>(bytes_per_desc),
+        static_cast<unsigned>(explicit_dma_per_side), tx, rx);
+}
+
+constexpr uint8_t kRegReset = 0x00;
+constexpr uint8_t kRegClk01 = 0x01;
+constexpr uint8_t kRegClk02 = 0x02;
+constexpr uint8_t kRegClk03 = 0x03;
+constexpr uint8_t kRegClk04 = 0x04;
+constexpr uint8_t kRegClk05 = 0x05;
+constexpr uint8_t kRegClk06 = 0x06;
+constexpr uint8_t kRegClk07 = 0x07;
+constexpr uint8_t kRegClk08 = 0x08;
+constexpr uint8_t kRegSdpIn = 0x09;
+constexpr uint8_t kRegSdpOut = 0x0A;
+constexpr uint8_t kRegSystem0B = 0x0B;
+constexpr uint8_t kRegSystem0C = 0x0C;
+constexpr uint8_t kRegSystem0D = 0x0D;
+constexpr uint8_t kRegSystem0E = 0x0E;
+constexpr uint8_t kRegSystem10 = 0x10;
+constexpr uint8_t kRegSystem11 = 0x11;
+constexpr uint8_t kRegSystem12 = 0x12;
+constexpr uint8_t kRegSystem13 = 0x13;
+constexpr uint8_t kRegSystem14 = 0x14;
+constexpr uint8_t kRegAdc15 = 0x15;
+constexpr uint8_t kRegAdc16 = 0x16;
+constexpr uint8_t kRegAdc17 = 0x17;
+constexpr uint8_t kRegAdc1B = 0x1B;
+constexpr uint8_t kRegAdc1C = 0x1C;
+constexpr uint8_t kRegDacMute = 0x31;
+constexpr uint8_t kRegDacVolume = 0x32;
+constexpr uint8_t kRegDac37 = 0x37;
+constexpr uint8_t kRegGpio44 = 0x44;
+constexpr uint8_t kRegGp45 = 0x45;
+constexpr uint8_t kDacMuteBits = 0x60;
+constexpr uint8_t kDacVolumeZeroDb = 0xBF;
 
 enum class CommandType : uint8_t {
     kBegin,
@@ -102,6 +209,15 @@ std::atomic<wqn::services::AudioState> g_state{
 std::atomic<uint32_t> g_session_id{0};
 std::atomic<bool> g_codec_powered{true};
 std::atomic<bool> g_amplifier_enabled{false};
+// ES8311 stays on across ordinary audio sessions.  A successful register
+// program therefore remains valid after its temporary I2C device handle and
+// I2S channels are released.  Re-running the full reset/open sequence on that
+// warm codec caused the second and later Flash sessions to lose I2C ACKs in
+// REG04/06/08 even though the first session was healthy.
+std::atomic<bool> g_codec_configuration_valid{false};
+std::atomic<wqn::services::AudioCodecProfile> g_codec_configuration_profile{
+    wqn::services::AudioCodecProfile::kCapture};
+std::atomic<int> g_codec_configuration_volume{-1};
 std::atomic<wqn::services::AudioActivity> g_activity{
     wqn::services::AudioActivity::kCapture};
 std::atomic<bool> g_accept_operations{false};
@@ -420,7 +536,47 @@ esp_err_t ApplyCodecPower(bool enabled)
     ESP_RETURN_ON_ERROR(
         HoldOutput(kCodecPower, enabled), kTag, "set codec power GPIO");
     g_codec_powered.store(enabled, std::memory_order_release);
+    if (!enabled) {
+        g_codec_configuration_valid.store(false, std::memory_order_release);
+        g_codec_configuration_volume.store(-1, std::memory_order_relaxed);
+    }
     return ESP_OK;
+}
+
+// Caller must hold ScopedI2cBusLock. ESP-IDF 5.5 collapses NACK, hardware
+// timeout and software timeout into ESP_ERR_INVALID_STATE when a synchronous
+// transaction does not finish with I2C_STATUS_DONE. Its ordinary error path
+// resets only the controller FSM; the factory Note4 driver additionally
+// clears the physical bus before retrying the same register. Do that at the
+// transaction boundary, not only after the complete ES8311 program fails.
+esp_err_t RecoverCodecI2cBusLocked(
+    const wqn::services::AudioSession& session,
+    const char* operation,
+    uint8_t reg,
+    esp_err_t cause)
+{
+    i2c_master_bus_handle_t bus = wqn::GetSharedI2cBusHandle();
+    if (bus == nullptr) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    const int sda_before = gpio_get_level(kI2cSda);
+    const int scl_before = gpio_get_level(kI2cScl);
+    const esp_err_t reset_result = i2c_master_bus_reset(bus);
+    const esp_err_t power_result = ApplyCodecPower(true);
+    const int sda_after = gpio_get_level(kI2cSda);
+    const int scl_after = gpio_get_level(kI2cScl);
+    ESP_LOGW(
+        kTag,
+        "codec I2C bus recovery: session=%lu op=%s reg=0x%02x "
+        "cause=%s (%d) bus_reset=%s (%d) power=%s (%d) "
+        "pins_before=SDA%d/SCL%d pins_after=SDA%d/SCL%d",
+        static_cast<unsigned long>(session.id), operation, reg,
+        esp_err_to_name(cause), static_cast<int>(cause),
+        esp_err_to_name(reset_result), static_cast<int>(reset_result),
+        esp_err_to_name(power_result), static_cast<int>(power_result),
+        sda_before, scl_before, sda_after, scl_after);
+    return reset_result != ESP_OK ? reset_result : power_result;
 }
 
 esp_err_t RecoverCodecPower(const AudioCommand& command)
@@ -515,7 +671,7 @@ i2s_chan_config_t MakeChannelConfig(uint32_t dma_frame_count)
     i2s_chan_config_t config = {};
     config.id = I2S_NUM_0;
     config.role = I2S_ROLE_MASTER;
-    config.dma_desc_num = 6;
+    config.dma_desc_num = kI2sDmaDescNum;
     config.dma_frame_num = dma_frame_count;
     config.auto_clear_after_cb = true;
     config.auto_clear_before_cb = false;
@@ -764,6 +920,172 @@ TickType_t RemainingCallTicks(int64_t deadline_us)
         (static_cast<uint64_t>(remaining_us) + tick_us - 1) / tick_us;
     return static_cast<TickType_t>(ticks > portMAX_DELAY
         ? portMAX_DELAY : ticks);
+}
+
+const char* CodecProfileName(wqn::services::AudioCodecProfile profile)
+{
+    switch (profile) {
+        case wqn::services::AudioCodecProfile::kCapture:
+            return "capture";
+        case wqn::services::AudioCodecProfile::kPlayback:
+            return "playback";
+        case wqn::services::AudioCodecProfile::kDuplex:
+            return "duplex";
+        default:
+            return "unknown";
+    }
+}
+
+bool CodecProfileHasOutput(wqn::services::AudioCodecProfile profile)
+{
+    return profile == wqn::services::AudioCodecProfile::kPlayback ||
+        profile == wqn::services::AudioCodecProfile::kDuplex;
+}
+
+uint8_t PercentToCodecVolumeRegister(int percent)
+{
+    if (percent >= 100) {
+        return kDacVolumeZeroDb;
+    }
+    if (percent <= 0) {
+        return 0;
+    }
+    const double db = 20.0 * std::log10(
+        static_cast<double>(percent) / 100.0);
+    const int value = static_cast<int>(std::lround(
+        static_cast<double>(kDacVolumeZeroDb) + db / 0.5));
+    return static_cast<uint8_t>(std::clamp(
+        value, 0, static_cast<int>(kDacVolumeZeroDb)));
+}
+
+esp_err_t RunEs8311RegisterProgram(
+    const wqn::services::AudioSession& session,
+    wqn::services::AudioCodecHandle codec,
+    wqn::services::AudioCodecProfile profile,
+    int volume_percent)
+{
+    // Match the factory esp_codec_dev wrapper, which holds the shared-bus
+    // mutex for the whole codec open/configure operation.  The per-register
+    // helpers acquire the same recursive mutex, so this prevents an RTC
+    // transaction from being inserted between clock/reset writes without
+    // changing their validation or retry behavior.
+    ScopedI2cBusLock program_bus_lock("audio_codec_program");
+    if (!program_bus_lock.locked()) {
+        return program_bus_lock.status();
+    }
+    esp_err_t result = ESP_OK;
+    int sequence = 0;
+    auto write = [&](uint8_t reg, uint8_t value) {
+        if (result != ESP_OK) {
+            return;
+        }
+        ++sequence;
+        result = wqn::services::WriteAudioCodecRegister(
+            session, codec, reg, value);
+        if (result != ESP_OK) {
+            ESP_LOGE(kTag,
+                     "ES8311 program failed: profile=%s seq=%d reg=0x%02x value=0x%02x result=%s (%d)",
+                     CodecProfileName(profile), sequence, reg, value,
+                     esp_err_to_name(result), static_cast<int>(result));
+        }
+    };
+    auto read = [&](uint8_t reg, uint8_t* value) {
+        if (result != ESP_OK) {
+            return;
+        }
+        result = wqn::services::ReadAudioCodecRegister(
+            session, codec, reg, value);
+        if (result != ESP_OK) {
+            ESP_LOGE(kTag,
+                     "ES8311 program read failed: profile=%s reg=0x%02x result=%s (%d)",
+                     CodecProfileName(profile), reg,
+                     esp_err_to_name(result), static_cast<int>(result));
+        }
+    };
+    auto update = [&](uint8_t reg, uint8_t clear_mask, uint8_t set_mask) {
+        uint8_t value = 0;
+        read(reg, &value);
+        if (result == ESP_OK) {
+            write(reg, static_cast<uint8_t>((value & ~clear_mask) | set_mask));
+        }
+    };
+
+    // This is the one register program for capture, playback, self-test and
+    // Flash. It follows Espressif esp_codec_dev's ES8311 open/enable order.
+    // Callers must already have enabled I2S so the external clock domain is
+    // live before REG04/REG05 select it.
+    // Espressif deliberately repeats the first REG44 write: the first enables
+    // the codec-side I2C noise filter, the second confirms it after activation.
+    write(kRegGpio44, 0x08);
+    write(kRegGpio44, 0x08);
+    write(kRegClk01, 0x30);
+    write(kRegClk02, 0x00);
+    write(kRegClk03, 0x10);
+    write(kRegAdc16, 0x24);
+    write(kRegClk04, 0x10);
+    write(kRegClk05, 0x00);
+    if (result == ESP_OK) {
+        vTaskDelay(kCodecClockSwitchSettle);
+    }
+    write(kRegSystem0B, 0x00);
+    write(kRegSystem0C, 0x00);
+    write(kRegSystem10, 0x1F);
+    write(kRegSystem11, 0x7F);
+    write(kRegReset, 0x80);
+    if (result == ESP_OK) {
+        vTaskDelay(kCodecResetSettle);
+    }
+    update(kRegReset, 0x40, 0x00);
+    write(kRegClk01, 0x3F);
+    update(kRegClk06, 0x20, 0x00);
+    write(kRegSystem13, 0x10);
+    write(kRegAdc1B, 0x0A);
+    write(kRegAdc1C, 0x6A);
+    write(kRegGpio44, 0x58);
+    write(kRegClk02, 0x00);
+    write(kRegClk03, 0x10);
+    write(kRegClk04, 0x10);
+    write(kRegClk05, 0x00);
+    // Match esp_codec_dev's sample-clock transaction order. REG06 switches
+    // the BCLK divider and can temporarily make ES8311 stop ACKing I2C, so it
+    // must be the final clock write rather than preceding REG07/REG08.
+    write(kRegClk07, 0x00);
+    write(kRegClk08, 0xFF);
+    write(kRegClk06, 0x0F);
+    if (result == ESP_OK) {
+        vTaskDelay(kCodecClockSwitchSettle);
+    }
+    update(kRegSdpOut, 0x40, 0x0C);
+    update(kRegSdpIn, 0x40, 0x0C);
+    write(kRegAdc17, 0xBF);
+    write(kRegSystem14, 0x1A);
+    update(kRegSystem14, 0x40, 0x00);
+    write(kRegSystem0E, 0x02);
+    write(kRegSystem12, 0x00);
+    write(kRegSystem0D, 0x01);
+    // Capture and Flash duplex follow the factory board driver's BOTH-mode
+    // topology. Standalone playback keeps this board's field-verified DAC-only
+    // values; its prior 0x08 setting produced silent TTS on this hardware.
+    const bool playback_only =
+        profile == wqn::services::AudioCodecProfile::kPlayback;
+    write(kRegAdc15, playback_only ? 0x00 : 0x40);
+    write(kRegDac37, playback_only ? 0x16 : 0x08);
+    write(kRegGp45, 0x00);
+
+    if (result == ESP_OK && CodecProfileHasOutput(profile)) {
+        uint8_t mute = 0;
+        read(kRegDacMute, &mute);
+        if (result == ESP_OK) {
+            mute &= 0x9F;
+            if (volume_percent == 0) {
+                mute |= kDacMuteBits;
+            }
+            write(kRegDacMute, mute);
+            write(kRegDacVolume,
+                  PercentToCodecVolumeRegister(volume_percent));
+        }
+    }
+    return result;
 }
 
 esp_err_t Call(
@@ -1066,6 +1388,7 @@ esp_err_t AddAudioCodec(
     config.dev_addr_length = I2C_ADDR_BIT_LEN_7;
     config.device_address = kEs8311Address;
     config.scl_speed_hz = kCodecI2cClockHz;
+    config.scl_wait_us = 0;
     i2c_master_dev_handle_t device = nullptr;
     esp_err_t result = i2c_master_bus_add_device(
         AsBus(bus), &config, &device);
@@ -1131,8 +1454,23 @@ esp_err_t WriteAudioCodecRegister(
         // cadence and never starves the RTC owner.
         ScopedI2cBusLock bus_lock("audio_codec_write");
         if (bus_lock.locked()) {
-            result = i2c_master_transmit(
-                AsCodec(codec), data, sizeof(data), pdMS_TO_TICKS(100));
+            // The factory board wrapper reasserts GPIO42 before every codec
+            // transaction. This is idempotent while the rail is already held
+            // high and repairs a stale hold left by a standby transition.
+            result = ApplyCodecPower(true);
+            if (result == ESP_OK) {
+                result = i2c_master_transmit(
+                    AsCodec(codec), data, sizeof(data),
+                    pdMS_TO_TICKS(100));
+            }
+            if (IsRetryableCodecI2cError(result)) {
+                const esp_err_t recovery_result =
+                    RecoverCodecI2cBusLocked(
+                        session, "write", reg, result);
+                if (recovery_result != ESP_OK) {
+                    result = recovery_result;
+                }
+            }
         } else {
             result = bus_lock.status();
         }
@@ -1183,9 +1521,20 @@ esp_err_t ReadAudioCodecRegister(
         // [i2c-bus-lock] Same per-attempt serialization as the write path.
         ScopedI2cBusLock bus_lock("audio_codec_read");
         if (bus_lock.locked()) {
-            result = i2c_master_transmit_receive(
-                AsCodec(codec), &reg, sizeof(reg), value, sizeof(*value),
-                pdMS_TO_TICKS(100));
+            result = ApplyCodecPower(true);
+            if (result == ESP_OK) {
+                result = i2c_master_transmit_receive(
+                    AsCodec(codec), &reg, sizeof(reg), value, sizeof(*value),
+                    pdMS_TO_TICKS(100));
+            }
+            if (IsRetryableCodecI2cError(result)) {
+                const esp_err_t recovery_result =
+                    RecoverCodecI2cBusLocked(
+                        session, "read", reg, result);
+                if (recovery_result != ESP_OK) {
+                    result = recovery_result;
+                }
+            }
         } else {
             result = bus_lock.status();
         }
@@ -1216,6 +1565,105 @@ esp_err_t ReadAudioCodecRegister(
              attempts_used, esp_err_to_name(result),
              static_cast<int>(result));
     return result;
+}
+
+esp_err_t ConfigureAudioCodec(
+    const AudioSession& session,
+    AudioCodecProfile profile,
+    int volume_percent)
+{
+    if (!session ||
+        (profile != AudioCodecProfile::kCapture &&
+         profile != AudioCodecProfile::kPlayback &&
+         profile != AudioCodecProfile::kDuplex) ||
+        volume_percent < 0 || volume_percent > 100) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    // The rail is intentionally kept high between sessions.  Preserve the
+    // factory driver's open-once lifecycle: if no other audio profile or
+    // volume has replaced a known-good configuration, restoring I2S clocks is
+    // sufficient and touching the codec over I2C is both redundant and, on
+    // this board's weak pull-ups, observably less reliable.
+    if (g_codec_powered.load(std::memory_order_acquire) &&
+        g_codec_configuration_valid.load(std::memory_order_acquire) &&
+        g_codec_configuration_profile.load(std::memory_order_relaxed) == profile &&
+        g_codec_configuration_volume.load(std::memory_order_relaxed) ==
+            volume_percent) {
+        ESP_LOGI(kTag,
+                 "ES8311 configuration reused: session=%lu profile=%s volume=%d rail=warm",
+                 static_cast<unsigned long>(session.id),
+                 CodecProfileName(profile), volume_percent);
+        return ESP_OK;
+    }
+
+    AudioBusHandle bus = nullptr;
+    ESP_RETURN_ON_ERROR(
+        GetSharedAudioBus(session, &bus), kTag,
+        "get shared bus for ES8311 configuration");
+
+    // From this point onward a failed/partial program must never leave an old
+    // cache entry reusable.
+    g_codec_configuration_valid.store(false, std::memory_order_release);
+    g_codec_configuration_volume.store(-1, std::memory_order_relaxed);
+
+    esp_err_t final_result = ESP_FAIL;
+    for (int attempt = 1; attempt <= kCodecProgramMaxAttempts; ++attempt) {
+        AudioCodecHandle codec = nullptr;
+        esp_err_t result = AddAudioCodec(session, bus, &codec);
+        if (result == ESP_OK) {
+            result = RunEs8311RegisterProgram(
+                session, codec, profile, volume_percent);
+        }
+        if (codec != nullptr) {
+            const esp_err_t remove_result =
+                RemoveAudioCodec(session, &codec);
+            if (result == ESP_OK) {
+                result = remove_result;
+            } else if (remove_result != ESP_OK) {
+                ESP_LOGE(kTag,
+                         "ES8311 cleanup failed after program error: session=%lu result=%s (%d)",
+                         static_cast<unsigned long>(session.id),
+                         esp_err_to_name(remove_result),
+                         static_cast<int>(remove_result));
+                return remove_result;
+            }
+        }
+        if (result == ESP_OK) {
+            g_codec_configuration_profile.store(
+                profile, std::memory_order_relaxed);
+            g_codec_configuration_volume.store(
+                volume_percent, std::memory_order_relaxed);
+            g_codec_configuration_valid.store(true, std::memory_order_release);
+            ESP_LOGI(kTag,
+                     "ES8311 configured: session=%lu profile=%s attempt=%d volume=%d",
+                     static_cast<unsigned long>(session.id),
+                     CodecProfileName(profile), attempt, volume_percent);
+            return ESP_OK;
+        }
+        final_result = result;
+        if (attempt < kCodecProgramMaxAttempts) {
+            esp_err_t reset_result = ESP_ERR_TIMEOUT;
+            {
+                ScopedI2cBusLock reset_lock("audio_codec_bus_reset");
+                if (reset_lock.locked()) {
+                    reset_result = i2c_master_bus_reset(AsBus(bus));
+                } else {
+                    reset_result = reset_lock.status();
+                }
+            }
+            ESP_LOGW(kTag,
+                     "ES8311 full-program retry: session=%lu profile=%s attempt=%d/%d result=%s (%d) bus_reset=%s (%d)",
+                     static_cast<unsigned long>(session.id),
+                     CodecProfileName(profile), attempt,
+                     kCodecProgramMaxAttempts,
+                     esp_err_to_name(result), static_cast<int>(result),
+                     esp_err_to_name(reset_result),
+                     static_cast<int>(reset_result));
+            vTaskDelay(kCodecProgramRetryDelay);
+        }
+    }
+    return final_result;
 }
 
 esp_err_t CreateAudioRxChannel(
@@ -1344,34 +1792,164 @@ esp_err_t CreateAudioDuplexChannels(
     }
     i2s_chan_handle_t rx_channel = nullptr;
     i2s_chan_handle_t tx_channel = nullptr;
+    bool tx_enabled = false;
+    bool rx_enabled = false;
+    bool tx_enable_attempted = false;
+    bool rx_enable_attempted = false;
+    if (dma_frame_count == 0 ||
+        dma_frame_count > SIZE_MAX / kDuplexBytesPerFrame) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    const size_t bytes_per_desc =
+        static_cast<size_t>(dma_frame_count) * kDuplexBytesPerFrame;
+    const size_t explicit_dma_per_side = kI2sDmaDescNum *
+        (bytes_per_desc + sizeof(lldesc_t));
+    const size_t explicit_dma_duplex = explicit_dma_per_side * 2U;
+    const size_t admission_dma_floor =
+        explicit_dma_duplex + kDuplexAdmissionInternalHeadroom;
+    const AudioHeapSnapshot admission = CaptureAudioHeapSnapshot();
+    ESP_LOGI(
+        kTag,
+        "Flash duplex DMA plan: desc=%u frames=%u bytes_per_frame=%u "
+        "bytes_per_desc=%u descriptor_bytes=%u explicit_per_side=%u "
+        "explicit_duplex=%u admission_floor=%u",
+        static_cast<unsigned>(kI2sDmaDescNum),
+        static_cast<unsigned>(dma_frame_count),
+        static_cast<unsigned>(kDuplexBytesPerFrame),
+        static_cast<unsigned>(bytes_per_desc),
+        static_cast<unsigned>(sizeof(lldesc_t)),
+        static_cast<unsigned>(explicit_dma_per_side),
+        static_cast<unsigned>(explicit_dma_duplex),
+        static_cast<unsigned>(admission_dma_floor));
+    LogDuplexHeapPoint(
+        "C-before-i2s-new-channel", session, dma_frame_count,
+        tx_channel, rx_channel);
+    if (admission.dma_free < admission_dma_floor ||
+        admission.internal_free < admission_dma_floor ||
+        admission.dma_largest < bytes_per_desc) {
+        ESP_LOGE(
+            kTag,
+            "Flash duplex admission rejected: dma_free=%u internal_free=%u "
+            "dma_largest=%u required_floor=%u required_block=%u",
+            static_cast<unsigned>(admission.dma_free),
+            static_cast<unsigned>(admission.internal_free),
+            static_cast<unsigned>(admission.dma_largest),
+            static_cast<unsigned>(admission_dma_floor),
+            static_cast<unsigned>(bytes_per_desc));
+        return ESP_ERR_NO_MEM;
+    }
     i2s_chan_config_t channel_config = MakeChannelConfig(dma_frame_count);
     esp_err_t result = i2s_new_channel(
         &channel_config, &tx_channel, &rx_channel);
+    ESP_LOGI(kTag,
+             "create I2S duplex: i2s_new_channel result=%s (%d) tx=%p rx=%p",
+             esp_err_to_name(result), static_cast<int>(result),
+             tx_channel, rx_channel);
+    const AudioHeapSnapshot before_tx_config = CaptureAudioHeapSnapshot();
+    LogDuplexHeapPoint(
+        "D-before-configure-tx", session, dma_frame_count,
+        tx_channel, rx_channel, &admission);
     if (result == ESP_OK) {
-        i2s_std_config_t receive = MakeStandardConfig(
-            sample_rate_hz, left_aligned, true);
-        result = i2s_channel_init_std_mode(rx_channel, &receive);
-    }
-    if (result == ESP_OK) {
-        result = i2s_channel_enable(rx_channel);
-    }
-    if (result == ESP_OK) {
-        i2s_std_config_t transmit = MakeStandardConfig(
+        // The factory board configures both pins on both bound channels, then
+        // initializes TX before RX. The pair shares one clock controller, so
+        // enabling RX before TX has been configured leaves RX in INVALID_STATE
+        // on the first read even though both init calls returned ESP_OK.
+        i2s_std_config_t duplex = MakeStandardConfig(
             sample_rate_hz, left_aligned, false);
-        result = i2s_channel_init_std_mode(tx_channel, &transmit);
+        duplex.gpio_cfg.din = kI2sDataIn;
+        result = i2s_channel_init_std_mode(tx_channel, &duplex);
+        ESP_LOGI(kTag,
+                 "create I2S duplex: init TX result=%s (%d) channel=%p",
+                 esp_err_to_name(result), static_cast<int>(result), tx_channel);
+    }
+    const AudioHeapSnapshot after_tx_config = CaptureAudioHeapSnapshot();
+    LogDuplexHeapPoint(
+        "D-after-configure-tx", session, dma_frame_count,
+        tx_channel, rx_channel, &before_tx_config);
+    const AudioHeapSnapshot before_rx_config = after_tx_config;
+    LogDuplexHeapPoint(
+        "E-before-configure-rx", session, dma_frame_count,
+        tx_channel, rx_channel);
+    if (result == ESP_OK) {
+        i2s_std_config_t duplex = MakeStandardConfig(
+            sample_rate_hz, left_aligned, true);
+        duplex.gpio_cfg.dout = kI2sDataOut;
+        result = i2s_channel_init_std_mode(rx_channel, &duplex);
+        ESP_LOGI(kTag,
+                 "create I2S duplex: init RX result=%s (%d) channel=%p",
+                 esp_err_to_name(result), static_cast<int>(result), rx_channel);
+    }
+    const AudioHeapSnapshot after_rx_config = CaptureAudioHeapSnapshot();
+    LogDuplexHeapPoint(
+        "E-after-configure-rx", session, dma_frame_count,
+        tx_channel, rx_channel, &before_rx_config);
+    const AudioHeapSnapshot before_tx_enable = after_rx_config;
+    if (result == ESP_OK) {
+        LogDuplexHeapPoint(
+            "F-before-enable-tx", session, dma_frame_count,
+            tx_channel, rx_channel);
     }
     if (result == ESP_OK) {
+        tx_enable_attempted = true;
         result = i2s_channel_enable(tx_channel);
+        tx_enabled = result == ESP_OK;
+        ESP_LOGI(kTag,
+                 "create I2S duplex: enable TX result=%s (%d) channel=%p",
+                 esp_err_to_name(result), static_cast<int>(result), tx_channel);
+    }
+    const AudioHeapSnapshot after_tx_enable = CaptureAudioHeapSnapshot();
+    if (tx_enable_attempted) {
+        LogDuplexHeapPoint(
+            "F-after-enable-tx", session, dma_frame_count,
+            tx_channel, rx_channel, &before_tx_enable);
+    }
+    const AudioHeapSnapshot before_rx_enable = after_tx_enable;
+    if (result == ESP_OK) {
+        LogDuplexHeapPoint(
+            "G-before-enable-rx", session, dma_frame_count,
+            tx_channel, rx_channel);
+    }
+    if (result == ESP_OK) {
+        rx_enable_attempted = true;
+        result = i2s_channel_enable(rx_channel);
+        rx_enabled = result == ESP_OK;
+        ESP_LOGI(kTag,
+                 "create I2S duplex: enable RX result=%s (%d) channel=%p",
+                 esp_err_to_name(result), static_cast<int>(result), rx_channel);
+    }
+    if (rx_enable_attempted) {
+        LogDuplexHeapPoint(
+            "G-after-enable-rx", session, dma_frame_count,
+            tx_channel, rx_channel, &before_rx_enable);
     }
     if (result != ESP_OK) {
+        esp_err_t tx_disable_result = ESP_OK;
+        esp_err_t tx_delete_result = ESP_OK;
+        esp_err_t rx_disable_result = ESP_OK;
+        esp_err_t rx_delete_result = ESP_OK;
         if (tx_channel != nullptr) {
-            i2s_channel_disable(tx_channel);
-            i2s_del_channel(tx_channel);
+            if (tx_enabled) {
+                tx_disable_result = i2s_channel_disable(tx_channel);
+            }
+            tx_delete_result = i2s_del_channel(tx_channel);
         }
         if (rx_channel != nullptr) {
-            i2s_channel_disable(rx_channel);
-            i2s_del_channel(rx_channel);
+            if (rx_enabled) {
+                rx_disable_result = i2s_channel_disable(rx_channel);
+            }
+            rx_delete_result = i2s_del_channel(rx_channel);
         }
+        ESP_LOGI(
+            kTag,
+            "create I2S duplex rollback: cause=%s tx_disable=%s "
+            "tx_delete=%s rx_disable=%s rx_delete=%s tx=%p rx=%p",
+            esp_err_to_name(result), esp_err_to_name(tx_disable_result),
+            esp_err_to_name(tx_delete_result),
+            esp_err_to_name(rx_disable_result),
+            esp_err_to_name(rx_delete_result), tx_channel, rx_channel);
+        LogDuplexHeapPoint(
+            "rollback-after-local-delete", session, dma_frame_count,
+            nullptr, nullptr, &admission);
         return result;
     }
     result = RegisterResource(

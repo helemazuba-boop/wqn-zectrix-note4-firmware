@@ -11,7 +11,6 @@
 #include "freertos/task.h"
 #include "services/audio_service.h"
 #include "storage.h"
-#include "audio_volume.h"
 
 namespace {
 
@@ -20,31 +19,7 @@ constexpr char kTag[] = "wqn_audio_player";
 constexpr int kPlaybackSampleRate = 16000;
 constexpr int kPlaybackChannels = 1;
 constexpr size_t kPlaybackChunkFrames = 512;
-
-constexpr uint8_t ES8311_RESET_REG00 = 0x00;
-constexpr uint8_t ES8311_CLK_MANAGER_REG01 = 0x01;
-constexpr uint8_t ES8311_CLK_MANAGER_REG02 = 0x02;
-constexpr uint8_t ES8311_CLK_MANAGER_REG03 = 0x03;
-constexpr uint8_t ES8311_CLK_MANAGER_REG04 = 0x04;
-constexpr uint8_t ES8311_CLK_MANAGER_REG05 = 0x05;
-constexpr uint8_t ES8311_CLK_MANAGER_REG06 = 0x06;
-constexpr uint8_t ES8311_CLK_MANAGER_REG07 = 0x07;
-constexpr uint8_t ES8311_CLK_MANAGER_REG08 = 0x08;
-constexpr uint8_t ES8311_SDPIN_REG09 = 0x09;
-constexpr uint8_t ES8311_SDPOUT_REG0A = 0x0A;
-constexpr uint8_t ES8311_SYSTEM_REG0B = 0x0B;
-constexpr uint8_t ES8311_SYSTEM_REG0C = 0x0C;
-constexpr uint8_t ES8311_SYSTEM_REG0D = 0x0D;
-constexpr uint8_t ES8311_SYSTEM_REG0E = 0x0E;
-constexpr uint8_t ES8311_SYSTEM_REG10 = 0x10;
-constexpr uint8_t ES8311_SYSTEM_REG11 = 0x11;
-constexpr uint8_t ES8311_SYSTEM_REG12 = 0x12;
-constexpr uint8_t ES8311_SYSTEM_REG13 = 0x13;
-constexpr uint8_t ES8311_SYSTEM_REG14 = 0x14;
-constexpr uint8_t ES8311_ADC_REG15 = 0x15;
-constexpr uint8_t ES8311_DAC_REG37 = 0x37;
-constexpr uint8_t ES8311_GPIO_REG44 = 0x44;
-constexpr uint8_t ES8311_GP_REG45 = 0x45;
+constexpr TickType_t kI2sClockWarmup = pdMS_TO_TICKS(20);
 
 struct PlayerState {
     SemaphoreHandle_t mutex = nullptr;
@@ -89,139 +64,21 @@ esp_err_t InitI2c(wqn::services::AudioBusHandle* bus)
     return wqn::services::GetSharedAudioBus(g_player.session, bus);
 }
 
-esp_err_t AddCodecDevice(
-    wqn::services::AudioBusHandle bus,
-    wqn::services::AudioCodecHandle* dev)
-{
-    if (bus == nullptr || dev == nullptr) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    return wqn::services::AddAudioCodec(g_player.session, bus, dev);
-}
-
-esp_err_t WriteCodecReg(
-    wqn::services::AudioCodecHandle dev, uint8_t reg, uint8_t value)
-{
-    return wqn::services::WriteAudioCodecRegister(
-        g_player.session, dev, reg, value);
-}
-
-esp_err_t ReadCodecReg(
-    wqn::services::AudioCodecHandle dev, uint8_t reg, uint8_t* value)
-{
-    if (value == nullptr) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    return wqn::services::ReadAudioCodecRegister(
-        g_player.session, dev, reg, value);
-}
-
 esp_err_t InitEs8311Dac(wqn::services::AudioBusHandle bus)
 {
-    wqn::services::AudioCodecHandle dev = nullptr;
-    ESP_RETURN_ON_ERROR(AddCodecDevice(bus, &dev), kTag, "add ES8311 device for DAC");
-
-    auto write = [&](uint8_t reg, uint8_t value) -> esp_err_t {
-        const esp_err_t ret = WriteCodecReg(dev, reg, value);
-        if (ret != ESP_OK) {
-            ESP_LOGE(kTag, "ES8311 DAC write failed: reg=0x%02x val=0x%02x err=%s",
-                     reg, value, esp_err_to_name(ret));
-        }
-        return ret;
-    };
-
-    esp_err_t ret = ESP_OK;
-    ret |= write(ES8311_GPIO_REG44, 0x08);
-    ret |= write(ES8311_GPIO_REG44, 0x08);
-
-    ret |= write(ES8311_CLK_MANAGER_REG01, 0x30);
-    ret |= write(ES8311_CLK_MANAGER_REG02, 0x00);
-    ret |= write(ES8311_CLK_MANAGER_REG03, 0x10);
-    ret |= write(ES8311_SYSTEM_REG0B, 0x00);
-    ret |= write(ES8311_SYSTEM_REG0C, 0x00);
-    ret |= write(ES8311_SYSTEM_REG10, 0x1F);
-    ret |= write(ES8311_SYSTEM_REG11, 0x7F);
-    ret |= write(ES8311_RESET_REG00, 0x80);
-
-    uint8_t reg00 = 0;
-    if (ReadCodecReg(dev, ES8311_RESET_REG00, &reg00) == ESP_OK) {
-        reg00 &= 0xBF;
-        ret |= write(ES8311_RESET_REG00, reg00);
-    } else {
-        ret = ESP_FAIL;
+    if (bus == nullptr) {
+        return ESP_ERR_INVALID_ARG;
     }
-
-    ret |= write(ES8311_CLK_MANAGER_REG01, 0x3F);
-    uint8_t reg06 = 0;
-    if (ReadCodecReg(dev, ES8311_CLK_MANAGER_REG06, &reg06) == ESP_OK) {
-        reg06 &= ~0x20;
-        ret |= write(ES8311_CLK_MANAGER_REG06, reg06);
-    } else {
-        ret = ESP_FAIL;
-    }
-
-    ret |= write(ES8311_SYSTEM_REG13, 0x10);
-    ret |= write(ES8311_GPIO_REG44, 0x58);
-
-    ret |= write(ES8311_DAC_REG37, 0x00);
-    ret |= write(ES8311_SYSTEM_REG0D, 0x01);
-
-    ret |= write(ES8311_SYSTEM_REG14, 0x1A);
-    uint8_t reg14 = 0;
-    if (ReadCodecReg(dev, ES8311_SYSTEM_REG14, &reg14) == ESP_OK) {
-        reg14 &= ~0x40;
-        ret |= write(ES8311_SYSTEM_REG14, reg14);
-    } else {
-        ret = ESP_FAIL;
-    }
-
-    ret |= write(ES8311_GP_REG45, 0x00);
-
-    ret |= write(ES8311_ADC_REG15, 0x00);
-
-    ret |= write(ES8311_SYSTEM_REG0E, 0x02);
-    ret |= write(ES8311_SYSTEM_REG12, 0x00);
-
-    ret |= write(ES8311_DAC_REG37, 0x16);            // [dac-fix] DAC output enable (Gemini 0x08 -> TTS silent; reverted to 0x16)
-
-    uint8_t dac_iface = 0;
-    if (ReadCodecReg(dev, ES8311_SDPIN_REG09, &dac_iface) == ESP_OK) {
-        dac_iface = (dac_iface & ~0x40) | 0x0C;  // [wordlen-fix] 16bit I2S (bit[4:2]=011, bit[1:0]=00) - reverted from Gemini 0x0D (LJ broke format)
-        ret |= write(ES8311_SDPIN_REG09, dac_iface);
-    } else {
-        ret = ESP_FAIL;
-    }
-    uint8_t adc_iface = 0;
-    if (ReadCodecReg(dev, ES8311_SDPOUT_REG0A, &adc_iface) == ESP_OK) {
-        adc_iface = (adc_iface & ~0x40) | 0x0C;  // [wordlen-fix] 16bit I2S (bit[4:2]=011, bit[1:0]=00) - reverted from Gemini 0x0D (LJ broke format)
-        ret |= write(ES8311_SDPOUT_REG0A, adc_iface);
-    } else {
-        ret = ESP_FAIL;
-    }
-
-    ret |= write(ES8311_CLK_MANAGER_REG02, 0x00);
-    ret |= write(ES8311_CLK_MANAGER_REG03, 0x10);
-    ret |= write(ES8311_CLK_MANAGER_REG04, 0x10);
-    ret |= write(ES8311_CLK_MANAGER_REG05, 0x00);
-    ret |= write(ES8311_CLK_MANAGER_REG06, 0x0F);    // bclk_div = 16 (esp_codec_dev official; Gemini 0x03 broke clock - reverted)
-    ret |= write(ES8311_CLK_MANAGER_REG07, 0x00);
-
-    ret |= write(ES8311_SYSTEM_REG0B, 0x44);
-    ret |= write(ES8311_SYSTEM_REG0C, 0x00);
-
-    // [hw-volume] Apply persisted volume to ES8311 DAC registers (0x32/0x31)
-    // before releasing the I2C device handle. Software PCM scaling was removed.
-    wqn::SetEs8311Volume(
-        g_player.session, dev, wqn::GetPlaybackVolumePercent());
-    const esp_err_t remove_result =
-        wqn::services::RemoveAudioCodec(g_player.session, &dev);
-    RecordFirstError(remove_result, &ret);
-    if (ret == ESP_OK) {
+    const esp_err_t result = wqn::services::ConfigureAudioCodec(
+        g_player.session, wqn::services::AudioCodecProfile::kPlayback,
+        wqn::GetPlaybackVolumePercent());
+    if (result == ESP_OK) {
         ESP_LOGI(kTag, "ES8311 DAC init ok: sample_rate=%d", kPlaybackSampleRate);
     } else {
-        ESP_LOGE(kTag, "ES8311 DAC init failed");
+        ESP_LOGE(kTag, "ES8311 DAC init failed: %s",
+                 esp_err_to_name(result));
     }
-    return ret;
+    return result;
 }
 
 esp_err_t InitI2sTx(wqn::services::AudioChannelHandle* tx_handle)
@@ -285,10 +142,13 @@ esp_err_t InitAudioPlayer()
         result = InitI2c(&g_player.i2c_bus);
     }
     if (result == ESP_OK) {
-        result = InitEs8311Dac(g_player.i2c_bus);
+        result = InitI2sTx(&g_player.tx);
     }
     if (result == ESP_OK) {
-        result = InitI2sTx(&g_player.tx);
+        // Match the board reference: start MCLK/BCLK before switching ES8311
+        // onto its external clock domain.
+        vTaskDelay(kI2sClockWarmup);
+        result = InitEs8311Dac(g_player.i2c_bus);
     }
 
     if (result == ESP_OK) {
@@ -296,14 +156,41 @@ esp_err_t InitAudioPlayer()
         ESP_LOGI(kTag, "audio player initialized");
     } else {
         ESP_LOGE(kTag, "audio player init failed: %s", esp_err_to_name(result));
+        esp_err_t cleanup_result = ESP_OK;
+        if (g_player.tx != nullptr && g_player.tx_enabled) {
+            const esp_err_t disable_result =
+                wqn::services::DisableAudioChannel(
+                    g_player.session, g_player.tx);
+            RecordFirstError(disable_result, &cleanup_result);
+            if (disable_result == ESP_OK) {
+                g_player.tx_enabled = false;
+            }
+        }
+        if (g_player.tx != nullptr) {
+            const esp_err_t delete_result =
+                wqn::services::DeleteAudioChannel(
+                    g_player.session, &g_player.tx);
+            RecordFirstError(delete_result, &cleanup_result);
+            if (delete_result == ESP_OK) {
+                g_player.tx_enabled = false;
+            }
+        }
+        g_player.i2c_bus = nullptr;
         const esp_err_t power_result = SetAudioPowerForPlayback(false);
-        RecordFirstError(power_result, &result);
+        RecordFirstError(power_result, &cleanup_result);
         if (power_result == ESP_OK) {
             g_player.powered = false;
         }
-        const esp_err_t end_result =
-            wqn::services::EndAudioActivity(&g_player.session);
-        RecordFirstError(end_result, &result);
+        if (g_player.tx == nullptr && !g_player.powered) {
+            RecordFirstError(
+                wqn::services::EndAudioActivity(&g_player.session),
+                &cleanup_result);
+        }
+        if (cleanup_result != ESP_OK) {
+            ESP_LOGE(kTag,
+                     "audio player init rollback failed; session retained: %s",
+                     esp_err_to_name(cleanup_result));
+        }
     }
 
     xSemaphoreGive(g_player.mutex);

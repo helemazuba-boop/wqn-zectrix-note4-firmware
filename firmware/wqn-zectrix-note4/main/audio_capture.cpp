@@ -38,47 +38,8 @@ constexpr int kAdcWarmupReadCount = 4;
 constexpr uint32_t kI2sDmaFrameNum = 128;
 constexpr int kMaxConsecutiveReadTimeouts = 5;
 constexpr int kI2sClockWarmupMs = 20;
-// CONFIG_FREERTOS_HZ is 100, so waits shorter than 10 ms round down to zero
-// ticks. Give ES8311 one real scheduler tick to resynchronize its I2C logic
-// after the external clock path is selected.
-// [codec-nack] Field data (USB/charger powered runs): the ES8311 NACK window
-// around the REG04/REG05 external-clock switch widens with charger noise on
-// the rails, and 10 ms was exhausted on every pass (24/24 configure failures,
-// zero in-sequence recoveries). 25 ms keeps the same documented mechanism but
-// rides out the wider window without touching the register order.
-constexpr int kCodecClockSwitchSettleMs = 25;
-constexpr int kCodecResetSettleMs = 20;
 constexpr int kCaptureInitWaitAttempts = 120;
 constexpr int kCaptureInitWaitStepMs = 25;
-
-constexpr uint8_t ES8311_RESET_REG00 = 0x00;
-constexpr uint8_t ES8311_CLK_MANAGER_REG01 = 0x01;
-constexpr uint8_t ES8311_CLK_MANAGER_REG02 = 0x02;
-constexpr uint8_t ES8311_CLK_MANAGER_REG03 = 0x03;
-constexpr uint8_t ES8311_CLK_MANAGER_REG04 = 0x04;
-constexpr uint8_t ES8311_CLK_MANAGER_REG05 = 0x05;
-constexpr uint8_t ES8311_CLK_MANAGER_REG06 = 0x06;
-constexpr uint8_t ES8311_CLK_MANAGER_REG07 = 0x07;
-constexpr uint8_t ES8311_CLK_MANAGER_REG08 = 0x08;
-constexpr uint8_t ES8311_SDPIN_REG09 = 0x09;
-constexpr uint8_t ES8311_SDPOUT_REG0A = 0x0A;
-constexpr uint8_t ES8311_SYSTEM_REG0B = 0x0B;
-constexpr uint8_t ES8311_SYSTEM_REG0C = 0x0C;
-constexpr uint8_t ES8311_SYSTEM_REG0D = 0x0D;
-constexpr uint8_t ES8311_SYSTEM_REG0E = 0x0E;
-constexpr uint8_t ES8311_SYSTEM_REG10 = 0x10;
-constexpr uint8_t ES8311_SYSTEM_REG11 = 0x11;
-constexpr uint8_t ES8311_SYSTEM_REG12 = 0x12;
-constexpr uint8_t ES8311_SYSTEM_REG13 = 0x13;
-constexpr uint8_t ES8311_SYSTEM_REG14 = 0x14;
-constexpr uint8_t ES8311_ADC_REG15 = 0x15;
-constexpr uint8_t ES8311_ADC_REG16 = 0x16;
-constexpr uint8_t ES8311_ADC_REG17 = 0x17;
-constexpr uint8_t ES8311_ADC_REG1B = 0x1B;
-constexpr uint8_t ES8311_ADC_REG1C = 0x1C;
-constexpr uint8_t ES8311_DAC_REG37 = 0x37;
-constexpr uint8_t ES8311_GPIO_REG44 = 0x44;
-constexpr uint8_t ES8311_GP_REG45 = 0x45;
 
 struct AudioServiceState {
     SemaphoreHandle_t mutex = nullptr;
@@ -250,163 +211,16 @@ esp_err_t InitI2c(wqn::services::AudioBusHandle* bus)
     return result;
 }
 
-esp_err_t AddCodecDevice(
-    wqn::services::AudioBusHandle bus,
-    wqn::services::AudioCodecHandle* dev)
-{
-    if (bus == nullptr || dev == nullptr) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    const esp_err_t result =
-        wqn::services::AddAudioCodec(g_audio.session, bus, dev);
-    ESP_LOGI(kTag, "capture init codec: add ES8311 result=%s (%d) dev=%p",
-             esp_err_to_name(result), static_cast<int>(result), *dev);
-    return result;
-}
-
-esp_err_t WriteCodecReg(
-    wqn::services::AudioCodecHandle dev, uint8_t reg, uint8_t value)
-{
-    return wqn::services::WriteAudioCodecRegister(
-        g_audio.session, dev, reg, value);
-}
-
-esp_err_t ReadCodecReg(
-    wqn::services::AudioCodecHandle dev, uint8_t reg, uint8_t* value)
-{
-    if (value == nullptr) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    return wqn::services::ReadAudioCodecRegister(
-        g_audio.session, dev, reg, value);
-}
-
 esp_err_t InitEs8311Adc(wqn::services::AudioBusHandle bus)
 {
-    wqn::services::AudioCodecHandle dev = nullptr;
-    ESP_RETURN_ON_ERROR(AddCodecDevice(bus, &dev), kTag, "add ES8311 device");
-
-    esp_err_t first_error = ESP_OK;
-    int write_seq = 0;  // [codec-nack] index of the failing transaction within
-                        // the sequence: distinguishes clock-switch NACKs
-                        // (early indices) from late-sequence degradation.
-    auto write = [&](uint8_t reg, uint8_t value) -> esp_err_t {
-        if (first_error != ESP_OK) {
-            return first_error;
-        }
-        ++write_seq;
-        const esp_err_t result = WriteCodecReg(dev, reg, value);
-        if (result != ESP_OK) {
-            first_error = result;
-            ESP_LOGE(kTag, "ES8311 write failed: seq=%d reg=0x%02x value=0x%02x result=%s (%d)",
-                     write_seq, reg, value, esp_err_to_name(result), static_cast<int>(result));
-        }
-        return result;
-    };
-    auto read = [&](uint8_t reg, uint8_t* value) -> esp_err_t {
-        if (first_error != ESP_OK) {
-            return first_error;
-        }
-        const esp_err_t result = ReadCodecReg(dev, reg, value);
-        if (result != ESP_OK) {
-            first_error = result;
-            ESP_LOGE(kTag, "ES8311 read failed: reg=0x%02x result=%s (%d)",
-                     reg, esp_err_to_name(result), static_cast<int>(result));
-        }
-        return result;
-    };
-
-    esp_err_t ret = ESP_OK;
-    // Espressif's ES8311 stability fix deliberately writes REG44 twice at the
-    // start of every open. The first write enables the codec-side I2C noise
-    // filter; the second confirms the setting after the filter takes effect.
-    // Keep the normal codec sequence intact: the only software reset is after
-    // the clock/system preamble, as in the verified playback and flash paths.
-    ret |= write(ES8311_GPIO_REG44, 0x08);
-    ret |= write(ES8311_GPIO_REG44, 0x08);
-    ret |= write(ES8311_CLK_MANAGER_REG01, 0x30);
-    ret |= write(ES8311_CLK_MANAGER_REG02, 0x00);
-    ret |= write(ES8311_CLK_MANAGER_REG03, 0x10);
-    ret |= write(ES8311_ADC_REG16, 0x24);
-    ret |= write(ES8311_CLK_MANAGER_REG04, 0x10);
-    ret |= write(ES8311_CLK_MANAGER_REG05, 0x00);
-    if (first_error == ESP_OK) {
-        // REG04/REG05 switch the codec onto the external I2S clock domain.
-        // ES8311 may temporarily stop ACKing I2C while that clock settles.
-        vTaskDelay(pdMS_TO_TICKS(kCodecClockSwitchSettleMs));
+    if (bus == nullptr) {
+        return ESP_ERR_INVALID_ARG;
     }
-    ret |= write(ES8311_SYSTEM_REG0B, 0x00);
-    ret |= write(ES8311_SYSTEM_REG0C, 0x00);
-    ret |= write(ES8311_SYSTEM_REG10, 0x1F);
-    ret |= write(ES8311_SYSTEM_REG11, 0x7F);
-    const esp_err_t sequence_reset_result = write(ES8311_RESET_REG00, 0x80);
-    ret |= sequence_reset_result;
-    if (sequence_reset_result == ESP_OK) {
-        // ES8311 briefly NACKs transactions while its software reset settles.
-        // Wait before the read/modify/write operations that follow reset.
-        vTaskDelay(pdMS_TO_TICKS(kCodecResetSettleMs));
-    }
-
-    uint8_t reg = 0;
-    if (read(ES8311_RESET_REG00, &reg) == ESP_OK) {
-        ret |= write(ES8311_RESET_REG00, reg & 0xBF);
-    } else {
-        ret = ESP_FAIL;
-    }
-    ret |= write(ES8311_CLK_MANAGER_REG01, 0x3F);
-    if (read(ES8311_CLK_MANAGER_REG06, &reg) == ESP_OK) {
-        ret |= write(ES8311_CLK_MANAGER_REG06, reg & ~0x20);
-    } else {
-        ret = ESP_FAIL;
-    }
-
-    ret |= write(ES8311_SYSTEM_REG13, 0x10);
-    ret |= write(ES8311_ADC_REG1B, 0x0A);
-    ret |= write(ES8311_ADC_REG1C, 0x6A);
-    ret |= write(ES8311_GPIO_REG44, 0x58);
-    ret |= write(ES8311_CLK_MANAGER_REG02, 0x00);
-    ret |= write(ES8311_CLK_MANAGER_REG03, 0x10);
-    ret |= write(ES8311_CLK_MANAGER_REG04, 0x10);
-    ret |= write(ES8311_CLK_MANAGER_REG05, 0x00);
-    ret |= write(ES8311_CLK_MANAGER_REG06, 0x0F);
-    ret |= write(ES8311_CLK_MANAGER_REG07, 0x00);
-    ret |= write(ES8311_CLK_MANAGER_REG08, 0xFF);
-
-    if (read(ES8311_SDPOUT_REG0A, &reg) == ESP_OK) {
-        ret |= write(ES8311_SDPOUT_REG0A, (reg & ~0x40) | 0x0C);  // [wordlen-fix] 16bit WL matches I2S 16bit
-    } else {
-        ret = ESP_FAIL;
-    }
-    if (read(ES8311_SDPIN_REG09, &reg) == ESP_OK) {
-        ret |= write(ES8311_SDPIN_REG09, (reg & ~0x40) | 0x0C);  // [wordlen-fix] 16bit WL matches I2S 16bit
-    } else {
-        ret = ESP_FAIL;
-    }
-
-    ret |= write(ES8311_ADC_REG17, 0xBF);
-    ret |= write(ES8311_SYSTEM_REG14, 0x1A);
-    if (read(ES8311_SYSTEM_REG14, &reg) == ESP_OK) {
-        ret |= write(ES8311_SYSTEM_REG14, reg & ~0x40);
-    } else {
-        ret = ESP_FAIL;
-    }
-    ret |= write(ES8311_SYSTEM_REG0E, 0x02);
-    ret |= write(ES8311_SYSTEM_REG12, 0x00);
-    ret |= write(ES8311_SYSTEM_REG0D, 0x01);
-    ret |= write(ES8311_ADC_REG15, 0x40);
-    ret |= write(ES8311_DAC_REG37, 0x08);
-    ret |= write(ES8311_GP_REG45, 0x00);
-
-    if (first_error != ESP_OK) {
-        // Preserve the transport error instead of converting a NACK into the
-        // generic ESP_FAIL produced by skipped read/modify/write operations.
-        ret = first_error;
-    }
-    RecordFirstError(
-        wqn::services::RemoveAudioCodec(g_audio.session, &dev), &ret);
+    const esp_err_t result = wqn::services::ConfigureAudioCodec(
+        g_audio.session, wqn::services::AudioCodecProfile::kCapture);
     ESP_LOGI(kTag, "capture init codec: configure ES8311 result=%s (%d)",
-             esp_err_to_name(ret), static_cast<int>(ret));
-    return ret;
+             esp_err_to_name(result), static_cast<int>(result));
+    return result;
 }
 
 esp_err_t InitI2s(wqn::services::AudioChannelHandle* rx_handle)
@@ -554,22 +368,6 @@ void CaptureSession()
         result = InitEs8311Adc(g_audio.i2c_bus);
         ESP_LOGI(kTag, "capture init step=es8311 result=%s (%d)",
                  esp_err_to_name(result), static_cast<int>(result));
-        if (result != ESP_OK) {
-            // [codec-retry] The codec intermittently NACKs a random register
-            // mid-sequence (REG05/06/08/12 observed) while its clock domain
-            // settles, then ACKs again on the next turn. InitEs8311Adc removes
-            // its own device on failure, so one full re-add + reconfigure pass
-            // recovers most of those turns without touching the sequence.
-            vTaskDelay(pdMS_TO_TICKS(50));
-            const esp_err_t retry_result = InitEs8311Adc(g_audio.i2c_bus);
-            ESP_LOGI(kTag,
-                     "capture init step=es8311 retry result=%s (%d)",
-                     esp_err_to_name(retry_result),
-                     static_cast<int>(retry_result));
-            if (retry_result == ESP_OK) {
-                result = ESP_OK;
-            }
-        }
     }
 
     if (result != ESP_OK) {

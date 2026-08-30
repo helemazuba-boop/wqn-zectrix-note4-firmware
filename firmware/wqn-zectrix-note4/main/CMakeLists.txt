@@ -5,7 +5,6 @@ idf_component_register(
         "ai_session.cpp"
         "audio_capture.cpp"
         "audio_player.cpp"
-        "audio_volume.cpp"
         "audio_selftest.cpp"
         "button_input.cpp"
         "contract_fixtures.cpp"

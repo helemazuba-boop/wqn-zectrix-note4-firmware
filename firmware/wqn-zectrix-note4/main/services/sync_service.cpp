@@ -46,6 +46,7 @@ wqn::services::SyncSnapshot g_sync_snapshot = {};
 portMUX_TYPE g_sync_snapshot_lock = portMUX_INITIALIZER_UNLOCKED;
 uint32_t g_sync_event_sequence = 1;
 wqn::services::SyncEvent g_latest_sync_event = {};
+std::atomic<wqn::services::SyncEventSink> g_sync_event_sink{nullptr};
 // [gap-1] Nominal full-sync retry ladder: a persistent failure used to pin the
 // retry cadence at 10s forever, keeping the radio hot across deep-sleep cycles
 // (2026-08-19 sync liveness audit). Consecutive nominal-path failures escalate
@@ -1619,7 +1620,14 @@ void PublishSyncEvent(
     event.todo_revision = g_sync_snapshot.todo_revision;
     g_latest_sync_event = event;
     taskEXIT_CRITICAL(&g_sync_snapshot_lock);
-
+    // The mailbox payload is complete before the sink is observed/called. A
+    // task notification may coalesce, which is safe because consumers compare
+    // the overwrite-safe sequence rather than expecting one wake per event.
+    const wqn::services::SyncEventSink sink =
+        g_sync_event_sink.load(std::memory_order_acquire);
+    if (sink != nullptr) {
+        sink();
+    }
 }
 
 bool LoadUsableToken(std::string* token)
@@ -3630,6 +3638,15 @@ void GetLatestSyncEvent(SyncEvent* event)
     taskEXIT_CRITICAL(&g_sync_snapshot_lock);
 #else
     *event = SyncEvent{};
+#endif
+}
+
+void SetSyncEventSink(SyncEventSink sink)
+{
+#if CONFIG_WQN_WIFI_STA_ENABLE
+    g_sync_event_sink.store(sink, std::memory_order_release);
+#else
+    (void)sink;
 #endif
 }
 

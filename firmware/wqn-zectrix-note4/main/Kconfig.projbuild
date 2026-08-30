@@ -92,13 +92,26 @@ menu "WQN firmware"
             are RTC-capable GPIO0, GPIO18, and GPIO5. GPIO39 cannot wake from
             deep sleep on ESP32-S3. GPIO17 is held high to preserve board power.
 
+    config WQN_RETAINED_STANDBY_IDLE_MS
+        int "Retained standby idle timeout in milliseconds"
+        default 60000
+        range 1000 86400000
+        depends on PM_ENABLE && FREERTOS_USE_TICKLESS_IDLE
+        help
+            User-idle time before the UI switches to an event/deadline-driven
+            wait. Automatic light sleep then retains RAM, PSRAM and the display
+            framebuffer, so every button (including GPIO39) remains a wake
+            source without rebooting the firmware.
+
     config WQN_DEEP_SLEEP_IDLE_MS
         int "Deep sleep idle timeout in milliseconds"
-        default 60000
+        default 1800000
         range 10000 86400000
         depends on WQN_DEEP_SLEEP_ENABLE
         help
-            Idle time before entering deep sleep. Default 60 seconds for normal use.
+            Idle time before entering deep sleep for a UI state that has an
+            explicit durable hibernate contract. Ordinary application pages
+            use retained standby instead. The default is 30 minutes.
 
     config WQN_DEEP_SLEEP_TIMER_WAKE_SEC
         int "Deep sleep timer wake interval in seconds"

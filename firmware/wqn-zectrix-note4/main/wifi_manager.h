@@ -23,6 +23,10 @@ esp_err_t ConnectWifiStationNow();
 esp_err_t DisconnectWifiStationNow();
 esp_err_t StopWifiStationRadio();
 esp_err_t StartWifiStationRadio();
+// Interactive voice/cloud work needs deterministic uplink latency.  The
+// connectivity service disables modem sleep while an interactive demand is
+// active and restores it for background/idle operation.
+esp_err_t SetWifiStationPowerSaveEnabled(bool enabled);
 esp_err_t WaitForWifiStationConnected(TickType_t timeout);
 bool IsWifiStationConnected();
 bool IsWifiStationInitialized();

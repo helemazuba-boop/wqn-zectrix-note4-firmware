@@ -20,6 +20,7 @@
 #include "esp_timer.h"
 #include "esp_tls_crypto.h"
 #include "esp_system.h"
+#include "lwip/sockets.h"
 #include <errno.h>
 
 static const char *TAG = "websocket_client";
@@ -1526,6 +1527,31 @@ bool esp_websocket_client_is_connected(esp_websocket_client_handle_t client)
  return false;
  }
  return client->state == WEBSOCKET_STATE_CONNECTED;
+}
+
+esp_err_t esp_websocket_client_set_tcp_nodelay(
+    esp_websocket_client_handle_t client, bool enabled)
+{
+ if (client == NULL) {
+ return ESP_ERR_INVALID_ARG;
+ }
+ if (xSemaphoreTakeRecursive(client->lock, pdMS_TO_TICKS(1000)) != pdPASS) {
+ return ESP_ERR_TIMEOUT;
+ }
+ esp_err_t result = ESP_ERR_INVALID_STATE;
+ if (client->transport != NULL && client->state == WEBSOCKET_STATE_CONNECTED) {
+ int sock = esp_transport_get_socket(client->transport);
+ int value = enabled ? 1 : 0;
+ if (sock >= 0 && setsockopt(sock, IPPROTO_TCP, TCP_NODELAY,
+ &value, sizeof(value)) == 0) {
+ result = ESP_OK;
+ } else {
+ ESP_LOGW(TAG, "set TCP_NODELAY failed: socket=%d errno=%d", sock, errno);
+ result = ESP_FAIL;
+ }
+ }
+ xSemaphoreGiveRecursive(client->lock);
+ return result;
 }
 
 size_t esp_websocket_client_get_ping_interval_sec(esp_websocket_client_handle_t client)

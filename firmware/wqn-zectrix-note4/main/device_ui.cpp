@@ -20,6 +20,7 @@
 #include "esp_timer.h"
 #include "flash_session.h"
 #include "power_manager.h"
+#include "runtime/sleep_coordinator.h"
 #include "runtime/wake_context.h"
 #include "services/sync_service.h"
 #include "ui/persist_worker.h"
@@ -92,27 +93,24 @@ bool ScreenSupportsTimerSkip(wqn::UiScreen screen)
 wqn::DeepSleepUiPolicy DeepSleepPolicyForUiState(const wqn::AppState& state)
 {
     switch (state.screen) {
-        case wqn::UiScreen::kHome:
-            return wqn::DeepSleepUiPolicy::kDeepSleepWithDisplayTimer;
-        case wqn::UiScreen::kTime:
-            return state.time_app.config_mode
-                ? wqn::DeepSleepUiPolicy::kLightSleepOnly
-                : wqn::DeepSleepUiPolicy::kDeepSleepWithDisplayTimer;
         case wqn::UiScreen::kProvisioning:
             // An unpaired device on battery keeps the existing slow
             // maintenance cadence; an active portal still owns a blocker.
             return wqn::DeepSleepUiPolicy::kDeepSleepNoDisplayTimer;
+        case wqn::UiScreen::kHome:
+        case wqn::UiScreen::kTime:
         case wqn::UiScreen::kAi:
         case wqn::UiScreen::kTodo:
         case wqn::UiScreen::kSettings:
         case wqn::UiScreen::kWord:
         case wqn::UiScreen::kNote:
-            // Interactive pages retain foreground/session state in RAM and
-            // page-up GPIO39 cannot wake the S3 from deep sleep. ESP-PM
-            // tickless light sleep remains available whenever leases clear.
-            return wqn::DeepSleepUiPolicy::kLightSleepOnly;
+            // Ordinary application pages enter retained standby. Deep sleep
+            // becomes legal only after a later durable hibernate checkpoint
+            // transaction; page identity alone is never sufficient because
+            // it would drop RAM/PSRAM state and GPIO39 wake functionality.
+            return wqn::DeepSleepUiPolicy::kRetainedStandbyOnly;
     }
-    return wqn::DeepSleepUiPolicy::kLightSleepOnly;
+    return wqn::DeepSleepUiPolicy::kRetainedStandbyOnly;
 }
 
 bool IsBackgroundSyncTimerWake(
@@ -244,6 +242,69 @@ constexpr TickType_t kStatusRefreshDelayTicks = pdMS_TO_TICKS(60000);
 // Full UI snapshot reloads touch several persistent domains. Keep them out of
 // the word interaction window; typed sync events already update live status.
 constexpr int64_t kStatusReloadInteractionQuietUs = 5LL * 1000LL * 1000LL;
+
+TickType_t DelayMsToTicks(int64_t delay_ms)
+{
+    if (delay_ms <= 0) {
+        return 1;
+    }
+    const uint64_t ticks =
+        (static_cast<uint64_t>(delay_ms) + portTICK_PERIOD_MS - 1) /
+        portTICK_PERIOD_MS;
+    return ticks >= static_cast<uint64_t>(portMAX_DELAY)
+        ? portMAX_DELAY - 1
+        : static_cast<TickType_t>(std::max<uint64_t>(1, ticks));
+}
+
+TickType_t TicksUntilNextClockMinute()
+{
+    const std::time_t now = std::time(nullptr);
+    int64_t second = static_cast<int64_t>(now % 60);
+    if (second < 0) {
+        second += 60;
+    }
+    // Cross the wall-clock boundary rather than waking exactly on it; this
+    // avoids a scheduler/RTC rounding edge that would reproduce the old label
+    // and immediately arm another near-full-minute wait.
+    return DelayMsToTicks((60 - second) * 1000 + 25);
+}
+
+bool RetainedStandbyIdleWindow(const wqn::AppState& state)
+{
+    return DeepSleepPolicyForUiState(state) ==
+            wqn::DeepSleepUiPolicy::kRetainedStandbyOnly &&
+        wqn::IsUiIdleForRetainedStandby() &&
+        !wqn::TimeAppHasActiveTimer(state.time_app) &&
+        !state.status_edit.active;
+}
+
+bool CanWaitInRetainedStandby(const wqn::AppState& state)
+{
+    return RetainedStandbyIdleWindow(state) &&
+        !wqn::runtime::HasActiveSleepBlockers();
+}
+
+TickType_t RetainedStandbyWaitTicks(
+    const wqn::AppState& state,
+    uint64_t todo_desired_revision,
+    uint64_t todo_applied_revision,
+    int64_t todo_retry_not_before_ms)
+{
+    TickType_t wait_ticks = portMAX_DELAY;
+    if (device_ui_internal::ScreenUsesClockMinute(state)) {
+        wait_ticks = TicksUntilNextClockMinute();
+    }
+    if (todo_desired_revision > todo_applied_revision &&
+        todo_retry_not_before_ms > 0) {
+        const int64_t retry_delay_ms =
+            todo_retry_not_before_ms - esp_timer_get_time() / 1000;
+        if (retry_delay_ms > 0) {
+            wait_ticks = std::min(
+                wait_ticks, DelayMsToTicks(retry_delay_ms));
+        }
+    }
+    return wait_ticks;
+}
 
 using device_ui_internal::BuildHomeSummary;
 using device_ui_internal::CheckBatteryProtection;
@@ -487,6 +548,7 @@ void DeviceUiTask(void*)
     }
     // [input-capture] Cloud results and sync events wake this same task.
     device_ui_internal::SetUiTaskToNotify(xTaskGetCurrentTaskHandle());
+    wqn::services::SetSyncEventSink(&device_ui_internal::NotifyUiTask);
 
     const wqn::runtime::WakeContext& wake = wqn::runtime::GetWakeContext();
     // An active retained timer may have crossed a visual milestone or its
@@ -1037,6 +1099,9 @@ wqn::AiStreamingStatusView streaming_view{};
         const TickType_t now = xTaskGetTickCount();
         const bool status_reload_due =
             now - last_status_refresh >= kStatusRefreshDelayTicks;
+        const bool retained_standby_candidate =
+            refresh_schedule == RefreshSchedule::kNone &&
+            RetainedStandbyIdleWindow(state);
         const bool interaction_quiet =
             esp_timer_get_time() - g_last_active_us_local >=
             kStatusReloadInteractionQuietUs;
@@ -1070,7 +1135,8 @@ wqn::AiStreamingStatusView streaming_view{};
         // [hang-fix] Surface domains stuck busy past their lane budget; a
         // silent stuck domain looks identical to "cloud slow" from the UI.
         device_ui_internal::WarnStuckCloudDomains();
-        if (status_reload_due && refresh_schedule == RefreshSchedule::kNone &&
+        if (status_reload_due && !retained_standby_candidate &&
+            refresh_schedule == RefreshSchedule::kNone &&
             !button_consumed_this_iter && interaction_quiet && cloud_quiet &&
             persist_quiet) {
             if (state.screen != wqn::UiScreen::kWord) {
@@ -1274,11 +1340,6 @@ wqn::AiStreamingStatusView streaming_view{};
         // cleanup full refresh no longer blocks the UI task.
         device_ui_internal::RequestEpdIdleMaintenance();
 
-        // Automatic light sleep is owned by ESP-IDF tickless idle. SleepLease
-        // maps active service work to ESP_PM_NO_LIGHT_SLEEP; GPIO17 sleep-mode
-        // selection is disabled by the Note4 HAL.
-        vTaskDelay(pdMS_TO_TICKS(10));
-
         g_rtc_screen_val = static_cast<int>(state.screen);
         wqn::SetDeepSleepUiPolicy(DeepSleepPolicyForUiState(state));
 
@@ -1286,7 +1347,31 @@ wqn::AiStreamingStatusView streaming_view{};
         const bool screen_active = (state.screen == wqn::UiScreen::kTime ||
                                     state.screen == wqn::UiScreen::kAi ||
                                     state.screen == wqn::UiScreen::kWord);
-        if (refresh_schedule != RefreshSchedule::kNone || screen_active) {
+        const bool todo_convergence_due =
+            todo_desired_revision > todo_applied_revision &&
+            esp_timer_get_time() / 1000 >= todo_retry_not_before_ms;
+        const bool retained_standby_ready =
+            refresh_schedule == RefreshSchedule::kNone &&
+            pending_refresh_schedule == RefreshSchedule::kNone &&
+            !todo_convergence_due &&
+            CanWaitInRetainedStandby(state);
+        // Keep the managed retained-standby state armed across selective
+        // minute/sync/display work. Its SleepLease temporarily prevents light
+        // sleep; treating that short wake as a standby exit would spam the RTC
+        // diagnostic ring twice per minute and obscure real user exits.
+        wqn::SetRetainedStandbyUiReady(RetainedStandbyIdleWindow(state));
+
+        if (retained_standby_ready) {
+            // Automatic ESP-PM light sleep owns the actual sleep entry. The
+            // UI contributes only real deadlines, so GPIO input/cloud/sync/
+            // persist notifications remain ordinary FreeRTOS wakeups and all
+            // RAM/PSRAM/framebuffer state stays live.
+            poll_delay = RetainedStandbyWaitTicks(
+                state,
+                todo_desired_revision,
+                todo_applied_revision,
+                todo_retry_not_before_ms);
+        } else if (refresh_schedule != RefreshSchedule::kNone || screen_active) {
             poll_delay = kUiPollDelayTicks;
         } else if (idle_ms < 3000) {
             poll_delay = kUiPollDelayTicks;
@@ -1295,10 +1380,9 @@ wqn::AiStreamingStatusView streaming_view{};
         }
 
         // [input-capture] Wait for the next button/cloud/sync notify or the
-        // poll deadline, whichever comes first. The button task, Send*Result
-        // and the sync-event sink all NotifyUiTask on arrival, so a queued
-        // event is consumed within one scheduler hop instead of up to the
-        // 500 ms idle poll period.
+        // nearest real deadline. Before retained standby the short timeout
+        // preserves legacy pump/tick behavior; in retained standby the wait is
+        // minute/retry/notification driven and may be indefinite.
         ulTaskNotifyTake(pdTRUE, poll_delay);
     }
 }

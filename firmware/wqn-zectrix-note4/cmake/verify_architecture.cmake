@@ -30,8 +30,6 @@ set(feature_sources
     main/audio_player.h
     main/audio_selftest.cpp
     main/audio_selftest.h
-    main/audio_volume.cpp
-    main/audio_volume.h
     main/device_ui.cpp
     main/device_ui.h
     main/flash_session.cpp

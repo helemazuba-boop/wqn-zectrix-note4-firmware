@@ -28,16 +28,20 @@ void NoteUserActivityAtMs(int64_t occurred_at_ms);
 void CheckBatteryAfterUserActivity();
 bool IsUiIdleForSleep();
 bool IsUiIdleForSleepEx(int extra_idle_ms);
+// True after the shorter retained-standby idle threshold. Unlike deep sleep,
+// this is only a scheduling hint: automatic ESP-PM light sleep keeps lease
+// admission open and retains RAM/PSRAM/framebuffer state.
+bool IsUiIdleForRetainedStandby();
 // True when an idle, battery-powered device is ready to enter deep sleep and
 // a cosmetic minute refresh should yield instead of acquiring a display
 // lease at the same threshold.
 bool ShouldYieldClockRefreshToDeepSleep();
 
-// Foreground UI policy for automatic idle deep sleep. Interactive pages use
-// ESP-PM light sleep only; standby pages may additionally arm a display timer.
-// Emergency/user-requested shutdown paths deliberately ignore this policy.
+// Foreground UI policy for automatic idle deep sleep. Ordinary pages use
+// retained standby; deep sleep is reserved for states with an explicit durable
+// hibernate contract. Emergency/user-requested shutdown ignores this policy.
 enum class DeepSleepUiPolicy : uint8_t {
-    kLightSleepOnly = 0,
+    kRetainedStandbyOnly = 0,
     kDeepSleepNoDisplayTimer,
     kDeepSleepWithDisplayTimer,
 };
@@ -47,6 +51,9 @@ esp_err_t StartPowerCoordinator();
 // after InitSleepCoordinator(), then periodically from PowerCoordinator.
 void RefreshUsbPowerSleepPolicy();
 void SetDeepSleepUiPolicy(DeepSleepUiPolicy policy);
+// UI-owned readiness signal used to lengthen coordinator polling and record
+// retained-standby transitions. It does not close SleepLease admission.
+void SetRetainedStandbyUiReady(bool ready);
 void ShutdownForBatteryDepleted();
 // [power-fix] User-initiated power-off (settings page): the coordinator
 // clears the panel on the EPD owner task, quiesces services, then cuts the

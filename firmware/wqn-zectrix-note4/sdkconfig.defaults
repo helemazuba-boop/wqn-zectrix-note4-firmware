@@ -22,10 +22,15 @@ CONFIG_ESP_WIFI_ENTERPRISE_SUPPORT=n
 # internal heap before the 12 KiB AI submit task stack is created.
 # CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP is not set
 CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER=y
-# [dma-footprint] Dynamic TX buffers are DMA-capped internal RAM; 32 of them
-# can transiently hold ~50 KiB and starve I2S DMA descriptor placement during
-# AI turns. 16 halves that ceiling without affecting bulk sync throughput.
-CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=16
+# Flash now reserves both I2S directions before TLS/WebSocket starts and uses
+# a 6 x 128-frame DMA ring, so I2S admission no longer depends on starving the
+# WiFi driver.  Keep the ESP-IDF default depth for sustained 24 kHz realtime
+# uplink; 16 buffers reproduced TCP write stalls after the first PCM frames.
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=32
+
+# Flash realtime keeps its capture/playback worker stacks in PSRAM so their
+# 12 KiB do not consume the same internal heap used by WiFi and I2S DMA.
+CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM=y
 
 CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
 CONFIG_MBEDTLS_SSL_KEEP_PEER_CERTIFICATE=n

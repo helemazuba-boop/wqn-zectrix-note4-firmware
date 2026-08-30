@@ -36,6 +36,7 @@ std::atomic<bool> g_reconfigure_disconnect_pending{false};
 bool g_sntp_started = false;
 std::atomic<bool> g_sleep_quiescing{false};
 std::atomic<bool> g_resume_after_sleep_abort{false};
+std::atomic<bool> g_power_save_enabled{true};
 std::atomic<wqn::WifiStationEventSink> g_event_sink{nullptr};
 EventGroupHandle_t g_wifi_event_group = nullptr;
 
@@ -341,7 +342,10 @@ esp_err_t StartWifiWithCredentials(const char* ssid, const char* password)
     wifi_config.sta.sae_pwe_h2e = WPA3_SAE_PWE_BOTH;
 
     ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_STA, &wifi_config), kTag, "set WiFi STA config");
-    ESP_RETURN_ON_ERROR(esp_wifi_set_ps(WIFI_PS_MIN_MODEM), kTag, "set WiFi power save");
+    const wifi_ps_type_t power_save =
+        g_power_save_enabled.load(std::memory_order_acquire)
+        ? WIFI_PS_MIN_MODEM : WIFI_PS_NONE;
+    ESP_RETURN_ON_ERROR(esp_wifi_set_ps(power_save), kTag, "set WiFi power save");
     const esp_err_t start_result = esp_wifi_start();
     ESP_RETURN_ON_ERROR(start_result, kTag, "start WiFi");
     NoteWifiRadioOn();
@@ -467,10 +471,47 @@ esp_err_t StartWifiStationRadio()
     const esp_err_t start_result = esp_wifi_start();
     if (start_result == ESP_OK) {
         NoteWifiRadioOn();
+        const wifi_ps_type_t mode =
+            g_power_save_enabled.load(std::memory_order_acquire)
+            ? WIFI_PS_MIN_MODEM : WIFI_PS_NONE;
+        const esp_err_t ps_result = esp_wifi_set_ps(mode);
+        if (ps_result == ESP_OK) {
+            ESP_LOGI(kTag, "WiFi power save after radio start: %s",
+                     mode == WIFI_PS_NONE ? "disabled" : "min-modem");
+        } else {
+            ESP_LOGW(kTag, "WiFi power save after radio start failed: %s",
+                     esp_err_to_name(ps_result));
+        }
     }
     return start_result;
 #else
     return ESP_ERR_INVALID_STATE;
+#endif
+}
+
+esp_err_t SetWifiStationPowerSaveEnabled(bool enabled)
+{
+#if CONFIG_WQN_WIFI_STA_ENABLE
+    g_power_save_enabled.store(enabled, std::memory_order_release);
+    if (!g_initialized.load(std::memory_order_acquire)) {
+        // StartWifiWithCredentials applies the requested mode after the driver
+        // is initialized and before the station starts.
+        return ESP_OK;
+    }
+    const wifi_ps_type_t mode = enabled ? WIFI_PS_MIN_MODEM : WIFI_PS_NONE;
+    const esp_err_t result = esp_wifi_set_ps(mode);
+    if (result == ESP_ERR_WIFI_NOT_STARTED) {
+        // The desired mode is retained above and applied immediately after
+        // StartWifiStationRadio brings the radio back up.
+        return ESP_OK;
+    }
+    if (result == ESP_OK) {
+        ESP_LOGI(kTag, "WiFi power save: %s", enabled ? "min-modem" : "disabled");
+    }
+    return result;
+#else
+    (void)enabled;
+    return ESP_OK;
 #endif
 }
 

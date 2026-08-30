@@ -22,19 +22,19 @@ namespace {
 
 constexpr char kTag[] = "stdpro_ws";
 constexpr size_t kPcmFramesPerBlock = 240; // 15ms @ 16kHz mono s16le
-// [heap-fit] 8 blocks ~= 120 ms of jitter buffering (~3.9 KiB internal). The
-// old 64-deep queue reserved ~31 KiB of scarce internal RAM permanently and
-// starved the largest-free-block down below any viable task stack; overflow
-// degrades gracefully (pre-FINAL latch -> ResetRequired -> HTTP fallback).
-constexpr size_t kPcmQueueLength = 8;
+// One WebSocket send may legally block for 1.5 s. Keep 1.92 s of capture
+// jitter in explicitly allocated PSRAM so a transient TCP stall cannot turn
+// into pre-FINAL loss, without reclaiming the ~62 KiB from DMA/internal RAM.
+constexpr size_t kPcmQueueLength = 128;
 constexpr size_t kCtrlQueueLength = 8;
 constexpr size_t kCtrlCompletionQueueLength = 4;
+constexpr UBaseType_t kTransportTaskPriority = 7;
 // [stream-depth] Device-observed failure: an SSE burst of 1287 bytes arrived
 // with only 512 B free in an 8 KiB buffer -> overflow -> ResetRequired killed
 // a healthy connection mid-turn. Consumer (this same owner task) can stall
 // for up to a PCM send timeout while the socket keeps delivering, so size for
-// multi-frame bursts. malloc-backed: lands in PSRAM, not the DMA-starved
-// internal heap.
+// multi-frame bursts. The backing store is explicitly allocated from PSRAM;
+// FreeRTOS dynamic object allocation is internal-only in this IDF build.
 constexpr size_t kTextStreamBufferSize = 16384;
 
 enum class ConnectionState : uint8_t {
@@ -110,6 +110,7 @@ constexpr uint32_t kEvtBitCtrlPending         = (1 << 4);
 constexpr uint32_t kEvtBitResetRequired       = (1 << 5);
 constexpr uint32_t kEvtBitEmergencyAbort      = (1 << 6);
 constexpr uint32_t kEvtBitEmergencyDisconnect = (1 << 7);
+constexpr uint32_t kEvtBitPcmPending           = (1 << 8);
 
 // Global synchronization and queue primitives
 QueueHandle_t g_pcm_queue = nullptr;
@@ -122,6 +123,18 @@ SemaphoreHandle_t g_transport_mutex = nullptr;
 SemaphoreHandle_t g_sync_op_sem = nullptr;
 SemaphoreHandle_t g_final_sem = nullptr;
 SemaphoreHandle_t g_turn_complete_sem = nullptr;
+
+// Init is transactional and serialized independently from the transport
+// mutex, which does not exist until the transaction commits. Keeping the
+// stream control block static lets its 16 KiB backing store live in PSRAM
+// without relying on FreeRTOS' internal-only pvPortMalloc path.
+StaticSemaphore_t g_init_mutex_storage = {};
+SemaphoreHandle_t g_init_mutex = nullptr;
+portMUX_TYPE g_init_mutex_lock = portMUX_INITIALIZER_UNLOCKED;
+StaticQueue_t g_pcm_queue_control = {};
+uint8_t* g_pcm_queue_storage = nullptr;
+StaticStreamBuffer_t g_text_stream_control = {};
+uint8_t* g_text_stream_storage = nullptr;
 
 std::atomic<uint32_t> g_sync_op_gen{0};
 std::atomic<uint32_t> g_turn_gen{0};
@@ -744,10 +757,18 @@ void HandleAllNotificationBits(uint32_t bits)
     if (bits & kEvtBitCtrlPending) {
         // kEvtBitCtrlPending wakes the root loop; g_ctrl_queue is drained exclusively in the root loop below
     }
+    if (bits & kEvtBitPcmPending) {
+        // Wake-only bit. The root loop drains exactly one PCM block below and
+        // then immediately iterates while the queue remains non-empty.
+    }
 }
 
 void VoiceWsTransportTask(void*)
 {
+    // InitPrimitives creates this task before publishing the primitive set.
+    // Stay behind the commit gate until every handle is globally visible.
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
     uint32_t notified_bits = 0;
     uint8_t frame[wqn::kWflvHeaderBytes + kPcmFramesPerBlock * 2];
 
@@ -847,37 +868,164 @@ void VoiceWsTransportTask(void*)
     }
 }
 
-void InitPrimitives()
+SemaphoreHandle_t GetInitMutex()
 {
-    if (g_transport_mutex == nullptr) {
-        g_transport_mutex = xSemaphoreCreateMutex();
+    portENTER_CRITICAL(&g_init_mutex_lock);
+    if (g_init_mutex == nullptr) {
+        g_init_mutex = xSemaphoreCreateMutexStatic(&g_init_mutex_storage);
     }
-    if (g_sync_op_sem == nullptr) {
-        g_sync_op_sem = xSemaphoreCreateBinary();
+    SemaphoreHandle_t mutex = g_init_mutex;
+    portEXIT_CRITICAL(&g_init_mutex_lock);
+    return mutex;
+}
+
+bool PrimitivesReady()
+{
+    return g_transport_mutex != nullptr && g_sync_op_sem != nullptr &&
+        g_final_sem != nullptr && g_turn_complete_sem != nullptr &&
+        g_pcm_queue != nullptr && g_ctrl_queue != nullptr &&
+        g_ctrl_completion_queue != nullptr && g_text_stream != nullptr &&
+        g_pcm_queue_storage != nullptr && g_text_stream_storage != nullptr &&
+        g_transport_task != nullptr;
+}
+
+void DeleteUncommittedPrimitives(
+    SemaphoreHandle_t transport_mutex,
+    SemaphoreHandle_t sync_op_sem,
+    SemaphoreHandle_t final_sem,
+    SemaphoreHandle_t turn_complete_sem,
+    QueueHandle_t pcm_queue,
+    uint8_t* pcm_queue_storage,
+    QueueHandle_t ctrl_queue,
+    QueueHandle_t ctrl_completion_queue,
+    StreamBufferHandle_t text_stream,
+    uint8_t* text_stream_storage)
+{
+    if (text_stream != nullptr) {
+        vStreamBufferDelete(text_stream);
     }
-    if (g_final_sem == nullptr) {
-        g_final_sem = xSemaphoreCreateBinary();
+    if (text_stream_storage != nullptr) {
+        heap_caps_free(text_stream_storage);
     }
-    if (g_turn_complete_sem == nullptr) {
-        g_turn_complete_sem = xSemaphoreCreateBinary();
+    if (ctrl_completion_queue != nullptr) {
+        vQueueDelete(ctrl_completion_queue);
     }
-    if (g_pcm_queue == nullptr) {
-        g_pcm_queue = xQueueCreate(kPcmQueueLength, sizeof(PcmBlock));
+    if (ctrl_queue != nullptr) {
+        vQueueDelete(ctrl_queue);
     }
-    if (g_ctrl_queue == nullptr) {
-        g_ctrl_queue = xQueueCreate(kCtrlQueueLength, sizeof(CtrlCmd));
+    if (pcm_queue != nullptr) {
+        vQueueDelete(pcm_queue);
     }
-    if (g_ctrl_completion_queue == nullptr) {
-        g_ctrl_completion_queue =
-            xQueueCreate(kCtrlCompletionQueueLength, sizeof(CtrlCompletion));
+    if (pcm_queue_storage != nullptr) {
+        heap_caps_free(pcm_queue_storage);
     }
-    if (g_text_stream == nullptr) {
-        g_text_stream = xStreamBufferCreate(kTextStreamBufferSize, 1);
+    if (turn_complete_sem != nullptr) {
+        vSemaphoreDelete(turn_complete_sem);
     }
-    if (g_transport_task == nullptr) {
-        xTaskCreate(VoiceWsTransportTask, "wqn_vws_ctrl", 8192, nullptr, 5,
-                    &g_transport_task);
+    if (final_sem != nullptr) {
+        vSemaphoreDelete(final_sem);
     }
+    if (sync_op_sem != nullptr) {
+        vSemaphoreDelete(sync_op_sem);
+    }
+    if (transport_mutex != nullptr) {
+        vSemaphoreDelete(transport_mutex);
+    }
+}
+
+esp_err_t InitPrimitives()
+{
+    SemaphoreHandle_t init_mutex = GetInitMutex();
+    if (init_mutex == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
+    if (xSemaphoreTake(init_mutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    if (PrimitivesReady()) {
+        xSemaphoreGive(init_mutex);
+        return ESP_OK;
+    }
+
+    // Allocate the complete set locally. The task blocks on its commit gate,
+    // so no global handle needs to be published until task creation succeeds.
+    SemaphoreHandle_t transport_mutex = xSemaphoreCreateMutex();
+    SemaphoreHandle_t sync_op_sem = xSemaphoreCreateBinary();
+    SemaphoreHandle_t final_sem = xSemaphoreCreateBinary();
+    SemaphoreHandle_t turn_complete_sem = xSemaphoreCreateBinary();
+    uint8_t* pcm_queue_storage = static_cast<uint8_t*>(heap_caps_malloc(
+        kPcmQueueLength * sizeof(PcmBlock),
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    QueueHandle_t pcm_queue = pcm_queue_storage == nullptr
+        ? nullptr
+        : xQueueCreateStatic(
+            kPcmQueueLength, sizeof(PcmBlock), pcm_queue_storage,
+            &g_pcm_queue_control);
+    QueueHandle_t ctrl_queue =
+        xQueueCreate(kCtrlQueueLength, sizeof(CtrlCmd));
+    QueueHandle_t ctrl_completion_queue =
+        xQueueCreate(kCtrlCompletionQueueLength, sizeof(CtrlCompletion));
+    uint8_t* text_stream_storage = static_cast<uint8_t*>(heap_caps_malloc(
+        kTextStreamBufferSize, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    StreamBufferHandle_t text_stream = text_stream_storage == nullptr
+        ? nullptr
+        : xStreamBufferCreateStatic(
+            kTextStreamBufferSize, 1, text_stream_storage,
+            &g_text_stream_control);
+
+    const bool allocations_ok = transport_mutex != nullptr &&
+        sync_op_sem != nullptr && final_sem != nullptr &&
+        turn_complete_sem != nullptr && pcm_queue != nullptr &&
+        ctrl_queue != nullptr && ctrl_completion_queue != nullptr &&
+        text_stream != nullptr;
+    if (!allocations_ok) {
+        DeleteUncommittedPrimitives(
+            transport_mutex, sync_op_sem, final_sem, turn_complete_sem,
+            pcm_queue, pcm_queue_storage, ctrl_queue,
+            ctrl_completion_queue, text_stream,
+            text_stream_storage);
+        xSemaphoreGive(init_mutex);
+        ESP_LOGE(kTag, "transport primitive allocation failed; rolled back");
+        return ESP_ERR_NO_MEM;
+    }
+
+    TaskHandle_t transport_task = nullptr;
+    const BaseType_t created = xTaskCreate(
+        VoiceWsTransportTask, "wqn_vws_ctrl", 8192, nullptr,
+        kTransportTaskPriority,
+        &transport_task);
+    if (created != pdPASS) {
+        DeleteUncommittedPrimitives(
+            transport_mutex, sync_op_sem, final_sem, turn_complete_sem,
+            pcm_queue, pcm_queue_storage, ctrl_queue,
+            ctrl_completion_queue, text_stream,
+            text_stream_storage);
+        xSemaphoreGive(init_mutex);
+        ESP_LOGE(kTag, "transport task allocation failed; primitives rolled back");
+        return ESP_ERR_NO_MEM;
+    }
+
+    g_transport_mutex = transport_mutex;
+    g_sync_op_sem = sync_op_sem;
+    g_final_sem = final_sem;
+    g_turn_complete_sem = turn_complete_sem;
+    g_pcm_queue = pcm_queue;
+    g_pcm_queue_storage = pcm_queue_storage;
+    g_ctrl_queue = ctrl_queue;
+    g_ctrl_completion_queue = ctrl_completion_queue;
+    g_text_stream = text_stream;
+    g_text_stream_storage = text_stream_storage;
+    g_transport_task = transport_task;
+    xTaskNotifyGive(transport_task);
+    xSemaphoreGive(init_mutex);
+    ESP_LOGI(kTag,
+             "transport primitives ready: pcm_psram=%p blocks=%u bytes=%u text_psram=%p bytes=%u",
+             g_pcm_queue_storage,
+             static_cast<unsigned>(kPcmQueueLength),
+             static_cast<unsigned>(kPcmQueueLength * sizeof(PcmBlock)),
+             g_text_stream_storage,
+             static_cast<unsigned>(kTextStreamBufferSize));
+    return ESP_OK;
 }
 
 }  // namespace
@@ -886,11 +1034,9 @@ namespace wqn::stdpro_ws {
 
 esp_err_t EnsureConnected(const std::string& token, uint32_t timeout_ms)
 {
-    InitPrimitives();
-    if (g_transport_mutex == nullptr || g_sync_op_sem == nullptr ||
-        g_ctrl_queue == nullptr || g_ctrl_completion_queue == nullptr ||
-        g_transport_task == nullptr) {
-        return ESP_ERR_NO_MEM;
+    const esp_err_t init_result = InitPrimitives();
+    if (init_result != ESP_OK) {
+        return init_result;
     }
 
     CtrlCmd cmd = {};
@@ -1008,7 +1154,10 @@ esp_err_t StartTurn(const std::string& request_id,
                     const char* reasoning_effort,
                     uint32_t* out_turn_gen)
 {
-    InitPrimitives();
+    const esp_err_t init_result = InitPrimitives();
+    if (init_result != ESP_OK) {
+        return init_result;
+    }
     if (g_transport_mutex == nullptr || g_sync_op_sem == nullptr ||
         g_ctrl_queue == nullptr || g_ctrl_completion_queue == nullptr ||
         g_transport_task == nullptr ||
@@ -1095,7 +1244,8 @@ esp_err_t StartTurn(const std::string& request_id,
 void PushPcm(const int16_t* samples, size_t count)
 {
     if (g_turn_state.load(std::memory_order_acquire) != TurnState::kRecording ||
-        g_pcm_queue == nullptr || samples == nullptr || count == 0) {
+        g_pcm_queue == nullptr || samples == nullptr || count == 0 ||
+        g_prefinal_pcm_lost.load(std::memory_order_acquire)) {
         return;
     }
 
@@ -1109,12 +1259,23 @@ void PushPcm(const int16_t* samples, size_t count)
         std::memcpy(block.samples, samples, chunk_count * sizeof(int16_t));
 
         if (xQueueSend(g_pcm_queue, &block, 0) != pdTRUE) {
-            ESP_LOGW(kTag, "PCM queue overflow — latching pre-FINAL failure and requesting reset");
-            g_prefinal_pcm_lost.store(true, std::memory_order_release);
-            if (g_transport_task != nullptr) {
-                xTaskNotify(g_transport_task, kEvtBitResetRequired, eSetBits);
+            bool expected = false;
+            if (g_prefinal_pcm_lost.compare_exchange_strong(
+                    expected, true, std::memory_order_acq_rel,
+                    std::memory_order_acquire)) {
+                ESP_LOGW(kTag,
+                         "PCM queue overflow: queued=%u capacity=%u; latching pre-FINAL failure",
+                         static_cast<unsigned>(uxQueueMessagesWaiting(g_pcm_queue)),
+                         static_cast<unsigned>(kPcmQueueLength));
+                if (g_transport_task != nullptr) {
+                    xTaskNotify(
+                        g_transport_task, kEvtBitResetRequired, eSetBits);
+                }
             }
             break;
+        }
+        if (g_transport_task != nullptr) {
+            xTaskNotify(g_transport_task, kEvtBitPcmPending, eSetBits);
         }
 
         samples += chunk_count;

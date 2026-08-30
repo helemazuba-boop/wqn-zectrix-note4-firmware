@@ -42,6 +42,10 @@
 #define CONFIG_WQN_DEEP_SLEEP_IDLE_MS 300000
 #endif
 
+#ifndef CONFIG_WQN_RETAINED_STANDBY_IDLE_MS
+#define CONFIG_WQN_RETAINED_STANDBY_IDLE_MS 60000
+#endif
+
 #ifndef CONFIG_WQN_CHARGING_DEEP_SLEEP_EXTRA_MS
 #define CONFIG_WQN_CHARGING_DEEP_SLEEP_EXTRA_MS 300000
 #endif
@@ -152,7 +156,12 @@ i2c_master_bus_handle_t g_i2c_bus = nullptr;
 
 TaskHandle_t g_power_coordinator_task = nullptr;
 std::atomic<DeepSleepUiPolicy> g_deep_sleep_ui_policy{
-    DeepSleepUiPolicy::kLightSleepOnly};
+    DeepSleepUiPolicy::kRetainedStandbyOnly};
+// Published by the UI after it has drained all immediate work and switched to
+// an event/deadline-driven wait. This is observability/polling policy only:
+// retained standby deliberately keeps SleepLease admission open, so any new
+// work can wake automatic light sleep and acquire its normal owner lease.
+std::atomic<bool> g_retained_standby_ui_ready{false};
 std::atomic<bool> g_battery_shutdown_requested{false};
 // [power-fix] Set by the settings-page confirm; consumed (and re-set on a
 // busy quiesce) by the PowerCoordinator. See RunUserPowerOffShutdown.
@@ -214,6 +223,8 @@ RTC_DATA_ATTR uint32_t g_unattended_sync_wakes = 0;
 constexpr int64_t kEmergencyStorageTimeoutUs = 2 * 1000 * 1000;
 constexpr int64_t kEmergencyHardwareTimeoutUs = 2 * 1000 * 1000;
 constexpr int64_t kLeaseWarningAfterUs = 60 * 1000 * 1000;
+constexpr TickType_t kActiveCoordinatorPollTicks = pdMS_TO_TICKS(1000);
+constexpr TickType_t kRetainedCoordinatorPollTicks = pdMS_TO_TICKS(30000);
 
 enum class DeepSleepCommitAbortReason : uint8_t {
     kUserActivity = 0,
@@ -223,7 +234,7 @@ enum class DeepSleepCommitAbortReason : uint8_t {
 
 constexpr bool DeepSleepAllowedByUiPolicy(DeepSleepUiPolicy policy)
 {
-    return policy != DeepSleepUiPolicy::kLightSleepOnly;
+    return policy != DeepSleepUiPolicy::kRetainedStandbyOnly;
 }
 
 constexpr bool UiPolicyUsesDisplayTimer(DeepSleepUiPolicy policy)
@@ -250,8 +261,8 @@ static_assert(!DisplayDeadlineWins(60, ApplyMinimumWakeFloor(1, 30)));
 const char* DeepSleepUiPolicyName(DeepSleepUiPolicy policy)
 {
     switch (policy) {
-        case DeepSleepUiPolicy::kLightSleepOnly:
-            return "light-only";
+        case DeepSleepUiPolicy::kRetainedStandbyOnly:
+            return "retained-standby";
         case DeepSleepUiPolicy::kDeepSleepNoDisplayTimer:
             return "deep-background";
         case DeepSleepUiPolicy::kDeepSleepWithDisplayTimer:
@@ -545,6 +556,12 @@ void PublishUserActivity(int64_t occurred_at_ms)
     g_unattended_sync_wakes = 0;
     g_user_activity_generation.fetch_add(1, std::memory_order_release);
     taskEXIT_CRITICAL(&g_activity_gate);
+    // The button producer runs before the event enters the UI ring. Wake the
+    // coordinator at the same linearization point so a retained-standby poll
+    // cannot remain parked for its longer diagnostic interval after input.
+    if (g_power_coordinator_task != nullptr) {
+        xTaskNotifyGive(g_power_coordinator_task);
+    }
 }
 
 void NoteUserActivity()
@@ -574,7 +591,7 @@ bool IsUiIdleForSleep()
     return IsUiIdleForSleepEx(0);
 }
 
-bool IsUiIdleForSleepEx(int extra_idle_ms)
+static bool IsUiIdleForThresholdMs(int threshold_ms)
 {
     // If we woke up by a timer and there has been no user interaction in this boot session,
     // we should sleep immediately.
@@ -582,14 +599,6 @@ bool IsUiIdleForSleepEx(int extra_idle_ms)
         !g_user_interacted_current_boot.load(std::memory_order_relaxed)) {
         return true;
     }
-
-    int threshold_ms = CONFIG_WQN_DEEP_SLEEP_IDLE_MS;
-    /* Temporarily commented out for fast testing/verification over USB
-    if (IsCharging()) {
-        threshold_ms += CONFIG_WQN_CHARGING_DEEP_SLEEP_EXTRA_MS;
-    }
-    */
-    threshold_ms += extra_idle_ms;
 
     const int64_t now_ms = NowMs();
     const int64_t last_activity_ms =
@@ -601,6 +610,23 @@ bool IsUiIdleForSleepEx(int extra_idle_ms)
     // device in active mode. EPD activity is still tracked separately for
     // the EPD rail power-off path.
     return last_activity_ms > 0 && (now_ms - last_activity_ms) >= threshold_ms;
+}
+
+bool IsUiIdleForSleepEx(int extra_idle_ms)
+{
+    int threshold_ms = CONFIG_WQN_DEEP_SLEEP_IDLE_MS;
+    /* Temporarily commented out for fast testing/verification over USB
+    if (IsCharging()) {
+        threshold_ms += CONFIG_WQN_CHARGING_DEEP_SLEEP_EXTRA_MS;
+    }
+    */
+    threshold_ms += extra_idle_ms;
+    return IsUiIdleForThresholdMs(threshold_ms);
+}
+
+bool IsUiIdleForRetainedStandby()
+{
+    return IsUiIdleForThresholdMs(CONFIG_WQN_RETAINED_STANDBY_IDLE_MS);
 }
 
 bool ShouldYieldClockRefreshToDeepSleep()
@@ -1519,6 +1545,24 @@ void SetDeepSleepUiPolicy(DeepSleepUiPolicy policy)
     }
 }
 
+void SetRetainedStandbyUiReady(bool ready)
+{
+    const bool previous = g_retained_standby_ui_ready.exchange(
+        ready, std::memory_order_acq_rel);
+    if (previous == ready) {
+        return;
+    }
+    ESP_LOGI(kTag, "retained standby UI: %s", ready ? "ready" : "active");
+    runtime::SleepDiagnosticEvent diagnostic = MakeSleepDiagnosticEvent(
+        runtime::SleepDiagnosticEventKind::kPowerPolicy);
+    SetSleepDiagnosticReason(
+        &diagnostic, ready ? "retained-enter" : "retained-exit");
+    runtime::RecordSleepDiagnosticEvent(diagnostic);
+    if (g_power_coordinator_task != nullptr) {
+        xTaskNotifyGive(g_power_coordinator_task);
+    }
+}
+
 void RequestUserPowerOff()
 {
     ESP_LOGI(kTag, "user power-off requested from UI");
@@ -1540,7 +1584,11 @@ static void PowerCoordinatorTask(void*)
         }
         EnterDeepSleepIfEnabled(
             g_deep_sleep_ui_policy.load(std::memory_order_acquire));
-        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000));
+        const TickType_t wait_ticks =
+            g_retained_standby_ui_ready.load(std::memory_order_acquire)
+            ? kRetainedCoordinatorPollTicks
+            : kActiveCoordinatorPollTicks;
+        ulTaskNotifyTake(pdTRUE, wait_ticks);
     }
 }
 
