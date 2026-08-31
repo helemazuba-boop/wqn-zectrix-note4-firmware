@@ -15,6 +15,7 @@
 #include "config.h"
 #include "device_protocol/claim_crypto.h"
 #include "esp_attr.h"
+#include "esp_app_desc.h"
 #include "esp_check.h"
 #include "esp_err.h"
 #include "esp_log.h"
@@ -939,9 +940,9 @@ enum class SyncRoundOutcome : uint8_t {
     kFailed,
 };
 
-// Sticky suspension latch for CLIENT_PROTOCOL_BLOCKED. RAM-resident by
-// design: an OTA reboot re-probes the server once and either clears it or
-// re-arms it with fresh information.
+// Runtime mirror of the durable CLIENT_PROTOCOL_BLOCKED latch. The journal
+// binds it to the running ELF hash so resets stay parked and a different OTA
+// image receives exactly one fresh probe.
 bool g_outbox_protocol_suspended = false;
 
 WordOutboxUploadState g_last_word_outbox_upload_state =
@@ -972,6 +973,19 @@ static_assert(static_cast<uint8_t>(OutboxRetryCause::kNone) == 0);
 static_assert(static_cast<uint8_t>(OutboxRetryCause::kTransport) == 1);
 static_assert(static_cast<uint8_t>(OutboxRetryCause::kServer) == 2);
 static_assert(static_cast<uint8_t>(OutboxRetryCause::kLocalStorage) == 3);
+
+const char* CurrentFirmwareImageId()
+{
+    static char image_id[65] = {};
+    if (image_id[0] == '\0') {
+        const int written = esp_app_get_elf_sha256(image_id, sizeof(image_id));
+        if (written <= 1) {
+            std::snprintf(
+                image_id, sizeof(image_id), "version:%s", WQN_FIRMWARE_VERSION);
+        }
+    }
+    return image_id;
+}
 
 void CopyOutboxRetryCheckpoint(
     wqn::SyncJournalOutboxRetryState* target,
@@ -1027,6 +1041,29 @@ void PersistOutboxRetryCheckpoint()
     taskEXIT_CRITICAL(&g_sync_snapshot_lock);
     if (PersistLatestSyncJournal() != ESP_OK) {
         ESP_LOGW(kTag, "outbox retry journal save failed");
+    }
+}
+
+void SetOutboxProtocolSuspended(bool suspended)
+{
+    const char* const blocked_image_id = suspended ? CurrentFirmwareImageId() : "";
+    const bool journal_changed = std::strcmp(
+        g_sync_journal.protocol_blocked_image_id,
+        blocked_image_id) != 0;
+    const bool runtime_changed = g_outbox_protocol_suspended != suspended;
+    g_outbox_protocol_suspended = suspended;
+    if (!g_sync_journal_loaded || (!journal_changed && !runtime_changed)) {
+        return;
+    }
+    taskENTER_CRITICAL(&g_sync_snapshot_lock);
+    std::snprintf(
+        g_sync_journal.protocol_blocked_image_id,
+        sizeof(g_sync_journal.protocol_blocked_image_id),
+        "%s",
+        blocked_image_id);
+    taskEXIT_CRITICAL(&g_sync_snapshot_lock);
+    if (PersistLatestSyncJournal() != ESP_OK) {
+        ESP_LOGW(kTag, "protocol suspension journal save failed");
     }
 }
 
@@ -1362,13 +1399,13 @@ esp_err_t EnsureSyncJournalLoaded()
         ESP_LOGE(kTag, "sync journal invalid: %s", esp_err_to_name(result));
         return result;
     }
-    bool recovered_interrupted_install = false;
+    bool journal_changed = false;
     const auto recover = [&](wqn::SyncJournalContentState* state) {
         if (state->phase == wqn::SyncJournalPhase::kFetching ||
             state->phase == wqn::SyncJournalPhase::kInstalling) {
             state->phase = wqn::SyncJournalPhase::kPending;
             state->retry_not_before_unix_seconds = 0;
-            recovered_interrupted_install = true;
+            journal_changed = true;
         }
     };
     recover(&g_sync_journal.word_packs);
@@ -1463,9 +1500,25 @@ esp_err_t EnsureSyncJournalLoaded()
         &g_problem_outbox_retry_not_before_ms,
         &g_problem_outbox_retry_attempts,
         &g_problem_outbox_retry_cause);
+    const char* const blocked_image_id =
+        g_sync_journal.protocol_blocked_image_id;
+    const char* const current_image_id = CurrentFirmwareImageId();
+    if (blocked_image_id[0] != '\0' &&
+        std::strcmp(blocked_image_id, current_image_id) == 0) {
+        g_outbox_protocol_suspended = true;
+        ESP_LOGW(
+            kTag,
+            "protocol suspension restored for current firmware image");
+    } else if (blocked_image_id[0] != '\0') {
+        ESP_LOGI(
+            kTag,
+            "clearing protocol suspension after firmware image change");
+        g_sync_journal.protocol_blocked_image_id[0] = '\0';
+        journal_changed = true;
+    }
     g_sync_journal_loaded = true;
-    if (recovered_interrupted_install) {
-        ESP_LOGW(kTag, "interrupted content install recovered as pending");
+    if (journal_changed) {
+        ESP_LOGW(kTag, "sync journal recovered or migrated during startup");
         ESP_RETURN_ON_ERROR(
             PersistLatestSyncJournal(), kTag, "persist recovered sync journal");
     }
@@ -2981,13 +3034,18 @@ TickType_t OutboxWaitDelay()
 
 TickType_t SchedulerWaitDelay()
 {
+    // Protocol suspension parks the whole scheduler: nothing time-based may
+    // wake it. A manual request may explicitly re-probe the same firmware;
+    // boot/content/credential reasons remain parked until an OTA changes the
+    // persisted firmware-version key.
+    if (g_outbox_protocol_suspended) {
+        return (g_full_sync_reasons.load(std::memory_order_acquire) &
+                kFullSyncManual) != 0
+            ? 0
+            : portMAX_DELAY;
+    }
     if (g_full_sync_reasons.load(std::memory_order_acquire) != 0) {
         return 0;
-    }
-    // Protocol suspension parks the whole scheduler: nothing time-based may
-    // wake it. Only a direct task notification (manual sync request) does.
-    if (g_outbox_protocol_suspended) {
-        return portMAX_DELAY;
     }
     const TickType_t retry_delay = FullSyncRetryWaitDelay();
     const TickType_t full_delay = retry_delay != portMAX_DELAY
@@ -3080,17 +3138,15 @@ void SyncServiceTask(void*)
         // outbox requests.
         const uint32_t full_reasons =
             g_full_sync_reasons.exchange(0, std::memory_order_acq_rel);
-        // CLIENT_PROTOCOL_BLOCKED latch: while suspended (and no explicit
-        // manual/boot reason says otherwise), retry/periodic/outbox dispatch
-        // is suppressed entirely -- probing a contract the firmware cannot
-        // satisfy just burns the radio. The flag lives in RAM, so an OTA
-        // reboot naturally re-probes once.
-        bool protocol_suppressed = g_outbox_protocol_suspended;
-        if (protocol_suppressed && full_reasons != 0) {
-            // An explicit user/boot reason overrides the latch once; if the
-            // server still answers 426 the round re-arms it below.
-            protocol_suppressed = false;
-        }
+        // CLIENT_PROTOCOL_BLOCKED is durable for this firmware version.
+        // Automatic boot/content/credential reasons must not bypass it; an
+        // explicit manual request may re-probe once, and an OTA clears the
+        // latch while loading the journal because the version key changes.
+        const bool protocol_suppressed = g_outbox_protocol_suspended &&
+            (full_reasons & kFullSyncManual) == 0;
+        const uint32_t admitted_full_reasons = protocol_suppressed
+            ? 0
+            : full_reasons;
         const bool retry_due = !protocol_suppressed && FullSyncRetryDue();
         const uint32_t interval_minutes =
             g_auto_sync_interval_minutes.load(std::memory_order_acquire);
@@ -3098,7 +3154,7 @@ void SyncServiceTask(void*)
             FullSyncRetryWaitDelay() == portMAX_DELAY &&
             PeriodicScheduleDue(interval_minutes);
         bool full_requested =
-            full_reasons != 0 || retry_due || periodic_due;
+            admitted_full_reasons != 0 || retry_due || periodic_due;
         if (full_requested) {
             ClearFullSyncRetry();
         }
@@ -3121,7 +3177,7 @@ void SyncServiceTask(void*)
             sleep_lease.Reset();
             continue;
         }
-        if ((full_reasons & kFullSyncBoot) != 0) {
+        if ((admitted_full_reasons & kFullSyncBoot) != 0) {
             const std::time_t now = CurrentUnixSeconds();
             if (now >= kMinScheduleUnixTime) {
                 const esp_err_t saved =
@@ -3137,7 +3193,7 @@ void SyncServiceTask(void*)
             kTag,
             "sync dispatch: full=%d reasons=0x%lx periodic=%d retry=%d outbox=%d interval=%u",
             full_requested ? 1 : 0,
-            static_cast<unsigned long>(full_reasons),
+            static_cast<unsigned long>(admitted_full_reasons),
             periodic_due ? 1 : 0,
             retry_due ? 1 : 0,
             word_outbox_requested ? 1 : 0,
@@ -3150,7 +3206,8 @@ void SyncServiceTask(void*)
 #endif
 
         const bool interactive_sync =
-            (full_reasons & (kFullSyncManual | kFullSyncCredentials)) != 0;
+            (admitted_full_reasons &
+             (kFullSyncManual | kFullSyncCredentials)) != 0;
         wqn::services::ConnectivityDemand connectivity_demand =
             wqn::services::AcquireConnectivityDemand(
                 interactive_sync
@@ -3180,10 +3237,10 @@ void SyncServiceTask(void*)
         const bool has_token_after_round = wqn::services::HasUsableStoredToken();
         if (outcome == SyncRoundOutcome::kProtocolBlocked) {
             // CLIENT_PROTOCOL_BLOCKED: latch suspension. No retry ladder,
-            // no periodic re-arm, no outbox self-wake -- only an explicit
-            // manual/boot reason may re-probe the server (and fail the same
-            // way until an OTA lands). Records stay parked in place.
-            g_outbox_protocol_suspended = true;
+            // no periodic re-arm, no outbox self-wake. A manual request may
+            // re-probe explicitly; otherwise records stay parked until the
+            // running firmware image changes.
+            SetOutboxProtocolSuspended(true);
             SetSyncStatus("protocol-blocked");
             PublishSyncEvent(
                 wqn::services::SyncEventStatus::kFailed,
@@ -3193,7 +3250,7 @@ void SyncServiceTask(void*)
                     : wqn::services::SyncEventScope::kFull);
             ClearFullSyncRetry();
         } else if (outcome == SyncRoundOutcome::kSucceeded) {
-            g_outbox_protocol_suspended = false;
+            SetOutboxProtocolSuspended(false);
             SetSyncStatus("success");
             PublishSyncEvent(
                 wqn::services::SyncEventStatus::kSucceeded,
@@ -3203,7 +3260,6 @@ void SyncServiceTask(void*)
                     : wqn::services::SyncEventScope::kFull);
         } else if (outcome == SyncRoundOutcome::kPartial ||
                    outcome == SyncRoundOutcome::kPartialNeedsFullRetry) {
-            g_outbox_protocol_suspended = false;
             SetSyncStatus("partial");
             PublishSyncEvent(
                 wqn::services::SyncEventStatus::kPartial,
@@ -3212,7 +3268,6 @@ void SyncServiceTask(void*)
                     ? wqn::services::SyncEventScope::kWordOutbox
                     : wqn::services::SyncEventScope::kFull);
         } else {
-            g_outbox_protocol_suspended = false;
             SetSyncStatus(has_token_after_round ? "failed" : "waiting-pair");
             PublishSyncEvent(
                 has_token_after_round
@@ -3243,8 +3298,8 @@ void SyncServiceTask(void*)
         if (g_outbox_protocol_suspended &&
             !g_full_sync_reasons.load(std::memory_order_acquire)) {
             // Suppressed: neither the retry deadline nor the outbox flag may
-            // wake the task while protocol-blocked. A manual/boot full-sync
-            // reason still dispatches (checked at the loop head).
+            // wake the task while protocol-blocked. A manual full-sync reason
+            // still dispatches (checked at the loop head).
         } else if (
             g_last_word_outbox_upload_state == WordOutboxUploadState::kYielded ||
             g_last_note_outbox_upload_state == WordOutboxUploadState::kYielded ||

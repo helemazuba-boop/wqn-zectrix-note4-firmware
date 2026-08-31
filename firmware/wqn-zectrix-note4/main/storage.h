@@ -81,6 +81,7 @@ struct SyncJournal {
     SyncJournalOutboxRetryState word_outbox = {};
     SyncJournalOutboxRetryState note_outbox = {};
     SyncJournalOutboxRetryState problem_outbox = {};
+    char protocol_blocked_image_id[65] = {};
 };
 
 esp_err_t InitStorage();

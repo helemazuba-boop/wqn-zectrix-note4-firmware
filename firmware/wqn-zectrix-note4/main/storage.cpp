@@ -830,8 +830,11 @@ esp_err_t ParseSyncJournalPayload(
               root, "note_outbox", &journal->note_outbox) &&
           ReadJournalOutboxRetryState(
               root, "problem_outbox", &journal->problem_outbox)));
+    const std::string blocked_image_id =
+        ReadJournalString(root, "protocol_blocked_image_id");
+    const bool blocked_image_id_valid = blocked_image_id.size() <= 64;
     cJSON_Delete(root);
-    if (!valid) {
+    if (!valid || !blocked_image_id_valid) {
         *journal = {};
         return ESP_ERR_INVALID_STATE;
     }
@@ -840,6 +843,11 @@ esp_err_t ParseSyncJournalPayload(
     journal->schema_version = 2;
     journal->config_revision = config_revision;
     journal->sync_cursor = sync_cursor;
+    std::snprintf(
+        journal->protocol_blocked_image_id,
+        sizeof(journal->protocol_blocked_image_id),
+        "%s",
+        blocked_image_id.c_str());
     return ESP_OK;
 }
 
@@ -1149,6 +1157,10 @@ esp_err_t SaveSyncJournal(const SyncJournal& journal)
     AddJournalOutboxRetryState(root, "word_outbox", journal.word_outbox);
     AddJournalOutboxRetryState(root, "note_outbox", journal.note_outbox);
     AddJournalOutboxRetryState(root, "problem_outbox", journal.problem_outbox);
+    cJSON_AddStringToObject(
+        root,
+        "protocol_blocked_image_id",
+        journal.protocol_blocked_image_id);
     std::string payload;
     const esp_err_t render_result = JsonToString(root, &payload);
     cJSON_Delete(root);
