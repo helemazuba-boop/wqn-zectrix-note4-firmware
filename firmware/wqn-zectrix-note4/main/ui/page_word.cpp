@@ -23,6 +23,8 @@ constexpr int kWordHeaderLineY = 36;
 constexpr int kWordHeaderDividerY = 58;
 constexpr int kWordProgressX = 282;          // right-aligned progress, width 108 to kEpdWidth-kMarginX
 constexpr int kWordProgressWidth = (wqn::kEpdWidth - kMarginX) - kWordProgressX;
+constexpr int kWordActionDividerY = 274;
+constexpr int kWordActionTextY = 280;
 
 // Word home feature cards (the rounded-card language).
 constexpr int kWordCardH = 60;
@@ -58,11 +60,54 @@ constexpr int kWordRecallX = 74;
 constexpr int kWordRecallW = 252;
 constexpr int kWordRecallH = 48;
 
-// Persisting toast pill (rounded, content-only -- not a focus decoration).
-constexpr int kPersistPillX = 122;
-constexpr int kPersistPillW = 156;
-constexpr int kPersistPillH = 24;
-constexpr int kPersistPillR = 5;
+std::string WordActionHint(const wqn::WordAppSnapshot& word)
+{
+    if (word.commit_state == wqn::WordObservationCommitState::kFailed) {
+        return "保存失败 · 确认重试";
+    }
+    if (word.card_phase == wqn::WordCardPhase::kPersisting) {
+        return "正在保存，请稍候";
+    }
+    switch (word.mode) {
+        case wqn::WordAppMode::kHome:
+            return "上下选择 · 确认进入 · 长按确认返回";
+        case wqn::WordAppMode::kSessionStarting:
+            return "长按确认取消";
+        case wqn::WordAppMode::kDictionaryPicker:
+            return word.dictionary_stage == wqn::WordDictionaryStage::kLookupChoice
+                ? "上下选择 · 确认执行 · 长按确认返回"
+                : "上下选字 · 确认输入 · 长按确认删除";
+        case wqn::WordAppMode::kWordCard:
+            if (word.card_phase == wqn::WordCardPhase::kFront) {
+                return "确认看释义 · 下键跳过 · 长按确认暂停";
+            }
+            return "上键不认识 · 确认认识 · 下键跳过";
+    }
+    return "";
+}
+
+esp_err_t DrawWordActionFooter(const wqn::WordAppSnapshot& word)
+{
+    DrawHorizontalLine(kMarginX, kWordActionDividerY, kContentWidth);
+    return DrawCenteredText(
+        kMarginX, kWordActionTextY, kContentWidth, WordActionHint(word));
+}
+
+void DrawWordHeadline(const std::string& text)
+{
+    const lv_font_t* font = wqn::PrimaryUiFont();
+    const int base_width = wqn::MeasureTextWithFont(font, text.c_str());
+    if (base_width <= 0 || base_width > 360) {
+        // Very long or unsupported entries retain the compact fallback so the
+        // headword never runs outside the card surface.
+        (void)DrawCenteredText(20, 80, 360, text);
+        return;
+    }
+    const uint8_t scale = base_width * 2 <= 360 ? 2 : 1;
+    const int y = scale == 2 ? 70 : 80;
+    wqn::DrawTextWithFontScaledCentered(
+        20, y, 360, font, text.c_str(), scale, true);
+}
 
 esp_err_t RenderWordToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
 {
@@ -71,7 +116,11 @@ esp_err_t RenderWordToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
     DrawStatusBar("单词", frame.home);
 
     ESP_RETURN_ON_ERROR(DrawClippedText(kMarginX, kWordHeaderLineY, 250, word.status_line), kTag, "draw word status");
-    ESP_RETURN_ON_ERROR(DrawClippedText(kWordProgressX, kWordHeaderLineY, kWordProgressWidth, word.progress_line), kTag, "draw word progress");
+    const std::string header_progress = word.mode == wqn::WordAppMode::kHome
+        ? "今日 " + std::to_string(word.reviewed_today) + "/" +
+            std::to_string(word.correct_today)
+        : word.progress_line;
+    ESP_RETURN_ON_ERROR(DrawClippedText(kWordProgressX, kWordHeaderLineY, kWordProgressWidth, header_progress), kTag, "draw word progress");
     DrawHorizontalLine(kMarginX, kWordHeaderDividerY, kContentWidth);
 
     auto draw_choice = [](int y, const std::string& title, const std::string& subtitle, bool selected) -> esp_err_t {
@@ -157,6 +206,7 @@ esp_err_t RenderWordToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
                       word.home_selection == wqn::WordHomeSelection::kDictionary),
             kTag,
             "draw dictionary card");
+        ESP_RETURN_ON_ERROR(DrawWordActionFooter(word), kTag, "draw word home actions");
         if (schedule == RefreshSchedule::kSelection || schedule == RefreshSchedule::kConfig) {
             return RefreshStableRegion({0, 64, wqn::kEpdWidth, 220, "word-home"}, schedule);
         }
@@ -182,6 +232,7 @@ esp_err_t RenderWordToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
                                 wqn::WordLookupSelection::kAiLookup),
                 kTag,
                 "draw ai lookup choice");
+            ESP_RETURN_ON_ERROR(DrawWordActionFooter(word), kTag, "draw word lookup actions");
             if (schedule == RefreshSchedule::kSelection ||
                 schedule == RefreshSchedule::kConfig) {
                 return RefreshRegion(
@@ -214,6 +265,7 @@ esp_err_t RenderWordToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
             ESP_RETURN_ON_ERROR(DrawClippedText(42, y, 300, marker + word.dictionary_preview_words[i]), kTag, "draw dictionary preview");
             y += 22;
         }
+        ESP_RETURN_ON_ERROR(DrawWordActionFooter(word), kTag, "draw word dictionary actions");
         if (schedule == RefreshSchedule::kSelection ||
             schedule == RefreshSchedule::kConfig) {
             return RefreshRegion(
@@ -229,16 +281,13 @@ esp_err_t RenderWordToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
             : "词库未同步";
         // [v2] Unified empty-state surface (was bare centered text).
         ESP_RETURN_ON_ERROR(DrawEmptyState(empty_title, word.hint), kTag, "draw word empty state");
+        ESP_RETURN_ON_ERROR(DrawWordActionFooter(word), kTag, "draw word empty actions");
         return RefreshFrame(frame, schedule);
     }
 
-    const std::string position =
-        word.card_count == 0 ? "" : std::to_string(word.card_position) + "/" + std::to_string(std::max<uint16_t>(1, word.card_count));
-    ESP_RETURN_ON_ERROR(DrawCenteredText(20, 68, 360, position), kTag, "draw word position");
-
-    ESP_RETURN_ON_ERROR(DrawCenteredText(20, 94, 360, word.word), kTag, "draw word headword");
+    DrawWordHeadline(word.word);
     if (!word.phonetic.empty()) {
-        ESP_RETURN_ON_ERROR(DrawCenteredText(20, 118, 360, word.phonetic), kTag, "draw word phonetic");
+        ESP_RETURN_ON_ERROR(DrawCenteredText(20, 110, 360, word.phonetic), kTag, "draw word phonetic");
     }
 
     if (word.card_phase == wqn::WordCardPhase::kFront) {
@@ -248,13 +297,7 @@ esp_err_t RenderWordToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
         ESP_RETURN_ON_ERROR(draw_word_back(), kTag, "draw word back");
     }
 
-    if (word.card_phase == wqn::WordCardPhase::kPersisting) {
-        DrawRoundedRect(kPersistPillX, 250, kPersistPillW, kPersistPillH, kPersistPillR);
-        ESP_RETURN_ON_ERROR(
-            DrawCenteredText(kPersistPillX, 256, kPersistPillW, "正在保存"),
-            kTag,
-            "draw word persisting");
-    }
+    ESP_RETURN_ON_ERROR(DrawWordActionFooter(word), kTag, "draw word card actions");
 
     if (schedule == RefreshSchedule::kSelection ||
         schedule == RefreshSchedule::kConfig) {

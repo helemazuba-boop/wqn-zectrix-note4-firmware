@@ -1099,6 +1099,51 @@ void DrawGlyphFromFont(int x, int y, const lv_font_t* font, uint32_t codepoint, 
     }
 }
 
+void DrawGlyphFromFontScaled(
+    int x,
+    int y,
+    const lv_font_t* font,
+    uint32_t codepoint,
+    uint8_t scale,
+    bool black)
+{
+    if (scale <= 1) {
+        DrawGlyphFromFont(x, y, font, codepoint, black);
+        return;
+    }
+    if (font == nullptr) {
+        return;
+    }
+    const lv_font_fmt_txt_dsc_t* font_dsc = font->dsc;
+    const lv_font_fmt_txt_glyph_dsc_t* glyph = FindGlyphInFont(font, codepoint);
+    if (font_dsc == nullptr || glyph == nullptr || glyph->box_w == 0 || glyph->box_h == 0) {
+        return;
+    }
+
+    const uint8_t* bitmap = &font_dsc->glyph_bitmap[glyph->bitmap_index];
+    const int draw_x = x + glyph->ofs_x * scale;
+    const int draw_y = y +
+        ((font->line_height - font->base_line) - glyph->box_h - glyph->ofs_y) * scale;
+    int bit_index = 0;
+    for (int row = 0; row < glyph->box_h; ++row) {
+        for (int col = 0; col < glyph->box_w; ++col, ++bit_index) {
+            const uint8_t byte = bitmap[bit_index >> 3];
+            const uint8_t mask = static_cast<uint8_t>(0x80U >> (bit_index & 0x07));
+            if ((byte & mask) == 0) {
+                continue;
+            }
+            for (uint8_t yy = 0; yy < scale; ++yy) {
+                for (uint8_t xx = 0; xx < scale; ++xx) {
+                    DrawEpdPixel(
+                        draw_x + col * scale + xx,
+                        draw_y + row * scale + yy,
+                        black);
+                }
+            }
+        }
+    }
+}
+
 void DrawCjkGlyph(int x, int y, uint32_t codepoint, bool black)
 {
     DrawGlyphFromFont(x, y, &SourceHanSansSC_Regular_slim, codepoint, black);
@@ -1221,6 +1266,11 @@ esp_err_t DrawUtf8Text(int x, int y, const char* text, bool black)
     return ESP_OK;
 }
 
+const lv_font_t* PrimaryUiFont()
+{
+    return &SourceHanSansSC_Regular_slim;
+}
+
 int MeasureUtf8TextWidth(const char* text)
 {
     if (text == nullptr) {
@@ -1326,6 +1376,45 @@ void DrawTextWithFontCentered(int x, int y, int width, const lv_font_t* font, co
     const int text_width = MeasureTextWithFont(font, text);
     const int draw_x = x + std::max(0, (width - text_width) / 2);
     DrawTextWithFont(draw_x, y, font, text, black);
+}
+
+void DrawTextWithFontScaledCentered(
+    int x,
+    int y,
+    int width,
+    const lv_font_t* font,
+    const char* text,
+    uint8_t scale,
+    bool black)
+{
+    if (font == nullptr || text == nullptr || scale == 0) {
+        return;
+    }
+    const int text_width = MeasureTextWithFont(font, text) * scale;
+    int cursor_x = x + std::max(0, (width - text_width) / 2);
+    int cursor_y = y;
+    const char* cursor = text;
+    while (*cursor != '\0') {
+        uint32_t codepoint = 0;
+        const char* before = cursor;
+        if (!DecodeUtf8(cursor, &codepoint) || cursor == before) {
+            break;
+        }
+        if (codepoint == '\r') {
+            continue;
+        }
+        if (codepoint == '\n') {
+            cursor_y += font->line_height * scale;
+            cursor_x = x;
+            continue;
+        }
+        const int glyph_width = MeasureGlyphWidthInFont(font, codepoint) * scale;
+        if (cursor_x + glyph_width > x + width || cursor_x + glyph_width > kEpdWidth) {
+            break;
+        }
+        DrawGlyphFromFontScaled(cursor_x, cursor_y, font, codepoint, scale, black);
+        cursor_x += glyph_width;
+    }
 }
 
 std::string TruncateUtf8TextToWidth(const std::string& text, int max_width_px)

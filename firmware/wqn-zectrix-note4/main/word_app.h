@@ -157,6 +157,7 @@ struct WordAppSnapshot {
     WordAppMode mode = WordAppMode::kHome;
     WordCardPhase card_phase = WordCardPhase::kFront;
     WordCardSource card_source = WordCardSource::kStudy;
+    WordObservationCommitState commit_state = WordObservationCommitState::kIdle;
     WordDictionaryStage dictionary_stage = WordDictionaryStage::kLetters;
     WordHomeSelection home_selection = WordHomeSelection::kSequential;
     WordLookupSelection lookup_selection = WordLookupSelection::kOnlineSearch;

@@ -161,6 +161,8 @@ struct ProblemAppSnapshot {
 
     size_t verdict_selected = 0;
     ProblemVerdictCommitState commit_state = ProblemVerdictCommitState::kIdle;
+    size_t outbox_pending_count = 0;
+    size_t outbox_suspended_count = 0;
     bool cloud_sync_failed = false;
     std::string status_line;
     std::string hint;

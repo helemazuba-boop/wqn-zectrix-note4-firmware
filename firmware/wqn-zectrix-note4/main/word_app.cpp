@@ -1479,6 +1479,7 @@ WordAppSnapshot BuildWordAppSnapshot(const WordAppState& state)
     snapshot.mode = state.mode;
     snapshot.card_phase = state.card_phase;
     snapshot.card_source = state.card_source;
+    snapshot.commit_state = state.session.commit_state;
     snapshot.dictionary_stage = state.dictionary_stage;
     snapshot.home_selection = state.home_selection;
     snapshot.lookup_selection = state.lookup_selection;
@@ -1602,6 +1603,10 @@ std::string WordAppSignature(const WordAppState& state)
     signature.append(std::to_string(static_cast<int>(state.dictionary_stage)));
     signature.push_back('/');
     signature.append(std::to_string(static_cast<int>(state.home_selection)));
+    signature.push_back('/');
+    signature.append(std::to_string(static_cast<int>(state.lookup_selection)));
+    signature.push_back('/');
+    signature.append(std::to_string(static_cast<int>(state.session.commit_state)));
     signature.push_back('/');
     signature.append(state.sequential_session_resumable ? "1" : "0");
     signature.append(state.random_session_resumable ? "1" : "0");
@@ -1858,6 +1863,16 @@ bool RunWordPageStateSelfTest()
                  "dictionary view does not create progress") ||
         !require(dictionary->mode == WordAppMode::kDictionaryPicker,
                  "dictionary card returns to picker")) {
+        return false;
+    }
+    dictionary->dictionary_stage = WordDictionaryStage::kLookupChoice;
+    dictionary->lookup_selection = WordLookupSelection::kOnlineSearch;
+    const std::string online_signature = WordAppSignature(dictionary.get());
+    if (HandleWordAppInput(&dictionary.get(), WordInput::kDown) != ESP_OK ||
+        !require(dictionary->lookup_selection == WordLookupSelection::kAiLookup,
+                 "lookup choice moves to AI") ||
+        !require(WordAppSignature(dictionary.get()) != online_signature,
+                 "lookup choice invalidates the render signature")) {
         return false;
     }
 

@@ -24,9 +24,10 @@ using wqn::protocol::problem_study_v1::ReviewAction;
 // Visible rows on the problem title list; mirrors page_problem.cpp geometry
 // (same list layout as the note lists).
 constexpr size_t kProblemListVisibleRows = 8;
-// Body/answer faces show 13 wrapped lines (no image entry row: attachments
-// live on their own ring segments); must match page_problem.cpp.
-constexpr uint32_t kProblemFaceVisibleLines = 13;
+// Body/answer faces show 12 wrapped lines; the final row is reserved for the
+// persistent control/status rail. Attachments live on their own ring segments.
+// Must match page_problem.cpp.
+constexpr uint32_t kProblemFaceVisibleLines = 12;
 constexpr uint32_t kProblemFaceScrollStep = 4;
 
 // Edge-triggered viewport (see note_app.cpp UpdateListViewport for the
@@ -1009,6 +1010,8 @@ ProblemAppSnapshot BuildProblemAppSnapshot(const ProblemAppState& state)
     }
     snapshot.verdict_selected = state.verdict_selected;
     snapshot.commit_state = state.commit_state;
+    snapshot.outbox_pending_count = state.outbox.pending_count;
+    snapshot.outbox_suspended_count = state.outbox.suspended_count;
     snapshot.status_line = ProblemAppStatusLine(state);
     switch (state.mode) {
         case ProblemAppMode::kProblemList:
@@ -1048,11 +1051,11 @@ std::string ProblemAppSignature(const ProblemAppState& state)
     // Compact identity for the render layer to detect meaningful frame
     // changes; every navigation/unlock/verdict/image transition must land
     // here or the dedup pipeline freezes the page.
-    char buffer[144] = {};
+    char buffer[160] = {};
     std::snprintf(
         buffer,
         sizeof(buffer),
-        "%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u",
+        "%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u",
         static_cast<unsigned>(state.active ? 1 : 0),
         static_cast<unsigned>(state.mode),
         static_cast<unsigned>(state.list_selected),
@@ -1064,6 +1067,7 @@ std::string ProblemAppSignature(const ProblemAppState& state)
         static_cast<unsigned>(state.commit_state),
         static_cast<unsigned>(state.outbox.pending_count),
         static_cast<unsigned>(state.outbox.suspended_count),
+        static_cast<unsigned>(state.cloud_sync_failed ? 1 : 0),
         static_cast<unsigned>(state.image_error ? 1 : 0),
         static_cast<unsigned>(state.pack_index.sets.size()));
     return std::string(buffer);
@@ -1118,6 +1122,13 @@ bool RunProblemPageStateSelfTest()
     ProblemPageFixture idle;
     if (!idle) return require(false, "allocate idle fixture");
     idle.get().initialized = true;
+    const std::string healthy_signature = ProblemAppSignature(idle.get());
+    idle.get().cloud_sync_failed = true;
+    if (!require(ProblemAppSignature(idle.get()) != healthy_signature,
+                 "sync failure invalidates the render signature")) {
+        return false;
+    }
+    idle.get().cloud_sync_failed = false;
     for (size_t index = 0; index < 100; ++index) {
         const ProblemInput input = (index % 2 == 0) ? ProblemInput::kDown : ProblemInput::kUp;
         if (HandleProblemAppInput(&idle.get(), input) != ESP_OK) return false;

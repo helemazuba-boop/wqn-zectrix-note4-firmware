@@ -37,9 +37,23 @@ int MeasureUtf8TextWidth(const char* text);
 
 // Draw / measure text with an arbitrary LVGL-format font (e.g. font_zectrix_48_1).
 // Iterates UTF-8 codepoints; missing glyphs are skipped (zero width, nothing drawn).
+// PrimaryUiFont exposes the firmware's 16 px text face so a page can opt into
+// real Latin glyphs instead of the compact 5x7 body-text fallback.
+const lv_font_t* PrimaryUiFont();
 void DrawTextWithFont(int x, int y, const lv_font_t* font, const char* text, bool black = true);
 int MeasureTextWithFont(const lv_font_t* font, const char* text);
 void DrawTextWithFontCentered(int x, int y, int width, const lv_font_t* font, const char* text, bool black = true);
+// Nearest-neighbour bitmap scaling is intended for short, static hero labels
+// such as a vocabulary headword. It changes framebuffer composition only; it
+// does not alter the panel refresh policy or waveform.
+void DrawTextWithFontScaledCentered(
+    int x,
+    int y,
+    int width,
+    const lv_font_t* font,
+    const char* text,
+    uint8_t scale,
+    bool black = true);
 std::string TruncateUtf8TextToWidth(const std::string& text, int max_width_px);
 std::vector<std::string> WrapUtf8TextToWidth(const std::string& text, int max_width_px, size_t max_lines);
 

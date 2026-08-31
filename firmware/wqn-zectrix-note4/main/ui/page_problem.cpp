@@ -21,9 +21,12 @@ constexpr char kTag[] = "wqn_problem_page";
 constexpr int kProblemMarginX = kMarginDense;  // [v2] density-page margin (was 8)
 constexpr int kContentW = wqn::kEpdWidth - 2 * kProblemMarginX;
 constexpr int kContentTop = 32;
-// No footer line (device pages keep no bottom status row); the 13-line face
-// budget must stay in sync with kProblemFaceVisibleLines in problem_app.cpp.
-constexpr int kContentBottom = wqn::kEpdHeight - 4;
+// A persistent control/status rail makes the three-button model discoverable
+// and keeps durable-commit failures visible. The 12-line face budget must stay
+// in sync with kProblemFaceVisibleLines in problem_app.cpp.
+constexpr int kContentBottom = 274;
+constexpr int kProblemFooterDividerY = 274;
+constexpr int kProblemFooterTextY = 280;
 constexpr int kListRowH = 30;
 constexpr int kBodyLineH = 20;
 
@@ -65,7 +68,7 @@ esp_err_t DrawListRow(int y, const std::string& primary, const std::string& trai
 esp_err_t RenderProblemList(const wqn::ProblemAppSnapshot& problem)
 {
     if (problem.rows.empty()) {
-        return DrawCenteredText(kProblemMarginX, 160, kContentW, "该错题本暂无题目");
+        return DrawEmptyState("暂无错题", "该错题本还没有题目");
     }
     const size_t visible = static_cast<size_t>(VisibleListRows());
     const size_t start = ClampListWindowStart(
@@ -82,6 +85,34 @@ esp_err_t RenderProblemList(const wqn::ProblemAppSnapshot& problem)
             kTag, "draw problem title row");
     }
     return ESP_OK;
+}
+
+std::string ProblemFooterText(const wqn::ProblemAppSnapshot& problem)
+{
+    if (problem.commit_state == wqn::ProblemVerdictCommitState::kPersisting) {
+        return problem.status_line.empty() ? "正在保存，请稍候" : problem.status_line;
+    }
+    if (problem.commit_state == wqn::ProblemVerdictCommitState::kFailed) {
+        return "保存失败 · 确认重新自评";
+    }
+    if (problem.outbox_suspended_count > 0) {
+        return "同步挂起 " + std::to_string(problem.outbox_suspended_count) +
+            " 条 · 可继续离线复习";
+    }
+    if (problem.cloud_sync_failed) {
+        return "同步异常 · 可继续离线复习";
+    }
+    return problem.hint;
+}
+
+esp_err_t DrawProblemFooter(const wqn::ProblemAppSnapshot& problem)
+{
+    DrawHorizontalLine(kProblemMarginX, kProblemFooterDividerY, kContentW);
+    return DrawCenteredText(
+        kProblemMarginX,
+        kProblemFooterTextY,
+        kContentW,
+        ProblemFooterText(problem));
 }
 
 // Wrapped scroll viewport shared by the 题面 and 答案面. The Markdown rows are
@@ -236,7 +267,8 @@ esp_err_t RenderProblemBrowseToEpd(const wqn::UiFrame& frame, RefreshSchedule sc
 
     wqn::ClearEpdFramebuffer(true);
 
-    // Status-bar title: problem title > set name > 错题.
+    // Status-bar title: include the current face so unlocking the answer is a
+    // visible semantic transition instead of an unexplained body-text swap.
     std::string bar_title = "错题";
     if (!problem.set_name.empty()) {
         bar_title = problem.set_name;
@@ -244,7 +276,25 @@ esp_err_t RenderProblemBrowseToEpd(const wqn::UiFrame& frame, RefreshSchedule sc
     if ((problem.mode == wqn::ProblemAppMode::kProblemView ||
          problem.mode == wqn::ProblemAppMode::kVerdict) &&
         !problem.problem_title.empty()) {
-        bar_title = problem.problem_title;
+        if (problem.mode == wqn::ProblemAppMode::kVerdict) {
+            bar_title = "自评 · ";
+        } else {
+            switch (problem.face) {
+                case wqn::ProblemFace::kProblemImage:
+                    bar_title = "题图 · ";
+                    break;
+                case wqn::ProblemFace::kBody:
+                    bar_title = "题面 · ";
+                    break;
+                case wqn::ProblemFace::kAnswer:
+                    bar_title = "答案 · ";
+                    break;
+                case wqn::ProblemFace::kSolutionImage:
+                    bar_title = "答案图 · ";
+                    break;
+            }
+        }
+        bar_title += problem.problem_title;
         if (problem.total > 0) {
             bar_title += " " + std::to_string(problem.position) + "/" +
                 std::to_string(problem.total);
@@ -275,6 +325,8 @@ esp_err_t RenderProblemBrowseToEpd(const wqn::UiFrame& frame, RefreshSchedule sc
             ESP_RETURN_ON_ERROR(RenderVerdictDialog(problem), kTag, "render verdict dialog");
             break;
     }
+
+    ESP_RETURN_ON_ERROR(DrawProblemFooter(problem), kTag, "render problem footer");
 
     return RefreshFrame(frame, schedule);
 }

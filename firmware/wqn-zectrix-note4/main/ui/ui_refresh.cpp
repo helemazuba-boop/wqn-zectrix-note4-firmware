@@ -7,6 +7,7 @@
 #include <array>
 #include <atomic>
 #include <cstdio>
+#include <functional>
 #include <string>
 
 #include "display_service.h"
@@ -528,9 +529,13 @@ std::string FrameSignature(const wqn::UiFrame& frame)
         signature.push_back('/');
         signature.append(std::to_string(static_cast<int>(frame.word_app.card_source)));
         signature.push_back('/');
+        signature.append(std::to_string(static_cast<int>(frame.word_app.commit_state)));
+        signature.push_back('/');
         signature.append(std::to_string(static_cast<int>(frame.word_app.dictionary_stage)));
         signature.push_back('/');
         signature.append(std::to_string(static_cast<int>(frame.word_app.home_selection)));
+        signature.push_back('/');
+        signature.append(std::to_string(static_cast<int>(frame.word_app.lookup_selection)));
         signature.push_back('/');
         signature.append(
             frame.word_app.sequential_session_resumable ? "1" : "0");
@@ -543,9 +548,29 @@ std::string FrameSignature(const wqn::UiFrame& frame)
         signature.push_back('/');
         signature.append(std::to_string(frame.word_app.reviewed_today));
         signature.push_back('/');
+        signature.append(std::to_string(frame.word_app.correct_today));
+        signature.push_back('/');
+        signature.append(std::to_string(frame.word_app.total_count));
+        signature.push_back('/');
+        signature.append(frame.word_app.pack_ready ? "1" : "0");
+        signature.push_back('/');
+        signature.append(frame.word_app.has_card ? "1" : "0");
+        signature.push_back('/');
         signature.append(frame.word_app.word);
         signature.push_back('/');
+        signature.append(frame.word_app.phonetic);
+        signature.push_back('/');
         signature.append(frame.word_app.meaning);
+        signature.push_back('/');
+        signature.append(frame.word_app.example);
+        signature.push_back('/');
+        signature.append(frame.word_app.example_translation);
+        signature.push_back('/');
+        signature.append(frame.word_app.part_of_speech);
+        signature.push_back('/');
+        signature.append(frame.word_app.status_line);
+        signature.push_back('/');
+        signature.append(frame.word_app.progress_line);
         signature.push_back('/');
         signature.append(frame.word_app.dictionary_prefix);
         signature.push_back('/');
@@ -554,6 +579,13 @@ std::string FrameSignature(const wqn::UiFrame& frame)
         signature.append(std::to_string(frame.word_app.dictionary_match_selected));
         signature.push_back('/');
         signature.append(frame.word_app.hint);
+        for (const char letter : frame.word_app.dictionary_letters) {
+            signature.push_back(letter);
+        }
+        for (const std::string& preview : frame.word_app.dictionary_preview_words) {
+            signature.push_back('|');
+            signature.append(preview);
+        }
     }
     if (frame.screen == wqn::UiScreen::kNote) {
         // The note page renders entirely from frame.note_app (RenderNote adds no
@@ -635,6 +667,8 @@ std::string FrameSignature(const wqn::UiFrame& frame)
             signature.push_back('/');
             signature.append(std::to_string(static_cast<int>(problem.mode)));
             signature.push_back('/');
+            signature.append(problem.set_name);
+            signature.push_back('/');
             signature.append(std::to_string(problem.list_selected));
             signature.push_back('/');
             signature.append(std::to_string(problem.list_window_start));
@@ -651,7 +685,19 @@ std::string FrameSignature(const wqn::UiFrame& frame)
             signature.push_back('/');
             signature.append(std::to_string(static_cast<int>(problem.commit_state)));
             signature.push_back('/');
+            signature.append(std::to_string(problem.outbox_pending_count));
+            signature.push_back(':');
+            signature.append(std::to_string(problem.outbox_suspended_count));
+            signature.push_back('/');
+            signature.append(problem.cloud_sync_failed ? "1" : "0");
+            signature.push_back('/');
             signature.append(problem.problem_id);
+            signature.push_back('/');
+            signature.append(problem.problem_title);
+            signature.push_back('/');
+            signature.append(std::to_string(std::hash<std::string>{}(problem.body_text)));
+            signature.push_back(':');
+            signature.append(std::to_string(std::hash<std::string>{}(problem.answer_text)));
             signature.push_back('/');
             signature.append(std::to_string(problem.position));
             signature.push_back(':');
@@ -659,11 +705,19 @@ std::string FrameSignature(const wqn::UiFrame& frame)
             signature.push_back('/');
             signature.append(std::to_string(problem.image_ordinal));
             signature.push_back(':');
+            signature.append(std::to_string(problem.image_count));
+            signature.push_back(':');
+            signature.append(problem.image_is_solution ? "1" : "0");
+            signature.push_back(':');
             signature.append(problem.image_ready ? "1" : "0");
             signature.push_back(':');
             signature.append(problem.image_error ? "1" : "0");
             signature.push_back(':');
             signature.append(problem.image_id);
+            signature.push_back('/');
+            signature.append(problem.status_line);
+            signature.push_back('/');
+            signature.append(problem.hint);
             for (const wqn::ProblemListRow& row : problem.rows) {
                 signature.push_back('|');
                 signature.append(row.title);
