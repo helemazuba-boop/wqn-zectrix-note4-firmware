@@ -593,9 +593,9 @@ void DropEpdHotState(bool cut_rail, bool invalidate_framebuffer)
         g_partial_refreshes_since_full = 0;
         g_heavy_partials_since_full = 0;
         g_last_partial_was_full_frame = false;
+        g_last_epd_refresh_us = 0;
     }
     g_hot_refresh_ok = false;
-    g_last_epd_refresh_us = 0;
 }
 
 esp_err_t InitPanelSequence()
