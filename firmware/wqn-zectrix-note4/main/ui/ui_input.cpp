@@ -6,10 +6,12 @@
 #include "persist_worker.h"
 
 #include <string>
+#include <utility>
 
 #include "ai_session.h"
 #include "esp_log.h"
 #include "flash_session.h"
+#include "opencode_session.h"
 #include "power_manager.h"
 #include "services/connectivity_service.h"
 #include "services/sync_service.h"
@@ -534,18 +536,70 @@ RefreshSchedule ApplyButtonEvent(
     const wqn::AiTier old_ai_tier = state->ai.tier;
 
     // [PTT-Filter-Fix] Filter out raw kPress/kRelease edge events for all UI
-    // components except the Confirm button on the AI page when the Flash
-    // voice tier is active. This prevents double-firing / double-paging bugs.
+    // components except Confirm when it owns a PTT gesture. This prevents
+    // double-firing / double-paging bugs while retaining low-latency audio.
     const bool is_flash_ptt =
         state->screen == wqn::UiScreen::kAi &&
         event.button == wqn::ButtonId::kConfirm &&
         state->ai.tier == wqn::AiTier::kFlash;
+    const bool is_agent_ptt =
+        state->screen == wqn::UiScreen::kOpenCode &&
+        event.button == wqn::ButtonId::kConfirm;
 
     if ((event.type == wqn::ButtonEventType::kPress ||
          event.type == wqn::ButtonEventType::kRelease ||
          event.type == wqn::ButtonEventType::kHoldPress) &&
-        !is_flash_ptt) {
+        !is_flash_ptt && !is_agent_ptt) {
         return RefreshSchedule::kNone;
+    }
+
+    // Agent PTT is intentionally a two-step operation. Releasing this gesture
+    // can only stop capture and start transcription; it cannot submit a prompt.
+    // The resulting kAwaitingConfirmation state requires a separate Up press.
+    if (is_agent_ptt &&
+        (event.type == wqn::ButtonEventType::kPress ||
+         event.type == wqn::ButtonEventType::kRelease ||
+         event.type == wqn::ButtonEventType::kHoldPress)) {
+        if (event.type == wqn::ButtonEventType::kPress) {
+            state->gestures.agent_ptt_started = false;
+            return RefreshSchedule::kNone;
+        }
+        if (event.type == wqn::ButtonEventType::kHoldPress) {
+            if (wqn::StartOpenCodeVoiceInput() == ESP_OK) {
+                state->gestures.agent_ptt_started = true;
+                wqn::AgentSessionState snapshot;
+                if (wqn::CopyOpenCodeSessionToUi(&snapshot)) {
+                    state->agent = std::move(snapshot);
+                }
+                return RefreshSchedule::kAi;
+            }
+            return RefreshSchedule::kNone;
+        }
+        if (state->gestures.agent_ptt_started) {
+            state->gestures.agent_ptt_started = false;
+            const esp_err_t result = wqn::StopOpenCodeVoiceInput();
+            wqn::AgentSessionState snapshot;
+            if (wqn::CopyOpenCodeSessionToUi(&snapshot)) {
+                state->agent = std::move(snapshot);
+            }
+            if (result != ESP_OK) {
+                ESP_LOGW(kTag, "Agent recording stop failed: %s", esp_err_to_name(result));
+            }
+            return RefreshSchedule::kAi;
+        }
+        return RefreshSchedule::kNone;
+    }
+
+    // button_input emits a derived click/long-release around the same physical
+    // hold. Swallow it so one PTT gesture cannot also lock/send/navigate.
+    if (state->screen == wqn::UiScreen::kOpenCode &&
+        event.button == wqn::ButtonId::kConfirm &&
+        state->gestures.agent_ptt_started &&
+        (event.type == wqn::ButtonEventType::kShortPress ||
+         event.type == wqn::ButtonEventType::kDoublePress ||
+         event.type == wqn::ButtonEventType::kLongPress ||
+         event.type == wqn::ButtonEventType::kLongRelease)) {
+        return RefreshSchedule::kAi;
     }
 
 #if CONFIG_WQN_AI_ENABLE
@@ -680,6 +734,69 @@ RefreshSchedule ApplyButtonEvent(
 
     if (repeated_long_press && !time_value_edit_repeat && !time_running_exit) {
         return RefreshSchedule::kNone;
+    }
+
+    if (state->screen == wqn::UiScreen::kOpenCode) {
+        const bool short_press = event.type == wqn::ButtonEventType::kShortPress;
+        if (event.button == wqn::ButtonId::kConfirm &&
+            (long_press || long_release)) {
+            // PTT is handled by raw Hold/Release above. Never route its derived
+            // long event to the generic "back to home" action.
+            return RefreshSchedule::kAi;
+        }
+        if (short_press && !state->agent.session_locked &&
+            (event.button == wqn::ButtonId::kUp ||
+             event.button == wqn::ButtonId::kDownPower)) {
+            const int direction = event.button == wqn::ButtonId::kUp ? -1 : 1;
+            (void)wqn::MoveOpenCodeSessionSelection(direction);
+            wqn::AgentSessionState snapshot;
+            if (wqn::CopyOpenCodeSessionToUi(&snapshot)) {
+                state->agent = std::move(snapshot);
+            }
+            return RefreshSchedule::kAi;
+        }
+        if (short_press && !state->agent.session_locked &&
+            event.button == wqn::ButtonId::kConfirm) {
+            (void)wqn::LockSelectedOpenCodeSession();
+            wqn::AgentSessionState snapshot;
+            if (wqn::CopyOpenCodeSessionToUi(&snapshot)) {
+                state->agent = std::move(snapshot);
+            }
+            return RefreshSchedule::kAi;
+        }
+        if (short_press && state->agent.ui.phase == wqn::AiFeaturePhase::kAwaitingConfirmation &&
+            (event.button == wqn::ButtonId::kUp ||
+             event.button == wqn::ButtonId::kDownPower)) {
+            if (event.button == wqn::ButtonId::kUp) {
+                (void)wqn::ConfirmOpenCodePrompt(event_time_ms);
+            } else {
+                wqn::CancelOpenCodePrompt();
+            }
+            wqn::AgentSessionState snapshot;
+            if (wqn::CopyOpenCodeSessionToUi(&snapshot)) {
+                state->agent = std::move(snapshot);
+            }
+            return RefreshSchedule::kAi;
+        }
+        if (short_press && state->agent.session_locked &&
+            (event.button == wqn::ButtonId::kUp ||
+             event.button == wqn::ButtonId::kDownPower)) {
+            if (!wqn::AiFeaturePhaseIsBusy(state->agent.ui.phase) ||
+                state->agent.ui.phase == wqn::AiFeaturePhase::kRunning) {
+                wqn::ScrollOpenCodeResponse(
+                    event.button == wqn::ButtonId::kUp ? 1 : -1);
+                wqn::AgentSessionState snapshot;
+                if (wqn::CopyOpenCodeSessionToUi(&snapshot)) {
+                    state->agent = std::move(snapshot);
+                }
+                return RefreshSchedule::kAi;
+            }
+            return RefreshSchedule::kNone;
+        }
+        if (short_press && event.button == wqn::ButtonId::kConfirm) {
+            // A short Confirm is deliberately never an Agent send action.
+            return RefreshSchedule::kNone;
+        }
     }
     if (long_release && event.button == wqn::ButtonId::kConfirm && state->screen == wqn::UiScreen::kAi) {
 #if CONFIG_WQN_AI_ENABLE
@@ -873,8 +990,16 @@ RefreshSchedule ApplyButtonEvent(
             wqn::DisarmTimeAppAction(&state->time_app);
         }
         state->gestures.flash_ptt_started = false;
+        state->gestures.agent_ptt_started = false;
         state->gestures.last_ai_confirm_tap_ms = 0;
-        if (state->screen == wqn::UiScreen::kTodo) {
+        if (state->screen == wqn::UiScreen::kOpenCode &&
+            !state->agent.session_locked && state->agent.sessions.empty()) {
+            (void)wqn::RequestOpenCodeSessionList();
+            wqn::AgentSessionState snapshot;
+            if (wqn::CopyOpenCodeSessionToUi(&snapshot)) {
+                state->agent = std::move(snapshot);
+            }
+        } else if (state->screen == wqn::UiScreen::kTodo) {
             RefreshTodosFromCloud(state);
         } else if (state->screen == wqn::UiScreen::kWord && state->word_app.cloud_sync_requested) {
             wqn::services::RequestContentRefresh(

@@ -32,6 +32,7 @@ enum class AppEventKind : uint8_t {
     kAiStreamingSnapshot,
     kAiSessionSnapshot,
     kFlashSnapshot,
+    kAgentSnapshot,
     kClockMinute,
     kStatusEditTimeout,
     kStatusReload,
@@ -76,6 +77,7 @@ public:
     UiUpdate DispatchAiStreamingSnapshot(const wqn::AiStreamingStatusView& view);
     UiUpdate DispatchAiSessionSnapshot(const wqn::AiSessionState& snapshot);
     UiUpdate DispatchFlashSnapshot(const wqn::FlashUiState& snapshot);
+    UiUpdate DispatchAgentSnapshot(const wqn::AgentSessionState& snapshot);
     UiUpdate DispatchClockMinute(bool panel_needs_refresh);
     UiUpdate DispatchStatusEditTimeout(int64_t now_ms);
     UiUpdate DispatchStatusReload(wqn::AppState&& snapshot);

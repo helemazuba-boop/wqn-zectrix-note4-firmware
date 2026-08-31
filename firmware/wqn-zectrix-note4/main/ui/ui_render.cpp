@@ -92,6 +92,9 @@ esp_err_t RenderFrameToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
     if (frame.screen == wqn::UiScreen::kAi) {
         return RenderAiToEpd(frame, schedule);
     }
+    if (frame.screen == wqn::UiScreen::kOpenCode) {
+        return RenderAgentToEpd(frame, schedule);
+    }
     if (frame.screen == wqn::UiScreen::kTodo) {
         return RenderTodoToEpd(frame, schedule);
     }

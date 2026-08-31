@@ -1266,7 +1266,7 @@ namespace wqn {
 
 esp_err_t InitAiSession()
 {
-    wqn::SetAudioCaptureTap(&AudioCaptureTapHandler, nullptr);
+    SetAiAudioCaptureTapEnabled(true);
     const esp_err_t capture_buffer_result = InitAudioCaptureBuffer();
     if (capture_buffer_result != ESP_OK) {
         // Keep the rest of the device bootable. StartAudioCapture retries and
@@ -1285,6 +1285,11 @@ esp_err_t InitAiSession()
     LoadTodaySessionLocked();
     xSemaphoreGive(g_lock);
     return ESP_OK;
+}
+
+void SetAiAudioCaptureTapEnabled(bool enabled)
+{
+    wqn::SetAudioCaptureTap(enabled ? &AudioCaptureTapHandler : nullptr, nullptr);
 }
 
 esp_err_t StartAiRecordingSession()
@@ -1729,6 +1734,8 @@ esp_err_t InitAiSession()
 {
     return ESP_OK;
 }
+
+void SetAiAudioCaptureTapEnabled(bool) {}
 
 esp_err_t StartAiRecordingSession()
 {

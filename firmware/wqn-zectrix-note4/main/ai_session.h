@@ -9,6 +9,10 @@
 namespace wqn {
 
 esp_err_t InitAiSession();
+// The shared capture service normally mirrors PCM into the legacy Std/Pro
+// WebSocket transport. Independent AI features must suspend that tap while
+// they own the microphone so their audio cannot leak into another backend.
+void SetAiAudioCaptureTapEnabled(bool enabled);
 esp_err_t StartAiRecordingSession();
 esp_err_t StopAiRecordingAndSubmit();
 // Clear STD/PRO conversation context (AiHistory + conversation_id + display

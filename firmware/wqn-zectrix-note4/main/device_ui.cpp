@@ -19,6 +19,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "flash_session.h"
+#include "opencode_session.h"
 #include "power_manager.h"
 #include "runtime/sleep_coordinator.h"
 #include "runtime/wake_context.h"
@@ -100,6 +101,7 @@ wqn::DeepSleepUiPolicy DeepSleepPolicyForUiState(const wqn::AppState& state)
         case wqn::UiScreen::kHome:
         case wqn::UiScreen::kTime:
         case wqn::UiScreen::kAi:
+        case wqn::UiScreen::kOpenCode:
         case wqn::UiScreen::kTodo:
         case wqn::UiScreen::kSettings:
         case wqn::UiScreen::kWord:
@@ -1069,6 +1071,13 @@ wqn::AiStreamingStatusView streaming_view{};
         }
 #endif
 
+        wqn::AgentSessionState agent_snapshot;
+        if (wqn::CopyOpenCodeSessionToUi(&agent_snapshot)) {
+            const device_ui_internal::UiUpdate update =
+                ui_runtime.DispatchAgentSnapshot(agent_snapshot);
+            refresh_schedule = StrongerSchedule(refresh_schedule, update.refresh);
+        }
+
         const std::string clock_label = CurrentClockLabel();
         if (clock_label != last_clock_label) {
             last_clock_label = clock_label;
@@ -1225,9 +1234,20 @@ wqn::AiStreamingStatusView streaming_view{};
                     } else {
                         last_flash_render_ms = now_ms_d;
                     }
+                } else if (state.screen == wqn::UiScreen::kOpenCode &&
+                           state.agent.stream_active) {
+                    // Agent events can arrive at token/tool cadence. A 500 ms
+                    // sampling floor keeps EPD partial refreshes bounded.
+                    static int64_t last_agent_render_ms = 0;
+                    const int64_t now_ms_d = esp_timer_get_time() / 1000;
+                    if (now_ms_d - last_agent_render_ms < 500) {
+                        skip_for_throttle = true;
+                    } else {
+                        last_agent_render_ms = now_ms_d;
+                    }
                 }
                 if (skip_for_throttle) {
-                    ESP_LOGI(kTag, "Flash refresh throttled (coalescing streaming deltas)");
+                    ESP_LOGI(kTag, "stream refresh throttled (coalescing deltas)");
                     pending_refresh_schedule = StrongerSchedule(
                         pending_refresh_schedule, refresh_schedule);
                     display_tracking.force_next_submission = force_submission;
@@ -1343,6 +1363,7 @@ wqn::AiStreamingStatusView streaming_view{};
         const int64_t idle_ms = (esp_timer_get_time() - g_last_active_us_local) / 1000;
         const bool screen_active = (state.screen == wqn::UiScreen::kTime ||
                                     state.screen == wqn::UiScreen::kAi ||
+                                    state.screen == wqn::UiScreen::kOpenCode ||
                                     state.screen == wqn::UiScreen::kWord);
         const bool todo_convergence_due =
             todo_desired_revision > todo_applied_revision &&

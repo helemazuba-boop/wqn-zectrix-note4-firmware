@@ -1,6 +1,7 @@
 idf_component_register(
     SRCS
         "main.cpp"
+        "ai_feature.cpp"
         "ai_history.cpp"
         "ai_session.cpp"
         "audio_capture.cpp"
@@ -34,6 +35,7 @@ idf_component_register(
         "ui/markdown_layout.cpp"
         "ui/markdown_render.cpp"
         "ui/page_ai.cpp"
+        "ui/page_agent.cpp"
         "ui/page_home.cpp"
         "ui/page_settings.cpp"
         "ui/page_time.cpp"
@@ -60,6 +62,8 @@ idf_component_register(
         "note_cloud.cpp"
         "note_store.cpp"
         "note_app.cpp"
+        "opencode_client.cpp"
+        "opencode_session.cpp"
         "problem_pack.cpp"
         "problem_cloud.cpp"
         "problem_store.cpp"

@@ -8,6 +8,7 @@
 
 #include "ai_history.h"
 #include "note_app.h"
+#include "opencode_model.h"
 #include "problem_app.h"
 #include "storage.h"
 #include "time_app.h"
@@ -28,6 +29,7 @@ enum class UiScreen : uint8_t {
     kWord = 5,
     kNote = 6,
     kProvisioning = 13,
+    kOpenCode = 14,
 };
 
 enum class UiInput {
@@ -298,6 +300,7 @@ struct StatusBarEditState {
 // timestamped input sequence starts from and produces the same state.
 struct UiGestureState {
     bool flash_ptt_started = false;
+    bool agent_ptt_started = false;
     int64_t last_ai_confirm_tap_ms = 0;
 };
 
@@ -314,6 +317,7 @@ struct AppState {
     size_t selected_home_task = 0;
     UiRuntimeStatus status;
     AiSessionState ai;
+    AgentSessionState agent;
     TimeAppState time_app;
     WordAppState word_app;
     NoteAppState note_app;
@@ -339,6 +343,7 @@ struct UiFrame {
     StatusBarEditState status_edit;  // [shell] status-bar edit mode for render
     HomeSummary home;
     AiSessionState ai;
+    AgentSessionState agent;
     std::shared_ptr<const AiHistorySnapshot> ai_history;
     uint64_t ai_history_revision = 0;
     TodoUiState todo;

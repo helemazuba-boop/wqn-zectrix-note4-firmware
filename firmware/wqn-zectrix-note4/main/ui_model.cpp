@@ -127,6 +127,8 @@ const char* ScreenName(wqn::UiScreen screen)
             return "笔记";
         case wqn::UiScreen::kProvisioning:
             return "配网";
+        case wqn::UiScreen::kOpenCode:
+            return "Agent";
     }
     return "WQN";
 }
@@ -137,7 +139,7 @@ wqn::UiScreen PreviousTopScreen(wqn::UiScreen screen)
         case wqn::UiScreen::kAi:
             return wqn::UiScreen::kTodo;
         case wqn::UiScreen::kSettings:
-            return wqn::UiScreen::kAi;
+            return wqn::UiScreen::kOpenCode;
         case wqn::UiScreen::kHome:
             return wqn::UiScreen::kSettings;
         case wqn::UiScreen::kTime:
@@ -148,6 +150,8 @@ wqn::UiScreen PreviousTopScreen(wqn::UiScreen screen)
             return wqn::UiScreen::kWord;
         case wqn::UiScreen::kTodo:
             return wqn::UiScreen::kNote;
+        case wqn::UiScreen::kOpenCode:
+            return wqn::UiScreen::kAi;
         case wqn::UiScreen::kProvisioning:
             return wqn::UiScreen::kHome;
     }
@@ -158,6 +162,8 @@ wqn::UiScreen NextTopScreen(wqn::UiScreen screen)
 {
     switch (screen) {
         case wqn::UiScreen::kAi:
+            return wqn::UiScreen::kOpenCode;
+        case wqn::UiScreen::kOpenCode:
             return wqn::UiScreen::kSettings;
         case wqn::UiScreen::kSettings:
             return wqn::UiScreen::kHome;
@@ -676,6 +682,7 @@ UiFrame RenderUiFrame(const UiState& state)
     frame.claim_code = state.status.claim_code;
     frame.home = state.home;
     frame.ai = state.ai;
+    frame.agent = state.agent;
     if (state.screen == UiScreen::kAi) {
         const AiHistoryChannel channel = state.ai.tier == AiTier::kFlash
             ? AiHistoryChannel::kFlash
@@ -724,6 +731,8 @@ UiFrame RenderUiFrame(const UiState& state)
             break;
         case UiScreen::kProvisioning:
             // Handled by the provisioning early-return above; unreachable here.
+            break;
+        case UiScreen::kOpenCode:
             break;
     }
 

@@ -634,6 +634,7 @@ esp_err_t RenderTimeToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule);
 // ---- AI page ----------------------------------------------------------------
 
 esp_err_t RenderAiToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule);
+esp_err_t RenderAgentToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule);
 const char* AiStatusLabel(wqn::AiSessionStatus status);
 void GetAiScrollBounds(
     std::shared_ptr<const wqn::AiHistorySnapshot> snapshot,

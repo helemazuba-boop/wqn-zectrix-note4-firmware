@@ -134,6 +134,7 @@ bool LoadUiState(wqn::UiState* state, bool restore_screen_from_rtc)
                 case wqn::UiScreen::kNote:
                     return true;
                 case wqn::UiScreen::kAi:
+                case wqn::UiScreen::kOpenCode:
                 case wqn::UiScreen::kProvisioning:
                     return false;
             }

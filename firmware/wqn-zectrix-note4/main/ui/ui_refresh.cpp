@@ -329,6 +329,7 @@ std::string FrameSignature(const wqn::UiFrame& frame)
     // the shared loop at the end of this function already covers.
     switch (frame.screen) {
         case wqn::UiScreen::kAi:
+        case wqn::UiScreen::kOpenCode:
         case wqn::UiScreen::kTodo:
         case wqn::UiScreen::kSettings:
         case wqn::UiScreen::kHome:
@@ -492,6 +493,39 @@ std::string FrameSignature(const wqn::UiFrame& frame)
         signature.append(frame.ai.expand_content ? "1" : "0");
         signature.push_back('/');
         signature.append(std::to_string(frame.ai_history_revision));
+    }
+    if (frame.screen == wqn::UiScreen::kOpenCode) {
+        const wqn::AgentSessionState& agent = frame.agent;
+        signature.append("|agent:");
+        signature.append(std::to_string(static_cast<int>(agent.ui.phase)));
+        signature.push_back('/');
+        signature.append(agent.ui.status_label);
+        signature.push_back('/');
+        signature.append(agent.ui.prompt_text);
+        signature.push_back('/');
+        signature.append(agent.ui.response_text);
+        signature.push_back('/');
+        signature.append(agent.ui.activity_text);
+        signature.push_back('/');
+        signature.append(agent.ui.action_hint);
+        signature.push_back('/');
+        signature.append(std::to_string(agent.ui.scroll_offset_lines));
+        signature.push_back('/');
+        signature.append(agent.ui.requires_confirmation ? "1" : "0");
+        signature.push_back('/');
+        signature.append(std::to_string(agent.confirmation_armed_at_ms));
+        signature.push_back('/');
+        signature.append(agent.session_locked ? "1" : "0");
+        signature.push_back('/');
+        signature.append(std::to_string(agent.selected_session));
+        signature.push_back('/');
+        signature.append(agent.current_session_id);
+        for (const wqn::AgentSessionOption& session : agent.sessions) {
+            signature.push_back('/');
+            signature.append(session.id);
+            signature.push_back(':');
+            signature.append(session.title);
+        }
     }
     if (frame.screen == wqn::UiScreen::kTodo) {
         signature.append("|todo:");

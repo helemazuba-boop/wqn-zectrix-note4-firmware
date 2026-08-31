@@ -40,6 +40,8 @@ const char* AppEventKindName(AppEventKind event)
             return "ai-session";
         case AppEventKind::kFlashSnapshot:
             return "flash";
+        case AppEventKind::kAgentSnapshot:
+            return "agent";
         case AppEventKind::kClockMinute:
             return "clock-minute";
         case AppEventKind::kStatusEditTimeout:
@@ -762,6 +764,28 @@ UiUpdate UiRuntime::DispatchFlashSnapshot(const wqn::FlashUiState& flash)
         state_.screen == wqn::UiScreen::kAi
             ? RefreshSchedule::kAi
             : RefreshSchedule::kNone,
+        true);
+}
+
+UiUpdate UiRuntime::DispatchAgentSnapshot(const wqn::AgentSessionState& snapshot)
+{
+    const wqn::AiFeaturePhase previous_phase = state_.agent.ui.phase;
+    state_.agent = snapshot;
+    // Keep the logical state current while the codec is being initialized,
+    // but avoid overlapping that hardware transaction with an EPD refresh.
+    const bool defer_refresh_for_audio_init =
+        snapshot.ui.phase == wqn::AiFeaturePhase::kLoading &&
+        snapshot.ui.status_label == "准备录音";
+    RefreshSchedule refresh = RefreshSchedule::kNone;
+    if (state_.screen == wqn::UiScreen::kOpenCode && !defer_refresh_for_audio_init) {
+        refresh = snapshot.ui.phase == wqn::AiFeaturePhase::kComplete &&
+                previous_phase != wqn::AiFeaturePhase::kComplete
+            ? RefreshSchedule::kCommit
+            : RefreshSchedule::kAi;
+    }
+    return FinishEvent(
+        AppEventKind::kAgentSnapshot,
+        refresh,
         true);
 }
 

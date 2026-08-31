@@ -18,6 +18,7 @@
 #include "freertos/task.h"
 #include "services/sync_service.h"
 #include "power_manager.h"
+#include "opencode_session.h"
 #include "power/rtc_timekeep.h"
 #include "power/wake_controller.h"
 #include "runtime/sleep_coordinator.h"
@@ -193,6 +194,7 @@ extern "C" void app_main(void)
 
     ConfirmRunningApp();
     ESP_ERROR_CHECK(wqn::InitAiSession());
+    ESP_ERROR_CHECK(wqn::InitOpenCodeSession());
 
     // Seed the durable sync admission cache, but do not start WiFi here.
     // Connectivity is demand-owned: SyncService, AI and cloud lanes acquire
