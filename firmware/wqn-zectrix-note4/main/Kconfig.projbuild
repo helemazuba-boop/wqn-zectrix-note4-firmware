@@ -109,18 +109,10 @@ menu "WQN firmware"
         range 10000 86400000
         depends on WQN_DEEP_SLEEP_ENABLE
         help
-            Idle time before entering deep sleep for a UI state that has an
-            explicit durable hibernate contract. Ordinary application pages
-            use retained standby instead. The default is 30 minutes.
-
-    config WQN_DEEP_SLEEP_TIMER_WAKE_SEC
-        int "Deep sleep timer wake interval in seconds"
-        default 0
-        range 0 86400
-        depends on WQN_DEEP_SLEEP_ENABLE
-        help
-            Optional RTC timer wake interval. Set 0 to wake only from GPIO0,
-            GPIO18, or GPIO5.
+            Idle time before the stateless provisioning/background screen may
+            enter deep sleep. Ordinary application pages have no hibernate
+            contract and use retained standby instead. The default is 30
+            minutes.
 
     config WQN_SLEEP_TIMER_WAKE_FLOOR_SEC
         int "Minimum deep sleep timer wake interval in seconds"

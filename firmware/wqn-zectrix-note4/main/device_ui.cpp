@@ -104,10 +104,10 @@ wqn::DeepSleepUiPolicy DeepSleepPolicyForUiState(const wqn::AppState& state)
         case wqn::UiScreen::kSettings:
         case wqn::UiScreen::kWord:
         case wqn::UiScreen::kNote:
-            // Ordinary application pages enter retained standby. Deep sleep
-            // becomes legal only after a later durable hibernate checkpoint
-            // transaction; page identity alone is never sufficient because
-            // it would drop RAM/PSRAM state and GPIO39 wake functionality.
+            // Ordinary application pages enter retained standby. This
+            // firmware intentionally exposes no application-page hibernate
+            // policy: page identity alone cannot make deep sleep safe because
+            // it drops RAM/PSRAM state and GPIO39 wake functionality.
             return wqn::DeepSleepUiPolicy::kRetainedStandbyOnly;
     }
     return wqn::DeepSleepUiPolicy::kRetainedStandbyOnly;

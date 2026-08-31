@@ -37,13 +37,13 @@ bool IsUiIdleForRetainedStandby();
 // lease at the same threshold.
 bool ShouldYieldClockRefreshToDeepSleep();
 
-// Foreground UI policy for automatic idle deep sleep. Ordinary pages use
-// retained standby; deep sleep is reserved for states with an explicit durable
-// hibernate contract. Emergency/user-requested shutdown ignores this policy.
+// Foreground UI policy for automatic idle deep sleep. Ordinary paired pages
+// use retained standby; the current firmware permits automatic deep sleep only
+// for the stateless provisioning/background-maintenance screen. There is no
+// application-page hibernate contract. Emergency/user shutdown ignores this.
 enum class DeepSleepUiPolicy : uint8_t {
     kRetainedStandbyOnly = 0,
     kDeepSleepNoDisplayTimer,
-    kDeepSleepWithDisplayTimer,
 };
 
 esp_err_t StartPowerCoordinator();

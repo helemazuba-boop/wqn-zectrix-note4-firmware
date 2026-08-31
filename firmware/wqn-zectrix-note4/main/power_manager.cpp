@@ -50,10 +50,6 @@
 #define CONFIG_WQN_CHARGING_DEEP_SLEEP_EXTRA_MS 300000
 #endif
 
-#ifndef CONFIG_WQN_DEEP_SLEEP_TIMER_WAKE_SEC
-#define CONFIG_WQN_DEEP_SLEEP_TIMER_WAKE_SEC 0
-#endif
-
 #ifndef CONFIG_WQN_BATTERY_LOW_THRESHOLD_MV
 #define CONFIG_WQN_BATTERY_LOW_THRESHOLD_MV 3450
 #endif
@@ -237,26 +233,12 @@ constexpr bool DeepSleepAllowedByUiPolicy(DeepSleepUiPolicy policy)
     return policy != DeepSleepUiPolicy::kRetainedStandbyOnly;
 }
 
-constexpr bool UiPolicyUsesDisplayTimer(DeepSleepUiPolicy policy)
-{
-    return policy == DeepSleepUiPolicy::kDeepSleepWithDisplayTimer;
-}
-
 constexpr uint32_t ApplyMinimumWakeFloor(uint32_t seconds, uint32_t floor_seconds)
 {
     return seconds != 0 && floor_seconds != 0 && seconds < floor_seconds
         ? floor_seconds
         : seconds;
 }
-
-constexpr bool DisplayDeadlineWins(uint32_t display_seconds, uint32_t sync_seconds)
-{
-    return display_seconds != 0 &&
-        (sync_seconds == 0 || display_seconds <= sync_seconds);
-}
-
-static_assert(DisplayDeadlineWins(60, ApplyMinimumWakeFloor(1, 60)));
-static_assert(!DisplayDeadlineWins(60, ApplyMinimumWakeFloor(1, 30)));
 
 const char* DeepSleepUiPolicyName(DeepSleepUiPolicy policy)
 {
@@ -265,8 +247,6 @@ const char* DeepSleepUiPolicyName(DeepSleepUiPolicy policy)
             return "retained-standby";
         case DeepSleepUiPolicy::kDeepSleepNoDisplayTimer:
             return "deep-background";
-        case DeepSleepUiPolicy::kDeepSleepWithDisplayTimer:
-            return "deep-display";
     }
     return "unknown";
 }
@@ -1261,7 +1241,6 @@ static void EnterDeepSleepIfEnabled(DeepSleepUiPolicy ui_policy)
         g_deep_sleep_clock_yield.store(false, std::memory_order_release);
         return;
     }
-    const bool enable_timer_wakeup = UiPolicyUsesDisplayTimer(ui_policy);
     // The charger status pins are also deep-sleep wake sources. This explicit
     // guard prevents beginning quiesce while USB is already present; the USB
     // SleepLease additionally keeps automatic light sleep out of serial and
@@ -1354,9 +1333,10 @@ static void EnterDeepSleepIfEnabled(DeepSleepUiPolicy ui_policy)
     // its retry deadline immediately before releasing the online-sync lease;
     // relying only on the UI task's earlier preference sample could then sleep
     // with no timer on a non-clock screen and strand the retry indefinitely.
-    const uint32_t display_wakeup_seconds = enable_timer_wakeup
-        ? CONFIG_WQN_DEEP_SLEEP_TIMER_WAKE_SEC
-        : 0;
+    // No current UI state has a durable hibernate/display-wake contract.
+    // Deep sleep is limited to background provisioning maintenance; paired
+    // application pages remain in retained standby.
+    constexpr uint32_t display_wakeup_seconds = 0;
     uint32_t sync_wakeup_seconds = services::SecondsUntilNextSyncWake();
     uint32_t effective_sync_wakeup_seconds = sync_wakeup_seconds;
     uint32_t timer_wakeup_seconds = display_wakeup_seconds;
@@ -1389,9 +1369,7 @@ static void EnterDeepSleepIfEnabled(DeepSleepUiPolicy ui_policy)
     // Compare display against the already floor-clamped sync deadline. A raw
     // sync retry at 1 s and a display deadline at 60 s both become due at 60 s;
     // display wins that tie and must never be counted as unattended sync.
-    bool timer_wakeup_for_display = has_usable_token &&
-        DisplayDeadlineWins(
-            display_wakeup_seconds, effective_sync_wakeup_seconds);
+    constexpr bool timer_wakeup_for_display = false;
     // [gap-1] Unattended background-maintenance wakes escalate: after enough
     // consecutive sync-source cycles with zero user interaction, widen the
     // floor so a stuck deadline can burn at most one radio window per 15
