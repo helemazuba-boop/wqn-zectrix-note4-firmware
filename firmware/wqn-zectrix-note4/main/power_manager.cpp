@@ -1204,11 +1204,13 @@ static void RunUserPowerOffShutdown()
         vTaskDelay(pdMS_TO_TICKS(10));
     }
 
-    // Full-refresh budget: white clear + BUSY wait + rail cut. Generous
-    // deadline -- the op is TWDT-fed and failure-tolerant by contract.
-    constexpr int64_t kShutdownClearDeadlineUs = 12LL * 1000 * 1000;
+    // Bound how long the request may wait to be claimed by the EPD owner.
+    // Once claimed, the hardware operation is non-cancellable and this caller
+    // waits for its bounded terminal result before cutting the board latch.
+    constexpr int64_t kShutdownClearClaimDeadlineUs = 12LL * 1000 * 1000;
     const esp_err_t clear_result =
-        wqn::PrepareDisplayForShutdown(esp_timer_get_time() + kShutdownClearDeadlineUs);
+        wqn::PrepareDisplayForShutdown(
+            esp_timer_get_time() + kShutdownClearClaimDeadlineUs);
     if (clear_result != ESP_OK) {
         ESP_LOGW(kTag, "shutdown display clear failed; continuing: %s",
                  esp_err_to_name(clear_result));

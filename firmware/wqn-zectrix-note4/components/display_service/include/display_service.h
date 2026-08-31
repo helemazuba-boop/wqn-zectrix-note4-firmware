@@ -58,9 +58,10 @@ esp_err_t RefreshEpdGray16(const uint8_t* gray4, size_t size);
 esp_err_t PrepareDisplayForSleep(int64_t deadline_us);
 
 // [power-fix] User-initiated power-off: white-clear + forced full refresh
-// (owner task), then rail power-off. Same Pending/Claimed channel and
-// deadline semantics as PrepareDisplayForSleep; a refresh failure still cuts
-// the rail. Called by the PowerCoordinator before the final latch cut.
+// (owner task), then rail power-off. The deadline bounds Pending admission;
+// after the owner claims the non-cancellable hardware operation, the caller
+// waits for its internally bounded terminal result so the final board-latch
+// cut can never race live EPD GPIO/SPI. A refresh failure still cuts the rail.
 esp_err_t PrepareDisplayForShutdown(int64_t deadline_us);
 void RollbackDisplayAfterSleepAbort();
 // [epd-owner] The EPD refresh task registers itself as the panel owner at

@@ -2312,10 +2312,21 @@ static esp_err_t PrepareDisplayPowerOpInternal(int64_t deadline_us, bool clear_f
             std::memory_order_acq_rel, std::memory_order_acquire)) {
         return ESP_ERR_TIMEOUT;
     }
-    // Owner claimed it: Claimed only means the hardware op cannot be cancelled,
-    // NOT that the caller may block a second full budget. Wait only the time
-    // still left against the absolute deadline; if none remains, return now and
-    // let the owner's late give be drained by the next request.
+    // Owner claimed it: the hardware op cannot be cancelled. User shutdown
+    // must never proceed to the board-latch cut while the owner can still be
+    // driving EPD GPIO/SPI, so after claim its deadline is an admission bound
+    // and the caller waits for the operation's internally bounded terminal
+    // result. Ordinary sleep prep remains rollback-capable and keeps the
+    // absolute completion deadline below.
+    if (clear_first) {
+        while (xSemaphoreTake(sem, portMAX_DELAY) == pdTRUE) {
+            if (g_sleep_prep_result_generation.load(
+                    std::memory_order_acquire) == generation) {
+                return g_sleep_prep_result.load(std::memory_order_relaxed);
+            }
+        }
+        return ESP_ERR_INVALID_STATE;
+    }
     wait = remaining_ticks();
     if (wait != 0 && xSemaphoreTake(sem, wait) == pdTRUE &&
         g_sleep_prep_result_generation.load(std::memory_order_acquire) == generation) {
