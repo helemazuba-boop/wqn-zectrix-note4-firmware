@@ -30,6 +30,13 @@ constexpr size_t kPcmQueueLength = 128;
 constexpr size_t kCtrlQueueLength = 8;
 constexpr size_t kCtrlCompletionQueueLength = 4;
 constexpr UBaseType_t kTransportTaskPriority = 7;
+// The ESP WebSocket component owns a separate 8 KiB task stack which must stay
+// in internal RAM. Keeping this product-level owner stack in the default
+// FreeRTOS heap made the two stacks compete for the same largest internal
+// block. This task never self-deletes and CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM
+// is enabled, so reserve one stable PSRAM stack and retain only its TCB in
+// internal RAM (the same ownership model used by Flash stream/playback).
+constexpr uint32_t kTransportTaskStackBytes = 8192;
 // [stream-depth] Device-observed failure: an SSE burst of 1287 bytes arrived
 // with only 512 B free in an 8 KiB buffer -> overflow -> ResetRequired killed
 // a healthy connection mid-turn. Consumer (this same owner task) can stall
@@ -134,8 +141,14 @@ SemaphoreHandle_t g_init_mutex = nullptr;
 portMUX_TYPE g_init_mutex_lock = portMUX_INITIALIZER_UNLOCKED;
 StaticQueue_t g_pcm_queue_control = {};
 uint8_t* g_pcm_queue_storage = nullptr;
+StaticQueue_t g_ctrl_queue_control = {};
+uint8_t* g_ctrl_queue_storage = nullptr;
+StaticQueue_t g_ctrl_completion_queue_control = {};
+uint8_t* g_ctrl_completion_queue_storage = nullptr;
 StaticStreamBuffer_t g_text_stream_control = {};
 uint8_t* g_text_stream_storage = nullptr;
+StaticTask_t g_transport_task_tcb = {};
+StackType_t* g_transport_task_stack = nullptr;
 
 std::atomic<uint32_t> g_sync_op_gen{0};
 std::atomic<uint32_t> g_turn_gen{0};
@@ -209,6 +222,24 @@ void PublishTurnTerminalRecord(uint32_t turn_gen,
     }
 }
 
+void LogTransportMemory(const char* stage)
+{
+    const unsigned owner_stack_hwm = g_transport_task == nullptr
+        ? 0U
+        : static_cast<unsigned>(uxTaskGetStackHighWaterMark(g_transport_task));
+    ESP_LOGI(
+        kTag,
+        "memory stage=%s internal_free=%u internal_largest=%u dma_free=%u dma_largest=%u psram_free=%u psram_largest=%u owner_stack_hwm=%u",
+        stage,
+        static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
+        static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)),
+        static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_DMA)),
+        static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_DMA)),
+        static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)),
+        static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM)),
+        owner_stack_hwm);
+}
+
 void DoDestroyWs()
 {
     bool destroyed = false;
@@ -244,10 +275,7 @@ void DoDestroyWs()
     if (destroyed) {
         // [dma-attrib] Attribute the per-cycle DMA-capable decay: snapshot right
         // after a full client stop+destroy so connect/teardown deltas are visible.
-        ESP_LOGW(kTag,
-                 "[dma-attrib] after-do-destroy-ws dma_free=%u dma_largest=%u",
-                 static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_DMA)),
-                 static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_DMA)));
+        LogTransportMemory("after-do-destroy-ws");
     }
 }
 
@@ -395,6 +423,7 @@ void ProcessTextStream()
                     std::strcmp(type_item->valuestring, "session.ready") == 0) {
                     ESP_LOGI(kTag, "session.ready control frame validated");
                     g_session_ready.store(true, std::memory_order_release);
+                    LogTransportMemory("session-ready");
                     if (g_conn_state.load(std::memory_order_acquire) ==
                         ConnectionState::kConnecting) {
                         g_conn_state.store(ConnectionState::kReady,
@@ -552,13 +581,16 @@ void ExecuteCtrlCmdSingleStep(const CtrlCmd& cmd)
                 g_ws_client, WEBSOCKET_EVENT_ANY,
                 WebsocketEventHandler, nullptr);
 
+            LogTransportMemory("before-ws-task-start");
             const esp_err_t start_err =
                 esp_websocket_client_start(g_ws_client);
             if (start_err != ESP_OK) {
+                LogTransportMemory("ws-task-start-failed");
                 DoDestroyWs();
                 PublishCompletion(cmd.gen, start_err, CmdDisposition::kExecuted);
                 return;
             }
+            LogTransportMemory("after-ws-task-start");
 
             // Asynchronous connecting state: owner task records active operation and returns to root loop
             g_active_conn_op_gen = cmd.gen;
@@ -894,8 +926,10 @@ bool PrimitivesReady()
         g_final_sem != nullptr && g_turn_complete_sem != nullptr &&
         g_pcm_queue != nullptr && g_ctrl_queue != nullptr &&
         g_ctrl_completion_queue != nullptr && g_text_stream != nullptr &&
-        g_pcm_queue_storage != nullptr && g_text_stream_storage != nullptr &&
-        g_transport_task != nullptr;
+        g_pcm_queue_storage != nullptr && g_ctrl_queue_storage != nullptr &&
+        g_ctrl_completion_queue_storage != nullptr &&
+        g_text_stream_storage != nullptr &&
+        g_transport_task != nullptr && g_transport_task_stack != nullptr;
 }
 
 void DeleteUncommittedPrimitives(
@@ -906,10 +940,16 @@ void DeleteUncommittedPrimitives(
     QueueHandle_t pcm_queue,
     uint8_t* pcm_queue_storage,
     QueueHandle_t ctrl_queue,
+    uint8_t* ctrl_queue_storage,
     QueueHandle_t ctrl_completion_queue,
+    uint8_t* ctrl_completion_queue_storage,
     StreamBufferHandle_t text_stream,
-    uint8_t* text_stream_storage)
+    uint8_t* text_stream_storage,
+    StackType_t* transport_task_stack)
 {
+    if (transport_task_stack != nullptr) {
+        heap_caps_free(transport_task_stack);
+    }
     if (text_stream != nullptr) {
         vStreamBufferDelete(text_stream);
     }
@@ -919,8 +959,14 @@ void DeleteUncommittedPrimitives(
     if (ctrl_completion_queue != nullptr) {
         vQueueDelete(ctrl_completion_queue);
     }
+    if (ctrl_completion_queue_storage != nullptr) {
+        heap_caps_free(ctrl_completion_queue_storage);
+    }
     if (ctrl_queue != nullptr) {
         vQueueDelete(ctrl_queue);
+    }
+    if (ctrl_queue_storage != nullptr) {
+        heap_caps_free(ctrl_queue_storage);
     }
     if (pcm_queue != nullptr) {
         vQueueDelete(pcm_queue);
@@ -970,10 +1016,25 @@ esp_err_t InitPrimitives()
         : xQueueCreateStatic(
             kPcmQueueLength, sizeof(PcmBlock), pcm_queue_storage,
             &g_pcm_queue_control);
-    QueueHandle_t ctrl_queue =
-        xQueueCreate(kCtrlQueueLength, sizeof(CtrlCmd));
+    uint8_t* ctrl_queue_storage = static_cast<uint8_t*>(heap_caps_malloc(
+        kCtrlQueueLength * sizeof(CtrlCmd),
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    QueueHandle_t ctrl_queue = ctrl_queue_storage == nullptr
+        ? nullptr
+        : xQueueCreateStatic(
+            kCtrlQueueLength, sizeof(CtrlCmd), ctrl_queue_storage,
+            &g_ctrl_queue_control);
+    uint8_t* ctrl_completion_queue_storage =
+        static_cast<uint8_t*>(heap_caps_malloc(
+            kCtrlCompletionQueueLength * sizeof(CtrlCompletion),
+            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     QueueHandle_t ctrl_completion_queue =
-        xQueueCreate(kCtrlCompletionQueueLength, sizeof(CtrlCompletion));
+        ctrl_completion_queue_storage == nullptr
+        ? nullptr
+        : xQueueCreateStatic(
+            kCtrlCompletionQueueLength, sizeof(CtrlCompletion),
+            ctrl_completion_queue_storage,
+            &g_ctrl_completion_queue_control);
     uint8_t* text_stream_storage = static_cast<uint8_t*>(heap_caps_malloc(
         kTextStreamBufferSize, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     StreamBufferHandle_t text_stream = text_stream_storage == nullptr
@@ -981,34 +1042,37 @@ esp_err_t InitPrimitives()
         : xStreamBufferCreateStatic(
             kTextStreamBufferSize, 1, text_stream_storage,
             &g_text_stream_control);
+    StackType_t* transport_task_stack = static_cast<StackType_t*>(
+        heap_caps_calloc(
+            1, kTransportTaskStackBytes,
+            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
 
     const bool allocations_ok = transport_mutex != nullptr &&
         sync_op_sem != nullptr && final_sem != nullptr &&
         turn_complete_sem != nullptr && pcm_queue != nullptr &&
         ctrl_queue != nullptr && ctrl_completion_queue != nullptr &&
-        text_stream != nullptr;
+        text_stream != nullptr && transport_task_stack != nullptr;
     if (!allocations_ok) {
         DeleteUncommittedPrimitives(
             transport_mutex, sync_op_sem, final_sem, turn_complete_sem,
-            pcm_queue, pcm_queue_storage, ctrl_queue,
-            ctrl_completion_queue, text_stream,
-            text_stream_storage);
+            pcm_queue, pcm_queue_storage, ctrl_queue, ctrl_queue_storage,
+            ctrl_completion_queue, ctrl_completion_queue_storage,
+            text_stream, text_stream_storage, transport_task_stack);
         xSemaphoreGive(init_mutex);
         ESP_LOGE(kTag, "transport primitive allocation failed; rolled back");
         return ESP_ERR_NO_MEM;
     }
 
-    TaskHandle_t transport_task = nullptr;
-    const BaseType_t created = xTaskCreate(
-        VoiceWsTransportTask, "wqn_vws_ctrl", 8192, nullptr,
+    TaskHandle_t transport_task = xTaskCreateStatic(
+        VoiceWsTransportTask, "wqn_vws_ctrl", kTransportTaskStackBytes, nullptr,
         kTransportTaskPriority,
-        &transport_task);
-    if (created != pdPASS) {
+        transport_task_stack, &g_transport_task_tcb);
+    if (transport_task == nullptr) {
         DeleteUncommittedPrimitives(
             transport_mutex, sync_op_sem, final_sem, turn_complete_sem,
-            pcm_queue, pcm_queue_storage, ctrl_queue,
-            ctrl_completion_queue, text_stream,
-            text_stream_storage);
+            pcm_queue, pcm_queue_storage, ctrl_queue, ctrl_queue_storage,
+            ctrl_completion_queue, ctrl_completion_queue_storage,
+            text_stream, text_stream_storage, transport_task_stack);
         xSemaphoreGive(init_mutex);
         ESP_LOGE(kTag, "transport task allocation failed; primitives rolled back");
         return ESP_ERR_NO_MEM;
@@ -1021,19 +1085,29 @@ esp_err_t InitPrimitives()
     g_pcm_queue = pcm_queue;
     g_pcm_queue_storage = pcm_queue_storage;
     g_ctrl_queue = ctrl_queue;
+    g_ctrl_queue_storage = ctrl_queue_storage;
     g_ctrl_completion_queue = ctrl_completion_queue;
+    g_ctrl_completion_queue_storage = ctrl_completion_queue_storage;
     g_text_stream = text_stream;
     g_text_stream_storage = text_stream_storage;
     g_transport_task = transport_task;
+    g_transport_task_stack = transport_task_stack;
     xTaskNotifyGive(transport_task);
     xSemaphoreGive(init_mutex);
     ESP_LOGI(kTag,
-             "transport primitives ready: pcm_psram=%p blocks=%u bytes=%u text_psram=%p bytes=%u",
+             "transport primitives ready: pcm_psram=%p blocks=%u bytes=%u ctrl_psram=%p bytes=%u completion_psram=%p bytes=%u text_psram=%p bytes=%u task_stack_psram=%p bytes=%u",
              g_pcm_queue_storage,
              static_cast<unsigned>(kPcmQueueLength),
              static_cast<unsigned>(kPcmQueueLength * sizeof(PcmBlock)),
+             g_ctrl_queue_storage,
+             static_cast<unsigned>(kCtrlQueueLength * sizeof(CtrlCmd)),
+             g_ctrl_completion_queue_storage,
+             static_cast<unsigned>(kCtrlCompletionQueueLength * sizeof(CtrlCompletion)),
              g_text_stream_storage,
-             static_cast<unsigned>(kTextStreamBufferSize));
+             static_cast<unsigned>(kTextStreamBufferSize),
+             g_transport_task_stack,
+             static_cast<unsigned>(kTransportTaskStackBytes));
+    LogTransportMemory("transport-primitives-ready");
     return ESP_OK;
 }
 

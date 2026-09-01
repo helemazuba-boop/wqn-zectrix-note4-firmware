@@ -173,6 +173,26 @@ esp_err_t WriteRequestBody(esp_http_client_handle_t client,
   return ESP_OK;
 }
 
+void CaptureHttpStatus(StreamContext* ctx, esp_http_client_handle_t client)
+{
+  if (ctx == nullptr || client == nullptr || ctx->http_status > 0) {
+    return;
+  }
+  const int status = esp_http_client_get_status_code(client);
+  // IDF can emit the first HTTP_EVENT_ON_HEADER before exposing the parsed
+  // status code. Do not latch its transient -1 value and suppress all later
+  // checks; fetch_headers() calls this helper again once parsing is complete.
+  if (status <= 0) {
+    return;
+  }
+  ctx->http_status = status;
+  ESP_LOGI(kTag, "HTTP status=%d", status);
+  if (status >= 400) {
+    ctx->fatal = true;
+    ctx->error_code = wqn::internal::AiStreamHttpErrorCode(status);
+  }
+}
+
 esp_err_t OnHttpEvent(esp_http_client_event_t* evt)
 {
   StreamContext* ctx = static_cast<StreamContext*>(evt->user_data);
@@ -186,14 +206,7 @@ esp_err_t OnHttpEvent(esp_http_client_event_t* evt)
       // HTTP_EVENT_ON_HEADER which fires once per header line. We only care
       // about the status code, so grab it on the first header and ignore the
       // rest. Subsequent header events fall through to the parser unchanged.
-      if (ctx->http_status == 0) {
-        ctx->http_status = esp_http_client_get_status_code(evt->client);
-        ESP_LOGI(kTag, "HTTP status=%d", ctx->http_status);
-        if (ctx->http_status >= 400) {
-          ctx->fatal = true;
-          ctx->error_code = wqn::internal::AiStreamHttpErrorCode(ctx->http_status);
-        }
-      }
+      CaptureHttpStatus(ctx, evt->client);
       break;
     }
     case HTTP_EVENT_ON_DATA: {
@@ -355,6 +368,14 @@ esp_err_t UploadAiAudioChatStream(const WqnAiStreamRequest& request,
     // success so a buffered/non-chunked SSE response is still consumed.
     const int64_t header_result = esp_http_client_fetch_headers(client);
     err = header_result < 0 ? ESP_FAIL : ESP_OK;
+    if (err == ESP_OK) {
+      CaptureHttpStatus(&ctx, client);
+      if (ctx.http_status <= 0) {
+        ctx.error_code = "bad_response";
+        ctx.error_message = "HTTP response status unavailable";
+        err = ESP_FAIL;
+      }
+    }
   }
   if (err == ESP_OK) {
     // Pull the chunked stream until close.

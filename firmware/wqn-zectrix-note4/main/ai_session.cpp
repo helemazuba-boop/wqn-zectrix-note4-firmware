@@ -40,27 +40,34 @@ constexpr TickType_t kWifiReadyWait = pdMS_TO_TICKS(35000);
 
 SemaphoreHandle_t g_lock = nullptr;
 TaskHandle_t g_submit_task = nullptr;
-// True while the persistent submit worker is parked waiting for a stop press
-// (no live submission). Replaces the old "g_submit_task == nullptr" state.
+enum class AiWorkerCommand : uint8_t {
+    kNone,
+    kPrepareRecording,
+    kSubmitSession,
+};
+AiWorkerCommand g_worker_command = AiWorkerCommand::kNone;
+// True while the corresponding phase of the shared AI worker is parked. The
+// worker's single static stack is reused for both preparation and submission.
 bool g_submit_parked = true;
-// [submit-task-reserve] Statically-stored stack/TCB for the AI submit worker,
-// mirroring the capture worker. Field data (wqn-device 2026-08-23): after the
+// [ai-worker-reserve] Statically-stored stack/TCB for the AI worker. Field data
+// (wqn-device 2026-08-23): after the
 // first TLS upload the internal largest free block settles at 6.4-6.9 KiB, so
-// a transient xTaskCreate of this task deterministically fails with NO_MEM on
-// every stop after the first turn. A once-created parked worker removes the
-// allocation from the failure surface entirely.
+// transient xTaskCreate calls deterministically fail on later turns. A single
+// once-created worker removes both prepare and submit stacks from that failure
+// surface without reserving a second permanent 6 KiB internal stack.
 constexpr uint32_t kSubmitTaskStackBytes = 7168;
 StaticTask_t g_submit_task_tcb = {};
 StackType_t g_submit_task_stack[kSubmitTaskStackBytes / sizeof(StackType_t)] = {};
-TaskHandle_t g_prepare_task = nullptr;
 wqn::AiSessionState g_state;
 std::string g_conversation_id;
 bool g_changed = false;
 bool g_loaded_today = false;
 bool g_prepare_active = false;
+bool g_prepare_parked = true;
 bool g_recording_requested = false;
 uint32_t g_prepare_generation = 0;
-bool g_streaming_active = false;        // true while SubmitTask is parsing SSE events
+uint32_t g_prepare_command_generation = 0;
+bool g_streaming_active = false;        // true while the AI worker is parsing SSE events
 bool g_streaming_force_full_render = false; // when true the next UI tick does a full refresh
 wqn::runtime::SleepLease g_ai_sleep_lease;
 wqn::services::ConnectivityDemand g_ai_connectivity_demand;
@@ -208,7 +215,7 @@ void ReleaseAiSleepLeaseIfIdleLocked()
         g_state.status == wqn::AiSessionStatus::kListening ||
         g_state.status == wqn::AiSessionStatus::kWaitingReply ||
         g_state.status == wqn::AiSessionStatus::kStreaming;
-    if (!g_prepare_active && g_prepare_task == nullptr && g_submit_parked &&
+    if (!g_prepare_active && g_prepare_parked && g_submit_parked &&
         !g_streaming_active && !state_active) {
         g_ai_connectivity_demand.Reset();
         g_ai_sleep_lease.Reset();
@@ -217,9 +224,10 @@ void ReleaseAiSleepLeaseIfIdleLocked()
 
 void FinishSubmitTaskLocked()
 {
-    // The worker is persistent: publish "parked" instead of dropping the
-    // handle so the statically-stored stack is reused without heap churn.
     g_submit_parked = true;
+    if (g_worker_command == AiWorkerCommand::kSubmitSession) {
+        g_worker_command = AiWorkerCommand::kNone;
+    }
     ReleaseAiSleepLeaseIfIdleLocked();
 }
 
@@ -297,7 +305,7 @@ void SetCancelledBeforeRecordingLocked()
 // v2 SSE consumer
 // ============================================================================
 //
-// SubmitTask drives the SSE stream on its own task stack. Each callback runs on
+// The shared AI worker drives the SSE stream on its own task stack. Each callback runs on
 // that stack, so we take g_lock only briefly and we never call esp_http_client
 // or cJSON inside the lock.
 //
@@ -548,8 +556,9 @@ void FinishPrepareTaskLocked(uint32_t generation)
     if (generation == g_prepare_generation) {
         g_prepare_active = false;
     }
-    if (g_prepare_task == xTaskGetCurrentTaskHandle() || generation == g_prepare_generation) {
-        g_prepare_task = nullptr;
+    g_prepare_parked = true;
+    if (g_worker_command == AiWorkerCommand::kPrepareRecording) {
+        g_worker_command = AiWorkerCommand::kNone;
     }
     ReleaseAiSleepLeaseIfIdleLocked();
 }
@@ -743,7 +752,7 @@ void LoadTodaySessionLocked()
 
 // One AI submission: stop capture, validate the clip, hand off to the WS
 // transport (FINAL + REMOTE_HANDOFF) or fall back to HTTP SSE upload.
-// Runs on the persistent SubmitTask worker; returns when terminal state is
+// Runs on the persistent shared AI worker; returns when terminal state is
 // published and the worker parks again.
 void SubmitSession()
 {
@@ -1009,21 +1018,8 @@ void SubmitSession()
     xSemaphoreGive(g_lock);
 }
 
-void SubmitTask(void*)
+void PrepareRecordingSession(uint32_t generation)
 {
-    for (;;) {
-        // Parked between submissions; StopAiRecordingAndSubmit dispatches
-        // exactly one submission per notification. The worker never deletes
-        // itself, so its statically-stored stack/TCB are reused with no
-        // teardown race and no heap churn between turns.
-        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-        SubmitSession();
-    }
-}
-
-void PrepareRecordingTask(void* parameter)
-{
-    const uint32_t generation = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(parameter));
     std::string token;
     enum class PrepareFailure {
         kNone,
@@ -1143,7 +1139,6 @@ void PrepareRecordingTask(void* parameter)
         }
         FinishPrepareTaskLocked(generation);
         xSemaphoreGive(g_lock);
-        vTaskDelete(nullptr);
         return;
     }
 
@@ -1228,7 +1223,6 @@ void PrepareRecordingTask(void* parameter)
         xSemaphoreGive(g_lock);
         ESP_LOGI(kTag, "record_start: generation=%lu req_id=%s ws=%d; toast=录音中",
                  static_cast<unsigned long>(generation), req_id.c_str(), ws_ready);
-        vTaskDelete(nullptr);
         return;
     }
 
@@ -1257,7 +1251,27 @@ void PrepareRecordingTask(void* parameter)
         wqn::StopAudioCapture(&discarded);
         wqn::ReleaseAudioCapturePower();
     }
-    vTaskDelete(nullptr);
+}
+
+void AiSessionWorkerTask(void*)
+{
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        xSemaphoreTake(g_lock, portMAX_DELAY);
+        const AiWorkerCommand command = g_worker_command;
+        const uint32_t generation = g_prepare_command_generation;
+        xSemaphoreGive(g_lock);
+        switch (command) {
+            case AiWorkerCommand::kPrepareRecording:
+                PrepareRecordingSession(generation);
+                break;
+            case AiWorkerCommand::kSubmitSession:
+                SubmitSession();
+                break;
+            case AiWorkerCommand::kNone:
+                break;
+        }
+    }
 }
 
 }  // namespace
@@ -1280,6 +1294,19 @@ esp_err_t InitAiSession()
             return ESP_ERR_NO_MEM;
         }
     }
+    if (g_submit_task == nullptr) {
+        g_submit_task = xTaskCreateStatic(
+            AiSessionWorkerTask,
+            "wqn_ai_worker",
+            kSubmitTaskStackBytes,
+            nullptr,
+            5,
+            g_submit_task_stack,
+            &g_submit_task_tcb);
+        if (g_submit_task == nullptr) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
     ESP_LOGI(kTag, "ai-session build: %s %s", __DATE__, __TIME__);
     xSemaphoreTake(g_lock, portMAX_DELAY);
     LoadTodaySessionLocked();
@@ -1299,7 +1326,13 @@ esp_err_t StartAiRecordingSession()
     xSemaphoreTake(g_lock, portMAX_DELAY);
     if (g_state.status == AiSessionStatus::kPreparingCapture ||
         g_state.status == AiSessionStatus::kListening || g_state.status == AiSessionStatus::kWaitingReply ||
-        !g_submit_parked || g_prepare_task != nullptr || g_prepare_active) {
+        !g_submit_parked || !g_prepare_parked || g_prepare_active ||
+        g_worker_command != AiWorkerCommand::kNone) {
+        ESP_LOGW(kTag,
+                 "record start rejected: status=%d submit_parked=%d prepare_parked=%d prepare_active=%d command=%d",
+                 static_cast<int>(g_state.status), g_submit_parked ? 1 : 0,
+                 g_prepare_parked ? 1 : 0, g_prepare_active ? 1 : 0,
+                 static_cast<int>(g_worker_command));
         xSemaphoreGive(g_lock);
         return ESP_ERR_INVALID_STATE;
     }
@@ -1322,31 +1355,14 @@ esp_err_t StartAiRecordingSession()
     g_state.scroll_offset_lines = 0;
     g_state.status_since_ms = esp_timer_get_time() / 1000;
     g_prepare_active = true;
+    g_prepare_parked = false;
     g_recording_requested = true;
     const uint32_t prepare_generation = ++g_prepare_generation;
-    g_prepare_task = nullptr;
+    g_prepare_command_generation = prepare_generation;
+    g_worker_command = AiWorkerCommand::kPrepareRecording;
     MarkChanged();
     xSemaphoreGive(g_lock);
-
-    TaskHandle_t task = nullptr;
-    const BaseType_t created = xTaskCreate(PrepareRecordingTask,
-                                           "wqn_ai_prepare",
-                                           6144,
-                                           reinterpret_cast<void*>(static_cast<uintptr_t>(prepare_generation)),
-                                           5,
-                                           &task);
-    xSemaphoreTake(g_lock, portMAX_DELAY);
-    if (created != pdPASS) {
-        g_recording_requested = false;
-        FinishPrepareTaskLocked(prepare_generation);
-        SetErrorLocked("AI 任务创建失败");
-        xSemaphoreGive(g_lock);
-        return ESP_ERR_NO_MEM;
-    }
-    if (IsCurrentPrepareTaskLocked(prepare_generation)) {
-        g_prepare_task = task;
-    }
-    xSemaphoreGive(g_lock);
+    xTaskNotifyGive(g_submit_task);
     return ESP_OK;
 }
 
@@ -1363,7 +1379,7 @@ esp_err_t StopAiRecordingAndSubmit()
         ++g_prepare_generation;
         g_prepare_active = false;
         // Cancels the typed WiFi wait within its 200 ms wake bound without
-        // touching the prepare task handle from the UI task.
+        // touching the shared worker task from the UI task.
         g_ai_connectivity_demand.Reset();
         SetCancelledBeforeRecordingLocked();
         xSemaphoreGive(g_lock);
@@ -1382,45 +1398,21 @@ esp_err_t StopAiRecordingAndSubmit()
         xSemaphoreGive(g_lock);
         return ESP_ERR_INVALID_STATE;
     }
-    SetStateLocked(AiSessionStatus::kWaitingReply, "正在停止录音...", "", "");
-    xSemaphoreGive(g_lock);
-
-    LogAiMemory("before-submit-task-create");
-    xSemaphoreTake(g_lock, portMAX_DELAY);
-    // [submit-task-reserve] Create the persistent worker once; its stack and
-    // TCB are statically stored so post-TLS heap fragmentation can never block
-    // a recording stop again.
-    if (g_submit_task == nullptr) {
-        TaskHandle_t worker = xTaskCreateStatic(
-            SubmitTask, "wqn_ai_submit", kSubmitTaskStackBytes, nullptr, 5,
-            g_submit_task_stack, &g_submit_task_tcb);
-        if (worker == nullptr) {
-            // Unreachable with CONFIG_FREERTOS_SUPPORT_STATIC_ALLOCATION=y;
-            // kept for symmetry with the historical dynamic-creation rollback.
-            xSemaphoreGive(g_lock);
-            AudioCaptureChunk discarded;
-            StopAudioCapture(&discarded);
-            ReleaseAudioCapturePower();
-            xSemaphoreTake(g_lock, portMAX_DELAY);
-            if (g_turn_ws_capable && !g_current_turn_req_id.empty()) {
-                wqn::stdpro_ws::AbortTurn(g_current_turn_req_id,
-                                          g_current_turn_gen);
-                g_turn_ws_capable = false;
-            }
-            SetErrorLocked("AI 任务创建失败");
-            xSemaphoreGive(g_lock);
-            return ESP_ERR_NO_MEM;
-        }
-        g_submit_task = worker;
-    }
-    if (!g_submit_parked) {
-        // The previous submission is still winding down on the worker context.
+    if (!g_prepare_parked || g_worker_command != AiWorkerCommand::kNone ||
+        g_submit_task == nullptr) {
+        ESP_LOGW(kTag,
+                 "record stop rejected: prepare_parked=%d command=%d worker=%p",
+                 g_prepare_parked ? 1 : 0, static_cast<int>(g_worker_command),
+                 static_cast<void*>(g_submit_task));
         xSemaphoreGive(g_lock);
         return ESP_ERR_INVALID_STATE;
     }
+    SetStateLocked(AiSessionStatus::kWaitingReply, "正在停止录音...", "", "");
     g_submit_parked = false;
+    g_worker_command = AiWorkerCommand::kSubmitSession;
     xSemaphoreGive(g_lock);
 
+    LogAiMemory("before-submit-dispatch");
     xTaskNotifyGive(g_submit_task);
     return ESP_OK;
 }
@@ -1570,7 +1562,7 @@ bool IsAiSessionActive()
     }
     xSemaphoreTake(g_lock, portMAX_DELAY);
     const bool active =
-        g_prepare_active || g_prepare_task != nullptr || !g_submit_parked ||
+        g_prepare_active || !g_prepare_parked || !g_submit_parked ||
         g_streaming_active || g_state.status == AiSessionStatus::kPreparingCapture ||
         g_state.status == AiSessionStatus::kListening ||
         g_state.status == AiSessionStatus::kWaitingReply;
