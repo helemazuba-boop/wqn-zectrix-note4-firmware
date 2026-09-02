@@ -7,7 +7,13 @@ CONFIG_SPIRAM=y
 CONFIG_SPIRAM_MODE_OCT=y
 CONFIG_SPIRAM_SPEED_80M=y
 CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=512
-CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=65536
+# [ws-task-margin] 96 KiB, up from 64 KiB. Device measurement (7 PTT rounds):
+# at 64 KiB the largest contiguous internal block right before the
+# esp_websocket_client 8 KiB task creation fell to exactly 8192 on one of five
+# sessions, so it passed with zero margin. This reserve keeps general-purpose
+# malloc from eating the internal RAM that task stack needs. It adds margin
+# only -- it does NOT replace the explicit PSRAM task/queue ownership fix.
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=98304
 CONFIG_SPIRAM_MEMTEST=n
 CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
 
