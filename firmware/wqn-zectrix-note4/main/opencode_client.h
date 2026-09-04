@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -24,6 +25,7 @@ struct OpenCodeResult {
 
 enum class OpenCodeEventKind : uint8_t {
     kAccepted,
+    kAttached,
     kStatus,
     kTextDelta,
     kText,
@@ -43,9 +45,33 @@ struct OpenCodeEvent {
 
 using OpenCodeEventCallback = void (*)(const OpenCodeEvent& event, void* ctx);
 
+struct OpenCodeOutboundReply {
+    std::string permission_id;
+    bool approve = true;
+};
+
+// Thread-safe handoff for permission replies issued while an agent event
+// stream is open. The UI thread pushes; the streaming worker drains between
+// reads (the gateway keep-alive guarantees a read returns at least every ~15
+// s) and performs the reply POST itself, so no second task or long-lived TLS
+// connection ever runs alongside the stream.
+class OpenCodeOutboundQueue {
+public:
+    void Push(OpenCodeOutboundReply reply);
+    bool Pop(OpenCodeOutboundReply* out);
+
+private:
+    std::mutex mutex_;
+    std::vector<OpenCodeOutboundReply> items_;
+};
+
 esp_err_t ListOpenCodeSessions(
     const std::string& token,
     std::vector<OpenCodeSessionInfo>* sessions,
+    OpenCodeResult* result);
+esp_err_t CreateOpenCodeSession(
+    const std::string& token,
+    OpenCodeSessionInfo* session,
     OpenCodeResult* result);
 esp_err_t TranscribeOpenCodeAudio(
     const std::string& token,
@@ -56,6 +82,14 @@ esp_err_t RunOpenCodePrompt(
     const std::string& token,
     const std::string& session_id,
     const std::string& prompt,
+    OpenCodeOutboundQueue* outbound_replies,
+    OpenCodeEventCallback callback,
+    void* callback_ctx,
+    OpenCodeResult* result);
+esp_err_t WatchOpenCodeSession(
+    const std::string& token,
+    const std::string& session_id,
+    OpenCodeOutboundQueue* outbound_replies,
     OpenCodeEventCallback callback,
     void* callback_ctx,
     OpenCodeResult* result);

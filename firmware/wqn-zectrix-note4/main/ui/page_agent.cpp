@@ -49,7 +49,7 @@ void DrawTopBar(const wqn::AgentSessionState& state, const wqn::HomeSummary& hom
 
 void DrawSessionPicker(const wqn::AgentSessionState& state)
 {
-    AGENT_DRAW_TEXT(12, kContextY, "选择 Session · ↑/↓移动 · 确认锁定", true);
+    AGENT_DRAW_TEXT(12, kContextY, "选择 Session · 确认锁定 · 长按新建", true);
     DrawHorizontalLine(8, 52, 384);
     if (state.sessions.empty()) {
         AGENT_DRAW_TEXT(12, 82, state.ui.activity_text.c_str(), true);

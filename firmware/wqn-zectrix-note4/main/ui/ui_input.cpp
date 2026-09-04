@@ -741,7 +741,16 @@ RefreshSchedule ApplyButtonEvent(
         if (event.button == wqn::ButtonId::kConfirm &&
             (long_press || long_release)) {
             // PTT is handled by raw Hold/Release above. Never route its derived
-            // long event to the generic "back to home" action.
+            // long event to the generic "back to home" action. On the session
+            // selection screen (not locked) a long confirm creates a fresh
+            // OpenCode session instead of being swallowed.
+            if (long_press && !state->agent.session_locked) {
+                (void)wqn::CreateNewOpenCodeSession();
+                wqn::AgentSessionState snapshot;
+                if (wqn::CopyOpenCodeSessionToUi(&snapshot)) {
+                    state->agent = std::move(snapshot);
+                }
+            }
             return RefreshSchedule::kAi;
         }
         if (short_press && !state->agent.session_locked &&
@@ -772,6 +781,33 @@ RefreshSchedule ApplyButtonEvent(
             } else {
                 wqn::CancelOpenCodePrompt();
             }
+            wqn::AgentSessionState snapshot;
+            if (wqn::CopyOpenCodeSessionToUi(&snapshot)) {
+                state->agent = std::move(snapshot);
+            }
+            return RefreshSchedule::kAi;
+        }
+        if (short_press && state->agent.ui.phase == wqn::AiFeaturePhase::kAwaitingPermission &&
+            (event.button == wqn::ButtonId::kUp ||
+             event.button == wqn::ButtonId::kDownPower)) {
+            // While OpenCode waits on a permission ask, Up/Down approve or
+            // deny it from the device instead of scrolling the response.
+            (void)wqn::ReplyPendingOpenCodePermission(
+                event.button == wqn::ButtonId::kUp);
+            wqn::AgentSessionState snapshot;
+            if (wqn::CopyOpenCodeSessionToUi(&snapshot)) {
+                state->agent = std::move(snapshot);
+            }
+            return RefreshSchedule::kAi;
+        }
+        if (event.button == wqn::ButtonId::kConfirm &&
+            event.type == wqn::ButtonEventType::kDoublePress &&
+            !state->agent.current_session_id.empty() &&
+            (state->agent.ui.phase == wqn::AiFeaturePhase::kIdle ||
+             state->agent.ui.phase == wqn::AiFeaturePhase::kComplete)) {
+            // Double confirm re-attaches to the session's live event stream so
+            // a run that outlived the device connection stays observable.
+            (void)wqn::ObserveOpenCodeSession();
             wqn::AgentSessionState snapshot;
             if (wqn::CopyOpenCodeSessionToUi(&snapshot)) {
                 state->agent = std::move(snapshot);

@@ -21,6 +21,7 @@ struct AgentSessionState {
     size_t selected_session = 0;
     std::string current_session_id;
     std::string current_session_title;
+    std::string pending_permission_id;
     int64_t confirmation_armed_at_ms = 0;
     bool session_locked = false;
     bool stream_active = false;

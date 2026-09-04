@@ -19,6 +19,8 @@ const char* AiFeaturePhaseLabel(AiFeaturePhase phase)
             return "提交";
         case AiFeaturePhase::kRunning:
             return "执行";
+        case AiFeaturePhase::kAwaitingPermission:
+            return "待授权";
         case AiFeaturePhase::kComplete:
             return "完成";
         case AiFeaturePhase::kError:
@@ -35,7 +37,8 @@ bool AiFeaturePhaseIsBusy(AiFeaturePhase phase)
            phase == AiFeaturePhase::kRecording ||
            phase == AiFeaturePhase::kTranscribing ||
            phase == AiFeaturePhase::kSubmitting ||
-           phase == AiFeaturePhase::kRunning;
+           phase == AiFeaturePhase::kRunning ||
+           phase == AiFeaturePhase::kAwaitingPermission;
 }
 
 bool AiFeatureCanStartVoiceInput(AiFeaturePhase phase)

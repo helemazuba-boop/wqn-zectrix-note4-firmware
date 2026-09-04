@@ -27,9 +27,11 @@ constexpr uint32_t kWorkerStackBytes = 9216;
 enum class WorkerCommand : uint8_t {
     kNone,
     kLoadSessions,
+    kCreateSession,
     kPrepareCapture,
     kTranscribe,
     kRunPrompt,
+    kObserveSession,
 };
 
 StaticSemaphore_t g_lock_storage = {};
@@ -42,10 +44,14 @@ WorkerCommand g_command = WorkerCommand::kNone;
 bool g_changed = false;
 bool g_recording_requested = false;
 bool g_run_failed = false;
+bool g_observing = false;
 std::string g_run_session_id;
 std::string g_run_prompt;
+wqn::OpenCodeOutboundQueue g_outbound_replies;
 wqn::runtime::SleepLease g_agent_sleep_lease;
 wqn::services::ConnectivityDemand g_connectivity_demand;
+
+void DiscardOutboundReplies();
 
 void MarkChangedLocked()
 {
@@ -157,6 +163,8 @@ void LoadSessions()
             g_state.session_locked = false;
             g_state.current_session_id.clear();
             g_state.current_session_title.clear();
+            g_state.pending_permission_id.clear();
+            g_observing = false;
             g_state.ui.context_label.clear();
             g_state.ui.prompt_text.clear();
             g_state.ui.response_text.clear();
@@ -166,7 +174,7 @@ void LoadSessions()
             g_state.ui.phase = wqn::AiFeaturePhase::kIdle;
             g_state.ui.status_label = "选择 Session";
             g_state.ui.activity_text = "上下选择，确认锁定";
-            g_state.ui.action_hint = "↑/↓ 选择 · 确认锁定";
+            g_state.ui.action_hint = "↑/↓ 选择 · 确认锁定 · 长按新建";
             MarkChangedLocked();
             ReleaseWorkOwnershipLocked();
         }
@@ -184,6 +192,7 @@ void PrepareCapture()
         result = AcquireNetwork();
     }
     bool should_capture = false;
+    bool mic_busy = false;
     xSemaphoreTake(g_lock, portMAX_DELAY);
     should_capture = result == ESP_OK && g_recording_requested;
     xSemaphoreGive(g_lock);
@@ -192,6 +201,7 @@ void PrepareCapture()
         // PCM to its Std/Pro WebSocket. Agent capture is ASR-only until the
         // user confirms, so isolate the microphone before starting it.
         if (wqn::IsAudioCaptureRunning()) {
+            mic_busy = true;
             result = ESP_ERR_INVALID_STATE;
         } else {
             wqn::SetAiAudioCaptureTapEnabled(false);
@@ -203,9 +213,11 @@ void PrepareCapture()
     }
     xSemaphoreTake(g_lock, portMAX_DELAY);
     if (result != ESP_OK) {
-        SetErrorLocked(result == ESP_ERR_INVALID_STATE
-            ? "设备未配对或网络不可用"
-            : "录音启动失败");
+        SetErrorLocked(mic_busy
+            ? "麦克风被其他功能占用"
+            : (result == ESP_ERR_INVALID_STATE
+                ? "设备未配对或网络不可用"
+                : "录音启动失败"));
     } else if (!g_recording_requested) {
         wqn::AudioCaptureChunk discarded;
         xSemaphoreGive(g_lock);
@@ -290,18 +302,31 @@ void OnOpenCodeEvent(const wqn::OpenCodeEvent& event, void*)
             SetPhaseLocked(wqn::AiFeaturePhase::kRunning, "Agent 执行中");
             g_state.ui.activity_text = "OpenCode 已接收任务";
             break;
+        case wqn::OpenCodeEventKind::kAttached:
+            SetPhaseLocked(wqn::AiFeaturePhase::kRunning, "观察中");
+            g_state.ui.activity_text = "已连接 Session 事件流";
+            break;
         case wqn::OpenCodeEventKind::kStatus:
+            g_state.pending_permission_id.clear();
             if (event.status == "idle") {
                 g_state.stream_active = false;
                 if (!g_run_failed) {
                     SetPhaseLocked(wqn::AiFeaturePhase::kComplete, "执行完成");
-                    g_state.ui.action_hint = "长按确认发起新任务";
+                    if (g_observing) {
+                        g_state.ui.status_label = "观察结束";
+                        g_state.ui.activity_text = "无运行中任务或任务已结束";
+                    }
+                    g_state.ui.action_hint = g_observing
+                        ? "长按确认录音 · 双击确认观察"
+                        : "长按确认发起新任务";
                 }
             } else if (event.status == "retry") {
-                SetPhaseLocked(wqn::AiFeaturePhase::kRunning, "Agent 重试中");
+                SetPhaseLocked(wqn::AiFeaturePhase::kRunning,
+                               g_observing ? "观察中" : "Agent 重试中");
                 g_state.ui.activity_text = event.text;
             } else {
-                SetPhaseLocked(wqn::AiFeaturePhase::kRunning, "Agent 执行中");
+                SetPhaseLocked(wqn::AiFeaturePhase::kRunning,
+                               g_observing ? "观察中" : "Agent 执行中");
             }
             break;
         case wqn::OpenCodeEventKind::kTextDelta:
@@ -326,16 +351,19 @@ void OnOpenCodeEvent(const wqn::OpenCodeEvent& event, void*)
             MarkChangedLocked();
             break;
         case wqn::OpenCodeEventKind::kPermission:
+            g_state.ui.phase = wqn::AiFeaturePhase::kAwaitingPermission;
             g_state.ui.status_label = "等待权限";
+            g_state.pending_permission_id = event.permission_id;
             g_state.ui.activity_text = event.text;
             if (!event.preview.empty()) {
                 g_state.ui.activity_text += " · " + event.preview;
             }
-            g_state.ui.action_hint = "请在 OpenCode 端审批";
+            g_state.ui.action_hint = "↑ 批准 · ↓ 拒绝";
             MarkChangedLocked();
             break;
         case wqn::OpenCodeEventKind::kError:
             g_run_failed = true;
+            g_state.pending_permission_id.clear();
             g_state.ui.phase = wqn::AiFeaturePhase::kError;
             g_state.ui.status_label = "执行失败";
             g_state.ui.activity_text = event.text;
@@ -356,7 +384,13 @@ void RunPrompt()
     wqn::OpenCodeResult api_result;
     if (result == ESP_OK) {
         result = wqn::RunOpenCodePrompt(
-            token, g_run_session_id, g_run_prompt, OnOpenCodeEvent, nullptr, &api_result);
+            token,
+            g_run_session_id,
+            g_run_prompt,
+            &g_outbound_replies,
+            OnOpenCodeEvent,
+            nullptr,
+            &api_result);
     }
     xSemaphoreTake(g_lock, portMAX_DELAY);
     if (result != ESP_OK && !g_run_failed) {
@@ -369,6 +403,79 @@ void RunPrompt()
     g_run_session_id.clear();
     g_run_prompt.clear();
     xSemaphoreGive(g_lock);
+    DiscardOutboundReplies();
+}
+
+void CreateSession()
+{
+    std::string token;
+    esp_err_t result = LoadToken(&token);
+    if (result == ESP_OK) {
+        result = AcquireNetwork();
+    }
+    wqn::OpenCodeSessionInfo created;
+    wqn::OpenCodeResult api_result;
+    if (result == ESP_OK) {
+        result = wqn::CreateOpenCodeSession(token, &created, &api_result);
+    }
+
+    xSemaphoreTake(g_lock, portMAX_DELAY);
+    if (result == ESP_OK) {
+        g_state.current_session_id = created.id;
+        g_state.current_session_title = created.title;
+        g_state.session_locked = true;
+        g_observing = false;
+        g_state.pending_permission_id.clear();
+        g_state.ui.context_label = created.title;
+        g_state.ui.phase = wqn::AiFeaturePhase::kIdle;
+        g_state.ui.status_label = "就绪";
+        g_state.ui.activity_text = "新 Session 已创建";
+        g_state.ui.action_hint = "长按确认录音 · 双击确认观察";
+        g_state.ui.prompt_text.clear();
+        g_state.ui.response_text.clear();
+        g_state.ui.scroll_offset_lines = 0;
+        g_state.ui.requires_confirmation = false;
+        g_state.confirmation_armed_at_ms = 0;
+        MarkChangedLocked();
+        ReleaseWorkOwnershipLocked();
+    } else {
+        SetErrorLocked(api_result.detail.empty() ? "Session 创建失败" : api_result.detail);
+    }
+    xSemaphoreGive(g_lock);
+}
+
+void ObserveSession()
+{
+    std::string token;
+    esp_err_t result = LoadToken(&token);
+    if (result == ESP_OK) {
+        result = AcquireNetwork();
+    }
+    wqn::OpenCodeResult api_result;
+    if (result == ESP_OK && g_run_session_id.empty()) {
+        result = ESP_ERR_INVALID_STATE;
+    }
+    if (result == ESP_OK) {
+        result = wqn::WatchOpenCodeSession(
+            token,
+            g_run_session_id,
+            &g_outbound_replies,
+            OnOpenCodeEvent,
+            nullptr,
+            &api_result);
+    }
+    xSemaphoreTake(g_lock, portMAX_DELAY);
+    if (result != ESP_OK && !g_run_failed) {
+        SetErrorLocked(api_result.detail.empty() ? "观察连接失败" : api_result.detail);
+    } else {
+        g_state.stream_active = false;
+        ReleaseWorkOwnershipLocked();
+        MarkChangedLocked();
+    }
+    g_run_session_id.clear();
+    g_observing = false;
+    xSemaphoreGive(g_lock);
+    DiscardOutboundReplies();
 }
 
 void WorkerTask(void*)
@@ -382,6 +489,9 @@ void WorkerTask(void*)
             case WorkerCommand::kLoadSessions:
                 LoadSessions();
                 break;
+            case WorkerCommand::kCreateSession:
+                CreateSession();
+                break;
             case WorkerCommand::kPrepareCapture:
                 PrepareCapture();
                 break;
@@ -390,6 +500,9 @@ void WorkerTask(void*)
                 break;
             case WorkerCommand::kRunPrompt:
                 RunPrompt();
+                break;
+            case WorkerCommand::kObserveSession:
+                ObserveSession();
                 break;
             case WorkerCommand::kNone:
                 break;
@@ -413,6 +526,13 @@ esp_err_t AcquireAgentLeaseLocked()
     }
     g_agent_sleep_lease = std::move(lease);
     return ESP_OK;
+}
+
+void DiscardOutboundReplies()
+{
+    wqn::OpenCodeOutboundReply discard;
+    while (g_outbound_replies.Pop(&discard)) {
+    }
 }
 
 }  // namespace
@@ -505,12 +625,98 @@ esp_err_t LockSelectedOpenCodeSession()
     g_state.current_session_id = selected.id;
     g_state.current_session_title = selected.title;
     g_state.session_locked = true;
+    g_observing = false;
+    g_state.pending_permission_id.clear();
     g_state.ui.context_label = selected.title;
     g_state.ui.phase = AiFeaturePhase::kIdle;
     g_state.ui.status_label = "就绪";
     g_state.ui.activity_text = "长按确认键语音输入";
-    g_state.ui.action_hint = "长按确认录音 · ↑/↓ 滚动";
+    g_state.ui.action_hint = "长按确认录音 · ↑/↓ 滚动 · 双击观察";
     g_state.confirmation_armed_at_ms = 0;
+    MarkChangedLocked();
+    xSemaphoreGive(g_lock);
+    return ESP_OK;
+}
+
+esp_err_t CreateNewOpenCodeSession()
+{
+    ESP_RETURN_ON_ERROR(InitOpenCodeSession(), kTag, "init OpenCode session");
+    xSemaphoreTake(g_lock, portMAX_DELAY);
+    if (g_command != WorkerCommand::kNone) {
+        xSemaphoreGive(g_lock);
+        return ESP_ERR_INVALID_STATE;
+    }
+    esp_err_t result = AcquireAgentLeaseLocked();
+    if (result == ESP_OK && !ArmWorkerLocked(WorkerCommand::kCreateSession)) {
+        result = ESP_ERR_INVALID_STATE;
+    }
+    if (result == ESP_OK) {
+        g_observing = false;
+        g_state.ui.phase = AiFeaturePhase::kLoading;
+        g_state.ui.status_label = "创建 Session";
+        g_state.ui.activity_text = "正在通过 WQN 网关新建";
+        g_state.ui.action_hint.clear();
+        MarkChangedLocked();
+    } else {
+        ReleaseWorkOwnershipLocked();
+    }
+    xSemaphoreGive(g_lock);
+    return result;
+}
+
+esp_err_t ObserveOpenCodeSession()
+{
+    ESP_RETURN_ON_ERROR(InitOpenCodeSession(), kTag, "init OpenCode session");
+    xSemaphoreTake(g_lock, portMAX_DELAY);
+    if (g_command != WorkerCommand::kNone || g_state.current_session_id.empty()) {
+        xSemaphoreGive(g_lock);
+        return ESP_ERR_INVALID_STATE;
+    }
+    esp_err_t result = AcquireAgentLeaseLocked();
+    if (result == ESP_OK && !ArmWorkerLocked(WorkerCommand::kObserveSession)) {
+        result = ESP_ERR_INVALID_STATE;
+    }
+    if (result == ESP_OK) {
+        g_run_failed = false;
+        g_observing = true;
+        g_state.pending_permission_id.clear();
+        // Observe locks the session so the interaction view (not the picker)
+        // renders while the stream is attached; the lock persists afterwards
+        // so the observed session can immediately be prompted as well.
+        g_state.session_locked = true;
+        g_state.ui.phase = AiFeaturePhase::kRunning;
+        g_state.ui.status_label = "观察中";
+        g_state.ui.response_text.clear();
+        g_state.ui.activity_text = "正在连接 Session 事件流";
+        g_state.ui.action_hint.clear();
+        g_state.ui.scroll_offset_lines = 0;
+        g_state.stream_active = true;
+        MarkChangedLocked();
+    } else {
+        ReleaseWorkOwnershipLocked();
+    }
+    xSemaphoreGive(g_lock);
+    return result;
+}
+
+esp_err_t ReplyPendingOpenCodePermission(bool approve)
+{
+    if (g_lock == nullptr) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    xSemaphoreTake(g_lock, portMAX_DELAY);
+    if (g_state.ui.phase != AiFeaturePhase::kAwaitingPermission ||
+        g_state.pending_permission_id.empty()) {
+        xSemaphoreGive(g_lock);
+        return ESP_ERR_INVALID_STATE;
+    }
+    g_outbound_replies.Push(wqn::OpenCodeOutboundReply{
+        g_state.pending_permission_id, approve});
+    g_state.pending_permission_id.clear();
+    g_state.ui.phase = AiFeaturePhase::kRunning;
+    g_state.ui.status_label = g_observing ? "观察中" : "Agent 执行中";
+    g_state.ui.activity_text = approve ? "已批准权限" : "已拒绝权限";
+    g_state.ui.action_hint.clear();
     MarkChangedLocked();
     xSemaphoreGive(g_lock);
     return ESP_OK;

@@ -4,6 +4,7 @@
 #include <array>
 #include <cstdio>
 #include <cstring>
+#include <utility>
 
 #include "cJSON.h"
 #include "config.h"
@@ -186,6 +187,8 @@ void DispatchAgentEvent(
     wqn::OpenCodeEvent event;
     if (event_name == "agent.accepted") {
         event.kind = wqn::OpenCodeEventKind::kAccepted;
+    } else if (event_name == "agent.attached") {
+        event.kind = wqn::OpenCodeEventKind::kAttached;
     } else if (event_name == "agent.status") {
         event.kind = wqn::OpenCodeEventKind::kStatus;
         event.status = JsonString(root, "status");
@@ -216,6 +219,156 @@ void DispatchAgentEvent(
     }
     cJSON_Delete(root);
     callback(event, callback_ctx);
+}
+
+esp_err_t PostPermissionReply(
+    const std::string& token,
+    const std::string& session_id,
+    const wqn::OpenCodeOutboundReply& reply)
+{
+    cJSON* root = cJSON_CreateObject();
+    if (root == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
+    cJSON_AddStringToObject(root, "permission_id", reply.permission_id.c_str());
+    cJSON_AddStringToObject(root, "decision", reply.approve ? "once" : "reject");
+    cJSON_AddBoolToObject(root, "confirmed", true);
+    char* printed = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (printed == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
+    const std::string body = printed;
+    cJSON_free(printed);
+    const std::string path = "/agent/sessions/" + session_id + "/permission";
+    std::string response_body;
+    wqn::OpenCodeResult reply_result;
+    const esp_err_t request_result = OpenJsonRequest(
+        token,
+        AgentUrl(path.c_str()),
+        HTTP_METHOD_POST,
+        &body,
+        &response_body,
+        &reply_result);
+    if (request_result != ESP_OK) {
+        ESP_LOGW(kTag, "permission reply rejected: %s (%s)",
+                 reply_result.error_code.c_str(),
+                 reply_result.detail.c_str());
+    }
+    return request_result;
+}
+
+struct AgentStreamRequest {
+    const std::string& token;
+    const std::string& path;
+    const std::string* request_body;
+    const std::string& session_id;
+    wqn::OpenCodeOutboundQueue* outbound_replies;
+    wqn::OpenCodeEventCallback callback;
+    void* callback_ctx;
+    wqn::OpenCodeResult* result;
+};
+
+void DrainOutboundReplies(const AgentStreamRequest& request)
+{
+    if (request.outbound_replies == nullptr) {
+        return;
+    }
+    wqn::OpenCodeOutboundReply reply;
+    while (request.outbound_replies->Pop(&reply)) {
+        // Reply POSTs run on this worker between stream reads. They open a
+        // short-lived second connection, but never a second task or a second
+        // long-lived TLS session, and the stream itself keeps its socket.
+        PostPermissionReply(request.token, request.session_id, reply);
+    }
+}
+
+esp_err_t ReadAgentEventStream(const AgentStreamRequest& request)
+{
+    const std::string url = AgentUrl(request.path.c_str());
+    esp_http_client_config_t config = {};
+    config.url = url.c_str();
+    config.method =
+        request.request_body != nullptr ? HTTP_METHOD_POST : HTTP_METHOD_GET;
+    config.timeout_ms = 5 * 60 * 1000;
+    config.crt_bundle_attach = esp_crt_bundle_attach;
+    config.buffer_size = 2048;
+    config.buffer_size_tx = 1024;
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (client == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
+    const size_t body_size =
+        request.request_body != nullptr ? request.request_body->size() : 0;
+    esp_err_t request_result = SetCommonHeaders(
+        client,
+        request.token,
+        "text/event-stream",
+        request.request_body != nullptr ? "application/json" : nullptr);
+    if (request_result == ESP_OK) {
+        request_result = esp_http_client_open(client, body_size);
+    }
+    if (request_result == ESP_OK && request.request_body != nullptr) {
+        const int written = esp_http_client_write(
+            client, request.request_body->data(), request.request_body->size());
+        if (written < 0 ||
+            static_cast<size_t>(written) != request.request_body->size()) {
+            request_result = ESP_FAIL;
+        }
+    }
+    if (request_result == ESP_OK) {
+        const int64_t header_result = esp_http_client_fetch_headers(client);
+        request_result = header_result < 0 ? ESP_FAIL : ESP_OK;
+        request.result->http_status = esp_http_client_get_status_code(client);
+        if (request_result == ESP_OK &&
+            (request.result->http_status < 200 ||
+             request.result->http_status >= 300)) {
+            std::string error_body;
+            request_result = ReadBoundedResponse(client, &error_body, kMaxJsonResponseBytes);
+            ParseErrorBody(error_body, request.result);
+            if (request_result == ESP_OK) {
+                request_result = ESP_FAIL;
+            }
+        }
+    }
+    wqn::SseFrameBuffer parser;
+    std::array<char, 768> buffer = {};
+    bool idle_seen = false;
+    while (request_result == ESP_OK && !idle_seen) {
+        const int count = esp_http_client_read(client, buffer.data(), buffer.size());
+        if (count < 0) {
+            request_result = ESP_FAIL;
+            break;
+        }
+        if (count == 0) {
+            break;
+        }
+        parser.feed(buffer.data(), static_cast<size_t>(count));
+        std::string event_name;
+        uint64_t event_id = 0;
+        std::string event_data;
+        while (parser.extract(&event_name, &event_id, &event_data) ==
+               wqn::SseFrameBuffer::FrameState::kComplete) {
+            (void)event_id;
+            DispatchAgentEvent(event_name, event_data, request.callback, request.callback_ctx);
+            if (event_name == "agent.status") {
+                cJSON* status_root = wqn::protocol::JsonNestingWithinLimit(
+                    event_data.data(), event_data.size())
+                    ? cJSON_ParseWithLength(event_data.data(), event_data.size())
+                    : nullptr;
+                idle_seen = JsonString(status_root, "status") == "idle";
+                cJSON_Delete(status_root);
+            }
+        }
+        DrainOutboundReplies(request);
+    }
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+    if (request_result == ESP_OK && !idle_seen) {
+        SetResultError(request.result, request.result->http_status, "stream_incomplete", "Agent stream ended before idle");
+        return ESP_FAIL;
+    }
+    return request_result;
 }
 
 }  // namespace
@@ -349,6 +502,7 @@ esp_err_t RunOpenCodePrompt(
     const std::string& token,
     const std::string& session_id,
     const std::string& prompt,
+    OpenCodeOutboundQueue* outbound_replies,
     OpenCodeEventCallback callback,
     void* callback_ctx,
     OpenCodeResult* result)
@@ -372,80 +526,107 @@ esp_err_t RunOpenCodePrompt(
     const std::string body = printed;
     cJSON_free(printed);
     const std::string path = "/agent/sessions/" + session_id + "/run";
-    const std::string url = AgentUrl(path.c_str());
-    esp_http_client_config_t config = {};
-    config.url = url.c_str();
-    config.method = HTTP_METHOD_POST;
-    config.timeout_ms = 5 * 60 * 1000;
-    config.crt_bundle_attach = esp_crt_bundle_attach;
-    config.buffer_size = 2048;
-    config.buffer_size_tx = 1024;
-    esp_http_client_handle_t client = esp_http_client_init(&config);
-    if (client == nullptr) {
-        return ESP_ERR_NO_MEM;
+    AgentStreamRequest request{
+        token,
+        path,
+        &body,
+        session_id,
+        outbound_replies,
+        callback,
+        callback_ctx,
+        result};
+    return ReadAgentEventStream(request);
+}
+
+esp_err_t WatchOpenCodeSession(
+    const std::string& token,
+    const std::string& session_id,
+    OpenCodeOutboundQueue* outbound_replies,
+    OpenCodeEventCallback callback,
+    void* callback_ctx,
+    OpenCodeResult* result)
+{
+    if (token.empty() || session_id.rfind("ses_", 0) != 0 || result == nullptr) {
+        return ESP_ERR_INVALID_ARG;
     }
-    esp_err_t request_result = SetCommonHeaders(
-        client, token, "text/event-stream", "application/json");
-    if (request_result == ESP_OK) {
-        request_result = esp_http_client_open(client, body.size());
+    *result = OpenCodeResult{};
+    const std::string path = "/agent/sessions/" + session_id + "/events";
+    AgentStreamRequest request{
+        token,
+        path,
+        nullptr,
+        session_id,
+        outbound_replies,
+        callback,
+        callback_ctx,
+        result};
+    return ReadAgentEventStream(request);
+}
+
+void OpenCodeOutboundQueue::Push(OpenCodeOutboundReply reply)
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    items_.push_back(std::move(reply));
+}
+
+bool OpenCodeOutboundQueue::Pop(OpenCodeOutboundReply* out)
+{
+    if (out == nullptr) {
+        return false;
     }
-    if (request_result == ESP_OK) {
-        const int written = esp_http_client_write(client, body.data(), body.size());
-        if (written < 0 || static_cast<size_t>(written) != body.size()) {
-            request_result = ESP_FAIL;
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (items_.empty()) {
+        return false;
+    }
+    *out = std::move(items_.front());
+    items_.erase(items_.begin());
+    return true;
+}
+
+esp_err_t CreateOpenCodeSession(
+    const std::string& token,
+    OpenCodeSessionInfo* session,
+    OpenCodeResult* result)
+{
+    if (token.empty() || session == nullptr || result == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *result = OpenCodeResult{};
+    *session = OpenCodeSessionInfo{};
+    const std::string body = "{}";
+    std::string response;
+    const esp_err_t request_result = OpenJsonRequest(
+        token,
+        AgentUrl("/agent/sessions"),
+        HTTP_METHOD_POST,
+        &body,
+        &response,
+        result);
+    if (request_result != ESP_OK) {
+        return request_result;
+    }
+    cJSON* root = protocol::JsonNestingWithinLimit(response.data(), response.size())
+        ? cJSON_ParseWithLength(response.data(), response.size())
+        : nullptr;
+    cJSON* data = root != nullptr ? cJSON_GetObjectItemCaseSensitive(root, "data") : nullptr;
+    cJSON* row = data != nullptr ? cJSON_GetObjectItemCaseSensitive(data, "session") : nullptr;
+    if (row != nullptr) {
+        session->id = JsonString(row, "id");
+        session->title = JsonString(row, "title");
+        cJSON* updated = cJSON_GetObjectItemCaseSensitive(row, "updatedAt");
+        if (cJSON_IsNumber(updated)) {
+            session->updated_at = static_cast<int64_t>(updated->valuedouble);
         }
     }
-    if (request_result == ESP_OK) {
-        const int64_t header_result = esp_http_client_fetch_headers(client);
-        request_result = header_result < 0 ? ESP_FAIL : ESP_OK;
-        result->http_status = esp_http_client_get_status_code(client);
-        if (request_result == ESP_OK &&
-            (result->http_status < 200 || result->http_status >= 300)) {
-            std::string error_body;
-            request_result = ReadBoundedResponse(client, &error_body, kMaxJsonResponseBytes);
-            ParseErrorBody(error_body, result);
-            if (request_result == ESP_OK) {
-                request_result = ESP_FAIL;
-            }
-        }
+    cJSON_Delete(root);
+    if (session->id.rfind("ses_", 0) != 0) {
+        SetResultError(result, result->http_status, "invalid_response", "Created session is invalid");
+        return ESP_ERR_INVALID_RESPONSE;
     }
-    SseFrameBuffer parser;
-    std::array<char, 768> buffer = {};
-    bool idle_seen = false;
-    while (request_result == ESP_OK && !idle_seen) {
-        const int count = esp_http_client_read(client, buffer.data(), buffer.size());
-        if (count < 0) {
-            request_result = ESP_FAIL;
-            break;
-        }
-        if (count == 0) {
-            break;
-        }
-        parser.feed(buffer.data(), static_cast<size_t>(count));
-        std::string event_name;
-        uint64_t event_id = 0;
-        std::string event_data;
-        while (parser.extract(&event_name, &event_id, &event_data) ==
-               SseFrameBuffer::FrameState::kComplete) {
-            (void)event_id;
-            DispatchAgentEvent(event_name, event_data, callback, callback_ctx);
-            if (event_name == "agent.status") {
-                cJSON* status_root = protocol::JsonNestingWithinLimit(
-                    event_data.data(), event_data.size())
-                    ? cJSON_ParseWithLength(event_data.data(), event_data.size())
-                    : nullptr;
-                idle_seen = JsonString(status_root, "status") == "idle";
-                cJSON_Delete(status_root);
-            }
-        }
+    if (session->title.empty()) {
+        session->title = "新 Session";
     }
-    esp_http_client_close(client);
-    esp_http_client_cleanup(client);
-    if (request_result == ESP_OK && !idle_seen) {
-        SetResultError(result, result->http_status, "stream_incomplete", "Agent stream ended before idle");
-        return ESP_FAIL;
-    }
-    return request_result;
+    return ESP_OK;
 }
 
 }  // namespace wqn
