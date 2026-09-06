@@ -10,6 +10,8 @@
 #include "config.h"
 #include "device_protocol/json_depth_guard.h"
 #include "esp_crt_bundle.h"
+#include "esp_err.h"
+#include "esp_heap_caps.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
 #include "sse_chunk.h"
@@ -251,9 +253,16 @@ esp_err_t PostPermissionReply(
         &response_body,
         &reply_result);
     if (request_result != ESP_OK) {
-        ESP_LOGW(kTag, "permission reply rejected: %s (%s)",
+        // Surface the allocator/transport state alongside the gateway error:
+        // a failed reply here is exactly the internal-RAM contention pattern
+        // the 2026-09 RCA documented, so the log must be diagnosable.
+        ESP_LOGW(kTag,
+                 "permission reply rejected: %s (%s) err=%s internal_free=%u dma_largest=%u",
                  reply_result.error_code.c_str(),
-                 reply_result.detail.c_str());
+                 reply_result.detail.c_str(),
+                 esp_err_to_name(request_result),
+                 static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
+                 static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_DMA)));
     }
     return request_result;
 }
@@ -264,6 +273,8 @@ struct AgentStreamRequest {
     const std::string* request_body;
     const std::string& session_id;
     wqn::OpenCodeOutboundQueue* outbound_replies;
+    wqn::OpenCodeReplyFailedCallback reply_failed;
+    void* reply_failed_ctx;
     wqn::OpenCodeEventCallback callback;
     void* callback_ctx;
     wqn::OpenCodeResult* result;
@@ -279,7 +290,11 @@ void DrainOutboundReplies(const AgentStreamRequest& request)
         // Reply POSTs run on this worker between stream reads. They open a
         // short-lived second connection, but never a second task or a second
         // long-lived TLS session, and the stream itself keeps its socket.
-        PostPermissionReply(request.token, request.session_id, reply);
+        const esp_err_t reply_error =
+            PostPermissionReply(request.token, request.session_id, reply);
+        if (reply_error != ESP_OK && request.reply_failed != nullptr) {
+            request.reply_failed(reply, reply_error, request.reply_failed_ctx);
+        }
     }
 }
 
@@ -503,6 +518,8 @@ esp_err_t RunOpenCodePrompt(
     const std::string& session_id,
     const std::string& prompt,
     OpenCodeOutboundQueue* outbound_replies,
+    OpenCodeReplyFailedCallback reply_failed,
+    void* reply_failed_ctx,
     OpenCodeEventCallback callback,
     void* callback_ctx,
     OpenCodeResult* result)
@@ -532,6 +549,8 @@ esp_err_t RunOpenCodePrompt(
         &body,
         session_id,
         outbound_replies,
+        reply_failed,
+        reply_failed_ctx,
         callback,
         callback_ctx,
         result};
@@ -542,6 +561,8 @@ esp_err_t WatchOpenCodeSession(
     const std::string& token,
     const std::string& session_id,
     OpenCodeOutboundQueue* outbound_replies,
+    OpenCodeReplyFailedCallback reply_failed,
+    void* reply_failed_ctx,
     OpenCodeEventCallback callback,
     void* callback_ctx,
     OpenCodeResult* result)
@@ -557,6 +578,8 @@ esp_err_t WatchOpenCodeSession(
         nullptr,
         session_id,
         outbound_replies,
+        reply_failed,
+        reply_failed_ctx,
         callback,
         callback_ctx,
         result};

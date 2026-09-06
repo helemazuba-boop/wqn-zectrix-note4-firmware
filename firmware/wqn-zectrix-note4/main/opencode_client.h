@@ -50,6 +50,13 @@ struct OpenCodeOutboundReply {
     bool approve = true;
 };
 
+// Invoked on the streaming worker when an outbound permission reply could not
+// be delivered, so the session layer can restore the pending-ask UI instead of
+// silently leaving the run blocked.
+using OpenCodeReplyFailedCallback = void (*)(const OpenCodeOutboundReply& reply,
+                                             esp_err_t error,
+                                             void* user_ctx);
+
 // Thread-safe handoff for permission replies issued while an agent event
 // stream is open. The UI thread pushes; the streaming worker drains between
 // reads (the gateway keep-alive guarantees a read returns at least every ~15
@@ -83,6 +90,8 @@ esp_err_t RunOpenCodePrompt(
     const std::string& session_id,
     const std::string& prompt,
     OpenCodeOutboundQueue* outbound_replies,
+    OpenCodeReplyFailedCallback reply_failed,
+    void* reply_failed_ctx,
     OpenCodeEventCallback callback,
     void* callback_ctx,
     OpenCodeResult* result);
@@ -90,6 +99,8 @@ esp_err_t WatchOpenCodeSession(
     const std::string& token,
     const std::string& session_id,
     OpenCodeOutboundQueue* outbound_replies,
+    OpenCodeReplyFailedCallback reply_failed,
+    void* reply_failed_ctx,
     OpenCodeEventCallback callback,
     void* callback_ctx,
     OpenCodeResult* result);

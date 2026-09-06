@@ -327,6 +327,11 @@ void OnOpenCodeEvent(const wqn::OpenCodeEvent& event, void*)
             } else {
                 SetPhaseLocked(wqn::AiFeaturePhase::kRunning,
                                g_observing ? "观察中" : "Agent 执行中");
+                // Status text (gateway hints, upstream status messages) is
+                // transient context; the next tool/text event replaces it.
+                if (!event.text.empty()) {
+                    g_state.ui.activity_text = event.text;
+                }
             }
             break;
         case wqn::OpenCodeEventKind::kTextDelta:
@@ -374,6 +379,27 @@ void OnOpenCodeEvent(const wqn::OpenCodeEvent& event, void*)
     xSemaphoreGive(g_lock);
 }
 
+void OnOpenCodeReplyFailed(
+    const wqn::OpenCodeOutboundReply& reply, esp_err_t error, void*)
+{
+    xSemaphoreTake(g_lock, portMAX_DELAY);
+    if (g_state.ui.phase == wqn::AiFeaturePhase::kRunning &&
+        g_state.pending_permission_id.empty()) {
+        // No newer ask superseded this one: restore it so the reply can be
+        // retried instead of leaving the run blocked behind a silent failure.
+        g_state.pending_permission_id = reply.permission_id;
+        g_state.ui.phase = wqn::AiFeaturePhase::kAwaitingPermission;
+        g_state.ui.status_label = "权限回复失败";
+        g_state.ui.activity_text = reply.approve ? "批准未送达，可重试"
+                                                 : "拒绝未送达，可重试";
+        g_state.ui.action_hint = "↑ 批准 · ↓ 拒绝";
+        MarkChangedLocked();
+    } else {
+        ESP_LOGW(kTag, "permission reply failed: %s", esp_err_to_name(error));
+    }
+    xSemaphoreGive(g_lock);
+}
+
 void RunPrompt()
 {
     std::string token;
@@ -388,6 +414,8 @@ void RunPrompt()
             g_run_session_id,
             g_run_prompt,
             &g_outbound_replies,
+            OnOpenCodeReplyFailed,
+            nullptr,
             OnOpenCodeEvent,
             nullptr,
             &api_result);
@@ -460,6 +488,8 @@ void ObserveSession()
             token,
             g_run_session_id,
             &g_outbound_replies,
+            OnOpenCodeReplyFailed,
+            nullptr,
             OnOpenCodeEvent,
             nullptr,
             &api_result);
@@ -679,6 +709,9 @@ esp_err_t ObserveOpenCodeSession()
     if (result == ESP_OK) {
         g_run_failed = false;
         g_observing = true;
+        // The worker reads the target session from g_run_session_id, the same
+        // handoff slot ConfirmOpenCodePrompt uses.
+        g_run_session_id = g_state.current_session_id;
         g_state.pending_permission_id.clear();
         // Observe locks the session so the interaction view (not the picker)
         // renders while the stream is attached; the lock persists afterwards
