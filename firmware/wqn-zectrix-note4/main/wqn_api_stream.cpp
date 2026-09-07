@@ -173,15 +173,24 @@ esp_err_t WriteRequestBody(esp_http_client_handle_t client,
   return ESP_OK;
 }
 
+// Sole authoritative capture point for the response status. It must be called
+// only after esp_http_client_fetch_headers() returns.
+//
+// Capturing from HTTP_EVENT_ON_HEADER cannot work: in IDF v5.5 the status code
+// is assigned in http_on_headers_complete (esp_http_client.c:289), i.e. *after*
+// http_on_header_event() dispatches the last ON_HEADER (:288), and
+// http_on_status is a no-op (:237). fetch_headers() additionally resets
+// status_code to -1 on entry (:1565), so every ON_HEADER callback observes
+// -1 - latching it there (as this code once did) permanently suppressed the
+// 4xx/5xx check.
 void CaptureHttpStatus(StreamContext* ctx, esp_http_client_handle_t client)
 {
   if (ctx == nullptr || client == nullptr || ctx->http_status > 0) {
     return;
   }
   const int status = esp_http_client_get_status_code(client);
-  // IDF can emit the first HTTP_EVENT_ON_HEADER before exposing the parsed
-  // status code. Do not latch its transient -1 value and suppress all later
-  // checks; fetch_headers() calls this helper again once parsing is complete.
+  // A non-positive value means "not parsed yet", not "no status". Never latch
+  // it, or every later check is suppressed.
   if (status <= 0) {
     return;
   }
@@ -203,10 +212,9 @@ esp_err_t OnHttpEvent(esp_http_client_event_t* evt)
     }
     case HTTP_EVENT_ON_HEADER: {
       // ESP-IDF v5.4+ removed HTTP_EVENT_HEADERS_RECEIVED in favour of
-      // HTTP_EVENT_ON_HEADER which fires once per header line. We only care
-      // about the status code, so grab it on the first header and ignore the
-      // rest. Subsequent header events fall through to the parser unchanged.
-      CaptureHttpStatus(ctx, evt->client);
+      // HTTP_EVENT_ON_HEADER, which fires once per header line. The status
+      // code is deliberately not read here: it is still -1 at every ON_HEADER
+      // (see CaptureHttpStatus). Fall through unchanged.
       break;
     }
     case HTTP_EVENT_ON_DATA: {
@@ -363,18 +371,20 @@ esp_err_t UploadAiAudioChatStream(const WqnAiStreamRequest& request,
   }
 
   if (err == ESP_OK) {
-    // fetch_headers returns the response Content-Length (which may be a
-    // positive byte count), not esp_err_t. Treat every non-negative value as
-    // success so a buffered/non-chunked SSE response is still consumed.
+    // fetch_headers returns the response Content-Length (0 for a chunked SSE
+    // response), not esp_err_t. Treat every non-negative value as success so a
+    // buffered/non-chunked SSE response is still consumed.
     const int64_t header_result = esp_http_client_fetch_headers(client);
+    // Capture unconditionally: a failed fetch can still leave a parsed status
+    // behind, and a missed 4xx/5xx would otherwise surface as a generic
+    // transport error instead of its mapped error_code.
+    CaptureHttpStatus(&ctx, client);
     err = header_result < 0 ? ESP_FAIL : ESP_OK;
-    if (err == ESP_OK) {
-      CaptureHttpStatus(&ctx, client);
-      if (ctx.http_status <= 0) {
-        ctx.error_code = "bad_response";
-        ctx.error_message = "HTTP response status unavailable";
-        err = ESP_FAIL;
-      }
+    if (err == ESP_OK && ctx.http_status <= 0) {
+      ctx.fatal = true;
+      ctx.error_code = "bad_response";
+      ctx.error_message = "HTTP response status unavailable";
+      err = ESP_FAIL;
     }
   }
   if (err == ESP_OK) {

@@ -25,6 +25,7 @@
 #include "stdpro_ws_transport.h"
 #include "storage.h"
 #include "wqn_api.h"
+#include "error_recorder.h"
 
 namespace {
 
@@ -39,31 +40,37 @@ constexpr int kMinAudioRms = 8;
 constexpr TickType_t kWifiReadyWait = pdMS_TO_TICKS(35000);
 
 SemaphoreHandle_t g_lock = nullptr;
-TaskHandle_t g_submit_task = nullptr;
+TaskHandle_t g_ai_worker = nullptr;
 enum class AiWorkerCommand : uint8_t {
     kNone,
     kPrepareRecording,
     kSubmitSession,
 };
+// Single source of truth for the shared worker: kNone means the worker is
+// parked and neither phase is in flight. "Prepare dispatched", "submit
+// dispatched" and "worker busy" are all derived from this one value - do not
+// reintroduce per-phase booleans, they drift from it.
 AiWorkerCommand g_worker_command = AiWorkerCommand::kNone;
-// True while the corresponding phase of the shared AI worker is parked. The
-// worker's single static stack is reused for both preparation and submission.
-bool g_submit_parked = true;
+// Dispatch timestamp (ms) of the outstanding command.
+uint32_t g_worker_command_since_ms = 0;
+// Only the worker itself can clear g_worker_command, so a phase that blocks in
+// an unbounded call would wedge both entry points forever with a W line per
+// rejected attempt and no clue as to why. Past this age, report at E level.
+constexpr uint32_t kWorkerStuckReportMs = 60000;
 // [ai-worker-reserve] Statically-stored stack/TCB for the AI worker. Field data
 // (wqn-device 2026-08-23): after the
 // first TLS upload the internal largest free block settles at 6.4-6.9 KiB, so
 // transient xTaskCreate calls deterministically fail on later turns. A single
 // once-created worker removes both prepare and submit stacks from that failure
 // surface without reserving a second permanent 6 KiB internal stack.
-constexpr uint32_t kSubmitTaskStackBytes = 7168;
-StaticTask_t g_submit_task_tcb = {};
-StackType_t g_submit_task_stack[kSubmitTaskStackBytes / sizeof(StackType_t)] = {};
+constexpr uint32_t kAiWorkerStackBytes = 7168;
+StaticTask_t g_ai_worker_tcb = {};
+StackType_t g_ai_worker_stack[kAiWorkerStackBytes / sizeof(StackType_t)] = {};
 wqn::AiSessionState g_state;
 std::string g_conversation_id;
 bool g_changed = false;
 bool g_loaded_today = false;
 bool g_prepare_active = false;
-bool g_prepare_parked = true;
 bool g_recording_requested = false;
 uint32_t g_prepare_generation = 0;
 uint32_t g_prepare_command_generation = 0;
@@ -215,16 +222,50 @@ void ReleaseAiSleepLeaseIfIdleLocked()
         g_state.status == wqn::AiSessionStatus::kListening ||
         g_state.status == wqn::AiSessionStatus::kWaitingReply ||
         g_state.status == wqn::AiSessionStatus::kStreaming;
-    if (!g_prepare_active && g_prepare_parked && g_submit_parked &&
+    if (!g_prepare_active && g_worker_command == AiWorkerCommand::kNone &&
         !g_streaming_active && !state_active) {
         g_ai_connectivity_demand.Reset();
         g_ai_sleep_lease.Reset();
     }
 }
 
+bool SubmitDispatchedLocked()
+{
+    return g_worker_command == AiWorkerCommand::kSubmitSession;
+}
+
+uint32_t WorkerCommandAgeMsLocked()
+{
+    if (g_worker_command == AiWorkerCommand::kNone) {
+        return 0;
+    }
+    const uint32_t now_ms = static_cast<uint32_t>(esp_timer_get_time() / 1000);
+    return now_ms - g_worker_command_since_ms;
+}
+
+// Called from the entry points that reject while a command is outstanding.
+// Without it a worker blocked inside a phase shows up only as an unexplained
+// run of "record start rejected" / "record stop rejected" W lines.
+void ReportStuckWorkerIfAnyLocked(const char* entry)
+{
+    const uint32_t age_ms = WorkerCommandAgeMsLocked();
+    if (age_ms < kWorkerStuckReportMs) {
+        return;
+    }
+    ESP_LOGE(kTag,
+             "AI worker stuck: entry=%s command=%d age_ms=%lu; only the worker "
+             "can clear the command, so AI stays wedged until reboot",
+             entry, static_cast<int>(g_worker_command),
+             static_cast<unsigned long>(age_ms));
+    // [dev-diag] A wedged worker survives every transient SetErrorLocked;
+    // keep it in the ring with the wedged command id.
+    wqn::RecordError(
+        "ai", "worker stuck cmd=%d age=%lums", static_cast<int>(g_worker_command),
+        static_cast<unsigned long>(age_ms));
+}
+
 void FinishSubmitTaskLocked()
 {
-    g_submit_parked = true;
     if (g_worker_command == AiWorkerCommand::kSubmitSession) {
         g_worker_command = AiWorkerCommand::kNone;
     }
@@ -556,10 +597,13 @@ void FinishPrepareTaskLocked(uint32_t generation)
     if (generation == g_prepare_generation) {
         g_prepare_active = false;
     }
-    g_prepare_parked = true;
     if (g_worker_command == AiWorkerCommand::kPrepareRecording) {
         g_worker_command = AiWorkerCommand::kNone;
     }
+    // Peak-stack evidence for the prepare chain. The worker reuses one stack
+    // for both phases and is never recreated, so this reads the merged-phase
+    // high-water mark, not just this turn's.
+    LogAiMemory("prepare-end");
     ReleaseAiSleepLeaseIfIdleLocked();
 }
 
@@ -920,6 +964,9 @@ void SubmitSession()
                     ? response.error_code
                     : response.error_message;
                 SetErrorLocked(msg.empty() ? "AI 请求失败" : ("AI 请求失败: " + msg));
+                // [dev-diag] Server-side cause would otherwise be overwritten
+                // by the next turn's state.
+                wqn::RecordError("ai", "request failed %s", msg.c_str());
             }
         } else if (g_state.status != wqn::AiSessionStatus::kReplyReady) {
             // Stream finished cleanly but never delivered a `final` event: surface a
@@ -1070,7 +1117,7 @@ void PrepareRecordingSession(uint32_t generation)
     if (result == ESP_OK) {
         xSemaphoreTake(g_lock, portMAX_DELAY);
         should_start_capture = g_recording_requested && IsCurrentPrepareTaskLocked(generation) &&
-                               g_state.status == wqn::AiSessionStatus::kPreparingCapture && g_submit_parked;
+                               g_state.status == wqn::AiSessionStatus::kPreparingCapture && !SubmitDispatchedLocked();
         if (should_start_capture) {
             g_state.pending_text = "正在启动录音...";
             g_state.status_since_ms = esp_timer_get_time() / 1000;
@@ -1157,7 +1204,7 @@ void PrepareRecordingSession(uint32_t generation)
         xSemaphoreTake(g_lock, portMAX_DELAY);
         proceed_network =
             g_recording_requested && IsCurrentPrepareTaskLocked(generation) &&
-            g_state.status == wqn::AiSessionStatus::kPreparingCapture && g_submit_parked;
+            g_state.status == wqn::AiSessionStatus::kPreparingCapture && !SubmitDispatchedLocked();
         xSemaphoreGive(g_lock);
 
         if (proceed_network) {
@@ -1201,7 +1248,7 @@ void PrepareRecordingSession(uint32_t generation)
     bool stop_started_capture = false;
     xSemaphoreTake(g_lock, portMAX_DELAY);
     const bool still_requested = g_recording_requested && IsCurrentPrepareTaskLocked(generation) &&
-                                 g_state.status == wqn::AiSessionStatus::kPreparingCapture && g_submit_parked;
+                                 g_state.status == wqn::AiSessionStatus::kPreparingCapture && !SubmitDispatchedLocked();
     if (result == ESP_OK && still_requested) {
         g_recording_requested = false;
         g_state.status = wqn::AiSessionStatus::kListening;
@@ -1229,6 +1276,8 @@ void PrepareRecordingSession(uint32_t generation)
     const bool current = IsCurrentPrepareTaskLocked(generation);
     if (result != ESP_OK && still_requested) {
         SetErrorLocked(std::string("录音启动失败: ") + esp_err_to_name(result));
+        // [dev-diag] Mic bring-up failure detail (dev diagnostics §5).
+        wqn::RecordError("ai", "record start failed %s", esp_err_to_name(result));
     } else if (current && !still_requested && g_state.status == wqn::AiSessionStatus::kPreparingCapture) {
         SetCancelledBeforeRecordingLocked();
     }
@@ -1269,6 +1318,11 @@ void AiSessionWorkerTask(void*)
                 SubmitSession();
                 break;
             case AiWorkerCommand::kNone:
+                // Woken with nothing to do: either a duplicate notification or
+                // a command that was cleared before this wake-up. Loud, because
+                // a genuinely lost dispatch is otherwise invisible.
+                ESP_LOGW(kTag, "AI worker woken with no command; command=%d",
+                         static_cast<int>(command));
                 break;
         }
     }
@@ -1294,16 +1348,16 @@ esp_err_t InitAiSession()
             return ESP_ERR_NO_MEM;
         }
     }
-    if (g_submit_task == nullptr) {
-        g_submit_task = xTaskCreateStatic(
+    if (g_ai_worker == nullptr) {
+        g_ai_worker = xTaskCreateStatic(
             AiSessionWorkerTask,
             "wqn_ai_worker",
-            kSubmitTaskStackBytes,
+            kAiWorkerStackBytes,
             nullptr,
             5,
-            g_submit_task_stack,
-            &g_submit_task_tcb);
-        if (g_submit_task == nullptr) {
+            g_ai_worker_stack,
+            &g_ai_worker_tcb);
+        if (g_ai_worker == nullptr) {
             return ESP_ERR_NO_MEM;
         }
     }
@@ -1326,13 +1380,13 @@ esp_err_t StartAiRecordingSession()
     xSemaphoreTake(g_lock, portMAX_DELAY);
     if (g_state.status == AiSessionStatus::kPreparingCapture ||
         g_state.status == AiSessionStatus::kListening || g_state.status == AiSessionStatus::kWaitingReply ||
-        !g_submit_parked || !g_prepare_parked || g_prepare_active ||
-        g_worker_command != AiWorkerCommand::kNone) {
+        g_prepare_active || g_worker_command != AiWorkerCommand::kNone) {
+        ReportStuckWorkerIfAnyLocked("start");
         ESP_LOGW(kTag,
-                 "record start rejected: status=%d submit_parked=%d prepare_parked=%d prepare_active=%d command=%d",
-                 static_cast<int>(g_state.status), g_submit_parked ? 1 : 0,
-                 g_prepare_parked ? 1 : 0, g_prepare_active ? 1 : 0,
-                 static_cast<int>(g_worker_command));
+                 "record start rejected: status=%d prepare_active=%d command=%d age_ms=%lu",
+                 static_cast<int>(g_state.status), g_prepare_active ? 1 : 0,
+                 static_cast<int>(g_worker_command),
+                 static_cast<unsigned long>(WorkerCommandAgeMsLocked()));
         xSemaphoreGive(g_lock);
         return ESP_ERR_INVALID_STATE;
     }
@@ -1355,14 +1409,17 @@ esp_err_t StartAiRecordingSession()
     g_state.scroll_offset_lines = 0;
     g_state.status_since_ms = esp_timer_get_time() / 1000;
     g_prepare_active = true;
-    g_prepare_parked = false;
     g_recording_requested = true;
     const uint32_t prepare_generation = ++g_prepare_generation;
     g_prepare_command_generation = prepare_generation;
     g_worker_command = AiWorkerCommand::kPrepareRecording;
+    g_worker_command_since_ms = static_cast<uint32_t>(esp_timer_get_time() / 1000);
     MarkChanged();
     xSemaphoreGive(g_lock);
-    xTaskNotifyGive(g_submit_task);
+    // InitAiSession() only returns ESP_OK with a live worker, so g_ai_worker
+    // is non-null here. Do not add a null check after this point: the state
+    // above is already published and bailing out would wedge the session.
+    xTaskNotifyGive(g_ai_worker);
     return ESP_OK;
 }
 
@@ -1370,7 +1427,8 @@ esp_err_t StopAiRecordingAndSubmit()
 {
     ESP_RETURN_ON_ERROR(InitAiSession(), kTag, "init AI session");
     xSemaphoreTake(g_lock, portMAX_DELAY);
-    if (!g_submit_parked) {
+    if (SubmitDispatchedLocked()) {
+        // A submission is already in flight; the stop that dispatched it wins.
         xSemaphoreGive(g_lock);
         return ESP_OK;
     }
@@ -1398,22 +1456,23 @@ esp_err_t StopAiRecordingAndSubmit()
         xSemaphoreGive(g_lock);
         return ESP_ERR_INVALID_STATE;
     }
-    if (!g_prepare_parked || g_worker_command != AiWorkerCommand::kNone ||
-        g_submit_task == nullptr) {
+    if (g_worker_command != AiWorkerCommand::kNone || g_ai_worker == nullptr) {
+        ReportStuckWorkerIfAnyLocked("stop");
         ESP_LOGW(kTag,
-                 "record stop rejected: prepare_parked=%d command=%d worker=%p",
-                 g_prepare_parked ? 1 : 0, static_cast<int>(g_worker_command),
-                 static_cast<void*>(g_submit_task));
+                 "record stop rejected: command=%d age_ms=%lu worker=%p",
+                 static_cast<int>(g_worker_command),
+                 static_cast<unsigned long>(WorkerCommandAgeMsLocked()),
+                 static_cast<void*>(g_ai_worker));
         xSemaphoreGive(g_lock);
         return ESP_ERR_INVALID_STATE;
     }
     SetStateLocked(AiSessionStatus::kWaitingReply, "正在停止录音...", "", "");
-    g_submit_parked = false;
     g_worker_command = AiWorkerCommand::kSubmitSession;
+    g_worker_command_since_ms = static_cast<uint32_t>(esp_timer_get_time() / 1000);
     xSemaphoreGive(g_lock);
 
     LogAiMemory("before-submit-dispatch");
-    xTaskNotifyGive(g_submit_task);
+    xTaskNotifyGive(g_ai_worker);
     return ESP_OK;
 }
 
@@ -1562,7 +1621,7 @@ bool IsAiSessionActive()
     }
     xSemaphoreTake(g_lock, portMAX_DELAY);
     const bool active =
-        g_prepare_active || !g_prepare_parked || !g_submit_parked ||
+        g_prepare_active || g_worker_command != AiWorkerCommand::kNone ||
         g_streaming_active || g_state.status == AiSessionStatus::kPreparingCapture ||
         g_state.status == AiSessionStatus::kListening ||
         g_state.status == AiSessionStatus::kWaitingReply;
