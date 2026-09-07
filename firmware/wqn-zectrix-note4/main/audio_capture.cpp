@@ -755,6 +755,23 @@ bool IsAudioCaptureRunning()
     return running;
 }
 
+size_t PeekAudioCaptureSamples(const int16_t** out_samples)
+{
+    if (out_samples == nullptr) {
+        return 0;
+    }
+    *out_samples = nullptr;
+    if (g_audio.mutex == nullptr) {
+        return 0;
+    }
+    xSemaphoreTake(g_audio.mutex, portMAX_DELAY);
+    const bool usable = g_audio.running && g_audio.chunk.samples != nullptr;
+    const size_t count = usable ? g_audio.chunk.sample_count : 0;
+    *out_samples = usable ? g_audio.chunk.samples : nullptr;
+    xSemaphoreGive(g_audio.mutex);
+    return count;
+}
+
 void ReleaseAudioCapturePower()
 {
     // GPIO42 remains warm during runtime and capture already keeps the PA

@@ -35,4 +35,10 @@ bool IsAudioCaptureRunning();
 typedef void (*AudioCaptureTapFn)(const int16_t* samples, size_t count, void* ctx);
 void SetAudioCaptureTap(AudioCaptureTapFn cb, void* ctx);
 
+// Samples captured so far in the running session, plus a read-only view of
+// them, so a streaming transport can replay what the microphone recorded
+// before its turn became ready. Returns 0 (and stores nullptr) when no
+// capture is running. The view stays valid until the next StopAudioCapture().
+size_t PeekAudioCaptureSamples(const int16_t** out_samples);
+
 }  // namespace wqn
