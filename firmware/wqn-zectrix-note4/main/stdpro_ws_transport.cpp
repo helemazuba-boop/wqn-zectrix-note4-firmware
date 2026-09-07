@@ -36,7 +36,16 @@ constexpr UBaseType_t kTransportTaskPriority = 7;
 // block. This task never self-deletes and CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM
 // is enabled, so reserve one stable PSRAM stack and retain only its TCB in
 // internal RAM (the same ownership model used by Flash stream/playback).
-constexpr uint32_t kTransportTaskStackBytes = 8192;
+//
+// The unit is StackType_t WORDS, not bytes: xTaskCreateStatic indexes
+// puxStackBuffer[ulStackDepth - 1] and memsets ulStackDepth*sizeof(StackType_t)
+// (FreeRTOS-Kernel/tasks.c:1054, :1044). The "Words" suffix keeps that unit
+// visible at every use site -- it was previously named "...Bytes" and passed
+// to xTaskCreateStatic directly, so the task was handed an 8 KiB buffer while
+// declaring 8192 words (32 KiB) and ran ~9 KiB past its allocation.
+// 8192 words restores the depth this task had as a dynamic xTaskCreate before
+// the PSRAM move; device-measured peak is 4480 words (HWM 3712).
+constexpr uint32_t kTransportTaskStackWords = 8192;
 // [stream-depth] Device-observed failure: an SSE burst of 1287 bytes arrived
 // with only 512 B free in an 8 KiB buffer -> overflow -> ResetRequired killed
 // a healthy connection mid-turn. Consumer (this same owner task) can stall
@@ -809,7 +818,7 @@ void HandleAllNotificationBits(uint32_t bits)
 // PCM pump: during a turn this task dequeues one 15 ms block per iteration,
 // prefixes a WFLV header and hands it to the WebSocket client.
 //
-// Its stack lives in PSRAM (see kTransportTaskStackBytes). That is legal here
+// Its stack lives in PSRAM (see kTransportTaskStackWords). That is legal here
 // because CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM is enabled, no ISR touches
 // this task's stack, and it performs no SPI-flash/NVS writes - external RAM is
 // unreachable while the cache is disabled. Do not add any of those to this
@@ -1078,9 +1087,10 @@ esp_err_t InitPrimitives()
             &g_text_stream_control);
     bool task_stack_in_psram = false;
     // No zeroing: a task stack has no meaningful initial contents and calloc
-    // would touch all 8 KiB for nothing.
+    // would touch the whole stack for nothing.
     prims.transport_task_stack = static_cast<StackType_t*>(
-        AllocPrefersPsram(kTransportTaskStackBytes, &task_stack_in_psram));
+        AllocPrefersPsram(kTransportTaskStackWords * sizeof(StackType_t),
+                          &task_stack_in_psram));
 
     const bool allocations_ok = prims.transport_mutex != nullptr &&
         prims.sync_op_sem != nullptr && prims.final_sem != nullptr &&
@@ -1096,7 +1106,7 @@ esp_err_t InitPrimitives()
     }
 
     TaskHandle_t transport_task = xTaskCreateStatic(
-        VoiceWsTransportTask, "wqn_vws_ctrl", kTransportTaskStackBytes, nullptr,
+        VoiceWsTransportTask, "wqn_vws_ctrl", kTransportTaskStackWords, nullptr,
         kTransportTaskPriority,
         prims.transport_task_stack, &g_transport_task_tcb);
     if (transport_task == nullptr) {
@@ -1134,7 +1144,7 @@ esp_err_t InitPrimitives()
              g_text_stream_storage,
              static_cast<unsigned>(kTextStreamBufferSize),
              g_transport_task_stack,
-             static_cast<unsigned>(kTransportTaskStackBytes),
+             static_cast<unsigned>(kTransportTaskStackWords * sizeof(StackType_t)),
              task_stack_in_psram ? 1 : 0);
     LogTransportMemory("transport-primitives-ready");
     return ESP_OK;
