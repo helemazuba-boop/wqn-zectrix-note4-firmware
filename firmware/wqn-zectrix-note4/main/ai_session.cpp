@@ -63,9 +63,21 @@ constexpr uint32_t kWorkerStuckReportMs = 60000;
 // transient xTaskCreate calls deterministically fail on later turns. A single
 // once-created worker removes both prepare and submit stacks from that failure
 // surface without reserving a second permanent 6 KiB internal stack.
-constexpr uint32_t kAiWorkerStackBytes = 7168;
+//
+// The unit is StackType_t WORDS, not bytes: xTaskCreateStatic indexes
+// puxStackBuffer[ulStackDepth - 1] and memsets ulStackDepth*sizeof(StackType_t)
+// (FreeRTOS-Kernel/tasks.c:1054, :1044). This constant was previously named
+// "...Bytes" with the buffer sized kAiWorkerStackBytes/sizeof(StackType_t), so
+// the worker declared 7168 words (28 KiB) while owning 7 KiB and kept its
+// working set in whatever followed that array in BSS.
+//
+// 7168 words is the depth this worker has always declared. The stack is
+// allocated from PSRAM rather than BSS because 28 KiB of internal RAM is not
+// affordable here; the worker performs no SPI-flash/NVS writes, so external
+// RAM is safe. The TCB stays internal.
+constexpr uint32_t kAiWorkerStackWords = 7168;
 StaticTask_t g_ai_worker_tcb = {};
-StackType_t g_ai_worker_stack[kAiWorkerStackBytes / sizeof(StackType_t)] = {};
+StackType_t* g_ai_worker_stack = nullptr;
 wqn::AiSessionState g_state;
 std::string g_conversation_id;
 bool g_changed = false;
@@ -1349,10 +1361,19 @@ esp_err_t InitAiSession()
         }
     }
     if (g_ai_worker == nullptr) {
+        if (g_ai_worker_stack == nullptr) {
+            // No zeroing: a task stack has no meaningful initial contents.
+            g_ai_worker_stack = static_cast<StackType_t*>(heap_caps_malloc(
+                kAiWorkerStackWords * sizeof(StackType_t),
+                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        }
+        if (g_ai_worker_stack == nullptr) {
+            return ESP_ERR_NO_MEM;
+        }
         g_ai_worker = xTaskCreateStatic(
             AiSessionWorkerTask,
             "wqn_ai_worker",
-            kAiWorkerStackBytes,
+            kAiWorkerStackWords,
             nullptr,
             5,
             g_ai_worker_stack,
