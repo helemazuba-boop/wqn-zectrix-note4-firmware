@@ -4,6 +4,17 @@
 #define WQN_FIRMWARE_VERSION "0.1.0"
 #define WQN_BOARD_ID "zectrix-s3-epaper-4.2"
 
+// [dev-diag] Configure-time build identity injected by main/CMakeLists.txt.
+// The #ifndef fallbacks cover tooling that parses config.h without the build's
+// compile definitions. NOT appended to WQN_FIRMWARE_VERSION: that string is
+// part of the sync image_id and the EPD frame signature.
+#ifndef WQN_GIT_COMMIT
+#define WQN_GIT_COMMIT "unknown"
+#endif
+#ifndef WQN_BUILD_TIME
+#define WQN_BUILD_TIME "unknown"
+#endif
+
 #ifndef WQN_API_BASE
 #define WQN_API_BASE "https://wqn.helema.cn/api/esp32"
 #endif

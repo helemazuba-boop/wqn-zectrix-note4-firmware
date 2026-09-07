@@ -231,8 +231,13 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
         return RefreshSchedule::kNone;
     }
 
+    // [dev-diag] kDevInfo/kDevSync/kDevErrors share the read-only dialog
+    // contract: confirm (short or long) closes; up/down do nothing.
     if (state->settings.dialog == wqn::SettingsDialog::kBattery ||
-        state->settings.dialog == wqn::SettingsDialog::kStorage) {
+        state->settings.dialog == wqn::SettingsDialog::kStorage ||
+        state->settings.dialog == wqn::SettingsDialog::kDevInfo ||
+        state->settings.dialog == wqn::SettingsDialog::kDevSync ||
+        state->settings.dialog == wqn::SettingsDialog::kDevErrors) {
         if (event.button == wqn::ButtonId::kConfirm && (short_press || long_press)) {
             state->settings.dialog = wqn::SettingsDialog::kNone;
             return RefreshSchedule::kConfig;
@@ -347,40 +352,51 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
     }
 
     switch (state->settings.selected) {
-        case 0:
+        case wqn::kSettingsRowWifi:
             OpenSettingsDialog(state, wqn::SettingsDialog::kWifiManage);
             return RefreshSchedule::kConfig;
-        case 1:
+        case wqn::kSettingsRowSyncNow:
             wqn::services::RequestSyncNow();
             state->settings.sync_status = "已请求同步";
             state->settings.notice = "已请求同步";
             return RefreshSchedule::kConfig;
-        case 2:
+        case wqn::kSettingsRowAutoSync:
             OpenSettingsDialog(state, wqn::SettingsDialog::kAutoSync);
             return RefreshSchedule::kConfig;
-        case 3:
+        case wqn::kSettingsRowBattery:
             OpenSettingsDialog(state, wqn::SettingsDialog::kBattery);
             return RefreshSchedule::kConfig;
-        case 4:
+        case wqn::kSettingsRowStorage:
             OpenSettingsDialog(state, wqn::SettingsDialog::kStorage);
             return RefreshSchedule::kConfig;
-        case 5:
+        case wqn::kSettingsRowImageRender:
             OpenSettingsDialog(state, wqn::SettingsDialog::kImageRendering);
             return RefreshSchedule::kConfig;
-        case 6:
+        case wqn::kSettingsRowVolume:
             OpenSettingsDialog(state, wqn::SettingsDialog::kVolume);
             return RefreshSchedule::kConfig;
-        case 7:
+        case wqn::kSettingsRowWordDeck:
             OpenSettingsDialog(state, wqn::SettingsDialog::kDefaultWordDeck);
             return RefreshSchedule::kConfig;
-        case 8:
+        case wqn::kSettingsRowVersion:
             UpdateSettingsDiagnostics(state);
             state->settings.notice = "固件 " + state->settings.diagnostics.firmware_version;
             return RefreshSchedule::kConfig;
-        case 9:
+#if CONFIG_WQN_DEV_MENU_ENABLE
+        case wqn::kSettingsRowDevInfo:
+            OpenSettingsDialog(state, wqn::SettingsDialog::kDevInfo);
+            return RefreshSchedule::kConfig;
+        case wqn::kSettingsRowDevSync:
+            OpenSettingsDialog(state, wqn::SettingsDialog::kDevSync);
+            return RefreshSchedule::kConfig;
+        case wqn::kSettingsRowDevErrors:
+            OpenSettingsDialog(state, wqn::SettingsDialog::kDevErrors);
+            return RefreshSchedule::kConfig;
+#endif
+        case wqn::kSettingsRowFactoryReset:
             OpenSettingsDialog(state, wqn::SettingsDialog::kFactoryReset);
             return RefreshSchedule::kConfig;
-        case 10:
+        case wqn::kSettingsRowPowerOff:
             OpenSettingsDialog(state, wqn::SettingsDialog::kPowerOff);
             return RefreshSchedule::kConfig;
         default:

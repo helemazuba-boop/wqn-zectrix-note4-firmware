@@ -58,21 +58,24 @@ esp_err_t DrawSettingsRow(size_t row_index, int y, const std::string& title, con
         ESP_RETURN_ON_ERROR(DrawClippedText(kContentX + 48, y + 20, 250, value), kTag, "draw settings value");
     }
     const char* tag = "菜单";
-    if (row_index == 0) {
+    if (row_index == wqn::kSettingsRowWifi) {
         tag = "设置";  // WiFi manage
-    } else if (row_index == 1) {
+    } else if (row_index == wqn::kSettingsRowSyncNow) {
         tag = "执行";  // sync now
-    } else if (row_index == 2) {
-        tag = "设置";  // auto sync interval
-    } else if (row_index == 5) {
-        tag = "设置";  // image rendering
-    } else if (row_index == 6) {
-        tag = "设置";  // volume
-    } else if (row_index == 7) {
-        tag = "设置";  // default word deck
-    } else if (row_index == 8) {
+    } else if (row_index == wqn::kSettingsRowAutoSync ||
+               row_index == wqn::kSettingsRowImageRender ||
+               row_index == wqn::kSettingsRowVolume ||
+               row_index == wqn::kSettingsRowWordDeck) {
+        tag = "设置";
+    } else if (row_index == wqn::kSettingsRowVersion) {
         tag = "系统";  // firmware version
-    } else if (row_index == 9) {
+#if CONFIG_WQN_DEV_MENU_ENABLE
+    } else if (row_index == wqn::kSettingsRowDevInfo ||
+               row_index == wqn::kSettingsRowDevSync ||
+               row_index == wqn::kSettingsRowDevErrors) {
+        tag = "系统";  // dev diagnostics rows
+#endif
+    } else if (row_index == wqn::kSettingsRowFactoryReset) {
         tag = "重置";  // factory reset
     }
     DrawChip(kContentX + kContentWidth - 6 - 54, y + 8, 54, 20, tag);
@@ -259,6 +262,71 @@ esp_err_t RenderSettingsDialog(const wqn::SettingsAppState& settings)
             ESP_RETURN_ON_ERROR(DrawCenteredText(86, 226, 228, "上下选择  确认保存"), kTag, "draw word deck help");
             break;
         }
+        case wqn::SettingsDialog::kDevInfo: {
+            // [dev-diag] Read-only build/runtime snapshot (DEV_DIAGNOSTICS.md
+            // §4.1). Six clipped lines at the kBattery 20px pitch.
+            ESP_RETURN_ON_ERROR(DrawSettingsDialogBox("Dev 信息"), kTag, "draw dev info dialog");
+            const std::string dev_version =
+                diag.firmware_version.empty() ? WQN_FIRMWARE_VERSION : diag.firmware_version;
+            ESP_RETURN_ON_ERROR(
+                DrawClippedText(88, 94, 224, "固件 " + dev_version + " @ " + diag.git_commit),
+                kTag, "draw dev build id");
+            ESP_RETURN_ON_ERROR(
+                DrawClippedText(88, 114, 224, "构建 " + diag.build_time), kTag, "draw dev build time");
+            ESP_RETURN_ON_ERROR(
+                DrawClippedText(88, 134, 224, "复位 " + diag.reset_reason_label),
+                kTag, "draw dev reset reason");
+            ESP_RETURN_ON_ERROR(
+                DrawClippedText(88, 154, 224, "运行 " + diag.uptime_label), kTag, "draw dev uptime");
+            ESP_RETURN_ON_ERROR(
+                DrawClippedText(
+                    88, 174, 224,
+                    "堆 " + BytesLabel(diag.heap_free) + " 最小 " + BytesLabel(diag.heap_min_free)),
+                kTag, "draw dev heap");
+            ESP_RETURN_ON_ERROR(
+                DrawClippedText(
+                    88, 194, 224,
+                    "PSRAM " + BytesLabel(diag.psram_free) + "/" + BytesLabel(diag.psram_total)),
+                kTag, "draw dev psram");
+            break;
+        }
+        case wqn::SettingsDialog::kDevSync: {
+            // [dev-diag] Sync snapshot pre-formatted at
+            // UpdateSettingsDiagnostics time; the dialog only draws the seven
+            // prepared lines (DEV_DIAGNOSTICS.md §4.2).
+            ESP_RETURN_ON_ERROR(DrawSettingsDialogBox("同步诊断"), kTag, "draw dev sync dialog");
+            for (size_t i = 0; i < diag.sync_diag_lines.size(); ++i) {
+                if (diag.sync_diag_lines[i].empty()) {
+                    continue;
+                }
+                ESP_RETURN_ON_ERROR(
+                    DrawClippedText(88, 94 + static_cast<int>(i) * 18, 224, diag.sync_diag_lines[i]),
+                    kTag, "draw dev sync line");
+            }
+            break;
+        }
+        case wqn::SettingsDialog::kDevErrors: {
+            // [dev-diag] Recent-error list from the error_recorder ring copy
+            // (§4.3). Static like kBattery: no scrolling, closing and
+            // reopening takes a fresh snapshot.
+            ESP_RETURN_ON_ERROR(DrawSettingsDialogBox("错误记录"), kTag, "draw dev errors dialog");
+            if (diag.error_line_count == 0) {
+                ESP_RETURN_ON_ERROR(
+                    DrawCenteredText(86, 148, 228, "暂无错误记录"), kTag, "draw dev errors empty");
+            } else {
+                const size_t shown = std::min<size_t>(diag.error_line_count, 6);
+                for (size_t i = 0; i < shown; ++i) {
+                    if (!diag.error_lines[i].valid) {
+                        continue;
+                    }
+                    ESP_RETURN_ON_ERROR(
+                        DrawClippedText(
+                            88, 94 + static_cast<int>(i) * 18, 224, diag.error_lines[i].text),
+                        kTag, "draw dev error line");
+                }
+            }
+            break;
+        }
         case wqn::SettingsDialog::kFactoryReset:
             ESP_RETURN_ON_ERROR(DrawSettingsDialogBox("恢复出厂"), kTag, "draw factory reset dialog");
             ESP_RETURN_ON_ERROR(DrawWrappedText(54, 98, 292, "将清除 NVS 中的配对、缓存、待上传、AI 会话、单词进度和设置。", 3), kTag, "draw reset body");
@@ -330,6 +398,11 @@ esp_err_t RenderSettingsToEpd(const wqn::UiFrame& frame, RefreshSchedule schedul
         "音量",
         "Word 默认词库",
         "固件版本",
+#if CONFIG_WQN_DEV_MENU_ENABLE
+        "Dev 信息",
+        "同步诊断",
+        "错误记录",
+#endif
         "恢复出厂",
         "关机",
     };
@@ -343,6 +416,11 @@ esp_err_t RenderSettingsToEpd(const wqn::UiFrame& frame, RefreshSchedule schedul
         volume_label,
         settings.default_word_deck_title.empty() ? "全部词库" : settings.default_word_deck_title,
         version_value,
+#if CONFIG_WQN_DEV_MENU_ENABLE
+        diag.git_commit,
+        diag.sync_diag_summary,
+        diag.error_count_label,
+#endif
         "",
         "",
     };

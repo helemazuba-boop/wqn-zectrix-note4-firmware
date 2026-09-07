@@ -120,6 +120,9 @@ Configure features through `idf.py menuconfig` under `WQN firmware`:
   stay server-side.
 - `CONFIG_WQN_AI_AUDIO_SELFTEST_ENABLE`: captures and logs audio statistics at boot
   without uploading audio.
+- `CONFIG_WQN_DEV_MENU_ENABLE`: shows three read-only dev diagnostics rows in the
+  settings page (dev info / sync diagnostics / error log); the structure is fixed
+  by `DEV_DIAGNOSTICS.md`. Release builds keep it n; error capture is always compiled.
 
 ## Local Flashing
 

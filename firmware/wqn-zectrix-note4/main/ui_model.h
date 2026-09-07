@@ -1,10 +1,13 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
+
+#include "sdkconfig.h"
 
 #include "ai_history.h"
 #include "note_app.h"
@@ -188,6 +191,40 @@ struct HomeSummary {
     std::vector<HomeTask> tasks;
 };
 
+// Settings-page row count, the single source of truth for every layer that
+// indexes settings rows (model clamps, button dispatch, row rendering). It
+// lives here — not in device_ui_internal — because the model layer
+// (ui_model.cpp) clamps the selection without including ui/ headers.
+// Structure (rows, order, dialogs) is specified by DEV_DIAGNOSTICS.md.
+#if CONFIG_WQN_DEV_MENU_ENABLE
+constexpr size_t kSettingsItemCount = 14;
+#else
+constexpr size_t kSettingsItemCount = 11;
+#endif
+
+// Row indices as named constants — dispatch and chip-tag code must reference
+// these, never row-number literals (the historical hardcoded 9/8 clamp in
+// ui_model.cpp is why this rule exists).
+constexpr size_t kSettingsRowWifi = 0;
+constexpr size_t kSettingsRowSyncNow = 1;
+constexpr size_t kSettingsRowAutoSync = 2;
+constexpr size_t kSettingsRowBattery = 3;
+constexpr size_t kSettingsRowStorage = 4;
+constexpr size_t kSettingsRowImageRender = 5;
+constexpr size_t kSettingsRowVolume = 6;
+constexpr size_t kSettingsRowWordDeck = 7;
+constexpr size_t kSettingsRowVersion = 8;
+#if CONFIG_WQN_DEV_MENU_ENABLE
+constexpr size_t kSettingsRowDevInfo = 9;
+constexpr size_t kSettingsRowDevSync = 10;
+constexpr size_t kSettingsRowDevErrors = 11;
+constexpr size_t kSettingsRowFactoryReset = 12;
+constexpr size_t kSettingsRowPowerOff = 13;
+#else
+constexpr size_t kSettingsRowFactoryReset = 9;
+constexpr size_t kSettingsRowPowerOff = 10;
+#endif
+
 enum class SettingsDialog {
     kNone,
     kWifiManage,
@@ -197,8 +234,20 @@ enum class SettingsDialog {
     kImageRendering,
     kVolume,
     kDefaultWordDeck,
+    kDevInfo,
+    kDevSync,
+    kDevErrors,
     kFactoryReset,
     kPowerOff,
+};
+
+// [dev-diag] One formatted error-log line for the Dev error dialog, built at
+// snapshot time by UpdateSettingsDiagnostics from a wqn::ErrorRecord copy.
+// POD with a fixed buffer: SettingsAppState (and UiFrame) are copied by value
+// on every render, so published payloads stay trivially copyable.
+struct SettingsErrorLine {
+    bool valid = false;
+    char text[96] = {};
 };
 
 struct SettingsDiagnosticsSnapshot {
@@ -220,6 +269,23 @@ struct SettingsDiagnosticsSnapshot {
     std::string board_id;
     std::string idf_target;
     std::string content_sync_label;
+    // [dev-diag] Dev-menu fields (structure fixed by DEV_DIAGNOSTICS.md).
+    // Filled by UpdateSettingsDiagnostics on dialog open / state reload; the
+    // Kconfig flag only gates the visible rows, these fields always exist.
+    std::string git_commit;  // configure-time git describe, "unknown" fallback
+    std::string build_time;  // configure-time build timestamp
+    std::string reset_reason_label;
+    std::string uptime_label;
+    size_t heap_free = 0;
+    size_t heap_min_free = 0;
+    // Sync diagnostics, formatted into fixed display lines at snapshot time
+    // (render draws them verbatim; DrawClippedText clips overflow).
+    std::string sync_diag_summary;               // row value: last round result
+    std::array<std::string, 7> sync_diag_lines;  // dialog body, top to bottom
+    // Error-log ring copy, oldest first, formatted one line per record.
+    std::string error_count_label;      // row value: "3 条" / "无"
+    size_t error_line_count = 0;
+    SettingsErrorLine error_lines[6];
 };
 
 struct SettingsAppState {

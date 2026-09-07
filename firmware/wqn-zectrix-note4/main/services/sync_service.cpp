@@ -37,6 +37,7 @@
 #include "services/server_error_codes.h"
 #include "word_study_store.h"
 #include "wqn_api.h"
+#include "error_recorder.h"
 
 namespace {
 
@@ -3269,6 +3270,14 @@ void SyncServiceTask(void*)
                     : wqn::services::SyncEventScope::kFull);
         } else {
             SetSyncStatus(has_token_after_round ? "failed" : "waiting-pair");
+            if (has_token_after_round) {
+                // [dev-diag] The full-round failure detail otherwise only
+                // reaches the serial log; the per-domain last_error fields do
+                // not cover the control plane (DEV_DIAGNOSTICS.md §5).
+                wqn::RecordError(
+                    "sync", "round failed outcome=%d",
+                    static_cast<int>(outcome));
+            }
             PublishSyncEvent(
                 has_token_after_round
                     ? wqn::services::SyncEventStatus::kFailed

@@ -15,6 +15,7 @@
 #include "storage.h"
 #include "runtime/sleep_coordinator.h"
 #include "wifi_provision_portal.h"
+#include "error_recorder.h"
 
 #if defined(CONFIG_WQN_WIFI_STA_ENABLE) && defined(CONFIG_WQN_PROVISION_ENABLE)
 
@@ -110,6 +111,9 @@ void ProvisionTask(void*)
                 storage_role, ssid, password, keep_existing_password);
             if (result != ESP_OK) {
                 ESP_LOGE(kTag, "save WiFi credentials failed: %s", esp_err_to_name(result));
+                // [dev-diag] ProvisionState is an atomic enum — the cause
+                // detail would be lost without the ring.
+                wqn::RecordError("provision", "save creds failed %s", esp_err_to_name(result));
                 return result;
             }
 
@@ -146,6 +150,8 @@ void ProvisionTask(void*)
         const esp_err_t start_result = portal_ptr->Start();
         if (start_result != ESP_OK) {
             ESP_LOGE(kTag, "provisioning portal start failed: %s", esp_err_to_name(start_result));
+            // [dev-diag] SoftAP bring-up failure with its cause.
+            wqn::RecordError("provision", "portal start failed %s", esp_err_to_name(start_result));
             g_prov_state = wqn::ProvisionState::kFailed;
             PublishStopped();
             continue;

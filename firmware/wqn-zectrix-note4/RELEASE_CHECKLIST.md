@@ -9,6 +9,10 @@ self-hosted database and proxy procedure is
 
 - Record the firmware and WQN commit IDs, ESP-IDF revision, `sdkconfig` profile,
   database migration head and container image digests.
+- Confirm the recorded `sdkconfig` contains
+  `# CONFIG_WQN_DEV_MENU_ENABLE is not set` — the dev diagnostics rows
+  (`DEV_DIAGNOSTICS.md`) must be absent from release builds; error capture
+  (`wqn::RecordError`) is always compiled and that is expected.
 - Confirm the firmware contract manifest/schema hash matches WQN fixtures.
 - Confirm AI SSE and `wqn-flash-v2` wire layouts are unchanged.
 - Confirm no credentials, Wi-Fi passwords, database URLs or device tokens are

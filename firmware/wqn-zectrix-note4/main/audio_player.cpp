@@ -6,6 +6,7 @@
 
 #include "esp_check.h"
 #include "esp_log.h"
+#include "error_recorder.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -77,6 +78,8 @@ esp_err_t InitEs8311Dac(wqn::services::AudioBusHandle bus)
     } else {
         ESP_LOGE(kTag, "ES8311 DAC init failed: %s",
                  esp_err_to_name(result));
+        // [dev-diag] Playback codec bring-up failure.
+        wqn::RecordError("audio_play", "DAC init failed %s", esp_err_to_name(result));
     }
     return result;
 }
@@ -156,6 +159,9 @@ esp_err_t InitAudioPlayer()
         ESP_LOGI(kTag, "audio player initialized");
     } else {
         ESP_LOGE(kTag, "audio player init failed: %s", esp_err_to_name(result));
+        // [dev-diag] Whole-player init failure; keeps the cause that the AI
+        // page only surfaces transiently.
+        wqn::RecordError("audio_play", "player init failed %s", esp_err_to_name(result));
         esp_err_t cleanup_result = ESP_OK;
         if (g_player.tx != nullptr && g_player.tx_enabled) {
             const esp_err_t disable_result =
@@ -243,6 +249,8 @@ esp_err_t PlayPcmSamples(const int16_t* samples, size_t count)
 
     if (result != ESP_OK) {
         ESP_LOGW(kTag, "I2S write failed: %s", esp_err_to_name(result));
+        // [dev-diag] Playback underrun/transport failure.
+        wqn::RecordError("audio_play", "I2S write failed %s", esp_err_to_name(result));
     }
     const esp_err_t stop_result = StopAudioPlayback();
     return result == ESP_OK ? stop_result : result;

@@ -21,6 +21,7 @@
 #include "i2c_bus_lock.h"
 #include "power_manager.h"
 #include "runtime/sleep_coordinator.h"
+#include "error_recorder.h"
 
 namespace {
 
@@ -1330,6 +1331,9 @@ esp_err_t GetSharedAudioBus(
                  static_cast<unsigned long>(session.id),
                  esp_err_to_name(ESP_ERR_INVALID_STATE),
                  static_cast<int>(ESP_ERR_INVALID_STATE));
+        // [dev-diag] Audio hardware init refused — usually a session/state
+        // machine mismatch rather than an I2C fault.
+        wqn::RecordError("audio", "I2C bus request rejected");
         return ESP_ERR_INVALID_STATE;
     }
     i2c_master_bus_handle_t shared = wqn::GetSharedI2cBusHandle();
@@ -1362,6 +1366,8 @@ esp_err_t AddAudioCodec(
                  static_cast<unsigned long>(session.id),
                  esp_err_to_name(ESP_ERR_INVALID_STATE),
                  static_cast<int>(ESP_ERR_INVALID_STATE));
+        // [dev-diag] Codec bring-up refused.
+        wqn::RecordError("audio", "add ES8311 rejected");
         return ESP_ERR_INVALID_STATE;
     }
     // `i2c_master_bus_add_device` only allocates and attaches a software
@@ -1689,6 +1695,8 @@ esp_err_t CreateAudioRxChannel(
                  static_cast<unsigned long>(session.id),
                  esp_err_to_name(ESP_ERR_INVALID_STATE),
                  static_cast<int>(ESP_ERR_INVALID_STATE));
+        // [dev-diag] Capture channel bring-up refused.
+        wqn::RecordError("audio", "create I2S RX rejected");
         return ESP_ERR_INVALID_STATE;
     }
     i2s_chan_handle_t channel = nullptr;

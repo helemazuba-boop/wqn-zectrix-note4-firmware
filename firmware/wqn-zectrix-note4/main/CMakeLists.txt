@@ -11,6 +11,7 @@ idf_component_register(
         "contract_fixtures.cpp"
         "device_ui.cpp"
         "diagnostics.cpp"
+        "error_recorder.cpp"
         "i2c_bus_lock.cpp"
         "power_manager.cpp"
         "power/rtc_timekeep.cpp"
@@ -113,11 +114,31 @@ endif()
 
 set(WQN_API_BASE "" CACHE STRING "Override the WQN ESP32 API base URL")
 
+# [dev-diag] Build identity for the Dev info dialog (DEV_DIAGNOSTICS.md §4.1).
+# Both values are configure-time snapshots: a commit made after configure only
+# shows up on the next reconfigure. Git absence (building from an export)
+# degrades to "unknown". Deliberately separate from WQN_FIRMWARE_VERSION --
+# that string feeds the sync image_id and the EPD frame signature and must not
+# change on every commit.
+execute_process(
+    COMMAND git -C ${CMAKE_CURRENT_LIST_DIR}/../.. describe --always --dirty --abbrev=8
+    OUTPUT_VARIABLE WQN_GIT_COMMIT
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+    RESULT_VARIABLE WQN_GIT_COMMIT_RESULT
+)
+if(NOT WQN_GIT_COMMIT_RESULT EQUAL 0 OR NOT WQN_GIT_COMMIT)
+    set(WQN_GIT_COMMIT "unknown")
+endif()
+string(TIMESTAMP WQN_BUILD_TIME "%Y-%m-%d %H:%M" UTC)
+
 target_compile_definitions(
     ${COMPONENT_LIB}
     PRIVATE
         BOARD_TYPE=\"zectrix-s3-epaper-4.2\"
         BOARD_NAME=\"ZecTrix_Note4\"
+        WQN_GIT_COMMIT=\"${WQN_GIT_COMMIT}\"
+        WQN_BUILD_TIME=\"${WQN_BUILD_TIME}\"
 )
 
 if(WQN_API_BASE)

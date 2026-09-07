@@ -806,6 +806,36 @@ std::string FrameSignature(const wqn::UiFrame& frame)
         signature.append(frame.home.wifi_label);
         signature.push_back('/');
         signature.append(WQN_FIRMWARE_VERSION);
+        signature.push_back('/');
+        // [dev-diag] Dev-menu snapshot fields: a parked 60s reload that
+        // changes any of them must invalidate the signature, or the dedup
+        // would swallow the repaint.
+        signature.append(diag.git_commit);
+        signature.push_back('/');
+        signature.append(diag.build_time);
+        signature.push_back('/');
+        signature.append(diag.reset_reason_label);
+        signature.push_back('/');
+        signature.append(diag.uptime_label);
+        signature.push_back('/');
+        signature.append(std::to_string(diag.heap_free));
+        signature.push_back('/');
+        signature.append(std::to_string(diag.heap_min_free));
+        signature.push_back('/');
+        signature.append(diag.sync_diag_summary);
+        signature.push_back('/');
+        for (const std::string& sync_line : diag.sync_diag_lines) {
+            signature.append(sync_line);
+            signature.push_back('|');
+        }
+        signature.push_back('/');
+        signature.append(diag.error_count_label);
+        signature.push_back('/');
+        signature.append(std::to_string(diag.error_line_count));
+        for (const wqn::SettingsErrorLine& error_line : diag.error_lines) {
+            signature.push_back('|');
+            signature.append(error_line.text);
+        }
     }
     for (const wqn::UiLine& line : frame.lines) {
         signature.push_back('|');

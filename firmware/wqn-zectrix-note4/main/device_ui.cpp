@@ -29,6 +29,7 @@
 #include "ui/ui_runtime.h"
 #include "ui_model.h"
 #include "wqn_api.h"
+#include "error_recorder.h"
 
 namespace device_ui_internal {
 // Last screen survives deep sleep via RTC slow memory. Initialized to kHome (=3)
@@ -537,6 +538,7 @@ void DeviceUiTask(void*)
     esp_err_t result = wqn::InitButtonInput();
     if (result != ESP_OK) {
         ESP_LOGE(kTag, "button input init failed: %s", esp_err_to_name(result));
+        wqn::RecordError("ui", "button init failed %s", esp_err_to_name(result));
         vTaskDelete(nullptr);
         return;
     }
@@ -545,6 +547,7 @@ void DeviceUiTask(void*)
     result = wqn::StartButtonInputTask(xTaskGetCurrentTaskHandle());
     if (result != ESP_OK) {
         ESP_LOGE(kTag, "button task start failed: %s", esp_err_to_name(result));
+        wqn::RecordError("ui", "button task start failed %s", esp_err_to_name(result));
         vTaskDelete(nullptr);
         return;
     }
@@ -563,6 +566,7 @@ void DeviceUiTask(void*)
         result = wqn::InitEpdDisplay();
         if (result != ESP_OK) {
             ESP_LOGE(kTag, "EPD display init failed: %s", esp_err_to_name(result));
+            wqn::RecordError("ui", "EPD init failed %s", esp_err_to_name(result));
             vTaskDelete(nullptr);
             return;
         }

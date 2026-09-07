@@ -13,6 +13,7 @@
 #include "runtime/sleep_coordinator.h"
 #include "storage.h"
 #include "ui_internal.h"  // NotifyUiTask
+#include "error_recorder.h"
 
 namespace device_ui_internal {
 namespace {
@@ -253,6 +254,14 @@ void PersistWorkerTask(void*)
             continue;
         }
         command.result = ExecutePersistCommand(command);
+        if (command.result != ESP_OK) {
+            // [dev-diag] One hook covers every domain's durable-write failure
+            // (DEV_DIAGNOSTICS.md §5); the ring keeps the kind + esp_err that
+            // the transient notice drops.
+            wqn::RecordError(
+                "persist", "kind=%u %s", static_cast<unsigned>(command.kind),
+                esp_err_to_name(command.result));
+        }
         // Storage has ended: the SleepLease lifetime ends with the write, NOT
         // with the UI ack. Release it here; the busy gate stays set until ack.
         command.lease.Reset();

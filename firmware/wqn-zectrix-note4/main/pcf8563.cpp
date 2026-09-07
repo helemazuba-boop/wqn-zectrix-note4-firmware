@@ -9,6 +9,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "i2c_bus_lock.h"
+#include "error_recorder.h"
 
 namespace {
 
@@ -107,6 +108,8 @@ bool Pcf8563ReadTime(int* year, int* month, int* day, int* hour, int* min, int* 
     const uint8_t vl_bit = regs[0] & 0x80;
     if (vl_bit != 0) {
         ESP_LOGW(kTag, "PCF8563 clock integrity lost (VL flag set)");
+        // [dev-diag] Wall clock untrusted — a top user-visible condition.
+        wqn::RecordError("rtc", "clock integrity lost (VL)");
         return false;
     }
 
@@ -191,6 +194,9 @@ bool Pcf8563WriteTime(int year, int month, int day, int hour, int min,
                  esp_err_to_name(err),
                  readback[0], readback[1], readback[2],
                  readback[3], readback[4], readback[5], readback[6]);
+        // [dev-diag] Written time could not be confirmed — keep the detail
+        // that the boolean return drops.
+        wqn::RecordError("rtc", "time write verify failed");
         return false;
     }
 

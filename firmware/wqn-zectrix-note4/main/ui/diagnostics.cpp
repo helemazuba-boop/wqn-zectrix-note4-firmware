@@ -5,9 +5,14 @@
 
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 
 #include "config.h"
+#include "error_recorder.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_system.h"
+#include "esp_timer.h"
 #include "diagnostics.h"
 #include "services/sync_service.h"
 #include "storage.h"
@@ -73,6 +78,68 @@ std::string BytesLabel(size_t bytes)
         std::snprintf(buffer, sizeof(buffer), "%lu B", static_cast<unsigned long>(bytes));
     }
     return buffer;
+}
+
+// [dev-diag] Monotonic uptime rendered as a short human label ("3h12m").
+std::string UptimeLabel()
+{
+    const int64_t minutes = esp_timer_get_time() / 1000000 / 60;
+    if (minutes < 60) {
+        return std::to_string(minutes) + "m";
+    }
+    return std::to_string(minutes / 60) + "h" + std::to_string(minutes % 60) + "m";
+}
+
+// [dev-diag] Sync content/outbox phase labels (DEV_DIAGNOSTICS.md §4.2).
+std::string SyncContentPhaseLabel(wqn::services::SyncContentPhase phase)
+{
+    switch (phase) {
+        case wqn::services::SyncContentPhase::kClean:
+            return "干净";
+        case wqn::services::SyncContentPhase::kFetching:
+            return "拉取中";
+        case wqn::services::SyncContentPhase::kInstalling:
+            return "安装中";
+        case wqn::services::SyncContentPhase::kBackoff:
+            return "回退重试";
+        case wqn::services::SyncContentPhase::kBlocked:
+            return "受阻";
+        default:
+            return "?";
+    }
+}
+
+std::string SyncOutboxPhaseLabel(wqn::services::SyncOutboxPhase phase)
+{
+    switch (phase) {
+        case wqn::services::SyncOutboxPhase::kDrained:
+            return "已清空";
+        case wqn::services::SyncOutboxPhase::kPending:
+            return "待上传";
+        case wqn::services::SyncOutboxPhase::kYielded:
+            return "让路中";
+        case wqn::services::SyncOutboxPhase::kBlocked:
+            return "受阻";
+        default:
+            return "?";
+    }
+}
+
+std::string SyncDomainLine(
+    const char* title,
+    const std::string& phase_label,
+    uint8_t retry_attempt,
+    const char* last_error)
+{
+    std::string line = std::string(title) + " " + phase_label;
+    if (retry_attempt > 0) {
+        line += " 重试" + std::to_string(retry_attempt);
+    }
+    if (last_error != nullptr && last_error[0] != '\0') {
+        line += " ";
+        line += last_error;
+    }
+    return line;
 }
 
 void UpdateSettingsDiagnostics(wqn::UiState* state)
@@ -189,6 +256,47 @@ void UpdateSettingsDiagnostics(wqn::UiState* state)
     snapshot.board_id = WQN_BOARD_ID;
     snapshot.idf_target = CONFIG_IDF_TARGET;
 
+    // [dev-diag] Dev info dialog fields (DEV_DIAGNOSTICS.md §4.1). All cheap
+    // queries on the UI task; no locks beyond the spinlocks inside the heap
+    // APIs. heap_min_free is the all-time watermark, i.e. the tightest the
+    // internal heap has ever been since boot.
+    snapshot.git_commit = WQN_GIT_COMMIT;
+    snapshot.build_time = WQN_BUILD_TIME;
+    snapshot.reset_reason_label = wqn::ResetReasonToString(esp_reset_reason());
+    snapshot.uptime_label = UptimeLabel();
+    snapshot.heap_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    snapshot.heap_min_free = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL);
+    // [dev-diag] Error-log ring copy (DEV_DIAGNOSTICS.md §4.3/§5). The ring is
+    // snapshotted under its own spinlock via CopyRecentErrors, then formatted
+    // here on the UI task; render draws the prepared lines verbatim.
+    wqn::ErrorRecord records[wqn::kErrorRecordDepth] = {};
+    const size_t record_count = wqn::CopyRecentErrors(records, wqn::kErrorRecordDepth);
+    snapshot.error_line_count = record_count > 6 ? 6 : record_count;
+    snapshot.error_count_label =
+        record_count == 0 ? std::string("无") : std::to_string(record_count) + " 条";
+    for (size_t i = 0; i < snapshot.error_line_count; ++i) {
+        const wqn::ErrorRecord& record = records[record_count - 1 - i];  // newest first
+        wqn::SettingsErrorLine& line = snapshot.error_lines[i];
+        char time_label[10] = {};
+        const std::time_t record_time = static_cast<std::time_t>(record.unix_sec);
+        if (record_time >= kMinReasonableUnixTime) {
+            std::tm local = {};
+            localtime_r(&record_time, &local);
+            std::strftime(time_label, sizeof(time_label), "%H:%M", &local);
+        } else {
+            std::snprintf(
+                time_label, sizeof(time_label), "+%lum",
+                static_cast<unsigned long>(record.uptime_ms / 60000));
+        }
+        std::snprintf(
+            line.text, sizeof(line.text), "%s [%s] %s", time_label, record.tag,
+            record.msg);
+        line.valid = true;
+    }
+    for (size_t i = snapshot.error_line_count; i < 6; ++i) {
+        snapshot.error_lines[i].valid = false;
+    }
+
     wqn::services::SyncSnapshot online = {};
     wqn::services::GetSyncSnapshot(&online);
     char content_label[96] = {};
@@ -206,6 +314,36 @@ void UpdateSettingsDiagnostics(wqn::UiState* state)
     if (online.status[0] != '\0') {
         state->settings.sync_status = OnlineSyncStatusLabel(online.status);
     }
+
+    // [dev-diag] Sync diagnostics dialog lines (DEV_DIAGNOSTICS.md §4.2),
+    // formatted here so the render path stays dumb. `online` is the copy
+    // GetSyncSnapshot already made under its spinlock — no shared state is
+    // referenced past this point.
+    snapshot.sync_diag_summary =
+        online.status[0] != '\0' ? OnlineSyncStatusLabel(online.status) : "空闲";
+    snapshot.sync_diag_lines[0] =
+        std::string(online.last_round_success ? "上轮 成功" : "上轮 未完成") +
+        " · 成" + std::to_string(online.success_count) +
+        "/部" + std::to_string(online.partial_count) +
+        "/败" + std::to_string(online.failure_count);
+    snapshot.sync_diag_lines[1] = SyncDomainLine(
+        "词包", SyncContentPhaseLabel(online.word_packs.phase),
+        online.word_packs.retry_attempt, online.word_packs.last_error);
+    snapshot.sync_diag_lines[2] = SyncDomainLine(
+        "笔记", SyncContentPhaseLabel(online.note_packs.phase),
+        online.note_packs.retry_attempt, online.note_packs.last_error);
+    snapshot.sync_diag_lines[3] = SyncDomainLine(
+        "错题", SyncContentPhaseLabel(online.problem_packs.phase),
+        online.problem_packs.retry_attempt, online.problem_packs.last_error);
+    snapshot.sync_diag_lines[4] = SyncDomainLine(
+        "词箱", SyncOutboxPhaseLabel(online.word_outbox.phase),
+        online.word_outbox.retry_attempt, online.word_outbox.last_error);
+    snapshot.sync_diag_lines[5] = SyncDomainLine(
+        "笔箱", SyncOutboxPhaseLabel(online.note_outbox.phase),
+        online.note_outbox.retry_attempt, online.note_outbox.last_error);
+    snapshot.sync_diag_lines[6] = SyncDomainLine(
+        "题箱", SyncOutboxPhaseLabel(online.problem_outbox.phase),
+        online.problem_outbox.retry_attempt, online.problem_outbox.last_error);
 }
 
 }  // namespace device_ui_internal

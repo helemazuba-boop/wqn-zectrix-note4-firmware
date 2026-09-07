@@ -15,6 +15,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "services/audio_service.h"
+#include "error_recorder.h"
 
 namespace {
 
@@ -136,6 +137,9 @@ esp_err_t EnsureCaptureBuffer()
         kMaxCaptureSamples * sizeof(int16_t),
         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     if (g_audio.capture_buffer == nullptr) {
+        // [dev-diag] 640 KiB PSRAM reservation failure is the canonical
+        // memory-pressure signal (see the allocation notes above).
+        wqn::RecordError("audio_cap", "PSRAM alloc failed");
         ESP_LOGE(
             kTag,
             "capture PSRAM allocation failed: bytes=%u free=%u largest=%u internal_free=%u",
@@ -376,6 +380,8 @@ void CaptureSession()
                  esp_err_to_name(result), static_cast<int>(result),
                  static_cast<unsigned long>(g_audio.session.id),
                  g_audio.i2c_bus, g_audio.rx, g_audio.rx_enabled ? 1 : 0);
+        // [dev-diag] Retain the failure the AI UX only shows transiently.
+        wqn::RecordError("audio_cap", "init failed %s", esp_err_to_name(result));
         esp_err_t terminal_result = result;
         const esp_err_t cleanup_result = CleanupCaptureHardware(false);
         ESP_LOGI(kTag, "capture init cleanup result=%s (%d), bus=%p rx=%p",
@@ -661,6 +667,8 @@ esp_err_t StartAudioCapture()
     }
     xSemaphoreGive(g_audio.mutex);
     ESP_LOGE(kTag, "audio capture init handshake timed out");
+    // [dev-diag] Mic path never reached the capture loop this session.
+    wqn::RecordError("audio_cap", "init handshake timeout");
     return ESP_ERR_TIMEOUT;
 }
 

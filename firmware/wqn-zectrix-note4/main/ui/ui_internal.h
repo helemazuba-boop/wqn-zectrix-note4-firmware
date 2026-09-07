@@ -80,7 +80,9 @@ constexpr TickType_t kSelectionRefreshDelay = pdMS_TO_TICKS(100);
 constexpr TickType_t kConfigRefreshDelay = pdMS_TO_TICKS(120);
 constexpr TickType_t kAiRefreshDelay = pdMS_TO_TICKS(120);
 
-constexpr size_t kSettingsItemCount = 11;
+// Aliases the model-layer constant (ui_model.h) — the row count must have
+// exactly one definition because ui_model.cpp clamps against it too.
+constexpr size_t kSettingsItemCount = wqn::kSettingsItemCount;
 // Settings rows overflow the panel at 38px pitch; the list renders a
 // selection-following window of this many rows.
 constexpr size_t kSettingsVisibleRows = 6;
