@@ -1,7 +1,12 @@
 #pragma once
 
 #define WQN_FIRMWARE_NAME "wqn-zectrix-note4"
-#define WQN_FIRMWARE_VERSION "0.1.0"
+// [release] Injected by main/CMakeLists.txt from PROJECT_VER, which the release
+// tooling derives from a content fingerprint. The fallback only exists so tools
+// that parse config.h without the build's compile definitions still compile.
+#ifndef WQN_FIRMWARE_VERSION
+#define WQN_FIRMWARE_VERSION "0.1.0-dev"
+#endif
 #define WQN_BOARD_ID "zectrix-s3-epaper-4.2"
 
 // [dev-diag] Configure-time build identity injected by main/CMakeLists.txt.

@@ -175,6 +175,11 @@ struct WordCloudRequest {
     char cursor[65] = {};
     uint16_t limit = 0;
     uint8_t study_mode = 0;
+    // [deck-scope] kStartSession only: the deck the UI scoped the session to.
+    // Empty means "every visible deck", which is what the cloud falls back to
+    // -- but without carrying the id the device's deck choice silently never
+    // reached the server at all. Mirrors NoteCloudRequest::notebook_id.
+    char deck_id[37] = {};
     char query[96] = {};
     // [deck-scope] Scope epoch sampled when the request was QUEUED (session
     // ops only). The runner stamps it into the persisted session (the store

@@ -655,10 +655,16 @@ esp_err_t ParseObservationResponse(
     *data = {};
     JsonDocument document(body);
     cJSON* payload = nullptr;
-    ESP_RETURN_ON_ERROR(
-        ParseEnvelope(document.root(), expected_request_id, &payload, error),
-        "word_study",
-        "observation envelope");
+    // Not ESP_RETURN_ON_ERROR: a rejected observation (409 SEQUENCE_GAP and
+    // friends) legitimately carries a protocol error envelope instead of an
+    // observation payload. Logging that as an E-level firmware fault made
+    // every normal rejection look like a parser bug and masked the real
+    // failure. The caller inspects `error` and logs status/code once.
+    const esp_err_t envelope_result =
+        ParseEnvelope(document.root(), expected_request_id, &payload, error);
+    if (envelope_result != ESP_OK) {
+        return envelope_result;
+    }
     data->observation_id = StringField(payload, "observation_id");
     data->session_id = StringField(payload, "session_id");
     data->item_id = StringField(payload, "item_id");

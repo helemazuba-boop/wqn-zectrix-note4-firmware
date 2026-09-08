@@ -164,6 +164,17 @@ bool QueueWordSessionStart(
         "%s",
         session.metadata.request_id.c_str());
     request.study_mode = static_cast<uint8_t>(session.mode);
+    // [deck-scope] Carry the UI's deck choice across the queue boundary. The
+    // runner rebuilds the request from this struct, so anything left here is
+    // what actually reaches the server. Only a full 36-char UUID is meaningful.
+    if (!session.scope.deck_ids.empty() &&
+        session.scope.deck_ids.front().size() == 36) {
+        std::snprintf(
+            request.deck_id,
+            sizeof(request.deck_id),
+            "%s",
+            session.scope.deck_ids.front().c_str());
+    }
     return QueueWordCloudRequest(request);
 }
 
@@ -579,6 +590,12 @@ void ExecuteWordCloudRequest(const WordCloudRequest& request)
         session.metadata.request_id = request.request_id;
         session.mode = static_cast<wqn::protocol::word_study_v1::Mode>(
             request.study_mode);
+        // [deck-scope] The runner rebuilds the request, so the queued deck id
+        // has to be re-attached here or the server sees an empty scope and
+        // silently substitutes the first 32 visible decks.
+        if (std::strlen(request.deck_id) == 36) {
+            session.scope.deck_ids.push_back(request.deck_id);
+        }
         result.result = wqn::CreateWordStudySessionV1(
             token,
             session,

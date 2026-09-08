@@ -736,6 +736,10 @@ constexpr uint32_t kWordOutboxRetryBaseMs = 30000;
 constexpr uint32_t kWordOutboxRetryMaxMs = 5 * 60 * 1000;
 constexpr uint32_t kWordOutboxRetryJitterMaxMs = 2000;
 constexpr uint8_t kWordOutboxRetryMaxShift = 4;
+// Retry ladder reaches ~5 minutes by the 4th attempt; 5 attempts covers a
+// genuine in-flight race (an earlier record still uploading on a slow link)
+// while bounding a permanent gap to roughly 15 minutes instead of forever.
+constexpr uint8_t kWordOutboxSequenceGapEscalation = 5;
 std::string g_bootstrap_request_id;
 std::string g_sync_request_id;
 uint32_t g_sync_request_auto_interval_minutes = 0;
@@ -929,6 +933,14 @@ std::string g_word_outbox_retry_request_id;
 int64_t g_word_outbox_retry_not_before_ms = 0;
 uint8_t g_word_outbox_retry_attempts = 0;
 OutboxRetryCause g_word_outbox_retry_cause = OutboxRetryCause::kNone;
+
+// A STUDY_SEQUENCE_GAP on a session that already survived
+// kWordOutboxSequenceGapEscalation attempts is not a race: the earlier record
+// is gone (parked at the identity level, lost from storage, or stranded on a
+// retired session), so no future upload can close the hole. Remembering the
+// session lets every remaining record of it be quarantined immediately instead
+// of each one burning its own retry ladder against the same dead gap.
+std::string g_word_outbox_gap_terminal_session_id;
 
 enum class SyncRoundOutcome : uint8_t {
     kSucceeded,
@@ -2102,6 +2114,9 @@ WordOutboxUploadState UploadPendingWordObservations(const std::string& token)
         esp_err_t result = wqn::PeekPendingWordObservation(&pending);
         if (result == ESP_ERR_NOT_FOUND) {
             ResetWordOutboxRetryBackoff();
+            // The queue is empty, so no record of the retired session is left
+            // to skip the retry ladder for.
+            g_word_outbox_gap_terminal_session_id.clear();
             if (processed > 0) {
                 ESP_LOGI(
                     kTag,
@@ -2141,8 +2156,37 @@ WordOutboxUploadState UploadPendingWordObservations(const std::string& token)
         result = wqn::SubmitWordStudyObservationV1(
             token, request, &response, &word_error, &transport_failure);
         if (result != ESP_OK) {
-            const OutboxFailureDisposition disposition =
+            OutboxFailureDisposition disposition =
                 ClassifyOutboxFailure(word_error, transport_failure);
+            // Audit §14 Case B: SEQUENCE_GAP is classified kTransientRetry on
+            // the assumption that an earlier record is still in flight and
+            // will close the hole. Once this head has retried that many times
+            // no earlier record is coming -- the local counter ran ahead of
+            // the server (parked identity failure, storage loss, or a retired
+            // session) and uploading can never fill the gap. Retire the
+            // session so its whole backlog quarantines instead of the head
+            // retrying forever and wedging the FIFO queue (observed in the
+            // field: attempt=255, 5-minute backoff, word study silent for
+            // days while note sync kept working on its own outbox).
+            if (disposition == OutboxFailureDisposition::kTransientServer &&
+                word_error.code == "SEQUENCE_GAP") {
+                if (!g_word_outbox_gap_terminal_session_id.empty() &&
+                    pending.session_id ==
+                        g_word_outbox_gap_terminal_session_id) {
+                    disposition = OutboxFailureDisposition::kSessionTerminal;
+                } else if (g_word_outbox_retry_attempts >=
+                           kWordOutboxSequenceGapEscalation) {
+                    g_word_outbox_gap_terminal_session_id = pending.session_id;
+                    ESP_LOGW(
+                        kTag,
+                        "word observation gap unrecoverable after %u attempts; retiring session: request=%s sequence=%llu session=%s",
+                        static_cast<unsigned>(g_word_outbox_retry_attempts),
+                        pending.request_id.c_str(),
+                        static_cast<unsigned long long>(pending.sequence),
+                        pending.session_id.c_str());
+                    disposition = OutboxFailureDisposition::kSessionTerminal;
+                }
+            }
             if (disposition ==
                 OutboxFailureDisposition::kAuthenticationRequired) {
                 ResetWordOutboxRetryBackoff();

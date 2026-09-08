@@ -130,7 +130,19 @@ execute_process(
 if(NOT WQN_GIT_COMMIT_RESULT EQUAL 0 OR NOT WQN_GIT_COMMIT)
     set(WQN_GIT_COMMIT "unknown")
 endif()
-string(TIMESTAMP WQN_BUILD_TIME "%Y-%m-%d %H:%M" UTC)
+# The release tooling pins this to the version's original timestamp so both
+# machines report the same build time for the same version.
+if(DEFINED ENV{WQN_BUILD_TIME} AND NOT "$ENV{WQN_BUILD_TIME}" STREQUAL "")
+    set(WQN_BUILD_TIME "$ENV{WQN_BUILD_TIME}")
+else()
+    string(TIMESTAMP WQN_BUILD_TIME "%Y-%m-%d %H:%M" UTC)
+endif()
+
+# [release] Single source of truth for the firmware version: PROJECT_VER is set
+# in the top-level CMakeLists.txt from WQN_RELEASE_VERSION. It feeds the sync
+# image_id and the EPD frame signature, so it must not drift from the release
+# record. main/config.h keeps an #ifndef fallback for standalone parsers.
+idf_build_get_property(WQN_PROJECT_VER PROJECT_VER)
 
 target_compile_definitions(
     ${COMPONENT_LIB}
@@ -139,6 +151,7 @@ target_compile_definitions(
         BOARD_NAME=\"ZecTrix_Note4\"
         WQN_GIT_COMMIT=\"${WQN_GIT_COMMIT}\"
         WQN_BUILD_TIME=\"${WQN_BUILD_TIME}\"
+        WQN_FIRMWARE_VERSION=\"${WQN_PROJECT_VER}\"
 )
 
 if(WQN_API_BASE)
