@@ -66,29 +66,18 @@ struct AudioServiceState {
 
 AudioServiceState g_audio;
 
-// [capture-task-reserve] The capture worker and its TCB are pinned for the
-// process lifetime, mirroring the PSRAM PCM buffer reservation. After the
-// first AI turn fragments the internal heap a transient xTaskCreate of this
-// size can never succeed again; a permanently-parked worker makes capture
-// start independent of heap layout.
-//
-// The unit is StackType_t WORDS, not bytes: xTaskCreateStatic indexes
-// puxStackBuffer[ulStackDepth - 1] and memsets ulStackDepth*sizeof(StackType_t)
-// (FreeRTOS-Kernel/tasks.c:1054, :1044). This constant was previously named
-// "...Bytes" with the buffer sized kCaptureTaskStackBytes/sizeof(StackType_t),
-// so the task declared 6144 words (24 KiB) while owning 6 KiB and kept its
-// entire working set in whatever followed that array in BSS.
-//
-// 6144 words is the depth this task has always declared; the device-measured
-// peak is 3904 words (HIL 2026-09-01: capture stop stack_hwm=2240).
-//
-// The stack is allocated from PSRAM rather than BSS: 24 KiB of internal RAM
-// is not affordable here (internal free sits near 23 KiB during a turn), and
-// this task performs no SPI-flash/NVS writes, so external RAM is safe. The
-// TCB stays internal.
-constexpr uint32_t kCaptureTaskStackWords = 6144;
+// [capture-task-reserve] The capture worker's internal stack and TCB are
+// pinned here for the process lifetime, mirroring the PSRAM PCM buffer
+// reservation. After the first AI turn fragments the internal heap a
+// transient xTaskCreate of this size can never succeed again; a
+// statically-stored, permanently-parked worker makes capture start
+// independent of heap layout.
+// 6144 B: device-measured session peak is 4184 B (HWM 4008 incl. codec-retry
+// logging bursts); this leaves ~1.9 KiB margin while returning 2 KiB of SRAM
+// to the DMA-starved heap versus the original 8192.
+constexpr uint32_t kCaptureTaskStackBytes = 6144;
 StaticTask_t g_capture_task_tcb = {};
-StackType_t* g_capture_task_stack = nullptr;
+StackType_t g_capture_task_stack[kCaptureTaskStackBytes / sizeof(StackType_t)] = {};
 
 int64_t IntegerSqrt(int64_t value)
 {
@@ -613,25 +602,12 @@ esp_err_t StartAudioCapture()
         xSemaphoreGive(g_audio.mutex);
         return ESP_ERR_INVALID_STATE;
     }
-    // [capture-task-reserve] Create the persistent worker once; its stack is
-    // reserved in PSRAM and its TCB is statically stored, so internal-heap
-    // fragmentation can never block a recording start again.
+    // [capture-task-reserve] Create the persistent worker once; its stack and
+    // TCB are statically stored so internal-heap fragmentation can never block
+    // a recording start again.
     if (g_audio.task == nullptr) {
-        if (g_capture_task_stack == nullptr) {
-            // No zeroing: a task stack has no meaningful initial contents.
-            g_capture_task_stack = static_cast<StackType_t*>(heap_caps_malloc(
-                kCaptureTaskStackWords * sizeof(StackType_t),
-                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-        }
-        if (g_capture_task_stack == nullptr) {
-            g_audio.running = false;
-            ESP_ERROR_CHECK_WITHOUT_ABORT(
-                wqn::services::EndAudioActivity(&g_audio.session));
-            xSemaphoreGive(g_audio.mutex);
-            return ESP_ERR_NO_MEM;
-        }
         TaskHandle_t worker = xTaskCreateStatic(
-            CaptureTask, "wqn_audio_cap", kCaptureTaskStackWords, nullptr, 6,
+            CaptureTask, "wqn_audio_cap", kCaptureTaskStackBytes, nullptr, 6,
             g_capture_task_stack, &g_capture_task_tcb);
         if (worker == nullptr) {
             // Unreachable with CONFIG_FREERTOS_SUPPORT_STATIC_ALLOCATION=y;
