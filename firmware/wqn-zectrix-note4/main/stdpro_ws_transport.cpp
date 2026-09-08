@@ -236,9 +236,18 @@ void LogTransportMemory(const char* stage)
     const unsigned owner_stack_hwm = g_transport_task == nullptr
         ? 0U
         : static_cast<unsigned>(uxTaskGetStackHighWaterMark(g_transport_task));
+    // The websocket task belongs to the ESP WebSocket component, so there is no
+    // handle to it: look it up by the name that component uses when no
+    // task_name is configured. Its stack is the one that decides whether a
+    // connection can be made at all, so keep it visible next to the heap
+    // figures. 0 means "not running", i.e. no client or already stopped.
+    const TaskHandle_t ws_task = xTaskGetHandle("websocket_task");
+    const unsigned ws_stack_hwm = ws_task == nullptr
+        ? 0U
+        : static_cast<unsigned>(uxTaskGetStackHighWaterMark(ws_task));
     ESP_LOGI(
         kTag,
-        "memory stage=%s internal_free=%u internal_largest=%u dma_free=%u dma_largest=%u psram_free=%u psram_largest=%u owner_stack_hwm=%u",
+        "memory stage=%s internal_free=%u internal_largest=%u dma_free=%u dma_largest=%u psram_free=%u psram_largest=%u owner_stack_hwm=%u ws_stack_hwm=%u",
         stage,
         static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
         static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)),
@@ -246,7 +255,8 @@ void LogTransportMemory(const char* stage)
         static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_DMA)),
         static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)),
         static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM)),
-        owner_stack_hwm);
+        owner_stack_hwm,
+        ws_stack_hwm);
 }
 
 void DoDestroyWs()
@@ -576,7 +586,20 @@ void ExecuteCtrlCmdSingleStep(const CtrlCmd& cmd)
             cfg.subprotocol = WQN_VOICE_WS_SUBPROTOCOL;
             cfg.headers = auth_header.c_str();
             cfg.network_timeout_ms = 2500;
-            cfg.task_stack = 8192;
+            // The websocket component allocates this stack as one contiguous
+            // internal block, which makes it the binding constraint on being
+            // able to connect at all. Device measurement (2026-09-08, 22 PTT
+            // over two builds incl. 71f99b7): the largest internal block
+            // converges to 7680 B (7168 B at worst) and stays there for the
+            // rest of the boot, so an 8192 B request succeeds only on the
+            // first connection after a reset and fails on every later one --
+            // "Error create websocket task" followed by a silent, permanent
+            // move to the HTTP fallback. 6144 B fits under that floor and
+            // still gives 50% over the component default
+            // (WEBSOCKET_TASK_STACK = 4096).
+            // Verify against ws_stack_hwm in the "memory stage=" lines: if it
+            // approaches 0, raise this only together with freeing internal RAM.
+            cfg.task_stack = 6144;
             cfg.buffer_size = 4096;
             cfg.crt_bundle_attach = esp_crt_bundle_attach;
             cfg.reconnect_timeout_ms = 2000;
