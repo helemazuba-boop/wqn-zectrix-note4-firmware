@@ -15,9 +15,11 @@ namespace wqn {
 // carry rms/peak, so the clip itself has to leave the board somehow, and the
 // console is the only channel that needs no new plumbing.
 //
-// Compiled out unless CONFIG_WQN_AI_PCM_DUMP_ENABLE is set. When enabled the
-// dump is capped by kMaxDumpSamples: at 115200 baud the console moves roughly
-// 11 KiB/s, so an uncapped 6 s turn would block the AI worker for ~20 s.
+// Only the loudest 2 s window of the clip is emitted, not its head: these
+// recordings start with a pause, and a head window came back as noise floor
+// every single time. Compiled out unless CONFIG_WQN_AI_PCM_DUMP_ENABLE is set.
+// At 115200 baud the console moves roughly 11 KiB/s, so an uncapped 6 s turn
+// would block the AI worker for ~20 s.
 void DumpCapturedPcmForAnalysis(const int16_t* samples, size_t sample_count,
                                 int sample_rate);
 

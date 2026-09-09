@@ -189,11 +189,11 @@ menu "WQN firmware"
         default n
         depends on WQN_AI_ENABLE
         help
-            After each AI recording stops, print the captured mono PCM as
-            base64 between PCM_DUMP_BEGIN/PCM_DUMP_END markers, capped at
-            2 s. Diagnostic only: at 115200 baud this blocks the AI worker
-            for roughly 10 s per turn, so never enable it outside a
-            targeted capture session.
+            After each AI recording stops, print the loudest 2 s window of
+            the captured mono PCM as base64 between PCM_DUMP_BEGIN and
+            PCM_DUMP_END markers. Diagnostic only: at 115200 baud this
+            blocks the AI worker for roughly 10 s per turn, so never enable
+            it outside a targeted capture session.
 
     config WQN_BATTERY_LOW_THRESHOLD_MV
         int "Battery low shutdown threshold in millivolts"
