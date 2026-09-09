@@ -16,6 +16,27 @@ CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=512
 CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=98304
 CONFIG_SPIRAM_MEMTEST=n
 CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
+# [aes-dma-fix] Do not route AES through the GDMA engine.
+#
+# With MBEDTLS_EXTERNAL_MEM_ALLOC the TLS buffers live in PSRAM, and the data
+# cache line is 64 B, so any record whose output is not 64 B aligned or whose
+# length is not a multiple of 64 takes esp_aes_process_dma_ext_ram(), which
+# mallocs and frees a 1600 B MALLOC_CAP_DMA bounce buffer for every single TLS
+# record (AES_MAX_CHUNK_WRITE_SIZE = 1600 on ESP32-S3).
+#
+# Device measurement (2026-09-08, 14 PTT): during AI sessions the largest free
+# DMA-capable block sits between 608 B and 5632 B, so that bounce buffer fails
+# -- "esp-aes: Failed to allocate memory", immediately followed by
+# esp_tls_conn_read/write errors and a WebSocket "Reconnect after 2000 ms"
+# that rebuilds the whole session. 5 of 7 session deaths in that log trace back
+# to it; the 71f99b7 control build had zero occurrences.
+#
+# mbedtls' own Kconfig note applies here: at 240 MHz (which this project uses)
+# hardware AES offers no speed advantage over software AES, and
+# MBEDTLS_AES_ROM_TABLES is always defined for this target, so the software
+# path costs no extra DRAM. It also removes every AES GDMA allocation, which is
+# the point -- the DMA heap is the scarcest resource on this board.
+CONFIG_MBEDTLS_HARDWARE_AES=n
 
 CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=3
 CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=6
