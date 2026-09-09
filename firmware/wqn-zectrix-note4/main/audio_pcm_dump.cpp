@@ -1,5 +1,9 @@
 #include "audio_pcm_dump.h"
 
+// Must precede every CONFIG_* test in this file: nothing else here pulls it in,
+// so without it the gate silently evaluates to 0 and compiles the no-op stub.
+#include "sdkconfig.h"
+
 #if CONFIG_WQN_AI_PCM_DUMP_ENABLE
 
 #include <cstdio>
