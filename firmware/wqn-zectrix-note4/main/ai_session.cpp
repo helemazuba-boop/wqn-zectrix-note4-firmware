@@ -13,6 +13,7 @@
 
 #include "ai_history.h"
 #include "audio_capture.h"
+#include "audio_pcm_dump.h"
 #include "config.h"
 #include "esp_check.h"
 #include "esp_heap_caps.h"
@@ -856,6 +857,9 @@ void SubmitSession()
              static_cast<unsigned>(audio.sample_count),
              static_cast<int>(audio.peak),
              audio.rms);
+
+    wqn::DumpCapturedPcmForAnalysis(audio.samples, audio.sample_count,
+                                    wqn::kAudioCaptureSampleRate);
 
     if (audio.duration_ms < kMinAudioDurationMs || audio.sample_count < kMinAudioSamples) {
         if (is_ws_turn && !turn_req_id.empty()) {
