@@ -9,6 +9,7 @@
 #include "esp_crt_bundle.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_memory_utils.h"
 #include "esp_timer.h"
 #include "esp_websocket_client.h"
 #include "freertos/FreeRTOS.h"
@@ -258,6 +259,9 @@ void LogTransportMemory(const char* stage)
         owner_stack_hwm,
         ws_stack_hwm);
 }
+
+// Defined after AllocPrefersPsram, which it uses for the task array.
+void DumpResourceLedger(const char* stage);
 
 void DoDestroyWs()
 {
@@ -616,6 +620,7 @@ void ExecuteCtrlCmdSingleStep(const CtrlCmd& cmd)
                 WebsocketEventHandler, nullptr);
 
             LogTransportMemory("before-ws-task-start");
+            DumpResourceLedger("before-ws-task-start");
             const esp_err_t start_err =
                 esp_websocket_client_start(g_ws_client);
             if (start_err != ESP_OK) {
@@ -991,6 +996,55 @@ void* AllocPrefersPsram(size_t size, bool* in_psram = nullptr)
         return ptr;
     }
     return heap_caps_malloc(size, MALLOC_CAP_8BIT);
+}
+
+// [diag] Resource ledger for the internal-RAM investigation.
+//
+// heap_caps_print_heap_info() gives the per-pool block picture for the two pools
+// that keep failing -- INTERNAL is what the websocket task stack needs, DMA is
+// what the mbedtls/AES and WiFi buffers need. The task walk then attributes the
+// largest single class of internal consumer, task stacks, to internal vs PSRAM.
+//
+// Caveat: TaskStatus_t carries no stack *size*, only the remaining high water
+// mark, so "internal" vs "psram" is the hard signal here; exact per-stack byte
+// totals have to come from a source census (see the investigation notes).
+// Requires CONFIG_FREERTOS_USE_TRACE_FACILITY for uxTaskGetSystemState.
+// Remove together with that [diag] option once the investigation is done.
+void DumpResourceLedger(const char* stage)
+{
+    ESP_LOGI(kTag, "[diag] ledger stage=%s begin", stage);
+    heap_caps_print_heap_info(MALLOC_CAP_INTERNAL);
+    heap_caps_print_heap_info(MALLOC_CAP_DMA);
+
+    constexpr UBaseType_t kMaxTasks = 48;
+    TaskStatus_t* tasks = static_cast<TaskStatus_t*>(
+        AllocPrefersPsram(kMaxTasks * sizeof(TaskStatus_t)));
+    if (tasks == nullptr) {
+        ESP_LOGW(kTag, "[diag] ledger stage=%s task walk skipped: no memory",
+                 stage);
+        return;
+    }
+
+    const UBaseType_t found = uxTaskGetSystemState(tasks, kMaxTasks, nullptr);
+    unsigned internal_stacked = 0;
+    for (UBaseType_t i = 0; i < found; ++i) {
+        const TaskStatus_t& t = tasks[i];
+        const bool in_psram = esp_ptr_external_ram(t.pxStackBase);
+        if (!in_psram) {
+            ++internal_stacked;
+        }
+        // usStackHighWaterMark counts *remaining* StackType_t words, not bytes.
+        ESP_LOGI(kTag,
+                 "[diag] task name=%s stack=%s hwm_remaining_bytes=%u prio=%u",
+                 t.pcTaskName,
+                 in_psram ? "psram" : "internal",
+                 static_cast<unsigned>(t.usStackHighWaterMark) *
+                     static_cast<unsigned>(sizeof(StackType_t)),
+                 static_cast<unsigned>(t.uxCurrentPriority));
+    }
+    ESP_LOGI(kTag, "[diag] ledger stage=%s tasks=%u internal_stacked=%u end",
+             stage, static_cast<unsigned>(found), internal_stacked);
+    heap_caps_free(tasks);
 }
 
 // Init is transactional: every handle below is either committed as a set or
