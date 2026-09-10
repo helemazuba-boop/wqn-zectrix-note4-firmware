@@ -160,6 +160,29 @@ constexpr uint8_t kRegDacVolume = 0x32;
 constexpr uint8_t kRegDac37 = 0x37;
 constexpr uint8_t kRegGpio44 = 0x44;
 constexpr uint8_t kRegGp45 = 0x45;
+
+// [mic-gain] Microphone PGA gain, written to REG16 (kRegAdc16).
+//
+// esp_codec_dev encodes this as an index into es8311_mic_gain_t:
+// 0=0dB 1=6dB 2=12dB 3=18dB 4=24dB 5=30dB 6=36dB 7=42dB, written as the whole
+// byte by es8311_set_mic_gain(). Espressif's es8311_open() only parks REG16 at
+// 0x24 during clock setup and never sets the gain itself; the application is
+// expected to call esp_codec_dev_set_in_gain() afterwards, which is what the
+// board's reference driver does (it asks for 30 dB).
+//
+// This firmware never did, so the gain was whatever 0x24 happens to select.
+// Both plausible field positions in 0x24 read as index 4, i.e. 24 dB, and at
+// 24 dB the loud clips already hit the rail: measured over the 2026-09-10
+// captures, a close-mic whisper produced 336 full-scale samples in 2 s across
+// 89 separate runs (the reported "popping"), while quiet voiced speech stayed
+// clean. Breath blasts are transient, so only headroom helps -- a level change
+// cannot, the crest factor is the problem.
+//
+// 18 dB buys 6 dB of it. The quietest measured voiced clip had rms 855, which
+// becomes ~428, still more than twice the server's non-speech floor of 200, so
+// quiet speech does not fall out of recognition.
+constexpr uint8_t kMicGainIndex = 3;  // 18 dB
+constexpr uint8_t kMicGainDb = 18;
 constexpr uint8_t kDacMuteBits = 0x60;
 constexpr uint8_t kDacVolumeZeroDb = 0xBF;
 
@@ -1072,6 +1095,12 @@ esp_err_t RunEs8311RegisterProgram(
     write(kRegAdc15, playback_only ? 0x00 : 0x40);
     write(kRegDac37, playback_only ? 0x16 : 0x08);
     write(kRegGp45, 0x00);
+    // [mic-gain] Espressif's open sequence leaves REG16 at its 0x24 parking
+    // value and relies on the application to set the gain; see kMicGainIndex.
+    // Written last so it survives the register program above.
+    write(kRegAdc16, kMicGainIndex);
+    ESP_LOGI(kTag, "[mic-gain] ES8311 REG16 set to index=%u (%d dB)",
+             static_cast<unsigned>(kMicGainIndex), static_cast<int>(kMicGainDb));
 
     if (result == ESP_OK && CodecProfileHasOutput(profile)) {
         uint8_t mute = 0;
