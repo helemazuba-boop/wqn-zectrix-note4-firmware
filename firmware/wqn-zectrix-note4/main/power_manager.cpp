@@ -23,6 +23,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "psram_task_stack.h"
 #include "services/sync_service.h"
 #include "pcf8563.h"
 #include "power/rtc_timekeep.h"
@@ -151,6 +152,13 @@ SemaphoreHandle_t g_adc_mutex = nullptr;
 i2c_master_bus_handle_t g_i2c_bus = nullptr;
 
 TaskHandle_t g_power_coordinator_task = nullptr;
+// [psram-stack] The coordinator never performs flash or NVS access on its own
+// stack: its one storage call, PrepareStorageForSleep (power_manager.cpp:962),
+// dispatches to the storage service task. Sleep uses deep sleep, which does not
+// suspend the cache the way light sleep does. See psram_task_stack.cpp.
+constexpr size_t kPowerCoordinatorStackBytes = 8192;
+StaticTask_t g_power_coordinator_tcb = {};
+StackType_t* g_power_coordinator_stack = nullptr;
 std::atomic<DeepSleepUiPolicy> g_deep_sleep_ui_policy{
     DeepSleepUiPolicy::kRetainedStandbyOnly};
 // Published by the UI after it has drained all immediate work and switched to
@@ -1591,10 +1599,18 @@ esp_err_t StartPowerCoordinator()
     // Treat startup as the initial activity epoch so an untouched device can
     // enter retained standby after the normal idle threshold.
     UserActivityMsRef().store(NowMs(), std::memory_order_relaxed);
-    const BaseType_t created =
-        xTaskCreate(PowerCoordinatorTask, "wqn_power_coord", 8192, nullptr, 4, &g_power_coordinator_task);
-    if (created != pdPASS) {
-        g_power_coordinator_task = nullptr;
+    if (g_power_coordinator_stack == nullptr) {
+        g_power_coordinator_stack = AllocTaskStack(
+            kPowerCoordinatorStackBytes, "wqn_power_coord", nullptr);
+    }
+    if (g_power_coordinator_stack == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
+    g_power_coordinator_task = xTaskCreateStatic(
+        PowerCoordinatorTask, "wqn_power_coord",
+        TaskStackWords(kPowerCoordinatorStackBytes), nullptr, 4,
+        g_power_coordinator_stack, &g_power_coordinator_tcb);
+    if (g_power_coordinator_task == nullptr) {
         return ESP_ERR_NO_MEM;
     }
     return ESP_OK;

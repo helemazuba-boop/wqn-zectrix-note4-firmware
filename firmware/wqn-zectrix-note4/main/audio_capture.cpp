@@ -16,6 +16,7 @@
 #include "freertos/task.h"
 #include "services/audio_service.h"
 #include "error_recorder.h"
+#include "psram_task_stack.h"
 
 namespace {
 
@@ -77,7 +78,17 @@ AudioServiceState g_audio;
 // to the DMA-starved heap versus the original 8192.
 constexpr uint32_t kCaptureTaskStackBytes = 6144;
 StaticTask_t g_capture_task_tcb = {};
-StackType_t g_capture_task_stack[kCaptureTaskStackBytes / sizeof(StackType_t)] = {};
+// Allocated from PSRAM on first use (see psram_task_stack.cpp). This worker
+// never touches flash or NVS itself: every storage operation goes through the
+// audio service or the storage service, which run on their own internal stacks.
+//
+// The previous form declared this array with kCaptureTaskStackBytes /
+// sizeof(StackType_t) elements (1536 words == the intended 6144 B) but then
+// passed kCaptureTaskStackBytes (6144) as xTaskCreateStatic's ulStackDepth,
+// which is counted in WORDS -- FreeRTOS therefore treated the stack as 24576 B
+// and memset 18 KiB past the end of this array into .bss. Route the depth
+// through wqn::TaskStackWords() so the unit is stated at the point of use.
+StackType_t* g_capture_task_stack = nullptr;
 
 int64_t IntegerSqrt(int64_t value)
 {
@@ -606,8 +617,20 @@ esp_err_t StartAudioCapture()
     // TCB are statically stored so internal-heap fragmentation can never block
     // a recording start again.
     if (g_audio.task == nullptr) {
+        if (g_capture_task_stack == nullptr) {
+            g_capture_task_stack = wqn::AllocTaskStack(
+                kCaptureTaskStackBytes, "wqn_audio_cap", nullptr);
+        }
+        if (g_capture_task_stack == nullptr) {
+            g_audio.running = false;
+            ESP_ERROR_CHECK_WITHOUT_ABORT(
+                wqn::services::EndAudioActivity(&g_audio.session));
+            xSemaphoreGive(g_audio.mutex);
+            return ESP_ERR_NO_MEM;
+        }
         TaskHandle_t worker = xTaskCreateStatic(
-            CaptureTask, "wqn_audio_cap", kCaptureTaskStackBytes, nullptr, 6,
+            CaptureTask, "wqn_audio_cap",
+            wqn::TaskStackWords(kCaptureTaskStackBytes), nullptr, 6,
             g_capture_task_stack, &g_capture_task_tcb);
         if (worker == nullptr) {
             // Unreachable with CONFIG_FREERTOS_SUPPORT_STATIC_ALLOCATION=y;

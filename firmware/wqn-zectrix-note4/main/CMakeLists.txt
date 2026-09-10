@@ -8,6 +8,7 @@ idf_component_register(
         "audio_player.cpp"
         "audio_selftest.cpp"
         "audio_pcm_dump.cpp"
+        "psram_task_stack.cpp"
         "button_input.cpp"
         "contract_fixtures.cpp"
         "device_ui.cpp"

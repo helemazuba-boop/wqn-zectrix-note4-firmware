@@ -14,6 +14,7 @@
 #include "storage.h"
 #include "ui_internal.h"  // NotifyUiTask
 #include "error_recorder.h"
+#include "psram_task_stack.h"
 
 namespace device_ui_internal {
 namespace {
@@ -64,6 +65,12 @@ struct PersistCommand {
 PersistCommand g_pool[kPoolDepth];
 QueueHandle_t g_worker_queue = nullptr;  // carries slot indices (uint8_t)
 TaskHandle_t g_worker_task = nullptr;
+// [psram-stack] Safe to keep in PSRAM: all seven PersistKind command paths
+// dispatch through ExecuteStorageTransaction, so the actual NVS/SPIFFS work
+// runs on the storage service task's internal stack, not this one. Verified
+// per kind in persist_worker.cpp ExecutePersistCommand. See psram_task_stack.cpp.
+StaticTask_t g_worker_tcb = {};
+StackType_t* g_worker_stack = nullptr;
 portMUX_TYPE g_start_lock = portMUX_INITIALIZER_UNLOCKED;
 bool g_starting = false;
 std::atomic<uint32_t> g_next_operation_id{1};
@@ -303,8 +310,20 @@ esp_err_t StartPersistWorker()
         }
     }
     TaskHandle_t created = nullptr;
-    if (xTaskCreate(PersistWorkerTask, "wqn_persist", kTaskStackBytes, nullptr,
-                    kTaskPriority, &created) != pdPASS) {
+    if (g_worker_stack == nullptr) {
+        g_worker_stack = wqn::AllocTaskStack(
+            kTaskStackBytes, "wqn_persist", nullptr);
+    }
+    if (g_worker_stack == nullptr) {
+        taskENTER_CRITICAL(&g_start_lock);
+        g_starting = false;
+        taskEXIT_CRITICAL(&g_start_lock);
+        return ESP_ERR_NO_MEM;
+    }
+    created = xTaskCreateStatic(
+        PersistWorkerTask, "wqn_persist", wqn::TaskStackWords(kTaskStackBytes),
+        nullptr, kTaskPriority, g_worker_stack, &g_worker_tcb);
+    if (created == nullptr) {
         taskENTER_CRITICAL(&g_start_lock);
         g_starting = false;
         taskEXIT_CRITICAL(&g_start_lock);
