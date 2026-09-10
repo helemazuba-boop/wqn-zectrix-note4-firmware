@@ -183,6 +183,14 @@ constexpr uint8_t kRegGp45 = 0x45;
 // quiet speech does not fall out of recognition.
 constexpr uint8_t kMicGainIndex = 3;  // 18 dB
 constexpr uint8_t kMicGainDb = 18;
+// REG16 bit 5 is ADC_SYNC: 1 = "synchronize filter counter with LRCK -
+// standard audio clock". Espressif's open sequence sets it (it writes 0x24 =
+// 0x20 | 4) and the whole register program depends on it. Writing a bare gain
+// index here clears it, which desynchronises the ADC decimation filter from
+// LRCK -- that was shipped once and it destroyed quiet speech outright.
+// The gain lives in bits[2:0] (ADC_SCALE), so the sync bit must be OR-ed in.
+constexpr uint8_t kRegAdc16Sync = 0x20;
+constexpr uint8_t kRegAdc16Value = kRegAdc16Sync | kMicGainIndex;
 constexpr uint8_t kDacMuteBits = 0x60;
 constexpr uint8_t kDacVolumeZeroDb = 0xBF;
 
@@ -1098,8 +1106,9 @@ esp_err_t RunEs8311RegisterProgram(
     // [mic-gain] Espressif's open sequence leaves REG16 at its 0x24 parking
     // value and relies on the application to set the gain; see kMicGainIndex.
     // Written last so it survives the register program above.
-    write(kRegAdc16, kMicGainIndex);
-    ESP_LOGI(kTag, "[mic-gain] ES8311 REG16 set to index=%u (%d dB)",
+    write(kRegAdc16, kRegAdc16Value);
+    ESP_LOGI(kTag, "[mic-gain] ES8311 REG16=0x%02x (ADC_SYNC=1, ADC_SCALE=%u = %d dB)",
+             static_cast<unsigned>(kRegAdc16Value),
              static_cast<unsigned>(kMicGainIndex), static_cast<int>(kMicGainDb));
 
     if (result == ESP_OK && CodecProfileHasOutput(profile)) {
