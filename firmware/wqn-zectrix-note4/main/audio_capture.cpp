@@ -28,24 +28,6 @@ constexpr size_t kMaxCaptureSamples =
     static_cast<size_t>(wqn::kAudioCaptureSampleRate) *
     (kMaxCaptureMs / 1000);
 constexpr size_t kReadFrames = 240;
-
-// [dc-block] The ES8311 capture path has no DC removal, so every recording
-// carries a sub-audio baseline wander. Measured on device (2026-09-10, 4 PTT):
-// 36%-54% of each clip's energy sits below 80 Hz, and that component peaks at
-// 1.5 Hz, 2.5 Hz and 7 Hz in three of the four clips -- below hearing, not
-// speech. It inflates rms, eats headroom (it is what pushed the loudest whisper
-// into 89 separate clipping runs), and turns into an audible "thump" as soon as
-// anything normalises the clip.
-// Two cascaded one-pole sections remove it: y[n] = x[n] - x[n-1] +
-// (1 - 2^-kHighPassShift) * y[n-1], corner fs / (2*pi*2^kHighPassShift), so at
-// 16 kHz a shift of 5 gives ~80 Hz, the standard ASR high-pass corner.
-// Measured against the four 2026-09-10 clips, one pole left the worst clip at
-// 24.8% of its energy below 80 Hz; two poles bring it to 10.5% while the
-// 100-300 Hz band (voiced fundamentals) is untouched and the 300-3400 Hz share
-// actually rises, because the drift had been inflating the total.
-constexpr int kHighPassShift = 5;
-constexpr int kHighPassCutoffHz = 16000 / 6 / 32;  // ~83 Hz, for the log line
-
 constexpr size_t kReadSamples = kReadFrames * kStereoChannels;
 constexpr int kAdcWarmupReadCount = 4;
 // [dma-footprint] The RX DMA pool is 6 descriptors x this frame count x 4 B.
@@ -469,17 +451,9 @@ void CaptureSession()
     g_audio.initialized = true;
     xSemaphoreGive(g_audio.mutex);
     ESP_LOGI(kTag,
-             "capture start: 16kHz s16le mono from ES8311 left channel; ADC warmup discarded reads=%d bytes=%u highpass_hz=%u",
-             kAdcWarmupReadCount, static_cast<unsigned>(warmup_bytes),
-             static_cast<unsigned>(kHighPassCutoffHz));
+             "capture start: 16kHz s16le mono from ES8311 left channel; ADC warmup discarded reads=%d bytes=%u",
+             kAdcWarmupReadCount, static_cast<unsigned>(warmup_bytes));
     const int64_t start_us = esp_timer_get_time();
-    // State of the two cascaded high-pass poles below. Must live across I2S
-    // reads: each read is only 15 ms, and the pole time constant is an order of
-    // magnitude longer than that.
-    int hp1_prev_input = 0;
-    int hp1_prev_output = 0;
-    int hp2_prev_input = 0;
-    int hp2_prev_output = 0;
     int64_t sum_squares = 0;
     int64_t left_abs_sum = 0;
     int64_t right_abs_sum = 0;
@@ -520,27 +494,9 @@ void CaptureSession()
                 sample_capacity_reached = true;
                 break;
             }
+            const int left = static_cast<int>(buffer[i]);
             const int right = static_cast<int>(buffer[i + 1]);
-            // Two cascaded one-pole sections, see kHighPassShift. The shift form
-            // keeps each section to an add, a subtract and two shifts, which
-            // matters at 16 kHz inside the I2S read loop.
-            const int raw_left = static_cast<int>(buffer[i]);
-            const int stage1 = raw_left - hp1_prev_input + hp1_prev_output -
-                               (hp1_prev_output >> kHighPassShift);
-            hp1_prev_input = raw_left;
-            hp1_prev_output = stage1;
-            const int stage2 = stage1 - hp2_prev_input + hp2_prev_output -
-                               (hp2_prev_output >> kHighPassShift);
-            hp2_prev_input = stage1;
-            hp2_prev_output = stage2;
-            int filtered = stage2;
-            if (filtered > 32767) {
-                filtered = 32767;
-            } else if (filtered < -32768) {
-                filtered = -32768;
-            }
-            const int left = filtered;
-            const int16_t sample = static_cast<int16_t>(filtered);
+            const int16_t sample = buffer[i];
             g_audio.capture_buffer[g_audio.chunk.sample_count++] = sample;
             if (mono_count < kMaxMonoFrames) {
                 mono_buf[mono_count++] = sample;
