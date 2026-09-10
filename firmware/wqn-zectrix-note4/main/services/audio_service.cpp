@@ -153,9 +153,6 @@ constexpr uint8_t kRegSystem14 = 0x14;
 constexpr uint8_t kRegAdc15 = 0x15;
 constexpr uint8_t kRegAdc16 = 0x16;
 constexpr uint8_t kRegAdc17 = 0x17;
-constexpr uint8_t kRegAlc18Reg = 0x18;
-constexpr uint8_t kRegAlc19Reg = 0x19;
-constexpr uint8_t kRegAlc1AReg = 0x1A;
 constexpr uint8_t kRegAdc1B = 0x1B;
 constexpr uint8_t kRegAdc1C = 0x1C;
 constexpr uint8_t kRegDacMute = 0x31;
@@ -194,38 +191,6 @@ constexpr uint8_t kMicGainDb = 18;
 // The gain lives in bits[2:0] (ADC_SCALE), so the sync bit must be OR-ed in.
 constexpr uint8_t kRegAdc16Sync = 0x20;
 constexpr uint8_t kRegAdc16Value = kRegAdc16Sync | kMicGainIndex;
-
-// [alc] Automatic level control, ES8311 datasheet REG18/REG19/REG1A.
-//
-// The clipping on close-mic whispering is a crest-factor problem: breath
-// blasts are short transients many times the rms of the speech around them,
-// so no static gain setting can both keep quiet speech loud enough and leave
-// room for them. Measured on device, one clip put 336 samples at full scale
-// in 2 s across 89 separate runs while its neighbour, quiet voiced speech,
-// never clipped at all.
-//
-// ALC is the codec's own answer: it turns the gain down when the signal runs
-// past ALC_MAXLEVEL and back up when it falls below ALC_MINLEVEL, so the
-// blasts get compressed and the quiet parts get lifted.
-//
-//   REG18 bit7    ALC_EN           1 = enable
-//   REG18 bit6    ADC_AUTOMUTE_EN  0 = automute OFF, see below
-//   REG18 b[3:0]  ALC_WINSIZE      3 = 0.25 dB per 16 LRCK, i.e. 1 ms per
-//                                  step at 16 kHz, so ~80 ms to pull 20 dB.
-//                                  Fast enough for a blast, slow enough not
-//                                  to pump on every syllable.
-//   REG19 b[7:4]  ALC_MAXLEVEL     7 = -12.0 dB, the compression ceiling
-//   REG19 b[3:0]  ALC_MINLEVEL     3 = -18.1 dB, the lift floor
-//   REG1A         automute/noise gate left at 0x00, deliberately.
-//
-// Automute and the noise gate stay off on purpose. Both work against this
-// use case: the shortest automute window is 2048 samples (~128 ms at 16 kHz)
-// with a threshold that a whisper will not clear, and the noise gate tops out
-// at -30 dB, so either one would mute exactly the audio we are trying to
-// recover.
-constexpr uint8_t kRegAlc18 = 0x80 | 0x03;  // ALC_EN | winsize 3
-constexpr uint8_t kRegAlc19 = (0x7 << 4) | 0x3;  // -12.0 dB max, -18.1 dB min
-constexpr uint8_t kRegAlc1A = 0x00;  // automute and noise gate off
 constexpr uint8_t kDacMuteBits = 0x60;
 constexpr uint8_t kDacVolumeZeroDb = 0xBF;
 
@@ -1145,15 +1110,6 @@ esp_err_t RunEs8311RegisterProgram(
     ESP_LOGI(kTag, "[mic-gain] ES8311 REG16=0x%02x (ADC_SYNC=1, ADC_SCALE=%u = %d dB)",
              static_cast<unsigned>(kRegAdc16Value),
              static_cast<unsigned>(kMicGainIndex), static_cast<int>(kMicGainDb));
-    // REG17 must already hold the ceiling: "when ALC is on, ADC_VOLUME =
-    // MAXGAIN", and the program above writes 0xBF (0 dB) to it.
-    write(kRegAlc18Reg, kRegAlc18);
-    write(kRegAlc19Reg, kRegAlc19);
-    write(kRegAlc1AReg, kRegAlc1A);
-    ESP_LOGI(kTag, "[alc] ES8311 ALC on: REG18=0x%02x REG19=0x%02x REG1A=0x%02x",
-             static_cast<unsigned>(kRegAlc18),
-             static_cast<unsigned>(kRegAlc19),
-             static_cast<unsigned>(kRegAlc1A));
 
     if (result == ESP_OK && CodecProfileHasOutput(profile)) {
         uint8_t mute = 0;
