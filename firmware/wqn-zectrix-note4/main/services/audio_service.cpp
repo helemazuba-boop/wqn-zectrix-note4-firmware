@@ -181,8 +181,14 @@ constexpr uint8_t kRegGp45 = 0x45;
 // 18 dB buys 6 dB of it. The quietest measured voiced clip had rms 855, which
 // becomes ~428, still more than twice the server's non-speech floor of 200, so
 // quiet speech does not fall out of recognition.
-constexpr uint8_t kMicGainIndex = 3;  // 18 dB
-constexpr uint8_t kMicGainDb = 18;
+// 24 dB, the value this board has always run at: it is what Espressif's 0x24
+// parking byte selects, and it is the level the device shipped and was tested
+// with. It was lowered to 18 dB for one round on the theory that the extra
+// headroom would stop the clipping; it did not (peaks still reached 32767), it
+// only cost level, and quiet speech got worse. Restore it. The clipping is a
+// crest-factor problem and is not solved by static gain either way.
+constexpr uint8_t kMicGainIndex = 4;  // 24 dB
+constexpr uint8_t kMicGainDb = 24;
 // REG16 bit 5 is ADC_SYNC: 1 = "synchronize filter counter with LRCK -
 // standard audio clock". Espressif's open sequence sets it (it writes 0x24 =
 // 0x20 | 4) and the whole register program depends on it. Writing a bare gain
