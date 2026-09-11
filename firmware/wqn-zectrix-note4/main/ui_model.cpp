@@ -340,6 +340,14 @@ void ClampUiSelection(UiState* state)
     if (state->settings.selected >= kSettingsItemCount) {
         state->settings.selected = kSettingsItemCount - 1;
     }
+    if (state->settings.dev_selected >= kDevItemCount) {
+        state->settings.dev_selected = kDevItemCount - 1;
+    }
+#if !CONFIG_WQN_DEV_MENU_ENABLE
+    // The dev list is only reachable through the flag-gated root row, so a
+    // firmware built without it must never be left in the second level.
+    state->settings.view = SettingsView::kRoot;
+#endif
     const size_t ai_pages = AiSessionPageCount(state->ai);
     if (state->ai.page >= ai_pages) {
         state->ai.page = ai_pages > 0 ? ai_pages - 1 : 0;

@@ -99,9 +99,9 @@ Load-bearing flags: `CONFIG_WQN_WIFI_STA_ENABLE` (default n),
 `CONFIG_WQN_EPD_UI_ENABLE` (default n), `CONFIG_WQN_EPD_LOCAL_PARTIAL_ENABLE`
 (`0x83` local partial), `CONFIG_WQN_DEEP_SLEEP_ENABLE`, `CONFIG_WQN_AI_ENABLE`,
 `CONFIG_WQN_AI_AUDIO_SELFTEST_ENABLE`, `CONFIG_WQN_EPD_IDLE_POWER_OFF_MS`,
-`CONFIG_WQN_DEV_MENU_ENABLE` (default n; three read-only dev settings rows,
-structure fixed by `DEV_DIAGNOSTICS.md`; `wqn::RecordError` capture is always
-compiled regardless of this flag).
+`CONFIG_WQN_DEV_MENU_ENABLE` (default n; one settings row opening a
+second-level read-only dev list, structure fixed by `DEV_DIAGNOSTICS.md`;
+`wqn::RecordError` capture is always compiled regardless of this flag).
 
 ### Tests
 

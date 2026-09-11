@@ -765,6 +765,13 @@ std::string FrameSignature(const wqn::UiFrame& frame)
         signature.append("|settings:");
         signature.append(std::to_string(frame.settings.selected));
         signature.push_back('/');
+        // Second-level dev list: which list is drawn and which row is selected
+        // are both visible state; leaving them out would dedup the switch into
+        // the dev list and every UP/DOWN inside it.
+        signature.append(std::to_string(static_cast<int>(frame.settings.view)));
+        signature.push_back('/');
+        signature.append(std::to_string(frame.settings.dev_selected));
+        signature.push_back('/');
         signature.append(std::to_string(static_cast<int>(frame.settings.dialog)));
         signature.push_back('/');
         signature.append(std::to_string(frame.settings.auto_sync_selected));
@@ -835,6 +842,14 @@ std::string FrameSignature(const wqn::UiFrame& frame)
         for (const wqn::SettingsErrorLine& error_line : diag.error_lines) {
             signature.push_back('|');
             signature.append(error_line.text);
+        }
+        signature.push_back('/');
+        signature.append(diag.sleep_diag_count_label);
+        signature.push_back('/');
+        signature.append(std::to_string(diag.sleep_diag_line_count));
+        for (const wqn::SettingsSleepDiagLine& sleep_line : diag.sleep_diag_lines) {
+            signature.push_back('|');
+            signature.append(sleep_line.text);
         }
     }
     for (const wqn::UiLine& line : frame.lines) {

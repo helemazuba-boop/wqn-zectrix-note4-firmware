@@ -80,4 +80,14 @@ bool ConsumeSleepDiagnosticsDumpRequest();
 // whether a dump is worth showing.
 size_t SleepDiagnosticEntryCount();
 
+// Read-only ring snapshot for the UI: copies the newest min(cap, valid)
+// entries, oldest first (same contract as error_recorder's CopyRecentErrors).
+// This is the only way to read the ring on battery -- DumpSleepDiagnosticsToLog
+// needs a console, which the USB-triggered path cannot assume. Lock-free like
+// SleepDiagnosticEntryCount: a concurrent RecordSleepDiagnosticEvent can only
+// make the newest entry look torn, and the per-entry CRC rejects it, so the
+// worst case is one missing entry rather than a bogus one. RTC slow memory is
+// uncached and slow, so call this once per dialog open, never per render.
+size_t CopySleepDiagnosticEntries(SleepDiagnosticEvent* out, size_t cap);
+
 }  // namespace wqn::runtime

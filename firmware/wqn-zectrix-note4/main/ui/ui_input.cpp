@@ -13,6 +13,7 @@
 #include "flash_session.h"
 #include "opencode_session.h"
 #include "power_manager.h"
+#include "runtime/sleep_diagnostics.h"
 #include "services/connectivity_service.h"
 #include "services/sync_service.h"
 
@@ -231,13 +232,15 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
         return RefreshSchedule::kNone;
     }
 
-    // [dev-diag] kDevInfo/kDevSync/kDevErrors share the read-only dialog
-    // contract: confirm (short or long) closes; up/down do nothing.
+    // [dev-diag] kBattery/kStorage/kDevInfo/kDevSync/kDevErrors/kSleepDiag
+    // share the read-only dialog contract: confirm (short or long) closes;
+    // up/down do nothing.
     if (state->settings.dialog == wqn::SettingsDialog::kBattery ||
         state->settings.dialog == wqn::SettingsDialog::kStorage ||
         state->settings.dialog == wqn::SettingsDialog::kDevInfo ||
         state->settings.dialog == wqn::SettingsDialog::kDevSync ||
-        state->settings.dialog == wqn::SettingsDialog::kDevErrors) {
+        state->settings.dialog == wqn::SettingsDialog::kDevErrors ||
+        state->settings.dialog == wqn::SettingsDialog::kSleepDiag) {
         if (event.button == wqn::ButtonId::kConfirm && (short_press || long_press)) {
             state->settings.dialog = wqn::SettingsDialog::kNone;
             return RefreshSchedule::kConfig;
@@ -288,6 +291,65 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
             return RefreshSchedule::kConfig;
         }
         return RefreshSchedule::kNone;
+    }
+
+    // [dev-diag] Second-level dev list (DEV_DIAGNOSTICS.md §3). Reached only
+    // from the root row kSettingsRowDevMenu; long-Confirm returns to the root
+    // list instead of Home, and every Confirm opens a read-only dialog. Placed
+    // after all dialog blocks so an open dev dialog keeps its own handling.
+    if (state->settings.view == wqn::SettingsView::kDev) {
+        if (long_press && event.button == wqn::ButtonId::kConfirm) {
+            state->settings.view = wqn::SettingsView::kRoot;
+            state->settings.notice.clear();
+            return RefreshSchedule::kConfig;
+        }
+        if (!short_press) {
+            return RefreshSchedule::kNone;
+        }
+        if (event.button == wqn::ButtonId::kUp) {
+            state->settings.dev_selected =
+                state->settings.dev_selected == 0 ? wqn::kDevItemCount - 1
+                                                  : state->settings.dev_selected - 1;
+            return RefreshSchedule::kSelection;
+        }
+        if (event.button == wqn::ButtonId::kDownPower) {
+            state->settings.dev_selected =
+                state->settings.dev_selected + 1 >= wqn::kDevItemCount
+                    ? 0
+                    : state->settings.dev_selected + 1;
+            return RefreshSchedule::kSelection;
+        }
+        if (event.button != wqn::ButtonId::kConfirm) {
+            return RefreshSchedule::kNone;
+        }
+        switch (state->settings.dev_selected) {
+            case wqn::kDevRowDevInfo:
+                OpenSettingsDialog(state, wqn::SettingsDialog::kDevInfo);
+                return RefreshSchedule::kConfig;
+            case wqn::kDevRowDevSync:
+                OpenSettingsDialog(state, wqn::SettingsDialog::kDevSync);
+                return RefreshSchedule::kConfig;
+            case wqn::kDevRowDevErrors:
+                OpenSettingsDialog(state, wqn::SettingsDialog::kDevErrors);
+                return RefreshSchedule::kConfig;
+            case wqn::kDevRowBatteryRaw:
+                OpenSettingsDialog(state, wqn::SettingsDialog::kBattery);
+                return RefreshSchedule::kConfig;
+            case wqn::kDevRowStorage:
+                OpenSettingsDialog(state, wqn::SettingsDialog::kStorage);
+                return RefreshSchedule::kConfig;
+            case wqn::kDevRowSleepDiag:
+                // The on-panel view comes from the snapshot, which is filled by
+                // UpdateSettingsDiagnostics. This additionally asks the power
+                // coordinator to log the whole ring -- a bonus that only pays
+                // off with a USB console attached, since the deferred dump
+                // exists precisely because battery operation has no console.
+                wqn::runtime::RequestSleepDiagnosticsDump();
+                OpenSettingsDialog(state, wqn::SettingsDialog::kSleepDiag);
+                return RefreshSchedule::kConfig;
+            default:
+                return RefreshSchedule::kNone;
+        }
     }
 
     if (long_press && event.button == wqn::ButtonId::kConfirm) {
@@ -364,10 +426,12 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
             OpenSettingsDialog(state, wqn::SettingsDialog::kAutoSync);
             return RefreshSchedule::kConfig;
         case wqn::kSettingsRowBattery:
-            OpenSettingsDialog(state, wqn::SettingsDialog::kBattery);
-            return RefreshSchedule::kConfig;
-        case wqn::kSettingsRowStorage:
-            OpenSettingsDialog(state, wqn::SettingsDialog::kStorage);
+            // [dev-diag] The raw ADC numbers and the fit formula moved to the
+            // second-level dev list (电量原始); the root row keeps the
+            // user-facing percent and just reports it in the notice line.
+            UpdateSettingsDiagnostics(state);
+            state->settings.notice =
+                "电量 " + std::to_string(state->settings.diagnostics.battery_percent) + "%";
             return RefreshSchedule::kConfig;
         case wqn::kSettingsRowImageRender:
             OpenSettingsDialog(state, wqn::SettingsDialog::kImageRendering);
@@ -383,14 +447,15 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
             state->settings.notice = "固件 " + state->settings.diagnostics.firmware_version;
             return RefreshSchedule::kConfig;
 #if CONFIG_WQN_DEV_MENU_ENABLE
-        case wqn::kSettingsRowDevInfo:
-            OpenSettingsDialog(state, wqn::SettingsDialog::kDevInfo);
-            return RefreshSchedule::kConfig;
-        case wqn::kSettingsRowDevSync:
-            OpenSettingsDialog(state, wqn::SettingsDialog::kDevSync);
-            return RefreshSchedule::kConfig;
-        case wqn::kSettingsRowDevErrors:
-            OpenSettingsDialog(state, wqn::SettingsDialog::kDevErrors);
+        case wqn::kSettingsRowDevMenu:
+            // Snapshot before switching: the dev rows show the git commit, the
+            // sync summary and the error/sleep counts, and
+            // UpdateSettingsDiagnostics is the only place they are filled. It
+            // also runs on the 60s reload, but taking one here keeps a freshly
+            // opened list correct.
+            UpdateSettingsDiagnostics(state);
+            state->settings.view = wqn::SettingsView::kDev;
+            state->settings.notice.clear();
             return RefreshSchedule::kConfig;
 #endif
         case wqn::kSettingsRowFactoryReset:

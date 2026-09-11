@@ -76,8 +76,9 @@ Feature toggles live in `idf.py menuconfig` under **WQN firmware** (defined in
   secrets still server-side.
 - `CONFIG_WQN_AI_AUDIO_SELFTEST_ENABLE` — capture a short mic sample at boot, print
   RMS/peak, never upload.
-- `CONFIG_WQN_DEV_MENU_ENABLE` — three read-only dev diagnostics rows in the settings
-  page (Dev info / sync diagnostics / error log); structure fixed by
+- `CONFIG_WQN_DEV_MENU_ENABLE` — a settings row that opens the second-level read-only
+  dev list (Dev info / sync diagnostics / error log / raw battery / storage detail /
+  sleep diagnostics); structure fixed by
   `firmware/wqn-zectrix-note4/DEV_DIAGNOSTICS.md`. Default n; error capture
   (`wqn::RecordError`) is always compiled regardless of this flag.
 

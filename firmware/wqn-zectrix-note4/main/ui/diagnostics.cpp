@@ -14,6 +14,7 @@
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "diagnostics.h"
+#include "runtime/sleep_diagnostics.h"
 #include "services/sync_service.h"
 #include "storage.h"
 
@@ -140,6 +141,27 @@ std::string SyncDomainLine(
         line += last_error;
     }
     return line;
+}
+
+// [dev-diag] Sleep/power diagnostic event labels (DEV_DIAGNOSTICS.md §4.6).
+std::string SleepEventKindLabel(wqn::runtime::SleepDiagnosticEventKind kind)
+{
+    switch (kind) {
+        case wqn::runtime::SleepDiagnosticEventKind::kBoot:
+            return "启动";
+        case wqn::runtime::SleepDiagnosticEventKind::kPowerPolicy:
+            return "策略";
+        case wqn::runtime::SleepDiagnosticEventKind::kAdmissionBlocked:
+            return "准入受阻";
+        case wqn::runtime::SleepDiagnosticEventKind::kWakePlan:
+            return "唤醒计划";
+        case wqn::runtime::SleepDiagnosticEventKind::kRollback:
+            return "回滚";
+        case wqn::runtime::SleepDiagnosticEventKind::kCommit:
+            return "提交";
+        default:
+            return "?";
+    }
 }
 
 void UpdateSettingsDiagnostics(wqn::UiState* state)
@@ -344,6 +366,43 @@ void UpdateSettingsDiagnostics(wqn::UiState* state)
     snapshot.sync_diag_lines[6] = SyncDomainLine(
         "题箱", SyncOutboxPhaseLabel(online.problem_outbox.phase),
         online.problem_outbox.retry_attempt, online.problem_outbox.last_error);
+
+    // [dev-diag] Sleep/power diagnostics (DEV_DIAGNOSTICS.md §4.6). The ring
+    // lives in RTC slow memory and survives deep sleep, but it is only readable
+    // through CopySleepDiagnosticEntries -- the log dump needs a console that
+    // does not exist on battery. Refreshed with the rest of the snapshot (every
+    // 60s reload and every dialog open); never called from the render path
+    // because RTC slow memory is uncached and slow.
+    wqn::runtime::SleepDiagnosticEvent sleep_events[wqn::kSleepDiagLines] = {};
+    const size_t sleep_count =
+        wqn::runtime::CopySleepDiagnosticEntries(sleep_events, wqn::kSleepDiagLines);
+    snapshot.sleep_diag_line_count = sleep_count;
+    snapshot.sleep_diag_count_label =
+        sleep_count == 0 ? std::string("无") : std::to_string(sleep_count) + " 条";
+    for (size_t i = 0; i < sleep_count; ++i) {
+        const wqn::runtime::SleepDiagnosticEvent& event =
+            sleep_events[sleep_count - 1 - i];  // newest first
+        wqn::SettingsSleepDiagLine& line = snapshot.sleep_diag_lines[i];
+        char time_label[10] = {};
+        const std::time_t event_time = static_cast<std::time_t>(event.wall_time_sec);
+        if (event_time >= kMinReasonableUnixTime) {
+            std::tm local = {};
+            localtime_r(&event_time, &local);
+            std::strftime(time_label, sizeof(time_label), "%H:%M", &local);
+        } else {
+            std::snprintf(
+                time_label, sizeof(time_label), "+%lum",
+                static_cast<unsigned long>(event.app_uptime_ms / 60000));
+        }
+        std::snprintf(
+            line.text, sizeof(line.text), "%s [%s] %s", time_label,
+            SleepEventKindLabel(event.kind).c_str(),
+            event.reason[0] == '\0' ? "-" : event.reason);
+        line.valid = true;
+    }
+    for (size_t i = sleep_count; i < wqn::kSleepDiagLines; ++i) {
+        snapshot.sleep_diag_lines[i].valid = false;
+    }
 }
 
 }  // namespace device_ui_internal

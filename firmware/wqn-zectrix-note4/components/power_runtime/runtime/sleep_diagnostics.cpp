@@ -355,4 +355,36 @@ size_t SleepDiagnosticEntryCount()
     return count;
 }
 
+size_t CopySleepDiagnosticEntries(SleepDiagnosticEvent* out, size_t cap)
+{
+    if (out == nullptr || cap == 0) {
+        return 0;
+    }
+    // Same insertion sort as DumpSleepDiagnosticsToLog: the ring is written
+    // round-robin, so sequence order is the only ordering that exists.
+    std::array<const RtcSleepDiagnosticEntry*, kSleepDiagnosticCapacity> ordered{};
+    size_t count = 0;
+    for (const RtcSleepDiagnosticEntry& entry : g_sleep_diagnostic_entries) {
+        if (!IsValid(entry)) {
+            continue;
+        }
+        size_t position = count;
+        while (position > 0 &&
+               SequenceAfter(ordered[position - 1]->sequence, entry.sequence)) {
+            ordered[position] = ordered[position - 1];
+            --position;
+        }
+        ordered[position] = &entry;
+        ++count;
+    }
+    // `ordered` is oldest first; emit the newest `take` of them, still oldest
+    // first, so the caller indexes the newest at take - 1.
+    const size_t take = count < cap ? count : cap;
+    for (size_t i = 0; i < take; ++i) {
+        out[i] = ordered[count - take + i]->event;
+    }
+    return take;
+}
+
+
 }  // namespace wqn::runtime

@@ -226,15 +226,16 @@ menu "WQN firmware"
             reached while charging. Kept for a future policy change.
 
     config WQN_DEV_MENU_ENABLE
-        bool "Enable dev diagnostics rows in the settings page"
+        bool "Enable the dev diagnostics submenu in the settings page"
         default n
         depends on WQN_EPD_UI_ENABLE
         help
-            Adds three read-only settings rows (Dev info / sync diagnostics /
-            error log) for firmware development. Structure is fixed by
-            DEV_DIAGNOSTICS.md. Error capture (wqn::RecordError) is always
-            compiled in; this flag only controls the visible menu rows, so
-            release builds keep it n (RELEASE_CHECKLIST.md asserts the
+            Adds one "开发者选项" row to the settings page that opens a
+            second-level read-only list: dev info, sync diagnostics, error log,
+            raw battery, storage detail and sleep/power diagnostics. Structure
+            is fixed by DEV_DIAGNOSTICS.md. Error capture (wqn::RecordError) is
+            always compiled in; this flag only controls the visible menu entry,
+            so release builds keep it n (RELEASE_CHECKLIST.md asserts the
             recorded sdkconfig has it unset).
 
 endmenu

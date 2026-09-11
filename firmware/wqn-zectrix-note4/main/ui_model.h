@@ -197,9 +197,9 @@ struct HomeSummary {
 // (ui_model.cpp) clamps the selection without including ui/ headers.
 // Structure (rows, order, dialogs) is specified by DEV_DIAGNOSTICS.md.
 #if CONFIG_WQN_DEV_MENU_ENABLE
-constexpr size_t kSettingsItemCount = 14;
-#else
 constexpr size_t kSettingsItemCount = 11;
+#else
+constexpr size_t kSettingsItemCount = 10;
 #endif
 
 // Row indices as named constants — dispatch and chip-tag code must reference
@@ -209,21 +209,41 @@ constexpr size_t kSettingsRowWifi = 0;
 constexpr size_t kSettingsRowSyncNow = 1;
 constexpr size_t kSettingsRowAutoSync = 2;
 constexpr size_t kSettingsRowBattery = 3;
-constexpr size_t kSettingsRowStorage = 4;
-constexpr size_t kSettingsRowImageRender = 5;
-constexpr size_t kSettingsRowVolume = 6;
-constexpr size_t kSettingsRowWordDeck = 7;
-constexpr size_t kSettingsRowVersion = 8;
+constexpr size_t kSettingsRowImageRender = 4;
+constexpr size_t kSettingsRowVolume = 5;
+constexpr size_t kSettingsRowWordDeck = 6;
+constexpr size_t kSettingsRowVersion = 7;
 #if CONFIG_WQN_DEV_MENU_ENABLE
-constexpr size_t kSettingsRowDevInfo = 9;
-constexpr size_t kSettingsRowDevSync = 10;
-constexpr size_t kSettingsRowDevErrors = 11;
-constexpr size_t kSettingsRowFactoryReset = 12;
-constexpr size_t kSettingsRowPowerOff = 13;
-#else
+constexpr size_t kSettingsRowDevMenu = 8;
 constexpr size_t kSettingsRowFactoryReset = 9;
 constexpr size_t kSettingsRowPowerOff = 10;
+#else
+constexpr size_t kSettingsRowFactoryReset = 8;
+constexpr size_t kSettingsRowPowerOff = 9;
 #endif
+
+// Second-level dev list (DEV_DIAGNOSTICS.md §3): six rows, which is exactly the
+// panel's 6-row window, so it needs no scrolling. kDevRowBatteryRaw and
+// kDevRowStorage carry the two detail dialogs that used to sit on the root
+// list; the flag gates only the root entry row, not these constants.
+constexpr size_t kDevItemCount = 6;
+constexpr size_t kDevRowDevInfo = 0;
+constexpr size_t kDevRowDevSync = 1;
+constexpr size_t kDevRowDevErrors = 2;
+constexpr size_t kDevRowBatteryRaw = 3;
+constexpr size_t kDevRowStorage = 4;
+constexpr size_t kDevRowSleepDiag = 5;
+// On-panel sleep/power diagnostic lines (DEV_DIAGNOSTICS.md §4.6).
+constexpr size_t kSleepDiagLines = 6;
+
+// Which row list the settings page is showing. The dev list is a second-level
+// view inside the same UiScreen -- deliberately not a new UiScreen, so the
+// top-level navigation ring, the retained deep-sleep screen ID and the sleep
+// policy per screen all stay untouched.
+enum class SettingsView {
+    kRoot,
+    kDev,
+};
 
 enum class SettingsDialog {
     kNone,
@@ -237,6 +257,7 @@ enum class SettingsDialog {
     kDevInfo,
     kDevSync,
     kDevErrors,
+    kSleepDiag,
     kFactoryReset,
     kPowerOff,
 };
@@ -246,6 +267,14 @@ enum class SettingsDialog {
 // POD with a fixed buffer: SettingsAppState (and UiFrame) are copied by value
 // on every render, so published payloads stay trivially copyable.
 struct SettingsErrorLine {
+    bool valid = false;
+    char text[96] = {};
+};
+
+// [dev-diag] One formatted sleep/power diagnostic line, built at snapshot time
+// by UpdateSettingsDiagnostics from a wqn::runtime::SleepDiagnosticEvent copy.
+// POD with a fixed buffer for the same reason as SettingsErrorLine above.
+struct SettingsSleepDiagLine {
     bool valid = false;
     char text[96] = {};
 };
@@ -286,10 +315,22 @@ struct SettingsDiagnosticsSnapshot {
     std::string error_count_label;      // row value: "3 条" / "无"
     size_t error_line_count = 0;
     SettingsErrorLine error_lines[6];
+    // [dev-diag] Sleep/power diagnostics (DEV_DIAGNOSTICS.md §4.6): the ring
+    // lives in RTC slow memory and is only readable through
+    // CopySleepDiagnosticEntries, so this copy is the on-panel view of it.
+    // Newest first, formatted at snapshot time like the error lines.
+    std::string sleep_diag_count_label;  // row value: "12 条" / "无"
+    size_t sleep_diag_line_count = 0;
+    SettingsSleepDiagLine sleep_diag_lines[kSleepDiagLines];
 };
 
 struct SettingsAppState {
     size_t selected = 0;
+    // Second-level dev list (kDevItemCount rows) opened from the root row
+    // kSettingsRowDevMenu; long-Confirm returns to kRoot. Defaults to kRoot so
+    // a deep-sleep wake or a fresh state reload never lands in the dev list.
+    SettingsView view = SettingsView::kRoot;
+    size_t dev_selected = 0;
     SettingsDialog dialog = SettingsDialog::kNone;
     size_t auto_sync_selected = 0;
     uint32_t auto_sync_interval_min = 0;

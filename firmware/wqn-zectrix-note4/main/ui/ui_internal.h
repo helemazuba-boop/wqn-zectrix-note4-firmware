@@ -663,7 +663,9 @@ esp_err_t RenderProblemBrowseToEpd(const wqn::UiFrame& frame, RefreshSchedule sc
 
 // ---- Settings page ----------------------------------------------------------
 
-esp_err_t DrawSettingsRow(size_t row_index, int y, const std::string& title, const std::string& value, bool selected);
+// `view` selects the row list semantics: the root list tags rows by the kind
+// of action they perform, the dev list (kDev) is uniformly read-only.
+esp_err_t DrawSettingsRow(wqn::SettingsView view, size_t row_index, int y, const std::string& title, const std::string& value, bool selected);
 // Footer defaults to the dismiss hint ("确认关闭"); action dialogs pass their
 // own (e.g. "确认进入配网").
 esp_err_t DrawSettingsDialogBox(const std::string& title, const char* footer = "确认关闭");

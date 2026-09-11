@@ -14,7 +14,7 @@ namespace device_ui_internal {
 
 constexpr char kTag[] = "wqn_ui";
 
-esp_err_t DrawSettingsRow(size_t row_index, int y, const std::string& title, const std::string& value, bool selected)
+esp_err_t DrawSettingsRow(wqn::SettingsView view, size_t row_index, int y, const std::string& title, const std::string& value, bool selected)
 {
     // [v2] Row horizontal bounds aligned to the AI page's flush 6px edges
     // (kMarginDense): left x=6, width 388 (6..394). Vertical geometry (y, 36px
@@ -58,7 +58,9 @@ esp_err_t DrawSettingsRow(size_t row_index, int y, const std::string& title, con
         ESP_RETURN_ON_ERROR(DrawClippedText(kContentX + 48, y + 20, 250, value), kTag, "draw settings value");
     }
     const char* tag = "菜单";
-    if (row_index == wqn::kSettingsRowWifi) {
+    if (view == wqn::SettingsView::kDev) {
+        tag = "查看";  // every dev row opens a read-only dialog
+    } else if (row_index == wqn::kSettingsRowWifi) {
         tag = "设置";  // WiFi manage
     } else if (row_index == wqn::kSettingsRowSyncNow) {
         tag = "执行";  // sync now
@@ -67,16 +69,18 @@ esp_err_t DrawSettingsRow(size_t row_index, int y, const std::string& title, con
                row_index == wqn::kSettingsRowVolume ||
                row_index == wqn::kSettingsRowWordDeck) {
         tag = "设置";
+    } else if (row_index == wqn::kSettingsRowBattery) {
+        tag = "查看";  // read-only notice, the raw numbers live in the dev list
     } else if (row_index == wqn::kSettingsRowVersion) {
         tag = "系统";  // firmware version
 #if CONFIG_WQN_DEV_MENU_ENABLE
-    } else if (row_index == wqn::kSettingsRowDevInfo ||
-               row_index == wqn::kSettingsRowDevSync ||
-               row_index == wqn::kSettingsRowDevErrors) {
-        tag = "系统";  // dev diagnostics rows
+    } else if (row_index == wqn::kSettingsRowDevMenu) {
+        tag = "菜单";  // opens the second-level dev list
 #endif
     } else if (row_index == wqn::kSettingsRowFactoryReset) {
         tag = "重置";  // factory reset
+    } else if (row_index == wqn::kSettingsRowPowerOff) {
+        tag = "电源";  // power off
     }
     DrawChip(kContentX + kContentWidth - 6 - 54, y + 8, 54, 20, tag);
     return ESP_OK;
@@ -327,6 +331,28 @@ esp_err_t RenderSettingsDialog(const wqn::SettingsAppState& settings)
             }
             break;
         }
+        case wqn::SettingsDialog::kSleepDiag: {
+            // [dev-diag] Sleep/power diagnostics (DEV_DIAGNOSTICS.md §4.6). The
+            // ring lives in RTC slow memory, so this is the on-battery view of
+            // it; opening the dialog also asks the power coordinator to dump
+            // the full ring to the log, which only helps with a USB console.
+            ESP_RETURN_ON_ERROR(DrawSettingsDialogBox("电源睡眠诊断"), kTag, "draw sleep diag dialog");
+            if (diag.sleep_diag_line_count == 0) {
+                ESP_RETURN_ON_ERROR(
+                    DrawCenteredText(86, 148, 228, "暂无睡眠记录"), kTag, "draw sleep diag empty");
+                break;
+            }
+            for (size_t i = 0; i < diag.sleep_diag_line_count; ++i) {
+                if (!diag.sleep_diag_lines[i].valid) {
+                    continue;
+                }
+                ESP_RETURN_ON_ERROR(
+                    DrawClippedText(
+                        88, 94 + static_cast<int>(i) * 18, 224, diag.sleep_diag_lines[i].text),
+                    kTag, "draw sleep diag line");
+            }
+            break;
+        }
         case wqn::SettingsDialog::kFactoryReset:
             ESP_RETURN_ON_ERROR(DrawSettingsDialogBox("恢复出厂"), kTag, "draw factory reset dialog");
             ESP_RETURN_ON_ERROR(DrawWrappedText(54, 98, 292, "将清除 NVS 中的配对、缓存、待上传、AI 会话、单词进度和设置。", 3), kTag, "draw reset body");
@@ -388,61 +414,86 @@ esp_err_t RenderSettingsToEpd(const wqn::UiFrame& frame, RefreshSchedule schedul
     const std::string storage_value = "NVS " + std::to_string(diag.nvs_used_entries) + "/" + std::to_string(diag.nvs_total_entries);
     const std::string version_value = diag.firmware_version.empty() ? WQN_FIRMWARE_VERSION : diag.firmware_version;
 
-    const std::string titles[kSettingsItemCount] = {
+    const std::string root_titles[kSettingsItemCount] = {
         "WiFi 管理",
         "立即同步",
         "自动同步间隔",
         "电量",
-        "存储详情",
         "图片渲染",
         "音量",
         "Word 默认词库",
         "固件版本",
 #if CONFIG_WQN_DEV_MENU_ENABLE
-        "Dev 信息",
-        "同步诊断",
-        "错误记录",
+        "开发者选项",
 #endif
         "恢复出厂",
         "关机",
     };
-    const std::string values[kSettingsItemCount] = {
+    const std::string root_values[kSettingsItemCount] = {
         settings.wifi_primary_ssid[0] != '\0' ? settings.wifi_primary_ssid : "未配置",
         settings.sync_status.empty() ? "空闲" : settings.sync_status,
         auto_sync_label,
         battery_value,
-        storage_value,
         image_render_label,
         volume_label,
         settings.default_word_deck_title.empty() ? "全部词库" : settings.default_word_deck_title,
         version_value,
 #if CONFIG_WQN_DEV_MENU_ENABLE
-        diag.git_commit,
-        diag.sync_diag_summary,
-        diag.error_count_label,
+        "只读诊断",
 #endif
         "",
         "",
     };
-    // Nine rows no longer fit the 300px panel at the 38px pitch; draw a
+    // [dev-diag] Second-level list (DEV_DIAGNOSTICS.md §3): six rows, which is
+    // exactly the panel window, so it never needs to scroll. 电量原始 and
+    // 存储详情 are the two detail dialogs that used to sit on the root list.
+    const std::string dev_titles[wqn::kDevItemCount] = {
+        "Dev 信息",
+        "同步诊断",
+        "错误记录",
+        "电量原始",
+        "存储详情",
+        "电源睡眠诊断",
+    };
+    const std::string dev_values[wqn::kDevItemCount] = {
+        diag.git_commit,
+        diag.sync_diag_summary,
+        diag.error_count_label,
+        std::to_string(diag.battery_mv) + " mV",
+        storage_value,
+        diag.sleep_diag_count_label,
+    };
+    const bool dev_view = settings.view == wqn::SettingsView::kDev;
+    const std::string* titles = dev_view ? dev_titles : root_titles;
+    const std::string* values = dev_view ? dev_values : root_values;
+    const size_t item_count = dev_view ? wqn::kDevItemCount : kSettingsItemCount;
+    const size_t selected = dev_view ? settings.dev_selected : settings.selected;
+    // Rows no longer fit the 300px panel at the 38px pitch; draw a
     // selection-following window instead (deterministic from the selection so
     // partial refreshes repaint consistently).
     size_t window_start = 0;
-    if (settings.selected >= kSettingsVisibleRows) {
+    if (selected >= kSettingsVisibleRows) {
         window_start = std::min(
-            settings.selected + 1 - kSettingsVisibleRows,
-            kSettingsItemCount - kSettingsVisibleRows);
+            selected + 1 - kSettingsVisibleRows,
+            item_count - kSettingsVisibleRows);
     }
     int y = 42;
-    for (size_t i = 0; i < kSettingsVisibleRows && window_start + i < kSettingsItemCount; ++i) {
+    for (size_t i = 0; i < kSettingsVisibleRows && window_start + i < item_count; ++i) {
         const size_t index = window_start + i;
         ESP_RETURN_ON_ERROR(
-            DrawSettingsRow(index, y, titles[index], values[index], index == settings.selected),
+            DrawSettingsRow(settings.view, index, y, titles[index], values[index], index == selected),
             kTag, "draw settings row");
         y += 38;
     }
+    // The dev list is a second level, so its escape hint differs. The title bar
+    // above y=32 is outside kSettingsContentRect and is therefore never redrawn
+    // on a kConfig partial refresh -- the orientation cue lives here instead.
+    const std::string help_line =
+        !settings.notice.empty() ? settings.notice
+        : dev_view ? std::string("上下选择，确认查看，长按确认返回设置")
+                   : std::string("上下选择，确认操作，长按确认返回首页");
     ESP_RETURN_ON_ERROR(
-        DrawClippedText(kMarginDense, 274, wqn::kEpdWidth - 2 * kMarginDense, settings.notice.empty() ? "上下选择，确认操作，长按确认返回首页" : settings.notice),
+        DrawClippedText(kMarginDense, 274, wqn::kEpdWidth - 2 * kMarginDense, help_line),
         kTag,
         "draw settings help");
 

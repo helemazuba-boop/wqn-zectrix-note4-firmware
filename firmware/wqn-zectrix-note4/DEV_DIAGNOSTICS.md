@@ -4,34 +4,55 @@
 
 ## 1. 目的与范围
 
-固件仍在开发阶段。Dev 菜单是设置页里的开发诊断区，用于回答三类高频问题：
+固件仍在开发阶段。Dev 菜单是设置页「开发者选项」进入的**二级菜单**，用于回答高频问题：
 
 1. **这台设备跑的是哪个构建、为什么重启的**（Dev 信息）；
 2. **同步为什么失败、卡在哪个域**（同步诊断）；
-3. **最近发生过哪些错误**（错误记录）。
+3. **最近发生过哪些错误**（错误记录）；
+4. **电量/存储的原始数字是多少**（电量原始、存储详情；两者原本平铺在一级）；
+5. **睡眠为什么没进去**（电源睡眠诊断）。
 
 **v1 边界（明确不做）**：只读。无写操作、无危险动作、无持久化、无自动刷新、不做 `esp_log` vprintf 全量捕获、不触碰 persist-worker 事务协议。要加可写操作时先扩展本文档。
 
 ## 2. 配置与发布策略
 
 - 新 Kconfig 开关：`CONFIG_WQN_DEV_MENU_ENABLE`（`main/Kconfig.projbuild`，`depends on WQN_EPD_UI_ENABLE`，**default n**）。
-- 门控语义：开关**只门控设置页的三个菜单行与对话框**（`#if` 预处理器裁剪）；错误捕获（`RecordError`）**常开编译**，发布固件同样保留——失败路径才执行，代价约 1KB flash / 0.8KB RAM 静态环，换来现场设备的问题回溯能力。
+- 门控语义：开关**只门控设置页一级的「开发者选项」入口行**（`#if` 预处理器裁剪；二级六行随之不可达）；错误捕获（`RecordError`）**常开编译**，发布固件同样保留——失败路径才执行，代价约 1KB flash / 0.8KB RAM 静态环，换来现场设备的问题回溯能力。
 - 发布保障：default n + `RELEASE_CHECKLIST.md` §1 校验步（记录的 sdkconfig 中 `# CONFIG_WQN_DEV_MENU_ENABLE is not set`）。开发机用 menuconfig 打开（写入 gitignored 的 `sdkconfig`，不进版本库）。
 - `sdkconfig.ai-local.defaults` 中保留注释行 `# CONFIG_WQN_DEV_MENU_ENABLE is not set`（照 `WQN_AI_AUDIO_SELFTEST_ENABLE` 先例），显式文档化 off 态。
 
-## 3. 入口结构：三行分区（固定）
+## 3. 入口结构：一级一行 + 二级六行（固定）
 
-设置页在「固件版本」之后、「恢复出厂」之前插入三行（`ui/page_settings.cpp` 的 titles/values 数组）：
+设置页一级在「固件版本」之后、「恢复出厂」之前插入**一行**入口（`ui/page_settings.cpp` 的 `root_titles`/`root_values`）：
 
-| 行 | 标题 | 值列 | 对话框 | 内容 |
+| 一级行 | 标题 | 值列 | 动作 |
+|---|---|---|---|
+| +1 | 开发者选项 | `只读诊断` | 进入二级列表（`SettingsView::kDev`） |
+
+确认该行进入二级列表（`dev_titles`/`dev_values`，六行 = 面板 6 行窗口，不需要滚动）：
+
+| 二级行 | 标题 | 值列 | 对话框 | 内容 |
 |---|---|---|---|---|
-| +1 | Dev 信息 | git hash 短码 | `kDevInfo` | 构建标识、复位原因、运行时长、堆/PSRAM |
-| +2 | 同步诊断 | 上轮结果 | `kDevSync` | 同步计数、三内容域与三 outbox 的 phase/重试/last_error |
-| +3 | 错误记录 | N 条 | `kDevErrors` | `error_recorder` 环形缓冲最近 6 条 |
+| 1 | Dev 信息 | git hash 短码 | `kDevInfo` | 构建标识、复位原因、运行时长、堆/PSRAM（§4.1） |
+| 2 | 同步诊断 | 上轮结果 | `kDevSync` | 同步计数、三内容域与三 outbox 的 phase/重试/last_error（§4.2） |
+| 3 | 错误记录 | N 条 | `kDevErrors` | `error_recorder` 环形缓冲最近 6 条（§4.3） |
+| 4 | 电量原始 | battery_mv | `kBattery` | adc_raw / adc_mv / battery_mv / percent / 充电标志 / 拟合公式（§4.4，原一级「电量详情」对话框） |
+| 5 | 存储详情 | NVS used/total | `kStorage` | Flash、内容同步 revision、NVS 条目、PSRAM（§4.5，原一级「存储详情」行） |
+| 6 | 电源睡眠诊断 | N 条 | `kSleepDiag` | `sleep_diagnostics` RTC 环最近 6 条（§4.6） |
 
-**扩展规则**：新的调试信息一律加进这三个对话框之一（数据面进 `SettingsDiagnosticsSnapshot` + `UpdateSettingsDiagnostics`，登记 `FrameSignature`）。要加第四行菜单，必须先修订本文档并说明为何三行装不下。
+一级「电量」行保留用户可见的百分比，确认只写 notice（`电量 87%`，照「固件版本」行的做法）；原始数字移到二级。
 
-三个对话框全部沿用 **kBattery/kStorage 只读模式**（`ui_input.cpp` 的 `kBattery || kStorage` 输入块）：确认（短按或长按）关闭，Up/Down 无操作，无滚动，快照在打开时取一次；驻留设置页时由既有的 60s 状态重载（`device_ui.cpp` `kStatusRefreshDelayTicks` → `LoadUiState`）被动更新。
+**导航**：上下移动 `dev_selected`（环绕），确认打开对应的只读对话框，**长按确认返回一级**（一级长按确认仍是回首页）。
+
+**为什么是二级而不是平铺**：一级已有 11 行，而 dev 信息还在增长（电源睡眠诊断是第六项），平铺会把「恢复出厂」「关机」推得更远；二级把 dev 信息收敛到一屏，且门控只需挡住一行入口。
+
+**实现形态**：二级是 `SettingsAppState.view` 切换的**同屏行列表**，不是新 `UiScreen` —— 避免改动顶级导航环、深睡屏幕恢复白名单、`DeepSleepUiPolicyForScreen` 以及 `ui_runtime.cpp` 里各处 `screen == kSettings` 判定。切换用 `kConfig` 局部刷：标题栏（y<32）不在 `kSettingsContentRect` 内，因此标题保持「设置」，方向感由底部提示行「上下选择，确认查看，长按确认返回设置」承担（要改标题就得用 `kCommit` 整屏全刷）。
+
+**扩展规则**：新的调试信息一律加进这六个对话框之一（数据面进 `SettingsDiagnosticsSnapshot` + `UpdateSettingsDiagnostics`，登记 `FrameSignature`）。要加第七行，必须先修订本文档并说明为何六行装不下（超过 6 行需启用现成的 selection-following 窗口逻辑）。
+
+六个对话框全部沿用 **kBattery/kStorage 只读模式**（`ui_input.cpp` 的 `kBattery || kStorage || ...` 输入块）：确认（短按或长按）关闭，Up/Down 无操作，无滚动，快照在打开时取一次；驻留设置页时由既有的 60s 状态重载（`device_ui.cpp` `kStatusRefreshDelayTicks` → `LoadUiState`）被动更新。
+
+**新增可见状态必须登记**：`view` 与 `dev_selected` 已进 `FrameSignature`；以后再加二级状态同理，否则 dedup 会吞掉重绘。
 
 ## 4. 对话框字段清单（v1）
 
@@ -54,6 +75,20 @@ phase 标签 helper 放 `ui/diagnostics.cpp`（照 `OnlineSyncStatusLabel` 风�
 ### 4.3 错误记录（`kDevErrors`，≤6 行）
 
 `CopyRecentErrors` 拷出的最近 6 条，每条一行：`HH:MM [tag] 消息`；时间不可信（`< kMinReasonableUnixTime`，照 `ui/clock.cpp` 先例）时显示 `up+Xm`。空态显示「暂无错误记录」。
+
+### 4.4 电量原始（`kBattery`，原一级「电量详情」对话框）
+
+adc_raw、adc_mv、battery_mv、percent、charging/full 标志，以及电压拟合公式 `(-V^2+9016V-19189000)/10000`。一级「电量」行只显示百分比。
+
+### 4.5 存储详情（`kStorage`，原一级「存储详情」行）
+
+Flash 大小、三内容域同步 revision、NVS 条目（带进度条）、PSRAM used（带进度条）与 free。
+
+### 4.6 电源睡眠诊断（`kSleepDiag`，≤6 行）
+
+`wqn::runtime::CopySleepDiagnosticEntries` 从 RTC slow memory 环拷出的最近 6 条，每条一行：`HH:MM [kind] reason`；`wall_time_sec` 不可信时退回 `up+Xm`。kind 标签（启动/策略/准入受阻/唤醒计划/回滚/提交）由 `ui/diagnostics.cpp` 的 `SleepEventKindLabel` 给出。空态显示「暂无睡眠记录」。
+
+打开这个对话框**同时**调用 `RequestSleepDiagnosticsDump()`：coordinator 下一个 tick 把完整 64 条打到日志。屏上 6 条是电池下的唯一读法；日志版只在插 USB 时有用，且必须用 `deploy.bat` / `listen_usb.py` —— `idf.py monitor` 的 `USB_UART_CHIP_RESET` 会毁掉 RTC slow memory。
 
 ## 5. error_recorder 模块契约
 
@@ -100,7 +135,7 @@ size_t CopyRecentErrors(ErrorRecord* out, size_t cap);
 3. **并发**：短临界区用 `portMUX_TYPE` 自旋锁（照 `GetSyncSnapshot`）；**不用**阻塞互斥锁；载荷先备好、锁内只拷贝（AGENTS.md §4.7）。
 4. **墨水屏**：只用 `DrawSettingsDialogBox` / `DrawClippedText` / `DrawWrappedText` / `DrawCenteredText` / `DrawProgressBar` 与 `ESP_RETURN_ON_ERROR` 包装；刷新走既有 kConfig/kSelection 语义，**不新增 RefreshSchedule 值**；对话框内可见的新字段必须登记进 `FrameSignature`（`ui/ui_refresh.cpp` settings 段），否则 60s 驻留重载后 dedup 会吞掉重绘。
 5. **构建门禁**：新 .cpp 登记 SRCS；每次构建必须 0 警告 + `wqn_architecture_check`（M8）通过；条件编译用裸 `#if CONFIG_WQN_...`（仓库主流风格），整文件门控照 `audio_selftest.cpp` 先例。
-6. **行索引单源**：`kSettingsItemCount` 与各行索引常量（`kSettingsRow*`）唯一存在于 `ui_model.h`（namespace `wqn`），`ui_internal.h` 引用之；任何代码不得再硬编码行号字面量（`ui_model.cpp` 的 `ClampUiSelection`/`HandleUiInput` 历史上硬编码 9 是本规范的由来）。
+6. **行索引单源**：`kSettingsItemCount`、`kDevItemCount` 与各行索引常量（`kSettingsRow*`、`kDevRow*`）唯一存在于 `ui_model.h`（namespace `wqn`），`ui_internal.h` 引用之；任何代码不得再硬编码行号字面量（`ui_model.cpp` 的 `ClampUiSelection`/`HandleUiInput` 历史上硬编码 9 是本规范的由来）。`ClampUiSelection` 必须钳制 `dev_selected`，并在 flag 关闭时强制 `view = kRoot`。
 
 ## 7. 验证流程
 
@@ -112,4 +147,5 @@ size_t CopyRecentErrors(ErrorRecord* out, size_t cap);
 
 - `WQN_GIT_COMMIT` / 构建时间为 **configure 期快照**：同一构建目录内 commit 后需重新 configure 才刷新；拿不到 git 时回退 `"unknown"`。
 - 错误环不持久化：重启即失（崩溃类信息由「上次复位原因」兜底）；要做持久化先修订本文档并评估 NVS 写入频率。
+- 电源睡眠诊断屏上只显示最近 6 条，完整 64 条要靠 USB 日志（见 §4.6）；环本身跨深睡保留，但 `USB_UART_CHIP_RESET` 会清空 RTC slow memory。
 - `WQN_FIRMWARE_VERSION` 保持手写、**不掺 hash**：它进同步 `image_id`（`sync_service.cpp`）与刷新签名（`ui/ui_refresh.cpp`），每次提交变化会污染这两处。
