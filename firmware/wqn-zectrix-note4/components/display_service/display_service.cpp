@@ -133,6 +133,38 @@ std::atomic<int64_t> g_last_epd_activity_ms{0};
 std::atomic<uint32_t> g_epd_activity_generation{0};
 std::atomic<bool> g_epd_idle_cut{false};
 
+// [epd-waveform-gate] True while the panel is driving a refresh waveform: from
+// the 0x12 display-update command until BUSY releases. Sleep prep must never
+// cut the rail in that window. EpdOperationGuard is a RECURSIVE mutex, so a
+// power-off raised on the EPD owner task re-enters it immediately and would
+// tear the panel down mid-waveform (half-driven frame, wedged BUSY line, and a
+// forced full-refresh recovery the user sees as a freeze). The mutex must stay
+// recursive -- the refresh path itself legitimately re-enters it
+// (RefreshEpdFull -> TriggerDisplayUpdate -> PowerOffEpd) -- so the window is
+// tracked with an explicit flag instead.
+std::atomic<bool> g_epd_waveform_active{false};
+
+// Holds the waveform flag for a scope so every exit path clears it, including
+// the DropEpdHotState early returns. A flag stuck true would block deep sleep
+// until the cell runs flat.
+struct EpdWaveformScope {
+    EpdWaveformScope()
+    {
+        g_epd_waveform_active.store(true, std::memory_order_release);
+    }
+    ~EpdWaveformScope()
+    {
+        g_epd_waveform_active.store(false, std::memory_order_release);
+    }
+    EpdWaveformScope(const EpdWaveformScope&) = delete;
+    EpdWaveformScope& operator=(const EpdWaveformScope&) = delete;
+};
+
+bool EpdWaveformActive()
+{
+    return g_epd_waveform_active.load(std::memory_order_acquire);
+}
+
 // [power-fix] Persisted across deep-sleep resets so the EPD refresh task
 // can skip redundant panel updates after an RTC-timer wakeup.  Without this,
 // RAM state is lost on every deep sleep and the driver always forces a full
@@ -855,17 +887,24 @@ esp_err_t TriggerDisplayUpdate(bool is_partial, bool keep_powered)
         }
         g_epd_powered = true;
     }
-    esp_err_t ret = SendCommand(0x12);
-    if (ret != ESP_OK) {
-        DropEpdHotState(true, true);
-        return ret;
+    // [epd-waveform-gate] Every waveform path funnels through here (the local
+    // partial path ends in TriggerDisplayUpdate too), so this is the only place
+    // the flag has to be set.
+    esp_err_t refresh_ret = ESP_OK;
+    {
+        EpdWaveformScope waveform;
+        esp_err_t ret = SendCommand(0x12);
+        if (ret != ESP_OK) {
+            DropEpdHotState(true, true);
+            return ret;
+        }
+        ret = SendData(0x00);
+        if (ret != ESP_OK) {
+            DropEpdHotState(true, true);
+            return ret;
+        }
+        refresh_ret = WaitBusyTimeout(is_partial ? kPartialRefreshBusyTimeoutMs : kBusyTimeoutMs);
     }
-    ret = SendData(0x00);
-    if (ret != ESP_OK) {
-        DropEpdHotState(true, true);
-        return ret;
-    }
-    const esp_err_t refresh_ret = WaitBusyTimeout(is_partial ? kPartialRefreshBusyTimeoutMs : kBusyTimeoutMs);
     if (refresh_ret != ESP_OK) {
         ESP_LOGW(kTag, "EPD %s refresh timed out; dropping hot refresh state", is_partial ? "partial" : "full");
         DropEpdHotState(true, true);
@@ -1870,6 +1909,13 @@ static esp_err_t TryPowerOffEpd(uint32_t timeout_ms)
     if (!operation.locked()) {
         return ESP_ERR_TIMEOUT;
     }
+    // [epd-waveform-gate] The lock above is recursive, so it does NOT prove
+    // the panel is idle when the caller is the EPD owner task. Refuse instead
+    // of sending 0x07 or cutting GPIO6 mid-waveform.
+    if (EpdWaveformActive()) {
+        ESP_LOGW(kTag, "EPD power-off deferred: refresh waveform in progress");
+        return ESP_ERR_INVALID_STATE;
+    }
     // Recursive acquisition keeps every power-off path on the same lock.
     PowerOffEpd();
     return ESP_OK;
@@ -2331,6 +2377,15 @@ static esp_err_t PrepareDisplayPowerOpInternal(int64_t deadline_us, bool clear_f
     // PowerCoordinator may begin quiesce only when no SleepLease exists. Every
     // accepted UI frame owns kDisplay until its terminal result, so reaching
     // this service boundary proves there is no upstream frame left to drain.
+
+    // [epd-waveform-gate] Running locally on the owner task bypasses the
+    // command point, which is exactly the state in which a refresh can be in
+    // flight. Refuse rather than tear the panel down mid-waveform; the power
+    // side rolls the sleep transaction back and retries.
+    if (wqn::EpdWaveformActive()) {
+        ESP_LOGW(wqn::kTag, "display sleep prep refused: refresh waveform in progress");
+        return ESP_ERR_INVALID_STATE;
+    }
 
     // Owner fast-path: if the caller IS the EPD owner task (defensive -- e.g.
     // an emergency shutdown raised on that task), run locally; posting to

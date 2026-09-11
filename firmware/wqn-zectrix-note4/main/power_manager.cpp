@@ -47,10 +47,6 @@
 #define CONFIG_WQN_RETAINED_STANDBY_IDLE_MS 60000
 #endif
 
-#ifndef CONFIG_WQN_CHARGING_DEEP_SLEEP_EXTRA_MS
-#define CONFIG_WQN_CHARGING_DEEP_SLEEP_EXTRA_MS 300000
-#endif
-
 #ifndef CONFIG_WQN_BATTERY_LOW_THRESHOLD_MV
 #define CONFIG_WQN_BATTERY_LOW_THRESHOLD_MV 3450
 #endif
@@ -186,8 +182,54 @@ bool g_sleep_diag_dumped_for_host = false;
 int64_t g_sleep_diag_dump_not_before_us = 0;
 bool g_sleep_diag_admission_blocked = false;
 uint32_t g_sleep_diag_last_blocker_mask = 0;
+// [sleep-admission] Set when a sleep transaction was refused because a lease
+// was still held at sampling time, so the coordinator retries on the short
+// poll instead of waiting out the whole retained-standby interval.
+std::atomic<bool> g_admission_retry_soon{false};
 
-constexpr int64_t kPrepareSleepTimeoutUs = 5 * 1000 * 1000;
+// [sleep-budget] Overall cap for one prepare transaction. Every service also
+// gets its own budget below and takes the earlier of the two, so the emergency
+// paths (which pass their own 2 s deadline) keep that tight bound while the
+// idle path can afford to wait for the EPD.
+constexpr int64_t kPrepareSleepTimeoutUs = 43LL * 1000 * 1000;
+// [sleep-budget] Per-service preparation budgets. The old single shared 5 s
+// deadline let the display service -- which legitimately waits for the EPD
+// owner task to reach its command point, ~2-3 s for a healthy full refresh --
+// consume all of it, after which storage/audio/connectivity were never invoked
+// at all and were reported as timed out: one slow service failed the whole
+// transaction. These are sized so each service can only fail for itself.
+constexpr int64_t kPrepareSleepBudgetUs[wqn::power::kSleepServiceCount] = {
+    30LL * 1000 * 1000,  // kDisplay: EPD owner must return to its command point
+    5LL * 1000 * 1000,   // kStorage
+    3LL * 1000 * 1000,   // kAudio
+    5LL * 1000 * 1000,   // kConnectivity
+};
+// Wake-source assembly is two 2 ms waits plus a few GPIO reads; it must not
+// inherit the (much larger) display budget.
+constexpr int64_t kWakeArmTimeoutUs = 2LL * 1000 * 1000;
+
+constexpr int64_t PrepareSleepBudgetUs(wqn::power::SleepService service)
+{
+    return kPrepareSleepBudgetUs[static_cast<size_t>(service)];
+}
+
+// The diagnostic event carries reason[16], so keep the service tag short.
+const char* ShortServiceReason(wqn::power::SleepService service)
+{
+    switch (service) {
+        case wqn::power::SleepService::kDisplay:
+            return "svc:display";
+        case wqn::power::SleepService::kStorage:
+            return "svc:storage";
+        case wqn::power::SleepService::kAudio:
+            return "svc:audio";
+        case wqn::power::SleepService::kConnectivity:
+            return "svc:conn";
+        default:
+            return "svc:unknown";
+    }
+}
+
 constexpr int64_t kSleepDiagnosticUsbDumpDelayUs = 2 * 1000 * 1000;
 // [power-fix] Sleep-preparation failure backoff escalates per consecutive
 // system failure (30s -> 60s -> 120s -> 5m cap) so a wedged service cannot
@@ -603,12 +645,11 @@ static bool IsUiIdleForThresholdMs(int threshold_ms)
 
 bool IsUiIdleForSleepEx(int extra_idle_ms)
 {
+    // No charging bonus: external power owns the kUsbPower sleep lease, which
+    // blocks deep sleep outright while a host is attached or the charger is
+    // active, so this path is only ever reached on battery. See
+    // ShouldBlockSleepForExternalPower().
     int threshold_ms = CONFIG_WQN_DEEP_SLEEP_IDLE_MS;
-    /* Temporarily commented out for fast testing/verification over USB
-    if (IsCharging()) {
-        threshold_ms += CONFIG_WQN_CHARGING_DEEP_SLEEP_EXTRA_MS;
-    }
-    */
     threshold_ms += extra_idle_ms;
     return IsUiIdleForThresholdMs(threshold_ms);
 }
@@ -952,39 +993,50 @@ static power::PrepareSleepResults BroadcastPrepareSleep(const power::PrepareSlee
              power::SleepModeName(command.mode),
              static_cast<long long>(command.deadline_us));
 
-    const auto deadline_result = [&command]() {
-        return command.deadline_us > 0 && esp_timer_get_time() >= command.deadline_us
+    // [sleep-budget] Each service gets its own absolute deadline: the earlier
+    // of the transaction cap and that service's own budget. A service that
+    // stalls can therefore only fail for itself instead of starving every
+    // service behind it.
+    const auto scoped_command = [&command](power::SleepService service) {
+        power::PrepareSleepCommand scoped = command;
+        const int64_t budget_us = esp_timer_get_time() + PrepareSleepBudgetUs(service);
+        scoped.deadline_us = command.deadline_us > 0
+            ? std::min(command.deadline_us, budget_us)
+            : budget_us;
+        return scoped;
+    };
+    const auto deadline_result = [](const power::PrepareSleepCommand& scoped) {
+        return scoped.deadline_us > 0 && esp_timer_get_time() >= scoped.deadline_us
             ? ESP_ERR_TIMEOUT
             : ESP_OK;
     };
+    // `prepare` receives the scoped command so services that take the whole
+    // command see a deadline that belongs to them alone.
+    const auto run_service = [&](power::SleepService service, auto prepare) {
+        const power::PrepareSleepCommand scoped = scoped_command(service);
+        esp_err_t error = deadline_result(scoped);
+        if (error == ESP_OK) {
+            error = prepare(scoped);
+        }
+        results[static_cast<size_t>(service)] = MakePrepareResult(scoped, service, error);
+    };
 
-    esp_err_t error = deadline_result();
-    if (error == ESP_OK) {
-        error = PrepareDisplayForSleep(command.deadline_us);
-    }
-    results[static_cast<size_t>(power::SleepService::kDisplay)] =
-        MakePrepareResult(command, power::SleepService::kDisplay, error);
-
-    error = deadline_result();
-    if (error == ESP_OK) {
-        error = PrepareStorageForSleep(command.deadline_us);
-    }
-    results[static_cast<size_t>(power::SleepService::kStorage)] =
-        MakePrepareResult(command, power::SleepService::kStorage, error);
-
-    error = deadline_result();
-    if (error == ESP_OK) {
-        error = services::PrepareAudioServiceForSleep(command);
-    }
-    results[static_cast<size_t>(power::SleepService::kAudio)] =
-        MakePrepareResult(command, power::SleepService::kAudio, error);
-
-    error = deadline_result();
-    if (error == ESP_OK) {
-        error = services::PrepareConnectivityForSleep(command);
-    }
-    results[static_cast<size_t>(power::SleepService::kConnectivity)] =
-        MakePrepareResult(command, power::SleepService::kConnectivity, error);
+    run_service(power::SleepService::kDisplay,
+                [](const power::PrepareSleepCommand& scoped) {
+                    return PrepareDisplayForSleep(scoped.deadline_us);
+                });
+    run_service(power::SleepService::kStorage,
+                [](const power::PrepareSleepCommand& scoped) {
+                    return PrepareStorageForSleep(scoped.deadline_us);
+                });
+    run_service(power::SleepService::kAudio,
+                [](const power::PrepareSleepCommand& scoped) {
+                    return services::PrepareAudioServiceForSleep(scoped);
+                });
+    run_service(power::SleepService::kConnectivity,
+                [](const power::PrepareSleepCommand& scoped) {
+                    return services::PrepareConnectivityForSleep(scoped);
+                });
     return results;
 }
 
@@ -1308,6 +1360,11 @@ static void EnterDeepSleepIfEnabled(DeepSleepUiPolicy ui_policy)
             g_sleep_diag_admission_blocked = true;
             g_sleep_diag_last_blocker_mask = blocker_mask;
         }
+        // [sleep-admission] Blockers are usually short-lived (a single NVS
+        // write, one persist ticket). Without this the next attempt waits out
+        // the full retained-standby poll, so one transient lease costs an
+        // entire sleep window.
+        g_admission_retry_soon.store(true, std::memory_order_release);
         return;
     }
     g_sleep_diag_admission_blocked = false;
@@ -1330,7 +1387,18 @@ static void EnterDeepSleepIfEnabled(DeepSleepUiPolicy ui_policy)
     command.deadline_us = esp_timer_get_time() + kPrepareSleepTimeoutUs;
     const power::PrepareSleepResults results = BroadcastPrepareSleep(command);
     if (!AllServicesReady(command, results)) {
-        RollbackSleepPreparation(generation, "service-denied-or-timeout");
+        // [sleep-budget] Name the service that actually failed: the old single
+        // "service-denied-or-timeout" reason could not tell a genuinely stuck
+        // service from one that had merely been starved by an earlier one.
+        const char* failed_service = "svc:unknown";
+        for (const power::PrepareSleepResult& result : results) {
+            if (result.generation != command.generation ||
+                result.status != power::SleepPrepareStatus::kReady) {
+                failed_service = ShortServiceReason(result.service);
+                break;
+            }
+        }
+        RollbackSleepPreparation(generation, failed_service);
         return;
     }
     if (PreemptIdleSleepForBatteryEmergency(generation)) {
@@ -1451,8 +1519,12 @@ static void EnterDeepSleepIfEnabled(DeepSleepUiPolicy ui_policy)
         ESP_LOGW(kTag, "RTC time persist skipped; next boot falls back to build-time seeding");
     }
 #endif
+    // [sleep-budget] Arming only waits ~4 ms; it must not inherit the display
+    // budget via the transaction deadline.
+    const int64_t wake_arm_deadline_us =
+        std::min(command.deadline_us, esp_timer_get_time() + kWakeArmTimeoutUs);
     const power::WakeArmResult wake =
-        power::ArmWakeSources(timer_wakeup_seconds, command.deadline_us);
+        power::ArmWakeSources(timer_wakeup_seconds, wake_arm_deadline_us);
     if (wake.error != ESP_OK) {
         RollbackSleepPreparation(generation, esp_err_to_name(wake.error));
         return;
@@ -1563,6 +1635,14 @@ static void PowerCoordinatorTask(void*)
     ESP_LOGI(kTag, "power coordinator task started: stack_free=%u",
              static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
     while (true) {
+        // [sleep-diag-hook] Deferred dump: the ring is only auto-dumped when a
+        // USB host is attached, but sleep behaviour has to be validated on
+        // battery. A future settings-page dev mode only has to call
+        // runtime::RequestSleepDiagnosticsDump(); the logging runs here so it
+        // never blocks the UI task.
+        if (runtime::ConsumeSleepDiagnosticsDumpRequest()) {
+            runtime::DumpSleepDiagnosticsToLog();
+        }
         RefreshUsbPowerSleepPolicy();
         runtime::LogLongHeldSleepLeases(esp_timer_get_time(), kLeaseWarningAfterUs);
         if (g_user_poweroff_requested.exchange(false, std::memory_order_acq_rel)) {
@@ -1573,10 +1653,13 @@ static void PowerCoordinatorTask(void*)
         }
         EnterDeepSleepIfEnabled(
             g_deep_sleep_ui_policy.load(std::memory_order_acquire));
-        const TickType_t wait_ticks =
-            g_retained_standby_ui_ready.load(std::memory_order_acquire)
-            ? kRetainedCoordinatorPollTicks
-            : kActiveCoordinatorPollTicks;
+        const bool retry_soon =
+            g_admission_retry_soon.exchange(false, std::memory_order_acq_rel);
+        const bool retained_ready =
+            g_retained_standby_ui_ready.load(std::memory_order_acquire);
+        const TickType_t wait_ticks = (retry_soon || !retained_ready)
+            ? kActiveCoordinatorPollTicks
+            : kRetainedCoordinatorPollTicks;
         ulTaskNotifyTake(pdTRUE, wait_ticks);
     }
 }

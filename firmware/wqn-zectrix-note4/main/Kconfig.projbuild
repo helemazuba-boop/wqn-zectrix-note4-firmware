@@ -217,6 +217,14 @@ menu "WQN firmware"
             so the device stays awake longer for syncing/updates.
             Default 5 minutes extra.
 
+            Currently unused: external power holds the kUsbPower sleep lease,
+            which blocks deep sleep outright, so the idle threshold is never
+            reached while charging. Kept for a future policy change.
+
+            Currently unused: external power holds the kUsbPower sleep lease,
+            which blocks deep sleep outright, so the idle threshold is never
+            reached while charging. Kept for a future policy change.
+
     config WQN_DEV_MENU_ENABLE
         bool "Enable dev diagnostics rows in the settings page"
         default n

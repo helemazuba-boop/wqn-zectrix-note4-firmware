@@ -68,4 +68,16 @@ constexpr size_t kSleepDiagnosticCapacity = 64;
 void RecordSleepDiagnosticEvent(const SleepDiagnosticEvent& event);
 void DumpSleepDiagnosticsToLog();
 
+// Deferred dump for callers that must not log synchronously (a settings-page
+// dev mode, say): RequestSleepDiagnosticsDump() only raises a flag and the
+// power coordinator performs the logging on its next tick. The ring lives in
+// RTC slow memory and survives deep sleep, so this is the way to read it while
+// running on battery -- the USB-triggered dump cannot fire there.
+void RequestSleepDiagnosticsDump();
+// True once, per request, for the task that owns the logging.
+bool ConsumeSleepDiagnosticsDumpRequest();
+// Valid (CRC-checked) entries currently in the ring, so a caller can decide
+// whether a dump is worth showing.
+size_t SleepDiagnosticEntryCount();
+
 }  // namespace wqn::runtime

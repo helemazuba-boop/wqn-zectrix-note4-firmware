@@ -1,6 +1,7 @@
 #include "runtime/sleep_diagnostics.h"
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -328,6 +329,30 @@ void DumpSleepDiagnosticsToLog()
             event.reason[0] == '\0' ? "-" : event.reason);
     }
     ESP_LOGI(kTag, "sleep-diag end");
+}
+
+// Set by RequestSleepDiagnosticsDump, consumed by the power coordinator.
+std::atomic<bool> g_dump_requested{false};
+
+void RequestSleepDiagnosticsDump()
+{
+    g_dump_requested.store(true, std::memory_order_release);
+}
+
+bool ConsumeSleepDiagnosticsDumpRequest()
+{
+    return g_dump_requested.exchange(false, std::memory_order_acq_rel);
+}
+
+size_t SleepDiagnosticEntryCount()
+{
+    size_t count = 0;
+    for (const RtcSleepDiagnosticEntry& entry : g_sleep_diagnostic_entries) {
+        if (IsValid(entry)) {
+            ++count;
+        }
+    }
+    return count;
 }
 
 }  // namespace wqn::runtime

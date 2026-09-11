@@ -3,6 +3,7 @@
 #include <atomic>
 
 #include "driver/gpio.h"
+#include "esp_err.h"
 #include "esp_log.h"
 #include "esp_sleep.h"
 #include "esp_timer.h"
@@ -99,6 +100,39 @@ bool DeadlineExpired(int64_t deadline_us)
     return deadline_us > 0 && esp_timer_get_time() >= deadline_us;
 }
 
+// [sleep-wake-fix] On ESP32-S3 there is no deep-sleep GPIO wakeup
+// (SOC_GPIO_SUPPORT_DEEPSLEEP_WAKEUP is absent), so RTC_GPIO_TRIG_EN is the
+// light-sleep-only wakeup master switch: rtc_sleep_start() writes it straight
+// into RTC_CNTL_WAKEUP_ENA, while gpio_wakeup_enable() only programs the
+// per-pad level/intr type. esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL)
+// clears it (the ALL branch only does `s_config.wakeup_triggers = 0`), and
+// button_input.cpp arms the pads exactly once at boot -- so a single
+// deep-sleep transaction would otherwise leave light sleep unable to wake on a
+// key press for the rest of the boot. Re-arming is idempotent and cheap.
+// Deep sleep passes allow_sleep_rejection=false, so this bit stays inert there;
+// light sleep passes true, so a held key correctly rejects sleep entry.
+void RestoreLightSleepGpioWake()
+{
+    for (gpio_num_t pin : {kConfirmWake, kDownPowerWake}) {
+        const esp_err_t result = gpio_wakeup_enable(pin, GPIO_INTR_LOW_LEVEL);
+        if (result != ESP_OK) {
+            ESP_LOGW(kTag, "re-arm light-sleep wake for GPIO%d failed: %s",
+                     static_cast<int>(pin), esp_err_to_name(result));
+        }
+    }
+    const esp_err_t result = esp_sleep_enable_gpio_wakeup();
+    if (result != ESP_OK) {
+        ESP_LOGW(kTag, "re-arm light-sleep GPIO wakeup failed: %s",
+                 esp_err_to_name(result));
+    }
+}
+
+// Re-arms the light-sleep key wakeup on every exit path of ArmWakeSources,
+// including the early returns that used to leave the source cleared.
+struct WakeSourceScope {
+    ~WakeSourceScope() { RestoreLightSleepGpioWake(); }
+};
+
 }  // namespace
 
 namespace wqn::power {
@@ -136,7 +170,12 @@ WakeArmResult ArmWakeSources(uint32_t timer_wakeup_seconds, int64_t deadline_us)
             kTag,
             "/STDBY already asserted; omitted GPIO1 from this EXT1 wake mask");
     }
-    esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+    // Clear only the sources this transaction owns. ESP_SLEEP_WAKEUP_ALL also
+    // clears RTC_GPIO_TRIG_EN, the light-sleep key wakeup master switch; see
+    // RestoreLightSleepGpioWake().
+    esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_EXT1);
+    esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_TIMER);
+    WakeSourceScope wake_scope;
 
     const bool pcf_available = g_pcf8563_available.load(std::memory_order_acquire);
     if (pcf_available && !Pcf8563DisableTimerWakeAndClearFlags()) {
@@ -216,11 +255,13 @@ WakeArmResult ArmWakeSources(uint32_t timer_wakeup_seconds, int64_t deadline_us)
 
 void DisarmWakeSources()
 {
-    esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+    esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_EXT1);
+    esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_TIMER);
     if (g_pcf8563_available.load(std::memory_order_acquire) &&
         !Pcf8563DisableTimerWakeAndClearFlags()) {
         ESP_LOGW(kTag, "PCF8563 wake flags could not be cleared during rollback");
     }
+    RestoreLightSleepGpioWake();
 }
 
 const char* TimerWakeSourceName(TimerWakeSource source)
