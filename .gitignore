@@ -41,3 +41,7 @@ docs/
 .opencode/
 .vscode/
 .codeartsdoer
+
+# Worktrees and local service scratch
+.worktrees/
+supabase/
