@@ -83,6 +83,25 @@ menu "WQN firmware"
             restart. Set 0 to keep the EPD rail on as long as the firmware is
             running.
 
+    config WQN_EPD_IDLE_CLEANUP_MS
+        int "Heavy-partial cleanup full refresh idle threshold in milliseconds"
+        default 45000
+        range 0 600000
+        depends on WQN_EPD_UI_ENABLE
+        help
+            User-idle time before the EPD owner task discharges accumulated
+            heavy-partial debt (kIdleCleanupHeavyPartials) with one full
+            refresh. This is deliberately NOT the power-off point: while the
+            cleanup rode WQN_EPD_IDLE_POWER_OFF_MS, every pause longer than a
+            few seconds flashed the panel even though nothing had changed.
+            The default sits below WQN_RETAINED_STANDBY_IDLE_MS so the UI task
+            is still polling when it fires -- once it enters light sleep the
+            debt survives and is paid by the ordinary heavy-threshold
+            promotion on the next interaction. A cold rail is fine: the
+            genuine full refresh powers the panel itself and ends with the
+            rail down again. Set 0 to attach the cleanup back to the
+            power-off point (pre-2026-09-11 behaviour).
+
     config WQN_DEEP_SLEEP_ENABLE
         bool "Enable deep sleep after UI idle"
         default y

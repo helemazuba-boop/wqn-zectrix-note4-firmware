@@ -132,6 +132,11 @@ int64_t g_last_epd_refresh_us = 0;
 std::atomic<int64_t> g_last_epd_activity_ms{0};
 std::atomic<uint32_t> g_epd_activity_generation{0};
 std::atomic<bool> g_epd_idle_cut{false};
+// [epd-health] One-shot-per-idle-period notice that the cleanup full refresh is
+// owed but its own deadline has not elapsed yet. Without it the log cannot tell
+// "no debt" from "debt waiting for WQN_EPD_IDLE_CLEANUP_MS". Cleared by
+// NoteEpdActivity, i.e. once per idle period at most one line is emitted.
+std::atomic<bool> g_epd_cleanup_deferred_logged{false};
 
 // [epd-waveform-gate] True while the panel is driving a refresh waveform: from
 // the 0x12 display-update command until BUSY releases. Sleep prep must never
@@ -2156,6 +2161,81 @@ esp_err_t RefreshEpdGray16(const uint8_t* gray4, size_t size)
     return result;
 }
 
+// [epd-health] Debt only: is there enough accumulated heavy-partial stress to
+// be worth a cleanup full refresh at all? Shared by the due-check and the
+// runner so the two can never disagree about the threshold.
+static bool IdleCleanupPending()
+{
+    return g_initialized && g_framebuffer != nullptr &&
+           g_heavy_partials_since_full >= kIdleCleanupHeavyPartials;
+}
+
+// [epd-health] Runs the cleanup full refresh when its own deadline has elapsed.
+// Split away from PowerOffEpdAfterIdleIfNeeded so the two actions stop sharing
+// one trigger: a cleanup attached to the power-off point fires on every pause
+// longer than WQN_EPD_IDLE_POWER_OFF_MS, which is exactly the "sat still for a
+// few seconds and the screen flashed itself" report. It now waits for
+// WQN_EPD_IDLE_CLEANUP_MS instead, and the rail may already be down by then --
+// RefreshEpdFull powers the panel itself and a genuine full refresh ends with
+// the rail down again (TriggerDisplayUpdate's !is_partial && !keep_powered
+// branch), so no follow-up power-off is needed.
+static void RunIdleEpdCleanupIfNeeded(int64_t now_ms, int64_t last_activity_ms)
+{
+    if (!IdleCleanupPending() || last_activity_ms == 0) {
+        return;
+    }
+    const int cleanup_ms = CONFIG_WQN_EPD_IDLE_CLEANUP_MS;
+    const int64_t idle_ms = now_ms - last_activity_ms;
+    if (cleanup_ms > 0 && idle_ms < cleanup_ms) {
+        bool expected = false;
+        if (g_epd_cleanup_deferred_logged.compare_exchange_strong(
+                expected, true, std::memory_order_relaxed)) {
+            ESP_LOGI(kTag,
+                     "EPD idle cleanup deferred: heavy=%u idle_ms=%lld waiting_for=%d",
+                     static_cast<unsigned>(g_heavy_partials_since_full),
+                     static_cast<long long>(idle_ms), cleanup_ms);
+        }
+        return;
+    }
+    EpdOperationGuard operation(0);
+    if (!operation.locked()) {
+        return;
+    }
+    if (!IdleCleanupPending()) {
+        return;
+    }
+    ESP_LOGI(kTag, "EPD idle cleanup full refresh: heavy=%u idle_ms=%lld",
+             static_cast<unsigned>(g_heavy_partials_since_full),
+             static_cast<long long>(idle_ms));
+    // Defeat the unchanged-framebuffer skip; the panel content is what
+    // needs the clean waveform, not the pixels.
+    g_previous_framebuffer_synced = false;
+    const esp_err_t cleanup_ret = RefreshEpdFull(false, true);
+    // [hang-fix] Unconditional completion log: the HIL hang trace ends
+    // right after the "idle cleanup" line above, so this bracket log
+    // tells the next capture whether RefreshEpdFull returned at all.
+    ESP_LOGI(kTag, "EPD idle cleanup full refresh done: %s",
+             esp_err_to_name(cleanup_ret));
+    if (cleanup_ret != ESP_OK) {
+        ESP_LOGW(kTag, "EPD idle cleanup full refresh failed: %s",
+                 esp_err_to_name(cleanup_ret));
+    }
+}
+
+bool IsEpdIdleCleanupDue()
+{
+    const int cleanup_ms = CONFIG_WQN_EPD_IDLE_CLEANUP_MS;
+    if (cleanup_ms <= 0 || !IdleCleanupPending()) {
+        return false;  // legacy mode: the cleanup rides the power-off point
+    }
+    const int64_t last_activity_ms =
+        g_last_epd_activity_ms.load(std::memory_order_relaxed);
+    if (last_activity_ms == 0) {
+        return false;
+    }
+    return (esp_timer_get_time() / 1000 - last_activity_ms) >= cleanup_ms;
+}
+
 } // namespace wqn
 
 wqn::EpdFrameTransaction::EpdFrameTransaction()
@@ -2185,6 +2265,7 @@ void wqn::NoteEpdActivity()
 {
     g_last_epd_activity_ms.store(esp_timer_get_time() / 1000, std::memory_order_relaxed);
     g_epd_idle_cut.store(false, std::memory_order_relaxed);
+    g_epd_cleanup_deferred_logged.store(false, std::memory_order_relaxed);
     g_epd_activity_generation.fetch_add(1, std::memory_order_release);
 }
 
@@ -2207,45 +2288,29 @@ bool wqn::IsEpdIdleMaintenanceDue()
 
 void wqn::PowerOffEpdAfterIdleIfNeeded()
 {
-    const int idle_ms = CONFIG_WQN_EPD_IDLE_POWER_OFF_MS;
+    const int idle_ms_config = CONFIG_WQN_EPD_IDLE_POWER_OFF_MS;
     const int64_t last_activity_ms =
         g_last_epd_activity_ms.load(std::memory_order_relaxed);
-    if (idle_ms <= 0 || g_epd_idle_cut.load(std::memory_order_relaxed) ||
+    const int64_t now_ms = esp_timer_get_time() / 1000;
+    // Cleanup first, on its own deadline. It must not be gated on
+    // g_epd_idle_cut: once this function has cut the rail, that flag keeps
+    // IsEpdIdleMaintenanceDue() -- and therefore RequestEpdIdleMaintenance --
+    // false for the rest of the idle period, so a cleanup that waited for the
+    // power-off point would never be armed again.
+    RunIdleEpdCleanupIfNeeded(now_ms, last_activity_ms);
+    if (idle_ms_config <= 0 || g_epd_idle_cut.load(std::memory_order_relaxed) ||
         last_activity_ms == 0) {
         return;
     }
-    if ((esp_timer_get_time() / 1000 - last_activity_ms) < idle_ms) {
+    if ((now_ms - last_activity_ms) < idle_ms_config) {
         return;
-    }
-    // [epd-health] Deferred heavy-partial cleanup: forcing the full refresh
-    // mid-scroll read as a 1.2 s freeze every few steps, so scrolling stays on
-    // partials and the accumulated charge is cleared here instead, once the
-    // user has stopped interacting and just before the rail drops.
-    if (g_heavy_partials_since_full >= kIdleCleanupHeavyPartials &&
-        g_initialized && g_framebuffer != nullptr) {
-        EpdOperationGuard operation(0);
-        if (operation.locked() &&
-            g_heavy_partials_since_full >= kIdleCleanupHeavyPartials) {
-            ESP_LOGI(kTag, "EPD idle cleanup full refresh: heavy=%u",
-                     static_cast<unsigned>(g_heavy_partials_since_full));
-            // Defeat the unchanged-framebuffer skip; the panel content is what
-            // needs the clean waveform, not the pixels.
-            g_previous_framebuffer_synced = false;
-            const esp_err_t cleanup_ret = RefreshEpdFull(false, true);
-            // [hang-fix] Unconditional completion log: the HIL hang trace ends
-            // right after the "idle cleanup" line above, so this bracket log
-            // tells the next capture whether RefreshEpdFull returned at all.
-            ESP_LOGI(kTag, "EPD idle cleanup full refresh done: %s",
-                     esp_err_to_name(cleanup_ret));
-            if (cleanup_ret != ESP_OK) {
-                ESP_LOGW(kTag, "EPD idle cleanup full refresh failed: %s",
-                         esp_err_to_name(cleanup_ret));
-            }
-        }
     }
     const esp_err_t result = TryPowerOffEpd(0);
     if (result == ESP_OK) {
-        ESP_LOGI(kTag, "EPD idle power-off after %d ms", idle_ms);
+        ESP_LOGI(kTag, "EPD idle power-off after %d ms (heavy=%u, cleanup %s)",
+                 idle_ms_config,
+                 static_cast<unsigned>(g_heavy_partials_since_full),
+                 IdleCleanupPending() ? "owed" : "clear");
         g_epd_idle_cut.store(true, std::memory_order_relaxed);
     } else if (result != ESP_ERR_TIMEOUT) {
         ESP_LOGW(kTag, "EPD idle power-off failed: %s", esp_err_to_name(result));

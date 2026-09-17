@@ -115,6 +115,10 @@ Configure features through `idf.py menuconfig` under `WQN firmware`:
   refresh path.
 - `CONFIG_WQN_EPD_IDLE_POWER_OFF_MS`: powers off the e-paper rail after UI idle
   time to save battery.
+- `CONFIG_WQN_EPD_IDLE_CLEANUP_MS`: when the accumulated heavy-partial debt is
+  repaid with one full refresh. Kept separate from the rail power-off above so
+  a short pause no longer flashes the panel; `0` restores the old behaviour of
+  cleaning at the power-off point.
 - `CONFIG_WQN_DEEP_SLEEP_ENABLE`: optional experimental deep sleep path.
 - `CONFIG_WQN_AI_ENABLE`: enables AI firmware modules; provider secrets still
   stay server-side.

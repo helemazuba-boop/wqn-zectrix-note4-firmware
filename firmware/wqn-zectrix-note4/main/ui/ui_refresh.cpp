@@ -1038,7 +1038,11 @@ void RequestEpdIdleMaintenance()
     // notify on the false->true transition of the request flag so an in-flight
     // (or repeated) request never re-wakes the task. A skipped maintenance
     // re-arms naturally on the next poll once it is genuinely due.
-    if (!wqn::IsEpdIdleMaintenanceDue()) {
+    // Two predicates, not one: IsEpdIdleMaintenanceDue() goes false for the
+    // rest of the idle period the moment the rail cut succeeds, so the deferred
+    // heavy-partial cleanup (WQN_EPD_IDLE_CLEANUP_MS) has to arm the task on its
+    // own deadline or it would never run after a power-off.
+    if (!wqn::IsEpdIdleMaintenanceDue() && !wqn::IsEpdIdleCleanupDue()) {
         return;
     }
     // Publish order: write the generation payload FIRST, then release the
@@ -1058,16 +1062,27 @@ void RequestEpdIdleMaintenance()
 
 // [epd-owner] Runs idle maintenance on the EPD task. Re-validates first: skip
 // if a frame is pending/secondary-queued or activity happened since the
-// request was armed (generation moved). PowerOffEpdAfterIdleIfNeeded owns the
-// heavy-partial cleanup full refresh + rail power-off and takes the frame
-// mutex internally. Wrapped in a scoped TWDT subscription just like the render
+// request was armed (generation moved). PowerOffEpdAfterIdleIfNeeded owns both
+// idle actions -- the rail power-off at WQN_EPD_IDLE_POWER_OFF_MS and the
+// heavy-partial cleanup full refresh at WQN_EPD_IDLE_CLEANUP_MS -- and takes the
+// frame mutex internally; either may fire without the other. Wrapped in a scoped TWDT subscription just like the render
 // window: a wedged cleanup panics after CONFIG_ESP_TASK_WDT_TIMEOUT_S with a
 // backtrace instead of silently hanging the task (display_service feeds the
 // TWDT from its BUSY-wait / row-write loops).
 void RunIdleMaintenanceIfStillValid()
 {
-    if (wqn::GetEpdActivityGeneration() !=
-        g_idle_maintenance_activity_generation.load(std::memory_order_relaxed)) {
+    const uint32_t armed_generation =
+        g_idle_maintenance_activity_generation.load(std::memory_order_relaxed);
+    const uint32_t current_generation = wqn::GetEpdActivityGeneration();
+    if (current_generation != armed_generation) {
+        // Activity landed between arming the request and running it. This was
+        // silent: with the cleanup moved onto its own deadline, "owed but
+        // cancelled" became indistinguishable from "nothing owed".
+        ESP_LOGI(
+            kTag,
+            "EPD idle maintenance skipped: activity since arm (generation %u -> %u)",
+            static_cast<unsigned>(armed_generation),
+            static_cast<unsigned>(current_generation));
         return;
     }
     {
@@ -1076,6 +1091,7 @@ void RunIdleMaintenanceIfStillValid()
             g_refresh_pending || g_refresh_busy || g_secondary.pending;
         xSemaphoreGive(g_refresh_mutex);
         if (busy_or_pending) {
+            ESP_LOGI(kTag, "EPD idle maintenance skipped: frame pending or in flight");
             return;
         }
     }

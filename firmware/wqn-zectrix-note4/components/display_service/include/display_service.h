@@ -105,6 +105,14 @@ uint32_t GetEpdActivityGeneration();
 // poll does not wake the EPD task every cycle (edge-trigger the request only
 // when it flips to due).
 bool IsEpdIdleMaintenanceDue();
+// [epd-owner] True when the heavy-partial cleanup full refresh is due. It is
+// deliberately independent of IsEpdIdleMaintenanceDue(): that one stays false
+// for the rest of the idle period once g_epd_idle_cut is set, so a cleanup
+// moved past the power-off point would never arm the EPD task again. False while the debt
+// is below kIdleCleanupHeavyPartials, and always false when
+// CONFIG_WQN_EPD_IDLE_CLEANUP_MS is 0 (the cleanup then rides the power-off
+// point exactly as before).
+bool IsEpdIdleCleanupDue();
 void PowerOffEpdAfterIdleIfNeeded();
 
 // [epd-owner] RAII lock over the WHOLE clear->draw->refresh sequence of one

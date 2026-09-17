@@ -44,6 +44,8 @@ idf.py -B build-ai-local-s3 -DWQN_API_BASE=https://your-host.example.com/api/esp
 - `CONFIG_WQN_EPD_UI_ENABLE`：启用电子纸 UI 和按键驱动的设备应用。
 - `CONFIG_WQN_EPD_LOCAL_PARTIAL_ENABLE`：启用 Note4 本地局部窗口刷新。
 - `CONFIG_WQN_EPD_IDLE_POWER_OFF_MS`：UI 空闲后关闭电纸屏电源轨以节省电量。
+- `CONFIG_WQN_EPD_IDLE_CLEANUP_MS`：累积的重局刷债务用一次全刷清偿的空闲门槛。刻意
+  与上面的掉电点分离，短暂停顿不再自己闪屏；设为 `0` 恢复"挂在掉电点"的旧行为。
 - `CONFIG_WQN_DEEP_SLEEP_ENABLE`：启用由 `PowerCoordinator` 独占的两阶段深睡路径。
 - `CONFIG_WQN_AI_ENABLE`：启用 AI 固件模块；provider 密钥仍只存在云端。
 - `CONFIG_WQN_AI_AUDIO_SELFTEST_ENABLE`：启动时采集并打印音频统计，不上传音频。
