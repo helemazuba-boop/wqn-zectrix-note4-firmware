@@ -41,7 +41,18 @@ constexpr gpio_num_t kEpdSck = GPIO_NUM_12;
 constexpr gpio_num_t kEpdMosi = GPIO_NUM_13;
 constexpr spi_host_device_t kEpdSpiHost = SPI3_HOST;
 
-constexpr int kSpiClockHz = 40 * 1000 * 1000;
+// [epd-spi-fix] SSD2683 datasheet Table 12-1: tSCYCW (write) = 50 ns, i.e.
+// 20 MHz maximum, and the text states a 20 MHz maximum SPI write speed. The
+// previous 40 MHz was 2x the rated limit. A timing violation like this is
+// marginal -- it only shows up under disturbance -- which fits a fault that
+// reproduces on battery but never on the bench.
+constexpr int kSpiWriteClockHz = 20 * 1000 * 1000;
+// tSCYCL (read) = 400 ns, i.e. 2.5 MHz maximum. Take 2 MHz: RecvData() reads
+// a single byte per full refresh, so the 20% margin costs nothing measurable.
+// (The waveform figures label the read cycle tSCYCR instead of tSCYCL -- same
+// timing.) The vendor demo's 8 MHz (zectrix_epd.cc:120) is itself over the
+// datasheet limit and must not be copied back.
+constexpr int kSpiReadClockHz = 2 * 1000 * 1000;
 // [hang-fix] Full-refresh DRF waveform completion wait. Healthy full
 // refreshes complete in 2-3 s across HIL sessions; the old 30 s budget only
 // stretched the stall (with the EPD operation mutex held) when the panel was
@@ -512,7 +523,7 @@ esp_err_t InitSpiBus(bool rx_mode)
 
     spi_device_interface_config_t device_config = {};
     device_config.spics_io_num = -1;
-    device_config.clock_speed_hz = rx_mode ? 8 * 1000 * 1000 : kSpiClockHz;
+    device_config.clock_speed_hz = rx_mode ? kSpiReadClockHz : kSpiWriteClockHz;
     device_config.mode = 0;
     device_config.queue_size = 1;
 
