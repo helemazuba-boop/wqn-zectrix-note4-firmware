@@ -1573,6 +1573,20 @@ esp_err_t PreparePanelForFramebufferWrite()
 
 esp_err_t PreparePanelForHotFramebufferWrite()
 {
+    // [epd-temp-fix] Reset the temperature input source to the internal sensor
+    // before every full-frame partial. The full-refresh prelude
+    // (PreparePanelForFramebufferWrite) sets CCSET A[1]=TSFIX=1 to apply a
+    // manually measured VCOM and never clears it, so without this each
+    // following full-frame partial drives its waveform from a STALE manual
+    // temperature. The windowed local-partial path already gets this from
+    // WaitPanelStatusReady():0xE0/0x00; mirror that, plus the same 0x50/0x77
+    // CDI prelude both other preludes and the vendor partial path send.
+    ESP_RETURN_ON_ERROR(SendCommand(0x50), kTag, "EPD hot partial display setting");
+    ESP_RETURN_ON_ERROR(SendData(0x77), kTag, "EPD hot partial display setting data");
+    ESP_RETURN_ON_ERROR(SendCommand(0xE0), kTag, "EPD hot CCSET (temperature input select)");
+    ESP_RETURN_ON_ERROR(SendData(0x00), kTag, "EPD hot CCSET: TSFIX=0 use internal sensor");
+    vTaskDelay(pdMS_TO_TICKS(10));
+
     ESP_RETURN_ON_ERROR(SendCommand(0x10), kTag, "EPD hot DTM1 write");
     ESP_RETURN_ON_ERROR(WaitBusyTimeout(kPartialCommandBusyTimeoutMs), kTag, "wait EPD hot RAM command");
     return ESP_OK;
