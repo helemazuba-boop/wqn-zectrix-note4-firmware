@@ -58,6 +58,13 @@ constexpr int kCommandBusyTimeoutMs = 5000;
 // lengthens the stall before the automatic full-refresh recovery kicks in.
 constexpr int kPartialRefreshBusyTimeoutMs = 1500;
 constexpr int kPartialCommandBusyTimeoutMs = 1500;
+// [epd-lag-fix] Per-attempt budget for the local-partial status probe. This is
+// a "is the controller awake yet" poll, not a data transfer, and the HIL record
+// above says a healthy panel answers in <=800 ms while a wedged one never
+// answers at all. Deliberately NOT a change to kPartialCommandBusyTimeoutMs:
+// that constant has four other users (all post-0x10 command-ready waits) and
+// shrinking it would quietly retime all of them.
+constexpr int kPanelStatusProbeTimeoutMs = 800;
 constexpr int kLocalPartialMaxHeight = 170;
 // [epd-health] SSDs (SSD1683 / WaveShare 4.2") accumulate DC bias after
 // consecutive partial refreshes; without interleaving full refreshes the
@@ -880,13 +887,21 @@ esp_err_t WaitPartialCooldown()
     return ESP_OK;
 }
 
-esp_err_t WaitPanelStatusReady(int max_retries)
+// [epd-temp-fix] Load-bearing side effect: despite the name, the payload is the
+// 0xE0/0x00 above, which is what resets CCSET A[1]=TSFIX to the internal sensor
+// on the windowed local-partial path. PreparePanelForLocalPartialWrite() only
+// sends 0x50/0x77 and waits for the cooldown. If this call is ever removed from
+// SendDirtyRectToPanel(), the 0xE0/0x00 must move into
+// PreparePanelForLocalPartialWrite() first, or windowed partials will keep
+// driving their waveform from a stale manual temperature -- P0-B returning via
+// the path that stage 2a did not cover.
+esp_err_t WaitPanelStatusReady(int max_retries, int busy_timeout_ms)
 {
     for (int i = 0; i < max_retries; ++i) {
         ESP_RETURN_ON_ERROR(SendCommand(0xE0), kTag, "EPD status check cmd");
         ESP_RETURN_ON_ERROR(SendData(0x00), kTag, "EPD status check data");
         ESP_RETURN_ON_ERROR(SendCommand(0xA5), kTag, "EPD status probe cmd");
-        const esp_err_t busy_ret = WaitBusyTimeout(kPartialCommandBusyTimeoutMs);
+        const esp_err_t busy_ret = WaitBusyTimeout(busy_timeout_ms);
         if (busy_ret == ESP_OK) {
             vTaskDelay(pdMS_TO_TICKS(1));
             return ESP_OK;
@@ -1755,7 +1770,12 @@ esp_err_t SendDirtyRectToPanel(const DirtyRect& rect)
     }
 
     ESP_RETURN_ON_ERROR(PreparePanelForLocalPartialWrite(), kTag, "prepare EPD local partial write");
-    ESP_RETURN_ON_ERROR(WaitPanelStatusReady(3), kTag, "EPD panel status not ready for local partial");
+    // [epd-lag-fix] Was (3, kPartialCommandBusyTimeoutMs) = a 4.5 s worst case
+    // that froze the UI task. One attempt at 800 ms: the HIL record says a
+    // wedged panel never recovers within the old window either, so the extra
+    // retries only bought stall time before the fallback full refresh.
+    ESP_RETURN_ON_ERROR(WaitPanelStatusReady(1, kPanelStatusProbeTimeoutMs), kTag,
+                        "EPD panel status not ready for local partial");
     ESP_RETURN_ON_ERROR(SetPartialWindow(aligned), kTag, "set EPD partial window");
     ESP_RETURN_ON_ERROR(SendCommand(0x10), kTag, "EPD partial DTM1 write");
     ESP_RETURN_ON_ERROR(WaitBusyTimeout(kPartialCommandBusyTimeoutMs), kTag, "wait EPD partial RAM command");
