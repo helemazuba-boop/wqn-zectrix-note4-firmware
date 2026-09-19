@@ -112,6 +112,39 @@ esp_err_t InitZectrixNote4SafePins()
     // entry, matching the official firmware's `ConfigureSleepInput` path.
     ESP_ERROR_CHECK(gpio_sleep_sel_dis(kBoardPowerLatch));
 
+    // [epd-sleep-fix] The EPD bus must not be sleep-isolated while the panel is
+    // still powered. CONFIG_PM_SLP_DISABLE_GPIO=y runs esp_sleep_startup_init()
+    // at boot: esp_sleep_config_gpio_isolate() puts EVERY GPIO's sleep state at
+    // GPIO_MODE_DISABLE + GPIO_FLOATING, then esp_sleep_enable_gpio_switch(true)
+    // sets SLP_SEL=1 on every valid GPIO. At each light-sleep entry the pad
+    // therefore switches to that state and SCK/MOSI/CS/DC stop being driven and
+    // float. A random level on CS/SCK/DC can be clocked in as a command by the
+    // SSD2683, leaving it out of spec with BUSY stuck low -- the multi-second
+    // wedge, which so far has only reproduced on battery.
+    //
+    // GPIO 6 matters for a second reason: it is the EPD rail enable, active
+    // HIGH, and unlike kAudioPower it is NOT gpio_hold_en'd here. Isolated, it
+    // can float up and light the panel during idle light sleep.
+    //
+    // NOTE what this does and does not cover. PowerOffEpd() drives the same
+    // five bus pins (SCK/MOSI/CS/DC/Reset) LOW and gpio_hold_en()s them; a held
+    // pad is force-driven by the hold bit rather than by the sleep config, so
+    // that path is already safe. The exposure is the running case, where the
+    // IO_MUX/SPI owns these pins: a "changed but nothing improved" HIL result
+    // means the running-state path was not the one at fault.
+    constexpr gpio_num_t kEpdSleepIsolationPins[] = {
+        kEpdPower,
+        kEpdBusy,
+        kEpdReset,
+        kEpdDc,
+        kEpdCs,
+        kEpdSck,
+        kEpdMosi,
+    };
+    for (gpio_num_t pin : kEpdSleepIsolationPins) {
+        ESP_ERROR_CHECK(gpio_sleep_sel_dis(pin));
+    }
+
     const uint64_t epd_bus_pins =
         (1ULL << kEpdBusy) |
         (1ULL << kEpdReset) |
