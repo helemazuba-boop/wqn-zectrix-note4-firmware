@@ -111,6 +111,16 @@ bool g_bus_initialized = false;
 bool g_initialized = false;
 bool g_epd_rail_powered = false;
 bool g_epd_powered = false;
+// [epd-bias-fix] Tracks the SSD2683 internal booster, split out of
+// g_epd_powered. g_epd_powered now means only "the panel is initialized and
+// the previous-frame diff is still valid"; this one means "0x04 PON has been
+// issued and 0x02 POF has not undone it". The datasheet pairs the two
+// ("POF works at PON only", "PON Include booster on"), so any path that
+// issues 0x02 must leave this false or the next refresh skips PON and drives
+// 0x12 with the booster down.
+// When in doubt, clear: a spurious re-PON only costs the default BTST time
+// (>80 ms), while a wrongly-set flag drives a waveform with no booster.
+bool g_epd_booster_on = false;
 bool g_previous_framebuffer_synced = false;
 bool g_hot_refresh_ok = false;
 uint32_t g_partial_refreshes_since_full = 0;
@@ -625,6 +635,7 @@ void DropEpdHotState(bool cut_rail, bool invalidate_framebuffer)
         g_epd_rail_powered = false;
     }
     g_epd_powered = false;
+    g_epd_booster_on = false;
     if (invalidate_framebuffer) {
         g_previous_framebuffer_synced = false;
         g_partial_refreshes_since_full = 0;
@@ -635,10 +646,33 @@ void DropEpdHotState(bool cut_rail, bool invalidate_framebuffer)
     g_hot_refresh_ok = false;
 }
 
+// [epd-bias-fix] Discharge the internal booster after a partial waveform
+// WITHOUT clearing g_epd_powered. POF keeps registers and SRAM ("register and
+// SRAM data will keep until VDD off"), so the panel stays initialized and the
+// previous-frame diff that hot partials rely on stays valid; only the booster
+// goes down, which is what forces the next refresh to re-issue 0x04 (PON).
+// The external rail is deliberately NOT cut -- this is not
+// TurnGrayInternalPowerOff(), which drops the whole hot state and exists for
+// the gray16 controller swap path.
+static esp_err_t TurnBoosterOff(int timeout_ms)
+{
+    ESP_RETURN_ON_ERROR(SendCommand(0x02), kTag, "EPD internal power off");
+    ESP_RETURN_ON_ERROR(SendData(0x00), kTag, "EPD internal power off data");
+    // Clear at the point the command is issued, NOT after the BUSY wait. If
+    // the wait times out the 0x02 has still been clocked out, so leaving the
+    // flag set would make the next refresh skip PON -- the exact failure this
+    // flag exists to prevent.
+    g_epd_booster_on = false;
+    ESP_RETURN_ON_ERROR(WaitBusyTimeout(timeout_ms), kTag, "wait EPD internal power off");
+    return ESP_OK;
+}
+
 esp_err_t InitPanelSequence()
 {
     PowerOnEpd();
     g_epd_powered = false;
+    // A hardware reset clears the controller back to POR, booster included.
+    g_epd_booster_on = false;
     vTaskDelay(pdMS_TO_TICKS(10));
     SetReset(true);
     vTaskDelay(pdMS_TO_TICKS(10));
@@ -878,7 +912,13 @@ esp_err_t TriggerDisplayUpdate(bool is_partial, bool keep_powered)
     if (!g_epd_rail_powered) {
         PowerOnEpd();
     }
-    if (!g_epd_powered) {
+    // [epd-bias-fix] Also re-PON when only the booster was discharged.
+    // g_epd_powered staying true across a partial POF is the intended
+    // outcome: hot_ready/hot_update keep reading "panel initialized", so the
+    // next partial does not fall back to a full InitPanelSequence() and only
+    // pays for one extra PON. The vendor TriggerOtpRefresh() does exactly
+    // this -- 0x04 -> 0x12 -> 0x02 on every waveform.
+    if (!g_epd_powered || !g_epd_booster_on) {
         esp_err_t ret = SendCommand(0x04);
         if (ret != ESP_OK) {
             DropEpdHotState(true, true);
@@ -891,6 +931,7 @@ esp_err_t TriggerDisplayUpdate(bool is_partial, bool keep_powered)
             return ret;
         }
         g_epd_powered = true;
+        g_epd_booster_on = true;
     }
     // [epd-waveform-gate] Every waveform path funnels through here (the local
     // partial path ends in TriggerDisplayUpdate too), so this is the only place
@@ -920,8 +961,27 @@ esp_err_t TriggerDisplayUpdate(bool is_partial, bool keep_powered)
     if (!is_partial && !keep_powered) {
         ESP_RETURN_ON_ERROR(SendCommand(0x02), kTag, "EPD power off command");
         ESP_RETURN_ON_ERROR(SendData(0x00), kTag, "EPD power off data");
+        // Clear here rather than after the wait, and rather than relying on
+        // PowerOffEpd(): it can return early when the operation mutex is
+        // unavailable, which would leave the flag set after 0x02 was already
+        // sent. Same reasoning as TurnBoosterOff().
+        g_epd_booster_on = false;
         ESP_RETURN_ON_ERROR(WaitBusy(), kTag, "wait EPD power off command");
         PowerOffEpd();
+    } else if (is_partial) {
+        // [epd-bias-fix] Partial refreshes keep the external rail on
+        // (ShouldKeepEpdPowered() is unconditionally true under
+        // CONFIG_WQN_EPD_LOCAL_PARTIAL_ENABLE), but the internal booster is now
+        // discharged after every partial so DC bias cannot accumulate one-way.
+        // The next refresh re-issues 0x04 (PON) through the g_epd_booster_on
+        // gate above. Bounded by the partial timeout so a wedged panel cannot
+        // stall longer than the 4.5 s this series removes.
+        const esp_err_t booster_ret = TurnBoosterOff(kPartialCommandBusyTimeoutMs);
+        if (booster_ret != ESP_OK) {
+            // Match the failure handling of every other branch here.
+            DropEpdHotState(true, true);
+            return booster_ret;
+        }
     }
     return ESP_OK;
 }
@@ -2005,6 +2065,7 @@ static esp_err_t TriggerGrayBatch(bool power_on)
         ESP_RETURN_ON_ERROR(SendCommand(0x04), kTag, "gray16 internal power on");
         ESP_RETURN_ON_ERROR(WaitBusyTimeout(kCommandBusyTimeoutMs), kTag, "wait gray16 power on");
         g_epd_powered = true;
+        g_epd_booster_on = true;
         vTaskDelay(pdMS_TO_TICKS(10));
     }
     ESP_RETURN_ON_ERROR(SendCommand(0x12), kTag, "gray16 refresh trigger");
@@ -2019,6 +2080,7 @@ static esp_err_t TurnGrayInternalPowerOff()
     ESP_RETURN_ON_ERROR(SendData(0x00), kTag, "gray16 internal power off data");
     ESP_RETURN_ON_ERROR(WaitBusy(), kTag, "wait gray16 internal power off");
     g_epd_powered = false;
+    g_epd_booster_on = false;
     return ESP_OK;
 }
 
