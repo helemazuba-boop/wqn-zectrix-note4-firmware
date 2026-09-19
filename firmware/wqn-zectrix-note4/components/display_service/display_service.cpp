@@ -104,6 +104,14 @@ constexpr uint32_t kMaxHeavyPartialsBeforeFull = 10;
 // Run the deferred cleanup full refresh at idle once at least this many heavy
 // partials accumulated since the last full.
 constexpr uint32_t kIdleCleanupHeavyPartials = 6;
+// [epd-health] Second, independent idle-cleanup trigger, on the plain partial
+// counter. The heavy counter above never moves on a clock/timer screen: those
+// diffs sit under kHeavyPartialDiffRatio, so g_heavy_partials_since_full stays
+// at 0 and IdleCleanupPending() was never true no matter how long the device
+// ran -- the only backstop left was kMaxPartialRefreshesBeforeFull, i.e. four
+// hours of one-per-minute ticks. 24 lets a long-running idle screen shed DC
+// bias roughly every 24 minutes instead.
+constexpr uint32_t kIdleCleanupFramePartials = 24;
 constexpr int kTextGlyphWidth = 5;
 constexpr int kTextGlyphHeight = 7;
 constexpr int kTextCellWidth = 6;
@@ -2268,13 +2276,17 @@ esp_err_t RefreshEpdGray16(const uint8_t* gray4, size_t size)
     return result;
 }
 
-// [epd-health] Debt only: is there enough accumulated heavy-partial stress to
-// be worth a cleanup full refresh at all? Shared by the due-check and the
-// runner so the two can never disagree about the threshold.
+// [epd-health] Debt only: has enough partial stress accumulated to be worth a
+// cleanup full refresh at all? Two independent channels because they cover
+// different screens: the heavy counter catches large-diff scrolling early, the
+// plain counter catches long-running tiny-diff screens (clock/timer) that never
+// register as heavy. Shared by the due-check and the runner so the two can
+// never disagree about the threshold.
 static bool IdleCleanupPending()
 {
     return g_initialized && g_framebuffer != nullptr &&
-           g_heavy_partials_since_full >= kIdleCleanupHeavyPartials;
+           (g_partial_refreshes_since_full >= kIdleCleanupFramePartials ||
+            g_heavy_partials_since_full >= kIdleCleanupHeavyPartials);
 }
 
 // [epd-health] Runs the cleanup full refresh when its own deadline has elapsed.
