@@ -136,26 +136,33 @@ const char* ScreenName(wqn::UiScreen screen)
     return "WQN";
 }
 
+// Inverse of NextTopScreen: the page you would have come FROM by pressing
+// "next". These two must stay exact inverses -- when they agree, long-press Up
+// and long-press Down do the same thing and half the ring becomes unreachable.
+// Derivation after kOpenCode was demoted into the AI page: the forward ring is
+// Ai -> Settings -> Home -> Time -> Word -> Note -> Todo -> Ai, so the reverse
+// ring is that same list walked backwards.
 wqn::UiScreen PreviousTopScreen(wqn::UiScreen screen)
 {
     switch (screen) {
         case wqn::UiScreen::kAi:
-            return wqn::UiScreen::kSettings;
-        case wqn::UiScreen::kSettings:
-            return wqn::UiScreen::kHome;
-        case wqn::UiScreen::kHome:
-            return wqn::UiScreen::kTime;
-        case wqn::UiScreen::kTime:
-            return wqn::UiScreen::kWord;
-        case wqn::UiScreen::kWord:
-            return wqn::UiScreen::kNote;
-        case wqn::UiScreen::kNote:
             return wqn::UiScreen::kTodo;
-        case wqn::UiScreen::kTodo:
+        case wqn::UiScreen::kSettings:
             return wqn::UiScreen::kAi;
-        case wqn::UiScreen::kOpenCode:
-            // [agent] Reserved, unreachable. The ring is Ai -> Settings.
+        case wqn::UiScreen::kHome:
+            return wqn::UiScreen::kSettings;
+        case wqn::UiScreen::kTime:
             return wqn::UiScreen::kHome;
+        case wqn::UiScreen::kWord:
+            return wqn::UiScreen::kTime;
+        case wqn::UiScreen::kNote:
+            return wqn::UiScreen::kWord;
+        case wqn::UiScreen::kTodo:
+            return wqn::UiScreen::kNote;
+        case wqn::UiScreen::kOpenCode:
+            // [agent] Reserved, unreachable. Kept so the default-less switch
+            // stays exhaustive; IsRestorableScreen rejects ID 14.
+            return wqn::UiScreen::kAi;
         case wqn::UiScreen::kProvisioning:
             return wqn::UiScreen::kHome;
     }
