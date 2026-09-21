@@ -194,7 +194,11 @@ extern "C" void app_main(void)
 
     ConfirmRunningApp();
     ESP_ERROR_CHECK(wqn::InitAiSession());
+#if CONFIG_WQN_AGENT_ENABLE
+    // [agent] Gated with the tier itself: an Agent-disabled build must not
+    // start the gateway worker task or reserve its 9 KB static stack.
     ESP_ERROR_CHECK(wqn::InitOpenCodeSession());
+#endif
 
     // Seed the durable sync admission cache, but do not start WiFi here.
     // Connectivity is demand-owned: SyncService, AI and cloud lanes acquire

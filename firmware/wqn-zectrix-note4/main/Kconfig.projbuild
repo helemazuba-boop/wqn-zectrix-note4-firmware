@@ -162,6 +162,24 @@ menu "WQN firmware"
             Enable experimental AI support modules. Provider secrets must stay
             on the WQN server and must never be embedded in firmware.
 
+    config WQN_AGENT_ENABLE
+        bool "Enable the Agent tier (OpenCode gateway)"
+        default y
+        depends on WQN_AI_ENABLE
+        help
+            Compile the Agent tier of the AI page: the OpenCode gateway that
+            proxies a self-hosted OpenCode server through the WQN cloud
+            (/api/esp32/agent/*), its worker task, and its session picker.
+
+            Provider secrets and tool execution stay on the gateway; the device
+            only ever holds the pairing token.
+
+            When disabled, AiTier::kAgent is dropped from the tier ring so the
+            user can never land on a tier with no backend behind it, and the
+            OpenCode session/client translation units compile to stubs. Disable
+            only for builds against a cloud that does not serve the agent
+            routes.
+
     config WQN_AI_STREAMING_ENABLE
         bool "Enable v2 SSE streaming for Std/Pro AI tier (new default)"
         default y

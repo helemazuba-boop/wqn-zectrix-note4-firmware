@@ -765,7 +765,14 @@ namespace wqn {
 
 AiTier NextAiTier(AiTier current)
 {
+#if CONFIG_WQN_AGENT_ENABLE
     return static_cast<AiTier>((static_cast<uint8_t>(current) + 1) % static_cast<uint8_t>(AiTier::kCount));
+#else
+    // [agent] Without the gateway compiled in, kAgent must not be offered: the
+    // tier would render a page whose every action returns ESP_ERR_NOT_SUPPORTED.
+    // The ring collapses to Flash <-> Std, which is exactly the pre-Agent set.
+    return (current == AiTier::kStd) ? AiTier::kFlash : AiTier::kStd;
+#endif
 }
 
 const char* AiTierLabel(AiTier tier)

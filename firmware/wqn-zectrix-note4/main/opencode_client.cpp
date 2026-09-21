@@ -1,5 +1,7 @@
 #include "opencode_client.h"
 
+#if CONFIG_WQN_AGENT_ENABLE
+
 #include <algorithm>
 #include <array>
 #include <cstdio>
@@ -653,3 +655,5 @@ esp_err_t CreateOpenCodeSession(
 }
 
 }  // namespace wqn
+
+#endif  // CONFIG_WQN_AGENT_ENABLE

@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <utility>
 
+#if CONFIG_WQN_AGENT_ENABLE
+
 #include "ai_session.h"
 #include "ai_history.h"
 #include "audio_capture.h"
@@ -1055,3 +1057,32 @@ bool IsOpenCodeSessionActive()
 }
 
 }  // namespace wqn
+
+#else  // !CONFIG_WQN_AGENT_ENABLE
+
+// [agent] Agent tier compiled out. The public API keeps its signatures so the
+// AI page's tier switch, status-bar slots, scroll branch and history mirror all
+// build unchanged -- they simply never fire, because NextAiTier does not offer
+// kAgent in this configuration. Every entry point refuses instead of touching
+// the network, so a stale call cannot reach a gateway this build has no client
+// for. Mirrors the stub half of ai_session.cpp.
+namespace wqn {
+
+esp_err_t InitOpenCodeSession() { return ESP_ERR_NOT_SUPPORTED; }
+esp_err_t RequestOpenCodeSessionList() { return ESP_ERR_NOT_SUPPORTED; }
+esp_err_t MoveOpenCodeSessionSelection(int) { return ESP_ERR_NOT_SUPPORTED; }
+esp_err_t LockSelectedOpenCodeSession() { return ESP_ERR_NOT_SUPPORTED; }
+esp_err_t CreateNewOpenCodeSession() { return ESP_ERR_NOT_SUPPORTED; }
+esp_err_t ObserveOpenCodeSession() { return ESP_ERR_NOT_SUPPORTED; }
+esp_err_t ReplyPendingOpenCodePermission(bool) { return ESP_ERR_NOT_SUPPORTED; }
+esp_err_t StartOpenCodeVoiceInput() { return ESP_ERR_NOT_SUPPORTED; }
+esp_err_t StopOpenCodeVoiceInput() { return ESP_ERR_NOT_SUPPORTED; }
+esp_err_t ConfirmOpenCodePrompt(int64_t) { return ESP_ERR_NOT_SUPPORTED; }
+void CancelOpenCodePrompt() {}
+void ScrollOpenCodeResponse(int) {}
+bool CopyOpenCodeSessionToUi(AgentSessionState*) { return false; }
+bool IsOpenCodeSessionActive() { return false; }
+
+}  // namespace wqn
+
+#endif  // CONFIG_WQN_AGENT_ENABLE
