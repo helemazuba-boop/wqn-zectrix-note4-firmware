@@ -4,6 +4,7 @@
 #include <utility>
 
 #include "ai_session.h"
+#include "ai_history.h"
 #include "audio_capture.h"
 #include "esp_check.h"
 #include "esp_log.h"
@@ -294,9 +295,102 @@ void Transcribe()
     xSemaphoreGive(g_lock);
 }
 
+// ---- History mirror --------------------------------------------------------
+// [agent] The Agent tier is rendered by the AI page's chat-bubble viewport, so
+// every stream event that changes what the user reads is mirrored into the
+// kAgent history channel. The channel is chosen explicitly rather than read
+// from the visible tier: a run started on one tier must never append to
+// another tier's conversation. Everything below runs with g_lock held.
+
+wqn::ChatMessageId g_agent_assistant_id = wqn::kInvalidChatMessageId;
+wqn::ChatMessageId g_agent_tool_id = wqn::kInvalidChatMessageId;
+std::string g_agent_tool_name;
+// Last status/preview seen for the open tool block. The gateway's `agent.tool`
+// event carries a free-form status string, not an explicit start/end pair, so
+// the newest detail wins and the block is closed by whatever arrives next.
+std::string g_agent_tool_detail;
+int64_t g_agent_tool_since_ms = 0;
+
+void ResetAgentHistoryTurnLocked()
+{
+    g_agent_assistant_id = wqn::kInvalidChatMessageId;
+    g_agent_tool_id = wqn::kInvalidChatMessageId;
+    g_agent_tool_name.clear();
+    g_agent_tool_detail.clear();
+    g_agent_tool_since_ms = 0;
+}
+
+// Closes the open tool placeholder into a result block. Because the gateway
+// has no tool-end event, this is driven by the next event of any kind (text, a
+// different tool, run end, error) instead of by guessing the status vocabulary
+// -- that keeps exactly one block per tool and never leaks a "running"
+// placeholder into the rendered history.
+void CloseAgentToolBlockLocked(bool ok, int64_t now_ms)
+{
+    if (g_agent_tool_id == wqn::kInvalidChatMessageId) {
+        return;
+    }
+    const std::string name = g_agent_tool_name;
+    const std::string detail = g_agent_tool_detail;
+    const int64_t since_ms = g_agent_tool_since_ms;
+    wqn::AiHistory& history = wqn::GetAiHistory(wqn::AiHistoryChannel::kAgent);
+    if (history.PopLastIf(wqn::ChatMessageKind::kToolStart)) {
+        const int32_t elapsed_ms =
+            (since_ms > 0 && now_ms >= since_ms) ? static_cast<int32_t>(now_ms - since_ms) : 0;
+        history.AppendToolResult(name, std::string_view(), detail, ok, elapsed_ms, now_ms);
+    }
+    g_agent_tool_id = wqn::kInvalidChatMessageId;
+    g_agent_tool_name.clear();
+    g_agent_tool_detail.clear();
+    g_agent_tool_since_ms = 0;
+    // Post-tool text must open a NEW assistant entry. Rewriting the pre-tool
+    // entry in place would drag it below the tool block and overwrite its own
+    // text with the post-tool text.
+    g_agent_assistant_id = wqn::kInvalidChatMessageId;
+}
+
+// Streams the accumulated gateway text into a single assistant entry: the
+// first delta creates it, later deltas replace it in place. Replacing matters
+// -- the gateway emits dozens of deltas per reply and appending each one would
+// blow through the ring buffer's byte budget before the reply finished.
+void MirrorAgentTextLocked(int64_t now_ms)
+{
+    CloseAgentToolBlockLocked(true, now_ms);
+    const std::string& text = g_state.ui.response_text;
+    if (text.empty()) {
+        return;
+    }
+    wqn::AiHistory& history = wqn::GetAiHistory(wqn::AiHistoryChannel::kAgent);
+    if (g_agent_assistant_id == wqn::kInvalidChatMessageId) {
+        g_agent_assistant_id = history.AppendAssistant(text, now_ms);
+        return;
+    }
+    history.ReplaceText(g_agent_assistant_id, wqn::ChatMessageKind::kAssistant, text, now_ms);
+}
+
+// Records the submitted prompt and arms a fresh turn. Called before the worker
+// starts so the user bubble is on screen while the gateway is still connecting.
+void AppendAgentUserLocked(std::string_view text, int64_t now_ms)
+{
+    ResetAgentHistoryTurnLocked();
+    if (!text.empty()) {
+        wqn::GetAiHistory(wqn::AiHistoryChannel::kAgent).AppendUser(text, now_ms);
+    }
+}
+
+void AppendAgentErrorLocked(std::string_view text, int64_t now_ms)
+{
+    CloseAgentToolBlockLocked(false, now_ms);
+    g_agent_assistant_id = wqn::kInvalidChatMessageId;
+    if (!text.empty()) {
+        wqn::GetAiHistory(wqn::AiHistoryChannel::kAgent).AppendAssistant(text, now_ms);
+    }
+}
+
 void OnOpenCodeEvent(const wqn::OpenCodeEvent& event, void*)
 {
     xSemaphoreTake(g_lock, portMAX_DELAY);
+    const int64_t now_ms = esp_timer_get_time() / 1000;
     switch (event.kind) {
         case wqn::OpenCodeEventKind::kAccepted:
             SetPhaseLocked(wqn::AiFeaturePhase::kRunning, "Agent 执行中");
@@ -310,6 +404,8 @@ void OnOpenCodeEvent(const wqn::OpenCodeEvent& event, void*)
             g_state.pending_permission_id.clear();
             if (event.status == "idle") {
                 g_state.stream_active = false;
+                // Run finished: close a tool block the gateway never closed.
+                CloseAgentToolBlockLocked(!g_run_failed, now_ms);
                 if (!g_run_failed) {
                     SetPhaseLocked(wqn::AiFeaturePhase::kComplete, "执行完成");
                     if (g_observing) {
@@ -339,13 +435,15 @@ void OnOpenCodeEvent(const wqn::OpenCodeEvent& event, void*)
                 const size_t remaining = kMaxAgentTextBytes - g_state.ui.response_text.size();
                 g_state.ui.response_text.append(event.text.data(), std::min(remaining, event.text.size()));
             }
+            MirrorAgentTextLocked(now_ms);
             MarkChangedLocked();
             break;
         case wqn::OpenCodeEventKind::kText:
             g_state.ui.response_text = event.text.substr(0, kMaxAgentTextBytes);
+            MirrorAgentTextLocked(now_ms);
             MarkChangedLocked();
             break;
-        case wqn::OpenCodeEventKind::kTool:
+        case wqn::OpenCodeEventKind::kTool: {
             g_state.ui.activity_text = event.tool;
             if (!event.status.empty()) {
                 g_state.ui.activity_text += " · " + event.status;
@@ -353,8 +451,23 @@ void OnOpenCodeEvent(const wqn::OpenCodeEvent& event, void*)
             if (!event.preview.empty()) {
                 g_state.ui.activity_text += " · " + event.preview;
             }
+            // Coalesce by tool name: the gateway re-emits `agent.tool` as a
+            // tool progresses, and one history block per tool keeps the
+            // transcript readable on a 400x300 panel.
+            if (g_agent_tool_id != wqn::kInvalidChatMessageId &&
+                g_agent_tool_name == event.tool) {
+                g_agent_tool_detail = event.preview.empty() ? event.status : event.preview;
+            } else {
+                CloseAgentToolBlockLocked(true, now_ms);
+                g_agent_tool_id = wqn::GetAiHistory(wqn::AiHistoryChannel::kAgent)
+                                      .AppendToolStart(event.tool, std::string_view(), now_ms);
+                g_agent_tool_name = event.tool;
+                g_agent_tool_detail = event.preview.empty() ? event.status : event.preview;
+                g_agent_tool_since_ms = now_ms;
+            }
             MarkChangedLocked();
             break;
+        }
         case wqn::OpenCodeEventKind::kPermission:
             g_state.ui.phase = wqn::AiFeaturePhase::kAwaitingPermission;
             g_state.ui.status_label = "等待权限";
@@ -364,6 +477,9 @@ void OnOpenCodeEvent(const wqn::OpenCodeEvent& event, void*)
                 g_state.ui.activity_text += " · " + event.preview;
             }
             g_state.ui.action_hint = "↑ 批准 · ↓ 拒绝";
+            // Deliberately NOT mirrored into history: the ask is a live
+            // interaction rendered by the dashed bubble + option bar, and its
+            // outcome already shows up as the tool blocks and text that follow.
             MarkChangedLocked();
             break;
         case wqn::OpenCodeEventKind::kError:
@@ -373,6 +489,7 @@ void OnOpenCodeEvent(const wqn::OpenCodeEvent& event, void*)
             g_state.ui.status_label = "执行失败";
             g_state.ui.activity_text = event.text;
             g_state.ui.action_hint = "长按确认重试新任务";
+            AppendAgentErrorLocked(event.text, now_ms);
             MarkChangedLocked();
             break;
     }
@@ -464,12 +581,12 @@ void CreateSession()
         g_state.ui.scroll_offset_lines = 0;
         g_state.ui.requires_confirmation = false;
         g_state.confirmation_armed_at_ms = 0;
+        ResetAgentHistoryTurnLocked();
         MarkChangedLocked();
         ReleaseWorkOwnershipLocked();
     } else {
         SetErrorLocked(api_result.detail.empty() ? "Session 创建失败" : api_result.detail);
-    }
-    xSemaphoreGive(g_lock);
+    }    xSemaphoreGive(g_lock);
 }
 
 void ObserveSession()
@@ -663,6 +780,11 @@ esp_err_t LockSelectedOpenCodeSession()
     g_state.ui.activity_text = "长按确认键语音输入";
     g_state.ui.action_hint = "长按确认录音 · ↑/↓ 滚动 · 双击观察";
     g_state.confirmation_armed_at_ms = 0;
+    // [agent] Switching sessions switches conversation: the mirrored transcript
+    // belongs to the session that produced it, so drop it rather than letting
+    // the new session render the previous one's bubbles.
+    wqn::GetAiHistory(wqn::AiHistoryChannel::kAgent).Clear();
+    ResetAgentHistoryTurnLocked();
     MarkChangedLocked();
     xSemaphoreGive(g_lock);
     return ESP_OK;
@@ -724,6 +846,8 @@ esp_err_t ObserveOpenCodeSession()
         g_state.ui.action_hint.clear();
         g_state.ui.scroll_offset_lines = 0;
         g_state.stream_active = true;
+        // Attaching mid-stream: any assistant id from the previous run is stale.
+        ResetAgentHistoryTurnLocked();
         MarkChangedLocked();
     } else {
         ReleaseWorkOwnershipLocked();
@@ -859,6 +983,10 @@ esp_err_t ConfirmOpenCodePrompt(int64_t confirmed_at_ms)
         g_state.confirmation_armed_at_ms = 0;
         g_state.ui.scroll_offset_lines = 0;
         g_state.stream_active = true;
+        // [agent] Mirror the submitted prompt into the kAgent channel before the
+        // worker starts, so the user bubble is on screen while the gateway is
+        // still connecting.
+        AppendAgentUserLocked(g_run_prompt, esp_timer_get_time() / 1000);
         MarkChangedLocked();
     } else {
         ReleaseWorkOwnershipLocked();
@@ -881,6 +1009,8 @@ void CancelOpenCodePrompt()
         g_state.ui.action_hint = "长按确认重新录音";
         g_state.ui.requires_confirmation = false;
         g_state.confirmation_armed_at_ms = 0;
+        // Nothing was sent, so the armed turn never reached history.
+        ResetAgentHistoryTurnLocked();
         MarkChangedLocked();
     }
     xSemaphoreGive(g_lock);
