@@ -429,6 +429,11 @@ struct UiGestureState {
     bool flash_ptt_started = false;
     bool agent_ptt_started = false;
     int64_t last_ai_confirm_tap_ms = 0;
+    // [agent] Separate from last_ai_confirm_tap_ms on purpose: on the AI page a
+    // double-confirm enters status-bar edit mode, but in the Agent session
+    // picker the same gesture re-attaches to a running stream. Sharing one
+    // timestamp would let a tap in one mode satisfy the other's window.
+    int64_t last_agent_confirm_tap_ms = 0;
 };
 
 // M4: the application state has exactly one owner (UiRuntime on DeviceUiTask).

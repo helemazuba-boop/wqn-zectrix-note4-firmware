@@ -8,6 +8,7 @@
 #include <string>
 #include <utility>
 
+#include "ai_history.h"
 #include "ai_session.h"
 #include "esp_log.h"
 #include "flash_session.h"
@@ -509,10 +510,219 @@ static void CycleAiStatusBarToggleReverse(wqn::UiState* state, uint8_t index)
     }
 }
 
+// ---------------------------------------------------------------------------
+// [agent] Agent-tier input
+//
+// The Agent tier has two modal surfaces the STD/Pro tiers do not have, and both
+// must own input outright while they are up -- otherwise the confirm key would
+// start a PTT recording in the middle of a decision the user is trying to make.
+// Everything they do not claim falls through to the ordinary Agent PTT / scroll
+// paths at the bottom of ApplyButtonEvent.
+// ---------------------------------------------------------------------------
+
+// Pull the backend's authoritative Agent state into AppState. Every Agent
+// action is asynchronous (a worker task performs the HTTP call), so the UI
+// state is only ever a snapshot taken after the request was accepted.
+static void SyncAgentSnapshot(wqn::UiState* state)
+{
+    wqn::AgentSessionState snapshot;
+    if (wqn::CopyOpenCodeSessionToUi(&snapshot)) {
+        state->agent = std::move(snapshot);
+    }
+}
+
+// Turn navigation: jump the viewport to the previous/next answer. Reuses the
+// renderer's own layout pass (GetAiTurnJumpOffsetLines) so the jump target and
+// the scroll clamp cannot disagree.
+static bool ApplyAgentTurnJump(wqn::UiState* state, int direction)
+{
+    if (state == nullptr || direction == 0) {
+        return false;
+    }
+    const auto snapshot = wqn::GetAiHistorySnapshot(wqn::AiHistoryChannel::kAgent);
+    if (!snapshot || snapshot->messages.empty()) {
+        return false;
+    }
+    int32_t next = 0;
+    if (!device_ui_internal::GetAiTurnJumpOffsetLines(
+            snapshot, state->ai.expand_content, state->agent.ui.scroll_offset_lines,
+            direction, &next)) {
+        return false;
+    }
+    state->agent.ui.scroll_offset_lines = next;
+    return true;
+}
+
+// Runs the focused option-bar slot. 发送 submits the armed transcript,
+// 重新输入 discards it, 同意/拒绝 answer the gateway's permission ask.
+static RefreshSchedule ExecuteAgentOption(wqn::UiState* state,
+                                          device_ui_internal::AgentOption option,
+                                          int64_t now_ms)
+{
+    switch (option) {
+        case device_ui_internal::AgentOption::kSend:
+            if (wqn::ConfirmOpenCodePrompt(now_ms) == ESP_OK) {
+                ESP_LOGI(kTag, "Agent option: send");
+            } else {
+                ESP_LOGW(kTag, "Agent option: send rejected (armed state moved on)");
+            }
+            break;
+        case device_ui_internal::AgentOption::kReinput:
+            wqn::CancelOpenCodePrompt();
+            ESP_LOGI(kTag, "Agent option: reinput");
+            break;
+        case device_ui_internal::AgentOption::kApprove:
+        case device_ui_internal::AgentOption::kDeny:
+            if (wqn::ReplyPendingOpenCodePermission(
+                    option == device_ui_internal::AgentOption::kApprove) == ESP_OK) {
+                ESP_LOGI(kTag, "Agent option: permission %s",
+                         option == device_ui_internal::AgentOption::kApprove ? "approve" : "deny");
+            } else {
+                ESP_LOGW(kTag, "Agent option: permission reply rejected");
+            }
+            break;
+        case device_ui_internal::AgentOption::kCount:
+        default:
+            return RefreshSchedule::kNone;
+    }
+    // The pending state is gone the moment the action is accepted, so the focus
+    // it indexed into is meaningless. Reset it rather than leaving it pointing
+    // at a slot the next state may not have.
+    state->agent_option.focused = 0;
+    SyncAgentSnapshot(state);
+    return RefreshSchedule::kAi;
+}
+
+static RefreshSchedule ApplyAgentOptionBarEvent(
+    const wqn::ButtonEvent& event,
+    int64_t now_ms,
+    wqn::UiState* state,
+    device_ui_internal::AgentOptionMode mode)
+{
+    if (event.button == wqn::ButtonId::kConfirm) {
+        // Both the fast kDoublePress and a slow pair of kShortPress execute:
+        // the second tap of a slow pair is the decision, and treating it as
+        // "first tap" would strand the user on a focused-but-unexecuted bar.
+        if (event.type == wqn::ButtonEventType::kShortPress ||
+            event.type == wqn::ButtonEventType::kDoublePress) {
+            return ExecuteAgentOption(
+                state, device_ui_internal::AgentFocusedOption(mode, state->agent_option.focused),
+                now_ms);
+        }
+        // Swallow everything else, including the PTT hold edges: recording is
+        // not what the confirm key means while a decision is on screen.
+        return RefreshSchedule::kNone;
+    }
+    if (event.button == wqn::ButtonId::kUp || event.button == wqn::ButtonId::kDownPower) {
+        if (event.type == wqn::ButtonEventType::kShortPress) {
+            state->agent_option.focused ^= 1u;  // exactly two slots
+            return RefreshSchedule::kAi;
+        }
+        return RefreshSchedule::kNone;
+    }
+    return RefreshSchedule::kNone;
+}
+
+// Session picker: confirm locks the focused session, a second confirm within
+// the window re-attaches to its live stream, long-confirm creates a new one.
+// Same gesture map the retired standalone page used, so nothing has to be
+// relearned.
+static RefreshSchedule ApplyAgentPickerEvent(
+    const wqn::ButtonEvent& event,
+    int64_t now_ms,
+    wqn::UiState* state)
+{
+    constexpr int64_t kAgentPickerWindowMs = 1000;
+    if (event.button == wqn::ButtonId::kConfirm) {
+        if (event.type == wqn::ButtonEventType::kLongRelease) {
+            if (wqn::CreateNewOpenCodeSession() == ESP_OK) {
+                ESP_LOGI(kTag, "Agent picker: new session");
+            } else {
+                ESP_LOGW(kTag, "Agent picker: new session rejected");
+            }
+            SyncAgentSnapshot(state);
+            return RefreshSchedule::kAi;
+        }
+        if (event.type == wqn::ButtonEventType::kShortPress) {
+            if (state->gestures.last_agent_confirm_tap_ms > 0 &&
+                now_ms - state->gestures.last_agent_confirm_tap_ms <= kAgentPickerWindowMs) {
+                state->gestures.last_agent_confirm_tap_ms = 0;
+                if (wqn::ObserveOpenCodeSession() == ESP_OK) {
+                    ESP_LOGI(kTag, "Agent picker: observe");
+                } else {
+                    ESP_LOGW(kTag, "Agent picker: observe rejected");
+                }
+                SyncAgentSnapshot(state);
+                return RefreshSchedule::kAi;
+            }
+            state->gestures.last_agent_confirm_tap_ms = now_ms;
+            if (wqn::LockSelectedOpenCodeSession() == ESP_OK) {
+                ESP_LOGI(kTag, "Agent picker: lock session");
+                state->agent_option.focused = 0;
+            } else {
+                ESP_LOGW(kTag, "Agent picker: lock rejected (empty list?)");
+            }
+            SyncAgentSnapshot(state);
+            return RefreshSchedule::kAi;
+        }
+        if (event.type == wqn::ButtonEventType::kDoublePress) {
+            state->gestures.last_agent_confirm_tap_ms = 0;
+            if (wqn::ObserveOpenCodeSession() == ESP_OK) {
+                ESP_LOGI(kTag, "Agent picker: observe (fast)");
+            } else {
+                ESP_LOGW(kTag, "Agent picker: observe rejected");
+            }
+            SyncAgentSnapshot(state);
+            return RefreshSchedule::kAi;
+        }
+        return RefreshSchedule::kNone;
+    }
+    if (event.button == wqn::ButtonId::kUp || event.button == wqn::ButtonId::kDownPower) {
+        if (event.type == wqn::ButtonEventType::kShortPress) {
+            const int direction = (event.button == wqn::ButtonId::kUp) ? -1 : 1;
+            if (wqn::MoveOpenCodeSessionSelection(direction) == ESP_OK) {
+                SyncAgentSnapshot(state);
+                return RefreshSchedule::kAi;
+            }
+        }
+        return RefreshSchedule::kNone;
+    }
+    return RefreshSchedule::kNone;
+}
+
+// Returns kHandled only when a modal Agent surface consumed the event.
+enum class AgentInputResult : uint8_t { kFallThrough, kHandled };
+
+static AgentInputResult TryApplyAgentAiButtonEvent(
+    const wqn::ButtonEvent& event,
+    int64_t event_time_ms,
+    wqn::UiState* state)
+{
+    if (state->screen != wqn::UiScreen::kAi ||
+        state->ai.tier != wqn::AiTier::kAgent) {
+        return AgentInputResult::kFallThrough;
+    }
+    const device_ui_internal::AgentOptionMode mode =
+        device_ui_internal::AgentOptionModeFor(state->agent);
+    if (mode != device_ui_internal::AgentOptionMode::kNone) {
+        ApplyAgentOptionBarEvent(event, event_time_ms, state, mode);
+        return AgentInputResult::kHandled;
+    }
+    if (!state->agent.session_locked) {
+        ApplyAgentPickerEvent(event, event_time_ms, state);
+        return AgentInputResult::kHandled;
+    }
+    return AgentInputResult::kFallThrough;
+}
+
 // [shell] Status-bar edit mode owns all button input on the AI page while active.
 // short-confirm = cycle selected toggle; up/down = move selection (wrap 0..2);
 // long-confirm (release) = exit. Edge events (Press/Release) are consumed so
 // Flash PTT never fires mid-edit (though edit mode is only entered on Std/Pro).
+//
+// [agent] The Agent tier reuses the same five slots (0 = tier, 1..4 = cluster),
+// so only the slot 1..3 actions differ: they are immediate actions rather than
+// toggles, because they configure the gateway rather than the STD/Pro text turn.
 static RefreshSchedule ApplyStatusBarEditEvent(
     const wqn::ButtonEvent& event,
     int64_t now_ms,
@@ -536,15 +746,61 @@ static RefreshSchedule ApplyStatusBarEditEvent(
                 if (prev_tier == wqn::AiTier::kFlash && next != wqn::AiTier::kFlash) {
                     wqn::StopFlashSession();
                 }
+                // [agent] Arriving on the Agent tier with no locked session shows
+                // the picker, so fetch the list now rather than making the user
+                // press the session button first. Failure is not fatal: the
+                // picker renders the backend's last activity text instead.
+                if (next == wqn::AiTier::kAgent && state->agent.current_session_id.empty()) {
+                    if (wqn::RequestOpenCodeSessionList() != ESP_OK) {
+                        ESP_LOGW(kTag, "AI status-bar: agent session list request failed");
+                    }
+                }
+                // A stale option-bar focus must not survive a tier change: the
+                // pending state it indexed into belongs to the previous tier.
+                state->agent_option.focused = 0;
                 state->status_edit.active = false;
                 state->status_edit.last_cycle_ms = 0;
                 wqn::RequestForceFullRefresh();
                 ESP_LOGI(kTag, "AI status-bar: tier switch -> %d", static_cast<int>(next));
                 return RefreshSchedule::kAi;
             }
+            // [agent] Slots 1..3 are immediate actions on the Agent tier (open
+            // the session picker, jump to the previous/next answer). They run
+            // and exit like the tier and trash slots instead of arming a toggle
+            // double-confirm, which is what STD/Pro needs for its value toggles.
+            if (state->ai.tier == wqn::AiTier::kAgent &&
+                state->status_edit.selected >= 1 && state->status_edit.selected <= 3) {
+                const int slot = state->status_edit.selected;
+                state->status_edit.active = false;
+                state->status_edit.last_cycle_ms = 0;
+                state->status_edit.last_action_ms = now_ms;
+                wqn::RequestForceFullRefresh();
+                if (slot == 1) {
+                    state->agent.session_locked = false;
+                    state->agent.selected_session = 0;
+                    if (wqn::RequestOpenCodeSessionList() != ESP_OK) {
+                        ESP_LOGW(kTag, "AI status-bar: agent session list request failed");
+                    }
+                    ESP_LOGI(kTag, "AI status-bar: agent session picker");
+                    return RefreshSchedule::kAi;
+                }
+                const int direction = (slot == 2) ? -1 : 1;
+                if (ApplyAgentTurnJump(state, direction)) {
+                    ESP_LOGI(kTag, "AI status-bar: agent turn jump dir=%d -> %ld",
+                             direction,
+                             static_cast<long>(state->agent.ui.scroll_offset_lines));
+                }
+                return RefreshSchedule::kAi;
+            }
             // [trash] index 4 = clear-context action: clear + exit immediately.
             if (state->status_edit.selected == 4) {
-                wqn::ClearAiConversationContext();
+                // [agent] Each tier owns its own history channel, so the trash
+                // clears the one the visible tier writes to.
+                if (state->ai.tier == wqn::AiTier::kAgent) {
+                    wqn::GetAiHistory(wqn::AiHistoryChannel::kAgent).Clear();
+                } else {
+                    wqn::ClearAiConversationContext();
+                }
                 state->status_edit.active = false;
                 state->status_edit.last_cycle_ms = 0;
                 wqn::RequestForceFullRefresh();
@@ -611,6 +867,15 @@ RefreshSchedule ApplyButtonEvent(
     // [shell] Status-bar edit mode intercepts all input on the AI page.
     if (state->screen == wqn::UiScreen::kAi && state->status_edit.active) {
         return ApplyStatusBarEditEvent(event, event_time_ms, state);
+    }
+
+    // [agent] Modal Agent surfaces take priority over everything below: the
+    // option bar (dashed pending bubble) and the session picker both answer the
+    // confirm key with a decision, and neither may be interrupted by a PTT hold
+    // or a scroll event.
+    if (TryApplyAgentAiButtonEvent(event, event_time_ms, state) ==
+        AgentInputResult::kHandled) {
+        return RefreshSchedule::kAi;
     }
 
     const size_t old_page = state->ai.page;
@@ -866,6 +1131,26 @@ RefreshSchedule ApplyButtonEvent(
         return RefreshSchedule::kNone;
     }
 
+    // [agent] The Agent tier scrolls its own history. ScrollOpenCodeResponse
+    // owns the offset -- it is also advanced by the live SSE stream -- so the UI
+    // must only ask it to move, never write the offset directly. The busy test
+    // is the shared phase enum rather than AiSessionStatus, which the Agent
+    // tier never populates.
+    if (state->screen == wqn::UiScreen::kAi && state->ai.tier == wqn::AiTier::kAgent &&
+        !long_press && event.type == wqn::ButtonEventType::kShortPress &&
+        (event.button == wqn::ButtonId::kUp || event.button == wqn::ButtonId::kDownPower) &&
+        !wqn::AiFeaturePhaseIsBusy(state->agent.ui.phase)) {
+        // Up = older content above; the sign matches ScrollOpenCodeResponse's
+        // own convention (positive = older).
+        const int direction = (event.button == wqn::ButtonId::kUp) ? 1 : -1;
+        wqn::ScrollOpenCodeResponse(direction);
+        SyncAgentSnapshot(state);
+        ESP_LOGI(kTag, "Agent scroll: %s -> offset=%ld",
+                 direction > 0 ? "older" : "newer",
+                 static_cast<long>(state->agent.ui.scroll_offset_lines));
+        return RefreshSchedule::kAi;
+    }
+
     // -------------------------------------------------------------------
     // v2 AI scroll: short-press Up/Down on AI page drives the chat
     // viewport instead of paging through the assistant text. We do this
@@ -874,8 +1159,13 @@ RefreshSchedule ApplyButtonEvent(
     //
     // Recording / waiting state must NOT scroll — the page is reserved for
     // the recording surface.
+    //
+    // [agent] STD/Pro/Flash only: the Agent tier is handled by its own branch
+    // above, which routes through ScrollOpenCodeResponse instead of the
+    // shared AiSession offset that AiSessionState::scroll_offset_lines owns.
     // -------------------------------------------------------------------
-    if (state->screen == wqn::UiScreen::kAi && !long_press &&
+    if (state->screen == wqn::UiScreen::kAi && state->ai.tier != wqn::AiTier::kAgent &&
+        !long_press &&
         (event.type == wqn::ButtonEventType::kShortPress) &&
         (event.button == wqn::ButtonId::kUp || event.button == wqn::ButtonId::kDownPower) &&
         state->ai.status != wqn::AiSessionStatus::kPreparingCapture &&

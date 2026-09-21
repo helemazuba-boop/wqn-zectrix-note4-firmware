@@ -698,6 +698,8 @@ enum class AgentOptionMode : uint8_t {
     kPermission,    // gateway ask pending: 同意 / 拒绝
 };
 AgentOptionMode AgentOptionModeFor(const wqn::AgentSessionState& agent);
+// The focused slot, clamped to the two the current mode actually offers.
+AgentOption AgentFocusedOption(AgentOptionMode mode, uint8_t focused);
 const char* AgentOptionLabel(AgentOption option);
 
 // ---- Word page --------------------------------------------------------------

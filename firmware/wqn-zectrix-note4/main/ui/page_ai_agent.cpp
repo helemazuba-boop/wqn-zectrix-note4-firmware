@@ -95,7 +95,7 @@ const char* AgentOptionLabel(AgentOption option)
 
 // The focused slot, clamped to the two the current mode actually offers so a
 // focus left over from the other mode cannot index past the end.
-static AgentOption AgentFocusedOption(AgentOptionMode mode, uint8_t focused)
+AgentOption AgentFocusedOption(AgentOptionMode mode, uint8_t focused)
 {
     const AgentOption first = (mode == AgentOptionMode::kPermission)
         ? AgentOption::kApprove
