@@ -1,5 +1,6 @@
 // AI conversation history: PSRAM-backed ring buffer for chat messages and tool blocks.
-// Rebuilt each boot — no NVS persistence. STD/Pro and Flash use independent histories.
+// Rebuilt each boot — no NVS persistence. STD/Pro, Flash and Agent (OpenCode)
+// use independent histories.
 
 #pragma once
 
@@ -29,9 +30,14 @@ enum class ChatMessageKind : uint8_t {
     kToolResult,
 };
 
+// [agent] One channel per AI-page tier. kAgent carries the OpenCode gateway
+// conversation, which shares the chat bubble / markdown / tool-block renderer
+// with kStdPro but must never be merged into it: the two backends answer the
+// same prompts with completely different content and lifetimes.
 enum class AiHistoryChannel : uint8_t {
     kStdPro,
     kFlash,
+    kAgent,
 };
 
 struct ChatMessage {

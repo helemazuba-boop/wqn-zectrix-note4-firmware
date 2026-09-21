@@ -102,11 +102,13 @@ wqn::DeepSleepUiPolicy DeepSleepPolicyForUiState(const wqn::AppState& state)
         case wqn::UiScreen::kHome:
         case wqn::UiScreen::kTime:
         case wqn::UiScreen::kAi:
-        case wqn::UiScreen::kOpenCode:
         case wqn::UiScreen::kTodo:
         case wqn::UiScreen::kSettings:
         case wqn::UiScreen::kWord:
         case wqn::UiScreen::kNote:
+        case wqn::UiScreen::kOpenCode:
+            // [agent] kOpenCode is a reserved, unreachable ID: the Agent page
+            // lives on the AI screen and is covered by the kAi case above.
             // Ordinary application pages enter retained standby. This
             // firmware intentionally exposes no application-page hibernate
             // policy: page identity alone cannot make deep sleep safe because
@@ -1238,7 +1240,8 @@ wqn::AiStreamingStatusView streaming_view{};
                     } else {
                         last_flash_render_ms = now_ms_d;
                     }
-                } else if (state.screen == wqn::UiScreen::kOpenCode &&
+                } else if (state.screen == wqn::UiScreen::kAi &&
+                           state.ai.tier == wqn::AiTier::kAgent &&
                            state.agent.stream_active) {
                     // Agent events can arrive at token/tool cadence. A 500 ms
                     // sampling floor keeps EPD partial refreshes bounded.
@@ -1367,7 +1370,6 @@ wqn::AiStreamingStatusView streaming_view{};
         const int64_t idle_ms = (esp_timer_get_time() - g_last_active_us_local) / 1000;
         const bool screen_active = (state.screen == wqn::UiScreen::kTime ||
                                     state.screen == wqn::UiScreen::kAi ||
-                                    state.screen == wqn::UiScreen::kOpenCode ||
                                     state.screen == wqn::UiScreen::kWord);
         const bool todo_convergence_due =
             todo_desired_revision > todo_applied_revision &&

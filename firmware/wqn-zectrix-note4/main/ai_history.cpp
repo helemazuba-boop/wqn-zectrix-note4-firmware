@@ -305,13 +305,18 @@ uint64_t AiHistory::revision() const
 namespace {
 AiHistory g_history_stdpro;
 AiHistory g_history_flash;
+AiHistory g_history_agent;
 }  // namespace
 
 AiHistory& GetAiHistory(AiHistoryChannel channel)
 {
+    // [agent] The OpenCode channel shares kCapBytes with the others. The cap is
+    // an upper bound, not a preallocation: each ring only grows as messages
+    // arrive and evicts the oldest ones past the cap, so a third channel costs
+    // PSRAM only in proportion to what the Agent conversation actually holds.
     AiHistory& history = channel == AiHistoryChannel::kFlash
         ? g_history_flash
-        : g_history_stdpro;
+        : (channel == AiHistoryChannel::kAgent ? g_history_agent : g_history_stdpro);
     (void)history.Init(kCapBytes);
     return history;
 }

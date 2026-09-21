@@ -894,7 +894,9 @@ void SubmitSession()
     g_state.toast_since_ms = esp_timer_get_time() / 1000;
     g_state.toast_recording_ms = 0;
     MarkChanged();
-    const std::string tier_str = g_state.tier == wqn::AiTier::kPro ? "pro" : "std";
+    // [agent] Only the STD/Pro text turn carries a tier header; Flash is a
+    // separate WebSocket and the Agent tier never reaches this code path.
+    const std::string tier_str = g_state.tier == wqn::AiTier::kStd ? "std" : "pro";
     const wqn::ThinkingLevel thinking_level = g_state.thinking_level;
     const std::string conversation_id = g_conversation_id;
     g_streaming_active = true;
@@ -1160,7 +1162,7 @@ void PrepareRecordingSession(uint32_t generation)
             // TLS handshake claims its share of the pool.
             req_id = GenerateRequestId();
             g_current_turn_req_id = req_id;
-            tier_str = (g_state.tier == wqn::AiTier::kPro) ? "pro" : "std";
+            tier_str = (g_state.tier == wqn::AiTier::kStd) ? "std" : "pro";
             conv_id = g_conversation_id;
             enable_thinking = (g_state.thinking_level != wqn::ThinkingLevel::kOff);
             switch (g_state.thinking_level) {

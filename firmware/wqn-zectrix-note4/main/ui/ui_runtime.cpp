@@ -777,7 +777,11 @@ UiUpdate UiRuntime::DispatchAgentSnapshot(const wqn::AgentSessionState& snapshot
         snapshot.ui.phase == wqn::AiFeaturePhase::kLoading &&
         snapshot.ui.status_label == "准备录音";
     RefreshSchedule refresh = RefreshSchedule::kNone;
-    if (state_.screen == wqn::UiScreen::kOpenCode && !defer_refresh_for_audio_init) {
+    // [agent] The Agent tier lives on the AI screen; kOpenCode is a reserved
+    // unreachable screen ID.
+    if (state_.screen == wqn::UiScreen::kAi &&
+        state_.ai.tier == wqn::AiTier::kAgent &&
+        !defer_refresh_for_audio_init) {
         refresh = snapshot.ui.phase == wqn::AiFeaturePhase::kComplete &&
                 previous_phase != wqn::AiFeaturePhase::kComplete
             ? RefreshSchedule::kCommit

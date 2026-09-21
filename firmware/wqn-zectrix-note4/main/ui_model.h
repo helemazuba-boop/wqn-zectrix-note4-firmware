@@ -32,6 +32,12 @@ enum class UiScreen : uint8_t {
     kWord = 5,
     kNote = 6,
     kProvisioning = 13,
+    // [agent] Reserved. The standalone OpenCode Agent page was demoted into
+    // the AI page as AiTier::kAgent, so this screen is no longer reachable
+    // from the page ring. The ID stays occupied for the same reason 7-12 do:
+    // a device that wakes from deep sleep with 14 in RTC memory must reject it
+    // (see IsRestorableScreen in ui_state.cpp) instead of rendering a page
+    // that no longer exists.
     kOpenCode = 14,
 };
 
@@ -66,15 +72,20 @@ enum class AiSessionStatus {
     kError,
 };
 
+// [agent] Tier 2 was Pro: a cloud-side model swap behind the exact same
+// endpoint, prompts and reasoning-effort mapping as STD, selected only by an
+// `X-WQN-Ai-Tier: pro` header no other client ever sends. It is deprecated and
+// replaced by Agent, the OpenCode gateway tier, where the model is chosen
+// server-side by the WQN binding. AiTier is never persisted (no NVS field and
+// SetAiTier has exactly one caller), so this is a pure in-memory rename.
 enum class AiTier : uint8_t {
     kFlash = 0,
     kStd = 1,
-    kPro = 2,
+    kAgent = 2,
     kCount = 3,
 };
 
 AiTier NextAiTier(AiTier current);
-AiTier PrevAiTier(AiTier current);
 const char* AiTierLabel(AiTier tier);
 
 // [shell] Thinking effort level shown as the status-bar lightbulb icon

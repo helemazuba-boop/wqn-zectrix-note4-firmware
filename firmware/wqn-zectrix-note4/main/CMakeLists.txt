@@ -38,7 +38,6 @@ idf_component_register(
         "ui/markdown_layout.cpp"
         "ui/markdown_render.cpp"
         "ui/page_ai.cpp"
-        "ui/page_agent.cpp"
         "ui/page_home.cpp"
         "ui/page_settings.cpp"
         "ui/page_time.cpp"

@@ -329,7 +329,6 @@ std::string FrameSignature(const wqn::UiFrame& frame)
     // the shared loop at the end of this function already covers.
     switch (frame.screen) {
         case wqn::UiScreen::kAi:
-        case wqn::UiScreen::kOpenCode:
         case wqn::UiScreen::kTodo:
         case wqn::UiScreen::kSettings:
         case wqn::UiScreen::kHome:
@@ -337,6 +336,9 @@ std::string FrameSignature(const wqn::UiFrame& frame)
         case wqn::UiScreen::kWord:
         case wqn::UiScreen::kNote:
         case wqn::UiScreen::kProvisioning:
+        case wqn::UiScreen::kOpenCode:
+            // [agent] kOpenCode is a reserved, unreachable ID (demoted into the
+            // AI page); listed only to keep the switch exhaustive.
             break;
     }
     std::string signature = std::to_string(static_cast<int>(frame.screen));
@@ -494,7 +496,11 @@ std::string FrameSignature(const wqn::UiFrame& frame)
         signature.push_back('/');
         signature.append(std::to_string(frame.ai_history_revision));
     }
-    if (frame.screen == wqn::UiScreen::kOpenCode) {
+    // [agent] The Agent tier renders on the AI screen, so its fields must
+    // contribute to the AI screen's signature or the dedup pipeline silently
+    // skips repaints of the picker, the pending bubble and the option bar.
+    if (frame.screen == wqn::UiScreen::kAi &&
+        frame.ai.tier == wqn::AiTier::kAgent) {
         const wqn::AgentSessionState& agent = frame.agent;
         signature.append("|agent:");
         signature.append(std::to_string(static_cast<int>(agent.ui.phase)));

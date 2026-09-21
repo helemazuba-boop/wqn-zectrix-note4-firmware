@@ -106,8 +106,10 @@ static void DrawExpandIcon(int x, int y, bool on, bool selected) {
     DrawStatusAsset(x, y, on ? a10_ai_detail_expand_on_16_asset : a11_ai_detail_expand_off_16_asset, selected);
 }
 
-// [tier-icon] Status-bar tier indicator (16px, display only - tier switch is
-// double-press Up/Down). Flash=lightning, STD=hourglass, Pro=brain.
+// [tier-icon] Status-bar tier indicator (16px, display only - the tier is
+// cycled from the status-bar edit mode). Flash=lightning, STD=hourglass,
+// Agent=brain (the retired Pro glyph, reused: the model behind the Agent tier
+// is chosen server-side by the WQN OpenCode binding, so it needs no new asset).
 static void DrawLightningIcon(int x, int y, bool selected) {
     DrawStatusAsset(x, y, a01_ai_tier_flash_16_asset, selected);
 }
@@ -136,12 +138,12 @@ void DrawAiStatusBar(const wqn::AiSessionState& ai, const wqn::HomeSummary& home
     // Status bar occupies y=0..27 with a bottom divider line.
     DrawHorizontalLine(0, kAiStatusBarH - 1, wqn::kEpdWidth);
     // Left: page title + tier chip.
-    // [tier-icon] Tier indicator + edit-mode button 0 (replaces "AI" + tier text):
-    // Flash=lightning, STD=hourglass, Pro=brain. confirm cycles tier (all tiers).
+    // [tier-icon] Tier indicator + edit-mode button 0: Flash=lightning,
+    // STD=hourglass, Agent=brain. confirm cycles tier (all tiers).
     const bool tier_sel = status_edit.active && status_edit.selected == 0;
     switch (ai.tier) {
         case wqn::AiTier::kFlash: DrawLightningIcon(6, kAiToggleY, tier_sel); break;
-        case wqn::AiTier::kPro:   DrawBrainIcon(6, kAiToggleY, tier_sel); break;
+        case wqn::AiTier::kAgent: DrawBrainIcon(6, kAiToggleY, tier_sel); break;
         case wqn::AiTier::kStd:
         default:                  DrawHourglassIcon(6, kAiToggleY, tier_sel); break;
     }

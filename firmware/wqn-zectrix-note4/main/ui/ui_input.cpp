@@ -619,13 +619,20 @@ RefreshSchedule ApplyButtonEvent(
     // [PTT-Filter-Fix] Filter out raw kPress/kRelease edge events for all UI
     // components except Confirm when it owns a PTT gesture. This prevents
     // double-firing / double-paging bugs while retaining low-latency audio.
+    // [agent] Agent PTT lives on the AI page as AiTier::kAgent. It keeps the
+    // same raw Press/Hold/Release gesture as Flash (hold to record, release to
+    // stop and transcribe) because the Agent tier must stop at
+    // kAwaitingConfirmation instead of submitting like the STD long-release
+    // path does. The two PTT guards are mutually exclusive by construction:
+    // only one tier can be selected at a time.
     const bool is_flash_ptt =
         state->screen == wqn::UiScreen::kAi &&
         event.button == wqn::ButtonId::kConfirm &&
         state->ai.tier == wqn::AiTier::kFlash;
     const bool is_agent_ptt =
-        state->screen == wqn::UiScreen::kOpenCode &&
-        event.button == wqn::ButtonId::kConfirm;
+        state->screen == wqn::UiScreen::kAi &&
+        event.button == wqn::ButtonId::kConfirm &&
+        state->ai.tier == wqn::AiTier::kAgent;
 
     if ((event.type == wqn::ButtonEventType::kPress ||
          event.type == wqn::ButtonEventType::kRelease ||
@@ -672,8 +679,10 @@ RefreshSchedule ApplyButtonEvent(
     }
 
     // button_input emits a derived click/long-release around the same physical
-    // hold. Swallow it so one PTT gesture cannot also lock/send/navigate.
-    if (state->screen == wqn::UiScreen::kOpenCode &&
+    // hold. Swallow it so one PTT gesture cannot also enter the status-bar edit
+    // mode or scroll. [agent] The Agent tier shares this guard with Flash; both
+    // own the same raw Hold/Release gesture.
+    if (state->screen == wqn::UiScreen::kAi &&
         event.button == wqn::ButtonId::kConfirm &&
         state->gestures.agent_ptt_started &&
         (event.type == wqn::ButtonEventType::kShortPress ||
@@ -817,104 +826,6 @@ RefreshSchedule ApplyButtonEvent(
         return RefreshSchedule::kNone;
     }
 
-    if (state->screen == wqn::UiScreen::kOpenCode) {
-        const bool short_press = event.type == wqn::ButtonEventType::kShortPress;
-        if (event.button == wqn::ButtonId::kConfirm &&
-            (long_press || long_release)) {
-            // PTT is handled by raw Hold/Release above. Never route its derived
-            // long event to the generic "back to home" action. On the session
-            // selection screen (not locked) a long confirm creates a fresh
-            // OpenCode session instead of being swallowed.
-            if (long_press && !state->agent.session_locked) {
-                (void)wqn::CreateNewOpenCodeSession();
-                wqn::AgentSessionState snapshot;
-                if (wqn::CopyOpenCodeSessionToUi(&snapshot)) {
-                    state->agent = std::move(snapshot);
-                }
-            }
-            return RefreshSchedule::kAi;
-        }
-        if (short_press && !state->agent.session_locked &&
-            (event.button == wqn::ButtonId::kUp ||
-             event.button == wqn::ButtonId::kDownPower)) {
-            const int direction = event.button == wqn::ButtonId::kUp ? -1 : 1;
-            (void)wqn::MoveOpenCodeSessionSelection(direction);
-            wqn::AgentSessionState snapshot;
-            if (wqn::CopyOpenCodeSessionToUi(&snapshot)) {
-                state->agent = std::move(snapshot);
-            }
-            return RefreshSchedule::kAi;
-        }
-        if (short_press && !state->agent.session_locked &&
-            event.button == wqn::ButtonId::kConfirm) {
-            (void)wqn::LockSelectedOpenCodeSession();
-            wqn::AgentSessionState snapshot;
-            if (wqn::CopyOpenCodeSessionToUi(&snapshot)) {
-                state->agent = std::move(snapshot);
-            }
-            return RefreshSchedule::kAi;
-        }
-        if (short_press && state->agent.ui.phase == wqn::AiFeaturePhase::kAwaitingConfirmation &&
-            (event.button == wqn::ButtonId::kUp ||
-             event.button == wqn::ButtonId::kDownPower)) {
-            if (event.button == wqn::ButtonId::kUp) {
-                (void)wqn::ConfirmOpenCodePrompt(event_time_ms);
-            } else {
-                wqn::CancelOpenCodePrompt();
-            }
-            wqn::AgentSessionState snapshot;
-            if (wqn::CopyOpenCodeSessionToUi(&snapshot)) {
-                state->agent = std::move(snapshot);
-            }
-            return RefreshSchedule::kAi;
-        }
-        if (short_press && state->agent.ui.phase == wqn::AiFeaturePhase::kAwaitingPermission &&
-            (event.button == wqn::ButtonId::kUp ||
-             event.button == wqn::ButtonId::kDownPower)) {
-            // While OpenCode waits on a permission ask, Up/Down approve or
-            // deny it from the device instead of scrolling the response.
-            (void)wqn::ReplyPendingOpenCodePermission(
-                event.button == wqn::ButtonId::kUp);
-            wqn::AgentSessionState snapshot;
-            if (wqn::CopyOpenCodeSessionToUi(&snapshot)) {
-                state->agent = std::move(snapshot);
-            }
-            return RefreshSchedule::kAi;
-        }
-        if (event.button == wqn::ButtonId::kConfirm &&
-            event.type == wqn::ButtonEventType::kDoublePress &&
-            !state->agent.current_session_id.empty() &&
-            (state->agent.ui.phase == wqn::AiFeaturePhase::kIdle ||
-             state->agent.ui.phase == wqn::AiFeaturePhase::kComplete)) {
-            // Double confirm re-attaches to the session's live event stream so
-            // a run that outlived the device connection stays observable.
-            (void)wqn::ObserveOpenCodeSession();
-            wqn::AgentSessionState snapshot;
-            if (wqn::CopyOpenCodeSessionToUi(&snapshot)) {
-                state->agent = std::move(snapshot);
-            }
-            return RefreshSchedule::kAi;
-        }
-        if (short_press && state->agent.session_locked &&
-            (event.button == wqn::ButtonId::kUp ||
-             event.button == wqn::ButtonId::kDownPower)) {
-            if (!wqn::AiFeaturePhaseIsBusy(state->agent.ui.phase) ||
-                state->agent.ui.phase == wqn::AiFeaturePhase::kRunning) {
-                wqn::ScrollOpenCodeResponse(
-                    event.button == wqn::ButtonId::kUp ? 1 : -1);
-                wqn::AgentSessionState snapshot;
-                if (wqn::CopyOpenCodeSessionToUi(&snapshot)) {
-                    state->agent = std::move(snapshot);
-                }
-                return RefreshSchedule::kAi;
-            }
-            return RefreshSchedule::kNone;
-        }
-        if (short_press && event.button == wqn::ButtonId::kConfirm) {
-            // A short Confirm is deliberately never an Agent send action.
-            return RefreshSchedule::kNone;
-        }
-    }
     if (long_release && event.button == wqn::ButtonId::kConfirm && state->screen == wqn::UiScreen::kAi) {
 #if CONFIG_WQN_AI_ENABLE
         // [ptt-fix] Flash tier uses the kRelease edge event for its stop hook
@@ -1109,14 +1020,10 @@ RefreshSchedule ApplyButtonEvent(
         state->gestures.flash_ptt_started = false;
         state->gestures.agent_ptt_started = false;
         state->gestures.last_ai_confirm_tap_ms = 0;
-        if (state->screen == wqn::UiScreen::kOpenCode &&
-            !state->agent.session_locked && state->agent.sessions.empty()) {
-            (void)wqn::RequestOpenCodeSessionList();
-            wqn::AgentSessionState snapshot;
-            if (wqn::CopyOpenCodeSessionToUi(&snapshot)) {
-                state->agent = std::move(snapshot);
-            }
-        } else if (state->screen == wqn::UiScreen::kTodo) {
+        // [agent] The OpenCode session list is no longer loaded on screen
+        // entry: the picker opens from the AI page's status-bar edit mode and
+        // that path issues the request itself.
+        if (state->screen == wqn::UiScreen::kTodo) {
             RefreshTodosFromCloud(state);
         } else if (state->screen == wqn::UiScreen::kWord && state->word_app.cloud_sync_requested) {
             wqn::services::RequestContentRefresh(

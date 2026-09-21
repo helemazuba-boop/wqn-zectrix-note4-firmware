@@ -128,6 +128,9 @@ const char* ScreenName(wqn::UiScreen screen)
         case wqn::UiScreen::kProvisioning:
             return "配网";
         case wqn::UiScreen::kOpenCode:
+            // [agent] Unreachable reserved ID (the page now lives on the AI
+            // screen as AiTier::kAgent). Kept so the default-less switch stays
+            // exhaustive.
             return "Agent";
     }
     return "WQN";
@@ -137,21 +140,22 @@ wqn::UiScreen PreviousTopScreen(wqn::UiScreen screen)
 {
     switch (screen) {
         case wqn::UiScreen::kAi:
-            return wqn::UiScreen::kTodo;
-        case wqn::UiScreen::kSettings:
-            return wqn::UiScreen::kOpenCode;
-        case wqn::UiScreen::kHome:
             return wqn::UiScreen::kSettings;
-        case wqn::UiScreen::kTime:
+        case wqn::UiScreen::kSettings:
             return wqn::UiScreen::kHome;
-        case wqn::UiScreen::kWord:
+        case wqn::UiScreen::kHome:
             return wqn::UiScreen::kTime;
-        case wqn::UiScreen::kNote:
+        case wqn::UiScreen::kTime:
             return wqn::UiScreen::kWord;
-        case wqn::UiScreen::kTodo:
+        case wqn::UiScreen::kWord:
             return wqn::UiScreen::kNote;
-        case wqn::UiScreen::kOpenCode:
+        case wqn::UiScreen::kNote:
+            return wqn::UiScreen::kTodo;
+        case wqn::UiScreen::kTodo:
             return wqn::UiScreen::kAi;
+        case wqn::UiScreen::kOpenCode:
+            // [agent] Reserved, unreachable. The ring is Ai -> Settings.
+            return wqn::UiScreen::kHome;
         case wqn::UiScreen::kProvisioning:
             return wqn::UiScreen::kHome;
     }
@@ -162,8 +166,6 @@ wqn::UiScreen NextTopScreen(wqn::UiScreen screen)
 {
     switch (screen) {
         case wqn::UiScreen::kAi:
-            return wqn::UiScreen::kOpenCode;
-        case wqn::UiScreen::kOpenCode:
             return wqn::UiScreen::kSettings;
         case wqn::UiScreen::kSettings:
             return wqn::UiScreen::kHome;
@@ -177,6 +179,9 @@ wqn::UiScreen NextTopScreen(wqn::UiScreen screen)
             return wqn::UiScreen::kTodo;
         case wqn::UiScreen::kTodo:
             return wqn::UiScreen::kAi;
+        case wqn::UiScreen::kOpenCode:
+            // [agent] Reserved, unreachable. The ring is Ai -> Settings.
+            return wqn::UiScreen::kHome;
         case wqn::UiScreen::kProvisioning:
             return wqn::UiScreen::kHome;
     }
@@ -692,9 +697,14 @@ UiFrame RenderUiFrame(const UiState& state)
     frame.ai = state.ai;
     frame.agent = state.agent;
     if (state.screen == UiScreen::kAi) {
-        const AiHistoryChannel channel = state.ai.tier == AiTier::kFlash
-            ? AiHistoryChannel::kFlash
-            : AiHistoryChannel::kStdPro;
+        // [agent] Explicit channel selection: a background Agent stream must
+        // never write into the history of whichever tier happens to be visible.
+        AiHistoryChannel channel = AiHistoryChannel::kStdPro;
+        if (state.ai.tier == AiTier::kFlash) {
+            channel = AiHistoryChannel::kFlash;
+        } else if (state.ai.tier == AiTier::kAgent) {
+            channel = AiHistoryChannel::kAgent;
+        }
         frame.ai_history = GetAiHistorySnapshot(channel);
         if (frame.ai_history) {
             frame.ai_history_revision = frame.ai_history->revision;
@@ -741,6 +751,7 @@ UiFrame RenderUiFrame(const UiState& state)
             // Handled by the provisioning early-return above; unreachable here.
             break;
         case UiScreen::kOpenCode:
+            // [agent] Reserved, unreachable (demoted into the AI page).
             break;
     }
 
@@ -756,12 +767,6 @@ AiTier NextAiTier(AiTier current)
     return static_cast<AiTier>((static_cast<uint8_t>(current) + 1) % static_cast<uint8_t>(AiTier::kCount));
 }
 
-AiTier PrevAiTier(AiTier current)
-{
-    const uint8_t val = static_cast<uint8_t>(current);
-    return static_cast<AiTier>((val + static_cast<uint8_t>(AiTier::kCount) - 1) % static_cast<uint8_t>(AiTier::kCount));
-}
-
 const char* AiTierLabel(AiTier tier)
 {
     switch (tier) {
@@ -769,8 +774,8 @@ const char* AiTierLabel(AiTier tier)
             return "Flash";
         case AiTier::kStd:
             return "STD";
-        case AiTier::kPro:
-            return "Pro";
+        case AiTier::kAgent:
+            return "Agent";
         default:
             return "???";
     }
