@@ -98,6 +98,10 @@ Load-bearing flags: `CONFIG_WQN_WIFI_STA_ENABLE` (default n),
 `CONFIG_WQN_PROVISION_ENABLE` (SoftAP `ZECTRIX_XXXX` at `192.168.4.1`),
 `CONFIG_WQN_EPD_UI_ENABLE` (default n), `CONFIG_WQN_EPD_LOCAL_PARTIAL_ENABLE`
 (`0x83` local partial), `CONFIG_WQN_DEEP_SLEEP_ENABLE`, `CONFIG_WQN_AI_ENABLE`,
+`CONFIG_WQN_AGENT_ENABLE` (the AI page's Agent tier — the OpenCode gateway;
+default y, depends on `CONFIG_WQN_AI_ENABLE`; when off the two OpenCode
+translation units compile to refusing stubs and `NextAiTier` drops `kAgent`
+from the tier ring, so the tier is unreachable rather than present and broken),
 `CONFIG_WQN_AI_AUDIO_SELFTEST_ENABLE`, `CONFIG_WQN_EPD_IDLE_POWER_OFF_MS` (rail off), `CONFIG_WQN_EPD_IDLE_CLEANUP_MS`
 (heavy-partial cleanup full refresh, default 45 s, deliberately later than the
 rail cut so a short pause does not flash the panel; 0 re-attaches it to the
@@ -105,6 +109,12 @@ power-off point),
 `CONFIG_WQN_DEV_MENU_ENABLE` (default n; one settings row opening a
 second-level read-only dev list, structure fixed by `DEV_DIAGNOSTICS.md`;
 `wqn::RecordError` capture is always compiled regardless of this flag).
+
+> A **new** Kconfig symbol does not reach `sdkconfig.h` until a reconfigure.
+> IDF does not define a disabled bool symbol at all, so
+> `#if CONFIG_WQN_AGENT_ENABLE` silently evaluates to 0 while the symbol is
+> absent — the same property `CONFIG_WQN_AI_ENABLE` has always had. A build that
+> unexpectedly excludes a feature means the reconfigure did not happen.
 
 ### Tests
 
@@ -327,6 +337,18 @@ generation, valid id) — never replay a corrupt marker as a real change.
   sleep, `SecondsUntilNextSyncWake()` contributes the earliest sync deadline
   to wake-source assembly. Consumers get fixed-size `SyncEvent` values or an
   immutable `SyncSnapshot`; snapshot reads must not fall through to NVS.
+- **Agent gateway** (`opencode_session.cpp`): one static worker task
+  (`wqn_agent`) owns the whole `/api/esp32/agent/*` conversation — session list,
+  create, ASR, run, observe — behind a single mutex-guarded
+  `AgentSessionState`. The UI never calls the HTTP layer; it posts a command
+  through the enum and reads `CopyOpenCodeSessionToUi` afterwards. Because a run
+  and an observe share that one task, they are mutually exclusive by
+  construction: never add a second agent task or a second long-lived TLS
+  session. Permission replies are POSTed *from the worker, between stream
+  reads*, and a failed reply restores the pending ask rather than assuming it
+  was answered. The UI state is only ever a post-request snapshot, so
+  `SyncAgentSnapshot` follows every accepted action. Contract:
+  `contracts/agent-gateway-v0/`.
 - **Refresh terminal results**: every accepted display revision ends in exactly
   one `Presented` / `Superseded` / `Failed`. One reset/re-init/full retry is
   allowed; cold/untrusted wake and every Nth partial force a full refresh.
@@ -392,6 +414,10 @@ git -c core.whitespace=cr-at-eol diff --check   # clean (CRLF-aware; see §7)
 - **`// [power-fix]`, `// [sleep-race]`, `// [epd-owner]`, `// [persist-worker]`,
   `// [deck-scope]` comments** encode the measured "why" behind a hotspot.
   Preserve them; match the tag when extending the same fix.
+- **`// [agent]`** marks the Agent-tier (OpenCode gateway) reasoning that a
+  later reader would otherwise undo: the per-tier history channel, the
+  backend-owned scroll offset, the modal input priority over PTT, and why a
+  permission ask is not mirrored into history.
 - **`device_ui.cpp` is large and being split into `ui/`.** Prefer a new
   `ui/page_*` / sub-module over growing it inline. `ui_layout.h` tokens replace
   magic numbers.

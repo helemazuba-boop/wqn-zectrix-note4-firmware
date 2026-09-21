@@ -49,9 +49,39 @@ Features also remain in `main` until their interfaces are equally stable.
 | I2S, ES8311 and amplifier GPIO | `AudioService` | fixed command/result interfaces |
 | Application state and page transitions | `UiRuntime` | fixed-size events, reducer and effects |
 | v3 claim/bootstrap/sync lifecycle | `SyncService` | explicit reasons, RTC-retained schedule/retry, outbox triggers, immutable snapshot and domain events |
+| OpenCode gateway session, stream and history mirror | `opencode_session` worker (`wqn_agent`) | one mutex-guarded `AgentSessionState`, `CopyOpenCodeSessionToUi`, worker command enum |
 
 `platform_note4` may drive rails low before services start. This is a
 bootstrap-only safety exception; after bring-up it does not run again.
+
+### Agent tier
+
+The AI page hosts three tiers behind one `AiTier` (`kFlash`, `kStd`, `kAgent`);
+`AiTier` is never persisted, so the tier ring is pure in-memory state.
+`kAgent` replaced the retired **Pro** tier, which was only an
+`X-WQN-Ai-Tier: pro` header over the STD endpoint and is gone.
+
+Agent is the only tier whose backend is not the device's own cloud route
+family. `opencode_session.cpp` owns a single static worker task that talks to
+`/api/esp32/agent/*` (see `contracts/agent-gateway-v0/`), which proxies a
+self-hosted OpenCode server bound to the user's account. Consequences that the
+rest of the firmware must respect:
+
+- **One stream at a time, per worker.** A run and an observe share the same
+  task, so the UI never issues both. Permission replies are POSTed from that
+  worker between stream reads — never from a second task or a second long-lived
+  TLS session.
+- **Each tier owns its own `AiHistory` channel** (`kStdPro`, `kFlash`,
+  `kAgent`). The channel is passed explicitly at every call site; it is never
+  inferred from the currently visible tier, so a late background stream cannot
+  write into whichever tier the user happens to be looking at.
+- **The scroll offset is backend-owned.** The live stream advances it, so the
+  UI calls `ScrollOpenCodeResponse` instead of writing the offset the way the
+  STD/Pro path writes `AiSessionState::scroll_offset_lines`.
+- **`CONFIG_WQN_AGENT_ENABLE` gates the whole tier.** When off, the two
+  OpenCode translation units compile to refusing stubs and `NextAiTier` drops
+  `kAgent` from the ring, so the tier is unreachable rather than present and
+  broken.
 
 Storage media are deliberately tiered. NVS is reserved for bounded control
 state such as identity, Wi-Fi, schema markers, revisions, cursors and settings.

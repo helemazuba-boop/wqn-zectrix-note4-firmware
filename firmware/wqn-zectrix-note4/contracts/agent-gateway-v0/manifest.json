@@ -1,0 +1,20 @@
+{
+  "contract": "agent-gateway-v0",
+  "schema": "agent-gateway-v0.schema.json",
+  "schema_sha256": "45c8ffc1eb53af3ebae9d4b4ce612e721b588064af243b15900f6971d8830852",
+  "api_base": "https://wqn.helema.cn/api/esp32",
+  "routes_prefix": "/agent",
+  "auth": "Authorization: Bearer <device pairing token>",
+  "stream_events": [
+    "agent.accepted",
+    "agent.attached",
+    "agent.status",
+    "agent.text.delta",
+    "agent.text",
+    "agent.tool",
+    "agent.permission",
+    "agent.error"
+  ],
+  "stream_terminator": "agent.status { status: \"idle\" }",
+  "replaces": "X-WQN-Ai-Tier: pro (retired Pro tier)"
+}
