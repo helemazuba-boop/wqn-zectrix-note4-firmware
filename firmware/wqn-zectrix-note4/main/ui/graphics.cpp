@@ -37,6 +37,28 @@ void DrawRect(int x, int y, int width, int height)
     DrawVerticalLine(x + width - 1, y, height);
 }
 
+// [agent] Dashed outline. The Agent tier's pending bubble is drawn dashed to
+// say "this is not committed yet": the voice transcript and the permission ask
+// both sit in history only after the user acts on them, so they must not read
+// as settled chat entries. Same dash/gap cadence as DrawDashedVerticalLine so
+// the two dashed languages stay consistent.
+void DrawDashedRect(int x, int y, int width, int height)
+{
+    if (width <= 0 || height <= 0) {
+        return;
+    }
+    constexpr int kDash = 6;
+    constexpr int kGap = 5;
+    for (int xx = 0; xx < width; xx += kDash + kGap) {
+        DrawHorizontalLine(x + xx, y, std::min(kDash, width - xx));
+        DrawHorizontalLine(x + xx, y + height - 1, std::min(kDash, width - xx));
+    }
+    for (int yy = 0; yy < height; yy += kDash + kGap) {
+        DrawVerticalLine(x, y + yy, std::min(kDash, height - yy));
+        DrawVerticalLine(x + width - 1, y + yy, std::min(kDash, height - yy));
+    }
+}
+
 void FillRect(int x, int y, int width, int height, bool black)
 {
     for (int yy = 0; yy < height; ++yy) {

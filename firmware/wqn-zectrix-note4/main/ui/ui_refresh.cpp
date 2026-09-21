@@ -519,6 +519,14 @@ std::string FrameSignature(const wqn::UiFrame& frame)
         signature.push_back('/');
         signature.append(agent.ui.requires_confirmation ? "1" : "0");
         signature.push_back('/');
+        // The permission ask drives a different option bar than the transcript
+        // confirmation, so its identity (not just its phase) must reach the
+        // signature or the bar keeps the previous mode's labels.
+        signature.append(agent.pending_permission_id);
+        signature.push_back('/');
+        // Option-bar focus: without it the ▣ marker never moves.
+        signature.append(std::to_string(frame.agent_option.focused));
+        signature.push_back('/');
         signature.append(std::to_string(agent.confirmation_armed_at_ms));
         signature.push_back('/');
         signature.append(agent.session_locked ? "1" : "0");

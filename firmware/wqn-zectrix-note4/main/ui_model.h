@@ -413,6 +413,15 @@ struct StatusBarEditState {
                                 // confirm within kStatusBarEditDblMs = save & exit
 };
 
+// [agent] Focus inside the Agent tier's bottom option bar (the two-choice
+// pending states: 发送/重新输入 and 同意/拒绝). 0 = first slot, 1 = second.
+// Purely UI-owned -- the OpenCode session layer never sees it -- and reset by
+// the input path whenever the pending state changes, so the focus can never
+// point at a slot that no longer exists.
+struct AgentOptionState {
+    uint8_t focused = 0;
+};
+
 // Reducer-owned gesture memory. Keeping these values inside AppState removes
 // hidden file-static history from button reduction, so replaying the same
 // timestamped input sequence starts from and produces the same state.
@@ -432,6 +441,7 @@ struct AppState {
     UiScreen screen = UiScreen::kHome;
     StatusBarEditState status_edit;
     UiGestureState gestures;
+    AgentOptionState agent_option;  // [agent] option-bar focus
     size_t selected_home_task = 0;
     UiRuntimeStatus status;
     AiSessionState ai;
@@ -459,6 +469,7 @@ struct UiFrame {
     bool paired = false;
     std::string claim_code;
     StatusBarEditState status_edit;  // [shell] status-bar edit mode for render
+    AgentOptionState agent_option;   // [agent] option-bar focus for render
     HomeSummary home;
     AiSessionState ai;
     AgentSessionState agent;

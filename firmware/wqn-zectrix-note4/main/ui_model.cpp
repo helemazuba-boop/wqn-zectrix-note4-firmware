@@ -711,6 +711,7 @@ UiFrame RenderUiFrame(const UiState& state)
         }
     }
     frame.status_edit = state.status_edit;  // [shell] status-bar edit mode
+    frame.agent_option = state.agent_option;  // [agent] option-bar focus
     frame.todo = state.todo;
     frame.word_app = BuildWordAppSnapshot(state.word_app);
     frame.settings = state.settings;

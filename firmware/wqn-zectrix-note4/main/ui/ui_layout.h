@@ -8,6 +8,7 @@
 #pragma once
 
 #include "display_service.h"  // wqn::kEpdWidth / kEpdHeight
+#include "typography.h"       // kCjkLineHeight
 
 namespace device_ui_internal {
 
@@ -41,6 +42,44 @@ constexpr int kBottomHintY = 278;               // 底部提示/脚注行 y
 // ---- 组件间距 (gutter) ----
 constexpr int kGutterCard = 12;                 // 卡片垂直间距
 constexpr int kGutterRow = 8;                   // 列表行垂直间距
+
+// ---- AI page ---------------------------------------------------------------
+// [agent] Shared by page_ai.cpp (STD/Pro + Flash tiers) and page_ai_agent.cpp
+// (Agent tier): the Agent tier renders through the same viewport, so the two
+// files MUST agree on where the status bar ends and where the bottom band
+// begins. Duplicating them locally would let one file drift from the other.
+
+constexpr int kAiStatusBarY = 0;
+constexpr int kAiStatusBarH = kStatusBarHeight;  // 28, divider on kStatusBarDividerY
+constexpr int kAiViewportY = kAiStatusBarY + kAiStatusBarH;  // 27
+constexpr int kAiViewportH = kScreenHeight - kAiViewportY;   // 273
+constexpr int kAiLineH = kCjkLineHeight;                     // 18
+constexpr int kAiLineGap = 4;
+constexpr int kAiAssistantLeftBorder = 4;
+constexpr int kAiHistoryLeftPad = kMarginDense;                        // 6
+constexpr int kAiHistoryRightPad = kMarginDense;                       // 6
+constexpr int kAiHistoryRightEdge = kScreenWidth - kAiHistoryRightPad;  // 394
+constexpr int kAiHistoryUsableW = kAiHistoryRightEdge - kAiHistoryLeftPad;  // 388
+constexpr int kAiUserPillMaxW = kAiHistoryUsableW * 78 / 100;              // ~302
+constexpr int kAiAssistantW = kAiHistoryUsableW;
+constexpr int kAiRowTopPad = 2;
+// [scroll-fix] Reserve 22 px at the bottom of the viewport for the ▼ scroll
+// indicator + breathing room so the latest message never overlaps it. The
+// Agent tier's option bar lives in exactly this band.
+constexpr int kAiViewportBottomPad = 22;
+// [toggle-cluster] Status-bar toggle cluster geometry. tier occupies x=6..22
+// (16px); the cluster starts at kAiToggleX and each icon is kAiToggleStep apart
+// (18 = 16px icon + 2px gap). Applies to every tier -- STD/Pro uses the slots
+// for thinking/TTS/expand/trash, Agent for session/turn-up/turn-down/trash.
+constexpr int kAiToggleX = 30;
+constexpr int kAiToggleY = 5;
+constexpr int kAiToggleStep = 18;
+constexpr int kAiToggleZonePad = 2;   // pad around the cluster for the edit-mode rect
+// Slots in the edit-mode toggle list, index 0 = tier icon. Both tiers fill all
+// four remaining slots, so the cluster width is tier-independent.
+constexpr int kAiToggleSlotCount = 5;
+constexpr int kAiToggleZoneW =
+    kAiToggleStep * (kAiToggleSlotCount - 1) + 16 + 2 * kAiToggleZonePad;
 
 // ---- Selection style (focus decoration, not interaction timing) ----
 //

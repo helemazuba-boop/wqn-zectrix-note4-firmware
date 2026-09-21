@@ -574,6 +574,10 @@ std::string TwoDigit(int value);
 void DrawHorizontalLine(int x, int y, int width);
 void DrawVerticalLine(int x, int y, int height);
 void DrawRect(int x, int y, int width, int height);
+// [agent] Dashed outline for the Agent tier's pending bubble (uncommitted
+// transcript / permission ask). Same dash/gap cadence as
+// DrawDashedVerticalLine.
+void DrawDashedRect(int x, int y, int width, int height);
 void DrawRoundedRect(int x, int y, int width, int height, int radius);
 // [rowfill] Filled rounded rect: the density-list row selection block and the
 // rounded reverse-fill action block (SelectionStyle::kRowFill / kInvert).
@@ -647,6 +651,54 @@ void GetAiScrollBounds(
     bool expand_content,
     int32_t* out_min_scroll,
     int32_t* out_max_scroll);
+
+// [agent] Single source of truth for the AI history's vertical geometry
+// (page_ai.cpp). The turn-jump helper reuses it so the jump target and the
+// scroll clamp can never disagree about where a block sits.
+struct AiHistoryLayout {
+    std::vector<int> heights;       // chronological, per message
+    std::vector<int> virtual_tops;  // chronological, includes kAiLineGap
+    int total_content_h = 0;
+    int anchor_top = 0;  // virtual top of the newest user message (0 if none)
+};
+AiHistoryLayout ComputeAiHistoryLayout(
+    const std::vector<wqn::ChatMessageSnapshot>& messages, bool expand_content);
+// Scroll offset that brings the previous/next answer to the top of the
+// viewport. `direction` < 0 = older, > 0 = newer. Returns false when there is
+// no answer in that direction, so the caller can show the "已最新" style hint
+// instead of moving.
+bool GetAiTurnJumpOffsetLines(
+    std::shared_ptr<const wqn::AiHistorySnapshot> snapshot,
+    bool expand_content,
+    int32_t current_scroll,
+    int direction,
+    int32_t* out_scroll);
+
+// [agent] The Agent tier is rendered by the AI page; this is its branch.
+esp_err_t RenderAgentAiToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule);
+// Shared chat-viewport draw (page_ai.cpp). The Agent tier renders its own
+// status bar and bottom band but reuses this verbatim, so the two tiers can
+// never disagree about how a bubble or a tool block looks.
+void RenderAiHistoryViewport(const wqn::AiSessionState& ai,
+                             const std::shared_ptr<const wqn::AiHistorySnapshot>& snapshot,
+                             int32_t scroll_offset_lines);
+// Option-bar slots for the Agent tier's two-choice states. The order is the
+// ↑/↓ cycle order and the confirm action runs the focused slot.
+enum class AgentOption : uint8_t {
+    kSend,
+    kReinput,
+    kApprove,
+    kDeny,
+    kCount,
+};
+// Which two-choice state the option bar currently shows, if any.
+enum class AgentOptionMode : uint8_t {
+    kNone,
+    kConfirmSend,   // voice transcript armed: 发送 / 重新输入
+    kPermission,    // gateway ask pending: 同意 / 拒绝
+};
+AgentOptionMode AgentOptionModeFor(const wqn::AgentSessionState& agent);
+const char* AgentOptionLabel(AgentOption option);
 
 // ---- Word page --------------------------------------------------------------
 
