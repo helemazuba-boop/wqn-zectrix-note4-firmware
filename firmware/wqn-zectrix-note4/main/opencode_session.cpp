@@ -1018,15 +1018,36 @@ void CancelOpenCodePrompt()
     xSemaphoreGive(g_lock);
 }
 
-void ScrollOpenCodeResponse(int direction)
+// [scroll-clamp] The offset lives in the AI page viewport's coordinate space,
+// where 0 is the anchor (newest question at the top) and NEGATIVE values scroll
+// further down to the tail of the newest reply. Only the renderer knows how tall
+// the history is, so the backend cannot clamp this itself: the caller passes the
+// bounds it already computed for the STD/Pro path (GetAiScrollBounds) and both
+// tiers share one clamp.
+//
+// The old `std::max<int32_t>(0, next)` was correct for the retired standalone
+// page, which measured the offset as "distance from latest" and therefore
+// wanted a floor of 0. On the AI page that same floor made the bottom of the
+// newest reply unreachable, which read as "cannot scroll to the very bottom".
+void ScrollOpenCodeResponse(int direction, int32_t min_scroll, int32_t max_scroll)
 {
     if (g_lock == nullptr || direction == 0) {
         return;
     }
     xSemaphoreTake(g_lock, portMAX_DELAY);
-    const int32_t next = g_state.ui.scroll_offset_lines + direction * 4;
-    g_state.ui.scroll_offset_lines = std::max<int32_t>(0, next);
-    MarkChangedLocked();
+    int32_t next = g_state.ui.scroll_offset_lines + direction * 4;
+    if (next < min_scroll) {
+        next = min_scroll;
+    }
+    if (next > max_scroll) {
+        next = max_scroll;
+    }
+    // Only mark changed when the offset actually moved: a no-op press at either
+    // bound must not cost an EPD refresh.
+    if (next != g_state.ui.scroll_offset_lines) {
+        g_state.ui.scroll_offset_lines = next;
+        MarkChangedLocked();
+    }
     xSemaphoreGive(g_lock);
 }
 
@@ -1079,7 +1100,7 @@ esp_err_t StartOpenCodeVoiceInput() { return ESP_ERR_NOT_SUPPORTED; }
 esp_err_t StopOpenCodeVoiceInput() { return ESP_ERR_NOT_SUPPORTED; }
 esp_err_t ConfirmOpenCodePrompt(int64_t) { return ESP_ERR_NOT_SUPPORTED; }
 void CancelOpenCodePrompt() {}
-void ScrollOpenCodeResponse(int) {}
+void ScrollOpenCodeResponse(int, int32_t, int32_t) {}
 bool CopyOpenCodeSessionToUi(AgentSessionState*) { return false; }
 bool IsOpenCodeSessionActive() { return false; }
 

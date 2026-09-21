@@ -1149,11 +1149,27 @@ RefreshSchedule ApplyButtonEvent(
         // Up = older content above; the sign matches ScrollOpenCodeResponse's
         // own convention (positive = older).
         const int direction = (event.button == wqn::ButtonId::kUp) ? 1 : -1;
-        wqn::ScrollOpenCodeResponse(direction);
+        // [scroll-clamp] Same bounds pass as the STD/Pro branch below, and for
+        // the same reason: the clamp MUST come from the layout that is actually
+        // drawn or the viewport desyncs from its own bounds. It matters more
+        // here -- min_scroll is NEGATIVE whenever the newest exchange is taller
+        // than the viewport, and a floor of 0 makes the tail of the newest reply
+        // permanently unreachable. The backend used to clamp at exactly 0.
+        const auto snapshot = wqn::GetAiHistorySnapshot(wqn::AiHistoryChannel::kAgent);
+        if (snapshot == nullptr || snapshot->messages.empty()) {
+            return RefreshSchedule::kNone;  // nothing laid out, nothing to clamp
+        }
+        int32_t min_scroll = 0;
+        int32_t max_scroll = 0;
+        device_ui_internal::GetAiScrollBounds(
+            snapshot, state->ai.expand_content, &min_scroll, &max_scroll);
+        wqn::ScrollOpenCodeResponse(direction, min_scroll, max_scroll);
         SyncAgentSnapshot(state);
-        ESP_LOGI(kTag, "Agent scroll: %s -> offset=%ld",
+        ESP_LOGI(kTag, "Agent scroll: %s -> offset=%ld bounds=[%ld,%ld]",
                  direction > 0 ? "older" : "newer",
-                 static_cast<long>(state->agent.ui.scroll_offset_lines));
+                 static_cast<long>(state->agent.ui.scroll_offset_lines),
+                 static_cast<long>(min_scroll),
+                 static_cast<long>(max_scroll));
         return RefreshSchedule::kAi;
     }
 
