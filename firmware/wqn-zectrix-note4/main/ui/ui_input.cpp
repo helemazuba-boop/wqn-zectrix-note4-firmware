@@ -690,13 +690,16 @@ static RefreshSchedule ApplyAgentPickerEvent(
     return RefreshSchedule::kNone;
 }
 
-// Returns kHandled only when a modal Agent surface consumed the event.
+// Returns kHandled only when a modal Agent surface consumed the event, and
+// reports what that surface actually did through `out_schedule` -- an event the
+// surface swallowed without changing anything must not cost a refresh.
 enum class AgentInputResult : uint8_t { kFallThrough, kHandled };
 
 static AgentInputResult TryApplyAgentAiButtonEvent(
     const wqn::ButtonEvent& event,
     int64_t event_time_ms,
-    wqn::UiState* state)
+    wqn::UiState* state,
+    RefreshSchedule* out_schedule)
 {
     if (state->screen != wqn::UiScreen::kAi ||
         state->ai.tier != wqn::AiTier::kAgent) {
@@ -705,11 +708,11 @@ static AgentInputResult TryApplyAgentAiButtonEvent(
     const device_ui_internal::AgentOptionMode mode =
         device_ui_internal::AgentOptionModeFor(state->agent);
     if (mode != device_ui_internal::AgentOptionMode::kNone) {
-        ApplyAgentOptionBarEvent(event, event_time_ms, state, mode);
+        *out_schedule = ApplyAgentOptionBarEvent(event, event_time_ms, state, mode);
         return AgentInputResult::kHandled;
     }
     if (!state->agent.session_locked) {
-        ApplyAgentPickerEvent(event, event_time_ms, state);
+        *out_schedule = ApplyAgentPickerEvent(event, event_time_ms, state);
         return AgentInputResult::kHandled;
     }
     return AgentInputResult::kFallThrough;
@@ -872,10 +875,13 @@ RefreshSchedule ApplyButtonEvent(
     // [agent] Modal Agent surfaces take priority over everything below: the
     // option bar (dashed pending bubble) and the session picker both answer the
     // confirm key with a decision, and neither may be interrupted by a PTT hold
-    // or a scroll event.
-    if (TryApplyAgentAiButtonEvent(event, event_time_ms, state) ==
+    // or a scroll event. The sub-handlers' own schedule is returned verbatim so
+    // a swallowed edge (kPress/kRelease while the bar is up) costs no EPD
+    // refresh.
+    RefreshSchedule agent_schedule = RefreshSchedule::kNone;
+    if (TryApplyAgentAiButtonEvent(event, event_time_ms, state, &agent_schedule) ==
         AgentInputResult::kHandled) {
-        return RefreshSchedule::kAi;
+        return agent_schedule;
     }
 
     const size_t old_page = state->ai.page;
