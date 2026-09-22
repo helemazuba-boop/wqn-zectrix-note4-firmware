@@ -96,7 +96,12 @@ if not exist "%BUILD_UNC%\CMakeCache.txt" (
 )
 
 
-wsl -d %WSL_DISTRO% -- bash -c "cd %WSL_FW_DIR% && . %WSL_IDF_EXPORT% && idf.py --no-ccache -B %BUILD_DIR% build"
+:: Build through the release tooling, exactly as the root deploy.bat does.
+:: A bare `idf.py build` does not reconfigure cmake, so PROJECT_VER keeps
+:: whatever was configured last: the firmware gets current code under a version
+:: stamp describing different sources, and nothing downstream can tell.
+:: release.py also records the source diff under dist/.
+wsl -d %WSL_DISTRO% -- bash -c "cd %WSL_FW_DIR% && . %WSL_IDF_EXPORT% && python3 tools/release/release.py build --build-dir %BUILD_DIR%"
 
 if errorlevel 1 (
     echo   ERROR: WSL build failed^!
@@ -117,6 +122,30 @@ echo   Done.
 
 
 :build_done
+
+
+:: ============================================================
+:: Step 1b
+:: Refuse to flash an artifact whose version stamp does not
+:: describe it. Reads the artifacts themselves, so it holds
+:: whichever build path produced them. After :build_done so it
+:: also covers SKIP_BUILD=1.
+:: ============================================================
+
+echo.
+
+echo [Step 1b] Verifying build artifacts against their baked version...
+
+wsl -d %WSL_DISTRO% -- bash -c "cd %WSL_FW_DIR% && . %WSL_IDF_EXPORT% && python3 tools/release/release.py verify-build --build-dir %BUILD_DIR%"
+
+if errorlevel 1 (
+    echo   ERROR: build artifacts failed verification -- refusing to flash^!
+    echo          Re-run without SKIP_BUILD so the release tooling rebuilds them.
+    pause
+    exit /b 1
+)
+
+echo   Done.
 
 
 :: ============================================================
@@ -176,9 +205,16 @@ popd
 
 if not "%FLASH_RC%"=="0" (
     echo   ERROR: Flash failed ^(esptool exit %FLASH_RC%^)^!
+    wsl -d %WSL_DISTRO% -- bash -c "cd %WSL_FW_DIR% && python3 tools/release/release.py record-flash --build-dir %BUILD_DIR% --port %COM_PORT% --status failed"
     pause
     exit /b 1
 )
+
+
+:: Append to dist/flash-history.jsonl so we can always answer "which source is on
+:: this device right now". This path recorded nothing at all, which is how a
+:: stale-stamped flash went unnoticed.
+wsl -d %WSL_DISTRO% -- bash -c "cd %WSL_FW_DIR% && python3 tools/release/release.py record-flash --build-dir %BUILD_DIR% --port %COM_PORT% --status ok"
 
 
 echo   Done.

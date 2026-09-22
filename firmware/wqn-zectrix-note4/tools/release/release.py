@@ -302,6 +302,88 @@ def cmd_record_flash(args: argparse.Namespace) -> int:
 
 
 # --------------------------------------------------------------------------
+# verify-build
+# --------------------------------------------------------------------------
+
+
+def cmd_verify_build(args: argparse.Namespace) -> int:
+    """Refuse a build dir whose artifacts do not match the version baked into them.
+
+    PROJECT_VER lives in the cmake cache and only changes when cmake
+    reconfigures, and only `release.py build` reconfigures on purpose. A plain
+    `idf.py build` therefore relinks new code under the previous version: the
+    firmware is current but reports a version describing different sources, and
+    nothing downstream can tell. Check the app image against the record written
+    for its own baked version, so the answer does not depend on who ran the
+    build or on what the tree looks like now.
+    """
+    build_dir = resolve_build_dir(args.build_dir)
+    cache = build_dir / "CMakeCache.txt"
+    if not cache.is_file():
+        raise SystemExit(f"{cache} not found; build the firmware first")
+    baked = ""
+    for line in cache.read_text(encoding="utf-8", errors="replace").splitlines():
+        if line.startswith("PROJECT_VER:"):
+            baked = line.split("=", 1)[1].strip()
+            break
+    if not baked:
+        raise SystemExit(f"No PROJECT_VER in {cache}; {args.build_dir} was never configured")
+
+    hint = f"python3 tools/release/release.py build --build-dir {args.build_dir}"
+    record_dir = release_dir(baked)
+    identity = load_json(record_dir / "identity.json")
+    if identity is None:
+        raise SystemExit(
+            f"{args.build_dir} is stamped {baked}, but {record_dir} holds no build record.\n"
+            f"  That stamp did not come from the release tooling: a bare `idf.py build`\n"
+            f"  keeps whatever cmake configured last.\n"
+            f"  Re-run: {hint}"
+        )
+
+    actual_app = (app_artifact(args.build_dir) or {}).get("sha256")
+    if not actual_app:
+        raise SystemExit(f"Cannot read the app image under {build_dir}; nothing to verify")
+    recorded_app = (identity.get("app") or {}).get("sha256")
+    if recorded_app and recorded_app != actual_app:
+        raise SystemExit(
+            f"{args.build_dir} is stamped {baked}, but its app image is not the one\n"
+            f"  recorded for that version ({recorded_app[:12]} != {actual_app[:12]}).\n"
+            f"  The sources changed after the last release build, so this image would\n"
+            f"  report a version describing different code.\n"
+            f"  Re-run: {hint}"
+        )
+
+    print(
+        f"Verified: {args.build_dir} app matches the record for {baked} "
+        f"[{identity.get('base_commit_short', '?')}, "
+        f"{'dirty' if identity.get('dirty') else 'clean'}, app {actual_app[:12]}]",
+        file=sys.stderr,
+    )
+    # A mismatch here only means the tree moved on after this image was built.
+    # That is expected when re-flashing recorded artifacts with SKIP_BUILD=1, so
+    # it warns instead of failing; the check above is the one that must hold.
+    # List what changed: a pure tooling edit (deploy.bat) trips this too, and a
+    # warning that cannot say "it is only the .bat" gets ignored.
+    manifest = V.source_manifest()
+    fp = V.fingerprint(manifest, V.profile_from_build_dir(args.build_dir), V.idf_version())
+    if identity.get("fingerprint") != fp:
+        previous = load_json(record_dir / "source-manifest.json")
+        detail = ""
+        if previous:
+            changes = V.diff_manifests(previous, manifest)
+            if changes:
+                shown = ", ".join(f"{status} {path}" for status, path in changes[:8])
+                more = f" (+{len(changes) - 8} more)" if len(changes) > 8 else ""
+                detail = f"\n  Changed since then: {shown}{more}"
+        print(
+            f"WARNING: the working tree has changed since {baked} was built.{detail}\n"
+            f"  You are about to flash the recorded {baked} image, not the current sources.",
+            file=sys.stderr,
+        )
+    return 0
+
+
+# --------------------------------------------------------------------------
 # package / publish
 # --------------------------------------------------------------------------
 
@@ -513,6 +595,12 @@ def build_parser() -> argparse.ArgumentParser:
     record_build.add_argument("--build-dir", default=V.DEFAULT_BUILD_DIR)
     record_build.add_argument("--kind", choices=("dev", "release"), default="dev")
     record_build.set_defaults(func=cmd_record_build)
+
+    verify_build = sub.add_parser(
+        "verify-build", help="check a build dir's artifacts match the version baked into them"
+    )
+    verify_build.add_argument("--build-dir", default=V.DEFAULT_BUILD_DIR)
+    verify_build.set_defaults(func=cmd_verify_build)
 
     record_flash = sub.add_parser("record-flash", help="append a flash event to the history")
     record_flash.add_argument("--build-dir", default=V.DEFAULT_BUILD_DIR)

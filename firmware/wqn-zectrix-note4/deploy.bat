@@ -95,6 +95,26 @@ if not exist "%BUILD_UNC%\flash_args" (
 echo   Done.
 :build_done
 
+:: Step 1b: Refuse to flash an artifact whose version stamp does not describe it.
+::          PROJECT_VER lives in the cmake cache and only changes when cmake
+::          reconfigures, which only release.py does on purpose. A bare
+::          `idf.py build` therefore relinks new code under the previous
+::          version, and the flashed firmware reports a version describing
+::          different sources with nothing downstream able to tell. The check
+::          reads the artifacts themselves, so it holds whichever build path
+::          produced them. Deliberately after :build_done so it also covers
+::          SKIP_BUILD=1, which is the case where a stale stamp is likeliest.
+echo.
+echo [Step 1b] Verifying build artifacts against their baked version...
+wsl -d %WSL_DISTRO% -- bash -c "cd %WSL_FW_DIR% && . %WSL_IDF_EXPORT% && python3 tools/release/release.py verify-build --build-dir %BUILD_DIR%"
+if errorlevel 1 (
+    echo   ERROR: build artifacts failed verification -- refusing to flash^!
+    echo          Re-run without SKIP_BUILD so the release tooling rebuilds them.
+    pause
+    exit /b 1
+)
+echo   Done.
+
 :: Step 2: COM port + esptool preflight
 echo.
 echo [Step 2] Using COM port: %COM_PORT% @ %BAUD% baud
