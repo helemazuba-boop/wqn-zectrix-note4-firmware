@@ -146,6 +146,11 @@ bool g_epd_powered = false;
 // 0x12 with the booster down.
 // When in doubt, clear: a spurious re-PON only costs the default BTST time
 // (>80 ms), while a wrongly-set flag drives a waveform with no booster.
+// [epd-latency-fix] Kept after the per-partial discharge was reverted. Every
+// path that currently issues 0x02 also clears g_epd_powered, so this flag is
+// no longer load-bearing on the happy path -- it is the sequencing guarantee
+// for the case where PowerOffEpd() bails out AFTER 0x02 has already been
+// clocked out, leaving g_epd_powered true with the booster already down.
 bool g_epd_booster_on = false;
 bool g_previous_framebuffer_synced = false;
 bool g_hot_refresh_ok = false;
@@ -672,27 +677,6 @@ void DropEpdHotState(bool cut_rail, bool invalidate_framebuffer)
     g_hot_refresh_ok = false;
 }
 
-// [epd-bias-fix] Discharge the internal booster after a partial waveform
-// WITHOUT clearing g_epd_powered. POF keeps registers and SRAM ("register and
-// SRAM data will keep until VDD off"), so the panel stays initialized and the
-// previous-frame diff that hot partials rely on stays valid; only the booster
-// goes down, which is what forces the next refresh to re-issue 0x04 (PON).
-// The external rail is deliberately NOT cut -- this is not
-// TurnGrayInternalPowerOff(), which drops the whole hot state and exists for
-// the gray16 controller swap path.
-static esp_err_t TurnBoosterOff(int timeout_ms)
-{
-    ESP_RETURN_ON_ERROR(SendCommand(0x02), kTag, "EPD internal power off");
-    ESP_RETURN_ON_ERROR(SendData(0x00), kTag, "EPD internal power off data");
-    // Clear at the point the command is issued, NOT after the BUSY wait. If
-    // the wait times out the 0x02 has still been clocked out, so leaving the
-    // flag set would make the next refresh skip PON -- the exact failure this
-    // flag exists to prevent.
-    g_epd_booster_on = false;
-    ESP_RETURN_ON_ERROR(WaitBusyTimeout(timeout_ms), kTag, "wait EPD internal power off");
-    return ESP_OK;
-}
-
 esp_err_t InitPanelSequence()
 {
     PowerOnEpd();
@@ -946,12 +930,15 @@ esp_err_t TriggerDisplayUpdate(bool is_partial, bool keep_powered)
     if (!g_epd_rail_powered) {
         PowerOnEpd();
     }
-    // [epd-bias-fix] Also re-PON when only the booster was discharged.
-    // g_epd_powered staying true across a partial POF is the intended
-    // outcome: hot_ready/hot_update keep reading "panel initialized", so the
-    // next partial does not fall back to a full InitPanelSequence() and only
-    // pays for one extra PON. The vendor TriggerOtpRefresh() does exactly
-    // this -- 0x04 -> 0x12 -> 0x02 on every waveform.
+    // [epd-latency-fix] Partials deliberately do not discharge the booster
+    // (see the tail of this function), so during a burst of partials this is
+    // false and the waveform starts at 0x12 directly -- that is the ~320 ms
+    // per refresh this series recovers. PON is now only paid after a real
+    // discharge: full refresh, gray16 internal power-off, idle rail cut, or
+    // hardware reset.
+    // The second term is g_epd_booster_on because it tracks 0x02 independently
+    // of g_epd_powered: if PowerOffEpd() bails out after 0x02 was clocked out,
+    // g_epd_powered can still read true while the booster is already down.
     if (!g_epd_powered || !g_epd_booster_on) {
         esp_err_t ret = SendCommand(0x04);
         if (ret != ESP_OK) {
@@ -998,25 +985,22 @@ esp_err_t TriggerDisplayUpdate(bool is_partial, bool keep_powered)
         // Clear here rather than after the wait, and rather than relying on
         // PowerOffEpd(): it can return early when the operation mutex is
         // unavailable, which would leave the flag set after 0x02 was already
-        // sent. Same reasoning as TurnBoosterOff().
+        // sent.
         g_epd_booster_on = false;
         ESP_RETURN_ON_ERROR(WaitBusy(), kTag, "wait EPD power off command");
         PowerOffEpd();
-    } else if (is_partial) {
-        // [epd-bias-fix] Partial refreshes keep the external rail on
-        // (ShouldKeepEpdPowered() is unconditionally true under
-        // CONFIG_WQN_EPD_LOCAL_PARTIAL_ENABLE), but the internal booster is now
-        // discharged after every partial so DC bias cannot accumulate one-way.
-        // The next refresh re-issues 0x04 (PON) through the g_epd_booster_on
-        // gate above. Bounded by the partial timeout so a wedged panel cannot
-        // stall longer than the 4.5 s this series removes.
-        const esp_err_t booster_ret = TurnBoosterOff(kPartialCommandBusyTimeoutMs);
-        if (booster_ret != ESP_OK) {
-            // Match the failure handling of every other branch here.
-            DropEpdHotState(true, true);
-            return booster_ret;
-        }
     }
+    // [epd-latency-fix] No else-branch: partial refreshes deliberately keep the
+    // booster up. Discharging it here cost POF (~120 ms) plus a re-PON
+    // (~200 ms) on EVERY partial -- 530 ms -> 868 ms -- which pushed a refresh
+    // past the ~600-800 ms double-tap interval and turned a linear cost into
+    // 1.6-3.2 s of queued frames.
+    // The discharge still happens, just not per refresh: a full refresh
+    // (kMaxPartialRefreshesBeforeFull = 240, or the idle cleanup at
+    // kIdleCleanupFramePartials = 24) reaches the branch above and cuts the
+    // rail, and any >= CONFIG_WQN_EPD_IDLE_POWER_OFF_MS (5000) pause cuts it
+    // too. So the booster-up interval is bounded, not unbounded: the worst
+    // case is a sustained interaction burst, roughly 240 partials.
     return ESP_OK;
 }
 
