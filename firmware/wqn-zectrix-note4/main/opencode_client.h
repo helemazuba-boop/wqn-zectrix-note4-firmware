@@ -183,4 +183,22 @@ esp_err_t InterruptOpenCodeSession(
     const std::string& session_id,
     OpenCodeResult* result);
 
+// ---- Framing and payloads, split out of the stream so they can be tested ----
+// The device's event vocabulary is a whitelist: an event name outside it is
+// dropped, never passed through. Both return codes describe a frame the device
+// will not act on, so a caller that only wants the kind can treat them alike.
+esp_err_t ParseOpenCodeAgentFrame(
+    const std::string& event_name,
+    const std::string& data,
+    OpenCodeEvent* out_event);
+// Parse a `GET /agent/sessions/{id}/history` response body. Kept separate from
+// GetOpenCodeHistory so the boot-time contract self-test can replay fixtures
+// without a network: it enforces the same 16 KiB JSON ceiling the bounded HTTP
+// reader does, because a history the device cannot hold must be refused rather
+// than half-rendered.
+esp_err_t ParseOpenCodeHistoryBody(
+    const std::string& body,
+    std::vector<OpenCodeHistoryMessage>* messages,
+    OpenCodeResult* result);
+
 }  // namespace wqn

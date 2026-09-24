@@ -9,6 +9,7 @@
 #include "device_protocol/word_study.h"
 #include "esp_log.h"
 #include "note_app.h"
+#include "opencode_client.h"
 #include "power/rtc_timekeep.h"
 #include "problem_app.h"
 #include "problem_pack.h"
@@ -1542,6 +1543,317 @@ bool CheckRtcTimekeepConversions()
            Require(range_ok, "rtc timekeep register range rejection");
 }
 
+// ---- agent-gateway-v0 ----------------------------------------------------
+//
+// Every literal below is the golden fixture in
+// `contracts/agent-gateway-v0/fixtures/` copied verbatim, and every negative
+// case is that literal mutated. The CMake-side check is a SHA of the schema
+// against `manifest.json`; this one is what actually proves the firmware's
+// parser still accepts what the schema accepts. Editing one without the other
+// makes the hash pass while testing nothing, which is why both note it.
+#if CONFIG_WQN_AGENT_ENABLE
+
+// `valid/question-stream.json`. The frames are split into an array of
+// `{event, data}` pairs so the helper below can walk them in order.
+constexpr char kAgentQuestionStream[] = R"json([
+  { "event": "agent.accepted", "data": {} },
+  {
+    "event": "agent.question",
+    "data": {
+      "question_id": "frm_01J8ZQ5R8W3P1Y4N7C0D2E6F9G",
+      "title": "要写入哪个错题本？",
+      "options": [
+        { "value": "math", "label": "数学错题本" },
+        { "value": "physics", "label": "物理错题本" }
+      ]
+    }
+  },
+  { "event": "agent.text.delta", "data": { "delta": "已写入数学错题本。" } },
+  { "event": "agent.status", "data": { "status": "idle", "message": "执行完成" } }
+])json";
+
+// `valid/reasoning-stream.json`.
+constexpr char kAgentReasoningStream[] = R"json([
+  { "event": "agent.accepted", "data": {} },
+  { "event": "agent.status", "data": { "status": "running", "message": "已接取任务" } },
+  { "event": "agent.reasoning.delta", "data": { "delta": "先判断极限类型：" } },
+  { "event": "agent.reasoning.delta", "data": { "delta": "属于 0/0 型。" } },
+  { "event": "agent.text.delta", "data": { "delta": "用洛必达法则，" } },
+  { "event": "agent.reasoning.delta", "data": { "delta": "再检查分母导数。" } },
+  { "event": "agent.text.delta", "data": { "delta": "分子分母同时求导。" } },
+  {
+    "event": "agent.reasoning",
+    "data": { "text": "先判断极限类型：属于 0/0 型。再检查分母导数。" }
+  },
+  { "event": "agent.text", "data": { "text": "用洛必达法则，分子分母同时求导。" } },
+  { "event": "agent.status", "data": { "status": "idle", "message": "执行完成" } }
+])json";
+
+// `valid/history-response.json`.
+constexpr char kAgentHistory[] = R"json({
+  "data": {
+    "messages": [
+      { "role": "user", "text": "帮我把这道极限题的步骤整理成错题本" },
+      {
+        "role": "assistant",
+        "text": "",
+        "thinking": "先确认题目给出的条件是否足以使用洛必达法则，再决定是否需要分情况讨论。",
+        "tools": [
+          { "name": "notebook.search", "status": "done", "preview": "query=极限" }
+        ]
+      },
+      {
+        "role": "assistant",
+        "text": "已找到 3 道同类题，并写入错题本。",
+        "tools": [
+          { "name": "notebook.search", "status": "done", "preview": "query=极限" },
+          { "name": "notebook.write", "status": "running", "preview": "题目 128" }
+        ]
+      },
+      { "role": "user", "text": "第二题也用同样的步骤" },
+      { "role": "assistant", "text": "好的，第二题是 1 的无穷次幂型，先取对数再求极限。" }
+    ]
+  }
+})json";
+
+// Replay one fixture's `{event, data}` pairs through the frame parser, handing
+// each event to `visit`. Parsing stops at the first frame the parser refuses,
+// so a caller cannot accidentally assert on a frame that was dropped.
+template <typename Visit>
+bool ReplayAgentStream(const char* literal, Visit visit)
+{
+    cJSON* frames = cJSON_Parse(literal);
+    const int count = cJSON_IsArray(frames) ? cJSON_GetArraySize(frames) : 0;
+    for (int index = 0; index < count; ++index) {
+        const cJSON* frame = cJSON_GetArrayItem(frames, index);
+        const char* event = cJSON_GetStringValue(
+            cJSON_GetObjectItemCaseSensitive(frame, "event"));
+        char* data = cJSON_PrintUnformatted(
+            cJSON_GetObjectItemCaseSensitive(frame, "data"));
+        const std::string payload = data != nullptr ? data : "";
+        cJSON_free(data);
+        wqn::OpenCodeEvent parsed;
+        const esp_err_t result =
+            wqn::ParseOpenCodeAgentFrame(event != nullptr ? event : "", payload, &parsed);
+        if (!visit(index, result, parsed)) {
+            cJSON_Delete(frames);
+            return false;
+        }
+    }
+    cJSON_Delete(frames);
+    return count > 0;
+}
+
+bool CheckAgentGatewayV0Contract()
+{
+    // --- question stream: a question is read as one, with its two options ---
+    int question_frames = 0;
+    bool question_ids_ok = true;
+    if (!ReplayAgentStream(kAgentQuestionStream,
+                           [&](int index, esp_err_t result, const wqn::OpenCodeEvent& event) {
+                               ++question_frames;
+                               if (index == 1) {
+                                   if (!Require(
+                                           result == ESP_OK,
+                                           "agent question frame parses") ||
+                                       !Require(
+                                           event.kind == wqn::OpenCodeEventKind::kQuestion,
+                                           "agent question kind") ||
+                                       !Require(
+                                           event.question_id ==
+                                               "frm_01J8ZQ5R8W3P1Y4N7C0D2E6F9G",
+                                           "agent question id") ||
+                                       !Require(
+                                           event.text == "要写入哪个错题本？",
+                                           "agent question title") ||
+                                       !Require(
+                                           event.question_options.size() == 2,
+                                           "agent question option count") ||
+                                       !Require(
+                                           event.question_options[0].value == "math" &&
+                                               event.question_options[0].label == "数学错题本",
+                                           "agent question first option") ||
+                                       !Require(
+                                           event.question_options[1].value == "physics" &&
+                                               event.question_options[1].label == "物理错题本",
+                                           "agent question second option")) {
+                                       question_ids_ok = false;
+                                       return false;
+                                   }
+                               }
+                               // The last frame is the terminator: without it the
+                               // device would sit out the 5-minute socket timeout.
+                               if (index == 3 &&
+                                   !Require(
+                                       result == ESP_OK &&
+                                           event.kind == wqn::OpenCodeEventKind::kStatus &&
+                                           event.status == "idle",
+                                       "agent question stream terminates on idle")) {
+                                   question_ids_ok = false;
+                                   return false;
+                               }
+                               return true;
+                           }) ||
+        !Require(question_frames == 4, "agent question stream frame count") ||
+        !Require(question_ids_ok, "agent question option projection")) {
+        return false;
+    }
+
+    // --- reasoning stream: thinking is its own channel (P1 regression) ------
+    //
+    // The invariant is negative as much as positive: no reasoning payload may
+    // surface as a text event, so a gateway that mapped `session.reasoning.delta`
+    // onto `agent.text.delta` would be caught here rather than as
+    // chain-of-thought inside an answer.
+    int reasoning_deltas = 0;
+    int text_deltas = 0;
+    bool reasoning_ok = true;
+    if (!ReplayAgentStream(kAgentReasoningStream,
+                           [&](int index, esp_err_t result, const wqn::OpenCodeEvent& event) {
+                               if (!Require(result == ESP_OK, "agent reasoning frame parses")) {
+                                   reasoning_ok = false;
+                                   return false;
+                               }
+                               switch (event.kind) {
+                                   case wqn::OpenCodeEventKind::kReasoningDelta:
+                                       ++reasoning_deltas;
+                                       if (event.text != "先判断极限类型：" &&
+                                           event.text != "属于 0/0 型。" &&
+                                           event.text != "再检查分母导数。") {
+                                           reasoning_ok = false;
+                                           return false;
+                                       }
+                                       break;
+                                   case wqn::OpenCodeEventKind::kTextDelta:
+                                       ++text_deltas;
+                                       if (event.text != "用洛必达法则，" &&
+                                           event.text != "分子分母同时求导。") {
+                                           reasoning_ok = false;
+                                           return false;
+                                       }
+                                       break;
+                                   case wqn::OpenCodeEventKind::kReasoning:
+                                       // Repair frame: replaces the thinking block.
+                                       if (event.text !=
+                                           "先判断极限类型：属于 0/0 型。再检查分母导数。") {
+                                           reasoning_ok = false;
+                                           return false;
+                                       }
+                                       break;
+                                   case wqn::OpenCodeEventKind::kText:
+                                       if (event.text != "用洛必达法则，分子分母同时求导。") {
+                                           reasoning_ok = false;
+                                           return false;
+                                       }
+                                       break;
+                                   default:
+                                       break;
+                               }
+                               if (index == 9 &&
+                                   !Require(
+                                       event.kind == wqn::OpenCodeEventKind::kStatus &&
+                                           event.status == "idle",
+                                       "agent reasoning stream terminates on idle")) {
+                                   reasoning_ok = false;
+                                   return false;
+                               }
+                               return true;
+                           }) ||
+        !Require(reasoning_ok, "agent reasoning channel separation") ||
+        !Require(reasoning_deltas == 3, "agent reasoning delta count") ||
+        !Require(text_deltas == 2, "agent text delta count")) {
+        return false;
+    }
+
+    // --- whitelist: an event name outside the vocabulary is dropped ---------
+    wqn::OpenCodeEvent unknown_event;
+    if (!Require(
+            wqn::ParseOpenCodeAgentFrame("session.text.delta", R"json({"delta":"x"})json",
+                                         &unknown_event) == ESP_ERR_NOT_SUPPORTED,
+            "agent stream drops upstream event names")) {
+        return false;
+    }
+
+    // --- question without options: the fixture's negative case --------------
+    //
+    // The gateway is what projects a form into two options, so a question frame
+    // with none is a malformed frame, not a question with no choices.
+    std::string empty_options = kAgentQuestionStream;
+    const size_t options_start = empty_options.find("\"options\": [");
+    if (!Require(options_start != std::string::npos, "agent options mutation anchor")) {
+        return false;
+    }
+    const size_t options_end = empty_options.find("]", options_start);
+    if (!Require(options_end != std::string::npos, "agent options mutation end")) {
+        return false;
+    }
+    empty_options.replace(options_start, options_end - options_start + 1, "\"options\": []");
+    cJSON* frames = cJSON_Parse(empty_options.c_str());
+    std::string question_data;
+    if (cJSON_IsArray(frames)) {
+        const cJSON* frame = cJSON_GetArrayItem(frames, 1);
+        char* printed = cJSON_PrintUnformatted(
+            cJSON_GetObjectItemCaseSensitive(frame, "data"));
+        question_data = printed != nullptr ? printed : "";
+        cJSON_free(printed);
+    }
+    cJSON_Delete(frames);
+    if (!Require(
+            wqn::ParseOpenCodeAgentFrame("agent.question", question_data, &unknown_event) ==
+                ESP_ERR_INVALID_RESPONSE,
+            "agent question with no options is rejected")) {
+        return false;
+    }
+
+    // --- history backfill --------------------------------------------------
+    std::vector<wqn::OpenCodeHistoryMessage> messages;
+    wqn::OpenCodeResult history_result;
+    if (!Require(
+            wqn::ParseOpenCodeHistoryBody(kAgentHistory, &messages, &history_result) == ESP_OK,
+            "agent history parses") ||
+        !Require(messages.size() == 5, "agent history message count") ||
+        !Require(messages[0].role == "user", "agent history oldest first") ||
+        !Require(messages[1].role == "assistant", "agent history assistant role") ||
+        !Require(
+            messages[1].thinking ==
+                "先确认题目给出的条件是否足以使用洛必达法则，再决定是否需要分情况讨论。",
+            "agent history thinking channel") ||
+        !Require(
+            messages[1].tools.size() == 1 && messages[1].tools[0].name == "notebook.search" &&
+                messages[1].tools[0].status == "done" &&
+                messages[1].tools[0].preview == "query=极限",
+            "agent history tool projection") ||
+        !Require(messages[0].tools.empty(), "agent history user row has no tools") ||
+        !Require(
+            messages[4].text == "好的，第二题是 1 的无穷次幂型，先取对数再求极限。",
+            "agent history newest last")) {
+        return false;
+    }
+
+    // `invalid/history-not-array.json`: a body the device cannot read as
+    // messages is refused rather than rendered as an empty transcript.
+    if (!Require(
+            wqn::ParseOpenCodeHistoryBody(R"json({"data":{"messages":{}}})json", &messages,
+                                          &history_result) == ESP_ERR_INVALID_RESPONSE,
+            "agent history rejects non-array messages")) {
+        return false;
+    }
+
+    // `invalid/history-too-large.json`: the device's 16 KiB JSON ceiling is
+    // enforced by the parser and not only by the HTTP reader, so an oversized
+    // backfill is a visible failure rather than a half-drawn transcript.
+    const std::string oversized(16 * 1024 + 1, 'x');
+    if (!Require(
+            wqn::ParseOpenCodeHistoryBody(oversized, &messages, &history_result) ==
+                ESP_ERR_INVALID_SIZE,
+            "agent history rejects oversized body")) {
+        return false;
+    }
+
+    return true;
+}
+#endif  // CONFIG_WQN_AGENT_ENABLE
+
 }  // namespace
 
 namespace wqn {
@@ -1564,6 +1876,9 @@ bool RunContractFixtureSelfTest()
         CheckAiStreamHttpFailures() &&
         CheckMarkdownLayout() &&
         CheckRtcTimekeepConversions() &&
+#if CONFIG_WQN_AGENT_ENABLE
+        CheckAgentGatewayV0Contract() &&
+#endif
         RunTimeAppStateSelfTest() &&
         RunWordPageStateSelfTest() &&
         RunNotePageStateSelfTest() &&

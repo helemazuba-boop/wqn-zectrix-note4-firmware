@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://wqn.helema.cn/contracts/agent-gateway-v0/agent-gateway-v0.schema.json",
   "title": "WQN ESP32 Agent Gateway Protocol v0",
-  "description": "Language-neutral contract for the /api/esp32/agent/* routes that proxy a bound self-hosted OpenCode server. Replaces the retired X-WQN-Ai-Tier: pro tier.",
+  "description": "Language-neutral contract for the /api/esp32/agent/* routes that proxy a bound self-hosted OpenCode server. The device-facing vocabulary is deliberately small and stable; the OpenCode v2 migration widened it (reasoning + question) without renaming or removing anything. Replaces the retired X-WQN-Ai-Tier: pro tier.",
   "$defs": {
     "sessionId": {
       "type": "string",
@@ -108,8 +108,124 @@
       "required": ["permission_id", "decision", "confirmed"],
       "properties": {
         "permission_id": { "type": "string", "minLength": 1, "maxLength": 128 },
-        "decision": { "enum": ["once", "reject"] },
+        "decision": {
+          "enum": ["once", "reject"],
+          "description": "No `always`: the firmware can only express a one-shot approval or a rejection, so the third upstream value would be a dead surface."
+        },
         "confirmed": { "type": "boolean", "const": true }
+      }
+    },
+    "questionReplyRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["question_id", "answer", "confirmed"],
+      "properties": {
+        "question_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "answer": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "description": "The `value` of the projected option the user chose. Never a field id: the gateway is what knows which upstream field the option came from."
+        },
+        "confirmed": { "type": "boolean", "const": true }
+      }
+    },
+    "historyTool": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "status"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "status": {
+          "enum": ["running", "done", "error"],
+          "description": "Projected from the upstream `state.status`; `completed` becomes `done`. `executed` is deliberately not consulted: it is false even for completed calls."
+        },
+        "preview": { "type": "string", "maxLength": 160 }
+      }
+    },
+    "historyMessage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["role", "text"],
+      "properties": {
+        "role": {
+          "enum": ["user", "assistant"],
+          "description": "Upstream's turn-boundary and bookkeeping messages are dropped by the gateway, not by the device."
+        },
+        "text": {
+          "type": "string",
+          "maxLength": 2048,
+          "description": "May be empty for an assistant turn whose only content is tool calls."
+        },
+        "thinking": { "type": "string", "maxLength": 2048 },
+        "tools": {
+          "type": "array",
+          "maxItems": 8,
+          "items": { "$ref": "#/$defs/historyTool" }
+        }
+      }
+    },
+    "historyResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["data"],
+      "properties": {
+        "data": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["messages"],
+          "properties": {
+            "messages": {
+              "type": "array",
+              "maxItems": 24,
+              "description": "Oldest first. The whole response must fit the device's 16 KiB JSON ceiling, which is why the gateway trims from the front and caps each field.",
+              "items": { "$ref": "#/$defs/historyMessage" }
+            }
+          }
+        }
+      }
+    },
+    "interruptResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["data"],
+      "properties": {
+        "data": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["interrupted"],
+          "properties": {
+            "interrupted": {
+              "type": "boolean",
+              "description": "`false` is a successful \"that run had already finished\", not an error."
+            }
+          }
+        }
+      }
+    },
+    "questionOption": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["value"],
+      "properties": {
+        "value": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "label": { "type": "string", "maxLength": 120 }
+      }
+    },
+    "questionData": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["question_id", "title", "options"],
+      "properties": {
+        "question_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "title": { "type": "string", "maxLength": 160 },
+        "options": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 2,
+          "description": "At most two, because the device's option bar has exactly two slots. A form the gateway cannot project into them is delivered as `agent.status` instead.",
+          "items": { "$ref": "#/$defs/questionOption" }
+        }
       }
     },
     "streamFrame": {
@@ -124,14 +240,156 @@
             "agent.status",
             "agent.text.delta",
             "agent.text",
+            "agent.reasoning.delta",
+            "agent.reasoning",
             "agent.tool",
             "agent.permission",
+            "agent.question",
             "agent.error"
           ]
         },
         "data": {
           "type": "object",
-          "description": "JSON payload of the SSE data: line. Empty for the two acknowledgements."
+          "description": "JSON payload of the SSE data: line. Empty for the two acknowledgements; per-event shapes are constrained below."
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "event": { "const": "agent.status" } }, "required": ["event"] },
+          "then": {
+            "properties": {
+              "data": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["status"],
+                "properties": {
+                  "status": { "enum": ["running", "busy", "retry", "idle", "error"] },
+                  "message": { "type": "string", "maxLength": 240 }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "event": { "const": "agent.text.delta" } }, "required": ["event"] },
+          "then": {
+            "properties": {
+              "data": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["delta"],
+                "properties": { "delta": { "type": "string", "maxLength": 2048 } }
+              }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "event": { "const": "agent.text" } }, "required": ["event"] },
+          "then": {
+            "properties": {
+              "data": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["text"],
+                "properties": { "text": { "type": "string", "maxLength": 8192 } }
+              }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "event": { "const": "agent.reasoning.delta" } }, "required": ["event"] },
+          "then": {
+            "properties": {
+              "data": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["delta"],
+                "properties": { "delta": { "type": "string", "maxLength": 2048 } }
+              }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "event": { "const": "agent.reasoning" } }, "required": ["event"] },
+          "then": {
+            "properties": {
+              "data": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["text"],
+                "properties": { "text": { "type": "string", "maxLength": 2048 } }
+              }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "event": { "const": "agent.tool" } }, "required": ["event"] },
+          "then": {
+            "properties": {
+              "data": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["tool", "status"],
+                "properties": {
+                  "tool": { "type": "string", "minLength": 1, "maxLength": 80 },
+                  "status": { "enum": ["running", "done", "error"] },
+                  "preview": { "type": "string", "maxLength": 160 }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "event": { "const": "agent.permission" } }, "required": ["event"] },
+          "then": {
+            "properties": {
+              "data": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["permission_id"],
+                "properties": {
+                  "permission_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+                  "type": { "type": "string", "maxLength": 80 },
+                  "title": { "type": "string", "maxLength": 160 },
+                  "preview": { "type": "string", "maxLength": 160 }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "event": { "const": "agent.question" } }, "required": ["event"] },
+          "then": { "properties": { "data": { "$ref": "#/$defs/questionData" } } }
+        },
+        {
+          "if": { "properties": { "event": { "const": "agent.error" } }, "required": ["event"] },
+          "then": {
+            "properties": {
+              "data": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["message"],
+                "properties": { "message": { "type": "string", "minLength": 1, "maxLength": 512 } }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "streamTerminator": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["event", "data"],
+      "properties": {
+        "event": { "const": "agent.status" },
+        "data": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status"],
+          "properties": {
+            "status": { "const": "idle" },
+            "message": { "type": "string", "maxLength": 240 }
+          }
         }
       }
     },
@@ -139,7 +397,8 @@
       "type": "array",
       "minItems": 1,
       "items": { "$ref": "#/$defs/streamFrame" },
-      "description": "Ordered SSE frames of one run. Must terminate with agent.status {status: idle}."
+      "description": "Ordered SSE frames of one run. It must terminate with agent.status {status: idle}, and that frame must be the last one; JSON Schema cannot express \"last\", so the schema requires that the terminator be present and the device reads to it.",
+      "contains": { "$ref": "#/$defs/streamTerminator" }
     },
     "errorEnvelope": {
       "type": "object",
@@ -152,8 +411,15 @@
   },
   "oneOf": [
     { "$ref": "#/$defs/sessionsListResponse" },
+    { "$ref": "#/$defs/sessionCreateRequest" },
     { "$ref": "#/$defs/sessionCreateResponse" },
     { "$ref": "#/$defs/transcribeResponse" },
+    { "$ref": "#/$defs/runRequest" },
+    { "$ref": "#/$defs/permissionReplyRequest" },
+    { "$ref": "#/$defs/questionReplyRequest" },
+    { "$ref": "#/$defs/historyResponse" },
+    { "$ref": "#/$defs/interruptResponse" },
+    { "$ref": "#/$defs/runStream" },
     { "$ref": "#/$defs/errorEnvelope" }
   ]
 }

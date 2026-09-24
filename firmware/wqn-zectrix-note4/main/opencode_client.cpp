@@ -33,27 +33,21 @@ esp_err_t PostQuestionReply(const std::string& token,
 esp_err_t InterruptOpenCodeSession(const std::string& token,
                                    const std::string& session_id,
                                    OpenCodeResult* result);
-}  // namespace wqn
 
-namespace {
-
-constexpr char kTag[] = "wqn_opencode_api";
-constexpr size_t kMaxJsonResponseBytes = 16 * 1024;
-constexpr size_t kMaxPromptBytes = 4096;
-// Backfill caps. The gateway already truncates to the device's JSON budget;
-// these stop a future gateway change from turning one backfill into an
-// unbounded heap allocation on a 4 KB-stack worker.
-constexpr int kMaxHistoryMessages = 24;
-constexpr int kMaxHistoryTools = 8;
-
-std::string AgentUrl(const char* path)
+// One string field of a cJSON object. It lives here rather than in the anonymous
+// namespace below because the exported frame and history parsers need it too;
+// the `using` inside that namespace keeps its unqualified call sites intact.
+std::string JsonString(cJSON* object, const char* key)
 {
-    std::string url = WQN_API_BASE;
-    url += path;
-    return url;
+    const char* value = cJSON_GetStringValue(
+        object != nullptr ? cJSON_GetObjectItemCaseSensitive(object, key) : nullptr);
+    return value != nullptr ? value : "";
 }
 
-void SetResultError(wqn::OpenCodeResult* result, int status, const char* code, const char* detail)
+// Fail a request with a machine-readable code and a short user-facing detail.
+// Also here rather than in the anonymous namespace, for the same reason: the
+// exported parsers report `invalid_response` with it.
+void SetResultError(OpenCodeResult* result, int status, const char* code, const char* detail)
 {
     if (result == nullptr) {
         return;
@@ -61,6 +55,35 @@ void SetResultError(wqn::OpenCodeResult* result, int status, const char* code, c
     result->http_status = status;
     result->error_code = code != nullptr ? code : "upstream_error";
     result->detail = detail != nullptr ? detail : "OpenCode request failed";
+}
+// Device-side budgets. They are the same numbers the agent-gateway-v0 manifest
+// records under `bounds`, and the exported history parser enforces the JSON one
+// itself, so they live with the parsers rather than with the HTTP plumbing.
+constexpr size_t kMaxJsonResponseBytes = 16 * 1024;
+constexpr size_t kMaxPromptBytes = 4096;
+// Backfill caps. The gateway already truncates to the device's JSON budget;
+// these stop a future gateway change from turning one backfill into an
+// unbounded heap allocation on a 4 KB-stack worker.
+constexpr int kMaxHistoryMessages = 24;
+constexpr int kMaxHistoryTools = 8;
+}  // namespace wqn
+
+namespace {
+
+using wqn::JsonString;
+using wqn::SetResultError;
+using wqn::kMaxJsonResponseBytes;
+using wqn::kMaxPromptBytes;
+using wqn::kMaxHistoryMessages;
+using wqn::kMaxHistoryTools;
+
+constexpr char kTag[] = "wqn_opencode_api";
+
+std::string AgentUrl(const char* path)
+{
+    std::string url = WQN_API_BASE;
+    url += path;
+    return url;
 }
 
 esp_err_t SetCommonHeaders(
@@ -187,13 +210,6 @@ esp_err_t OpenJsonRequest(
     return request_result;
 }
 
-std::string JsonString(cJSON* object, const char* key)
-{
-    const char* value = cJSON_GetStringValue(
-        object != nullptr ? cJSON_GetObjectItemCaseSensitive(object, key) : nullptr);
-    return value != nullptr ? value : "";
-}
-
 void DispatchAgentEvent(
     const std::string& event_name,
     const std::string& data,
@@ -203,90 +219,24 @@ void DispatchAgentEvent(
     if (callback == nullptr) {
         return;
     }
-    cJSON* root = wqn::protocol::JsonNestingWithinLimit(data.data(), data.size())
-        ? cJSON_ParseWithLength(data.data(), data.size())
-        : nullptr;
-    if (root == nullptr) {
-        ESP_LOGW(kTag, "invalid Agent SSE JSON");
-        return;
-    }
     wqn::OpenCodeEvent event;
-    if (event_name == "agent.accepted") {
-        event.kind = wqn::OpenCodeEventKind::kAccepted;
-    } else if (event_name == "agent.attached") {
-        event.kind = wqn::OpenCodeEventKind::kAttached;
-    } else if (event_name == "agent.status") {
-        event.kind = wqn::OpenCodeEventKind::kStatus;
-        event.status = JsonString(root, "status");
-        event.text = JsonString(root, "message");
-    } else if (event_name == "agent.text.delta") {
-        event.kind = wqn::OpenCodeEventKind::kTextDelta;
-        event.text = JsonString(root, "delta");
-    } else if (event_name == "agent.text") {
-        event.kind = wqn::OpenCodeEventKind::kText;
-        event.text = JsonString(root, "text");
-    } else if (event_name == "agent.reasoning.delta") {
-        // Reasoning travels its own channel. It is never folded into
-        // `agent.text`, so a gateway mapping bug cannot leak chain-of-thought
-        // into the answer.
-        event.kind = wqn::OpenCodeEventKind::kReasoningDelta;
-        event.text = JsonString(root, "delta");
-    } else if (event_name == "agent.reasoning") {
-        event.kind = wqn::OpenCodeEventKind::kReasoning;
-        event.text = JsonString(root, "text");
-    } else if (event_name == "agent.tool") {
-        event.kind = wqn::OpenCodeEventKind::kTool;
-        event.tool = JsonString(root, "tool");
-        event.status = JsonString(root, "status");
-        event.preview = JsonString(root, "preview");
-    } else if (event_name == "agent.permission") {
-        event.kind = wqn::OpenCodeEventKind::kPermission;
-        event.permission_id = JsonString(root, "permission_id");
-        event.tool = JsonString(root, "type");
-        event.text = JsonString(root, "title");
-        event.preview = JsonString(root, "preview");
-    } else if (event_name == "agent.question") {
-        // The gateway projects the upstream form onto at most two options; a
-        // form with more than two is delivered as `agent.status` instead, so an
-        // empty `options` here is a malformed frame and is dropped below.
-        event.kind = wqn::OpenCodeEventKind::kQuestion;
-        event.question_id = JsonString(root, "question_id");
-        event.text = JsonString(root, "title");
-        cJSON* options = cJSON_GetObjectItemCaseSensitive(root, "options");
-        if (cJSON_IsArray(options)) {
-            const int option_count = std::min<int>(cJSON_GetArraySize(options), 2);
-            event.question_options.reserve(static_cast<size_t>(option_count));
-            for (int i = 0; i < option_count; ++i) {
-                const cJSON* option = cJSON_GetArrayItem(options, i);
-                if (!cJSON_IsObject(option)) {
-                    continue;
-                }
-                wqn::OpenCodeQuestionOption projected;
-                projected.value = JsonString(const_cast<cJSON*>(option), "value");
-                projected.label = JsonString(const_cast<cJSON*>(option), "label");
-                if (!projected.value.empty()) {
-                    event.question_options.push_back(std::move(projected));
-                }
-            }
-        }
-        if (event.question_id.empty() || event.question_options.empty()) {
-            cJSON_Delete(root);
+    const esp_err_t parsed = wqn::ParseOpenCodeAgentFrame(event_name, data, &event);
+    switch (parsed) {
+        case ESP_OK:
+            callback(event, callback_ctx);
             return;
-        }
-    } else if (event_name == "agent.error") {
-        event.kind = wqn::OpenCodeEventKind::kError;
-        event.text = JsonString(root, "message");
-    } else {
-        // Whitelist stays whitelist: an event the gateway invented and this
-        // firmware does not know is dropped, never surfaced as text. Log it at
-        // debug level so on-device verification can spot "cloud maps it,
-        // firmware does not" without a reflash-to-printf cycle.
-        ESP_LOGD(kTag, "unhandled Agent SSE event: %s", event_name.c_str());
-        cJSON_Delete(root);
-        return;
+        case ESP_ERR_NOT_SUPPORTED:
+            // Whitelist stays whitelist: an event the gateway invented and this
+            // firmware does not know is dropped, never surfaced as text. Log it
+            // at debug level so on-device verification can spot "cloud maps it,
+            // firmware does not" without a reflash-to-printf cycle.
+            ESP_LOGD(kTag, "unhandled Agent SSE event: %s", event_name.c_str());
+            return;
+        default:
+            ESP_LOGW(kTag, "dropped Agent SSE frame %s (%s)", event_name.c_str(),
+                     esp_err_to_name(parsed));
+            return;
     }
-    cJSON_Delete(root);
-    callback(event, callback_ctx);
 }
 
 esp_err_t PostOutboundReply(
@@ -821,7 +771,12 @@ esp_err_t InterruptOpenCodeSession(
         ? cJSON_ParseWithLength(response_body.data(), response_body.size())
         : nullptr;
     cJSON* data = root != nullptr ? cJSON_GetObjectItemCaseSensitive(root, "data") : nullptr;
-    const bool interrupted = JsonString(data, "interrupted") != "false";
+    // `interrupted` is a boolean, so it has to be read as one. Reading it as a
+    // string yields "" for both values, which makes every interrupt look
+    // delivered -- the log is the only consumer today, but it is the thing an
+    // on-device verification reads to tell the two apart.
+    cJSON* flag = data != nullptr ? cJSON_GetObjectItemCaseSensitive(data, "interrupted") : nullptr;
+    const bool interrupted = cJSON_IsBool(flag) ? cJSON_IsTrue(flag) : false;
     cJSON_Delete(root);
     ESP_LOGI(kTag, "session interrupt %s: %s", session_id.c_str(),
              interrupted ? "delivered" : "no-op");
@@ -851,6 +806,167 @@ esp_err_t GetOpenCodeHistory(
     if (request_result != ESP_OK) {
         return request_result;
     }
+    return ParseOpenCodeHistoryBody(body, messages, result);
+}
+
+esp_err_t PostQuestionReply(
+    const std::string& token,
+    const std::string& session_id,
+    const std::string& question_id,
+    const std::string& answer,
+    OpenCodeResult* result)
+{
+    if (token.empty() || session_id.rfind("ses_", 0) != 0 ||
+        question_id.empty() || answer.empty() || result == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *result = OpenCodeResult{};
+    cJSON* root = cJSON_CreateObject();
+    if (root == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
+    cJSON_AddStringToObject(root, "question_id", question_id.c_str());
+    cJSON_AddStringToObject(root, "answer", answer.c_str());
+    cJSON_AddBoolToObject(root, "confirmed", true);
+    char* printed = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (printed == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
+    const std::string body = printed;
+    cJSON_free(printed);
+    std::string response_body;
+    return OpenJsonRequest(
+        token,
+        AgentUrl(("/agent/sessions/" + session_id + "/question").c_str()),
+        HTTP_METHOD_POST,
+        &body,
+        &response_body,
+        result);
+}
+
+// Parse one SSE frame into an event. Return codes:
+//   ESP_OK             -- the frame is inside the vocabulary and well formed
+//   ESP_ERR_NOT_SUPPORTED -- an event name this firmware does not know. The
+//                            vocabulary is a whitelist, so the frame is dropped
+//                            rather than passed through; the caller logs it at
+//                            debug level so on-device verification can spot a
+//                            "the cloud maps it, the firmware does not" gap.
+//   ESP_ERR_INVALID_RESPONSE -- a known event with a payload the device cannot
+//                            act on (a question with no options, say).
+esp_err_t ParseOpenCodeAgentFrame(
+    const std::string& event_name,
+    const std::string& data,
+    wqn::OpenCodeEvent* out_event)
+{
+    if (out_event == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *out_event = wqn::OpenCodeEvent{};
+    cJSON* root = wqn::protocol::JsonNestingWithinLimit(data.data(), data.size())
+        ? cJSON_ParseWithLength(data.data(), data.size())
+        : nullptr;
+    if (root == nullptr) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    wqn::OpenCodeEvent event;
+    if (event_name == "agent.accepted") {
+        event.kind = wqn::OpenCodeEventKind::kAccepted;
+    } else if (event_name == "agent.attached") {
+        event.kind = wqn::OpenCodeEventKind::kAttached;
+    } else if (event_name == "agent.status") {
+        event.kind = wqn::OpenCodeEventKind::kStatus;
+        event.status = JsonString(root, "status");
+        event.text = JsonString(root, "message");
+    } else if (event_name == "agent.text.delta") {
+        event.kind = wqn::OpenCodeEventKind::kTextDelta;
+        event.text = JsonString(root, "delta");
+    } else if (event_name == "agent.text") {
+        event.kind = wqn::OpenCodeEventKind::kText;
+        event.text = JsonString(root, "text");
+    } else if (event_name == "agent.reasoning.delta") {
+        // Reasoning travels its own channel. It is never folded into
+        // `agent.text`, so a gateway mapping bug cannot leak chain-of-thought
+        // into the answer.
+        event.kind = wqn::OpenCodeEventKind::kReasoningDelta;
+        event.text = JsonString(root, "delta");
+    } else if (event_name == "agent.reasoning") {
+        event.kind = wqn::OpenCodeEventKind::kReasoning;
+        event.text = JsonString(root, "text");
+    } else if (event_name == "agent.tool") {
+        event.kind = wqn::OpenCodeEventKind::kTool;
+        event.tool = JsonString(root, "tool");
+        event.status = JsonString(root, "status");
+        event.preview = JsonString(root, "preview");
+    } else if (event_name == "agent.permission") {
+        event.kind = wqn::OpenCodeEventKind::kPermission;
+        event.permission_id = JsonString(root, "permission_id");
+        event.tool = JsonString(root, "type");
+        event.text = JsonString(root, "title");
+        event.preview = JsonString(root, "preview");
+    } else if (event_name == "agent.question") {
+        // The gateway projects the upstream form onto at most two options; a
+        // form with more than two is delivered as `agent.status` instead, so an
+        // empty `options` here is a malformed frame and is dropped below.
+        event.kind = wqn::OpenCodeEventKind::kQuestion;
+        event.question_id = JsonString(root, "question_id");
+        event.text = JsonString(root, "title");
+        cJSON* options = cJSON_GetObjectItemCaseSensitive(root, "options");
+        if (cJSON_IsArray(options)) {
+            const int option_count = std::min<int>(cJSON_GetArraySize(options), 2);
+            event.question_options.reserve(static_cast<size_t>(option_count));
+            for (int i = 0; i < option_count; ++i) {
+                const cJSON* option = cJSON_GetArrayItem(options, i);
+                if (!cJSON_IsObject(option)) {
+                    continue;
+                }
+                wqn::OpenCodeQuestionOption projected;
+                projected.value = JsonString(const_cast<cJSON*>(option), "value");
+                projected.label = JsonString(const_cast<cJSON*>(option), "label");
+                if (!projected.value.empty()) {
+                    event.question_options.push_back(std::move(projected));
+                }
+            }
+        }
+        if (event.question_id.empty() || event.question_options.empty()) {
+            cJSON_Delete(root);
+            return ESP_ERR_INVALID_RESPONSE;
+        }
+    } else if (event_name == "agent.error") {
+        event.kind = wqn::OpenCodeEventKind::kError;
+        event.text = JsonString(root, "message");
+    } else {
+        cJSON_Delete(root);
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    cJSON_Delete(root);
+    *out_event = std::move(event);
+    return ESP_OK;
+}
+
+// The body of `GET /agent/sessions/{id}/history`. The gateway has already
+// trimmed it to the device's budget, so a body this large is a contract bug
+// rather than a large conversation, and is refused rather than half-rendered:
+// a truncated read would look identical to a short transcript. Bounded the same
+// way here as in the HTTP reader, so the boot self-test can exercise the bound
+// without a socket.
+esp_err_t ParseOpenCodeHistoryBody(
+    const std::string& body,
+    std::vector<OpenCodeHistoryMessage>* messages,
+    OpenCodeResult* result)
+{
+    if (messages == nullptr || result == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    // Carried over from the request, if there was one: the self-test calls this
+    // with a bare body, where it stays 0.
+    const int http_status = result->http_status;
+    *result = OpenCodeResult{};
+    messages->clear();
+    if (body.size() > kMaxJsonResponseBytes) {
+        SetResultError(result, http_status, "invalid_size", "History response is too large");
+        return ESP_ERR_INVALID_SIZE;
+    }
     cJSON* root = protocol::JsonNestingWithinLimit(body.data(), body.size())
         ? cJSON_ParseWithLength(body.data(), body.size())
         : nullptr;
@@ -858,7 +974,7 @@ esp_err_t GetOpenCodeHistory(
     cJSON* rows = data != nullptr ? cJSON_GetObjectItemCaseSensitive(data, "messages") : nullptr;
     if (!cJSON_IsArray(rows)) {
         cJSON_Delete(root);
-        SetResultError(result, result->http_status, "invalid_response", "History is invalid");
+        SetResultError(result, http_status, "invalid_response", "History is invalid");
         return ESP_ERR_INVALID_RESPONSE;
     }
     const int count = std::min<int>(cJSON_GetArraySize(rows), kMaxHistoryMessages);
@@ -896,42 +1012,6 @@ esp_err_t GetOpenCodeHistory(
     }
     cJSON_Delete(root);
     return ESP_OK;
-}
-
-esp_err_t PostQuestionReply(
-    const std::string& token,
-    const std::string& session_id,
-    const std::string& question_id,
-    const std::string& answer,
-    OpenCodeResult* result)
-{
-    if (token.empty() || session_id.rfind("ses_", 0) != 0 ||
-        question_id.empty() || answer.empty() || result == nullptr) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    *result = OpenCodeResult{};
-    cJSON* root = cJSON_CreateObject();
-    if (root == nullptr) {
-        return ESP_ERR_NO_MEM;
-    }
-    cJSON_AddStringToObject(root, "question_id", question_id.c_str());
-    cJSON_AddStringToObject(root, "answer", answer.c_str());
-    cJSON_AddBoolToObject(root, "confirmed", true);
-    char* printed = cJSON_PrintUnformatted(root);
-    cJSON_Delete(root);
-    if (printed == nullptr) {
-        return ESP_ERR_NO_MEM;
-    }
-    const std::string body = printed;
-    cJSON_free(printed);
-    std::string response_body;
-    return OpenJsonRequest(
-        token,
-        AgentUrl(("/agent/sessions/" + session_id + "/question").c_str()),
-        HTTP_METHOD_POST,
-        &body,
-        &response_body,
-        result);
 }
 
 }  // namespace wqn

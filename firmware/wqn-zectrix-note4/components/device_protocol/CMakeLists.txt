@@ -98,3 +98,34 @@ target_compile_definitions(
     ${COMPONENT_LIB}
     PUBLIC WQN_PROBLEM_STUDY_SCHEMA_SHA256="${WQN_PROBLEM_STUDY_SCHEMA_SHA256}"
 )
+
+# [agent] The Agent gateway contract is the one whose parser lives in `main`
+# rather than in this component, so it was also the one contract without a
+# build-time hash gate -- a schema change could drift silently against the
+# parser. CONFIGURE_DEPENDS matters more here than for the others: the agent
+# schema is the one being actively edited, and without it only a fresh configure
+# would notice.
+set(WQN_AGENT_GATEWAY_CONTRACT_DIR
+    "${CMAKE_CURRENT_LIST_DIR}/../../contracts/agent-gateway-v0")
+set(WQN_AGENT_GATEWAY_SCHEMA
+    "${WQN_AGENT_GATEWAY_CONTRACT_DIR}/agent-gateway-v0.schema.json")
+set(WQN_AGENT_GATEWAY_MANIFEST
+    "${WQN_AGENT_GATEWAY_CONTRACT_DIR}/manifest.json")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${WQN_AGENT_GATEWAY_SCHEMA}"
+    "${WQN_AGENT_GATEWAY_MANIFEST}"
+    "${WQN_AGENT_GATEWAY_CONTRACT_DIR}/README.md")
+file(SHA256 "${WQN_AGENT_GATEWAY_SCHEMA}" WQN_AGENT_GATEWAY_SCHEMA_SHA256)
+file(READ "${WQN_AGENT_GATEWAY_MANIFEST}" WQN_AGENT_GATEWAY_MANIFEST_JSON)
+string(JSON WQN_AGENT_GATEWAY_MANIFEST_SHA256
+    GET "${WQN_AGENT_GATEWAY_MANIFEST_JSON}" schema_sha256)
+if(NOT WQN_AGENT_GATEWAY_SCHEMA_SHA256 STREQUAL WQN_AGENT_GATEWAY_MANIFEST_SHA256)
+    message(FATAL_ERROR
+        "agent-gateway-v0 schema hash mismatch: actual=${WQN_AGENT_GATEWAY_SCHEMA_SHA256} "
+        "manifest=${WQN_AGENT_GATEWAY_MANIFEST_SHA256}")
+endif()
+
+target_compile_definitions(
+    ${COMPONENT_LIB}
+    PUBLIC WQN_AGENT_GATEWAY_SCHEMA_SHA256="${WQN_AGENT_GATEWAY_SCHEMA_SHA256}"
+)
