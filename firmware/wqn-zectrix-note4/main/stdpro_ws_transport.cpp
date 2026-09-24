@@ -468,7 +468,15 @@ void ProcessTextStream()
         }
 
         // Feed into SSE parser
-        g_sse_parser.feed(buf, bytes_read);
+        if (!g_sse_parser.feed(buf, bytes_read)) {
+          // A frame past the device's JSON budget cannot be parsed even when
+          // complete, so the stream is broken rather than missing a frame.
+          ESP_LOGE(kTag,
+                   "SSE frame overflow (>%u bytes) — fatal stream loss",
+                   static_cast<unsigned>(wqn::kMaxSseFrameBytes));
+          xTaskNotify(g_transport_task, kEvtBitResetRequired, eSetBits);
+          continue;
+        }
         std::string ev_name;
         uint64_t ev_id = 0;
         std::string ev_data;

@@ -7,12 +7,19 @@
 
 namespace wqn {
 
-void LineStreamingBuffer::feed(const char* data, size_t len)
+bool LineStreamingBuffer::feed(const char* data, size_t len)
 {
   if (data == nullptr || len == 0) {
-    return;
+    return true;
+  }
+  if (buffer_.size() + len > kMaxSseLineBytes) {
+    // An unterminated line this long is not a frame we could ever parse, and
+    // letting it keep growing spends internal RAM on garbage.
+    buffer_.clear();
+    return false;
   }
   buffer_.append(data, len);
+  return true;
 }
 
 bool LineStreamingBuffer::take_line(std::string* out)
@@ -45,9 +52,9 @@ void SseFrameBuffer::clear()
   id_seen_ = false;
 }
 
-void SseFrameBuffer::feed(const char* data, size_t len)
+bool SseFrameBuffer::feed(const char* data, size_t len)
 {
-  lines_.feed(data, len);
+  return lines_.feed(data, len);
 }
 
 SseFrameBuffer::FrameState SseFrameBuffer::extract(std::string* event_name,
@@ -95,6 +102,12 @@ SseFrameBuffer::FrameState SseFrameBuffer::extract(std::string* event_name,
     if (field == "event") {
       event_ = std::move(value);
     } else if (field == "data") {
+      // A frame's payload is the sum of its data: lines, so the cap has to be
+      // checked on the accumulation rather than per line.
+      if (data_.size() + value.size() + 1 > kMaxSseFrameBytes) {
+        clear();
+        return FrameState::kPartial;
+      }
       if (!data_.empty()) data_.push_back('\n');
       data_ += value;
     } else if (field == "id") {

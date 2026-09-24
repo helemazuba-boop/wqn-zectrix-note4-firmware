@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <utility>
@@ -18,11 +19,32 @@
 #include "esp_log.h"
 #include "sse_chunk.h"
 
+namespace wqn {
+// Both are defined in the `wqn` namespace at the bottom of this file. The
+// anonymous-namespace code below reaches them before their definitions are
+// visible, so they are declared here at global scope: a nested
+// `namespace wqn` inside the anonymous namespace would declare a different,
+// never-defined function.
+esp_err_t PostQuestionReply(const std::string& token,
+                            const std::string& session_id,
+                            const std::string& question_id,
+                            const std::string& answer,
+                            OpenCodeResult* result);
+esp_err_t InterruptOpenCodeSession(const std::string& token,
+                                   const std::string& session_id,
+                                   OpenCodeResult* result);
+}  // namespace wqn
+
 namespace {
 
 constexpr char kTag[] = "wqn_opencode_api";
 constexpr size_t kMaxJsonResponseBytes = 16 * 1024;
 constexpr size_t kMaxPromptBytes = 4096;
+// Backfill caps. The gateway already truncates to the device's JSON budget;
+// these stop a future gateway change from turning one backfill into an
+// unbounded heap allocation on a 4 KB-stack worker.
+constexpr int kMaxHistoryMessages = 24;
+constexpr int kMaxHistoryTools = 8;
 
 std::string AgentUrl(const char* path)
 {
@@ -203,6 +225,15 @@ void DispatchAgentEvent(
     } else if (event_name == "agent.text") {
         event.kind = wqn::OpenCodeEventKind::kText;
         event.text = JsonString(root, "text");
+    } else if (event_name == "agent.reasoning.delta") {
+        // Reasoning travels its own channel. It is never folded into
+        // `agent.text`, so a gateway mapping bug cannot leak chain-of-thought
+        // into the answer.
+        event.kind = wqn::OpenCodeEventKind::kReasoningDelta;
+        event.text = JsonString(root, "delta");
+    } else if (event_name == "agent.reasoning") {
+        event.kind = wqn::OpenCodeEventKind::kReasoning;
+        event.text = JsonString(root, "text");
     } else if (event_name == "agent.tool") {
         event.kind = wqn::OpenCodeEventKind::kTool;
         event.tool = JsonString(root, "tool");
@@ -214,10 +245,43 @@ void DispatchAgentEvent(
         event.tool = JsonString(root, "type");
         event.text = JsonString(root, "title");
         event.preview = JsonString(root, "preview");
+    } else if (event_name == "agent.question") {
+        // The gateway projects the upstream form onto at most two options; a
+        // form with more than two is delivered as `agent.status` instead, so an
+        // empty `options` here is a malformed frame and is dropped below.
+        event.kind = wqn::OpenCodeEventKind::kQuestion;
+        event.question_id = JsonString(root, "question_id");
+        event.text = JsonString(root, "title");
+        cJSON* options = cJSON_GetObjectItemCaseSensitive(root, "options");
+        if (cJSON_IsArray(options)) {
+            const int option_count = std::min<int>(cJSON_GetArraySize(options), 2);
+            event.question_options.reserve(static_cast<size_t>(option_count));
+            for (int i = 0; i < option_count; ++i) {
+                const cJSON* option = cJSON_GetArrayItem(options, i);
+                if (!cJSON_IsObject(option)) {
+                    continue;
+                }
+                wqn::OpenCodeQuestionOption projected;
+                projected.value = JsonString(const_cast<cJSON*>(option), "value");
+                projected.label = JsonString(const_cast<cJSON*>(option), "label");
+                if (!projected.value.empty()) {
+                    event.question_options.push_back(std::move(projected));
+                }
+            }
+        }
+        if (event.question_id.empty() || event.question_options.empty()) {
+            cJSON_Delete(root);
+            return;
+        }
     } else if (event_name == "agent.error") {
         event.kind = wqn::OpenCodeEventKind::kError;
         event.text = JsonString(root, "message");
     } else {
+        // Whitelist stays whitelist: an event the gateway invented and this
+        // firmware does not know is dropped, never surfaced as text. Log it at
+        // debug level so on-device verification can spot "cloud maps it,
+        // firmware does not" without a reflash-to-printf cycle.
+        ESP_LOGD(kTag, "unhandled Agent SSE event: %s", event_name.c_str());
         cJSON_Delete(root);
         return;
     }
@@ -225,26 +289,52 @@ void DispatchAgentEvent(
     callback(event, callback_ctx);
 }
 
-esp_err_t PostPermissionReply(
+esp_err_t PostOutboundReply(
     const std::string& token,
     const std::string& session_id,
     const wqn::OpenCodeOutboundReply& reply)
 {
-    cJSON* root = cJSON_CreateObject();
-    if (root == nullptr) {
-        return ESP_ERR_NO_MEM;
+    std::string body;
+    std::string path;
+    if (reply.is_question) {
+        // The device sends the option's value; the gateway turns it into the
+        // upstream form's `{[fieldKey]: value}` answer record, because only the
+        // cloud knows which field the projected options came from.
+        wqn::OpenCodeResult question_result;
+        const esp_err_t question_error = wqn::PostQuestionReply(
+            token, session_id, reply.question_id, reply.answer, &question_result);
+        if (question_error != ESP_OK) {
+            // Surface the allocator/transport state alongside the gateway
+            // error: a failed reply here is exactly the internal-RAM
+            // contention pattern the 2026-09 RCA documented, so the log has to
+            // be diagnosable.
+            ESP_LOGW(kTag,
+                     "question reply rejected: %s (%s) err=%s internal_free=%u dma_largest=%u",
+                     question_result.error_code.c_str(),
+                     question_result.detail.c_str(),
+                     esp_err_to_name(question_error),
+                     static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
+                     static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_DMA)));
+        }
+        return question_error;
     }
-    cJSON_AddStringToObject(root, "permission_id", reply.permission_id.c_str());
-    cJSON_AddStringToObject(root, "decision", reply.approve ? "once" : "reject");
-    cJSON_AddBoolToObject(root, "confirmed", true);
-    char* printed = cJSON_PrintUnformatted(root);
-    cJSON_Delete(root);
-    if (printed == nullptr) {
-        return ESP_ERR_NO_MEM;
+    {
+        cJSON* root = cJSON_CreateObject();
+        if (root == nullptr) {
+            return ESP_ERR_NO_MEM;
+        }
+        cJSON_AddStringToObject(root, "permission_id", reply.permission_id.c_str());
+        cJSON_AddStringToObject(root, "decision", reply.approve ? "once" : "reject");
+        cJSON_AddBoolToObject(root, "confirmed", true);
+        char* printed = cJSON_PrintUnformatted(root);
+        cJSON_Delete(root);
+        if (printed == nullptr) {
+            return ESP_ERR_NO_MEM;
+        }
+        body = printed;
+        cJSON_free(printed);
+        path = "/agent/sessions/" + session_id + "/permission";
     }
-    const std::string body = printed;
-    cJSON_free(printed);
-    const std::string path = "/agent/sessions/" + session_id + "/permission";
     std::string response_body;
     wqn::OpenCodeResult reply_result;
     const esp_err_t request_result = OpenJsonRequest(
@@ -269,6 +359,11 @@ esp_err_t PostPermissionReply(
     return request_result;
 }
 
+// Ask upstream to stop a run. Returns ESP_OK whenever the gateway accepted the
+// request, including when it reports that nothing was running: `interrupted:
+// false` is a successful "already finished", not a failure. Defined in the
+// `wqn` namespace below because the read loop below calls it.
+
 struct AgentStreamRequest {
     const std::string& token;
     const std::string& path;
@@ -280,6 +375,13 @@ struct AgentStreamRequest {
     wqn::OpenCodeEventCallback callback;
     void* callback_ctx;
     wqn::OpenCodeResult* result;
+    // Set by the session layer (from the UI thread) to ask the worker to stop
+    // this stream. The worker is the only task allowed to make the interrupt
+    // POST, so the UI thread never opens a connection of its own.
+    std::atomic<bool>* interrupt_requested = nullptr;
+    // Set by the worker once it has actually delivered the interrupt, so the
+    // session layer can report "已中止" instead of a transport failure.
+    std::atomic<bool>* interrupt_delivered = nullptr;
 };
 
 void DrainOutboundReplies(const AgentStreamRequest& request)
@@ -293,7 +395,7 @@ void DrainOutboundReplies(const AgentStreamRequest& request)
         // short-lived second connection, but never a second task or a second
         // long-lived TLS session, and the stream itself keeps its socket.
         const esp_err_t reply_error =
-            PostPermissionReply(request.token, request.session_id, reply);
+            PostOutboundReply(request.token, request.session_id, reply);
         if (reply_error != ESP_OK && request.reply_failed != nullptr) {
             request.reply_failed(reply, reply_error, request.reply_failed_ctx);
         }
@@ -352,6 +454,19 @@ esp_err_t ReadAgentEventStream(const AgentStreamRequest& request)
     std::array<char, 768> buffer = {};
     bool idle_seen = false;
     while (request_result == ESP_OK && !idle_seen) {
+        if (request.interrupt_requested != nullptr &&
+            request.interrupt_requested->load(std::memory_order_acquire)) {
+            // This loop is the only place that can end the stream, so it is
+            // also the only place that can perform the interrupt. Without it a
+            // cancel press would be invisible until the gateway itself closed
+            // the run, i.e. up to the 30-minute outer timeout.
+            const esp_err_t interrupt_error =
+                wqn::InterruptOpenCodeSession(request.token, request.session_id, nullptr);
+            if (interrupt_error == ESP_OK && request.interrupt_delivered != nullptr) {
+                request.interrupt_delivered->store(true, std::memory_order_release);
+            }
+            break;
+        }
         const int count = esp_http_client_read(client, buffer.data(), buffer.size());
         if (count < 0) {
             request_result = ESP_FAIL;
@@ -360,7 +475,14 @@ esp_err_t ReadAgentEventStream(const AgentStreamRequest& request)
         if (count == 0) {
             break;
         }
-        parser.feed(buffer.data(), static_cast<size_t>(count));
+        if (!parser.feed(buffer.data(), static_cast<size_t>(count))) {
+            // A frame past the device's JSON budget cannot be parsed even when
+            // complete, so this is a broken stream rather than a dropped frame.
+            SetResultError(request.result, request.result->http_status, "frame_overflow",
+                           "Agent stream frame exceeded the device limit");
+            request_result = ESP_FAIL;
+            break;
+        }
         std::string event_name;
         uint64_t event_id = 0;
         std::string event_data;
@@ -381,6 +503,13 @@ esp_err_t ReadAgentEventStream(const AgentStreamRequest& request)
     }
     esp_http_client_close(client);
     esp_http_client_cleanup(client);
+    const bool interrupted = request.interrupt_delivered != nullptr &&
+        request.interrupt_delivered->load(std::memory_order_acquire);
+    if (interrupted) {
+        // Ending by request is a success, not an incomplete stream: the run is
+        // over because the user stopped it.
+        return ESP_OK;
+    }
     if (request_result == ESP_OK && !idle_seen) {
         SetResultError(request.result, request.result->http_status, "stream_incomplete", "Agent stream ended before idle");
         return ESP_FAIL;
@@ -522,6 +651,8 @@ esp_err_t RunOpenCodePrompt(
     OpenCodeOutboundQueue* outbound_replies,
     OpenCodeReplyFailedCallback reply_failed,
     void* reply_failed_ctx,
+    std::atomic<bool>* interrupt_requested,
+    std::atomic<bool>* interrupt_delivered,
     OpenCodeEventCallback callback,
     void* callback_ctx,
     OpenCodeResult* result)
@@ -555,7 +686,9 @@ esp_err_t RunOpenCodePrompt(
         reply_failed_ctx,
         callback,
         callback_ctx,
-        result};
+        result,
+        interrupt_requested,
+        interrupt_delivered};
     return ReadAgentEventStream(request);
 }
 
@@ -565,6 +698,8 @@ esp_err_t WatchOpenCodeSession(
     OpenCodeOutboundQueue* outbound_replies,
     OpenCodeReplyFailedCallback reply_failed,
     void* reply_failed_ctx,
+    std::atomic<bool>* interrupt_requested,
+    std::atomic<bool>* interrupt_delivered,
     OpenCodeEventCallback callback,
     void* callback_ctx,
     OpenCodeResult* result)
@@ -584,7 +719,9 @@ esp_err_t WatchOpenCodeSession(
         reply_failed_ctx,
         callback,
         callback_ctx,
-        result};
+        result,
+        interrupt_requested,
+        interrupt_delivered};
     return ReadAgentEventStream(request);
 }
 
@@ -652,6 +789,149 @@ esp_err_t CreateOpenCodeSession(
         session->title = "新 Session";
     }
     return ESP_OK;
+}
+
+// Ask upstream to stop a run. Returns ESP_OK whenever the gateway accepted the
+// request, including when it reports that nothing was running: `interrupted:
+// false` is a successful "already finished", not a failure.
+esp_err_t InterruptOpenCodeSession(
+    const std::string& token,
+    const std::string& session_id,
+    OpenCodeResult* result)
+{
+    if (token.empty() || session_id.rfind("ses_", 0) != 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (result != nullptr) {
+        *result = OpenCodeResult{};
+    }
+    static const std::string kBody = "{}";
+    std::string response_body;
+    const esp_err_t request_result = OpenJsonRequest(
+        token,
+        AgentUrl(("/agent/sessions/" + session_id + "/interrupt").c_str()),
+        HTTP_METHOD_POST,
+        &kBody,
+        &response_body,
+        result);
+    if (request_result != ESP_OK) {
+        return request_result;
+    }
+    cJSON* root = protocol::JsonNestingWithinLimit(response_body.data(), response_body.size())
+        ? cJSON_ParseWithLength(response_body.data(), response_body.size())
+        : nullptr;
+    cJSON* data = root != nullptr ? cJSON_GetObjectItemCaseSensitive(root, "data") : nullptr;
+    const bool interrupted = JsonString(data, "interrupted") != "false";
+    cJSON_Delete(root);
+    ESP_LOGI(kTag, "session interrupt %s: %s", session_id.c_str(),
+             interrupted ? "delivered" : "no-op");
+    return ESP_OK;
+}
+
+esp_err_t GetOpenCodeHistory(
+    const std::string& token,
+    const std::string& session_id,
+    std::vector<OpenCodeHistoryMessage>* messages,
+    OpenCodeResult* result)
+{
+    if (token.empty() || session_id.rfind("ses_", 0) != 0 ||
+        messages == nullptr || result == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *result = OpenCodeResult{};
+    messages->clear();
+    std::string body;
+    const esp_err_t request_result = OpenJsonRequest(
+        token,
+        AgentUrl(("/agent/sessions/" + session_id + "/history").c_str()),
+        HTTP_METHOD_GET,
+        nullptr,
+        &body,
+        result);
+    if (request_result != ESP_OK) {
+        return request_result;
+    }
+    cJSON* root = protocol::JsonNestingWithinLimit(body.data(), body.size())
+        ? cJSON_ParseWithLength(body.data(), body.size())
+        : nullptr;
+    cJSON* data = root != nullptr ? cJSON_GetObjectItemCaseSensitive(root, "data") : nullptr;
+    cJSON* rows = data != nullptr ? cJSON_GetObjectItemCaseSensitive(data, "messages") : nullptr;
+    if (!cJSON_IsArray(rows)) {
+        cJSON_Delete(root);
+        SetResultError(result, result->http_status, "invalid_response", "History is invalid");
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    const int count = std::min<int>(cJSON_GetArraySize(rows), kMaxHistoryMessages);
+    messages->reserve(static_cast<size_t>(count));
+    for (int index = 0; index < count; ++index) {
+        cJSON* row = cJSON_GetArrayItem(rows, index);
+        OpenCodeHistoryMessage message;
+        message.role = JsonString(row, "role");
+        message.text = JsonString(row, "text");
+        message.thinking = JsonString(row, "thinking");
+        cJSON* tools = cJSON_GetObjectItemCaseSensitive(row, "tools");
+        if (cJSON_IsArray(tools)) {
+            const int tool_count = std::min<int>(cJSON_GetArraySize(tools), kMaxHistoryTools);
+            message.tools.reserve(static_cast<size_t>(tool_count));
+            for (int t = 0; t < tool_count; ++t) {
+                cJSON* tool_row = cJSON_GetArrayItem(tools, t);
+                if (!cJSON_IsObject(tool_row)) {
+                    continue;
+                }
+                OpenCodeHistoryTool tool;
+                tool.name = JsonString(tool_row, "name");
+                tool.status = JsonString(tool_row, "status");
+                tool.preview = JsonString(tool_row, "preview");
+                if (!tool.name.empty()) {
+                    message.tools.push_back(std::move(tool));
+                }
+            }
+        }
+        // Only the two roles the gateway projects are backfilled; an empty
+        // assistant row would render as a blank bubble.
+        if ((message.role == "user" || message.role == "assistant") &&
+            (!message.text.empty() || !message.thinking.empty() || !message.tools.empty())) {
+            messages->push_back(std::move(message));
+        }
+    }
+    cJSON_Delete(root);
+    return ESP_OK;
+}
+
+esp_err_t PostQuestionReply(
+    const std::string& token,
+    const std::string& session_id,
+    const std::string& question_id,
+    const std::string& answer,
+    OpenCodeResult* result)
+{
+    if (token.empty() || session_id.rfind("ses_", 0) != 0 ||
+        question_id.empty() || answer.empty() || result == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *result = OpenCodeResult{};
+    cJSON* root = cJSON_CreateObject();
+    if (root == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
+    cJSON_AddStringToObject(root, "question_id", question_id.c_str());
+    cJSON_AddStringToObject(root, "answer", answer.c_str());
+    cJSON_AddBoolToObject(root, "confirmed", true);
+    char* printed = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (printed == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
+    const std::string body = printed;
+    cJSON_free(printed);
+    std::string response_body;
+    return OpenJsonRequest(
+        token,
+        AgentUrl(("/agent/sessions/" + session_id + "/question").c_str()),
+        HTTP_METHOD_POST,
+        &body,
+        &response_body,
+        result);
 }
 
 }  // namespace wqn

@@ -69,16 +69,39 @@ std::string AgentOneLine(const std::string& text, int width)
 
 AgentOptionMode AgentOptionModeFor(const wqn::AgentSessionState& agent)
 {
-    // Permission first: it can only arrive while a run is live, and a run that
-    // is blocked on an ask is the more urgent of the two states.
+    // An ask first: either kind can only arrive while a run is live, and a run
+    // blocked on a decision is the more urgent of the two states. A malformed
+    // ask (no id, or a question the gateway projected no options for) is not
+    // answerable, so it falls through instead of drawing an unusable bar.
     if (agent.ui.phase == wqn::AiFeaturePhase::kAwaitingPermission &&
         !agent.pending_permission_id.empty()) {
         return AgentOptionMode::kPermission;
+    }
+    if (agent.ui.phase == wqn::AiFeaturePhase::kAwaitingQuestion &&
+        !agent.pending_question_id.empty() && !agent.pending_question_options.empty()) {
+        return AgentOptionMode::kQuestion;
     }
     if (agent.ui.requires_confirmation) {
         return AgentOptionMode::kConfirmSend;
     }
     return AgentOptionMode::kNone;
+}
+
+// Two is the bar's hard ceiling, not the gateway's: the gateway already caps a
+// projected form at two options for exactly this reason.
+int AgentQuestionSlotCount(const wqn::AgentSessionState& agent)
+{
+    return static_cast<int>(
+        std::min<size_t>(agent.pending_question_options.size(), 2));
+}
+
+int AgentQuestionFocusedSlot(const wqn::AgentSessionState& agent, uint8_t focused)
+{
+    const int count = AgentQuestionSlotCount(agent);
+    if (count <= 0) {
+        return 0;
+    }
+    return std::min<int>(focused, count - 1);
 }
 
 const char* AgentOptionLabel(AgentOption option)
@@ -106,30 +129,43 @@ AgentOption AgentFocusedOption(AgentOptionMode mode, uint8_t focused)
     return (focused == 0) ? first : second;
 }
 
-static void DrawAgentOptionBar(AgentOptionMode mode, uint8_t focused)
+static void DrawAgentOptionBar(AgentOptionMode mode, uint8_t focused,
+                                const wqn::AgentSessionState& agent)
 {
     // The band is cleared here rather than by the caller so a disappearing
     // option bar cannot leave a ghost on the E-ink panel.
     FillRect(0, kAgentBarY, wqn::kEpdWidth, kAgentBarH, false);
-    const AgentOption focused_option = AgentFocusedOption(mode, focused);
-    const AgentOption slots[2] = {
-        AgentFocusedOption(mode, 0),
-        AgentFocusedOption(mode, 1),
-    };
 
     // A rule above the bar separates it from the transcript above it.
     DrawHorizontalLine(0, kAgentBarY, wqn::kEpdWidth);
 
-    for (int i = 0; i < 2; ++i) {
+    const int slot_count = (mode == AgentOptionMode::kQuestion)
+        ? AgentQuestionSlotCount(agent)
+        : 2;
+    const int focused_slot = (mode == AgentOptionMode::kQuestion)
+        ? AgentQuestionFocusedSlot(agent, focused)
+        : (AgentFocusedOption(mode, focused) == AgentFocusedOption(mode, 1) ? 1 : 0);
+
+    for (int i = 0; i < slot_count; ++i) {
         const int x = kAgentBarLabelX + i * kAgentBarSlotStep;
-        const bool is_focused = slots[i] == focused_option;
-        if (is_focused) {
+        if (i == focused_slot) {
             // ▣ marker: a filled square says "this slot is armed" without
             // borrowing a directional chevron that would imply something else.
             FillRect(kAgentBarMarkerX + i * kAgentBarSlotStep, kAgentBarTextY + 3,
                      8, 8, true);
         }
-        AGENT_TEXT(x, kAgentBarTextY, AgentOptionLabel(slots[i]), true);
+        std::string label;
+        if (mode == AgentOptionMode::kQuestion) {
+            // The gateway projects {value,label}; an unlabelled option still
+            // shows its value rather than an empty slot.
+            label = agent.pending_question_options[i].label.empty()
+                ? agent.pending_question_options[i].value
+                : agent.pending_question_options[i].label;
+        } else {
+            label = AgentOptionLabel(
+                AgentFocusedOption(mode, static_cast<uint8_t>(i)));
+        }
+        AGENT_TEXT(x, kAgentBarTextY, AgentOneLine(label, 88).c_str(), true);
     }
 
     // Key legend, right-aligned, leaving the far-right 40 px clear.
@@ -304,13 +340,18 @@ esp_err_t RenderAgentAiToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule
             ? std::string("OpenCode 请求权限")
             : agent.ui.activity_text;
         DrawAgentPendingBubble(ask, "权限请求");
+    } else if (mode == AgentOptionMode::kQuestion) {
+        const std::string ask = agent.pending_question_title.empty()
+            ? std::string("OpenCode 请求回答")
+            : agent.pending_question_title;
+        DrawAgentPendingBubble(ask, "提问");
     } else {
         const std::string prompt = agent.ui.prompt_text.empty()
             ? std::string("(空)")
             : agent.ui.prompt_text;
         DrawAgentPendingBubble(prompt, "确认发送");
     }
-    DrawAgentOptionBar(mode, frame.agent_option.focused);
+    DrawAgentOptionBar(mode, frame.agent_option.focused, agent);
     return RefreshFrame(frame, schedule);
 }
 

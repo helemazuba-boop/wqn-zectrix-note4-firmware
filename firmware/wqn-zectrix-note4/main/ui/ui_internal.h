@@ -684,6 +684,11 @@ void RenderAiHistoryViewport(const wqn::AiSessionState& ai,
                              int32_t scroll_offset_lines);
 // Option-bar slots for the Agent tier's two-choice states. The order is the
 // ↑/↓ cycle order and the confirm action runs the focused slot.
+//
+// kQuestion is deliberately NOT part of this enum: its slots are the options the
+// gateway projected for a form, so their labels are data, not constants. The bar
+// keeps its two slots because the geometry and the ↑/↓ arithmetic assume
+// exactly two (see page_ai_agent.cpp's kAgentBarSlotStep and the key-hint strip).
 enum class AgentOption : uint8_t {
     kSend,
     kReinput,
@@ -696,11 +701,17 @@ enum class AgentOptionMode : uint8_t {
     kNone,
     kConfirmSend,   // voice transcript armed: 发送 / 重新输入
     kPermission,    // gateway ask pending: 同意 / 拒绝
+    kQuestion,      // gateway form pending: up to two projected options
 };
 AgentOptionMode AgentOptionModeFor(const wqn::AgentSessionState& agent);
 // The focused slot, clamped to the two the current mode actually offers.
 AgentOption AgentFocusedOption(AgentOptionMode mode, uint8_t focused);
 const char* AgentOptionLabel(AgentOption option);
+// How many options a pending question actually projects (at most two).
+int AgentQuestionSlotCount(const wqn::AgentSessionState& agent);
+// Focus index shared by the kQuestion render and its confirm action: the bar
+// draws `count` slots, and this clamps a carried-over focus into that range.
+int AgentQuestionFocusedSlot(const wqn::AgentSessionState& agent, uint8_t focused);
 
 // ---- Word page --------------------------------------------------------------
 

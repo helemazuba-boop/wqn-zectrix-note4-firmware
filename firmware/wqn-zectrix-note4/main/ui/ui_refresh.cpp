@@ -524,6 +524,20 @@ std::string FrameSignature(const wqn::UiFrame& frame)
         // signature or the bar keeps the previous mode's labels.
         signature.append(agent.pending_permission_id);
         signature.push_back('/');
+        // A question's bar carries gateway data (its question id, the projected
+        // option labels), so all three have to reach the signature: the id alone
+        // would keep a re-armed ask's previous labels on screen.
+        signature.append(agent.pending_question_id);
+        signature.push_back('/');
+        signature.append(agent.pending_question_title);
+        signature.push_back('/');
+        for (const wqn::OpenCodeQuestionOption& option : agent.pending_question_options) {
+            signature.push_back('/');
+            signature.append(option.value);
+            signature.push_back(':');
+            signature.append(option.label);
+        }
+        signature.push_back('|');
         // Option-bar focus: without it the ▣ marker never moves.
         signature.append(std::to_string(frame.agent_option.focused));
         signature.push_back('/');

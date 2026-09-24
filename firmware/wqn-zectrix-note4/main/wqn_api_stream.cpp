@@ -222,7 +222,16 @@ esp_err_t OnHttpEvent(esp_http_client_event_t* evt)
         // discard the body of an error response; we'll surface the code shortly
         return ESP_OK;
       }
-      ctx->parser.feed(static_cast<const char*>(evt->data), evt->data_len);
+      if (!ctx->parser.feed(static_cast<const char*>(evt->data), evt->data_len)) {
+        // A frame past the device's JSON budget cannot be parsed even when
+        // complete, so the stream is broken rather than missing a frame.
+        if (!ctx->fatal) {
+          ctx->fatal = true;
+          ctx->error_code = "frame_overflow";
+          ctx->error_message = "stream frame exceeded the device limit";
+        }
+        return ESP_OK;
+      }
       std::string ev_name;
       uint64_t ev_id = 0;
       std::string ev_data;

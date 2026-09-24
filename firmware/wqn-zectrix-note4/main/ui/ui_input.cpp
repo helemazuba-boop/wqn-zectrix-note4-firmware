@@ -593,6 +593,25 @@ static RefreshSchedule ExecuteAgentOption(wqn::UiState* state,
     return RefreshSchedule::kAi;
 }
 
+// A question is not one of the two fixed AgentOption slots: its labels are data
+// the gateway projected, so it is answered by slot index instead of by option.
+// The index is already clamped by AgentQuestionFocusedSlot, so it can only ever
+// name an option the bar is actually showing.
+static RefreshSchedule ExecuteAgentQuestion(wqn::UiState* state, uint8_t focused)
+{
+    const int slot =
+        device_ui_internal::AgentQuestionFocusedSlot(state->agent, focused);
+    if (wqn::ReplyPendingOpenCodeQuestion(slot) == ESP_OK) {
+        ESP_LOGI(kTag, "Agent option: question answer slot=%d", slot);
+    } else {
+        ESP_LOGW(kTag, "Agent option: question reply rejected (ask moved on?)");
+        return RefreshSchedule::kNone;
+    }
+    state->agent_option.focused = 0;
+    SyncAgentSnapshot(state);
+    return RefreshSchedule::kAi;
+}
+
 static RefreshSchedule ApplyAgentOptionBarEvent(
     const wqn::ButtonEvent& event,
     int64_t now_ms,
@@ -605,6 +624,9 @@ static RefreshSchedule ApplyAgentOptionBarEvent(
         // "first tap" would strand the user on a focused-but-unexecuted bar.
         if (event.type == wqn::ButtonEventType::kShortPress ||
             event.type == wqn::ButtonEventType::kDoublePress) {
+            if (mode == device_ui_internal::AgentOptionMode::kQuestion) {
+                return ExecuteAgentQuestion(state, state->agent_option.focused);
+            }
             return ExecuteAgentOption(
                 state, device_ui_internal::AgentFocusedOption(mode, state->agent_option.focused),
                 now_ms);
@@ -615,7 +637,15 @@ static RefreshSchedule ApplyAgentOptionBarEvent(
     }
     if (event.button == wqn::ButtonId::kUp || event.button == wqn::ButtonId::kDownPower) {
         if (event.type == wqn::ButtonEventType::kShortPress) {
-            state->agent_option.focused ^= 1u;  // exactly two slots
+            // Focus flips between exactly two slots -- except for a question the
+            // gateway projected a single option for, where moving the marker
+            // would park it on a slot that does not exist.
+            const int slots = (mode == device_ui_internal::AgentOptionMode::kQuestion)
+                ? device_ui_internal::AgentQuestionSlotCount(state->agent)
+                : 2;
+            if (slots > 1) {
+                state->agent_option.focused ^= 1u;
+            }
             return RefreshSchedule::kAi;
         }
         return RefreshSchedule::kNone;
@@ -713,6 +743,20 @@ static AgentInputResult TryApplyAgentAiButtonEvent(
     }
     if (!state->agent.session_locked) {
         *out_schedule = ApplyAgentPickerEvent(event, event_time_ms, state);
+        return AgentInputResult::kHandled;
+    }
+    // [interrupt] A submitted run has no option bar -- there is nothing to
+    // decide -- so its cancel gesture has to live here, on long-confirm. It is
+    // deliberately not a short press: the confirm key is the PTT gesture on this
+    // page, and a short press during a run must stay free for the next prompt.
+    // CancelOpenCodePrompt already routes here when no stream is attached yet.
+    if (event.button == wqn::ButtonId::kConfirm &&
+        event.type == wqn::ButtonEventType::kLongRelease &&
+        state->agent.stream_active) {
+        wqn::InterruptOpenCodeRun();
+        ESP_LOGI(kTag, "Agent run: interrupt requested");
+        SyncAgentSnapshot(state);
+        *out_schedule = RefreshSchedule::kAi;
         return AgentInputResult::kHandled;
     }
     return AgentInputResult::kFallThrough;

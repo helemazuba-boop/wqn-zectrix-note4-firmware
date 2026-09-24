@@ -1,6 +1,7 @@
 #include "opencode_session.h"
 
 #include <algorithm>
+#include <atomic>
 #include <utility>
 
 #if CONFIG_WQN_AGENT_ENABLE
@@ -24,6 +25,11 @@ namespace {
 constexpr char kTag[] = "wqn_agent";
 constexpr TickType_t kConnectivityWait = pdMS_TO_TICKS(20000);
 constexpr size_t kMaxAgentTextBytes = 12 * 1024;
+// Reasoning gets its own budget rather than sharing the answer's: a long
+// chain-of-thought must not starve the reply the user actually asked for, and
+// the history channel is evicted oldest-first, so an unbounded thinking buffer
+// would push the whole conversation out of the ring.
+constexpr size_t kMaxThinkingBytes = 2 * 1024;
 constexpr size_t kMaxPromptBytes = 4096;
 constexpr uint32_t kWorkerStackBytes = 9216;
 
@@ -35,6 +41,7 @@ enum class WorkerCommand : uint8_t {
     kTranscribe,
     kRunPrompt,
     kObserveSession,
+    kLoadHistory,
 };
 
 StaticSemaphore_t g_lock_storage = {};
@@ -51,10 +58,18 @@ bool g_observing = false;
 std::string g_run_session_id;
 std::string g_run_prompt;
 wqn::OpenCodeOutboundQueue g_outbound_replies;
+// Cancel handshake for an attached stream. The UI thread only sets the request;
+// the worker is the one that makes the interrupt POST, so it is also the one
+// that records whether the interrupt actually reached the gateway.
+std::atomic<bool> g_interrupt_requested{false};
+std::atomic<bool> g_interrupt_delivered{false};
 wqn::runtime::SleepLease g_agent_sleep_lease;
 wqn::services::ConnectivityDemand g_connectivity_demand;
 
 void DiscardOutboundReplies();
+// Declared up here: clearing a pending ask is part of every terminal status and
+// of every list load, which run long before the definition below.
+void ClearPendingQuestionLocked();
 
 void MarkChangedLocked()
 {
@@ -167,6 +182,10 @@ void LoadSessions()
             g_state.current_session_id.clear();
             g_state.current_session_title.clear();
             g_state.pending_permission_id.clear();
+            ClearPendingQuestionLocked();
+            // A fresh list means no session's transcript is on screen any more,
+            // so the next observe must backfill again.
+            g_state.history_loaded_session_id.clear();
             g_observing = false;
             g_state.ui.context_label.clear();
             g_state.ui.prompt_text.clear();
@@ -304,9 +323,24 @@ void Transcribe()
 // from the visible tier: a run started on one tier must never append to
 // another tier's conversation. Everything below runs with g_lock held.
 
+// The renderer draws a thinking bubble from the message kind alone; the marker
+// prefix is the caller's, matching ai_session.cpp / flash_session.cpp.
+std::string AgentThinkingLabel(const std::string& text)
+{
+    return text.empty() ? std::string() : std::string("\xE2\x9C\x8D ") + text;
+}
+
 wqn::ChatMessageId g_agent_assistant_id = wqn::kInvalidChatMessageId;
 wqn::ChatMessageId g_agent_tool_id = wqn::kInvalidChatMessageId;
+wqn::ChatMessageId g_agent_thinking_id = wqn::kInvalidChatMessageId;
 std::string g_agent_tool_name;
+// Reasoning has its own channel and its own buffer. It is deliberately NOT
+// accumulated into `g_state.ui.response_text`: even if the gateway mapped a
+// reasoning frame as `agent.text`, the answer the user reads would stay clean.
+std::string g_agent_thinking_text;
+// Whether the open tool block succeeded. The gateway's `agent.tool` status is
+// the only signal available; `error` is the failure case.
+bool g_agent_tool_ok = true;
 // Last status/preview seen for the open tool block. The gateway's `agent.tool`
 // event carries a free-form status string, not an explicit start/end pair, so
 // the newest detail wins and the block is closed by whatever arrives next.
@@ -317,9 +351,12 @@ void ResetAgentHistoryTurnLocked()
 {
     g_agent_assistant_id = wqn::kInvalidChatMessageId;
     g_agent_tool_id = wqn::kInvalidChatMessageId;
+    g_agent_thinking_id = wqn::kInvalidChatMessageId;
     g_agent_tool_name.clear();
+    g_agent_thinking_text.clear();
     g_agent_tool_detail.clear();
     g_agent_tool_since_ms = 0;
+    g_agent_tool_ok = true;
 }
 
 // Closes the open tool placeholder into a result block. Because the gateway
@@ -357,7 +394,7 @@ void CloseAgentToolBlockLocked(bool ok, int64_t now_ms)
 // blow through the ring buffer's byte budget before the reply finished.
 void MirrorAgentTextLocked(int64_t now_ms)
 {
-    CloseAgentToolBlockLocked(true, now_ms);
+    CloseAgentToolBlockLocked(g_agent_tool_ok, now_ms);
     const std::string& text = g_state.ui.response_text;
     if (text.empty()) {
         return;
@@ -368,6 +405,28 @@ void MirrorAgentTextLocked(int64_t now_ms)
         return;
     }
     history.ReplaceText(g_agent_assistant_id, wqn::ChatMessageKind::kAssistant, text, now_ms);
+}
+
+// Same in-place contract as MirrorAgentTextLocked, on the thinking channel. The
+// gateway can emit hundreds of reasoning deltas for one turn, and each new
+// `kThinking` message would evict the ring buffer's head -- i.e. the rest of
+// the conversation -- before the reply even finished.
+void MirrorAgentThinkingLocked(int64_t now_ms)
+{
+    CloseAgentToolBlockLocked(g_agent_tool_ok, now_ms);
+    if (g_agent_thinking_text.empty()) {
+        return;
+    }
+    // Post-tool reasoning must open a NEW entry for the same reason post-tool
+    // text does (see CloseAgentToolBlockLocked).
+    if (g_agent_thinking_id == wqn::kInvalidChatMessageId) {
+        g_agent_thinking_id = wqn::GetAiHistory(wqn::AiHistoryChannel::kAgent)
+                                  .AppendThinking(AgentThinkingLabel(g_agent_thinking_text), now_ms);
+        return;
+    }
+    wqn::GetAiHistory(wqn::AiHistoryChannel::kAgent).ReplaceText(
+        g_agent_thinking_id, wqn::ChatMessageKind::kThinking,
+        AgentThinkingLabel(g_agent_thinking_text), now_ms);
 }
 
 // Records the submitted prompt and arms a fresh turn. Called before the worker
@@ -384,8 +443,56 @@ void AppendAgentErrorLocked(std::string_view text, int64_t now_ms)
 {
     CloseAgentToolBlockLocked(false, now_ms);
     g_agent_assistant_id = wqn::kInvalidChatMessageId;
+    g_agent_thinking_id = wqn::kInvalidChatMessageId;
+    g_agent_thinking_text.clear();
     if (!text.empty()) {
         wqn::GetAiHistory(wqn::AiHistoryChannel::kAgent).AppendAssistant(text, now_ms);
+    }
+}
+
+void ClearPendingQuestionLocked()
+{
+    g_state.pending_question_id.clear();
+    g_state.pending_question_title.clear();
+    g_state.pending_question_options.clear();
+}
+
+// Replays one session's backfilled turns into the kAgent channel, oldest first.
+// The gateway already chose the window and truncated each field, so this is a
+// direct projection: no dedupe against live deltas, because the caller resets
+// the turn lock first and subscribes to the stream only afterwards.
+void BackfillAgentHistoryLocked(const std::vector<wqn::OpenCodeHistoryMessage>& messages,
+                                int64_t now_ms)
+{
+    wqn::AiHistory& history = wqn::GetAiHistory(wqn::AiHistoryChannel::kAgent);
+    for (const wqn::OpenCodeHistoryMessage& message : messages) {
+        if (message.role == "user") {
+            if (!message.text.empty()) {
+                history.AppendUser(message.text, now_ms);
+            }
+            continue;
+        }
+        if (message.role != "assistant") {
+            continue;
+        }
+        if (!message.thinking.empty()) {
+            history.AppendThinking(AgentThinkingLabel(message.thinking), now_ms);
+        }
+        if (!message.text.empty()) {
+            history.AppendAssistant(message.text, now_ms);
+        }
+        for (const wqn::OpenCodeHistoryTool& tool : message.tools) {
+            if (tool.name.empty()) {
+                continue;
+            }
+            // Append-then-close keeps one finished block per call. The tool
+            // placeholder has no separate start event on this path, so there is
+            // no turn lock to maintain either.
+            history.AppendToolStart(tool.name, std::string_view(), now_ms);
+            history.PopLastIf(wqn::ChatMessageKind::kToolStart);
+            history.AppendToolResult(tool.name, std::string_view(), tool.preview,
+                                     tool.status != "error", 0, now_ms);
+        }
     }
 }
 
@@ -403,7 +510,15 @@ void OnOpenCodeEvent(const wqn::OpenCodeEvent& event, void*)
             g_state.ui.activity_text = "已连接 Session 事件流";
             break;
         case wqn::OpenCodeEventKind::kStatus:
-            g_state.pending_permission_id.clear();
+            // [P3c] A pending ask is only cleared by a terminal status. Clearing
+            // it on every status frame disarmed a live ask whenever the gateway
+            // emitted an incidental one (retry, compaction), and the device then
+            // had no way to answer it -- the run blocked until the 30-minute
+            // stream timeout and surfaced as stream_incomplete.
+            if (event.status == "idle" || event.status == "error") {
+                g_state.pending_permission_id.clear();
+                ClearPendingQuestionLocked();
+            }
             if (event.status == "idle") {
                 g_state.stream_active = false;
                 // Run finished: close a tool block the gateway never closed.
@@ -445,6 +560,21 @@ void OnOpenCodeEvent(const wqn::OpenCodeEvent& event, void*)
             MirrorAgentTextLocked(now_ms);
             MarkChangedLocked();
             break;
+        case wqn::OpenCodeEventKind::kReasoningDelta:
+            // Reasoning is bounded by its own budget, never by the answer's.
+            if (g_agent_thinking_text.size() < kMaxThinkingBytes) {
+                const size_t remaining = kMaxThinkingBytes - g_agent_thinking_text.size();
+                g_agent_thinking_text.append(event.text.data(),
+                                             std::min(remaining, event.text.size()));
+                MirrorAgentThinkingLocked(now_ms);
+            }
+            MarkChangedLocked();
+            break;
+        case wqn::OpenCodeEventKind::kReasoning:
+            g_agent_thinking_text = event.text.substr(0, kMaxThinkingBytes);
+            MirrorAgentThinkingLocked(now_ms);
+            MarkChangedLocked();
+            break;
         case wqn::OpenCodeEventKind::kTool: {
             g_state.ui.activity_text = event.tool;
             if (!event.status.empty()) {
@@ -453,6 +583,7 @@ void OnOpenCodeEvent(const wqn::OpenCodeEvent& event, void*)
             if (!event.preview.empty()) {
                 g_state.ui.activity_text += " · " + event.preview;
             }
+            g_agent_tool_ok = event.status != "error";
             // Coalesce by tool name: the gateway re-emits `agent.tool` as a
             // tool progresses, and one history block per tool keeps the
             // transcript readable on a 400x300 panel.
@@ -460,7 +591,7 @@ void OnOpenCodeEvent(const wqn::OpenCodeEvent& event, void*)
                 g_agent_tool_name == event.tool) {
                 g_agent_tool_detail = event.preview.empty() ? event.status : event.preview;
             } else {
-                CloseAgentToolBlockLocked(true, now_ms);
+                CloseAgentToolBlockLocked(g_agent_tool_ok, now_ms);
                 g_agent_tool_id = wqn::GetAiHistory(wqn::AiHistoryChannel::kAgent)
                                       .AppendToolStart(event.tool, std::string_view(), now_ms);
                 g_agent_tool_name = event.tool;
@@ -484,9 +615,30 @@ void OnOpenCodeEvent(const wqn::OpenCodeEvent& event, void*)
             // outcome already shows up as the tool blocks and text that follow.
             MarkChangedLocked();
             break;
+        case wqn::OpenCodeEventKind::kQuestion:
+            // A question and a permission can never be live at once: the option
+            // bar has one mode, and the session state has one pending ask. A
+            // second concurrent ask is dropped here -- the gateway's own single
+            // slot does the same, and the next poll re-discovers it.
+            if (!g_state.pending_permission_id.empty()) {
+                ESP_LOGW(kTag, "question %s dropped: a permission ask is pending",
+                         event.question_id.c_str());
+                break;
+            }
+            g_state.ui.phase = wqn::AiFeaturePhase::kAwaitingQuestion;
+            g_state.ui.status_label = "等待回答";
+            g_state.pending_question_id = event.question_id;
+            g_state.pending_question_title = event.text;
+            g_state.pending_question_options = event.question_options;
+            g_state.ui.activity_text = event.text;
+            g_state.ui.action_hint = "↑/↓ 选择 · 确认回答";
+            // Not mirrored for the same reason a permission ask is not.
+            MarkChangedLocked();
+            break;
         case wqn::OpenCodeEventKind::kError:
             g_run_failed = true;
             g_state.pending_permission_id.clear();
+            ClearPendingQuestionLocked();
             g_state.ui.phase = wqn::AiFeaturePhase::kError;
             g_state.ui.status_label = "执行失败";
             g_state.ui.activity_text = event.text;
@@ -502,25 +654,39 @@ void OnOpenCodeReplyFailed(
     const wqn::OpenCodeOutboundReply& reply, esp_err_t error, void*)
 {
     xSemaphoreTake(g_lock, portMAX_DELAY);
-    if (g_state.ui.phase == wqn::AiFeaturePhase::kRunning &&
-        g_state.pending_permission_id.empty()) {
+    const bool superseded = reply.is_question
+        ? g_state.pending_question_id.empty() || g_state.pending_question_id != reply.question_id
+        : g_state.pending_permission_id.empty() ||
+          g_state.pending_permission_id != reply.permission_id;
+    if (g_state.ui.phase == wqn::AiFeaturePhase::kRunning && !superseded) {
         // No newer ask superseded this one: restore it so the reply can be
         // retried instead of leaving the run blocked behind a silent failure.
-        g_state.pending_permission_id = reply.permission_id;
-        g_state.ui.phase = wqn::AiFeaturePhase::kAwaitingPermission;
-        g_state.ui.status_label = "权限回复失败";
-        g_state.ui.activity_text = reply.approve ? "批准未送达，可重试"
-                                                 : "拒绝未送达，可重试";
-        g_state.ui.action_hint = "↑ 批准 · ↓ 拒绝";
+        if (reply.is_question) {
+            g_state.ui.phase = wqn::AiFeaturePhase::kAwaitingQuestion;
+            g_state.ui.status_label = "回答失败";
+            g_state.ui.activity_text = "回答未送达，可重试";
+            g_state.ui.action_hint = "↑/↓ 选择 · 确认回答";
+        } else {
+            g_state.pending_permission_id = reply.permission_id;
+            g_state.ui.phase = wqn::AiFeaturePhase::kAwaitingPermission;
+            g_state.ui.status_label = "权限回复失败";
+            g_state.ui.activity_text = reply.approve ? "批准未送达，可重试"
+                                                     : "拒绝未送达，可重试";
+            g_state.ui.action_hint = "↑ 批准 · ↓ 拒绝";
+        }
         MarkChangedLocked();
     } else {
-        ESP_LOGW(kTag, "permission reply failed: %s", esp_err_to_name(error));
+        ESP_LOGW(kTag, "%s reply failed: %s",
+                 reply.is_question ? "question" : "permission",
+                 esp_err_to_name(error));
     }
     xSemaphoreGive(g_lock);
 }
 
 void RunPrompt()
 {
+    g_interrupt_requested.store(false, std::memory_order_release);
+    g_interrupt_delivered.store(false, std::memory_order_release);
     std::string token;
     esp_err_t result = LoadToken(&token);
     if (result == ESP_OK) {
@@ -535,12 +701,23 @@ void RunPrompt()
             &g_outbound_replies,
             OnOpenCodeReplyFailed,
             nullptr,
+            &g_interrupt_requested,
+            &g_interrupt_delivered,
             OnOpenCodeEvent,
             nullptr,
             &api_result);
     }
     xSemaphoreTake(g_lock, portMAX_DELAY);
-    if (result != ESP_OK && !g_run_failed) {
+    if (g_interrupt_delivered.load(std::memory_order_acquire)) {
+        // Stopping the run on request is a success, not a failure.
+        g_state.ui.phase = wqn::AiFeaturePhase::kComplete;
+        g_state.ui.status_label = "已中止";
+        g_state.ui.activity_text = "任务已按确认键中止";
+        g_state.ui.action_hint = "长按确认发起新任务";
+        g_state.stream_active = false;
+        ReleaseWorkOwnershipLocked();
+        MarkChangedLocked();
+    } else if (result != ESP_OK && !g_run_failed) {
         SetErrorLocked(api_result.detail.empty() ? "Agent 执行连接失败" : api_result.detail);
     } else {
         g_state.stream_active = false;
@@ -573,6 +750,10 @@ void CreateSession()
         g_state.session_locked = true;
         g_observing = false;
         g_state.pending_permission_id.clear();
+        ClearPendingQuestionLocked();
+        // Nothing to backfill in an empty session; mark it loaded so the first
+        // observe attaches straight to the stream.
+        g_state.history_loaded_session_id = created.id;
         g_state.ui.context_label = created.title;
         g_state.ui.phase = wqn::AiFeaturePhase::kIdle;
         g_state.ui.status_label = "就绪";
@@ -609,12 +790,18 @@ void ObserveSession()
             &g_outbound_replies,
             OnOpenCodeReplyFailed,
             nullptr,
+            &g_interrupt_requested,
+            &g_interrupt_delivered,
             OnOpenCodeEvent,
             nullptr,
             &api_result);
     }
     xSemaphoreTake(g_lock, portMAX_DELAY);
-    if (result != ESP_OK && !g_run_failed) {
+    if (g_interrupt_delivered.load(std::memory_order_acquire)) {
+        g_state.stream_active = false;
+        ReleaseWorkOwnershipLocked();
+        MarkChangedLocked();
+    } else if (result != ESP_OK && !g_run_failed) {
         SetErrorLocked(api_result.detail.empty() ? "观察连接失败" : api_result.detail);
     } else {
         g_state.stream_active = false;
@@ -625,6 +812,59 @@ void ObserveSession()
     g_observing = false;
     xSemaphoreGive(g_lock);
     DiscardOutboundReplies();
+}
+
+// Backfills the transcript of the session the caller is about to attach to.
+// Failure is a warning, not an error: observing a live run must still work when
+// the history read fails, and the live deltas that follow are the authoritative
+// view anyway.
+void LoadHistory()
+{
+    std::string token;
+    esp_err_t result = LoadToken(&token);
+    if (result == ESP_OK) {
+        result = AcquireNetwork();
+    }
+    std::vector<wqn::OpenCodeHistoryMessage> messages;
+    wqn::OpenCodeResult api_result;
+    if (result == ESP_OK) {
+        result = wqn::GetOpenCodeHistory(token, g_run_session_id, &messages, &api_result);
+    }
+    xSemaphoreTake(g_lock, portMAX_DELAY);
+    if (result == ESP_OK) {
+        // Reset first, then append, then let the caller subscribe: the reverse
+        // order lets the first live delta land on a backfilled message id and
+        // overwrite history with new text.
+        ResetAgentHistoryTurnLocked();
+        BackfillAgentHistoryLocked(messages, esp_timer_get_time() / 1000);
+        g_state.history_loaded_session_id = g_run_session_id;
+        MarkChangedLocked();
+    } else {
+        ESP_LOGW(kTag, "history backfill failed for %s: %s (%s)",
+                 g_run_session_id.c_str(), api_result.error_code.c_str(),
+                 api_result.detail.c_str());
+    }
+    if (result == ESP_OK && g_observing) {
+        // Chain the observe stream behind the backfill: the stream must not
+        // attach until the history it precedes is already in the channel.
+        // ArmWorkerLocked writes g_command directly, so FinishCommand's guard
+        // (it only clears the command it just ran) leaves this one armed.
+        g_run_session_id = g_state.current_session_id;
+        g_state.ui.activity_text = "正在连接 Session 事件流";
+        if (ArmWorkerLocked(WorkerCommand::kObserveSession)) {
+            xSemaphoreGive(g_lock);
+            return;
+        }
+        g_run_session_id.clear();
+        g_state.ui.phase = wqn::AiFeaturePhase::kError;
+        g_state.ui.status_label = "观察失败";
+        g_state.ui.activity_text = "历史读取后无法连接事件流";
+        g_state.stream_active = false;
+        g_observing = false;
+    }
+    g_run_session_id.clear();
+    xSemaphoreGive(g_lock);
+    ReleaseWorkOwnershipLocked();
 }
 
 void WorkerTask(void*)
@@ -652,6 +892,9 @@ void WorkerTask(void*)
                 break;
             case WorkerCommand::kObserveSession:
                 ObserveSession();
+                break;
+            case WorkerCommand::kLoadHistory:
+                LoadHistory();
                 break;
             case WorkerCommand::kNone:
                 break;
@@ -776,6 +1019,10 @@ esp_err_t LockSelectedOpenCodeSession()
     g_state.session_locked = true;
     g_observing = false;
     g_state.pending_permission_id.clear();
+    ClearPendingQuestionLocked();
+    // The mirrored transcript belongs to the session that produced it: drop the
+    // backfill marker too, so the next observe of this session re-reads it.
+    g_state.history_loaded_session_id.clear();
     g_state.ui.context_label = selected.title;
     g_state.ui.phase = AiFeaturePhase::kIdle;
     g_state.ui.status_label = "就绪";
@@ -822,12 +1069,17 @@ esp_err_t ObserveOpenCodeSession()
 {
     ESP_RETURN_ON_ERROR(InitOpenCodeSession(), kTag, "init OpenCode session");
     xSemaphoreTake(g_lock, portMAX_DELAY);
-    if (g_command != WorkerCommand::kNone || g_state.current_session_id.empty()) {
+    if (g_state.current_session_id.empty()) {
         xSemaphoreGive(g_lock);
         return ESP_ERR_INVALID_STATE;
     }
+    // Backfill runs once per session, before the stream attaches. Repeating it
+    // on every reconnect would append the same turns twice and fight the local
+    // copy of the prompt the device already appended when it was submitted.
+    const bool needs_history =
+        g_state.history_loaded_session_id != g_state.current_session_id;
     esp_err_t result = AcquireAgentLeaseLocked();
-    if (result == ESP_OK && !ArmWorkerLocked(WorkerCommand::kObserveSession)) {
+    if (result == ESP_OK && g_command != WorkerCommand::kNone) {
         result = ESP_ERR_INVALID_STATE;
     }
     if (result == ESP_OK) {
@@ -837,6 +1089,7 @@ esp_err_t ObserveOpenCodeSession()
         // handoff slot ConfirmOpenCodePrompt uses.
         g_run_session_id = g_state.current_session_id;
         g_state.pending_permission_id.clear();
+        ClearPendingQuestionLocked();
         // Observe locks the session so the interaction view (not the picker)
         // renders while the stream is attached; the lock persists afterwards
         // so the observed session can immediately be prompted as well.
@@ -844,14 +1097,24 @@ esp_err_t ObserveOpenCodeSession()
         g_state.ui.phase = AiFeaturePhase::kRunning;
         g_state.ui.status_label = "观察中";
         g_state.ui.response_text.clear();
-        g_state.ui.activity_text = "正在连接 Session 事件流";
+        g_state.ui.activity_text = needs_history
+            ? "正在读取历史对话"
+            : "正在连接 Session 事件流";
         g_state.ui.action_hint.clear();
         g_state.ui.scroll_offset_lines = 0;
         g_state.stream_active = true;
         // Attaching mid-stream: any assistant id from the previous run is stale.
         ResetAgentHistoryTurnLocked();
+        if (!ArmWorkerLocked(needs_history ? WorkerCommand::kLoadHistory
+                                           : WorkerCommand::kObserveSession)) {
+            g_run_session_id.clear();
+            result = ESP_ERR_INVALID_STATE;
+        }
         MarkChangedLocked();
-    } else {
+    }
+    if (result != ESP_OK) {
+        g_observing = false;
+        g_state.stream_active = false;
         ReleaseWorkOwnershipLocked();
     }
     xSemaphoreGive(g_lock);
@@ -870,7 +1133,7 @@ esp_err_t ReplyPendingOpenCodePermission(bool approve)
         return ESP_ERR_INVALID_STATE;
     }
     g_outbound_replies.Push(wqn::OpenCodeOutboundReply{
-        g_state.pending_permission_id, approve});
+        g_state.pending_permission_id, approve, false, {}, {}});
     g_state.pending_permission_id.clear();
     g_state.ui.phase = AiFeaturePhase::kRunning;
     g_state.ui.status_label = g_observing ? "观察中" : "Agent 执行中";
@@ -879,6 +1142,59 @@ esp_err_t ReplyPendingOpenCodePermission(bool approve)
     MarkChangedLocked();
     xSemaphoreGive(g_lock);
     return ESP_OK;
+}
+
+esp_err_t ReplyPendingOpenCodeQuestion(int index)
+{
+    if (g_lock == nullptr) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    xSemaphoreTake(g_lock, portMAX_DELAY);
+    if (g_state.ui.phase != AiFeaturePhase::kAwaitingQuestion ||
+        g_state.pending_question_id.empty() ||
+        index < 0 || index >= static_cast<int>(g_state.pending_question_options.size())) {
+        xSemaphoreGive(g_lock);
+        return ESP_ERR_INVALID_ARG;
+    }
+    // The answer is the option's value, never its label and never a field id:
+    // the gateway is what knows which upstream field the option came from.
+    const std::string answer = g_state.pending_question_options[index].value;
+    wqn::OpenCodeOutboundReply reply;
+    reply.is_question = true;
+    reply.question_id = g_state.pending_question_id;
+    reply.answer = answer;
+    g_outbound_replies.Push(std::move(reply));
+    g_state.ui.phase = AiFeaturePhase::kRunning;
+    g_state.ui.status_label = g_observing ? "观察中" : "Agent 执行中";
+    g_state.ui.activity_text = "已回答：" + answer;
+    g_state.ui.action_hint.clear();
+    // The pending ask stays armed until a terminal status: if the reply POST
+    // fails, OnOpenCodeReplyFailed restores exactly this state for a retry.
+    MarkChangedLocked();
+    xSemaphoreGive(g_lock);
+    return ESP_OK;
+}
+
+void InterruptOpenCodeRun()
+{
+    if (g_lock == nullptr) {
+        return;
+    }
+    xSemaphoreTake(g_lock, portMAX_DELAY);
+    if (!g_state.stream_active) {
+        // No stream to break: an interrupt for a run nobody started is a no-op,
+        // and the worker would consume the flag on its next (unrelated) stream.
+        g_interrupt_requested.store(false, std::memory_order_release);
+        xSemaphoreGive(g_lock);
+        return;
+    }
+    // Flag only. The streaming worker makes the interrupt POST itself, so the
+    // UI thread never opens a connection of its own while a stream is attached.
+    g_interrupt_requested.store(true, std::memory_order_release);
+    g_state.ui.status_label = "正在中止";
+    g_state.ui.activity_text = "已请求中止当前任务";
+    MarkChangedLocked();
+    xSemaphoreGive(g_lock);
 }
 
 esp_err_t StartOpenCodeVoiceInput()
@@ -1014,8 +1330,16 @@ void CancelOpenCodePrompt()
         // Nothing was sent, so the armed turn never reached history.
         ResetAgentHistoryTurnLocked();
         MarkChangedLocked();
+        xSemaphoreGive(g_lock);
+        return;
     }
+    const bool attached = g_state.stream_active;
     xSemaphoreGive(g_lock);
+    if (attached) {
+        // A submitted run is stopped through the interrupt path; the stream
+        // worker performs the POST and reports back through ReadAgentEventStream.
+        InterruptOpenCodeRun();
+    }
 }
 
 // [scroll-clamp] The offset lives in the AI page viewport's coordinate space,
@@ -1066,17 +1390,6 @@ bool CopyOpenCodeSessionToUi(AgentSessionState* state)
     return changed;
 }
 
-bool IsOpenCodeSessionActive()
-{
-    if (g_lock == nullptr) {
-        return false;
-    }
-    xSemaphoreTake(g_lock, portMAX_DELAY);
-    const bool active = AiFeaturePhaseIsBusy(g_state.ui.phase);
-    xSemaphoreGive(g_lock);
-    return active;
-}
-
 }  // namespace wqn
 
 #else  // !CONFIG_WQN_AGENT_ENABLE
@@ -1102,7 +1415,6 @@ esp_err_t ConfirmOpenCodePrompt(int64_t) { return ESP_ERR_NOT_SUPPORTED; }
 void CancelOpenCodePrompt() {}
 void ScrollOpenCodeResponse(int, int32_t, int32_t) {}
 bool CopyOpenCodeSessionToUi(AgentSessionState*) { return false; }
-bool IsOpenCodeSessionActive() { return false; }
 
 }  // namespace wqn
 

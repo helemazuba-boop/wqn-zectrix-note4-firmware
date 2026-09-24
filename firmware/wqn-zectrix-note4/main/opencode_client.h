@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
@@ -17,6 +18,31 @@ struct OpenCodeSessionInfo {
     int64_t updated_at = 0;
 };
 
+// One answerable option of an `agent.question` ask. The gateway projects the
+// upstream form's fields onto at most two of these, because the option bar has
+// two slots; the device only ever sends the chosen `value` back.
+struct OpenCodeQuestionOption {
+    std::string value;
+    std::string label;
+};
+
+// A tool call inside a backfilled turn. `status` is one of the three the
+// gateway projects (`running`, `done`, `error`).
+struct OpenCodeHistoryTool {
+    std::string name;
+    std::string status;
+    std::string preview;
+};
+
+// One backfilled conversation row. `role` is `user` or `assistant`; `thinking`
+// and `tools` are only present on assistant rows.
+struct OpenCodeHistoryMessage {
+    std::string role;
+    std::string text;
+    std::string thinking;
+    std::vector<OpenCodeHistoryTool> tools;
+};
+
 struct OpenCodeResult {
     int http_status = 0;
     std::string error_code;
@@ -29,8 +55,11 @@ enum class OpenCodeEventKind : uint8_t {
     kStatus,
     kTextDelta,
     kText,
+    kReasoningDelta,
+    kReasoning,
     kTool,
     kPermission,
+    kQuestion,
     kError,
 };
 
@@ -41,14 +70,33 @@ struct OpenCodeEvent {
     std::string tool;
     std::string preview;
     std::string permission_id;
+    std::string question_id;
+    std::string question_title;
+    std::vector<OpenCodeQuestionOption> question_options;
 };
 
 using OpenCodeEventCallback = void (*)(const OpenCodeEvent& event, void* ctx);
 
+// An outbound answer to an ask the gateway delivered over the event stream.
+// Both kinds ride the same queue so a single stream drain loop can answer them
+// without a second long-lived connection or a second task; `is_question`
+// selects which POST the streaming worker makes.
 struct OpenCodeOutboundReply {
     std::string permission_id;
     bool approve = true;
+    bool is_question = false;
+    std::string question_id;
+    // The selected option's `value` as projected by the gateway. The device
+    // never assembles the upstream `{[fieldKey]: value}` answer record.
+    std::string answer;
 };
+
+// The id of whichever ask a queued reply answers, for logging and for restoring
+// the pending-ask UI when the reply POST fails.
+inline const std::string& OpenCodeReplyId(const OpenCodeOutboundReply& reply)
+{
+    return reply.is_question ? reply.question_id : reply.permission_id;
+}
 
 // Invoked on the streaming worker when an outbound permission reply could not
 // be delivered, so the session layer can restore the pending-ask UI instead of
@@ -85,6 +133,11 @@ esp_err_t TranscribeOpenCodeAudio(
     const AudioCaptureChunk& audio,
     std::string* transcript,
     OpenCodeResult* result);
+// Both stream entry points share one cancel contract: the caller owns the two
+// atomics, sets `interrupt_requested` to end the stream, and reads
+// `interrupt_delivered` afterwards to tell "stopped on request" from "the
+// stream died". The streaming worker performs the interrupt POST itself, so no
+// caller ever opens a connection of its own while a stream is attached.
 esp_err_t RunOpenCodePrompt(
     const std::string& token,
     const std::string& session_id,
@@ -92,6 +145,8 @@ esp_err_t RunOpenCodePrompt(
     OpenCodeOutboundQueue* outbound_replies,
     OpenCodeReplyFailedCallback reply_failed,
     void* reply_failed_ctx,
+    std::atomic<bool>* interrupt_requested,
+    std::atomic<bool>* interrupt_delivered,
     OpenCodeEventCallback callback,
     void* callback_ctx,
     OpenCodeResult* result);
@@ -101,8 +156,31 @@ esp_err_t WatchOpenCodeSession(
     OpenCodeOutboundQueue* outbound_replies,
     OpenCodeReplyFailedCallback reply_failed,
     void* reply_failed_ctx,
+    std::atomic<bool>* interrupt_requested,
+    std::atomic<bool>* interrupt_delivered,
     OpenCodeEventCallback callback,
     void* callback_ctx,
+    OpenCodeResult* result);
+// Backfill one session's transcript, oldest message first. The gateway has
+// already truncated it to fit the device's bounded-JSON budget.
+esp_err_t GetOpenCodeHistory(
+    const std::string& token,
+    const std::string& session_id,
+    std::vector<OpenCodeHistoryMessage>* messages,
+    OpenCodeResult* result);
+// Answer an `agent.question` ask with the selected option's value. The gateway
+// owns the mapping from that value back to the upstream form's field id.
+esp_err_t PostQuestionReply(
+    const std::string& token,
+    const std::string& session_id,
+    const std::string& question_id,
+    const std::string& answer,
+    OpenCodeResult* result);
+// Stop a run the device already submitted. Only meaningful while a stream is
+// attached; the caller also uses it to break that stream's read loop.
+esp_err_t InterruptOpenCodeSession(
+    const std::string& token,
+    const std::string& session_id,
     OpenCodeResult* result);
 
 }  // namespace wqn

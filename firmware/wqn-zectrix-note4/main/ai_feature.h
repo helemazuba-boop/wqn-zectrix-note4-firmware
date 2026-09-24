@@ -18,6 +18,7 @@ enum class AiFeaturePhase : uint8_t {
     kSubmitting,
     kRunning,
     kAwaitingPermission,
+    kAwaitingQuestion,
     kComplete,
     kError,
 };
