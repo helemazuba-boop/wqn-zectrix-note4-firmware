@@ -69,25 +69,29 @@ constexpr int kAiRowTopPad = 2;
 constexpr int kAiViewportBottomPad = 22;
 // [toggle-cluster] Status-bar toggle cluster geometry. tier occupies x=6..22
 // (16px); the cluster starts at kAiToggleX and each icon is kAiToggleStep apart
-// (18 = 16px icon + 2px gap). Applies to every tier -- STD/Pro uses the slots
-// for thinking/TTS/expand/follow/trash, Agent for
-// session/turn-up/turn-down/follow/trash.
+// (18 = 16px icon + 2px gap). Applies to every tier -- STD/Pro uses four slots
+// for thinking/TTS/expand/trash, the Agent tier five for
+// session/turn-up/turn-down/detail/trash.
 constexpr int kAiToggleX = 30;
 constexpr int kAiToggleY = 5;
 constexpr int kAiToggleStep = 18;
 constexpr int kAiToggleZonePad = 2;   // pad around the cluster for the edit-mode rect
-// Slots in the edit-mode toggle list, index 0 = tier icon. Both tiers fill all
-// five remaining slots, so the cluster width is tier-independent.
-constexpr int kAiToggleSlotCount = 6;
+// Slots in the edit-mode toggle list, index 0 = tier icon. The cluster width is
+// NOT tier-independent any more: the follow toggle moved to the settings page,
+// so STD/Pro keeps four cluster slots and only the Agent tier fills five.
+constexpr int kAiToggleClusterCountStd = 4;
+constexpr int kAiToggleClusterCountAgent = 5;
 // The edit-mode zone rect must HUG the icons: slot i starts at
-// kAiToggleX + i*step, so the last icon ends at kAiToggleX + (count-2)*step +
-// 16, plus one pad on each side. (The old (count-1) overshot by a whole step:
-// 4 icons drew the rect out to x=120 while the glyphs ended at x=100. With the
-// 5th icon the glyphs reach x=118, so the same overshoot would have covered the
-// Agent session title -- whose clamp now starts at x=122 for exactly this
-// reason.)
-constexpr int kAiToggleZoneW =
-    kAiToggleStep * (kAiToggleSlotCount - 2) + 16 + 2 * kAiToggleZonePad;
+// kAiToggleX + i*step, so the last icon ends at kAiToggleX + (slots-1)*step +
+// 16, plus one pad on each side. (The pre-tier formula overshot by a whole
+// step: 4 icons drew the rect out to x=120 while the glyphs ended at x=100.)
+// The Agent cluster's five glyphs reach x=118, so the Agent session title's
+// clamp starts at x=122 for exactly this reason.
+constexpr int kAiToggleZoneWidth(int cluster_slots) {
+    return kAiToggleStep * (cluster_slots - 1) + 16 + 2 * kAiToggleZonePad;
+}
+constexpr int kAiToggleZoneWStd = kAiToggleZoneWidth(kAiToggleClusterCountStd);      // 74
+constexpr int kAiToggleZoneWAgent = kAiToggleZoneWidth(kAiToggleClusterCountAgent);  // 92
 
 // ---- Selection style (focus decoration, not interaction timing) ----
 //

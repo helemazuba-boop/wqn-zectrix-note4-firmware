@@ -158,6 +158,34 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
         return RefreshSchedule::kNone;
     }
 
+    if (state->settings.dialog == wqn::SettingsDialog::kAiFollow) {
+        if (short_press && event.button == wqn::ButtonId::kUp) {
+            if (state->settings.ai_follow_selected == 0) {
+                return RefreshSchedule::kNone;
+            }
+            --state->settings.ai_follow_selected;
+            return RefreshSchedule::kConfig;
+        }
+        if (short_press && event.button == wqn::ButtonId::kDownPower) {
+            if (state->settings.ai_follow_selected >= 1) {
+                return RefreshSchedule::kNone;
+            }
+            ++state->settings.ai_follow_selected;
+            return RefreshSchedule::kConfig;
+        }
+        if (short_press && event.button == wqn::ButtonId::kConfirm) {
+            // [ai-follow] The toggle left the status-bar cluster for this row.
+            // The flag the follow step reads lives on the worker's AiSessionState
+            // (the UI copy is replaced by every snapshot), so the change must go
+            // through SetAiAutoFollow -- writing state->ai alone would revert.
+            state->settings.auto_follow = state->settings.ai_follow_selected == 0;
+            wqn::SetAiAutoFollow(state->settings.auto_follow);
+            state->settings.dialog = wqn::SettingsDialog::kNone;
+            return RefreshSchedule::kConfig;
+        }
+        return RefreshSchedule::kNone;
+    }
+
     if (state->settings.dialog == wqn::SettingsDialog::kDefaultWordDeck) {
         auto& settings = state->settings;
         if (short_press && event.button == wqn::ButtonId::kUp) {
@@ -443,6 +471,9 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
         case wqn::kSettingsRowWordDeck:
             OpenSettingsDialog(state, wqn::SettingsDialog::kDefaultWordDeck);
             return RefreshSchedule::kConfig;
+        case wqn::kSettingsRowAiFollow:
+            OpenSettingsDialog(state, wqn::SettingsDialog::kAiFollow);
+            return RefreshSchedule::kConfig;
         case wqn::kSettingsRowVersion:
             UpdateSettingsDiagnostics(state);
             state->settings.notice = "固件 " + state->settings.diagnostics.firmware_version;
@@ -470,10 +501,26 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
     }
 }
 
+// [detail] Cycle the Agent tier's cloud detail level (0 简要 / 1 标准 / 2 详细,
+// the ?detail=N tier). The worker is written first -- it is the authority, and
+// its setter also drops the transcript cache key so the next lock/observe
+// re-reads the session at the new tier -- then the UI copy is mirrored so the
+// same-tick render draws the new glyph instead of waiting up to a poll period
+// for the snapshot (the snapshot confirms the mirror right after).
+static void CycleAgentDetailLevel(wqn::UiState* state, int direction)
+{
+    constexpr int kCount = 3;
+    const int current = static_cast<int>(state->agent.detail_level);
+    const int next = ((current + direction) % kCount + kCount) % kCount;
+    state->agent.detail_level = static_cast<uint8_t>(next);
+    wqn::SetOpenCodeDetailLevel(state->agent.detail_level);
+}
+
 // [shell] Cycle the AI status-bar toggle at `index`. Index 0=tier (handled in
-// ApplyStatusBarEditEvent as an immediate switch), 1=thinking, 2=tts, 3=expand,
-// 4=follow, 5=trash (also immediate, in ApplyStatusBarEditEvent). This fn only
-// cycles 1-4.
+// ApplyStatusBarEditEvent as an immediate switch), 5=trash (also immediate
+// there). This fn only cycles the value toggles: 1=thinking, 2=tts, 3=expand on
+// STD/Pro, 4=详细程度 on the Agent tier (its 1..3 are immediate actions and
+// return before this path).
 static void CycleAiStatusBarToggle(wqn::UiState* state, uint8_t index)
 {
     wqn::AiSessionState& ai = state->ai;
@@ -486,10 +533,8 @@ static void CycleAiStatusBarToggle(wqn::UiState* state, uint8_t index)
         }
         case 2: ai.tts_on = !ai.tts_on; wqn::SetAiTtsOn(ai.tts_on); break;
         case 3: ai.expand_content = !ai.expand_content; wqn::SetAiExpandContent(ai.expand_content); break;
-        // [follow] Both tiers: same flag, same setter (see the [follow] block in
-        // ui_model.h). Toggling it off mid-reply lets the user scroll away
-        // without the next tick yanking the viewport back to the bottom.
-        case 4: ai.auto_follow = !ai.auto_follow; wqn::SetAiAutoFollow(ai.auto_follow); break;
+        // [detail] Agent-only value toggle: the three-step detail tier.
+        case 4: CycleAgentDetailLevel(state, +1); break;
         default: break;
     }
 }
@@ -511,8 +556,9 @@ static void CycleAiStatusBarToggleReverse(wqn::UiState* state, uint8_t index)
         }
         case 2: ai.tts_on = !ai.tts_on; wqn::SetAiTtsOn(ai.tts_on); break;
         case 3: ai.expand_content = !ai.expand_content; wqn::SetAiExpandContent(ai.expand_content); break;
-        // [follow] Boolean, so the reverse is the same flip as the forward cycle.
-        case 4: ai.auto_follow = !ai.auto_follow; wqn::SetAiAutoFollow(ai.auto_follow); break;
+        // [detail] Three states, so the reverse is a real step back rather than
+        // a boolean flip -- the undo gesture has to land on the previous tier.
+        case 4: CycleAgentDetailLevel(state, -1); break;
         default: break;
     }
 }
@@ -800,14 +846,16 @@ static AgentInputResult TryApplyAgentAiButtonEvent(
 }
 
 // [shell] Status-bar edit mode owns all button input on the AI page while active.
-// short-confirm = cycle selected toggle; up/down = move selection (wrap 0..5);
+// short-confirm = cycle selected toggle; up/down = move selection (wrap 0..max);
 // long-confirm (release) = exit. Edge events (Press/Release) are consumed so
 // Flash PTT never fires mid-edit (though edit mode is only entered on Std/Pro).
 //
-// [agent] The Agent tier reuses the same six slots (0 = tier, 1..5 = cluster),
-// so only the slot 1..3 actions differ: they are immediate actions rather than
-// toggles, because they configure the gateway rather than the STD/Pro text turn.
-// Slot 4 (follow) and slot 5 (trash) behave identically on both tiers.
+// [agent] The Agent tier reuses the same slot numbering (0 = tier, 1..5 =
+// cluster) with one more slot than STD/Pro (which has 0..4 since the follow
+// toggle moved to the settings page). Slots 1..3 are immediate actions rather
+// than toggles, because they configure the gateway rather than the STD/Pro text
+// turn; slot 4 is its detail-tier cycle and slot 5 its trash, where STD/Pro's
+// slot 4 is the trash.
 static RefreshSchedule ApplyStatusBarEditEvent(
     const wqn::ButtonEvent& event,
     int64_t now_ms,
@@ -882,8 +930,11 @@ static RefreshSchedule ApplyStatusBarEditEvent(
                 }
                 return RefreshSchedule::kAi;
             }
-            // [trash] index 5 = clear-context action: clear + exit immediately.
-            if (state->status_edit.selected == 5) {
+            // [trash] Clear-context action: index 5 on the Agent tier, 4 on
+            // STD/Pro (its cluster is one slot shorter). Clear + exit.
+            const uint8_t trash_index =
+                (state->ai.tier == wqn::AiTier::kAgent) ? 5 : 4;
+            if (state->status_edit.selected == trash_index) {
                 // [agent] Each tier owns its own history channel, so the trash
                 // clears the one the visible tier writes to.
                 if (state->ai.tier == wqn::AiTier::kAgent) {
@@ -901,7 +952,8 @@ static RefreshSchedule ApplyStatusBarEditEvent(
             // Double-confirm (2nd short-press within window of the last forward
             // cycle) = save & exit: undo the last cycle so the value saved is the
             // one BEFORE this double, then leave edit mode. Single short-press =
-            // cycle forward (optimistic). Applies to toggles (1-4) only.
+            // cycle forward (optimistic). Applies to the value toggles only
+            // (1-3 on STD/Pro, 4 on Agent); the immediate slots return earlier.
             if (state->status_edit.last_cycle_ms > 0 &&
                 now_ms - state->status_edit.last_cycle_ms <= kStatusBarEditDblMs) {
                 CycleAiStatusBarToggleReverse(state, state->status_edit.selected);
@@ -927,9 +979,12 @@ static RefreshSchedule ApplyStatusBarEditEvent(
         if (event.type == wqn::ButtonEventType::kShortPress ||
             event.type == wqn::ButtonEventType::kLongPress) {
             const int dir = (event.button == wqn::ButtonId::kUp) ? -1 : 1;
-            // Flash edit mode has only the tier button (index 0); STD/Pro and
-            // Agent have 0..5 (tier + five cluster slots).
-            const int max_idx = (state->ai.tier == wqn::AiTier::kFlash) ? 0 : 5;
+            // Flash edit mode has only the tier button (index 0); STD/Pro has
+            // 0..4 (tier + four cluster slots) and the Agent tier 0..5 (tier +
+            // five, slot 4 being its detail control).
+            const int max_idx = state->ai.tier == wqn::AiTier::kFlash ? 0
+                : state->ai.tier == wqn::AiTier::kAgent ? 5
+                : 4;
             int s = static_cast<int>(state->status_edit.selected) + dir;
             if (s < 0) { s = max_idx; }
             if (s > max_idx) { s = 0; }

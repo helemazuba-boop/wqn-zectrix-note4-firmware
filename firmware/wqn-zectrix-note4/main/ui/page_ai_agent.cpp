@@ -11,10 +11,12 @@
 // and the permission ask only enter history once the user acts on them, so
 // they must not read as settled chat entries.
 //
-// The status bar keeps the same six edit-mode slots STD/Pro uses (0 = tier,
-// 1..5 = cluster), so the input path's index arithmetic is tier-independent;
-// only the glyphs in slots 1..3 change. Slot 4 (auto-follow) and slot 5
-// (clear) are shared verbatim with STD/Pro.
+// The status bar keeps the same edit-mode slot numbering STD/Pro uses (0 =
+// tier, 1..5 = cluster), so the input path's index arithmetic stays tier-
+// independent -- the cluster LENGTH and the trash index are the two
+// tier-dependent values (five slots here, four on STD/Pro). Slot 4 is this
+// tier's 详细程度 control (the ?detail=N tier the gateway projects at); slot 5
+// (clear) is shared verbatim with STD/Pro.
 
 #include "ui_internal.h"
 #include "ui_widgets.h"
@@ -253,17 +255,28 @@ static void DrawAgentSessionPicker(const wqn::AgentSessionState& agent)
 // Status bar
 // ---------------------------------------------------------------------------
 
-// [agent] Agent-tier status bar. Same six edit-mode slots as STD/Pro
-// (0 = tier, 1 = session, 2 = turn up, 3 = turn down, 4 = auto-follow,
-// 5 = clear), so ApplyStatusBarEditEvent's index arithmetic does not need a
-// tier branch. The thinking/TTS/expand slots STD/Pro fills are repurposed
-// because they configure the STD/Pro text turn and mean nothing to the gateway.
-// `auto_follow` is the shared AiSessionState flag, not an Agent-only one: the
-// follow setting means the same thing on every tier.
+// [detail] Glyph for a detail tier: 0 简要 / 1 标准 / 2 详细. Unknown values fall
+// back to 详细 -- the same fallback the request path applies to ?detail=N.
+static const WqnBitmapAsset& AgentDetailAsset(uint8_t level)
+{
+    switch (level) {
+        case 0: return a18_ai_detail_brief_16_asset;
+        case 1: return a19_ai_detail_standard_16_asset;
+        case 2:
+        default: return a20_ai_detail_full_16_asset;
+    }
+}
+
+// [agent] Agent-tier status bar. Same edit-mode slot numbering as STD/Pro
+// (0 = tier, 1 = session, 2 = turn up, 3 = turn down, 4 = 详细程度, 5 = clear),
+// so ApplyStatusBarEditEvent's index arithmetic does not need a tier branch --
+// only the trash index and the cluster length differ. The thinking/TTS/expand
+// slots STD/Pro fills are repurposed because they configure the STD/Pro text
+// turn and mean nothing to the gateway; slot 4 carries the detail tier every
+// Agent request is projected at.
 static void DrawAgentStatusBar(const wqn::AgentSessionState& agent,
                                const wqn::HomeSummary& home,
-                               const wqn::StatusBarEditState& status_edit,
-                               bool auto_follow)
+                               const wqn::StatusBarEditState& status_edit)
 {
     DrawHorizontalLine(0, kAiStatusBarH - 1, wqn::kEpdWidth);
 
@@ -276,7 +289,7 @@ static void DrawAgentStatusBar(const wqn::AgentSessionState& agent,
 
     if (status_edit.active) {
         DrawRect(kAiToggleX - kAiToggleZonePad, kAiToggleY - kAiToggleZonePad,
-                 kAiToggleZoneW, 16 + 2 * kAiToggleZonePad);
+                 kAiToggleZoneWAgent, 16 + 2 * kAiToggleZonePad);
     }
     // Slot 1: open the session picker / switch / new session.
     DrawSelectableIcon(kAiToggleX + 0 * kAiToggleStep, kAiToggleY,
@@ -286,10 +299,10 @@ static void DrawAgentStatusBar(const wqn::AgentSessionState& agent,
                        a14_ai_turn_up_16_asset, selected(2), 0);
     DrawSelectableIcon(kAiToggleX + 2 * kAiToggleStep, kAiToggleY,
                        a15_ai_turn_down_16_asset, selected(3), 0);
-    // Slot 4: auto-follow (shared with STD/Pro; same glyph, same meaning).
+    // Slot 4: the detail tier (0 简要 / 1 标准 / 2 详细). Agent-only: ?detail=N
+    // shapes the /agent/* projections, which STD/Pro never reads.
     DrawSelectableIcon(kAiToggleX + 3 * kAiToggleStep, kAiToggleY,
-                       auto_follow ? a16_ai_follow_on_16_asset : a17_ai_follow_off_16_asset,
-                       selected(4), 0);
+                       AgentDetailAsset(agent.detail_level), selected(4), 0);
     // Slot 5: clear the mirrored Agent transcript.
     DrawSelectableIcon(kAiToggleX + 4 * kAiToggleStep, kAiToggleY,
                        a12_ai_clear_context_16_asset, selected(5), 0);
@@ -297,7 +310,9 @@ static void DrawAgentStatusBar(const wqn::AgentSessionState& agent,
     // Centre column: which session is live. This is the one piece of context
     // the Agent tier cannot do without -- the same prompt means something
     // different in a different session. The clamp keeps the title clear of the
-    // five-icon cluster, which now ends at x=118 (was 100 with four).
+    // five-icon cluster, which still ends at x=118: STD/Pro dropped to four
+    // icons when the follow toggle moved to the settings page, this tier did
+    // not (slot 4 became the detail control).
     if (!agent.current_session_title.empty()) {
         const std::string title = AgentOneLine(agent.current_session_title, 150);
         const int w = wqn::MeasureUtf8TextWidth(title.c_str());
@@ -328,7 +343,7 @@ esp_err_t RenderAgentAiToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule
     const wqn::AgentSessionState& agent = frame.agent;
     wqn::ClearEpdFramebuffer(true);
 
-    DrawAgentStatusBar(agent, frame.home, frame.status_edit, frame.ai.auto_follow);
+    DrawAgentStatusBar(agent, frame.home, frame.status_edit);
 
     if (!agent.session_locked) {
         // Picker mode owns the whole viewport: there is no conversation to

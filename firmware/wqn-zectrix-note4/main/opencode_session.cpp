@@ -1739,6 +1739,25 @@ void SetOpenCodeFollowState(bool active, bool user_moved)
     xSemaphoreGive(g_lock);
 }
 
+void SetOpenCodeDetailLevel(uint8_t level)
+{
+    if (g_lock == nullptr || level > 2) {
+        return;
+    }
+    xSemaphoreTake(g_lock, portMAX_DELAY);
+    if (g_state.detail_level != level) {
+        g_state.detail_level = level;
+        // The transcript cache key is the session id alone, so a tier change
+        // invalidates what is mirrored: clearing it makes the next Lock/Observe
+        // take the needs_history branch and re-read the session at the new tier.
+        // The already-mirrored turns keep the old tier until then -- deliberately
+        // no eager clear, so the user does not watch the panel empty out.
+        g_state.history_loaded_session_id.clear();
+        MarkChangedLocked();
+    }
+    xSemaphoreGive(g_lock);
+}
+
 }  // namespace wqn
 
 #else  // !CONFIG_WQN_AGENT_ENABLE
@@ -1765,6 +1784,7 @@ void CancelOpenCodePrompt() {}
 void ScrollOpenCodeResponse(int, int32_t, int32_t) {}
 void SetOpenCodeScrollOffsetClamped(int32_t, int32_t, int32_t) {}
 void SetOpenCodeFollowState(bool, bool) {}
+void SetOpenCodeDetailLevel(uint8_t) {}
 bool CopyOpenCodeSessionToUi(AgentSessionState*) { return false; }
 
 }  // namespace wqn

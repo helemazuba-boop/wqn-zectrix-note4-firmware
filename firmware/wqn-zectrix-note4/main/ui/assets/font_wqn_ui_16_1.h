@@ -282,32 +282,45 @@ static const WqnBitmapAsset a15_ai_turn_down_16_asset = {
     16, 16, 2, sizeof(a15_ai_turn_down_16), a15_ai_turn_down_16
 };
 
-// A16/A17: auto-follow toggle, 16x16, 32 bytes -- shared by STD/Pro and the
-// Agent tier (edit-mode slot 4). Hand-authored like A13..A15: a compact down
-// arrow (the newest answer) over a baseline -- solid when the viewport is
-// pinned to the newest answer, dashed when it is not. The arrow is deliberately
-// shorter than A15's so the two glyphs do not read as the same button.
-#define A16_AI_FOLLOW_ON_16_WIDTH  16
-#define A16_AI_FOLLOW_ON_16_HEIGHT 16
-#define A16_AI_FOLLOW_ON_16_STRIDE 2
-static const uint8_t a16_ai_follow_on_16[] = {
-    0x00, 0x00, 0x03, 0xC0, 0x03, 0xC0, 0x03, 0xC0, 0x1F, 0xF8, 0x0F, 0xF0,
-    0x07, 0xE0, 0x03, 0xC0, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x7F, 0xFE, 0x7F, 0xFE, 0x00, 0x00, 0x00, 0x00
+// A18/A19/A20: the Agent tier's detail-tier control (edit-mode slot 4), 16x16,
+// 32 bytes each -- a three-step level meter: one short bar (简要), two (标准),
+// three ascending (详细). The count-of-marks idiom matches the thinking icons,
+// and vertical bars cannot be mistaken for A13's session-list rows. Hand-
+// authored like A13..A15: the generator is not part of this checkout.
+#define A18_AI_DETAIL_BRIEF_16_WIDTH  16
+#define A18_AI_DETAIL_BRIEF_16_HEIGHT 16
+#define A18_AI_DETAIL_BRIEF_16_STRIDE 2
+static const uint8_t a18_ai_detail_brief_16[] = {
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x00, 0x18, 0x00,
+    0x18, 0x00, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00
 };
-static const WqnBitmapAsset a16_ai_follow_on_16_asset = {
-    16, 16, 2, sizeof(a16_ai_follow_on_16), a16_ai_follow_on_16
+static const WqnBitmapAsset a18_ai_detail_brief_16_asset = {
+    16, 16, 2, sizeof(a18_ai_detail_brief_16), a18_ai_detail_brief_16
 };
 
-// A17: same arrow, dashed baseline (auto-follow off).
-#define A17_AI_FOLLOW_OFF_16_WIDTH  16
-#define A17_AI_FOLLOW_OFF_16_HEIGHT 16
-#define A17_AI_FOLLOW_OFF_16_STRIDE 2
-static const uint8_t a17_ai_follow_off_16[] = {
-    0x00, 0x00, 0x03, 0xC0, 0x03, 0xC0, 0x03, 0xC0, 0x1F, 0xF8, 0x0F, 0xF0,
-    0x07, 0xE0, 0x03, 0xC0, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x66, 0x66, 0x66, 0x66, 0x00, 0x00, 0x00, 0x00
+// A19: two bars.
+#define A19_AI_DETAIL_STANDARD_16_WIDTH  16
+#define A19_AI_DETAIL_STANDARD_16_HEIGHT 16
+#define A19_AI_DETAIL_STANDARD_16_STRIDE 2
+static const uint8_t a19_ai_detail_standard_16[] = {
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x1B, 0x00, 0x1B, 0x00, 0x1B, 0x00, 0x18, 0x00, 0x18, 0x00,
+    0x18, 0x00, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00
 };
-static const WqnBitmapAsset a17_ai_follow_off_16_asset = {
-    16, 16, 2, sizeof(a17_ai_follow_off_16), a17_ai_follow_off_16
+static const WqnBitmapAsset a19_ai_detail_standard_16_asset = {
+    16, 16, 2, sizeof(a19_ai_detail_standard_16), a19_ai_detail_standard_16
+};
+
+// A20: three bars (the tallest first).
+#define A20_AI_DETAIL_FULL_16_WIDTH  16
+#define A20_AI_DETAIL_FULL_16_HEIGHT 16
+#define A20_AI_DETAIL_FULL_16_STRIDE 2
+static const uint8_t a20_ai_detail_full_16[] = {
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1B, 0x60, 0x1B, 0x60,
+    0x1B, 0x60, 0x1B, 0x00, 0x1B, 0x00, 0x1B, 0x00, 0x18, 0x00, 0x18, 0x00,
+    0x18, 0x00, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00
+};
+static const WqnBitmapAsset a20_ai_detail_full_16_asset = {
+    16, 16, 2, sizeof(a20_ai_detail_full_16), a20_ai_detail_full_16
 };

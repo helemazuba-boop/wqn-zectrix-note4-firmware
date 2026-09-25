@@ -38,6 +38,15 @@ void SetOpenCodeScrollOffsetClamped(int32_t target, int32_t min_scroll, int32_t 
 // this setter when the answer body lands, and the input path clears it on a
 // manual scroll -- the UI copy alone would be overwritten by the next snapshot.
 void SetOpenCodeFollowState(bool active, bool user_moved);
+// [detail] The cloud detail tier every Agent request is projected at (0 简要 /
+// 1 标准 / 2 详细, kOpenCodeDetailDefault in opencode_model.h), written from the
+// status bar's detail control. A real change also drops the transcript cache key
+// (history_loaded_session_id), so the next lock/observe re-reads the session at
+// the new tier. It deliberately does NOT arm kLoadHistory: a live stream owns
+// the command slot for its whole duration (ArmWorkerLocked) and LoadHistory
+// stomps the phase to kIdle when no stream is attached -- arming from here would
+// fight both.
+void SetOpenCodeDetailLevel(uint8_t level);
 bool CopyOpenCodeSessionToUi(AgentSessionState* state);
 
 }  // namespace wqn

@@ -98,13 +98,9 @@ static void DrawHourglassIcon(int x, int y, bool selected) {
 static void DrawBrainIcon(int x, int y, bool selected) {
     DrawStatusAsset(x, y, a03_ai_tier_pro_16_asset, selected);
 }
-// [follow] Auto-follow toggle (edit-mode index 4, both tiers): solid baseline
-// = the viewport stays pinned to the newest answer while a reply streams in,
-// dashed = the user scrolls freely. See the [follow] block in ui_model.h.
-static void DrawFollowIcon(int x, int y, bool on, bool selected) {
-    DrawStatusAsset(x, y, on ? a16_ai_follow_on_16_asset : a17_ai_follow_off_16_asset, selected);
-}
-// [trash] Clear-context action button (edit-mode index 5, both tiers).
+// [trash] Clear-context action button (edit-mode index 4 on STD/Pro, 5 on the
+// Agent tier -- the cluster is one slot shorter here since the follow toggle
+// moved to the settings page).
 static void DrawTrashIcon(int x, int y, bool selected) {
     DrawStatusAsset(x, y, a12_ai_clear_context_16_asset, selected);
 }
@@ -112,11 +108,11 @@ static void DrawTrashIcon(int x, int y, bool selected) {
 // [toggle-cluster] The status-bar toggles pack tightly right after the tier
 // icon. tier occupies x=6..22 (16px); the toggle cluster starts at
 // kAiToggleX with a small gap, and consecutive toggles are kAiToggleStep
-// apart (18 = 16px icon + 2px gap). The edit-mode zone rect (kAiToggleZoneW)
+// apart (18 = 16px icon + 2px gap). The edit-mode zone rect (kAiToggleZoneWStd)
 // spans exactly the icons plus a kAiToggleZonePad pad on each side. STD/Pro use
-// the five slots for thinking/TTS/expand/follow/trash; the Agent tier uses them
-// for session/turn-up/turn-down/follow/trash (page_ai_agent.cpp). The follow
-// glyph is identical on both tiers -- the setting means the same thing.
+// the four slots for thinking/TTS/expand/trash; the Agent tier uses its five for
+// session/turn-up/turn-down/detail/trash (page_ai_agent.cpp). The follow toggle
+// moved to the settings page, so no tier draws it in the cluster any more.
 
 void DrawAiStatusBar(const wqn::AiSessionState& ai, const wqn::HomeSummary& home, const wqn::StatusBarEditState& status_edit)
 {
@@ -133,22 +129,20 @@ void DrawAiStatusBar(const wqn::AiSessionState& ai, const wqn::HomeSummary& home
         default:                  DrawHourglassIcon(6, kAiToggleY, tier_sel); break;
     }
 
-    // [shell] Toggle zone (STD/Pro only):
-    // thinking(1)/TTS(2)/expand(3)/follow(4)/trash(5).
+    // [shell] Toggle zone (STD/Pro only): thinking(1)/TTS(2)/expand(3)/trash(4).
     // Flash hides the whole zone (only the tier icon, button 0, is editable).
     // The Agent tier has its own cluster (page_ai_agent.cpp), so it never
     // reaches this branch -- RenderAiToEpd dispatches it away first.
     if (ai.tier == wqn::AiTier::kStd) {
         if (status_edit.active) {
-            // Zone rect hugs the five tightly-packed toggle icons.
+            // Zone rect hugs the four tightly-packed toggle icons.
             DrawRect(kAiToggleX - kAiToggleZonePad, kAiToggleY - kAiToggleZonePad,
-                     kAiToggleZoneW, 16 + 2 * kAiToggleZonePad);
+                     kAiToggleZoneWStd, 16 + 2 * kAiToggleZonePad);
         }
         DrawThinkingIcon(kAiToggleX + 0 * kAiToggleStep, kAiToggleY, ai.thinking_level, status_edit.active && status_edit.selected == 1);
         DrawTtsIcon(kAiToggleX + 1 * kAiToggleStep, kAiToggleY, ai.tts_on, status_edit.active && status_edit.selected == 2);
         DrawExpandIcon(kAiToggleX + 2 * kAiToggleStep, kAiToggleY, ai.expand_content, status_edit.active && status_edit.selected == 3);
-        DrawFollowIcon(kAiToggleX + 3 * kAiToggleStep, kAiToggleY, ai.auto_follow, status_edit.active && status_edit.selected == 4);
-        DrawTrashIcon(kAiToggleX + 4 * kAiToggleStep, kAiToggleY, status_edit.active && status_edit.selected == 5);
+        DrawTrashIcon(kAiToggleX + 3 * kAiToggleStep, kAiToggleY, status_edit.active && status_edit.selected == 4);
     }
 
     // Center column: reserved for the toast label. When the toast is visible

@@ -220,9 +220,9 @@ struct HomeSummary {
 // (ui_model.cpp) clamps the selection without including ui/ headers.
 // Structure (rows, order, dialogs) is specified by DEV_DIAGNOSTICS.md.
 #if CONFIG_WQN_DEV_MENU_ENABLE
-constexpr size_t kSettingsItemCount = 11;
+constexpr size_t kSettingsItemCount = 12;
 #else
-constexpr size_t kSettingsItemCount = 10;
+constexpr size_t kSettingsItemCount = 11;
 #endif
 
 // Row indices as named constants — dispatch and chip-tag code must reference
@@ -235,14 +235,17 @@ constexpr size_t kSettingsRowBattery = 3;
 constexpr size_t kSettingsRowImageRender = 4;
 constexpr size_t kSettingsRowVolume = 5;
 constexpr size_t kSettingsRowWordDeck = 6;
-constexpr size_t kSettingsRowVersion = 7;
+// [ai-follow] The auto-follow toggle's new home: it left the AI status-bar
+// cluster (where a set-once preference did not belong) for the settings page.
+constexpr size_t kSettingsRowAiFollow = 7;
+constexpr size_t kSettingsRowVersion = 8;
 #if CONFIG_WQN_DEV_MENU_ENABLE
-constexpr size_t kSettingsRowDevMenu = 8;
+constexpr size_t kSettingsRowDevMenu = 9;
+constexpr size_t kSettingsRowFactoryReset = 10;
+constexpr size_t kSettingsRowPowerOff = 11;
+#else
 constexpr size_t kSettingsRowFactoryReset = 9;
 constexpr size_t kSettingsRowPowerOff = 10;
-#else
-constexpr size_t kSettingsRowFactoryReset = 8;
-constexpr size_t kSettingsRowPowerOff = 9;
 #endif
 
 // Second-level dev list (DEV_DIAGNOSTICS.md §3): six rows, which is exactly the
@@ -277,6 +280,7 @@ enum class SettingsDialog {
     kImageRendering,
     kVolume,
     kDefaultWordDeck,
+    kAiFollow,
     kDevInfo,
     kDevSync,
     kDevErrors,
@@ -369,6 +373,13 @@ struct SettingsAppState {
     std::string default_word_deck_title;
     std::string sync_status;
     std::string notice;
+    // [ai-follow] 「AI 回复时翻页」 row (settings index kSettingsRowAiFollow).
+    // auto_follow is the durable value the row displays and the value the ACK
+    // installs; the worker's AiSessionState::auto_follow is the copy the follow
+    // step actually reads, and SetAiAutoFollow is the only bridge. The dialog
+    // focus is separate so an Up/Down repaint cannot be deduped away.
+    bool auto_follow = true;
+    size_t ai_follow_selected = 0;  // option index: 0 = 开 (the default), 1 = 关
     // [persist-worker] In-flight/failed async settings saves (c4). Confirm arms
     // the chosen value here (pending_* + *_pending_valid) and, on a successful
     // submit, its dispatch operation id. The UI shows "正在保存" and only installs

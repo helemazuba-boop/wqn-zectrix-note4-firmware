@@ -494,10 +494,9 @@ std::string FrameSignature(const wqn::UiFrame& frame)
         signature.push_back('/');
         signature.append(frame.ai.expand_content ? "1" : "0");
         signature.push_back('/');
-        // [follow] The follow toggle's glyph is the only visible change when the
-        // user flips it, so the sig must carry it or the repaint is deduped away.
-        signature.append(frame.ai.auto_follow ? "1" : "0");
-        signature.push_back('/');
+        // [follow] No tier draws the follow toggle in the cluster any more (it
+        // moved to the settings page), so auto_follow no longer changes a pixel
+        // on this screen and is deliberately absent from this signature.
         signature.append(std::to_string(frame.ai_history_revision));
     }
     // [agent] The Agent tier renders on the AI screen, so its fields must
@@ -548,6 +547,11 @@ std::string FrameSignature(const wqn::UiFrame& frame)
         signature.append(std::to_string(agent.confirmation_armed_at_ms));
         signature.push_back('/');
         signature.append(agent.session_locked ? "1" : "0");
+        signature.push_back('/');
+        // [detail] The status-bar detail-tier glyph is the only visible change
+        // when the user cycles it, so it must reach the signature or layer-1
+        // dedup skips the repaint.
+        signature.append(std::to_string(agent.detail_level));
         signature.push_back('/');
         signature.append(std::to_string(agent.selected_session));
         signature.push_back('/');
@@ -825,6 +829,12 @@ std::string FrameSignature(const wqn::UiFrame& frame)
         signature.append(std::to_string(frame.settings.word_deck_selected));
         signature.push_back('/');
         signature.append(frame.settings.default_word_deck_title);
+        signature.push_back('/');
+        // [ai-follow] The new row's value and its dialog cursor are both visible
+        // state; a missing cursor froze the word-deck dialog the same way.
+        signature.append(frame.settings.auto_follow ? "1" : "0");
+        signature.push_back('/');
+        signature.append(std::to_string(frame.settings.ai_follow_selected));
         signature.push_back('/');
         signature.append(frame.settings.sync_status);
         signature.push_back('/');

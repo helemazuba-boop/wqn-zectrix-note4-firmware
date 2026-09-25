@@ -67,7 +67,8 @@ esp_err_t DrawSettingsRow(wqn::SettingsView view, size_t row_index, int y, const
     } else if (row_index == wqn::kSettingsRowAutoSync ||
                row_index == wqn::kSettingsRowImageRender ||
                row_index == wqn::kSettingsRowVolume ||
-               row_index == wqn::kSettingsRowWordDeck) {
+               row_index == wqn::kSettingsRowWordDeck ||
+               row_index == wqn::kSettingsRowAiFollow) {
         tag = "设置";
     } else if (row_index == wqn::kSettingsRowBattery) {
         tag = "查看";  // read-only notice, the raw numbers live in the dev list
@@ -214,6 +215,25 @@ esp_err_t RenderSettingsDialog(const wqn::SettingsAppState& settings)
             ESP_RETURN_ON_ERROR(
                 DrawCenteredText(86, 202, 228, "上下选择  确认保存"), kTag,
                 "draw image rendering help");
+            break;
+        }
+        case wqn::SettingsDialog::kAiFollow: {
+            ESP_RETURN_ON_ERROR(
+                DrawSettingsDialogBox("AI 回复时翻页"), kTag,
+                "draw ai follow dialog");
+            ESP_RETURN_ON_ERROR(
+                DrawSettingsOptionCard(
+                    88, 112, 224, "开｜自动跟到最新",
+                    settings.ai_follow_selected == 0),
+                kTag, "draw ai follow on option");
+            ESP_RETURN_ON_ERROR(
+                DrawSettingsOptionCard(
+                    88, 156, 224, "关｜保持当前位置",
+                    settings.ai_follow_selected == 1),
+                kTag, "draw ai follow off option");
+            ESP_RETURN_ON_ERROR(
+                DrawCenteredText(86, 202, 228, "上下选择  确认保存"), kTag,
+                "draw ai follow help");
             break;
         }
         case wqn::SettingsDialog::kVolume: {
@@ -422,6 +442,7 @@ esp_err_t RenderSettingsToEpd(const wqn::UiFrame& frame, RefreshSchedule schedul
         "图片渲染",
         "音量",
         "Word 默认词库",
+        "AI 回复时翻页",
         "固件版本",
 #if CONFIG_WQN_DEV_MENU_ENABLE
         "开发者选项",
@@ -437,6 +458,7 @@ esp_err_t RenderSettingsToEpd(const wqn::UiFrame& frame, RefreshSchedule schedul
         image_render_label,
         volume_label,
         settings.default_word_deck_title.empty() ? "全部词库" : settings.default_word_deck_title,
+        settings.auto_follow ? "开" : "关",
         version_value,
 #if CONFIG_WQN_DEV_MENU_ENABLE
         "只读诊断",
@@ -536,6 +558,10 @@ void OpenSettingsDialog(wqn::UiState* state, wqn::SettingsDialog dialog)
             : state->settings.image_render_mode;
         state->settings.image_render_selected =
             seed == wqn::ImageRenderMode::kBlackWhite ? 0 : 1;
+    } else if (dialog == wqn::SettingsDialog::kAiFollow) {
+        // Focus the current value -- the same one the row displays.
+        state->settings.ai_follow_selected =
+            state->settings.auto_follow ? 0 : 1;
     } else if (dialog == wqn::SettingsDialog::kDefaultWordDeck) {
         // Option 0 is the fixed 全部词库; the rest mirror the mounted deck
         // catalog. Preselect an armed-but-unsaved switch (submit rejected or
