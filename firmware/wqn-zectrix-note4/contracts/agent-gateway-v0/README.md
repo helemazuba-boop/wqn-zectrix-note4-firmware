@@ -50,11 +50,22 @@ All paths are relative to the ESP32 API base (`WQN_API_BASE`, default
 | `POST` | `/agent/sessions/{id}/question` | `{question_id, answer, confirmed}` | Answer a form ask with the chosen option value |
 | `POST` | `/agent/sessions/{id}/interrupt` | — | Stop a run that was already submitted |
 
-Every response is a `{ "data": … }` envelope; every failure is
-`{ "error": { "code", "message" } }`. The two streaming endpoints answer
-`Accept: text/event-stream` and speak the SSE dialect already used by the
-v2-streaming AI tier (`event:` + `data:` frames, one JSON object per data
-payload).
+Every non-streaming response is
+`{ "success": true, "data": … }`; every recognised failure is
+`{ "success": false, "error": { "code", "message" } }`. The device reads `data`
+/ `error` and ignores `success`, so the flag is not load-bearing for the
+firmware — it is here because this contract describes what the routes actually
+return rather than a shape the device would happen to tolerate. One response
+sits outside the pair: when device lookup itself throws, the cloud's shared
+error helper answers `{ "error": "<message>", "status", "timestamp" }` with no
+`code` at all. That body carries no machine-readable code, so the device
+degrades it to `upstream_error` with a generic detail instead of inventing one.
+
+The two streaming endpoints answer `Accept: text/event-stream` and speak the SSE
+dialect already used by the v2-streaming AI tier: `event:` + `data:` frames, one
+JSON object per data payload, terminated by a blank line. They also send `id:`
+lines and `:` comment keepalives, which the device discards; a streaming body is
+the `runStream` frame list and carries no envelope.
 
 `/agent/transcribe` sends raw PCM with the audio shape in headers rather than
 multipart, matching the existing AI audio endpoints:
@@ -133,10 +144,11 @@ delivered as `agent.status {status: "busy"}` telling the user to answer in
 OpenCode, because an unanswerable prompt is worse than a clear instruction.
 
 **Interrupt is a success even when there was nothing to interrupt.**
-`POST /agent/sessions/{id}/interrupt` answers `{data:{interrupted}}`, and
-`interrupted: false` means "that run had already finished", which is not an
-error. The device makes the POST from the stream worker itself: the UI thread
-never opens a connection while a stream is attached.
+`POST /agent/sessions/{id}/interrupt` answers `{success: true,
+data: {interrupted}}`, and `interrupted: false` means "that run had already
+finished", which is not an error. The device makes the POST from the stream
+worker itself: the UI thread never opens a connection while a stream is
+attached.
 
 ## What the device does *not* mirror into history
 

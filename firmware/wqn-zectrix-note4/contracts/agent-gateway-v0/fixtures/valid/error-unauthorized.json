@@ -1,4 +1,5 @@
 {
+  "success": false,
   "error": {
     "code": "auth_required",
     "message": "设备未配对或令牌已失效"

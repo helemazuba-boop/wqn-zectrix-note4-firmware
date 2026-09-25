@@ -1,4 +1,5 @@
 {
+  "success": false,
   "error": {
     "code": "agent_unavailable",
     "message": "OpenCode 服务暂不可用"

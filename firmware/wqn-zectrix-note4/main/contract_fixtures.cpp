@@ -1615,6 +1615,7 @@ constexpr char kAgentErrorRetryStream[] = R"json([
 
 // `valid/history-response.json`.
 constexpr char kAgentHistory[] = R"json({
+  "success": true,
   "data": {
     "messages": [
       { "role": "user", "text": "帮我把这道极限题的步骤整理成错题本" },
