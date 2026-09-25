@@ -135,6 +135,19 @@ would block the run behind a prompt the user never saw. The deferred ask takes
 the bar the moment the permission is answered. Only one can be held, because the
 option bar has one mode; a third concurrent ask is logged and lost.
 
+**An ask is answered on the session that raised it.** `agent.permission` and
+`agent.question` carry `session_id`, which is the session the ask belongs to and
+is *not* necessarily the session the device attached to: a subagent has its own
+id and raises its asks against it. Both reply routes are session-scoped
+upstream, so the device POSTs against whichever session this names — answering
+on the attached session is a 404, which is what made a subagent's ask
+discoverable but never answerable. The field is required, but the device still
+tolerates its absence and then answers on the attached session, which is what a
+relay that predates the field wants; the same fallback covers a value that is
+not a session id. The fallback lives at the reply POST rather than in the frame
+parser, because a dropped ask is silently lost while a mis-routed one reports
+itself.
+
 **A question is answered by option value, never by field id.** The gateway
 projects the upstream form onto at most two `{value, label}` options and is the
 only component that knows which upstream field they came from; the device sends
