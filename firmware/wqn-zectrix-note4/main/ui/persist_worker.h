@@ -49,6 +49,8 @@ enum class PersistKind : uint8_t {
     kSettingsImageRender,
     kSettingsVolume,
     kSettingsDefaultDeck,
+    kSettingsAiFollow,
+    kSettingsAgentDetail,
     kCount,
 };
 
@@ -105,6 +107,8 @@ void EnqueueReservedProblemVerdict(
 uint32_t SubmitAutoSyncIntervalSave(uint32_t minutes);
 uint32_t SubmitImageRenderModeSave(wqn::ImageRenderMode mode);
 uint32_t SubmitVolumeSave(int percent);
+uint32_t SubmitAiFollowSave(bool follow);
+uint32_t SubmitAgentDetailLevelSave(uint8_t level);
 // Default-deck switch (c5): runs the recoverable marker protocol
 // (ChangeDefaultWordDeckForeground) on the worker. deck_id empty = all decks.
 // The UI installs the new deck ONLY after the durable ACK.

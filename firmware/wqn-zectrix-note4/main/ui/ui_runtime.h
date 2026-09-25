@@ -175,6 +175,22 @@ public:
     // inside the worker's marker transaction) and rebuilds the [词] rows;
     // failure keeps the displayed deck and the armed pending pair for retry.
     UiUpdate DispatchDefaultDeckChangeResult(esp_err_t result, uint32_t operation_id);
+    // [ai-follow] Durable follow-toggle result (c4 shape). Success installs the
+    // armed choice, pushes it to the worker (SetAiAutoFollow, the only bridge to
+    // the copy the follow step reads) and relabels the row; a failure keeps the
+    // durable value displayed and the armed choice for a re-Confirm.
+    UiUpdate DispatchAiFollowSaveResult(esp_err_t result, uint32_t operation_id);
+    // [detail] Debounced detail-tier write result. The status-bar value is
+    // already mirrored (it has to draw on the cycle's own tick); this only moves
+    // the durable bookkeeping. A failure re-anchors the debounce so the retry
+    // waits a full window instead of spinning on a failing NVS commit.
+    UiUpdate DispatchAgentDetailSaveResult(
+        esp_err_t result, uint32_t operation_id, int64_t now_ms);
+    // [detail] Per-tick debounce hook -- there is no Confirm gesture to hang the
+    // write off. Submits the pending tier once it has been stable for
+    // kAgentDetailSaveDebounceMs; a no-op while a write is in flight or when the
+    // desired value is already the persisted one.
+    UiUpdate DispatchAgentDetailPersist(int64_t now_ms);
 
 private:
     UiUpdate FinishEvent(

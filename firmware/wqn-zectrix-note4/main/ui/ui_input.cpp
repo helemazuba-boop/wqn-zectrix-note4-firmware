@@ -174,12 +174,26 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
             return RefreshSchedule::kConfig;
         }
         if (short_press && event.button == wqn::ButtonId::kConfirm) {
-            // [ai-follow] The toggle left the status-bar cluster for this row.
-            // The flag the follow step reads lives on the worker's AiSessionState
-            // (the UI copy is replaced by every snapshot), so the change must go
-            // through SetAiAutoFollow -- writing state->ai alone would revert.
-            state->settings.auto_follow = state->settings.ai_follow_selected == 0;
-            wqn::SetAiAutoFollow(state->settings.auto_follow);
+            // [ai-follow] The toggle left the status-bar cluster for this row, so
+            // it now follows the same two-phase shape as the other settings rows:
+            // arm the choice here, install it only when the durable ACK lands
+            // (DispatchAiFollowSaveResult). The flag the follow step reads lives
+            // on the worker's AiSessionState (the UI copy is replaced by every
+            // snapshot), so SetAiAutoFollow is called from the ACK, never here.
+            const bool choice = state->settings.ai_follow_selected == 0;
+            state->settings.pending_auto_follow = choice;
+            state->settings.auto_follow_pending_valid = true;
+            const uint32_t op_id = SubmitAiFollowSave(choice);
+            if (op_id != 0) {
+                state->settings.auto_follow_save_op_id = op_id;
+                state->settings.notice = "正在保存…";
+            } else {
+                state->settings.auto_follow_save_op_id = 0;
+                state->settings.notice =
+                    IsPersistKindBusy(PersistKind::kSettingsAiFollow)
+                    ? "正在保存，请稍后"
+                    : "保存繁忙，请重试";
+            }
             state->settings.dialog = wqn::SettingsDialog::kNone;
             return RefreshSchedule::kConfig;
         }
@@ -507,13 +521,22 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
 // re-reads the session at the new tier -- then the UI copy is mirrored so the
 // same-tick render draws the new glyph instead of waiting up to a poll period
 // for the snapshot (the snapshot confirms the mirror right after).
-static void CycleAgentDetailLevel(wqn::UiState* state, int direction)
+//
+// The NVS write is NOT immediate: this is a status-bar value toggle with no
+// Confirm, so a write per keypress would put an NVS commit behind every click
+// (and a double-click undo would write a value the user just took back). Only
+// the intent is recorded here; DispatchAgentDetailPersist submits it once the
+// value has been stable for a debounce window, which collapses a run of cycles
+// into one write of the value it settles on.
+static void CycleAgentDetailLevel(wqn::UiState* state, int direction, int64_t now_ms)
 {
     constexpr int kCount = 3;
     const int current = static_cast<int>(state->agent.detail_level);
     const int next = ((current + direction) % kCount + kCount) % kCount;
     state->agent.detail_level = static_cast<uint8_t>(next);
     wqn::SetOpenCodeDetailLevel(state->agent.detail_level);
+    state->settings.agent_detail_desired = state->agent.detail_level;
+    state->settings.agent_detail_last_change_ms = now_ms;
 }
 
 // [shell] Cycle the AI status-bar toggle at `index`. Index 0=tier (handled in
@@ -521,7 +544,7 @@ static void CycleAgentDetailLevel(wqn::UiState* state, int direction)
 // there). This fn only cycles the value toggles: 1=thinking, 2=tts, 3=expand on
 // STD/Pro, 4=详细程度 on the Agent tier (its 1..3 are immediate actions and
 // return before this path).
-static void CycleAiStatusBarToggle(wqn::UiState* state, uint8_t index)
+static void CycleAiStatusBarToggle(wqn::UiState* state, uint8_t index, int64_t now_ms)
 {
     wqn::AiSessionState& ai = state->ai;
     switch (index) {
@@ -534,7 +557,7 @@ static void CycleAiStatusBarToggle(wqn::UiState* state, uint8_t index)
         case 2: ai.tts_on = !ai.tts_on; wqn::SetAiTtsOn(ai.tts_on); break;
         case 3: ai.expand_content = !ai.expand_content; wqn::SetAiExpandContent(ai.expand_content); break;
         // [detail] Agent-only value toggle: the three-step detail tier.
-        case 4: CycleAgentDetailLevel(state, +1); break;
+        case 4: CycleAgentDetailLevel(state, +1, now_ms); break;
         default: break;
     }
 }
@@ -543,7 +566,7 @@ static void CycleAiStatusBarToggle(wqn::UiState* state, uint8_t index)
 // when a double-confirm turns the last single-cycle into a "save & exit" instead
 // (the optimistic forward cycle is rolled back so the saved value is the one the
 // user was looking at before the double-click).
-static void CycleAiStatusBarToggleReverse(wqn::UiState* state, uint8_t index)
+static void CycleAiStatusBarToggleReverse(wqn::UiState* state, uint8_t index, int64_t now_ms)
 {
     wqn::AiSessionState& ai = state->ai;
     switch (index) {
@@ -558,7 +581,9 @@ static void CycleAiStatusBarToggleReverse(wqn::UiState* state, uint8_t index)
         case 3: ai.expand_content = !ai.expand_content; wqn::SetAiExpandContent(ai.expand_content); break;
         // [detail] Three states, so the reverse is a real step back rather than
         // a boolean flip -- the undo gesture has to land on the previous tier.
-        case 4: CycleAgentDetailLevel(state, -1); break;
+        // Reversing also re-anchors the debounce: if the undo lands back on the
+        // persisted value the pump writes nothing at all.
+        case 4: CycleAgentDetailLevel(state, -1, now_ms); break;
         default: break;
     }
 }
@@ -956,13 +981,13 @@ static RefreshSchedule ApplyStatusBarEditEvent(
             // (1-3 on STD/Pro, 4 on Agent); the immediate slots return earlier.
             if (state->status_edit.last_cycle_ms > 0 &&
                 now_ms - state->status_edit.last_cycle_ms <= kStatusBarEditDblMs) {
-                CycleAiStatusBarToggleReverse(state, state->status_edit.selected);
+                CycleAiStatusBarToggleReverse(state, state->status_edit.selected, now_ms);
                 state->status_edit.active = false;
                 state->status_edit.last_cycle_ms = 0;
                 ESP_LOGI(kTag, "AI status-bar edit: save & exit (double-confirm)");
                 return RefreshSchedule::kSelection;
             }
-            CycleAiStatusBarToggle(state, state->status_edit.selected);
+            CycleAiStatusBarToggle(state, state->status_edit.selected, now_ms);
             state->status_edit.last_cycle_ms = now_ms;
             state->status_edit.last_action_ms = now_ms;
             return RefreshSchedule::kSelection;

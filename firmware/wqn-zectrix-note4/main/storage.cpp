@@ -41,6 +41,13 @@ constexpr char kAiSessionKey[] = "ai_session_day";
 constexpr char kAutoSyncIntervalMinKey[] = "sync_min";
 constexpr char kBootFullSyncAttemptKey[] = "boot_sync_at";
 constexpr char kImageRenderModeKey[] = "img_render";
+// [ai-follow] 「AI 回复时翻页」 (1 = on). A missing key reads as on: the
+// product default, and the behaviour the AI page shipped before the toggle
+// became durable.
+constexpr char kAiAutoFollowKey[] = "ai_follow";
+// [detail] Agent-tier cloud detail tier (0 简要 / 1 标准 / 2 详细). A missing
+// or out-of-range key reads as the full tier (see LoadAgentDetailLevel).
+constexpr char kAgentDetailLevelKey[] = "agent_detail";
 constexpr char kDefaultWordDeckKey[] = "word_deck";
 constexpr char kWifiSsidKey[] = "wifi_ssid";
 constexpr char kWifiPasswordKey[] = "wifi_pass";
@@ -53,6 +60,8 @@ constexpr char kControlSyncCursorKey[] = "v3_cursor";
 static_assert(sizeof(kAutoSyncIntervalMinKey) <= 16, "NVS key must fit ESP-IDF's 15-character limit");
 static_assert(sizeof(kBootFullSyncAttemptKey) <= 16, "NVS key must fit ESP-IDF's 15-character limit");
 static_assert(sizeof(kImageRenderModeKey) <= 16, "NVS key must fit ESP-IDF's 15-character limit");
+static_assert(sizeof(kAiAutoFollowKey) <= 16, "NVS key must fit ESP-IDF's 15-character limit");
+static_assert(sizeof(kAgentDetailLevelKey) <= 16, "NVS key must fit ESP-IDF's 15-character limit");
 static_assert(sizeof(kWifiSsidKey) <= 16, "NVS key must fit ESP-IDF's 15-character limit");
 static_assert(sizeof(kWifiPasswordKey) <= 16, "NVS key must fit ESP-IDF's 15-character limit");
 static_assert(sizeof(kWifiCredsBlobKey) <= 16, "NVS key must fit ESP-IDF's 15-character limit");
@@ -1372,6 +1381,62 @@ esp_err_t SaveImageRenderModeForeground(ImageRenderMode mode)
 std::string ImageRenderModeLabel(ImageRenderMode mode)
 {
     return mode == ImageRenderMode::kBlackWhite ? "黑白" : "16阶灰度";
+}
+
+esp_err_t LoadAiAutoFollow(bool* follow)
+{
+    if (follow == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    uint64_t raw = 0;
+    bool found = false;
+    ESP_RETURN_ON_ERROR(
+        LoadU64FromNvs(kAiAutoFollowKey, &raw, &found), kTag,
+        "load ai auto follow");
+    // Absent key = on (the product default); any nonzero stored value = on.
+    *follow = !found || raw != 0;
+    return ESP_OK;
+}
+
+esp_err_t SaveAiAutoFollowForeground(bool follow)
+{
+    StorageWriteGuard write("save-ai-follow", __FILE__, __LINE__);
+    if (!write) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    U64WriteContext context = {kAiAutoFollowKey, follow ? 1U : 0U};
+    return services::ExecuteForegroundStorageTransaction(
+        SaveU64Transaction, &context, "save-ai-follow");
+}
+
+esp_err_t LoadAgentDetailLevel(uint8_t* level)
+{
+    if (level == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    uint64_t raw = 0;
+    bool found = false;
+    ESP_RETURN_ON_ERROR(
+        LoadU64FromNvs(kAgentDetailLevelKey, &raw, &found), kTag,
+        "load agent detail level");
+    // An unknown future value degrades to the full tier (kOpenCodeDetailDefault
+    // in opencode_model.h) rather than to a tier the user never chose.
+    *level = found && raw <= 2 ? static_cast<uint8_t>(raw) : 2;
+    return ESP_OK;
+}
+
+esp_err_t SaveAgentDetailLevelForeground(uint8_t level)
+{
+    if (level > 2) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    StorageWriteGuard write("save-agent-detail", __FILE__, __LINE__);
+    if (!write) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    U64WriteContext context = {kAgentDetailLevelKey, static_cast<uint64_t>(level)};
+    return services::ExecuteForegroundStorageTransaction(
+        SaveU64Transaction, &context, "save-agent-detail");
 }
 
 esp_err_t LoadDefaultWordDeckId(std::string* deck_id)

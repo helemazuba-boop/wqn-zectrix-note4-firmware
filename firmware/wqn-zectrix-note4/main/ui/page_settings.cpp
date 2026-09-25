@@ -559,9 +559,13 @@ void OpenSettingsDialog(wqn::UiState* state, wqn::SettingsDialog dialog)
         state->settings.image_render_selected =
             seed == wqn::ImageRenderMode::kBlackWhite ? 0 : 1;
     } else if (dialog == wqn::SettingsDialog::kAiFollow) {
-        // Focus the current value -- the same one the row displays.
-        state->settings.ai_follow_selected =
-            state->settings.auto_follow ? 0 : 1;
+        // [ai-follow] Preselect an armed-but-unsaved choice (submit rejected or
+        // write failed) over the durable one so a re-Confirm retries the
+        // intended value; the durable one is what the row displays.
+        const bool seed = state->settings.auto_follow_pending_valid
+            ? state->settings.pending_auto_follow
+            : state->settings.auto_follow;
+        state->settings.ai_follow_selected = seed ? 0 : 1;
     } else if (dialog == wqn::SettingsDialog::kDefaultWordDeck) {
         // Option 0 is the fixed 全部词库; the rest mirror the mounted deck
         // catalog. Preselect an armed-but-unsaved switch (submit rejected or

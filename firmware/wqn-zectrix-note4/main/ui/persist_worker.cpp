@@ -65,7 +65,7 @@ struct PersistCommand {
 PersistCommand g_pool[kPoolDepth];
 QueueHandle_t g_worker_queue = nullptr;  // carries slot indices (uint8_t)
 TaskHandle_t g_worker_task = nullptr;
-// [psram-stack] Safe to keep in PSRAM: all seven PersistKind command paths
+// [psram-stack] Safe to keep in PSRAM: all nine PersistKind command paths
 // dispatch through ExecuteStorageTransaction, so the actual NVS/SPIFFS work
 // runs on the storage service task's internal stack, not this one. Verified
 // per kind in persist_worker.cpp ExecutePersistCommand. See psram_task_stack.cpp.
@@ -199,6 +199,11 @@ esp_err_t ExecutePersistCommand(PersistCommand& command)
             // Recoverable marker protocol; one foreground storage transaction
             // (marker -> session clears -> deck+generation -> marker clear).
             return wqn::ChangeDefaultWordDeckForeground(command.settings_str);
+        case PersistKind::kSettingsAiFollow:
+            return wqn::SaveAiAutoFollowForeground(command.settings_int != 0);
+        case PersistKind::kSettingsAgentDetail:
+            return wqn::SaveAgentDetailLevelForeground(
+                static_cast<uint8_t>(command.settings_int));
         case PersistKind::kCount:
             return ESP_ERR_NOT_SUPPORTED;
     }
@@ -469,6 +474,33 @@ uint32_t SubmitVolumeSave(int percent)
     // playback uses the new level regardless of how long the durable NVS write
     // waits behind other worker commands.
     wqn::SetPlaybackVolumeCache(percent);
+    EnqueueReserved(command, ticket.slot_index, ticket.kind);
+    return ticket.operation_id;
+}
+
+uint32_t SubmitAiFollowSave(bool follow)
+{
+    PersistTicket ticket = TryReservePersist(PersistKind::kSettingsAiFollow);
+    if (!ticket.valid()) {
+        return 0;
+    }
+    PersistCommand& command = g_pool[ticket.slot_index];
+    command.settings_int = follow ? 1 : 0;
+    EnqueueReserved(command, ticket.slot_index, ticket.kind);
+    return ticket.operation_id;
+}
+
+uint32_t SubmitAgentDetailLevelSave(uint8_t level)
+{
+    if (level > 2) {
+        return 0;
+    }
+    PersistTicket ticket = TryReservePersist(PersistKind::kSettingsAgentDetail);
+    if (!ticket.valid()) {
+        return 0;
+    }
+    PersistCommand& command = g_pool[ticket.slot_index];
+    command.settings_int = static_cast<int>(level);
     EnqueueReserved(command, ticket.slot_index, ticket.kind);
     return ticket.operation_id;
 }

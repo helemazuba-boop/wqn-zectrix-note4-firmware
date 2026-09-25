@@ -196,6 +196,25 @@ void UpdateSettingsDiagnostics(wqn::UiState* state)
     state->settings.image_render_selected =
         image_mode == wqn::ImageRenderMode::kBlackWhite ? 0 : 1;
 
+    // [ai-follow] Durable follow toggle: the value the settings row displays.
+    // The worker's own copy is seeded once at boot (LoadUiState's restore pass)
+    // and otherwise only moved by a save ACK -- never from here, since a periodic
+    // reload can run while a save is armed or in flight.
+    bool auto_follow = true;
+    if (wqn::LoadAiAutoFollow(&auto_follow) != ESP_OK) {
+        auto_follow = true;
+    }
+    state->settings.auto_follow = auto_follow;
+
+    // [detail] Durable detail tier. Only the PERSISTED half is refreshed: the
+    // status bar shows agent_detail_desired, which the user can change while this
+    // reload runs, and overwriting it would undo an unsaved cycle.
+    uint8_t detail_level = wqn::kOpenCodeDetailDefault;
+    if (wqn::LoadAgentDetailLevel(&detail_level) != ESP_OK) {
+        detail_level = wqn::kOpenCodeDetailDefault;
+    }
+    state->settings.agent_detail_persisted = detail_level;
+
     // [wifi-redundancy] Stored WiFi identity for the WiFi-manage row/dialog:
     // the configured networks (preferred + backup), independent of the
     // transient connection state.

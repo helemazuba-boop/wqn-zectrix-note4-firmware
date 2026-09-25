@@ -4,6 +4,7 @@
 
 #include "esp_log.h"
 #include "opencode_session.h"  // [follow] Agent viewport setters
+#include "persist_worker.h"    // [detail] SubmitAgentDetailLevelSave
 #include "ui_internal.h"
 #include "services/sync_service.h"
 #include "storage.h"
@@ -13,6 +14,12 @@ namespace device_ui_internal {
 namespace {
 
 constexpr char kTag[] = "wqn_ui_runtime";
+
+// [detail] How long the Agent detail tier must hold still before its NVS write
+// is submitted. Deliberately longer than the status bar's 400 ms double-confirm
+// window: the undo gesture lands back on the persisted value, so waiting past
+// the window means a double-click writes nothing at all.
+constexpr int64_t kAgentDetailSaveDebounceMs = 500;
 
 }  // namespace
 
@@ -600,6 +607,88 @@ UiUpdate UiRuntime::DispatchDefaultDeckChangeResult(
         ? RefreshSchedule::kConfig
         : RefreshSchedule::kNone;
     return FinishEvent(AppEventKind::kSettingsPersist, refresh, true);
+}
+
+UiUpdate UiRuntime::DispatchAiFollowSaveResult(esp_err_t result, uint32_t operation_id)
+{
+    wqn::SettingsAppState& settings = state_.settings;
+    if (settings.auto_follow_save_op_id == 0 ||
+        settings.auto_follow_save_op_id != operation_id) {
+        ESP_LOGW(kTag, "stale ai follow save result: op=%lu expected=%lu",
+                 static_cast<unsigned long>(operation_id),
+                 static_cast<unsigned long>(settings.auto_follow_save_op_id));
+        return FinishEvent(AppEventKind::kSettingsPersist,
+                           RefreshSchedule::kNone, false);
+    }
+    settings.auto_follow_save_op_id = 0;
+    if (result == ESP_OK) {
+        settings.auto_follow = settings.pending_auto_follow;
+        settings.auto_follow_pending_valid = false;
+        // The follow step reads the worker's copy and every snapshot replaces
+        // the UI copy, so the RAM effect has to go through the setter.
+        wqn::SetAiAutoFollow(settings.auto_follow);
+        settings.notice = settings.auto_follow ? "翻页已保存：开" : "翻页已保存：关";
+    } else {
+        settings.notice = "翻页设置未保存，请重试";
+        ESP_LOGW(kTag, "ai follow save failed: %s", esp_err_to_name(result));
+    }
+    const RefreshSchedule refresh = state_.screen == wqn::UiScreen::kSettings
+        ? RefreshSchedule::kConfig
+        : RefreshSchedule::kNone;
+    return FinishEvent(AppEventKind::kSettingsPersist, refresh, true);
+}
+
+UiUpdate UiRuntime::DispatchAgentDetailSaveResult(
+    esp_err_t result, uint32_t operation_id, int64_t now_ms)
+{
+    wqn::SettingsAppState& settings = state_.settings;
+    if (settings.agent_detail_save_op_id == 0 ||
+        settings.agent_detail_save_op_id != operation_id) {
+        ESP_LOGW(kTag, "stale agent detail save result: op=%lu expected=%lu",
+                 static_cast<unsigned long>(operation_id),
+                 static_cast<unsigned long>(settings.agent_detail_save_op_id));
+        return FinishEvent(AppEventKind::kSettingsPersist,
+                           RefreshSchedule::kNone, false);
+    }
+    settings.agent_detail_save_op_id = 0;
+    if (result == ESP_OK) {
+        // Install what the worker actually wrote, not `desired`: the user can
+        // keep cycling while the commit is in flight, and the pump picks the
+        // newer value up on a later tick.
+        settings.agent_detail_persisted = settings.agent_detail_inflight;
+    } else {
+        // Re-anchor so the retry waits a full debounce window; otherwise the
+        // pump would re-submit on every UI tick while NVS keeps failing.
+        settings.agent_detail_last_change_ms = now_ms;
+        ESP_LOGW(kTag, "agent detail save failed: %s", esp_err_to_name(result));
+    }
+    return FinishEvent(AppEventKind::kSettingsPersist, RefreshSchedule::kNone, true);
+}
+
+UiUpdate UiRuntime::DispatchAgentDetailPersist(int64_t now_ms)
+{
+    wqn::SettingsAppState& settings = state_.settings;
+    // Nothing to do while a write is in flight (the worker's per-kind busy gate
+    // would reject a second one anyway), when the durable value already matches
+    // the status bar, or while the value is still inside its debounce window.
+    if (settings.agent_detail_save_op_id != 0 ||
+        settings.agent_detail_desired == settings.agent_detail_persisted ||
+        now_ms - settings.agent_detail_last_change_ms < kAgentDetailSaveDebounceMs) {
+        return FinishEvent(AppEventKind::kSettingsPersist,
+                           RefreshSchedule::kNone, false);
+    }
+    const uint8_t target = settings.agent_detail_desired;
+    const uint32_t op_id = SubmitAgentDetailLevelSave(target);
+    if (op_id == 0) {
+        // Busy or pool-full: retry after another window, not on every tick.
+        settings.agent_detail_last_change_ms = now_ms;
+        return FinishEvent(AppEventKind::kSettingsPersist,
+                           RefreshSchedule::kNone, true);
+    }
+    settings.agent_detail_inflight = target;
+    settings.agent_detail_save_op_id = op_id;
+    return FinishEvent(AppEventKind::kSettingsPersist,
+                       RefreshSchedule::kNone, true);
 }
 
 UiUpdate UiRuntime::DispatchTimeTick(int64_t now_ms)

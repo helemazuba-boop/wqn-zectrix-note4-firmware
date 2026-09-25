@@ -13,7 +13,9 @@
 #include "services/sync_service.h"
 #include "services/connectivity_service.h"
 #include "storage.h"
+#include "ai_session.h"
 #include "note_app.h"
+#include "opencode_session.h"
 #include "word_app.h"
 #include "wqn_api.h"
 
@@ -208,6 +210,19 @@ bool LoadUiState(wqn::UiState* state, bool restore_screen_from_rtc)
 #endif
 
     UpdateSettingsDiagnostics(state);
+    if (restore_screen_from_rtc) {
+        // [ai-follow][detail] Boot seeding for the two settings that live in a
+        // worker's own state struct (AiSessionState / OpenCodeSessionState)
+        // rather than in AppState: the UI only ever sees a snapshot of them, and
+        // only their setters can change them, so the durable values have to be
+        // pushed once, here. A periodic reload deliberately does NOT do this --
+        // it can run while a save is armed or in flight and would overwrite the
+        // user's choice with the value still on flash.
+        wqn::SetAiAutoFollow(state->settings.auto_follow);
+        state->settings.agent_detail_desired = state->settings.agent_detail_persisted;
+        state->agent.detail_level = state->settings.agent_detail_desired;
+        wqn::SetOpenCodeDetailLevel(state->settings.agent_detail_desired);
+    }
     wqn::SetNoteImageRenderMode(
         &state->note_app, state->settings.image_render_mode);
     wqn::SetProblemImageRenderMode(

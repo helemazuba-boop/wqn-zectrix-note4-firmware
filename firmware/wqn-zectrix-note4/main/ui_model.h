@@ -377,9 +377,29 @@ struct SettingsAppState {
     // auto_follow is the durable value the row displays and the value the ACK
     // installs; the worker's AiSessionState::auto_follow is the copy the follow
     // step actually reads, and SetAiAutoFollow is the only bridge. The dialog
-    // focus is separate so an Up/Down repaint cannot be deduped away.
+    // focus is separate so an Up/Down repaint cannot be deduped away. The
+    // pending trio follows the c4 shape: Confirm arms the choice, a successful
+    // submit records its op id, and only the matching ACK installs it (a failed
+    // one keeps the armed choice so a re-open preselects it).
     bool auto_follow = true;
     size_t ai_follow_selected = 0;  // option index: 0 = 开 (the default), 1 = 关
+    bool pending_auto_follow = true;
+    bool auto_follow_pending_valid = false;
+    uint32_t auto_follow_save_op_id = 0;
+    // [detail] Agent-tier detail tier (0 简要 / 1 标准 / 2 详细). There is no
+    // Confirm gesture here: a status-bar cycle mirrors the value into the worker
+    // and into the UI copy immediately (it has to draw on this tick), and only
+    // the DURABLE write is deferred. Rapid cycles -- and the double-confirm
+    // undo, which lands back on the persisted value -- therefore collapse into
+    // at most one write of the value the user settles on. desired is what the
+    // status bar shows, persisted is what NVS holds, and a nonzero save op id
+    // means `inflight` is the value being written right now. The defaults match
+    // kOpenCodeDetailDefault so an absent key is a no-op at boot.
+    uint8_t agent_detail_desired = kOpenCodeDetailDefault;
+    uint8_t agent_detail_persisted = kOpenCodeDetailDefault;
+    uint8_t agent_detail_inflight = 0;
+    uint32_t agent_detail_save_op_id = 0;
+    int64_t agent_detail_last_change_ms = 0;
     // [persist-worker] In-flight/failed async settings saves (c4). Confirm arms
     // the chosen value here (pending_* + *_pending_valid) and, on a successful
     // submit, its dispatch operation id. The UI shows "正在保存" and only installs

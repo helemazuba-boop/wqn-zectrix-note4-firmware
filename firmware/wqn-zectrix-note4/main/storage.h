@@ -121,6 +121,19 @@ std::string AutoSyncIntervalLabel(uint32_t minutes);
 esp_err_t LoadImageRenderMode(ImageRenderMode* mode);
 esp_err_t SaveImageRenderModeForeground(ImageRenderMode mode);
 std::string ImageRenderModeLabel(ImageRenderMode mode);
+// [ai-follow] 「AI 回复时翻页」: whether a reply drags the viewport to its newest
+// line. A missing key reads as true (the product default). The AI session keeps
+// the copy the follow step actually reads; boot seeds it from here.
+esp_err_t LoadAiAutoFollow(bool* follow);
+// [persist-worker] Worker-dedicated variant (see SaveAutoSyncIntervalMinutesForeground).
+esp_err_t SaveAiAutoFollowForeground(bool follow);
+// [detail] Agent-tier cloud detail tier (0 简要 / 1 标准 / 2 详细). A missing or
+// out-of-range key reads as the full tier (kOpenCodeDetailDefault in
+// opencode_model.h). The opencode session keeps the copy the request builders
+// read; boot seeds it from here.
+esp_err_t LoadAgentDetailLevel(uint8_t* level);
+// [persist-worker] Worker-dedicated variant (see SaveAutoSyncIntervalMinutesForeground).
+esp_err_t SaveAgentDetailLevelForeground(uint8_t level);
 // Default word deck for the device (empty = all decks). The word page's
 // study sessions scope to it; the other decks enter via the note screen's
 // mixed [词] rows.
