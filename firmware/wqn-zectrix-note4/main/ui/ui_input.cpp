@@ -690,7 +690,7 @@ static RefreshSchedule ApplyAgentPickerEvent(
                 ESP_LOGI(kTag, "Agent picker: lock session");
                 state->agent_option.focused = 0;
             } else {
-                ESP_LOGW(kTag, "Agent picker: lock rejected (empty list?)");
+                ESP_LOGW(kTag, "Agent picker: lock rejected (busy or empty list)");
             }
             SyncAgentSnapshot(state);
             return RefreshSchedule::kAi;
@@ -823,12 +823,17 @@ static RefreshSchedule ApplyStatusBarEditEvent(
                 state->status_edit.last_action_ms = now_ms;
                 wqn::RequestForceFullRefresh();
                 if (slot == 1) {
-                    state->agent.session_locked = false;
-                    state->agent.selected_session = 0;
-                    if (wqn::RequestOpenCodeSessionList() != ESP_OK) {
+                    // [agent] Only open the picker when the list request was
+                    // accepted: a picker over an in-flight command could lock a
+                    // session the worker is not ready to backfill, and Observe
+                    // is only reachable from the picker.
+                    if (wqn::RequestOpenCodeSessionList() == ESP_OK) {
+                        state->agent.session_locked = false;
+                        state->agent.selected_session = 0;
+                        ESP_LOGI(kTag, "AI status-bar: agent session picker");
+                    } else {
                         ESP_LOGW(kTag, "AI status-bar: agent session list request failed");
                     }
-                    ESP_LOGI(kTag, "AI status-bar: agent session picker");
                     return RefreshSchedule::kAi;
                 }
                 const int direction = (slot == 2) ? -1 : 1;

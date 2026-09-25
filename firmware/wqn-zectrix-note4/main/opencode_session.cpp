@@ -1006,6 +1006,13 @@ void LoadHistory()
         result = wqn::GetOpenCodeHistory(token, g_run_session_id, &messages, &api_result);
     }
     xSemaphoreTake(g_lock, portMAX_DELAY);
+    // A lock that switched sessions while this read was in flight invalidates
+    // it: the transcript must never claim a session it was not read from.
+    if (result == ESP_OK && g_run_session_id != g_state.current_session_id) {
+        ESP_LOGW(kTag, "history backfill dropped: %s is no longer current",
+                 g_run_session_id.c_str());
+        result = ESP_ERR_INVALID_STATE;
+    }
     if (result == ESP_OK) {
         // Reset first, then append, then let the caller subscribe: the reverse
         // order lets the first live delta land on a backfilled message id and
@@ -1013,11 +1020,27 @@ void LoadHistory()
         ResetAgentHistoryTurnLocked();
         BackfillAgentHistoryLocked(messages, esp_timer_get_time() / 1000);
         g_state.history_loaded_session_id = g_run_session_id;
+        if (!g_observing) {
+            // Lock-triggered backfill: the stream was never the goal, so hand
+            // the session back ready to prompt.
+            g_state.ui.phase = wqn::AiFeaturePhase::kIdle;
+            g_state.ui.status_label = "就绪";
+            g_state.ui.activity_text = "长按确认键语音输入";
+        }
         MarkChangedLocked();
     } else {
         ESP_LOGW(kTag, "history backfill failed for %s: %s (%s)",
                  g_run_session_id.c_str(), api_result.error_code.c_str(),
                  api_result.detail.c_str());
+        // Failure must not leave a busy phase behind: an observing caller would
+        // sit on "观察中" with no stream attached, and a lock would stay busy.
+        g_state.ui.phase = wqn::AiFeaturePhase::kError;
+        g_state.ui.status_label = g_observing ? "观察失败" : "历史读取失败";
+        g_state.ui.activity_text =
+            g_observing ? "历史读取失败" : "可重新选择 Session 重试";
+        g_state.stream_active = false;
+        g_observing = false;
+        MarkChangedLocked();
     }
     if (result == ESP_OK && g_observing) {
         // Chain the observe stream behind the backfill: the stream must not
@@ -1026,6 +1049,7 @@ void LoadHistory()
         // (it only clears the command it just ran) leaves this one armed.
         g_run_session_id = g_state.current_session_id;
         g_state.ui.activity_text = "正在连接 Session 事件流";
+        MarkChangedLocked();
         if (ArmWorkerLocked(WorkerCommand::kObserveSession)) {
             xSemaphoreGive(g_lock);
             return;
@@ -1180,15 +1204,36 @@ esp_err_t MoveOpenCodeSessionSelection(int direction)
 
 esp_err_t LockSelectedOpenCodeSession()
 {
-    if (g_lock == nullptr) {
-        return ESP_ERR_INVALID_STATE;
-    }
+    ESP_RETURN_ON_ERROR(InitOpenCodeSession(), kTag, "init OpenCode session");
     xSemaphoreTake(g_lock, portMAX_DELAY);
     if (g_state.sessions.empty() || g_state.selected_session >= g_state.sessions.size()) {
         xSemaphoreGive(g_lock);
         return ESP_ERR_NOT_FOUND;
     }
+    // Ownership first: locking arms the backfill, so a lock that cannot start
+    // one must not touch any state at all. Mutating first and failing later
+    // would leave the view pointing at a session whose transcript and stream
+    // still belong to the previous one.
+    if (g_command != WorkerCommand::kNone) {
+        xSemaphoreGive(g_lock);
+        return ESP_ERR_INVALID_STATE;
+    }
     const AgentSessionOption& selected = g_state.sessions[g_state.selected_session];
+    esp_err_t result = AcquireAgentLeaseLocked();
+    if (result == ESP_OK) {
+        // The worker reads the target session from g_run_session_id, the same
+        // handoff slot ObserveOpenCodeSession uses.
+        g_run_session_id = selected.id;
+        if (!ArmWorkerLocked(WorkerCommand::kLoadHistory)) {
+            result = ESP_ERR_INVALID_STATE;
+        }
+    }
+    if (result != ESP_OK) {
+        g_run_session_id.clear();
+        ReleaseWorkOwnershipLocked();
+        xSemaphoreGive(g_lock);
+        return result;
+    }
     g_state.current_session_id = selected.id;
     g_state.current_session_title = selected.title;
     g_state.session_locked = true;
@@ -1198,13 +1243,17 @@ esp_err_t LockSelectedOpenCodeSession()
     ClearDeferredQuestionLocked();
     ClearReplyFlightLocked();
     // The mirrored transcript belongs to the session that produced it: drop the
-    // backfill marker too, so the next observe of this session re-reads it.
+    // backfill marker so the load armed above re-reads it for this session.
     g_state.history_loaded_session_id.clear();
     g_state.ui.context_label = selected.title;
-    g_state.ui.phase = AiFeaturePhase::kIdle;
-    g_state.ui.status_label = "就绪";
-    g_state.ui.activity_text = "长按确认键语音输入";
+    g_state.ui.phase = AiFeaturePhase::kLoading;
+    g_state.ui.status_label = "读取历史";
+    g_state.ui.activity_text = "正在读取历史对话";
     g_state.ui.action_hint = "长按确认录音 · ↑/↓ 滚动 · 双击观察";
+    g_state.ui.prompt_text.clear();
+    g_state.ui.response_text.clear();
+    g_state.ui.requires_confirmation = false;
+    g_state.ui.scroll_offset_lines = 0;
     g_state.confirmation_armed_at_ms = 0;
     // [agent] Switching sessions switches conversation: the mirrored transcript
     // belongs to the session that produced it, so drop it rather than letting
