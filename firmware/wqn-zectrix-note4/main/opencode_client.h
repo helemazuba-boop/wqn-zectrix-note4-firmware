@@ -69,6 +69,13 @@ struct OpenCodeEvent {
     std::string text;
     std::string tool;
     std::string preview;
+    // Upstream call id for an `agent.tool` frame. Empty when the gateway could
+    // not learn it (a mid-run attach); blocks then fall back to merging by name.
+    std::string call_id;
+    // True when an `agent.error` ends the run. A retryable upstream step failure
+    // is reported as an error with `fatal = false`: the run continues, so the
+    // session keeps running instead of showing a failure. Absent means fatal.
+    bool fatal = true;
     std::string permission_id;
     std::string question_id;
     std::string question_title;

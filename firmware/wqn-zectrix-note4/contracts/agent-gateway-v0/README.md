@@ -83,10 +83,10 @@ remaining nine carry data:
 | `agent.text` | `text` | Replaces the live assistant block (repair frames only) |
 | `agent.reasoning.delta` | `delta` | Appends to the thinking block, **never** to the answer |
 | `agent.reasoning` | `text` | Replaces the thinking block in place (repair frames only) |
-| `agent.tool` | `tool`, `status`, `preview` | One history block per tool, coalesced by name |
+| `agent.tool` | `tool`, `call_id`, `status`, `preview` | One history block per call, coalesced by `call_id` (falling back to the name when the gateway could not learn it) |
 | `agent.permission` | `permission_id`, `type`, `title`, `preview` | Enters `kAwaitingPermission`; the ask is answered by a separate POST |
 | `agent.question` | `question_id`, `title`, `options[]` | Enters `kAwaitingQuestion`; the ask is answered by a separate POST |
-| `agent.error` | `message` | Fails the run and surfaces the message |
+| `agent.error` | `message`, `fatal` | `fatal: false` records the message and keeps running; absent or `true` fails the run and surfaces the message |
 
 **Termination.** The device reads until it sees `agent.status` with
 `status: "idle"`. A stream that ends for any other reason — socket close,
@@ -116,6 +116,13 @@ the first is answered. If that POST fails, the pending ask is restored so it can
 be retried rather than leaving the run blocked behind a silent failure — the
 device does not assume the ask was answered. A pending ask is cleared only by a
 terminal status (`idle` or `error`), never by an intermediate one.
+
+The device defends against a gateway that does *not* hold the second ask back: a
+question arriving while the option bar is taken is **deferred**, not dropped —
+the gateway has already marked it seen and will not re-send it, so dropping it
+would block the run behind a prompt the user never saw. The deferred ask takes
+the bar the moment the permission is answered. Only one can be held, because the
+option bar has one mode; a third concurrent ask is logged and lost.
 
 **A question is answered by option value, never by field id.** The gateway
 projects the upstream form onto at most two `{value, label}` options and is the

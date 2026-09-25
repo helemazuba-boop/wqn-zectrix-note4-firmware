@@ -1589,6 +1589,30 @@ constexpr char kAgentReasoningStream[] = R"json([
   { "event": "agent.status", "data": { "status": "idle", "message": "执行完成" } }
 ])json";
 
+// `valid/error-retry-stream.json`. An error is not the end of a run: the
+// gateway marks a retryable upstream step failure `fatal: false` and keeps the
+// stream open, so the run that follows it is still a success.
+constexpr char kAgentErrorRetryStream[] = R"json([
+  { "event": "agent.accepted", "data": {} },
+  { "event": "agent.status", "data": { "status": "running", "message": "已接取任务" } },
+  {
+    "event": "agent.error",
+    "data": { "message": "上游步骤失败，正在重试", "fatal": false }
+  },
+  { "event": "agent.status", "data": { "status": "retry", "message": "第 1 次重试" } },
+  {
+    "event": "agent.tool",
+    "data": {
+      "tool": "notebook.search",
+      "call_id": "call_01J8ZQ5R8W3P1Y4N7C0D2E6F9G",
+      "status": "done",
+      "preview": "3 条结果"
+    }
+  },
+  { "event": "agent.text.delta", "data": { "delta": "重试后已找到 3 道同类题。" } },
+  { "event": "agent.status", "data": { "status": "idle", "message": "执行完成" } }
+])json";
+
 // `valid/history-response.json`.
 constexpr char kAgentHistory[] = R"json({
   "data": {
@@ -1771,6 +1795,106 @@ bool CheckAgentGatewayV0Contract()
             wqn::ParseOpenCodeAgentFrame("session.text.delta", R"json({"delta":"x"})json",
                                          &unknown_event) == ESP_ERR_NOT_SUPPORTED,
             "agent stream drops upstream event names")) {
+        return false;
+    }
+
+    // --- retry stream: a non-fatal error is not a failed run ----------------
+    //
+    // The gateway projects a retryable upstream step failure as `agent.error`
+    // with `fatal: false`. The device must read that as "keep going": treating
+    // every error as terminal locked a run that later succeeded into 失败, and
+    // the failure flag then closed every later tool block as an error too.
+    int retry_frames = 0;
+    bool retry_ok = true;
+    if (!ReplayAgentStream(kAgentErrorRetryStream,
+                           [&](int index, esp_err_t result, const wqn::OpenCodeEvent& event) {
+                               ++retry_frames;
+                               if (!Require(result == ESP_OK, "agent retry frame parses")) {
+                                   retry_ok = false;
+                                   return false;
+                               }
+                               if (index == 2) {
+                                   if (!Require(
+                                           event.kind == wqn::OpenCodeEventKind::kError,
+                                           "agent retry error kind") ||
+                                       !Require(
+                                           event.text == "上游步骤失败，正在重试",
+                                           "agent retry error text") ||
+                                       !Require(
+                                           !event.fatal,
+                                           "agent retry error is not fatal")) {
+                                       retry_ok = false;
+                                       return false;
+                                   }
+                               }
+                               // The run survives the error: the frames after it
+                               // must still reach the device.
+                               if (index == 4 && !Require(
+                                                      event.kind ==
+                                                              wqn::OpenCodeEventKind::kTool &&
+                                                          event.tool == "notebook.search" &&
+                                                          event.call_id ==
+                                                              "call_01J8ZQ5R8W3P1Y4N7C0D2E"
+                                                              "6F9G",
+                                                      "agent retry tool frame after error")) {
+                                   retry_ok = false;
+                                   return false;
+                               }
+                               if (index == 6 &&
+                                   !Require(
+                                       event.kind == wqn::OpenCodeEventKind::kStatus &&
+                                           event.status == "idle",
+                                       "agent retry stream terminates on idle")) {
+                                   retry_ok = false;
+                                   return false;
+                               }
+                               return true;
+                           }) ||
+        !Require(retry_ok, "agent retry error keeps the run alive") ||
+        !Require(retry_frames == 7, "agent retry stream frame count")) {
+        return false;
+    }
+
+    // --- `fatal` is opt-out: absent means the run is over --------------------
+    //
+    // A gateway that predates the field must keep its original meaning, so an
+    // absent (or true) flag is terminal rather than silently downgrading every
+    // error into a recoverable one.
+    wqn::OpenCodeEvent error_event;
+    if (!Require(
+            wqn::ParseOpenCodeAgentFrame("agent.error", R"json({"message":"x"})json",
+                                         &error_event) == ESP_OK,
+            "agent error without fatal parses") ||
+        !Require(error_event.fatal, "agent error without fatal is terminal") ||
+        !Require(
+            wqn::ParseOpenCodeAgentFrame("agent.error",
+                                         R"json({"message":"x","fatal":true})json",
+                                         &error_event) == ESP_OK,
+            "agent error with fatal true parses") ||
+        !Require(error_event.fatal, "agent error with fatal true is terminal")) {
+        return false;
+    }
+
+    // --- `call_id` separates two calls of the same tool ----------------------
+    //
+    // Upstream only pairs the tool name with the frame that announces the call,
+    // and the frames that end it carry just the id. The gateway echoes that id
+    // so the device can keep two calls of one tool as two blocks; when it is
+    // absent (a mid-run attach) the device falls back to merging by name.
+    wqn::OpenCodeEvent tool_event;
+    if (!Require(
+            wqn::ParseOpenCodeAgentFrame(
+                "agent.tool",
+                R"json({"tool":"notebook.search","call_id":"call_a","status":"running"})json",
+                &tool_event) == ESP_OK,
+            "agent tool with call_id parses") ||
+        !Require(tool_event.call_id == "call_a", "agent tool call_id projection") ||
+        !Require(
+            wqn::ParseOpenCodeAgentFrame("agent.tool",
+                                         R"json({"tool":"notebook.search","status":"done"})json",
+                                         &tool_event) == ESP_OK,
+            "agent tool without call_id parses") ||
+        !Require(tool_event.call_id.empty(), "agent tool call_id is optional")) {
         return false;
     }
 

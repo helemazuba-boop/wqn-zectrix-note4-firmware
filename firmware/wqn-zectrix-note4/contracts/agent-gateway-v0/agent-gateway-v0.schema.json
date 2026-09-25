@@ -332,6 +332,12 @@
                 "required": ["tool", "status"],
                 "properties": {
                   "tool": { "type": "string", "minLength": 1, "maxLength": 80 },
+                  "call_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "description": "Upstream call id, echoed on every frame of one call. Without it the device merges frames by tool name, so two calls of the same tool become one block whose detail is the last call's. Absent only when the gateway could not learn it (a mid-run attach); the device then falls back to merging by name."
+                  },
                   "status": { "enum": ["running", "done", "error"] },
                   "preview": { "type": "string", "maxLength": 160 }
                 }
@@ -369,7 +375,13 @@
                 "type": "object",
                 "additionalProperties": false,
                 "required": ["message"],
-                "properties": { "message": { "type": "string", "minLength": 1, "maxLength": 512 } }
+                "properties": {
+                  "message": { "type": "string", "minLength": 1, "maxLength": 512 },
+                  "fatal": {
+                    "type": "boolean",
+                    "description": "Whether this error ends the run. Absent or true is terminal -- the device shows 失败 and closes the turn. false means the upstream step failed but will be retried, so the device records the error and keeps running: treating a retryable failure as terminal showed a successful run as a failure and closed every later tool block as an error."
+                  }
+                }
               }
             }
           }

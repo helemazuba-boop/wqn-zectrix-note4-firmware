@@ -2,7 +2,7 @@
   "contract": "agent-gateway-v0",
   "version": "2.0",
   "schema": "agent-gateway-v0.schema.json",
-  "schema_sha256": "9aea3f3249ff0e70ed476ced647781fb5472e09af8533f97e0d8031b6362ca94",
+  "schema_sha256": "41c182f7b042776c84a67d851137abab784da194eb7457337f897434eb235df3",
   "api_base": "https://wqn.helema.cn/api/esp32",
   "routes_prefix": "/agent",
   "auth": "Authorization: Bearer <device pairing token>",
@@ -62,7 +62,11 @@
       "agent.question is a new device event carrying at most two projected options",
       "GET /agent/sessions/{id}/history is a new device route; it must fit the 16 KiB JSON ceiling, so the gateway trims from the front",
       "POST /agent/sessions/{id}/question and POST /agent/sessions/{id}/interrupt are new device routes"
-    ]
+    ],
+    "additive_fields": {
+      "agent.tool.call_id": "upstream call id echoed on every frame of one call, so two calls of the same tool are two blocks rather than one; absent only on a mid-run attach, where the device merges by tool name",
+      "agent.error.fatal": "false marks a retryable upstream step failure: the device records the error and keeps running. Absent or true means the run is over, which is what every gateway that predates the field sends"
+    }
   },
   "replaces": "X-WQN-Ai-Tier: pro (retired Pro tier)"
 }

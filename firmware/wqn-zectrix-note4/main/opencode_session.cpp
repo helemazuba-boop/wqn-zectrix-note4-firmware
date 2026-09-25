@@ -58,6 +58,12 @@ bool g_observing = false;
 std::string g_run_session_id;
 std::string g_run_prompt;
 wqn::OpenCodeOutboundQueue g_outbound_replies;
+// The ask a queued reply answers. The UI closes its option bar the moment the
+// reply is queued, so the live ask id is not proof that a reply went out: this
+// is. Only a failed POST consults it, and it holds exactly one reply because
+// the worker drains the queue serially.
+std::string g_reply_flight_permission_id;
+std::string g_reply_flight_question_id;
 // Cancel handshake for an attached stream. The UI thread only sets the request;
 // the worker is the one that makes the interrupt POST, so it is also the one
 // that records whether the interrupt actually reached the gateway.
@@ -70,6 +76,9 @@ void DiscardOutboundReplies();
 // Declared up here: clearing a pending ask is part of every terminal status and
 // of every list load, which run long before the definition below.
 void ClearPendingQuestionLocked();
+void ClearReplyFlightLocked();
+void ClearDeferredQuestionLocked();
+void PromoteDeferredQuestionLocked();
 
 void MarkChangedLocked()
 {
@@ -183,6 +192,8 @@ void LoadSessions()
             g_state.current_session_title.clear();
             g_state.pending_permission_id.clear();
             ClearPendingQuestionLocked();
+            ClearDeferredQuestionLocked();
+            ClearReplyFlightLocked();
             // A fresh list means no session's transcript is on screen any more,
             // so the next observe must backfill again.
             g_state.history_loaded_session_id.clear();
@@ -334,6 +345,8 @@ wqn::ChatMessageId g_agent_assistant_id = wqn::kInvalidChatMessageId;
 wqn::ChatMessageId g_agent_tool_id = wqn::kInvalidChatMessageId;
 wqn::ChatMessageId g_agent_thinking_id = wqn::kInvalidChatMessageId;
 std::string g_agent_tool_name;
+// Call id of the open block, when the gateway sends one. See the kTool branch.
+std::string g_agent_tool_call;
 // Reasoning has its own channel and its own buffer. It is deliberately NOT
 // accumulated into `g_state.ui.response_text`: even if the gateway mapped a
 // reasoning frame as `agent.text`, the answer the user reads would stay clean.
@@ -353,6 +366,7 @@ void ResetAgentHistoryTurnLocked()
     g_agent_tool_id = wqn::kInvalidChatMessageId;
     g_agent_thinking_id = wqn::kInvalidChatMessageId;
     g_agent_tool_name.clear();
+    g_agent_tool_call.clear();
     g_agent_thinking_text.clear();
     g_agent_tool_detail.clear();
     g_agent_tool_since_ms = 0;
@@ -380,6 +394,7 @@ void CloseAgentToolBlockLocked(bool ok, int64_t now_ms)
     }
     g_agent_tool_id = wqn::kInvalidChatMessageId;
     g_agent_tool_name.clear();
+    g_agent_tool_call.clear();
     g_agent_tool_detail.clear();
     g_agent_tool_since_ms = 0;
     // Post-tool text must open a NEW assistant entry. Rewriting the pre-tool
@@ -457,6 +472,53 @@ void ClearPendingQuestionLocked()
     g_state.pending_question_options.clear();
 }
 
+// Forget which reply is on the wire once the ask it answers is over. A stream
+// that outlives the ask (a permission answered from the OpenCode side, a run
+// that ended while a reply was in flight) must not let a later failure restore
+// an ask the user already moved past.
+void ClearReplyFlightLocked()
+{
+    g_reply_flight_permission_id.clear();
+    g_reply_flight_question_id.clear();
+}
+
+// One question the device could not show yet, because a permission ask holds the
+// option bar. It is promoted the moment that bar is free, so an ask that arrives
+// behind another is answered rather than lost.
+bool g_deferred_question_valid = false;
+std::string g_deferred_question_id;
+std::string g_deferred_question_title;
+std::vector<wqn::OpenCodeQuestionOption> g_deferred_question_options;
+
+// Hand the deferred ask the option bar it has been waiting for. Only a
+// permission reply calls this, because only a permission reply can free the bar:
+// a question arm means the permission slot is already empty, and a terminal
+// status clears the deferred ask instead of promoting it.
+void PromoteDeferredQuestionLocked()
+{
+    if (!g_deferred_question_valid || !g_state.pending_permission_id.empty() ||
+        !g_state.pending_question_id.empty()) {
+        return;
+    }
+    g_state.ui.phase = wqn::AiFeaturePhase::kAwaitingQuestion;
+    g_state.ui.status_label = "等待回答";
+    g_state.pending_question_id = std::move(g_deferred_question_id);
+    g_state.pending_question_title = std::move(g_deferred_question_title);
+    g_state.pending_question_options = std::move(g_deferred_question_options);
+    g_state.ui.activity_text = g_state.pending_question_title;
+    g_state.ui.action_hint = "↑/↓ 选择 · 确认回答";
+    g_deferred_question_valid = false;
+    MarkChangedLocked();
+}
+
+void ClearDeferredQuestionLocked()
+{
+    g_deferred_question_valid = false;
+    g_deferred_question_id.clear();
+    g_deferred_question_title.clear();
+    g_deferred_question_options.clear();
+}
+
 // Replays one session's backfilled turns into the kAgent channel, oldest first.
 // The gateway already chose the window and truncated each field, so this is a
 // direct projection: no dedupe against live deltas, because the caller resets
@@ -518,6 +580,7 @@ void OnOpenCodeEvent(const wqn::OpenCodeEvent& event, void*)
             if (event.status == "idle" || event.status == "error") {
                 g_state.pending_permission_id.clear();
                 ClearPendingQuestionLocked();
+                ClearReplyFlightLocked();
             }
             if (event.status == "idle") {
                 g_state.stream_active = false;
@@ -584,17 +647,24 @@ void OnOpenCodeEvent(const wqn::OpenCodeEvent& event, void*)
                 g_state.ui.activity_text += " · " + event.preview;
             }
             g_agent_tool_ok = event.status != "error";
-            // Coalesce by tool name: the gateway re-emits `agent.tool` as a
-            // tool progresses, and one history block per tool keeps the
-            // transcript readable on a 400x300 panel.
-            if (g_agent_tool_id != wqn::kInvalidChatMessageId &&
-                g_agent_tool_name == event.tool) {
+            // Coalesce one tool call into one block. The key is the call id when
+            // the gateway learned it: a run that reads two files re-emits the
+            // same tool name twice, and merging by name alone collapsed both
+            // into a single block whose detail was the last call's. When the id
+            // is unknown (mid-run attach) fall back to the name, which is the
+            // most a v0 conversation can distinguish.
+            const bool same_call = g_agent_tool_id != wqn::kInvalidChatMessageId &&
+                                   !event.call_id.empty() && g_agent_tool_call == event.call_id;
+            const bool same_name = g_agent_tool_id != wqn::kInvalidChatMessageId &&
+                                   event.call_id.empty() && g_agent_tool_name == event.tool;
+            if (same_call || same_name) {
                 g_agent_tool_detail = event.preview.empty() ? event.status : event.preview;
             } else {
                 CloseAgentToolBlockLocked(g_agent_tool_ok, now_ms);
                 g_agent_tool_id = wqn::GetAiHistory(wqn::AiHistoryChannel::kAgent)
                                       .AppendToolStart(event.tool, std::string_view(), now_ms);
                 g_agent_tool_name = event.tool;
+                g_agent_tool_call = event.call_id;
                 g_agent_tool_detail = event.preview.empty() ? event.status : event.preview;
                 g_agent_tool_since_ms = now_ms;
             }
@@ -617,12 +687,23 @@ void OnOpenCodeEvent(const wqn::OpenCodeEvent& event, void*)
             break;
         case wqn::OpenCodeEventKind::kQuestion:
             // A question and a permission can never be live at once: the option
-            // bar has one mode, and the session state has one pending ask. A
-            // second concurrent ask is dropped here -- the gateway's own single
-            // slot does the same, and the next poll re-discovers it.
+            // bar has one mode, and the session state has one pending ask.
+            // Deferring -- not dropping -- is what keeps the run alive: a dropped
+            // ask is lost for good, because the gateway has already marked it
+            // seen and will not re-send it, so the run sits behind a question the
+            // user was never shown.
             if (!g_state.pending_permission_id.empty()) {
-                ESP_LOGW(kTag, "question %s dropped: a permission ask is pending",
-                         event.question_id.c_str());
+                if (g_deferred_question_valid) {
+                    ESP_LOGW(kTag, "question %s dropped: a permission and a question are already pending",
+                             event.question_id.c_str());
+                } else {
+                    g_deferred_question_valid = true;
+                    g_deferred_question_id = event.question_id;
+                    g_deferred_question_title = event.text;
+                    g_deferred_question_options = event.question_options;
+                    ESP_LOGI(kTag, "question %s held until the permission ask is answered",
+                             event.question_id.c_str());
+                }
                 break;
             }
             g_state.ui.phase = wqn::AiFeaturePhase::kAwaitingQuestion;
@@ -636,14 +717,37 @@ void OnOpenCodeEvent(const wqn::OpenCodeEvent& event, void*)
             MarkChangedLocked();
             break;
         case wqn::OpenCodeEventKind::kError:
-            g_run_failed = true;
-            g_state.pending_permission_id.clear();
-            ClearPendingQuestionLocked();
-            g_state.ui.phase = wqn::AiFeaturePhase::kError;
-            g_state.ui.status_label = "执行失败";
-            g_state.ui.activity_text = event.text;
-            g_state.ui.action_hint = "长按确认重试新任务";
+            // An error is not the end of a run by itself: the gateway projects a
+            // retryable upstream step failure as `agent.error` and keeps the
+            // stream open. Treating every error as terminal locked the run into
+            // 失败, so a step that retried successfully still ended shown as a
+            // failure -- and `g_run_failed` then closed every later tool block as
+            // an error too.
             AppendAgentErrorLocked(event.text, now_ms);
+            if (event.fatal) {
+                // The run is over, so the ask and its in-flight reply are over
+                // with it: nothing can answer them any more.
+                g_state.pending_permission_id.clear();
+                ClearPendingQuestionLocked();
+                ClearDeferredQuestionLocked();
+                ClearReplyFlightLocked();
+                g_run_failed = true;
+                g_state.ui.phase = wqn::AiFeaturePhase::kError;
+                g_state.ui.status_label = "执行失败";
+                g_state.ui.action_hint = "长按确认重试新任务";
+            } else {
+                // Keep running: the error is recorded, the run continues. A live
+                // ask stays armed on purpose -- disarming it would leave the run
+                // blocked behind an ask the gateway has already marked seen and
+                // will not re-send.
+                g_state.ui.activity_text = event.text;
+                if (g_state.pending_permission_id.empty() &&
+                    g_state.pending_question_id.empty()) {
+                    g_state.ui.phase = wqn::AiFeaturePhase::kRunning;
+                    g_state.ui.status_label = g_observing ? "观察中" : "Agent 执行中";
+                    g_state.ui.action_hint.clear();
+                }
+            }
             MarkChangedLocked();
             break;
     }
@@ -654,13 +758,16 @@ void OnOpenCodeReplyFailed(
     const wqn::OpenCodeOutboundReply& reply, esp_err_t error, void*)
 {
     xSemaphoreTake(g_lock, portMAX_DELAY);
-    const bool superseded = reply.is_question
-        ? g_state.pending_question_id.empty() || g_state.pending_question_id != reply.question_id
-        : g_state.pending_permission_id.empty() ||
-          g_state.pending_permission_id != reply.permission_id;
-    if (g_state.ui.phase == wqn::AiFeaturePhase::kRunning && !superseded) {
-        // No newer ask superseded this one: restore it so the reply can be
-        // retried instead of leaving the run blocked behind a silent failure.
+    // Match against the reply that is actually in flight, not against the live
+    // ask: the option bar is closed as soon as the reply is queued, so the old
+    // "is this ask still pending?" test read "superseded" on every outcome and
+    // the restore below was unreachable. A failed reply left the run blocked
+    // behind an ask the device could no longer answer, until the stream timed
+    // out -- which v1 could recover from and v2 could not.
+    const bool in_flight = reply.is_question
+        ? g_reply_flight_question_id == reply.question_id
+        : g_reply_flight_permission_id == reply.permission_id;
+    if (g_state.ui.phase == wqn::AiFeaturePhase::kRunning && in_flight) {
         if (reply.is_question) {
             g_state.ui.phase = wqn::AiFeaturePhase::kAwaitingQuestion;
             g_state.ui.status_label = "回答失败";
@@ -751,6 +858,8 @@ void CreateSession()
         g_observing = false;
         g_state.pending_permission_id.clear();
         ClearPendingQuestionLocked();
+        ClearDeferredQuestionLocked();
+        ClearReplyFlightLocked();
         // Nothing to backfill in an empty session; mark it loaded so the first
         // observe attaches straight to the stream.
         g_state.history_loaded_session_id = created.id;
@@ -1020,6 +1129,8 @@ esp_err_t LockSelectedOpenCodeSession()
     g_observing = false;
     g_state.pending_permission_id.clear();
     ClearPendingQuestionLocked();
+    ClearDeferredQuestionLocked();
+    ClearReplyFlightLocked();
     // The mirrored transcript belongs to the session that produced it: drop the
     // backfill marker too, so the next observe of this session re-reads it.
     g_state.history_loaded_session_id.clear();
@@ -1090,6 +1201,11 @@ esp_err_t ObserveOpenCodeSession()
         g_run_session_id = g_state.current_session_id;
         g_state.pending_permission_id.clear();
         ClearPendingQuestionLocked();
+        // Attaching is a fresh turn: a question the previous attach could not
+        // show is stale, and a gateway re-attach re-discovers it anyway --
+        // holding it would swallow the fresh copy for the slot it occupies.
+        ClearDeferredQuestionLocked();
+        ClearReplyFlightLocked();
         // Observe locks the session so the interaction view (not the picker)
         // renders while the stream is attached; the lock persists afterwards
         // so the observed session can immediately be prompted as well.
@@ -1134,11 +1250,15 @@ esp_err_t ReplyPendingOpenCodePermission(bool approve)
     }
     g_outbound_replies.Push(wqn::OpenCodeOutboundReply{
         g_state.pending_permission_id, approve, false, {}, {}});
+    // The reply on the wire is the only thing that proves the id was delivered.
+    // The UI closes its option bar here, so the live id is deliberately not it.
+    g_reply_flight_permission_id = g_state.pending_permission_id;
     g_state.pending_permission_id.clear();
     g_state.ui.phase = AiFeaturePhase::kRunning;
     g_state.ui.status_label = g_observing ? "观察中" : "Agent 执行中";
     g_state.ui.activity_text = approve ? "已批准权限" : "已拒绝权限";
     g_state.ui.action_hint.clear();
+    PromoteDeferredQuestionLocked();
     MarkChangedLocked();
     xSemaphoreGive(g_lock);
     return ESP_OK;
@@ -1164,10 +1284,12 @@ esp_err_t ReplyPendingOpenCodeQuestion(int index)
     reply.question_id = g_state.pending_question_id;
     reply.answer = answer;
     g_outbound_replies.Push(std::move(reply));
+    g_reply_flight_question_id = reply.question_id;
     g_state.ui.phase = AiFeaturePhase::kRunning;
     g_state.ui.status_label = g_observing ? "观察中" : "Agent 执行中";
     g_state.ui.activity_text = "已回答：" + answer;
     g_state.ui.action_hint.clear();
+    ClearDeferredQuestionLocked();
     // The pending ask stays armed until a terminal status: if the reply POST
     // fails, OnOpenCodeReplyFailed restores exactly this state for a retry.
     MarkChangedLocked();
@@ -1292,6 +1414,11 @@ esp_err_t ConfirmOpenCodePrompt(int64_t confirmed_at_ms)
     }
     if (result == ESP_OK) {
         g_run_failed = false;
+        // A submitted run is a fresh turn. Ask state the previous turn left
+        // behind cannot be answered any more -- the gateway it belonged to is
+        // gone -- and the re-attached gateway re-discovers its own pending asks.
+        ClearDeferredQuestionLocked();
+        ClearReplyFlightLocked();
         g_state.ui.phase = AiFeaturePhase::kSubmitting;
         g_state.ui.status_label = "正在提交";
         g_state.ui.response_text.clear();

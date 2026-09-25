@@ -898,6 +898,10 @@ esp_err_t ParseOpenCodeAgentFrame(
         event.tool = JsonString(root, "tool");
         event.status = JsonString(root, "status");
         event.preview = JsonString(root, "preview");
+        // The upstream call id. Upstream only ever pairs it with the tool name
+        // in the frame that announces the call, so it is what makes two calls of
+        // the same tool two blocks rather than one.
+        event.call_id = JsonString(root, "call_id");
     } else if (event_name == "agent.permission") {
         event.kind = wqn::OpenCodeEventKind::kPermission;
         event.permission_id = JsonString(root, "permission_id");
@@ -935,6 +939,13 @@ esp_err_t ParseOpenCodeAgentFrame(
     } else if (event_name == "agent.error") {
         event.kind = wqn::OpenCodeEventKind::kError;
         event.text = JsonString(root, "message");
+        // An absent or non-boolean flag means fatal, so a gateway that predates
+        // the field keeps its original meaning rather than silently downgrading
+        // every error into a recoverable one.
+        cJSON* fatal = cJSON_GetObjectItemCaseSensitive(root, "fatal");
+        if (cJSON_IsBool(fatal)) {
+            event.fatal = cJSON_IsTrue(fatal);
+        }
     } else {
         cJSON_Delete(root);
         return ESP_ERR_NOT_SUPPORTED;
