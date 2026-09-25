@@ -1560,6 +1560,7 @@ constexpr char kAgentQuestionStream[] = R"json([
   {
     "event": "agent.question",
     "data": {
+      "session_id": "ses_01J8ZQ4K7V2N9X0M3B6C5D4E7F",
       "question_id": "frm_01J8ZQ5R8W3P1Y4N7C0D2E6F9G",
       "title": "要写入哪个错题本？",
       "options": [
@@ -1569,6 +1570,47 @@ constexpr char kAgentQuestionStream[] = R"json([
     }
   },
   { "event": "agent.text.delta", "data": { "delta": "已写入数学错题本。" } },
+  { "event": "agent.status", "data": { "status": "idle", "message": "执行完成" } }
+])json";
+
+// `valid/subagent-ask-stream.json`. Both asks name a session that is not the one
+// the device attached to: a subagent has its own id and raises its asks against
+// it, and both reply routes are scoped to whichever session the frame names.
+constexpr char kAgentSubagentAskStream[] = R"json([
+  { "event": "agent.accepted", "data": {} },
+  { "event": "agent.status", "data": { "status": "running", "message": "已接取任务" } },
+  {
+    "event": "agent.tool",
+    "data": {
+      "tool": "notebook.search",
+      "call_id": "call_01J8ZQ5R8W3P1Y4N7C0D2E6F9G",
+      "status": "running",
+      "preview": "query=极限"
+    }
+  },
+  {
+    "event": "agent.permission",
+    "data": {
+      "session_id": "ses_01J8ZQ4K7V2N9X0M3B6C5SUBA1",
+      "permission_id": "prm_01J8ZQ5R8W3P1Y4N7C0D2SUBA1",
+      "type": "notebook.write",
+      "title": "子任务请求写入错题本",
+      "preview": "题目 129 · 追加 1 条记录"
+    }
+  },
+  {
+    "event": "agent.question",
+    "data": {
+      "session_id": "ses_01J8ZQ4K7V2N9X0M3B6C5SUBA1",
+      "question_id": "frm_01J8ZQ5R8W3P1Y4N7C0D2SUBA1",
+      "title": "子任务的提问：追加到哪里？",
+      "options": [
+        { "value": "math", "label": "数学错题本" },
+        { "value": "physics", "label": "物理错题本" }
+      ]
+    }
+  },
+  { "event": "agent.text.delta", "data": { "delta": "子任务已写入数学错题本。" } },
   { "event": "agent.status", "data": { "status": "idle", "message": "执行完成" } }
 ])json";
 
@@ -1685,6 +1727,10 @@ bool CheckAgentGatewayV0Contract()
                                            event.kind == wqn::OpenCodeEventKind::kQuestion,
                                            "agent question kind") ||
                                        !Require(
+                                           event.session_id ==
+                                               "ses_01J8ZQ4K7V2N9X0M3B6C5D4E7F",
+                                           "agent question session") ||
+                                       !Require(
                                            event.question_id ==
                                                "frm_01J8ZQ5R8W3P1Y4N7C0D2E6F9G",
                                            "agent question id") ||
@@ -1721,6 +1767,69 @@ bool CheckAgentGatewayV0Contract()
                            }) ||
         !Require(question_frames == 4, "agent question stream frame count") ||
         !Require(question_ids_ok, "agent question option projection")) {
+        return false;
+    }
+
+    // --- subagent asks: the owning session is not the attached one ------------
+    //
+    // The relay watches the attached session and every child of it, and a child
+    // raises its asks against its own id. Both reply routes are session-scoped
+    // upstream, so a frame that does not carry the owning session is an ask the
+    // device cannot answer: the reply lands on the attached session and 404s.
+    // This is the fixture that keeps the field from being dropped as decorative.
+    int subagent_asks = 0;
+    bool subagent_ok = true;
+    if (!ReplayAgentStream(kAgentSubagentAskStream,
+                           [&](int index, esp_err_t result, const wqn::OpenCodeEvent& event) {
+                               if (index != 3 && index != 4) {
+                                   return true;
+                               }
+                               ++subagent_asks;
+                               const bool is_permission =
+                                   event.kind == wqn::OpenCodeEventKind::kPermission;
+                               if (!Require(
+                                       result == ESP_OK &&
+                                           (is_permission ||
+                                            event.kind == wqn::OpenCodeEventKind::kQuestion) &&
+                                           event.session_id ==
+                                               "ses_01J8ZQ4K7V2N9X0M3B6C5SUBA1" &&
+                                           (is_permission
+                                                ? event.permission_id ==
+                                                      "prm_01J8ZQ5R8W3P1Y4N7C0D2SUBA1"
+                                                : event.question_id ==
+                                                      "frm_01J8ZQ5R8W3P1Y4N7C0D2SUBA1"),
+                                       "agent subagent ask names its own session")) {
+                                   subagent_ok = false;
+                                   return false;
+                               }
+                               return true;
+                           }) ||
+        !Require(subagent_asks == 2, "agent subagent ask count") ||
+        !Require(subagent_ok, "agent subagent ask session attribution")) {
+        return false;
+    }
+
+    // The reply session is chosen here, not at the POST: the ask's own id wins,
+    // and anything that is not a session id falls back to the attached session,
+    // which is the behaviour the device had before the field existed. Asserted
+    // because the fallback is silent -- a reply to the wrong session 404s rather
+    // than reporting a routing bug.
+    const wqn::OpenCodeOutboundReply child_permission{
+        "prm_01J8ZQ5R8W3P1Y4N7C0D2SUBA1", true, false, {},
+        "ses_01J8ZQ4K7V2N9X0M3B6C5SUBA1", {}};
+    const wqn::OpenCodeOutboundReply child_question{
+        "prm_unused", true, true, "frm_01J8ZQ5R8W3P1Y4N7C0D2SUBA1",
+        "ses_01J8ZQ4K7V2N9X0M3B6C5SUBA1", "math"};
+    const wqn::OpenCodeOutboundReply legacy_permission{
+        "prm_01J8ZQ5R8W3P1Y4N7C0D2E6F9G", true, false, {}, {}, {}};
+    const std::string attached = "ses_01J8ZQ4K7V2N9X0M3B6C5D4E7F";
+    if (!Require(
+            wqn::OpenCodeReplySessionId(child_permission, attached) ==
+                "ses_01J8ZQ4K7V2N9X0M3B6C5SUBA1" &&
+                wqn::OpenCodeReplySessionId(child_question, attached) ==
+                    "ses_01J8ZQ4K7V2N9X0M3B6C5SUBA1" &&
+                wqn::OpenCodeReplySessionId(legacy_permission, attached) == attached,
+            "agent reply session attribution")) {
         return false;
     }
 
@@ -1896,6 +2005,52 @@ bool CheckAgentGatewayV0Contract()
                                          &tool_event) == ESP_OK,
             "agent tool without call_id parses") ||
         !Require(tool_event.call_id.empty(), "agent tool call_id is optional")) {
+        return false;
+    }
+
+    // --- the ask's session is optional, and the router is what judges it ------
+    //
+    // A relay that predates the field still has to be answerable, so an absent
+    // session is not a malformed frame: it answers on the attached session. Nor
+    // does the parser drop a session it does not recognize -- the frame is
+    // refused by the schema, but on the device a dropped ask is lost for good,
+    // so the routing decision belongs at the reply POST, where the fallback and
+    // the failure are both observable. Together these two keep `session_id` from
+    // becoming a required field the device cannot do without.
+    wqn::OpenCodeEvent session_event;
+    if (!Require(
+            wqn::ParseOpenCodeAgentFrame(
+                "agent.permission",
+                R"json({"permission_id":"prm_a","type":"bash","title":"运行命令"})json",
+                &session_event) == ESP_OK,
+            "agent permission without session_id parses") ||
+        !Require(session_event.session_id.empty(),
+                 "agent permission without session_id has no session") ||
+        !Require(
+            wqn::ParseOpenCodeAgentFrame(
+                "agent.question",
+                R"json({"question_id":"frm_a","title":"哪个？","options":[{"value":"a","label":"A"}]})json",
+                &session_event) == ESP_OK,
+            "agent question without session_id parses") ||
+        !Require(session_event.session_id.empty(),
+                 "agent question without session_id has no session") ||
+        !Require(
+            wqn::ParseOpenCodeAgentFrame(
+                "agent.permission",
+                R"json({"session_id":"../elsewhere","permission_id":"prm_a"})json",
+                &session_event) == ESP_OK,
+            "agent permission with a foreign session_id still parses")) {
+        return false;
+    }
+    // ...and the reply falls back to the attached session rather than to the
+    // foreign one, so the device keeps answering a relay it can no longer trust
+    // to name the right session.
+    if (!Require(
+            wqn::OpenCodeReplySessionId(
+                wqn::OpenCodeOutboundReply{
+                    "prm_a", true, false, {}, "../elsewhere", {}},
+                "ses_attached") == "ses_attached",
+            "agent reply session falls back on a foreign id")) {
         return false;
     }
 

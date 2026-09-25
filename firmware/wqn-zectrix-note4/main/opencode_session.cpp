@@ -75,6 +75,7 @@ wqn::services::ConnectivityDemand g_connectivity_demand;
 void DiscardOutboundReplies();
 // Declared up here: clearing a pending ask is part of every terminal status and
 // of every list load, which run long before the definition below.
+void ClearPendingPermissionLocked();
 void ClearPendingQuestionLocked();
 void ClearReplyFlightLocked();
 void ClearDeferredQuestionLocked();
@@ -190,7 +191,7 @@ void LoadSessions()
             g_state.session_locked = false;
             g_state.current_session_id.clear();
             g_state.current_session_title.clear();
-            g_state.pending_permission_id.clear();
+            ClearPendingPermissionLocked();
             ClearPendingQuestionLocked();
             ClearDeferredQuestionLocked();
             ClearReplyFlightLocked();
@@ -465,11 +466,21 @@ void AppendAgentErrorLocked(std::string_view text, int64_t now_ms)
     }
 }
 
+// Drops a pending permission and the session that raised it. The two travel
+// together: the reply route is scoped to the owning session, so keeping one
+// without the other answers on whatever session happens to be attached next.
+void ClearPendingPermissionLocked()
+{
+    g_state.pending_permission_id.clear();
+    g_state.pending_permission_session.clear();
+}
+
 void ClearPendingQuestionLocked()
 {
     g_state.pending_question_id.clear();
     g_state.pending_question_title.clear();
     g_state.pending_question_options.clear();
+    g_state.pending_question_session.clear();
 }
 
 // Forget which reply is on the wire once the ask it answers is over. A stream
@@ -489,6 +500,8 @@ bool g_deferred_question_valid = false;
 std::string g_deferred_question_id;
 std::string g_deferred_question_title;
 std::vector<wqn::OpenCodeQuestionOption> g_deferred_question_options;
+// The session the deferred question came from, promoted with it below.
+std::string g_deferred_question_session;
 
 // Hand the deferred ask the option bar it has been waiting for. Only a
 // permission reply calls this, because only a permission reply can free the bar:
@@ -505,6 +518,7 @@ void PromoteDeferredQuestionLocked()
     g_state.pending_question_id = std::move(g_deferred_question_id);
     g_state.pending_question_title = std::move(g_deferred_question_title);
     g_state.pending_question_options = std::move(g_deferred_question_options);
+    g_state.pending_question_session = std::move(g_deferred_question_session);
     g_state.ui.activity_text = g_state.pending_question_title;
     g_state.ui.action_hint = "↑/↓ 选择 · 确认回答";
     g_deferred_question_valid = false;
@@ -517,6 +531,7 @@ void ClearDeferredQuestionLocked()
     g_deferred_question_id.clear();
     g_deferred_question_title.clear();
     g_deferred_question_options.clear();
+    g_deferred_question_session.clear();
 }
 
 // Replays one session's backfilled turns into the kAgent channel, oldest first.
@@ -578,7 +593,7 @@ void OnOpenCodeEvent(const wqn::OpenCodeEvent& event, void*)
             // had no way to answer it -- the run blocked until the 30-minute
             // stream timeout and surfaced as stream_incomplete.
             if (event.status == "idle" || event.status == "error") {
-                g_state.pending_permission_id.clear();
+                ClearPendingPermissionLocked();
                 ClearPendingQuestionLocked();
                 ClearReplyFlightLocked();
             }
@@ -675,6 +690,10 @@ void OnOpenCodeEvent(const wqn::OpenCodeEvent& event, void*)
             g_state.ui.phase = wqn::AiFeaturePhase::kAwaitingPermission;
             g_state.ui.status_label = "等待权限";
             g_state.pending_permission_id = event.permission_id;
+            // Which session the ask belongs to, not which one we attached to. A
+            // subagent's permission must be answered on the subagent's own id or
+            // the reply 404s.
+            g_state.pending_permission_session = event.session_id;
             g_state.ui.activity_text = event.text;
             if (!event.preview.empty()) {
                 g_state.ui.activity_text += " · " + event.preview;
@@ -701,6 +720,10 @@ void OnOpenCodeEvent(const wqn::OpenCodeEvent& event, void*)
                     g_deferred_question_id = event.question_id;
                     g_deferred_question_title = event.text;
                     g_deferred_question_options = event.question_options;
+                    // Deferring carries the session with the ask: the promote
+                    // below copies it straight into the pending ask, so a
+                    // subagent's question stays answerable on its own id.
+                    g_deferred_question_session = event.session_id;
                     ESP_LOGI(kTag, "question %s held until the permission ask is answered",
                              event.question_id.c_str());
                 }
@@ -711,6 +734,7 @@ void OnOpenCodeEvent(const wqn::OpenCodeEvent& event, void*)
             g_state.pending_question_id = event.question_id;
             g_state.pending_question_title = event.text;
             g_state.pending_question_options = event.question_options;
+            g_state.pending_question_session = event.session_id;
             g_state.ui.activity_text = event.text;
             g_state.ui.action_hint = "↑/↓ 选择 · 确认回答";
             // Not mirrored for the same reason a permission ask is not.
@@ -727,7 +751,7 @@ void OnOpenCodeEvent(const wqn::OpenCodeEvent& event, void*)
             if (event.fatal) {
                 // The run is over, so the ask and its in-flight reply are over
                 // with it: nothing can answer them any more.
-                g_state.pending_permission_id.clear();
+                ClearPendingPermissionLocked();
                 ClearPendingQuestionLocked();
                 ClearDeferredQuestionLocked();
                 ClearReplyFlightLocked();
@@ -764,17 +788,59 @@ void OnOpenCodeReplyFailed(
     // the restore below was unreachable. A failed reply left the run blocked
     // behind an ask the device could no longer answer, until the stream timed
     // out -- which v1 could recover from and v2 could not.
+    // The flight id is the evidence, not the phase. Requiring kRunning made the
+    // restore unreachable for a permission reply that arrives while a deferred
+    // question holds the bar: the permission reply path promotes that question
+    // (kRunning -> kAwaitingQuestion) before the POST is even attempted, so the
+    // phase was already kAwaitingQuestion by the time the failure came back.
+    // The flight id is safe on its own because every terminal path -- run end,
+    // fatal error, observe teardown -- calls ClearReplyFlightLocked(), so a live
+    // flight id can only mean "our reply, and its ask is not known to be over".
     const bool in_flight = reply.is_question
         ? g_reply_flight_question_id == reply.question_id
         : g_reply_flight_permission_id == reply.permission_id;
-    if (g_state.ui.phase == wqn::AiFeaturePhase::kRunning && in_flight) {
+    if (in_flight) {
         if (reply.is_question) {
             g_state.ui.phase = wqn::AiFeaturePhase::kAwaitingQuestion;
             g_state.ui.status_label = "回答失败";
             g_state.ui.activity_text = "回答未送达，可重试";
             g_state.ui.action_hint = "↑/↓ 选择 · 确认回答";
         } else {
+            // The permission was never answered, so it takes the bar back. A
+            // question that has meanwhile claimed the bar -- promoted from the
+            // deferred slot when the reply cleared the permission, or arrived
+            // fresh while the reply was on the wire -- goes back to deferred
+            // rather than staying armed under a permission bar it cannot be
+            // answered from. Leaving it armed would strand it: the pending id
+            // blocks the question slot for the rest of the run, and
+            // PromoteDeferredQuestionLocked refuses to promote while it is set.
+            if (!g_state.pending_question_id.empty()) {
+                if (g_deferred_question_valid) {
+                    // Two questions plus a permission in one round. The gateway
+                    // arms at most one ask, so this cannot happen against a
+                    // compliant relay; keeping the armed one is still the safer
+                    // choice, because it is the one the user is looking at.
+                    ESP_LOGW(kTag,
+                             "question %s displaced by %s in the deferred slot",
+                             g_deferred_question_id.c_str(),
+                             g_state.pending_question_id.c_str());
+                }
+                g_deferred_question_valid = true;
+                g_deferred_question_id = std::move(g_state.pending_question_id);
+                g_deferred_question_title = std::move(g_state.pending_question_title);
+                g_deferred_question_options =
+                    std::move(g_state.pending_question_options);
+                g_deferred_question_session =
+                    std::move(g_state.pending_question_session);
+                ESP_LOGI(kTag, "question %s held again: the permission reply failed",
+                         g_deferred_question_id.c_str());
+                ClearPendingQuestionLocked();
+            }
             g_state.pending_permission_id = reply.permission_id;
+            // Restore the owning session along with the id, so the retry POSTs
+            // to the session that raised the ask rather than to the one attached
+            // when the failure came back.
+            g_state.pending_permission_session = reply.session_id;
             g_state.ui.phase = wqn::AiFeaturePhase::kAwaitingPermission;
             g_state.ui.status_label = "权限回复失败";
             g_state.ui.activity_text = reply.approve ? "批准未送达，可重试"
@@ -856,7 +922,7 @@ void CreateSession()
         g_state.current_session_title = created.title;
         g_state.session_locked = true;
         g_observing = false;
-        g_state.pending_permission_id.clear();
+        ClearPendingPermissionLocked();
         ClearPendingQuestionLocked();
         ClearDeferredQuestionLocked();
         ClearReplyFlightLocked();
@@ -1127,7 +1193,7 @@ esp_err_t LockSelectedOpenCodeSession()
     g_state.current_session_title = selected.title;
     g_state.session_locked = true;
     g_observing = false;
-    g_state.pending_permission_id.clear();
+    ClearPendingPermissionLocked();
     ClearPendingQuestionLocked();
     ClearDeferredQuestionLocked();
     ClearReplyFlightLocked();
@@ -1199,7 +1265,7 @@ esp_err_t ObserveOpenCodeSession()
         // The worker reads the target session from g_run_session_id, the same
         // handoff slot ConfirmOpenCodePrompt uses.
         g_run_session_id = g_state.current_session_id;
-        g_state.pending_permission_id.clear();
+        ClearPendingPermissionLocked();
         ClearPendingQuestionLocked();
         // Attaching is a fresh turn: a question the previous attach could not
         // show is stale, and a gateway re-attach re-discovers it anyway --
@@ -1249,11 +1315,12 @@ esp_err_t ReplyPendingOpenCodePermission(bool approve)
         return ESP_ERR_INVALID_STATE;
     }
     g_outbound_replies.Push(wqn::OpenCodeOutboundReply{
-        g_state.pending_permission_id, approve, false, {}, {}});
+        g_state.pending_permission_id, approve, false, {},
+        g_state.pending_permission_session, {}});
     // The reply on the wire is the only thing that proves the id was delivered.
     // The UI closes its option bar here, so the live id is deliberately not it.
     g_reply_flight_permission_id = g_state.pending_permission_id;
-    g_state.pending_permission_id.clear();
+    ClearPendingPermissionLocked();
     g_state.ui.phase = AiFeaturePhase::kRunning;
     g_state.ui.status_label = g_observing ? "观察中" : "Agent 执行中";
     g_state.ui.activity_text = approve ? "已批准权限" : "已拒绝权限";
@@ -1282,9 +1349,19 @@ esp_err_t ReplyPendingOpenCodeQuestion(int index)
     wqn::OpenCodeOutboundReply reply;
     reply.is_question = true;
     reply.question_id = g_state.pending_question_id;
+    // The owning session travels with the ask, so a subagent's question is
+    // answered on the subagent's own id rather than on the attached one.
+    reply.session_id = g_state.pending_question_session;
     reply.answer = answer;
+    // Capture the id before the queue takes the reply. `Push` takes it by
+    // value, and a libstdc++ string move empties the source, so reading
+    // `reply.question_id` after the push below yields "". The flight id would
+    // then never match the id inside the queue, `in_flight` would be false
+    // forever, and a failed question reply could not restore the bar -- the one
+    // path that never had this bug until the shared id was introduced.
+    const std::string flight_id = reply.question_id;
     g_outbound_replies.Push(std::move(reply));
-    g_reply_flight_question_id = reply.question_id;
+    g_reply_flight_question_id = flight_id;
     g_state.ui.phase = AiFeaturePhase::kRunning;
     g_state.ui.status_label = g_observing ? "观察中" : "Agent 执行中";
     g_state.ui.activity_text = "已回答：" + answer;

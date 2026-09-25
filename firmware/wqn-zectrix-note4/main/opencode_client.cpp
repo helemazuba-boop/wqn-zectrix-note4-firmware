@@ -244,6 +244,14 @@ esp_err_t PostOutboundReply(
     const std::string& session_id,
     const wqn::OpenCodeOutboundReply& reply)
 {
+    // The ask's own session wins. Both reply routes are session-scoped upstream,
+    // and a subagent raises its asks against its own id -- so answering on the
+    // attached session is a 404 against the ownership check, which is what made
+    // subagent asks discoverable but never answerable. A relay that omits the
+    // field, or sends one this device does not recognize, keeps answering on the
+    // attached session exactly as before.
+    const std::string& reply_session =
+        wqn::OpenCodeReplySessionId(reply, session_id);
     std::string body;
     std::string path;
     if (reply.is_question) {
@@ -252,7 +260,7 @@ esp_err_t PostOutboundReply(
         // cloud knows which field the projected options came from.
         wqn::OpenCodeResult question_result;
         const esp_err_t question_error = wqn::PostQuestionReply(
-            token, session_id, reply.question_id, reply.answer, &question_result);
+            token, reply_session, reply.question_id, reply.answer, &question_result);
         if (question_error != ESP_OK) {
             // Surface the allocator/transport state alongside the gateway
             // error: a failed reply here is exactly the internal-RAM
@@ -283,7 +291,7 @@ esp_err_t PostOutboundReply(
         }
         body = printed;
         cJSON_free(printed);
-        path = "/agent/sessions/" + session_id + "/permission";
+        path = "/agent/sessions/" + reply_session + "/permission";
     }
     std::string response_body;
     wqn::OpenCodeResult reply_result;
@@ -904,6 +912,7 @@ esp_err_t ParseOpenCodeAgentFrame(
         event.call_id = JsonString(root, "call_id");
     } else if (event_name == "agent.permission") {
         event.kind = wqn::OpenCodeEventKind::kPermission;
+        event.session_id = JsonString(root, "session_id");
         event.permission_id = JsonString(root, "permission_id");
         event.tool = JsonString(root, "type");
         event.text = JsonString(root, "title");
@@ -913,6 +922,7 @@ esp_err_t ParseOpenCodeAgentFrame(
         // form with more than two is delivered as `agent.status` instead, so an
         // empty `options` here is a malformed frame and is dropped below.
         event.kind = wqn::OpenCodeEventKind::kQuestion;
+        event.session_id = JsonString(root, "session_id");
         event.question_id = JsonString(root, "question_id");
         event.text = JsonString(root, "title");
         cJSON* options = cJSON_GetObjectItemCaseSensitive(root, "options");

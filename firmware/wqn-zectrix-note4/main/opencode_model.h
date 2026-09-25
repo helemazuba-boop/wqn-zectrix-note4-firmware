@@ -23,10 +23,17 @@ struct AgentSessionState {
     std::string current_session_id;
     std::string current_session_title;
     std::string pending_permission_id;
+    // The session that raised the pending permission. It is the attached session
+    // for a permission this device asked about, and a subagent's own id when a
+    // subagent raised it -- the reply route is scoped to whichever it was, so
+    // the id travels with the ask from the frame that delivered it to the POST.
+    std::string pending_permission_session;
     // Live `agent.question` ask. The device answers by option index, never by
     // field id: the gateway owns that mapping.
     std::string pending_question_id;
     std::string pending_question_title;
+    // The session that raised the pending question; see pending_permission_session.
+    std::string pending_question_session;
     std::vector<OpenCodeQuestionOption> pending_question_options;
     // Session id whose transcript is already in the kAgent channel. Backfill
     // runs once per session, on switch and on first observe, so a reconnect

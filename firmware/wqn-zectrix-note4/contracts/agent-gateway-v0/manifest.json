@@ -2,7 +2,7 @@
   "contract": "agent-gateway-v0",
   "version": "2.0",
   "schema": "agent-gateway-v0.schema.json",
-  "schema_sha256": "7dcd6a9bccf1c50c6a9a34f2c5732d399712f5139b2a32735f9f8aa22039ef7c",
+  "schema_sha256": "777034053df4d6fc95bd5daff00fa5947b854432b2417e2458fa3208d5cb8465",
   "api_base": "https://wqn.helema.cn/api/esp32",
   "routes_prefix": "/agent",
   "auth": "Authorization: Bearer <device pairing token>",

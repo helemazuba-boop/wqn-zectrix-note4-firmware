@@ -65,6 +65,12 @@ enum class OpenCodeEventKind : uint8_t {
 
 struct OpenCodeEvent {
     OpenCodeEventKind kind = OpenCodeEventKind::kStatus;
+    // The session an `agent.permission` / `agent.question` ask belongs to. It is
+    // not necessarily the session the device attached to: a subagent has its own
+    // id and raises its asks against it, and the reply routes are session-scoped
+    // upstream, so answering on the attached session is a 404. Empty means "the
+    // attached session", which is what a relay that omits the field still wants.
+    std::string session_id;
     std::string status;
     std::string text;
     std::string tool;
@@ -93,6 +99,11 @@ struct OpenCodeOutboundReply {
     bool approve = true;
     bool is_question = false;
     std::string question_id;
+    // The session that raised the ask this reply answers, carried from the
+    // `agent.permission` / `agent.question` frame that delivered it. The stream
+    // request only knows the attached session, so without this a subagent's ask
+    // would be POSTed against a session that never raised it.
+    std::string session_id;
     // The selected option's `value` as projected by the gateway. The device
     // never assembles the upstream `{[fieldKey]: value}` answer record.
     std::string answer;
@@ -103,6 +114,22 @@ struct OpenCodeOutboundReply {
 inline const std::string& OpenCodeReplyId(const OpenCodeOutboundReply& reply)
 {
     return reply.is_question ? reply.question_id : reply.permission_id;
+}
+
+// The session a reply is POSTed against. The ask's own session wins, because both
+// reply routes are scoped to it and a subagent raises its asks against its own
+// id -- answering on the attached session is a 404 against the ownership check,
+// which made a subagent's ask discoverable but never answerable. A value that is
+// not a session id (a relay that omitted the field, or a frame the contract
+// already refuses) falls back to the attached session: that is what the device
+// did before the field existed, and it keeps an ask from being silently
+// unroutable when the fallback is in fact the right session.
+inline const std::string& OpenCodeReplySessionId(
+    const OpenCodeOutboundReply& reply,
+    const std::string& attached_session_id)
+{
+    return reply.session_id.rfind("ses_", 0) == 0 ? reply.session_id
+                                                  : attached_session_id;
 }
 
 // Invoked on the streaming worker when an outbound permission reply could not
