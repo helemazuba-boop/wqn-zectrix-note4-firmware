@@ -27,6 +27,12 @@ AiTier GetAiTier();
 void SetAiThinkingLevel(ThinkingLevel level);
 void SetAiTtsOn(bool on);
 void SetAiExpandContent(bool expanded);
+// [follow] Auto-follow toggle (status-bar edit cluster) and the per-turn
+// viewport-follow state. These MUST be setters, not UI-copy writes:
+// CopyAiSessionToUi overwrites the whole struct, so a write that only touched
+// the UI's copy would be reverted by the next snapshot.
+void SetAiAutoFollow(bool follow);
+void SetAiFollowState(bool active, bool user_moved);
 int32_t GetAiScrollOffsetLines();
 
 // Lightweight, mutex-free snapshot of v2 SSE streaming bookkeeping. UI calls

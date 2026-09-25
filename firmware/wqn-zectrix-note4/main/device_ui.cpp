@@ -1084,6 +1084,17 @@ wqn::AiStreamingStatusView streaming_view{};
             refresh_schedule = StrongerSchedule(refresh_schedule, update.refresh);
         }
 
+        // [follow] Auto-follow step. Runs on EVERY tick (not only when a
+        // refresh is already pending): the whole point is to notice that the
+        // answer body landed and move the viewport without waiting for another
+        // event. Placed after both session snapshots -- it reads their flags --
+        // and before the render below, which must see the offset it writes.
+        {
+            const device_ui_internal::UiUpdate update =
+                ui_runtime.DispatchAiViewportFollow();
+            refresh_schedule = StrongerSchedule(refresh_schedule, update.refresh);
+        }
+
         const std::string clock_label = CurrentClockLabel();
         if (clock_label != last_clock_label) {
             last_clock_label = clock_label;

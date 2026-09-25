@@ -374,6 +374,23 @@ void ResetAgentHistoryTurnLocked()
     g_agent_tool_ok = true;
 }
 
+// [follow] Arm the Agent viewport follow for a fresh turn. Every turn-start
+// path (submit, permission/question reply, voice capture, observe) calls this
+// so the viewport watches the run: the per-tick step
+// (UiRuntime::DispatchAiViewportFollow) pins it to the live tail while the run
+// executes and retires the follow -- parking the viewport on the answer's first
+// line -- as soon as a non-empty answer body lands. `user_moved=false` marks
+// this turn's viewport as untouched, which is what the follow step needs to
+// decide whether it may move it at all.
+//
+// Caller must hold g_lock; the caller's own MarkChangedLocked() covers the
+// state change (the follow flags are read from the same snapshot).
+void ArmAgentFollowLocked()
+{
+    g_state.follow_active = true;
+    g_state.user_moved = false;
+}
+
 // Closes the open tool placeholder into a result block. Because the gateway
 // has no tool-end event, this is driven by the next event of any kind (text, a
 // different tool, run end, error) instead of by guessing the status vocabulary
@@ -1333,6 +1350,11 @@ esp_err_t ObserveOpenCodeSession()
             : "正在连接 Session 事件流";
         g_state.ui.action_hint.clear();
         g_state.ui.scroll_offset_lines = 0;
+        // [follow] Attaching is a fresh turn (see ArmAgentFollowLocked): the
+        // viewport watches the stream and parks on the newest answer once it
+        // has a body. A session whose newest entry is already a full answer
+        // retires the follow on the very next tick, so nothing moves.
+        ArmAgentFollowLocked();
         g_state.stream_active = true;
         // Attaching mid-stream: any assistant id from the previous run is stale.
         ResetAgentHistoryTurnLocked();
@@ -1374,6 +1396,9 @@ esp_err_t ReplyPendingOpenCodePermission(bool approve)
     g_state.ui.status_label = g_observing ? "观察中" : "Agent 执行中";
     g_state.ui.activity_text = approve ? "已批准权限" : "已拒绝权限";
     g_state.ui.action_hint.clear();
+    // [follow] The run continues after the ask: watch it again from the tail
+    // and park on the answer body when it lands.
+    ArmAgentFollowLocked();
     PromoteDeferredQuestionLocked();
     MarkChangedLocked();
     xSemaphoreGive(g_lock);
@@ -1415,6 +1440,8 @@ esp_err_t ReplyPendingOpenCodeQuestion(int index)
     g_state.ui.status_label = g_observing ? "观察中" : "Agent 执行中";
     g_state.ui.activity_text = "已回答：" + answer;
     g_state.ui.action_hint.clear();
+    // [follow] Same as the permission reply: the run resumes, so watch it.
+    ArmAgentFollowLocked();
     ClearDeferredQuestionLocked();
     // The pending ask stays armed until a terminal status: if the reply POST
     // fails, OnOpenCodeReplyFailed restores exactly this state for a retry.
@@ -1472,6 +1499,12 @@ esp_err_t StartOpenCodeVoiceInput()
             g_state.ui.prompt_text.clear();
             g_state.ui.scroll_offset_lines = 0;
         }
+        // [follow] Capture arms the follow so the viewport is already watching
+        // when the transcript is confirmed. The per-tick step skips the capture
+        // phases outright (the codec is being configured and must not share the
+        // panel with a repaint), so this only takes effect once the transcript
+        // is back -- by which point the newest content is what the user needs.
+        ArmAgentFollowLocked();
         g_state.confirmation_armed_at_ms = 0;
         g_state.ui.phase = AiFeaturePhase::kLoading;
         g_state.ui.status_label = "准备录音";
@@ -1553,6 +1586,8 @@ esp_err_t ConfirmOpenCodePrompt(int64_t confirmed_at_ms)
         g_state.ui.requires_confirmation = false;
         g_state.confirmation_armed_at_ms = 0;
         g_state.ui.scroll_offset_lines = 0;
+        // [follow] Submit starts the turn the viewport should watch.
+        ArmAgentFollowLocked();
         g_state.stream_active = true;
         // [agent] Mirror the submitted prompt into the kAgent channel before the
         // worker starts, so the user bubble is on screen while the gateway is
@@ -1643,6 +1678,54 @@ bool CopyOpenCodeSessionToUi(AgentSessionState* state)
     return changed;
 }
 
+void SetOpenCodeScrollOffsetClamped(int32_t target, int32_t min_scroll, int32_t max_scroll)
+{
+    if (g_lock == nullptr) {
+        return;
+    }
+    if (min_scroll > max_scroll) {
+        return;  // degenerate bounds: fail open, leave the offset untouched
+    }
+    xSemaphoreTake(g_lock, portMAX_DELAY);
+    // Read-clamp-write stays inside ONE lock hold: a split Get/Set across locks
+    // would let a streaming auto-follow interleave between them.
+    if (target > max_scroll) {
+        target = max_scroll;
+    }
+    if (target < min_scroll) {
+        target = min_scroll;
+    }
+    constexpr int32_t kMaxScrollRows = 4096;
+    if (target > kMaxScrollRows) {
+        target = kMaxScrollRows;
+    }
+    if (target < -kMaxScrollRows) {
+        target = -kMaxScrollRows;
+    }
+    // Only mark changed when the offset actually moved: the per-tick follow
+    // calls this every 50 ms while it is pinned, and a redundant mark would
+    // repaint the panel on every tick.
+    if (g_state.ui.scroll_offset_lines != target) {
+        g_state.ui.scroll_offset_lines = target;
+        MarkChangedLocked();
+    }
+    xSemaphoreGive(g_lock);
+}
+
+void SetOpenCodeFollowState(bool active, bool user_moved)
+{
+    if (g_lock == nullptr) {
+        return;
+    }
+    xSemaphoreTake(g_lock, portMAX_DELAY);
+    if (g_state.follow_active != active || g_state.user_moved != user_moved) {
+        g_state.follow_active = active;
+        g_state.user_moved = user_moved;
+        MarkChangedLocked();
+    }
+    xSemaphoreGive(g_lock);
+}
+
 }  // namespace wqn
 
 #else  // !CONFIG_WQN_AGENT_ENABLE
@@ -1667,6 +1750,8 @@ esp_err_t StopOpenCodeVoiceInput() { return ESP_ERR_NOT_SUPPORTED; }
 esp_err_t ConfirmOpenCodePrompt(int64_t) { return ESP_ERR_NOT_SUPPORTED; }
 void CancelOpenCodePrompt() {}
 void ScrollOpenCodeResponse(int, int32_t, int32_t) {}
+void SetOpenCodeScrollOffsetClamped(int32_t, int32_t, int32_t) {}
+void SetOpenCodeFollowState(bool, bool) {}
 bool CopyOpenCodeSessionToUi(AgentSessionState*) { return false; }
 
 }  // namespace wqn

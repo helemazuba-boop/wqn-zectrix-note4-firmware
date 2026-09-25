@@ -494,6 +494,10 @@ std::string FrameSignature(const wqn::UiFrame& frame)
         signature.push_back('/');
         signature.append(frame.ai.expand_content ? "1" : "0");
         signature.push_back('/');
+        // [follow] The follow toggle's glyph is the only visible change when the
+        // user flips it, so the sig must carry it or the repaint is deduped away.
+        signature.append(frame.ai.auto_follow ? "1" : "0");
+        signature.push_back('/');
         signature.append(std::to_string(frame.ai_history_revision));
     }
     // [agent] The Agent tier renders on the AI screen, so its fields must

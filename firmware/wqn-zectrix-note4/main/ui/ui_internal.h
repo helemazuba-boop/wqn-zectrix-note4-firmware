@@ -673,6 +673,15 @@ bool GetAiTurnJumpOffsetLines(
     int32_t current_scroll,
     int direction,
     int32_t* out_scroll);
+// [follow] Scroll offset that parks the newest answer's first line at the top
+// of the viewport, or false when the newest entry is not a non-empty assistant
+// body (nothing to park on yet -- keep following the live tail). Same geometry
+// pass and clamp as GetAiScrollBounds, so a follow target and the scroll bounds
+// can never disagree.
+bool GetAiNewestAnswerTopOffsetLines(
+    std::shared_ptr<const wqn::AiHistorySnapshot> snapshot,
+    bool expand_content,
+    int32_t* out_scroll);
 
 // [agent] The Agent tier is rendered by the AI page; this is its branch.
 esp_err_t RenderAgentAiToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule);

@@ -245,6 +245,24 @@ void MarkChanged()
     g_changed = true;
 }
 
+// [follow] Arm the STD/Pro viewport follow for a fresh turn. Called from the
+// two capture-start paths (the recording request and the transition into
+// kListening), because the STD/Pro turn is submitted by the key release rather
+// than by an explicit confirm call -- by the time the reply starts there is no
+// further hook to arm from. The per-tick step
+// (UiRuntime::DispatchAiViewportFollow) skips the capture phases, so nothing
+// moves while the codec is being configured; from kWaitingReply on it pins the
+// viewport to the live tail and retires the follow as soon as the answer body
+// lands. `user_moved=false` marks this turn's viewport as untouched.
+//
+// Caller must hold g_lock; the caller's own MarkChanged() covers the state
+// change (the follow flags ride the same snapshot).
+void ArmAiFollowLocked()
+{
+    g_state.follow_active = true;
+    g_state.user_moved = false;
+}
+
 void ReleaseAiSleepLeaseIfIdleLocked()
 {
     const bool state_active =
@@ -575,7 +593,14 @@ void OnSseEvent(const wqn::WqnAiSseEvent& ev)
             if (!ev.conversation_id.empty()) g_conversation_id = ev.conversation_id;
             g_state.conversation_id = g_conversation_id;
             g_state.page = 0;
-            g_state.scroll_offset_lines = 0;
+            // [follow] Conditional recenter: land on the newest exchange only
+            // when the user did not move the viewport during this turn. A
+            // retired auto-follow leaves user_moved false, so a followed reply
+            // still gets presented from its first line; a viewport the user
+            // scrolled (or turn-jumped) is left exactly where they put it.
+            if (!g_state.user_moved) {
+                g_state.scroll_offset_lines = 0;
+            }
             g_streaming_force_full_render = true;
             g_streaming_active = false;
             g_state.status_since_ms = now_ms;
@@ -1301,6 +1326,8 @@ void PrepareRecordingSession(uint32_t generation)
         g_state.conversation_id = g_conversation_id;
         g_state.page = 0;
         g_state.scroll_offset_lines = 0;
+        // [follow] Capture started: arm the viewport follow for this turn.
+        ArmAiFollowLocked();
         g_state.toast_label = "● 录音中 00:00";
         g_state.toast_visible = true;
         g_state.toast_since_ms = esp_timer_get_time() / 1000;
@@ -1448,6 +1475,10 @@ esp_err_t StartAiRecordingSession()
     g_state.conversation_id = g_conversation_id;
     g_state.page = 0;
     g_state.scroll_offset_lines = 0;
+    // [follow] A fresh recording request starts a turn: arm the follow here as
+    // well as at the kListening transition, so a capture that fails to start
+    // still leaves the viewport watching for the reply.
+    ArmAiFollowLocked();
     g_state.status_since_ms = esp_timer_get_time() / 1000;
     g_prepare_active = true;
     g_recording_requested = true;
@@ -1591,6 +1622,34 @@ void SetAiExpandContent(bool expanded)
     xSemaphoreTake(g_lock, portMAX_DELAY);
     g_state.expand_content = expanded;
     MarkChanged();
+    xSemaphoreGive(g_lock);
+}
+
+void SetAiAutoFollow(bool follow)
+{
+    if (g_lock == nullptr) {
+        return;
+    }
+    xSemaphoreTake(g_lock, portMAX_DELAY);
+    g_state.auto_follow = follow;
+    MarkChanged();
+    xSemaphoreGive(g_lock);
+}
+
+// [follow] Per-turn follow state. Mark only on a real change: the per-tick
+// follow step calls this to retire the follow when the answer lands, and a
+// redundant mark would cost an EPD refresh on every later tick.
+void SetAiFollowState(bool active, bool user_moved)
+{
+    if (g_lock == nullptr) {
+        return;
+    }
+    xSemaphoreTake(g_lock, portMAX_DELAY);
+    if (g_state.follow_active != active || g_state.user_moved != user_moved) {
+        g_state.follow_active = active;
+        g_state.user_moved = user_moved;
+        MarkChanged();
+    }
     xSemaphoreGive(g_lock);
 }
 
@@ -1862,6 +1921,8 @@ AiTier GetAiTier()
 void SetAiThinkingLevel(ThinkingLevel) {}
 void SetAiTtsOn(bool) {}
 void SetAiExpandContent(bool) {}
+void SetAiAutoFollow(bool) {}
+void SetAiFollowState(bool, bool) {}
 
 int32_t GetAiScrollOffsetLines()
 {

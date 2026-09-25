@@ -131,6 +131,14 @@ struct AiSessionState {
     // elapsed-seconds counter by design; the user reaches "still working"
     // signal by the toast being present at all, with a blink dot.
     int32_t scroll_offset_lines = 0;
+    // [follow] Per-turn viewport-follow state, owned here because this struct
+    // owns the offset it drives. follow_active: the viewport is still chasing
+    // the newest content this turn (cleared when the answer text arrives, so
+    // the reply stays readable). user_moved: the user moved the viewport this
+    // turn, which disables the follow AND the completion recenter. Both are
+    // armed by the turn-start paths in ai_session.cpp.
+    bool follow_active = false;
+    bool user_moved = false;
     bool toast_visible = false;
     std::string toast_label;       // e.g. "\xe2\x97\x8f 录音中 00:04" / "\xe2\x97\x8f 上传…"
     int64_t toast_since_ms = 0;
@@ -143,6 +151,10 @@ struct AiSessionState {
     ThinkingLevel thinking_level = ThinkingLevel::kMed;
     bool tts_on = false;
     bool expand_content = true;   // [expand] default full thinking/tool display (Flash can't toggle)
+    // [follow] Auto-follow the newest content while a reply streams, stopping
+    // when the answer text (正文) arrives. Exposed as the 4th edit-cluster
+    // toggle; STD/Pro and Agent only (Flash hides the whole cluster).
+    bool auto_follow = true;
 };
 
 // Returns the current scroll offset in 18-px line units (0 == bottom / newest).

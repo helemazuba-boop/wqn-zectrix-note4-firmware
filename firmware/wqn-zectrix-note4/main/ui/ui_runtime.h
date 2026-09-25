@@ -31,6 +31,7 @@ enum class AppEventKind : uint8_t {
     kAiTick,
     kAiStreamingSnapshot,
     kAiSessionSnapshot,
+    kAiViewportFollow,
     kFlashSnapshot,
     kAgentSnapshot,
     kClockMinute,
@@ -76,6 +77,12 @@ public:
     UiUpdate DispatchAiTick(int64_t now_ms);
     UiUpdate DispatchAiStreamingSnapshot(const wqn::AiStreamingStatusView& view);
     UiUpdate DispatchAiSessionSnapshot(const wqn::AiSessionState& snapshot);
+    // [follow] Per-tick auto-follow step. Must run after the session/agent
+    // snapshots (it reads their flags) and before RenderUiFrame (it mirrors the
+    // offset it writes into the UI copy so this tick renders the new position).
+    // Safe to call unconditionally: it no-ops unless the AI screen is up, the
+    // auto-follow setting is on and a turn has armed the follow.
+    UiUpdate DispatchAiViewportFollow();
     UiUpdate DispatchFlashSnapshot(const wqn::FlashUiState& snapshot);
     UiUpdate DispatchAgentSnapshot(const wqn::AgentSessionState& snapshot);
     UiUpdate DispatchClockMinute(bool panel_needs_refresh);

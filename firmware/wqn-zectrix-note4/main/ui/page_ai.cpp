@@ -98,7 +98,13 @@ static void DrawHourglassIcon(int x, int y, bool selected) {
 static void DrawBrainIcon(int x, int y, bool selected) {
     DrawStatusAsset(x, y, a03_ai_tier_pro_16_asset, selected);
 }
-// [trash] Clear-context action button (edit-mode index 3, STD/Pro only).
+// [follow] Auto-follow toggle (edit-mode index 4, both tiers): solid baseline
+// = the viewport stays pinned to the newest answer while a reply streams in,
+// dashed = the user scrolls freely. See the [follow] block in ui_model.h.
+static void DrawFollowIcon(int x, int y, bool on, bool selected) {
+    DrawStatusAsset(x, y, on ? a16_ai_follow_on_16_asset : a17_ai_follow_off_16_asset, selected);
+}
+// [trash] Clear-context action button (edit-mode index 5, both tiers).
 static void DrawTrashIcon(int x, int y, bool selected) {
     DrawStatusAsset(x, y, a12_ai_clear_context_16_asset, selected);
 }
@@ -108,8 +114,9 @@ static void DrawTrashIcon(int x, int y, bool selected) {
 // kAiToggleX with a small gap, and consecutive toggles are kAiToggleStep
 // apart (18 = 16px icon + 2px gap). The edit-mode zone rect (kAiToggleZoneW)
 // spans exactly the icons plus a kAiToggleZonePad pad on each side. STD/Pro use
-// the four slots for thinking/TTS/expand/trash; the Agent tier uses them for
-// session/turn-up/turn-down/trash (page_ai_agent.cpp).
+// the five slots for thinking/TTS/expand/follow/trash; the Agent tier uses them
+// for session/turn-up/turn-down/follow/trash (page_ai_agent.cpp). The follow
+// glyph is identical on both tiers -- the setting means the same thing.
 
 void DrawAiStatusBar(const wqn::AiSessionState& ai, const wqn::HomeSummary& home, const wqn::StatusBarEditState& status_edit)
 {
@@ -126,20 +133,22 @@ void DrawAiStatusBar(const wqn::AiSessionState& ai, const wqn::HomeSummary& home
         default:                  DrawHourglassIcon(6, kAiToggleY, tier_sel); break;
     }
 
-    // [shell] Toggle zone (STD/Pro only): thinking(1)/TTS(2)/expand(3)/trash(4).
+    // [shell] Toggle zone (STD/Pro only):
+    // thinking(1)/TTS(2)/expand(3)/follow(4)/trash(5).
     // Flash hides the whole zone (only the tier icon, button 0, is editable).
     // The Agent tier has its own cluster (page_ai_agent.cpp), so it never
     // reaches this branch -- RenderAiToEpd dispatches it away first.
     if (ai.tier == wqn::AiTier::kStd) {
         if (status_edit.active) {
-            // Zone rect hugs the four tightly-packed toggle icons.
+            // Zone rect hugs the five tightly-packed toggle icons.
             DrawRect(kAiToggleX - kAiToggleZonePad, kAiToggleY - kAiToggleZonePad,
                      kAiToggleZoneW, 16 + 2 * kAiToggleZonePad);
         }
         DrawThinkingIcon(kAiToggleX + 0 * kAiToggleStep, kAiToggleY, ai.thinking_level, status_edit.active && status_edit.selected == 1);
         DrawTtsIcon(kAiToggleX + 1 * kAiToggleStep, kAiToggleY, ai.tts_on, status_edit.active && status_edit.selected == 2);
         DrawExpandIcon(kAiToggleX + 2 * kAiToggleStep, kAiToggleY, ai.expand_content, status_edit.active && status_edit.selected == 3);
-        DrawTrashIcon(kAiToggleX + 3 * kAiToggleStep, kAiToggleY, status_edit.active && status_edit.selected == 4);
+        DrawFollowIcon(kAiToggleX + 3 * kAiToggleStep, kAiToggleY, ai.auto_follow, status_edit.active && status_edit.selected == 4);
+        DrawTrashIcon(kAiToggleX + 4 * kAiToggleStep, kAiToggleY, status_edit.active && status_edit.selected == 5);
     }
 
     // Center column: reserved for the toast label. When the toast is visible
@@ -771,6 +780,52 @@ bool GetAiTurnJumpOffsetLines(
     }
     if (next == clamped) {
         return false;  // already there
+    }
+    *out_scroll = next;
+    return true;
+}
+
+// [follow] The newest answer's first line as a scroll offset. The per-tick
+// auto-follow parks the viewport here when the answer body starts, so the user
+// reads the reply from its beginning instead of chasing the streaming tail.
+// Reuses ComputeAiHistoryLayout (never re-measures) and clamps through the same
+// min/max the renderer uses.
+//
+// Returns false when the newest history entry is not a non-empty assistant body
+// -- the answer has not started, or the turn is still thinking / running tools.
+// The caller then keeps following the live tail instead.
+bool GetAiNewestAnswerTopOffsetLines(
+    std::shared_ptr<const wqn::AiHistorySnapshot> snapshot,
+    bool expand_content,
+    int32_t* out_scroll)
+{
+    if (out_scroll == nullptr || !snapshot || snapshot->messages.empty()) {
+        return false;
+    }
+    const wqn::ChatMessageSnapshot& newest = snapshot->messages.back();
+    if (newest.kind != wqn::ChatMessageKind::kAssistant || newest.text.empty()) {
+        return false;
+    }
+    const AiHistoryLayout layout = ComputeAiHistoryLayout(snapshot->messages, expand_content);
+
+    const int line_h = kAiLineH;
+    const int viewport_h = wqn::kEpdHeight - kAiViewportY - kAiViewportBottomPad;
+    int max_window_top = layout.total_content_h - viewport_h;
+    if (max_window_top < 0) {
+        max_window_top = 0;
+    }
+    int max_scroll = layout.anchor_top / line_h;
+    int min_scroll = (layout.anchor_top - max_window_top) / line_h;
+    if (min_scroll > 0) {
+        min_scroll = 0;
+    }
+
+    int32_t next = (layout.anchor_top - layout.virtual_tops.back()) / line_h;
+    if (next < min_scroll) {
+        next = min_scroll;
+    }
+    if (next > max_scroll) {
+        next = max_scroll;
     }
     *out_scroll = next;
     return true;

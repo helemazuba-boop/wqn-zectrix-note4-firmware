@@ -33,20 +33,6 @@ const char* AiFeaturePhaseLabel(AiFeaturePhase phase)
     }
 }
 
-bool AiFeaturePhaseIsBusy(AiFeaturePhase phase)
-{
-    // A pending ask is still a live run: the agent is blocked on the user, not
-    // finished. Treating either ask as idle would let voice input start while an
-    // outbound reply is still queued on the stream worker.
-    return phase == AiFeaturePhase::kLoading ||
-           phase == AiFeaturePhase::kRecording ||
-           phase == AiFeaturePhase::kTranscribing ||
-           phase == AiFeaturePhase::kSubmitting ||
-           phase == AiFeaturePhase::kRunning ||
-           phase == AiFeaturePhase::kAwaitingPermission ||
-           phase == AiFeaturePhase::kAwaitingQuestion;
-}
-
 bool AiFeatureCanStartVoiceInput(AiFeaturePhase phase)
 {
     return phase == AiFeaturePhase::kIdle ||

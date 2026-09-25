@@ -70,16 +70,24 @@ constexpr int kAiViewportBottomPad = 22;
 // [toggle-cluster] Status-bar toggle cluster geometry. tier occupies x=6..22
 // (16px); the cluster starts at kAiToggleX and each icon is kAiToggleStep apart
 // (18 = 16px icon + 2px gap). Applies to every tier -- STD/Pro uses the slots
-// for thinking/TTS/expand/trash, Agent for session/turn-up/turn-down/trash.
+// for thinking/TTS/expand/follow/trash, Agent for
+// session/turn-up/turn-down/follow/trash.
 constexpr int kAiToggleX = 30;
 constexpr int kAiToggleY = 5;
 constexpr int kAiToggleStep = 18;
 constexpr int kAiToggleZonePad = 2;   // pad around the cluster for the edit-mode rect
 // Slots in the edit-mode toggle list, index 0 = tier icon. Both tiers fill all
-// four remaining slots, so the cluster width is tier-independent.
-constexpr int kAiToggleSlotCount = 5;
+// five remaining slots, so the cluster width is tier-independent.
+constexpr int kAiToggleSlotCount = 6;
+// The edit-mode zone rect must HUG the icons: slot i starts at
+// kAiToggleX + i*step, so the last icon ends at kAiToggleX + (count-2)*step +
+// 16, plus one pad on each side. (The old (count-1) overshot by a whole step:
+// 4 icons drew the rect out to x=120 while the glyphs ended at x=100. With the
+// 5th icon the glyphs reach x=118, so the same overshoot would have covered the
+// Agent session title -- whose clamp now starts at x=122 for exactly this
+// reason.)
 constexpr int kAiToggleZoneW =
-    kAiToggleStep * (kAiToggleSlotCount - 1) + 16 + 2 * kAiToggleZonePad;
+    kAiToggleStep * (kAiToggleSlotCount - 2) + 16 + 2 * kAiToggleZonePad;
 
 // ---- Selection style (focus decoration, not interaction timing) ----
 //

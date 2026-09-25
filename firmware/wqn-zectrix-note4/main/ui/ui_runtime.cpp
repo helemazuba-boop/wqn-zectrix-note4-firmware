@@ -3,6 +3,7 @@
 #include <utility>
 
 #include "esp_log.h"
+#include "opencode_session.h"  // [follow] Agent viewport setters
 #include "ui_internal.h"
 #include "services/sync_service.h"
 #include "storage.h"
@@ -38,6 +39,8 @@ const char* AppEventKindName(AppEventKind event)
             return "ai-stream";
         case AppEventKind::kAiSessionSnapshot:
             return "ai-session";
+        case AppEventKind::kAiViewportFollow:
+            return "ai-follow";
         case AppEventKind::kFlashSnapshot:
             return "flash";
         case AppEventKind::kAgentSnapshot:
@@ -710,6 +713,108 @@ UiUpdate UiRuntime::DispatchAiSessionSnapshot(const wqn::AiSessionState& snapsho
             ? RefreshSchedule::kAi
             : RefreshSchedule::kNone,
         true);
+}
+
+// [follow] Per-tick auto-follow. See the declaration in ui_runtime.h and the
+// [follow] block in ui_model.h for the setting's semantics: while a turn is in
+// flight the viewport is pinned to the live tail so the user watches the
+// execution; as soon as the answer body lands the follow retires -- the Agent
+// parks on the answer's first line, STD/Pro leave the position to the
+// conditional recenter at the end of the turn (ai_session.cpp kFinal).
+UiUpdate UiRuntime::DispatchAiViewportFollow()
+{
+    constexpr AppEventKind kEvent = AppEventKind::kAiViewportFollow;
+    if (state_.screen != wqn::UiScreen::kAi) {
+        return FinishEvent(kEvent, RefreshSchedule::kNone, false);
+    }
+
+    const wqn::AiTier tier = state_.ai.tier;
+    const bool agent_tier = tier == wqn::AiTier::kAgent;
+    // Which history channel and which follow flags this tier owns. Flash never
+    // arms the follow (it has no turn to watch), so the check below no-ops
+    // there without needing its own branch.
+    const wqn::AiHistoryChannel channel = agent_tier
+        ? wqn::AiHistoryChannel::kAgent
+        : (tier == wqn::AiTier::kFlash ? wqn::AiHistoryChannel::kFlash
+                                       : wqn::AiHistoryChannel::kStdPro);
+    const bool follow_active =
+        agent_tier ? state_.agent.follow_active : state_.ai.follow_active;
+    if (!state_.ai.auto_follow || !follow_active) {
+        return FinishEvent(kEvent, RefreshSchedule::kNone, false);
+    }
+
+    // Capture owns the surface: the ES8311 is being configured and the panel
+    // must not be repainted underneath it (the same policy that defers the
+    // kPreparingCapture snapshot refresh above). The follow resumes with the
+    // reply, which is what it exists to watch.
+    if (agent_tier) {
+        const wqn::AiFeaturePhase phase = state_.agent.ui.phase;
+        if (phase == wqn::AiFeaturePhase::kLoading ||
+            phase == wqn::AiFeaturePhase::kRecording ||
+            phase == wqn::AiFeaturePhase::kTranscribing) {
+            return FinishEvent(kEvent, RefreshSchedule::kNone, false);
+        }
+    } else if (state_.ai.status == wqn::AiSessionStatus::kPreparingCapture ||
+               state_.ai.status == wqn::AiSessionStatus::kListening) {
+        return FinishEvent(kEvent, RefreshSchedule::kNone, false);
+    }
+
+    const auto snapshot = wqn::GetAiHistorySnapshot(channel);
+    if (!snapshot || snapshot->messages.empty()) {
+        return FinishEvent(kEvent, RefreshSchedule::kNone, false);
+    }
+    int32_t min_scroll = 0;
+    int32_t max_scroll = 0;
+    GetAiScrollBounds(snapshot, state_.ai.expand_content, &min_scroll, &max_scroll);
+
+    // Has the answer body started? The Agent mirrors its text straight into
+    // the history, so the newest entry IS the body. STD/Pro streams into
+    // assistant_partial until the seal, so the mirror alone cannot answer this
+    // -- a partial that has not been sealed yet is still a started body.
+    int32_t answer_top = 0;
+    const bool body_started =
+        GetAiNewestAnswerTopOffsetLines(snapshot, state_.ai.expand_content, &answer_top) ||
+        (!agent_tier && !state_.ai.assistant_partial.empty());
+
+    if (body_started) {
+        bool moved = false;
+        if (agent_tier && state_.agent.ui.scroll_offset_lines != answer_top) {
+            wqn::SetOpenCodeScrollOffsetClamped(answer_top, min_scroll, max_scroll);
+            // Mirror into the UI copy: the renderer reads this field this very
+            // tick, and the next snapshot would otherwise lag one frame behind.
+            state_.agent.ui.scroll_offset_lines = answer_top;
+            moved = true;
+        }
+        // Retire the follow for the rest of the turn, keeping user_moved as it
+        // is: the follow retired itself, the user did not move the viewport.
+        if (agent_tier) {
+            wqn::SetOpenCodeFollowState(false, state_.agent.user_moved);
+        } else {
+            wqn::SetAiFollowState(false, state_.ai.user_moved);
+        }
+        ESP_LOGI(kTag, "ai-follow: body started -> retire (tier=%d parked=%d offset=%ld)",
+                 static_cast<int>(tier), moved ? 1 : 0,
+                 static_cast<long>(agent_tier ? state_.agent.ui.scroll_offset_lines
+                                              : state_.ai.scroll_offset_lines));
+        return FinishEvent(kEvent, moved ? RefreshSchedule::kAi : RefreshSchedule::kNone, true);
+    }
+
+    // No body yet: pin to the live tail (min_scroll), where the newest line
+    // stays put as the run appends thinking/tool blocks above it.
+    if (agent_tier) {
+        if (state_.agent.ui.scroll_offset_lines == min_scroll) {
+            return FinishEvent(kEvent, RefreshSchedule::kNone, false);
+        }
+        wqn::SetOpenCodeScrollOffsetClamped(min_scroll, min_scroll, max_scroll);
+        state_.agent.ui.scroll_offset_lines = min_scroll;
+    } else {
+        if (state_.ai.scroll_offset_lines == min_scroll) {
+            return FinishEvent(kEvent, RefreshSchedule::kNone, false);
+        }
+        wqn::SetAiScrollOffsetLinesClamped(min_scroll, min_scroll, max_scroll);
+        state_.ai.scroll_offset_lines = min_scroll;
+    }
+    return FinishEvent(kEvent, RefreshSchedule::kAi, true);
 }
 
 UiUpdate UiRuntime::DispatchFlashSnapshot(const wqn::FlashUiState& flash)

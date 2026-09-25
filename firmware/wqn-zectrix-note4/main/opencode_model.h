@@ -42,6 +42,11 @@ struct AgentSessionState {
     int64_t confirmation_armed_at_ms = 0;
     bool session_locked = false;
     bool stream_active = false;
+    // [follow] Per-turn viewport-follow state for the Agent tier; same
+    // semantics as AiSessionState::follow_active / user_moved. Armed by the
+    // turn-start paths in opencode_session.cpp, cleared by manual scrolls.
+    bool follow_active = false;
+    bool user_moved = false;
 };
 
 }  // namespace wqn

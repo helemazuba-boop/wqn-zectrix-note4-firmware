@@ -37,7 +37,6 @@ struct AiFeatureUiState {
 };
 
 const char* AiFeaturePhaseLabel(AiFeaturePhase phase);
-bool AiFeaturePhaseIsBusy(AiFeaturePhase phase);
 bool AiFeatureCanStartVoiceInput(AiFeaturePhase phase);
 bool AiFeatureCanSubmit(const AiFeatureUiState& state);
 AiFeaturePhase AiFeaturePhaseFromLegacy(AiSessionStatus status);

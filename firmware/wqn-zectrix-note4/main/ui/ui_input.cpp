@@ -472,7 +472,8 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
 
 // [shell] Cycle the AI status-bar toggle at `index`. Index 0=tier (handled in
 // ApplyStatusBarEditEvent as an immediate switch), 1=thinking, 2=tts, 3=expand,
-// 4=trash (also immediate, in ApplyStatusBarEditEvent). This fn only cycles 1-3.
+// 4=follow, 5=trash (also immediate, in ApplyStatusBarEditEvent). This fn only
+// cycles 1-4.
 static void CycleAiStatusBarToggle(wqn::UiState* state, uint8_t index)
 {
     wqn::AiSessionState& ai = state->ai;
@@ -485,6 +486,10 @@ static void CycleAiStatusBarToggle(wqn::UiState* state, uint8_t index)
         }
         case 2: ai.tts_on = !ai.tts_on; wqn::SetAiTtsOn(ai.tts_on); break;
         case 3: ai.expand_content = !ai.expand_content; wqn::SetAiExpandContent(ai.expand_content); break;
+        // [follow] Both tiers: same flag, same setter (see the [follow] block in
+        // ui_model.h). Toggling it off mid-reply lets the user scroll away
+        // without the next tick yanking the viewport back to the bottom.
+        case 4: ai.auto_follow = !ai.auto_follow; wqn::SetAiAutoFollow(ai.auto_follow); break;
         default: break;
     }
 }
@@ -506,6 +511,8 @@ static void CycleAiStatusBarToggleReverse(wqn::UiState* state, uint8_t index)
         }
         case 2: ai.tts_on = !ai.tts_on; wqn::SetAiTtsOn(ai.tts_on); break;
         case 3: ai.expand_content = !ai.expand_content; wqn::SetAiExpandContent(ai.expand_content); break;
+        // [follow] Boolean, so the reverse is the same flip as the forward cycle.
+        case 4: ai.auto_follow = !ai.auto_follow; wqn::SetAiAutoFollow(ai.auto_follow); break;
         default: break;
     }
 }
@@ -531,6 +538,23 @@ static void SyncAgentSnapshot(wqn::UiState* state)
     }
 }
 
+// [follow] "Has this turn's answer body started?" -- the same predicate the
+// per-tick follow step uses (UiRuntime::DispatchAiViewportFollow). The mirror
+// side alone is not enough for STD/Pro: its streaming text lives in
+// assistant_partial until the seal, so the newest history entry is still the
+// previous turn's reply while the body is already on screen.
+static bool AnswerBodyStarted(
+    const wqn::AiSessionState& ai,
+    const std::shared_ptr<const wqn::AiHistorySnapshot>& snapshot)
+{
+    int32_t probe = 0;
+    if (device_ui_internal::GetAiNewestAnswerTopOffsetLines(
+            snapshot, ai.expand_content, &probe)) {
+        return true;
+    }
+    return ai.tier != wqn::AiTier::kAgent && !ai.assistant_partial.empty();
+}
+
 // Turn navigation: jump the viewport to the previous/next answer. Reuses the
 // renderer's own layout pass (GetAiTurnJumpOffsetLines) so the jump target and
 // the scroll clamp cannot disagree.
@@ -549,7 +573,20 @@ static bool ApplyAgentTurnJump(wqn::UiState* state, int direction)
             direction, &next)) {
         return false;
     }
+    // [follow] Write through the backend, not the UI copy: the next
+    // CopyOpenCodeSessionToUi replaces the whole struct and would snap the
+    // viewport back to the offset the worker last saw. A turn jump is also a
+    // manual viewport move, so it retires the follow -- otherwise the next
+    // follow tick would drag the viewport back to the tail.
+    int32_t min_scroll = 0;
+    int32_t max_scroll = 0;
+    device_ui_internal::GetAiScrollBounds(
+        snapshot, state->ai.expand_content, &min_scroll, &max_scroll);
+    wqn::SetOpenCodeScrollOffsetClamped(next, min_scroll, max_scroll);
+    wqn::SetOpenCodeFollowState(false, /*user_moved=*/true);
     state->agent.ui.scroll_offset_lines = next;
+    state->agent.follow_active = false;
+    state->agent.user_moved = true;
     return true;
 }
 
@@ -763,13 +800,14 @@ static AgentInputResult TryApplyAgentAiButtonEvent(
 }
 
 // [shell] Status-bar edit mode owns all button input on the AI page while active.
-// short-confirm = cycle selected toggle; up/down = move selection (wrap 0..2);
+// short-confirm = cycle selected toggle; up/down = move selection (wrap 0..5);
 // long-confirm (release) = exit. Edge events (Press/Release) are consumed so
 // Flash PTT never fires mid-edit (though edit mode is only entered on Std/Pro).
 //
-// [agent] The Agent tier reuses the same five slots (0 = tier, 1..4 = cluster),
+// [agent] The Agent tier reuses the same six slots (0 = tier, 1..5 = cluster),
 // so only the slot 1..3 actions differ: they are immediate actions rather than
 // toggles, because they configure the gateway rather than the STD/Pro text turn.
+// Slot 4 (follow) and slot 5 (trash) behave identically on both tiers.
 static RefreshSchedule ApplyStatusBarEditEvent(
     const wqn::ButtonEvent& event,
     int64_t now_ms,
@@ -844,8 +882,8 @@ static RefreshSchedule ApplyStatusBarEditEvent(
                 }
                 return RefreshSchedule::kAi;
             }
-            // [trash] index 4 = clear-context action: clear + exit immediately.
-            if (state->status_edit.selected == 4) {
+            // [trash] index 5 = clear-context action: clear + exit immediately.
+            if (state->status_edit.selected == 5) {
                 // [agent] Each tier owns its own history channel, so the trash
                 // clears the one the visible tier writes to.
                 if (state->ai.tier == wqn::AiTier::kAgent) {
@@ -863,7 +901,7 @@ static RefreshSchedule ApplyStatusBarEditEvent(
             // Double-confirm (2nd short-press within window of the last forward
             // cycle) = save & exit: undo the last cycle so the value saved is the
             // one BEFORE this double, then leave edit mode. Single short-press =
-            // cycle forward (optimistic). Applies to toggles (1-3) only.
+            // cycle forward (optimistic). Applies to toggles (1-4) only.
             if (state->status_edit.last_cycle_ms > 0 &&
                 now_ms - state->status_edit.last_cycle_ms <= kStatusBarEditDblMs) {
                 CycleAiStatusBarToggleReverse(state, state->status_edit.selected);
@@ -889,8 +927,9 @@ static RefreshSchedule ApplyStatusBarEditEvent(
         if (event.type == wqn::ButtonEventType::kShortPress ||
             event.type == wqn::ButtonEventType::kLongPress) {
             const int dir = (event.button == wqn::ButtonId::kUp) ? -1 : 1;
-            // Flash edit mode has only the tier button (index 0); STD/Pro have 0..4.
-            const int max_idx = (state->ai.tier == wqn::AiTier::kFlash) ? 0 : 4;
+            // Flash edit mode has only the tier button (index 0); STD/Pro and
+            // Agent have 0..5 (tier + five cluster slots).
+            const int max_idx = (state->ai.tier == wqn::AiTier::kFlash) ? 0 : 5;
             int s = static_cast<int>(state->status_edit.selected) + dir;
             if (s < 0) { s = max_idx; }
             if (s > max_idx) { s = 0; }
@@ -1187,14 +1226,23 @@ RefreshSchedule ApplyButtonEvent(
     }
 
     // [agent] The Agent tier scrolls its own history. ScrollOpenCodeResponse
-    // owns the offset -- it is also advanced by the live SSE stream -- so the UI
-    // must only ask it to move, never write the offset directly. The busy test
-    // is the shared phase enum rather than AiSessionStatus, which the Agent
-    // tier never populates.
+    // owns the offset (the auto-follow policy may also move it) -- so the UI
+    // must only ask it to move, never write the offset directly. The phase test
+    // is the shared enum rather than AiSessionStatus, which the Agent tier
+    // never populates.
+    //
+    // [scroll-anytime] Only the capture phases own the surface. A run in flight
+    // (kSubmitting/kRunning and the asks) and the history backfill (kLoading)
+    // stay scrollable: blocking kRunning made the newest reply unreadable for
+    // the whole run. Capture is swallowed HERE (return kNone) so the event
+    // cannot fall through to HandleUiInput and dirty ai.page.
     if (state->screen == wqn::UiScreen::kAi && state->ai.tier == wqn::AiTier::kAgent &&
         !long_press && event.type == wqn::ButtonEventType::kShortPress &&
-        (event.button == wqn::ButtonId::kUp || event.button == wqn::ButtonId::kDownPower) &&
-        !wqn::AiFeaturePhaseIsBusy(state->agent.ui.phase)) {
+        (event.button == wqn::ButtonId::kUp || event.button == wqn::ButtonId::kDownPower)) {
+        if (state->agent.ui.phase == wqn::AiFeaturePhase::kRecording ||
+            state->agent.ui.phase == wqn::AiFeaturePhase::kTranscribing) {
+            return RefreshSchedule::kNone;
+        }
         // Up = older content above; the sign matches ScrollOpenCodeResponse's
         // own convention (positive = older).
         const int direction = (event.button == wqn::ButtonId::kUp) ? 1 : -1;
@@ -1212,13 +1260,27 @@ RefreshSchedule ApplyButtonEvent(
         int32_t max_scroll = 0;
         device_ui_internal::GetAiScrollBounds(
             snapshot, state->ai.expand_content, &min_scroll, &max_scroll);
+        // [follow] A manual scroll is the user taking the viewport back: the
+        // follow retires for the rest of the turn and the conditional recenter
+        // must leave the viewport where the user put it. The one exception is a
+        // Down press that lands back on the tail before the answer body has
+        // started -- that is the user asking to watch the run again, so the
+        // follow is re-armed (user_moved stays true: they did move it).
+        const bool body_started = AnswerBodyStarted(state->ai, snapshot);
         wqn::ScrollOpenCodeResponse(direction, min_scroll, max_scroll);
         SyncAgentSnapshot(state);
-        ESP_LOGI(kTag, "Agent scroll: %s -> offset=%ld bounds=[%ld,%ld]",
+        const bool resumed =
+            state->ai.auto_follow && direction < 0 &&
+            state->agent.ui.scroll_offset_lines == min_scroll && !body_started;
+        wqn::SetOpenCodeFollowState(resumed, /*user_moved=*/true);
+        state->agent.follow_active = resumed;
+        state->agent.user_moved = true;
+        ESP_LOGI(kTag, "Agent scroll: %s -> offset=%ld bounds=[%ld,%ld] follow=%d",
                  direction > 0 ? "older" : "newer",
                  static_cast<long>(state->agent.ui.scroll_offset_lines),
                  static_cast<long>(min_scroll),
-                 static_cast<long>(max_scroll));
+                 static_cast<long>(max_scroll),
+                 resumed ? 1 : 0);
         return RefreshSchedule::kAi;
     }
 
@@ -1228,8 +1290,10 @@ RefreshSchedule ApplyButtonEvent(
     // explicitly here (instead of letting it fall through to HandleUiInput)
     // so tier switch (kDoublePress) remains untouched and idle stays clean.
     //
-    // Recording / waiting state must NOT scroll — the page is reserved for
-    // the recording surface.
+    // [scroll-anytime] Only capture owns the surface. kWaitingReply and
+    // kStreaming MUST scroll: that is exactly when the reply grows past the
+    // bottom of the viewport. Capture is swallowed HERE (return kNone) so the
+    // event cannot fall through to HandleUiInput and dirty ai.page.
     //
     // [agent] STD/Pro/Flash only: the Agent tier is handled by its own branch
     // above, which routes through ScrollOpenCodeResponse instead of the
@@ -1238,16 +1302,22 @@ RefreshSchedule ApplyButtonEvent(
     if (state->screen == wqn::UiScreen::kAi && state->ai.tier != wqn::AiTier::kAgent &&
         !long_press &&
         (event.type == wqn::ButtonEventType::kShortPress) &&
-        (event.button == wqn::ButtonId::kUp || event.button == wqn::ButtonId::kDownPower) &&
-        state->ai.status != wqn::AiSessionStatus::kPreparingCapture &&
-        state->ai.status != wqn::AiSessionStatus::kListening &&
-        state->ai.status != wqn::AiSessionStatus::kWaitingReply &&
-        state->ai.status != wqn::AiSessionStatus::kStreaming) {
+        (event.button == wqn::ButtonId::kUp || event.button == wqn::ButtonId::kDownPower)) {
+        if (state->ai.status == wqn::AiSessionStatus::kPreparingCapture ||
+            state->ai.status == wqn::AiSessionStatus::kListening) {
+            return RefreshSchedule::kNone;
+        }
         constexpr int32_t kScrollStepRows = 4;  // [scroll-2x] was 2; doubled per request
         const wqn::AiHistoryChannel channel = state->ai.tier == wqn::AiTier::kFlash
             ? wqn::AiHistoryChannel::kFlash
             : wqn::AiHistoryChannel::kStdPro;
         auto snapshot = wqn::GetAiHistorySnapshot(channel);
+
+        // [follow] Whether the viewport is currently following this turn. Read
+        // before the scroll: a viewport the follow is holding at the tail must
+        // not flash the "已最新" hint -- the hint means "you cannot go further
+        // down", while a followed viewport is at the newest content on purpose.
+        const bool following = state->ai.auto_follow && state->ai.follow_active;
 
         // Fail open: without history there are no trustworthy bounds, so the
         // offset stays untouched (an empty snapshot must never reset scroll).
@@ -1261,15 +1331,38 @@ RefreshSchedule ApplyButtonEvent(
                 // Up = "older" content above. Scroll band shifts content down.
                 wqn::SetAiScrollOffsetLinesClamped(
                     current + kScrollStepRows, min_scroll, max_scroll);
+                // [follow] A manual scroll takes the viewport back: retire the
+                // follow and let the conditional recenter keep off it.
+                wqn::SetAiFollowState(false, /*user_moved=*/true);
+                state->ai.follow_active = false;
+                state->ai.user_moved = true;
             } else {
                 // Down = "newer". Scroll band shifts content up.
-                if (current <= min_scroll) {
+                if (current <= min_scroll && !following) {
                     wqn::StampScrollNoOpHint();
                 }
-                wqn::SetAiScrollOffsetLinesClamped(
-                    current - kScrollStepRows, min_scroll, max_scroll);
+                int32_t landed = current - kScrollStepRows;
+                if (landed < min_scroll) {
+                    landed = min_scroll;
+                }
+                if (landed > max_scroll) {
+                    landed = max_scroll;
+                }
+                wqn::SetAiScrollOffsetLinesClamped(landed, min_scroll, max_scroll);
+                // [follow] A Down that lands on the tail before the answer body
+                // has started = "watch the run again": re-arm the follow
+                // (user_moved stays true -- they did move the viewport). Any
+                // other Down is a manual move and retires it. Flash is excluded:
+                // it has no arm path and hides the toggle, so its viewport keeps
+                // its old "stays where the user put it" behavior.
+                const bool resumed = state->ai.auto_follow &&
+                    state->ai.tier != wqn::AiTier::kFlash && landed == min_scroll &&
+                    !AnswerBodyStarted(state->ai, snapshot);
+                wqn::SetAiFollowState(resumed, /*user_moved=*/true);
+                state->ai.follow_active = resumed;
+                state->ai.user_moved = true;
             }
-        } else if (event.button != wqn::ButtonId::kUp) {
+        } else if (event.button != wqn::ButtonId::kUp && !following) {
             wqn::StampScrollNoOpHint();
         }
         state->ai.scroll_offset_lines = wqn::GetAiScrollOffsetLines();
@@ -1286,17 +1379,10 @@ RefreshSchedule ApplyButtonEvent(
                  static_cast<long long>(state->ai.scroll_no_op_hint_ms));
         return RefreshSchedule::kAi;
     }
-    // Block Up/Down while busy on AI page so the user cannot accidentally
-    // scroll mid-recording or mid-stream.
-    if (state->screen == wqn::UiScreen::kAi && !long_press &&
-        (event.type == wqn::ButtonEventType::kShortPress) &&
-        (event.button == wqn::ButtonId::kUp || event.button == wqn::ButtonId::kDownPower) &&
-        (state->ai.status == wqn::AiSessionStatus::kListening ||
-         state->ai.status == wqn::AiSessionStatus::kPreparingCapture ||
-         state->ai.status == wqn::AiSessionStatus::kWaitingReply ||
-         state->ai.status == wqn::AiSessionStatus::kStreaming)) {
-        return RefreshSchedule::kNone;
-    }
+    // [scroll-anytime] The old "Block Up/Down while busy on AI page" fallback
+    // that stood here was removed with the gate narrowing: both tier branches
+    // above now match every short-press Up/Down on the AI page and swallow
+    // their own capture phases, so it could never be reached.
     // Short-press confirm on AI page is a no-op now (long-press starts,
     // long-release submits). Keep behavior symmetric with the no-scroll
     // case so the user doesn't get double-submits.
