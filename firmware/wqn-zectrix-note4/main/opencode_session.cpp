@@ -57,6 +57,10 @@ bool g_run_failed = false;
 bool g_observing = false;
 std::string g_run_session_id;
 std::string g_run_prompt;
+// [detail] Detail tier for the command in flight, handed over the same way as
+// g_run_session_id: written under g_lock at arm time, read by the worker
+// without the lock. Not cleared on finish -- every arm overwrites it.
+uint8_t g_run_detail = wqn::kOpenCodeDetailDefault;
 wqn::OpenCodeOutboundQueue g_outbound_replies;
 // The ask a queued reply answers. The UI closes its option bar the moment the
 // reply is queued, so the live ask id is not proof that a reply went out: this
@@ -887,6 +891,7 @@ void RunPrompt()
         result = wqn::RunOpenCodePrompt(
             token,
             g_run_session_id,
+            g_run_detail,
             g_run_prompt,
             &g_outbound_replies,
             OnOpenCodeReplyFailed,
@@ -979,6 +984,7 @@ void ObserveSession()
         result = wqn::WatchOpenCodeSession(
             token,
             g_run_session_id,
+            g_run_detail,
             &g_outbound_replies,
             OnOpenCodeReplyFailed,
             nullptr,
@@ -1020,7 +1026,8 @@ void LoadHistory()
     std::vector<wqn::OpenCodeHistoryMessage> messages;
     wqn::OpenCodeResult api_result;
     if (result == ESP_OK) {
-        result = wqn::GetOpenCodeHistory(token, g_run_session_id, &messages, &api_result);
+        result = wqn::GetOpenCodeHistory(
+            token, g_run_session_id, g_run_detail, &messages, &api_result);
     }
     xSemaphoreTake(g_lock, portMAX_DELAY);
     // A lock that switched sessions while this read was in flight invalidates
@@ -1241,6 +1248,7 @@ esp_err_t LockSelectedOpenCodeSession()
         // The worker reads the target session from g_run_session_id, the same
         // handoff slot ObserveOpenCodeSession uses.
         g_run_session_id = selected.id;
+        g_run_detail = g_state.detail_level;
         if (!ArmWorkerLocked(WorkerCommand::kLoadHistory)) {
             result = ESP_ERR_INVALID_STATE;
         }
@@ -1331,6 +1339,10 @@ esp_err_t ObserveOpenCodeSession()
         // The worker reads the target session from g_run_session_id, the same
         // handoff slot ConfirmOpenCodePrompt uses.
         g_run_session_id = g_state.current_session_id;
+        // [detail] The chained kObserveSession reuses this value: the command
+        // gate is single-slot, so nothing can re-arm between the backfill and
+        // the attach that follows it.
+        g_run_detail = g_state.detail_level;
         ClearPendingPermissionLocked();
         ClearPendingQuestionLocked();
         // Attaching is a fresh turn: a question the previous attach could not
@@ -1565,6 +1577,7 @@ esp_err_t ConfirmOpenCodePrompt(int64_t confirmed_at_ms)
     if (result == ESP_OK) {
         g_run_session_id = g_state.current_session_id;
         g_run_prompt = g_state.ui.prompt_text;
+        g_run_detail = g_state.detail_level;
         if (!ArmWorkerLocked(WorkerCommand::kRunPrompt)) {
             g_run_session_id.clear();
             g_run_prompt.clear();

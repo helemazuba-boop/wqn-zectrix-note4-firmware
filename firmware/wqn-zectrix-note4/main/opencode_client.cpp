@@ -86,6 +86,15 @@ std::string AgentUrl(const char* path)
     return url;
 }
 
+// [detail] Every agent route that projects agent output carries the device's
+// requested detail tier (0 简要 / 1 标准 / 2 详细, see kOpenCodeDetailDefault).
+// Clamped here so a junk value from a future setting cannot reach the wire.
+std::string DetailQuery(uint8_t detail)
+{
+    const uint8_t clamped = detail > 2 ? 2 : detail;
+    return std::string("?detail=") + std::to_string(clamped);
+}
+
 esp_err_t SetCommonHeaders(
     esp_http_client_handle_t client,
     const std::string& token,
@@ -605,6 +614,7 @@ esp_err_t TranscribeOpenCodeAudio(
 esp_err_t RunOpenCodePrompt(
     const std::string& token,
     const std::string& session_id,
+    uint8_t detail,
     const std::string& prompt,
     OpenCodeOutboundQueue* outbound_replies,
     OpenCodeReplyFailedCallback reply_failed,
@@ -633,7 +643,7 @@ esp_err_t RunOpenCodePrompt(
     }
     const std::string body = printed;
     cJSON_free(printed);
-    const std::string path = "/agent/sessions/" + session_id + "/run";
+    const std::string path = "/agent/sessions/" + session_id + "/run" + DetailQuery(detail);
     AgentStreamRequest request{
         token,
         path,
@@ -653,6 +663,7 @@ esp_err_t RunOpenCodePrompt(
 esp_err_t WatchOpenCodeSession(
     const std::string& token,
     const std::string& session_id,
+    uint8_t detail,
     OpenCodeOutboundQueue* outbound_replies,
     OpenCodeReplyFailedCallback reply_failed,
     void* reply_failed_ctx,
@@ -666,7 +677,7 @@ esp_err_t WatchOpenCodeSession(
         return ESP_ERR_INVALID_ARG;
     }
     *result = OpenCodeResult{};
-    const std::string path = "/agent/sessions/" + session_id + "/events";
+    const std::string path = "/agent/sessions/" + session_id + "/events" + DetailQuery(detail);
     AgentStreamRequest request{
         token,
         path,
@@ -794,6 +805,7 @@ esp_err_t InterruptOpenCodeSession(
 esp_err_t GetOpenCodeHistory(
     const std::string& token,
     const std::string& session_id,
+    uint8_t detail,
     std::vector<OpenCodeHistoryMessage>* messages,
     OpenCodeResult* result)
 {
@@ -806,7 +818,7 @@ esp_err_t GetOpenCodeHistory(
     std::string body;
     const esp_err_t request_result = OpenJsonRequest(
         token,
-        AgentUrl(("/agent/sessions/" + session_id + "/history").c_str()),
+        AgentUrl(("/agent/sessions/" + session_id + "/history" + DetailQuery(detail)).c_str()),
         HTTP_METHOD_GET,
         nullptr,
         &body,

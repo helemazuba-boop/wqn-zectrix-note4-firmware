@@ -172,9 +172,14 @@ esp_err_t TranscribeOpenCodeAudio(
 // `interrupt_delivered` afterwards to tell "stopped on request" from "the
 // stream died". The streaming worker performs the interrupt POST itself, so no
 // caller ever opens a connection of its own while a stream is attached.
+//
+// `detail` is the requested cloud detail tier (kOpenCodeDetailDefault in
+// opencode_model.h). It rides the request as `?detail=N` and only shapes what
+// the gateway projects onto the stream -- never the run itself.
 esp_err_t RunOpenCodePrompt(
     const std::string& token,
     const std::string& session_id,
+    uint8_t detail,
     const std::string& prompt,
     OpenCodeOutboundQueue* outbound_replies,
     OpenCodeReplyFailedCallback reply_failed,
@@ -187,6 +192,7 @@ esp_err_t RunOpenCodePrompt(
 esp_err_t WatchOpenCodeSession(
     const std::string& token,
     const std::string& session_id,
+    uint8_t detail,
     OpenCodeOutboundQueue* outbound_replies,
     OpenCodeReplyFailedCallback reply_failed,
     void* reply_failed_ctx,
@@ -196,10 +202,12 @@ esp_err_t WatchOpenCodeSession(
     void* callback_ctx,
     OpenCodeResult* result);
 // Backfill one session's transcript, oldest message first. The gateway has
-// already truncated it to fit the device's bounded-JSON budget.
+// already truncated it to fit the device's bounded-JSON budget, and projects it
+// at `detail` (kOpenCodeDetailDefault).
 esp_err_t GetOpenCodeHistory(
     const std::string& token,
     const std::string& session_id,
+    uint8_t detail,
     std::vector<OpenCodeHistoryMessage>* messages,
     OpenCodeResult* result);
 // Answer an `agent.question` ask with the selected option's value. The gateway

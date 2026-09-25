@@ -16,6 +16,18 @@ struct AgentSessionOption {
     int64_t updated_at = 0;
 };
 
+// [detail] Cloud detail tier requested by this device: 0 = brief (text only,
+// with a one-line digest standing in for a tool-only turn), 1 = standard
+// (text + tool blocks), 2 = full (+ thinking). Sent as `?detail=N` on the
+// history, run and events requests; the gateway omits the optional fields
+// accordingly, and below full it also stops streaming reasoning.
+//
+// No writer this round: the value is pinned here so the request path can be
+// built and verified end to end. The NVS-backed setting and its switch land
+// together in the next round -- until then, flipping this constant and
+// reflashing is the only way to exercise a tier on device.
+constexpr uint8_t kOpenCodeDetailDefault = 2;
+
 struct AgentSessionState {
     AiFeatureUiState ui;
     std::vector<AgentSessionOption> sessions;
@@ -47,6 +59,9 @@ struct AgentSessionState {
     // turn-start paths in opencode_session.cpp, cleared by manual scrolls.
     bool follow_active = false;
     bool user_moved = false;
+    // [detail] See kOpenCodeDetailDefault. Rides the snapshot to the UI with
+    // every other field; the request builders read it at command-arm time.
+    uint8_t detail_level = kOpenCodeDetailDefault;
 };
 
 }  // namespace wqn
