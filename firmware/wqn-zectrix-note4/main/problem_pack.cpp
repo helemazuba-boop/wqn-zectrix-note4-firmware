@@ -20,6 +20,7 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_spiffs.h"
+#include "esp_timer.h"
 #include "mbedtls/sha256.h"
 #include "runtime/sleep_coordinator.h"
 #include "services/storage_service.h"
@@ -530,7 +531,8 @@ esp_err_t ResetProblemPackStorageCacheRaw(void*)
 esp_err_t ScanProblemPackFile(
     const wqn::WqnProblemPackManifestSet& set,
     uint32_t set_order,
-    wqn::ProblemPackIndex* index)
+    wqn::ProblemPackIndex* index,
+    int64_t* parse_us)
 {
     if (index == nullptr) {
         return ESP_ERR_INVALID_ARG;
@@ -603,7 +605,11 @@ esp_err_t ScanProblemPackFile(
             return result == ESP_OK ? ESP_ERR_INVALID_SIZE : result;
         }
         wqn::WqnProblemEntry entry;
+        const int64_t parse_started_us = esp_timer_get_time();
         result = wqn::ParseProblemRecordLine(line.c_str(), &entry, /*include_content=*/false);
+        if (parse_us != nullptr) {
+            *parse_us += esp_timer_get_time() - parse_started_us;
+        }
         if (result != ESP_OK) {
             std::fclose(file);
             return result;
@@ -976,6 +982,10 @@ esp_err_t LoadProblemPackIndex(ProblemPackIndex* index)
     if (index == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
+    // [timing] The SHA verify and the JSONL scan each walk the whole pack and
+    // scale with its size, so the watchdog budget of a bigger pack has to be
+    // extrapolated from measured phases rather than guessed.
+    const int64_t index_started_us = esp_timer_get_time();
     // SHA verification and JSONL scanning are CPU-bound; scope max frequency
     // to this rebuild instead of disabling dynamic frequency scaling globally.
     auto cpu_lease = runtime::CpuPerformanceLease::TryAcquire();
@@ -1044,6 +1054,9 @@ esp_err_t LoadProblemPackIndex(ProblemPackIndex* index)
     index->problem_order.reserve(expected_entries);
     index->sets.reserve(manifest.problem_sets.size());
 
+    int64_t sha_us_total = 0;
+    int64_t scan_us_total = 0;
+    int64_t parse_us_total = 0;
     for (const WqnProblemPackManifestSet& item : manifest.problem_sets) {
         const uint32_t set_order = static_cast<uint32_t>(index->sets.size());
         ProblemPackSet set;
@@ -1062,11 +1075,17 @@ esp_err_t LoadProblemPackIndex(ProblemPackIndex* index)
             if (stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode)) {
                 index->pack_bytes += static_cast<size_t>(st.st_size);
             }
-            if (!VerifyFileSha256(path, item.sha256)) {
+            const int64_t sha_started_us = esp_timer_get_time();
+            const bool sha_ok = VerifyFileSha256(path, item.sha256);
+            sha_us_total += esp_timer_get_time() - sha_started_us;
+            if (!sha_ok) {
                 index->pack_error = true;
                 index->status_message = "错题校验失败";
             } else {
-                const esp_err_t scan_result = ScanProblemPackFile(item, set_order, index);
+                const int64_t scan_started_us = esp_timer_get_time();
+                const esp_err_t scan_result =
+                    ScanProblemPackFile(item, set_order, index, &parse_us_total);
+                scan_us_total += esp_timer_get_time() - scan_started_us;
                 if (scan_result != ESP_OK) {
                     index->pack_error = true;
                     index->status_message = "错题读取失败";
@@ -1099,12 +1118,16 @@ esp_err_t LoadProblemPackIndex(ProblemPackIndex* index)
 
     ESP_LOGI(
         kTag,
-        "problem pack index: sets=%u problems=%u pack_bytes=%u free_internal=%u free_psram=%u",
+        "problem pack index: sets=%u problems=%u pack_bytes=%u free_internal=%u free_psram=%u total_ms=%lld sha_ms=%lld scan_ms=%lld parse_ms=%lld",
         static_cast<unsigned>(index->set_count),
         static_cast<unsigned>(index->entries.size()),
         static_cast<unsigned>(index->pack_bytes),
         static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
-        static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)));
+        static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)),
+        static_cast<long long>((esp_timer_get_time() - index_started_us) / 1000),
+        static_cast<long long>(sha_us_total / 1000),
+        static_cast<long long>(scan_us_total / 1000),
+        static_cast<long long>(parse_us_total / 1000));
     return ESP_OK;
 }
 

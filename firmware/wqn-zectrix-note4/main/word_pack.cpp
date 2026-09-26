@@ -492,7 +492,8 @@ void CopyField(char* dst, size_t dst_size, const std::string& src)
 esp_err_t ScanPackFile(
     const wqn::WqnWordPackManifestItem& item,
     uint32_t deck_order,
-    wqn::WordPackIndex* index)
+    wqn::WordPackIndex* index,
+    int64_t* parse_us)
 {
     if (index == nullptr) {
         return ESP_ERR_INVALID_ARG;
@@ -583,7 +584,11 @@ esp_err_t ScanPackFile(
         }
         wqn::WqnWordEntry entry;
         int32_t sort_index = 0;
+        const int64_t parse_started_us = esp_timer_get_time();
         result = ParsePackEntryLine(line.c_str(), &entry, &sort_index);
+        if (parse_us != nullptr) {
+            *parse_us += esp_timer_get_time() - parse_started_us;
+        }
         if (result != ESP_OK) {
             std::fclose(file);
             return result;
@@ -900,6 +905,10 @@ esp_err_t LoadWordPackIndexInternal(
     if (index == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
+    // [timing] The SHA verify and the JSONL scan each walk the whole pack and
+    // scale with its size, so the watchdog budget of a bigger pack has to be
+    // extrapolated from measured phases rather than guessed.
+    const int64_t index_started_us = esp_timer_get_time();
     // SHA verification and JSONL scanning are CPU-bound.
     // Keep maximum frequency scoped to this rebuild instead of disabling DFS.
     auto cpu_lease = runtime::CpuPerformanceLease::TryAcquire();
@@ -1013,22 +1022,31 @@ esp_err_t LoadWordPackIndexInternal(
     // this guard must run immediately before reserve().
     index->entries.reserve(expected_entries);
 
+    int64_t sha_us_total = 0;
+    int64_t scan_us_total = 0;
+    int64_t parse_us_total = 0;
     for (const WqnWordPackManifestItem& item : manifest.packs) {
         const std::string path = PackPathForItem(item);
         struct stat st = {};
         if (stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode)) {
             index->pack_bytes += static_cast<size_t>(st.st_size);
         }
-        if (!VerifyFileSha256(path, item.sha256)) {
+        const int64_t sha_started_us = esp_timer_get_time();
+        const bool sha_ok = VerifyFileSha256(path, item.sha256);
+        sha_us_total += esp_timer_get_time() - sha_started_us;
+        if (!sha_ok) {
             index->pack_error = true;
             index->status_message = "词库校验失败";
             continue;
         }
         index->manifest_revision = std::max(index->manifest_revision, item.change_sequence);
+        const int64_t scan_started_us = esp_timer_get_time();
         const esp_err_t scan_result = ScanPackFile(
             item,
             static_cast<uint32_t>(&item - manifest.packs.data()),
-            index);
+            index,
+            &parse_us_total);
+        scan_us_total += esp_timer_get_time() - scan_started_us;
         if (scan_result != ESP_OK) {
             index->pack_error = true;
             index->status_message = "词库读取失败";
@@ -1048,13 +1066,17 @@ esp_err_t LoadWordPackIndexInternal(
 
     ESP_LOGI(
         kTag,
-        "word pack index: pack_count=%u word_index_count=%u pack_bytes=%u free_internal=%u free_psram=%u truncated=%d",
+        "word pack index: pack_count=%u word_index_count=%u pack_bytes=%u free_internal=%u free_psram=%u truncated=%d total_ms=%lld sha_ms=%lld scan_ms=%lld parse_ms=%lld",
         static_cast<unsigned>(index->pack_count),
         static_cast<unsigned>(index->entries.size()),
         static_cast<unsigned>(index->pack_bytes),
         static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
         static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)),
-        index->truncated ? 1 : 0);
+        index->truncated ? 1 : 0,
+        static_cast<long long>((esp_timer_get_time() - index_started_us) / 1000),
+        static_cast<long long>(sha_us_total / 1000),
+        static_cast<long long>(scan_us_total / 1000),
+        static_cast<long long>(parse_us_total / 1000));
     return ESP_OK;
 }
 

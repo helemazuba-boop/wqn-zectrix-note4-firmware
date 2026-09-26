@@ -657,7 +657,8 @@ esp_err_t ParseNoteRecordLine(const char* line, wqn::WqnNoteEntry* entry, bool i
 esp_err_t ScanNotePackFile(
     const wqn::WqnNotePackManifestNotebook& notebook,
     uint32_t notebook_order,
-    wqn::NotePackIndex* index)
+    wqn::NotePackIndex* index,
+    int64_t* parse_us)
 {
     if (index == nullptr) {
         return ESP_ERR_INVALID_ARG;
@@ -731,7 +732,11 @@ esp_err_t ScanNotePackFile(
             return result == ESP_OK ? ESP_ERR_INVALID_SIZE : result;
         }
         wqn::WqnNoteEntry entry;
+        const int64_t parse_started_us = esp_timer_get_time();
         result = ParseNoteRecordLine(line.c_str(), &entry, /*include_content=*/false);
+        if (parse_us != nullptr) {
+            *parse_us += esp_timer_get_time() - parse_started_us;
+        }
         if (result != ESP_OK) {
             std::fclose(file);
             return result;
@@ -984,6 +989,10 @@ esp_err_t LoadNotePackIndex(NotePackIndex* index)
     if (index == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
+    // [timing] The SHA verify and the JSONL scan each walk the whole pack and
+    // scale with its size, so the watchdog budget of a bigger pack has to be
+    // extrapolated from measured phases rather than guessed.
+    const int64_t index_started_us = esp_timer_get_time();
     // SHA verification and JSONL scanning are CPU-bound; scope max frequency to
     // this rebuild instead of disabling dynamic frequency scaling globally.
     auto cpu_lease = runtime::CpuPerformanceLease::TryAcquire();
@@ -1060,6 +1069,9 @@ esp_err_t LoadNotePackIndex(NotePackIndex* index)
     index->pack_identities.reserve(pack_notebooks);
     index->notebooks.reserve(manifest.notebooks.size());
 
+    int64_t sha_us_total = 0;
+    int64_t scan_us_total = 0;
+    int64_t parse_us_total = 0;
     for (const WqnNotePackManifestNotebook& item : manifest.notebooks) {
         const uint32_t notebook_order = static_cast<uint32_t>(index->notebooks.size());
         NotePackNotebook notebook;
@@ -1085,11 +1097,17 @@ esp_err_t LoadNotePackIndex(NotePackIndex* index)
             if (stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode)) {
                 index->pack_bytes += static_cast<size_t>(st.st_size);
             }
-            if (!VerifyFileSha256(path, item.sha256)) {
+            const int64_t sha_started_us = esp_timer_get_time();
+            const bool sha_ok = VerifyFileSha256(path, item.sha256);
+            sha_us_total += esp_timer_get_time() - sha_started_us;
+            if (!sha_ok) {
                 index->pack_error = true;
                 index->status_message = "笔记校验失败";
             } else {
-                const esp_err_t scan_result = ScanNotePackFile(item, notebook_order, index);
+                const int64_t scan_started_us = esp_timer_get_time();
+                const esp_err_t scan_result =
+                    ScanNotePackFile(item, notebook_order, index, &parse_us_total);
+                scan_us_total += esp_timer_get_time() - scan_started_us;
                 if (scan_result != ESP_OK) {
                     index->pack_error = true;
                     index->status_message = "笔记读取失败";
@@ -1124,12 +1142,16 @@ esp_err_t LoadNotePackIndex(NotePackIndex* index)
 
     ESP_LOGI(
         kTag,
-        "note pack index: notebooks=%u notes=%u pack_bytes=%u free_internal=%u free_psram=%u",
+        "note pack index: notebooks=%u notes=%u pack_bytes=%u free_internal=%u free_psram=%u total_ms=%lld sha_ms=%lld scan_ms=%lld parse_ms=%lld",
         static_cast<unsigned>(index->notebook_count),
         static_cast<unsigned>(index->entries.size()),
         static_cast<unsigned>(index->pack_bytes),
         static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
-        static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)));
+        static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)),
+        static_cast<long long>((esp_timer_get_time() - index_started_us) / 1000),
+        static_cast<long long>(sha_us_total / 1000),
+        static_cast<long long>(scan_us_total / 1000),
+        static_cast<long long>(parse_us_total / 1000));
     // [note-image-diag] Image ids only reach the viewer through pack lines, so
     // report how many indexed notes carry attachments; with_images=0 while the
     // web shows attachments means the device pack predates the attach (sync
