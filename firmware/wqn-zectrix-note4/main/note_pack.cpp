@@ -71,6 +71,46 @@ static_assert(
 // Maximum contract line, its optional LF, and the terminating NUL for fgets.
 constexpr size_t kLineBufferSize = kMaxLineBytes + 2;
 
+// [pack-io] The default stdio buffer is 128 B (newlib __BUFSIZ__) and SPIFFS
+// reports st_blksize = 0, so every fgets refill costs one VFS read: a 381 KB
+// pack measures ~2,978 reads. A 32 KiB PSRAM buffer cuts that to ~12 while
+// the SPIFFS per-page transfer cost stays the same. Lifetime invariant: the
+// buffer must outlive fclose -- newlib never frees a caller-supplied setvbuf
+// buffer (__SMBF is only set by __smakebuf_r), so any new path that returns
+// without fclose turns a FILE leak into a use-after-free of this PSRAM block.
+constexpr size_t kPackReadBufferBytes = 32 * 1024;
+
+class PackReadBuffer {
+public:
+    explicit PackReadBuffer(FILE* file)
+    {
+        if (file == nullptr) {
+            return;
+        }
+        data_ = static_cast<char*>(heap_caps_malloc(
+            kPackReadBufferBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        if (data_ == nullptr) {
+            return;  // Degrade to the default buffer; behaviour unchanged.
+        }
+        if (std::setvbuf(file, data_, _IOFBF, kPackReadBufferBytes) != 0) {
+            heap_caps_free(data_);
+            data_ = nullptr;
+        }
+    }
+    ~PackReadBuffer()
+    {
+        if (data_ != nullptr) {
+            heap_caps_free(data_);
+        }
+    }
+    PackReadBuffer(const PackReadBuffer&) = delete;
+    PackReadBuffer& operator=(const PackReadBuffer&) = delete;
+
+private:
+    char* data_ = nullptr;
+};
+
+
 class JsonDocument {
 public:
     explicit JsonDocument(const char* payload)
@@ -218,6 +258,7 @@ bool VerifyFileSha256(const std::string& path, const std::string& expected)
     if (file == nullptr) {
         return false;
     }
+    PackReadBuffer read_buffer(file);
     mbedtls_sha256_context ctx;
     mbedtls_sha256_init(&ctx);
     mbedtls_sha256_starts(&ctx, 0);
@@ -668,6 +709,7 @@ esp_err_t ScanNotePackFile(
     if (file == nullptr) {
         return ESP_ERR_NOT_FOUND;
     }
+    PackReadBuffer read_buffer(file);
     const size_t initial_entry_count = index->entries.size();
     struct EntryRollback {
         wqn::NotePackIndex* index;
