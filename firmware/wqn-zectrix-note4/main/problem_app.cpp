@@ -106,6 +106,22 @@ const char* ProblemStatusLabel(uint8_t status)
     return "";
 }
 
+// MCQ options render as markdown list items so long option text wraps with a
+// hanging indent ("- A. 选项文字"). The first line never gets a leading
+// newline so a choices-only part does not start with a blank row.
+void AppendChoiceLines(std::string* section, const wqn::WqnProblemPackPart& part)
+{
+    for (const wqn::WqnProblemPackChoice& choice : part.choices) {
+        if (!section->empty()) {
+            section->push_back('\n');
+        }
+        *section += "- ";
+        *section += choice.id;
+        *section += ". ";
+        *section += choice.text;
+    }
+}
+
 // 题面: the gaokao shell model splits the text across the shell's shared
 // stem (content_text, may be empty) and every part's own body. Rendering only
 // the shell stem dropped the actual questions -- single-part problems (whose
@@ -136,6 +152,7 @@ std::string ComposeBodyText(const wqn::WqnProblemEntry& entry)
         } else {
             section = part.content_text;
         }
+        AppendChoiceLines(&section, part);
         if (section.empty()) continue;
         if (!text.empty()) {
             text += "\n\n";
@@ -143,6 +160,40 @@ std::string ComposeBodyText(const wqn::WqnProblemEntry& entry)
         text += section;
     }
     return text;
+}
+
+// Echoes the correct option's text on the answer face: single choice inline
+// ("答案：B. 文字"), multi choice as one list line per selected id. Multi
+// choice matches ids by substring against the joined letters, so ids longer
+// than one character could collide -- the form's default ids are A-D.
+std::string CorrectChoiceSuffix(const wqn::WqnProblemPackPart& part)
+{
+    if (part.choices.empty() || part.answer_text.empty()) {
+        return {};
+    }
+    std::string suffix;
+    if (part.type == "single_choice") {
+        for (const wqn::WqnProblemPackChoice& choice : part.choices) {
+            if (choice.id == part.answer_text) {
+                suffix = ". ";
+                suffix += choice.text;
+                break;
+            }
+        }
+        return suffix;
+    }
+    if (part.type == "multi_choice") {
+        for (const wqn::WqnProblemPackChoice& choice : part.choices) {
+            if (!choice.id.empty() &&
+                part.answer_text.find(choice.id) != std::string::npos) {
+                suffix += "\n- ";
+                suffix += choice.id;
+                suffix += ". ";
+                suffix += choice.text;
+            }
+        }
+    }
+    return suffix;
 }
 
 // 答案面: 逐问 label · 分值 · 正确答案, one blank line between parts.
@@ -161,6 +212,7 @@ std::string ComposeAnswerText(const wqn::WqnProblemEntry& entry)
         text.push_back('\n');
         text += "答案：";
         text += part.answer_text.empty() ? "（见解析图）" : part.answer_text;
+        text += CorrectChoiceSuffix(part);
         text.push_back('\n');
         text.push_back('\n');
     }
@@ -1298,6 +1350,60 @@ bool RunProblemPageStateSelfTest()
     if (!require(f.commit_state == ProblemVerdictCommitState::kFailed,
                  "failed commit is terminal") ||
         !require(f.list_selected == 0, "failed commit does not advance")) {
+        return false;
+    }
+
+    // Choice rendering: MCQ options join the 题面 as "- A. 文字" list lines
+    // (a choices-only part still renders) and the answer face echoes the
+    // correct option's text -- inline for single choice, one list line per
+    // selected id for multi choice.
+    wqn::WqnProblemEntry single;
+    {
+        wqn::WqnProblemPackPart part;
+        part.index = 1;
+        part.type = "single_choice";
+        part.content_text = "题干";
+        part.answer_text = "B";
+        part.choices = {{"A", "甲选项"}, {"B", "乙选项"}};
+        single.parts.push_back(std::move(part));
+    }
+    if (!require(
+            ComposeBodyText(single) == "题干\n- A. 甲选项\n- B. 乙选项",
+            "choices render as a list under the part body") ||
+        !require(
+            ComposeAnswerText(single) == "第1问\n答案：B. 乙选项",
+            "single choice answer echoes the option text")) {
+        return false;
+    }
+    wqn::WqnProblemEntry multi;
+    {
+        wqn::WqnProblemPackPart part;
+        part.index = 1;
+        part.label = "多选";
+        part.type = "multi_choice";
+        part.content_text = "题干";
+        part.answer_text = "BD";
+        part.choices = {{"A", "甲选项"}, {"B", "乙选项"}, {"D", "丁选项"}};
+        multi.parts.push_back(std::move(part));
+    }
+    if (!require(
+            ComposeAnswerText(multi) ==
+                "第1问 · 多选\n答案：BD\n- B. 乙选项\n- D. 丁选项",
+            "multi choice answer lists the selected options")) {
+        return false;
+    }
+    wqn::WqnProblemEntry choices_only;
+    {
+        wqn::WqnProblemPackPart part;
+        part.index = 1;
+        part.type = "single_choice";
+        part.answer_text = "A";
+        part.choices = {{"A", "甲选项"}};
+        choices_only.parts.push_back(std::move(part));
+    }
+    if (!require(
+            ComposeBodyText(choices_only) == "- A. 甲选项",
+            "choices-only part still renders")) {
         return false;
     }
     return true;

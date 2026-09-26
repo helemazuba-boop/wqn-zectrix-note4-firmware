@@ -317,7 +317,13 @@ const char kProblemPackRowV1[] = R"json({
       "type": "single_choice",
       "full_marks": 6,
       "content_text": "该植物花色遗传遵循的规律是？",
-      "answer_text": "B"
+      "answer_text": "B",
+      "choices": [
+        { "id": "A", "text": "基因的分离定律" },
+        { "id": "B", "text": "基因的自由组合定律" },
+        { "id": "C", "text": "伴性遗传" },
+        { "id": "D", "text": "细胞质遗传" }
+      ]
     },
     {
       "index": 2,
@@ -342,9 +348,11 @@ const char kProblemPackRowV1[] = R"json({
   "image_ids": [
     "9e00e194c412bff778bfd1235b3b2b25a4f7f8b1d3ef1c72fca11d21b36d1e05"
   ],
+  "gray4_image_ids": [null],
   "solution_image_ids": [
     "1b1f4d9c22cf8d0b6cf6a52ad4a3f2e8809d15b9a7f96ff2f4bf1cf3a2b4c6d8"
-  ]
+  ],
+  "solution_gray4_image_ids": [null]
 })json";
 
 const char kV3ClaimStart[] = R"json({
@@ -1458,6 +1466,12 @@ bool CheckProblemStudyV1Contract()
         !Require(entry.parts[0].type == "single_choice", "pack row part type") ||
         !Require(entry.parts[0].full_marks == 6, "pack row part marks") ||
         !Require(entry.parts[0].answer_text == "B", "pack row flattened answer") ||
+        !Require(entry.parts[0].choices.size() == 4, "pack row part choices") ||
+        !Require(entry.parts[0].choices[1].id == "B", "pack row choice id") ||
+        !Require(
+            entry.parts[0].choices[1].text == "基因的自由组合定律",
+            "pack row choice text") ||
+        !Require(entry.parts[1].choices.empty(), "pack row choice-less part") ||
         !Require(entry.parts[2].answer_text.empty(), "pack row essay empty answer") ||
         !Require(entry.image_ids.size() == 1, "pack row image ids") ||
         !Require(entry.solution_image_ids.size() == 1, "pack row solution image ids") ||

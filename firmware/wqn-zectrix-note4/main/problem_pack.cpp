@@ -56,6 +56,11 @@ constexpr size_t kMaxPartTextBytes = 16384;
 constexpr size_t kMaxPartLabelBytes = 80;
 constexpr size_t kMaxPartTypeBytes = 32;
 constexpr size_t kMaxPartAnswerBytes = 4096;
+// Contract bounds on a part's optional MCQ options (packChoice: id <= 10
+// chars, text <= 500 chars), at 4 bytes per character.
+constexpr size_t kMaxPartChoices = 10;
+constexpr size_t kMaxChoiceIdBytes = 40;
+constexpr size_t kMaxChoiceTextBytes = 2048;
 constexpr size_t kPackIdStemChars = 6;
 constexpr size_t kPackHashStemChars = 12;
 // SPIFFS counts the leading slash in its object name and reserves one byte for
@@ -309,6 +314,43 @@ void CopyTitleUtf8Safe(char* dst, size_t dst_size, const std::string& src)
     }
     std::memcpy(dst, src.data(), n);
     dst[n] = '\0';
+}
+
+// Parses a part's optional `choices` array (contract packChoice). Absent or
+// null means "no options" and is valid; a present array must be 1..10
+// well-formed objects, otherwise the row is rejected like any other field.
+bool ParsePartChoices(cJSON* part_object, std::vector<wqn::WqnProblemPackChoice>* choices)
+{
+    if (choices == nullptr) {
+        return false;
+    }
+    choices->clear();
+    cJSON* items = cJSON_GetObjectItemCaseSensitive(part_object, "choices");
+    if (items == nullptr || cJSON_IsNull(items)) {
+        return true;
+    }
+    if (!cJSON_IsArray(items)) {
+        return false;
+    }
+    const int count = cJSON_GetArraySize(items);
+    if (count < 1 || static_cast<size_t>(count) > kMaxPartChoices) {
+        return false;
+    }
+    cJSON* item = nullptr;
+    cJSON_ArrayForEach(item, items) {
+        if (!cJSON_IsObject(item)) {
+            return false;
+        }
+        wqn::WqnProblemPackChoice choice;
+        choice.id = GetOptionalString(item, "id");
+        choice.text = GetOptionalString(item, "text");
+        if (choice.id.empty() || choice.id.size() > kMaxChoiceIdBytes ||
+            choice.text.size() > kMaxChoiceTextBytes) {
+            return false;
+        }
+        choices->push_back(std::move(choice));
+    }
+    return true;
 }
 
 bool IsImageIdArrayValid(cJSON* array, size_t* count)
@@ -1030,7 +1072,8 @@ esp_err_t ParseProblemRecordLine(const char* line, WqnProblemEntry* entry, bool 
             part.label.size() > kMaxPartLabelBytes ||
             part.type.empty() || part.type.size() > kMaxPartTypeBytes ||
             part.content_text.size() > kMaxPartTextBytes ||
-            part.answer_text.size() > kMaxPartAnswerBytes) {
+            part.answer_text.size() > kMaxPartAnswerBytes ||
+            !ParsePartChoices(part_object, &part.choices)) {
             return ESP_ERR_INVALID_RESPONSE;
         }
         part.index = static_cast<int>(part_index);

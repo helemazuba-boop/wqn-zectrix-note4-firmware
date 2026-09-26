@@ -14,6 +14,13 @@
 
 namespace wqn {
 
+// One MCQ option of a part; text is already flattened to display-ready
+// device text by the cloud (math stripped, whitespace collapsed).
+struct WqnProblemPackChoice {
+    std::string id;
+    std::string text;
+};
+
 // One typed sub-question of a problem shell, straight from the pack line.
 // answer_text is display-ready (choice letters already joined for MCQ); the
 // device never parses answer_config.
@@ -24,6 +31,8 @@ struct WqnProblemPackPart {
     int full_marks = 0;
     std::string content_text;
     std::string answer_text;
+    // MCQ options; empty for parts without choices.
+    std::vector<WqnProblemPackChoice> choices;
 };
 
 // A parsed problem record (one JSONL line of a problem pack). Bodies and
