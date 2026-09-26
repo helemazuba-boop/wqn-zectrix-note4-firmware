@@ -144,9 +144,15 @@ esp_err_t RenderWordToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
         constexpr int kCardW = kContentWidth;
         const std::string count_chip = std::to_string(word.total_count) + " 词";
         // [word-due-hint] The review card advertises today's due queue when the
-        // last sync reported one; the other two entries keep the pack size.
+        // last sync reported one; the shuffle card keeps the pack size.
         const std::string review_chip = word.review_due_count > 0
             ? std::to_string(word.review_due_count) + " 到期"
+            : count_chip;
+        // [word-mistake-hint] The mistakes card advertises the pool the last
+        // sync reported (0 is a real "empty pool"); -1 means no hint yet and
+        // falls back to the pack size like the review card.
+        const std::string mistake_chip = word.mistake_count >= 0
+            ? std::to_string(word.mistake_count) + " 词"
             : count_chip;
         auto draw_card = [&word, &count_chip](int y0, const WqnBitmapAsset& icon, const std::string& title, const std::string& subtitle,
                                                const std::string& chip, bool selected) -> esp_err_t {
@@ -201,7 +207,7 @@ esp_err_t RenderWordToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
                                    ? "可继续上次会话"
                                    : "复习答错的单词")
                             : "需同步词库",
-                      ready ? count_chip : "未同步",
+                      ready ? mistake_chip : "未同步",
                       word.home_selection == wqn::WordHomeSelection::kMistakes),
             kTag,
             "draw mistakes card");

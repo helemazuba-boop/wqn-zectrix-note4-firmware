@@ -51,7 +51,8 @@ const char kV3Sync[] = R"json({
     "summaries": {
       "due_problem_ids": ["33333333-3333-4333-8333-333333333333"],
       "todo_count": 2,
-      "word_due_count": 5
+      "word_due_count": 5,
+      "word_mistake_count": 4
     },
     "content_manifest": [
       { "kind": "problems", "revision": 12, "cursor": "problems:12" },
@@ -876,11 +877,36 @@ bool CheckV3ControlContract()
         !Require(sync.due_problem_ids.size() == 1, "v3 sync due count") ||
         !Require(sync.todo_count == 2, "v3 sync todo count") ||
         !Require(sync.word_due_count == 5, "v3 sync word count") ||
+        !Require(sync.word_mistake_count == 4, "v3 sync mistake count") ||
         !Require(sync.content_targets.size() == 6, "v3 sync content target count") ||
         !Require(sync.content_targets[1].revision == 0, "v3 sync accepts zero revision") ||
         !Require(sync.content_targets[2].cursor.empty(), "v3 sync accepts missing cursor") ||
         !Require(sync.content_targets[4].revision == 0, "v3 sync accepts empty note domain") ||
         !Require(sync.content_targets[5].revision == 0, "v3 sync accepts empty problem domain")) {
+        return false;
+    }
+
+    // Additive contract: a server that predates the mistakes hint omits the
+    // field entirely, and the parser must keep it "unknown" (-1) rather than
+    // reject the sync.
+    std::string missing_mistake_hint = kV3Sync;
+    const size_t mistake_hint_position =
+        missing_mistake_hint.find(",\n      \"word_mistake_count\": 4");
+    if (!Require(
+            mistake_hint_position != std::string::npos,
+            "v3 mistake hint fixture mutation")) {
+        return false;
+    }
+    missing_mistake_hint.erase(
+        mistake_hint_position, std::strlen(",\n      \"word_mistake_count\": 4"));
+    wqn::protocol::v3::SyncData additive_sync;
+    if (!Require(
+            wqn::protocol::v3::ParseSyncResponse(
+                missing_mistake_hint, "req_sync_000000001", &additive_sync, &error) == ESP_OK,
+            "v3 sync accepts a missing additive mistake hint") ||
+        !Require(
+            additive_sync.word_mistake_count == -1,
+            "v3 sync missing mistake hint stays unknown")) {
         return false;
     }
 

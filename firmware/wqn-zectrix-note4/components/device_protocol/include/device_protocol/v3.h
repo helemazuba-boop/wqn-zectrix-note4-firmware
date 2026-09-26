@@ -87,6 +87,10 @@ struct SyncData {
     uint32_t auto_sync_interval_minutes = 0;
     int todo_count = 0;
     int word_due_count = 0;
+    // Mistakes-mode pool size (words answered "unknown" that are not mastered
+    // yet). -1 means an older server omitted the field; the home card then
+    // falls back to the pack size instead of advertising an unknown pool.
+    int word_mistake_count = -1;
     std::vector<std::string> due_problem_ids;
     // Additive v3 content targets. Older servers may omit the field and
     // older firmware ignores unknown kinds, so control sync remains

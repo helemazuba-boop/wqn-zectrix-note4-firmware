@@ -2058,14 +2058,18 @@ esp_err_t SyncControlPlaneV3(const std::string& token)
     }
     ESP_LOGI(
         kTag,
-        "v3 sync summary: due=%u todos=%d words=%d cursor=%llu",
+        "v3 sync summary: due=%u todos=%d words=%d mistakes=%d cursor=%llu",
         static_cast<unsigned>(sync.due_problem_ids.size()),
         sync.todo_count,
         sync.word_due_count,
+        sync.word_mistake_count,
         static_cast<unsigned long long>(sync.sync_cursor));
     // Surface the due-word count on the review home card; it is only a hint
     // (the queue itself comes from the word-study session request).
     wqn::SetWordReviewDueCount(sync.word_due_count);
+    // Same hint pattern for the mistakes card; -1 (field absent) keeps the
+    // card on the pack size instead of advertising an unknown pool.
+    wqn::SetWordMistakeCount(sync.word_mistake_count);
     const wqn::DeviceControlState checkpoint = {
         sync.config_revision,
         sync.sync_cursor,

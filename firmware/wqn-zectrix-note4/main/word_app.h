@@ -222,6 +222,10 @@ struct WordAppSnapshot {
     // Last sync's due-word count, shown on the review home card. 0 means "not
     // known" and renders as the pack size instead.
     uint16_t review_due_count = 0;
+    // Last sync's mistakes-pool size, shown on the mistakes home card. -1
+    // means "not known" (no sync yet, or an older server) and renders as the
+    // pack size; 0 is a known-empty pool and renders as "0 词".
+    int16_t mistake_count = -1;
     size_t pack_count = 0;
     size_t pack_bytes = 0;
     std::string word;
@@ -238,6 +242,11 @@ struct WordAppSnapshot {
 // [word-due-hint] The control-plane sync knows how many words are due today;
 // the word home is where the user looks for it. Safe to call from any task.
 void SetWordReviewDueCount(int count);
+
+// [word-mistake-hint] Same contract for the mistakes card: the sync service
+// reports the pool size, the home card renders it. -1 clears the hint back to
+// "unknown". Safe to call from any task.
+void SetWordMistakeCount(int count);
 
 esp_err_t InitWordApp(WordAppState* state);
 esp_err_t HandleWordAppInput(WordAppState* state, WordInput input);

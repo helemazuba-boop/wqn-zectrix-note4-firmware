@@ -414,6 +414,16 @@ esp_err_t ParseSyncResponse(
         std::min<uint64_t>(auto_sync_interval_minutes, UINT32_MAX));
     data->todo_count = static_cast<int>(std::min<uint64_t>(todo_count, INT_MAX));
     data->word_due_count = static_cast<int>(std::min<uint64_t>(word_due_count, INT_MAX));
+    // Additive field: an older server omits it and the hint stays -1, so the
+    // home card keeps rendering the pack size.
+    if (cJSON_GetObjectItemCaseSensitive(summaries, "word_mistake_count") != nullptr) {
+        uint64_t word_mistake_count = 0;
+        if (!U64Field(summaries, "word_mistake_count", &word_mistake_count)) {
+            return ESP_ERR_INVALID_RESPONSE;
+        }
+        data->word_mistake_count =
+            static_cast<int>(std::min<uint64_t>(word_mistake_count, INT_MAX));
+    }
     const int count = cJSON_GetArraySize(due);
     data->due_problem_ids.reserve(count);
     for (int index = 0; index < count; ++index) {

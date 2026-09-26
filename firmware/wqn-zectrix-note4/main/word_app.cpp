@@ -22,6 +22,8 @@ constexpr char kTag[] = "wqn_word";
 constexpr size_t kWordHomeSelectionCount = 3;
 // Written by the sync service, read by the UI task when it builds a snapshot.
 std::atomic<int32_t> g_word_review_due_count{0};
+// Mistakes-pool hint written by the sync service; -1 = unknown (no sync yet).
+std::atomic<int32_t> g_word_mistake_count{-1};
 // [word-modes-v2] Local replay rules of the review entry: a word the user did
 // not recognize comes back after at least kWordReplayMinGap answered cards,
 // and at most kWordReplayMax times per session. The FSRS timeline stays
@@ -854,6 +856,12 @@ void SetWordReviewDueCount(int count)
 {
     g_word_review_due_count.store(
         count > 0 ? count : 0, std::memory_order_release);
+}
+
+void SetWordMistakeCount(int count)
+{
+    g_word_mistake_count.store(
+        count >= 0 ? count : -1, std::memory_order_release);
 }
 
 esp_err_t InitWordApp(WordAppState* state)
@@ -1787,6 +1795,10 @@ WordAppSnapshot BuildWordAppSnapshot(const WordAppState& state)
         g_word_review_due_count.load(std::memory_order_acquire);
     snapshot.review_due_count =
         ClampUint16(static_cast<size_t>(due_hint > 0 ? due_hint : 0));
+    const int32_t mistake_hint =
+        g_word_mistake_count.load(std::memory_order_acquire);
+    snapshot.mistake_count = static_cast<int16_t>(
+        mistake_hint > INT16_MAX ? INT16_MAX : mistake_hint);
     snapshot.sequential_cursor = state.chain.sequential_cursor;
     snapshot.sequential_total = ClampUint16(state.pack_index.entries.size());
     snapshot.pack_count = state.pack_index.pack_count;
@@ -1923,6 +1935,9 @@ std::string WordAppSignature(const WordAppState& state)
     signature.push_back('/');
     signature.append(std::to_string(
         g_word_review_due_count.load(std::memory_order_acquire)));
+    signature.push_back('/');
+    signature.append(std::to_string(
+        g_word_mistake_count.load(std::memory_order_acquire)));
     signature.push_back('/');
     signature.append(std::to_string(state.pack_index.entries.size()));
     signature.push_back('/');
