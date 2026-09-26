@@ -174,6 +174,12 @@ void StorageServiceTask(void*)
         completion->result = result;
         completion->state.store(kCompletionDone, std::memory_order_release);
         xSemaphoreGive(completion->semaphore);
+        // [watchdog] SPIFFS lookups are CPU-bound directory scans that never
+        // block, so a boot scan or pack-sync burst runs back-to-back
+        // transactions for longer than the 5 s IDLE0 window and task_wdt
+        // aborts the device (20260926.5 boot loop). Yield one tick per
+        // transaction so the idle task always gets a slot.
+        vTaskDelay(1);
     }
 }
 
