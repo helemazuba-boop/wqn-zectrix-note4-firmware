@@ -49,6 +49,7 @@ constexpr char kAiAutoFollowKey[] = "ai_follow";
 // or out-of-range key reads as the full tier (see LoadAgentDetailLevel).
 constexpr char kAgentDetailLevelKey[] = "agent_detail";
 constexpr char kDefaultWordDeckKey[] = "word_deck";
+constexpr char kWordSequentialCursorKey[] = "word_seq_idx";
 constexpr char kWifiSsidKey[] = "wifi_ssid";
 constexpr char kWifiPasswordKey[] = "wifi_pass";
 // [wifi-redundancy] Versioned dual-slot credential blob (replaces the per-key
@@ -1456,6 +1457,34 @@ esp_err_t LoadDefaultWordDeckId(std::string* deck_id)
     return result;
 }
 
+esp_err_t LoadWordSequentialCursor(uint32_t* cursor)
+{
+    if (cursor == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *cursor = 0;
+    uint64_t stored = 0;
+    bool found = false;
+    // A missing key is an unset cursor (start of the library), not an error.
+    ESP_RETURN_ON_ERROR(
+        LoadU64FromNvs(kWordSequentialCursorKey, &stored, &found),
+        kTag,
+        "load word sequential cursor");
+    if (found && stored <= UINT32_MAX) {
+        *cursor = static_cast<uint32_t>(stored);
+    }
+    return ESP_OK;
+}
+
+esp_err_t SaveWordSequentialCursor(uint32_t cursor)
+{
+    StorageWriteGuard write("save-word-cursor", __FILE__, __LINE__);
+    if (!write) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    return SaveU64ToNvs(kWordSequentialCursorKey, cursor);
+}
+
 esp_err_t SaveDefaultWordDeckId(const std::string& deck_id)
 {
     StorageWriteGuard write("save-word-deck", __FILE__, __LINE__);
@@ -1490,12 +1519,21 @@ std::atomic<uint32_t> g_deck_scope_generation{0};
 // ClearPersistedWordSession calls rely on the service-task passthrough).
 esp_err_t ApplyDeckScopeChangeLocked(uint32_t target_generation, const std::string& deck_id)
 {
+    // [word-modes-v2] Every resumable word session mode must be dropped here:
+    // a session pinned to the old deck scope can never be resumed, and leaving
+    // the file behind only confuses boot recovery.
     ESP_RETURN_ON_ERROR(
         ClearPersistedWordSession(protocol::word_study_v1::Mode::kSequential),
         kTag, "deck change: clear sequential session");
     ESP_RETURN_ON_ERROR(
-        ClearPersistedWordSession(protocol::word_study_v1::Mode::kRandom),
-        kTag, "deck change: clear random session");
+        ClearPersistedWordSession(protocol::word_study_v1::Mode::kReview),
+        kTag, "deck change: clear review session");
+    ESP_RETURN_ON_ERROR(
+        ClearPersistedWordSession(protocol::word_study_v1::Mode::kShuffle),
+        kTag, "deck change: clear shuffle session");
+    ESP_RETURN_ON_ERROR(
+        ClearPersistedWordSession(protocol::word_study_v1::Mode::kMistakes),
+        kTag, "deck change: clear mistakes session");
     if (deck_id.empty()) {
         ESP_RETURN_ON_ERROR(ClearNvsKeyRaw(kDefaultWordDeckKey), kTag,
                             "deck change: clear deck key");

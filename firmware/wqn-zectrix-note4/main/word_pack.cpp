@@ -41,8 +41,9 @@ constexpr size_t kPackIdStemChars = 6;
 constexpr size_t kPackHashStemChars = 12;
 constexpr wqn::protocol::word_study_v1::Mode kPersistedSessionModes[] = {
     wqn::protocol::word_study_v1::Mode::kSequential,
-    wqn::protocol::word_study_v1::Mode::kRandom,
-    wqn::protocol::word_study_v1::Mode::kDictionary,
+    wqn::protocol::word_study_v1::Mode::kReview,
+    wqn::protocol::word_study_v1::Mode::kShuffle,
+    wqn::protocol::word_study_v1::Mode::kMistakes,
 };
 // SPIFFS counts the leading slash in its object name and reserves one byte for
 // NUL. Keep the longest final suffix (.wqwp) strictly within that budget.
@@ -125,8 +126,6 @@ void ReleaseWordPackIndexAllocations(wqn::WordPackIndex* index)
         wqn::WordPackIndexEntry,
         wqn::PsramAllocator<wqn::WordPackIndexEntry>> empty_entries;
     index->entries.swap(empty_entries);
-    std::vector<uint32_t, wqn::PsramAllocator<uint32_t>> empty_dictionary;
-    index->dictionary_order.swap(empty_dictionary);
     std::vector<
         wqn::WordPackIdentity,
         wqn::PsramAllocator<wqn::WordPackIdentity>> empty_identities;
@@ -594,7 +593,6 @@ esp_err_t ScanPackFile(
         CopyField(indexed.word_id, sizeof(indexed.word_id), entry.id);
         CopyField(indexed.deck_id, sizeof(indexed.deck_id), item.deck_id);
         CopyField(indexed.word, sizeof(indexed.word), entry.word);
-        CopyField(indexed.normalized_word, sizeof(indexed.normalized_word), entry.normalized_word);
         CopyField(indexed.pack_stem, sizeof(indexed.pack_stem), pack_stem);
         indexed.file_offset = static_cast<uint32_t>(offset);
         indexed.deck_order = deck_order;
@@ -902,7 +900,7 @@ esp_err_t LoadWordPackIndexInternal(
     if (index == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
-    // SHA verification, JSONL scanning and dictionary sorting are CPU-bound.
+    // SHA verification and JSONL scanning are CPU-bound.
     // Keep maximum frequency scoped to this rebuild instead of disabling DFS.
     auto cpu_lease = runtime::CpuPerformanceLease::TryAcquire();
     *index = WordPackIndex{};
@@ -990,9 +988,7 @@ esp_err_t LoadWordPackIndexInternal(
     }
     const size_t entry_index_bytes =
         expected_entries * sizeof(WordPackIndexEntry);
-    const size_t dictionary_index_bytes =
-        expected_entries * sizeof(uint32_t);
-    const size_t required_psram = entry_index_bytes + dictionary_index_bytes;
+    const size_t required_psram = entry_index_bytes;
     constexpr size_t kIndexAllocationReserveBytes = 64U * 1024U;
     const size_t free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
     const size_t largest_psram =
@@ -1004,43 +1000,18 @@ esp_err_t LoadWordPackIndexInternal(
         index->status_message = "词库索引内存不足";
         ESP_LOGW(
             kTag,
-            "word pack index PSRAM preflight failed: need=%u entries=%u dictionary=%u free=%u largest=%u reserve=%u",
+            "word pack index PSRAM preflight failed: need=%u entries=%u free=%u largest=%u reserve=%u",
             static_cast<unsigned>(required_psram),
             static_cast<unsigned>(entry_index_bytes),
-            static_cast<unsigned>(dictionary_index_bytes),
             static_cast<unsigned>(free_psram),
             static_cast<unsigned>(largest_psram),
             static_cast<unsigned>(kIndexAllocationReserveBytes));
         ReleaseWordPackIndexAllocations(index);
         return ESP_OK;
     }
+    // WordStorePsramAllocator deliberately aborts on allocation failure, so
+    // this guard must run immediately before reserve().
     index->entries.reserve(expected_entries);
-
-    // The entries allocation can split the largest free block. Re-check the
-    // exact second allocation instead of assuming that the remaining total is
-    // contiguous. WordStorePsramAllocator deliberately aborts on allocation
-    // failure, so this guard must run immediately before reserve().
-    const size_t remaining_psram =
-        heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
-    const size_t remaining_largest_psram =
-        heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
-    if (dictionary_index_bytes > remaining_largest_psram ||
-        dictionary_index_bytes > remaining_psram ||
-        remaining_psram - dictionary_index_bytes <
-            kIndexAllocationReserveBytes) {
-        index->pack_error = true;
-        index->status_message = "词库索引内存不足";
-        ESP_LOGW(
-            kTag,
-            "word pack dictionary PSRAM preflight failed: need=%u free=%u largest=%u reserve=%u",
-            static_cast<unsigned>(dictionary_index_bytes),
-            static_cast<unsigned>(remaining_psram),
-            static_cast<unsigned>(remaining_largest_psram),
-            static_cast<unsigned>(kIndexAllocationReserveBytes));
-        ReleaseWordPackIndexAllocations(index);
-        return ESP_OK;
-    }
-    index->dictionary_order.reserve(expected_entries);
 
     for (const WqnWordPackManifestItem& item : manifest.packs) {
         const std::string path = PackPathForItem(item);
@@ -1064,21 +1035,7 @@ esp_err_t LoadWordPackIndexInternal(
         }
     }
 
-    // Preserve entries in stable deck/import order for sequential study. The
-    // dictionary gets its own compact indirection array so lookup never
-    // rewrites the study order.
-    for (size_t entry_index = 0; entry_index < index->entries.size(); ++entry_index) {
-        index->dictionary_order.push_back(static_cast<uint32_t>(entry_index));
-    }
-    std::sort(
-        index->dictionary_order.begin(),
-        index->dictionary_order.end(),
-        [&](uint32_t left, uint32_t right) {
-            const WordPackIndexEntry& a = index->entries[left];
-            const WordPackIndexEntry& b = index->entries[right];
-            const int word_compare = std::strcmp(a.normalized_word, b.normalized_word);
-            return word_compare != 0 ? word_compare < 0 : std::strcmp(a.word_id, b.word_id) < 0;
-        });
+    // Entries stay in stable deck/import order for sequential study.
 
     if (index->entries.empty() && index->status_message.empty()) {
         index->status_message = "词库为空";
@@ -1380,87 +1337,6 @@ esp_err_t ReadWordPackEntry(const WordPackIndexEntry& index_entry, WqnWordEntry*
         static_cast<long long>((finished_us - read_us) / 1000),
         static_cast<long long>((finished_us - started_us) / 1000));
     return ESP_OK;
-}
-
-void FindWordPackPrefixMatches(const WordPackIndex& index, const std::string& prefix, size_t limit, std::vector<size_t>* matches)
-{
-    if (matches == nullptr) {
-        return;
-    }
-    matches->clear();
-    const std::string normalized = NormalizeWordLookupText(prefix);
-    for (const uint32_t entry_index : index.dictionary_order) {
-        if (entry_index >= index.entries.size()) {
-            continue;
-        }
-        const WordPackIndexEntry& entry = index.entries[entry_index];
-        if (!normalized.empty()) {
-            const int cmp = std::strncmp(
-                entry.normalized_word,
-                normalized.c_str(),
-                normalized.size());
-            if (cmp < 0) {
-                continue;
-            }
-            if (cmp > 0) {
-                break;
-            }
-        }
-        matches->push_back(static_cast<size_t>(entry_index));
-        if (matches->size() >= limit) {
-            break;
-        }
-    }
-}
-
-std::vector<char> WordPackNextLetters(const WordPackIndex& index, const std::string& prefix)
-{
-    const std::string normalized = NormalizeWordLookupText(prefix);
-    std::vector<char> letters;
-    for (const uint32_t entry_index : index.dictionary_order) {
-        if (entry_index >= index.entries.size()) {
-            continue;
-        }
-        const WordPackIndexEntry& entry = index.entries[entry_index];
-        const size_t nw_len = std::strlen(entry.normalized_word);
-        if (nw_len <= normalized.size()) {
-            // Entry is shorter than prefix; if sorted, skip (don't break
-            // - a shorter entry could still be "before" the prefix).
-            continue;
-        }
-        if (!normalized.empty()) {
-            const int cmp = std::strncmp(entry.normalized_word, normalized.c_str(), normalized.size());
-            if (cmp < 0) {
-                continue;  // before prefix range
-            }
-            if (cmp > 0) {
-                break;  // past prefix range, done
-            }
-        }
-        const char next = entry.normalized_word[normalized.size()];
-        if (next < 'a' || next > 'z') {
-            continue;
-        }
-        if (std::find(letters.begin(), letters.end(), next) == letters.end()) {
-            letters.push_back(next);
-        }
-    }
-    std::sort(letters.begin(), letters.end());
-    return letters;
-}
-
-std::string NormalizeWordLookupText(const std::string& value)
-{
-    std::string normalized;
-    normalized.reserve(value.size());
-    for (const unsigned char ch : value) {
-        if (ch >= 'A' && ch <= 'Z') {
-            normalized.push_back(static_cast<char>(ch - 'A' + 'a'));
-        } else if ((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '-' || ch == '\'') {
-            normalized.push_back(static_cast<char>(ch));
-        }
-    }
-    return normalized;
 }
 
 }  // namespace wqn

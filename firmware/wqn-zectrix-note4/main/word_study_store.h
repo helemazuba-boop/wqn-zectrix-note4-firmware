@@ -92,6 +92,9 @@ struct PersistedWordSession {
     bool active = false;
     bool paused = false;
     uint32_t position = 0;
+    // [word-sequential-chain] Library index this session was created at, so a
+    // resumed walk can still report "#N / total". Zero for every other mode.
+    uint32_t start_index = 0;
     WordPresentationPhase phase = WordPresentationPhase::kFront;
     // [deck-scope] Generation of the default-deck scope this session was built
     // under. Stamped automatically on save (from GetDeckScopeGeneration) and
@@ -136,9 +139,9 @@ struct WordOutboxSnapshot {
 
 inline constexpr size_t kWordObservationOutboxCapacity = 1000;
 
-// Sequential, random, and dictionary sessions have independent durable
-// slots. This is part of the product contract: changing entry mode must not
-// destroy the user's paused session in another mode.
+// Every resumable word mode (sequential, review, shuffle, mistakes) has its own
+// durable slot. This is part of the product contract: changing entry mode must
+// not destroy the user's paused session in another mode.
 esp_err_t LoadPersistedWordSession(
     protocol::word_study_v1::Mode mode,
     PersistedWordSession* session);

@@ -1606,18 +1606,10 @@ RefreshSchedule ApplyButtonEvent(
         if (wqn::TakeWordSessionStartRequest(&state->word_app, &session_request) &&
             !QueueWordSessionStart(session_request)) {
             wqn::CancelWordSessionStartResult(&state->word_app);
-            if (session_request.mode ==
-                wqn::protocol::word_study_v1::Mode::kDictionary) {
-                state->word_app.session.requested_mode =
-                    wqn::protocol::word_study_v1::Mode::kDictionary;
-                state->word_app.session.start_requested = true;
-                state->word_app.message = "词典可浏览，记录稍后准备";
-            } else {
-                state->word_app.mode = wqn::WordAppMode::kHome;
-                state->word_app.message = IsWordCloudBusy()
-                    ? "单词服务忙，请重试"
-                    : "本轮准备失败，请重试";
-            }
+            state->word_app.mode = wqn::WordAppMode::kHome;
+            state->word_app.message = IsWordCloudBusy()
+                ? "单词服务忙，请重试"
+                : "本轮准备失败，请重试";
         }
         // [persist-worker] The word observation commit (durable outbox append +
         // session-cursor snapshot) no longer runs synchronously here -- it used
@@ -1625,22 +1617,6 @@ RefreshSchedule ApplyButtonEvent(
         // now hands it to the persist worker; the card stays in kPersisting
         // ("正在保存") until the worker's result is applied (advance card / retry)
         // on the UI task via DispatchWordObservationPersistResult.
-        wqn::WqnWordSearchRequest search_request;
-        if (wqn::TakeWordSearchRequest(&state->word_app, &search_request)) {
-            if (!QueueWordSearch(search_request)) {
-                state->word_app.search_pending = true;
-                state->word_app.pending_search_query = search_request.query.empty() ? search_request.prefix : search_request.query;
-                state->word_app.message = IsWordCloudBusy() ? "单词同步中" : "在线搜索失败";
-            }
-        }
-        wqn::WqnWordAiLookupRequest lookup_request;
-        if (wqn::TakeWordAiLookupRequest(&state->word_app, &lookup_request)) {
-            if (!QueueWordAiLookup(lookup_request)) {
-                state->word_app.ai_lookup_pending = true;
-                state->word_app.pending_ai_query = lookup_request.query.empty() ? lookup_request.prefix : lookup_request.query;
-                state->word_app.message = IsWordCloudBusy() ? "单词同步中" : "AI 查词失败";
-            }
-        }
         BuildHomeSummary(state);
         return RefreshSchedule::kSelection;
     }

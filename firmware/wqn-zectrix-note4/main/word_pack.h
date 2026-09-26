@@ -56,13 +56,11 @@ bool operator!=(const PsramAllocator<A>&, const PsramAllocator<B>&) noexcept {
 // a std::basic_string with a custom PSRAM allocator corrupted the heap during
 // vector growth/move (SSO interactions), crashing in tlsf_walk_pool. A trivially
 // copyable POD is memcpy/realloc-safe in the PSRAM vector. W3 retains stable
-// item/deck IDs and import ordering so sessions can pin exact content while a
-// separate compact dictionary index provides lexicographic lookup.
+// item/deck IDs and import ordering so sessions can pin exact content.
 struct WordPackIndexEntry {
     char word_id[37];
     char deck_id[37];
     char word[81];
-    char normalized_word[81];
     char pack_stem[28];
     uint32_t file_offset;
     uint32_t deck_order;
@@ -86,7 +84,6 @@ struct WordPackIndex {
     size_t pack_bytes = 0;
     uint64_t manifest_revision = 0;
     std::vector<WordPackIndexEntry, PsramAllocator<WordPackIndexEntry>> entries;
-    std::vector<uint32_t, PsramAllocator<uint32_t>> dictionary_order;
     std::vector<WordPackIdentity, PsramAllocator<WordPackIdentity>> pack_identities;
 };
 
@@ -110,8 +107,5 @@ esp_err_t DownloadWordPackToStorage(
     const WqnWordPackManifestItem& item);
 bool WordPackNeedsDownload(const WqnWordPackManifestItem& item);
 esp_err_t ReadWordPackEntry(const WordPackIndexEntry& index_entry, WqnWordEntry* entry);
-void FindWordPackPrefixMatches(const WordPackIndex& index, const std::string& prefix, size_t limit, std::vector<size_t>* matches);
-std::vector<char> WordPackNextLetters(const WordPackIndex& index, const std::string& prefix);
-std::string NormalizeWordLookupText(const std::string& value);
 
 }  // namespace wqn

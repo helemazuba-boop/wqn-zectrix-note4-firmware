@@ -164,8 +164,6 @@ enum class WordCloudOp {
     kPackSync,
     kStartSession,
     kFetchSessionPage,
-    kSearch,
-    kAiLookup,
 };
 
 struct WordCloudRequest {
@@ -175,12 +173,19 @@ struct WordCloudRequest {
     char cursor[65] = {};
     uint16_t limit = 0;
     uint8_t study_mode = 0;
+    // [word-modes-v2] kStartSession only: the sequential walk's continuation
+    // point and the intake head's daily new-word budget. The runner rebuilds
+    // the protocol request from this struct, so both must travel here.
+    // -1 = unset: only the sequential builder branch serializes start_index,
+    // and a uint32_t here turned the sentinel into a literal 0 the server
+    // rejected (WORD_START_INDEX_UNSUPPORTED).
+    int32_t start_index = -1;
+    uint16_t new_word_limit = 0;
     // [deck-scope] kStartSession only: the deck the UI scoped the session to.
     // Empty means "every visible deck", which is what the cloud falls back to
     // -- but without carrying the id the device's deck choice silently never
     // reached the server at all. Mirrors NoteCloudRequest::notebook_id.
     char deck_id[37] = {};
-    char query[96] = {};
     // [deck-scope] Scope epoch sampled when the request was QUEUED (session
     // ops only). The runner stamps it into the persisted session (the store
     // rejects a save whose epoch is stale) and echoes it in the result so the
@@ -200,9 +205,6 @@ struct WordCloudResult {
     wqn::protocol::word_study_v1::SessionData session;
     wqn::protocol::word_study_v1::CandidatePageData candidate_page;
     wqn::protocol::v3::Error protocol_error;
-    wqn::WqnWordSearchResult search;
-    wqn::WqnWordAiLookupResult lookup;
-    std::string query;
     std::string message;
     // kStartSession: the compacted session snapshot, already persisted on the
     // runner thread so the 36 KB fsync never runs on the UI task. The apply
@@ -443,8 +445,6 @@ bool QueueWordCandidatePage(
     const std::string& session_id,
     const wqn::protocol::word_study_v1::CandidatePageRequest& request);
 void PumpWordCandidatePrefetch(UiRuntime* runtime);
-bool QueueWordSearch(const wqn::WqnWordSearchRequest& search);
-bool QueueWordAiLookup(const wqn::WqnWordAiLookupRequest& lookup);
 // Rebuilds the note screen's [词] rows from word_app.deck_catalog, excluding
 // the current default deck (it lives on the word page itself).
 void RebuildNoteWordDeckRows(wqn::UiState* state);

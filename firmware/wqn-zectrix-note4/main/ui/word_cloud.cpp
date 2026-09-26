@@ -1,4 +1,4 @@
-// Word review cloud task: pack sync, review submit, online search, AI lookup.
+// Word review cloud task: pack sync, session start/paging, review submit.
 // Extracted from device_ui.cpp.
 
 #include "ui_internal.h"
@@ -164,6 +164,12 @@ bool QueueWordSessionStart(
         "%s",
         session.metadata.request_id.c_str());
     request.study_mode = static_cast<uint8_t>(session.mode);
+    // Carry the -1 "unset" sentinel untouched; collapsing it to 0 here
+    // made every non-sequential start send a literal start_index.
+    request.start_index = session.start_index;
+    request.new_word_limit = session.new_word_limit > 0
+        ? static_cast<uint16_t>(session.new_word_limit)
+        : 0;
     // [deck-scope] Carry the UI's deck choice across the queue boundary. The
     // runner rebuilds the request from this struct, so anything left here is
     // what actually reaches the server. Only a full 36-char UUID is meaningful.
@@ -222,30 +228,6 @@ void PumpWordCandidatePrefetch(UiRuntime* runtime)
     if (!QueueWordCandidatePage(session_id, request)) {
         runtime->RestoreWordCandidatePageRequest();
     }
-}
-
-bool QueueWordSearch(const wqn::WqnWordSearchRequest& search)
-{
-    if (search.query.empty() && search.prefix.empty()) {
-        return false;
-    }
-    WordCloudRequest request;
-    request.op = WordCloudOp::kSearch;
-    const std::string query = !search.query.empty() ? search.query : search.prefix;
-    std::snprintf(request.query, sizeof(request.query), "%s", query.c_str());
-    return QueueWordCloudRequest(request);
-}
-
-bool QueueWordAiLookup(const wqn::WqnWordAiLookupRequest& lookup)
-{
-    if (lookup.query.empty() && lookup.prefix.empty()) {
-        return false;
-    }
-    WordCloudRequest request;
-    request.op = WordCloudOp::kAiLookup;
-    const std::string query = !lookup.query.empty() ? lookup.query : lookup.prefix;
-    std::snprintf(request.query, sizeof(request.query), "%s", query.c_str());
-    return QueueWordCloudRequest(request);
 }
 
 WordCloudResult* PeekWordCloudResult(CloudDomain domain, uint32_t generation)
@@ -398,38 +380,6 @@ bool ApplyWordCloudResult(wqn::UiState* state, WordCloudResult& result)
         BuildHomeSummary(state);
         return true;
     }
-    if (result.op == WordCloudOp::kSearch) {
-        if (state->screen != wqn::UiScreen::kWord) {
-            wqn::CancelWordLookupResult(&state->word_app);
-            return false;
-        }
-        const bool applied = result.result == ESP_OK
-            ? wqn::ApplyWordSearchResult(
-                  &state->word_app, result.query, result.search)
-            : wqn::ApplyWordLookupFailure(
-                  &state->word_app,
-                  result.query,
-                  result.auth_required ? "请重新配对" : "在线搜索失败");
-        if (!applied) return false;
-        BuildHomeSummary(state);
-        return true;
-    }
-    if (result.op == WordCloudOp::kAiLookup) {
-        if (state->screen != wqn::UiScreen::kWord) {
-            wqn::CancelWordLookupResult(&state->word_app);
-            return false;
-        }
-        const bool applied = result.result == ESP_OK
-            ? wqn::ApplyWordAiLookupResult(
-                  &state->word_app, result.query, result.lookup)
-            : wqn::ApplyWordLookupFailure(
-                  &state->word_app,
-                  result.query,
-                  result.auth_required ? "请重新配对" : "AI 查词失败");
-        if (!applied) return false;
-        BuildHomeSummary(state);
-        return true;
-    }
     return false;
 }
 
@@ -456,7 +406,6 @@ void ExecuteWordCloudRequest(const WordCloudRequest& request)
     }
     WordCloudResult& result = result_slot;
     result.op = request.op;
-    result.query = request.query;
     result.scope_generation = request.scope_generation;
     result.message.clear();
 
@@ -590,6 +539,8 @@ void ExecuteWordCloudRequest(const WordCloudRequest& request)
         session.metadata.request_id = request.request_id;
         session.mode = static_cast<wqn::protocol::word_study_v1::Mode>(
             request.study_mode);
+        session.start_index = request.start_index;
+        session.new_word_limit = static_cast<int>(request.new_word_limit);
         // [deck-scope] The runner rebuilds the request, so the queued deck id
         // has to be re-attached here or the server sees an empty scope and
         // silently substitutes the first 32 visible decks.
@@ -608,6 +559,10 @@ void ExecuteWordCloudRequest(const WordCloudRequest& request)
             result.persisted_session.active = !result.session.items.empty();
             result.persisted_session.paused = false;
             result.persisted_session.position = 0;
+            // Stored as uint32_t; keep the -1 sentinel out of it.
+            result.persisted_session.start_index = request.start_index > 0
+                ? static_cast<uint32_t>(request.start_index)
+                : 0;
             result.persisted_session.phase = wqn::WordPresentationPhase::kFront;
             // [deck-scope] Pin the session to the epoch it was REQUESTED under;
             // the store rejects the save below if a deck switch landed since.
@@ -633,15 +588,6 @@ void ExecuteWordCloudRequest(const WordCloudRequest& request)
             page,
             &result.candidate_page,
             &result.protocol_error);
-    } else if (request.op == WordCloudOp::kSearch) {
-        wqn::WqnWordSearchRequest search;
-        search.query = request.query;
-        search.limit = 8;
-        result.result = wqn::SearchWords(token, search, &result.search);
-    } else if (request.op == WordCloudOp::kAiLookup) {
-        wqn::WqnWordAiLookupRequest lookup;
-        lookup.query = request.query;
-        result.result = wqn::LookupWordWithAi(token, lookup, &result.lookup);
     } else {
         result.result = ESP_ERR_INVALID_ARG;
     }

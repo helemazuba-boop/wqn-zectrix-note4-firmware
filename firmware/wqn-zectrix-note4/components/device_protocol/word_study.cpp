@@ -115,6 +115,10 @@ bool ParseMode(const std::string& value, Mode* mode)
     if (value == "sequential") *mode = Mode::kSequential;
     else if (value == "random") *mode = Mode::kRandom;
     else if (value == "dictionary") *mode = Mode::kDictionary;
+    else if (value == "review") *mode = Mode::kReview;
+    else if (value == "intake") *mode = Mode::kIntake;
+    else if (value == "shuffle") *mode = Mode::kShuffle;
+    else if (value == "mistakes") *mode = Mode::kMistakes;
     else return false;
     return true;
 }
@@ -134,6 +138,10 @@ bool ParseOrdering(const std::string& value, Ordering* ordering)
     if (value == "sequential") *ordering = Ordering::kSequential;
     else if (value == "guided_random_v1") *ordering = Ordering::kGuidedRandomV1;
     else if (value == "lexicographic") *ordering = Ordering::kLexicographic;
+    else if (value == "due_queue_v1") *ordering = Ordering::kDueQueueV1;
+    else if (value == "new_intake_v1") *ordering = Ordering::kNewIntakeV1;
+    else if (value == "pure_random_v1") *ordering = Ordering::kPureRandomV1;
+    else if (value == "mistake_words_v1") *ordering = Ordering::kMistakeWordsV1;
     else return false;
     return true;
 }
@@ -169,7 +177,15 @@ bool SemanticsMatch(Mode mode, Purpose purpose, Ordering ordering)
         (mode == Mode::kRandom && purpose == Purpose::kStudy &&
          ordering == Ordering::kGuidedRandomV1) ||
         (mode == Mode::kDictionary && purpose == Purpose::kLookup &&
-         ordering == Ordering::kLexicographic);
+         ordering == Ordering::kLexicographic) ||
+        (mode == Mode::kReview && purpose == Purpose::kStudy &&
+         ordering == Ordering::kDueQueueV1) ||
+        (mode == Mode::kIntake && purpose == Purpose::kStudy &&
+         ordering == Ordering::kNewIntakeV1) ||
+        (mode == Mode::kShuffle && purpose == Purpose::kStudy &&
+         ordering == Ordering::kPureRandomV1) ||
+        (mode == Mode::kMistakes && purpose == Purpose::kStudy &&
+         ordering == Ordering::kMistakeWordsV1);
 }
 
 esp_err_t Render(cJSON* root, std::string* body)
@@ -283,6 +299,29 @@ int CandidateBucket(const Candidate& candidate, int64_t now_ms)
     return candidate.status == CandidateStatus::kLearning ? 0 : 1;
 }
 
+// The review queue is a plain list: relearning/learning words first, then due
+// review words by due_at. Selection (what is due today) happens server-side.
+int DueQueueBucket(const Candidate& candidate)
+{
+    switch (candidate.status) {
+        case CandidateStatus::kLearning: return 0;
+        case CandidateStatus::kReview: return 1;
+        case CandidateStatus::kNew: return 2;
+        case CandidateStatus::kMastered: return 3;
+    }
+    return 3;
+}
+
+bool DeckOrderLess(const Candidate& a, const Candidate& b)
+{
+    if (a.deck_order != b.deck_order) return a.deck_order < b.deck_order;
+    if (a.sort_index != b.sort_index) return a.sort_index < b.sort_index;
+    if (a.normalized_word != b.normalized_word) {
+        return a.normalized_word < b.normalized_word;
+    }
+    return a.item_id < b.item_id;
+}
+
 }  // namespace
 
 namespace wqn::protocol::word_study_v1 {
@@ -293,6 +332,10 @@ const char* ModeName(Mode mode)
         case Mode::kSequential: return "sequential";
         case Mode::kRandom: return "random";
         case Mode::kDictionary: return "dictionary";
+        case Mode::kReview: return "review";
+        case Mode::kIntake: return "intake";
+        case Mode::kShuffle: return "shuffle";
+        case Mode::kMistakes: return "mistakes";
     }
     return "";
 }
@@ -303,6 +346,10 @@ const char* CandidatePolicyVersionName(Ordering ordering)
         case Ordering::kSequential: return "sequential_v1";
         case Ordering::kGuidedRandomV1: return "guided_random_v1";
         case Ordering::kLexicographic: return "lexicographic_v1";
+        case Ordering::kDueQueueV1: return "due_queue_v1";
+        case Ordering::kNewIntakeV1: return "new_intake_v1";
+        case Ordering::kPureRandomV1: return "pure_random_v1";
+        case Ordering::kMistakeWordsV1: return "mistake_words_v1";
     }
     return "";
 }
@@ -354,18 +401,30 @@ void OrderCandidates(
             if (a_hash != b_hash) return a_hash < b_hash;
             return a.item_id < b.item_id;
         }
+        if (ordering == Ordering::kPureRandomV1 ||
+            ordering == Ordering::kMistakeWordsV1) {
+            const uint64_t a_hash = GuidedRandomHash(seed, a.item_id);
+            const uint64_t b_hash = GuidedRandomHash(seed, b.item_id);
+            if (a_hash != b_hash) return a_hash < b_hash;
+            return a.item_id < b.item_id;
+        }
+        if (ordering == Ordering::kDueQueueV1) {
+            const int a_bucket = DueQueueBucket(a);
+            const int b_bucket = DueQueueBucket(b);
+            if (a_bucket != b_bucket) return a_bucket < b_bucket;
+            const int64_t a_due = a.due_at_ms >= 0 ? a.due_at_ms : INT64_MAX;
+            const int64_t b_due = b.due_at_ms >= 0 ? b.due_at_ms : INT64_MAX;
+            if (a_due != b_due) return a_due < b_due;
+            return DeckOrderLess(a, b);
+        }
         if (ordering == Ordering::kLexicographic) {
             if (a.normalized_word != b.normalized_word) {
                 return a.normalized_word < b.normalized_word;
             }
             return a.item_id < b.item_id;
         }
-        if (a.deck_order != b.deck_order) return a.deck_order < b.deck_order;
-        if (a.sort_index != b.sort_index) return a.sort_index < b.sort_index;
-        if (a.normalized_word != b.normalized_word) {
-            return a.normalized_word < b.normalized_word;
-        }
-        return a.item_id < b.item_id;
+        // `kSequential` and `kNewIntakeV1` are both a faithful deck-order walk.
+        return DeckOrderLess(a, b);
     });
 }
 
@@ -375,6 +434,8 @@ esp_err_t BuildCreateSessionRequest(
 {
     if (body == nullptr || request.scope.deck_ids.size() > kMaxDecks ||
         request.optional_count < 1 || request.optional_count > 500 ||
+        (request.start_index >= 0 && request.start_index > 1000000) ||
+        request.new_word_limit < 0 || request.new_word_limit > 200 ||
         (!request.seed.empty() && !IsUrlSafe(request.seed, 1, 64))) {
         return ESP_ERR_INVALID_ARG;
     }
@@ -400,6 +461,12 @@ esp_err_t BuildCreateSessionRequest(
     cJSON_AddNumberToObject(document.root(), "optional_count", request.optional_count);
     if (!request.seed.empty()) {
         cJSON_AddStringToObject(document.root(), "seed", request.seed.c_str());
+    }
+    if (request.start_index >= 0) {
+        cJSON_AddNumberToObject(document.root(), "start_index", request.start_index);
+    }
+    if (request.new_word_limit > 0) {
+        cJSON_AddNumberToObject(document.root(), "new_word_limit", request.new_word_limit);
     }
     return Render(document.root(), body);
 }

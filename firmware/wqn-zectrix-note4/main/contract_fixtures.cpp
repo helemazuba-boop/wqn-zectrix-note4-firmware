@@ -532,26 +532,6 @@ const char kAiTodoActions[] = R"json({
   }
 })json";
 
-const char kWordSearch[] = R"json({
-  "success": true,
-  "data": {
-    "prefix": "co",
-    "words": [
-      {
-        "id": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
-        "word": "concept",
-        "phonetic": "/concept/",
-        "meaning": "idea"
-      },
-      {
-        "id": "ffffffff-ffff-4fff-8fff-ffffffffffff",
-        "word": "broken"
-      }
-    ],
-    "next_letters": ["m", "n", "r"]
-  }
-})json";
-
 const char kAiWordActions[] = R"json({
   "success": true,
   "data": {
@@ -726,18 +706,6 @@ bool CheckAiTodoActions()
            Require(response.actions[2].status == "pending", "AI restored status") &&
            Require(response.actions[3].status == "cancelled", "AI cancelled status") &&
            Require(response.actions[4].type == "future_action", "AI unknown action preserved");
-}
-
-bool CheckWordSearch()
-{
-    wqn::WqnWordSearchResult search;
-    const esp_err_t result = wqn::ParseWordSearchResponse(kWordSearch, &search);
-    return Require(result == ESP_OK, "word search parse result") &&
-           Require(search.prefix == "co", "word search prefix") &&
-           Require(search.words.size() == 1, "word search skips invalid word") &&
-           Require(search.words[0].word == "concept", "word search word") &&
-           Require(search.next_letters.size() == 3, "word search next letter count") &&
-           Require(search.next_letters[1] == "n", "word search next letter value");
 }
 
 bool CheckAiWordActions()
@@ -1091,6 +1059,145 @@ bool CheckWordStudyV1Contract()
         !Require(
             body.find("word.study.v1") != std::string::npos,
             "word-study capability advertised")) {
+        return false;
+    }
+
+    // [word-modes-v2] Additive create-session fields. Review takes the whole
+    // due queue (no cursor, no quota); intake carries the daily new-word quota;
+    // sequential carries the durable library cursor. Unset fields must be
+    // omitted entirely so the server keeps its own defaults.
+    auto replace_once = [](std::string* value, const std::string& from, const std::string& to) {
+        const size_t position = value->find(from);
+        if (position == std::string::npos) {
+            return false;
+        }
+        value->replace(position, from.size(), to);
+        return true;
+    };
+
+    words::CreateSessionRequest create_request;
+    create_request.metadata = metadata;
+    create_request.metadata.request_id = "req_word_review_0001";
+    create_request.mode = words::Mode::kReview;
+    create_request.scope.deck_ids = {"11111111-1111-4111-8111-111111111111"};
+    create_request.optional_count = 500;
+    if (!Require(
+            words::BuildCreateSessionRequest(create_request, &body) == ESP_OK,
+            "word-study review request build") ||
+        !Require(
+            body.find("\"mode\":\"review\"") != std::string::npos,
+            "word-study review mode encoded") ||
+        !Require(
+            body.find("start_index") == std::string::npos &&
+                body.find("new_word_limit") == std::string::npos &&
+                body.find("\"seed\"") == std::string::npos,
+            "word-study review omits optional fields")) {
+        return false;
+    }
+
+    create_request.mode = words::Mode::kIntake;
+    create_request.metadata.request_id = "req_word_intake_0001";
+    create_request.new_word_limit = 20;
+    if (!Require(
+            words::BuildCreateSessionRequest(create_request, &body) == ESP_OK,
+            "word-study intake request build") ||
+        !Require(
+            body.find("\"new_word_limit\":20") != std::string::npos,
+            "word-study intake quota encoded") ||
+        !Require(
+            body.find("start_index") == std::string::npos,
+            "word-study intake omits start_index")) {
+        return false;
+    }
+
+    create_request.mode = words::Mode::kSequential;
+    create_request.metadata.request_id = "req_word_sequential_0002";
+    create_request.new_word_limit = 0;
+    create_request.start_index = 1200;
+    create_request.scope.include_mastered = true;
+    if (!Require(
+            words::BuildCreateSessionRequest(create_request, &body) == ESP_OK,
+            "word-study sequential cursor request build") ||
+        !Require(
+            body.find("\"start_index\":1200") != std::string::npos,
+            "word-study sequential cursor encoded") ||
+        !Require(
+            body.find("\"include_mastered\":true") != std::string::npos,
+            "word-study sequential includes mastered")) {
+        return false;
+    }
+    // Bounds belong to the contract, not the server: reject locally so a buggy
+    // UI cursor cannot produce an ambiguous request.
+    create_request.start_index = 1000001;
+    if (!Require(
+            words::BuildCreateSessionRequest(create_request, &body) ==
+                ESP_ERR_INVALID_ARG,
+            "word-study rejects start_index beyond bound")) {
+        return false;
+    }
+    create_request.start_index = -1;
+    create_request.new_word_limit = 201;
+    if (!Require(
+            words::BuildCreateSessionRequest(create_request, &body) ==
+                ESP_ERR_INVALID_ARG,
+            "word-study rejects new_word_limit beyond bound")) {
+        return false;
+    }
+
+    // Every new mode/ordering pair must survive the response parser: the whole
+    // queue semantics are keyed on the returned names.
+    const char* session_mode_names[] = {"review", "intake", "shuffle", "mistakes"};
+    const char* session_ordering_names[] = {
+        "due_queue_v1", "new_intake_v1", "pure_random_v1", "mistake_words_v1"};
+    const words::Mode expected_modes[] = {
+        words::Mode::kReview,
+        words::Mode::kIntake,
+        words::Mode::kShuffle,
+        words::Mode::kMistakes};
+    const words::Ordering expected_orderings[] = {
+        words::Ordering::kDueQueueV1,
+        words::Ordering::kNewIntakeV1,
+        words::Ordering::kPureRandomV1,
+        words::Ordering::kMistakeWordsV1};
+    for (size_t index = 0; index < 4; ++index) {
+        std::string json(kWordSessionV1);
+        const std::string mode_value =
+            std::string("\"") + session_mode_names[index] + "\"";
+        const std::string ordering_value =
+            std::string("\"") + session_ordering_names[index] + "\"";
+        if (!Require(
+                replace_once(&json, "\"mode\": \"random\"", "\"mode\": " + mode_value) &&
+                    replace_once(
+                        &json,
+                        "\"ordering\": \"guided_random_v1\"",
+                        "\"ordering\": " + ordering_value) &&
+                    replace_once(
+                        &json,
+                        "\"candidate_policy_version\": \"guided_random_v1\"",
+                        "\"candidate_policy_version\": " + ordering_value),
+                "word-study mode fixture rewrite")) {
+            return false;
+        }
+        words::SessionData parsed;
+        if (!Require(
+                words::ParseSessionResponse(
+                    json.c_str(), "req_word_session_0001", &parsed, &error) == ESP_OK,
+                "word-study mode response parse") ||
+            !Require(
+                parsed.mode == expected_modes[index] &&
+                    parsed.ordering == expected_orderings[index],
+                "word-study mode/ordering pair")) {
+            return false;
+        }
+    }
+    // A mixed pair is a contract violation, not a fallback: reject it.
+    std::string mismatch(kWordSessionV1);
+    if (!Require(
+            replace_once(&mismatch, "\"mode\": \"random\"", "\"mode\": \"review\"") &&
+                words::ParseSessionResponse(
+                    mismatch.c_str(), "req_word_session_0001", &session, &error) ==
+                    ESP_ERR_INVALID_RESPONSE,
+            "word-study rejects mode/ordering mismatch")) {
         return false;
     }
 
@@ -2147,7 +2254,6 @@ bool RunContractFixtureSelfTest()
         CheckTodoList() &&
         CheckTodoComplete() &&
         CheckAiTodoActions() &&
-        CheckWordSearch() &&
         CheckAiWordActions() &&
         CheckUnauthorizedError() &&
         CheckV3ControlContract() &&

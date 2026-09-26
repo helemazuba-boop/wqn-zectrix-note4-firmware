@@ -59,18 +59,6 @@ struct WqnWordEntry {
     int revision = 0;
 };
 
-struct WqnWordSearchRequest {
-    std::string query;
-    std::string prefix;
-    int limit = 8;
-};
-
-struct WqnWordSearchResult {
-    std::string prefix;
-    std::vector<WqnWordEntry> words;
-    std::vector<std::string> next_letters;
-};
-
 struct WqnWordPackManifestItem {
     std::string pack_id;
     std::string deck_id;
@@ -159,16 +147,6 @@ enum class WqnProblemImageKind : uint8_t {
     kSolution,
 };
 
-struct WqnWordAiLookupRequest {
-    std::string query;
-    std::string prefix;
-};
-
-struct WqnWordAiLookupResult {
-    WqnWordEntry word;
-    std::string reply_text;
-};
-
 struct WqnAiAction {
     std::string type;
     std::string notebook_id;
@@ -251,7 +229,6 @@ esp_err_t FetchTodoTimeline(const std::string& token, const WqnTodoTimelineReque
 esp_err_t FetchTodoTimeline(const std::string& token, WqnTodoListPage* page);
 esp_err_t FetchTodayPendingTodos(const std::string& token, WqnTodoListPage* page);
 esp_err_t CompleteTodo(const std::string& token, const std::string& todo_id, WqnTodoItem* todo);
-esp_err_t SearchWords(const std::string& token, const WqnWordSearchRequest& request, WqnWordSearchResult* result);
 esp_err_t FetchWordPackManifest(
     const std::string& token,
     const protocol::v3::RequestMetadata& metadata,
@@ -404,7 +381,6 @@ esp_err_t SubmitProblemReviewObservationV1(
     protocol::problem_study_v1::ObservationData* observation,
     protocol::v3::Error* error,
     bool* transport_failure);
-esp_err_t LookupWordWithAi(const std::string& token, const WqnWordAiLookupRequest& request, WqnWordAiLookupResult* result);
 
 // === v2 SSE streaming (Std/Pro tier, default path when WQN_AI_STREAMING_ENABLE=y) ===
 //
@@ -508,9 +484,7 @@ esp_err_t UploadAiAudioChat(
 
 esp_err_t ParseTodoListResponse(const std::string& body, WqnTodoListPage* page);
 esp_err_t ParseTodoCompleteResponse(const std::string& body, WqnTodoItem* todo);
-esp_err_t ParseWordSearchResponse(const std::string& body, WqnWordSearchResult* result);
 esp_err_t ParseWordPackManifestResponse(const std::string& body, WqnWordPackManifest* manifest);
-esp_err_t ParseWordAiLookupResponse(const std::string& body, WqnWordAiLookupResult* result);
 esp_err_t ParseAiChatResponseBody(const std::string& body, WqnAiChatResponse* response);
 
 }  // namespace wqn

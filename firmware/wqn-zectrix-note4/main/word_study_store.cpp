@@ -35,7 +35,9 @@ constexpr uint32_t kOutboxMagic = UINT32_C(0x424f5157);  // WQOB
 // longer matches the committed scope generation reports NOT_FOUND. Bumping the
 // version discards v2 snapshots once at upgrade -- acceptable, they are only
 // browse cursors (the observation outbox is a separate, versioned store).
-constexpr uint16_t kSessionSchemaVersion = 3;
+// v4 appends start_index (the 顺序过词库 continuation point) for the same
+// reason: it is a browse cursor, and a v3 file simply loses its label.
+constexpr uint16_t kSessionSchemaVersion = 4;
 constexpr uint16_t kOutboxSchemaVersion = 1;
 constexpr size_t kMaxSessionPayloadBytes = 96U * 1024U;
 constexpr size_t kMaxSessionCursorBytes = 256;
@@ -43,8 +45,9 @@ constexpr size_t kRuntimeCompactAckThreshold = 32;
 constexpr size_t kRejectedOutboxCapacity = 256;
 constexpr wqn::protocol::word_study_v1::Mode kPersistedSessionModes[] = {
     wqn::protocol::word_study_v1::Mode::kSequential,
-    wqn::protocol::word_study_v1::Mode::kRandom,
-    wqn::protocol::word_study_v1::Mode::kDictionary,
+    wqn::protocol::word_study_v1::Mode::kReview,
+    wqn::protocol::word_study_v1::Mode::kShuffle,
+    wqn::protocol::word_study_v1::Mode::kMistakes,
 };
 
 #pragma pack(push, 1)
@@ -134,6 +137,18 @@ bool GetSessionPaths(
         case wqn::protocol::word_study_v1::Mode::kDictionary:
             *paths = {"/storage/wsd.v1", "/storage/wsd.tmp", "/storage/wsd.bak"};
             return true;
+        case wqn::protocol::word_study_v1::Mode::kReview:
+            *paths = {"/storage/wsv.v1", "/storage/wsv.tmp", "/storage/wsv.bak"};
+            return true;
+        case wqn::protocol::word_study_v1::Mode::kIntake:
+            *paths = {"/storage/wsi.v1", "/storage/wsi.tmp", "/storage/wsi.bak"};
+            return true;
+        case wqn::protocol::word_study_v1::Mode::kShuffle:
+            *paths = {"/storage/wsh.v1", "/storage/wsh.tmp", "/storage/wsh.bak"};
+            return true;
+        case wqn::protocol::word_study_v1::Mode::kMistakes:
+            *paths = {"/storage/wsm.v1", "/storage/wsm.tmp", "/storage/wsm.bak"};
+            return true;
     }
     return false;
 }
@@ -214,7 +229,7 @@ private:
 
 bool ValidMode(uint8_t value)
 {
-    return value <= static_cast<uint8_t>(wqn::protocol::word_study_v1::Mode::kDictionary);
+    return value <= static_cast<uint8_t>(wqn::protocol::word_study_v1::Mode::kMistakes);
 }
 
 bool ValidPurpose(uint8_t value)
@@ -224,7 +239,8 @@ bool ValidPurpose(uint8_t value)
 
 bool ValidOrdering(uint8_t value)
 {
-    return value <= static_cast<uint8_t>(wqn::protocol::word_study_v1::Ordering::kLexicographic);
+    return value <=
+        static_cast<uint8_t>(wqn::protocol::word_study_v1::Ordering::kMistakeWordsV1);
 }
 
 bool EncodeSession(
@@ -250,6 +266,7 @@ bool EncodeSession(
     AppendScalar<uint8_t>(payload, session.remote.include_mastered ? 1 : 0);
     AppendScalar<uint8_t>(payload, session.remote.has_more ? 1 : 0);
     AppendScalar<uint32_t>(payload, session.position);
+    AppendScalar<uint32_t>(payload, session.start_index);
     AppendScalar<uint32_t>(payload, static_cast<uint32_t>(session.remote.optional_count));
     AppendScalar<uint64_t>(payload, session.remote.next_sequence);
     // [deck-scope] The session's OWN scope stamp (assigned when the session
@@ -306,7 +323,9 @@ bool DecodeSession(
         !reader.Scalar(&phase) || !reader.Scalar(&mode) ||
         !reader.Scalar(&purpose) || !reader.Scalar(&ordering) ||
         !reader.Scalar(&include_mastered) || !reader.Scalar(&has_more) ||
-        !reader.Scalar(&parsed.position) || !reader.Scalar(&optional_count) ||
+        !reader.Scalar(&parsed.position) ||
+        !reader.Scalar(&parsed.start_index) ||
+        !reader.Scalar(&optional_count) ||
         !reader.Scalar(&parsed.remote.next_sequence) ||
         !reader.Scalar(&parsed.deck_scope_generation) ||
         !reader.String(&parsed.remote.session_id, 36) ||
@@ -496,6 +515,18 @@ bool GetSessionCursorPaths(
         case wqn::protocol::word_study_v1::Mode::kDictionary:
             *paths = {"/storage/wsd.cur", "/storage/wsd.ctp", "/storage/wsd.cbk"};
             return true;
+        case wqn::protocol::word_study_v1::Mode::kReview:
+            *paths = {"/storage/wsv.cur", "/storage/wsv.ctp", "/storage/wsv.cbk"};
+            return true;
+        case wqn::protocol::word_study_v1::Mode::kIntake:
+            *paths = {"/storage/wsi.cur", "/storage/wsi.ctp", "/storage/wsi.cbk"};
+            return true;
+        case wqn::protocol::word_study_v1::Mode::kShuffle:
+            *paths = {"/storage/wsh.cur", "/storage/wsh.ctp", "/storage/wsh.cbk"};
+            return true;
+        case wqn::protocol::word_study_v1::Mode::kMistakes:
+            *paths = {"/storage/wsm.cur", "/storage/wsm.ctp", "/storage/wsm.cbk"};
+            return true;
     }
     return false;
 }
@@ -672,7 +703,7 @@ esp_err_t BuildObservationRecord(
     using wqn::protocol::word_study_v1::ObservationAction;
     if (record == nullptr || observation.sequence > wqn::protocol::v3::kMaxSafeJsonInteger ||
         static_cast<uint8_t>(observation.action) > static_cast<uint8_t>(ObservationAction::kLookedUp) ||
-        static_cast<uint8_t>(observation.mode) > static_cast<uint8_t>(Mode::kDictionary) ||
+        static_cast<uint8_t>(observation.mode) > static_cast<uint8_t>(Mode::kMistakes) ||
         static_cast<uint8_t>(observation.next_phase) > 1) {
         return ESP_ERR_INVALID_ARG;
     }

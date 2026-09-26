@@ -597,20 +597,19 @@ std::string FrameSignature(const wqn::UiFrame& frame)
         signature.push_back('/');
         signature.append(std::to_string(static_cast<int>(frame.word_app.card_phase)));
         signature.push_back('/');
-        signature.append(std::to_string(static_cast<int>(frame.word_app.card_source)));
-        signature.push_back('/');
         signature.append(std::to_string(static_cast<int>(frame.word_app.commit_state)));
-        signature.push_back('/');
-        signature.append(std::to_string(static_cast<int>(frame.word_app.dictionary_stage)));
         signature.push_back('/');
         signature.append(std::to_string(static_cast<int>(frame.word_app.home_selection)));
         signature.push_back('/');
-        signature.append(std::to_string(static_cast<int>(frame.word_app.lookup_selection)));
+        signature.append(std::to_string(
+            static_cast<int>(frame.word_app.complete_selection)));
         signature.push_back('/');
         signature.append(
-            frame.word_app.sequential_session_resumable ? "1" : "0");
+            frame.word_app.review_session_resumable ? "1" : "0");
         signature.append(
-            frame.word_app.random_session_resumable ? "1" : "0");
+            frame.word_app.shuffle_session_resumable ? "1" : "0");
+        signature.append(
+            frame.word_app.mistakes_session_resumable ? "1" : "0");
         signature.push_back('/');
         signature.append(std::to_string(frame.word_app.card_position));
         signature.push_back('/');
@@ -642,20 +641,18 @@ std::string FrameSignature(const wqn::UiFrame& frame)
         signature.push_back('/');
         signature.append(frame.word_app.progress_line);
         signature.push_back('/');
-        signature.append(frame.word_app.dictionary_prefix);
+        signature.append(frame.word_app.review_complete_empty ? "1" : "0");
+        signature.append(std::to_string(frame.word_app.review_complete_reviewed));
         signature.push_back('/');
-        signature.append(std::to_string(frame.word_app.dictionary_letter_selected));
+        signature.append(std::to_string(frame.word_app.review_complete_unknown));
         signature.push_back('/');
-        signature.append(std::to_string(frame.word_app.dictionary_match_selected));
+        signature.append(std::to_string(frame.word_app.review_complete_replayed));
+        signature.push_back('/');
+        signature.append(std::to_string(frame.word_app.sequential_cursor));
+        signature.push_back('/');
+        signature.append(std::to_string(frame.word_app.sequential_total));
         signature.push_back('/');
         signature.append(frame.word_app.hint);
-        for (const char letter : frame.word_app.dictionary_letters) {
-            signature.push_back(letter);
-        }
-        for (const std::string& preview : frame.word_app.dictionary_preview_words) {
-            signature.push_back('|');
-            signature.append(preview);
-        }
     }
     if (frame.screen == wqn::UiScreen::kNote) {
         // The note page renders entirely from frame.note_app (RenderNote adds no

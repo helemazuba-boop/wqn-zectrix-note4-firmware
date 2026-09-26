@@ -35,6 +35,7 @@
 #include "problem_store.h"
 #include "services/connectivity_service.h"
 #include "services/server_error_codes.h"
+#include "word_app.h"
 #include "word_study_store.h"
 #include "wqn_api.h"
 #include "error_recorder.h"
@@ -2062,6 +2063,9 @@ esp_err_t SyncControlPlaneV3(const std::string& token)
         sync.todo_count,
         sync.word_due_count,
         static_cast<unsigned long long>(sync.sync_cursor));
+    // Surface the due-word count on the review home card; it is only a hint
+    // (the queue itself comes from the word-study session request).
+    wqn::SetWordReviewDueCount(sync.word_due_count);
     const wqn::DeviceControlState checkpoint = {
         sync.config_revision,
         sync.sync_cursor,

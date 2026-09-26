@@ -134,6 +134,13 @@ esp_err_t SaveAiAutoFollowForeground(bool follow);
 esp_err_t LoadAgentDetailLevel(uint8_t* level);
 // [persist-worker] Worker-dedicated variant (see SaveAutoSyncIntervalMinutesForeground).
 esp_err_t SaveAgentDetailLevelForeground(uint8_t level);
+// [word-sequential-chain] How far the library walk (顺序过词库) has come:
+// the index of the next word to study. Device-local and independent of any
+// session record, so it survives a finished/cleared session. Reset to 0 when
+// the deck scope changes (the index is relative to the scoped library).
+esp_err_t LoadWordSequentialCursor(uint32_t* cursor);
+esp_err_t SaveWordSequentialCursor(uint32_t cursor);
+
 // Default word deck for the device (empty = all decks). The word page's
 // study sessions scope to it; the other decks enter via the note screen's
 // mixed [词] rows.
