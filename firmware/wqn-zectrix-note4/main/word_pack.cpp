@@ -21,6 +21,8 @@
 #include "esp_log.h"
 #include "esp_spiffs.h"
 #include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "mbedtls/sha256.h"
 #include "runtime/sleep_coordinator.h"
 #include "services/storage_service.h"
@@ -94,6 +96,21 @@ private:
     char* data_ = nullptr;
 };
 
+// [watchdog] The SHA and JSONL scan loops can run for seconds without
+// blocking; the 10 s task watchdog only checks IDLE0/IDLE1 starvation and
+// no task in this path subscribes to TWDT, so yielding is the only lever.
+// 100 ms slices leave ~1000 yield points inside the 10 s window.
+constexpr int64_t kPackYieldSliceUs = 100 * 1000;
+
+void MaybeYieldPackRebuild(int64_t& last_yield_us)
+{
+    const int64_t now_us = esp_timer_get_time();
+    if (now_us - last_yield_us < kPackYieldSliceUs) {
+        return;
+    }
+    vTaskDelay(1);
+    last_yield_us = esp_timer_get_time();
+}
 
 class JsonDocument {
 public:
@@ -290,11 +307,13 @@ bool VerifyFileSha256(const std::string& path, const std::string& expected)
     mbedtls_sha256_init(&ctx);
     mbedtls_sha256_starts(&ctx, 0);
     std::array<unsigned char, 1024> buffer = {};
+    int64_t last_yield_us = esp_timer_get_time();
     while (true) {
         const size_t read = std::fread(buffer.data(), 1, buffer.size(), file);
         if (read > 0) {
             mbedtls_sha256_update(&ctx, buffer.data(), read);
         }
+        MaybeYieldPackRebuild(last_yield_us);
         if (read < buffer.size()) {
             if (std::ferror(file)) {
                 std::fclose(file);
@@ -613,6 +632,7 @@ esp_err_t ScanPackFile(
     const std::string pack_stem = wqn::SafePackStem(item);
 
     uint32_t scanned_entries = 0;
+    int64_t last_yield_us = esp_timer_get_time();
     while (true) {
         const long offset = std::ftell(file);
         result = ReadBoundedPackLine(file, &line_buffer, &line);
@@ -645,6 +665,7 @@ esp_err_t ScanPackFile(
         indexed.deck_order = deck_order;
         indexed.sort_index = sort_index;
         index->entries.push_back(indexed);
+        MaybeYieldPackRebuild(last_yield_us);
         ++scanned_entries;
         if (index->entries.size() > kMaxIndexEntries || scanned_entries > item.entry_count) {
             std::fclose(file);
