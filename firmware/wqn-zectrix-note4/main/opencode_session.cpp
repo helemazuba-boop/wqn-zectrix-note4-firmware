@@ -84,10 +84,39 @@ void ClearPendingQuestionLocked();
 void ClearReplyFlightLocked();
 void ClearDeferredQuestionLocked();
 void PromoteDeferredQuestionLocked();
+void ClearAllAsksLocked();
 
 void MarkChangedLocked()
 {
     g_changed = true;
+}
+
+// The longest prefix of `text` that fits `max_bytes` without ending inside a
+// UTF-8 sequence. Truncating a Chinese answer at a byte count with substr()
+// splits a 3-byte character into stray bytes, and the history channel then
+// renders mojibake (or drops the tail of the message). Backing up from the
+// cut to the lead byte and keeping the whole character when it fits keeps the
+// buffer valid UTF-8 at every prefix length.
+size_t Utf8SafePrefixBytes(std::string_view text, size_t max_bytes)
+{
+    if (text.size() <= max_bytes) {
+        return text.size();
+    }
+    size_t start = max_bytes;
+    while (start > 0 &&
+           (static_cast<unsigned char>(text[start]) & 0xC0) == 0x80) {
+        --start;
+    }
+    const unsigned char lead = static_cast<unsigned char>(text[start]);
+    size_t length = 1;
+    if ((lead & 0xE0) == 0xC0) {
+        length = 2;
+    } else if ((lead & 0xF0) == 0xE0) {
+        length = 3;
+    } else if ((lead & 0xF8) == 0xF0) {
+        length = 4;
+    }
+    return start + length <= max_bytes ? start + length : start;
 }
 
 void SetPhaseLocked(wqn::AiFeaturePhase phase, const std::string& status)
@@ -112,6 +141,10 @@ void SetErrorLocked(const std::string& message)
     g_state.ui.requires_confirmation = false;
     g_state.confirmation_armed_at_ms = 0;
     g_state.stream_active = false;
+    // Every SetErrorLocked call site is turn-terminal or pre-turn, and the
+    // stream that would carry a reply is gone: an ask left armed here can never
+    // be answered and would hold the option bar against the next turn's asks.
+    ClearAllAsksLocked();
     MarkChangedLocked();
     ReleaseWorkOwnershipLocked();
 }
@@ -124,6 +157,18 @@ bool ArmWorkerLocked(WorkerCommand command)
     g_command = command;
     xTaskNotifyGive(g_worker);
     return true;
+}
+
+// Chains the next command from inside the worker command that is running now.
+// ArmWorkerLocked cannot be used for this: it refuses while g_command is still
+// occupied by the running command (WorkerTask only clears it after the handler
+// returns), so the history->observe chain used to fall through to its error
+// branch on every single observe. The worker is the only caller, which is why
+// no g_worker null check is needed.
+void ChainWorkerCommandLocked(WorkerCommand command)
+{
+    g_command = command;
+    xTaskNotifyGive(g_worker);
 }
 
 esp_err_t LoadToken(std::string* token)
@@ -195,10 +240,7 @@ void LoadSessions()
             g_state.session_locked = false;
             g_state.current_session_id.clear();
             g_state.current_session_title.clear();
-            ClearPendingPermissionLocked();
-            ClearPendingQuestionLocked();
-            ClearDeferredQuestionLocked();
-            ClearReplyFlightLocked();
+            ClearAllAsksLocked();
             // A fresh list means no session's transcript is on screen any more,
             // so the next observe must backfill again.
             g_state.history_loaded_session_id.clear();
@@ -555,6 +597,18 @@ void ClearDeferredQuestionLocked()
     g_deferred_question_session.clear();
 }
 
+// Drops every ask the device is holding: both slots, the deferred question and
+// the in-flight reply bookkeeping. This is what a turn boundary needs -- an ask
+// that outlives its run can never be answered, holds the option bar, and would
+// otherwise swallow the next turn's first ask.
+void ClearAllAsksLocked()
+{
+    ClearPendingPermissionLocked();
+    ClearPendingQuestionLocked();
+    ClearDeferredQuestionLocked();
+    ClearReplyFlightLocked();
+}
+
 // Replays one session's backfilled turns into the kAgent channel, oldest first.
 // The gateway already chose the window and truncated each field, so this is a
 // direct projection: no dedupe against live deltas, because the caller resets
@@ -614,9 +668,10 @@ void OnOpenCodeEvent(const wqn::OpenCodeEvent& event, void*)
             // had no way to answer it -- the run blocked until the 30-minute
             // stream timeout and surfaced as stream_incomplete.
             if (event.status == "idle" || event.status == "error") {
-                ClearPendingPermissionLocked();
-                ClearPendingQuestionLocked();
-                ClearReplyFlightLocked();
+                // Includes the deferred question: with the run over it can
+                // never be promoted, and leaving it queued would arm a dead
+                // ask on the next turn.
+                ClearAllAsksLocked();
             }
             if (event.status == "idle") {
                 g_state.stream_active = false;
@@ -631,6 +686,21 @@ void OnOpenCodeEvent(const wqn::OpenCodeEvent& event, void*)
                     g_state.ui.action_hint = g_observing
                         ? "长按确认录音 · 双击确认观察"
                         : "长按确认发起新任务";
+                }
+            } else if (event.status == "error") {
+                // A terminal error status: v2's gateway does not emit this
+                // today (failures arrive as agent.error + idle), but the
+                // contract allows it, and without this branch it fell into the
+                // generic else below -- a failed run was relabelled
+                // "Agent 执行中" and `g_run_failed` stayed false, so the
+                // trailing idle then closed the turn as a SUCCESS.
+                g_run_failed = true;
+                g_state.stream_active = false;
+                CloseAgentToolBlockLocked(false, now_ms);
+                SetPhaseLocked(wqn::AiFeaturePhase::kError, "执行失败");
+                g_state.ui.action_hint = "长按确认重试新任务";
+                if (!event.text.empty()) {
+                    g_state.ui.activity_text = event.text;
                 }
             } else if (event.status == "retry") {
                 SetPhaseLocked(wqn::AiFeaturePhase::kRunning,
@@ -649,13 +719,16 @@ void OnOpenCodeEvent(const wqn::OpenCodeEvent& event, void*)
         case wqn::OpenCodeEventKind::kTextDelta:
             if (g_state.ui.response_text.size() < kMaxAgentTextBytes) {
                 const size_t remaining = kMaxAgentTextBytes - g_state.ui.response_text.size();
-                g_state.ui.response_text.append(event.text.data(), std::min(remaining, event.text.size()));
+                g_state.ui.response_text.append(
+                    event.text.data(), Utf8SafePrefixBytes(event.text, remaining));
             }
             MirrorAgentTextLocked(now_ms);
             MarkChangedLocked();
             break;
         case wqn::OpenCodeEventKind::kText:
-            g_state.ui.response_text = event.text.substr(0, kMaxAgentTextBytes);
+            g_state.ui.response_text.assign(
+                event.text.data(),
+                Utf8SafePrefixBytes(event.text, kMaxAgentTextBytes));
             MirrorAgentTextLocked(now_ms);
             MarkChangedLocked();
             break;
@@ -663,14 +736,16 @@ void OnOpenCodeEvent(const wqn::OpenCodeEvent& event, void*)
             // Reasoning is bounded by its own budget, never by the answer's.
             if (g_agent_thinking_text.size() < kMaxThinkingBytes) {
                 const size_t remaining = kMaxThinkingBytes - g_agent_thinking_text.size();
-                g_agent_thinking_text.append(event.text.data(),
-                                             std::min(remaining, event.text.size()));
+                g_agent_thinking_text.append(
+                    event.text.data(), Utf8SafePrefixBytes(event.text, remaining));
                 MirrorAgentThinkingLocked(now_ms);
             }
             MarkChangedLocked();
             break;
         case wqn::OpenCodeEventKind::kReasoning:
-            g_agent_thinking_text = event.text.substr(0, kMaxThinkingBytes);
+            g_agent_thinking_text.assign(
+                event.text.data(),
+                Utf8SafePrefixBytes(event.text, kMaxThinkingBytes));
             MirrorAgentThinkingLocked(now_ms);
             MarkChangedLocked();
             break;
@@ -682,7 +757,6 @@ void OnOpenCodeEvent(const wqn::OpenCodeEvent& event, void*)
             if (!event.preview.empty()) {
                 g_state.ui.activity_text += " · " + event.preview;
             }
-            g_agent_tool_ok = event.status != "error";
             // Coalesce one tool call into one block. The key is the call id when
             // the gateway learned it: a run that reads two files re-emits the
             // same tool name twice, and merging by name alone collapsed both
@@ -694,9 +768,16 @@ void OnOpenCodeEvent(const wqn::OpenCodeEvent& event, void*)
             const bool same_name = g_agent_tool_id != wqn::kInvalidChatMessageId &&
                                    event.call_id.empty() && g_agent_tool_name == event.tool;
             if (same_call || same_name) {
+                // Same block: this status is the one it will be closed with.
+                g_agent_tool_ok = event.status != "error";
                 g_agent_tool_detail = event.preview.empty() ? event.status : event.preview;
             } else {
+                // Close the previous block with the status it ended on. Setting
+                // `g_agent_tool_ok` before this close marked a successful tool
+                // as failed (and a failed one as successful) whenever two
+                // different calls arrived back to back.
                 CloseAgentToolBlockLocked(g_agent_tool_ok, now_ms);
+                g_agent_tool_ok = event.status != "error";
                 g_agent_tool_id = wqn::GetAiHistory(wqn::AiHistoryChannel::kAgent)
                                       .AppendToolStart(event.tool, std::string_view(), now_ms);
                 g_agent_tool_name = event.tool;
@@ -708,6 +789,18 @@ void OnOpenCodeEvent(const wqn::OpenCodeEvent& event, void*)
             break;
         }
         case wqn::OpenCodeEventKind::kPermission:
+            // The option bar has one mode, so a permission supersedes a question
+            // the device is still holding. The gateway re-arms a question that
+            // is still pending once this permission is answered (it re-reads
+            // liveness every poll round), so dropping it here loses nothing --
+            // and keeping it would leave both asks live at once, with the
+            // question unanswerable behind the permission.
+            ClearPendingQuestionLocked();
+            ClearDeferredQuestionLocked();
+            // Only the question flight: a question reply already on the wire
+            // must not restore a question this permission has superseded. The
+            // permission flight (if any) is a different reply.
+            g_reply_flight_question_id.clear();
             g_state.ui.phase = wqn::AiFeaturePhase::kAwaitingPermission;
             g_state.ui.status_label = "等待权限";
             g_state.pending_permission_id = event.permission_id;
@@ -772,10 +865,7 @@ void OnOpenCodeEvent(const wqn::OpenCodeEvent& event, void*)
             if (event.fatal) {
                 // The run is over, so the ask and its in-flight reply are over
                 // with it: nothing can answer them any more.
-                ClearPendingPermissionLocked();
-                ClearPendingQuestionLocked();
-                ClearDeferredQuestionLocked();
-                ClearReplyFlightLocked();
+                ClearAllAsksLocked();
                 g_run_failed = true;
                 g_state.ui.phase = wqn::AiFeaturePhase::kError;
                 g_state.ui.status_label = "执行失败";
@@ -905,6 +995,10 @@ void RunPrompt()
     xSemaphoreTake(g_lock, portMAX_DELAY);
     if (g_interrupt_delivered.load(std::memory_order_acquire)) {
         // Stopping the run on request is a success, not a failure.
+        // The run is over, so any ask it raised is dead too -- and the outbound
+        // queue that would carry the reply is discarded right below, so a bar
+        // left armed here would answer nothing.
+        ClearAllAsksLocked();
         g_state.ui.phase = wqn::AiFeaturePhase::kComplete;
         g_state.ui.status_label = "已中止";
         g_state.ui.activity_text = "任务已按确认键中止";
@@ -944,10 +1038,7 @@ void CreateSession()
         g_state.current_session_title = created.title;
         g_state.session_locked = true;
         g_observing = false;
-        ClearPendingPermissionLocked();
-        ClearPendingQuestionLocked();
-        ClearDeferredQuestionLocked();
-        ClearReplyFlightLocked();
+        ClearAllAsksLocked();
         // Nothing to backfill in an empty session; mark it loaded so the first
         // observe attaches straight to the stream.
         g_state.history_loaded_session_id = created.id;
@@ -996,6 +1087,9 @@ void ObserveSession()
     }
     xSemaphoreTake(g_lock, portMAX_DELAY);
     if (g_interrupt_delivered.load(std::memory_order_acquire)) {
+        // Same reasoning as the run path: the run is over and the outbound
+        // queue is discarded below, so a surviving ask could not be answered.
+        ClearAllAsksLocked();
         g_state.stream_active = false;
         ReleaseWorkOwnershipLocked();
         MarkChangedLocked();
@@ -1069,21 +1163,15 @@ void LoadHistory()
     if (result == ESP_OK && g_observing) {
         // Chain the observe stream behind the backfill: the stream must not
         // attach until the history it precedes is already in the channel.
-        // ArmWorkerLocked writes g_command directly, so FinishCommand's guard
-        // (it only clears the command it just ran) leaves this one armed.
+        // This runs inside the kLoadHistory command, so the chain must bypass
+        // ArmWorkerLocked's "worker is free" guard -- FinishCommand only
+        // clears the command it just ran, so it leaves this one armed.
         g_run_session_id = g_state.current_session_id;
         g_state.ui.activity_text = "正在连接 Session 事件流";
         MarkChangedLocked();
-        if (ArmWorkerLocked(WorkerCommand::kObserveSession)) {
-            xSemaphoreGive(g_lock);
-            return;
-        }
-        g_run_session_id.clear();
-        g_state.ui.phase = wqn::AiFeaturePhase::kError;
-        g_state.ui.status_label = "观察失败";
-        g_state.ui.activity_text = "历史读取后无法连接事件流";
-        g_state.stream_active = false;
-        g_observing = false;
+        ChainWorkerCommandLocked(WorkerCommand::kObserveSession);
+        xSemaphoreGive(g_lock);
+        return;
     }
     g_run_session_id.clear();
     xSemaphoreGive(g_lock);
@@ -1263,10 +1351,7 @@ esp_err_t LockSelectedOpenCodeSession()
     g_state.current_session_title = selected.title;
     g_state.session_locked = true;
     g_observing = false;
-    ClearPendingPermissionLocked();
-    ClearPendingQuestionLocked();
-    ClearDeferredQuestionLocked();
-    ClearReplyFlightLocked();
+    ClearAllAsksLocked();
     // The mirrored transcript belongs to the session that produced it: drop the
     // backfill marker so the load armed above re-reads it for this session.
     g_state.history_loaded_session_id.clear();
@@ -1343,13 +1428,10 @@ esp_err_t ObserveOpenCodeSession()
         // gate is single-slot, so nothing can re-arm between the backfill and
         // the attach that follows it.
         g_run_detail = g_state.detail_level;
-        ClearPendingPermissionLocked();
-        ClearPendingQuestionLocked();
-        // Attaching is a fresh turn: a question the previous attach could not
-        // show is stale, and a gateway re-attach re-discovers it anyway --
-        // holding it would swallow the fresh copy for the slot it occupies.
-        ClearDeferredQuestionLocked();
-        ClearReplyFlightLocked();
+        // Attaching is a fresh turn: an ask the previous attach left armed is
+        // stale, and a gateway re-attach re-discovers its own pending asks --
+        // holding one would swallow the fresh copy for the slot it occupies.
+        ClearAllAsksLocked();
         // Observe locks the session so the interaction view (not the picker)
         // renders while the stream is attached; the lock persists afterwards
         // so the observed session can immediately be prompted as well.
@@ -1589,8 +1671,9 @@ esp_err_t ConfirmOpenCodePrompt(int64_t confirmed_at_ms)
         // A submitted run is a fresh turn. Ask state the previous turn left
         // behind cannot be answered any more -- the gateway it belonged to is
         // gone -- and the re-attached gateway re-discovers its own pending asks.
-        ClearDeferredQuestionLocked();
-        ClearReplyFlightLocked();
+        // That includes the two live slots: a bar left armed from the previous
+        // turn would hide this run's first ask and answer nothing.
+        ClearAllAsksLocked();
         g_state.ui.phase = AiFeaturePhase::kSubmitting;
         g_state.ui.status_label = "正在提交";
         g_state.ui.response_text.clear();

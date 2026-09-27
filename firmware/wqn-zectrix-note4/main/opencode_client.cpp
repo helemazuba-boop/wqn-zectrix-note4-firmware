@@ -61,6 +61,11 @@ void SetResultError(OpenCodeResult* result, int status, const char* code, const 
 // itself, so they live with the parsers rather than with the HTTP plumbing.
 constexpr size_t kMaxJsonResponseBytes = 16 * 1024;
 constexpr size_t kMaxPromptBytes = 4096;
+// The manifest's `history_response_bytes`: the agreed ceiling for a backfill
+// body, tighter than the generic JSON budget because the gateway trims the
+// transcript to fit it. A body over this is a contract violation, not a large
+// conversation.
+constexpr size_t kMaxHistoryResponseBytes = 12 * 1024;
 // Backfill caps. The gateway already truncates to the device's JSON budget;
 // these stop a future gateway change from turning one backfill into an
 // unbounded heap allocation on a 4 KB-stack worker.
@@ -74,6 +79,7 @@ using wqn::JsonString;
 using wqn::SetResultError;
 using wqn::kMaxJsonResponseBytes;
 using wqn::kMaxPromptBytes;
+using wqn::kMaxHistoryResponseBytes;
 using wqn::kMaxHistoryMessages;
 using wqn::kMaxHistoryTools;
 
@@ -419,8 +425,12 @@ esp_err_t ReadAgentEventStream(const AgentStreamRequest& request)
     }
     wqn::SseFrameBuffer parser;
     std::array<char, 768> buffer = {};
-    bool idle_seen = false;
-    while (request_result == ESP_OK && !idle_seen) {
+    // Either terminal status ends the read loop: `idle` is the contract's
+    // terminator, and `error` is the same signal with a failure verdict (the
+    // device records it as a failed run). Waiting for `idle` after an `error`
+    // left the device reading a stream the gateway had already finished.
+    bool terminal_seen = false;
+    while (request_result == ESP_OK && !terminal_seen) {
         if (request.interrupt_requested != nullptr &&
             request.interrupt_requested->load(std::memory_order_acquire)) {
             // This loop is the only place that can end the stream, so it is
@@ -462,9 +472,25 @@ esp_err_t ReadAgentEventStream(const AgentStreamRequest& request)
                     event_data.data(), event_data.size())
                     ? cJSON_ParseWithLength(event_data.data(), event_data.size())
                     : nullptr;
-                idle_seen = JsonString(status_root, "status") == "idle";
+                const std::string status = JsonString(status_root, "status");
+                terminal_seen = status == "idle" || status == "error";
                 cJSON_Delete(status_root);
+                if (terminal_seen) {
+                    // Frames after a terminator belong to no run this device is
+                    // watching; stop extracting rather than dispatching them.
+                    break;
+                }
             }
+        }
+        if (parser.overflowed()) {
+            // One frame's data passed kMaxSseFrameBytes and was dropped by the
+            // parser. Its remainder was dropped with it, so any frame parsed
+            // after this point may be spliced garbage -- fail the stream the
+            // same way the line cap does, rather than rendering the splice.
+            SetResultError(request.result, request.result->http_status, "frame_overflow",
+                           "Agent stream frame exceeded the device limit");
+            request_result = ESP_FAIL;
+            break;
         }
         DrainOutboundReplies(request);
     }
@@ -477,7 +503,7 @@ esp_err_t ReadAgentEventStream(const AgentStreamRequest& request)
         // over because the user stopped it.
         return ESP_OK;
     }
-    if (request_result == ESP_OK && !idle_seen) {
+    if (request_result == ESP_OK && !terminal_seen) {
         SetResultError(request.result, request.result->http_status, "stream_incomplete", "Agent stream ended before idle");
         return ESP_FAIL;
     }
@@ -929,6 +955,13 @@ esp_err_t ParseOpenCodeAgentFrame(
         event.tool = JsonString(root, "type");
         event.text = JsonString(root, "title");
         event.preview = JsonString(root, "preview");
+        // An ask with no id can never be answered, and arming it would hold the
+        // option bar for the rest of the run -- the reply route needs the id.
+        // Drop the frame instead, the same way a malformed question is dropped.
+        if (event.permission_id.empty()) {
+            cJSON_Delete(root);
+            return ESP_ERR_INVALID_RESPONSE;
+        }
     } else if (event_name == "agent.question") {
         // The gateway projects the upstream form onto at most two options; a
         // form with more than two is delivered as `agent.status` instead, so an
@@ -996,7 +1029,7 @@ esp_err_t ParseOpenCodeHistoryBody(
     const int http_status = result->http_status;
     *result = OpenCodeResult{};
     messages->clear();
-    if (body.size() > kMaxJsonResponseBytes) {
+    if (body.size() > kMaxHistoryResponseBytes) {
         SetResultError(result, http_status, "invalid_size", "History response is too large");
         return ESP_ERR_INVALID_SIZE;
     }
@@ -1010,9 +1043,14 @@ esp_err_t ParseOpenCodeHistoryBody(
         SetResultError(result, http_status, "invalid_response", "History is invalid");
         return ESP_ERR_INVALID_RESPONSE;
     }
-    const int count = std::min<int>(cJSON_GetArraySize(rows), kMaxHistoryMessages);
+    const int row_count = cJSON_GetArraySize(rows);
+    const int count = std::min<int>(row_count, kMaxHistoryMessages);
+    // Keep the newest rows, not the oldest: the gateway trims the transcript
+    // from the front, so the tail is the part the user was looking at. Taking
+    // the first N showed the oldest N whenever a gateway sent more than the cap.
+    const int start = row_count > count ? row_count - count : 0;
     messages->reserve(static_cast<size_t>(count));
-    for (int index = 0; index < count; ++index) {
+    for (int index = start; index < start + count; ++index) {
         cJSON* row = cJSON_GetArrayItem(rows, index);
         OpenCodeHistoryMessage message;
         message.role = JsonString(row, "role");

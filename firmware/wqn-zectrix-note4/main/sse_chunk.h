@@ -61,13 +61,19 @@ public:
     kComplete,
   };
 
-  // Returns false when the chunk would push the buffered frame past
-  // kMaxSseFrameBytes; the parser is cleared, so the caller must treat the
-  // stream as broken rather than resynchronising mid-frame.
+  // feed() returns false when the chunk would push the unterminated line past
+  // kMaxSseLineBytes; the buffer is cleared, so the caller must treat the
+  // stream as broken rather than resynchronising.
   bool feed(const char* data, size_t len);
   FrameState extract(std::string* event_name, uint64_t* event_id, std::string* data_json);
 
   void clear();
+
+  // True once a frame was dropped for exceeding kMaxSseFrameBytes. Sticky: it
+  // survives clear() on purpose, because the caller's recovery is to fail the
+  // request -- the dropped frame's remainder is gone, so anything parsed after
+  // it may be spliced garbage.
+  bool overflowed() const { return overflowed_; }
 
 private:
   LineStreamingBuffer lines_;
@@ -75,6 +81,7 @@ private:
   uint64_t id_ = 0;
   std::string data_;
   bool id_seen_ = false;
+  bool overflowed_ = false;
 };
 
 // Decodes an SSE frame into WqnAiSseEvent.

@@ -100,11 +100,12 @@ remaining nine carry data:
 | `agent.error` | `message`, `fatal` | `fatal: false` records the message and keeps running; absent or `true` fails the run and surfaces the message |
 
 **Termination.** The device reads until it sees `agent.status` with
-`status: "idle"`. A stream that ends for any other reason — socket close,
-timeout, upstream drop — is `stream_incomplete`, not a success: a run the user
-believes finished but did not is worse than a visible failure. The stream has
-a 5-minute socket timeout and the gateway is expected to keep it alive well
-inside that.
+`status: "idle"`, or with `status: "error"` (a terminal failure — the device
+marks the run failed and stops reading). A stream that ends for any other reason
+— socket close, timeout, upstream drop — is `stream_incomplete`, not a success:
+a run the user believes finished but did not is worse than a visible failure.
+The stream has a 5-minute socket timeout and the gateway is expected to keep it
+alive well inside that.
 
 **Reasoning is its own channel.** `agent.reasoning.delta` accumulates into a
 buffer separate from the answer and `agent.reasoning` replaces that block in
@@ -181,15 +182,23 @@ stay well inside them.
 | Assistant text per run | 12 KiB |
 | Prompt per run | 4 KiB |
 | JSON body | 16 KiB |
+| History response | 12 KiB (`history_response_bytes`) |
 | SSE frame (single line, and accumulated payload) | 16 KiB |
 | Stream socket timeout | 5 min |
 
-`GET /agent/sessions/{id}/history` must fit the same 16 KiB JSON ceiling as any
-other response, so the gateway is what trims: at most 24 messages, oldest
-first, with each text or thinking field capped at 2 KiB and at most 8 tools per
-message. A history response the device cannot accept is `invalid_response`, not
-a truncated render — the device would rather retry than show half a transcript
-and call it the whole one.
+`GET /agent/sessions/{id}/history` has its own 12 KiB bound, tighter than the
+generic JSON ceiling, so the gateway is what trims: at most 24 messages, oldest
+first within the window, with each text or thinking field capped at 2 KiB and at
+most 8 tools per message. When a gateway sends more than 24 messages anyway, the
+device keeps the **newest** 24 — the tail is the part the user was looking at,
+and the gateway already drops from the front. A history response the device
+cannot accept is `invalid_size`, not a truncated render — the device would
+rather retry than show half a transcript and call it the whole one.
+
+One SSE frame must fit the frame bound above. A frame the device cannot
+accumulate inside it fails the stream with `frame_overflow` rather than being
+skipped: the dropped frame's remainder is gone with it, so anything parsed after
+that point may be a splice of two frames and cannot be trusted.
 
 ## Local history channels
 

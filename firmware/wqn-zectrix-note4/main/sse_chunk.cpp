@@ -105,6 +105,10 @@ SseFrameBuffer::FrameState SseFrameBuffer::extract(std::string* event_name,
       // A frame's payload is the sum of its data: lines, so the cap has to be
       // checked on the accumulation rather than per line.
       if (data_.size() + value.size() + 1 > kMaxSseFrameBytes) {
+        // Sticky flag first: clear() deliberately does not reset it, so the
+        // caller can see the drop and fail the stream instead of reading on
+        // through the spliced remainder of the oversized frame.
+        overflowed_ = true;
         clear();
         return FrameState::kPartial;
       }

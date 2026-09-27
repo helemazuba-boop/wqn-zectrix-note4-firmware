@@ -14,6 +14,7 @@
 #include "problem_app.h"
 #include "problem_pack.h"
 #include "services/server_error_codes.h"
+#include "sse_chunk.h"
 #include "text_render.h"
 #include "time_app.h"
 #include "ui/markdown_layout.h"
@@ -2232,6 +2233,66 @@ bool CheckAgentGatewayV0Contract()
         return false;
     }
 
+    // --- permission without an id: unanswerable, so refused ------------------
+    //
+    // The reply route needs the id, so arming an id-less ask would hold the
+    // option bar for the rest of the run with no way to clear it. This mirrors
+    // the question case above: a malformed ask is dropped, not shown.
+    if (!Require(
+            wqn::ParseOpenCodeAgentFrame(
+                "agent.permission",
+                R"json({"type":"bash","title":"运行命令"})json",
+                &unknown_event) == ESP_ERR_INVALID_RESPONSE,
+            "agent permission without an id is rejected")) {
+        return false;
+    }
+
+    // --- one frame past the byte cap is a broken stream ----------------------
+    //
+    // `extract()` clears the frame and returns kPartial when the accumulated
+    // `data:` lines pass kMaxSseFrameBytes -- which is exactly what "need more
+    // data" looks like, so the caller used to keep reading and could parse the
+    // oversized frame's spliced tail as a real event. The sticky overflow flag
+    // is what makes the drop visible.
+    //
+    // The lines are fed and extracted one at a time on purpose: feeding them
+    // all first would trip the 16 KiB *line* cap (a different failure) before
+    // the frame cap could be reached.
+    {
+        wqn::SseFrameBuffer frame_parser;
+        std::string ev_name;
+        uint64_t ev_id = 0;
+        std::string ev_data;
+        const std::string nine_k(9 * 1024, 'x');
+        const char* event_line = "event: agent.text\n";
+        const char* data_prefix = "data: ";
+        std::string data_line = data_prefix;
+        data_line += nine_k;
+        data_line += "\n";
+
+        if (!Require(frame_parser.feed(event_line, std::strlen(event_line)),
+                     "sse overflow: event line feeds") ||
+            !Require(frame_parser.extract(&ev_name, &ev_id, &ev_data) ==
+                         wqn::SseFrameBuffer::FrameState::kPartial,
+                     "sse overflow: event line stays partial") ||
+            !Require(frame_parser.feed(data_line.data(), data_line.size()),
+                     "sse overflow: first data line feeds") ||
+            !Require(frame_parser.extract(&ev_name, &ev_id, &ev_data) ==
+                         wqn::SseFrameBuffer::FrameState::kPartial,
+                     "sse overflow: first data line stays partial") ||
+            !Require(!frame_parser.overflowed(),
+                     "sse overflow: under the cap is not flagged") ||
+            !Require(frame_parser.feed(data_line.data(), data_line.size()),
+                     "sse overflow: second data line feeds") ||
+            !Require(frame_parser.extract(&ev_name, &ev_id, &ev_data) ==
+                         wqn::SseFrameBuffer::FrameState::kPartial,
+                     "sse overflow: dropped frame stays partial") ||
+            !Require(frame_parser.overflowed(),
+                     "sse overflow: dropped frame is flagged")) {
+            return false;
+        }
+    }
+
     // --- history backfill --------------------------------------------------
     std::vector<wqn::OpenCodeHistoryMessage> messages;
     wqn::OpenCodeResult history_result;
@@ -2266,10 +2327,11 @@ bool CheckAgentGatewayV0Contract()
         return false;
     }
 
-    // `invalid/history-too-large.json`: the device's 16 KiB JSON ceiling is
-    // enforced by the parser and not only by the HTTP reader, so an oversized
-    // backfill is a visible failure rather than a half-drawn transcript.
-    const std::string oversized(16 * 1024 + 1, 'x');
+    // `invalid/history-too-large.json`: the manifest's `history_response_bytes`
+    // bound is enforced by the parser and not only by the HTTP reader, so an
+    // oversized backfill is a visible failure rather than a half-drawn
+    // transcript.
+    const std::string oversized(12 * 1024 + 1, 'x');
     if (!Require(
             wqn::ParseOpenCodeHistoryBody(oversized, &messages, &history_result) ==
                 ESP_ERR_INVALID_SIZE,
