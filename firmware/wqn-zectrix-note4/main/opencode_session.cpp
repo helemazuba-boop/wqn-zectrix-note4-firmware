@@ -61,6 +61,11 @@ std::string g_run_prompt;
 // g_run_session_id: written under g_lock at arm time, read by the worker
 // without the lock. Not cleared on finish -- every arm overwrites it.
 uint8_t g_run_detail = wqn::kOpenCodeDetailDefault;
+// One-shot for the post-run list refresh: RunPrompt sets it before chaining
+// kLoadHistory, so the backfill knows it is replacing the live transcript of a
+// finished run (not filling the empty channel a lock starts from). Consumed by
+// LoadHistory, which also leaves the run-terminal UI alone when it is set.
+bool g_history_refresh = false;
 wqn::OpenCodeOutboundQueue g_outbound_replies;
 // The ask a queued reply answers. The UI closes its option bar the moment the
 // reply is queued, so the live ask id is not proof that a reply went out: this
@@ -993,6 +998,7 @@ void RunPrompt()
             &api_result);
     }
     xSemaphoreTake(g_lock, portMAX_DELAY);
+    bool refreshing_history = false;
     if (g_interrupt_delivered.load(std::memory_order_acquire)) {
         // Stopping the run on request is a success, not a failure.
         // The run is over, so any ask it raised is dead too -- and the outbound
@@ -1010,10 +1016,23 @@ void RunPrompt()
         SetErrorLocked(api_result.detail.empty() ? "Agent 执行连接失败" : api_result.detail);
     } else {
         g_state.stream_active = false;
-        ReleaseWorkOwnershipLocked();
+        // [detail] The brief tier hides tool work from the live stream, so the
+        // digest that stands in for it exists only in the history projection.
+        // Refresh the list behind the finished run instead of releasing the
+        // session here: the chained kLoadHistory hands the ownership back when
+        // it is done, and it needs g_run_session_id until then.
+        if (g_run_detail < 1 && !g_run_failed) {
+            refreshing_history = true;
+            g_history_refresh = true;
+            ChainWorkerCommandLocked(WorkerCommand::kLoadHistory);
+        } else {
+            ReleaseWorkOwnershipLocked();
+        }
         MarkChangedLocked();
     }
-    g_run_session_id.clear();
+    if (!refreshing_history) {
+        g_run_session_id.clear();
+    }
     g_run_prompt.clear();
     xSemaphoreGive(g_lock);
     DiscardOutboundReplies();
@@ -1124,6 +1143,8 @@ void LoadHistory()
             token, g_run_session_id, g_run_detail, &messages, &api_result);
     }
     xSemaphoreTake(g_lock, portMAX_DELAY);
+    const bool refresh = g_history_refresh;
+    g_history_refresh = false;
     // A lock that switched sessions while this read was in flight invalidates
     // it: the transcript must never claim a session it was not read from.
     if (result == ESP_OK && g_run_session_id != g_state.current_session_id) {
@@ -1132,15 +1153,25 @@ void LoadHistory()
         result = ESP_ERR_INVALID_STATE;
     }
     if (result == ESP_OK) {
+        if (refresh) {
+            // Post-run refresh: the channel holds the live transcript of the
+            // run that just finished, and the backfill replaces it with the
+            // projection -- at the brief tier the digest exists only here.
+            // Clearing only on success means a failed read leaves the live
+            // transcript on screen.
+            wqn::GetAiHistory(wqn::AiHistoryChannel::kAgent).Clear();
+        }
         // Reset first, then append, then let the caller subscribe: the reverse
         // order lets the first live delta land on a backfilled message id and
         // overwrite history with new text.
         ResetAgentHistoryTurnLocked();
         BackfillAgentHistoryLocked(messages, esp_timer_get_time() / 1000);
         g_state.history_loaded_session_id = g_run_session_id;
-        if (!g_observing) {
+        if (!g_observing && !refresh) {
             // Lock-triggered backfill: the stream was never the goal, so hand
-            // the session back ready to prompt.
+            // the session back ready to prompt. A post-run refresh is not the
+            // lock's backfill: the status bar already reported the run's own
+            // terminal state, and a background re-read must not relabel it.
             g_state.ui.phase = wqn::AiFeaturePhase::kIdle;
             g_state.ui.status_label = "就绪";
             g_state.ui.activity_text = "长按确认键语音输入";
@@ -1150,15 +1181,20 @@ void LoadHistory()
         ESP_LOGW(kTag, "history backfill failed for %s: %s (%s)",
                  g_run_session_id.c_str(), api_result.error_code.c_str(),
                  api_result.detail.c_str());
-        // Failure must not leave a busy phase behind: an observing caller would
-        // sit on "观察中" with no stream attached, and a lock would stay busy.
-        g_state.ui.phase = wqn::AiFeaturePhase::kError;
-        g_state.ui.status_label = g_observing ? "观察失败" : "历史读取失败";
-        g_state.ui.activity_text =
-            g_observing ? "历史读取失败" : "可重新选择 Session 重试";
-        g_state.stream_active = false;
-        g_observing = false;
-        MarkChangedLocked();
+        if (!refresh) {
+            // Failure must not leave a busy phase behind: an observing caller
+            // would sit on "观察中" with no stream attached, and a lock would
+            // stay busy. A post-run refresh has neither problem -- the run
+            // already reached its terminal UI and the live transcript is
+            // intact -- so its failure is the log line above and nothing more.
+            g_state.ui.phase = wqn::AiFeaturePhase::kError;
+            g_state.ui.status_label = g_observing ? "观察失败" : "历史读取失败";
+            g_state.ui.activity_text =
+                g_observing ? "历史读取失败" : "可重新选择 Session 重试";
+            g_state.stream_active = false;
+            g_observing = false;
+            MarkChangedLocked();
+        }
     }
     if (result == ESP_OK && g_observing) {
         // Chain the observe stream behind the backfill: the stream must not
