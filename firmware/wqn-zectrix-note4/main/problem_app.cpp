@@ -216,7 +216,10 @@ std::string ComposeAnswerText(const wqn::WqnProblemEntry& entry)
         text.push_back('\n');
         text.push_back('\n');
     }
-    if (!text.empty()) {
+    // Each part appends a "\n\n" separator; drop the whole trailing one so
+    // the text ends on the last answer line (parts stay blank-separated).
+    if (text.size() >= 2) {
+        text.pop_back();
         text.pop_back();
     }
     return text;
