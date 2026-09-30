@@ -181,6 +181,9 @@ esp_err_t RunOpenCodePrompt(
     const std::string& session_id,
     uint8_t detail,
     const std::string& prompt,
+    // Run idempotency key: 16 hex chars. Empty omits the field, which is the
+    // pre-P2 body the cloud treats as "no idempotency".
+    const std::string& request_id,
     OpenCodeOutboundQueue* outbound_replies,
     OpenCodeReplyFailedCallback reply_failed,
     void* reply_failed_ctx,

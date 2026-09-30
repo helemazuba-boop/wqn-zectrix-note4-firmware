@@ -3,6 +3,7 @@
 #include <cstring>
 #include <string>
 
+#include "ai_session.h"
 #include "cJSON.h"
 #include "device_protocol/v3.h"
 #include "device_protocol/problem_study.h"
@@ -1831,6 +1832,16 @@ constexpr char kAgentHistory[] = R"json({
   }
 })json";
 
+// `valid/run-request-with-id.json`. The boot self-test has no schema validator,
+// so this fixture is asserted by hand: the id must be exactly 16 lowercase hex
+// characters, which is both what the cloud's `request_id` pattern accepts and
+// what GenerateRequestId() mints for the run body.
+constexpr char kAgentRunRequestWithId[] = R"json({
+  "text": "帮我把这道极限题的步骤整理成错题本",
+  "confirmed": true,
+  "request_id": "0123456789abcdef"
+})json";
+
 // Replay one fixture's `{event, data}` pairs through the frame parser, handing
 // each event to `visit`. Parsing stops at the first frame the parser refuses,
 // so a caller cannot accidentally assert on a frame that was dropped.
@@ -2336,6 +2347,45 @@ bool CheckAgentGatewayV0Contract()
             wqn::ParseOpenCodeHistoryBody(oversized, &messages, &history_result) ==
                 ESP_ERR_INVALID_SIZE,
             "agent history rejects oversized body")) {
+        return false;
+    }
+
+    // --- run request idempotency key: 16 lowercase hex chars ----------------
+    //
+    // The schema carries the pattern but nothing in the firmware validates a
+    // request body, so the shape is pinned here by hand -- against the fixture
+    // and against the generator that actually mints the ids the run route
+    // sends. An uppercase or short id would be a 422 the device could not
+    // explain.
+    cJSON* run_request = cJSON_ParseWithLength(
+        kAgentRunRequestWithId, sizeof(kAgentRunRequestWithId) - 1);
+    if (!Require(run_request != nullptr, "agent run request fixture parses")) {
+        return false;
+    }
+    const cJSON* fixture_id =
+        cJSON_GetObjectItemCaseSensitive(run_request, "request_id");
+    const auto is_run_request_id = [](const char* value) {
+        if (value == nullptr || std::strlen(value) != 16) {
+            return false;
+        }
+        for (const char* cursor = value; *cursor != '\0'; ++cursor) {
+            const bool hex = (*cursor >= '0' && *cursor <= '9') ||
+                             (*cursor >= 'a' && *cursor <= 'f');
+            if (!hex) {
+                return false;
+            }
+        }
+        return true;
+    };
+    const bool fixture_id_ok = Require(
+        cJSON_IsString(fixture_id) && is_run_request_id(fixture_id->valuestring),
+        "agent run request fixture id is 16 hex chars");
+    cJSON_Delete(run_request);
+    const std::string minted_id = wqn::GenerateRequestId();
+    if (!fixture_id_ok ||
+        !Require(
+            is_run_request_id(minted_id.c_str()),
+            "agent generated run request id is 16 hex chars")) {
         return false;
     }
 

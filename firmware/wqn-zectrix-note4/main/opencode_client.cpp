@@ -663,6 +663,7 @@ esp_err_t RunOpenCodePrompt(
     const std::string& session_id,
     uint8_t detail,
     const std::string& prompt,
+    const std::string& request_id,
     OpenCodeOutboundQueue* outbound_replies,
     OpenCodeReplyFailedCallback reply_failed,
     void* reply_failed_ctx,
@@ -683,6 +684,11 @@ esp_err_t RunOpenCodePrompt(
     }
     cJSON_AddStringToObject(root, "text", prompt.c_str());
     cJSON_AddBoolToObject(root, "confirmed", true);
+    // Omitted when empty so a caller with no key keeps the pre-P2 body byte
+    // for byte. The cloud validates the shape (16 lowercase hex chars).
+    if (!request_id.empty()) {
+        cJSON_AddStringToObject(root, "request_id", request_id.c_str());
+    }
     char* printed = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
     if (printed == nullptr) {

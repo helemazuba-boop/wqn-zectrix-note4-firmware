@@ -43,7 +43,7 @@ All paths are relative to the ESP32 API base (`WQN_API_BASE`, default
 | `GET` | `/agent/sessions` | — | List bound sessions (device shows at most 12) |
 | `POST` | `/agent/sessions` | `{}` | Create a new session |
 | `POST` | `/agent/transcribe` | PCM16 LE | ASR for a held PTT recording |
-| `POST` | `/agent/sessions/{id}/run` | `{text, confirmed}` | Start or resume a run, stream its events |
+| `POST` | `/agent/sessions/{id}/run` | `{text, confirmed, request_id?}` | Start or resume a run, stream its events |
 | `GET` | `/agent/sessions/{id}/events` | — | Observe a run started elsewhere |
 | `POST` | `/agent/sessions/{id}/permission` | `{permission_id, decision, confirmed}` | Answer a pending ask |
 | `GET` | `/agent/sessions/{id}/history` | — | Backfill a transcript this device has not rendered |
@@ -66,6 +66,14 @@ dialect already used by the v2-streaming AI tier: `event:` + `data:` frames, one
 JSON object per data payload, terminated by a blank line. They also send `id:`
 lines and `:` comment keepalives, which the device discards; a streaming body is
 the `runStream` frame list and carries no envelope.
+
+`/agent/sessions/{id}/run` may answer a **JSON error envelope instead of a
+stream**: when the optional `request_id` is rejected — reused with a different
+prompt (`request_id_conflict`), while another run is already in flight
+(`run_in_progress`), or with the idempotency ledger unavailable
+(`run_idempotency_unavailable`) — the route answers 409/503 before any frame
+exists. Those are the only JSON answers either streaming route sends, and they
+are why the device must read the HTTP status before parsing a body as SSE.
 
 `/agent/transcribe` sends raw PCM with the audio shape in headers rather than
 multipart, matching the existing AI audio endpoints:

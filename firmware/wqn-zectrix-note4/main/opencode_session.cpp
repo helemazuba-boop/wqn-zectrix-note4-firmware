@@ -64,6 +64,12 @@ bool g_run_failed = false;
 bool g_observing = false;
 std::string g_run_session_id;
 std::string g_run_prompt;
+// [run-id] Idempotency key of the current logical submission. Minted once at
+// confirm time and reused by a transport retry of the same prompt, so the
+// cloud attaches to the live run instead of running the prompt twice. Cleared
+// when the prompt changes and when a run reaches a known terminal outcome
+// (both mean the next submission is a new logical run).
+std::string g_run_request_id;
 // [detail] Detail tier for the command in flight, handed over the same way as
 // g_run_session_id: written under g_lock at arm time, read by the worker
 // without the lock. Not cleared on finish -- every arm overwrites it.
@@ -1138,6 +1144,7 @@ void RunPrompt()
             g_run_session_id,
             g_run_detail,
             g_run_prompt,
+            g_run_request_id,
             &g_outbound_replies,
             OnOpenCodeReplyFailed,
             nullptr,
@@ -1184,6 +1191,14 @@ void RunPrompt()
         g_run_session_id.clear();
     }
     g_run_prompt.clear();
+    if (result == ESP_OK) {
+        // [run-id] ESP_OK means the stream reached a terminal frame (or the
+        // interrupt was delivered): the outcome is known, so the next
+        // submission is a new logical run. A transport failure keeps the id --
+        // the cloud may have accepted the run, and the retry must attach to it
+        // rather than run the prompt twice.
+        g_run_request_id.clear();
+    }
     xSemaphoreGive(g_lock);
     DiscardOutboundReplies();
 }
@@ -1787,6 +1802,10 @@ esp_err_t StartOpenCodeVoiceInput()
             g_state.ui.prompt_text.clear();
             g_state.ui.scroll_offset_lines = 0;
         }
+        // [run-id] Both branches change the prompt (replace or append), and
+        // the cloud fingerprints the prompt text: a pending idempotency key
+        // belongs to a text that no longer exists, so it must not be reused.
+        g_run_request_id.clear();
         // [follow] Capture arms the follow so the viewport is already watching
         // when the transcript is confirmed. The per-tick step skips the capture
         // phases outright (the codec is being configured and must not share the
@@ -1892,6 +1911,14 @@ esp_err_t ConfirmOpenCodePrompt(int64_t confirmed_at_ms)
         g_run_session_id = g_state.current_session_id;
         g_run_prompt = g_state.ui.prompt_text;
         g_run_detail = g_state.detail_level;
+        // [run-id] Minted once per logical submission; a transport retry of
+        // the same prompt reuses it. Anything that changes the prompt clears
+        // it (StartOpenCodeVoiceInput), because the cloud fingerprints the
+        // text: the same id with a different prompt is a conflict, not a
+        // retry. A known terminal outcome also clears it (RunPrompt).
+        if (g_run_request_id.empty()) {
+            g_run_request_id = wqn::GenerateRequestId();
+        }
         if (!ArmWorkerLocked(WorkerCommand::kRunPrompt)) {
             g_run_session_id.clear();
             g_run_prompt.clear();
