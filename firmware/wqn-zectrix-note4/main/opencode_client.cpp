@@ -85,6 +85,16 @@ using wqn::kMaxHistoryTools;
 
 constexpr char kTag[] = "wqn_opencode_api";
 
+// [interrupt-fix] One socket-read window inside the agent event stream.
+// esp_http_client_read() only returns once the caller's buffer is full or the
+// socket read times out, and the stream buffer is 768 bytes. A silent run
+// carries only ~13-byte keepalive comments every ~14 s, so a single read could
+// stay blocked for minutes -- and the interrupt flag was only re-checked
+// between reads. A one-second window makes an idle stream return
+// -ESP_ERR_HTTP_EAGAIN once a second so the loop can poll the flag; real data
+// still arrives long before the window closes, so no bytes are lost.
+constexpr int kAgentStreamIdleReadTimeoutMs = 1000;
+
 std::string AgentUrl(const char* path)
 {
     std::string url = WQN_API_BASE;
@@ -423,6 +433,11 @@ esp_err_t ReadAgentEventStream(const AgentStreamRequest& request)
             }
         }
     }
+    if (request_result == ESP_OK) {
+        // [interrupt-fix] Connect and header fetch above keep the long
+        // timeout; only the streaming read gets the short idle window.
+        esp_http_client_set_timeout_ms(client, kAgentStreamIdleReadTimeoutMs);
+    }
     wqn::SseFrameBuffer parser;
     std::array<char, 768> buffer = {};
     // Either terminal status ends the read loop: `idle` is the contract's
@@ -445,6 +460,12 @@ esp_err_t ReadAgentEventStream(const AgentStreamRequest& request)
             break;
         }
         const int count = esp_http_client_read(client, buffer.data(), buffer.size());
+        if (count == -ESP_ERR_HTTP_EAGAIN) {
+            // The idle window closed with no bytes: a quiet stream, not a
+            // transport failure. Loop so the interrupt flag is re-checked;
+            // the next window picks up whatever arrives.
+            continue;
+        }
         if (count < 0) {
             request_result = ESP_FAIL;
             break;
