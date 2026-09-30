@@ -4,6 +4,7 @@ idf_component_register(
         "ai_feature.cpp"
         "ai_history.cpp"
         "ai_session.cpp"
+        "agent_voice_pipe.cpp"
         "audio_capture.cpp"
         "audio_player.cpp"
         "audio_selftest.cpp"

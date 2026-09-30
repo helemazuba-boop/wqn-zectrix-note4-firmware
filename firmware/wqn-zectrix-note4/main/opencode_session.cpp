@@ -8,6 +8,7 @@
 
 #include "ai_session.h"
 #include "ai_history.h"
+#include "agent_voice_pipe.h"
 #include "audio_capture.h"
 #include "esp_check.h"
 #include "esp_log.h"
@@ -32,6 +33,11 @@ constexpr size_t kMaxAgentTextBytes = 12 * 1024;
 constexpr size_t kMaxThinkingBytes = 2 * 1024;
 constexpr size_t kMaxPromptBytes = 4096;
 constexpr uint32_t kWorkerStackBytes = 9216;
+// [voice-pipe] How long Transcribe() waits for the agent WS turn to produce an
+// ASR result after FINAL. The ASR-only pipeline is fast (streamed deltas),
+// and a stuck turn should surface as an error long before the STD driver's
+// 10-minute chat budget.
+constexpr uint32_t kAgentVoiceFinalizeTimeoutMs = 15000;
 
 enum class WorkerCommand : uint8_t {
     kNone,
@@ -39,6 +45,7 @@ enum class WorkerCommand : uint8_t {
     kCreateSession,
     kPrepareCapture,
     kTranscribe,
+    kCancelVoice,
     kRunPrompt,
     kObserveSession,
     kLoadHistory,
@@ -78,6 +85,15 @@ std::string g_reply_flight_question_id;
 // that records whether the interrupt actually reached the gateway.
 std::atomic<bool> g_interrupt_requested{false};
 std::atomic<bool> g_interrupt_delivered{false};
+// [voice-pipe] Hard-abort request for the capture phases. Set by
+// CancelAgentVoiceInput (UI thread); consumed by the kCancelVoice worker
+// command -- or, when the capture worker is still bringing the WS turn up
+// inside kPrepareCapture, by that handler's own check after the turn exists.
+bool g_voice_abort_requested = false;
+// Last ASR error message from the agent voice stream, stashed by
+// OnAgentVoiceSse for the worker's error branch. Reset at the start of every
+// capture so a stale message can never be reported for a new turn.
+std::string g_voice_last_error;
 wqn::runtime::SleepLease g_agent_sleep_lease;
 wqn::services::ConnectivityDemand g_connectivity_demand;
 
@@ -269,6 +285,97 @@ void LoadSessions()
     xSemaphoreGive(g_lock);
 }
 
+// ---- Voice pipe (WS turn) --------------------------------------------------
+// [voice-pipe] The Agent capture rides the shared Std/Pro WebSocket with
+// tier=agent: the capture tap (owned by ai_session, armed once in InitAiSession)
+// forwards PCM into stdpro_ws, which drops it until a turn reaches kRecording.
+// agent_voice_pipe owns the turn itself; these helpers bridge it to the worker
+// and the UI.
+
+// UI-side observer for the live voice stream. Runs on the transport task, so
+// every state write takes g_lock. The module's trampoline already accumulates
+// the transcript for the worker; this only shapes what the screen shows while
+// the turn is live.
+void OnAgentVoiceSse(const wqn::WqnAiSseEvent& ev, void* /*user_ctx*/)
+{
+    using Kind = wqn::WqnAiSseEvent::Kind;
+    if (g_lock == nullptr) {
+        return;
+    }
+    xSemaphoreTake(g_lock, portMAX_DELAY);
+    const wqn::AiFeaturePhase phase = g_state.ui.phase;
+    const bool capturing = phase == wqn::AiFeaturePhase::kRecording ||
+                           phase == wqn::AiFeaturePhase::kTranscribing;
+    switch (ev.kind) {
+        case Kind::kAsrDelta: {
+            if (!capturing) {
+                break;
+            }
+            g_state.ui.voice_partial += ev.delta;
+            // Same delta coalescing as the STD consumer (ai_session.cpp
+            // OnSseEvent): every change mark costs a full state copy on the UI
+            // task, and deltas land far faster than the panel can repaint.
+            static int64_t s_last_delta_mark_ms = -1000;
+            const int64_t now_ms = esp_timer_get_time() / 1000;
+            if (now_ms - s_last_delta_mark_ms >= 50) {
+                s_last_delta_mark_ms = now_ms;
+                MarkChangedLocked();
+            }
+            break;
+        }
+        case Kind::kAsrComplete:
+            if (capturing) {
+                g_state.ui.voice_partial = ev.text;
+                MarkChangedLocked();
+            }
+            break;
+        case Kind::kAsrFailed:
+            g_voice_last_error = ev.error_message.empty()
+                ? std::string("语音识别失败")
+                : ev.error_message;
+            break;
+        case Kind::kError:
+            g_voice_last_error = ev.error_message.empty() ? ev.error_code
+                                                          : ev.error_message;
+            break;
+        default:
+            break;
+    }
+    xSemaphoreGive(g_lock);
+}
+
+// Bring up the WS turn that carries this capture. Called from the capture
+// worker after the microphone is running; every failure is non-fatal --
+// Transcribe() falls back to the batch endpoint when no turn exists.
+void StartVoiceTurn(const std::string& token)
+{
+    const std::string request_id = wqn::GenerateRequestId();
+    uint32_t turn_gen = 0;
+    const esp_err_t result = wqn::AgentVoiceTurnStart(token, request_id, &turn_gen);
+    if (result != ESP_OK) {
+        ESP_LOGW(kTag, "agent voice turn not started (%s); batch fallback armed",
+                 esp_err_to_name(result));
+    }
+}
+
+// Hard abort: drop the captured audio, tear the WS turn down (a no-op when it
+// was never established) and release everything the capture acquired. The UI
+// half (idle label) is set by CancelAgentVoiceInput, which is the only caller.
+void TearDownVoiceCapture()
+{
+    wqn::AgentVoiceTurnAbort();
+    wqn::AudioCaptureChunk discarded;
+    wqn::StopAudioCapture(&discarded);
+    wqn::ReleaseAudioCapturePower();
+
+    xSemaphoreTake(g_lock, portMAX_DELAY);
+    g_recording_requested = false;
+    g_voice_abort_requested = false;
+    g_state.ui.voice_partial.clear();
+    ReleaseWorkOwnershipLocked();
+    xSemaphoreGive(g_lock);
+}
+
 void PrepareCapture()
 {
     std::string token;
@@ -282,20 +389,19 @@ void PrepareCapture()
     should_capture = result == ESP_OK && g_recording_requested;
     xSemaphoreGive(g_lock);
     if (should_capture) {
-        // AudioCapture is shared with the legacy AI page, whose tap forwards
-        // PCM to its Std/Pro WebSocket. Agent capture is ASR-only until the
-        // user confirms, so isolate the microphone before starting it.
+        // [voice-pipe] The Agent capture rides the shared Std/Pro WebSocket
+        // (tier=agent), so the capture tap STAYS installed: it forwards PCM
+        // into stdpro_ws, which drops it until the turn reaches kRecording.
+        // The tap is armed once in InitAiSession and nothing may disable it
+        // here -- that is what keeps this capture out of the batch-only path.
         if (wqn::IsAudioCaptureRunning()) {
             mic_busy = true;
             result = ESP_ERR_INVALID_STATE;
         } else {
-            wqn::SetAiAudioCaptureTapEnabled(false);
             result = wqn::StartAudioCapture();
-            if (result != ESP_OK) {
-                wqn::SetAiAudioCaptureTapEnabled(true);
-            }
         }
     }
+    bool capture_started = false;
     xSemaphoreTake(g_lock, portMAX_DELAY);
     if (result != ESP_OK) {
         SetErrorLocked(mic_busy
@@ -307,7 +413,6 @@ void PrepareCapture()
         wqn::AudioCaptureChunk discarded;
         xSemaphoreGive(g_lock);
         wqn::StopAudioCapture(&discarded);
-        wqn::SetAiAudioCaptureTapEnabled(true);
         wqn::ReleaseAudioCapturePower();
         xSemaphoreTake(g_lock, portMAX_DELAY);
         if (!g_state.ui.prompt_text.empty() && g_state.ui.requires_confirmation) {
@@ -328,15 +433,35 @@ void PrepareCapture()
         g_state.ui.activity_text = "松开确认键开始转写";
         g_state.ui.action_hint = "松开确认键停止";
         MarkChangedLocked();
+        capture_started = true;
     }
     xSemaphoreGive(g_lock);
+
+    if (!capture_started) {
+        return;
+    }
+    // Bring the WS turn up OUTSIDE the lock: EnsureConnected can block for
+    // seconds and must never hold the state mutex. The turn belongs to this
+    // capture -- Transcribe() finalizes it, and falls back to the batch
+    // endpoint when it was never established.
+    wqn::AgentVoiceRegisterDeltaCallback(&OnAgentVoiceSse, nullptr);
+    StartVoiceTurn(token);
+
+    // [voice-pipe] A Down-cancel that landed while this worker owned the
+    // command slot could not arm kCancelVoice; honor it here, now that the
+    // turn exists, so no half-open turn is left behind.
+    xSemaphoreTake(g_lock, portMAX_DELAY);
+    const bool abort_requested = g_voice_abort_requested;
+    xSemaphoreGive(g_lock);
+    if (abort_requested) {
+        TearDownVoiceCapture();
+    }
 }
 
 void Transcribe()
 {
     wqn::AudioCaptureChunk audio;
     esp_err_t result = wqn::StopAudioCapture(&audio);
-    wqn::SetAiAudioCaptureTapEnabled(true);
     if (result == ESP_OK && (audio.empty() || audio.duration_ms < 1000)) {
         result = ESP_ERR_INVALID_SIZE;
     }
@@ -347,13 +472,33 @@ void Transcribe()
     std::string transcript;
     wqn::OpenCodeResult api_result;
     if (result == ESP_OK) {
-        result = wqn::TranscribeOpenCodeAudio(token, audio, &transcript, &api_result);
+        // [voice-pipe] A live WS turn carries this clip: FINAL hands the audio
+        // over and the ASR text comes back from the stream. When no turn was
+        // established (connect/start failed, or the clip never left the
+        // device), ESP_ERR_INVALID_STATE means the batch endpoint is the only
+        // safe path. A soft cancel returns ESP_OK with an empty transcript and
+        // is handled by the cancel branch below.
+        const esp_err_t ws_result = wqn::AgentVoiceTurnFinalize(
+            audio.duration_ms, kAgentVoiceFinalizeTimeoutMs, &transcript);
+        if (ws_result == ESP_ERR_INVALID_STATE) {
+            result = wqn::TranscribeOpenCodeAudio(token, audio, &transcript, &api_result);
+        } else {
+            result = ws_result;
+        }
     }
     wqn::ReleaseAudioCapturePower();
 
     xSemaphoreTake(g_lock, portMAX_DELAY);
     g_recording_requested = false;
-    if (result == ESP_OK &&
+    const bool cancelled = wqn::AgentVoiceCancelRequested();
+    wqn::AgentVoiceClearCancel();
+    g_state.ui.voice_partial.clear();
+    if (cancelled) {
+        // [voice-pipe] The UI already flipped to idle when the user cancelled;
+        // there is nothing to commit and nothing to report. The capture's
+        // network demand and sleep lease still have to go back, though.
+        ReleaseWorkOwnershipLocked();
+    } else if (result == ESP_OK &&
         g_state.ui.prompt_text.size() + transcript.size() +
                 (g_state.ui.prompt_text.empty() ? 0 : 1) >
             kMaxPromptBytes) {
@@ -374,7 +519,12 @@ void Transcribe()
     } else if (result == ESP_ERR_INVALID_SIZE) {
         SetErrorLocked("录音过短或未检测到语音");
     } else {
-        SetErrorLocked(api_result.detail.empty() ? "语音转写失败" : api_result.detail);
+        // The stream's error text (when one arrived) beats the generic label;
+        // the batch path has its own detail in api_result.
+        const std::string& detail = !api_result.detail.empty()
+            ? api_result.detail
+            : g_voice_last_error;
+        SetErrorLocked(detail.empty() ? "语音转写失败" : detail);
     }
     xSemaphoreGive(g_lock);
 }
@@ -1234,6 +1384,9 @@ void WorkerTask(void*)
             case WorkerCommand::kTranscribe:
                 Transcribe();
                 break;
+            case WorkerCommand::kCancelVoice:
+                TearDownVoiceCapture();
+                break;
             case WorkerCommand::kRunPrompt:
                 RunPrompt();
                 break;
@@ -1625,6 +1778,11 @@ esp_err_t StartOpenCodeVoiceInput()
         }
     }
     if (result == ESP_OK) {
+        // [voice-pipe] A fresh capture starts from a clean voice slate: no
+        // partial text, no stale stream error, no abort left armed.
+        g_voice_last_error.clear();
+        g_voice_abort_requested = false;
+        g_state.ui.voice_partial.clear();
         if (!append_to_pending_prompt) {
             g_state.ui.prompt_text.clear();
             g_state.ui.scroll_offset_lines = 0;
@@ -1673,6 +1831,44 @@ esp_err_t StopOpenCodeVoiceInput()
     xTaskNotifyGive(g_worker);
     xSemaphoreGive(g_lock);
     return ESP_OK;
+}
+
+void CancelAgentVoiceInput()
+{
+    if (g_lock == nullptr) {
+        return;
+    }
+    xSemaphoreTake(g_lock, portMAX_DELAY);
+    const wqn::AiFeaturePhase phase = g_state.ui.phase;
+    if (phase == wqn::AiFeaturePhase::kRecording) {
+        // Hard abort: the audio is discarded and the WS turn is torn down. The
+        // worker usually owns no command in this phase, but the tail of
+        // kPrepareCapture (bringing the WS turn up) still does -- it checks the
+        // flag after the turn exists and tears it down itself.
+        g_voice_abort_requested = true;
+        if (g_command == WorkerCommand::kNone) {
+            ArmWorkerLocked(WorkerCommand::kCancelVoice);
+        }
+        g_state.ui.phase = wqn::AiFeaturePhase::kIdle;
+        g_state.ui.status_label = "已取消录音";
+        g_state.ui.activity_text = "录音已丢弃";
+        g_state.ui.action_hint = "长按确认重新录音";
+        g_state.ui.voice_partial.clear();
+        MarkChangedLocked();
+    } else if (phase == wqn::AiFeaturePhase::kTranscribing) {
+        // Soft cancel: the finalize stops waiting and drops whatever the
+        // stream returns; the turn is left to finish on the transport's own
+        // time. A prompt re-record falls back to the batch endpoint when the
+        // transport is still busy.
+        wqn::AgentVoiceRequestCancel();
+        g_state.ui.phase = wqn::AiFeaturePhase::kIdle;
+        g_state.ui.status_label = "已取消";
+        g_state.ui.activity_text = "语音内容未发送";
+        g_state.ui.action_hint = "长按确认重新录音";
+        g_state.ui.voice_partial.clear();
+        MarkChangedLocked();
+    }
+    xSemaphoreGive(g_lock);
 }
 
 esp_err_t ConfirmOpenCodePrompt(int64_t confirmed_at_ms)
@@ -1900,6 +2096,7 @@ esp_err_t StartOpenCodeVoiceInput() { return ESP_ERR_NOT_SUPPORTED; }
 esp_err_t StopOpenCodeVoiceInput() { return ESP_ERR_NOT_SUPPORTED; }
 esp_err_t ConfirmOpenCodePrompt(int64_t) { return ESP_ERR_NOT_SUPPORTED; }
 void CancelOpenCodePrompt() {}
+void CancelAgentVoiceInput() {}
 void ScrollOpenCodeResponse(int, int32_t, int32_t) {}
 void SetOpenCodeScrollOffsetClamped(int32_t, int32_t, int32_t) {}
 void SetOpenCodeFollowState(bool, bool) {}

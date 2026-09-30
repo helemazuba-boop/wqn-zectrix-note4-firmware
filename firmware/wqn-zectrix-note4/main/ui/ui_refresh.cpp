@@ -512,6 +512,11 @@ std::string FrameSignature(const wqn::UiFrame& frame)
         signature.push_back('/');
         signature.append(agent.ui.prompt_text);
         signature.push_back('/');
+        // [voice-pipe] The live ASR partial is the only content that changes
+        // while a capture is transcribing; without it here the dedup pipeline
+        // would silently skip every partial repaint.
+        signature.append(agent.ui.voice_partial);
+        signature.push_back('/');
         signature.append(agent.ui.response_text);
         signature.push_back('/');
         signature.append(agent.ui.activity_text);

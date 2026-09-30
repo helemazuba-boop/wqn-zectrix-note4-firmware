@@ -633,8 +633,9 @@ void TrampolineSseEvent(const wqn::WqnAiSseEvent& ev, void* /*user*/)
 }
 
 // Request-id used by the SSE idempotency header. Same shape as the v1
-// `request_id` (16 hex chars) so server-side logs read consistently.
-std::string GenerateRequestId()
+// `request_id` (16 hex chars) so server-side logs read consistently. The
+// public wrapper lives below; the Agent voice pipe shares this generator.
+std::string GenerateAiRequestId()
 {
     static std::mt19937 rng{static_cast<unsigned>(esp_timer_get_time())};
     char buf[20];
@@ -1003,7 +1004,7 @@ void SubmitSession()
             req.reasoning_effort = effort;
             req.enable_thinking = (thinking_level != wqn::ThinkingLevel::kOff);
         }
-        req.request_id = turn_req_id.empty() ? GenerateRequestId() : turn_req_id;
+        req.request_id = turn_req_id.empty() ? GenerateAiRequestId() : turn_req_id;
         req.callback = &TrampolineSseEvent;
         req.user_ctx = nullptr;
         LogAiMemory("before-sse-upload");
@@ -1185,7 +1186,7 @@ void PrepareRecordingSession(uint32_t generation)
             // published only after StartTurn so no other stage can act on a
             // turn that does not exist yet. I2S DMA must be placed before the
             // TLS handshake claims its share of the pool.
-            req_id = GenerateRequestId();
+            req_id = GenerateAiRequestId();
             g_current_turn_req_id = req_id;
             tier_str = (g_state.tier == wqn::AiTier::kStd) ? "std" : "pro";
             conv_id = g_conversation_id;
@@ -1439,6 +1440,20 @@ esp_err_t InitAiSession()
 void SetAiAudioCaptureTapEnabled(bool enabled)
 {
     wqn::SetAudioCaptureTap(enabled ? &AudioCaptureTapHandler : nullptr, nullptr);
+}
+
+// [agent-voice] See the declarations in ai_session.h. The Agent voice pipe
+// drives its own stdpro_ws turn, so it needs the preroll arm and the request-id
+// generator without any of the STD session state that PrepareRecordingSession
+// installs.
+void ArmAiVoicePreroll()
+{
+    g_preroll_pending.store(true, std::memory_order_release);
+}
+
+std::string GenerateRequestId()
+{
+    return GenerateAiRequestId();
 }
 
 esp_err_t StartAiRecordingSession()
@@ -1890,6 +1905,16 @@ esp_err_t InitAiSession()
 }
 
 void SetAiAudioCaptureTapEnabled(bool) {}
+
+// [agent-voice] Stubs: the Agent tier is unreachable without AI features
+// (CONFIG_WQN_AGENT_ENABLE depends on WQN_AI_ENABLE), but agent_voice_pipe.cpp
+// keeps its signatures so both halves build against the same header.
+void ArmAiVoicePreroll() {}
+
+std::string GenerateRequestId()
+{
+    return std::string();
+}
 
 esp_err_t StartAiRecordingSession()
 {

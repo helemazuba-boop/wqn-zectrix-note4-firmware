@@ -1335,6 +1335,15 @@ RefreshSchedule ApplyButtonEvent(
         (event.button == wqn::ButtonId::kUp || event.button == wqn::ButtonId::kDownPower)) {
         if (state->agent.ui.phase == wqn::AiFeaturePhase::kRecording ||
             state->agent.ui.phase == wqn::AiFeaturePhase::kTranscribing) {
+            // [voice-cancel] Down cancels the voice input in either capture
+            // phase: a hard abort while recording (the audio is discarded and
+            // the WS turn is torn down) or a soft cancel while transcribing
+            // (the transcript is dropped when it lands). Up has no cancel
+            // meaning and stays swallowed.
+            if (event.button == wqn::ButtonId::kDownPower) {
+                wqn::CancelAgentVoiceInput();
+                return RefreshSchedule::kAi;
+            }
             return RefreshSchedule::kNone;
         }
         // Up = older content above; the sign matches ScrollOpenCodeResponse's

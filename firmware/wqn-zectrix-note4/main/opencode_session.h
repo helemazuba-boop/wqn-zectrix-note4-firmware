@@ -18,6 +18,12 @@ esp_err_t ReplyPendingOpenCodePermission(bool approve);
 esp_err_t ReplyPendingOpenCodeQuestion(int index);
 esp_err_t StartOpenCodeVoiceInput();
 esp_err_t StopOpenCodeVoiceInput();
+// [voice-pipe] Down short press during a capture phase. While recording this
+// hard-aborts the WS turn (audio discarded, nothing submitted); while
+// transcribing it soft-cancels (the transcript is discarded when it lands).
+// Both land on idle with a "已取消" label; a phase outside the capture pair
+// makes it a no-op.
+void CancelAgentVoiceInput();
 esp_err_t ConfirmOpenCodePrompt(int64_t confirmed_at_ms);
 // Discard a prompt that has not been submitted yet.
 void CancelOpenCodePrompt();

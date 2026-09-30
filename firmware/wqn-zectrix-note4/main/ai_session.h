@@ -10,9 +10,20 @@ namespace wqn {
 
 esp_err_t InitAiSession();
 // The shared capture service normally mirrors PCM into the legacy Std/Pro
-// WebSocket transport. Independent AI features must suspend that tap while
-// they own the microphone so their audio cannot leak into another backend.
+// WebSocket transport. A feature that owns the microphone for a DIFFERENT
+// backend can suspend the tap; the Agent voice pipe deliberately keeps it
+// enabled, because its tier=agent turn rides that same transport (the tap
+// feeds stdpro_ws, which drops PCM until a turn reaches kRecording).
 void SetAiAudioCaptureTapEnabled(bool enabled);
+// [agent-voice] Exported for the Agent voice pipe (agent_voice_pipe.cpp),
+// which drives its own stdpro_ws turn and therefore cannot reuse
+// PrepareRecordingSession. ArmAiVoicePreroll only arms the one-shot replay of
+// audio captured before the turn committed -- it must NOT install the STD SSE
+// trampoline (SetSseCallback is a single global slot; the agent path installs
+// its own trampoline).
+void ArmAiVoicePreroll();
+// Request-id used by the SSE idempotency headers: 16 hex chars.
+std::string GenerateRequestId();
 esp_err_t StartAiRecordingSession();
 esp_err_t StopAiRecordingAndSubmit();
 // Clear STD/PRO conversation context (AiHistory + conversation_id + display

@@ -354,6 +354,18 @@ esp_err_t RenderAgentAiToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule
 
     RenderAiHistoryViewport(frame.ai, frame.ai_history, agent.ui.scroll_offset_lines);
 
+    // [voice-pipe] While the ASR result streams in, the partial transcript is
+    // the only new content on screen: draw it in the same pending bubble the
+    // asks use, with no option bar (there is nothing to choose yet). This must
+    // come before the kNone early return below -- kTranscribing projects no
+    // option mode, so without this branch the partial would never render.
+    if (agent.ui.phase == wqn::AiFeaturePhase::kTranscribing) {
+        if (!agent.ui.voice_partial.empty()) {
+            DrawAgentPendingBubble(agent.ui.voice_partial, "转写中");
+        }
+        return RefreshFrame(frame, schedule);
+    }
+
     const AgentOptionMode mode = AgentOptionModeFor(agent);
     if (mode == AgentOptionMode::kNone) {
         return RefreshFrame(frame, schedule);

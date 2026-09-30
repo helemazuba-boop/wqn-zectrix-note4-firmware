@@ -29,6 +29,10 @@ struct AiFeatureUiState {
     std::string context_label;
     std::string status_label;
     std::string prompt_text;
+    // [voice-pipe] Live ASR text for the in-flight voice capture. Appended by
+    // the agent SSE callback while the turn is transcribing and rendered in
+    // the pending bubble; the finalized text lands in prompt_text instead.
+    std::string voice_partial;
     std::string response_text;
     std::string activity_text;
     std::string action_hint;

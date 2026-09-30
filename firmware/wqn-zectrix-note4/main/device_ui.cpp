@@ -1292,9 +1292,13 @@ wqn::AiStreamingStatusView streaming_view{};
                     }
                 } else if (state.screen == wqn::UiScreen::kAi &&
                            state.ai.tier == wqn::AiTier::kAgent &&
-                           state.agent.stream_active) {
+                           (state.agent.stream_active ||
+                            state.agent.ui.phase == wqn::AiFeaturePhase::kTranscribing)) {
                     // Agent events can arrive at token/tool cadence. A 500 ms
                     // sampling floor keeps EPD partial refreshes bounded.
+                    // [voice-pipe] The voice-transcribe phase streams ASR
+                    // deltas into the pending bubble, so it coalesces under the
+                    // same floor.
                     static int64_t last_agent_render_ms = 0;
                     const int64_t now_ms_d = esp_timer_get_time() / 1000;
                     if (now_ms_d - last_agent_render_ms < 500) {
