@@ -1261,6 +1261,20 @@ RefreshSchedule ApplyButtonEvent(
         return RefreshSchedule::kAi;
     }
 
+    // [agent-fix] The Agent tier needs the same swallow even when its PTT was
+    // rejected: a hold that begins mid-run never sets agent_ptt_started (the
+    // derived-event guard above is skipped), and the event then fell through
+    // to HandleUiInput(kLongConfirm), whose STD branch started a recording
+    // whose release the interrupt gesture consumed -- an orphan session that
+    // held the microphone and the sleep lease. The Agent tier has no legacy
+    // long-confirm action, so nothing is lost. kNone: no state changed here,
+    // the release edge schedules the interrupt refresh itself.
+    if (state->screen == wqn::UiScreen::kAi &&
+        state->ai.tier == wqn::AiTier::kAgent &&
+        event.button == wqn::ButtonId::kConfirm && long_press) {
+        return RefreshSchedule::kNone;
+    }
+
     if (repeated_long_press && !time_value_edit_repeat && !time_running_exit) {
         return RefreshSchedule::kNone;
     }

@@ -567,7 +567,13 @@ void HandleUiInput(UiState* state, UiInput input)
                 }
                 break;
             } else if (state->screen == UiScreen::kAi) {
-                if (state->ai.status != AiSessionStatus::kListening &&
+                // [agent-fix] The Agent tier runs its own hold-to-record PTT
+                // and its long-confirm interrupt gesture (ui_input.cpp); it
+                // never populates ai.status, so this legacy branch would read
+                // as idle and start a STD recording behind a running Agent
+                // run. Skip the branch entirely for kAgent.
+                if (state->ai.tier != AiTier::kAgent &&
+                    state->ai.status != AiSessionStatus::kListening &&
                     state->ai.status != AiSessionStatus::kPreparingCapture &&
                     state->ai.status != AiSessionStatus::kWaitingReply) {
 #if CONFIG_WQN_AI_ENABLE
