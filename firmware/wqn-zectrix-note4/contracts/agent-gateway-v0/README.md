@@ -104,7 +104,7 @@ remaining nine carry data:
 | `agent.reasoning` | `text` | Replaces the thinking block in place (repair frames only) |
 | `agent.tool` | `tool`, `call_id`, `status`, `preview` | One history block per call, coalesced by `call_id` (falling back to the name when the gateway could not learn it) |
 | `agent.permission` | `permission_id`, `type`, `title`, `preview` | Enters `kAwaitingPermission`; the ask is answered by a separate POST |
-| `agent.question` | `question_id`, `title`, `options[]` | Enters `kAwaitingQuestion`; the ask is answered by a separate POST |
+| `agent.question` | `question_id`, `title`, `options[]` | Enters `kAwaitingQuestion`; the ask is answered by a separate POST. Up to eight options; an empty list is an ask the device can only abort |
 | `agent.error` | `message`, `fatal` | `fatal: false` records the message and keeps running; absent or `true` fails the run and surfaces the message |
 
 **Termination.** The device reads until it sees `agent.status` with
@@ -137,6 +137,15 @@ be retried rather than leaving the run blocked behind a silent failure — the
 device does not assume the ask was answered. A pending ask is cleared only by a
 terminal status (`idle` or `error`), never by an intermediate one.
 
+**A multi-field form arrives as a sequence of single-field asks.** v2 settles a
+form on the first reply even when that reply is partial, so the gateway cannot
+answer field by field upstream. It arms the form's answerable fields one at a
+time — each `agent.question` names the next field, and `question_id` carries a
+`#{step}` suffix so a late or duplicate reply is recognised as stale — and
+accumulates the device's answers until the last step, when it POSTs the single
+upstream reply. The suffix is opaque to the device, which echoes `question_id`
+back verbatim.
+
 The device defends against a gateway that does *not* hold the second ask back: a
 question arriving while the option bar is taken is **deferred**, not dropped —
 the gateway has already marked it seen and will not re-send it, so dropping it
@@ -158,12 +167,17 @@ parser, because a dropped ask is silently lost while a mis-routed one reports
 itself.
 
 **A question is answered by option value, never by field id.** The gateway
-projects the upstream form onto at most two `{value, label}` options and is the
-only component that knows which upstream field they came from; the device sends
-the value it rendered and the cloud assembles the answer record. A form that
-cannot be projected into two options is not armed on the device at all — it is
-delivered as `agent.status {status: "busy"}` telling the user to answer in
-OpenCode, because an unanswerable prompt is worse than a clear instruction.
+projects each answerable upstream field onto up to eight `{value, label}`
+options and is the only component that knows which upstream field they came
+from; the device sends the value it rendered and the cloud assembles the answer
+record. A field the device cannot answer — no options upstream, or more than
+eight — is skipped by the sequence and left out of the submitted answer. When no
+field is answerable at all, the first field is still armed with `options: []`
+so the ask stays visible: the device's option bar always carries a synthetic
+abort entry, which is also the escape path for an empty list. A form with no
+visible field at all falls back to `agent.status {status: "busy"}` telling the
+user to answer in OpenCode, because an unanswerable prompt is worse than a
+clear instruction.
 
 **Interrupt is a success even when there was nothing to interrupt.**
 `POST /agent/sessions/{id}/interrupt` answers `{success: true,
@@ -192,6 +206,8 @@ stay well inside them.
 | JSON body | 16 KiB |
 | History response | 12 KiB (`history_response_bytes`) |
 | SSE frame (single line, and accumulated payload) | 16 KiB |
+| Question options | 8 |
+| Question frame (options payload) | 10 KiB (`question_frame_bytes`) |
 | Stream socket timeout | 5 min |
 
 `GET /agent/sessions/{id}/history` has its own 12 KiB bound, tighter than the

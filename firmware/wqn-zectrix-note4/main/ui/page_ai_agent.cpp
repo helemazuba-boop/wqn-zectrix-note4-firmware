@@ -4,8 +4,10 @@
 //
 //   1. a session picker (the gateway's conversations are server-side and
 //      long-lived, so the user must be able to switch and to re-attach), and
-//   2. a two-choice option bar (发送/重新输入 for the voice transcript,
-//      同意/拒绝 for a permission ask) driven by ↑/↓ + confirm.
+//   2. an option bar (发送/重新输入 for the voice transcript, 同意/拒绝 for a
+//      permission ask) driven by ↑/↓ + confirm. A question ask walks the
+//      gateway's projected options as a two-slot window over the whole list,
+//      with a trailing 自定义回答 pseudo-option that aborts the run.
 //
 // Both are drawn with a dashed outline: they are uncommitted. The transcript
 // and the permission ask only enter history once the user acts on them, so
@@ -73,15 +75,15 @@ std::string AgentOneLine(const std::string& text, int width)
 AgentOptionMode AgentOptionModeFor(const wqn::AgentSessionState& agent)
 {
     // An ask first: either kind can only arrive while a run is live, and a run
-    // blocked on a decision is the more urgent of the two states. A malformed
-    // ask (no id, or a question the gateway projected no options for) is not
-    // answerable, so it falls through instead of drawing an unusable bar.
+    // blocked on a decision is the more urgent of the two states. An ask with
+    // no id is unanswerable and falls through; a question with no options is
+    // still a question -- the bar then offers only the 自定义回答 escape.
     if (agent.ui.phase == wqn::AiFeaturePhase::kAwaitingPermission &&
         !agent.pending_permission_id.empty()) {
         return AgentOptionMode::kPermission;
     }
     if (agent.ui.phase == wqn::AiFeaturePhase::kAwaitingQuestion &&
-        !agent.pending_question_id.empty() && !agent.pending_question_options.empty()) {
+        !agent.pending_question_id.empty()) {
         return AgentOptionMode::kQuestion;
     }
     if (agent.ui.requires_confirmation) {
@@ -90,17 +92,30 @@ AgentOptionMode AgentOptionModeFor(const wqn::AgentSessionState& agent)
     return AgentOptionMode::kNone;
 }
 
-// Two is the bar's hard ceiling, not the gateway's: the gateway already caps a
-// projected form at two options for exactly this reason.
-int AgentQuestionSlotCount(const wqn::AgentSessionState& agent)
+// The question bar walks `options + 1` items: every projected option, plus a
+// trailing 自定义回答 pseudo-option that escapes the ask by interrupting the
+// run (a pending ask swallows every key, so a long-press cannot reach the
+// interrupt path). Two of them are visible at a time.
+int AgentQuestionItemCount(const wqn::AgentSessionState& agent)
 {
-    return static_cast<int>(
-        std::min<size_t>(agent.pending_question_options.size(), 2));
+    return static_cast<int>(agent.pending_question_options.size()) + 1;
 }
 
-int AgentQuestionFocusedSlot(const wqn::AgentSessionState& agent, uint8_t focused)
+int AgentQuestionWindowStart(const wqn::AgentSessionState& agent, uint8_t focused)
 {
-    const int count = AgentQuestionSlotCount(agent);
+    const int count = AgentQuestionItemCount(agent);
+    if (count <= 2) {
+        return 0;
+    }
+    const int item = std::min<int>(focused, count - 1);
+    // Keep the focused item in the window with the two slots available: the
+    // start trails one behind the focus and stops one short of the end.
+    return std::min(std::max(0, item - 1), count - 2);
+}
+
+int AgentQuestionFocusedItem(const wqn::AgentSessionState& agent, uint8_t focused)
+{
+    const int count = AgentQuestionItemCount(agent);
     if (count <= 0) {
         return 0;
     }
@@ -142,33 +157,54 @@ static void DrawAgentOptionBar(AgentOptionMode mode, uint8_t focused,
     // A rule above the bar separates it from the transcript above it.
     DrawHorizontalLine(0, kAgentBarY, wqn::kEpdWidth);
 
-    const int slot_count = (mode == AgentOptionMode::kQuestion)
-        ? AgentQuestionSlotCount(agent)
-        : 2;
-    const int focused_slot = (mode == AgentOptionMode::kQuestion)
-        ? AgentQuestionFocusedSlot(agent, focused)
+    const bool is_question = (mode == AgentOptionMode::kQuestion);
+    const int item_count = is_question ? AgentQuestionItemCount(agent) : 2;
+    const int window_start = is_question
+        ? AgentQuestionWindowStart(agent, focused)
+        : 0;
+    const int focused_item = is_question
+        ? AgentQuestionFocusedItem(agent, focused)
         : (AgentFocusedOption(mode, focused) == AgentFocusedOption(mode, 1) ? 1 : 0);
+    const int slot_count = is_question ? std::min(item_count, 2) : 2;
 
     for (int i = 0; i < slot_count; ++i) {
+        const int item = window_start + i;
         const int x = kAgentBarLabelX + i * kAgentBarSlotStep;
-        if (i == focused_slot) {
+        if (item == focused_item) {
             // ▣ marker: a filled square says "this slot is armed" without
             // borrowing a directional chevron that would imply something else.
             FillRect(kAgentBarMarkerX + i * kAgentBarSlotStep, kAgentBarTextY + 3,
                      8, 8, true);
         }
         std::string label;
-        if (mode == AgentOptionMode::kQuestion) {
-            // The gateway projects {value,label}; an unlabelled option still
-            // shows its value rather than an empty slot.
-            label = agent.pending_question_options[i].label.empty()
-                ? agent.pending_question_options[i].value
-                : agent.pending_question_options[i].label;
+        if (is_question) {
+            if (item < static_cast<int>(agent.pending_question_options.size())) {
+                // The gateway projects {value,label}; an unlabelled option
+                // still shows its value rather than an empty slot.
+                label = agent.pending_question_options[item].label.empty()
+                    ? agent.pending_question_options[item].value
+                    : agent.pending_question_options[item].label;
+            } else {
+                label = "自定义回答";
+            }
         } else {
             label = AgentOptionLabel(
                 AgentFocusedOption(mode, static_cast<uint8_t>(i)));
         }
         AGENT_TEXT(x, kAgentBarTextY, AgentOneLine(label, 88).c_str(), true);
+    }
+
+    if (is_question) {
+        // Position sense for the walk list: 2/9 while the window moves. It is
+        // right-aligned, so the key hint shifts left to make room.
+        char counter[16];
+        snprintf(counter, sizeof(counter), "%d/%d", focused_item + 1, item_count);
+        const int counter_w = wqn::MeasureUtf8TextWidth(counter);
+        const char* hint = "↑↓ 确认";
+        const int hint_w = wqn::MeasureUtf8TextWidth(hint);
+        AGENT_TEXT(wqn::kEpdWidth - counter_w - 8, kAgentBarTextY, counter, true);
+        AGENT_TEXT(wqn::kEpdWidth - counter_w - hint_w - 16, kAgentBarTextY, hint, true);
+        return;
     }
 
     // Key legend, right-aligned, leaving the far-right 40 px clear.
@@ -368,6 +404,19 @@ esp_err_t RenderAgentAiToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule
 
     const AgentOptionMode mode = AgentOptionModeFor(agent);
     if (mode == AgentOptionMode::kNone) {
+        // [visibility] While a run is live the cloud keeps writing
+        // activity_text (已批准权限 / 已回答 / 已请求中止 ...), but without a
+        // surface of its own a silent run reads as a hung one. Draw it in the
+        // same bottom band the option bar owns; the option bar, when it
+        // appears, clears the band itself.
+        if (agent.ui.phase == wqn::AiFeaturePhase::kRunning &&
+            !agent.ui.activity_text.empty()) {
+            FillRect(0, kAgentBarY, wqn::kEpdWidth, kAgentBarH, false);
+            DrawHorizontalLine(0, kAgentBarY, wqn::kEpdWidth);
+            AGENT_TEXT(kAgentBarMarkerX, kAgentBarTextY,
+                       AgentOneLine(agent.ui.activity_text, wqn::kEpdWidth - 16).c_str(),
+                       true);
+        }
         return RefreshFrame(frame, schedule);
     }
 
@@ -377,9 +426,15 @@ esp_err_t RenderAgentAiToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule
             : agent.ui.activity_text;
         DrawAgentPendingBubble(ask, "权限请求");
     } else if (mode == AgentOptionMode::kQuestion) {
-        const std::string ask = agent.pending_question_title.empty()
+        std::string ask = agent.pending_question_title.empty()
             ? std::string("OpenCode 请求回答")
             : agent.pending_question_title;
+        if (agent.pending_question_options.empty()) {
+            // A field with nothing the device can choose between (free text,
+            // an over-long list). Say so instead of showing a bar that looks
+            // broken; 自定义回答 aborts the run so the request can be retyped.
+            ask += "　设备无法显示选项；选“自定义回答”将中止本次任务";
+        }
         DrawAgentPendingBubble(ask, "提问");
     } else {
         const std::string prompt = agent.ui.prompt_text.empty()

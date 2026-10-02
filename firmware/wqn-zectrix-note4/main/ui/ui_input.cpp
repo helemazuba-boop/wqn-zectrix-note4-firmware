@@ -702,15 +702,21 @@ static RefreshSchedule ExecuteAgentOption(wqn::UiState* state,
 }
 
 // A question is not one of the two fixed AgentOption slots: its labels are data
-// the gateway projected, so it is answered by slot index instead of by option.
-// The index is already clamped by AgentQuestionFocusedSlot, so it can only ever
-// name an option the bar is actually showing.
+// the gateway projected, so it is answered by item index instead of by option.
+// The last item is the 自定义回答 pseudo-option: there is no reply to send for
+// it, it escapes the ask by interrupting the run -- the same path a long press
+// would take if a pending ask did not swallow every key.
 static RefreshSchedule ExecuteAgentQuestion(wqn::UiState* state, uint8_t focused)
 {
-    const int slot =
-        device_ui_internal::AgentQuestionFocusedSlot(state->agent, focused);
-    if (wqn::ReplyPendingOpenCodeQuestion(slot) == ESP_OK) {
-        ESP_LOGI(kTag, "Agent option: question answer slot=%d", slot);
+    const int item =
+        device_ui_internal::AgentQuestionFocusedItem(state->agent, focused);
+    const int option_count =
+        static_cast<int>(state->agent.pending_question_options.size());
+    if (item >= option_count) {
+        wqn::InterruptOpenCodeRun();
+        ESP_LOGI(kTag, "Agent option: question custom answer -> interrupt");
+    } else if (wqn::ReplyPendingOpenCodeQuestion(item) == ESP_OK) {
+        ESP_LOGI(kTag, "Agent option: question answer slot=%d", item);
     } else {
         ESP_LOGW(kTag, "Agent option: question reply rejected (ask moved on?)");
         return RefreshSchedule::kNone;
@@ -745,14 +751,24 @@ static RefreshSchedule ApplyAgentOptionBarEvent(
     }
     if (event.button == wqn::ButtonId::kUp || event.button == wqn::ButtonId::kDownPower) {
         if (event.type == wqn::ButtonEventType::kShortPress) {
-            // Focus flips between exactly two slots -- except for a question the
-            // gateway projected a single option for, where moving the marker
-            // would park it on a slot that does not exist.
-            const int slots = (mode == device_ui_internal::AgentOptionMode::kQuestion)
-                ? device_ui_internal::AgentQuestionSlotCount(state->agent)
-                : 2;
-            if (slots > 1) {
-                state->agent_option.focused ^= 1u;
+            if (mode == device_ui_internal::AgentOptionMode::kQuestion) {
+                // Walk the whole question list in the pressed direction,
+                // wrapping at both ends: the trailing 自定义回答 escape must
+                // be one press from the first item, not N, and the list can be
+                // longer than the two slots on screen.
+                const int count = device_ui_internal::AgentQuestionItemCount(state->agent);
+                if (count > 1) {
+                    const int item = device_ui_internal::AgentQuestionFocusedItem(
+                        state->agent, state->agent_option.focused);
+                    const int delta = (event.button == wqn::ButtonId::kUp) ? -1 : 1;
+                    state->agent_option.focused = static_cast<uint8_t>(
+                        ((item + delta) % count + count) % count);
+                }
+            } else if (state->agent_option.focused == 0) {
+                // The fixed two-choice bars still just flip the marker.
+                state->agent_option.focused = 1;
+            } else {
+                state->agent_option.focused = 0;
             }
             return RefreshSchedule::kAi;
         }

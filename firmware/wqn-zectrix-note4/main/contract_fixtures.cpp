@@ -1710,7 +1710,7 @@ constexpr char kAgentQuestionStream[] = R"json([
     "event": "agent.question",
     "data": {
       "session_id": "ses_01J8ZQ4K7V2N9X0M3B6C5D4E7F",
-      "question_id": "frm_01J8ZQ5R8W3P1Y4N7C0D2E6F9G",
+      "question_id": "frm_01J8ZQ5R8W3P1Y4N7C0D2E6F9G#0",
       "title": "要写入哪个错题本？",
       "options": [
         { "value": "math", "label": "数学错题本" },
@@ -1719,6 +1719,75 @@ constexpr char kAgentQuestionStream[] = R"json([
     }
   },
   { "event": "agent.text.delta", "data": { "delta": "已写入数学错题本。" } },
+  { "event": "agent.status", "data": { "status": "idle", "message": "执行完成" } }
+])json";
+
+// `valid/question-empty-options.json`. A field the device cannot render as a
+// choice (free text, or a list past the frame budget) is projected as an ask
+// with no options: the UI shows the title plus the 自定义回答 escape, which
+// aborts the run. The frame is legal and must reach the UI.
+constexpr char kAgentQuestionEmptyOptions[] = R"json([
+  { "event": "agent.accepted", "data": {} },
+  {
+    "event": "agent.question",
+    "data": {
+      "session_id": "ses_01J8ZQ4K7V2N9X0M3B6C5D4E7F",
+      "question_id": "frm_01J8ZQ5R8W3P1Y4N7C0D2E6F9H#0",
+      "title": "请用一句话描述这道题的错因",
+      "options": []
+    }
+  },
+  { "event": "agent.status", "data": { "status": "idle", "message": "执行完成" } }
+])json";
+
+// `valid/question-many-options.json`: eight options is the contract maximum.
+constexpr char kAgentQuestionManyOptions[] = R"json([
+  { "event": "agent.accepted", "data": {} },
+  {
+    "event": "agent.question",
+    "data": {
+      "session_id": "ses_01J8ZQ4K7V2N9X0M3B6C5D4E7F",
+      "question_id": "frm_01J8ZQ5R8W3P1Y4N7C0D2E6F9J#0",
+      "title": "选择要使用的题库",
+      "options": [
+        { "value": "math", "label": "数学" },
+        { "value": "physics", "label": "物理" },
+        { "value": "chemistry", "label": "化学" },
+        { "value": "biology", "label": "生物" },
+        { "value": "history", "label": "历史" },
+        { "value": "geography", "label": "地理" },
+        { "value": "politics", "label": "政治" },
+        { "value": "english", "label": "英语" }
+      ]
+    }
+  },
+  { "event": "agent.status", "data": { "status": "idle", "message": "执行完成" } }
+])json";
+
+// `invalid/question-too-many-options.json`: nine options is past the contract
+// bound. The parser must refuse the frame, not truncate it -- a truncated list
+// would silently hide answers.
+constexpr char kAgentQuestionTooManyOptions[] = R"json([
+  { "event": "agent.accepted", "data": {} },
+  {
+    "event": "agent.question",
+    "data": {
+      "session_id": "ses_01J8ZQ4K7V2N9X0M3B6C5D4E7F",
+      "question_id": "frm_01J8ZQ5R8W3P1Y4N7C0D2E6F9K#0",
+      "title": "选项过多的提问",
+      "options": [
+        { "value": "o1", "label": "选项一" },
+        { "value": "o2", "label": "选项二" },
+        { "value": "o3", "label": "选项三" },
+        { "value": "o4", "label": "选项四" },
+        { "value": "o5", "label": "选项五" },
+        { "value": "o6", "label": "选项六" },
+        { "value": "o7", "label": "选项七" },
+        { "value": "o8", "label": "选项八" },
+        { "value": "o9", "label": "选项九" }
+      ]
+    }
+  },
   { "event": "agent.status", "data": { "status": "idle", "message": "执行完成" } }
 ])json";
 
@@ -1751,7 +1820,7 @@ constexpr char kAgentSubagentAskStream[] = R"json([
     "event": "agent.question",
     "data": {
       "session_id": "ses_01J8ZQ4K7V2N9X0M3B6C5SUBA1",
-      "question_id": "frm_01J8ZQ5R8W3P1Y4N7C0D2SUBA1",
+      "question_id": "frm_01J8ZQ5R8W3P1Y4N7C0D2SUBA1#0",
       "title": "子任务的提问：追加到哪里？",
       "options": [
         { "value": "math", "label": "数学错题本" },
@@ -1872,7 +1941,7 @@ bool ReplayAgentStream(const char* literal, Visit visit)
 
 bool CheckAgentGatewayV0Contract()
 {
-    // --- question stream: a question is read as one, with its two options ---
+    // --- question stream: a question is read as one, with its step id --------
     int question_frames = 0;
     bool question_ids_ok = true;
     if (!ReplayAgentStream(kAgentQuestionStream,
@@ -1891,7 +1960,7 @@ bool CheckAgentGatewayV0Contract()
                                            "agent question session") ||
                                        !Require(
                                            event.question_id ==
-                                               "frm_01J8ZQ5R8W3P1Y4N7C0D2E6F9G",
+                                               "frm_01J8ZQ5R8W3P1Y4N7C0D2E6F9G#0",
                                            "agent question id") ||
                                        !Require(
                                            event.text == "要写入哪个错题本？",
@@ -1929,6 +1998,55 @@ bool CheckAgentGatewayV0Contract()
         return false;
     }
 
+    // --- question option bounds: 0 is the abort-only ask, 9 is a violation ---
+    //
+    // `options` is minItems 0 / maxItems 8 in the contract. The empty edge is
+    // what lets a field with nothing to choose between stay visible (the UI
+    // then offers only 自定义回答); the top edge is refused rather than
+    // truncated, because a truncated list silently hides answers.
+    if (!ReplayAgentStream(
+            kAgentQuestionManyOptions,
+            [&](int index, esp_err_t result, const wqn::OpenCodeEvent& event) {
+                if (index != 1) {
+                    return true;
+                }
+                return Require(
+                    result == ESP_OK &&
+                        event.kind == wqn::OpenCodeEventKind::kQuestion &&
+                        event.question_options.size() == 8,
+                    "agent question accepts eight options");
+            })) {
+        return false;
+    }
+    if (!ReplayAgentStream(
+            kAgentQuestionEmptyOptions,
+            [&](int index, esp_err_t result, const wqn::OpenCodeEvent& event) {
+                if (index != 1) {
+                    return true;
+                }
+                return Require(
+                    result == ESP_OK &&
+                        event.kind == wqn::OpenCodeEventKind::kQuestion &&
+                        event.question_options.empty() &&
+                        event.question_id ==
+                            "frm_01J8ZQ5R8W3P1Y4N7C0D2E6F9H#0",
+                    "agent question accepts empty options");
+            })) {
+        return false;
+    }
+    if (!ReplayAgentStream(
+            kAgentQuestionTooManyOptions,
+            [&](int index, esp_err_t result, const wqn::OpenCodeEvent&) {
+                if (index != 1) {
+                    return true;
+                }
+                return Require(
+                    result == ESP_ERR_INVALID_RESPONSE,
+                    "agent question rejects nine options");
+            })) {
+        return false;
+    }
+
     // --- subagent asks: the owning session is not the attached one ------------
     //
     // The relay watches the attached session and every child of it, and a child
@@ -1956,7 +2074,7 @@ bool CheckAgentGatewayV0Contract()
                                                 ? event.permission_id ==
                                                       "prm_01J8ZQ5R8W3P1Y4N7C0D2SUBA1"
                                                 : event.question_id ==
-                                                      "frm_01J8ZQ5R8W3P1Y4N7C0D2SUBA1"),
+                                                      "frm_01J8ZQ5R8W3P1Y4N7C0D2SUBA1#0"),
                                        "agent subagent ask names its own session")) {
                                    subagent_ok = false;
                                    return false;
@@ -1977,7 +2095,7 @@ bool CheckAgentGatewayV0Contract()
         "prm_01J8ZQ5R8W3P1Y4N7C0D2SUBA1", true, false, {},
         "ses_01J8ZQ4K7V2N9X0M3B6C5SUBA1", {}};
     const wqn::OpenCodeOutboundReply child_question{
-        "prm_unused", true, true, "frm_01J8ZQ5R8W3P1Y4N7C0D2SUBA1",
+        "prm_unused", true, true, "frm_01J8ZQ5R8W3P1Y4N7C0D2SUBA1#0",
         "ses_01J8ZQ4K7V2N9X0M3B6C5SUBA1", "math"};
     const wqn::OpenCodeOutboundReply legacy_permission{
         "prm_01J8ZQ5R8W3P1Y4N7C0D2E6F9G", true, false, {}, {}, {}};

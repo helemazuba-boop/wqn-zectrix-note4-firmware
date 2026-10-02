@@ -41,7 +41,11 @@ struct AgentSessionState {
     // the id travels with the ask from the frame that delivered it to the POST.
     std::string pending_permission_session;
     // Live `agent.question` ask. The device answers by option index, never by
-    // field id: the gateway owns that mapping.
+    // field id: the gateway owns that mapping. The id carries the gateway's
+    // step (`{formId}#{step}`) and is echoed back verbatim, which is how a
+    // multi-field form is answered one step per request. An empty option list
+    // means the field has nothing the device can choose; the bar then offers
+    // only 自定义回答, which aborts the run instead of replying.
     std::string pending_question_id;
     std::string pending_question_title;
     // The session that raised the pending question; see pending_permission_session.

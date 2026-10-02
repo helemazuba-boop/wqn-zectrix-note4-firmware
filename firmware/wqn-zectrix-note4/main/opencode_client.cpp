@@ -926,7 +926,7 @@ esp_err_t PostQuestionReply(
 //                            debug level so on-device verification can spot a
 //                            "the cloud maps it, the firmware does not" gap.
 //   ESP_ERR_INVALID_RESPONSE -- a known event with a payload the device cannot
-//                            act on (a question with no options, say).
+//                            act on (a question with nine options, say).
 esp_err_t ParseOpenCodeAgentFrame(
     const std::string& event_name,
     const std::string& data,
@@ -990,16 +990,24 @@ esp_err_t ParseOpenCodeAgentFrame(
             return ESP_ERR_INVALID_RESPONSE;
         }
     } else if (event_name == "agent.question") {
-        // The gateway projects the upstream form onto at most two options; a
-        // form with more than two is delivered as `agent.status` instead, so an
-        // empty `options` here is a malformed frame and is dropped below.
+        // One step of a question sequence: the gateway walks a multi-field
+        // form one field at a time and reuses `question_id` as the step id
+        // (`{formId}#{step}`, opaque to the device). Up to
+        // kMaxOpenCodeQuestionOptions options; an empty list is the
+        // abort-only ask for a field with nothing the device can choose
+        // between, and it must still reach the UI so the user can escape.
+        // Only a missing id makes the frame unanswerable.
         event.kind = wqn::OpenCodeEventKind::kQuestion;
         event.session_id = JsonString(root, "session_id");
         event.question_id = JsonString(root, "question_id");
         event.text = JsonString(root, "title");
         cJSON* options = cJSON_GetObjectItemCaseSensitive(root, "options");
         if (cJSON_IsArray(options)) {
-            const int option_count = std::min<int>(cJSON_GetArraySize(options), 2);
+            const int option_count = cJSON_GetArraySize(options);
+            if (option_count > wqn::kMaxOpenCodeQuestionOptions) {
+                cJSON_Delete(root);
+                return ESP_ERR_INVALID_RESPONSE;
+            }
             event.question_options.reserve(static_cast<size_t>(option_count));
             for (int i = 0; i < option_count; ++i) {
                 const cJSON* option = cJSON_GetArrayItem(options, i);
@@ -1014,7 +1022,7 @@ esp_err_t ParseOpenCodeAgentFrame(
                 }
             }
         }
-        if (event.question_id.empty() || event.question_options.empty()) {
+        if (event.question_id.empty()) {
             cJSON_Delete(root);
             return ESP_ERR_INVALID_RESPONSE;
         }

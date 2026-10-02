@@ -695,9 +695,11 @@ void RenderAiHistoryViewport(const wqn::AiSessionState& ai,
 // ↑/↓ cycle order and the confirm action runs the focused slot.
 //
 // kQuestion is deliberately NOT part of this enum: its slots are the options the
-// gateway projected for a form, so their labels are data, not constants. The bar
-// keeps its two slots because the geometry and the ↑/↓ arithmetic assume
-// exactly two (see page_ai_agent.cpp's kAgentBarSlotStep and the key-hint strip).
+// gateway projected for a form, so their labels are data, not constants. The
+// bar still shows two slots at a time (the geometry and the ↑/↓ arithmetic
+// assume exactly two), but it now walks the whole list as a window: the
+// question item count is the projected options plus one trailing pseudo-option
+// (自定义回答), which escapes the ask by interrupting the run.
 enum class AgentOption : uint8_t {
     kSend,
     kReinput,
@@ -710,17 +712,20 @@ enum class AgentOptionMode : uint8_t {
     kNone,
     kConfirmSend,   // voice transcript armed: 发送 / 重新输入
     kPermission,    // gateway ask pending: 同意 / 拒绝
-    kQuestion,      // gateway form pending: up to two projected options
+    kQuestion,      // gateway form pending: projected options + 自定义回答
 };
 AgentOptionMode AgentOptionModeFor(const wqn::AgentSessionState& agent);
 // The focused slot, clamped to the two the current mode actually offers.
 AgentOption AgentFocusedOption(AgentOptionMode mode, uint8_t focused);
 const char* AgentOptionLabel(AgentOption option);
-// How many options a pending question actually projects (at most two).
-int AgentQuestionSlotCount(const wqn::AgentSessionState& agent);
-// Focus index shared by the kQuestion render and its confirm action: the bar
-// draws `count` slots, and this clamps a carried-over focus into that range.
-int AgentQuestionFocusedSlot(const wqn::AgentSessionState& agent, uint8_t focused);
+// Question walk-list length: the projected options plus the trailing
+// 自定义回答 escape (so at least one item, even for a zero-option ask).
+int AgentQuestionItemCount(const wqn::AgentSessionState& agent);
+// First item of the two-slot window that keeps the focused item visible.
+int AgentQuestionWindowStart(const wqn::AgentSessionState& agent, uint8_t focused);
+// Focus index shared by the kQuestion render and its confirm action: the item
+// count is dynamic, so this clamps a carried-over focus into range.
+int AgentQuestionFocusedItem(const wqn::AgentSessionState& agent, uint8_t focused);
 
 // ---- Word page --------------------------------------------------------------
 

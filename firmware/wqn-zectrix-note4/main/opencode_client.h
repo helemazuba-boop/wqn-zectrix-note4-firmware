@@ -18,13 +18,21 @@ struct OpenCodeSessionInfo {
     int64_t updated_at = 0;
 };
 
-// One answerable option of an `agent.question` ask. The gateway projects the
-// upstream form's fields onto at most two of these, because the option bar has
-// two slots; the device only ever sends the chosen `value` back.
+// One answerable option of an `agent.question` ask. The gateway projects one
+// field of the upstream form per ask -- at most kMaxOpenCodeQuestionOptions
+// options -- and the device only ever sends the chosen `value` back. An ask
+// with no options is the abort-only projection of a field the device cannot
+// answer; it still reaches the UI so the user can escape via 自定义回答.
 struct OpenCodeQuestionOption {
     std::string value;
     std::string label;
 };
+
+// The contract's `questionData.options` maxItems. A frame with more is a
+// gateway contract violation and is refused at parse time rather than
+// half-rendered: the option bar walks the list two slots at a time and a
+// truncated list would silently hide answers.
+inline constexpr int kMaxOpenCodeQuestionOptions = 8;
 
 // A tool call inside a backfilled turn. `status` is one of the three the
 // gateway projects (`running`, `done`, `error`).
