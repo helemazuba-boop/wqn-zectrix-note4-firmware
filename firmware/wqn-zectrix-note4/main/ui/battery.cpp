@@ -15,6 +15,20 @@ constexpr int kBatteryShutdownMv = 3450;
 constexpr int kBatteryShutdownDebounceCount = 3;
 constexpr const char* kPmuStatusUnknown = "unknown";
 
+constexpr bool IsBatteryDepletedCandidate(
+    int percent,
+    int battery_mv,
+    bool external_power_present)
+{
+    return percent == kBatteryShutdownPercent &&
+        battery_mv <= kBatteryShutdownMv &&
+        !external_power_present;
+}
+
+static_assert(IsBatteryDepletedCandidate(0, 3430, false));
+static_assert(!IsBatteryDepletedCandidate(0, 3430, true));
+static_assert(!IsBatteryDepletedCandidate(1, 3430, false));
+
 bool ShouldLogBattery()
 {
     static int64_t last_log_us = 0;
@@ -40,25 +54,28 @@ bool ReadBatteryStatus(BatteryReading* reading)
     reading->adc_mv = snapshot.adc_mv;
     reading->battery_mv = snapshot.battery_mv;
     reading->percent = snapshot.battery_percent;
+    reading->usb_host_connected = snapshot.usb_host_connected;
     reading->charging = snapshot.charging;
     reading->full = snapshot.fully_charged;
+    reading->external_power_present = snapshot.external_power_present;
     reading->chrg_l = reading->charging ? 0 : 1;
     reading->stdby_h = reading->full ? 0 : 1;
-    reading->power_present_or_status_known = reading->charging || reading->full;
     reading->pmu_status = kPmuStatusUnknown;
     reading->pmu_implemented = false;
     if (ShouldLogBattery()) {
         ESP_LOGI(
             kTag,
-            "battery adc_raw=%d adc_mv=%d battery_mv=%d percent=%d chrg_l=%d stdby_h=%d charging=%d full=%d pmu_status=%s pmu_implemented=%d",
+            "battery adc_raw=%d adc_mv=%d battery_mv=%d percent=%d chrg_l=%d stdby_h=%d host=%d charging=%d full=%d external_power=%d pmu_status=%s pmu_implemented=%d",
             reading->raw,
             reading->adc_mv,
             reading->battery_mv,
             reading->percent,
             reading->chrg_l,
             reading->stdby_h,
+            reading->usb_host_connected ? 1 : 0,
             reading->charging ? 1 : 0,
             reading->full ? 1 : 0,
+            reading->external_power_present ? 1 : 0,
             reading->pmu_status,
             reading->pmu_implemented ? 1 : 0);
     }
@@ -67,7 +84,7 @@ bool ReadBatteryStatus(BatteryReading* reading)
 
 std::string BatteryLabel(const BatteryReading& reading)
 {
-    if (reading.full) {
+    if (reading.full && reading.external_power_present) {
         return "满电";
     }
     if (reading.charging) {
@@ -94,36 +111,51 @@ void CheckLowBatteryProtection(const BatteryReading* reading)
         return;
     }
 
-    const bool depleted_candidate =
-        reading->percent == kBatteryShutdownPercent &&
-        reading->battery_mv <= kBatteryShutdownMv &&
-        !reading->charging &&
-        !reading->full;
+    const bool depleted_candidate = IsBatteryDepletedCandidate(
+        reading->percent,
+        reading->battery_mv,
+        reading->external_power_present);
+    if (reading->full && !reading->external_power_present &&
+        reading->battery_mv <= kBatteryShutdownMv) {
+        ESP_LOGW(
+            kTag,
+            "/STDBY residual during depletion: host=%d charging=%d full=1 battery_mv=%d percent=%d",
+            reading->usb_host_connected ? 1 : 0,
+            reading->charging ? 1 : 0,
+            reading->battery_mv,
+            reading->percent);
+    }
     if (!depleted_candidate) {
         if (shutdown_count != 0) {
-            ESP_LOGI(kTag, "Battery shutdown count reset: percent=%d battery_mv=%d charging=%d full=%d depleted_candidate=0 shutdown_count=0",
+            ESP_LOGI(kTag, "Battery shutdown count reset: percent=%d battery_mv=%d host=%d charging=%d full=%d external_power=%d depleted_candidate=0 shutdown_count=0",
                      reading->percent,
                      reading->battery_mv,
+                     reading->usb_host_connected ? 1 : 0,
                      reading->charging ? 1 : 0,
-                     reading->full ? 1 : 0);
+                     reading->full ? 1 : 0,
+                     reading->external_power_present ? 1 : 0);
         }
         shutdown_count = 0;
-        ESP_LOGI(kTag, "battery protection percent=%d battery_mv=%d charging=%d full=%d pmu_status=%s depleted_candidate=0 shutdown_count=%d",
+        ESP_LOGI(kTag, "battery protection percent=%d battery_mv=%d host=%d charging=%d full=%d external_power=%d pmu_status=%s depleted_candidate=0 shutdown_count=%d",
                  reading->percent,
                  reading->battery_mv,
+                 reading->usb_host_connected ? 1 : 0,
                  reading->charging ? 1 : 0,
                  reading->full ? 1 : 0,
+                 reading->external_power_present ? 1 : 0,
                  reading->pmu_status,
                  shutdown_count);
         return;
     }
 
     ++shutdown_count;
-    ESP_LOGW(kTag, "battery protection percent=%d battery_mv=%d charging=%d full=%d pmu_status=%s depleted_candidate=1 shutdown_count=%d/%d",
+    ESP_LOGW(kTag, "battery protection percent=%d battery_mv=%d host=%d charging=%d full=%d external_power=%d pmu_status=%s depleted_candidate=1 shutdown_count=%d/%d",
              reading->percent,
              reading->battery_mv,
+             reading->usb_host_connected ? 1 : 0,
              reading->charging ? 1 : 0,
              reading->full ? 1 : 0,
+             reading->external_power_present ? 1 : 0,
              reading->pmu_status,
              shutdown_count,
              kBatteryShutdownDebounceCount);

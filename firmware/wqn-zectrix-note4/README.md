@@ -30,18 +30,20 @@ on the server.
 - Board bring-up and diagnostics: safe GPIO initialization, chip/flash/PSRAM
   diagnostics, reset reason, WiFi MAC, battery diagnostics, and serial logs.
 - WQN cloud connection: optional WiFi station mode, pairing token storage,
-  masked token logging, due problem sync, problem index refresh, review upload
-  retry, Todo sync, and AI request upload.
-- E-paper UI: local device pages for home/time, countdown, pomodoro, cached
-  problems, Todo, word/notebook-facing study flows, and AI conversation status.
+  masked token logging, problem-study manifest/pack sync, durable observation
+  upload, Todo sync, and AI request upload.
+- E-paper UI: local device pages for home/time, countdown, pomodoro, Todo,
+  word/notebook-facing study flows, Note-integrated problem sets, and AI
+  conversation status.
 - E-paper refresh control: full refresh and local partial-window refresh support
   with cooldown and idle power-off controls.
 - AI audio path: long-press confirm to record, release to upload 16 kHz mono PCM
   to the WQN server, then display transcript, reply text, and action summaries.
 - Local storage: NVS holds only small control state (pairing/WiFi credentials,
-  revisions, cursors and settings). Durable content lives on SPIFFS; the problem
-  cache uses the versioned, block-compressed WQPC format with atomic temp/rename
-  commits, while PSRAM is used only for volatile decode/UI snapshots.
+  revisions, cursors and settings). Durable content lives on SPIFFS. The current
+  problem-study-v1 path stores its manifest and per-problem-set WQNP packs there,
+  builds a fixed-size index in PSRAM, reads problem bodies on demand, and records
+  review observations in a durable outbox until upload succeeds.
 
 ## Security Boundary
 
@@ -113,11 +115,20 @@ Configure features through `idf.py menuconfig` under `WQN firmware`:
   refresh path.
 - `CONFIG_WQN_EPD_IDLE_POWER_OFF_MS`: powers off the e-paper rail after UI idle
   time to save battery.
+- `CONFIG_WQN_EPD_IDLE_CLEANUP_MS`: when the accumulated heavy-partial debt is
+  repaid with one full refresh. Kept separate from the rail power-off above so
+  a short pause no longer flashes the panel; `0` restores the old behaviour of
+  cleaning at the power-off point.
 - `CONFIG_WQN_DEEP_SLEEP_ENABLE`: optional experimental deep sleep path.
 - `CONFIG_WQN_AI_ENABLE`: enables AI firmware modules; provider secrets still
   stay server-side.
 - `CONFIG_WQN_AI_AUDIO_SELFTEST_ENABLE`: captures and logs audio statistics at boot
   without uploading audio.
+- `CONFIG_WQN_DEV_MENU_ENABLE`: adds a "开发者选项" (developer options) entry to the
+  settings page that opens a second-level read-only list (dev info / sync
+  diagnostics / error log / raw battery / storage detail / sleep diagnostics);
+  the structure is fixed by `DEV_DIAGNOSTICS.md`. Release builds keep it n;
+  error capture is always compiled.
 
 ## Local Flashing
 

@@ -1,6 +1,7 @@
 #include "word_app.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
@@ -11,20 +12,35 @@
 #include "esp_check.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 
 #include "storage.h"
 
 namespace {
 
 constexpr char kTag[] = "wqn_word";
-constexpr size_t kDictionaryPreviewLimit = 8;
 constexpr size_t kWordHomeSelectionCount = 3;
+// Written by the sync service, read by the UI task when it builds a snapshot.
+std::atomic<int32_t> g_word_review_due_count{0};
+// Mistakes-pool hint written by the sync service; -1 = unknown (no sync yet).
+std::atomic<int32_t> g_word_mistake_count{-1};
+// [word-modes-v2] Local replay rules of the review entry: a word the user did
+// not recognize comes back after at least kWordReplayMinGap answered cards,
+// and at most kWordReplayMax times per session. The FSRS timeline stays
+// authoritative -- the unknown judgment already set due=now server-side, so
+// the pool only decides how the session interleaves it locally.
+constexpr uint32_t kWordReplayMinGap = 5;
+constexpr uint8_t kWordReplayMax = 2;
+// Today's new-word budget, spent at the head of 顺序过词库. The server keeps
+// the daily accounting (word_progress.created_at); the device only asks.
+constexpr int kWordNewWordDailyLimit = 20;
 constexpr size_t kCandidatePrefetchThreshold =
     wqn::protocol::word_study_v1::kInitialCandidatePageSize;
 constexpr wqn::protocol::word_study_v1::Mode kPersistedSessionModes[] = {
     wqn::protocol::word_study_v1::Mode::kSequential,
-    wqn::protocol::word_study_v1::Mode::kRandom,
-    wqn::protocol::word_study_v1::Mode::kDictionary,
+    wqn::protocol::word_study_v1::Mode::kReview,
+    wqn::protocol::word_study_v1::Mode::kShuffle,
+    wqn::protocol::word_study_v1::Mode::kMistakes,
 };
 
 size_t SelectionIndex(wqn::WordHomeSelection selection)
@@ -36,25 +52,25 @@ wqn::WordHomeSelection HomeSelectionFromIndex(size_t index)
 {
     switch (index % kWordHomeSelectionCount) {
         case 0:
-            return wqn::WordHomeSelection::kSequential;
+            return wqn::WordHomeSelection::kReview;
         case 1:
-            return wqn::WordHomeSelection::kRandom;
+            return wqn::WordHomeSelection::kShuffle;
         default:
-            return wqn::WordHomeSelection::kDictionary;
+            return wqn::WordHomeSelection::kMistakes;
     }
 }
 
 [[maybe_unused]] std::string HomeSelectionLabel(wqn::WordHomeSelection selection)
 {
     switch (selection) {
-        case wqn::WordHomeSelection::kSequential:
-            return "顺序";
-        case wqn::WordHomeSelection::kRandom:
+        case wqn::WordHomeSelection::kReview:
+            return "智能复习";
+        case wqn::WordHomeSelection::kShuffle:
             return "随机";
-        case wqn::WordHomeSelection::kDictionary:
-            return "词典";
+        case wqn::WordHomeSelection::kMistakes:
+            return "遗忘的单词";
     }
-    return "顺序";
+    return "智能复习";
 }
 
 bool HasPackWords(const wqn::WordAppState& state)
@@ -70,20 +86,26 @@ wqn::WordCardPhase CardPhaseFromSession(
         : wqn::WordCardPhase::kFront;
 }
 
+bool IsReviewSession(const wqn::PersistedWordSession& session)
+{
+    return session.remote.mode == wqn::protocol::word_study_v1::Mode::kReview;
+}
+
+bool IsIntakeSession(const wqn::PersistedWordSession& session)
+{
+    return session.remote.mode == wqn::protocol::word_study_v1::Mode::kIntake;
+}
+
+bool IsSequentialSession(const wqn::PersistedWordSession& session)
+{
+    return session.remote.mode == wqn::protocol::word_study_v1::Mode::kSequential;
+}
+
 void ShowStudyCard(wqn::WordAppState* state)
 {
     if (state == nullptr) return;
     state->mode = wqn::WordAppMode::kWordCard;
-    state->card_source = wqn::WordCardSource::kStudy;
     state->card_phase = CardPhaseFromSession(state->session.persisted);
-}
-
-void ShowDictionaryCard(wqn::WordAppState* state)
-{
-    if (state == nullptr) return;
-    state->mode = wqn::WordAppMode::kWordCard;
-    state->card_source = wqn::WordCardSource::kDictionary;
-    state->card_phase = wqn::WordCardPhase::kRevealed;
 }
 
 void SetStudySessionResumable(
@@ -92,27 +114,228 @@ void SetStudySessionResumable(
     bool resumable)
 {
     if (state == nullptr) return;
-    if (mode == wqn::protocol::word_study_v1::Mode::kSequential) {
-        state->sequential_session_resumable = resumable;
-    } else if (mode == wqn::protocol::word_study_v1::Mode::kRandom) {
-        state->random_session_resumable = resumable;
+    switch (mode) {
+        case wqn::protocol::word_study_v1::Mode::kReview:
+            state->review_session_resumable = resumable;
+            break;
+        case wqn::protocol::word_study_v1::Mode::kShuffle:
+            state->shuffle_session_resumable = resumable;
+            break;
+        case wqn::protocol::word_study_v1::Mode::kMistakes:
+            state->mistakes_session_resumable = resumable;
+            break;
+        case wqn::protocol::word_study_v1::Mode::kSequential:
+        case wqn::protocol::word_study_v1::Mode::kIntake:
+            // The library walk has no home card of its own: it is resumed from
+            // the completion page and its resume point is the durable cursor.
+            break;
+        case wqn::protocol::word_study_v1::Mode::kRandom:
+        case wqn::protocol::word_study_v1::Mode::kDictionary:
+            break;
     }
 }
 
-void RefreshDictionaryState(wqn::WordAppState* state)
+// ---- review replay pool ---------------------------------------------------
+
+uint32_t NextReplayRandom(uint32_t* seed)
 {
-    if (state == nullptr) {
-        return;
+    if (seed == nullptr || *seed == 0) return 0;
+    // xorshift32: tiny and deterministic, which is all that interleaving a
+    // handful of replays needs.
+    uint32_t value = *seed;
+    value ^= value << 13;
+    value ^= value >> 17;
+    value ^= value << 5;
+    *seed = value;
+    return value;
+}
+
+void SeedReviewRuntime(
+    wqn::WordReviewRuntime* review,
+    const std::string& session_id)
+{
+    if (review == nullptr) return;
+    review->pool.clear();
+    review->seed = 0;
+    review->cards_seen = 0;
+    review->replay_in_flight = false;
+    review->replay_pool_index = 0;
+    review->replay_return_ordinal = 0;
+    review->next_is_replay = false;
+    review->next_pool_index = 0;
+    review->next_return_ordinal = 0;
+    review->reviewed = 0;
+    review->unknown = 0;
+    review->replayed = 0;
+    review->replay_unknown = 0;
+    review->complete_selection = wqn::WordCompleteSelection::kSequential;
+    uint32_t hash = 2166136261u;
+    for (const char ch : session_id) {
+        hash ^= static_cast<uint8_t>(ch);
+        hash *= 16777619u;
     }
-    state->dictionary_letters = wqn::WordPackNextLetters(state->pack_index, state->dictionary_prefix);
-    if (state->dictionary_letter_selected >= state->dictionary_letters.size()) {
-        state->dictionary_letter_selected = 0;
+    hash ^= static_cast<uint32_t>(esp_timer_get_time());
+    review->seed = hash != 0 ? hash : 0x9E3779B9u;
+}
+
+bool PickReadyReplay(wqn::WordReviewRuntime* review, size_t* index)
+{
+    if (review == nullptr || index == nullptr) return false;
+    size_t ready_count = 0;
+    for (const wqn::WordReplayEntry& entry : review->pool) {
+        if (entry.ready_at <= review->cards_seen) ++ready_count;
     }
-    wqn::FindWordPackPrefixMatches(state->pack_index, state->dictionary_prefix, kDictionaryPreviewLimit, &state->dictionary_matches);
-    if (state->dictionary_match_selected >= state->dictionary_matches.size()) {
-        state->dictionary_match_selected = 0;
+    if (ready_count == 0) return false;
+    size_t target = ready_count > 1
+        ? NextReplayRandom(&review->seed) % ready_count
+        : 0;
+    for (size_t i = 0; i < review->pool.size(); ++i) {
+        if (review->pool[i].ready_at > review->cards_seen) continue;
+        if (target == 0) {
+            *index = i;
+            return true;
+        }
+        --target;
+    }
+    return false;
+}
+
+// The spacing rule cannot be honoured once the queue is empty; drain the entry
+// that has been waiting longest.
+bool PickAnyReplay(const wqn::WordReviewRuntime& review, size_t* index)
+{
+    if (review.pool.empty() || index == nullptr) return false;
+    size_t best = 0;
+    for (size_t i = 1; i < review.pool.size(); ++i) {
+        if (review.pool[i].ready_at < review.pool[best].ready_at) best = i;
+    }
+    *index = best;
+    return true;
+}
+
+// Pool bookkeeping for one committed review judgment. Runs on commit (not on
+// Prepare) so a failed persist can be retried without counting a replay twice.
+void ApplyWordReviewBookkeeping(
+    wqn::WordAppState* state,
+    wqn::protocol::word_study_v1::ObservationAction action,
+    uint64_t answered_ordinal)
+{
+    using wqn::protocol::word_study_v1::ObservationAction;
+    if (state == nullptr) return;
+    auto& review = state->review;
+    const bool answered_replay = review.replay_in_flight;
+    ++review.cards_seen;
+    if (answered_replay) {
+        const size_t pool_index = review.replay_pool_index;
+        if (action == ObservationAction::kKnown ||
+            action == ObservationAction::kUnknown) {
+            ++review.replayed;
+        }
+        if (pool_index < review.pool.size()) {
+            wqn::WordReplayEntry& entry = review.pool[pool_index];
+            if (action == ObservationAction::kKnown) {
+                // Recognized this time: the word leaves the pool.
+                review.pool.erase(
+                    review.pool.begin() + static_cast<std::ptrdiff_t>(pool_index));
+            } else if (action == ObservationAction::kUnknown) {
+                ++review.replay_unknown;
+                ++entry.replays;
+                if (entry.replays >= kWordReplayMax) {
+                    review.pool.erase(
+                        review.pool.begin() + static_cast<std::ptrdiff_t>(pool_index));
+                } else {
+                    entry.ready_at = review.cards_seen + kWordReplayMinGap;
+                }
+            } else {
+                // Skipped without judging: keep it, just push it back.
+                entry.ready_at = review.cards_seen + kWordReplayMinGap;
+            }
+        }
+        review.replay_in_flight = false;
+        review.replay_pool_index = 0;
+    } else if (action == ObservationAction::kUnknown) {
+        const auto existing = std::find_if(
+            review.pool.begin(),
+            review.pool.end(),
+            [answered_ordinal](const wqn::WordReplayEntry& entry) {
+                return entry.ordinal == answered_ordinal;
+            });
+        if (existing != review.pool.end()) {
+            existing->ready_at = review.cards_seen + kWordReplayMinGap;
+        } else {
+            wqn::WordReplayEntry entry;
+            entry.ordinal = answered_ordinal;
+            entry.replays = 0;
+            entry.ready_at = review.cards_seen + kWordReplayMinGap;
+            review.pool.push_back(entry);
+            // "X 张没答对" counts distinct words, so a word missed again on a
+            // replay does not inflate it.
+            ++review.unknown;
+        }
+    }
+    if (action == ObservationAction::kKnown ||
+        action == ObservationAction::kUnknown) {
+        ++review.reviewed;
+    }
+    // A replay chosen while leaving this card starts with the next one.
+    if (review.next_is_replay) {
+        review.replay_in_flight = true;
+        review.replay_pool_index = review.next_pool_index;
+        review.replay_return_ordinal = review.next_return_ordinal;
+        review.next_is_replay = false;
+        review.next_pool_index = 0;
+        review.next_return_ordinal = 0;
     }
 }
+
+// ---- session cursor helpers ----------------------------------------------
+
+uint64_t SessionEndOrdinal(const wqn::StoredWordSessionData& remote)
+{
+    return remote.items.empty() ? 0 : remote.items.back().ordinal + 1;
+}
+
+size_t SessionIndexOfOrdinal(
+    const wqn::StoredWordSessionData& remote,
+    uint64_t ordinal)
+{
+    for (size_t i = 0; i < remote.items.size(); ++i) {
+        if (remote.items[i].ordinal == ordinal) return i;
+    }
+    return remote.items.size();
+}
+
+bool IsChainSkipped(const wqn::WordSessionChain& chain, uint64_t ordinal)
+{
+    return std::find(
+               chain.skip_ordinals.begin(),
+               chain.skip_ordinals.end(),
+               ordinal) != chain.skip_ordinals.end();
+}
+
+// Next queue index at/after `from`, skipping the intake words the sequential
+// walk must not repeat. May return items.size() (queue done).
+size_t NextQueuePosition(const wqn::WordAppState& state, size_t from)
+{
+    const auto& items = state.session.persisted.remote.items;
+    size_t position = from;
+    while (position < items.size() &&
+           IsChainSkipped(state.chain, items[position].ordinal)) {
+        ++position;
+    }
+    return position;
+}
+
+// Where a plain (non-replay) advance from the current card lands.
+uint64_t NextQueueOrdinal(const wqn::WordAppState& state)
+{
+    const auto& remote = state.session.persisted.remote;
+    const size_t next =
+        NextQueuePosition(state, state.session.persisted.position + 1);
+    return next < remote.items.size() ? remote.items[next].ordinal
+                                      : SessionEndOrdinal(remote);
+}
+
 
 esp_err_t LoadCurrentReviewWord(wqn::WordAppState* state)
 {
@@ -137,26 +360,67 @@ esp_err_t LoadCurrentReviewWord(wqn::WordAppState* state)
     return wqn::ReadWordPackEntry(*entry, &state->current_word);
 }
 
-esp_err_t LoadCurrentDictionaryWord(wqn::WordAppState* state)
+// Decide where the card on screen leads. Review sessions interleave the replay
+// pool into the remaining queue; every other mode is a straight walk. Pure with
+// respect to the pool: the bookkeeping happens when the observation commits
+// (ApplyWordObservationCommitResult), so a failed persist can be retried
+// without counting a replay twice.
+uint64_t PlannedNextOrdinal(wqn::WordAppState* state)
 {
-    if (state == nullptr) {
-        return ESP_ERR_INVALID_ARG;
+    const auto& persisted = state->session.persisted;
+    const auto& remote = persisted.remote;
+    auto& review = state->review;
+    review.next_is_replay = false;
+    review.next_pool_index = 0;
+    review.next_return_ordinal = 0;
+    if (review.replay_in_flight) {
+        // Answering a replay returns to the queue position it interrupted.
+        return review.replay_return_ordinal;
     }
-    state->current_word = wqn::WqnWordEntry{};
-    if (state->dictionary_matches.empty() || state->dictionary_match_selected >= state->dictionary_matches.size()) {
-        return ESP_OK;
+    if (!IsReviewSession(persisted)) {
+        return NextQueueOrdinal(*state);
     }
-    const size_t index = state->dictionary_matches[state->dictionary_match_selected];
-    if (index >= state->pack_index.entries.size()) {
-        return ESP_ERR_INVALID_ARG;
+    // 1) A due replay is inserted into the remaining queue.
+    size_t pool_index = 0;
+    if (PickReadyReplay(&review, &pool_index)) {
+        const size_t item_index =
+            SessionIndexOfOrdinal(remote, review.pool[pool_index].ordinal);
+        if (item_index < remote.items.size()) {
+            review.next_is_replay = true;
+            review.next_pool_index = pool_index;
+            review.next_return_ordinal = NextQueueOrdinal(*state);
+            return review.pool[pool_index].ordinal;
+        }
+        // The word rolled out of the local candidate window: forget it.
+        review.pool.erase(
+            review.pool.begin() + static_cast<std::ptrdiff_t>(pool_index));
     }
-    return wqn::ReadWordPackEntry(state->pack_index.entries[index], &state->current_word);
+    // 2) The queue itself.
+    const size_t next = NextQueuePosition(*state, persisted.position + 1);
+    if (next < remote.items.size()) {
+        return remote.items[next].ordinal;
+    }
+    // 3) Queue exhausted and no further pages: drain whatever the pool still
+    //    holds. The minimum-gap rule degrades to "as soon as possible" here.
+    if (!remote.has_more && PickAnyReplay(review, &pool_index)) {
+        const size_t item_index =
+            SessionIndexOfOrdinal(remote, review.pool[pool_index].ordinal);
+        if (item_index < remote.items.size()) {
+            review.next_is_replay = true;
+            review.next_pool_index = pool_index;
+            review.next_return_ordinal = SessionEndOrdinal(remote);
+            return review.pool[pool_index].ordinal;
+        }
+        review.pool.erase(
+            review.pool.begin() + static_cast<std::ptrdiff_t>(pool_index));
+    }
+    return SessionEndOrdinal(remote);
 }
 
 void PrepareObservation(
     wqn::WordAppState* state,
     wqn::protocol::word_study_v1::ObservationAction action,
-    uint32_t next_position,
+    wqn::WordObservationTarget target,
     wqn::WordPresentationPhase next_phase)
 {
     if (state == nullptr || !state->session.persisted.active ||
@@ -164,58 +428,26 @@ void PrepareObservation(
             state->session.persisted.remote.items.size()) {
         return;
     }
-    auto& observation = state->session.pending_observation;
-    observation = {};
-    observation.session_id = state->session.persisted.remote.session_id;
-    observation.sequence = state->session.persisted.remote.next_sequence;
-    observation.item_id =
-        state->session.persisted.remote.items[state->session.persisted.position].item_id;
-    observation.action = action;
-    observation.mode = state->session.persisted.remote.mode;
-    const uint64_t current_ordinal =
-        state->session.persisted.remote.items[
-            state->session.persisted.position].ordinal;
-    const bool advances = next_position > state->session.persisted.position;
-    const uint64_t next_ordinal = current_ordinal + (advances ? 1U : 0U);
+    const auto& remote = state->session.persisted.remote;
+    const size_t position = state->session.persisted.position;
+    uint64_t next_ordinal = remote.items[position].ordinal;
+    if (target == wqn::WordObservationTarget::kAdvance) {
+        next_ordinal = PlannedNextOrdinal(state);
+    }
     if (next_ordinal > UINT32_MAX) {
         state->message = "会话游标超限";
         return;
     }
+    auto& observation = state->session.pending_observation;
+    observation = {};
+    observation.session_id = remote.session_id;
+    observation.sequence = remote.next_sequence;
+    observation.item_id = remote.items[position].item_id;
+    observation.action = action;
+    observation.mode = remote.mode;
     observation.next_position = static_cast<uint32_t>(next_ordinal);
     observation.next_phase = next_phase;
     state->session.commit_state = wqn::WordObservationCommitState::kPersisting;
-    state->card_phase = wqn::WordCardPhase::kPersisting;
-    state->session.observation_effect_ready = true;
-    state->message = "正在保存";
-}
-
-void PrepareDictionaryObservation(
-    wqn::WordAppState* state,
-    wqn::protocol::word_study_v1::ObservationAction action)
-{
-    if (state == nullptr) return;
-    if (state->current_word.id.empty()) {
-        state->message = "临时词无法写入学习记录";
-        return;
-    }
-    const auto& session = state->session.persisted;
-    if (!session.active || session.remote.session_id.empty() ||
-        session.remote.mode !=
-            wqn::protocol::word_study_v1::Mode::kDictionary) {
-        state->message = "记录尚未就绪，请稍后重试";
-        return;
-    }
-    auto& observation = state->session.pending_observation;
-    observation = {};
-    observation.session_id = session.remote.session_id;
-    observation.sequence = session.remote.next_sequence;
-    observation.item_id = state->current_word.id;
-    observation.action = action;
-    observation.mode = wqn::protocol::word_study_v1::Mode::kDictionary;
-    observation.next_position = session.position;
-    observation.next_phase = wqn::WordPresentationPhase::kBack;
-    state->session.commit_state =
-        wqn::WordObservationCommitState::kPersisting;
     state->card_phase = wqn::WordCardPhase::kPersisting;
     state->session.observation_effect_ready = true;
     state->message = "正在保存";
@@ -228,6 +460,49 @@ size_t RemainingCandidateItems(const wqn::PersistedWordSession& session)
         : 0;
 }
 
+// Compaction erases the already-answered prefix of the candidate window; drop
+// every local ordinal reference that rolled out with it (a pooled replay whose
+// item is gone can no longer be shown, and a stale skip ordinal is harmless but
+// noise).
+void PruneSessionOrdinals(wqn::WordAppState* state)
+{
+    if (state == nullptr) return;
+    const auto& items = state->session.persisted.remote.items;
+    const auto present = [&items](uint64_t ordinal) {
+        return std::any_of(
+            items.begin(),
+            items.end(),
+            [ordinal](const wqn::StoredWordSessionItem& item) {
+                return item.ordinal == ordinal;
+            });
+    };
+    auto& pool = state->review.pool;
+    pool.erase(
+        std::remove_if(
+            pool.begin(),
+            pool.end(),
+            [&present](const wqn::WordReplayEntry& entry) {
+                return !present(entry.ordinal);
+            }),
+        pool.end());
+    if (state->review.replay_in_flight &&
+        state->review.replay_return_ordinal !=
+            SessionEndOrdinal(state->session.persisted.remote) &&
+        !present(state->review.replay_return_ordinal)) {
+        // The interrupted queue position rolled out of the window: continue
+        // from the end of the new one.
+        state->review.replay_return_ordinal =
+            SessionEndOrdinal(state->session.persisted.remote);
+    }
+    auto& skip = state->chain.skip_ordinals;
+    skip.erase(
+        std::remove_if(
+            skip.begin(),
+            skip.end(),
+            [&present](uint64_t ordinal) { return !present(ordinal); }),
+        skip.end());
+}
+
 void RequestCandidatePageIfNeeded(wqn::WordAppState* state)
 {
     if (state == nullptr || !state->session.persisted.active ||
@@ -236,10 +511,17 @@ void RequestCandidatePageIfNeeded(wqn::WordAppState* state)
         state->session.page_in_flight || state->session.page_requested) {
         return;
     }
-    if (RemainingCandidateItems(state->session.persisted) <=
+    if (RemainingCandidateItems(state->session.persisted) >
         kCandidatePrefetchThreshold) {
-        state->session.page_requested = true;
+        return;
     }
+    // [word-modes-v2] Compaction drops the answered prefix, which is exactly
+    // where a pending replay lives. Wait for the pool to drain (a few cards)
+    // before pulling the next page.
+    if (!state->review.pool.empty()) {
+        return;
+    }
+    state->session.page_requested = true;
 }
 
 bool SetSessionCursorOrdinal(
@@ -297,6 +579,9 @@ void InstallWordPackIndex(
     const bool pack_error = index.pack_error;
     const std::string status_message = index.status_message;
     state->pack_index = std::move(index);
+    // Every install lands the library index unless the caller re-pins it
+    // immediately (the resumed-session path below does).
+    state->pack_index_pinned = false;
     state->cloud_loaded_once = has_manifest;
     state->cloud_sync_failed = pack_error;
     state->cloud_sync_requested = !has_manifest || pack_error;
@@ -304,7 +589,6 @@ void InstallWordPackIndex(
     if (state->message.empty()) {
         state->message = HasPackWords(*state) ? "词库已就绪" : "词库未同步";
     }
-    RefreshDictionaryState(state);
 }
 
 void ActivatePendingWordPackIndex(wqn::WordAppState* state)
@@ -318,6 +602,56 @@ void ActivatePendingWordPackIndex(wqn::WordAppState* state)
     state->pending_pack_index = {};
     state->pending_pack_index_ready = false;
     InstallWordPackIndex(state, std::move(pending), "词库更新已启用");
+}
+
+// [word-sequential-chain] Persist how far the library walk has come, so the
+// completion page can offer 续 #N after a reboot. Only meaningful for a
+// sequential session; every other mode has no library cursor.
+void SaveSequentialCursor(wqn::WordAppState* state)
+{
+    if (state == nullptr || !IsSequentialSession(state->session.persisted)) {
+        return;
+    }
+    const uint64_t index = static_cast<uint64_t>(state->session.persisted.start_index) +
+        state->session.persisted.position;
+    const uint32_t cursor =
+        index > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(index);
+    const esp_err_t result = wqn::SaveWordSequentialCursor(cursor);
+    if (result != ESP_OK) {
+        ESP_LOGW(kTag, "save sequential cursor failed: %s", esp_err_to_name(result));
+        return;
+    }
+    state->chain.sequential_cursor = cursor;
+}
+
+// Arm the library walk (mode=sequential from the durable cursor). Used both by
+// the completion page and after the intake head of the chain.
+void StartSequentialWalk(wqn::WordAppState* state, bool from_chain)
+{
+    if (state == nullptr) return;
+    if (state->session.requested_mode !=
+        wqn::protocol::word_study_v1::Mode::kSequential) {
+        state->session.create_request_id.clear();
+    }
+    state->session.requested_mode = wqn::protocol::word_study_v1::Mode::kSequential;
+    state->session.requested_start_index = state->chain.sequential_cursor;
+    state->session.requested_new_word_limit = 0;
+    state->session.start_requested = true;
+    state->mode = wqn::WordAppMode::kSessionStarting;
+    state->message = from_chain ? "正在进入词库顺序" : "正在准备词库顺序";
+}
+
+// Arm today's new words (mode=intake), the head of 顺序过词库.
+void StartIntakeHead(wqn::WordAppState* state)
+{
+    if (state == nullptr) return;
+    state->session.requested_mode = wqn::protocol::word_study_v1::Mode::kIntake;
+    state->session.requested_start_index = 0;
+    state->session.requested_new_word_limit = kWordNewWordDailyLimit;
+    state->session.create_request_id.clear();
+    state->session.start_requested = true;
+    state->mode = wqn::WordAppMode::kSessionStarting;
+    state->message = "正在准备今日新词";
 }
 
 void FinishOrLoadAdvancedReview(wqn::WordAppState* state)
@@ -334,62 +668,201 @@ void FinishOrLoadAdvancedReview(wqn::WordAppState* state)
         }
         state->message = "会话词包不可用";
     }
-    if (session.active && session.position == session.remote.items.size() &&
+    // [word-modes-v2] A review session is not finished while its local replay
+    // pool still holds a word: jump back to it. This also runs before paging,
+    // because compaction drops the pool entries that rolled out of the window.
+    if (session.active && IsReviewSession(session) &&
+        !state->review.replay_in_flight) {
+        size_t pool_index = 0;
+        if (PickAnyReplay(state->review, &pool_index)) {
+            const size_t item_index = SessionIndexOfOrdinal(
+                session.remote, state->review.pool[pool_index].ordinal);
+            if (item_index < session.remote.items.size()) {
+                state->review.replay_in_flight = true;
+                state->review.replay_pool_index = pool_index;
+                state->review.replay_return_ordinal =
+                    SessionEndOrdinal(session.remote);
+                session.position = static_cast<uint32_t>(item_index);
+                if (LoadCurrentReviewWord(state) == ESP_OK) {
+                    ShowStudyCard(state);
+                    state->message = "重学一遍";
+                    return;
+                }
+                state->review.replay_in_flight = false;
+                state->message = "会话词包不可用";
+            } else {
+                state->review.pool.erase(
+                    state->review.pool.begin() +
+                    static_cast<std::ptrdiff_t>(pool_index));
+                FinishOrLoadAdvancedReview(state);
+                return;
+            }
+        }
+    }
+    if (session.active && session.position >= session.remote.items.size() &&
         session.remote.has_more) {
         state->mode = wqn::WordAppMode::kSessionStarting;
         state->session.page_requested = true;
         state->message = "正在加载后续单词";
         return;
     }
+    // [word-sequential-chain] The intake head is done: remember its words so
+    // the walk does not repeat them, then arm the sequential session.
+    if (IsIntakeSession(session) && state->chain.active) {
+        state->chain.exclude_ids.clear();
+        for (const wqn::StoredWordSessionItem& item : session.remote.items) {
+            state->chain.exclude_ids.push_back(item.item_id);
+        }
+        session.active = false;
+        session.paused = false;
+        StartSequentialWalk(state, true);
+        return;
+    }
+    // The observation effect may already have cleared `active` (the queue ran
+    // out), so the mode -- not the flag -- decides where this lands.
+    const bool completed_review = IsReviewSession(session);
+    const bool completed_sequential = IsSequentialSession(session);
     session.active = false;
     session.paused = false;
     SetStudySessionResumable(state, session.remote.mode, false);
-    state->mode = wqn::WordAppMode::kHome;
     state->current_word = wqn::WqnWordEntry{};
+    if (completed_sequential) {
+        // The walk reached the end of the library: wrap the cursor so the next
+        // 顺序过词库 starts over instead of asking for an empty slice.
+        state->chain.sequential_cursor = 0;
+        const esp_err_t wrap_result = wqn::SaveWordSequentialCursor(0);
+        if (wrap_result != ESP_OK) {
+            ESP_LOGW(
+                kTag,
+                "reset sequential cursor failed: %s",
+                esp_err_to_name(wrap_result));
+        }
+    }
     if (state->pending_pack_index_ready) {
         ActivatePendingWordPackIndex(state);
-    } else {
+    } else if (state->pack_index_pinned) {
+        // Only a resumed session's pinned snapshot needs replacing. Pack files
+        // are immutable, so re-reading SPIFFS and re-hashing every pack on a
+        // plain completion would freeze the caller for seconds and change
+        // nothing (the boot contract fixtures hit this path hundreds of times).
         wqn::WordPackIndex current;
         if (wqn::LoadWordPackIndex(&current) == ESP_OK) {
             InstallWordPackIndex(state, std::move(current), "");
         }
     }
+    if (completed_review) {
+        state->mode = wqn::WordAppMode::kReviewComplete;
+        state->review.complete_selection = wqn::WordCompleteSelection::kSequential;
+        state->message = "今天的复习完成了";
+        // Nothing is due anymore: drop the sync hint so the home card does not
+        // keep advertising yesterday's queue until the next sync.
+        wqn::SetWordReviewDueCount(0);
+        return;
+    }
+    state->mode = wqn::WordAppMode::kHome;
     state->message = "本轮浏览完成";
 }
 
-void RequestOnlineLookup(wqn::WordAppState* state)
+// Long-press on a card: keep the cursor, remember it as resumable, go home.
+void PauseWordSession(wqn::WordAppState* state)
 {
-    if (state == nullptr || state->dictionary_prefix.empty()) {
-        return;
-    }
-    state->pending_search_query = state->dictionary_prefix;
-    state->search_pending = true;
-    state->message = "正在在线搜索";
+    if (state == nullptr) return;
+    state->session.persisted.paused = true;
+    SetStudySessionResumable(state, state->session.persisted.remote.mode, true);
+    SaveSequentialCursor(state);
+    ESP_ERROR_CHECK_WITHOUT_ABORT(
+        wqn::SaveWordSessionCursor(state->session.persisted));
+    state->mode = wqn::WordAppMode::kHome;
+    state->message = "本轮已暂停";
+    ActivatePendingWordPackIndex(state);
 }
 
-void RequestAiLookup(wqn::WordAppState* state)
+// Resume a paused session of `mode`, pinning the session's own pack snapshot
+// when the mounted index moved on. Returns true when the caller must not start
+// a new session (the card is on screen, or the pinned pack is unavailable).
+bool TryResumePausedSession(
+    wqn::WordAppState* state,
+    wqn::protocol::word_study_v1::Mode mode)
 {
-    if (state == nullptr || state->dictionary_prefix.empty()) {
-        return;
+    if (state == nullptr) return false;
+    wqn::PersistedWordSession stored_session;
+    if (wqn::LoadPersistedWordSession(mode, &stored_session) == ESP_OK &&
+        stored_session.active && stored_session.paused &&
+        (stored_session.position < stored_session.remote.items.size() ||
+         (stored_session.position == stored_session.remote.items.size() &&
+          stored_session.remote.has_more))) {
+        state->session.persisted = std::move(stored_session);
+        if (!wqn::WordPackIndexMatchesSession(
+                state->pack_index, state->session.persisted)) {
+            wqn::WordPackIndex pinned_index;
+            const esp_err_t pinned_result = wqn::LoadWordPackIndexForSession(
+                state->session.persisted, &pinned_index);
+            if (pinned_result != ESP_OK || pinned_index.pack_error) {
+                state->message = "会话词包不可用";
+                return true;
+            }
+            InstallWordPackIndex(state, std::move(pinned_index), "已载入会话词包");
+            state->pack_index_pinned = true;
+        } else {
+            ESP_LOGI(kTag, "reuse in-memory word pack index for pinned session");
+        }
     }
-    state->pending_ai_query = state->dictionary_prefix;
-    state->ai_lookup_pending = true;
-    state->message = "正在询问 AI";
-}
-
-bool LookupResultMatches(
-    const wqn::WordAppState& state,
-    const std::string& query)
-{
-    return state.mode == wqn::WordAppMode::kDictionaryPicker &&
-        state.dictionary_stage == wqn::WordDictionaryStage::kLookupChoice &&
-        state.lookup_result_expected && !query.empty() &&
-        query == state.active_lookup_query;
+    if (!state->session.persisted.active ||
+        !state->session.persisted.paused ||
+        state->session.persisted.remote.mode != mode ||
+        !(state->session.persisted.position <
+              state->session.persisted.remote.items.size() ||
+          (state->session.persisted.position ==
+               state->session.persisted.remote.items.size() &&
+           state->session.persisted.remote.has_more))) {
+        return false;
+    }
+    state->session.persisted.paused = false;
+    SetStudySessionResumable(state, mode, false);
+    if (mode == wqn::protocol::word_study_v1::Mode::kReview) {
+        // A resumed review session starts a fresh local pool: every word the
+        // user missed is already due=now on the server.
+        SeedReviewRuntime(&state->review, state->session.persisted.remote.session_id);
+    }
+    const esp_err_t cursor_result =
+        wqn::SaveWordSessionCursor(state->session.persisted);
+    if (cursor_result != ESP_OK) {
+        ESP_LOGW(kTag, "resume word session failed: %s", esp_err_to_name(cursor_result));
+        state->message = "会话未保存，请重试";
+        return true;
+    }
+    if (state->session.persisted.position ==
+        state->session.persisted.remote.items.size()) {
+        state->mode = wqn::WordAppMode::kSessionStarting;
+        state->session.page_requested = true;
+        state->message = "正在加载后续单词";
+        return true;
+    }
+    if (LoadCurrentReviewWord(state) != ESP_OK) {
+        state->message = "会话词包不可用";
+        return true;
+    }
+    ShowStudyCard(state);
+    state->message = "已继续上次会话";
+    RequestCandidatePageIfNeeded(state);
+    return true;
 }
 
 }  // namespace
 
 namespace wqn {
+
+void SetWordReviewDueCount(int count)
+{
+    g_word_review_due_count.store(
+        count > 0 ? count : 0, std::memory_order_release);
+}
+
+void SetWordMistakeCount(int count)
+{
+    g_word_mistake_count.store(
+        count >= 0 ? count : -1, std::memory_order_release);
+}
 
 esp_err_t InitWordApp(WordAppState* state)
 {
@@ -402,11 +875,15 @@ esp_err_t InitWordApp(WordAppState* state)
 
     state->mode = WordAppMode::kHome;
     state->card_phase = WordCardPhase::kFront;
-    state->card_source = WordCardSource::kStudy;
-    state->dictionary_stage = WordDictionaryStage::kLetters;
-    state->home_selection = WordHomeSelection::kSequential;
-    state->lookup_selection = WordLookupSelection::kOnlineSearch;
+    state->home_selection = WordHomeSelection::kReview;
     state->message = "词库同步中";
+    // The sequential walk resumes from this cursor (and the completion page
+    // shows it as 续 #N).
+    uint32_t sequential_cursor = 0;
+    if (wqn::LoadWordSequentialCursor(&sequential_cursor) != ESP_OK) {
+        sequential_cursor = 0;
+    }
+    state->chain.sequential_cursor = sequential_cursor;
 
     const esp_err_t storage_result = InitWordPackStorage();
     if (storage_result != ESP_OK) {
@@ -424,6 +901,8 @@ esp_err_t InitWordApp(WordAppState* state)
     WordOutboxSnapshot outbox;
     if (ReadWordOutboxSnapshot(&outbox) == ESP_OK) {
         state->outbox.pending_count = outbox.pending_count;
+        state->outbox.suspended_count = outbox.suspended_count;
+        state->outbox.blocked_count = outbox.blocked_count;
         state->outbox.capacity = outbox.capacity;
     }
 
@@ -444,26 +923,15 @@ esp_err_t InitWordApp(WordAppState* state)
             (persisted.position < persisted.remote.items.size() ||
              (persisted.position == persisted.remote.items.size() &&
               persisted.remote.has_more));
-        if (session_result == ESP_OK && resumable &&
-            persisted.remote.mode ==
-                protocol::word_study_v1::Mode::kDictionary) {
-            // Dictionary is an arbitrary lookup context, not a card cursor to
-            // auto-resume. Keep its server session for explicit observations,
-            // but always return to the neutral word home after reboot.
-            if (!persisted.paused) {
-                persisted.paused = true;
-                ESP_ERROR_CHECK_WITHOUT_ABORT(
-                    SaveWordSessionCursor(persisted));
-            }
-            continue;
-        }
         if (session_result == ESP_OK && resumable) {
             if (persisted.remote.mode ==
                 protocol::word_study_v1::Mode::kSequential) {
-                state->sequential_session_resumable = true;
-            } else if (persisted.remote.mode ==
-                       protocol::word_study_v1::Mode::kRandom) {
-                state->random_session_resumable = true;
+                // No home card of its own: the walk is resumed from the review
+                // completion page, and its cursor is already loaded.
+                state->chain.sequential_cursor =
+                    persisted.start_index + persisted.position;
+            } else {
+                SetStudySessionResumable(state, persisted.remote.mode, true);
             }
         }
         if (session_result == ESP_OK && resumable) {
@@ -489,6 +957,17 @@ esp_err_t InitWordApp(WordAppState* state)
                 state->session.persisted = std::move(persisted);
                 found_paused_session = true;
             }
+        } else if (session_result == ESP_ERR_INVALID_VERSION) {
+            // [word-modes-v2] A record written by an older schema (v3 lacked
+            // start_index) can never be loaded again. Drop it instead of
+            // greeting every upgraded device with "会话记录损坏": a session is
+            // only a browse cursor, the observation outbox is the durable one.
+            ESP_LOGI(
+                kTag,
+                "discard legacy word session: mode=%u",
+                static_cast<unsigned>(mode));
+            ESP_ERROR_CHECK_WITHOUT_ABORT(
+                ClearPersistedWordSession(mode));
         } else if (session_result != ESP_OK && session_result != ESP_ERR_NOT_FOUND) {
             found_corrupt_session = true;
             ESP_LOGW(
@@ -552,102 +1031,26 @@ esp_err_t HandleWordAppInput(WordAppState* state, WordInput input)
             if (input != WordInput::kConfirm) {
                 return ESP_OK;
             }
-            if (state->home_selection == WordHomeSelection::kDictionary) {
-                CancelWordLookupResult(state);
-                state->mode = WordAppMode::kDictionaryPicker;
-                state->dictionary_stage = WordDictionaryStage::kLetters;
-                state->dictionary_prefix.clear();
-                RefreshDictionaryState(state);
-                PersistedWordSession dictionary_session;
-                const bool can_record =
-                    LoadPersistedWordSession(
-                        protocol::word_study_v1::Mode::kDictionary,
-                        &dictionary_session) == ESP_OK &&
-                    dictionary_session.active;
-                if (can_record) {
-                    dictionary_session.paused = false;
-                    state->session.persisted = std::move(dictionary_session);
-                    state->session.commit_state =
-                        WordObservationCommitState::kIdle;
-                } else if (HasPackWords(*state)) {
-                    if (state->session.requested_mode !=
-                        protocol::word_study_v1::Mode::kDictionary) {
-                        state->session.create_request_id.clear();
-                    }
-                    state->session.requested_mode =
-                        protocol::word_study_v1::Mode::kDictionary;
-                    state->session.start_requested = true;
-                }
-                state->message = !HasPackWords(*state)
-                    ? "词库未同步"
-                    : (can_record ? "选择首字母" : "选择首字母，记录准备中");
-                return ESP_OK;
-            }
             if (!HasPackWords(*state)) {
                 state->message = state->pack_index.status_message.empty() ? "词库未同步" : state->pack_index.status_message;
                 state->cloud_sync_requested = true;
                 return ESP_OK;
             }
-            const auto requested_mode = state->home_selection == WordHomeSelection::kRandom
-                ? protocol::word_study_v1::Mode::kRandom
-                : protocol::word_study_v1::Mode::kSequential;
-            PersistedWordSession stored_session;
-            if (LoadPersistedWordSession(requested_mode, &stored_session) == ESP_OK &&
-                stored_session.active && stored_session.paused &&
-                (stored_session.position < stored_session.remote.items.size() ||
-                 (stored_session.position == stored_session.remote.items.size() &&
-                stored_session.remote.has_more))) {
-                state->session.persisted = std::move(stored_session);
-                if (!WordPackIndexMatchesSession(
-                        state->pack_index,
-                        state->session.persisted)) {
-                    WordPackIndex pinned_index;
-                    const esp_err_t pinned_result = LoadWordPackIndexForSession(
-                        state->session.persisted, &pinned_index);
-                    if (pinned_result != ESP_OK || pinned_index.pack_error) {
-                        state->message = "会话词包不可用";
-                        return ESP_OK;
-                    }
-                    InstallWordPackIndex(
-                        state, std::move(pinned_index), "已载入会话词包");
-                } else {
-                    ESP_LOGI(
-                        kTag,
-                        "reuse in-memory word pack index for pinned session");
-                }
-            }
-            if (state->session.persisted.active &&
-                state->session.persisted.paused &&
-                state->session.persisted.remote.mode == requested_mode &&
-                (state->session.persisted.position <
-                     state->session.persisted.remote.items.size() ||
-                 (state->session.persisted.position ==
-                      state->session.persisted.remote.items.size() &&
-                  state->session.persisted.remote.has_more))) {
-                state->session.persisted.paused = false;
-                SetStudySessionResumable(
-                    state, state->session.persisted.remote.mode, false);
-                ESP_RETURN_ON_ERROR(
-                    SaveWordSessionCursor(state->session.persisted),
-                    kTag,
-                    "resume word session");
-                if (state->session.persisted.position ==
-                    state->session.persisted.remote.items.size()) {
-                    state->mode = WordAppMode::kSessionStarting;
-                    state->session.page_requested = true;
-                    state->message = "正在加载后续单词";
-                } else {
-                    ESP_RETURN_ON_ERROR(LoadCurrentReviewWord(state), kTag, "load resumed word");
-                    ShowStudyCard(state);
-                    state->message = "已继续上次会话";
-                    RequestCandidatePageIfNeeded(state);
-                }
+            const auto requested_mode =
+                state->home_selection == WordHomeSelection::kShuffle
+                    ? protocol::word_study_v1::Mode::kShuffle
+                    : (state->home_selection == WordHomeSelection::kMistakes
+                           ? protocol::word_study_v1::Mode::kMistakes
+                           : protocol::word_study_v1::Mode::kReview);
+            if (TryResumePausedSession(state, requested_mode)) {
                 return ESP_OK;
             }
             if (state->session.requested_mode != requested_mode) {
                 state->session.create_request_id.clear();
             }
             state->session.requested_mode = requested_mode;
+            state->session.requested_start_index = 0;
+            state->session.requested_new_word_limit = 0;
             state->session.start_requested = true;
             state->mode = WordAppMode::kSessionStarting;
             state->message = "正在准备本轮单词";
@@ -671,9 +1074,13 @@ esp_err_t HandleWordAppInput(WordAppState* state, WordInput input)
                     state->session.persisted.paused = true;
                     SetStudySessionResumable(
                         state, state->session.persisted.remote.mode, true);
+                    SaveSequentialCursor(state);
                     ESP_ERROR_CHECK_WITHOUT_ABORT(
                         SaveWordSessionCursor(state->session.persisted));
                 }
+                state->chain.active = false;
+                state->chain.exclude_ids.clear();
+                state->chain.skip_ordinals.clear();
                 state->mode = WordAppMode::kHome;
                 state->message = state->session.persisted.active
                     ? "本轮已暂停"
@@ -694,52 +1101,21 @@ esp_err_t HandleWordAppInput(WordAppState* state, WordInput input)
                 }
                 return ESP_OK;
             }
-            if (state->card_source == WordCardSource::kDictionary) {
-                // Merely opening the card is read-only. The same revealed-card
-                // controls as study create an explicit durable observation.
-                if (input == WordInput::kConfirm) {
-                    PrepareDictionaryObservation(
-                        state,
-                        protocol::word_study_v1::ObservationAction::kKnown);
-                } else if (input == WordInput::kUp) {
-                    PrepareDictionaryObservation(
-                        state,
-                        protocol::word_study_v1::ObservationAction::kUnknown);
-                } else if (input == WordInput::kDown) {
-                    PrepareDictionaryObservation(
-                        state,
-                        protocol::word_study_v1::ObservationAction::kSkipped);
-                } else if (input == WordInput::kLongConfirm) {
-                    state->mode = WordAppMode::kDictionaryPicker;
-                    state->dictionary_stage = WordDictionaryStage::kLetters;
-                    state->message = state->dictionary_prefix.empty()
-                        ? "选择首字母"
-                        : state->dictionary_prefix;
-                }
-                return ESP_OK;
-            }
             if (state->card_phase == WordCardPhase::kFront) {
                 if (input == WordInput::kConfirm) {
                     PrepareObservation(
                         state,
                         protocol::word_study_v1::ObservationAction::kRevealed,
-                        state->session.persisted.position,
+                        WordObservationTarget::kStay,
                         WordPresentationPhase::kBack);
                 } else if (input == WordInput::kDown) {
                     PrepareObservation(
                         state,
                         protocol::word_study_v1::ObservationAction::kSkipped,
-                        state->session.persisted.position + 1,
+                        WordObservationTarget::kAdvance,
                         WordPresentationPhase::kFront);
                 } else if (input == WordInput::kLongConfirm) {
-                    state->session.persisted.paused = true;
-                    SetStudySessionResumable(
-                        state, state->session.persisted.remote.mode, true);
-                    ESP_ERROR_CHECK_WITHOUT_ABORT(
-                        SaveWordSessionCursor(state->session.persisted));
-                    state->mode = WordAppMode::kHome;
-                    state->message = "本轮已暂停";
-                    ActivatePendingWordPackIndex(state);
+                    PauseWordSession(state);
                 }
                 return ESP_OK;
             }
@@ -747,131 +1123,74 @@ esp_err_t HandleWordAppInput(WordAppState* state, WordInput input)
                 PrepareObservation(
                     state,
                     protocol::word_study_v1::ObservationAction::kKnown,
-                    state->session.persisted.position + 1,
+                    WordObservationTarget::kAdvance,
                     WordPresentationPhase::kFront);
             } else if (input == WordInput::kUp) {
                 PrepareObservation(
                     state,
                     protocol::word_study_v1::ObservationAction::kUnknown,
-                    state->session.persisted.position + 1,
+                    WordObservationTarget::kAdvance,
                     WordPresentationPhase::kFront);
             } else if (input == WordInput::kDown) {
                 PrepareObservation(
                     state,
                     protocol::word_study_v1::ObservationAction::kSkipped,
-                    state->session.persisted.position + 1,
+                    WordObservationTarget::kAdvance,
                     WordPresentationPhase::kFront);
             } else if (input == WordInput::kLongConfirm) {
-                state->session.persisted.paused = true;
-                SetStudySessionResumable(
-                    state, state->session.persisted.remote.mode, true);
-                ESP_ERROR_CHECK_WITHOUT_ABORT(
-                    SaveWordSessionCursor(state->session.persisted));
-                state->mode = WordAppMode::kHome;
-                state->message = "本轮已暂停";
-                ActivatePendingWordPackIndex(state);
+                PauseWordSession(state);
             }
             return ESP_OK;
 
-        case WordAppMode::kDictionaryPicker:
-            if (state->dictionary_stage == WordDictionaryStage::kLookupChoice) {
-                if (input == WordInput::kUp || input == WordInput::kDown) {
-                    state->lookup_selection =
-                        state->lookup_selection == WordLookupSelection::kOnlineSearch
-                        ? WordLookupSelection::kAiLookup
-                        : WordLookupSelection::kOnlineSearch;
-                    return ESP_OK;
-                }
-                if (input == WordInput::kLongConfirm) {
-                    CancelWordLookupResult(state);
-                    state->dictionary_stage = WordDictionaryStage::kLetters;
-                    state->message = state->dictionary_prefix.empty()
-                        ? "选择首字母"
-                        : state->dictionary_prefix;
-                    return ESP_OK;
-                }
-                if (input == WordInput::kConfirm) {
-                    if (state->lookup_selection ==
-                        WordLookupSelection::kOnlineSearch) {
-                        RequestOnlineLookup(state);
-                    } else {
-                        RequestAiLookup(state);
-                    }
-                }
+        case WordAppMode::kReviewComplete:
+            if (input == WordInput::kUp || input == WordInput::kDown) {
+                state->review.complete_selection =
+                    state->review.complete_selection ==
+                        WordCompleteSelection::kSequential
+                    ? WordCompleteSelection::kReturn
+                    : WordCompleteSelection::kSequential;
                 return ESP_OK;
             }
             if (input == WordInput::kLongConfirm) {
-                if (!state->dictionary_prefix.empty()) {
-                    state->dictionary_prefix.pop_back();
-                    RefreshDictionaryState(state);
-                    state->dictionary_letter_selected = 0;
-                    state->dictionary_match_selected = 0;
-                    state->message = state->dictionary_prefix.empty() ? "选择首字母" : state->dictionary_prefix;
-                } else {
-                    CancelWordSessionStartResult(state);
-                    if (state->session.persisted.active &&
-                        state->session.persisted.remote.mode ==
-                            protocol::word_study_v1::Mode::kDictionary) {
-                        state->session.persisted.paused = true;
-                        ESP_ERROR_CHECK_WITHOUT_ABORT(
-                            SaveWordSessionCursor(
-                                state->session.persisted));
-                    }
-                    state->mode = WordAppMode::kHome;
-                    state->message = "已返回单词主页";
-                    ActivatePendingWordPackIndex(state);
-                }
-                return ESP_OK;
-            }
-            if (input == WordInput::kUp) {
-                if (!state->dictionary_letters.empty()) {
-                    state->dictionary_letter_selected =
-                        (state->dictionary_letter_selected + state->dictionary_letters.size() - 1) % state->dictionary_letters.size();
-                }
-                return ESP_OK;
-            }
-            if (input == WordInput::kDown) {
-                if (!state->dictionary_letters.empty()) {
-                    state->dictionary_letter_selected = (state->dictionary_letter_selected + 1) % state->dictionary_letters.size();
-                }
+                state->mode = WordAppMode::kHome;
+                state->message = "已返回单词主页";
+                ActivatePendingWordPackIndex(state);
                 return ESP_OK;
             }
             if (input != WordInput::kConfirm) {
                 return ESP_OK;
             }
-            if (!state->dictionary_letters.empty()) {
-                state->dictionary_prefix.push_back(state->dictionary_letters[state->dictionary_letter_selected]);
-                RefreshDictionaryState(state);
-                state->dictionary_letter_selected = 0;
-                state->dictionary_match_selected = 0;
-                if (state->dictionary_matches.size() == 1 && state->dictionary_letters.empty()) {
-                    if (LoadCurrentDictionaryWord(state) == ESP_OK) {
-                        ShowDictionaryCard(state);
-                        state->message = "词典浏览，不自动改变进度";
-                    } else {
-                        state->message = "词条读取失败";
-                    }
-                } else if (state->dictionary_matches.empty()) {
-                    state->dictionary_stage = WordDictionaryStage::kLookupChoice;
-                    state->lookup_selection = WordLookupSelection::kOnlineSearch;
-                    state->message = "本地未命中";
-                } else {
-                    state->message = state->dictionary_prefix;
-                }
+            if (state->review.complete_selection ==
+                WordCompleteSelection::kReturn) {
+                state->mode = WordAppMode::kHome;
+                state->message = "已返回单词主页";
+                ActivatePendingWordPackIndex(state);
                 return ESP_OK;
             }
-            if (!state->dictionary_matches.empty()) {
-                if (LoadCurrentDictionaryWord(state) == ESP_OK) {
-                    ShowDictionaryCard(state);
-                    state->message = "词典浏览，不自动改变进度";
-                } else {
-                    state->message = "词条读取失败";
-                }
+            if (!HasPackWords(*state)) {
+                state->message = "词库未同步";
+                state->cloud_sync_requested = true;
                 return ESP_OK;
             }
-            state->dictionary_stage = WordDictionaryStage::kLookupChoice;
-            state->lookup_selection = WordLookupSelection::kOnlineSearch;
-            state->message = "本地未命中";
+            // [word-sequential-chain] 顺序过词库: today's new words first (the
+            // server's intake accounting), then the library walk from the
+            // durable cursor. A paused walk/intake session resumes instead.
+            state->chain.active = true;
+            if (state->chain.sequential_cursor >= state->pack_index.entries.size()) {
+                state->chain.sequential_cursor = 0;
+                ESP_ERROR_CHECK_WITHOUT_ABORT(wqn::SaveWordSequentialCursor(0));
+            }
+            if (TryResumePausedSession(
+                    state, protocol::word_study_v1::Mode::kIntake)) {
+                return ESP_OK;
+            }
+            if (TryResumePausedSession(
+                    state, protocol::word_study_v1::Mode::kSequential)) {
+                return ESP_OK;
+            }
+            state->chain.exclude_ids.clear();
+            state->chain.skip_ordinals.clear();
+            StartIntakeHead(state);
             return ESP_OK;
     }
 
@@ -953,16 +1272,20 @@ void ResetWordSessionsForScopeChange(WordAppState* state, bool clear_persisted)
             : state->session.persisted.remote.session_id.c_str(),
         clear_persisted ? 1 : 0);
     if (clear_persisted) {
-        ESP_ERROR_CHECK_WITHOUT_ABORT(
-            ClearPersistedWordSession(protocol::word_study_v1::Mode::kSequential));
-        ESP_ERROR_CHECK_WITHOUT_ABORT(
-            ClearPersistedWordSession(protocol::word_study_v1::Mode::kRandom));
+        for (const auto mode : kPersistedSessionModes) {
+            ESP_ERROR_CHECK_WITHOUT_ABORT(ClearPersistedWordSession(mode));
+        }
     }
     state->session = WordSessionState{};
-    state->sequential_session_resumable = false;
-    state->random_session_resumable = false;
+    state->review = WordReviewRuntime{};
+    state->chain = WordSessionChain{};
+    // The library walk's cursor indexes the scoped library, so a scope switch
+    // invalidates it.
+    ESP_ERROR_CHECK_WITHOUT_ABORT(SaveWordSequentialCursor(0));
+    state->review_session_resumable = false;
+    state->shuffle_session_resumable = false;
+    state->mistakes_session_resumable = false;
     state->card_phase = WordCardPhase::kFront;
-    state->card_source = WordCardSource::kStudy;
     state->current_word = WqnWordEntry{};
     state->mode = WordAppMode::kHome;
     state->message = "词库范围已切换";
@@ -989,95 +1312,6 @@ void ApplyWordPackIndex(WordAppState* state, WordPackIndex index, const std::str
     InstallWordPackIndex(state, std::move(index), message);
 }
 
-bool ApplyWordSearchResult(
-    WordAppState* state,
-    const std::string& query,
-    const WqnWordSearchResult& result)
-{
-    if (state == nullptr || !LookupResultMatches(*state, query)) return false;
-    CancelWordLookupResult(state);
-    state->online_results = result.words;
-    state->online_result_selected = 0;
-    if (!state->online_results.empty()) {
-        state->current_word = state->online_results.front();
-        ShowDictionaryCard(state);
-        state->message = "在线搜索结果";
-    } else {
-        state->mode = WordAppMode::kDictionaryPicker;
-        state->dictionary_stage = WordDictionaryStage::kLookupChoice;
-        state->lookup_selection = WordLookupSelection::kAiLookup;
-        state->message = "未找到，确认询问 AI";
-    }
-    return true;
-}
-
-bool ApplyWordAiLookupResult(
-    WordAppState* state,
-    const std::string& query,
-    const WqnWordAiLookupResult& result)
-{
-    if (state == nullptr || !LookupResultMatches(*state, query)) return false;
-    CancelWordLookupResult(state);
-    state->lookup_word = result.word;
-    state->current_word = result.word;
-    ShowDictionaryCard(state);
-    state->message = "AI 临时释义";
-    return true;
-}
-
-bool ApplyWordLookupFailure(
-    WordAppState* state,
-    const std::string& query,
-    const std::string& message)
-{
-    if (state == nullptr || !LookupResultMatches(*state, query)) return false;
-    CancelWordLookupResult(state);
-    state->message = message;
-    return true;
-}
-
-void CancelWordLookupResult(WordAppState* state)
-{
-    if (state == nullptr) return;
-    state->search_pending = false;
-    state->ai_lookup_pending = false;
-    state->lookup_result_expected = false;
-    state->pending_search_query.clear();
-    state->pending_ai_query.clear();
-    state->active_lookup_query.clear();
-}
-
-bool TakeWordSearchRequest(WordAppState* state, WqnWordSearchRequest* request)
-{
-    if (state == nullptr || request == nullptr || !state->search_pending ||
-        state->mode != WordAppMode::kDictionaryPicker ||
-        state->dictionary_stage != WordDictionaryStage::kLookupChoice) {
-        return false;
-    }
-    request->query = state->pending_search_query;
-    request->limit = 8;
-    state->search_pending = false;
-    state->lookup_result_expected = true;
-    state->active_lookup_query = request->query;
-    state->pending_search_query.clear();
-    return true;
-}
-
-bool TakeWordAiLookupRequest(WordAppState* state, WqnWordAiLookupRequest* request)
-{
-    if (state == nullptr || request == nullptr || !state->ai_lookup_pending ||
-        state->mode != WordAppMode::kDictionaryPicker ||
-        state->dictionary_stage != WordDictionaryStage::kLookupChoice) {
-        return false;
-    }
-    request->query = state->pending_ai_query;
-    state->ai_lookup_pending = false;
-    state->lookup_result_expected = true;
-    state->active_lookup_query = request->query;
-    state->pending_ai_query.clear();
-    return true;
-}
-
 bool TakeWordSessionStartRequest(
     WordAppState* state,
     protocol::word_study_v1::CreateSessionRequest* request)
@@ -1093,17 +1327,23 @@ bool TakeWordSessionStartRequest(
     request->mode = state->session.requested_mode;
     request->scope = {};
     // Study sessions honour the deck scope ([词] row override first, then the
-    // NVS default); the dictionary stays cross-deck (a lookup is global).
-    if (request->mode != protocol::word_study_v1::Mode::kDictionary) {
-        const std::string& scope_deck_id = !state->scoped_deck_id.empty()
-            ? state->scoped_deck_id
-            : state->default_deck_id;
-        if (scope_deck_id.size() == 36) {
-            request->scope.deck_ids.push_back(scope_deck_id);
-        }
+    // NVS default).
+    const std::string& scope_deck_id = !state->scoped_deck_id.empty()
+        ? state->scoped_deck_id
+        : state->default_deck_id;
+    if (scope_deck_id.size() == 36) {
+        request->scope.deck_ids.push_back(scope_deck_id);
     }
     request->optional_count = 500;
     request->seed.clear();
+    request->start_index = -1;
+    request->new_word_limit = 0;
+    if (request->mode == protocol::word_study_v1::Mode::kSequential) {
+        request->start_index =
+            static_cast<int>(state->session.requested_start_index);
+    } else if (request->mode == protocol::word_study_v1::Mode::kIntake) {
+        request->new_word_limit = state->session.requested_new_word_limit;
+    }
     state->session.start_requested = false;
     state->session.start_result_expected = true;
     return true;
@@ -1118,61 +1358,98 @@ bool ApplyWordSessionStartResult(
 {
     if (state == nullptr || !state->session.start_result_expected) return false;
     state->session.start_result_expected = false;
-    const bool dictionary_request = state->session.requested_mode ==
-        protocol::word_study_v1::Mode::kDictionary;
+    const auto requested_mode = state->session.requested_mode;
     if (result != ESP_OK) {
-        if (!dictionary_request) {
-            state->mode = WordAppMode::kHome;
-        }
+        state->mode = WordAppMode::kHome;
         state->message = result == ESP_ERR_INVALID_STATE
             ? "请先完成配对"
-            : (dictionary_request
-                  ? "词典可浏览，记录准备失败"
-                  : "本轮准备失败，可重试");
+            : "本轮准备失败，可重试";
+        state->chain.active = false;
+        state->chain.exclude_ids.clear();
+        state->chain.skip_ordinals.clear();
         return true;
     }
     // The runner thread already compacted and (for active sessions) persisted
     // the snapshot; only the in-memory install happens here.
-    const bool dictionary_session = persisted.remote.mode ==
-        protocol::word_study_v1::Mode::kDictionary;
     if (compact_result != ESP_OK) {
         state->mode = WordAppMode::kHome;
         state->message = "会话数据过大";
+        state->chain.active = false;
+        state->chain.exclude_ids.clear();
+        state->chain.skip_ordinals.clear();
         return true;
     }
     if (!persisted.active) {
         state->session.create_request_id.clear();
-        if (dictionary_session) {
-            state->message = "词典可浏览，学习记录暂不可用";
-        } else {
-            state->mode = WordAppMode::kHome;
-            state->message = "当前范围没有可浏览的单词";
+        // [word-modes-v2] An empty review session is not a failure: it is the
+        // "nothing due today" variant of the completion page. An empty intake
+        // head just means today's new-word budget is spent -- the walk still
+        // starts.
+        if (requested_mode == protocol::word_study_v1::Mode::kReview) {
+            SeedReviewRuntime(&state->review, std::string());
+            state->mode = WordAppMode::kReviewComplete;
+            state->review.complete_selection =
+                WordCompleteSelection::kSequential;
+            state->message = "今天没有到期的单词";
+            return true;
         }
+        if (requested_mode == protocol::word_study_v1::Mode::kIntake &&
+            state->chain.active) {
+            state->chain.exclude_ids.clear();
+            StartSequentialWalk(state, true);
+            return true;
+        }
+        state->mode = WordAppMode::kHome;
+        state->message = "当前范围没有可浏览的单词";
         return true;
     }
     if (persist_result != ESP_OK) {
         state->mode = WordAppMode::kHome;
         state->message = "会话未保存，请重试";
+        state->chain.active = false;
+        state->chain.exclude_ids.clear();
+        state->chain.skip_ordinals.clear();
         return true;
     }
     state->session.persisted = std::move(persisted);
+    if (IsSequentialSession(state->session.persisted)) {
+        // The server response does not carry the walk's continuation point;
+        // stamp the value the request was built with.
+        state->session.persisted.start_index =
+            state->session.requested_start_index;
+    }
     SetStudySessionResumable(
         state, state->session.persisted.remote.mode, false);
     state->session.commit_state = WordObservationCommitState::kIdle;
     state->session.page_in_flight = false;
     state->session.page_requested = false;
     state->session.create_request_id.clear();
-    if (dictionary_session) {
-        state->session.persisted.paused = false;
-        if (state->mode == WordAppMode::kWordCard &&
-            state->card_source == WordCardSource::kDictionary) {
-            state->card_phase = WordCardPhase::kRevealed;
-        } else {
-            state->mode = WordAppMode::kDictionaryPicker;
-            state->dictionary_stage = WordDictionaryStage::kLetters;
+    if (IsReviewSession(state->session.persisted)) {
+        SeedReviewRuntime(&state->review, state->session.persisted.remote.session_id);
+    }
+    if (IsSequentialSession(state->session.persisted) && state->chain.active) {
+        // The walk must not repeat the words the intake head just introduced.
+        state->chain.skip_ordinals.clear();
+        for (const StoredWordSessionItem& item :
+             state->session.persisted.remote.items) {
+            const auto match = std::find(
+                state->chain.exclude_ids.begin(),
+                state->chain.exclude_ids.end(),
+                std::string(item.item_id));
+            if (match != state->chain.exclude_ids.end()) {
+                state->chain.skip_ordinals.push_back(item.ordinal);
+            }
         }
-        state->message = "词典记录已就绪";
-        return true;
+        state->chain.exclude_ids.clear();
+        const size_t first =
+            NextQueuePosition(*state, state->session.persisted.position);
+        state->session.persisted.position = static_cast<uint32_t>(first);
+        if (first >= state->session.persisted.remote.items.size()) {
+            // This whole window was already introduced by the intake head:
+            // hand over to the normal paging/finish path.
+            FinishOrLoadAdvancedReview(state);
+            return true;
+        }
     }
     result = LoadCurrentReviewWord(state);
     if (result != ESP_OK) {
@@ -1182,6 +1459,9 @@ bool ApplyWordSessionStartResult(
         ESP_ERROR_CHECK_WITHOUT_ABORT(SavePersistedWordSession(state->session.persisted));
         state->mode = WordAppMode::kHome;
         state->message = "会话词包尚未就绪";
+        state->chain.active = false;
+        state->chain.exclude_ids.clear();
+        state->chain.skip_ordinals.clear();
         return true;
     }
     ShowStudyCard(state);
@@ -1209,10 +1489,14 @@ void ResetWordSessionForServerInvalid(WordAppState* state)
     const protocol::word_study_v1::Mode mode = state->session.persisted.remote.mode;
     ESP_ERROR_CHECK_WITHOUT_ABORT(ClearPersistedWordSession(mode));
     state->session = WordSessionState{};
-    state->sequential_session_resumable = false;
-    state->random_session_resumable = false;
+    state->review = WordReviewRuntime{};
+    state->chain.active = false;
+    state->chain.exclude_ids.clear();
+    state->chain.skip_ordinals.clear();
+    state->review_session_resumable = false;
+    state->shuffle_session_resumable = false;
+    state->mistakes_session_resumable = false;
     state->card_phase = WordCardPhase::kFront;
-    state->card_source = WordCardSource::kStudy;
     state->current_word = WqnWordEntry{};
     state->mode = WordAppMode::kHome;
     state->message = "上次会话已失效，请重新开始";
@@ -1321,6 +1605,7 @@ void ApplyWordCandidatePageResult(
         return;
     }
     persisted = std::move(updated);
+    PruneSessionOrdinals(state);
     auto& committed_remote = persisted.remote;
     if (persisted.position < committed_remote.items.size()) {
         result = LoadCurrentReviewWord(state);
@@ -1331,11 +1616,13 @@ void ApplyWordCandidatePageResult(
         ShowStudyCard(state);
         state->message = "后续单词已就绪";
     } else if (!committed_remote.has_more) {
-        persisted.active = false;
-        SetStudySessionResumable(state, persisted.remote.mode, false);
-        state->mode = WordAppMode::kHome;
-        state->message = "本轮浏览完成";
-        ESP_ERROR_CHECK_WITHOUT_ABORT(SavePersistedWordSession(persisted));
+        // The last page brought nothing left to show: let the normal finish
+        // path decide (review completion page, replay drain, or home).
+        FinishOrLoadAdvancedReview(state);
+        ESP_ERROR_CHECK_WITHOUT_ABORT(
+            SavePersistedWordSession(state->session.persisted));
+        RequestCandidatePageIfNeeded(state);
+        return;
     }
     RequestCandidatePageIfNeeded(state);
 }
@@ -1359,15 +1646,9 @@ bool TakeWordObservationEffect(
         pending.occurred_at = occurred_at;
     }
     PersistedWordSession advanced = state->session.persisted;
-    const bool dictionary_observation =
-        pending.mode == protocol::word_study_v1::Mode::kDictionary;
     if (pending.session_id != advanced.remote.session_id ||
         pending.sequence != advanced.remote.next_sequence ||
-        (dictionary_observation &&
-         advanced.remote.mode !=
-             protocol::word_study_v1::Mode::kDictionary) ||
-        (!dictionary_observation &&
-         !SetSessionCursorOrdinal(&advanced, pending.next_position))) {
+        !SetSessionCursorOrdinal(&advanced, pending.next_position)) {
         state->session.observation_effect_ready = false;
         state->session.commit_state = WordObservationCommitState::kFailed;
         state->card_phase = CardPhaseFromSession(state->session.persisted);
@@ -1376,9 +1657,14 @@ bool TakeWordObservationEffect(
     }
     advanced.phase = pending.next_phase;
     advanced.remote.next_sequence = pending.sequence + 1;
-    if (!dictionary_observation &&
-        advanced.position >= advanced.remote.items.size() &&
-        !advanced.remote.has_more) {
+    // A review session whose replay pool still owes a word is not finished; the
+    // unknown judgment below is what puts the just-missed word in that pool.
+    const bool review_owes_replay =
+        advanced.remote.mode == protocol::word_study_v1::Mode::kReview &&
+        (!state->review.pool.empty() ||
+         pending.action == protocol::word_study_v1::ObservationAction::kUnknown);
+    if (advanced.position >= advanced.remote.items.size() &&
+        !advanced.remote.has_more && !review_owes_replay) {
         advanced.active = false;
         advanced.paused = false;
     }
@@ -1409,11 +1695,19 @@ void ApplyWordObservationCommitResult(WordAppState* state, esp_err_t result)
     }
     const auto action = state->session.pending_observation.action;
     const auto observation_mode = state->session.pending_observation.mode;
+    uint64_t answered_ordinal = 0;
+    if (state->session.persisted.position <
+        state->session.persisted.remote.items.size()) {
+        answered_ordinal =
+            state->session.persisted.remote
+                .items[state->session.persisted.position].ordinal;
+    }
     state->session.persisted = std::move(state->session.pending_advanced_session);
     state->session.pending_advanced_session = {};
     state->session.pending_observation = {};
     state->session.commit_state = WordObservationCommitState::kCloudPending;
-    if (state->outbox.pending_count < state->outbox.capacity) {
+    if (state->outbox.pending_count + state->outbox.suspended_count <
+        state->outbox.capacity) {
         ++state->outbox.pending_count;
     }
     if (action == protocol::word_study_v1::ObservationAction::kKnown) {
@@ -1428,14 +1722,9 @@ void ApplyWordObservationCommitResult(WordAppState* state, esp_err_t result)
     } else {
         state->message = "已保存，待同步";
     }
-    if (observation_mode ==
-        protocol::word_study_v1::Mode::kDictionary) {
-        state->mode = WordAppMode::kDictionaryPicker;
-        state->dictionary_stage = WordDictionaryStage::kLetters;
-        state->card_source = WordCardSource::kDictionary;
-        state->card_phase = WordCardPhase::kRevealed;
-        state->current_word = {};
-        return;
+    if (observation_mode == protocol::word_study_v1::Mode::kReview &&
+        action != protocol::word_study_v1::ObservationAction::kRevealed) {
+        ApplyWordReviewBookkeeping(state, action, answered_ordinal);
     }
     RequestCandidatePageIfNeeded(state);
     if (action == protocol::word_study_v1::ObservationAction::kRevealed &&
@@ -1457,12 +1746,13 @@ void RefreshWordOutboxState(WordAppState* state)
     WordOutboxSnapshot snapshot;
     if (ReadWordOutboxSnapshot(&snapshot) != ESP_OK) return;
     state->outbox.pending_count = snapshot.pending_count;
+    state->outbox.suspended_count = snapshot.suspended_count;
+    state->outbox.blocked_count = snapshot.blocked_count;
     state->outbox.capacity = snapshot.capacity;
-    if (snapshot.pending_count == 0 &&
+    if (snapshot.pending_count == 0 && snapshot.suspended_count == 0 &&
         state->session.commit_state == WordObservationCommitState::kCloudPending) {
         state->session.commit_state = WordObservationCommitState::kCloudAcknowledged;
-        if (state->mode == WordAppMode::kWordCard &&
-            state->card_source == WordCardSource::kStudy) {
+        if (state->mode == WordAppMode::kWordCard) {
             state->message = "已同步";
         }
     }
@@ -1473,22 +1763,20 @@ WordAppSnapshot BuildWordAppSnapshot(const WordAppState& state)
     WordAppSnapshot snapshot;
     snapshot.mode = state.mode;
     snapshot.card_phase = state.card_phase;
-    snapshot.card_source = state.card_source;
-    snapshot.dictionary_stage = state.dictionary_stage;
+    snapshot.commit_state = state.session.commit_state;
     snapshot.home_selection = state.home_selection;
-    snapshot.lookup_selection = state.lookup_selection;
+    snapshot.complete_selection = state.review.complete_selection;
     snapshot.pack_ready = HasPackWords(state);
     snapshot.pack_truncated = state.pack_index.truncated;
     snapshot.cloud_sync_failed = state.cloud_sync_failed;
-    snapshot.sequential_session_resumable =
-        state.sequential_session_resumable;
-    snapshot.random_session_resumable = state.random_session_resumable;
+    snapshot.review_session_resumable = state.review_session_resumable;
+    snapshot.shuffle_session_resumable = state.shuffle_session_resumable;
+    snapshot.mistakes_session_resumable = state.mistakes_session_resumable;
     snapshot.reviewed_today = state.reviewed_today;
     snapshot.correct_today = state.correct_today;
     snapshot.total_count = ClampUint16(state.pack_index.entries.size());
     const bool study_cursor_visible =
-        (state.mode == WordAppMode::kWordCard &&
-         state.card_source == WordCardSource::kStudy) ||
+        state.mode == WordAppMode::kWordCard ||
         state.mode == WordAppMode::kSessionStarting;
     snapshot.card_count = study_cursor_visible
         ? ClampUint16(state.session.persisted.remote.items.size())
@@ -1499,13 +1787,22 @@ WordAppSnapshot BuildWordAppSnapshot(const WordAppState& state)
         : ClampUint16(state.session.persisted.position + 1);
     snapshot.finished_today = !state.session.persisted.active &&
         !state.session.persisted.remote.session_id.empty();
+    snapshot.review_complete_empty = state.review.cards_seen == 0;
+    snapshot.review_complete_reviewed = state.review.reviewed;
+    snapshot.review_complete_unknown = state.review.unknown;
+    snapshot.review_complete_replayed = state.review.replayed;
+    const int32_t due_hint =
+        g_word_review_due_count.load(std::memory_order_acquire);
+    snapshot.review_due_count =
+        ClampUint16(static_cast<size_t>(due_hint > 0 ? due_hint : 0));
+    const int32_t mistake_hint =
+        g_word_mistake_count.load(std::memory_order_acquire);
+    snapshot.mistake_count = static_cast<int16_t>(
+        mistake_hint > INT16_MAX ? INT16_MAX : mistake_hint);
+    snapshot.sequential_cursor = state.chain.sequential_cursor;
+    snapshot.sequential_total = ClampUint16(state.pack_index.entries.size());
     snapshot.pack_count = state.pack_index.pack_count;
     snapshot.pack_bytes = state.pack_index.pack_bytes;
-    snapshot.dictionary_prefix = state.dictionary_prefix;
-    snapshot.dictionary_letters = state.dictionary_letters;
-    snapshot.dictionary_letter_selected = state.dictionary_letter_selected;
-    snapshot.dictionary_match_selected = state.dictionary_match_selected;
-    snapshot.online_result_selected = state.online_result_selected;
     snapshot.progress_line = WordAppProgressLabel(state);
     snapshot.status_line = WordAppStatusLine(state);
     snapshot.hint = state.message.empty() ? "确认选择，长按确认返回" : state.message;
@@ -1520,23 +1817,12 @@ WordAppSnapshot BuildWordAppSnapshot(const WordAppState& state)
         snapshot.example_translation = word.example_translation;
         snapshot.part_of_speech = word.part_of_speech;
     }
-
-    for (size_t i = 0; i < state.dictionary_matches.size() && i < kDictionaryPreviewLimit; ++i) {
-        const size_t index = state.dictionary_matches[i];
-        if (index < state.pack_index.entries.size()) {
-            snapshot.dictionary_preview_words.push_back(state.pack_index.entries[index].word);
-        }
-    }
-    for (const WqnWordEntry& entry : state.online_results) {
-        snapshot.online_words.push_back(entry.word);
-    }
     return snapshot;
 }
 
 std::string WordAppProgressLabel(const WordAppState& state)
 {
-    if ((state.mode != WordAppMode::kWordCard ||
-         state.card_source != WordCardSource::kStudy) &&
+    if (state.mode != WordAppMode::kWordCard &&
         state.mode != WordAppMode::kSessionStarting) {
         return "";
     }
@@ -1546,6 +1832,16 @@ std::string WordAppProgressLabel(const WordAppState& state)
     const size_t visible_position = std::min(
         static_cast<size_t>(state.session.persisted.position) + 1,
         state.session.persisted.remote.items.size());
+    if (IsSequentialSession(state.session.persisted)) {
+        // The walk counts through the whole library, not the local window.
+        const size_t library_index =
+            static_cast<size_t>(state.session.persisted.start_index) +
+            visible_position;
+        const std::string total = state.pack_index.entries.empty()
+            ? std::string("--")
+            : std::to_string(state.pack_index.entries.size());
+        return "#" + std::to_string(library_index) + "/" + total;
+    }
     return std::to_string(visible_position) + "/" +
            std::to_string(state.session.persisted.remote.items.size());
 }
@@ -1560,6 +1856,15 @@ std::string WordAppStatusLine(const WordAppState& state)
     }
     if (!HasPackWords(state)) {
         return state.pack_index.status_message.empty() ? "词库未同步" : state.pack_index.status_message;
+    }
+    if (state.outbox.suspended_count > 0) {
+        std::string status =
+            "同步挂起 " + std::to_string(state.outbox.suspended_count) + " 条";
+        if (state.outbox.blocked_count > 0) {
+            status += "，同会话待处理 " +
+                std::to_string(state.outbox.blocked_count) + " 条";
+        }
+        return status;
     }
     if (state.outbox.pending_count > 0) {
         return "待同步 " + std::to_string(state.outbox.pending_count) + " 条";
@@ -1583,18 +1888,22 @@ std::string WordAppSignature(const WordAppState& state)
     signature.push_back('/');
     signature.append(std::to_string(static_cast<int>(state.card_phase)));
     signature.push_back('/');
-    signature.append(std::to_string(static_cast<int>(state.card_source)));
-    signature.push_back('/');
-    signature.append(std::to_string(static_cast<int>(state.dictionary_stage)));
-    signature.push_back('/');
     signature.append(std::to_string(static_cast<int>(state.home_selection)));
     signature.push_back('/');
-    signature.append(state.sequential_session_resumable ? "1" : "0");
-    signature.append(state.random_session_resumable ? "1" : "0");
+    signature.append(std::to_string(
+        static_cast<int>(state.review.complete_selection)));
+    signature.push_back('/');
+    signature.append(std::to_string(static_cast<int>(state.session.commit_state)));
+    signature.push_back('/');
+    signature.append(state.review_session_resumable ? "1" : "0");
+    signature.append(state.shuffle_session_resumable ? "1" : "0");
+    signature.append(state.mistakes_session_resumable ? "1" : "0");
     signature.push_back('/');
     signature.append(state.scoped_deck_id);
     signature.push_back(':');
     signature.append(state.default_deck_id);
+    signature.push_back('/');
+    signature.append(std::to_string(state.session.persisted.start_index));
     signature.push_back('/');
     signature.append(std::to_string(state.session.persisted.position));
     signature.push_back('/');
@@ -1604,15 +1913,31 @@ std::string WordAppSignature(const WordAppState& state)
     signature.push_back('/');
     signature.append(std::to_string(state.outbox.pending_count));
     signature.push_back('/');
+    signature.append(std::to_string(state.outbox.suspended_count));
+    signature.push_back('/');
+    signature.append(std::to_string(state.outbox.blocked_count));
+    signature.push_back('/');
     signature.append(state.current_word.id);
     signature.push_back('/');
     signature.append(state.current_word.word);
     signature.push_back('/');
-    signature.append(state.dictionary_prefix);
+    signature.append(std::to_string(state.review.pool.size()));
     signature.push_back('/');
-    signature.append(std::to_string(state.dictionary_letter_selected));
+    signature.append(std::to_string(state.review.cards_seen));
     signature.push_back('/');
-    signature.append(std::to_string(state.dictionary_match_selected));
+    signature.append(std::to_string(state.review.reviewed));
+    signature.push_back('/');
+    signature.append(std::to_string(state.review.unknown));
+    signature.push_back('/');
+    signature.append(std::to_string(state.review.replayed));
+    signature.push_back('/');
+    signature.append(std::to_string(state.chain.sequential_cursor));
+    signature.push_back('/');
+    signature.append(std::to_string(
+        g_word_review_due_count.load(std::memory_order_acquire)));
+    signature.push_back('/');
+    signature.append(std::to_string(
+        g_word_mistake_count.load(std::memory_order_acquire)));
     signature.push_back('/');
     signature.append(std::to_string(state.pack_index.entries.size()));
     signature.push_back('/');
@@ -1688,7 +2013,6 @@ bool RunWordPageStateSelfTest()
     if (!study) return require(false, "allocate study fixture");
     study->initialized = true;
     study->mode = WordAppMode::kWordCard;
-    study->card_source = WordCardSource::kStudy;
     study->card_phase = WordCardPhase::kFront;
     study->session.persisted.active = true;
     study->session.persisted.phase = WordPresentationPhase::kFront;
@@ -1742,7 +2066,6 @@ bool RunWordPageStateSelfTest()
     if (!mixed) return require(false, "allocate mixed fixture");
     mixed->initialized = true;
     mixed->mode = WordAppMode::kWordCard;
-    mixed->card_source = WordCardSource::kStudy;
     mixed->session.persisted.remote.session_id =
         "00000000-0000-4000-8000-000000000010";
     mixed->session.persisted.remote.mode =
@@ -1813,7 +2136,6 @@ bool RunWordPageStateSelfTest()
     if (!revealed) return require(false, "allocate revealed fixture");
     revealed->initialized = true;
     revealed->mode = WordAppMode::kWordCard;
-    revealed->card_source = WordCardSource::kStudy;
     revealed->card_phase = WordCardPhase::kRevealed;
     revealed->session.persisted = study->session.persisted;
     revealed->session.persisted.phase = WordPresentationPhase::kBack;
@@ -1827,51 +2149,253 @@ bool RunWordPageStateSelfTest()
         return false;
     }
 
-    WordPageFixtureState dictionary;
-    if (!dictionary) return require(false, "allocate dictionary fixture");
-    dictionary->initialized = true;
-    dictionary->mode = WordAppMode::kWordCard;
-    dictionary->card_source = WordCardSource::kDictionary;
-    dictionary->card_phase = WordCardPhase::kRevealed;
-    dictionary->current_word.id = item.item_id;
-    dictionary->current_word.word = "baseline";
-    if (HandleWordAppInput(&dictionary.get(), WordInput::kLongConfirm) != ESP_OK ||
-        !require(!dictionary->session.observation_effect_ready,
-                 "dictionary view does not create progress") ||
-        !require(dictionary->mode == WordAppMode::kDictionaryPicker,
-                 "dictionary card returns to picker")) {
+    // [word-modes-v2] Review replay pool: a word the user did not recognize
+    // comes back after at least five answered cards, at most twice, and the
+    // queue resumes where the replay interrupted it.
+    WordPageFixtureState review;
+    if (!review) return require(false, "allocate review fixture");
+    review->initialized = true;
+    review->session.persisted.active = true;
+    review->session.persisted.remote.mode =
+        protocol::word_study_v1::Mode::kReview;
+    review->session.persisted.remote.session_id =
+        "00000000-0000-4000-8000-000000000030";
+    review->session.persisted.remote.next_sequence = 100;
+    constexpr size_t kReviewItemCount = 12;
+    review->session.persisted.remote.items.reserve(kReviewItemCount);
+    for (size_t index = 0; index < kReviewItemCount; ++index) {
+        StoredWordSessionItem review_item;
+        std::snprintf(
+            review_item.item_id,
+            sizeof(review_item.item_id),
+            "00000000-0000-4000-8000-%012u",
+            static_cast<unsigned>(index + 500));
+        std::snprintf(
+            review_item.deck_id,
+            sizeof(review_item.deck_id),
+            "%s",
+            "00000000-0000-4000-8000-000000000020");
+        review_item.ordinal = index;
+        review->session.persisted.remote.items.push_back(review_item);
+    }
+    // Answering a card needs no pack access; the fixture only tracks the
+    // planned cursor. Re-arm the card surface between commits (a commit with
+    // an exhausted queue parks on the completion page).
+    // Sized by the step count, not the card count: a 12-element buffer
+    // written by this 16-step loop is UB past step 11, which let the
+    // compiler drop the loop's exit test and delete the whole tail of
+    // the self-test as unreachable (20260926.7 boot failure).
+    constexpr size_t kReviewSteps = 16;
+    uint32_t planned[kReviewSteps] = {};
+    for (size_t step = 0; step < kReviewSteps; ++step) {
+        review->mode = WordAppMode::kWordCard;
+        review->card_phase = WordCardPhase::kRevealed;
+        review->session.commit_state = WordObservationCommitState::kIdle;
+        review->session.persisted.active = true;
+        review->session.persisted.paused = false;
+        review->session.persisted.phase = WordPresentationPhase::kBack;
+        if (HandleWordAppInput(&review.get(), WordInput::kUp) != ESP_OK) {
+            return false;
+        }
+        planned[step] =
+            review->session.pending_observation.next_position;
+        char request_id[40] = {};
+        std::snprintf(
+            request_id,
+            sizeof(request_id),
+            "req_word_review_%016u",
+            static_cast<unsigned>(step));
+        DurableWordObservation observation;
+        PersistedWordSession advanced;
+        if (!TakeWordObservationEffect(
+                &review.get(),
+                request_id,
+                "2026-07-20T12:00:00Z",
+                1u,
+                &observation,
+                &advanced)) {
+            return require(false, "review observation enters durable effect");
+        }
+        ApplyWordObservationCommitResult(&review.get(), ESP_OK);
+        review->session.persisted.position = advanced.position;
+    }
+    // Sixteen misses over twelve cards pin the whole interleave: a replay waits
+    // at least five answered cards, returns to the queue position it
+    // interrupted, and the second miss of a word drains it for good.
+    const uint32_t expected_planned[kReviewSteps] = {
+        1, 2, 3, 4, 5, 6, 0, 7, 1, 8, 2, 9, 3, 10, 0, 11};
+    for (size_t step = 0; step < kReviewSteps; ++step) {
+        if (!require(
+                planned[step] == expected_planned[step],
+                "review replay spacing and resume")) {
+            return false;
+        }
+    }
+    if (!require(
+            review->review.replayed == 5 && review->review.unknown == 11 &&
+                review->review.reviewed == 16 && review->review.cards_seen == 16,
+            "review counters follow the commits") ||
+        !require(
+            review->review.pool.size() == 10 &&
+                !review->review.replay_in_flight,
+            "review pool drains the twice-replayed word")) {
         return false;
     }
 
-    dictionary->mode = WordAppMode::kWordCard;
-    dictionary->card_phase = WordCardPhase::kRevealed;
-    dictionary->session.persisted.active = true;
-    dictionary->session.persisted.remote.mode =
-        protocol::word_study_v1::Mode::kDictionary;
-    dictionary->session.persisted.remote.session_id =
-        "00000000-0000-4000-8000-000000000004";
-    dictionary->session.persisted.remote.next_sequence = 3;
-    if (HandleWordAppInput(&dictionary.get(), WordInput::kUp) != ESP_OK ||
-        !require(dictionary->session.pending_observation.action ==
-                     protocol::word_study_v1::ObservationAction::kUnknown,
-                 "dictionary shares revealed-card controls") ||
-        !require(dictionary->card_phase == WordCardPhase::kPersisting,
-                 "dictionary classification persists first")) {
+    // A drawn replay must come from the ready set (never a word whose minimum
+    // gap has not elapsed) and must actually consult the seeded stream: with a
+    // constant pick every draw below would be the first ready entry.
+    wqn::WordReviewRuntime seeded;
+    seeded.seed = 0x12345678u;
+    seeded.cards_seen = 10;
+    seeded.pool = {{11, 0, 10}, {12, 0, 10}, {13, 0, 10}, {14, 0, 11}};
+    const uint64_t expected_replays[] = {13, 13, 12};
+    for (const uint64_t expected : expected_replays) {
+        size_t pool_index = 0;
+        if (!require(
+                PickReadyReplay(&seeded, &pool_index),
+                "seeded review has a ready replay") ||
+            !require(
+                seeded.pool[pool_index].ready_at <= seeded.cards_seen,
+                "replay respects the minimum gap") ||
+            !require(
+                seeded.pool[pool_index].ordinal == expected,
+                "replay draw follows the seeded stream")) {
+            return false;
+        }
+    }
+
+    // Queue exhausted while the pool still owes a word: the plan drains the
+    // pool (returning to the end of the queue) instead of completing, and a
+    // pooled ordinal that left the candidate window is forgotten.
+    WordPageFixtureState drained;
+    if (!drained) return require(false, "allocate drain fixture");
+    drained->initialized = true;
+    drained->mode = WordAppMode::kWordCard;
+    drained->session.persisted.active = true;
+    drained->session.persisted.remote.mode =
+        protocol::word_study_v1::Mode::kReview;
+    drained->session.persisted.remote.session_id =
+        "00000000-0000-4000-8000-000000000033";
+    StoredWordSessionItem drained_item;
+    std::snprintf(
+        drained_item.item_id,
+        sizeof(drained_item.item_id),
+        "%s",
+        "00000000-0000-4000-8000-000000000034");
+    std::snprintf(
+        drained_item.deck_id,
+        sizeof(drained_item.deck_id),
+        "%s",
+        "00000000-0000-4000-8000-000000000020");
+    drained_item.ordinal = 0;
+    drained->session.persisted.remote.items.push_back(drained_item);
+    drained->session.persisted.position = 1;
+    drained->review.cards_seen = 6;
+    wqn::WordReplayEntry owed;
+    owed.ordinal = 0;
+    owed.ready_at = 7;  // minimum gap not reached: this is the drain path
+    drained->review.pool.push_back(owed);
+    if (!require(
+            PlannedNextOrdinal(&drained.get()) == 0 &&
+                drained->review.next_is_replay &&
+                drained->review.next_return_ordinal == 1,
+            "exhausted queue drains the replay pool")) {
         return false;
     }
-    DurableWordObservation dictionary_observation;
-    PersistedWordSession dictionary_advanced;
-    if (!require(TakeWordObservationEffect(
-                     &dictionary.get(),
-                     "req_word_dictionary_0001",
-                     "2026-07-20T12:00:00Z",
-                     1u,
-                     &dictionary_observation,
-                     &dictionary_advanced),
-                 "dictionary observation enters durable effect") ||
-        !require(dictionary_advanced.position == 0 &&
-                     dictionary_advanced.remote.next_sequence == 4,
-                 "dictionary observation advances sequence only")) {
+    drained->review.pool.clear();
+    wqn::WordReplayEntry stale_replay;
+    stale_replay.ordinal = 99;
+    stale_replay.ready_at = 7;
+    drained->review.pool.push_back(stale_replay);
+    if (!require(
+            PlannedNextOrdinal(&drained.get()) == 1 &&
+                drained->review.pool.empty() &&
+                !drained->review.next_is_replay,
+            "pooled ordinal outside the window is forgotten")) {
+        return false;
+    }
+
+    // A review session whose queue empties lands on the local completion page.
+    WordPageFixtureState done;
+    if (!done) return require(false, "allocate completion fixture");
+    done->initialized = true;
+    done->session.persisted.active = true;
+    done->session.persisted.remote.mode =
+        protocol::word_study_v1::Mode::kReview;
+    done->session.persisted.remote.session_id =
+        "00000000-0000-4000-8000-000000000031";
+    for (size_t index = 0; index < 3; ++index) {
+        StoredWordSessionItem done_item;
+        std::snprintf(
+            done_item.item_id,
+            sizeof(done_item.item_id),
+            "00000000-0000-4000-8000-%012u",
+            static_cast<unsigned>(index + 700));
+        std::snprintf(
+            done_item.deck_id,
+            sizeof(done_item.deck_id),
+            "%s",
+            "00000000-0000-4000-8000-000000000020");
+        done_item.ordinal = index;
+        done->session.persisted.remote.items.push_back(done_item);
+    }
+    for (size_t step = 0; step < 3; ++step) {
+        done->mode = WordAppMode::kWordCard;
+        done->card_phase = WordCardPhase::kRevealed;
+        done->session.commit_state = WordObservationCommitState::kIdle;
+        done->session.persisted.active = true;
+        done->session.persisted.paused = false;
+        done->session.persisted.phase = WordPresentationPhase::kBack;
+        if (HandleWordAppInput(&done.get(), WordInput::kConfirm) != ESP_OK) {
+            return false;
+        }
+        char request_id[40] = {};
+        std::snprintf(
+            request_id,
+            sizeof(request_id),
+            "req_word_done_%016u",
+            static_cast<unsigned>(step));
+        DurableWordObservation observation;
+        PersistedWordSession advanced;
+        if (!TakeWordObservationEffect(
+                &done.get(),
+                request_id,
+                "2026-07-20T12:00:00Z",
+                1u,
+                &observation,
+                &advanced)) {
+            return require(false, "completion observation enters effect");
+        }
+        ApplyWordObservationCommitResult(&done.get(), ESP_OK);
+        done->session.persisted.position = advanced.position;
+    }
+    if (!require(
+            done->mode == WordAppMode::kReviewComplete,
+            "exhausted review lands on the completion page") ||
+        !require(
+            done->review.reviewed == 3 && done->review.unknown == 0 &&
+                !done->session.persisted.active,
+            "completion page keeps the session totals")) {
+        return false;
+    }
+
+    // An empty review session is the "nothing due today" completion variant,
+    // not an error.
+    WordPageFixtureState idle;
+    if (!idle) return require(false, "allocate empty-review fixture");
+    idle->initialized = true;
+    idle->mode = WordAppMode::kSessionStarting;
+    idle->session.requested_mode = protocol::word_study_v1::Mode::kReview;
+    idle->session.start_result_expected = true;
+    PersistedWordSession empty_session;
+    if (!require(
+            ApplyWordSessionStartResult(
+                &idle.get(), ESP_OK, ESP_OK, ESP_OK, std::move(empty_session)),
+            "empty review result is applied") ||
+        !require(
+            idle->mode == WordAppMode::kReviewComplete,
+            "empty review opens the completion page")) {
         return false;
     }
 
@@ -1879,7 +2403,7 @@ bool RunWordPageStateSelfTest()
     if (!stale) return require(false, "allocate stale-result fixture");
     stale->initialized = true;
     stale->mode = WordAppMode::kHome;
-    stale->home_selection = WordHomeSelection::kRandom;
+    stale->home_selection = WordHomeSelection::kShuffle;
     PersistedWordSession stale_persisted;
     stale_persisted.active = true;
     if (!require(!ApplyWordSessionStartResult(
@@ -1887,34 +2411,18 @@ bool RunWordPageStateSelfTest()
                      std::move(stale_persisted)),
                  "cancelled session result is ignored") ||
         !require(stale->mode == WordAppMode::kHome &&
-                     stale->home_selection == WordHomeSelection::kRandom,
+                     stale->home_selection == WordHomeSelection::kShuffle,
                  "stale session result preserves selection")) {
         return false;
     }
 
-    stale->mode = WordAppMode::kDictionaryPicker;
-    stale->dictionary_stage = WordDictionaryStage::kLookupChoice;
-    stale->lookup_result_expected = true;
-    stale->active_lookup_query = "alpha";
-    CancelWordLookupResult(&stale.get());
-    WqnWordSearchResult stale_lookup;
-    stale_lookup.prefix = "alpha";
-    if (!require(!ApplyWordSearchResult(
-                     &stale.get(), "alpha", stale_lookup),
-                 "cancelled lookup result is ignored") ||
-        !require(stale->mode == WordAppMode::kDictionaryPicker,
-                 "stale lookup result preserves picker")) {
-        return false;
-    }
-
     const WordAppSnapshot front_snapshot = BuildWordAppSnapshot(study.get());
-    dictionary->mode = WordAppMode::kDictionaryPicker;
-    dictionary->card_phase = WordCardPhase::kRevealed;
-    const WordAppSnapshot dictionary_snapshot = BuildWordAppSnapshot(dictionary.get());
+    const WordAppSnapshot done_snapshot = BuildWordAppSnapshot(done.get());
     return require(front_snapshot.mode == WordAppMode::kWordCard,
                    "study snapshot uses WordCard") &&
-        require(dictionary_snapshot.mode == WordAppMode::kDictionaryPicker,
-                "dictionary snapshot uses picker after return");
+        require(done_snapshot.mode == WordAppMode::kReviewComplete &&
+                    done_snapshot.review_complete_reviewed == 3,
+                "completion snapshot carries the totals");
 }
 
 }  // namespace wqn

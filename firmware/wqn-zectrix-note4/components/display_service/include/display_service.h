@@ -18,6 +18,10 @@ constexpr int kEpdFramebufferSize = kEpdBytesPerRow * kEpdHeight;
 
 // Initializes the Note4 4.2" EPD backend and allocates the 1bpp framebuffer.
 esp_err_t InitEpdDisplay();
+// True only when the RAM previous-frame mirror represents the physical panel.
+// Deep sleep/cold initialization clears this state; region-only drawing must
+// fall back to a complete frame until a successful refresh synchronizes it.
+bool IsEpdFramebufferSynchronized();
 
 // Rendering executes on DisplayService's task. The framebuffer remains
 // private to the service; clients receive drawing operations, not a pointer.
@@ -33,9 +37,23 @@ int MeasureUtf8TextWidth(const char* text);
 
 // Draw / measure text with an arbitrary LVGL-format font (e.g. font_zectrix_48_1).
 // Iterates UTF-8 codepoints; missing glyphs are skipped (zero width, nothing drawn).
+// PrimaryUiFont exposes the firmware's 16 px text face so a page can opt into
+// real Latin glyphs instead of the compact 5x7 body-text fallback.
+const lv_font_t* PrimaryUiFont();
 void DrawTextWithFont(int x, int y, const lv_font_t* font, const char* text, bool black = true);
 int MeasureTextWithFont(const lv_font_t* font, const char* text);
 void DrawTextWithFontCentered(int x, int y, int width, const lv_font_t* font, const char* text, bool black = true);
+// Nearest-neighbour bitmap scaling is intended for short, static hero labels
+// such as a vocabulary headword. It changes framebuffer composition only; it
+// does not alter the panel refresh policy or waveform.
+void DrawTextWithFontScaledCentered(
+    int x,
+    int y,
+    int width,
+    const lv_font_t* font,
+    const char* text,
+    uint8_t scale,
+    bool black = true);
 std::string TruncateUtf8TextToWidth(const std::string& text, int max_width_px);
 std::vector<std::string> WrapUtf8TextToWidth(const std::string& text, int max_width_px, size_t max_lines);
 
@@ -44,7 +62,21 @@ std::vector<std::string> WrapUtf8TextToWidth(const std::string& text, int max_wi
 // broad for the panel's hot partial path.
 esp_err_t RefreshEpdFull(bool allow_local_partial = true, bool force_full_refresh = false);
 
+// Full-screen 4bpp WQNI image refresh using the SSD2683 vendor-calibrated
+// sixteen-level waveform. This is a full refresh only; callers must provide
+// exactly kEpdGray4PayloadSize bytes (two pixels per source byte).
+constexpr size_t kEpdGray4RowBytes = kEpdWidth / 2;
+constexpr size_t kEpdGray4PayloadSize = kEpdGray4RowBytes * kEpdHeight;
+esp_err_t RefreshEpdGray16(const uint8_t* gray4, size_t size);
+
 esp_err_t PrepareDisplayForSleep(int64_t deadline_us);
+
+// [power-fix] User-initiated power-off: white-clear + forced full refresh
+// (owner task), then rail power-off. The deadline bounds Pending admission;
+// after the owner claims the non-cancellable hardware operation, the caller
+// waits for its internally bounded terminal result so the final board-latch
+// cut can never race live EPD GPIO/SPI. A refresh failure still cuts the rail.
+esp_err_t PrepareDisplayForShutdown(int64_t deadline_us);
 void RollbackDisplayAfterSleepAbort();
 // [epd-owner] The EPD refresh task registers itself as the panel owner at
 // startup. PrepareDisplayForSleep then runs the power-off ON THAT TASK: when a
@@ -73,6 +105,14 @@ uint32_t GetEpdActivityGeneration();
 // poll does not wake the EPD task every cycle (edge-trigger the request only
 // when it flips to due).
 bool IsEpdIdleMaintenanceDue();
+// [epd-owner] True when the heavy-partial cleanup full refresh is due. It is
+// deliberately independent of IsEpdIdleMaintenanceDue(): that one stays false
+// for the rest of the idle period once g_epd_idle_cut is set, so a cleanup
+// moved past the power-off point would never arm the EPD task again. False while the debt
+// is below kIdleCleanupHeavyPartials, and always false when
+// CONFIG_WQN_EPD_IDLE_CLEANUP_MS is 0 (the cleanup then rides the power-off
+// point exactly as before).
+bool IsEpdIdleCleanupDue();
 void PowerOffEpdAfterIdleIfNeeded();
 
 // [epd-owner] RAII lock over the WHOLE clear->draw->refresh sequence of one

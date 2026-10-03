@@ -238,3 +238,89 @@ static const uint8_t a12_ai_clear_context_16[] = {
 static const WqnBitmapAsset a12_ai_clear_context_16_asset = {
     16, 16, 2, sizeof(a12_ai_clear_context_16), a12_ai_clear_context_16
 };
+
+// A13: ai_session_list, 16x16, 32 bytes
+// [agent] Hand-authored: build_tools/generate_assets.py is not part of this
+// checkout, so the three Agent status-bar icons below were written directly in
+// the same 1bpp MSB-first format the generated assets use. Regenerate them from
+// SVG masters once the generator returns to the tree.
+#define A13_AI_SESSION_LIST_16_WIDTH  16
+#define A13_AI_SESSION_LIST_16_HEIGHT 16
+#define A13_AI_SESSION_LIST_16_STRIDE 2
+static const uint8_t a13_ai_session_list_16[] = {
+    0x00, 0x00, 0x00, 0x00, 0x3F, 0xFC, 0x3F, 0xFC, 0x00, 0x00, 0x00, 0x00,
+    0x3F, 0xFC, 0x3F, 0xFC, 0x00, 0x00, 0x00, 0x00, 0x3F, 0xFC, 0x3F, 0xFC,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+};
+static const WqnBitmapAsset a13_ai_session_list_16_asset = {
+    16, 16, 2, sizeof(a13_ai_session_list_16), a13_ai_session_list_16
+};
+
+// A14: ai_turn_up, 16x16, 32 bytes -- jump to the previous answer
+#define A14_AI_TURN_UP_16_WIDTH  16
+#define A14_AI_TURN_UP_16_HEIGHT 16
+#define A14_AI_TURN_UP_16_STRIDE 2
+static const uint8_t a14_ai_turn_up_16[] = {
+    0x00, 0x00, 0x00, 0x00, 0x01, 0x80, 0x03, 0xC0, 0x07, 0xE0, 0x0F, 0xF0,
+    0x1F, 0xF8, 0x03, 0xC0, 0x03, 0xC0, 0x03, 0xC0, 0x03, 0xC0, 0x03, 0xC0,
+    0x03, 0xC0, 0x03, 0xC0, 0x00, 0x00, 0x00, 0x00
+};
+static const WqnBitmapAsset a14_ai_turn_up_16_asset = {
+    16, 16, 2, sizeof(a14_ai_turn_up_16), a14_ai_turn_up_16
+};
+
+// A15: ai_turn_down, 16x16, 32 bytes -- jump to the next answer
+#define A15_AI_TURN_DOWN_16_WIDTH  16
+#define A15_AI_TURN_DOWN_16_HEIGHT 16
+#define A15_AI_TURN_DOWN_16_STRIDE 2
+static const uint8_t a15_ai_turn_down_16[] = {
+    0x00, 0x00, 0x00, 0x00, 0x03, 0xC0, 0x03, 0xC0, 0x03, 0xC0, 0x03, 0xC0,
+    0x03, 0xC0, 0x03, 0xC0, 0x03, 0xC0, 0x1F, 0xF8, 0x0F, 0xF0, 0x07, 0xE0,
+    0x03, 0xC0, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00
+};
+static const WqnBitmapAsset a15_ai_turn_down_16_asset = {
+    16, 16, 2, sizeof(a15_ai_turn_down_16), a15_ai_turn_down_16
+};
+
+// A18/A19/A20: the Agent tier's detail-tier control (edit-mode slot 4), 16x16,
+// 32 bytes each -- a three-step level meter: one short bar (简要), two (标准),
+// three ascending (详细). The count-of-marks idiom matches the thinking icons,
+// and vertical bars cannot be mistaken for A13's session-list rows. Hand-
+// authored like A13..A15: the generator is not part of this checkout.
+#define A18_AI_DETAIL_BRIEF_16_WIDTH  16
+#define A18_AI_DETAIL_BRIEF_16_HEIGHT 16
+#define A18_AI_DETAIL_BRIEF_16_STRIDE 2
+static const uint8_t a18_ai_detail_brief_16[] = {
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x00, 0x18, 0x00,
+    0x18, 0x00, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00
+};
+static const WqnBitmapAsset a18_ai_detail_brief_16_asset = {
+    16, 16, 2, sizeof(a18_ai_detail_brief_16), a18_ai_detail_brief_16
+};
+
+// A19: two bars.
+#define A19_AI_DETAIL_STANDARD_16_WIDTH  16
+#define A19_AI_DETAIL_STANDARD_16_HEIGHT 16
+#define A19_AI_DETAIL_STANDARD_16_STRIDE 2
+static const uint8_t a19_ai_detail_standard_16[] = {
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x1B, 0x00, 0x1B, 0x00, 0x1B, 0x00, 0x18, 0x00, 0x18, 0x00,
+    0x18, 0x00, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00
+};
+static const WqnBitmapAsset a19_ai_detail_standard_16_asset = {
+    16, 16, 2, sizeof(a19_ai_detail_standard_16), a19_ai_detail_standard_16
+};
+
+// A20: three bars (the tallest first).
+#define A20_AI_DETAIL_FULL_16_WIDTH  16
+#define A20_AI_DETAIL_FULL_16_HEIGHT 16
+#define A20_AI_DETAIL_FULL_16_STRIDE 2
+static const uint8_t a20_ai_detail_full_16[] = {
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1B, 0x60, 0x1B, 0x60,
+    0x1B, 0x60, 0x1B, 0x00, 0x1B, 0x00, 0x1B, 0x00, 0x18, 0x00, 0x18, 0x00,
+    0x18, 0x00, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00
+};
+static const WqnBitmapAsset a20_ai_detail_full_16_asset = {
+    16, 16, 2, sizeof(a20_ai_detail_full_16), a20_ai_detail_full_16
+};

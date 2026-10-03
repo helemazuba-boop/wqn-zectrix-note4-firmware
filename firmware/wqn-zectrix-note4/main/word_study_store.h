@@ -9,6 +9,7 @@
 #include "device_protocol/word_study.h"
 #include "esp_err.h"
 #include "esp_heap_caps.h"
+#include "outbox_suspend_reason.h"
 
 namespace wqn {
 
@@ -25,6 +26,9 @@ struct WordStorePsramAllocator {
     WordStorePsramAllocator(const WordStorePsramAllocator<U>&) noexcept {}
     T* allocate(std::size_t count)
     {
+        if (count == 0) {
+            return nullptr;
+        }
         void* memory = heap_caps_malloc(count * sizeof(T), MALLOC_CAP_SPIRAM);
         if (memory == nullptr) abort();
         return static_cast<T*>(memory);
@@ -88,6 +92,9 @@ struct PersistedWordSession {
     bool active = false;
     bool paused = false;
     uint32_t position = 0;
+    // [word-sequential-chain] Library index this session was created at, so a
+    // resumed walk can still report "#N / total". Zero for every other mode.
+    uint32_t start_index = 0;
     WordPresentationPhase phase = WordPresentationPhase::kFront;
     // [deck-scope] Generation of the default-deck scope this session was built
     // under. Stamped automatically on save (from GetDeckScopeGeneration) and
@@ -121,14 +128,20 @@ struct DurableWordObservation {
 
 struct WordOutboxSnapshot {
     size_t pending_count = 0;
+    // Records parked by SuspendPendingWordObservation: excluded from the
+    // upload queue but still resident on device awaiting intervention.
+    size_t suspended_count = 0;
+    // Pending successors held because an earlier record in their session is
+    // suspended. Other sessions remain eligible for upload.
+    size_t blocked_count = 0;
     size_t capacity = 0;
 };
 
 inline constexpr size_t kWordObservationOutboxCapacity = 1000;
 
-// Sequential, random, and dictionary sessions have independent durable
-// slots. This is part of the product contract: changing entry mode must not
-// destroy the user's paused session in another mode.
+// Every resumable word mode (sequential, review, shuffle, mistakes) has its own
+// durable slot. This is part of the product contract: changing entry mode must
+// not destroy the user's paused session in another mode.
 esp_err_t LoadPersistedWordSession(
     protocol::word_study_v1::Mode mode,
     PersistedWordSession* session);
@@ -151,6 +164,14 @@ esp_err_t AcknowledgeWordObservation(const std::string& request_id);
 // before removing it from the upload queue. Other sessions and observations
 // remain available and no restart is required.
 esp_err_t QuarantinePendingWordObservation(const std::string& request_id);
+// Parks one observation whose server-side disposition forbids unilateral
+// deletion (idempotency conflict, actor ownership conflict, corrupt
+// identity, protocol block). The head is durably marked and skipped by
+// PeekPendingWordObservation so the queue keeps advancing, but the payload
+// stays recoverable on device pending human intervention.
+esp_err_t SuspendPendingWordObservation(
+    const std::string& request_id,
+    OutboxSuspendReason reason);
 esp_err_t ReadWordOutboxSnapshot(WordOutboxSnapshot* snapshot);
 esp_err_t PrepareWordObservationOutboxForSleep(int64_t deadline_us);
 

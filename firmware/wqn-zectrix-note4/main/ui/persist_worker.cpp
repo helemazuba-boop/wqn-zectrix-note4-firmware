@@ -13,6 +13,8 @@
 #include "runtime/sleep_coordinator.h"
 #include "storage.h"
 #include "ui_internal.h"  // NotifyUiTask
+#include "error_recorder.h"
+#include "psram_task_stack.h"
 
 namespace device_ui_internal {
 namespace {
@@ -63,6 +65,12 @@ struct PersistCommand {
 PersistCommand g_pool[kPoolDepth];
 QueueHandle_t g_worker_queue = nullptr;  // carries slot indices (uint8_t)
 TaskHandle_t g_worker_task = nullptr;
+// [psram-stack] Safe to keep in PSRAM: all nine PersistKind command paths
+// dispatch through ExecuteStorageTransaction, so the actual NVS/SPIFFS work
+// runs on the storage service task's internal stack, not this one. Verified
+// per kind in persist_worker.cpp ExecutePersistCommand. See psram_task_stack.cpp.
+StaticTask_t g_worker_tcb = {};
+StackType_t* g_worker_stack = nullptr;
 portMUX_TYPE g_start_lock = portMUX_INITIALIZER_UNLOCKED;
 bool g_starting = false;
 std::atomic<uint32_t> g_next_operation_id{1};
@@ -182,12 +190,20 @@ esp_err_t ExecutePersistCommand(PersistCommand& command)
         case PersistKind::kSettingsAutoSync:
             return wqn::SaveAutoSyncIntervalMinutesForeground(
                 static_cast<uint32_t>(command.settings_int));
+        case PersistKind::kSettingsImageRender:
+            return wqn::SaveImageRenderModeForeground(
+                static_cast<wqn::ImageRenderMode>(command.settings_int));
         case PersistKind::kSettingsVolume:
             return wqn::SaveVolumePercentForeground(command.settings_int);
         case PersistKind::kSettingsDefaultDeck:
             // Recoverable marker protocol; one foreground storage transaction
             // (marker -> session clears -> deck+generation -> marker clear).
             return wqn::ChangeDefaultWordDeckForeground(command.settings_str);
+        case PersistKind::kSettingsAiFollow:
+            return wqn::SaveAiAutoFollowForeground(command.settings_int != 0);
+        case PersistKind::kSettingsAgentDetail:
+            return wqn::SaveAgentDetailLevelForeground(
+                static_cast<uint8_t>(command.settings_int));
         case PersistKind::kCount:
             return ESP_ERR_NOT_SUPPORTED;
     }
@@ -250,6 +266,14 @@ void PersistWorkerTask(void*)
             continue;
         }
         command.result = ExecutePersistCommand(command);
+        if (command.result != ESP_OK) {
+            // [dev-diag] One hook covers every domain's durable-write failure
+            // (DEV_DIAGNOSTICS.md §5); the ring keeps the kind + esp_err that
+            // the transient notice drops.
+            wqn::RecordError(
+                "persist", "kind=%u %s", static_cast<unsigned>(command.kind),
+                esp_err_to_name(command.result));
+        }
         // Storage has ended: the SleepLease lifetime ends with the write, NOT
         // with the UI ack. Release it here; the busy gate stays set until ack.
         command.lease.Reset();
@@ -291,8 +315,20 @@ esp_err_t StartPersistWorker()
         }
     }
     TaskHandle_t created = nullptr;
-    if (xTaskCreate(PersistWorkerTask, "wqn_persist", kTaskStackBytes, nullptr,
-                    kTaskPriority, &created) != pdPASS) {
+    if (g_worker_stack == nullptr) {
+        g_worker_stack = wqn::AllocTaskStack(
+            kTaskStackBytes, "wqn_persist", nullptr);
+    }
+    if (g_worker_stack == nullptr) {
+        taskENTER_CRITICAL(&g_start_lock);
+        g_starting = false;
+        taskEXIT_CRITICAL(&g_start_lock);
+        return ESP_ERR_NO_MEM;
+    }
+    created = xTaskCreateStatic(
+        PersistWorkerTask, "wqn_persist", wqn::TaskStackWords(kTaskStackBytes),
+        nullptr, kTaskPriority, g_worker_stack, &g_worker_tcb);
+    if (created == nullptr) {
         taskENTER_CRITICAL(&g_start_lock);
         g_starting = false;
         taskEXIT_CRITICAL(&g_start_lock);
@@ -410,6 +446,22 @@ uint32_t SubmitAutoSyncIntervalSave(uint32_t minutes)
     return ticket.operation_id;
 }
 
+uint32_t SubmitImageRenderModeSave(wqn::ImageRenderMode mode)
+{
+    if (mode != wqn::ImageRenderMode::kBlackWhite &&
+        mode != wqn::ImageRenderMode::kGray16) {
+        return 0;
+    }
+    PersistTicket ticket = TryReservePersist(PersistKind::kSettingsImageRender);
+    if (!ticket.valid()) {
+        return 0;
+    }
+    PersistCommand& command = g_pool[ticket.slot_index];
+    command.settings_int = static_cast<int>(mode);
+    EnqueueReserved(command, ticket.slot_index, ticket.kind);
+    return ticket.operation_id;
+}
+
 uint32_t SubmitVolumeSave(int percent)
 {
     PersistTicket ticket = TryReservePersist(PersistKind::kSettingsVolume);
@@ -422,6 +474,33 @@ uint32_t SubmitVolumeSave(int percent)
     // playback uses the new level regardless of how long the durable NVS write
     // waits behind other worker commands.
     wqn::SetPlaybackVolumeCache(percent);
+    EnqueueReserved(command, ticket.slot_index, ticket.kind);
+    return ticket.operation_id;
+}
+
+uint32_t SubmitAiFollowSave(bool follow)
+{
+    PersistTicket ticket = TryReservePersist(PersistKind::kSettingsAiFollow);
+    if (!ticket.valid()) {
+        return 0;
+    }
+    PersistCommand& command = g_pool[ticket.slot_index];
+    command.settings_int = follow ? 1 : 0;
+    EnqueueReserved(command, ticket.slot_index, ticket.kind);
+    return ticket.operation_id;
+}
+
+uint32_t SubmitAgentDetailLevelSave(uint8_t level)
+{
+    if (level > 2) {
+        return 0;
+    }
+    PersistTicket ticket = TryReservePersist(PersistKind::kSettingsAgentDetail);
+    if (!ticket.valid()) {
+        return 0;
+    }
+    PersistCommand& command = g_pool[ticket.slot_index];
+    command.settings_int = static_cast<int>(level);
     EnqueueReserved(command, ticket.slot_index, ticket.kind);
     return ticket.operation_id;
 }

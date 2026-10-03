@@ -83,6 +83,25 @@ menu "WQN firmware"
             restart. Set 0 to keep the EPD rail on as long as the firmware is
             running.
 
+    config WQN_EPD_IDLE_CLEANUP_MS
+        int "Heavy-partial cleanup full refresh idle threshold in milliseconds"
+        default 45000
+        range 0 600000
+        depends on WQN_EPD_UI_ENABLE
+        help
+            User-idle time before the EPD owner task discharges accumulated
+            heavy-partial debt (kIdleCleanupHeavyPartials) with one full
+            refresh. This is deliberately NOT the power-off point: while the
+            cleanup rode WQN_EPD_IDLE_POWER_OFF_MS, every pause longer than a
+            few seconds flashed the panel even though nothing had changed.
+            The default sits below WQN_RETAINED_STANDBY_IDLE_MS so the UI task
+            is still polling when it fires -- once it enters light sleep the
+            debt survives and is paid by the ordinary heavy-threshold
+            promotion on the next interaction. A cold rail is fine: the
+            genuine full refresh powers the panel itself and ends with the
+            rail down again. Set 0 to attach the cleanup back to the
+            power-off point (pre-2026-09-11 behaviour).
+
     config WQN_DEEP_SLEEP_ENABLE
         bool "Enable deep sleep after UI idle"
         default y
@@ -92,22 +111,49 @@ menu "WQN firmware"
             are RTC-capable GPIO0, GPIO18, and GPIO5. GPIO39 cannot wake from
             deep sleep on ESP32-S3. GPIO17 is held high to preserve board power.
 
+    config WQN_RETAINED_STANDBY_IDLE_MS
+        int "Retained standby idle timeout in milliseconds"
+        default 60000
+        range 1000 86400000
+        depends on PM_ENABLE && FREERTOS_USE_TICKLESS_IDLE
+        help
+            User-idle time before the UI switches to an event/deadline-driven
+            wait. Automatic light sleep then retains RAM, PSRAM and the display
+            framebuffer, so every button (including GPIO39) remains a wake
+            source without rebooting the firmware.
+
     config WQN_DEEP_SLEEP_IDLE_MS
         int "Deep sleep idle timeout in milliseconds"
-        default 60000
+        default 1800000
         range 10000 86400000
         depends on WQN_DEEP_SLEEP_ENABLE
         help
-            Idle time before entering deep sleep. Default 60 seconds for normal use.
+            Idle time before the stateless provisioning/background screen may
+            enter deep sleep. Ordinary application pages have no hibernate
+            contract and use retained standby instead. The default is 30
+            minutes.
 
-    config WQN_DEEP_SLEEP_TIMER_WAKE_SEC
-        int "Deep sleep timer wake interval in seconds"
-        default 0
+    config WQN_SLEEP_TIMER_WAKE_FLOOR_SEC
+        int "Minimum deep sleep timer wake interval in seconds"
+        default 60
         range 0 86400
         depends on WQN_DEEP_SLEEP_ENABLE
         help
-            Optional RTC timer wake interval. Set 0 to wake only from GPIO0,
-            GPIO18, or GPIO5.
+            Floor applied to any non-zero computed timer wake interval.
+            Sync retry/content deadlines shorter than this are folded into
+            one wake per interval instead of a boot-per-10s micro-wake loop;
+            a deadline that lands inside the floor simply fires one interval
+            late. 0 disables the floor.
+
+    config WQN_RTC_TIMEKEEP_ENABLE
+        bool "Keep wall-clock time across deep sleep via PCF8563"
+        default y
+        depends on WQN_DEEP_SLEEP_ENABLE
+        help
+            Before entering deep sleep, write the system wall clock into the
+            PCF8563 RTC; on a trusted deep-sleep resume, read it back and
+            calibrate the system clock before UI/sync consumers start. Any
+            failure degrades safely to the existing build-time seed.
 
     config WQN_AI_ENABLE
         bool "Enable WQN AI firmware modules"
@@ -115,6 +161,24 @@ menu "WQN firmware"
         help
             Enable experimental AI support modules. Provider secrets must stay
             on the WQN server and must never be embedded in firmware.
+
+    config WQN_AGENT_ENABLE
+        bool "Enable the Agent tier (OpenCode gateway)"
+        default y
+        depends on WQN_AI_ENABLE
+        help
+            Compile the Agent tier of the AI page: the OpenCode gateway that
+            proxies a self-hosted OpenCode server through the WQN cloud
+            (/api/esp32/agent/*), its worker task, and its session picker.
+
+            Provider secrets and tool execution stay on the gateway; the device
+            only ever holds the pairing token.
+
+            When disabled, AiTier::kAgent is dropped from the tier ring so the
+            user can never land on a tier with no backend behind it, and the
+            OpenCode session/client translation units compile to stubs. Disable
+            only for builds against a cloud that does not serve the agent
+            routes.
 
     config WQN_AI_STREAMING_ENABLE
         bool "Enable v2 SSE streaming for Std/Pro AI tier (new default)"
@@ -157,6 +221,17 @@ menu "WQN firmware"
             print channel RMS/peak statistics over serial, then power audio off.
             This mode does not upload audio or start WiFi by itself.
 
+    config WQN_AI_PCM_DUMP_ENABLE
+        bool "Dump captured AI turn PCM as base64 over the console"
+        default n
+        depends on WQN_AI_ENABLE
+        help
+            After each AI recording stops, print the loudest 2 s window of
+            the captured mono PCM as base64 between PCM_DUMP_BEGIN and
+            PCM_DUMP_END markers. Diagnostic only: at 115200 baud this
+            blocks the AI worker for roughly 10 s per turn, so never enable
+            it outside a targeted capture session.
+
     config WQN_BATTERY_LOW_THRESHOLD_MV
         int "Battery low shutdown threshold in millivolts"
         default 3450
@@ -178,5 +253,26 @@ menu "WQN firmware"
             When charging, extend deep sleep idle timeout by this amount
             so the device stays awake longer for syncing/updates.
             Default 5 minutes extra.
+
+            Currently unused: external power holds the kUsbPower sleep lease,
+            which blocks deep sleep outright, so the idle threshold is never
+            reached while charging. Kept for a future policy change.
+
+            Currently unused: external power holds the kUsbPower sleep lease,
+            which blocks deep sleep outright, so the idle threshold is never
+            reached while charging. Kept for a future policy change.
+
+    config WQN_DEV_MENU_ENABLE
+        bool "Enable the dev diagnostics submenu in the settings page"
+        default n
+        depends on WQN_EPD_UI_ENABLE
+        help
+            Adds one "开发者选项" row to the settings page that opens a
+            second-level read-only list: dev info, sync diagnostics, error log,
+            raw battery, storage detail and sleep/power diagnostics. Structure
+            is fixed by DEV_DIAGNOSTICS.md. Error capture (wqn::RecordError) is
+            always compiled in; this flag only controls the visible menu entry,
+            so release builds keep it n (RELEASE_CHECKLIST.md asserts the
+            recorded sdkconfig has it unset).
 
 endmenu

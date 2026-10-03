@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -17,12 +18,15 @@ namespace device_ui_internal {
 namespace {
 
 constexpr char kTag[] = "wqn_problem_page";
-constexpr int kProblemMarginX = 8;
+constexpr int kProblemMarginX = kMarginDense;  // [v2] density-page margin (was 8)
 constexpr int kContentW = wqn::kEpdWidth - 2 * kProblemMarginX;
 constexpr int kContentTop = 32;
-// No footer line (device pages keep no bottom status row); the 13-line face
-// budget must stay in sync with kProblemFaceVisibleLines in problem_app.cpp.
-constexpr int kContentBottom = wqn::kEpdHeight - 4;
+// A persistent control/status rail makes the three-button model discoverable
+// and keeps durable-commit failures visible. The 12-line face budget must stay
+// in sync with kProblemFaceVisibleLines in problem_app.cpp.
+constexpr int kContentBottom = 274;
+constexpr int kProblemFooterDividerY = 274;
+constexpr int kProblemFooterTextY = 280;
 constexpr int kListRowH = 30;
 constexpr int kBodyLineH = 20;
 
@@ -44,7 +48,8 @@ size_t ClampListWindowStart(size_t start, size_t selected, size_t count, size_t 
 esp_err_t DrawListRow(int y, const std::string& primary, const std::string& trailing, bool selected)
 {
     if (selected) {
-        DrawSelectedFill(kProblemMarginX, y, kContentW, kListRowH - 4);
+        // [v2] density-list row selection: rounded reverse-fill block.
+        DrawSelectionDecoration(kProblemMarginX, y, kContentW, kListRowH - 4, SelectionStyle::kRowFill);
     }
     const bool black = !selected;
     const int trailing_w = 88;
@@ -63,7 +68,7 @@ esp_err_t DrawListRow(int y, const std::string& primary, const std::string& trai
 esp_err_t RenderProblemList(const wqn::ProblemAppSnapshot& problem)
 {
     if (problem.rows.empty()) {
-        return DrawCenteredText(kProblemMarginX, 160, kContentW, "该错题本暂无题目");
+        return DrawEmptyState("暂无错题", "该错题本还没有题目");
     }
     const size_t visible = static_cast<size_t>(VisibleListRows());
     const size_t start = ClampListWindowStart(
@@ -82,8 +87,39 @@ esp_err_t RenderProblemList(const wqn::ProblemAppSnapshot& problem)
     return ESP_OK;
 }
 
-// Wrapped scroll viewport shared by the 题面 and 答案面. The wrapped lines are
-// cached per problem+face so scrolling never re-wraps a multi-KB body.
+std::string ProblemFooterText(const wqn::ProblemAppSnapshot& problem)
+{
+    if (problem.commit_state == wqn::ProblemVerdictCommitState::kPersisting) {
+        return problem.status_line.empty() ? "正在保存，请稍候" : problem.status_line;
+    }
+    if (problem.commit_state == wqn::ProblemVerdictCommitState::kFailed) {
+        return "保存失败 · 确认重新自评";
+    }
+    if (problem.outbox_suspended_count > 0) {
+        return "同步挂起 " + std::to_string(problem.outbox_suspended_count) +
+            " 条 · 可继续离线复习";
+    }
+    if (problem.cloud_sync_failed) {
+        return "同步异常 · 可继续离线复习";
+    }
+    return problem.hint;
+}
+
+esp_err_t DrawProblemFooter(const wqn::ProblemAppSnapshot& problem)
+{
+    DrawHorizontalLine(kProblemMarginX, kProblemFooterDividerY, kContentW);
+    return DrawCenteredText(
+        kProblemMarginX,
+        kProblemFooterTextY,
+        kContentW,
+        ProblemFooterText(problem));
+}
+
+// Wrapped scroll viewport shared by the 题面 and 答案面. The Markdown rows are
+// cached per problem+face so scrolling never re-lays a multi-KB body. Layout
+// runs with kMdNoSingleEmphasis (math plain text keeps single * / _ literal)
+// and MUST match problem_app.cpp's scroll-clamp count: same width 370, same
+// opts, same LayoutMarkdown.
 esp_err_t RenderProblemTextFace(
     const wqn::ProblemAppSnapshot& problem,
     bool answer_face)
@@ -102,14 +138,24 @@ esp_err_t RenderProblemTextFace(
     }
     const int body_top = kContentTop;
     const int visible = std::max(1, (kContentBottom - body_top) / kBodyLineH);
-    static std::string s_wrapped_key;
-    static std::vector<std::string> s_wrapped_lines;
+    // Identity is keyed on face key + text size + hash: the cache must notice
+    // a same-key content change WITHOUT pinning a second full copy of the
+    // face text in static storage.
+    static std::string s_layout_key;
+    static size_t s_layout_text_size = 0;
+    static size_t s_layout_text_hash = 0;
+    static std::vector<MdLine> s_md_lines;
     const std::string key = problem.problem_id + (answer_face ? "#a" : "#b");
-    if (key != s_wrapped_key) {
-        s_wrapped_lines = wqn::WrapUtf8TextToWidth(text, kContentW - 14, 4096);
-        s_wrapped_key = key;
+    const size_t text_hash = std::hash<std::string>{}(text);
+    if (key != s_layout_key ||
+        text.size() != s_layout_text_size ||
+        text_hash != s_layout_text_hash) {
+        s_md_lines = LayoutMarkdown(text, kMarkdownWidthDense, kMdNoSingleEmphasis);
+        s_layout_key = key;
+        s_layout_text_size = text.size();
+        s_layout_text_hash = text_hash;
     }
-    const std::vector<std::string>& lines = s_wrapped_lines;
+    const std::vector<MdLine>& lines = s_md_lines;
     const int total = static_cast<int>(lines.size());
     const int max_top = total > visible ? total - visible : 0;
     int top = static_cast<int>(scroll);
@@ -117,8 +163,9 @@ esp_err_t RenderProblemTextFace(
     if (top < 0) top = 0;
     for (int i = 0; i < visible && top + i < total; ++i) {
         ESP_RETURN_ON_ERROR(
-            DrawClippedText(
-                kProblemMarginX + 2, body_top + i * kBodyLineH, kContentW - 14, lines[top + i]),
+            DrawMarkdownLine(
+                lines[top + i], kProblemMarginX + 2, body_top + i * kBodyLineH,
+                kMarkdownWidthDense, kBodyLineH),
             kTag, "draw problem face line");
     }
     if (total > visible) {
@@ -176,7 +223,8 @@ esp_err_t RenderVerdictDialog(const wqn::ProblemAppSnapshot& problem)
         const int y = first_y + static_cast<int>(index) * row_h;
         const bool selected = index == problem.verdict_selected;
         if (selected) {
-            DrawSelectedFill(box_x + 10, y, box_w - 20, row_h - 6);
+            // [v2] verdict option executes-on-confirm: rounded reverse-fill (kInvert).
+            DrawSelectionDecoration(box_x + 10, y, box_w - 20, row_h - 6, SelectionStyle::kInvert);
         }
         ESP_RETURN_ON_ERROR(
             DrawClippedText(box_x + 24, y + 6, box_w - 48, kOptions[index], !selected),
@@ -197,6 +245,18 @@ esp_err_t RenderProblemBrowseToEpd(const wqn::UiFrame& frame, RefreshSchedule sc
         (problem.face == wqn::ProblemFace::kProblemImage ||
          problem.face == wqn::ProblemFace::kSolutionImage) &&
         problem.image_ready && problem.image_wqni != nullptr &&
+        problem.image_wqni->size() >= wqn::kNoteImageHeaderBytes &&
+        problem.image_wqni->data()[5] == 2 &&
+        problem.image_wqni->size() ==
+            wqn::kNoteImageHeaderBytes + wqn::kNoteImageGray4PayloadBytes) {
+        return wqn::RefreshEpdGray16(
+            problem.image_wqni->data() + wqn::kNoteImageHeaderBytes,
+            wqn::kNoteImageGray4PayloadBytes);
+    }
+    if (problem.mode == wqn::ProblemAppMode::kProblemView &&
+        (problem.face == wqn::ProblemFace::kProblemImage ||
+         problem.face == wqn::ProblemFace::kSolutionImage) &&
+        problem.image_ready && problem.image_wqni != nullptr &&
         problem.image_wqni->size() ==
             wqn::kNoteImageHeaderBytes + static_cast<size_t>(wqn::kEpdFramebufferSize)) {
         wqn::BlitEpdFramebuffer(
@@ -207,7 +267,8 @@ esp_err_t RenderProblemBrowseToEpd(const wqn::UiFrame& frame, RefreshSchedule sc
 
     wqn::ClearEpdFramebuffer(true);
 
-    // Status-bar title: problem title > set name > 错题.
+    // Status-bar title: include the current face so unlocking the answer is a
+    // visible semantic transition instead of an unexplained body-text swap.
     std::string bar_title = "错题";
     if (!problem.set_name.empty()) {
         bar_title = problem.set_name;
@@ -215,7 +276,25 @@ esp_err_t RenderProblemBrowseToEpd(const wqn::UiFrame& frame, RefreshSchedule sc
     if ((problem.mode == wqn::ProblemAppMode::kProblemView ||
          problem.mode == wqn::ProblemAppMode::kVerdict) &&
         !problem.problem_title.empty()) {
-        bar_title = problem.problem_title;
+        if (problem.mode == wqn::ProblemAppMode::kVerdict) {
+            bar_title = "自评 · ";
+        } else {
+            switch (problem.face) {
+                case wqn::ProblemFace::kProblemImage:
+                    bar_title = "题图 · ";
+                    break;
+                case wqn::ProblemFace::kBody:
+                    bar_title = "题面 · ";
+                    break;
+                case wqn::ProblemFace::kAnswer:
+                    bar_title = "答案 · ";
+                    break;
+                case wqn::ProblemFace::kSolutionImage:
+                    bar_title = "答案图 · ";
+                    break;
+            }
+        }
+        bar_title += problem.problem_title;
         if (problem.total > 0) {
             bar_title += " " + std::to_string(problem.position) + "/" +
                 std::to_string(problem.total);
@@ -246,6 +325,8 @@ esp_err_t RenderProblemBrowseToEpd(const wqn::UiFrame& frame, RefreshSchedule sc
             ESP_RETURN_ON_ERROR(RenderVerdictDialog(problem), kTag, "render verdict dialog");
             break;
     }
+
+    ESP_RETURN_ON_ERROR(DrawProblemFooter(problem), kTag, "render problem footer");
 
     return RefreshFrame(frame, schedule);
 }

@@ -33,6 +33,10 @@ enum class Mode : uint8_t {
     kSequential,
     kRandom,
     kDictionary,
+    kReview,
+    kIntake,
+    kShuffle,
+    kMistakes,
 };
 
 enum class Purpose : uint8_t {
@@ -44,6 +48,10 @@ enum class Ordering : uint8_t {
     kSequential,
     kGuidedRandomV1,
     kLexicographic,
+    kDueQueueV1,
+    kNewIntakeV1,
+    kPureRandomV1,
+    kMistakeWordsV1,
 };
 
 enum class ObservationAction : uint8_t {
@@ -177,6 +185,11 @@ struct CreateSessionRequest {
     Scope scope;
     int optional_count = 500;
     std::string seed;
+    // Sequential continuation cursor: skip this many candidates of the ordered
+    // scope. Negative means "omit" (fresh walk from the top).
+    int start_index = -1;
+    // Daily new-word budget for intake sessions. Zero means "omit".
+    int new_word_limit = 0;
 };
 
 struct ObservationRequest {

@@ -4,6 +4,7 @@
 #include "ui_internal.h"
 
 #include <algorithm>
+#include <cmath>
 
 #include "display_service.h"
 
@@ -34,6 +35,28 @@ void DrawRect(int x, int y, int width, int height)
     DrawHorizontalLine(x, y + height - 1, width);
     DrawVerticalLine(x, y, height);
     DrawVerticalLine(x + width - 1, y, height);
+}
+
+// [agent] Dashed outline. The Agent tier's pending bubble is drawn dashed to
+// say "this is not committed yet": the voice transcript and the permission ask
+// both sit in history only after the user acts on them, so they must not read
+// as settled chat entries. Same dash/gap cadence as DrawDashedVerticalLine so
+// the two dashed languages stay consistent.
+void DrawDashedRect(int x, int y, int width, int height)
+{
+    if (width <= 0 || height <= 0) {
+        return;
+    }
+    constexpr int kDash = 6;
+    constexpr int kGap = 5;
+    for (int xx = 0; xx < width; xx += kDash + kGap) {
+        DrawHorizontalLine(x + xx, y, std::min(kDash, width - xx));
+        DrawHorizontalLine(x + xx, y + height - 1, std::min(kDash, width - xx));
+    }
+    for (int yy = 0; yy < height; yy += kDash + kGap) {
+        DrawVerticalLine(x, y + yy, std::min(kDash, height - yy));
+        DrawVerticalLine(x + width - 1, y + yy, std::min(kDash, height - yy));
+    }
 }
 
 void FillRect(int x, int y, int width, int height, bool black)
@@ -106,6 +129,40 @@ void DrawRoundedRect(int x, int y, int width, int height, int radius)
     }
 }
 
+// [rowfill] Filled rounded rect (reverse-fill with rounded corners). This is
+// the density-list row selection block (SelectionStyle::kRowFill): the row is
+// ink-filled, the caller draws its content in paper color on top. Corners use
+// the same midpoint-circle walk as DrawRoundedRect but fill the interior rows
+// between the left/right arc spans. radius<=0 degrades to FillRect.
+void FillRoundedRect(int x, int y, int width, int height, int radius)
+{
+    if (width <= 0 || height <= 0) {
+        return;
+    }
+    if (radius <= 0) {
+        FillRect(x, y, width, height, true);
+        return;
+    }
+    const int r = std::min(radius, std::min(width, height) / 2);
+    // For each scanline row, compute the horizontal extent of the rounded
+    // shape and fill it. Straight middle rows fill full width; the top/bottom
+    // r rows are clipped by the corner circle.
+    for (int yy = 0; yy < height; ++yy) {
+        int inset = 0;
+        // Distance of this row from the nearest top/bottom edge (0-based).
+        const int edge = std::min(yy, height - 1 - yy);
+        if (edge < r) {
+            // Row inside a corner arc: how far the circle pulls the edge in.
+            // (r - edge) is the vertical distance from the arc center row.
+            const int dy = r - edge;
+            // inset = r - round(sqrt(r^2 - dy^2)); classic circle clip.
+            const int span = static_cast<int>(std::sqrt(static_cast<double>(r * r - dy * dy)) + 0.5);
+            inset = r - span;
+        }
+        DrawHorizontalLine(x + inset, y + yy, width - 2 * inset);
+    }
+}
+
 void ClearRect(const UiRect& rect)
 {
     const int x0 = std::max(0, rect.x);
@@ -127,6 +184,16 @@ void DrawProgressFill(int x, int y, int width, int height) { FillRect(x, y, widt
 void DrawRoleBar(int x, int y, int width, int height) { FillRect(x, y, width, height, true); }       // role marker bar (AI assistant)
 void DrawActivityDot(int x, int y, int size) { FillRect(x, y, size, size, true); }                    // activity indicator dot
 
+constexpr bool ScheduleAllowsWindowedPartial(RefreshSchedule schedule)
+{
+    return schedule == RefreshSchedule::kClock ||
+           schedule == RefreshSchedule::kTimer ||
+           schedule == RefreshSchedule::kConfig;
+}
+
+static_assert(!ScheduleAllowsWindowedPartial(RefreshSchedule::kSelection));
+static_assert(ScheduleAllowsWindowedPartial(RefreshSchedule::kClock));
+
 // [L3-doc] RefreshRegion/RefreshStableRegion: the UiRect is logged + feeds
 // FrameSignature dedup, but the actual refresh scope is decided by
 // RefreshEpdFull's internal FindDirtyRect (dirty bits vs g_previous_framebuffer).
@@ -144,7 +211,12 @@ esp_err_t RefreshRegion(const UiRect& rect, RefreshSchedule schedule)
         rect.y,
         rect.width,
         rect.height);
-    return wqn::RefreshEpdFull(true, false);
+    // [epd-wedge-fix] Keep the same selection policy as RefreshFrame(). Word
+    // and settings renderers reach this wrapper directly, so hardcoding true
+    // here bypassed the selection guard and produced the measured
+    // selection -> local-partial -> BUSY timeout/recovery stall.
+    return wqn::RefreshEpdFull(
+        ScheduleAllowsWindowedPartial(schedule), false);
 }
 
 esp_err_t RefreshStableRegion(const UiRect& rect, RefreshSchedule schedule)
@@ -173,8 +245,7 @@ esp_err_t RefreshFrame(const wqn::UiFrame& frame, RefreshSchedule schedule)
     // (LP 366-772ms vs FFP 408-772ms; the DRF waveform dominates). Clock/timer
     // ticks keep the local path: tiny diffs, power-sensitive, never wedged.
     const bool allow_local_partial =
-        schedule == RefreshSchedule::kClock || schedule == RefreshSchedule::kTimer ||
-        schedule == RefreshSchedule::kConfig;
+        ScheduleAllowsWindowedPartial(schedule);
     // [power-fix] Force a full refresh when:
     //   (a) the panel is being shown a genuinely different screen, OR
     //   (b) the producer asked for kCommit (used for screen transitions,
@@ -187,10 +258,13 @@ esp_err_t RefreshFrame(const wqn::UiFrame& frame, RefreshSchedule schedule)
     //   The kImmediate branch is intentionally absent here -- on RTC wake the
     //   CRC fast path inside RefreshEpdFull() suppresses the SPI transfer
     //   when nothing changed.
+    const bool prefer_full_for_schedule = frame.prefer_full_refresh &&
+        schedule != RefreshSchedule::kClock &&
+        schedule != RefreshSchedule::kTimer;
     const bool force_full_refresh =
         frame.screen != g_last_rendered_screen ||
         schedule == RefreshSchedule::kCommit ||
-        frame.prefer_full_refresh;  // [full-refresh-fix] honor producer's full-refresh request (was dead code -> ghosting on tier switch / provision exit)
+        prefer_full_for_schedule;  // [full-refresh-fix] honor producer preference without overriding clock/timer partial intent
     if (frame.screen != g_last_rendered_screen) {
         ESP_LOGI(kTag, "EPD: screen change detected (%d -> %d), forcing full refresh",
                  static_cast<int>(g_last_rendered_screen), static_cast<int>(frame.screen));

@@ -76,6 +76,17 @@ bool QueueTodoRefresh()
     return QueueTodoCloudRequest(request);
 }
 
+bool QueueTodoRefreshForRevision(uint64_t target_revision)
+{
+    if (target_revision == 0) {
+        return false;
+    }
+    TodoCloudRequest request;
+    request.op = TodoCloudOp::kRefresh;
+    request.content_target_revision = target_revision;
+    return QueueTodoCloudRequest(request);
+}
+
 bool QueueTodoRefreshCursor(const std::string& cursor)
 {
     if (cursor.empty()) {
@@ -316,6 +327,7 @@ void ExecuteTodoCloudRequest(const TodoCloudRequest& request)
     }
     TodoCloudResult& result = g_todo_result_slot;
     result.op = request.op;
+    result.content_target_revision = request.content_target_revision;
     std::snprintf(result.todo_id, sizeof(result.todo_id), "%s", request.todo_id);
 
     std::string token;

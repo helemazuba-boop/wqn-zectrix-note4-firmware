@@ -3,15 +3,22 @@
 #include <cstring>
 #include <string>
 
+#include "ai_session.h"
 #include "cJSON.h"
 #include "device_protocol/v3.h"
 #include "device_protocol/problem_study.h"
 #include "device_protocol/word_study.h"
 #include "esp_log.h"
 #include "note_app.h"
+#include "opencode_client.h"
+#include "power/rtc_timekeep.h"
 #include "problem_app.h"
 #include "problem_pack.h"
+#include "services/server_error_codes.h"
+#include "sse_chunk.h"
 #include "text_render.h"
+#include "time_app.h"
+#include "ui/markdown_layout.h"
 #include "word_app.h"
 #include "wqn_api.h"
 #include "wqn_api_stream_internal.h"
@@ -46,9 +53,17 @@ const char kV3Sync[] = R"json({
     "summaries": {
       "due_problem_ids": ["33333333-3333-4333-8333-333333333333"],
       "todo_count": 2,
-      "word_due_count": 5
+      "word_due_count": 5,
+      "word_mistake_count": 4
     },
-    "content_manifest": []
+    "content_manifest": [
+      { "kind": "problems", "revision": 12, "cursor": "problems:12" },
+      { "kind": "todos", "revision": 0, "cursor": "todos:0" },
+      { "kind": "words", "revision": 17 },
+      { "kind": "word_packs", "revision": 9, "cursor": "word_packs:9" },
+      { "kind": "note_packs", "revision": 0, "cursor": "note_packs:0" },
+      { "kind": "problem_packs", "revision": 0, "cursor": "problem_packs:0" }
+    ]
   }
 })json";
 
@@ -304,7 +319,13 @@ const char kProblemPackRowV1[] = R"json({
       "type": "single_choice",
       "full_marks": 6,
       "content_text": "该植物花色遗传遵循的规律是？",
-      "answer_text": "B"
+      "answer_text": "B",
+      "choices": [
+        { "id": "A", "text": "基因的分离定律" },
+        { "id": "B", "text": "基因的自由组合定律" },
+        { "id": "C", "text": "伴性遗传" },
+        { "id": "D", "text": "细胞质遗传" }
+      ]
     },
     {
       "index": 2,
@@ -329,9 +350,11 @@ const char kProblemPackRowV1[] = R"json({
   "image_ids": [
     "9e00e194c412bff778bfd1235b3b2b25a4f7f8b1d3ef1c72fca11d21b36d1e05"
   ],
+  "gray4_image_ids": [null],
   "solution_image_ids": [
     "1b1f4d9c22cf8d0b6cf6a52ad4a3f2e8809d15b9a7f96ff2f4bf1cf3a2b4c6d8"
-  ]
+  ],
+  "solution_gray4_image_ids": [null]
 })json";
 
 const char kV3ClaimStart[] = R"json({
@@ -393,71 +416,6 @@ const char kPollAlreadyPaired[] = R"json({
     "device_name": "ZecTrix_Note4",
     "message": "Device is already paired. Unpair from the web before requesting a new token."
   },
-  "timestamp": "2026-05-10T12:00:00.000Z"
-})json";
-
-const char kSyncDue[] = R"json({
-  "success": true,
-  "data": {
-    "due_problems": [
-      "11111111-1111-4111-8111-111111111111",
-      "22222222-2222-4222-8222-222222222222"
-    ],
-    "total": 2
-  },
-  "timestamp": "2026-05-10T12:00:00.000Z"
-})json";
-
-const char kProblemDetails[] = R"json({
-  "success": true,
-  "data": {
-    "problems": [
-      {
-        "id": "11111111-1111-4111-8111-111111111111",
-        "title": "Linear equation",
-        "content": "<p>Solve <strong>x + 2 = 5</strong>.</p>",
-        "content_format": "esp32_text_v1",
-        "content_text": "Solve x + 2 = 5.",
-        "problem_type": "short",
-        "answer_config": { "mode": "text" },
-        "solution_text": "x = 3",
-        "assets": [
-          {
-            "role": "problem",
-            "kind": "image",
-            "mime_type": "image/png",
-            "url": "https://wqn.helema.cn/api/esp32/assets?path=user%2Fdemo%2Fproblems%2Fp1%2Fproblem%2Fscan.png",
-            "sha256": "",
-            "width": 0,
-            "height": 0,
-            "bytes": 0
-          }
-        ]
-      }
-    ]
-  },
-  "timestamp": "2026-05-10T12:00:00.000Z"
-})json";
-
-const char kProblemWithMath[] = R"json({
-  "success": true,
-  "data": {
-    "problems": [
-      {
-        "id": "33333333-3333-4333-8333-333333333333",
-        "title": "Quadratic",
-        "content_format": "esp32_text_v1",
-        "content_text": "求 x^2 >= 4 的解。",
-        "problem_type": "short",
-        "solution_text": "x <= -2 或 x >= 2"
-      }
-    ]
-  }
-})json";
-
-const char kReviewComplete[] = R"json({
-  "success": true,
-  "data": { "processed": 1 },
   "timestamp": "2026-05-10T12:00:00.000Z"
 })json";
 
@@ -585,26 +543,6 @@ const char kAiTodoActions[] = R"json({
   }
 })json";
 
-const char kWordSearch[] = R"json({
-  "success": true,
-  "data": {
-    "prefix": "co",
-    "words": [
-      {
-        "id": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
-        "word": "concept",
-        "phonetic": "/concept/",
-        "meaning": "idea"
-      },
-      {
-        "id": "ffffffff-ffff-4fff-8fff-ffffffffffff",
-        "word": "broken"
-      }
-    ],
-    "next_letters": ["m", "n", "r"]
-  }
-})json";
-
 const char kAiWordActions[] = R"json({
   "success": true,
   "data": {
@@ -726,76 +664,6 @@ bool CheckPollAlreadyPaired()
            Require(token == nullptr || cJSON_IsNull(token), "poll already_paired must not echo access_token");
 }
 
-bool CheckSyncDue()
-{
-    JsonDocument document(kSyncDue);
-    if (!Require(document.ok(), "sync due parses")) {
-        return false;
-    }
-
-    cJSON* data = cJSON_GetObjectItemCaseSensitive(document.root(), "data");
-    cJSON* due = cJSON_GetObjectItemCaseSensitive(data, "due_problems");
-    cJSON* total = cJSON_GetObjectItemCaseSensitive(data, "total");
-
-    return Require(CheckSuccess(document.root()), "sync due success") &&
-           Require(cJSON_IsArray(due) && cJSON_GetArraySize(due) == 2, "sync due ids") &&
-           Require(cJSON_IsNumber(total) && total->valueint == 2, "sync due total");
-}
-
-bool CheckProblemDetails()
-{
-    JsonDocument document(kProblemDetails);
-    if (!Require(document.ok(), "problem details parses")) {
-        return false;
-    }
-
-    cJSON* data = cJSON_GetObjectItemCaseSensitive(document.root(), "data");
-    cJSON* problems = cJSON_GetObjectItemCaseSensitive(data, "problems");
-    cJSON* first = cJSON_GetArrayItem(problems, 0);
-    cJSON* content = cJSON_GetObjectItemCaseSensitive(first, "content_text");
-    cJSON* assets = cJSON_GetObjectItemCaseSensitive(first, "assets");
-
-    const std::string text = cJSON_IsString(content) ? content->valuestring : "";
-    return Require(CheckSuccess(document.root()), "problem details success") &&
-           Require(cJSON_IsArray(problems) && cJSON_GetArraySize(problems) == 1, "problem details count") &&
-           Require(text.find("x + 2 = 5") != std::string::npos, "problem device text") &&
-           Require(cJSON_IsArray(assets) && cJSON_GetArraySize(assets) == 1, "problem image asset manifest");
-}
-
-bool CheckProblemMathFallback()
-{
-    JsonDocument document(kProblemWithMath);
-    if (!Require(document.ok(), "problem math parses")) {
-        return false;
-    }
-
-    cJSON* data = cJSON_GetObjectItemCaseSensitive(document.root(), "data");
-    cJSON* problems = cJSON_GetObjectItemCaseSensitive(data, "problems");
-    cJSON* first = cJSON_GetArrayItem(problems, 0);
-    cJSON* content = cJSON_GetObjectItemCaseSensitive(first, "content_text");
-    cJSON* solution = cJSON_GetObjectItemCaseSensitive(first, "solution_text");
-
-    return Require(CheckSuccess(document.root()), "problem math success") &&
-           Require(cJSON_IsString(content) && std::strstr(content->valuestring, "x^2 >= 4") != nullptr,
-                   "problem math content fallback") &&
-           Require(cJSON_IsString(solution) && std::strstr(solution->valuestring, "x <= -2") != nullptr,
-                   "problem math solution fallback");
-}
-
-bool CheckReviewComplete()
-{
-    JsonDocument document(kReviewComplete);
-    if (!Require(document.ok(), "review complete parses")) {
-        return false;
-    }
-
-    cJSON* data = cJSON_GetObjectItemCaseSensitive(document.root(), "data");
-    cJSON* processed = cJSON_GetObjectItemCaseSensitive(data, "processed");
-
-    return Require(CheckSuccess(document.root()), "review complete success") &&
-           Require(cJSON_IsNumber(processed) && processed->valueint == 1, "review complete processed");
-}
-
 bool CheckTodoList()
 {
     wqn::WqnTodoListPage page;
@@ -849,18 +717,6 @@ bool CheckAiTodoActions()
            Require(response.actions[2].status == "pending", "AI restored status") &&
            Require(response.actions[3].status == "cancelled", "AI cancelled status") &&
            Require(response.actions[4].type == "future_action", "AI unknown action preserved");
-}
-
-bool CheckWordSearch()
-{
-    wqn::WqnWordSearchResult search;
-    const esp_err_t result = wqn::ParseWordSearchResponse(kWordSearch, &search);
-    return Require(result == ESP_OK, "word search parse result") &&
-           Require(search.prefix == "co", "word search prefix") &&
-           Require(search.words.size() == 1, "word search skips invalid word") &&
-           Require(search.words[0].word == "concept", "word search word") &&
-           Require(search.next_letters.size() == 3, "word search next letter count") &&
-           Require(search.next_letters[1] == "n", "word search next letter value");
 }
 
 bool CheckAiWordActions()
@@ -1000,6 +856,29 @@ bool CheckV3ControlContract()
         return false;
     }
 
+    metadata.config_revision = 99;
+    metadata.sync_cursor = 88;
+    if (!Require(
+            wqn::protocol::v3::BuildSyncRequest(metadata, 15, &request_body) ==
+                ESP_OK,
+            "v3 sync request reports local interval")) {
+        return false;
+    }
+    JsonDocument sync_request(request_body.c_str());
+    cJSON* sync_configuration = cJSON_GetObjectItemCaseSensitive(
+        sync_request.root(), "configuration");
+    cJSON* sync_interval = cJSON_GetObjectItemCaseSensitive(
+        sync_configuration, "auto_sync_interval_minutes");
+    if (!Require(sync_request.ok(), "v3 sync request parses") ||
+        !Require(cJSON_IsNumber(sync_interval) && sync_interval->valueint == 15,
+                 "v3 sync request interval value") ||
+        !Require(
+            wqn::protocol::v3::BuildSyncRequest(metadata, 10, &request_body) ==
+                ESP_ERR_INVALID_ARG,
+            "v3 sync request rejects unsupported interval")) {
+        return false;
+    }
+
     wqn::protocol::v3::SyncData sync;
     if (!Require(
             wqn::protocol::v3::ParseSyncResponse(
@@ -1007,16 +886,118 @@ bool CheckV3ControlContract()
             "v3 sync parse") ||
         !Require(sync.due_problem_ids.size() == 1, "v3 sync due count") ||
         !Require(sync.todo_count == 2, "v3 sync todo count") ||
-        !Require(sync.word_due_count == 5, "v3 sync word count")) {
+        !Require(sync.word_due_count == 5, "v3 sync word count") ||
+        !Require(sync.word_mistake_count == 4, "v3 sync mistake count") ||
+        !Require(sync.content_targets.size() == 6, "v3 sync content target count") ||
+        !Require(sync.content_targets[1].revision == 0, "v3 sync accepts zero revision") ||
+        !Require(sync.content_targets[2].cursor.empty(), "v3 sync accepts missing cursor") ||
+        !Require(sync.content_targets[4].revision == 0, "v3 sync accepts empty note domain") ||
+        !Require(sync.content_targets[5].revision == 0, "v3 sync accepts empty problem domain")) {
+        return false;
+    }
+
+    // Additive contract: a server that predates the mistakes hint omits the
+    // field entirely, and the parser must keep it "unknown" (-1) rather than
+    // reject the sync.
+    std::string missing_mistake_hint = kV3Sync;
+    const size_t mistake_hint_position =
+        missing_mistake_hint.find(",\n      \"word_mistake_count\": 4");
+    if (!Require(
+            mistake_hint_position != std::string::npos,
+            "v3 mistake hint fixture mutation")) {
+        return false;
+    }
+    missing_mistake_hint.erase(
+        mistake_hint_position, std::strlen(",\n      \"word_mistake_count\": 4"));
+    wqn::protocol::v3::SyncData additive_sync;
+    if (!Require(
+            wqn::protocol::v3::ParseSyncResponse(
+                missing_mistake_hint, "req_sync_000000001", &additive_sync, &error) == ESP_OK,
+            "v3 sync accepts a missing additive mistake hint") ||
+        !Require(
+            additive_sync.word_mistake_count == -1,
+            "v3 sync missing mistake hint stays unknown")) {
+        return false;
+    }
+
+    std::string invalid_revision = kV3Sync;
+    const size_t revision_position = invalid_revision.find("\"revision\": 0");
+    if (!Require(revision_position != std::string::npos, "v3 zero revision fixture mutation")) {
+        return false;
+    }
+    invalid_revision.replace(revision_position, std::strlen("\"revision\": 0"), "\"revision\": -1");
+    if (!Require(
+            wqn::protocol::v3::ParseSyncResponse(
+                invalid_revision, "req_sync_000000001", &sync, &error) ==
+                ESP_ERR_INVALID_RESPONSE,
+            "v3 sync rejects negative revision")) {
+        return false;
+    }
+
+    std::string invalid_cursor = kV3Sync;
+    const size_t cursor_position = invalid_cursor.find("\"cursor\": \"todos:0\"");
+    if (!Require(cursor_position != std::string::npos, "v3 cursor fixture mutation")) {
+        return false;
+    }
+    invalid_cursor.replace(
+        cursor_position,
+        std::strlen("\"cursor\": \"todos:0\""),
+        "\"cursor\": 0");
+    if (!Require(
+            wqn::protocol::v3::ParseSyncResponse(
+                invalid_cursor, "req_sync_000000001", &sync, &error) ==
+                ESP_ERR_INVALID_RESPONSE,
+            "v3 sync rejects non-string cursor")) {
         return false;
     }
 
     const esp_err_t error_result = wqn::protocol::v3::ParseSyncResponse(
         kV3Error, "req_sync_000000002", &sync, &error);
-    return Require(error_result != ESP_OK, "v3 error returns failure") &&
-           Require(error.code == "TEMPORARILY_UNAVAILABLE", "v3 error code") &&
-           Require(error.retryable, "v3 error retryable") &&
-           Require(error.retry_after_ms == 10000, "v3 retry delay");
+    if (!Require(error_result != ESP_OK, "v3 error returns failure") ||
+        !Require(error.code == "TEMPORARILY_UNAVAILABLE", "v3 error code") ||
+        !Require(error.retryable, "v3 error retryable") ||
+        !Require(error.retry_after_ms == 10000, "v3 retry delay")) {
+        return false;
+    }
+
+    struct ErrorFixture {
+        const char* code;
+        bool retryable;
+        int64_t retry_after_ms;
+        wqn::services::ServerErrorClass expected_class;
+    };
+    constexpr ErrorFixture kErrorFixtures[] = {
+        {"UNAUTHORIZED", false, 0, wqn::services::ServerErrorClass::kAuthRequired},
+        {"SEQUENCE_GAP", true, 30000, wqn::services::ServerErrorClass::kTransientRetry},
+        {"SEQUENCE_ALREADY_APPLIED", false, 0, wqn::services::ServerErrorClass::kSequenceResolved},
+        {"SESSION_NOT_ACTIVE", false, 0, wqn::services::ServerErrorClass::kSessionTerminal},
+        {"ITEM_NOT_VISIBLE", false, 0, wqn::services::ServerErrorClass::kTombstoneRecoverable},
+        {"UPGRADE_REQUIRED", false, 0, wqn::services::ServerErrorClass::kProtocolBlocked},
+        {"REQUEST_ID_REUSED", false, 0, wqn::services::ServerErrorClass::kProtocolIntegrity},
+    };
+    for (const ErrorFixture& fixture : kErrorFixtures) {
+        const std::string json =
+            std::string("{\"ok\":false,\"request_id\":\"req_error_fixture_01\","
+                        "\"error\":{\"code\":\"") +
+            fixture.code + "\",\"retryable\":" +
+            (fixture.retryable ? "true" : "false") +
+            (fixture.retry_after_ms > 0
+                 ? ",\"retry_after_ms\":" + std::to_string(fixture.retry_after_ms)
+                 : "") +
+            "}}";
+        const esp_err_t result = wqn::protocol::v3::ParseSyncResponse(
+            json, "req_error_fixture_01", &sync, &error);
+        if (!Require(result != ESP_OK, "v3 classified error returns failure") ||
+            !Require(error.code == fixture.code, "v3 classified error code") ||
+            !Require(error.retryable == fixture.retryable, "v3 classified retryable") ||
+            !Require(error.retry_after_ms == fixture.retry_after_ms, "v3 classified retry delay") ||
+            !Require(
+                wqn::services::ClassifyServerErrorCode(error.code) == fixture.expected_class,
+                "v3 seven-class error taxonomy")) {
+            return false;
+        }
+    }
+    return true;
 }
 
 bool CheckWordStudyV1Contract()
@@ -1114,6 +1095,145 @@ bool CheckWordStudyV1Contract()
         !Require(
             body.find("word.study.v1") != std::string::npos,
             "word-study capability advertised")) {
+        return false;
+    }
+
+    // [word-modes-v2] Additive create-session fields. Review takes the whole
+    // due queue (no cursor, no quota); intake carries the daily new-word quota;
+    // sequential carries the durable library cursor. Unset fields must be
+    // omitted entirely so the server keeps its own defaults.
+    auto replace_once = [](std::string* value, const std::string& from, const std::string& to) {
+        const size_t position = value->find(from);
+        if (position == std::string::npos) {
+            return false;
+        }
+        value->replace(position, from.size(), to);
+        return true;
+    };
+
+    words::CreateSessionRequest create_request;
+    create_request.metadata = metadata;
+    create_request.metadata.request_id = "req_word_review_0001";
+    create_request.mode = words::Mode::kReview;
+    create_request.scope.deck_ids = {"11111111-1111-4111-8111-111111111111"};
+    create_request.optional_count = 500;
+    if (!Require(
+            words::BuildCreateSessionRequest(create_request, &body) == ESP_OK,
+            "word-study review request build") ||
+        !Require(
+            body.find("\"mode\":\"review\"") != std::string::npos,
+            "word-study review mode encoded") ||
+        !Require(
+            body.find("start_index") == std::string::npos &&
+                body.find("new_word_limit") == std::string::npos &&
+                body.find("\"seed\"") == std::string::npos,
+            "word-study review omits optional fields")) {
+        return false;
+    }
+
+    create_request.mode = words::Mode::kIntake;
+    create_request.metadata.request_id = "req_word_intake_0001";
+    create_request.new_word_limit = 20;
+    if (!Require(
+            words::BuildCreateSessionRequest(create_request, &body) == ESP_OK,
+            "word-study intake request build") ||
+        !Require(
+            body.find("\"new_word_limit\":20") != std::string::npos,
+            "word-study intake quota encoded") ||
+        !Require(
+            body.find("start_index") == std::string::npos,
+            "word-study intake omits start_index")) {
+        return false;
+    }
+
+    create_request.mode = words::Mode::kSequential;
+    create_request.metadata.request_id = "req_word_sequential_0002";
+    create_request.new_word_limit = 0;
+    create_request.start_index = 1200;
+    create_request.scope.include_mastered = true;
+    if (!Require(
+            words::BuildCreateSessionRequest(create_request, &body) == ESP_OK,
+            "word-study sequential cursor request build") ||
+        !Require(
+            body.find("\"start_index\":1200") != std::string::npos,
+            "word-study sequential cursor encoded") ||
+        !Require(
+            body.find("\"include_mastered\":true") != std::string::npos,
+            "word-study sequential includes mastered")) {
+        return false;
+    }
+    // Bounds belong to the contract, not the server: reject locally so a buggy
+    // UI cursor cannot produce an ambiguous request.
+    create_request.start_index = 1000001;
+    if (!Require(
+            words::BuildCreateSessionRequest(create_request, &body) ==
+                ESP_ERR_INVALID_ARG,
+            "word-study rejects start_index beyond bound")) {
+        return false;
+    }
+    create_request.start_index = -1;
+    create_request.new_word_limit = 201;
+    if (!Require(
+            words::BuildCreateSessionRequest(create_request, &body) ==
+                ESP_ERR_INVALID_ARG,
+            "word-study rejects new_word_limit beyond bound")) {
+        return false;
+    }
+
+    // Every new mode/ordering pair must survive the response parser: the whole
+    // queue semantics are keyed on the returned names.
+    const char* session_mode_names[] = {"review", "intake", "shuffle", "mistakes"};
+    const char* session_ordering_names[] = {
+        "due_queue_v1", "new_intake_v1", "pure_random_v1", "mistake_words_v1"};
+    const words::Mode expected_modes[] = {
+        words::Mode::kReview,
+        words::Mode::kIntake,
+        words::Mode::kShuffle,
+        words::Mode::kMistakes};
+    const words::Ordering expected_orderings[] = {
+        words::Ordering::kDueQueueV1,
+        words::Ordering::kNewIntakeV1,
+        words::Ordering::kPureRandomV1,
+        words::Ordering::kMistakeWordsV1};
+    for (size_t index = 0; index < 4; ++index) {
+        std::string json(kWordSessionV1);
+        const std::string mode_value =
+            std::string("\"") + session_mode_names[index] + "\"";
+        const std::string ordering_value =
+            std::string("\"") + session_ordering_names[index] + "\"";
+        if (!Require(
+                replace_once(&json, "\"mode\": \"random\"", "\"mode\": " + mode_value) &&
+                    replace_once(
+                        &json,
+                        "\"ordering\": \"guided_random_v1\"",
+                        "\"ordering\": " + ordering_value) &&
+                    replace_once(
+                        &json,
+                        "\"candidate_policy_version\": \"guided_random_v1\"",
+                        "\"candidate_policy_version\": " + ordering_value),
+                "word-study mode fixture rewrite")) {
+            return false;
+        }
+        words::SessionData parsed;
+        if (!Require(
+                words::ParseSessionResponse(
+                    json.c_str(), "req_word_session_0001", &parsed, &error) == ESP_OK,
+                "word-study mode response parse") ||
+            !Require(
+                parsed.mode == expected_modes[index] &&
+                    parsed.ordering == expected_orderings[index],
+                "word-study mode/ordering pair")) {
+            return false;
+        }
+    }
+    // A mixed pair is a contract violation, not a fallback: reject it.
+    std::string mismatch(kWordSessionV1);
+    if (!Require(
+            replace_once(&mismatch, "\"mode\": \"random\"", "\"mode\": \"review\"") &&
+                words::ParseSessionResponse(
+                    mismatch.c_str(), "req_word_session_0001", &session, &error) ==
+                    ESP_ERR_INVALID_RESPONSE,
+            "word-study rejects mode/ordering mismatch")) {
         return false;
     }
 
@@ -1348,6 +1468,12 @@ bool CheckProblemStudyV1Contract()
         !Require(entry.parts[0].type == "single_choice", "pack row part type") ||
         !Require(entry.parts[0].full_marks == 6, "pack row part marks") ||
         !Require(entry.parts[0].answer_text == "B", "pack row flattened answer") ||
+        !Require(entry.parts[0].choices.size() == 4, "pack row part choices") ||
+        !Require(entry.parts[0].choices[1].id == "B", "pack row choice id") ||
+        !Require(
+            entry.parts[0].choices[1].text == "基因的自由组合定律",
+            "pack row choice text") ||
+        !Require(entry.parts[1].choices.empty(), "pack row choice-less part") ||
         !Require(entry.parts[2].answer_text.empty(), "pack row essay empty answer") ||
         !Require(entry.image_ids.size() == 1, "pack row image ids") ||
         !Require(entry.solution_image_ids.size() == 1, "pack row solution image ids") ||
@@ -1387,6 +1513,1004 @@ bool CheckAiStreamHttpFailures()
                "successful SSE stream remains successful");
 }
 
+// Exercises the note-body Markdown layout engine (ui/markdown_layout) over a
+// showcase covering every stage-1 element, asserting each adornment class is
+// produced and that the render/scroll-count paths agree. Runs on the UI-free
+// boot self-test so a layout regression fails fast instead of on-panel.
+bool CheckMarkdownLayout()
+{
+    using namespace device_ui_internal;
+    static const char kShowcase[] =
+        "# Heading 1\n"
+        "## Heading 2\n"
+        "### Heading 3\n"
+        "Normal **bold** and *italic* and ~~strike~~ text.\n"
+        "Inline `code` and a [link](https://example.com).\n"
+        "An image ![diagram](http://img/x.png) inline.\n"
+        "- item one\n"
+        "- item two\n"
+        "  - nested item\n"
+        "1. first\n"
+        "2. second\n"
+        "> quoted line\n"
+        ">> nested quote\n"
+        "---\n"
+        "```\ncode block\nsecond code line\n```\n"
+        "| A | B | C |\n|---|---|---|\n| 1 | 2 | 3 |\n";
+
+    const std::vector<MdLine> lines = LayoutMarkdown(kShowcase, 370);
+    if (!Require(!lines.empty(), "markdown layout produced rows") ||
+        !Require(
+            CountMarkdownLines(kShowcase, 370) == lines.size(),
+            "markdown count matches layout size")) {
+        return false;
+    }
+
+    bool has_rule = false, has_heading_underline = false, has_bullet = false;
+    bool has_code = false, has_quote = false, has_table = false, has_table_border = false;
+    bool has_underline = false, has_codebox = false, has_strike = false;
+    for (const MdLine& line : lines) {
+        has_rule |= line.kind == MdLineKind::kRule;
+        has_table |= line.kind == MdLineKind::kTableRow;
+        has_table_border |= line.kind == MdLineKind::kTableRow && line.border_top;
+        has_heading_underline |= line.rule_below;
+        has_bullet |= line.bullet != MdBullet::kNone;
+        has_code |= line.code;
+        has_quote |= line.quote_depth > 0;
+        for (const MdDecoration& deco : line.decorations) {
+            has_underline |= deco.kind == MdDecoKind::kUnderline;
+            has_codebox |= deco.kind == MdDecoKind::kCodeBox;
+            has_strike |= deco.kind == MdDecoKind::kStrike;
+        }
+    }
+
+    // A table wider than the native cap must degrade to plain text rows, never
+    // kTableRow (the renderer only draws <=4 column grids).
+    static const char kWideTable[] =
+        "| a | b | c | d | e |\n|---|---|---|---|---|\n| 1 | 2 | 3 | 4 | 5 |\n";
+    bool wide_downgraded = true;
+    for (const MdLine& line : LayoutMarkdown(kWideTable, 370)) {
+        if (line.kind == MdLineKind::kTableRow) wide_downgraded = false;
+    }
+
+    // A 4-column table of long cells still renders as a real grid (cells wrap,
+    // columns scale down) -- it must NOT be demoted to source-like text rows.
+    static const char kDenseTable[] =
+        "| 语法类别 | Markdown 源码示例 | 实际渲染效果说明 | 边界极端情况测试 |\n"
+        "| --- | --- | --- | --- |\n"
+        "| 基础文本样式演示 | 粗体斜体删除线组合 | 显示的渲染结果 | 各种极端组合测试 |\n";
+    bool dense_is_grid = false;
+    for (const MdLine& line : LayoutMarkdown(kDenseTable, 370)) {
+        if (line.kind == MdLineKind::kTableRow) dense_is_grid = true;
+    }
+
+    // Triple emphasis must strip completely; the old pairwise probe leaked a
+    // literal '*' on each side ("*粗斜体*").
+    const std::vector<MdLine> triple = LayoutMarkdown("***粗斜体***", 370);
+    const bool triple_clean = triple.size() == 1 && triple[0].text == "粗斜体";
+
+    // kMdNoSingleEmphasis (problem-face mode): math plain text keeps single
+    // * / _ literal while double-marker bold still strips.
+    const std::vector<MdLine> math =
+        LayoutMarkdown("x*y*z 与 x_1 加 **粗体**", 370, kMdNoSingleEmphasis);
+    const bool math_clean =
+        math.size() == 1 && math[0].text == "x*y*z 与 x_1 加 粗体";
+
+    // AI assistant width (378 px): the showcase lays out and the row-count
+    // path agrees, mirroring the measure/draw split in page_ai.cpp.
+    const std::vector<MdLine> ai_rows = LayoutMarkdown(kShowcase, 378);
+    const bool ai_width_ok =
+        !ai_rows.empty() && CountMarkdownLines(kShowcase, 378) == ai_rows.size();
+
+    return Require(has_rule, "markdown horizontal rule") &&
+           Require(has_heading_underline, "markdown heading underline") &&
+           Require(has_bullet, "markdown list bullet") &&
+           Require(has_code, "markdown code block") &&
+           Require(has_quote, "markdown blockquote bar") &&
+           Require(has_table && has_table_border, "markdown table with border") &&
+           Require(has_underline, "markdown link underline") &&
+           Require(has_codebox, "markdown inline code box") &&
+           Require(has_strike, "markdown strikethrough") &&
+           Require(wide_downgraded, "markdown wide table downgraded to text") &&
+           Require(dense_is_grid, "markdown dense 4-col table renders as grid") &&
+           Require(triple_clean, "markdown triple emphasis fully stripped") &&
+           Require(math_clean, "markdown math mode keeps single emphasis literal") &&
+           Require(ai_width_ok, "markdown AI width layout and count agree");
+}
+
+// Pure UTC calendar <-> epoch conversions behind the PCF8563 timekeeping
+// bridge. Injected values only; no RTC hardware is touched here.
+bool CheckRtcTimekeepConversions()
+{
+    using wqn::power::timekeep::CalendarFromUnixSeconds;
+    using wqn::power::timekeep::RtcCalendar;
+    using wqn::power::timekeep::UnixSecondsFromCalendar;
+
+    // Known anchor: 2024-01-01T00:00:00Z, the shared "reasonable clock" floor.
+    RtcCalendar anchor;
+    const bool anchor_ok =
+        CalendarFromUnixSeconds(1704067200, &anchor) &&
+        anchor.year == 124 && anchor.month == 0 && anchor.day == 1 &&
+        anchor.hour == 0 && anchor.min == 0 && anchor.sec == 0 &&
+        anchor.weekday == 1;  // Monday
+
+    // Leap day: 2024-01-01 was a Monday and January has 31 days, so
+    // 2024-02-29 fell on a Thursday (index 4).
+    int64_t leap_seconds = -1;
+    RtcCalendar leap;
+    const bool leap_ok =
+        UnixSecondsFromCalendar(RtcCalendar{124, 1, 29, 12, 34, 56, 4},
+                                &leap_seconds) &&
+        CalendarFromUnixSeconds(leap_seconds, &leap) &&
+        leap.year == 124 && leap.month == 1 && leap.day == 29 &&
+        leap.hour == 12 && leap.min == 34 && leap.sec == 56 && leap.weekday == 4;
+
+    // Century window: 2099-12-31T23:59:59Z is representable; 2100-01-01 is not.
+    int64_t last_second = 0;
+    const bool upper_ok =
+        UnixSecondsFromCalendar(RtcCalendar{199, 11, 31, 23, 59, 59, 5},
+                                &last_second) &&
+        last_second == 4102444799;
+    RtcCalendar beyond;
+    const bool beyond_rejected = !CalendarFromUnixSeconds(4102444800, &beyond);
+
+    // Round-trip identity across the representable range.
+    constexpr int64_t kProbeTimes[] = {
+        946684800,   // 2000-01-01T00:00:00Z
+        951782400,   // 2000-02-28T00:00:00Z
+        1704067200,
+        2051222400,
+        4102444799,  // last representable second
+    };
+    bool round_trip_ok = true;
+    for (const int64_t probe : kProbeTimes) {
+        RtcCalendar forward;
+        int64_t back = -1;
+        if (!CalendarFromUnixSeconds(probe, &forward) ||
+            !UnixSecondsFromCalendar(forward, &back) ||
+            back != probe) {
+            round_trip_ok = false;
+            break;
+        }
+    }
+
+    // Register-level range validation mirrors Pcf8563WriteTime rejections.
+    const bool range_ok =
+        !UnixSecondsFromCalendar(RtcCalendar{99, 0, 1, 0, 0, 0, 0}, &last_second) &&
+        !UnixSecondsFromCalendar(RtcCalendar{200, 0, 1, 0, 0, 0, 0}, &last_second) &&
+        !UnixSecondsFromCalendar(RtcCalendar{124, 12, 1, 0, 0, 0, 0}, &last_second) &&
+        !UnixSecondsFromCalendar(RtcCalendar{124, 0, 0, 0, 0, 0, 0}, &last_second) &&
+        !UnixSecondsFromCalendar(RtcCalendar{124, 0, 1, 24, 0, 0, 0}, &last_second) &&
+        !UnixSecondsFromCalendar(RtcCalendar{124, 0, 1, 0, 60, 0, 0}, &last_second) &&
+        !UnixSecondsFromCalendar(RtcCalendar{124, 0, 1, 0, 0, 60, 0}, &last_second) &&
+        !UnixSecondsFromCalendar(RtcCalendar{124, 0, 1, 0, 0, 0, 7}, &last_second);
+
+    return Require(anchor_ok, "rtc timekeep 2024-01-01 anchor") &&
+           Require(leap_ok, "rtc timekeep leap-day round trip") &&
+           Require(upper_ok && beyond_rejected, "rtc timekeep century window") &&
+           Require(round_trip_ok, "rtc timekeep round trip identity") &&
+           Require(range_ok, "rtc timekeep register range rejection");
+}
+
+// ---- agent-gateway-v0 ----------------------------------------------------
+//
+// Every literal below is the golden fixture in
+// `contracts/agent-gateway-v0/fixtures/` copied verbatim, and every negative
+// case is that literal mutated. The CMake-side check is a SHA of the schema
+// against `manifest.json`; this one is what actually proves the firmware's
+// parser still accepts what the schema accepts. Editing one without the other
+// makes the hash pass while testing nothing, which is why both note it.
+#if CONFIG_WQN_AGENT_ENABLE
+
+// `valid/question-stream.json`. The frames are split into an array of
+// `{event, data}` pairs so the helper below can walk them in order.
+constexpr char kAgentQuestionStream[] = R"json([
+  { "event": "agent.accepted", "data": {} },
+  {
+    "event": "agent.question",
+    "data": {
+      "session_id": "ses_01J8ZQ4K7V2N9X0M3B6C5D4E7F",
+      "question_id": "frm_01J8ZQ5R8W3P1Y4N7C0D2E6F9G#0",
+      "title": "要写入哪个错题本？",
+      "options": [
+        { "value": "math", "label": "数学错题本" },
+        { "value": "physics", "label": "物理错题本" }
+      ]
+    }
+  },
+  { "event": "agent.text.delta", "data": { "delta": "已写入数学错题本。" } },
+  { "event": "agent.status", "data": { "status": "idle", "message": "执行完成" } }
+])json";
+
+// `valid/question-empty-options.json`. A field the device cannot render as a
+// choice (free text, or a list past the frame budget) is projected as an ask
+// with no options: the UI shows the title plus the 自定义回答 escape, which
+// aborts the run. The frame is legal and must reach the UI.
+constexpr char kAgentQuestionEmptyOptions[] = R"json([
+  { "event": "agent.accepted", "data": {} },
+  {
+    "event": "agent.question",
+    "data": {
+      "session_id": "ses_01J8ZQ4K7V2N9X0M3B6C5D4E7F",
+      "question_id": "frm_01J8ZQ5R8W3P1Y4N7C0D2E6F9H#0",
+      "title": "请用一句话描述这道题的错因",
+      "options": []
+    }
+  },
+  { "event": "agent.status", "data": { "status": "idle", "message": "执行完成" } }
+])json";
+
+// `valid/question-many-options.json`: eight options is the contract maximum.
+constexpr char kAgentQuestionManyOptions[] = R"json([
+  { "event": "agent.accepted", "data": {} },
+  {
+    "event": "agent.question",
+    "data": {
+      "session_id": "ses_01J8ZQ4K7V2N9X0M3B6C5D4E7F",
+      "question_id": "frm_01J8ZQ5R8W3P1Y4N7C0D2E6F9J#0",
+      "title": "选择要使用的题库",
+      "options": [
+        { "value": "math", "label": "数学" },
+        { "value": "physics", "label": "物理" },
+        { "value": "chemistry", "label": "化学" },
+        { "value": "biology", "label": "生物" },
+        { "value": "history", "label": "历史" },
+        { "value": "geography", "label": "地理" },
+        { "value": "politics", "label": "政治" },
+        { "value": "english", "label": "英语" }
+      ]
+    }
+  },
+  { "event": "agent.status", "data": { "status": "idle", "message": "执行完成" } }
+])json";
+
+// `invalid/question-too-many-options.json`: nine options is past the contract
+// bound. The parser must refuse the frame, not truncate it -- a truncated list
+// would silently hide answers.
+constexpr char kAgentQuestionTooManyOptions[] = R"json([
+  { "event": "agent.accepted", "data": {} },
+  {
+    "event": "agent.question",
+    "data": {
+      "session_id": "ses_01J8ZQ4K7V2N9X0M3B6C5D4E7F",
+      "question_id": "frm_01J8ZQ5R8W3P1Y4N7C0D2E6F9K#0",
+      "title": "选项过多的提问",
+      "options": [
+        { "value": "o1", "label": "选项一" },
+        { "value": "o2", "label": "选项二" },
+        { "value": "o3", "label": "选项三" },
+        { "value": "o4", "label": "选项四" },
+        { "value": "o5", "label": "选项五" },
+        { "value": "o6", "label": "选项六" },
+        { "value": "o7", "label": "选项七" },
+        { "value": "o8", "label": "选项八" },
+        { "value": "o9", "label": "选项九" }
+      ]
+    }
+  },
+  { "event": "agent.status", "data": { "status": "idle", "message": "执行完成" } }
+])json";
+
+// `valid/subagent-ask-stream.json`. Both asks name a session that is not the one
+// the device attached to: a subagent has its own id and raises its asks against
+// it, and both reply routes are scoped to whichever session the frame names.
+constexpr char kAgentSubagentAskStream[] = R"json([
+  { "event": "agent.accepted", "data": {} },
+  { "event": "agent.status", "data": { "status": "running", "message": "已接取任务" } },
+  {
+    "event": "agent.tool",
+    "data": {
+      "tool": "notebook.search",
+      "call_id": "call_01J8ZQ5R8W3P1Y4N7C0D2E6F9G",
+      "status": "running",
+      "preview": "query=极限"
+    }
+  },
+  {
+    "event": "agent.permission",
+    "data": {
+      "session_id": "ses_01J8ZQ4K7V2N9X0M3B6C5SUBA1",
+      "permission_id": "prm_01J8ZQ5R8W3P1Y4N7C0D2SUBA1",
+      "type": "notebook.write",
+      "title": "子任务请求写入错题本",
+      "preview": "题目 129 · 追加 1 条记录"
+    }
+  },
+  {
+    "event": "agent.question",
+    "data": {
+      "session_id": "ses_01J8ZQ4K7V2N9X0M3B6C5SUBA1",
+      "question_id": "frm_01J8ZQ5R8W3P1Y4N7C0D2SUBA1#0",
+      "title": "子任务的提问：追加到哪里？",
+      "options": [
+        { "value": "math", "label": "数学错题本" },
+        { "value": "physics", "label": "物理错题本" }
+      ]
+    }
+  },
+  { "event": "agent.text.delta", "data": { "delta": "子任务已写入数学错题本。" } },
+  { "event": "agent.status", "data": { "status": "idle", "message": "执行完成" } }
+])json";
+
+// `valid/reasoning-stream.json`.
+constexpr char kAgentReasoningStream[] = R"json([
+  { "event": "agent.accepted", "data": {} },
+  { "event": "agent.status", "data": { "status": "running", "message": "已接取任务" } },
+  { "event": "agent.reasoning.delta", "data": { "delta": "先判断极限类型：" } },
+  { "event": "agent.reasoning.delta", "data": { "delta": "属于 0/0 型。" } },
+  { "event": "agent.text.delta", "data": { "delta": "用洛必达法则，" } },
+  { "event": "agent.reasoning.delta", "data": { "delta": "再检查分母导数。" } },
+  { "event": "agent.text.delta", "data": { "delta": "分子分母同时求导。" } },
+  {
+    "event": "agent.reasoning",
+    "data": { "text": "先判断极限类型：属于 0/0 型。再检查分母导数。" }
+  },
+  { "event": "agent.text", "data": { "text": "用洛必达法则，分子分母同时求导。" } },
+  { "event": "agent.status", "data": { "status": "idle", "message": "执行完成" } }
+])json";
+
+// `valid/error-retry-stream.json`. An error is not the end of a run: the
+// gateway marks a retryable upstream step failure `fatal: false` and keeps the
+// stream open, so the run that follows it is still a success.
+constexpr char kAgentErrorRetryStream[] = R"json([
+  { "event": "agent.accepted", "data": {} },
+  { "event": "agent.status", "data": { "status": "running", "message": "已接取任务" } },
+  {
+    "event": "agent.error",
+    "data": { "message": "上游步骤失败，正在重试", "fatal": false }
+  },
+  { "event": "agent.status", "data": { "status": "retry", "message": "第 1 次重试" } },
+  {
+    "event": "agent.tool",
+    "data": {
+      "tool": "notebook.search",
+      "call_id": "call_01J8ZQ5R8W3P1Y4N7C0D2E6F9G",
+      "status": "done",
+      "preview": "3 条结果"
+    }
+  },
+  { "event": "agent.text.delta", "data": { "delta": "重试后已找到 3 道同类题。" } },
+  { "event": "agent.status", "data": { "status": "idle", "message": "执行完成" } }
+])json";
+
+// `valid/history-response.json`.
+constexpr char kAgentHistory[] = R"json({
+  "success": true,
+  "data": {
+    "messages": [
+      { "role": "user", "text": "帮我把这道极限题的步骤整理成错题本" },
+      {
+        "role": "assistant",
+        "text": "",
+        "thinking": "先确认题目给出的条件是否足以使用洛必达法则，再决定是否需要分情况讨论。",
+        "tools": [
+          { "name": "notebook.search", "status": "done", "preview": "query=极限" }
+        ]
+      },
+      {
+        "role": "assistant",
+        "text": "已找到 3 道同类题，并写入错题本。",
+        "tools": [
+          { "name": "notebook.search", "status": "done", "preview": "query=极限" },
+          { "name": "notebook.write", "status": "running", "preview": "题目 128" }
+        ]
+      },
+      { "role": "user", "text": "第二题也用同样的步骤" },
+      { "role": "assistant", "text": "好的，第二题是 1 的无穷次幂型，先取对数再求极限。" }
+    ]
+  }
+})json";
+
+// `valid/run-request-with-id.json`. The boot self-test has no schema validator,
+// so this fixture is asserted by hand: the id must be exactly 16 lowercase hex
+// characters, which is both what the cloud's `request_id` pattern accepts and
+// what GenerateRequestId() mints for the run body.
+constexpr char kAgentRunRequestWithId[] = R"json({
+  "text": "帮我把这道极限题的步骤整理成错题本",
+  "confirmed": true,
+  "request_id": "0123456789abcdef"
+})json";
+
+// Replay one fixture's `{event, data}` pairs through the frame parser, handing
+// each event to `visit`. Parsing stops at the first frame the parser refuses,
+// so a caller cannot accidentally assert on a frame that was dropped.
+template <typename Visit>
+bool ReplayAgentStream(const char* literal, Visit visit)
+{
+    cJSON* frames = cJSON_Parse(literal);
+    const int count = cJSON_IsArray(frames) ? cJSON_GetArraySize(frames) : 0;
+    for (int index = 0; index < count; ++index) {
+        const cJSON* frame = cJSON_GetArrayItem(frames, index);
+        const char* event = cJSON_GetStringValue(
+            cJSON_GetObjectItemCaseSensitive(frame, "event"));
+        char* data = cJSON_PrintUnformatted(
+            cJSON_GetObjectItemCaseSensitive(frame, "data"));
+        const std::string payload = data != nullptr ? data : "";
+        cJSON_free(data);
+        wqn::OpenCodeEvent parsed;
+        const esp_err_t result =
+            wqn::ParseOpenCodeAgentFrame(event != nullptr ? event : "", payload, &parsed);
+        if (!visit(index, result, parsed)) {
+            cJSON_Delete(frames);
+            return false;
+        }
+    }
+    cJSON_Delete(frames);
+    return count > 0;
+}
+
+bool CheckAgentGatewayV0Contract()
+{
+    // --- question stream: a question is read as one, with its step id --------
+    int question_frames = 0;
+    bool question_ids_ok = true;
+    if (!ReplayAgentStream(kAgentQuestionStream,
+                           [&](int index, esp_err_t result, const wqn::OpenCodeEvent& event) {
+                               ++question_frames;
+                               if (index == 1) {
+                                   if (!Require(
+                                           result == ESP_OK,
+                                           "agent question frame parses") ||
+                                       !Require(
+                                           event.kind == wqn::OpenCodeEventKind::kQuestion,
+                                           "agent question kind") ||
+                                       !Require(
+                                           event.session_id ==
+                                               "ses_01J8ZQ4K7V2N9X0M3B6C5D4E7F",
+                                           "agent question session") ||
+                                       !Require(
+                                           event.question_id ==
+                                               "frm_01J8ZQ5R8W3P1Y4N7C0D2E6F9G#0",
+                                           "agent question id") ||
+                                       !Require(
+                                           event.text == "要写入哪个错题本？",
+                                           "agent question title") ||
+                                       !Require(
+                                           event.question_options.size() == 2,
+                                           "agent question option count") ||
+                                       !Require(
+                                           event.question_options[0].value == "math" &&
+                                               event.question_options[0].label == "数学错题本",
+                                           "agent question first option") ||
+                                       !Require(
+                                           event.question_options[1].value == "physics" &&
+                                               event.question_options[1].label == "物理错题本",
+                                           "agent question second option")) {
+                                       question_ids_ok = false;
+                                       return false;
+                                   }
+                               }
+                               // The last frame is the terminator: without it the
+                               // device would sit out the 5-minute socket timeout.
+                               if (index == 3 &&
+                                   !Require(
+                                       result == ESP_OK &&
+                                           event.kind == wqn::OpenCodeEventKind::kStatus &&
+                                           event.status == "idle",
+                                       "agent question stream terminates on idle")) {
+                                   question_ids_ok = false;
+                                   return false;
+                               }
+                               return true;
+                           }) ||
+        !Require(question_frames == 4, "agent question stream frame count") ||
+        !Require(question_ids_ok, "agent question option projection")) {
+        return false;
+    }
+
+    // --- question option bounds: 0 is the abort-only ask, 9 is a violation ---
+    //
+    // `options` is minItems 0 / maxItems 8 in the contract. The empty edge is
+    // what lets a field with nothing to choose between stay visible (the UI
+    // then offers only 自定义回答); the top edge is refused rather than
+    // truncated, because a truncated list silently hides answers.
+    if (!ReplayAgentStream(
+            kAgentQuestionManyOptions,
+            [&](int index, esp_err_t result, const wqn::OpenCodeEvent& event) {
+                if (index != 1) {
+                    return true;
+                }
+                return Require(
+                    result == ESP_OK &&
+                        event.kind == wqn::OpenCodeEventKind::kQuestion &&
+                        event.question_options.size() == 8,
+                    "agent question accepts eight options");
+            })) {
+        return false;
+    }
+    if (!ReplayAgentStream(
+            kAgentQuestionEmptyOptions,
+            [&](int index, esp_err_t result, const wqn::OpenCodeEvent& event) {
+                if (index != 1) {
+                    return true;
+                }
+                return Require(
+                    result == ESP_OK &&
+                        event.kind == wqn::OpenCodeEventKind::kQuestion &&
+                        event.question_options.empty() &&
+                        event.question_id ==
+                            "frm_01J8ZQ5R8W3P1Y4N7C0D2E6F9H#0",
+                    "agent question accepts empty options");
+            })) {
+        return false;
+    }
+    if (!ReplayAgentStream(
+            kAgentQuestionTooManyOptions,
+            [&](int index, esp_err_t result, const wqn::OpenCodeEvent&) {
+                if (index != 1) {
+                    return true;
+                }
+                return Require(
+                    result == ESP_ERR_INVALID_RESPONSE,
+                    "agent question rejects nine options");
+            })) {
+        return false;
+    }
+
+    // --- subagent asks: the owning session is not the attached one ------------
+    //
+    // The relay watches the attached session and every child of it, and a child
+    // raises its asks against its own id. Both reply routes are session-scoped
+    // upstream, so a frame that does not carry the owning session is an ask the
+    // device cannot answer: the reply lands on the attached session and 404s.
+    // This is the fixture that keeps the field from being dropped as decorative.
+    int subagent_asks = 0;
+    bool subagent_ok = true;
+    if (!ReplayAgentStream(kAgentSubagentAskStream,
+                           [&](int index, esp_err_t result, const wqn::OpenCodeEvent& event) {
+                               if (index != 3 && index != 4) {
+                                   return true;
+                               }
+                               ++subagent_asks;
+                               const bool is_permission =
+                                   event.kind == wqn::OpenCodeEventKind::kPermission;
+                               if (!Require(
+                                       result == ESP_OK &&
+                                           (is_permission ||
+                                            event.kind == wqn::OpenCodeEventKind::kQuestion) &&
+                                           event.session_id ==
+                                               "ses_01J8ZQ4K7V2N9X0M3B6C5SUBA1" &&
+                                           (is_permission
+                                                ? event.permission_id ==
+                                                      "prm_01J8ZQ5R8W3P1Y4N7C0D2SUBA1"
+                                                : event.question_id ==
+                                                      "frm_01J8ZQ5R8W3P1Y4N7C0D2SUBA1#0"),
+                                       "agent subagent ask names its own session")) {
+                                   subagent_ok = false;
+                                   return false;
+                               }
+                               return true;
+                           }) ||
+        !Require(subagent_asks == 2, "agent subagent ask count") ||
+        !Require(subagent_ok, "agent subagent ask session attribution")) {
+        return false;
+    }
+
+    // The reply session is chosen here, not at the POST: the ask's own id wins,
+    // and anything that is not a session id falls back to the attached session,
+    // which is the behaviour the device had before the field existed. Asserted
+    // because the fallback is silent -- a reply to the wrong session 404s rather
+    // than reporting a routing bug.
+    const wqn::OpenCodeOutboundReply child_permission{
+        "prm_01J8ZQ5R8W3P1Y4N7C0D2SUBA1", true, false, {},
+        "ses_01J8ZQ4K7V2N9X0M3B6C5SUBA1", {}};
+    const wqn::OpenCodeOutboundReply child_question{
+        "prm_unused", true, true, "frm_01J8ZQ5R8W3P1Y4N7C0D2SUBA1#0",
+        "ses_01J8ZQ4K7V2N9X0M3B6C5SUBA1", "math"};
+    const wqn::OpenCodeOutboundReply legacy_permission{
+        "prm_01J8ZQ5R8W3P1Y4N7C0D2E6F9G", true, false, {}, {}, {}};
+    const std::string attached = "ses_01J8ZQ4K7V2N9X0M3B6C5D4E7F";
+    if (!Require(
+            wqn::OpenCodeReplySessionId(child_permission, attached) ==
+                "ses_01J8ZQ4K7V2N9X0M3B6C5SUBA1" &&
+                wqn::OpenCodeReplySessionId(child_question, attached) ==
+                    "ses_01J8ZQ4K7V2N9X0M3B6C5SUBA1" &&
+                wqn::OpenCodeReplySessionId(legacy_permission, attached) == attached,
+            "agent reply session attribution")) {
+        return false;
+    }
+
+    // --- reasoning stream: thinking is its own channel (P1 regression) ------
+    //
+    // The invariant is negative as much as positive: no reasoning payload may
+    // surface as a text event, so a gateway that mapped `session.reasoning.delta`
+    // onto `agent.text.delta` would be caught here rather than as
+    // chain-of-thought inside an answer.
+    int reasoning_deltas = 0;
+    int text_deltas = 0;
+    bool reasoning_ok = true;
+    if (!ReplayAgentStream(kAgentReasoningStream,
+                           [&](int index, esp_err_t result, const wqn::OpenCodeEvent& event) {
+                               if (!Require(result == ESP_OK, "agent reasoning frame parses")) {
+                                   reasoning_ok = false;
+                                   return false;
+                               }
+                               switch (event.kind) {
+                                   case wqn::OpenCodeEventKind::kReasoningDelta:
+                                       ++reasoning_deltas;
+                                       if (event.text != "先判断极限类型：" &&
+                                           event.text != "属于 0/0 型。" &&
+                                           event.text != "再检查分母导数。") {
+                                           reasoning_ok = false;
+                                           return false;
+                                       }
+                                       break;
+                                   case wqn::OpenCodeEventKind::kTextDelta:
+                                       ++text_deltas;
+                                       if (event.text != "用洛必达法则，" &&
+                                           event.text != "分子分母同时求导。") {
+                                           reasoning_ok = false;
+                                           return false;
+                                       }
+                                       break;
+                                   case wqn::OpenCodeEventKind::kReasoning:
+                                       // Repair frame: replaces the thinking block.
+                                       if (event.text !=
+                                           "先判断极限类型：属于 0/0 型。再检查分母导数。") {
+                                           reasoning_ok = false;
+                                           return false;
+                                       }
+                                       break;
+                                   case wqn::OpenCodeEventKind::kText:
+                                       if (event.text != "用洛必达法则，分子分母同时求导。") {
+                                           reasoning_ok = false;
+                                           return false;
+                                       }
+                                       break;
+                                   default:
+                                       break;
+                               }
+                               if (index == 9 &&
+                                   !Require(
+                                       event.kind == wqn::OpenCodeEventKind::kStatus &&
+                                           event.status == "idle",
+                                       "agent reasoning stream terminates on idle")) {
+                                   reasoning_ok = false;
+                                   return false;
+                               }
+                               return true;
+                           }) ||
+        !Require(reasoning_ok, "agent reasoning channel separation") ||
+        !Require(reasoning_deltas == 3, "agent reasoning delta count") ||
+        !Require(text_deltas == 2, "agent text delta count")) {
+        return false;
+    }
+
+    // --- whitelist: an event name outside the vocabulary is dropped ---------
+    wqn::OpenCodeEvent unknown_event;
+    if (!Require(
+            wqn::ParseOpenCodeAgentFrame("session.text.delta", R"json({"delta":"x"})json",
+                                         &unknown_event) == ESP_ERR_NOT_SUPPORTED,
+            "agent stream drops upstream event names")) {
+        return false;
+    }
+
+    // --- retry stream: a non-fatal error is not a failed run ----------------
+    //
+    // The gateway projects a retryable upstream step failure as `agent.error`
+    // with `fatal: false`. The device must read that as "keep going": treating
+    // every error as terminal locked a run that later succeeded into 失败, and
+    // the failure flag then closed every later tool block as an error too.
+    int retry_frames = 0;
+    bool retry_ok = true;
+    if (!ReplayAgentStream(kAgentErrorRetryStream,
+                           [&](int index, esp_err_t result, const wqn::OpenCodeEvent& event) {
+                               ++retry_frames;
+                               if (!Require(result == ESP_OK, "agent retry frame parses")) {
+                                   retry_ok = false;
+                                   return false;
+                               }
+                               if (index == 2) {
+                                   if (!Require(
+                                           event.kind == wqn::OpenCodeEventKind::kError,
+                                           "agent retry error kind") ||
+                                       !Require(
+                                           event.text == "上游步骤失败，正在重试",
+                                           "agent retry error text") ||
+                                       !Require(
+                                           !event.fatal,
+                                           "agent retry error is not fatal")) {
+                                       retry_ok = false;
+                                       return false;
+                                   }
+                               }
+                               // The run survives the error: the frames after it
+                               // must still reach the device.
+                               if (index == 4 && !Require(
+                                                      event.kind ==
+                                                              wqn::OpenCodeEventKind::kTool &&
+                                                          event.tool == "notebook.search" &&
+                                                          event.call_id ==
+                                                              "call_01J8ZQ5R8W3P1Y4N7C0D2E"
+                                                              "6F9G",
+                                                      "agent retry tool frame after error")) {
+                                   retry_ok = false;
+                                   return false;
+                               }
+                               if (index == 6 &&
+                                   !Require(
+                                       event.kind == wqn::OpenCodeEventKind::kStatus &&
+                                           event.status == "idle",
+                                       "agent retry stream terminates on idle")) {
+                                   retry_ok = false;
+                                   return false;
+                               }
+                               return true;
+                           }) ||
+        !Require(retry_ok, "agent retry error keeps the run alive") ||
+        !Require(retry_frames == 7, "agent retry stream frame count")) {
+        return false;
+    }
+
+    // --- `fatal` is opt-out: absent means the run is over --------------------
+    //
+    // A gateway that predates the field must keep its original meaning, so an
+    // absent (or true) flag is terminal rather than silently downgrading every
+    // error into a recoverable one.
+    wqn::OpenCodeEvent error_event;
+    if (!Require(
+            wqn::ParseOpenCodeAgentFrame("agent.error", R"json({"message":"x"})json",
+                                         &error_event) == ESP_OK,
+            "agent error without fatal parses") ||
+        !Require(error_event.fatal, "agent error without fatal is terminal") ||
+        !Require(
+            wqn::ParseOpenCodeAgentFrame("agent.error",
+                                         R"json({"message":"x","fatal":true})json",
+                                         &error_event) == ESP_OK,
+            "agent error with fatal true parses") ||
+        !Require(error_event.fatal, "agent error with fatal true is terminal")) {
+        return false;
+    }
+
+    // --- `call_id` separates two calls of the same tool ----------------------
+    //
+    // Upstream only pairs the tool name with the frame that announces the call,
+    // and the frames that end it carry just the id. The gateway echoes that id
+    // so the device can keep two calls of one tool as two blocks; when it is
+    // absent (a mid-run attach) the device falls back to merging by name.
+    wqn::OpenCodeEvent tool_event;
+    if (!Require(
+            wqn::ParseOpenCodeAgentFrame(
+                "agent.tool",
+                R"json({"tool":"notebook.search","call_id":"call_a","status":"running"})json",
+                &tool_event) == ESP_OK,
+            "agent tool with call_id parses") ||
+        !Require(tool_event.call_id == "call_a", "agent tool call_id projection") ||
+        !Require(
+            wqn::ParseOpenCodeAgentFrame("agent.tool",
+                                         R"json({"tool":"notebook.search","status":"done"})json",
+                                         &tool_event) == ESP_OK,
+            "agent tool without call_id parses") ||
+        !Require(tool_event.call_id.empty(), "agent tool call_id is optional")) {
+        return false;
+    }
+
+    // --- the ask's session is optional, and the router is what judges it ------
+    //
+    // A relay that predates the field still has to be answerable, so an absent
+    // session is not a malformed frame: it answers on the attached session. Nor
+    // does the parser drop a session it does not recognize -- the frame is
+    // refused by the schema, but on the device a dropped ask is lost for good,
+    // so the routing decision belongs at the reply POST, where the fallback and
+    // the failure are both observable. Together these two keep `session_id` from
+    // becoming a required field the device cannot do without.
+    wqn::OpenCodeEvent session_event;
+    if (!Require(
+            wqn::ParseOpenCodeAgentFrame(
+                "agent.permission",
+                R"json({"permission_id":"prm_a","type":"bash","title":"运行命令"})json",
+                &session_event) == ESP_OK,
+            "agent permission without session_id parses") ||
+        !Require(session_event.session_id.empty(),
+                 "agent permission without session_id has no session") ||
+        !Require(
+            wqn::ParseOpenCodeAgentFrame(
+                "agent.question",
+                R"json({"question_id":"frm_a","title":"哪个？","options":[{"value":"a","label":"A"}]})json",
+                &session_event) == ESP_OK,
+            "agent question without session_id parses") ||
+        !Require(session_event.session_id.empty(),
+                 "agent question without session_id has no session") ||
+        !Require(
+            wqn::ParseOpenCodeAgentFrame(
+                "agent.permission",
+                R"json({"session_id":"../elsewhere","permission_id":"prm_a"})json",
+                &session_event) == ESP_OK,
+            "agent permission with a foreign session_id still parses")) {
+        return false;
+    }
+    // ...and the reply falls back to the attached session rather than to the
+    // foreign one, so the device keeps answering a relay it can no longer trust
+    // to name the right session.
+    if (!Require(
+            wqn::OpenCodeReplySessionId(
+                wqn::OpenCodeOutboundReply{
+                    "prm_a", true, false, {}, "../elsewhere", {}},
+                "ses_attached") == "ses_attached",
+            "agent reply session falls back on a foreign id")) {
+        return false;
+    }
+
+    // --- question without options: the fixture's negative case --------------
+    //
+    // The gateway is what projects a form into two options, so a question frame
+    // with none is a malformed frame, not a question with no choices.
+    std::string empty_options = kAgentQuestionStream;
+    const size_t options_start = empty_options.find("\"options\": [");
+    if (!Require(options_start != std::string::npos, "agent options mutation anchor")) {
+        return false;
+    }
+    const size_t options_end = empty_options.find("]", options_start);
+    if (!Require(options_end != std::string::npos, "agent options mutation end")) {
+        return false;
+    }
+    empty_options.replace(options_start, options_end - options_start + 1, "\"options\": []");
+    cJSON* frames = cJSON_Parse(empty_options.c_str());
+    std::string question_data;
+    if (cJSON_IsArray(frames)) {
+        const cJSON* frame = cJSON_GetArrayItem(frames, 1);
+        char* printed = cJSON_PrintUnformatted(
+            cJSON_GetObjectItemCaseSensitive(frame, "data"));
+        question_data = printed != nullptr ? printed : "";
+        cJSON_free(printed);
+    }
+    cJSON_Delete(frames);
+    if (!Require(
+            wqn::ParseOpenCodeAgentFrame("agent.question", question_data, &unknown_event) ==
+                ESP_ERR_INVALID_RESPONSE,
+            "agent question with no options is rejected")) {
+        return false;
+    }
+
+    // --- permission without an id: unanswerable, so refused ------------------
+    //
+    // The reply route needs the id, so arming an id-less ask would hold the
+    // option bar for the rest of the run with no way to clear it. This mirrors
+    // the question case above: a malformed ask is dropped, not shown.
+    if (!Require(
+            wqn::ParseOpenCodeAgentFrame(
+                "agent.permission",
+                R"json({"type":"bash","title":"运行命令"})json",
+                &unknown_event) == ESP_ERR_INVALID_RESPONSE,
+            "agent permission without an id is rejected")) {
+        return false;
+    }
+
+    // --- one frame past the byte cap is a broken stream ----------------------
+    //
+    // `extract()` clears the frame and returns kPartial when the accumulated
+    // `data:` lines pass kMaxSseFrameBytes -- which is exactly what "need more
+    // data" looks like, so the caller used to keep reading and could parse the
+    // oversized frame's spliced tail as a real event. The sticky overflow flag
+    // is what makes the drop visible.
+    //
+    // The lines are fed and extracted one at a time on purpose: feeding them
+    // all first would trip the 16 KiB *line* cap (a different failure) before
+    // the frame cap could be reached.
+    {
+        wqn::SseFrameBuffer frame_parser;
+        std::string ev_name;
+        uint64_t ev_id = 0;
+        std::string ev_data;
+        const std::string nine_k(9 * 1024, 'x');
+        const char* event_line = "event: agent.text\n";
+        const char* data_prefix = "data: ";
+        std::string data_line = data_prefix;
+        data_line += nine_k;
+        data_line += "\n";
+
+        if (!Require(frame_parser.feed(event_line, std::strlen(event_line)),
+                     "sse overflow: event line feeds") ||
+            !Require(frame_parser.extract(&ev_name, &ev_id, &ev_data) ==
+                         wqn::SseFrameBuffer::FrameState::kPartial,
+                     "sse overflow: event line stays partial") ||
+            !Require(frame_parser.feed(data_line.data(), data_line.size()),
+                     "sse overflow: first data line feeds") ||
+            !Require(frame_parser.extract(&ev_name, &ev_id, &ev_data) ==
+                         wqn::SseFrameBuffer::FrameState::kPartial,
+                     "sse overflow: first data line stays partial") ||
+            !Require(!frame_parser.overflowed(),
+                     "sse overflow: under the cap is not flagged") ||
+            !Require(frame_parser.feed(data_line.data(), data_line.size()),
+                     "sse overflow: second data line feeds") ||
+            !Require(frame_parser.extract(&ev_name, &ev_id, &ev_data) ==
+                         wqn::SseFrameBuffer::FrameState::kPartial,
+                     "sse overflow: dropped frame stays partial") ||
+            !Require(frame_parser.overflowed(),
+                     "sse overflow: dropped frame is flagged")) {
+            return false;
+        }
+    }
+
+    // --- history backfill --------------------------------------------------
+    std::vector<wqn::OpenCodeHistoryMessage> messages;
+    wqn::OpenCodeResult history_result;
+    if (!Require(
+            wqn::ParseOpenCodeHistoryBody(kAgentHistory, &messages, &history_result) == ESP_OK,
+            "agent history parses") ||
+        !Require(messages.size() == 5, "agent history message count") ||
+        !Require(messages[0].role == "user", "agent history oldest first") ||
+        !Require(messages[1].role == "assistant", "agent history assistant role") ||
+        !Require(
+            messages[1].thinking ==
+                "先确认题目给出的条件是否足以使用洛必达法则，再决定是否需要分情况讨论。",
+            "agent history thinking channel") ||
+        !Require(
+            messages[1].tools.size() == 1 && messages[1].tools[0].name == "notebook.search" &&
+                messages[1].tools[0].status == "done" &&
+                messages[1].tools[0].preview == "query=极限",
+            "agent history tool projection") ||
+        !Require(messages[0].tools.empty(), "agent history user row has no tools") ||
+        !Require(
+            messages[4].text == "好的，第二题是 1 的无穷次幂型，先取对数再求极限。",
+            "agent history newest last")) {
+        return false;
+    }
+
+    // `invalid/history-not-array.json`: a body the device cannot read as
+    // messages is refused rather than rendered as an empty transcript.
+    if (!Require(
+            wqn::ParseOpenCodeHistoryBody(R"json({"data":{"messages":{}}})json", &messages,
+                                          &history_result) == ESP_ERR_INVALID_RESPONSE,
+            "agent history rejects non-array messages")) {
+        return false;
+    }
+
+    // `invalid/history-too-large.json`: the manifest's `history_response_bytes`
+    // bound is enforced by the parser and not only by the HTTP reader, so an
+    // oversized backfill is a visible failure rather than a half-drawn
+    // transcript.
+    const std::string oversized(12 * 1024 + 1, 'x');
+    if (!Require(
+            wqn::ParseOpenCodeHistoryBody(oversized, &messages, &history_result) ==
+                ESP_ERR_INVALID_SIZE,
+            "agent history rejects oversized body")) {
+        return false;
+    }
+
+    // --- run request idempotency key: 16 lowercase hex chars ----------------
+    //
+    // The schema carries the pattern but nothing in the firmware validates a
+    // request body, so the shape is pinned here by hand -- against the fixture
+    // and against the generator that actually mints the ids the run route
+    // sends. An uppercase or short id would be a 422 the device could not
+    // explain.
+    cJSON* run_request = cJSON_ParseWithLength(
+        kAgentRunRequestWithId, sizeof(kAgentRunRequestWithId) - 1);
+    if (!Require(run_request != nullptr, "agent run request fixture parses")) {
+        return false;
+    }
+    const cJSON* fixture_id =
+        cJSON_GetObjectItemCaseSensitive(run_request, "request_id");
+    const auto is_run_request_id = [](const char* value) {
+        if (value == nullptr || std::strlen(value) != 16) {
+            return false;
+        }
+        for (const char* cursor = value; *cursor != '\0'; ++cursor) {
+            const bool hex = (*cursor >= '0' && *cursor <= '9') ||
+                             (*cursor >= 'a' && *cursor <= 'f');
+            if (!hex) {
+                return false;
+            }
+        }
+        return true;
+    };
+    const bool fixture_id_ok = Require(
+        cJSON_IsString(fixture_id) && is_run_request_id(fixture_id->valuestring),
+        "agent run request fixture id is 16 hex chars");
+    cJSON_Delete(run_request);
+    const std::string minted_id = wqn::GenerateRequestId();
+    if (!fixture_id_ok ||
+        !Require(
+            is_run_request_id(minted_id.c_str()),
+            "agent generated run request id is 16 hex chars")) {
+        return false;
+    }
+
+    return true;
+}
+#endif  // CONFIG_WQN_AGENT_ENABLE
+
 }  // namespace
 
 namespace wqn {
@@ -1397,20 +2521,21 @@ bool RunContractFixtureSelfTest()
         CheckPollPaired() &&
         CheckPollNoPending() &&
         CheckPollAlreadyPaired() &&
-        CheckSyncDue() &&
-        CheckProblemDetails() &&
-        CheckProblemMathFallback() &&
-        CheckReviewComplete() &&
         CheckTodoList() &&
         CheckTodoComplete() &&
         CheckAiTodoActions() &&
-        CheckWordSearch() &&
         CheckAiWordActions() &&
         CheckUnauthorizedError() &&
         CheckV3ControlContract() &&
         CheckWordStudyV1Contract() &&
         CheckProblemStudyV1Contract() &&
         CheckAiStreamHttpFailures() &&
+        CheckMarkdownLayout() &&
+        CheckRtcTimekeepConversions() &&
+#if CONFIG_WQN_AGENT_ENABLE
+        CheckAgentGatewayV0Contract() &&
+#endif
+        RunTimeAppStateSelfTest() &&
         RunWordPageStateSelfTest() &&
         RunNotePageStateSelfTest() &&
         RunProblemPageStateSelfTest();

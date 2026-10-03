@@ -1,6 +1,15 @@
 cmake_minimum_required(VERSION 3.16)
 
-set(PROJECT_VER "0.1.0")
+# [release] The version comes from the release tooling (tools/release/release.py),
+# which derives it from a content fingerprint rather than a commit or tag.
+# WQN_RELEASE_VERSION is exported by the deploy/release entry points; a build
+# without it is a local dev build. Read from the environment (not a cache
+# variable) so a stale cache entry can never label a dev build as a release.
+if(DEFINED ENV{WQN_RELEASE_VERSION} AND NOT "$ENV{WQN_RELEASE_VERSION}" STREQUAL "")
+    set(PROJECT_VER "$ENV{WQN_RELEASE_VERSION}" CACHE STRING "Firmware version" FORCE)
+else()
+    set(PROJECT_VER "0.1.0-dev" CACHE STRING "Firmware version" FORCE)
+endif()
 
 # [power-fix] Layer the ai-local profile on top of the default sdkconfig
 # values. The ai-local.defaults file is the place where we collect the

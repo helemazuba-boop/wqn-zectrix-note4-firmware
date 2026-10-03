@@ -75,6 +75,12 @@ idf.py -B build-ai-local-s3 build
 scripts\monitor.bat
 ```
 
+The monitor applies IDF Monitor's `--no-reset` DTR/RTS ordering without needing
+a Windows ESP-IDF/Python installation. This is mandatory on the ESP32-S3 native
+USB-Serial-JTAG port: opening a resetting monitor produces
+`USB_UART_CHIP_RESET (0x15)`, destroys RTC slow-memory diagnostics, and starts
+Wi-Fi/display work that contaminates a sleep-efficiency observation.
+
 ### D. Recover from bad flash
 
 ```bat

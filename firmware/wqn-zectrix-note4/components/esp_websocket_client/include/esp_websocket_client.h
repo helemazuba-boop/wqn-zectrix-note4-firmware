@@ -146,6 +146,9 @@ int esp_websocket_client_send_with_opcode(esp_websocket_client_handle_t client, 
 esp_err_t esp_websocket_client_close(esp_websocket_client_handle_t client, TickType_t timeout);
 esp_err_t esp_websocket_client_close_with_code(esp_websocket_client_handle_t client, int code, const char *data, int len, TickType_t timeout);
 bool esp_websocket_client_is_connected(esp_websocket_client_handle_t client);
+/** Enable or disable TCP_NODELAY on the connected WebSocket socket. */
+esp_err_t esp_websocket_client_set_tcp_nodelay(
+    esp_websocket_client_handle_t client, bool enabled);
 size_t esp_websocket_client_get_ping_interval_sec(esp_websocket_client_handle_t client);
 esp_err_t esp_websocket_client_set_ping_interval_sec(esp_websocket_client_handle_t client, size_t ping_interval_sec);
 int esp_websocket_client_get_reconnect_timeout(esp_websocket_client_handle_t client);

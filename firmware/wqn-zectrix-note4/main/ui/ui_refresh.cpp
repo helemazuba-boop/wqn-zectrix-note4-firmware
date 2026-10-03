@@ -7,9 +7,11 @@
 #include <array>
 #include <atomic>
 #include <cstdio>
+#include <functional>
 #include <string>
 
 #include "display_service.h"
+#include "esp_attr.h"
 #include "esp_log.h"
 #include "esp_task_wdt.h"
 #include "esp_timer.h"
@@ -36,7 +38,11 @@ static bool g_refresh_busy = false;
 TickType_t g_refresh_due_tick = 0;
 RefreshSchedule g_refresh_schedule = RefreshSchedule::kNone;
 SecondarySlot g_secondary;
-volatile wqn::UiScreen g_last_rendered_screen = wqn::UiScreen::kHome;
+// Physical-display commit metadata: update only after a successful refresh and
+// retain it across deep sleep so RefreshFrame does not manufacture a screen
+// transition before the driver's trusted RTC-CRC fast path can run.
+RTC_DATA_ATTR volatile wqn::UiScreen g_last_rendered_screen =
+    wqn::UiScreen::kHome;
 wqn::runtime::SleepLease g_display_sleep_lease;
 // [epd-owner] Set by the UI task via RequestEpdIdleMaintenance, cleared by the
 // EPD task when it services the request. The EPD task samples the activity
@@ -329,13 +335,10 @@ std::string FrameSignature(const wqn::UiFrame& frame)
         case wqn::UiScreen::kTime:
         case wqn::UiScreen::kWord:
         case wqn::UiScreen::kNote:
-        case wqn::UiScreen::kLibrary:
-        case wqn::UiScreen::kProblem:
-        case wqn::UiScreen::kSolution:
-        case wqn::UiScreen::kReviewQueue:
-        case wqn::UiScreen::kReviewScore:
-        case wqn::UiScreen::kReviewQueued:
         case wqn::UiScreen::kProvisioning:
+        case wqn::UiScreen::kOpenCode:
+            // [agent] kOpenCode is a reserved, unreachable ID (demoted into the
+            // AI page); listed only to keep the switch exhaustive.
             break;
     }
     std::string signature = std::to_string(static_cast<int>(frame.screen));
@@ -347,6 +350,10 @@ std::string FrameSignature(const wqn::UiFrame& frame)
         signature.append(frame.home.battery_label);
         signature.push_back('/');
         signature.append(frame.home.primary_time_line);
+        signature.push_back('/');
+        signature.append(frame.home.timer_status_only ? "1" : "0");
+        signature.push_back('/');
+        signature.append(CurrentClockLabel());
         signature.push_back('/');
         signature.append(frame.home.review_metric.value);
         signature.push_back('/');
@@ -383,7 +390,20 @@ std::string FrameSignature(const wqn::UiFrame& frame)
         signature.push_back('/');
         signature.append(std::to_string(time_app.active_field));
         signature.push_back('/');
-        signature.append(std::to_string(time_app.remaining_seconds));
+        // A running timer renders its fixed endpoint, not a live countdown.
+        // Excluding the internal second counter keeps display dedup aligned
+        // with pixels; paused/terminal pages do render the frozen value.
+        if (time_app.status != wqn::TimerStatus::kRunning) {
+            signature.append(std::to_string(time_app.remaining_seconds));
+        }
+        signature.push_back('/');
+        const bool timer_progress_is_visible =
+            !time_config_mode && time_app.tile != wqn::TimeTile::kClock &&
+            wqn::TimeAppHasActiveTimer(time_app);
+        signature.append(std::to_string(
+            timer_progress_is_visible
+                ? wqn::TimeAppVisualProgressBucket(time_app)
+                : 0));
         signature.push_back('/');
         signature.append(std::to_string(time_app.countdown_hours));
         signature.push_back(':');
@@ -403,7 +423,19 @@ std::string FrameSignature(const wqn::UiFrame& frame)
         signature.push_back('/');
         signature.append(std::to_string(time_app.pomodoro_current_round));
         signature.push_back('/');
-        if (!time_config_mode) {
+        signature.append(std::to_string(time_app.session_started_unix_seconds));
+        signature.push_back(':');
+        signature.append(std::to_string(time_app.phase_started_unix_seconds));
+        signature.push_back(':');
+        signature.append(std::to_string(time_app.phase_ends_unix_seconds));
+        signature.push_back(':');
+        signature.append(std::to_string(time_app.paused_at_unix_seconds));
+        signature.push_back('/');
+        signature.append(time_app.action_armed ? "1" : "0");
+        signature.push_back('/');
+        signature.append(time_app.task_name);
+        signature.push_back('/');
+        if (!time_config_mode && time_app.tile == wqn::TimeTile::kClock) {
             signature.append(CurrentClockLabel());
         }
     }
@@ -462,7 +494,79 @@ std::string FrameSignature(const wqn::UiFrame& frame)
         signature.push_back('/');
         signature.append(frame.ai.expand_content ? "1" : "0");
         signature.push_back('/');
+        // [follow] No tier draws the follow toggle in the cluster any more (it
+        // moved to the settings page), so auto_follow no longer changes a pixel
+        // on this screen and is deliberately absent from this signature.
         signature.append(std::to_string(frame.ai_history_revision));
+    }
+    // [agent] The Agent tier renders on the AI screen, so its fields must
+    // contribute to the AI screen's signature or the dedup pipeline silently
+    // skips repaints of the picker, the pending bubble and the option bar.
+    if (frame.screen == wqn::UiScreen::kAi &&
+        frame.ai.tier == wqn::AiTier::kAgent) {
+        const wqn::AgentSessionState& agent = frame.agent;
+        signature.append("|agent:");
+        signature.append(std::to_string(static_cast<int>(agent.ui.phase)));
+        signature.push_back('/');
+        signature.append(agent.ui.status_label);
+        signature.push_back('/');
+        signature.append(agent.ui.prompt_text);
+        signature.push_back('/');
+        // [voice-pipe] The live ASR partial is the only content that changes
+        // while a capture is transcribing; without it here the dedup pipeline
+        // would silently skip every partial repaint.
+        signature.append(agent.ui.voice_partial);
+        signature.push_back('/');
+        signature.append(agent.ui.response_text);
+        signature.push_back('/');
+        signature.append(agent.ui.activity_text);
+        signature.push_back('/');
+        signature.append(agent.ui.action_hint);
+        signature.push_back('/');
+        signature.append(std::to_string(agent.ui.scroll_offset_lines));
+        signature.push_back('/');
+        signature.append(agent.ui.requires_confirmation ? "1" : "0");
+        signature.push_back('/');
+        // The permission ask drives a different option bar than the transcript
+        // confirmation, so its identity (not just its phase) must reach the
+        // signature or the bar keeps the previous mode's labels.
+        signature.append(agent.pending_permission_id);
+        signature.push_back('/');
+        // A question's bar carries gateway data (its question id, the projected
+        // option labels), so all three have to reach the signature: the id alone
+        // would keep a re-armed ask's previous labels on screen.
+        signature.append(agent.pending_question_id);
+        signature.push_back('/');
+        signature.append(agent.pending_question_title);
+        signature.push_back('/');
+        for (const wqn::OpenCodeQuestionOption& option : agent.pending_question_options) {
+            signature.push_back('/');
+            signature.append(option.value);
+            signature.push_back(':');
+            signature.append(option.label);
+        }
+        signature.push_back('|');
+        // Option-bar focus: without it the ▣ marker never moves.
+        signature.append(std::to_string(frame.agent_option.focused));
+        signature.push_back('/');
+        signature.append(std::to_string(agent.confirmation_armed_at_ms));
+        signature.push_back('/');
+        signature.append(agent.session_locked ? "1" : "0");
+        signature.push_back('/');
+        // [detail] The status-bar detail-tier glyph is the only visible change
+        // when the user cycles it, so it must reach the signature or layer-1
+        // dedup skips the repaint.
+        signature.append(std::to_string(agent.detail_level));
+        signature.push_back('/');
+        signature.append(std::to_string(agent.selected_session));
+        signature.push_back('/');
+        signature.append(agent.current_session_id);
+        for (const wqn::AgentSessionOption& session : agent.sessions) {
+            signature.push_back('/');
+            signature.append(session.id);
+            signature.push_back(':');
+            signature.append(session.title);
+        }
     }
     if (frame.screen == wqn::UiScreen::kTodo) {
         signature.append("|todo:");
@@ -498,16 +602,19 @@ std::string FrameSignature(const wqn::UiFrame& frame)
         signature.push_back('/');
         signature.append(std::to_string(static_cast<int>(frame.word_app.card_phase)));
         signature.push_back('/');
-        signature.append(std::to_string(static_cast<int>(frame.word_app.card_source)));
-        signature.push_back('/');
-        signature.append(std::to_string(static_cast<int>(frame.word_app.dictionary_stage)));
+        signature.append(std::to_string(static_cast<int>(frame.word_app.commit_state)));
         signature.push_back('/');
         signature.append(std::to_string(static_cast<int>(frame.word_app.home_selection)));
         signature.push_back('/');
+        signature.append(std::to_string(
+            static_cast<int>(frame.word_app.complete_selection)));
+        signature.push_back('/');
         signature.append(
-            frame.word_app.sequential_session_resumable ? "1" : "0");
+            frame.word_app.review_session_resumable ? "1" : "0");
         signature.append(
-            frame.word_app.random_session_resumable ? "1" : "0");
+            frame.word_app.shuffle_session_resumable ? "1" : "0");
+        signature.append(
+            frame.word_app.mistakes_session_resumable ? "1" : "0");
         signature.push_back('/');
         signature.append(std::to_string(frame.word_app.card_position));
         signature.push_back('/');
@@ -515,15 +622,40 @@ std::string FrameSignature(const wqn::UiFrame& frame)
         signature.push_back('/');
         signature.append(std::to_string(frame.word_app.reviewed_today));
         signature.push_back('/');
+        signature.append(std::to_string(frame.word_app.correct_today));
+        signature.push_back('/');
+        signature.append(std::to_string(frame.word_app.total_count));
+        signature.push_back('/');
+        signature.append(frame.word_app.pack_ready ? "1" : "0");
+        signature.push_back('/');
+        signature.append(frame.word_app.has_card ? "1" : "0");
+        signature.push_back('/');
         signature.append(frame.word_app.word);
+        signature.push_back('/');
+        signature.append(frame.word_app.phonetic);
         signature.push_back('/');
         signature.append(frame.word_app.meaning);
         signature.push_back('/');
-        signature.append(frame.word_app.dictionary_prefix);
+        signature.append(frame.word_app.example);
         signature.push_back('/');
-        signature.append(std::to_string(frame.word_app.dictionary_letter_selected));
+        signature.append(frame.word_app.example_translation);
         signature.push_back('/');
-        signature.append(std::to_string(frame.word_app.dictionary_match_selected));
+        signature.append(frame.word_app.part_of_speech);
+        signature.push_back('/');
+        signature.append(frame.word_app.status_line);
+        signature.push_back('/');
+        signature.append(frame.word_app.progress_line);
+        signature.push_back('/');
+        signature.append(frame.word_app.review_complete_empty ? "1" : "0");
+        signature.append(std::to_string(frame.word_app.review_complete_reviewed));
+        signature.push_back('/');
+        signature.append(std::to_string(frame.word_app.review_complete_unknown));
+        signature.push_back('/');
+        signature.append(std::to_string(frame.word_app.review_complete_replayed));
+        signature.push_back('/');
+        signature.append(std::to_string(frame.word_app.sequential_cursor));
+        signature.push_back('/');
+        signature.append(std::to_string(frame.word_app.sequential_total));
         signature.push_back('/');
         signature.append(frame.word_app.hint);
     }
@@ -607,6 +739,8 @@ std::string FrameSignature(const wqn::UiFrame& frame)
             signature.push_back('/');
             signature.append(std::to_string(static_cast<int>(problem.mode)));
             signature.push_back('/');
+            signature.append(problem.set_name);
+            signature.push_back('/');
             signature.append(std::to_string(problem.list_selected));
             signature.push_back('/');
             signature.append(std::to_string(problem.list_window_start));
@@ -623,7 +757,19 @@ std::string FrameSignature(const wqn::UiFrame& frame)
             signature.push_back('/');
             signature.append(std::to_string(static_cast<int>(problem.commit_state)));
             signature.push_back('/');
+            signature.append(std::to_string(problem.outbox_pending_count));
+            signature.push_back(':');
+            signature.append(std::to_string(problem.outbox_suspended_count));
+            signature.push_back('/');
+            signature.append(problem.cloud_sync_failed ? "1" : "0");
+            signature.push_back('/');
             signature.append(problem.problem_id);
+            signature.push_back('/');
+            signature.append(problem.problem_title);
+            signature.push_back('/');
+            signature.append(std::to_string(std::hash<std::string>{}(problem.body_text)));
+            signature.push_back(':');
+            signature.append(std::to_string(std::hash<std::string>{}(problem.answer_text)));
             signature.push_back('/');
             signature.append(std::to_string(problem.position));
             signature.push_back(':');
@@ -631,11 +777,19 @@ std::string FrameSignature(const wqn::UiFrame& frame)
             signature.push_back('/');
             signature.append(std::to_string(problem.image_ordinal));
             signature.push_back(':');
+            signature.append(std::to_string(problem.image_count));
+            signature.push_back(':');
+            signature.append(problem.image_is_solution ? "1" : "0");
+            signature.push_back(':');
             signature.append(problem.image_ready ? "1" : "0");
             signature.push_back(':');
             signature.append(problem.image_error ? "1" : "0");
             signature.push_back(':');
             signature.append(problem.image_id);
+            signature.push_back('/');
+            signature.append(problem.status_line);
+            signature.push_back('/');
+            signature.append(problem.hint);
             for (const wqn::ProblemListRow& row : problem.rows) {
                 signature.push_back('|');
                 signature.append(row.title);
@@ -649,11 +803,23 @@ std::string FrameSignature(const wqn::UiFrame& frame)
         signature.append("|settings:");
         signature.append(std::to_string(frame.settings.selected));
         signature.push_back('/');
+        // Second-level dev list: which list is drawn and which row is selected
+        // are both visible state; leaving them out would dedup the switch into
+        // the dev list and every UP/DOWN inside it.
+        signature.append(std::to_string(static_cast<int>(frame.settings.view)));
+        signature.push_back('/');
+        signature.append(std::to_string(frame.settings.dev_selected));
+        signature.push_back('/');
         signature.append(std::to_string(static_cast<int>(frame.settings.dialog)));
         signature.push_back('/');
         signature.append(std::to_string(frame.settings.auto_sync_selected));
         signature.push_back('/');
         signature.append(std::to_string(frame.settings.auto_sync_interval_min));
+        signature.push_back('/');
+        signature.append(std::to_string(
+            static_cast<int>(frame.settings.image_render_mode)));
+        signature.push_back('/');
+        signature.append(std::to_string(frame.settings.image_render_selected));
         signature.push_back('/');
         signature.append(std::to_string(frame.settings.volume_percent));
         signature.push_back('/');
@@ -665,6 +831,12 @@ std::string FrameSignature(const wqn::UiFrame& frame)
         signature.append(std::to_string(frame.settings.word_deck_selected));
         signature.push_back('/');
         signature.append(frame.settings.default_word_deck_title);
+        signature.push_back('/');
+        // [ai-follow] The new row's value and its dialog cursor are both visible
+        // state; a missing cursor froze the word-deck dialog the same way.
+        signature.append(frame.settings.auto_follow ? "1" : "0");
+        signature.push_back('/');
+        signature.append(std::to_string(frame.settings.ai_follow_selected));
         signature.push_back('/');
         signature.append(frame.settings.sync_status);
         signature.push_back('/');
@@ -685,6 +857,44 @@ std::string FrameSignature(const wqn::UiFrame& frame)
         signature.append(frame.home.wifi_label);
         signature.push_back('/');
         signature.append(WQN_FIRMWARE_VERSION);
+        signature.push_back('/');
+        // [dev-diag] Dev-menu snapshot fields: a parked 60s reload that
+        // changes any of them must invalidate the signature, or the dedup
+        // would swallow the repaint.
+        signature.append(diag.git_commit);
+        signature.push_back('/');
+        signature.append(diag.build_time);
+        signature.push_back('/');
+        signature.append(diag.reset_reason_label);
+        signature.push_back('/');
+        signature.append(diag.uptime_label);
+        signature.push_back('/');
+        signature.append(std::to_string(diag.heap_free));
+        signature.push_back('/');
+        signature.append(std::to_string(diag.heap_min_free));
+        signature.push_back('/');
+        signature.append(diag.sync_diag_summary);
+        signature.push_back('/');
+        for (const std::string& sync_line : diag.sync_diag_lines) {
+            signature.append(sync_line);
+            signature.push_back('|');
+        }
+        signature.push_back('/');
+        signature.append(diag.error_count_label);
+        signature.push_back('/');
+        signature.append(std::to_string(diag.error_line_count));
+        for (const wqn::SettingsErrorLine& error_line : diag.error_lines) {
+            signature.push_back('|');
+            signature.append(error_line.text);
+        }
+        signature.push_back('/');
+        signature.append(diag.sleep_diag_count_label);
+        signature.push_back('/');
+        signature.append(std::to_string(diag.sleep_diag_line_count));
+        for (const wqn::SettingsSleepDiagLine& sleep_line : diag.sleep_diag_lines) {
+            signature.push_back('|');
+            signature.append(sleep_line.text);
+        }
     }
     for (const wqn::UiLine& line : frame.lines) {
         signature.push_back('|');
@@ -872,7 +1082,11 @@ void RequestEpdIdleMaintenance()
     // notify on the false->true transition of the request flag so an in-flight
     // (or repeated) request never re-wakes the task. A skipped maintenance
     // re-arms naturally on the next poll once it is genuinely due.
-    if (!wqn::IsEpdIdleMaintenanceDue()) {
+    // Two predicates, not one: IsEpdIdleMaintenanceDue() goes false for the
+    // rest of the idle period the moment the rail cut succeeds, so the deferred
+    // heavy-partial cleanup (WQN_EPD_IDLE_CLEANUP_MS) has to arm the task on its
+    // own deadline or it would never run after a power-off.
+    if (!wqn::IsEpdIdleMaintenanceDue() && !wqn::IsEpdIdleCleanupDue()) {
         return;
     }
     // Publish order: write the generation payload FIRST, then release the
@@ -892,16 +1106,27 @@ void RequestEpdIdleMaintenance()
 
 // [epd-owner] Runs idle maintenance on the EPD task. Re-validates first: skip
 // if a frame is pending/secondary-queued or activity happened since the
-// request was armed (generation moved). PowerOffEpdAfterIdleIfNeeded owns the
-// heavy-partial cleanup full refresh + rail power-off and takes the frame
-// mutex internally. Wrapped in a scoped TWDT subscription just like the render
+// request was armed (generation moved). PowerOffEpdAfterIdleIfNeeded owns both
+// idle actions -- the rail power-off at WQN_EPD_IDLE_POWER_OFF_MS and the
+// heavy-partial cleanup full refresh at WQN_EPD_IDLE_CLEANUP_MS -- and takes the
+// frame mutex internally; either may fire without the other. Wrapped in a scoped TWDT subscription just like the render
 // window: a wedged cleanup panics after CONFIG_ESP_TASK_WDT_TIMEOUT_S with a
 // backtrace instead of silently hanging the task (display_service feeds the
 // TWDT from its BUSY-wait / row-write loops).
 void RunIdleMaintenanceIfStillValid()
 {
-    if (wqn::GetEpdActivityGeneration() !=
-        g_idle_maintenance_activity_generation.load(std::memory_order_relaxed)) {
+    const uint32_t armed_generation =
+        g_idle_maintenance_activity_generation.load(std::memory_order_relaxed);
+    const uint32_t current_generation = wqn::GetEpdActivityGeneration();
+    if (current_generation != armed_generation) {
+        // Activity landed between arming the request and running it. This was
+        // silent: with the cleanup moved onto its own deadline, "owed but
+        // cancelled" became indistinguishable from "nothing owed".
+        ESP_LOGI(
+            kTag,
+            "EPD idle maintenance skipped: activity since arm (generation %u -> %u)",
+            static_cast<unsigned>(armed_generation),
+            static_cast<unsigned>(current_generation));
         return;
     }
     {
@@ -910,6 +1135,7 @@ void RunIdleMaintenanceIfStillValid()
             g_refresh_pending || g_refresh_busy || g_secondary.pending;
         xSemaphoreGive(g_refresh_mutex);
         if (busy_or_pending) {
+            ESP_LOGI(kTag, "EPD idle maintenance skipped: frame pending or in flight");
             return;
         }
     }
