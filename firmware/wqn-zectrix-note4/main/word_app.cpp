@@ -1287,11 +1287,6 @@ void ResetWordSessionsInMemory(WordAppState* state)
 
 void ApplyWordPackIndex(WordAppState* state, WordPackIndex index, const std::string& message)
 {
-    // [pack-read-cache] A fresh index means the pack set may have changed (a
-    // sync just ran). Drop the cached card-read handle now instead of waiting
-    // for the epoch check on the next read, so the SPIFFS fd slot goes back
-    // immediately. Single reader (wqn_ui), so closing here is race-free.
-    wqn::CloseWordPackReadCache();
     if (state == nullptr) {
         return;
     }

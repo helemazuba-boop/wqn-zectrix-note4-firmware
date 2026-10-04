@@ -110,10 +110,5 @@ esp_err_t DownloadWordPackToStorage(
     const WqnWordPackManifestItem& item);
 bool WordPackNeedsDownload(const WqnWordPackManifestItem& item);
 esp_err_t ReadWordPackEntry(const WordPackIndexEntry& index_entry, WqnWordEntry* entry);
-// [pack-read-cache] Drops the cached card-read handle. The epoch already makes a
-// stale handle harmless (it is re-opened on the next read); this returns the
-// SPIFFS fd slot immediately for callers that KNOW the pack content changed or
-// that the reader is going away. Single-reader: wqn_ui only.
-void CloseWordPackReadCache();
 
 }  // namespace wqn
