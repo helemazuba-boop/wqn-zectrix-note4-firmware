@@ -102,7 +102,12 @@ esp_err_t SaveDeviceControlState(const DeviceControlState& state);
 // Durable coordinator checkpoint. The file is committed through a
 // temp/backup/rename sequence and is safe to replay after a power cut.
 esp_err_t LoadSyncJournal(SyncJournal* journal);
-esp_err_t SaveSyncJournal(const SyncJournal& journal);
+// [storage-single-writer] Dispatches the commit to the StorageService task so
+// the journal's rename sequence can never interleave with a pack or NVS write
+// from another task. The kStorage lease is held by the caller across the queue
+// wait, so the write is never refused by a quiesce it should have blocked.
+// The raw entry point is file-local on purpose.
+esp_err_t SaveSyncJournalThroughStorageService(const SyncJournal& journal);
 
 esp_err_t SaveAiSessionForDay(const CachedAiSession& session);
 esp_err_t LoadAiSessionForDay(const std::string& day, CachedAiSession* session);

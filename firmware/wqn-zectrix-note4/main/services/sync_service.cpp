@@ -665,7 +665,7 @@ esp_err_t PersistLatestSyncJournal()
     taskENTER_CRITICAL(&g_sync_snapshot_lock);
     snapshot = g_sync_journal;
     taskEXIT_CRITICAL(&g_sync_snapshot_lock);
-    const esp_err_t result = wqn::SaveSyncJournal(snapshot);
+    const esp_err_t result = wqn::SaveSyncJournalThroughStorageService(snapshot);
     xSemaphoreGive(g_sync_journal_mutex);
     return result;
 }

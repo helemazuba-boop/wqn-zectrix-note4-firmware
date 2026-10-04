@@ -1142,14 +1142,17 @@ esp_err_t LoadSyncJournal(SyncJournal* journal)
         : primary_result;
 }
 
-esp_err_t SaveSyncJournal(const SyncJournal& journal)
+namespace {
+// [storage-single-writer] File-local on purpose: the only supported entry point
+// is SaveSyncJournalThroughStorageService below, so no other task can
+// reintroduce a raw SPIFFS commit outside StorageService. No StorageWriteGuard
+// here on purpose -- the caller's lease already spans the queue wait and this
+// body runs after it was granted, so the commit cannot be refused by a quiesce
+// that started in between. Mirrors SaveDeviceControlState/SaveDeviceControlStateRaw.
+esp_err_t SaveSyncJournalRaw(const SyncJournal& journal)
 {
     if (journal.schema_version != 2) {
         return ESP_ERR_INVALID_ARG;
-    }
-    StorageWriteGuard write("save-sync-journal", __FILE__, __LINE__);
-    if (!write) {
-        return ESP_ERR_INVALID_STATE;
     }
     cJSON* root = cJSON_CreateObject();
     if (root == nullptr) {
@@ -1178,6 +1181,35 @@ esp_err_t SaveSyncJournal(const SyncJournal& journal)
         return render_result;
     }
     return WriteSyncJournalFileAtomic(payload);
+}
+
+esp_err_t SaveSyncJournalTransaction(void* opaque)
+{
+    return SaveSyncJournalRaw(*static_cast<const SyncJournal*>(opaque));
+}
+}  // namespace
+
+esp_err_t SaveSyncJournalThroughStorageService(const SyncJournal& journal)
+{
+    // [storage-single-writer] The kStorage lease is taken HERE, on the caller,
+    // so it spans the queue wait. A lease acquired only inside the transaction
+    // would leave this write invisible to sleep admission while it sits queued:
+    // TryBeginSleepQuiesce could then start and the transaction's own guard
+    // would be refused by the very quiesce this write should have blocked.
+    // The caller blocks on the completion semaphore for the whole transaction
+    // (background = portMAX_DELAY, no abandon branch), so this one lease covers
+    // the queue wait AND the rename sequence.
+    StorageWriteGuard write("save-sync-journal", __FILE__, __LINE__);
+    if (!write) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    // Background queue with an unbounded wait: no journal writer owns a UI
+    // thread, and a foreground budget could abandon the command while it is
+    // still queued and report a marker as failed that will in fact be written.
+    return services::ExecuteStorageTransactionNamed(
+        SaveSyncJournalTransaction,
+        const_cast<SyncJournal*>(&journal),
+        "save-sync-journal");
 }
 
 esp_err_t SaveAiSessionForDay(const CachedAiSession& session)
