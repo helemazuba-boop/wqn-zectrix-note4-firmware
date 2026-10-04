@@ -54,6 +54,31 @@ enum class PersistKind : uint8_t {
     kCount,
 };
 
+// [worker-domain-gate] Coarser gate over PersistKind. Two kinds in the same
+// domain mutate the SAME durable session snapshot, so letting them overlap
+// re-opens the lost-update window the persist worker exists to close: the
+// per-kind busy flag alone allows kWordObservation and a future word session
+// reset to run concurrently, and whichever writes second silently rolls the
+// other back. Settings collapses to one domain on purpose -- the settings UI
+// only ever arms one dialog at a time, so the domain gate is a no-op there and
+// costs nothing.
+enum class PersistDomain : uint8_t {
+    kWord = 0,
+    kNote,
+    kProblem,
+    kSettings,
+    kCount,
+};
+
+// Which domain a kind belongs to. Public so the UI layer can ask "is this domain
+// busy" without learning the kind list. kCount is rejected by ValidKind before
+// this is reached.
+PersistDomain DomainForKind(PersistKind kind);
+
+// True while any kind in this domain is in flight. The per-kind flag is the
+// narrow question; this is the one the UI's gates should ask.
+bool IsPersistDomainBusy(PersistDomain domain);
+
 // Handle to a reserved pool slot that already holds the per-kind busy gate and
 // a storage SleepLease. Invalid when reservation failed.
 struct PersistTicket {

@@ -783,6 +783,15 @@ void DeviceUiTask(void*)
                 // domain busy (xxx_cloud_completed stays false, so no Finish);
                 // the persist result is applied+acked just below this scan, so
                 // next iteration this result merges onto the advanced session.
+                //
+                // [worker-domain-gate] This is now the THIRD line of defense on
+                // this ordering, not the only one. The persist worker refuses a
+                // second command in the same domain, so a session-writing kind
+                // can no longer even reserve while the observation is in flight;
+                // and the candidate-page apply stamps the snapshot it was queued
+                // with and merges instead of installing when the session moved.
+                // Keep it: it is what makes the ordering visible in one place,
+                // and the merge path logs when it fires.
                 if ((result_domain == device_ui_internal::CloudDomain::kWord ||
                      result_domain == device_ui_internal::CloudDomain::kWordBulk) &&
                     word_commit_pending) {

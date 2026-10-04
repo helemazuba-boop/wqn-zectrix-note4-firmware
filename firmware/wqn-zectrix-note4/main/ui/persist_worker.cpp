@@ -79,6 +79,14 @@ std::atomic<uint32_t> g_next_operation_id{1};
 // at worker finish). One in-flight per kind + duplicate-Confirm guard.
 std::atomic<bool> g_kind_busy[static_cast<size_t>(PersistKind::kCount)];
 
+// [worker-domain-gate] Per-domain busy, strictly coarser than per-kind. The
+// reservation takes the kind first and the domain second, releasing the kind
+// again when the domain is taken -- so the two are only ever held together.
+// Because the domain gate admits at most one kind per domain, releasing the
+// domain alongside its kind is exact: there is never a second kind in that
+// domain still relying on it.
+std::atomic<bool> g_domain_busy[static_cast<size_t>(PersistDomain::kCount)];
+
 // Per-kind ACK mailbox. result/operation_id/slot are written before
 // pending_generation (release) and read after it (acquire); the busy gate keeps
 // one in-flight per kind, so the single slot is race-free behind that fence.
@@ -108,17 +116,38 @@ uint32_t NextOperationId()
     return id;
 }
 
-// Reserve the per-kind busy gate (one in-flight per kind). False if already busy.
+// [worker-domain-gate] Reserve the per-kind gate AND the per-domain gate. The
+// kind CAS comes first so the common single-kind case is unchanged; the domain
+// CAS is what rejects a second command that would mutate the same session
+// snapshot. On a domain rejection the kind is released immediately, so the
+// caller sees exactly the same "busy, retry later" answer it always did.
 bool ReserveKind(PersistKind kind)
 {
     bool expected = false;
-    return g_kind_busy[KindIndex(kind)].compare_exchange_strong(
-        expected, true, std::memory_order_acq_rel, std::memory_order_acquire);
+    if (!g_kind_busy[KindIndex(kind)].compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        return false;
+    }
+    const PersistDomain domain = DomainForKind(kind);
+    if (domain != PersistDomain::kCount) {
+        bool domain_expected = false;
+        if (!g_domain_busy[static_cast<size_t>(domain)].compare_exchange_strong(
+                domain_expected, true, std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+            g_kind_busy[KindIndex(kind)].store(false, std::memory_order_release);
+            return false;
+        }
+    }
+    return true;
 }
 
 void ReleaseKind(PersistKind kind)
 {
     g_kind_busy[KindIndex(kind)].store(false, std::memory_order_release);
+    const PersistDomain domain = DomainForKind(kind);
+    if (domain != PersistDomain::kCount) {
+        g_domain_busy[static_cast<size_t>(domain)].store(false, std::memory_order_release);
+    }
 }
 
 // Acquire a Free slot and move it to Filling. UI task only. Null when full.
@@ -603,6 +632,36 @@ bool IsAnyPersistBusy()
         }
     }
     return false;
+}
+
+PersistDomain DomainForKind(PersistKind kind)
+{
+    switch (kind) {
+        case PersistKind::kWordObservation:
+            return PersistDomain::kWord;
+        case PersistKind::kNoteObservation:
+            return PersistDomain::kNote;
+        case PersistKind::kProblemVerdict:
+            return PersistDomain::kProblem;
+        case PersistKind::kSettingsAutoSync:
+        case PersistKind::kSettingsImageRender:
+        case PersistKind::kSettingsVolume:
+        case PersistKind::kSettingsDefaultDeck:
+        case PersistKind::kSettingsAiFollow:
+        case PersistKind::kSettingsAgentDetail:
+            return PersistDomain::kSettings;
+        case PersistKind::kCount:
+            break;
+    }
+    return PersistDomain::kCount;
+}
+
+bool IsPersistDomainBusy(PersistDomain domain)
+{
+    if (domain == PersistDomain::kCount) {
+        return false;
+    }
+    return g_domain_busy[static_cast<size_t>(domain)].load(std::memory_order_acquire);
 }
 
 }  // namespace device_ui_internal
