@@ -228,6 +228,9 @@ esp_err_t ExecutePersistCommand(PersistCommand& command)
             // Recoverable marker protocol; one foreground storage transaction
             // (marker -> session clears -> deck+generation -> marker clear).
             return wqn::ChangeDefaultWordDeckForeground(command.settings_str);
+        case PersistKind::kWordSessionReset:
+            // Generation-first scope reset; one foreground storage transaction.
+            return wqn::ResetWordSessionScope();
         case PersistKind::kSettingsAiFollow:
             return wqn::SaveAiAutoFollowForeground(command.settings_int != 0);
         case PersistKind::kSettingsAgentDetail:
@@ -534,6 +537,21 @@ uint32_t SubmitAgentDetailLevelSave(uint8_t level)
     return ticket.operation_id;
 }
 
+uint32_t SubmitWordSessionReset(const std::string& deck_id)
+{
+    if (deck_id.empty() || deck_id.size() != 36) {
+        return 0;
+    }
+    PersistTicket ticket = TryReservePersist(PersistKind::kWordSessionReset);
+    if (!ticket.valid()) {
+        return 0;
+    }
+    PersistCommand& command = g_pool[ticket.slot_index];
+    command.settings_str = deck_id;
+    EnqueueReserved(command, ticket.slot_index, ticket.kind);
+    return ticket.operation_id;
+}
+
 uint32_t SubmitDefaultDeckChange(const std::string& deck_id)
 {
     if (!deck_id.empty() && deck_id.size() != 36) {
@@ -638,6 +656,7 @@ PersistDomain DomainForKind(PersistKind kind)
 {
     switch (kind) {
         case PersistKind::kWordObservation:
+        case PersistKind::kWordSessionReset:
             return PersistDomain::kWord;
         case PersistKind::kNoteObservation:
             return PersistDomain::kNote;

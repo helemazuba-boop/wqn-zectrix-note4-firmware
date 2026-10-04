@@ -498,6 +498,56 @@ UiUpdate UiRuntime::DispatchAutoSyncSaveResult(esp_err_t result, uint32_t operat
     return FinishEvent(AppEventKind::kSettingsPersist, refresh, true);
 }
 
+UiUpdate UiRuntime::DispatchWordSessionResetResult(
+    esp_err_t result, uint32_t operation_id)
+{
+    wqn::WordAppState& word_app = state_.word_app;
+    if (word_app.scope_reset_save_op_id == 0 ||
+        word_app.scope_reset_save_op_id != operation_id) {
+        ESP_LOGW(kTag, "stale word scope reset result: op=%lu expected=%lu",
+                 static_cast<unsigned long>(operation_id),
+                 static_cast<unsigned long>(word_app.scope_reset_save_op_id));
+        return FinishEvent(AppEventKind::kWordObservationPersist, RefreshSchedule::kNone, false);
+    }
+    word_app.scope_reset_save_op_id = 0;
+    if (result == ESP_OK) {
+        // Durable state is committed (new scope generation, four session files
+        // and the walk cursor gone). NOW install the in-memory half and switch
+        // screens -- the reset never blocked the UI task.
+        // The pending deck is only installed when the user is still on the note
+        // screen waiting for it (the [词] row switches screens on success). The
+        // leave-word-page tail clears the override immediately and submits with
+        // an empty pending deck, so an ACK landing later must not re-install a
+        // scope the user already left, nor yank them back to the word page.
+        const bool switching_screens = !word_app.scope_reset_pending_deck_id.empty();
+        if (switching_screens) {
+            word_app.scoped_deck_id = word_app.scope_reset_pending_deck_id;
+            word_app.scoped_deck_title = word_app.scope_reset_pending_deck_title;
+            state_.screen = wqn::UiScreen::kWord;
+        }
+        wqn::ResetWordSessionsInMemory(&word_app);
+        word_app.scope_reset_pending_deck_id.clear();
+        word_app.scope_reset_pending_deck_title.clear();
+        word_app.scope_reset_pending_valid = false;
+        state_.note_app.message = "词库范围已切换";
+        ESP_LOGI(kTag, "word scope reset committed: switching=%s deck=%s",
+                 switching_screens ? "yes" : "no",
+                 word_app.scoped_deck_id.empty() ? "all"
+                                                 : word_app.scoped_deck_id.c_str());
+    } else {
+        // Keep the old scope AND the armed pending pair so the user can retry
+        // without re-picking the deck. If the transaction died mid-way the new
+        // scope generation is already committed, so every old session file is
+        // inert and boot cannot resume a half-switched scope.
+        state_.note_app.message = "词库切换未保存，请重试";
+        ESP_LOGW(kTag, "word scope reset failed: %s", esp_err_to_name(result));
+    }
+    const RefreshSchedule refresh = state_.screen == wqn::UiScreen::kWord
+        ? RefreshSchedule::kConfig
+        : RefreshSchedule::kNone;
+    return FinishEvent(AppEventKind::kWordObservationPersist, refresh, true);
+}
+
 UiUpdate UiRuntime::DispatchVolumeSaveResult(esp_err_t result, uint32_t operation_id)
 {
     wqn::SettingsAppState& settings = state_.settings;

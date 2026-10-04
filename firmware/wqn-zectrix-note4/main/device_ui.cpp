@@ -935,6 +935,26 @@ void DeviceUiTask(void*)
             }
         }
 
+        // [persist-worker] Drain the word-page scope-switch result (C6b). The
+        // durable half -- new scope generation, four session clears, walk cursor
+        // -- already ran on the worker; this installs the in-memory half and
+        // switches screens, so the scope switch never blocked the UI task.
+        {
+            device_ui_internal::PersistResultReceipt scope_reset;
+            if (device_ui_internal::TakePersistResultToApply(
+                    device_ui_internal::PersistKind::kWordSessionReset,
+                    &scope_reset)) {
+                const device_ui_internal::UiUpdate persist_update =
+                    ui_runtime.DispatchWordSessionResetResult(
+                        scope_reset.result, scope_reset.operation_id);
+                refresh_schedule =
+                    StrongerSchedule(refresh_schedule, persist_update.refresh);
+                device_ui_internal::AckPersistResult(
+                    device_ui_internal::PersistKind::kWordSessionReset,
+                    scope_reset.generation, scope_reset.operation_id);
+            }
+        }
+
         // [persist-worker] Drain the note observation commit result (moved off
         // the cloud lane in c3). Apply on the UI task and ack with
         // generation+op_id; the dispatch returns kNone on success (invisible

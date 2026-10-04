@@ -51,6 +51,10 @@ enum class PersistKind : uint8_t {
     kSettingsDefaultDeck,
     kSettingsAiFollow,
     kSettingsAgentDetail,
+    // [word-scope-reset] Word-page scope switch that does not change the
+    // default deck. One foreground transaction: commit the new scope
+    // generation, then the four session clears and the walk cursor.
+    kWordSessionReset,
     kCount,
 };
 
@@ -138,6 +142,10 @@ uint32_t SubmitAgentDetailLevelSave(uint8_t level);
 // (ChangeDefaultWordDeckForeground) on the worker. deck_id empty = all decks.
 // The UI installs the new deck ONLY after the durable ACK.
 uint32_t SubmitDefaultDeckChange(const std::string& deck_id);
+// [word-scope-reset] Scope switch without a deck change. The durable half runs
+// on the worker; the UI arms the scope and installs it only on the durable ACK,
+// so the scope switch never blocks the UI task on storage.
+uint32_t SubmitWordSessionReset(const std::string& deck_id);
 
 // --- Consumer side (UI task). ---
 // True when an unapplied terminal result is waiting for `kind`; copies it out.

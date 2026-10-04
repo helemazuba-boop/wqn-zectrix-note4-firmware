@@ -188,6 +188,16 @@ struct WordAppState {
     std::string default_deck_title;
     std::string scoped_deck_id;
     std::string scoped_deck_title;
+    // [word-scope-reset] In-flight scope switch. The durable half (new scope
+    // generation, four session clears, walk cursor) runs on the persist worker;
+    // nothing is installed optimistically -- the scope, the screen switch and
+    // the in-memory reset all wait for the durable ACK, mirroring the
+    // default-deck switch's pending pair. On failure the pending pair stays
+    // armed so a retry re-scopes without re-picking the deck.
+    std::string scope_reset_pending_deck_id;
+    std::string scope_reset_pending_deck_title;
+    bool scope_reset_pending_valid = false;
+    uint32_t scope_reset_save_op_id = 0;
     std::vector<WordDeckInfo> deck_catalog;
 };
 
@@ -266,6 +276,10 @@ void SetDefaultWordDeck(
 // scope, so resuming it would keep studying the previous deck set. Returns
 // to the word home; clear_persisted also drops the durable session records.
 void ResetWordSessionsForScopeChange(WordAppState* state, bool clear_persisted);
+// [word-scope-reset] In-memory half only: drops the session/review/chain state
+// and switches the card phase. The durable half is the worker's
+// kWordSessionReset transaction, and this must not run before its ACK.
+void ResetWordSessionsInMemory(WordAppState* state);
 bool TakeWordSessionStartRequest(
     WordAppState* state,
     protocol::word_study_v1::CreateSessionRequest* request);

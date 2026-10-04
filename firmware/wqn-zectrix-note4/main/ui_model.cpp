@@ -6,6 +6,7 @@
 #include "ai_session.h"
 #include "display_service.h"
 #include "flash_session.h"
+#include "ui/persist_worker.h"
 #include "provision_manager.h"
 
 namespace {
@@ -506,27 +507,33 @@ void HandleUiInput(UiState* state, UiInput input)
                 // switches screens; the word page's own UI takes over.
                 std::string requested_deck_id;
                 if (TakeNoteWordDeckOpenRequest(&state->note_app, &requested_deck_id)) {
-                    if (state->word_app.session.commit_state ==
-                        wqn::WordObservationCommitState::kPersisting) {
-                        // A previous word answer is still persisting; scoping now
-                        // runs ResetWordSessionsForScopeChange synchronously and
-                        // would queue behind the in-flight persist transaction.
-                        // Consume the request (so it does not re-fire) and ask
-                        // the user to retry after the save completes.
-                        state->note_app.message = "正在保存，请稍后";
-                    } else {
-                        state->word_app.scoped_deck_id = requested_deck_id;
-                        state->word_app.scoped_deck_title.clear();
-                        for (const WordDeckInfo& deck : state->word_app.deck_catalog) {
-                            if (deck.deck_id == requested_deck_id) {
-                                state->word_app.scoped_deck_title = deck.title;
-                                break;
-                            }
+                    // [word-scope-reset] Arm + submit; nothing is installed until
+                    // the durable ACK (DispatchWordSessionResetResult), so a scope
+                    // switch never blocks the UI task on the reset transaction.
+                    // The pending pair stays armed on a submit reject or a write
+                    // failure, exactly like the default-deck switch, so the user
+                    // re-picks the row and retries.
+                    std::string requested_deck_title;
+                    for (const WordDeckInfo& deck : state->word_app.deck_catalog) {
+                        if (deck.deck_id == requested_deck_id) {
+                            requested_deck_title = deck.title;
+                            break;
                         }
-                        // The restored session is pinned to the previous scope;
-                        // starting the deck study must not resume it.
-                        ResetWordSessionsForScopeChange(&state->word_app, true);
-                        state->screen = UiScreen::kWord;
+                    }
+                    state->word_app.scope_reset_pending_deck_id = requested_deck_id;
+                    state->word_app.scope_reset_pending_deck_title = requested_deck_title;
+                    const uint32_t op_id = device_ui_internal::SubmitWordSessionReset(requested_deck_id);
+                    if (op_id != 0) {
+                        state->word_app.scope_reset_pending_valid = true;
+                        state->word_app.scope_reset_save_op_id = op_id;
+                        state->note_app.message = "正在切换词库…";
+                    } else {
+                        state->word_app.scope_reset_save_op_id = 0;
+                        state->note_app.message =
+                            device_ui_internal::IsPersistDomainBusy(
+                                device_ui_internal::PersistDomain::kWord)
+                                ? "正在保存，请稍后"
+                                : "切换繁忙，请重试";
                     }
                 }
                 break;
@@ -629,13 +636,31 @@ void HandleUiInput(UiState* state, UiInput input)
     if (screen_before == wqn::UiScreen::kWord &&
         state->screen != wqn::UiScreen::kWord &&
         !state->word_app.scoped_deck_id.empty()) {
-        // The kTopPrevious/kTopNext guards block leaving a scoped word page
-        // while a commit is persisting, so this cleanup only runs once the
-        // session is safe to drop -- there is no in-flight persist transaction
-        // for the synchronous clears to queue behind.
+        // [word-scope-reset] Leaving the scoped word page drops the scope
+        // override and the sessions with it. Same arm+submit shape as the [词]
+        // row above: the durable half runs on the worker, so leaving a word page
+        // never blocks the UI task on the reset transaction. The in-memory half
+        // is applied by the ACK dispatch -- but the scope must clear NOW,
+        // because the user is already on another screen and the next direct
+        // word entry must study the default deck, not the override they left.
+        //
+        // The kTopPrevious/kTopNext guards already block leaving a scoped word
+        // page while a commit is persisting, so there is no in-flight persist
+        // transaction for this to queue behind.
+        const std::string leaving_deck_id = state->word_app.scoped_deck_id;
         state->word_app.scoped_deck_id.clear();
         state->word_app.scoped_deck_title.clear();
-        ResetWordSessionsForScopeChange(&state->word_app, true);
+        const uint32_t op_id = device_ui_internal::SubmitWordSessionReset(leaving_deck_id);
+        if (op_id != 0) {
+            state->word_app.scope_reset_pending_deck_id = leaving_deck_id;
+            state->word_app.scope_reset_pending_deck_title.clear();
+            state->word_app.scope_reset_pending_valid = true;
+            state->word_app.scope_reset_save_op_id = op_id;
+        }
+        // A submit reject is tolerable here: the scope override is already gone
+        // in memory, the durable reset will be retried by the next scope change,
+        // and the sessions it failed to drop are inert the moment any later
+        // reset commits a generation.
     }
 #if CONFIG_WQN_AI_ENABLE
     // Leaving the AI screen while in Flash tier must tear down the WebSocket

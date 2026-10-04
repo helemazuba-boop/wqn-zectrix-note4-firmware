@@ -1265,6 +1265,15 @@ void ResetWordSessionsForScopeChange(WordAppState* state, bool clear_persisted)
         // walk cursor is the only piece that one does not reset.
         ESP_ERROR_CHECK_WITHOUT_ABORT(SaveWordSequentialCursor(0));
     }
+    ResetWordSessionsInMemory(state);
+    state->message = "词库范围已切换";
+}
+
+void ResetWordSessionsInMemory(WordAppState* state)
+{
+    if (state == nullptr) {
+        return;
+    }
     state->session = WordSessionState{};
     state->review = WordReviewRuntime{};
     state->chain = WordSessionChain{};
@@ -1274,7 +1283,6 @@ void ResetWordSessionsForScopeChange(WordAppState* state, bool clear_persisted)
     state->card_phase = WordCardPhase::kFront;
     state->current_word = WqnWordEntry{};
     state->mode = WordAppMode::kHome;
-    state->message = "词库范围已切换";
 }
 
 void ApplyWordPackIndex(WordAppState* state, WordPackIndex index, const std::string& message)

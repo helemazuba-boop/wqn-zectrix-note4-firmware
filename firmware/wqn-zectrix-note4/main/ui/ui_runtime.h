@@ -176,6 +176,8 @@ public:
     // inside the worker's marker transaction) and rebuilds the [词] rows;
     // failure keeps the displayed deck and the armed pending pair for retry.
     UiUpdate DispatchDefaultDeckChangeResult(esp_err_t result, uint32_t operation_id);
+    // [word-scope-reset] Applies the durable ACK of a word-page scope switch.
+    UiUpdate DispatchWordSessionResetResult(esp_err_t result, uint32_t operation_id);
     // [ai-follow] Durable follow-toggle result (c4 shape). Success installs the
     // armed choice, pushes it to the worker (SetAiAutoFollow, the only bridge to
     // the copy the follow step reads) and relabels the row; a failure keeps the
