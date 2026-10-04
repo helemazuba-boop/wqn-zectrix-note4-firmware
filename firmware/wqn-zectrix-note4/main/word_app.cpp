@@ -1505,9 +1505,11 @@ void ResetWordSessionForServerInvalid(WordAppState* state)
 bool TakeWordCandidatePageRequest(
     WordAppState* state,
     protocol::word_study_v1::CandidatePageRequest* request,
+    PersistedWordSession* snapshot,
     std::string* session_id)
 {
-    if (state == nullptr || request == nullptr || session_id == nullptr ||
+    if (state == nullptr || request == nullptr || snapshot == nullptr ||
+        session_id == nullptr ||
         !state->session.page_requested || state->session.page_in_flight ||
         !state->session.persisted.active ||
         state->session.persisted.paused ||
@@ -1518,6 +1520,10 @@ bool TakeWordCandidatePageRequest(
     request->cursor = state->session.persisted.remote.cursor;
     request->limit = static_cast<int>(
         protocol::word_study_v1::kCandidatePrefetchPageSize);
+    // [ui-gates] Snapshot as of this take: the runner persists THIS one, so it
+    // must be the state the page was asked for, not whatever the user has
+    // advanced to by the time the page comes back.
+    *snapshot = state->session.persisted;
     *session_id = state->session.persisted.remote.session_id;
     state->session.page_requested = false;
     state->session.page_in_flight = true;
@@ -1535,15 +1541,36 @@ void RestoreWordCandidatePageRequest(WordAppState* state)
     }
 }
 
+// [ui-gates] The runner's extend/persist outcomes transport the UI messages the
+// old inline apply produced; keeping them in one place stops the two paths from
+// drifting apart in wording.
+const char* WordPageExtendMessage(esp_err_t compact_result)
+{
+    switch (compact_result) {
+        case ESP_ERR_INVALID_RESPONSE:
+            return "后续单词快照不一致";
+        case ESP_ERR_INVALID_STATE:
+            return "会话游标损坏";
+        case ESP_ERR_INVALID_SIZE:
+            return "候选窗口超限";
+        case ESP_ERR_INVALID_ARG:
+            return "候选页顺序无效";
+        default:
+            return "后续单词已就绪";
+    }
+}
+
 void ApplyWordCandidatePageResult(
     WordAppState* state,
     esp_err_t result,
+    esp_err_t compact_result,
+    esp_err_t persist_result,
+    const PersistedWordSession& runner_snapshot,
     protocol::word_study_v1::CandidatePageData page)
 {
     if (state == nullptr) return;
     state->session.page_in_flight = false;
     auto& persisted = state->session.persisted;
-    auto& remote = persisted.remote;
     if (!persisted.active || persisted.paused) {
         // The user left or paused while this bounded prefetch was in flight.
         // Its result belongs to the old interaction context and must not
@@ -1555,54 +1582,38 @@ void ApplyWordCandidatePageResult(
         state->message = "后续单词加载失败，继续时重试";
         return;
     }
-    if (page.session_id != remote.session_id || page.ordering != remote.ordering ||
-        page.candidate_policy_version !=
-            protocol::word_study_v1::CandidatePolicyVersionName(remote.ordering) ||
-        page.seed != remote.seed || page.progress_revision != remote.progress_revision ||
-        page.cursor != remote.cursor || !SnapshotMatches(remote, page)) {
-        state->message = "后续单词快照不一致";
-        return;
-    }
-
-    if (persisted.position > remote.items.size()) {
-        state->message = "会话游标损坏";
-        return;
-    }
-    PersistedWordSession updated = persisted;
-    auto& updated_remote = updated.remote;
-    if (updated.position > 0) {
-        updated_remote.items.erase(
-            updated_remote.items.begin(),
-            updated_remote.items.begin() + updated.position);
-        updated.position = 0;
-    }
-    if (updated_remote.items.size() + page.items.size() >
-        protocol::word_study_v1::kCandidateWindowSize) {
-        state->message = "候选窗口超限";
-        return;
-    }
-    uint64_t expected_ordinal = updated_remote.items.empty()
-        ? (page.items.empty() ? 0 : page.items.front().ordinal)
-        : updated_remote.items.back().ordinal + 1;
-    for (const auto& source : page.items) {
-        if (source.ordinal != expected_ordinal || source.item_id.size() != 36 ||
-            source.deck_id.size() != 36) {
-            state->message = "候选页顺序无效";
+    // [ui-gates] The runner extended and persisted the snapshot the page was
+    // QUEUED with. If the session has advanced since -- the user answered while
+    // the page was in flight -- that snapshot is stale: installing it would roll
+    // the position back, and the durable state is already ahead because the
+    // observation commit persisted the advanced session. Keep the in-memory
+    // state and merge the page into it here; the next commit re-persists.
+    const bool runner_snapshot_current =
+        persisted.remote.session_id == runner_snapshot.remote.session_id &&
+        persisted.position == runner_snapshot.position;
+    PersistedWordSession updated;
+    if (runner_snapshot_current) {
+        if (compact_result != ESP_OK) {
+            state->message = WordPageExtendMessage(compact_result);
             return;
         }
-        StoredWordSessionItem item;
-        std::snprintf(item.item_id, sizeof(item.item_id), "%s", source.item_id.c_str());
-        std::snprintf(item.deck_id, sizeof(item.deck_id), "%s", source.deck_id.c_str());
-        item.ordinal = source.ordinal;
-        updated_remote.items.push_back(item);
-        ++expected_ordinal;
-    }
-    updated_remote.cursor = page.next_cursor;
-    updated_remote.has_more = page.has_more;
-    result = SavePersistedWordSession(updated);
-    if (result != ESP_OK) {
-        state->message = "后续单词未保存";
-        return;
+        if (persist_result != ESP_OK) {
+            state->message = "后续单词未保存";
+            return;
+        }
+        updated = runner_snapshot;
+    } else {
+        const esp_err_t merge_result = wqn::ExtendPersistedWordSessionWithPage(
+            persisted, page, &updated);
+        if (merge_result != ESP_OK) {
+            state->message = WordPageExtendMessage(merge_result);
+            return;
+        }
+        ESP_LOGI(
+            kTag,
+            "candidate page merged over an advanced session: position=%lu runner=%lu",
+            static_cast<unsigned long>(persisted.position),
+            static_cast<unsigned long>(runner_snapshot.position));
     }
     persisted = std::move(updated);
     PruneSessionOrdinals(state);

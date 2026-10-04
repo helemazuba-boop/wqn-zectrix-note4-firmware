@@ -286,11 +286,18 @@ void ResetWordSessionForServerInvalid(WordAppState* state);
 bool TakeWordCandidatePageRequest(
     WordAppState* state,
     protocol::word_study_v1::CandidatePageRequest* request,
+    PersistedWordSession* snapshot,
     std::string* session_id);
 void RestoreWordCandidatePageRequest(WordAppState* state);
+// [ui-gates] `runner_snapshot` is the snapshot the runner extended and
+// persisted; when the in-memory session has advanced past it the page is merged
+// in memory instead and nothing is written here.
 void ApplyWordCandidatePageResult(
     WordAppState* state,
     esp_err_t result,
+    esp_err_t compact_result,
+    esp_err_t persist_result,
+    const PersistedWordSession& runner_snapshot,
     protocol::word_study_v1::CandidatePageData page);
 bool TakeWordObservationEffect(
     WordAppState* state,

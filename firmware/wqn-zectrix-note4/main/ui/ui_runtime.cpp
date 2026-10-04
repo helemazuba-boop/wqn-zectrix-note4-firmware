@@ -161,10 +161,11 @@ UiUpdate UiRuntime::DispatchWordCloudResult(WordCloudResult& result)
 
 bool UiRuntime::TakeWordCandidatePageRequest(
     wqn::protocol::word_study_v1::CandidatePageRequest* request,
+    wqn::PersistedWordSession* snapshot,
     std::string* session_id)
 {
     return wqn::TakeWordCandidatePageRequest(
-        &state_.word_app, request, session_id);
+        &state_.word_app, request, snapshot, session_id);
 }
 
 void UiRuntime::RestoreWordCandidatePageRequest()

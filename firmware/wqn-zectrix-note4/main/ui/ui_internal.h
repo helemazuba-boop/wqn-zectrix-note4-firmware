@@ -186,6 +186,12 @@ struct WordCloudRequest {
     // -- but without carrying the id the device's deck choice silently never
     // reached the server at all. Mirrors NoteCloudRequest::notebook_id.
     char deck_id[37] = {};
+    // [ui-gates] kFetchSessionPage only: handle of the session snapshot parked
+    // for this page (see g_page_extension in word_cloud.cpp). The snapshot is
+    // 168 bytes but not trivially copyable, and CloudJob must stay POD for the
+    // union -- and only one candidate page is ever in flight, so a handle is
+    // cheaper than a copy and just as safe.
+    uint32_t page_extension_handle = 0;
     // [deck-scope] Scope epoch sampled when the request was QUEUED (session
     // ops only). The runner stamps it into the persisted session (the store
     // rejects a save whose epoch is stale) and echoes it in the result so the
@@ -441,9 +447,13 @@ bool QueueTodoComplete(const std::string& todo_id);
 bool QueueWordReviewRefresh();
 bool QueueWordSessionStart(
     const wqn::protocol::word_study_v1::CreateSessionRequest& request);
+// [ui-gates] `snapshot` is the session as of THIS request: the runner extends
+// and persists it, so a page that lands after the user has answered more words
+// cannot clobber the newer durable state (the apply step stamps it).
 bool QueueWordCandidatePage(
     const std::string& session_id,
-    const wqn::protocol::word_study_v1::CandidatePageRequest& request);
+    const wqn::protocol::word_study_v1::CandidatePageRequest& request,
+    const wqn::PersistedWordSession& snapshot);
 void PumpWordCandidatePrefetch(UiRuntime* runtime);
 // Rebuilds the note screen's [词] rows from word_app.deck_catalog, excluding
 // the current default deck (it lives on the word page itself).

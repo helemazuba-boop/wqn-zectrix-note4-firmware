@@ -1768,6 +1768,85 @@ esp_err_t CompactWordSessionData(
     return ESP_OK;
 }
 
+bool WordSessionSnapshotMatches(
+    const StoredWordSessionData& session,
+    const protocol::word_study_v1::CandidatePageData& page)
+{
+    if (session.snapshot.size() != page.snapshot.size()) return false;
+    for (size_t index = 0; index < session.snapshot.size(); ++index) {
+        const auto& stored = session.snapshot[index];
+        const auto& remote = page.snapshot[index];
+        if (remote.deck_id != stored.deck_id ||
+            remote.content_revision != stored.content_revision ||
+            remote.pack_revision != stored.pack_revision ||
+            remote.sha256 != stored.sha256) {
+            return false;
+        }
+    }
+    return true;
+}
+
+esp_err_t ExtendPersistedWordSessionWithPage(
+    const PersistedWordSession& persisted,
+    const protocol::word_study_v1::CandidatePageData& page,
+    PersistedWordSession* updated)
+{
+    // [ui-gates] Validates a candidate page against the session snapshot it was
+    // fetched for and produces the extended snapshot: the answered prefix is
+    // trimmed, the page's items are appended in ordinal order, and the cursor is
+    // advanced. Pure -- no I/O -- so both the cloud runner (which also persists
+    // the result) and the UI's stale-merge path can call it.
+    //
+    // Error codes are the transport for the UI's messages; see
+    // WordPageExtendMessage in word_app.cpp.
+    if (updated == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    const auto& remote = persisted.remote;
+    if (page.session_id != remote.session_id || page.ordering != remote.ordering ||
+        page.candidate_policy_version !=
+            protocol::word_study_v1::CandidatePolicyVersionName(remote.ordering) ||
+        page.seed != remote.seed || page.progress_revision != remote.progress_revision ||
+        page.cursor != remote.cursor ||
+        !WordSessionSnapshotMatches(remote, page)) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    if (persisted.position > remote.items.size()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    PersistedWordSession candidate = persisted;
+    auto& candidate_remote = candidate.remote;
+    if (candidate.position > 0) {
+        candidate_remote.items.erase(
+            candidate_remote.items.begin(),
+            candidate_remote.items.begin() + candidate.position);
+        candidate.position = 0;
+    }
+    if (candidate_remote.items.size() + page.items.size() >
+        protocol::word_study_v1::kCandidateWindowSize) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    uint64_t expected_ordinal = candidate_remote.items.empty()
+        ? (page.items.empty() ? 0 : page.items.front().ordinal)
+        : candidate_remote.items.back().ordinal + 1;
+    for (const auto& source : page.items) {
+        if (source.ordinal != expected_ordinal || source.item_id.size() != 36 ||
+            source.deck_id.size() != 36) {
+            return ESP_ERR_INVALID_ARG;
+        }
+        StoredWordSessionItem item;
+        std::snprintf(item.item_id, sizeof(item.item_id), "%s", source.item_id.c_str());
+        std::snprintf(item.deck_id, sizeof(item.deck_id), "%s", source.deck_id.c_str());
+        item.ordinal = source.ordinal;
+        candidate_remote.items.push_back(item);
+        ++expected_ordinal;
+    }
+    candidate_remote.cursor = page.next_cursor;
+    candidate_remote.has_more = page.has_more;
+    *updated = std::move(candidate);
+    return ESP_OK;
+}
+
 esp_err_t LoadPersistedWordSession(
     protocol::word_study_v1::Mode mode,
     PersistedWordSession* session)

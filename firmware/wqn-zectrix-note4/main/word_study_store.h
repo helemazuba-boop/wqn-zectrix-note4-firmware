@@ -106,6 +106,16 @@ struct PersistedWordSession {
     StoredWordSessionData remote;
 };
 
+// [ui-gates] Validates a candidate page against the snapshot it was fetched for
+// and returns the extended snapshot (answered prefix trimmed, page items
+// appended, cursor advanced). Pure, so the cloud runner can persist the result
+// and the UI can merge it. Error codes: INVALID_RESPONSE = snapshot mismatch,
+// INVALID_STATE = cursor past the window, INVALID_SIZE = window overflow,
+// INVALID_ARG = page ordering invalid.
+esp_err_t ExtendPersistedWordSessionWithPage(
+    const PersistedWordSession& persisted,
+    const protocol::word_study_v1::CandidatePageData& page,
+    PersistedWordSession* updated);
 esp_err_t CompactWordSessionData(
     const protocol::word_study_v1::SessionData& source,
     StoredWordSessionData* destination);

@@ -100,6 +100,7 @@ public:
         int64_t now_us);
     bool TakeWordCandidatePageRequest(
         wqn::protocol::word_study_v1::CandidatePageRequest* request,
+        wqn::PersistedWordSession* snapshot,
         std::string* session_id);
     void RestoreWordCandidatePageRequest();
     bool TakeNoteCandidatePageRequest(

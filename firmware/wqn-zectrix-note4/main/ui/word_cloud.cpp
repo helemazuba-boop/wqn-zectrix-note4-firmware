@@ -184,9 +184,51 @@ bool QueueWordSessionStart(
     return QueueWordCloudRequest(request);
 }
 
+
+// [ui-gates] Hand-off slot for the one candidate page in flight.
+// `session.page_in_flight` guarantees only one page is outstanding at a time,
+// and the result is applied before the next can be queued, so a single slot is
+// enough -- and it keeps CloudJob POD (a PersistedWordSession is 168 bytes but
+// not trivially copyable, and the job union needs POD). The handle is the
+// validation: a job whose handle no longer matches must not consume a snapshot
+// parked for a later page.
+struct PageExtensionSlot {
+    std::atomic<uint32_t> handle{0};
+    wqn::PersistedWordSession snapshot;
+};
+PageExtensionSlot g_page_extension;
+
+// Parks the snapshot for a queued page and returns its handle (never 0).
+uint32_t ParkPageExtension(const wqn::PersistedWordSession& snapshot)
+{
+    uint32_t handle = g_page_extension.handle.load(std::memory_order_relaxed) + 1;
+    if (handle == 0) {
+        handle = 1;  // 0 means "empty"
+    }
+    g_page_extension.snapshot = snapshot;
+    g_page_extension.handle.store(handle, std::memory_order_release);
+    return handle;
+}
+
+// Takes the snapshot parked for `handle`, or returns false when it is gone
+// (superseded, or the queue send failed and nothing was parked).
+bool TakePageExtension(uint32_t handle, wqn::PersistedWordSession* snapshot)
+{
+    if (handle == 0 || snapshot == nullptr) {
+        return false;
+    }
+    if (g_page_extension.handle.load(std::memory_order_acquire) != handle) {
+        return false;
+    }
+    *snapshot = g_page_extension.snapshot;
+    g_page_extension.handle.store(0, std::memory_order_release);
+    return true;
+}
+
 bool QueueWordCandidatePage(
     const std::string& session_id,
-    const wqn::protocol::word_study_v1::CandidatePageRequest& page)
+    const wqn::protocol::word_study_v1::CandidatePageRequest& page,
+    const wqn::PersistedWordSession& snapshot)
 {
     if (session_id.size() != 36 || page.metadata.request_id.empty() ||
         page.cursor.empty() || page.limit < 1 ||
@@ -213,6 +255,7 @@ bool QueueWordCandidatePage(
         "%s",
         page.cursor.c_str());
     request.limit = static_cast<uint16_t>(page.limit);
+    request.page_extension_handle = ParkPageExtension(snapshot);
     return QueueWordCloudRequest(request);
 }
 
@@ -222,10 +265,11 @@ void PumpWordCandidatePrefetch(UiRuntime* runtime)
     wqn::protocol::word_study_v1::CandidatePageRequest request;
     request.metadata = wqn::services::MakeDeviceRequestMetadata();
     std::string session_id;
-    if (!runtime->TakeWordCandidatePageRequest(&request, &session_id)) {
+    wqn::PersistedWordSession snapshot;
+    if (!runtime->TakeWordCandidatePageRequest(&request, &snapshot, &session_id)) {
         return;
     }
-    if (!QueueWordCandidatePage(session_id, request)) {
+    if (!QueueWordCandidatePage(session_id, request, snapshot)) {
         runtime->RestoreWordCandidatePageRequest();
     }
 }
@@ -366,7 +410,12 @@ bool ApplyWordCloudResult(wqn::UiState* state, WordCloudResult& result)
                      static_cast<unsigned long>(result.scope_generation),
                      static_cast<unsigned long>(wqn::GetDeckScopeGeneration()));
             wqn::ApplyWordCandidatePageResult(
-                &state->word_app, ESP_ERR_INVALID_STATE, {});
+                &state->word_app,
+                ESP_ERR_INVALID_STATE,
+                ESP_OK,
+                ESP_OK,
+                state->word_app.session.persisted,
+                {});
             return false;
         }
         if (result.result != ESP_OK && IsWordSessionInvalidError(result.protocol_error)) {
@@ -375,6 +424,9 @@ bool ApplyWordCloudResult(wqn::UiState* state, WordCloudResult& result)
             wqn::ApplyWordCandidatePageResult(
                 &state->word_app,
                 result.result,
+                result.session_compact_result,
+                result.session_persist_result,
+                result.persisted_session,
                 std::move(result.candidate_page));
         }
         BuildHomeSummary(state);
@@ -582,12 +634,34 @@ void ExecuteWordCloudRequest(const WordCloudRequest& request)
         page.metadata.request_id = request.request_id;
         page.cursor = request.cursor;
         page.limit = request.limit;
+        // [ui-gates] Take the parked snapshot FIRST, before the network call,
+        // so the slot is free for the next page and a superseded job cannot
+        // consume it.
+        wqn::PersistedWordSession parked;
+        const bool have_parked = TakePageExtension(
+            request.page_extension_handle, &parked);
         result.result = wqn::FetchWordStudyCandidatePageV1(
             token,
             request.session_id,
             page,
             &result.candidate_page,
             &result.protocol_error);
+        if (result.result == ESP_OK && have_parked) {
+            // Extend and persist the snapshot this page was queued with, on this
+            // thread. The apply step used to run the multi-second snapshot fsync
+            // on the UI task. When the snapshot is gone the UI merges the page in
+            // memory instead and the next observation commit persists it.
+            result.persisted_session = parked;
+            result.session_compact_result = wqn::ExtendPersistedWordSessionWithPage(
+                parked,
+                result.candidate_page,
+                &result.persisted_session);
+            if (result.session_compact_result == ESP_OK &&
+                result.persisted_session.active) {
+                result.session_persist_result =
+                    wqn::SavePersistedWordSession(result.persisted_session);
+            }
+        }
     } else {
         result.result = ESP_ERR_INVALID_ARG;
     }
