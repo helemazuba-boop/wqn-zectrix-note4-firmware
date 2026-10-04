@@ -22,6 +22,25 @@ namespace device_ui_internal {
 
 constexpr char kTag[] = "wqn_ui";
 
+// [persist-worker] The §4.2 window for settings-page actions: the persist
+// worker's busy flag OR any domain's commit_state == kPersisting, which is
+// wider than "worker busy" because it also covers the Prepare->reserve gap
+// where the effect is armed but not yet enqueued.
+//
+// Both the settings-row Confirm and the factory-reset dialog must use this one
+// predicate. The dialog used to test only IsAnyPersistBusy(), so it would erase
+// NVS underneath an observation that was armed but not yet enqueued.
+bool AnyLocalPersistPending(const wqn::UiState& state)
+{
+    return device_ui_internal::IsAnyPersistBusy() ||
+        state.word_app.session.commit_state ==
+            wqn::WordObservationCommitState::kPersisting ||
+        state.note_app.session.commit_state ==
+            wqn::NoteObservationCommitState::kPersisting ||
+        state.problem_app.commit_state ==
+            wqn::ProblemVerdictCommitState::kPersisting;
+}
+
 RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiState* state)
 {
     if (state == nullptr || state->screen != wqn::UiScreen::kSettings || !event.HasEvent()) {
@@ -295,8 +314,11 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
         if (long_press && event.button == wqn::ButtonId::kConfirm) {
             // [persist-worker] Defensive second line behind the main-page gate:
             // a factory reset erases NVS and reboots -- never do it while a
-            // durable local write is still in flight on the persist worker.
-            if (device_ui_internal::IsAnyPersistBusy()) {
+            // durable local write is in flight or armed. Uses the full §4.2
+            // window (worker busy OR any domain armed), not just the worker
+            // flag, so an armed observation cannot be erased underneath the
+            // user.
+            if (AnyLocalPersistPending(*state)) {
                 state->settings.notice = "正在保存，请稍后";
                 return RefreshSchedule::kConfig;
             }
@@ -443,15 +465,7 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
     // Prepare->reserve gap -- that work would contend with or queue behind the
     // persist worker's transaction and re-stall the UI. Refuse the action with
     // a notice; nothing is opened, read or written.
-    const bool persist_pending =
-        device_ui_internal::IsAnyPersistBusy() ||
-        state->word_app.session.commit_state ==
-            wqn::WordObservationCommitState::kPersisting ||
-        state->note_app.session.commit_state ==
-            wqn::NoteObservationCommitState::kPersisting ||
-        state->problem_app.commit_state ==
-            wqn::ProblemVerdictCommitState::kPersisting;
-    if (persist_pending) {
+    if (AnyLocalPersistPending(*state)) {
         state->settings.notice = "正在保存，请稍后";
         return RefreshSchedule::kConfig;
     }

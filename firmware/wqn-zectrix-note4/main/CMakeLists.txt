@@ -36,6 +36,7 @@ idf_component_register(
         "ui/persist_worker.cpp"
         "ui/diagnostics.cpp"
         "ui/graphics.cpp"
+        "ui/ui_gates_selftest.cpp"
         "ui/markdown_layout.cpp"
         "ui/markdown_render.cpp"
         "ui/page_ai.cpp"

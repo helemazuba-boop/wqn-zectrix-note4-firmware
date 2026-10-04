@@ -19,6 +19,7 @@
 #include "text_render.h"
 #include "time_app.h"
 #include "ui/markdown_layout.h"
+#include "ui/ui_gates_selftest.h"
 #include "word_app.h"
 #include "wqn_api.h"
 #include "wqn_api_stream_internal.h"
@@ -2538,7 +2539,8 @@ bool RunContractFixtureSelfTest()
         RunTimeAppStateSelfTest() &&
         RunWordPageStateSelfTest() &&
         RunNotePageStateSelfTest() &&
-        RunProblemPageStateSelfTest();
+        RunProblemPageStateSelfTest() &&
+        RunUiGateSelfTest();
 
     if (ok) {
         ESP_LOGI(kTag, "contract fixture self-test passed");
