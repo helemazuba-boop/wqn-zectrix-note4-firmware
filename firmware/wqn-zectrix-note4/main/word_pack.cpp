@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <cctype>
 #include <cmath>
@@ -29,6 +30,19 @@
 #include "word_study_store.h"
 
 namespace {
+// [pack-read-cache] Monotonic epoch bumped by every transaction that removes,
+// renames or writes a pack or manifest file. The card-read handle cache compares
+// it before each use, so a handle whose file was replaced underneath it is
+// re-opened instead of served. An epoch rather than a cross-task fclose: the
+// reader (wqn_ui) and those writers (storage_svc) are different tasks, and
+// closing a newlib FILE* from the writer would be a data race.
+std::atomic<uint32_t> g_pack_mutation_epoch{1};
+
+void NoteWordPackStorageMutated()
+{
+    g_pack_mutation_epoch.fetch_add(1, std::memory_order_release);
+}
+
 
 constexpr char kTag[] = "word_pack";
 constexpr char kStorageRoot[] = "/storage";
@@ -392,6 +406,8 @@ esp_err_t ParsePackManifestFile(wqn::WqnWordPackManifest* manifest)
 
 void PruneUnreferencedPackFiles(const wqn::WqnWordPackManifest& current)
 {
+    NoteWordPackStorageMutated();
+
     std::vector<std::string> retained_stems;
     std::vector<std::string> pinned_hash_prefixes;
     AddManifestPackStems(current, &retained_stems);
@@ -463,6 +479,7 @@ void PruneUnreferencedPackFiles(const wqn::WqnWordPackManifest& current)
 
 esp_err_t ResetWordPackStorageCacheRaw(void*)
 {
+    NoteWordPackStorageMutated();
     const char* manifest_paths[] = {
         kManifestPath,
         kManifestTempPath,
@@ -773,6 +790,7 @@ esp_err_t InitWordPackStorage()
 
 esp_err_t InvalidateWordPackManifestTransaction(void*)
 {
+    NoteWordPackStorageMutated();
     // Drops ONLY the manifest. The pack files are deliberately left behind: the
     // pack sync's own NOT_FOUND branch already calls ResetWordPackStorageCache
     // to clear them, and it does so on the cloud lane rather than on whatever
@@ -1284,6 +1302,8 @@ esp_err_t WordPackStreamTransaction(void* opaque)
             return ESP_OK;
 
         case WordPackStreamOperation::kCommit: {
+            // The final path is replaced by the rename below.
+            NoteWordPackStorageMutated();
             if (context->file == nullptr || !context->sha_started ||
                 context->bytes_written != context->item->byte_size) {
                 return ESP_ERR_INVALID_SIZE;
@@ -1326,6 +1346,8 @@ esp_err_t WordPackStreamTransaction(void* opaque)
         }
 
         case WordPackStreamOperation::kAbort:
+            // The partially downloaded temp file is removed.
+            NoteWordPackStorageMutated();
             if (context->file != nullptr) {
                 std::fclose(context->file);
                 context->file = nullptr;
@@ -1402,6 +1424,77 @@ bool WordPackNeedsDownload(const WqnWordPackManifestItem& item)
     return !FileExists(path) || !VerifyFileSha256(path, item.sha256);
 }
 
+
+// [pack-read-cache] One cached read handle for the word card path.
+//
+// Measured on device: a card turn spends 319 of its 320 ms in fopen+fseek
+// (log: "word card loaded: open_seek_ms=319 read_close_ms=0 parse_ms=0"), and
+// every card turn re-opens the same pack file. SPIFFS allows 8 concurrent
+// handles (storage.cpp max_files), so keeping one open removes almost all of
+// that cost without adding any cross-task state.
+//
+// Preconditions, all verified before this was written:
+//  * ONE reader. ReadWordPackEntry has a single call site (word_app.cpp
+//    LoadCurrentReviewWord) and every upstream path runs on wqn_ui
+//    (device_ui.cpp:1533, 12288 B). No timer, ISR-fed task, cloud lane or
+//    SyncServiceTask reader exists. A second reader must add a lock first --
+//    newlib FILE* is stateful and non-reentrant.
+//  * Keyed by pack stem: one session can cross decks, so the cached handle is
+//    only valid for the stem it was opened for.
+//  * Re-seeked to index_entry.file_offset on EVERY read (the existing fseek is
+//    the contract). Never rely on a prior position: ScanPackFile reads the same
+//    file linearly on another task.
+//  * Invalidation is a MONOTONIC EPOCH, not a cross-task fclose. Every
+//    transaction that removes, renames or writes a pack/manifest file bumps it;
+//    the reader compares before use and re-opens when it moved. The reader and
+//    those writers are different tasks, so closing the handle from the writer
+//    would be a data race on a newlib FILE*.
+//  * The default 128 B stdio buffer is used (PackReadBuffer is NOT): it is owned
+//    by the FILE* and freed with it, so the [pack-io] "buffer must outlive the
+//    FILE" invariant does not apply here. Switching to PackReadBuffer later
+//    would make that invariant load-bearing.
+//  * Deep sleep needs no close: the handle lives in RAM and dies with the image;
+//    light sleep leaves SPIFFS files valid.
+constexpr size_t kPackStemMax = 28;  // WordPackIndexEntry::pack_stem
+char g_pack_read_stem[kPackStemMax] = {};
+FILE* g_pack_read_file = nullptr;
+uint32_t g_pack_read_epoch = 0;
+
+void CloseWordPackReadCache()
+{
+    if (g_pack_read_file != nullptr) {
+        std::fclose(g_pack_read_file);
+        g_pack_read_file = nullptr;
+    }
+    g_pack_read_stem[0] = '\0';
+    g_pack_read_epoch = 0;
+}
+
+// Returns a handle positioned nowhere in particular; the caller must fseek.
+// Re-opens when the cached stem differs or any pack mutation landed since the
+// handle was taken.
+FILE* AcquireWordPackReadHandle(const char* stem, uint32_t* opened_epoch)
+{
+    const uint32_t epoch = g_pack_mutation_epoch.load(std::memory_order_acquire);
+    if (g_pack_read_file != nullptr &&
+        epoch == g_pack_read_epoch &&
+        std::strncmp(g_pack_read_stem, stem, sizeof(g_pack_read_stem)) == 0) {
+        *opened_epoch = epoch;
+        return g_pack_read_file;
+    }
+    CloseWordPackReadCache();
+    const std::string path = PackPathForStem(stem);
+    FILE* file = std::fopen(path.c_str(), "rb");
+    if (file == nullptr) {
+        return nullptr;
+    }
+    std::snprintf(g_pack_read_stem, sizeof(g_pack_read_stem), "%s", stem);
+    g_pack_read_file = file;
+    g_pack_read_epoch = epoch;
+    *opened_epoch = epoch;
+    return file;
+}
+
 esp_err_t ReadWordPackEntry(const WordPackIndexEntry& index_entry, WqnWordEntry* entry)
 {
     if (entry == nullptr || index_entry.pack_stem[0] == '\0') {
@@ -1413,13 +1506,15 @@ esp_err_t ReadWordPackEntry(const WordPackIndexEntry& index_entry, WqnWordEntry*
     const int64_t started_us = esp_timer_get_time();
     *entry = WqnWordEntry{};
 
-    const std::string path = PackPathForStem(index_entry.pack_stem);
-    FILE* file = std::fopen(path.c_str(), "rb");
+    uint32_t handle_epoch = 0;
+    FILE* file = AcquireWordPackReadHandle(index_entry.pack_stem, &handle_epoch);
     if (file == nullptr) {
         return ESP_ERR_NOT_FOUND;
     }
     if (std::fseek(file, static_cast<long>(index_entry.file_offset), SEEK_SET) != 0) {
-        std::fclose(file);
+        // A failed seek on a shared handle is not trustworthy for the next
+        // reader: drop the cache rather than keep a FILE* in an unknown state.
+        CloseWordPackReadCache();
         return ESP_FAIL;
     }
     const int64_t opened_us = esp_timer_get_time();
@@ -1430,9 +1525,11 @@ esp_err_t ReadWordPackEntry(const WordPackIndexEntry& index_entry, WqnWordEntry*
     std::vector<char> line_buffer(kLineBufferSize, 0);
     std::string line;
     const esp_err_t line_result = ReadBoundedPackLine(file, &line_buffer, &line);
-    std::fclose(file);
     const int64_t read_us = esp_timer_get_time();
     if (line_result != ESP_OK) {
+        // Same reasoning as the seek failure: never keep a handle whose read
+        // just failed.
+        CloseWordPackReadCache();
         return line_result;
     }
 
