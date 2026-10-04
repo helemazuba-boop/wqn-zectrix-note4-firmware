@@ -15,6 +15,7 @@
 #include "opencode_session.h"
 #include "power_manager.h"
 #include "runtime/sleep_diagnostics.h"
+#include "word_pack.h"
 #include "services/connectivity_service.h"
 #include "services/sync_service.h"
 
@@ -39,6 +40,37 @@ bool AnyLocalPersistPending(const wqn::UiState& state)
             wqn::NoteObservationCommitState::kPersisting ||
         state.problem_app.commit_state ==
             wqn::ProblemVerdictCommitState::kPersisting;
+}
+
+// [dev-diag] Forces a full word-pack re-download so a HIL run can hold a
+// multi-MB pack write in flight while an observation advances -- the load the
+// C.2 acceptance criterion measures, and which no production path generates on a
+// healthy device. Three production calls, no test-only branch:
+//   1. drop the local manifest and pack files, so `!had_local_manifest` makes
+//      the next pack sync re-fetch everything instead of diffing an unchanged
+//      manifest and reporting "no change";
+//   2. mark the content phase pending and wake the sync task;
+//   3. claim the refresh and queue the bulk-lane pack sync -- the same call the
+//      word page makes on entry.
+// Only the content phase is forced; nothing else about the sync round changes.
+void RequestWordPackRedownload(wqn::UiState* state)
+{
+    if (state == nullptr) {
+        return;
+    }
+    const esp_err_t reset_result = wqn::ResetWordPackStorageCache();
+    if (reset_result != ESP_OK) {
+        state->settings.notice = "词库包缓存清除失败";
+        ESP_LOGE(kTag, "word pack cache reset failed: %s", esp_err_to_name(reset_result));
+        return;
+    }
+    wqn::services::RequestContentRefresh(wqn::services::SyncContentDomain::kWordPacks);
+    if (QueueWordReviewRefresh()) {
+        state->settings.notice = "已重下词库包，去词页看";
+        ESP_LOGW(kTag, "dev: word pack redownload requested");
+    } else {
+        state->settings.notice = IsWordCloudBusy() ? "单词同步中" : "词库包同步失败";
+    }
 }
 
 RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiState* state)
@@ -294,15 +326,39 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
         return RefreshSchedule::kNone;
     }
 
-    // [dev-diag] kBattery/kStorage/kDevInfo/kDevSync/kDevErrors/kSleepDiag
-    // share the read-only dialog contract: confirm (short or long) closes;
-    // up/down do nothing.
+    // [dev-diag] kBattery/kStorage/kDevInfo/kDevErrors/kSleepDiag share the
+    // read-only dialog contract: confirm (short or long) closes; up/down do
+    // nothing. kDevSync is deliberately NOT in this list -- see its own block
+    // below, which is the one dev dialog that can act.
     if (state->settings.dialog == wqn::SettingsDialog::kBattery ||
         state->settings.dialog == wqn::SettingsDialog::kStorage ||
         state->settings.dialog == wqn::SettingsDialog::kDevInfo ||
-        state->settings.dialog == wqn::SettingsDialog::kDevSync ||
         state->settings.dialog == wqn::SettingsDialog::kDevErrors ||
         state->settings.dialog == wqn::SettingsDialog::kSleepDiag) {
+        if (event.button == wqn::ButtonId::kConfirm && (short_press || long_press)) {
+            state->settings.dialog = wqn::SettingsDialog::kNone;
+            return RefreshSchedule::kConfig;
+        }
+        return RefreshSchedule::kNone;
+    }
+
+    // [dev-diag] The sync dialog is the one dev dialog that can act: a double
+    // Confirm re-downloads the word packs. That is the only way to hold a
+    // multi-MB pack write in flight on demand -- the load the C.2 HIL criterion
+    // measures, and which no production path generates on a healthy device (the
+    // word page only syncs when its local manifest is missing or in error).
+    //
+    // Double-press, not long-press: long-press Confirm is the "leave/back"
+    // gesture throughout the settings tree, so hijacking it for an action that
+    // throws away downloaded content would break that convention and invite
+    // misfires. Double-press Confirm is unused in the settings tree and is a
+    // deliberate gesture, which is what this wants.
+    if (state->settings.dialog == wqn::SettingsDialog::kDevSync) {
+        if (event.button == wqn::ButtonId::kConfirm &&
+            event.type == wqn::ButtonEventType::kDoublePress) {
+            RequestWordPackRedownload(state);
+            return RefreshSchedule::kConfig;
+        }
         if (event.button == wqn::ButtonId::kConfirm && (short_press || long_press)) {
             state->settings.dialog = wqn::SettingsDialog::kNone;
             return RefreshSchedule::kConfig;
