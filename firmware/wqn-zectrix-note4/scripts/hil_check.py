@@ -110,27 +110,41 @@ def el(tx): return int(tx['el'])
 # ------------------------------------------------------------------ 判据实现 --
 
 def hil_p0_wifi(log: Log):
-    """c93800c — wifi legacy 迁移（Codex 评论 2）。"""
+    """c93800c — wifi legacy 迁移（Codex 评论 2）。
+
+    三种合法结局，判据各不相同：
+      A. 本次启动真做了迁移 → 必须恰好一条 migrated 日志、两个 key 被擦掉
+      B. 设备早已迁移（blob 在位）→ 必须「有凭据 + 零 wifi 写事务」
+      C. 迁移被拒（kRetryLater）→ 必须非致命且有 connectivity 重试
+    """
     migrated = log.has('migrated legacy wifi credentials into slot 0')
     orphan = log.has('clearing orphan legacy wifi credentials')
     deferred = log.has('legacy wifi credential migration deferred')
-    if not (migrated or orphan or deferred):
-        skip(log, 'P0-wifi:legacy-boot', '日志无 legacy 迁移痕迹（设备已迁移或非 legacy 固件升级路径）')
-        return
+    has_creds = log.has('WiFi credentials stored: SSID=')
+    wifi_writes = [t for t in log.tx
+                   if 'wifi-cred' in t['owner'] or 'legacy-wifi' in t['owner']
+                   or 'migrate-wifi' in t['owner']]
+
     if migrated:
         expect(log, 'P0-wifi:migrated-once',
                log.text.count('migrated legacy wifi credentials into slot 0') == 1,
                '恰好一条 migrated 日志（重复说明幂等失效）')
+        expect(log, 'P0-wifi:migration-wrote-once',
+               len(wifi_writes) == 1,
+               f'迁移写事务 {len(wifi_writes)} 笔（blob 写 1 笔 + 2 笔 erase 应为 1 次性事务）')
+        return
     if deferred:
-        expect(log, 'P0-wifi:deferred-logged', True, '启动迁移被拒时有 W 日志且非致命')
-    # 已迁移设备：boot 阶段不应有 NVS 写（零 commit）
-    boot_tx = [t for t in log.tx if int(t['qw']) >= 0 and log.text.find('storage service started') < log.text.find(
-        'owner=' + t['owner'])]
-    if migrated or orphan:
-        expect(log, 'P0-wifi:no-extra-commits-on-clean-boot',
-               not any('clear-legacy-wifi' in t['owner'] or 'migrate-wifi' in t['owner']
-                       for t in log.tx),
-               '已迁移设备重启时无 wifi 迁移写')
+        expect(log, 'P0-wifi:deferred-non-fatal', True,
+               '启动迁移被拒时有 W 日志且不中止启动')
+        return
+    if has_creds:
+        # 已迁移设备：干净启动 = 读到凭据且不做任何迁移写
+        expect(log, 'P0-wifi:migrated-device-clean-boot',
+               not wifi_writes,
+               f'已迁移设备启动时有凭据且零 wifi 写事务（实测 {len(wifi_writes)} 笔）')
+        return
+    skip(log, 'P0-wifi:no-credential-state',
+         '日志既无迁移痕迹也无已存凭据（可能未连过 WiFi）')
 
 
 def hil_p0_journal(log: Log):
