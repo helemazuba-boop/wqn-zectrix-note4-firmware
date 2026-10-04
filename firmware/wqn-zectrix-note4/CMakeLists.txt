@@ -31,3 +31,25 @@ add_custom_target(
         -P ${CMAKE_CURRENT_LIST_DIR}/cmake/verify_architecture.cmake
     COMMENT "Verifying M8 resource ownership and layer boundaries"
     VERBATIM)
+
+# Fixture tests for the architecture gate itself. Every rule above is
+# load-bearing and until now had no test of its own, and the gate is the only
+# automated protection against a new single-owner or layering violation.
+#
+# Deliberately not part of ALL: a fresh clone should not be surprised by a
+# second cmake invocation on every build. Run it with the target below, or with
+# ctest. The same `cmake -P` script is the entry point if CI ever appears.
+enable_testing()
+add_test(NAME m8_gate_fixtures
+    COMMAND ${CMAKE_COMMAND}
+        -DQN_REPO_DIR=${CMAKE_CURRENT_LIST_DIR}
+        -DQN_BUILD_DIR=${CMAKE_CURRENT_BINARY_DIR}
+        -P ${CMAKE_CURRENT_LIST_DIR}/cmake/tests/run_gate_fixture.cmake)
+add_custom_target(
+    wqn_m8_gate_tests
+    COMMAND ${CMAKE_COMMAND}
+        -DQN_REPO_DIR=${CMAKE_CURRENT_LIST_DIR}
+        -DQN_BUILD_DIR=${CMAKE_CURRENT_BINARY_DIR}
+        -P ${CMAKE_CURRENT_LIST_DIR}/cmake/tests/run_gate_fixture.cmake
+    COMMENT "Running M8 gate fixture tests"
+    VERBATIM)
