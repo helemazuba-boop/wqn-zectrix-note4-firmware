@@ -1527,13 +1527,18 @@ esp_err_t SaveWordSequentialCursor(uint32_t cursor)
     // entirely -- and most callers run on the UI task. Foreground, for the same
     // reason SaveWordSessionCursor is: this is a tiny write that must not queue
     // behind a multi-MB pack sync.
-    StorageWriteGuard write("save-word-cursor", __FILE__, __LINE__);
+    //
+    // Owner string names the SEQUENTIAL walk position to keep it distinguishable
+    // from word_study_store.cpp's "word-session-cursor", which is the per-session
+    // cursor record. HIL confused the two, so the log names now say which is
+    // which.
+    StorageWriteGuard write("word-sequential-cursor", __FILE__, __LINE__);
     if (!write) {
         return ESP_ERR_INVALID_STATE;
     }
     U64WriteContext context = {kWordSequentialCursorKey, cursor};
     return services::ExecuteForegroundStorageTransaction(
-        SaveU64Transaction, &context, "save-word-cursor");
+        SaveU64Transaction, &context, "word-sequential-cursor");
 }
 
 esp_err_t SaveDefaultWordDeckId(const std::string& deck_id)
