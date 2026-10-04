@@ -175,6 +175,10 @@ wqn::runtime::SleepLease g_connectivity_lease;
 wqn::WifiCredentialStore g_cred_store{};
 uint8_t g_active_slot = 0;
 uint8_t g_slot_fail_count[2] = {0, 0};
+// [wifi-redundancy] Set once the legacy-key migration has been attempted this
+// boot; kRetryLater leaves it clear so the next entry retries. ConnectivityTask
+// is the only writer.
+std::atomic<bool> g_legacy_wifi_migration_attempted{false};
 // [wifi-redundancy] Snapshot identity read by GetConnectivitySnapshot from any
 // task. Written by ConnectivityTask under g_snapshot_lock; copies are short and
 // under the spinlock so a cross-core reader never sees a torn string.
@@ -459,6 +463,31 @@ void ReloadCredStoreFromNvs()
         ESP_LOGW(kTag, "load wifi credential store failed: %s", esp_err_to_name(result));
         g_cred_store = wqn::WifiCredentialStore{};
     }
+}
+
+// [wifi-redundancy] Retry for the boot-time legacy wifi_ssid/wifi_pass
+// migration. InitStorage owns the normal case; this covers the branch where
+// that write was refused (quiesce / NVS busy), which would otherwise leave a
+// provisioned legacy device reporting kNeedsProvisioning until it re-provisions.
+//
+// MUST be called before ReloadCredStoreFromNvs(): the connect-vs-provision
+// decision reads g_cred_store.count, so a migration that ran after the reload
+// would not be visible to it. Runs on the connectivity task only (the migration
+// writes NVS). The gate keeps one read pass per boot: InitStorage's own attempt
+// is not visible here, so the first connectivity entry re-reads (and writes
+// nothing) before latching; kRetryLater leaves the gate clear so a refused
+// attempt is retried on the next entry.
+void RetryLegacyWifiMigrationIfNeeded()
+{
+    if (g_legacy_wifi_migration_attempted.load(std::memory_order_acquire)) {
+        return;
+    }
+    const wqn::WifiLegacyMigrationResult result =
+        wqn::MigrateLegacyWifiCredentialsIfNeeded();
+    if (result == wqn::WifiLegacyMigrationResult::kRetryLater) {
+        return;
+    }
+    g_legacy_wifi_migration_attempted.store(true, std::memory_order_release);
 }
 
 // [wifi-redundancy] Starts a fresh connect cycle on the preferred slot and
@@ -787,6 +816,7 @@ esp_err_t StartConfiguredConnectivity(bool force_backoff = false)
     // [wifi-demand] A normal request never silently opens the provisioning
     // portal. Missing credentials are a typed terminal result; only the
     // explicit settings/provisioning flow may start SoftAP mode.
+    RetryLegacyWifiMigrationIfNeeded();
     ReloadCredStoreFromNvs();
     esp_err_t result = ESP_ERR_NOT_FOUND;
     if (g_cred_store.count > 0) {
@@ -939,6 +969,10 @@ esp_err_t StartWithCredentials(const ConnectivityCommand& command)
     // [wifi-redundancy] Persist first (dedup by SSID, the new credential becomes
     // preferred), then connect from the refreshed store. If the upsert fails we
     // still connect the raw credentials so the user gets online.
+    // The legacy migration runs first so an upsert never writes over an
+    // unmigrated legacy network: before the read/write split it happened inside
+    // the load that UpsertWifiCredential performs.
+    RetryLegacyWifiMigrationIfNeeded();
     const esp_err_t upsert_result = wqn::UpsertWifiCredential(command.ssid, command.password);
     if (upsert_result != ESP_OK) {
         ESP_LOGW(kTag, "upsert wifi credential failed: %s", esp_err_to_name(upsert_result));
@@ -1259,6 +1293,7 @@ void HandleScheduledAction()
             ESP_LOGI(kTag, "WiFi backoff complete; restarting radio");
             // Reload the store because provisioning may have written new
             // credentials while the radio was stopped.
+            RetryLegacyWifiMigrationIfNeeded();
             ReloadCredStoreFromNvs();
             esp_err_t result = ESP_ERR_NOT_FOUND;
             if (g_cred_store.count > 0) {

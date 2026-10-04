@@ -960,6 +960,18 @@ esp_err_t InitStorage()
     // and business services must not run against that state.
     ESP_RETURN_ON_ERROR(RecoverDefaultDeckScopeChange(), kTag,
                         "recover deck scope change");
+    // [wifi-redundancy] Migrate the legacy wifi_ssid/wifi_pass pair into the
+    // versioned blob once, here, before any consumer can read the credential
+    // store. It used to run lazily inside LoadWifiCredentialStore, which made
+    // the UI task's settings snapshot perform NVS writes (§4.1). A refused write
+    // is deliberately non-fatal and logged, mirroring the cleanup step below:
+    // the connectivity task retries it, so a brief NVS refusal cannot drop a
+    // provisioned device into provisioning mode.
+    const WifiLegacyMigrationResult wifi_migration =
+        MigrateLegacyWifiCredentialsIfNeeded();
+    if (wifi_migration == WifiLegacyMigrationResult::kRetryLater) {
+        ESP_LOGW(kTag, "legacy wifi credential migration deferred to connectivity retry");
+    }
     // The removed prototype used three compressed files and two NVS blobs. Reclaim
     // those exact artifacts on StorageService so cleanup is serialized with
     // all current pack/outbox writes. It is intentionally idempotent and does
@@ -1952,51 +1964,144 @@ esp_err_t LoadWifiCredentialStore(WifiCredentialStore* store)
     if (store == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
-    // A valid empty store is versioned too. The old zero-initialized return
-    // path caused the first Upsert to persist version=0 forever.
+    // [wifi-redundancy] PURE READ. This runs on the UI task (settings
+    // diagnostics, the 60 s reload, the settings dialogs), so it must never
+    // write: the legacy wifi_ssid/wifi_pass -> blob migration used to live here
+    // and blocked the UI task behind the storage queue. It now lives in
+    // MigrateLegacyWifiCredentialsIfNeeded(), called once by InitStorage and
+    // retried by the connectivity task.
     *store = EmptyWifiCredentialStore();
 
     std::string blob;
-    ESP_RETURN_ON_ERROR(LoadBlobFromNvs(kWifiCredsBlobKey, &blob), kTag, "load wifi credential blob");
-    if (!blob.empty()) {
-        if (blob.size() != sizeof(WifiCredentialStore)) {
-            ESP_LOGW(
-                kTag,
-                "wifi credential blob size mismatch: %u != %u; ignoring",
-                static_cast<unsigned>(blob.size()),
-                static_cast<unsigned>(sizeof(WifiCredentialStore)));
+    const esp_err_t blob_result = LoadBlobFromNvs(kWifiCredsBlobKey, &blob);
+    if (blob_result != ESP_OK && blob_result != ESP_ERR_NOT_FOUND) {
+        // A genuine NVS read failure stays visible to the caller so an upsert
+        // cannot silently write over a store it failed to read.
+        return blob_result;
+    }
+    if (blob_result == ESP_OK && blob.size() != sizeof(WifiCredentialStore)) {
+        // Reachable on a layout change: kWifiCredentialStoreVersion is bumped by
+        // the static_asserts below whenever the struct changes.
+        ESP_LOGW(
+            kTag,
+            "wifi credential blob size mismatch: %u != %u; ignoring",
+            static_cast<unsigned>(blob.size()),
+            static_cast<unsigned>(sizeof(WifiCredentialStore)));
+    }
+    if (blob_result == ESP_OK && blob.size() == sizeof(WifiCredentialStore)) {
+        WifiCredentialStore candidate;
+        std::memcpy(&candidate, blob.data(), sizeof(candidate));
+        if (ValidateWifiCredentialStore(&candidate, true)) {
+            *store = candidate;
+            return ESP_OK;
+        }
+        ESP_LOGW(kTag, "wifi credential blob failed validation; store treated as empty");
+    }
+    return ESP_OK;
+}
+
+WifiLegacyMigrationResult MigrateLegacyWifiCredentialsIfNeeded()
+{
+    // [wifi-redundancy] Explicit, idempotent migration of the pre-dual-slot
+    // wifi_ssid/wifi_pass pair into the versioned blob. Writes NVS, so it must
+    // never run on the UI task: InitStorage calls it once during boot and the
+    // connectivity / provisioning tasks retry it when that write was refused.
+    //
+    // No §4.8 marker is needed: this is an NVS-only sequence that is ordered
+    // write-before-erase, so a power cut at any point leaves either the legacy
+    // pair intact (retryable) or the blob present with orphan keys (harmless and
+    // cleaned up by the next call).
+    WifiCredentialStore store;
+    const esp_err_t load_result = LoadWifiCredentialStore(&store);
+    if (load_result != ESP_OK) {
+        ESP_LOGW(
+            kTag,
+            "legacy wifi credential migration deferred: %s",
+            esp_err_to_name(load_result));
+        return WifiLegacyMigrationResult::kRetryLater;
+    }
+
+    std::string ssid;
+    std::string password;
+    // LoadStringFromNvs returns ESP_OK with an empty string when the key is
+    // absent, so emptiness -- not the return code -- is what marks "present".
+    // An empty legacy password (an open network) migrates but is not worth an
+    // extra erase commit; the orphan key is inert. A genuine read FAILURE is
+    // different from absence and must abort the whole attempt: erasing on a
+    // failed read could destroy a password that is merely unreadable right now.
+    const esp_err_t ssid_result = LoadStringFromNvs(kWifiSsidKey, &ssid);
+    const esp_err_t password_result = LoadStringFromNvs(kWifiPasswordKey, &password);
+    if (ssid_result != ESP_OK || password_result != ESP_OK) {
+        ESP_LOGW(
+            kTag,
+            "legacy wifi credential migration deferred: ssid=%s password=%s",
+            esp_err_to_name(ssid_result),
+            esp_err_to_name(password_result));
+        return WifiLegacyMigrationResult::kRetryLater;
+    }
+    const bool has_legacy_ssid = !ssid.empty();
+    const bool has_legacy_password = !password.empty();
+    if (!has_legacy_ssid && !has_legacy_password) {
+        // The normal already-migrated device: no write, no lease, no NVS commit.
+        return WifiLegacyMigrationResult::kNothingToMigrate;
+    }
+    const bool migrate_legacy_pair = has_legacy_ssid && store.count == 0;
+    if (!migrate_legacy_pair) {
+        if (!has_legacy_ssid) {
+            // A stray password without an SSID carries no network: drop it so
+            // the next boot does not re-read a half-written legacy pair.
+            ESP_LOGW(kTag, "dropping stray legacy wifi password with no SSID");
         } else {
-            WifiCredentialStore candidate;
-            std::memcpy(&candidate, blob.data(), sizeof(candidate));
-            if (ValidateWifiCredentialStore(&candidate, true)) {
-                *store = candidate;
-                return ESP_OK;
-            }
-            ESP_LOGW(kTag, "wifi credential blob failed validation; trying legacy migration");
+            // A valid blob is authoritative and the legacy pair is an orphan
+            // left by a power cut between the blob commit and the erases.
+            ESP_LOGI(kTag, "clearing orphan legacy wifi credentials (blob is present)");
         }
     }
 
-    // Legacy migration: synthesize slot 0 from the per-key wifi_ssid/wifi_pass,
-    // then persist as a blob and clear the legacy keys so the blob becomes the
-    // single source of truth.
-    std::string ssid;
-    std::string password;
-    ESP_RETURN_ON_ERROR(LoadStringFromNvs(kWifiSsidKey, &ssid), kTag, "load legacy wifi ssid");
-    if (ssid.empty()) {
-        return ESP_OK;
+    // One kStorage lease for the whole commit (blob write plus both erases), so a
+    // sleep quiesce cannot land between them. The caller blocks on the storage
+    // queue for each step, so this also bounds how long the lease is held.
+    StorageWriteGuard write("migrate-wifi-credentials", __FILE__, __LINE__);
+    if (!write) {
+        return WifiLegacyMigrationResult::kRetryLater;
     }
-    ESP_RETURN_ON_ERROR(LoadStringFromNvs(kWifiPasswordKey, &password), kTag, "load legacy wifi password");
-    store->version = kWifiCredentialStoreVersion;
-    store->preferred = 0;
-    store->count = 1;
-    CopyWifiCredentialField(store->slots[0].ssid, sizeof(store->slots[0].ssid), ssid.c_str());
-    CopyWifiCredentialField(store->slots[0].password, sizeof(store->slots[0].password), password.c_str());
-    ESP_LOGI(kTag, "migrated legacy wifi credentials into slot 0 (SSID=%s)", ssid.c_str());
-    if (SaveWifiCredentialStore(*store) == ESP_OK) {
-        ClearNvsKey(kWifiSsidKey);
-        ClearNvsKey(kWifiPasswordKey);
+    if (migrate_legacy_pair) {
+        WifiCredentialStore migrated = store;
+        migrated.version = kWifiCredentialStoreVersion;
+        migrated.preferred = 0;
+        migrated.count = 1;
+        CopyWifiCredentialField(
+            migrated.slots[0].ssid, sizeof(migrated.slots[0].ssid), ssid.c_str());
+        CopyWifiCredentialField(
+            migrated.slots[0].password,
+            sizeof(migrated.slots[0].password),
+            password.c_str());
+        const esp_err_t save_result = SaveWifiCredentialStore(migrated);
+        if (save_result != ESP_OK) {
+            // The legacy keys are untouched, so the next attempt re-derives the
+            // same store.
+            ESP_LOGW(
+                kTag,
+                "legacy wifi credential migration deferred: %s",
+                esp_err_to_name(save_result));
+            return WifiLegacyMigrationResult::kRetryLater;
+        }
+        ESP_LOGI(kTag, "migrated legacy wifi credentials into slot 0 (SSID=%s)", ssid.c_str());
     }
-    return ESP_OK;
+
+    // Erase only what is present: ClearNvsKeyRaw commits unconditionally, and an
+    // unconditional erase pair would add two NVS commits to every boot of every
+    // already-migrated device.
+    if (has_legacy_ssid && ClearNvsKey(kWifiSsidKey) != ESP_OK) {
+        ESP_LOGW(kTag, "legacy wifi ssid key not cleared; will retry");
+        return WifiLegacyMigrationResult::kRetryLater;
+    }
+    if (has_legacy_password && ClearNvsKey(kWifiPasswordKey) != ESP_OK) {
+        ESP_LOGW(kTag, "legacy wifi password key not cleared; will retry");
+        return WifiLegacyMigrationResult::kRetryLater;
+    }
+    return migrate_legacy_pair ? WifiLegacyMigrationResult::kMigrated
+                               : WifiLegacyMigrationResult::kNothingToMigrate;
 }
 
 esp_err_t SaveWifiCredentialStore(const WifiCredentialStore& store)

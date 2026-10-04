@@ -190,7 +190,8 @@ bool HasWifiCredentials();
 // NVS blob holding up to two (ssid, password) slots plus a `preferred` index
 // pointing at the last slot that connected successfully. Persistence is a
 // single atomic blob commit (the legacy per-key wifi_ssid/wifi_pass pair could
-// tear across power loss). Load migrates legacy keys on first read.
+// tear across power loss). Load is a pure read; MigrateLegacyWifiCredentialsIfNeeded
+// performs the legacy-key migration explicitly.
 struct WifiCredentialSlot {
     char ssid[33];       // 32 + NUL
     char password[65];   // 64 + NUL
@@ -210,12 +211,31 @@ enum class WifiCredentialRole : uint8_t {
     kBackup,
 };
 
-// Loads the store, validating the blob and migrating legacy wifi_ssid/wifi_pass
-// keys when the blob is absent. On success `store` always holds a coherent
-// (possibly empty) store with version == 1. Returns ESP_OK when a valid store
-// (blob or migrated) was loaded; legacy migration with no keys yields an empty
-// store and ESP_OK.
+// Outcome of MigrateLegacyWifiCredentialsIfNeeded. kRetryLater means nothing
+// durable changed and the caller is expected to try again later; kMigrated and
+// kNothingToMigrate are both terminal (the store on flash is already correct),
+// so callers normally only branch on kRetryLater.
+enum class WifiLegacyMigrationResult : uint8_t {
+    kNothingToMigrate,
+    kMigrated,
+    kRetryLater,
+};
+
+// Pure read of the store. Validates the blob; an absent, size-mismatched or
+// invalid blob yields an empty versioned store (count == 0) and ESP_OK, because
+// this runs on the UI task and must never write. A genuine NVS read failure is
+// returned to the caller instead of being reported as an empty store, so an
+// upsert cannot write over a store it failed to read.
 esp_err_t LoadWifiCredentialStore(WifiCredentialStore* store);
+// [wifi-redundancy] Migrates the legacy wifi_ssid/wifi_pass pair into the
+// versioned blob, then erases whichever legacy keys were actually present (an
+// empty-valued key is left behind rather than costing an extra NVS commit). Also
+// clears orphan legacy keys when a valid blob already exists. Idempotent: the
+// durable end state is the same however often it runs, and a device with nothing
+// to migrate performs no write and takes no lease. It DOES block its caller on
+// the storage queue while it writes, so only app_main / boot-time init and the
+// connectivity and provisioning tasks may call it -- never the UI task.
+WifiLegacyMigrationResult MigrateLegacyWifiCredentialsIfNeeded();
 // Persists the whole store as one atomic NVS blob commit.
 esp_err_t SaveWifiCredentialStore(const WifiCredentialStore& store);
 // Insert or update a credential: same-SSID slots get their password refreshed,
