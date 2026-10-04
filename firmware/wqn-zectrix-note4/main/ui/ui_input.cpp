@@ -45,23 +45,30 @@ bool AnyLocalPersistPending(const wqn::UiState& state)
 // [dev-diag] Forces a full word-pack re-download so a HIL run can hold a
 // multi-MB pack write in flight while an observation advances -- the load the
 // C.2 acceptance criterion measures, and which no production path generates on a
-// healthy device. Three production calls, no test-only branch:
-//   1. drop the local manifest and pack files, so `!had_local_manifest` makes
-//      the next pack sync re-fetch everything instead of diffing an unchanged
-//      manifest and reporting "no change";
-//   2. mark the content phase pending and wake the sync task;
-//   3. claim the refresh and queue the bulk-lane pack sync -- the same call the
-//      word page makes on entry.
+// healthy device. Production calls only, no test-only branch:
+//   1. InvalidateWordPackManifest() drops ONLY the manifest, so
+//      `!had_local_manifest` makes the next pack sync re-fetch everything. The
+//      pack files are left for the lane to clear: resetting the whole cache here
+//      measured 25.7 s on a device holding multi-MB packs, which froze the UI
+//      task this action runs on.
+//   2. RequestContentRefresh(kWordPacks) marks the phase pending and wakes the
+//      sync task;
+//   3. QueueWordReviewRefresh() claims the ticket and queues the bulk-lane pack
+//      sync -- the same call the word page makes on entry, and whose own
+//      NOT_FOUND branch clears the leftover pack files off the UI task.
 // Only the content phase is forced; nothing else about the sync round changes.
 void RequestWordPackRedownload(wqn::UiState* state)
 {
     if (state == nullptr) {
         return;
     }
-    const esp_err_t reset_result = wqn::ResetWordPackStorageCache();
-    if (reset_result != ESP_OK) {
-        state->settings.notice = "词库包缓存清除失败";
-        ESP_LOGE(kTag, "word pack cache reset failed: %s", esp_err_to_name(reset_result));
+    const esp_err_t invalidate_result = wqn::InvalidateWordPackManifest();
+    if (invalidate_result != ESP_OK) {
+        state->settings.notice = "词库包清单清除失败";
+        ESP_LOGE(
+            kTag,
+            "word pack manifest invalidate failed: %s",
+            esp_err_to_name(invalidate_result));
         return;
     }
     wqn::services::RequestContentRefresh(wqn::services::SyncContentDomain::kWordPacks);

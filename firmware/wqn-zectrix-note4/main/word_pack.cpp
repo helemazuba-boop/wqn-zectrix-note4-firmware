@@ -771,6 +771,35 @@ esp_err_t InitWordPackStorage()
     return ESP_OK;
 }
 
+esp_err_t InvalidateWordPackManifestTransaction(void*)
+{
+    // Drops ONLY the manifest. The pack files are deliberately left behind: the
+    // pack sync's own NOT_FOUND branch already calls ResetWordPackStorageCache
+    // to clear them, and it does so on the cloud lane rather than on whatever
+    // task asked for the invalidation.
+    const char* manifest_paths[] = {
+        kManifestPath,
+        kManifestTempPath,
+        kManifestBackupPath,
+    };
+    for (const char* path : manifest_paths) {
+        if (std::remove(path) != 0 && errno != ENOENT) {
+            return ESP_FAIL;
+        }
+    }
+    return ESP_OK;
+}
+
+esp_err_t InvalidateWordPackManifest()
+{
+    // [dev-diag] Used by the sync dialog's "re-download word packs" action.
+    // Measured on a device holding multi-MB packs: dropping the whole cache from
+    // the UI task took 25.7 s and froze it, while this manifest-only variant is
+    // ~1.5 s and leaves the expensive part to the lane.
+    return services::ExecuteStorageTransaction(
+        InvalidateWordPackManifestTransaction, nullptr);
+}
+
 esp_err_t ResetWordPackStorageCache()
 {
     runtime::SleepLease storage_lease = runtime::SleepLease::TryAcquire(
