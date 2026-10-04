@@ -144,6 +144,9 @@ esp_err_t SaveAgentDetailLevelForeground(uint8_t level);
 // session record, so it survives a finished/cleared session. Reset to 0 when
 // the deck scope changes (the index is relative to the scoped library).
 esp_err_t LoadWordSequentialCursor(uint32_t* cursor);
+// [storage-single-writer] Foreground storage write: a tiny NVS value that must
+// not queue behind a multi-MB pack sync. It used to run the NVS primitives
+// inline on the caller's task, which is the UI task for most callers.
 esp_err_t SaveWordSequentialCursor(uint32_t cursor);
 
 // Default word deck for the device (empty = all decks). The word page's

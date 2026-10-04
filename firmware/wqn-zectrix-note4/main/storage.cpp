@@ -1522,11 +1522,18 @@ esp_err_t LoadWordSequentialCursor(uint32_t* cursor)
 
 esp_err_t SaveWordSequentialCursor(uint32_t cursor)
 {
+    // [storage-single-writer] This used to be a raw inline
+    // nvs_set_u64 + nvs_commit on the CALLER's task, bypassing StorageService
+    // entirely -- and most callers run on the UI task. Foreground, for the same
+    // reason SaveWordSessionCursor is: this is a tiny write that must not queue
+    // behind a multi-MB pack sync.
     StorageWriteGuard write("save-word-cursor", __FILE__, __LINE__);
     if (!write) {
         return ESP_ERR_INVALID_STATE;
     }
-    return SaveU64ToNvs(kWordSequentialCursorKey, cursor);
+    U64WriteContext context = {kWordSequentialCursorKey, cursor};
+    return services::ExecuteForegroundStorageTransaction(
+        SaveU64Transaction, &context, "save-word-cursor");
 }
 
 esp_err_t SaveDefaultWordDeckId(const std::string& deck_id)
