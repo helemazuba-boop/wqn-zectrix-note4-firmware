@@ -64,6 +64,17 @@ file(GLOB_RECURSE firmware_sources
     "${WQN_PROJECT_DIR}/components/*.cpp"
     "${WQN_PROJECT_DIR}/components/*.h")
 
+# [storage-single-writer] The only files allowed to contain a SPIFFS mutation
+# primitive. Each is reached through a StorageService transaction.
+set(spiffs_writer_files
+    main/storage.cpp
+    main/word_study_store.cpp
+    main/note_store.cpp
+    main/problem_store.cpp
+    main/word_pack.cpp
+    main/note_pack.cpp
+    main/problem_pack.cpp)
+
 set(deep_sleep_call_count 0)
 foreach(source IN LISTS firmware_sources)
     wqn_read("${source}" contents)
@@ -117,6 +128,46 @@ foreach(source IN LISTS firmware_sources)
        NOT source STREQUAL "main/runtime/storage_schema.cpp")
         message(FATAL_ERROR
             "M8 architecture gate: ${source}: NVS write bypasses StorageService/schema bootstrap")
+    endif()
+
+    # [storage-single-writer] SPIFFS mutation primitives are confined to the
+    # seven files that own durable pack/store I/O; every one of them is reached
+    # through a StorageService transaction. The journal's raw rename sequence
+    # was the one path that bypassed the owner task, and this is what keeps the
+    # next one from being added silently. Balanced against the NVS rule above,
+    # which already had a file allowlist.
+    #
+    # NOT enforced here: which task performs the write. A caller-level check
+    # belongs to the STORAGE-ENTRYPOINT rule and to the storage service's own
+    # caller accounting, not to a text scan.
+    #
+    # Pattern notes, all verified against the tree:
+    #  * fopen: any mode containing w, a or + is a writing mode ("rb" is not).
+    #  * std::remove is constrained to a path-looking argument, because the
+    #    <algorithm> erase-remove idiom shares the name; the writer files always
+    #    pass a *Path variable or a .c_str() path, the idiom never does.
+    #  * bare rename/unlink are constrained the same way.
+    if(NOT source IN_LIST spiffs_writer_files)
+        if(contents MATCHES "fopen[ \t\r\n]*\\([^;]*\"[^\"]*[wa+][^\"]*\"")
+            message(FATAL_ERROR
+                "M8 architecture gate: ${source}: rule SPIFFS-WRITER: fopen with a writing mode -- route durable writes through StorageService")
+        endif()
+        if(contents MATCHES "std::rename[ \t\r\n]*\\(")
+            message(FATAL_ERROR
+                "M8 architecture gate: ${source}: rule SPIFFS-WRITER: std::rename -- route file replacement through StorageService")
+        endif()
+        if(contents MATCHES "unlink[ \t\r\n]*\\(")
+            message(FATAL_ERROR
+                "M8 architecture gate: ${source}: rule SPIFFS-WRITER: unlink -- route file removal through StorageService")
+        endif()
+        if(contents MATCHES "std::remove[ \t\r\n]*\\([^;]*([Pp]ath|c_str)")
+            message(FATAL_ERROR
+                "M8 architecture gate: ${source}: rule SPIFFS-WRITER: std::remove on a path -- route file removal through StorageService")
+        endif()
+        if(contents MATCHES "(^|[^:_[:alnum:]])rename[ \t\r\n]*\\([^;]*([Pp]ath|c_str)")
+            message(FATAL_ERROR
+                "M8 architecture gate: ${source}: rule SPIFFS-WRITER: rename on a path -- route file replacement through StorageService")
+        endif()
     endif()
 endforeach()
 
