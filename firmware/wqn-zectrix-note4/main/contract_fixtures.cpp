@@ -2332,10 +2332,17 @@ bool CheckAgentGatewayV0Contract()
         return false;
     }
 
-    // --- question without options: the fixture's negative case --------------
+    // --- question without options: the abort-only ask ----------------------
     //
-    // The gateway is what projects a form into two options, so a question frame
-    // with none is a malformed frame, not a question with no choices.
+    // A form field with nothing to choose between projects to an EMPTY option
+    // list, not to a malformed frame: the ask must still reach the UI so the
+    // user can escape it (opencode_client.cpp states this as the contract). Only
+    // a missing question_id makes the frame unanswerable.
+    //
+    // This block used to assert the opposite -- "a question frame with none is a
+    // malformed frame" -- which 56c87bd invalidated when it made empty options
+    // valid. The stale assertion kept the whole boot self-test red, which in turn
+    // masked every check appended after it in the chain.
     std::string empty_options = kAgentQuestionStream;
     const size_t options_start = empty_options.find("\"options\": [");
     if (!Require(options_start != std::string::npos, "agent options mutation anchor")) {
@@ -2358,8 +2365,26 @@ bool CheckAgentGatewayV0Contract()
     cJSON_Delete(frames);
     if (!Require(
             wqn::ParseOpenCodeAgentFrame("agent.question", question_data, &unknown_event) ==
-                ESP_ERR_INVALID_RESPONSE,
-            "agent question with no options is rejected")) {
+                ESP_OK,
+            "agent question with no options parses as the abort-only ask") ||
+        !Require(unknown_event.kind == wqn::OpenCodeEventKind::kQuestion,
+                 "abort-only ask is still a question") ||
+        !Require(unknown_event.question_options.empty(),
+                 "abort-only ask carries no options")) {
+        return false;
+    }
+
+    // --- question without an id: unanswerable, so refused -------------------
+    //
+    // The reply route needs the id, so arming an id-less ask would hold the
+    // option bar for the rest of the run with no way to clear it. This is the
+    // genuine negative case for the question frame.
+    if (!Require(
+            wqn::ParseOpenCodeAgentFrame(
+                "agent.question",
+                R"json({"session_id":"ses_a","title":"哪个？","options":[]})json",
+                &unknown_event) == ESP_ERR_INVALID_RESPONSE,
+            "agent question without an id is rejected")) {
         return false;
     }
 
@@ -2518,7 +2543,7 @@ namespace wqn {
 
 bool RunContractFixtureSelfTest()
 {
-    const bool ok =
+    bool contract_ok =
         CheckPollPaired() &&
         CheckPollNoPending() &&
         CheckPollAlreadyPaired() &&
@@ -2539,8 +2564,15 @@ bool RunContractFixtureSelfTest()
         RunTimeAppStateSelfTest() &&
         RunWordPageStateSelfTest() &&
         RunNotePageStateSelfTest() &&
-        RunProblemPageStateSelfTest() &&
-        RunUiGateSelfTest();
+        RunProblemPageStateSelfTest();
+
+    // [ui-gates] Runs OUTSIDE the && chain on purpose. The chain short-circuits
+    // on the first failing contract check, and one contract fixture was already
+    // red on the agent gateway, so a gate assertion appended to the end was
+    // never reached -- the §4.2 acceptance tests were silent on exactly the
+    // device that needed them. A red contract must not hide a red gate.
+    const bool gates_ok = RunUiGateSelfTest();
+    const bool ok = contract_ok && gates_ok;
 
     if (ok) {
         ESP_LOGI(kTag, "contract fixture self-test passed");
