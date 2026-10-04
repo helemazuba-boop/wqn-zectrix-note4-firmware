@@ -547,24 +547,6 @@ bool SetSessionCursorOrdinal(
     return false;
 }
 
-bool SnapshotMatches(
-    const wqn::StoredWordSessionData& session,
-    const wqn::protocol::word_study_v1::CandidatePageData& page)
-{
-    if (session.snapshot.size() != page.snapshot.size()) return false;
-    for (size_t index = 0; index < session.snapshot.size(); ++index) {
-        const auto& stored = session.snapshot[index];
-        const auto& remote = page.snapshot[index];
-        if (remote.deck_id != stored.deck_id ||
-            remote.content_revision != stored.content_revision ||
-            remote.pack_revision != stored.pack_revision ||
-            remote.sha256 != stored.sha256) {
-            return false;
-        }
-    }
-    return true;
-}
-
 uint16_t ClampUint16(size_t value)
 {
     return static_cast<uint16_t>(std::min<size_t>(value, UINT16_MAX));
