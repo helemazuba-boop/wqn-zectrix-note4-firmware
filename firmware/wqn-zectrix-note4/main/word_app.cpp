@@ -1254,16 +1254,20 @@ void ResetWordSessionsForScopeChange(WordAppState* state, bool clear_persisted)
             : state->session.persisted.remote.session_id.c_str(),
         clear_persisted ? 1 : 0);
     if (clear_persisted) {
-        for (const auto mode : kPersistedSessionModes) {
-            ESP_ERROR_CHECK_WITHOUT_ABORT(ClearPersistedWordSession(mode));
-        }
+        // [word-scope-reset] ONE transaction: commit the new scope generation
+        // first (so every existing session file is inert from that instant),
+        // then remove the four session files and the walk cursor. The old form
+        // was four independent background transactions plus a raw NVS write, so
+        // it could stop between clears and leave a half-wiped scope behind.
+        ESP_ERROR_CHECK_WITHOUT_ABORT(wqn::ResetWordSessionScope());
+    } else {
+        // The durable half already ran inside the default-deck transaction; the
+        // walk cursor is the only piece that one does not reset.
+        ESP_ERROR_CHECK_WITHOUT_ABORT(SaveWordSequentialCursor(0));
     }
     state->session = WordSessionState{};
     state->review = WordReviewRuntime{};
     state->chain = WordSessionChain{};
-    // The library walk's cursor indexes the scoped library, so a scope switch
-    // invalidates it.
-    ESP_ERROR_CHECK_WITHOUT_ABORT(SaveWordSequentialCursor(0));
     state->review_session_resumable = false;
     state->shuffle_session_resumable = false;
     state->mistakes_session_resumable = false;

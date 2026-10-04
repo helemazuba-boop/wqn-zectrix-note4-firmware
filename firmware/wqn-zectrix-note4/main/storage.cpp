@@ -1709,10 +1709,75 @@ esp_err_t ChangeDefaultWordDeckForeground(const std::string& deck_id)
         DeckScopeChangeTransaction, &context, "word-deck-change");
 }
 
+// [word-scope-reset] Drops every word session after a scope switch that does
+// NOT change the default deck (the [词] row on the note page, and leaving a
+// scoped word screen). Same shape as DeckScopeChangeTransaction above and the
+// same reason it needs no marker: the scope generation is committed FIRST, which
+// makes every existing session file inert immediately (the load side rejects a
+// snapshot whose stamped generation differs), so the four removals degrade into
+// idempotent garbage collection. A power cut at any point therefore leaves
+// either the old sessions intact or the new generation with orphan files that a
+// later reset removes -- never a half-wiped scope that boot would resume.
+//
+// kDefaultWordDeckKey is deliberately untouched: this path scopes the word page,
+// it does not change what "default deck" means.
+struct WordSessionScopeResetContext {};
+
+esp_err_t WordSessionScopeResetTransaction(void*)
+{
+    const uint32_t committed = g_deck_scope_generation.load(std::memory_order_acquire);
+    uint32_t target_generation = committed + 1;
+    if (target_generation == 0) {
+        target_generation = 1;  // uint32 wrap: 0 is "never initialized"
+    }
+    // Step 1: the linearization point. Everything below is cleanup.
+    ESP_RETURN_ON_ERROR(
+        SaveU64ToNvsRaw(kDeckScopeGenKey, target_generation),
+        kTag, "word scope reset: commit generation");
+    g_deck_scope_generation.store(target_generation, std::memory_order_release);
+
+    // Step 2: remove the four session files. STORAGE TASK ONLY -- the direct
+    // ClearPersistedWordSession calls rely on the service-task passthrough,
+    // exactly as ApplyDeckScopeChangeLocked does above.
+    const wqn::protocol::word_study_v1::Mode modes[] = {
+        wqn::protocol::word_study_v1::Mode::kSequential,
+        wqn::protocol::word_study_v1::Mode::kReview,
+        wqn::protocol::word_study_v1::Mode::kShuffle,
+        wqn::protocol::word_study_v1::Mode::kMistakes,
+    };
+    for (const auto mode : modes) {
+        ESP_RETURN_ON_ERROR(
+            ClearPersistedWordSession(mode),
+            kTag, "word scope reset: clear session");
+    }
+
+    // Step 3: the library walk's cursor indexes the scoped library, so a scope
+    // switch invalidates it.
+    ESP_RETURN_ON_ERROR(
+        SaveWordSequentialCursor(0), kTag, "word scope reset: clear cursor");
+    return ESP_OK;
+}
+
 esp_err_t RecoverDefaultDeckScopeChange()
 {
     return services::ExecuteStorageTransactionNamed(
         RecoverDeckScopeTransaction, nullptr, "word-deck-recover");
+}
+
+esp_err_t ResetWordSessionScope()
+{
+    // One foreground transaction, matching ChangeDefaultWordDeckForeground: this
+    // is a small write that must not queue behind a multi-MB pack sync. Callers
+    // run on the UI task and block for its duration (C6b moves that off the UI
+    // task); the win over the previous four separate transactions is that they
+    // are now one write, generation-first, so an in-flight observation commit is
+    // rejected instead of silently re-materializing a wiped session.
+    StorageWriteGuard write("word-scope-reset", __FILE__, __LINE__);
+    if (!write) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    return services::ExecuteForegroundStorageTransaction(
+        WordSessionScopeResetTransaction, nullptr, "word-scope-reset");
 }
 
 uint32_t GetDeckScopeGeneration()

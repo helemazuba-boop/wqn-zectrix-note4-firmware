@@ -171,6 +171,12 @@ esp_err_t RecoverDefaultDeckScopeChange();
 // rejected on load when it no longer matches (second line of defense behind
 // the marker protocol). Atomic; safe from any task.
 uint32_t GetDeckScopeGeneration();
+// [word-scope-reset] Drops every word session after a word-page scope switch
+// that does not change the default deck: commits a new scope generation first
+// (making existing session files inert), then removes the four session files and
+// the walk cursor. One foreground storage transaction; blocks its caller, which
+// today is the UI task.
+esp_err_t ResetWordSessionScope();
 esp_err_t LoadVolumePercent(int* percent);
 esp_err_t SaveVolumePercent(int percent);
 // [persist-worker] Worker-dedicated variant (see SaveAutoSyncIntervalMinutesForeground).
