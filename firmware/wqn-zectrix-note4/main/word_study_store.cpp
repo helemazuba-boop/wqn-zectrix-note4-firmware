@@ -626,6 +626,11 @@ esp_err_t LoadSessionFile(const char* path, wqn::PersistedWordSession* session)
     return ESP_OK;
 }
 
+// [load-repair] Writes: when the primary session file is torn (a power cut
+// mid-commit) and the backup is intact, this promotes the backup back to primary
+// so the next read is served by one file. That is the healing of the read it
+// just performed, and it has to run on the storage task that owns the file,
+// which is why it lives inside the load instead of in a separate repair pass.
 esp_err_t LoadSessionSlotRaw(
     wqn::protocol::word_study_v1::Mode mode,
     wqn::PersistedWordSession* session)
@@ -1215,6 +1220,14 @@ struct LoadSessionContext {
     wqn::PersistedWordSession* session;
 };
 
+// [load-repair] Writes three things, all of them the reconciliation of the
+// session it just read against the durable outbox: re-derive the cursor when the
+// outbox shows more acks than the snapshot recorded, checkpoint the sessions
+// from the outbox before repairing its tail, and compact the outbox when it was
+// read from a backup or ended mid-record. Doing this inside the read is what
+// makes the on-disk snapshot agree with the outbox before any UI decision is
+// made from it; splitting it into a separate pass would let a caller act on an
+// unreconciled snapshot.
 esp_err_t LoadSessionTransaction(void* opaque)
 {
     auto* context = static_cast<LoadSessionContext*>(opaque);

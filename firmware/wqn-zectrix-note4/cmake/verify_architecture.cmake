@@ -171,6 +171,70 @@ foreach(source IN LISTS firmware_sources)
     endif()
 endforeach()
 
+# [load-repair] Functions named Load* that nevertheless write. They are not
+# accidents and not laziness: each one is a recovery or repair step that has to
+# run on the same task that owns the read, because the write it performs is the
+# healing of the thing it just read (promote the backup, re-derive the cursor
+# from the durable outbox, drop a corrupt cache entry). Splitting them is future
+# work; until then they must stay annotated so nobody mistakes one for a pure
+# read -- and so the build can tell the day the split actually lands.
+#
+# Format: <relative path>|<function name>, one per declared writable Load. The
+# annotation requirement is per FILE and counted, so removing the annotation on
+# the second Load in a file is caught, not just the first.
+set(declared_load_repairs
+    main/word_study_store.cpp|LoadSessionSlotRaw
+    main/word_study_store.cpp|LoadSessionTransaction
+    main/note_store.cpp|LoadSessionRaw
+    main/note_store.cpp|LoadSessionTransaction
+    main/note_pack.cpp|LoadNoteImageTransaction
+    main/note_pack.cpp|LoadCachedNoteImage)
+
+set(load_repair_files "")
+foreach(entry IN LISTS declared_load_repairs)
+    string(REPLACE "|" ";" parts "${entry}")
+    list(GET parts 0 repair_file)
+    if(NOT repair_file IN_LIST load_repair_files)
+        list(APPEND load_repair_files "${repair_file}")
+    endif()
+endforeach()
+
+foreach(repair_file IN LISTS load_repair_files)
+    set(repair_required 0)
+    foreach(entry IN LISTS declared_load_repairs)
+        string(REPLACE "|" ";" parts "${entry}")
+        list(GET parts 0 declared_file)
+        if(declared_file STREQUAL repair_file)
+            math(EXPR repair_required "${repair_required} + 1")
+        endif()
+    endforeach()
+
+    wqn_read("${repair_file}" contents)
+
+    # Every declared function must still be defined here -- a rename, or a split
+    # into a pure read plus a separate repair, has to update this list rather
+    # than leave a stale entry pointing at nothing.
+    foreach(entry IN LISTS declared_load_repairs)
+        string(REPLACE "|" ";" parts "${entry}")
+        list(GET parts 0 declared_file)
+        list(GET parts 1 declared_function)
+        if(declared_file STREQUAL repair_file)
+            string(FIND "${contents}" "esp_err_t ${declared_function}(" definition_at)
+            if(definition_at EQUAL -1)
+                message(FATAL_ERROR
+                    "M8 architecture gate: ${repair_file}: rule LOAD-REPAIR: ${declared_function} is declared as a writable Load but is no longer defined -- update declared_load_repairs when the read/write split lands")
+            endif()
+        endif()
+    endforeach()
+
+    string(REGEX MATCHALL "\\[load-repair\\]" repair_markers "${contents}")
+    list(LENGTH repair_markers repair_marker_count)
+    if(repair_marker_count LESS repair_required)
+        message(FATAL_ERROR
+            "M8 architecture gate: ${repair_file}: rule LOAD-REPAIR: ${repair_required} writable Load(s) but ${repair_marker_count} // [load-repair] annotation(s) -- name the write each one performs")
+    endif()
+endforeach()
+
 set(removed_problem_prototype_patterns
     "CachedProblem"
     "PendingReviewResult"

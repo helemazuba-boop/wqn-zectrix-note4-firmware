@@ -1531,6 +1531,10 @@ struct LoadNoteImageContext {
     std::vector<uint8_t>* wqni = nullptr;
 };
 
+// [load-repair] Writes: a cache entry that fails its own header or payload
+// check is corrupt (a power cut during the download that stored it), so it is
+// unlinked rather than returned. Serving it would render a corrupt panel, and
+// leaving it would make every later read fail the same check.
 esp_err_t LoadNoteImageTransaction(void* opaque)
 {
     auto* context = static_cast<LoadNoteImageContext*>(opaque);
@@ -1652,6 +1656,9 @@ esp_err_t ValidateNoteImageWqni(const uint8_t* data, size_t size)
     return ESP_OK;
 }
 
+// [load-repair] Writes through LoadNoteImageTransaction: the public read entry
+// point whose transaction unlinks corrupt cache entries, so the annotation belongs
+// here too.
 esp_err_t LoadCachedNoteImage(const std::string& image_id, std::vector<uint8_t>* wqni)
 {
     if (wqni == nullptr || !IsNoteImageId(image_id)) {
