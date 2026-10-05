@@ -6,6 +6,7 @@
 #include "ai_session.h"
 #include "display_service.h"
 #include "flash_session.h"
+#include "opencode_session.h"
 #include "ui/persist_worker.h"
 #include "provision_manager.h"
 
@@ -688,6 +689,14 @@ void HandleUiInput(UiState* state, UiInput input)
     if (screen_before == wqn::UiScreen::kAi && state->screen != wqn::UiScreen::kAi &&
         state->ai.tier == wqn::AiTier::kFlash) {
         wqn::StopFlashSession();
+    }
+    // [agent] B3 / D-lease: leaving the AI screen from the Agent tier drops its
+    // event stream and the sleep lease behind it. Not gated on the tier being
+    // current -- a user who cycles to another tier and then leaves hits the tier
+    // cycle first, which already released; this is the same release for the user
+    // who leaves straight from the Agent tier.
+    if (screen_before == wqn::UiScreen::kAi && state->screen != wqn::UiScreen::kAi) {
+        wqn::LeaveOpenCodeAgentTier();
     }
 #endif
 }

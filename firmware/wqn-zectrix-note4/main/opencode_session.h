@@ -43,6 +43,12 @@ esp_err_t ReplyPendingOpenCodePermission(bool approve);
 esp_err_t ReplyPendingOpenCodeQuestion(int index);
 esp_err_t StartOpenCodeVoiceInput();
 esp_err_t StopOpenCodeVoiceInput();
+// [agent] B3 / D-lease: called when the UI leaves the Agent tier (a tier cycle,
+// or leaving the AI screen entirely). Detaches from the attached stream without
+// asking upstream to stop anything -- the cloud run keeps going -- and drops the
+// sleep lease the stream was holding. Safe to call when nothing is attached;
+// see the definition in opencode_session.cpp.
+void LeaveOpenCodeAgentTier();
 // [voice-pipe] Down short press during a capture phase. While recording this
 // hard-aborts the WS turn (audio discarded, nothing submitted); while
 // transcribing it soft-cancels (the transcript is discarded when it lands).

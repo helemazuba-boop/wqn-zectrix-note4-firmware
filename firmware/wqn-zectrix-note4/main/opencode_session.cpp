@@ -112,6 +112,14 @@ bool g_voice_abort_requested = false;
 std::string g_voice_last_error;
 wqn::runtime::SleepLease g_agent_sleep_lease;
 wqn::services::ConnectivityDemand g_connectivity_demand;
+// [agent] Set while an observe stream is attached and has seen a frame that
+// proves the watched session has work in flight (a delta, a segment, a tool, an
+// ask). It exists because the other two run-in-flight signals cannot learn this
+// one: the picker snapshot is a fixed point in time, and the device's own run
+// is by definition not an observe. Without it, a session that was idle when the
+// list was read and started running while the device sat on it would never be
+// seen as running again until the picker was reopened.
+bool g_observed_run_live = false;
 
 void DiscardOutboundReplies();
 // Declared up here: clearing a pending ask is part of every terminal status and
@@ -129,6 +137,9 @@ esp_err_t AcquireAgentLeaseLocked();
 // so the view does not keep an open tool block the terminal frame would have
 // closed.
 void ResetAgentHistoryTurnLocked();
+// The lease criterion lives down with ReleaseWorkOwnershipLocked, but
+// OnOpenCodeEvent and every worker tail call it from far above its definition.
+void RefreshAgentRunLeaseLocked();
 
 void MarkChangedLocked()
 {
@@ -148,6 +159,125 @@ void ReleaseWorkOwnershipLocked()
     g_agent_sleep_lease.Reset();
 }
 
+// [agent] The agent's sleep-lease criterion -- items B1 and B3 (D-lease) of
+// doc/1005-opencode-bidi-gap-plan.md §0.1.
+//
+// B1 makes "a stream is attached" the default state of the AI page, so it can
+// no longer be a reason to stay awake: an idle session's stream stays open for
+// as long as nothing detaches it. The revision before this one acquired the
+// lease on every entry point and only released it in a worker tail, so having
+// the AI page open at all pinned the device awake -- the 60-second idle deep
+// sleep the rest of the product is built around never ran once a session was
+// locked.
+//
+// The criterion is therefore NOT "a stream is attached" and NOT "the AI page is
+// open". It is "a run this device can still see is in flight", from three
+// sources:
+//
+//   1. the device's own submitted run, from its first frame to its terminal one;
+//   2. the gateway's `outcome` for the session being watched, which it computed
+//      from two upstream reads and which contract 2.2 now delivers with the
+//      list (see OpenCodeSessionOutcome);
+//   3. a frame on the attached observe stream that carries actual work.
+//
+// (2) is a snapshot and cannot learn that a session which was idle when the
+// list was read has since started running -- which is exactly the case where
+// the device is sitting on an attached stream with nothing else to look at.
+// (3) closes that hole from the stream itself, at the cost of no request.
+//
+// Sources (2) and (3) are both gated on a stream being attached, and that gate
+// is what bounds the snapshot. Without it a `running` row read when the picker
+// opened would keep claiming a run in flight after the stream that justified it
+// had gone, and the lease would be held for the rest of the session's life on a
+// session nobody is watching -- the same stuck-awake failure B3 exists to end.
+// Re-reading the picker is the only way to refresh the claim, which is the
+// honest cost: it costs one request and it happens whenever the user looks.
+//
+// Two non-run cases are held as well, because they are agent work in progress
+// rather than agent work observable: a voice capture owns the codec and an ASR
+// turn, and a transcript backfill chained behind a finished run was explicitly
+// handed the lease by the tail that armed it. Both clear in seconds.
+//
+// The failing direction is the one worth stating. kUnknown and an absent
+// `outcome` both mean NO run in flight, so an unrecognised or missing value can
+// only ever release the lease EARLY: the run keeps executing in the cloud
+// untouched, and the next lock re-reads the list. Reading either as running
+// would hold the lease on a session that is merely fresh, and the device would
+// never sleep again -- the exact failure this function was written to end.
+bool AgentRunInFlightLocked()
+{
+    // A voice capture owns the codec and the ASR turn. This is the case the
+    // lease was introduced for and it must not regress.
+    if (g_state.ui.phase == wqn::AiFeaturePhase::kLoading ||
+        g_state.ui.phase == wqn::AiFeaturePhase::kRecording ||
+        g_state.ui.phase == wqn::AiFeaturePhase::kTranscribing) {
+        return true;
+    }
+    // A brief-tier run's digest exists only in the history projection, so the
+    // run tail chains a backfill behind itself and hands it the lease rather
+    // than releasing it. Refreshing means that handoff happened.
+    if (g_history_refresh) {
+        return true;
+    }
+    // The device's own run. `g_observing` is what separates it from an observe:
+    // both set stream_active, and only this one is the device's own work.
+    if (!g_observing && g_state.stream_active) {
+        return true;
+    }
+    // Everything below is a claim about somebody else's run, which this device
+    // can only make while it is attached to that session's stream.
+    if (!g_observing || !g_state.stream_active) {
+        return false;
+    }
+    for (const wqn::AgentSessionOption& option : g_state.sessions) {
+        if (option.id != g_state.current_session_id) {
+            continue;
+        }
+        if (option.outcome == wqn::OpenCodeSessionOutcome::kRunning) {
+            return true;
+        }
+    }
+    return g_observed_run_live;
+}
+
+// Aligns the lease with AgentRunInFlightLocked. Every agent path that used to
+// hand ownership back unconditionally calls this instead, so there is exactly
+// one place that answers the question and one comment explaining it.
+void RefreshAgentRunLeaseLocked()
+{
+    if (AgentRunInFlightLocked()) {
+        AcquireAgentLeaseLocked();
+        return;
+    }
+    g_agent_sleep_lease.Reset();
+}
+
+// Rewrites the watched session's row in the picker snapshot to what the stream
+// just proved about it, and drops the stream's own evidence.
+//
+// Without this the snapshot keeps saying `running` after the run it described
+// has ended, and source (2) of the criterion above reads that as "a run is in
+// flight" for as long as the list goes unread -- the device then never sleeps
+// again, which is the same failure as the one B3 was written to end. The
+// stream is the authority while it is attached; this is the moment it hands
+// that authority back.
+//
+// `running` maps to kUnknown rather than kSucceeded on purpose: a terminal
+// status can end in a failure (an `agent.error` frame arrives as error + idle),
+// and claiming a success the device never saw would be a lie in the picker.
+void SettleWatchedSessionOutcomeLocked()
+{
+    for (wqn::AgentSessionOption& option : g_state.sessions) {
+        if (option.id != g_state.current_session_id) {
+            continue;
+        }
+        if (option.outcome == wqn::OpenCodeSessionOutcome::kRunning) {
+            option.outcome = wqn::OpenCodeSessionOutcome::kUnknown;
+        }
+    }
+    g_observed_run_live = false;
+}
+
 void SetErrorLocked(const std::string& message)
 {
     g_state.ui.phase = wqn::AiFeaturePhase::kError;
@@ -162,7 +292,11 @@ void SetErrorLocked(const std::string& message)
     // be answered and would hold the option bar against the next turn's asks.
     ClearAllAsksLocked();
     MarkChangedLocked();
-    ReleaseWorkOwnershipLocked();
+    // B3: an error ends this device's view of the run, not the run. The
+    // criterion decides what is left to wait for -- and the answer it used to
+    // give unconditionally ("release everything") is what pinned the device
+    // awake on a session that had been idle for an hour.
+    RefreshAgentRunLeaseLocked();
 }
 
 bool ArmWorkerLocked(WorkerCommand command)
@@ -284,6 +418,10 @@ bool FinishSwitchedStreamLocked()
     // outbound queue that would carry its replies is discarded by the caller.
     ClearAllAsksLocked();
     g_observing = false;
+    // The stream we just left is the only thing that could still have proven a
+    // run was live, and it is gone. Its evidence goes with it: the follow-up
+    // that inherits this state decides its own lease from its own facts.
+    g_observed_run_live = false;
     g_state.stream_active = false;
     g_state.ui.phase = wqn::AiFeaturePhase::kLoading;
     g_state.ui.status_label = "正在切换";
@@ -316,6 +454,20 @@ bool FinishSwitchedStreamLocked()
     wqn::GetAiHistory(wqn::AiHistoryChannel::kAgent).Clear();
     ResetAgentHistoryTurnLocked();
     MarkChangedLocked();
+    if (follow_up == WorkerCommand::kNone) {
+        // [agent] D-lease: a switch with nothing to switch to. This is what
+        // leaving the AI page raises -- detach from the stream, ask upstream to
+        // stop nothing, and do not chain another command. Every other follow-up
+        // is network work that inherits the lease; there is none here, so the
+        // handover the comment above describes would otherwise leave the lease
+        // held by an idle worker with no stream and no reason.
+        //
+        // The criterion now reads no: stream_active and g_observing were cleared
+        // at the top of this function, so both of its remote-run sources are
+        // gone and what is left on screen belongs to a session nobody is
+        // watching. The device is free to sleep through a run it left behind.
+        RefreshAgentRunLeaseLocked();
+    }
     ChainWorkerCommandLocked(follow_up);
     return true;
 }
@@ -395,6 +547,7 @@ void LoadSessions()
             // so the next observe must backfill again.
             g_state.history_loaded_session_id.clear();
             g_observing = false;
+            g_observed_run_live = false;
             g_state.ui.context_label.clear();
             g_state.ui.prompt_text.clear();
             g_state.ui.response_text.clear();
@@ -987,9 +1140,11 @@ void OnOpenCodeEvent(const wqn::OpenCodeEvent& event, void*)
                         g_state.ui.status_label = "观察结束";
                         g_state.ui.activity_text = "无运行中任务或任务已结束";
                     }
-                    g_state.ui.action_hint = g_observing
-                        ? "长按确认录音 · 双击确认观察"
-                        : "长按确认发起新任务";
+                    // The observe hint is gone with the observe gesture: B1
+                    // attaches by entering, so there is no double-press to
+                    // offer. What is left is the ordinary capture, exactly as it
+                    // reads on any session the device did not observe.
+                    g_state.ui.action_hint = "长按确认发起新任务";
                 }
             } else if (event.status == "error") {
                 // A terminal error status: v2's gateway does not emit this
@@ -1258,6 +1413,41 @@ void OnOpenCodeEvent(const wqn::OpenCodeEvent& event, void*)
             MarkChangedLocked();
             break;
     }
+    // [agent] B1/B3: every frame can change whether the watched session has a
+    // run in flight, and this is the only place the device learns it from. An
+    // observe attached to a session the picker called idle gets its first
+    // status frame here; the moment that session starts working, the deltas
+    // arrive here. Deciding at the entry points instead would make the lease
+    // answer to "what the picker said when it was opened", which is exactly the
+    // staleness B3 exists to remove.
+    switch (event.kind) {
+        // Frames that ARE a run in progress. A kText with empty text counts:
+        // it is the cloud's round-boundary frame and only a live round emits
+        // one. Status frames deliberately do not -- a terminal `idle` clears
+        // the marks below rather than setting them.
+        case wqn::OpenCodeEventKind::kTextDelta:
+        case wqn::OpenCodeEventKind::kText:
+        case wqn::OpenCodeEventKind::kReasoningDelta:
+        case wqn::OpenCodeEventKind::kReasoning:
+        case wqn::OpenCodeEventKind::kTool:
+        case wqn::OpenCodeEventKind::kPermission:
+        case wqn::OpenCodeEventKind::kQuestion:
+            if (g_observing) {
+                g_observed_run_live = true;
+            }
+            break;
+        default:
+            break;
+    }
+    if (g_observing && (event.kind == wqn::OpenCodeEventKind::kStatus) &&
+        (event.status == "idle" || event.status == "error")) {
+        // The observed run reached its terminal frame. The stream is the
+        // authority while it is attached, so its word is final: the snapshot
+        // row that said `running` and any delta evidence collected here both
+        // go, or the lease stays held on a run that has ended.
+        SettleWatchedSessionOutcomeLocked();
+    }
+    RefreshAgentRunLeaseLocked();
     xSemaphoreGive(g_lock);
 }
 
@@ -1408,7 +1598,7 @@ void RunPrompt()
         g_state.ui.activity_text = "任务已按确认键中止";
         g_state.ui.action_hint = "长按确认发起新任务";
         g_state.stream_active = false;
-        ReleaseWorkOwnershipLocked();
+        RefreshAgentRunLeaseLocked();
         MarkChangedLocked();
     } else if (result != ESP_OK && !g_run_failed) {
         SetErrorLocked(api_result.detail.empty() ? "Agent 执行连接失败" : api_result.detail);
@@ -1424,7 +1614,7 @@ void RunPrompt()
             g_history_refresh = true;
             ChainWorkerCommandLocked(WorkerCommand::kLoadHistory);
         } else {
-            ReleaseWorkOwnershipLocked();
+            RefreshAgentRunLeaseLocked();
         }
         MarkChangedLocked();
     }
@@ -1471,7 +1661,7 @@ void CreateSession()
         g_state.ui.phase = wqn::AiFeaturePhase::kIdle;
         g_state.ui.status_label = "就绪";
         g_state.ui.activity_text = "新 Session 已创建";
-        g_state.ui.action_hint = "长按确认录音 · 双击确认观察";
+        g_state.ui.action_hint = "长按确认录音";
         g_state.ui.prompt_text.clear();
         g_state.ui.response_text.clear();
         g_state.ui.scroll_offset_lines = 0;
@@ -1532,17 +1722,22 @@ void ObserveSession()
         // queue is discarded below, so a surviving ask could not be answered.
         ClearAllAsksLocked();
         g_state.stream_active = false;
-        ReleaseWorkOwnershipLocked();
+        RefreshAgentRunLeaseLocked();
         MarkChangedLocked();
     } else if (result != ESP_OK && !g_run_failed) {
         SetErrorLocked(api_result.detail.empty() ? "观察连接失败" : api_result.detail);
     } else {
         g_state.stream_active = false;
-        ReleaseWorkOwnershipLocked();
+        RefreshAgentRunLeaseLocked();
         MarkChangedLocked();
     }
     g_run_session_id.clear();
     g_observing = false;
+    // The stream that was the only evidence a run was live is gone, so that
+    // evidence is gone with it. Clearing it here (rather than leaving it to the
+    // next attach) is what stops a detached stream's last delta from holding
+    // the lease for the rest of the session's life.
+    g_observed_run_live = false;
     xSemaphoreGive(g_lock);
     DiscardOutboundReplies();
 }
@@ -1618,16 +1813,29 @@ void LoadHistory()
             MarkChangedLocked();
         }
     }
-    if (result == ESP_OK && g_observing) {
+    if (result == ESP_OK && g_observing && !refresh) {
         // Chain the observe stream behind the backfill: the stream must not
         // attach until the history it precedes is already in the channel.
         // This runs inside the kLoadHistory command, so the chain must bypass
         // ArmWorkerLocked's "worker is free" guard -- FinishCommand only
         // clears the command it just ran, so it leaves this one armed.
+        //
+        // `!refresh` is load-bearing and was not before B1: a post-run refresh
+        // (RunPrompt's brief-tier branch) inherits g_observing from the session
+        // it ran in, and without this guard every brief-tier run would end by
+        // re-attaching an observe stream to the session it just finished.
         g_run_session_id = g_state.current_session_id;
         g_state.ui.activity_text = "正在连接 Session 事件流";
         MarkChangedLocked();
         ChainWorkerCommandLocked(WorkerCommand::kObserveSession);
+        // [agent] B1: this is the path a lock takes, so it is where the attach
+        // becomes the default and where the lease has to stop being automatic.
+        // A session that was idle when the list was read gets a stream here and
+        // nothing else -- holding the lease on it would pin the device awake for
+        // as long as the stream lives, which is until something detaches it, i.e.
+        // forever. OnOpenCodeEvent revisits the decision on every frame, which
+        // is the only place that can learn an idle session has started running.
+        RefreshAgentRunLeaseLocked();
         xSemaphoreGive(g_lock);
         return;
     }
@@ -1732,10 +1940,44 @@ esp_err_t InitOpenCodeSession()
     return ESP_OK;
 }
 
+// [agent] B3 / D-lease: leaving the AI page drops the agent's claim on the
+// device's sleep, and detaches from the stream that justified it.
+//
+// It is a switch with no follow-up, which is why it goes through
+// ArmSwitchLocked rather than releasing anything itself: detaching must ask
+// upstream to stop NOTHING (the run keeps executing in the cloud, which is the
+// whole point of the switch contract) and it must go through the same handshake
+// every other detach uses. FinishSwitchedStreamLocked does the release.
+//
+// Nothing to detach is the common case -- the user left while nothing was
+// attached -- and then this is only the lease, which the criterion decides. A
+// bounded read in flight (a backfill behind a lock) is deliberately NOT counted
+// as attached: it finishes on its own within seconds and must not be swapped out
+// from under itself, and the follow-up it chains reaches the same decision.
+//
+// Idempotent and safe to call on every tier change: with no stream it is a
+// lease re-decision, and a stream already detached has nothing to re-arm.
+void LeaveOpenCodeAgentTier()
+{
+    if (g_lock == nullptr) {
+        return;
+    }
+    xSemaphoreTake(g_lock, portMAX_DELAY);
+    const bool stream_attached =
+        (g_command == WorkerCommand::kRunPrompt ||
+         g_command == WorkerCommand::kObserveSession) &&
+        g_state.stream_active;
+    if (stream_attached) {
+        ArmSwitchLocked(WorkerCommand::kNone, std::string(), nullptr);
+    } else {
+        RefreshAgentRunLeaseLocked();
+    }
+    xSemaphoreGive(g_lock);
+}
+
 esp_err_t RequestOpenCodeSessionList(OpenCodeRejectReason* reason)
 {
-    ESP_RETURN_ON_ERROR(InitOpenCodeSession(), kTag, "init OpenCode session");
-    xSemaphoreTake(g_lock, portMAX_DELAY);
+    ESP_RETURN_ON_ERROR(InitOpenCodeSession(), kTag, "init OpenCode session");    xSemaphoreTake(g_lock, portMAX_DELAY);
     if (g_command != WorkerCommand::kNone) {
         // [agent] Opening the picker is the switch entry point: the user asking
         // for the session list during a run is asking to leave that run, so the
@@ -1821,6 +2063,7 @@ esp_err_t LockSelectedOpenCodeSession(OpenCodeRejectReason* reason)
     }
     if (result != ESP_OK) {
         g_run_session_id.clear();
+        g_state.stream_active = false;
         ReleaseWorkOwnershipLocked();
         xSemaphoreGive(g_lock);
         return result;
@@ -1828,7 +2071,20 @@ esp_err_t LockSelectedOpenCodeSession(OpenCodeRejectReason* reason)
     g_state.current_session_id = selected.id;
     g_state.current_session_title = selected.title;
     g_state.session_locked = true;
-    g_observing = false;
+    // [agent] B1: locking a session IS attaching to it. Observe used to be a
+    // separate gesture, which made "open a session that already has a run in
+    // flight" the one shape that showed nothing -- the picker could not tell the
+    // user which session was running (D-which, contract 2.2), so the only way to
+    // find out was to lock one and watch it say nothing. Setting g_observing
+    // here makes LoadHistory chain kObserveSession behind the backfill, which
+    // is the whole of the change: the observe state machine, the switch
+    // handshake and the terminal handling are all reused untouched.
+    //
+    // What it costs is the lease: the attach is now unconditional, so
+    // AgentRunInFlightLocked -- not "a stream is open" -- is what decides
+    // whether this device stays awake. See the criterion's comment for why
+    // that is the only workable answer.
+    g_observing = true;
     ClearAllAsksLocked();
     // The mirrored transcript belongs to the session that produced it: drop the
     // backfill marker so the load armed above re-reads it for this session.
@@ -1837,7 +2093,10 @@ esp_err_t LockSelectedOpenCodeSession(OpenCodeRejectReason* reason)
     g_state.ui.phase = AiFeaturePhase::kLoading;
     g_state.ui.status_label = "读取历史";
     g_state.ui.activity_text = "正在读取历史对话";
-    g_state.ui.action_hint = "长按确认录音 · ↑/↓ 滚动 · 双击观察";
+    // B1 removed the observe gesture, so the hint no longer offers one. The
+    // second confirm on the status bar's detail row keeps its own meaning
+    // (edit the tier), which is exactly what it says here.
+    g_state.ui.action_hint = "长按确认录音 · ↑/↓ 滚动";
     g_state.ui.prompt_text.clear();
     g_state.ui.response_text.clear();
     g_state.ui.requires_confirmation = false;
@@ -1848,6 +2107,15 @@ esp_err_t LockSelectedOpenCodeSession(OpenCodeRejectReason* reason)
     // the new session render the previous one's bubbles.
     wqn::GetAiHistory(wqn::AiHistoryChannel::kAgent).Clear();
     ResetAgentHistoryTurnLocked();
+    // [agent] Raise stream_active with the attach, exactly as
+    // ObserveOpenCodeSession does. The chained observe it arms goes straight to
+    // ObserveSession, which never raises it -- so without this the default
+    // attach (B1) would run with stream_active false for its whole life, and
+    // two things that read that flag would silently not apply to it:
+    // ArmSwitchLocked's "a stream is attached" predicate (the user could not
+    // switch away from a default attach at all), and AgentRunInFlightLocked's
+    // lease criterion. LoadHistory clears it again on its own failure path.
+    g_state.stream_active = true;
     MarkChangedLocked();
     xSemaphoreGive(g_lock);
     return ESP_OK;
@@ -1948,6 +2216,10 @@ esp_err_t ObserveOpenCodeSession(OpenCodeRejectReason* reason)
         g_state.stream_active = true;
         // Attaching mid-stream: any assistant id from the previous run is stale.
         ResetAgentHistoryTurnLocked();
+        // The stream has not produced a frame yet, so a previous attach's
+        // evidence must not be inherited by this one -- it would hold the lease
+        // on a session this attach has seen nothing from.
+        g_observed_run_live = false;
         if (!ArmWorkerLocked(needs_history ? WorkerCommand::kLoadHistory
                                            : WorkerCommand::kObserveSession)) {
             g_run_session_id.clear();
@@ -1958,7 +2230,7 @@ esp_err_t ObserveOpenCodeSession(OpenCodeRejectReason* reason)
     if (result != ESP_OK) {
         g_observing = false;
         g_state.stream_active = false;
-        ReleaseWorkOwnershipLocked();
+        RefreshAgentRunLeaseLocked();
     }
     xSemaphoreGive(g_lock);
     return result;

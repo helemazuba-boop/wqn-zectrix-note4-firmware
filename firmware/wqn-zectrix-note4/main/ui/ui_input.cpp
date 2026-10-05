@@ -1026,6 +1026,13 @@ static RefreshSchedule ApplyStatusBarEditEvent(
                 if (prev_tier == wqn::AiTier::kFlash && next != wqn::AiTier::kFlash) {
                     wqn::StopFlashSession();
                 }
+                // [agent] B3 / D-lease: leaving the Agent tier drops its stream
+                // and its sleep lease. The cloud run, if any, keeps going --
+                // detaching is not a cancel. Coming back re-attaches below, so
+                // this is a release rather than a teardown.
+                if (prev_tier == wqn::AiTier::kAgent && next != wqn::AiTier::kAgent) {
+                    wqn::LeaveOpenCodeAgentTier();
+                }
                 // [agent] Arriving on the Agent tier with no locked session shows
                 // the picker, so fetch the list now rather than making the user
                 // press the session button first. Failure is not fatal: the
@@ -1036,6 +1043,27 @@ static RefreshSchedule ApplyStatusBarEditEvent(
                     if (wqn::RequestOpenCodeSessionList(&reason) != ESP_OK) {
                         ESP_LOGW(kTag,
                                  "AI status-bar: agent session list request failed (%s)",
+                                 AgentRejectLabel(reason));
+                    }
+                } else if (next == wqn::AiTier::kAgent &&
+                           state->agent.session_locked && !state->agent.stream_active) {
+                    // [agent] B1: arriving on the Agent tier with a session
+                    // already locked but no stream behind it re-attaches. Without
+                    // this, leaving and coming back left the previous session's
+                    // transcript on screen with nothing feeding it -- which is
+                    // symptom 3 ("entering a running session receives nothing"),
+                    // just re-reachable through a tier cycle instead of a page
+                    // entry. The transcript lives in the history channel and is
+                    // not cleared, so this re-reads the stream, not the bubbles.
+                    //
+                    // The !stream_active half matters: a stream still attached
+                    // needs nothing, and ObserveOpenCodeSession would refuse on
+                    // the busy worker anyway -- but asserting it here keeps the
+                    // log quiet about a state that is not a failure.
+                    wqn::OpenCodeRejectReason reason =
+                        wqn::OpenCodeRejectReason::kNone;
+                    if (wqn::ObserveOpenCodeSession(&reason) != ESP_OK) {
+                        ESP_LOGW(kTag, "AI status-bar: agent re-attach refused (%s)",
                                  AgentRejectLabel(reason));
                     }
                 }
