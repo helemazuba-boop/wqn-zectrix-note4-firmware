@@ -64,10 +64,10 @@ STACK_RE = re.compile(r'RenderFrameToEpd: stack HWM before render: (?P<hwm>\d+) 
 # 这七项之和与 total_ms 比——如果加起来远小于 total_ms，瓶颈不在 AtomicWrite，
 # 我们在量一个不相干的东西。
 PROBE_RE = re.compile(
-    r'atomic write: bytes=(?P<bytes>\d+) backup=(?P<backup>\d+) '
+    r'^[IWEDV] \((?P<at>\d+)\) \S+ atomic write: bytes=(?P<bytes>\d+) backup=(?P<backup>\d+) '
     r'fopen_ms=(?P<fopen>\d+) write_ms=(?P<write>\d+) stat_ms=(?P<stat>\d+) '
     r'remove_ms=(?P<remove>\d+) rename_backup_ms=(?P<rb>\d+) '
-    r'rename_primary_ms=(?P<rp>\d+) total_ms=(?P<total>\d+)')
+    r'rename_primary_ms=(?P<rp>\d+) total_ms=(?P<total>\d+)', re.M)
 
 # bench 的起止标记。刻意宽容：只要一行里同时出现 bench 与 begin/end 即计入，
 # 不锁定重写侧的措辞，免得它改个词判读器就瞎了。
@@ -1665,6 +1665,258 @@ def hil_stream_bench_vs_direct(log: Log):
            f'之后抬头，真实值会比这个大。两个绝对值都打在上面，别只引用比值')
 
 
+def hil_write_parts_reconcile(log: Log):
+    """一笔事务的子字段之和必须解释它的 elapsed —— 但**加数会变，判据不能瞎**。
+
+    WHY: 1005.26 上这个等式第一次做成了：一次 `word-session-save` = 两笔 AtomicWrite
+    （3.3 KB 快照 + 52 B 伴随游标），子字段之和 5,075 vs elapsed 5,083，误差 <0.3%。
+    那是"成本全在 AtomicWrite 里、没有第三块"的证据。
+
+    ⚠️ **但 52 B 游标迁 NVS 后，这个等式的形状合法地变了**（peer 的 Milestone A
+    警告，2026-10-06）：`atomic write:` 每次答题从 **2 条降到 1 条**，owner 名和
+    事务数都不变。于是旧等式会变成"子字段和 + 1,766 ms ≈ elapsed"，**不是 SKIP，
+    是看起来像回归**——判据会以为插桩漏掉了主要耗时，而真相是那部分成本搬到了 NVS。
+
+    所以这里把等式写成"所有 storage-write 行的子字段/耗时之和"，而不是只数
+    `atomic write:`。`nvs write:` 一旦出现就自动并入加数，不需要在迁移时改判据。
+    """
+    nvs_by_ms = []
+    for line in log.text.splitlines():
+        if 'nvs write:' not in line:
+            continue
+        f = dict(re.findall(r'(\w+)=([-\w]+)', line))
+        if 'total_ms' not in f:
+            continue
+        tm = re.match(r'^[IWEDV] \((\d+)\)', line)
+        if tm:
+            nvs_by_ms.append((int(tm.group(1)), int(f['total_ms'])))
+    txs = log.txof('word-session-save')
+    if not txs:
+        skip(log, 'WRITE:parts-account-for-transaction',
+             '本轮无 word-session-save 事务，无法对账')
+        return
+    # 窗口对账，不是"全部写行 / 全部事务"。
+    # WHY: 分母只取 word-session-save 而分子含 bench 与其它路径时，1006.1 上
+    # 会算出 395% 覆盖，然后据此得出"插桩重复计数"的假结论。那正是这条判据
+    # 自己批判过的"拿子字段比别人的全量"（本会话已因此错过一轮）。全量比全量
+    # 的唯一办法是**同一执行窗口**内比。
+    write_ms = 0.0
+    breakdown = []
+    covered = 0
+    for t in txs:
+        end = int(t['t'])
+        start = end - el(t)
+        aw = [p['total'] for p in log.probes if start <= p['at'] <= end]
+        nv = [ms for ts, ms in nvs_by_ms if start <= ts <= end]
+        if aw or nv:
+            covered += 1
+        if aw:
+            breakdown.append(f'atomic write {sum(aw):.0f} ms × {len(aw)} 笔')
+        if nv:
+            breakdown.append(f'nvs write {sum(nv):.0f} ms × {len(nv)} 笔')
+        write_ms += sum(aw) + sum(nv)
+    if not breakdown:
+        skip(log, 'WRITE:parts-account-for-transaction',
+             f'{len(txs)} 笔 word-session-save 的执行窗口内没有任何写行'
+             f'（atomic write: / nvs write:），判不出成本归属')
+        return
+    tx_ms = sum(el(t) for t in txs)
+    ratio = write_ms / tx_ms if tx_ms else float('inf')
+    parts = '；'.join(dict.fromkeys(breakdown))
+    ok = ratio >= 0.6
+    detail = (f'{covered}/{len(txs)} 笔窗口内有写行。写行合计 {write_ms:.0f} ms'
+              f'（{parts}）vs word-session-save sum(elapsed) {tx_ms:.0f} ms'
+              f' ⇒ 覆盖 {ratio:.0%}。口径是"**落在同一执行窗口内**的所有 '
+              f'storage-write 行"，不是只数 `atomic write:`：52 B 游标迁 NVS 后'
+              f'每次答题少一条 `atomic write:` 而 owner 名不变，只数它会把合法'
+              f'迁移读成"插桩漏掉主要耗时"')
+    if not ok:
+        detail += (' ⇒ 覆盖 <60%，插桩漏掉了主要耗时，本轮任何子字段结论都不可信')
+    else:
+        detail += ' ⇒ 成本都在已插桩的写路径里'
+    expect(log, 'WRITE:parts-account-for-transaction', ok, detail)
+
+
+def hil_nvs_stats_measured(log: Log):
+    """把 §五之十 的 NVS 算术变成实测——peer 自己标的第一个"③ 不测就没法定夺"。
+
+    §五之十 第 1 节那几张表（"~4.7 笔""21.2%""504 条目"）**全部是
+    4 页 × 126 条目从源码+分区表推出来的，没有一个数是量的**。peer 为此提了新行：
+
+        nvs stats: used_entries=%zu free_entries=%zu available_entries=%zu
+                   total_entries=%zu
+
+    （IDF 现成 API：`nvs_get_stats("nvs", &s)`，`nvs_api.cpp:541`。）
+
+    为什么这条判据重要：`total_entries` 会**直接证实或推翻 504**——如果实测不是
+    504（比如分区里有别的 NVS 使用者、或页布局不同），那么 §五之十 里每一个
+    "占分区百分之几"的结论都要按比例重算。`free_entries` 则给出那条
+    "写开始失败"的悬崖**实际在哪一格**：peer 的机制分析说空闲页掉到 2 以下后每次
+    答题付一次寄生存活+4096 B 擦除、页耗尽则 `requestNewPage` 返回
+    `ESP_ERR_NVS_INVALID_STATE`，但**具体落在第几笔取决于同一分区里其它 NVS
+    使用者占多少条目——他们没实测，我也不能替他们猜**。
+    """
+    rows = []
+    for line in log.text.splitlines():
+        if 'nvs stats:' not in line:
+            continue
+        f = dict(re.findall(r'(\w+)=(\d+)', line))
+        if 'total_entries' in f:
+            rows.append(f)
+    if not rows:
+        skip(log, 'WRITE:nvs-entry-budget-measured',
+             '本轮没有 `nvs stats:` 行。§五之十 的 NVS 算术（4 页 × 126 = 504 条、'
+             '21.2%/54.2% 占比）**至今纯属推导，没有实测支撑**——这是 peer 列的'
+             '第一个"③ 不测就没法定夺"项：烧一版带 `nvs_get_stats` 的构建即可')
+        return
+    last = rows[-1]
+    total = int(last['total_entries'])
+    used = int(last.get('used_entries', -1))
+    free = int(last.get('free_entries', -1))
+    # 推导值，不是测量值：用来和实测对账。
+    derived = (0x4000 // 4096) * 126
+    detail = (f'实测 total_entries={total}（推导值 {derived} = 4 页 × 126，'
+              f'来自 partitions/16m.csv:3 的 0x4000 + nvs_constants.h 的 '
+              f'NVS_CONST_ENTRY_COUNT=126）')
+    if total != derived:
+        detail += (f' ⇒ **与推导不符**。§五之十 里所有"占分区百分之几"都要按 '
+                   f'{derived}/{total} 重算，别照抄 21.2%/54.2% 那两张表')
+    else:
+        detail += ' ⇒ 与推导一致，那两张表的分母站得住'
+    if used >= 0:
+        detail += f'；used={used}'
+    if free >= 0:
+        detail += (f'；free={free}。⚠️ **这条是"写开始失败"的悬崖位置**：'
+                   f'peer 的机制分析（nvs_pagemanager.cpp:157/171/185/190）说空闲页'
+                   f'<2 后每次答题付一次寄生存活+4096 B 擦除、页耗尽则 '
+                   f'requestNewPage 返回 ESP_ERR_NVS_INVALID_STATE，'
+                   f'**但落在第几笔没实测**——要连续答 ≥5 题看 free 的掉落曲线')
+    expect(log, 'WRITE:nvs-entry-budget-measured', True, detail)
+
+
+def hil_nvs_entry_budget(log: Log):
+    """NVS 条目预算的设计门禁：把"某个载荷能不能放 NVS"变成可执行的断言。
+
+    WHY THIS EXISTS: peer 的 §五之十 决定把 52 B 游标迁 NVS、快照留在 SPIFFS 追加
+    日志上。这个决定依赖一条他们从 IDF 源码推出来的算术，我独立复核过（2026-10-06）：
+
+    1. 条目数 = 1 + ceil(dataSize / 32)     —— nvs_page.cpp:184-190
+       `totalSize = ENTRY_SIZE`（表头占一条）+ `roundedSize` 按 32 进位
+    2. 分区预算 = 4 页 × 126 条 = **504 条** —— partitions/16m.csv:3 是
+       `nvs ... 0x9000, 0x4000`；NVS_CONST_ENTRY_COUNT=126、页 4096 B
+    3. 单 blob 硬顶 = min(pageCount-1, 127) × 4000 = **12000 B**
+       —— nvs_storage.cpp:282-290 `dataSize > max_pages * Page::CHUNK_MAX_SIZE`
+
+    于是： 52 B → 3 条（0.6%，可迁）/ **3379 B → 107 条（21.2%）**
+    / **8676 B → 273 条（54.2%）**。peer 三个数我逐条对上，一个不差。
+
+    所以这是一条**现在就跑**的判据（只用已有的 `atomic write: bytes=`，不等新探针）：
+    它把"快照迁 NVS"这条路直接判掉。比 peer 强调的更硬——他们的重点在
+    "空闲页掉到 2 以下后每次答题付一次寄生存活+4096 B 擦除、页耗尽则
+    requestNewPage 返回 ESP_ERR_NVS_INVALID_STATE"，而 8676 B 连**单个 key 都
+    装不下**（12000 B 上限内但占 54.2%；超过 12000 B 则 ESP_ERR_NVS_VALUE_TOO_LONG）。
+
+    FAIL 的语义是**设计违规**，不是设备坏了：某个载荷占分区超 25% 就不该走 NVS。
+    阈值 25%：52 B 是 0.6%，快照两个尺寸是 21.2%/54.2%，中间没有自然分界，
+    取 25% 让 3379 B 判 FAIL——它虽然装得下，但一次就吃掉五分之一分区，
+    且旧值不会立即释放（NVS 无 delete-in-place，旧条目靠页级 GC）。
+    """
+    if not log.probes:
+        skip(log, 'WRITE:nvs-entry-budget',
+             '本轮无 `atomic write:` 行，判不出载荷分布')
+        return
+    # 这些常量来自本地 IDF + 分区表，不是估计值。
+    kEntrySize = 32
+    kEntryCountPerPage = 126
+    kNvsSizeBytes = 0x4000
+    kPages = kNvsSizeBytes // 4096
+    kBudget = kPages * kEntryCountPerPage
+    kSingleBlobCap = min(kPages - 1, (0xff - 1) // 2) * (kEntrySize * (kEntryCountPerPage - 1))
+    kShareLimit = 0.25
+
+    worst_share, worst_bytes, over_cap = 0.0, None, []
+    for p in log.probes:
+        n = p['bytes']
+        entries = 1 + -(-n // kEntrySize)
+        share = entries / kBudget
+        if share > worst_share:
+            worst_share, worst_bytes = share, n
+        if n > kSingleBlobCap:
+            over_cap.append(n)
+    if worst_bytes is None:
+        skip(log, 'WRITE:nvs-entry-budget', '有 `atomic write:` 行但字节数缺失')
+        return
+    worst_entries = 1 + -(-worst_bytes // kEntrySize)
+    detail = (
+        f'NVS 分区 {kNvsSizeBytes} B = {kPages} 页 × {kEntryCountPerPage} 条 = '
+        f'{kBudget} 条；单 blob 硬顶 {kSingleBlobCap} B'
+        f'（nvs_storage.cpp:282-290）。本轮最大载荷 {worst_bytes} B ⇒ '
+        f'{worst_entries} 条 = **分区 {worst_share:.1%}**。'
+        f'对照：52 B 游标 = 3 条 = {3 / kBudget:.1%}（迁 NVS 的正确用法）、'
+        f'3379 B = 107 条 = {107 / kBudget:.1%}、8676 B = 273 条 = '
+        f'{273 / kBudget:.1%}。')
+    if over_cap:
+        detail += (f' ⚠️ {len(over_cap)} 笔超过单 blob 硬顶（最大 {max(over_cap)} B）'
+                   f'⇒ 它们连一个 NVS key 都装不下。')
+    ok = worst_share <= kShareLimit and not over_cap
+    if not ok:
+        detail += (f' ⇒ **超过 {kShareLimit:.0%} 的载荷不许迁 NVS**：'
+                   f'它会让每次答题付一次"寄生存活条目 + 4096 B 擦除"，'
+                   f'空闲页掉到 2 以下后 requestNewPage 直接返回 '
+                   f'ESP_ERR_NVS_INVALID_STATE —— 终点是**答题写失败**，'
+                   f'不只是"答题慢"。')
+    expect(log, 'WRITE:nvs-entry-budget', ok, detail)
+
+
+def hil_append_open_split(log: Log):
+    """`append_open_ms` 是否真的把"建对象"那部分拆出来了（新探针契约 §五之十）。
+
+    追加写便宜 234× 这个结论，peer 自己标了缺口：§五之三 的 8 ms 是 `append_ms`
+    一整字段，**没分解**。434×（后修正为 234×）里多少来自 `"ab"` ≠ `"wb"`、
+    多少来自省掉 remove+2 rename，**是推理不是测量**。
+
+    所以这条判据等的就是那个拆开的字段：`append_open_ms << fopen` 才是"不建对象"
+    的**直接证据**，而不是从总价反推的。`fopen` 是同一份日志里 `atomic write:`
+    行实测的（52 B ~670–1400 ms，已独立复核）。
+
+    只扫 key=value 对、不锁行头：行头是 peer 的，他们改一次词判据不该跟着瞎
+    （位置正则静默失配这个坑在本会话已经错过一轮，见 LOG:word-pack-format-parsed）。
+    """
+    pairs = []
+    for line in log.text.splitlines():
+        if 'append_open_ms=' not in line or 'append_ms=' not in line:
+            continue
+        f = dict(re.findall(r'(\w+)=(-?\d+)', line))
+        if 'append_open_ms' in f and 'append_ms' in f:
+            pairs.append(f)
+    if not pairs:
+        skip(log, 'WRITE:append-open-vs-fopen',
+             '本轮没有同时带 `append_open_ms=` 与 `append_ms=` 的行'
+             '（新探针未进这个构建；契约见 doc §五之十 第 6 节）')
+        return
+    opens = [int(p['append_open_ms']) for p in pairs]
+    fp = [p['fopen'] for p in log.probes if p.get('fopen')]
+    med_open = statistics.median(opens)
+    med_fopen = statistics.median(fp) if fp else None
+    detail = (f'append_open_ms 中位 {med_open:.0f} ms（n={len(opens)}），'
+              f'append_ms 中位 {statistics.median(int(p["append_ms"]) for p in pairs):.0f} ms')
+    if med_fopen:
+        ratio = med_open / med_fopen
+        detail += (f'；同轮 `atomic write:` 的 fopen 中位 {med_fopen:.0f} ms ⇒ '
+                   f'append_open_ms / fopen = {ratio:.3f}')
+        if ratio < 0.1:
+            detail += (' ⇒ **这就是"不建对象"的直接证据**（差一个数量级以上），'
+                       '不再是 §五之三 那种从总价反推的推理。'
+                       '注意它仍然只支持"追加形状便宜"，'
+                       '不支持"改 fopen 模式就便宜"——那两个成因还没分解。')
+        else:
+            detail += (' ⇒ append_open_ms 没有比 fopen 低一个数量级，'
+                       '"拆出来的就是建对象那部分"这个假设**不成立**，'
+                       '§五之三 的推理缺口仍然敞开。')
+    expect(log, 'WRITE:append-open-vs-fopen', med_fopen is None or med_open < med_fopen,
+           detail)
+
+
 def hil_log_format_drift(log: Log):
     """抓"判据正则静默失配"。
 
@@ -1730,6 +1982,10 @@ def main(argv):
         hil_stream_append_chunk(log)
         hil_stream_bench_vs_direct(log)
         hil_log_format_drift(log)
+        hil_nvs_entry_budget(log)
+        hil_nvs_stats_measured(log)
+        hil_write_parts_reconcile(log)
+        hil_append_open_split(log)
         hil_stability(log)
 
     # 归因总表：命名 pass 之后这里应该列出 10+ 个真实 owner，而不是一个
