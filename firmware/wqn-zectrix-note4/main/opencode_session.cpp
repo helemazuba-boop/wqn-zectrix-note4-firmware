@@ -379,7 +379,8 @@ void LoadSessions()
         g_state.sessions.reserve(sessions.size());
         for (wqn::OpenCodeSessionInfo& source : sessions) {
             g_state.sessions.push_back(wqn::AgentSessionOption{
-                std::move(source.id), std::move(source.title), source.updated_at});
+                std::move(source.id), std::move(source.title), source.updated_at,
+                source.outcome});
         }
         if (g_state.sessions.empty()) {
             SetErrorLocked("没有可用的 OpenCode Session");

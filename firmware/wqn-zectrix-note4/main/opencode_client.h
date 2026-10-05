@@ -12,10 +12,34 @@
 
 namespace wqn {
 
+/**
+ * Whether a session has a run in flight, and how its last run ended.
+ * `contracts/agent-gateway-v0` (2.2) `$defs/session.outcome`.
+ *
+ * The gateway resolves this from two reads; the device receives the answer
+ * and does not re-derive it. The only rule the device has to get right is
+ * about the two "not running" spellings: `kUnknown` and a field the relay
+ * never sent both mean NO run in flight. Reading either as running would
+ * hold the sleep lease on a session that is merely fresh, and the device
+ * would never sleep again -- which is why the mapping is one-way here and
+ * the fallback is the safe direction.
+ */
+enum class OpenCodeSessionOutcome : uint8_t {
+    // No run in flight and no settle recorded: never prompted, an upstream
+    // vocabulary this contract predates, or a relay that predates the field.
+    kUnknown = 0,
+    kRunning,
+    kSucceeded,
+    kInterrupted,
+    kFailed,
+};
+
 struct OpenCodeSessionInfo {
     std::string id;
     std::string title;
     int64_t updated_at = 0;
+    // Absent from a relay predating the field; see OpenCodeSessionOutcome.
+    OpenCodeSessionOutcome outcome = OpenCodeSessionOutcome::kUnknown;
 };
 
 // One answerable option of an `agent.question` ask. The gateway projects one

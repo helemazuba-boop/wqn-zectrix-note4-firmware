@@ -569,6 +569,27 @@ esp_err_t ReadAgentEventStream(const AgentStreamRequest& request)
 
 namespace wqn {
 
+// Maps one device-contract `outcome` string onto the enum. Unrecognised and
+// absent both land on kUnknown, which the callers must read as "no run in
+// flight" -- see OpenCodeSessionOutcome. The gateway is the only place that can
+// distinguish the reasons, and it already collapsed them.
+wqn::OpenCodeSessionOutcome ParseSessionOutcome(std::string_view value)
+{
+    if (value == "running") {
+        return wqn::OpenCodeSessionOutcome::kRunning;
+    }
+    if (value == "succeeded") {
+        return wqn::OpenCodeSessionOutcome::kSucceeded;
+    }
+    if (value == "interrupted") {
+        return wqn::OpenCodeSessionOutcome::kInterrupted;
+    }
+    if (value == "failed") {
+        return wqn::OpenCodeSessionOutcome::kFailed;
+    }
+    return wqn::OpenCodeSessionOutcome::kUnknown;
+}
+
 esp_err_t ListOpenCodeSessions(
     const std::string& token,
     std::vector<OpenCodeSessionInfo>* sessions,
@@ -606,6 +627,7 @@ esp_err_t ListOpenCodeSessions(
         if (cJSON_IsNumber(updated)) {
             session.updated_at = static_cast<int64_t>(updated->valuedouble);
         }
+        session.outcome = ParseSessionOutcome(JsonString(row, "outcome"));
         if (session.id.rfind("ses_", 0) == 0) {
             sessions->push_back(std::move(session));
         }
@@ -843,6 +865,10 @@ esp_err_t CreateOpenCodeSession(
         if (cJSON_IsNumber(updated)) {
             session->updated_at = static_cast<int64_t>(updated->valuedouble);
         }
+        // A brand-new session has no run and no settle, so the gateway answers
+        // `unknown`; parsing it rather than assuming it keeps one code path for
+        // "what the row said" and lets the create path disagree later.
+        session->outcome = ParseSessionOutcome(JsonString(row, "outcome"));
     }
     cJSON_Delete(root);
     if (session->id.rfind("ses_", 0) != 0) {

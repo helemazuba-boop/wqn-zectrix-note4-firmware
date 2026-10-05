@@ -14,6 +14,12 @@ struct AgentSessionOption {
     std::string id;
     std::string title;
     int64_t updated_at = 0;
+    // `outcome` from the gateway's session summary. kUnknown means no run in
+    // flight for our purposes -- never prompted, unrecognised upstream value,
+    // or a relay that predates the field -- and the hold-lock criterion built
+    // on it in C11 must treat it that way, or a fresh session would hold the
+    // sleep lease forever.
+    OpenCodeSessionOutcome outcome = OpenCodeSessionOutcome::kUnknown;
 };
 
 // [detail] Cloud detail tier requested by this device: 0 = brief (text only,
