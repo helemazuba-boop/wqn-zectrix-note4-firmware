@@ -507,7 +507,26 @@ void HandleUiInput(UiState* state, UiInput input)
                 // switches screens; the word page's own UI takes over.
                 std::string requested_deck_id;
                 if (TakeNoteWordDeckOpenRequest(&state->note_app, &requested_deck_id)) {
-                    // [word-scope-reset] Arm + submit; nothing is installed until
+                    // AGENTS §4.2, [词]-row: this path breaks the gate twice over.
+                    // (a) SubmitWordSessionReset resets the word session, and the
+                    //     observation armed by the worker is still between here
+                    //     and the reserve -- commit_state already reads kPersisting
+                    //     while the word domain still looks free, so TryReserve
+                    //     cannot see the window and the reset's generation bump
+                    //     would clear the session out from under the commit.
+                    // (b) The durable ACK switches screens, which navigates away
+                    //     from the note screen's answering context.
+                    // Consume the request and say nothing else, so a retry is the
+                    // only thing left to do. Mirrors the top-nav guards above.
+                    if (state->word_app.session.commit_state ==
+                            wqn::WordObservationCommitState::kPersisting ||
+                        (state->problem_app.active &&
+                         state->problem_app.commit_state ==
+                             wqn::ProblemVerdictCommitState::kPersisting)) {
+                        state->note_app.message = "正在保存，请稍后";
+                        break;
+                    }
+                    // Arm + submit; nothing is installed until
                     // the durable ACK (DispatchWordSessionResetResult), so a scope
                     // switch never blocks the UI task on the reset transaction.
                     // The pending pair stays armed on a submit reject or a write
