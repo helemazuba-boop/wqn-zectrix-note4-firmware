@@ -992,6 +992,32 @@ void OnOpenCodeEvent(const wqn::OpenCodeEvent& event, void*)
                 // as failed (and a failed one as successful) whenever two
                 // different calls arrived back to back.
                 CloseAgentToolBlockLocked(g_agent_tool_ok, now_ms);
+                // [agent] Drop the accumulated answer text at a tool boundary.
+                // A round change is already caught by the empty `agent.text` the
+                // cloud sends (see the kText case), but that only fires between
+                // model rounds: the cloud's round key is the assistant message
+                // id alone, so "text part, then a tool, then another text part
+                // inside the same message" is one round as far as it can tell.
+                // The device appends every delta into one buffer, so without
+                // this the second part's text is glued behind the first's.
+                //
+                // Deliberately here and NOT in CloseAgentToolBlockLocked, which
+                // would be the tidier spot and is wrong: the mirror functions
+                // call that close *after* they have written the current frame's
+                // text into the buffer, so clearing there erases the very frame
+                // that triggered the close -- and because `endText` replays a
+                // whole part when it thinks a delta was lost, what gets eaten
+                // can be an entire text part rather than one delta. A tool
+                // frame carries no text of its own, so this is the one place
+                // the clear cannot cost a frame.
+                //
+                // Safe to drop the accumulated text: every pre-tool delta has
+                // already been mirrored into history by MirrorAgentTextLocked,
+                // and the close above retired the assistant id, so the next
+                // text delta can only AppendAssistant a new entry. It cannot
+                // ReplaceText over the pre-tool one, which is what makes this a
+                // clear rather than a loss.
+                g_state.ui.response_text.clear();
                 g_agent_tool_ok = event.status != "error";
                 g_agent_tool_id = wqn::GetAiHistory(wqn::AiHistoryChannel::kAgent)
                                       .AppendToolStart(event.tool, std::string_view(), now_ms);
