@@ -94,6 +94,14 @@ LEASE_RE = re.compile(
 # these patterns stop at the last field they name and never anchor to EOL.)
 BENCH_END_RE = re.compile(r'\((?P<at_ms>\d+)\) \w+: storage bench END')
 
+# Gate self-test (`RunUiGateSelfTest`, C1). Two lines, one honest verdict:
+#   I wqn_ui_gates: commit_state gate self-test passed
+#   E wqn_ui_gates: gate self-test failed: word-row scope switch refused ...
+# The failing form repeats the gate name twice (message + bare name), so the
+# names are de-duplicated below -- a report that lists `word-row` once is easier
+# to act on than one that lists it twice.
+GATE_OK_RE = re.compile(r'commit_state gate self-test passed')
+GATE_FAIL_RE = re.compile(r'gate self-test failed: (?P<name>[a-z-]+)')
 
 
 @dataclass
@@ -233,6 +241,30 @@ def hil_p0_journal(log: Log):
         expect(log, 'P0-journal:queue-wait-survives',
                all(t['res'] == 'ESP_OK' for t in j if qw(t) > 500),
                '排队久的 journal 写最终仍 ESP_OK（未被 quiesce 拒）')
+
+
+def hil_gate_selftest(log: Log):
+    """b472f20 — `RunUiGateSelfTest()` 在设备上必须报 passed。
+
+    WHY A CRITERION OF ITS OWN: this is the cheapest signal in the whole log and
+    it was red for three consecutive captures (1005.4 / 1005.6 / 1005.7) purely
+    because the [word]-row path has no `commit_state` gate -- a real §4.2 defect
+    introduced by 1fdfe52, not a fixture problem. With no criterion, "the log
+    looks fine" was being reported while the firmware was printing an error at
+    every boot. A red here blocks C6/C7 work: it means the gate inventory the
+    self-test pins is no longer true.
+    """
+    failed = sorted(set(m.group('name') for m in GATE_FAIL_RE.finditer(log.text)))
+    passed = bool(GATE_OK_RE.search(log.text))
+    if failed:
+        expect(log, 'GATES:self-test-green', False,
+               f'启动自检红：{", ".join(failed)}（门禁清单已与代码不符，'
+               f'先修它再动 C6/C7——否则分不清红灯来自新代码还是自检本身）')
+    elif passed:
+        expect(log, 'GATES:self-test-green', True, 'commit_state gate self-test passed')
+    else:
+        skip(log, 'GATES:self-test-green',
+             '本轮构建没有 gate 自检（b472f20 之前），无从判定')
 
 
 def hil_c5_domain_gate(log: Log):
@@ -572,6 +604,7 @@ def main(argv):
             return 2
         hil_p0_wifi(log)
         hil_p0_journal(log)
+        hil_gate_selftest(log)
         hil_c5_domain_gate(log)
         hil_c6a_generation(log)
         hil_c6b_scope_switch(log)
