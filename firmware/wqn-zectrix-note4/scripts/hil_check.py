@@ -76,6 +76,8 @@ BENCH_ROUND_RE = re.compile(
     r'wall_ms=(?P<wall>\d+) result=(?P<result>\w+)')
 
 
+
+
 @dataclass
 class Log:
     path: str
@@ -112,7 +114,6 @@ class Log:
                       for m in BENCH_ROUND_RE.finditer(text)]
         log.boots = text.count('opened COM') or text.count('End of partition table')
         return log
-
     def txof(self, owner: str) -> list:
         return [t for t in self.tx if t['owner'] == owner]
 
@@ -395,6 +396,32 @@ def hil_storage_bench(log: Log):
     by_shape = {}
     for r in log.rounds:
         by_shape.setdefault(r['shape'], []).append(r['wall'])
+
+    # 2a. 追加 shape 是"成本在扫描长度"这个前提的直接反驳，必须优先判。
+    # WHY: probe/cur 的比值只描述"未命中走查 vs 一笔写"，它看不见另一件事——
+    # 同样字节数的持久写，走"追加到已存在对象"是几十毫秒，走"temp/rename 建新
+    # 对象"是一秒级。1005.12 实测 append 209 ms vs cur52 1097 ms（5.3×），页数
+    # 完全一样。单看 probe/cur 比值会给出 0.62 → "底价成立，按缩短扫描长度施工"
+    # 的绿灯，而那恰好是这份日志证伪的方向。所以这里显式判一次，并推翻 2b。
+    # 用 cur*（最小载荷的 AtomicWrite）作分母，是为了把"载荷差异"这个辩解拿走。
+    cur_med = min((statistics.median(w) for s, w in by_shape.items()
+                   if s.startswith('cur')), default=None)
+    append_med = min((statistics.median(w) for s, w in by_shape.items()
+                      if 'append' in s), default=None)
+    append_refutes = None
+    if cur_med and append_med:
+        ratio = cur_med / append_med if append_med else float('inf')
+        if append_med < 20.0:
+            append_refutes = (
+                f'追加写只花 {append_med:.0f} ms，而同样走 SPIFFS 的 cur* 写要 '
+                f'{cur_med:.0f} ms（{ratio:.1f}×）。差距大到不可能由载荷或扫描长度解释，'
+                f'成本在"创建新对象 + backup 轮换"，不在"按名查找扫描"')
+        elif ratio >= 3.0:
+            append_refutes = (
+                f'追加写 {append_med:.0f} ms vs cur* AtomicWrite {cur_med:.0f} ms'
+                f'（{ratio:.1f}×，页数相同）。差额就是 temp 创建与 backup 轮换，'
+                f'"缩短扫描长度"只解释其中一小部分')
+
     if 'probe' in by_shape:
         probe_med = statistics.median(by_shape['probe'])
         per_op = None
@@ -408,7 +435,15 @@ def hil_storage_bench(log: Log):
             skip(log, 'BENCH:floor-model-holds', '有 probe 但没有可折算单次 op 成本的写 shape')
         else:
             ratio = per_op / probe_med if probe_med > 0 else float('inf')
-            if probe_med < 20.0:
+            if append_refutes:
+                # 追加证据优先：它比 probe/cur 比值更直接地量到了写路径本身。
+                # 这条曾经是绿的（1005.7 也是绿的），因为判读器只比较了 probe 与
+                # cur，看不见"同一文件系统上追加写只要 8 ms"这一档。
+                verdict = (f'底价模型被推翻（追加侧证据）：{append_refutes}。'
+                           f'（probe/cur 比值 {ratio:.2f} 落在 0.4~2.5 内，但那是因为'
+                           f'probe 量的是"未命中走查"，不是"一笔完整写"。）'
+                           f'施工方向改为"消除对象创建与 backup 轮换，改追加/日志结构"')
+            elif probe_med < 20.0:
                 verdict = (f'底价模型被推翻：纯查找只花 {probe_med:.0f} ms，而写入侧单次 op '
                            f'≈{per_op:.0f} ms（比值 {ratio:.1f}）。成本不在元数据扫描上，'
                            f'"减少页数/减少 op"这个方向不成立，必须重推根因再动重写')
@@ -419,7 +454,8 @@ def hil_storage_bench(log: Log):
             else:
                 verdict = (f'底价模型成立：纯查找中位 {probe_med:.0f} ms，单次元数据 op '
                            f'≈{per_op:.0f} ms（比值 {ratio:.2f}）。与 1005.6 上 n=11 的 '
-                           f'journal 拟合一致，可按"缩短扫描长度"施工')
+                           f'journal 拟合一致，可按"缩短扫描长度"施工'
+                           + ('；本轮无追加 shape，未覆盖"成本是否在对象创建"' if append_med is None else ''))
             expect(log, 'BENCH:floor-model-holds', bool(verdict.startswith('底价模型成立')),
                    verdict)
     detail = '；'.join(
@@ -428,8 +464,7 @@ def hil_storage_bench(log: Log):
     if detail:
         check(log, 'BENCH:shape-costs', 'PASS', True, detail)
 
-    # --- 3. bench 不能把真实流量弄丢 ---------------------------------------
-    # 第一条写法是错的，被重写侧指出后改掉：bench 是 20 笔串行事务，第 N 笔的
+    # --- 4. bench 不能把真实流量弄丢 ---------------------------------------    # 第一条写法是错的，被重写侧指出后改掉：bench 是 20 笔串行事务，第 N 笔的
     # queue_wait 就是前 N-1 笔的累计 elapsed——按我们自己的模型 3 KB 那档单笔
     # 1.4~2 s，后几笔必然 >2 s，且那正是 bench 自己造成的。判 bench 自己的
     # queue_wait 恒红，等于让判读器对"我们设计的实验"喊狼来了。
