@@ -428,11 +428,24 @@ def hil_storage_bench(log: Log):
     if detail:
         check(log, 'BENCH:shape-costs', 'PASS', True, detail)
 
-    # --- 3. bench 不能反过来堵住别人 ---------------------------------------
+    # --- 3. bench 不能把真实流量弄丢 ---------------------------------------
+    # 第一条写法是错的，被重写侧指出后改掉：bench 是 20 笔串行事务，第 N 笔的
+    # queue_wait 就是前 N-1 笔的累计 elapsed——按我们自己的模型 3 KB 那档单笔
+    # 1.4~2 s，后几笔必然 >2 s，且那正是 bench 自己造成的。判 bench 自己的
+    # queue_wait 恒红，等于让判读器对"我们设计的实验"喊狼来了。
+    # 真正要抓的是：**排在 bench 后面的真实事务有没有被弄丢**。bench 期间
+    # 真实流量被推迟是必然且可接受的，被拒/被丢弃才是回归。
     if bench_tx:
-        worst = max(int(t['qw']) for t in bench_tx)
-        expect(log, 'BENCH:bench-did-not-starve-others', worst < 2000,
-               f'bench 事务自身最大 queue_wait={worst} ms')
+        starved = [t for t in log.tx
+                   if t['owner'] != 'storage-bench' and int(t['qw']) >= 2000]
+        if not starved:
+            skip(log, 'BENCH:real-traffic-survived',
+                 'bench 期间没有真实事务被推迟 2 s 以上，无从判定')
+        else:
+            lost = [t for t in starved if t['res'] != 'ESP_OK']
+            expect(log, 'BENCH:real-traffic-survived', not lost,
+                   f'{len(starved)} 笔真实事务排在 bench 后等了 ≥2 s，其中 {len(lost)} '
+                   f'笔没成功（被推迟可以接受，被丢掉是回归）')
 
 
 def hil_stability(log: Log):
