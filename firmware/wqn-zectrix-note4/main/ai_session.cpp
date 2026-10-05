@@ -415,6 +415,27 @@ void OnSseEvent(const wqn::WqnAiSseEvent& ev)
         g_turn.last_event_id = ev.event_id;
     }
 
+    // [ui-throttle] Streaming deltas land every ~15 ms; the EPD cannot render
+    // that fast and every changed-flag round-trip costs a full state copy on
+    // the UI task. Coalesce delta-only marks to 50 ms; terminal / stage /
+    // tool events always mark immediately so completion never lags. Runs
+    // under g_lock with one producer per turn, so the watermark is stable.
+    //
+    // [D1/D4] Hoisted above the switch because the kTextDelta case needs the
+    // same predicate: item D1 of doc/1005 mirrors the streamed text into
+    // AiHistory, and the mirror has to ride this watermark rather than the SSE
+    // rate. Every ReplaceText bumps the history's revision, which makes
+    // AiHistory::Snapshot() recopy the whole message vector on the next tick --
+    // so an unthrottled mirror would trade one wasted EPD refresh for a full
+    // vector copy per token. Sharing the watermark is what makes the mirror and
+    // the mark advance together: one tick, one write, one mark.
+    static int64_t s_last_delta_mark_ms = -1000;
+    const bool is_streaming_delta =
+        ev.kind == wqn::WqnAiSseEvent::Kind::kTextDelta ||
+        ev.kind == wqn::WqnAiSseEvent::Kind::kAsrDelta ||
+        ev.kind == wqn::WqnAiSseEvent::Kind::kThinkingDelta;
+    const bool delta_watermark_open = now_ms - s_last_delta_mark_ms >= 50;
+
     switch (ev.kind) {
         case wqn::WqnAiSseEvent::Kind::kUnknown:
             ESP_LOGD(kTag, "ignore unknown SSE event id=%llu",
@@ -504,6 +525,35 @@ void OnSseEvent(const wqn::WqnAiSseEvent& ev)
             }
             g_state.assistant_partial += ev.delta;
             g_turn.assistant_text += ev.delta;
+            // [D1] Symptom 1's fix: mirror the streamed text into history as it
+            // arrives, so a batched download is reusable by the STD model and a
+            // tool-interleaved turn lands in ITS OWN entries rather than one
+            // lump at the end. Without this, only a seal or a terminal writes
+            // AiHistory, so a long reply's streamed prefix exists nowhere but
+            // `assistant_text` -- and `assistant_partial`, which the plan
+            // measured has no renderer at all.
+            //
+            // FinalizeAssistantLocked is the existing mirror: AppendAssistant on
+            // the first call, ReplaceText on every one after, both over
+            // `g_turn.assistant_text`. It is the same shape as
+            // MirrorAgentTextLocked on the Agent side, and reusing it means no
+            // new mechanism -- only the missing call site.
+            //
+            // Deliberately NOT SealAssistantSegmentLocked: that resets the
+            // segment state (and hands out a fresh assistant id), which would
+            // make every delta open a new entry and defeat the point. This
+            // keeps the segment open and grows it in place.
+            //
+            // On the 50 ms watermark, not per delta -- see D4 above. The guard
+            // is on the same bool MarkChanged uses below, so a delta that does
+            // not advance the watermark does not write either.
+            //
+            // A no-op when no user turn was committed (FinalizeAssistantLocked
+            // checks), which is what keeps a stray delta before the user's turn
+            // from creating an entry.
+            if (delta_watermark_open) {
+                FinalizeAssistantLocked(history, std::string(), now_ms);
+            }
             g_state.last_render_ms = now_ms;
             break;
         case wqn::WqnAiSseEvent::Kind::kTextEnd: {
@@ -612,12 +662,7 @@ void OnSseEvent(const wqn::WqnAiSseEvent& ev)
     // the UI task. Coalesce delta-only marks to 50 ms; terminal / stage /
     // tool events always mark immediately so completion never lags. Runs
     // under g_lock with one producer per turn, so the watermark is stable.
-    static int64_t s_last_delta_mark_ms = -1000;
-    const bool is_streaming_delta =
-        ev.kind == wqn::WqnAiSseEvent::Kind::kTextDelta ||
-        ev.kind == wqn::WqnAiSseEvent::Kind::kAsrDelta ||
-        ev.kind == wqn::WqnAiSseEvent::Kind::kThinkingDelta;
-    if (!is_streaming_delta || now_ms - s_last_delta_mark_ms >= 50) {
+    if (!is_streaming_delta || delta_watermark_open) {
         if (is_streaming_delta) {
             s_last_delta_mark_ms = now_ms;
         }
