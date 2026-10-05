@@ -409,13 +409,68 @@ esp_err_t RenderAgentAiToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule
         // surface of its own a silent run reads as a hung one. Draw it in the
         // same bottom band the option bar owns; the option bar, when it
         // appears, clears the band itself.
-        if (agent.ui.phase == wqn::AiFeaturePhase::kRunning &&
-            !agent.ui.activity_text.empty()) {
+        //
+        // [B4] The gesture hint rides the same line, right-aligned, and it is
+        // the reason the band is drawn at all for the phases it now covers.
+        // `action_hint` was previously the only place the device said what the
+        // confirm key was about to do, and its sole consumer was the frame
+        // signature in ui_refresh.cpp -- so every word of it was invisible, and
+        // the one gesture with two meanings (long press = capture when idle,
+        // long press = interrupt while a run is in flight) was undiscoverable.
+        // The failure it hid is the worst kind: a user who long-presses to send
+        // into a running session gets silence for one gesture and an interrupt
+        // for the next.
+        //
+        // Hence the phases below. A run that is live must SAY that the long
+        // press will stop it; a finished one must say the long press starts a
+        // new task. Both are drawn from action_hint so there is exactly one
+        // string per state, set where the state is decided.
+        //
+        // Only the phases AgentOptionModeFor projects as kNone can reach here:
+        // the two ask phases render the option bar below instead, so they get
+        // their hint from it. A capture (kLoading / kRecording) draws its own
+        // partial above and leaves the band to activity_text.
+        std::string hint;
+        switch (agent.ui.phase) {
+            case wqn::AiFeaturePhase::kRunning:
+                // Fixed, not taken from action_hint: at kRunning that field holds
+                // whatever the last frame happened to leave in it (a permission
+                // was just answered, a status line came through), and a long
+                // press here interrupts the run no matter what the cloud said.
+                // B4's requirement is that the one gesture with two meanings is
+                // named in the state where the meaning is the surprising one.
+                hint = "长按=中止";
+                break;
+            case wqn::AiFeaturePhase::kIdle:
+            case wqn::AiFeaturePhase::kComplete:
+            case wqn::AiFeaturePhase::kError:
+                // Terminal states: the state's owner set the precise gesture
+                // (发起新任务 / 重试新任务), and those differ by phase. Fall back
+                // to the ordinary capture for a state nobody labelled.
+                hint = agent.ui.action_hint.empty() ? std::string("长按=录音")
+                                                    : agent.ui.action_hint;
+                break;
+            default:
+                break;
+        }
+        if (!agent.ui.activity_text.empty() || !hint.empty()) {
+            const int hint_w = hint.empty() ? 0 : wqn::MeasureUtf8TextWidth(hint.c_str());
             FillRect(0, kAgentBarY, wqn::kEpdWidth, kAgentBarH, false);
             DrawHorizontalLine(0, kAgentBarY, wqn::kEpdWidth);
-            AGENT_TEXT(kAgentBarMarkerX, kAgentBarTextY,
-                       AgentOneLine(agent.ui.activity_text, wqn::kEpdWidth - 16).c_str(),
-                       true);
+            if (!hint.empty()) {
+                AGENT_TEXT(wqn::kEpdWidth - hint_w - 8, kAgentBarTextY, hint.c_str(), true);
+            }
+            if (!agent.ui.activity_text.empty()) {
+                // The cloud's own line, truncated to the room the hint leaves.
+                // A capture owns its own band above, so the marker column is
+                // where the run's activity line starts.
+                const std::string body =
+                    hint.empty()
+                        ? AgentOneLine(agent.ui.activity_text, wqn::kEpdWidth - 16)
+                        : AgentOneLine(agent.ui.activity_text,
+                                       wqn::kEpdWidth - hint_w - 24);
+                AGENT_TEXT(kAgentBarMarkerX, kAgentBarTextY, body.c_str(), true);
+            }
         }
         return RefreshFrame(frame, schedule);
     }

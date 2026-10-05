@@ -1157,6 +1157,9 @@ void OnOpenCodeEvent(const wqn::OpenCodeEvent& event, void*)
                 g_state.stream_active = false;
                 CloseAgentToolBlockLocked(false, now_ms);
                 SetPhaseLocked(wqn::AiFeaturePhase::kError, "执行失败");
+                // [B4] Retry, not record: the renderer prefers this hint when the
+                // state's owner set one, so the gesture it draws is the one that
+                // actually works in this phase.
                 g_state.ui.action_hint = "长按确认重试新任务";
                 if (!event.text.empty()) {
                     g_state.ui.activity_text = event.text;
@@ -1784,15 +1787,24 @@ void LoadHistory()
         ResetAgentHistoryTurnLocked();
         BackfillAgentHistoryLocked(messages, esp_timer_get_time() / 1000);
         g_state.history_loaded_session_id = g_run_session_id;
-        if (!g_observing && !refresh) {
-            // Lock-triggered backfill: the stream was never the goal, so hand
-            // the session back ready to prompt. A post-run refresh is not the
-            // lock's backfill: the status bar already reported the run's own
-            // terminal state, and a background re-read must not relabel it.
-            g_state.ui.phase = wqn::AiFeaturePhase::kIdle;
-            g_state.ui.status_label = "就绪";
-            g_state.ui.activity_text = "长按确认键语音输入";
-        }
+        // [agent] B1 deleted the branch that used to sit here. It set phase to
+        // kIdle / "就绪" / "长按确认键语音输入" for a non-observing backfill, which
+        // was the lie item C4 of doc/1005 exists for: mid-run history arrives
+        // with the in-flight messages in it (`finish` empty -- measured, §2.3),
+        // so the device had the evidence in hand and labelled the session idle
+        // anyway. A user who then long-pressed to send got silence followed by an
+        // interrupt, because the send gate reads kRunning and a long press in
+        // kIdle is a capture.
+        //
+        // It is not being re-written to fork on upstream truth, because B1 makes
+        // it unreachable: every kLoadHistory armer now sets g_observing (the
+        // lock, and ObserveOpenCodeSession with needs_history), so the condition
+        // below was always false before the `&& !refresh` was even reached. The
+        // honest state is now supplied by the stream the chain below attaches.
+        //
+        // If this branch is ever revived, it must not be revived as kIdle. The
+        // phase is what gates the send gesture, so "idle" on a session with a
+        // live run converts a send into an interrupt.
         MarkChangedLocked();
     } else {
         ESP_LOGW(kTag, "history backfill failed for %s: %s (%s)",
@@ -1804,10 +1816,15 @@ void LoadHistory()
             // stay busy. A post-run refresh has neither problem -- the run
             // already reached its terminal UI and the live transcript is
             // intact -- so its failure is the log line above and nothing more.
+            //
+            // The two ternaries that used to branch on g_observing here are now
+            // single-valued, because B1 made every non-refresh kLoadHistory an
+            // observe's backfill. The retry hint stays, because "pick another
+            // session" is wrong for a user who is already inside one -- and the
+            // picker-open path clears the locked session anyway.
             g_state.ui.phase = wqn::AiFeaturePhase::kError;
-            g_state.ui.status_label = g_observing ? "观察失败" : "历史读取失败";
-            g_state.ui.activity_text =
-                g_observing ? "历史读取失败" : "可重新选择 Session 重试";
+            g_state.ui.status_label = "观察失败";
+            g_state.ui.activity_text = "历史读取失败，可重新选择 Session 重试";
             g_state.stream_active = false;
             g_observing = false;
             MarkChangedLocked();
