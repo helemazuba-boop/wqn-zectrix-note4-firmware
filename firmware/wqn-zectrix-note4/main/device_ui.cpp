@@ -524,6 +524,85 @@ void DrainDisplayResults(
     }
 }
 
+namespace {
+// [deferral-observability] The commit-pending skip in DeviceUiTask's result
+// scan is correct but used to be completely silent: while a word observation
+// commit never clears, every Word/WordBulk result was dropped from that scan
+// with no trace at all, so the word session-start result never landed and the
+// word page sat in kSessionStarting ("正在准备") forever with nothing in the
+// log to explain it.
+//
+// This only *observes*; it changes no control flow. It stays quiet during
+// normal operation because a healthy observation commit finishes in tens of
+// milliseconds (worst measured tier 1224 ms), so a result merely being held
+// back for one scan is the intended ordering, not a defect. Only a hold that
+// outlasts every healthy commit -- i.e. the commit ACK never arrived -- is
+// worth shouting about, and it reports how long the result has actually been
+// held rather than claiming to know the root cause.
+constexpr int64_t kHeldResultWarnMs = 3000;
+constexpr int64_t kHeldResultRepeatMs = 2000;
+
+// Reset to 0 whenever nothing is held, so a later hold is timed from its own
+// start instead of inheriting an earlier episode's timestamp.
+// Plain int64_t, NOT std::atomic (§4.7): these are touched only from
+// DeviceUiTask, the single UI owner, in its result scan. If a second task ever
+// reads or writes them, make them atomic first.
+int64_t g_held_result_since_ms[device_ui_internal::kCloudDomainCount] = {};
+int64_t g_held_result_last_log_ms[device_ui_internal::kCloudDomainCount] = {};
+
+const char* CloudDomainName(device_ui_internal::CloudDomain domain)
+{
+    switch (domain) {
+        case device_ui_internal::CloudDomain::kTodo:
+            return "todo";
+        case device_ui_internal::CloudDomain::kWord:
+            return "word";
+        case device_ui_internal::CloudDomain::kNote:
+            return "note";
+        case device_ui_internal::CloudDomain::kProblem:
+            return "problem";
+        case device_ui_internal::CloudDomain::kWordBulk:
+            return "word-bulk";
+        case device_ui_internal::CloudDomain::kNoteBulk:
+            return "note-bulk";
+        case device_ui_internal::CloudDomain::kProblemBulk:
+            return "problem-bulk";
+    }
+    return "unknown";
+}
+
+void TrackHeldCloudResult(device_ui_internal::CloudDomain domain, bool gated)
+{
+    const size_t i = static_cast<size_t>(domain);
+    // Reset must happen for the UNGATED case too. When the gate opens the
+    // result is taken and acked on this same pass, so without this branch the
+    // stale timestamp survives and the next unrelated hold would immediately
+    // report "held for 99997 ms" -- a false reading from our own probe.
+    if (!gated || !device_ui_internal::HasCloudResultPending(domain)) {
+        g_held_result_since_ms[i] = 0;
+        return;
+    }
+    const int64_t now_ms = esp_timer_get_time() / 1000;
+    if (g_held_result_since_ms[i] == 0) {
+        g_held_result_since_ms[i] = now_ms;
+        return;
+    }
+    const int64_t held_ms = now_ms - g_held_result_since_ms[i];
+    if (held_ms < kHeldResultWarnMs) {
+        return;
+    }
+    if (now_ms - g_held_result_last_log_ms[i] < kHeldResultRepeatMs) {
+        return;
+    }
+    g_held_result_last_log_ms[i] = now_ms;
+    ESP_LOGW(kTag,
+             "cloud result held for %lld ms by commit-pending gate (domain=%s) "
+             "-- the persist ACK for that domain has not arrived, so this "
+             "result will never be applied until it does",
+             static_cast<long long>(held_ms), CloudDomainName(domain));
+}
+}  // namespace
+
 void DeviceUiTask(void*)
 {
     ESP_LOGI(kTag, "device UI task started");
@@ -792,14 +871,18 @@ void DeviceUiTask(void*)
                 // with and merges instead of installing when the session moved.
                 // Keep it: it is what makes the ordering visible in one place,
                 // and the merge path logs when it fires.
-                if ((result_domain == device_ui_internal::CloudDomain::kWord ||
-                     result_domain == device_ui_internal::CloudDomain::kWordBulk) &&
-                    word_commit_pending) {
-                    continue;
-                }
-                if ((result_domain == device_ui_internal::CloudDomain::kNote ||
-                     result_domain == device_ui_internal::CloudDomain::kNoteBulk) &&
-                    note_commit_pending) {
+                // [deferral-observability] Observe (never alter) this gate. A
+                // domain is either word-ish or note-ish, never both, so the
+                // boolean below is exactly the old two-if skip's condition.
+                const bool result_gated =
+                    ((result_domain == device_ui_internal::CloudDomain::kWord ||
+                      result_domain == device_ui_internal::CloudDomain::kWordBulk) &&
+                     word_commit_pending) ||
+                    ((result_domain == device_ui_internal::CloudDomain::kNote ||
+                      result_domain == device_ui_internal::CloudDomain::kNoteBulk) &&
+                     note_commit_pending);
+                TrackHeldCloudResult(result_domain, result_gated);
+                if (result_gated) {
                     continue;
                 }
                 device_ui_internal::CloudResultReady ready;

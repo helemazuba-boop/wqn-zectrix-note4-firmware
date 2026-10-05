@@ -406,6 +406,12 @@ void NotifyUiTask();
 void PublishCloudResult(CloudDomain domain, uint32_t generation);
 bool TakeCloudResultToApply(CloudDomain domain, uint32_t* generation);
 void AckCloudResult(CloudDomain domain, uint32_t generation);
+// [deferral-observability] Non-consuming twin of TakeCloudResultToApply: is a
+// published result still waiting to be applied? Needed because the
+// commit-pending deferral in DeviceUiTask only misbehaves when it is actually
+// holding a result back -- probing with Take* would consume it. Same mailbox
+// state, same atomics, no side effects.
+bool HasCloudResultPending(CloudDomain domain);
 
 static_assert(std::is_trivially_copyable_v<TodoCloudResultReady>);
 static_assert(std::is_trivially_copyable_v<WordCloudResultReady>);
