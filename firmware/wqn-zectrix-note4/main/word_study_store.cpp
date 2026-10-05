@@ -647,6 +647,22 @@ void BenchTask(void*)
     // bench's numbers are not polluted by queue_wait from startup traffic.
     vTaskDelay(kBenchStartDelayTicks);
 
+    // [sleep] The bench outlives the 60 s idle deadline: it starts ~25 s after
+    // boot and runs for tens of seconds, so quiesce can otherwise begin mid-run
+    // and truncate it (a quiet device on battery has no kUsbPower lease to
+    // block sleep, and the bench's own transactions take no lease of their
+    // own). Hold one kStorage lease across the whole run -- same reasoning as
+    // §五.8: the lease must cover the work it protects. If quiesce already
+    // started, TryAcquire fails and we skip rather than race it.
+    wqn::runtime::SleepLease bench_lease = wqn::runtime::SleepLease::TryAcquire(
+        wqn::runtime::SleepBlocker::kStorage, "storage-bench", __FILE__, __LINE__);
+    if (!bench_lease) {
+        ESP_LOGW(kTag, "storage bench ABORT: sleep quiesce already active");
+        ESP_LOGI(kTag, "storage bench END total_ms=0");
+        vTaskDelete(nullptr);
+        return;
+    }
+
     const int shape_count =
         static_cast<int>(sizeof(kBenchShapes) / sizeof(kBenchShapes[0]));
     int write_count = 0;
