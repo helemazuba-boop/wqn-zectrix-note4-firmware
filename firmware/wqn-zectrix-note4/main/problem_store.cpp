@@ -507,9 +507,13 @@ esp_err_t ExecuteWithStorageLease(
     if (!storage_lease) {
         return ESP_ERR_INVALID_STATE;
     }
+    // [measure] Pass `label` on the background path too. word_study_store.cpp
+    // and note_store.cpp both forward their holder here; this one did not, so
+    // every background problem transaction was logged with the default owner
+    // "background" and the §一 table could not tell problem traffic apart.
     return foreground
         ? wqn::services::ExecuteForegroundStorageTransaction(transaction, context, label)
-        : wqn::services::ExecuteStorageTransaction(transaction, context);
+        : wqn::services::ExecuteStorageTransactionNamed(transaction, context, label);
 }
 
 }  // namespace

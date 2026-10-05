@@ -796,8 +796,8 @@ esp_err_t InvalidateWordPackManifest()
     // Measured on a device holding multi-MB packs: dropping the whole cache from
     // the UI task took 25.7 s and froze it, while this manifest-only variant is
     // ~1.5 s and leaves the expensive part to the lane.
-    return services::ExecuteStorageTransaction(
-        InvalidateWordPackManifestTransaction, nullptr);
+    return services::ExecuteStorageTransactionNamed(
+        InvalidateWordPackManifestTransaction, nullptr, "wp-manifest-invalidate");
 }
 
 esp_err_t ResetWordPackStorageCache()
@@ -810,8 +810,8 @@ esp_err_t ResetWordPackStorageCache()
     if (!storage_lease) {
         return ESP_ERR_INVALID_STATE;
     }
-    const esp_err_t result = services::ExecuteStorageTransaction(
-        ResetWordPackStorageCacheRaw, nullptr);
+    const esp_err_t result = services::ExecuteStorageTransactionNamed(
+        ResetWordPackStorageCacheRaw, nullptr, "wp-cache-reset");
     if (result == ESP_OK) {
         ESP_LOGW(kTag, "cleared incompatible word pack cache; cloud content is recoverable");
     }
@@ -985,9 +985,9 @@ esp_err_t SaveWordPackManifest(const WqnWordPackManifest& manifest)
     if (!storage_lease) {
         return ESP_ERR_INVALID_STATE;
     }
-    return services::ExecuteStorageTransaction(
+    return services::ExecuteStorageTransactionNamed(
         SaveWordPackManifestTransaction,
-        const_cast<WqnWordPackManifest*>(&manifest));
+        const_cast<WqnWordPackManifest*>(&manifest), "wp-manifest-save");
 }
 
 esp_err_t LoadWordPackIndexInternal(
@@ -1348,8 +1348,8 @@ esp_err_t AppendWordPackStream(
     context->operation = WordPackStreamOperation::kAppend;
     context->chunk = bytes;
     context->chunk_size = size;
-    return services::ExecuteStorageTransaction(
-        WordPackStreamTransaction, context);
+    return services::ExecuteStorageTransactionNamed(
+        WordPackStreamTransaction, context, "wp-stream");
 }
 
 esp_err_t DownloadWordPackToStorage(
@@ -1375,22 +1375,22 @@ esp_err_t DownloadWordPackToStorage(
     context.item = &item;
     mbedtls_sha256_init(&context.sha);
     context.operation = WordPackStreamOperation::kBegin;
-    esp_err_t result = services::ExecuteStorageTransaction(
-        WordPackStreamTransaction, &context);
+    esp_err_t result = services::ExecuteStorageTransactionNamed(
+        WordPackStreamTransaction, &context, "wp-stream");
     if (result == ESP_OK) {
         result = DownloadWordPackStream(
             token, metadata, item, AppendWordPackStream, &context);
     }
     if (result == ESP_OK) {
         context.operation = WordPackStreamOperation::kCommit;
-        result = services::ExecuteStorageTransaction(
-            WordPackStreamTransaction, &context);
+        result = services::ExecuteStorageTransactionNamed(
+            WordPackStreamTransaction, &context, "wp-stream");
     }
     if (result != ESP_OK) {
         context.operation = WordPackStreamOperation::kAbort;
         ESP_ERROR_CHECK_WITHOUT_ABORT(
-            services::ExecuteStorageTransaction(
-                WordPackStreamTransaction, &context));
+            services::ExecuteStorageTransactionNamed(
+                WordPackStreamTransaction, &context, "wp-stream"));
     }
     mbedtls_sha256_free(&context.sha);
     return result;

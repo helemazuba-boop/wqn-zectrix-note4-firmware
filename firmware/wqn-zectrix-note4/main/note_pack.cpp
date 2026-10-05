@@ -858,8 +858,8 @@ esp_err_t ResetNotePackStorageCache()
     if (!storage_lease) {
         return ESP_ERR_INVALID_STATE;
     }
-    const esp_err_t result = services::ExecuteStorageTransaction(
-        ResetNotePackStorageCacheRaw, nullptr);
+    const esp_err_t result = services::ExecuteStorageTransactionNamed(
+        ResetNotePackStorageCacheRaw, nullptr, "np-cache-reset");
     if (result == ESP_OK) {
         ESP_LOGW(kTag, "cleared incompatible note pack cache; cloud content is recoverable");
     }
@@ -1042,9 +1042,9 @@ esp_err_t SaveNotePackManifest(const WqnNotePackManifest& manifest)
     if (!storage_lease) {
         return ESP_ERR_INVALID_STATE;
     }
-    return services::ExecuteStorageTransaction(
+    return services::ExecuteStorageTransactionNamed(
         SaveNotePackManifestTransaction,
-        const_cast<WqnNotePackManifest*>(&manifest));
+        const_cast<WqnNotePackManifest*>(&manifest), "np-manifest-save");
 }
 
 esp_err_t LoadNotePackIndex(NotePackIndex* index)
@@ -1353,7 +1353,7 @@ esp_err_t AppendNotePackStream(void* opaque, const uint8_t* bytes, size_t size)
     context->operation = NotePackStreamOperation::kAppend;
     context->chunk = bytes;
     context->chunk_size = size;
-    return services::ExecuteStorageTransaction(NotePackStreamTransaction, context);
+    return services::ExecuteStorageTransactionNamed(NotePackStreamTransaction, context, "np-stream");
 }
 
 esp_err_t DownloadNotePackToStorage(
@@ -1381,21 +1381,21 @@ esp_err_t DownloadNotePackToStorage(
     context.notebook = &notebook;
     mbedtls_sha256_init(&context.sha);
     context.operation = NotePackStreamOperation::kBegin;
-    esp_err_t result = services::ExecuteStorageTransaction(
-        NotePackStreamTransaction, &context);
+    esp_err_t result = services::ExecuteStorageTransactionNamed(
+        NotePackStreamTransaction, &context, "np-stream");
     if (result == ESP_OK) {
         result = DownloadNotePackStream(
             token, metadata, notebook, AppendNotePackStream, &context, progress);
     }
     if (result == ESP_OK) {
         context.operation = NotePackStreamOperation::kCommit;
-        result = services::ExecuteStorageTransaction(
-            NotePackStreamTransaction, &context);
+        result = services::ExecuteStorageTransactionNamed(
+            NotePackStreamTransaction, &context, "np-stream");
     }
     if (result != ESP_OK) {
         context.operation = NotePackStreamOperation::kAbort;
         ESP_ERROR_CHECK_WITHOUT_ABORT(
-            services::ExecuteStorageTransaction(NotePackStreamTransaction, &context));
+            services::ExecuteStorageTransactionNamed(NotePackStreamTransaction, &context, "np-stream"));
     }
     mbedtls_sha256_free(&context.sha);
     return result;
@@ -1673,7 +1673,7 @@ esp_err_t LoadCachedNoteImage(const std::string& image_id, std::vector<uint8_t>*
         return ESP_ERR_INVALID_STATE;
     }
     LoadNoteImageContext context = {&image_id, wqni};
-    return services::ExecuteStorageTransaction(LoadNoteImageTransaction, &context);
+    return services::ExecuteStorageTransactionNamed(LoadNoteImageTransaction, &context, "np-image-load");
 }
 
 esp_err_t StoreCachedNoteImage(const std::string& image_id, const uint8_t* data, size_t size)
@@ -1697,9 +1697,9 @@ esp_err_t StoreCachedNoteImage(const std::string& image_id, const uint8_t* data,
         return ESP_ERR_INVALID_STATE;
     }
     StoreNoteImageContext context = {&image_id, data, size};
-    return services::ExecuteStorageTransaction(
+    return services::ExecuteStorageTransactionNamed(
         StoreNoteImageTransaction,
-        &context);
+        &context, "np-image-store");
 }
 
 }  // namespace wqn

@@ -296,7 +296,7 @@ esp_err_t SaveStringTransaction(void* opaque)
 esp_err_t SaveStringToNvs(const char* key, const std::string& value)
 {
     StringWriteContext context = {key, &value};
-    return wqn::services::ExecuteStorageTransaction(SaveStringTransaction, &context);
+    return wqn::services::ExecuteStorageTransactionNamed(SaveStringTransaction, &context, "save-string");
 }
 
 esp_err_t LoadU64FromNvs(const char* key, uint64_t* value, bool* found)
@@ -349,7 +349,7 @@ esp_err_t SaveU64Transaction(void* opaque)
 esp_err_t SaveU64ToNvs(const char* key, uint64_t value)
 {
     U64WriteContext context = {key, value};
-    return wqn::services::ExecuteStorageTransaction(SaveU64Transaction, &context);
+    return wqn::services::ExecuteStorageTransactionNamed(SaveU64Transaction, &context, "save-u64");
 }
 
 esp_err_t LoadBlobFromNvs(const char* key, std::string* value)
@@ -407,7 +407,7 @@ esp_err_t SaveBlobTransaction(void* opaque)
 esp_err_t SaveBlobToNvs(const char* key, const std::string& value)
 {
     BlobWriteContext context = {key, &value};
-    return wqn::services::ExecuteStorageTransaction(SaveBlobTransaction, &context);
+    return wqn::services::ExecuteStorageTransactionNamed(SaveBlobTransaction, &context, "save-blob");
 }
 
 esp_err_t ClearNvsKeyRaw(const char* key)
@@ -436,9 +436,9 @@ esp_err_t ClearNvsKeyTransaction(void* opaque)
 
 esp_err_t ClearNvsKey(const char* key)
 {
-    return wqn::services::ExecuteStorageTransaction(
+    return wqn::services::ExecuteStorageTransactionNamed(
         ClearNvsKeyTransaction,
-        const_cast<char*>(key));
+        const_cast<char*>(key), "clear-nvs-key");
 }
 
 bool IsValidAutoSyncInterval(uint32_t minutes)
@@ -504,9 +504,9 @@ esp_err_t ClearIdentityStateTransaction(void*)
 
 esp_err_t ClearAccessTokenKeys()
 {
-    return wqn::services::ExecuteStorageTransaction(
+    return wqn::services::ExecuteStorageTransactionNamed(
         ClearIdentityStateTransaction,
-        nullptr);
+        nullptr, "clear-identity-state");
 }
 
 esp_err_t SaveDeviceControlStateRaw(const wqn::DeviceControlState& state)
@@ -963,9 +963,9 @@ esp_err_t InitStorage()
     // those exact artifacts on StorageService so cleanup is serialized with
     // all current pack/outbox writes. It is intentionally idempotent and does
     // not touch problem-study-v1 pp_* / po_* files.
-    const esp_err_t cleanup_result = services::ExecuteStorageTransaction(
+    const esp_err_t cleanup_result = services::ExecuteStorageTransactionNamed(
         CleanupPrototypeProblemStorageTransaction,
-        nullptr);
+        nullptr, "cleanup-proto-problem");
     if (cleanup_result != ESP_OK) {
         ESP_LOGW(
             kTag,
@@ -1017,9 +1017,9 @@ esp_err_t EnsurePackDownloadCapacity(
         required_bytes,
         safety_reserve_bytes,
     };
-    return services::ExecuteStorageTransaction(
+    return services::ExecuteStorageTransactionNamed(
         EnsurePackDownloadCapacityTransaction,
-        &request);
+        &request, "ensure-pack-capacity");
 }
 
 esp_err_t LoadAccessToken(std::string* token)
@@ -1100,9 +1100,9 @@ esp_err_t SaveDeviceControlState(const DeviceControlState& state)
     if (!write) {
         return ESP_ERR_INVALID_STATE;
     }
-    return services::ExecuteStorageTransaction(
+    return services::ExecuteStorageTransactionNamed(
         SaveDeviceControlStateTransaction,
-        const_cast<DeviceControlState*>(&state));
+        const_cast<DeviceControlState*>(&state), "save-device-control");
 }
 
 esp_err_t LoadSyncJournal(SyncJournal* journal)
@@ -1784,7 +1784,7 @@ esp_err_t SaveVolumePercent(int percent)
         return ESP_ERR_INVALID_ARG;
     }
     g_volume_percent_cache.store(percent, std::memory_order_relaxed);
-    return services::ExecuteStorageTransaction(SaveVolumeTransaction, &percent);
+    return services::ExecuteStorageTransactionNamed(SaveVolumeTransaction, &percent, "save-volume");
 }
 
 esp_err_t SaveVolumePercentForeground(int percent)
@@ -1830,7 +1830,7 @@ esp_err_t FactoryResetNvsAndRestart()
     if (!write) {
         return ESP_ERR_INVALID_STATE;
     }
-    return services::ExecuteStorageTransaction(FactoryResetTransaction, nullptr);
+    return services::ExecuteStorageTransactionNamed(FactoryResetTransaction, nullptr, "factory-reset");
 }
 
 namespace {
