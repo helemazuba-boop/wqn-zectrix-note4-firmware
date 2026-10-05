@@ -75,6 +75,24 @@ BENCH_ROUND_RE = re.compile(
     r'storage bench round: shape=(?P<shape>\S+) round=(?P<round>\d+) '
     r'wall_ms=(?P<wall>\d+) result=(?P<result>\w+)')
 
+# `long-held sleep lease: blocker=storage holder=storage-bench held_ms=209480`
+# Only meaningful for holders that MUST have died: the bench's lease covers the
+# whole run, so a warning naming it after `storage bench END` is a leak, not a
+# long download. The pack/cloud holders legitimately span minutes and are
+# deliberately NOT judged here (see BENCH:lease-released).
+# `at_ms` is the log's own boot-relative clock, not held_ms -- that is the whole
+# point of comparing them: held_ms counts from acquisition, so on its own it
+# cannot say whether the lease outlived the run it was acquired for.
+LEASE_RE = re.compile(
+    r'\((?P<at_ms>\d+)\) (?P<tag>\w+): long-held sleep lease: '
+    r'blocker=(?P<blocker>[\w-]+) holder=(?P<holder>[\w-]+) held_ms=(?P<held>\d+)')
+
+# Boot-relative clock of the bench END marker. The marker prints `total_ms` (the
+# bench's own duration) but not when it finished, so the clock comes from the log
+# prefix -- same clock the lease warnings use, which is what makes them
+# comparable at all. (Serial logs arrive CRLF; `\w+` cannot swallow the `\r`, so
+# these patterns stop at the last field they name and never anchor to EOL.)
+BENCH_END_RE = re.compile(r'\((?P<at_ms>\d+)\) \w+: storage bench END')
 
 
 
@@ -92,6 +110,7 @@ class Log:
     bench_events: list = field(default_factory=list)
     rounds: list = field(default_factory=list)
     boots: int = 0
+    leases: list = field(default_factory=list)
 
     @classmethod
     def load(cls, path: str) -> 'Log':
@@ -113,6 +132,9 @@ class Log:
                        for k, v in m.groupdict().items()}
                       for m in BENCH_ROUND_RE.finditer(text)]
         log.boots = text.count('opened COM') or text.count('End of partition table')
+        log.leases = [{k: (v if k in ('blocker', 'holder', 'tag') else int(v))
+                      for k, v in m.groupdict().items()}
+                      for m in LEASE_RE.finditer(text)]
         return log
     def txof(self, owner: str) -> list:
         return [t for t in self.tx if t['owner'] == owner]
@@ -463,6 +485,33 @@ def hil_storage_bench(log: Log):
         for shape, w in sorted(by_shape.items()))
     if detail:
         check(log, 'BENCH:shape-costs', 'PASS', True, detail)
+
+    # --- 3. bench 的 sleep lease 必须死了 ----------------------------------
+    # WHY THIS EXISTS (1005.12, commit 17c3d4c): `BenchTask` ended with
+    # `vTaskDelete(nullptr)`, which runs NO destructors, so the stack SleepLease
+    # acquired to survive the 60 s idle deadline was never returned. The device
+    # sat there for 236 s after the bench had finished, `ActiveSleepBlockerCount
+    # (kStorage)` stuck above zero, deep sleep permanently blocked -- caused by
+    # the very lease added to protect the bench. It is invisible in the bench's
+    # own numbers (END total_ms is honest) and needs the sleep warnings to see.
+    # Scope is deliberately narrow: only `storage-bench`. The pack and cloud
+    # holders legitimately outlive a download by minutes and would make a
+    # blanket check cry wolf on a healthy device.
+    ends = [int(m.group('at_ms')) for m in BENCH_END_RE.finditer(log.text)]
+    leaked = [l for l in log.leases
+              if l['holder'] == 'storage-bench' and ends and l['at_ms'] > max(ends)]
+    if not ends:
+        skip(log, 'BENCH:lease-released',
+             '本轮 bench 没有 END 标记（只跑到 begin），无从判断 lease 是否归还')
+    elif not leaked:
+        expect(log, 'BENCH:lease-released', True,
+               f'bench 在 {max(ends)} ms 结束，此后再无 storage-bench 租约告警')
+    else:
+        worst = max(leaked, key=lambda l: l['held'])
+        expect(log, 'BENCH:lease-released', False,
+               f'bench 已于 {max(ends)} ms 结束，但 {len(leaked)} 条 storage-bench 租约'
+               f'告警出现在其后（最晚一条 held_ms={worst["held"]}，'
+               f'日志时钟 {worst["at_ms"]} ms）⇒ 租约没还，深睡被永久挡住')
 
     # --- 4. bench 不能把真实流量弄丢 ---------------------------------------    # 第一条写法是错的，被重写侧指出后改掉：bench 是 20 笔串行事务，第 N 笔的
     # queue_wait 就是前 N-1 笔的累计 elapsed——按我们自己的模型 3 KB 那档单笔
