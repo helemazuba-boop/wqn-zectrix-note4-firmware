@@ -8,6 +8,7 @@
 
 #include "ai_session.h"
 #include "ai_history.h"
+#include "agent_round_policy.h"
 #include "agent_voice_pipe.h"
 #include "audio_capture.h"
 #include "esp_check.h"
@@ -25,12 +26,6 @@ namespace {
 
 constexpr char kTag[] = "wqn_agent";
 constexpr TickType_t kConnectivityWait = pdMS_TO_TICKS(20000);
-constexpr size_t kMaxAgentTextBytes = 12 * 1024;
-// Reasoning gets its own budget rather than sharing the answer's: a long
-// chain-of-thought must not starve the reply the user actually asked for, and
-// the history channel is evicted oldest-first, so an unbounded thinking buffer
-// would push the whole conversation out of the ring.
-constexpr size_t kMaxThinkingBytes = 2 * 1024;
 constexpr size_t kMaxPromptBytes = 4096;
 constexpr uint32_t kWorkerStackBytes = 9216;
 // [voice-pipe] How long Transcribe() waits for the agent WS turn to produce an
@@ -138,34 +133,6 @@ void ResetAgentHistoryTurnLocked();
 void MarkChangedLocked()
 {
     g_changed = true;
-}
-
-// The longest prefix of `text` that fits `max_bytes` without ending inside a
-// UTF-8 sequence. Truncating a Chinese answer at a byte count with substr()
-// splits a 3-byte character into stray bytes, and the history channel then
-// renders mojibake (or drops the tail of the message). Backing up from the
-// cut to the lead byte and keeping the whole character when it fits keeps the
-// buffer valid UTF-8 at every prefix length.
-size_t Utf8SafePrefixBytes(std::string_view text, size_t max_bytes)
-{
-    if (text.size() <= max_bytes) {
-        return text.size();
-    }
-    size_t start = max_bytes;
-    while (start > 0 &&
-           (static_cast<unsigned char>(text[start]) & 0xC0) == 0x80) {
-        --start;
-    }
-    const unsigned char lead = static_cast<unsigned char>(text[start]);
-    size_t length = 1;
-    if ((lead & 0xE0) == 0xC0) {
-        length = 2;
-    } else if ((lead & 0xF0) == 0xE0) {
-        length = 3;
-    } else if ((lead & 0xF8) == 0xF0) {
-        length = 4;
-    }
-    return start + length <= max_bytes ? start + length : start;
 }
 
 void SetPhaseLocked(wqn::AiFeaturePhase phase, const std::string& status)
@@ -798,45 +765,50 @@ void CloseAgentToolBlockLocked(bool ok, int64_t now_ms)
     g_agent_thinking_id = wqn::kInvalidChatMessageId;
 }
 
-// Streams the accumulated gateway text into a single assistant entry: the
-// first delta creates it, later deltas replace it in place. Replacing matters
-// -- the gateway emits dozens of deltas per reply and appending each one would
-// blow through the ring buffer's byte budget before the reply finished.
-void MirrorAgentTextLocked(int64_t now_ms)
+// Applies one agent text/reasoning frame to the live channels. The policy in
+// agent_round_policy.h decides what happens; this function performs it against
+// the real AiHistory, and it is the only place in the firmware that turns a
+// policy flag into a history write. The host matrix in
+// test/agent_round_policy_test.cpp exercises the policy half.
+//
+// Caller must hold g_lock.
+void ApplyAgentRoundFrameLocked(const wqn::AgentRoundFrame& frame, int64_t now_ms)
 {
-    CloseAgentToolBlockLocked(g_agent_tool_ok, now_ms);
-    const std::string& text = g_state.ui.response_text;
-    if (text.empty()) {
-        return;
-    }
-    wqn::AiHistory& history = wqn::GetAiHistory(wqn::AiHistoryChannel::kAgent);
-    if (g_agent_assistant_id == wqn::kInvalidChatMessageId) {
-        g_agent_assistant_id = history.AppendAssistant(text, now_ms);
-        return;
-    }
-    history.ReplaceText(g_agent_assistant_id, wqn::ChatMessageKind::kAssistant, text, now_ms);
-}
+    bool assistant_open = (g_agent_assistant_id != wqn::kInvalidChatMessageId);
+    bool thinking_open = (g_agent_thinking_id != wqn::kInvalidChatMessageId);
+    bool tool_open = (g_agent_tool_id != wqn::kInvalidChatMessageId);
+    const wqn::AgentRoundOps ops = wqn::ApplyAgentRoundFrame(
+        g_state.ui.response_text, g_agent_thinking_text, assistant_open, thinking_open,
+        tool_open, frame,
+        wqn::AgentRoundBudgets{g_run_detail, wqn::kMaxAgentTextBytes, wqn::kMaxThinkingBytes});
 
-// Same in-place contract as MirrorAgentTextLocked, on the thinking channel. The
-// gateway can emit hundreds of reasoning deltas for one turn, and each new
-// `kThinking` message would evict the ring buffer's head -- i.e. the rest of
-// the conversation -- before the reply even finished.
-void MirrorAgentThinkingLocked(int64_t now_ms)
-{
-    CloseAgentToolBlockLocked(g_agent_tool_ok, now_ms);
-    if (g_agent_thinking_text.empty()) {
-        return;
+    // Order matters: the close writes the tool result, and it retires both
+    // entries, so it runs before any history write below and the id bookkeeping
+    // catches up with it before the Append/Replace chooses an entry.
+    if (ops.close_tool_block) {
+        CloseAgentToolBlockLocked(g_agent_tool_ok, now_ms);
     }
-    // Post-tool reasoning must open a NEW entry for the same reason post-tool
-    // text does (see CloseAgentToolBlockLocked).
-    if (g_agent_thinking_id == wqn::kInvalidChatMessageId) {
-        g_agent_thinking_id = wqn::GetAiHistory(wqn::AiHistoryChannel::kAgent)
-                                  .AppendThinking(AgentThinkingLabel(g_agent_thinking_text), now_ms);
-        return;
+    if (!assistant_open) {
+        g_agent_assistant_id = wqn::kInvalidChatMessageId;
     }
-    wqn::GetAiHistory(wqn::AiHistoryChannel::kAgent).ReplaceText(
-        g_agent_thinking_id, wqn::ChatMessageKind::kThinking,
-        AgentThinkingLabel(g_agent_thinking_text), now_ms);
+    if (!thinking_open) {
+        g_agent_thinking_id = wqn::kInvalidChatMessageId;
+    }
+
+    wqn::AiHistory& history = wqn::GetAiHistory(wqn::AiHistoryChannel::kAgent);
+    if (ops.append_assistant) {
+        g_agent_assistant_id = history.AppendAssistant(g_state.ui.response_text, now_ms);
+    } else if (ops.replace_assistant) {
+        history.ReplaceText(g_agent_assistant_id, wqn::ChatMessageKind::kAssistant,
+                            g_state.ui.response_text, now_ms);
+    }
+    if (ops.append_thinking) {
+        g_agent_thinking_id =
+            history.AppendThinking(AgentThinkingLabel(g_agent_thinking_text), now_ms);
+    } else if (ops.replace_thinking) {
+        history.ReplaceText(g_agent_thinking_id, wqn::ChatMessageKind::kThinking,
+                            AgentThinkingLabel(g_agent_thinking_text), now_ms);
+    }
 }
 
 // Records the submitted prompt and arms a fresh turn. Called before the worker
@@ -1048,23 +1020,20 @@ void OnOpenCodeEvent(const wqn::OpenCodeEvent& event, void*)
             }
             break;
         case wqn::OpenCodeEventKind::kTextDelta:
-            if (g_state.ui.response_text.size() < kMaxAgentTextBytes) {
-                const size_t remaining = kMaxAgentTextBytes - g_state.ui.response_text.size();
-                g_state.ui.response_text.append(
-                    event.text.data(), Utf8SafePrefixBytes(event.text, remaining));
-            }
-            MirrorAgentTextLocked(now_ms);
+            ApplyAgentRoundFrameLocked(
+                wqn::AgentRoundFrame{wqn::AgentRoundFrameKind::kTextDelta, event.text},
+                now_ms);
             MarkChangedLocked();
             break;
         case wqn::OpenCodeEventKind::kText:
             // H1: the cloud sends an EMPTY `agent.text` as its "start this round
-            // over" frame at every detail tier now, not just brief. The assign
-            // below is already the clear -- assigning an empty string IS clearing
-            // the buffer -- so the only thing missing was retiring the assistant
-            // id. Without it, the next round's delta lands on ReplaceText and
-            // writes into the entry that is currently holding the previous
-            // round's answer, so the two rounds end up stacked in one bubble
-            // instead of the new one replacing it.
+            // over" frame at every detail tier now, not just brief. Assigning an
+            // empty string IS clearing the buffer, so the clear half was always
+            // free; what was missing was retiring the assistant id. Without it,
+            // the next round's delta lands on ReplaceText and writes into the
+            // entry that is currently holding the previous round's answer, so
+            // the two rounds end up stacked in one bubble instead of the new one
+            // replacing it.
             //
             // Gated on the detail tier because that is what decides whether the
             // cloud emits this frame at all: brief tier has been sending it all
@@ -1072,23 +1041,20 @@ void OnOpenCodeEvent(const wqn::OpenCodeEvent& event, void*)
             // and tool blocks -- the tiers where a round boundary is actually
             // visible as a splice. Reading `g_state.detail_level` here instead
             // would let a tier change made mid-run change this run's behaviour.
-            if (event.text.empty() && g_run_detail >= 1) {
-                g_agent_assistant_id = wqn::kInvalidChatMessageId;
-            }
-            g_state.ui.response_text.assign(
-                event.text.data(),
-                Utf8SafePrefixBytes(event.text, kMaxAgentTextBytes));
-            MirrorAgentTextLocked(now_ms);
+            //
+            // Both halves of that (the clear and the retirement) now live in
+            // agent_round_policy.h and are asserted as a pair by the host matrix,
+            // which is why the code here is a single call.
+            ApplyAgentRoundFrameLocked(
+                wqn::AgentRoundFrame{wqn::AgentRoundFrameKind::kText, event.text},
+                now_ms);
             MarkChangedLocked();
             break;
         case wqn::OpenCodeEventKind::kReasoningDelta:
             // Reasoning is bounded by its own budget, never by the answer's.
-            if (g_agent_thinking_text.size() < kMaxThinkingBytes) {
-                const size_t remaining = kMaxThinkingBytes - g_agent_thinking_text.size();
-                g_agent_thinking_text.append(
-                    event.text.data(), Utf8SafePrefixBytes(event.text, remaining));
-                MirrorAgentThinkingLocked(now_ms);
-            }
+            ApplyAgentRoundFrameLocked(
+                wqn::AgentRoundFrame{wqn::AgentRoundFrameKind::kReasoningDelta, event.text},
+                now_ms);
             MarkChangedLocked();
             break;
         case wqn::OpenCodeEventKind::kReasoning:
@@ -1098,25 +1064,19 @@ void OnOpenCodeEvent(const wqn::OpenCodeEvent& event, void*)
             // reasoning, because `applyReasoningDelta` sees the boundary before
             // `applyDelta` does.
             //
-            // The assign below is already the buffer clear, so -- as in A4 --
-            // the only thing missing was retiring the id. Without it the next
-            // reasoning delta lands on ReplaceText and writes into the PREVIOUS
-            // round's thinking entry, which sits above any tool block that ran
-            // in between. The text would be right and the position wrong: round
-            // N's thought would render where round N-1's used to be. Retiring the
-            // id is what makes the next reasoning delta AppendThinking at the
-            // current tail instead.
+            // Without retiring the id, the next reasoning delta lands on
+            // ReplaceText and writes into the PREVIOUS round's thinking entry,
+            // which sits above any tool block that ran in between. The text
+            // would be right and the position wrong: round N's thought would
+            // render where round N-1's used to be. Retiring the id is what makes
+            // the next reasoning delta AppendThinking at the current tail instead.
             //
             // No detail gate here, unlike A4: reasoning only reaches the device
             // at detail >= 2 at all, because the cloud is what filters it, so
             // there is no tier at which this frame arrives unexpectedly.
-            if (event.text.empty()) {
-                g_agent_thinking_id = wqn::kInvalidChatMessageId;
-            }
-            g_agent_thinking_text.assign(
-                event.text.data(),
-                Utf8SafePrefixBytes(event.text, kMaxThinkingBytes));
-            MirrorAgentThinkingLocked(now_ms);
+            ApplyAgentRoundFrameLocked(
+                wqn::AgentRoundFrame{wqn::AgentRoundFrameKind::kReasoning, event.text},
+                now_ms);
             MarkChangedLocked();
             break;
         case wqn::OpenCodeEventKind::kTool: {
@@ -1167,12 +1127,27 @@ void OnOpenCodeEvent(const wqn::OpenCodeEvent& event, void*)
                 // the clear cannot cost a frame.
                 //
                 // Safe to drop the accumulated text: every pre-tool delta has
-                // already been mirrored into history by MirrorAgentTextLocked,
-                // and the close above retired the assistant id, so the next
-                // text delta can only AppendAssistant a new entry. It cannot
-                // ReplaceText over the pre-tool one, which is what makes this a
-                // clear rather than a loss.
-                g_state.ui.response_text.clear();
+                // already been mirrored into history, and the close above
+                // retired the assistant id, so the next text delta can only
+                // AppendAssistant a new entry. It cannot ReplaceText over the
+                // pre-tool one, which is what makes this a clear rather than a
+                // loss.
+                //
+                // The clear and the two retirements are AgentRoundToolBoundary
+                // in agent_round_policy.h, so the host matrix covers the pair.
+                bool assistant_open = (g_agent_assistant_id != wqn::kInvalidChatMessageId);
+                bool thinking_open = (g_agent_thinking_id != wqn::kInvalidChatMessageId);
+                wqn::AgentRoundToolBoundary(g_state.ui.response_text, assistant_open,
+                                            thinking_open);
+                // The close above retires both entries only when a block was
+                // actually open, so this write-back is load-bearing for the
+                // first tool frame of a run rather than being belt and braces.
+                if (!assistant_open) {
+                    g_agent_assistant_id = wqn::kInvalidChatMessageId;
+                }
+                if (!thinking_open) {
+                    g_agent_thinking_id = wqn::kInvalidChatMessageId;
+                }
                 g_agent_tool_ok = event.status != "error";
                 g_agent_tool_id = wqn::GetAiHistory(wqn::AiHistoryChannel::kAgent)
                                       .AppendToolStart(event.tool, std::string_view(), now_ms);
