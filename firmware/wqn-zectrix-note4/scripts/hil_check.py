@@ -79,7 +79,6 @@ BENCH_RE = re.compile(r'(?i)\bbench\b[^\n]*?\b(?P<what>begin|end)\b')
 BENCH_ROUND_RE = re.compile(
     r'storage bench round: shape=(?P<shape>\S+) round=(?P<round>\d+) '
     r'wall_ms=(?P<wall>\d+) result=(?P<result>\w+)')
-
 # `long-held sleep lease: blocker=storage holder=storage-bench held_ms=209480`
 # Only meaningful for holders that MUST have died: the bench's lease covers the
 # whole run, so a warning naming it after `storage bench END` is a leak, not a
@@ -177,10 +176,33 @@ WORD_PACK_APPEND_RE = re.compile(
 # 这个行让判据说一句它本来没资格说的话：双峰是产品自己的行为，不是 bench 的
 # 行为。1005.26 实测 append_ms = 6/6/6/6/8/15/15 + 365/433/433，与 bench 的
 # 31 / 1308~2149 同形（便宜簇 + 贵约百倍的簇），只是绝对量级因载荷不同而不同。
-WORD_OBS_DURABLE_RE = re.compile(
-    r'^[IWEDV] \((?P<t>\d+)\) word_store: word observation durable: '
-    r'sequence=(?P<seq>\d+) lookup_ms=(?P<lookup>\d+) '
-    r'append_ms=(?P<append>\d+) total_ms=(?P<total>\d+)', re.M)
+# 只锁行头，字段全部按 key=value 扫。
+# WHY: 对端 1006.4 在 `append_ms=` 与 `total_ms=` 之间插了 `append_open_ms=` 和
+# `append_bytes=`，位置正则当场一条都匹配不上——而"匹配不上"在判据里长得跟
+# "这轮没测"一模一样，于是这条真实流量双峰证据会**静默消失**。它恰恰是"双峰不是
+# bench 量测假象"的唯一凭据（1006.3 上 n=30）。加字段、换顺序都不该影响它。
+WORD_OBS_DURABLE_HEAD = 'word observation durable:'
+
+# `storage bench append round=%d bytes=%u result=%s new_object=%d`
+# 这是 append shape **自己额外打**的一行：通用轮次行只有 shape/round/wall_ms/
+# result/info_ms，没有 new_object。`new_object=1` 只在 round 0（建文件那次），
+# 之后每轮都是 0 —— 就是用来把 append shape 实测出的两簇成本分开的那一位。
+# 两行的 round 是同一个计数器（ctx.round = round），所以能按 round 对上。
+BENCH_APPEND_RE = re.compile(
+    r'storage bench append round=(?P<round>\d+) bytes=(?P<bytes>\d+) '
+    r'result=(?P<result>\w+) new_object=(?P<new_object>\d+)')
+
+# 数字型 key=value。刻意不带行头：同一份日志里同一类行的字段会增删，
+# 判据只该对"这一行里有没有我要的那个 key"负责。
+KV_NUM_RE = re.compile(r'(\w+)=(-?\d+)')
+LOG_PREFIX_RE = re.compile(r'^[IWEDV] \((\d+)\)')
+# 字符串型 key=value：`nvs write: key=word-session-cursor ...` 里的那个 key。
+# WHY: `KV_NUM_RE` 只吃数字，所以 key= 会被整条丢掉——而"哪一笔是第一次写
+# 这个 key"正是 §五之十 里唯一能分开"一次性成本"和"每次成本"的字段。
+# 少了它，6 笔 52 B 写法会全部显示成 key=?，跨 key 的统计（几个 key × 几条）
+# 就直接退化成"1 个 key"，那是我在 1006.10 上犯的错的同一个方向：
+# **把不同来源的样本混成一个来源再统计**。
+KV_KEY_RE = re.compile(r'\bkey=([A-Za-z0-9_.-]+)')
 
 # Gate self-test (`RunUiGateSelfTest`, C1). Two lines, one honest verdict:
 #   I wqn_ui_gates: commit_state gate self-test passed
@@ -223,6 +245,38 @@ kStreamDeadlineMs = 120000
 # P1b-B 正在验证的那个读缓冲尺寸。读缓冲大小就是 wp-stream 的事务笔数，
 # 所以"32 KB 够不够"是整个 P1b-B 要回答的产品问题。
 kStreamChunkUnderTest = 32 * 1024
+
+# NVS 分区算术，从本地 IDF 树 + 分区表实推，**不是估计值**：
+#   BLOB_DATA 条目 = 1 + ceil(dataSize / 32)    —— nvs_page.cpp:186-191
+#   BLOB_IDX   条目 = 1（固定 8 B 索引项，不在 isVariableLengthType 里）
+#                                            —— nvs_storage.cpp:351-361
+#   isVariableLengthType 只含 BLOB / SZ / BLOB_DATA —— nvs_types.hpp:33-38
+#   分区预算 = 4 页 × 126 条 = 504 条          —— partitions/16m.csv:3 (0x4000)
+#   单 blob 顶 = min(pages-1, …) × (32×125) = 12000 B —— nvs_storage.cpp:287
+# 提出来给两条判据共用：本地定义过一份，peer 改分区表时只会改一处。
+#
+# ⚠️ **这个公式在 1006.10 上被实测打回来过一次**：我原来只算 BLOB_DATA，
+# 得出 52 B = 3 条；实测 `used_entries` 每笔游标写涨 **4** 条。
+# 差的就是那条 BLOB_IDX——`nvs_set_blob` 写 blob 时除数据项外**必定**再写一条
+# 索引项（dataSize/chunkCount/chunkStart），而索引项是定长类型、占满 1 条。
+# 所以 blob 一律 +1。教训和"recompute peer 的算术"是同一条，只是这次错的是我。
+kNvsEntrySize = 32
+kNvsEntryCountPerPage = 126
+kNvsSizeBytes = 0x4000
+kNvsPages = kNvsSizeBytes // 4096
+kNvsBudget = kNvsPages * kNvsEntryCountPerPage
+kNvsSingleBlobCap = min(kNvsPages - 1, (0xff - 1) // 2) * (
+    kNvsEntrySize * (kNvsEntryCountPerPage - 1))
+# 迁 NVS 的那个 52 B 暂停/恢复游标。
+kSessionCursorBytes = 52
+
+
+def nvs_entries(data_bytes: int) -> int:
+    """一个 blob 占几条 NVS 条目（含表头条目 + 定长的 BLOB_IDX 索引条目）。
+
+    数据项：1 + ceil(data/32)；索引项：恒 1 条（nvs_storage.cpp:351-361）。
+    """
+    return 1 + -(-data_bytes // kNvsEntrySize) + 1
 
 
 def commit_cost_ms(g):
@@ -492,6 +546,21 @@ class Log:
     http_err: list = field(default_factory=list)
     appends: list = field(default_factory=list)
     obs_durable: list = field(default_factory=list)
+    # `nvs write: key= bytes= total_ms= changed=`（每笔 NVS 写一行）与
+    # `nvs stats: used_entries= free_entries= available_entries= total_entries=`
+    # （开机一次 + 每次游标写后一次）。字段名是对端的契约：`total_ms` 改名
+    # 或 `changed` 消失，本文件多处就会静默失配，所以集中一处解析。
+    nvs_writes: list = field(default_factory=list)
+    nvs_stats: list = field(default_factory=list)
+    # round -> new_object，append shape 专用（见 BENCH_APPEND_RE）。
+    bench_new_object: dict = field(default_factory=dict)
+    lines: list = field(default_factory=list)
+    obs_line_count: int = 0
+    bench_append_line_count: int = 0
+    bench_round_line_count: int = 0
+    bench_stream_line_count: int = 0
+    nvs_write_line_count: int = 0
+    nvs_stats_line_count: int = 0
     pack_line_count: int = 0
     boots: int = 0
     leases: list = field(default_factory=list)
@@ -501,6 +570,7 @@ class Log:
         with open(path, encoding='utf-8', errors='ignore') as fh:
             text = fh.read()
         log = cls(path=path, text=text)
+        log.lines = text.splitlines()
         for m in TX_RE.finditer(text):
             log.tx.append(m.groupdict())
         for m in CARD_RE.finditer(text):
@@ -554,9 +624,57 @@ class Log:
                         'total': int(m.group('total')), 'want': int(m.group('want'))}
                        for m in WORD_PACK_APPEND_RE.finditer(text)]
         # 真实流量侧的追加写：用来看 bench 的双峰是不是我们自己量测造出来的。
-        log.obs_durable = [{'t': int(m.group('t')), 'append': int(m.group('append')),
-                            'total': int(m.group('total'))}
-                           for m in WORD_OBS_DURABLE_RE.finditer(text)]
+        # 扫 key=value 而不是位置正则——理由见 WORD_OBS_DURABLE_HEAD 处。
+        obs = []
+        for line in log.lines:
+            if WORD_OBS_DURABLE_HEAD not in line:
+                continue
+            f = {k: int(v) for k, v in KV_NUM_RE.findall(line)}
+            tm = LOG_PREFIX_RE.match(line)
+            # `append` 是判据用的统一名（行里叫 append_ms）。缺它就算没解析到，
+            # 由 LOG:*-format-parsed 当场 FAIL，不会伪装成"这轮没测"。
+            if tm and 'append_ms' in f:
+                obs.append(dict(f, t=int(tm.group(1)), append=f['append_ms']))
+        log.obs_durable = obs
+        # append shape 的 new_object 位（BENCH_APPEND_RE），按 round 索引。
+        log.bench_new_object = {int(m.group('round')): int(m.group('new_object'))
+                                for m in BENCH_APPEND_RE.finditer(text)}
+        # 行数计数只服务 LOG:probe-lines-parsed，而且**必须带上必需字段才算**：
+        # 数"行头出现过"会把"旧构建没有新字段"误报成漂移（第一版就是这么写的，
+        # 10 份老日志里 `storage bench append round=` 全红，而 new_object 是新
+        # 构建才有的）。数"行头 + 必需 key 同时出现"才对得上解析器的实际条件。
+        for ln in log.lines:
+            if WORD_OBS_DURABLE_HEAD in ln and 'append_ms=' in ln:
+                log.obs_line_count += 1
+            if ('storage bench append round=' in ln
+                    and 'new_object=' in ln):
+                log.bench_append_line_count += 1
+            if ('storage bench round: shape=' in ln
+                    and 'wall_ms=' in ln):
+                log.bench_round_line_count += 1
+            if 'storage bench stream round=' in ln and 'cost_ms=' in ln:
+                log.bench_stream_line_count += 1
+            if 'nvs write:' in ln and 'total_ms=' in ln:
+                log.nvs_write_line_count += 1
+            if 'nvs stats:' in ln and 'total_entries=' in ln:
+                log.nvs_stats_line_count += 1
+        # NVS 侧两行。`changed=0` 是**真的没写**（storage.cpp:1084 先读出旧值
+        # memcmp，相同就跳过 nvs_set_blob），所以它必须原样带着走，否则
+        # "游标没变所以不花钱"会被读成"NVS 就是快"——那是两个相反的结论。
+        for line in log.lines:
+            if 'nvs write:' in line:
+                f = {k: int(v) for k, v in KV_NUM_RE.findall(line)}
+                km = KV_KEY_RE.search(line)
+                if km:
+                    f['key'] = km.group(1)
+                tm = LOG_PREFIX_RE.match(line)
+                if tm and 'total_ms' in f:
+                    log.nvs_writes.append(dict(f, t=int(tm.group(1))))
+            elif 'nvs stats:' in line:
+                f = {k: int(v) for k, v in KV_NUM_RE.findall(line)}
+                tm = LOG_PREFIX_RE.match(line)
+                if tm and 'total_entries' in f:
+                    log.nvs_stats.append(dict(f, t=int(tm.group(1))))
         # 格式漂移：有 word-pack-download 行，但没有一条 end 行被解析出来。
         log.pack_line_count = len(WORD_PACK_LINE_COUNT_RE.findall(text))
         log.boots = text.count('opened COM') or text.count('End of partition table')
@@ -793,17 +911,152 @@ def hil_c8_page_save(log: Log):
         skip(log, 'C8:no-page-save-observed', '本轮未见候选页快照写，也未见合并路径')
 
 
-def hil_pk_handle(log: Log):
-    """fbfa950 — 包读句柄复用。"""
+def pk_open_seek_context(paths, exclude=None):
+    """跨日志的 `open_seek` 中位区间——**只作上下文打印，不参与判定**。
+
+    WHY NOT A CONSTANT: 第一版这儿是个写死的 `(258, 722)`。结果它**当天就错了**：
+    1004.5(2) 的中位是 723，比写死的上界高 1 ms，于是一份历史日志被判成"已超出
+    历史区间，这才是回归"——**而这个区间的名字就叫"全历史"**。一个自称覆盖全
+    历史的常量，一定会在下一份日志到来时悄悄过期，而它过期的样子和"真的回归"
+    长得一模一样。这就是狼来了判据的成因。
+
+    WHY NOT THE VERDICT EITHER: min/max 区间**两端都当不了判定线**——
+      · 含着本轮自己 ⇒ 本轮永远不可能超出区间 ⇒ 判据退化成永远 PASS；
+      · 剔掉本轮自己 ⇒ 定义端点的那份日志每次都 FAIL。实测两份都踩到了：
+        1004.5(2) 中位 723 是全网最高，剔掉自己后上界变 722 ⇒ 假 FAIL；
+        1005.7 中位 258 是全网最低，剔掉自己后下界变 329 ⇒ 假 FAIL。
+    两份 FAIL 都是这个方法本身造出来的，设备一点没变。**一个会让"最极端的
+    那份样本必然失败"的统计量，不能当判据**——这是 min/max 类基线的通病，
+    换任何量都一样（双峰样本的中位数同理，见 cluster_gap 的注释）。
+
+    所以这里只回答"本轮在全历史里坐在哪一格"，判定看分量（hil_pk_handle）。
+    """
+    meds = {}
+    for p in paths:
+        if exclude is not None and p == exclude:
+            continue
+        try:
+            lg = Log.load(p)
+        except OSError:
+            continue
+        if lg.cards:
+            meds[p] = statistics.median([c['os'] for c in lg.cards])
+    if len(meds) < 2:
+        return None
+    return min(meds.values()), max(meds.values()), meds
+
+
+def hil_pk_handle(log, context=None):
+    """fbfa950 — 包读句柄复用。
+
+    ⚠️ **这条判据原来是对着自己的实验喊狼来了，2026-10-06 修了两轮。**
+
+    第一版：拿**单份日志**（1004.9）的中位 362 ms 当基线，>500 ms 即回归。
+    于是 1006.10 的 634 ms 被判成"新增真回归"，还当问题报给了对端。peer 一句话
+    驳回：**"634 没有回归，是判据基线只取了一份日志"**——我按 9 份日志复核，
+    中位跨 258~722（2.8× 摆幅），1005.4 的 721.5 比 1006.10 的 634 还高。
+
+    第二版：改成"跨日志 min/max 区间，剔掉自己"。看着严谨，**当天又造出两份
+    假 FAIL**（1004.5(2) 的 723 和 1005.7 的 258，理由见
+    pk_open_seek_context 的注释）。根因是同一个：**拿一个本身就带 2.8× 自然
+    摆幅的点统计量去卡 min/max 线。**
+
+    摆幅的来源不是 `fseek`（中位 258~375，跨日志只 1.45×），而是 `fopen` 的
+    **缓存未命中**：`open_seek = fopen + fseek`，`fopen` 是双值的——命中 ≈0、
+    未命中 344~392（跨日志只 1.14×）。未命中率是**抽样量**（这轮开了哪些包/
+    哪些 offset），随日志变：6%~57%。open_seek 中位 = fseek + 未命中率 ×
+    未命中成本，所以它的摆幅几乎全部由未命中率贡献，**不是句柄复用退化了**。
+
+    所以判定改在**分量**上（那里跨日志只 1.14× / 1.45×），`open_seek` 中位退回
+    上下文：印出来 + 印它在全历史里的位置，但不拿它判 FAIL。
+    """
     if not log.cards:
         skip(log, 'PK:no-card-reads', '本轮无词卡读取')
         return
     os_vals = [c['os'] for c in log.cards]
+    n = len(os_vals)
     med = statistics.median(os_vals)
-    # 判据随 revert 改变：不再追求「降到两位数」（那需要先解决 seek 成本），
-    # 而是「不得劣化」——基线 362ms，>500ms 中位即视为回归。
-    expect(log, 'PK:open-seek-not-regressed', med < 500,
-           f'open_seek 中位 {med:.0f}ms（基线 362ms；>500ms 即回归）')
+    # fopen 未命中率：open_seek 摆幅的真实来源。
+    fp = []
+    for line in log.lines:
+        if 'word card loaded:' not in line:
+            continue
+        m = re.search(r'fopen_ms=(\d+) fseek_ms=(\d+)', line)
+        if m:
+            fp.append((int(m.group(1)), int(m.group(2))))
+    miss = None
+    if fp:
+        # `fopen_ms` 是**双值**的：≈0 = 缓存命中，>0 = 未命中（真开了一次）。
+        # ⚠️ 第一版这里写的 `if a == 0` 并命名 miss，方向是反的——那算的是
+        # **命中率**。于是"全命中"的日志被打成"未命中 100%"，再因为一份未命中
+        # 样本都没有、测不到未命中成本，被误判成回归。
+        # **命名和计数必须同向**：这条错让判据在 1005.26 / 1005.7 上各造一次假 FAIL。
+        miss = sum(1 for a, _ in fp if a > 0) / len(fp)
+    fs_med = (statistics.median([b for _, b in fp if b > 0]) if any(b for _, b in fp)
+              else None)
+    # 分量带：跨全部日志实测的 fopen 未命中成本 / fseek 中位，再各放宽成判线。
+    # 放宽的幅度写在这里，下一个读数就能判断"是不是该收口"。
+    #   fopen 未命中成本 实测 344~392（n=4 份日志，1.14×）⇒ 判线 [300, 430]
+    #   fseek 中位      实测 258~375（n=6 份日志，1.45×；258 来自 n=1 的
+    #                  1005.7，是单点）⇒ 判线 [240, 400]
+    kFopenMissBand = (300, 430)
+    kFseekBand = (240, 400)
+    # 机理给出的可达上界：最坏情形每笔都未命中 ⇒ fseek 375 + fopen 392 ≈ 767。
+    # 低于它，"中位高"完全可以由未命中率解释；高于它，未命中率再也解释不了。
+    # **不设下界**——中位变低不是回归。
+    kOpenSeekCeiling = 800
+    detail = (f'open_seek 中位 {med:.0f} ms（n={n}，机理上界 ≈{kOpenSeekCeiling} ms：'
+              f'fseek + fopen 未命中 ≈ 375 + 392）。')
+    if context is not None:
+        lo, hi, meds = context
+        rank = 1 + sum(1 for v in meds.values() if v > med)
+        detail += (f'全历史 {len(meds) + 1} 份跨 [{lo:.0f}, {hi:.0f}] ms（**2.8× 自然'
+                   f'摆幅**，全部来自 fopen 未命中率的抽样差异）⇒ 本轮排第 '
+                   f'{rank}/{len(meds) + 1}。⚠️ **"没排第一"不是 FAIL**：min/max '
+                   f'区间当判定线两头都会造假 FAIL（见 pk_open_seek_context）')
+    else:
+        detail += '⚠️ 只跑了一份日志，没有跨日志区间可对照'
+    if miss is not None:
+        detail += (f'；fopen 未命中 {miss:.0%}（{len(fp)} 次）'
+                   f'——open_seek 的摆幅在 fopen 的双值性上，不在 fseek')
+    if fs_med is not None:
+        detail += f'；fseek 中位 {fs_med:.0f} ms'
+    if n < 8:
+        detail += (f'。⚠️ n={n} 偏小：未命中率差一两笔就能把中位从 329 推到 634，'
+                   f'**别把这一轮的高低位当趋势**')
+    if fp:
+        missv = [a for a, _ in fp if a > 0]
+        fm = statistics.median(missv) if missv else None
+        ok_fp = fm is None or kFopenMissBand[0] <= fm <= kFopenMissBand[1]
+        if fm is not None:
+            detail += (f'\n  · fopen 未命中成本中位 **{fm:.0f} ms**（n={len(missv)}，'
+                       f'判线 [{kFopenMissBand[0]}, {kFopenMissBand[1]}]，'
+                       f'实测历史 344~392 = 1.14×）⇒ '
+                       + ('在带内' if ok_fp else '**出带，这才是回归**'))
+        else:
+            # 一轮里一次未命中都没有，这个分量的成本就**没被测到**。
+            # 这不是通过，也不是回归——是这一轮的 open_seek 便宜得没有可分的量。
+            detail += (f'\n  · fopen 未命中成本：本轮 {len(fp)} 次全是缓存命中，'
+                       f'**未命中样本为 0，这个分量没测到**'
+                       f'（判线 [{kFopenMissBand[0]}, {kFopenMissBand[1]}] 无从校验）')
+        ok_fs = fs_med is not None and kFseekBand[0] <= fs_med <= kFseekBand[1]
+        if fs_med is not None:
+            detail += (f'\n  · fseek 中位 **{fs_med:.0f} ms**'
+                       f'（判线 [{kFseekBand[0]}, {kFseekBand[1]}]，'
+                       f'实测历史 258~375）⇒ '
+                       + ('在带内' if ok_fs else '**出带，这才是回归**'))
+        detail += ('\n  ⇒ 判据问的是这两个分量，不是 open_seek 中位：'
+                   '后者的摆幅是未命中率的抽样噪声，前者的摆幅才是设备变化'
+                   '（fopen 分量在"没有未命中样本"时无从校验，此时绿灯只代表'
+                   ' fseek 这一半）')
+        expect(log, 'PK:open-seek-not-regressed', ok_fp and ok_fs, detail)
+    else:
+        detail += ('\n  ⚠️ 本轮 `word card loaded:` 行**没有 fopen_ms/fseek_ms 位**'
+                   '（探针来自 1005.24 之后的构建：word_pack.cpp:1428-1478 的 '
+                   '`open_seek_ms` 之外追加这两个字段，老构建整条没有）。'
+                   '分量测不到 ⇒ 只能退回机理上界这一条弱判线。'
+                   '**这不是通过，是这次构建没带探针**')
+        expect(log, 'PK:open-seek-not-regressed', med <= kOpenSeekCeiling, detail)
     expect(log, 'PK:parse-still-cheap',
            all(c['pa'] < 50 for c in log.cards), 'parse 仍可忽略')
 
@@ -893,8 +1146,25 @@ def hil_storage_bench(log: Log):
     # "我们准备照其施工的那个前提是错的，停下来重推"。FAIL 不是说设备坏了——
     # 宁可让一条判据红着挡住错误的重写，也不要一条绿的放过它。
     by_shape = {}
+    append_by_round = {}
     for r in log.rounds:
         by_shape.setdefault(r['shape'], []).append(r['wall'])
+        if 'append' in r['shape']:
+            append_by_round[r['round']] = r['wall']
+    # `new_object` 分簇：round 0 = 建文件（1），之后每轮只追加（0）。
+    # ⚠️ 这一位**不能独自结案**，因为 round 0 永远是那个 new_object=1 的 round，
+    # 所以 new_object 与"本轮第一笔"完全共线——贵档落在 round 0 上，可以是
+    # "建对象贵"，也可以是"第一笔贵"（冷缓存、首次分配、目录项第一次落盘），
+    # 而 n=1 分辨不了。真正能定案的是反过来的情形：**贵档里出现 new_object=0
+    # 的轮次**，那就证明建对象不是全部成因，追加路径自己就有贵档。
+    append_split = None
+    if log.bench_new_object and append_by_round:
+        groups = {0: [], 1: []}
+        for rnd, wall in sorted(append_by_round.items()):
+            if rnd in log.bench_new_object:
+                groups[log.bench_new_object[rnd]].append(wall)
+        if any(groups.values()):
+            append_split = groups
 
     # 2a. 追加 shape 是"成本在扫描长度"这个前提的直接反驳，必须优先判。
     # WHY: probe/cur 的比值只描述"未命中走查 vs 一笔写"，它看不见另一件事——
@@ -930,11 +1200,41 @@ def hil_storage_bench(log: Log):
                          for a, b, n in append_clusters)
             + f'，最贵与最便宜差 {spread:.0f}×。n={len(append_walls)} 且两档各占一半时'
             f'**中位数落在两档之间的空隙里，它既不是哪一档的代价**（空隙位置随哪个'
-            f'便宜样本更大而漂移，历史上因此差出 2.6×），所以拿它和 cur* 比 '
-            f'{cur_med:.0f} ms 得出的倍数是个噪声比值，不能当施工依据。'
-            f'便宜档已证明"追加本身可以很便宜"，贵档证明"它有时不是"——'
+            f'便宜样本更大而漂移，历史上因此差出 2.6×），所以'
+            + (f'拿它和 cur* 比 {cur_med:.0f} ms 得出的倍数是个噪声比值，'
+               f'不能当施工依据。' if cur_med
+               else '它（和任何单值归约）都不能当施工依据。')
+            + f'便宜档已证明"追加本身可以很便宜"，贵档证明"它有时不是"——'
             f'**这恰是重写要回答的问题，不是答案**。补测：把 append shape 的 '
             f'rounds 提到 ≥12（两档都能拿到足够的 n），并给每笔记下是否新建对象')
+        if append_split is None and append_walls:
+            append_indeterminate += (
+                '（本轮没有 `new_object=` 位可切：贵的轮次是不是 round 0，'
+                '决定"建对象贵"和"第一笔贵"哪个解释成立，而现在一个都排不掉）')
+        elif append_split is not None:
+            new_w = append_split[1]
+            old_w = append_split[0]
+            # 贵档 = 超过便宜档最小值 2× 的那一侧。
+            cheap = min(old_w) if old_w else None
+            dear_in_new = [w for w in new_w if cheap and w > 2 * cheap]
+            dear_in_old = [w for w in old_w if cheap and w > 2 * cheap]
+            append_indeterminate += (
+                f'；`new_object` 切开：round 0（=1，建文件）'
+                f'{new_w}、其余轮次（=0，只追加）{old_w}。'
+                f'⚠️ **这一位不能独自结案**：round 0 永远是那个 new_object=1 的'
+                f'轮次，所以"新建对象"与"本轮第一笔"完全共线——贵档落在 round 0 '
+                f'上，可以是建对象贵，也可以是第一笔贵（冷缓存/目录项首次落盘），'
+                f'n=1 分辨不了')
+            if dear_in_old:
+                append_indeterminate += (
+                    f'。但 **new_object=0 的轮次里出现贵档**（{dear_in_old}），'
+                    f'这就把"建对象"这个解释否掉了：追加路径自己就有贵档，'
+                    f'重写不能只靠"别建对象"了事')
+            elif dear_in_new:
+                append_indeterminate += (
+                    f'。贵的全在 round 0（n={len(dear_in_new)}），便宜的全是'
+                    f'new_object=0（n={len(old_w)}）——这**与"建对象贵"一致**，'
+                    f'但因为共线，也同样与"第一笔贵"一致，仍不足以定案')
     elif cur_med and append_med:
         ratio = cur_med / append_med if append_med else float('inf')
         if append_med < 20.0:
@@ -1728,17 +2028,20 @@ def hil_write_parts_reconcile(log: Log):
 
     所以这里把等式写成"所有 storage-write 行的子字段/耗时之和"，而不是只数
     `atomic write:`。`nvs write:` 一旦出现就自动并入加数，不需要在迁移时改判据。
+
+    ⚠️ **`changed=0` 的 `nvs write:` 不是一次写**（storage.cpp:1084-1093：先读出
+    旧值 memcmp，相同就整个跳过 `nvs_set_blob`）。它必须单独点出来，否则 breakdown
+    里一句"nvs write 0 ms × 1 笔"会被读成"NVS 就是快"，而真相是"游标没变、
+    这一笔没碰 flash"——两个相反的结论。
+
+    ⚠️ **但 `changed` 不能当"是不是写"的判据**：`ClearWordSessionCursorNvs` 走同一个
+    探针报 `bytes=0 changed=**true**`（peer 2026-10-06 改的：该函数在 NOT_FOUND 时
+    提前返回且不打探针，所以能走到 emit 就说明 key 存在、3 条目真被擦了）。拿 changed
+    判别会把一次擦除归档成"NVS 写 changed=1"，正好与事实相反，还会把 §五之十 504
+    条目预算最要紧的那一次消耗藏掉。所以判别量用 **`bytes==0` ⇒ 擦除**。它自己的
+    耗时窗口也已从 `nvs_erase_key` 之后提到 `nvs_open` 之前（`nvs_commit` 在
+    IDF v5.5 是字面 no-op，`nvs_api.cpp:411-413`），两行才可比。
     """
-    nvs_by_ms = []
-    for line in log.text.splitlines():
-        if 'nvs write:' not in line:
-            continue
-        f = dict(re.findall(r'(\w+)=([-\w]+)', line))
-        if 'total_ms' not in f:
-            continue
-        tm = re.match(r'^[IWEDV] \((\d+)\)', line)
-        if tm:
-            nvs_by_ms.append((int(tm.group(1)), int(f['total_ms'])))
     txs = log.txof('word-session-save')
     if not txs:
         skip(log, 'WRITE:parts-account-for-transaction',
@@ -1756,13 +2059,40 @@ def hil_write_parts_reconcile(log: Log):
         end = int(t['t'])
         start = end - el(t)
         aw = [p['total'] for p in log.probes if start <= p['at'] <= end]
-        nv = [ms for ts, ms in nvs_by_ms if start <= ts <= end]
+        nv = [w['total_ms'] for w in log.nvs_writes if start <= w['t'] <= end]
         if aw or nv:
             covered += 1
         if aw:
             breakdown.append(f'atomic write {sum(aw):.0f} ms × {len(aw)} 笔')
         if nv:
-            breakdown.append(f'nvs write {sum(nv):.0f} ms × {len(nv)} 笔')
+            # 窗口内的 nvs 行要分三类说：真写的、值没变跳过的、和**擦除**的。
+            win = [w for w in log.nvs_writes if start <= w['t'] <= end]
+            # 判别用 `bytes==0` 而不是 `changed`：`ClearWordSessionCursorNvs`
+            # 报的就是 bytes=0 + changed=**true**（peer 2026-10-06 改的，理由见
+            # storage.cpp 里那段注释：能走到 emit 说明 key 存在、条目真被擦了）。
+            # 若仍拿 changed 当判别量，一次擦除会被归档成"NVS 写 changed=1"
+            # ——正好和它是擦除这件事相反，还会把 §五之十 504 条目预算最要紧的
+            # 那一次消耗藏掉。
+            erased = [w for w in win if w.get('bytes', -1) == 0]
+            noop = [w for w in win
+                    if w.get('bytes', -1) > 0 and w.get('changed') == 0]
+            wrote = [w for w in win
+                     if w.get('bytes', -1) > 0 and w.get('changed') != 0]
+            bits = []
+            if wrote:
+                bits.append(f'nvs write {sum(w["total_ms"] for w in wrote):.0f} ms '
+                            f'× {len(wrote)} 笔')
+            if noop:
+                bits.append(
+                    f'同值短路 {len(noop)} 笔（值没变，`nvs_set_blob` 整个跳过；'
+                    f'那 {sum(w["total_ms"] for w in noop):.0f} ms 是读出旧值'
+                    f'再比较的耗时，真实但**没碰 flash**，'
+                    f'别读成"NVS 写只要这么多"）')
+            if erased:
+                bits.append(f'nvs **erase** {sum(w["total_ms"] for w in erased):.0f} ms '
+                            f'× {len(erased)} 笔（bytes=0 ⇒ 擦键、释放条目，'
+                            f'**不是写**；窗口已含 `nvs_open`）')
+            breakdown.append('；'.join(bits))
         write_ms += sum(aw) + sum(nv)
     if not breakdown:
         skip(log, 'WRITE:parts-account-for-transaction',
@@ -1786,6 +2116,56 @@ def hil_write_parts_reconcile(log: Log):
     expect(log, 'WRITE:parts-account-for-transaction', ok, detail)
 
 
+def hil_cursor_erase_logged(log: Log):
+    """清会话那一次擦除，必须**既打 nvs write: 又打 nvs stats:**。
+
+    WHY THIS EXISTS: peer 2026-10-06 自查发现 `ClearWordSessionCursorNvs` 有两个让
+    探针说谎的缺陷——(1) 计时窗只包住 `nvs_commit` 而它在 IDF v5.5 是字面 no-op，
+    于是擦除恒报 ~0 ms；(2) 擦完不落 `nvs stats:`，于是 `used_entries` **唯一该跌的
+    那一刻没有读数**。两个都已修。这条判据盯住修复别退化：擦除是 §五之十 504 条目
+    预算里唯一会**释放**条目的动作，没有它，一次清会话漏掉的条目要等下一题才可见。
+
+    判据用 owner 名 `word-session-clear`（peer 提供，不是我自己猜的），窗口对账口径与
+    WRITE:parts-account-for-transaction 一致——否则 erase 那个 total_ms 无处安放。
+    """
+    txs = log.txof('word-session-clear')
+    if not txs:
+        skip(log, 'WRITE:cursor-erase-logged',
+             '本轮无 word-session-clear 事务（没清过会话）——'
+             '这是 §五之十 里唯一释放 NVS 条目的路径，F.2 表第 5 项要跑一次')
+        return
+    covered = 0
+    drops = []
+    for t in txs:
+        end = int(t['t'])
+        start = end - el(t)
+        win = [w for w in log.nvs_writes if start <= w['t'] <= end]
+        erased = [w for w in win if w.get('bytes', -1) == 0]
+        if erased or win:
+            covered += 1
+        if not erased:
+            continue
+        # 擦除前后各取一条 `nvs stats:`。peer 的修法是擦完**紧接着**打 stats，
+        # 所以 erase 行之后那条就在窗口里；但也允许它落在窗口外（下一条读数）。
+        # 两边都取不到就不下结论——没有读数就没有证据，别编。
+        used = [(r['t'], int(r['used_entries'])) for r in log.nvs_stats
+                if 'used_entries' in r]
+        before = [u for ts, u in used if ts < start]
+        after = [u for ts, u in used if ts >= start]
+        if before and after:
+            drops.append(after[-1] - before[-1])
+    detail = (f'{covered}/{len(txs)} 笔 word-session-clear 窗口内有 `nvs write:` 行。'
+              f'擦除行判别用 `bytes=0`（**不是 `changed`**——peer 已把 erase 路径的 '
+              f'changed 改成 true，拿它判别会把擦除读成"写了一次"）。')
+    if drops:
+        detail += (f' 擦除前后 `used_entries` 变化 {drops}（**应为负**：那条 4 条目 '
+                   f'blob 被释放；只涨不跌 = 有泄漏，正是这条判据要拦的）')
+    else:
+        detail += (' ⚠️ 没有取到擦除前后的两条 `nvs stats:` 读数，'
+                   '无法确认条目真的释放了——这正是 peer 修掉的第二个缺陷，别让它退化')
+    expect(log, 'WRITE:cursor-erase-logged', covered == len(txs), detail)
+
+
 def hil_nvs_stats_measured(log: Log):
     """把 §五之十 的 NVS 算术变成实测——peer 自己标的第一个"③ 不测就没法定夺"。
 
@@ -1805,13 +2185,7 @@ def hil_nvs_stats_measured(log: Log):
     `ESP_ERR_NVS_INVALID_STATE`，但**具体落在第几笔取决于同一分区里其它 NVS
     使用者占多少条目——他们没实测，我也不能替他们猜**。
     """
-    rows = []
-    for line in log.text.splitlines():
-        if 'nvs stats:' not in line:
-            continue
-        f = dict(re.findall(r'(\w+)=(\d+)', line))
-        if 'total_entries' in f:
-            rows.append(f)
+    rows = log.nvs_stats
     if not rows:
         skip(log, 'WRITE:nvs-entry-budget-measured',
              '本轮没有 `nvs stats:` 行。§五之十 的 NVS 算术（4 页 × 126 = 504 条、'
@@ -1822,9 +2196,11 @@ def hil_nvs_stats_measured(log: Log):
     total = int(last['total_entries'])
     used = int(last.get('used_entries', -1))
     free = int(last.get('free_entries', -1))
+    avail = int(last.get('available_entries', -1))
     # 推导值，不是测量值：用来和实测对账。
-    derived = (0x4000 // 4096) * 126
-    detail = (f'实测 total_entries={total}（推导值 {derived} = 4 页 × 126，'
+    derived = kNvsBudget
+    detail = (f'实测 total_entries={total}（推导值 {derived} = {kNvsPages} 页 × '
+              f'{kNvsEntryCountPerPage}，'
               f'来自 partitions/16m.csv:3 的 0x4000 + nvs_constants.h 的 '
               f'NVS_CONST_ENTRY_COUNT=126）')
     if total != derived:
@@ -1832,14 +2208,104 @@ def hil_nvs_stats_measured(log: Log):
                    f'{derived}/{total} 重算，别照抄 21.2%/54.2% 那两张表')
     else:
         detail += ' ⇒ 与推导一致，那两张表的分母站得住'
+    # 52 B 游标该占几条——用**实测**的每笔变化给它命名，别只信算术。
+    # 1006.10 上算术说 3、实测是 4，差的那条是 BLOB_IDX（见 nvs_entries 注释）。
+    used_seq = [int(r['used_entries']) for r in rows if 'used_entries' in r]
+    if len(used_seq) >= 2 and not log.nvs_writes:
+        steps = [b - a for a, b in zip(used_seq, used_seq[1:])]
+        detail += (f'；used 逐次 {used_seq[0]} → {used_seq[-1]}，'
+                   f'每步变化 {steps}（**没有 `nvs write:` 行可归因，'
+                   f'所以只能看总数台阶，说不出是哪笔、是不是新 key**）')
     if used >= 0:
-        detail += f'；used={used}'
-    if free >= 0:
-        detail += (f'；free={free}。⚠️ **这条是"写开始失败"的悬崖位置**：'
-                   f'peer 的机制分析（nvs_pagemanager.cpp:157/171/185/190）说空闲页'
-                   f'<2 后每次答题付一次寄生存活+4096 B 擦除、页耗尽则 '
-                   f'requestNewPage 返回 ESP_ERR_NVS_INVALID_STATE，'
-                   f'**但落在第几笔没实测**——要连续答 ≥5 题看 free 的掉落曲线')
+        detail += f'；末次 used={used}'
+    cursor_entries = nvs_entries(kSessionCursorBytes)
+    # 悬崖的分母必须是 **available_entries，不是 free_entries**。
+    # WHY: `free_entries` = 空闲槽位 + 所有空闲页 × 126；`available_entries` =
+    # free_entries − 126，即**整整一页留给 GC**（nvs_pagemanager.cpp:246）。
+    # 1006.10 上两者差 126：free=301 / available=175。用 free 当分母会把
+    # "还剩多少答题"高估 1.7×——这正是"拿行上现成的那个数当分母"的老毛病，
+    # 而这次两个数都在同一行上。
+    #
+    # ⚠️⚠️ 但比"分母选错"更严重的错，是我在 1006.10 上犯的：
+    # **拿 available / "每次 4 条" 当"还有几次答题"的答案** —— 那是个
+    # **不存在的假悬崖**（peer 2026-10-06 指出，我复核 IDF 源码后确认他对）。
+    # 4 条是**每个 key 的一次性成本**，不是每次答题的成本：同一个 key 再写时，
+    # 旧 blob 的条目被**就地擦除并立刻算回 free** ——
+    #   `eraseEntryAndSpan` 逐条 `--mUsedEntryCount`（nvs_page.cpp:432/446），
+    #   `calcEntries` 里 `free += ENTRY_COUNT - mUsedEntryCount` 的注释原文是
+    #   *"it's equivalent free + erase entries"*（nvs_page.cpp:1181）。
+    # 1006.10 的实测逐笔配对正是这个形状：cur_rev +4、cur_int +4、
+    # cur_int（第二次）**0**、cur_shf +4、cur_shf（第二/三次）**0 / 0**。
+    # ⇒ 稳态每答题净 **0** 条；三个 key × 4 = 12 条，整轮就这么多。
+    # 这就是我自己记下的老毛病的同型复发：**拿一个推导比值当直接测量，
+    # 而同一份日志里的直接测量（逐笔 Δused）就在否掉它**。
+    #
+    # 配对的归因边界（写清楚，别让它自己假装精确）：一个 key 的写只会**保留
+    # 自己的**条目（BLOB_IDX 是定长可寻址的，nvs_storage.cpp:351-361 在原地改），
+    # 所以"改写同一个 key 净 0"是**逐 key 归因**的结论，不受其它 key 干扰。
+    # 反过来，**新 key 的 +N 里可能含着同一窗口内别人的首次写**——stats 是按
+    # 事务批量出的，两笔写落在同两条 stats 之间时上面只标了"新 key"、看不出
+    # 是谁的 N。所以下面只用"每个 key 的首次写花了 ~4"这个量级，
+    # 不拿"N 条 ÷ N 个 key"当精确分配。
+    pairs = []
+    for w in log.nvs_writes:
+        after = [r for r in log.nvs_stats
+                 if r['t'] >= w['t'] and 'used_entries' in r]
+        before = [r for r in log.nvs_stats
+                  if r['t'] < w['t'] and 'used_entries' in r]
+        if before and after:
+            # 同一对 stats 之间还夹着几笔写？>1 时 +N 里就有别人的份。
+            sharing = sum(1 for o in log.nvs_writes
+                          if before[-1]['t'] < o['t'] <= after[0]['t'])
+            pairs.append({'key': w.get('key', '?'), 'bytes': w.get('bytes', 0),
+                          'changed': w.get('changed', -1), 'sharing': sharing,
+                          'delta': int(after[0]['used_entries'])
+                          - int(before[-1]['used_entries'])})
+    if pairs:
+        detail += '；**逐笔 Δused 配对**（一笔写前后各取一条 stats）：'
+        for p in pairs:
+            if p['delta'] > 0:
+                tag = f'**新 key，一次性 +{p["delta"]}**'
+                if p['sharing'] > 1:
+                    tag += f' ⚠️窗口内还有另外 {p["sharing"] - 1} 笔写，这 +{p["delta"]} 里可能有别人的份'
+            elif p['changed'] == 0:
+                tag = '同值短路，没碰 flash'
+            else:
+                tag = '**改写已有 key，净 0**'
+            detail += (f'\n  · {p["key"]} bytes={p["bytes"]} '
+                       f'changed={p["changed"]} ⇒ Δused {p["delta"]:+d}（{tag}）')
+    first_write = [p for p in pairs if p['bytes'] > 0 and p['delta'] > 0]
+    rewrites = [p for p in pairs
+                if p['bytes'] > 0 and p['delta'] == 0 and p['changed'] != 0]
+    if first_write and rewrites:
+        once_each = statistics.median([p['delta'] for p in first_write])
+        n_keys = len({p['key'] for p in first_write})
+        detail += (
+            f'\n  ⇒ **{once_each:.0f} 条是每个 key 的一次性成本，'
+            f'稳态每答题净 0 条**（改写已有 key 时旧 blob 被就地擦除并算回 '
+            f'free，nvs_page.cpp:432/446 + :1181）。本轮 {n_keys} 个 key 首次写'
+            f'各花 ~{once_each:.0f} 条 = ~{n_keys * once_each:.0f} 条 = 分区 '
+            f'~{n_keys * once_each / kNvsBudget:.0%}，**一次性**。'
+            f'⚠️ 所以**不要说"约 N 次答题后触崖"**——那是个不存在的悬崖；'
+            f'§五之十 里"168 笔"那张表同理作废。GC 悬崖仍然是真的，'
+            f'但它是**页碎片/搬迁**型，不是条目累积型，'
+            f'**落在哪一行仍没实测**。'
+            f'要确认稳态真的净 0，得连续答 ≥5 题看 available 的**台阶形状**：'
+            f'平坦 ⇒ 净 0；每答一级 ⇒ 还有别的使用者在涨')
+    elif first_write:
+        once_each = statistics.median([p['delta'] for p in first_write])
+        detail += (f'\n  ⇒ 只见到新 key 的首次写（**~{once_each:.0f} 条/key**），'
+                   f'**没有第二次写同一个 key**，所以"稳态净 0"这句**还没被'
+                   f'这份日志测到**——同值短路（changed=0）也算一种证据，但它'
+                   f'回答的是"值没变时不花钱"，不是"值变了时免费重写"')
+    if avail >= 0:
+        detail += (f'；末次 **available={avail}**（free={free}）'
+                   f'⇒ 按 {cursor_entries} 条/key 算，还够约 '
+                   f'**{int(avail // cursor_entries)} 个新 mode key**。'
+                   f'⚠️ 这个分母取 available 而不是 free：`available_entries` = '
+                   f'free − 126，那一整页是留给 GC 的'
+                   f'（nvs_pagemanager.cpp:246），free 会把余量高估 '
+                   f'{free / avail:.1f}×')
     expect(log, 'WRITE:nvs-entry-budget-measured', True, detail)
 
 
@@ -1849,8 +2315,10 @@ def hil_nvs_entry_budget(log: Log):
     WHY THIS EXISTS: peer 的 §五之十 决定把 52 B 游标迁 NVS、快照留在 SPIFFS 追加
     日志上。这个决定依赖一条他们从 IDF 源码推出来的算术，我独立复核过（2026-10-06）：
 
-    1. 条目数 = 1 + ceil(dataSize / 32)     —— nvs_page.cpp:184-190
-       `totalSize = ENTRY_SIZE`（表头占一条）+ `roundedSize` 按 32 进位
+    1. 一个 blob 的条目 = 1 + ceil(dataSize / 32) **再加 1 条定长 BLOB_IDX**
+       —— nvs_page.cpp:186-191（数据项）+ nvs_storage.cpp:351-361（索引项）
+       「再加 1」这一项我第一版漏了，1006.10 的实测 `used_entries` 把它抓了出来：
+       52 B 我算 3 条，实测每笔涨 **4** 条。见 nvs_entries() 处的注释。
     2. 分区预算 = 4 页 × 126 条 = **504 条** —— partitions/16m.csv:3 是
        `nvs ... 0x9000, 0x4000`；NVS_CONST_ENTRY_COUNT=126、页 4096 B
     3. 单 blob 硬顶 = min(pageCount-1, 127) × 4000 = **12000 B**
@@ -1874,36 +2342,33 @@ def hil_nvs_entry_budget(log: Log):
         skip(log, 'WRITE:nvs-entry-budget',
              '本轮无 `atomic write:` 行，判不出载荷分布')
         return
-    # 这些常量来自本地 IDF + 分区表，不是估计值。
-    kEntrySize = 32
-    kEntryCountPerPage = 126
-    kNvsSizeBytes = 0x4000
-    kPages = kNvsSizeBytes // 4096
-    kBudget = kPages * kEntryCountPerPage
-    kSingleBlobCap = min(kPages - 1, (0xff - 1) // 2) * (kEntrySize * (kEntryCountPerPage - 1))
     kShareLimit = 0.25
 
     worst_share, worst_bytes, over_cap = 0.0, None, []
     for p in log.probes:
         n = p['bytes']
-        entries = 1 + -(-n // kEntrySize)
-        share = entries / kBudget
+        entries = nvs_entries(n)
+        share = entries / kNvsBudget
         if share > worst_share:
             worst_share, worst_bytes = share, n
-        if n > kSingleBlobCap:
+        if n > kNvsSingleBlobCap:
             over_cap.append(n)
     if worst_bytes is None:
         skip(log, 'WRITE:nvs-entry-budget', '有 `atomic write:` 行但字节数缺失')
         return
-    worst_entries = 1 + -(-worst_bytes // kEntrySize)
+    worst_entries = nvs_entries(worst_bytes)
     detail = (
-        f'NVS 分区 {kNvsSizeBytes} B = {kPages} 页 × {kEntryCountPerPage} 条 = '
-        f'{kBudget} 条；单 blob 硬顶 {kSingleBlobCap} B'
+        f'NVS 分区 {kNvsSizeBytes} B = {kNvsPages} 页 × '
+        f'{kNvsEntryCountPerPage} 条 = {kNvsBudget} 条；单 blob 硬顶 '
+        f'{kNvsSingleBlobCap} B'
         f'（nvs_storage.cpp:282-290）。本轮最大载荷 {worst_bytes} B ⇒ '
         f'{worst_entries} 条 = **分区 {worst_share:.1%}**。'
-        f'对照：52 B 游标 = 3 条 = {3 / kBudget:.1%}（迁 NVS 的正确用法）、'
-        f'3379 B = 107 条 = {107 / kBudget:.1%}、8676 B = 273 条 = '
-        f'{273 / kBudget:.1%}。')
+        f'对照：52 B 游标 = {nvs_entries(kSessionCursorBytes)} 条 = '
+        f'{nvs_entries(kSessionCursorBytes) / kNvsBudget:.1%}'
+        f'（迁 NVS 的正确用法）、'
+        f'3379 B = {nvs_entries(3379)} 条 = {nvs_entries(3379) / kNvsBudget:.1%}、'
+        f'8676 B = {nvs_entries(8676)} 条 = '
+        f'{nvs_entries(8676) / kNvsBudget:.1%}。')
     if over_cap:
         detail += (f' ⚠️ {len(over_cap)} 笔超过单 blob 硬顶（最大 {max(over_cap)} B）'
                    f'⇒ 它们连一个 NVS key 都装不下。')
@@ -1931,13 +2396,11 @@ def hil_append_open_split(log: Log):
     只扫 key=value 对、不锁行头：行头是 peer 的，他们改一次词判据不该跟着瞎
     （位置正则静默失配这个坑在本会话已经错过一轮，见 LOG:word-pack-format-parsed）。
     """
-    pairs = []
-    for line in log.text.splitlines():
-        if 'append_open_ms=' not in line or 'append_ms=' not in line:
-            continue
-        f = dict(re.findall(r'(\w+)=(-?\d+)', line))
-        if 'append_open_ms' in f and 'append_ms' in f:
-            pairs.append(f)
+    # 与 LOG:probe-lines-parsed 同一处解析：obs_durable 已经带着 append_open_ms /
+    # append_bytes（它们在 `word observation durable:` 那一行上）。这里不再自己
+    # 扫一遍，免得两套解析各自漂移。
+    pairs = [o for o in log.obs_durable
+             if 'append_open_ms' in o and 'append_ms' in o]
     if not pairs:
         skip(log, 'WRITE:append-open-vs-fopen',
              '本轮没有同时带 `append_open_ms=` 与 `append_ms=` 的行'
@@ -1947,23 +2410,103 @@ def hil_append_open_split(log: Log):
     fp = [p['fopen'] for p in log.probes if p.get('fopen')]
     med_open = statistics.median(opens)
     med_fopen = statistics.median(fp) if fp else None
-    detail = (f'append_open_ms 中位 {med_open:.0f} ms（n={len(opens)}），'
-              f'append_ms 中位 {statistics.median(int(p["append_ms"]) for p in pairs):.0f} ms')
+
+    # ⚠️ 全局中位数会再次犯"把双峰样本压成一个数"那个错，而这一格正是靠分峰
+    # 才问得出来。1006.10 实测：便宜簇 open≈3 ms / append≈7 ms（开起来 43%，
+    # 绝对值都可忽略），贵簇四条里 seq2 open=383/append=387（**99% 在 open**），
+    # 另外三条 open=2~5/append=424~434（**~1% 在 open，成本在 append 本体**）。
+    # 同一个 200 B 载荷、同一个 "ab"，两种成因**都出现了**——所以"追加不建对象"
+    # 这一句在贵簇里不成立。拿全局中位 ratio 0.003 判 PASS，等于用便宜簇替贵簇
+    # 回答问题，而那正是贵簇要回答的问题。
+    clusters = cluster_gap([int(p['append_ms']) for p in pairs])
+    rows = [(int(p['append_ms']), int(p['append_open_ms'])) for p in pairs]
+    per_cluster = []
+    for lo, hi, n in clusters:
+        sub = [(a, o) for a, o in rows if lo <= a <= hi]
+        shares = sorted(o / a for a, o in sub) if sub else []
+        per_cluster.append((lo, hi, n, sub, shares))
+
+    detail = (f'append_open_ms 全域中位 {med_open:.0f} ms（n={len(opens)}），'
+              f'append_ms 全域中位 '
+          f'{statistics.median(int(p["append_ms"]) for p in pairs):.0f} ms')
     if med_fopen:
         ratio = med_open / med_fopen
         detail += (f'；同轮 `atomic write:` 的 fopen 中位 {med_fopen:.0f} ms ⇒ '
-                   f'append_open_ms / fopen = {ratio:.3f}')
-        if ratio < 0.1:
-            detail += (' ⇒ **这就是"不建对象"的直接证据**（差一个数量级以上），'
-                       '不再是 §五之三 那种从总价反推的推理。'
-                       '注意它仍然只支持"追加形状便宜"，'
-                       '不支持"改 fopen 模式就便宜"——那两个成因还没分解。')
-        else:
-            detail += (' ⇒ append_open_ms 没有比 fopen 低一个数量级，'
-                       '"拆出来的就是建对象那部分"这个假设**不成立**，'
-                       '§五之三 的推理缺口仍然敞开。')
-    expect(log, 'WRITE:append-open-vs-fopen', med_fopen is None or med_open < med_fopen,
-           detail)
+                   f'全域 append_open_ms / fopen = {ratio:.3f}')
+    detail += '。**按 append_ms 分簇看 open 占比**（这是本节真正的问题）：'
+    for lo, hi, n, sub, shares in per_cluster:
+        detail += (f'\n  · append {lo:.0f}~{hi:.0f} ms (n={n})：'
+                   + ' / '.join(f'{o:.0f}/{a:.0f}' for a, o in sub)
+                   + f' ⇒ open 占比 {min(shares):.0%}~{max(shares):.0%}'
+                   if shares else '')
+    dear = [c for c in per_cluster if c[0] > 10 and c[4] and max(c[4]) >= 0.1]
+    dear_body = [c for c in per_cluster
+                 if c[0] > 10 and c[4] and min(c[4]) < 0.1]
+    if dear and dear_body:
+        detail += ('\n  ⚠️ **贵簇里两种成因都出现了**：既有 open 占比 ≥10% 的'
+                   '（成本在打开/建对象那一侧），也有 ≤10% 的（成本在 append '
+                   '本体，fwrite+fflush+fsync+fclose）。'
+                   '所以"追加不建对象所以便宜"这句**在贵簇里不成立**——'
+                   '别拿便宜簇的中位数替贵簇回答问题')
+    elif dear:
+        detail += ('\n  ⇒ 贵簇成本集中在 open 这一侧，'
+                   '"不建对象"至少对贵簇自洽')
+    elif dear_body:
+        detail += ('\n  ⇒ 贵簇的成本**不在 open**（占比 <10%），'
+                   '在 append 本体里。这一档与"建对象"无关，')
+    if med_fopen and ratio < 0.1 and not (dear and dear_body):
+        detail += ('\n全域看 **append_open_ms 比 fopen 低一个数量级以上**，'
+                   '这是"追加形状不付 AtomicWrite 那个固定项"的直接证据，'
+                   '不再是 §五之三 那种从总价反推的推理')
+    elif med_fopen and ratio >= 0.1:
+        detail += ('\n⇒ append_open_ms 没有比 fopen 低一个数量级，'
+                   '"拆出来的就是建对象那部分"这个假设**不成立**，'
+                   '§五之三 的推理缺口仍然敞开')
+    # 判据只在"贵簇也全都在 open 之外"时给绿。便宜簇绿没有意义：它本来就便宜。
+    expect(log, 'WRITE:append-open-vs-fopen',
+           med_fopen is None or not (dear and dear_body), detail)
+
+
+def hil_probe_lines_drift(log: Log):
+    """抓"判据正则静默失配"——存储侧重写新增的那几行。
+
+    WHY: 判据按 key=value 扫这些行，加字段本该无感；但"本该解析出来却一条都没有"
+    必须在场。位置正则改一次字段就静默失配一次，而失配长得跟"这轮没测"一模一样：
+    1006.4 起 `word observation durable:` 在 `append_ms=` 与 `total_ms=` 之间插了
+    `append_open_ms=`/`append_bytes=`，老的正则当场瞎掉，于是"双峰不是 bench 量测
+    假象"的唯一凭据（真实流量 append_ms）会从判据里**无声消失**。
+
+    ⚠️ 阈值取"**字段在场**"，不是"行头在场"：数行头会把"旧构建没有新字段"读成
+    漂移。第一版就是这么写的，10 份老日志里 `storage bench append round=` 全被
+    报 FAIL——行在、`new_object=` 不在，而那只是新构建才有的字段。拿构建年龄当
+    漂移，是这条判据自己版本的喊狼来了。
+
+    所以这里判 FAIL 而不是 SKIP：格式漂移必须当场可见。
+    """
+    counts = [
+        ('word observation durable:', log.obs_line_count, len(log.obs_durable),
+         'append_ms'),
+        ('storage bench append round=', log.bench_append_line_count,
+         len(log.bench_new_object), 'new_object'),
+        ('storage bench round: shape=', log.bench_round_line_count,
+         len(log.rounds), 'wall_ms'),
+        ('storage bench stream round=', log.bench_stream_line_count,
+         len(log.stream_rounds), 'cost_ms'),
+        ('nvs write:', log.nvs_write_line_count, len(log.nvs_writes), 'total_ms'),
+        ('nvs stats:', log.nvs_stats_line_count, len(log.nvs_stats), 'total_entries'),
+    ]
+    bad = [f'`{head}` + `{need}=` 同时出现 {n} 次，却解析出 0 条'
+           for head, n, parsed, need in counts if n and not parsed]
+    present = '；'.join(f'{head}: {n} 行 / {p} 条解析'
+                        for head, n, p, _ in counts if n)
+    if bad:
+        expect(log, 'LOG:probe-lines-parsed', False,
+               '；'.join(bad) + ' ⇒ **判据与当前日志格式漂移了**。'
+               '这一格的所有存储结论都不可用，先修判据——'
+               '格式漂移不许伪装成 SKIP')
+        return
+    expect(log, 'LOG:probe-lines-parsed', True,
+           present if present else '本轮无存储侧重写探针行')
 
 
 def hil_log_format_drift(log: Log):
@@ -2008,6 +2551,8 @@ def main(argv):
         print(__doc__)
         return 2
     paths = argv[1:]
+    # PK 的基线是**跨日志**的区间。为每份日志单独算、并把它自己剔出去，
+    # 否则"全网最高那份"永远测不出超高（它的中位就在区间端点里）。
     for p in paths:
         try:
             log = Log.load(p)
@@ -2021,7 +2566,7 @@ def main(argv):
         hil_c6a_generation(log)
         hil_c6b_scope_switch(log)
         hil_c8_page_save(log)
-        hil_pk_handle(log)
+        hil_pk_handle(log, pk_open_seek_context(paths, exclude=p))
         hil_owner_attribution(log)
         hil_storage_bench(log)
         hil_stream_read_buffer(log)
@@ -2030,9 +2575,11 @@ def main(argv):
         hil_stream_two_gate(log)
         hil_stream_append_chunk(log)
         hil_stream_bench_vs_direct(log)
+        hil_probe_lines_drift(log)
         hil_log_format_drift(log)
         hil_nvs_entry_budget(log)
         hil_nvs_stats_measured(log)
+        hil_cursor_erase_logged(log)
         hil_write_parts_reconcile(log)
         hil_append_open_split(log)
         hil_stability(log)
