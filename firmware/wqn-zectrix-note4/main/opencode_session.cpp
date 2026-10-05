@@ -91,6 +91,21 @@ std::string g_reply_flight_question_id;
 // that records whether the interrupt actually reached the gateway.
 std::atomic<bool> g_interrupt_requested{false};
 std::atomic<bool> g_interrupt_delivered{false};
+// [agent] Switch-away handshake for an attached stream (symptom 2). Unlike the
+// cancel pair above, a switch asks for no upstream action at all: the device
+// detaches and the cloud keeps running the session. The UI thread sets the
+// request along with the follow-up it wants next; the streaming worker records
+// the detach, and the tail of whichever stream was open honours both.
+//
+// The follow-up is an existing WorkerCommand rather than a new kSwitch: the
+// thing the user actually asked for is "open the picker" / "lock this session"
+// / "observe this session", each of which already has a command. The switch is
+// a modifier on it, not a command of its own -- so it reuses the existing
+// dispatch and the existing ChainWorkerCommandLocked hand-over.
+WorkerCommand g_switch_follow_up = WorkerCommand::kNone;
+std::string g_switch_session_id;
+std::atomic<bool> g_switch_requested{false};
+std::atomic<bool> g_switch_delivered{false};
 // [voice-pipe] Hard-abort request for the capture phases. Set by
 // CancelAgentVoiceInput (UI thread); consumed by the kCancelVoice worker
 // command -- or, when the capture worker is still bringing the WS turn up
@@ -112,6 +127,13 @@ void ClearReplyFlightLocked();
 void ClearDeferredQuestionLocked();
 void PromoteDeferredQuestionLocked();
 void ClearAllAsksLocked();
+// Defined down with the other arm paths, but ArmSwitchLocked needs it from the
+// top of the file, next to ChainWorkerCommandLocked.
+esp_err_t AcquireAgentLeaseLocked();
+// Same reason: FinishSwitchedStreamLocked clears the departed run's turn state
+// so the view does not keep an open tool block the terminal frame would have
+// closed.
+void ResetAgentHistoryTurnLocked();
 
 void MarkChangedLocked()
 {
@@ -196,6 +218,139 @@ void ChainWorkerCommandLocked(WorkerCommand command)
 {
     g_command = command;
     xTaskNotifyGive(g_worker);
+}
+
+// [agent] The entry-point half of a session switch (symptom 2). Called with
+// g_lock held when the caller's own command slot is already taken, and returns
+// ESP_OK only once the switch is armed -- the caller must NOT arm its own
+// command in that case.
+//
+// Only the picker-open path switches today. The other attach entry points
+// (lock / create / observe) perform their state transition *after* they acquire
+// the slot, and their handlers do not repeat that transition, so switching them
+// would leave the view on a session whose transcript still belongs to the
+// previous one. See the comments at each of those call sites. Extending the
+// switch to them means hoisting that transition out first, not calling this.
+//
+// A switch is possible only while a *stream* is attached, and the predicate has
+// to name that exactly -- `g_state.stream_active` alone is not enough.
+// ObserveOpenCodeSession raises it before arming a transcript backfill
+// (kLoadHistory, a bounded read that lasts seconds), so during a backfill it
+// looks identical to an attached stream. But only RunPrompt and ObserveSession
+// consume a switch: LoadHistory never calls FinishSwitchedStreamLocked, so a
+// request armed during a backfill would sit unconsumed with the worker idle,
+// and then detach the NEXT observe the user starts while chaining its stale
+// follow-up. Guarding on the command that owns the slot rules that out, and
+// `stream_active` stays in the test because the tail that consumes the request
+// clears it: with both set, the read loop is provably still inside
+// ReadAgentEventStream and the tail has not run yet.
+//
+// A bounded read (a transcript backfill, voice capture) finishes on its own
+// within seconds and must not be swapped out from under itself anyway: the read
+// it replaced would still be writing into the state the follow-up is about to
+// rebuild, and nothing in that chain checks for it.
+//
+// The lease and the connectivity demand are NOT released here. The follow-up is
+// itself network work, so they are handed over rather than dropped and
+// re-acquired -- releasing first would leave a window where the device could
+// sleep out from under the very request that is replacing the run it just left.
+// AcquireAgentLeaseLocked is a no-op when the departing stream already holds it.
+esp_err_t ArmSwitchLocked(WorkerCommand follow_up, const std::string& session_id,
+                          wqn::OpenCodeRejectReason* reason)
+{
+    const bool stream_attached =
+        (g_command == WorkerCommand::kRunPrompt ||
+         g_command == WorkerCommand::kObserveSession) &&
+        g_state.stream_active;
+    if (!stream_attached) {
+        if (reason != nullptr) {
+            *reason = wqn::OpenCodeRejectReason::kWorkerBusy;
+        }
+        return ESP_ERR_INVALID_STATE;
+    }
+    const esp_err_t result = AcquireAgentLeaseLocked();
+    if (result != ESP_OK) {
+        if (reason != nullptr) {
+            *reason = wqn::OpenCodeRejectReason::kLeaseBusy;
+        }
+        return result;
+    }
+    g_switch_follow_up = follow_up;
+    g_switch_session_id = session_id;
+    g_switch_delivered.store(false, std::memory_order_release);
+    g_switch_requested.store(true, std::memory_order_release);
+    // The stream can be idle for up to kAgentStreamIdleReadTimeoutMs before the
+    // worker notices, so say something now rather than leaving the departing
+    // run's label on screen looking like nothing happened.
+    g_state.ui.status_label = "正在切换";
+    g_state.ui.activity_text = "已离开当前 Session，云端任务继续运行";
+    MarkChangedLocked();
+    return ESP_OK;
+}
+
+// [agent] The worker half of a session switch. Called with g_lock held from the
+// tail of whichever stream was open, and returns true when it handled the end
+// -- the caller must then skip every other terminal branch.
+//
+// Ownership deliberately survives: the chained follow-up is the next network
+// operation and it takes the lease over from here, exactly as the
+// history->observe chain already does. ReleaseWorkOwnershipLocked is the
+// follow-up's job.
+//
+// `g_switch_requested` alone is enough to honour the switch. The stream loop
+// sets `g_switch_delivered` when it sees the request, but a request that lands
+// after the last read has already returned would otherwise leave the follow-up
+// armed and never run -- the caller would watch nothing happen. Both streams
+// only ever arm this while `stream_active` is true, and both that flag and this
+// handshake are written under the same lock, so there is no window in which a
+// request is raised for a stream that has already finished.
+bool FinishSwitchedStreamLocked()
+{
+    if (!g_switch_requested.load(std::memory_order_acquire)) {
+        return false;
+    }
+    g_switch_requested.store(false, std::memory_order_release);
+    g_switch_delivered.store(false, std::memory_order_release);
+    const WorkerCommand follow_up = g_switch_follow_up;
+    g_switch_follow_up = WorkerCommand::kNone;
+    // The departing stream is gone, so every ask it raised is dead and the
+    // outbound queue that would carry its replies is discarded by the caller.
+    ClearAllAsksLocked();
+    g_observing = false;
+    g_state.stream_active = false;
+    g_state.ui.phase = wqn::AiFeaturePhase::kLoading;
+    g_state.ui.status_label = "正在切换";
+    g_state.ui.activity_text = "已离开当前 Session，云端任务继续运行";
+    g_state.ui.action_hint.clear();
+    g_state.ui.response_text.clear();
+    g_state.ui.scroll_offset_lines = 0;
+    // Hand the target over the same way every other command does: the worker
+    // reads it from g_run_session_id, so the tail's own clear must not run. The
+    // one current follow-up (kLoadSessions) ignores it, and the clear is what
+    // stops the departed run's session id from lingering as the target.
+    g_run_session_id = g_switch_session_id;
+    g_switch_session_id.clear();
+    // The departed session's view state is cleared HERE rather than left to the
+    // follow-up, because the follow-up is not obliged to succeed. kLoadSessions
+    // clears all of this on its success path but its failure path only calls
+    // SetErrorLocked, so a list load that 5xx's would otherwise drop the user
+    // straight back onto the session they just left -- locked view, that
+    // session's transcript still in the channel, and a tool block the terminal
+    // frame that would have closed it never arrived. Clearing it here means the
+    // outcome is "no session selected" whether or not the list arrives.
+    g_state.session_locked = false;
+    g_state.current_session_id.clear();
+    g_state.current_session_title.clear();
+    g_state.ui.context_label.clear();
+    g_state.ui.prompt_text.clear();
+    g_state.ui.requires_confirmation = false;
+    g_state.confirmation_armed_at_ms = 0;
+    g_state.history_loaded_session_id.clear();
+    wqn::GetAiHistory(wqn::AiHistoryChannel::kAgent).Clear();
+    ResetAgentHistoryTurnLocked();
+    MarkChangedLocked();
+    ChainWorkerCommandLocked(follow_up);
+    return true;
 }
 
 esp_err_t LoadToken(std::string* token)
@@ -1212,6 +1367,10 @@ void RunPrompt()
 {
     g_interrupt_requested.store(false, std::memory_order_release);
     g_interrupt_delivered.store(false, std::memory_order_release);
+    // A switch armed for the *previous* stream must not detach this one: the
+    // handshake belongs to the stream it was raised against.
+    g_switch_requested.store(false, std::memory_order_release);
+    g_switch_delivered.store(false, std::memory_order_release);
     std::string token;
     esp_err_t result = LoadToken(&token);
     if (result == ESP_OK) {
@@ -1230,11 +1389,37 @@ void RunPrompt()
             nullptr,
             &g_interrupt_requested,
             &g_interrupt_delivered,
+            &g_switch_requested,
+            &g_switch_delivered,
             OnOpenCodeEvent,
             nullptr,
             &api_result);
     }
     xSemaphoreTake(g_lock, portMAX_DELAY);
+    if (FinishSwitchedStreamLocked()) {
+        // Leaving the session is not a failure and not a cancellation: the run
+        // it was watching is still executing in the cloud. The follow-up armed
+        // by ArmSwitchLocked now owns the worker and the lease.
+        g_run_prompt.clear();
+        // [run-id] Known outcome for *this* delivery: the device will not be
+        // told how the run ends, so the next submission is a new logical run.
+        // The cloud keeps its own in-flight claim for that (device, session).
+        //
+        // What that costs is stated plainly, because the obvious recovery is
+        // NOT available right now: a fresh prompt into the same session gets a
+        // 409 before any frame, which reaches SetErrorLocked as an error whose
+        // hint tells the user to re-record -- and re-recording 409s again. The
+        // run can then be neither watched nor stopped from this device, because
+        // observe is only reachable from the picker and the picker clears the
+        // current session. Turning that 409 into an automatic observe attach is
+        // tracked as item C13 in doc/1005; until it lands, the honest summary is
+        // that switching away from a run orphans it as far as this device can
+        // tell, and the run itself is fine in the cloud.
+        g_run_request_id.clear();
+        xSemaphoreGive(g_lock);
+        DiscardOutboundReplies();
+        return;
+    }
     bool refreshing_history = false;
     if (g_interrupt_delivered.load(std::memory_order_acquire)) {
         // Stopping the run on request is a success, not a failure.
@@ -1326,6 +1511,13 @@ void CreateSession()
 
 void ObserveSession()
 {
+    // Mirrors RunPrompt: the switch handshake belongs to the stream it was
+    // raised against, so an observe never inherits a request armed before it
+    // started. Reaching this command means nothing else owns the slot, which
+    // makes this a guard rather than a live case -- but it is the difference
+    // between "impossible" and "unlikely" for the orphaned-request failure.
+    g_switch_requested.store(false, std::memory_order_release);
+    g_switch_delivered.store(false, std::memory_order_release);
     std::string token;
     esp_err_t result = LoadToken(&token);
     if (result == ESP_OK) {
@@ -1345,11 +1537,20 @@ void ObserveSession()
             nullptr,
             &g_interrupt_requested,
             &g_interrupt_delivered,
+            &g_switch_requested,
+            &g_switch_delivered,
             OnOpenCodeEvent,
             nullptr,
             &api_result);
     }
     xSemaphoreTake(g_lock, portMAX_DELAY);
+    if (FinishSwitchedStreamLocked()) {
+        // Same contract as the run path: detaching is an intentional end, the
+        // observed run keeps going upstream, and the follow-up takes over.
+        xSemaphoreGive(g_lock);
+        DiscardOutboundReplies();
+        return;
+    }
     if (g_interrupt_delivered.load(std::memory_order_acquire)) {
         // Same reasoning as the run path: the run is over and the outbound
         // queue is discarded below, so a surviving ask could not be answered.
@@ -1555,13 +1756,17 @@ esp_err_t InitOpenCodeSession()
     return ESP_OK;
 }
 
-esp_err_t RequestOpenCodeSessionList()
+esp_err_t RequestOpenCodeSessionList(OpenCodeRejectReason* reason)
 {
     ESP_RETURN_ON_ERROR(InitOpenCodeSession(), kTag, "init OpenCode session");
     xSemaphoreTake(g_lock, portMAX_DELAY);
     if (g_command != WorkerCommand::kNone) {
+        // [agent] Opening the picker is the switch entry point: the user asking
+        // for the session list during a run is asking to leave that run, so the
+        // list request detaches from it and then loads.
+        const esp_err_t busy = ArmSwitchLocked(WorkerCommand::kLoadSessions, "", reason);
         xSemaphoreGive(g_lock);
-        return ESP_ERR_INVALID_STATE;
+        return busy;
     }
     esp_err_t result = AcquireAgentLeaseLocked();
     if (result == ESP_OK && !ArmWorkerLocked(WorkerCommand::kLoadSessions)) {
@@ -1598,7 +1803,7 @@ esp_err_t MoveOpenCodeSessionSelection(int direction)
     return ESP_OK;
 }
 
-esp_err_t LockSelectedOpenCodeSession()
+esp_err_t LockSelectedOpenCodeSession(OpenCodeRejectReason* reason)
 {
     ESP_RETURN_ON_ERROR(InitOpenCodeSession(), kTag, "init OpenCode session");
     xSemaphoreTake(g_lock, portMAX_DELAY);
@@ -1610,11 +1815,24 @@ esp_err_t LockSelectedOpenCodeSession()
     // one must not touch any state at all. Mutating first and failing later
     // would leave the view pointing at a session whose transcript and stream
     // still belong to the previous one.
+    const AgentSessionOption& selected = g_state.sessions[g_state.selected_session];
     if (g_command != WorkerCommand::kNone) {
+        // [agent] Deliberately NOT a switch, unlike RequestOpenCodeSessionList.
+        // The switch could detach the stream, but the state transition a lock
+        // performs (current_session_id, session_locked, dropping the mirrored
+        // transcript and the loaded-session marker) lives *after* the slot is
+        // acquired, and LoadHistory does none of it -- it only reads whatever
+        // g_run_session_id says. Applying that mutation before the slot is free
+        // would put the view on a session whose transcript is still the
+        // previous one's, which is exactly the hazard the comment above guards
+        // against. The picker-open path is the switch: reaching the lock at all
+        // means the user already came through it, so the slot is free by then.
+        if (reason != nullptr) {
+            *reason = wqn::OpenCodeRejectReason::kWorkerBusy;
+        }
         xSemaphoreGive(g_lock);
         return ESP_ERR_INVALID_STATE;
     }
-    const AgentSessionOption& selected = g_state.sessions[g_state.selected_session];
     esp_err_t result = AcquireAgentLeaseLocked();
     if (result == ESP_OK) {
         // The worker reads the target session from g_run_session_id, the same
@@ -1659,11 +1877,16 @@ esp_err_t LockSelectedOpenCodeSession()
     return ESP_OK;
 }
 
-esp_err_t CreateNewOpenCodeSession()
+esp_err_t CreateNewOpenCodeSession(OpenCodeRejectReason* reason)
 {
     ESP_RETURN_ON_ERROR(InitOpenCodeSession(), kTag, "init OpenCode session");
     xSemaphoreTake(g_lock, portMAX_DELAY);
     if (g_command != WorkerCommand::kNone) {
+        // Same scoping decision as LockSelectedOpenCodeSession: the picker-open
+        // path is the switch, and a create is only reachable from the picker.
+        if (reason != nullptr) {
+            *reason = wqn::OpenCodeRejectReason::kWorkerBusy;
+        }
         xSemaphoreGive(g_lock);
         return ESP_ERR_INVALID_STATE;
     }
@@ -1685,11 +1908,14 @@ esp_err_t CreateNewOpenCodeSession()
     return result;
 }
 
-esp_err_t ObserveOpenCodeSession()
+esp_err_t ObserveOpenCodeSession(OpenCodeRejectReason* reason)
 {
     ESP_RETURN_ON_ERROR(InitOpenCodeSession(), kTag, "init OpenCode session");
     xSemaphoreTake(g_lock, portMAX_DELAY);
     if (g_state.current_session_id.empty()) {
+        if (reason != nullptr) {
+            *reason = wqn::OpenCodeRejectReason::kNoSession;
+        }
         xSemaphoreGive(g_lock);
         return ESP_ERR_INVALID_STATE;
     }
@@ -1700,7 +1926,17 @@ esp_err_t ObserveOpenCodeSession()
         g_state.history_loaded_session_id != g_state.current_session_id;
     esp_err_t result = AcquireAgentLeaseLocked();
     if (result == ESP_OK && g_command != WorkerCommand::kNone) {
-        result = ESP_ERR_INVALID_STATE;
+        // Same scoping decision as the lock and create paths -- with one extra
+        // reason: observe's own follow-up depends on g_run_detail and on
+        // g_observing surviving into it, both of which this function writes
+        // below. Return rather than falling through: the tail below releases
+        // ownership, and that ownership belongs to whatever command still holds
+        // the slot, not to this call.
+        if (reason != nullptr) {
+            *reason = wqn::OpenCodeRejectReason::kWorkerBusy;
+        }
+        xSemaphoreGive(g_lock);
+        return ESP_ERR_INVALID_STATE;
     }
     if (result == ESP_OK) {
         g_run_failed = false;
@@ -1763,6 +1999,16 @@ esp_err_t ReplyPendingOpenCodePermission(bool approve)
         xSemaphoreGive(g_lock);
         return ESP_ERR_INVALID_STATE;
     }
+    if (g_switch_requested.load(std::memory_order_acquire)) {
+        // A switch is pending: the stream carrying this reply is about to detach
+        // and DiscardOutboundReplies will destroy whatever is queued, so pushing
+        // would tell the user "已批准" for an answer the upstream run never
+        // receives -- leaving it blocked behind a permission nobody can answer.
+        // Refuse instead; the detach clears the ask a moment later anyway.
+        ESP_LOGW(kTag, "permission reply refused: a session switch is pending");
+        xSemaphoreGive(g_lock);
+        return ESP_ERR_INVALID_STATE;
+    }
     g_outbound_replies.Push(wqn::OpenCodeOutboundReply{
         g_state.pending_permission_id, approve, false, {},
         g_state.pending_permission_session, {}});
@@ -1797,6 +2043,13 @@ esp_err_t ReplyPendingOpenCodeQuestion(int index)
     }
     // The answer is the option's value, never its label and never a field id:
     // the gateway is what knows which upstream field the option came from.
+    if (g_switch_requested.load(std::memory_order_acquire)) {
+        // Same as the permission reply: queuing an answer for a stream that is
+        // about to detach strands the run behind a question nobody can answer.
+        ESP_LOGW(kTag, "question reply refused: a session switch is pending");
+        xSemaphoreGive(g_lock);
+        return ESP_ERR_INVALID_STATE;
+    }
     const std::string answer = g_state.pending_question_options[index].value;
     wqn::OpenCodeOutboundReply reply;
     reply.is_question = true;
@@ -1844,6 +2097,12 @@ void InterruptOpenCodeRun()
     // Flag only. The streaming worker makes the interrupt POST itself, so the
     // UI thread never opens a connection of its own while a stream is attached.
     g_interrupt_requested.store(true, std::memory_order_release);
+    // [agent] A pending switch is deliberately LEFT armed: the user asked for
+    // the picker and then for a cancel, and both can be served -- the interrupt
+    // POST stops the run and the tail still chains the follow-up, so the user
+    // lands on the picker they asked for instead of back on the session they
+    // were leaving. Clearing it here would revoke an already-acknowledged
+    // switch and strand them with "已中止".
     g_state.ui.status_label = "正在中止";
     g_state.ui.activity_text = "已请求中止当前任务";
     MarkChangedLocked();
@@ -2193,11 +2452,11 @@ void SetOpenCodeDetailLevel(uint8_t level)
 namespace wqn {
 
 esp_err_t InitOpenCodeSession() { return ESP_ERR_NOT_SUPPORTED; }
-esp_err_t RequestOpenCodeSessionList() { return ESP_ERR_NOT_SUPPORTED; }
+esp_err_t RequestOpenCodeSessionList(OpenCodeRejectReason*) { return ESP_ERR_NOT_SUPPORTED; }
 esp_err_t MoveOpenCodeSessionSelection(int) { return ESP_ERR_NOT_SUPPORTED; }
-esp_err_t LockSelectedOpenCodeSession() { return ESP_ERR_NOT_SUPPORTED; }
-esp_err_t CreateNewOpenCodeSession() { return ESP_ERR_NOT_SUPPORTED; }
-esp_err_t ObserveOpenCodeSession() { return ESP_ERR_NOT_SUPPORTED; }
+esp_err_t LockSelectedOpenCodeSession(OpenCodeRejectReason*) { return ESP_ERR_NOT_SUPPORTED; }
+esp_err_t CreateNewOpenCodeSession(OpenCodeRejectReason*) { return ESP_ERR_NOT_SUPPORTED; }
+esp_err_t ObserveOpenCodeSession(OpenCodeRejectReason*) { return ESP_ERR_NOT_SUPPORTED; }
 esp_err_t ReplyPendingOpenCodePermission(bool) { return ESP_ERR_NOT_SUPPORTED; }
 esp_err_t StartOpenCodeVoiceInput() { return ESP_ERR_NOT_SUPPORTED; }
 esp_err_t StopOpenCodeVoiceInput() { return ESP_ERR_NOT_SUPPORTED; }

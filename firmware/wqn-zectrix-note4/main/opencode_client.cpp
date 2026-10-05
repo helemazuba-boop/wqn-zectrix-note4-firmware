@@ -365,6 +365,16 @@ struct AgentStreamRequest {
     // Set by the worker once it has actually delivered the interrupt, so the
     // session layer can report "已中止" instead of a transport failure.
     std::atomic<bool>* interrupt_delivered = nullptr;
+    // [agent] Set by the session layer to ask the worker to detach from this
+    // stream *without* asking upstream to stop the run. Switching session is a
+    // change of local view and the cloud keeps executing (§0), so this is the
+    // whole difference from `interrupt_requested`: a switch performs no POST at
+    // all, so nothing upstream ever learns the device left.
+    std::atomic<bool>* switch_requested = nullptr;
+    // Set by the worker once it has actually detached, so the session layer can
+    // say "已切换" and chain its follow-up instead of reporting an incomplete
+    // stream.
+    std::atomic<bool>* switch_delivered = nullptr;
 };
 
 void DrainOutboundReplies(const AgentStreamRequest& request)
@@ -452,10 +462,26 @@ esp_err_t ReadAgentEventStream(const AgentStreamRequest& request)
             // also the only place that can perform the interrupt. Without it a
             // cancel press would be invisible until the gateway itself closed
             // the run, i.e. up to the 30-minute outer timeout.
+            //
+            // Checked BEFORE the switch below, and that ordering is deliberate:
+            // an explicit cancel must never be swallowed by a pending switch, or
+            // the run the user asked to stop keeps executing. Both requests can
+            // be armed at once -- the caller honours the switch from its tail
+            // even when this branch is the one that ends the stream -- so
+            // checking the destructive intent first loses nothing.
             const esp_err_t interrupt_error =
                 wqn::InterruptOpenCodeSession(request.token, request.session_id, nullptr);
             if (interrupt_error == ESP_OK && request.interrupt_delivered != nullptr) {
                 request.interrupt_delivered->store(true, std::memory_order_release);
+            }
+            break;
+        }
+        if (request.switch_requested != nullptr &&
+            request.switch_requested->load(std::memory_order_acquire)) {
+            // [agent] Detaching is deliberately NOT an interrupt: no POST, so
+            // no upstream state changes and the run keeps going in the cloud.
+            if (request.switch_delivered != nullptr) {
+                request.switch_delivered->store(true, std::memory_order_release);
             }
             break;
         }
@@ -522,6 +548,14 @@ esp_err_t ReadAgentEventStream(const AgentStreamRequest& request)
     if (interrupted) {
         // Ending by request is a success, not an incomplete stream: the run is
         // over because the user stopped it.
+        return ESP_OK;
+    }
+    if (request.switch_delivered != nullptr &&
+        request.switch_delivered->load(std::memory_order_acquire)) {
+        // [agent] Same for a switch, and the distinction matters more here: the
+        // run is still executing upstream, so reporting `stream_incomplete`
+        // would put an error on screen for a run the user merely navigated away
+        // from. ESP_OK says only that this device's delivery ended on purpose.
         return ESP_OK;
     }
     if (request_result == ESP_OK && !terminal_seen) {
@@ -669,6 +703,8 @@ esp_err_t RunOpenCodePrompt(
     void* reply_failed_ctx,
     std::atomic<bool>* interrupt_requested,
     std::atomic<bool>* interrupt_delivered,
+    std::atomic<bool>* switch_requested,
+    std::atomic<bool>* switch_delivered,
     OpenCodeEventCallback callback,
     void* callback_ctx,
     OpenCodeResult* result)
@@ -709,7 +745,9 @@ esp_err_t RunOpenCodePrompt(
         callback_ctx,
         result,
         interrupt_requested,
-        interrupt_delivered};
+        interrupt_delivered,
+        switch_requested,
+        switch_delivered};
     return ReadAgentEventStream(request);
 }
 
@@ -722,6 +760,8 @@ esp_err_t WatchOpenCodeSession(
     void* reply_failed_ctx,
     std::atomic<bool>* interrupt_requested,
     std::atomic<bool>* interrupt_delivered,
+    std::atomic<bool>* switch_requested,
+    std::atomic<bool>* switch_delivered,
     OpenCodeEventCallback callback,
     void* callback_ctx,
     OpenCodeResult* result)
@@ -743,7 +783,9 @@ esp_err_t WatchOpenCodeSession(
         callback_ctx,
         result,
         interrupt_requested,
-        interrupt_delivered};
+        interrupt_delivered,
+        switch_requested,
+        switch_delivered};
     return ReadAgentEventStream(request);
 }
 

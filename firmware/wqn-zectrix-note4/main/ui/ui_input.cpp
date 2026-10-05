@@ -854,6 +854,27 @@ static RefreshSchedule ApplyAgentOptionBarEvent(
     return RefreshSchedule::kNone;
 }
 
+// [agent] Names why an Agent request was refused. Every one of these used to
+// log the same "busy or empty list", which is indistinguishable when reading a
+// device log after the fact. Switching away from a run is no longer one of
+// them: with a stream attached the entry points detach and carry on.
+static const char* AgentRejectLabel(wqn::OpenCodeRejectReason reason)
+{
+    switch (reason) {
+        case wqn::OpenCodeRejectReason::kWorkerBusy:
+            return "worker busy with a bounded read";
+        case wqn::OpenCodeRejectReason::kLeaseBusy:
+            return "sleep lease held elsewhere";
+        case wqn::OpenCodeRejectReason::kNoSelection:
+            return "no session selected";
+        case wqn::OpenCodeRejectReason::kNoSession:
+            return "no current session";
+        case wqn::OpenCodeRejectReason::kNone:
+            break;
+    }
+    return "unspecified";
+}
+
 // Session picker: confirm locks the focused session, a second confirm within
 // the window re-attaches to its live stream, long-confirm creates a new one.
 // Same gesture map the retired standalone page used, so nothing has to be
@@ -866,10 +887,12 @@ static RefreshSchedule ApplyAgentPickerEvent(
     constexpr int64_t kAgentPickerWindowMs = 1000;
     if (event.button == wqn::ButtonId::kConfirm) {
         if (event.type == wqn::ButtonEventType::kLongRelease) {
-            if (wqn::CreateNewOpenCodeSession() == ESP_OK) {
+            wqn::OpenCodeRejectReason reason = wqn::OpenCodeRejectReason::kNone;
+            if (wqn::CreateNewOpenCodeSession(&reason) == ESP_OK) {
                 ESP_LOGI(kTag, "Agent picker: new session");
             } else {
-                ESP_LOGW(kTag, "Agent picker: new session rejected");
+                ESP_LOGW(kTag, "Agent picker: new session rejected (%s)",
+                         AgentRejectLabel(reason));
             }
             SyncAgentSnapshot(state);
             return RefreshSchedule::kAi;
@@ -878,30 +901,36 @@ static RefreshSchedule ApplyAgentPickerEvent(
             if (state->gestures.last_agent_confirm_tap_ms > 0 &&
                 now_ms - state->gestures.last_agent_confirm_tap_ms <= kAgentPickerWindowMs) {
                 state->gestures.last_agent_confirm_tap_ms = 0;
-                if (wqn::ObserveOpenCodeSession() == ESP_OK) {
+                wqn::OpenCodeRejectReason reason = wqn::OpenCodeRejectReason::kNone;
+                if (wqn::ObserveOpenCodeSession(&reason) == ESP_OK) {
                     ESP_LOGI(kTag, "Agent picker: observe");
                 } else {
-                    ESP_LOGW(kTag, "Agent picker: observe rejected");
+                    ESP_LOGW(kTag, "Agent picker: observe rejected (%s)",
+                             AgentRejectLabel(reason));
                 }
                 SyncAgentSnapshot(state);
                 return RefreshSchedule::kAi;
             }
             state->gestures.last_agent_confirm_tap_ms = now_ms;
-            if (wqn::LockSelectedOpenCodeSession() == ESP_OK) {
+            wqn::OpenCodeRejectReason reason = wqn::OpenCodeRejectReason::kNone;
+            if (wqn::LockSelectedOpenCodeSession(&reason) == ESP_OK) {
                 ESP_LOGI(kTag, "Agent picker: lock session");
                 state->agent_option.focused = 0;
             } else {
-                ESP_LOGW(kTag, "Agent picker: lock rejected (busy or empty list)");
+                ESP_LOGW(kTag, "Agent picker: lock rejected (%s)",
+                         AgentRejectLabel(reason));
             }
             SyncAgentSnapshot(state);
             return RefreshSchedule::kAi;
         }
         if (event.type == wqn::ButtonEventType::kDoublePress) {
             state->gestures.last_agent_confirm_tap_ms = 0;
-            if (wqn::ObserveOpenCodeSession() == ESP_OK) {
+            wqn::OpenCodeRejectReason reason = wqn::OpenCodeRejectReason::kNone;
+            if (wqn::ObserveOpenCodeSession(&reason) == ESP_OK) {
                 ESP_LOGI(kTag, "Agent picker: observe (fast)");
             } else {
-                ESP_LOGW(kTag, "Agent picker: observe rejected");
+                ESP_LOGW(kTag, "Agent picker: observe rejected (%s)",
+                         AgentRejectLabel(reason));
             }
             SyncAgentSnapshot(state);
             return RefreshSchedule::kAi;
@@ -1002,8 +1031,12 @@ static RefreshSchedule ApplyStatusBarEditEvent(
                 // press the session button first. Failure is not fatal: the
                 // picker renders the backend's last activity text instead.
                 if (next == wqn::AiTier::kAgent && state->agent.current_session_id.empty()) {
-                    if (wqn::RequestOpenCodeSessionList() != ESP_OK) {
-                        ESP_LOGW(kTag, "AI status-bar: agent session list request failed");
+                    wqn::OpenCodeRejectReason reason =
+                        wqn::OpenCodeRejectReason::kNone;
+                    if (wqn::RequestOpenCodeSessionList(&reason) != ESP_OK) {
+                        ESP_LOGW(kTag,
+                                 "AI status-bar: agent session list request failed (%s)",
+                                 AgentRejectLabel(reason));
                     }
                 }
                 // A stale option-bar focus must not survive a tier change: the
@@ -1031,12 +1064,16 @@ static RefreshSchedule ApplyStatusBarEditEvent(
                     // accepted: a picker over an in-flight command could lock a
                     // session the worker is not ready to backfill, and Observe
                     // is only reachable from the picker.
-                    if (wqn::RequestOpenCodeSessionList() == ESP_OK) {
+                    wqn::OpenCodeRejectReason reason =
+                        wqn::OpenCodeRejectReason::kNone;
+                    if (wqn::RequestOpenCodeSessionList(&reason) == ESP_OK) {
                         state->agent.session_locked = false;
                         state->agent.selected_session = 0;
                         ESP_LOGI(kTag, "AI status-bar: agent session picker");
                     } else {
-                        ESP_LOGW(kTag, "AI status-bar: agent session list request failed");
+                        ESP_LOGW(kTag,
+                                 "AI status-bar: agent session list request failed (%s)",
+                                 AgentRejectLabel(reason));
                     }
                     return RefreshSchedule::kAi;
                 }

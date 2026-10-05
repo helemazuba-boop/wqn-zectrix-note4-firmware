@@ -5,12 +5,37 @@
 
 namespace wqn {
 
+// Why an Agent request was refused. Every attach entry point returns the same
+// bare `ESP_ERR_INVALID_STATE` for all of these, which made "the list is
+// empty", "another feature holds the sleep lease" and "a bounded read is still
+// running" indistinguishable to the caller -- the UI could only log "rejected".
+// Passed as an optional out-param so the failure mode is nameable.
+enum class OpenCodeRejectReason : uint8_t {
+    kNone,
+    // The worker owns the command slot but no switch can be taken: a bounded
+    // read is running (transcript backfill, voice capture), or the stream that
+    // was attached has just reached its terminal frame and the tail is closing
+    // it. All of these clear within seconds, so this is a retry, not a wall.
+    kWorkerBusy,
+    // Another feature holds the sleep lease, so this one cannot start.
+    kLeaseBusy,
+    // No session is selected in the picker.
+    kNoSelection,
+    // There is no session to act on at all.
+    kNoSession,
+};
+
 esp_err_t InitOpenCodeSession();
-esp_err_t RequestOpenCodeSessionList();
+// `reason` (optional) is written only when the call fails, so a caller that does
+// not care can pass nullptr. When a stream is attached, the list request is not
+// refused at all: it detaches from that stream -- leaving the run going in the
+// cloud -- and then loads the list. That is the switch described in
+// opencode_client.h.
+esp_err_t RequestOpenCodeSessionList(OpenCodeRejectReason* reason = nullptr);
 esp_err_t MoveOpenCodeSessionSelection(int direction);
-esp_err_t LockSelectedOpenCodeSession();
-esp_err_t CreateNewOpenCodeSession();
-esp_err_t ObserveOpenCodeSession();
+esp_err_t LockSelectedOpenCodeSession(OpenCodeRejectReason* reason = nullptr);
+esp_err_t CreateNewOpenCodeSession(OpenCodeRejectReason* reason = nullptr);
+esp_err_t ObserveOpenCodeSession(OpenCodeRejectReason* reason = nullptr);
 esp_err_t ReplyPendingOpenCodePermission(bool approve);
 // Answer the live `agent.question` ask by option index. The index is the slot
 // the option bar is showing, so it is always within the (at most two) options

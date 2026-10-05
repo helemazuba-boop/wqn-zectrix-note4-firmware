@@ -181,6 +181,18 @@ esp_err_t TranscribeOpenCodeAudio(
 // stream died". The streaming worker performs the interrupt POST itself, so no
 // caller ever opens a connection of its own while a stream is attached.
 //
+// They also share a *switch* contract, which is the same shape with the
+// opposite intent: `switch_requested` detaches the device from the stream
+// without asking upstream to stop anything, so the run keeps executing in the
+// cloud while only the local view moves on. `switch_delivered` then reads back
+// as ESP_OK rather than `stream_incomplete`.
+//
+// Both can be armed at once, and the INTERRUPT is the one checked first. That
+// ordering is the point: an explicit cancel must never be swallowed by a
+// pending switch, or the run the user asked to stop keeps going. A switch left
+// armed under a cancel is still honoured by the caller's tail, so the user gets
+// the picker they asked for as well as the stop they asked for.
+//
 // `detail` is the requested cloud detail tier (kOpenCodeDetailDefault in
 // opencode_model.h). It rides the request as `?detail=N` and only shapes what
 // the gateway projects onto the stream -- never the run itself.
@@ -197,6 +209,8 @@ esp_err_t RunOpenCodePrompt(
     void* reply_failed_ctx,
     std::atomic<bool>* interrupt_requested,
     std::atomic<bool>* interrupt_delivered,
+    std::atomic<bool>* switch_requested,
+    std::atomic<bool>* switch_delivered,
     OpenCodeEventCallback callback,
     void* callback_ctx,
     OpenCodeResult* result);
@@ -209,6 +223,8 @@ esp_err_t WatchOpenCodeSession(
     void* reply_failed_ctx,
     std::atomic<bool>* interrupt_requested,
     std::atomic<bool>* interrupt_delivered,
+    std::atomic<bool>* switch_requested,
+    std::atomic<bool>* switch_delivered,
     OpenCodeEventCallback callback,
     void* callback_ctx,
     OpenCodeResult* result);
