@@ -626,6 +626,21 @@ void CloseAgentToolBlockLocked(bool ok, int64_t now_ms)
     // entry in place would drag it below the tool block and overwrite its own
     // text with the post-tool text.
     g_agent_assistant_id = wqn::kInvalidChatMessageId;
+    // Same for the thinking channel, and this is fixing a live bug rather than
+    // adding a feature. The comment in MirrorAgentThinkingLocked below claims
+    // "Post-tool reasoning must open a NEW entry for the same reason post-tool
+    // text does (see CloseAgentToolBlockLocked)" -- but this function never
+    // retired the thinking id, so the claim was false: post-tool reasoning fell
+    // through to ReplaceText and overwrote the pre-tool thinking bubble in
+    // place. Any run with detail >= 2 that reasons again after a tool call hit
+    // it, and nothing covered the case.
+    //
+    // Retiring the id here is safe for the same reason retiring the assistant id
+    // is: the mirror functions call this BEFORE they bind the text they are
+    // about to write, and an id is not that text. Clearing the id cannot erase a
+    // frame that is already on its way -- it only decides which entry the next
+    // write lands in.
+    g_agent_thinking_id = wqn::kInvalidChatMessageId;
 }
 
 // Streams the accumulated gateway text into a single assistant entry: the
@@ -887,6 +902,24 @@ void OnOpenCodeEvent(const wqn::OpenCodeEvent& event, void*)
             MarkChangedLocked();
             break;
         case wqn::OpenCodeEventKind::kText:
+            // H1: the cloud sends an EMPTY `agent.text` as its "start this round
+            // over" frame at every detail tier now, not just brief. The assign
+            // below is already the clear -- assigning an empty string IS clearing
+            // the buffer -- so the only thing missing was retiring the assistant
+            // id. Without it, the next round's delta lands on ReplaceText and
+            // writes into the entry that is currently holding the previous
+            // round's answer, so the two rounds end up stacked in one bubble
+            // instead of the new one replacing it.
+            //
+            // Gated on the detail tier because that is what decides whether the
+            // cloud emits this frame at all: brief tier has been sending it all
+            // along, and A1/A2/A3 extended it to the tiers that render reasoning
+            // and tool blocks -- the tiers where a round boundary is actually
+            // visible as a splice. Reading `g_state.detail_level` here instead
+            // would let a tier change made mid-run change this run's behaviour.
+            if (event.text.empty() && g_run_detail >= 1) {
+                g_agent_assistant_id = wqn::kInvalidChatMessageId;
+            }
             g_state.ui.response_text.assign(
                 event.text.data(),
                 Utf8SafePrefixBytes(event.text, kMaxAgentTextBytes));
@@ -904,6 +937,27 @@ void OnOpenCodeEvent(const wqn::OpenCodeEvent& event, void*)
             MarkChangedLocked();
             break;
         case wqn::OpenCodeEventKind::kReasoning:
+            // A5/A6, the thinking channel's twin of A4. An empty `agent.reasoning`
+            // is the cloud's "this round's thought starts over" frame: it is
+            // emitted at a round boundary immediately before the new round's
+            // reasoning, because `applyReasoningDelta` sees the boundary before
+            // `applyDelta` does.
+            //
+            // The assign below is already the buffer clear, so -- as in A4 --
+            // the only thing missing was retiring the id. Without it the next
+            // reasoning delta lands on ReplaceText and writes into the PREVIOUS
+            // round's thinking entry, which sits above any tool block that ran
+            // in between. The text would be right and the position wrong: round
+            // N's thought would render where round N-1's used to be. Retiring the
+            // id is what makes the next reasoning delta AppendThinking at the
+            // current tail instead.
+            //
+            // No detail gate here, unlike A4: reasoning only reaches the device
+            // at detail >= 2 at all, because the cloud is what filters it, so
+            // there is no tier at which this frame arrives unexpectedly.
+            if (event.text.empty()) {
+                g_agent_thinking_id = wqn::kInvalidChatMessageId;
+            }
             g_agent_thinking_text.assign(
                 event.text.data(),
                 Utf8SafePrefixBytes(event.text, kMaxThinkingBytes));
