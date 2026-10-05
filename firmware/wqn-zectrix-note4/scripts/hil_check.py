@@ -442,10 +442,23 @@ def hil_storage_bench(log: Log):
             skip(log, 'BENCH:real-traffic-survived',
                  'bench 期间没有真实事务被推迟 2 s 以上，无从判定')
         else:
-            lost = [t for t in starved if t['res'] != 'ESP_OK']
-            expect(log, 'BENCH:real-traffic-survived', not lost,
-                   f'{len(starved)} 笔真实事务排在 bench 后等了 ≥2 s，其中 {len(lost)} '
-                   f'笔没成功（被推迟可以接受，被丢掉是回归）')
+            # NOT_FOUND is not a loss: outbox-peek / session-load legitimately
+            # return it on a device with nothing pending, and the P1 log is full
+            # of them. Counting it made a clean log read as FAIL, which is the
+            # same disease as the queue_wait criterion -- a judge that cries
+            # wolf on its own experiment. What actually means "lost" is a
+            # refusal (a gate or lease said no) or an abandonment (the queue
+            # deadline dropped it). Everything else is reported, not counted.
+            lost = [t for t in starved
+                    if t['res'] in ('ESP_ERR_INVALID_STATE', 'ESP_ERR_TIMEOUT')]
+            other = [t for t in starved if t['res'] not in
+                     ('ESP_OK', 'ESP_ERR_INVALID_STATE', 'ESP_ERR_TIMEOUT')]
+            detail = (f'{len(starved)} 笔真实事务排在 bench 后等了 ≥2 s'
+                      f'，其中 {len(lost)} 笔被拒/被丢弃（被推迟可以接受，'
+                      f'被丢掉是回归）')
+            if other:
+                detail += f'；另有 {len(other)} 笔返回非 OK 的空结果（{other[0]["res"]} 等）'
+            expect(log, 'BENCH:real-traffic-survived', not lost, detail)
 
 
 def hil_stability(log: Log):
