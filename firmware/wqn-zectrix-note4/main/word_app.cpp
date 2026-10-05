@@ -1745,24 +1745,6 @@ void ApplyWordObservationCommitResult(WordAppState* state, esp_err_t result)
     FinishOrLoadAdvancedReview(state);
 }
 
-void RefreshWordOutboxState(WordAppState* state)
-{
-    if (state == nullptr) return;
-    WordOutboxSnapshot snapshot;
-    if (ReadWordOutboxSnapshot(&snapshot) != ESP_OK) return;
-    state->outbox.pending_count = snapshot.pending_count;
-    state->outbox.suspended_count = snapshot.suspended_count;
-    state->outbox.blocked_count = snapshot.blocked_count;
-    state->outbox.capacity = snapshot.capacity;
-    if (snapshot.pending_count == 0 && snapshot.suspended_count == 0 &&
-        state->session.commit_state == WordObservationCommitState::kCloudPending) {
-        state->session.commit_state = WordObservationCommitState::kCloudAcknowledged;
-        if (state->mode == WordAppMode::kWordCard) {
-            state->message = "已同步";
-        }
-    }
-}
-
 WordAppSnapshot BuildWordAppSnapshot(const WordAppState& state)
 {
     WordAppSnapshot snapshot;

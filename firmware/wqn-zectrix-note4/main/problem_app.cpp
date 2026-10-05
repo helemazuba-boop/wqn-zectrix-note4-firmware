@@ -991,20 +991,6 @@ void ApplyProblemVerdictCommitResult(ProblemAppState* state, esp_err_t result)
     }
 }
 
-void RefreshProblemOutboxState(ProblemAppState* state)
-{
-    if (state == nullptr) return;
-    ProblemOutboxSnapshot snapshot;
-    if (ReadProblemOutboxSnapshot(&snapshot) != ESP_OK) return;
-    state->outbox.pending_count = snapshot.pending_count;
-    state->outbox.suspended_count = snapshot.suspended_count;
-    state->outbox.capacity = snapshot.capacity;
-    if (snapshot.pending_count == 0 && snapshot.suspended_count == 0 &&
-        state->commit_state == ProblemVerdictCommitState::kCloudPending) {
-        state->commit_state = ProblemVerdictCommitState::kCloudAcknowledged;
-    }
-}
-
 ProblemAppSnapshot BuildProblemAppSnapshot(const ProblemAppState& state)
 {
     ProblemAppSnapshot snapshot;

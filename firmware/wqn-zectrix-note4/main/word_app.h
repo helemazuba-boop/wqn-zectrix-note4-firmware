@@ -321,7 +321,6 @@ bool TakeWordObservationEffect(
     DurableWordObservation* observation,
     PersistedWordSession* advanced_session);
 void ApplyWordObservationCommitResult(WordAppState* state, esp_err_t result);
-void RefreshWordOutboxState(WordAppState* state);
 WordAppSnapshot BuildWordAppSnapshot(const WordAppState& state);
 std::string WordAppProgressLabel(const WordAppState& state);
 std::string WordAppStatusLine(const WordAppState& state);

@@ -1466,21 +1466,6 @@ bool NoteImageLoadingGraceActive(const NoteAppState& state, int64_t now_us)
         now_us - state.image_view_entered_us < kNoteImageGraceUs;
 }
 
-void RefreshNoteOutboxState(NoteAppState* state)
-{
-    if (state == nullptr) return;
-    NoteOutboxSnapshot snapshot;
-    if (ReadNoteOutboxSnapshot(&snapshot) != ESP_OK) return;
-    state->outbox.pending_count = snapshot.pending_count;
-    state->outbox.suspended_count = snapshot.suspended_count;
-    state->outbox.blocked_count = snapshot.blocked_count;
-    state->outbox.capacity = snapshot.capacity;
-    if (snapshot.pending_count == 0 && snapshot.suspended_count == 0 &&
-        state->session.commit_state == NoteObservationCommitState::kCloudPending) {
-        state->session.commit_state = NoteObservationCommitState::kCloudAcknowledged;
-    }
-}
-
 NoteAppSnapshot BuildNoteAppSnapshot(const NoteAppState& state)
 {
     NoteAppSnapshot snapshot;
