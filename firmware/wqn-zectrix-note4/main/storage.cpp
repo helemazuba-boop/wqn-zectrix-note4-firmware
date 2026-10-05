@@ -37,7 +37,6 @@ constexpr char kTag[] = "wqn_storage";
 constexpr size_t kAccessTokenLength = 64;
 constexpr char kProblemsKey[] = "problems";
 constexpr char kPendingReviewsKey[] = "pending_reviews";
-constexpr char kAiSessionKey[] = "ai_session_day";
 constexpr char kAutoSyncIntervalMinKey[] = "sync_min";
 constexpr char kBootFullSyncAttemptKey[] = "boot_sync_at";
 constexpr char kImageRenderModeKey[] = "img_render";
@@ -241,18 +240,6 @@ public:
 private:
     cJSON* root_ = nullptr;
 };
-
-std::string GetOptionalString(cJSON* object, const char* key)
-{
-    cJSON* item = cJSON_GetObjectItemCaseSensitive(object, key);
-    return cJSON_IsString(item) && item->valuestring != nullptr ? item->valuestring : "";
-}
-
-int GetOptionalInt(cJSON* object, const char* key)
-{
-    cJSON* item = cJSON_GetObjectItemCaseSensitive(object, key);
-    return cJSON_IsNumber(item) ? item->valueint : 0;
-}
 
 esp_err_t LoadStringFromNvs(const char* key, std::string* value)
 {
@@ -1222,101 +1209,6 @@ esp_err_t SaveSyncJournalThroughStorageService(const SyncJournal& journal)
         SaveSyncJournalTransaction,
         const_cast<SyncJournal*>(&journal),
         "save-sync-journal");
-}
-
-esp_err_t SaveAiSessionForDay(const CachedAiSession& session)
-{
-    StorageWriteGuard write("save-ai-session", __FILE__, __LINE__);
-    if (!write) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    if (session.day.empty()) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    JsonDocument document(cJSON_CreateObject());
-    if (document.root() == nullptr ||
-        !cJSON_AddStringToObject(document.root(), "day", session.day.c_str()) ||
-        !cJSON_AddStringToObject(document.root(), "conversation_id", session.conversation_id.c_str()) ||
-        !cJSON_AddStringToObject(document.root(), "transcript", session.transcript.c_str()) ||
-        !cJSON_AddStringToObject(document.root(), "reply_text", session.reply_text.c_str()) ||
-        !cJSON_AddStringToObject(document.root(), "status_detail", session.status_detail.c_str()) ||
-        cJSON_AddNumberToObject(document.root(), "latency_ms", session.latency_ms) == nullptr) {
-        return ESP_ERR_NO_MEM;
-    }
-
-    cJSON* calls = cJSON_AddArrayToObject(document.root(), "function_call_summaries");
-    if (calls == nullptr) {
-        return ESP_ERR_NO_MEM;
-    }
-    for (const std::string& summary : session.function_call_summaries) {
-        cJSON* item = cJSON_CreateString(summary.c_str());
-        if (item == nullptr) {
-            return ESP_ERR_NO_MEM;
-        }
-        cJSON_AddItemToArray(calls, item);
-    }
-
-    std::string payload;
-    ESP_RETURN_ON_ERROR(JsonToString(document.root(), &payload), kTag, "serialize AI session");
-    return SaveBlobToNvs(kAiSessionKey, payload);
-}
-
-esp_err_t LoadAiSessionForDay(const std::string& day, CachedAiSession* session)
-{
-    if (session == nullptr) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    *session = CachedAiSession{};
-    if (day.empty()) {
-        return ESP_OK;
-    }
-
-    std::string payload;
-    ESP_RETURN_ON_ERROR(LoadBlobFromNvs(kAiSessionKey, &payload), kTag, "load AI session");
-    if (payload.empty()) {
-        return ESP_OK;
-    }
-
-    JsonDocument document(payload);
-    if (!cJSON_IsObject(document.root())) {
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    const std::string stored_day = GetOptionalString(document.root(), "day");
-    if (stored_day != day) {
-        return ESP_OK;
-    }
-
-    session->day = stored_day;
-    session->conversation_id = GetOptionalString(document.root(), "conversation_id");
-    session->transcript = GetOptionalString(document.root(), "transcript");
-    session->reply_text = GetOptionalString(document.root(), "reply_text");
-    session->status_detail = GetOptionalString(document.root(), "status_detail");
-    session->latency_ms = GetOptionalInt(document.root(), "latency_ms");
-
-    cJSON* calls = cJSON_GetObjectItemCaseSensitive(document.root(), "function_call_summaries");
-    if (cJSON_IsArray(calls)) {
-        const int count = cJSON_GetArraySize(calls);
-        session->function_call_summaries.reserve(count);
-        for (int i = 0; i < count; ++i) {
-            cJSON* item = cJSON_GetArrayItem(calls, i);
-            if (cJSON_IsString(item) && item->valuestring != nullptr) {
-                session->function_call_summaries.emplace_back(item->valuestring);
-            }
-        }
-    }
-    return ESP_OK;
-}
-
-esp_err_t ClearAiSession()
-{
-    StorageWriteGuard write("clear-ai-session", __FILE__, __LINE__);
-    if (!write) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    return ClearNvsKey(kAiSessionKey);
 }
 
 esp_err_t LoadAutoSyncIntervalMinutes(uint32_t* minutes)
@@ -2338,35 +2230,6 @@ esp_err_t LoadWifiCredentials(std::string* ssid, std::string* password)
     *ssid = store.slots[store.preferred].ssid;
     *password = store.slots[store.preferred].password;
     return ESP_OK;
-}
-
-esp_err_t SaveWifiCredentials(const std::string& ssid, const std::string& password)
-{
-    return UpsertWifiCredential(ssid, password);
-}
-
-esp_err_t ClearWifiCredentials()
-{
-    StorageWriteGuard write("clear-wifi-credentials", __FILE__, __LINE__);
-    if (!write) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    esp_err_t result = ClearNvsKey(kWifiCredsBlobKey);
-    const esp_err_t legacy_ssid = ClearNvsKey(kWifiSsidKey);
-    const esp_err_t legacy_pass = ClearNvsKey(kWifiPasswordKey);
-    if (result == ESP_OK) {
-        result = legacy_ssid;
-    }
-    if (result == ESP_OK) {
-        result = legacy_pass;
-    }
-    return result;
-}
-
-bool HasWifiCredentials()
-{
-    WifiCredentialStore store;
-    return LoadWifiCredentialStore(&store) == ESP_OK && store.count > 0;
 }
 
 esp_err_t PrepareStorageForSleep(int64_t deadline_us)

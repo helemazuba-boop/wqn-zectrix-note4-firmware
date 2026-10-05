@@ -3,7 +3,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
-#include <vector>
 
 #include "esp_err.h"
 
@@ -22,16 +21,6 @@ struct StorageCapacitySnapshot {
     size_t nvs_used_entries = 0;
     size_t nvs_free_entries = 0;
     size_t nvs_total_entries = 0;
-};
-
-struct CachedAiSession {
-    std::string day;
-    std::string conversation_id;
-    std::string transcript;
-    std::string reply_text;
-    std::string status_detail;
-    std::vector<std::string> function_call_summaries;
-    int latency_ms = 0;
 };
 
 struct DeviceControlState {
@@ -108,10 +97,6 @@ esp_err_t LoadSyncJournal(SyncJournal* journal);
 // wait, so the write is never refused by a quiesce it should have blocked.
 // The raw entry point is file-local on purpose.
 esp_err_t SaveSyncJournalThroughStorageService(const SyncJournal& journal);
-
-esp_err_t SaveAiSessionForDay(const CachedAiSession& session);
-esp_err_t LoadAiSessionForDay(const std::string& day, CachedAiSession* session);
-esp_err_t ClearAiSession();
 
 esp_err_t LoadAutoSyncIntervalMinutes(uint32_t* minutes);
 esp_err_t SaveAutoSyncIntervalMinutes(uint32_t minutes);
@@ -191,9 +176,6 @@ void SetPlaybackVolumeCache(int percent);
 esp_err_t FactoryResetNvsAndRestart();
 
 esp_err_t LoadWifiCredentials(std::string* ssid, std::string* password);
-esp_err_t SaveWifiCredentials(const std::string& ssid, const std::string& password);
-esp_err_t ClearWifiCredentials();
-bool HasWifiCredentials();
 
 // [wifi-redundancy] Dual-slot WiFi credential store. The store is a versioned
 // NVS blob holding up to two (ssid, password) slots plus a `preferred` index
