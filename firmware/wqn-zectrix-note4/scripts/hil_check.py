@@ -198,6 +198,21 @@ GATE_FAIL_RE = re.compile(r'gate self-test failed: (?P<name>[a-z-]+)')
 # 低于这个值就不许参与外推，只许报"未实测"。
 kStreamCommitResolutionMs = 2
 
+# kCommit 在**同一个** bench shape（62 KiB 文件）上的历轮实测读数，单位 ms。
+# 这六个数全是量的，不是估计，来源逐个标了：
+#   1005.19 0        （`cost_ms=0`）
+#   1005.24 0.099    （`cost_us=99`）
+#   1005.26 0.115    （`cost_us=115`）
+#   1005.28 1250.918 （`cost_us=1250918`）
+#   1006.1  0.107    （`cost_us=107`）
+#   1006.3  343.74   （`cost_us=343740`）
+# ⚠️ **四次 ≈0.1 ms、两次 344~1251 ms，差 12,600×**。所以 kCommit 和这个文件系统上
+# 其它东西一样是**双峰的**，而判据以前只看当前这一轮：1005.19/24/26/1006.1 说"低于
+# 分辨率、未实测"，1005.28 说"≈26.4 s"，1006.3 说"≈7.3 s"——同一个 shape 上两个
+# 相差 3.6× 的"量级估计"，各自都只来自一档里的一个样本。外推时必须说清这一点，
+# 否则读的人会把 n=1 当成这个量的稳定值。
+kStreamCommitHistoryMs = [0.0, 0.099, 0.115, 0.107, 1250.918, 343.74]
+
 # stream ramp 的 deadline 标定值。两个数都来自实测日志/源码，不是估计：
 #   pack    = 1,341,248 B —— 1005.15 `word-pack-download: ... bytes_expected=1341248`
 #             （就是那一笔在 278528 B / 20.8% 处 ESP_ERR_TIMEOUT 的包）
@@ -323,6 +338,31 @@ def StreamDeadlinePrediction(fixed_ms, per_byte_ms,
     # STREAM:download-within-deadline（1005.19 的收尾一笔 15,327 ms）。
     commit_note = ''
     commit_total = 0.0
+    # kCommit 自己的双峰：同一个 62 KiB shape 上，六轮读数四次 ≈0.1 ms、两次
+    # 344~1251 ms（见 kStreamCommitHistoryMs 的来源注释）。**外推的是哪一档，
+    # 必须说出来**——否则"≈7.3 s"（1006.3）和"≈26.4 s"（1005.28）这两个相差
+    # 3.6× 的量级估计会被当成同一个量的两次测量，而它们各自只是 n=1。
+    def commit_history_note(ms, factor):
+        cheap = [v for v in kStreamCommitHistoryMs
+                 if 0 < v < kStreamCommitResolutionMs]
+        zero = [v for v in kStreamCommitHistoryMs if v == 0]
+        expensive = [v for v in kStreamCommitHistoryMs if v >= kStreamCommitResolutionMs]
+        if not expensive:
+            return ''
+        # 跨度按最小**非零**读数算：拿 0 当分母会得到 1e12 这种没意义的数，
+        # 而 0 本身就是"低到测不出来"，不是"真的是零"。
+        span = max(expensive) / min(cheap) if cheap else float('inf')
+        mode = '贵档' if ms >= kStreamCommitResolutionMs else '便宜档'
+        cheap_txt = f'{min(cheap):.2f}~{max(cheap):.2f} ms ×{len(cheap)}' if cheap \
+            else f'{min(expensive):.0f}~{max(expensive):.0f} ms'
+        exp_txt = f'{min(expensive):.0f}~{max(expensive):.0f} ms ×{len(expensive)}'
+        return (f'。⚠️ kCommit 本身是**双峰**的：同一个 {commit_file_bytes // 1024} KiB '
+                f'shape 上六轮实测——便宜档 {cheap_txt}'
+                + (f'（另有 {len(zero)} 轮读到 0，即低到 ms 计时测不出）' if zero else '')
+                + f'、贵档 {exp_txt}，最小非零与最贵差 **{span:.0f}×**。'
+                f'本轮落在**{mode}**，外推只用这一档的单个样本 ⇒ '
+                f'别把 {fmt(ms * factor)} 当成 kCommit 的稳定值')
+
     if commit_ms is not None and commit_file_bytes \
             and commit_ms >= kStreamCommitResolutionMs:
         factor = pack_bytes / commit_file_bytes
@@ -336,11 +376,20 @@ def StreamDeadlinePrediction(fixed_ms, per_byte_ms,
             commit_note = (
                 f'；kCommit {commit_ms:.0f} ms（{commit_file_bytes // 1024} KiB '
                 f'文件，外推 {factor:.1f}×）⇒ ≈{fmt(commit_total)}')
+        commit_note += commit_history_note(commit_ms, factor)
     elif commit_ms is not None and commit_file_bytes:
+        # 0.107 ms 不许印成 "0 ms"：那正是"低分辨率的零被当成测出来的零"，
+        # 听着像"这项免费"。保留两位小数，让便宜档读数本身可见
+        # （1005.24/26/1006.1 分别是 0.099/0.115/0.107 ms）。
+        shown = f'{commit_ms:.2f}'.rstrip('0').rstrip('.') \
+            if commit_ms < 1 else f'{commit_ms:.0f}'
         commit_note = (
-            f'；kCommit 实测 {commit_ms:.0f} ms 在 {commit_file_bytes // 1024} KiB '
+            f'；kCommit 实测 {shown} ms 在 {commit_file_bytes // 1024} KiB '
             f'文件上 = **低于 ms 计时分辨率，未实测**，不计入总数。别把它读成'
             f'"这项免费"——1005.19 里 1.34 MiB 的真实收尾是 15,327 ms')
+        # 便宜档也要说：正是"本轮恰好落在便宜档"最容易让人以为这项免费。
+        hist_factor = pack_bytes / commit_file_bytes
+        commit_note += commit_history_note(commit_ms, hist_factor)
     elif commit_ms is not None:
         commit_note = f'；kCommit 实测 {commit_ms:.0f} ms（文件大小未知，未计入总数）'
 
