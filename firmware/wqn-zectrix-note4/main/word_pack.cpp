@@ -1414,7 +1414,13 @@ esp_err_t ReadWordPackEntry(const WordPackIndexEntry& index_entry, WqnWordEntry*
     *entry = WqnWordEntry{};
 
     const std::string path = PackPathForStem(index_entry.pack_stem);
+    // [measure] §四.6: split the open_seek_ms the rewrite has been attributing
+    // to "opening" into the fopen and the fseek halves. The split is appended
+    // after total_ms so the existing `word card loaded` fields -- and the
+    // PK:open-seek-not-regressed criterion that reads them -- stay byte-identical.
+    const int64_t before_fopen_us = esp_timer_get_time();
     FILE* file = std::fopen(path.c_str(), "rb");
+    const int64_t after_fopen_us = esp_timer_get_time();
     if (file == nullptr) {
         return ESP_ERR_NOT_FOUND;
     }
@@ -1445,11 +1451,14 @@ esp_err_t ReadWordPackEntry(const WordPackIndexEntry& index_entry, WqnWordEntry*
     const int64_t finished_us = esp_timer_get_time();
     ESP_LOGI(
         kTag,
-        "word card loaded: open_seek_ms=%lld read_close_ms=%lld parse_ms=%lld total_ms=%lld",
+        "word card loaded: open_seek_ms=%lld read_close_ms=%lld parse_ms=%lld "
+        "total_ms=%lld fopen_ms=%lld fseek_ms=%lld",
         static_cast<long long>((opened_us - started_us) / 1000),
         static_cast<long long>((read_us - opened_us) / 1000),
         static_cast<long long>((finished_us - read_us) / 1000),
-        static_cast<long long>((finished_us - started_us) / 1000));
+        static_cast<long long>((finished_us - started_us) / 1000),
+        static_cast<long long>((after_fopen_us - before_fopen_us) / 1000),
+        static_cast<long long>((opened_us - after_fopen_us) / 1000));
     return ESP_OK;
 }
 

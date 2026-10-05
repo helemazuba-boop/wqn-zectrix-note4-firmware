@@ -267,6 +267,17 @@ esp_err_t ExecuteStorageTransactionInternal(
 
 }  // namespace
 
+// [measure] Global scope on purpose: this file's body is inside
+// namespace wqn::services, so a declaration placed there would declare
+// wqn::services::wqn::StartStorageWriteBench and fail to link. Forward-declared
+// rather than included because the service must not depend upward on the store
+// layer, and this hook is temporary scaffolding for the rewrite measurement
+// (doc/1005-storage-rewrite-todo.md §四). Delete it with the [measure] block in
+// word_study_store.cpp.
+namespace wqn {
+void StartStorageWriteBench();
+}
+
 namespace wqn::services {
 
 esp_err_t StartStorageService()
@@ -321,6 +332,10 @@ esp_err_t StartStorageService()
     g_task = created_task;
     g_starting = false;
     taskEXIT_CRITICAL(&g_start_lock);
+    // [measure] Kick the write bench once the task handle exists. It delays
+    // itself ~25 s first so boot storage traffic has drained and the numbers
+    // are not polluted by startup queue_wait.
+    wqn::StartStorageWriteBench();
     return ESP_OK;
 }
 

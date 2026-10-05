@@ -14,6 +14,9 @@
 #include "esp_check.h"
 #include "esp_log.h"
 #include "esp_rom_crc.h"
+#include "esp_spiffs.h"  // [measure] esp_spiffs_info for the bench capacity log
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"  // [measure] xTaskCreate / vTaskDelete for the bench
 #include "storage.h"  // GetDeckScopeGeneration (deck-scope session validation)
 #include "esp_timer.h"
 #include "runtime/sleep_coordinator.h"
@@ -397,6 +400,68 @@ bool DecodeSession(
     return true;
 }
 
+// [measure] Phase-1 write-path instrumentation for the storage rewrite
+// (doc/1005-storage-rewrite-todo.md §四.1). Emits exactly one line per
+// AtomicWrite call -- the destructor fires on every exit path, including the
+// early returns that skip later operations (those fields then read 0).
+// stat_ms is deliberately a sixth field: FileExists(primary) below is itself a
+// SPIFFS metadata operation and is not one of the five §四.1 names an
+// "operation", so leaving it out would silently credit its cost to whatever
+// happens to be measured next.
+// The point is the reconciliation, not the individual numbers: the six parts
+// must be summed and compared against the enclosing transaction's elapsed_ms.
+// If they do not add up to the whole, the cost is not in AtomicWrite and the
+// rewrite has to look somewhere else. Delete this block with the rest of the
+// [measure] tags once the split is recorded in §一.
+class AtomicWriteProbe {
+  public:
+    AtomicWriteProbe(size_t bytes, bool preserve_backup)
+        : bytes_(bytes), preserve_backup_(preserve_backup) {}
+
+    ~AtomicWriteProbe() {
+        ESP_LOGI(
+            kTag,
+            "atomic write: bytes=%u backup=%d fopen_ms=%lld write_ms=%lld "
+            "stat_ms=%lld remove_ms=%lld rename_backup_ms=%lld "
+            "rename_primary_ms=%lld total_ms=%lld",
+            static_cast<unsigned>(bytes_),
+            preserve_backup_ ? 1 : 0,
+            static_cast<long long>(fopen_ms_),
+            static_cast<long long>(write_ms_),
+            static_cast<long long>(stat_ms_),
+            static_cast<long long>(remove_ms_),
+            static_cast<long long>(rename_backup_ms_),
+            static_cast<long long>(rename_primary_ms_),
+            static_cast<long long>((esp_timer_get_time() - entered_us_) / 1000));
+    }
+
+    void AfterFopen() { fopen_ms_ = Delta(); }
+    void AfterWrite() { write_ms_ = Delta(); }
+    void AfterStat() { stat_ms_ = Delta(); }
+    void AfterRemove() { remove_ms_ = Delta(); }
+    void AfterRenameBackup() { rename_backup_ms_ = Delta(); }
+    void AfterRenamePrimary() { rename_primary_ms_ = Delta(); }
+
+  private:
+    int64_t Delta() {
+        const int64_t now_us = esp_timer_get_time();
+        const int64_t elapsed_ms = (now_us - mark_us_) / 1000;
+        mark_us_ = now_us;
+        return elapsed_ms;
+    }
+
+    size_t bytes_;
+    bool preserve_backup_;
+    int64_t entered_us_ = esp_timer_get_time();
+    int64_t mark_us_ = entered_us_;
+    int64_t fopen_ms_ = 0;
+    int64_t write_ms_ = 0;
+    int64_t stat_ms_ = 0;
+    int64_t remove_ms_ = 0;
+    int64_t rename_backup_ms_ = 0;
+    int64_t rename_primary_ms_ = 0;
+};
+
 esp_err_t AtomicWrite(
     const char* primary,
     const char* temporary,
@@ -405,25 +470,31 @@ esp_err_t AtomicWrite(
     size_t size,
     bool preserve_backup = false)
 {
+    AtomicWriteProbe probe(size, preserve_backup);
     FILE* file = std::fopen(temporary, "wb");
+    probe.AfterFopen();
     if (file == nullptr) return ESP_FAIL;
     const bool written = std::fwrite(bytes, 1, size, file) == size;
     const bool durable = written && std::fflush(file) == 0 && ::fsync(fileno(file)) == 0;
     const bool closed = std::fclose(file) == 0;
+    probe.AfterWrite();
     if (!durable || !closed) {
         std::remove(temporary);
         return ESP_FAIL;
     }
     const bool had_primary = FileExists(primary);
+    probe.AfterStat();
     if (preserve_backup) {
         if (had_primary && std::remove(primary) != 0 && errno != ENOENT) {
             std::remove(temporary);
             return ESP_FAIL;
         }
+        probe.AfterRemove();
         if (std::rename(temporary, primary) != 0) {
             std::remove(temporary);
             return ESP_FAIL;
         }
+        probe.AfterRenamePrimary();
         return ESP_OK;
     }
     if (had_primary) {
@@ -431,18 +502,229 @@ esp_err_t AtomicWrite(
             std::remove(temporary);
             return ESP_FAIL;
         }
+        probe.AfterRemove();
         if (std::rename(primary, backup) != 0) {
             std::remove(temporary);
             return ESP_FAIL;
         }
+        probe.AfterRenameBackup();
     }
     if (std::rename(temporary, primary) != 0) {
         if (had_primary) std::rename(backup, primary);
         std::remove(temporary);
         return ESP_FAIL;
     }
+    probe.AfterRenamePrimary();
     return ESP_OK;
 }
+
+// ---------------------------------------------------------------------------
+// [measure] Phase-1 write bench (doc/1005-storage-rewrite-todo.md §四 2/3/4).
+//
+// WHY A BENCH AND NOT REAL TRAFFIC: every number in §一 that would decide the
+// rewrite is n=1 (session-save, cursor) or one aggregated bucket (background).
+// A single sample cannot carry a rewrite. This synthesizes repeatable writes so
+// the three open questions get real n:
+//   A2/A4  -- does cost grow with write count (GC pressure), and what does the
+//             backup rotation actually cost (3 KB rotated vs 3 KB direct)?
+//   A3     -- what share of a write is fsync (see the no-fsync shape)?
+//   §四.1  -- the per-op split is already logged by AtomicWriteProbe above; the
+//             bench is what gives that split a stable, repeated input.
+//
+// SHAPE CONSTRAINTS (hard, from the [watchdog] note in
+// services/storage_service.cpp): SPIFFS lookups are CPU-bound directory scans
+// that never block, so a long uninterrupted transaction starves IDLE0 past the
+// 10 s task_wdt timeout and panics the device. Therefore ONE write per
+// transaction, never a loop inside one, and the service's own vTaskDelay(1)
+// between transactions plus a delay here keeps IDLE0 fed.
+//
+// TEMPORARY: gated by the constexpr below, not a Kconfig symbol (a new symbol
+// silently evaluates to 0 until a reconfigure, which would burn a flash for
+// nothing). Remove this entire block before the rewrite lands.
+constexpr bool kStorageBenchEnabled = true;
+constexpr int kBenchRounds = 4;
+constexpr size_t kBenchMaxBytes = 3072;
+constexpr TickType_t kBenchStartDelayTicks = pdMS_TO_TICKS(25000);
+constexpr size_t kBenchReserveBytes = 64 * 1024;
+
+struct BenchShape {
+    const char* name;
+    size_t bytes;
+    bool preserve_backup;
+};
+
+// probe = a lookup with no write at all: fopen("rb") on a path that does not
+// exist. That is the purest measurement of the scan cost the model blames.
+// session3k vs session3k-direct is §四.4: same bytes, rotated vs written over
+// the primary in place, so the difference is what the backup rotation costs.
+constexpr BenchShape kBenchShapes[] = {
+    {"probe", 0, true},
+    {"cur52", 52, true},
+    {"journal400", 400, false},
+    {"session3k", kBenchMaxBytes, false},
+    {"session3k-direct", kBenchMaxBytes, true},
+};
+
+struct BenchContext {
+    const BenchShape* shape = nullptr;
+    int round = 0;
+    esp_err_t result = ESP_FAIL;
+};
+
+// Scratch paths, deliberately outside every real store's name space.
+constexpr char kBenchPrimary[] = "/storage/bench.pri";
+constexpr char kBenchTemp[] = "/storage/bench.tmp";
+constexpr char kBenchBackup[] = "/storage/bench.bak";
+constexpr char kBenchProbeMissing[] = "/storage/bench-does-not-exist";
+
+// Runs ON the storage task. One AtomicWrite per invocation -- see the watchdog
+// note above; a loop here would hold the task through the whole bench.
+//
+// This body contains ONLY the measured operation. The capacity log and the free
+// space check live in BenchTask outside the timed window on purpose:
+// esp_spiffs_info may itself walk pages, and counting that inside the
+// transaction would inflate the very cost we are trying to measure.
+esp_err_t BenchTransaction(void* opaque)
+{
+    BenchContext* ctx = static_cast<BenchContext*>(opaque);
+    if (ctx == nullptr || ctx->shape == nullptr) return ESP_ERR_INVALID_ARG;
+    const BenchShape& shape = *ctx->shape;
+
+    if (shape.bytes == 0) {
+        // Pure lookup probe: no write, so no AtomicWrite line is expected. This
+        // is the cleanest read on the scan cost the model blames for the floor.
+        FILE* missing = std::fopen(kBenchProbeMissing, "rb");
+        if (missing != nullptr) std::fclose(missing);
+        ctx->result = ESP_OK;
+        return ESP_OK;
+    }
+
+    // Payload lives on the heap: the storage task stack is 20 KiB and a 3 KiB
+    // buffer plus the AtomicWrite frame is not worth spending stack on.
+    std::vector<uint8_t> payload(shape.bytes, 0xA5);
+    ctx->result = AtomicWrite(
+        kBenchPrimary, kBenchTemp, kBenchBackup,
+        payload.data(), payload.size(), shape.preserve_backup);
+    return ctx->result;
+}
+
+// Returns the free-space verdict and, in info_ms_out, how long
+// esp_spiffs_info itself took. That cost is reported separately rather than
+// folded into the write measurement: if it turns out to be hundreds of
+// milliseconds it is a second, independent confirmation of the scan-cost model
+// from a completely different code path -- worth having, but it must not be
+// allowed to inflate the number the bench is actually about.
+bool BenchFreeSpaceOk(const BenchShape& shape, int round, int64_t* info_ms_out)
+{
+    size_t total = 0;
+    size_t used = 0;
+    const int64_t info_started_us = esp_timer_get_time();
+    const esp_err_t info_result = esp_spiffs_info("storage", &total, &used);
+    if (info_ms_out != nullptr) {
+        *info_ms_out = (esp_timer_get_time() - info_started_us) / 1000;
+    }
+    if (info_result != ESP_OK) {
+        ESP_LOGW(kTag, "storage bench SKIP shape=%s round=%d: spiffs unavailable",
+                 shape.name, round);
+        return false;
+    }
+    if (total - used < shape.bytes + kBenchReserveBytes) {
+        // Never let the bench fill the partition: the outboxes live here and a
+        // full SPIFFS would cost real study records, not just this measurement.
+        ESP_LOGW(kTag,
+                 "storage bench SKIP shape=%s round=%d free=%u need=%u",
+                 shape.name, round,
+                 static_cast<unsigned>(total - used),
+                 static_cast<unsigned>(shape.bytes + kBenchReserveBytes));
+        return false;
+    }
+    return true;
+}
+
+void BenchTask(void*)
+{
+    // Boot runs a burst of real storage work; wait for it to drain so the
+    // bench's numbers are not polluted by queue_wait from startup traffic.
+    vTaskDelay(kBenchStartDelayTicks);
+
+    const int shape_count =
+        static_cast<int>(sizeof(kBenchShapes) / sizeof(kBenchShapes[0]));
+    int write_count = 0;
+    for (const BenchShape& shape : kBenchShapes) {
+        if (shape.bytes > 0) write_count += kBenchRounds;
+    }
+    // No predicted duration on purpose: any number here would be derived from
+    // the very model this bench exists to test, and printing it would smuggle a
+    // hypothesis in as a measurement. The real total is printed at END.
+    ESP_LOGI(kTag, "storage bench BEGIN shapes=%d rounds=%d writes=%d",
+             shape_count, kBenchRounds, write_count);
+
+    // Mount precheck: if the partition is not up, skip the whole run rather
+    // than let the bench write into an unmounted or unhealthy filesystem.
+    size_t total = 0;
+    size_t used = 0;
+    if (esp_spiffs_info("storage", &total, &used) != ESP_OK) {
+        ESP_LOGW(kTag, "storage bench ABORT: storage partition not mounted");
+        ESP_LOGI(kTag, "storage bench END total_ms=0");
+        vTaskDelete(nullptr);
+        return;
+    }
+    ESP_LOGI(kTag, "storage bench begin: total=%u used=%u free=%u",
+             static_cast<unsigned>(total),
+             static_cast<unsigned>(used),
+             static_cast<unsigned>(total - used));
+
+    const int64_t bench_started_us = esp_timer_get_time();
+
+    for (const BenchShape& shape : kBenchShapes) {
+        for (int round = 0; round < kBenchRounds; ++round) {
+            // Checked here, outside the timed window -- see BenchTransaction.
+            int64_t info_ms = 0;
+            if (!BenchFreeSpaceOk(shape, round, &info_ms)) continue;
+            BenchContext ctx;
+            ctx.shape = &shape;
+            ctx.round = round;
+            const int64_t started_us = esp_timer_get_time();
+            const esp_err_t dispatched =
+                wqn::services::ExecuteStorageTransactionNamed(
+                    BenchTransaction, &ctx, "storage-bench");
+            // info_ms is appended, not inserted: it is adjacent context, not
+            // part of wall_ms, and appending keeps the field order stable.
+            ESP_LOGI(
+                kTag,
+                "storage bench round: shape=%s round=%d wall_ms=%lld result=%s "
+                "info_ms=%lld",
+                shape.name, round,
+                static_cast<long long>((esp_timer_get_time() - started_us) / 1000),
+                esp_err_to_name(dispatched),
+                static_cast<long long>(info_ms));
+            // Give IDLE0 a slot between transactions; the service also yields
+            // one tick per transaction, this is belt-and-braces.
+            vTaskDelay(2);
+        }
+    }
+
+    std::remove(kBenchPrimary);
+    std::remove(kBenchTemp);
+    std::remove(kBenchBackup);
+    size_t end_total = 0;
+    size_t end_used = 0;
+    if (esp_spiffs_info("storage", &end_total, &end_used) == ESP_OK) {
+        ESP_LOGI(kTag, "storage bench end: total=%u used=%u free=%u",
+                 static_cast<unsigned>(end_total),
+                 static_cast<unsigned>(end_used),
+                 static_cast<unsigned>(end_total - end_used));
+    }
+    ESP_LOGI(kTag, "storage bench END total_ms=%lld",
+             static_cast<long long>(
+                 (esp_timer_get_time() - bench_started_us) / 1000));
+    vTaskDelete(nullptr);
+}
+
+// BenchTask stays in this file-local namespace so it can reach AtomicWrite and
+// the scratch paths above. The public starter lives at the end of the file,
+// inside namespace wqn, once this anonymous namespace has closed.
+// ---------------------------------------------------------------------------
 
 esp_err_t SaveSessionRaw(
     const wqn::PersistedWordSession& session,
@@ -1949,6 +2231,23 @@ esp_err_t PrepareWordObservationOutboxForSleep(int64_t deadline_us)
         PrepareOutboxForSleepTransaction,
         &context,
         "word-outbox-sleep-compact");
+}
+
+}  // namespace wqn
+
+// [measure] Temporary bench starter. Defined here, after the file-local
+// namespace has closed, so it can reach BenchTask while still exposing a wqn::
+// symbol for the boot hook. Remove with the rest of the [measure] block.
+namespace wqn {
+
+void StartStorageWriteBench()
+{
+    if (!kStorageBenchEnabled) return;
+    // Small stack: this task only enqueues and waits on the completion
+    // semaphore; the writes themselves run on the storage task's 20 KiB stack.
+    if (xTaskCreate(BenchTask, "wqn_bench", 4096, nullptr, 2, nullptr) != pdPASS) {
+        ESP_LOGW(kTag, "storage bench task create failed");
+    }
 }
 
 }  // namespace wqn
