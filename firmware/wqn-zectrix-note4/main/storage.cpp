@@ -455,6 +455,9 @@ esp_err_t InitStoragePartition()
     // M7 owns all destructive recovery in the pre-business schema gate. A
     // mount failure here must stop startup instead of silently replacing data
     // and then running with an uncommitted schema generation.
+    // Deliberately false: silently reformatting this partition on any mount
+    // failure would destroy un-uploaded study observations
+    // (/storage/wout.v1, wrej.v1, nout.v1, nrej.v1, po_outbox.jsonl).
     config.format_if_mount_failed = false;
 
     esp_err_t result = esp_vfs_spiffs_register(&config);
@@ -467,7 +470,14 @@ esp_err_t InitStoragePartition()
     size_t used = 0;
     result = esp_spiffs_info(kStoragePartitionLabel, &total, &used);
     if (result == ESP_OK) {
-        ESP_LOGI(kTag, "storage SPIFFS ready: total=%u used=%u", static_cast<unsigned>(total), static_cast<unsigned>(used));
+        // Page size is logged because it is the one build-time setting that
+        // silently changes every storage number in the log without changing
+        // any code, so a log read without it can be misattributed.
+        ESP_LOGI(kTag,
+                 "storage SPIFFS ready: total=%u used=%u page_size=%d",
+                 static_cast<unsigned>(total),
+                 static_cast<unsigned>(used),
+                 CONFIG_SPIFFS_PAGE_SIZE);
     } else {
         ESP_LOGW(kTag, "storage SPIFFS info failed: %s", esp_err_to_name(result));
     }

@@ -551,18 +551,29 @@ struct BenchShape {
     const char* name;
     size_t bytes;
     bool preserve_backup;
+    bool append;
 };
 
 // probe = a lookup with no write at all: fopen("rb") on a path that does not
 // exist. That is the purest measurement of the scan cost the model blames.
 // session3k vs session3k-direct is §四.4: same bytes, rotated vs written over
 // the primary in place, so the difference is what the backup rotation costs.
+//
+// append exists to separate two explanations that the write shapes alone cannot
+// tell apart. AppendOutboxRecordTo() does fopen("ab") + fwrite + fsync + fclose
+// with no temp file, no remove and no rename, and its real cost is ~8 ms median
+// (n=46 across 1005.4/1005.6/1005.7) against ~1875 ms for a 52 B AtomicWrite on
+// the same partition in the same boot. Either the per-lookup scan dominates (in
+// which case a smaller page count helps both) or object creation dominates (in
+// which case it only helps the lookup tier). Appending to one fixed path
+// isolates it: round 0 creates, later rounds only extend.
 constexpr BenchShape kBenchShapes[] = {
-    {"probe", 0, true},
-    {"cur52", 52, true},
-    {"journal400", 400, false},
-    {"session3k", kBenchMaxBytes, false},
-    {"session3k-direct", kBenchMaxBytes, true},
+    {"probe", 0, true, false},
+    {"cur52", 52, true, false},
+    {"journal400", 400, false, false},
+    {"session3k", kBenchMaxBytes, false, false},
+    {"session3k-direct", kBenchMaxBytes, true, false},
+    {"append", 0, true, true},
 };
 
 struct BenchContext {
@@ -576,6 +587,7 @@ constexpr char kBenchPrimary[] = "/storage/bench.pri";
 constexpr char kBenchTemp[] = "/storage/bench.tmp";
 constexpr char kBenchBackup[] = "/storage/bench.bak";
 constexpr char kBenchProbeMissing[] = "/storage/bench-does-not-exist";
+constexpr char kBenchAppend[] = "/storage/bench.append";
 
 // Runs ON the storage task. One AtomicWrite per invocation -- see the watchdog
 // note above; a loop here would hold the task through the whole bench.
@@ -589,6 +601,27 @@ esp_err_t BenchTransaction(void* opaque)
     BenchContext* ctx = static_cast<BenchContext*>(opaque);
     if (ctx == nullptr || ctx->shape == nullptr) return ESP_ERR_INVALID_ARG;
     const BenchShape& shape = *ctx->shape;
+
+    if (shape.append) {
+        // Mirrors AppendOutboxRecordTo(): append, flush, fsync, close. No temp
+        // file, no remove, no rename. Reported on its own line rather than the
+        // `atomic write:` line because it is not an AtomicWrite and folding it
+        // in would corrupt the per-op reconciliation that line exists for.
+        FILE* file = std::fopen(kBenchAppend, "ab");
+        if (file == nullptr) {
+            ctx->result = ESP_FAIL;
+            return ctx->result;
+        }
+        const uint8_t record[52] = {};
+        const bool written = std::fwrite(record, 1, sizeof(record), file) == sizeof(record);
+        const bool durable =
+            written && std::fflush(file) == 0 && ::fsync(fileno(file)) == 0;
+        const bool closed = std::fclose(file) == 0;
+        ctx->result = (durable && closed) ? ESP_OK : ESP_FAIL;
+        ESP_LOGI(kTag, "storage bench append round=%d result=%s",
+                 ctx->round, esp_err_to_name(ctx->result));
+        return ctx->result;
+    }
 
     if (shape.bytes == 0) {
         // Pure lookup probe: no write, so no AtomicWrite line is expected. This
@@ -723,6 +756,7 @@ void BenchTask(void*)
     std::remove(kBenchPrimary);
     std::remove(kBenchTemp);
     std::remove(kBenchBackup);
+    std::remove(kBenchAppend);
     size_t end_total = 0;
     size_t end_used = 0;
     if (esp_spiffs_info("storage", &end_total, &end_used) == ESP_OK) {
@@ -734,6 +768,14 @@ void BenchTask(void*)
     ESP_LOGI(kTag, "storage bench END total_ms=%lld",
              static_cast<long long>(
                  (esp_timer_get_time() - bench_started_us) / 1000));
+
+    // [sleep] Release explicitly. vTaskDelete below ends the task WITHOUT
+    // running destructors, so a stack-held SleepLease would otherwise never be
+    // given back: ActiveSleepBlockerCount(kStorage) stays non-zero for the
+    // life of the boot and deep sleep is blocked forever. 1005.12 caught this
+    // as "long-held sleep lease: holder=storage-bench held_ms=209480" long
+    // after the bench had finished.
+    bench_lease.Reset();
     vTaskDelete(nullptr);
 }
 
