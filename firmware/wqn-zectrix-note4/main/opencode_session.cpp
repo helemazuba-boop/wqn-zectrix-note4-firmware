@@ -1532,6 +1532,26 @@ void OnOpenCodeReplyFailed(
     xSemaphoreGive(g_lock);
 }
 
+// [C13] True when a run submission was refused because a run is already in
+// flight, which is the one upstream refusal that means "look at the run that is
+// executing" rather than "your request was bad".
+//
+// Matched on the error code, not the message: the message is upstream prose
+// that has already been translated once ("Another run is already in flight on
+// this device") and matches on it break the moment that string is reworded,
+// silently turning a downgrade back into a dead end. The status is checked too,
+// because a code is only meaningful next to the status that carried it -- and
+// `request_id_conflict`, the other 409 this route can return, must NOT reach the
+// downgrade: it means the device re-used an idempotency key with a different
+// prompt, which is a device bug and belongs in front of the user as an error.
+//
+// A 503 (run_idempotency_unavailable) is deliberately excluded: nothing is in
+// flight in that case, so attaching would show a session with no run.
+bool RunConflictsWithInFlightRun(const wqn::OpenCodeResult& result)
+{
+    return result.http_status == 409 && result.error_code == "run_in_progress";
+}
+
 void RunPrompt()
 {
     g_interrupt_requested.store(false, std::memory_order_release);
@@ -1602,6 +1622,55 @@ void RunPrompt()
         g_state.ui.action_hint = "长按确认发起新任务";
         g_state.stream_active = false;
         RefreshAgentRunLeaseLocked();
+        MarkChangedLocked();
+    } else if (result != ESP_OK && !g_run_failed && RunConflictsWithInFlightRun(api_result)) {
+        // [C13] The cloud refused this submission because a run is already in
+        // flight on this (device, session) -- the ledger Stage C6 made
+        // per-session, so this is now only reachable when the device and the
+        // cloud disagree about what is running. The old behaviour surfaced the
+        // upstream's English sentence as an error and told the user to
+        // re-record, which 409s again: an unbreakable loop that left a live run
+        // neither watchable nor stoppable from this device, because observe was
+        // only reachable from the picker and the picker clears the current
+        // session.
+        //
+        // Downgrading to observe is the only action that is true to what
+        // happened: the prompt was NOT necessarily lost -- upstream
+        // `delivery:'steer'` accepts a submission into an in-flight session and
+        // queues it (§2.2) -- but the device cannot prove it landed, so it must
+        // not claim it did. Attaching shows the run that is actually executing
+        // and leaves the user watching something real rather than reading an
+        // error that tells them to do the thing that just failed.
+        //
+        // The prompt stays on screen: it is the one thing worth keeping, and
+        // re-attaching does not touch prompt_text.
+        g_state.stream_active = false;
+        g_run_prompt.clear();
+        g_run_request_id.clear();
+        g_observing = true;
+        g_run_session_id = g_state.current_session_id;
+        // The tail below clears g_run_session_id unless a follow-up owns it.
+        // The chained observe reads its target from that slot, exactly as the
+        // history-refresh chain does -- so the "a follow-up is running" flag is
+        // what keeps this branch's target alive. Clearing it would leave
+        // ObserveSession arming a stream for an empty session id.
+        refreshing_history = true;
+        g_state.ui.phase = wqn::AiFeaturePhase::kRunning;
+        g_state.ui.status_label = "执行中";
+        g_state.ui.activity_text = "已有任务在运行，正在转为观察";
+        g_state.ui.action_hint = "长按=中止";
+        g_state.ui.requires_confirmation = false;
+        g_state.confirmation_armed_at_ms = 0;
+        ClearAllAsksLocked();
+        ArmAgentFollowLocked();
+        ResetAgentHistoryTurnLocked();
+        // The stream supplies the lease criterion from here, so the frames
+        // decide rather than inheriting the submission's hold.
+        g_observed_run_live = false;
+        RefreshAgentRunLeaseLocked();
+        ChainWorkerCommandLocked(WorkerCommand::kObserveSession);
+        ESP_LOGI(kTag, "run 409 on %s: downgraded to observe",
+                 g_run_session_id.c_str());
         MarkChangedLocked();
     } else if (result != ESP_OK && !g_run_failed) {
         SetErrorLocked(api_result.detail.empty() ? "Agent 执行连接失败" : api_result.detail);

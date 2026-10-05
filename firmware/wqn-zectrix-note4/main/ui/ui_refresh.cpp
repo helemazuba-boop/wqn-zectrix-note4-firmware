@@ -566,6 +566,14 @@ std::string FrameSignature(const wqn::UiFrame& frame)
             signature.append(session.id);
             signature.push_back(':');
             signature.append(session.title);
+            // [D-which] The picker's running marker is drawn from `outcome`
+            // (page_ai_agent.cpp), so a row transitioning running -> settled
+            // must reach the signature or layer-1 dedup skips the repaint and
+            // the glyph stays over a session whose run has ended. Only kRunning
+            // reaches that glyph, so the bit is one state deep on purpose.
+            signature.push_back(session.outcome == wqn::OpenCodeSessionOutcome::kRunning
+                                    ? 'R'
+                                    : '.');
         }
     }
     if (frame.screen == wqn::UiScreen::kTodo) {

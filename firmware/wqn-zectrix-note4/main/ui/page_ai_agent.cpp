@@ -278,11 +278,35 @@ static void DrawAgentSessionPicker(const wqn::AgentSessionState& agent)
         if (focused) {
             FillRoundedRect(8, y - 3, 384, 25, 5);
         }
+        // [D-which] The running marker. Item B1 of doc/1005 §0.1 makes attaching
+        // the default, so the picker is no longer where the user goes to start
+        // watching -- it is where they decide which session to look at. Before
+        // this marker, a session with a run in flight was indistinguishable
+        // from one that had never been prompted: the only way to find out was
+        // to lock it and watch nothing happen, and with the picker clearing the
+        // current session, doing that to the wrong row cost a detach.
+        //
+        // Only kRunning gets a marker. `outcome` also carries settled values
+        // (succeeded / interrupted / failed / unknown), and marking those would
+        // make the list say "this one ran" about rows that ran days ago -- a
+        // list where most rows are marked is a list the user learns to ignore.
+        // An absent or unrecognised value is kUnknown, which is no marker; that
+        // direction is the same fail-safe the lease criterion in
+        // opencode_session.cpp uses, and it is why a typo in that table costs a
+        // missing glyph rather than a device that never sleeps.
+        const bool running = agent.sessions[index].outcome ==
+                            wqn::OpenCodeSessionOutcome::kRunning;
         const std::string title = AgentOneLine(
             agent.sessions[index].title.empty() ? agent.sessions[index].id
                                                 : agent.sessions[index].title,
-            360);
+            running ? 300 : 360);
         AGENT_TEXT(16, y, title.c_str(), !focused);
+        if (running) {
+            // Right-aligned pulse glyph plus the label: the glyph alone is a
+            // shape the user has to learn, and "运行中" next to a row they are
+            // about to lock is the difference between choosing and guessing.
+            AGENT_TEXT(16 + 6 * 16 + 8, y, "◆ 运行中", !focused);
+        }
         y += kAgentPickerRowStep;
     }
 }
