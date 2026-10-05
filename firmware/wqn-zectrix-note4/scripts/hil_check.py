@@ -33,8 +33,13 @@ from dataclasses import dataclass, field
 # ---------------------------------------------------------------- 解析原语 --
 
 TX_RE = re.compile(
+    # 时间戳可有可无：有的抓取不带 `I (ms)` 前缀。中间的
+    # `storage_service: storage transaction complete: request=` 用 `[^\n]*?` 跳过
+    # ——不能写成紧邻 owner= 的字面量，那会让可选组永远匹配不上而静默拿到 None
+    # （1005.19 上就是这么错的：事务全都 t=None，端到端判据直接 SKIP）。
+    r'(?:^[IWEDV] \((?P<t>\d+)\) [^\n]*?)?'
     r'owner=(?P<owner>[a-z0-9-]+) queue_wait_ms=(?P<qw>\d+) '
-    r'elapsed_ms=(?P<el>\d+) result=(?P<res>\w+)')
+    r'elapsed_ms=(?P<el>\d+) result=(?P<res>\w+)', re.M)
 
 CARD_RE = re.compile(
     r'word card loaded: open_seek_ms=(?P<os>\d+) read_close_ms=(?P<rc>\d+) '
@@ -94,6 +99,89 @@ LEASE_RE = re.compile(
 # these patterns stop at the last field they name and never anchor to EOL.)
 BENCH_END_RE = re.compile(r'\((?P<at_ms>\d+)\) \w+: storage bench END')
 
+# P1b-B stream ramp: one shape, 5 rounds, each round writes a BIGGER chunk into
+# the SAME already-open handle. This is the instrument that separates the two
+# surviving cost models, which are degenerate at a single chunk size:
+#   H1  cost is charged per CALL   -> cost_ms flat across chunk_bytes
+#   H2  cost is charged per BYTE   -> cost_ms grows with chunk_bytes
+# At the ~1719 B chunk 1005.15 actually measured, BOTH models predict ~890 ms
+# (1719 x 0.517), which is why a single fixed size could never answer it.
+# The round line carries every field on one line so `cost_ms` can be read
+# against `chunk_bytes` and `file_bytes` directly:
+#   `storage bench stream round=%d chunk_bytes=%u file_bytes=%ld result=%s cost_ms=%lld`
+BENCH_STREAM_ROUND_RE = re.compile(
+    r'storage bench stream round=(?P<round>\d+) chunk_bytes=(?P<chunk>\d+) '
+    r'file_bytes=(?P<file>\d+) result=(?P<result>\w+) cost_ms=(?P<cost>\d+)')
+
+# kCommit equivalent: the fflush+fsync+close wp-stream pays exactly once per
+# download, timed apart from the rounds so per-round numbers stay clean.
+# `aborted=1` means the ramp was cut short by the 6 s per-round budget.
+BENCH_STREAM_COMMIT_RE = re.compile(
+    # 对端把 cost_ms 改成了 cost_us（µs）——因为 ms 分辨率下 62 KiB 的 fsync
+    # 会量成 0，而那个 0 被乘 21.1× 外推成"kCommit ≈0.0 s"，和 1.34 MiB 上真的
+    # 15,327 ms 差 15 s。两种单位都认：手上既有旧格式日志，也会有新格式日志。
+    # 单位不同，分辨率下限也要跟着变（见 kCommitFloorUs / kCommitFloorMs）。
+    r'storage bench stream commit: result=(?P<result>\w+) '
+    r'cost_(?P<unit>ms|us)=(?P<cost>\d+) aborted=(?P<aborted>\d+)')
+
+# >6 s round. This is a CONCLUSION, not a crash: under H2 the big rounds are
+# exactly the ones that blow the budget, so an abort is H2's strongest evidence.
+# Treating it as "the bench died" throws away the one thing it measured.
+BENCH_STREAM_ABORT_RE = re.compile(
+    r'storage bench stream ABORT round=(?P<round>\d+): '
+    r'cost_ms=(?P<cost>\d+) exceeds (?P<budget>\d+) ms')
+
+# The read buffer size IS the wp-stream transaction count: a 1.34 MB pack at
+# 2 KB/chunk costs ~780 transactions, at 32 KB/chunk ~41. If this line still
+# reports the old 2 KB, the chunk-size fix is not in the build at all and the
+# whole H1 prediction is void -- so the number is checked, not assumed.
+WORD_PACK_READ_BUFFER_RE = re.compile(
+    r'word-pack-download: read_buffer_bytes=(?P<bytes>\d+)')
+
+# 一次词包下载的两端：起点（知道整包解压后多大）和终点（失败/成功各一行）。
+# 这些行**不要用位置正则**：对端在这轮已经改过三次字段（`received=` → `of M`
+# → `reason=` → `plain= / wire= / plain_bytes_per_s=`），每改一次位置正则就静默
+# 失配一次，而失配的表现是"SKIP：本轮没有该行"——看着像没测，其实是判据瞎了。
+# 所以只固定行头，字段一律用 KV_RE 扫，缺字段就是缺，多字段自动收下。
+WORD_PACK_START_RE = re.compile(
+    r'^[IWEDV] \((?P<t>\d+)\) wqn_api: word-pack-download: pack_id=\S+ '
+    r'url=\S+ bytes_expected=(?P<bytes>\d+)', re.M)
+WORD_PACK_END_RE = re.compile(
+    r'^[IWEDV] \((?P<t>\d+)\) wqn_api: word-pack-download '
+    r'(?P<what>failed|completed): '
+    # err 是紧跟 failed: 的裸 token（ESP_ERR_TIMEOUT），不是 key=value，KV_RE 抓不到
+    r'(?:(?P<err>[A-Z][A-Z0-9_]*) )?'
+    r'(?P<body>.*)$', re.M)
+KV_RE = re.compile(r'(?P<k>[a-z_]+)=(?P<v>[^\s]+)')
+# word-pack-download 行出现过多少次 —— 用来抓"格式漂移"。判据正则没匹配上时
+# 如果日志里明明有这些行，那是判据瞎了，必须 FAIL，不能 SKIP。
+# 本会话已经因为这个模式错过一次（新增判据静默不触发）。
+WORD_PACK_LINE_COUNT_RE = re.compile(
+    r'^[IWEDV] \(\d+\) wqn_api: word-pack-download.*$', re.M)
+# 服务器侧错误与"我们自己超时"要分开：前者这一轮什么都没测到。
+WORD_PACK_HTTP_RE = re.compile(
+    r'^[IWEDV] \((?P<t>\d+)\) wqn_api: word-pack-download HTTP status=(?P<status>\d+)',
+    re.M)
+# 真实下载路径的 kAppend —— **这一行给出的一直是缺的那个数**：解压后的分片大小。
+# 直到它出现之前，"wp-stream 比 bench 贵几倍"有 1.22×~5.7× 四个自俞读法，
+# 因为谁都不知道每笔到底写了多少解压字节。`total_bytes of %lu` 又给出真实进度，
+# 不会再有人把压缩 received 当分母去算完成度。
+WORD_PACK_APPEND_RE = re.compile(
+    r'^[IWEDV] \((?P<t>\d+)\) word_pack: word pack stream append: '
+    r'chunk_bytes=(?P<chunk>\d+) total_bytes=(?P<total>\d+) of (?P<want>\d+)', re.M)
+
+# 真实流量侧的追加写（不是 bench）：`word observation durable: sequence=%u
+# lookup_ms=%lld append_ms=%lld total_ms=%lld`。
+# WHY 它重要: `BENCH:floor-model-holds` 只看 bench 的 append shape，而 bench 的
+# 双峰完全有可能是**我们自己量测**造出来的（bench 逐轮换 shape、租约、排队）。
+# 这个行让判据说一句它本来没资格说的话：双峰是产品自己的行为，不是 bench 的
+# 行为。1005.26 实测 append_ms = 6/6/6/6/8/15/15 + 365/433/433，与 bench 的
+# 31 / 1308~2149 同形（便宜簇 + 贵约百倍的簇），只是绝对量级因载荷不同而不同。
+WORD_OBS_DURABLE_RE = re.compile(
+    r'^[IWEDV] \((?P<t>\d+)\) word_store: word observation durable: '
+    r'sequence=(?P<seq>\d+) lookup_ms=(?P<lookup>\d+) '
+    r'append_ms=(?P<append>\d+) total_ms=(?P<total>\d+)', re.M)
+
 # Gate self-test (`RunUiGateSelfTest`, C1). Two lines, one honest verdict:
 #   I wqn_ui_gates: commit_state gate self-test passed
 #   E wqn_ui_gates: gate self-test failed: word-row scope switch refused ...
@@ -102,6 +190,234 @@ BENCH_END_RE = re.compile(r'\((?P<at_ms>\d+)\) \w+: storage bench END')
 # to act on than one that lists it twice.
 GATE_OK_RE = re.compile(r'commit_state gate self-test passed')
 GATE_FAIL_RE = re.compile(r'gate self-test failed: (?P<name>[a-z-]+)')
+
+# kCommit 计时分辨率下限。日志时间戳是 ms，所以 `cost_ms=0` 的真实含义是
+# "短于 1 ms"——对一次 fflush+fsync+fclose 来说不可能，它是**未测到**，不是免费。
+# 1005.19 就是这个坑：bench 在 62 KiB 上量到 0 ms，外推 21.1× 后判据说
+# "kCommit ≈0.0 s"，而同一份日志里真实收尾那笔是 15,327 ms，差 15 s。
+# 低于这个值就不许参与外推，只许报"未实测"。
+kStreamCommitResolutionMs = 2
+
+# stream ramp 的 deadline 标定值。两个数都来自实测日志/源码，不是估计：
+#   pack    = 1,341,248 B —— 1005.15 `word-pack-download: ... bytes_expected=1341248`
+#             （就是那一笔在 278528 B / 20.8% 处 ESP_ERR_TIMEOUT 的包）
+#   deadline = 120,000 ms  —— wqn_api.cpp:1941-1942 `now + 120LL * 1000 * 1000`
+# 换包型或改 deadline 时，这两个数是这里唯一要动的地方。
+kStreamPackBytes = 1341248
+kStreamDeadlineMs = 120000
+# P1b-B 正在验证的那个读缓冲尺寸。读缓冲大小就是 wp-stream 的事务笔数，
+# 所以"32 KB 够不够"是整个 P1b-B 要回答的产品问题。
+kStreamChunkUnderTest = 32 * 1024
+
+
+def commit_cost_ms(g):
+    """把 bench 的 stream commit 行归一成 `cost_ms`，并标记原始单位。
+
+    对端已把 `cost_ms` 改成 `cost_us`：ms 分辨率下一次 62 KiB 的 fsync 会量成 0，
+    而那个 0 被外推成"kCommit ≈0.0 s"，与 1.34 MiB 上实测的 15,327 ms 差 15 s。
+    两种单位都要认（旧日志是 ms、新日志是 us），归一后下游只跟一个字段打交道。
+    """
+    d = {k: (v if k in ('result', 'unit') else int(v)) for k, v in g.items()}
+    d['cost_ms'] = d['cost'] / 1000.0 if g.get('unit') == 'us' else float(d['cost'])
+    return d
+
+
+def knee_note(fixed_ms, per_byte_ms, pts):
+    """ramp 是否存在单一 `cost=F+s×bytes` 描述不了的拐点。返回给人读的一句，或 ''。
+
+    逐个点算「实测 / 模型预测」。一条直线如果真描述整条 ramp，所有点都该 ≈1。
+    1005.19 实测：2K 0.05、4K 0.08、8K 1.00、16K 1.04、32K 0.92 —— 最大/最小
+    17×，即最小分片掉到了 append 基线价。这时候"H2 成立"这种单一标签是过度自信：
+    它把"大分片区间每字节恒定"升级成了"整条 ramp 是一条直线"。
+
+    阈值取 3×：拟合本身有噪声（单点抖动几 ms 就能让 2K 那种小值偏很多），
+    3× 以下不报，避免对正常数据喊狼来了。
+    """
+    ratios = []
+    for r in pts:
+        predicted = fixed_ms + per_byte_ms * r[1]
+        if predicted <= 0:
+            return ''
+        ratios.append((r[1], r[2] / predicted))
+    if len(ratios) < 3:
+        return ''
+    lo = min(ratios, key=lambda x: x[1])
+    hi = max(ratios, key=lambda x: x[1])
+    if hi[1] <= 0 or hi[1] / max(lo[1], 1e-9) < 3.0:
+        return ''
+    worst = '、'.join(f'{b // 1024}K≈{q:.2f}' for b, q in ratios)
+    return (f'⚠️ ramp 有拐点，单一 cost=F+s×bytes 描述不了整条'
+            f'（实测/预测比 {hi[1] / max(lo[1], 1e-9):.0f}×：{worst}）。'
+            f'大分片区间的斜率可用，但小分片已掉到 append 基线价，'
+            f'别把"这个区间每字节恒定"读成"整条 ramp 是直线"')
+
+
+def StreamFit(pts):
+    """对 ramp 做 cost = F + s×bytes 的最小二乘，返回 (F, s)。
+
+    pts 是 (round, chunk_bytes, cost_ms, cost_per_byte) 四元组。点数 <2 或
+    自变量全同（分母为 0）时返回 None——这两种情况拟不出模型，调用方必须
+    明说，不能拿一个假的结论顶替。
+    截距与斜率都被夹到 ≥0：负的固定项或负的每字节成本在物理上不成立，
+    宁可将该侧报成 0（即退化成另一个极端模型），也不要输出负数。
+    """
+    n = len(pts)
+    if n < 2:
+        return None
+    sx = sum(p[1] for p in pts)
+    sy = sum(p[2] for p in pts)
+    sxx = sum(p[1] * p[1] for p in pts)
+    sxy = sum(p[1] * p[2] for p in pts)
+    denom = n * sxx - sx * sx
+    if denom == 0:
+        return None
+    per_byte = (n * sxy - sx * sy) / denom
+    fixed = (sy - per_byte * sx) / n
+    return max(fixed, 0.0), max(per_byte, 0.0)
+
+
+def StreamDeadlinePrediction(fixed_ms, per_byte_ms,
+                             pack_bytes=kStreamPackBytes,
+                             deadline_ms=kStreamDeadlineMs,
+                             chunk_options=None,
+                             commit_ms=None,
+                             commit_file_bytes=None):
+    """用拟合出的 F/s 算「这个包能不能在 deadline 内下完」，返回给人读的一句结论。
+
+    关键是把 **每字节地板**（分片无穷大时的总耗时）单独算出来：固定项可以靠
+    加大分片压掉，每字节项压不掉。地板若已贴近 deadline，那么"加大分片"这条
+    路本身就到头了——这与"32 KB 就是修法"是完全相反的施工结论，必须显式写出来。
+
+    `chunk_options` 是 [(标签, 分片字节), ...]，对每个分片假设各算一行。
+    WHY 它是个列表而不是一个数：`kStreamChunkUnderTest` 是**正在验证的提案值**，
+    不是当前构建的真实值。1005.26 第一次从真实下载里量到 chunk_bytes 中位
+    6,140 B（n=261，mode 落在 6000–6999 那一档），而判据一直只印"32K 分片需
+    41 笔"——把提案值当成了现状。41 笔 vs 218 笔差 5.3×，正是对端说的
+    "1.22×~5.7× 歧义"中的大端。所以两个值都要印，并标明各自是什么。
+
+    `commit_ms` / `commit_file_bytes` 是 kCommit 的实测：wp-stream 下载结束时要
+    付一次 `fflush+fsync+fclose+remove(旧包)+rename`（word_pack.cpp:1309-1324），
+    那是 1.28 MiB 对象上的一次 AtomicWrite 级提交。三个成本模型都没有这一项——
+     F × n + s × 字节 覆盖的是 kAppend，不含 kCommit。
+    ⚠️ 1005.15 **没有这项实测**：下载在 20.8% 处超时，kCommit 从未执行。本轮
+    bench 会给一个点，但那是在 ramp 累计 62 KB 的文件上；外推到 1.28 MiB 是
+    ~21×，线性外推（fflush/fsync 大致随脏页数走）只是一个量级估计。
+    所以外推倍数 >4 时判据必须明说这是量级估计，不能当预测用。
+    """
+    per_byte_total = per_byte_ms * pack_bytes
+
+    def fmt(ms):
+        return f'{ms / 1000:.1f} s'
+
+    per_option = []
+    for label, chunk_bytes in chunk_options:
+        n = -(-pack_bytes // max(chunk_bytes, 1))  # ceil
+        per_option.append((label, chunk_bytes, n,
+                           fixed_ms * n + per_byte_total))
+
+    # --- kCommit 项 -------------------------------------------------------
+    # 只加能算的那部分：commit_file_bytes 未知时无法外推，只能原样报出并说明
+    # 它没有被计入总数——把未测项静默算成 0 比报"差一项"危险得多。
+    # 而 commit_ms **低于计时分辨率**时比"未知"更糟：0 × 21.1 = 0 会生成一个
+    # 看起来很精确的"kCommit ≈0.0 s"，听着像"这项免费"。真实代价见
+    # STREAM:download-within-deadline（1005.19 的收尾一笔 15,327 ms）。
+    commit_note = ''
+    commit_total = 0.0
+    if commit_ms is not None and commit_file_bytes \
+            and commit_ms >= kStreamCommitResolutionMs:
+        factor = pack_bytes / commit_file_bytes
+        commit_total = commit_ms * factor
+        if factor > 4.0:
+            commit_note = (
+                f'；kCommit 实测 {commit_ms:.0f} ms 是在 {commit_file_bytes // 1024} KiB '
+                f'文件上，外推 {factor:.1f}× 到 {pack_bytes // 1024} KiB ⇒ '
+                f'≈{fmt(commit_total)}（**外推，仅量级估计，非预测**）')
+        else:
+            commit_note = (
+                f'；kCommit {commit_ms:.0f} ms（{commit_file_bytes // 1024} KiB '
+                f'文件，外推 {factor:.1f}×）⇒ ≈{fmt(commit_total)}')
+    elif commit_ms is not None and commit_file_bytes:
+        commit_note = (
+            f'；kCommit 实测 {commit_ms:.0f} ms 在 {commit_file_bytes // 1024} KiB '
+            f'文件上 = **低于 ms 计时分辨率，未实测**，不计入总数。别把它读成'
+            f'"这项免费"——1005.19 里 1.34 MiB 的真实收尾是 15,327 ms')
+    elif commit_ms is not None:
+        commit_note = f'；kCommit 实测 {commit_ms:.0f} ms（文件大小未知，未计入总数）'
+
+    # 分片加到无穷大时的总耗时：kAppend 只剩一笔，所以固定项只付一次，
+    # 不是一次都不付。漏掉 fixed_ms 会让地板在小 F 时偏一点、大 F 时偏很多。
+    floor_total = fixed_ms + per_byte_total + commit_total
+
+    # 每个分片假设各印一行。grand/append_total 取**分片最大**的那个（最乐观），
+    # 因为调用方要判断"只看 kAppend 会得出尚有余量的结论"——只有最乐观那档才配
+    # 谈"余量"，用小分片的数字去谈余量是把悲观值当乐观用。
+    grand = per_option[-1][3] + commit_total
+    append_total = per_option[-1][3]
+    parts = [f'套到 {pack_bytes // 1024} KiB 词包（deadline {deadline_ms // 1000} s）']
+    for label, chunk_bytes, n, tot in per_option:
+        parts.append(f'{label} ⇒ {n} 笔 kAppend、共 {fmt(tot)}')
+    if commit_note:
+        parts.append(commit_note[1:])  # 去掉开头的'；'
+    if grand <= deadline_ms:
+        parts.append(
+            f'合计 {fmt(grand)}，余量 {fmt(deadline_ms - grand)} ⇒ 够')
+    else:
+        # "分片加到无穷也救不回来"的判据必须是 **floor_total 本身** 超 deadline，
+        # 不能用 deadline - per_byte - commit：那个量漏掉了固定项，而分片无穷大时
+        # kAppend 仍要付一笔 F。漏掉它时，地板只超 deadline 一点点的情形会被算成
+        # "需要 ≥6 MB 分片"——听着像有解，其实无解。
+        if floor_total >= deadline_ms:
+            parts.append(
+                f'合计 {fmt(grand)} 已超 deadline {fmt(grand - deadline_ms)}，'
+                f'且每字节 + kCommit 地板 {fmt(floor_total)} 本身就超 deadline '
+                f'⇒ 分片加到无穷也救不回来')
+        elif floor_total >= deadline_ms * 0.90:
+            need = fixed_ms * pack_bytes / (deadline_ms - floor_total)
+            parts.append(
+                f'合计 {fmt(grand)}，超 deadline {fmt(grand - deadline_ms)}；'
+                f'每字节 + kCommit 地板 {fmt(floor_total)} 已吃掉 deadline 的 '
+                f'{floor_total / deadline_ms:.0%} ⇒ 分片这条路没有可用余量'
+                f'（数学上需 ≥{need / 1024:.0f} KB 分片，实际不可行）')
+        else:
+            need = fixed_ms * pack_bytes / (deadline_ms - floor_total)
+            parts.append(
+                f'合计 {fmt(grand)}，超 deadline {fmt(grand - deadline_ms)}；'
+                f'每字节 + kCommit 地板 {fmt(floor_total)}'
+                f'（余量 {fmt(deadline_ms - floor_total)}）'
+                f' ⇒ 需要 ≥{need / 1024:.0f} KB 分片才进 deadline')
+    # 返回 grand 与 append_only 两项，调用方要判断"kCommit 是否把结论翻了过来"
+    return '；'.join(parts), grand, append_total
+
+
+def cluster_gap(walls):
+    """按最大**相对**间隙把样本切簇，返回 [(lo, hi, n), ...] 升序。
+
+    追加写在 SPIFFS 上的代价是双峰的：便宜那档是往已打开句柄追加（几毫秒到几十
+    毫秒），贵的那档踩到对象创建 / backup 轮换 / GC（几百到上千毫秒）。两档各占
+    一半而 n 只有 4 时，**中位数落在两档之间的空隙里**，既不是便宜档也不是贵档的
+    代价——而空隙的位置随哪个便宜样本更大而漂移，于是同一组现象在两次 HIL 上给出
+    差 2.6× 的"中位数"（1005.19 的 541 / 1005.24 的 216，原始样本几乎一样）。
+
+    所以调用方必须先切簇：单峰才谈中位数，多峰就报各档、并拒绝拿中位数下结论。
+    间隙按**相对值**算（相邻两个样本的比值），否则 10 ms 与 400 ms 之间的绝对差
+    会被 1400 ms 与 1447 ms 之间的差压过去。
+    返回至少一档；样本少于 2 个时也只有一档。
+    """
+    if not walls or len(walls) < 2:
+        return [(min(walls) if walls else 0, max(walls) if walls else 0,
+                 len(walls) if walls else 0)]
+    xs = sorted(walls)
+    best, best_i = 0.0, 0
+    for i in range(1, len(xs)):
+        gap = (xs[i] - xs[i - 1]) / xs[i - 1] if xs[i - 1] else float('inf')
+        if gap > best:
+            best, best_i = gap, i
+    # 间隙要足够大才认为真是两档：小于 2×（100%）当噪声，否则 21/23 这种正常
+    # 抖动也会被切成两档，反而把单峰数据也变成"不予裁决"。
+    if best < 1.0:
+        return [(xs[0], xs[-1], len(xs))]
+    return ([(xs[0], xs[best_i - 1], best_i)]
+            + cluster_gap(xs[best_i:]))
 
 
 @dataclass
@@ -117,6 +433,17 @@ class Log:
     probes: list = field(default_factory=list)
     bench_events: list = field(default_factory=list)
     rounds: list = field(default_factory=list)
+    stream_rounds: list = field(default_factory=list)
+    stream_commit: list = field(default_factory=list)
+    stream_abort: list = field(default_factory=list)
+    read_buffers: list = field(default_factory=list)
+    downloads: list = field(default_factory=list)
+    failures: list = field(default_factory=list)
+    done: list = field(default_factory=list)
+    http_err: list = field(default_factory=list)
+    appends: list = field(default_factory=list)
+    obs_durable: list = field(default_factory=list)
+    pack_line_count: int = 0
     boots: int = 0
     leases: list = field(default_factory=list)
 
@@ -139,6 +466,50 @@ class Log:
         log.rounds = [{k: (v if k in ('shape', 'result') else int(v))
                        for k, v in m.groupdict().items()}
                       for m in BENCH_ROUND_RE.finditer(text)]
+        log.stream_rounds = [{k: (v if k == 'result' else int(v))
+                              for k, v in m.groupdict().items()}
+                             for m in BENCH_STREAM_ROUND_RE.finditer(text)]
+        log.stream_commit = [commit_cost_ms(m.groupdict())
+                             for m in BENCH_STREAM_COMMIT_RE.finditer(text)]
+        log.stream_abort = [{k: int(v) for k, v in m.groupdict().items()}
+                            for m in BENCH_STREAM_ABORT_RE.finditer(text)]
+        log.read_buffers = [int(m.group('bytes'))
+                            for m in WORD_PACK_READ_BUFFER_RE.finditer(text)]
+        log.downloads = [{k: (v if k == 'url' else int(v))
+                          for k, v in m.groupdict().items()}
+                         for m in WORD_PACK_START_RE.finditer(text)]
+        log.failures = []
+        log.done = []
+        for m in WORD_PACK_END_RE.finditer(text):
+            d = {'t': int(m.group('t')), 'what': m.group('what'),
+                 'err': m.group('err')}
+            for kv in KV_RE.finditer(m.group('body')):
+                key, val = kv.group('k'), kv.group('v')
+                # 同一个 key 在新旧格式里叫不同的名字，归一到一套：
+                #   完成字节数  plain= / bytes= / received=
+                #   wire 字节数 wire= / received=
+                #   文件名/URL 不是数字，原样留下
+                try:
+                    d[key] = int(val)
+                except ValueError:
+                    d[key] = val
+            for old, new in (('plain', 'plain'), ('bytes', 'plain'),
+                             ('received', 'wire')):
+                if new not in d and old in d:
+                    d[new] = d[old]
+            (log.failures if d['what'] == 'failed' else log.done).append(d)
+        log.http_err = [{k: int(v) for k, v in m.groupdict().items()}
+                        for m in WORD_PACK_HTTP_RE.finditer(text)]
+        # 真实下载路径 kAppend：chunk_bytes 是这一轮之前谁也不掌握的那个数。
+        log.appends = [{'t': int(m.group('t')), 'chunk': int(m.group('chunk')),
+                        'total': int(m.group('total')), 'want': int(m.group('want'))}
+                       for m in WORD_PACK_APPEND_RE.finditer(text)]
+        # 真实流量侧的追加写：用来看 bench 的双峰是不是我们自己量测造出来的。
+        log.obs_durable = [{'t': int(m.group('t')), 'append': int(m.group('append')),
+                            'total': int(m.group('total'))}
+                           for m in WORD_OBS_DURABLE_RE.finditer(text)]
+        # 格式漂移：有 word-pack-download 行，但没有一条 end 行被解析出来。
+        log.pack_line_count = len(WORD_PACK_LINE_COUNT_RE.findall(text))
         log.boots = text.count('opened COM') or text.count('End of partition table')
         log.leases = [{k: (v if k in ('blocker', 'holder', 'tag') else int(v))
                       for k, v in m.groupdict().items()}
@@ -346,6 +717,27 @@ def hil_c8_page_save(log: Log):
         worst_qw = max((qw(t) for t in commits), default=0)
         expect(log, 'C8:commit-not-blocked-by-page-save', worst_qw < 1000,
                f'答题提交最大 queue_wait={worst_qw}ms（C8 回归判据：应 <1s）')
+        # --- C8 的原判据会自己变成瞎的，这里补第二把尺子 -------------------
+        # WHY: `word-observation-commit` 的 queue_wait 量的是"提交有没有排在
+        # 会话保存后面"，而用户看见的卡顿是**保存本身多久**。1005.26 上
+        # queue_wait 3,870 ms（FAIL），1006.1 上 689 ms（PASS）——可 `word-session-save`
+        # 的 elapsed 两轮都是 4.7 s。原判据转绿是因为提交换了时机，不是因为
+        # 4 s 消失了。把"提交不堵"当成"保存不慢"，正是把我的判据量错了对象。
+        # 历史 elapsed（同一形状、同一批日志）：5398 / 4169~5210 / 4512~5383 /
+        # 4853~5913 / 4747、4714 —— **六轮 4.1–5.9 s，一次都没动过**。
+        # 所以这里**不设新的目标门禁**（会变成一条每轮都红的判据，训练所有人
+        # 忽略红色），只做两件事：把数字和文档目标 p90<200 ms 的差距如实报出来，
+        # 以及在超过历史最差值（5,913 ms）时当回归拦下来。
+        save_el = [el(t) for t in saves]
+        worst_el = max(save_el, default=0)
+        med_el = statistics.median(save_el) if save_el else 0
+        expect(log, 'C8:session-save-elapsed-not-regressed', worst_el <= 6000,
+               f'word-session-save elapsed 中位 {med_el:.0f} ms / 最大 {worst_el} ms'
+               f'（n={len(save_el)}）。⚠️ **这不是 C8 的功劳计量，是用户的真实等待**：'
+               f'六轮日志 4.1–5.9 s 一次都没降过，而上面那条 queue_wait 判据已经转绿——'
+               f'绿的是"提交不再排在保存后面"，**不是"保存变快了"**。'
+               f'文档目标 p90<200 ms，当前差 {med_el / 200:.0f}×。'
+               f'（阈值 6000 ms = 历史最差 5913，只拦回归，不当目标门禁）')
     if not saves and merged:
         expect(log, 'C8:merge-path-works', True, '走合并路径（预取白做）且无写盘')
     if not saves and not merged:
@@ -423,7 +815,11 @@ def hil_storage_bench(log: Log):
       3. bench 有没有反过来拖累别人（它自己的入队等待）
     """
     bench_tx = log.txof('storage-bench')
-    if not log.rounds and not log.probes and not bench_tx:
+    # stream ramp 也算 bench 的一部分：它既不打 `atomic write:` 行（那是
+    # AtomicWrite 专属），也不打 `storage bench round: shape=` 行（那是按 shape
+    # 记 wall_ms 的轮次行），所以只看 rounds/probes/bench_tx 会在"本轮只跑了
+    # stream shape"时提前 return，把第 5 节整节静默跳过——判据不叫不是通过。
+    if not log.rounds and not log.probes and not log.stream_rounds and not bench_tx:
         skip(log, 'BENCH:ran', '本轮无 storage bench（未跑 P1 量测构建）')
         return
     expect(log, 'BENCH:completed',
@@ -458,12 +854,39 @@ def hil_storage_bench(log: Log):
     # 完全一样。单看 probe/cur 比值会给出 0.62 → "底价成立，按缩短扫描长度施工"
     # 的绿灯，而那恰好是这份日志证伪的方向。所以这里显式判一次，并推翻 2b。
     # 用 cur*（最小载荷的 AtomicWrite）作分母，是为了把"载荷差异"这个辩解拿走。
+    #
+    # ⚠️ 但 append shape 本身在 SPIFFS 上是**双峰**的，n=4 时中位数没有意义：
+    # 便宜档 ~10–40 ms（往已打开句柄追加），贵档 ~400–1500 ms（踩到对象创建/GC）。
+    # 两峰各占一半时，中位数落在**两峰之间的空隙里**，而空隙位置随哪个便宜样本
+    # 更大而漂移——1005.12 的贵档最小 410 → 中位 216、1005.24 同一现象 216、
+    # 1005.19 贵档最小 1042 → 中位 541。**同一组现象，"中位数"差 2.6×**，于是
+    # 1005.19 判"按缩短扫描长度施工"、1005.24 判"改追加/日志结构"，而 append 的
+    # 原始样本几乎一模一样。这是判据对自己的实验喊狼来了，且两次喊的方向相反。
+    # 现在：双峰就判"数据不足"，并说清补测什么，绝不拿空隙里的中位数下施工结论。
     cur_med = min((statistics.median(w) for s, w in by_shape.items()
                    if s.startswith('cur')), default=None)
-    append_med = min((statistics.median(w) for s, w in by_shape.items()
-                      if 'append' in s), default=None)
+    append_walls = next((w for s, w in sorted(by_shape.items())
+                         if 'append' in s), None)
+    append_clusters = cluster_gap(append_walls) if append_walls else None
+    append_bimodal = bool(append_clusters and len(append_clusters) > 1)
+    append_med = (min(statistics.median(w) for s, w in by_shape.items()
+                      if 'append' in s) if append_walls else None)
     append_refutes = None
-    if cur_med and append_med:
+    append_indeterminate = None
+    if append_bimodal:
+        spread = max(append_walls) / min(append_walls) if min(append_walls) else float('inf')
+        append_indeterminate = (
+            f'追加 shape 的 {len(append_walls)} 笔分裂成多档：'
+            + ' / '.join(f'{a:.0f}~{b:.0f} ms (n={n})'
+                         for a, b, n in append_clusters)
+            + f'，最贵与最便宜差 {spread:.0f}×。n={len(append_walls)} 且两档各占一半时'
+            f'**中位数落在两档之间的空隙里，它既不是哪一档的代价**（空隙位置随哪个'
+            f'便宜样本更大而漂移，历史上因此差出 2.6×），所以拿它和 cur* 比 '
+            f'{cur_med:.0f} ms 得出的倍数是个噪声比值，不能当施工依据。'
+            f'便宜档已证明"追加本身可以很便宜"，贵档证明"它有时不是"——'
+            f'**这恰是重写要回答的问题，不是答案**。补测：把 append shape 的 '
+            f'rounds 提到 ≥12（两档都能拿到足够的 n），并给每笔记下是否新建对象')
+    elif cur_med and append_med:
         ratio = cur_med / append_med if append_med else float('inf')
         if append_med < 20.0:
             append_refutes = (
@@ -476,7 +899,53 @@ def hil_storage_bench(log: Log):
                 f'（{ratio:.1f}×，页数相同）。差额就是 temp 创建与 backup 轮换，'
                 f'"缩短扫描长度"只解释其中一小部分')
 
-    if 'probe' in by_shape:
+    # 追加档的证据先判，且**不依赖 probe 那一支**：它量的是写路径本身，比
+    # probe/cur 比值更直接。以前它被塞在 `if 'probe' in by_shape` 里，一旦某轮
+    # 没跑 probe 追加档就被完全跳过——那是把最硬的一条证据变成可选项。
+    if append_indeterminate:
+        # 判 FAIL 而不是 SKIP：这正是"数据不足却给出施工结论"的那种情形，
+        # SKIP 会让判据在什么都没测到的情况下报绿（并让上游以为已裁决）。
+        probe_note = ''
+        if 'probe' in by_shape and by_shape['probe']:
+            probe_note = (f'（probe/cur 比值也无法裁决：它量的是"未命中走查 vs '
+                          f'一笔写"，不是"成本在不在对象创建"。）')
+        # 真实流量侧的追加写：这是判据唯一能分辨"双峰是 bench 造出来的"还是
+        # "产品自己就是双峰"的地方。bench 逐轮换 shape、持租约、排队，它的双峰
+        # 有可能全是我们自己的量测方式造成的；`word observation durable:` 是产品
+        # 自己在答题路径上打的，没有 bench 的那些因素。1005.26 上它同样双峰
+        # （6~15 ms ×7 / 365~433 ms ×3），与 bench 的 31 / 1308~2149 同形。
+        # 这条把"bench 数据不够"升级成"产品行为如此"——后者不是补测能消除的，
+        # 是重写必须解决的东西。
+        real_note = ''
+        if log.obs_durable:
+            rc = cluster_gap([o['append'] for o in log.obs_durable])
+            if len(rc) > 1:
+                real_note = (
+                    f'⚠️ **真实流量侧同样是双峰**（`word observation durable:` '
+                    f'append_ms：'
+                    + ' / '.join(f'{a:.0f}~{b:.0f} ms (n={n})' for a, b, n in rc)
+                    + f'），所以双峰**不是 bench 的量测假象**，是这条路径本身'
+                    f'的行为——补测 bench rounds 不能消除它，重写要正面处理'
+                    f'"便宜簇＋贵约百倍的簇"这件事')
+            else:
+                lo, hi, n = rc[0]
+                real_note = (f'（真实流量侧本轮是单峰：append_ms {lo:.0f}~{hi:.0f} ms '
+                             f'n={n}，所以 bench 的双峰**可能**是量测假象，'
+                             f'这一条仍要靠补测定夺）')
+        expect(log, 'BENCH:floor-model-holds', False,
+               f'追加 shape 双峰，{append_indeterminate}。'
+               f'本轮**不予裁决**，不要照任何一版中位数定施工方向。{probe_note}{real_note}')
+    elif append_refutes:
+        # 追加证据优先：它比 probe/cur 比值更直接地量到了写路径本身。
+        # 这条曾经是绿的（1005.7 也是绿的），因为判读器只比较了 probe 与
+        # cur，看不见"同一文件系统上追加写只要 8 ms"这一档。
+        expect(log, 'BENCH:floor-model-holds', False,
+               f'底价模型被推翻（追加侧证据）：{append_refutes}。'
+               f'施工方向改为"消除对象创建与 backup 轮换，改追加/日志结构"')
+
+    # 追加档已裁决时，probe 支不再下第二个 verdict：同一条判据对同一份数据出两个
+    # 结论，会把一次 FAIL 数成两次；而且 probe/cur 说明不了"成本在不在对象创建"。
+    if not (append_indeterminate or append_refutes) and 'probe' in by_shape:
         probe_med = statistics.median(by_shape['probe'])
         per_op = None
         for shape, walls in by_shape.items():
@@ -489,15 +958,7 @@ def hil_storage_bench(log: Log):
             skip(log, 'BENCH:floor-model-holds', '有 probe 但没有可折算单次 op 成本的写 shape')
         else:
             ratio = per_op / probe_med if probe_med > 0 else float('inf')
-            if append_refutes:
-                # 追加证据优先：它比 probe/cur 比值更直接地量到了写路径本身。
-                # 这条曾经是绿的（1005.7 也是绿的），因为判读器只比较了 probe 与
-                # cur，看不见"同一文件系统上追加写只要 8 ms"这一档。
-                verdict = (f'底价模型被推翻（追加侧证据）：{append_refutes}。'
-                           f'（probe/cur 比值 {ratio:.2f} 落在 0.4~2.5 内，但那是因为'
-                           f'probe 量的是"未命中走查"，不是"一笔完整写"。）'
-                           f'施工方向改为"消除对象创建与 backup 轮换，改追加/日志结构"')
-            elif probe_med < 20.0:
+            if probe_med < 20.0:
                 verdict = (f'底价模型被推翻：纯查找只花 {probe_med:.0f} ms，而写入侧单次 op '
                            f'≈{per_op:.0f} ms（比值 {ratio:.1f}）。成本不在元数据扫描上，'
                            f'"减少页数/减少 op"这个方向不成立，必须重推根因再动重写')
@@ -512,9 +973,16 @@ def hil_storage_bench(log: Log):
                            + ('；本轮无追加 shape，未覆盖"成本是否在对象创建"' if append_med is None else ''))
             expect(log, 'BENCH:floor-model-holds', bool(verdict.startswith('底价模型成立')),
                    verdict)
-    detail = '；'.join(
-        f'{shape} 中位 {statistics.median(w):.0f} ms (n={len(w)})'
-        for shape, w in sorted(by_shape.items()))
+    # 双峰 shape 不印中位数——那个数落在两峰空隙里，印出来只会被当成某一档的
+    # 代价引用（本轮就被引用过一次，结论完全相反）。
+    def shape_desc(shape, walls):
+        cl = cluster_gap(walls)
+        if len(cl) > 1:
+            return (f'{shape} **双峰** ' + ' / '.join(
+                f'{a:.0f}~{b:.0f} ms (n={n})' for a, b, n in cl))
+        return f'{shape} 中位 {statistics.median(walls):.0f} ms (n={len(walls)})'
+
+    detail = '；'.join(shape_desc(s, w) for s, w in sorted(by_shape.items()))
     if detail:
         check(log, 'BENCH:shape-costs', 'PASS', True, detail)
 
@@ -545,7 +1013,8 @@ def hil_storage_bench(log: Log):
                f'告警出现在其后（最晚一条 held_ms={worst["held"]}，'
                f'日志时钟 {worst["at_ms"]} ms）⇒ 租约没还，深睡被永久挡住')
 
-    # --- 4. bench 不能把真实流量弄丢 ---------------------------------------    # 第一条写法是错的，被重写侧指出后改掉：bench 是 20 笔串行事务，第 N 笔的
+    # --- 4. bench 不能把真实流量弄丢 ---------------------------------------
+    # 第一条写法是错的，被指出后改掉：bench 是 20 笔串行事务，第 N 笔的
     # queue_wait 就是前 N-1 笔的累计 elapsed——按我们自己的模型 3 KB 那档单笔
     # 1.4~2 s，后几笔必然 >2 s，且那正是 bench 自己造成的。判 bench 自己的
     # queue_wait 恒红，等于让判读器对"我们设计的实验"喊狼来了。
@@ -575,6 +1044,648 @@ def hil_storage_bench(log: Log):
             if other:
                 detail += f'；另有 {len(other)} 笔返回非 OK 的空结果（{other[0]["res"]} 等）'
             expect(log, 'BENCH:real-traffic-survived', not lost, detail)
+
+    # --- 5. stream ramp：每笔成本按次收，还是按字节收 -----------------------
+    # WHY THIS EXISTS: 1005.15 的"106× 异常"是判读器侧的量法错误——那个
+    # write_ms=15 取自 `AtomicWriteProbe::AfterWrite()`，而 `AfterWrite()` 在
+    # fwrite+fflush+fsync+fclose **全部**之后才调用（word_study_store.cpp:477-480），
+    # 所以 15 ms 是这几个动作合计的子字段；它所属事务的 total_ms 中位是 1500 ms
+    # （fopen 1089 + write 15 + rename 358，子字段闭合）。用全量比全量：
+    # session3k-direct 500 ms/KB vs wp-stream 517 ms/KB，差 1.03×。
+    # 没有异常，所以这条判据不负责解释那个差距。
+    # 顺带一个方向性更强的推论：AtomicWrite **付了** fsync 仍比**不付** fsync 的
+    # wp-stream 每字节便宜 6 倍，所以 6.2× 不能归咎于"wp-stream 省掉了 fsync"。
+    # 它负责的是另一个真正没解释的事实：kAppend 只做 fwrite + sha256，全程
+    # 一个句柄、只在 kCommit fsync 一次，可每笔仍要 ~890 ms，且 elapsed 是三峰
+    # （13 笔 5–50 ms / 52 笔 ~470 ms / 104 笔 ~890 ms）。这个 ramp 就是拿
+    # 分片大小当自变量，把那两种收费方式分开。
+    # FAIL 的语义只有一种：**ramp 退化，这份日志分辨不出结论**。判出 H1 或 H2
+    # 都是 PASS + 结论写进 detail——它们是施工决策的输入，不是设备好坏。
+    if not log.stream_rounds:
+        skip(log, 'BENCH:stream-cost-model',
+             '本轮无 stream shape（旧 bench 的单一 32 KB 尺寸不构成 ramp）')
+    else:
+        # 超预算那一笔的 cost 是预算本身（下界），不是实测成本，但它仍然算数：
+        # H2 下超预算的正是大分片那几轮，abort 就是 H2 最强的证据。
+        aborted = {a['round']: a for a in log.stream_abort}
+        pts = []
+        for r in sorted(log.stream_rounds, key=lambda r: r['chunk']):
+            cost = r['cost']
+            if cost <= 0:
+                cost = aborted.get(r['round'], {}).get('cost', 0)
+            if cost > 0:
+                pts.append((r['round'], r['chunk'], cost, cost / r['chunk']))
+        sizes = sorted({p[1] for p in pts})
+
+        # 退化守卫：单一尺寸上 H1 和 H2 的预测完全重合（1719 B 时都预测
+        # 890 ms / 517 ms/KB）， ramp 一旦退化，每字节成本之比会恒等于 1，
+        # 判读器会自信地报出一个"H2 成立"的绿灯——而它什么都没测。
+        # 这一类错误（被证伪的模型读出 PASS）在这份判读器里已经错过两次。
+        if len(sizes) < 3 or (sizes[-1] // max(sizes[0], 1)) < 4:
+            expect(log, 'BENCH:stream-cost-model', False,
+                   f'ramp 退化：只测到 {[s // 1024 for s in sizes]} KB'
+                   f'（需要 ≥3 个尺寸且跨度 ≥4×）。H1 与 H2 在单一尺寸上是'
+                   f'退化的，这份日志无法分辨，不要据它下结论')
+
+        # kCommit 必须跑到：只有 round 行没有 commit 行，说明句柄没关，
+        # 也正是 bench 之外 wp-stream 失败时要丢数据的那条路径。
+        if log.stream_rounds and not log.stream_commit:
+            expect(log, 'BENCH:stream-kcommit-closed', False,
+                   f'{len(log.stream_rounds)} 笔 stream round，但没有 '
+                   f'`storage bench stream commit:` ⇒ kCommit 没跑到，'
+                   f'跨轮持有的句柄没有 fflush+fsync+fclose（wp-stream 的 '
+                   f'kCommit 走的是同一段代码）')
+        else:
+            commit = log.stream_commit[-1]
+            # aborted=1 只说明 ramp 被 6 s 预算截短，句柄仍然被 fflush+fsync+
+            # fclose 了（result=ESP_OK 就是证据）。把它判成 FAIL 等于对"我们
+            # 自己设计的实验"喊狼来了——而这个判读器已经犯过三次同类错误。
+            # 真正要抓的只有"没有 commit 行"（句柄泄漏）和"commit 自己失败"。
+            cost = commit['cost_ms']
+            unres = (f'（**低于计时分辨率，未实测**——1005.19 在这个尺度上量到 0，'
+                     f'而 1.34 MiB 上真实的收尾是 15,327 ms）'
+                     if cost < kStreamCommitResolutionMs else '')
+            detail = (f'kCommit fflush+fsync+fclose {cost:.1f} ms{unres} '
+                      f'result={commit["result"]}'
+                      + (f'（ramp 被 6 s 预算提前收尾，后几轮未测；'
+                         f'这正是 H2 下该发生的事）' if commit['aborted'] else ''))
+            expect(log, 'BENCH:stream-kcommit-closed',
+                   commit['result'] == 'ESP_OK', detail)
+
+        if len(sizes) >= 3 and (sizes[-1] // max(sizes[0], 1)) >= 4 and pts:
+            # 最小/最大两端比：H1 预测 = 分片跨度（成本固定 ⇒ 每字节 ∝ 1/bytes），
+            # H2 预测 = 1（成本 ∝ bytes ⇒ 每字节恒定）。两端比不需要拟合，是模型
+            # 的直接推论，拿它当第二个读数与拟合互相印证。
+            small, big = pts[0], pts[-1]
+            spread = small[3] / big[3] if big[3] > 0 else float('inf')
+            table = '；'.join(
+                f'{c // 1024}K→{cost}ms（{pb:.3f} ms/B'
+                + ('，超 6s 预算，cost 为下界' if rnd in aborted else '') + '）'
+                for rnd, c, cost, pb in pts)
+
+            # --- 最小二乘 cost = F + s×bytes，然后用它算 deadline -------------
+            # WHY: "每笔固定"与"每字节计费"是两种极端，真实形态大概率在中间
+            # （AtomicWrite 拟出来就是 F≈1243/1964 ms + s≈0.084 ms/byte，
+            # 截距差 721 ms ≈ 实测 backup 轮换 719 ms，自洽）。中间态下的施工
+            # 结论与两个极端都相反——32 KB 分片不够，而且加大分片有地板——
+            # 所以不能只贴一个模型名放过去，必须把数算出来。
+            fit = StreamFit(pts)
+            if fit is None:
+                verdict = ('ramp 点数不足以拟合，拟不出固定项/每字节项。'
+                           '两端比 ' + f'{spread:.1f}×' + ' 可作参考')
+            else:
+                fixed, per_byte = fit
+                # kCommit 的实测值，以及它作用在多大的文件上。文件大小必须取
+                # **最后执行的那一轮的 file_bytes**（日志里的累计量）：abort 时
+                # 提交发生在被截断处，不是发生在最大分片那一轮。错用最后一轮的
+                # chunk_bytes（32K）会把外推倍数从 21× 说成 41×，方向就偏了。
+                commit = log.stream_commit[-1] if log.stream_commit else None
+                commit_file = None
+                if commit is not None and log.stream_rounds:
+                    commit_file = max(r['file'] for r in log.stream_rounds)
+                # 分片假设要分两行印：**当前构建实测值**和**正在验证的提案值**。
+                # WHY: kStreamChunkUnderTest 是提案值（P1b-B 要回答"32 KB 够不
+                # 够"），判据曾经只印它，于是 1005.26 之前每一份日志都在用
+                # "32K 分片需 41 笔"描述一条实际跑 6 KB 分片的路径。真实值是
+                # 1005.26 才第一次量到的：`word pack stream append: chunk_bytes=`
+                # 中位 6,140 B（n=261），41 vs 218 笔差 5.3×。提案值不是现状，
+                # 不印现状就等于把提案当成了事实。
+                chunk_options = []
+                if log.appends:
+                    real = statistics.median(a['chunk'] for a in log.appends)
+                    chunk_options.append(
+                        (f'当前构建实测分片中位 {real / 1024:.1f} KB'
+                         f'（n={len(log.appends)} 次 kAppend）', int(real)))
+                chunk_options.append(
+                    (f'提案值 {kStreamChunkUnderTest // 1024} KB 分片',
+                     kStreamChunkUnderTest))
+                pred, grand_ms, append_only_ms = StreamDeadlinePrediction(
+                    fixed, per_byte,
+                    chunk_options=chunk_options,
+                    # 取归一后的 cost_ms，不是原始 cost：对端后来把字段从
+                    # cost_ms 改成了 cost_us，1005.28 是 cost_us=1250918，
+                    # 直接拿原始值会打印"kCommit 实测 1250918 ms"——把 1.25 s
+                    # 说成 20 分钟，还把外推结论放大 1000 倍。
+                    # commit_cost_ms() 已经按单位归一，下游只该看 cost_ms。
+                    commit_ms=commit['cost_ms'] if commit else None,
+                    commit_file_bytes=commit_file)
+                fixed_share = (fixed / (fixed + per_byte * big[1])
+                               if (fixed + per_byte * big[1]) > 0 else 0.0)
+                if per_byte <= 0:
+                    model = (f'H1 成立（拟合不出每字节项，成本全是固定项）：'
+                             f'每笔 ≈{fixed:.0f} ms')
+                elif fixed <= 0:
+                    model = (f'H2 成立（拟合不出固定项，成本全是每字节项）：'
+                             f'每字节 {per_byte:.4f} ms')
+                else:
+                    model = (f'混合模型成立：固定项 ≈{fixed:.0f} ms/笔 + '
+                             f'每字节 {per_byte:.4f} ms/B'
+                             f'（{big[1] // 1024}K 那一笔里固定项占 '
+                             f'{fixed_share:.0%}）')
+                # --- 拿真实下载直量校准模型，而不是只让模型自洽 -------------
+                # WHY: bench 的 stream shape 与真实 kAppend **不是**同一条代码
+                # 路径——bench 跨轮持有 `FILE* g_bench_stream`，所以它拟合出的
+                # 固定项天然不含 fopen；而 `atomic write:` 探针量到 fopen 占
+                # 42.5%、rename 18.1%、stat 10.0%、remove 8.9%
+                # （= 非写入 88.3%），真数据 write 只占 11.7%。
+                # 只看 bench 自洽会把"成本在不在对象创建"这个问题量漏。
+                # 1005.26 第一次同时有 bench ramp + 真实完成的下载，所以这是
+                # 第一次能拿真实路径的每笔成本反过来校模型——必须做。
+                agree = ''
+                direct = ''
+                real_tx = [t for t in log.txof('wp-stream') if el(t) > 0]
+                if log.appends and real_tx:
+                    measured = statistics.median(el(t) for t in real_tx)
+                    real_chunk = statistics.median(a['chunk'] for a in log.appends)
+                    predicted = fixed + per_byte * real_chunk
+                    ratio = measured / predicted if predicted > 0 else float('inf')
+                    direct = (f'；真实下载直量校准：{len(real_tx)} 笔 wp-stream '
+                              f'elapsed **中位** {measured:.0f} ms，模型在同分片'
+                              f'（{real_chunk / 1024:.1f} KB）下预测 '
+                              f'{predicted:.0f} ms ⇒ 实测/预测 {ratio:.2f}×'
+                              f'（姊妹判据 STREAM:append-chunk-measured 报的'
+                              f'"每笔 NNN ms"是**均值**，同一个均值/中位之别，'
+                              f'不是两套量）')
+                    if ratio > 3.0 or ratio < 0.33:
+                        direct += (f'（差 >3× ⇒ bench 拟合值**不能**当作真实 '
+                                  f'kAppend 的代价用，它漏掉了这条路上的'
+                                  f'那部分成本；命中点以真实下载为准）')
+                agree = direct + agree if direct else agree
+                # 两端比与拟合是两套独立读数，矛盾要说出来而不是藏着
+                span = sizes[-1] // max(sizes[0], 1)
+                if spread >= 5.0 and per_byte > 0 and fixed > 0:
+                    agree = (f'⚠️ 两端比 {spread:.1f}× 看似 H1，但拟合出固定项'
+                             f'{fixed:.0f} ms + 每字节 {per_byte:.4f} ms/B——'
+                             f'两端比只看两个端点，会漏掉中间的每字节成分，以拟合为准')
+                elif spread <= 1.5 and per_byte <= 0:
+                    agree = (f'⚠️ 两端比 {spread:.2f}× 看似 H2，但拟合不出每字节项'
+                             f'（固定 {fixed:.0f} ms），以拟合为准')
+                # 拟合残差：一条直线描述不了整条 ramp 时必须说出来。
+                # 1005.19 的 ramp 是 2K→10 ms / 4K→29 ms / 8K→769 / 16K→1558 /
+                # 32K→2757——最小两点比模型预测低 13–18 倍（那已经是 append 基线的
+                # 价），大分片三点却很贴。退化守卫只查"≥3 尺寸且跨度 ≥4×"，这条
+                # ramp 满足（5 尺寸 / 16×），所以拦不住；但不拦的结果是判据自信地
+                # 报"H2 成立"，而 ramp 明显是**拐点**形状。
+                # 施工含义：大分片区间的斜率可用（分片调大正是要進那个区间），
+                # 但"整条 ramp 服从 cost=F+s×bytes"这个更强的说法不成立。
+                knee = knee_note(fixed, per_byte, pts)
+                if knee:
+                    agree += '；' + knee
+                # kCommit 是三个模型都没有的一项，也是唯一没有真尺度实测的
+                # （1005.15 在 20.8% 处超时，kCommit 从未执行）。如果它把
+                # kAppend 侧的余量吃掉，结论就从"够"翻成"实际不通"——必须显式说。
+                if commit is not None:
+                    factor = kStreamPackBytes / max(commit_file, 1)
+                    if factor > 4.0 and grand_ms > kStreamDeadlineMs >= append_only_ms:
+                        agree += (f'；⚠️ 只看 kAppend 会得出"余量 '
+                                  f'{(kStreamDeadlineMs - append_only_ms) / 1000:.1f} s"的'
+                                  f'结论，而 kCommit 未实测，别拿这个数当上界')
+                    elif factor > 4.0:
+                        agree += (f'；⚠️ kCommit 在本尺度未实测（{factor:.1f}× 外推'
+                                  f'已因低于分辨率被拒绝），结论对它敏感——'
+                                  f'真值见 STREAM:download-within-deadline')
+                verdict = (
+                    f'{model}。{pred}'
+                    f'（H1 理论跨度 ≈{span}×，H2 理论 ≈1×，实测两端比 '
+                    f'{spread:.1f}×）{agree}')
+            check(log, 'BENCH:stream-cost-model', 'PASS', True,
+                  verdict + '。' + table)
+
+
+def hil_stream_read_buffer(log: Log):
+    """读缓冲尺寸：报数，不再当门禁。
+
+    它曾经是门禁，因为"32 KB 读缓冲是修法吗"就是 P1b-B 要回答的问题，而读到 2048
+    说明烧错固件、整轮白跑。**那个问题已经有答案了**（1005.19：净收益为零，
+    事务数 169→36 但总时间不动），缓冲也被撤回 2 KB。所以以后日志里不会再出现
+    32768，继续判 FAIL 等于对我们自己已经结束的实验喊狼来了。
+
+    保留它是为了归因：读缓冲大小决定分片笔数，决定了每一笔该按多大算。
+    只报数 + 说明这个数会影响什么。
+    """
+    if not log.read_buffers:
+        skip(log, 'STREAM:read-buffer-32k',
+             '本轮没有 `word-pack-download: read_buffer_bytes=` 行（没下载词包，'
+             '或没跑带该插桩的构建）')
+        return
+    sizes = sorted(set(log.read_buffers))
+    buf = sizes[0] if len(sizes) == 1 else None
+    if buf is None:
+        expect(log, 'STREAM:read-buffer-32k', True,
+               f'同一次启动里出现多个读缓冲尺寸 {sizes} ⇒ 下载路径有多条且分片'
+               f'大小不同。解读下面任何每笔成本前先按路径拆开，别混在一起平均')
+        return
+    tx_per_pack = -(-kStreamPackBytes // max(buf, 1))
+    note = ''
+    if buf != 32 * 1024:
+        note = (f'（不是 32768：这是 P1b-B 之前的 2 KB 路径，'
+                f'每笔成本会比分片大的时候高几倍。该实验已出结论并撤回）')
+    expect(log, 'STREAM:read-buffer-32k', True,
+           f'read_buffer_bytes={buf}{note}；{kStreamPackBytes // 1024} KiB 词包'
+           f'在这个读缓冲下约 {tx_per_pack} 笔事务。本轮日志出现 '
+           f'{len(log.read_buffers)} 次')
+
+
+def hil_stream_download_deadline(log: Log):
+    """端到端直量：一次大包下载有没有在 deadline 内下完。**不经过模型。**
+
+    这是本组判据里唯一直接量"产品有没有达标"的一条。BENCH:stream-cost-model
+    走"拟合 F/s → 外推"，而 1005.19 证明外推会骗人：bench 的 kCommit 在 62 KiB 上
+    量到 0 ms（低于 ms 计时分辨率），21× 外推后判据说"≈0.0 s"，可同一份日志里
+    真实收尾那笔是 15,327 ms——一条 15 s 的误差，方向还是"乐观"。
+    模型能回答"成本结构是什么"，回答不了"这一版到底行不行"。
+
+    做法：取日志里 bytes_expected 最大的那次下载，把它起点到失败行之间
+    `owner=wp-stream` 的 elapsed_ms **直接加起来**。
+
+    ⚠️ 这里**不算每字节**。解压后的分片大小没有任何一行日志记录：
+    `chunk_bytes` 只有 bench ramp 有（那是 bench 自己选的），真实下载侧只打
+    `read_buffer_bytes`（**压缩**读缓冲）和 `received`（**压缩**累计）。
+    拿 received 当分母会差一个压缩比（1005.19 实测 ≈4×），那正是
+    "wp-stream 比 bench 贵 4.9×"这类幻影的来源。每字节只能由 bench ramp 出，
+    本条只报"窗口被存储占了多少、够跑几笔"。
+
+    FAIL 的语义是**产品没达标**，不是设备坏了。它会在 1005.7/12/15/19 上
+    都 FAIL——四版都真的超时了，这不是喊狼来了。
+    PASS 的条件是"没有失败行且末笔在 deadline 前结束"：wqn_api.cpp:1986 只在
+    `result != ESP_OK` 时打失败行，所以没有失败行 ≈ 下完了。
+    """
+    if not log.downloads:
+        skip(log, 'STREAM:download-within-deadline',
+             '本轮没有 `word-pack-download:` 行（没下载词包）')
+        return
+    big = max(log.downloads, key=lambda d: d['bytes'])
+    if big['bytes'] < kStreamPackBytes:
+        skip(log, 'STREAM:download-within-deadline',
+             f'本轮最大词包只有 {big["bytes"]} B（阈值 {kStreamPackBytes} B），'
+             f'测不到 deadline 量级的下载')
+        return
+    fail = next((f for f in log.failures if f['t'] >= big['t']), None)
+    done = next((d for d in log.done if d['t'] >= big['t']), None)
+    # deadline 从日志里取，不再假定 120 s。成功行**不带** reason，所以预算也可能
+    # 只能从同一次启动里别的失败行拿到；都拿不到才退回源码标定值，并把来源写进
+    # detail ——一个说不清来源的预算会让 PASS 也是虚的。
+    deadline, src = kStreamDeadlineMs, '标定值 wqn_api.cpp:1941'
+    for f in log.failures:
+        m = re.search(r'total-budget-(\d+)s', str(f.get('reason', '')))
+        if m:
+            deadline, src = int(m.group(1)) * 1000, f'日志 reason={f["reason"]}'
+            break
+    if fail and fail.get('reason') == 'error':
+        skip(log, 'STREAM:download-within-deadline',
+             f'那次下载以 reason=error 结束（不是两个时限闸）⇒ 这一格没测到，'
+             f'本条不判')
+        return
+    # 窗口右边界：失败行优先。成功后没有失败行，就用"下一次下载起点之前"或
+    # 预算的 4 倍——不能用 horizon 当窗口末端，那会把窗口说成 480 s 这种数，
+    # 而真实下载在末笔就结束了。
+    nxt = min((d['t'] for d in log.downloads if d['t'] > big['t']), default=None)
+    cap = big['t'] + 4 * deadline
+    right = fail['t'] if fail else cap
+    seg = [t for t in log.txof('wp-stream') if t['t'] and big['t'] <= int(t['t'])]
+    if nxt:
+        seg = [t for t in seg if int(t['t']) < nxt]
+    tx = [t for t in seg if int(t['t']) <= right]
+    if not tx:
+        skip(log, 'STREAM:download-within-deadline',
+             f'{big["bytes"]} B 那次下载起点之后没有 wp-stream 事务，判不出成本')
+        return
+    total = sum(el(t) for t in tx)
+    after = [t for t in seg if fail and int(t['t']) > fail['t']]
+    tail_total = sum(el(t) for t in after)
+    mean = total / len(tx)
+    # 成功的窗口末端是末笔结束时刻，不是 cap
+    last_end = max(int(t['t']) + el(t) for t in tx) if not fail else fail['t']
+    window = last_end - big['t']
+    fits = int(deadline // mean)
+    # 两个单位不要混：bytes_expected 是**解压**总字节，wire 侧的 received/wire
+    # 是**压缩**累计（wqn_api.cpp:1965 `received += read`）。拿压缩字节当分母
+    # 会差一个压缩比，本轮已经造出两个幻影。**解压后的分片大小现在有实测了**
+    # （`word pack stream append: chunk_bytes=`，见 STREAM:append-chunk-measured），
+    # 所以每字节成本只在有那个数时才敢算。
+    units = ''
+    if fail:
+        plain = fail.get('plain')
+        wire = fail.get('wire')
+        bits = [f'下载以 {fail["err"]} 结束']
+        if plain and big['bytes']:
+            bits.append(f'解压进度 {plain} / {big["bytes"]} = '
+                        f'{plain / big["bytes"]:.0%}（来自 `inflater.total_out()`'
+                        f'，不是拿压缩 received 推的）')
+        if wire:
+            bits.append(f'wire {wire} B 是**压缩**字节，与上面的解压字节'
+                        f'不同单位，不能相除当完成度')
+        units = '；' + '。'.join(bits)
+    tail = (f'。超时之后另有 {len(after)} 笔收尾共 {tail_total / 1000:.1f} s'
+            f'（未计入窗口；它是这次尝试真实付出的存储成本的一部分，'
+            f'也是本轮唯一一次真尺度 kCommit 的量）' if after else '')
+    budget_note = f'（预算取自{src}）' if src != '标定值 wqn_api.cpp:1941' else \
+        f'（⚠️ 本轮日志未给出预算，用的是{src}；若固件已放宽，这条会误判）'
+    detail = (
+        f'{big["bytes"]} B 词包：起点到{"失败行" if fail else "末笔"}共 '
+        f'{window / 1000:.1f} s，其中 {len(tx)} 笔 wp-stream Σelapsed '
+        f'{total / 1000:.1f} s、Σqueue_wait '
+        f'{sum(qw(t) for t in tx) / 1000:.1f} s'
+        f'（存储占窗口 {total / max(window, 1):.0%}）。'
+        f'每笔均 {mean:.0f} ms ⇒ {deadline // 1000} s 预算{budget_note} '
+        f'只够 {fits} 笔'
+        + units + tail)
+    # 判据只对"有没有下完"下结论：下完了就 PASS，没下完就 FAIL。
+    # 预算够不够是detail 里那个数给人看的——而且日志能给出预算时才可信，
+    # 给不出时（成功行不带 reason）宁可只报数，不拿一个过期标定值去否掉一次
+    # 成功的下载。
+    over = window > deadline
+    if done and over:
+        detail += (f'；⚠️ 用了 {window / 1000:.1f} s 超过 {src} 的 '
+                   f'{deadline // 1000} s —— 预算来源不是本行，先确认固件版本')
+    expect(log, 'STREAM:download-within-deadline', not fail, detail)
+
+
+def hil_stream_download_completed(log: Log):
+    """成功行的自洽性：`completed: bytes=N` 必须等于 `bytes_expected`。
+
+    wqn_api.cpp:1970-1973 已经把 `inflater.total_out() != item.byte_size` 判成
+    ESP_ERR_INVALID_SIZE，所以 bytes 不等时**走不到** completed 行。这条判据因此
+    是给插桩兜底的：如果哪天 completed 行打出来而字节数不对，说明那处校验被绕过了
+    （或日志打错了对象），而"下完了一个不完整的包"是会装进 flash 的。
+
+    elapsed_ms 一并报：它是唯一直接从 download 口径量出来的总耗时，不经过
+    "事务笔数 × 每笔"的换算。
+    """
+    if not log.done:
+        skip(log, 'STREAM:download-completed-consistent',
+             '本轮没有 `word-pack-download completed:` 行'
+             '（旧构建只有失败才打日志；或本轮没有成功的下载）')
+        return
+    bad = []
+    for d in log.done:
+        # 找到起点在它之前、最接近的那次下载来比 bytes_expected。
+        # 完成字节数有 `plain` / `bytes` / `received` 三种名字，load() 已归一到 plain；
+        # 旧日志只有 `bytes`，也接受。一个都没有 ⇒ 格式漂移，交浮漂移判据去报。
+        starts = [s for s in log.downloads if s['t'] <= d['t']]
+        got = d.get('plain', d.get('bytes'))
+        if not starts or got is None:
+            continue
+        want = starts[-1]['bytes']
+        if got != want:
+            bad.append((d['t'], got, want))
+    for t, got, want in bad:
+        expect(log, 'STREAM:download-completed-consistent', False,
+               f'{t} ms 那次 completed plain={got} 但 bytes_expected={want} '
+               f'⇒ 下完了一个不完整的包，`total_out() != byte_size` 那处校验'
+               f'被绕过了或日志打错了对象')
+    if not bad:
+        d = log.done[-1]
+        got = d.get('plain', d.get('bytes'))
+        detail = (f'{len(log.done)} 次成功下载的字节数都与 bytes_expected 一致')
+        if got is not None:
+            detail += f'；末次解压 {got} B'
+        if d.get('elapsed_ms'):
+            detail += f' / {d["elapsed_ms"] / 1000:.1f} s'
+        elif d.get('elapsed'):
+            detail += f' / {d["elapsed"] / 1000:.1f} s'
+        for rate in ('plain_bytes_per_s', 'bytes_per_s'):
+            if d.get(rate):
+                detail += f' = {d[rate] / 1024:.0f} KiB/s（解压口径）'
+                break
+        expect(log, 'STREAM:download-completed-consistent', True, detail)
+
+
+def hil_stream_append_chunk(log: Log):
+    """真实下载路径的每笔解压字节数 —— 争论了好几轮的那个数，现在终于有实测。
+
+    在这行插桩出现之前，"wp-stream 比 bench 每字节贵几倍"有 1.22×~5.7× 三个
+    自俞读法，因为谁都不知道每笔到底写了多少解压字节；"整包需要多少存储时间"
+    也跟着有 138~551 s 的区间。**一个没有实测的分母，能让所有下游结论差 4 倍。**
+
+    判据只做一件事：把 chunk_bytes 如实报出来，并和 bench ramp 的最大分片比。
+    这不判 PASS/FAIL——它是个测量值，取值本身没有对错；但它**必须出现**，
+    缺少它时下面那条漂移判据会红。
+    """
+    if not log.appends:
+        skip(log, 'STREAM:append-chunk-measured',
+             '本轮没有 `word pack stream append:` 行（没下载词包，'
+             '或跑的是加插桩之前的构建）')
+        return
+    chunks = sorted({a['chunk'] for a in log.appends})
+    last = log.appends[-1]
+    t0 = log.appends[0]['t']
+    t1 = last['t']
+    tx = [t for t in log.txof('wp-stream') if t['t']
+          and t0 <= int(t['t']) <= t1 + 60000]
+    total = sum(el(t) for t in tx)
+    written = last['total']
+    per_byte = total / max(written, 1)
+    detail = (
+        f'{len(log.appends)} 次 kAppend，chunk_bytes 取值 {[c for c in chunks]}'
+        f'（{'一致' if len(chunks) == 1 else "不一致 ⇒ 分片路径有多条"}）；'
+        f'累计写入 {written} / {last["want"]} B = '
+        f'{written / max(last["want"], 1):.0%}（这是**解压**进度，'
+        f'不是压缩 received 的进度）。窗口内 {len(tx)} 笔存储事务 Σelapsed '
+        f'{total / 1000:.1f} s ⇒ 每解压字节 {per_byte:.4f} ms/B')
+    if len(tx) and len(log.appends):
+        detail += (f'，每笔 {total / len(tx):.0f} ms / '
+                   f'{written / len(log.appends):.0f} B')
+    expect(log, 'STREAM:append-chunk-measured', True, detail)
+
+
+def sane_ms_per_byte(v, what):
+    """每字节成本的数量级守卫。
+
+    为一个值存在：`cost/chunk*1000` 这个笔误。乘过的版本把 0.0841 ms/B 印成
+    84.14「ms/B」——**比值恰好不变**，所以凡是拿比值做交叉检查的地方都会
+    通过（两个数一起错，比值自洽）。这条错误比单个数错更难发现，它躲得过验证。
+
+    数量级物理上限：>10 ms/B 意味着写 1 KB 要 10 s，比这个项目里任何观测都高
+    三个数量级以上（最慢的 session3k 是 ~0.7 ms/B）。所以超出范围的一律是单位
+    错，直接抛出来，而不是让它变成一个看起来很准的数。
+    """
+    if not 0 < v <= 10.0:
+        raise ValueError(
+            f'{what} 算出 {v:.4f} ms/B，超出物理范围（0, 10]。'
+            f'几乎一定是单位乘错了——检查是不是多乘/少乘了 1000')
+    return v
+
+
+kStreamNoProgressGateMs = 30000   # 无进展闸阈值，固件侧 30 s
+kStreamGateIdleSlackMs = 10000    # 判"≈阈值"时允许的偏差
+kStreamGateStalledProofMs = 60000 # 超过这个 idle 却说"是总预算拦的"⇒ 自相矛盾
+
+
+def hil_stream_two_gate(log: Log):
+    """两个时限闸自己的逻辑对不对：30 s 无进展 + 总预算。
+
+    **这一条验的是守卫逻辑，不是产品行为。** 产品有没有下完由
+    `STREAM:download-within-deadline` 判；这里判的是"拦我们的那个闸，拦对了吗"。
+
+    为什么需要 `idle_ms=`：判"是不是真的没有进展"只能用**结束前距上次收到字节的
+    时间**，不能用 `plain_bytes_per_s`——那是**全程平均**，一个下了 50% 然后对端
+    彻底死掉的传输，平均值照样 > 0，而 `reason=no-progress-30s` 对它正是正确行为。
+    拿平均速率去判会把一次正确拦截判成 FAIL（我自己差点这么写）。
+
+    四种情况，见 bench_per_byte 上方的常量：
+      no-progress 且 idle≈30 s   ⇒ PASS  真的断了，闸拦对了
+      no-progress 且 idle<10 s   ⇒ FAIL  还在流却被无进展闸拦了，逻辑错误
+      total-budget 且 idle<30 s  ⇒ PASS  慢但一直在流，兜底拦对了
+      total-budget 且 idle>60 s  ⇒ FAIL  已经停了 60 s 却说"是预算拦的"——
+                                       无进展闸本该先拦，它没生效
+    没有 reason=（旧格式）或 reason=error 都判 SKIP：前者没测到这个场景，
+    后者两个闸都没参与。
+    """
+    reason = None
+    end = None
+    for f in log.failures:
+        if f.get('reason') and f['reason'] != 'error':
+            reason, end = f['reason'], f
+            break
+    if end is None:
+        # 分清是"根本没带 reason= 的旧格式"还是"带了 reason=error"：后者两个闸
+        # 都没参与，前者是日志旧了，两者都不是两个闸判错了。
+        has_error = any(f.get('reason') == 'error' for f in log.failures)
+        why = ('下载以 reason=error 结束，两个时限闸都没有参与拦截'
+               if has_error else
+               '本轮没有带 `reason=` 的失败行（旧格式，或两个闸都没参与）')
+        skip(log, 'STREAM:two-gate-logic', why)
+        return
+    idle = end.get('idle_ms')
+    if idle is None:
+        skip(log, 'STREAM:two-gate-logic',
+             f'失败行有 reason={reason} 但没有 `idle_ms=` ⇒ 无法判断拦截时刻'
+             f'还有没有字节在到达（平均速率给不出这个），本条不判')
+        return
+    # 不变量：空闲时间不可能长过这笔下载自己的 elapsed_ms。破了它就是字段本身
+    # 不自洽（单位换了、或它量的不是"距上次收到字节"），此时按阈值去判等于拿
+    # 一个错数下结论。宁可 FAIL 出来修日志，也不要 SKIP 成"这条没问题"——
+    # 后者会让判据在什么都没测到的情况下报绿。
+    elapsed = end.get('elapsed_ms')
+    if elapsed is not None and idle > elapsed:
+        expect(log, 'STREAM:two-gate-logic', False,
+               f'reason={reason} 但 idle_ms={idle} > elapsed_ms={elapsed}：'
+               f'空闲时间不可能长过下载本身耗时 ⇒ `idle_ms` 不是"距上次收到字节的'
+               f'毫秒数"（单位换了，或参照时刻取错）。修好字段之前本条判不出任何东西')
+        return
+    gate = 'no-progress' if reason.startswith('no-progress') else 'total-budget'
+    if gate == 'no-progress':
+        near = abs(idle - kStreamNoProgressGateMs) <= kStreamGateIdleSlackMs
+        if idle < kStreamGateIdleSlackMs:
+            expect(log, 'STREAM:two-gate-logic', False,
+                   f'reason={reason} 但 idle_ms={idle}（<{kStreamGateIdleSlackMs} ms）'
+                   f'⇒ 拦截那一刻字节还在到达，无进展闸却拦了它。这是闸的逻辑错误，'
+                   f'不是产品问题；查 30 s 阈值的比较是不是写反了或用了错误的基准时刻')
+        elif near:
+            expect(log, 'STREAM:two-gate-logic', True,
+                   f'reason={reason} 且 idle_ms={idle} ≈ {kStreamNoProgressGateMs} ms '
+                   f'⇒ 真的断了 ~30 s，无进展闸拦截正确')
+        else:
+            expect(log, 'STREAM:two-gate-logic', True,
+                   f'reason={reason} 且 idle_ms={idle}，偏离 30 s 阈值 '
+                   f'{abs(idle - kStreamNoProgressGateMs)} ms（在 {kStreamGateIdleSlackMs} '
+                   f'ms 容差外）。拦对了，但阈值基准时刻可能有偏移，值得看一眼')
+    else:
+        if idle > kStreamGateStalledProofMs:
+            expect(log, 'STREAM:two-gate-logic', False,
+                   f'reason={reason} 但 idle_ms={idle}（>{kStreamGateStalledProofMs} ms）'
+                   f'⇒ 传输早就停流了，却是总预算兜底拦的，**30 s 无进展闸没生效**。'
+                   f'两个闸的交互有问题（谁先查、idle 是否被其它事件重置）')
+        else:
+            expect(log, 'STREAM:two-gate-logic', True,
+                   f'reason={reason} 且 idle_ms={idle}（<{kStreamNoProgressGateMs} ms）'
+                   f'⇒ 慢但一直在流，兜底闸拦对了，无进展闸正确地没有插手')
+
+
+def bench_per_byte(log: Log):
+    """bench ramp 的每字节斜率，只取**最大分片**那一轮。
+
+    不取最小二乘：ramp 有明显拐点（1005.19 上 2K→10 ms / 4K→29 ms 比直线低
+    13–18×），拟合一条斜线会把两个不可用的点混进来。要预测下载路径，该用的是
+    下载实际落在的那个区间的斜率，也就是最大分片那一轮。
+    没有 ramp 时返回 None。
+    """
+    if not log.stream_rounds:
+        return None
+    pts = [(r['chunk'], r['cost']) for r in log.stream_rounds if r.get('cost', 0) > 0]
+    if not pts:
+        return None
+    chunk, cost = max(pts, key=lambda p: p[0])
+    # 不再乘 1000：cost/chunk 直接就是 ms/B（2757/32768 = 0.0841）。乘过的版本
+    # 会把 0.0841 印成 84.14「ms/B」——数值差 1000 倍，而比值恰好不变，
+    # 所以只有把绝对值印出来时才会被发现。
+    return sane_ms_per_byte(cost / chunk, 'bench ramp 每字节成本')
+
+
+def direct_per_byte(log: Log):
+    """真实下载路径的每解压字节成本，从 `word pack stream append` + 事务表直算。
+
+    与 bench_per_byte 是**两套独立测量**：bench 在 WiFi 关闭、无其它流量的窗口里
+    对一个 62 KiB 的临时文件写固定尺寸；真实下载在 WiFi 打开、UI/EPD 并发的
+    情况下往一个 >1 MiB 的文件追加。两者不可能恒等，问题是差多少。
+    """
+    if not log.appends:
+        return None
+    last = log.appends[-1]
+    t0, t1 = log.appends[0]['t'], last['t']
+    seg = [t for t in log.txof('wp-stream') if t['t'] and t0 <= int(t['t']) <= t1 + 60000]
+    if not seg or not last['total']:
+        return None
+    return sane_ms_per_byte(sum(el(t) for t in seg) / last['total'],
+                            '真实下载每字节成本')
+
+
+def hil_stream_bench_vs_direct(log: Log):
+    """bench ramp 还能不能当下载路径的预测器？
+
+    这条是**给 BENCH:stream-cost-model 定位用的**。1005.19 之前，bench 是唯一
+    的能量度，所有 deadline 结论都从它外推；这一轮它错过一次——kCommit 在 62 KiB
+    上量到 0 ms，外推成"≈0.0 s"，而 1.34 MiB 上真实收尾是 15,327 ms。所以 bench
+    的角色必须从"预测器"降级为"标定工具"，而这一条就是那个降级的**度量**。
+
+    两套独立测量相差多少：
+      ≤1.5×  bench 仍可用作标定，`BENCH:stream-cost-model` 的预测有参考价值
+      >1.5×  bench 系统性偏乐观（条件不同：WiFi 开/关、并发流量、文件大小），
+             它的数字只能当 bench 自己的结论，不能拿去预测下载路径
+    不判 PASS/FAIL——两边都没错，差的是实验条件；但这个倍数必须每次都出现在
+    判读里，否则下一次又会有人拿 bench 的数去承诺产品预算。
+    """
+    bench = bench_per_byte(log)
+    direct = direct_per_byte(log)
+    if bench is None or direct is None:
+        skip(log, 'STREAM:bench-vs-direct',
+             ' bench ramp 与真实 kAppend 缺一个（本轮只跑了其中一路），无法对比')
+        return
+    ratio = direct / bench
+    verdict = ('bench 仍是有效标定' if ratio <= 1.5 else
+               f'bench 偏乐观 {ratio:.2f}× ⇒ 它的数只能当 bench 自己的结论')
+    expect(log, 'STREAM:bench-vs-direct', True,
+           f'真实下载 {direct:.4f} ms/B vs bench ramp 最大分片 {bench:.4f} ms/B '
+           f'= {ratio:.2f}×：{verdict}。差的是实验条件（bench 在 WiFi 关闭、无并发'
+           f'流量下写 62 KiB 临时文件；真实下载在 WiFi 打开、UI/EPD 并发下追加'
+           f'>1 MiB），不是谁测错了。'
+           f'⚠️ 即便 ≤1.5× 也不是"完全可比"：**62 KiB vs 1.28 MiB 是 21× 外推**，'
+           f'"每字节成本不随文件增长"只在 294 KB 内验过（§五之七）。若它在 1 MiB'
+           f'之后抬头，真实值会比这个大。两个绝对值都打在上面，别只引用比值')
+
+
+def hil_log_format_drift(log: Log):
+    """抓"判据正则静默失配"。
+
+    日志里明明有 `word-pack-download` 行，却没有一条被 WORD_PACK_END_RE 解析出来
+    ——那不是"这轮没测"，是**判据瞎了**。位置正则改一次字段就静默失配一次，
+    本会话已经因为这个模式错过一轮（新增判据以为没触发，其实格式变了）。
+    所以这里判 FAIL，让格式漂移当场可见，而不是伪装成 SKIP。
+    阈值取 2：单行可能是 HTTP status 之类不带的，两条以上仍然全不解析才是漂移。
+    """
+    got = len(log.failures) + len(log.done)
+    lines = [ln for ln in WORD_PACK_LINE_COUNT_RE.findall(log.text)
+             if 'read_buffer_bytes' not in ln and 'HTTP status' not in ln]
+    if len(lines) >= 2 and got == 0:
+        expect(log, 'LOG:word-pack-format-parsed', False,
+               f'日志里有 {len(lines)} 条 word-pack-download 起点/终点行，'
+               f'但成功/失败行一条都没解析出来 ⇒ 判据的 WORD_PACK_END_RE 与'
+               f'当前日志格式漂移了。这一格的所有结论都不可用，先修判据')
+        return
+    expect(log, 'LOG:word-pack-format-parsed', True,
+           f'{len(lines)} 条起点/终点行，其中 {got} 条成功/失败行解析成功'
+           if lines else '本轮无 word-pack-download 起点/终点行')
 
 
 def hil_stability(log: Log):
@@ -612,6 +1723,13 @@ def main(argv):
         hil_pk_handle(log)
         hil_owner_attribution(log)
         hil_storage_bench(log)
+        hil_stream_read_buffer(log)
+        hil_stream_download_deadline(log)
+        hil_stream_download_completed(log)
+        hil_stream_two_gate(log)
+        hil_stream_append_chunk(log)
+        hil_stream_bench_vs_direct(log)
+        hil_log_format_drift(log)
         hil_stability(log)
 
     # 归因总表：命名 pass 之后这里应该列出 10+ 个真实 owner，而不是一个
