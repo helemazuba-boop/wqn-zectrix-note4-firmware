@@ -107,7 +107,8 @@ class Log:
         log.probes = [{k: int(v) for k, v in m.groupdict().items()}
                       for m in PROBE_RE.finditer(text)]
         log.bench_events = [m.group('what').lower() for m in BENCH_RE.finditer(text)]
-        log.rounds = [{k: (int(v) if k != 'shape' else v) for k, v in m.groupdict().items()}
+        log.rounds = [{k: (v if k in ('shape', 'result') else int(v))
+                       for k, v in m.groupdict().items()}
                       for m in BENCH_ROUND_RE.finditer(text)]
         log.boots = text.count('opened COM') or text.count('End of partition table')
         return log
@@ -311,6 +312,23 @@ def hil_pk_handle(log: Log):
            all(c['pa'] < 50 for c in log.cards), 'parse 仍可忽略')
 
 
+# 命名 pass 引入的 owner。判据用"日志里出现过这些名字之一"来识别构建是否已带
+# 命名 pass——刻意不用"owner 数量"之类的启发式：老日志有 12 个真实 owner 也不少。
+# 列子集不会漏判（漏的只是不启用），列错不会误判（不会把老日志判成回归），
+# 这正是我们要的失效方向。以后再加 owner 时把名字补进来即可。
+NEW_OWNER_NAMES = frozenset({
+    # pack 系列（note_pack / problem_pack / word_pack）
+    'np-cache-reset', 'np-manifest-save', 'np-stream', 'np-image-load', 'np-image-store',
+    'pp-cache-reset', 'pp-manifest-save', 'pp-stream',
+    'wp-manifest-invalidate', 'wp-cache-reset', 'wp-manifest-save', 'wp-stream',
+    # storage.cpp（存储基元，共 10 处）
+    'save-string', 'save-u64', 'save-blob', 'clear-nvs-key', 'clear-identity-state',
+    'cleanup-proto-problem', 'ensure-pack-capacity', 'save-device-control',
+    'save-volume', 'factory-reset',
+})
+NEW_OWNER_PREFIXES = ('wp-', 'np-', 'pp-')
+
+
 def hil_owner_attribution(log: Log):
     """owner 命名 pass 的回归判据。
 
@@ -319,14 +337,16 @@ def hil_owner_attribution(log: Log):
     §一 那张表里 `background` 中位 782 / max 4054 因此说不清是谁写的。命名 pass
     之后这个桶应该是空的。
 
-    判据只在"命名 pass 确实在盘上"时才启用：用 wp-/np-/pp- 前缀的存在与否识别
-    构建。老日志（1005.4 / 1005.6）里 owner=background 是当时的正常形态，判 SKIP
-    而不是 FAIL——否则历史日志会被误判成回归。
+    判据只在"命名 pass 确实在盘上"时才启用：靠日志里是否出现该 pass 引入的
+    owner 名字。老日志（1005.4 / 1005.6）里 owner=background 是当时的正常形态，
+    判 SKIP 而不是 FAIL——否则历史日志会被误判成回归。默认字面量本身还留在
+    storage_service.cpp:49，将来有人新增一处忘了命名，这条会抓住它。
     """
     owners = log.owners()
-    named = [o for o in owners if o.startswith(('wp-', 'np-', 'pp-'))]
+    has_pass = any(o in NEW_OWNER_NAMES or o.startswith(NEW_OWNER_PREFIXES)
+                   for o in owners)
     defaulted = log.txof('background')
-    if not named:
+    if not has_pass:
         skip(log, 'OWNERS:attribution',
              '本日志来自 owner 命名 pass 之前的构建，background 桶是当时的正常形态')
         return
@@ -369,6 +389,9 @@ def hil_storage_bench(log: Log):
                    f'（<0.6 说明插桩漏掉了主要耗时，结论不可信）')
 
     # --- 2. 纯查找底价 -----------------------------------------------------
+    # 语义说明：这一条 PASS 的意思是"重写方向有数据支撑"，FAIL 的意思是
+    # "我们准备照其施工的那个前提是错的，停下来重推"。FAIL 不是说设备坏了——
+    # 宁可让一条判据红着挡住错误的重写，也不要一条绿的放过它。
     by_shape = {}
     for r in log.rounds:
         by_shape.setdefault(r['shape'], []).append(r['wall'])
@@ -382,14 +405,23 @@ def hil_storage_bench(log: Log):
         if per_op is None and log.probes:
             per_op = statistics.median(p['total'] for p in log.probes) / 5.0
         if per_op is None:
-            skip(log, 'BENCH:floor-model', '有 probe 但没有可折算单次 op 成本的写 shape')
+            skip(log, 'BENCH:floor-model-holds', '有 probe 但没有可折算单次 op 成本的写 shape')
         else:
             ratio = per_op / probe_med if probe_med > 0 else float('inf')
-            holds = probe_med >= 100.0 and 0.4 <= ratio <= 2.5
-            expect(log, 'BENCH:floor-model-holds-or-refuted', holds or probe_med < 20.0,
-                   f'纯查找 probe 中位 {probe_med:.0f} ms；单次元数据 op ≈ '
-                   f'{per_op:.0f} ms（比值 {ratio:.2f}）。probe<20ms 且写很贵 = '
-                   f'底价模型被推翻，重写前提要重议')
+            if probe_med < 20.0:
+                verdict = (f'底价模型被推翻：纯查找只花 {probe_med:.0f} ms，而写入侧单次 op '
+                           f'≈{per_op:.0f} ms（比值 {ratio:.1f}）。成本不在元数据扫描上，'
+                           f'"减少页数/减少 op"这个方向不成立，必须重推根因再动重写')
+            elif not 0.4 <= ratio <= 2.5:
+                verdict = (f'模型对不齐：纯查找 {probe_med:.0f} ms 而单次 op ≈{per_op:.0f} ms'
+                           f'（比值 {ratio:.2f}，超出 0.4~2.5）。查找贵而写便宜 ⇒ 该优化'
+                           f'的是"少打开"，不是"少分页"；反之则相反。按实测重定方向')
+            else:
+                verdict = (f'底价模型成立：纯查找中位 {probe_med:.0f} ms，单次元数据 op '
+                           f'≈{per_op:.0f} ms（比值 {ratio:.2f}）。与 1005.6 上 n=11 的 '
+                           f'journal 拟合一致，可按"缩短扫描长度"施工')
+            expect(log, 'BENCH:floor-model-holds', bool(verdict.startswith('底价模型成立')),
+                   verdict)
     detail = '；'.join(
         f'{shape} 中位 {statistics.median(w):.0f} ms (n={len(w)})'
         for shape, w in sorted(by_shape.items()))
