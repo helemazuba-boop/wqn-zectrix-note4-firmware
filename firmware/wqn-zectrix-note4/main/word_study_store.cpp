@@ -552,6 +552,7 @@ struct BenchShape {
     size_t bytes;
     bool preserve_backup;
     bool append;
+    bool stream = false;
 };
 
 // probe = a lookup with no write at all: fopen("rb") on a path that does not
@@ -574,7 +575,49 @@ constexpr BenchShape kBenchShapes[] = {
     {"session3k", kBenchMaxBytes, false, false},
     {"session3k-direct", kBenchMaxBytes, true, false},
     {"append", 0, true, true},
+    {"stream", 0, false, false, true},
 };
+
+// [measure][P1b-B] The stream shape measures what one wp-stream transaction
+// costs, as a function of how many bytes that transaction writes.
+//
+// It must reproduce wp-stream's write pattern exactly, because the whole point
+// is a number that transfers to the download path:
+//   kBegin  -> fopen("wb") once,          here: opened once before round 0
+//   kAppend -> fwrite only, NO flush,     here: one fwrite per round, no fsync
+//              NO fsync, NO close
+//   kCommit -> fflush+fsync+fclose+rename here: done once after the last round
+// (word_pack.cpp WordPackStreamTransaction). An earlier version of this shape
+// did fopen+fflush+fsync+fclose EVERY round; that measures the `append` shape
+// at 32 KB, not wp-stream, and its numbers do not transfer. wp-stream pays one
+// open and one fsync for the whole file, not one per chunk.
+//
+// What it discriminates. 1005.15: wp-stream cost 890 ms median per ~1719 B
+// chunk. Two models fit that single point equally well:
+//   H1 fixed per transaction (~890 ms regardless of size)
+//      -> a 32 KB chunk is still ~890 ms -> 41 chunks -> ~36 s -> download fits
+//         in the 120 s deadline. Bigger chunks are the fix.
+//   H2 proportional to bytes (~0.52 ms/byte)
+//      -> a 32 KB chunk is ~16 s -> no gain at all from bigger chunks, and the
+//         fix has to attack the per-byte cost instead.
+// One chunk size cannot separate them -- both predict 890 ms at 1719 B. A RAMP
+// can: if cost stays flat while the chunk grows 16x, it is H1; if cost tracks
+// the chunk, it is H2.
+//
+// Both models are ~1000x slower than raw SPI flash (~2 KB/s vs MB/s), and it is
+// NOT a full partition: 1005.15 logged 451800 / 7703441 bytes used (94% free),
+// so GC pressure from a nearly-full filesystem does not explain it either.
+// Something else is charging ~0.5 ms per byte and this ramp is how we find out
+// whether it is charged per call or per byte.
+constexpr size_t kBenchStreamChunks[] = {
+    2 * 1024, 4 * 1024, 8 * 1024, 16 * 1024, 32 * 1024,
+};
+constexpr int kBenchStreamRounds =
+    static_cast<int>(sizeof(kBenchStreamChunks) / sizeof(kBenchStreamChunks[0]));
+// A round costing more than this ends the shape early. At ~0.52 ms/byte the
+// 32 KB round alone would be ~16 s, and the bench must not hold the storage
+// task (and with it IDLE0) for minutes -- see the watchdog note above.
+constexpr int64_t kBenchStreamAbortMs = 6000;
 
 struct BenchContext {
     const BenchShape* shape = nullptr;
@@ -588,6 +631,22 @@ constexpr char kBenchTemp[] = "/storage/bench.tmp";
 constexpr char kBenchBackup[] = "/storage/bench.bak";
 constexpr char kBenchProbeMissing[] = "/storage/bench-does-not-exist";
 constexpr char kBenchAppend[] = "/storage/bench.append";
+constexpr char kBenchStream[] = "/storage/bench.stream";
+
+// Held open across the stream shape's rounds, exactly as
+// WordPackStreamContext::file is held across every kAppend of one download.
+// It cannot live in BenchContext: that is rebuilt per round, and reopening each
+// round is precisely the pattern that made the first version of this shape
+// measure the wrong thing.
+FILE* g_bench_stream = nullptr;
+
+// Sum of the ramp, used only for the free-space check.
+size_t BenchStreamTotalBytes()
+{
+    size_t sum = 0;
+    for (const size_t chunk : kBenchStreamChunks) sum += chunk;
+    return sum;
+}
 
 // Runs ON the storage task. One AtomicWrite per invocation -- see the watchdog
 // note above; a loop here would hold the task through the whole bench.
@@ -602,6 +661,31 @@ esp_err_t BenchTransaction(void* opaque)
     if (ctx == nullptr || ctx->shape == nullptr) return ESP_ERR_INVALID_ARG;
     const BenchShape& shape = *ctx->shape;
 
+    if (shape.stream) {
+        // kAppend equivalent: fwrite and nothing else. No flush, no fsync, no
+        // close -- see the ramp comment on kBenchStreamChunks for why paying
+        // those per round would measure a different shape than wp-stream.
+        const int64_t started_us = esp_timer_get_time();
+        if (g_bench_stream == nullptr) {
+            ctx->result = ESP_ERR_INVALID_STATE;
+            return ctx->result;
+        }
+        const size_t chunk_bytes = kBenchStreamChunks[ctx->round];
+        std::vector<uint8_t> data(chunk_bytes, 0xA5);
+        const bool written =
+            std::fwrite(data.data(), 1, data.size(), g_bench_stream) ==
+            data.size();
+        ctx->result = written ? ESP_OK : ESP_FAIL;
+        const long file_bytes = std::ftell(g_bench_stream);
+        ESP_LOGI(
+            kTag,
+            "storage bench stream round=%d chunk_bytes=%u file_bytes=%ld "
+            "result=%s cost_ms=%lld",
+            ctx->round, static_cast<unsigned>(chunk_bytes), file_bytes,
+            esp_err_to_name(ctx->result),
+            static_cast<long long>((esp_timer_get_time() - started_us) / 1000));
+        return ctx->result;
+    }
     if (shape.append) {
         // Mirrors AppendOutboxRecordTo(): append, flush, fsync, close. No temp
         // file, no remove, no rename. Reported on its own line rather than the
@@ -618,8 +702,9 @@ esp_err_t BenchTransaction(void* opaque)
             written && std::fflush(file) == 0 && ::fsync(fileno(file)) == 0;
         const bool closed = std::fclose(file) == 0;
         ctx->result = (durable && closed) ? ESP_OK : ESP_FAIL;
-        ESP_LOGI(kTag, "storage bench append round=%d result=%s",
-                 ctx->round, esp_err_to_name(ctx->result));
+        ESP_LOGI(kTag, "storage bench append round=%d bytes=%u result=%s",
+                 ctx->round, static_cast<unsigned>(sizeof(record)),
+                 esp_err_to_name(ctx->result));
         return ctx->result;
     }
 
@@ -640,7 +725,6 @@ esp_err_t BenchTransaction(void* opaque)
         payload.data(), payload.size(), shape.preserve_backup);
     return ctx->result;
 }
-
 // Returns the free-space verdict and, in info_ms_out, how long
 // esp_spiffs_info itself took. That cost is reported separately rather than
 // folded into the write measurement: if it turns out to be hundreds of
@@ -661,14 +745,20 @@ bool BenchFreeSpaceOk(const BenchShape& shape, int round, int64_t* info_ms_out)
                  shape.name, round);
         return false;
     }
-    if (total - used < shape.bytes + kBenchReserveBytes) {
+    // The stream shape declares bytes=0 (its size comes from the chunk) so the
+    // chunk is added here: it accumulates a quarter megabyte across its rounds
+    // and must not be allowed to eat into the reserve unaccounted for.
+    const size_t need = shape.bytes +
+                        (shape.stream ? BenchStreamTotalBytes() : 0) +
+                        kBenchReserveBytes;
+    if (total - used < need) {
         // Never let the bench fill the partition: the outboxes live here and a
         // full SPIFFS would cost real study records, not just this measurement.
         ESP_LOGW(kTag,
                  "storage bench SKIP shape=%s round=%d free=%u need=%u",
                  shape.name, round,
                  static_cast<unsigned>(total - used),
-                 static_cast<unsigned>(shape.bytes + kBenchReserveBytes));
+                 static_cast<unsigned>(need));
         return false;
     }
     return true;
@@ -701,6 +791,7 @@ void BenchTask(void*)
     int write_count = 0;
     for (const BenchShape& shape : kBenchShapes) {
         if (shape.bytes > 0) write_count += kBenchRounds;
+        if (shape.stream) write_count += kBenchStreamRounds;
     }
     // No predicted duration on purpose: any number here would be derived from
     // the very model this bench exists to test, and printing it would smuggle a
@@ -726,7 +817,20 @@ void BenchTask(void*)
     const int64_t bench_started_us = esp_timer_get_time();
 
     for (const BenchShape& shape : kBenchShapes) {
-        for (int round = 0; round < kBenchRounds; ++round) {
+        const int rounds = shape.stream ? kBenchStreamRounds : kBenchRounds;
+        if (shape.stream) {
+            // kBegin equivalent: opened ONCE for the whole shape, held in
+            // g_bench_stream across every round. This is the single detail that
+            // makes the shape comparable to a pack download.
+            std::remove(kBenchStream);
+            g_bench_stream = std::fopen(kBenchStream, "wb");
+            if (g_bench_stream == nullptr) {
+                ESP_LOGW(kTag, "storage bench SKIP shape=stream: open failed");
+                continue;
+            }
+        }
+        bool stream_aborted = false;
+        for (int round = 0; round < rounds; ++round) {
             // Checked here, outside the timed window -- see BenchTransaction.
             int64_t info_ms = 0;
             if (!BenchFreeSpaceOk(shape, round, &info_ms)) continue;
@@ -750,6 +854,47 @@ void BenchTask(void*)
             // Give IDLE0 a slot between transactions; the service also yields
             // one tick per transaction, this is belt-and-braces.
             vTaskDelay(2);
+            if (shape.stream &&
+                (esp_timer_get_time() - started_us) / 1000 >=
+                    kBenchStreamAbortMs) {
+                // Cost is already past the point where continuing tells us
+                // anything new, and the remaining rounds are the big ones.
+                stream_aborted = true;
+                ESP_LOGW(kTag,
+                         "storage bench stream ABORT round=%d: cost_ms=%lld "
+                         "exceeds %lld ms",
+                         round,
+                         static_cast<long long>(
+                             (esp_timer_get_time() - started_us) / 1000),
+                         static_cast<long long>(kBenchStreamAbortMs));
+                break;
+            }
+        }
+        if (shape.stream && g_bench_stream != nullptr) {
+            // kCommit equivalent: the fsync and close wp-stream pays once, at
+            // the end. Timed and logged separately from the rounds so the
+            // per-round numbers stay clean.
+            //
+            // [measure] Reported in MICROSECONDS, not ms. 1005.19 printed
+            // `cost_ms=0` here and that zero was then extrapolated 21x to
+            // predict the real download's kCommit -- a sub-resolution zero is
+            // not "free", it is "unmeasured". The real end-of-file cost is
+            // large: the aborted 1.28 MiB download spent 15327 ms in its
+            // closing transaction. Never extrapolate a field that can read 0.
+            const int64_t commit_started_us = esp_timer_get_time();
+            const bool flushed =
+                std::fflush(g_bench_stream) == 0 &&
+                ::fsync(fileno(g_bench_stream)) == 0;
+            const bool closed = std::fclose(g_bench_stream) == 0;
+            g_bench_stream = nullptr;
+            ESP_LOGI(kTag,
+                     "storage bench stream commit: result=%s cost_us=%lld "
+                     "aborted=%d",
+                     (flushed && closed) ? "ESP_OK" : "ESP_FAIL",
+                     static_cast<long long>(
+                         esp_timer_get_time() - commit_started_us),
+                     stream_aborted ? 1 : 0);
+            std::remove(kBenchStream);
         }
     }
 
@@ -757,6 +902,7 @@ void BenchTask(void*)
     std::remove(kBenchTemp);
     std::remove(kBenchBackup);
     std::remove(kBenchAppend);
+    std::remove(kBenchStream);
     size_t end_total = 0;
     size_t end_used = 0;
     if (esp_spiffs_info("storage", &end_total, &end_used) == ESP_OK) {

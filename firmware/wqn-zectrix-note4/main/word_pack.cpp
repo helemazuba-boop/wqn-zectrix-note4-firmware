@@ -1281,6 +1281,21 @@ esp_err_t WordPackStreamTransaction(void* opaque)
                 return ESP_FAIL;
             }
             context->bytes_written += context->chunk_size;
+            // [measure] The decompressed chunk size has to be logged, because
+            // nothing else in the system records it and every per-byte cost
+            // depends on it. The transport is zlib (`received` in wqn_api.cpp
+            // counts COMPRESSED bytes from esp_http_client_read), so the
+            // download's own progress line mixes units: 1005.19 printed
+            // `received=294912` against `bytes_expected=1341248`, which reads
+            // as 22.0% but is bytes-off-the-wire over plaintext bytes. The
+            // decompressed truth was ~88%. Without this line, a per-byte
+            // figure can be off by 4x and no log can show which is right.
+            ESP_LOGI(kTag,
+                     "word pack stream append: chunk_bytes=%u total_bytes=%u "
+                     "of %lu",
+                     static_cast<unsigned>(context->chunk_size),
+                     static_cast<unsigned>(context->bytes_written),
+                     static_cast<unsigned long>(context->item->byte_size));
             return ESP_OK;
 
         case WordPackStreamOperation::kCommit: {
