@@ -17,6 +17,8 @@
   C8    9f1a6d8  候选页快照写搬到 runner
   PK    fbfa950→reverted  包读句柄复用（§十一方案3，已 revert：实测变慢，
                                  判据保留为「open_seek 不得劣化到 >500ms 中位」）
+  OWNERS owner 命名 pass  storage_service.cpp:49/:346 的默认 "background" 桶
+  BENCH  P1 量测 bench   单次元数据操作底价是否成立（重写前提的可证伪化）
 
 退出码：0 = 全部 PASS；1 = 有 FAIL；2 = 用法/读取错误。
 """
@@ -50,6 +52,29 @@ PRESENT_RE = re.compile(
 
 STACK_RE = re.compile(r'RenderFrameToEpd: stack HWM before render: (?P<hwm>\d+) bytes free')
 
+# P1 量测协议（存储侧重写前的插桩）。字段由重写侧约定，判读器只按契约解析：
+#   `atomic write: bytes=%u backup=%d fopen_ms=%lld write_ms=%lld stat_ms=%lld
+#    remove_ms=%lld rename_backup_ms=%lld rename_primary_ms=%lld total_ms=%lld`
+# `total_ms` 是一次 AtomicWrite 的墙钟；前七项是它的组成部分。对账判据就是拿
+# 这七项之和与 total_ms 比——如果加起来远小于 total_ms，瓶颈不在 AtomicWrite，
+# 我们在量一个不相干的东西。
+PROBE_RE = re.compile(
+    r'atomic write: bytes=(?P<bytes>\d+) backup=(?P<backup>\d+) '
+    r'fopen_ms=(?P<fopen>\d+) write_ms=(?P<write>\d+) stat_ms=(?P<stat>\d+) '
+    r'remove_ms=(?P<remove>\d+) rename_backup_ms=(?P<rb>\d+) '
+    r'rename_primary_ms=(?P<rp>\d+) total_ms=(?P<total>\d+)')
+
+# bench 的起止标记。刻意宽容：只要一行里同时出现 bench 与 begin/end 即计入，
+# 不锁定重写侧的措辞，免得它改个词判读器就瞎了。
+BENCH_RE = re.compile(r'(?i)\bbench\b[^\n]*?\b(?P<what>begin|end)\b')
+
+# `storage bench round: shape=%s round=%d wall_ms=%lld result=%s`
+# wall_ms 是一笔 bench 事务的墙钟；probe shape 没有对应的 `atomic write:` 行
+# （它只 fopen 一个不存在的路径），所以逐 op 明细只对写 shape 有意义。
+BENCH_ROUND_RE = re.compile(
+    r'storage bench round: shape=(?P<shape>\S+) round=(?P<round>\d+) '
+    r'wall_ms=(?P<wall>\d+) result=(?P<result>\w+)')
+
 
 @dataclass
 class Log:
@@ -61,6 +86,9 @@ class Log:
     dispatches: list = field(default_factory=list)
     presents: list = field(default_factory=list)
     hwm: list = field(default_factory=list)
+    probes: list = field(default_factory=list)
+    bench_events: list = field(default_factory=list)
+    rounds: list = field(default_factory=list)
     boots: int = 0
 
     @classmethod
@@ -76,6 +104,11 @@ class Log:
         log.dispatches = [m.groupdict() for m in DISPATCH_RE.finditer(text)]
         log.presents = [m.groupdict() for m in PRESENT_RE.finditer(text)]
         log.hwm = [int(m.group('hwm')) for m in STACK_RE.finditer(text)]
+        log.probes = [{k: int(v) for k, v in m.groupdict().items()}
+                      for m in PROBE_RE.finditer(text)]
+        log.bench_events = [m.group('what').lower() for m in BENCH_RE.finditer(text)]
+        log.rounds = [{k: (int(v) if k != 'shape' else v) for k, v in m.groupdict().items()}
+                      for m in BENCH_ROUND_RE.finditer(text)]
         log.boots = text.count('opened COM') or text.count('End of partition table')
         return log
 
@@ -84,6 +117,18 @@ class Log:
 
     def has(self, needle: str) -> bool:
         return needle in self.text
+
+    def owners(self) -> dict:
+        """owner -> (笔数, elapsed 中位, queue_wait 最大)。归因总表用。"""
+        table = {}
+        for t in self.tx:
+            n, med, qw = table.get(t['owner'], (0, [], []))
+            n += 1
+            med.append(int(t['el']))
+            qw.append(int(t['qw']))
+            table[t['owner']] = (n, med, qw)
+        return {o: (n, statistics.median(m), max(q))
+                for o, (n, m, q) in table.items()}
 
 
 # ------------------------------------------------------------------ 判据框架 --
@@ -266,6 +311,98 @@ def hil_pk_handle(log: Log):
            all(c['pa'] < 50 for c in log.cards), 'parse 仍可忽略')
 
 
+def hil_owner_attribution(log: Log):
+    """owner 命名 pass 的回归判据。
+
+    命名之前，不传 owner 的 ExecuteStorageTransaction 一律记成 "background"
+    （storage_service.cpp:49/:346），所以 31 个后台样挤在一个桶里、无法归因——
+    §一 那张表里 `background` 中位 782 / max 4054 因此说不清是谁写的。命名 pass
+    之后这个桶应该是空的。
+
+    判据只在"命名 pass 确实在盘上"时才启用：用 wp-/np-/pp- 前缀的存在与否识别
+    构建。老日志（1005.4 / 1005.6）里 owner=background 是当时的正常形态，判 SKIP
+    而不是 FAIL——否则历史日志会被误判成回归。
+    """
+    owners = log.owners()
+    named = [o for o in owners if o.startswith(('wp-', 'np-', 'pp-'))]
+    defaulted = log.txof('background')
+    if not named:
+        skip(log, 'OWNERS:attribution',
+             '本日志来自 owner 命名 pass 之前的构建，background 桶是当时的正常形态')
+        return
+    expect(log, 'OWNERS:no-default-bucket',
+           not defaulted,
+           f'命名 pass 之后仍有 {len(defaulted)} 笔 owner=background'
+           '（有调用点漏了命名；problem_store 的 background 分支曾被丢 label，'
+           '是已知的同类缺陷）')
+
+
+def hil_storage_bench(log: Log):
+    """P1 量测 bench：把"单次元数据操作的底价"从推测变成测量。
+
+    这个判据组不是"通过/不通过"意义上的测试，而是把重写的前提假设变成可证伪
+    的数字。三个判据分别对应：
+      1. 插桩是否真的解释了耗时（七项之和 vs total）——否则我们在量不相干的东西
+      2. 纯查找底价是否存在——probe shape 对一个不存在的路径 fopen，
+         保证走完整扫描、零数据页，是模型最干净的判据
+      3. bench 有没有反过来拖累别人（它自己的入队等待）
+    """
+    bench_tx = log.txof('storage-bench')
+    if not log.rounds and not log.probes and not bench_tx:
+        skip(log, 'BENCH:ran', '本轮无 storage bench（未跑 P1 量测构建）')
+        return
+    expect(log, 'BENCH:completed',
+           'end' in log.bench_events or not log.bench_events,
+           f'bench 标记 begin/end 配对情况：{log.bench_events}（只有 begin 说明中途挂了）')
+
+    # --- 1. 插桩自证：七项之和应当解释 total 的大部分 -----------------------
+    if log.probes:
+        ratios = []
+        for p in log.probes:
+            parts = p['fopen'] + p['write'] + p['stat'] + p['remove'] + p['rb'] + p['rp']
+            if p['total'] > 0:
+                ratios.append(parts / p['total'])
+        if ratios:
+            med = statistics.median(ratios)
+            expect(log, 'BENCH:op-sum-accounts-for-total', med >= 0.6,
+                   f'七项之和 / total 中位 = {med:.2f}'
+                   f'（<0.6 说明插桩漏掉了主要耗时，结论不可信）')
+
+    # --- 2. 纯查找底价 -----------------------------------------------------
+    by_shape = {}
+    for r in log.rounds:
+        by_shape.setdefault(r['shape'], []).append(r['wall'])
+    if 'probe' in by_shape:
+        probe_med = statistics.median(by_shape['probe'])
+        per_op = None
+        for shape, walls in by_shape.items():
+            if shape.startswith('cur'):
+                per_op = statistics.median(walls) / 5.0  # fopen+write+stat+remove+rename
+                break
+        if per_op is None and log.probes:
+            per_op = statistics.median(p['total'] for p in log.probes) / 5.0
+        if per_op is None:
+            skip(log, 'BENCH:floor-model', '有 probe 但没有可折算单次 op 成本的写 shape')
+        else:
+            ratio = per_op / probe_med if probe_med > 0 else float('inf')
+            holds = probe_med >= 100.0 and 0.4 <= ratio <= 2.5
+            expect(log, 'BENCH:floor-model-holds-or-refuted', holds or probe_med < 20.0,
+                   f'纯查找 probe 中位 {probe_med:.0f} ms；单次元数据 op ≈ '
+                   f'{per_op:.0f} ms（比值 {ratio:.2f}）。probe<20ms 且写很贵 = '
+                   f'底价模型被推翻，重写前提要重议')
+    detail = '；'.join(
+        f'{shape} 中位 {statistics.median(w):.0f} ms (n={len(w)})'
+        for shape, w in sorted(by_shape.items()))
+    if detail:
+        check(log, 'BENCH:shape-costs', 'PASS', True, detail)
+
+    # --- 3. bench 不能反过来堵住别人 ---------------------------------------
+    if bench_tx:
+        worst = max(int(t['qw']) for t in bench_tx)
+        expect(log, 'BENCH:bench-did-not-starve-others', worst < 2000,
+               f'bench 事务自身最大 queue_wait={worst} ms')
+
+
 def hil_stability(log: Log):
     """跨批次通用：不崩、不重启循环、栈不爆。"""
     if log.boots > 1:
@@ -298,7 +435,25 @@ def main(argv):
         hil_c6b_scope_switch(log)
         hil_c8_page_save(log)
         hil_pk_handle(log)
+        hil_owner_attribution(log)
+        hil_storage_bench(log)
         hil_stability(log)
+
+    # 归因总表：命名 pass 之后这里应该列出 10+ 个真实 owner，而不是一个
+    # "background" 桶。打印在判据之前，因为它决定后面所有数字能不能归因。
+    print('—— 事务 owner 分布（笔数 / elapsed 中位 / queue_wait 最大）——')
+    for p in paths:
+        try:
+            log = Log.load(p)
+        except OSError:
+            continue
+        table = log.owners()
+        if not table:
+            continue
+        print(f'  {p}:')
+        for owner in sorted(table, key=lambda o: -table[o][1]):
+            n, med, qw = table[owner]
+            print(f'    {owner:<28} n={n:<4} elapsed 中位 {med:>6} ms   queue_wait 最大 {qw:>6} ms')
 
     width = max(len(r[1]) for r in RESULTS) + 2
     fails = 0
