@@ -87,13 +87,24 @@ constexpr int kMaxSessionsListed = 12;
 // number stops being a manifest entry nobody reads.
 constexpr size_t kMaxTextEventBytes = 8 * 1024;
 constexpr size_t kMaxDeltaEventBytes = 2 * 1024;
-// The manifest's `question_frame_bytes`. Enforced as a refusal because it is
-// unreachable by a conformant peer: the schema caps an ask at 8 options x
-// (value + label) plus the session/form ids and title, which is ~3.7 KB in the
-// worst case -- a frame over 10 KiB is a contract bug, not a big question.
-// Refusing it beats parsing it, because an ask the device cannot hold answer is
-// one the user cannot dismiss.
+// The manifest's `question_frame_bytes`. OBSERVED like the two text bounds, and
+// that used to be a refusal -- see the warning at the frame parser for why that
+// was wrong in both directions: the bound is reachable by a conformant CJK peer
+// (the worst schema-legal questionData is 10,265 B with 3-byte characters and
+// 13,561 B with 4-byte, against 10,240), and refusing the frame dropped the ask,
+// which is the one outcome the guard was meant to prevent.
 constexpr size_t kMaxQuestionFrameBytes = 10 * 1024;
+// How many bytes `{"<field>":""}` costs around the field the manifest actually
+// caps. The manifest's `text_event_bytes` / `delta_event_bytes` bound a STRING
+// (`agent.text.data.text`, `agent.text.delta.data.delta`); the warning below
+// measures `payload.size()`, which is the whole JSON envelope. Comparing them
+// directly made the effective cap that many bytes tighter than the manifest, so
+// a conformant peer sitting at the schema's own `maxLength` ceiling warned on
+// every frame: `{"delta":<2048 chars>}` is 2,060 B against a 2,048 bound.
+// `maxLength` also counts CODE POINTS while this counts BYTES, so multibyte
+// text still overruns -- that part is a real property of the UTF-8 wire and is
+// what the warning is for. This only removes the part that is pure arithmetic.
+constexpr size_t kJsonFieldEnvelopeBytes = 16;
 }  // namespace wqn
 
 namespace {
@@ -109,6 +120,7 @@ using wqn::kMaxSessionsListed;
 using wqn::kMaxTextEventBytes;
 using wqn::kMaxDeltaEventBytes;
 using wqn::kMaxQuestionFrameBytes;
+using wqn::kJsonFieldEnvelopeBytes;
 
 constexpr char kTag[] = "wqn_opencode_api";
 
@@ -1105,7 +1117,8 @@ esp_err_t ParseOpenCodeAgentFrame(
     //   not enforced -- the frame is still parsed and still acted on.
     //
     // Enforcing would be the stricter-looking and wronger choice HERE, which is
-    // the opposite of the question frame below and for a reason worth stating:
+    // the opposite of what this file used to do for `agent.question` and for a
+    // reason worth stating:
     // nobody has measured the v2 gateway's largest text frame from this
     // checkout, and refusing one over 8 KiB would drop the tail of a real
     // answer to protect against a bound the peer may already exceed. A dropped
@@ -1113,22 +1126,33 @@ esp_err_t ParseOpenCodeAgentFrame(
     // SSE budget is what the device actually refuses, so the exposure stays
     // bounded either way.
     //
-    // `agent.question` is the exception and is refused further down: an ask the
-    // device cannot hold is one the user cannot dismiss, and its bound is
-    // unreachable by a conformant peer.
-    if (!acknowledgement && payload.size() > kMaxTextEventBytes &&
+    // `agent.question` USED to be "the exception and is refused further down",
+    // on the claim that its bound was unreachable by a conformant peer. It is
+    // reachable -- see kMaxQuestionFrameBytes -- and the refusal dropped the
+    // ask, so it is no longer an exception.
+    //
+    // The envelope slack: the manifest caps the FIELD, this measures the whole
+    // JSON envelope, and comparing them directly made the effective cap that
+    // many bytes tighter than the manifest intended -- a conformant peer
+    // sitting at the schema's own `maxLength` warned on every frame. See
+    // kJsonFieldEnvelopeBytes. What is left over after removing it is real:
+    // `maxLength` counts code points and this counts bytes, so multibyte text
+    // at the ceiling still warns, which is the point of the warning.
+    const size_t text_envelope = kMaxTextEventBytes + kJsonFieldEnvelopeBytes;
+    const size_t delta_envelope = kMaxDeltaEventBytes + kJsonFieldEnvelopeBytes;
+    if (!acknowledgement && payload.size() > text_envelope &&
         (event_name == "agent.text" || event_name == "agent.reasoning")) {
         ESP_LOGW(kTag,
-                 "agent frame %s is %u B, over the manifest's text_event_bytes=%u -- "
-                 "parsing anyway",
+                 "agent frame %s is %u B, over the manifest's text_event_bytes=%u "
+                 "plus its JSON envelope -- parsing anyway",
                  event_name.c_str(), static_cast<unsigned>(payload.size()),
                  static_cast<unsigned>(kMaxTextEventBytes));
     }
-    if (!acknowledgement && payload.size() > kMaxDeltaEventBytes &&
+    if (!acknowledgement && payload.size() > delta_envelope &&
         (event_name == "agent.text.delta" || event_name == "agent.reasoning.delta")) {
         ESP_LOGW(kTag,
-                 "agent frame %s is %u B, over the manifest's delta_event_bytes=%u -- "
-                 "parsing anyway",
+                 "agent frame %s is %u B, over the manifest's delta_event_bytes=%u "
+                 "plus its JSON envelope -- parsing anyway",
                  event_name.c_str(), static_cast<unsigned>(payload.size()),
                  static_cast<unsigned>(kMaxDeltaEventBytes));
     }
@@ -1186,19 +1210,39 @@ esp_err_t ParseOpenCodeAgentFrame(
             return ESP_ERR_INVALID_RESPONSE;
         }
     } else if (event_name == "agent.question") {
-        // [bounds] The manifest's `question_frame_bytes`, ENFORCED -- unlike the
-        // two text bounds above, because this one is arithmetic rather than a
-        // measurement: the schema caps an ask at 8 options, each a value plus a
-        // label, around three fixed ids and a title. That is ~3.7 KB in the worst
-        // legal case, so a 10 KiB question is a contract bug and not a big form.
+        // [bounds] The manifest's `question_frame_bytes`, OBSERVED like the two
+        // text bounds above -- and it used to be ENFORCED here, which was wrong
+        // twice over.
         //
-        // Refusing beats parsing it because the ask is modal: it owns every key
-        // until it is answered, and the only escape is the 自定义回答 pseudo-option
-        // that interrupts the run. An ask the device cannot hold is therefore one
-        // the user cannot dismiss, and a log line is not a way out of it.
+        // (1) The bound is reachable by a conformant peer, so the refusal fired
+        // on legal traffic. `maxLength` counts CODE POINTS and the wire is UTF-8:
+        // computing the worst schema-legal `questionData` (session_id 128 ASCII
+        // by pattern, question_id 128, title 160, 8 x {value 256, label 120})
+        // gives 3,673 B all-ASCII, 10,265 B with CJK and 13,561 B with astral
+        // characters -- against a 10,240 B bound. CJK is the ordinary case for a
+        // Chinese-language product, not the exotic one. The first version of
+        // this check measured only the ASCII worst case and concluded the bound
+        // was unreachable.
+        //
+        // (2) Refusing it dropped the ask, and a dropped ask is the one outcome
+        // the original comment claimed to prevent. DispatchAgentEvent logs a
+        // refused frame and returns; it does not end the stream. So the run
+        // continued, the user never saw the question, and no reply was ever
+        // POSTed -- the gateway sat waiting on an answer the device had thrown
+        // away. Parsing it instead renders each label through
+        // AgentOneLine(label, 88), which truncates to one line, so the user can
+        // still answer or take the 自定义回答 pseudo-option that interrupts.
+        // "Cannot hold" and "cannot dismiss" were being conflated: parsing is
+        // what makes it dismissable.
+        //
+        // What is left of the bound is the diagnostic: a frame over it is logged
+        // once, naming the event, the size and the bound.
         if (payload.size() > kMaxQuestionFrameBytes) {
-            cJSON_Delete(root);
-            return ESP_ERR_INVALID_SIZE;
+            ESP_LOGW(kTag,
+                     "agent frame %s is %u B, over the manifest's "
+                     "question_frame_bytes=%u -- parsing anyway",
+                     event_name.c_str(), static_cast<unsigned>(payload.size()),
+                     static_cast<unsigned>(kMaxQuestionFrameBytes));
         }
         // One step of a question sequence: the gateway walks a multi-field
         // form one field at a time and reuses `question_id` as the step id
