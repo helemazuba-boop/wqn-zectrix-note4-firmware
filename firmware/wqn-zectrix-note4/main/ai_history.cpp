@@ -221,7 +221,7 @@ bool AiHistory::ReplaceText(ChatMessageId id, ChatMessageKind expected_kind,
         return true;
     }
     xSemaphoreGive(mutex_);
-    // [D3] This was silent, and it cannot be: the id-not-found case is the one
+    // [evict-recovery] This was silent, and it cannot be: the id-not-found case is the one
     // a streaming mirror hits when the ring evicts the entry it has been
     // growing for the whole answer. Logged at warning because every caller
     // that ignores the return value is now losing an entry, and the fix

@@ -99,7 +99,7 @@ public:
     // Replace a known message without changing order. The kind guard prevents a
     // late event from overwriting a different message after eviction/clear.
     //
-    // [D3] The id can be gone for two very different reasons -- the ring
+    // [evict-recovery] The id can be gone for two very different reasons -- the ring
     // evicted it, or it never belonged to this kind -- and the return value
     // cannot tell them apart, which mattered once AiSession began mirroring
     // streamed text into history on every render tick (doc/1005 item D1): a

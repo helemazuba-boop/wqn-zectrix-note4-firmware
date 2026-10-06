@@ -1422,7 +1422,7 @@ wqn::AiStreamingStatusView streaming_view{};
                            state.ai.tier == wqn::AiTier::kStd &&
                            (state.ai.status == wqn::AiSessionStatus::kStreaming ||
                             state.ai.status == wqn::AiSessionStatus::kListening)) {
-                    // [D6] STD/Pro had no merge floor at all, so every SSE delta
+                    // [std-throttle] STD/Pro had no merge floor at all, so every SSE delta
                     // reached the panel: each ReplaceText on the mirrored answer
                     // bumps the history revision, which invalidates the snapshot
                     // cache and re-copies the whole message vector. The panel
