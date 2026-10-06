@@ -1,0 +1,15 @@
+# HIL log-reading smoke fixture for scripts/hil_check.py.
+# Synthetic — contains no device data. It pins the parser against the
+# transaction, gate-self-test and stack-HWM line formats, so a regression in
+# those regular expressions surfaces as a failing criterion in CI.
+# Regenerate the expected output with:
+#   python3 scripts/hil_check.py scripts/testdata/hil_smoke.txt
+
+I (1000) wqn_ui_gates: commit_state gate self-test passed
+
+I (1100) RenderFrameToEpd: stack HWM before render: 8584 bytes free
+
+I (1200) storage_service: storage transaction complete: request=1 owner=word-observation-commit queue_wait_ms=0 elapsed_ms=12 result=ESP_OK
+I (1400) storage_service: storage transaction complete: request=2 owner=word-scope-reset queue_wait_ms=0 elapsed_ms=18 result=ESP_OK
+I (1600) storage_service: storage transaction complete: request=3 owner=note-observation-commit queue_wait_ms=0 elapsed_ms=9 result=ESP_OK
+I (1700) storage_service: storage transaction complete: request=4 owner=note-session-save queue_wait_ms=0 elapsed_ms=11 result=ESP_OK
