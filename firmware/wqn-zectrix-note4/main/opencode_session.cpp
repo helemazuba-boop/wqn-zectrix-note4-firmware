@@ -121,6 +121,14 @@ wqn::services::ConnectivityDemand g_connectivity_demand;
 // seen as running again until the picker was reopened.
 bool g_observed_run_live = false;
 
+// [409-live] Set by the run tail when the upstream answered a submission with
+// 409 and the device downgraded it to an observe. Positive evidence that a run
+// is executing, straight from the party running it -- which is why
+// AgentRunInFlightLocked consults it before the picker row, and why the row's
+// staleness cannot suppress it. Cleared on every path that retires the turn
+// the same way g_observed_run_live is.
+bool g_upstream_run_live = false;
+
 void DiscardOutboundReplies();
 // Declared up here: clearing a pending ask is part of every terminal status and
 // of every list load, which run long before the definition below.
@@ -257,6 +265,30 @@ bool AgentRunInFlightLocked()
     if (!g_observing && g_state.stream_active) {
         return true;
     }
+    // [409-live] A submission the upstream answered 409. This is the strongest
+    // evidence in the list and it used to be invisible here, which cost two
+    // things at once. The criterion is what publishes run_live, and
+    // RefreshAgentRunLeaseLocked reads it directly -- so a live run released
+    // the sleep lease. And the bottom band's kRunning branch reads run_live to
+    // name the gesture, so it printed 长按=发起新任务 while
+    // TryApplyAgentAiButtonEvent routed on stream_active alone and aborted the
+    // very run that was in flight. A destructive gesture must never be named
+    // as a benign one; that is the failure this band exists to prevent.
+    //
+    // None of the other three sources could see it: this branch sets
+    // g_observing (so source (3)'s !g_observing test fails), it does not set
+    // g_history_refresh, and it clears g_observed_run_live because no frame has
+    // been read. The picker row is the only evidence left, and a stale row is
+    // exactly the staleness this whole family exists for. The 409 answer is
+    // upstream stating in as many words that a run is executing on this
+    // device+session, so it belongs here rather than being inferred.
+    //
+    // Cleared wherever g_observed_run_live is: the flag asserts something
+    // about the turn that just ended, and the next ask is the next frame, a
+    // terminal status, a detach, or a fresh list read.
+    if (g_upstream_run_live) {
+        return true;
+    }
     // Everything below is a claim about somebody else's run, which this device
     // can only make while it is attached to that session's stream.
     if (!g_observing || !g_state.stream_active) {
@@ -388,6 +420,7 @@ void SettleWatchedSessionOutcomeLocked()
         }
     }
     g_observed_run_live = false;
+    g_upstream_run_live = false;
 }
 
 void SetErrorLocked(const std::string& message)
@@ -532,8 +565,11 @@ bool FinishSwitchedStreamLocked()
     g_observing = false;
     // The stream we just left is the only thing that could still have proven a
     // run was live, and it is gone. Its evidence goes with it: the follow-up
-    // that inherits this state decides its own lease from its own facts.
+    // that inherits this state decides its own lease from its own facts. A 409
+    // the deprecated run raised goes with it -- the run is somebody else's now
+    // that this device is no longer attached to the session.
     g_observed_run_live = false;
+    g_upstream_run_live = false;
     g_state.stream_active = false;
     g_state.ui.phase = wqn::AiFeaturePhase::kLoading;
     g_state.ui.status_label = "正在切换";
@@ -677,6 +713,7 @@ void LoadSessions()
             g_state.history_loaded_session_id.clear();
             g_observing = false;
             g_observed_run_live = false;
+            g_upstream_run_live = false;
             g_state.ui.context_label.clear();
             g_state.ui.prompt_text.clear();
             g_state.ui.response_text.clear();
@@ -1822,6 +1859,14 @@ void RunPrompt()
         // The stream supplies the lease criterion from here, so the frames
         // decide rather than inheriting the submission's hold.
         g_observed_run_live = false;
+        // [409-live] The exception to the line above, and the reason this branch
+        // is not left to the frames: the 409 IS a frame's worth of evidence,
+        // from the party running the task. Publishing it here means the very
+        // next line's refresh sees the run that the action_hint two lines up
+        // already promised to abort -- the band names the gesture from exactly
+        // this answer, so without it 长按=中止 was drawn on a device that had
+        // just released the lease for the run it was about to stop.
+        g_upstream_run_live = true;
         RefreshAgentRunLeaseLocked();
         ChainWorkerCommandLocked(WorkerCommand::kObserveSession);
         ESP_LOGI(kTag, "run 409 on %s: downgraded to observe",
@@ -2029,6 +2074,7 @@ void ObserveSession()
     // next attach) is what stops a detached stream's last delta from holding
     // the lease for the rest of the session's life.
     g_observed_run_live = false;
+    g_upstream_run_live = false;
     xSemaphoreGive(g_lock);
     DiscardOutboundReplies();
 }
@@ -2538,8 +2584,10 @@ esp_err_t ObserveOpenCodeSession(OpenCodeRejectReason* reason)
         ResetAgentHistoryTurnLocked();
         // The stream has not produced a frame yet, so a previous attach's
         // evidence must not be inherited by this one -- it would hold the lease
-        // on a session this attach has seen nothing from.
+        // on a session this attach has seen nothing from. A previous turn's 409
+        // is the same kind of stale claim, so it goes too.
         g_observed_run_live = false;
+        g_upstream_run_live = false;
         if (!ArmWorkerLocked(needs_history ? WorkerCommand::kLoadHistory
                                            : WorkerCommand::kObserveSession)) {
             g_run_session_id.clear();
