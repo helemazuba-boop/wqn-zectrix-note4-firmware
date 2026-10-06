@@ -1739,6 +1739,16 @@ void CreateSession()
         g_state.ui.scroll_offset_lines = 0;
         g_state.ui.requires_confirmation = false;
         g_state.confirmation_armed_at_ms = 0;
+        // [agent] Same reasoning as LockSelectedOpenCodeSession: the mirrored
+        // transcript belongs to the session that produced it. A new session is the
+        // strongest form of that switch, and this path is reachable with the
+        // channel still holding the previous session's bubbles -- the picker only
+        // clears `session_locked` (ui_input.cpp), never the channel, so
+        // "lock a session with a transcript, open the picker, long-confirm create"
+        // used to render the OLD conversation under the NEW session's title.
+        // ResetAgentHistoryTurnLocked only retires the ids being written to; the
+        // already-written entries stay on screen without this.
+        wqn::GetAiHistory(wqn::AiHistoryChannel::kAgent).Clear();
         ResetAgentHistoryTurnLocked();
         MarkChangedLocked();
         ReleaseWorkOwnershipLocked();

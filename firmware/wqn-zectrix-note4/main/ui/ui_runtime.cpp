@@ -907,10 +907,15 @@ UiUpdate UiRuntime::DispatchAiViewportFollow()
     int32_t max_scroll = 0;
     GetAiScrollBounds(snapshot, state_.ai.expand_content, &min_scroll, &max_scroll);
 
-    // Has the answer body started? The Agent mirrors its text straight into
-    // the history, so the newest entry IS the body. STD/Pro streams into
-    // assistant_partial until the seal, so the mirror alone cannot answer this
-    // -- a partial that has not been sealed yet is still a started body.
+    // Has the answer body started? Both tiers now mirror their streamed text
+    // straight into history, so the newest non-empty assistant entry IS the body
+    // on either one and GetAiNewestAnswerTopOffsetLines can answer it directly.
+    // assistant_partial stays in the predicate as the tier-independent fallback:
+    // it is set unconditionally on every delta while the mirror rides the 50 ms
+    // render watermark (ai_session.cpp), so on the tick a body starts it can be
+    // non-empty up to a watermark period before the history write lands.
+    // `answer_top` is still consumed only by the Agent tier -- the STD viewport
+    // follow has no per-tier scroll offset of its own to park.
     int32_t answer_top = 0;
     const bool body_started =
         GetAiNewestAnswerTopOffsetLines(snapshot, state_.ai.expand_content, &answer_top) ||

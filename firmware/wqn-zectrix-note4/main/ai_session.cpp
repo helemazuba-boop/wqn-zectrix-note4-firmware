@@ -41,7 +41,7 @@ constexpr int kMaxAudioDurationMs = 20000;
 constexpr int kMinAudioPeak = 80;
 constexpr int kMinAudioRms = 8;
 constexpr TickType_t kWifiReadyWait = pdMS_TO_TICKS(35000);
-// [D2] Bound on the streamed answer's accumulated text, and therefore on the
+// [mirror-cap] Bound on the streamed answer's accumulated text, and on the
 // one history entry that grows with it. The same figure the Agent tier uses,
 // for the same reason: an entry larger than this evicts the ring's head before
 // the reply finishes. Declared as an alias of the Agent constant rather than a
@@ -199,7 +199,28 @@ bool FinalizeAssistantLocked(wqn::AiHistory& history, const std::string& authori
                              int64_t now_ms)
 {
     if (!authoritative.empty()) {
-        g_turn.assistant_text = authoritative;
+        // [mirror-cap] The authoritative text gets the same bound the streamed
+        // accumulation does -- and this is where that bound actually matters most,
+        // not in kTextDelta. Capping only the deltas looked sufficient because
+        // kTextEnd is "a whole-text overwrite", but the overwrite is exactly what
+        // lands in history: ResolveSegmentTextLocked hands back the server's full
+        // text whenever no tool sealed a segment (the plain-text answer, i.e. the
+        // common case), so a turn that streamed under the cap still wrote an
+        // uncapped 30 KiB entry at the terminal frame and evicted the
+        // conversation's head -- the precise failure the cap exists to prevent,
+        // arriving through the one path explicitly declared not to need it.
+        //
+        // Truncating here rather than in the callers covers kTextEnd and kFinal in
+        // one place. kTurnDone passes ResolveSegmentTextLocked's fallback, which is
+        // the already-capped streamed text, so capping it again is a no-op; the
+        // streaming call sites pass the capped accumulation for the same reason.
+        //
+        // Prefer the authoritative text over the streamed prefix when both fit:
+        // it is the server's own reconciliation and carries anything the deltas
+        // dropped. Keeping its first 12 KiB beats keeping the stream's first 12 KiB.
+        g_turn.assistant_text.assign(
+            authoritative.data(),
+            wqn::Utf8SafePrefixBytes(authoritative, kMaxStreamingAnswerBytes));
     }
     if (!g_turn.user_committed || g_turn.assistant_text.empty()) {
         return false;
@@ -212,7 +233,7 @@ bool FinalizeAssistantLocked(wqn::AiHistory& history, const std::string& authori
                             g_turn.assistant_text, now_ms)) {
         return true;
     }
-    // [D3] The id is no longer in the ring with the kind we expect. Before item
+    // [evict-recovery] The id is no longer in the ring with the kind we expect. Before item
     // D1 of doc/1005 this was unreachable for a growing entry, because every
     // write came with a fresh id from a seal -- so a false return was always a
     // kind mismatch and correctly a no-op. The mirror changes that: one entry
@@ -556,7 +577,7 @@ void OnSseEvent(const wqn::WqnAiSseEvent& ev)
                 SealAssistantSegmentLocked(history, now_ms);
                 g_turn.text_started = true;
             }
-            // [D5] assistant_partial is deliberately NOT bounded here. Its two
+            // [mirror-cap] assistant_partial is deliberately NOT bounded here. Its two
             // consumers (ui_runtime.cpp body_started, ui_input.cpp
             // AnswerBodyStarted) only test whether it is non-empty, so a bound
             // would be harmless to them -- but it is also the field the plan
@@ -566,14 +587,15 @@ void OnSseEvent(const wqn::WqnAiSseEvent& ev)
             // kTextEnd, so its lifetime is one segment, not one answer.
             g_state.assistant_partial += ev.delta;
             g_turn.assistant_text += ev.delta;
-            // [D2] Bound the streamed answer at the same 12 KiB the Agent tier
-            // uses (kMaxAgentTextBytes in agent_round_policy.h). This is not
-            // defensive tidying: with item D1 one entry now grows for the whole
+            // [mirror-cap] Bound the streamed answer at the same 12 KiB the Agent
+            // tier uses (kMaxAgentTextBytes in agent_round_policy.h). This is not
+            // defensive tidying: with item D1 one entry grows for the whole
             // answer, and an unbounded entry evicts the ring's head -- the rest
             // of the conversation -- before the reply finishes. The bound is on
-            // this line and NOT on kTextEnd, because kTextEnd is a whole-text
-            // overwrite; what has to be bounded is the accumulation that feeds
-            // the mirror.
+            // this line because this is the accumulation that feeds the mirror;
+            // the authoritative-text path is bounded in FinalizeAssistantLocked,
+            // which is where an uncapped write actually reached history (see the
+            // [mirror-cap] note there -- bounding only this line left that hole).
             //
             // Cut on a character boundary, never through one: the Agent tier
             // already does this with Utf8SafePrefixBytes and that helper is the
@@ -585,7 +607,7 @@ void OnSseEvent(const wqn::WqnAiSseEvent& ev)
                     wqn::Utf8SafePrefixBytes(g_turn.assistant_text,
                                              kMaxStreamingAnswerBytes));
             }
-            // [D1] Symptom 1's fix: mirror the streamed text into history as it
+            // [stream-mirror] Symptom 1's fix: mirror the streamed text into history as
             // arrives, so a batched download is reusable by the STD model and a
             // tool-interleaved turn lands in ITS OWN entries rather than one
             // lump at the end. Without this, only a seal or a terminal writes
