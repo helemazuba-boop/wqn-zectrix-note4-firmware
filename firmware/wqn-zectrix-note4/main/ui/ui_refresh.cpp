@@ -572,12 +572,16 @@ std::string FrameSignature(const wqn::UiFrame& frame)
         signature.push_back('/');
         signature.append(std::to_string(agent.selected_session));
         signature.push_back('/');
-        // [run-live] The bottom band's gesture hint switches on this bit, and the
-        // bit flips from a worker tail -- with no other field changing. Without
-        // it here, layer-1 dedup skips the one repaint the flip is for and the
-        // hint keeps the previous gesture's words on screen.
-        signature.push_back(agent.run_live ? 'R' : '.');
-        signature.push_back('/');
+        // [run-live] Not here any more. This bit used to carry the bottom band's
+        // gesture hint, and the band is interactive-only now, so a flip of it
+        // changes no pixel -- while still building a frame from a worker tail that
+        // may have changed nothing else either. Keeping it would have been the
+        // same dead signature entry as action_hint, in the other direction: there
+        // it suppressed a needed repaint, here it manufactures an unneeded one.
+        //
+        // Every site that flips it also writes phase / status_label /
+        // activity_text or rewrites the session rows below, all of which are still
+        // in this signature, so no repaint is lost.
         signature.append(agent.current_session_id);
         for (const wqn::AgentSessionOption& session : agent.sessions) {
             signature.push_back('/');
