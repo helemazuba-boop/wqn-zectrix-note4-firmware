@@ -60,12 +60,12 @@ ESP-IDF **v5.5.x** required.
 
 ```sh
 cd firmware/wqn-zectrix-note4
-source /home/unknow/esp/esp-idf-v5.5/export.sh
+source <esp-idf-dir>/export.sh
 idf.py -B build-wsl build
 ```
 
 > The tracked READMEs / `BUILD_HERE.md` / `CLAUDE.md` were written for the
-> maintainer's Windows workspace and use `build-ai-local-s3` + a `D:\...`
+> maintainer's Windows workspace and use `build-ai-local-s3` + a Windows-local
 > ESP-IDF path. Both are valid; **match whichever build dir already exists in
 > the current checkout** and do not create a second one casually. If you truly
 > need another, name it `build-<purpose>-<date>` and note it in `BUILD_HERE.md`.
@@ -368,7 +368,7 @@ Before presenting a change as done or committing it:
 
 ```sh
 cd firmware/wqn-zectrix-note4
-source /home/unknow/esp/esp-idf-v5.5/export.sh
+source <esp-idf-dir>/export.sh
 idf.py -B build-wsl build        # EXIT=0, 0 warnings, "M8 ownership gate passed"
 git -c core.whitespace=cr-at-eol diff --check   # clean (CRLF-aware; see §7)
 ```

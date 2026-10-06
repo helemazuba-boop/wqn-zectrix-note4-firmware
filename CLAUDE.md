@@ -20,9 +20,9 @@ The detailed English firmware README is `firmware/wqn-zectrix-note4/README.md`;
 comments are mixed Chinese/English; identifiers are English.
 
 > Environment note: the tracked READMEs and `BUILD_HERE.md` were written for the
-> maintainer's Windows workspace and reference `D:\projects\wqn-zectrix-note4-firmware`
-> plus `D:\Program\Espressif\frameworks\esp-idf-v5.5.4`. This checkout lives at
-> `/home/unknow/projects/firmware` (WSL). The `idf.py` commands below are
+> maintainer's Windows workspace and reference `<repo-root>`
+> plus `<esp-idf-dir>`. This checkout lives at
+> `<repo-root>` (WSL). The `idf.py` commands below are
 > environment-agnostic once the ESP-IDF env is activated; adjust the `cd` and IDF
 > activation path to wherever ESP-IDF lives in the current environment.
 
