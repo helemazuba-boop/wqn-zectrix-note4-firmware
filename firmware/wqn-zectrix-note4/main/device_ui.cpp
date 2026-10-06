@@ -1418,6 +1418,31 @@ wqn::AiStreamingStatusView streaming_view{};
                     } else {
                         last_agent_render_ms = now_ms_d;
                     }
+                } else if (state.screen == wqn::UiScreen::kAi &&
+                           state.ai.tier == wqn::AiTier::kStd &&
+                           (state.ai.status == wqn::AiSessionStatus::kStreaming ||
+                            state.ai.status == wqn::AiSessionStatus::kListening)) {
+                    // [D6] STD/Pro had no merge floor at all, so every SSE delta
+                    // reached the panel: each ReplaceText on the mirrored answer
+                    // bumps the history revision, which invalidates the snapshot
+                    // cache and re-copies the whole message vector. The panel
+                    // partial is ~734 ms, so a token-cadence stream kept the EPD
+                    // owner permanently behind. Same 300 ms tier as Flash, not
+                    // the Agent's 500 ms: STD carries text only -- no tool frames
+                    // -- so its cadence is Flash's cadence. (Flash keeps its own
+                    // branch above, keyed on flash_is_streaming, which also
+                    // covers its kWaitingReply gap; that is Flash's business,
+                    // not this change's.)
+                    // kListening is in the gate on purpose: asr.delta grows the
+                    // pending user bubble at recognizer cadence, which is the
+                    // same burn through a different buffer.
+                    static int64_t last_std_render_ms = 0;
+                    const int64_t now_ms_d = esp_timer_get_time() / 1000;
+                    if (now_ms_d - last_std_render_ms < 300) {
+                        skip_for_throttle = true;
+                    } else {
+                        last_std_render_ms = now_ms_d;
+                    }
                 }
                 if (skip_for_throttle) {
                     ESP_LOGI(kTag, "stream refresh throttled (coalescing deltas)");

@@ -12,6 +12,7 @@
 #include <utility>
 
 #include "ai_history.h"
+#include "agent_round_policy.h"
 #include "audio_capture.h"
 #include "audio_pcm_dump.h"
 #include "config.h"
@@ -40,6 +41,14 @@ constexpr int kMaxAudioDurationMs = 20000;
 constexpr int kMinAudioPeak = 80;
 constexpr int kMinAudioRms = 8;
 constexpr TickType_t kWifiReadyWait = pdMS_TO_TICKS(35000);
+// [D2] Bound on the streamed answer's accumulated text, and therefore on the
+// one history entry that grows with it. The same figure the Agent tier uses,
+// for the same reason: an entry larger than this evicts the ring's head before
+// the reply finishes. Declared as an alias of the Agent constant rather than a
+// copy so the two tiers cannot drift -- if one is ever retuned, the other
+// moves with it, and the plan's "same shape as Agent" stays true by
+// construction rather than by review.
+constexpr size_t kMaxStreamingAnswerBytes = wqn::kMaxAgentTextBytes;
 
 SemaphoreHandle_t g_lock = nullptr;
 TaskHandle_t g_ai_worker = nullptr;
@@ -199,8 +208,32 @@ bool FinalizeAssistantLocked(wqn::AiHistory& history, const std::string& authori
         g_turn.assistant_id = history.AppendAssistant(g_turn.assistant_text, now_ms);
         return g_turn.assistant_id != wqn::kInvalidChatMessageId;
     }
-    return history.ReplaceText(g_turn.assistant_id, wqn::ChatMessageKind::kAssistant,
-                               g_turn.assistant_text, now_ms);
+    if (history.ReplaceText(g_turn.assistant_id, wqn::ChatMessageKind::kAssistant,
+                            g_turn.assistant_text, now_ms)) {
+        return true;
+    }
+    // [D3] The id is no longer in the ring with the kind we expect. Before item
+    // D1 of doc/1005 this was unreachable for a growing entry, because every
+    // write came with a fresh id from a seal -- so a false return was always a
+    // kind mismatch and correctly a no-op. The mirror changes that: one entry
+    // now grows for the whole streamed answer, and a long conversation can evict
+    // it mid-answer. Left as a silent false return, every subsequent Replace --
+    // including the one kTextEnd makes -- is a no-op and the ENTIRE answer
+    // vanishes from history, which is worse than the bug D1 fixes.
+    //
+    // Re-append, but only for eviction. A kind mismatch is a real logic error
+    // (this id belongs to some other message) and re-appending against it would
+    // duplicate the bubble -- the one symptom this plan exists to remove.
+    // Contains() is what tells the two apart, and it is the only reason that
+    // predicate exists.
+    if (history.Contains(g_turn.assistant_id, wqn::ChatMessageKind::kAssistant)) {
+        return false;
+    }
+    ESP_LOGW(kTag, "assistant entry %llu evicted mid-answer; re-appending %u B",
+             static_cast<unsigned long long>(g_turn.assistant_id),
+             static_cast<unsigned>(g_turn.assistant_text.size()));
+    g_turn.assistant_id = history.AppendAssistant(g_turn.assistant_text, now_ms);
+    return g_turn.assistant_id != wqn::kInvalidChatMessageId;
 }
 
 // [tool-order] Commit the open text run as its own assistant history entry so
@@ -523,8 +556,35 @@ void OnSseEvent(const wqn::WqnAiSseEvent& ev)
                 SealAssistantSegmentLocked(history, now_ms);
                 g_turn.text_started = true;
             }
+            // [D5] assistant_partial is deliberately NOT bounded here. Its two
+            // consumers (ui_runtime.cpp body_started, ui_input.cpp
+            // AnswerBodyStarted) only test whether it is non-empty, so a bound
+            // would be harmless to them -- but it is also the field the plan
+            // measured as having no renderer, and bounding a field nobody reads
+            // while leaving the one that costs the ring unbounded would be the
+            // wrong fix in the right place. It is cleared at every seal and at
+            // kTextEnd, so its lifetime is one segment, not one answer.
             g_state.assistant_partial += ev.delta;
             g_turn.assistant_text += ev.delta;
+            // [D2] Bound the streamed answer at the same 12 KiB the Agent tier
+            // uses (kMaxAgentTextBytes in agent_round_policy.h). This is not
+            // defensive tidying: with item D1 one entry now grows for the whole
+            // answer, and an unbounded entry evicts the ring's head -- the rest
+            // of the conversation -- before the reply finishes. The bound is on
+            // this line and NOT on kTextEnd, because kTextEnd is a whole-text
+            // overwrite; what has to be bounded is the accumulation that feeds
+            // the mirror.
+            //
+            // Cut on a character boundary, never through one: the Agent tier
+            // already does this with Utf8SafePrefixBytes and that helper is the
+            // existing implementation (it moved into the shared, ESP-IDF-free
+            // header in f5ff266, so there is nothing to copy -- the plan's D2
+            // note about having to duplicate ~22 lines predates that).
+            if (g_turn.assistant_text.size() > kMaxStreamingAnswerBytes) {
+                g_turn.assistant_text.resize(
+                    wqn::Utf8SafePrefixBytes(g_turn.assistant_text,
+                                             kMaxStreamingAnswerBytes));
+            }
             // [D1] Symptom 1's fix: mirror the streamed text into history as it
             // arrives, so a batched download is reusable by the STD model and a
             // tool-interleaved turn lands in ITS OWN entries rather than one

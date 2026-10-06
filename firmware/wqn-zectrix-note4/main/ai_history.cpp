@@ -221,7 +221,32 @@ bool AiHistory::ReplaceText(ChatMessageId id, ChatMessageKind expected_kind,
         return true;
     }
     xSemaphoreGive(mutex_);
+    // [D3] This was silent, and it cannot be: the id-not-found case is the one
+    // a streaming mirror hits when the ring evicts the entry it has been
+    // growing for the whole answer. Logged at warning because every caller
+    // that ignores the return value is now losing an entry, and the fix
+    // (re-append) belongs at the call site that knows which entry it was.
+    ESP_LOGW(kTag, "ReplaceText: id %llu not in ring (cap %u B, %u msgs)",
+             static_cast<unsigned long long>(id),
+             static_cast<unsigned>(cap_bytes_),
+             static_cast<unsigned>(messages_.size()));
     return false;
+}
+
+bool AiHistory::Contains(ChatMessageId id, ChatMessageKind kind) const
+{
+    if (id == kInvalidChatMessageId || mutex_ == nullptr) {
+        return false;
+    }
+    xSemaphoreTake(mutex_, portMAX_DELAY);
+    bool found = false;
+    for (const ChatMessage& msg : messages_) {
+        if (msg.id != id) continue;
+        found = (msg.kind == kind);
+        break;
+    }
+    xSemaphoreGive(mutex_);
+    return found;
 }
 
 bool AiHistory::PopLastIf(ChatMessageKind kind)

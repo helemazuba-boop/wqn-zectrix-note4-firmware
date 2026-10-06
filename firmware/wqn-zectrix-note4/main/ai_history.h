@@ -98,8 +98,24 @@ public:
 
     // Replace a known message without changing order. The kind guard prevents a
     // late event from overwriting a different message after eviction/clear.
+    //
+    // [D3] The id can be gone for two very different reasons -- the ring
+    // evicted it, or it never belonged to this kind -- and the return value
+    // cannot tell them apart, which mattered once AiSession began mirroring
+    // streamed text into history on every render tick (doc/1005 item D1): a
+    // long answer grows one entry for its whole lifetime, so eviction became
+    // reachable mid-answer, and a caller that mistook "evicted" for "kind
+    // mismatch" would re-append and duplicate the bubble while a caller that
+    // mistook it for success would lose the answer outright. Contains()
+    // answers which of the two it was.
     bool ReplaceText(ChatMessageId id, ChatMessageKind expected_kind,
                      std::string_view text, int64_t now_ms);
+
+    // True while `id` is still in the ring AND still carries `kind`. Distinguishes
+    // an evicted entry from one that changed kind, which the bare bool from
+    // ReplaceText cannot. Used by the streaming mirror to recover from eviction
+    // instead of silently dropping the rest of the answer.
+    bool Contains(ChatMessageId id, ChatMessageKind kind) const;
 
     bool PopLastIf(ChatMessageKind kind);
     std::shared_ptr<const AiHistorySnapshot> Snapshot() const;
