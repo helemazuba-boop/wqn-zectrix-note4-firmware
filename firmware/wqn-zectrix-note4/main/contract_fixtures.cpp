@@ -1902,7 +1902,8 @@ constexpr char kAgentRoundBoundaryStream[] = R"json([
   { "event": "agent.status", "data": { "status": "idle", "message": "执行完成" } }
 ])json";
 
-// `valid/accepted-without-data-stream.json`. The shape that proved the parser// disagreed with its own schema. streamFrame requires only `event` and lists
+// `valid/accepted-without-data-stream.json`. The shape that proved the parser
+// disagreed with its own schema. streamFrame requires only `event` and lists
 // `data` as optional, with the description "Empty for the two acknowledgements" --
 // so a gateway that omits the field entirely is conformant, and the device parsed
 // an absent payload as an empty JSON document, got null, and dropped BOTH

@@ -729,12 +729,21 @@ void HandleUiInput(UiState* state, UiInput input)
         } else if (state->agent.session_locked && !state->agent.stream_active) {
             const esp_err_t result = wqn::ObserveOpenCodeSession();
             if (result != ESP_OK) {
-                // Expected whenever the leaving attach has not finished detaching
-                // yet: LeaveOpenCodeAgentTier only ARMS the switch, and the
-                // worker's tail clears stream_active asynchronously, so the flag
-                // can still read true here. Logged rather than retried -- the
+                // The worker slot is taken -- kNoSession cannot happen, this
+                // branch requires current_session_id to be non-empty. What holds
+                // it is a backfill still reading the transcript the last entry
+                // armed, or a run, or a list load whose success branch has not
+                // cleared session_locked yet. Logged rather than retried: the
                 // tier-cycle path accepts the same race, and a retry loop would
                 // fight the single-slot command gate.
+                //
+                // The third case is deliberate and silent. A leaving attach that
+                // has not finished detaching still reads stream_active true, so
+                // neither branch here fires and nothing is logged -- re-attaching
+                // then would be refused on the same slot anyway, and the tail
+                // will clear the flag on its own. An earlier version of this
+                // comment claimed that case reaches the log below; it cannot,
+                // the branch condition excludes it.
                 ESP_LOGW("ui_model", "Agent screen entry: re-attach refused (%s)",
                          esp_err_to_name(result));
             }
