@@ -2000,12 +2000,26 @@ constexpr char kAgentSessionsList[] = R"json({
   }
 })json";
 
-// `invalid/sessions-list-bad-outcome.json`. Legal at the wire level -- the
-// schema types `outcome` as an open string, and this one is not in the enum.
-// It must NOT fail the request: the readable rows are still worth showing, and
-// one unclassifiable row taking the whole picker down is strictly worse than a
-// missing marker. This fixture is the zero-coverage bug's other half: without
-// it, "unknown maps to unknown" was an assumption rather than a measured fact.
+// `invalid/sessions-list-bad-outcome.json`. INVALID per the schema -- `outcome`
+// is an enum of five values (running / succeeded / interrupted / failed /
+// unknown), and "running-maybe" is not one of them, which is why this file
+// lives under `invalid/` and not `valid/`.
+//
+// The device must still NOT fail the request on it: the readable rows are worth
+// showing, and one unclassifiable row taking the whole picker down is strictly
+// worse than a missing marker. That tolerance is defence in depth, not a
+// reading of the schema -- a gateway running a newer vocabulary, or one that
+// predates this enum, sends exactly this shape. ParseSessionOutcome maps every
+// unrecognised value to kUnknown, which is also the direction that fails safe
+// for the sleep lease: no marker, no lease.
+//
+// This fixture is the zero-coverage bug's other half: without it,
+// "unknown maps to unknown" was an assumption rather than a measured fact.
+//
+// (The first version of this comment claimed the schema types `outcome` as an
+// open string. It does not -- it is the enum above. The behaviour being tested
+// was right; the reason written next to it was not, and a reader who trusted it
+// would conclude the fixture belonged in `valid/` and move it.)
 constexpr char kAgentSessionsBadOutcome[] = R"json({
   "success": true,
   "data": {
@@ -2893,18 +2907,27 @@ bool CheckAgentGatewayV0Contract()
     // --- the question frame's size bound -------------------------------------
     //
     // [bounds] The manifest's `question_frame_bytes`. This is NOT a golden
-    // conformant frame -- it cannot be, because the bound is unreachable by one:
-    // the schema caps a question at 8 options x (value 256 B + label 120 B)
-    // around three ids and a 160 B title, which is ~3.7 KB at the very most. The
-    // frame below exceeds that with 1400-byte labels precisely to reach 10 KiB,
-    // so what is asserted is the device's own defence against a peer that broke
-    // the schema, not the schema itself. The size assertion before the parse is
-    // what keeps the fixture honest: if the construction ever stops clearing the
-    // bound, the self-test fails here instead of quietly passing.
+    // conformant frame: the labels below are 1400 characters, over the schema's
+    // 120, precisely to reach 10 KiB so the bound can be crossed at all.
     //
-    // Refusing is the right call because the ask is modal -- it owns every key
-    // until answered, and its only escape interrupts the run -- so an ask the
-    // device cannot hold is one the user cannot dismiss.
+    // What is asserted CHANGED. This block used to require
+    // ESP_ERR_INVALID_SIZE, on the reasoning that the bound was unreachable by
+    // a conformant peer ("~3.7 KB at the very most"). That was measured in
+    // ASCII only. `maxLength` counts code points and the wire is UTF-8, so the
+    // worst schema-legal questionData is 3,673 B all-ASCII, 10,265 B with CJK
+    // and 13,561 B with astral characters -- against a 10,240 B bound. CJK is
+    // the ordinary case for this product. And refusing the frame dropped the
+    // ask (DispatchAgentEvent logs and returns; it does not end the stream), so
+    // the run continued with no reply ever POSTed and the user never saw the
+    // question -- the exact outcome "an ask the user cannot dismiss" was
+    // supposed to prevent, produced by the guard.
+    //
+    // So the frame is now parsed anyway, and this asserts that plus the two
+    // things that make it safe: the options survive the over-bound parse, and
+    // the ask is still answerable (its id is what the reply routes on). The
+    // size assertion before the parse is what keeps the fixture honest: if the
+    // construction ever stops clearing the bound, the self-test fails here
+    // instead of quietly passing.
     {
         wqn::OpenCodeEvent oversized_question;
         std::string big_options;
@@ -2920,9 +2943,80 @@ bool CheckAgentGatewayV0Contract()
         if (!Require(question_body.size() > 10 * 1024,
                      "agent question fixture is over the bound") ||
             !Require(wqn::ParseOpenCodeAgentFrame("agent.question", question_body,
-                                                  &oversized_question) ==
-                         ESP_ERR_INVALID_SIZE,
-                     "agent question frame over the bound is refused")) {
+                                                  &oversized_question) == ESP_OK,
+                     "agent question frame over the bound is parsed, not refused") ||
+            !Require(oversized_question.kind ==
+                         wqn::OpenCodeEventKind::kQuestion,
+                     "agent over-bound question is still an ask") ||
+            !Require(oversized_question.question_id ==
+                         "frm_01J8ZQ5R8W3P1Y4N7C0D2E6F9G#0",
+                     "agent over-bound question keeps the id the reply routes on") ||
+            !Require(oversized_question.question_options.size() == 8,
+                     "agent over-bound question keeps all eight options")) {
+            return false;
+        }
+    }
+
+    // --- the same bound, crossed by a frame the schema ALLOWS -----------------
+    //
+    // [bounds] The bug the oversized block above used to be testing for the
+    // wrong reason. Its comment claimed the bound was unreachable by a
+    // conformant peer, having measured only the ASCII worst case (3,673 B). It
+    // is not: `maxLength` counts code points and the wire is UTF-8, so the worst
+    // schema-legal questionData is 10,265 B with CJK and 13,561 B with astral
+    // characters, against a 10,240 B bound.
+    //
+    // This frame is built at EXACTLY the schema's ceilings -- session_id 128
+    // ASCII (the pattern forces it), question_id 128, title 160, 8 options of
+    // value 256 + label 120 -- with a 3-byte character. It is schema-LEGAL, it
+    // is 25 bytes over the bound, and the old code refused it with
+    // ESP_ERR_INVALID_SIZE, which dropped the ask and stalled the run. For a
+    // Chinese-language product this is the ordinary frame, not a hostile one.
+    {
+        wqn::OpenCodeEvent cjk_question;
+        // One UTF-8 encoded CJK character (3 bytes) as a STRING literal. A
+        // narrow char literal would be a multi-character constant -- the
+        // compiler is happy to fold the three bytes into one int and then
+        // truncate it, which is how the first version of this block built a
+        // string of 0xAD.
+        const char kCjkUnit[] = "\u4e2d";
+        const auto kCjkRepeat = [&kCjkUnit](int count) {
+            std::string out;
+            out.reserve(static_cast<size_t>(count) * 3);
+            for (int i = 0; i < count; ++i) {
+                out += kCjkUnit;
+            }
+            return out;
+        };
+        const std::string kCjkQuestionId = kCjkRepeat(128);
+        const std::string kCjkTitle = kCjkRepeat(160);
+        const std::string kCjkValue = kCjkRepeat(256);
+        const std::string kCjkLabel = kCjkRepeat(120);
+        std::string cjk_options;
+        for (int i = 0; i < 8; ++i) {
+            cjk_options += "{\"value\":\"" + kCjkValue + "\",\"label\":\"" +
+                           kCjkLabel + "\"},";
+        }
+        cjk_options.pop_back();
+        const std::string cjk_question_body =
+            "{\"session_id\":\"ses_" + std::string(124, 'a') + "\",\"question_id\":\"" +
+            kCjkQuestionId + "\",\"title\":\"" + kCjkTitle + "\",\"options\":[" +
+            cjk_options + "]}";
+        if (!Require(cjk_question_body.size() > 10 * 1024,
+                     "agent CJK question fixture is over the bound") ||
+            !Require(cjk_question_body.size() < 16 * 1024,
+                     "agent CJK question fixture still fits the SSE budget") ||
+            !Require(wqn::ParseOpenCodeAgentFrame("agent.question", cjk_question_body,
+                                                  &cjk_question) == ESP_OK,
+                     "agent schema-legal CJK question is parsed, not refused") ||
+            !Require(cjk_question.question_id == kCjkQuestionId,
+                     "agent CJK question keeps its 128-char id") ||
+            !Require(cjk_question.text == kCjkTitle,
+                     "agent CJK question keeps its 160-char title") ||
+            !Require(cjk_question.question_options.size() == 8,
+                     "agent CJK question keeps all eight options") ||
+            !Require(cjk_question.question_options[0].label == kCjkLabel,
+                     "agent CJK question keeps its 120-char label")) {
             return false;
         }
     }
