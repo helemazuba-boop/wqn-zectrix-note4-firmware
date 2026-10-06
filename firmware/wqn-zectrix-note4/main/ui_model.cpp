@@ -5,6 +5,7 @@
 
 #include "ai_session.h"
 #include "display_service.h"
+#include "esp_log.h"
 #include "flash_session.h"
 #include "opencode_session.h"
 #include "ui/persist_worker.h"
@@ -697,6 +698,47 @@ void HandleUiInput(UiState* state, UiInput input)
     // who leaves straight from the Agent tier.
     if (screen_before == wqn::UiScreen::kAi && state->screen != wqn::UiScreen::kAi) {
         wqn::LeaveOpenCodeAgentTier();
+    }
+    // [agent] The B1 counterpart on SCREEN ENTRY. The tier-cycle handler in
+    // ui_input.cpp re-fetches the list / re-attaches on arriving at the Agent
+    // tier; entering the AI screen from another screen runs no tier logic at
+    // all, so a return left one of two stale states behind:
+    //
+    //   - the leave path that found no stream attached clears NOTHING -- it only
+    //     refreshes the lease -- so session_locked, current_session_id, the
+    //     transcript and the scroll offset all survive the round trip. The user
+    //     comes back to a locked view with no stream behind it: symptom 3
+    //     ("entering a running session receives nothing"), reached through a
+    //     screen change instead of a tier cycle.
+    //   - the leave path that did find a stream clears the lock but leaves
+    //     g_state.sessions exactly as it was, and no gesture can refresh it while
+    //     the picker is up (see DispatchAgentSessionListPoll). The picker's 运行中
+    //     marker is then as old as the last fetch -- hours, if the device slept.
+    //
+    // Exactly the two branches the tier cycle runs, so the two entry points
+    // cannot drift: no session locked means fetch the list, a locked session with
+    // no stream means attach to it.
+    if (state->screen == wqn::UiScreen::kAi && screen_before != wqn::UiScreen::kAi &&
+        state->ai.tier == wqn::AiTier::kAgent) {
+        if (state->agent.current_session_id.empty()) {
+            const esp_err_t result = wqn::RequestOpenCodeSessionList();
+            if (result != ESP_OK) {
+                ESP_LOGW("ui_model", "Agent screen entry: session list refused (%s)",
+                         esp_err_to_name(result));
+            }
+        } else if (state->agent.session_locked && !state->agent.stream_active) {
+            const esp_err_t result = wqn::ObserveOpenCodeSession();
+            if (result != ESP_OK) {
+                // Expected whenever the leaving attach has not finished detaching
+                // yet: LeaveOpenCodeAgentTier only ARMS the switch, and the
+                // worker's tail clears stream_active asynchronously, so the flag
+                // can still read true here. Logged rather than retried -- the
+                // tier-cycle path accepts the same race, and a retry loop would
+                // fight the single-slot command gate.
+                ESP_LOGW("ui_model", "Agent screen entry: re-attach refused (%s)",
+                         esp_err_to_name(result));
+            }
+        }
     }
 #endif
 }
