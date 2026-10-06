@@ -1817,6 +1817,27 @@ void ObserveSession()
     // started. Reaching this command means nothing else owns the slot, which
     // makes this a guard rather than a live case -- but it is the difference
     // between "impossible" and "unlikely" for the orphaned-request failure.
+    //
+    // [interrupt-fix] That comment said "mirrors RunPrompt" while clearing only
+    // the switch pair. RunPrompt clears all four; this cleared two. The half it
+    // skipped is the destructive one: an interrupt request raised against a
+    // PREVIOUS observe survives into this stream, the read loop's first
+    // iteration sees it, POSTs /interrupt for the session this observe just
+    // attached to, and breaks before reading a single frame. The tail does the
+    // same in reverse (see below), so the flag is never cleared anywhere on this
+    // path at all -- InterruptOpenCodeRun's !stream_active guard covers the
+    // request armed with no stream, and says nothing about the one consumed and
+    // left behind.
+    //
+    // Clearing here rather than only in the tail costs one press in a window no
+    // gesture should be in anyway: ObserveOpenCodeSession raises stream_active
+    // under the same lock hold that arms this command, so a long-press landing
+    // between that release and this line has its request discarded. The stream
+    // is not connected yet at that point, so an interrupt POST could not have
+    // changed anything upstream -- and the switch pair this function already
+    // clears at this exact line has always had the same window.
+    g_interrupt_requested.store(false, std::memory_order_release);
+    g_interrupt_delivered.store(false, std::memory_order_release);
     g_switch_requested.store(false, std::memory_order_release);
     g_switch_delivered.store(false, std::memory_order_release);
     std::string token;
@@ -1845,6 +1866,19 @@ void ObserveSession()
             &api_result);
     }
     xSemaphoreTake(g_lock, portMAX_DELAY);
+    // [interrupt-fix] The interrupt pair belongs to the stream that just ended,
+    // so it is read into a local ONCE and disarmed here, in the tail, rather
+    // than left for the next command's opening to clear. Both halves are needed:
+    // the opening clear above stops an armed request from leaking forward, but
+    // it cannot stop `interrupt_delivered` from leaking BACKWARD -- a request
+    // this stream consumed leaves that flag set, and the next observe's tail
+    // then reads it true and takes this branch for a stream that ran to its
+    // natural end, overwriting a settled phase with "已中止" and clearing asks
+    // the next turn had just armed.
+    const bool interrupt_delivered =
+        g_interrupt_delivered.load(std::memory_order_acquire);
+    g_interrupt_requested.store(false, std::memory_order_release);
+    g_interrupt_delivered.store(false, std::memory_order_release);
     if (FinishSwitchedStreamLocked()) {
         // Same contract as the run path: detaching is an intentional end, the
         // observed run keeps going upstream, and the follow-up takes over.
@@ -1852,10 +1886,30 @@ void ObserveSession()
         DiscardOutboundReplies();
         return;
     }
-    if (g_interrupt_delivered.load(std::memory_order_acquire)) {
+    if (interrupt_delivered) {
         // Same reasoning as the run path: the run is over and the outbound
         // queue is discarded below, so a surviving ask could not be answered.
         ClearAllAsksLocked();
+        // [interrupt-fix] Settle the phase. An interrupt ends the stream at the
+        // read loop's first iteration, so no agent.status frame ever arrives to
+        // settle it, and this branch used to leave kRunning on screen behind a
+        // stream that no longer existed -- kRunning, "正在中止", and the
+        // "长按=中止" hint. That is the dead end, not a cosmetic one:
+        // AiFeatureCanStartVoiceInput excludes kRunning, so voice capture (the
+        // only route to a new prompt on this page) was refused, the interrupt
+        // gesture no longer had a stream to break, and the only writer that ever
+        // cleared the request flag was RunPrompt -- unreachable from here. The
+        // device was wedged in a state no gesture could leave.
+        //
+        // The wording deliberately does NOT claim the upstream run died. The
+        // contract's interrupt response reports `interrupted: false` as a
+        // successful "that run had already finished", and both cases arrive here
+        // with the same flag -- so the one thing this device can state is what it
+        // did: it stopped observing.
+        g_state.ui.phase = wqn::AiFeaturePhase::kComplete;
+        g_state.ui.status_label = "已中止";
+        g_state.ui.activity_text = "已停止观察当前 Session";
+        g_state.ui.action_hint = "长按确认发起新任务";
         g_state.stream_active = false;
         RefreshAgentRunLeaseLocked();
         MarkChangedLocked();
