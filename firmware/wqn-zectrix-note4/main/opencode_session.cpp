@@ -434,11 +434,29 @@ void SettleWatchedSessionOutcomeLocked()
     g_upstream_run_live = false;
 }
 
+// [banner] The only writer that puts activity_text on screen.
+//
+// activity_text is written in ~40 places, and most of those lines the user must
+// never see: a connect notice the status label already states, an answer that is
+// already sitting in the transcript, a gesture hint that belongs in the manual.
+// Those writers keep writing -- the field is the model's own record of the last
+// thing that happened -- but only these callers get a surface.
+//
+// A stamp rather than a clear-on-next-frame, because the lines that need it have
+// no successor to clear them: "上一个任务还在跑，先看进展" describes a transition
+// the user caused, and nothing arrives afterwards to retract it. So the line
+// expires on its own instead of waiting for a frame that never comes.
+void SetUserVisibleActivityLocked(const std::string& message)
+{
+    g_state.ui.activity_text = message;
+    g_state.ui.activity_text_ms = esp_timer_get_time() / 1000;
+}
+
 void SetErrorLocked(const std::string& message)
 {
     g_state.ui.phase = wqn::AiFeaturePhase::kError;
     g_state.ui.status_label = "错误";
-    g_state.ui.activity_text = message;
+    SetUserVisibleActivityLocked(message);
     g_state.ui.action_hint = "长按确认重新录音";
     g_state.ui.requires_confirmation = false;
     g_state.confirmation_armed_at_ms = 0;
@@ -922,7 +940,7 @@ void PrepareCapture()
         if (!g_state.ui.prompt_text.empty() && g_state.ui.requires_confirmation) {
             g_state.ui.phase = wqn::AiFeaturePhase::kAwaitingConfirmation;
             g_state.ui.status_label = "确认发送";
-            g_state.ui.activity_text = "没有录到声音，刚才说的还没发送";
+            SetUserVisibleActivityLocked("没有录到声音，刚才说的还没发送");
             g_state.ui.action_hint = "↑ 发送 · ↓ 取消 · 长按确认追加";
             g_state.confirmation_armed_at_ms = esp_timer_get_time() / 1000;
         } else {
@@ -1898,7 +1916,7 @@ void RunPrompt()
         refreshing_history = true;
         g_state.ui.phase = wqn::AiFeaturePhase::kRunning;
         g_state.ui.status_label = "进行中";
-        g_state.ui.activity_text = "上一个任务还在跑，先看进展";
+        SetUserVisibleActivityLocked("上一个任务还在跑，先看进展");
         g_state.ui.action_hint = "长按=中止";
         g_state.ui.requires_confirmation = false;
         g_state.confirmation_armed_at_ms = 0;

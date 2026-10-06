@@ -521,8 +521,20 @@ std::string FrameSignature(const wqn::UiFrame& frame)
         signature.push_back('/');
         signature.append(agent.ui.activity_text);
         signature.push_back('/');
-        signature.append(agent.ui.action_hint);
-        signature.push_back('/');
+        // [banner] The stamp, not the text. A stamped line disappears purely
+        // because time passed, so a signature that only tracked the string
+        // would stop changing at the exact moment the banner should vanish --
+        // and the repaint that erases it would never be built. Bucketed rather
+        // than raw so the frame rate is bounded, and only while a line is
+        // actually on screen: once the stamp is stale this appends nothing at
+        // all and the page goes quiet again.
+        if (agent.ui.activity_text_ms > 0) {
+            constexpr int64_t kAgentBannerBucketMs = 500;
+            signature.append("|banner");
+            signature.append(std::to_string(
+                (esp_timer_get_time() / 1000 - agent.ui.activity_text_ms) /
+                    kAgentBannerBucketMs));
+        }
         signature.append(std::to_string(agent.ui.scroll_offset_lines));
         signature.push_back('/');
         signature.append(agent.ui.requires_confirmation ? "1" : "0");

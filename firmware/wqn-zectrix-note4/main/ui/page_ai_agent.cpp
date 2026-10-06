@@ -32,6 +32,7 @@
 #include "ai_history.h"
 #include "display_service.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "opencode_session.h"
 #include "ui/assets/font_wqn_inline_12_1.h"
 #include "ui/assets/font_wqn_ui_16_1.h"
@@ -485,6 +486,36 @@ esp_err_t RenderAgentAiToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule
             DrawAgentPendingBubble(agent.ui.voice_partial, "转写中");
         }
         return RefreshFrame(frame, schedule);
+    }
+
+    // [banner] The one line the user has to read right now, for two seconds.
+    //
+    // The bottom band used to carry every event line and now carries none: an
+    // interactive-only band is the right call, but two things still have to be
+    // said out loud -- a run already in flight turned your press into an
+    // observe, and a capture you released without speaking dropped the
+    // transcript you had already recorded. Neither has a successor frame that
+    // retracts it, so the line expires on its own instead of waiting for one
+    // that never comes.
+    //
+    // Drawn over the bottom of the transcript rather than in a reserved strip:
+    // RenderAgentAiToEpd clears the whole framebuffer every frame, so the line
+    // it covers comes back on its own and the banner needs no clearing logic.
+    // It stops short of the scroll-indicator column, for the same reason the
+    // band does -- the ▼ needs that 44 px to survive.
+    if (agent.ui.activity_text_ms > 0) {
+        const int64_t age_ms =
+            esp_timer_get_time() / 1000 - agent.ui.activity_text_ms;
+        if (age_ms >= 0 && age_ms <= wqn::kAiActivityBannerTtlMs) {
+            const int banner_right =
+                wqn::kEpdWidth - kAgentIndicatorColumn - kMarginDense;
+            const std::string body =
+                AgentOneLine(agent.ui.activity_text, banner_right - kMarginDense);
+            if (!body.empty()) {
+                AGENT_TEXT(kMarginDense, kAgentBarY - kAiLineH + 4,
+                           body.c_str(), true);
+            }
+        }
     }
 
     const AgentOptionMode mode = AgentOptionModeFor(agent);
