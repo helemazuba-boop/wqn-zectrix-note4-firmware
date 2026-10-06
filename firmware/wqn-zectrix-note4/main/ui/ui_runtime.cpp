@@ -988,7 +988,11 @@ UiUpdate UiRuntime::DispatchAiViewportFollow()
     }
     int32_t min_scroll = 0;
     int32_t max_scroll = 0;
-    GetAiScrollBounds(snapshot, state_.ai.expand_content, &min_scroll, &max_scroll);
+    // The Agent tier's band is only up while there is something to answer, so
+    // the reserve the follow computes with is the one the renderer draws with.
+    GetAiScrollBounds(snapshot, state_.ai.expand_content,
+                      agent_tier ? AiBottomReserve(state_.agent) : 0, &min_scroll,
+                      &max_scroll);
 
     // Has the answer body started? Both tiers now mirror their streamed text
     // straight into history, so the newest non-empty assistant entry IS the body
@@ -1001,7 +1005,9 @@ UiUpdate UiRuntime::DispatchAiViewportFollow()
     // follow has no per-tier scroll offset of its own to park.
     int32_t answer_top = 0;
     const bool body_started =
-        GetAiNewestAnswerTopOffsetLines(snapshot, state_.ai.expand_content, &answer_top) ||
+        GetAiNewestAnswerTopOffsetLines(snapshot, state_.ai.expand_content,
+                                        agent_tier ? AiBottomReserve(state_.agent) : 0,
+                                        &answer_top) ||
         (!agent_tier && !state_.ai.assistant_partial.empty());
 
     if (body_started) {

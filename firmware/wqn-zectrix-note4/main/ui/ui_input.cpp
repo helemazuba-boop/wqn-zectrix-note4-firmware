@@ -697,7 +697,7 @@ static bool AnswerBodyStarted(
 {
     int32_t probe = 0;
     if (device_ui_internal::GetAiNewestAnswerTopOffsetLines(
-            snapshot, ai.expand_content, &probe)) {
+            snapshot, ai.expand_content, /*bottom_pad=*/0, &probe)) {
         return true;
     }
     return ai.tier != wqn::AiTier::kAgent && !ai.assistant_partial.empty();
@@ -717,8 +717,9 @@ static bool ApplyAgentTurnJump(wqn::UiState* state, int direction)
     }
     int32_t next = 0;
     if (!device_ui_internal::GetAiTurnJumpOffsetLines(
-            snapshot, state->ai.expand_content, state->agent.ui.scroll_offset_lines,
-            direction, &next)) {
+            snapshot, state->ai.expand_content,
+            device_ui_internal::AiBottomReserve(state->agent),
+            state->agent.ui.scroll_offset_lines, direction, &next)) {
         return false;
     }
     // [follow] Write through the backend, not the UI copy: the next
@@ -729,7 +730,9 @@ static bool ApplyAgentTurnJump(wqn::UiState* state, int direction)
     int32_t min_scroll = 0;
     int32_t max_scroll = 0;
     device_ui_internal::GetAiScrollBounds(
-        snapshot, state->ai.expand_content, &min_scroll, &max_scroll);
+        snapshot, state->ai.expand_content,
+        device_ui_internal::AiBottomReserve(state->agent), &min_scroll,
+        &max_scroll);
     wqn::SetOpenCodeScrollOffsetClamped(next, min_scroll, max_scroll);
     wqn::SetOpenCodeFollowState(false, /*user_moved=*/true);
     state->agent.ui.scroll_offset_lines = next;
@@ -1521,7 +1524,9 @@ RefreshSchedule ApplyButtonEvent(
         int32_t min_scroll = 0;
         int32_t max_scroll = 0;
         device_ui_internal::GetAiScrollBounds(
-            snapshot, state->ai.expand_content, &min_scroll, &max_scroll);
+            snapshot, state->ai.expand_content,
+            device_ui_internal::AiBottomReserve(state->agent), &min_scroll,
+            &max_scroll);
         // [follow] A manual scroll is the user taking the viewport back: the
         // follow retires for the rest of the turn and the conditional recenter
         // must leave the viewport where the user put it. The one exception is a
@@ -1586,8 +1591,10 @@ RefreshSchedule ApplyButtonEvent(
         if (snapshot != nullptr && !snapshot->messages.empty()) {
             int32_t min_scroll = 0;
             int32_t max_scroll = 0;
+            // 0: this tier has no bottom band, so it reserves nothing.
             device_ui_internal::GetAiScrollBounds(
-                snapshot, state->ai.expand_content, &min_scroll, &max_scroll);
+                snapshot, state->ai.expand_content, /*bottom_pad=*/0, &min_scroll,
+                &max_scroll);
             const int32_t current = wqn::GetAiScrollOffsetLines();
             if (event.button == wqn::ButtonId::kUp) {
                 // Up = "older" content above. Scroll band shifts content down.

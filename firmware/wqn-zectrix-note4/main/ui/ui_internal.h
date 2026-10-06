@@ -672,6 +672,7 @@ const char* AiStatusLabel(wqn::AiSessionStatus status);
 void GetAiScrollBounds(
     std::shared_ptr<const wqn::AiHistorySnapshot> snapshot,
     bool expand_content,
+    int bottom_pad,
     int32_t* out_min_scroll,
     int32_t* out_max_scroll);
 
@@ -693,6 +694,7 @@ AiHistoryLayout ComputeAiHistoryLayout(
 bool GetAiTurnJumpOffsetLines(
     std::shared_ptr<const wqn::AiHistorySnapshot> snapshot,
     bool expand_content,
+    int bottom_pad,
     int32_t current_scroll,
     int direction,
     int32_t* out_scroll);
@@ -704,6 +706,7 @@ bool GetAiTurnJumpOffsetLines(
 bool GetAiNewestAnswerTopOffsetLines(
     std::shared_ptr<const wqn::AiHistorySnapshot> snapshot,
     bool expand_content,
+    int bottom_pad,
     int32_t* out_scroll);
 
 // [agent] The Agent tier is rendered by the AI page; this is its branch.
@@ -711,9 +714,16 @@ esp_err_t RenderAgentAiToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule
 // Shared chat-viewport draw (page_ai.cpp). The Agent tier renders its own
 // status bar and bottom band but reuses this verbatim, so the two tiers can
 // never disagree about how a bubble or a tool block looks.
+//
+// `bottom_pad` is what this frame leaves clear at the panel's bottom. Pass 0
+// unless the caller actually draws something there: RenderAiHistoryViewport and
+// the three scroll helpers above all read the same value, and a caller that
+// answers it one way for the renderer and another for the clamp is the desync
+// their comments warn about.
 void RenderAiHistoryViewport(const wqn::AiSessionState& ai,
                              const std::shared_ptr<const wqn::AiHistorySnapshot>& snapshot,
-                             int32_t scroll_offset_lines);
+                             int32_t scroll_offset_lines,
+                             int bottom_pad);
 // Option-bar slots for the Agent tier's two-choice states. The order is the
 // ↑/↓ cycle order and the confirm action runs the focused slot.
 //
@@ -738,6 +748,17 @@ enum class AgentOptionMode : uint8_t {
     kQuestion,      // gateway form pending: projected options + 自定义回答
 };
 AgentOptionMode AgentOptionModeFor(const wqn::AgentSessionState& agent);
+// [band] How much of the panel's bottom the current frame leaves clear for the
+// Agent tier's option bar: its full height while there is something to answer,
+// and 0 for everything else -- including on the STD/Flash tier, which has no
+// bottom band at all.
+//
+// Every caller that needs this number asks here rather than deriving it, because
+// the renderer and the scroll clamp must agree. A tier that reserved 22 for the
+// clip and 0 for the clamp would let a keypress ask for a window the viewport
+// cannot draw -- which is precisely the desync page_ai.cpp's geometry comments
+// have been warning about for five rounds.
+int AiBottomReserve(const wqn::AgentSessionState& agent);
 // [agent] Names why an Agent request was refused. Every one of these used to
 // log the same "busy or empty list", which is indistinguishable when reading a
 // device log after the fact. Was static in ui_input.cpp; promoted when the

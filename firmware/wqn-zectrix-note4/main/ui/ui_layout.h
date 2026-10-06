@@ -63,10 +63,20 @@ constexpr int kAiHistoryUsableW = kAiHistoryRightEdge - kAiHistoryLeftPad;  // 3
 constexpr int kAiUserPillMaxW = kAiHistoryUsableW * 78 / 100;              // ~302
 constexpr int kAiAssistantW = kAiHistoryUsableW;
 constexpr int kAiRowTopPad = 2;
-// [scroll-fix] Reserve 22 px at the bottom of the viewport for the ▼ scroll
-// indicator + breathing room so the latest message never overlaps it. The
-// Agent tier's option bar lives in exactly this band.
-constexpr int kAiViewportBottomPad = 22;
+// [band] The bottom band of the AI transcript. The Agent tier's option bar --
+// asks, confirmations, the question counter -- is exactly this tall.
+//
+// It is reserved ONLY while it is actually up. It used to be reserved
+// unconditionally on every tier, which was right while the band always drew
+// something; once the band became interactive-only (4169b1f) the reservation
+// turned into a permanent blank strip that no answer could use. With the band
+// clear the transcript runs to the panel's last pixel, and the ▼ indicator
+// lives in its own cleared strip down there -- the same way ▲ already does at
+// the top, over content it never had to reserve away.
+//
+// Nothing else in the transcript reserves the bottom: the STD/Flash tier has no
+// bottom band at all, so it reserves 0 too.
+constexpr int kAiBottomBandH = 22;
 // [toggle-cluster] Status-bar toggle cluster geometry. tier occupies x=6..22
 // (16px); the cluster starts at kAiToggleX and each icon is kAiToggleStep apart
 // (18 = 16px icon + 2px gap). Applies to every tier -- STD/Pro uses four slots

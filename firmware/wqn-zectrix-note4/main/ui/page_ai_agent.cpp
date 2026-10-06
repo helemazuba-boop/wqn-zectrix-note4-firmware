@@ -41,13 +41,14 @@ namespace device_ui_internal {
 
 constexpr char kTag[] = "wqn_ui";
 
-// [agent] Option bar geometry. It lives inside the same 22 px bottom band the
-// scroll indicator uses (kAiViewportBottomPad), so adding it cost zero
-// viewport height. It still leaves the ▼ chevron its column: the band clears
-// and lays out only the width left of kAgentIndicatorColumn below, so a pending
-// decision and the scroll position stay legible together.
-constexpr int kAgentBarY = wqn::kEpdHeight - kAiViewportBottomPad;  // 278
-constexpr int kAgentBarH = kAiViewportBottomPad;                    // 22
+// [agent] Option bar geometry. It lives in the 22 px bottom band
+// (kAiBottomBandH), reserved only while there is something to answer -- with the
+// band clear the transcript runs to the panel's last pixel instead of stranding
+// that strip. It still leaves the ▼ chevron its column: the band clears and lays
+// out only the width left of kAgentIndicatorColumn below, so a pending decision
+// and the scroll position stay legible together.
+constexpr int kAgentBarY = wqn::kEpdHeight - kAiBottomBandH;  // 278
+constexpr int kAgentBarH = kAiBottomBandH;                    // 22
 constexpr int kAgentBarTextY = kAgentBarY + 3;                      // baseline
 constexpr int kAgentBarMarkerX = 8;
 constexpr int kAgentBarLabelX = kAgentBarMarkerX + 16;
@@ -114,6 +115,13 @@ AgentOptionMode AgentOptionModeFor(const wqn::AgentSessionState& agent)
         return AgentOptionMode::kConfirmSend;
     }
     return AgentOptionMode::kNone;
+}
+
+int AiBottomReserve(const wqn::AgentSessionState& agent)
+{
+    return AgentOptionModeFor(agent) == AgentOptionMode::kNone
+        ? 0
+        : kAiBottomBandH;
 }
 
 // The question bar walks `options + 1` items: every projected option, plus a
@@ -474,7 +482,12 @@ esp_err_t RenderAgentAiToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule
         return RefreshFrame(frame, schedule);
     }
 
-    RenderAiHistoryViewport(frame.ai, frame.ai_history, agent.ui.scroll_offset_lines);
+    // [band] The transcript runs to the panel's last pixel unless there is
+    // something to answer. This used to be an unconditional 22 px reservation,
+    // which was correct while the band always drew something and became a blank
+    // strip the answer could not use once it became interactive-only.
+    RenderAiHistoryViewport(frame.ai, frame.ai_history, agent.ui.scroll_offset_lines,
+                            AiBottomReserve(agent));
 
     // [voice-pipe] While the ASR result streams in, the partial transcript is
     // the only new content on screen: draw it in the same pending bubble the
