@@ -703,6 +703,20 @@ void LoadSessions()
 
     xSemaphoreTake(g_lock, portMAX_DELAY);
     if (result == ESP_OK) {
+        // [picker-anchor] selected_session is an index, and this rewrite is the
+        // only thing that reorders the rows behind it. The device does not sort:
+        // the gateway's order is the order, and a new session or a fresh message
+        // in another session changes updated_at, so the order changes. An index
+        // carried across that lands on whatever row slid into its place -- rows
+        // [A(running),B,C,D] with D highlighted become [A',A,B,C,D] and the
+        // confirm press locks C. Re-anchoring on the session id is what keeps the
+        // highlight on the row the user actually walked to, and it degrades to
+        // the clamp that was here before when that session is gone from the
+        // list.
+        const std::string highlighted =
+            g_state.selected_session < g_state.sessions.size()
+                ? g_state.sessions[g_state.selected_session].id
+                : std::string();
         g_state.sessions.clear();
         g_state.sessions.reserve(sessions.size());
         for (wqn::OpenCodeSessionInfo& source : sessions) {
@@ -713,8 +727,15 @@ void LoadSessions()
         if (g_state.sessions.empty()) {
             SetErrorLocked("没有可用的 OpenCode Session");
         } else {
-            g_state.selected_session = std::min(
-                g_state.selected_session, g_state.sessions.size() - 1);
+            g_state.selected_session = g_state.sessions.size() - 1;
+            if (!highlighted.empty()) {
+                for (size_t i = 0; i < g_state.sessions.size(); ++i) {
+                    if (g_state.sessions[i].id == highlighted) {
+                        g_state.selected_session = i;
+                        break;
+                    }
+                }
+            }
             g_state.session_locked = false;
             g_state.current_session_id.clear();
             g_state.current_session_title.clear();
@@ -742,12 +763,24 @@ void LoadSessions()
             // inside the publish, on transition only.
             RefreshAgentRunLeaseLocked();
             MarkChangedLocked();
-            ReleaseWorkOwnershipLocked();
         }
     } else {
         SetErrorLocked(api_result.detail.empty() ? "Session 列表加载失败" : api_result.detail);
     }
     xSemaphoreGive(g_lock);
+    // [connectivity] The fetch is over on every path, so the demand it took out
+    // goes back on every path. The success branch used to release it here and the
+    // two error branches did not, which acquired a kAiInteractive demand plus the
+    // kConnectivity lease inside it and never handed either back: the next
+    // successful AcquireNetwork replaced it by move-assignment and hid the leak,
+    // but a device left on an unreachable network held the demand from the first
+    // failure onward and never slept. C26 made that the common case rather than a
+    // curiosity by polling this command on a timer.
+    //
+    // Only the demand. Both branches above let RefreshAgentRunLeaseLocked decide
+    // the sleep lease -- on the error path SetErrorLocked calls it -- and
+    // resetting that here would drop a lease a live run elsewhere still justifies.
+    g_connectivity_demand.Reset();
 }
 
 // ---- Voice pipe (WS turn) --------------------------------------------------
