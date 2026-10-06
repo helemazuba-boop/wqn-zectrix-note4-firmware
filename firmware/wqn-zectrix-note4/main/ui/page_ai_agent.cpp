@@ -574,7 +574,15 @@ esp_err_t RenderAgentAiToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule
             // A field with nothing the device can choose between (free text,
             // an over-long list). Say so instead of showing a bar that looks
             // broken; 自定义回答 aborts the run so the request can be retyped.
-            ask += "　设备无法显示选项；选“自定义回答”将中止本次任务";
+            //
+            // [font-fix] The gap was an ideographic space (U+3000), which this
+            // font does not contain: MeasureGlyphWidthInFont returns 0 on a miss,
+            // so it contributed no width and no ink, and the advisory butted
+            // straight onto the question title it is appended to. A plain ASCII
+            // space is the smallest separator the font can actually draw. There is
+            // only one candidate here -- `ask` is the title, so the advisory has to
+            // be visually separate from it.
+            ask += " 设备无法显示选项；选“自定义回答”将中止本次任务";
         }
         DrawAgentPendingBubble(ask, "提问");
     } else {
