@@ -220,6 +220,14 @@ bool AiHistory::ReplaceText(ChatMessageId id, ChatMessageKind expected_kind,
         xSemaphoreGive(mutex_);
         return true;
     }
+    // Read the ring's own figures out BEFORE releasing it. cap_bytes_ and
+    // messages_ belong to the critical section; sampling them after the give
+    // reads whatever a concurrent Append/Trim left behind, so the log that
+    // exists to explain WHY the entry was gone was the one line in this file
+    // that could describe a different ring than the one it was called on.
+    // Publish the payload first, then release -- the order §4.7 requires.
+    const size_t cap_bytes = cap_bytes_;
+    const size_t message_count = messages_.size();
     xSemaphoreGive(mutex_);
     // [evict-recovery] This was silent, and it cannot be: the id-not-found case is the one
     // a streaming mirror hits when the ring evicts the entry it has been
@@ -228,8 +236,8 @@ bool AiHistory::ReplaceText(ChatMessageId id, ChatMessageKind expected_kind,
     // (re-append) belongs at the call site that knows which entry it was.
     ESP_LOGW(kTag, "ReplaceText: id %llu not in ring (cap %u B, %u msgs)",
              static_cast<unsigned long long>(id),
-             static_cast<unsigned>(cap_bytes_),
-             static_cast<unsigned>(messages_.size()));
+             static_cast<unsigned>(cap_bytes),
+             static_cast<unsigned>(message_count));
     return false;
 }
 
