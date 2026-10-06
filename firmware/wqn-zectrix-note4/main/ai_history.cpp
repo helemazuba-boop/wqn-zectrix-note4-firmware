@@ -203,7 +203,30 @@ bool AiHistory::ReplaceText(ChatMessageId id, ChatMessageKind expected_kind,
     for (ChatMessage& msg : messages_) {
         if (msg.id != id) continue;
         if (msg.kind != expected_kind) {
+            // Payload first, then release -- same order as the not-found log
+            // below (AGENTS.md §4.7).
+            const ChatMessageKind found_kind = msg.kind;
+            const size_t cap_bytes = cap_bytes_;
+            const size_t message_count = messages_.size();
             xSemaphoreGive(mutex_);
+            // [evict-recovery] This branch was silent, and it had to stop being
+            // the moment the caller's recovery predicate was corrected to test
+            // PRESENCE instead of presence-with-kind. The caller now reaches here
+            // and answers "yes, still in the ring" -> it re-appends nothing and
+            // returns false. That is the right outcome, but it means the caller's
+            // entry is silently not being updated for the rest of the turn --
+            // exactly the failure D3 exists to prevent, arriving by a different
+            // door. Before the correction this branch could not be told apart
+            // from "not found" at the call site, so logging only the not-found
+            // case was enough; now the two must be distinguishable in the log.
+            ESP_LOGW(kTag,
+                     "ReplaceText: id %llu is in the ring as kind %d, not %d -- "
+                     "caller will not re-append (cap %u B, %u msgs)",
+                     static_cast<unsigned long long>(id),
+                     static_cast<int>(found_kind),
+                     static_cast<int>(expected_kind),
+                     static_cast<unsigned>(cap_bytes),
+                     static_cast<unsigned>(message_count));
             return false;
         }
         if (msg.text.size() == text.size() &&
