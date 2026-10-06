@@ -54,9 +54,9 @@ deploy.bat
 
 - **Dev port is `COM7`.** `COM5` is the official-firmware checkpoint; the portable
   flasher refuses `COM5`. Do not flash `COM5`.
-- `deploy.bat` ends by running `listen_usb.py` (writes serial output to `wqn.log`)
+- `deploy.bat` ends by opening `scripts\monitor_serial.bat` (no-reset serial monitor)
   because **`idf.py monitor` is broken over the chip's Native USB-Serial-JTAG
-  interface**. Use `listen_usb.py` / `scripts\monitor.bat` for live logs.
+  interface**. Use `scripts\monitor_serial.bat` / `scripts\monitor.bat` for live logs.
 - Granular helpers live in `firmware/wqn-zectrix-note4/scripts/` (`flash-fix.bat`,
   `erase_reflash.bat`, `monitor.bat`, `read_flash.bat`, …). **Do not drop new `.bat`
   files in the repo root** — only `deploy.bat` belongs there.
