@@ -71,6 +71,29 @@ constexpr size_t kMaxHistoryResponseBytes = 12 * 1024;
 // unbounded heap allocation on a 4 KB-stack worker.
 constexpr int kMaxHistoryMessages = 24;
 constexpr int kMaxHistoryTools = 8;
+// The manifest's `sessions_listed`. Was the bare literal 12 in the row walk
+// below, which is exactly the problem: a limit that decides how much of the
+// picker the device can hold had no name to check the manifest against.
+constexpr int kMaxSessionsListed = 12;
+// The manifest's `text_event_bytes` (`agent.text`) and `delta_event_bytes`
+// (`agent.text.delta`). MEASURED, NOT ENFORCED, and that asymmetry is
+// deliberate -- see the warning at the frame parser.
+//
+// The stream already refuses a frame past the 16 KiB SSE budget
+// (kMaxSseFrameBytes in sse_chunk.h), so these two are a tighter per-event
+// contract the device currently only observes. Turning them into refusals would
+// be a behaviour change against a gateway nobody has measured the largest frame
+// of from here; the answer is a log line that says the peer is over, so the
+// number stops being a manifest entry nobody reads.
+constexpr size_t kMaxTextEventBytes = 8 * 1024;
+constexpr size_t kMaxDeltaEventBytes = 2 * 1024;
+// The manifest's `question_frame_bytes`. Enforced as a refusal because it is
+// unreachable by a conformant peer: the schema caps an ask at 8 options x
+// (value + label) plus the session/form ids and title, which is ~3.7 KB in the
+// worst case -- a frame over 10 KiB is a contract bug, not a big question.
+// Refusing it beats parsing it, because an ask the device cannot hold answer is
+// one the user cannot dismiss.
+constexpr size_t kMaxQuestionFrameBytes = 10 * 1024;
 }  // namespace wqn
 
 namespace {
@@ -82,6 +105,10 @@ using wqn::kMaxPromptBytes;
 using wqn::kMaxHistoryResponseBytes;
 using wqn::kMaxHistoryMessages;
 using wqn::kMaxHistoryTools;
+using wqn::kMaxSessionsListed;
+using wqn::kMaxTextEventBytes;
+using wqn::kMaxDeltaEventBytes;
+using wqn::kMaxQuestionFrameBytes;
 
 constexpr char kTag[] = "wqn_opencode_api";
 
@@ -573,6 +600,13 @@ namespace wqn {
 // absent both land on kUnknown, which the callers must read as "no run in
 // flight" -- see OpenCodeSessionOutcome. The gateway is the only place that can
 // distinguish the reasons, and it already collapsed them.
+//
+// Every unrecognised value lands on kUnknown rather than an error, and that
+// includes the invalid fixture below: a row the device cannot classify must be
+// loadable, because dropping the whole list would take the readable rows with
+// it. The direction is the same fail-safe the picker marker and the lease
+// criterion use -- an unknown outcome costs a missing glyph, never a device
+// that never sleeps.
 wqn::OpenCodeSessionOutcome ParseSessionOutcome(std::string_view value)
 {
     if (value == "running") {
@@ -588,6 +622,69 @@ wqn::OpenCodeSessionOutcome ParseSessionOutcome(std::string_view value)
         return wqn::OpenCodeSessionOutcome::kFailed;
     }
     return wqn::OpenCodeSessionOutcome::kUnknown;
+}
+
+// The body of `GET /agent/sessions`. Split out of ListOpenCodeSessions exactly
+// the way ParseOpenCodeHistoryBody is split out of GetOpenCodeHistory, and for
+// the same reason: the row walk decides which sessions the picker offers, how
+// the 运行中 marker is drawn, and whether the device holds its sleep lease --
+// and until it lived in a function that needs a token and a socket, ZERO of
+// that was covered by any test. Every assertion in the boot self-test that
+// touches `outcome` today was written against a hand-rolled copy of this loop,
+// which tests the copy.
+esp_err_t ParseOpenCodeSessionsBody(
+    const std::string& body,
+    std::vector<OpenCodeSessionInfo>* sessions,
+    OpenCodeResult* result)
+{
+    if (sessions == nullptr || result == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    // Carried over from the request, if there was one: the self-test calls this
+    // with a bare body, where it stays 0.
+    const int http_status = result->http_status;
+    *result = OpenCodeResult{};
+    sessions->clear();
+    if (body.size() > kMaxJsonResponseBytes) {
+        SetResultError(result, http_status, "invalid_size", "Session list is too large");
+        return ESP_ERR_INVALID_SIZE;
+    }
+    cJSON* root = protocol::JsonNestingWithinLimit(body.data(), body.size())
+        ? cJSON_ParseWithLength(body.data(), body.size())
+        : nullptr;
+    cJSON* data = root != nullptr ? cJSON_GetObjectItemCaseSensitive(root, "data") : nullptr;
+    cJSON* rows = data != nullptr ? cJSON_GetObjectItemCaseSensitive(data, "sessions") : nullptr;
+    if (!cJSON_IsArray(rows)) {
+        cJSON_Delete(root);
+        SetResultError(result, http_status, "invalid_response", "Session list is invalid");
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    // The manifest's `sessions_listed`: the picker windows four rows and the
+    // snapshot rides the UI copy verbatim, so an unbounded list is an unbounded
+    // PSRAM cost and an unbounded frame signature. Rows past the cap are
+    // ignored, not an error -- the gateway is the side that trims.
+    const int available = cJSON_GetArraySize(rows);
+    const int count = std::min(available, kMaxSessionsListed);
+    sessions->reserve(static_cast<size_t>(count));
+    for (int index = 0; index < count; ++index) {
+        cJSON* row = cJSON_GetArrayItem(rows, index);
+        OpenCodeSessionInfo session;
+        session.id = JsonString(row, "id");
+        session.title = JsonString(row, "title");
+        cJSON* updated = cJSON_GetObjectItemCaseSensitive(row, "updatedAt");
+        if (cJSON_IsNumber(updated)) {
+            session.updated_at = static_cast<int64_t>(updated->valuedouble);
+        }
+        session.outcome = ParseSessionOutcome(JsonString(row, "outcome"));
+        // A row without a usable id is not a session this device can attach to,
+        // and OfferSessionOptions would offer one anyway. Dropped silently: the
+        // rest of the list is still worth showing.
+        if (session.id.rfind("ses_", 0) == 0) {
+            sessions->push_back(std::move(session));
+        }
+    }
+    cJSON_Delete(root);
+    return ESP_OK;
 }
 
 esp_err_t ListOpenCodeSessions(
@@ -606,34 +703,7 @@ esp_err_t ListOpenCodeSessions(
     if (request_result != ESP_OK) {
         return request_result;
     }
-    cJSON* root = protocol::JsonNestingWithinLimit(body.data(), body.size())
-        ? cJSON_ParseWithLength(body.data(), body.size())
-        : nullptr;
-    cJSON* data = root != nullptr ? cJSON_GetObjectItemCaseSensitive(root, "data") : nullptr;
-    cJSON* rows = data != nullptr ? cJSON_GetObjectItemCaseSensitive(data, "sessions") : nullptr;
-    if (!cJSON_IsArray(rows)) {
-        cJSON_Delete(root);
-        SetResultError(result, result->http_status, "invalid_response", "Session list is invalid");
-        return ESP_ERR_INVALID_RESPONSE;
-    }
-    const int count = std::min(cJSON_GetArraySize(rows), 12);
-    sessions->reserve(static_cast<size_t>(count));
-    for (int index = 0; index < count; ++index) {
-        cJSON* row = cJSON_GetArrayItem(rows, index);
-        OpenCodeSessionInfo session;
-        session.id = JsonString(row, "id");
-        session.title = JsonString(row, "title");
-        cJSON* updated = cJSON_GetObjectItemCaseSensitive(row, "updatedAt");
-        if (cJSON_IsNumber(updated)) {
-            session.updated_at = static_cast<int64_t>(updated->valuedouble);
-        }
-        session.outcome = ParseSessionOutcome(JsonString(row, "outcome"));
-        if (session.id.rfind("ses_", 0) == 0) {
-            sessions->push_back(std::move(session));
-        }
-    }
-    cJSON_Delete(root);
-    return ESP_OK;
+    return ParseOpenCodeSessionsBody(body, sessions, result);
 }
 
 esp_err_t TranscribeOpenCodeAudio(
@@ -1026,6 +1096,42 @@ esp_err_t ParseOpenCodeAgentFrame(
     if (acknowledgement && payload.find_first_not_of(" \t\r\n") == std::string::npos) {
         payload = "{}";
     }
+    // [bounds] The manifest's `text_event_bytes` / `delta_event_bytes`, OBSERVED
+    // and not enforced. The two sides of that sentence are the whole point:
+    //
+    //   observed  -- a frame over the bound is logged once, at warning, naming
+    //                the event, the size and the bound. The manifest entry was
+    //                unread; now a peer that outgrows it says so.
+    //   not enforced -- the frame is still parsed and still acted on.
+    //
+    // Enforcing would be the stricter-looking and wronger choice HERE, which is
+    // the opposite of the question frame below and for a reason worth stating:
+    // nobody has measured the v2 gateway's largest text frame from this
+    // checkout, and refusing one over 8 KiB would drop the tail of a real
+    // answer to protect against a bound the peer may already exceed. A dropped
+    // answer is unrecoverable; an over-long one is merely unplanned. The 16 KiB
+    // SSE budget is what the device actually refuses, so the exposure stays
+    // bounded either way.
+    //
+    // `agent.question` is the exception and is refused further down: an ask the
+    // device cannot hold is one the user cannot dismiss, and its bound is
+    // unreachable by a conformant peer.
+    if (!acknowledgement && payload.size() > kMaxTextEventBytes &&
+        (event_name == "agent.text" || event_name == "agent.reasoning")) {
+        ESP_LOGW(kTag,
+                 "agent frame %s is %u B, over the manifest's text_event_bytes=%u -- "
+                 "parsing anyway",
+                 event_name.c_str(), static_cast<unsigned>(payload.size()),
+                 static_cast<unsigned>(kMaxTextEventBytes));
+    }
+    if (!acknowledgement && payload.size() > kMaxDeltaEventBytes &&
+        (event_name == "agent.text.delta" || event_name == "agent.reasoning.delta")) {
+        ESP_LOGW(kTag,
+                 "agent frame %s is %u B, over the manifest's delta_event_bytes=%u -- "
+                 "parsing anyway",
+                 event_name.c_str(), static_cast<unsigned>(payload.size()),
+                 static_cast<unsigned>(kMaxDeltaEventBytes));
+    }
     cJSON* root = wqn::protocol::JsonNestingWithinLimit(payload.data(), payload.size())
         ? cJSON_ParseWithLength(payload.data(), payload.size())
         : nullptr;
@@ -1080,6 +1186,20 @@ esp_err_t ParseOpenCodeAgentFrame(
             return ESP_ERR_INVALID_RESPONSE;
         }
     } else if (event_name == "agent.question") {
+        // [bounds] The manifest's `question_frame_bytes`, ENFORCED -- unlike the
+        // two text bounds above, because this one is arithmetic rather than a
+        // measurement: the schema caps an ask at 8 options, each a value plus a
+        // label, around three fixed ids and a title. That is ~3.7 KB in the worst
+        // legal case, so a 10 KiB question is a contract bug and not a big form.
+        //
+        // Refusing beats parsing it because the ask is modal: it owns every key
+        // until it is answered, and the only escape is the 自定义回答 pseudo-option
+        // that interrupts the run. An ask the device cannot hold is therefore one
+        // the user cannot dismiss, and a log line is not a way out of it.
+        if (payload.size() > kMaxQuestionFrameBytes) {
+            cJSON_Delete(root);
+            return ESP_ERR_INVALID_SIZE;
+        }
         // One step of a question sequence: the gateway walks a multi-field
         // form one field at a time and reuses `question_id` as the step id
         // (`{formId}#{step}`, opaque to the device). Up to

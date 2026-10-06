@@ -190,6 +190,21 @@ esp_err_t ListOpenCodeSessions(
     const std::string& token,
     std::vector<OpenCodeSessionInfo>* sessions,
     OpenCodeResult* result);
+// Parse a `GET /agent/sessions` response body. Split out of ListOpenCodeSessions
+// exactly the way ParseOpenCodeHistoryBody is split out of GetOpenCodeHistory:
+// the row walk below decides which sessions the picker offers, how the 运行中
+// marker is drawn and whether the device holds its sleep lease, and while it
+// lived inside a function that needs a token and a socket none of that had any
+// coverage at all.
+esp_err_t ParseOpenCodeSessionsBody(
+    const std::string& body,
+    std::vector<OpenCodeSessionInfo>* sessions,
+    OpenCodeResult* result);
+// Maps one device-contract `outcome` string onto the enum. Exported so the boot
+// self-test can pin the table: an unrecognised value must land on kUnknown
+// (no marker, no lease) rather than on an error that would take the whole list
+// down with one bad row.
+OpenCodeSessionOutcome ParseSessionOutcome(std::string_view value);
 esp_err_t CreateOpenCodeSession(
     const std::string& token,
     OpenCodeSessionInfo* session,

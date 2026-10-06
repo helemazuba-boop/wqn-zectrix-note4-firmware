@@ -1902,8 +1902,7 @@ constexpr char kAgentRoundBoundaryStream[] = R"json([
   { "event": "agent.status", "data": { "status": "idle", "message": "执行完成" } }
 ])json";
 
-// `valid/accepted-without-data-stream.json`. The shape that proved the parser
-// disagreed with its own schema. streamFrame requires only `event` and lists
+// `valid/accepted-without-data-stream.json`. The shape that proved the parser// disagreed with its own schema. streamFrame requires only `event` and lists
 // `data` as optional, with the description "Empty for the two acknowledgements" --
 // so a gateway that omits the field entirely is conformant, and the device parsed
 // an absent payload as an empty JSON document, got null, and dropped BOTH
@@ -1960,6 +1959,65 @@ constexpr char kAgentRunRequestWithId[] = R"json({
   "text": "帮我把这道极限题的步骤整理成错题本",
   "confirmed": true,
   "request_id": "0123456789abcdef"
+})json";
+
+// `valid/sessions-list-response.json`. Until the row walk was split out of
+// ListOpenCodeSessions into ParseOpenCodeSessionsBody, ZERO assertions in this
+// self-test touched `outcome` -- the field the picker's 运行中 marker is drawn
+// from and the field AgentRunInFlightLocked reads to decide whether the device
+// sleeps. Four rows on purpose, because each is a different answer:
+//   running    -> kRunning  : the only value that produces a marker or holds a lease
+//   succeeded  -> kSucceeded: settled, no marker
+//   unknown    -> kUnknown  : the explicit unknown
+//   absent     -> kUnknown  : a relay predating the field, and it must still load
+constexpr char kAgentSessionsList[] = R"json({
+  "success": true,
+  "data": {
+    "sessions": [
+      {
+        "id": "ses_01J8ZQ4K7V2N9X0M3B6C5D4E7F",
+        "title": "考研数学 · 强化班错题整理",
+        "updatedAt": 1758432000000,
+        "outcome": "running"
+      },
+      {
+        "id": "ses_01J8ZQ4K7V2N9X0M3B6C5D4E8A",
+        "title": "英语作文批改",
+        "updatedAt": 1758345600000,
+        "outcome": "succeeded"
+      },
+      {
+        "id": "ses_01J8ZQ4K7V2N9X0M3B6C5D4E9B",
+        "title": "新 Session",
+        "updatedAt": 1758262400000,
+        "outcome": "unknown"
+      },
+      {
+        "id": "ses_01J8ZQ4K7V2N9X0M3B6C5D4EAC",
+        "updatedAt": 1758178800000
+      }
+    ]
+  }
+})json";
+
+// `invalid/sessions-list-bad-outcome.json`. Legal at the wire level -- the
+// schema types `outcome` as an open string, and this one is not in the enum.
+// It must NOT fail the request: the readable rows are still worth showing, and
+// one unclassifiable row taking the whole picker down is strictly worse than a
+// missing marker. This fixture is the zero-coverage bug's other half: without
+// it, "unknown maps to unknown" was an assumption rather than a measured fact.
+constexpr char kAgentSessionsBadOutcome[] = R"json({
+  "success": true,
+  "data": {
+    "sessions": [
+      {
+        "id": "ses_01J8ZQ4K7V2N9X0M3B6C5D4E7F",
+        "title": "x",
+        "updatedAt": 1758432000000,
+        "outcome": "running-maybe"
+      }
+    ]
+  }
 })json";
 
 // Replay one fixture's `{event, data}` pairs through the frame parser, handing
@@ -2751,6 +2809,122 @@ bool CheckAgentGatewayV0Contract()
                 ESP_ERR_INVALID_SIZE,
             "agent history rejects oversized body")) {
         return false;
+    }
+
+    // --- session list, and the outcome field the picker reads ----------------
+    //
+    // [outcome-coverage] `outcome` had no coverage of any kind. It is the field
+    // the picker's 运行中 marker is drawn from AND the field AgentRunInFlightLocked
+    // reads to decide whether the device holds its sleep lease -- so the one
+    // table with a power consequence was the one table nothing replayed. These
+    // assertions go through the real row walk (ParseOpenCodeSessionsBody),
+    // which exists now precisely so they can.
+    {
+        std::vector<wqn::OpenCodeSessionInfo> sessions;
+        wqn::OpenCodeResult list_result;
+        if (!Require(wqn::ParseOpenCodeSessionsBody(kAgentSessionsList, &sessions,
+                                                    &list_result) == ESP_OK,
+                     "agent session list parses") ||
+            !Require(sessions.size() == 4, "agent session list row count") ||
+            !Require(sessions[0].id == "ses_01J8ZQ4K7V2N9X0M3B6C5D4E7F",
+                     "agent session list first id") ||
+            !Require(sessions[0].title == "考研数学 · 强化班错题整理",
+                     "agent session list title") ||
+            !Require(sessions[0].updated_at == 1758432000000LL,
+                     "agent session list updatedAt") ||
+            !Require(sessions[0].outcome == wqn::OpenCodeSessionOutcome::kRunning,
+                     "agent session outcome running") ||
+            !Require(sessions[1].outcome == wqn::OpenCodeSessionOutcome::kSucceeded,
+                     "agent session outcome succeeded") ||
+            !Require(sessions[2].outcome == wqn::OpenCodeSessionOutcome::kUnknown,
+                     "agent session outcome unknown") ||
+            // The relay that predates the field: absent is kUnknown, and the row
+            // must still be offered. A device that dropped it would hide every
+            // session an older gateway created.
+            !Require(sessions[3].outcome == wqn::OpenCodeSessionOutcome::kUnknown,
+                     "agent session absent outcome is unknown") ||
+            !Require(sessions[3].title.empty(), "agent session absent title is empty")) {
+            return false;
+        }
+        // The unrecognised value is not an error. One bad row costs a missing
+        // marker; failing the request would cost the whole picker.
+        if (!Require(wqn::ParseOpenCodeSessionsBody(kAgentSessionsBadOutcome, &sessions,
+                                                    &list_result) == ESP_OK,
+                     "agent session list accepts an unknown outcome") ||
+            !Require(sessions.size() == 1, "agent unknown outcome keeps its row") ||
+            !Require(sessions[0].outcome == wqn::OpenCodeSessionOutcome::kUnknown,
+                     "agent unknown outcome maps to unknown")) {
+            return false;
+        }
+        // The table itself, one call per value. The point of pinning it directly
+        // rather than only through the fixture: the fixture proves the row walk,
+        // and these prove the mapping, so a future edit that adds a value to the
+        // enum and forgets the table fails here rather than on a device.
+        if (!Require(wqn::ParseSessionOutcome("running") ==
+                         wqn::OpenCodeSessionOutcome::kRunning &&
+                     wqn::ParseSessionOutcome("succeeded") ==
+                         wqn::OpenCodeSessionOutcome::kSucceeded &&
+                     wqn::ParseSessionOutcome("interrupted") ==
+                         wqn::OpenCodeSessionOutcome::kInterrupted &&
+                     wqn::ParseSessionOutcome("failed") ==
+                         wqn::OpenCodeSessionOutcome::kFailed &&
+                     wqn::ParseSessionOutcome("unknown") ==
+                         wqn::OpenCodeSessionOutcome::kUnknown &&
+                     wqn::ParseSessionOutcome("") ==
+                         wqn::OpenCodeSessionOutcome::kUnknown &&
+                     wqn::ParseSessionOutcome("Running") ==
+                         wqn::OpenCodeSessionOutcome::kUnknown &&
+                     wqn::ParseSessionOutcome("running-maybe") ==
+                         wqn::OpenCodeSessionOutcome::kUnknown,
+                     "agent outcome table maps every value and only those")) {
+            return false;
+        }
+        // A body that is not a session list is refused, not rendered as empty --
+        // an empty picker and a network failure would look the same on screen.
+        if (!Require(wqn::ParseOpenCodeSessionsBody(R"json({"data":{"sessions":{}}})json",
+                                                   &sessions,
+                                                   &list_result) ==
+                         ESP_ERR_INVALID_RESPONSE,
+                     "agent session list rejects non-array sessions")) {
+            return false;
+        }
+    }
+
+    // --- the question frame's size bound -------------------------------------
+    //
+    // [bounds] The manifest's `question_frame_bytes`. This is NOT a golden
+    // conformant frame -- it cannot be, because the bound is unreachable by one:
+    // the schema caps a question at 8 options x (value 256 B + label 120 B)
+    // around three ids and a 160 B title, which is ~3.7 KB at the very most. The
+    // frame below exceeds that with 1400-byte labels precisely to reach 10 KiB,
+    // so what is asserted is the device's own defence against a peer that broke
+    // the schema, not the schema itself. The size assertion before the parse is
+    // what keeps the fixture honest: if the construction ever stops clearing the
+    // bound, the self-test fails here instead of quietly passing.
+    //
+    // Refusing is the right call because the ask is modal -- it owns every key
+    // until answered, and its only escape interrupts the run -- so an ask the
+    // device cannot hold is one the user cannot dismiss.
+    {
+        wqn::OpenCodeEvent oversized_question;
+        std::string big_options;
+        for (int i = 0; i < 8; ++i) {
+            big_options += "{\"value\":\"v" + std::to_string(i) + "\",\"label\":\"";
+            big_options.append(1400, 'x');
+            big_options += "\"},";
+        }
+        big_options.pop_back();
+        const std::string question_body =
+            R"json({"session_id":"ses_01J8ZQ4K7V2N9X0M3B6C5D4E7F","question_id":"frm_01J8ZQ5R8W3P1Y4N7C0D2E6F9G#0","title":"t","options":[)json" +
+            big_options + "]}";
+        if (!Require(question_body.size() > 10 * 1024,
+                     "agent question fixture is over the bound") ||
+            !Require(wqn::ParseOpenCodeAgentFrame("agent.question", question_body,
+                                                  &oversized_question) ==
+                         ESP_ERR_INVALID_SIZE,
+                     "agent question frame over the bound is refused")) {
+            return false;
+        }
     }
 
     // --- run request idempotency key: 16 lowercase hex chars ----------------
