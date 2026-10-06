@@ -250,6 +250,32 @@ void RefreshAgentRunLeaseLocked()
         return;
     }
     g_agent_sleep_lease.Reset();
+    // [agent] The connectivity demand goes too, and leaving it behind was a
+    // power bug rather than a tidiness one. This function REPLACED
+    // ReleaseWorkOwnershipLocked at six call sites, and that function released
+    // BOTH resources:
+    //
+    //     void ReleaseWorkOwnershipLocked() {
+    //         g_connectivity_demand.Reset();
+    //         g_agent_sleep_lease.Reset();
+    //     }
+    //
+    // ConnectivityDemand owns a runtime::SleepLease of its own
+    // (services/connectivity_service.h:89) with no expiry -- only Reset(), its
+    // destructor, or the move-assignment of the NEXT command's AcquireNetwork
+    // releases it. So after the criterion refactor the first agent command left
+    // a demand held for the rest of the boot: no deep sleep AND no light sleep
+    // (the demand takes the ESP-PM NO_LIGHT_SLEEP lock), with nothing on screen
+    // to explain it, repairable only by an action that still reaches a surviving
+    // ReleaseWorkOwnershipLocked -- the picker list or a session create.
+    //
+    // Releasing here is safe for the same reason the original call sites were:
+    // a chained follow-up re-acquires. Every worker handler starts with
+    // LoadToken + AcquireNetwork, and AcquireNetwork move-assigns a fresh
+    // demand, so the kLoadHistory / kObserveSession chains take their own
+    // before they need it. Both sibling tiers release their demand in their
+    // stream tail (ai_session.cpp, flash_session.cpp) for the same reason.
+    g_connectivity_demand.Reset();
 }
 
 // Rewrites the watched session's row in the picker snapshot to what the stream
@@ -462,10 +488,27 @@ bool FinishSwitchedStreamLocked()
         // handover the comment above describes would otherwise leave the lease
         // held by an idle worker with no stream and no reason.
         //
-        // The criterion now reads no: stream_active and g_observing were cleared
-        // at the top of this function, so both of its remote-run sources are
-        // gone and what is left on screen belongs to a session nobody is
-        // watching. The device is free to sleep through a run it left behind.
+        // The phase must be settled BEFORE the criterion reads it, and that is
+        // not a detail. This function sets kLoading nine lines above as the
+        // switching spinner, and the criterion's FIRST branch answers "a run is
+        // in flight" for kLoading -- so the criterion read true here, acquired
+        // the lease, and nothing ever released it: ChainWorkerCommandLocked(kNone)
+        // arms no handler, so the kLoading phase survived for the rest of the
+        // boot and every later call answered true. Leaving the AI page was
+        // therefore the one gesture that pinned the device awake forever --
+        // exactly what this whole criterion was written to stop, arriving
+        // through the comment above it claiming the criterion "now reads no".
+        // That comment only reasoned about stream_active and g_observing, which
+        // this function does clear, and never looked at the phase it set.
+        //
+        // kIdle is the settled value the terminal paths use, and there is no
+        // stream to be loading. The label settles with it: "正在切换" describes
+        // work this path does not do, and leaving it beside kIdle would be the
+        // same category of lie item C4 of the plan removed.
+        g_state.ui.phase = wqn::AiFeaturePhase::kIdle;
+        g_state.ui.status_label = "已离开 Session";
+        g_state.ui.activity_text = "云端任务继续运行";
+        g_state.ui.action_hint.clear();
         RefreshAgentRunLeaseLocked();
     }
     ChainWorkerCommandLocked(follow_up);
@@ -1644,7 +1687,17 @@ void RunPrompt()
         //
         // The prompt stays on screen: it is the one thing worth keeping, and
         // re-attaching does not touch prompt_text.
-        g_state.stream_active = false;
+        //
+        // stream_active is raised with the attach, exactly as
+        // LockSelectedOpenCodeSession does, and for the same reason: the stream
+        // being chained is an observe, and ObserveSession never raises the flag.
+        // Clearing it here instead left the attached stream invisible to four
+        // separate readers -- the lease criterion's own gate, the interrupt
+        // gesture, ArmSwitchLocked's "a stream is attached" predicate and
+        // therefore LeaveOpenCodeAgentTier -- which is to say this branch
+        // reattached successfully and then reproduced the dead end it was written
+        // to remove: a stream the user could neither stop nor leave.
+        g_state.stream_active = true;
         g_run_prompt.clear();
         g_run_request_id.clear();
         g_observing = true;
