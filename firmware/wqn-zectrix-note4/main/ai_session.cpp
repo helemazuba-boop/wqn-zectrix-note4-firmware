@@ -190,7 +190,14 @@ bool FinalizeThinkingLocked(wqn::AiHistory& history, const std::string& authorit
                             int64_t now_ms)
 {
     if (!authoritative.empty()) {
-        g_turn.thinking_text = authoritative;
+        // [mirror-cap] The authoritative thinking gets the same bound the streamed
+        // deltas do, for the same reason FinalizeAssistantLocked needs one: the
+        // terminal frame is the write that actually reaches history, and capping
+        // only the accumulation leaves kThinkingDone's full_text free to blow
+        // straight through the budget the accumulation was keeping.
+        g_turn.thinking_text.assign(
+            authoritative.data(),
+            wqn::Utf8SafePrefixBytes(authoritative, wqn::kMaxThinkingBytes));
     }
     return EnsureThinkingHistoryLocked(history, now_ms);
 }
@@ -544,6 +551,21 @@ void OnSseEvent(const wqn::WqnAiSseEvent& ev)
             if (!g_turn.thinking_done && !ev.delta.empty()) {
                 g_turn.thinking_seen = true;
                 g_turn.thinking_text += ev.delta;
+                // [mirror-cap] Bound the streamed thinking at the same 2 KiB the
+                // Agent tier uses (kMaxThinkingBytes in agent_round_policy.h).
+                // The answer cap below was written for assistant_text and left
+                // this accumulator untouched, which is the same hole one tier
+                // over: EnsureThinkingHistoryLocked writes `thinking_text` into
+                // a history entry, so an unbounded reasoning stream grows one
+                // entry without limit and evicts the ring's head before the
+                // answer has even started. The reasoning model is where the
+                // longest streams live, so this was the likelier of the two to
+                // fire. Cut on a character boundary, as the answer cap does.
+                if (g_turn.thinking_text.size() > wqn::kMaxThinkingBytes) {
+                    g_turn.thinking_text.resize(
+                        wqn::Utf8SafePrefixBytes(g_turn.thinking_text,
+                                                 wqn::kMaxThinkingBytes));
+                }
                 if (g_turn.thinking_id == wqn::kInvalidChatMessageId) {
                     EnsureThinkingHistoryLocked(history, now_ms);  // first visible prefix only
                     g_streaming_force_full_render = true;
