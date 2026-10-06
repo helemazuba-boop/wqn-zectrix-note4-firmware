@@ -1848,6 +1848,17 @@ void ClearAiConversationContext()
     g_state.toast_visible = false;
     g_state.toast_label.clear();
     wqn::GetAiHistory(wqn::AiHistoryChannel::kStdPro).Clear();
+    // [context-clear] Drop the in-flight turn's own state too, not just the ring.
+    // This function clears the kStdPro channel but leaves g_turn standing, and
+    // g_turn is what decides how the next mirrored frame writes: assistant_id
+    // still names an entry that has just been evicted, and assistant_text still
+    // holds the whole previous answer. The next kTextDelta therefore takes the
+    // "my entry vanished" path in FinalizeAssistantLocked -- correctly, since it
+    // did -- and re-appends the PREVIOUS answer into the ring the user just
+    // asked to empty. Clearing and then streaming one delta resurrects the turn
+    // that was cleared. ResetTurnAssemblyLocked is the same reset the turn's own
+    // start applies; the ring clear was simply never paired with it.
+    ResetTurnAssemblyLocked();
     ReleaseAiSleepLeaseIfIdleLocked();
     MarkChanged();
     xSemaphoreGive(g_lock);
