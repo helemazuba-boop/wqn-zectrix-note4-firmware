@@ -249,8 +249,17 @@ bool AgentRunInFlightLocked()
 //
 // kComplete rather than kIdle, because the device is looking at a conversation
 // that already finished and kComplete is the terminal state whose owner sets
-// 长按确认发起新任务. AiFeatureCanStartVoiceInput admits both phases, so this
-// changes what the band SAYS about a long press, not what the long press does.
+// 长按确认发起新任务. The long-press gesture itself is NOT gated on the phase --
+// TryApplyAgentAiButtonEvent routes on AgentOptionModeFor + session_locked +
+// stream_active -- so for the gesture this is only about what the band SAYS.
+//
+// It is not ONLY that, and the first version of this comment was wrong on
+// exactly this point: AiFeatureCanStartVoiceInput (ai_feature.cpp) admits
+// kIdle / kAwaitingConfirmation / kComplete / kError and EXCLUDES kRunning, so
+// claiming kRunning on a session whose run had already finished also blocked
+// voice input for as long as the claim stood. Returning kComplete here
+// re-enables it, which is the correct reading -- nothing was running.
+//
 // The first frame that proves otherwise re-decides through the same criterion:
 // a delta raises g_observed_run_live, a terminal status settles the turn, and
 // both republish run_live through RefreshAgentRunLeaseLocked.
