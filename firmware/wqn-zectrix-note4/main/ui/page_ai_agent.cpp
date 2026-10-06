@@ -358,7 +358,14 @@ static void DrawAgentSessionPicker(const wqn::AgentSessionState& agent)
         AGENT_TEXT(16, y, title.c_str(), !focused);
         if (running) {
             // 12 px icon centred in the 16 px line box.
-            DrawWqnBitmapAsset(marker_x, y + 2, m02_ai_tool_running_12_asset, true);
+            //
+            // `!focused`, like the title and the label beside it. The focused row
+            // is an INK reverse-fill (FillRoundedRect above is the [rowfill] style
+            // -- see graphics.cpp:132), so every element on that row has to be
+            // painted in paper colour. Hardcoding black here drew a black icon
+            // inside a black filled row: on the one row the user is looking at,
+            // the marker said nothing.
+            DrawWqnBitmapAsset(marker_x, y + 2, m02_ai_tool_running_12_asset, !focused);
             AGENT_TEXT(marker_x + kMarkerIconW + kMarkerGap, y, kRunningLabel, !focused);
         }
         y += kAgentPickerRowStep;
