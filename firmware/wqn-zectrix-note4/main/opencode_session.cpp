@@ -540,7 +540,7 @@ esp_err_t ArmSwitchLocked(WorkerCommand follow_up, const std::string& session_id
     // worker notices, so say something now rather than leaving the departing
     // run's label on screen looking like nothing happened.
     g_state.ui.status_label = "正在切换";
-    g_state.ui.activity_text = "已离开当前 Session，云端任务继续运行";
+    g_state.ui.activity_text = "已退出，任务还在跑";
     MarkChangedLocked();
     return ESP_OK;
 }
@@ -584,7 +584,7 @@ bool FinishSwitchedStreamLocked()
     g_state.stream_active = false;
     g_state.ui.phase = wqn::AiFeaturePhase::kLoading;
     g_state.ui.status_label = "正在切换";
-    g_state.ui.activity_text = "已离开当前 Session，云端任务继续运行";
+    g_state.ui.activity_text = "已退出，任务还在跑";
     g_state.ui.action_hint.clear();
     g_state.ui.response_text.clear();
     g_state.ui.scroll_offset_lines = 0;
@@ -639,8 +639,8 @@ bool FinishSwitchedStreamLocked()
         // work this path does not do, and leaving it beside kIdle would be the
         // same category of lie item C4 of the plan removed.
         g_state.ui.phase = wqn::AiFeaturePhase::kIdle;
-        g_state.ui.status_label = "已离开 Session";
-        g_state.ui.activity_text = "云端任务继续运行";
+        g_state.ui.status_label = "已退出";
+        g_state.ui.activity_text = "任务还在跑";
         g_state.ui.action_hint.clear();
         RefreshAgentRunLeaseLocked();
     }
@@ -725,7 +725,7 @@ void LoadSessions()
                 source.outcome});
         }
         if (g_state.sessions.empty()) {
-            SetErrorLocked("没有可用的 OpenCode Session");
+            SetErrorLocked("没有可用的任务");
         } else {
             // Nothing was highlighted because there was no list to highlight in
             // (the first open, or the previous one came back empty), so this is
@@ -759,8 +759,8 @@ void LoadSessions()
             g_state.ui.requires_confirmation = false;
             g_state.confirmation_armed_at_ms = 0;
             g_state.ui.phase = wqn::AiFeaturePhase::kIdle;
-            g_state.ui.status_label = "选择 Session";
-            g_state.ui.activity_text = "上下选择，确认锁定";
+            g_state.ui.status_label = "选任务";
+            g_state.ui.activity_text = "暂无任务";
             g_state.ui.action_hint = "↑/↓ 选择 · 确认锁定 · 长按新建";
             // [run-live] This is the only full rewrite of the picker rows, so it
             // is the only place outside a stream that can flip run_live -- the
@@ -771,7 +771,7 @@ void LoadSessions()
             MarkChangedLocked();
         }
     } else {
-        SetErrorLocked(api_result.detail.empty() ? "Session 列表加载失败" : api_result.detail);
+        SetErrorLocked(api_result.detail.empty() ? "任务列表获取失败，请重试" : api_result.detail);
     }
     xSemaphoreGive(g_lock);
     // [connectivity] The fetch is over on every path, so the demand it took out
@@ -921,8 +921,8 @@ void PrepareCapture()
         xSemaphoreTake(g_lock, portMAX_DELAY);
         if (!g_state.ui.prompt_text.empty() && g_state.ui.requires_confirmation) {
             g_state.ui.phase = wqn::AiFeaturePhase::kAwaitingConfirmation;
-            g_state.ui.status_label = "确认后发送";
-            g_state.ui.activity_text = "追加录音已取消，原转写尚未执行";
+            g_state.ui.status_label = "确认发送";
+            g_state.ui.activity_text = "没有录到声音，刚才说的还没发送";
             g_state.ui.action_hint = "↑ 发送 · ↓ 取消 · 长按确认追加";
             g_state.confirmation_armed_at_ms = esp_timer_get_time() / 1000;
         } else {
@@ -934,7 +934,6 @@ void PrepareCapture()
     } else {
         g_state.ui.phase = wqn::AiFeaturePhase::kRecording;
         g_state.ui.status_label = "录音中";
-        g_state.ui.activity_text = "松开确认键开始转写";
         g_state.ui.action_hint = "松开确认键停止";
         MarkChangedLocked();
         capture_started = true;
@@ -1013,8 +1012,8 @@ void Transcribe()
         }
         g_state.ui.prompt_text += transcript;
         g_state.ui.phase = wqn::AiFeaturePhase::kAwaitingConfirmation;
-        g_state.ui.status_label = "确认后发送";
-        g_state.ui.activity_text = "语音已转写，尚未执行";
+        g_state.ui.status_label = "确认发送";
+        g_state.ui.activity_text = "转写完了，还没发送";
         g_state.ui.action_hint = "↑ 发送 · ↓ 取消 · 长按确认追加";
         g_state.ui.requires_confirmation = true;
         g_state.confirmation_armed_at_ms = esp_timer_get_time() / 1000;
@@ -1028,7 +1027,7 @@ void Transcribe()
         const std::string& detail = !api_result.detail.empty()
             ? api_result.detail
             : g_voice_last_error;
-        SetErrorLocked(detail.empty() ? "语音转写失败" : detail);
+        SetErrorLocked(detail.empty() ? "转写失败" : detail);
     }
     xSemaphoreGive(g_lock);
 }
@@ -1256,7 +1255,7 @@ void PromoteDeferredQuestionLocked()
         return;
     }
     g_state.ui.phase = wqn::AiFeaturePhase::kAwaitingQuestion;
-    g_state.ui.status_label = "等待回答";
+    g_state.ui.status_label = "等你回答";
     g_state.pending_question_id = std::move(g_deferred_question_id);
     g_state.pending_question_title = std::move(g_deferred_question_title);
     g_state.pending_question_options = std::move(g_deferred_question_options);
@@ -1333,8 +1332,8 @@ void OnOpenCodeEvent(const wqn::OpenCodeEvent& event, void*)
     const int64_t now_ms = esp_timer_get_time() / 1000;
     switch (event.kind) {
         case wqn::OpenCodeEventKind::kAccepted:
-            SetPhaseLocked(wqn::AiFeaturePhase::kRunning, "Agent 执行中");
-            g_state.ui.activity_text = "OpenCode 已接收任务";
+            SetPhaseLocked(wqn::AiFeaturePhase::kRunning, "进行中");
+            g_state.ui.activity_text = "已收到";
             break;
         case wqn::OpenCodeEventKind::kAttached:
             // [run-live] Not SetPhaseLocked(kRunning, ...) unconditionally any
@@ -1346,8 +1345,8 @@ void OnOpenCodeEvent(const wqn::OpenCodeEvent& event, void*)
             //
             // The label and the activity line are unconditional: they are what
             // this frame actually proves (the stream is connected).
-            g_state.ui.status_label = "观察中";
-            g_state.ui.activity_text = "已连接 Session 事件流";
+            g_state.ui.status_label = "连接中";
+            g_state.ui.activity_text = "已连接";
             MarkChangedLocked();
             break;
         case wqn::OpenCodeEventKind::kStatus:
@@ -1369,8 +1368,8 @@ void OnOpenCodeEvent(const wqn::OpenCodeEvent& event, void*)
                 if (!g_run_failed) {
                     SetPhaseLocked(wqn::AiFeaturePhase::kComplete, "执行完成");
                     if (g_observing) {
-                        g_state.ui.status_label = "观察结束";
-                        g_state.ui.activity_text = "无运行中任务或任务已结束";
+                        g_state.ui.status_label = "已退出";
+                        g_state.ui.activity_text = "没有进行中的任务";
                     }
                     // The observe hint is gone with the observe gesture: B1
                     // attaches by entering, so there is no double-press to
@@ -1383,12 +1382,12 @@ void OnOpenCodeEvent(const wqn::OpenCodeEvent& event, void*)
                 // today (failures arrive as agent.error + idle), but the
                 // contract allows it, and without this branch it fell into the
                 // generic else below -- a failed run was relabelled
-                // "Agent 执行中" and `g_run_failed` stayed false, so the
+                // "进行中" and `g_run_failed` stayed false, so the
                 // trailing idle then closed the turn as a SUCCESS.
                 g_run_failed = true;
                 g_state.stream_active = false;
                 CloseAgentToolBlockLocked(false, now_ms);
-                SetPhaseLocked(wqn::AiFeaturePhase::kError, "执行失败");
+                SetPhaseLocked(wqn::AiFeaturePhase::kError, "任务失败");
                 // [B4] Retry, not record: the renderer prefers this hint when the
                 // state's owner set one, so the gesture it draws is the one that
                 // actually works in this phase.
@@ -1398,11 +1397,11 @@ void OnOpenCodeEvent(const wqn::OpenCodeEvent& event, void*)
                 }
             } else if (event.status == "retry") {
                 SetPhaseLocked(wqn::AiFeaturePhase::kRunning,
-                               g_observing ? "观察中" : "Agent 重试中");
+                               g_observing ? "连接中" : "重试中");
                 g_state.ui.activity_text = event.text;
             } else {
                 SetPhaseLocked(wqn::AiFeaturePhase::kRunning,
-                               g_observing ? "观察中" : "Agent 执行中");
+                               g_observing ? "连接中" : "进行中");
                 // Status text (gateway hints, upstream status messages) is
                 // transient context; the next tool/text event replaces it.
                 if (!event.text.empty()) {
@@ -1564,7 +1563,7 @@ void OnOpenCodeEvent(const wqn::OpenCodeEvent& event, void*)
             // permission flight (if any) is a different reply.
             g_reply_flight_question_id.clear();
             g_state.ui.phase = wqn::AiFeaturePhase::kAwaitingPermission;
-            g_state.ui.status_label = "等待权限";
+            g_state.ui.status_label = "等你允许";
             g_state.pending_permission_id = event.permission_id;
             // Which session the ask belongs to, not which one we attached to. A
             // subagent's permission must be answered on the subagent's own id or
@@ -1606,7 +1605,7 @@ void OnOpenCodeEvent(const wqn::OpenCodeEvent& event, void*)
                 break;
             }
             g_state.ui.phase = wqn::AiFeaturePhase::kAwaitingQuestion;
-            g_state.ui.status_label = "等待回答";
+            g_state.ui.status_label = "等你回答";
             g_state.pending_question_id = event.question_id;
             g_state.pending_question_title = event.text;
             g_state.pending_question_options = event.question_options;
@@ -1630,7 +1629,7 @@ void OnOpenCodeEvent(const wqn::OpenCodeEvent& event, void*)
                 ClearAllAsksLocked();
                 g_run_failed = true;
                 g_state.ui.phase = wqn::AiFeaturePhase::kError;
-                g_state.ui.status_label = "执行失败";
+                g_state.ui.status_label = "任务失败";
                 g_state.ui.action_hint = "长按确认重试新任务";
             } else {
                 // Keep running: the error is recorded, the run continues. A live
@@ -1641,7 +1640,7 @@ void OnOpenCodeEvent(const wqn::OpenCodeEvent& event, void*)
                 if (g_state.pending_permission_id.empty() &&
                     g_state.pending_question_id.empty()) {
                     g_state.ui.phase = wqn::AiFeaturePhase::kRunning;
-                    g_state.ui.status_label = g_observing ? "观察中" : "Agent 执行中";
+                    g_state.ui.status_label = g_observing ? "连接中" : "进行中";
                     g_state.ui.action_hint.clear();
                 }
             }
@@ -1710,8 +1709,8 @@ void OnOpenCodeReplyFailed(
     if (in_flight) {
         if (reply.is_question) {
             g_state.ui.phase = wqn::AiFeaturePhase::kAwaitingQuestion;
-            g_state.ui.status_label = "回答失败";
-            g_state.ui.activity_text = "回答未送达，可重试";
+            g_state.ui.status_label = "发送失败，请重试";
+            g_state.ui.activity_text = "发送失败，请重试";
             g_state.ui.action_hint = "↑/↓ 选择 · 确认回答";
         } else {
             // The permission was never answered, so it takes the bar back. A
@@ -1750,9 +1749,9 @@ void OnOpenCodeReplyFailed(
             // when the failure came back.
             g_state.pending_permission_session = reply.session_id;
             g_state.ui.phase = wqn::AiFeaturePhase::kAwaitingPermission;
-            g_state.ui.status_label = "权限回复失败";
-            g_state.ui.activity_text = reply.approve ? "批准未送达，可重试"
-                                                     : "拒绝未送达，可重试";
+            g_state.ui.status_label = "发送失败，请重试";
+            g_state.ui.activity_text = reply.approve ? "发送失败，请重试"
+                                                     : "发送失败，请重试";
             g_state.ui.action_hint = "↑ 批准 · ↓ 拒绝";
         }
         MarkChangedLocked();
@@ -1849,8 +1848,8 @@ void RunPrompt()
         // left armed here would answer nothing.
         ClearAllAsksLocked();
         g_state.ui.phase = wqn::AiFeaturePhase::kComplete;
-        g_state.ui.status_label = "已中止";
-        g_state.ui.activity_text = "任务已按确认键中止";
+        g_state.ui.status_label = "已停止";
+        g_state.ui.activity_text = "已停止";
         g_state.ui.action_hint = "长按确认发起新任务";
         g_state.stream_active = false;
         RefreshAgentRunLeaseLocked();
@@ -1898,8 +1897,8 @@ void RunPrompt()
         // ObserveSession arming a stream for an empty session id.
         refreshing_history = true;
         g_state.ui.phase = wqn::AiFeaturePhase::kRunning;
-        g_state.ui.status_label = "执行中";
-        g_state.ui.activity_text = "已有任务在运行，正在转为观察";
+        g_state.ui.status_label = "进行中";
+        g_state.ui.activity_text = "上一个任务还在跑，先看进展";
         g_state.ui.action_hint = "长按=中止";
         g_state.ui.requires_confirmation = false;
         g_state.confirmation_armed_at_ms = 0;
@@ -1923,7 +1922,7 @@ void RunPrompt()
                  g_run_session_id.c_str());
         MarkChangedLocked();
     } else if (result != ESP_OK && !g_run_failed) {
-        SetErrorLocked(api_result.detail.empty() ? "Agent 执行连接失败" : api_result.detail);
+        SetErrorLocked(api_result.detail.empty() ? "连接失败，请重试" : api_result.detail);
     } else {
         g_state.stream_active = false;
         // [detail] The brief tier hides tool work from the live stream, so the
@@ -1982,7 +1981,7 @@ void CreateSession()
         g_state.ui.context_label = created.title;
         g_state.ui.phase = wqn::AiFeaturePhase::kIdle;
         g_state.ui.status_label = "就绪";
-        g_state.ui.activity_text = "新 Session 已创建";
+        g_state.ui.activity_text = "已新建任务";
         g_state.ui.action_hint = "长按确认录音";
         g_state.ui.prompt_text.clear();
         g_state.ui.response_text.clear();
@@ -2003,7 +2002,7 @@ void CreateSession()
         MarkChangedLocked();
         ReleaseWorkOwnershipLocked();
     } else {
-        SetErrorLocked(api_result.detail.empty() ? "Session 创建失败" : api_result.detail);
+        SetErrorLocked(api_result.detail.empty() ? "新建任务失败，请重试" : api_result.detail);
     }    xSemaphoreGive(g_lock);
 }
 
@@ -2042,7 +2041,7 @@ void ObserveSession()
     // interrupt gesture, LeaveOpenCodeAgentTier). The gesture is therefore live
     // for the whole backfill, and a request armed in it is aimed at a run that
     // is still executing -- not at a stream that never existed. Dropping it left
-    // "已请求中止当前任务" on screen with no POST behind it, while the run went
+    // "正在停止" on screen with no POST behind it, while the run went
     // on. InterruptOpenCodeRun records the command that held the slot when the
     // gesture landed, and a backfill is the one case where the request is handed
     // on instead of discarded. Preserving it late beats honouring the promise
@@ -2091,7 +2090,7 @@ void ObserveSession()
     // it cannot stop `interrupt_delivered` from leaking BACKWARD -- a request
     // this stream consumed leaves that flag set, and the next observe's tail
     // then reads it true and takes this branch for a stream that ran to its
-    // natural end, overwriting a settled phase with "已中止" and clearing asks
+    // natural end, overwriting a settled phase with "已停止" and clearing asks
     // the next turn had just armed.
     const bool interrupt_delivered =
         g_interrupt_delivered.load(std::memory_order_acquire);
@@ -2111,7 +2110,7 @@ void ObserveSession()
         // [interrupt-fix] Settle the phase. An interrupt ends the stream at the
         // read loop's first iteration, so no agent.status frame ever arrives to
         // settle it, and this branch used to leave kRunning on screen behind a
-        // stream that no longer existed -- kRunning, "正在中止", and the
+        // stream that no longer existed -- kRunning, "正在停止", and the
         // "长按=中止" hint. That is the dead end, not a cosmetic one:
         // AiFeatureCanStartVoiceInput excludes kRunning, so voice capture (the
         // only route to a new prompt on this page) was refused, the interrupt
@@ -2125,14 +2124,14 @@ void ObserveSession()
         // with the same flag -- so the one thing this device can state is what it
         // did: it stopped observing.
         g_state.ui.phase = wqn::AiFeaturePhase::kComplete;
-        g_state.ui.status_label = "已中止";
-        g_state.ui.activity_text = "已停止观察当前 Session";
+        g_state.ui.status_label = "已停止";
+        g_state.ui.activity_text = "已退出任务";
         g_state.ui.action_hint = "长按确认发起新任务";
         g_state.stream_active = false;
         RefreshAgentRunLeaseLocked();
         MarkChangedLocked();
     } else if (result != ESP_OK && !g_run_failed) {
-        SetErrorLocked(api_result.detail.empty() ? "观察连接失败" : api_result.detail);
+        SetErrorLocked(api_result.detail.empty() ? "连接失败，请重试" : api_result.detail);
     } else {
         g_state.stream_active = false;
         RefreshAgentRunLeaseLocked();
@@ -2217,7 +2216,7 @@ void LoadHistory()
                  api_result.detail.c_str());
         if (!refresh) {
             // Failure must not leave a busy phase behind: an observing caller
-            // would sit on "观察中" with no stream attached, and a lock would
+            // would sit on "连接中" with no stream attached, and a lock would
             // stay busy. A post-run refresh has neither problem -- the run
             // already reached its terminal UI and the live transcript is
             // intact -- so its failure is the log line above and nothing more.
@@ -2228,8 +2227,8 @@ void LoadHistory()
             // session" is wrong for a user who is already inside one -- and the
             // picker-open path clears the locked session anyway.
             g_state.ui.phase = wqn::AiFeaturePhase::kError;
-            g_state.ui.status_label = "观察失败";
-            g_state.ui.activity_text = "历史读取失败，可重新选择 Session 重试";
+            g_state.ui.status_label = "连接失败";
+            g_state.ui.activity_text = "记录读取失败，请重试";
             g_state.stream_active = false;
             g_observing = false;
             MarkChangedLocked();
@@ -2247,7 +2246,7 @@ void LoadHistory()
         // it ran in, and without this guard every brief-tier run would end by
         // re-attaching an observe stream to the session it just finished.
         g_run_session_id = g_state.current_session_id;
-        g_state.ui.activity_text = "正在连接 Session 事件流";
+        g_state.ui.activity_text = "正在连接";
         MarkChangedLocked();
         ChainWorkerCommandLocked(WorkerCommand::kObserveSession);
         // [agent] B1: this is the path a lock takes, so it is where the attach
@@ -2349,8 +2348,8 @@ esp_err_t InitOpenCodeSession()
             return ESP_ERR_NO_MEM;
         }
         g_state.ui.title = "OpenCode";
-        g_state.ui.status_label = "未加载";
-        g_state.ui.activity_text = "进入页面后加载 Session";
+        g_state.ui.status_label = "未连接";
+        g_state.ui.activity_text = "还没有打开任务";
         g_state.ui.action_hint = "长按上下键切换页面";
         g_changed = true;
     }
@@ -2422,8 +2421,8 @@ esp_err_t RequestOpenCodeSessionList(OpenCodeRejectReason* reason)
     }
     if (result == ESP_OK) {
         g_state.ui.phase = AiFeaturePhase::kLoading;
-        g_state.ui.status_label = "加载 Session";
-        g_state.ui.activity_text = "正在连接 WQN Agent 网关";
+        g_state.ui.status_label = "打开任务中";
+        g_state.ui.activity_text = "正在连接";
         g_state.ui.action_hint.clear();
         MarkChangedLocked();
     } else {
@@ -2521,8 +2520,8 @@ esp_err_t LockSelectedOpenCodeSession(OpenCodeRejectReason* reason)
     g_state.history_loaded_session_id.clear();
     g_state.ui.context_label = selected.title;
     g_state.ui.phase = AiFeaturePhase::kLoading;
-    g_state.ui.status_label = "读取历史";
-    g_state.ui.activity_text = "正在读取历史对话";
+    g_state.ui.status_label = "读取记录中";
+    g_state.ui.activity_text = "正在读取记录";
     // B1 removed the observe gesture, so the hint no longer offers one. The
     // second confirm on the status bar's detail row keeps its own meaning
     // (edit the tier), which is exactly what it says here.
@@ -2571,8 +2570,8 @@ esp_err_t CreateNewOpenCodeSession(OpenCodeRejectReason* reason)
     if (result == ESP_OK) {
         g_observing = false;
         g_state.ui.phase = AiFeaturePhase::kLoading;
-        g_state.ui.status_label = "创建 Session";
-        g_state.ui.activity_text = "正在通过 WQN 网关新建";
+        g_state.ui.status_label = "新建任务中";
+        g_state.ui.activity_text = "正在新建任务";
         g_state.ui.action_hint.clear();
         MarkChangedLocked();
     } else {
@@ -2631,7 +2630,7 @@ esp_err_t ObserveOpenCodeSession(OpenCodeRejectReason* reason)
         // so the observed session can immediately be prompted as well.
         g_state.session_locked = true;
         // [run-live] Claim the phase the row can support, NOT kRunning
-        // unconditionally. "观察中" was always true here; kRunning is the part
+        // unconditionally. "连接中" was always true here; kRunning is the part
         // that was a guess, and the bottom band turned it into 长按=中止 -- a
         // destructive gesture offered for a session whose run had already
         // finished. See ObserveAttachPhaseLocked.
@@ -2642,13 +2641,13 @@ esp_err_t ObserveOpenCodeSession(OpenCodeRejectReason* reason)
         // the user armed before leaving reset the phase to kComplete while
         // requires_confirmation stayed true, which is the stranded 发送 the
         // clear now prevents. See SetPhaseLocked.
-        SetPhaseLocked(ObserveAttachPhaseLocked(), "观察中");
+        SetPhaseLocked(ObserveAttachPhaseLocked(), "连接中");
         g_state.ui.response_text.clear();
         g_state.ui.activity_text = needs_history
-            ? "正在读取历史对话"
+            ? "正在读取记录"
             : (g_state.ui.phase == wqn::AiFeaturePhase::kRunning
-                   ? "正在连接 Session 事件流"
-                   : "无运行中任务或任务已结束");
+                   ? "正在连接"
+                   : "没有进行中的任务");
         g_state.ui.action_hint = g_state.ui.phase == wqn::AiFeaturePhase::kRunning
                                      ? std::string()
                                      : std::string("长按确认发起新任务");
@@ -2717,8 +2716,8 @@ esp_err_t ReplyPendingOpenCodePermission(bool approve)
     g_reply_flight_permission_id = g_state.pending_permission_id;
     ClearPendingPermissionLocked();
     g_state.ui.phase = AiFeaturePhase::kRunning;
-    g_state.ui.status_label = g_observing ? "观察中" : "Agent 执行中";
-    g_state.ui.activity_text = approve ? "已批准权限" : "已拒绝权限";
+    g_state.ui.status_label = g_observing ? "连接中" : "进行中";
+    g_state.ui.activity_text = approve ? "已允许" : "已拒绝";
     g_state.ui.action_hint.clear();
     // [follow] The run continues after the ask: watch it again from the tail
     // and park on the answer body when it lands.
@@ -2768,8 +2767,7 @@ esp_err_t ReplyPendingOpenCodeQuestion(int index)
     g_outbound_replies.Push(std::move(reply));
     g_reply_flight_question_id = flight_id;
     g_state.ui.phase = AiFeaturePhase::kRunning;
-    g_state.ui.status_label = g_observing ? "观察中" : "Agent 执行中";
-    g_state.ui.activity_text = "已回答：" + answer;
+    g_state.ui.status_label = g_observing ? "连接中" : "进行中";
     g_state.ui.action_hint.clear();
     // [follow] Same as the permission reply: the run resumes, so watch it.
     ArmAgentFollowLocked();
@@ -2810,9 +2808,9 @@ void InterruptOpenCodeRun()
     // POST stops the run and the tail still chains the follow-up, so the user
     // lands on the picker they asked for instead of back on the session they
     // were leaving. Clearing it here would revoke an already-acknowledged
-    // switch and strand them with "已中止".
-    g_state.ui.status_label = "正在中止";
-    g_state.ui.activity_text = "已请求中止当前任务";
+    // switch and strand them with "已停止".
+    g_state.ui.status_label = "正在停止";
+    g_state.ui.activity_text = "正在停止";
     MarkChangedLocked();
     xSemaphoreGive(g_lock);
 }
@@ -2862,7 +2860,7 @@ esp_err_t StartOpenCodeVoiceInput()
         g_state.confirmation_armed_at_ms = 0;
         g_state.ui.phase = AiFeaturePhase::kLoading;
         g_state.ui.status_label = "准备录音";
-        g_state.ui.activity_text = "正在连接 WiFi 与麦克风";
+        g_state.ui.activity_text = "正在准备";
         g_state.ui.action_hint = "保持按住确认键";
         MarkChangedLocked();
     } else {
@@ -2890,8 +2888,7 @@ esp_err_t StopOpenCodeVoiceInput()
     g_recording_requested = false;
     g_command = WorkerCommand::kTranscribe;
     g_state.ui.phase = AiFeaturePhase::kTranscribing;
-    g_state.ui.status_label = "语音转写中";
-    g_state.ui.activity_text = "转写完成后必须确认才会发送";
+    g_state.ui.status_label = "转写中";
     g_state.ui.action_hint.clear();
     MarkChangedLocked();
     xTaskNotifyGive(g_worker);
@@ -2929,7 +2926,7 @@ void CancelAgentVoiceInput()
         wqn::AgentVoiceRequestCancel();
         g_state.ui.phase = wqn::AiFeaturePhase::kIdle;
         g_state.ui.status_label = "已取消";
-        g_state.ui.activity_text = "语音内容未发送";
+        g_state.ui.activity_text = "刚才说的没发送";
         g_state.ui.action_hint = "长按确认重新录音";
         g_state.ui.voice_partial.clear();
         MarkChangedLocked();
@@ -2981,9 +2978,9 @@ esp_err_t ConfirmOpenCodePrompt(int64_t confirmed_at_ms)
         // turn would hide this run's first ask and answer nothing.
         ClearAllAsksLocked();
         g_state.ui.phase = AiFeaturePhase::kSubmitting;
-        g_state.ui.status_label = "正在提交";
+        g_state.ui.status_label = "发送中";
         g_state.ui.response_text.clear();
-        g_state.ui.activity_text = "WQN 正在中转到 OpenCode";
+        g_state.ui.activity_text = "正在发送到云端";
         g_state.ui.action_hint.clear();
         g_state.ui.requires_confirmation = false;
         g_state.confirmation_armed_at_ms = 0;
@@ -3013,7 +3010,7 @@ void CancelOpenCodePrompt()
         g_state.ui.prompt_text.clear();
         g_state.ui.phase = AiFeaturePhase::kIdle;
         g_state.ui.status_label = "已取消";
-        g_state.ui.activity_text = "语音内容未发送";
+        g_state.ui.activity_text = "刚才说的没发送";
         g_state.ui.action_hint = "长按确认重新录音";
         g_state.ui.requires_confirmation = false;
         g_state.confirmation_armed_at_ms = 0;

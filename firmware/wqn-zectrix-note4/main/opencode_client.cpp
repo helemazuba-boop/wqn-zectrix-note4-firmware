@@ -958,7 +958,7 @@ esp_err_t CreateOpenCodeSession(
         return ESP_ERR_INVALID_RESPONSE;
     }
     if (session->title.empty()) {
-        session->title = "新 Session";
+        session->title = "新任务";
     }
     return ESP_OK;
 }

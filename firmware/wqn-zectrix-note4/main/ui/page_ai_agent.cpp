@@ -145,7 +145,7 @@ const char* AgentOptionLabel(AgentOption option)
 {
     switch (option) {
         case AgentOption::kSend: return "发送";
-        case AgentOption::kReinput: return "重新输入";
+        case AgentOption::kReinput: return "重说";
         case AgentOption::kApprove: return "同意";
         case AgentOption::kDeny: return "拒绝";
         case AgentOption::kCount:
@@ -205,7 +205,7 @@ static void DrawAgentOptionBar(AgentOptionMode mode, uint8_t focused,
                     ? agent.pending_question_options[item].value
                     : agent.pending_question_options[item].label;
             } else {
-                label = "自定义回答";
+                label = "自己回答";
             }
         } else {
             label = AgentOptionLabel(
@@ -280,11 +280,11 @@ static void DrawAgentPendingBubble(const std::string& text, const char* title)
 
 static void DrawAgentSessionPicker(const wqn::AgentSessionState& agent)
 {
-    AGENT_TEXT(12, kAgentPickerTitleY, "选择 Session · 确认锁定 · 长按新建", true);
+    AGENT_TEXT(12, kAgentPickerTitleY, "选任务", true);
     DrawHorizontalLine(8, 52, 384);
     if (agent.sessions.empty()) {
         const std::string empty = agent.ui.activity_text.empty()
-            ? "暂无 Session"
+            ? "暂无任务"
             : agent.ui.activity_text;
         AGENT_TEXT(12, 82, AgentOneLine(empty, 360).c_str(), true);
         return;
@@ -342,7 +342,7 @@ static void DrawAgentSessionPicker(const wqn::AgentSessionState& agent)
         // m02_ai_tool_running is the icon the tool blocks already use for a
         // running tool, so the picker says "in flight" with the same mark the
         // transcript does.
-        static const char kRunningLabel[] = "运行中";
+        static const char kRunningLabel[] = "进行中";
         const int label_w = wqn::MeasureUtf8TextWidth(kRunningLabel);
         constexpr int kMarkerIconW = 12;      // m02_ai_tool_running_12
         constexpr int kMarkerGap = 4;         // icon -> label
@@ -582,12 +582,12 @@ esp_err_t RenderAgentAiToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule
 
     if (mode == AgentOptionMode::kPermission) {
         const std::string ask = agent.ui.activity_text.empty()
-            ? std::string("OpenCode 请求权限")
+            ? std::string("等你允许")
             : agent.ui.activity_text;
         DrawAgentPendingBubble(ask, "权限请求");
     } else if (mode == AgentOptionMode::kQuestion) {
         std::string ask = agent.pending_question_title.empty()
-            ? std::string("OpenCode 请求回答")
+            ? std::string("等你回答")
             : agent.pending_question_title;
         if (agent.pending_question_options.empty()) {
             // A field with nothing the device can choose between (free text,
@@ -601,7 +601,7 @@ esp_err_t RenderAgentAiToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule
             // space is the smallest separator the font can actually draw. There is
             // only one candidate here -- `ask` is the title, so the advisory has to
             // be visually separate from it.
-            ask += " 设备无法显示选项；选“自定义回答”将中止本次任务";
+            ask += " 选项太多，长按说话回答";
         }
         DrawAgentPendingBubble(ask, "提问");
     } else {
