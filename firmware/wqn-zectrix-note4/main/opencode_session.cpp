@@ -86,6 +86,17 @@ std::string g_reply_flight_question_id;
 // that records whether the interrupt actually reached the gateway.
 std::atomic<bool> g_interrupt_requested{false};
 std::atomic<bool> g_interrupt_delivered{false};
+// [interrupt-fix] Set by InterruptOpenCodeRun when the gesture landed while a
+// transcript backfill (kLoadHistory) held the command slot. A backfill is the
+// one state where the interrupt gesture is live before the stream it belongs to
+// exists -- stream_active is raised with the attach, not with the socket -- so a
+// request armed there cannot be dismissed as pre-attach noise. ObserveSession's
+// entry clear reads it and hands the request on instead of discarding it.
+//
+// Written on the UI thread under g_lock and read by the worker under g_lock, so
+// it does not need to be atomic; it is next to the pair it travels with because
+// it is meaningless alone.
+bool g_interrupt_held_backfill = false;
 // [agent] Switch-away handshake for an attached stream (symptom 2). Unlike the
 // cancel pair above, a switch asks for no upstream action at all: the device
 // detaches and the cloud keeps running the session. The UI thread sets the
@@ -1983,8 +1994,29 @@ void ObserveSession()
     // is not connected yet at that point, so an interrupt POST could not have
     // changed anything upstream -- and the switch pair this function already
     // clears at this exact line has always had the same window.
-    g_interrupt_requested.store(false, std::memory_order_release);
-    g_interrupt_delivered.store(false, std::memory_order_release);
+    //
+    // [interrupt-fix] That window is the DIRECT arm's window, and the direct arm
+    // is no longer the only one. An attach with a transcript still to backfill
+    // chains kLoadHistory, which holds the single command slot for seconds with
+    // stream_active ALREADY true -- deliberately, so the four readers that key
+    // off it keep working (ArmSwitchLocked's predicate, the lease criterion, the
+    // interrupt gesture, LeaveOpenCodeAgentTier). The gesture is therefore live
+    // for the whole backfill, and a request armed in it is aimed at a run that
+    // is still executing -- not at a stream that never existed. Dropping it left
+    // "已请求中止当前任务" on screen with no POST behind it, while the run went
+    // on. InterruptOpenCodeRun records the command that held the slot when the
+    // gesture landed, and a backfill is the one case where the request is handed
+    // on instead of discarded. Preserving it late beats honouring the promise
+    // never: if the backfill fails and never chains this observe, the flag waits
+    // for the next one, which is still closer to what the user asked for than
+    // dropping it -- and the contract treats an interrupt for a finished run as
+    // a successful no-op.
+    const bool armed_during_backfill = g_interrupt_held_backfill;
+    g_interrupt_held_backfill = false;
+    if (!armed_during_backfill) {
+        g_interrupt_requested.store(false, std::memory_order_release);
+        g_interrupt_delivered.store(false, std::memory_order_release);
+    }
     g_switch_requested.store(false, std::memory_order_release);
     g_switch_delivered.store(false, std::memory_order_release);
     std::string token;
@@ -2191,6 +2223,14 @@ void LoadHistory()
         return;
     }
     g_run_session_id.clear();
+    // [interrupt-fix] This backfill is not chaining the observe that would have
+    // inherited an interrupt armed during it, so the handover ObserveSession's
+    // entry clear was promised never happens here. Drop the marker with it: the
+    // next observe belongs to whatever session is current then, and must not
+    // honour a request the user raised against this one. The request flag itself
+    // is left alone -- with no stream attached the next entry clear discards it,
+    // and the UI state is already settled by the failure branch above.
+    g_interrupt_held_backfill = false;
     xSemaphoreGive(g_lock);
     ReleaseWorkOwnershipLocked();
 }
@@ -2712,12 +2752,20 @@ void InterruptOpenCodeRun()
         // No stream to break: an interrupt for a run nobody started is a no-op,
         // and the worker would consume the flag on its next (unrelated) stream.
         g_interrupt_requested.store(false, std::memory_order_release);
+        // Nothing is attached, so nothing was in a backfill either.
+        g_interrupt_held_backfill = false;
         xSemaphoreGive(g_lock);
         return;
     }
     // Flag only. The streaming worker makes the interrupt POST itself, so the
     // UI thread never opens a connection of its own while a stream is attached.
     g_interrupt_requested.store(true, std::memory_order_release);
+    // [interrupt-fix] Remember what held the worker slot when this landed. A
+    // backfill raises stream_active with the attach but has no socket yet, which
+    // makes this gesture live for the whole read; the observe the backfill chains
+    // opens the stream afterwards and used to throw the request away here,
+    // leaving the promise on screen with nothing behind it.
+    g_interrupt_held_backfill = (g_command == WorkerCommand::kLoadHistory);
     // [agent] A pending switch is deliberately LEFT armed: the user asked for
     // the picker and then for a cancel, and both can be served -- the interrupt
     // POST stops the run and the tail still chains the follow-up, so the user
