@@ -64,6 +64,22 @@ struct AgentSessionState {
     int64_t confirmation_armed_at_ms = 0;
     bool session_locked = false;
     bool stream_active = false;
+    // [run-live] "A run this device can see is in flight", which is NOT the same
+    // claim as stream_active. stream_active says a stream is attached, and B1
+    // makes an attach the default state of the AI page -- so it is true for the
+    // whole time the user sits on a session that already finished. The bottom
+    // band's hint has to name the gesture that works, and at kRunning the two
+    // candidates are 长按=中止 (needs a run to stop) and 长按=发起新任务 (needs a
+    // settled session). Choosing from stream_active picked the destructive one
+    // for a session with nothing running.
+    //
+    // Published from RefreshAgentRunLeaseLocked, which is the same function that
+    // decides the sleep lease from this criterion -- so the gesture and the power
+    // decision cannot answer differently. Marked only on transition, so a flip
+    // costs one repaint rather than one per tick. The renderer MUST also carry it
+    // in the frame signature, or layer-1 dedup skips the repaint the flip needs
+    // and the fix is invisible.
+    bool run_live = false;
     // [follow] Per-turn viewport-follow state for the Agent tier; same
     // semantics as AiSessionState::follow_active / user_moved. Armed by the
     // turn-start paths in opencode_session.cpp, cleared by manual scrolls.

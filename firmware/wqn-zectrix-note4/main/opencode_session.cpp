@@ -240,12 +240,56 @@ bool AgentRunInFlightLocked()
     return g_observed_run_live;
 }
 
+// [run-live] The one place an observe attach decides what it may claim, from the
+// only evidence an attach has: the picker row the last list fetch wrote. No frame
+// has been read yet, so stream_active and g_observing say only "a stream is being
+// opened" -- they cannot answer "is a run in flight", and reading them as if they
+// could is what put 长按=中止 on a settled session (the criterion this mirrors
+// refuses exactly that conflation: see the !g_observing || !stream_active gate).
+//
+// kComplete rather than kIdle, because the device is looking at a conversation
+// that already finished and kComplete is the terminal state whose owner sets
+// 长按确认发起新任务. AiFeatureCanStartVoiceInput admits both phases, so this
+// changes what the band SAYS about a long press, not what the long press does.
+// The first frame that proves otherwise re-decides through the same criterion:
+// a delta raises g_observed_run_live, a terminal status settles the turn, and
+// both republish run_live through RefreshAgentRunLeaseLocked.
+wqn::AiFeaturePhase ObserveAttachPhaseLocked()
+{
+    for (const wqn::AgentSessionOption& option : g_state.sessions) {
+        if (option.id != g_state.current_session_id) {
+            continue;
+        }
+        return option.outcome == wqn::OpenCodeSessionOutcome::kRunning
+                   ? wqn::AiFeaturePhase::kRunning
+                   : wqn::AiFeaturePhase::kComplete;
+    }
+    // No row for this session (a create, or a list that has not been read since
+    // the lock). Absent is the same fail-safe direction every other unknown in
+    // this file takes: claim nothing destructive.
+    return wqn::AiFeaturePhase::kComplete;
+}
+
 // Aligns the lease with AgentRunInFlightLocked. Every agent path that used to
 // hand ownership back unconditionally calls this instead, so there is exactly
 // one place that answers the question and one comment explaining it.
 void RefreshAgentRunLeaseLocked()
 {
-    if (AgentRunInFlightLocked()) {
+    // [run-live] Same question, second consumer. The lease above/below answers it
+    // for the power coordinator; the bottom band's gesture hint answers it for the
+    // user, and the renderer used to derive that hint from the phase instead. The
+    // phase is a claim, this is the evidence behind it, and publishing both from
+    // one function is what stops them drifting apart again.
+    //
+    // Only on a transition: MarkChangedLocked on every call would repaint the AI
+    // frame once per tick for the whole time a session is merely open, and the
+    // answer does not change while a stream is quiet.
+    const bool live = AgentRunInFlightLocked();
+    if (g_state.run_live != live) {
+        g_state.run_live = live;
+        MarkChangedLocked();
+    }
+    if (live) {
         AcquireAgentLeaseLocked();
         return;
     }
@@ -601,6 +645,12 @@ void LoadSessions()
             g_state.ui.status_label = "选择 Session";
             g_state.ui.activity_text = "上下选择，确认锁定";
             g_state.ui.action_hint = "↑/↓ 选择 · 确认锁定 · 长按新建";
+            // [run-live] This is the only full rewrite of the picker rows, so it
+            // is the only place outside a stream that can flip run_live -- the
+            // row that seeded it may have settled while the list was stale, or a
+            // row this device was attached to may have started running. Marked
+            // inside the publish, on transition only.
+            RefreshAgentRunLeaseLocked();
             MarkChangedLocked();
             ReleaseWorkOwnershipLocked();
         }
@@ -1158,8 +1208,18 @@ void OnOpenCodeEvent(const wqn::OpenCodeEvent& event, void*)
             g_state.ui.activity_text = "OpenCode 已接收任务";
             break;
         case wqn::OpenCodeEventKind::kAttached:
-            SetPhaseLocked(wqn::AiFeaturePhase::kRunning, "观察中");
+            // [run-live] Not SetPhaseLocked(kRunning, ...) unconditionally any
+            // more. kAttached is observe-only, and the attach already claimed the
+            // phase the evidence supports (ObserveAttachPhaseLocked); re-claiming
+            // kRunning here overwrote that with the same guess, which is why the
+            // hint said 中止 on a settled session even after the attach was
+            // corrected. Same predicate, so the two can no longer disagree.
+            //
+            // The label and the activity line are unconditional: they are what
+            // this frame actually proves (the stream is connected).
+            g_state.ui.status_label = "观察中";
             g_state.ui.activity_text = "已连接 Session 事件流";
+            MarkChangedLocked();
             break;
         case wqn::OpenCodeEventKind::kStatus:
             // [P3c] A pending ask is only cleared by a terminal status. Clearing
@@ -2403,13 +2463,22 @@ esp_err_t ObserveOpenCodeSession(OpenCodeRejectReason* reason)
         // renders while the stream is attached; the lock persists afterwards
         // so the observed session can immediately be prompted as well.
         g_state.session_locked = true;
-        g_state.ui.phase = AiFeaturePhase::kRunning;
+        // [run-live] Claim the phase the row can support, NOT kRunning
+        // unconditionally. "观察中" was always true here; kRunning is the part
+        // that was a guess, and the bottom band turned it into 长按=中止 -- a
+        // destructive gesture offered for a session whose run had already
+        // finished. See ObserveAttachPhaseLocked.
+        g_state.ui.phase = ObserveAttachPhaseLocked();
         g_state.ui.status_label = "观察中";
         g_state.ui.response_text.clear();
         g_state.ui.activity_text = needs_history
             ? "正在读取历史对话"
-            : "正在连接 Session 事件流";
-        g_state.ui.action_hint.clear();
+            : (g_state.ui.phase == wqn::AiFeaturePhase::kRunning
+                   ? "正在连接 Session 事件流"
+                   : "无运行中任务或任务已结束");
+        g_state.ui.action_hint = g_state.ui.phase == wqn::AiFeaturePhase::kRunning
+                                     ? std::string()
+                                     : std::string("长按确认发起新任务");
         g_state.ui.scroll_offset_lines = 0;
         // [follow] Attaching is a fresh turn (see ArmAgentFollowLocked): the
         // viewport watches the stream and parks on the newest answer once it
@@ -2428,6 +2497,11 @@ esp_err_t ObserveOpenCodeSession(OpenCodeRejectReason* reason)
             g_run_session_id.clear();
             result = ESP_ERR_INVALID_STATE;
         }
+        // [run-live] Publish before the worker starts, so the picker row's claim
+        // is on screen from the very first frame of UI state rather than one
+        // snapshot later. stream_active is set just above, which is what lets the
+        // criterion's observe branch reach the row at all.
+        RefreshAgentRunLeaseLocked();
         MarkChangedLocked();
     }
     if (result != ESP_OK) {

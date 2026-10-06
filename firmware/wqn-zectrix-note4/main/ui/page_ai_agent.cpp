@@ -515,16 +515,35 @@ esp_err_t RenderAgentAiToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule
         // the two ask phases render the option bar below instead, so they get
         // their hint from it. A capture (kLoading / kRecording) draws its own
         // partial above and leaves the band to activity_text.
+        //
+        // [run-live] The kRunning case now reads run_live instead of assuming it.
+        // kRunning means "attached and waiting" as much as "a run is in flight":
+        // B1 attaches on entering the AI page, so an idle session sits at kRunning
+        // with a stream open for as long as nothing detaches it. The phase alone
+        // therefore cannot tell the two meanings of the gesture apart, and
+        // guessing 中止 offered a destructive gesture for a session with nothing
+        // to abort -- the exact failure this band exists to prevent, reintroduced
+        // by the default attach. run_live is the criterion's own answer, published
+        // from the same function that decides the sleep lease.
+        //
+        // The gate deliberately does NOT also demand a live run to ACT on the
+        // interrupt (ui_input.cpp still keys off stream_active). The criterion
+        // fails safe toward "no run" -- an unknown outcome, or a row that has not
+        // been read yet, answers false -- and gating the gesture on it would
+        // refuse a legitimate abort in exactly those cases. Naming the gesture
+        // and honouring it are two different questions with two different safe
+        // directions.
         std::string hint;
         switch (agent.ui.phase) {
             case wqn::AiFeaturePhase::kRunning:
-                // Fixed, not taken from action_hint: at kRunning that field holds
+                // Still not taken from action_hint: at kRunning that field holds
                 // whatever the last frame happened to leave in it (a permission
-                // was just answered, a status line came through), and a long
-                // press here interrupts the run no matter what the cloud said.
-                // B4's requirement is that the one gesture with two meanings is
-                // named in the state where the meaning is the surprising one.
-                hint = "长按=中止";
+                // was just answered, a status line came through). B4's
+                // requirement is that the one gesture with two meanings is named
+                // in the state where the meaning is the surprising one -- which
+                // is now only the state where a run is actually in flight.
+                hint = agent.run_live ? std::string("长按=中止")
+                                      : std::string("长按=发起新任务");
                 break;
             case wqn::AiFeaturePhase::kIdle:
             case wqn::AiFeaturePhase::kComplete:
