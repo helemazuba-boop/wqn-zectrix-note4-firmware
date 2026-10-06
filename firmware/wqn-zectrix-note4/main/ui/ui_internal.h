@@ -37,6 +37,13 @@
 #include "ui/assets/wqn_bitmap_asset.h"
 #include "display/display_types.h"
 
+// [agent] Forward-declared rather than including opencode_session.h here: this
+// header only needs the type for the label below, and the enum has an explicit
+// underlying type so the declaration is complete on its own.
+namespace wqn {
+enum class OpenCodeRejectReason : uint8_t;
+}  // namespace wqn
+
 namespace device_ui_internal {
 
 class UiRuntime;
@@ -731,6 +738,11 @@ enum class AgentOptionMode : uint8_t {
     kQuestion,      // gateway form pending: projected options + 自定义回答
 };
 AgentOptionMode AgentOptionModeFor(const wqn::AgentSessionState& agent);
+// [agent] Names why an Agent request was refused. Every one of these used to
+// log the same "busy or empty list", which is indistinguishable when reading a
+// device log after the fact. Was static in ui_input.cpp; promoted when the
+// picker's stale-marker refresh (ui_runtime.cpp) became a second caller.
+const char* AgentRejectLabel(wqn::OpenCodeRejectReason reason);
 // The focused slot, clamped to the two the current mode actually offers.
 AgentOption AgentFocusedOption(AgentOptionMode mode, uint8_t focused);
 const char* AgentOptionLabel(AgentOption option);

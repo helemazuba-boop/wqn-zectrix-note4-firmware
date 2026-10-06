@@ -21,6 +21,12 @@ constexpr char kTag[] = "wqn_ui_runtime";
 // the window means a double-click writes nothing at all.
 constexpr int64_t kAgentDetailSaveDebounceMs = 500;
 
+// [picker-stale] How long the session picker's rows may keep claiming 运行中
+// before the UI re-reads them. Long enough that an actively-pressing user is not
+// racing a 1-2 s list load, short enough to matter for a list the user is
+// reading rather than glancing at.
+constexpr int64_t kAgentListPollIntervalMs = 10000;
+
 }  // namespace
 
 const char* AppEventKindName(AppEventKind event)
@@ -72,6 +78,8 @@ const char* AppEventKindName(AppEventKind event)
             return "problem-persist";
         case AppEventKind::kSettingsPersist:
             return "settings-persist";
+        case AppEventKind::kAgentListPoll:
+            return "agent-list-poll";
         default:
             return "unknown";
     }
@@ -740,6 +748,81 @@ UiUpdate UiRuntime::DispatchAgentDetailPersist(int64_t now_ms)
     settings.agent_detail_save_op_id = op_id;
     return FinishEvent(AppEventKind::kSettingsPersist,
                        RefreshSchedule::kNone, true);
+}
+
+UiUpdate UiRuntime::DispatchAgentSessionListPoll(int64_t now_ms)
+{
+    // [picker-stale] The picker's 运行中 marker is drawn from each row's
+    // `outcome`, and g_state.sessions has exactly two writers: a list load, and
+    // the terminal-status path that settles the ATTACHED session's row. With the
+    // picker open the device is attached to nothing, so the second cannot run,
+    // and both list-load paths are user gestures (tier cycle onto the tier with
+    // no session locked, status-bar slot 1) that the open picker makes
+    // unreachable -- it returns kHandled ahead of both. So the marker is a fixed
+    // point: it can say 运行中 about a session that finished while the user was
+    // reading the list, and nothing on the device can discover otherwise.
+    //
+    // The user then acts on it. In one direction they lock a session they believe
+    // is live and watch it say nothing; in the other they skip one that just
+    // started. The attach corrects both within a frame or two, but the marker
+    // exists precisely so the user does not have to find out by locking (D-which).
+    //
+    // So the only writer that can reach this state is this tick. Conditions, in
+    // order of how much they narrow it:
+    //
+    //   picker open, list non-empty, at least one row claims running
+    //
+    // The running-row gate is what bounds the cost: the poll fires at most a
+    // couple of times per picker opening and then disarms itself permanently,
+    // because a list with no running row is a list with no marker that can be
+    // lying. A poll is a non-blocking arm (RequestOpenCodeSessionList takes
+    // g_lock briefly and posts to the same single agent worker -- AGENTS.md §5:
+    // no second task, no second TLS session), and when the worker already holds
+    // the slot it degrades to a deferred switch whose tail runs the same load,
+    // so a busy worker costs a retry rather than a lost refresh.
+    //
+    // The trade, stated plainly: while a load is in flight a confirm press is
+    // refused with kWorkerBusy and only logged. That race already exists for the
+    // user-initiated list load, and the running-row gate means a background load
+    // can be in flight for a second or two at most a couple of times per picker
+    // opening. A failed poll is invisible here on purpose -- DrawAgentSessionPicker
+    // reads only the rows, and a list that has not been replaced is still the
+    // list it was drawing.
+    if (state_.screen != wqn::UiScreen::kAi ||
+        state_.ai.tier != wqn::AiTier::kAgent ||
+        state_.agent.session_locked ||
+        state_.agent.sessions.empty()) {
+        return FinishEvent(AppEventKind::kAgentListPoll, RefreshSchedule::kNone, false);
+    }
+    if (now_ms - agent_list_poll_at_ms_ < kAgentListPollIntervalMs) {
+        return FinishEvent(AppEventKind::kAgentListPoll, RefreshSchedule::kNone, false);
+    }
+    bool any_running = false;
+    for (const wqn::AgentSessionOption& option : state_.agent.sessions) {
+        if (option.outcome == wqn::OpenCodeSessionOutcome::kRunning) {
+            any_running = true;
+            break;
+        }
+    }
+    if (!any_running) {
+        // [picker-stale] Disarmed for this picker opening: nothing is claiming a
+        // run, so nothing can be lying. Not latched -- a later fetch may bring
+        // the marker back, and it should be polled again if it does.
+        return FinishEvent(AppEventKind::kAgentListPoll, RefreshSchedule::kNone, false);
+    }
+    // Set on attempt, not on success: a rejected poll (worker busy) must not
+    // retry on the next tick, or a chain that outlives one interval spins.
+    agent_list_poll_at_ms_ = now_ms;
+    wqn::OpenCodeRejectReason reason = wqn::OpenCodeRejectReason::kNone;
+    if (wqn::RequestOpenCodeSessionList(&reason) != ESP_OK) {
+        ESP_LOGW(kTag, "Agent picker: stale-marker refresh refused (%s)",
+                 AgentRejectLabel(reason));
+        return FinishEvent(AppEventKind::kAgentListPoll, RefreshSchedule::kNone, false);
+    }
+    ESP_LOGI(kTag, "Agent picker: stale-marker refresh requested");
+    // The next snapshot carries the new rows; the renderer's signature already
+    // carries each row's running bit, so the repaint needs no extra push here.
+    return FinishEvent(AppEventKind::kAgentListPoll, RefreshSchedule::kNone, false);
 }
 
 UiUpdate UiRuntime::DispatchTimeTick(int64_t now_ms)

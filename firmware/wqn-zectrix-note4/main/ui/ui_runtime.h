@@ -44,6 +44,8 @@ enum class AppEventKind : uint8_t {
     kNoteObservationPersist,
     kProblemVerdictPersist,
     kSettingsPersist,
+    // [picker-stale] Diagnose-only marker for the picker's self-refresh arm.
+    kAgentListPoll,
 };
 
 struct UiUpdate {
@@ -194,6 +196,15 @@ public:
     // kAgentDetailSaveDebounceMs; a no-op while a write is in flight or when the
     // desired value is already the persisted one.
     UiUpdate DispatchAgentDetailPersist(int64_t now_ms);
+    // [picker-stale] Per-tick hook that refreshes the session list while the
+    // picker is open and claims a run it cannot re-check. No gesture can do it:
+    // the picker is a modal surface that answers only confirm and up/down, so the
+    // status-bar slot that reloads the list is unreachable while it is up and the
+    // screen-navigation long-press is swallowed by it. The list is therefore
+    // frozen for as long as the user sits there, and every row's 运行中 marker is
+    // a claim about the moment the list was fetched. See ui_runtime.cpp for the
+    // conditions and their cost.
+    UiUpdate DispatchAgentSessionListPoll(int64_t now_ms);
 
 private:
     UiUpdate FinishEvent(
@@ -205,6 +216,9 @@ private:
 
     wqn::AppState state_;
     uint64_t event_sequence_ = 0;
+    // [picker-stale] Last attempt at the picker's self-refresh, whether or not
+    // the worker accepted it: a rejected poll must not retry on the next tick.
+    int64_t agent_list_poll_at_ms_ = 0;
 };
 
 const char* AppEventKindName(AppEventKind event);

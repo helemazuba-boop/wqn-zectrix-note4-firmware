@@ -1246,6 +1246,17 @@ wqn::AiStreamingStatusView streaming_view{};
             refresh_schedule = StrongerSchedule(refresh_schedule, update.refresh);
         }
 
+        // [picker-stale] Session-picker self-refresh. Runs on the same tick as
+        // the follow step and for the same reason: the thing it corrects (a
+        // 运行中 marker for a session that already finished) is only wrong
+        // because time passed, so nothing but a tick can notice. It no-ops unless
+        // the picker is open AND a row claims a run.
+        {
+            const device_ui_internal::UiUpdate update =
+                ui_runtime.DispatchAgentSessionListPoll(now_ms);
+            refresh_schedule = StrongerSchedule(refresh_schedule, update.refresh);
+        }
+
         const std::string clock_label = CurrentClockLabel();
         if (clock_label != last_clock_label) {
             last_clock_label = clock_label;

@@ -857,8 +857,9 @@ static RefreshSchedule ApplyAgentOptionBarEvent(
 // [agent] Names why an Agent request was refused. Every one of these used to
 // log the same "busy or empty list", which is indistinguishable when reading a
 // device log after the fact. Switching away from a run is no longer one of
-// them: with a stream attached the entry points detach and carry on.
-static const char* AgentRejectLabel(wqn::OpenCodeRejectReason reason)
+// them: with a stream attached the entry points detach and carry on. Declared in
+// ui_internal.h since the picker's stale-marker refresh became a second caller.
+const char* AgentRejectLabel(wqn::OpenCodeRejectReason reason)
 {
     switch (reason) {
         case wqn::OpenCodeRejectReason::kWorkerBusy:
