@@ -1874,6 +1874,34 @@ constexpr char kAgentErrorRetryStream[] = R"json([
   { "event": "agent.status", "data": { "status": "idle", "message": "执行完成" } }
 ])json";
 
+// `valid/round-boundary-stream.json`. The frame pair that ends every round at
+// detail >= 1, and the reason the C1/C2 pair of this plan had to ship in order:
+// the gateway emits BOTH channels' commit frame with an empty string, and a
+// device that receives it before its firmware half has retired the round's
+// message ids writes the next round's answer into the entry still holding the
+// previous round's.
+//
+// The payload is legal -- the schema requires `text` present but puts no
+// minLength on it -- so this is a frame the parser must accept, not one it may
+// drop. This is the fixture the plan's §七 L2 called for: until it existed,
+// nothing on the host side had ever replayed an empty stream frame, and the
+// whole of Stage A went in with zero parser coverage. The one "text": "" that
+// did exist here is a history assistant row, which is a different shape over a
+// different route.
+constexpr char kAgentRoundBoundaryStream[] = R"json([
+  { "event": "agent.accepted", "data": {} },
+  { "event": "agent.status", "data": { "status": "running", "message": "已接取任务" } },
+  { "event": "agent.reasoning.delta", "data": { "delta": "第一轮：先判断极限类型。" } },
+  { "event": "agent.text.delta", "data": { "delta": "第一种做法是洛必达法则。" } },
+  { "event": "agent.reasoning", "data": { "text": "" } },
+  { "event": "agent.text", "data": { "text": "" } },
+  { "event": "agent.reasoning.delta", "data": { "delta": "第二轮：再检查分母导数。" } },
+  { "event": "agent.text.delta", "data": { "delta": "分子分母同时求导。" } },
+  { "event": "agent.reasoning", "data": { "text": "" } },
+  { "event": "agent.text", "data": { "text": "" } },
+  { "event": "agent.status", "data": { "status": "idle", "message": "执行完成" } }
+])json";
+
 // `valid/history-response.json`.
 constexpr char kAgentHistory[] = R"json({
   "success": true,
@@ -2240,6 +2268,123 @@ bool CheckAgentGatewayV0Contract()
                            }) ||
         !Require(retry_ok, "agent retry error keeps the run alive") ||
         !Require(retry_frames == 7, "agent retry stream frame count")) {
+        return false;
+    }
+
+    // --- the round-boundary commit frames, both channels empty --------------
+    //
+    // Section seven item L2 of doc/1005: the gateway's round boundary is BOTH
+    // channels' commit frame sent with an empty string, and nothing on the host
+    // side had ever replayed one. The parser half is what lives here -- an empty
+    // `text` is schema-legal, so the frame must arrive as kText/kReasoning with
+    // an empty string, not as ESP_ERR_INVALID_RESPONSE. Dropping it would leave
+    // the device waiting for a boundary that never comes, which is the splice
+    // this plan exists to remove.
+    //
+    // What is deliberately NOT asserted here: the id retirement that C2 added on
+    // top of the parse (A4/A5/A6 in opencode_session.cpp). Those live in a
+    // static frame handler the fixture cannot reach, so this pins the wire half
+    // only. The invariant they must preserve -- "clear buffer and invalidate the
+    // id always appear together" -- is item L1's, and L1 extracted it as a pure
+    // function for exactly that reason.
+    int boundary_empty_text = 0;
+    int boundary_empty_reasoning = 0;
+    bool boundary_ok = true;
+    if (!ReplayAgentStream(kAgentRoundBoundaryStream,
+                           [&](int index, esp_err_t result, const wqn::OpenCodeEvent& event) {
+                               if (!Require(result == ESP_OK,
+                                            "agent round-boundary frame parses")) {
+                                   boundary_ok = false;
+                                   return false;
+                               }
+                               // Both channels' commit frames are the empty ones
+                               // at indices 4, 5, 8 and 9. The deltas around them
+                               // carry the round's text, so a parser that
+                               // silently swallowed an empty payload would still
+                               // see a plausible stream -- which is why the empty
+                               // ones are counted rather than assumed.
+                               if (index == 4 || index == 8) {
+                                   if (event.kind != wqn::OpenCodeEventKind::kReasoning ||
+                                       !event.text.empty()) {
+                                       boundary_ok = false;
+                                       return false;
+                                   }
+                                   ++boundary_empty_reasoning;
+                                   return true;
+                               }
+                               if (index == 5 || index == 9) {
+                                   if (event.kind != wqn::OpenCodeEventKind::kText ||
+                                       !event.text.empty()) {
+                                       boundary_ok = false;
+                                       return false;
+                                   }
+                                   ++boundary_empty_text;
+                                   return true;
+                               }
+                               // The deltas keep their payload: an empty-string
+                               // check alone cannot tell "the boundary frame"
+                               // from "every frame arrived blank".
+                               if (index == 2 && event.text != "第一轮：先判断极限类型。") {
+                                   boundary_ok = false;
+                                   return false;
+                               }
+                               if (index == 3 && event.text != "第一种做法是洛必达法则。") {
+                                   boundary_ok = false;
+                                   return false;
+                               }
+                               if (index == 6 && event.text != "第二轮：再检查分母导数。") {
+                                   boundary_ok = false;
+                                   return false;
+                               }
+                               if (index == 7 && event.text != "分子分母同时求导。") {
+                                   boundary_ok = false;
+                                   return false;
+                               }
+                               // The terminator is still idle: the boundary
+                               // frames are not the end of the stream, and
+                               // without this the device would sit out the
+                               // five-minute socket timeout.
+                               if (index == 10 &&
+                                   !Require(event.kind == wqn::OpenCodeEventKind::kStatus &&
+                                                    event.status == "idle",
+                                            "agent round-boundary stream still terminates on "
+                                            "idle")) {
+                                   boundary_ok = false;
+                                   return false;
+                               }
+                               return true;
+                           }) ||
+        !Require(boundary_ok, "agent round-boundary frames are accepted as empty") ||
+        !Require(boundary_empty_reasoning == 2,
+                 "agent round boundary empties the reasoning channel twice") ||
+        !Require(boundary_empty_text == 2,
+                 "agent round boundary empties the text channel twice")) {
+        return false;
+    }
+
+    // --- an absent `text` reads as an empty one, and that is the safe way ---
+    //
+    // Noted here because the replay above cannot tell the two apart, and a
+    // reader who assumes the parser checks presence would conclude this fixture
+    // proves something it does not. JsonString returns "" for a missing key, so
+    // `{"text": ""}` and `{}` both arrive as kText with an empty string.
+    //
+    // The direction is the safe one: reading an absent field as empty can only
+    // cause an EXTRA round boundary -- retire the id, clear the visible buffer,
+    // let the next delta append at the tail -- whereas treating an empty string
+    // as absent would skip a boundary the cloud really sent and reproduce the
+    // splice this plan removes. The same tolerance the status frame has always
+    // had. Adding a presence check would be the stricter-looking and wronger
+    // choice.
+    wqn::OpenCodeEvent absent_text_event;
+    if (!Require(
+            wqn::ParseOpenCodeAgentFrame("agent.text", R"json({})json",
+                                         &absent_text_event) == ESP_OK,
+            "agent text without a payload still parses") ||
+        !Require(absent_text_event.kind == wqn::OpenCodeEventKind::kText,
+                 "agent text without a payload is still a text frame") ||
+        !Require(absent_text_event.text.empty(),
+                 "agent text without a payload reads as empty")) {
         return false;
     }
 
