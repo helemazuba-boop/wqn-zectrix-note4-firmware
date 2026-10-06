@@ -1902,6 +1902,28 @@ constexpr char kAgentRoundBoundaryStream[] = R"json([
   { "event": "agent.status", "data": { "status": "idle", "message": "执行完成" } }
 ])json";
 
+// `valid/accepted-without-data-stream.json`. The shape that proved the parser
+// disagreed with its own schema. streamFrame requires only `event` and lists
+// `data` as optional, with the description "Empty for the two acknowledgements" --
+// so a gateway that omits the field entirely is conformant, and the device parsed
+// an absent payload as an empty JSON document, got null, and dropped BOTH
+// acknowledgements as invalid_response. Losing `agent.accepted` loses the
+// transition into kRunning and "Agent 执行中"; losing `agent.attached` loses the
+// one frame that says the observe stream is connected. Neither had a symptom the
+// user could report beyond "nothing happened", which is why nothing caught it.
+//
+// Note how the first two frames differ from every other fixture in this file:
+// they carry NO `data` key, and ReplayAgentStream hands the parser an empty string
+// for exactly that reason. `"data": {}` was always accepted -- this fixture is
+// the case that was not.
+constexpr char kAgentAcceptedWithoutDataStream[] = R"json([
+  { "event": "agent.accepted" },
+  { "event": "agent.attached" },
+  { "event": "agent.status", "data": { "status": "running", "message": "已在别处开始" } },
+  { "event": "agent.text.delta", "data": { "delta": "继续整理第 2 题。" } },
+  { "event": "agent.status", "data": { "status": "idle", "message": "观察结束" } }
+])json";
+
 // `valid/history-response.json`.
 constexpr char kAgentHistory[] = R"json({
   "success": true,
@@ -2360,6 +2382,98 @@ bool CheckAgentGatewayV0Contract()
         !Require(boundary_empty_text == 2,
                  "agent round boundary empties the text channel twice")) {
         return false;
+    }
+
+    // --- the two acknowledgements are legal with NO `data` at all ------------
+    //
+    // [contract-ack] The schema requires only `event`; `data` is optional and
+    // described as "Empty for the two acknowledgements". The parser used to
+    // parse the absent payload as an empty document and drop the frame as
+    // invalid_response, so a conformant gateway lost both acknowledgements. The
+    // positives below pin the fix; the negatives pin the line it is NOT allowed
+    // to cross, because accepting an empty payload for an event whose data the
+    // schema requires would silently swallow a frame the device needs but cannot
+    // act on -- a delta with no text is a dropped answer, not an empty one.
+    {
+        bool ack_ok = true;
+        int ack_frames = 0;
+        int accepted_seen = 0;
+        int attached_seen = 0;
+        if (!ReplayAgentStream(kAgentAcceptedWithoutDataStream,
+                               [&](int index, esp_err_t result,
+                                   const wqn::OpenCodeEvent& event) {
+                                   ++ack_frames;
+                                   if (!Require(result == ESP_OK,
+                                                "agent frame with absent data parses")) {
+                                       ack_ok = false;
+                                       return false;
+                                   }
+                                   if (index == 0) {
+                                       if (event.kind !=
+                                           wqn::OpenCodeEventKind::kAccepted) {
+                                           ack_ok = false;
+                                           return false;
+                                       }
+                                       ++accepted_seen;
+                                       return true;
+                                   }
+                                   if (index == 1) {
+                                       if (event.kind !=
+                                           wqn::OpenCodeEventKind::kAttached) {
+                                           ack_ok = false;
+                                           return false;
+                                       }
+                                       ++attached_seen;
+                                       return true;
+                                   }
+                                   // The stream is still a well-formed run
+                                   // around the two bare frames: the terminator
+                                   // matters most, since a stream that does not
+                                   // end on idle is stream_incomplete and the
+                                   // device sits out the socket timeout.
+                                   if (index == 2 &&
+                                       (event.kind != wqn::OpenCodeEventKind::kStatus ||
+                                        event.status != "running")) {
+                                       ack_ok = false;
+                                       return false;
+                                   }
+                                   if (index == 3 &&
+                                       (event.kind !=
+                                            wqn::OpenCodeEventKind::kTextDelta ||
+                                        event.text != "继续整理第 2 题。")) {
+                                       ack_ok = false;
+                                       return false;
+                                   }
+                                   if (index == 4 &&
+                                       (event.kind != wqn::OpenCodeEventKind::kStatus ||
+                                        event.status != "idle")) {
+                                       ack_ok = false;
+                                       return false;
+                                   }
+                                   return true;
+                               }) ||
+            !Require(ack_ok, "agent acknowledgements parse with no data") ||
+            !Require(ack_frames == 5, "agent ack stream replays all five frames") ||
+            !Require(accepted_seen == 1, "agent accepted survives an absent data") ||
+            !Require(attached_seen == 1, "agent attached survives an absent data")) {
+            return false;
+        }
+        // The negatives. Each is a direct call rather than a fixture, because
+        // none of them is a legal stream: they are the shapes the whitelist must
+        // still refuse, replayed one frame at a time.
+        wqn::OpenCodeEvent dropped;
+        if (!Require(wqn::ParseOpenCodeAgentFrame("agent.text", "", &dropped) ==
+                         ESP_ERR_INVALID_RESPONSE,
+                     "agent text with absent data is refused") ||
+            !Require(wqn::ParseOpenCodeAgentFrame("agent.status", "", &dropped) ==
+                         ESP_ERR_INVALID_RESPONSE,
+                     "agent status with absent data is refused") ||
+            !Require(wqn::ParseOpenCodeAgentFrame(
+                         "agent.not_a_real_event", "{}", &dropped) ==
+                         ESP_ERR_NOT_SUPPORTED,
+                     "an unknown agent event is refused as unsupported")) {
+            return false;
+        }
     }
 
     // --- an absent `text` reads as an empty one, and that is the safe way ---

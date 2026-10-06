@@ -1004,8 +1004,30 @@ esp_err_t ParseOpenCodeAgentFrame(
         return ESP_ERR_INVALID_ARG;
     }
     *out_event = wqn::OpenCodeEvent{};
-    cJSON* root = wqn::protocol::JsonNestingWithinLimit(data.data(), data.size())
-        ? cJSON_ParseWithLength(data.data(), data.size())
+    // [contract-ack] `data` is OPTIONAL in streamFrame -- the schema requires only
+    // `event` -- and its own description says "Empty for the two
+    // acknowledgements". So `agent.accepted` / `agent.attached` arriving with the
+    // field absent entirely (no `data:` line in the SSE frame, which is what the
+    // gateway's own shape allows) is a CONTRACT-VALID frame, and parsing an empty
+    // string as JSON returned null here, so the device dropped it as
+    // invalid_response: the acknowledgement was lost, and with it the state
+    // transition that is the only thing the frame was for.
+    //
+    // Whitelisted to those two events on purpose. They are the two whose payload
+    // the schema documents as empty, they are the two that read nothing out of
+    // `data`, and every other event's data is REQUIRED (agent.status needs
+    // `status`, agent.text needs `text`, ...). Accepting an empty payload for
+    // those would silently swallow a frame the device needs but cannot act on --
+    // a delta with no text is a dropped answer, not an empty one. The negatives
+    // below pin that line.
+    const bool acknowledgement =
+        event_name == "agent.accepted" || event_name == "agent.attached";
+    std::string payload = data;
+    if (acknowledgement && payload.find_first_not_of(" \t\r\n") == std::string::npos) {
+        payload = "{}";
+    }
+    cJSON* root = wqn::protocol::JsonNestingWithinLimit(payload.data(), payload.size())
+        ? cJSON_ParseWithLength(payload.data(), payload.size())
         : nullptr;
     if (root == nullptr) {
         return ESP_ERR_INVALID_RESPONSE;
