@@ -411,7 +411,7 @@ bool EnsureFlashThinkingHistoryLocked(int64_t now_ms)
     if (!g_flash.history_user_committed || g_flash.thinking_text.empty()) {
         return false;
     }
-    const std::string label = "💭 " + g_flash.thinking_text;
+    const std::string label = g_flash.thinking_text;
     wqn::AiHistory& history = wqn::GetAiHistory(wqn::AiHistoryChannel::kFlash);
     if (g_flash.thinking_message_id == wqn::kInvalidChatMessageId) {
         g_flash.thinking_message_id = history.AppendThinking(label, now_ms);
@@ -1722,7 +1722,7 @@ void ParseAndHandleEvent(const char* data, size_t len)
     if (std::strcmp(type, "tool.start") == 0) {
         const char* name = JsonStr(g.p, "name");
         xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
-        g_flash.tool_label = std::string("🔧 ") + (name ? name : "tool") + "…";
+        g_flash.tool_label = std::string(name ? name : "tool") + "…";
         g_flash.status_since_ms = esp_timer_get_time() / 1000;
         MarkChanged();
         xSemaphoreGive(g_flash.mutex);
@@ -1734,7 +1734,7 @@ void ParseAndHandleEvent(const char* data, size_t len)
         const char* name = JsonStr(g.p, "name");
         const bool ok = std::strcmp(type, "tool.result") == 0;
         xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
-        g_flash.tool_label = std::string(ok ? "✅ " : "❌ ") +
+        g_flash.tool_label = std::string(ok ? "ok " : "fail ") +
                              (display && display[0] ? display : (name ? name : "tool"));
         g_flash.status_since_ms = esp_timer_get_time() / 1000;
         MarkChanged();

@@ -77,7 +77,7 @@ bool IsAiSessionActive();
 // Callbacks (long-press confirm / long-release confirm) feed these helpers,
 // and the v2 SSE consumer flushes history rows into AiHistory. The UI side
 // renders straight off the history snapshot + scroll offset + toast fields.
-void ShowAiToast(const std::string& label);                   // e.g. "● 上传…"
+void ShowAiToast(const std::string& label);                   // e.g. "上传…"
 void HideAiToast();                                            // for ready / idle
 void SetAiRecordingLabel(int32_t elapsed_ms);                  // updates recording toast
 void ResetAiScroll();                                          // recenter on newest

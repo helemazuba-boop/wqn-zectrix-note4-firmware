@@ -89,7 +89,7 @@ bool g_streaming_active = false;        // true while the AI worker is parsing S
 bool g_streaming_force_full_render = false; // when true the next UI tick does a full refresh
 wqn::runtime::SleepLease g_ai_sleep_lease;
 wqn::services::ConnectivityDemand g_ai_connectivity_demand;
-std::string g_pending_tool_label;        // "🔧 create_todo…" or "✅ ..." for status bar
+std::string g_pending_tool_label;        // "create_todo…" or "create_todo done" for status bar
 int64_t g_tool_clear_at_ms = 0;          // scheduled status-bar clear
 
 bool g_turn_ws_capable = false;
@@ -162,9 +162,16 @@ void LogAiMemory(const char* stage)
         static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
 }
 
+// [font-fix] The 💭 prefix this used to carry cannot be drawn: U+1F4AD is not in
+// SourceHanSansSC_Regular_slim, and MeasureGlyphWidthInFont returns 0 on a miss
+// while DrawGlyphFromFont skips it -- so the prefix cost 5 bytes per entry in the
+// ring and rendered as nothing. The thinking block already draws its own marker
+// (m01_ai_thinking_marker_12 at page_ai.cpp:367) into the inset it reserves, so
+// the glyph was doing nothing visible. Do not re-add a character here without
+// checking the font's cmap first.
 std::string ThinkingLabel(const std::string& text)
 {
-    return text.empty() ? std::string() : std::string("💭 ") + text;
+    return text;
 }
 
 void ResetTurnAssemblyLocked()
@@ -510,7 +517,7 @@ void OnSseEvent(const wqn::WqnAiSseEvent& ev)
         case wqn::WqnAiSseEvent::Kind::kReady:
             g_state.status = wqn::AiSessionStatus::kStreaming;
             g_state.pending_text = "已连接 · 等待模型…";
-            g_state.toast_label = "● 服务器处理中";
+            g_state.toast_label = "服务器处理中";
             g_state.toast_visible = true;
             g_state.toast_since_ms = now_ms;
             if (!ev.conversation_id.empty()) g_conversation_id = ev.conversation_id;
@@ -680,7 +687,8 @@ void OnSseEvent(const wqn::WqnAiSseEvent& ev)
             // [tool-order] Seal before appending so pre-tool text stays above
             // this block.
             SealAssistantSegmentLocked(history, now_ms);
-            std::string label = "🔧 " + (ev.tool_name.empty() ? std::string("tool") : ev.tool_name) + "…";
+            std::string label =
+                (ev.tool_name.empty() ? std::string("tool") : ev.tool_name) + "…";
             g_pending_tool_label = label;
             g_tool_clear_at_ms = 0;
             g_state.function_call_summaries.push_back(ev.tool_name.empty() ? "tool" : ev.tool_name);
@@ -696,7 +704,7 @@ void OnSseEvent(const wqn::WqnAiSseEvent& ev)
             // must sit between the placeholder and the result block.
             history.PopLastIf(wqn::ChatMessageKind::kToolStart);
             SealAssistantSegmentLocked(history, now_ms);
-            std::string label = ev.tool_ok ? "✅ " : "❌ ";
+            std::string label = ev.tool_ok ? "ok " : "fail ";
             label += ev.tool_display.empty() ? ev.tool_name : ev.tool_display;
             g_pending_tool_label = label;
             g_tool_clear_at_ms = now_ms + 2000;
@@ -1069,7 +1077,7 @@ void SubmitSession()
         audio.duration_ms = kMaxAudioDurationMs;
     }
     SetStateLocked(wqn::AiSessionStatus::kWaitingReply, "正在识别...", "", "");
-    g_state.toast_label = "● 识别中…";
+    g_state.toast_label = "识别中…";
     g_state.toast_visible = true;
     g_state.toast_since_ms = esp_timer_get_time() / 1000;
     g_state.toast_recording_ms = 0;
@@ -1483,7 +1491,7 @@ void PrepareRecordingSession(uint32_t generation)
         g_state.scroll_offset_lines = 0;
         // [follow] Capture started: arm the viewport follow for this turn.
         ArmAiFollowLocked();
-        g_state.toast_label = "● 录音中 00:00";
+        g_state.toast_label = "录音中 00:00";
         g_state.toast_visible = true;
         g_state.toast_since_ms = esp_timer_get_time() / 1000;
         g_state.toast_recording_ms = 0;
