@@ -727,8 +727,14 @@ void LoadSessions()
         if (g_state.sessions.empty()) {
             SetErrorLocked("没有可用的 OpenCode Session");
         } else {
-            g_state.selected_session = g_state.sessions.size() - 1;
-            if (!highlighted.empty()) {
+            // Nothing was highlighted because there was no list to highlight in
+            // (the first open, or the previous one came back empty), so this is
+            // the index clamp the code had before: min(old, count-1), which is 0
+            // on a first open and must stay 0.
+            if (highlighted.empty()) {
+                g_state.selected_session = std::min(
+                    g_state.selected_session, g_state.sessions.size() - 1);
+            } else {
                 for (size_t i = 0; i < g_state.sessions.size(); ++i) {
                     if (g_state.sessions[i].id == highlighted) {
                         g_state.selected_session = i;
