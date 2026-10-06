@@ -59,7 +59,7 @@ constexpr int kAgentBarSlotStep = 96;
 //
 // It used to clear and fill the full 400 px, which wiped the ▼ on every frame it
 // drew -- and the band is drawn on nearly every frame, because every phase
-// projects a gesture hint (B4's whole point). The Agent tier had therefore lost
+// projected a gesture hint (B4's whole point). The Agent tier had therefore lost
 // the "more below" indicator entirely while keeping "more above", and the only
 // trace was the top-of-file comment claiming the chevron was "suppressed for
 // that frame", which was true of the erasure and false as a description of a
@@ -67,8 +67,12 @@ constexpr int kAgentBarSlotStep = 96;
 //
 // 44 px leaves the 36 px reserve plus an 8 px gutter from the band's own
 // right-aligned text. Everything the band prints still fits: the longest
-// right-aligned string is "↑↓切换 确认执行" at ~120 px, which now starts at
-// ~228, clear of the option labels ending at 208.
+// right-aligned string is the question counter ("9/9"), a dozen px.
+//
+// The rule above the bar is drawn to the same 356 px the clear erases, not the
+// full width. A wider rule would outlive the kNone path's clear and leave a
+// permanent line across the panel -- the band is interactive-only now, so that
+// path draws no rule of its own to overwrite it with.
 constexpr int kAgentIndicatorColumn = 44;
 // Gap between the pending bubble's bottom edge and the option bar.
 constexpr int kAgentBubbleGap = 6;
@@ -175,8 +179,11 @@ static void DrawAgentOptionBar(AgentOptionMode mode, uint8_t focused,
     // the scroll-indicator column is cleared -- see kAgentIndicatorColumn.
     FillRect(0, kAgentBarY, wqn::kEpdWidth - kAgentIndicatorColumn, kAgentBarH, false);
 
-    // A rule above the bar separates it from the transcript above it.
-    DrawHorizontalLine(0, kAgentBarY, wqn::kEpdWidth);
+    // A rule above the bar separates it from the transcript above it. Never
+    // wider than the clear above: the kNone path clears 356 px and draws no
+    // rule, so a full-width rule here would survive that clear in the 44 px the
+    // scroll indicator owns and stake a permanent line across the panel.
+    DrawHorizontalLine(0, kAgentBarY, wqn::kEpdWidth - kAgentIndicatorColumn);
 
     const bool is_question = (mode == AgentOptionMode::kQuestion);
     const int item_count = is_question ? AgentQuestionItemCount(agent) : 2;
@@ -216,25 +223,18 @@ static void DrawAgentOptionBar(AgentOptionMode mode, uint8_t focused,
     }
 
     if (is_question) {
-        // Position sense for the walk list: 2/9 while the window moves. It is
-        // right-aligned inside the indicator column's left edge, so the key hint
-        // shifts left to make room.
+        // Position sense for the walk list: 2/9 while the window moves. This is
+        // the one readout the bar cannot do without -- the two visible options
+        // are a window onto a longer list, and without the counter a long list
+        // looks like a short one that repeats. Right-aligned inside the
+        // indicator column's left edge.
         const int right = wqn::kEpdWidth - kAgentIndicatorColumn - 8;
         char counter[16];
         snprintf(counter, sizeof(counter), "%d/%d", focused_item + 1, item_count);
         const int counter_w = wqn::MeasureUtf8TextWidth(counter);
-        const char* hint = "↑↓ 确认";
-        const int hint_w = wqn::MeasureUtf8TextWidth(hint);
         AGENT_TEXT(right - counter_w, kAgentBarTextY, counter, true);
-        AGENT_TEXT(right - counter_w - hint_w - 16, kAgentBarTextY, hint, true);
         return;
     }
-
-    // Key legend, right-aligned inside the indicator column's left edge.
-    const int right = wqn::kEpdWidth - kAgentIndicatorColumn - 8;
-    const char* hint = "↑↓切换 确认执行";
-    const int hint_w = wqn::MeasureUtf8TextWidth(hint);
-    AGENT_TEXT(right - hint_w, kAgentBarTextY, hint, true);
 }
 
 // ---------------------------------------------------------------------------
@@ -520,94 +520,27 @@ esp_err_t RenderAgentAiToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule
 
     const AgentOptionMode mode = AgentOptionModeFor(agent);
     if (mode == AgentOptionMode::kNone) {
-        // [visibility] While a run is live the cloud keeps writing
-        // activity_text (已批准权限 / 已回答 / 已请求中止 ...), but without a
-        // surface of its own a silent run reads as a hung one. Draw it in the
-        // same bottom band the option bar owns; the option bar, when it
-        // appears, clears the band itself.
+        // [band-interactive-only] The band carries one thing: an ask, a
+        // confirmation, or nothing.
         //
-        // [B4] The gesture hint rides the same line, right-aligned, and it is
-        // the reason the band is drawn at all for the phases it now covers.
-        // `action_hint` was previously the only place the device said what the
-        // confirm key was about to do, and its sole consumer was the frame
-        // signature in ui_refresh.cpp -- so every word of it was invisible, and
-        // the one gesture with two meanings (long press = capture when idle,
-        // long press = interrupt while a run is in flight) was undiscoverable.
-        // The failure it hid is the worst kind: a user who long-presses to send
-        // into a running session gets silence for one gesture and an interrupt
-        // for the next.
+        // It used to carry every event line as well, and that is exactly what
+        // made it read as a status bar: ~40 writers behind activity_text, none
+        // of them expiring, so "已连接 Session 事件流" sat at the bottom of an
+        // idle session for as long as the user stayed on the page. Lines the
+        // user must read have a surface of their own now (the banner above); the
+        // rest are the model's own record, and the status label's job to
+        // summarise.
         //
-        // Hence the phases below. A run that is live must SAY that the long
-        // press will stop it; a finished one must say the long press starts a
-        // new task. Both are drawn from action_hint so there is exactly one
-        // string per state, set where the state is decided.
+        // The gesture instructions went in the same cut, from every phase --
+        // four strings, always on. A permanent line saying what the confirm key
+        // is about to do is chrome, not information: long-press-to-talk is this
+        // device's basic design language, and the manual owns the remainder.
         //
-        // Only the phases AgentOptionModeFor projects as kNone can reach here:
-        // the two ask phases render the option bar below instead, so they get
-        // their hint from it. A capture (kLoading / kRecording) draws its own
-        // partial above and leaves the band to activity_text.
-        //
-        // [run-live] The kRunning case now reads run_live instead of assuming it.
-        // kRunning means "attached and waiting" as much as "a run is in flight":
-        // B1 attaches on entering the AI page, so an idle session sits at kRunning
-        // with a stream open for as long as nothing detaches it. The phase alone
-        // therefore cannot tell the two meanings of the gesture apart, and
-        // guessing 中止 offered a destructive gesture for a session with nothing
-        // to abort -- the exact failure this band exists to prevent, reintroduced
-        // by the default attach. run_live is the criterion's own answer, published
-        // from the same function that decides the sleep lease.
-        //
-        // The gate deliberately does NOT also demand a live run to ACT on the
-        // interrupt (ui_input.cpp still keys off stream_active). The criterion
-        // fails safe toward "no run" -- an unknown outcome, or a row that has not
-        // been read yet, answers false -- and gating the gesture on it would
-        // refuse a legitimate abort in exactly those cases. Naming the gesture
-        // and honouring it are two different questions with two different safe
-        // directions.
-        std::string hint;
-        switch (agent.ui.phase) {
-            case wqn::AiFeaturePhase::kRunning:
-                // Still not taken from action_hint: at kRunning that field holds
-                // whatever the last frame happened to leave in it (a permission
-                // was just answered, a status line came through). B4's
-                // requirement is that the one gesture with two meanings is named
-                // in the state where the meaning is the surprising one -- which
-                // is now only the state where a run is actually in flight.
-                hint = agent.run_live ? std::string("长按=中止")
-                                      : std::string("长按=发起新任务");
-                break;
-            case wqn::AiFeaturePhase::kIdle:
-            case wqn::AiFeaturePhase::kComplete:
-            case wqn::AiFeaturePhase::kError:
-                // Terminal states: the state's owner set the precise gesture
-                // (发起新任务 / 重试新任务), and those differ by phase. Fall back
-                // to the ordinary capture for a state nobody labelled.
-                hint = agent.ui.action_hint.empty() ? std::string("长按=录音")
-                                                    : agent.ui.action_hint;
-                break;
-            default:
-                break;
-        }
-        if (!agent.ui.activity_text.empty() || !hint.empty()) {
-            const int right = wqn::kEpdWidth - kAgentIndicatorColumn - 8;
-            const int hint_w = hint.empty() ? 0 : wqn::MeasureUtf8TextWidth(hint.c_str());
-            FillRect(0, kAgentBarY, wqn::kEpdWidth - kAgentIndicatorColumn, kAgentBarH, false);
-            DrawHorizontalLine(0, kAgentBarY, wqn::kEpdWidth);
-            if (!hint.empty()) {
-                AGENT_TEXT(right - hint_w, kAgentBarTextY, hint.c_str(), true);
-            }
-            if (!agent.ui.activity_text.empty()) {
-                // The cloud's own line, truncated to the room the hint leaves.
-                // A capture owns its own band above, so the marker column is
-                // where the run's activity line starts.
-                const std::string body =
-                    hint.empty()
-                        ? AgentOneLine(agent.ui.activity_text, right - 16)
-                        : AgentOneLine(agent.ui.activity_text,
-                                       right - hint_w - 16);
-                AGENT_TEXT(kAgentBarMarkerX, kAgentBarTextY, body.c_str(), true);
-            }
-        }
+        // The clear stays. The option bar owns this band whenever an ask or a
+        // confirmation is up, and an option bar that disappeared without it
+        // would leave its pixels on the panel.
+        FillRect(0, kAgentBarY, wqn::kEpdWidth - kAgentIndicatorColumn,
+                 kAgentBarH, false);
         return RefreshFrame(frame, schedule);
     }
 

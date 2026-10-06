@@ -280,11 +280,12 @@ bool AgentRunInFlightLocked()
     // evidence in the list and it used to be invisible here, which cost two
     // things at once. The criterion is what publishes run_live, and
     // RefreshAgentRunLeaseLocked reads it directly -- so a live run released
-    // the sleep lease. And the bottom band's kRunning branch reads run_live to
-    // name the gesture, so it printed 长按=发起新任务 while
-    // TryApplyAgentAiButtonEvent routed on stream_active alone and aborted the
-    // very run that was in flight. A destructive gesture must never be named
-    // as a benign one; that is the failure this band exists to prevent.
+    // the sleep lease. And the band that named the gesture read the phase
+    // instead, so it printed 长按=发起新任务 while TryApplyAgentAiButtonEvent
+    // routed on stream_active alone and aborted the very run in flight.
+    //
+    // The band is interactive-only now and names no gesture, so the first cost
+    // is the only one that remains -- and it is the one that drains a battery.
     //
     // None of the other three sources could see it: this branch sets
     // g_observing (so source (3)'s !g_observing test fails), it does not set
@@ -320,8 +321,9 @@ bool AgentRunInFlightLocked()
 // only evidence an attach has: the picker row the last list fetch wrote. No frame
 // has been read yet, so stream_active and g_observing say only "a stream is being
 // opened" -- they cannot answer "is a run in flight", and reading them as if they
-// could is what put 长按=中止 on a settled session (the criterion this mirrors
-// refuses exactly that conflation: see the !g_observing || !stream_active gate).
+// could is the conflation the run-live criterion refuses by construction (see the
+// !g_observing || !stream_active gate). It used to surface as 长按=中止 offered
+// for a session that had already finished.
 //
 // kComplete rather than kIdle, because the device is looking at a conversation
 // that already finished and kComplete is the terminal state whose owner sets
@@ -360,11 +362,11 @@ wqn::AiFeaturePhase ObserveAttachPhaseLocked()
 // one place that answers the question and one comment explaining it.
 void RefreshAgentRunLeaseLocked()
 {
-    // [run-live] Same question, second consumer. The lease above/below answers it
-    // for the power coordinator; the bottom band's gesture hint answers it for the
-    // user, and the renderer used to derive that hint from the phase instead. The
-    // phase is a claim, this is the evidence behind it, and publishing both from
-    // one function is what stops them drifting apart again.
+    // [run-live] One question, one answer. The lease answers it for the power
+    // coordinator, and the frame signature carries run_live so the page repaints
+    // on the transition -- that is the whole consumer list now that the bottom
+    // band is interactive-only. The phase is a claim, this is the evidence behind
+    // it, and publishing both from one function is what stops them drifting.
     //
     // Only on a transition: MarkChangedLocked on every call would repaint the AI
     // frame once per tick for the whole time a session is merely open, and the
@@ -1929,10 +1931,9 @@ void RunPrompt()
         // [409-live] The exception to the line above, and the reason this branch
         // is not left to the frames: the 409 IS a frame's worth of evidence,
         // from the party running the task. Publishing it here means the very
-        // next line's refresh sees the run that the action_hint two lines up
-        // already promised to abort -- the band names the gesture from exactly
-        // this answer, so without it 长按=中止 was drawn on a device that had
-        // just released the lease for the run it was about to stop.
+        // next line's lease refresh sees the run instead of inheriting this
+        // submission's hold -- without it the device released the lease for the
+        // run it was about to stop.
         g_upstream_run_live = true;
         RefreshAgentRunLeaseLocked();
         ChainWorkerCommandLocked(WorkerCommand::kObserveSession);
@@ -2649,9 +2650,9 @@ esp_err_t ObserveOpenCodeSession(OpenCodeRejectReason* reason)
         g_state.session_locked = true;
         // [run-live] Claim the phase the row can support, NOT kRunning
         // unconditionally. "连接中" was always true here; kRunning is the part
-        // that was a guess, and the bottom band turned it into 长按=中止 -- a
-        // destructive gesture offered for a session whose run had already
-        // finished. See ObserveAttachPhaseLocked.
+        // that was a guess, and the bottom band used to turn that guess into
+        // 长按=中止 -- a destructive gesture offered for a session whose run
+        // had already finished. See ObserveAttachPhaseLocked.
         //
         // Through SetPhaseLocked rather than assigned directly: this was the
         // one transition site the armed-prompt clear did not cover, and it is
