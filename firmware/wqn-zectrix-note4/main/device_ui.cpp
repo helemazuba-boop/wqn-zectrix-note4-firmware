@@ -1188,7 +1188,7 @@ void DeviceUiTask(void*)
             refresh_schedule, status_timeout_update.refresh);
 
         // v2: while the user is recording, the top toast label needs to tick
-        // up so "● 录音中 00:04" advances once a second. We do this here on
+        // up so "录音中 00:04" advances once a second. We do this here on
         // the UI task (the audio task only knows about stream samples).
         if (state.screen == wqn::UiScreen::kAi &&
             state.ai.status == wqn::AiSessionStatus::kListening) {
