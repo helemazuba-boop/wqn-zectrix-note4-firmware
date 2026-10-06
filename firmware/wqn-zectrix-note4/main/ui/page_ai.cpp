@@ -614,6 +614,15 @@ void RenderAiHistoryViewport(const wqn::AiSessionState& ai,
     // `kAiViewportBottomPad` slack so it never overlaps content. ▲ sits in
     // the top-right corner when there's more above. The indicator strip is
     // cleared each tick to avoid ghosting on the E-ink panel.
+    //
+    // [scroll-indicator] Each icon's left edge is clamped to the strip the clear
+    // above reserves. Both were `kEpdWidth - count_w - 18`, which walks LEFT as
+    // the hidden-line count grows: a 3-digit count puts the icon at x=358,
+    // outside the [360, 400) strip just cleared, so it drew over message text
+    // nobody cleared. Clamping keeps the icon inside its strip and lets the
+    // count clip at the panel edge -- the icon is what says "there is more" and
+    // the number is the refinement, so losing digits is the cheaper loss.
+    constexpr int kIndicatorColumnLeft = wqn::kEpdWidth - 40;
     if (messages.size() > 1) {
         const bool more_above = !oldest_fully_visible;
         const bool more_below = (window_top < max_window_top);
@@ -627,7 +636,8 @@ void RenderAiHistoryViewport(const wqn::AiSessionState& ai,
             std::snprintf(count, sizeof(count), "%ld",
                           static_cast<long>((max_window_top - window_top + line_h - 1) / line_h));
             const int count_w = wqn::MeasureUtf8TextWidth(count);
-            const int x = wqn::kEpdWidth - count_w - 18;
+            const int x = std::max<int>(kIndicatorColumnLeft,
+                                        wqn::kEpdWidth - count_w - 18);
             // Bottom-right, 2 px above the panel bottom.
             DrawWqnBitmapAsset(x, wqn::kEpdHeight - 16, m06_chevron_down_12_asset, true);
             DRC(x + 14, wqn::kEpdHeight - 18, count, true);
@@ -638,7 +648,8 @@ void RenderAiHistoryViewport(const wqn::AiSessionState& ai,
             char count[12];
             std::snprintf(count, sizeof(count), "%ld", static_cast<long>(window_top / line_h));
             const int count_w = wqn::MeasureUtf8TextWidth(count);
-            const int x = wqn::kEpdWidth - count_w - 18;
+            const int x = std::max<int>(kIndicatorColumnLeft,
+                                        wqn::kEpdWidth - count_w - 18);
             DrawWqnBitmapAsset(x, kAiViewportY + 3, m07_chevron_up_12_asset, true);
             DRC(x + 14, kAiViewportY + 4, count, true);
         }

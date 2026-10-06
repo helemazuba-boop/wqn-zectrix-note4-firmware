@@ -33,6 +33,7 @@
 #include "display_service.h"
 #include "esp_log.h"
 #include "opencode_session.h"
+#include "ui/assets/font_wqn_inline_12_1.h"
 #include "ui/assets/font_wqn_ui_16_1.h"
 
 namespace device_ui_internal {
@@ -41,15 +42,33 @@ constexpr char kTag[] = "wqn_ui";
 
 // [agent] Option bar geometry. It lives inside the same 22 px bottom band the
 // scroll indicator uses (kAiViewportBottomPad), so adding it cost zero
-// viewport height. While it is visible it owns the band outright -- the ▼
-// chevron is suppressed for that frame because the pending state, not the
-// scroll position, is what the user is acting on.
+// viewport height. It still leaves the ▼ chevron its column: the band clears
+// and lays out only the width left of kAgentIndicatorColumn below, so a pending
+// decision and the scroll position stay legible together.
 constexpr int kAgentBarY = wqn::kEpdHeight - kAiViewportBottomPad;  // 278
 constexpr int kAgentBarH = kAiViewportBottomPad;                    // 22
 constexpr int kAgentBarTextY = kAgentBarY + 3;                      // baseline
 constexpr int kAgentBarMarkerX = 8;
 constexpr int kAgentBarLabelX = kAgentBarMarkerX + 16;
 constexpr int kAgentBarSlotStep = 96;
+// [scroll-indicator] The right-hand column page_ai.cpp reserves for the ▼/▲
+// scroll chevrons (kEpdWidth - 40, 36 px wide). This tier's bottom band sits in
+// the same 22 px strip the ▼ lives in, so the band clears and lays out only the
+// width LEFT of that column.
+//
+// It used to clear and fill the full 400 px, which wiped the ▼ on every frame it
+// drew -- and the band is drawn on nearly every frame, because every phase
+// projects a gesture hint (B4's whole point). The Agent tier had therefore lost
+// the "more below" indicator entirely while keeping "more above", and the only
+// trace was the top-of-file comment claiming the chevron was "suppressed for
+// that frame", which was true of the erasure and false as a description of a
+// deliberate design.
+//
+// 44 px leaves the 36 px reserve plus an 8 px gutter from the band's own
+// right-aligned text. Everything the band prints still fits: the longest
+// right-aligned string is "↑↓切换 确认执行" at ~120 px, which now starts at
+// ~228, clear of the option labels ending at 208.
+constexpr int kAgentIndicatorColumn = 44;
 // Gap between the pending bubble's bottom edge and the option bar.
 constexpr int kAgentBubbleGap = 6;
 constexpr int kAgentBubbleMaxLines = 3;
@@ -151,8 +170,9 @@ static void DrawAgentOptionBar(AgentOptionMode mode, uint8_t focused,
                                 const wqn::AgentSessionState& agent)
 {
     // The band is cleared here rather than by the caller so a disappearing
-    // option bar cannot leave a ghost on the E-ink panel.
-    FillRect(0, kAgentBarY, wqn::kEpdWidth, kAgentBarH, false);
+    // option bar cannot leave a ghost on the E-ink panel. Only the width left of
+    // the scroll-indicator column is cleared -- see kAgentIndicatorColumn.
+    FillRect(0, kAgentBarY, wqn::kEpdWidth - kAgentIndicatorColumn, kAgentBarH, false);
 
     // A rule above the bar separates it from the transcript above it.
     DrawHorizontalLine(0, kAgentBarY, wqn::kEpdWidth);
@@ -196,21 +216,24 @@ static void DrawAgentOptionBar(AgentOptionMode mode, uint8_t focused,
 
     if (is_question) {
         // Position sense for the walk list: 2/9 while the window moves. It is
-        // right-aligned, so the key hint shifts left to make room.
+        // right-aligned inside the indicator column's left edge, so the key hint
+        // shifts left to make room.
+        const int right = wqn::kEpdWidth - kAgentIndicatorColumn - 8;
         char counter[16];
         snprintf(counter, sizeof(counter), "%d/%d", focused_item + 1, item_count);
         const int counter_w = wqn::MeasureUtf8TextWidth(counter);
         const char* hint = "↑↓ 确认";
         const int hint_w = wqn::MeasureUtf8TextWidth(hint);
-        AGENT_TEXT(wqn::kEpdWidth - counter_w - 8, kAgentBarTextY, counter, true);
-        AGENT_TEXT(wqn::kEpdWidth - counter_w - hint_w - 16, kAgentBarTextY, hint, true);
+        AGENT_TEXT(right - counter_w, kAgentBarTextY, counter, true);
+        AGENT_TEXT(right - counter_w - hint_w - 16, kAgentBarTextY, hint, true);
         return;
     }
 
-    // Key legend, right-aligned, leaving the far-right 40 px clear.
+    // Key legend, right-aligned inside the indicator column's left edge.
+    const int right = wqn::kEpdWidth - kAgentIndicatorColumn - 8;
     const char* hint = "↑↓切换 确认执行";
     const int hint_w = wqn::MeasureUtf8TextWidth(hint);
-    AGENT_TEXT(wqn::kEpdWidth - hint_w - 8, kAgentBarTextY, hint, true);
+    AGENT_TEXT(right - hint_w, kAgentBarTextY, hint, true);
 }
 
 // ---------------------------------------------------------------------------
@@ -296,16 +319,47 @@ static void DrawAgentSessionPicker(const wqn::AgentSessionState& agent)
         // missing glyph rather than a device that never sleeps.
         const bool running = agent.sessions[index].outcome ==
                             wqn::OpenCodeSessionOutcome::kRunning;
+        // [D-which] Marker geometry, measured rather than assumed. The block is
+        // the cloud's own "in flight" icon plus the label, right-aligned against
+        // the panel edge; the title budget is then whatever room is actually
+        // left, so the two can never collide whichever way the title wraps.
+        //
+        // Two things were wrong with the literal that was here:
+        //
+        //   1. The glyph was the character "◆" (U+25C6), which this font does
+        //      not contain. SourceHanSansSC_Regular_slim covers ASCII, a
+        //      ~70-codepoint punctuation/math/arrow set, and GB2312 -- U+25C6
+        //      is in none of them (nor are the obvious substitutes: no U+25CF,
+        //      U+26A1, U+2605). MeasureGlyphWidthInFont returns 0 on a miss and
+        //      DrawGlyphFromFont skips it, so the marker drew as whitespace and
+        //      the label alone carried the meaning -- which is why nobody saw
+        //      the second problem until the glyph was made visible.
+        //   2. The offset was the literal 16 + 6 * 16 + 8 = 120 px: a fixed
+        //      column on a 400 px panel, not a right edge. The title was
+        //      truncated to 300 px at x=16, so it can reach x=316 -- past it. Any
+        //      title longer than ~104 px overlapped the (invisible) glyph.
+        //
+        // m02_ai_tool_running is the icon the tool blocks already use for a
+        // running tool, so the picker says "in flight" with the same mark the
+        // transcript does.
+        static const char kRunningLabel[] = "运行中";
+        const int label_w = wqn::MeasureUtf8TextWidth(kRunningLabel);
+        constexpr int kMarkerIconW = 12;      // m02_ai_tool_running_12
+        constexpr int kMarkerGap = 4;         // icon -> label
+        constexpr int kMarkerRightPad = 8;
+        constexpr int kMarkerTitleGap = 8;
+        const int marker_x = wqn::kEpdWidth - kMarkerRightPad - kMarkerIconW -
+                             kMarkerGap - label_w;
+        const int title_max_w = marker_x - 16 - kMarkerTitleGap;
         const std::string title = AgentOneLine(
             agent.sessions[index].title.empty() ? agent.sessions[index].id
                                                 : agent.sessions[index].title,
-            running ? 300 : 360);
+            running ? title_max_w : 360);
         AGENT_TEXT(16, y, title.c_str(), !focused);
         if (running) {
-            // Right-aligned pulse glyph plus the label: the glyph alone is a
-            // shape the user has to learn, and "运行中" next to a row they are
-            // about to lock is the difference between choosing and guessing.
-            AGENT_TEXT(16 + 6 * 16 + 8, y, "◆ 运行中", !focused);
+            // 12 px icon centred in the 16 px line box.
+            DrawWqnBitmapAsset(marker_x, y + 2, m02_ai_tool_running_12_asset, true);
+            AGENT_TEXT(marker_x + kMarkerIconW + kMarkerGap, y, kRunningLabel, !focused);
         }
         y += kAgentPickerRowStep;
     }
@@ -478,11 +532,12 @@ esp_err_t RenderAgentAiToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule
                 break;
         }
         if (!agent.ui.activity_text.empty() || !hint.empty()) {
+            const int right = wqn::kEpdWidth - kAgentIndicatorColumn - 8;
             const int hint_w = hint.empty() ? 0 : wqn::MeasureUtf8TextWidth(hint.c_str());
-            FillRect(0, kAgentBarY, wqn::kEpdWidth, kAgentBarH, false);
+            FillRect(0, kAgentBarY, wqn::kEpdWidth - kAgentIndicatorColumn, kAgentBarH, false);
             DrawHorizontalLine(0, kAgentBarY, wqn::kEpdWidth);
             if (!hint.empty()) {
-                AGENT_TEXT(wqn::kEpdWidth - hint_w - 8, kAgentBarTextY, hint.c_str(), true);
+                AGENT_TEXT(right - hint_w, kAgentBarTextY, hint.c_str(), true);
             }
             if (!agent.ui.activity_text.empty()) {
                 // The cloud's own line, truncated to the room the hint leaves.
@@ -490,9 +545,9 @@ esp_err_t RenderAgentAiToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule
                 // where the run's activity line starts.
                 const std::string body =
                     hint.empty()
-                        ? AgentOneLine(agent.ui.activity_text, wqn::kEpdWidth - 16)
+                        ? AgentOneLine(agent.ui.activity_text, right - 16)
                         : AgentOneLine(agent.ui.activity_text,
-                                       wqn::kEpdWidth - hint_w - 24);
+                                       right - hint_w - 16);
                 AGENT_TEXT(kAgentBarMarkerX, kAgentBarTextY, body.c_str(), true);
             }
         }
