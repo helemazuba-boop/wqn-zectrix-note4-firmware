@@ -509,7 +509,15 @@ void RenderAiHistoryViewport(const wqn::AiSessionState& ai,
     static const std::vector<wqn::ChatMessageSnapshot> kEmpty;
     const auto& messages = snapshot ? snapshot->messages : kEmpty;
     if (messages.empty() && ai.status == wqn::AiSessionStatus::kIdle) {
-        const std::string hint = "长按确认键开始语音提问";
+        // [agent] This branch is shared with the STD/Flash tiers, and that is
+        // how the Agent tier came to be told "长按确认键开始语音提问" -- the STD
+        // tier's gesture, offered by a tier whose unit of input is a task
+        // rather than a question. Its own empty state says what is actually
+        // true instead. Gesture instructions have left this tier entirely; the
+        // manual owns them.
+        const std::string hint = ai.tier == wqn::AiTier::kAgent
+            ? std::string("这个任务还没有记录")
+            : std::string("长按确认键开始语音提问");
         const auto lines = WrapForViewport(hint, kAiAssistantW - kAiAssistantLeftBorder - 6, 4);
         int y = kAiViewportY + 30;
         for (const auto& l : lines) {
