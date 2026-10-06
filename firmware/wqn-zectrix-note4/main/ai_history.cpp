@@ -233,7 +233,7 @@ bool AiHistory::ReplaceText(ChatMessageId id, ChatMessageKind expected_kind,
     return false;
 }
 
-bool AiHistory::Contains(ChatMessageId id, ChatMessageKind kind) const
+bool AiHistory::Contains(ChatMessageId id) const
 {
     if (id == kInvalidChatMessageId || mutex_ == nullptr) {
         return false;
@@ -241,9 +241,10 @@ bool AiHistory::Contains(ChatMessageId id, ChatMessageKind kind) const
     xSemaphoreTake(mutex_, portMAX_DELAY);
     bool found = false;
     for (const ChatMessage& msg : messages_) {
-        if (msg.id != id) continue;
-        found = (msg.kind == kind);
-        break;
+        if (msg.id == id) {
+            found = true;
+            break;
+        }
     }
     xSemaphoreGive(mutex_);
     return found;

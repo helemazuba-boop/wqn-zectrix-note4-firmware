@@ -111,11 +111,21 @@ public:
     bool ReplaceText(ChatMessageId id, ChatMessageKind expected_kind,
                      std::string_view text, int64_t now_ms);
 
-    // True while `id` is still in the ring AND still carries `kind`. Distinguishes
-    // an evicted entry from one that changed kind, which the bare bool from
-    // ReplaceText cannot. Used by the streaming mirror to recover from eviction
-    // instead of silently dropping the rest of the answer.
-    bool Contains(ChatMessageId id, ChatMessageKind kind) const;
+    // True while `id` is still in the ring AT ALL, with any kind. The streaming
+    // mirror needs to know which of two very different things ReplaceText's
+    // false return meant -- "the ring evicted the entry I have been growing for
+    // the whole answer" (safe to re-append) or "this id belongs to some other
+    // message" (a logic error; re-appending duplicates the bubble) -- and the
+    // bare bool cannot tell them apart.
+    //
+    // [evict-recovery] There is deliberately no kind parameter. The caller has
+    // just been told the entry does not carry the kind it expected, so "is it
+    // here with that kind?" is a question the false it already holds answers.
+    // The discriminator has to be presence alone; an earlier version took the
+    // kind and therefore returned false for BOTH cases, which made the recovery
+    // branch unconditional -- exactly the duplicate-bubble behaviour it was
+    // written to prevent.
+    bool Contains(ChatMessageId id) const;
 
     bool PopLastIf(ChatMessageKind kind);
     std::shared_ptr<const AiHistorySnapshot> Snapshot() const;

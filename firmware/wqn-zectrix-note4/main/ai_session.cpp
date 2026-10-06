@@ -245,9 +245,14 @@ bool FinalizeAssistantLocked(wqn::AiHistory& history, const std::string& authori
     // Re-append, but only for eviction. A kind mismatch is a real logic error
     // (this id belongs to some other message) and re-appending against it would
     // duplicate the bubble -- the one symptom this plan exists to remove.
-    // Contains() is what tells the two apart, and it is the only reason that
-    // predicate exists.
-    if (history.Contains(g_turn.assistant_id, wqn::ChatMessageKind::kAssistant)) {
+    //
+    // Contains() answers presence, NOT presence-with-kind. This distinction is
+    // the whole branch: ReplaceText has already established that the entry is
+    // not here as an assistant, so asking "is it here as an assistant?" is
+    // answered "no" for an evicted entry AND for a mismatched one, which makes
+    // the branch unconditional re-append. Presence alone separates them: the
+    // mismatched id is still in the ring under another kind.
+    if (history.Contains(g_turn.assistant_id)) {
         return false;
     }
     ESP_LOGW(kTag, "assistant entry %llu evicted mid-answer; re-appending %u B",
