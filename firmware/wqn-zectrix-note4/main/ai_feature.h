@@ -43,6 +43,17 @@ struct AiFeatureUiState {
     // SetUserVisibleActivityLocked stamp this, and the line is on screen only
     // while the stamp is fresh -- see kAiActivityBannerTtlMs.
     int64_t activity_text_ms = 0;
+    // [band-interactive-only] The model's answer to "what does the confirm key
+    // do right now", written in ~24 places. The Agent tier's bottom band used
+    // to render it; that band is interactive-only now and draws no gesture
+    // instruction from any phase, so this has no consumer on screen.
+    //
+    // The writers stay. They are the state machine's own description of its
+    // gesture, they cost nothing, and a device that is going to grow a unified
+    // gesture system -- the other pages' key legends are going too -- should
+    // not have to rediscover it. But nothing reads it today, and that has to be
+    // said out loud rather than implied: a field that looks live and is not is
+    // the same lying-comment failure this plan has spent four rounds removing.
     std::string action_hint;
     int32_t scroll_offset_lines = 0;
     bool requires_confirmation = false;
