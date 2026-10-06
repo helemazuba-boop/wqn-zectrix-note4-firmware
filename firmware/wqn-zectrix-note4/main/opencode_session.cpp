@@ -146,8 +146,41 @@ void MarkChangedLocked()
     g_changed = true;
 }
 
+// [armed] The one place a phase transition has to go through, because an armed
+// transcript is only runnable at kAwaitingConfirmation: AiFeatureCanSubmit
+// gates on the phase, and ConfirmOpenCodePrompt also refuses while the worker
+// slot is taken. Every caller here is a stream frame settling a turn, and none
+// of them can settle it to kAwaitingConfirmation -- so leaving
+// requires_confirmation set behind any other phase strands the transcript in a
+// state that OFFERS 发送 and then refuses it.
+//
+// That was reachable two ways, both of which end in a state no gesture leaves:
+// a re-attach resetting the phase behind a prompt the user armed before
+// leaving the screen (ObserveOpenCodeSession claimed kComplete straight into
+// requires_confirmation), and an incidental status frame arriving over the
+// same window. Worse than the refused send, 重新输入 then fell past
+// CancelOpenCodePrompt's kAwaitingConfirmation body, saw stream_active raised
+// by the attach, and interrupted a session with nothing running -- the
+// transcript gone and a POST nobody asked for.
+//
+// The three sibling transition sites (FinishSwitchedStreamLocked,
+// LockSelectedOpenCodeSession, CreateSession) already clear this pair by hand.
+// Doing it here is what stops the next site from forgetting to.
 void SetPhaseLocked(wqn::AiFeaturePhase phase, const std::string& status)
 {
+    if (phase != wqn::AiFeaturePhase::kAwaitingConfirmation &&
+        g_state.ui.requires_confirmation) {
+        // Not silent: the user's own words are being dropped, and the state
+        // they now sit in must not look like the one they left.
+        ESP_LOGI(kTag, "%s: dropping %u B of unsent transcript (phase %s -> %s)",
+                 g_state.current_session_id.c_str(),
+                 static_cast<unsigned>(g_state.ui.prompt_text.size()),
+                 AiFeaturePhaseLabel(g_state.ui.phase),
+                 AiFeaturePhaseLabel(phase));
+        g_state.ui.prompt_text.clear();
+        g_state.ui.requires_confirmation = false;
+        g_state.confirmation_armed_at_ms = 0;
+    }
     g_state.ui.phase = phase;
     g_state.ui.status_label = status;
     MarkChangedLocked();
@@ -2477,8 +2510,14 @@ esp_err_t ObserveOpenCodeSession(OpenCodeRejectReason* reason)
         // that was a guess, and the bottom band turned it into 长按=中止 -- a
         // destructive gesture offered for a session whose run had already
         // finished. See ObserveAttachPhaseLocked.
-        g_state.ui.phase = ObserveAttachPhaseLocked();
-        g_state.ui.status_label = "观察中";
+        //
+        // Through SetPhaseLocked rather than assigned directly: this was the
+        // one transition site the armed-prompt clear did not cover, and it is
+        // the one a screen return reaches. Entering the AI page over a prompt
+        // the user armed before leaving reset the phase to kComplete while
+        // requires_confirmation stayed true, which is the stranded 发送 the
+        // clear now prevents. See SetPhaseLocked.
+        SetPhaseLocked(ObserveAttachPhaseLocked(), "观察中");
         g_state.ui.response_text.clear();
         g_state.ui.activity_text = needs_history
             ? "正在读取历史对话"
