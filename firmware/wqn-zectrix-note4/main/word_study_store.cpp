@@ -541,7 +541,9 @@ esp_err_t AtomicWrite(
 // TEMPORARY: gated by the constexpr below, not a Kconfig symbol (a new symbol
 // silently evaluates to 0 until a reconfigure, which would burn a flash for
 // nothing). Remove this entire block before the rewrite lands.
-constexpr bool kStorageBenchEnabled = true;
+// [measure] The size/reserve experiment is complete and failed its target.
+// Do not charge every normal boot another GC sweep (last write took 33.4 s).
+constexpr bool kStorageBenchEnabled = false;
 constexpr int kBenchRounds = 4;
 constexpr size_t kBenchMaxBytes = 3072;
 constexpr TickType_t kBenchStartDelayTicks = pdMS_TO_TICKS(25000);
@@ -2446,7 +2448,10 @@ namespace wqn {
 
 void StartStorageWriteBench()
 {
-    if (!kStorageBenchEnabled) return;
+    if (!kStorageBenchEnabled) {
+        ESP_LOGI(kTag, "storage bench boot gate: enabled=0");
+        return;
+    }
     // Small stack: this task only enqueues and waits on the completion
     // semaphore; the writes themselves run on the storage task's 20 KiB stack.
     if (xTaskCreate(BenchTask, "wqn_bench", 4096, nullptr, 2, nullptr) != pdPASS) {
