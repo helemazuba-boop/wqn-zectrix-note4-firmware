@@ -549,11 +549,14 @@ esp_err_t RenderAgentAiToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule
         // is about to do is chrome, not information: long-press-to-talk is this
         // device's basic design language, and the manual owns the remainder.
         //
-        // The clear stays. The option bar owns this band whenever an ask or a
-        // confirmation is up, and an option bar that disappeared without it
-        // would leave its pixels on the panel.
-        FillRect(0, kAgentBarY, wqn::kEpdWidth - kAgentIndicatorColumn,
-                 kAgentBarH, false);
+        // No clear here. With the band interactive-only the transcript owns
+        // these 22 px -- RenderAiHistoryViewport was asked for a reserve of 0
+        // and drew into them -- so an erasing FillRect over
+        // kAgentBarY..kEpdHeight would cut the answer off 22 px short of the
+        // panel's last row and leave exactly the blank strip the user reported.
+        // Nothing needs erasing when a bar goes away: the framebuffer is
+        // cleared at the top of every frame, and the diff refresh sends the
+        // resulting white (or newly drawn) pixels either way.
         return RefreshFrame(frame, schedule);
     }
 
