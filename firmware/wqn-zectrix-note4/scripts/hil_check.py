@@ -166,6 +166,8 @@ WORD_PACK_LINE_COUNT_RE = re.compile(
 # 压成 1，**重启循环被判成单次启动**——假绿，且正好放掉最该抓的那份日志。
 BOOT_BANNER_RE = re.compile(r'^[IWEDV] \(\d+\) boot: End of partition table',
                             re.M)
+# 配对域也认直接ROM复位行（有时分区表未抓全）；仍不改 boots 的单一计数口径。
+ROM_RESET_RE = re.compile(r'^(?:ESP-ROM:esp32s3\b|rst:0x[0-9a-fA-F]+\b)')
 # 监听器附着次数。**不是设备事件**，只作上下文印出来：它解释"为什么有人看到
 # 很多 attach 行"，也防止下一个人再把它当启动数。
 #
@@ -617,16 +619,12 @@ class Log:
     def parse(cls, path: str, text: str) -> 'Log':
         log = cls(path=path, text=text)
         log.lines = text.splitlines()
-        for m in TX_RE.finditer(text):
-            log.tx.append(m.groupdict())
         for m in CARD_RE.finditer(text):
             log.cards.append({k: int(v) for k, v in m.groupdict().items()})
         log.submits = [m.groupdict() for m in SUBMIT_RE.finditer(text)]
         log.dispatches = [m.groupdict() for m in DISPATCH_RE.finditer(text)]
         log.presents = [m.groupdict() for m in PRESENT_RE.finditer(text)]
         log.hwm = [int(m.group('hwm')) for m in STACK_RE.finditer(text)]
-        log.probes = [{k: int(v) for k, v in m.groupdict().items()}
-                      for m in PROBE_RE.finditer(text)]
         log.bench_events = [m.group('what').lower() for m in BENCH_RE.finditer(text)]
         log.rounds = [{k: (v if k in ('shape', 'result') else int(v))
                        for k, v in m.groupdict().items()}
@@ -707,7 +705,19 @@ class Log:
         # NVS 侧两行。`changed=0` 是**真的没写**（storage.cpp:1084 先读出旧值
         # memcmp，相同就跳过 nvs_set_blob），所以它必须原样带着走，否则
         # "游标没变所以不花钱"会被读成"NVS 就是快"——那是两个相反的结论。
-        for line in log.lines:
+        epoch = 0
+        for line_no, line in enumerate(log.lines):
+            # 仅设备启动/ROM复位证据切域，监听器 attach 不切。
+            # 多任务日志有10–60 ms倒序实测，不能把每个时钟回退假装成重启；
+            # 单笔统计配对另检验前后时钟包围关系，拒绝不自洽的窗口。
+            if BOOT_BANNER_RE.search(line) or ROM_RESET_RE.search(line):
+                epoch += 1
+            for m in TX_RE.finditer(line):
+                log.tx.append(dict(m.groupdict(), epoch=epoch, line=line_no))
+            for m in PROBE_RE.finditer(line):
+                log.probes.append(dict(
+                    {k: int(v) for k, v in m.groupdict().items()},
+                    epoch=epoch, line=line_no))
             if 'nvs write:' in line:
                 f = {k: int(v) for k, v in KV_NUM_RE.findall(line)}
                 km = KV_KEY_RE.search(line)
@@ -715,12 +725,14 @@ class Log:
                     f['key'] = km.group(1)
                 tm = LOG_PREFIX_RE.match(line)
                 if tm and 'total_ms' in f:
-                    log.nvs_writes.append(dict(f, t=int(tm.group(1))))
+                    log.nvs_writes.append(dict(
+                        f, t=int(tm.group(1)), epoch=epoch, line=line_no))
             elif 'nvs stats:' in line:
                 f = {k: int(v) for k, v in KV_NUM_RE.findall(line)}
                 tm = LOG_PREFIX_RE.match(line)
                 if tm and 'total_entries' in f:
-                    log.nvs_stats.append(dict(f, t=int(tm.group(1))))
+                    log.nvs_stats.append(dict(
+                        f, t=int(tm.group(1)), epoch=epoch, line=line_no))
         # 格式漂移：有 word-pack-download 行，但没有一条 end 行被解析出来。
         log.pack_line_count = len(WORD_PACK_LINE_COUNT_RE.findall(text))
         # ⚠️⚠️ 启动数原来写成 `text.count('opened COM') or
@@ -3108,6 +3120,41 @@ def hil_stream_bench_vs_direct(log: Log):
            f'之后抬头，真实值会比这个大。两个绝对值都打在上面，别只引用比值')
 
 
+def _writes_in_transaction(log: Log, tx, rows, timestamp):
+    """同一时钟域、同一串行属主事务；毫秒相等时靠行序分开相邻事务。"""
+    if tx['t'] is None:
+        return []
+    end = int(tx['t'])
+    start = end - el(tx)
+    previous_line = max((other['line'] for other in log.tx
+                         if other['epoch'] == tx['epoch']
+                         and other['line'] < tx['line']), default=-1)
+    scoped = [row for row in rows if row['epoch'] == tx['epoch']
+              and previous_line < row['line'] < tx['line']]
+    # 若最新写的时钟已不在窗口内，不得退回更早的一笔制造覆盖。
+    # 这也拒绝漏抓启动行的时钟重叠，不需把多任务日志的小倒序当重启。
+    if scoped and not start <= scoped[-1][timestamp] <= end:
+        return []
+    return [row for row in scoped if start <= row[timestamp] <= end]
+
+
+def _nvs_stats_pair(log: Log, write):
+    """最近的前/后统计按行序配对，不借别次启动或同毫秒的别笔写。"""
+    rows = [row for row in log.nvs_stats if row['epoch'] == write['epoch']
+            and 'used_entries' in row]
+    before = [row for row in rows if row['line'] < write['line']]
+    after = [row for row in rows if row['line'] > write['line']]
+    if not before or not after:
+        return None
+    left, right = before[-1], after[0]
+    if not left['t'] <= write['t'] <= right['t']:
+        return None
+    sharing = sum(other['epoch'] == write['epoch']
+                  and left['line'] < other['line'] < right['line']
+                  for other in log.nvs_writes)
+    return left, right, sharing
+
+
 def hil_write_parts_reconcile(log: Log):
     """一笔事务的子字段之和必须解释它的 elapsed —— 但**加数会变，判据不能瞎**。
 
@@ -3141,6 +3188,10 @@ def hil_write_parts_reconcile(log: Log):
         skip(log, 'WRITE:parts-account-for-transaction',
              '本轮无 word-session-save 事务，无法对账')
         return
+    if any(t['t'] is None or int(t['t']) < el(t) for t in txs):
+        expect(log, 'WRITE:parts-account-for-transaction', False,
+               'word-session-save 时间戳缺失或耗时超出本启动时钟，不能配执行窗口')
+        return
     # 窗口对账，不是"全部写行 / 全部事务"。
     # WHY: 分母只取 word-session-save 而分子含 bench 与其它路径时，1006.1 上
     # 会算出 395% 覆盖，然后据此得出"插桩重复计数"的假结论。那正是这条判据
@@ -3150,17 +3201,15 @@ def hil_write_parts_reconcile(log: Log):
     breakdown = []
     covered = 0
     for t in txs:
-        end = int(t['t'])
-        start = end - el(t)
-        aw = [p['total'] for p in log.probes if start <= p['at'] <= end]
-        nv = [w['total_ms'] for w in log.nvs_writes if start <= w['t'] <= end]
+        aw = [p['total'] for p in _writes_in_transaction(log, t, log.probes, 'at')]
+        win = _writes_in_transaction(log, t, log.nvs_writes, 't')
+        nv = [w['total_ms'] for w in win]
         if aw or nv:
             covered += 1
         if aw:
             breakdown.append(f'atomic write {sum(aw):.0f} ms × {len(aw)} 笔')
         if nv:
             # 窗口内的 nvs 行要分三类说：真写的、值没变跳过的、和**擦除**的。
-            win = [w for w in log.nvs_writes if start <= w['t'] <= end]
             # 判别用 `bytes==0` 而不是 `changed`：`ClearWordSessionCursorNvs`
             # 报的就是 bytes=0 + changed=**true**（peer 2026-10-06 改的，理由见
             # storage.cpp 里那段注释：能走到 emit 说明 key 存在、条目真被擦了）。
@@ -3189,21 +3238,27 @@ def hil_write_parts_reconcile(log: Log):
             breakdown.append('；'.join(bits))
         write_ms += sum(aw) + sum(nv)
     if not breakdown:
-        skip(log, 'WRITE:parts-account-for-transaction',
-             f'{len(txs)} 笔 word-session-save 的执行窗口内没有任何写行'
-             f'（atomic write: / nvs write:），判不出成本归属')
+        message = (f'{len(txs)} 笔 word-session-save 的本启动、完成行之前的执行窗口'
+                   f'没有任何写行（atomic write: / nvs write:），判不出成本归属')
+        if log.probes or log.nvs_writes:
+            expect(log, 'WRITE:parts-account-for-transaction', False,
+                   message + '；日志有写探针，不能借其它窗口补成本')
+        else:
+            skip(log, 'WRITE:parts-account-for-transaction', message)
         return
     tx_ms = sum(el(t) for t in txs)
     ratio = write_ms / tx_ms if tx_ms else float('inf')
     parts = '；'.join(dict.fromkeys(breakdown))
-    ok = ratio >= 0.6
+    ok = ratio >= 0.6 and covered == len(txs)
     detail = (f'{covered}/{len(txs)} 笔窗口内有写行。写行合计 {write_ms:.0f} ms'
               f'（{parts}）vs word-session-save sum(elapsed) {tx_ms:.0f} ms'
               f' ⇒ 覆盖 {ratio:.0%}。口径是"**落在同一执行窗口内**的所有 '
               f'storage-write 行"，不是只数 `atomic write:`：52 B 游标迁 NVS 后'
               f'每次答题少一条 `atomic write:` 而 owner 名不变，只数它会把合法'
               f'迁移读成"插桩漏掉主要耗时"')
-    if not ok:
+    if covered != len(txs):
+        detail += ' ⇒ 存在未覆盖的事务，不能让其它事务的写行补账'
+    elif not ok:
         detail += (' ⇒ 覆盖 <60%，插桩漏掉了主要耗时，本轮任何子字段结论都不可信')
     else:
         detail += ' ⇒ 成本都在已插桩的写路径里'
@@ -3230,33 +3285,45 @@ def hil_cursor_erase_logged(log: Log):
         return
     covered = 0
     drops = []
-    for t in txs:
-        end = int(t['t'])
-        start = end - el(t)
-        win = [w for w in log.nvs_writes if start <= w['t'] <= end]
-        erased = [w for w in win if w.get('bytes', -1) == 0]
-        if erased or win:
-            covered += 1
-        if not erased:
+    failures = []
+    cursor_keys = {'cur_seq', 'cur_rnd', 'cur_dic', 'cur_rev',
+                   'cur_int', 'cur_shf', 'cur_mis'}
+    for index, t in enumerate(txs, 1):
+        if t['t'] is None or int(t['t']) < el(t) or t['res'] != 'ESP_OK':
+            failures.append(f'第{index}笔清事务失败或缺合法时间窗')
             continue
-        # 擦除前后各取一条 `nvs stats:`。peer 的修法是擦完**紧接着**打 stats，
-        # 所以 erase 行之后那条就在窗口里；但也允许它落在窗口外（下一条读数）。
-        # 两边都取不到就不下结论——没有读数就没有证据，别编。
-        used = [(r['t'], int(r['used_entries'])) for r in log.nvs_stats
-                if 'used_entries' in r]
-        before = [u for ts, u in used if ts < start]
-        after = [u for ts, u in used if ts >= start]
-        if before and after:
-            drops.append(after[-1] - before[-1])
-    detail = (f'{covered}/{len(txs)} 笔 word-session-clear 窗口内有 `nvs write:` 行。'
-              f'擦除行判别用 `bytes=0`（**不是 `changed`**——peer 已把 erase 路径的 '
-              f'changed 改成 true，拿它判别会把擦除读成"写了一次"）。')
+        win = _writes_in_transaction(log, t, log.nvs_writes, 't')
+        if (len(win) != 1 or win[0].get('bytes', -1) != 0
+                or win[0].get('changed') != 1 or win[0].get('key') not in cursor_keys
+                or win[0]['total_ms'] > el(t)):
+            failures.append(f'第{index}笔缺唯一正式游标 bytes=0 changed=1 擦除行')
+            continue
+        write = win[0]
+        pair = _nvs_stats_pair(log, write)
+        if pair is None:
+            failures.append(f'第{index}笔缺本启动擦除前后统计')
+            continue
+        left, right, sharing = pair
+        delta = int(right['used_entries']) - int(left['used_entries'])
+        drops.append(delta)
+        if right['line'] >= t['line'] or right['t'] > int(t['t']):
+            failures.append(f'第{index}笔擦除后统计不在本事务内')
+        elif sharing != 1:
+            failures.append(f'第{index}笔统计间夹{sharing}笔操作，净台阶无法独立归因')
+        elif delta >= 0:
+            failures.append(f'第{index}笔 used_entries 未减少（{delta:+d}）')
+        else:
+            covered += 1
+    detail = (f'{covered}/{len(txs)} 笔 word-session-clear 同启动窗口内有正式游标'
+              f' `bytes=0 changed=1` 擦除、ESP_OK和成对统计。'
+              f'按日志行序取最近前/后值，同毫秒也不混淆；擦除后的统计须在完成行之前。')
     if drops:
         detail += (f' 擦除前后 `used_entries` 变化 {drops}（**应为负**：那条 4 条目 '
                    f'blob 被释放；只涨不跌 = 有泄漏，正是这条判据要拦的）')
     else:
-        detail += (' ⚠️ 没有取到擦除前后的两条 `nvs stats:` 读数，'
-                   '无法确认条目真的释放了——这正是 peer 修掉的第二个缺陷，别让它退化')
+        detail += ' 没有本次成对读数，不能确认条目释放。'
+    if failures:
+        detail += ' FAIL原因：' + '；'.join(failures)
     expect(log, 'WRITE:cursor-erase-logged', covered == len(txs), detail)
 
 
@@ -3344,22 +3411,19 @@ def hil_nvs_stats_measured(log: Log):
     # 不拿"N 条 ÷ N 个 key"当精确分配。
     pairs = []
     for w in log.nvs_writes:
-        after = [r for r in log.nvs_stats
-                 if r['t'] >= w['t'] and 'used_entries' in r]
-        before = [r for r in log.nvs_stats
-                  if r['t'] < w['t'] and 'used_entries' in r]
-        if before and after:
-            # 同一对 stats 之间还夹着几笔写？>1 时 +N 里就有别人的份。
-            sharing = sum(1 for o in log.nvs_writes
-                          if before[-1]['t'] < o['t'] <= after[0]['t'])
+        pair = _nvs_stats_pair(log, w)
+        if pair is not None:
+            before, after, sharing = pair
             pairs.append({'key': w.get('key', '?'), 'bytes': w.get('bytes', 0),
                           'changed': w.get('changed', -1), 'sharing': sharing,
-                          'delta': int(after[0]['used_entries'])
-                          - int(before[-1]['used_entries'])})
+                          'delta': int(after['used_entries'])
+                          - int(before['used_entries'])})
     if pairs:
-        detail += '；**逐笔 Δused 配对**（一笔写前后各取一条 stats）：'
+        detail += '；**逐笔 Δused 配对**（同启动按行序取最近前/后 stats）：'
         for p in pairs:
-            if p['bytes'] == 0 and p['delta'] < 0:
+            if p['sharing'] > 1:
+                tag = f'共享统计窗口夹{p["sharing"]}笔操作，全局台阶不能逐key归因'
+            elif p['bytes'] == 0 and p['delta'] < 0:
                 tag = f'**擦除 key，释放 {-p["delta"]} 条**'
             elif p['bytes'] == 0:
                 tag = '擦除窗口没有观察到净减少，不能声称免费改写'
@@ -3367,17 +3431,20 @@ def hil_nvs_stats_measured(log: Log):
                 tag = '减少台阶不能证明免费改写，需查同窗口其他操作'
             elif p['delta'] > 0:
                 tag = f'**新 key，一次性 +{p["delta"]}**'
-                if p['sharing'] > 1:
-                    tag += f' ⚠️窗口内还有另外 {p["sharing"] - 1} 笔写，这 +{p["delta"]} 里可能有别人的份'
             elif p['changed'] == 0:
                 tag = '同值短路，没碰 flash'
             else:
                 tag = '**改写已有 key，净 0**'
             detail += (f'\n  · {p["key"]} bytes={p["bytes"]} '
                        f'changed={p["changed"]} ⇒ Δused {p["delta"]:+d}（{tag}）')
-    first_write = [p for p in pairs if p['bytes'] > 0 and p['delta'] > 0]
+    unpaired = len(log.nvs_writes) - len(pairs)
+    if unpaired:
+        detail += f'；{unpaired} 笔写缺本启动成对stats，未量到其Δused（不借其它启动补值）'
+    first_write = [p for p in pairs
+                   if p['bytes'] > 0 and p['delta'] > 0 and p['sharing'] == 1]
     rewrites = [p for p in pairs
-                if p['bytes'] > 0 and p['delta'] == 0 and p['changed'] != 0]
+                if p['bytes'] > 0 and p['delta'] == 0 and p['changed'] != 0
+                and p['sharing'] == 1]
     if first_write and rewrites:
         once_each = statistics.median([p['delta'] for p in first_write])
         n_keys = len({p['key'] for p in first_write})
@@ -4529,6 +4596,114 @@ def selftest():
     falling = cursor_steps.split('I (500)')[0].replace('used_entries=200', 'used_entries=192')
     falling_detail = detail(hil_nvs_stats_measured, falling, measured_name)
     check('非擦除负台阶不能标免费改写', '减少台阶不能证明免费改写' in falling_detail, True)
+    # 多启动/同毫秒/后续写故意用不同 used，防止两个恰好相等的数藏住错配。
+    def ns(t, used):
+        return (f'I ({t}) wqn_storage: nvs stats: used_entries={used} '
+                f'free_entries={504-used} available_entries={378-used} total_entries=504\n')
+
+    def nw(t, key='cur_rev', size=0, changed=1):
+        return (f'I ({t}) wqn_storage: nvs write: key={key} bytes={size} '
+                f'total_ms=10 changed={changed}\n')
+
+    def nt(owner='word-session-clear', result='ESP_OK'):
+        return (f'I (205) storage_service: owner={owner} queue_wait_ms=0 '
+                f'elapsed_ms=15 result={result}\n')
+
+    erase_name = 'WRITE:cursor-erase-logged'
+    clear = 'unrelated first line\n' + ns(100, 200) + nw(200) + ns(200, 196) + nt()
+    check('清真实游标同毫秒后stats下降可通过', verdict(
+        hil_cursor_erase_logged, clear, erase_name), 'PASS')
+    for malformed, label in (
+            (clear.replace(ns(100, 200), ''), '缺之前统计'),
+            (clear.replace(ns(200, 196), ''), '缺之后统计'),
+            (clear.replace(ns(200, 196), ns(200, 200)), '条目未下降'),
+            (clear.replace(ns(200, 196), ns(200, 204)), '条目反而增加'),
+            (clear.replace(nw(200), nw(200, size=52)), '普通写冒充擦除'),
+            (clear.replace(nw(200), nw(200, changed=0)), '同值短路冒充擦除'),
+            (clear.replace(nw(200), nw(200, key='_hil_cur52')), '临时key冒充正式会话'),
+            (clear.replace(nt(), nt(result='ESP_FAIL')), '清事务失败'),
+            (clear.replace(ns(200, 196), '') + ns(206, 196), '事务后才有统计'),
+            (clear.replace(ns(200, 196), ns(200, 200)) + ns(300, 196), '后续下降冒充本次下降')):
+        check(f'清会话{label}必须 FAIL', verdict(
+            hil_cursor_erase_logged, malformed, erase_name), 'FAIL')
+    later_write = clear + nw(300, size=52) + ns(300, 200)
+    check('清除只看紧随stats，不拿末次改写抵消-4',
+          '变化 [-4]' in detail(hil_cursor_erase_logged, later_write, erase_name), True)
+    shared = clear.replace(nw(200), nw(195, key='cur_int', size=52) + nw(200))
+    check('同对stats夹多个操作，不能把全局下降独归清除', verdict(
+        hil_cursor_erase_logged, shared, erase_name), 'FAIL')
+    boot = 'I (99) boot: End of partition table\n'
+    prior = 'unrelated first line\n' + ns(100, 200) + nw(200) + ns(200, 196)
+    foreign = prior + boot + ns(100, 212) + ns(200, 208) + nt()
+    check('旧启动擦除不能覆盖新启动清事务', verdict(
+        hil_cursor_erase_logged, foreign, erase_name), 'FAIL')
+    missing_before = prior + boot + nw(200) + ns(200, 208) + nt()
+    check('不能借旧启动统计补新启动清除前值', verdict(
+        hil_cursor_erase_logged, missing_before, erase_name), 'FAIL')
+    reboot_pairs = ('unrelated first line\n' + ns(100, 196) + nw(200, size=52) +
+                    ns(200, 200) + boot + ns(100, 208) +
+                    nw(200, key='cur_int', size=52) + ns(200, 212))
+    check('两启动重叠时钟的写各自配本启动stats',
+          'cur_int bytes=52 changed=1 ⇒ Δused +4' in detail(
+              hil_nvs_stats_measured, reboot_pairs, measured_name), True)
+    one_tick = ('unrelated first line\n' + ns(200, 196) + nw(200, size=52) +
+                ns(200, 200) + nw(200, size=52) + ns(200, 200))
+    tick_detail = detail(hil_nvs_stats_measured, one_tick, measured_name)
+    check('同毫秒行序仍能量到新key+4', 'Δused +4' in tick_detail, True)
+    check('同毫秒第二次写仍配净0，不借上一笔+4', 'Δused +0' in tick_detail, True)
+    parts_name = 'WRITE:parts-account-for-transaction'
+    own_save = 'unrelated first line\n' + nw(200, size=52) + nt(owner='word-session-save')
+    check('同一启动NVS写覆盖save窗口', verdict(
+        hil_write_parts_reconcile, own_save, parts_name), 'PASS')
+    foreign_save = prior + boot + nt(owner='word-session-save')
+    check('另一启动写不能冒充本启动save成本', verdict(
+        hil_write_parts_reconcile, foreign_save, parts_name), 'FAIL')
+    future_save = 'unrelated first line\n' + nt(owner='word-session-save') + nw(200, size=52)
+    check('完成行之后的回退时钟写不能补save成本', verdict(
+        hil_write_parts_reconcile, future_save, parts_name), 'FAIL')
+    same_tick_future = 'unrelated first line\n' + nt(owner='word-session-save') + nw(205, size=52)
+    check('完成行之后同毫秒写不能补save成本', verdict(
+        hil_write_parts_reconcile, same_tick_future, parts_name), 'FAIL')
+    adjacent = ('unrelated first line\n' + nw(200, size=52) +
+                nt(owner='word-session-cursor') + nt(owner='word-session-save'))
+    check('上一已完成事务的写不能补相邻save成本', verdict(
+        hil_write_parts_reconcile, adjacent, parts_name), 'FAIL')
+    atomic = ('I (200) wqn_storage: atomic write: bytes=3379 backup=1 fopen_ms=1 '
+              'write_ms=1 stat_ms=1 remove_ms=1 rename_backup_ms=1 '
+              'rename_primary_ms=5 total_ms=10\n')
+    check('同一启动AtomicWrite也能覆盖执行窗', verdict(
+        hil_write_parts_reconcile, 'unrelated first line\n' + atomic +
+        nt(owner='word-session-save'), parts_name), 'PASS')
+    check('另一启动AtomicWrite不能补本启动save成本', verdict(
+        hil_write_parts_reconcile, 'unrelated first line\n' + atomic + boot +
+        nt(owner='word-session-save'), parts_name), 'FAIL')
+    check('save时间戳漂移是FAIL，不抛异常或SKIP', verdict(
+        hil_write_parts_reconcile, own_save.replace('I (205) storage_service:',
+                                                  'storage_service:'), parts_name), 'FAIL')
+    check('清除时间戳漂移是FAIL，不抛异常或SKIP', verdict(
+        hil_cursor_erase_logged, clear.replace('I (205) storage_service:',
+                                              'storage_service:'), erase_name), 'FAIL')
+    check('擦除耗时超出自身事务不能绿', verdict(
+        hil_cursor_erase_logged, clear.replace('total_ms=10', 'total_ms=500'), erase_name), 'FAIL')
+    attach_only = clear.replace(nw(200), '[22:24:00] listener attached: COM7\n' + nw(200))
+    check('监听器重附着不切设备统计域', verdict(
+        hil_cursor_erase_logged, attach_only, erase_name), 'PASS')
+    rollback = prior + nw(150) + ns(150, 192) + nt()
+    check('没有boot行但时钟回退，也不能借上段擦除前统计', verdict(
+        hil_cursor_erase_logged, rollback, erase_name), 'FAIL')
+    rollback_log = Log.from_text(rollback)
+    check('不自洽时钟拒绝配对，但不冒充可见设备启动数', rollback_log.boots, 0)
+    concurrent = clear.replace(nw(200),
+        'I (150) background: running\nI (140) background: delayed log\n' + nw(200))
+    check('多任务10ms日志倒序不假装新启动', verdict(
+        hil_cursor_erase_logged, concurrent, erase_name), 'PASS')
+    reset_without_table = prior + 'rst:0x15 (USB_UART_CHIP_RESET)\n' + nw(200) + ns(200, 192) + nt()
+    check('只有ROM复位行也不能借上一启动统计', verdict(
+        hil_cursor_erase_logged, reset_without_table, erase_name), 'FAIL')
+    check('ROM边界不冒充分区表启动计数', Log.from_text(reset_without_table).boots, 0)
+    shared_detail = detail(hil_nvs_stats_measured, shared, measured_name)
+    check('共享统计窗口不能标某key释放4条', '擦除 key，释放 4 条' not in shared_detail, True)
+    check('共享统计窗口明确报告无法逐key归因', '不能逐key归因' in shared_detail, True)
     check('分组结束但总实验未收尾，不能借子 END 判租约', verdict(
         hil_storage_bench, lifecycle.replace(
             'I (20000) word_store: storage gc reserve experiment END\n', ''), lease_name), 'SKIP')
