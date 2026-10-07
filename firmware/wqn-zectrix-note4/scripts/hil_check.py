@@ -157,6 +157,35 @@ KV_RE = re.compile(r'(?P<k>[a-z_]+)=(?P<v>[^\s]+)')
 # 本会话已经因为这个模式错过一次（新增判据静默不触发）。
 WORD_PACK_LINE_COUNT_RE = re.compile(
     r'^[IWEDV] \(\d+\) wqn_api: word-pack-download.*$', re.M)
+# 可见的设备启动证据：bootloader 打分区表，紧跟 esp_image 段表，时钟重新
+# 起跳。它也出现在 USB/软件复位后，不能单凭这行证明真实断电或冷启。
+# WHY A NEW RE: 原来用 `text.count('opened COM')` 数启动，那数的是**监听器
+# 连上串口的次数**，一次设备没重启也能有好几行（monitor_serial.ps1 每次自动
+# 重连写一行 `[HH:mm:ss] opened COM7`）。两个数在多数日志里恰好相等，所以这个错
+# 一直没露馅；在 1005.7crash（14 次启动）和 1004.2（12 次）上 `or` 短路把它
+# 压成 1，**重启循环被判成单次启动**——假绿，且正好放掉最该抓的那份日志。
+BOOT_BANNER_RE = re.compile(r'^[IWEDV] \(\d+\) boot: End of partition table',
+                            re.M)
+# 监听器附着次数。**不是设备事件**，只作上下文印出来：它解释"为什么有人看到
+# 很多 attach 行"，也防止下一个人再把它当启动数。
+#
+# ⚠️ **两种写法都要认，不能只认新的。** 2026-10-06 projects-cf 把 emitter 从
+# `[HH:mm:ss] opened COM7` 改名成 `[HH:mm:ss] listener attached: COM7`，理由是对的：
+# 裸 `opened COM7` 长得和设备事件一模一样，正是我的启动数判据被骗的原因。
+# 但如果只匹配新串，**全部 19 份历史日志的 monitor_attaches 会归零**——而那个
+# 0 会被读成"这一轮监听器没连过"，与"旧 emitter"是两回事。
+# 所以这里两型式并列：`opened`（历史）+ `listener attached:`（新）。
+# 桌面 capture 脚本生成的 `[$ts] opened $Port @ $Baud` 由 `opened` 那半边接着。
+#
+# ⚠️⚠️ **`re.M` 是必需的，`^` 才是"行首"而不是"整个字符串的开头"。**
+# 第一版漏了它，合成日志一测就露：`attaches = 0`。而它在 19 份历史日志上
+# 全都显示 1、看着完全正常——因为那些日志的**第一行恰好就是 attach 行**，
+# 于是"只匹配到开头那一行"和"匹配到所有行"在这一整个语料上**恒等**。
+# 又一处"两个答案恰好相等所以发现不了"，和我刚修的启动数是同一个病：
+# **拿单行日志做单元测试永远测不到 `^` 的语义，必须拿多行文本测。**
+MONITOR_ATTACH_RE = re.compile(
+    r'^\[[0-9]{2}:[0-9]{2}:[0-9]{2}\] (?:listener attached:|opened) ?\w+',
+    re.M)
 # 服务器侧错误与"我们自己超时"要分开：前者这一轮什么都没测到。
 WORD_PACK_HTTP_RE = re.compile(
     r'^[IWEDV] \((?P<t>\d+)\) wqn_api: word-pack-download HTTP status=(?P<status>\d+)',
@@ -246,8 +275,8 @@ kStreamDeadlineMs = 120000
 # 所以"32 KB 够不够"是整个 P1b-B 要回答的产品问题。
 kStreamChunkUnderTest = 32 * 1024
 
-# NVS 分区算术，从本地 IDF 树 + 分区表实推，**不是估计值**：
-#   BLOB_DATA 条目 = 1 + ceil(dataSize / 32)    —— nvs_page.cpp:186-191
+# NVS 分区算术，从本地 IDF 树 + 分区表实推：
+#   每个 BLOB_DATA chunk = 1 + ceil(chunkSize / 32) —— nvs_page.cpp:186-191
 #   BLOB_IDX   条目 = 1（固定 8 B 索引项，不在 isVariableLengthType 里）
 #                                            —— nvs_storage.cpp:351-361
 #   isVariableLengthType 只含 BLOB / SZ / BLOB_DATA —— nvs_types.hpp:33-38
@@ -259,7 +288,8 @@ kStreamChunkUnderTest = 32 * 1024
 # 得出 52 B = 3 条；实测 `used_entries` 每笔游标写涨 **4** 条。
 # 差的就是那条 BLOB_IDX——`nvs_set_blob` 写 blob 时除数据项外**必定**再写一条
 # 索引项（dataSize/chunkCount/chunkStart），而索引项是定长类型、占满 1 条。
-# 所以 blob 一律 +1。教训和"recompute peer 的算术"是同一条，只是这次错的是我。
+# 跨页 blob 每个 BLOB_DATA chunk 都有表头；4000 B 上限不能当作单一表头。
+# 以下大 blob 算的是紧密分块时的下界，页尾碎片可能使实际占用更大。
 kNvsEntrySize = 32
 kNvsEntryCountPerPage = 126
 kNvsSizeBytes = 0x4000
@@ -272,11 +302,11 @@ kSessionCursorBytes = 52
 
 
 def nvs_entries(data_bytes: int) -> int:
-    """一个 blob 占几条 NVS 条目（含表头条目 + 定长的 BLOB_IDX 索引条目）。
-
-    数据项：1 + ceil(data/32)；索引项：恒 1 条（nvs_storage.cpp:351-361）。
-    """
-    return 1 + -(-data_bytes // kNvsEntrySize) + 1
+    """紧密分块时的条目下界：每个 <=4000 B 的 chunk 表头 + 数据 + 一个索引。"""
+    chunk_max = kNvsEntrySize * (kNvsEntryCountPerPage - 1)
+    full, tail = divmod(data_bytes, chunk_max)
+    return 1 + full * (1 + chunk_max // kNvsEntrySize) + (
+        1 + -(-tail // kNvsEntrySize) if tail or not full else 0)
 
 
 def commit_cost_ms(g):
@@ -563,12 +593,28 @@ class Log:
     nvs_stats_line_count: int = 0
     pack_line_count: int = 0
     boots: int = 0
+    monitor_attaches: int = 0
     leases: list = field(default_factory=list)
 
     @classmethod
     def load(cls, path: str) -> 'Log':
         with open(path, encoding='utf-8', errors='ignore') as fh:
             text = fh.read()
+        return cls.parse(path, text)
+
+    @classmethod
+    def from_text(cls, text: str, path: str = '<memory>') -> 'Log':
+        """从一段字符串造 Log——给 `--selftest` 的合成夹具用。
+
+        WHY: 合成日志原先写在 `/tmp`，而 `/tmp` 会被清。2026-10-06 抓到的那个
+        假绿（`MONITOR_ATTACH_RE` 漏 `re.M`）唯一的证据就是那样一份文件，
+        下一个会话拿不到它，同一个错可以再静默一年。夹具必须和判据放在一起。
+        不落盘也顺带解决了"要不要把一个假日志提交进仓库"的问题。
+        """
+        return cls.parse(path, text)
+
+    @classmethod
+    def parse(cls, path: str, text: str) -> 'Log':
         log = cls(path=path, text=text)
         log.lines = text.splitlines()
         for m in TX_RE.finditer(text):
@@ -677,7 +723,23 @@ class Log:
                     log.nvs_stats.append(dict(f, t=int(tm.group(1))))
         # 格式漂移：有 word-pack-download 行，但没有一条 end 行被解析出来。
         log.pack_line_count = len(WORD_PACK_LINE_COUNT_RE.findall(text))
-        log.boots = text.count('opened COM') or text.count('End of partition table')
+        # ⚠️⚠️ 启动数原来写成 `text.count('opened COM') or
+        # text.count('End of partition table')` —— **这是个假绿，方向还正好相反**：
+        # `or` 短路，只要 `opened COM` 非零就用它，把真正的启动数**丢掉**。
+        # 而 `opened COM` 是**监听器事件**（监控脚本连上串口），从来不是设备事件：
+        # 每次自动重连都会多一行，设备一次没重启也能有好几行。
+        # 实测它把最该被这份判据抓住的日志放过去了：
+        #   1005.7crash  partition table 出现 **14 次**（每次 t 都从 (99) 重新起跳、
+        #                 紧跟完整 esp_image 段表 = 14 次完整冷启），判据报"1 次启动"；
+        #   1004.2       同样 12 次 vs 报 1；
+        #   26.16        6 次 vs 报 6（这份恰好监听次数=启动次数，所以一直没露馅）。
+        # 1006.10 上 projects-cf 的 monitor_serial.ps1 每次自动重连也写一行
+        # `[HH:mm:ss] opened COM7` ⇒ 下一份日志开始，冷启测试必然放大这个数。
+        #
+        # 设备启动的**唯一直接证据是 bootloader 自己打的那行**：每次冷启一次，
+        # 段表和 t 计时都随之重置。监听器连了几次单独记，只作上下文。
+        log.boots = len(BOOT_BANNER_RE.findall(text))
+        log.monitor_attaches = len(MONITOR_ATTACH_RE.findall(text))
         log.leases = [{k: (v if k in ('blocker', 'holder', 'tag') else int(v))
                       for k, v in m.groupdict().items()}
                       for m in LEASE_RE.finditer(text)]
@@ -723,6 +785,997 @@ def el(tx): return int(tx['el'])
 
 
 # ------------------------------------------------------------------ 判据实现 --
+
+def hil_word_commit_queue(log: Log):
+    """§7.3：答题排队 <500 ms；不依赖本轮是否恰好触发 session-save。
+
+    BEGIN/END 内的探针会污染真实流量。用提交的整个入队至完成窗口剔除，
+    而不是只看完成时刻。设备重启后时钟复位，窗口必须按启动分开。
+    """
+    name = 'WRITE:word-commit-queue-wait'
+    epoch = 0
+    transactions, windows = [], []
+    active = None
+    reserve_active = False
+    malformed = 0
+    for line in log.lines:
+        if BOOT_BANNER_RE.search(line):
+            epoch += 1
+            active = None
+            reserve_active = False
+        reserve = re.search(r'storage gc reserve experiment (BEGIN|END)\b', line, re.I)
+        bm = reserve or (None if reserve_active else re.search(
+            r'storage bench (BEGIN|END)\b', line, re.I))
+        if reserve:
+            reserve_active = reserve.group(1).upper() == 'BEGIN'
+        if bm:
+            tm = LOG_PREFIX_RE.match(line)
+            if not tm:
+                malformed += 1
+            elif bm.group(1).upper() == 'BEGIN':
+                if active is None:
+                    active = [epoch, int(tm.group(1)), None]
+                    windows.append(active)
+            elif active is not None:
+                active[2] = int(tm.group(1))
+                active = None
+            elif windows and windows[-1][0] == epoch:
+                # 旧 emitter 同时发 lowercase end stats 和 uppercase END。
+                windows[-1][2] = int(tm.group(1))
+        for m in TX_RE.finditer(line):
+            transactions.append(dict(m.groupdict(), epoch=epoch))
+    commits = [t for t in transactions if t['owner'] == 'word-observation-commit']
+    commit_heads = sum('owner=word-observation-commit' in line for line in log.lines)
+    if commit_heads != len(commits):
+        expect(log, name, False,
+               f'答题事务格式漂移：{commit_heads} 行 / {len(commits)} 条解析')
+        return
+    if not commits:
+        skip(log, name, '无答题提交事务；不以 session-save 的存在作为触发门')
+        return
+    if malformed or any(t['t'] is None for t in commits):
+        expect(log, name, False, '答题或 bench 时间戳缺失，不能可靠剔除探针污染')
+        return
+    clean, polluted = [], []
+    for t in commits:
+        end = int(t['t'])
+        enqueue = end - el(t) - qw(t)
+        if enqueue < 0:
+            expect(log, name, False, '事务耗时与设备时钟矛盾，无法判读排队窗口')
+            return
+        overlaps = any(e == t['epoch'] and end >= start and
+                       (stop is None or enqueue <= stop)
+                       for e, start, stop in windows)
+        (polluted if overlaps else clean).append(t)
+    if not clean:
+        skip(log, name, f'{len(polluted)} 笔全部与 bench 重叠；没有未污染样本')
+        return
+    worst = max(clean, key=qw)
+    detail = (f'未污染答题 n={len(clean)}，排除 bench 重叠 n={len(polluted)}；'
+              f'queue_wait 最大 {qw(worst)} ms（要求 <500 ms）')
+    run = int(worst['t']) - el(worst)
+    enqueue = run - qw(worst)
+    blockers = []
+    for t in transactions:
+        if t is worst or t['epoch'] != worst['epoch'] or t['t'] is None:
+            continue
+        overlap = min(run, int(t['t'])) - max(enqueue, int(t['t']) - el(t))
+        if overlap > 0:
+            blockers.append((overlap, t))
+    if blockers:
+        overlap, t = max(blockers, key=lambda p: p[0])
+        detail += (f"；等待窗口与 {t['owner']} 的执行重叠 {overlap} ms"
+                   f'（该事务 elapsed={el(t)} ms；仅时序归因，不细分内部耗时）')
+    expect(log, name, qw(worst) < 500, detail)
+
+
+def probe_profile(line: str, allowed) -> bool:
+    """Exact field token: snapshot-held/paired must not silently mean snapshot."""
+    m = re.search(r'(?:^|\s)profile=(\S+)', line)
+    return bool(m and m.group(1) in allowed)
+
+
+def hil_snapshot_append_probe(log: Log):
+    """实尺寸 append 原型：全量逐 op 对账，首次创建与稳态分开，不验恢复协议。"""
+    head = 'storage snapshot append probe:'
+    rows, bad = [], []
+    epoch, serial = 0, 0
+    active = None
+    runs = {}
+    required = {'bytes', 'round', 'result', 'new_object', 'open_us', 'write_us',
+                'flush_us', 'sync_us', 'close_us', 'total_us', 'written_bytes'}
+    for line in log.lines:
+        if BOOT_BANNER_RE.search(line):
+            epoch += 1
+            active = None
+        if 'storage bench BEGIN' in line and probe_profile(line, ('snapshot', 'snapshot-paired')):
+            if not LOG_PREFIX_RE.match(line):
+                bad.append(line)
+            serial += 1
+            active = (epoch, serial)
+            runs[active] = None
+        if 'storage bench END' in line and probe_profile(line, ('snapshot', 'snapshot-paired')):
+            end_fields = {m.group('k'): m.group('v') for m in KV_RE.finditer(line)}
+            if active is None or 'result' not in end_fields or not LOG_PREFIX_RE.match(line):
+                bad.append(line)
+            else:
+                runs[active] = end_fields['result']
+                active = None
+        if head not in line:
+            continue
+        fields = {m.group('k'): m.group('v') for m in KV_RE.finditer(line)}
+        try:
+            if (not required <= fields.keys() or not LOG_PREFIX_RE.match(line)
+                    or active is None):
+                raise ValueError('missing fields or timestamp')
+            row = {k: (fields[k] if k == 'result' else int(fields[k]))
+                   for k in required}
+            if any(v < 0 for k, v in row.items() if k != 'result'):
+                raise ValueError('negative metric')
+            if row['bytes'] not in (3379, 8676) or row['round'] >= 12:
+                raise ValueError('unsupported size or round')
+            row['run'] = active
+            rows.append(row)
+        except ValueError:
+            bad.append(line)
+    if not rows and not bad and not runs:
+        skip(log, 'LOG:snapshot-append-probe-parsed', '本轮无实尺寸快照 append 探针')
+    else:
+        expect(log, 'LOG:snapshot-append-probe-parsed', not bad,
+               f'解析 {len(rows)} 行，格式异常 {len(bad)} 行')
+    for size in (3379, 8676):
+        name = f'WRITE:snapshot-append-{size}-p90'
+        samples = [r for r in rows if r['bytes'] == size]
+        if bad:
+            expect(log, name, False, '有格式漂移，不能以剩余可解析行验收')
+            continue
+        if any(status not in (None, 'ESP_OK') for status in runs.values()):
+            expect(log, name, False, '探针运行/清理中止；不能以成功的子集验收')
+            continue
+        if not samples:
+            skip(log, name, '缺此尺寸的 append 探针；不能用 52/200 B 外推')
+            continue
+        fields_ok = all(
+            r['result'] == 'ESP_OK' and r['written_bytes'] == size and
+            r['new_object'] == int(r['round'] == 0) and
+            sum(r[k] for k in ('open_us', 'write_us', 'flush_us', 'sync_us',
+                              'close_us')) <= r['total_us'] <=
+            sum(r[k] for k in ('open_us', 'write_us', 'flush_us', 'sync_us',
+                              'close_us')) + 2000
+            for r in samples)
+        rounds = [(r['run'], r['round']) for r in samples]
+        if not fields_ok or len(rounds) != len(set(rounds)):
+            expect(log, name, False, '写入失败/短写/创建位错误/分项不对账/重复 round')
+            continue
+        if (any(status is None for status in runs.values()) or
+                any(sorted(r['round'] for r in samples if r['run'] == run)
+                    != list(range(12)) for run in runs)):
+            skip(log, name, f'{len(runs)} 次运行共 {len(samples)} 笔；缺 END 或每次 12 轮未齐')
+            continue
+        steady = sorted(r['total_us'] for r in samples if r['round'] != 0)
+        per_run = [sorted(r['total_us'] for r in samples
+                          if r['run'] == run and r['round'] != 0) for run in runs]
+        p90 = max(s[(9 * len(s) + 9) // 10 - 1] for s in per_run)
+        clusters = cluster_gap(steady)
+        first = [r['total_us'] / 1000 for r in samples if r['round'] == 0]
+        expect(log, name, p90 < 200000 and len(clusters) == 1,
+               f'首次创建(ms)={first}；每次稳态 n=11，最差运行最近秩 p90='
+               f'{p90 / 1000:.3f} ms（<200 ms），最大 {max(steady) / 1000:.3f} ms；'
+               f'分簇(us)={clusters}（多档拒绝以单一成本验收）；'
+               f'仅探针性能，不代表会话恢复/真实答题已通过')
+
+
+def hil_snapshot_held_probe(log: Log):
+    """Long-held FILE, every write still fflush+fsync; open/close measured apart.
+
+    API success flags and post-close file length are observability checks, not
+    proof of power-loss recovery. Never include close/stat in a commit total.
+    """
+    required = {
+        'open': {'bytes', 'result', 'new_object', 'open_us'},
+        'commit': {'bytes', 'round', 'result', 'write_us', 'flush_us', 'sync_us',
+                   'total_us', 'written_bytes', 'flush_ok', 'sync_attempted', 'sync_ok'},
+        'close': {'bytes', 'result', 'close_us', 'rounds', 'committed_bytes',
+                  'file_bytes', 'stat_us', 'close_ok', 'stat_ok'},
+        'control': {'bytes', 'round', 'result', 'new_object', 'open_us', 'write_us',
+                    'flush_us', 'sync_us', 'close_us', 'total_us', 'written_bytes'},
+    }
+    rows, bad, runs, paired = [], [], {}, set()
+    epoch, serial, active = 0, 0, None
+    for line in log.lines:
+        if BOOT_BANNER_RE.search(line):
+            epoch += 1
+            active = None
+        relevant = probe_profile(line, ('snapshot-held', 'snapshot-paired'))
+        if 'storage bench BEGIN' in line and relevant:
+            serial += 1
+            active = (epoch, serial)
+            runs[active] = None
+            if probe_profile(line, ('snapshot-paired',)):
+                paired.add(active)
+            if not LOG_PREFIX_RE.match(line):
+                bad.append(line)
+        if 'storage bench END' in line and relevant:
+            f = {m.group('k'): m.group('v') for m in KV_RE.finditer(line)}
+            if active is None or 'result' not in f or not LOG_PREFIX_RE.match(line):
+                bad.append(line)
+            else:
+                runs[active] = f['result']
+                active = None
+        kind = None
+        if 'storage snapshot held ' in line:
+            km = re.search(r'storage snapshot held (open|commit|close):', line)
+            if not km:
+                bad.append(line)
+                continue
+            kind = km.group(1)
+        elif active in paired and 'storage snapshot append probe:' in line:
+            kind = 'control'
+        if kind is None:
+            continue
+        fields = {m.group('k'): m.group('v') for m in KV_RE.finditer(line)}
+        try:
+            if (not required[kind] <= fields.keys() or active is None or
+                    not LOG_PREFIX_RE.match(line)):
+                raise ValueError('missing fields/run/timestamp')
+            row = {k: (fields[k] if k == 'result' else int(fields[k]))
+                   for k in required[kind]}
+            if (row['bytes'] not in (3379, 8676) or
+                    any(v < 0 for k, v in row.items() if k not in ('result', 'file_bytes')) or
+                    ('round' in row and row['round'] >= 12)):
+                raise ValueError('unsupported metric')
+            rows.append(dict(row, kind=kind, run=active))
+        except ValueError:
+            bad.append(line)
+    fmt = 'LOG:snapshot-held-probe-parsed'
+    if not rows and not bad and not runs:
+        skip(log, fmt, '无长开句柄快照探针')
+    else:
+        expect(log, fmt, not bad,
+               f'长开事件 {sum(r["kind"] != "control" for r in rows)}，'
+               f'重开对照 {sum(r["kind"] == "control" for r in rows)}，格式异常 {len(bad)}')
+    aborted = any(s not in (None, 'ESP_OK') for s in runs.values())
+
+    def row_ok(r):
+        if r['result'] != 'ESP_OK':
+            return False
+        if r['kind'] == 'open':
+            return r['new_object'] == 1
+        if r['kind'] == 'close':
+            return (r['close_ok'] == r['stat_ok'] == 1 and r['rounds'] <= 12 and
+                    r['file_bytes'] == r['committed_bytes'] == r['rounds'] * r['bytes'])
+        parts = ('write_us', 'flush_us', 'sync_us')
+        if r['kind'] == 'commit':
+            extra_ok = r['flush_ok'] == r['sync_attempted'] == r['sync_ok'] == 1
+        else:
+            parts = ('open_us', 'write_us', 'flush_us', 'sync_us', 'close_us')
+            extra_ok = r['new_object'] == int(r['round'] == 0)
+        return (extra_ok and r['written_bytes'] == r['bytes'] and
+                0 <= r['total_us'] - sum(r[k] for k in parts) <= 2000)
+
+    for size in (3379, 8676):
+        name = f'WRITE:snapshot-held-{size}-p90'
+        samples = [r for r in rows if r['bytes'] == size and r['kind'] != 'control']
+        if bad or aborted:
+            expect(log, name, False, '格式漂移或运行/清理中止，不能拿成功子集验收')
+            continue
+        if not samples:
+            skip(log, name, '没有此尺寸的长开持久提交，不能从重开或其他尺寸外推')
+            continue
+        valid = all(row_ok(r) for r in samples)
+        groups = [[r for r in samples if r['run'] == run] for run in runs]
+        duplicate = any(
+            sum(r['kind'] == 'open' for r in g) > 1 or
+            sum(r['kind'] == 'close' for r in g) > 1 or
+            len([r for r in g if r['kind'] == 'commit']) !=
+            len({r['round'] for r in g if r['kind'] == 'commit'}) for g in groups)
+        if not valid or duplicate:
+            expect(log, name, False, '同步未成功/短写/分项或长度不对账/重复生命周期事件')
+            continue
+        complete = all(
+            len(g) == 14 and sum(r['kind'] == 'open' for r in g) == 1 and
+            sum(r['kind'] == 'close' for r in g) == 1 and
+            sorted(r['round'] for r in g if r['kind'] == 'commit') == list(range(12))
+            for g in groups)
+        if not complete or any(s is None for s in runs.values()):
+            skip(log, name, '缺每次运行的 open→12 次 commit→close/END；未完整测到')
+            continue
+        ordered = all(g[0]['kind'] == 'open' and g[-1]['kind'] == 'close' and
+                      [r['round'] for r in g if r['kind'] == 'commit'] == list(range(12)) and
+                      g[-1]['rounds'] == 12 for g in groups)
+        if not ordered:
+            expect(log, name, False, '句柄生命周期/轮次顺序不符合连续追加协议')
+            continue
+        steady = [[r['total_us'] for r in g if r['kind'] == 'commit' and r['round'] > 0]
+                  for g in groups]
+        p90 = max(sorted(s)[(9 * len(s) + 9) // 10 - 1] for s in steady)
+        clusters = cluster_gap([v for s in steady for v in s])
+        opened = [g[0]['open_us'] / 1000 for g in groups]
+        closed = [g[-1]['close_us'] / 1000 for g in groups]
+        first = [next(r['total_us'] / 1000 for r in g if r['kind'] == 'commit')
+                 for g in groups]
+        expect(log, name, p90 < 200000 and len(clusters) == 1,
+               f'首次 open(ms)={opened}，首次 commit(ms)={first}，最终 close(ms)={closed}；'
+               f'每次稳态 n=11，最差运行 p90={p90 / 1000:.3f} ms（<200 ms），'
+               f'分簇(us)={clusters}；每笔同步且文件长度对账，不代表掉电安全已验')
+    name = 'WRITE:snapshot-held-paired-control'
+    if bad or aborted:
+        expect(log, name, False, '格式漂移或运行中止，不能以子集比较两种策略')
+    elif not paired:
+        skip(log, name, '无同一次运行的交替对照（历史日志不冒充配对实验）')
+    else:
+        groups = [[r for r in rows if r['run'] == run and r['bytes'] == size and
+                   r['kind'] in ('control', 'commit')]
+                  for run in paired for size in (3379, 8676)]
+        expected = [('control' if (rnd + arm) % 2 == 0 else 'commit', rnd)
+                    for rnd in range(12) for arm in range(2)]
+        if any(len(g) != len({(r['kind'], r['round']) for r in g}) or
+               not all(row_ok(r) for r in g) for g in groups):
+            expect(log, name, False, '配对样本重复/短写/同步失败/分项不对账')
+        elif any(len(g) != 24 for g in groups):
+            skip(log, name, '每个尺寸均需 12 对同期样本；本轮未完整测到')
+        else:
+            expect(log, name, all(
+                [(r['kind'], r['round']) for r in g] == expected
+                for g in groups), '两档各 12 对，先后顺序逐轮交替，均成功写满并同步；'
+                   '这是对照完整性，不是任一策略性能达标')
+
+SNAPSHOT_IO_PHASES = {'reopen': ('open', 'write', 'flush', 'sync', 'close'),
+                      'held-open': ('open',), 'held-commit': ('write', 'flush', 'sync'),
+                      'held-close': ('close', 'stat'),
+                      'reserve-open': ('open',), 'reserve-commit': ('write', 'flush', 'sync'),
+                      'reserve-close': ('close', 'stat'), 'reserve-prep': ('prepare',)}
+RESERVE_PROFILES = ('snapshot-gc-control', 'snapshot-gc-prepared')
+SNAPSHOT_PROFILES = ('snapshot', 'snapshot-paired', 'snapshot-held', *RESERVE_PROFILES)
+
+
+def snapshot_expected_parents(runs, selected):
+    expected = set()
+    for run in selected:
+        state = runs[run]
+        if state['profile'] in RESERVE_PROFILES:
+            size, count = state['sizes'][0], state['rounds']
+            expected.update((run, 'reserve-commit', size, rnd) for rnd in range(count))
+            expected.update(((run, 'reserve-open', size, 0), (run, 'reserve-close', size, count)))
+            if state['profile'] == 'snapshot-gc-prepared':
+                expected.add((run, 'reserve-prep', size, 0))
+        else:
+            for size in (3379, 8676):
+                if state['profile'] in ('snapshot', 'snapshot-paired'):
+                    expected.update((run, 'reopen', size, rnd) for rnd in range(12))
+                if state['profile'] in ('snapshot-held', 'snapshot-paired'):
+                    expected.update((run, 'held-commit', size, rnd) for rnd in range(12))
+                    expected.update(((run, 'held-open', size, 0), (run, 'held-close', size, 12)))
+    return expected
+
+
+IDF_RECORD_HEAD_RE = re.compile(r'[IWEDV] \(\d+\) [A-Za-z0-9_.-]+: ')
+SNAPSHOT_RECORD_RE = re.compile(
+    r'^[IWEDV] \(\d+\) (?:storage_io_probe: storage (?:partition|spiffs)|'
+    r'word_store: storage (?:bench|snapshot|gc))\b')
+
+
+def snapshot_probe_records(log: Log):
+    """Frame byte-stream records, not invented/rewritten probe payloads.
+
+    SDK Wi-Fi prints header/body separately: a complete ESP_LOG record can
+    appear after ``wifi:`` or ``state: ...`` on the same physical serial line.
+    Split only at a COMPLETE IDF timestamp+tag header; retain the preceding
+    fragment too, so a torn/malformed probe is never discarded. Each resulting
+    probe must still start with its own header/tag and pass every old contract.
+    This is scoped to the two direct meters; Log.text and other parsers stay raw.
+    """
+    for line in log.lines:
+        heads = list(IDF_RECORD_HEAD_RE.finditer(line))
+        if not heads:
+            yield line
+            continue
+        if heads[0].start():
+            yield line[:heads[0].start()]
+        for index, head in enumerate(heads):
+            end = heads[index + 1].start() if index + 1 < len(heads) else len(line)
+            yield line[head.start():end]
+
+
+def snapshot_record_fields(line: str):
+    # A dict alone would silently overwrite duplicate keys from interleaving.
+    pairs = re.findall(r'\b([a-z][a-z0-9_]*)=([^\s]+)', line)
+    return dict(pairs), len(pairs) == len(dict(pairs))
+
+
+def snapshot_partition_io_data(log: Log):
+    """Pure parser shared by the API and GC-subset meters (no verdict side effects)."""
+    phases = SNAPSHOT_IO_PHASES
+    required = {'kind', 'bytes', 'round', 'phase', 'vfs_us', 'span_us',
+                'scope_ok', 'nested_calls'} | {
+                    f'{op}_{field}' for op in ('read', 'write', 'erase')
+                    for field in ('calls', 'bytes', 'us', 'max_us', 'failures')}
+    rows, parents, runs, bad = {}, {}, {}, []
+    epoch, serial, active, ready, triggered = 0, 0, None, False, False
+    for line in snapshot_probe_records(log):
+        if BOOT_BANNER_RE.search(line):
+            epoch += 1
+            active, ready = None, False
+        # This schema has elf_sha256. The legacy KV_RE intentionally accepts
+        # only letter/underscore keys; do not silently lose digit-bearing keys.
+        f, unique = snapshot_record_fields(line)
+        if ('storage partition' in line or 'storage snapshot' in line or 'storage gc snapshot' in line or
+                'storage bench' in line) and (
+                not unique or SNAPSHOT_RECORD_RE.match(line) is None):
+            bad.append(line)
+        if 'storage partition probe' in line:
+            triggered = True
+            ready = ('storage partition probe READY ' in line and
+                     LOG_PREFIX_RE.match(line) is not None and
+                     f.get('schema') == '1' and f.get('enabled') == '1' and
+                     f.get('scope') == 'task+partition' and f.get('partition') == 'storage' and
+                     bool(f.get('app_version')) and
+                     re.fullmatch(r'[0-9a-fA-F]{16}', f.get('elf_sha256', '')) is not None)
+            if not ready:
+                bad.append(line)
+        relevant = probe_profile(line, SNAPSHOT_PROFILES)
+        if 'storage bench BEGIN' in line and relevant:
+            serial += 1
+            active = (epoch, serial)
+            marked = 'partition_probe' in f
+            runs[active] = {'marked': marked, 'end': None, 'ready': ready,
+                            'profile': f.get('profile'), 'rounds': 12, 'sizes': (3379, 8676)}
+            if f.get('profile') in RESERVE_PROFILES:
+                try:
+                    count, size = int(f['rounds']), int(f['bytes'])
+                    prepared = f['profile'] == 'snapshot-gc-prepared'
+                    if (f.get('reserve_probe') != '1' or count != (48 if prepared else 12) or
+                            size not in (3379, 8676) or int(f['writes']) != count or
+                            int(f['requested_bytes']) != (131072 if prepared else 0)):
+                        raise ValueError('reserve run contract')
+                    runs[active].update(rounds=count, sizes=(size,))
+                except (KeyError, ValueError):
+                    bad.append(line)
+            if marked:
+                triggered = True
+                if f['partition_probe'] != '1' or not ready or not LOG_PREFIX_RE.match(line):
+                    bad.append(line)
+        if 'storage bench END' in line and relevant:
+            if active in runs:
+                runs[active]['end'] = f.get('result')
+                if runs[active]['marked'] and (
+                        f.get('partition_probe') != '1' or 'result' not in f or
+                        not LOG_PREFIX_RE.match(line)):
+                    bad.append(line)
+            active = None
+        kind = next((kind for text, kind in (
+            ('storage snapshot append probe:', 'reopen'),
+            ('storage snapshot held open:', 'held-open'),
+            ('storage snapshot held commit:', 'held-commit'),
+            ('storage snapshot held close:', 'held-close'),
+            ('storage gc snapshot held open:', 'reserve-open'),
+            ('storage gc snapshot held commit:', 'reserve-commit'),
+            ('storage gc snapshot held close:', 'reserve-close'),
+            ('storage gc snapshot prepare:', 'reserve-prep')) if text in line), None)
+        if kind and active in runs and runs[active]['marked']:
+            try:
+                size = int(f['bytes'])
+                rnd = int(f.get('round', f.get('rounds', '0')))
+                key = (active, kind, size, rnd)
+                if key in parents or 'result' not in f:
+                    raise ValueError('duplicate/missing parent')
+                parents[key] = {phase: int(f[phase + '_us']) for phase in phases[kind]}
+                parents[key]['result'] = f['result']
+            except (KeyError, ValueError):
+                bad.append(line)
+        if 'storage partition io' not in line:
+            continue
+        triggered = True
+        try:
+            if ('storage partition io: ' not in line or not required <= f.keys() or
+                    not LOG_PREFIX_RE.match(line) or active not in runs or
+                    not runs[active]['marked']):
+                raise ValueError('missing contract/run/timestamp')
+            row = {k: f[k] if k in ('kind', 'phase') else int(f[k]) for k in required}
+            if (row['kind'] not in phases or row['phase'] not in phases[row['kind']] or
+                    row['bytes'] not in (3379, 8676) or
+                    any(v < 0 for v in row.values() if isinstance(v, int)) or
+                    row['round'] > (runs[active]['rounds'] if row['kind'].endswith('-close')
+                                    else runs[active]['rounds'] - 1) or
+                    (row['kind'] in ('held-open', 'reserve-open', 'reserve-prep') and row['round'] != 0)):
+                raise ValueError('unknown stage/metric')
+            key = (active, row['kind'], row['bytes'], row['round'], row['phase'])
+            if key in rows:
+                raise ValueError('duplicate stage')
+            rows[key] = row
+        except ValueError:
+            bad.append(line)
+    return rows, parents, runs, bad, triggered
+
+
+def hil_snapshot_partition_io(log: Log):
+    """Scoped top-level esp_partition API wall time, NOT chip busy/GC time.
+
+    Rows reconcile with their own VFS phase. Whole-payload requested write bytes
+    make an unlinked wrapper fail rather than produce misleading zero costs.
+    """
+    phases = SNAPSHOT_IO_PHASES
+    rows, parents, runs, bad, triggered = snapshot_partition_io_data(log)
+    fmt, metric = 'LOG:snapshot-partition-io-parsed', 'WRITE:snapshot-partition-io-accounting'
+    if not triggered:
+        skip(log, fmt, '旧日志无分区调用探针；不把缺测当作底层耗时零')
+        skip(log, metric, '无任务+分区过滤的直接 API 计量')
+        return
+    marked = [run for run, state in runs.items() if state['marked']]
+    ended_empty = any(runs[run]['end'] == 'ESP_OK' and
+                      not any(k[0] == run for k in rows) for run in marked)
+    expect(log, fmt, not bad and not ended_empty,
+           f'分区阶段 {len(rows)}，格式异常 {len(bad)}，成功结束但无阶段={ended_empty}')
+    if bad or ended_empty or not marked:
+        expect(log, metric, False, '契约漂移/探针静默；不可当成调用数或耗时零')
+        return
+    if any(runs[run]['end'] not in (None, 'ESP_OK') for run in marked):
+        expect(log, metric, False, '运行/清理中止，不以成功子集归因')
+        return
+    valid = True
+    for key, row in rows.items():
+        parent = parents.get(key[:-1])
+        native = sum(row[op + '_us'] for op in ('read', 'write', 'erase'))
+        valid &= (row['scope_ok'] == 1 and native <= row['span_us'] <= row['vfs_us'] + 2 and
+                  parent is not None and parent.get(row['phase']) == row['vfs_us'])
+        for op in ('read', 'write', 'erase'):
+            count, us, maximum = (row[op + field] for field in ('_calls', '_us', '_max_us'))
+            valid &= (row[op + '_failures'] == 0 and maximum <= us <= maximum * count)
+            if count == 0:
+                valid &= all(row[op + '_' + field] == 0
+                             for field in ('bytes', 'us', 'max_us', 'failures'))
+    if not valid:
+        expect(log, metric, False, 'scope/API 错误、计数不自洽或未与本阶段 VFS 耗时对账')
+        return
+    if any(runs[run]['end'] is None for run in marked):
+        skip(log, metric, '缺 END；不能用进行中/重启截断运行作完整归因')
+        return
+    expected_parents = snapshot_expected_parents(runs, marked)
+    expected = {key + (phase,) for key in expected_parents for phase in phases[key[1]]}
+    if set(rows) != expected or set(parents) != expected_parents:
+        expect(log, metric, False, '成功 END 却缺阶段/父记录，属于探针丢失，不是未触发')
+        return
+    for key, parent in parents.items():
+        if parent['result'] != 'ESP_OK':
+            valid = False
+        if key[1] in ('reopen', 'held-commit', 'reserve-commit'):
+            group = [rows[key + (phase,)] for phase in phases[key[1]]]
+            valid &= (sum(r['write_calls'] for r in group) > 0 and
+                      sum(r['write_bytes'] for r in group) >= key[2])
+    if not valid:
+        expect(log, metric, False, '成功持久提交却无足量分区写请求：wrapper 未接入/过滤错误')
+        return
+    details = []
+    for size in (3379, 8676):
+        for kind in ('reopen', 'held-commit', 'reserve-commit'):
+            group = [r for r in rows.values() if r['bytes'] == size and
+                     r['kind'] == kind and r['round'] > 0]
+            if not group:
+                continue
+            vfs = sum(r['vfs_us'] for r in group)
+            native = sum(r[op + '_us'] for r in group for op in ('read', 'write', 'erase'))
+            costs = '/'.join(f'{op}={sum(r[op + "_us"] for r in group) / 1000:.3f}ms'
+                             f'({sum(r[op + "_calls"] for r in group)}次)'
+                             for op in ('read', 'write', 'erase'))
+            details.append(f'{size}/{kind}: {costs}, outside={(vfs-native)/1000:.3f}ms')
+    expect(log, metric, True, '; '.join(details) +
+           '；均为累计 API wall，非芯片 busy/GC 时间；这是测量对账，不是性能通过')
+
+
+def hil_snapshot_spiffs_gc(log: Log):
+    """GC function wall and API subsets, never additive to the parent API meter.
+
+    No GC work is REQUIRED: a fresh FS may take only fast checks. But successful
+    payloads must trigger the gc_check wrapper, or zero GC is not trustworthy.
+    """
+    fmt, metric = 'LOG:snapshot-spiffs-gc-parsed', 'WRITE:snapshot-spiffs-gc-accounting'
+    native, parents, runs, native_bad, _ = snapshot_partition_io_data(log)
+    state_fields = ('free_before', 'free_after', 'free_min', 'free_max',
+                    'allocated_before', 'allocated_after', 'deleted_before', 'deleted_after')
+    counters = ('gc_check_calls', 'gc_quick_calls', 'gc_nested_calls',
+                'gc_check_us', 'gc_quick_us', 'gc_check_errors', 'gc_quick_errors',
+                'gc_quick_no_deleted', 'fs_seen', 'block_count', 'block_size', 'page_size')
+    required = {'schema', 'kind', 'bytes', 'round', 'phase', 'scope_ok', *state_fields, *counters} | {
+        f'gc_{op}_{field}' for op in ('read', 'write', 'erase') for field in ('calls', 'bytes', 'us')}
+    gc_rows, marked, partition_sizes, bad = {}, set(), {}, []
+    epoch, serial, active, ready_bytes, triggered = 0, 0, None, None, False
+    for line in snapshot_probe_records(log):
+        if BOOT_BANNER_RE.search(line):
+            epoch += 1
+            active, ready_bytes = None, None
+        f, unique = snapshot_record_fields(line)
+        if 'storage spiffs gc' in line and (
+                not unique or SNAPSHOT_RECORD_RE.match(line) is None):
+            bad.append(line)
+        if 'gc_probe' in f:
+            triggered = True
+            if f['gc_probe'] != '1' or LOG_PREFIX_RE.match(line) is None:
+                bad.append(line)
+        if 'storage partition probe' in line:
+            ready_bytes = None
+            if 'gc_probe' in f:
+                try:
+                    ready_bytes = int(f['partition_bytes'])
+                    if ready_bytes <= 0:
+                        raise ValueError('partition size')
+                except (KeyError, ValueError):
+                    bad.append(line)
+        relevant = probe_profile(line, SNAPSHOT_PROFILES)
+        if 'storage bench BEGIN' in line and relevant:
+            serial += 1
+            active = (epoch, serial)
+            if 'gc_probe' in f:
+                marked.add(active)
+                if ready_bytes is None or f.get('partition_probe') != '1':
+                    bad.append(line)
+                else:
+                    partition_sizes[active] = ready_bytes
+        if 'storage bench END' in line and relevant:
+            if active in marked and f.get('gc_probe') != '1':
+                bad.append(line)
+            active = None
+        if 'storage partition io:' in line and active in marked and f.get('gc_probe') != '1':
+            bad.append(line)
+        if 'storage spiffs gc' not in line:
+            continue
+        triggered = True
+        try:
+            if ('storage spiffs gc: ' not in line or not required <= f.keys() or
+                    LOG_PREFIX_RE.match(line) is None or active not in marked or f['schema'] != '1'):
+                raise ValueError('GC schema/run/timestamp')
+            row = {k: f[k] if k in ('kind', 'phase') else int(f[k]) for k in required}
+            if (row['kind'] not in SNAPSHOT_IO_PHASES or
+                    row['phase'] not in SNAPSHOT_IO_PHASES[row['kind']] or
+                    row['bytes'] not in (3379, 8676) or
+                    not 0 <= row['round'] <= (runs.get(active, {}).get('rounds', 0)
+                        if row['kind'].endswith('-close') else runs.get(active, {}).get('rounds', 0) - 1) or
+                    any(v < (-1 if k in state_fields else 0)
+                        for k, v in row.items() if isinstance(v, int))):
+                raise ValueError('GC stage/metric')
+            key = (active, row['kind'], row['bytes'], row['round'], row['phase'])
+            if key in gc_rows:
+                raise ValueError('duplicate GC stage')
+            gc_rows[key] = row
+        except ValueError:
+            bad.append(line)
+    if not triggered:
+        skip(log, fmt, '旧日志无 GC 函数归属探针；不把 read 形状当直接 GC 证据')
+        skip(log, metric, '缺 GC function wall、内部页状态及其 API 子集')
+        return
+    expect(log, fmt, not bad and bool(gc_rows),
+           f'GC 阶段 {len(gc_rows)}，格式异常 {len(bad)}')
+    if bad or native_bad or not gc_rows or not marked or any(run not in runs for run in marked):
+        expect(log, metric, False, 'GC/父探针契约漂移或静默，不接受全零假测量')
+        return
+    valid, geometries = True, {}
+    for key, g in gc_rows.items():
+        n, parent = native.get(key), parents.get(key[:-1])
+        if n is None or parent is None:
+            valid = False
+            continue
+        gc_wall = g['gc_check_us'] + g['gc_quick_us']
+        gc_api = sum(g[f'gc_{op}_us'] for op in ('read', 'write', 'erase'))
+        native_api = sum(n[f'{op}_us'] for op in ('read', 'write', 'erase'))
+        valid &= (g['scope_ok'] == n['scope_ok'] == 1 and
+                  parent.get(g['phase']) == n['vfs_us'] and
+                  native_api <= n['span_us'] <= n['vfs_us'] + 2 and
+                  gc_api <= gc_wall <= n['span_us'] and
+                  g['gc_check_errors'] == g['gc_quick_errors'] == 0 and
+                  g['gc_quick_no_deleted'] <= g['gc_quick_calls'])
+        calls = g['gc_check_calls'] + g['gc_quick_calls']
+        for family in ('check', 'quick'):
+            if g[f'gc_{family}_calls'] == 0:
+                valid &= g[f'gc_{family}_us'] == 0
+        for op in ('read', 'write', 'erase'):
+            valid &= n[op + '_failures'] == 0
+            for field in ('calls', 'bytes', 'us'):
+                valid &= g[f'gc_{op}_{field}'] <= n[f'{op}_{field}']
+            if g[f'gc_{op}_calls'] == 0:
+                valid &= g[f'gc_{op}_bytes'] == g[f'gc_{op}_us'] == 0
+        if calls == 0:
+            valid &= (g['fs_seen'] == 0 and g['gc_nested_calls'] == 0 and
+                      all(g[k] == -1 for k in state_fields) and
+                      g['block_count'] == g['block_size'] == g['page_size'] == 0 and
+                      all(g[f'gc_{op}_{field}'] == 0 for op in ('read', 'write', 'erase')
+                          for field in ('calls', 'bytes', 'us')))
+        else:
+            valid &= (g['fs_seen'] == 1 and all(g[k] >= 0 for k in state_fields) and
+                      g['block_count'] > 0 and g['page_size'] > 0 and
+                      g['block_size'] >= g['page_size'] and
+                      g['block_size'] % max(1, g['page_size']) == 0 and
+                      g['block_count'] * g['block_size'] == partition_sizes.get(key[0]) and
+                      0 <= g['free_min'] <= min(g['free_before'], g['free_after']) and
+                      max(g['free_before'], g['free_after']) <= g['free_max'] <= g['block_count'])
+            physical_pages = g['block_count'] * g['block_size'] // max(1, g['page_size'])
+            valid &= all(g[f'allocated_{when}'] + g[f'deleted_{when}'] <= physical_pages
+                         for when in ('before', 'after'))
+            geometry = (g['block_count'], g['block_size'], g['page_size'])
+            valid &= geometries.setdefault(key[0], geometry) == geometry
+    if not valid:
+        expect(log, metric, False, 'GC scope/错误/状态不自洽，或子集超出自己的 GC/分区阶段')
+        return
+    if any(runs[run]['end'] not in (None, 'ESP_OK') for run in marked):
+        expect(log, metric, False, '运行/清理失败，不用成功子集归因')
+        return
+    if any(runs[run]['end'] is None for run in marked):
+        skip(log, metric, '缺 END；GC 归属仍未完整测到')
+        return
+    expected = {key + (phase,) for key in snapshot_expected_parents(runs, marked)
+                for phase in SNAPSHOT_IO_PHASES[key[1]]}
+    if set(gc_rows) != expected or {k for k in native if k[0] in marked} != expected:
+        expect(log, metric, False, '成功 END 却缺 GC/父阶段，不能降为 SKIP')
+        return
+    for key, parent in parents.items():
+        if key[0] not in marked or key[1] not in ('reopen', 'held-commit', 'reserve-commit'):
+            continue
+        group = [gc_rows[key + (phase,)] for phase in SNAPSHOT_IO_PHASES[key[1]]]
+        valid &= (parent['result'] == 'ESP_OK' and sum(g['gc_check_calls'] for g in group) > 0)
+    if not valid:
+        expect(log, metric, False, '成功 payload 没有 gc_check：包装未接入/归属过滤错误')
+        return
+    details = []
+    for size in (3379, 8676):
+        for kind in ('reopen', 'held-commit', 'reserve-commit'):
+            keys = [k for k in gc_rows if k[2] == size and k[1] == kind and k[3] > 0]
+            if not keys:
+                continue
+            gs = [gc_rows[k] for k in keys]
+            read_total = sum(native[k]['read_us'] for k in keys)
+            gc_read = sum(g['gc_read_us'] for g in gs)
+            seen = [g for g in gs if g['fs_seen']]
+            details.append(f'{size}/{kind}: GC wall='
+                           f'{sum(g["gc_check_us"] + g["gc_quick_us"] for g in gs)/1000:.3f}ms, '
+                           f'GC read={gc_read/1000:.3f}/{read_total/1000:.3f}ms, '
+                           f'free_blocks={min(g["free_min"] for g in seen)}..'
+                           f'{max(g["free_max"] for g in seen)}')
+    expect(log, metric, True, '; '.join(details) +
+           '；GC wall 包含 API 子集，不重复相加；状态为首次入口/末次出口及极值，'
+           '不是每次扫描记录；这是归属对账，不是性能/掉电验收')
+
+
+def snapshot_direct_meters_pass(log: Log):
+    """Reuse the SAME strongest meters without emitting duplicate criteria.
+
+    RESULTS is synchronous report accumulation. Always remove only our temporary
+    tail; selftests can call this checker alone, not depend on a previous PASS.
+    """
+    start = len(RESULTS)
+    try:
+        hil_snapshot_partition_io(log)
+        hil_snapshot_spiffs_gc(log)
+        return len(RESULTS) - start == 4 and all(r[2] == 'PASS' for r in RESULTS[start:])
+    finally:
+        del RESULTS[start:]
+
+
+def hil_snapshot_gc_reserve(log: Log):
+    """Sequential GC-control/reserve trial, not randomized paired proof.
+
+    No recurring maintenance in the 48-commit arm. Both first12 and all48 are
+    unconditional gates: a fast prefix cannot hide reserve exhaustion.
+    Explicit prepared-only headers cover just 8676/prepared, never the control
+    comparison or the missing small size. Legacy full trials still need 4 arms.
+    """
+    fmt, control = 'LOG:snapshot-gc-reserve-parsed', 'WRITE:snapshot-gc-reserve-control'
+    metrics = [control, 'WRITE:snapshot-gc-reserve-maintenance',
+               'WRITE:snapshot-gc-reserve-lifetime'] + [
+        f'WRITE:snapshot-gc-reserve-{size}-{window}-p90'
+        for size in (3379, 8676) for window in ('first12', 'all48')]
+    native, parents, runs, native_bad, _ = snapshot_partition_io_data(log)
+    selected = [k for k, v in runs.items() if v['profile'] in RESERVE_PROFILES]
+    triggered = bool(selected) or any('storage gc reserve experiment' in l or
+                                    'reserve_probe=' in l for l in log.lines)
+    if not triggered:
+        for name in (fmt, *metrics):
+            skip(log, name, '旧日志无一次前置 GC / 连续 48 笔对照，不外推储备寿命')
+        return
+    rows, gc_rows, begins, ends, bad = {}, {}, [], [], []
+    epoch, serial, active = 0, 0, None
+    experiment_active = False
+    modes = {}
+    required = {
+        'reserve-open': {'bytes', 'result', 'new_object', 'open_us'},
+        'reserve-commit': {'bytes', 'round', 'result', 'write_us', 'flush_us', 'sync_us',
+                           'total_us', 'written_bytes', 'flush_ok', 'sync_attempted', 'sync_ok'},
+        'reserve-close': {'bytes', 'result', 'close_us', 'rounds', 'committed_bytes',
+                          'file_bytes', 'stat_us', 'close_ok', 'stat_ok'},
+        'reserve-prep': {'bytes', 'result', 'requested_bytes', 'prepare_us'},
+    }
+    extras = ('lookup_pages', 'data_page_bytes', 'free_data_bytes_before', 'free_data_bytes_after')
+    for line in snapshot_probe_records(log):
+        if BOOT_BANNER_RE.search(line):
+            epoch += 1
+            active = None
+            experiment_active = False
+        f, unique = snapshot_record_fields(line)
+        if 'storage gc reserve experiment' in line:
+            try:
+                if not unique or not SNAPSHOT_RECORD_RE.match(line):
+                    raise ValueError('experiment header')
+                if 'storage gc reserve experiment BEGIN ' in line:
+                    mode = f.get('mode', 'full')
+                    if (mode not in ('full', 'prepared-only') or
+                            (mode == 'prepared-only' and int(f['bytes']) != 8676)):
+                        raise ValueError('experiment mode')
+                    if (experiment_active or active is not None or f.get('schema') != '1' or
+                            int(f['requested_bytes']) != 131072 or
+                            int(f['control_rounds']) != (0 if mode == 'prepared-only' else 12) or
+                            int(f['prepared_rounds']) != 48):
+                        raise ValueError('experiment contract')
+                    begins.append(epoch)
+                    modes[epoch] = mode
+                    experiment_active = True
+                elif 'storage gc reserve experiment END ' in line:
+                    if not experiment_active or active is not None:
+                        raise ValueError('experiment END outside its window')
+                    if (f.get('mode', 'full') != modes[epoch] or
+                            (modes[epoch] == 'prepared-only' and int(f['bytes']) != 8676)):
+                        raise ValueError('experiment END mode')
+                    ends.append((epoch, f['result'], int(f['completed_runs']), int(f['total_ms'])))
+                    experiment_active = False
+                else:
+                    raise ValueError('unknown experiment event')
+            except (KeyError, ValueError):
+                bad.append(line)
+        if 'storage bench BEGIN' in line and probe_profile(line, SNAPSHOT_PROFILES):
+            serial += 1
+            active = (epoch, serial)
+            if active in selected and not experiment_active:
+                bad.append(line)
+        if 'storage bench END' in line and probe_profile(line, SNAPSHOT_PROFILES):
+            if active in selected:
+                try:
+                    if (f.get('reserve_probe') != '1' or int(f.get('bytes', '0')) not in runs[active]['sizes']):
+                        raise ValueError('END reserve contract')
+                except ValueError:
+                    bad.append(line)
+            active = None
+        if active not in selected:
+            if 'storage gc snapshot' in line:
+                bad.append(line)
+            continue
+        kind = next((k for text, k in (
+            ('storage gc snapshot held open:', 'reserve-open'),
+            ('storage gc snapshot held commit:', 'reserve-commit'),
+            ('storage gc snapshot held close:', 'reserve-close'),
+            ('storage gc snapshot prepare:', 'reserve-prep')) if text in line), None)
+        if kind:
+            try:
+                if not unique or not SNAPSHOT_RECORD_RE.match(line) or not required[kind] <= f.keys():
+                    raise ValueError('parent contract')
+                row = {k: v if k == 'result' else int(v) for k, v in f.items() if k in required[kind]}
+                rnd = row.get('round', row.get('rounds', 0))
+                key = (active, kind, row['bytes'], rnd)
+                if key in rows or any(v < 0 for k, v in row.items() if k != 'result'):
+                    raise ValueError('duplicate/negative parent')
+                rows[key] = row
+            except (KeyError, ValueError):
+                bad.append(line)
+        if 'storage spiffs gc:' in line:
+            try:
+                if not unique or not set(extras) <= f.keys():
+                    raise ValueError('clean capacity schema')
+                key = (active, f['kind'], int(f['bytes']), int(f['round']), f['phase'])
+                if key in gc_rows:
+                    raise ValueError('duplicate GC row')
+                gc_rows[key] = {k: v if k in ('kind', 'phase') else int(v) for k, v in f.items()}
+            except (KeyError, ValueError):
+                bad.append(line)
+    expect(log, fmt, not bad and not native_bad and bool(rows),
+           f'实验父记录={len(rows)}，clean-state 阶段={len(gc_rows)}，格式异常={len(bad)+len(native_bad)}')
+    if bad or native_bad or not selected or not rows:
+        for name in metrics:
+            expect(log, name, False, '实验契约漂移/静默，不能以剩余成功样本验收')
+        return
+    prepared_only = bool(modes) and set(modes.values()) == {'prepared-only'}
+    if prepared_only:
+        unavailable = [control] + [f'WRITE:snapshot-gc-reserve-3379-{w}-p90'
+                                   for w in ('first12', 'all48')]
+        for name in unavailable:
+            skip(log, name, '显式单组补测只含 8676/prepared48；未测 control/3379，不是四组对照通过')
+        metrics = [name for name in metrics if name not in unavailable]
+    if not ends:
+        for name in metrics:
+            skip(log, name, '缺 experiment END，不能只用快的前缀验收')
+        return
+    epochs = sorted({k[0] for k in selected})
+    complete = (begins == epochs and [e[0] for e in ends] == epochs and
+                len(set(modes.values())) == 1 and
+                all(e[1] == 'ESP_OK' and e[2] == (1 if prepared_only else 4) and e[3] >= 0
+                    for e in ends))
+    expected_order = ([(8676, 'snapshot-gc-prepared')] if prepared_only else
+                      [(size, profile) for size in (3379, 8676) for profile in RESERVE_PROFILES])
+    complete &= all([(runs[k]['sizes'][0], runs[k]['profile']) for k in selected if k[0] == ep]
+                    == expected_order for ep in epochs)
+    complete &= all(runs[k]['end'] == 'ESP_OK' for k in selected)
+    if not complete or not snapshot_direct_meters_pass(log):
+        for name in metrics:
+            expect(log, name, False, '需本模式完整序列、experiment END 及两套直接计量全部 PASS；'
+                   'full 仍需四组，prepared-only 只允许 8676/prepared48 一组')
+        return
+    expected = snapshot_expected_parents(runs, selected)
+    valid = set(rows) == expected and {k[:-1] for k in gc_rows} == expected
+    reserve_ok = {}
+    for run in selected:
+        size, count = runs[run]['sizes'][0], runs[run]['rounds']
+        sequence = [(run, 'reserve-open', size, 0)]
+        if runs[run]['profile'] == 'snapshot-gc-prepared':
+            sequence.append((run, 'reserve-prep', size, 0))
+        sequence += [(run, 'reserve-commit', size, rnd) for rnd in range(count)]
+        sequence.append((run, 'reserve-close', size, count))
+        valid &= [key for key in rows if key[0] == run] == sequence
+    for key, g in gc_rows.items():
+        if not g['fs_seen']:
+            valid &= (g['lookup_pages'] == g['data_page_bytes'] == 0 and
+                      g['free_data_bytes_before'] == g['free_data_bytes_after'] == -1)
+        else:
+            pages_per_block = g['block_size'] // g['page_size']
+            valid &= (0 < g['lookup_pages'] < pages_per_block and
+                      0 < g['data_page_bytes'] <= g['page_size'])
+            for when in ('before', 'after'):
+                clean = ((pages_per_block - g['lookup_pages']) * (g['block_count'] - 2) -
+                         g[f'allocated_{when}'] - g[f'deleted_{when}']) * g['data_page_bytes']
+                valid &= clean == g[f'free_data_bytes_{when}']
+    for key, row in rows.items():
+        valid &= row['result'] == 'ESP_OK'
+        if key[1] == 'reserve-open':
+            valid &= row['new_object'] == 1
+        elif key[1] == 'reserve-commit':
+            valid &= (row['written_bytes'] == key[2] and
+                      row['flush_ok'] == row['sync_attempted'] == row['sync_ok'] == 1 and
+                      0 <= row['total_us'] - sum(row[p + '_us'] for p in ('write', 'flush', 'sync')) <= 2000)
+        elif key[1] == 'reserve-close':
+            count = runs[key[0]]['rounds']
+            valid &= (row['rounds'] == count and row['stat_ok'] == row['close_ok'] == 1 and
+                      row['file_bytes'] == row['committed_bytes'] == count * key[2])
+        else:
+            g = gc_rows[key + ('prepare',)]
+            valid &= (row['requested_bytes'] == 131072 and g['gc_check_calls'] == 1 and
+                      g['fs_seen'] == 1)
+            reserve_ok[key[0]] = (g['free_after'] > 3 and
+                                  g['free_data_bytes_after'] >= row['requested_bytes'])
+    if not valid:
+        for name in metrics:
+            expect(log, name, False, '短写/同步/长度/clean-state/阶段顺序不自洽，或前置 GC 未建立请求的储备')
+        return
+    if not prepared_only:
+        expect(log, control, all(reserve_ok.values()),
+               '同版同分区：两档各 control12→一次维护→prepared48；顺序对照，不冒充随机配对；'
+               f'前置储备成立={sum(reserve_ok.values())}/{len(reserve_ok)}，SDK 成功不等于快路径储备')
+    maintenance, lifetime = [], []
+    for run in selected:
+        size = runs[run]['sizes'][0]
+        count = runs[run]['rounds']
+        keys = [(run, 'reserve-commit', size, rnd) for rnd in range(count)]
+        samples = [rows[k]['total_us'] for k in keys]
+        p90 = lambda s: sorted(s)[(9 * len(s) + 9) // 10 - 1] / 1000
+        if runs[run]['profile'] == 'snapshot-gc-control':
+            lifetime.append(f'{size}/control: n=12 p90={p90(samples):.3f}ms')
+            continue
+        prep_key = (run, 'reserve-prep', size, 0)
+        prep, g = rows[prep_key], gc_rows[prep_key + ('prepare',)]
+        maintenance.append(f'{size}: SDK wall={prep["prepare_us"]/1000:.3f}ms, '
+                           f'free_blocks={g["free_before"]}→{g["free_after"]}, '
+                           f'clean_bytes={g["free_data_bytes_before"]}→{g["free_data_bytes_after"]}, '
+                           f'GC API read={g["gc_read_us"]/1000:.3f}ms, erase={g["gc_erase_calls"]}次, '
+                           f'储备成立={int(reserve_ok[run])}')
+        work = [rnd for rnd, key in enumerate(keys) if any(
+            gc_rows[key + (phase,)][f'gc_{op}_calls'] > 0
+            for phase in ('write', 'flush', 'sync') for op in ('read', 'write', 'erase'))]
+        lifetime.append(f'{size}/prepared: 首次再次发生 GC I/O round={work[0] if work else "未见(仅观察48笔)"}; '
+                        f'有 GC I/O={len(work)}/48, n=48 p90={p90(samples):.3f}ms')
+        for window, values in (('first12', samples[:12]), ('all48', samples)):
+            clusters = cluster_gap(values)
+            expect(log, f'WRITE:snapshot-gc-reserve-{size}-{window}-p90',
+                   reserve_ok[run] and p90(values) < 200 and len(clusters) == 1,
+                   f'n={len(values)} p90={p90(values):.3f}ms (<200), max={max(values)/1000:.3f}ms, '
+                   f'分簇(us)={clusters}, 储备成立={int(reserve_ok[run])}; '
+                   '每笔同步，维护成本另计，不是恢复/正式方案验收')
+    expect(log, 'WRITE:snapshot-gc-reserve-maintenance', True,
+           '; '.join(maintenance) + '；计量 PASS，不代表真实睡眠预算允许，不重复相加包含时间')
+    expect(log, 'WRITE:snapshot-gc-reserve-lifetime', True,
+           '; '.join(lifetime) + '；寿命仅限该序列，未见耗尽不外推无限；其他事务仍可消耗储备')
+
 
 def hil_p0_wifi(log: Log):
     """c93800c — wifi legacy 迁移（Codex 评论 2）。
@@ -1346,21 +2399,62 @@ def hil_storage_bench(log: Log):
     # Scope is deliberately narrow: only `storage-bench`. The pack and cloud
     # holders legitimately outlive a download by minutes and would make a
     # blanket check cry wolf on a healthy device.
-    ends = [int(m.group('at_ms')) for m in BENCH_END_RE.finditer(log.text)]
-    leaked = [l for l in log.leases
-              if l['holder'] == 'storage-bench' and ends and l['at_ms'] > max(ends)]
-    if not ends:
+    reserve_markers = any('storage gc reserve experiment' in line for line in log.lines)
+    # The lease covers the WHOLE experiment (four arms or prepared-only), not
+    # a sub-arm END. Reboot clocks and observation tails must not be mixed.
+    ends, leaked, epoch, final_by_epoch = [], [], 0, {}
+    last_by_epoch, warning_by_epoch = {}, {}
+    malformed_end = False
+    selected_end = ('storage gc reserve experiment END' if reserve_markers else 'storage bench END')
+    for line in snapshot_probe_records(log):
+        if BOOT_BANNER_RE.search(line):
+            epoch += 1
+        tm = LOG_PREFIX_RE.match(line)
+        if tm:
+            at = int(tm.group(1))
+            last_by_epoch[epoch] = max(at, last_by_epoch.get(epoch, 0))
+        if selected_end in line:
+            if tm and SNAPSHOT_RECORD_RE.match(line):
+                at = int(tm.group(1))
+                ends.append(at)
+                final_by_epoch[epoch] = at
+            else:
+                malformed_end = True
+        for m in LEASE_RE.finditer(line):
+            l = {k: v if k in ('tag', 'blocker', 'holder') else int(v)
+                 for k, v in m.groupdict().items()}
+            if l['holder'] != 'storage-bench':
+                continue
+            warning_by_epoch[epoch] = l['at_ms']
+            if epoch in final_by_epoch and l['at_ms'] > final_by_epoch[epoch]:
+                leaked.append(l)
+    if malformed_end:
+        expect(log, 'BENCH:lease-released', False, 'bench/experiment END 时间戳/日志头漂移，不借分组 END 冒充收尾')
+    elif not ends:
         skip(log, 'BENCH:lease-released',
-             '本轮 bench 没有 END 标记（只跑到 begin），无从判断 lease 是否归还')
-    elif not leaked:
-        expect(log, 'BENCH:lease-released', True,
-               f'bench 在 {max(ends)} ms 结束，此后再无 storage-bench 租约告警')
-    else:
+             '本轮 bench/总实验没有 END 标记，无从判断 lease 是否归还')
+    elif leaked:
         worst = max(leaked, key=lambda l: l['held'])
         expect(log, 'BENCH:lease-released', False,
                f'bench 已于 {max(ends)} ms 结束，但 {len(leaked)} 条 storage-bench 租约'
                f'告警出现在其后（最晚一条 held_ms={worst["held"]}，'
                f'日志时钟 {worst["at_ms"]} ms）⇒ 租约没还，深睡被永久挡住')
+    else:
+        # sleep_coordinator.cpp repeats a holder's warning no more often than
+        # once per 60 s. Silence before that holder's next gate proves nothing.
+        # No earlier warning: conservatively observe a full 60 s after END.
+        gates = {ep: max(at, warning_by_epoch.get(ep, at) + 60000)
+                 for ep, at in final_by_epoch.items()}
+        missing = [(ep, last_by_epoch.get(ep, 0), gate)
+                   for ep, gate in gates.items() if last_by_epoch.get(ep, 0) <= gate]
+        if missing:
+            skip(log, 'BENCH:lease-released',
+                 f'END 后无告警但未跨该启动的下一告警门(epoch,last_ms,gate_ms)={missing}；'
+                 '不是租约已释放的证据')
+        else:
+            expect(log, 'BENCH:lease-released', True,
+                   f'bench 在 {max(ends)} ms 结束，各启动已跨下一告警门 {gates} 且无后续告警；'
+                   '这是告警代理，不是直接 holder=0/深睡恢复验收')
 
     # --- 4. bench 不能把真实流量弄丢 ---------------------------------------
     # 第一条写法是错的，被指出后改掉：bench 是 20 笔串行事务，第 N 笔的
@@ -2189,7 +3283,8 @@ def hil_nvs_stats_measured(log: Log):
     if not rows:
         skip(log, 'WRITE:nvs-entry-budget-measured',
              '本轮没有 `nvs stats:` 行。§五之十 的 NVS 算术（4 页 × 126 = 504 条、'
-             '21.2%/54.2% 占比）**至今纯属推导，没有实测支撑**——这是 peer 列的'
+             '21.4%/54.8% 占比）在**本轮缺少实测字段**，不能从日志缺行推断历史上'
+             '从未测过，也不能推断镜像没有插桩——这是 peer 列的'
              '第一个"③ 不测就没法定夺"项：烧一版带 `nvs_get_stats` 的构建即可')
         return
     last = rows[-1]
@@ -2310,76 +3405,37 @@ def hil_nvs_stats_measured(log: Log):
 
 
 def hil_nvs_entry_budget(log: Log):
-    """NVS 条目预算的设计门禁：把"某个载荷能不能放 NVS"变成可执行的断言。
+    """检查实际 NVS blob，而不是把 SPIFFS AtomicWrite 假装成 NVS 写入。
 
-    WHY THIS EXISTS: peer 的 §五之十 决定把 52 B 游标迁 NVS、快照留在 SPIFFS 追加
-    日志上。这个决定依赖一条他们从 IDF 源码推出来的算术，我独立复核过（2026-10-06）：
-
-    1. 一个 blob 的条目 = 1 + ceil(dataSize / 32) **再加 1 条定长 BLOB_IDX**
-       —— nvs_page.cpp:186-191（数据项）+ nvs_storage.cpp:351-361（索引项）
-       「再加 1」这一项我第一版漏了，1006.10 的实测 `used_entries` 把它抓了出来：
-       52 B 我算 3 条，实测每笔涨 **4** 条。见 nvs_entries() 处的注释。
-    2. 分区预算 = 4 页 × 126 条 = **504 条** —— partitions/16m.csv:3 是
-       `nvs ... 0x9000, 0x4000`；NVS_CONST_ENTRY_COUNT=126、页 4096 B
-    3. 单 blob 硬顶 = min(pageCount-1, 127) × 4000 = **12000 B**
-       —— nvs_storage.cpp:282-290 `dataSize > max_pages * Page::CHUNK_MAX_SIZE`
-
-    于是： 52 B → 3 条（0.6%，可迁）/ **3379 B → 107 条（21.2%）**
-    / **8676 B → 273 条（54.2%）**。peer 三个数我逐条对上，一个不差。
-
-    所以这是一条**现在就跑**的判据（只用已有的 `atomic write: bytes=`，不等新探针）：
-    它把"快照迁 NVS"这条路直接判掉。比 peer 强调的更硬——他们的重点在
-    "空闲页掉到 2 以下后每次答题付一次寄生存活+4096 B 擦除、页耗尽则
-    requestNewPage 返回 ESP_ERR_NVS_INVALID_STATE"，而 8676 B 连**单个 key 都
-    装不下**（12000 B 上限内但占 54.2%；超过 12000 B 则 ESP_ERR_NVS_VALUE_TOO_LONG）。
-
-    FAIL 的语义是**设计违规**，不是设备坏了：某个载荷占分区超 25% 就不该走 NVS。
-    阈值 25%：52 B 是 0.6%，快照两个尺寸是 21.2%/54.2%，中间没有自然分界，
-    取 25% 让 3379 B 判 FAIL——它虽然装得下，但一次就吃掉五分之一分区，
-    且旧值不会立即释放（NVS 无 delete-in-place，旧条目靠页级 GC）。
+    保留 25% 预算门槛；它不单独禁止 3379 B（21.4%），不能冒充两层落点协议。
+    跨页条目数是最佳分块下界，不推断实际 GC 次数或页耗尽。
     """
-    if not log.probes:
-        skip(log, 'WRITE:nvs-entry-budget',
-             '本轮无 `atomic write:` 行，判不出载荷分布')
+    name = 'WRITE:nvs-entry-budget'
+    heads = [line for line in log.lines if 'nvs write:' in line]
+    if not heads:
+        skip(log, name, '无实际 `nvs write:` 行；SPIFFS 载荷仅可用于假设容量分析')
+        return
+    if len(heads) != len(log.nvs_writes) or any(
+            not {'bytes', 'key', 'changed'} <= w.keys() for w in log.nvs_writes):
+        expect(log, name, False, 'NVS 写日志格式漂移，缺 bytes/key/changed 或时间戳')
+        return
+    writes = [w for w in log.nvs_writes if w['bytes'] > 0]
+    if not writes:
+        skip(log, name, '仅擦除行（bytes=0），没有实际 blob 载荷')
         return
     kShareLimit = 0.25
-
-    worst_share, worst_bytes, over_cap = 0.0, None, []
-    for p in log.probes:
-        n = p['bytes']
-        entries = nvs_entries(n)
-        share = entries / kNvsBudget
-        if share > worst_share:
-            worst_share, worst_bytes = share, n
-        if n > kNvsSingleBlobCap:
-            over_cap.append(n)
-    if worst_bytes is None:
-        skip(log, 'WRITE:nvs-entry-budget', '有 `atomic write:` 行但字节数缺失')
-        return
+    worst = max(writes, key=lambda w: w['bytes'])
+    worst_bytes = worst['bytes']
     worst_entries = nvs_entries(worst_bytes)
+    worst_share = worst_entries / kNvsBudget
     detail = (
-        f'NVS 分区 {kNvsSizeBytes} B = {kNvsPages} 页 × '
-        f'{kNvsEntryCountPerPage} 条 = {kNvsBudget} 条；单 blob 硬顶 '
-        f'{kNvsSingleBlobCap} B'
-        f'（nvs_storage.cpp:282-290）。本轮最大载荷 {worst_bytes} B ⇒ '
-        f'{worst_entries} 条 = **分区 {worst_share:.1%}**。'
-        f'对照：52 B 游标 = {nvs_entries(kSessionCursorBytes)} 条 = '
-        f'{nvs_entries(kSessionCursorBytes) / kNvsBudget:.1%}'
-        f'（迁 NVS 的正确用法）、'
-        f'3379 B = {nvs_entries(3379)} 条 = {nvs_entries(3379) / kNvsBudget:.1%}、'
-        f'8676 B = {nvs_entries(8676)} 条 = '
-        f'{nvs_entries(8676) / kNvsBudget:.1%}。')
-    if over_cap:
-        detail += (f' ⚠️ {len(over_cap)} 笔超过单 blob 硬顶（最大 {max(over_cap)} B）'
-                   f'⇒ 它们连一个 NVS key 都装不下。')
-    ok = worst_share <= kShareLimit and not over_cap
-    if not ok:
-        detail += (f' ⇒ **超过 {kShareLimit:.0%} 的载荷不许迁 NVS**：'
-                   f'它会让每次答题付一次"寄生存活条目 + 4096 B 擦除"，'
-                   f'空闲页掉到 2 以下后 requestNewPage 直接返回 '
-                   f'ESP_ERR_NVS_INVALID_STATE —— 终点是**答题写失败**，'
-                   f'不只是"答题慢"。')
-    expect(log, 'WRITE:nvs-entry-budget', ok, detail)
+        f"实际 NVS n={len(writes)}，最大 key={worst['key']} {worst_bytes} B ⇒ "
+        f'至少 {worst_entries} 条/{kNvsBudget} 条 = {worst_share:.1%}；'
+        f'单 blob 上限 {kNvsSingleBlobCap} B，预算门槛 {kShareLimit:.0%}。'
+        f'对照（假设容量，非本轮 NVS 写）：3379 B 至少 {nvs_entries(3379)} 条，'
+        f'8676 B 至少 {nvs_entries(8676)} 条。')
+    expect(log, name, worst_share <= kShareLimit and
+           worst_bytes <= kNvsSingleBlobCap, detail)
 
 
 def hil_append_open_split(log: Log):
@@ -2404,7 +3460,7 @@ def hil_append_open_split(log: Log):
     if not pairs:
         skip(log, 'WRITE:append-open-vs-fopen',
              '本轮没有同时带 `append_open_ms=` 与 `append_ms=` 的行'
-             '（新探针未进这个构建；契约见 doc §五之十 第 6 节）')
+             '（日志未覆盖该测量，不能据此推断探针未进镜像；契约见 doc §五之十 第 6 节）')
         return
     opens = [int(p['append_open_ms']) for p in pairs]
     fp = [p['fopen'] for p in log.probes if p.get('fopen')]
@@ -2534,9 +3590,26 @@ def hil_log_format_drift(log: Log):
 
 def hil_stability(log: Log):
     """跨批次通用：不崩、不重启循环、栈不爆。"""
-    if log.boots > 1:
+    # 启动数取 **bootloader 分区表行**，不取 `opened COM`（后者是监听器事件）。
+    # 0 条 ≠ 1 次启动：可能是抓取被截断、也可能整份日志只有一段没有冷启。
+    # 这种时候说"没测到"，不要默认它是正常的单次启动。
+    if log.boots == 0:
+        skip(log, 'STAB:no-reboot-loop',
+             '本轮没有一条 `boot: End of partition table` ⇒ **设备启动次数没测到**'
+             '（抓取被截断，或这段日志不含冷启）。别把它读成"启动 1 次、正常"')
+    else:
+        detail = (f'{log.boots} 次设备启动（数 `boot: End of partition table`，'
+                  f'USB/软件复位也会出现，不证明真实断电）')
+        if log.monitor_attaches:
+            detail += (f'；监听器附着 {log.monitor_attaches} 次'
+                       f'（`[HH:mm:ss] opened COM*` 或 '
+                       f'`[HH:mm:ss] listener attached: COM*`，'
+                       f'**这是脚本连串口的次数，不是设备启动**——两者在多数日志里'
+                       f'恰好相等，这正是旧判据把 12/14 次重启读成 1 次的原因。'
+                       f'对端 2026-10-06 把 emitter 从裸 `opened COM7` 改名成 '
+                       f'`listener attached: COM7`，就是为了让这行自证身份）')
         expect(log, 'STAB:no-reboot-loop', log.boots <= 2,
-               f'{log.boots} 次启动（>2 视为重启循环）')
+               detail + '（>2 视为重启循环）')
     expect(log, 'STAB:no-stack-overflow',
            not log.has('stack overflow in task'), '无任务栈溢出')
     if log.hwm:
@@ -2544,9 +3617,923 @@ def hil_stability(log: Log):
                f'最低 HWM {min(log.hwm)}B（>2KB 余量）')
 
 
+# --------------------------------------------------------------- 判据自检 --
+
+# WHY THIS EXISTS: 2026-10-06 我修一个假绿时新造了一个假绿（`MONITOR_ATTACH_RE`
+# 漏 `re.M`），而它在 19 份历史日志上全显示 1、看着完全正常——因为那些日志的
+# **第一行恰好就是 attach 行**，"只匹配开头那一行"和"匹配所有行"在这整个语料上
+# **恒等**。当时唯一的证据是一份写在 `/tmp` 的合成日志，而 `/tmp` 会被清：
+# 下一个会话拿不到它，同一个错就能再静默一年。
+# 所以把那几种合成形状**固化进判据自己**，`--selftest` 跑。
+#
+# 三条铁律（都是从这次的事里学来的，写在这儿免得忘）：
+#   1. **行锚定模式的夹具必须多行**——单行字符串永远触发不了 `^` 的行语义；
+#   2. **且第一行必须是不匹配行**——否则"只匹配第一行"和"匹配所有行"又恒等；
+#   3. **每个夹具都要有一个"已知答案"**，不能只断言"不报错"。
+SELFTEST_ATTACH_SHAPE = """[02:10:00] monitoring COM7 @ 115200 bps, log: serial-COM7-021000.log
+I (99) boot: End of partition table
+[02:10:01] listener attached: COM7
+I (1200) wqn_storage: nvs write: key=cur_rev bytes=52 total_ms=3 changed=1
+[02:10:02] listener attached: COM7
+I (4200) wqn_storage: nvs write: key=cur_int bytes=52 total_ms=2 changed=1
+[02:40:00] listener attached: COM7
+I (99) boot: End of partition table
+[02:40:09] COM7 unavailable: The port 'COM7' does not exist. Retrying in 1s...
+"""
+
+# 同一形状的**旧 emitter** 版本：producer 改名后判据仍然要认历史那半。
+SELFTEST_ATTACH_SHAPE_OLD = SELFTEST_ATTACH_SHAPE.replace(
+    'listener attached: COM7', 'opened COM7')
+
+
+def selftest():
+    """`python3 hil_check.py --selftest`：拿已知答案的合成输入验判据自己。
+
+    这不是产品测试，是**狼来了判据的自检**：它验的是"判据在该出声的时候会不会出声"。
+    2026-10-06 之前没有它，于是 `STAB:no-reboot-loop` 在 1004.2 / 1005.7crash 上
+    连门都不进（判据静默不触发，比假 PASS 更难发现），而这个失效模式只有一个
+    `/tmp` 里的合成日志能抓住。
+    """
+    ok = 0
+    bad = []
+
+    def check(name, got, want):
+        nonlocal ok
+        if got == want:
+            ok += 1
+            print(f'  [PASS] {name:<44} {got}')
+        else:
+            bad.append(name)
+            print(f'  [FAIL] {name:<44} got {got!r}, want {want!r}')
+
+    print('—— hil_check 自检：合成形状 × 已知答案 ——')
+
+    # 1. 冷启数必须只认 bootloader 分区表行，且**不被 attach 行污染**。
+    log = Log.from_text(SELFTEST_ATTACH_SHAPE, '<selftest>')
+    check('boots = 分区表行数（2），不吃 attach', log.boots, 2)
+    check('attaches = 3（新 emitter，首行不是 attach）',
+          log.monitor_attaches, 3)
+
+    # 2. 同一个形状换旧 emitter，两句都要认——改名不能让历史归零。
+    #    ⚠️ 而且**只有这个夹具能抓住启动数的回归**：把 boots 退回最初的
+    #    `text.count('opened COM') or …` 时，上面的新 emitter 形状上
+    #    `count('opened COM') == 0`，`or` 恰好回落到分区表行数 ⇒ **答案是对的**，
+    #    又是"碰巧相等"。旧 emitter 形状有 3 个 `opened COM7` 而只有 2 次冷启，
+    #    那一份才把它照出来。所以这个夹具**不能当作冗余删掉**。
+    log_old = Log.from_text(SELFTEST_ATTACH_SHAPE_OLD, '<selftest-old>')
+    check('attaches = 3（旧 emitter 同样认）', log_old.monitor_attaches, 3)
+    check('boots 不随 emitter 变', log_old.boots, 2)
+
+    # 3. 第一行就是 attach 行时，答案必须**一样**——这就是 `re.M` 的守门测试。
+    first_attach = ('[02:10:00] opened COM7\n'
+                    'I (99) boot: End of partition table\n'
+                    '[02:11:00] opened COM7\n'
+                    'I (99) boot: End of partition table\n')
+    lf = Log.from_text(first_attach, '<selftest-first-attach>')
+    check('首行就是 attach：boots 仍是 2', lf.boots, 2)
+    check('首行就是 attach：attaches 仍是 2（不是 1）', lf.monitor_attaches, 2)
+
+    # 4. 字符串型 key=value 不能被数字型解析器丢掉（它曾把 3 个 key 印成 key=?）。
+    log2 = Log.from_text(
+        'I (6359) wqn_storage: nvs write: key=cur_rev bytes=52 total_ms=3 changed=1\n'
+        'I (6359) wqn_storage: nvs stats: used_entries=195 free_entries=309 '
+        'available_entries=183 total_entries=504\n'
+        'I (127459) wqn_storage: nvs write: key=cur_int bytes=52 total_ms=6 changed=1\n'
+        'I (127459) wqn_storage: nvs stats: used_entries=199 free_entries=305 '
+        'available_entries=179 total_entries=504\n', '<selftest-kv>')
+    check('nvs write 解析出 2 笔', len(log2.nvs_writes), 2)
+    check('key 名保住了（不是 ?）',
+          [w.get('key') for w in log2.nvs_writes], ['cur_rev', 'cur_int'])
+
+    # 5. 墙钟前缀的状态行**不能**被设备时间戳正则吃掉（监听器行的守门测试）。
+    check('LOG_PREFIX_RE 不匹配墙钟前缀行',
+          bool(LOG_PREFIX_RE.match('[02:10:00] opened COM7')), False)
+    check('LOG_PREFIX_RE 匹配设备行',
+          bool(LOG_PREFIX_RE.match('I (1200) wqn_storage: nvs write: key=cur_rev')), True)
+
+    # 6. 双峰样本不许被压成一个中位数（`cluster_gap` 的守门测试）。
+    cl = cluster_gap([7, 8, 6, 9, 387, 426, 424, 434])
+    check('双峰被分成 2 簇（不是 1 个）', len(cl), 2)
+
+    # 7. 判据端到端：同一份合成日志上，该 FAIL 的必须 FAIL。
+    RESULTS.clear()
+    hil_stability(log)
+    verdicts = {n: k for _p, n, k, _o, _d in RESULTS}
+    check('合成日志 2 次冷启 ⇒ no-reboot-loop PASS',
+          verdicts.get('STAB:no-reboot-loop'), 'PASS')
+    RESULTS.clear()
+    hil_stability(Log.from_text(
+        ''.join(f'I (99) boot: End of partition table\n' for _ in range(14)),
+        '<selftest-crash>'))
+    verdicts = {n: k for _p, n, k, _o, _d in RESULTS}
+    check('14 次冷启 ⇒ no-reboot-loop FAIL（门进得去）',
+          verdicts.get('STAB:no-reboot-loop'), 'FAIL')
+    RESULTS.clear()
+    hil_stability(Log.from_text('I (1200) wqn_ui: hello\n', '<selftest-noboot>'))
+    verdicts = {n: k for _p, n, k, _o, _d in RESULTS}
+    check('0 条分区表 ⇒ SKIP（不是默认"启动 1 次"）',
+          verdicts.get('STAB:no-reboot-loop'), 'SKIP')
+    RESULTS.clear()
+
+    def verdict(fn, text, name):
+        RESULTS.clear()
+        fn(Log.from_text('fixture preamble (not a device line)\n' + text))
+        return {n: k for _p, n, k, _o, _d in RESULTS}.get(name)
+
+    queue_name = 'WRITE:word-commit-queue-wait'
+    def commit(t=10000, wait=4479):
+        return (f'I ({t}) storage_service: storage transaction complete: request=151 '
+                f'owner=word-observation-commit queue_wait_ms={wait} '
+                'elapsed_ms=15 result=ESP_OK\n')
+
+    check('无 save 的答题排队 4479 ms 必须 FAIL',
+          verdict(hil_word_commit_queue, commit(), queue_name), 'FAIL')
+    check('排队 499 ms PASS',
+          verdict(hil_word_commit_queue, commit(wait=499), queue_name), 'PASS')
+    check('排队 500 ms 边界 FAIL',
+          verdict(hil_word_commit_queue, commit(wait=500), queue_name), 'FAIL')
+    check('无答题 SKIP', verdict(hil_word_commit_queue, '', queue_name), 'SKIP')
+    bench = ('I (5000) word_store: storage bench BEGIN profile=snapshot\n'
+             'I (9000) word_store: storage bench END total_ms=4000\n')
+    check('完成在 END 后、入队在 bench 内仍剔除',
+          verdict(hil_word_commit_queue, bench + commit(), queue_name), 'SKIP')
+    check('bench 后真实排队不被剔除',
+          verdict(hil_word_commit_queue, bench + commit(t=20000), queue_name), 'FAIL')
+    check('未结束 bench 不会抹掉更早的排队失败', verdict(
+        hil_word_commit_queue, commit() +
+        'I (15000) word_store: storage bench BEGIN\n', queue_name), 'FAIL')
+    check('重启清空前一启动未结束的 bench 窗口', verdict(
+        hil_word_commit_queue, 'I (500) word_store: storage bench BEGIN\n'
+        'I (99) boot: End of partition table\n' + commit(), queue_name), 'FAIL')
+    check('答题时间戳缺失不能假 PASS', verdict(
+        hil_word_commit_queue, commit(wait=0).replace('I (10000) ', ''),
+        queue_name), 'FAIL')
+    check('bench 时间戳缺失不能伪装污染剔除', verdict(
+        hil_word_commit_queue, 'word_store: storage bench BEGIN\n' +
+        commit(wait=0), queue_name), 'FAIL')
+    check('答题事务字段漂移 FAIL，不能静默 SKIP', verdict(
+        hil_word_commit_queue, commit().replace('queue_wait_ms=', 'queued_ms='),
+        queue_name), 'FAIL')
+
+    check('NVS 52/3379/4392/8676 B 最佳分块算术',
+          [nvs_entries(n) for n in (52, 3379, 4392, 8676)], [4, 108, 141, 276])
+    cursor = ('I (1200) wqn_storage: nvs write: key=cur_rev '
+              'bytes=52 total_ms=11 changed=1\n')
+    atomic = ('I (1201) word_store: atomic write: bytes=4392 backup=0 '
+              'fopen_ms=1200 write_ms=20 stat_ms=7 remove_ms=382 '
+              'rename_backup_ms=190 rename_primary_ms=410 total_ms=2209\n')
+    check('实际小 NVS + 大 SPIFFS 不误报预算 FAIL', verdict(
+        hil_nvs_entry_budget, cursor + atomic, 'WRITE:nvs-entry-budget'), 'PASS')
+    check('只有 SPIFFS 不冒充实际 NVS 通过', verdict(
+        hil_nvs_entry_budget, atomic, 'WRITE:nvs-entry-budget'), 'SKIP')
+    check('实际大 NVS 预算超限 FAIL', verdict(
+        hil_nvs_entry_budget, cursor.replace('bytes=52', 'bytes=8676'),
+        'WRITE:nvs-entry-budget'), 'FAIL')
+    check('NVS bytes 格式漂移 FAIL', verdict(
+        hil_nvs_entry_budget, cursor.replace('bytes=52 ', ''),
+        'WRITE:nvs-entry-budget'), 'FAIL')
+
+    def snapshot_fixture(slow=False, base_cost=10000):
+        lines = ['I (500) word_store: storage bench BEGIN profile=snapshot\n']
+        for size in (3379, 8676):
+            for i in range(12):
+                # 两个慢样本足以破坏 p90，但中位仍为便宜档：专抓假绿。
+                cost = 200000 if slow and size == 8676 and i in (10, 11) else base_cost
+                lines.append(
+                    f'I ({1000 + i}) word_store: storage snapshot append probe: '
+                    f'bytes={size} round={i} result=ESP_OK new_object={int(i == 0)} '
+                    f'open_us=1000 write_us={cost - 1100} flush_us=50 sync_us=30 '
+                    f'close_us=20 total_us={cost} written_bytes={size}\n')
+        lines.append('I (2000) word_store: storage bench END total_ms=1500 '
+                     'profile=snapshot result=ESP_OK\n')
+        return ''.join(lines)
+
+    probe_name = 'WRITE:snapshot-append-8676-p90'
+    fast = snapshot_fixture()
+    check('实尺寸 append 两档便宜样本 PASS', verdict(
+        hil_snapshot_append_probe, fast, probe_name), 'PASS')
+    check('append 双峰 p90=200 ms FAIL（中位会假绿）', verdict(
+        hil_snapshot_append_probe, snapshot_fixture(True), probe_name), 'FAIL')
+    check('单个慢模态即使 p90 便宜也不通过', verdict(
+        hil_snapshot_append_probe, snapshot_fixture(True).replace(
+            'round=10 result=ESP_OK new_object=0 open_us=1000 write_us=198900 '
+            'flush_us=50 sync_us=30 close_us=20 total_us=200000',
+            'round=10 result=ESP_OK new_object=0 open_us=1000 write_us=8900 '
+            'flush_us=50 sync_us=30 close_us=20 total_us=10000'), probe_name), 'FAIL')
+    check('单峰 p90=200 ms 边界也 FAIL', verdict(
+        hil_snapshot_append_probe, snapshot_fixture(base_cost=200000),
+        probe_name), 'FAIL')
+    check('小尺寸与大尺寸同样验收', verdict(
+        hil_snapshot_append_probe, fast, 'WRITE:snapshot-append-3379-p90'), 'PASS')
+    check('append 短写不能通过', verdict(
+        hil_snapshot_append_probe, fast.replace('written_bytes=8676', 'written_bytes=1'),
+        probe_name), 'FAIL')
+    check('append 字段改名格式门 FAIL', verdict(
+        hil_snapshot_append_probe, fast.replace('sync_us=', 'renamed_us='),
+        'LOG:snapshot-append-probe-parsed'), 'FAIL')
+    check('格式异常不能让性能项假 PASS', verdict(
+        hil_snapshot_append_probe, fast.replace('sync_us=', 'renamed_us='),
+        probe_name), 'FAIL')
+    check('append 11/12 轮是 SKIP，不是通过', verdict(
+        hil_snapshot_append_probe, fast.replace(
+            next(l for l in fast.splitlines(True) if 'bytes=8676 round=11 ' in l), ''),
+        probe_name), 'SKIP')
+    check('重复 round FAIL', verdict(
+        hil_snapshot_append_probe, fast.replace(
+            'I (2000)', fast.splitlines(True)[-2] + 'I (2000)'), probe_name), 'FAIL')
+    check('分项与自身 total 不对账 FAIL', verdict(
+        hil_snapshot_append_probe, fast.replace('total_us=10000', 'total_us=15000'),
+        probe_name), 'FAIL')
+    check('旧构建没有实尺寸探针 SKIP', verdict(
+        hil_snapshot_append_probe, cursor, probe_name), 'SKIP')
+    check('两次启动的 probe round 分组，不误报重复', verdict(
+        hil_snapshot_append_probe, fast + 'I (99) boot: End of partition table\n' +
+        fast, probe_name), 'PASS')
+    check('缺 END 即使 12 轮已齐也不通过', verdict(
+        hil_snapshot_append_probe, ''.join(fast.splitlines(True)[:-1]),
+        probe_name), 'SKIP')
+    check('探针清理失败不能以样本子集通过', verdict(
+        hil_snapshot_append_probe, fast.replace('profile=snapshot result=ESP_OK',
+                                               'profile=snapshot result=ESP_FAIL'),
+        probe_name), 'FAIL')
+
+    def held_fixture(profile='snapshot-paired', sync=True, slow=False, alternate=True):
+        lines = [f'I (500) word_store: storage bench BEGIN profile={profile}\n']
+        tick = 1000
+        def emit(body):
+            nonlocal tick
+            lines.append(f'I ({tick}) word_store: {body}\n')
+            tick += 10
+        for size in (3379, 8676):
+            emit(f'storage snapshot held open: bytes={size} result=ESP_OK '
+                 'new_object=1 open_us=900000')
+            for rnd in range(12):
+                cost = 200000 if slow and size == 8676 and rnd in (10, 11) else 10000
+                sync_cost = 100 if sync else 0
+                held = (f'storage snapshot held commit: bytes={size} round={rnd} '
+                        f'result=ESP_OK write_us={cost - 50 - sync_cost} flush_us=50 '
+                        f'sync_us={sync_cost} total_us={cost} written_bytes={size} '
+                        f'flush_ok=1 sync_attempted={int(sync)} sync_ok={int(sync)}')
+                control = (f'storage snapshot append probe: bytes={size} round={rnd} '
+                           f'result=ESP_OK new_object={int(rnd == 0)} open_us=100000 '
+                           'write_us=390000 flush_us=1000 sync_us=5000 close_us=4000 '
+                           f'total_us=500000 written_bytes={size}')
+                if profile == 'snapshot-paired':
+                    for body in ([held, control] if alternate and rnd % 2 else [control, held]):
+                        emit(body)
+                else:
+                    emit(held)
+            emit(f'storage snapshot held close: bytes={size} result=ESP_OK close_us=300000 '
+                 f'rounds=12 committed_bytes={size * 12} file_bytes={size * 12} '
+                 'stat_us=1000 close_ok=1 stat_ok=1')
+        emit(f'storage bench END total_ms=1000 profile={profile} result=ESP_OK')
+        return ''.join(lines)
+
+    held_fast = held_fixture()
+    held_name = 'WRITE:snapshot-held-8676-p90'
+    paired_name = 'WRITE:snapshot-held-paired-control'
+    held_format = 'LOG:snapshot-held-probe-parsed'
+    check('长开提交 PASS，不能把 900ms open/300ms close 塞入每笔', verdict(
+        hil_snapshot_held_probe, held_fast, held_name), 'PASS')
+    check('长开小尺寸同样判读', verdict(
+        hil_snapshot_held_probe, held_fast, 'WRITE:snapshot-held-3379-p90'), 'PASS')
+    check('每笔不做 fsync 即使便宜也 FAIL', verdict(
+        hil_snapshot_held_probe, held_fixture(sync=False), held_name), 'FAIL')
+    check('fsync 返回失败不假绿', verdict(
+        hil_snapshot_held_probe, held_fast.replace('sync_ok=1', 'sync_ok=0'),
+        held_name), 'FAIL')
+    check('fflush 未成功不假绿', verdict(
+        hil_snapshot_held_probe, held_fast.replace('flush_ok=1', 'flush_ok=0'),
+        held_name), 'FAIL')
+    check('长开短写 FAIL', verdict(
+        hil_snapshot_held_probe, held_fast.replace('written_bytes=8676', 'written_bytes=1'),
+        held_name), 'FAIL')
+    check('关闭后实际文件长度必须对账', verdict(
+        hil_snapshot_held_probe, held_fast.replace('file_bytes=104112', 'file_bytes=1'),
+        held_name), 'FAIL')
+    check('最终 close 错误不假绿', verdict(
+        hil_snapshot_held_probe, held_fast.replace('close_ok=1', 'close_ok=0'),
+        held_name), 'FAIL')
+    check('长开双峰慢尾拒绝中位假绿', verdict(
+        hil_snapshot_held_probe, held_fixture(slow=True), held_name), 'FAIL')
+    check('长开分项只和本笔 total 对账', verdict(
+        hil_snapshot_held_probe, held_fast.replace('total_us=10000', 'total_us=15000'),
+        held_name), 'FAIL')
+    held_missing = held_fast.replace(next(l for l in held_fast.splitlines(True)
+                                         if 'held commit: bytes=8676 round=11 ' in l), '')
+    check('长开缺一笔是 SKIP 不是通过', verdict(
+        hil_snapshot_held_probe, held_missing, held_name), 'SKIP')
+    check('长开缺 close 是 SKIP', verdict(
+        hil_snapshot_held_probe, ''.join(l for l in held_fast.splitlines(True)
+                                       if 'held close: bytes=8676 ' not in l), held_name), 'SKIP')
+    check('长开缺 END 是 SKIP', verdict(
+        hil_snapshot_held_probe, ''.join(held_fast.splitlines(True)[:-1]), held_name), 'SKIP')
+    last_commit = next(l for l in held_fast.splitlines(True)
+                       if 'held commit: bytes=8676 round=11 ' in l)
+    check('长开重复 round FAIL', verdict(
+        hil_snapshot_held_probe, held_fast.replace(last_commit, last_commit * 2),
+        held_name), 'FAIL')
+    first_open = next(l for l in held_fast.splitlines(True) if 'held open: bytes=8676 ' in l)
+    first_commit = next(l for l in held_fast.splitlines(True)
+                        if 'held commit: bytes=8676 round=0 ' in l)
+    check('完整但 commit 在 open 前的生命周期 FAIL', verdict(
+        hil_snapshot_held_probe, held_fast.replace(first_open, '').replace(
+            first_commit, first_commit + first_open), held_name), 'FAIL')
+    check('长开字段改名格式 FAIL', verdict(
+        hil_snapshot_held_probe, held_fast.replace('sync_attempted=', 'renamed='),
+        held_format), 'FAIL')
+    check('格式漂移不能让长开性能项假 PASS', verdict(
+        hil_snapshot_held_probe, held_fast.replace('sync_attempted=', 'renamed='),
+        held_name), 'FAIL')
+    check('长开未知事件行不能静默丢掉', verdict(
+        hil_snapshot_held_probe, held_fast.replace('held close:', 'held closed:'),
+        held_format), 'FAIL')
+    check('长开清理/运行错误 FAIL', verdict(
+        hil_snapshot_held_probe, held_fast.replace(
+            'profile=snapshot-paired result=ESP_OK', 'profile=snapshot-paired result=ESP_FAIL'),
+        held_name), 'FAIL')
+    check('两档 12 对交替控制完整 PASS', verdict(
+        hil_snapshot_held_probe, held_fast, paired_name), 'PASS')
+    check('一直固定先后顺序不得冒充交替对照', verdict(
+        hil_snapshot_held_probe, held_fixture(alternate=False), paired_name), 'FAIL')
+    check('缺重开对照不得声称同期比较', verdict(
+        hil_snapshot_held_probe, ''.join(l for l in held_fast.splitlines(True)
+                                       if 'append probe: bytes=8676 round=11 ' not in l),
+        paired_name), 'SKIP')
+    last_control = next(l for l in held_fast.splitlines(True)
+                        if 'append probe: bytes=8676 round=11 ' in l)
+    check('重复对照不是样本不足，必须 FAIL', verdict(
+        hil_snapshot_held_probe, held_fast.replace(last_control, last_control * 2),
+        paired_name), 'FAIL')
+    check('paired 的旧重开性能仍单独 FAIL', verdict(
+        hil_snapshot_append_probe, held_fast, probe_name), 'FAIL')
+    check('profile 精确匹配：held 不能冒充旧 snapshot', verdict(
+        hil_snapshot_append_probe, held_fixture(profile='snapshot-held'),
+        'LOG:snapshot-append-probe-parsed'), 'SKIP')
+    check('旧 snapshot 没有长开探针 SKIP', verdict(
+        hil_snapshot_held_probe, fast, held_name), 'SKIP')
+    check('跨两次启动长开生命周期分别完整', verdict(
+        hil_snapshot_held_probe, held_fast + 'I (99) boot: End of partition table\n' +
+        held_fast, held_name), 'PASS')
+
+    def partition_fixture(zero=False):
+        # Multi-line anchoring: the first line deliberately does not match.
+        lines = ['unrelated first line\n',
+                 'I (400) storage_io_probe: storage partition probe READY schema=1 enabled=1 '
+                 'scope=task+partition partition=storage app_version=fixture elf_sha256=0123456789abcdef\n']
+        for line in held_fast.splitlines(True):
+            if 'storage bench ' in line:
+                line = line.rstrip('\n') + ' partition_probe=1\n'
+            lines.append(line)
+            fields = {m.group('k'): m.group('v') for m in KV_RE.finditer(line)}
+            kind = next((kind for text, kind in (
+                ('storage snapshot append probe:', 'reopen'),
+                ('storage snapshot held open:', 'held-open'),
+                ('storage snapshot held commit:', 'held-commit'),
+                ('storage snapshot held close:', 'held-close')) if text in line), None)
+            if kind is None:
+                continue
+            stages = {'reopen': ('open', 'write', 'flush', 'sync', 'close'),
+                      'held-open': ('open',), 'held-commit': ('write', 'flush', 'sync'),
+                      'held-close': ('close', 'stat')}[kind]
+            size = int(fields['bytes'])
+            rnd = fields.get('round', fields.get('rounds', '0'))
+            for phase in stages:
+                vfs = int(fields[phase + '_us'])
+                values = {'kind': kind, 'bytes': size, 'round': rnd, 'phase': phase,
+                          'vfs_us': vfs, 'span_us': vfs, 'scope_ok': 1, 'nested_calls': 0}
+                for op in ('read', 'write', 'erase'):
+                    writing = not zero and op == 'write' and phase == 'write'
+                    for field, value in (('calls', int(writing)), ('bytes', size if writing else 0),
+                                         ('us', 10 if writing else 0), ('max_us', 10 if writing else 0),
+                                         ('failures', 0)):
+                        values[op + '_' + field] = value
+                lines.append('I (999) storage_io_probe: storage partition io: ' +
+                             ' '.join(f'{k}={v}' for k, v in values.items()) + '\n')
+        return ''.join(lines)
+
+    io = partition_fixture()
+    io_metric = 'WRITE:snapshot-partition-io-accounting'
+    io_format = 'LOG:snapshot-partition-io-parsed'
+    check('分区 198 阶段完整并对自己的 VFS 字段 PASS', verdict(
+        hil_snapshot_partition_io, io, io_metric), 'PASS')
+    check('分区行首锚定，多行且首行不匹配仍解析 PASS', verdict(
+        hil_snapshot_partition_io, io, io_format), 'PASS')
+    check('wrapper 未链接、持久提交全零必须 FAIL', verdict(
+        hil_snapshot_partition_io, partition_fixture(zero=True), io_metric), 'FAIL')
+    check('任务/分区 scope 不成立 FAIL', verdict(
+        hil_snapshot_partition_io, io.replace('scope_ok=1', 'scope_ok=0'), io_metric), 'FAIL')
+    check('分区字段改名不能静默 SKIP', verdict(
+        hil_snapshot_partition_io, io.replace('erase_calls=', 'renamed='), io_format), 'FAIL')
+    check('分区字段漂移也不能让归因 PASS', verdict(
+        hil_snapshot_partition_io, io.replace('erase_calls=', 'renamed='), io_metric), 'FAIL')
+    check('分区负耗时 FAIL', verdict(
+        hil_snapshot_partition_io, io.replace('read_us=0', 'read_us=-1'), io_format), 'FAIL')
+    check('底层耗时不能超过自己的阶段 VFS', verdict(
+        hil_snapshot_partition_io, io.replace('write_us=10 write_max_us=10',
+                                               'write_us=9999999 write_max_us=9999999'),
+        io_metric), 'FAIL')
+    check('底层字段不能和其他阶段总耗时对账', verdict(
+        hil_snapshot_partition_io, io.replace('vfs_us=900000 span_us=900000',
+                                               'vfs_us=100000 span_us=100000'), io_metric), 'FAIL')
+    check('max_us 与次数/总耗时不自洽 FAIL', verdict(
+        hil_snapshot_partition_io, io.replace('write_max_us=10', 'write_max_us=1'), io_metric), 'FAIL')
+    check('底层 API 返回失败即拒绝成功样本子集', verdict(
+        hil_snapshot_partition_io, io.replace(
+            'write_calls=1 write_bytes=3379 write_us=10 write_max_us=10 write_failures=0',
+            'write_calls=1 write_bytes=3379 write_us=10 write_max_us=10 write_failures=1'),
+        io_metric), 'FAIL')
+    check('完整 END 后缺阶段是 FAIL 不是 SKIP', verdict(
+        hil_snapshot_partition_io, ''.join(l for l in io.splitlines(True)
+                                          if 'phase=flush' not in l), io_metric), 'FAIL')
+    check('完整 END 后连父记录一起消失也 FAIL', verdict(
+        hil_snapshot_partition_io, ''.join(l for l in io.splitlines(True)
+                                          if not ('round=3' in l and
+                                                  ('kind=held-commit' in l or 'held commit:' in l))),
+        io_metric), 'FAIL')
+    row = next(l for l in io.splitlines(True) if 'storage partition io:' in l)
+    check('分区阶段重复 FAIL', verdict(
+        hil_snapshot_partition_io, io.replace(row, row * 2), io_format), 'FAIL')
+    check('缺 END 只能 SKIP', verdict(
+        hil_snapshot_partition_io, ''.join(io.splitlines(True)[:-1]), io_metric), 'SKIP')
+    check('READY 缺身份/版本契约 FAIL', verdict(
+        hil_snapshot_partition_io, io.replace('app_version=fixture', 'unknown=fixture'), io_format), 'FAIL')
+    check('profile 标记丢失不当成未编译 SKIP', verdict(
+        hil_snapshot_partition_io, io.replace(' partition_probe=1', ''), io_metric), 'FAIL')
+    check('旧长开日志没有分区计量 SKIP', verdict(
+        hil_snapshot_partition_io, held_fast, io_metric), 'SKIP')
+    check('跨启动分区阶段按运行分别对账', verdict(
+        hil_snapshot_partition_io, io + 'I (99) boot: End of partition table\n' + io,
+        io_metric), 'PASS')
+
+    def gc_fixture(empty=False, fast_only=False, quick_no_deleted=False):
+        lines = []
+        for line in io.splitlines(True):
+            if 'storage partition probe READY ' in line:
+                line = line.rstrip('\n') + ' gc_probe=1 partition_bytes=8388608\n'
+            elif 'storage bench BEGIN' in line or 'storage bench END' in line or 'storage partition io:' in line:
+                line = line.rstrip('\n') + ' gc_probe=1\n'
+            lines.append(line)
+            if 'storage partition io:' not in line:
+                continue
+            f = dict(re.findall(r'\b([a-z][a-z0-9_]*)=([^\s]+)', line))
+            checking = not empty and f['phase'] == 'write'
+            g = {'schema': 1, **{k: f[k] for k in ('kind', 'bytes', 'round', 'phase')},
+                 'scope_ok': 1, 'gc_check_calls': int(checking), 'gc_quick_calls': 0,
+                 'gc_nested_calls': 0, 'gc_check_us': 20 if checking else 0,
+                 'gc_quick_us': 0, 'gc_check_errors': 0, 'gc_quick_errors': 0,
+                 'gc_quick_no_deleted': 0, 'fs_seen': int(checking),
+                 'block_count': 2048 if checking else 0, 'block_size': 4096 if checking else 0,
+                 'page_size': 256 if checking else 0}
+            for name in ('free_before', 'free_after', 'free_min', 'free_max'):
+                g[name] = 3 if checking else -1
+            for name in ('allocated_before', 'allocated_after'):
+                g[name] = 7500 if checking else -1
+            for name in ('deleted_before', 'deleted_after'):
+                g[name] = 20000 if checking else -1
+            if checking and quick_no_deleted:
+                g.update(gc_quick_calls=1, gc_quick_us=2, gc_quick_no_deleted=1)
+            for op in ('read', 'write', 'erase'):
+                inside = checking and not fast_only and op == 'write'
+                for field, value in (('calls', int(inside)), ('bytes', int(f['bytes']) if inside else 0),
+                                     ('us', 10 if inside else 0)):
+                    g[f'gc_{op}_{field}'] = value
+            lines.append('I (999) storage_io_probe: storage spiffs gc: ' +
+                         ' '.join(f'{k}={v}' for k, v in g.items()) + '\n')
+        return ''.join(lines)
+
+    gc = gc_fixture()
+    gc_metric, gc_format = 'WRITE:snapshot-spiffs-gc-accounting', 'LOG:snapshot-spiffs-gc-parsed'
+    check('GC 198 阶段与父 API 子集完整 PASS', verdict(
+        hil_snapshot_spiffs_gc, gc, gc_metric), 'PASS')
+    check('GC 行锚定，多行且首行不匹配 PASS', verdict(
+        hil_snapshot_spiffs_gc, gc, gc_format), 'PASS')
+    check('GC 增量字段不破坏旧分区契约', verdict(
+        hil_snapshot_partition_io, gc, io_metric), 'PASS')
+    check('没有实际 GC I/O，快路径检查仍是有效测量', verdict(
+        hil_snapshot_spiffs_gc, gc_fixture(fast_only=True), gc_metric), 'PASS')
+    check('quick 无可删块是记录的正常结果，不伪造 API 错误', verdict(
+        hil_snapshot_spiffs_gc, gc_fixture(quick_no_deleted=True), gc_metric), 'PASS')
+    check('全零 GC 包装不能假 PASS', verdict(
+        hil_snapshot_spiffs_gc, gc_fixture(empty=True), gc_metric), 'FAIL')
+    check('quick 有调用也不能代替每笔 gc_check 的接线证据', verdict(
+        hil_snapshot_spiffs_gc, gc.replace('gc_check_calls=1 gc_quick_calls=0',
+                                          'gc_check_calls=0 gc_quick_calls=1').replace(
+            'gc_check_us=20 gc_quick_us=0', 'gc_check_us=0 gc_quick_us=20'), gc_metric), 'FAIL')
+    check('GC scope 不成立 FAIL', verdict(
+        hil_snapshot_spiffs_gc, gc.replace('phase=write scope_ok=1', 'phase=write scope_ok=0'),
+        gc_metric), 'FAIL')
+    check('GC 字段漂移不能静默 SKIP', verdict(
+        hil_snapshot_spiffs_gc, gc.replace('gc_read_calls=', 'renamed='), gc_format), 'FAIL')
+    check('GC 字段漂移也使测量项 FAIL', verdict(
+        hil_snapshot_spiffs_gc, gc.replace('gc_read_calls=', 'renamed='), gc_metric), 'FAIL')
+    check('GC check 返回失败，拒绝成功子集', verdict(
+        hil_snapshot_spiffs_gc, gc.replace('gc_check_errors=0', 'gc_check_errors=1'), gc_metric), 'FAIL')
+    check('GC quick 真错误与无可删块不同', verdict(
+        hil_snapshot_spiffs_gc, gc_fixture(quick_no_deleted=True).replace(
+            'gc_quick_errors=0 gc_quick_no_deleted=1', 'gc_quick_errors=1 gc_quick_no_deleted=0'),
+        gc_metric), 'FAIL')
+    check('GC API 不能超出自己的父 bucket 次数', verdict(
+        hil_snapshot_spiffs_gc, gc.replace('gc_write_calls=1', 'gc_write_calls=2'), gc_metric), 'FAIL')
+    check('GC API 不能超出自己的父 bucket 字节', verdict(
+        hil_snapshot_spiffs_gc, gc.replace('gc_write_bytes=3379', 'gc_write_bytes=3380'), gc_metric), 'FAIL')
+    check('GC API 不能超出自己的父 bucket 时间', verdict(
+        hil_snapshot_spiffs_gc, gc.replace('gc_write_us=10', 'gc_write_us=11'), gc_metric), 'FAIL')
+    # Native 10us remains valid; only the GC inclusive bound must reject it.
+    gc_short_wall = gc.replace('gc_check_us=20', 'gc_check_us=9')
+    check('API 子集时间不能超过 GC inclusive wall', verdict(
+        hil_snapshot_spiffs_gc, gc_short_wall, gc_metric), 'FAIL')
+    check('GC wall 不能超出自己的 VFS 阶段', verdict(
+        hil_snapshot_spiffs_gc, gc.replace('gc_check_us=20', 'gc_check_us=9851'), gc_metric), 'FAIL')
+    check('GC wall 与 native API 包含关系，不能重复相加', verdict(
+        hil_snapshot_spiffs_gc, gc.replace('gc_check_us=20', 'gc_check_us=9850'), gc_metric), 'PASS')
+    check('GC 状态未知 sentinel 不能冒充已测到零', verdict(
+        hil_snapshot_spiffs_gc, gc.replace('free_before=-1', 'free_before=0'), gc_metric), 'FAIL')
+    check('已量到 free_blocks=0 与未知 -1 不混淆', verdict(
+        hil_snapshot_spiffs_gc, gc.replace('free_before=3', 'free_before=0').replace(
+            'free_after=3', 'free_after=0').replace('free_min=3', 'free_min=0').replace(
+            'free_max=3', 'free_max=0'), gc_metric), 'PASS')
+    check('GC 负状态仅允许未测到的 -1', verdict(
+        hil_snapshot_spiffs_gc, gc.replace('free_before=3', 'free_before=-2'), gc_format), 'FAIL')
+    check('GC 状态极值必须覆盖入口出口', verdict(
+        hil_snapshot_spiffs_gc, gc.replace('free_min=3', 'free_min=4'), gc_metric), 'FAIL')
+    check('GC geometry 必须与真实分区尺寸对账', verdict(
+        hil_snapshot_spiffs_gc, gc.replace('block_count=2048', 'block_count=2047'), gc_metric), 'FAIL')
+    check('GC 页计数不能超过物理页数', verdict(
+        hil_snapshot_spiffs_gc, gc.replace('deleted_before=20000', 'deleted_before=99999'), gc_metric), 'FAIL')
+    check('GC READY 缺分区尺寸 FAIL', verdict(
+        hil_snapshot_spiffs_gc, gc.replace('partition_bytes=', 'renamed='), gc_metric), 'FAIL')
+    check('GC BEGIN/END 标记丢失不是旧镜像 SKIP', verdict(
+        hil_snapshot_spiffs_gc, gc.replace(' gc_probe=1', ''), gc_metric), 'FAIL')
+    check('GC 成功 END 缺阶段必须 FAIL', verdict(
+        hil_snapshot_spiffs_gc, ''.join(l for l in gc.splitlines(True)
+                                       if not ('storage spiffs gc:' in l and 'phase=flush' in l)),
+        gc_metric), 'FAIL')
+    check('GC 成功 END 连父阶段一起缺也 FAIL', verdict(
+        hil_snapshot_spiffs_gc, ''.join(l for l in gc.splitlines(True)
+                                       if not ('phase=flush' in l and
+                                               ('storage partition io:' in l or 'storage spiffs gc:' in l))),
+        gc_metric), 'FAIL')
+    gc_row = next(l for l in gc.splitlines(True) if 'storage spiffs gc:' in l)
+    check('GC 重复阶段 FAIL', verdict(
+        hil_snapshot_spiffs_gc, gc.replace(gc_row, gc_row * 2), gc_format), 'FAIL')
+    check('GC 缺 END 只能 SKIP', verdict(
+        hil_snapshot_spiffs_gc, ''.join(gc.splitlines(True)[:-1]), gc_metric), 'SKIP')
+    check('GC 运行错误不能用成功子集', verdict(
+        hil_snapshot_spiffs_gc, gc.replace('result=ESP_OK partition_probe=1 gc_probe=1',
+                                          'result=ESP_FAIL partition_probe=1 gc_probe=1'),
+        gc_metric), 'FAIL')
+    check('旧分区日志无 GC 归属必须 SKIP', verdict(
+        hil_snapshot_spiffs_gc, io, gc_metric), 'SKIP')
+    check('GC 两次启动独立对账不误报重复', verdict(
+        hil_snapshot_spiffs_gc, gc + 'I (99) boot: End of partition table\n' + gc,
+        gc_metric), 'PASS')
+
+    # Real 122443 capture: Wi-Fi's separately printed header/body straddled
+    # three COMPLETE probe records. No payload bytes may be reconstructed.
+    wire_lines = gc.splitlines(True)
+    sync_row = next(l for l in wire_lines if 'storage partition io:' in l and
+                    'kind=reopen' in l and 'phase=sync' in l)
+    close_row = next(l for l in wire_lines if 'storage partition io:' in l and
+                     'kind=reopen' in l and 'phase=close' in l)
+    flush_gc = next(l for l in wire_lines if 'storage spiffs gc:' in l and
+                    'kind=reopen' in l and 'phase=flush' in l)
+    wire = gc.replace(flush_gc, 'I (48363) wifi:' + flush_gc).replace(
+        sync_row, 'state: run -> init (0x0)' + sync_row).replace(
+        close_row, 'I (48483) wifi:' + close_row)
+    check('Wi-Fi 分片粘在完整分区头前，仍逐阶段完整对账', verdict(
+        hil_snapshot_partition_io, wire, io_metric), 'PASS')
+    check('Wi-Fi 分片粘在完整 GC 头前，GC 子集仍完整对账', verdict(
+        hil_snapshot_spiffs_gc, wire, gc_metric), 'PASS')
+    framed = list(snapshot_probe_records(Log.from_text(wire)))
+    check('分帧保留探针自己的时间戳和原字段，不借用 Wi-Fi 头',
+          sync_row.rstrip('\n') in framed and flush_gc.rstrip('\n') in framed, True)
+    check('分帧不重写原始 Log.text，其他判据仍读原日志',
+          Log.from_text(wire).text == wire, True)
+    check('同一物理行两条完整探针独立解析', verdict(
+        hil_snapshot_spiffs_gc, gc.replace(sync_row, sync_row.rstrip('\n')).replace(
+            close_row, close_row.rstrip('\n')), gc_metric), 'PASS')
+    for malformed, label in (
+            (sync_row.replace('read_calls=', 'renamed='), '缺字段'),
+            (sync_row.rstrip('\n') + ' scope_ok=1\n', '重复同值字段'),
+            (sync_row.replace('scope_ok=1', 'scope_ok=0 scope_ok=1'), '重复字段掩盖坏值'),
+            (sync_row.replace('storage_io_probe:', 'wifi:'), '借用异 tag 日志头')):
+        check(f'粘连分区行{label}仍 FAIL', verdict(
+            hil_snapshot_partition_io, wire.replace(sync_row, malformed), io_metric), 'FAIL')
+    for malformed, label in (
+            (flush_gc.replace('gc_read_calls=', 'renamed='), '缺字段'),
+            (flush_gc.rstrip('\n') + ' scope_ok=1\n', '重复同值字段'),
+            (flush_gc.replace('scope_ok=1', 'scope_ok=0 scope_ok=1'), '重复字段掩盖坏值'),
+            (flush_gc.replace('storage_io_probe:', 'wifi:'), '借用异 tag 日志头')):
+        check(f'粘连 GC 行{label}仍 FAIL', verdict(
+            hil_snapshot_spiffs_gc, wire.replace(flush_gc, malformed), gc_metric), 'FAIL')
+    torn = flush_gc.replace(' gc_read_calls=', 'I (990) wifi: interleaved\n gc_read_calls=')
+    check('GC 字段中途被打断不能拼回假完整', verdict(
+        hil_snapshot_spiffs_gc, wire.replace(flush_gc, torn), gc_metric), 'FAIL')
+    broken_prefix = sync_row.replace('I (999) storage_io_probe: ', '')
+    check('残缺探针前缀不能被后面的完整记录丢弃', verdict(
+        hil_snapshot_partition_io, wire.replace(sync_row, broken_prefix + sync_row),
+        io_metric), 'FAIL')
+
+    def reserve_fixture(ramp=False, prepared_only=False):
+        mode_tail = ' mode=prepared-only bytes=8676' if prepared_only else ''
+        lines = ['unrelated first line\n',
+                 next(l for l in gc.splitlines(True) if 'storage partition probe READY' in l),
+                 'I (400) word_store: storage gc reserve experiment BEGIN schema=1 '
+                 f'requested_bytes=131072 control_rounds={0 if prepared_only else 12} '
+                 f'prepared_rounds=48{mode_tail}\n']
+        nbase = dict(re.findall(r'\b([a-z][a-z0-9_]*)=([^\s]+)', row))
+        gbase = dict(re.findall(r'\b([a-z][a-z0-9_]*)=([^\s]+)', gc_row))
+        for size in (3379, 8676):
+            for profile, count in zip(RESERVE_PROFILES, (12, 48)):
+                prepared = profile == 'snapshot-gc-prepared'
+                if prepared_only and (size != 8676 or not prepared):
+                    continue
+                lines.append(f'I (500) word_store: storage bench BEGIN shapes=1 rounds={count} '
+                             f'writes={count} profile={profile} partition_probe=1 gc_probe=1 '
+                             f'reserve_probe=1 bytes={size} requested_bytes={131072 if prepared else 0}\n')
+                sequence = [('reserve-open', 0)]
+                if prepared:
+                    sequence.append(('reserve-prep', 0))
+                sequence += [('reserve-commit', rnd) for rnd in range(count)]
+                sequence.append(('reserve-close', count))
+                for kind, rnd in sequence:
+                    fields = dict(bytes=size, result='ESP_OK')
+                    if kind == 'reserve-open':
+                        head = 'storage gc snapshot held open'
+                        fields.update(new_object=1, open_us=1000)
+                    elif kind == 'reserve-prep':
+                        head = 'storage gc snapshot prepare'
+                        fields.update(requested_bytes=131072, prepare_us=1000)
+                    elif kind == 'reserve-close':
+                        head = 'storage gc snapshot held close'
+                        fields.update(close_us=1000, rounds=count, committed_bytes=count*size,
+                                      file_bytes=count*size, stat_us=1000, close_ok=1, stat_ok=1)
+                    else:
+                        head = 'storage gc snapshot held commit'
+                        cost = (150000 + 2000*rnd if ramp else 10000) if prepared else 500000
+                        fields.update(round=rnd, write_us=cost, flush_us=100, sync_us=1000,
+                                      total_us=cost+1100, written_bytes=size,
+                                      flush_ok=1, sync_attempted=1, sync_ok=1)
+                    lines.append('I (600) word_store: ' + head + ': ' +
+                                 ' '.join(f'{k}={v}' for k,v in fields.items()) + '\n')
+                    for phase in SNAPSHOT_IO_PHASES[kind]:
+                        n = dict(nbase)
+                        n.update(kind=kind, bytes=size, round=rnd, phase=phase,
+                                 vfs_us=fields[phase+'_us'], span_us=fields[phase+'_us'], gc_probe=1)
+                        for op in ('read','write','erase'):
+                            writing = op == 'write' and phase == 'write'
+                            for field,value in (('calls',int(writing)), ('bytes',size if writing else 0),
+                                                ('us',10 if writing else 0), ('max_us',10 if writing else 0),
+                                                ('failures',0)):
+                                n[f'{op}_{field}'] = value
+                        lines.append('I (600) storage_io_probe: storage partition io: ' +
+                                     ' '.join(f'{k}={v}' for k,v in n.items()) + '\n')
+                        g = dict(gbase)
+                        seen = phase in ('write', 'prepare')
+                        allocated = 7500 + rnd * ((size+250)//251)
+                        g.update(kind=kind, bytes=size, round=rnd, phase=phase,
+                                 gc_check_calls=int(seen), gc_check_us=20 if seen else 0,
+                                 fs_seen=int(seen), block_count=2048 if seen else 0,
+                                 block_size=4096 if seen else 0, page_size=256 if seen else 0,
+                                 lookup_pages=int(seen), data_page_bytes=251 if seen else 0)
+                        for name in ('free_before','free_after','free_min','free_max'):
+                            g[name] = 4 if seen else -1
+                        for when in ('before','after'):
+                            g[f'allocated_{when}'] = allocated if seen else -1
+                            g[f'deleted_{when}'] = 20000 if seen else -1
+                            g[f'free_data_bytes_{when}'] = (15*2046-allocated-20000)*251 if seen else -1
+                        lines.append('I (600) storage_io_probe: storage spiffs gc: ' +
+                                     ' '.join(f'{k}={v}' for k,v in g.items()) + '\n')
+                lines.append(f'I (700) word_store: storage bench END total_ms=1000 profile={profile} '
+                             f'result=ESP_OK partition_probe=1 gc_probe=1 reserve_probe=1 bytes={size}\n')
+        lines.append('I (800) word_store: storage gc reserve experiment END total_ms=4000 '
+                     f'result=ESP_OK completed_runs={1 if prepared_only else 4}{mode_tail}\n')
+        return ''.join(lines)
+
+    reserve = reserve_fixture()
+    rf = 'LOG:snapshot-gc-reserve-parsed'
+    rc = 'WRITE:snapshot-gc-reserve-control'
+    rfirst = 'WRITE:snapshot-gc-reserve-8676-first12-p90'
+    rall = 'WRITE:snapshot-gc-reserve-8676-all48-p90'
+    check('前置 GC 四组 374 个 native 阶段完整', verdict(
+        hil_snapshot_partition_io, reserve, io_metric), 'PASS')
+    check('前置 GC 四组 374 个 GC 阶段完整', verdict(
+        hil_snapshot_spiffs_gc, reserve, gc_metric), 'PASS')
+    check('前置 GC 顺序对照与 clean-state 完整', verdict(
+        hil_snapshot_gc_reserve, reserve, rc), 'PASS')
+    check('维护后首12笔是真提交窗口 PASS', verdict(
+        hil_snapshot_gc_reserve, reserve, rfirst), 'PASS')
+    check('维护后完整48笔仍无退化 PASS', verdict(
+        hil_snapshot_gc_reserve, reserve, rall), 'PASS')
+    check('晚轮渐进退化不影响首12笔的已测窗口', verdict(
+        hil_snapshot_gc_reserve, reserve_fixture(ramp=True), rfirst), 'PASS')
+    check('晚轮渐进退化必须让完整48笔 FAIL', verdict(
+        hil_snapshot_gc_reserve, reserve_fixture(ramp=True), rall), 'FAIL')
+    check('旧 GC 日志没有维护前置对照 SKIP', verdict(
+        hil_snapshot_gc_reserve, gc, rc), 'SKIP')
+    check('缺 experiment END 不能拿快前缀验收', verdict(
+        hil_snapshot_gc_reserve, ''.join(reserve.splitlines(True)[:-1]), rall), 'SKIP')
+    check('实验成功 END 但晚轮连父记录都少了，必须 FAIL', verdict(
+        hil_snapshot_gc_reserve, ''.join(l for l in reserve.splitlines(True)
+                                        if 'round=47 ' not in l), rc), 'FAIL')
+    check('GC 净容量字段漂移必须 FAIL', verdict(
+        hil_snapshot_gc_reserve, reserve.replace('free_data_bytes_after=', 'renamed='), rf), 'FAIL')
+    check('GC 净容量字段漂移也拒绝性能假通过', verdict(
+        hil_snapshot_gc_reserve, reserve.replace('free_data_bytes_after=', 'renamed='), rall), 'FAIL')
+    check('净容量必须与自身 allocated/deleted/几何严格对账', verdict(
+        hil_snapshot_gc_reserve, reserve.replace('free_data_bytes_before=800690',
+                                                  'free_data_bytes_before=800691'), rc), 'FAIL')
+    check('无 GC 调用时净容量未知，不伪造零', verdict(
+        hil_snapshot_gc_reserve, reserve.replace('free_data_bytes_after=-1', 'free_data_bytes_after=0'),
+        rc), 'FAIL')
+    check('同值 duplicate clean-state 字段也 FAIL', verdict(
+        hil_snapshot_gc_reserve, reserve.replace('lookup_pages=1', 'lookup_pages=1 lookup_pages=1'),
+        rf), 'FAIL')
+    check('未同步不能用低耗时冒充持久提交', verdict(
+        hil_snapshot_gc_reserve, reserve.replace('sync_ok=1', 'sync_ok=0'), rc), 'FAIL')
+    check('少写一字节不能用低耗时冒充持久提交', verdict(
+        hil_snapshot_gc_reserve, reserve.replace('written_bytes=8676', 'written_bytes=8675'), rc), 'FAIL')
+    check('末次文件长度不对账 FAIL', verdict(
+        hil_snapshot_gc_reserve, reserve.replace('file_bytes=416448', 'file_bytes=416449'), rc), 'FAIL')
+    check('前置维护本身失败不能只用成功提交子集', verdict(
+        hil_snapshot_gc_reserve, reserve.replace('result=ESP_OK requested_bytes=131072 prepare_us=',
+                                                  'result=ESP_FAIL requested_bytes=131072 prepare_us='),
+        rc), 'FAIL')
+    check('四组 END 后仍需实验 completed_runs=4', verdict(
+        hil_snapshot_gc_reserve, reserve.replace('completed_runs=4', 'completed_runs=3'), rc), 'FAIL')
+    check('前置请求量不符合实验契约 FAIL', verdict(
+        hil_snapshot_gc_reserve, reserve.replace('requested_bytes=131072', 'requested_bytes=4096'),
+        rc), 'FAIL')
+    insufficient = ''.join(l.replace('deleted_before=20000', 'deleted_before=23000').replace(
+        'deleted_after=20000', 'deleted_after=23000').replace(
+        'free_data_bytes_before=800690', 'free_data_bytes_before=47690').replace(
+        'free_data_bytes_after=800690', 'free_data_bytes_after=47690')
+        if 'kind=reserve-prep' in l and 'storage spiffs gc:' in l else l
+        for l in reserve.splitlines(True))
+    check('SDK 报成功但干净储备不足，不能假通过', verdict(
+        hil_snapshot_gc_reserve, insufficient, rc), 'FAIL')
+    check('储备不足仍保留实测维护成本，不静默丢掉最强测量', verdict(
+        hil_snapshot_gc_reserve, insufficient, 'WRITE:snapshot-gc-reserve-maintenance'), 'PASS')
+    check('储备不足不能以快的48笔把性能门刷绿', verdict(
+        hil_snapshot_gc_reserve, insufficient, rall), 'FAIL')
+    low_blocks = ''.join(l.replace('free_before=4', 'free_before=3').replace(
+        'free_after=4', 'free_after=3').replace('free_min=4', 'free_min=3').replace(
+        'free_max=4', 'free_max=3') if 'kind=reserve-prep' in l and 'storage spiffs gc:' in l else l
+        for l in reserve.splitlines(True))
+    check('SDK 字节要求满足但空块仍只3个，不当快路径储备', verdict(
+        hil_snapshot_gc_reserve, low_blocks, rc), 'FAIL')
+    check('空块不足仍记录48笔内再次发生 GC 的观察', verdict(
+        hil_snapshot_gc_reserve, low_blocks, 'WRITE:snapshot-gc-reserve-lifetime'), 'PASS')
+    check('END 字节字段漂移要 FAIL，不抛 ValueError', verdict(
+        hil_snapshot_gc_reserve, reserve.replace('reserve_probe=1 bytes=8676\n',
+                                                  'reserve_probe=1 bytes=broken\n'), rf), 'FAIL')
+    check('父 API 自己坏了不能让维护实验绿', verdict(
+        hil_snapshot_gc_reserve, reserve.replace('scope_ok=1', 'scope_ok=0'), rc), 'FAIL')
+    check('实验里把维护塞进每笔写，会被重复阶段挡住', verdict(
+        hil_snapshot_gc_reserve, reserve.replace(
+            next(l for l in reserve.splitlines(True) if 'storage gc snapshot prepare:' in l),
+            next(l for l in reserve.splitlines(True) if 'storage gc snapshot prepare:' in l)*2),
+        rc), 'FAIL')
+    prep_parent = next(l for l in reserve.splitlines(True) if 'storage gc snapshot prepare:' in l)
+    commit_parent = next(l for l in reserve.splitlines(True)[reserve.splitlines(True).index(prep_parent)+1:]
+                         if 'storage gc snapshot held commit:' in l)
+    swapped = reserve.replace(prep_parent, '__swap_prepare__\n', 1).replace(
+        commit_parent, prep_parent, 1).replace('__swap_prepare__\n', commit_parent, 1)
+    check('维护发生在首笔提交之后，不能冒充前置维护', verdict(
+        hil_snapshot_gc_reserve, swapped, rc), 'FAIL')
+    outer_begin = next(l for l in reserve.splitlines(True) if 'storage gc reserve experiment BEGIN' in l)
+    check('四组不在 experiment BEGIN 之内不能偷算完整对照', verdict(
+        hil_snapshot_gc_reserve, reserve.replace(outer_begin, '') + outer_begin, rf), 'FAIL')
+    single = reserve_fixture(prepared_only=True)
+    for func, name, label in (
+            (hil_snapshot_partition_io, io_metric, '分区直接计量'),
+            (hil_snapshot_spiffs_gc, gc_metric, 'GC 直接计量'),
+            (hil_snapshot_gc_reserve, rf, '格式'),
+            (hil_snapshot_gc_reserve, 'WRITE:snapshot-gc-reserve-maintenance', '维护计量'),
+            (hil_snapshot_gc_reserve, 'WRITE:snapshot-gc-reserve-lifetime', '寿命计量'),
+            (hil_snapshot_gc_reserve, rfirst, '首12笔'),
+            (hil_snapshot_gc_reserve, rall, '全48笔')):
+        check(f'显式 8676 单组补测{label} PASS', verdict(func, single, name), 'PASS')
+    for name, label in ((rc, '对照'),
+                        ('WRITE:snapshot-gc-reserve-3379-first12-p90', '3379首12笔'),
+                        ('WRITE:snapshot-gc-reserve-3379-all48-p90', '3379全48笔')):
+        check(f'单组不冒充{label}通过，必须 SKIP', verdict(
+            hil_snapshot_gc_reserve, single, name), 'SKIP')
+    check('单组晚轮退化不能让全48笔假绿', verdict(
+        hil_snapshot_gc_reserve, reserve_fixture(ramp=True, prepared_only=True), rall), 'FAIL')
+    check('单组晚轮退化仍独立判首12笔', verdict(
+        hil_snapshot_gc_reserve, reserve_fixture(ramp=True, prepared_only=True), rfirst), 'PASS')
+    for malformed, label in (
+            (single.replace(' mode=prepared-only bytes=8676', ''), '无显式模式'),
+            (single.replace('mode=prepared-only', 'mode=unknown'), '未知模式'),
+            (single.replace('mode=prepared-only', 'mode=full', 1), 'BEGIN模式漂移'),
+            (single.replace('prepared_rounds=48 mode=prepared-only bytes=8676',
+                            'prepared_rounds=48 mode=prepared-only bytes=3379'), '模式尺寸漂移'),
+            (single.replace('control_rounds=0', 'control_rounds=12'), '声称包含control'),
+            (single.replace('completed_runs=1 mode=prepared-only bytes=8676',
+                            'completed_runs=1'), 'END模式丢失')):
+        check(f'单组{label}格式必须 FAIL', verdict(
+            hil_snapshot_gc_reserve, malformed, rf), 'FAIL')
+    for malformed, label in (
+            (single.replace('completed_runs=1', 'completed_runs=4'), '完成组数伪造'),
+            (single.replace('completed_runs=1', 'completed_runs=0'), '未完成'),
+            (single.replace('total_ms=4000 result=ESP_OK',
+                            'total_ms=4000 result=ESP_ERR_TIMEOUT'), '总实验保护退出'),
+            (''.join(l for l in single.splitlines(True) if 'round=47 ' not in l), '缺末笔'),
+            (single.replace('sync_ok=1', 'sync_ok=0'), '未同步'),
+            (single.replace('written_bytes=8676', 'written_bytes=8675'), '短写'),
+            (single.replace('file_bytes=416448', 'file_bytes=416449'), '文件长度不符'),
+            (single.replace('scope_ok=1', 'scope_ok=0'), '直接计量损坏'),
+            (single.replace('free_data_bytes_after=', 'renamed='), '净容量字段漂移')):
+        check(f'单组{label}仍让全48笔 FAIL', verdict(
+            hil_snapshot_gc_reserve, malformed, rall), 'FAIL')
+    check('单组缺总 END，不用已齐48笔假通过', verdict(
+        hil_snapshot_gc_reserve, ''.join(single.splitlines(True)[:-1]), rall), 'SKIP')
+    disguised_full = single.replace(' mode=prepared-only bytes=8676', '').replace(
+        'control_rounds=0', 'control_rounds=12').replace('completed_runs=1', 'completed_runs=4')
+    check('旧 full 契约缺三组，不能借单组支持变绿', verdict(
+        hil_snapshot_gc_reserve, disguised_full, rall), 'FAIL')
+    lifecycle = ('I (5000) word_store: storage gc reserve experiment BEGIN\n' + bench +
+                 'I (12000) word_store: storage bench BEGIN profile=snapshot-gc-prepared\n'
+                 'I (19000) storage_service: owner=storage-bench queue_wait_ms=0 elapsed_ms=10 result=ESP_OK\n'
+                 'I (19000) word_store: storage bench END\n'
+                 'W (19500) power: long-held sleep lease: blocker=storage holder=storage-bench held_ms=14500\n'
+                 'I (20000) word_store: storage gc reserve experiment END\n')
+    lease_name = 'BENCH:lease-released'
+    check('分组 END 后、总 END 前的长租约不是泄漏', verdict(
+        hil_storage_bench, lifecycle + 'I (80000) test: observing\n', lease_name), 'PASS')
+    check('总 END 后没有观察窗口，无告警也只能 SKIP', verdict(
+        hil_storage_bench, lifecycle, lease_name), 'SKIP')
+    check('恰好到重报门仍未跨门，只能 SKIP', verdict(
+        hil_storage_bench, lifecycle + 'I (79500) test: observing\n', lease_name), 'SKIP')
+    check('没有此前告警，完整观察 END 后60秒才可判代理', verdict(
+        hil_storage_bench, ''.join(l for l in lifecycle.splitlines(True)
+                                  if 'long-held sleep lease:' not in l) +
+        'I (80001) test: observing\n', lease_name), 'PASS')
+    real_window = (
+        'unrelated first line\n'
+        'I (26583) word_store: storage gc reserve experiment BEGIN\n'
+        'I (26663) word_store: storage bench BEGIN profile=snapshot-gc-prepared\n'
+        'I (43363) storage_service: owner=storage-bench queue_wait_ms=0 elapsed_ms=361 result=ESP_OK\n'
+        'W (94473) wqn_sleep: long-held sleep lease: blocker=storage holder=storage-bench held_ms=67895\n'
+        'I (102693) word_store: storage bench END\n'
+        'I (102703) word_store: storage gc reserve experiment END\n'
+        'I (118583) wqn_epd: observing\n')
+    check('174410 真实窗口15.88秒必须 SKIP，不假绿', verdict(
+        hil_storage_bench, real_window, lease_name), 'SKIP')
+    check('该现象确有此前告警，跨154473门后代理才 PASS', verdict(
+        hil_storage_bench, real_window + 'I (154474) test: observing\n', lease_name), 'PASS')
+    check('下一次启动的大时钟不能补上一启动的观察窗口', verdict(
+        hil_storage_bench, real_window +
+        'I (1000) boot: End of partition table\nI (200000) test: observing\n', lease_name), 'SKIP')
+    legacy_window = bench + 'I (19000) storage_service: owner=storage-bench queue_wait_ms=0 elapsed_ms=10 result=ESP_OK\n'
+    check('旧 bench 的短观察窗口也不是释放证明', verdict(
+        hil_storage_bench, legacy_window, lease_name), 'SKIP')
+    check('旧 bench 观察满门后仍按原 END 判代理', verdict(
+        hil_storage_bench, legacy_window + 'I (69001) test: observing\n', lease_name), 'PASS')
+    def detail(fn, text, name):
+        RESULTS.clear()
+        fn(Log.from_text(text, '<selftest-detail>'))
+        return next((d for _p, n, _k, _o, d in RESULTS if n == name), '')
+
+    absent = 'unrelated first line\nI (1000) test: no business writes\n'
+    check('缺 append 字段只说日志缺测，不推断未进镜像',
+          '日志未覆盖' in detail(hil_append_open_split, absent, 'WRITE:append-open-vs-fopen'), True)
+    check('缺 NVS stats 不推断历史上从未实测',
+          '本轮缺少实测字段' in detail(hil_nvs_stats_measured, absent, 'WRITE:nvs-entry-budget-measured'), True)
+    reset_boot = 'unrelated first line\nrst:0x15 (USB_UART_CHIP_RESET)\nI (1000) boot: End of partition table\n'
+    check('USB 复位启动计数不声称真实断电',
+          '不证明真实断电' in detail(hil_stability, reset_boot, 'STAB:no-reboot-loop'), True)
+    check('分组结束但总实验未收尾，不能借子 END 判租约', verdict(
+        hil_storage_bench, lifecycle.replace(
+            'I (20000) word_store: storage gc reserve experiment END\n', ''), lease_name), 'SKIP')
+    check('总 END 后租约真的还在，门必须 FAIL', verdict(
+        hil_storage_bench, lifecycle +
+        'W (21000) power: long-held sleep lease: blocker=storage holder=storage-bench held_ms=16000\n',
+        lease_name), 'FAIL')
+    check('总 END 时间戳漂移不能静默 SKIP', verdict(
+        hil_storage_bench, lifecycle.replace('I (20000) word_store:', 'word_store:'), lease_name), 'FAIL')
+    check('两分组之间的答题也在整个实验污染窗', verdict(
+        hil_word_commit_queue, lifecycle + commit(t=11000, wait=600), queue_name), 'SKIP')
+    check('总 END 后的排队 FAIL 仍保留，不全日志剔除', verdict(
+        hil_word_commit_queue, lifecycle + commit(t=25000, wait=600), queue_name), 'FAIL')
+    RESULTS.clear()
+
+    print(f'\n自检 {ok + len(bad)} 项：{ok} PASS / {len(bad)} FAIL')
+    if bad:
+        print('失败项：' + '、'.join(bad))
+        print('这些是判据自己的毛病——它们会在真机日志上静默出错，先修再跑日志。')
+        return 1
+    print('判据在已知答案的输入上全部出声。可以拿它去判真机日志了。')
+    return 0
+
+
 # --------------------------------------------------------------------- 主流程 --
 
 def main(argv):
+    if len(argv) >= 2 and argv[1] == '--selftest':
+        return selftest()
     if len(argv) < 2:
         print(__doc__)
         return 2
@@ -2566,6 +4553,7 @@ def main(argv):
         hil_c6a_generation(log)
         hil_c6b_scope_switch(log)
         hil_c8_page_save(log)
+        hil_word_commit_queue(log)
         hil_pk_handle(log, pk_open_seek_context(paths, exclude=p))
         hil_owner_attribution(log)
         hil_storage_bench(log)
@@ -2578,6 +4566,11 @@ def main(argv):
         hil_probe_lines_drift(log)
         hil_log_format_drift(log)
         hil_nvs_entry_budget(log)
+        hil_snapshot_append_probe(log)
+        hil_snapshot_held_probe(log)
+        hil_snapshot_partition_io(log)
+        hil_snapshot_spiffs_gc(log)
+        hil_snapshot_gc_reserve(log)
         hil_nvs_stats_measured(log)
         hil_cursor_erase_logged(log)
         hil_write_parts_reconcile(log)
