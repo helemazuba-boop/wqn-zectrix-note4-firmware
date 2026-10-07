@@ -3359,7 +3359,13 @@ def hil_nvs_stats_measured(log: Log):
     if pairs:
         detail += '；**逐笔 Δused 配对**（一笔写前后各取一条 stats）：'
         for p in pairs:
-            if p['delta'] > 0:
+            if p['bytes'] == 0 and p['delta'] < 0:
+                tag = f'**擦除 key，释放 {-p["delta"]} 条**'
+            elif p['bytes'] == 0:
+                tag = '擦除窗口没有观察到净减少，不能声称免费改写'
+            elif p['delta'] < 0:
+                tag = '减少台阶不能证明免费改写，需查同窗口其他操作'
+            elif p['delta'] > 0:
                 tag = f'**新 key，一次性 +{p["delta"]}**'
                 if p['sharing'] > 1:
                     tag += f' ⚠️窗口内还有另外 {p["sharing"] - 1} 笔写，这 +{p["delta"]} 里可能有别人的份'
@@ -3377,7 +3383,8 @@ def hil_nvs_stats_measured(log: Log):
         n_keys = len({p['key'] for p in first_write})
         detail += (
             f'\n  ⇒ **{once_each:.0f} 条是每个 key 的一次性成本，'
-            f'稳态每答题净 0 条**（改写已有 key 时旧 blob 被就地擦除并算回 '
+            f'本轮已有 key 的改写净 0 条**（仅此 key 写路径，不等同真实答题或长期GC验收；'
+            f'改写已有 key 时旧 blob 被就地擦除并算回 '
             f'free，nvs_page.cpp:432/446 + :1181）。本轮 {n_keys} 个 key 首次写'
             f'各花 ~{once_each:.0f} 条 = ~{n_keys * once_each:.0f} 条 = 分区 '
             f'~{n_keys * once_each / kNvsBudget:.0%}，**一次性**。'
@@ -4505,6 +4512,23 @@ def selftest():
     reset_boot = 'unrelated first line\nrst:0x15 (USB_UART_CHIP_RESET)\nI (1000) boot: End of partition table\n'
     check('USB 复位启动计数不声称真实断电',
           '不证明真实断电' in detail(hil_stability, reset_boot, 'STAB:no-reboot-loop'), True)
+    cursor_steps = ('unrelated first line\n'
+        'I (100) wqn_storage: nvs stats: used_entries=196 free_entries=308 available_entries=182 total_entries=504\n'
+        'I (200) wqn_storage: nvs write: key=_hil_cur52 bytes=52 total_ms=10 changed=1\n'
+        'I (201) wqn_storage: nvs stats: used_entries=200 free_entries=304 available_entries=178 total_entries=504\n'
+        'I (300) wqn_storage: nvs write: key=_hil_cur52 bytes=52 total_ms=0 changed=0\n'
+        'I (301) wqn_storage: nvs stats: used_entries=200 free_entries=304 available_entries=178 total_entries=504\n'
+        'I (400) wqn_storage: nvs write: key=_hil_cur52 bytes=52 total_ms=12 changed=1\n'
+        'I (401) wqn_storage: nvs stats: used_entries=200 free_entries=304 available_entries=178 total_entries=504\n'
+        'I (500) wqn_storage: nvs write: key=_hil_cur52 bytes=0 total_ms=10 changed=1\n'
+        'I (501) wqn_storage: nvs stats: used_entries=196 free_entries=308 available_entries=182 total_entries=504\n')
+    measured_name = 'WRITE:nvs-entry-budget-measured'
+    steps_detail = detail(hil_nvs_stats_measured, cursor_steps, measured_name)
+    check('真实-4擦除不是改写净0', 'Δused -4（**擦除 key，释放 4 条**）' in steps_detail, True)
+    check('临时key重复写不能声称真实逐题稳态通过', '稳态每答题净 0 条' not in steps_detail, True)
+    falling = cursor_steps.split('I (500)')[0].replace('used_entries=200', 'used_entries=192')
+    falling_detail = detail(hil_nvs_stats_measured, falling, measured_name)
+    check('非擦除负台阶不能标免费改写', '减少台阶不能证明免费改写' in falling_detail, True)
     check('分组结束但总实验未收尾，不能借子 END 判租约', verdict(
         hil_storage_bench, lifecycle.replace(
             'I (20000) word_store: storage gc reserve experiment END\n', ''), lease_name), 'SKIP')
