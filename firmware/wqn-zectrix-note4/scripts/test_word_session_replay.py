@@ -31,6 +31,8 @@ def main():
         raise SystemExit('FAIL: g++ unavailable; fixtures were not run')
     source = args.source.read_text(encoding='utf-8')
     pieces = {
+        '@@MAINTENANCE_THRESHOLD@@': next(line for line in source.splitlines()
+            if line.startswith('constexpr size_t kRuntimeCompactAckThreshold =')),
         '@@BATCH_ENABLED@@': (
             '#define FIXTURE_BATCH ' + str(int('struct CommitBatchContext {' in source)) +
             '\nconstexpr size_t kOutboxAppendBatchCapacity = 10;\n'),

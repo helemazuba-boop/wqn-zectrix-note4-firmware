@@ -45,7 +45,7 @@ constexpr uint16_t kSessionSchemaVersion = 4;
 constexpr uint16_t kOutboxSchemaVersion = 1;
 constexpr size_t kMaxSessionPayloadBytes = 96U * 1024U;
 constexpr size_t kMaxSessionCursorBytes = 256;
-constexpr size_t kRuntimeCompactAckThreshold = 32;
+constexpr size_t kRuntimeCompactAckThreshold = 128;
 constexpr size_t kRejectedOutboxCapacity = 256;
 constexpr wqn::protocol::word_study_v1::Mode kPersistedSessionModes[] = {
     wqn::protocol::word_study_v1::Mode::kSequential,
@@ -2092,10 +2092,10 @@ esp_err_t EnsureOutboxCache(OutboxScan** scan)
 }
 
 // Preserve the existing 1000 live-observation capacity. A parked observation
-// needs two records; retain room for 32 observation/ACK pairs as maintenance
-// slack. Reserve one future ACK/park record for EVERY pending observation.
+// needs two records; retain the EXISTING 64-record maintenance slack, independent
+// of maintenance frequency. Reserve one terminal slot for EVERY pending event.
 constexpr size_t kOutboxMaxRecords =
-    2 * wqn::kWordObservationOutboxCapacity + 2 * kRuntimeCompactAckThreshold;
+    2 * wqn::kWordObservationOutboxCapacity + 64;
 constexpr size_t kOutboxMaxBytes = kOutboxMaxRecords * sizeof(OutboxRecord);
 
 esp_err_t CheckOutboxAppendBudget(const OutboxScan& scan, bool observation)
@@ -2550,7 +2550,7 @@ esp_err_t OutboxMaintenanceStepTransaction(void* opaque)
     ESP_RETURN_ON_ERROR(EnsureOutboxCache(&scan), kTag, "load outbox maintenance step");
     if (!context->started) {
         if (!context->force_compact && (context->for_sleep
-                ? scan->ack_records == 0 && !scan->partial_tail && !scan->backup_source &&
+                ? scan->ack_records < kRuntimeCompactAckThreshold && !scan->partial_tail && !scan->backup_source &&
                       CheckOutboxAppendBudget(*scan, true) == ESP_OK
                 : scan->ack_records < kRuntimeCompactAckThreshold &&
                       CheckOutboxAppendBudget(*scan, true) == ESP_OK)) {

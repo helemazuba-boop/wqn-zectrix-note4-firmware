@@ -82,7 +82,7 @@ struct OutboxScan {
     std::vector<uint16_t> suspended_reasons;
     bool partial_tail = false, backup_source = false;
 };
-constexpr size_t kRuntimeCompactAckThreshold = 32;
+@@MAINTENANCE_THRESHOLD@@
 @@SESSION_GENERATION@@
 @@STEPPED_MAINTENANCE@@
 @@MODES@@
@@ -412,10 +412,16 @@ void TestMaintenanceSteps() {
           "cache I/O failure cannot manufacture a checkpoint proof");
     DueMaintenance(); context = {}; --cache.ack_records;
     Check(FinishMaintenance(&context) == ESP_OK && !context.started && reads == 0 && compactions == 0,
-          "runtime maintenance preserves the existing 32-ACK trigger");
+          "runtime maintenance waits for the configured ACK trigger");
     context = {}; context.for_sleep = true; cache.ack_records = 1;
-    Check(FinishMaintenance(&context) == ESP_OK && context.started && compactions == 1,
-          "sleep maintenance still reclaims a single ACK through the same step protocol");
+    Check(FinishMaintenance(&context) == ESP_OK && !context.started && compactions == 0,
+          "healthy sleep does not rewrite a full snapshot for a single retained ACK");
+    DueMaintenance(); context = {}; cache.ack_records = 32;
+    Check(FinishMaintenance(&context) == ESP_OK && !context.started && reads == 0 && compactions == 0,
+          "the former 32-ACK gate no longer schedules a full maintenance round");
+    DueMaintenance(); context = {}; context.for_sleep = true;
+    Check(FinishMaintenance(&context) == ESP_OK && context.started && saves == 1 && compactions == 1,
+          "sleep still performs checkpoint-before-reclaim once the larger threshold is reached");
     DueMaintenance(); context = {}; cache.ack_records = 0; cache.acknowledged.clear();
     cache.pending.push_back(Record()); cache.partial_tail = true; context.for_sleep = true;
     Check(FinishMaintenance(&context) == ESP_OK && saves == 1 && compactions == 1 && journal.pending.size() == 1,
@@ -499,7 +505,7 @@ void TestMaintenanceDriver() {
 #endif
 
 void TestOutboxQuota() {
-    constexpr size_t limit = 2 * wqn::kWordObservationOutboxCapacity + 2 * kRuntimeCompactAckThreshold;
+    constexpr size_t limit = kOutboxMaxRecords;
     Reset(); cache_loaded = true; cache.total_records = limit - 1;
     Session advanced = disk[0]; advanced.position = 1; advanced.remote.next_sequence = 1;
     advanced.phase = wqn::WordPresentationPhase::kBack;
@@ -619,7 +625,7 @@ void TestOutboxQuota() {
     OutboxMaintenanceContext pressure;
     for (size_t i = 0; i < 8 && !pressure.done; ++i) OutboxMaintenanceStepTransaction(&pressure);
     Check(pressure.done && compactions == 1 && saves == 1 && cache.total_records == 0,
-          "space pressure triggers runtime reclaim even below the 32-ACK gate");
+          "space pressure triggers runtime reclaim even below the ACK-count gate");
     Reset(); cache_loaded = true; cache.total_records = limit; cache.pending.push_back(Record());
     cache.suspended.assign(998, Record());
     Check(CheckOutboxAppendBudget(cache, false) == ESP_ERR_INVALID_SIZE,
