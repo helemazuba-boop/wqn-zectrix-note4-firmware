@@ -837,6 +837,7 @@ void DeviceUiTask(void*)
             // false but the effect is still armed. Read fresh here, after the
             // button drain that may have just armed a new answer.
             const bool word_commit_pending =
+                wqn::HasBufferedWordObservations(state.word_app) ||
                 state.word_app.session.commit_state ==
                 wqn::WordObservationCommitState::kPersisting ||
                 // [deck-scope] A default-deck switch in flight wipes and
@@ -1311,6 +1312,7 @@ wqn::AiStreamingStatusView streaming_view{};
         // read/write -- reload even runs InitNoteApp() -- would otherwise race
         // the pending commit).
         const bool persist_quiet = !device_ui_internal::IsAnyPersistBusy() &&
+            !wqn::HasBufferedWordObservations(state.word_app) &&
             state.word_app.session.commit_state !=
                 wqn::WordObservationCommitState::kPersisting &&
             state.note_app.session.commit_state !=
@@ -1343,6 +1345,11 @@ wqn::AiStreamingStatusView streaming_view{};
             last_status_refresh = now;
         }
 
+        // Fold RAM acceptance into this frame; do not paint "saving" and then
+        // schedule a second e-ink refresh just to advance the card. The buffer
+        // lease is acquired before acceptance; durable work stays off UI.
+        refresh_schedule = StrongerSchedule(refresh_schedule,
+            device_ui_internal::PumpWordObservationCommit(&ui_runtime));
         if (refresh_schedule != RefreshSchedule::kNone &&
             state.screen == wqn::UiScreen::kNote &&
             (wqn::NoteImageLoadingGraceActive(
@@ -1515,9 +1522,6 @@ wqn::AiStreamingStatusView streaming_view{};
             FinishProblemCloudRequest(device_ui_internal::CloudDomain::kProblemBulk);
         }
         device_ui_internal::PumpWordCandidatePrefetch(&ui_runtime);
-        pending_refresh_schedule = device_ui_internal::StrongerSchedule(
-            pending_refresh_schedule,
-            device_ui_internal::PumpWordObservationCommit(&ui_runtime));
         device_ui_internal::PumpNoteCandidatePrefetch(&ui_runtime);
         device_ui_internal::PumpNoteImageFetch(&ui_runtime);
         device_ui_internal::PumpNoteBodyPackFetch(&ui_runtime);

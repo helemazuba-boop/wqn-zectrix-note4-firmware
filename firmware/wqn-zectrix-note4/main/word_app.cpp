@@ -430,6 +430,14 @@ void PrepareObservation(
     }
     const auto& remote = state->session.persisted.remote;
     const size_t position = state->session.persisted.position;
+    if (!wqn::WordBatchPolicy::CanAccept(state->session.buffered_observations.size(),
+            state->session.batch_error != ESP_OK) ||
+        state->outbox.pending_count + state->outbox.suspended_count +
+            state->session.buffered_observations.size() >= state->outbox.capacity) {
+        state->session.batch_flush_requested = true;
+        state->message = "暂存已满，等待保存";
+        return;
+    }
     uint64_t next_ordinal = remote.items[position].ordinal;
     if (target == wqn::WordObservationTarget::kAdvance) {
         next_ordinal = PlannedNextOrdinal(state);
@@ -749,6 +757,11 @@ void FinishOrLoadAdvancedReview(wqn::WordAppState* state)
 void PauseWordSession(wqn::WordAppState* state)
 {
     if (state == nullptr) return;
+    if (wqn::HasBufferedWordObservations(*state)) {
+        state->session.batch_flush_requested = true;
+        state->message = "正在保存暂存，请稍后暂停";
+        return;
+    }
     state->session.persisted.paused = true;
     SetStudySessionResumable(state, state->session.persisted.remote.mode, true);
     SaveSequentialCursor(state);
@@ -990,6 +1003,21 @@ esp_err_t HandleWordAppInput(WordAppState* state, WordInput input)
         ESP_RETURN_ON_ERROR(InitWordApp(state), kTag, "init word app");
     }
     ActivatePendingWordPackIndex(state);
+
+    if (state->session.batch_error != ESP_OK && HasBufferedWordObservations(*state)) {
+        if (input == WordInput::kConfirm || input == WordInput::kLongConfirm) {
+            state->session.batch_retry_after_ms = 0;
+            state->session.batch_flush_requested = true;
+            state->message = "正在重试暂存，尚未保存";
+        }
+        return ESP_OK;
+    }
+    if (HasBufferedWordObservations(*state) &&
+        (input == WordInput::kLongConfirm || state->mode != WordAppMode::kWordCard)) {
+        state->session.batch_flush_requested = true;
+        state->message = "正在保存暂存，请稍后重试";
+        return ESP_OK;
+    }
 
     switch (state->mode) {
         case WordAppMode::kHome: {
@@ -1683,7 +1711,7 @@ bool TakeWordObservationEffect(
     return true;
 }
 
-void ApplyWordObservationCommitResult(WordAppState* state, esp_err_t result)
+void ApplyWordObservationState(WordAppState* state, esp_err_t result, bool durable)
 {
     if (state == nullptr) return;
     // The bound dispatch has now been consumed; clear it so a duplicate/late
@@ -1710,8 +1738,9 @@ void ApplyWordObservationCommitResult(WordAppState* state, esp_err_t result)
     state->session.persisted = std::move(state->session.pending_advanced_session);
     state->session.pending_advanced_session = {};
     state->session.pending_observation = {};
-    state->session.commit_state = WordObservationCommitState::kCloudPending;
-    if (state->outbox.pending_count + state->outbox.suspended_count <
+    state->session.commit_state = durable ? WordObservationCommitState::kCloudPending
+                                         : WordObservationCommitState::kBuffered;
+    if (durable && state->outbox.pending_count + state->outbox.suspended_count <
         state->outbox.capacity) {
         ++state->outbox.pending_count;
     }
@@ -1727,6 +1756,7 @@ void ApplyWordObservationCommitResult(WordAppState* state, esp_err_t result)
     } else {
         state->message = "已保存，待同步";
     }
+    if (!durable) state->message = "已暂存，待保存";
     if (observation_mode == protocol::word_study_v1::Mode::kReview &&
         action != protocol::word_study_v1::ObservationAction::kRevealed) {
         ApplyWordReviewBookkeeping(state, action, answered_ordinal);
@@ -1742,7 +1772,107 @@ void ApplyWordObservationCommitResult(WordAppState* state, esp_err_t result)
         ShowStudyCard(state);
         return;
     }
+    if (!durable && (!state->session.persisted.active ||
+        (state->session.persisted.position >= state->session.persisted.remote.items.size() &&
+         !state->session.persisted.remote.has_more && state->review.pool.empty()))) {
+        // Finishing can write a sequential cursor or replace the SID for an
+        // intake chain. Keep those lifecycle effects behind the durable fence.
+        state->session.batch_finish_pending = true;
+        state->session.batch_flush_requested = true;
+        state->mode = WordAppMode::kSessionStarting;
+        state->message = "正在保存最后的暂存";
+        return;
+    }
     FinishOrLoadAdvancedReview(state);
+}
+
+void ApplyWordObservationCommitResult(WordAppState* state, esp_err_t result)
+{
+    ApplyWordObservationState(state, result, true);
+}
+
+bool HasBufferedWordObservations(const WordAppState& state)
+{
+    return !state.session.buffered_observations.empty();
+}
+
+bool BufferWordObservationEffect(WordAppState* state, const std::string& request_id,
+    const std::string& occurred_at, int64_t now_ms)
+{
+    if (state == nullptr || !WordBatchPolicy::CanAccept(state->session.buffered_observations.size(),
+            state->session.batch_error != ESP_OK)) return false;
+    DurableWordObservation observation;
+    PersistedWordSession advanced;
+    if (!TakeWordObservationEffect(state, request_id, occurred_at, 0, &observation, &advanced)) return false;
+    state->session.buffered_observations.push_back({std::move(observation), now_ms});
+    state->session.buffered_advanced_session = std::move(advanced);
+    ApplyWordObservationState(state, ESP_OK, false);
+    ESP_LOGI(kTag, "word observation RAM accepted: sequence=%llu pending=%u inflight=%u",
+        static_cast<unsigned long long>(state->session.buffered_observations.back().observation.sequence),
+        static_cast<unsigned>(state->session.buffered_observations.size()),
+        static_cast<unsigned>(state->session.batch_in_flight));
+    return true;
+}
+
+bool TakeWordObservationBatch(WordAppState* state, uint32_t operation_id, int64_t now_ms,
+    std::vector<DurableWordObservation>* observations, PersistedWordSession* advanced_session)
+{
+    if (state == nullptr || observations == nullptr || advanced_session == nullptr || operation_id == 0)
+        return false;
+    auto& session = state->session;
+    // Do not snapshot across a Prepared-but-not-yet-accepted cursor change.
+    if (session.observation_effect_ready || session.buffered_observations.empty() ||
+        !WordBatchPolicy::FlushDue(session.buffered_observations.size(), session.batch_in_flight,
+            session.buffered_observations.front().accepted_ms, now_ms, session.batch_retry_after_ms,
+            session.batch_flush_requested)) return false;
+    observations->clear();
+    observations->reserve(session.buffered_observations.size());
+    for (const auto& value : session.buffered_observations) observations->push_back(value.observation);
+    *advanced_session = session.buffered_advanced_session;
+    session.batch_in_flight = observations->size();
+    session.batch_operation_id = operation_id;
+    return true;
+}
+
+bool ApplyWordObservationBatchResult(WordAppState* state, esp_err_t result,
+    uint32_t operation_id, int64_t now_ms)
+{
+    if (state == nullptr || operation_id == 0 || state->session.batch_operation_id != operation_id ||
+        state->session.batch_in_flight == 0 ||
+        state->session.batch_in_flight > state->session.buffered_observations.size()) return false;
+    auto& session = state->session;
+    const size_t count = session.batch_in_flight;
+    session.batch_operation_id = 0;
+    session.batch_in_flight = 0;
+    session.batch_error = result;
+    if (result != ESP_OK) {
+        session.batch_retry_after_ms = now_ms + WordBatchPolicy::kRetryMs;
+        session.batch_flush_requested = true;
+        state->message = "暂存未保存，确认重试";
+        return true;
+    }
+    session.buffered_observations.erase(session.buffered_observations.begin(),
+        session.buffered_observations.begin() + count);
+    state->outbox.pending_count = std::min(state->outbox.capacity,
+        state->outbox.pending_count + count);
+    session.batch_retry_after_ms = 0;
+    if (session.buffered_observations.empty()) {
+        session.buffered_advanced_session = {};
+        session.batch_flush_requested = false;
+        // A newer effect may already be Prepared. Its kPersisting fence and
+        // message must survive this older batch completion.
+        if (!session.observation_effect_ready) {
+            session.commit_state = WordObservationCommitState::kCloudPending;
+            state->message = "已保存，待同步";
+        }
+        if (session.batch_finish_pending) {
+            session.batch_finish_pending = false;
+            FinishOrLoadAdvancedReview(state);
+        }
+    } else {
+        state->message = "已暂存，待保存";
+    }
+    return true;
 }
 
 WordAppSnapshot BuildWordAppSnapshot(const WordAppState& state)

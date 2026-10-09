@@ -137,6 +137,17 @@ UiUpdate UiRuntime::DispatchButton(
     const wqn::ButtonEvent& event,
     int64_t event_time_ms)
 {
+    if (wqn::HasBufferedWordObservations(state_.word_app) &&
+        event.type == wqn::ButtonEventType::kLongPress) {
+        if (!word_boundary_pending_) {
+            word_boundary_pending_ = true;
+            word_boundary_event_ = event;
+        }
+        state_.word_app.session.batch_flush_requested = true;
+        state_.word_app.session.batch_retry_after_ms = 0;
+        state_.word_app.message = "正在保存暂存，请稍后重试";
+        return FinishEvent(AppEventKind::kButton, RefreshSchedule::kSelection, true);
+    }
     const RefreshSchedule refresh = ApplyButtonEvent(event, event_time_ms, &state_);
     RetainTimeAppState(state_.time_app);
     return FinishEvent(
@@ -333,6 +344,25 @@ bool UiRuntime::TakeWordObservationEffect(
 UiUpdate UiRuntime::DispatchWordObservationPersistResult(
     esp_err_t result, uint32_t operation_id)
 {
+    if (state_.word_app.session.batch_operation_id == operation_id &&
+        state_.word_app.session.batch_in_flight != 0) {
+        const bool applied = wqn::ApplyWordObservationBatchResult(&state_.word_app, result,
+            operation_id, esp_timer_get_time() / 1000);
+        if (applied && result == ESP_OK) wqn::services::RequestWordOutboxUpload();
+        RefreshSchedule boundary_refresh = RefreshSchedule::kNone;
+        if (applied && result == ESP_OK && !wqn::HasBufferedWordObservations(state_.word_app) &&
+            !state_.word_app.session.observation_effect_ready && word_boundary_pending_) {
+            word_boundary_pending_ = false;
+            // Apply the original navigation/pause gesture once, only after
+            // all buffered events are durable. No second user press required.
+            boundary_refresh = ApplyButtonEvent(word_boundary_event_, esp_timer_get_time() / 1000, &state_);
+        }
+        BuildHomeSummary(&state_);
+        return FinishEvent(AppEventKind::kWordObservationPersist,
+            StrongerSchedule(boundary_refresh,
+                state_.screen == wqn::UiScreen::kWord ? RefreshSchedule::kSelection : RefreshSchedule::kNone),
+            applied);
+    }
     // [persist-worker] Bind the result to the word state it was taken from.
     // The worker ran async; the user may have left the scoped page or switched
     // decks (ResetWordSessionsForScopeChange resets the session, clearing the
@@ -369,6 +399,30 @@ UiUpdate UiRuntime::DispatchWordObservationPersistResult(
         ? RefreshSchedule::kSelection
         : RefreshSchedule::kNone;
     return FinishEvent(AppEventKind::kWordObservationPersist, refresh, true);
+}
+
+UiUpdate UiRuntime::DispatchWordObservationBuffered(const std::string& request_id,
+    const std::string& occurred_at, int64_t now_ms)
+{
+    const bool accepted = wqn::BufferWordObservationEffect(&state_.word_app, request_id, occurred_at, now_ms);
+    if (!accepted) return DispatchWordObservationTakeFailed();
+    BuildHomeSummary(&state_);
+    return FinishEvent(AppEventKind::kWordObservationPersist,
+        state_.screen == wqn::UiScreen::kWord ? RefreshSchedule::kSelection : RefreshSchedule::kNone, true);
+}
+
+bool UiRuntime::TakeWordObservationBatch(uint32_t operation_id, int64_t now_ms,
+    std::vector<wqn::DurableWordObservation>* observations,
+    wqn::PersistedWordSession* advanced_session)
+{
+    return wqn::TakeWordObservationBatch(&state_.word_app, operation_id, now_ms,
+        observations, advanced_session);
+}
+
+void UiRuntime::RequestWordBatchFlush()
+{
+    if (wqn::HasBufferedWordObservations(state_.word_app))
+        state_.word_app.session.batch_flush_requested = true;
 }
 
 UiUpdate UiRuntime::DispatchWordObservationTakeFailed()

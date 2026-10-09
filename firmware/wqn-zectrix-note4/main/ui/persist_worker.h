@@ -38,6 +38,9 @@
 //       return;
 //   }
 //   EnqueueReserved...(t, std::move(payload));    // cannot fail after reserve
+// Word batching additionally has an explicit UI-owned RAM acceptance stage.
+// Its separate buffer lease and capacity include the in-flight prefix; this
+// worker ACK proves durability only and never reinstalls an older RAM cursor.
 
 namespace device_ui_internal {
 
@@ -118,6 +121,10 @@ void CancelPersistReservation(const PersistTicket& ticket);
 void EnqueueReservedWordObservation(
     const PersistTicket& ticket,
     wqn::DurableWordObservation observation,
+    wqn::PersistedWordSession advanced_session);
+void EnqueueReservedWordObservations(
+    const PersistTicket& ticket,
+    std::vector<wqn::DurableWordObservation> observations,
     wqn::PersistedWordSession advanced_session);
 void EnqueueReservedNoteObservation(
     const PersistTicket& ticket,

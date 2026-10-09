@@ -147,6 +147,12 @@ public:
         wqn::DurableWordObservation* observation,
         wqn::PersistedWordSession* advanced_session);
     UiUpdate DispatchWordObservationPersistResult(esp_err_t result, uint32_t operation_id);
+    UiUpdate DispatchWordObservationBuffered(const std::string& request_id,
+        const std::string& occurred_at, int64_t now_ms);
+    bool TakeWordObservationBatch(uint32_t operation_id, int64_t now_ms,
+        std::vector<wqn::DurableWordObservation>* observations,
+        wqn::PersistedWordSession* advanced_session);
+    void RequestWordBatchFlush();
     // Take failed inside the pump (cursor desync -> session already moved to
     // kFailed). Route it through FinishEvent so the revision advances and the
     // failure frame is not deduped against the "正在保存" frame's revision.
@@ -215,6 +221,8 @@ private:
     uint64_t NextRevision();
 
     wqn::AppState state_;
+    bool word_boundary_pending_ = false;
+    wqn::ButtonEvent word_boundary_event_{};
     uint64_t event_sequence_ = 0;
     // [picker-stale] Last attempt at the picker's self-refresh, whether or not
     // the worker accepted it: a rejected poll must not retry on the next tick.

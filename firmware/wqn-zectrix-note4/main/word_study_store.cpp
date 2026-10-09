@@ -2907,6 +2907,7 @@ esp_err_t CommitObservationTransaction(void* opaque)
 struct CommitBatchContext {
     const std::vector<wqn::DurableWordObservation>* observations;
     const wqn::PersistedWordSession* advanced_session;
+    bool maintenance_required = false;
 };
 
 esp_err_t CommitObservationBatchTransaction(void* opaque)
@@ -2917,6 +2918,7 @@ esp_err_t CommitObservationBatchTransaction(void* opaque)
         context->observations->size() > kOutboxAppendBatchCapacity) return ESP_ERR_INVALID_ARG;
     const auto& observations = *context->observations;
     const auto& session = *context->advanced_session;
+    context->maintenance_required = false;
     uint32_t ordinal = 0;
     if (session.deck_scope_generation != wqn::GetDeckScopeGeneration()) return ESP_ERR_INVALID_STATE;
     if (!SessionCursorOrdinal(session, &ordinal)) return ESP_ERR_INVALID_ARG;
@@ -2960,13 +2962,21 @@ esp_err_t CommitObservationBatchTransaction(void* opaque)
         ESP_RETURN_ON_ERROR(CheckpointSessionsFromOutbox(*scan), kTag, "checkpoint batch repair");
         ESP_RETURN_ON_ERROR(CompactCachedOutbox(scan), kTag, "repair before batch");
     }
-    ESP_RETURN_ON_ERROR(CheckOutboxAppendBudget(*scan, true), kTag, "batch quota");
-    if (records.size() > (kOutboxMaxRecords - scan->total_records - scan->pending.size()) / 2)
+    if (CheckOutboxAppendBudget(*scan, true) != ESP_OK) {
+        context->maintenance_required = true;
         return ESP_ERR_INVALID_SIZE;
+    }
+    if (records.size() > (kOutboxMaxRecords - scan->total_records - scan->pending.size()) / 2) {
+        context->maintenance_required = true;
+        return ESP_ERR_INVALID_SIZE;
+    }
     const int64_t started_us = esp_timer_get_time();
     size_t bytes = 0;
-    ESP_RETURN_ON_ERROR(AppendOutboxRecords(records.data(), records.size(), nullptr, &bytes),
-                        kTag, "append observation batch");
+    const esp_err_t appended = AppendOutboxRecords(records.data(), records.size(), nullptr, &bytes);
+    if (appended != ESP_OK) {
+        context->maintenance_required = appended == ESP_ERR_INVALID_SIZE;
+        return appended;
+    }
     scan->pending.insert(scan->pending.end(), records.begin(), records.end());
     scan->total_records += records.size();
     ESP_LOGI(kTag, "word observation batch durable: count=%u appended=%u bytes=%u "
@@ -3357,13 +3367,19 @@ esp_err_t RunOutboxMaintenance(OutboxMaintenanceContext* context, const char* ow
 
 template <typename Transaction, typename Context>
 esp_err_t ExecuteWithOutboxMaintenance(
-    const char* holder, Transaction transaction, Context* context)
+    const char* holder, Transaction transaction, Context* context,
+    bool foreground = false, bool maintain_after_commit = true)
 {
     if (context == nullptr) return ESP_ERR_INVALID_ARG;
     auto lease = wqn::runtime::SleepLease::TryAcquire(
         wqn::runtime::SleepBlocker::kStorage, holder, __FILE__, __LINE__);
     if (!lease) return ESP_ERR_INVALID_STATE;
-    esp_err_t result = wqn::services::ExecuteStorageTransactionNamed(transaction, context, holder);
+    const auto execute = [&]() {
+        return foreground
+            ? wqn::services::ExecuteForegroundStorageTransaction(transaction, context, holder)
+            : wqn::services::ExecuteStorageTransactionNamed(transaction, context, holder);
+    };
+    esp_err_t result = execute();
     if (result != ESP_OK && context->maintenance_required) {
         // A legacy oversized journal or a damaged source must be healed
         // before appending. Retry ONCE after a fenced, stepped compaction;
@@ -3373,9 +3389,10 @@ esp_err_t ExecuteWithOutboxMaintenance(
         ESP_RETURN_ON_ERROR(RunOutboxMaintenance(&repair, "word-outbox-space-reclaim"),
                             kTag, "reclaim before word outbox mutation");
         if (repair.deferred) return result;
-        result = wqn::services::ExecuteStorageTransactionNamed(transaction, context, holder);
+        result = execute();
     }
     ESP_RETURN_ON_ERROR(result, kTag, "commit word outbox mutation");
+    if (!maintain_after_commit) return ESP_OK;
     OutboxMaintenanceContext maintenance;
     // Keep the same lease across all queue waits. A changed proof/deadline
     // defers maintenance without changing the already-durable mutation result;
@@ -3581,8 +3598,8 @@ esp_err_t CommitWordObservations(
     const PersistedWordSession& advanced_session)
 {
     CommitBatchContext context{&observations, &advanced_session};
-    return ExecuteWithStorageLease(
-        "word-observation-batch", CommitObservationBatchTransaction, &context, true);
+    return ExecuteWithOutboxMaintenance(
+        "word-observation-batch", CommitObservationBatchTransaction, &context, true, false);
 }
 
 esp_err_t PeekPendingWordObservation(DurableWordObservation* observation)

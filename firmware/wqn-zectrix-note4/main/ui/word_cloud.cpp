@@ -13,6 +13,7 @@
 #include <utility>
 
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "runtime/sleep_coordinator.h"
 #include "services/sync_service.h"
 #include "storage.h"
@@ -27,6 +28,7 @@ static std::atomic<bool> g_word_cloud_busy{false};
 static std::atomic<bool> g_word_pack_cloud_busy{false};
 wqn::runtime::SleepLease g_word_sleep_lease;
 wqn::runtime::SleepLease g_word_pack_sleep_lease;
+wqn::runtime::SleepLease g_word_buffer_sleep_lease;
 WordCloudResult g_word_result_slot;
 uint32_t g_word_result_generation = 0;
 WordCloudResult g_word_pack_result_slot;
@@ -46,48 +48,42 @@ RefreshSchedule PumpWordObservationCommit(UiRuntime* runtime)
     if (runtime == nullptr) {
         return RefreshSchedule::kNone;
     }
-    // One word commit in flight at a time; wait for the UI to ack the last one
-    // (the card stays in kPersisting until then, so no second effect is armed).
-    if (IsPersistKindBusy(PersistKind::kWordObservation)) {
-        return RefreshSchedule::kNone;
+    RefreshSchedule refresh = RefreshSchedule::kNone;
+    const int64_t now_ms = esp_timer_get_time() / 1000;
+    if (runtime->state().word_app.session.observation_effect_ready) {
+        // The RAM buffer needs its own lease BEFORE acceptance; the worker's
+        // lease only covers an individual flush. This prevents normal sleep
+        // or power-off from quiescing over unpersisted events.
+        if (!g_word_buffer_sleep_lease) {
+            g_word_buffer_sleep_lease = wqn::runtime::SleepLease::TryAcquire(
+                wqn::runtime::SleepBlocker::kStorage, "word-RAM-buffer", __FILE__, __LINE__);
+            if (!g_word_buffer_sleep_lease) return refresh;
+        }
+        const auto metadata = wqn::services::MakeDeviceRequestMetadata();
+        std::string occurred_at = CurrentIsoTimestamp();
+        if (occurred_at.empty()) occurred_at = "2024-01-01T00:00:00Z";
+        refresh = runtime->DispatchWordObservationBuffered(metadata.request_id, occurred_at, now_ms).refresh;
     }
-    // Cheap readiness pre-check: reservation takes a SleepLease + pool slot, so
-    // an idle pump must not reserve just to cancel. Reserve happens BEFORE the
-    // effect is pulled from UI state (that mutates it), so we must first know
-    // there is something to commit.
-    if (!runtime->state().word_app.session.observation_effect_ready) {
-        return RefreshSchedule::kNone;
+    const auto& session = runtime->state().word_app.session;
+    if (session.buffered_observations.empty()) {
+        g_word_buffer_sleep_lease.Reset();
+        return refresh;
     }
-    // Phase 1: reserve busy + slot + storage lease. On failure the UI state is
-    // untouched (effect still armed) -- just retry next pump.
+    if (!wqn::WordBatchPolicy::FlushDue(session.buffered_observations.size(), session.batch_in_flight,
+            session.buffered_observations.front().accepted_ms, now_ms, session.batch_retry_after_ms,
+            session.batch_flush_requested) || IsPersistKindBusy(PersistKind::kWordObservation)) return refresh;
+    // Reserve the slot before moving the owned flush payload. RAM acceptance
+    // is already explicit, so a failed reservation retains every identity.
     PersistTicket ticket = TryReservePersist(PersistKind::kWordObservation);
-    if (!ticket.valid()) {
-        return RefreshSchedule::kNone;
-    }
-    const auto metadata = wqn::services::MakeDeviceRequestMetadata();
-    std::string occurred_at = CurrentIsoTimestamp();
-    if (occurred_at.empty()) {
-        // Durable even before SNTP; the server clamps implausible times.
-        occurred_at = "2024-01-01T00:00:00Z";
-    }
-    wqn::DurableWordObservation observation;
+    if (!ticket.valid()) return refresh;
+    std::vector<wqn::DurableWordObservation> observations;
     wqn::PersistedWordSession advanced_session;
-    // Phase 2: only now pull the effect from UI state, binding this dispatch's
-    // operation_id so a late result after a scope reset is rejected.
-    if (!runtime->TakeWordObservationEffect(
-            metadata.request_id, occurred_at, ticket.operation_id,
-            &observation, &advanced_session)) {
-        // Take mutated state to kFailed ("会话游标无效") and cleared the effect;
-        // release the reservation and route the failure through a typed event
-        // so the revision advances (this runs after the display commit, so the
-        // caller folds the returned refresh into the next iteration's pending
-        // schedule instead of leaving a stuck "正在保存").
+    if (!runtime->TakeWordObservationBatch(ticket.operation_id, now_ms, &observations, &advanced_session)) {
         CancelPersistReservation(ticket);
-        return runtime->DispatchWordObservationTakeFailed().refresh;
+        return refresh;
     }
-    EnqueueReservedWordObservation(
-        ticket, std::move(observation), std::move(advanced_session));
-    return RefreshSchedule::kNone;
+    EnqueueReservedWordObservations(ticket, std::move(observations), std::move(advanced_session));
+    return refresh;
 }
 
 bool IsWordCloudBusy()
@@ -262,6 +258,13 @@ bool QueueWordCandidatePage(
 void PumpWordCandidatePrefetch(UiRuntime* runtime)
 {
     if (runtime == nullptr || IsWordCloudBusy()) return;
+    if (wqn::HasBufferedWordObservations(runtime->state().word_app) ||
+        runtime->state().word_app.session.observation_effect_ready) {
+        // A page extension writes a full snapshot. Never publish RAM-ahead
+        // progress or prune the candidate window before the buffer is durable.
+        if (runtime->state().word_app.session.page_requested) runtime->RequestWordBatchFlush();
+        return;
+    }
     wqn::protocol::word_study_v1::CandidatePageRequest request;
     request.metadata = wqn::services::MakeDeviceRequestMetadata();
     std::string session_id;

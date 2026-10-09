@@ -34,6 +34,7 @@ constexpr char kTag[] = "wqn_ui";
 bool AnyLocalPersistPending(const wqn::UiState& state)
 {
     return device_ui_internal::IsAnyPersistBusy() ||
+        wqn::HasBufferedWordObservations(state.word_app) ||
         state.word_app.session.commit_state ==
             wqn::WordObservationCommitState::kPersisting ||
         state.note_app.session.commit_state ==
@@ -276,8 +277,9 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
         }
         if (short_press && event.button == wqn::ButtonId::kConfirm) {
             if (settings.word_deck_selected < settings.word_deck_options.size() &&
-                state->word_app.session.commit_state ==
-                    wqn::WordObservationCommitState::kPersisting) {
+                (wqn::HasBufferedWordObservations(state->word_app) ||
+                 state->word_app.session.commit_state == wqn::WordObservationCommitState::kPersisting)) {
+                state->word_app.session.batch_flush_requested = true;
                 // A word answer is still pending (kPersisting spans Prepare ->
                 // worker Apply, so it also covers the Prepare->reserve gap where
                 // persist-busy is briefly false but the effect is still armed):
@@ -382,6 +384,7 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
             // flag, so an armed observation cannot be erased underneath the
             // user.
             if (AnyLocalPersistPending(*state)) {
+                state->word_app.session.batch_flush_requested = true;
                 state->settings.notice = "正在保存，请稍后";
                 return RefreshSchedule::kConfig;
             }
@@ -402,6 +405,11 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
 
     if (state->settings.dialog == wqn::SettingsDialog::kPowerOff) {
         if (long_press && event.button == wqn::ButtonId::kConfirm) {
+            if (wqn::HasBufferedWordObservations(state->word_app)) {
+                state->word_app.session.batch_flush_requested = true;
+                state->settings.notice = "正在保存暂存，请稍后关机";
+                return RefreshSchedule::kConfig;
+            }
             // [power-fix] Hand off to the PowerCoordinator: it whites the
             // panel on the EPD owner task, quiesces services and cuts the
             // latch. The request re-arms itself while quiesce is busy, so
@@ -529,6 +537,7 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
     // persist worker's transaction and re-stall the UI. Refuse the action with
     // a notice; nothing is opened, read or written.
     if (AnyLocalPersistPending(*state)) {
+        state->word_app.session.batch_flush_requested = true;
         state->settings.notice = "正在保存，请稍后";
         return RefreshSchedule::kConfig;
     }
@@ -1800,12 +1809,10 @@ RefreshSchedule ApplyButtonEvent(
                 ? "单词服务忙，请重试"
                 : "本轮准备失败，请重试";
         }
-        // [persist-worker] The word observation commit (durable outbox append +
-        // session-cursor snapshot) no longer runs synchronously here -- it used
-        // to block the UI task on foreground storage. PumpWordObservationCommit
-        // now hands it to the persist worker; the card stays in kPersisting
-        // ("正在保存") until the worker's result is applied (advance card / retry)
-        // on the UI task via DispatchWordObservationPersistResult.
+        // The word pump accepts this effect into the bounded RAM buffer before
+        // rendering, then advances the card without claiming durability. A
+        // later worker batch ACK releases only its immutable prefix. Failed
+        // flushes retain identities and block lifecycle changes, not UI I/O.
         BuildHomeSummary(state);
         return RefreshSchedule::kSelection;
     }

@@ -10,6 +10,8 @@
 #include "word_study_store.h"
 #include "wqn_api.h"
 
+#include "word_batch_policy.h"
+
 namespace wqn {
 
 enum class WordInput {
@@ -62,6 +64,7 @@ enum class WordObservationCommitState : uint8_t {
     kCloudPending,
     kCloudAcknowledged,
     kFailed,
+    kBuffered,
 };
 
 // One word the user failed to recognize during a review session. It is
@@ -132,6 +135,20 @@ struct WordSessionState {
     // submit invalidates a late result, preventing it from installing a stale
     // or empty advanced session over freshly-reset state.
     uint32_t pending_persist_operation_id = 0;
+    struct BufferedObservation {
+        DurableWordObservation observation;
+        int64_t accepted_ms = 0;
+    };
+    // UI-owned immutable events, INCLUDING the worker's in-flight prefix.
+    // No worker result installs an older cursor over RAM-ahead progress.
+    std::vector<BufferedObservation> buffered_observations;
+    PersistedWordSession buffered_advanced_session;
+    size_t batch_in_flight = 0;
+    uint32_t batch_operation_id = 0;
+    int64_t batch_retry_after_ms = 0;
+    esp_err_t batch_error = ESP_OK;
+    bool batch_flush_requested = false;
+    bool batch_finish_pending = false;
 };
 
 struct WordOutboxState {
@@ -321,6 +338,13 @@ bool TakeWordObservationEffect(
     DurableWordObservation* observation,
     PersistedWordSession* advanced_session);
 void ApplyWordObservationCommitResult(WordAppState* state, esp_err_t result);
+bool HasBufferedWordObservations(const WordAppState& state);
+bool BufferWordObservationEffect(WordAppState* state, const std::string& request_id,
+    const std::string& occurred_at, int64_t now_ms);
+bool TakeWordObservationBatch(WordAppState* state, uint32_t operation_id, int64_t now_ms,
+    std::vector<DurableWordObservation>* observations, PersistedWordSession* advanced_session);
+bool ApplyWordObservationBatchResult(WordAppState* state, esp_err_t result,
+    uint32_t operation_id, int64_t now_ms);
 WordAppSnapshot BuildWordAppSnapshot(const WordAppState& state);
 std::string WordAppProgressLabel(const WordAppState& state);
 std::string WordAppStatusLine(const WordAppState& state);

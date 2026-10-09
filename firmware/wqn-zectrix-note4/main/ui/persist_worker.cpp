@@ -54,6 +54,7 @@ struct PersistCommand {
     // strings keep their heap data, so holding every kind's members inline
     // costs headers (a few hundred bytes) not the session arrays.
     wqn::DurableWordObservation word_obs;
+    std::vector<wqn::DurableWordObservation> word_batch;
     wqn::PersistedWordSession word_advanced;
     wqn::DurableNoteObservation note_obs;
     wqn::PersistedNoteSession note_advanced;
@@ -211,6 +212,8 @@ esp_err_t ExecutePersistCommand(PersistCommand& command)
 {
     switch (command.kind) {
         case PersistKind::kWordObservation:
+            if (!command.word_batch.empty())
+                return wqn::CommitWordObservations(command.word_batch, command.word_advanced);
             return wqn::CommitWordObservation(command.word_obs, command.word_advanced);
         case PersistKind::kNoteObservation:
             return wqn::CommitNoteObservation(command.note_obs, command.note_advanced);
@@ -266,6 +269,7 @@ void PublishPersistResult(PersistCommand& command, uint8_t slot_index)
 void ClearCommandPayload(PersistCommand& command)
 {
     command.word_obs = {};
+    command.word_batch.clear();
     command.word_advanced = {};
     command.note_obs = {};
     command.note_advanced = {};
@@ -434,6 +438,18 @@ void EnqueueReservedWordObservation(
         return;
     }
     command->word_obs = std::move(observation);
+    command->word_advanced = std::move(advanced_session);
+    EnqueueReserved(*command, ticket.slot_index, ticket.kind);
+}
+
+void EnqueueReservedWordObservations(
+    const PersistTicket& ticket,
+    std::vector<wqn::DurableWordObservation> observations,
+    wqn::PersistedWordSession advanced_session)
+{
+    PersistCommand* command = ReservedCommand(ticket);
+    if (command == nullptr || ticket.kind != PersistKind::kWordObservation) return;
+    command->word_batch = std::move(observations);
     command->word_advanced = std::move(advanced_session);
     EnqueueReserved(*command, ticket.slot_index, ticket.kind);
 }
