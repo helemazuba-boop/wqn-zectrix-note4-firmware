@@ -3015,13 +3015,16 @@ esp_err_t CommitObservationBatchTransaction(void* opaque)
     }
     scan->pending.insert(scan->pending.end(), records.begin(), records.end());
     scan->total_records += records.size();
+    const int64_t completed_us = esp_timer_get_time();
     ESP_LOGI(kTag, "word observation batch durable: count=%u appended=%u bytes=%u "
-                  "total_ms=%lld first_sequence=%llu last_sequence=%llu mode=%u session=%s",
+                  "total_ms=%lld first_sequence=%llu last_sequence=%llu mode=%u session=%s "
+                  "clock=esp_timer append_start_us=%lld append_end_us=%lld",
         static_cast<unsigned>(observations.size()), static_cast<unsigned>(records.size()),
-        static_cast<unsigned>(bytes), static_cast<long long>((esp_timer_get_time() - started_us) / 1000),
+        static_cast<unsigned>(bytes), static_cast<long long>((completed_us - started_us) / 1000),
         static_cast<unsigned long long>(observations.front().sequence),
         static_cast<unsigned long long>(last.sequence), static_cast<unsigned>(last.mode),
-        last.session_id.c_str());
+        last.session_id.c_str(), static_cast<long long>(started_us),
+        static_cast<long long>(completed_us));
     return ESP_OK;
 }
 
@@ -3181,9 +3184,12 @@ esp_err_t AckObservationBatchTransaction(void* opaque)
     }
     scan->ack_records += records.size();
     scan->total_records += records.size();
-    ESP_LOGI(kTag, "word ACK batch durable: count=%u bytes=%u total_ms=%lld",
+    const int64_t completed_us = esp_timer_get_time();
+    ESP_LOGI(kTag, "word ACK batch durable: count=%u bytes=%u total_ms=%lld "
+                  "clock=esp_timer append_start_us=%lld append_end_us=%lld",
         static_cast<unsigned>(records.size()), static_cast<unsigned>(bytes),
-        static_cast<long long>((esp_timer_get_time() - started) / 1000));
+        static_cast<long long>((completed_us - started) / 1000),
+        static_cast<long long>(started), static_cast<long long>(completed_us));
     return ESP_OK;
 }
 

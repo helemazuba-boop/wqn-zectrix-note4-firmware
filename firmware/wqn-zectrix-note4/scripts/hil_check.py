@@ -560,6 +560,26 @@ def cluster_gap(walls):
             + cluster_gap(xs[best_i:]))
 
 
+def parse_us_window(pairs, prefix, total_ms):
+    """Optional additive esp_timer fields; False = declared but malformed.
+
+    ESP_LOG timestamps use base + 10 ms ticks on this build, unlike the
+    esp_timer duration. Do not silently widen old windows; use these direct
+    fields whenever present, and never fall back after a malformed new field.
+    """
+    fields = dict(pairs)
+    start, end = prefix + '_start_us', prefix + '_end_us'
+    if not {'clock', start, end}.intersection(fields):
+        return None
+    if (len(fields) != len(pairs) or fields.get('clock') != 'esp_timer' or
+            any(not re.fullmatch(r'\d+', fields.get(key, '')) for key in (start, end))):
+        return False
+    begin, finish = int(fields[start]), int(fields[end])
+    if not 0 <= begin <= finish <= 0x7fffffffffffffff or (finish - begin) // 1000 != total_ms:
+        return False
+    return begin, finish
+
+
 @dataclass
 class Log:
     path: str
@@ -725,7 +745,9 @@ class Log:
             if BOOT_BANNER_RE.search(line) or ROM_RESET_RE.search(line):
                 epoch += 1
             for m in TX_RE.finditer(line):
-                log.tx.append(dict(m.groupdict(), epoch=epoch, line=line_no))
+                tx = dict(m.groupdict(), epoch=epoch, line=line_no)
+                tx['us_window'] = parse_us_window(KV_RE.findall(line), 'exec', int(tx['el']))
+                log.tx.append(tx)
             for m in PROBE_RE.finditer(line):
                 log.probes.append(dict(
                     {k: int(v) for k, v in m.groupdict().items()},
@@ -923,7 +945,15 @@ def hil_word_batches(log: Log):
                 malformed.append(f'{line_no + 1}:{head}')
                 continue
             fields.update({key: int(fields[key]) for key in numbers})
+            fields['us_window'] = parse_us_window(pairs, 'append', fields['total_ms']) if 'total_ms' in numbers else None
+            if fields['us_window'] is False:
+                malformed.append(f'{line_no + 1}:{head}微秒时间窗')
+                continue
             rows[head].append(dict(fields, t=int(prefix.group(1)), epoch=epoch, line=line_no))
+    batch_owners = {'word-observation-batch', 'word-outbox-ack-batch'}
+    malformed.extend(f"{tx['line'] + 1}:批量事务微秒时间窗" for tx in log.tx
+                     if tx['owner'] in batch_owners and (tx['us_window'] is False or
+                         (tx['us_window'] is not None and tx['t'] is None)))
     fmt = 'LOG:word-batches-parsed'
     names = ['WRITE:word-RAM-bound', 'WRITE:word-batch-record-accounting',
              'WRITE:word-batch-transaction-window', 'WRITE:word-batch-flush-trigger']
@@ -977,15 +1007,26 @@ def hil_word_batches(log: Log):
         return
     paired, bad, missing, used = [], [], [], set()
     for row, owner in observed:
-        candidates = [tx for tx in log.tx if tx['owner'] == owner and tx['epoch'] == row['epoch']
-                      and tx['line'] > row['line'] and tx['t'] is not None
-                      and int(tx['t']) - el(tx) - 2 <= row['t'] <= int(tx['t'])]
+        own = [tx for tx in log.tx if tx['owner'] == owner and tx['epoch'] == row['epoch']
+               and tx['line'] > row['line'] and tx['t'] is not None]
+        if row['us_window'] is not None:
+            # This exact same-clock containment is stronger than an ESP_LOG
+            # tick estimate. A real parent with missing/mismatched fields is
+            # FAIL, not a fallback to the weaker legacy timestamp branch.
+            candidates = [tx for tx in own if tx['us_window'] is not None and
+                          tx['us_window'][0] <= row['us_window'][1] <= tx['us_window'][1]]
+        else:
+            candidates = [tx for tx in own if
+                          int(tx['t']) - el(tx) - 2 <= row['t'] <= int(tx['t'])]
         if len(candidates) != 1:
-            missing.append(row['line'] + 1)
+            (bad if row['us_window'] is not None and own else missing).append(row['line'] + 1)
             continue
         tx = candidates[0]
-        if tx['line'] in used or tx['res'] != 'ESP_OK' or row['total_ms'] > el(tx) + 2 or (
-                row['t'] - row['total_ms'] < int(tx['t']) - el(tx) - 2):
+        if row['us_window'] is not None:
+            outside = row['us_window'][0] < tx['us_window'][0]
+        else:
+            outside = row['t'] - row['total_ms'] < int(tx['t']) - el(tx) - 2
+        if tx['line'] in used or tx['res'] != 'ESP_OK' or row['total_ms'] > el(tx) + 2 or outside:
             bad.append(row['line'] + 1)
         used.add(tx['line'])
         paired.append(tx)
@@ -998,6 +1039,7 @@ def hil_word_batches(log: Log):
         p90 = costs[(9 * len(costs) + 9) // 10 - 1]
         expect(log, names[2], True,
                f'StorageService 入队至完成 n={len(costs)}, p90={p90} ms, max={max(costs)} ms；'
+               f"直接微秒时间窗 n={sum(row['us_window'] is not None for row, _owner in observed)}；"
                '这不是按键到落盘/单事件时延；不除以批大小，也不宣称性能达标')
 
 
@@ -4984,6 +5026,49 @@ def selftest():
           batch_body+'I (1001) boot: End of partition table\n'+batch_tx, 'WRITE:word-batch-transaction-window'), 'SKIP')
     check('只见RAM不等于耐久', verdict(hil_word_batches, 'unrelated\n'+batch_ram,
           'WRITE:word-batch-record-accounting'), 'SKIP')
+    # Real clock source: IDF log_timestamp.c uses tick_count*(1000/HZ),
+    # whereas transaction duration uses esp_timer. Logs can also print after
+    # preemption. Direct same-clock endpoints, not a larger arbitrary slop.
+    window_name = 'WRITE:word-batch-transaction-window'
+    precise_body = batch_body.rstrip('\n') + ' clock=esp_timer append_start_us=600000 append_end_us=1000000\n'
+    precise_tx = batch_tx.replace('I (1002)', 'I (1010)').replace('elapsed_ms=420', 'elapsed_ms=402').rstrip('\n') + (
+        ' clock=esp_timer exec_start_us=599000 exec_end_us=1001000\n')
+    precise = precise_body + precise_tx
+    check('直接微秒窗不借10ms日志时钟', verdict(hil_word_batches, precise, window_name), 'PASS')
+    check('同形状去掉微秒字段旧估算仍FAIL', verdict(hil_word_batches,
+          precise_body.split(' clock=')[0] + '\n' + precise_tx.split(' clock=')[0] + '\n', window_name), 'FAIL')
+    outside = precise_body + precise_tx.replace('I (1010)', 'I (1002)').replace(
+        'exec_start_us=599000 exec_end_us=1001000', 'exec_start_us=601000 exec_end_us=1003000')
+    check('微秒起点越界不能退回会绿的旧估算', verdict(hil_word_batches, outside, window_name), 'FAIL')
+    check('微秒末点越界不能当未测', verdict(hil_word_batches,
+          precise.replace('total_ms=400', 'total_ms=405').replace('append_end_us=1000000', 'append_end_us=1005000'),
+          window_name), 'FAIL')
+    check('新body遇旧parent不借旧估算', verdict(hil_word_batches, precise_body + batch_tx, window_name), 'FAIL')
+    check('新body没有parent仍只算缺测', verdict(hil_word_batches, precise_body, window_name), 'SKIP')
+    check('微秒跨启动不能借窗', verdict(hil_word_batches,
+          precise_body + 'I (99) boot: End of partition table\n' + precise_tx, window_name), 'SKIP')
+    check('微秒同一parent不能支付两次', verdict(hil_word_batches,
+          precise_body + precise_body + precise_tx, window_name), 'FAIL')
+    check('微秒parent错误结果仍FAIL', verdict(hil_word_batches,
+          precise.replace('result=ESP_OK', 'result=ESP_FAIL'), window_name), 'FAIL')
+    for label, changed in (
+            ('body起点缺失', precise.replace('append_start_us=600000 ', '')),
+            ('body末点缺失', precise.replace('append_end_us=1000000', 'append_end_ms=1000')),
+            ('body单位漂移', precise.replace('append_start_us=600000', 'append_start_us=600000ms')),
+            ('body重复字段', precise.replace('append_end_us=1000000', 'append_end_us=1000000 append_end_us=1000000')),
+            ('body时钟错误', precise.replace('clock=esp_timer', 'clock=freertos', 1)),
+            ('body耗时不自洽', precise.replace('total_ms=400', 'total_ms=401')),
+            ('body负起点', precise.replace('append_start_us=600000', 'append_start_us=-600000')),
+            ('body倒序起止', precise.replace('append_start_us=600000', 'append_start_us=1000001')),
+            ('parent字段漂移', precise.replace('exec_end_us=1001000', 'exec_end_ms=1001')),
+            ('parent单位漂移', precise.replace('exec_end_us=1001000', 'exec_end_us=1001000ms')),
+            ('parent耗时不自洽', precise.replace('elapsed_ms=402', 'elapsed_ms=403')),
+            ('parent前缀丢失', precise.replace('I (1010) storage_service:', 'storage_service:'))):
+        check('微秒格式 ' + label, verdict(hil_word_batches, changed, 'LOG:word-batches-parsed'), 'FAIL')
+    precise_ack = ack_body.rstrip('\n') + ' clock=esp_timer append_start_us=1200000 append_end_us=1500000\n'
+    precise_ack_tx = ack_tx.rstrip('\n') + ' clock=esp_timer exec_start_us=1182000 exec_end_us=1502000\n'
+    check('ACK同样使用直接微秒窗', verdict(hil_word_batches, precise_ack + precise_ack_tx, window_name), 'PASS')
+
     for label, value, want in (
             ('计数5触发', queued_line, 'PASS'),
             ('未满5提前普通flush', queued_line.replace('count=5', 'count=4'), 'FAIL'),

@@ -151,7 +151,8 @@ void StorageServiceTask(void*)
                 ? ESP_ERR_INVALID_ARG
                 : command.transaction(command.context);
         }
-        const int64_t elapsed_ms = (esp_timer_get_time() - started_us) / 1000;
+        const int64_t completed_us = esp_timer_get_time();
+        const int64_t elapsed_ms = (completed_us - started_us) / 1000;
         // ESP-IDF reports this high-water mark in bytes, unlike upstream
         // FreeRTOS which documents stack words.
         const UBaseType_t free_stack_bytes = uxTaskGetStackHighWaterMark(nullptr);
@@ -165,13 +166,15 @@ void StorageServiceTask(void*)
         } else {
             ESP_LOGI(
                 kTag,
-                "storage transaction complete: request=%lu owner=%s queue_wait_ms=%lld elapsed_ms=%lld result=%s stack_free_bytes=%u",
+                "storage transaction complete: request=%lu owner=%s queue_wait_ms=%lld elapsed_ms=%lld result=%s stack_free_bytes=%u clock=esp_timer exec_start_us=%lld exec_end_us=%lld",
                 static_cast<unsigned long>(command.request_id),
                 command.owner == nullptr ? "unknown" : command.owner,
                 static_cast<long long>(queue_wait_ms),
                 static_cast<long long>(elapsed_ms),
                 esp_err_to_name(result),
-                static_cast<unsigned>(free_stack_bytes));
+                static_cast<unsigned>(free_stack_bytes),
+                static_cast<long long>(started_us),
+                static_cast<long long>(completed_us));
         }
         completion->result = result;
         completion->state.store(kCompletionDone, std::memory_order_release);
