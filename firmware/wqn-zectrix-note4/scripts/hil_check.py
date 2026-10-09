@@ -55,7 +55,12 @@ DISPATCH_RE = re.compile(
 PRESENT_RE = re.compile(
     r'display presented: revision=\d+ schedule=(?P<sch>\w+) elapsed_ms=(?P<el>\d+)')
 
-STACK_RE = re.compile(r'RenderFrameToEpd: stack HWM before render: (?P<hwm>\d+) bytes free')
+# These are DIFFERENT tasks even though both emit with tag wqn_ui. A healthy
+# EPD renderer must never hide the UI owner's 1128 B headroom (1009.4 crash).
+STACK_RE = re.compile(r'RenderFrameToEpd: stack HWM before render: (?P<hwm>\d+) bytes free(?=\s|$)')
+UI_STACK_RE = re.compile(
+    r'^[IWEDV] \(\d+\) wqn_ui: UI stack HWM: '
+    r'phase=(?P<phase>[a-z0-9-]+) free_bytes=(?P<hwm>\d+)(?=\s|$)', re.M)
 
 # P1 量测协议（存储侧重写前的插桩）。字段由重写侧约定，判读器只按契约解析：
 #   `atomic write: bytes=%u backup=%d fopen_ms=%lld write_ms=%lld stat_ms=%lld
@@ -565,6 +570,7 @@ class Log:
     dispatches: list = field(default_factory=list)
     presents: list = field(default_factory=list)
     hwm: list = field(default_factory=list)
+    ui_hwm: list = field(default_factory=list)
     probes: list = field(default_factory=list)
     bench_events: list = field(default_factory=list)
     rounds: list = field(default_factory=list)
@@ -625,6 +631,7 @@ class Log:
         log.dispatches = [m.groupdict() for m in DISPATCH_RE.finditer(text)]
         log.presents = [m.groupdict() for m in PRESENT_RE.finditer(text)]
         log.hwm = [int(m.group('hwm')) for m in STACK_RE.finditer(text)]
+        log.ui_hwm = [int(m.group('hwm')) for m in UI_STACK_RE.finditer(text)]
         log.bench_events = [m.group('what').lower() for m in BENCH_RE.finditer(text)]
         log.rounds = [{k: (v if k in ('shape', 'result') else int(v))
                        for k, v in m.groupdict().items()}
@@ -3834,11 +3841,25 @@ def hil_stability(log: Log):
                        f'`listener attached: COM7`，就是为了让这行自证身份）')
         expect(log, 'STAB:no-reboot-loop', log.boots <= 2,
                detail + '（>2 视为重启循环）')
+    overflows = re.findall(r'stack overflow in task\s+(\S+)', log.text)
     expect(log, 'STAB:no-stack-overflow',
-           not log.has('stack overflow in task'), '无任务栈溢出')
-    if log.hwm:
-        expect(log, 'STAB:stack-hwm-healthy', min(log.hwm) > 2000,
-               f'最低 HWM {min(log.hwm)}B（>2KB 余量）')
+           not log.has('stack overflow in task'),
+           f'任务栈溢出 {len(overflows)} 次：{overflows}' if overflows else '无任务栈溢出')
+    name = 'STAB:stack-hwm-healthy'
+    if (log.text.count('UI stack HWM:') != len(log.ui_hwm) or
+            log.text.count('RenderFrameToEpd: stack HWM before render:') != len(log.hwm)):
+        expect(log, name, False, '栈 HWM 格式漂移/缺字段/单位错误，不能静默忽略')
+        return
+    samples = [('wqn_ui', log.ui_hwm), ('wqn_epd_refresh', log.hwm)]
+    detail = '；'.join(f'{task}: n={len(values)}, min={min(values)} B'
+                      for task, values in samples if values)
+    if any(min(values) <= 2000 for _task, values in samples if values):
+        expect(log, name, False, detail + '；任一已测任务余量 <=2000 B')
+    elif any(not values for _task, values in samples):
+        missing = ', '.join(task for task, values in samples if not values)
+        skip(log, name, (detail + '；' if detail else '') + f'{missing} 缺测；不借另一任务的余量判通过')
+    else:
+        expect(log, name, True, detail + '；两任务已采样余量均 >2000 B，不证明未采样调用链')
 
 
 # --------------------------------------------------------------- 判据自检 --
@@ -3979,6 +4000,31 @@ def selftest():
         RESULTS.clear()
         fn(Log.from_text('fixture preamble (not a device line)\n' + text))
         return {n: k for _p, n, k, _o, _d in RESULTS}.get(name)
+
+    hwm_name = 'STAB:stack-hwm-healthy'
+    epd_hwm = 'I (100) wqn_ui: RenderFrameToEpd: stack HWM before render: 8860 bytes free\n'
+    ui_start = 'I (50) wqn_ui: UI stack HWM: phase=start free_bytes=4632\n'
+    ui_low = 'I (90) wqn_ui: UI stack HWM: phase=state-loaded free_bytes=1128\n'
+    ui_render = 'I (120) wqn_ui: UI stack HWM: phase=frame-dispatched free_bytes=4096\n'
+    check('EPD高余量不能盖住UI1128B', verdict(hil_stability, epd_hwm + ui_start + ui_low, hwm_name), 'FAIL')
+    check('UI低余量后EPD高余量仍FAIL', verdict(hil_stability, ui_low + epd_hwm, hwm_name), 'FAIL')
+    check('两任务分别健康才PASS', verdict(hil_stability, ui_start + epd_hwm + ui_render, hwm_name), 'PASS')
+    check('只有EPD不冒充UI健康', verdict(hil_stability, epd_hwm, hwm_name), 'SKIP')
+    check('只有UI不冒充EPD健康', verdict(hil_stability, ui_start, hwm_name), 'SKIP')
+    check('两任务都缺测显式SKIP', verdict(hil_stability, '', hwm_name), 'SKIP')
+    check('只测UI低余量仍FAIL', verdict(hil_stability, ui_low, hwm_name), 'FAIL')
+    check('UI健康不能盖住EPD低余量', verdict(hil_stability, ui_start + epd_hwm.replace('8860', '1000'), hwm_name), 'FAIL')
+    check('UI边界2000B不绿', verdict(hil_stability, ui_start.replace('4632', '2000') + epd_hwm, hwm_name), 'FAIL')
+    check('UI2001B过原门', verdict(hil_stability, ui_start.replace('4632', '2001') + epd_hwm, hwm_name), 'PASS')
+    check('UI字段漂移不静默SKIP', verdict(hil_stability, ui_start.replace('free_bytes=', 'free_words=') + epd_hwm, hwm_name), 'FAIL')
+    check('UI单位漂移不绿', verdict(hil_stability, ui_start.replace('4632', '4632ms') + epd_hwm, hwm_name), 'FAIL')
+    check('UI坏行混在绿行里仍FAIL', verdict(hil_stability, ui_start + ui_render.replace('free_bytes=', 'free=') + epd_hwm, hwm_name), 'FAIL')
+    check('EPD单位漂移不绿', verdict(hil_stability, ui_start + epd_hwm.replace('bytes free', 'words free'), hwm_name), 'FAIL')
+    check('UI来源错误不能借EPD健康', verdict(hil_stability, ui_start.replace('wqn_ui:', 'listener:') + epd_hwm, hwm_name), 'FAIL')
+    check('UI行锚定首行不匹配多行仍解析', Log.from_text('preamble\n' + ui_start + ui_low).ui_hwm, [4632, 1128])
+    check('已报栈溢出不能健康样本冒充无崩溃', verdict(hil_stability,
+          ui_start + epd_hwm + '***ERROR*** A stack overflow in task wqn_ui has been detected.\n',
+          'STAB:no-stack-overflow'), 'FAIL')
 
     queue_name = 'WRITE:word-commit-queue-wait'
     def commit(t=10000, wait=4479):
