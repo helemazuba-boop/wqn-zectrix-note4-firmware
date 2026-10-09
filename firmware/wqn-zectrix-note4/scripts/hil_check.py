@@ -951,6 +951,21 @@ def hil_word_batches(log: Log):
                 continue
             rows[head].append(dict(fields, t=int(prefix.group(1)), epoch=epoch, line=line_no))
     batch_owners = {'word-observation-batch', 'word-outbox-ack-batch'}
+    parsed_parent_lines = {tx['line'] for tx in log.tx if tx['owner'] in batch_owners}
+    for line_no, line in enumerate(log.lines):
+        if 'storage transaction complete:' not in line:
+            continue
+        pairs = KV_RE.findall(line)
+        fields = dict(pairs)
+        if fields.get('owner') not in batch_owners:
+            continue
+        # A present but unparseable ACK parent used to disappear from log.tx,
+        # so pairing treated format drift as an absent/truncated capture (SKIP).
+        # Check the emitter marker independently, including legacy parents.
+        if (line_no not in parsed_parent_lines or not LOG_PREFIX_RE.match(line) or
+                len(fields) != len(pairs) or any(not re.fullmatch(r'\d+', fields.get(key, ''))
+                                               for key in ('request', 'queue_wait_ms', 'elapsed_ms'))):
+            malformed.append(f'{line_no + 1}:批量事务格式漂移/缺字段')
     malformed.extend(f"{tx['line'] + 1}:批量事务微秒时间窗" for tx in log.tx
                      if tx['owner'] in batch_owners and (tx['us_window'] is False or
                          (tx['us_window'] is not None and tx['t'] is None)))
@@ -5068,6 +5083,15 @@ def selftest():
     precise_ack = ack_body.rstrip('\n') + ' clock=esp_timer append_start_us=1200000 append_end_us=1500000\n'
     precise_ack_tx = ack_tx.rstrip('\n') + ' clock=esp_timer exec_start_us=1182000 exec_end_us=1502000\n'
     check('ACK同样使用直接微秒窗', verdict(hil_word_batches, precise_ack + precise_ack_tx, window_name), 'PASS')
+    for label, changed in (
+            ('作答parent耗时单位漂移', precise.replace('elapsed_ms=402', 'elapsed_ms=402ms')),
+            ('ACKparent耗时单位漂移', precise_ack + precise_ack_tx.replace('elapsed_ms=320', 'elapsed_ms=320ms')),
+            ('ACKparentrequest缺失', ack_body + ack_tx.replace('request=8 ', '')),
+            ('ACKparentqueue单位漂移', ack_body + ack_tx.replace('queue_wait_ms=5', 'queue_wait_ms=5ms')),
+            ('旧ACKparent前缀缺失', ack_body + ack_tx.replace('I (1502) storage_service:', 'storage_service:')),
+            ('旧ACKparent重复字段', ack_body + ack_tx.rstrip('\n') + ' request=8\n')):
+        check('批量parent不可解析 ' + label,
+              verdict(hil_word_batches, 'unrelated first line\n' + changed, 'LOG:word-batches-parsed'), 'FAIL')
 
     for label, value, want in (
             ('计数5触发', queued_line, 'PASS'),
