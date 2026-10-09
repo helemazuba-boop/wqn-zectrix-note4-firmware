@@ -168,7 +168,15 @@ constexpr uint32_t kSessionMagic = 0;
 constexpr uint16_t kSessionSchemaVersion = 4;
 Session encoded_session;
 bool EncodeSession(const Session& session, std::vector<uint8_t>* output) {
-    encoded_session = session; output->assign(1, 0); return true;
+    encoded_session = session;
+    // Codec model only: encode every field present in this replay seam. The
+    // production comparison invokes the REAL complete EncodeSession codec.
+    std::string model = session.remote.session_id + ":" + session.remote.cursor + ":" +
+        std::to_string(session.remote.next_sequence) + ":" + std::to_string(session.position) + ":" +
+        std::to_string(session.deck_scope_generation) + ":" + std::to_string(int(session.remote.mode)) + ":" +
+        std::to_string(int(session.phase)) + ":" + std::to_string(session.active) + ":" + std::to_string(session.paused);
+    for(const auto& item:session.remote.items) model += ":" + std::to_string(item.ordinal);
+    output->assign(model.begin(),model.end()); return true;
 }
 uint32_t Crc32(const void*, size_t) { return 0; }
 esp_err_t AtomicWrite(const char*, const char*, const char*, const void*, size_t, bool) {
@@ -1029,12 +1037,29 @@ int main() {
     Check(SaveSessionTransaction(&captured) == ESP_ERR_INVALID_STATE && reads == 0 && scans == 0 &&
           saves == 0 && cursor_writes == 0,
           "stale scope is rejected before any snapshot or journal read");
-    Reset(); captured = disk[0]; save_error = ESP_FAIL;
+    Reset(); captured = disk[0]; captured.remote.cursor = "candidate-update"; save_error = ESP_FAIL;
     Check(SaveSessionTransaction(&captured) == ESP_FAIL && saves == 1 && cursor_writes == 0,
           "snapshot save failure cannot publish a refreshed cursor");
-    Reset(); captured = disk[0]; cursor_write_error = ESP_FAIL;
+    Reset(); captured = disk[0]; captured.remote.cursor = "candidate-update"; cursor_write_error = ESP_FAIL;
     Check(SaveSessionTransaction(&captured) == ESP_FAIL && saves == 1 && cursor_writes == 1,
           "cursor failure after successful protected snapshot save is still reported");
+    Reset(); captured = disk[0]; save_error = ESP_FAIL;
+    Check(SaveSessionTransaction(&captured) == ESP_OK && saves == 0 && cursor_writes == 1,
+          "identical complete snapshot reuses existing durable bytes but still refreshes the cursor contract");
+    for(int changed=0;changed<6;++changed) {
+        Reset(); captured=disk[0];
+        if(changed==0) captured.remote.items.push_back({14});
+        if(changed==1) captured.remote.cursor="new-cursor";
+        if(changed==2) captured.remote.session_id="new-SID";
+        if(changed==3) captured.paused=true;
+        if(changed==4) captured.phase=wqn::WordPresentationPhase::kBack;
+        if(changed==5) captured.active=false;
+        Check(SaveSessionTransaction(&captured)==ESP_OK && saves==1 && cursor_writes==1,
+              "same sequence is not enough to coalesce changed candidate content or control state");
+    }
+    Reset(); captured=disk[0]; cursor_write_error=ESP_FAIL;
+    Check(SaveSessionTransaction(&captured)==ESP_FAIL && saves==0 && cursor_writes==1,
+          "coalesced snapshot still reports a cursor persistence failure");
     Reset(); captured = disk[0]; captured.remote.items = {{12}, {13}};
     captured.remote.cursor = "next-page-cursor";
     captured.remote.next_sequence = 0;

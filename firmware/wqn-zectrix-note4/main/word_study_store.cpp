@@ -2689,6 +2689,16 @@ esp_err_t LoadSessionTransaction(void* opaque)
     return ESP_OK;
 }
 
+bool SameEncodedSessionSnapshot(const wqn::PersistedWordSession& left,
+                               const wqn::PersistedWordSession& right)
+{
+    // Compare the complete existing codec, not just SID/sequence or a hash.
+    // A new candidate window, pinned revision or paused flag is a real change.
+    std::vector<uint8_t> left_bytes, right_bytes;
+    return EncodeSession(left, &left_bytes) && EncodeSession(right, &right_bytes) &&
+        left_bytes == right_bytes;
+}
+
 esp_err_t SaveSessionProgressProtected(
     const wqn::PersistedWordSession& incoming,
     bool refresh_cursor)
@@ -2725,7 +2735,13 @@ esp_err_t SaveSessionProgressProtected(
         !SessionCoversRecords(scan->suspended, session)) {
         return ESP_ERR_INVALID_STATE;
     }
-    ESP_RETURN_ON_ERROR(SaveSessionRaw(session), kTag, "save word session snapshot");
+    if (loaded == ESP_OK && SameEncodedSessionSnapshot(session, current)) {
+        ESP_LOGI(kTag, "word snapshot coalesced: mode=%u sequence=%llu session=%s",
+            static_cast<unsigned>(session.remote.mode),
+            static_cast<unsigned long long>(session.remote.next_sequence), session.remote.session_id.c_str());
+    } else {
+        ESP_RETURN_ON_ERROR(SaveSessionRaw(session), kTag, "save word session snapshot");
+    }
     if (session.remote.next_sequence > incoming.remote.next_sequence) {
         ESP_LOGI(
             kTag,
