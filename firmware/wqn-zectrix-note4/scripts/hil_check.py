@@ -2038,7 +2038,7 @@ def hil_p0_wifi(log: Log):
                f'已迁移设备启动时有凭据且零 wifi 写事务（实测 {len(wifi_writes)} 笔）')
         return
     skip(log, 'P0-wifi:no-credential-state',
-         '日志既无迁移痕迹也无已存凭据（可能未连过 WiFi）')
+         '本捕获缺迁移/已存凭据状态行；未测到凭据状态，不推断设备从未连过 WiFi或没有凭据')
 
 
 def hil_p0_journal(log: Log):
@@ -2081,7 +2081,7 @@ def hil_gate_selftest(log: Log):
         expect(log, 'GATES:self-test-green', True, 'commit_state gate self-test passed')
     else:
         skip(log, 'GATES:self-test-green',
-             '本轮构建没有 gate 自检（b472f20 之前），无从判定')
+             '本捕获没有 gate 自检结果行，无法判定；启动前段可能缺失，不能推断固件版本或未编入自检')
 
 
 def hil_c5_domain_gate(log: Log):
@@ -2376,7 +2376,8 @@ def hil_owner_attribution(log: Log):
     defaulted = log.txof('background')
     if not has_pass:
         skip(log, 'OWNERS:attribution',
-             '本日志来自 owner 命名 pass 之前的构建，background 桶是当时的正常形态')
+             '本捕获没有命名 pass 的正向 owner 证据；不能推断固件版本，'
+             '也不能据此把 background 桶认证为正常')
         return
     expect(log, 'OWNERS:no-default-bucket',
            not defaulted,
@@ -4841,6 +4842,38 @@ def selftest():
         return next((d for _p, n, _k, _o, d in RESULTS if n == name), '')
 
     absent = 'unrelated first line\nI (1000) test: no business writes\n'
+    gate_name = 'GATES:self-test-green'
+    check('缺gate结果仍SKIP，不补一个默认PASS',
+          verdict(hil_gate_selftest, absent, gate_name), 'SKIP')
+    check('缺gate结果不能推断旧版本或未编入自检',
+          '不能推断固件版本或未编入自检' in detail(hil_gate_selftest, absent, gate_name), True)
+    gate_ok = 'I (1001) wqn_ui_gates: commit_state gate self-test passed\n'
+    gate_bad = 'E (1002) wqn_ui_gates: gate self-test failed: word-row scope switch\n'
+    check('捕获确有gate通过行仍PASS',
+          verdict(hil_gate_selftest, gate_ok, gate_name), 'PASS')
+    check('捕获确有gate失败行仍FAIL',
+          verdict(hil_gate_selftest, gate_bad, gate_name), 'FAIL')
+    check('gate失败不能被同捕获的通过行冲销',
+          verdict(hil_gate_selftest, gate_ok + gate_bad, gate_name), 'FAIL')
+    owner_skip = 'OWNERS:attribution'
+    check('缺owner证据仍SKIP',
+          verdict(hil_owner_attribution, absent, owner_skip), 'SKIP')
+    check('缺owner证据不能认证旧版本或正常background',
+          '不能推断固件版本' in detail(hil_owner_attribution, absent, owner_skip)
+          and '也不能据此把 background 桶认证为正常' in detail(
+              hil_owner_attribution, absent, owner_skip), True)
+    old_owner = 'I (1003) storage_service: owner=background queue_wait_ms=0 elapsed_ms=1 result=ESP_OK\n'
+    named_owner = 'I (1004) storage_service: owner=pp-stream queue_wait_ms=0 elapsed_ms=1 result=ESP_OK\n'
+    check('仅历史background仍SKIP，不偷偷扩大触发门',
+          verdict(hil_owner_attribution, old_owner, owner_skip), 'SKIP')
+    check('正向owner证据加漏名background仍FAIL',
+          verdict(hil_owner_attribution, named_owner + old_owner, 'OWNERS:no-default-bucket'), 'FAIL')
+    wifi_partial = absent + 'I (1005) wqn_wifi: WiFi got IP: ip=192.0.2.1\n'
+    wifi_name = 'P0-wifi:no-credential-state'
+    check('联网但凭据状态缺测仍SKIP，不当迁移PASS',
+          verdict(hil_p0_wifi, wifi_partial, wifi_name), 'SKIP')
+    check('缺凭据状态不推断从未联网或没有凭据',
+          '不推断设备从未连过 WiFi或没有凭据' in detail(hil_p0_wifi, wifi_partial, wifi_name), True)
     check('缺 append 字段只说日志缺测，不推断未进镜像',
           '日志未覆盖' in detail(hil_append_open_split, absent, 'WRITE:append-open-vs-fopen'), True)
     check('缺 NVS stats 不推断历史上从未实测',
