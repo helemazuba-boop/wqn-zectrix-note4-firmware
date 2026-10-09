@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-"""Exercise production RAM acceptance/flush/result reducers with host seams.
+"""Compile production prefetch reducers/cache read and ACK mailbox on a host.
 
-No flash, device or rendering. Lifecycle reducers keep their real control flow;
-card reads, review bookkeeping and final navigation are isolated host seams.
+Only card I/O, review selection and ESP services are seams; no flash/device.
 """
 import argparse
 from pathlib import Path
@@ -21,18 +20,19 @@ def main():
     root = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--source', type=Path, default=root / 'main/word_app.cpp')
-    parser.add_argument('--policy', type=Path, default=root / 'main/word_batch_policy.h')
+    parser.add_argument('--worker', type=Path, default=root / 'main/ui/persist_worker.cpp')
     args = parser.parse_args()
     source = args.source.read_text(encoding='utf-8')
+    worker = args.worker.read_text(encoding='utf-8')
     header = (root / 'main/word_app.h').read_text(encoding='utf-8')
     pieces = {
-        '@@POLICY@@': args.policy.read_text(encoding='utf-8').replace('#pragma once', ''),
-        '@@SESSION@@': section(header, 'struct WordSessionState {', '\n// One mounted deck'),
-        '@@REDUCERS@@': section(source, 'bool TakeWordObservationEffect(',
-            '\nbool SameWordCardPrefetchIndex(' if 'bool SameWordCardPrefetchIndex(' in source
-            else '\nWordAppSnapshot BuildWordAppSnapshot('),
+        '@@STATE@@': section(header, 'struct WordCardPrefetchState {', '\nstruct WordAppState {'),
+        '@@CACHE_READ@@': section(source, 'esp_err_t LoadCurrentReviewWord(', '\n// Decide where the card'),
+        '@@REDUCERS@@': section(source, 'bool SameWordCardPrefetchIndex(', '\nWordAppSnapshot BuildWordAppSnapshot('),
+        '@@CLEANUP@@': section(worker, 'void ClearCommandPayload(', '\nvoid PersistWorkerTask('),
+        '@@MAILBOX@@': section(worker, 'bool TakePersistResultToApply(', '\nbool IsPersistKindBusy('),
     }
-    fixture = (root / 'scripts/testdata/word_ram_batch.cpp').read_text(encoding='utf-8')
+    fixture = (root / 'scripts/testdata/word_card_prefetch.cpp').read_text(encoding='utf-8')
     for marker, body in pieces.items():
         if fixture.count(marker) != 1:
             raise ValueError(f'fixture marker drift: {marker}')
@@ -40,8 +40,8 @@ def main():
     compiler = shutil.which('g++')
     if not compiler:
         raise SystemExit('FAIL: g++ unavailable')
-    with tempfile.TemporaryDirectory(prefix='wqn-ram-batch-') as directory:
-        unit, binary = Path(directory) / 'batch.cpp', Path(directory) / 'batch'
+    with tempfile.TemporaryDirectory(prefix='wqn-card-prefetch-') as directory:
+        unit, binary = Path(directory) / 'prefetch.cpp', Path(directory) / 'prefetch'
         unit.write_text(fixture, encoding='utf-8')
         subprocess.run([compiler, '-std=c++17', '-Wall', '-Wextra', '-Werror',
                         str(unit), '-o', str(binary)], check=True, timeout=30)

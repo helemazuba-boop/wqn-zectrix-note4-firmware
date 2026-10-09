@@ -8,6 +8,7 @@
 #include "note_store.h"
 #include "problem_store.h"
 #include "word_study_store.h"
+#include "word_pack.h"
 
 // [persist-worker] Dedicated local-write worker. Word/note observation commits
 // and the problem verdict commit run here; settings saves follow (c4). It moves
@@ -58,6 +59,9 @@ enum class PersistKind : uint8_t {
     // default deck. One foreground transaction: commit the new scope
     // generation, then the four session clears and the walk cursor.
     kWordSessionReset,
+    // Read-only, immutable pack speculation. Reuses the worker and ACK mailbox;
+    // no word mutation domain and no additional task/storage owner.
+    kWordCardPrefetch,
     kCount,
 };
 
@@ -126,6 +130,8 @@ void EnqueueReservedWordObservations(
     const PersistTicket& ticket,
     std::vector<wqn::DurableWordObservation> observations,
     wqn::PersistedWordSession advanced_session);
+void EnqueueReservedWordCardPrefetch(const PersistTicket& ticket,
+    const wqn::WordPackIndexEntry& index);
 void EnqueueReservedNoteObservation(
     const PersistTicket& ticket,
     wqn::DurableNoteObservation observation,
@@ -157,6 +163,9 @@ uint32_t SubmitWordSessionReset(const std::string& deck_id);
 // --- Consumer side (UI task). ---
 // True when an unapplied terminal result is waiting for `kind`; copies it out.
 bool TakePersistResultToApply(PersistKind kind, PersistResultReceipt* out);
+// Copies the owned read result without consuming it. The slot retains it until
+// the fully fenced ACK, so repeat reads and a delayed UI cannot lose the card.
+bool TakeWordCardPrefetchResult(PersistResultReceipt* out, wqn::WqnWordEntry* entry);
 // Validates generation + operation_id + slot ownership; only a fully matching
 // ACK frees the slot and clears busy. Stale/duplicate ACKs are logged and
 // ignored (returns false), never mutating state.

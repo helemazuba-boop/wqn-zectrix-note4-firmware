@@ -999,6 +999,20 @@ void DeviceUiTask(void*)
             }
         }
 
+        // Read-only cache results are independent of RAM/durable word gates.
+        // The command owns its card until the generation/op/slot fenced ACK.
+        {
+            device_ui_internal::PersistResultReceipt receipt;
+            wqn::WqnWordEntry entry;
+            if (device_ui_internal::TakeWordCardPrefetchResult(&receipt, &entry)) {
+                ui_runtime.DispatchWordCardPrefetchResult(receipt.result,
+                    receipt.operation_id, std::move(entry));
+                device_ui_internal::AckPersistResult(
+                    device_ui_internal::PersistKind::kWordCardPrefetch,
+                    receipt.generation, receipt.operation_id);
+            }
+        }
+
         // [persist-worker] Drain the word observation commit result (moved off
         // the UI task in commit #2). Apply on the UI task, ack with
         // generation+operation_id (only a matching ack frees the slot), and
@@ -1522,6 +1536,8 @@ wqn::AiStreamingStatusView streaming_view{};
             FinishProblemCloudRequest(device_ui_internal::CloudDomain::kProblemBulk);
         }
         device_ui_internal::PumpWordCandidatePrefetch(&ui_runtime);
+        // Speculation begins only after this frame's display submission.
+        device_ui_internal::PumpWordCardPrefetch(&ui_runtime);
         device_ui_internal::PumpNoteCandidatePrefetch(&ui_runtime);
         device_ui_internal::PumpNoteImageFetch(&ui_runtime);
         device_ui_internal::PumpNoteBodyPackFetch(&ui_runtime);

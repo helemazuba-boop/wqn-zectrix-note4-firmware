@@ -46,6 +46,7 @@ enum class AppEventKind : uint8_t {
     kSettingsPersist,
     // [picker-stale] Diagnose-only marker for the picker's self-refresh arm.
     kAgentListPoll,
+    kWordCardPrefetch,
 };
 
 struct UiUpdate {
@@ -153,6 +154,10 @@ public:
         std::vector<wqn::DurableWordObservation>* observations,
         wqn::PersistedWordSession* advanced_session);
     void RequestWordBatchFlush();
+    bool TakeWordCardPrefetchEntry(uint32_t operation_id, int64_t now_ms,
+        wqn::WordPackIndexEntry* entry);
+    UiUpdate DispatchWordCardPrefetchResult(esp_err_t result, uint32_t operation_id,
+        wqn::WqnWordEntry entry);
     // Take failed inside the pump (cursor desync -> session already moved to
     // kFailed). Route it through FinishEvent so the revision advances and the
     // failure frame is not deduped against the "正在保存" frame's revision.

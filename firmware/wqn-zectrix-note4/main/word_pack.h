@@ -110,5 +110,6 @@ esp_err_t DownloadWordPackToStorage(
     const WqnWordPackManifestItem& item);
 bool WordPackNeedsDownload(const WqnWordPackManifestItem& item);
 esp_err_t ReadWordPackEntry(const WordPackIndexEntry& index_entry, WqnWordEntry* entry);
+esp_err_t ReadWordPackEntryPrefetch(const WordPackIndexEntry& index_entry, WqnWordEntry* entry);
 
 }  // namespace wqn

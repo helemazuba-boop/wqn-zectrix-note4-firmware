@@ -166,6 +166,16 @@ struct WordDeckInfo {
     size_t entry_count = 0;
 };
 
+struct WordCardPrefetchState {
+    uint32_t operation_id = 0;
+    uint32_t scope_generation = 0;
+    std::string session_id;
+    WordPackIndexEntry index{};
+    WqnWordEntry entry;
+    bool ready = false;
+    int64_t retry_after_ms = 0;
+};
+
 struct WordAppState {
     bool initialized = false;
     WordAppMode mode = WordAppMode::kHome;
@@ -189,6 +199,7 @@ struct WordAppState {
     // index re-read when the session finishes.
     bool pack_index_pinned = false;
     WqnWordEntry current_word;
+    WordCardPrefetchState card_prefetch;
 
     bool cloud_sync_requested = false;
     bool cloud_sync_failed = false;
@@ -345,6 +356,12 @@ bool TakeWordObservationBatch(WordAppState* state, uint32_t operation_id, int64_
     std::vector<DurableWordObservation>* observations, PersistedWordSession* advanced_session);
 bool ApplyWordObservationBatchResult(WordAppState* state, esp_err_t result,
     uint32_t operation_id, int64_t now_ms);
+bool SameWordCardPrefetchIndex(const WordPackIndexEntry& left, const WordPackIndexEntry& right);
+bool GetWordCardPrefetchEntry(const WordAppState& state, int64_t now_ms, WordPackIndexEntry* entry);
+bool TakeWordCardPrefetchEntry(WordAppState* state, uint32_t operation_id, int64_t now_ms,
+    WordPackIndexEntry* entry);
+bool ApplyWordCardPrefetchResult(WordAppState* state, uint32_t operation_id, esp_err_t result,
+    WqnWordEntry entry, int64_t now_ms);
 WordAppSnapshot BuildWordAppSnapshot(const WordAppState& state);
 std::string WordAppProgressLabel(const WordAppState& state);
 std::string WordAppStatusLine(const WordAppState& state);

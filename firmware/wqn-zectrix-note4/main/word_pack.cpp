@@ -1417,7 +1417,8 @@ bool WordPackNeedsDownload(const WqnWordPackManifestItem& item)
     return !FileExists(path) || !VerifyFileSha256(path, item.sha256);
 }
 
-esp_err_t ReadWordPackEntry(const WordPackIndexEntry& index_entry, WqnWordEntry* entry)
+static esp_err_t ReadWordPackEntryImpl(const WordPackIndexEntry& index_entry, WqnWordEntry* entry,
+    const char* source)
 {
     if (entry == nullptr || index_entry.pack_stem[0] == '\0') {
         return ESP_ERR_INVALID_ARG;
@@ -1467,14 +1468,24 @@ esp_err_t ReadWordPackEntry(const WordPackIndexEntry& index_entry, WqnWordEntry*
     ESP_LOGI(
         kTag,
         "word card loaded: open_seek_ms=%lld read_close_ms=%lld parse_ms=%lld "
-        "total_ms=%lld fopen_ms=%lld fseek_ms=%lld",
+        "total_ms=%lld fopen_ms=%lld fseek_ms=%lld source=%s",
         static_cast<long long>((opened_us - started_us) / 1000),
         static_cast<long long>((read_us - opened_us) / 1000),
         static_cast<long long>((finished_us - read_us) / 1000),
         static_cast<long long>((finished_us - started_us) / 1000),
         static_cast<long long>((after_fopen_us - before_fopen_us) / 1000),
-        static_cast<long long>((opened_us - after_fopen_us) / 1000));
+        static_cast<long long>((opened_us - after_fopen_us) / 1000), source);
     return ESP_OK;
+}
+
+esp_err_t ReadWordPackEntry(const WordPackIndexEntry& index_entry, WqnWordEntry* entry)
+{
+    return ReadWordPackEntryImpl(index_entry, entry, "foreground");
+}
+
+esp_err_t ReadWordPackEntryPrefetch(const WordPackIndexEntry& index_entry, WqnWordEntry* entry)
+{
+    return ReadWordPackEntryImpl(index_entry, entry, "prefetch");
 }
 
 }  // namespace wqn

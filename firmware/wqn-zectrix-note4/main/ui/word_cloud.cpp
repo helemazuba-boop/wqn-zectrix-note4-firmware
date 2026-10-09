@@ -255,6 +255,31 @@ bool QueueWordCandidatePage(
     return QueueWordCloudRequest(request);
 }
 
+void PumpWordCardPrefetch(UiRuntime* runtime)
+{
+    if (runtime == nullptr || runtime->state().screen != wqn::UiScreen::kWord ||
+        IsWordCloudBusy() || IsWordPackCloudBusy() ||
+        IsPersistKindBusy(PersistKind::kWordObservation)) return;
+    const auto& session = runtime->state().word_app.session;
+    const int64_t now_ms = esp_timer_get_time() / 1000;
+    // Do not start speculative I/O ahead of an already-due/forced flush. Once
+    // a SPIFFS read starts it is non-preemptible, even on the background lane.
+    if (session.observation_effect_ready || session.batch_flush_requested ||
+        (!session.buffered_observations.empty() && wqn::WordBatchPolicy::FlushDue(
+            session.buffered_observations.size(), session.batch_in_flight,
+            session.buffered_observations.front().accepted_ms, now_ms,
+            session.batch_retry_after_ms, false))) return;
+    wqn::WordPackIndexEntry index{};
+    if (!wqn::GetWordCardPrefetchEntry(runtime->state().word_app, now_ms, &index)) return;
+    const PersistTicket ticket = TryReservePersist(PersistKind::kWordCardPrefetch);
+    if (!ticket.valid()) return;
+    if (!runtime->TakeWordCardPrefetchEntry(ticket.operation_id, now_ms, &index)) {
+        CancelPersistReservation(ticket);
+        return;
+    }
+    EnqueueReservedWordCardPrefetch(ticket, index);
+}
+
 void PumpWordCandidatePrefetch(UiRuntime* runtime)
 {
     if (runtime == nullptr || IsWordCloudBusy()) return;

@@ -352,10 +352,23 @@ esp_err_t LoadCurrentReviewWord(wqn::WordAppState* state)
         state->pack_index.entries.begin(),
         state->pack_index.entries.end(),
         [&](const wqn::WordPackIndexEntry& value) {
-            return std::strcmp(item_id, value.word_id) == 0;
+            return std::strcmp(item_id, value.word_id) == 0 &&
+                std::strcmp(session.remote.items[session.position].deck_id, value.deck_id) == 0;
         });
     if (entry == state->pack_index.entries.end()) {
         return ESP_ERR_NOT_FOUND;
+    }
+    auto& prefetched = state->card_prefetch;
+    if (prefetched.ready && prefetched.session_id == session.remote.session_id &&
+        prefetched.scope_generation == session.deck_scope_generation &&
+        prefetched.scope_generation == wqn::GetDeckScopeGeneration() &&
+        wqn::SameWordCardPrefetchIndex(prefetched.index, *entry)) {
+        state->current_word = std::move(prefetched.entry);
+        prefetched.ready = false;
+        ESP_LOGI(kTag, "word card RAM hit: ordinal=%llu session=%s",
+            static_cast<unsigned long long>(session.remote.items[session.position].ordinal),
+            session.remote.session_id.c_str());
+        return ESP_OK;
     }
     return wqn::ReadWordPackEntry(*entry, &state->current_word);
 }
@@ -569,6 +582,7 @@ void InstallWordPackIndex(
     const bool pack_error = index.pack_error;
     const std::string status_message = index.status_message;
     state->pack_index = std::move(index);
+    state->card_prefetch = {};
     // Every install lands the library index unless the caller re-pins it
     // immediately (the resumed-session path below does).
     state->pack_index_pinned = false;
@@ -1303,6 +1317,7 @@ void ResetWordSessionsInMemory(WordAppState* state)
         return;
     }
     state->session = WordSessionState{};
+    state->card_prefetch = {};
     state->review = WordReviewRuntime{};
     state->chain = WordSessionChain{};
     state->review_session_resumable = false;
@@ -1872,6 +1887,83 @@ bool ApplyWordObservationBatchResult(WordAppState* state, esp_err_t result,
     } else {
         state->message = "已暂存，待保存";
     }
+    return true;
+}
+
+bool SameWordCardPrefetchIndex(const WordPackIndexEntry& left, const WordPackIndexEntry& right)
+{
+    return left.file_offset == right.file_offset &&
+        std::strcmp(left.word_id, right.word_id) == 0 && std::strcmp(left.deck_id, right.deck_id) == 0 &&
+        std::strcmp(left.pack_stem, right.pack_stem) == 0;
+}
+
+bool GetWordCardPrefetchEntry(const WordAppState& state, int64_t now_ms, WordPackIndexEntry* entry)
+{
+    if (entry == nullptr || state.mode != WordAppMode::kWordCard || !state.session.persisted.active ||
+        state.card_prefetch.operation_id != 0 || now_ms < state.card_prefetch.retry_after_ms) return false;
+    const auto& session = state.session.persisted;
+    if (session.position >= session.remote.items.size() ||
+        session.deck_scope_generation != GetDeckScopeGeneration()) return false;
+    // Only predict the ordinary queue/return path. Do NOT draw replay RNG or
+    // alter its spacing/bookkeeping just to speculate about the next card.
+    const size_t position = state.review.replay_in_flight
+        ? SessionIndexOfOrdinal(session.remote, state.review.replay_return_ordinal)
+        : NextQueuePosition(state, session.position + 1);
+    if (position >= session.remote.items.size()) return false;
+    const auto& item = session.remote.items[position];
+    const auto found = std::find_if(state.pack_index.entries.begin(), state.pack_index.entries.end(),
+        [&](const auto& candidate) {
+            return std::strcmp(candidate.word_id, item.item_id) == 0 &&
+                std::strcmp(candidate.deck_id, item.deck_id) == 0;
+        });
+    if (found == state.pack_index.entries.end()) return false;
+    if (state.card_prefetch.ready && state.card_prefetch.session_id == session.remote.session_id &&
+        state.card_prefetch.scope_generation == session.deck_scope_generation &&
+        SameWordCardPrefetchIndex(state.card_prefetch.index, *found)) return false;
+    *entry = *found;
+    return true;
+}
+
+bool TakeWordCardPrefetchEntry(WordAppState* state, uint32_t operation_id, int64_t now_ms,
+    WordPackIndexEntry* entry)
+{
+    if (state == nullptr || operation_id == 0 || !GetWordCardPrefetchEntry(*state, now_ms, entry)) return false;
+    auto& prefetch = state->card_prefetch;
+    prefetch.entry = {};
+    prefetch.ready = false;
+    prefetch.operation_id = operation_id;
+    prefetch.session_id = state->session.persisted.remote.session_id;
+    prefetch.scope_generation = state->session.persisted.deck_scope_generation;
+    prefetch.index = *entry;
+    return true;
+}
+
+bool ApplyWordCardPrefetchResult(WordAppState* state, uint32_t operation_id, esp_err_t result,
+    WqnWordEntry entry, int64_t now_ms)
+{
+    if (state == nullptr || operation_id == 0 || state->card_prefetch.operation_id != operation_id) return false;
+    auto& prefetch = state->card_prefetch;
+    prefetch.operation_id = 0;
+    if (prefetch.session_id != state->session.persisted.remote.session_id ||
+        prefetch.scope_generation != state->session.persisted.deck_scope_generation ||
+        prefetch.scope_generation != GetDeckScopeGeneration()) {
+        prefetch = {};
+        return false;
+    }
+    if (result != ESP_OK || entry.id != prefetch.index.word_id || entry.deck_id != prefetch.index.deck_id) {
+        prefetch.ready = false;
+        prefetch.retry_after_ms = now_ms + 5000;
+        return false;
+    }
+    const auto found = std::find_if(state->pack_index.entries.begin(), state->pack_index.entries.end(),
+        [&](const auto& candidate) { return SameWordCardPrefetchIndex(candidate, prefetch.index); });
+    if (found == state->pack_index.entries.end()) {
+        prefetch = {};
+        return false;
+    }
+    prefetch.entry = std::move(entry);
+    prefetch.ready = true;
+    prefetch.retry_after_ms = 0;
     return true;
 }
 

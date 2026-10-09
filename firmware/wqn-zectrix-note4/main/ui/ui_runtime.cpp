@@ -80,6 +80,8 @@ const char* AppEventKindName(AppEventKind event)
             return "settings-persist";
         case AppEventKind::kAgentListPoll:
             return "agent-list-poll";
+        case AppEventKind::kWordCardPrefetch:
+            return "word-card-prefetch";
         default:
             return "unknown";
     }
@@ -423,6 +425,22 @@ void UiRuntime::RequestWordBatchFlush()
 {
     if (wqn::HasBufferedWordObservations(state_.word_app))
         state_.word_app.session.batch_flush_requested = true;
+}
+
+bool UiRuntime::TakeWordCardPrefetchEntry(uint32_t operation_id, int64_t now_ms,
+    wqn::WordPackIndexEntry* entry)
+{
+    return wqn::TakeWordCardPrefetchEntry(&state_.word_app, operation_id, now_ms, entry);
+}
+
+UiUpdate UiRuntime::DispatchWordCardPrefetchResult(esp_err_t result, uint32_t operation_id,
+    wqn::WqnWordEntry entry)
+{
+    const bool applied = wqn::ApplyWordCardPrefetchResult(&state_.word_app, operation_id, result,
+        std::move(entry), esp_timer_get_time() / 1000);
+    // A ready cache is invisible; do not trigger an extra EPD refresh/revision.
+    if (applied) ESP_LOGD(kTag, "word RAM prefetch ready: op=%lu", static_cast<unsigned long>(operation_id));
+    return FinishEvent(AppEventKind::kWordCardPrefetch, RefreshSchedule::kNone, false);
 }
 
 UiUpdate UiRuntime::DispatchWordObservationTakeFailed()
