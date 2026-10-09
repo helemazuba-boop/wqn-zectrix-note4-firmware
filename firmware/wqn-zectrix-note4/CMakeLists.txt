@@ -23,6 +23,19 @@ list(APPEND SDKCONFIG_DEFAULTS "sdkconfig.defaults" "sdkconfig.ai-local.defaults
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(wqn-zectrix-note4)
 
+# [ui-stack] Check compiled entry frames too: lexical scoping of a 4 KiB
+# UiFrame did not prevent the 1009.4 overflow. Disabled UI builds have no
+# DeviceUiTask symbol, so only the enabled S3 profile runs this gate.
+if(CONFIG_WQN_EPD_UI_ENABLE AND IDF_TARGET STREQUAL "esp32s3")
+    add_custom_target(
+        wqn_ui_stack_check ALL
+        COMMAND ${PYTHON} ${CMAKE_CURRENT_LIST_DIR}/scripts/check_ui_stack.py
+            $<TARGET_FILE:${CMAKE_PROJECT_NAME}.elf> --objdump ${CMAKE_OBJDUMP}
+        DEPENDS ${CMAKE_PROJECT_NAME}.elf
+        COMMENT "Verifying compiled UI stack frame budgets (not HIL)"
+        VERBATIM)
+endif()
+
 add_custom_target(
     wqn_architecture_check ALL
     COMMAND

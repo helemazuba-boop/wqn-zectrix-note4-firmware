@@ -677,7 +677,10 @@ void DeviceUiTask(void*)
     std::string last_clock_label = CurrentClockLabel();
     DisplayTrackingState& display_tracking = g_display_tracking;
     RefreshSchedule pending_refresh_schedule = RefreshSchedule::kNone;
-    {
+    // [ui-stack] Keep the >4 KiB frame out of this long-lived task's fixed
+    // stack frame. noinline is intentional: lexical braces alone did not
+    // prevent it from consuming stack during unrelated state-load/dispatch.
+    [&]() __attribute__((noinline)) {
         const wqn::UiFrame frame = wqn::RenderUiFrame(state);
         display_tracking.desired_signature = FrameSignature(frame);
         RefreshSchedule init_schedule = RefreshSchedule::kImmediate;
@@ -725,7 +728,8 @@ void DeviceUiTask(void*)
                 pending_refresh_schedule = init_schedule;
             }
         }
-    }
+    }();
+    LogUiStackHighWater("initial-frame-dispatched");
     TickType_t last_status_refresh = xTaskGetTickCount();
     g_last_active_us_local = esp_timer_get_time();
     TickType_t poll_delay = kUiPollDelayTicks;
@@ -1380,6 +1384,9 @@ wqn::AiStreamingStatusView streaming_view{};
             refresh_schedule = RefreshSchedule::kNone;
         }
         if (refresh_schedule != RefreshSchedule::kNone) {
+            // [ui-stack] As above, the frame lives only on this out-of-line
+            // render/submit call; it must not inflate DeviceUiTask's frame.
+            [&]() __attribute__((noinline)) {
             wqn::UiFrame frame = wqn::RenderUiFrame(state);
             // [force-full-fix] Consume the one-shot flag HERE, after the final
             // render frame is built. RenderUiFrame above checks (but doesn't
@@ -1509,6 +1516,8 @@ wqn::AiStreamingStatusView streaming_view{};
             } else {
                 ESP_LOGI(kTag, "display submission skipped: desired state already represented");
             }
+            }();
+            LogUiStackHighWater("frame-dispatched");
         }
 
         // Hand cloud ownership to the display pipeline without an unguarded

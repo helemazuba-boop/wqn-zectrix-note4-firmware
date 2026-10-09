@@ -284,7 +284,7 @@ DisplayIntent NewDisplayIntent(
 
 void MergeDisplayPolicy(
     const DisplayIntent& old_intent,
-    wqn::UiFrame* latest_frame,
+    bool* prefer_full_refresh,
     DisplayIntent* latest_intent,
     TickType_t* latest_deadline)
 {
@@ -294,7 +294,7 @@ void MergeDisplayPolicy(
                                        *latest_deadline);
     latest_intent->deadline_tick = static_cast<uint32_t>(*latest_deadline);
     if (latest_intent->waveform == WaveformRequirement::kFull) {
-        latest_frame->prefer_full_refresh = true;
+        *prefer_full_refresh = true;
     }
 }
 
@@ -982,7 +982,10 @@ wqn::display::DisplaySubmission RequestEpdUiRefresh(
         g_display_sleep_lease = std::move(lease);
     }
 
-    wqn::UiFrame merged_frame = frame;
+    // [ui-stack] A UiFrame is >4 KiB. Merge only the scalar safety policy;
+    // copy pixels/state directly into the existing slot after supersession
+    // succeeds, under the same mutex. Failed supersession leaves slots intact.
+    bool merged_prefer_full_refresh = frame.prefer_full_refresh;
     wqn::display::DisplayIntent merged_intent =
         NewDisplayIntent(revision, schedule, due_tick, waveform);
 
@@ -992,7 +995,7 @@ wqn::display::DisplaySubmission RequestEpdUiRefresh(
         // policy is monotonic: never weaken its waveform and never postpone its deadline.
         if (g_secondary.pending) {
             MergeDisplayPolicy(g_secondary.intent,
-                               &merged_frame, &merged_intent, &due_tick);
+                               &merged_prefer_full_refresh, &merged_intent, &due_tick);
             if (!PublishDisplayResult(
                     SupersededResult(g_secondary.intent.revision, revision), 0)) {
                 xSemaphoreGive(g_refresh_mutex);
@@ -1008,7 +1011,8 @@ wqn::display::DisplaySubmission RequestEpdUiRefresh(
                  static_cast<unsigned>(due_tick),
                  static_cast<unsigned long>(merged_intent.reason_mask),
                  static_cast<int>(merged_intent.waveform), signature.size());
-        g_secondary.frame = std::move(merged_frame);
+        g_secondary.frame = frame;
+        g_secondary.frame.prefer_full_refresh = merged_prefer_full_refresh;
         g_secondary.signature = signature;
         g_secondary.intent = merged_intent;
         g_secondary.schedule = effective_schedule;
@@ -1039,7 +1043,7 @@ wqn::display::DisplaySubmission RequestEpdUiRefresh(
     const int producer_slot = 1 - consumer_holds;
     if (g_refresh_pending) {
         MergeDisplayPolicy(g_pending_intents[consumer_holds],
-                           &merged_frame, &merged_intent, &due_tick);
+                           &merged_prefer_full_refresh, &merged_intent, &due_tick);
         if (!PublishDisplayResult(
                 SupersededResult(g_pending_intents[consumer_holds].revision, revision), 0)) {
             xSemaphoreGive(g_refresh_mutex);
@@ -1055,7 +1059,8 @@ wqn::display::DisplaySubmission RequestEpdUiRefresh(
              static_cast<unsigned>(due_tick),
              static_cast<unsigned long>(merged_intent.reason_mask),
              static_cast<int>(merged_intent.waveform), signature.size(), producer_slot);
-    g_pending_frames[producer_slot] = std::move(merged_frame);
+    g_pending_frames[producer_slot] = frame;
+    g_pending_frames[producer_slot].prefer_full_refresh = merged_prefer_full_refresh;
     g_pending_signatures[producer_slot] = signature;
     g_pending_intents[producer_slot] = merged_intent;
     g_refresh_pending = true;
