@@ -55,6 +55,7 @@ template <typename T> using WordStorePsramAllocator = std::allocator<T>;
 uint32_t scope_generation = 7;
 uint32_t GetDeckScopeGeneration() { return scope_generation; }
 constexpr size_t kWordObservationOutboxCapacity = 1000;
+@@MAINTENANCE_GATE@@
 enum class OutboxSuspendReason : uint8_t { kProtocol = 1 };
 const char* OutboxSuspendReasonName(OutboxSuspendReason) { return "fixture"; }
 struct DurableWordObservation {
@@ -450,6 +451,82 @@ void TestMaintenanceSteps() {
 void PrepareAckBoundary() {
     Reset(); cache_loaded = true; cache.pending.push_back(Record());
     cache.ack_records = kRuntimeCompactAckThreshold - 1;
+}
+bool DeferMaintenance(void* context) { return *static_cast<bool*>(context); }
+void TestInteractionMaintenance() {
+    bool interacting = true;
+    const wqn::WordOutboxMaintenanceGate gate{DeferMaintenance, &interacting};
+    DueMaintenance(); OutboxMaintenanceContext context;
+    context.maintenance_gate = gate;
+    Check(FinishMaintenance(&context) == ESP_OK && context.deferred &&
+          reads == 0 && saves == 0 && compactions == 0 && cache.acknowledged.size() == 1,
+          "interaction defers the first checkpoint without deleting journal evidence");
+
+    DueMaintenance(); context = {}; context.maintenance_gate = gate; interacting = false;
+    for (int i = 0; i < 4; ++i) OutboxMaintenanceStepTransaction(&context);
+    interacting = true;
+    Check(FinishMaintenance(&context) == ESP_OK && context.deferred && saves == 1 &&
+          compactions == 0 && disk[0].remote.next_sequence == 1 && cache.acknowledged.size() == 1,
+          "new interaction between steps retains already-checkpointed progress and the full journal");
+
+    DueMaintenance(); context = {}; context.maintenance_gate = gate; interacting = false;
+    for (int i = 0; i < 7; ++i) OutboxMaintenanceStepTransaction(&context);
+    interacting = true;
+    Check(OutboxMaintenanceStepTransaction(&context) == ESP_OK && context.deferred && compactions == 0,
+          "the final long reclaim also checks interaction admission, not only checkpoints");
+
+    PrepareAckBoundary(); const std::string request = cache.pending.front().request_id;
+    Check(wqn::AcknowledgeWordObservations({request}, gate) == ESP_OK && appends == 1 &&
+          cache.pending.empty() && cache.acknowledged.size() == 1 && saves == 0 && compactions == 0,
+          "batch ACK is durable before routine maintenance yields to interaction");
+    Check(wqn::services::dispatches == 2 && wqn::services::lease_continuous &&
+          wqn::runtime::active_leases == 0,
+          "durable ACK and deferred owner admission keep one lease through queue waits");
+    interacting = false; bool deferred = true;
+    Check(wqn::MaintainWordObservationOutbox(gate, &deferred) == ESP_OK && !deferred &&
+          appends == 1 && saves == 1 && compactions == 1 && cache.acknowledged.empty(),
+          "quiet retry completes maintenance with no new ACK or HTTP item");
+
+    PrepareAckBoundary(); interacting = false; wqn::services::inject_at = 2;
+    wqn::services::interleave = [&]() { interacting = true; };
+    Check(wqn::AcknowledgeWordObservations({cache.pending.front().request_id}, gate) == ESP_OK &&
+          appends == 1 && saves == 0 && compactions == 0,
+          "input arriving while maintenance is queued is checked inside the storage owner");
+
+    DueMaintenance(); interacting = true; --cache.ack_records;
+    Check(wqn::MaintainWordObservationOutbox(gate, &deferred) == ESP_OK && !deferred &&
+          reads == 0 && saves == 0 && compactions == 0,
+          "a below-threshold no-op does not invent a deferred maintenance obligation");
+
+    DueMaintenance(); context = {}; context.maintenance_gate = gate; context.force_compact = true;
+    Check(FinishMaintenance(&context) == ESP_OK && !context.deferred && compactions == 1,
+          "forced repair ignores advisory interaction admission");
+    DueMaintenance(); context = {}; context.maintenance_gate = gate; context.for_sleep = true;
+    Check(FinishMaintenance(&context) == ESP_OK && !context.deferred && compactions == 1,
+          "sleep preparation keeps its existing maintenance and deadline semantics");
+    DueMaintenance(); context = {}; context.maintenance_gate = gate;
+    cache.total_records = kOutboxMaxRecords;
+    Check(FinishMaintenance(&context) == ESP_OK && !context.deferred && compactions == 1,
+          "byte pressure cannot be postponed behind an advisory interaction gate");
+    DueMaintenance(); context = {}; context.maintenance_gate = gate; cache.partial_tail = true;
+    Check(FinishMaintenance(&context) == ESP_OK && !context.deferred && compactions == 1,
+          "damaged tail repair at a due checkpoint bypasses advisory interaction");
+    DueMaintenance(); context = {}; context.maintenance_gate = gate; cache.backup_source = true;
+    Check(FinishMaintenance(&context) == ESP_OK && !context.deferred && compactions == 1,
+          "backup-source repair at a due checkpoint bypasses advisory interaction");
+
+    DueMaintenance(); interacting = false; save_error = ESP_FAIL;
+    Check(wqn::MaintainWordObservationOutbox(gate, &deferred) == ESP_FAIL &&
+          !deferred && cache.acknowledged.size() == 1 && compactions == 0,
+          "quiet-retry checkpoint errors are not disguised as successful deferral");
+    DueMaintenance(); compact_error = ESP_FAIL;
+    Check(wqn::MaintainWordObservationOutbox(gate, &deferred) == ESP_FAIL &&
+          !deferred && cache.acknowledged.size() == 1,
+          "quiet-retry reclaim failure retains records and propagates its error");
+    DueMaintenance(); wqn::runtime::lease_allowed = false; deferred = true;
+    Check(wqn::MaintainWordObservationOutbox(gate, &deferred) == ESP_ERR_INVALID_STATE &&
+          !deferred && wqn::services::dispatches == 0 && scans == 0,
+          "quiescing refuses a new runtime maintenance lease without executing I/O");
 }
 void TestMaintenanceDriver() {
     PrepareAckBoundary(); const std::string request = cache.pending.front().request_id;
@@ -1105,6 +1182,7 @@ int main() {
           "threshold-crossing ACK transaction only commits its ACK, not whole maintenance");
 #if FIXTURE_STEPPED_MAINTENANCE
     TestMaintenanceSteps();
+    TestInteractionMaintenance();
     TestMaintenanceDriver();
     TestOutboxQuota();
 #endif

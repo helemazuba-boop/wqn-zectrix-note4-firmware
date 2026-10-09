@@ -15,6 +15,7 @@ def main():
     root = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--source', type=Path, default=root / 'main/services/sync_service.cpp')
+    parser.add_argument('--mutation', choices=('skip-empty-maintenance',))
     args = parser.parse_args()
     source = args.source.read_text(encoding='utf-8')
     start = 'WordOutboxUploadState UploadPendingWordObservations('
@@ -22,7 +23,18 @@ def main():
     if source.count(start) != 1 or source.count(end) != 1:
         raise SystemExit('FAIL: production upload boundary drift')
     body = source[source.index(start):source.index(end, source.index(start))]
+    if args.mutation == 'skip-empty-maintenance':
+        needle = 'wqn::MaintainWordObservationOutbox(\n            maintenance_gate, &maintenance_deferred)'
+        if body.count(needle) != 1:
+            raise SystemExit('FAIL: maintenance retry mutation boundary drift')
+        body = body.replace(needle, 'ESP_OK')
     fixture = (root / 'scripts/testdata/word_ack_upload.cpp').read_text(encoding='utf-8')
+    header = (root / 'main/word_study_store.h').read_text(encoding='utf-8')
+    gate_start = 'struct WordOutboxMaintenanceGate {'
+    gate_end = '// Moves one permanently rejected observation'
+    if header.count(gate_start) != 1 or header.count(gate_end) != 1 or fixture.count('@@MAINTENANCE_GATE@@') != 1:
+        raise SystemExit('FAIL: production maintenance API boundary drift')
+    fixture = fixture.replace('@@MAINTENANCE_GATE@@', header[header.index(gate_start):header.index(gate_end)])
     if fixture.count('@@UPLOAD@@') != 1:
         raise SystemExit('FAIL: fixture marker drift')
     compiler = shutil.which('g++')

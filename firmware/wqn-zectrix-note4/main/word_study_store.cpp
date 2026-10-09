@@ -2538,6 +2538,7 @@ esp_err_t MaybeCompactCachedOutbox(OutboxScan* scan)
 }
 
 struct OutboxMaintenanceContext {
+    wqn::WordOutboxMaintenanceGate maintenance_gate;
     // This caller-owned payload is touched only while its synchronous owner
     // transaction is running. No cache pointer escapes the owner between steps.
     std::vector<OutboxRecord, wqn::WordStorePsramAllocator<OutboxRecord>> acknowledged;
@@ -2598,6 +2599,20 @@ esp_err_t OutboxMaintenanceStepTransaction(void* opaque)
         // proof. Keep the complete journal; the next call starts a fresh pass.
         context->done = context->deferred = true;
         ESP_LOGI(kTag, "word outbox maintenance deferred: reason=changed step=%u",
+                 static_cast<unsigned>(context->next_mode));
+        return ESP_OK;
+    }
+    if (!context->force_compact && !context->for_sleep &&
+        !scan->partial_tail && !scan->backup_source &&
+        CheckOutboxAppendBudget(*scan, true) == ESP_OK &&
+        context->maintenance_gate.should_defer != nullptr &&
+        context->maintenance_gate.should_defer(context->maintenance_gate.context)) {
+        // [batch-maintenance] ACK durability precedes maintenance admission.
+        // Check on the owner AFTER queue wait, before each checkpoint/reclaim;
+        // new interaction must not start the remaining long VFS steps. The
+        // retained journal still proves any progress already checkpointed.
+        context->done = context->deferred = true;
+        ESP_LOGI(kTag, "word outbox maintenance deferred: reason=interaction step=%u",
                  static_cast<unsigned>(context->next_mode));
         return ESP_OK;
     }
@@ -3410,7 +3425,8 @@ esp_err_t RunOutboxMaintenance(OutboxMaintenanceContext* context, const char* ow
 template <typename Transaction, typename Context>
 esp_err_t ExecuteWithOutboxMaintenance(
     const char* holder, Transaction transaction, Context* context,
-    bool foreground = false, bool maintain_after_commit = true)
+    bool foreground = false, bool maintain_after_commit = true,
+    const wqn::WordOutboxMaintenanceGate& maintenance_gate = {})
 {
     if (context == nullptr) return ESP_ERR_INVALID_ARG;
     auto lease = wqn::runtime::SleepLease::TryAcquire(
@@ -3436,6 +3452,7 @@ esp_err_t ExecuteWithOutboxMaintenance(
     ESP_RETURN_ON_ERROR(result, kTag, "commit word outbox mutation");
     if (!maintain_after_commit) return ESP_OK;
     OutboxMaintenanceContext maintenance;
+    maintenance.maintenance_gate = maintenance_gate;
     // Keep the same lease across all queue waits. A changed proof/deadline
     // defers maintenance without changing the already-durable mutation result;
     // actual maintenance I/O failures still propagate to the caller.
@@ -3669,8 +3686,30 @@ esp_err_t PeekPendingWordObservationExcluding(
 
 esp_err_t AcknowledgeWordObservations(const std::vector<std::string>& request_ids)
 {
+    return AcknowledgeWordObservations(request_ids, {});
+}
+
+esp_err_t AcknowledgeWordObservations(
+    const std::vector<std::string>& request_ids,
+    const WordOutboxMaintenanceGate& maintenance_gate)
+{
     AckBatchContext context{&request_ids};
-    return ExecuteWithOutboxMaintenance("word-outbox-ack-batch", AckObservationBatchTransaction, &context);
+    return ExecuteWithOutboxMaintenance("word-outbox-ack-batch", AckObservationBatchTransaction,
+                                       &context, false, true, maintenance_gate);
+}
+
+esp_err_t MaintainWordObservationOutbox(
+    const WordOutboxMaintenanceGate& maintenance_gate, bool* deferred)
+{
+    if (deferred != nullptr) *deferred = false;
+    auto lease = wqn::runtime::SleepLease::TryAcquire(
+        wqn::runtime::SleepBlocker::kStorage, "word-outbox-maintenance", __FILE__, __LINE__);
+    if (!lease) return ESP_ERR_INVALID_STATE;
+    OutboxMaintenanceContext context;
+    context.maintenance_gate = maintenance_gate;
+    const esp_err_t result = RunOutboxMaintenance(&context, "word-outbox-maintenance");
+    if (deferred != nullptr) *deferred = context.deferred;
+    return result;
 }
 
 esp_err_t QuarantinePendingWordObservation(const std::string& request_id)

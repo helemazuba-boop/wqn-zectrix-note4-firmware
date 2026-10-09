@@ -2102,6 +2102,13 @@ esp_err_t SyncControlPlaneV3(const std::string& token)
 #if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
 WordOutboxUploadState UploadPendingWordObservations(const std::string& token)
 {
+    uint32_t interaction_generation =
+        g_word_interaction_generation.load(std::memory_order_acquire);
+    const wqn::WordOutboxMaintenanceGate maintenance_gate{
+        [](void* context) {
+            return g_word_interaction_generation.load(std::memory_order_acquire) !=
+                *static_cast<const uint32_t*>(context);
+        }, &interaction_generation};
     std::vector<std::string> acknowledgements;
     acknowledgements.reserve(5);
     bool ack_flush_failed = false;
@@ -2109,7 +2116,7 @@ WordOutboxUploadState UploadPendingWordObservations(const std::string& token)
     const auto flush_acknowledgements = [&]() -> esp_err_t {
         if (acknowledgements.empty()) return ESP_OK;
         if (ack_flush_failed) return ESP_FAIL;
-        const esp_err_t result = wqn::AcknowledgeWordObservations(acknowledgements);
+        const esp_err_t result = wqn::AcknowledgeWordObservations(acknowledgements, maintenance_gate);
         if (result != ESP_OK) {
             ack_flush_failed = true;
             ScheduleWordOutboxRetry(acknowledgements.front(), 0, OutboxRetryCause::kLocalStorage);
@@ -2127,8 +2134,6 @@ WordOutboxUploadState UploadPendingWordObservations(const std::string& token)
     // the original identities; a reset can safely replay them to the server.
     const auto upload_round = [&]() -> WordOutboxUploadState {
     constexpr size_t kMaxWordObservationsPerRound = 64;
-    const uint32_t interaction_generation =
-        g_word_interaction_generation.load(std::memory_order_acquire);
     size_t processed = 0;
     size_t uploaded = 0;
     size_t quarantined = 0;
@@ -2458,6 +2463,22 @@ WordOutboxUploadState UploadPendingWordObservations(const std::string& token)
     if (flush_acknowledgements() != ESP_OK &&
         state != WordOutboxUploadState::kAuthenticationRequired &&
         state != WordOutboxUploadState::kProtocolBlocked) return WordOutboxUploadState::kPending;
+    if (!ack_flush_failed && state != WordOutboxUploadState::kAuthenticationRequired &&
+        state != WordOutboxUploadState::kProtocolBlocked) {
+        // An earlier ACK may already be durable while its maintenance was
+        // deferred. An empty upload queue must still retry that obligation.
+        bool maintenance_deferred = false;
+        const esp_err_t result = wqn::MaintainWordObservationOutbox(
+            maintenance_gate, &maintenance_deferred);
+        if (result != ESP_OK) {
+            ESP_LOGW(kTag, "word outbox maintenance failed: error=%s; journal retained",
+                     esp_err_to_name(result));
+            return WordOutboxUploadState::kFailed;
+        }
+        // Reuse the existing bounded quiet-window retry, including proof
+        // invalidation with no new input. Never turn deferral into a busy loop.
+        if (maintenance_deferred) return WordOutboxUploadState::kYielded;
+    }
     return state;
 }
 

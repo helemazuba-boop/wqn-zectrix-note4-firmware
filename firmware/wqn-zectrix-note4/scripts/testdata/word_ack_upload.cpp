@@ -17,6 +17,7 @@ enum class OutboxFailureDisposition { kTransientServer,kAuthenticationRequired,k
     kSequenceResolved,kSessionTerminal,kTombstoneRecoverable };
 enum class OutboxRetryCause { kLocalStorage,kServer };
 namespace wqn {
+@@MAINTENANCE_GATE@@
 enum class OutboxSuspendReason { kProtocol };
 const char* OutboxSuspendReasonName(OutboxSuspendReason) { return "fixture"; }
 struct Metadata { std::string request_id; };
@@ -40,6 +41,8 @@ int attempts=0, fail_http_at=0, fail_ack_at=0, yield_at=0, retry_calls=0, ack_ca
 int64_t http_delay_ms=0;
 OutboxFailureDisposition failure=OutboxFailureDisposition::kTransientServer;
 bool defer=false;
+bool maintenance_due=false, maintenance_proof_deferred=false, fail_maintenance=false;
+int maintenance_checks=0, maintenance_runs=0, yield_in_maintenance_at=0;
 wqn::Metadata MakeControlMetadata() { return {}; }
 void ResetWordOutboxRetryBackoff() { g_word_outbox_retry_attempts=0; }
 bool WordOutboxRetryDeferred(const std::string&,int64_t) { return defer; }
@@ -60,6 +63,26 @@ esp_err_t AcknowledgeWordObservations(const std::vector<std::string>& ids) {
     queue.erase(std::remove_if(queue.begin(),queue.end(),[&](const auto& entry) {
         return std::find(ids.begin(),ids.end(),entry.request_id)!=ids.end();
     }),queue.end());
+    return ESP_OK;
+}
+esp_err_t AcknowledgeWordObservations(const std::vector<std::string>& ids,
+    const WordOutboxMaintenanceGate& gate) {
+    const esp_err_t result=AcknowledgeWordObservations(ids);
+    if(result!=ESP_OK) return result;
+    if(maintenance_due && !gate.should_defer(gate.context)) {
+        ++maintenance_runs; maintenance_due=false;
+    }
+    return ESP_OK;
+}
+esp_err_t MaintainWordObservationOutbox(const WordOutboxMaintenanceGate& gate,bool* deferred) {
+    ++maintenance_checks;
+    if(maintenance_checks==yield_in_maintenance_at) g_word_interaction_generation.fetch_add(1);
+    *deferred=false;
+    if(fail_maintenance) return ESP_FAIL;
+    if(maintenance_due && (maintenance_proof_deferred || gate.should_defer(gate.context))) {
+        *deferred=true; return ESP_OK;
+    }
+    if(maintenance_due) { ++maintenance_runs; maintenance_due=false; }
     return ESP_OK;
 }
 esp_err_t SubmitWordStudyObservationV1(const std::string&,const protocol::word_study_v1::ObservationRequest&,
@@ -89,6 +112,8 @@ void Reset(int count) {
     queue.clear(); ack_sizes.clear(); order.clear(); now_ms=0;
     attempts=fail_http_at=fail_ack_at=yield_at=retry_calls=ack_calls=0; defer=false; http_delay_ms=0;
     failure=OutboxFailureDisposition::kTransientServer; g_word_interaction_generation=0;
+    maintenance_due=maintenance_proof_deferred=fail_maintenance=false;
+    maintenance_checks=maintenance_runs=yield_in_maintenance_at=0;
     g_word_outbox_gap_terminal_session_id.clear(); g_word_outbox_retry_attempts=0;
     for(int i=0;i<count;++i) { wqn::DurableWordObservation entry; entry.request_id=std::to_string(i);
         entry.session_id="session"; entry.sequence=uint64_t(i); queue.push_back(entry); }
@@ -128,6 +153,28 @@ int main() {
         "head backoff performs neither HTTP nor an empty write");
     Reset(5); http_delay_ms=16000; Check(UploadPendingWordObservations("fixture")==S::kDrained &&
         ack_sizes==std::vector<size_t>({3,2}),"oldest ACK timer is absolute, not refreshed by later responses");
+    Reset(5); maintenance_due=true; yield_at=5;
+    Check(UploadPendingWordObservations("fixture")==S::kYielded && ack_calls==1 && queue.empty() &&
+        maintenance_due && maintenance_runs==0,
+        "interaction during the fifth HTTP item cannot attach long maintenance to its durable ACK");
+    Check(UploadPendingWordObservations("fixture")==S::kDrained && !maintenance_due && maintenance_runs==1 &&
+        attempts==5 && ack_calls==1,
+        "a quiet next round retries deferred maintenance even with no remaining upload or new ACK");
+    Reset(0); maintenance_due=true; yield_in_maintenance_at=1;
+    Check(UploadPendingWordObservations("fixture")==S::kYielded && maintenance_due && maintenance_runs==0,
+        "interaction after an empty queue check still yields maintenance to the quiet timer");
+    Reset(0); maintenance_due=true; maintenance_proof_deferred=true;
+    Check(UploadPendingWordObservations("fixture")==S::kYielded && maintenance_due && attempts==0,
+        "proof invalidation without input is retried rather than stranded behind an empty queue");
+    Reset(3); fail_http_at=3; failure=D::kAuthenticationRequired; fail_maintenance=true;
+    Check(UploadPendingWordObservations("fixture")==S::kAuthenticationRequired && maintenance_checks==0 && ack_calls==1,
+        "optional quiet maintenance cannot mask a real 401 result");
+    Reset(3); fail_http_at=3; failure=D::kProtocolBlocked; fail_maintenance=true;
+    Check(UploadPendingWordObservations("fixture")==S::kProtocolBlocked && maintenance_checks==0 && ack_calls==1,
+        "optional maintenance cannot replace a protocol-blocked terminal disposition");
+    Reset(0); fail_maintenance=true;
+    Check(UploadPendingWordObservations("fixture")==S::kFailed && maintenance_checks==1 && attempts==0,
+        "empty-queue maintenance I/O failure reaches the existing bounded sync retry path");
     std::printf("%d PASS / %d FAIL (production upload loop with host seams; NOT network/flash HIL)\n",passes,failures);
     return failures?1:0;
 }

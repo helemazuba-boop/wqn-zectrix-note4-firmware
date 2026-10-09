@@ -188,6 +188,22 @@ esp_err_t PeekPendingWordObservationExcluding(
     const std::vector<std::string>& request_ids, DurableWordObservation* observation);
 esp_err_t AcknowledgeWordObservation(const std::string& request_id);
 esp_err_t AcknowledgeWordObservations(const std::vector<std::string>& request_ids);
+// Advisory admission for routine maintenance only. StorageService invokes
+// this at each step, including after queue wait. The callback/context remain
+// caller-owned until this synchronous call returns; they must be thread-safe
+// and perform no I/O. It cannot cancel a VFS operation already in progress.
+// Space/repair work and sleep preparation bypass this advisory gate.
+struct WordOutboxMaintenanceGate {
+    bool (*should_defer)(void* context) = nullptr;
+    void* context = nullptr;
+};
+esp_err_t AcknowledgeWordObservations(
+    const std::vector<std::string>& request_ids,
+    const WordOutboxMaintenanceGate& maintenance_gate);
+// Retries deferred maintenance even when no new ACK remains to trigger it.
+// Deferral retains the journal and returns ESP_OK; actual I/O errors propagate.
+esp_err_t MaintainWordObservationOutbox(
+    const WordOutboxMaintenanceGate& maintenance_gate, bool* deferred);
 // Moves one permanently rejected observation to the bounded forensic journal
 // before removing it from the upload queue. Other sessions and observations
 // remain available and no restart is required.

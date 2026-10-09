@@ -25,12 +25,26 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--source', type=Path,
                         default=root / 'main/word_study_store.cpp')
+    parser.add_argument('--mutation', choices=('disable-interaction-gate', 'gate-forced-repair'))
     args = parser.parse_args()
     compiler = shutil.which('g++')
     if compiler is None:
         raise SystemExit('FAIL: g++ unavailable; fixtures were not run')
     source = args.source.read_text(encoding='utf-8')
+    if args.mutation == 'disable-interaction-gate':
+        needle = 'context->maintenance_gate.should_defer != nullptr &&'
+        if source.count(needle) != 1:
+            raise SystemExit('FAIL: interaction gate mutation boundary drift')
+        source = source.replace(needle, 'false && ' + needle)
+    elif args.mutation == 'gate-forced-repair':
+        needle = 'if (!context->force_compact && !context->for_sleep &&'
+        if source.count(needle) != 1:
+            raise SystemExit('FAIL: mandatory maintenance mutation boundary drift')
+        source = source.replace(needle, 'if (!context->for_sleep &&')
+    header = (root / 'main/word_study_store.h').read_text(encoding='utf-8')
     pieces = {
+        '@@MAINTENANCE_GATE@@': section(header, 'struct WordOutboxMaintenanceGate {',
+            '// Moves one permanently rejected observation'),
         '@@MAINTENANCE_THRESHOLD@@': next(line for line in source.splitlines()
             if line.startswith('constexpr size_t kRuntimeCompactAckThreshold =')),
         '@@BATCH_ENABLED@@': (
