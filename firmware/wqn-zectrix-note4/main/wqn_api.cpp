@@ -139,6 +139,7 @@ namespace {
 constexpr char kTag[] = "wqn_api";
 constexpr int kHttpTimeoutMs = 10000;
 constexpr int kWordSessionHttpTimeoutMs = 30000;
+constexpr int kWordCandidateCoalesceTimeoutMs = 1000;
 // One owner round may spend 15 s associating and another 15 s on DHCP. Leave
 // a bounded margin for ConnectivityTask dispatch so callers do not time out a
 // healthy connection just before GOT_IP is published.
@@ -1692,12 +1693,13 @@ esp_err_t CreateWordStudySessionV1(
     return ESP_OK;
 }
 
-esp_err_t FetchWordStudyCandidatePageV1(
+static esp_err_t FetchWordStudyCandidatePageV1Impl(
     const std::string& token,
     const std::string& session_id,
     const protocol::word_study_v1::CandidatePageRequest& request,
     protocol::word_study_v1::CandidatePageData* page,
-    protocol::v3::Error* error)
+    protocol::v3::Error* error,
+    bool opportunistic)
 {
     if (page == nullptr || error == nullptr || token.empty() ||
         session_id.size() != 36) {
@@ -1709,10 +1711,19 @@ esp_err_t FetchWordStudyCandidatePageV1(
         ValidateTokenOrClear(token, "word-study-candidates"),
         kTag,
         "validate word candidate token");
-    ESP_RETURN_ON_ERROR(
-        WaitForNetworkReadyForHttps(),
-        kTag,
-        "prepare network for word candidates");
+    if (opportunistic) {
+        // The create request just established readiness. Never add a fresh
+        // 35 s connection / 15 s SNTP wait to this speculative second page.
+        ESP_RETURN_ON_ERROR(
+            wqn::services::WaitForConnectivity(0), kTag,
+            "require online demand for initial word candidates");
+        if (!IsClockReasonable()) return ESP_ERR_INVALID_STATE;
+    } else {
+        ESP_RETURN_ON_ERROR(
+            WaitForNetworkReadyForHttps(),
+            kTag,
+            "prepare network for word candidates");
+    }
 
     std::string request_body;
     ESP_RETURN_ON_ERROR(
@@ -1732,7 +1743,8 @@ esp_err_t FetchWordStudyCandidatePageV1(
         &status_code,
         &body,
         protocol::v3::kProtocolHeader,
-        &request.metadata.request_id);
+        &request.metadata.request_id,
+        opportunistic ? kWordCandidateCoalesceTimeoutMs : kHttpTimeoutMs);
     if (http_result != ESP_OK) return http_result;
     if (status_code == 401) {
         return ClearTokenOnUnauthorized("word-study-candidates");
@@ -1751,6 +1763,26 @@ esp_err_t FetchWordStudyCandidatePageV1(
         return parse_result == ESP_OK ? ESP_FAIL : parse_result;
     }
     return ESP_OK;
+}
+
+esp_err_t FetchWordStudyCandidatePageV1(
+    const std::string& token,
+    const std::string& session_id,
+    const protocol::word_study_v1::CandidatePageRequest& request,
+    protocol::word_study_v1::CandidatePageData* page,
+    protocol::v3::Error* error)
+{
+    return FetchWordStudyCandidatePageV1Impl(token, session_id, request, page, error, false);
+}
+
+esp_err_t TryFetchWordStudyCandidatePageV1(
+    const std::string& token,
+    const std::string& session_id,
+    const protocol::word_study_v1::CandidatePageRequest& request,
+    protocol::word_study_v1::CandidatePageData* page,
+    protocol::v3::Error* error)
+{
+    return FetchWordStudyCandidatePageV1Impl(token, session_id, request, page, error, true);
 }
 
 esp_err_t SubmitWordStudyObservationV1AtPath(

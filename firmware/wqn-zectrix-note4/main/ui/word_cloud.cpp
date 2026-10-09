@@ -334,6 +334,66 @@ bool IsWordSessionInvalidError(const wqn::protocol::v3::Error& error)
            error.code == "WORD_SESSION_SNAPSHOT_INCOMPLETE";
 }
 
+// [snapshot-coalesce] Neither the initial window nor its immediate prefetch
+// has been exposed to UI yet. Build at most one extended window in RAM, then
+// keep the existing durable-before-publish boundary with ONE snapshot save.
+void PersistInitialWordSessionSnapshot(const std::string& token, WordCloudResult* result)
+{
+    if (result == nullptr || result->result != ESP_OK ||
+        result->session_compact_result != ESP_OK || !result->persisted_session.active) return;
+    auto& initial = result->persisted_session;
+    const size_t base_items = initial.remote.items.size();
+    const bool prefetch = !initial.paused && initial.position == 0 &&
+        initial.phase == wqn::WordPresentationPhase::kFront && base_items > 0 &&
+        base_items <= wqn::protocol::word_study_v1::kInitialCandidatePageSize &&
+        initial.remote.has_more && !initial.remote.cursor.empty();
+    bool coalesced = false;
+    esp_err_t prefetch_result = ESP_OK;
+    int64_t prefetch_ms = 0;
+    if (prefetch) {
+        wqn::protocol::word_study_v1::CandidatePageRequest request;
+        request.metadata = wqn::services::MakeDeviceRequestMetadata();
+        request.cursor = initial.remote.cursor;
+        request.limit = static_cast<int>(wqn::protocol::word_study_v1::kCandidatePrefetchPageSize);
+        wqn::protocol::word_study_v1::CandidatePageData page;
+        wqn::protocol::v3::Error error;
+        const int64_t started_us = esp_timer_get_time();
+        prefetch_result = wqn::TryFetchWordStudyCandidatePageV1(
+            token, initial.remote.session_id, request, &page, &error);
+        if (prefetch_result == ESP_OK) {
+            wqn::PersistedWordSession extended;
+            prefetch_result = wqn::ExtendPersistedWordSessionWithPage(initial, page, &extended);
+            if (prefetch_result == ESP_OK) {
+                initial = std::move(extended);
+                coalesced = true;
+            }
+        } else {
+            // Transient or readiness failure falls back to the valid initial
+            // window. Do not revive a server-invalid session or ignore the
+            // existing API's 401 token clearing just to make prefetch succeed.
+            std::string current_token;
+            if (IsWordSessionInvalidError(error) || !LoadValidTokenForTodo(&current_token)) {
+                result->result = prefetch_result;
+                result->protocol_error = std::move(error);
+                ESP_LOGW(kTag, "word initial snapshot rejected: prefetch_result=%s session=%s",
+                    esp_err_to_name(prefetch_result), initial.remote.session_id.c_str());
+                return;
+            }
+        }
+        prefetch_ms = (esp_timer_get_time() - started_us) / 1000;
+    }
+    // The existing store still merges concurrent durable progress and rejects
+    // stale scope before writing. No intermediate window was saved/published.
+    result->session_persist_result = wqn::SavePersistedWordSession(initial);
+    ESP_LOGI(kTag,
+        "word initial snapshot: base_items=%u items=%u coalesced=%d prefetch_attempted=%d "
+        "prefetch_result=%s prefetch_ms=%lld result=%s session=%s",
+        static_cast<unsigned>(base_items), static_cast<unsigned>(initial.remote.items.size()),
+        coalesced ? 1 : 0, prefetch ? 1 : 0, esp_err_to_name(prefetch_result),
+        static_cast<long long>(prefetch_ms), esp_err_to_name(result->session_persist_result),
+        initial.remote.session_id.c_str());
+}
+
 // Rebuilds the note screen's [词] rows from the mounted deck catalog. The
 // current default deck is excluded: it lives on the word page itself, the
 // mixed list only carries the extra decks.
@@ -650,11 +710,7 @@ void ExecuteWordCloudRequest(const WordCloudRequest& request)
                 request.scope_generation;
             result.session_compact_result = wqn::CompactWordSessionData(
                 result.session, &result.persisted_session.remote);
-            if (result.session_compact_result == ESP_OK &&
-                result.persisted_session.active) {
-                result.session_persist_result =
-                    wqn::SavePersistedWordSession(result.persisted_session);
-            }
+            PersistInitialWordSessionSnapshot(token, &result);
         }
     } else if (request.op == WordCloudOp::kFetchSessionPage) {
         wqn::protocol::word_study_v1::CandidatePageRequest page;
