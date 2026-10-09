@@ -1619,25 +1619,29 @@ void ApplyWordCandidatePageResult(
         state->message = "后续单词加载失败，继续时重试";
         return;
     }
-    // [ui-gates] The runner extended and persisted the snapshot the page was
-    // QUEUED with. If the session has advanced since -- the user answered while
-    // the page was in flight -- that snapshot is stale: installing it would roll
-    // the position back, and the durable state is already ahead because the
-    // observation commit persisted the advanced session. Keep the in-memory
-    // state and merge the page into it here; the next commit re-persists.
+    // [word-batch] RAM-ahead progress does not prove this candidate page was
+    // saved. Check the runner's durable-page result BEFORE either install or
+    // stale merge: ordinary batches append events, not the new candidate window.
+    // An empty/mismatched snapshot cannot supply proof via default ESP_OK flags.
+    if (compact_result != ESP_OK) {
+        state->message = WordPageExtendMessage(compact_result);
+        return;
+    }
+    if (persist_result != ESP_OK || !runner_snapshot.active ||
+        runner_snapshot.remote.session_id != persisted.remote.session_id ||
+        runner_snapshot.deck_scope_generation != persisted.deck_scope_generation) {
+        state->message = "后续单词未保存";
+        return;
+    }
+    // [ui-gates] The runner saved the window captured at queue time. Answers
+    // may meanwhile have advanced RAM (and possibly durable journal progress).
+    // Do not reinstall that older cursor; merge the saved page over current RAM
+    // while leaving its buffered observations and phase intact.
     const bool runner_snapshot_current =
         persisted.remote.session_id == runner_snapshot.remote.session_id &&
         persisted.position == runner_snapshot.position;
     PersistedWordSession updated;
     if (runner_snapshot_current) {
-        if (compact_result != ESP_OK) {
-            state->message = WordPageExtendMessage(compact_result);
-            return;
-        }
-        if (persist_result != ESP_OK) {
-            state->message = "后续单词未保存";
-            return;
-        }
         updated = runner_snapshot;
     } else {
         const esp_err_t merge_result = wqn::ExtendPersistedWordSessionWithPage(
