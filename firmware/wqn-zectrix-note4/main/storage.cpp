@@ -22,6 +22,8 @@
 #include "esp_spiffs.h"
 #include "esp_system.h"
 #include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "nvs.h"
 #include "nvs_flash.h"
 #include "services/sync_service.h"
@@ -433,6 +435,7 @@ esp_err_t ClearNvsKeyTransaction(void* opaque)
 {
     return ClearNvsKeyRaw(static_cast<const char*>(opaque));
 }
+
 
 esp_err_t ClearNvsKey(const char* key)
 {
@@ -948,6 +951,11 @@ esp_err_t InitStorage()
     ESP_LOGW(kTag, "NVS encryption is disabled; device credentials are stored as plaintext NVS values");
 #endif
     ESP_LOGI(kTag, "NVS ready");
+    // [measure] §五之十 §6: seed the entry-budget baseline before any session
+    // write, so the first per-write delta has something to be a delta against.
+    // total_entries here is the denominator every percentage in §五之十 relies
+    // on and it has so far only been derived (4 pages x 126), never measured.
+    LogNvsStatsProbe();
     ESP_RETURN_ON_ERROR(InitStoragePartition(), kTag, "init storage partition");
     ESP_RETURN_ON_ERROR(services::StartStorageService(), kTag, "start storage service");
     // [deck-scope] Replay an interrupted default-deck change and seed the
@@ -1006,6 +1014,264 @@ bool ReadStorageCapacitySnapshot(StorageCapacitySnapshot* snapshot)
         snapshot->nvs_total_entries = stats.total_entries;
     }
     return snapshot->spiffs_valid || snapshot->nvs_valid;
+}
+
+// [measure] §五之十 §6. Field names are a contract with scripts/hil_check.py:
+// WRITE:nvs-entry-budget-measured greps `nvs stats:` and requires total_entries,
+// and WRITE:parts-account-for-transaction folds `nvs write:`'s total_ms into the
+// per-transaction write sum. Renaming either is a silent SKIP, which this judge
+// has already been bitten by four times (three renames, plus one field INSERTED
+// in the middle of an existing line that a positional regex matched). Do not add
+// fields to the middle of a line: append them at the end.
+void LogNvsWriteProbe(const NvsWriteProbe& probe)
+{
+    ESP_LOGI(
+        kTag,
+        "nvs write: key=%s bytes=%u total_ms=%lld changed=%d",
+        probe.key != nullptr ? probe.key : "?",
+        static_cast<unsigned>(probe.bytes),
+        static_cast<long long>(probe.total_ms),
+        probe.changed ? 1 : 0);
+}
+
+void LogNvsStatsProbe()
+{
+    nvs_stats_t stats = {};
+    // nullptr means "the default NVS partition" (nvs_api.cpp:555 maps it to
+    // NVS_DEFAULT_PART_NAME); spelling "nvs" literally would fail on a partition
+    // table that renames it. A silent return here is unreachable in practice:
+    // every caller has already opened the namespace successfully, and
+    // nvs_get_stats can only fail with NOT_INITIALIZED / INVALID_STATE.
+    if (nvs_get_stats(nullptr, &stats) != ESP_OK) {
+        return;
+    }
+    ESP_LOGI(
+        kTag,
+        "nvs stats: used_entries=%zu free_entries=%zu available_entries=%zu "
+        "total_entries=%zu",
+        stats.used_entries,
+        stats.free_entries,
+        stats.available_entries,
+        stats.total_entries);
+}
+
+// [word-session-cursor-nvs] The 52 B pause/resume cursor used to be a 52 B
+// AtomicWrite on SPIFFS, measured at a 1,766 ms median (n=7 late-boot,
+// doc/1005-storage-rewrite-todo.md §五之八). That write is what made answering
+// cost two AtomicWrites per answer. It is now one NVS blob.
+//
+// Callers pass the key from their own per-mode table so storage.h keeps no
+// dependency on the word protocol types.
+//
+// The NVS primitives run inline rather than through SaveBlobToNvs on purpose:
+// the only callers are SaveSessionTransaction and SaveCursorTransaction, which
+// already execute on the storage owner task. Re-queueing them would nest a
+// second write inside a transaction that is already the single writer (§7.4).
+//
+// Read-then-compare instead of an unconditional set is not a micro-optimization
+// -- it is what makes the probe honest. IDF short-circuits an identical value
+// itself (nvs_storage.cpp:504-507 for a single chunk, :478-480 multi-page), so
+// an unconditional nvs_set_blob would report changed=1 for a write that never
+// touched flash, and the WRITE:parts-account-for-transaction judge could not
+// tell "the cursor was unchanged, so it cost nothing" from "NVS is just fast".
+// Those are different conclusions and only one of them is evidence.
+esp_err_t SaveWordSessionCursorNvs(const char* key, const void* record, size_t size)
+{
+    const int64_t entered_us = esp_timer_get_time();
+    NvsHandle nvs;
+    ESP_RETURN_ON_ERROR(
+        nvs_open(WQN_NVS_NAMESPACE, NVS_READWRITE, &nvs.handle), kTag, "open NVS namespace");
+
+    size_t existing_size = 0;
+    esp_err_t result = nvs_get_blob(nvs.handle, key, nullptr, &existing_size);
+    if (result == ESP_ERR_NVS_NOT_FOUND) {
+        existing_size = 0;
+    } else {
+        ESP_RETURN_ON_ERROR(result, kTag, "measure existing word session cursor");
+    }
+
+    bool changed = existing_size != size;
+    if (!changed) {
+        std::vector<uint8_t> existing(size);
+        ESP_RETURN_ON_ERROR(
+            nvs_get_blob(nvs.handle, key, existing.data(), &existing_size), kTag,
+            "read existing word session cursor");
+        changed = std::memcmp(existing.data(), record, size) != 0;
+    }
+
+    if (changed) {
+        result = nvs_set_blob(nvs.handle, key, record, size);
+        if (result == ESP_OK) {
+            result = nvs_commit(nvs.handle);
+        }
+        if (result != ESP_OK) {
+            return result;
+        }
+    }
+
+    NvsWriteProbe probe = {};
+    probe.key = key;
+    probe.bytes = size;
+    probe.total_ms = (esp_timer_get_time() - entered_us) / 1000;
+    probe.changed = changed;
+    LogNvsWriteProbe(probe);
+    // Per-write, not just at boot: the whole point is the free_entries trend
+    // across a run of answers, which is what locates the §五之十 cliff.
+    LogNvsStatsProbe();
+    return ESP_OK;
+}
+
+// [word-session-cursor-nvs] Erase the cursor for one mode. ClearSessionTransaction
+// used to unlink .cur/.ctp/.cbk; once the value moved to NVS, unlinking those
+// files no longer clears anything and the erased session leaves an orphan blob
+// behind. It is rejected on read by the session_id check, so this is an entry
+// leak (4 entries per stale cursor: chunk header + 2 data + BLOB_IDX) and not
+// a correctness bug -- but an entry
+// leak is exactly what §五之十's 504-entry budget cannot afford to ignore.
+// NOT_FOUND is success: clearing a mode that never had a cursor is normal.
+esp_err_t ClearWordSessionCursorNvs(const char* key)
+{
+    // The window starts before nvs_open, not before nvs_commit: nvs_commit is a
+    // no-op in IDF v5.5 (nvs_api.cpp:411-420, "no-op for now"), so timing only
+    // the commit would report ~0 ms for an operation that really costs an open
+    // plus an erase. SaveWordSessionCursorNvs opens its window the same place, so
+    // the two lines are comparable.
+    const int64_t entered_us = esp_timer_get_time();
+    NvsHandle nvs;
+    esp_err_t result = nvs_open(WQN_NVS_NAMESPACE, NVS_READWRITE, &nvs.handle);
+    if (result == ESP_ERR_NVS_NOT_FOUND) {
+        return ESP_OK;
+    }
+    ESP_RETURN_ON_ERROR(result, kTag, "open NVS namespace");
+
+    result = nvs_erase_key(nvs.handle, key);
+    if (result == ESP_ERR_NVS_NOT_FOUND) {
+        return ESP_OK;
+    }
+    if (result != ESP_OK) {
+        return result;
+    }
+    result = nvs_commit(nvs.handle);
+    NvsWriteProbe probe = {};
+    probe.key = key;
+    probe.bytes = 0;
+    probe.total_ms = (esp_timer_get_time() - entered_us) / 1000;
+    // changed=true, NOT false: this function returns early on NOT_FOUND without
+    // emitting a probe at all, so reaching the line means the key existed and
+    // three entries were really erased. Reporting changed=0 here would make the
+    // judge's breakdown file this under "same value, flash untouched" (see G.4),
+    // which is the opposite of what an erase does -- and it would hide exactly
+    // the entry consumption that §五之十's 504-entry budget is watching.
+    probe.changed = true;
+    LogNvsWriteProbe(probe);
+    // So the erase shows up on the same free_entries curve the saves do: without
+    // it, the one moment used_entries should DROP is the one moment with no
+    // reading, and an entry leak after a clear would be invisible until the next
+    // answer.
+    LogNvsStatsProbe();
+    return result;
+}
+
+esp_err_t LoadWordSessionCursorNvs(const char* key, void* record, size_t size, bool* found)
+{
+    if (found == nullptr || record == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *found = false;
+    NvsHandle nvs;
+    esp_err_t result = nvs_open(WQN_NVS_NAMESPACE, NVS_READONLY, &nvs.handle);
+    if (result == ESP_ERR_NVS_NOT_FOUND) {
+        // A namespace that was never written has no cursor in it either.
+        return ESP_OK;
+    }
+    ESP_RETURN_ON_ERROR(result, kTag, "open NVS namespace");
+
+    size_t stored_size = 0;
+    result = nvs_get_blob(nvs.handle, key, nullptr, &stored_size);
+    if (result == ESP_ERR_NVS_NOT_FOUND) {
+        return ESP_OK;
+    }
+    ESP_RETURN_ON_ERROR(result, kTag, "measure word session cursor");
+    if (stored_size != size) {
+        // A size change means a different schema generation of the cursor
+        // record. Treat it as absent rather than as corrupt: the legacy
+        // .cur file below is a better source than a half-shaped NVS value.
+        ESP_LOGW(kTag, "word session cursor size %u != %u, ignoring", (unsigned)stored_size,
+                 (unsigned)size);
+        return ESP_OK;
+    }
+    ESP_RETURN_ON_ERROR(
+        nvs_get_blob(nvs.handle, key, record, &stored_size), kTag, "read word session cursor");
+    *found = true;
+    return ESP_OK;
+}
+esp_err_t RunWordCursorNvsSmokeProbe(void*)
+{
+    if (!services::IsStorageServiceTask()) return ESP_ERR_INVALID_STATE;
+    constexpr char key[] = "_hil_cur52";
+    constexpr size_t bytes = 52;
+    NvsHandle preflight;
+    ESP_RETURN_ON_ERROR(nvs_open(WQN_NVS_NAMESPACE, NVS_READONLY, &preflight.handle),
+                        kTag, "smoke requires an existing namespace");
+    size_t size = 0;
+    const esp_err_t existing = nvs_get_blob(preflight.handle, key, nullptr, &size);
+    if (existing != ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGW(kTag, "NVS cursor smoke refused: scratch key not absent result=%s",
+                 esp_err_to_name(existing));
+        return ESP_ERR_INVALID_STATE;  // Do not overwrite or clean up a prior value.
+    }
+    size_t base_entries = 0;
+    ESP_RETURN_ON_ERROR(nvs_get_used_entry_count(preflight.handle, &base_entries),
+                        kTag, "smoke namespace entry count");
+    ESP_LOGI(kTag, "NVS cursor smoke BEGIN key=%s bytes=%u namespace_entries=%u synthetic=1",
+             key, static_cast<unsigned>(bytes), static_cast<unsigned>(base_entries));
+    LogNvsStatsProbe();
+    uint8_t first[bytes] = {}, second[bytes] = {}, loaded[bytes] = {};
+    for (size_t i = 0; i < bytes; ++i) first[i] = static_cast<uint8_t>(17 * i + 0x45);
+    std::memcpy(second, first, bytes);
+    second[0] ^= 1;
+    const auto check_step = [&](const char* phase, esp_err_t result, size_t expected_entries) {
+        size_t actual = 0;
+        const esp_err_t counted = nvs_get_used_entry_count(preflight.handle, &actual);
+        if (result == ESP_OK && counted != ESP_OK) result = counted;
+        if (result == ESP_OK && actual != expected_entries) result = ESP_ERR_INVALID_STATE;
+        ESP_LOGI(kTag,
+                 "NVS cursor smoke step: phase=%s result=%s namespace_entries=%u expected_entries=%u synthetic=1",
+                 phase, esp_err_to_name(result), static_cast<unsigned>(actual),
+                 static_cast<unsigned>(expected_entries));
+        // Feed IDLE0 between tiny operations; this is not a timing deadline.
+        vTaskDelay(1);
+        return result;
+    };
+    esp_err_t result = check_step("create", SaveWordSessionCursorNvs(key, first, bytes), base_entries + 4);
+    bool found = false;
+    if (result == ESP_OK) {
+        result = LoadWordSessionCursorNvs(key, loaded, bytes, &found);
+        if (result == ESP_OK && (!found || std::memcmp(first, loaded, bytes) != 0)) result = ESP_FAIL;
+        result = check_step("read-created", result, base_entries + 4);
+    }
+    if (result == ESP_OK) result = check_step("same-value", SaveWordSessionCursorNvs(key, first, bytes), base_entries + 4);
+    if (result == ESP_OK) result = check_step("rewrite", SaveWordSessionCursorNvs(key, second, bytes), base_entries + 4);
+    if (result == ESP_OK) {
+        found = false;
+        result = LoadWordSessionCursorNvs(key, loaded, bytes, &found);
+        if (result == ESP_OK && (!found || std::memcmp(second, loaded, bytes) != 0)) result = ESP_FAIL;
+        result = check_step("read-rewritten", result, base_entries + 4);
+    }
+    // Preflight proved absent and the sole writer owns this whole transaction.
+    // Cleanup is safe even if the first attempted set partially failed.
+    const esp_err_t erased = check_step("erase", ClearWordSessionCursorNvs(key), base_entries);
+    if (result == ESP_OK) result = erased;
+    if (erased == ESP_OK) {
+        found = false;
+        esp_err_t absent = LoadWordSessionCursorNvs(key, loaded, bytes, &found);
+        if (absent == ESP_OK && found) absent = ESP_FAIL;
+        absent = check_step("read-erased", absent, base_entries);
+        if (result == ESP_OK) result = absent;
+    }
+    ESP_LOGI(kTag, "NVS cursor smoke END key=%s result=%s cleanup=%s synthetic=1",
+             key, esp_err_to_name(result), esp_err_to_name(erased));
+    return result;
 }
 
 esp_err_t EnsurePackDownloadCapacity(

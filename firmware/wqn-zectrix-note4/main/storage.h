@@ -23,6 +23,53 @@ struct StorageCapacitySnapshot {
     size_t nvs_total_entries = 0;
 };
 
+// [measure] §五之十 §6 probe contract. `nvs write:` is emitted per NVS write and
+// is folded into WRITE:parts-account-for-transaction's sum automatically by
+// hil_check.py, so the judge keeps working after the 52 B cursor leaves SPIFFS
+// and `atomic write:` drops from 2 rows to 1 per answer. Do not rename the field
+// names -- the criteria grep for them literally and a rename is a silent SKIP.
+struct NvsWriteProbe {
+    const char* key = nullptr;
+    size_t bytes = 0;
+    int64_t total_ms = 0;
+    // False when the value already matched what NVS holds, which is also the
+    // case IDF itself short-circuits in (nvs_storage.cpp:504-507 / :478-480).
+    bool changed = false;
+};
+
+// Emits `nvs write:`. Any task may call; it only formats a log line.
+void LogNvsWriteProbe(const NvsWriteProbe& probe);
+// Emits `nvs stats: used_entries=… free_entries=… available_entries=… total_entries=…`
+// from nvs_get_stats. This is the line that turns §五之十's derived NVS
+// arithmetic ("~4.7 writes", "21.2%", 504 entries) into a measurement: if the
+// measured total_entries is not 504, every percentage in that section is wrong.
+void LogNvsStatsProbe();
+
+// [word-session-cursor-nvs] The 52 B pause/resume cursor, moved off SPIFFS
+// (doc/1005-storage-rewrite-todo.md §五之十). It used to cost a 1,766 ms median
+// AtomicWrite per answer, which is half of the "answering takes 4.3 s" symptom.
+//
+// The NVS primitives run inline because the caller is already the storage owner
+// task; re-queuing through SaveBlobToNvs would nest a second writer inside a
+// transaction (§7.4). `key` comes from the caller's per-mode table so this
+// header keeps no dependency on the word protocol types.
+// Emits the `nvs write:` / `nvs stats:` probes of §五之十 §6.
+esp_err_t SaveWordSessionCursorNvs(const char* key, const void* record, size_t size);
+// `*found` stays false and the result stays ESP_OK when no cursor is stored --
+// that is the "this mode is unused / not migrated yet" case, not an error. The
+// caller then falls back to the legacy .cur file. found must not be null.
+esp_err_t LoadWordSessionCursorNvs(const char* key, void* record, size_t size, bool* found);
+// [word-session-cursor-nvs] Erase one mode's cursor. ClearSessionTransaction
+// needs this because it used to unlink .cur/.ctp/.cbk, and once the value moved
+// to NVS those file removals clear nothing and the erased session leaves an
+// orphan blob behind (4 entries of the 504-entry budget, §五之十). NOT_FOUND is
+// success: clearing a mode that never had a cursor is the normal case.
+esp_err_t ClearWordSessionCursorNvs(const char* key);
+// [measure] Owner-task-only synthetic 52 B CRUD smoke test. Refuses an
+// existing scratch key, never uses a real mode key, and cleans up its own key.
+// This is not a word-session migration/clear or physical power-loss test.
+esp_err_t RunWordCursorNvsSmokeProbe(void* context);
+
 struct DeviceControlState {
     uint64_t config_revision = 0;
     uint64_t sync_cursor = 0;

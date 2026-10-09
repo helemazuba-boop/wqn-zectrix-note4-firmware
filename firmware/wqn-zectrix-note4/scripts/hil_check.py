@@ -674,6 +674,11 @@ class Log:
             if WORD_OBS_DURABLE_HEAD not in line:
                 continue
             f = {k: int(v) for k, v in KV_NUM_RE.findall(line)}
+            # Keep the complete identity even when its UUID starts with digits;
+            # the generic numeric scanner alone would capture only that prefix.
+            for kv in KV_RE.finditer(line):
+                if kv.group('k') == 'session':
+                    f['session'] = kv.group('v')
             tm = LOG_PREFIX_RE.match(line)
             # `append` 是判据用的统一名（行里叫 append_ms）。缺它就算没解析到，
             # 由 LOG:*-format-parsed 当场 FAIL，不会伪装成"这轮没测"。
@@ -3778,6 +3783,22 @@ def selftest():
     check('nvs write 解析出 2 笔', len(log2.nvs_writes), 2)
     check('key 名保住了（不是 ?）',
           [w.get('key') for w in log2.nvs_writes], ['cur_rev', 'cur_int'])
+
+    # A UUID beginning with digits must not become its numeric prefix through
+    # KV_NUM_RE. Identity is a string, not a sequence counter or an Agent gate.
+    fixture_sid = '12345678-1234-1234-1234-123456789abc'
+    log_sid = Log.from_text(
+        'fixture preamble (not a device line)\n'
+        'I (500) word_store: word observation durable: sequence=16 lookup_ms=0 '
+        'append_ms=13 append_open_ms=3 append_bytes=200 total_ms=14 mode=3 '
+        f'session={fixture_sid}\n', '<selftest-observation-sid>')
+    check('作答行追加mode/session仍解析一笔', len(log_sid.obs_durable), 1)
+    check('作答SID保留完整UUID字符串而非数字前缀',
+          log_sid.obs_durable[0].get('session') if log_sid.obs_durable else None,
+          fixture_sid)
+    check('身份字段不改载荷/耗时单位',
+          [(o.get('append_bytes'), o.get('append_ms'), o.get('total_ms'))
+           for o in log_sid.obs_durable], [(200, 13, 14)])
 
     # 5. 墙钟前缀的状态行**不能**被设备时间戳正则吃掉（监听器行的守门测试）。
     check('LOG_PREFIX_RE 不匹配墙钟前缀行',

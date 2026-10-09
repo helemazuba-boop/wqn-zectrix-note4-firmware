@@ -147,6 +147,10 @@ struct WordOutboxSnapshot {
     size_t capacity = 0;
 };
 
+// Live capacity counts pending + parked observations, not historical ACKs.
+// A separate physical-byte bound reserves their terminal-marker slots. New
+// submissions can return INVALID_SIZE under unreclaimed space pressure; no
+// accepted observation is silently evicted to make room.
 inline constexpr size_t kWordObservationOutboxCapacity = 1000;
 
 // Every resumable word mode (sequential, review, shuffle, mistakes) has its own
@@ -162,9 +166,11 @@ esp_err_t SavePersistedWordSession(const PersistedWordSession& session);
 esp_err_t SaveWordSessionCursor(const PersistedWordSession& session);
 esp_err_t ClearPersistedWordSession(protocol::word_study_v1::Mode mode);
 
-// Commits the observation first, then the advanced session cursor. Retrying
-// the same request_id is idempotent. If the second write is interrupted, load
-// reconciliation advances the session from the durable outbox record.
+// A normal new observation durably includes the advanced position/phase/sequence
+// in its outbox record; it does not rewrite the complete candidate snapshot or
+// the pause-only NVS cursor. Retrying the same request_id is idempotent (existing
+// record retries may checkpoint the supplied session). Loads replay retained
+// observations, and maintenance checkpoints before reclaiming their progress.
 esp_err_t CommitWordObservation(
     const DurableWordObservation& observation,
     const PersistedWordSession& advanced_session);
