@@ -841,8 +841,9 @@ def hil_word_commit_queue(log: Log):
                 windows[-1][2] = int(tm.group(1))
         for m in TX_RE.finditer(line):
             transactions.append(dict(m.groupdict(), epoch=epoch))
-    commits = [t for t in transactions if t['owner'] == 'word-observation-commit']
-    commit_heads = sum('owner=word-observation-commit' in line for line in log.lines)
+    owners = {'word-observation-commit', 'word-observation-batch'}
+    commits = [t for t in transactions if t['owner'] in owners]
+    commit_heads = sum(any(f'owner={owner}' in line for owner in owners) for line in log.lines)
     if commit_heads != len(commits):
         expect(log, name, False,
                f'答题事务格式漂移：{commit_heads} 行 / {len(commits)} 条解析')
@@ -884,6 +885,150 @@ def hil_word_commit_queue(log: Log):
         detail += (f"；等待窗口与 {t['owner']} 的执行重叠 {overlap} ms"
                    f'（该事务 elapsed={el(t)} ms；仅时序归因，不细分内部耗时）')
     expect(log, name, qw(worst) < 500, detail)
+
+
+def hil_word_batches(log: Log):
+    """Only what logs directly show: bounded RAM, record accounting, own TX window.
+
+    RAM acceptance is NOT durability. Body total_ms is an append, not per-event
+    latency and not full UI latency. No performance threshold is changed here.
+    """
+    schemas = {
+        'word observation RAM accepted:': ({'sequence', 'pending', 'inflight'}, {'session'}),
+        'word observation batch durable:': (
+            {'count', 'appended', 'bytes', 'total_ms', 'first_sequence', 'last_sequence', 'mode'}, {'session'}),
+        'word ACK batch durable:': ({'count', 'bytes', 'total_ms'}, set()),
+        'word observation batch queued:': ({'count', 'oldest_age_ms', 'forced', 'op'}, {'session'}),
+    }
+    rows = {head: [] for head in schemas}
+    malformed, epoch = [], 0
+    for line_no, line in enumerate(log.lines):
+        if BOOT_BANNER_RE.search(line) or ROM_RESET_RE.search(line):
+            epoch += 1
+        for head, (numbers, strings) in schemas.items():
+            if head not in line:
+                continue
+            prefix = LOG_PREFIX_RE.match(line)
+            pairs = KV_RE.findall(line.split(head, 1)[1])
+            fields = dict(pairs)
+            if (not prefix or len(fields) != len(pairs) or not (numbers | strings) <= fields.keys()
+                    or any(not re.fullmatch(r'\d+', fields[key]) for key in numbers)):
+                malformed.append(f'{line_no + 1}:{head}')
+                continue
+            fields.update({key: int(fields[key]) for key in numbers})
+            rows[head].append(dict(fields, t=int(prefix.group(1)), epoch=epoch, line=line_no))
+    fmt = 'LOG:word-batches-parsed'
+    names = ['WRITE:word-RAM-bound', 'WRITE:word-batch-record-accounting',
+             'WRITE:word-batch-transaction-window', 'WRITE:word-batch-flush-trigger']
+    if malformed:
+        expect(log, fmt, False, '批量格式漂移/缺字段/单位错误：' + ', '.join(malformed))
+        for name in names:
+            expect(log, name, False, '批量日志不可解析，不把格式漂移当未测')
+        return
+    if not any(rows.values()):
+        skip(log, fmt, '无批量版行；旧版日志不是批量验证')
+        for name in names:
+            skip(log, name, '无对应批量场景；SKIP 不是通过')
+        return
+    expect(log, fmt, True, '；'.join(f'{head} n={len(values)}' for head, values in rows.items()))
+    ram = rows['word observation RAM accepted:']
+    observations = rows['word observation batch durable:']
+    acks = rows['word ACK batch durable:']
+    queued = rows['word observation batch queued:']
+    if queued:
+        expect(log, names[3], all(1 <= r['count'] <= 10 and r['op'] > 0 and r['forced'] in (0, 1)
+                                 and (r['forced'] or r['count'] >= 5 or r['oldest_age_ms'] >= 30000)
+                                 for r in queued),
+               f'flush 入队 n={len(queued)}；5事件/最老30秒/强制边界之一须满足；'
+               '此代理量只验触发原因，不证明排队/完成也在30秒内或无漏触发')
+    else:
+        skip(log, names[3], '缺 flush 入队行，不能由 durable 完成时间反推触发时间')
+    if ram:
+        expect(log, names[0], all(1 <= r['pending'] <= 10 and 0 <= r['inflight'] <= r['pending']
+                                 and r['sequence'] > 0 for r in ram),
+               f"RAM 接收 n={len(ram)}, 等待+在途最大 {max(r['pending'] for r in ram)} (<=10)；"
+               '仅采样边界，不证明所有中间状态/30秒触发或掉电恢复')
+    else:
+        skip(log, names[0], '无 RAM 接收行，不能用 durable 行代替')
+    records_ok = all(1 <= r['count'] <= 10 and 1 <= r['appended'] <= r['count']
+                     and r['bytes'] == r['appended'] * 200 and r['first_sequence'] > 0
+                     and r['last_sequence'] - r['first_sequence'] + 1 == r['count']
+                     and 0 <= r['mode'] < 7 for r in observations)
+    records_ok &= all(1 <= r['count'] <= 5 and r['bytes'] == r['count'] * 200 for r in acks)
+    if observations or acks:
+        expect(log, names[1], records_ok,
+               f'作答批 n={len(observations)}；ACK 批 n={len(acks)}；200 B/实际追加记录；'
+               '作答可含已耐久前缀的重试，不把 count 当新增记录数')
+    else:
+        skip(log, names[1], '只有 RAM 接收，未观察到耐久批量')
+    # Same boot, own completed transaction and own measured append duration.
+    # A nearby save/other batch/previous boot must never pay this body cost.
+    observed = [(r, 'word-observation-batch') for r in observations] + [
+        (r, 'word-outbox-ack-batch') for r in acks]
+    if not observed:
+        skip(log, names[2], '无批量耐久行，不用 RAM 接收冒充')
+        return
+    paired, bad, missing, used = [], [], [], set()
+    for row, owner in observed:
+        candidates = [tx for tx in log.tx if tx['owner'] == owner and tx['epoch'] == row['epoch']
+                      and tx['line'] > row['line'] and tx['t'] is not None
+                      and int(tx['t']) - el(tx) - 2 <= row['t'] <= int(tx['t'])]
+        if len(candidates) != 1:
+            missing.append(row['line'] + 1)
+            continue
+        tx = candidates[0]
+        if tx['line'] in used or tx['res'] != 'ESP_OK' or row['total_ms'] > el(tx) + 2 or (
+                row['t'] - row['total_ms'] < int(tx['t']) - el(tx) - 2):
+            bad.append(row['line'] + 1)
+        used.add(tx['line'])
+        paired.append(tx)
+    if bad or (missing and paired):
+        expect(log, names[2], False, f'自己的执行窗对不上：bad={bad}, missing={missing}')
+    elif missing:
+        skip(log, names[2], f'耐久行缺自己的 StorageService 完成窗：{missing}；无法对账')
+    else:
+        costs = sorted(el(tx) + qw(tx) for tx in paired)
+        p90 = costs[(9 * len(costs) + 9) // 10 - 1]
+        expect(log, names[2], True,
+               f'StorageService 入队至完成 n={len(costs)}, p90={p90} ms, max={max(costs)} ms；'
+               '这不是按键到落盘/单事件时延；不除以批大小，也不宣称性能达标')
+
+
+def hil_word_ram_reads(log: Log):
+    """Separate physical prefetch reads from RAM hits; never turn hits into 0ms I/O."""
+    name = 'PK:word-RAM-read-provenance'
+    foreground, prefetch, hits, legacy, bad = [], [], 0, 0, []
+    for line in log.lines:
+        if 'word card RAM hit:' in line:
+            fields = dict(KV_RE.findall(line))
+            if not LOG_PREFIX_RE.match(line) or not re.fullmatch(r'\d+', fields.get('ordinal', '')) or not fields.get('session'):
+                bad.append('RAM hit 缺身份/时间戳')
+            else:
+                hits += 1
+        if 'word card loaded:' not in line:
+            continue
+        fields = dict(KV_RE.findall(line))
+        if 'source' not in fields:
+            legacy += 1
+            continue
+        match = CARD_RE.search(line)
+        cost_keys = ('open_seek_ms', 'read_close_ms', 'parse_ms', 'total_ms', 'fopen_ms', 'fseek_ms')
+        if (fields['source'] not in ('foreground', 'prefetch') or not match or not LOG_PREFIX_RE.match(line)
+                or any(not re.fullmatch(r'\d+', fields.get(key, '')) for key in cost_keys)):
+            bad.append('card loaded source/成本字段漂移')
+            continue
+        target = prefetch if fields['source'] == 'prefetch' else foreground
+        target.append(int(match.group('tot')))
+    if bad:
+        expect(log, name, False, '；'.join(bad))
+    elif not prefetch and not foreground and not hits:
+        skip(log, name, f'无 RAM 版来源证据；legacy 物理读 n={legacy}')
+    else:
+        expect(log, name, True,
+               f'RAM命中 n={hits}（不是 0ms 物理读）；foreground n={len(foreground)}, '
+               f'prefetch n={len(prefetch)}, legacy n={legacy}；'
+               f'物理预取成本 max={max(prefetch) if prefetch else "未测"} ms；'
+               '不把异步搬离前台当硬件加速，也未证明完整按键→呈现延迟')
 
 
 def probe_profile(line: str, allowed) -> bool:
@@ -4738,6 +4883,76 @@ def selftest():
         hil_word_commit_queue, lifecycle + commit(t=11000, wait=600), queue_name), 'SKIP')
     check('总 END 后的排队 FAIL 仍保留，不全日志剔除', verdict(
         hil_word_commit_queue, lifecycle + commit(t=25000, wait=600), queue_name), 'FAIL')
+    # Batch-era fixtures are deliberately multi-line with a non-match first.
+    batch_ram = ('I (100) word_app: word observation RAM accepted: sequence=16 pending=2 inflight=1 '
+                 f'session={fixture_sid}\n')
+    batch_body = ('I (1000) word_store: word observation batch durable: count=5 appended=5 bytes=1000 '
+                  f'total_ms=400 first_sequence=16 last_sequence=20 mode=3 session={fixture_sid}\n')
+    batch_tx = ('I (1002) storage_service: storage transaction complete: request=7 '
+                'owner=word-observation-batch queue_wait_ms=5 elapsed_ms=420 result=ESP_OK\n')
+    ack_body = 'I (1500) word_store: word ACK batch durable: count=5 bytes=1000 total_ms=300\n'
+    ack_tx = ('I (1502) storage_service: storage transaction complete: request=8 '
+              'owner=word-outbox-ack-batch queue_wait_ms=5 elapsed_ms=320 result=ESP_OK\n')
+    batch_good = 'unrelated first line\n' + batch_ram + batch_body + batch_tx + ack_body + ack_tx
+    queued_line = ('I (500) word_app: word observation batch queued: count=5 oldest_age_ms=100 '
+                   f'forced=0 op=8 session={fixture_sid}\n')
+    batch_good = 'unrelated first line\n' + batch_ram + queued_line + batch_body + batch_tx + ack_body + ack_tx
+    for name in ('LOG:word-batches-parsed', 'WRITE:word-RAM-bound',
+                 'WRITE:word-batch-record-accounting', 'WRITE:word-batch-transaction-window'):
+        check('批量完整夹具 ' + name, verdict(hil_word_batches, batch_good, name), 'PASS')
+        check('旧版无批量 ' + name, verdict(hil_word_batches, atomic, name), 'SKIP')
+    for label, changed in (
+            ('RAM等待加在途越界', batch_good.replace('pending=2', 'pending=11')),
+            ('在途超过缓冲总数', batch_good.replace('inflight=1', 'inflight=3'))):
+        check(label, verdict(hil_word_batches, changed, 'WRITE:word-RAM-bound'), 'FAIL')
+    for label, changed in (
+            ('连续序号对不上', batch_good.replace('last_sequence=20', 'last_sequence=21')),
+            ('字节不能按count估算', batch_good.replace('bytes=1000', 'bytes=999', 1)),
+            ('实际新增不可大于请求', batch_good.replace('appended=5', 'appended=6')),
+            ('ACK触发上限5', batch_good.replace('word ACK batch durable: count=5', 'word ACK batch durable: count=6'))):
+        check(label, verdict(hil_word_batches, changed, 'WRITE:word-batch-record-accounting'), 'FAIL')
+    prefix_retry = batch_good.replace('appended=5 bytes=1000', 'appended=2 bytes=400')
+    check('已有前缀重试只数新增字节', verdict(hil_word_batches, prefix_retry,
+          'WRITE:word-batch-record-accounting'), 'PASS')
+    for label, changed in (
+            ('缺字段', batch_good.replace('inflight=1 ', '')),
+            ('单位漂移', batch_good.replace('count=5', 'count=5ms', 1)),
+            ('单条坏行混在绿行不能静默丢掉', batch_good + batch_body.replace('bytes=1000', 'bytes=nope')),
+            ('SID缺失', batch_good.replace(f'session={fixture_sid}', '', 1)),
+            ('前缀缺失', batch_good.replace('I (1000) word_store:', 'word_store:'))):
+        check('批量格式 ' + label, verdict(hil_word_batches, changed, 'LOG:word-batches-parsed'), 'FAIL')
+    check('本批body不能借另一事务总耗时', verdict(hil_word_batches,
+          batch_good.replace('total_ms=400', 'total_ms=600'), 'WRITE:word-batch-transaction-window'), 'FAIL')
+    check('同一事务不能为两个durable行付账', verdict(hil_word_batches,
+          batch_good.replace(batch_body, batch_body + batch_body), 'WRITE:word-batch-transaction-window'), 'FAIL')
+    check('事务失败不能支持durable成功', verdict(hil_word_batches,
+          batch_good.replace('result=ESP_OK', 'result=ESP_FAIL', 1), 'WRITE:word-batch-transaction-window'), 'FAIL')
+    check('上一启动完成窗不能为本启动付账', verdict(hil_word_batches,
+          batch_body+'I (1001) boot: End of partition table\n'+batch_tx, 'WRITE:word-batch-transaction-window'), 'SKIP')
+    check('只见RAM不等于耐久', verdict(hil_word_batches, 'unrelated\n'+batch_ram,
+          'WRITE:word-batch-record-accounting'), 'SKIP')
+    for label, value, want in (
+            ('计数5触发', queued_line, 'PASS'),
+            ('未满5提前普通flush', queued_line.replace('count=5', 'count=4'), 'FAIL'),
+            ('最老30秒触发', queued_line.replace('count=5', 'count=1').replace('oldest_age_ms=100', 'oldest_age_ms=30000'), 'PASS'),
+            ('强制边界不足5触发', queued_line.replace('count=5', 'count=1').replace('forced=0', 'forced=1'), 'PASS'),
+            ('缺入队行不推测', batch_body+batch_tx, 'SKIP')):
+        check(label, verdict(hil_word_batches, 'unrelated\n'+value, 'WRITE:word-batch-flush-trigger'), want)
+    check('批量排队也进入旧500ms门', verdict(hil_word_commit_queue,
+          batch_good.replace('queue_wait_ms=5 elapsed_ms=420', 'queue_wait_ms=500 elapsed_ms=420'), queue_name), 'FAIL')
+    ram_card = (f'I (100) word_app: word card RAM hit: ordinal=16 session={fixture_sid}\n'
+                'I (200) word_pack: word card loaded: open_seek_ms=1 read_close_ms=4 parse_ms=1 '
+                'total_ms=6 fopen_ms=0 fseek_ms=1 source=prefetch\n')
+    check('物理预取与RAM命中单列', verdict(hil_word_ram_reads, 'unrelated\n'+ram_card,
+          'PK:word-RAM-read-provenance'), 'PASS')
+    check('旧词卡行不假装已测RAM', verdict(hil_word_ram_reads,
+          ram_card.splitlines()[1].replace(' source=prefetch', ''), 'PK:word-RAM-read-provenance'), 'SKIP')
+    check('未知读取来源不SKIP', verdict(hil_word_ram_reads, ram_card.replace('source=prefetch', 'source=changed'),
+          'PK:word-RAM-read-provenance'), 'FAIL')
+    check('预取成本单位漂移不绿', verdict(hil_word_ram_reads, ram_card.replace('total_ms=6', 'total_ms=6us'),
+          'PK:word-RAM-read-provenance'), 'FAIL')
+    check('RAM身份缺失不SKIP', verdict(hil_word_ram_reads, ram_card.replace(f'session={fixture_sid}', ''),
+          'PK:word-RAM-read-provenance'), 'FAIL')
     RESULTS.clear()
 
     print(f'\n自检 {ok + len(bad)} 项：{ok} PASS / {len(bad)} FAIL')
@@ -4774,6 +4989,8 @@ def main(argv):
         hil_c6b_scope_switch(log)
         hil_c8_page_save(log)
         hil_word_commit_queue(log)
+        hil_word_batches(log)
+        hil_word_ram_reads(log)
         hil_pk_handle(log, pk_open_seek_context(paths, exclude=p))
         hil_owner_attribution(log)
         hil_storage_bench(log)

@@ -1822,10 +1822,11 @@ bool BufferWordObservationEffect(WordAppState* state, const std::string& request
     state->session.buffered_observations.push_back({std::move(observation), now_ms});
     state->session.buffered_advanced_session = std::move(advanced);
     ApplyWordObservationState(state, ESP_OK, false);
-    ESP_LOGI(kTag, "word observation RAM accepted: sequence=%llu pending=%u inflight=%u",
+    ESP_LOGI(kTag, "word observation RAM accepted: sequence=%llu pending=%u inflight=%u session=%s",
         static_cast<unsigned long long>(state->session.buffered_observations.back().observation.sequence),
         static_cast<unsigned>(state->session.buffered_observations.size()),
-        static_cast<unsigned>(state->session.batch_in_flight));
+        static_cast<unsigned>(state->session.batch_in_flight),
+        state->session.buffered_observations.back().observation.session_id.c_str());
     return true;
 }
 
@@ -1846,6 +1847,11 @@ bool TakeWordObservationBatch(WordAppState* state, uint32_t operation_id, int64_
     *advanced_session = session.buffered_advanced_session;
     session.batch_in_flight = observations->size();
     session.batch_operation_id = operation_id;
+    ESP_LOGI(kTag, "word observation batch queued: count=%u oldest_age_ms=%lld forced=%u op=%lu session=%s",
+        static_cast<unsigned>(observations->size()),
+        static_cast<long long>(now_ms - session.buffered_observations.front().accepted_ms),
+        session.batch_flush_requested ? 1U : 0U, static_cast<unsigned long>(operation_id),
+        observations->front().session_id.c_str());
     return true;
 }
 
