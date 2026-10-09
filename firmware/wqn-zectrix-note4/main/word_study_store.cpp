@@ -809,6 +809,37 @@ bool BenchFreeSpaceOk(const BenchShape& shape, int round, int64_t* info_ms_out)
     return true;
 }
 
+// Legacy scratch lifecycle must use the same owner as the measured rounds.
+// A SleepLease alone neither serializes SPIFFS nor supplies an internal stack.
+esp_err_t BenchRemoveTransaction(void* opaque)
+{
+    const auto* path = static_cast<const char*>(opaque);
+    if (path == nullptr) return ESP_ERR_INVALID_ARG;
+    return std::remove(path) == 0 || errno == ENOENT ? ESP_OK : ESP_FAIL;
+}
+
+esp_err_t BenchStreamBeginTransaction(void*)
+{
+    if (g_bench_stream != nullptr) return ESP_ERR_INVALID_STATE;
+    if (std::remove(kBenchStream) != 0 && errno != ENOENT) return ESP_FAIL;
+    g_bench_stream = std::fopen(kBenchStream, "wb");
+    return g_bench_stream != nullptr ? ESP_OK : ESP_FAIL;
+}
+
+esp_err_t BenchStreamCommitTransaction(void* opaque)
+{
+    if (opaque == nullptr || g_bench_stream == nullptr) return ESP_ERR_INVALID_ARG;
+    const bool aborted = *static_cast<const bool*>(opaque);
+    const int64_t started_us = esp_timer_get_time();
+    const bool flushed = std::fflush(g_bench_stream) == 0 && ::fsync(fileno(g_bench_stream)) == 0;
+    const bool closed = std::fclose(g_bench_stream) == 0;
+    g_bench_stream = nullptr;
+    const esp_err_t result = flushed && closed ? ESP_OK : ESP_FAIL;
+    ESP_LOGI(kTag, "storage bench stream commit: result=%s cost_us=%lld aborted=%d",
+        esp_err_to_name(result), static_cast<long long>(esp_timer_get_time() - started_us), aborted ? 1 : 0);
+    return result;
+}
+
 void BenchTask(void*)
 {
     // Boot runs a burst of real storage work; wait for it to drain so the
@@ -868,10 +899,10 @@ void BenchTask(void*)
             // kBegin equivalent: opened ONCE for the whole shape, held in
             // g_bench_stream across every round. This is the single detail that
             // makes the shape comparable to a pack download.
-            std::remove(kBenchStream);
-            g_bench_stream = std::fopen(kBenchStream, "wb");
-            if (g_bench_stream == nullptr) {
-                ESP_LOGW(kTag, "storage bench SKIP shape=stream: open failed");
+            const esp_err_t begun = wqn::services::ExecuteStorageTransactionNamed(
+                BenchStreamBeginTransaction, nullptr, "storage-bench-stream-begin");
+            if (begun != ESP_OK) {
+                ESP_LOGW(kTag, "storage bench SKIP shape=stream: open failed: %s", esp_err_to_name(begun));
                 continue;
             }
         }
@@ -927,28 +958,17 @@ void BenchTask(void*)
             // not "free", it is "unmeasured". The real end-of-file cost is
             // large: the aborted 1.28 MiB download spent 15327 ms in its
             // closing transaction. Never extrapolate a field that can read 0.
-            const int64_t commit_started_us = esp_timer_get_time();
-            const bool flushed =
-                std::fflush(g_bench_stream) == 0 &&
-                ::fsync(fileno(g_bench_stream)) == 0;
-            const bool closed = std::fclose(g_bench_stream) == 0;
-            g_bench_stream = nullptr;
-            ESP_LOGI(kTag,
-                     "storage bench stream commit: result=%s cost_us=%lld "
-                     "aborted=%d",
-                     (flushed && closed) ? "ESP_OK" : "ESP_FAIL",
-                     static_cast<long long>(
-                         esp_timer_get_time() - commit_started_us),
-                     stream_aborted ? 1 : 0);
-            std::remove(kBenchStream);
+            const esp_err_t committed = wqn::services::ExecuteStorageTransactionNamed(
+                BenchStreamCommitTransaction, &stream_aborted, "storage-bench-stream-commit");
+            if (committed != ESP_OK) ESP_LOGW(kTag, "storage bench stream commit failed: %s", esp_err_to_name(committed));
         }
     }
 
-    std::remove(kBenchPrimary);
-    std::remove(kBenchTemp);
-    std::remove(kBenchBackup);
-    std::remove(kBenchAppend);
-    std::remove(kBenchStream);
+    for (const char* path : {kBenchPrimary, kBenchTemp, kBenchBackup, kBenchAppend, kBenchStream}) {
+        const esp_err_t removed = wqn::services::ExecuteStorageTransactionNamed(
+            BenchRemoveTransaction, const_cast<char*>(path), "storage-bench-cleanup");
+        if (removed != ESP_OK) ESP_LOGW(kTag, "storage bench cleanup failed: path=%s error=%s", path, esp_err_to_name(removed));
+    }
     size_t end_total = 0;
     size_t end_used = 0;
     if (esp_spiffs_info("storage", &end_total, &end_used) == ESP_OK) {

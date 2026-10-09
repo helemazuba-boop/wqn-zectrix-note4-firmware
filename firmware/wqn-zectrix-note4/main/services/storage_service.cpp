@@ -23,12 +23,14 @@ constexpr UBaseType_t kForegroundQueueDepth = 4;
 constexpr uint32_t kTaskStackBytes = 20 * 1024;
 constexpr UBaseType_t kStackWarningBytes = 4 * 1024;
 constexpr UBaseType_t kTaskPriority = 6;
-// [hang-fix] Foreground (UI-facing) transactions bound their queue and
-// completion waits. During a pack-sync write storm the service runs
+// [hang-fix] Foreground (UI-facing) transactions budget queue admission and
+// the queued completion wait separately. This is NOT a completion deadline:
+// once kRunning wins, the caller waits portMAX_DELAY to keep its context alive.
+// During a pack-sync write storm the service runs
 // back-to-back ~0.5-1s background writes and HIL showed foreground callers
 // serialized behind them for 12s+; the worst measured single wait was
 // queue_wait 1.7s + transaction 3.2s, so 15s is generous headroom while
-// still turning a wedged SPIFFS into an error instead of a frozen UI.
+// still allowing an unstarted queued command to be abandoned with an error.
 // Background callers keep unbounded waits: they own no UI thread.
 constexpr TickType_t kForegroundWaitTicks = pdMS_TO_TICKS(15000);
 
@@ -142,8 +144,8 @@ void StorageServiceTask(void*)
         esp_err_t result = ESP_FAIL;
         {
             // Serialization, checksums and SPIFFS/NVS bookkeeping otherwise
-            // run at the 40 MHz DFS floor. Boost only for the bounded
-            // transaction; idle operation remains free to downclock.
+            // run at the 40 MHz DFS floor. Boost for this transaction (which
+            // has no running-time bound); idle operation may downclock.
             auto cpu_lease = wqn::runtime::CpuPerformanceLease::TryAcquire();
             result = command.transaction == nullptr
                 ? ESP_ERR_INVALID_ARG
