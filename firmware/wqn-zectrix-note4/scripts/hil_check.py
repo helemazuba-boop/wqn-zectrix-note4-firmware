@@ -952,13 +952,13 @@ def hil_word_batches(log: Log):
         skip(log, names[3], '缺 flush 入队行，不能由 durable 完成时间反推触发时间')
     if ram:
         expect(log, names[0], all(1 <= r['pending'] <= 10 and 0 <= r['inflight'] <= r['pending']
-                                 and r['sequence'] > 0 for r in ram),
+                                 and r['sequence'] >= 0 for r in ram),
                f"RAM 接收 n={len(ram)}, 等待+在途最大 {max(r['pending'] for r in ram)} (<=10)；"
                '仅采样边界，不证明所有中间状态/30秒触发或掉电恢复')
     else:
         skip(log, names[0], '无 RAM 接收行，不能用 durable 行代替')
     records_ok = all(1 <= r['count'] <= 10 and 1 <= r['appended'] <= r['count']
-                     and r['bytes'] == r['appended'] * 200 and r['first_sequence'] > 0
+                     and r['bytes'] == r['appended'] * 200 and r['first_sequence'] >= 0
                      and r['last_sequence'] - r['first_sequence'] + 1 == r['count']
                      and 0 <= r['mode'] < 7 for r in observations)
     records_ok &= all(1 <= r['count'] <= 5 and r['bytes'] == r['count'] * 200 for r in acks)
@@ -4947,6 +4947,13 @@ def selftest():
                  'WRITE:word-batch-record-accounting', 'WRITE:word-batch-transaction-window'):
         check('批量完整夹具 ' + name, verdict(hil_word_batches, batch_good, name), 'PASS')
         check('旧版无批量 ' + name, verdict(hil_word_batches, atomic, name), 'SKIP')
+    # Contract fixtures/session-response.json and observation-request.json
+    # both start at 0. The first real NEW-session batch exposed this >0 bug.
+    batch_zero = batch_good.replace('sequence=16', 'sequence=0').replace('last_sequence=20', 'last_sequence=4')
+    check('新会话RAM序号0合法', verdict(hil_word_batches, batch_zero, 'WRITE:word-RAM-bound'), 'PASS')
+    check('新会话耐久批0到4合法', verdict(hil_word_batches, batch_zero, 'WRITE:word-batch-record-accounting'), 'PASS')
+    check('负序号仍是格式错误', verdict(hil_word_batches,
+          batch_zero.replace('sequence=0', 'sequence=-1'), 'LOG:word-batches-parsed'), 'FAIL')
     for label, changed in (
             ('RAM等待加在途越界', batch_good.replace('pending=2', 'pending=11')),
             ('在途超过缓冲总数', batch_good.replace('inflight=1', 'inflight=3'))):
