@@ -18,6 +18,7 @@ constexpr esp_err_t ESP_ERR_INVALID_SIZE = 0x104;
 constexpr esp_err_t ESP_ERR_NOT_FOUND = 0x105;
 constexpr esp_err_t ESP_ERR_NO_MEM = 0x101;
 constexpr const char* kTag = "replay-fixture";
+@@BATCH_ENABLED@@
 void FixtureLog(const char*, const char*, ...) {}
 #define ESP_LOGI(...) FixtureLog(__VA_ARGS__)
 #define ESP_LOGW(...) FixtureLog(__VA_ARGS__)
@@ -125,6 +126,12 @@ esp_err_t BuildObservationRecord(const wqn::DurableWordObservation& observation,
 }
 esp_err_t AppendOutboxRecord(const OutboxRecord&, int64_t* = nullptr, size_t* = nullptr) {
     ++appends;
+    return append_error;
+}
+[[maybe_unused]] esp_err_t AppendOutboxRecords(const OutboxRecord*, size_t count,
+                                              int64_t* = nullptr, size_t* bytes = nullptr) {
+    ++appends;
+    if(bytes) *bytes=count*200;
     return append_error;
 }
 int forensic_appends = 0;
@@ -620,6 +627,96 @@ void TestOutboxQuota() {
 #endif
 }
 
+void TestObservationBatch() {
+#if FIXTURE_BATCH
+    Reset();
+    std::vector<wqn::DurableWordObservation> batch;
+    for(uint64_t i=0;i<5;++i) batch.push_back(ObservationFromRecord(Record(i,12)));
+    Session advanced=disk[0]; advanced.position=2; advanced.phase=wqn::WordPresentationPhase::kBack;
+    advanced.remote.next_sequence=5;
+    CommitBatchContext context{&batch,&advanced};
+    Check(CommitObservationBatchTransaction(&context)==ESP_OK && appends==1 &&
+          cache.pending.size()==5 && cache.total_records==5 && saves==0 && cursor_writes==0,
+          "five consecutive events commit once without a full snapshot or NVS cursor write");
+    Check(CommitObservationBatchTransaction(&context)==ESP_OK && appends==1 && cache.pending.size()==5,
+          "whole-batch retry preserves request identities without duplicate append");
+    for(int prefix=1;prefix<5;++prefix) {
+        Reset();
+        for(int i=0;i<prefix;++i) journal.pending.push_back(Record(uint64_t(i),12));
+        journal.total_records=size_t(prefix);
+        Check(CommitObservationBatchTransaction(&context)==ESP_OK && appends==1 &&
+              cache.pending.size()==5 && cache.total_records==5,
+              "complete physical prefix is deduplicated before retrying the rest of a batch");
+    }
+    for(int prior=0;prior<2;++prior) {
+        Reset();
+        (prior?journal.suspended:journal.acknowledged).push_back(Record(0,12));
+        journal.total_records=2;
+        Check(CommitObservationBatchTransaction(&context)==ESP_OK && cache.pending.size()==4 && appends==1,
+              "previously ACKed or parked identity is not recreated as pending during batch retry");
+    }
+    Reset();
+    Check(CommitObservationBatchTransaction(nullptr)==ESP_ERR_INVALID_ARG && scans==0,
+          "null batch context is rejected without storage access");
+    for(int bad=0;bad<3;++bad) {
+        Reset(); auto invalid=batch;
+        if(bad==0) invalid.clear();
+        if(bad==1) invalid.resize(11,batch[0]);
+        CommitBatchContext broken{bad==2?nullptr:&invalid,&advanced};
+        Check(CommitObservationBatchTransaction(&broken)==ESP_ERR_INVALID_ARG && scans==0 && appends==0,
+              "empty oversized or null event list is refused before storage");
+    }
+    Reset(); advanced.deck_scope_generation=6;
+    Check(CommitObservationBatchTransaction(&context)==ESP_ERR_INVALID_STATE && scans==0,
+          "stale scope cannot commit a buffered batch");
+    advanced.deck_scope_generation=7;
+    for(int bad=0;bad<7;++bad) {
+        Reset(); auto invalid=batch; Session end=advanced;
+        if(bad==0) invalid[0].session_id="other-session";
+        if(bad==1) invalid[0].mode=Mode::kShuffle;
+        if(bad==2) invalid[1].sequence=7;
+        if(bad==3) invalid[1].request_id=invalid[0].request_id;
+        if(bad==4) end.remote.next_sequence=6;
+        if(bad==5) end.position=1;
+        if(bad==6) end.phase=wqn::WordPresentationPhase::kFront;
+        CommitBatchContext broken{&invalid,&end};
+        Check(CommitObservationBatchTransaction(&broken)==ESP_ERR_INVALID_ARG && scans==0 && appends==0,
+              "batch preflight rejects SID mode sequence identity and final-cursor mismatch");
+    }
+    Reset(); journal.pending.push_back(Record(0,11)); journal.total_records=1;
+    Check(CommitObservationBatchTransaction(&context)==ESP_ERR_INVALID_STATE && appends==0 && saves==0,
+          "conflicting existing identity rejects the entire batch before repair or append");
+    Reset(); journal.pending.assign(997,Record(100,12)); journal.total_records=997;
+    Check(CommitObservationBatchTransaction(&context)==ESP_ERR_NO_MEM && appends==0,
+          "whole batch respects pending-plus-parked live capacity");
+    Reset(); journal.total_records=kOutboxMaxRecords-9;
+    Check(CommitObservationBatchTransaction(&context)==ESP_ERR_INVALID_SIZE && appends==0,
+          "batch reserves one future terminal marker for every new observation");
+    Reset(); journal.total_records=kOutboxMaxRecords-10;
+    Check(CommitObservationBatchTransaction(&context)==ESP_OK && appends==1 && cache.pending.size()==5,
+          "exact whole-batch observation-plus-terminal reserve remains admissible");
+    Reset(); scan_error=ESP_FAIL;
+    Check(CommitObservationBatchTransaction(&context)==ESP_FAIL && appends==0,
+          "batch cannot turn a journal read failure into an empty queue");
+    for(int repair=0;repair<2;++repair) {
+        Reset(); journal.pending.push_back(Record(0,12)); journal.total_records=1;
+        journal.partial_tail=repair==0; journal.backup_source=repair==1;
+        Check(CommitObservationBatchTransaction(&context)==ESP_OK && compactions==1 && saves==1 &&
+              appends==1 && cache.pending.size()==5,
+              "batch retains mandatory checkpoint-before-compaction for a damaged or backup journal");
+    }
+    Reset(); journal.pending.push_back(Record(0,12)); journal.partial_tail=true; save_error=ESP_FAIL;
+    Check(CommitObservationBatchTransaction(&context)==ESP_FAIL && compactions==0 && appends==0,
+          "failed repair checkpoint cannot erase a durable prefix before batch retry");
+    Reset(); append_error=ESP_FAIL;
+    Check(CommitObservationBatchTransaction(&context)==ESP_FAIL && cache.pending.empty() &&
+          cache.total_records==0 && appends==1,
+          "failed batch does not publish volatile events into the upload cache");
+#else
+    Check(false,"production supports a bounded observation batch transaction");
+#endif
+}
+
 int main() {
     Session out;
     Reset(); journal.pending.push_back(Record());
@@ -912,6 +1009,7 @@ int main() {
     TestMaintenanceDriver();
     TestOutboxQuota();
 #endif
+    TestObservationBatch();
     std::printf("%d PASS / %d FAIL (host storage mocks; NOT power-loss or concurrency HIL)\n",
                 passes, failures);
     return failures ? 1 : 0;

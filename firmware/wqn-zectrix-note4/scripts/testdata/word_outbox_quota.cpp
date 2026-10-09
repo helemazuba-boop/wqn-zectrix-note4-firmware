@@ -17,6 +17,7 @@ constexpr esp_err_t ESP_OK=0, ESP_FAIL=-1, ESP_ERR_INVALID_ARG=0x102,
     ESP_ERR_INVALID_STATE=0x103, ESP_ERR_INVALID_SIZE=0x104,
     ESP_ERR_NOT_FOUND=0x105, ESP_ERR_INVALID_CRC=0x109, ESP_ERR_INVALID_RESPONSE=0x108;
 constexpr const char* kTag="quota-fixture";
+@@BATCH_ENABLED@@
 void FixtureLog(const char*, const char*, ...) {}
 #define ESP_LOGI(...) FixtureLog(__VA_ARGS__)
 #define ESP_LOGW(...) FixtureLog(__VA_ARGS__)
@@ -49,6 +50,8 @@ OutboxScan g_outbox_cache;
 bool g_outbox_cache_loaded=false;
 char kOutboxPath[256], kOutboxTempPath[256], kOutboxBackupPath[256], direct_path[256];
 bool fail_stat=false, fail_read=false, fail_flush=false, fail_sync=false, fail_close=false, partial_write=false;
+size_t partial_write_bytes=7;
+int write_calls=0, flush_calls=0, sync_calls=0, close_calls=0;
 int rename_call=0, fail_rename_call=0;
 int64_t fixture_clock=0;
 int64_t esp_timer_get_time() { return ++fixture_clock; }
@@ -75,12 +78,13 @@ size_t FixtureRead(void* data, size_t size, size_t count, FILE* file) {
     return std::fread(data,size,count,file);
 }
 size_t FixtureWrite(const void* data, size_t size, size_t count, FILE* file) {
-    if(partial_write) { partial_write=false; return std::fwrite(data,size,std::min(count,size_t(7)),file); }
+    ++write_calls;
+    if(partial_write) { partial_write=false; return std::fwrite(data,size,std::min(count,partial_write_bytes),file); }
     return std::fwrite(data,size,count,file);
 }
-int FixtureFlush(FILE* file) { if(fail_flush) { errno=EIO; return EOF; } return std::fflush(file); }
-int FixtureSync(int fd) { if(fail_sync) { errno=EIO; return -1; } return ::fsync(fd); }
-int FixtureClose(FILE* file) { const int result=std::fclose(file); return fail_close ? EOF : result; }
+int FixtureFlush(FILE* file) { ++flush_calls; if(fail_flush) { errno=EIO; return EOF; } return std::fflush(file); }
+int FixtureSync(int fd) { ++sync_calls; if(fail_sync) { errno=EIO; return -1; } return ::fsync(fd); }
+int FixtureClose(FILE* file) { ++close_calls; const int result=std::fclose(file); return fail_close ? EOF : result; }
 int FixtureRename(const char* from, const char* to) {
     if(++rename_call==fail_rename_call) { errno=EIO; return -1; }
     return std::rename(from,to);
@@ -113,6 +117,8 @@ void Check(bool ok, const char* name) { std::printf("%s: %s\n",ok?"PASS":"FAIL",
 size_t Size(const char* path) { struct stat info={}; return ::stat(path,&info)==0 ? size_t(info.st_size) : 0; }
 void Reset() {
     fail_stat=fail_read=fail_flush=fail_sync=fail_close=partial_write=false;
+    partial_write_bytes=7;
+    write_calls=flush_calls=sync_calls=close_calls=0;
     rename_call=fail_rename_call=0;
     g_outbox_cache={}; g_outbox_cache_loaded=false;
     for(const char* path : {kOutboxPath,kOutboxTempPath,kOutboxBackupPath,direct_path}) std::remove(path);
@@ -206,6 +212,62 @@ int main() {
           ScanOutboxFile(kOutboxPath,&scan)==ESP_OK && scan.pending.size()==1 && scan.suspended.size()==1 &&
           scan.total_records==3 && scan.suspended_reasons[0]==1,
           "bounded rewrite preserves pending payload plus parked payload and its marker reason");
+#if FIXTURE_BATCH
+    std::vector<OutboxRecord> batch;
+    for(int i=0;i<10;++i) batch.push_back(Record("batch-"+std::to_string(i)));
+    Reset(); bytes=999;
+    const auto batch_result=AppendOutboxRecords(batch.data(),5,&open_ms,&bytes);
+    const bool one_flush=write_calls==1 && flush_calls==1 && sync_calls==1 && close_calls==1;
+    Check(batch_result==ESP_OK && bytes==1000 && one_flush &&
+          ScanOutboxFile(kOutboxPath,&scan)==ESP_OK && scan.pending.size()==5 &&
+          std::strcmp(scan.pending[4].request_id,"batch-4")==0,
+          "five distinct CRC records share exactly one write/flush/sync/close");
+    Reset();
+    Check(AppendOutboxRecords(batch.data(),10)==ESP_OK && Size(kOutboxPath)==2000,
+          "maximum ten-event batch is admitted");
+    for(int invalid=0;invalid<4;++invalid) {
+        Reset(); bytes=999;
+        const auto result=AppendOutboxRecordsTo(invalid==0?nullptr:kOutboxPath,
+            invalid==1?nullptr:batch.data(),invalid==2?0:invalid==3?11:5,&open_ms,&bytes,kOutboxMaxBytes);
+        Check(result==ESP_ERR_INVALID_ARG && bytes==0 && write_calls==0 && !FileExists(kOutboxPath),
+              "invalid batch is refused before creating a journal");
+    }
+    Reset(); WriteRecords(kOutboxPath,one,kOutboxMaxRecords-5);
+    Check(AppendOutboxRecords(batch.data(),5)==ESP_OK && Size(kOutboxPath)==kOutboxMaxBytes,
+          "entire batch fits the exact physical byte boundary");
+    Reset(); WriteRecords(kOutboxPath,one,kOutboxMaxRecords-4); g_outbox_cache_loaded=true; bytes=999;
+    Check(AppendOutboxRecords(batch.data(),5,nullptr,&bytes)==ESP_ERR_INVALID_SIZE &&
+          bytes==0 && write_calls==0 && !g_outbox_cache_loaded &&
+          Size(kOutboxPath)==kOutboxMaxBytes-800,
+          "batch quota checks all records before writing any prefix");
+    Reset(); WriteRecords(kOutboxPath,one,1,7); g_outbox_cache_loaded=true;
+    Check(AppendOutboxRecords(batch.data(),5)==ESP_ERR_INVALID_SIZE && write_calls==0 &&
+          !g_outbox_cache_loaded && Size(kOutboxPath)==207,
+          "batch cannot append over an existing torn tail");
+    Reset(); WriteRecords(kOutboxPath,one,1); fail_stat=true; g_outbox_cache_loaded=true;
+    Check(AppendOutboxRecords(batch.data(),5)==ESP_FAIL && write_calls==0 &&
+          !g_outbox_cache_loaded && Size(kOutboxPath)==200,
+          "batch physical-size failure is not permission to write");
+    for(int prefix=0;prefix<5;++prefix) {
+        Reset(); partial_write=true; partial_write_bytes=size_t(prefix)*200+7;
+        g_outbox_cache_loaded=true; bytes=999;
+        const bool failed=AppendOutboxRecords(batch.data(),5,nullptr,&bytes)==ESP_FAIL &&
+            !g_outbox_cache_loaded && bytes==size_t(prefix)*200+7 && sync_calls==0;
+        Check(failed && EnsureOutboxCache(&cached)==ESP_OK && cached->partial_tail &&
+              cached->pending.size()==size_t(prefix) && cached->total_records==size_t(prefix),
+              "short batch rescans the complete prefix and rejects the torn record");
+    }
+    for(int fault=0;fault<3;++fault) {
+        Reset(); g_outbox_cache_loaded=true;
+        fail_flush=fault==0; fail_sync=fault==1; fail_close=fault==2;
+        const bool failed=AppendOutboxRecords(batch.data(),5)==ESP_FAIL && !g_outbox_cache_loaded;
+        fail_flush=fail_sync=fail_close=false;
+        Check(failed && EnsureOutboxCache(&cached)==ESP_OK && cached->pending.size()==5,
+              "batch flush/sync/close failure preserves identities for a rescan-based retry");
+    }
+#else
+    Check(false,"bounded batch append is implemented, not a single-record loop");
+#endif
     Reset();
     if(::rmdir(directory)!=0) return 2;
     std::printf("%d PASS / %d FAIL (production libc files/fault seams; NOT ESP32 power-loss HIL)\n",passes,failures);

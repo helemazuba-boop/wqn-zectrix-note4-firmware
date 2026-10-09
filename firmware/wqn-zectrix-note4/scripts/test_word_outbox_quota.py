@@ -27,7 +27,9 @@ def main():
         raise SystemExit('FAIL: g++ unavailable; fixtures not run')
     source = args.source.read_text(encoding='utf-8')
     quota = 'constexpr size_t kOutboxMaxRecords =' in source
+    batch = 'constexpr size_t kOutboxAppendBatchCapacity =' in source
     pieces = {
+        '@@BATCH_ENABLED@@': f'#define FIXTURE_BATCH {int(batch)}\n',
         '@@RECORDS@@': section(source, '#pragma pack(push, 1)\nstruct SessionHeader {',
                               '\n// Every public operation below'),
         '@@UTILITIES@@': section(source, 'uint32_t Crc32(',
@@ -41,9 +43,13 @@ def main():
             '\n// [measure] §五之十 §6. `open_ms`') if quota else
             '#define FIXTURE_QUOTA 0\nconstexpr size_t kOutboxMaxRecords = 2064;\n'
             'constexpr size_t kOutboxMaxBytes = kOutboxMaxRecords * sizeof(OutboxRecord);\n'),
-        '@@APPEND_TO@@': section(source, 'esp_err_t AppendOutboxRecordTo(',
+        '@@APPEND_TO@@': section(source,
+                                'constexpr size_t kOutboxAppendBatchCapacity =' if batch else
+                                'esp_err_t AppendOutboxRecordTo(',
                                 '\n// The rejected journal is forensic data'),
-        '@@WRITE@@': section(source, 'esp_err_t AppendOutboxRecord(\n',
+        '@@WRITE@@': section(source,
+                            'esp_err_t AppendOutboxRecords(\n' if batch else
+                            'esp_err_t AppendOutboxRecord(\n',
                             '\nbool SetSessionCursorOrdinal('),
     }
     template = (root / 'scripts/testdata/word_outbox_quota.cpp').read_text(encoding='utf-8')

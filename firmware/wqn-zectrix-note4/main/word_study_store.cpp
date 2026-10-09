@@ -2127,16 +2127,24 @@ esp_err_t CheckOutboxAppendBudget(const OutboxScan& scan, bool observation)
 // mode versus the missing remove + two renames. append_open_ms is the half
 // that isolates it. `bytes` is separate because the record size was implicit in
 // the struct before, and a per-byte claim is meaningless without both numbers.
-esp_err_t AppendOutboxRecordTo(
+// [word-batch] One open/write/flush/sync/close for a bounded contiguous batch.
+// Every record keeps the existing v1 CRC and identity. A failed call may leave
+// a complete prefix plus a torn tail: callers must rescan before any retry.
+constexpr size_t kOutboxAppendBatchCapacity = 10;
+
+esp_err_t AppendOutboxRecordsTo(
     const char* path,
-    const OutboxRecord& record,
+    const OutboxRecord* records,
+    size_t count,
     int64_t* open_ms = nullptr,
     size_t* bytes = nullptr,
     size_t max_bytes = 0)
 {
-    if (path == nullptr) return ESP_ERR_INVALID_ARG;
     if (bytes != nullptr) *bytes = 0;
     if (open_ms != nullptr) *open_ms = 0;
+    if (path == nullptr || records == nullptr || count == 0 ||
+        count > kOutboxAppendBatchCapacity) return ESP_ERR_INVALID_ARG;
+    const size_t requested_bytes = count * sizeof(OutboxRecord);
     const int64_t entered_us = esp_timer_get_time();
     FILE* file = std::fopen(path, "ab");
     if (file == nullptr) return ESP_FAIL;
@@ -2148,21 +2156,31 @@ esp_err_t AppendOutboxRecordTo(
             std::fclose(file);
             return ESP_FAIL;
         }
-        if (max_bytes < sizeof(record) ||
-            static_cast<uint64_t>(info.st_size) > max_bytes - sizeof(record) ||
-            static_cast<uint64_t>(info.st_size) % sizeof(record) != 0) {
+        if (max_bytes < requested_bytes ||
+            static_cast<uint64_t>(info.st_size) > max_bytes - requested_bytes ||
+            static_cast<uint64_t>(info.st_size) % sizeof(OutboxRecord) != 0) {
             ESP_LOGW(kTag, "word outbox physical bound: bytes=%llu max_bytes=%u",
                      static_cast<unsigned long long>(info.st_size),
                      static_cast<unsigned>(max_bytes));
             return std::fclose(file) == 0 ? ESP_ERR_INVALID_SIZE : ESP_FAIL;
         }
     }
-    const size_t written_bytes = std::fwrite(&record, 1, sizeof(record), file);
-    const bool written = written_bytes == sizeof(record);
+    const size_t written_bytes = std::fwrite(records, 1, requested_bytes, file);
+    const bool written = written_bytes == requested_bytes;
     const bool durable = written && std::fflush(file) == 0 && ::fsync(fileno(file)) == 0;
     const bool closed = std::fclose(file) == 0;
     if (bytes != nullptr) *bytes = written_bytes;
     return durable && closed ? ESP_OK : ESP_FAIL;
+}
+
+esp_err_t AppendOutboxRecordTo(
+    const char* path,
+    const OutboxRecord& record,
+    int64_t* open_ms = nullptr,
+    size_t* bytes = nullptr,
+    size_t max_bytes = 0)
+{
+    return AppendOutboxRecordsTo(path, &record, 1, open_ms, bytes, max_bytes);
 }
 
 // The rejected journal is forensic data, not another upload queue. Keep it as
@@ -2241,12 +2259,23 @@ esp_err_t AppendRejectedOutboxRecord(const OutboxRecord& record)
     return ESP_OK;
 }
 
+esp_err_t AppendOutboxRecords(
+    const OutboxRecord* records, size_t count,
+    int64_t* open_ms = nullptr, size_t* bytes = nullptr)
+{
+    const esp_err_t result = AppendOutboxRecordsTo(
+        kOutboxPath, records, count, open_ms, bytes, kOutboxMaxBytes);
+    // A failed sync/close can still have written a whole record or a bad tail.
+    // Never use pre-write counters for the next budget or idempotence check.
+    if (result != ESP_OK) g_outbox_cache_loaded = false;
+    return result;
+}
+
 esp_err_t AppendOutboxRecord(
     const OutboxRecord& record, int64_t* open_ms = nullptr, size_t* bytes = nullptr)
 {
-    const esp_err_t result = AppendOutboxRecordTo(kOutboxPath, record, open_ms, bytes, kOutboxMaxBytes);
-    // A failed sync/close can still have written a whole record or a bad tail.
-    // Never use pre-write counters for the next budget or idempotence check.
+    const esp_err_t result = AppendOutboxRecordTo(
+        kOutboxPath, record, open_ms, bytes, kOutboxMaxBytes);
     if (result != ESP_OK) g_outbox_cache_loaded = false;
     return result;
 }
@@ -2875,6 +2904,81 @@ esp_err_t CommitObservationTransaction(void* opaque)
     return ESP_OK;
 }
 
+struct CommitBatchContext {
+    const std::vector<wqn::DurableWordObservation>* observations;
+    const wqn::PersistedWordSession* advanced_session;
+};
+
+esp_err_t CommitObservationBatchTransaction(void* opaque)
+{
+    auto* context = static_cast<CommitBatchContext*>(opaque);
+    if (context == nullptr || context->observations == nullptr ||
+        context->advanced_session == nullptr || context->observations->empty() ||
+        context->observations->size() > kOutboxAppendBatchCapacity) return ESP_ERR_INVALID_ARG;
+    const auto& observations = *context->observations;
+    const auto& session = *context->advanced_session;
+    uint32_t ordinal = 0;
+    if (session.deck_scope_generation != wqn::GetDeckScopeGeneration()) return ESP_ERR_INVALID_STATE;
+    if (!SessionCursorOrdinal(session, &ordinal)) return ESP_ERR_INVALID_ARG;
+    const auto& last = observations.back();
+    if (last.sequence == UINT64_MAX || session.remote.next_sequence != last.sequence + 1 ||
+        ordinal != last.next_position || session.phase != last.next_phase) return ESP_ERR_INVALID_ARG;
+    for (size_t i = 0; i < observations.size(); ++i) {
+        const auto& value = observations[i];
+        if (value.session_id != session.remote.session_id || value.mode != session.remote.mode ||
+            (i != 0 && (observations[i - 1].sequence == UINT64_MAX ||
+                        value.sequence != observations[i - 1].sequence + 1))) return ESP_ERR_INVALID_ARG;
+        for (size_t j = 0; j < i; ++j) {
+            if (observations[j].request_id == value.request_id) return ESP_ERR_INVALID_ARG;
+        }
+    }
+    OutboxScan* scan = nullptr;
+    ESP_RETURN_ON_ERROR(EnsureOutboxCache(&scan), kTag, "load outbox before batch");
+    std::vector<OutboxRecord, wqn::WordStorePsramAllocator<OutboxRecord>> records;
+    records.reserve(observations.size());
+    // Preflight the WHOLE batch before repair or append. Idempotence covers a
+    // complete prefix left by a short/failed earlier flush, including ACK/park.
+    for (const auto& value : observations) {
+        bool exists = false;
+        for (const auto* values : {&scan->pending, &scan->acknowledged, &scan->suspended}) {
+            const auto found = std::find_if(values->begin(), values->end(),
+                [&](const auto& record) { return value.request_id == record.request_id; });
+            if (found == values->end()) continue;
+            if (!SameObservation(ObservationFromRecord(*found), value)) return ESP_ERR_INVALID_STATE;
+            exists = true;
+        }
+        OutboxRecord record = {};
+        ESP_RETURN_ON_ERROR(BuildObservationRecord(value, OutboxRecordKind::kObservation, &record),
+                            kTag, "encode batch observation");
+        if (!exists) records.push_back(record);
+    }
+    if (records.empty()) return SaveSessionProgressProtected(session, false);
+    if (scan->pending.size() + scan->suspended.size() > wqn::kWordObservationOutboxCapacity ||
+        records.size() > wqn::kWordObservationOutboxCapacity -
+                         scan->pending.size() - scan->suspended.size()) return ESP_ERR_NO_MEM;
+    if (scan->partial_tail || scan->backup_source) {
+        ESP_RETURN_ON_ERROR(CheckpointSessionsFromOutbox(*scan), kTag, "checkpoint batch repair");
+        ESP_RETURN_ON_ERROR(CompactCachedOutbox(scan), kTag, "repair before batch");
+    }
+    ESP_RETURN_ON_ERROR(CheckOutboxAppendBudget(*scan, true), kTag, "batch quota");
+    if (records.size() > (kOutboxMaxRecords - scan->total_records - scan->pending.size()) / 2)
+        return ESP_ERR_INVALID_SIZE;
+    const int64_t started_us = esp_timer_get_time();
+    size_t bytes = 0;
+    ESP_RETURN_ON_ERROR(AppendOutboxRecords(records.data(), records.size(), nullptr, &bytes),
+                        kTag, "append observation batch");
+    scan->pending.insert(scan->pending.end(), records.begin(), records.end());
+    scan->total_records += records.size();
+    ESP_LOGI(kTag, "word observation batch durable: count=%u appended=%u bytes=%u "
+                  "total_ms=%lld first_sequence=%llu last_sequence=%llu mode=%u session=%s",
+        static_cast<unsigned>(observations.size()), static_cast<unsigned>(records.size()),
+        static_cast<unsigned>(bytes), static_cast<long long>((esp_timer_get_time() - started_us) / 1000),
+        static_cast<unsigned long long>(observations.front().sequence),
+        static_cast<unsigned long long>(last.sequence), static_cast<unsigned>(last.mode),
+        last.session_id.c_str());
+    return ESP_OK;
+}
+
 esp_err_t PeekObservationTransaction(void* context)
 {
     auto* observation = static_cast<wqn::DurableWordObservation*>(context);
@@ -3393,6 +3497,15 @@ esp_err_t CommitWordObservation(
         CommitObservationTransaction,
         &context,
         true);
+}
+
+esp_err_t CommitWordObservations(
+    const std::vector<DurableWordObservation>& observations,
+    const PersistedWordSession& advanced_session)
+{
+    CommitBatchContext context{&observations, &advanced_session};
+    return ExecuteWithStorageLease(
+        "word-observation-batch", CommitObservationBatchTransaction, &context, true);
 }
 
 esp_err_t PeekPendingWordObservation(DurableWordObservation* observation)

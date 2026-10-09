@@ -174,6 +174,13 @@ esp_err_t ClearPersistedWordSession(protocol::word_study_v1::Mode mode);
 esp_err_t CommitWordObservation(
     const DurableWordObservation& observation,
     const PersistedWordSession& advanced_session);
+// Bounded, same-session consecutive events share one journal flush. Success
+// means every supplied event is durable (possibly already present on retry).
+// Failure may leave a complete prefix; retry the SAME identities, never mint
+// new request_ids. This API does not accept RAM-only events or upload them.
+esp_err_t CommitWordObservations(
+    const std::vector<DurableWordObservation>& observations,
+    const PersistedWordSession& advanced_session);
 esp_err_t PeekPendingWordObservation(DurableWordObservation* observation);
 esp_err_t AcknowledgeWordObservation(const std::string& request_id);
 // Moves one permanently rejected observation to the bounded forensic journal
