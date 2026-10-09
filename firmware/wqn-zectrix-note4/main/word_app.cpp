@@ -1507,6 +1507,17 @@ bool ApplyWordSessionStartResult(
     return true;
 }
 
+void RestoreWordSessionStartRequest(WordAppState* state)
+{
+    if (state == nullptr || !state->session.start_result_expected) return;
+    state->session.start_result_expected = false;
+    if (state->mode == WordAppMode::kSessionStarting) {
+        // A rejected enqueue never reached the server. Keep the request ID
+        // and parameters for the next attempt; cancellation clears them.
+        state->session.start_requested = true;
+    }
+}
+
 void CancelWordSessionStartResult(WordAppState* state)
 {
     if (state == nullptr) return;

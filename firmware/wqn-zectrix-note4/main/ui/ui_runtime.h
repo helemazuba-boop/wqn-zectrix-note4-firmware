@@ -101,6 +101,9 @@ public:
         uint32_t done_bytes,
         uint32_t total_bytes,
         int64_t now_us);
+    bool TakeWordSessionStartRequest(
+        wqn::protocol::word_study_v1::CreateSessionRequest* request);
+    void RestoreWordSessionStartRequest();
     bool TakeWordCandidatePageRequest(
         wqn::protocol::word_study_v1::CandidatePageRequest* request,
         wqn::PersistedWordSession* snapshot,

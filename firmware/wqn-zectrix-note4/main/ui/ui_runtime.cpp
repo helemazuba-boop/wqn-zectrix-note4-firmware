@@ -180,6 +180,17 @@ UiUpdate UiRuntime::DispatchWordCloudResult(WordCloudResult& result)
     return FinishEvent(AppEventKind::kWordCloudResult, refresh, changed);
 }
 
+bool UiRuntime::TakeWordSessionStartRequest(
+    wqn::protocol::word_study_v1::CreateSessionRequest* request)
+{
+    return wqn::TakeWordSessionStartRequest(&state_.word_app, request);
+}
+
+void UiRuntime::RestoreWordSessionStartRequest()
+{
+    wqn::RestoreWordSessionStartRequest(&state_.word_app);
+}
+
 bool UiRuntime::TakeWordCandidatePageRequest(
     wqn::protocol::word_study_v1::CandidatePageRequest* request,
     wqn::PersistedWordSession* snapshot,

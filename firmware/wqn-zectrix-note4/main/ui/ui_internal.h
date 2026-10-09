@@ -467,6 +467,7 @@ bool QueueWordCandidatePage(
     const std::string& session_id,
     const wqn::protocol::word_study_v1::CandidatePageRequest& request,
     const wqn::PersistedWordSession& snapshot);
+void PumpWordSessionStart(UiRuntime* runtime);
 void PumpWordCandidatePrefetch(UiRuntime* runtime);
 void PumpWordCardPrefetch(UiRuntime* runtime);
 // Rebuilds the note screen's [词] rows from word_app.deck_catalog, excluding

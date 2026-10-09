@@ -1544,6 +1544,9 @@ wqn::AiStreamingStatusView streaming_view{};
         if (problem_bulk_completed) {
             FinishProblemCloudRequest(device_ui_internal::CloudDomain::kProblemBulk);
         }
+        // Result reducers can arm the next intake/sequential stage. Dispatch
+        // only after the previous cloud result has released its busy/lease.
+        device_ui_internal::PumpWordSessionStart(&ui_runtime);
         device_ui_internal::PumpWordCandidatePrefetch(&ui_runtime);
         // Speculation begins only after this frame's display submission.
         device_ui_internal::PumpWordCardPrefetch(&ui_runtime);

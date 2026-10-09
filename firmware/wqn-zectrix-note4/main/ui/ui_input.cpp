@@ -1799,16 +1799,8 @@ RefreshSchedule ApplyButtonEvent(
     }
     if (state->screen == wqn::UiScreen::kWord &&
         wqn::WordAppSignature(state->word_app) != old_word_signature) {
-        wqn::protocol::word_study_v1::CreateSessionRequest session_request;
-        session_request.metadata = wqn::services::MakeDeviceRequestMetadata();
-        if (wqn::TakeWordSessionStartRequest(&state->word_app, &session_request) &&
-            !QueueWordSessionStart(session_request)) {
-            wqn::CancelWordSessionStartResult(&state->word_app);
-            state->word_app.mode = wqn::WordAppMode::kHome;
-            state->word_app.message = IsWordCloudBusy()
-                ? "单词服务忙，请重试"
-                : "本轮准备失败，请重试";
-        }
+        // Session starts are effects, not button-only work. The event-loop
+        // pump also dispatches continuations armed by cloud/persist results.
         // The word pump accepts this effect into the bounded RAM buffer before
         // rendering, then advances the card without claiming durability. A
         // later worker batch ACK releases only its immutable prefix. Failed

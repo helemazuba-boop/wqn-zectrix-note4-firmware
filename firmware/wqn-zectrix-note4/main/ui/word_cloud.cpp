@@ -255,6 +255,32 @@ bool QueueWordCandidatePage(
     return QueueWordCloudRequest(request);
 }
 
+void PumpWordSessionStart(UiRuntime* runtime)
+{
+    if (runtime == nullptr || runtime->state().screen != wqn::UiScreen::kWord ||
+        runtime->state().word_app.mode != wqn::WordAppMode::kSessionStarting ||
+        !runtime->state().word_app.session.start_requested || IsWordCloudBusy()) return;
+    const auto& word = runtime->state().word_app;
+    if (wqn::HasBufferedWordObservations(word) || word.session.observation_effect_ready ||
+        word.session.commit_state == wqn::WordObservationCommitState::kPersisting ||
+        IsPersistKindBusy(PersistKind::kWordObservation)) {
+        // The old SID must remain installed until its entire RAM tail is
+        // durable. kPersisting also covers the Prepare-to-reserve gap.
+        runtime->RequestWordBatchFlush();
+        return;
+    }
+    wqn::protocol::word_study_v1::CreateSessionRequest request;
+    request.metadata = wqn::services::MakeDeviceRequestMetadata();
+    if (!runtime->TakeWordSessionStartRequest(&request)) return;
+    if (!QueueWordSessionStart(request)) {
+        runtime->RestoreWordSessionStartRequest();
+        return;
+    }
+    ESP_LOGI(kTag, "word session start queued: mode=%u start_index=%d new_word_limit=%d request=%s",
+        static_cast<unsigned>(request.mode), request.start_index, request.new_word_limit,
+        request.metadata.request_id.c_str());
+}
+
 void PumpWordCardPrefetch(UiRuntime* runtime)
 {
     if (runtime == nullptr || runtime->state().screen != wqn::UiScreen::kWord ||
@@ -712,6 +738,15 @@ void ExecuteWordCloudRequest(const WordCloudRequest& request)
                 result.session, &result.persisted_session.remote);
             PersistInitialWordSessionSnapshot(token, &result);
         }
+        // Include empty sessions: they advance the intake->sequential chain
+        // without a snapshot save, so save-only logs cannot diagnose it.
+        ESP_LOGI(kTag,
+            "word session start result: mode=%u items=%u active=%d has_more=%d result=%s "
+            "compact_result=%s persist_result=%s session=%s",
+            static_cast<unsigned>(session.mode), static_cast<unsigned>(result.session.items.size()),
+            result.persisted_session.active ? 1 : 0, result.session.has_more ? 1 : 0,
+            esp_err_to_name(result.result), esp_err_to_name(result.session_compact_result),
+            esp_err_to_name(result.session_persist_result), result.session.session_id.c_str());
     } else if (request.op == WordCloudOp::kFetchSessionPage) {
         wqn::protocol::word_study_v1::CandidatePageRequest page;
         page.metadata = wqn::services::MakeDeviceRequestMetadata();

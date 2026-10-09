@@ -311,6 +311,9 @@ void ResetWordSessionsInMemory(WordAppState* state);
 bool TakeWordSessionStartRequest(
     WordAppState* state,
     protocol::word_study_v1::CreateSessionRequest* request);
+// Re-arm only a rejected enqueue, retaining its request ID and parameters.
+// This is not a retry of an accepted/in-flight cloud request.
+void RestoreWordSessionStartRequest(WordAppState* state);
 // The runner thread already compacted (compact_result) and, for active
 // sessions, persisted (persist_result) the snapshot; apply only installs it in
 // memory so the UI task never runs the snapshot fsync.
