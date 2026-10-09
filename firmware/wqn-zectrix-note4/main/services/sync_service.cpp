@@ -2102,6 +2102,30 @@ esp_err_t SyncControlPlaneV3(const std::string& token)
 #if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
 WordOutboxUploadState UploadPendingWordObservations(const std::string& token)
 {
+    std::vector<std::string> acknowledgements;
+    acknowledgements.reserve(5);
+    bool ack_flush_failed = false;
+    int64_t oldest_ack_ms = 0;
+    const auto flush_acknowledgements = [&]() -> esp_err_t {
+        if (acknowledgements.empty()) return ESP_OK;
+        if (ack_flush_failed) return ESP_FAIL;
+        const esp_err_t result = wqn::AcknowledgeWordObservations(acknowledgements);
+        if (result != ESP_OK) {
+            ack_flush_failed = true;
+            ScheduleWordOutboxRetry(acknowledgements.front(), 0, OutboxRetryCause::kLocalStorage);
+            ESP_LOGW(kTag, "word ACK batch failed: count=%u error=%s; durable payloads retained",
+                static_cast<unsigned>(acknowledgements.size()), esp_err_to_name(result));
+            return result;
+        }
+        acknowledgements.clear();
+        oldest_ack_ms = 0;
+        return ESP_OK;
+    };
+    // A single exit funnel flushes successes on every return, including a
+    // yield, HTTP error and empty queue. Never rely on a destructor whose I/O
+    // error cannot change the return value. Failed ACKs remain uploadable with
+    // the original identities; a reset can safely replay them to the server.
+    const auto upload_round = [&]() -> WordOutboxUploadState {
     constexpr size_t kMaxWordObservationsPerRound = 64;
     const uint32_t interaction_generation =
         g_word_interaction_generation.load(std::memory_order_acquire);
@@ -2109,6 +2133,9 @@ WordOutboxUploadState UploadPendingWordObservations(const std::string& token)
     size_t uploaded = 0;
     size_t quarantined = 0;
     for (; processed < kMaxWordObservationsPerRound;) {
+        if (!acknowledgements.empty() &&
+            esp_timer_get_time() / 1000 - oldest_ack_ms >= 30000 &&
+            flush_acknowledgements() != ESP_OK) return WordOutboxUploadState::kPending;
         if (g_word_interaction_generation.load(std::memory_order_acquire) !=
             interaction_generation) {
             ESP_LOGI(
@@ -2119,7 +2146,7 @@ WordOutboxUploadState UploadPendingWordObservations(const std::string& token)
             return WordOutboxUploadState::kYielded;
         }
         wqn::DurableWordObservation pending;
-        esp_err_t result = wqn::PeekPendingWordObservation(&pending);
+        esp_err_t result = wqn::PeekPendingWordObservationExcluding(acknowledgements, &pending);
         if (result == ESP_ERR_NOT_FOUND) {
             ResetWordOutboxRetryBackoff();
             // The queue is empty, so no record of the retired session is left
@@ -2166,6 +2193,14 @@ WordOutboxUploadState UploadPendingWordObservations(const std::string& token)
         if (result != ESP_OK) {
             OutboxFailureDisposition disposition =
                 ClassifyOutboxFailure(word_error, transport_failure);
+            // Persist prior successes before parking/quarantining this head.
+            // A genuine 401 must still reach credential recovery if local ACK
+            // storage fails; timeouts/429/5xx never gain that authority.
+            if (flush_acknowledgements() != ESP_OK) {
+                return disposition == OutboxFailureDisposition::kAuthenticationRequired
+                    ? WordOutboxUploadState::kAuthenticationRequired
+                    : WordOutboxUploadState::kPending;
+            }
             // Audit §14 Case B: SEQUENCE_GAP is classified kTransientRetry on
             // the assumption that an earlier record is still in flight and
             // will close the hole. Once this head has retried that many times
@@ -2392,25 +2427,18 @@ WordOutboxUploadState UploadPendingWordObservations(const std::string& token)
                 RetryCauseFor(disposition));
             return WordOutboxUploadState::kPending;
         }
-        result = wqn::AcknowledgeWordObservation(pending.request_id);
-        if (result != ESP_OK) {
-            ESP_LOGW(
-                kTag,
-                "word outbox ack failed: request=%s error=%s",
-                pending.request_id.c_str(),
-                esp_err_to_name(result));
-            ScheduleWordOutboxRetry(
-                pending.request_id, 0, OutboxRetryCause::kLocalStorage);
-            return WordOutboxUploadState::kPending;
-        }
+        if (acknowledgements.empty()) oldest_ack_ms = esp_timer_get_time() / 1000;
+        acknowledgements.push_back(pending.request_id);
         ResetWordOutboxRetryBackoff();
         ++processed;
         ++uploaded;
+        if (acknowledgements.size() >= 5 && flush_acknowledgements() != ESP_OK)
+            return WordOutboxUploadState::kPending;
     }
 
     wqn::DurableWordObservation remaining;
     const esp_err_t remaining_result =
-        wqn::PeekPendingWordObservation(&remaining);
+        wqn::PeekPendingWordObservationExcluding(acknowledgements, &remaining);
     if (processed > 0) {
         ESP_LOGI(
             kTag,
@@ -2425,6 +2453,12 @@ WordOutboxUploadState UploadPendingWordObservations(const std::string& token)
     return remaining_result == ESP_OK
         ? WordOutboxUploadState::kPending
         : WordOutboxUploadState::kFailed;
+    };
+    const auto state = upload_round();
+    if (flush_acknowledgements() != ESP_OK &&
+        state != WordOutboxUploadState::kAuthenticationRequired &&
+        state != WordOutboxUploadState::kProtocolBlocked) return WordOutboxUploadState::kPending;
+    return state;
 }
 
 // Uploads pending problem verdicts (32-record batches, interaction-yield,

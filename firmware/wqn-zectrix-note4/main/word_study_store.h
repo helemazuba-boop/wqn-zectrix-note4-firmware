@@ -182,7 +182,12 @@ esp_err_t CommitWordObservations(
     const std::vector<DurableWordObservation>& observations,
     const PersistedWordSession& advanced_session);
 esp_err_t PeekPendingWordObservation(DurableWordObservation* observation);
+// Skip only the bounded list already accepted by the server in this upload
+// round. They remain durable pending records until the batch ACK succeeds.
+esp_err_t PeekPendingWordObservationExcluding(
+    const std::vector<std::string>& request_ids, DurableWordObservation* observation);
 esp_err_t AcknowledgeWordObservation(const std::string& request_id);
+esp_err_t AcknowledgeWordObservations(const std::vector<std::string>& request_ids);
 // Moves one permanently rejected observation to the bounded forensic journal
 // before removing it from the upload queue. Other sessions and observations
 // remain available and no restart is required.

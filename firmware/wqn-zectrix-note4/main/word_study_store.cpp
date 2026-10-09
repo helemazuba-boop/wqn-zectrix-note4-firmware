@@ -2979,10 +2979,18 @@ esp_err_t CommitObservationBatchTransaction(void* opaque)
     return ESP_OK;
 }
 
-esp_err_t PeekObservationTransaction(void* context)
+struct PeekBatchContext {
+    const std::vector<std::string>* excluded;
+    wqn::DurableWordObservation* observation;
+};
+
+esp_err_t PeekObservationExcludingTransaction(void* opaque)
 {
-    auto* observation = static_cast<wqn::DurableWordObservation*>(context);
-    if (observation == nullptr) return ESP_ERR_INVALID_ARG;
+    auto* context = static_cast<PeekBatchContext*>(opaque);
+    if (context == nullptr || context->observation == nullptr ||
+        (context->excluded != nullptr && context->excluded->size() > kOutboxAppendBatchCapacity))
+        return ESP_ERR_INVALID_ARG;
+    auto* observation = context->observation;
     OutboxScan* scan = nullptr;
     ESP_RETURN_ON_ERROR(
         EnsureOutboxCache(&scan), kTag, "load word outbox");
@@ -2999,6 +3007,9 @@ esp_err_t PeekObservationTransaction(void* context)
     const auto pending = std::find_if(
         scan->pending.begin(), scan->pending.end(),
         [&](const OutboxRecord& candidate) {
+            if (context->excluded != nullptr && std::find(
+                    context->excluded->begin(), context->excluded->end(),
+                    candidate.request_id) != context->excluded->end()) return false;
             return std::none_of(
                 scan->suspended.begin(), scan->suspended.end(),
                 [&](const OutboxRecord& parked) {
@@ -3008,6 +3019,12 @@ esp_err_t PeekObservationTransaction(void* context)
     if (pending == scan->pending.end()) return ESP_ERR_NOT_FOUND;
     *observation = ObservationFromRecord(*pending);
     return ESP_OK;
+}
+
+esp_err_t PeekObservationTransaction(void* context)
+{
+    PeekBatchContext batch{nullptr, static_cast<wqn::DurableWordObservation*>(context)};
+    return PeekObservationExcludingTransaction(&batch);
 }
 
 struct AckContext {
@@ -3061,6 +3078,66 @@ esp_err_t AckObservationTransaction(void* opaque)
     ++scan->total_records;
     // Maintenance follows in separate owner transactions, under the caller's
     // same SleepLease. This ACK is durable before any checkpoint/reclaim work.
+    return ESP_OK;
+}
+
+struct AckBatchContext {
+    const std::vector<std::string>* request_ids;
+    bool maintenance_required = false;
+};
+
+esp_err_t AckObservationBatchTransaction(void* opaque)
+{
+    auto* context = static_cast<AckBatchContext*>(opaque);
+    if (context == nullptr || context->request_ids == nullptr || context->request_ids->empty() ||
+        context->request_ids->size() > kOutboxAppendBatchCapacity) return ESP_ERR_INVALID_ARG;
+    context->maintenance_required = false;
+    OutboxScan* scan = nullptr;
+    ESP_RETURN_ON_ERROR(EnsureOutboxCache(&scan), kTag, "load outbox before ACK batch");
+    std::vector<OutboxRecord, wqn::WordStorePsramAllocator<OutboxRecord>> records, acknowledged;
+    for (const auto& request_id : *context->request_ids) {
+        if (request_id.empty()) return ESP_ERR_INVALID_ARG;
+        if (std::any_of(acknowledged.begin(), acknowledged.end(),
+                [&](const auto& value) { return request_id == value.request_id; })) continue;
+        const auto found = std::find_if(scan->pending.begin(), scan->pending.end(),
+            [&](const auto& value) { return request_id == value.request_id; });
+        if (found == scan->pending.end()) {
+            if (std::none_of(scan->acknowledged.begin(), scan->acknowledged.end(),
+                    [&](const auto& value) { return request_id == value.request_id; }))
+                return ESP_ERR_NOT_FOUND;
+            continue;
+        }
+        OutboxRecord record = {};
+        ESP_RETURN_ON_ERROR(BuildObservationRecord(ObservationFromRecord(*found),
+            OutboxRecordKind::kAck, &record), kTag, "encode batch ACK");
+        records.push_back(record);
+        acknowledged.push_back(*found);
+    }
+    if (records.empty()) return ESP_OK;
+    if (scan->partial_tail || scan->backup_source ||
+        CheckOutboxAppendBudget(*scan, false) != ESP_OK ||
+        records.size() > kOutboxMaxRecords - scan->total_records) {
+        context->maintenance_required = true;
+        return ESP_ERR_INVALID_SIZE;
+    }
+    const int64_t started = esp_timer_get_time();
+    size_t bytes = 0;
+    const esp_err_t result = AppendOutboxRecords(records.data(), records.size(), nullptr, &bytes);
+    if (result != ESP_OK) {
+        context->maintenance_required = result == ESP_ERR_INVALID_SIZE;
+        return result;
+    }
+    for (const auto& value : acknowledged) {
+        scan->pending.erase(std::remove_if(scan->pending.begin(), scan->pending.end(),
+            [&](const auto& pending) { return std::strcmp(pending.request_id, value.request_id) == 0; }),
+            scan->pending.end());
+        scan->acknowledged.push_back(value);
+    }
+    scan->ack_records += records.size();
+    scan->total_records += records.size();
+    ESP_LOGI(kTag, "word ACK batch durable: count=%u bytes=%u total_ms=%lld",
+        static_cast<unsigned>(records.size()), static_cast<unsigned>(bytes),
+        static_cast<long long>((esp_timer_get_time() - started) / 1000));
     return ESP_OK;
 }
 
@@ -3520,6 +3597,21 @@ esp_err_t AcknowledgeWordObservation(const std::string& request_id)
 {
     AckContext context{&request_id};
     return ExecuteWithOutboxMaintenance("word-outbox-ack", AckObservationTransaction, &context);
+}
+
+esp_err_t PeekPendingWordObservationExcluding(
+    const std::vector<std::string>& request_ids, DurableWordObservation* observation)
+{
+    if (observation == nullptr) return ESP_ERR_INVALID_ARG;
+    *observation = {};
+    PeekBatchContext context{&request_ids, observation};
+    return ExecuteWithStorageLease("word-outbox-peek-batch", PeekObservationExcludingTransaction, &context);
+}
+
+esp_err_t AcknowledgeWordObservations(const std::vector<std::string>& request_ids)
+{
+    AckBatchContext context{&request_ids};
+    return ExecuteWithOutboxMaintenance("word-outbox-ack-batch", AckObservationBatchTransaction, &context);
 }
 
 esp_err_t QuarantinePendingWordObservation(const std::string& request_id)

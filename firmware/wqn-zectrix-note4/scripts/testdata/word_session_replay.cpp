@@ -717,6 +717,74 @@ void TestObservationBatch() {
 #endif
 }
 
+void TestAckBatch() {
+    std::vector<std::string> requests;
+    Reset();
+    for (uint64_t i=0;i<5;++i) {
+        journal.pending.push_back(Record(i));
+        requests.push_back(journal.pending.back().request_id);
+    }
+    journal.total_records=5;
+    AckBatchContext context{&requests};
+    Check(AckObservationBatchTransaction(&context)==ESP_OK && appends==1 &&
+          cache.pending.empty() && cache.acknowledged.size()==5 && cache.ack_records==5 &&
+          cache.total_records==10 && saves==0,
+          "five server successes share one durable ACK append before cache removal");
+    Check(AckObservationBatchTransaction(&context)==ESP_OK && appends==1,
+          "whole ACK batch retry is idempotent");
+    for (int prefix=1;prefix<5;++prefix) {
+        Reset();
+        for(uint64_t i=0;i<5;++i) (i<uint64_t(prefix)?journal.acknowledged:journal.pending).push_back(Record(i));
+        journal.total_records=5+size_t(prefix); journal.ack_records=size_t(prefix);
+        Check(AckObservationBatchTransaction(&context)==ESP_OK && appends==1 &&
+              cache.pending.empty() && cache.acknowledged.size()==5 && cache.total_records==10,
+              "retry skips a physically durable prefix of ACKs without duplicating it");
+    }
+    Reset();
+    for(uint64_t i=0;i<5;++i) journal.pending.push_back(Record(i));
+    journal.total_records=5; append_error=ESP_FAIL;
+    Check(AckObservationBatchTransaction(&context)==ESP_FAIL && cache.pending.size()==5 &&
+          cache.acknowledged.empty() && cache.total_records==5,
+          "failed ACK flush never removes uploadable durable payloads");
+    Reset(); journal.pending.push_back(Record());
+    Check(AckObservationBatchTransaction(&context)==ESP_ERR_NOT_FOUND && appends==0,
+          "unknown ACK identity rejects the whole batch before any append");
+    std::vector<std::string> duplicate{requests[0],requests[0]};
+    AckBatchContext duplicate_context{&duplicate};
+    Check(AckObservationBatchTransaction(&duplicate_context)==ESP_OK && appends==1 && cache.acknowledged.size()==1,
+          "duplicate ACK identities consume only one terminal slot");
+    for(int invalid=0;invalid<3;++invalid) {
+        Reset(); std::vector<std::string> bad;
+        if(invalid==1) bad.assign(11,requests[0]);
+        if(invalid==2) bad.push_back("");
+        AckBatchContext broken{&bad};
+        Check(AckObservationBatchTransaction(&broken)==ESP_ERR_INVALID_ARG && appends==0,
+              "empty oversized or empty-identity ACK batches are rejected");
+    }
+    for(int repair=0;repair<3;++repair) {
+        Reset(); for(uint64_t i=0;i<5;++i) journal.pending.push_back(Record(i));
+        journal.total_records=repair==2?kOutboxMaxRecords-4:5;
+        journal.partial_tail=repair==0; journal.backup_source=repair==1;
+        Check(AckObservationBatchTransaction(&context)==ESP_ERR_INVALID_SIZE && context.maintenance_required && appends==0,
+              "batch ACK requests fenced repair before damaged or over-budget append");
+    }
+    Reset(); for(uint64_t i=0;i<5;++i) journal.pending.push_back(Record(i));
+    journal.total_records=5;
+    wqn::DurableWordObservation out;
+    std::vector<std::string> exclude{requests[0],requests[1]};
+    PeekBatchContext peek{&exclude,&out};
+    Check(PeekObservationExcludingTransaction(&peek)==ESP_OK && out.request_id==requests[2] &&
+          cache.pending.size()==5 && appends==0,
+          "upload round skips only its server-accepted RAM ACKs without deleting payloads");
+    exclude=requests;
+    Check(PeekObservationExcludingTransaction(&peek)==ESP_ERR_NOT_FOUND && cache.pending.size()==5,
+          "all excluded records remain durable pending until the exit funnel flushes ACKs");
+    Reset(); journal.pending.push_back(Record()); journal.suspended.push_back(Record(7));
+    exclude.clear();
+    Check(PeekObservationExcludingTransaction(&peek)==ESP_ERR_NOT_FOUND,
+          "batch selection preserves the parked-session predecessor fence");
+}
+
 int main() {
     Session out;
     Reset(); journal.pending.push_back(Record());
@@ -1010,6 +1078,7 @@ int main() {
     TestOutboxQuota();
 #endif
     TestObservationBatch();
+    TestAckBatch();
     std::printf("%d PASS / %d FAIL (host storage mocks; NOT power-loss or concurrency HIL)\n",
                 passes, failures);
     return failures ? 1 : 0;
