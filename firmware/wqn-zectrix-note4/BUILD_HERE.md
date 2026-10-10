@@ -64,8 +64,8 @@ deploy.bat
 ### B. Build only
 
 ```bat
-cd D:\projects\wqn-zectrix-note4-firmware\firmware\wqn-zectrix-note4
-call "D:\Program\Espressif\frameworks\esp-idf-v5.5.4\export.bat"
+cd <repo-root>\firmware\wqn-zectrix-note4
+call "<esp-idf-dir>\export.bat"
 idf.py -B build-ai-local-s3 build
 ```
 

@@ -100,7 +100,7 @@ Flash 大小、三内容域同步 revision、NVS 条目（带进度条）、PSRA
 
 `wqn::runtime::CopySleepDiagnosticEntries` 从 RTC slow memory 环拷出的最近 6 条，每条一行：`HH:MM [kind] reason`；`wall_time_sec` 不可信时退回 `up+Xm`。kind 标签（启动/策略/准入受阻/唤醒计划/回滚/提交）由 `ui/diagnostics.cpp` 的 `SleepEventKindLabel` 给出。空态显示「暂无睡眠记录」。
 
-打开这个对话框**同时**调用 `RequestSleepDiagnosticsDump()`：coordinator 下一个 tick 把完整 64 条打到日志。屏上 6 条是电池下的唯一读法；日志版只在插 USB 时有用，且必须用 `deploy.bat` / `listen_usb.py` —— `idf.py monitor` 的 `USB_UART_CHIP_RESET` 会毁掉 RTC slow memory。
+打开这个对话框**同时**调用 `RequestSleepDiagnosticsDump()`：coordinator 下一个 tick 把完整 64 条打到日志。屏上 6 条是电池下的唯一读法；日志版只在插 USB 时有用，且必须用 `deploy.bat` / `scripts\monitor_serial.bat` —— `idf.py monitor` 的 `USB_UART_CHIP_RESET` 会毁掉 RTC slow memory。
 
 ## 5. error_recorder 模块契约
 

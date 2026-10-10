@@ -62,23 +62,23 @@ audio captures, or user data.
 Use ESP-IDF 5.5.4 for this project. The primary WSL environment is:
 
 ```txt
-/home/unknow/esp/esp-idf-v5.5
+<esp-idf-dir>
 ```
 
 Build from WSL with:
 
 ```bash
-cd /home/unknow/projects/firmware/firmware/wqn-zectrix-note4
-source /home/unknow/esp/esp-idf-v5.5/export.sh
+cd <repo-root>/firmware/wqn-zectrix-note4
+source <esp-idf-dir>/export.sh
 idf.py -B build-ai-local-s3 set-target esp32s3
 idf.py -B build-ai-local-s3 build
 ```
 
 The previous Windows checkout remains available for recovery/reference at
-`D:\projects\wqn-zectrix-note4-firmware`. Its ESP-IDF root is:
+`<repo-root>`. Its ESP-IDF root is:
 
 ```txt
-D:\Program\Espressif\frameworks\esp-idf-v5.5.4
+<esp-idf-dir>
 ```
 
 The default WQN ESP32 API base is:
@@ -153,7 +153,7 @@ explicitly changed.
 Keep the verified official backup image outside this repository:
 
 ```txt
-D:\projects\ESP32DOC\zectrix_note4_backup.bin
+<backup-dir>\zectrix_note4_backup.bin
 ```
 
 Known backup facts:
@@ -168,7 +168,7 @@ Command templates:
 python -m esptool --chip esp32s3 -p COMx -b 460800 read_flash 0x0 0x1000000 current_device_backup.bin
 
 # Restore the preserved official backup.
-python -m esptool --chip esp32s3 -p COMx -b 460800 write_flash --flash_mode dio --flash_size 16MB --flash_freq 80m 0x0 D:\projects\ESP32DOC\zectrix_note4_backup.bin
+python -m esptool --chip esp32s3 -p COMx -b 460800 write_flash --flash_mode dio --flash_size 16MB --flash_freq 80m 0x0 <backup-dir>\zectrix_note4_backup.bin
 ```
 
 ## Development Notes

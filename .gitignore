@@ -17,6 +17,7 @@ firmware/wqn-zectrix-note4/%SystemDrive%/
 **/*.trace
 **/*.tmp
 **/crash_log.txt
+**/serial_log*
 
 # Build artifacts that escape build-*/
 **/*.bin
