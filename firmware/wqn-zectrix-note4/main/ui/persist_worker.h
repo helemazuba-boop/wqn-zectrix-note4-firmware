@@ -3,6 +3,7 @@
 #include <cstdint>
 
 #include "esp_err.h"
+#include "storage.h"
 
 #include "note_store.h"
 #include "problem_store.h"
@@ -45,8 +46,11 @@ enum class PersistKind : uint8_t {
     kNoteObservation,
     kProblemVerdict,
     kSettingsAutoSync,
+    kSettingsImageRender,
     kSettingsVolume,
     kSettingsDefaultDeck,
+    kSettingsAiFollow,
+    kSettingsAgentDetail,
     kCount,
 };
 
@@ -101,7 +105,10 @@ void EnqueueReservedProblemVerdict(
 //     or 0 when the kind is busy / the pool is full / the lease is
 //     unavailable. The per-kind busy doubles as the duplicate-Confirm guard.
 uint32_t SubmitAutoSyncIntervalSave(uint32_t minutes);
+uint32_t SubmitImageRenderModeSave(wqn::ImageRenderMode mode);
 uint32_t SubmitVolumeSave(int percent);
+uint32_t SubmitAiFollowSave(bool follow);
+uint32_t SubmitAgentDetailLevelSave(uint8_t level);
 // Default-deck switch (c5): runs the recoverable marker protocol
 // (ChangeDefaultWordDeckForeground) on the worker. deck_id empty = all decks.
 // The UI installs the new deck ONLY after the durable ACK.

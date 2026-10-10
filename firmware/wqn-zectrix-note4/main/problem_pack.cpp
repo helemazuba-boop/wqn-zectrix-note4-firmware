@@ -15,10 +15,14 @@
 #include <utility>
 
 #include "cJSON.h"
+#include "device_protocol/json_depth_guard.h"
 #include "device_protocol/problem_study.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_spiffs.h"
+#include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "mbedtls/sha256.h"
 #include "runtime/sleep_coordinator.h"
 #include "services/storage_service.h"
@@ -52,6 +56,11 @@ constexpr size_t kMaxPartTextBytes = 16384;
 constexpr size_t kMaxPartLabelBytes = 80;
 constexpr size_t kMaxPartTypeBytes = 32;
 constexpr size_t kMaxPartAnswerBytes = 4096;
+// Contract bounds on a part's optional MCQ options (packChoice: id <= 10
+// chars, text <= 500 chars), at 4 bytes per character.
+constexpr size_t kMaxPartChoices = 10;
+constexpr size_t kMaxChoiceIdBytes = 40;
+constexpr size_t kMaxChoiceTextBytes = 2048;
 constexpr size_t kPackIdStemChars = 6;
 constexpr size_t kPackHashStemChars = 12;
 // SPIFFS counts the leading slash in its object name and reserves one byte for
@@ -64,9 +73,68 @@ static_assert(
 // Maximum contract line, its optional LF, and the terminating NUL for fgets.
 constexpr size_t kLineBufferSize = kMaxLineBytes + 2;
 
+// [pack-io] The default stdio buffer is 128 B (newlib __BUFSIZ__) and SPIFFS
+// reports st_blksize = 0, so every fgets refill costs one VFS read: a 381 KB
+// pack measures ~2,978 reads. A 32 KiB PSRAM buffer cuts that to ~12 while
+// the SPIFFS per-page transfer cost stays the same. Lifetime invariant: the
+// buffer must outlive fclose -- newlib never frees a caller-supplied setvbuf
+// buffer (__SMBF is only set by __smakebuf_r), so any new path that returns
+// without fclose turns a FILE leak into a use-after-free of this PSRAM block.
+constexpr size_t kPackReadBufferBytes = 32 * 1024;
+
+class PackReadBuffer {
+public:
+    explicit PackReadBuffer(FILE* file)
+    {
+        if (file == nullptr) {
+            return;
+        }
+        data_ = static_cast<char*>(heap_caps_malloc(
+            kPackReadBufferBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        if (data_ == nullptr) {
+            return;  // Degrade to the default buffer; behaviour unchanged.
+        }
+        if (std::setvbuf(file, data_, _IOFBF, kPackReadBufferBytes) != 0) {
+            heap_caps_free(data_);
+            data_ = nullptr;
+        }
+    }
+    ~PackReadBuffer()
+    {
+        if (data_ != nullptr) {
+            heap_caps_free(data_);
+        }
+    }
+    PackReadBuffer(const PackReadBuffer&) = delete;
+    PackReadBuffer& operator=(const PackReadBuffer&) = delete;
+
+private:
+    char* data_ = nullptr;
+};
+
+// [watchdog] The SHA and JSONL scan loops can run for seconds without
+// blocking; the 10 s task watchdog only checks IDLE0/IDLE1 starvation and
+// no task in this path subscribes to TWDT, so yielding is the only lever.
+// 100 ms slices leave ~1000 yield points inside the 10 s window.
+constexpr int64_t kPackYieldSliceUs = 100 * 1000;
+
+void MaybeYieldPackRebuild(int64_t& last_yield_us)
+{
+    const int64_t now_us = esp_timer_get_time();
+    if (now_us - last_yield_us < kPackYieldSliceUs) {
+        return;
+    }
+    vTaskDelay(1);
+    last_yield_us = esp_timer_get_time();
+}
+
 class JsonDocument {
 public:
-    explicit JsonDocument(const char* payload) : root_(cJSON_Parse(payload)) {}
+    explicit JsonDocument(const char* payload)
+        : root_(payload != nullptr && wqn::protocol::JsonNestingWithinLimit(
+                    payload, std::strlen(payload))
+                    ? cJSON_Parse(payload)
+                    : nullptr) {}
     ~JsonDocument() { cJSON_Delete(root_); }
 
     cJSON* root() const { return root_; }
@@ -185,15 +253,18 @@ bool VerifyFileSha256(const std::string& path, const std::string& expected)
     if (file == nullptr) {
         return false;
     }
+    PackReadBuffer read_buffer(file);
     mbedtls_sha256_context ctx;
     mbedtls_sha256_init(&ctx);
     mbedtls_sha256_starts(&ctx, 0);
     std::array<unsigned char, 1024> buffer = {};
+    int64_t last_yield_us = esp_timer_get_time();
     while (true) {
         const size_t read = std::fread(buffer.data(), 1, buffer.size(), file);
         if (read > 0) {
             mbedtls_sha256_update(&ctx, buffer.data(), read);
         }
+        MaybeYieldPackRebuild(last_yield_us);
         if (read < buffer.size()) {
             if (std::ferror(file)) {
                 std::fclose(file);
@@ -243,6 +314,43 @@ void CopyTitleUtf8Safe(char* dst, size_t dst_size, const std::string& src)
     }
     std::memcpy(dst, src.data(), n);
     dst[n] = '\0';
+}
+
+// Parses a part's optional `choices` array (contract packChoice). Absent or
+// null means "no options" and is valid; a present array must be 1..10
+// well-formed objects, otherwise the row is rejected like any other field.
+bool ParsePartChoices(cJSON* part_object, std::vector<wqn::WqnProblemPackChoice>* choices)
+{
+    if (choices == nullptr) {
+        return false;
+    }
+    choices->clear();
+    cJSON* items = cJSON_GetObjectItemCaseSensitive(part_object, "choices");
+    if (items == nullptr || cJSON_IsNull(items)) {
+        return true;
+    }
+    if (!cJSON_IsArray(items)) {
+        return false;
+    }
+    const int count = cJSON_GetArraySize(items);
+    if (count < 1 || static_cast<size_t>(count) > kMaxPartChoices) {
+        return false;
+    }
+    cJSON* item = nullptr;
+    cJSON_ArrayForEach(item, items) {
+        if (!cJSON_IsObject(item)) {
+            return false;
+        }
+        wqn::WqnProblemPackChoice choice;
+        choice.id = GetOptionalString(item, "id");
+        choice.text = GetOptionalString(item, "text");
+        if (choice.id.empty() || choice.id.size() > kMaxChoiceIdBytes ||
+            choice.text.size() > kMaxChoiceTextBytes) {
+            return false;
+        }
+        choices->push_back(std::move(choice));
+    }
+    return true;
 }
 
 bool IsImageIdArrayValid(cJSON* array, size_t* count)
@@ -525,7 +633,8 @@ esp_err_t ResetProblemPackStorageCacheRaw(void*)
 esp_err_t ScanProblemPackFile(
     const wqn::WqnProblemPackManifestSet& set,
     uint32_t set_order,
-    wqn::ProblemPackIndex* index)
+    wqn::ProblemPackIndex* index,
+    int64_t* parse_us)
 {
     if (index == nullptr) {
         return ESP_ERR_INVALID_ARG;
@@ -535,6 +644,7 @@ esp_err_t ScanProblemPackFile(
     if (file == nullptr) {
         return ESP_ERR_NOT_FOUND;
     }
+    PackReadBuffer read_buffer(file);
     const size_t initial_entry_count = index->entries.size();
     struct EntryRollback {
         wqn::ProblemPackIndex* index;
@@ -586,6 +696,7 @@ esp_err_t ScanProblemPackFile(
 
     const std::string pack_stem = wqn::SafeProblemPackStem(set);
     uint32_t scanned_entries = 0;
+    int64_t last_yield_us = esp_timer_get_time();
     while (true) {
         const long offset = std::ftell(file);
         result = ReadBoundedProblemPackLine(file, &line_buffer, &line);
@@ -598,7 +709,11 @@ esp_err_t ScanProblemPackFile(
             return result == ESP_OK ? ESP_ERR_INVALID_SIZE : result;
         }
         wqn::WqnProblemEntry entry;
+        const int64_t parse_started_us = esp_timer_get_time();
         result = wqn::ParseProblemRecordLine(line.c_str(), &entry, /*include_content=*/false);
+        if (parse_us != nullptr) {
+            *parse_us += esp_timer_get_time() - parse_started_us;
+        }
         if (result != ESP_OK) {
             std::fclose(file);
             return result;
@@ -615,6 +730,7 @@ esp_err_t ScanProblemPackFile(
             static_cast<uint8_t>(entry.solution_image_ids.size());
         indexed.status = static_cast<uint8_t>(entry.status);
         index->entries.push_back(indexed);
+        MaybeYieldPackRebuild(last_yield_us);
         ++scanned_entries;
         if (index->entries.size() > kMaxIndexEntries || scanned_entries > set.entry_count) {
             std::fclose(file);
@@ -887,6 +1003,38 @@ esp_err_t ParseProblemRecordLine(const char* line, WqnProblemEntry* entry, bool 
     cJSON_ArrayForEach(image_id, solution_image_ids) {
         entry->solution_image_ids.emplace_back(image_id->valuestring);
     }
+    const auto parse_gray4_ids = [](cJSON* root, const char* key,
+                                     size_t expected,
+                                     std::vector<std::string>* out) -> bool {
+        cJSON* array = cJSON_GetObjectItemCaseSensitive(root, key);
+        if (array == nullptr || cJSON_IsNull(array)) {
+            out->resize(expected);
+            return true;
+        }
+        if (!cJSON_IsArray(array) ||
+            cJSON_GetArraySize(array) != static_cast<int>(expected)) {
+            return false;
+        }
+        cJSON* item = nullptr;
+        cJSON_ArrayForEach(item, array) {
+            if (cJSON_IsNull(item)) {
+                out->emplace_back();
+            } else if (cJSON_IsString(item) && item->valuestring != nullptr &&
+                       std::strlen(item->valuestring) == 64) {
+                out->emplace_back(item->valuestring);
+            } else {
+                return false;
+            }
+        }
+        return true;
+    };
+    if (!parse_gray4_ids(document.root(), "gray4_image_ids",
+                         image_count, &entry->gray4_image_ids) ||
+        !parse_gray4_ids(document.root(), "solution_gray4_image_ids",
+                         solution_image_count,
+                         &entry->solution_gray4_image_ids)) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
 
     // parts must be a well-formed 1..10 array even on index scans; the
     // per-part text is only materialised (and field-validated) on a body
@@ -924,7 +1072,8 @@ esp_err_t ParseProblemRecordLine(const char* line, WqnProblemEntry* entry, bool 
             part.label.size() > kMaxPartLabelBytes ||
             part.type.empty() || part.type.size() > kMaxPartTypeBytes ||
             part.content_text.size() > kMaxPartTextBytes ||
-            part.answer_text.size() > kMaxPartAnswerBytes) {
+            part.answer_text.size() > kMaxPartAnswerBytes ||
+            !ParsePartChoices(part_object, &part.choices)) {
             return ESP_ERR_INVALID_RESPONSE;
         }
         part.index = static_cast<int>(part_index);
@@ -939,6 +1088,10 @@ esp_err_t LoadProblemPackIndex(ProblemPackIndex* index)
     if (index == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
+    // [timing] The SHA verify and the JSONL scan each walk the whole pack and
+    // scale with its size, so the watchdog budget of a bigger pack has to be
+    // extrapolated from measured phases rather than guessed.
+    const int64_t index_started_us = esp_timer_get_time();
     // SHA verification and JSONL scanning are CPU-bound; scope max frequency
     // to this rebuild instead of disabling dynamic frequency scaling globally.
     auto cpu_lease = runtime::CpuPerformanceLease::TryAcquire();
@@ -1004,8 +1157,12 @@ esp_err_t LoadProblemPackIndex(ProblemPackIndex* index)
         return ESP_OK;
     }
     index->entries.reserve(expected_entries);
+    index->problem_order.reserve(expected_entries);
     index->sets.reserve(manifest.problem_sets.size());
 
+    int64_t sha_us_total = 0;
+    int64_t scan_us_total = 0;
+    int64_t parse_us_total = 0;
     for (const WqnProblemPackManifestSet& item : manifest.problem_sets) {
         const uint32_t set_order = static_cast<uint32_t>(index->sets.size());
         ProblemPackSet set;
@@ -1024,11 +1181,17 @@ esp_err_t LoadProblemPackIndex(ProblemPackIndex* index)
             if (stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode)) {
                 index->pack_bytes += static_cast<size_t>(st.st_size);
             }
-            if (!VerifyFileSha256(path, item.sha256)) {
+            const int64_t sha_started_us = esp_timer_get_time();
+            const bool sha_ok = VerifyFileSha256(path, item.sha256);
+            sha_us_total += esp_timer_get_time() - sha_started_us;
+            if (!sha_ok) {
                 index->pack_error = true;
                 index->status_message = "错题校验失败";
             } else {
-                const esp_err_t scan_result = ScanProblemPackFile(item, set_order, index);
+                const int64_t scan_started_us = esp_timer_get_time();
+                const esp_err_t scan_result =
+                    ScanProblemPackFile(item, set_order, index, &parse_us_total);
+                scan_us_total += esp_timer_get_time() - scan_started_us;
                 if (scan_result != ESP_OK) {
                     index->pack_error = true;
                     index->status_message = "错题读取失败";
@@ -1061,12 +1224,16 @@ esp_err_t LoadProblemPackIndex(ProblemPackIndex* index)
 
     ESP_LOGI(
         kTag,
-        "problem pack index: sets=%u problems=%u pack_bytes=%u free_internal=%u free_psram=%u",
+        "problem pack index: sets=%u problems=%u pack_bytes=%u free_internal=%u free_psram=%u total_ms=%lld sha_ms=%lld scan_ms=%lld parse_ms=%lld",
         static_cast<unsigned>(index->set_count),
         static_cast<unsigned>(index->entries.size()),
         static_cast<unsigned>(index->pack_bytes),
         static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
-        static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)));
+        static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)),
+        static_cast<long long>((esp_timer_get_time() - index_started_us) / 1000),
+        static_cast<long long>(sha_us_total / 1000),
+        static_cast<long long>(scan_us_total / 1000),
+        static_cast<long long>(parse_us_total / 1000));
     return ESP_OK;
 }
 

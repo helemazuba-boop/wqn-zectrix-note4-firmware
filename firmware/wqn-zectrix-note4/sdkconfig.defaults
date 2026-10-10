@@ -17,14 +17,38 @@ CONFIG_ESP_TASK_WDT_PANIC=y
 CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=6
 CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=8
 CONFIG_ESP_WIFI_ENTERPRISE_SUPPORT=n
+# [ai-memory-fix] Keep TX buffers dynamic. Enabling the WiFi/LwIP PSRAM
+# preference forces 16 static DMA TX buffers (~25.6 KiB), fragmenting the
+# internal heap before the 12 KiB AI submit task stack is created.
+# CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP is not set
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER=y
+# Flash now reserves both I2S directions before TLS/WebSocket starts and uses
+# a 6 x 128-frame DMA ring, so I2S admission no longer depends on starving the
+# WiFi driver.  Keep the ESP-IDF default depth for sustained 24 kHz realtime
+# uplink; 16 buffers reproduced TCP write stalls after the first PCM frames.
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=32
+
+# Flash realtime keeps its capture/playback worker stacks in PSRAM so their
+# 12 KiB do not consume the same internal heap used by WiFi and I2S DMA.
+CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM=y
 
 CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
 CONFIG_MBEDTLS_SSL_KEEP_PEER_CERTIFICATE=n
 
 CONFIG_SPI_FLASH_VERIFY_WRITE=y
+# Pack downloads may reclaim up to 1 MiB of deleted SPIFFS pages inside the
+# serialized storage worker before reporting a real capacity block.
+CONFIG_SPIFFS_GC_MAX_RUNS=256
 
 # WebSocket transport: nginx reverse proxy returns a large upgrade response
 # (INGRESSCOOKIE + many access-control-* + x-stainless-* headers) that exceeds
 # the default 1024-byte buffer and aborts the WS handshake with
 # "Header size exceeded buffer size". 4096 is plenty for any sane proxy.
 CONFIG_WS_BUFFER_SIZE=4096
+
+# [diag] Temporary: required by uxTaskGetSystemState() in
+# DumpResourceLedger() (stdpro_ws_transport.cpp), the internal-RAM ledger that
+# prints heap_caps_print_heap_info() for INTERNAL/DMA plus a per-task stack
+# census at every WebSocket connect. Revert together with the [diag] code once
+# the internal-RAM investigation is concluded.
+CONFIG_FREERTOS_USE_TRACE_FACILITY=y

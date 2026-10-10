@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -28,26 +29,8 @@ namespace device_ui_internal {
 
 constexpr char kTag[] = "wqn_ui";
 
-constexpr int kAiStatusBarY = 0;
-constexpr int kAiStatusBarH = 27;
-// [v2.1] No more dedicated toast region. The status-bar bottom rule still
-// draws, but the viewport starts immediately after it, recovering 24 px of
-// vertical space we previously lost to the redundant toast strip.
-constexpr int kAiViewportY = kAiStatusBarY + kAiStatusBarH;     // 27
-constexpr int kAiViewportH = wqn::kEpdHeight - kAiViewportY;     // 273
-constexpr int kAiLineH = kCjkLineHeight;                                   // single line height
-constexpr int kAiLineGap = 4;                                  // vertical gap between bubbles
-constexpr int kAiAssistantLeftBorder = 4;                      // assistant left edge 4px inset
-constexpr int kAiHistoryLeftPad = 6;
-constexpr int kAiHistoryRightPad = 6;
-constexpr int kAiHistoryRightEdge = wqn::kEpdWidth - kAiHistoryRightPad;
-constexpr int kAiHistoryUsableW = kAiHistoryRightEdge - kAiHistoryLeftPad;  // 388
-constexpr int kAiUserPillMaxW = kAiHistoryUsableW * 78 / 100;                // ~302
-constexpr int kAiAssistantW = kAiHistoryUsableW;
-constexpr int kAiRowTopPad = 2;
-// [scroll-fix] Reserve 22 px at the bottom of the viewport for the ▼ scroll
-// indicator + breathing room so the latest message never overlaps it.
-constexpr int kAiViewportBottomPad = 22;
+// [agent] All AI-page geometry lives in ui_layout.h so page_ai_agent.cpp (the
+// Agent tier, which renders through this same viewport) cannot drift from it.
 
 const char* AiStatusLabel(wqn::AiSessionStatus status)
 {
@@ -102,8 +85,10 @@ static void DrawExpandIcon(int x, int y, bool on, bool selected) {
     DrawStatusAsset(x, y, on ? a10_ai_detail_expand_on_16_asset : a11_ai_detail_expand_off_16_asset, selected);
 }
 
-// [tier-icon] Status-bar tier indicator (16px, display only - tier switch is
-// double-press Up/Down). Flash=lightning, STD=hourglass, Pro=brain.
+// [tier-icon] Status-bar tier indicator (16px, display only - the tier is
+// cycled from the status-bar edit mode). Flash=lightning, STD=hourglass,
+// Agent=brain (the retired Pro glyph, reused: the model behind the Agent tier
+// is chosen server-side by the WQN OpenCode binding, so it needs no new asset).
 static void DrawLightningIcon(int x, int y, bool selected) {
     DrawStatusAsset(x, y, a01_ai_tier_flash_16_asset, selected);
 }
@@ -113,41 +98,46 @@ static void DrawHourglassIcon(int x, int y, bool selected) {
 static void DrawBrainIcon(int x, int y, bool selected) {
     DrawStatusAsset(x, y, a03_ai_tier_pro_16_asset, selected);
 }
-// [trash] Clear-context action button (edit-mode index 3, STD/Pro only).
+// [trash] Clear-context action button (edit-mode index 4 on STD/Pro, 5 on the
+// Agent tier -- the cluster is one slot shorter here since the follow toggle
+// moved to the settings page).
 static void DrawTrashIcon(int x, int y, bool selected) {
     DrawStatusAsset(x, y, a12_ai_clear_context_16_asset, selected);
 }
 
-// [toggle-cluster] The four status-bar toggles (thinking/TTS/expand/trash)
-// pack tightly right after the tier icon. tier occupies x=6..22 (16px); the
-// toggle cluster starts at kAiToggleX with a small gap, and consecutive
-// toggles are kAiToggleStep apart (18 = 16px icon + 2px gap). The edit-mode
-// zone rect spans exactly the four icons plus a 2px pad on each side.
-constexpr int kAiToggleX = 30;
-constexpr int kAiToggleY = 5;
-constexpr int kAiToggleStep = 18;
+// [toggle-cluster] The status-bar toggles pack tightly right after the tier
+// icon. tier occupies x=6..22 (16px); the toggle cluster starts at
+// kAiToggleX with a small gap, and consecutive toggles are kAiToggleStep
+// apart (18 = 16px icon + 2px gap). The edit-mode zone rect (kAiToggleZoneWStd)
+// spans exactly the icons plus a kAiToggleZonePad pad on each side. STD/Pro use
+// the four slots for thinking/TTS/expand/trash; the Agent tier uses its five for
+// session/turn-up/turn-down/detail/trash (page_ai_agent.cpp). The follow toggle
+// moved to the settings page, so no tier draws it in the cluster any more.
 
 void DrawAiStatusBar(const wqn::AiSessionState& ai, const wqn::HomeSummary& home, const wqn::StatusBarEditState& status_edit)
 {
     // Status bar occupies y=0..27 with a bottom divider line.
     DrawHorizontalLine(0, kAiStatusBarH - 1, wqn::kEpdWidth);
     // Left: page title + tier chip.
-    // [tier-icon] Tier indicator + edit-mode button 0 (replaces "AI" + tier text):
-    // Flash=lightning, STD=hourglass, Pro=brain. confirm cycles tier (all tiers).
+    // [tier-icon] Tier indicator + edit-mode button 0: Flash=lightning,
+    // STD=hourglass, Agent=brain. confirm cycles tier (all tiers).
     const bool tier_sel = status_edit.active && status_edit.selected == 0;
     switch (ai.tier) {
         case wqn::AiTier::kFlash: DrawLightningIcon(6, kAiToggleY, tier_sel); break;
-        case wqn::AiTier::kPro:   DrawBrainIcon(6, kAiToggleY, tier_sel); break;
+        case wqn::AiTier::kAgent: DrawBrainIcon(6, kAiToggleY, tier_sel); break;
         case wqn::AiTier::kStd:
         default:                  DrawHourglassIcon(6, kAiToggleY, tier_sel); break;
     }
 
     // [shell] Toggle zone (STD/Pro only): thinking(1)/TTS(2)/expand(3)/trash(4).
     // Flash hides the whole zone (only the tier icon, button 0, is editable).
-    if (ai.tier != wqn::AiTier::kFlash) {
+    // The Agent tier has its own cluster (page_ai_agent.cpp), so it never
+    // reaches this branch -- RenderAiToEpd dispatches it away first.
+    if (ai.tier == wqn::AiTier::kStd) {
         if (status_edit.active) {
-            // Zone rect hugs the four tightly-packed toggle icons (2px pad).
-            DrawRect(kAiToggleX - 2, kAiToggleY - 2, kAiToggleStep * 3 + 16 + 4, 20);
+            // Zone rect hugs the four tightly-packed toggle icons.
+            DrawRect(kAiToggleX - kAiToggleZonePad, kAiToggleY - kAiToggleZonePad,
+                     kAiToggleZoneWStd, 16 + 2 * kAiToggleZonePad);
         }
         DrawThinkingIcon(kAiToggleX + 0 * kAiToggleStep, kAiToggleY, ai.thinking_level, status_edit.active && status_edit.selected == 1);
         DrawTtsIcon(kAiToggleX + 1 * kAiToggleStep, kAiToggleY, ai.tts_on, status_edit.active && status_edit.selected == 2);
@@ -221,7 +211,10 @@ int DrawUserPill(int x, int y, int max_w, const std::string& text)
     const int visible_bottom = std::min(wqn::kEpdHeight, y + total_h);
 
     if (visible_top < visible_bottom) {
-        DrawRect(x, visible_top, max_w, visible_bottom - visible_top);
+        // [v2] User pill uses the rounded container language (r4) like every
+        // other container; the square DrawRect outline was the last square
+        // container in the product. Inner paper fill keeps the text legible.
+        DrawRoundedRect(x, visible_top, max_w, visible_bottom - visible_top, 4);
         FillRect(x + 1, visible_top + 1, max_w - 2, visible_bottom - visible_top - 2, false);
     }
     for (int r = 0; r < row_count; ++r) {
@@ -233,21 +226,66 @@ int DrawUserPill(int x, int y, int max_w, const std::string& text)
     return total_h;
 }
 
+// [md-rows] Assistant markdown row-count cache for the measure pass.
+// Keyed on msg_id + text size + hash to ensure correctness across
+// session/tier swaps (hash alone is collision-prone; size is a cheap extra
+// discriminator).
+int CachedAssistantMdRows(uint64_t msg_id, const std::string& text)
+{
+    struct Entry {
+        uint64_t msg_id = 0;
+        size_t text_size = 0;
+        size_t text_hash = 0;
+        int rows = 1;
+    };
+    static std::vector<Entry> s_cache;
+
+    const size_t hash = std::hash<std::string>{}(text);
+
+    for (auto& entry : s_cache) {
+        if (entry.msg_id == msg_id && entry.text_size == text.size() &&
+            entry.text_hash == hash) {
+            return entry.rows;
+        }
+    }
+
+    int rows = std::max<int>(
+        1,
+        static_cast<int>(CountMarkdownLines(
+            text, kAiAssistantW - kAiAssistantLeftBorder - 6)));
+
+    bool found = false;
+    for (auto& entry : s_cache) {
+        if (entry.msg_id == msg_id) {
+            entry.text_size = text.size();
+            entry.text_hash = hash;
+            entry.rows = rows;
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
+        s_cache.push_back({msg_id, text.size(), hash, rows});
+    }
+
+    if (s_cache.size() > 100) {
+        s_cache.erase(s_cache.begin(), s_cache.begin() + 50);
+    }
+
+    return rows;
+}
+
 int DrawAssistantBlock(int x, int y, int max_w, const std::string& text)
 {
-    // [wrap-fix] The previous 8-row hard cap was inherited from the
-    // pre-scroll single-bubble UI. With multi-turn scrolling the user can
-    // pan to read the rest, so the cap is now well above the viewport
-    // height (~273 px / 18 px ≈ 15 rows). 32 keeps the block bounded for
-    // pathological inputs without truncating readable replies.
-    // [trunc-fix] Must match kAssistantLayoutRowCap in RenderAiHistoryViewport
-    // (line ~329). Previously this was 32 while the layout pass used 64, so the
-    // layout measured a block as 64 rows tall but only 32 rows were actually
-    // drawn — the remaining text was silently dropped and subsequent messages
-    // were positioned based on a height that didn't match what was rendered.
-    constexpr size_t kAssistantRowCap = 1024;  // [expand] was 64; raised to effectively remove the reply display cap (full reply, scrollable)
-    const auto lines = WrapForViewport(text, max_w - kAiAssistantLeftBorder - 6, kAssistantRowCap);
-    const int row_count = static_cast<int>(lines.size());
+    // [markdown] Assistant replies render through the shared Markdown row
+    // pipeline (headings, lists, tables, inline adornments -- same engine as
+    // the note body). Only viewport-intersecting blocks reach this function,
+    // so the per-call layout stays bounded; the measure pass counts rows via
+    // CachedAssistantMdRows at the SAME width, keeping this block's height
+    // equal to its virtual-canvas slot.
+    const int content_w = max_w - kAiAssistantLeftBorder - 6;
+    const std::vector<MdLine> md_lines = LayoutMarkdown(text, content_w);
+    const int row_count = std::max(1, static_cast<int>(md_lines.size()));
     const int row_h = kAiLineH;
     const int total_h = row_count * row_h + 6;
 
@@ -257,10 +295,11 @@ int DrawAssistantBlock(int x, int y, int max_w, const std::string& text)
     if (visible_top < visible_bottom) {
         FillRect(x, visible_top, kAiAssistantLeftBorder, visible_bottom - visible_top, true);
     }
-    for (int r = 0; r < row_count; ++r) {
-        const int line_y = y + r * row_h + 4;
+    const int text_x = x + kAiAssistantLeftBorder + 6;
+    for (size_t r = 0; r < md_lines.size(); ++r) {
+        const int line_y = y + static_cast<int>(r) * row_h + 4;
         if (line_y >= kAiViewportY && line_y + row_h <= wqn::kEpdHeight) {
-            DRC(x + kAiAssistantLeftBorder + 6, line_y, lines[r].c_str(), true);
+            DrawMarkdownLine(md_lines[r], text_x, line_y, content_w, row_h);
         }
     }
     const int rule_y = y + total_h - 2;
@@ -408,6 +447,57 @@ int DrawToolBlock(int x, int y, int max_w, const wqn::ChatMessageSnapshot& tool,
     return expected_h;
 }
 
+// Single source of truth for the AI history vertical geometry. Both the
+// renderer (RenderAiHistoryViewport) and the input-path scroll bounds
+// (GetAiScrollBounds) MUST consume this pass, or the scroll clamp desyncs
+// from what is actually drawn (same invariant as kMarkdownWidthDense on the
+// note/problem pages). The struct itself lives in ui_internal.h so the
+// turn-jump helper can share it without a second definition.
+AiHistoryLayout ComputeAiHistoryLayout(
+    const std::vector<wqn::ChatMessageSnapshot>& messages, bool expand_content)
+{
+    AiHistoryLayout out;
+    const int line_h = kAiLineH;
+    const size_t n = messages.size();
+    out.heights.assign(n, 0);
+    out.virtual_tops.assign(n, 0);
+    int newest_user_idx = -1;
+    int y = 0;
+    for (size_t i = 0; i < n; ++i) {
+        const wqn::ChatMessageSnapshot& msg = messages[i];
+        int h = 0;
+        const std::string body(msg.text.empty() ? std::string("-")
+                                               : std::string(msg.text.data(), msg.text.size()));
+        if (msg.kind == wqn::ChatMessageKind::kUser) {
+            const auto lines = WrapForViewport(body, kAiUserPillMaxW - 16, 4);
+            h = static_cast<int>(lines.size()) * line_h + 4;
+            newest_user_idx = static_cast<int>(i);
+        } else if (msg.kind == wqn::ChatMessageKind::kAssistant) {
+            // Markdown row count, cached per message so only the streaming
+            // reply is re-laid out while it grows. MUST use the same width as
+            // DrawAssistantBlock or block heights drift.
+            const int rows = CachedAssistantMdRows(msg.id, body);
+            h = rows * line_h + 6;
+        } else if (msg.kind == wqn::ChatMessageKind::kThinking) {
+            const auto lines = BuildThinkingLines(body, kAiAssistantW, expand_content);
+            h = static_cast<int>(lines.size()) * line_h + 6;
+        } else {
+            h = ToolBlockHeight(msg, kAiAssistantW, expand_content);
+        }
+        out.heights[i] = h;
+        out.virtual_tops[i] = y;
+        y += h + kAiLineGap;
+    }
+    out.total_content_h = (n > 0) ? y - kAiLineGap : 0;
+    if (out.total_content_h < 0) {
+        out.total_content_h = 0;
+    }
+    if (newest_user_idx >= 0) {
+        out.anchor_top = out.virtual_tops[newest_user_idx];
+    }
+    return out;
+}
+
 void RenderAiHistoryViewport(const wqn::AiSessionState& ai,
                             const std::shared_ptr<const wqn::AiHistorySnapshot>& snapshot,
                             int32_t scroll_offset_lines)
@@ -429,44 +519,12 @@ void RenderAiHistoryViewport(const wqn::AiSessionState& ai,
         return;
     }
 
-    // 1. Calculate heights and layout of all messages
-    struct Layout {
-        int height;
-        size_t msg_idx;
-        int rows_consumed;
-    };
-    std::vector<Layout> layout;
-    const size_t n = messages.size();
-    
-    // Index 0 is oldest, n-1 is newest. We build layout from newest (n-1) to oldest (0).
-    for (size_t i = 0; i < n; ++i) {
-        const size_t msg_idx = n - 1 - i;
-        const wqn::ChatMessageSnapshot& msg = messages[msg_idx];
-        int h = 0;
-        int rows_consumed = 0;
-        const std::string body(msg.text.empty() ? std::string("-")
-                                               : std::string(msg.text.data(), msg.text.size()));
-        if (msg.kind == wqn::ChatMessageKind::kUser) {
-            const auto lines = WrapForViewport(body, kAiUserPillMaxW - 16, 4);
-            h = static_cast<int>(lines.size()) * line_h + 4;
-            rows_consumed = static_cast<int>(lines.size());
-        } else if (msg.kind == wqn::ChatMessageKind::kAssistant) {
-            // Layout pass — keep the row cap generous so a long reply still
-            // measures its true height before we hit the viewport clip.
-            constexpr size_t kAssistantLayoutRowCap = 1024;  // [expand] must match kAssistantRowCap (was 64)
-            const auto lines = WrapForViewport(body, kAiAssistantW - kAiAssistantLeftBorder - 6, kAssistantLayoutRowCap);
-            h = static_cast<int>(lines.size()) * line_h + 6;
-            rows_consumed = static_cast<int>(lines.size());
-        } else if (msg.kind == wqn::ChatMessageKind::kThinking) {
-            const auto lines = BuildThinkingLines(body, kAiAssistantW, ai.expand_content);
-            h = static_cast<int>(lines.size()) * line_h + 6;
-            rows_consumed = static_cast<int>(lines.size());
-        } else {
-            h = ToolBlockHeight(msg, kAiAssistantW, ai.expand_content);
-            rows_consumed = h / line_h;
-        }
-        layout.push_back({h, msg_idx, rows_consumed});
-    }
+    // 1. Lay out all messages through the shared geometry pass. It is the
+    // single source of truth for GetAiScrollBounds as well: the input-path
+    // scroll clamp MUST agree with what is actually drawn, or the viewport
+    // desyncs from its own bounds.
+    const AiHistoryLayout layout = ComputeAiHistoryLayout(messages, ai.expand_content);
+    const int layout_size = static_cast<int>(messages.size());
 
     // 2. Determine the visible subset of messages and place them inside the
     // viewport.
@@ -482,52 +540,18 @@ void RenderAiHistoryViewport(const wqn::AiSessionState& ai,
     // scroll_offset_lines is then a relative adjustment on top of this
     // anchor: positive means "scroll up into older history", negative means
     // "scroll down past the latest content" (clamped at 0).
-    // (line_h already declared above.)
-
-    // 2. Determine the visible subset of messages and place them inside the
-    // viewport.
-    //
-    // Layout strategy: chat conversation reads top→bottom in chronological
-    // order (oldest at top, newest at bottom — standard chat convention).
     // All messages are laid out in a virtual canvas from oldest to newest.
-    const int layout_size = static_cast<int>(layout.size());
-    std::vector<int> virtual_tops(layout_size);
-    int current_y = 0;
-    for (int i = layout_size - 1; i >= 0; --i) {
-        virtual_tops[i] = current_y;
-        current_y += layout[i].height + kAiLineGap;
-    }
-    int total_content_h = current_y - kAiLineGap;
-    if (total_content_h < 0) {
-        total_content_h = 0;
-    }
-
     const int effective_bottom = wqn::kEpdHeight - kAiViewportBottomPad;
     const int viewport_h = effective_bottom - kAiViewportY;
 
-    // Locate the most-recent user message for default top-viewport anchoring.
-    int newest_user_idx = -1;
-    for (size_t i = 0; i < layout.size(); ++i) {
-        const Layout& L = layout[i];
-        if (messages[L.msg_idx].kind == wqn::ChatMessageKind::kUser) {
-            newest_user_idx = static_cast<int>(i);
-            break;
-        }
-    }
-
-    int anchor_top = 0;
-    if (newest_user_idx >= 0) {
-        anchor_top = virtual_tops[newest_user_idx];
-    }
-
-    int max_window_top = total_content_h - viewport_h;
+    int max_window_top = layout.total_content_h - viewport_h;
     if (max_window_top < 0) {
         max_window_top = 0;
     }
 
-    // Scroll limits in line units
-    int max_scroll = anchor_top / line_h;
-    int min_scroll = (anchor_top - max_window_top) / line_h;
+    // Scroll limits in line units (anchor = newest user message top).
+    int max_scroll = layout.anchor_top / line_h;
+    int min_scroll = (layout.anchor_top - max_window_top) / line_h;
     if (min_scroll > 0) {
         min_scroll = 0;
     }
@@ -540,11 +564,8 @@ void RenderAiHistoryViewport(const wqn::AiSessionState& ai,
     if (clamped_scroll > max_scroll) {
         clamped_scroll = max_scroll;
     }
-    if (clamped_scroll != scroll_offset_lines) {
-        wqn::SetAiScrollOffsetLines(clamped_scroll);
-    }
 
-    int window_top = anchor_top - clamped_scroll * line_h;
+    int window_top = layout.anchor_top - clamped_scroll * line_h;
     if (window_top < 0) {
         window_top = 0;
     } else if (window_top > max_window_top) {
@@ -555,12 +576,11 @@ void RenderAiHistoryViewport(const wqn::AiSessionState& ai,
 
     // Draw all messages that intersect with the viewport
     for (int i = layout_size - 1; i >= 0; --i) {
-        const Layout& L = layout[i];
-        const wqn::ChatMessageSnapshot& msg = messages[L.msg_idx];
-        const int block_top = kAiViewportY + (virtual_tops[i] - window_top);
+        const wqn::ChatMessageSnapshot& msg = messages[i];
+        const int block_top = kAiViewportY + (layout.virtual_tops[i] - window_top);
 
         // Clip completely above viewport
-        if (block_top + L.height <= kAiViewportY) {
+        if (block_top + layout.heights[i] <= kAiViewportY) {
             continue;
         }
         // Clip completely below viewport
@@ -638,9 +658,182 @@ void RenderAiHistoryViewport(const wqn::AiSessionState& ai,
     }
 }
 
+void GetAiScrollBounds(
+    std::shared_ptr<const wqn::AiHistorySnapshot> snapshot,
+    bool expand_content,
+    int32_t* out_min_scroll,
+    int32_t* out_max_scroll)
+{
+    if (out_min_scroll) *out_min_scroll = 0;
+    if (out_max_scroll) *out_max_scroll = 0;
+    if (!snapshot || snapshot->messages.empty()) return;
+
+    // Same geometry pass as the renderer -- never re-measure here.
+    const AiHistoryLayout layout = ComputeAiHistoryLayout(snapshot->messages, expand_content);
+
+    const int line_h = kAiLineH;
+    const int viewport_h = wqn::kEpdHeight - kAiViewportY - kAiViewportBottomPad;
+    int max_window_top = layout.total_content_h - viewport_h;
+    if (max_window_top < 0) {
+        max_window_top = 0;
+    }
+
+    int max_scroll = layout.anchor_top / line_h;
+    int min_scroll = (layout.anchor_top - max_window_top) / line_h;
+    if (min_scroll > 0) {
+        min_scroll = 0;
+    }
+
+    if (out_min_scroll) *out_min_scroll = min_scroll;
+    if (out_max_scroll) *out_max_scroll = max_scroll;
+}
+
+// [agent] Turn navigation: bring the previous/next ANSWER to the top of the
+// viewport instead of scrolling by a fixed number of lines, so one keypress
+// lands on a readable boundary no matter how long a reply is.
+//
+// The scroll model is `window_top = anchor_top - scroll * line_h`, so a target
+// block top maps to `scroll = (anchor_top - top) / line_h`. Reuses
+// ComputeAiHistoryLayout (never re-measures) and clamps through the same
+// min/max the renderer uses, so a jump can never ask for a window the viewport
+// cannot draw.
+bool GetAiTurnJumpOffsetLines(
+    std::shared_ptr<const wqn::AiHistorySnapshot> snapshot,
+    bool expand_content,
+    int32_t current_scroll,
+    int direction,
+    int32_t* out_scroll)
+{
+    if (out_scroll == nullptr || direction == 0 || !snapshot || snapshot->messages.empty()) {
+        return false;
+    }
+    const AiHistoryLayout layout = ComputeAiHistoryLayout(snapshot->messages, expand_content);
+
+    const int line_h = kAiLineH;
+    const int viewport_h = wqn::kEpdHeight - kAiViewportY - kAiViewportBottomPad;
+    int max_window_top = layout.total_content_h - viewport_h;
+    if (max_window_top < 0) {
+        max_window_top = 0;
+    }
+    int max_scroll = layout.anchor_top / line_h;
+    int min_scroll = (layout.anchor_top - max_window_top) / line_h;
+    if (min_scroll > 0) {
+        min_scroll = 0;
+    }
+    int32_t clamped = current_scroll;
+    if (clamped < min_scroll) {
+        clamped = min_scroll;
+    }
+    if (clamped > max_scroll) {
+        clamped = max_scroll;
+    }
+
+    // Current window top in virtual-canvas units.
+    int window_top = layout.anchor_top - clamped * line_h;
+    if (window_top < 0) {
+        window_top = 0;
+    } else if (window_top > max_window_top) {
+        window_top = max_window_top;
+    }
+
+    // Answers are assistant blocks; tool/thinking blocks belong to the reply
+    // above them and would jump to a half-rendered position.
+    const int n = static_cast<int>(snapshot->messages.size());
+    int target = -1;
+    if (direction < 0) {
+        for (int i = n - 1; i >= 0; --i) {
+            if (snapshot->messages[i].kind != wqn::ChatMessageKind::kAssistant) {
+                continue;
+            }
+            if (layout.virtual_tops[i] < window_top) {
+                target = layout.virtual_tops[i];
+                break;
+            }
+        }
+    } else {
+        for (int i = 0; i < n; ++i) {
+            if (snapshot->messages[i].kind != wqn::ChatMessageKind::kAssistant) {
+                continue;
+            }
+            if (layout.virtual_tops[i] > window_top) {
+                target = layout.virtual_tops[i];
+                break;
+            }
+        }
+    }
+    if (target < 0) {
+        return false;  // no answer in that direction
+    }
+
+    int32_t next = (layout.anchor_top - target) / line_h;
+    if (next < min_scroll) {
+        next = min_scroll;
+    }
+    if (next > max_scroll) {
+        next = max_scroll;
+    }
+    if (next == clamped) {
+        return false;  // already there
+    }
+    *out_scroll = next;
+    return true;
+}
+
+// [follow] The newest answer's first line as a scroll offset. The per-tick
+// auto-follow parks the viewport here when the answer body starts, so the user
+// reads the reply from its beginning instead of chasing the streaming tail.
+// Reuses ComputeAiHistoryLayout (never re-measures) and clamps through the same
+// min/max the renderer uses.
+//
+// Returns false when the newest history entry is not a non-empty assistant body
+// -- the answer has not started, or the turn is still thinking / running tools.
+// The caller then keeps following the live tail instead.
+bool GetAiNewestAnswerTopOffsetLines(
+    std::shared_ptr<const wqn::AiHistorySnapshot> snapshot,
+    bool expand_content,
+    int32_t* out_scroll)
+{
+    if (out_scroll == nullptr || !snapshot || snapshot->messages.empty()) {
+        return false;
+    }
+    const wqn::ChatMessageSnapshot& newest = snapshot->messages.back();
+    if (newest.kind != wqn::ChatMessageKind::kAssistant || newest.text.empty()) {
+        return false;
+    }
+    const AiHistoryLayout layout = ComputeAiHistoryLayout(snapshot->messages, expand_content);
+
+    const int line_h = kAiLineH;
+    const int viewport_h = wqn::kEpdHeight - kAiViewportY - kAiViewportBottomPad;
+    int max_window_top = layout.total_content_h - viewport_h;
+    if (max_window_top < 0) {
+        max_window_top = 0;
+    }
+    int max_scroll = layout.anchor_top / line_h;
+    int min_scroll = (layout.anchor_top - max_window_top) / line_h;
+    if (min_scroll > 0) {
+        min_scroll = 0;
+    }
+
+    int32_t next = (layout.anchor_top - layout.virtual_tops.back()) / line_h;
+    if (next < min_scroll) {
+        next = min_scroll;
+    }
+    if (next > max_scroll) {
+        next = max_scroll;
+    }
+    *out_scroll = next;
+    return true;
+}
+
 esp_err_t RenderAiToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
 {
     const wqn::AiSessionState& ai = frame.ai;
+    // [agent] The Agent tier owns the whole frame: its status bar carries a
+    // different toggle cluster and its bottom band carries the option bar, so
+    // it cannot share this function's body. It clears the framebuffer itself.
+    if (ai.tier == wqn::AiTier::kAgent) {
+        return RenderAgentAiToEpd(frame, schedule);
+    }
     wqn::ClearEpdFramebuffer(true);
 
     // Section 1: status bar (no battery, merges toast state).

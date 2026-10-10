@@ -7,20 +7,25 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <dirent.h>
 #include <limits>
 #include <string>
 #include <sys/stat.h>
+#include <utime.h>
 #include <unistd.h>
 #include <utility>
 
 #include "cJSON.h"
+#include "device_protocol/json_depth_guard.h"
 #include "device_protocol/note_study.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_rom_crc.h"
 #include "esp_spiffs.h"
 #include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "mbedtls/sha256.h"
 #include "runtime/sleep_coordinator.h"
 #include "services/storage_service.h"
@@ -50,6 +55,7 @@ constexpr size_t kMaxNoteTitleBytes = 4 * 120;
 constexpr size_t kMaxNoteContentBytes = 16384;
 constexpr size_t kPackIdStemChars = 6;
 constexpr size_t kPackHashStemChars = 12;
+constexpr size_t kNoteImageHashStemChars = 18;
 // SPIFFS counts the leading slash in its object name and reserves one byte for
 // NUL. Keep the longest final suffix (.wqnp) strictly within that budget.
 constexpr size_t kMaxPackObjectNameBytes =
@@ -57,12 +63,78 @@ constexpr size_t kMaxPackObjectNameBytes =
 static_assert(
     kMaxPackObjectNameBytes <= CONFIG_SPIFFS_OBJ_NAME_LEN - 1,
     "note pack filename exceeds SPIFFS object-name budget");
+// Include the longer `.wqni.tmp` transaction name. Eighteen hex characters
+// raise the cache-key prefix from 48 to 72 bits while staying within SPIFFS.
+constexpr size_t kMaxNoteImageObjectNameBytes =
+    1 + 3 + kNoteImageHashStemChars + 5 + 4;
+static_assert(
+    kMaxNoteImageObjectNameBytes <= CONFIG_SPIFFS_OBJ_NAME_LEN - 1,
+    "note image cache filename exceeds SPIFFS object-name budget");
 // Maximum contract line, its optional LF, and the terminating NUL for fgets.
 constexpr size_t kLineBufferSize = kMaxLineBytes + 2;
 
+// [pack-io] The default stdio buffer is 128 B (newlib __BUFSIZ__) and SPIFFS
+// reports st_blksize = 0, so every fgets refill costs one VFS read: a 381 KB
+// pack measures ~2,978 reads. A 32 KiB PSRAM buffer cuts that to ~12 while
+// the SPIFFS per-page transfer cost stays the same. Lifetime invariant: the
+// buffer must outlive fclose -- newlib never frees a caller-supplied setvbuf
+// buffer (__SMBF is only set by __smakebuf_r), so any new path that returns
+// without fclose turns a FILE leak into a use-after-free of this PSRAM block.
+constexpr size_t kPackReadBufferBytes = 32 * 1024;
+
+class PackReadBuffer {
+public:
+    explicit PackReadBuffer(FILE* file)
+    {
+        if (file == nullptr) {
+            return;
+        }
+        data_ = static_cast<char*>(heap_caps_malloc(
+            kPackReadBufferBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        if (data_ == nullptr) {
+            return;  // Degrade to the default buffer; behaviour unchanged.
+        }
+        if (std::setvbuf(file, data_, _IOFBF, kPackReadBufferBytes) != 0) {
+            heap_caps_free(data_);
+            data_ = nullptr;
+        }
+    }
+    ~PackReadBuffer()
+    {
+        if (data_ != nullptr) {
+            heap_caps_free(data_);
+        }
+    }
+    PackReadBuffer(const PackReadBuffer&) = delete;
+    PackReadBuffer& operator=(const PackReadBuffer&) = delete;
+
+private:
+    char* data_ = nullptr;
+};
+
+// [watchdog] The SHA and JSONL scan loops can run for seconds without
+// blocking; the 10 s task watchdog only checks IDLE0/IDLE1 starvation and
+// no task in this path subscribes to TWDT, so yielding is the only lever.
+// 100 ms slices leave ~1000 yield points inside the 10 s window.
+constexpr int64_t kPackYieldSliceUs = 100 * 1000;
+
+void MaybeYieldPackRebuild(int64_t& last_yield_us)
+{
+    const int64_t now_us = esp_timer_get_time();
+    if (now_us - last_yield_us < kPackYieldSliceUs) {
+        return;
+    }
+    vTaskDelay(1);
+    last_yield_us = esp_timer_get_time();
+}
+
 class JsonDocument {
 public:
-    explicit JsonDocument(const char* payload) : root_(cJSON_Parse(payload)) {}
+    explicit JsonDocument(const char* payload)
+        : root_(payload != nullptr && wqn::protocol::JsonNestingWithinLimit(
+                    payload, std::strlen(payload))
+                    ? cJSON_Parse(payload)
+                    : nullptr) {}
     ~JsonDocument() { cJSON_Delete(root_); }
 
     cJSON* root() const { return root_; }
@@ -203,15 +275,18 @@ bool VerifyFileSha256(const std::string& path, const std::string& expected)
     if (file == nullptr) {
         return false;
     }
+    PackReadBuffer read_buffer(file);
     mbedtls_sha256_context ctx;
     mbedtls_sha256_init(&ctx);
     mbedtls_sha256_starts(&ctx, 0);
     std::array<unsigned char, 1024> buffer = {};
+    int64_t last_yield_us = esp_timer_get_time();
     while (true) {
         const size_t read = std::fread(buffer.data(), 1, buffer.size(), file);
         if (read > 0) {
             mbedtls_sha256_update(&ctx, buffer.data(), read);
         }
+        MaybeYieldPackRebuild(last_yield_us);
         if (read < buffer.size()) {
             if (std::ferror(file)) {
                 std::fclose(file);
@@ -234,6 +309,25 @@ bool VerifyFileSha256(const std::string& path, const std::string& expected)
         actual.push_back(kHex[byte & 0x0F]);
     }
     return actual == expected;
+}
+
+bool VerifyBufferSha256(
+    const uint8_t* data, size_t size, const std::string& expected)
+{
+    if (data == nullptr || size == 0 || expected.size() != 64) {
+        return false;
+    }
+    std::array<unsigned char, 32> digest = {};
+    if (mbedtls_sha256(data, size, digest.data(), 0) != 0) {
+        return false;
+    }
+    constexpr char kHex[] = "0123456789abcdef";
+    std::array<char, 64> actual = {};
+    for (size_t i = 0; i < digest.size(); ++i) {
+        actual[i * 2] = kHex[digest[i] >> 4];
+        actual[i * 2 + 1] = kHex[digest[i] & 0x0F];
+    }
+    return std::equal(actual.begin(), actual.end(), expected.begin());
 }
 
 void CopyField(char* dst, size_t dst_size, const std::string& src)
@@ -594,13 +688,37 @@ esp_err_t ParseNoteRecordLine(const char* line, wqn::WqnNoteEntry* entry, bool i
             entry->image_ids.emplace_back(image_id->valuestring);
         }
     }
+    cJSON* gray4_ids =
+        cJSON_GetObjectItemCaseSensitive(document.root(), "gray4_image_ids");
+    if (gray4_ids == nullptr || cJSON_IsNull(gray4_ids)) {
+        entry->gray4_image_ids.resize(entry->image_ids.size());
+    } else {
+        if (!cJSON_IsArray(gray4_ids) ||
+            cJSON_GetArraySize(gray4_ids) !=
+                static_cast<int>(entry->image_ids.size())) {
+            return ESP_ERR_INVALID_RESPONSE;
+        }
+        cJSON* gray4_id = nullptr;
+        cJSON_ArrayForEach(gray4_id, gray4_ids) {
+            if (cJSON_IsNull(gray4_id)) {
+                entry->gray4_image_ids.emplace_back();
+            } else if (cJSON_IsString(gray4_id) &&
+                       gray4_id->valuestring != nullptr &&
+                       std::strlen(gray4_id->valuestring) == 64) {
+                entry->gray4_image_ids.emplace_back(gray4_id->valuestring);
+            } else {
+                return ESP_ERR_INVALID_RESPONSE;
+            }
+        }
+    }
     return ESP_OK;
 }
 
 esp_err_t ScanNotePackFile(
     const wqn::WqnNotePackManifestNotebook& notebook,
     uint32_t notebook_order,
-    wqn::NotePackIndex* index)
+    wqn::NotePackIndex* index,
+    int64_t* parse_us)
 {
     if (index == nullptr) {
         return ESP_ERR_INVALID_ARG;
@@ -610,6 +728,7 @@ esp_err_t ScanNotePackFile(
     if (file == nullptr) {
         return ESP_ERR_NOT_FOUND;
     }
+    PackReadBuffer read_buffer(file);
     const size_t initial_entry_count = index->entries.size();
     struct EntryRollback {
         wqn::NotePackIndex* index;
@@ -662,6 +781,7 @@ esp_err_t ScanNotePackFile(
 
     const std::string pack_stem = wqn::SafeNotePackStem(notebook);
     uint32_t scanned_entries = 0;
+    int64_t last_yield_us = esp_timer_get_time();
     while (true) {
         const long offset = std::ftell(file);
         result = ReadBoundedNotePackLine(file, &line_buffer, &line);
@@ -674,7 +794,11 @@ esp_err_t ScanNotePackFile(
             return result == ESP_OK ? ESP_ERR_INVALID_SIZE : result;
         }
         wqn::WqnNoteEntry entry;
+        const int64_t parse_started_us = esp_timer_get_time();
         result = ParseNoteRecordLine(line.c_str(), &entry, /*include_content=*/false);
+        if (parse_us != nullptr) {
+            *parse_us += esp_timer_get_time() - parse_started_us;
+        }
         if (result != ESP_OK) {
             std::fclose(file);
             return result;
@@ -693,6 +817,7 @@ esp_err_t ScanNotePackFile(
         indexed.sort_index = entry.sort_index;
         indexed.image_count = static_cast<uint8_t>(entry.image_ids.size());
         index->entries.push_back(indexed);
+        MaybeYieldPackRebuild(last_yield_us);
         ++scanned_entries;
         if (index->entries.size() > kMaxIndexEntries || scanned_entries > notebook.entry_count) {
             std::fclose(file);
@@ -927,6 +1052,10 @@ esp_err_t LoadNotePackIndex(NotePackIndex* index)
     if (index == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
+    // [timing] The SHA verify and the JSONL scan each walk the whole pack and
+    // scale with its size, so the watchdog budget of a bigger pack has to be
+    // extrapolated from measured phases rather than guessed.
+    const int64_t index_started_us = esp_timer_get_time();
     // SHA verification and JSONL scanning are CPU-bound; scope max frequency to
     // this rebuild instead of disabling dynamic frequency scaling globally.
     auto cpu_lease = runtime::CpuPerformanceLease::TryAcquire();
@@ -1003,6 +1132,9 @@ esp_err_t LoadNotePackIndex(NotePackIndex* index)
     index->pack_identities.reserve(pack_notebooks);
     index->notebooks.reserve(manifest.notebooks.size());
 
+    int64_t sha_us_total = 0;
+    int64_t scan_us_total = 0;
+    int64_t parse_us_total = 0;
     for (const WqnNotePackManifestNotebook& item : manifest.notebooks) {
         const uint32_t notebook_order = static_cast<uint32_t>(index->notebooks.size());
         NotePackNotebook notebook;
@@ -1028,11 +1160,17 @@ esp_err_t LoadNotePackIndex(NotePackIndex* index)
             if (stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode)) {
                 index->pack_bytes += static_cast<size_t>(st.st_size);
             }
-            if (!VerifyFileSha256(path, item.sha256)) {
+            const int64_t sha_started_us = esp_timer_get_time();
+            const bool sha_ok = VerifyFileSha256(path, item.sha256);
+            sha_us_total += esp_timer_get_time() - sha_started_us;
+            if (!sha_ok) {
                 index->pack_error = true;
                 index->status_message = "笔记校验失败";
             } else {
-                const esp_err_t scan_result = ScanNotePackFile(item, notebook_order, index);
+                const int64_t scan_started_us = esp_timer_get_time();
+                const esp_err_t scan_result =
+                    ScanNotePackFile(item, notebook_order, index, &parse_us_total);
+                scan_us_total += esp_timer_get_time() - scan_started_us;
                 if (scan_result != ESP_OK) {
                     index->pack_error = true;
                     index->status_message = "笔记读取失败";
@@ -1067,12 +1205,16 @@ esp_err_t LoadNotePackIndex(NotePackIndex* index)
 
     ESP_LOGI(
         kTag,
-        "note pack index: notebooks=%u notes=%u pack_bytes=%u free_internal=%u free_psram=%u",
+        "note pack index: notebooks=%u notes=%u pack_bytes=%u free_internal=%u free_psram=%u total_ms=%lld sha_ms=%lld scan_ms=%lld parse_ms=%lld",
         static_cast<unsigned>(index->notebook_count),
         static_cast<unsigned>(index->entries.size()),
         static_cast<unsigned>(index->pack_bytes),
         static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
-        static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)));
+        static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)),
+        static_cast<long long>((esp_timer_get_time() - index_started_us) / 1000),
+        static_cast<long long>(sha_us_total / 1000),
+        static_cast<long long>(scan_us_total / 1000),
+        static_cast<long long>(parse_us_total / 1000));
     // [note-image-diag] Image ids only reach the viewer through pack lines, so
     // report how many indexed notes carry attachments; with_images=0 while the
     // web shows attachments means the device pack predates the attach (sync
@@ -1320,14 +1462,15 @@ namespace {
 
 std::string NoteImageCachePath(const std::string& image_id)
 {
-    return std::string(kStorageRoot) + "/ni_" + image_id.substr(0, 12) + ".wqni";
+    return std::string(kStorageRoot) + "/ni_" +
+        image_id.substr(0, kNoteImageHashStemChars) + ".wqni";
 }
 
 bool IsNoteImageId(const std::string& image_id)
 {
     if (image_id.size() != 64) return false;
     for (char c : image_id) {
-        if (!std::isxdigit(static_cast<unsigned char>(c))) return false;
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
     }
     return true;
 }
@@ -1377,11 +1520,106 @@ void EvictNoteImageCacheIfNeeded()
     }
 }
 
+struct StoreNoteImageContext {
+    const std::string* image_id = nullptr;
+    const uint8_t* data = nullptr;
+    size_t size = 0;
+};
+
+struct LoadNoteImageContext {
+    const std::string* image_id = nullptr;
+    std::vector<uint8_t>* wqni = nullptr;
+};
+
+esp_err_t LoadNoteImageTransaction(void* opaque)
+{
+    auto* context = static_cast<LoadNoteImageContext*>(opaque);
+    if (context == nullptr || context->image_id == nullptr ||
+        context->wqni == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    const std::string path = NoteImageCachePath(*context->image_id);
+    FILE* file = std::fopen(path.c_str(), "rb");
+    if (file == nullptr) {
+        return ESP_ERR_NOT_FOUND;
+    }
+    // Read the header first so the cache accepts either BW1 or GRAY4 without
+    // allocating a second fixed-size buffer.
+    std::array<uint8_t, kNoteImageHeaderBytes> header = {};
+    const size_t header_read = std::fread(header.data(), 1, header.size(), file);
+    if (header_read != header.size()) {
+        std::fclose(file);
+        unlink(path.c_str());
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    const uint8_t format = header[5];
+    const size_t payload = format == 1 ? kNoteImagePayloadBytes
+        : format == 2 ? kNoteImageGray4PayloadBytes : 0;
+    if (payload == 0) {
+        std::fclose(file);
+        unlink(path.c_str());
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    context->wqni->assign(kNoteImageHeaderBytes + payload, 0);
+    std::memcpy(context->wqni->data(), header.data(), header.size());
+    const size_t read = std::fread(
+        context->wqni->data() + kNoteImageHeaderBytes, 1, payload, file);
+    const bool extra = std::fgetc(file) != EOF;
+    std::fclose(file);
+    if (read != payload || extra ||
+        ValidateNoteImageWqni(context->wqni->data(), context->wqni->size()) != ESP_OK ||
+        !VerifyBufferSha256(
+            context->wqni->data(), context->wqni->size(), *context->image_id)) {
+        // Corrupt cache entries are dropped so the next request re-downloads.
+        unlink(path.c_str());
+        context->wqni->clear();
+        return ESP_ERR_INVALID_CRC;
+    }
+    // Refresh mtime on a successful hit so capacity reclamation is genuinely
+    // least-recently-used rather than oldest-created.
+    struct utimbuf touched = {};
+    touched.actime = std::time(nullptr);
+    touched.modtime = touched.actime;
+    if (utime(path.c_str(), &touched) != 0) {
+        ESP_LOGD(kTag, "note image cache touch failed: %s", path.c_str());
+    }
+    return ESP_OK;
+}
+
+esp_err_t StoreNoteImageTransaction(void* opaque)
+{
+    const auto* context = static_cast<const StoreNoteImageContext*>(opaque);
+    if (context == nullptr || context->image_id == nullptr ||
+        context->data == nullptr || context->size == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    EvictNoteImageCacheIfNeeded();
+    const std::string path = NoteImageCachePath(*context->image_id);
+    const std::string temp = path + ".tmp";
+    FILE* file = std::fopen(temp.c_str(), "wb");
+    if (file == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
+    const size_t written = std::fwrite(context->data, 1, context->size, file);
+    const bool flushed = std::fflush(file) == 0 && ::fsync(fileno(file)) == 0;
+    const bool closed = std::fclose(file) == 0;
+    if (written != context->size || !flushed || !closed) {
+        unlink(temp.c_str());
+        return ESP_FAIL;
+    }
+    unlink(path.c_str());
+    if (rename(temp.c_str(), path.c_str()) != 0) {
+        unlink(temp.c_str());
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
 }  // namespace
 
 esp_err_t ValidateNoteImageWqni(const uint8_t* data, size_t size)
 {
-    if (data == nullptr || size != kNoteImageFileBytes) {
+    if (data == nullptr || size < kNoteImageHeaderBytes) {
         return ESP_ERR_INVALID_SIZE;
     }
     if (std::memcmp(data, "WQNI", 4) != 0) {
@@ -1398,12 +1636,16 @@ esp_err_t ValidateNoteImageWqni(const uint8_t* data, size_t size)
     std::memcpy(&crc, data + 16, sizeof(crc));
     // flags 0x0003 = MSB-first bit order + 1-renders-white: the exact wqn_epd
     // framebuffer convention. Anything else would need a transform we do not do.
-    if (version != 1 || pixel_format != 1 || flags != 0x0003 || width != 400 ||
-        height != 300 || payload_length != kNoteImagePayloadBytes) {
+    const size_t expected_payload = pixel_format == 1
+        ? kNoteImagePayloadBytes
+        : pixel_format == 2 ? kNoteImageGray4PayloadBytes : 0;
+    if (version != 1 || flags != 0x0003 || width != 400 || height != 300 ||
+        expected_payload == 0 || payload_length != expected_payload ||
+        size != kNoteImageHeaderBytes + expected_payload) {
         return ESP_ERR_INVALID_RESPONSE;
     }
     const uint32_t actual = esp_rom_crc32_le(
-        0, data + kNoteImageHeaderBytes, kNoteImagePayloadBytes);
+        0, data + kNoteImageHeaderBytes, expected_payload);
     if (actual != crc) {
         return ESP_ERR_INVALID_CRC;
     }
@@ -1415,23 +1657,16 @@ esp_err_t LoadCachedNoteImage(const std::string& image_id, std::vector<uint8_t>*
     if (wqni == nullptr || !IsNoteImageId(image_id)) {
         return ESP_ERR_INVALID_ARG;
     }
-    const std::string path = NoteImageCachePath(image_id);
-    FILE* file = std::fopen(path.c_str(), "rb");
-    if (file == nullptr) {
-        return ESP_ERR_NOT_FOUND;
+    runtime::SleepLease storage_lease = runtime::SleepLease::TryAcquire(
+        runtime::SleepBlocker::kStorage,
+        "note-image-read",
+        __FILE__,
+        __LINE__);
+    if (!storage_lease) {
+        return ESP_ERR_INVALID_STATE;
     }
-    wqni->assign(kNoteImageFileBytes, 0);
-    const size_t read = std::fread(wqni->data(), 1, kNoteImageFileBytes, file);
-    const bool extra = std::fgetc(file) != EOF;
-    std::fclose(file);
-    if (read != kNoteImageFileBytes || extra ||
-        ValidateNoteImageWqni(wqni->data(), wqni->size()) != ESP_OK) {
-        // Corrupt cache entries are dropped so the next request re-downloads.
-        unlink(path.c_str());
-        wqni->clear();
-        return ESP_ERR_INVALID_CRC;
-    }
-    return ESP_OK;
+    LoadNoteImageContext context = {&image_id, wqni};
+    return services::ExecuteStorageTransaction(LoadNoteImageTransaction, &context);
 }
 
 esp_err_t StoreCachedNoteImage(const std::string& image_id, const uint8_t* data, size_t size)
@@ -1443,26 +1678,21 @@ esp_err_t StoreCachedNoteImage(const std::string& image_id, const uint8_t* data,
     if (valid != ESP_OK) {
         return valid;
     }
-    EvictNoteImageCacheIfNeeded();
-    const std::string path = NoteImageCachePath(image_id);
-    const std::string temp = path + ".tmp";
-    FILE* file = std::fopen(temp.c_str(), "wb");
-    if (file == nullptr) {
-        return ESP_ERR_NO_MEM;
+    if (!VerifyBufferSha256(data, size, image_id)) {
+        return ESP_ERR_INVALID_CRC;
     }
-    const size_t written = std::fwrite(data, 1, size, file);
-    const bool flushed = std::fflush(file) == 0;
-    std::fclose(file);
-    if (written != size || !flushed) {
-        unlink(temp.c_str());
-        return ESP_FAIL;
+    runtime::SleepLease storage_lease = runtime::SleepLease::TryAcquire(
+        runtime::SleepBlocker::kStorage,
+        "note-image-cache",
+        __FILE__,
+        __LINE__);
+    if (!storage_lease) {
+        return ESP_ERR_INVALID_STATE;
     }
-    unlink(path.c_str());
-    if (rename(temp.c_str(), path.c_str()) != 0) {
-        unlink(temp.c_str());
-        return ESP_FAIL;
-    }
-    return ESP_OK;
+    StoreNoteImageContext context = {&image_id, data, size};
+    return services::ExecuteStorageTransaction(
+        StoreNoteImageTransaction,
+        &context);
 }
 
 }  // namespace wqn

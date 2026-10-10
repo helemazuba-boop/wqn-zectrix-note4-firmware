@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-ESP-IDF firmware for the **WQN ZecTrix Note4** — an ESP32-S3, 400×300 e-paper study
+ESP-IDF firmware for the **WQN Note4** — an ESP32-S3, 400×300 e-paper study
 terminal built on the `zectrix-s3-epaper-4.2` board. The device connects to the WQN
 cloud over WiFi, caches due problems / todos / word decks locally, renders them to
 e-paper, and uploads review results. Provider secrets (Supabase, ASR/LLM providers,
@@ -20,9 +20,9 @@ The detailed English firmware README is `firmware/wqn-zectrix-note4/README.md`;
 comments are mixed Chinese/English; identifiers are English.
 
 > Environment note: the tracked READMEs and `BUILD_HERE.md` were written for the
-> maintainer's Windows workspace and reference `D:\projects\wqn-zectrix-note4-firmware`
-> plus `D:\Program\Espressif\frameworks\esp-idf-v5.5.4`. This checkout lives at
-> `/home/unknow/projects/firmware` (WSL). The `idf.py` commands below are
+> maintainer's Windows workspace and reference `<repo-root>`
+> plus `<esp-idf-dir>`. This checkout lives at
+> `<repo-root>` (WSL). The `idf.py` commands below are
 > environment-agnostic once the ESP-IDF env is activated; adjust the `cd` and IDF
 > activation path to wherever ESP-IDF lives in the current environment.
 
@@ -54,9 +54,9 @@ deploy.bat
 
 - **Dev port is `COM7`.** `COM5` is the official-firmware checkpoint; the portable
   flasher refuses `COM5`. Do not flash `COM5`.
-- `deploy.bat` ends by running `listen_usb.py` (writes serial output to `wqn.log`)
+- `deploy.bat` ends by opening `scripts\monitor_serial.bat` (no-reset serial monitor)
   because **`idf.py monitor` is broken over the chip's Native USB-Serial-JTAG
-  interface**. Use `listen_usb.py` / `scripts\monitor.bat` for live logs.
+  interface**. Use `scripts\monitor_serial.bat` / `scripts\monitor.bat` for live logs.
 - Granular helpers live in `firmware/wqn-zectrix-note4/scripts/` (`flash-fix.bat`,
   `erase_reflash.bat`, `monitor.bat`, `read_flash.bat`, …). **Do not drop new `.bat`
   files in the repo root** — only `deploy.bat` belongs there.
@@ -74,8 +74,20 @@ Feature toggles live in `idf.py menuconfig` under **WQN firmware** (defined in
 - `CONFIG_WQN_DEEP_SLEEP_ENABLE` — deep sleep after UI idle (wake: GPIO 0/18/5).
 - `CONFIG_WQN_AI_ENABLE` — AI modules (SSE streaming + Flash realtime voice); provider
   secrets still server-side.
+- `CONFIG_WQN_AGENT_ENABLE` — the AI page's Agent tier (OpenCode gateway). Default y,
+  depends on `CONFIG_WQN_AI_ENABLE`. When off, `opencode_session.cpp` /
+  `opencode_client.cpp` compile to refusing stubs and `NextAiTier` drops `kAgent`
+  from the tier ring, so the tier is unreachable rather than present and broken.
+  A *new* Kconfig symbol only reaches `sdkconfig.h` after a reconfigure — IDF does
+  not define a disabled bool symbol at all, so `#if CONFIG_WQN_AGENT_ENABLE`
+  silently evaluates to 0 until then.
 - `CONFIG_WQN_AI_AUDIO_SELFTEST_ENABLE` — capture a short mic sample at boot, print
   RMS/peak, never upload.
+- `CONFIG_WQN_DEV_MENU_ENABLE` — a settings row that opens the second-level read-only
+  dev list (Dev info / sync diagnostics / error log / raw battery / storage detail /
+  sleep diagnostics); structure fixed by
+  `firmware/wqn-zectrix-note4/DEV_DIAGNOSTICS.md`. Default n; error capture
+  (`wqn::RecordError`) is always compiled regardless of this flag.
 
 Defaults are **layered**: the root `CMakeLists.txt` appends both `sdkconfig.defaults`
 **and** `sdkconfig.ai-local.defaults` to `SDKCONFIG_DEFAULTS`. The `ai-local` profile
@@ -136,6 +148,16 @@ connectivity and sync snapshots and must not include ESP-IDF driver headers.
 **Transport and media** — control plane uses `/api/esp32/v3/*` and protocol header 3.
 AI SSE and `wqn-flash-v2` retain their existing wire layouts but use the common
 authentication/session/cancel lifecycle. Firmware never connects to Supabase directly.
+
+**Agent tier** — the AI page's third tier (`AiTier::kAgent`) replaced the retired
+**Pro** tier, which was only an `X-WQN-Ai-Tier: pro` header over the STD endpoint.
+Agent talks to `/api/esp32/agent/*`, which proxies a self-hosted OpenCode server
+bound to the user's account; the wire vocabulary is frozen in
+`firmware/wqn-zectrix-note4/contracts/agent-gateway-v0/`. `CONFIG_WQN_AGENT_ENABLE`
+(default y) gates it — when off, the two OpenCode translation units compile to
+refusing stubs and `NextAiTier` drops `kAgent` from the tier ring. The stream is
+terminated by `agent.status {status:"idle"}`; ending any other way is
+`stream_incomplete`, not success.
 
 ### Key runtime concepts
 

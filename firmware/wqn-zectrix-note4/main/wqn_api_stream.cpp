@@ -61,7 +61,7 @@ std::string BuildMacAddress()
   return std::string(buf);
 }
 
-void DispatchEvent(StreamContext* ctx, const wqn::SseFrameBuffer& frame,
+void DispatchEvent(StreamContext* ctx, const wqn::SseFrameBuffer& /*frame*/,
                    const std::string& event_name, uint64_t event_id,
                    const std::string& data_json)
 {
@@ -70,103 +70,14 @@ void DispatchEvent(StreamContext* ctx, const wqn::SseFrameBuffer& frame,
     return;
   }
   wqn::WqnAiSseEvent ev;
-  ev.event_id = event_id;
-  ev.raw_json = data_json;
-  cJSON* root = cJSON_ParseWithLength(data_json.c_str(), data_json.size());
-  if (root == nullptr) {
+  cJSON* root = nullptr;
+  if (!wqn::DecodeSseEvent(event_name, event_id, data_json, &ev, &root)) {
     ESP_LOGW(kTag, "SSE JSON parse failed: %s",
              data_json.size() > 80 ? "<large>" : data_json.c_str());
     return;
   }
 
-  const std::string ev_name = event_name;
-  using Kind = wqn::WqnAiSseEvent::Kind;
-  Kind k = Kind::kUnknown;
-  if      (ev_name == "ready")        k = Kind::kReady;
-  else if (ev_name == "stage")        k = Kind::kStage;
-  else if (ev_name == "asr.delta")    k = Kind::kAsrDelta;
-  else if (ev_name == "asr.complete") k = Kind::kAsrComplete;
-  else if (ev_name == "asr.failed")   k = Kind::kAsrFailed;
-  else if (ev_name == "thinking.start" || ev_name == "reasoning.start" ||
-           ev_name == "response.thinking.start" || ev_name == "response.reasoning.start")
-                                            k = Kind::kThinkingStart;
-  else if (ev_name == "thinking.delta" || ev_name == "reasoning.delta" ||
-           ev_name == "response.thinking.delta" || ev_name == "response.reasoning.delta" ||
-           ev_name == "response.reasoning_summary_text.delta")
-                                            k = Kind::kThinkingDelta;
-  else if (ev_name == "thinking.done" || ev_name == "thinking.end" ||
-           ev_name == "reasoning.done" || ev_name == "reasoning.end" ||
-           ev_name == "response.thinking.done" || ev_name == "response.reasoning.done" ||
-           ev_name == "response.reasoning_summary_text.done")
-                                            k = Kind::kThinkingDone;
-  else if (ev_name == "text.start")    k = Kind::kTextStart;
-  else if (ev_name == "text.delta")    k = Kind::kTextDelta;
-  else if (ev_name == "text.end")      k = Kind::kTextEnd;
-  else if (ev_name == "tool.start")    k = Kind::kToolStart;
-  else if (ev_name == "tool.result")   k = Kind::kToolResult;
-  else if (ev_name == "tool.error")    k = Kind::kToolError;
-  else if (ev_name == "state")         k = Kind::kState;
-  else if (ev_name == "turn.done" || ev_name == "response.done")
-                                            k = Kind::kTurnDone;
-  else if (ev_name == "error")         k = Kind::kError;
-  else if (ev_name == "final")         k = Kind::kFinal;
-  ev.kind = k;
-
-  // Now copy relevant fields.
-  cJSON* n = nullptr;
-
-  if ((n = cJSON_GetObjectItemCaseSensitive(root, "delta")) != nullptr && cJSON_IsString(n)) {
-    ev.delta = n->valuestring;
-  }
-  if ((n = cJSON_GetObjectItemCaseSensitive(root, "text")) != nullptr && cJSON_IsString(n)) {
-    ev.text = n->valuestring;
-  }
-  if ((n = cJSON_GetObjectItemCaseSensitive(root, "full_text")) != nullptr && cJSON_IsString(n)) {
-    ev.full_text = n->valuestring;
-  }
-  if ((n = cJSON_GetObjectItemCaseSensitive(root, "sentence_id")) != nullptr && cJSON_IsString(n)) {
-    ev.sentence_id = n->valuestring;
-  }
-  if ((n = cJSON_GetObjectItemCaseSensitive(root, "tool_call_id")) != nullptr && cJSON_IsString(n)) {
-    ev.tool_call_id = n->valuestring;
-  }
-  if ((n = cJSON_GetObjectItemCaseSensitive(root, "name")) != nullptr && cJSON_IsString(n)) {
-    ev.tool_name = n->valuestring;
-  }
-  if ((n = cJSON_GetObjectItemCaseSensitive(root, "display")) != nullptr && cJSON_IsString(n)) {
-    ev.tool_display = n->valuestring;
-  }
-  if ((n = cJSON_GetObjectItemCaseSensitive(root, "ok")) != nullptr && cJSON_IsBool(n)) {
-    ev.tool_ok = cJSON_IsTrue(n);
-  }
-  if ((n = cJSON_GetObjectItemCaseSensitive(root, "items_count")) != nullptr && cJSON_IsNumber(n)) {
-    ev.tool_items_count = n->valueint;
-  }
-  if ((n = cJSON_GetObjectItemCaseSensitive(root, "elapsed_ms")) != nullptr && cJSON_IsNumber(n)) {
-    ev.elapsed_ms = n->valueint;
-    ev.tool_elapsed_ms = n->valueint;
-  }
-  if ((n = cJSON_GetObjectItemCaseSensitive(root, "stage")) != nullptr && cJSON_IsString(n)) {
-    ev.stage = n->valuestring;
-  }
-  if ((n = cJSON_GetObjectItemCaseSensitive(root, "text_chars")) != nullptr && cJSON_IsNumber(n)) {
-    ev.text_chars = n->valueint;
-  }
-  if ((n = cJSON_GetObjectItemCaseSensitive(root, "error_code")) != nullptr && cJSON_IsString(n)) {
-    ev.error_code = n->valuestring;
-  }
-  if ((n = cJSON_GetObjectItemCaseSensitive(root, "message")) != nullptr && cJSON_IsString(n)) {
-    ev.error_message = n->valuestring;
-  }
-  if ((n = cJSON_GetObjectItemCaseSensitive(root, "stage")) != nullptr && cJSON_IsString(n) && k == wqn::WqnAiSseEvent::Kind::kError) {
-    ev.error_stage = n->valuestring;
-  }
-  if ((n = cJSON_GetObjectItemCaseSensitive(root, "conversation_id")) != nullptr && cJSON_IsString(n)) {
-    ev.conversation_id = n->valuestring;
-  }
-  if ((n = cJSON_GetObjectItemCaseSensitive(root, "latency_ms")) != nullptr && cJSON_IsNumber(n)) {
-    ev.latency_ms = n->valueint;
-  }
+  const auto k = ev.kind;
 
   // Snapshot conversation_id into the response (used by the final callback).
   if (!ev.conversation_id.empty() && ctx->response != nullptr) {
@@ -262,6 +173,35 @@ esp_err_t WriteRequestBody(esp_http_client_handle_t client,
   return ESP_OK;
 }
 
+// Sole authoritative capture point for the response status. It must be called
+// only after esp_http_client_fetch_headers() returns.
+//
+// Capturing from HTTP_EVENT_ON_HEADER cannot work: in IDF v5.5 the status code
+// is assigned in http_on_headers_complete (esp_http_client.c:289), i.e. *after*
+// http_on_header_event() dispatches the last ON_HEADER (:288), and
+// http_on_status is a no-op (:237). fetch_headers() additionally resets
+// status_code to -1 on entry (:1565), so every ON_HEADER callback observes
+// -1 - latching it there (as this code once did) permanently suppressed the
+// 4xx/5xx check.
+void CaptureHttpStatus(StreamContext* ctx, esp_http_client_handle_t client)
+{
+  if (ctx == nullptr || client == nullptr || ctx->http_status > 0) {
+    return;
+  }
+  const int status = esp_http_client_get_status_code(client);
+  // A non-positive value means "not parsed yet", not "no status". Never latch
+  // it, or every later check is suppressed.
+  if (status <= 0) {
+    return;
+  }
+  ctx->http_status = status;
+  ESP_LOGI(kTag, "HTTP status=%d", status);
+  if (status >= 400) {
+    ctx->fatal = true;
+    ctx->error_code = wqn::internal::AiStreamHttpErrorCode(status);
+  }
+}
+
 esp_err_t OnHttpEvent(esp_http_client_event_t* evt)
 {
   StreamContext* ctx = static_cast<StreamContext*>(evt->user_data);
@@ -272,17 +212,9 @@ esp_err_t OnHttpEvent(esp_http_client_event_t* evt)
     }
     case HTTP_EVENT_ON_HEADER: {
       // ESP-IDF v5.4+ removed HTTP_EVENT_HEADERS_RECEIVED in favour of
-      // HTTP_EVENT_ON_HEADER which fires once per header line. We only care
-      // about the status code, so grab it on the first header and ignore the
-      // rest. Subsequent header events fall through to the parser unchanged.
-      if (ctx->http_status == 0) {
-        ctx->http_status = esp_http_client_get_status_code(evt->client);
-        ESP_LOGI(kTag, "HTTP status=%d", ctx->http_status);
-        if (ctx->http_status >= 400) {
-          ctx->fatal = true;
-          ctx->error_code = wqn::internal::AiStreamHttpErrorCode(ctx->http_status);
-        }
-      }
+      // HTTP_EVENT_ON_HEADER, which fires once per header line. The status
+      // code is deliberately not read here: it is still -1 at every ON_HEADER
+      // (see CaptureHttpStatus). Fall through unchanged.
       break;
     }
     case HTTP_EVENT_ON_DATA: {
@@ -290,7 +222,16 @@ esp_err_t OnHttpEvent(esp_http_client_event_t* evt)
         // discard the body of an error response; we'll surface the code shortly
         return ESP_OK;
       }
-      ctx->parser.feed(static_cast<const char*>(evt->data), evt->data_len);
+      if (!ctx->parser.feed(static_cast<const char*>(evt->data), evt->data_len)) {
+        // A frame past the device's JSON budget cannot be parsed even when
+        // complete, so the stream is broken rather than missing a frame.
+        if (!ctx->fatal) {
+          ctx->fatal = true;
+          ctx->error_code = "frame_overflow";
+          ctx->error_message = "stream frame exceeded the device limit";
+        }
+        return ESP_OK;
+      }
       std::string ev_name;
       uint64_t ev_id = 0;
       std::string ev_data;
@@ -367,13 +308,14 @@ esp_err_t UploadAiAudioChatStream(const WqnAiStreamRequest& request,
   if (!wqn::IsValidAccessToken(request.token)) {
     return ESP_ERR_INVALID_STATE;
   }
-  if (request.pcm.empty() || request.duration_ms <= 0) {
+  if (request.pcm_data == nullptr || request.pcm_sample_count == 0 ||
+      request.duration_ms <= 0) {
     return ESP_ERR_INVALID_ARG;
   }
 
   const uint8_t* pcm_bytes =
-      reinterpret_cast<const uint8_t*>(request.pcm.data());
-  const size_t pcm_size = request.pcm.size() * sizeof(int16_t);
+      reinterpret_cast<const uint8_t*>(request.pcm_data);
+  const size_t pcm_size = request.pcm_sample_count * sizeof(int16_t);
 
   // Build the URL with the protocol query so v2 servers unambiguously switch.
   std::string url = std::string(WQN_API_BASE) + WQN_AI_SSE_REQUEST_PATH +
@@ -438,11 +380,21 @@ esp_err_t UploadAiAudioChatStream(const WqnAiStreamRequest& request,
   }
 
   if (err == ESP_OK) {
-    // fetch_headers returns the response Content-Length (which may be a
-    // positive byte count), not esp_err_t. Treat every non-negative value as
-    // success so a buffered/non-chunked SSE response is still consumed.
+    // fetch_headers returns the response Content-Length (0 for a chunked SSE
+    // response), not esp_err_t. Treat every non-negative value as success so a
+    // buffered/non-chunked SSE response is still consumed.
     const int64_t header_result = esp_http_client_fetch_headers(client);
+    // Capture unconditionally: a failed fetch can still leave a parsed status
+    // behind, and a missed 4xx/5xx would otherwise surface as a generic
+    // transport error instead of its mapped error_code.
+    CaptureHttpStatus(&ctx, client);
     err = header_result < 0 ? ESP_FAIL : ESP_OK;
+    if (err == ESP_OK && ctx.http_status <= 0) {
+      ctx.fatal = true;
+      ctx.error_code = "bad_response";
+      ctx.error_message = "HTTP response status unavailable";
+      err = ESP_FAIL;
+    }
   }
   if (err == ESP_OK) {
     // Pull the chunked stream until close.

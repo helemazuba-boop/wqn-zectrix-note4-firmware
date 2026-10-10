@@ -16,11 +16,10 @@ namespace {
 constexpr char kTag[] = "storage_service";
 constexpr UBaseType_t kBackgroundQueueDepth = 8;
 constexpr UBaseType_t kForegroundQueueDepth = 4;
-// ESP-IDF's ROM miniz test alone requires an 8 KiB task stack. WQPC runs it
-// below the storage transaction, SPIFFS and C++ serialization call chains, and
-// the first COM7 HIL run proved that 8 KiB overflows. A second HIL run measured
-// only 3296 bytes free at 16 KiB, below the 4 KiB safety floor, so retain the
-// measured production call chain plus explicit bounded headroom.
+// The storage transaction call chain includes SPIFFS, pack compression checks
+// and C++ serialization. The first COM7 HIL run proved that 8 KiB overflows; a
+// second HIL run measured only 3296 bytes free at 16 KiB, below the 4 KiB safety
+// floor, so retain the measured production call chain plus explicit headroom.
 constexpr uint32_t kTaskStackBytes = 20 * 1024;
 constexpr UBaseType_t kStackWarningBytes = 4 * 1024;
 constexpr UBaseType_t kTaskPriority = 6;
@@ -175,6 +174,12 @@ void StorageServiceTask(void*)
         completion->result = result;
         completion->state.store(kCompletionDone, std::memory_order_release);
         xSemaphoreGive(completion->semaphore);
+        // [watchdog] SPIFFS lookups are CPU-bound directory scans that never
+        // block, so a boot scan or pack-sync burst runs back-to-back
+        // transactions for longer than the 5 s IDLE0 window and task_wdt
+        // aborts the device (20260926.5 boot loop). Yield one tick per
+        // transaction so the idle task always gets a slot.
+        vTaskDelay(1);
     }
 }
 

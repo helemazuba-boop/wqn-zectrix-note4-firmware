@@ -1,4 +1,5 @@
 #include "display_service.h"
+#include "ssd2683_gray16_waveform.h"
 
 #include <algorithm>
 #include <atomic>
@@ -40,7 +41,18 @@ constexpr gpio_num_t kEpdSck = GPIO_NUM_12;
 constexpr gpio_num_t kEpdMosi = GPIO_NUM_13;
 constexpr spi_host_device_t kEpdSpiHost = SPI3_HOST;
 
-constexpr int kSpiClockHz = 40 * 1000 * 1000;
+// [epd-spi-fix] SSD2683 datasheet Table 12-1: tSCYCW (write) = 50 ns, i.e.
+// 20 MHz maximum, and the text states a 20 MHz maximum SPI write speed. The
+// previous 40 MHz was 2x the rated limit. A timing violation like this is
+// marginal -- it only shows up under disturbance -- which fits a fault that
+// reproduces on battery but never on the bench.
+constexpr int kSpiWriteClockHz = 20 * 1000 * 1000;
+// tSCYCL (read) = 400 ns, i.e. 2.5 MHz maximum. Take 2 MHz: RecvData() reads
+// a single byte per full refresh, so the 20% margin costs nothing measurable.
+// (The waveform figures label the read cycle tSCYCR instead of tSCYCL -- same
+// timing.) The vendor demo's 8 MHz (zectrix_epd.cc:120) is itself over the
+// datasheet limit and must not be copied back.
+constexpr int kSpiReadClockHz = 2 * 1000 * 1000;
 // [hang-fix] Full-refresh DRF waveform completion wait. Healthy full
 // refreshes complete in 2-3 s across HIL sessions; the old 30 s budget only
 // stretched the stall (with the EPD operation mutex held) when the panel was
@@ -57,6 +69,13 @@ constexpr int kCommandBusyTimeoutMs = 5000;
 // lengthens the stall before the automatic full-refresh recovery kicks in.
 constexpr int kPartialRefreshBusyTimeoutMs = 1500;
 constexpr int kPartialCommandBusyTimeoutMs = 1500;
+// [epd-lag-fix] Per-attempt budget for the local-partial status probe. This is
+// a "is the controller awake yet" poll, not a data transfer, and the HIL record
+// above says a healthy panel answers in <=800 ms while a wedged one never
+// answers at all. Deliberately NOT a change to kPartialCommandBusyTimeoutMs:
+// that constant has four other users (all post-0x10 command-ready waits) and
+// shrinking it would quietly retime all of them.
+constexpr int kPanelStatusProbeTimeoutMs = 800;
 constexpr int kLocalPartialMaxHeight = 170;
 // [epd-health] SSDs (SSD1683 / WaveShare 4.2") accumulate DC bias after
 // consecutive partial refreshes; without interleaving full refreshes the
@@ -64,14 +83,14 @@ constexpr int kLocalPartialMaxHeight = 170;
 // and the only recovery is a full refresh (~2-3s), which the user feels as
 // a hard freeze. Forcing a full refresh every N partials is far less
 // disruptive than letting the panel stall in the middle of a UI flow.
-// [epd-tune] Bumped from 6 to 20 after observing SSD1683 stayed clean
-// through 10+ consecutive partial refreshes (UI smoke tests with a 10s
-// countdown). The timer-page once-per-second tick used to hit the old 6
-// threshold every 7s, producing a visible flash in the middle of a running
-// timer. 20 covers a 21-second timer run window without forcing a full
-// refresh, and a 6-min countdown still gets an interleaved full refresh
-// every 21 partials.
-constexpr uint32_t kMaxPartialRefreshesBeforeFull = 20;
+// [epd-tune] Tiny diffs such as the clock/timer alter well below 1% of the
+// framebuffer. Counting them exactly like a large list-row update forced a
+// 1.2 s full refresh after 20 minute ticks even when the final diff was only
+// ~0.36%. Keep a high absolute backstop for tiny updates; the independent
+// heavy-partial counter below still forces cleanup before measured drift.
+// At this cap a one-second timer gets a safety full roughly every four
+// minutes, while a once-per-minute clock does not flash for routine cleanup.
+constexpr uint32_t kMaxPartialRefreshesBeforeFull = 240;
 // Heavy partials (large diffs: list-row highlight flips ~17%, body scrolls
 // ~5-6%) stress the panel far more than a timer's once-per-second tick
 // (~0.02%). Field logs show the panel drifting from the framebuffer (stale
@@ -84,7 +103,15 @@ constexpr float kHeavyPartialDiffRatio = 0.02f;
 constexpr uint32_t kMaxHeavyPartialsBeforeFull = 10;
 // Run the deferred cleanup full refresh at idle once at least this many heavy
 // partials accumulated since the last full.
-constexpr uint32_t kIdleCleanupHeavyPartials = 2;
+constexpr uint32_t kIdleCleanupHeavyPartials = 6;
+// [epd-health] Second, independent idle-cleanup trigger, on the plain partial
+// counter. The heavy counter above never moves on a clock/timer screen: those
+// diffs sit under kHeavyPartialDiffRatio, so g_heavy_partials_since_full stays
+// at 0 and IdleCleanupPending() was never true no matter how long the device
+// ran -- the only backstop left was kMaxPartialRefreshesBeforeFull, i.e. four
+// hours of one-per-minute ticks. 24 lets a long-running idle screen shed DC
+// bias roughly every 24 minutes instead.
+constexpr uint32_t kIdleCleanupFramePartials = 24;
 constexpr int kTextGlyphWidth = 5;
 constexpr int kTextGlyphHeight = 7;
 constexpr int kTextCellWidth = 6;
@@ -110,6 +137,21 @@ bool g_bus_initialized = false;
 bool g_initialized = false;
 bool g_epd_rail_powered = false;
 bool g_epd_powered = false;
+// [epd-bias-fix] Tracks the SSD2683 internal booster, split out of
+// g_epd_powered. g_epd_powered now means only "the panel is initialized and
+// the previous-frame diff is still valid"; this one means "0x04 PON has been
+// issued and 0x02 POF has not undone it". The datasheet pairs the two
+// ("POF works at PON only", "PON Include booster on"), so any path that
+// issues 0x02 must leave this false or the next refresh skips PON and drives
+// 0x12 with the booster down.
+// When in doubt, clear: a spurious re-PON only costs the default BTST time
+// (>80 ms), while a wrongly-set flag drives a waveform with no booster.
+// [epd-latency-fix] Kept after the per-partial discharge was reverted. Every
+// path that currently issues 0x02 also clears g_epd_powered, so this flag is
+// no longer load-bearing on the happy path -- it is the sequencing guarantee
+// for the case where PowerOffEpd() bails out AFTER 0x02 has already been
+// clocked out, leaving g_epd_powered true with the booster already down.
+bool g_epd_booster_on = false;
 bool g_previous_framebuffer_synced = false;
 bool g_hot_refresh_ok = false;
 uint32_t g_partial_refreshes_since_full = 0;
@@ -131,6 +173,43 @@ int64_t g_last_epd_refresh_us = 0;
 std::atomic<int64_t> g_last_epd_activity_ms{0};
 std::atomic<uint32_t> g_epd_activity_generation{0};
 std::atomic<bool> g_epd_idle_cut{false};
+// [epd-health] One-shot-per-idle-period notice that the cleanup full refresh is
+// owed but its own deadline has not elapsed yet. Without it the log cannot tell
+// "no debt" from "debt waiting for WQN_EPD_IDLE_CLEANUP_MS". Cleared by
+// NoteEpdActivity, i.e. once per idle period at most one line is emitted.
+std::atomic<bool> g_epd_cleanup_deferred_logged{false};
+
+// [epd-waveform-gate] True while the panel is driving a refresh waveform: from
+// the 0x12 display-update command until BUSY releases. Sleep prep must never
+// cut the rail in that window. EpdOperationGuard is a RECURSIVE mutex, so a
+// power-off raised on the EPD owner task re-enters it immediately and would
+// tear the panel down mid-waveform (half-driven frame, wedged BUSY line, and a
+// forced full-refresh recovery the user sees as a freeze). The mutex must stay
+// recursive -- the refresh path itself legitimately re-enters it
+// (RefreshEpdFull -> TriggerDisplayUpdate -> PowerOffEpd) -- so the window is
+// tracked with an explicit flag instead.
+std::atomic<bool> g_epd_waveform_active{false};
+
+// Holds the waveform flag for a scope so every exit path clears it, including
+// the DropEpdHotState early returns. A flag stuck true would block deep sleep
+// until the cell runs flat.
+struct EpdWaveformScope {
+    EpdWaveformScope()
+    {
+        g_epd_waveform_active.store(true, std::memory_order_release);
+    }
+    ~EpdWaveformScope()
+    {
+        g_epd_waveform_active.store(false, std::memory_order_release);
+    }
+    EpdWaveformScope(const EpdWaveformScope&) = delete;
+    EpdWaveformScope& operator=(const EpdWaveformScope&) = delete;
+};
+
+bool EpdWaveformActive()
+{
+    return g_epd_waveform_active.load(std::memory_order_acquire);
+}
 
 // [power-fix] Persisted across deep-sleep resets so the EPD refresh task
 // can skip redundant panel updates after an RTC-timer wakeup.  Without this,
@@ -373,18 +452,54 @@ esp_err_t SendData(uint8_t data)
     return ret;
 }
 
+// [gray16-dma-fix] ESP32-S3 SPI DMA cannot address Flash DROM, while the
+// 16-gray waveform table is constexpr and lives in .rodata. Copy every send
+// larger than the transaction's inline storage into internal DMA-capable SRAM
+// before transmitting, matching the reference demo's Transmit path.
+constexpr size_t kSpiDmaBounceSize = 1024;
+uint8_t* g_spi_dma_bounce = nullptr;
+
+esp_err_t EnsureSpiDmaBounce()
+{
+    if (g_spi_dma_bounce == nullptr) {
+        g_spi_dma_bounce = static_cast<uint8_t*>(heap_caps_malloc(
+            kSpiDmaBounceSize, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
+        if (g_spi_dma_bounce == nullptr) {
+            ESP_LOGE(kTag, "alloc SPI DMA bounce buffer failed");
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    return ESP_OK;
+}
+
 esp_err_t WriteBytes(const uint8_t* data, size_t len)
 {
     if (len == 0) {
         return ESP_OK;
     }
+    ESP_RETURN_ON_ERROR(EnsureSpiDmaBounce(), kTag, "SPI DMA bounce buffer");
 
     SetDc(true);
     SetCs(false);
-    spi_transaction_t transaction = {};
-    transaction.length = len * 8;
-    transaction.tx_buffer = data;
-    const esp_err_t ret = spi_device_polling_transmit(g_spi, &transaction);
+    esp_err_t ret = ESP_OK;
+    size_t offset = 0;
+    while (offset < len) {
+        const size_t chunk = std::min(len - offset, kSpiDmaBounceSize);
+        spi_transaction_t transaction = {};
+        transaction.length = chunk * 8;
+        if (chunk <= sizeof(transaction.tx_data)) {
+            transaction.flags = SPI_TRANS_USE_TXDATA;
+            std::memcpy(transaction.tx_data, data + offset, chunk);
+        } else {
+            std::memcpy(g_spi_dma_bounce, data + offset, chunk);
+            transaction.tx_buffer = g_spi_dma_bounce;
+        }
+        ret = spi_device_polling_transmit(g_spi, &transaction);
+        if (ret != ESP_OK) {
+            break;
+        }
+        offset += chunk;
+    }
     SetCs(true);
     return ret;
 }
@@ -421,7 +536,7 @@ esp_err_t InitSpiBus(bool rx_mode)
 
     spi_device_interface_config_t device_config = {};
     device_config.spics_io_num = -1;
-    device_config.clock_speed_hz = rx_mode ? 8 * 1000 * 1000 : kSpiClockHz;
+    device_config.clock_speed_hz = rx_mode ? kSpiReadClockHz : kSpiWriteClockHz;
     device_config.mode = 0;
     device_config.queue_size = 1;
 
@@ -506,15 +621,35 @@ void FreeFramebuffer(uint8_t*& fb)
 
 void PowerOnEpd()
 {
-    // [epd-leak-fix] Release hold on SPI pins before driving the rail up.
-    // PowerOffEpd() holds kEpd{Sck,Mosi,Cs,Dc,Reset} low to block diode
-    // backflow into the de-powered EPD module. That hold survives deep sleep,
-    // so on the next refresh we must explicitly release it or the panel
-    // remains hardware-reset and SPI never reaches the controller.
-    constexpr gpio_num_t kSpiPins[] = {kEpdSck, kEpdMosi, kEpdCs, kEpdDc, kEpdReset};
-    for (gpio_num_t pin : kSpiPins) {
+    // [epd-leak-fix] Release hold on EPD pins before driving the rail up.
+    constexpr gpio_num_t kPinsToRelease[] = {kEpdSck, kEpdMosi, kEpdCs, kEpdDc, kEpdReset, kEpdBusy};
+    for (gpio_num_t pin : kPinsToRelease) {
         gpio_hold_dis(pin);
     }
+
+    // Restore GPIO configuration for EPD pins (excluding pull-ups/modes of kEpdPower)
+    gpio_config_t outputs = {};
+    outputs.intr_type = GPIO_INTR_DISABLE;
+    outputs.mode = GPIO_MODE_OUTPUT;
+    outputs.pin_bit_mask = (1ULL << kEpdReset) | (1ULL << kEpdDc) | (1ULL << kEpdCs);
+    outputs.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    outputs.pull_up_en = GPIO_PULLUP_ENABLE;
+    gpio_config(&outputs);
+
+    gpio_config_t busy = {};
+    busy.intr_type = GPIO_INTR_DISABLE;
+    busy.mode = GPIO_MODE_INPUT;
+    busy.pin_bit_mask = (1ULL << kEpdBusy);
+    busy.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    busy.pull_up_en = GPIO_PULLUP_ENABLE;
+    gpio_config(&busy);
+
+    SetCs(true);
+    SetDc(true);
+    SetReset(true);
+
+    // Re-initialize SPI bus configurations to restore SPI pins
+    InitSpiBus(false);
 
     gpio_hold_dis(kEpdPower);
     gpio_set_level(kEpdPower, 1);
@@ -531,20 +666,23 @@ void DropEpdHotState(bool cut_rail, bool invalidate_framebuffer)
         g_epd_rail_powered = false;
     }
     g_epd_powered = false;
+    g_epd_booster_on = false;
     if (invalidate_framebuffer) {
         g_previous_framebuffer_synced = false;
         g_partial_refreshes_since_full = 0;
         g_heavy_partials_since_full = 0;
         g_last_partial_was_full_frame = false;
+        g_last_epd_refresh_us = 0;
     }
     g_hot_refresh_ok = false;
-    g_last_epd_refresh_us = 0;
 }
 
 esp_err_t InitPanelSequence()
 {
     PowerOnEpd();
     g_epd_powered = false;
+    // A hardware reset clears the controller back to POR, booster included.
+    g_epd_booster_on = false;
     vTaskDelay(pdMS_TO_TICKS(10));
     SetReset(true);
     vTaskDelay(pdMS_TO_TICKS(10));
@@ -752,13 +890,21 @@ esp_err_t WaitPartialCooldown()
     return ESP_OK;
 }
 
-esp_err_t WaitPanelStatusReady(int max_retries)
+// [epd-temp-fix] Load-bearing side effect: despite the name, the payload is the
+// 0xE0/0x00 above, which is what resets CCSET A[1]=TSFIX to the internal sensor
+// on the windowed local-partial path. PreparePanelForLocalPartialWrite() only
+// sends 0x50/0x77 and waits for the cooldown. If this call is ever removed from
+// SendDirtyRectToPanel(), the 0xE0/0x00 must move into
+// PreparePanelForLocalPartialWrite() first, or windowed partials will keep
+// driving their waveform from a stale manual temperature -- P0-B returning via
+// the path that stage 2a did not cover.
+esp_err_t WaitPanelStatusReady(int max_retries, int busy_timeout_ms)
 {
     for (int i = 0; i < max_retries; ++i) {
         ESP_RETURN_ON_ERROR(SendCommand(0xE0), kTag, "EPD status check cmd");
         ESP_RETURN_ON_ERROR(SendData(0x00), kTag, "EPD status check data");
         ESP_RETURN_ON_ERROR(SendCommand(0xA5), kTag, "EPD status probe cmd");
-        const esp_err_t busy_ret = WaitBusyTimeout(kPartialCommandBusyTimeoutMs);
+        const esp_err_t busy_ret = WaitBusyTimeout(busy_timeout_ms);
         if (busy_ret == ESP_OK) {
             vTaskDelay(pdMS_TO_TICKS(1));
             return ESP_OK;
@@ -784,7 +930,16 @@ esp_err_t TriggerDisplayUpdate(bool is_partial, bool keep_powered)
     if (!g_epd_rail_powered) {
         PowerOnEpd();
     }
-    if (!g_epd_powered) {
+    // [epd-latency-fix] Partials deliberately do not discharge the booster
+    // (see the tail of this function), so during a burst of partials this is
+    // false and the waveform starts at 0x12 directly -- that is the ~320 ms
+    // per refresh this series recovers. PON is now only paid after a real
+    // discharge: full refresh, gray16 internal power-off, idle rail cut, or
+    // hardware reset.
+    // The second term is g_epd_booster_on because it tracks 0x02 independently
+    // of g_epd_powered: if PowerOffEpd() bails out after 0x02 was clocked out,
+    // g_epd_powered can still read true while the booster is already down.
+    if (!g_epd_powered || !g_epd_booster_on) {
         esp_err_t ret = SendCommand(0x04);
         if (ret != ESP_OK) {
             DropEpdHotState(true, true);
@@ -797,18 +952,26 @@ esp_err_t TriggerDisplayUpdate(bool is_partial, bool keep_powered)
             return ret;
         }
         g_epd_powered = true;
+        g_epd_booster_on = true;
     }
-    esp_err_t ret = SendCommand(0x12);
-    if (ret != ESP_OK) {
-        DropEpdHotState(true, true);
-        return ret;
+    // [epd-waveform-gate] Every waveform path funnels through here (the local
+    // partial path ends in TriggerDisplayUpdate too), so this is the only place
+    // the flag has to be set.
+    esp_err_t refresh_ret = ESP_OK;
+    {
+        EpdWaveformScope waveform;
+        esp_err_t ret = SendCommand(0x12);
+        if (ret != ESP_OK) {
+            DropEpdHotState(true, true);
+            return ret;
+        }
+        ret = SendData(0x00);
+        if (ret != ESP_OK) {
+            DropEpdHotState(true, true);
+            return ret;
+        }
+        refresh_ret = WaitBusyTimeout(is_partial ? kPartialRefreshBusyTimeoutMs : kBusyTimeoutMs);
     }
-    ret = SendData(0x00);
-    if (ret != ESP_OK) {
-        DropEpdHotState(true, true);
-        return ret;
-    }
-    const esp_err_t refresh_ret = WaitBusyTimeout(is_partial ? kPartialRefreshBusyTimeoutMs : kBusyTimeoutMs);
     if (refresh_ret != ESP_OK) {
         ESP_LOGW(kTag, "EPD %s refresh timed out; dropping hot refresh state", is_partial ? "partial" : "full");
         DropEpdHotState(true, true);
@@ -819,9 +982,25 @@ esp_err_t TriggerDisplayUpdate(bool is_partial, bool keep_powered)
     if (!is_partial && !keep_powered) {
         ESP_RETURN_ON_ERROR(SendCommand(0x02), kTag, "EPD power off command");
         ESP_RETURN_ON_ERROR(SendData(0x00), kTag, "EPD power off data");
+        // Clear here rather than after the wait, and rather than relying on
+        // PowerOffEpd(): it can return early when the operation mutex is
+        // unavailable, which would leave the flag set after 0x02 was already
+        // sent.
+        g_epd_booster_on = false;
         ESP_RETURN_ON_ERROR(WaitBusy(), kTag, "wait EPD power off command");
         PowerOffEpd();
     }
+    // [epd-latency-fix] No else-branch: partial refreshes deliberately keep the
+    // booster up. Discharging it here cost POF (~120 ms) plus a re-PON
+    // (~200 ms) on EVERY partial -- 530 ms -> 868 ms -- which pushed a refresh
+    // past the ~600-800 ms double-tap interval and turned a linear cost into
+    // 1.6-3.2 s of queued frames.
+    // The discharge still happens, just not per refresh: a full refresh
+    // (kMaxPartialRefreshesBeforeFull = 240, or the idle cleanup at
+    // kIdleCleanupFramePartials = 24) reaches the branch above and cuts the
+    // rail, and any >= CONFIG_WQN_EPD_IDLE_POWER_OFF_MS (5000) pause cuts it
+    // too. So the booster-up interval is bounded, not unbounded: the worst
+    // case is a sustained interaction burst, roughly 240 partials.
     return ESP_OK;
 }
 
@@ -1042,6 +1221,51 @@ void DrawGlyphFromFont(int x, int y, const lv_font_t* font, uint32_t codepoint, 
     }
 }
 
+void DrawGlyphFromFontScaled(
+    int x,
+    int y,
+    const lv_font_t* font,
+    uint32_t codepoint,
+    uint8_t scale,
+    bool black)
+{
+    if (scale <= 1) {
+        DrawGlyphFromFont(x, y, font, codepoint, black);
+        return;
+    }
+    if (font == nullptr) {
+        return;
+    }
+    const lv_font_fmt_txt_dsc_t* font_dsc = font->dsc;
+    const lv_font_fmt_txt_glyph_dsc_t* glyph = FindGlyphInFont(font, codepoint);
+    if (font_dsc == nullptr || glyph == nullptr || glyph->box_w == 0 || glyph->box_h == 0) {
+        return;
+    }
+
+    const uint8_t* bitmap = &font_dsc->glyph_bitmap[glyph->bitmap_index];
+    const int draw_x = x + glyph->ofs_x * scale;
+    const int draw_y = y +
+        ((font->line_height - font->base_line) - glyph->box_h - glyph->ofs_y) * scale;
+    int bit_index = 0;
+    for (int row = 0; row < glyph->box_h; ++row) {
+        for (int col = 0; col < glyph->box_w; ++col, ++bit_index) {
+            const uint8_t byte = bitmap[bit_index >> 3];
+            const uint8_t mask = static_cast<uint8_t>(0x80U >> (bit_index & 0x07));
+            if ((byte & mask) == 0) {
+                continue;
+            }
+            for (uint8_t yy = 0; yy < scale; ++yy) {
+                for (uint8_t xx = 0; xx < scale; ++xx) {
+                    DrawEpdPixel(
+                        draw_x + col * scale + xx,
+                        draw_y + row * scale + yy,
+                        black);
+                }
+            }
+        }
+    }
+}
+
 void DrawCjkGlyph(int x, int y, uint32_t codepoint, bool black)
 {
     DrawGlyphFromFont(x, y, &SourceHanSansSC_Regular_slim, codepoint, black);
@@ -1082,6 +1306,12 @@ esp_err_t InitEpdDisplay()
     ESP_RETURN_ON_ERROR(InitPanelSequence(), kTag, "init EPD panel");
     g_initialized = true;
     return ESP_OK;
+}
+
+bool IsEpdFramebufferSynchronized()
+{
+    EpdOperationGuard operation(portMAX_DELAY);
+    return operation.locked() && g_previous_framebuffer_synced;
 }
 
 void ClearEpdFramebuffer(bool white)
@@ -1156,6 +1386,11 @@ esp_err_t DrawUtf8Text(int x, int y, const char* text, bool black)
         cursor_x += glyph_width;
     }
     return ESP_OK;
+}
+
+const lv_font_t* PrimaryUiFont()
+{
+    return &SourceHanSansSC_Regular_slim;
 }
 
 int MeasureUtf8TextWidth(const char* text)
@@ -1263,6 +1498,45 @@ void DrawTextWithFontCentered(int x, int y, int width, const lv_font_t* font, co
     const int text_width = MeasureTextWithFont(font, text);
     const int draw_x = x + std::max(0, (width - text_width) / 2);
     DrawTextWithFont(draw_x, y, font, text, black);
+}
+
+void DrawTextWithFontScaledCentered(
+    int x,
+    int y,
+    int width,
+    const lv_font_t* font,
+    const char* text,
+    uint8_t scale,
+    bool black)
+{
+    if (font == nullptr || text == nullptr || scale == 0) {
+        return;
+    }
+    const int text_width = MeasureTextWithFont(font, text) * scale;
+    int cursor_x = x + std::max(0, (width - text_width) / 2);
+    int cursor_y = y;
+    const char* cursor = text;
+    while (*cursor != '\0') {
+        uint32_t codepoint = 0;
+        const char* before = cursor;
+        if (!DecodeUtf8(cursor, &codepoint) || cursor == before) {
+            break;
+        }
+        if (codepoint == '\r') {
+            continue;
+        }
+        if (codepoint == '\n') {
+            cursor_y += font->line_height * scale;
+            cursor_x = x;
+            continue;
+        }
+        const int glyph_width = MeasureGlyphWidthInFont(font, codepoint) * scale;
+        if (cursor_x + glyph_width > x + width || cursor_x + glyph_width > kEpdWidth) {
+            break;
+        }
+        DrawGlyphFromFontScaled(cursor_x, cursor_y, font, codepoint, scale, black);
+        cursor_x += glyph_width;
+    }
 }
 
 std::string TruncateUtf8TextToWidth(const std::string& text, int max_width_px)
@@ -1377,6 +1651,20 @@ esp_err_t PreparePanelForFramebufferWrite()
 
 esp_err_t PreparePanelForHotFramebufferWrite()
 {
+    // [epd-temp-fix] Reset the temperature input source to the internal sensor
+    // before every full-frame partial. The full-refresh prelude
+    // (PreparePanelForFramebufferWrite) sets CCSET A[1]=TSFIX=1 to apply a
+    // manually measured VCOM and never clears it, so without this each
+    // following full-frame partial drives its waveform from a STALE manual
+    // temperature. The windowed local-partial path already gets this from
+    // WaitPanelStatusReady():0xE0/0x00; mirror that, plus the same 0x50/0x77
+    // CDI prelude both other preludes and the vendor partial path send.
+    ESP_RETURN_ON_ERROR(SendCommand(0x50), kTag, "EPD hot partial display setting");
+    ESP_RETURN_ON_ERROR(SendData(0x77), kTag, "EPD hot partial display setting data");
+    ESP_RETURN_ON_ERROR(SendCommand(0xE0), kTag, "EPD hot CCSET (temperature input select)");
+    ESP_RETURN_ON_ERROR(SendData(0x00), kTag, "EPD hot CCSET: TSFIX=0 use internal sensor");
+    vTaskDelay(pdMS_TO_TICKS(10));
+
     ESP_RETURN_ON_ERROR(SendCommand(0x10), kTag, "EPD hot DTM1 write");
     ESP_RETURN_ON_ERROR(WaitBusyTimeout(kPartialCommandBusyTimeoutMs), kTag, "wait EPD hot RAM command");
     return ESP_OK;
@@ -1485,7 +1773,12 @@ esp_err_t SendDirtyRectToPanel(const DirtyRect& rect)
     }
 
     ESP_RETURN_ON_ERROR(PreparePanelForLocalPartialWrite(), kTag, "prepare EPD local partial write");
-    ESP_RETURN_ON_ERROR(WaitPanelStatusReady(3), kTag, "EPD panel status not ready for local partial");
+    // [epd-lag-fix] Was (3, kPartialCommandBusyTimeoutMs) = a 4.5 s worst case
+    // that froze the UI task. One attempt at 800 ms: the HIL record says a
+    // wedged panel never recovers within the old window either, so the extra
+    // retries only bought stall time before the fallback full refresh.
+    ESP_RETURN_ON_ERROR(WaitPanelStatusReady(1, kPanelStatusProbeTimeoutMs), kTag,
+                        "EPD panel status not ready for local partial");
     ESP_RETURN_ON_ERROR(SetPartialWindow(aligned), kTag, "set EPD partial window");
     ESP_RETURN_ON_ERROR(SendCommand(0x10), kTag, "EPD partial DTM1 write");
     ESP_RETURN_ON_ERROR(WaitBusyTimeout(kPartialCommandBusyTimeoutMs), kTag, "wait EPD partial RAM command");
@@ -1637,9 +1930,12 @@ esp_err_t RefreshEpdFull(bool allow_local_partial, bool force_full_refresh)
     std::memcpy(g_previous_framebuffer, g_framebuffer, kEpdFramebufferSize);
     g_previous_framebuffer_synced = true;
     g_partial_refreshes_since_full = full_refresh ? 0 : g_partial_refreshes_since_full + 1;
+    // A full-frame partial drives the partial waveform over the whole panel;
+    // sparse changed pixels do not make that electrical stress local.
     g_heavy_partials_since_full = full_refresh
         ? 0
-        : g_heavy_partials_since_full + (diff_ratio >= kHeavyPartialDiffRatio ? 1 : 0);
+        : g_heavy_partials_since_full +
+            ((!local_partial || diff_ratio >= kHeavyPartialDiffRatio) ? 1 : 0);
     g_last_partial_was_full_frame = !full_refresh && !local_partial;
     // [power-fix] Record the CRC so deep-sleep wakeups can skip the next
     // refresh if the frame content hasn't changed.
@@ -1680,15 +1976,33 @@ static void PowerOffEpd()
 
     DropEpdHotState(true, false);
 
-    // [epd-leak-fix] Spec book §5.3 step 3: reconfigure SPI pins to low-output
-    // or high-impedance after the rail drops, to prevent diode backflow into
-    // the de-powered EPD module. gpio_hold_en keeps them there through deep sleep.
-    constexpr gpio_num_t kSpiPins[] = {kEpdSck, kEpdMosi, kEpdCs, kEpdDc, kEpdReset};
-    for (gpio_num_t pin : kSpiPins) {
+    // [epd-leak-fix] Reconfigure SPI pins to GPIO mode and drive them low to
+    // prevent diode backflow into the de-powered EPD module.
+    gpio_config_t out_cfg = {};
+    out_cfg.intr_type = GPIO_INTR_DISABLE;
+    out_cfg.mode = GPIO_MODE_OUTPUT;
+    out_cfg.pin_bit_mask = (1ULL << kEpdSck) | (1ULL << kEpdMosi) | (1ULL << kEpdCs) | (1ULL << kEpdDc) | (1ULL << kEpdReset);
+    out_cfg.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    out_cfg.pull_up_en = GPIO_PULLUP_DISABLE;
+    gpio_config(&out_cfg);
+
+    constexpr gpio_num_t kPinsToHoldLow[] = {kEpdSck, kEpdMosi, kEpdCs, kEpdDc, kEpdReset};
+    for (gpio_num_t pin : kPinsToHoldLow) {
         gpio_hold_dis(pin);
         gpio_set_level(pin, 0);
         gpio_hold_en(pin);
     }
+
+    // [epd-leak-fix] Reconfigure BUSY pin to input with pull-up disabled to prevent leakage.
+    gpio_hold_dis(kEpdBusy);
+    gpio_config_t busy_cfg = {};
+    busy_cfg.intr_type = GPIO_INTR_DISABLE;
+    busy_cfg.mode = GPIO_MODE_INPUT;
+    busy_cfg.pin_bit_mask = (1ULL << kEpdBusy);
+    busy_cfg.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    busy_cfg.pull_up_en = GPIO_PULLUP_DISABLE;
+    gpio_config(&busy_cfg);
+    gpio_hold_en(kEpdBusy);
 }
 
 static esp_err_t TryPowerOffEpd(uint32_t timeout_ms)
@@ -1697,9 +2011,332 @@ static esp_err_t TryPowerOffEpd(uint32_t timeout_ms)
     if (!operation.locked()) {
         return ESP_ERR_TIMEOUT;
     }
+    // [epd-waveform-gate] The lock above is recursive, so it does NOT prove
+    // the panel is idle when the caller is the EPD owner task. Refuse instead
+    // of sending 0x07 or cutting GPIO6 mid-waveform.
+    if (EpdWaveformActive()) {
+        ESP_LOGW(kTag, "EPD power-off deferred: refresh waveform in progress");
+        return ESP_ERR_INVALID_STATE;
+    }
     // Recursive acquisition keeps every power-off path on the same lock.
     PowerOffEpd();
     return ESP_OK;
+}
+
+// [power-fix] User-shutdown variant: white the panel with a TRUE full-refresh
+// waveform so the blank frame overwrites ghosting history, then cut the rail.
+// Lives inside this namespace so it shares kTag/framebuffer state with the
+// other EPD primitives. A refresh failure is logged and NOT fatal: a shutdown
+// must not hang on a display fault, so the rail is still cut.
+static esp_err_t ShutdownClearAndPowerOffLocal(int64_t deadline_us)
+{
+    const int64_t remaining_us = deadline_us > 0
+        ? deadline_us - esp_timer_get_time()
+        : 0;
+    if (deadline_us > 0 && remaining_us <= 0) {
+        return ESP_ERR_TIMEOUT;
+    }
+    EpdFrameTransaction transaction;
+    if (!transaction.locked()) {
+        return ESP_ERR_NO_MEM;
+    }
+    ClearEpdFramebuffer(true);
+    // [power-fix] Leave a zero-power hint on the panel instead of a blank
+    // screen: e-paper retains the image after the latch cut, so the user
+    // always knows how to power back on. Hardware fact (schematic
+    // SCH_ZecTrix_Note4_V1.0, Power sheet): only SW1 / KEY_DET/PGDN (the
+    // page-down key, GPIO18) re-latches Q1 through D2; the confirm key has
+    // no power-on path. Best effort -- a text failure never blocks shutdown.
+    {
+        constexpr const char* kTitle = "已关机";
+        constexpr const char* kHint = "长按下方键(下页)开机";
+        const int title_w = MeasureUtf8TextWidth(kTitle);
+        const int hint_w = MeasureUtf8TextWidth(kHint);
+        (void)DrawUtf8Text((kEpdWidth - title_w) / 2, 124, kTitle, true);
+        (void)DrawUtf8Text((kEpdWidth - hint_w) / 2, 164, kHint, true);
+    }
+    g_previous_framebuffer_synced = false;
+    const esp_err_t refresh_result = RefreshEpdFull(false, true);
+    if (refresh_result != ESP_OK) {
+        ESP_LOGE(kTag,
+                 "shutdown clear refresh failed; continuing to rail power-off: %s",
+                 esp_err_to_name(refresh_result));
+    }
+    const uint32_t timeout_ms = deadline_us > 0
+        ? static_cast<uint32_t>((remaining_us + 999) / 1000)
+        : 0;
+    return TryPowerOffEpd(timeout_ms);
+}
+
+// Gray16 is a separate full-screen pipeline. It starts from an OTP-white
+// base and uses the vendor-calibrated five-pass external waveform; it never
+// participates in the 1bpp previous-frame/partial-refresh state machine.
+static esp_err_t ResetGrayController()
+{
+    SetReset(true);
+    vTaskDelay(pdMS_TO_TICKS(10));
+    SetReset(false);
+    vTaskDelay(pdMS_TO_TICKS(20));
+    SetReset(true);
+    vTaskDelay(pdMS_TO_TICKS(10));
+    return WaitBusy();
+}
+
+static esp_err_t TriggerGrayBatch(bool power_on)
+{
+    if (power_on) {
+        ESP_RETURN_ON_ERROR(SendCommand(0x04), kTag, "gray16 internal power on");
+        ESP_RETURN_ON_ERROR(WaitBusyTimeout(kCommandBusyTimeoutMs), kTag, "wait gray16 power on");
+        g_epd_powered = true;
+        g_epd_booster_on = true;
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    ESP_RETURN_ON_ERROR(SendCommand(0x12), kTag, "gray16 refresh trigger");
+    ESP_RETURN_ON_ERROR(SendData(0x00), kTag, "gray16 refresh trigger data");
+    vTaskDelay(pdMS_TO_TICKS(10));
+    return WaitBusyTimeout(kBusyTimeoutMs);
+}
+
+static esp_err_t TurnGrayInternalPowerOff()
+{
+    ESP_RETURN_ON_ERROR(SendCommand(0x02), kTag, "gray16 internal power off");
+    ESP_RETURN_ON_ERROR(SendData(0x00), kTag, "gray16 internal power off data");
+    ESP_RETURN_ON_ERROR(WaitBusy(), kTag, "wait gray16 internal power off");
+    g_epd_powered = false;
+    g_epd_booster_on = false;
+    return ESP_OK;
+}
+
+static esp_err_t InitGrayExternalWaveform(const uint8_t* waveform)
+{
+    ESP_RETURN_ON_ERROR(ResetGrayController(), kTag, "reset before gray16 waveform");
+    ESP_RETURN_ON_ERROR(SendCommand(0x00), kTag, "gray16 panel setting");
+    ESP_RETURN_ON_ERROR(SendData(0x2F), kTag, "gray16 panel setting data0");
+    ESP_RETURN_ON_ERROR(SendData(0x8E), kTag, "gray16 panel setting data1");
+    ESP_RETURN_ON_ERROR(SendCommand(0x01), kTag, "gray16 power setting");
+    const uint8_t power_values[] = {0x07, waveform[0], waveform[1], waveform[2], waveform[3], waveform[4]};
+    for (uint8_t value : power_values) {
+        ESP_RETURN_ON_ERROR(SendData(value), kTag, "gray16 power data");
+    }
+    ESP_RETURN_ON_ERROR(SendCommand(0x30), kTag, "gray16 pll setting");
+    ESP_RETURN_ON_ERROR(SendData(waveform[6]), kTag, "gray16 pll data");
+    ESP_RETURN_ON_ERROR(SendCommand(0x82), kTag, "gray16 vcom setting");
+    ESP_RETURN_ON_ERROR(SendData(waveform[5]), kTag, "gray16 vcom data");
+    ESP_RETURN_ON_ERROR(SendCommand(0x06), kTag, "gray16 booster setting");
+    const uint8_t booster[] = {0x0F, 0x8B, 0x9C, 0xAA};
+    for (uint8_t value : booster) {
+        ESP_RETURN_ON_ERROR(SendData(value), kTag, "gray16 booster data");
+    }
+    ESP_RETURN_ON_ERROR(SendCommand(0xE7), kTag, "gray16 power optimization");
+    ESP_RETURN_ON_ERROR(SendData(0x98), kTag, "gray16 power optimization data");
+    ESP_RETURN_ON_ERROR(SendCommand(0x50), kTag, "gray16 border setting");
+    ESP_RETURN_ON_ERROR(SendData(0x37), kTag, "gray16 border data");
+    ESP_RETURN_ON_ERROR(SendCommand(0x61), kTag, "gray16 resolution");
+    const uint8_t resolution[] = {0x01, 0x90, 0x01, 0x2C};
+    for (uint8_t value : resolution) {
+        ESP_RETURN_ON_ERROR(SendData(value), kTag, "gray16 resolution data");
+    }
+    ESP_RETURN_ON_ERROR(SendCommand(0x62), kTag, "gray16 vcom sensing");
+    ESP_RETURN_ON_ERROR(SendData(0x64), kTag, "gray16 vcom sensing data0");
+    ESP_RETURN_ON_ERROR(SendData(0x53), kTag, "gray16 vcom sensing data1");
+    ESP_RETURN_ON_ERROR(SendCommand(0x65), kTag, "gray16 gate timing");
+    for (int i = 0; i < 4; ++i) {
+        ESP_RETURN_ON_ERROR(SendData(0x00), kTag, "gray16 gate timing data");
+    }
+    ESP_RETURN_ON_ERROR(SendCommand(0xE9), kTag, "gray16 external mode");
+    ESP_RETURN_ON_ERROR(SendData(0x01), kTag, "gray16 external mode data");
+    ESP_RETURN_ON_ERROR(WaitBusy(), kTag, "wait gray16 waveform mode");
+    ESP_RETURN_ON_ERROR(SendCommand(0x20), kTag, "gray16 waveform load");
+    return WriteBytes(waveform, ssd2683_waveform::kWaveformSize);
+}
+
+static esp_err_t LoadGrayExternalWaveform(const uint8_t* waveform)
+{
+    ESP_RETURN_ON_ERROR(WaitBusy(), kTag, "wait gray16 waveform reload");
+    ESP_RETURN_ON_ERROR(SendCommand(0x30), kTag, "gray16 pll reload");
+    ESP_RETURN_ON_ERROR(SendData(waveform[6]), kTag, "gray16 pll reload data");
+    ESP_RETURN_ON_ERROR(SendCommand(0x20), kTag, "gray16 waveform reload");
+    return WriteBytes(waveform, ssd2683_waveform::kWaveformSize);
+}
+
+static esp_err_t WriteGrayPass(int pass, const uint8_t* gray4)
+{
+    ESP_RETURN_ON_ERROR(SendCommand(0x10), kTag, "gray16 RAM write");
+    ESP_RETURN_ON_ERROR(WaitBusyTimeout(kPartialCommandBusyTimeoutMs), kTag, "wait gray16 RAM write");
+    uint8_t line[kEpdGray4RowBytes / 2] = {};
+    for (int y = 0; y < kEpdHeight; ++y) {
+        for (size_t output = 0; output < sizeof(line); ++output) {
+            const size_t first_pixel = static_cast<size_t>(y) * kEpdWidth + output * 4;
+            uint8_t packed = 0;
+            for (size_t pixel_in_byte = 0; pixel_in_byte < 4; ++pixel_in_byte) {
+                const size_t pixel = first_pixel + pixel_in_byte;
+                const uint8_t source = gray4[pixel / 2];
+                const size_t level = (pixel & 1U) != 0 ? source & 0x0F : source >> 4;
+                const uint8_t code =
+                    ssd2683_waveform::VendorGray16RenderPassOfLevel(level) == static_cast<size_t>(pass)
+                        ? ssd2683_waveform::VendorGray16RenderCodeOfLevel(level)
+                        : 0;
+                packed |= static_cast<uint8_t>(code << (6 - pixel_in_byte * 2));
+            }
+            line[output] = packed;
+        }
+        ESP_RETURN_ON_ERROR(WriteBytes(line, sizeof(line)), kTag, "write gray16 line");
+        if ((y & 0x3F) == 0) {
+            FeedTwdtIfSubscribed();
+            vTaskDelay(1);
+        }
+    }
+    return ESP_OK;
+}
+
+static esp_err_t WriteOtpWhiteBase()
+{
+    ESP_RETURN_ON_ERROR(PreparePanelForFramebufferWrite(), kTag, "prepare gray16 OTP base");
+    ESP_RETURN_ON_ERROR(SendCommand(0x10), kTag, "gray16 OTP base RAM write");
+    uint8_t white_line[kEpdGray4RowBytes / 2] = {};
+    std::memset(white_line, 0x55, sizeof(white_line));
+    for (int y = 0; y < kEpdHeight; ++y) {
+        ESP_RETURN_ON_ERROR(WriteBytes(white_line, sizeof(white_line)), kTag, "write gray16 OTP base line");
+        if ((y & 0x3F) == 0) {
+            FeedTwdtIfSubscribed();
+            vTaskDelay(1);
+        }
+    }
+    ESP_RETURN_ON_ERROR(TriggerGrayBatch(true), kTag, "gray16 OTP base refresh");
+    return TurnGrayInternalPowerOff();
+}
+
+esp_err_t RefreshEpdGray16(const uint8_t* gray4, size_t size)
+{
+    EpdOperationGuard operation(portMAX_DELAY);
+    ESP_RETURN_ON_FALSE(operation.locked(), ESP_ERR_NO_MEM, kTag, "take EPD gray16 operation mutex");
+    ESP_RETURN_ON_FALSE(gray4 != nullptr && size == kEpdGray4PayloadSize,
+                        ESP_ERR_INVALID_ARG, kTag, "invalid gray16 payload");
+    if (!g_initialized) {
+        ESP_RETURN_ON_ERROR(InitEpdDisplay(), kTag, "lazy init EPD for gray16");
+    }
+
+    // Match zectrix_epd_refresh_full_4bpp: the only history-clearing pass is
+    // the OTP white base below. The reference demo's extra 1bpp full clear is
+    // an app-level gallery scene transition; putting it in this driver caused
+    // a black/white flash followed by a second white flash on every gray image.
+    // InitPanelSequence resets the controller and re-selects OTP, equivalent
+    // to the reference PrepareOtpRefresh, so no prior controller state leaks.
+    ESP_RETURN_ON_ERROR(InitPanelSequence(), kTag, "prepare gray16 OTP refresh");
+
+    esp_err_t result = WriteOtpWhiteBase();
+    bool waveform_session_open = false;
+    for (size_t pass = 0;
+         result == ESP_OK && pass < ssd2683_waveform::kVendorGray16RenderPassCount;
+         ++pass) {
+        const auto& waveform = ssd2683_waveform::kVendorGray16RenderWaveforms[pass];
+        result = waveform_session_open
+            ? LoadGrayExternalWaveform(waveform.data())
+            : InitGrayExternalWaveform(waveform.data());
+        waveform_session_open = waveform_session_open || result == ESP_OK;
+        if (result == ESP_OK) {
+            result = WriteGrayPass(static_cast<int>(pass), gray4);
+        }
+        if (result == ESP_OK) {
+            result = TriggerGrayBatch(pass == 0);
+        }
+    }
+    if (g_epd_powered) {
+        const esp_err_t off_result = TurnGrayInternalPowerOff();
+        if (result == ESP_OK) {
+            result = off_result;
+        }
+    }
+    const esp_err_t restore_result = InitPanelSequence();
+    if (result == ESP_OK) {
+        result = restore_result;
+    }
+    PowerOffEpd();
+    g_previous_framebuffer_synced = false;
+    g_partial_refreshes_since_full = 0;
+    g_heavy_partials_since_full = 0;
+    g_last_partial_was_full_frame = false;
+    g_rtc_last_frame_crc_valid = false;
+    return result;
+}
+
+// [epd-health] Debt only: has enough partial stress accumulated to be worth a
+// cleanup full refresh at all? Two independent channels because they cover
+// different screens: the heavy counter catches large-diff scrolling early, the
+// plain counter catches long-running tiny-diff screens (clock/timer) that never
+// register as heavy. Shared by the due-check and the runner so the two can
+// never disagree about the threshold.
+static bool IdleCleanupPending()
+{
+    return g_initialized && g_framebuffer != nullptr &&
+           (g_partial_refreshes_since_full >= kIdleCleanupFramePartials ||
+            g_heavy_partials_since_full >= kIdleCleanupHeavyPartials);
+}
+
+// [epd-health] Runs the cleanup full refresh when its own deadline has elapsed.
+// Split away from PowerOffEpdAfterIdleIfNeeded so the two actions stop sharing
+// one trigger: a cleanup attached to the power-off point fires on every pause
+// longer than WQN_EPD_IDLE_POWER_OFF_MS, which is exactly the "sat still for a
+// few seconds and the screen flashed itself" report. It now waits for
+// WQN_EPD_IDLE_CLEANUP_MS instead, and the rail may already be down by then --
+// RefreshEpdFull powers the panel itself and a genuine full refresh ends with
+// the rail down again (TriggerDisplayUpdate's !is_partial && !keep_powered
+// branch), so no follow-up power-off is needed.
+static void RunIdleEpdCleanupIfNeeded(int64_t now_ms, int64_t last_activity_ms)
+{
+    if (!IdleCleanupPending() || last_activity_ms == 0) {
+        return;
+    }
+    const int cleanup_ms = CONFIG_WQN_EPD_IDLE_CLEANUP_MS;
+    const int64_t idle_ms = now_ms - last_activity_ms;
+    if (cleanup_ms > 0 && idle_ms < cleanup_ms) {
+        bool expected = false;
+        if (g_epd_cleanup_deferred_logged.compare_exchange_strong(
+                expected, true, std::memory_order_relaxed)) {
+            ESP_LOGI(kTag,
+                     "EPD idle cleanup deferred: heavy=%u idle_ms=%lld waiting_for=%d",
+                     static_cast<unsigned>(g_heavy_partials_since_full),
+                     static_cast<long long>(idle_ms), cleanup_ms);
+        }
+        return;
+    }
+    EpdOperationGuard operation(0);
+    if (!operation.locked()) {
+        return;
+    }
+    if (!IdleCleanupPending()) {
+        return;
+    }
+    ESP_LOGI(kTag, "EPD idle cleanup full refresh: heavy=%u idle_ms=%lld",
+             static_cast<unsigned>(g_heavy_partials_since_full),
+             static_cast<long long>(idle_ms));
+    // Defeat the unchanged-framebuffer skip; the panel content is what
+    // needs the clean waveform, not the pixels.
+    g_previous_framebuffer_synced = false;
+    const esp_err_t cleanup_ret = RefreshEpdFull(false, true);
+    // [hang-fix] Unconditional completion log: the HIL hang trace ends
+    // right after the "idle cleanup" line above, so this bracket log
+    // tells the next capture whether RefreshEpdFull returned at all.
+    ESP_LOGI(kTag, "EPD idle cleanup full refresh done: %s",
+             esp_err_to_name(cleanup_ret));
+    if (cleanup_ret != ESP_OK) {
+        ESP_LOGW(kTag, "EPD idle cleanup full refresh failed: %s",
+                 esp_err_to_name(cleanup_ret));
+    }
+}
+
+bool IsEpdIdleCleanupDue()
+{
+    const int cleanup_ms = CONFIG_WQN_EPD_IDLE_CLEANUP_MS;
+    if (cleanup_ms <= 0 || !IdleCleanupPending()) {
+        return false;  // legacy mode: the cleanup rides the power-off point
+    }
+    const int64_t last_activity_ms =
+        g_last_epd_activity_ms.load(std::memory_order_relaxed);
+    if (last_activity_ms == 0) {
+        return false;
+    }
+    return (esp_timer_get_time() / 1000 - last_activity_ms) >= cleanup_ms;
 }
 
 } // namespace wqn
@@ -1731,6 +2368,7 @@ void wqn::NoteEpdActivity()
 {
     g_last_epd_activity_ms.store(esp_timer_get_time() / 1000, std::memory_order_relaxed);
     g_epd_idle_cut.store(false, std::memory_order_relaxed);
+    g_epd_cleanup_deferred_logged.store(false, std::memory_order_relaxed);
     g_epd_activity_generation.fetch_add(1, std::memory_order_release);
 }
 
@@ -1753,45 +2391,29 @@ bool wqn::IsEpdIdleMaintenanceDue()
 
 void wqn::PowerOffEpdAfterIdleIfNeeded()
 {
-    const int idle_ms = CONFIG_WQN_EPD_IDLE_POWER_OFF_MS;
+    const int idle_ms_config = CONFIG_WQN_EPD_IDLE_POWER_OFF_MS;
     const int64_t last_activity_ms =
         g_last_epd_activity_ms.load(std::memory_order_relaxed);
-    if (idle_ms <= 0 || g_epd_idle_cut.load(std::memory_order_relaxed) ||
+    const int64_t now_ms = esp_timer_get_time() / 1000;
+    // Cleanup first, on its own deadline. It must not be gated on
+    // g_epd_idle_cut: once this function has cut the rail, that flag keeps
+    // IsEpdIdleMaintenanceDue() -- and therefore RequestEpdIdleMaintenance --
+    // false for the rest of the idle period, so a cleanup that waited for the
+    // power-off point would never be armed again.
+    RunIdleEpdCleanupIfNeeded(now_ms, last_activity_ms);
+    if (idle_ms_config <= 0 || g_epd_idle_cut.load(std::memory_order_relaxed) ||
         last_activity_ms == 0) {
         return;
     }
-    if ((esp_timer_get_time() / 1000 - last_activity_ms) < idle_ms) {
+    if ((now_ms - last_activity_ms) < idle_ms_config) {
         return;
-    }
-    // [epd-health] Deferred heavy-partial cleanup: forcing the full refresh
-    // mid-scroll read as a 1.2 s freeze every few steps, so scrolling stays on
-    // partials and the accumulated charge is cleared here instead, once the
-    // user has stopped interacting and just before the rail drops.
-    if (g_heavy_partials_since_full >= kIdleCleanupHeavyPartials &&
-        g_initialized && g_framebuffer != nullptr) {
-        EpdOperationGuard operation(0);
-        if (operation.locked() &&
-            g_heavy_partials_since_full >= kIdleCleanupHeavyPartials) {
-            ESP_LOGI(kTag, "EPD idle cleanup full refresh: heavy=%u",
-                     static_cast<unsigned>(g_heavy_partials_since_full));
-            // Defeat the unchanged-framebuffer skip; the panel content is what
-            // needs the clean waveform, not the pixels.
-            g_previous_framebuffer_synced = false;
-            const esp_err_t cleanup_ret = RefreshEpdFull(false, true);
-            // [hang-fix] Unconditional completion log: the HIL hang trace ends
-            // right after the "idle cleanup" line above, so this bracket log
-            // tells the next capture whether RefreshEpdFull returned at all.
-            ESP_LOGI(kTag, "EPD idle cleanup full refresh done: %s",
-                     esp_err_to_name(cleanup_ret));
-            if (cleanup_ret != ESP_OK) {
-                ESP_LOGW(kTag, "EPD idle cleanup full refresh failed: %s",
-                         esp_err_to_name(cleanup_ret));
-            }
-        }
     }
     const esp_err_t result = TryPowerOffEpd(0);
     if (result == ESP_OK) {
-        ESP_LOGI(kTag, "EPD idle power-off after %d ms", idle_ms);
+        ESP_LOGI(kTag, "EPD idle power-off after %d ms (heavy=%u, cleanup %s)",
+                 idle_ms_config,
+                 static_cast<unsigned>(g_heavy_partials_since_full),
+                 IdleCleanupPending() ? "owed" : "clear");
         g_epd_idle_cut.store(true, std::memory_order_relaxed);
     } else if (result != ESP_ERR_TIMEOUT) {
         ESP_LOGW(kTag, "EPD idle power-off failed: %s", esp_err_to_name(result));
@@ -1823,6 +2445,11 @@ TaskHandle_t g_epd_owner_task = nullptr;
 // from a previously-timed-out request.
 std::atomic<esp_err_t> g_sleep_prep_result{ESP_FAIL};
 std::atomic<uint32_t> g_sleep_prep_result_generation{0};
+// [power-fix] Operation selector for the sleep-prep channel: false = plain
+// rail power-off (sleep prep), true = white-clear + forced full refresh +
+// rail power-off (user shutdown). Single producer (PowerCoordinator) stores
+// it before posting; the owner consumes it right after claiming.
+std::atomic<bool> g_sleep_prep_clear{false};
 
 SemaphoreHandle_t SleepPrepDoneSemaphore()
 {
@@ -1856,6 +2483,16 @@ esp_err_t RunSleepPrepLocal(int64_t deadline_us)
     return wqn::TryPowerOffEpd(timeout_ms);
 }
 
+// [power-fix] User-shutdown variant: delegates to the wqn-internal
+// ShutdownClearAndPowerOffLocal (white clear + forced full refresh + rail
+// power-off). Runs on the owner task at the idle command point, where no
+// frame transaction can be held, so the recursive transaction inside is
+// uncontended.
+esp_err_t RunShutdownClearLocal(int64_t deadline_us)
+{
+    return wqn::ShutdownClearAndPowerOffLocal(deadline_us);
+}
+
 }  // namespace
 
 void wqn::RegisterEpdOwnerTask(void* owner_task_handle)
@@ -1882,7 +2519,11 @@ bool wqn::ServiceDisplaySleepPrepCommand()
     // This runs at the idle command point, which never holds an
     // EpdFrameTransaction, so the recursive guard inside TryPowerOffEpd is
     // uncontended on this task.
-    const esp_err_t result = RunSleepPrepLocal(0);
+    const bool clear_first =
+        g_sleep_prep_clear.exchange(false, std::memory_order_acq_rel);
+    const esp_err_t result = clear_first
+        ? RunShutdownClearLocal(0)
+        : RunSleepPrepLocal(0);
     // Publish order (mirror of the requester's drain-then-post): write the
     // result, GIVE the semaphore, and only THEN drop to Idle. If Idle were
     // published before the give, a new request could enter Pending and then be
@@ -1896,27 +2537,43 @@ bool wqn::ServiceDisplaySleepPrepCommand()
     return true;
 }
 
-esp_err_t wqn::PrepareDisplayForSleep(int64_t deadline_us)
+// Shared body of PrepareDisplayForSleep / PrepareDisplayForShutdown. The
+// owner fast-path and no-owner fallback dispatch on clear_first; the posted
+// path carries the flag in g_sleep_prep_clear for the owner to consume.
+static esp_err_t PrepareDisplayPowerOpInternal(int64_t deadline_us, bool clear_first)
 {
     // PowerCoordinator may begin quiesce only when no SleepLease exists. Every
     // accepted UI frame owns kDisplay until its terminal result, so reaching
     // this service boundary proves there is no upstream frame left to drain.
+
+    // [epd-waveform-gate] Running locally on the owner task bypasses the
+    // command point, which is exactly the state in which a refresh can be in
+    // flight. Refuse rather than tear the panel down mid-waveform; the power
+    // side rolls the sleep transaction back and retries.
+    if (wqn::EpdWaveformActive()) {
+        ESP_LOGW(wqn::kTag, "display sleep prep refused: refresh waveform in progress");
+        return ESP_ERR_INVALID_STATE;
+    }
 
     // Owner fast-path: if the caller IS the EPD owner task (defensive -- e.g.
     // an emergency shutdown raised on that task), run locally; posting to
     // ourselves would deadlock on the completion wait.
     if (g_epd_owner_task != nullptr &&
         xTaskGetCurrentTaskHandle() == g_epd_owner_task) {
-        return RunSleepPrepLocal(deadline_us);
+        return clear_first ? RunShutdownClearLocal(deadline_us)
+                           : RunSleepPrepLocal(deadline_us);
     }
     // No owner registered yet (early boot / EPD UI disabled): run locally.
     if (g_epd_owner_task == nullptr) {
-        return RunSleepPrepLocal(deadline_us);
+        return clear_first ? RunShutdownClearLocal(deadline_us)
+                           : RunSleepPrepLocal(deadline_us);
     }
 
     SemaphoreHandle_t done = SleepPrepDoneSemaphore();
     if (done == nullptr) {
-        return RunSleepPrepLocal(deadline_us);  // allocation failed; degrade safely
+        // allocation failed; degrade safely
+        return clear_first ? RunShutdownClearLocal(deadline_us)
+                           : RunSleepPrepLocal(deadline_us);
     }
     // Drain any stale give left by a previously timed-out request so this
     // wait cannot be satisfied by an old completion.
@@ -1924,12 +2581,14 @@ esp_err_t wqn::PrepareDisplayForSleep(int64_t deadline_us)
 
     const uint32_t generation = NextSleepPrepGeneration();
     g_sleep_prep_generation.store(generation, std::memory_order_release);
+    g_sleep_prep_clear.store(clear_first, std::memory_order_release);
     // Idle -> Pending. If somehow not Idle (a prior request still Claimed),
     // fail closed: the power side treats it as a display-prep failure.
     uint32_t expected = kSleepPrepIdle;
     if (!g_sleep_prep_state.compare_exchange_strong(
             expected, kSleepPrepPending,
             std::memory_order_acq_rel, std::memory_order_acquire)) {
+        g_sleep_prep_clear.store(false, std::memory_order_release);
         return ESP_ERR_INVALID_STATE;
     }
     xTaskNotifyGive(g_epd_owner_task);
@@ -1965,16 +2624,39 @@ esp_err_t wqn::PrepareDisplayForSleep(int64_t deadline_us)
             std::memory_order_acq_rel, std::memory_order_acquire)) {
         return ESP_ERR_TIMEOUT;
     }
-    // Owner claimed it: Claimed only means the hardware op cannot be cancelled,
-    // NOT that the caller may block a second full budget. Wait only the time
-    // still left against the absolute deadline; if none remains, return now and
-    // let the owner's late give be drained by the next request.
+    // Owner claimed it: the hardware op cannot be cancelled. User shutdown
+    // must never proceed to the board-latch cut while the owner can still be
+    // driving EPD GPIO/SPI, so after claim its deadline is an admission bound
+    // and the caller waits for the operation's internally bounded terminal
+    // result. Ordinary sleep prep remains rollback-capable and keeps the
+    // absolute completion deadline below.
+    if (clear_first) {
+        while (xSemaphoreTake(sem, portMAX_DELAY) == pdTRUE) {
+            if (g_sleep_prep_result_generation.load(
+                    std::memory_order_acquire) == generation) {
+                return g_sleep_prep_result.load(std::memory_order_relaxed);
+            }
+        }
+        return ESP_ERR_INVALID_STATE;
+    }
     wait = remaining_ticks();
     if (wait != 0 && xSemaphoreTake(sem, wait) == pdTRUE &&
         g_sleep_prep_result_generation.load(std::memory_order_acquire) == generation) {
         return g_sleep_prep_result.load(std::memory_order_relaxed);
     }
     return ESP_ERR_TIMEOUT;
+}
+
+esp_err_t wqn::PrepareDisplayForSleep(int64_t deadline_us)
+{
+    return PrepareDisplayPowerOpInternal(deadline_us, /*clear_first=*/false);
+}
+
+esp_err_t wqn::PrepareDisplayForShutdown(int64_t deadline_us)
+{
+    // User-initiated power-off: white the panel first (owner task), then cut
+    // the rail. See RunShutdownClearLocal for failure semantics.
+    return PrepareDisplayPowerOpInternal(deadline_us, /*clear_first=*/true);
 }
 
 void wqn::RollbackDisplayAfterSleepAbort()

@@ -16,9 +16,12 @@
 #include "ai_history.h"
 #include "cJSON.h"
 #include "config.h"
+#include "device_protocol/json_depth_guard.h"
 #include "esp_check.h"
 #include "esp_crt_bundle.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_websocket_client.h"
 #include "esp_tls.h"
@@ -29,7 +32,11 @@
 #include "services/audio_service.h"
 #include "services/connectivity_service.h"
 #include "storage.h"
-#include "audio_volume.h"
+
+namespace wqn {
+esp_err_t StartFlashSessionNow(uint32_t generation);
+esp_err_t StopFlashSessionNow();
+}
 
 namespace {
 
@@ -86,10 +93,12 @@ constexpr int kChunkBytes = kChunkFrames * 2;
 constexpr int kChunkIntervalMs = 15;
 
 constexpr int kMaxReconnectAttempts = 3;
-constexpr TickType_t kWifiReadyWait = pdMS_TO_TICKS(15000);
+constexpr TickType_t kWifiReadyWait = pdMS_TO_TICKS(35000);
 constexpr TickType_t kWsConnectTimeout = pdMS_TO_TICKS(20000);
 constexpr uint32_t kLifecycleTaskStackBytes = 8192;
 constexpr UBaseType_t kLifecycleTaskPriority = 6;
+constexpr uint32_t kPlaybackTaskStackBytes = 4096;
+constexpr uint32_t kStreamTaskStackBytes = 8192;
 
 enum class InternalStatus {
     kIdle,
@@ -119,6 +128,8 @@ struct FlashState {
     int reconnect_attempts = 0;
     int64_t status_since_ms = 0;
     esp_websocket_client_handle_t ws_client = nullptr;
+    esp_websocket_client_handle_t ws_client_to_destroy = nullptr;
+    std::atomic<uint32_t> active_ws_sends{0};
     bool changed = false;
     wqn::AiTier tier = wqn::AiTier::kFlash;
     // WebSocket frame reassembly buffer for fragmented payloads
@@ -175,9 +186,30 @@ struct FlashState {
 
 FlashState g_flash;
 wqn::services::AudioSession g_flash_audio_session;
+wqn::services::ConnectivityDemand g_flash_connectivity_demand;
+
+class FlashWsSendRegistration {
+public:
+    explicit FlashWsSendRegistration(esp_websocket_client_handle_t client)
+        : client_(client) {}
+
+    ~FlashWsSendRegistration()
+    {
+        if (client_ != nullptr) {
+            g_flash.active_ws_sends.fetch_sub(1, std::memory_order_release);
+        }
+    }
+
+    FlashWsSendRegistration(const FlashWsSendRegistration&) = delete;
+    FlashWsSendRegistration& operator=(const FlashWsSendRegistration&) = delete;
+
+private:
+    esp_websocket_client_handle_t client_;
+};
 
 enum class FlashTerminalReason : uint8_t {
     kNone,
+    kIntentional,
     kDisconnected,
     kTransportError,
     kServerError,
@@ -187,11 +219,47 @@ StaticTask_t g_lifecycle_task_tcb;
 StackType_t g_lifecycle_task_stack[
     kLifecycleTaskStackBytes / sizeof(StackType_t)] = {};
 TaskHandle_t g_lifecycle_task = nullptr;
+// These realtime workers exist only while Flash is active, but allocating
+// their 12 KiB of stacks from the default internal heap made that memory also
+// disappear from MALLOC_CAP_DMA.  Retain one PSRAM stack for each worker and
+// keep only their TCBs in internal RAM.  The tasks use static creation, so
+// their self-deletion never frees or reallocates these stable buffers.
+StaticTask_t g_playback_task_tcb;
+StackType_t* g_playback_task_stack = nullptr;
+StaticTask_t g_stream_task_tcb;
+StackType_t* g_stream_task_stack = nullptr;
 std::atomic<FlashTerminalReason> g_terminal_reason{
     FlashTerminalReason::kNone};
 std::atomic<bool> g_intentional_stop{false};
+std::atomic<bool> g_teardown_pending{false};
+std::atomic<bool> g_restart_after_teardown{false};
+std::atomic<uint32_t> g_session_generation{0};
+std::atomic<uint32_t> g_terminal_generation{0};
+std::atomic<bool> g_start_pending{false};
+std::atomic<uint32_t> g_start_generation{0};
 
 void SetErrorLocked(const std::string& message);
+
+StackType_t* EnsurePsramTaskStack(
+    StackType_t** stack, size_t bytes, const char* owner)
+{
+    if (*stack != nullptr) {
+        return *stack;
+    }
+    *stack = static_cast<StackType_t*>(heap_caps_calloc(
+        1, bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (*stack == nullptr) {
+        ESP_LOGE(kTag, "%s PSRAM task stack allocation failed: bytes=%u",
+                 owner, static_cast<unsigned>(bytes));
+        return nullptr;
+    }
+    ESP_LOGI(kTag,
+             "%s task stack retained in PSRAM: bytes=%u stack=%p dma_free=%u internal_free=%u",
+             owner, static_cast<unsigned>(bytes), *stack,
+             static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_DMA)),
+             static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)));
+    return *stack;
+}
 
 const char* FlashTerminalMessage(FlashTerminalReason reason)
 {
@@ -217,17 +285,89 @@ void FlashLifecycleTask(void*)
             g_terminal_reason.exchange(
                 FlashTerminalReason::kNone, std::memory_order_acq_rel);
         if (reason == FlashTerminalReason::kNone) {
+            if (!g_start_pending.exchange(false, std::memory_order_acq_rel)) {
+                continue;
+            }
+            const uint32_t generation =
+                g_start_generation.load(std::memory_order_acquire);
+            const esp_err_t start_result =
+                wqn::StartFlashSessionNow(generation);
+            if (start_result != ESP_OK &&
+                !g_teardown_pending.load(std::memory_order_acquire)) {
+                xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+                if (generation ==
+                    g_session_generation.load(std::memory_order_acquire)) {
+                    if (g_flash.status != InternalStatus::kError) {
+                        SetErrorLocked("Flash 会话启动失败");
+                    }
+                    g_flash_connectivity_demand.Reset();
+                }
+                xSemaphoreGive(g_flash.mutex);
+            }
             continue;
         }
-        const esp_err_t stop_result = wqn::StopFlashSession();
-        xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
-        SetErrorLocked(FlashTerminalMessage(reason));
+        const uint32_t generation =
+            g_terminal_generation.load(std::memory_order_acquire);
+        if (generation != g_session_generation.load(std::memory_order_acquire)) {
+            ESP_LOGW(kTag, "discard stale Flash teardown generation=%lu active=%lu",
+                     static_cast<unsigned long>(generation),
+                     static_cast<unsigned long>(
+                         g_session_generation.load(std::memory_order_relaxed)));
+            continue;
+        }
+
+        g_intentional_stop.store(true, std::memory_order_release);
+        const int64_t deadline_us = esp_timer_get_time() + 30LL * 1000 * 1000;
+        esp_err_t stop_result = ESP_FAIL;
+        uint32_t attempts = 0;
+        do {
+            ++attempts;
+            stop_result = wqn::StopFlashSessionNow();
+            if (stop_result == ESP_OK) {
+                break;
+            }
+            ESP_LOGW(kTag,
+                     "Flash teardown deferred: generation=%lu attempt=%lu error=%s",
+                     static_cast<unsigned long>(generation),
+                     static_cast<unsigned long>(attempts),
+                     esp_err_to_name(stop_result));
+            vTaskDelay(pdMS_TO_TICKS(250));
+        } while (esp_timer_get_time() < deadline_us &&
+                 generation == g_session_generation.load(std::memory_order_acquire));
+
         if (stop_result != ESP_OK) {
-            g_flash.error_message += "（清理失败：";
-            g_flash.error_message += esp_err_to_name(stop_result);
-            g_flash.error_message += "）";
+            // [audio-lease-fix] A live task may still enter a wrapper with its
+            // session token, so deleting its I2S handle would be a UAF. A
+            // controlled restart is the only bounded safe recovery after the
+            // lifecycle task has retried for 30 seconds.
+            ESP_LOGE(
+                kTag,
+                "Flash teardown stuck; controlled restart: generation=%lu attempts=%lu error=%s internal_free=%u psram_free=%u",
+                static_cast<unsigned long>(generation),
+                static_cast<unsigned long>(attempts),
+                esp_err_to_name(stop_result),
+                static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
+                static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)));
+            vTaskDelay(pdMS_TO_TICKS(100));
+            esp_restart();
+        }
+
+        g_teardown_pending.store(false, std::memory_order_release);
+        g_intentional_stop.store(false, std::memory_order_release);
+        const bool restart =
+            g_restart_after_teardown.exchange(false, std::memory_order_acq_rel);
+        xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+        if (reason != FlashTerminalReason::kIntentional) {
+            SetErrorLocked(FlashTerminalMessage(reason));
         }
         xSemaphoreGive(g_flash.mutex);
+        if (restart) {
+            const esp_err_t restart_result = wqn::StartFlashSession();
+            if (restart_result != ESP_OK) {
+                ESP_LOGW(kTag, "Flash reconnect after teardown failed: %s",
+                         esp_err_to_name(restart_result));
+            }
+        }
     }
 }
 
@@ -253,6 +393,15 @@ void RequestFlashTerminalStop(FlashTerminalReason reason)
         g_lifecycle_task == nullptr) {
         return;
     }
+    bool expected = false;
+    if (!g_teardown_pending.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
+        return;
+    }
+    g_terminal_generation.store(
+        g_session_generation.load(std::memory_order_acquire),
+        std::memory_order_relaxed);
     g_terminal_reason.store(reason, std::memory_order_release);
     xTaskNotifyGive(g_lifecycle_task);
 }
@@ -457,15 +606,61 @@ void BuildV2AudioFrame(std::vector<uint8_t>* frame, const uint8_t* pcm,
 
 void ParseAndHandleEvent(const char* data, size_t len);
 
-constexpr uint32_t kStreamDmaFrameNum = 256;
+// Six 256-frame descriptors require 6,216 bytes of explicit DMA memory per
+// direction (6 * (256 stereo-s16 frames * 4 bytes + 12-byte descriptor)). At
+// the observed 12-13 KiB Flash admission point, TX can consume its half and
+// deterministically starve RX. Six 128-frame descriptors retain 32 ms of audio
+// per direction at 24 kHz while reducing the explicit duplex DMA request from
+// 12,432 to 6,288 bytes.
+constexpr uint32_t kStreamDmaDescNum = 6;
+constexpr uint32_t kStreamDmaFrameNum = 128;
 // The duplex stream is stereo 16-bit, so one DMA frame is four bytes.  Keep
 // this alongside the channel configuration: ResetAudioTxChannel preloads the
 // complete TX descriptor ring with silence after a barge-in/abort.
 constexpr size_t kStreamTxDmaBytes =
-    6U * static_cast<size_t>(kStreamDmaFrameNum) * sizeof(int16_t) * 2U;
+    kStreamDmaDescNum * static_cast<size_t>(kStreamDmaFrameNum) *
+    sizeof(int16_t) * 2U;
 constexpr int kStreamChunkFrames = 360;    // 15 ms at 24 kHz
 constexpr int kStreamChunkBytes = kStreamChunkFrames * 2;  // 16-bit mono
 constexpr int64_t kAmpIdleTailMs = 600;    // turn amp off this long after last audio-delta write
+constexpr TickType_t kI2sClockWarmup = pdMS_TO_TICKS(20);
+constexpr TickType_t kCodecWarmup = pdMS_TO_TICKS(250);
+constexpr size_t kCodecWarmupFrames = kSampleRate / 4;
+
+void LogFlashHeapPoint(const char* point)
+{
+    wqn::services::AudioChannelHandle tx = nullptr;
+    wqn::services::AudioChannelHandle rx = nullptr;
+    TaskHandle_t playback_task = nullptr;
+    TaskHandle_t stream_task = nullptr;
+    if (g_flash.mutex != nullptr) {
+        xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+        tx = g_flash.stream_tx;
+        rx = g_flash.stream_rx;
+        playback_task = g_flash.playback_task;
+        stream_task = g_flash.stream_task;
+        xSemaphoreGive(g_flash.mutex);
+    } else {
+        tx = g_flash.stream_tx;
+        rx = g_flash.stream_rx;
+        playback_task = g_flash.playback_task;
+        stream_task = g_flash.stream_task;
+    }
+    ESP_LOGI(
+        kTag,
+        "[flash-heap] point=%s dma_free=%u dma_largest=%u internal_free=%u "
+        "internal_largest=%u desc=%u frames=%u bytes_per_frame=%u tx=%p "
+        "rx=%p tx_retained=%d rx_retained=%d playback_task=%p stream_task=%p",
+        point,
+        static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_DMA)),
+        static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_DMA)),
+        static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
+        static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)),
+        static_cast<unsigned>(kStreamDmaDescNum),
+        static_cast<unsigned>(kStreamDmaFrameNum),
+        static_cast<unsigned>(sizeof(int16_t) * 2U), tx, rx,
+        tx != nullptr, rx != nullptr, playback_task, stream_task);
+}
 
 // [playback-fix] FreeRTOS ringbuffer for decoded downlink PCM. Sized for
 // ~11 s of 24 kHz mono audio = 524288 bytes (512 KB). Cloud TTS (StepFun)
@@ -475,44 +670,6 @@ constexpr int64_t kAmpIdleTailMs = 600;    // turn amp off this long after last 
 // (the v2 downlink frames arrive in 24-byte-header + variable-length PCM chunks).
 constexpr size_t kPlaybackRingbufBytes = 524288;
 constexpr size_t kPlaybackRingbufItemMax = 4096;  // matches an average downlink chunk
-
-constexpr uint8_t ES8311_REG_RESET = 0x00;
-constexpr uint8_t ES8311_REG_CLK_MAN1 = 0x01;
-constexpr uint8_t ES8311_REG_CLK_MAN2 = 0x02;
-constexpr uint8_t ES8311_REG_CLK_MAN3 = 0x03;
-constexpr uint8_t ES8311_REG_RESERVED1 = 0x04;
-constexpr uint8_t ES8311_REG_RESERVED2 = 0x05;
-constexpr uint8_t ES8311_REG_RESERVED3 = 0x06;
-constexpr uint8_t ES8311_REG_RESERVED4 = 0x07;
-constexpr uint8_t ES8311_REG_SDPOUT = 0x0A;
-constexpr uint8_t ES8311_REG_SDPIN = 0x09;
-constexpr uint8_t ES8311_REG_SYSTEM1 = 0x0B;
-constexpr uint8_t ES8311_REG_SYSTEM2 = 0x0C;
-constexpr uint8_t ES8311_REG_ADC_CTRL1 = 0x10;
-constexpr uint8_t ES8311_REG_ADC_CTRL2 = 0x11;
-constexpr uint8_t ES8311_REG_ADC_DGAIN1 = 0x13;
-constexpr uint8_t ES8311_REG_ADC_DGAIN2 = 0x14;
-constexpr uint8_t ES8311_REG_ADC_DGAIN3 = 0x15;
-constexpr uint8_t ES8311_REG_ADC_DGAIN4 = 0x16;
-constexpr uint8_t ES8311_REG_ADC_DGAIN5 = 0x17;
-constexpr uint8_t ES8311_REG_ADC_DGAIN6 = 0x1B;
-constexpr uint8_t ES8311_REG_ADC_DGAIN7 = 0x1C;
-constexpr uint8_t ES8311_REG_GPIO = 0x44;
-constexpr uint8_t ES8311_REG_GP = 0x45;
-
-esp_err_t WriteEs8311Reg(
-    wqn::services::AudioCodecHandle dev, uint8_t reg, uint8_t value)
-{
-    return wqn::services::WriteAudioCodecRegister(
-        g_flash_audio_session, dev, reg, value);
-}
-
-esp_err_t ReadEs8311Reg(
-    wqn::services::AudioCodecHandle dev, uint8_t reg, uint8_t* value)
-{
-    return wqn::services::ReadAudioCodecRegister(
-        g_flash_audio_session, dev, reg, value);
-}
 
 // [amp-fix] Was: amp was hard-tied to power and forced off, so response.audio.delta
 // PCM data went into I2S TX but the user heard nothing (ES8311 line-out disabled).
@@ -624,6 +781,33 @@ void FlashPlaybackTask(void* /*param*/)
             xSemaphoreGive(g_flash.mutex);
             vTaskDelete(nullptr);
         }
+        // Interrupts must be honored even while the duplex TX channel does
+        // not exist yet (warmup): dropping queued PCM and resetting the
+        // PA/amp bookkeeping needs no I2S handle. Keeping this above the
+        // stream_tx guard means a stop pressed during first-turn codec init
+        // drains the queue instead of waiting for audio to come up.
+        if (g_flash.drain_playback.load(std::memory_order_relaxed)) {
+            size_t drain_size = 0;
+            char* drain_item = nullptr;
+            while ((drain_item = static_cast<char*>(xRingbufferReceive(
+                           g_flash.playback_ringbuf, &drain_size, 0))) != nullptr) {
+                vRingbufferReturnItem(g_flash.playback_ringbuf, drain_item);
+            }
+            g_flash.playback_queued_bytes.store(0, std::memory_order_release);
+            g_flash.drain_playback.store(false, std::memory_order_relaxed);
+            xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+            g_flash.playback_write_active = false;
+            g_flash.playback_abort_requested = false;
+            g_flash.amp_idle_armed = false;
+            xSemaphoreGive(g_flash.mutex);
+            continue;
+        }
+        if (g_flash.stream_tx == nullptr) {
+            // PCM cannot be played until the duplex TX channel exists.
+            // Wait and retry, leaving items in the ring buffer.
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
         size_t item_size = 0;
         char* item = static_cast<char*>(xRingbufferReceiveUpTo(
             g_flash.playback_ringbuf, &item_size, pdMS_TO_TICKS(100),
@@ -681,15 +865,6 @@ void FlashPlaybackTask(void* /*param*/)
                      static_cast<unsigned>(sample_count), max_sample, rms);
         }
 
-        if (g_flash.stream_tx == nullptr) {
-            // PCM cannot be played until the duplex TX channel exists. Put the
-            // block back after a short delay instead of dropping response audio
-            // during first-turn codec/I2S initialization.
-            vRingbufferReturnItem(g_flash.playback_ringbuf, item);
-            vTaskDelay(pdMS_TO_TICKS(10));
-            continue;
-        }
-
         // Mark the full blocking write as active before opening the PA. Do not
         // start the idle tail yet: a byte-buffer receive can represent much more
         // than 600 ms of PCM, and another task must not close GPIO46 mid-write.
@@ -710,7 +885,7 @@ void FlashPlaybackTask(void* /*param*/)
         SetStreamAudioAmp(true);
 
         // [hw-volume] PCM sent at 100% - volume is the ES8311 DAC register
-        // (0x32/0x31) set during InitStreamEs8311Adc, not software scaling
+        // (0x32/0x31) set by AudioService's duplex profile, not software scaling
         // (which ruined SNR + quantization + log feel).
         stereo.resize(sample_count * 2);
         for (size_t i = 0; i < sample_count; ++i) {
@@ -726,7 +901,10 @@ void FlashPlaybackTask(void* /*param*/)
         // the blocking write itself. At 24 kHz stereo s16, 6 x 256 DMA frames
         // hold about 64 ms; add that to the post-write PA tail.
         constexpr int64_t kStreamDmaTailMs =
-            (6LL * kStreamDmaFrameNum * 1000 + kSampleRate - 1) / kSampleRate;
+            (static_cast<int64_t>(kStreamDmaDescNum) *
+                 kStreamDmaFrameNum * 1000 +
+             kSampleRate - 1) /
+            kSampleRate;
         const int64_t audio_duration_ms =
             (static_cast<int64_t>(sample_count) * 1000 + kSampleRate - 1) /
             kSampleRate;
@@ -812,12 +990,16 @@ esp_err_t EnsurePlaybackRingbuf()
         g_flash.playback_write_active = false;
         g_flash.amp_idle_armed = false;
         g_flash.playback_stop.store(false, std::memory_order_relaxed);  // [i2s-handoff] clear stale stop from a prior StopFlashSession
-        const BaseType_t created = xTaskCreatePinnedToCore(
-            FlashPlaybackTask, "flash_playback", 4096, nullptr, 10,
-            &g_flash.playback_task, 1);
-        if (created != pdPASS) {
+        StackType_t* stack = EnsurePsramTaskStack(
+            &g_playback_task_stack, kPlaybackTaskStackBytes,
+            "flash_playback");
+        g_flash.playback_task = stack == nullptr ? nullptr
+            : xTaskCreateStaticPinnedToCore(
+                FlashPlaybackTask, "flash_playback",
+                kPlaybackTaskStackBytes, nullptr, 10, stack,
+                &g_playback_task_tcb, 1);
+        if (g_flash.playback_task == nullptr) {
             ESP_LOGE(kTag, "flash playback task create failed");
-            g_flash.playback_task = nullptr;
         }
     }
     const esp_err_t result =
@@ -829,141 +1011,13 @@ esp_err_t EnsurePlaybackRingbuf()
 
 esp_err_t InitStreamEs8311Adc(wqn::services::AudioBusHandle bus)
 {
-    // [init-once] ES8311 register sequence (incl. 0x00 reset + 0x0B bias) runs
-    // ONCE. Re-running reset per turn wipes the DAC bias (0x0B=0x44) -> DAC
-    // stops consuming I2S TX -> DMA fills -> ringbuffer full -> hiss/no-sound.
-    // Mirrors xiaozhi/Zectrix closed firmware: codec configured once at first
-    // use; subsequent turns only toggle mute/PA. (Gemini cross-checked.)
-    static uint32_t s_configured_session_id = 0;
-    if (s_configured_session_id == g_flash_audio_session.id) {
-        return ESP_OK;
+    if (bus == nullptr) {
+        return ESP_ERR_INVALID_ARG;
     }
-
-    wqn::services::AudioCodecHandle dev = nullptr;
-    ESP_RETURN_ON_ERROR(
-        wqn::services::AddAudioCodec(g_flash_audio_session, bus, &dev),
-        kTag, "add ES8311 device");
-
-    auto write = [&](uint8_t r, uint8_t v) { return WriteEs8311Reg(dev, r, v); };
-    auto read = [&](uint8_t r, uint8_t* v) { return ReadEs8311Reg(dev, r, v); };
-    esp_err_t ret = ESP_OK;
-
-    // [adc-fix] Use the verified ADC init sequence from audio_capture.cpp::
-    // InitEs8311Adc (lines 261-322), NOT the DAC sequence from audio_player.
-    // The DAC sequence was missing ADC-specific registers (ADC_REG15=0x40 MIC
-    // bias, ADC_REG16/17 PGA/ALC, SYSTEM14, CLK08, DAC37) -> ADC input path
-    // unconfigured -> max_sample=0 (silent mic). Register names mapped to this
-    // file's constants; bare addresses where no const exists (0x08/0x0D/0x0E/
-    // 0x12/0x37). Matches audio_capture.cpp verbatim.
-    ret |= write(ES8311_REG_GPIO, 0x08);            // GPIO_REG44
-    ret |= write(ES8311_REG_CLK_MAN1, 0x30);        // CLK01
-    ret |= write(ES8311_REG_CLK_MAN2, 0x00);        // CLK02
-    ret |= write(ES8311_REG_CLK_MAN3, 0x10);        // CLK03
-    ret |= write(ES8311_REG_ADC_DGAIN4, 0x24);      // 0x16 ADC_REG16 (MIC amp)
-    ret |= write(ES8311_REG_RESERVED1, 0x10);        // 0x04 CLK04
-    ret |= write(ES8311_REG_RESERVED2, 0x00);        // 0x05 CLK05
-    ret |= write(ES8311_REG_SYSTEM1, 0x00);          // 0x0B
-    ret |= write(ES8311_REG_SYSTEM2, 0x00);          // 0x0C
-    ret |= write(ES8311_REG_ADC_CTRL1, 0x1F);       // 0x10 (PGA volume)
-    ret |= write(ES8311_REG_ADC_CTRL2, 0x7F);       // 0x11 (ADC max gain)
-    ret |= write(ES8311_REG_RESET, 0x80);
-    vTaskDelay(pdMS_TO_TICKS(2));  // [init-fix] let ES8311 software reset take effect before read-back
-    uint8_t reg00 = 0;
-    if (read(ES8311_REG_RESET, &reg00) == ESP_OK) {
-        ret |= write(ES8311_REG_RESET, reg00 & 0xBF);
-    }  // [init-fix] read failed (I2C jitter) - skip RMW, not fatal (reset + later writes cover it)
-
-    // [analog-bias-fix] REG0B=0x00 aligns official esp_codec_dev es8311_open
-    // (es8311_ref.c:571) which never writes 0x44. Prior 0x44 was misattribution:
-    // the "0x00=silent" symptom was actually REG37=0x08 (ADC-only mode, fixed
-    // to 0x16). 0x44 changes VSEL/VMID analog bias -> unstable reference ->
-    // 味呲 hiss. If 0x00 silent on this board, root cause is elsewhere (not REG0B).
-    ret |= write(ES8311_REG_SYSTEM1, 0x00);  // 0x0B official esp_codec_dev value
-
-    ret |= write(ES8311_REG_CLK_MAN1, 0x3F);
-    uint8_t reg06 = 0;
-    if (read(ES8311_REG_RESERVED3, &reg06) == ESP_OK) {  // 0x06
-        ret |= write(ES8311_REG_RESERVED3, reg06 & ~0x20);
-    }  // [init-fix] read failed (I2C jitter) - skip RMW, not fatal (reset + later writes cover it)
-
-    ret |= write(ES8311_REG_ADC_DGAIN1, 0x10);      // 0x13 SYSTEM13
-    ret |= write(ES8311_REG_ADC_DGAIN6, 0x0A);      // 0x1B
-    ret |= write(ES8311_REG_ADC_DGAIN7, 0x6A);      // 0x1C
-    ret |= write(ES8311_REG_GPIO, 0x58);
-    ret |= write(ES8311_REG_CLK_MAN2, 0x00);
-    ret |= write(ES8311_REG_CLK_MAN3, 0x10);
-    ret |= write(ES8311_REG_RESERVED1, 0x10);        // 0x04
-    ret |= write(ES8311_REG_RESERVED2, 0x00);        // 0x05
-    ret |= write(ES8311_REG_RESERVED3, 0x0F);        // 0x06 (bclk_div = 16, esp_codec_dev official; 0x07 stereo experiment showed no effect - bclk_div not the root cause)
-    ret |= write(ES8311_REG_RESERVED4, 0x00);        // 0x07
-    ret |= write(0x08, 0xFF);                        // CLK08 (no const)
-
-    uint8_t reg = 0;
-    if (read(ES8311_REG_SDPOUT, &reg) == ESP_OK) {   // 0x0A
-        ret |= write(ES8311_REG_SDPOUT, (reg & ~0x40) | 0x0C);  // [wordlen-fix] 16bit I2S (bit[4:2]=011, bit[1:0]=00) - uplink ASR verified working at 0x0C; Gemini 0x0D (LJ) broke ASR
-    }  // [init-fix] read failed (I2C jitter) - skip RMW, not fatal (reset + later writes cover it)
-    if (read(ES8311_REG_SDPIN, &reg) == ESP_OK) {    // 0x09
-        ret |= write(ES8311_REG_SDPIN, (reg & ~0x40) | 0x0C);  // [wordlen-fix] 16bit I2S (bit[4:2]=011, bit[1:0]=00) - uplink ASR verified working at 0x0C; Gemini 0x0D (LJ) broke ASR
-    }  // [init-fix] read failed (I2C jitter) - skip RMW, not fatal (reset + later writes cover it)
-
-    ret |= write(ES8311_REG_ADC_DGAIN5, 0xBF);      // 0x17 ADC_REG17
-    ret |= write(0x0E, 0x02);                        // SYSTEM0E
-    ret |= write(0x12, 0x00);                        // SYSTEM12
-    ret |= write(ES8311_REG_ADC_DGAIN2, 0x1A);      // 0x14 SYSTEM14
-    if (read(ES8311_REG_ADC_DGAIN2, &reg) == ESP_OK) {
-        ret |= write(ES8311_REG_ADC_DGAIN2, reg & ~0x40);
-    }  // [init-fix] read failed (I2C jitter) - skip RMW, not fatal (reset + later writes cover it)
-    ret |= write(0x0D, 0x01);                        // SYSTEM0D
-    ret |= write(ES8311_REG_ADC_DGAIN3, 0x40);      // 0x15 ADC_REG15 (MIC bias) -- KEY: was 0x00
-    ret |= write(0x37, 0x08);  // Official esp_codec_dev DAC/BOTH value; clean A/B with corrected REG32 and PA timing.
-    ret |= write(ES8311_REG_GP, 0x00);               // 0x45
-
-    // [hw-volume] Apply persisted volume before the final DAC readback so the
-    // log reflects the registers used for playback.
-    wqn::SetEs8311Volume(
-        g_flash_audio_session, dev, wqn::GetPlaybackVolumePercent());
-
-    // Read back key ADC and DAC registers to confirm the complete init landed.
-    // Expected: SDPIN(0x09) bit6=0, SDPOUT(0x0A) bit6=0 (both interfaces powered),
-    // SYS1(0x0B)=0x44, CLK06=0x0F, CLK04=0x10, ADC10=0x1F, ADC11=0x7F, ALC1B=0x0A.
-    // If SDPOUT bit6=1 -> ADC still in power-down. If reads return 0xFF -> I2C no-ACK.
-    {
-        uint8_t v09=0xFF, v0A=0xFF, v0B=0xFF, v06=0xFF, v04=0xFF, v10=0xFF, v11=0xFF, v14=0xFF, v1B=0xFF, v37=0xFF;
-        uint8_t v0D=0xFF, v0E=0xFF, v12=0xFF, v13=0xFF, v31=0xFF, v32=0xFF;
-        read(0x09, &v09); read(0x0A, &v0A); read(0x0B, &v0B);
-        read(0x06, &v06); read(0x04, &v04);
-        read(0x10, &v10); read(0x11, &v11); read(0x14, &v14); read(0x1B, &v1B); read(0x37, &v37);
-        read(0x0D, &v0D); read(0x0E, &v0E); read(0x12, &v12); read(0x13, &v13); read(0x31, &v31); read(0x32, &v32);
-        ESP_LOGI(kTag, "es8311 readback: SDPIN=0x%02x SDPOUT=0x%02x SYS1=0x%02x CLK06=0x%02x CLK04=0x%02x ADC10=0x%02x ADC11=0x%02x ADC14=0x%02x ALC1B=0x%02x DAC37=0x%02x",
-                 v09, v0A, v0B, v06, v04, v10, v11, v14, v1B, v37);
-        // DAC analog-domain readback after SetEs8311Volume. Expected: REG0D=0x01,
-        // REG0E=0x02, REG12=0x00, REG13=0x10, REG31 bit6:5 clear when unmuted,
-        // and REG32=0xBF at 100% (0 dB).
-        ESP_LOGI(kTag, "es8311 dac readback: REG0D=0x%02x REG0E=0x%02x REG12=0x%02x REG13=0x%02x REG31=0x%02x REG32=0x%02x",
-                 v0D, v0E, v12, v13, v31, v32);
-    }
-
-    const esp_err_t remove_result =
-        wqn::services::RemoveAudioCodec(g_flash_audio_session, &dev);
-    if (remove_result != ESP_OK) {
-        return remove_result;
-    }
-    // [init-fix] Do NOT fail the whole ADC init on a single register-write
-    // jitter. The ES8311 sequence is idempotent (later writes overwrite
-    // earlier ones) and the readback above already confirms the key registers
-    // landed (ADC10/11/14, ALC1B, DAC37, CLK06/04). A single I2C no-ACK on an
-    // untracked register (GPIO/SYSTEM/0x08) used to set ret!=ESP_OK -> init
-    // "failed" -> the streaming task was killed -> "I2S read timeout" +
-    // max_sample=0 cascaded, even though 99% of writes succeeded. Log and
-    // soldier on; the readback is the real verdict.
-    if (ret != ESP_OK) {
-        ESP_LOGW(kTag, "es8311 ADC init: some register writes jittered (ret=%s) - readback above, continuing", esp_err_to_name(ret));
-    }
-    // Skip reset only within this exact Flash session. A capture/player session
-    // may reconfigure the same codec between Flash visits, so a process-wide
-    // boolean would leave the next Flash session using the wrong profile.
-    s_configured_session_id = g_flash_audio_session.id;
-    return ESP_OK;
+    return wqn::services::ConfigureAudioCodec(
+        g_flash_audio_session,
+        wqn::services::AudioCodecProfile::kDuplex,
+        wqn::GetPlaybackVolumePercent());
 }
 
 esp_err_t InitStreamI2sDuplex(
@@ -988,19 +1042,77 @@ esp_err_t InitStreamI2sDuplex(
         rx_handle, &g_flash.stream_tx);
 }
 
+esp_err_t WarmupStreamAdc()
+{
+    if (g_flash.stream_rx == nullptr) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    // Match the board reference: let the analog/reference path settle after
+    // codec open, then actively drain 250 ms of ADC data before TLS starts.
+    vTaskDelay(kCodecWarmup);
+    uint8_t buffer[kStreamChunkBytes * 2] = {};
+    size_t discarded_frames = 0;
+    while (discarded_frames < kCodecWarmupFrames) {
+        size_t bytes_read = 0;
+        const esp_err_t read_result = wqn::services::ReadAudioChannel(
+            g_flash_audio_session, g_flash.stream_rx,
+            buffer, sizeof(buffer), &bytes_read,
+            pdMS_TO_TICKS(200));
+        if (read_result != ESP_OK) {
+            ESP_LOGE(kTag,
+                     "Flash ADC warmup read failed: result=%s (%d) rx=%p discarded_frames=%u",
+                     esp_err_to_name(read_result),
+                     static_cast<int>(read_result), g_flash.stream_rx,
+                     static_cast<unsigned>(discarded_frames));
+            return read_result;
+        }
+        if (bytes_read == 0) {
+            ESP_LOGE(kTag,
+                     "Flash ADC warmup made no progress: rx=%p discarded_frames=%u",
+                     g_flash.stream_rx,
+                     static_cast<unsigned>(discarded_frames));
+            return ESP_ERR_INVALID_STATE;
+        }
+        discarded_frames += bytes_read / (sizeof(int16_t) * 2U);
+    }
+    ESP_LOGI(kTag, "Flash audio hardware warm: discarded_frames=%u",
+             static_cast<unsigned>(discarded_frames));
+    return ESP_OK;
+}
+
+esp_err_t PrepareStreamHardware()
+{
+    ESP_LOGI(kTag,
+             "Flash audio reserve begin: dma_free=%u dma_largest=%u internal_free=%u internal_largest=%u",
+             static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_DMA)),
+             static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_DMA)),
+             static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
+             static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)));
+    ESP_RETURN_ON_ERROR(
+        wqn::services::GetSharedAudioBus(
+            g_flash_audio_session, &g_flash.stream_i2c_bus),
+        kTag, "get Flash shared I2C bus");
+    ESP_RETURN_ON_ERROR(
+        InitStreamI2sDuplex(&g_flash.stream_rx),
+        kTag, "reserve Flash duplex I2S");
+    vTaskDelay(kI2sClockWarmup);
+    ESP_RETURN_ON_ERROR(
+        InitStreamEs8311Adc(g_flash.stream_i2c_bus),
+        kTag, "configure Flash ES8311 duplex profile");
+    ESP_RETURN_ON_ERROR(WarmupStreamAdc(), kTag, "warm Flash audio path");
+    ESP_LOGI(kTag,
+             "Flash audio reserve complete: dma_free=%u dma_largest=%u",
+             static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_DMA)),
+             static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_DMA)));
+    return ESP_OK;
+}
+
 void CleanupStreamHardware()
 {
-    // Release the duplex I2S channels (RX + TX) that this module created.
-    // Do NOT delete any shared I2C bus or pull codec power — those are managed
-    // by audio_player (which is also using the same ES8311 codec and audio amp).
-    // Pulling the power here would cut off any audio that is still being played.
-    // [inflight-fix] Do NOT disable/delete I2S channels here. They are常驻
-    // (created once in InitStreamI2sDuplex, reused across turns). Deleting TX
-    // here meant TTS playback (which runs AFTER capture stops) found
-    // stream_tx=nullptr and skipped i2s_channel_write -> no sound. Disabling
-    // TX would break TTS the same way. Mirrors xiaozhi/Zectrix closed
-    // firmware: I2S channels stay enabled; only codec power/mute toggles.
-    // (RX/TX handles remain valid for the next turn + for FlashPlaybackTask.)
+    // Per-turn capture cleanup only drops the borrowed bus pointer. Keep the
+    // duplex channels enabled for the response playback that follows capture;
+    // session-level TearDownStreamChannels releases them before another audio
+    // activity may claim I2S_NUM_0. AudioService owns the rail and amplifier.
     if (g_flash.stream_i2c_bus != nullptr) {
         g_flash.stream_i2c_bus = nullptr;
     }
@@ -1034,13 +1146,19 @@ void FinishAudioStreamingTask(const char* error_message = nullptr)
 // FlashPlaybackTask (writer of stream_tx) is stopped here first.
 esp_err_t TearDownStreamChannels()
 {
+    const wqn::services::AudioChannelHandle tx_before = g_flash.stream_tx;
+    const wqn::services::AudioChannelHandle rx_before = g_flash.stream_rx;
+    esp_err_t tx_disable_result = ESP_OK;
+    esp_err_t tx_delete_result = ESP_OK;
+    esp_err_t rx_disable_result = ESP_OK;
+    esp_err_t rx_delete_result = ESP_OK;
     // 1. Stop FlashPlaybackTask so stream_tx has no writer. drain_playback
     //    discards in-flight PCM; playback_stop makes the task self-exit at its
     //    loop top (polled every 100 ms). Disabling stream_tx first breaks any
     //    blocked i2s_channel_write (returns INVALID_STATE) so the task unblocks
     //    even mid-write.
     if (g_flash.stream_tx != nullptr) {
-        wqn::services::DisableAudioChannel(
+        tx_disable_result = wqn::services::DisableAudioChannel(
             g_flash_audio_session, g_flash.stream_tx);
     }
     if (g_flash.playback_task != nullptr) {
@@ -1056,10 +1174,9 @@ esp_err_t TearDownStreamChannels()
 
     // 2. Delete stream_tx (safe now: playback task stopped). If the playback
     //    task somehow didn't exit, skip to avoid use-after-free on stream_tx.
-    bool tx_torn_down = false;
     if (g_flash.playback_task == nullptr && g_flash.stream_tx != nullptr) {
-        tx_torn_down = wqn::services::DeleteAudioChannel(
-            g_flash_audio_session, &g_flash.stream_tx) == ESP_OK;
+        tx_delete_result = wqn::services::DeleteAudioChannel(
+            g_flash_audio_session, &g_flash.stream_tx);
     } else if (g_flash.playback_task != nullptr) {
         ESP_LOGE(kTag, "playback task still alive; skipping stream_tx teardown (UAF risk)");
     }
@@ -1075,17 +1192,30 @@ esp_err_t TearDownStreamChannels()
         xSemaphoreGive(g_flash.mutex);
     }
     if (stream_task == nullptr && g_flash.stream_rx != nullptr) {
-        wqn::services::DisableAudioChannel(
+        rx_disable_result = wqn::services::DisableAudioChannel(
             g_flash_audio_session, g_flash.stream_rx);
-        wqn::services::DeleteAudioChannel(
+        rx_delete_result = wqn::services::DeleteAudioChannel(
             g_flash_audio_session, &g_flash.stream_rx);
     } else if (stream_task != nullptr) {
         ESP_LOGE(kTag, "stream task still alive; skipping stream_rx teardown (UAF risk)");
     }
 
-    ESP_LOGI(kTag, "stream I2S teardown: tx=%s rx=%s",
-             tx_torn_down ? "released" : "kept",
-             (g_flash.stream_rx == nullptr) ? "released" : "kept");
+    const char* tx_disposition = tx_before == nullptr
+        ? "absent"
+        : (g_flash.stream_tx == nullptr ? "released" : "retained");
+    const char* rx_disposition = rx_before == nullptr
+        ? "absent"
+        : (g_flash.stream_rx == nullptr ? "released" : "retained");
+    ESP_LOGI(
+        kTag,
+        "stream I2S teardown: tx=%s rx=%s tx_before=%p tx_after=%p "
+        "rx_before=%p rx_after=%p tx_disable=%s tx_delete=%s "
+        "rx_disable=%s rx_delete=%s",
+        tx_disposition, rx_disposition, tx_before, g_flash.stream_tx,
+        rx_before, g_flash.stream_rx,
+        esp_err_to_name(tx_disable_result), esp_err_to_name(tx_delete_result),
+        esp_err_to_name(rx_disable_result), esp_err_to_name(rx_delete_result));
+    LogFlashHeapPoint("H-after-teardown");
     return g_flash.stream_tx == nullptr && g_flash.stream_rx == nullptr
         ? ESP_OK
         : ESP_ERR_INVALID_STATE;
@@ -1094,40 +1224,31 @@ esp_err_t TearDownStreamChannels()
 void AudioStreamingTask(void* param)
 {
     (void)param;
-    // [deadlock-fix] ES8311 warm-up delay moved here from StartAudioStreaming
-    // so the WS client lock is released before we sleep. See comment there.
-    vTaskDelay(pdMS_TO_TICKS(250));
-
     uint8_t i2s_buf[kStreamChunkBytes * 2];  // stereo, 2 bytes/sample
-
-    // Audio must use the board's one shared I2C bus. Creating a fallback bus
-    // here races the RTC/NFC/codec owners and can panic with INVALID_STATE.
-    if (wqn::services::GetSharedAudioBus(
-            g_flash_audio_session, &g_flash.stream_i2c_bus) != ESP_OK) {
-        ESP_LOGE(kTag, "shared I2C bus unavailable; refusing private Flash bus");
-        FinishAudioStreamingTask("音频总线初始化失败");
-        return;
-    }
-
-    // Init ES8311 ADC
-    if (InitStreamEs8311Adc(g_flash.stream_i2c_bus) != ESP_OK) {
-        ESP_LOGW(kTag, "stream ES8311 ADC init failed");
-        FinishAudioStreamingTask("麦克风初始化失败");
-        return;
-    }
-
-    // Init I2S RX
-    if (InitStreamI2sDuplex(&g_flash.stream_rx) != ESP_OK) {
-        ESP_LOGW(kTag, "stream I2S RX init failed");
+#if CONFIG_WQN_FLASH_PROTOCOL_V2
+    // Reuse one PSRAM-backed frame allocation for the whole session instead
+    // of allocating/freeing a 744-byte vector every 15 ms.
+    std::vector<uint8_t> uplink_frame;
+    uplink_frame.reserve(sizeof(AudioFrameHeader) + kStreamChunkBytes);
+#endif
+    uint32_t uplink_append_count = 0;
+    if (g_flash.stream_rx == nullptr || g_flash.stream_tx == nullptr) {
+        ESP_LOGW(kTag, "stream hardware missing after preflight");
         FinishAudioStreamingTask("音频通道初始化失败");
         return;
     }
 
-    ESP_LOGI(kTag, "audio streaming task started");
+    ESP_LOGI(kTag,
+             "audio streaming task started: stack=psram dma_free=%u dma_largest=%u internal_free=%u internal_largest=%u stack_hwm=%u",
+             static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_DMA)),
+             static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_DMA)),
+             static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
+             static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)),
+             static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
 
-    // [adc-warmup] Discard the first few chunks after init: the ES8311 ADC
-    // needs ~60ms to stabilize after power-on, and the first samples are zero
-    // (cold-start pcm diag shows max_sample=0 -> empty ASR for the first turn).
+    // The codec was warmed before WebSocket/TLS allocation. Drain the live RX
+    // ring once more here so a long session handshake cannot prepend stale
+    // pre-session samples to the user's turn.
     for (int warmup = 0; warmup < 4; ++warmup) {
         size_t warmup_bytes = 0;
         wqn::services::ReadAudioChannel(
@@ -1216,34 +1337,78 @@ void AudioStreamingTask(void* param)
         // Send via WebSocket if connected.
         // v2 uses binary frames (24-byte header + PCM); v1 fallback sends
         // {"type":"input_audio_buffer.append","audio":"<base64>"}.
-        bool ws_ok = false;
+        esp_websocket_client_handle_t send_client = nullptr;
         xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
-        ws_ok = g_flash.ws_connected && (g_flash.ws_client != nullptr);
+        if (g_flash.ws_connected && g_flash.ws_client != nullptr) {
+            send_client = g_flash.ws_client;
+            g_flash.active_ws_sends.fetch_add(1, std::memory_order_relaxed);
+        }
         xSemaphoreGive(g_flash.mutex);
-        if (ws_ok) {
+        FlashWsSendRegistration send_registration(send_client);
+        if (send_client != nullptr) {
 #if CONFIG_WQN_FLASH_PROTOCOL_V2
-            std::vector<uint8_t> frame;
-            BuildV2AudioFrame(&frame, reinterpret_cast<const uint8_t*>(mono_buf), mono_bytes, ++g_flash.uplink_seq, /*final=*/false);
-            // [timeout-fix] Was 50ms - WiFi jitter fills TCP tx buffer for
-            // >50ms -> send returns 0 -> WS client treats as fatal -> closes
-            // connection (code 1006). 1000ms lets TCP retransmit recover.
-            esp_websocket_client_send_bin(g_flash.ws_client,
-                                         reinterpret_cast<const char*>(frame.data()),
-                                         frame.size(),
-                                         pdMS_TO_TICKS(1000));
+            uplink_frame.clear();
+            const uint32_t seq = ++g_flash.uplink_seq;
+            BuildV2AudioFrame(
+                &uplink_frame, reinterpret_cast<const uint8_t*>(mono_buf),
+                mono_bytes, seq, /*final=*/false);
+            // Sustained 24 kHz PCM can briefly fill the TCP send window while
+            // WiFi retransmits.  The previous 1 s deadline made that ordinary
+            // backpressure fatal inside esp_websocket_client.  Use the same
+            // bounded 2.5 s transport budget as STD/PRO and verify the exact
+            // number of bytes accepted; never report an append that failed.
+            const int64_t send_started_us = esp_timer_get_time();
+            const int sent = esp_websocket_client_send_bin(
+                send_client,
+                reinterpret_cast<const char*>(uplink_frame.data()),
+                uplink_frame.size(), pdMS_TO_TICKS(2500));
+            const int64_t send_elapsed_ms =
+                (esp_timer_get_time() - send_started_us) / 1000;
+            if (sent != static_cast<int>(uplink_frame.size())) {
+                ESP_LOGW(kTag,
+                         "uplink send failed: seq=%u sent=%d expected=%u elapsed_ms=%lld dma_free=%u dma_largest=%u internal_free=%u internal_largest=%u stack_hwm=%u",
+                         static_cast<unsigned>(seq), sent,
+                         static_cast<unsigned>(uplink_frame.size()),
+                         static_cast<long long>(send_elapsed_ms),
+                         static_cast<unsigned>(
+                             heap_caps_get_free_size(MALLOC_CAP_DMA)),
+                         static_cast<unsigned>(
+                             heap_caps_get_largest_free_block(MALLOC_CAP_DMA)),
+                         static_cast<unsigned>(
+                             heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
+                         static_cast<unsigned>(
+                             heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)),
+                         static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
+                RequestFlashTerminalStop(
+                    FlashTerminalReason::kTransportError);
+                break;
+            }
+            if (send_elapsed_ms >= 100) {
+                ESP_LOGW(kTag,
+                         "uplink send recovered after backpressure: seq=%u bytes=%u elapsed_ms=%lld",
+                         static_cast<unsigned>(seq),
+                         static_cast<unsigned>(uplink_frame.size()),
+                         static_cast<long long>(send_elapsed_ms));
+            }
             // [i2s-diag] Confirm uplink audio is actually being sent. Paired
             // with the I2S timeout log above: if this never prints but timeouts
             // do, the capture path is dead. If this prints but StepFun still
             // says "append not called", the proxy/StepFun side is dropping them.
-            static int uplink_append_count = 0;
-            if (++uplink_append_count % 66 == 1) {
-                ESP_LOGI(kTag, "uplink append #%d seq=%u bytes=%u",
-                         uplink_append_count, g_flash.uplink_seq, (unsigned)mono_bytes);
+            ++uplink_append_count;
+            if (uplink_append_count % 66 == 1) {
+                ESP_LOGI(kTag,
+                         "uplink append #%u seq=%u bytes=%u dma_free=%u dma_largest=%u internal_free=%u stack_hwm=%u",
+                         static_cast<unsigned>(uplink_append_count), seq,
+                         static_cast<unsigned>(mono_bytes),
+                         static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_DMA)),
+                         static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_DMA)),
+                         static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
+                         static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
             }
 #else
             std::string b64 = EncodeBase64(reinterpret_cast<const uint8_t*>(mono_buf), mono_bytes);
             std::string msg = R"({"type":"input_audio_buffer.append","audio":"}" + b64 + R"("})";
-            esp_websocket_client_send_text(g_flash.ws_client, msg.c_str(), msg.size(), pdMS_TO_TICKS(1000));
+            esp_websocket_client_send_text(send_client, msg.c_str(), msg.size(), pdMS_TO_TICKS(1000));
 #endif
         }
     }
@@ -1266,13 +1431,9 @@ void StartAudioStreaming()
     }
     // The codec rail is owned by AudioService and remains warm while running.
     g_flash.stream_audio_powered = true;
-    // [deadlock-fix] The 250ms ES8311 warm-up delay was here, but
-    // StartAudioStreaming() is called from WebsocketEventHandler which
-    // holds the WS client's internal lock. vTaskDelay here blocks the WS
-    // task for 250ms, and the AudioStreamingTask (priority 10) that we
-    // create below preempts and tries esp_websocket_client_send_bin()
-    // which needs that same lock -> 5s timeout deadlock. Move the delay
-    // into AudioStreamingTask so the WS lock is released immediately.
+    // All blocking hardware setup and warm-up completed on the lifecycle task
+    // before WebSocket start. This callback path only starts the PCM worker,
+    // so it never sleeps while the WebSocket client lock is held.
 
     // Capture starts with the speaker path closed. Do not set the drain flag
     // here: on the first turn the playback task may be blocked waiting for its
@@ -1281,10 +1442,13 @@ void StartAudioStreaming()
     g_flash.amp_idle_armed = false;
     SetStreamAudioAmp(false);
 
-    const BaseType_t created = xTaskCreatePinnedToCore(
-        &AudioStreamingTask, "flash_stream", 8192, nullptr, 10,
-        &g_flash.stream_task, 1);
-    if (created != pdPASS) {
+    StackType_t* stack = EnsurePsramTaskStack(
+        &g_stream_task_stack, kStreamTaskStackBytes, "flash_stream");
+    g_flash.stream_task = stack == nullptr ? nullptr
+        : xTaskCreateStaticPinnedToCore(
+            &AudioStreamingTask, "flash_stream", kStreamTaskStackBytes,
+            nullptr, 10, stack, &g_stream_task_tcb, 1);
+    if (g_flash.stream_task == nullptr) {
         g_flash.stream_task = nullptr;
         g_flash.capture_started = false;
         SetErrorLocked("录音任务启动失败");
@@ -1311,10 +1475,10 @@ void StopAudioStreaming()
         return;
     }
     // [panic-fix] Wait for the task to self-delete. The task can block in
-    // esp_websocket_client_send_bin (1 s timeout) or i2s_channel_read (200 ms),
-    // so it needs up to ~1.2 s after capture_started is cleared to exit. 3.0 s
-    // covers two send_bin timeouts + jitter. If it still doesn't exit, leave it
-    // alive (see below) - never vTaskDelete (corrupts FreeRTOS lists -> reboot).
+    // esp_websocket_client_send_bin (2.5 s timeout) or i2s_channel_read
+    // (200 ms), so 3.0 s covers the bounded call plus scheduling jitter. If it
+    // still doesn't exit, leave it alive; the lifecycle task will not destroy
+    // the registered WebSocket client while this sender remains active.
     for (int i = 0; i < 300; ++i) {  // 3.0s (was 2.0s)
         vTaskDelay(pdMS_TO_TICKS(10));
         xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
@@ -1325,8 +1489,8 @@ void StopAudioStreaming()
             return;
         }
     }
-    // Task still alive — force cleanup (rare fallback for hung task)
-    ESP_LOGE(kTag, "streaming task did not exit within 3s; leaving alive (will exit on WS destroy)");
+    // Task still alive — keep the task and its WebSocket lifetime registered.
+    ESP_LOGE(kTag, "streaming task did not exit within 3s; deferring client destroy");
     CleanupStreamHardware();
     // Do not query or delete `task` here: it may self-delete between the poll
     // and this point, making even eTaskGetState(task) a stale-handle access.
@@ -1356,6 +1520,15 @@ void ParseAndHandleEvent(const char* data, size_t len)
     // JSON string escapes correctly and is what every other parser in this
     // project already uses (wqn_api.cpp, word_pack.cpp).
     if (g_flash.mutex == nullptr || data == nullptr || len == 0) {
+        return;
+    }
+
+    constexpr size_t kMaxJsonNestingDepth = 16;
+    if (!wqn::protocol::JsonNestingWithinLimit(
+            data, len, kMaxJsonNestingDepth)) {
+        ESP_LOGW(kTag, "WS event JSON nesting exceeds %u, dropping (len=%u)",
+                 static_cast<unsigned>(kMaxJsonNestingDepth),
+                 static_cast<unsigned>(len));
         return;
     }
 
@@ -1696,7 +1869,6 @@ void WebsocketEventHandler(void* handler_args, esp_event_base_t, int32_t event_i
 
     switch (static_cast<esp_websocket_event_id_t>(event_id)) {
         case WEBSOCKET_EVENT_CONNECTED: {
-            ESP_LOGI(kTag, "WebSocket connected");
             xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
             g_flash.ws_connected = true;
             g_flash.status = InternalStatus::kSessionUpdating;
@@ -1705,8 +1877,27 @@ void WebsocketEventHandler(void* handler_args, esp_event_base_t, int32_t event_i
             g_flash.uplink_seq = 0;
             MarkChanged();
             esp_websocket_client_handle_t client = g_flash.ws_client;
+            if (client != nullptr) {
+                g_flash.active_ws_sends.fetch_add(1, std::memory_order_relaxed);
+            }
             xSemaphoreGive(g_flash.mutex);
+            FlashWsSendRegistration send_registration(client);
             if (client == nullptr) break;
+
+            // PCM frames arrive every 15 ms and are smaller than one TCP MSS.
+            // Disable Nagle on the device-facing socket so a delayed ACK does
+            // not let four small TLS records fill lwIP's 5,760-byte send
+            // window before the fifth append. The relay already applies the
+            // same policy to its upstream realtime socket.
+            const esp_err_t nodelay_result =
+                esp_websocket_client_set_tcp_nodelay(client, true);
+            ESP_LOGI(kTag,
+                     "WebSocket connected: tcp_nodelay=%s dma_free=%u dma_largest=%u internal_free=%u internal_largest=%u",
+                     esp_err_to_name(nodelay_result),
+                     static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_DMA)),
+                     static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_DMA)),
+                     static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
+                     static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)));
 
 #if CONFIG_WQN_FLASH_PROTOCOL_V2
             // [api-fix] session.update aligned to StepFun official Realtime API
@@ -1943,22 +2134,25 @@ esp_err_t InitFlashSession()
     g_flash.status = InternalStatus::kIdle;
     g_flash.status_since_ms = esp_timer_get_time() / 1000;
     xSemaphoreGive(g_flash.mutex);
-    // [playback-fix] Ringbuffer + playback task are allocated once, up front,
-    // so the WS event path can never hit a null ringbuffer in steady state.
-    return EnsurePlaybackRingbuf();
+    // Flash's DMA/I2S reservation must precede dynamic playback/WebSocket task
+    // allocation. StartFlashSessionNow creates the playback path after audio
+    // hardware warm-up and before WebSocket start.
+    return ESP_OK;
 }
 
 esp_err_t StartFlashSession()
 {
+    LogFlashHeapPoint("A-before-flash-session-request");
     if (g_flash.mutex == nullptr) {
         const esp_err_t init_result = InitFlashSession();
         if (init_result != ESP_OK) {
             return init_result;
         }
     }
-    ESP_RETURN_ON_ERROR(
-        EnsurePlaybackRingbuf(), kTag, "prepare Flash playback buffer");
-
+    if (g_teardown_pending.load(std::memory_order_acquire)) {
+        ESP_LOGI(kTag, "Flash start deferred while prior teardown is pending");
+        return ESP_ERR_INVALID_STATE;
+    }
     xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
     if (g_flash.ws_client != nullptr) {
         xSemaphoreGive(g_flash.mutex);
@@ -1969,20 +2163,11 @@ esp_err_t StartFlashSession()
         xSemaphoreGive(g_flash.mutex);
         return ESP_ERR_INVALID_STATE;
     }
-
-    // A dormant one-shot player may still own I2S_NUM_0. Release it before
-    // claiming the single AudioService activity slot. Capture and another
-    // Flash session remain explicit conflicts.
-    const esp_err_t playback_stop_result = wqn::StopAudioPlayback();
-    if (playback_stop_result != ESP_OK) {
-        xSemaphoreGive(g_flash.mutex);
-        return playback_stop_result;
-    }
-    const esp_err_t audio_result = wqn::services::BeginAudioActivity(
-        wqn::services::AudioActivity::kFlash, &g_flash_audio_session);
-    if (audio_result != ESP_OK) {
-        xSemaphoreGive(g_flash.mutex);
-        return audio_result;
+    uint32_t generation =
+        g_session_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
+    if (generation == 0) {
+        generation = 1;
+        g_session_generation.store(generation, std::memory_order_release);
     }
     g_flash.status = InternalStatus::kConnecting;
     g_flash.pending_text = "正在连接...";
@@ -1994,40 +2179,167 @@ esp_err_t StartFlashSession()
     g_flash.response_started = false;
     g_flash.status_since_ms = esp_timer_get_time() / 1000;
     MarkChanged();
+    g_start_generation.store(generation, std::memory_order_relaxed);
+    g_start_pending.store(true, std::memory_order_release);
     xSemaphoreGive(g_flash.mutex);
+    xTaskNotifyGive(g_lifecycle_task);
+    return ESP_OK;
+}
 
-    esp_err_t result = services::StartConnectivity();
-    if (result != ESP_OK) {
-        result = services::WaitForConnectivity(kWifiReadyWait);
-        if (result != ESP_OK) {
-            xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
-            SetErrorLocked("WiFi 未就绪");
-            ESP_ERROR_CHECK_WITHOUT_ABORT(
-                services::EndAudioActivity(&g_flash_audio_session));
-            xSemaphoreGive(g_flash.mutex);
-            return result;
-        }
-    } else if (!services::IsConnectivityOnline()) {
-        result = services::WaitForConnectivity(kWifiReadyWait);
-        if (result != ESP_OK) {
-            xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
-            SetErrorLocked("WiFi 未连接");
-            ESP_ERROR_CHECK_WITHOUT_ABORT(
-                services::EndAudioActivity(&g_flash_audio_session));
-            xSemaphoreGive(g_flash.mutex);
-            return result;
-        }
+esp_err_t StartFlashSessionNow(uint32_t generation)
+{
+    if (generation == 0 ||
+        generation != g_session_generation.load(std::memory_order_acquire)) {
+        return ESP_ERR_INVALID_STATE;
     }
-
     std::string access_token;
     esp_err_t tok_err = wqn::LoadAccessToken(&access_token);
     if (tok_err != ESP_OK || access_token.empty()) {
         xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
         SetErrorLocked("未登录，请先完成账号配对");
-        ESP_ERROR_CHECK_WITHOUT_ABORT(
-            services::EndAudioActivity(&g_flash_audio_session));
+        g_flash_connectivity_demand.Reset();
         xSemaphoreGive(g_flash.mutex);
         return ESP_ERR_INVALID_STATE;
+    }
+
+    services::ConnectivityDemand connectivity_demand =
+        services::AcquireConnectivityDemand(
+            services::ConnectivityDemandReason::kAiInteractive,
+            "flash-session",
+            __FILE__,
+            __LINE__);
+    if (!connectivity_demand) {
+        xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+        SetErrorLocked("网络任务繁忙，请稍后重试");
+        xSemaphoreGive(g_flash.mutex);
+        return ESP_ERR_INVALID_STATE;
+    }
+    services::ConnectivityDemandTicket ticket = connectivity_demand.ticket();
+    xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+    const bool admit_connect =
+        generation == g_session_generation.load(std::memory_order_acquire) &&
+        g_flash.status == InternalStatus::kConnecting &&
+        !g_teardown_pending.load(std::memory_order_acquire);
+    if (admit_connect) {
+        g_flash_connectivity_demand = std::move(connectivity_demand);
+        ticket = g_flash_connectivity_demand.ticket();
+    }
+    xSemaphoreGive(g_flash.mutex);
+    if (!admit_connect) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    LogFlashHeapPoint("B-after-wifi-demand-acquire");
+
+    const services::ConnectivityWaitResult wait_result =
+        services::WaitForConnectivity(ticket, kWifiReadyWait);
+    if (wait_result != services::ConnectivityWaitResult::kOnline) {
+        xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+        if (generation == g_session_generation.load(std::memory_order_acquire) &&
+            !g_teardown_pending.load(std::memory_order_acquire)) {
+            switch (wait_result) {
+                case services::ConnectivityWaitResult::kNeedsProvisioning:
+                    SetErrorLocked("未配置 WiFi，请先在设置中配网");
+                    break;
+                case services::ConnectivityWaitResult::kAuthFailed:
+                    SetErrorLocked("WiFi 密码错误，请重新配网");
+                    break;
+                case services::ConnectivityWaitResult::kTimedOut:
+                    SetErrorLocked("WiFi 连接超时，请稍后重试");
+                    break;
+                case services::ConnectivityWaitResult::kCancelled:
+                    break;
+                default:
+                    SetErrorLocked("WiFi 暂时不可用，请稍后重试");
+                    break;
+            }
+        }
+        g_flash_connectivity_demand.Reset();
+        xSemaphoreGive(g_flash.mutex);
+        ESP_LOGW(
+            kTag,
+            "Flash WiFi wait failed: result=%s generation=%lu",
+            services::ConnectivityWaitResultName(wait_result),
+            static_cast<unsigned long>(generation));
+        return services::ConnectivityWaitResultToEspErr(wait_result);
+    }
+
+    xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+    const bool still_current =
+        generation == g_session_generation.load(std::memory_order_acquire) &&
+        g_flash.status == InternalStatus::kConnecting &&
+        g_flash_connectivity_demand.ticket().id == ticket.id &&
+        !g_teardown_pending.load(std::memory_order_acquire);
+    xSemaphoreGive(g_flash.mutex);
+    if (!still_current) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    // Network association happens before I2S ownership. This keeps an absent
+    // AP from pinning AudioActivity for the entire connection budget and the
+    // lifecycle task, not the UI task, owns every blocking step.
+    const esp_err_t playback_stop_result = wqn::StopAudioPlayback();
+    if (playback_stop_result != ESP_OK) {
+        xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+        SetErrorLocked("音频资源释放失败");
+        g_flash_connectivity_demand.Reset();
+        xSemaphoreGive(g_flash.mutex);
+        return playback_stop_result;
+    }
+    const esp_err_t audio_result = wqn::services::BeginAudioActivity(
+        wqn::services::AudioActivity::kFlash, &g_flash_audio_session);
+    if (audio_result != ESP_OK) {
+        xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+        SetErrorLocked("音频资源繁忙");
+        g_flash_connectivity_demand.Reset();
+        xSemaphoreGive(g_flash.mutex);
+        return audio_result;
+    }
+
+    auto fail_after_audio_begin = [&](const char* message,
+                                      esp_err_t cause) -> esp_err_t {
+        SetStreamAudioAmp(false);
+        esp_err_t cleanup_result = TearDownStreamChannels();
+        g_flash.stream_i2c_bus = nullptr;
+        g_flash.stream_audio_powered = false;
+        if (cleanup_result == ESP_OK) {
+            cleanup_result =
+                services::EndAudioActivity(&g_flash_audio_session);
+        }
+        xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+        SetErrorLocked(message);
+        g_flash_connectivity_demand.Reset();
+        xSemaphoreGive(g_flash.mutex);
+        if (cleanup_result != ESP_OK) {
+            ESP_LOGE(kTag,
+                     "Flash start rollback incomplete: cause=%s cleanup=%s",
+                     esp_err_to_name(cause),
+                     esp_err_to_name(cleanup_result));
+            return cleanup_result;
+        }
+        return cause;
+    };
+
+    if (g_teardown_pending.load(std::memory_order_acquire) ||
+        generation != g_session_generation.load(std::memory_order_acquire)) {
+        return fail_after_audio_begin(
+            "Flash 启动已取消", ESP_ERR_INVALID_STATE);
+    }
+
+    // Reserve every DMA/I2S/codec resource before WebSocket/TLS can consume
+    // or fragment internal memory. This also guarantees MCLK is running before
+    // the ES8311 register program selects the external clock domain.
+    esp_err_t result = PrepareStreamHardware();
+    if (result != ESP_OK) {
+        return fail_after_audio_begin("音频硬件初始化失败", result);
+    }
+    result = EnsurePlaybackRingbuf();
+    if (result != ESP_OK) {
+        return fail_after_audio_begin("音频播放任务初始化失败", result);
+    }
+    if (g_teardown_pending.load(std::memory_order_acquire) ||
+        generation != g_session_generation.load(std::memory_order_acquire)) {
+        return fail_after_audio_begin(
+            "Flash 启动已取消", ESP_ERR_INVALID_STATE);
     }
 
     esp_websocket_client_config_t cfg = {};
@@ -2063,12 +2375,8 @@ esp_err_t StartFlashSession()
 
     g_flash.ws_client = esp_websocket_client_init(&cfg);
     if (g_flash.ws_client == nullptr) {
-        xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
-        SetErrorLocked("WS 客户端初始化失败");
-        ESP_ERROR_CHECK_WITHOUT_ABORT(
-            services::EndAudioActivity(&g_flash_audio_session));
-        xSemaphoreGive(g_flash.mutex);
-        return ESP_ERR_NO_MEM;
+        return fail_after_audio_begin(
+            "WS 客户端初始化失败", ESP_ERR_NO_MEM);
     }
 
     std::string bearer = "Bearer " + access_token;
@@ -2090,35 +2398,24 @@ esp_err_t StartFlashSession()
     if (reg_err != ESP_OK) {
         esp_websocket_client_destroy(g_flash.ws_client);
         g_flash.ws_client = nullptr;
-        xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
-        SetErrorLocked("WS 事件注册失败");
-        ESP_ERROR_CHECK_WITHOUT_ABORT(
-            services::EndAudioActivity(&g_flash_audio_session));
-        xSemaphoreGive(g_flash.mutex);
-        return reg_err;
+        return fail_after_audio_begin("WS 事件注册失败", reg_err);
     }
 
     result = esp_websocket_client_start(g_flash.ws_client);
     if (result != ESP_OK) {
         esp_websocket_client_destroy(g_flash.ws_client);
         g_flash.ws_client = nullptr;
-        xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
-        SetErrorLocked("WS 连接失败");
-        ESP_ERROR_CHECK_WITHOUT_ABORT(
-            services::EndAudioActivity(&g_flash_audio_session));
-        xSemaphoreGive(g_flash.mutex);
-        return result;
+        return fail_after_audio_begin("WS 连接失败", result);
     }
 
     return ESP_OK;
 }
 
-esp_err_t StopFlashSession()
+esp_err_t StopFlashSessionNow()
 {
     if (g_flash.mutex == nullptr) {
         return ESP_OK;
     }
-    g_intentional_stop.store(true, std::memory_order_release);
 
     // Signal streaming task to stop (outside mutex so task can read it)
     {
@@ -2142,31 +2439,55 @@ esp_err_t StopFlashSession()
     {
         xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
         if (g_flash.ws_client != nullptr) {
-            client_to_destroy = g_flash.ws_client;
+            g_flash.ws_client_to_destroy = g_flash.ws_client;
             g_flash.ws_client = nullptr;
             g_flash.ws_connected = false;
         }
+        client_to_destroy = g_flash.ws_client_to_destroy;
         g_flash.status = InternalStatus::kIdle;
         g_flash.pending_text.clear();
         g_flash.tool_label.clear();
         g_flash.error_message.clear();
+        g_flash.audio_reassembly_buf.clear();
+        g_flash.audio_reassembly_buf.shrink_to_fit();
         g_flash.status_since_ms = esp_timer_get_time() / 1000;
         MarkChanged();
         xSemaphoreGive(g_flash.mutex);
     }
 
-    // Now destroy the client (no mutex held, so WebSocket event handler can complete)
+    // Every sender registers while holding g_flash.mutex before it snapshots
+    // the handle. With the global handle now null, no new sender can enter;
+    // wait for existing API calls to return before freeing the client.
     if (client_to_destroy != nullptr) {
-        esp_websocket_client_stop(client_to_destroy);
-        esp_websocket_client_destroy(client_to_destroy);
+        for (int i = 0; i < 600; ++i) {  // longest send timeout is 5 s
+            if (g_flash.active_ws_sends.load(std::memory_order_acquire) == 0) {
+                break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+        const uint32_t active_sends =
+            g_flash.active_ws_sends.load(std::memory_order_acquire);
+        if (active_sends != 0) {
+            ESP_LOGE(kTag, "WS senders did not drain before teardown: active=%u",
+                     static_cast<unsigned>(active_sends));
+            return ESP_ERR_TIMEOUT;
+        }
+        ESP_ERROR_CHECK_WITHOUT_ABORT(
+            esp_websocket_client_stop(client_to_destroy));
+        ESP_RETURN_ON_ERROR(
+            esp_websocket_client_destroy(client_to_destroy), kTag,
+            "destroy Flash WebSocket client");
+        xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+        if (g_flash.ws_client_to_destroy == client_to_destroy) {
+            g_flash.ws_client_to_destroy = nullptr;
+        }
+        xSemaphoreGive(g_flash.mutex);
     }
 
-    // [i2s-handoff] WS destroy unblocks any AudioStreamingTask stuck in
-    // esp_websocket_client_send_bin (the only thing StopAudioStreaming's 3 s
-    // wait couldn't break). Wait briefly for it to self-exit, then tear down
-    // the duplex I2S channels so STD/Pro can claim I2S_NUM_0. TearDownStream
-    // Channels also stops FlashPlaybackTask and verifies stream_task is gone
-    // before deleting stream_rx (UAF-safe).
+    // Wait briefly for the drained AudioStreamingTask to publish its terminal
+    // state, then tear down the duplex I2S channels so STD/Pro can claim
+    // I2S_NUM_0. TearDownStreamChannels verifies stream_task is gone before
+    // deleting stream_rx.
     {
         xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
         TaskHandle_t stuck = g_flash.stream_task;
@@ -2191,11 +2512,43 @@ esp_err_t StopFlashSession()
     } else {
         ESP_LOGE(kTag, "Flash audio teardown incomplete; retaining session lease");
     }
+    if (teardown_result == ESP_OK) {
+        g_flash_connectivity_demand.Reset();
+    }
     xSemaphoreGive(g_flash.mutex);
 
     ESP_LOGI(kTag, "flash session stopped");
-    g_intentional_stop.store(false, std::memory_order_release);
     return teardown_result;
+}
+
+esp_err_t StopFlashSession()
+{
+    if (g_flash.mutex == nullptr) {
+        return ESP_OK;
+    }
+    if (g_lifecycle_task == nullptr) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    bool expected = false;
+    if (!g_teardown_pending.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
+        return ESP_OK;
+    }
+    g_start_pending.store(false, std::memory_order_release);
+    xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+    // Cancels a lifecycle-task WiFi wait without blocking the UI task. The
+    // radio remains alive for the bounded idle tail while teardown completes.
+    g_flash_connectivity_demand.Reset();
+    xSemaphoreGive(g_flash.mutex);
+    g_intentional_stop.store(true, std::memory_order_release);
+    g_terminal_generation.store(
+        g_session_generation.load(std::memory_order_acquire),
+        std::memory_order_relaxed);
+    g_terminal_reason.store(
+        FlashTerminalReason::kIntentional, std::memory_order_release);
+    xTaskNotifyGive(g_lifecycle_task);
+    return ESP_OK;
 }
 
 FlashStatus GetFlashStatus()
@@ -2326,9 +2679,10 @@ void OnFlashButtonPressed()
         // permanently locking the device in kError. Force-stop the old session
         // first so StartFlashSession creates a fresh client.
         if (g_flash.status == InternalStatus::kError) {
+            g_restart_after_teardown.store(true, std::memory_order_release);
             xSemaphoreGive(g_flash.mutex);
             StopFlashSession();
-            xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+            return;
         }
         xSemaphoreGive(g_flash.mutex);
         StartFlashSession();
@@ -2378,11 +2732,22 @@ void OnFlashButtonPressed()
                     kStreamTxDmaBytes);
             }
             // Remote side: ask the proxy to cancel the in-progress response.
-            const char* cancel = "{\"type\":\"response.cancel\"}";
-            esp_websocket_client_send_text(g_flash.ws_client, cancel,
-                                           std::strlen(cancel),
-                                           pdMS_TO_TICKS(1000));
-            ESP_LOGI(kTag, "barge-in: cancelled in-flight response");
+            esp_websocket_client_handle_t cancel_client = nullptr;
+            xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+            if (g_flash.ws_client != nullptr) {
+                cancel_client = g_flash.ws_client;
+                g_flash.active_ws_sends.fetch_add(
+                    1, std::memory_order_relaxed);
+            }
+            xSemaphoreGive(g_flash.mutex);
+            FlashWsSendRegistration send_registration(cancel_client);
+            if (cancel_client != nullptr) {
+                const char* cancel = "{\"type\":\"response.cancel\"}";
+                esp_websocket_client_send_text(
+                    cancel_client, cancel, std::strlen(cancel),
+                    pdMS_TO_TICKS(1000));
+                ESP_LOGI(kTag, "barge-in: cancelled in-flight response");
+            }
         }
 
         StartAudioStreaming();
@@ -2408,6 +2773,9 @@ void OnFlashButtonReleased(bool submit)
     // Always stop streaming if it was started, regardless of WS connection state.
     // If WS disconnected mid-recording, we still need to release the I2S hardware.
     bool was_capturing = g_flash.capture_started;
+    const bool cancel_pending_connect =
+        !was_capturing && !g_flash.ws_connected &&
+        g_flash.status == InternalStatus::kConnecting;
     g_flash.capture_started = false;
     g_flash.button_pressed = false;
     g_flash.status_since_ms = esp_timer_get_time() / 1000;
@@ -2417,6 +2785,12 @@ void OnFlashButtonReleased(bool submit)
     }
     bool ws_connected = g_flash.ws_connected;
     xSemaphoreGive(g_flash.mutex);
+
+    if (cancel_pending_connect) {
+        ESP_LOGI(kTag, "Flash PTT released before online; cancelling connect");
+        ESP_ERROR_CHECK_WITHOUT_ABORT(StopFlashSession());
+        return;
+    }
 
     if (was_capturing) {
         StopAudioStreaming();
@@ -2465,6 +2839,7 @@ void OnFlashButtonReleased(bool submit)
         // re-press after the prior response finishes).
         should_send = true;
         client = g_flash.ws_client;
+        g_flash.active_ws_sends.fetch_add(1, std::memory_order_relaxed);
         ++g_flash.uplink_seq;
         seq = g_flash.uplink_seq;
         g_flash.response_in_flight = true;  // in-flight until response.done/error
@@ -2474,6 +2849,7 @@ void OnFlashButtonReleased(bool submit)
     }
     xSemaphoreGive(g_flash.mutex);
 
+    FlashWsSendRegistration send_registration(should_send ? client : nullptr);
     if (should_send) {
 #if CONFIG_WQN_FLASH_PROTOCOL_V2
         std::vector<uint8_t> end;
@@ -2512,7 +2888,12 @@ void AbortFlashPlayback()
     xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
     const bool cancel = g_flash.ws_connected && g_flash.response_in_flight;
     esp_websocket_client_handle_t client = g_flash.ws_client;
+    if (cancel && client != nullptr) {
+        g_flash.active_ws_sends.fetch_add(1, std::memory_order_relaxed);
+    }
     xSemaphoreGive(g_flash.mutex);
+    FlashWsSendRegistration send_registration(
+        cancel && client != nullptr ? client : nullptr);
     if (cancel && client != nullptr) {
         const char* msg = "{\"type\":\"response.cancel\"}";
         esp_websocket_client_send_text(client, msg, std::strlen(msg), pdMS_TO_TICKS(1000));

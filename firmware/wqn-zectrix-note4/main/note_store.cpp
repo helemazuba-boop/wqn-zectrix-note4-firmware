@@ -54,6 +54,12 @@ struct SessionHeader {
 enum class OutboxRecordKind : uint8_t {
     kObservation = 1,
     kAck = 2,
+    // Parked record: pairs with a preceding kObservation by request_id and
+    // removes it from the upload queue WITHOUT deleting the payload. The
+    // suspend reason rides in OutboxRecord::reserved. Old firmware builds
+    // treat this kind as an invalid response and fall back to the .bak
+    // journal (documented downgrade caveat; upgrades parse it natively).
+    kSuspend = 3,
 };
 
 struct OutboxRecord {
@@ -79,9 +85,16 @@ static_assert(sizeof(OutboxRecord) == 206, "unexpected note OutboxRecord layout"
 struct OutboxScan {
     std::vector<OutboxRecord, wqn::NoteStorePsramAllocator<OutboxRecord>> pending;
     std::vector<OutboxRecord, wqn::NoteStorePsramAllocator<OutboxRecord>> acknowledged;
+    // Observations parked by a kSuspend marker: excluded from Peek/upload,
+    // but still rewritten by compaction so the payload survives on device.
+    std::vector<OutboxRecord, wqn::NoteStorePsramAllocator<OutboxRecord>> suspended;
+    // Parallel to `suspended`: preserves the marker reason across compaction.
+    std::vector<uint8_t, wqn::NoteStorePsramAllocator<uint8_t>> suspended_reasons;
     size_t total_records = 0;
     size_t ack_records = 0;
+    size_t suspend_records = 0;
     size_t orphan_ack_records = 0;
+    size_t orphan_suspend_records = 0;
     bool partial_tail = false;
     bool backup_source = false;
 };
@@ -488,6 +501,28 @@ esp_err_t BuildObservationRecord(
     return ESP_OK;
 }
 
+// Encodes a park marker for `request_id`. Only the identity and the reason
+// are stored; the paired kObservation record keeps the full payload.
+esp_err_t BuildSuspendRecord(
+    const std::string& request_id,
+    wqn::OutboxSuspendReason reason,
+    OutboxRecord* record)
+{
+    if (record == nullptr || request_id.empty() || request_id.size() > 64) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *record = {};
+    record->magic = kOutboxMagic;
+    record->version = kOutboxSchemaVersion;
+    record->kind = static_cast<uint8_t>(OutboxRecordKind::kSuspend);
+    record->reserved = static_cast<uint8_t>(reason);
+    if (!CopyField(record->request_id, sizeof(record->request_id), request_id)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    record->crc = RecordCrc(*record);
+    return ESP_OK;
+}
+
 esp_err_t ScanOutboxFile(const char* path, OutboxScan* scan)
 {
     if (path == nullptr || scan == nullptr) return ESP_ERR_INVALID_ARG;
@@ -545,13 +580,39 @@ esp_err_t ScanOutboxFile(const char* path, OutboxScan* scan)
                 ++scan->orphan_ack_records;
                 ESP_LOGW(kTag, "ignoring orphan note outbox ACK: request=%s", request_id.c_str());
             }
+        } else if (record.kind == static_cast<uint8_t>(OutboxRecordKind::kSuspend)) {
+            // Suspend markers park their paired observation without
+            // deleting it. Like ACKs they are idempotent: an orphaned
+            // marker (observation already compacted away) is retained as a
+            // diagnostic rather than poisoning the whole journal.
+            ++scan->suspend_records;
+            const auto pending = std::find_if(
+                scan->pending.begin(), scan->pending.end(),
+                [&](const auto& value) { return request_id == value.request_id; });
+            const auto suspended = std::find_if(
+                scan->suspended.begin(), scan->suspended.end(),
+                [&](const auto& value) { return request_id == value.request_id; });
+            if (pending != scan->pending.end()) {
+                if (suspended == scan->suspended.end()) {
+                    scan->suspended.push_back(*pending);
+                    scan->suspended_reasons.push_back(record.reserved);
+                }
+                scan->pending.erase(pending);
+            } else if (suspended == scan->suspended.end()) {
+                ++scan->orphan_suspend_records;
+                ESP_LOGW(
+                    kTag,
+                    "ignoring orphan note outbox suspend marker: request=%s",
+                    request_id.c_str());
+            }
         } else {
             std::fclose(file);
             return ESP_ERR_INVALID_RESPONSE;
         }
     }
     std::fclose(file);
-    return scan->pending.size() <= wqn::kNoteObservationOutboxCapacity
+    return scan->pending.size() + scan->suspended.size() <=
+            wqn::kNoteObservationOutboxCapacity
         ? ESP_OK
         : ESP_ERR_INVALID_SIZE;
 }
@@ -740,12 +801,38 @@ esp_err_t CompactOutbox(
 esp_err_t CompactCachedOutbox(OutboxScan* scan)
 {
     if (scan == nullptr) return ESP_ERR_INVALID_ARG;
+    // Suspended records are part of the durable rewrite set: compaction
+    // replaces the whole journal, so dropping them here would silently
+    // destroy parked payloads that still await intervention.
+    std::vector<OutboxRecord, wqn::NoteStorePsramAllocator<OutboxRecord>> rewrite;
+    if (scan->suspended.size() != scan->suspended_reasons.size()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    rewrite.reserve(scan->pending.size() + 2 * scan->suspended.size());
+    rewrite.insert(rewrite.end(), scan->pending.begin(), scan->pending.end());
+    for (size_t i = 0; i < scan->suspended.size(); ++i) {
+        rewrite.push_back(scan->suspended[i]);
+        OutboxRecord marker = {};
+        ESP_RETURN_ON_ERROR(
+            BuildSuspendRecord(
+                scan->suspended[i].request_id,
+                static_cast<wqn::OutboxSuspendReason>(scan->suspended_reasons[i]),
+                &marker),
+            kTag,
+            "rebuild note suspend marker");
+        rewrite.push_back(marker);
+    }
     ESP_RETURN_ON_ERROR(
-        CompactOutbox(scan->pending, scan->backup_source), kTag, "compact cached note outbox");
+        CompactOutbox(
+            rewrite, scan->backup_source || !scan->suspended.empty()),
+        kTag,
+        "compact cached note outbox");
     scan->acknowledged.clear();
-    scan->total_records = scan->pending.size();
+    scan->total_records = rewrite.size();
     scan->ack_records = 0;
+    scan->suspend_records = scan->suspended.size();
     scan->orphan_ack_records = 0;
+    scan->orphan_suspend_records = 0;
     scan->partial_tail = false;
     scan->backup_source = false;
     return ESP_OK;
@@ -803,6 +890,7 @@ esp_err_t CheckpointSessionFromOutbox(const OutboxScan& scan)
     bool changed = false;
     ReconcileSession(scan.acknowledged, &session, &changed);
     ReconcileSession(scan.pending, &session, &changed);
+    ReconcileSession(scan.suspended, &session, &changed);
     if (changed) {
         ESP_RETURN_ON_ERROR(
             SaveSessionRaw(session), kTag, "checkpoint session before outbox compaction");
@@ -812,6 +900,8 @@ esp_err_t CheckpointSessionFromOutbox(const OutboxScan& scan)
 
 esp_err_t MaybeCompactCachedOutbox(OutboxScan* scan)
 {
+    // Active suspend markers must survive every compaction, so they are not
+    // reclaimable records and must not continuously retrigger maintenance.
     if (scan == nullptr || scan->ack_records < kRuntimeCompactAckThreshold) {
         return ESP_OK;
     }
@@ -835,6 +925,7 @@ esp_err_t LoadSessionTransaction(void* opaque)
     bool changed = false;
     ReconcileSession(scan->acknowledged, session, &changed);
     ReconcileSession(scan->pending, session, &changed);
+    ReconcileSession(scan->suspended, session, &changed);
     if (changed) {
         ESP_RETURN_ON_ERROR(SaveSessionRaw(*session), kTag, "repair note session cursor");
     }
@@ -896,7 +987,16 @@ esp_err_t CommitObservationTransaction(void* opaque)
         scan->acknowledged.end()) {
         return SaveSessionRaw(session);
     }
-    if (scan->pending.size() >= wqn::kNoteObservationOutboxCapacity) {
+    const auto suspended = std::find_if(
+        scan->suspended.begin(), scan->suspended.end(),
+        [&](const auto& value) { return observation.request_id == value.request_id; });
+    if (suspended != scan->suspended.end()) {
+        return SameObservation(ObservationFromRecord(*suspended), observation)
+            ? SaveSessionRaw(session)
+            : ESP_ERR_INVALID_STATE;
+    }
+    if (scan->pending.size() + scan->suspended.size() >=
+        wqn::kNoteObservationOutboxCapacity) {
         return ESP_ERR_NO_MEM;
     }
     if (scan->partial_tail || scan->backup_source) {
@@ -936,8 +1036,17 @@ esp_err_t PeekObservationTransaction(void* context)
             CheckpointSessionFromOutbox(*scan), kTag, "checkpoint before note peek repair");
         ESP_RETURN_ON_ERROR(CompactCachedOutbox(scan), kTag, "repair note outbox tail");
     }
-    if (scan->pending.empty()) return ESP_ERR_NOT_FOUND;
-    *observation = ObservationFromRecord(scan->pending.front());
+    auto pending = std::find_if(
+        scan->pending.begin(), scan->pending.end(),
+        [&](const OutboxRecord& candidate) {
+            return std::none_of(
+                scan->suspended.begin(), scan->suspended.end(),
+                [&](const OutboxRecord& parked) {
+                    return std::strcmp(candidate.session_id, parked.session_id) == 0;
+                });
+        });
+    if (pending == scan->pending.end()) return ESP_ERR_NOT_FOUND;
+    *observation = ObservationFromRecord(*pending);
     return ESP_OK;
 }
 
@@ -1014,6 +1123,81 @@ esp_err_t QuarantineObservationTransaction(void* opaque)
     return MaybeCompactCachedOutbox(scan);
 }
 
+struct SuspendContext {
+    const std::string* request_id;
+    wqn::OutboxSuspendReason reason;
+};
+
+esp_err_t SuspendObservationTransaction(void* opaque)
+{
+    auto* context = static_cast<SuspendContext*>(opaque);
+    if (context == nullptr || context->request_id == nullptr || context->request_id->empty()) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    OutboxScan* scan = nullptr;
+    ESP_RETURN_ON_ERROR(EnsureOutboxCache(&scan), kTag, "load outbox before note suspend");
+    auto pending = std::find_if(
+        scan->pending.begin(), scan->pending.end(),
+        [&](const auto& value) { return *context->request_id == value.request_id; });
+    if (pending == scan->pending.end()) {
+        // Idempotent: already parked (or already gone) is success.
+        return std::find_if(
+                   scan->suspended.begin(), scan->suspended.end(),
+                   [&](const auto& value) {
+                       return *context->request_id == value.request_id;
+                   }) != scan->suspended.end()
+                ? ESP_OK
+                : ESP_ERR_NOT_FOUND;
+    }
+
+    if (scan->suspended.empty()) {
+        // Establish a marker-free fallback generation before introducing the
+        // first kind=3 record. Two rewrites also replace a stale backup that
+        // may contain an orphan marker from an interrupted earlier lifecycle.
+        ESP_RETURN_ON_ERROR(
+            CheckpointSessionFromOutbox(*scan),
+            kTag,
+            "checkpoint before first note suspend");
+        ESP_RETURN_ON_ERROR(
+            CompactCachedOutbox(scan),
+            kTag,
+            "prepare note suspend fallback");
+        ESP_RETURN_ON_ERROR(
+            CompactCachedOutbox(scan),
+            kTag,
+            "refresh note suspend fallback");
+        pending = std::find_if(
+            scan->pending.begin(), scan->pending.end(),
+            [&](const auto& value) {
+                return *context->request_id == value.request_id;
+            });
+        if (pending == scan->pending.end()) return ESP_ERR_NOT_FOUND;
+    }
+
+    // Park the head durably first: the marker append is fsync'd before the
+    // cache mutates, so a crash mid-transaction replays the marker against
+    // the still-present observation on the next scan.
+    OutboxRecord suspend_record = {};
+    ESP_RETURN_ON_ERROR(
+        BuildSuspendRecord(*context->request_id, context->reason, &suspend_record),
+        kTag,
+        "encode note suspend record");
+    ESP_RETURN_ON_ERROR(
+        AppendOutboxRecord(suspend_record), kTag, "append note suspend record");
+
+    scan->suspended.push_back(*pending);
+    scan->suspended_reasons.push_back(static_cast<uint8_t>(context->reason));
+    scan->pending.erase(pending);
+    ++scan->total_records;
+    ++scan->suspend_records;
+    ESP_LOGE(
+        kTag,
+        "note observation parked (%s): request=%s",
+        wqn::OutboxSuspendReasonName(context->reason),
+        context->request_id->c_str());
+    return MaybeCompactCachedOutbox(scan);
+}
+
 struct PrepareOutboxContext {
     int64_t deadline_us;
 };
@@ -1052,6 +1236,16 @@ esp_err_t SnapshotTransaction(void* context)
     OutboxScan* scan = nullptr;
     ESP_RETURN_ON_ERROR(EnsureOutboxCache(&scan), kTag, "load note outbox snapshot");
     snapshot->pending_count = scan->pending.size();
+    snapshot->suspended_count = scan->suspended.size();
+    snapshot->blocked_count = static_cast<size_t>(std::count_if(
+        scan->pending.begin(), scan->pending.end(),
+        [&](const OutboxRecord& candidate) {
+            return std::any_of(
+                scan->suspended.begin(), scan->suspended.end(),
+                [&](const OutboxRecord& parked) {
+                    return std::strcmp(candidate.session_id, parked.session_id) == 0;
+                });
+        }));
     snapshot->capacity = wqn::kNoteObservationOutboxCapacity;
     return ESP_OK;
 }
@@ -1174,6 +1368,15 @@ esp_err_t QuarantinePendingNoteObservation(const std::string& request_id)
     RequestIdContext context{&request_id};
     return ExecuteWithStorageLease(
         "note-outbox-quarantine", QuarantineObservationTransaction, &context);
+}
+
+esp_err_t SuspendPendingNoteObservation(
+    const std::string& request_id,
+    OutboxSuspendReason reason)
+{
+    SuspendContext context{&request_id, reason};
+    return ExecuteWithStorageLease(
+        "note-outbox-suspend", SuspendObservationTransaction, &context);
 }
 
 esp_err_t ReadNoteOutboxSnapshot(NoteOutboxSnapshot* snapshot)

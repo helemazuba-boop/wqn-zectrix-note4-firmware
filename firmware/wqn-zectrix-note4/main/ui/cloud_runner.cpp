@@ -11,6 +11,7 @@
 
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "services/connectivity_service.h"
 
 namespace device_ui_internal {
 
@@ -28,7 +29,7 @@ TaskHandle_t g_lane_task[2] = {nullptr, nullptr};
 // log loudly past a hard per-lane budget so field logs pin the stuck domain.
 // Forced recovery is deliberately not attempted -- resetting the busy flag
 // under a still-running job would race the shared result slot.
-std::atomic<int64_t> g_domain_busy_warn_deadline_us[4] = {};
+std::atomic<int64_t> g_domain_busy_warn_deadline_us[kCloudDomainCount] = {};
 constexpr int64_t kInteractiveBusyWarnUs = 60LL * 1000 * 1000;
 constexpr int64_t kBulkBusyWarnUs = 600LL * 1000 * 1000;
 
@@ -52,6 +53,12 @@ const char* CloudDomainName(CloudDomain domain)
             return "note";
         case CloudDomain::kProblem:
             return "problem";
+        case CloudDomain::kWordBulk:
+            return "word-bulk";
+        case CloudDomain::kNoteBulk:
+            return "note-bulk";
+        case CloudDomain::kProblemBulk:
+            return "problem-bulk";
     }
     return "unknown";
 }
@@ -67,6 +74,12 @@ bool CloudDomainBusy(CloudDomain domain)
             return IsNoteCloudBusy();
         case CloudDomain::kProblem:
             return IsProblemCloudBusy();
+        case CloudDomain::kWordBulk:
+            return IsWordPackCloudBusy();
+        case CloudDomain::kNoteBulk:
+            return IsNotePackCloudBusy();
+        case CloudDomain::kProblemBulk:
+            return IsProblemPackCloudBusy();
     }
     return false;
 }
@@ -89,6 +102,10 @@ CloudLane LaneForJob(const CloudJob& job)
             return job.problem.op == ProblemCloudOp::kPackSync
                 ? CloudLane::kBulk
                 : CloudLane::kInteractive;
+        case CloudDomain::kWordBulk:
+        case CloudDomain::kNoteBulk:
+        case CloudDomain::kProblemBulk:
+            return CloudLane::kBulk;
     }
     return CloudLane::kBulk;
 }
@@ -101,17 +118,36 @@ void CloudLaneTask(void* arg)
         if (xQueueReceive(queue, &job, portMAX_DELAY) != pdTRUE) {
             continue;
         }
+        const CloudLane lane = LaneForJob(job);
+        wqn::services::ConnectivityDemand connectivity_demand =
+            wqn::services::AcquireConnectivityDemand(
+                lane == CloudLane::kInteractive
+                    ? wqn::services::ConnectivityDemandReason::kCloudInteractive
+                    : wqn::services::ConnectivityDemandReason::kBulkBackground,
+                lane == CloudLane::kInteractive ? "cloud-interactive"
+                                                : "cloud-bulk",
+                __FILE__,
+                __LINE__);
+        if (!connectivity_demand) {
+            ESP_LOGW(
+                kTag,
+                "cloud job admitted without connectivity demand: domain=%s",
+                CloudDomainName(job.domain));
+        }
         switch (job.domain) {
             case CloudDomain::kTodo:
                 ExecuteTodoCloudRequest(job.todo);
                 break;
             case CloudDomain::kWord:
+            case CloudDomain::kWordBulk:
                 ExecuteWordCloudRequest(job.word);
                 break;
             case CloudDomain::kNote:
+            case CloudDomain::kNoteBulk:
                 ExecuteNoteCloudRequest(job.note);
                 break;
             case CloudDomain::kProblem:
+            case CloudDomain::kProblemBulk:
                 ExecuteProblemCloudRequest(job.problem);
                 break;
         }
@@ -152,7 +188,7 @@ struct DomainResultMailbox {
     std::atomic<uint32_t> pending_generation{0};
     std::atomic<uint32_t> acked_generation{0};
 };
-DomainResultMailbox g_result_mailbox[4];
+DomainResultMailbox g_result_mailbox[kCloudDomainCount];
 }  // namespace
 
 void PublishCloudResult(CloudDomain domain, uint32_t generation)
@@ -268,7 +304,7 @@ CloudTransferSnapshot ReadCloudTransferProgress()
 void WarnStuckCloudDomains()
 {
     const int64_t now_us = esp_timer_get_time();
-    for (size_t i = 0; i < 4; ++i) {
+    for (size_t i = 0; i < kCloudDomainCount; ++i) {
         const int64_t deadline = g_domain_busy_warn_deadline_us[i].load(
             std::memory_order_acquire);
         if (deadline <= 0 || now_us < deadline) {

@@ -7,6 +7,7 @@
 
 #include "problem_store.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
@@ -16,6 +17,7 @@
 #include <vector>
 
 #include "cJSON.h"
+#include "device_protocol/json_depth_guard.h"
 #include "esp_log.h"
 #include "runtime/sleep_coordinator.h"
 #include "services/storage_service.h"
@@ -26,8 +28,52 @@ constexpr char kTag[] = "problem_store";
 constexpr char kOutboxPath[] = "/storage/po_outbox.jsonl";
 constexpr char kOutboxTempPath[] = "/storage/po_outbox.tmp";
 constexpr char kRejectedPath[] = "/storage/po_rejected.jsonl";
+// Park markers (request_id + reason) for verdicts that must not be retried
+// nor deleted. The payload line stays in po_outbox.jsonl; Peek consults this
+// journal so a parked verdict neither uploads nor wedges the queue. Old
+// firmware builds ignore this file entirely: on downgrade they would retry
+// the parked verdicts (server rejects them again) rather than lose data.
+constexpr char kParkedPath[] = "/storage/po_parked.jsonl";
 constexpr size_t kMaxRejectedRecords = 50;
+constexpr size_t kMaxParkedRecords = wqn::kProblemObservationOutboxCapacity;
 constexpr size_t kMaxLineBytes = 512;
+constexpr size_t kMaxParkedLineBytes = 96;
+
+bool IsValidRequestId(const std::string& value)
+{
+    if (value.size() < 16 || value.size() > 64) return false;
+    return std::all_of(value.begin(), value.end(), [](char ch) {
+        return (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
+            (ch >= '0' && ch <= '9') || ch == '_' || ch == '-';
+    });
+}
+
+bool IsValidSuspendReasonName(const std::string& value)
+{
+    return value == "idempotency-conflict" || value == "actor-ownership" ||
+        value == "invalid-identity" || value == "protocol-blocked" ||
+        value == "unknown-terminal";
+}
+
+bool DecodeParkedLine(const std::string& line, std::string* request_id)
+{
+    if (request_id == nullptr || line.empty() ||
+        line.size() > kMaxParkedLineBytes) {
+        return false;
+    }
+    const size_t separator = line.find(' ');
+    if (separator == std::string::npos ||
+        line.find(' ', separator + 1) != std::string::npos) {
+        return false;
+    }
+    const std::string identity = line.substr(0, separator);
+    const std::string reason = line.substr(separator + 1);
+    if (!IsValidRequestId(identity) || !IsValidSuspendReasonName(reason)) {
+        return false;
+    }
+    *request_id = identity;
+    return true;
+}
 
 bool IsUuid(const std::string& value)
 {
@@ -46,8 +92,7 @@ bool IsUuid(const std::string& value)
 
 bool IsValidObservation(const wqn::DurableProblemObservation& observation)
 {
-    return observation.request_id.size() >= 16 &&
-        observation.request_id.size() <= 64 &&
+    return IsValidRequestId(observation.request_id) &&
         IsUuid(observation.problem_id) && !observation.occurred_at.empty() &&
         observation.occurred_at.size() <= 40;
 }
@@ -75,7 +120,10 @@ bool DecodeObservationLine(
 {
     if (observation == nullptr) return false;
     *observation = {};
-    cJSON* root = cJSON_Parse(line.c_str());
+    cJSON* root = wqn::protocol::JsonNestingWithinLimit(
+                      line.data(), line.size())
+        ? cJSON_Parse(line.c_str())
+        : nullptr;
     if (root == nullptr) return false;
     cJSON* request_id = cJSON_GetObjectItemCaseSensitive(root, "request_id");
     cJSON* problem_id = cJSON_GetObjectItemCaseSensitive(root, "problem_id");
@@ -164,6 +212,112 @@ esp_err_t WriteOutboxLines(const std::vector<std::string>& lines)
     return ESP_OK;
 }
 
+// Reads the parked request_ids from the park journal (bounded). A missing
+// file means nothing is parked.
+esp_err_t ReadParkedRequestIds(std::vector<std::string>* request_ids)
+{
+    if (request_ids == nullptr) return ESP_ERR_INVALID_ARG;
+    request_ids->clear();
+    FILE* file = std::fopen(kParkedPath, "rb");
+    if (file == nullptr) {
+        return errno == ENOENT ? ESP_OK : ESP_FAIL;
+    }
+    while (true) {
+        std::string line;
+        bool overlong = false;
+        bool saw_byte = false;
+        int ch = 0;
+        while ((ch = std::fgetc(file)) != EOF) {
+            saw_byte = true;
+            if (ch == '\n') break;
+            if (ch == '\r') continue;
+            if (line.size() < kMaxParkedLineBytes) {
+                line.push_back(static_cast<char>(ch));
+            } else {
+                overlong = true;
+            }
+        }
+        if (!saw_byte && ch == EOF) break;
+        std::string request_id;
+        if (!overlong && DecodeParkedLine(line, &request_id) &&
+            std::find(request_ids->begin(), request_ids->end(), request_id) ==
+                request_ids->end()) {
+            // A valid EOF-terminated final record is accepted. An incomplete
+            // crash tail fails DecodeParkedLine and is ignored.
+            request_ids->push_back(request_id);
+        } else if (!line.empty()) {
+            ESP_LOGW(kTag, "ignoring malformed problem park marker");
+        }
+        if (request_ids->size() > kMaxParkedRecords) {
+            std::fclose(file);
+            return ESP_ERR_INVALID_SIZE;
+        }
+        if (ch == EOF) break;
+    }
+    std::fclose(file);
+    return ESP_OK;
+}
+
+// Best-effort bounded append of one park marker. Returns ESP_ERR_NO_MEM when
+// the journal is full so the caller can fail the park transaction instead of
+// silently losing the marker (the verdict then keeps its queue place).
+esp_err_t AppendParkedEntry(
+    const std::string& request_id, wqn::OutboxSuspendReason reason)
+{
+    const std::string reason_name = wqn::OutboxSuspendReasonName(reason);
+    if (!IsValidRequestId(request_id) || !IsValidSuspendReasonName(reason_name)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    std::vector<std::string> parked;
+    const esp_err_t read_result = ReadParkedRequestIds(&parked);
+    if (read_result != ESP_OK) return read_result;
+    if (std::find(parked.begin(), parked.end(), request_id) != parked.end()) {
+        return ESP_OK;
+    }
+    if (parked.size() >= kMaxParkedRecords) {
+        return ESP_ERR_NO_MEM;
+    }
+    bool needs_separator = false;
+    FILE* probe = std::fopen(kParkedPath, "rb");
+    if (probe != nullptr) {
+        if (std::fseek(probe, 0, SEEK_END) != 0) {
+            std::fclose(probe);
+            return ESP_FAIL;
+        }
+        const long size = std::ftell(probe);
+        if (size < 0) {
+            std::fclose(probe);
+            return ESP_FAIL;
+        }
+        if (size > 0) {
+            if (std::fseek(probe, -1, SEEK_END) != 0) {
+                std::fclose(probe);
+                return ESP_FAIL;
+            }
+            const int last = std::fgetc(probe);
+            if (last == EOF && std::ferror(probe)) {
+                std::fclose(probe);
+                return ESP_FAIL;
+            }
+            needs_separator = last != '\n';
+        }
+        std::fclose(probe);
+    } else if (errno != ENOENT) {
+        return ESP_FAIL;
+    }
+    FILE* journal = std::fopen(kParkedPath, "ab");
+    if (journal == nullptr) return ESP_FAIL;
+    const std::string entry = request_id + ' ' + reason_name;
+    const bool separated = !needs_separator || std::fputc('\n', journal) != EOF;
+    const bool ok = separated &&
+        std::fwrite(entry.data(), 1, entry.size(), journal) ==
+            entry.size() &&
+        std::fputc('\n', journal) != EOF && std::fflush(journal) == 0 &&
+        ::fsync(fileno(journal)) == 0;
+    if (std::fclose(journal) != 0 || !ok) return ESP_FAIL;
+    return ESP_OK;
+}
+
 struct CommitContext {
     const wqn::DurableProblemObservation* observation;
 };
@@ -207,11 +361,21 @@ esp_err_t PeekTransaction(void* opaque)
     std::vector<std::string> lines;
     esp_err_t result = ReadOutboxLines(&lines);
     if (result != ESP_OK) return result;
+    std::vector<std::string> parked;
+    result = ReadParkedRequestIds(&parked);
+    if (result != ESP_OK) return result;
     for (const std::string& line : lines) {
-        if (DecodeObservationLine(line, observation)) {
-            return ESP_OK;
+        if (!DecodeObservationLine(line, observation)) {
+            ESP_LOGW(kTag, "skipping malformed problem outbox head");
+            continue;
         }
-        ESP_LOGW(kTag, "skipping malformed problem outbox head");
+        const bool is_parked = std::find(
+            parked.begin(), parked.end(), observation->request_id) !=
+            parked.end();
+        if (is_parked) {
+            continue;
+        }
+        return ESP_OK;
     }
     return ESP_ERR_NOT_FOUND;
 }
@@ -273,14 +437,65 @@ esp_err_t SnapshotTransaction(void* opaque)
     std::vector<std::string> lines;
     esp_err_t result = ReadOutboxLines(&lines);
     if (result != ESP_OK) return result;
+    std::vector<std::string> parked;
+    result = ReadParkedRequestIds(&parked);
+    if (result != ESP_OK) return result;
     size_t valid = 0;
+    size_t suspended = 0;
     for (const std::string& line : lines) {
         wqn::DurableProblemObservation parsed;
-        if (DecodeObservationLine(line, &parsed)) ++valid;
+        if (!DecodeObservationLine(line, &parsed)) continue;
+        const bool is_parked =
+            std::find(parked.begin(), parked.end(), parsed.request_id) !=
+            parked.end();
+        if (is_parked) {
+            ++suspended;
+            continue;
+        }
+        ++valid;
     }
     snapshot->pending_count = valid;
+    snapshot->suspended_count = suspended;
     snapshot->capacity = wqn::kProblemObservationOutboxCapacity;
     return ESP_OK;
+}
+
+struct ParkContext {
+    const std::string* request_id;
+    wqn::OutboxSuspendReason reason;
+};
+
+esp_err_t SuspendTransaction(void* opaque)
+{
+    auto* context = static_cast<ParkContext*>(opaque);
+    if (context == nullptr || context->request_id == nullptr ||
+        context->request_id->empty()) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    std::vector<std::string> parked;
+    esp_err_t result = ReadParkedRequestIds(&parked);
+    if (result != ESP_OK) return result;
+    if (std::find(parked.begin(), parked.end(), *context->request_id) !=
+        parked.end()) {
+        // Idempotent replay of an earlier park.
+        return ESP_OK;
+    }
+    std::vector<std::string> lines;
+    result = ReadOutboxLines(&lines);
+    if (result != ESP_OK) return result;
+    bool exists = false;
+    for (const std::string& line : lines) {
+        wqn::DurableProblemObservation parsed;
+        if (DecodeObservationLine(line, &parsed) &&
+            parsed.request_id == *context->request_id) {
+            exists = true;
+            break;
+        }
+    }
+    if (!exists) return ESP_ERR_NOT_FOUND;
+    // Single durable write: the payload stays in po_outbox.jsonl untouched,
+    // only the skip-marker journal gains an entry.
+    return AppendParkedEntry(*context->request_id, context->reason);
 }
 
 esp_err_t ExecuteWithStorageLease(
@@ -336,6 +551,16 @@ esp_err_t QuarantinePendingProblemObservation(const std::string& request_id)
     RequestIdContext context{&request_id, true};
     return ExecuteWithStorageLease(
         "problem-outbox-quarantine", RemoveTransaction, &context);
+}
+
+esp_err_t SuspendPendingProblemObservation(
+    const std::string& request_id,
+    OutboxSuspendReason reason)
+{
+    if (request_id.empty()) return ESP_ERR_INVALID_ARG;
+    ParkContext context{&request_id, reason};
+    return ExecuteWithStorageLease(
+        "problem-outbox-suspend", SuspendTransaction, &context);
 }
 
 esp_err_t ReadProblemOutboxSnapshot(ProblemOutboxSnapshot* snapshot)

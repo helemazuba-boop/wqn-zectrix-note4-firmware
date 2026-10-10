@@ -4,6 +4,8 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "esp_system.h"
+
 namespace wqn {
 
 struct PlatformDiagnosticsSnapshot {
@@ -15,6 +17,10 @@ struct PlatformDiagnosticsSnapshot {
     bool wifi_mac_valid = false;
     std::array<uint8_t, 6> wifi_mac = {};
 };
+
+// Human-readable reset reason label ("panic", "deep sleep", ...). Shared by
+// the boot log and the Dev info dialog.
+const char* ResetReasonToString(esp_reset_reason_t reason);
 
 void PrintBootDiagnostics();
 bool ReadPlatformDiagnosticsSnapshot(PlatformDiagnosticsSnapshot* snapshot);

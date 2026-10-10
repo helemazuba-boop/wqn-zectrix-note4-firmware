@@ -138,7 +138,19 @@ def main() -> int:
     parser.add_argument("--output-dir", default="dist")
     parser.add_argument("--esptool-exe", required=True)
     parser.add_argument("--ssh-host", default="aliyun")
-    parser.add_argument("--remote-dir", default="/www/wwwroot/alist_storage/WQN Deck")
+    parser.add_argument("--remote-dir", default="/www/wwwroot/alist_storage/WQN NOTE 4")
+    parser.add_argument(
+        "--release-version",
+        default=None,
+        help="Version from the release tooling; used for the package name and manifest",
+    )
+    parser.add_argument(
+        "--extra",
+        action="append",
+        default=[],
+        metavar="SRC::DEST",
+        help="Copy an extra file into the package, e.g. UPDATELOG.md::UPDATELOG.md",
+    )
     parser.add_argument("--upload", action="store_true")
     args = parser.parse_args()
 
@@ -161,10 +173,15 @@ def main() -> int:
     if not flash_files or not app_file:
         raise SystemExit("flasher_args.json does not contain expected flash_files/app entries")
 
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     commit = capture(["git", "rev-parse", "--short", "HEAD"], project) or "nogit"
     dirty = bool(capture(["git", "status", "--short"], project))
-    package_name = f"WQN-Note4-Flasher-{stamp}-{commit}"
+    if args.release_version:
+        package_name = f"WQN-Note4-Flasher-{args.release_version}-{commit}"
+        if dirty:
+            package_name += "-dirty"
+    else:
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        package_name = f"WQN-Note4-Flasher-{stamp}-{commit}"
     package_root = output_dir / package_name
     if package_root.exists():
         shutil.rmtree(package_root)
@@ -182,8 +199,20 @@ def main() -> int:
         shutil.copy2(src, dst)
         copied[offset] = dst.name
 
+    for item in args.extra:
+        src_text, sep, dest = item.partition("::")
+        if not sep or not src_text or not dest:
+            raise SystemExit(f"--extra expects SRC::DEST, got: {item}")
+        src = Path(src_text).resolve()
+        if not src.is_file():
+            raise SystemExit(f"Missing extra file for --extra: {src}")
+        dst = package_root / dest
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+
     manifest = {
         "package": package_name,
+        "release_version": args.release_version,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "git_commit": commit,
         "git_dirty": dirty,

@@ -1,12 +1,21 @@
 #include "storage.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <cmath>
+#include <cstdio>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
+#include <dirent.h>
+#include <sys/stat.h>
+#include <ctime>
+#include <unistd.h>
 #include <vector>
 
 #include "cJSON.h"
+#include "device_protocol/json_depth_guard.h"
 #include "config.h"
 #include "esp_check.h"
 #include "esp_log.h"
@@ -15,7 +24,6 @@
 #include "esp_timer.h"
 #include "nvs.h"
 #include "nvs_flash.h"
-#include "problem_cache.h"
 #include "services/sync_service.h"
 #include "runtime/sleep_coordinator.h"
 #include "runtime/storage_schema.h"
@@ -31,18 +39,161 @@ constexpr char kProblemsKey[] = "problems";
 constexpr char kPendingReviewsKey[] = "pending_reviews";
 constexpr char kAiSessionKey[] = "ai_session_day";
 constexpr char kAutoSyncIntervalMinKey[] = "sync_min";
+constexpr char kBootFullSyncAttemptKey[] = "boot_sync_at";
+constexpr char kImageRenderModeKey[] = "img_render";
+// [ai-follow] 「AI 回复时翻页」 (1 = on). A missing key reads as on: the
+// product default, and the behaviour the AI page shipped before the toggle
+// became durable.
+constexpr char kAiAutoFollowKey[] = "ai_follow";
+// [detail] Agent-tier cloud detail tier (0 简要 / 1 标准 / 2 详细). A missing
+// or out-of-range key reads as the full tier (see LoadAgentDetailLevel).
+constexpr char kAgentDetailLevelKey[] = "agent_detail";
 constexpr char kDefaultWordDeckKey[] = "word_deck";
+constexpr char kWordSequentialCursorKey[] = "word_seq_idx";
 constexpr char kWifiSsidKey[] = "wifi_ssid";
 constexpr char kWifiPasswordKey[] = "wifi_pass";
+// [wifi-redundancy] Versioned dual-slot credential blob (replaces the per-key
+// wifi_ssid/wifi_pass pair with a single atomic commit).
+constexpr char kWifiCredsBlobKey[] = "wifi_creds";
+constexpr uint8_t kWifiCredentialStoreVersion = 1;
 constexpr char kControlConfigRevisionKey[] = "v3_cfg_rev";
 constexpr char kControlSyncCursorKey[] = "v3_cursor";
 static_assert(sizeof(kAutoSyncIntervalMinKey) <= 16, "NVS key must fit ESP-IDF's 15-character limit");
+static_assert(sizeof(kBootFullSyncAttemptKey) <= 16, "NVS key must fit ESP-IDF's 15-character limit");
+static_assert(sizeof(kImageRenderModeKey) <= 16, "NVS key must fit ESP-IDF's 15-character limit");
+static_assert(sizeof(kAiAutoFollowKey) <= 16, "NVS key must fit ESP-IDF's 15-character limit");
+static_assert(sizeof(kAgentDetailLevelKey) <= 16, "NVS key must fit ESP-IDF's 15-character limit");
 static_assert(sizeof(kWifiSsidKey) <= 16, "NVS key must fit ESP-IDF's 15-character limit");
 static_assert(sizeof(kWifiPasswordKey) <= 16, "NVS key must fit ESP-IDF's 15-character limit");
+static_assert(sizeof(kWifiCredsBlobKey) <= 16, "NVS key must fit ESP-IDF's 15-character limit");
 static_assert(sizeof(kControlConfigRevisionKey) <= 16, "NVS key must fit ESP-IDF's 15-character limit");
 static_assert(sizeof(kControlSyncCursorKey) <= 16, "NVS key must fit ESP-IDF's 15-character limit");
 constexpr char kStoragePartitionLabel[] = "storage";
 constexpr char kStorageBasePath[] = "/storage";
+constexpr char kSyncJournalPath[] = "/storage/sync_journal.json";
+constexpr char kSyncJournalTempPath[] = "/storage/sync_journal.tmp";
+constexpr char kSyncJournalBackupPath[] = "/storage/sync_journal.bak";
+constexpr size_t kPackGcAttemptBytes = 1024U * 1024U;
+constexpr time_t kStaleTempAgeSeconds = 5 * 60;
+
+struct PackCapacityRequest {
+    size_t required_bytes = 0;
+    size_t safety_reserve_bytes = 0;
+};
+
+bool HasSuffix(const std::string& value, const char* suffix)
+{
+    const size_t suffix_length = std::strlen(suffix);
+    return value.size() >= suffix_length &&
+        value.compare(value.size() - suffix_length, suffix_length, suffix) == 0;
+}
+
+esp_err_t EnsurePackDownloadCapacityTransaction(void* opaque)
+{
+    const auto* request = static_cast<const PackCapacityRequest*>(opaque);
+    if (request == nullptr ||
+        request->required_bytes > SIZE_MAX - request->safety_reserve_bytes) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    const size_t target =
+        request->required_bytes + request->safety_reserve_bytes;
+    size_t total = 0;
+    size_t used = 0;
+    ESP_RETURN_ON_ERROR(
+        esp_spiffs_info(kStoragePartitionLabel, &total, &used),
+        kTag,
+        "read SPIFFS capacity before pack download");
+    size_t available = total > used ? total - used : 0;
+    if (available >= target) {
+        return ESP_OK;
+    }
+
+    // [storage-capacity-fix] StorageService serialization means no writer is
+    // inside a transaction while this runs. Remove interrupted transaction
+    // files first; final pack/manifests and their backups remain untouched.
+    DIR* directory = opendir(kStorageBasePath);
+    if (directory != nullptr) {
+        const time_t now = std::time(nullptr);
+        while (dirent* entry = readdir(directory)) {
+            const std::string name = entry->d_name;
+            if (!HasSuffix(name, ".tmp")) {
+                continue;
+            }
+            const std::string path = std::string(kStorageBasePath) + "/" + name;
+            struct stat info = {};
+            if (stat(path.c_str(), &info) != 0 || info.st_mtime <= 0 ||
+                now <= info.st_mtime ||
+                now - info.st_mtime < kStaleTempAgeSeconds) {
+                // Pack streams intentionally keep their temp file open across
+                // chunk transactions. Age-gating prevents a capacity check in
+                // another lane from unlinking an active download.
+                continue;
+            }
+            if (unlink(path.c_str()) == 0) {
+                ESP_LOGI(kTag, "removed stale storage temp: %s", name.c_str());
+            }
+        }
+        closedir(directory);
+    }
+
+    struct ImageCandidate {
+        std::string path;
+        time_t mtime = 0;
+    };
+    std::vector<ImageCandidate> images;
+    directory = opendir(kStorageBasePath);
+    if (directory != nullptr) {
+        while (dirent* entry = readdir(directory)) {
+            const std::string name = entry->d_name;
+            if (name.rfind("ni_", 0) != 0 || !HasSuffix(name, ".wqni")) {
+                continue;
+            }
+            const std::string path = std::string(kStorageBasePath) + "/" + name;
+            struct stat info = {};
+            images.push_back({path, stat(path.c_str(), &info) == 0 ? info.st_mtime : 0});
+        }
+        closedir(directory);
+    }
+    std::sort(images.begin(), images.end(), [](const auto& left, const auto& right) {
+        return left.mtime < right.mtime;
+    });
+    for (const ImageCandidate& image : images) {
+        if (esp_spiffs_info(kStoragePartitionLabel, &total, &used) != ESP_OK) {
+            return ESP_FAIL;
+        }
+        available = total > used ? total - used : 0;
+        if (available >= target) {
+            break;
+        }
+        if (unlink(image.path.c_str()) == 0) {
+            ESP_LOGI(kTag, "evicted image cache for pack capacity: %s",
+                     image.path.c_str());
+        }
+    }
+
+    const size_t gc_target = std::min(target, kPackGcAttemptBytes);
+    const esp_err_t gc_result = esp_spiffs_gc(kStoragePartitionLabel, gc_target);
+    if (gc_result != ESP_OK && gc_result != ESP_ERR_NOT_FINISHED) {
+        ESP_LOGW(kTag, "SPIFFS GC before pack download failed: %s",
+                 esp_err_to_name(gc_result));
+    }
+    ESP_RETURN_ON_ERROR(
+        esp_spiffs_info(kStoragePartitionLabel, &total, &used),
+        kTag,
+        "read SPIFFS capacity after reclaim");
+    available = total > used ? total - used : 0;
+    if (available < target) {
+        ESP_LOGW(
+            kTag,
+            "pack capacity blocked: required=%u reserve=%u available=%u total=%u",
+            static_cast<unsigned>(request->required_bytes),
+            static_cast<unsigned>(request->safety_reserve_bytes),
+            static_cast<unsigned>(available),
+            static_cast<unsigned>(total));
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
+}
 
 struct NvsHandle {
     ~NvsHandle()
@@ -75,7 +226,11 @@ private:
 class JsonDocument {
 public:
     explicit JsonDocument(cJSON* root) : root_(root) {}
-    explicit JsonDocument(const std::string& payload) : root_(cJSON_Parse(payload.c_str())) {}
+    explicit JsonDocument(const std::string& payload)
+        : root_(wqn::protocol::JsonNestingWithinLimit(
+                    payload.data(), payload.size())
+                    ? cJSON_Parse(payload.c_str())
+                    : nullptr) {}
     ~JsonDocument() { cJSON_Delete(root_); }
 
     cJSON* root() const { return root_; }
@@ -91,12 +246,6 @@ std::string GetOptionalString(cJSON* object, const char* key)
 {
     cJSON* item = cJSON_GetObjectItemCaseSensitive(object, key);
     return cJSON_IsString(item) && item->valuestring != nullptr ? item->valuestring : "";
-}
-
-bool GetOptionalBool(cJSON* object, const char* key)
-{
-    cJSON* item = cJSON_GetObjectItemCaseSensitive(object, key);
-    return cJSON_IsBool(item) && cJSON_IsTrue(item);
 }
 
 int GetOptionalInt(cJSON* object, const char* key)
@@ -412,177 +561,361 @@ esp_err_t JsonToString(cJSON* root, std::string* output)
     return ESP_OK;
 }
 
-esp_err_t ParseArrayPayload(const std::string& payload, cJSON** array)
+esp_err_t ReadStorageTextFile(const char* path, std::string* output)
 {
-    if (array == nullptr) {
+    if (path == nullptr || output == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
-
-    JsonDocument document(payload);
-    if (!cJSON_IsArray(document.root())) {
-        return ESP_ERR_INVALID_STATE;
+    output->clear();
+    FILE* file = std::fopen(path, "rb");
+    if (file == nullptr) {
+        return errno == ENOENT ? ESP_ERR_NOT_FOUND : ESP_FAIL;
     }
-
-    *array = cJSON_Duplicate(document.root(), true);
-    return *array != nullptr ? ESP_OK : ESP_ERR_NO_MEM;
+    if (std::fseek(file, 0, SEEK_END) != 0) {
+        std::fclose(file);
+        return ESP_FAIL;
+    }
+    const long length = std::ftell(file);
+    if (length < 0 || std::fseek(file, 0, SEEK_SET) != 0) {
+        std::fclose(file);
+        return ESP_FAIL;
+    }
+    output->resize(static_cast<size_t>(length));
+    if (!output->empty() &&
+        std::fread(output->data(), 1, output->size(), file) != output->size()) {
+        std::fclose(file);
+        output->clear();
+        return ESP_FAIL;
+    }
+    return std::fclose(file) == 0 ? ESP_OK : ESP_FAIL;
 }
 
-esp_err_t ParseLegacyProblemsJson(
-    const std::string& payload,
-    std::vector<wqn::CachedProblem>* problems)
+esp_err_t WriteSyncJournalFileAtomic(const std::string& payload)
 {
-    if (problems == nullptr) {
+    FILE* file = std::fopen(kSyncJournalTempPath, "wb");
+    if (file == nullptr) {
+        return ESP_FAIL;
+    }
+    const bool complete = payload.empty() ||
+        std::fwrite(payload.data(), 1, payload.size(), file) == payload.size();
+    const bool flushed = complete && std::fflush(file) == 0 &&
+        ::fsync(fileno(file)) == 0;
+    const bool closed = std::fclose(file) == 0;
+    if (!complete || !flushed || !closed) {
+        std::remove(kSyncJournalTempPath);
+        return ESP_FAIL;
+    }
+    std::remove(kSyncJournalBackupPath);
+    if (std::rename(kSyncJournalPath, kSyncJournalBackupPath) != 0 && errno != ENOENT) {
+        std::remove(kSyncJournalTempPath);
+        return ESP_FAIL;
+    }
+    if (std::rename(kSyncJournalTempPath, kSyncJournalPath) != 0) {
+        std::rename(kSyncJournalBackupPath, kSyncJournalPath);
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
+void AddJournalContentState(cJSON* parent, const char* key,
+                            const wqn::SyncJournalContentState& state)
+{
+    cJSON* object = cJSON_CreateObject();
+    if (object == nullptr) {
+        return;
+    }
+    cJSON_AddNumberToObject(object, "desired_revision",
+                            static_cast<double>(state.desired_revision));
+    cJSON_AddNumberToObject(object, "applied_revision",
+                            static_cast<double>(state.applied_revision));
+    cJSON_AddNumberToObject(object, "phase",
+                            static_cast<double>(static_cast<uint8_t>(state.phase)));
+    cJSON_AddNumberToObject(object, "retry_attempt",
+                            static_cast<double>(state.retry_attempt));
+    cJSON_AddNumberToObject(
+        object,
+        "retry_not_before_unix_seconds",
+        static_cast<double>(state.retry_not_before_unix_seconds));
+    cJSON_AddStringToObject(object, "desired_snapshot_id", state.desired_snapshot_id);
+    cJSON_AddStringToObject(object, "active_snapshot_id", state.active_snapshot_id);
+    cJSON_AddItemToObject(parent, key, object);
+}
+
+void AddJournalRetryState(cJSON* parent, const char* key,
+                          const wqn::SyncJournalRetryState& state)
+{
+    cJSON* object = cJSON_CreateObject();
+    if (object == nullptr) {
+        return;
+    }
+    cJSON_AddNumberToObject(
+        object,
+        "not_before_unix_seconds",
+        static_cast<double>(state.not_before_unix_seconds));
+    cJSON_AddNumberToObject(object, "attempt", state.attempt);
+    cJSON_AddItemToObject(parent, key, object);
+}
+
+void AddJournalOutboxRetryState(
+    cJSON* parent,
+    const char* key,
+    const wqn::SyncJournalOutboxRetryState& state)
+{
+    cJSON* object = cJSON_CreateObject();
+    if (object == nullptr) {
+        return;
+    }
+    cJSON_AddStringToObject(object, "request_id", state.request_id);
+    cJSON_AddNumberToObject(
+        object,
+        "not_before_unix_seconds",
+        static_cast<double>(state.not_before_unix_seconds));
+    cJSON_AddNumberToObject(object, "attempt", state.attempt);
+    cJSON_AddNumberToObject(object, "cause", state.cause);
+    cJSON_AddItemToObject(parent, key, object);
+}
+
+bool ReadJournalU64(cJSON* object, const char* key, uint64_t* value)
+{
+    if (object == nullptr || value == nullptr) {
+        return false;
+    }
+    cJSON* item = cJSON_GetObjectItemCaseSensitive(object, key);
+    if (!cJSON_IsNumber(item) || !std::isfinite(item->valuedouble) ||
+        item->valuedouble < 0 ||
+        item->valuedouble > 9007199254740991.0 ||
+        std::floor(item->valuedouble) != item->valuedouble) {
+        return false;
+    }
+    *value = static_cast<uint64_t>(item->valuedouble);
+    return true;
+}
+
+std::string ReadJournalString(cJSON* object, const char* key)
+{
+    cJSON* item = cJSON_GetObjectItemCaseSensitive(object, key);
+    return cJSON_IsString(item) && item->valuestring != nullptr
+        ? item->valuestring
+        : std::string();
+}
+
+bool ReadJournalContentState(cJSON* parent, const char* key,
+                             uint64_t schema,
+                             wqn::SyncJournalContentState* state)
+{
+    if (parent == nullptr || state == nullptr) {
+        return false;
+    }
+    cJSON* object = cJSON_GetObjectItemCaseSensitive(parent, key);
+    if (!cJSON_IsObject(object)) {
+        return false;
+    }
+    uint64_t desired = 0;
+    uint64_t applied = 0;
+    uint64_t phase = 0;
+    uint64_t retry = 0;
+    uint64_t retry_not_before = 0;
+    const auto valid_snapshot_id = [](const std::string& value) {
+        return value.empty() ||
+            (value.size() == 64 && std::all_of(
+                value.begin(), value.end(), [](char ch) {
+                    return (ch >= '0' && ch <= '9') ||
+                        (ch >= 'a' && ch <= 'f');
+                }));
+    };
+    if (!ReadJournalU64(object, "desired_revision", &desired) ||
+        !ReadJournalU64(object, "applied_revision", &applied) ||
+        !ReadJournalU64(object, "phase", &phase) ||
+        !ReadJournalU64(object, "retry_attempt", &retry) ||
+        phase > static_cast<uint64_t>(wqn::SyncJournalPhase::kBlocked) ||
+        retry > UINT8_MAX || applied > desired ||
+        (schema >= 2 && !ReadJournalU64(
+             object,
+             "retry_not_before_unix_seconds",
+             &retry_not_before))) {
+        return false;
+    }
+    const std::string desired_snapshot = ReadJournalString(object, "desired_snapshot_id");
+    const std::string active_snapshot = ReadJournalString(object, "active_snapshot_id");
+    if (!valid_snapshot_id(desired_snapshot) ||
+        !valid_snapshot_id(active_snapshot)) {
+        return false;
+    }
+    state->desired_revision = desired;
+    state->applied_revision = applied;
+    state->phase = static_cast<wqn::SyncJournalPhase>(phase);
+    state->retry_attempt = static_cast<uint8_t>(retry);
+    state->retry_not_before_unix_seconds = retry_not_before;
+    std::snprintf(state->desired_snapshot_id,
+                  sizeof(state->desired_snapshot_id), "%s", desired_snapshot.c_str());
+    std::snprintf(state->active_snapshot_id,
+                  sizeof(state->active_snapshot_id), "%s", active_snapshot.c_str());
+    return true;
+}
+
+bool ReadJournalRetryState(cJSON* parent, const char* key,
+                           wqn::SyncJournalRetryState* state)
+{
+    if (parent == nullptr || state == nullptr) {
+        return false;
+    }
+    cJSON* object = cJSON_GetObjectItemCaseSensitive(parent, key);
+    uint64_t not_before = 0;
+    uint64_t attempt = 0;
+    if (!cJSON_IsObject(object) ||
+        !ReadJournalU64(object, "not_before_unix_seconds", &not_before) ||
+        !ReadJournalU64(object, "attempt", &attempt) || attempt > UINT8_MAX) {
+        return false;
+    }
+    state->not_before_unix_seconds = not_before;
+    state->attempt = static_cast<uint8_t>(attempt);
+    return true;
+}
+
+bool ReadJournalOutboxRetryState(
+    cJSON* parent,
+    const char* key,
+    wqn::SyncJournalOutboxRetryState* state)
+{
+    if (parent == nullptr || state == nullptr) {
+        return false;
+    }
+    cJSON* object = cJSON_GetObjectItemCaseSensitive(parent, key);
+    uint64_t not_before = 0;
+    uint64_t attempt = 0;
+    uint64_t cause = 0;
+    const std::string request_id = ReadJournalString(object, "request_id");
+    if (!cJSON_IsObject(object) || request_id.size() > 64 ||
+        !ReadJournalU64(object, "not_before_unix_seconds", &not_before) ||
+        !ReadJournalU64(object, "attempt", &attempt) ||
+        !ReadJournalU64(object, "cause", &cause) || attempt > UINT8_MAX ||
+        cause > 3 || (request_id.empty() &&
+                      (not_before != 0 || attempt != 0 || cause != 0))) {
+        return false;
+    }
+    std::snprintf(
+        state->request_id, sizeof(state->request_id), "%s", request_id.c_str());
+    state->not_before_unix_seconds = not_before;
+    state->attempt = static_cast<uint8_t>(attempt);
+    state->cause = static_cast<uint8_t>(cause);
+    return true;
+}
+
+esp_err_t ParseSyncJournalPayload(
+    const std::string& payload,
+    wqn::SyncJournal* journal)
+{
+    if (journal == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
-    problems->clear();
-    if (payload.empty()) {
+    *journal = {};
+    if (payload.empty() || payload.find('\0') != std::string::npos) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    cJSON* root = wqn::protocol::JsonNestingWithinLimit(
+                      payload.data(), payload.size())
+        ? cJSON_ParseWithOpts(payload.c_str(), nullptr, true)
+        : nullptr;
+    if (!cJSON_IsObject(root)) {
+        cJSON_Delete(root);
+        return ESP_ERR_INVALID_STATE;
+    }
+    uint64_t schema = 0;
+    uint64_t config_revision = 0;
+    uint64_t sync_cursor = 0;
+    const bool valid =
+        ReadJournalU64(root, "schema_version", &schema) &&
+        ReadJournalU64(root, "config_revision", &config_revision) &&
+        ReadJournalU64(root, "sync_cursor", &sync_cursor) &&
+        (schema == 1 || schema == 2) &&
+        ReadJournalContentState(root, "word_packs", schema, &journal->word_packs) &&
+        ReadJournalContentState(root, "note_packs", schema, &journal->note_packs) &&
+        ReadJournalContentState(root, "problem_packs", schema, &journal->problem_packs) &&
+        (schema == 1 ||
+         (ReadJournalRetryState(
+              root, "full_sync_retry", &journal->full_sync_retry) &&
+          ReadJournalOutboxRetryState(
+              root, "word_outbox", &journal->word_outbox) &&
+          ReadJournalOutboxRetryState(
+              root, "note_outbox", &journal->note_outbox) &&
+          ReadJournalOutboxRetryState(
+              root, "problem_outbox", &journal->problem_outbox)));
+    const std::string blocked_image_id =
+        ReadJournalString(root, "protocol_blocked_image_id");
+    const bool blocked_image_id_valid = blocked_image_id.size() <= 64;
+    cJSON_Delete(root);
+    if (!valid || !blocked_image_id_valid) {
+        *journal = {};
+        return ESP_ERR_INVALID_STATE;
+    }
+    // In-memory state always uses the newest schema so the first subsequent
+    // save atomically migrates a valid v1 journal.
+    journal->schema_version = 2;
+    journal->config_revision = config_revision;
+    journal->sync_cursor = sync_cursor;
+    std::snprintf(
+        journal->protocol_blocked_image_id,
+        sizeof(journal->protocol_blocked_image_id),
+        "%s",
+        blocked_image_id.c_str());
+    return ESP_OK;
+}
+
+esp_err_t RemovePrototypeProblemFile(const char* path)
+{
+    if (std::remove(path) == 0 || errno == ENOENT) {
         return ESP_OK;
     }
-
-    cJSON* array = nullptr;
-    ESP_RETURN_ON_ERROR(ParseArrayPayload(payload, &array), kTag, "parse legacy problem cache");
-    JsonDocument document(array);
-    const int count = cJSON_GetArraySize(document.root());
-    if (count < 0) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    problems->reserve(static_cast<size_t>(count));
-    for (int i = 0; i < count; ++i) {
-        cJSON* item = cJSON_GetArrayItem(document.root(), i);
-        if (!cJSON_IsObject(item)) {
-            return ESP_ERR_INVALID_STATE;
-        }
-        wqn::CachedProblem problem;
-        problem.id = GetOptionalString(item, "id");
-        problem.title = GetOptionalString(item, "title");
-        problem.type = GetOptionalString(item, "type");
-        problem.status = GetOptionalString(item, "status");
-        problem.content_text = GetOptionalString(item, "content_text");
-        problem.solution_text = GetOptionalString(item, "solution_text");
-        problem.asset_count = GetOptionalInt(item, "asset_count");
-        problem.solution_asset_count = GetOptionalInt(item, "solution_asset_count");
-        problem.updated_at = GetOptionalString(item, "updated_at");
-        if (problem.id.empty()) {
-            return ESP_ERR_INVALID_STATE;
-        }
-        problems->push_back(std::move(problem));
-    }
-    return ESP_OK;
+    ESP_LOGW(kTag, "remove obsolete problem file failed: path=%s errno=%d", path, errno);
+    return ESP_FAIL;
 }
 
-struct ProblemCacheWriteContext {
-    const std::vector<wqn::CachedProblem>* problems = nullptr;
-};
-
-esp_err_t SaveProblemCacheTransaction(void* opaque)
+esp_err_t CleanupPrototypeProblemStorageTransaction(void*)
 {
-    const auto* context = static_cast<const ProblemCacheWriteContext*>(opaque);
-    return context == nullptr || context->problems == nullptr
-        ? ESP_ERR_INVALID_ARG
-        : wqn::problem_cache::Save(*context->problems);
-}
+    constexpr const char* kObsoleteFiles[] = {
+        "/storage/problems.v1",
+        "/storage/problems.tmp",
+        "/storage/problems.bak",
+    };
+    constexpr const char* kObsoleteKeys[] = {
+        kProblemsKey,
+        kPendingReviewsKey,
+    };
 
-esp_err_t ClearProblemCacheTransaction(void*)
-{
-    esp_err_t result = wqn::problem_cache::Clear();
-    const esp_err_t legacy_result = ClearNvsKeyRaw(kProblemsKey);
+    esp_err_t first_error = ESP_OK;
+    for (const char* path : kObsoleteFiles) {
+        const esp_err_t result = RemovePrototypeProblemFile(path);
+        if (first_error == ESP_OK && result != ESP_OK) {
+            first_error = result;
+        }
+    }
+    NvsHandle nvs;
+    esp_err_t result = nvs_open(WQN_NVS_NAMESPACE, NVS_READWRITE, &nvs.handle);
+    if (result != ESP_OK && result != ESP_ERR_NVS_NOT_FOUND) {
+        if (first_error == ESP_OK) {
+            first_error = result;
+        }
+        ESP_LOGW(kTag, "open obsolete problem NVS cleanup failed: %s",
+                 esp_err_to_name(result));
+        return first_error;
+    }
     if (result == ESP_OK) {
-        result = legacy_result;
-    }
-    return result;
-}
-
-esp_err_t ClearProblemFilesTransaction(void*)
-{
-    return wqn::problem_cache::Clear();
-}
-
-esp_err_t MigrateLegacyProblemCache()
-{
-    std::vector<wqn::CachedProblem> existing;
-    const esp_err_t existing_result = wqn::problem_cache::Load(&existing);
-    if (existing_result == ESP_OK) {
-        const esp_err_t clear_result = ClearNvsKey(kProblemsKey);
-        if (clear_result == ESP_OK) {
-            ESP_LOGI(kTag, "legacy NVS problem cache key absent or removed");
+        for (const char* key : kObsoleteKeys) {
+            result = nvs_erase_key(nvs.handle, key);
+            if (result != ESP_OK && result != ESP_ERR_NVS_NOT_FOUND) {
+                if (first_error == ESP_OK) {
+                    first_error = result;
+                }
+                ESP_LOGW(kTag, "erase obsolete problem key failed: key=%s error=%s",
+                         key, esp_err_to_name(result));
+            }
         }
-        return clear_result;
+        result = nvs_commit(nvs.handle);
+        if (first_error == ESP_OK && result != ESP_OK) {
+            first_error = result;
+        }
     }
-    if (existing_result != ESP_ERR_NOT_FOUND) {
-        ESP_LOGW(
-            kTag,
-            "discarding invalid regenerable WQPC before legacy migration: %s",
-            esp_err_to_name(existing_result));
-        ESP_RETURN_ON_ERROR(
-            wqn::services::ExecuteStorageTransaction(
-                ClearProblemFilesTransaction,
-                nullptr),
-            kTag,
-            "clear invalid WQPC files");
-    }
-
-    std::string payload;
-    ESP_RETURN_ON_ERROR(
-        LoadBlobFromNvs(kProblemsKey, &payload),
-        kTag,
-        "load legacy NVS problem cache");
-    if (payload.empty()) {
-        return ClearNvsKey(kProblemsKey);
-    }
-
-    std::vector<wqn::CachedProblem> problems;
-    const esp_err_t parse_result = ParseLegacyProblemsJson(payload, &problems);
-    if (parse_result != ESP_OK) {
-        ESP_LOGW(
-            kTag,
-            "dropping unreadable regenerable NVS problem cache: bytes=%u error=%s",
-            static_cast<unsigned>(payload.size()),
-            esp_err_to_name(parse_result));
-        return ClearNvsKey(kProblemsKey);
-    }
-
-    ProblemCacheWriteContext context = {&problems};
-    const esp_err_t save_result =
-        wqn::services::ExecuteStorageTransaction(SaveProblemCacheTransaction, &context);
-    if (save_result != ESP_OK) {
-        // The cache is cloud-reconstructable. Reclaim scarce NVS even if the
-        // SPIFFS migration cannot preserve this old snapshot; the next sync
-        // will rebuild it through the same atomic file path.
-        ESP_LOGW(
-            kTag,
-            "legacy problem cache migration failed; dropping regenerable cache: bytes=%u error=%s",
-            static_cast<unsigned>(payload.size()),
-            esp_err_to_name(save_result));
-        return ClearNvsKey(kProblemsKey);
-    }
-
-    ESP_RETURN_ON_ERROR(
-        ClearNvsKey(kProblemsKey),
-        kTag,
-        "remove migrated NVS problem cache");
-    ESP_LOGI(
-        kTag,
-        "legacy problem cache migrated: records=%u nvs_bytes_reclaimed=%u",
-        static_cast<unsigned>(problems.size()),
-        static_cast<unsigned>(payload.size()));
-    return ESP_OK;
-}
-
-esp_err_t MigrateLegacyProblemCacheTransaction(void*)
-{
-    return MigrateLegacyProblemCache();
-}
-
-struct ProblemCacheReadContext {
-    std::vector<wqn::CachedProblem>* problems = nullptr;
-};
-
-esp_err_t LoadProblemCacheTransaction(void* opaque)
-{
-    auto* context = static_cast<ProblemCacheReadContext*>(opaque);
-    return context == nullptr || context->problems == nullptr
-        ? ESP_ERR_INVALID_ARG
-        : wqn::problem_cache::Load(context->problems);
+    return first_error;
 }
 
 }  // namespace
@@ -627,18 +960,18 @@ esp_err_t InitStorage()
     // and business services must not run against that state.
     ESP_RETURN_ON_ERROR(RecoverDefaultDeckScopeChange(), kTag,
                         "recover deck scope change");
-    // Legacy JSON parsing, WQPC inflate/deflate and file validation are all
-    // deliberately executed on StorageService. Besides preserving single
-    // ownership, this prevents their deeper bounded stack from consuming the
-    // 8 KiB IDF main task during boot.
-    const esp_err_t migration_result = services::ExecuteStorageTransaction(
-        MigrateLegacyProblemCacheTransaction,
+    // The removed prototype used three compressed files and two NVS blobs. Reclaim
+    // those exact artifacts on StorageService so cleanup is serialized with
+    // all current pack/outbox writes. It is intentionally idempotent and does
+    // not touch problem-study-v1 pp_* / po_* files.
+    const esp_err_t cleanup_result = services::ExecuteStorageTransaction(
+        CleanupPrototypeProblemStorageTransaction,
         nullptr);
-    if (migration_result != ESP_OK) {
+    if (cleanup_result != ESP_OK) {
         ESP_LOGW(
             kTag,
-            "legacy problem cache cleanup deferred: %s",
-            esp_err_to_name(migration_result));
+            "obsolete problem storage cleanup deferred: %s",
+            esp_err_to_name(cleanup_result));
     }
     return ESP_OK;
 }
@@ -666,6 +999,30 @@ bool ReadStorageCapacitySnapshot(StorageCapacitySnapshot* snapshot)
     return snapshot->spiffs_valid || snapshot->nvs_valid;
 }
 
+esp_err_t EnsurePackDownloadCapacity(
+    size_t required_bytes,
+    size_t safety_reserve_bytes)
+{
+    if (required_bytes == 0) {
+        return ESP_OK;
+    }
+    runtime::SleepLease storage_lease = runtime::SleepLease::TryAcquire(
+        runtime::SleepBlocker::kStorage,
+        "pack-capacity-reclaim",
+        __FILE__,
+        __LINE__);
+    if (!storage_lease) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    PackCapacityRequest request = {
+        required_bytes,
+        safety_reserve_bytes,
+    };
+    return services::ExecuteStorageTransaction(
+        EnsurePackDownloadCapacityTransaction,
+        &request);
+}
+
 esp_err_t LoadAccessToken(std::string* token)
 {
     return LoadStringFromNvs(WQN_NVS_ACCESS_TOKEN_KEY, token);
@@ -687,11 +1044,10 @@ esp_err_t SaveAccessToken(const std::string& token)
         return result;
     }
 
-    // [power-fix] The online sync task is parked on portMAX_DELAY while
-    // the device is unpaired. Waking it here lets it run the first real
-    // sync round immediately after pairing instead of waiting for the
-    // next user action or scheduled interval.
-    services::RequestSyncNow();
+    // Credentials are an explicit full-sync reason. Publishing it here lets
+    // the scheduler run the first authenticated round immediately after
+    // pairing instead of waiting for the next periodic deadline.
+    services::NotifySyncCredentialsChanged();
     return result;
 }
 
@@ -701,12 +1057,10 @@ esp_err_t ClearAccessToken()
     if (!write) {
         return ESP_ERR_INVALID_STATE;
     }
-    // [power-fix] If clearing the token was triggered by some external
-    // event (e.g. the server returning 401 during sync), we want the
-    // SyncService to re-evaluate its delay immediately rather than stay
-    // parked on whatever value it was using.
+    // If clearing the token was triggered by 401, make the scheduler enter
+    // the claim path immediately rather than wait on its prior deadline.
     const esp_err_t result = ClearAccessTokenKeys();
-    wqn::services::RequestSyncNow();
+    wqn::services::NotifySyncCredentialsChanged();
     return result;
 }
 
@@ -752,133 +1106,78 @@ esp_err_t SaveDeviceControlState(const DeviceControlState& state)
         const_cast<DeviceControlState*>(&state));
 }
 
-esp_err_t SaveProblems(const std::vector<CachedProblem>& problems)
+esp_err_t LoadSyncJournal(SyncJournal* journal)
 {
-    StorageWriteGuard write("save-problems", __FILE__, __LINE__);
-    if (!write) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    ProblemCacheWriteContext context = {&problems};
-    return services::ExecuteStorageTransaction(SaveProblemCacheTransaction, &context);
-}
-
-esp_err_t LoadProblems(std::vector<CachedProblem>* problems)
-{
-    if (problems == nullptr) {
+    if (journal == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
-
-    ProblemCacheReadContext context = {problems};
-    const esp_err_t result = services::ExecuteStorageTransaction(
-        LoadProblemCacheTransaction,
-        &context);
-    if (result == ESP_ERR_NOT_FOUND) {
-        problems->clear();
-        return ESP_OK;
-    }
-    return result;
-}
-
-esp_err_t ClearProblems()
-{
-    StorageWriteGuard write("clear-problems", __FILE__, __LINE__);
-    if (!write) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    return services::ExecuteStorageTransaction(ClearProblemCacheTransaction, nullptr);
-}
-
-esp_err_t EnqueueReviewResult(const PendingReviewResult& result)
-{
-    StorageWriteGuard write("enqueue-review", __FILE__, __LINE__);
-    if (!write) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    if (result.problem_id.empty() || result.selected_status.empty()) {
-        return ESP_ERR_INVALID_ARG;
+    std::string payload;
+    esp_err_t primary_result = ReadStorageTextFile(kSyncJournalPath, &payload);
+    if (primary_result == ESP_OK) {
+        primary_result = ParseSyncJournalPayload(payload, journal);
+        if (primary_result == ESP_OK) {
+            return ESP_OK;
+        }
+        ESP_LOGW(kTag, "primary sync journal invalid; trying backup");
+    } else if (primary_result != ESP_ERR_NOT_FOUND) {
+        ESP_LOGW(kTag, "primary sync journal unreadable; trying backup");
     }
 
-    std::vector<PendingReviewResult> results;
-    ESP_RETURN_ON_ERROR(LoadPendingReviewResults(&results), kTag, "load pending reviews");
-    bool replaced = false;
-    for (PendingReviewResult& pending : results) {
-        if (pending.problem_id == result.problem_id) {
-            pending = result;
-            replaced = true;
-            break;
+    payload.clear();
+    esp_err_t backup_result = ReadStorageTextFile(kSyncJournalBackupPath, &payload);
+    if (backup_result == ESP_OK) {
+        backup_result = ParseSyncJournalPayload(payload, journal);
+        if (backup_result == ESP_OK) {
+            ESP_LOGW(kTag, "recovered sync journal from backup");
+            return ESP_OK;
         }
     }
-    if (!replaced) {
-        results.push_back(result);
+    *journal = {};
+    if (primary_result == ESP_ERR_NOT_FOUND &&
+        backup_result == ESP_ERR_NOT_FOUND) {
+        return ESP_OK;
     }
+    return backup_result != ESP_ERR_NOT_FOUND
+        ? backup_result
+        : primary_result;
+}
 
-    JsonDocument document(cJSON_CreateArray());
-    if (document.root() == nullptr) {
+esp_err_t SaveSyncJournal(const SyncJournal& journal)
+{
+    if (journal.schema_version != 2) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    StorageWriteGuard write("save-sync-journal", __FILE__, __LINE__);
+    if (!write) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    cJSON* root = cJSON_CreateObject();
+    if (root == nullptr) {
         return ESP_ERR_NO_MEM;
     }
-
-    for (const PendingReviewResult& pending : results) {
-        cJSON* item = cJSON_CreateObject();
-        if (item == nullptr ||
-            !cJSON_AddStringToObject(item, "problem_id", pending.problem_id.c_str()) ||
-            !cJSON_AddStringToObject(item, "selected_status", pending.selected_status.c_str()) ||
-            cJSON_AddBoolToObject(item, "is_correct", pending.is_correct) == nullptr ||
-            !cJSON_AddStringToObject(item, "submitted_answer", pending.submitted_answer.c_str()) ||
-            !cJSON_AddStringToObject(item, "created_at", pending.created_at.c_str())) {
-            cJSON_Delete(item);
-            return ESP_ERR_NO_MEM;
-        }
-        cJSON_AddItemToArray(document.root(), item);
-    }
-
+    cJSON_AddNumberToObject(root, "schema_version", journal.schema_version);
+    cJSON_AddNumberToObject(root, "config_revision",
+                            static_cast<double>(journal.config_revision));
+    cJSON_AddNumberToObject(root, "sync_cursor",
+                            static_cast<double>(journal.sync_cursor));
+    AddJournalRetryState(root, "full_sync_retry", journal.full_sync_retry);
+    AddJournalContentState(root, "word_packs", journal.word_packs);
+    AddJournalContentState(root, "note_packs", journal.note_packs);
+    AddJournalContentState(root, "problem_packs", journal.problem_packs);
+    AddJournalOutboxRetryState(root, "word_outbox", journal.word_outbox);
+    AddJournalOutboxRetryState(root, "note_outbox", journal.note_outbox);
+    AddJournalOutboxRetryState(root, "problem_outbox", journal.problem_outbox);
+    cJSON_AddStringToObject(
+        root,
+        "protocol_blocked_image_id",
+        journal.protocol_blocked_image_id);
     std::string payload;
-    ESP_RETURN_ON_ERROR(JsonToString(document.root(), &payload), kTag, "serialize pending reviews");
-    return SaveBlobToNvs(kPendingReviewsKey, payload);
-}
-
-esp_err_t LoadPendingReviewResults(std::vector<PendingReviewResult>* results)
-{
-    if (results == nullptr) {
-        return ESP_ERR_INVALID_ARG;
+    const esp_err_t render_result = JsonToString(root, &payload);
+    cJSON_Delete(root);
+    if (render_result != ESP_OK) {
+        return render_result;
     }
-
-    std::string payload;
-    ESP_RETURN_ON_ERROR(LoadBlobFromNvs(kPendingReviewsKey, &payload), kTag, "load pending reviews");
-    results->clear();
-    if (payload.empty()) {
-        return ESP_OK;
-    }
-
-    cJSON* array = nullptr;
-    ESP_RETURN_ON_ERROR(ParseArrayPayload(payload, &array), kTag, "parse pending reviews");
-    JsonDocument document(array);
-
-    const int count = cJSON_GetArraySize(document.root());
-    results->reserve(count);
-    for (int i = 0; i < count; ++i) {
-        cJSON* item = cJSON_GetArrayItem(document.root(), i);
-        if (!cJSON_IsObject(item)) {
-            continue;
-        }
-
-        PendingReviewResult pending;
-        pending.problem_id = GetOptionalString(item, "problem_id");
-        pending.selected_status = GetOptionalString(item, "selected_status");
-        pending.is_correct = GetOptionalBool(item, "is_correct");
-        pending.submitted_answer = GetOptionalString(item, "submitted_answer");
-        pending.created_at = GetOptionalString(item, "created_at");
-        results->push_back(pending);
-    }
-    return ESP_OK;
-}
-
-esp_err_t ClearPendingReviewResults()
-{
-    StorageWriteGuard write("clear-pending-reviews", __FILE__, __LINE__);
-    if (!write) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    return ClearNvsKey(kPendingReviewsKey);
+    return WriteSyncJournalFileAtomic(payload);
 }
 
 esp_err_t SaveAiSessionForDay(const CachedAiSession& session)
@@ -1016,6 +1315,131 @@ esp_err_t SaveAutoSyncIntervalMinutesForeground(uint32_t minutes)
         SaveU64Transaction, &context, "save-sync-interval");
 }
 
+esp_err_t LoadBootFullSyncAttemptUnixSeconds(int64_t* seconds)
+{
+    if (seconds == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    uint64_t raw = 0;
+    bool found = false;
+    ESP_RETURN_ON_ERROR(
+        LoadU64FromNvs(kBootFullSyncAttemptKey, &raw, &found), kTag,
+        "load boot full-sync attempt");
+    if (!found || raw > static_cast<uint64_t>(INT64_MAX)) {
+        *seconds = 0;
+        return ESP_OK;
+    }
+    *seconds = static_cast<int64_t>(raw);
+    return ESP_OK;
+}
+
+esp_err_t SaveBootFullSyncAttemptUnixSeconds(int64_t seconds)
+{
+    if (seconds < 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    StorageWriteGuard write("save-boot-sync-attempt", __FILE__, __LINE__);
+    if (!write) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    return SaveU64ToNvs(
+        kBootFullSyncAttemptKey, static_cast<uint64_t>(seconds));
+}
+
+esp_err_t LoadImageRenderMode(ImageRenderMode* mode)
+{
+    if (mode == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    uint64_t raw = 0;
+    bool found = false;
+    ESP_RETURN_ON_ERROR(
+        LoadU64FromNvs(kImageRenderModeKey, &raw, &found), kTag,
+        "load image render mode");
+    // GRAY16 is the product default. Unknown future values degrade to the
+    // same safe full-refresh path rather than silently selecting BW1.
+    *mode = found && raw == static_cast<uint64_t>(ImageRenderMode::kBlackWhite)
+        ? ImageRenderMode::kBlackWhite
+        : ImageRenderMode::kGray16;
+    return ESP_OK;
+}
+
+esp_err_t SaveImageRenderModeForeground(ImageRenderMode mode)
+{
+    if (mode != ImageRenderMode::kBlackWhite && mode != ImageRenderMode::kGray16) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    StorageWriteGuard write("save-image-render", __FILE__, __LINE__);
+    if (!write) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    U64WriteContext context = {
+        kImageRenderModeKey, static_cast<uint64_t>(mode)};
+    return services::ExecuteForegroundStorageTransaction(
+        SaveU64Transaction, &context, "save-image-render");
+}
+
+std::string ImageRenderModeLabel(ImageRenderMode mode)
+{
+    return mode == ImageRenderMode::kBlackWhite ? "黑白" : "16阶灰度";
+}
+
+esp_err_t LoadAiAutoFollow(bool* follow)
+{
+    if (follow == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    uint64_t raw = 0;
+    bool found = false;
+    ESP_RETURN_ON_ERROR(
+        LoadU64FromNvs(kAiAutoFollowKey, &raw, &found), kTag,
+        "load ai auto follow");
+    // Absent key = on (the product default); any nonzero stored value = on.
+    *follow = !found || raw != 0;
+    return ESP_OK;
+}
+
+esp_err_t SaveAiAutoFollowForeground(bool follow)
+{
+    StorageWriteGuard write("save-ai-follow", __FILE__, __LINE__);
+    if (!write) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    U64WriteContext context = {kAiAutoFollowKey, follow ? 1U : 0U};
+    return services::ExecuteForegroundStorageTransaction(
+        SaveU64Transaction, &context, "save-ai-follow");
+}
+
+esp_err_t LoadAgentDetailLevel(uint8_t* level)
+{
+    if (level == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    uint64_t raw = 0;
+    bool found = false;
+    ESP_RETURN_ON_ERROR(
+        LoadU64FromNvs(kAgentDetailLevelKey, &raw, &found), kTag,
+        "load agent detail level");
+    // An unknown future value degrades to the full tier (kOpenCodeDetailDefault
+    // in opencode_model.h) rather than to a tier the user never chose.
+    *level = found && raw <= 2 ? static_cast<uint8_t>(raw) : 2;
+    return ESP_OK;
+}
+
+esp_err_t SaveAgentDetailLevelForeground(uint8_t level)
+{
+    if (level > 2) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    StorageWriteGuard write("save-agent-detail", __FILE__, __LINE__);
+    if (!write) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    U64WriteContext context = {kAgentDetailLevelKey, static_cast<uint64_t>(level)};
+    return services::ExecuteForegroundStorageTransaction(
+        SaveU64Transaction, &context, "save-agent-detail");
+}
+
 esp_err_t LoadDefaultWordDeckId(std::string* deck_id)
 {
     if (deck_id == nullptr) {
@@ -1031,6 +1455,34 @@ esp_err_t LoadDefaultWordDeckId(std::string* deck_id)
         deck_id->clear();
     }
     return result;
+}
+
+esp_err_t LoadWordSequentialCursor(uint32_t* cursor)
+{
+    if (cursor == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *cursor = 0;
+    uint64_t stored = 0;
+    bool found = false;
+    // A missing key is an unset cursor (start of the library), not an error.
+    ESP_RETURN_ON_ERROR(
+        LoadU64FromNvs(kWordSequentialCursorKey, &stored, &found),
+        kTag,
+        "load word sequential cursor");
+    if (found && stored <= UINT32_MAX) {
+        *cursor = static_cast<uint32_t>(stored);
+    }
+    return ESP_OK;
+}
+
+esp_err_t SaveWordSequentialCursor(uint32_t cursor)
+{
+    StorageWriteGuard write("save-word-cursor", __FILE__, __LINE__);
+    if (!write) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    return SaveU64ToNvs(kWordSequentialCursorKey, cursor);
 }
 
 esp_err_t SaveDefaultWordDeckId(const std::string& deck_id)
@@ -1067,12 +1519,21 @@ std::atomic<uint32_t> g_deck_scope_generation{0};
 // ClearPersistedWordSession calls rely on the service-task passthrough).
 esp_err_t ApplyDeckScopeChangeLocked(uint32_t target_generation, const std::string& deck_id)
 {
+    // [word-modes-v2] Every resumable word session mode must be dropped here:
+    // a session pinned to the old deck scope can never be resumed, and leaving
+    // the file behind only confuses boot recovery.
     ESP_RETURN_ON_ERROR(
         ClearPersistedWordSession(protocol::word_study_v1::Mode::kSequential),
         kTag, "deck change: clear sequential session");
     ESP_RETURN_ON_ERROR(
-        ClearPersistedWordSession(protocol::word_study_v1::Mode::kRandom),
-        kTag, "deck change: clear random session");
+        ClearPersistedWordSession(protocol::word_study_v1::Mode::kReview),
+        kTag, "deck change: clear review session");
+    ESP_RETURN_ON_ERROR(
+        ClearPersistedWordSession(protocol::word_study_v1::Mode::kShuffle),
+        kTag, "deck change: clear shuffle session");
+    ESP_RETURN_ON_ERROR(
+        ClearPersistedWordSession(protocol::word_study_v1::Mode::kMistakes),
+        kTag, "deck change: clear mistakes session");
     if (deck_id.empty()) {
         ESP_RETURN_ON_ERROR(ClearNvsKeyRaw(kDefaultWordDeckKey), kTag,
                             "deck change: clear deck key");
@@ -1359,23 +1820,315 @@ esp_err_t FactoryResetNvsAndRestart()
     return services::ExecuteStorageTransaction(FactoryResetTransaction, nullptr);
 }
 
+namespace {
+
+constexpr size_t kWifiSsidMaxLen = 32;
+constexpr size_t kWifiPasswordMaxLen = 64;
+
+// [wifi-redundancy] The blob is a raw memcpy of WifiCredentialStore; lock the
+// layout so an accidental field change is a build error, not silent corruption.
+static_assert(sizeof(wqn::WifiCredentialSlot) == 33 + 65,
+              "WifiCredentialSlot layout changed; bump kWifiCredentialStoreVersion");
+static_assert(sizeof(wqn::WifiCredentialStore) == 3 + 2 * (33 + 65),
+              "WifiCredentialStore layout changed; bump kWifiCredentialStoreVersion");
+
+void CopyWifiCredentialField(char* destination, size_t destination_size, const char* value)
+{
+    if (destination == nullptr || destination_size == 0) {
+        return;
+    }
+    std::snprintf(destination, destination_size, "%s", value == nullptr ? "" : value);
+}
+
+wqn::WifiCredentialStore EmptyWifiCredentialStore()
+{
+    wqn::WifiCredentialStore store{};
+    store.version = kWifiCredentialStoreVersion;
+    return store;
+}
+
+// [wifi-redundancy] Validates a store deserialized from the NVS blob. The
+// opt-in version-0 path recovers blobs written by the original dual-slot bug,
+// whose layout was already final but whose empty-store initializer omitted the
+// version. Other bad versions/structures fall back to legacy migration.
+// Valid stores are normalized to the current version and compacted in place.
+bool ValidateWifiCredentialStore(
+    wqn::WifiCredentialStore* store,
+    bool allow_buggy_unversioned_store = false)
+{
+    if (store == nullptr) {
+        return false;
+    }
+    if (store->version != kWifiCredentialStoreVersion &&
+        !(allow_buggy_unversioned_store && store->version == 0)) {
+        return false;
+    }
+    if (store->count > 2 || store->preferred >= 2) {
+        return false;
+    }
+    for (auto& slot : store->slots) {
+        if (std::memchr(slot.ssid, '\0', sizeof(slot.ssid)) == nullptr ||
+            std::memchr(slot.password, '\0', sizeof(slot.password)) == nullptr) {
+            return false;
+        }
+    }
+
+    // Compact to occupied (non-empty-SSID) slots, tracking where the preferred
+    // entry lands. Identical SSIDs collapse to one slot; the preferred copy's
+    // password wins.
+    wqn::WifiCredentialStore compacted = EmptyWifiCredentialStore();
+    const bool preferred_valid =
+        store->preferred < store->count && store->slots[store->preferred].ssid[0] != '\0';
+    for (uint8_t i = 0; i < store->count; ++i) {
+        const auto& slot = store->slots[i];
+        if (slot.ssid[0] == '\0') {
+            continue;
+        }
+        bool duplicate = false;
+        for (uint8_t j = 0; j < compacted.count; ++j) {
+            if (std::strcmp(compacted.slots[j].ssid, slot.ssid) == 0) {
+                duplicate = true;
+                if (preferred_valid && i == store->preferred) {
+                    CopyWifiCredentialField(
+                        compacted.slots[j].password, sizeof(compacted.slots[j].password), slot.password);
+                    compacted.preferred = j;
+                }
+                break;
+            }
+        }
+        if (duplicate) {
+            continue;
+        }
+        const uint8_t destination = compacted.count;
+        compacted.slots[destination] = slot;
+        if (preferred_valid && i == store->preferred) {
+            compacted.preferred = destination;
+        }
+        ++compacted.count;
+    }
+    if (!preferred_valid) {
+        compacted.preferred = 0;
+    }
+    *store = compacted;
+    return true;
+}
+
+}  // namespace
+
+esp_err_t LoadWifiCredentialStore(WifiCredentialStore* store)
+{
+    if (store == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    // A valid empty store is versioned too. The old zero-initialized return
+    // path caused the first Upsert to persist version=0 forever.
+    *store = EmptyWifiCredentialStore();
+
+    std::string blob;
+    ESP_RETURN_ON_ERROR(LoadBlobFromNvs(kWifiCredsBlobKey, &blob), kTag, "load wifi credential blob");
+    if (!blob.empty()) {
+        if (blob.size() != sizeof(WifiCredentialStore)) {
+            ESP_LOGW(
+                kTag,
+                "wifi credential blob size mismatch: %u != %u; ignoring",
+                static_cast<unsigned>(blob.size()),
+                static_cast<unsigned>(sizeof(WifiCredentialStore)));
+        } else {
+            WifiCredentialStore candidate;
+            std::memcpy(&candidate, blob.data(), sizeof(candidate));
+            if (ValidateWifiCredentialStore(&candidate, true)) {
+                *store = candidate;
+                return ESP_OK;
+            }
+            ESP_LOGW(kTag, "wifi credential blob failed validation; trying legacy migration");
+        }
+    }
+
+    // Legacy migration: synthesize slot 0 from the per-key wifi_ssid/wifi_pass,
+    // then persist as a blob and clear the legacy keys so the blob becomes the
+    // single source of truth.
+    std::string ssid;
+    std::string password;
+    ESP_RETURN_ON_ERROR(LoadStringFromNvs(kWifiSsidKey, &ssid), kTag, "load legacy wifi ssid");
+    if (ssid.empty()) {
+        return ESP_OK;
+    }
+    ESP_RETURN_ON_ERROR(LoadStringFromNvs(kWifiPasswordKey, &password), kTag, "load legacy wifi password");
+    store->version = kWifiCredentialStoreVersion;
+    store->preferred = 0;
+    store->count = 1;
+    CopyWifiCredentialField(store->slots[0].ssid, sizeof(store->slots[0].ssid), ssid.c_str());
+    CopyWifiCredentialField(store->slots[0].password, sizeof(store->slots[0].password), password.c_str());
+    ESP_LOGI(kTag, "migrated legacy wifi credentials into slot 0 (SSID=%s)", ssid.c_str());
+    if (SaveWifiCredentialStore(*store) == ESP_OK) {
+        ClearNvsKey(kWifiSsidKey);
+        ClearNvsKey(kWifiPasswordKey);
+    }
+    return ESP_OK;
+}
+
+esp_err_t SaveWifiCredentialStore(const WifiCredentialStore& store)
+{
+    WifiCredentialStore normalized = store;
+    if (!ValidateWifiCredentialStore(&normalized)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    StorageWriteGuard write("save-wifi-credential-store", __FILE__, __LINE__);
+    if (!write) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    const std::string blob(
+        reinterpret_cast<const char*>(&normalized), sizeof(normalized));
+    return SaveBlobToNvs(kWifiCredsBlobKey, blob);
+}
+
+esp_err_t UpsertWifiCredential(const std::string& ssid, const std::string& password)
+{
+    if (ssid.empty() || ssid.size() > kWifiSsidMaxLen || password.size() > kWifiPasswordMaxLen) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    WifiCredentialStore store;
+    ESP_RETURN_ON_ERROR(LoadWifiCredentialStore(&store), kTag, "load store for upsert");
+
+    bool hit = false;
+    bool changed = false;
+    for (uint8_t i = 0; i < store.count; ++i) {
+        if (std::strcmp(store.slots[i].ssid, ssid.c_str()) != 0) {
+            continue;
+        }
+        // Refresh every slot carrying this SSID so a stale password cannot
+        // survive on the other slot.
+        hit = true;
+        if (std::strcmp(store.slots[i].password, password.c_str()) != 0) {
+            CopyWifiCredentialField(store.slots[i].password, sizeof(store.slots[i].password), password.c_str());
+            changed = true;
+        }
+        if (store.preferred != i) {
+            store.preferred = i;
+            changed = true;
+        }
+    }
+    if (!hit) {
+        const uint8_t target = (store.count < 2) ? store.count++ : (store.preferred == 0 ? 1 : 0);
+        store.slots[target] = WifiCredentialSlot{};
+        CopyWifiCredentialField(store.slots[target].ssid, sizeof(store.slots[target].ssid), ssid.c_str());
+        CopyWifiCredentialField(store.slots[target].password, sizeof(store.slots[target].password), password.c_str());
+        store.preferred = target;
+        changed = true;
+    }
+    if (!changed) {
+        return ESP_OK;  // identical credential already preferred; skip the NVS commit
+    }
+    return SaveWifiCredentialStore(store);
+}
+
+esp_err_t SetWifiCredentialForRole(
+    WifiCredentialRole role,
+    const std::string& ssid,
+    const std::string& password,
+    bool keep_existing_password)
+{
+    if (ssid.empty() || ssid.size() > kWifiSsidMaxLen || password.size() > kWifiPasswordMaxLen) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    WifiCredentialStore store;
+    ESP_RETURN_ON_ERROR(LoadWifiCredentialStore(&store), kTag, "load store for role update");
+
+    uint8_t target = 0;
+    bool target_exists = false;
+    switch (role) {
+        case WifiCredentialRole::kPrimary:
+            target = store.count == 0 ? 0 : store.preferred;
+            target_exists = store.count > 0;
+            break;
+        case WifiCredentialRole::kBackup:
+            if (store.count == 0) {
+                return ESP_ERR_INVALID_STATE;
+            }
+            target = store.count == 1 ? 1 : static_cast<uint8_t>(store.preferred == 0 ? 1 : 0);
+            target_exists = store.count == 2;
+            break;
+        default:
+            return ESP_ERR_INVALID_ARG;
+    }
+
+    const bool same_ssid = target_exists &&
+        std::strcmp(store.slots[target].ssid, ssid.c_str()) == 0;
+    if (keep_existing_password && !same_ssid) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    // The two roles must remain distinct. Keeping duplicate SSIDs would make
+    // failover ambiguous and the store validator would collapse the slots.
+    for (uint8_t i = 0; i < store.count; ++i) {
+        if (i != target && std::strcmp(store.slots[i].ssid, ssid.c_str()) == 0) {
+            return ESP_ERR_INVALID_ARG;
+        }
+    }
+
+    const char* effective_password = keep_existing_password
+        ? store.slots[target].password
+        : password.c_str();
+    const bool unchanged = same_ssid &&
+        std::strcmp(store.slots[target].password, effective_password) == 0 &&
+        (role != WifiCredentialRole::kPrimary || store.preferred == target);
+    if (unchanged) {
+        return ESP_OK;
+    }
+
+    if (!target_exists) {
+        ++store.count;
+    }
+    WifiCredentialSlot replacement{};
+    CopyWifiCredentialField(replacement.ssid, sizeof(replacement.ssid), ssid.c_str());
+    CopyWifiCredentialField(
+        replacement.password, sizeof(replacement.password), effective_password);
+    store.slots[target] = replacement;
+    if (role == WifiCredentialRole::kPrimary) {
+        store.preferred = target;
+    }
+    store.version = kWifiCredentialStoreVersion;
+    return SaveWifiCredentialStore(store);
+}
+
+esp_err_t MarkWifiSlotPreferred(uint8_t index)
+{
+    WifiCredentialStore store;
+    ESP_RETURN_ON_ERROR(LoadWifiCredentialStore(&store), kTag, "load store for mark preferred");
+    if (index >= store.count) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (store.preferred == index) {
+        return ESP_OK;  // unchanged; skip the NVS commit
+    }
+    store.preferred = index;
+    return SaveWifiCredentialStore(store);
+}
+
 esp_err_t LoadWifiCredentials(std::string* ssid, std::string* password)
 {
     if (ssid == nullptr || password == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
-    ESP_RETURN_ON_ERROR(LoadStringFromNvs(kWifiSsidKey, ssid), kTag, "load WiFi SSID");
-    return LoadStringFromNvs(kWifiPasswordKey, password);
+    // Back-compat shim over the slot store: returns the preferred slot. Empty
+    // store yields empty strings (matches the legacy LoadStringFromNvs contract
+    // callers already handle).
+    WifiCredentialStore store;
+    ESP_RETURN_ON_ERROR(LoadWifiCredentialStore(&store), kTag, "load wifi credential store");
+    if (store.count == 0) {
+        ssid->clear();
+        password->clear();
+        return ESP_OK;
+    }
+    *ssid = store.slots[store.preferred].ssid;
+    *password = store.slots[store.preferred].password;
+    return ESP_OK;
 }
 
 esp_err_t SaveWifiCredentials(const std::string& ssid, const std::string& password)
 {
-    StorageWriteGuard write("save-wifi-credentials", __FILE__, __LINE__);
-    if (!write) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    ESP_RETURN_ON_ERROR(SaveStringToNvs(kWifiSsidKey, ssid), kTag, "save WiFi SSID");
-    return SaveStringToNvs(kWifiPasswordKey, password);
+    return UpsertWifiCredential(ssid, password);
 }
 
 esp_err_t ClearWifiCredentials()
@@ -1384,18 +2137,22 @@ esp_err_t ClearWifiCredentials()
     if (!write) {
         return ESP_ERR_INVALID_STATE;
     }
-    esp_err_t result = ClearNvsKey(kWifiSsidKey);
-    const esp_err_t clear_pass = ClearNvsKey(kWifiPasswordKey);
+    esp_err_t result = ClearNvsKey(kWifiCredsBlobKey);
+    const esp_err_t legacy_ssid = ClearNvsKey(kWifiSsidKey);
+    const esp_err_t legacy_pass = ClearNvsKey(kWifiPasswordKey);
     if (result == ESP_OK) {
-        result = clear_pass;
+        result = legacy_ssid;
+    }
+    if (result == ESP_OK) {
+        result = legacy_pass;
     }
     return result;
 }
 
 bool HasWifiCredentials()
 {
-    std::string ssid;
-    return LoadStringFromNvs(kWifiSsidKey, &ssid) == ESP_OK && !ssid.empty();
+    WifiCredentialStore store;
+    return LoadWifiCredentialStore(&store) == ESP_OK && store.count > 0;
 }
 
 esp_err_t PrepareStorageForSleep(int64_t deadline_us)

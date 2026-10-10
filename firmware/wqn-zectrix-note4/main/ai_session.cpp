@@ -3,6 +3,7 @@
 #if CONFIG_WQN_AI_ENABLE
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdint>
 #include <ctime>
@@ -12,7 +13,10 @@
 
 #include "ai_history.h"
 #include "audio_capture.h"
+#include "audio_pcm_dump.h"
+#include "config.h"
 #include "esp_check.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -20,8 +24,10 @@
 #include "freertos/task.h"
 #include "runtime/sleep_coordinator.h"
 #include "services/connectivity_service.h"
+#include "stdpro_ws_transport.h"
 #include "storage.h"
 #include "wqn_api.h"
+#include "error_recorder.h"
 
 namespace {
 
@@ -33,11 +39,35 @@ constexpr size_t kMinAudioSamples =
 constexpr int kMaxAudioDurationMs = 20000;
 constexpr int kMinAudioPeak = 80;
 constexpr int kMinAudioRms = 8;
-constexpr TickType_t kWifiReadyWait = pdMS_TO_TICKS(15000);
+constexpr TickType_t kWifiReadyWait = pdMS_TO_TICKS(35000);
 
 SemaphoreHandle_t g_lock = nullptr;
-TaskHandle_t g_submit_task = nullptr;
-TaskHandle_t g_prepare_task = nullptr;
+TaskHandle_t g_ai_worker = nullptr;
+enum class AiWorkerCommand : uint8_t {
+    kNone,
+    kPrepareRecording,
+    kSubmitSession,
+};
+// Single source of truth for the shared worker: kNone means the worker is
+// parked and neither phase is in flight. "Prepare dispatched", "submit
+// dispatched" and "worker busy" are all derived from this one value - do not
+// reintroduce per-phase booleans, they drift from it.
+AiWorkerCommand g_worker_command = AiWorkerCommand::kNone;
+// Dispatch timestamp (ms) of the outstanding command.
+uint32_t g_worker_command_since_ms = 0;
+// Only the worker itself can clear g_worker_command, so a phase that blocks in
+// an unbounded call would wedge both entry points forever with a W line per
+// rejected attempt and no clue as to why. Past this age, report at E level.
+constexpr uint32_t kWorkerStuckReportMs = 60000;
+// [ai-worker-reserve] Statically-stored stack/TCB for the AI worker. Field data
+// (wqn-device 2026-08-23): after the
+// first TLS upload the internal largest free block settles at 6.4-6.9 KiB, so
+// transient xTaskCreate calls deterministically fail on later turns. A single
+// once-created worker removes both prepare and submit stacks from that failure
+// surface without reserving a second permanent 6 KiB internal stack.
+constexpr uint32_t kAiWorkerStackBytes = 7168;
+StaticTask_t g_ai_worker_tcb = {};
+StackType_t g_ai_worker_stack[kAiWorkerStackBytes / sizeof(StackType_t)] = {};
 wqn::AiSessionState g_state;
 std::string g_conversation_id;
 bool g_changed = false;
@@ -45,11 +75,50 @@ bool g_loaded_today = false;
 bool g_prepare_active = false;
 bool g_recording_requested = false;
 uint32_t g_prepare_generation = 0;
-bool g_streaming_active = false;        // true while SubmitTask is parsing SSE events
+uint32_t g_prepare_command_generation = 0;
+bool g_streaming_active = false;        // true while the AI worker is parsing SSE events
 bool g_streaming_force_full_render = false; // when true the next UI tick does a full refresh
 wqn::runtime::SleepLease g_ai_sleep_lease;
+wqn::services::ConnectivityDemand g_ai_connectivity_demand;
 std::string g_pending_tool_label;        // "🔧 create_todo…" or "✅ ..." for status bar
 int64_t g_tool_clear_at_ms = 0;          // scheduled status-bar clear
+
+bool g_turn_ws_capable = false;
+std::string g_current_turn_req_id;
+uint32_t g_current_turn_gen = 0;
+// Set when a streaming turn becomes ready. The capture tap runs before the
+// WebSocket turn exists and PushPcm() drops everything it receives until the
+// turn reaches kRecording, so the audio captured during the TLS/turn-start
+// handshake never reaches the server. The tap replays it once, on its next
+// block, before forwarding live audio.
+std::atomic<bool> g_preroll_pending{false};
+
+void AudioCaptureTapHandler(const int16_t* samples, size_t count, void*)
+{
+    if (g_preroll_pending.exchange(false, std::memory_order_acq_rel)) {
+        // `samples` is the block that was just appended to the capture buffer,
+        // so everything before it is audio captured while the turn was still
+        // being established. Replaying it here -- rather than from the AI
+        // worker -- keeps the backlog and the live stream strictly ordered:
+        // both are enqueued from this one task, so the capture task cannot
+        // interleave a newer block ahead of the backlog.
+        //
+        // The split is exact because a capture block is kMaxMonoFrames (240)
+        // samples and a PCM queue block is kPcmFramesPerBlock (240). If either
+        // side changes, this replay has to be re-derived from a shared
+        // constant instead of `count`.
+        const int16_t* backlog = nullptr;
+        const size_t captured = wqn::PeekAudioCaptureSamples(&backlog);
+        if (backlog != nullptr && count > 0 && captured > count) {
+            const size_t backlog_samples = captured - count;
+            ESP_LOGI(kTag, "preroll replay: samples=%u ms=%u before live tap",
+                     static_cast<unsigned>(backlog_samples),
+                     static_cast<unsigned>(backlog_samples / 16));
+            wqn::stdpro_ws::PushPcm(backlog, backlog_samples);
+        }
+    }
+    wqn::stdpro_ws::PushPcm(samples, count);
+}
 
 struct StdProTurnAssembly {
     uint64_t last_event_id = 0;
@@ -62,8 +131,27 @@ struct StdProTurnAssembly {
     std::string assistant_text;
     bool text_started = false;
     bool assistant_terminal = false;
+    // [tool-order] Text runs already committed as their own history entries by
+    // a tool-boundary seal this turn. Drives the authoritative-text
+    // reconciliation in ResolveSegmentTextLocked.
+    int segments_sealed = 0;
 };
 StdProTurnAssembly g_turn;
+
+void LogAiMemory(const char* stage)
+{
+    ESP_LOGI(
+        kTag,
+        "memory stage=%s internal_free=%u internal_largest=%u psram_free=%u psram_largest=%u dma_free=%u dma_largest=%u stack_hwm=%u",
+        stage,
+        static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
+        static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)),
+        static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)),
+        static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM)),
+        static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_DMA)),
+        static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_DMA)),
+        static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
+}
 
 std::string ThinkingLabel(const std::string& text)
 {
@@ -115,9 +203,64 @@ bool FinalizeAssistantLocked(wqn::AiHistory& history, const std::string& authori
                                g_turn.assistant_text, now_ms);
 }
 
+// [tool-order] Commit the open text run as its own assistant history entry so
+// a following tool block lands BELOW the text that preceded it (agent-style
+// interleaving), instead of the whole reply being appended after every tool
+// block at turn end. Also re-arms segment state so post-tool deltas open a
+// fresh entry instead of being dropped by the terminal guard or rewritten
+// into an earlier position via ReplaceText. No-op when nothing is pending:
+// a run already entered history through text.end is only closed out here.
+void SealAssistantSegmentLocked(wqn::AiHistory& history, int64_t now_ms)
+{
+    if (!g_turn.assistant_terminal && g_turn.user_committed &&
+        !g_turn.assistant_text.empty()) {
+        FinalizeAssistantLocked(history, std::string(), now_ms);
+        ++g_turn.segments_sealed;
+    }
+    g_turn.assistant_id = wqn::kInvalidChatMessageId;
+    g_turn.assistant_text.clear();
+    g_state.assistant_partial.clear();
+    g_turn.assistant_terminal = false;
+    g_turn.text_started = false;
+}
+
+// [tool-order] Authoritative-text precedence for text.end / turn.done / final.
+// Turns without a seal keep the legacy order (full_text > text > deltas).
+// After a tool-boundary seal the payload may be cumulative for the whole
+// turn, so adopting it verbatim would duplicate already-sealed entries: when
+// the open segment carries streamed deltas those win; only a run with no
+// streamed content of its own adopts the payload.
+std::string ResolveSegmentTextLocked(const std::string& full, const std::string& text)
+{
+    const std::string& streamed = g_turn.assistant_text;
+    if (g_turn.segments_sealed == 0 || streamed.empty()) {
+        return !full.empty() ? full : (!text.empty() ? text : streamed);
+    }
+    ESP_LOGD(kTag, "authoritative full_text ignored after segment seal");
+    return streamed;
+}
+
 void MarkChanged()
 {
     g_changed = true;
+}
+
+// [follow] Arm the STD/Pro viewport follow for a fresh turn. Called from the
+// two capture-start paths (the recording request and the transition into
+// kListening), because the STD/Pro turn is submitted by the key release rather
+// than by an explicit confirm call -- by the time the reply starts there is no
+// further hook to arm from. The per-tick step
+// (UiRuntime::DispatchAiViewportFollow) skips the capture phases, so nothing
+// moves while the codec is being configured; from kWaitingReply on it pins the
+// viewport to the live tail and retires the follow as soon as the answer body
+// lands. `user_moved=false` marks this turn's viewport as untouched.
+//
+// Caller must hold g_lock; the caller's own MarkChanged() covers the state
+// change (the follow flags ride the same snapshot).
+void ArmAiFollowLocked()
+{
+    g_state.follow_active = true;
+    g_state.user_moved = false;
 }
 
 void ReleaseAiSleepLeaseIfIdleLocked()
@@ -127,15 +270,53 @@ void ReleaseAiSleepLeaseIfIdleLocked()
         g_state.status == wqn::AiSessionStatus::kListening ||
         g_state.status == wqn::AiSessionStatus::kWaitingReply ||
         g_state.status == wqn::AiSessionStatus::kStreaming;
-    if (!g_prepare_active && g_prepare_task == nullptr && g_submit_task == nullptr &&
+    if (!g_prepare_active && g_worker_command == AiWorkerCommand::kNone &&
         !g_streaming_active && !state_active) {
+        g_ai_connectivity_demand.Reset();
         g_ai_sleep_lease.Reset();
     }
 }
 
+bool SubmitDispatchedLocked()
+{
+    return g_worker_command == AiWorkerCommand::kSubmitSession;
+}
+
+uint32_t WorkerCommandAgeMsLocked()
+{
+    if (g_worker_command == AiWorkerCommand::kNone) {
+        return 0;
+    }
+    const uint32_t now_ms = static_cast<uint32_t>(esp_timer_get_time() / 1000);
+    return now_ms - g_worker_command_since_ms;
+}
+
+// Called from the entry points that reject while a command is outstanding.
+// Without it a worker blocked inside a phase shows up only as an unexplained
+// run of "record start rejected" / "record stop rejected" W lines.
+void ReportStuckWorkerIfAnyLocked(const char* entry)
+{
+    const uint32_t age_ms = WorkerCommandAgeMsLocked();
+    if (age_ms < kWorkerStuckReportMs) {
+        return;
+    }
+    ESP_LOGE(kTag,
+             "AI worker stuck: entry=%s command=%d age_ms=%lu; only the worker "
+             "can clear the command, so AI stays wedged until reboot",
+             entry, static_cast<int>(g_worker_command),
+             static_cast<unsigned long>(age_ms));
+    // [dev-diag] A wedged worker survives every transient SetErrorLocked;
+    // keep it in the ring with the wedged command id.
+    wqn::RecordError(
+        "ai", "worker stuck cmd=%d age=%lums", static_cast<int>(g_worker_command),
+        static_cast<unsigned long>(age_ms));
+}
+
 void FinishSubmitTaskLocked()
 {
-    g_submit_task = nullptr;
+    if (g_worker_command == AiWorkerCommand::kSubmitSession) {
+        g_worker_command = AiWorkerCommand::kNone;
+    }
     ReleaseAiSleepLeaseIfIdleLocked();
 }
 
@@ -213,7 +394,7 @@ void SetCancelledBeforeRecordingLocked()
 // v2 SSE consumer
 // ============================================================================
 //
-// SubmitTask drives the SSE stream on its own task stack. Each callback runs on
+// The shared AI worker drives the SSE stream on its own task stack. Each callback runs on
 // that stack, so we take g_lock only briefly and we never call esp_http_client
 // or cJSON inside the lock.
 //
@@ -303,19 +484,30 @@ void OnSseEvent(const wqn::WqnAiSseEvent& ev)
                 g_turn.text_started = true;
                 g_state.assistant_partial.clear();
                 g_turn.assistant_text.clear();
+            } else {
+                // [tool-order] Server re-opened the text channel without an
+                // explicit end: seal the open run so the next one lands in
+                // its own entry below.
+                SealAssistantSegmentLocked(history, now_ms);
+                g_turn.text_started = true;
             }
             g_state.last_render_ms = now_ms;
             break;
         case wqn::WqnAiSseEvent::Kind::kTextDelta:
-            if (!g_turn.assistant_terminal) {
-                g_state.assistant_partial += ev.delta;
-                g_turn.assistant_text += ev.delta;
-                g_state.last_render_ms = now_ms;
+            if (ev.delta.empty()) break;
+            if (g_turn.assistant_terminal || !g_turn.text_started) {
+                // [tool-order] Deltas resumed after a terminal/boundary:
+                // open a fresh segment so they land below the sealed run
+                // instead of being dropped or merged into an earlier entry.
+                SealAssistantSegmentLocked(history, now_ms);
+                g_turn.text_started = true;
             }
+            g_state.assistant_partial += ev.delta;
+            g_turn.assistant_text += ev.delta;
+            g_state.last_render_ms = now_ms;
             break;
         case wqn::WqnAiSseEvent::Kind::kTextEnd: {
-            const std::string final_text = !ev.full_text.empty() ? ev.full_text
-                : (!ev.text.empty() ? ev.text : g_turn.assistant_text);
+            const std::string final_text = ResolveSegmentTextLocked(ev.full_text, ev.text);
             g_state.assistant_text = final_text;
             g_state.assistant_partial.clear();
             g_turn.assistant_terminal = true;
@@ -326,6 +518,9 @@ void OnSseEvent(const wqn::WqnAiSseEvent& ev)
             break;
         }
         case wqn::WqnAiSseEvent::Kind::kToolStart: {
+            // [tool-order] Seal before appending so pre-tool text stays above
+            // this block.
+            SealAssistantSegmentLocked(history, now_ms);
             std::string label = "🔧 " + (ev.tool_name.empty() ? std::string("tool") : ev.tool_name) + "…";
             g_pending_tool_label = label;
             g_tool_clear_at_ms = 0;
@@ -337,6 +532,11 @@ void OnSseEvent(const wqn::WqnAiSseEvent& ev)
         }
         case wqn::WqnAiSseEvent::Kind::kToolResult:
         case wqn::WqnAiSseEvent::Kind::kToolError: {
+            // [tool-order] Pop the placeholder before sealing: sealing may
+            // append a run streamed while the tool executed, and that text
+            // must sit between the placeholder and the result block.
+            history.PopLastIf(wqn::ChatMessageKind::kToolStart);
+            SealAssistantSegmentLocked(history, now_ms);
             std::string label = ev.tool_ok ? "✅ " : "❌ ";
             label += ev.tool_display.empty() ? ev.tool_name : ev.tool_display;
             g_pending_tool_label = label;
@@ -348,7 +548,6 @@ void OnSseEvent(const wqn::WqnAiSseEvent& ev)
             }
             g_state.status_detail = label;
             g_state.status_since_ms = now_ms;
-            history.PopLastIf(wqn::ChatMessageKind::kToolStart);
             history.AppendToolResult(ev.tool_name, ev.tool_display,
                                      ev.tool_display, ev.tool_ok,
                                      ev.tool_elapsed_ms, now_ms);
@@ -361,7 +560,8 @@ void OnSseEvent(const wqn::WqnAiSseEvent& ev)
         case wqn::WqnAiSseEvent::Kind::kTurnDone:
             g_turn.assistant_terminal = true;
             FinalizeThinkingLocked(history, std::string(), now_ms);
-            FinalizeAssistantLocked(history, g_turn.assistant_text, now_ms);
+            FinalizeAssistantLocked(
+                history, ResolveSegmentTextLocked(std::string(), std::string()), now_ms);
             g_streaming_force_full_render = true;
             break;
         case wqn::WqnAiSseEvent::Kind::kError: {
@@ -375,12 +575,16 @@ void OnSseEvent(const wqn::WqnAiSseEvent& ev)
             break;
         }
         case wqn::WqnAiSseEvent::Kind::kFinal: {
-            const std::string final_text = !ev.full_text.empty() ? ev.full_text
-                : (!g_turn.assistant_text.empty() ? g_turn.assistant_text : g_state.assistant_text);
-            g_turn.assistant_terminal = true;
-            FinalizeThinkingLocked(history, std::string(), now_ms);
-            FinalizeAssistantLocked(history, final_text, now_ms);
-            g_state.assistant_text = final_text;
+            const std::string final_text = ResolveSegmentTextLocked(ev.full_text, ev.text);
+            if (final_text.empty()) {
+                // Nothing streamed or authoritative for the open run; keep the
+                // last known reply text instead of blanking the session.
+            } else {
+                g_turn.assistant_terminal = true;
+                FinalizeThinkingLocked(history, std::string(), now_ms);
+                FinalizeAssistantLocked(history, final_text, now_ms);
+                g_state.assistant_text = final_text;
+            }
             g_state.assistant_partial.clear();
             g_state.user_partial.clear();
             g_state.pending_text.clear();
@@ -389,14 +593,36 @@ void OnSseEvent(const wqn::WqnAiSseEvent& ev)
             if (!ev.conversation_id.empty()) g_conversation_id = ev.conversation_id;
             g_state.conversation_id = g_conversation_id;
             g_state.page = 0;
-            g_state.scroll_offset_lines = 0;
+            // [follow] Conditional recenter: land on the newest exchange only
+            // when the user did not move the viewport during this turn. A
+            // retired auto-follow leaves user_moved false, so a followed reply
+            // still gets presented from its first line; a viewport the user
+            // scrolled (or turn-jumped) is left exactly where they put it.
+            if (!g_state.user_moved) {
+                g_state.scroll_offset_lines = 0;
+            }
             g_streaming_force_full_render = true;
             g_streaming_active = false;
             g_state.status_since_ms = now_ms;
             break;
         }
     }
-    MarkChanged();
+    // [ui-throttle] Streaming deltas land every ~15 ms; the EPD cannot render
+    // that fast and every changed-flag round-trip costs a full state copy on
+    // the UI task. Coalesce delta-only marks to 50 ms; terminal / stage /
+    // tool events always mark immediately so completion never lags. Runs
+    // under g_lock with one producer per turn, so the watermark is stable.
+    static int64_t s_last_delta_mark_ms = -1000;
+    const bool is_streaming_delta =
+        ev.kind == wqn::WqnAiSseEvent::Kind::kTextDelta ||
+        ev.kind == wqn::WqnAiSseEvent::Kind::kAsrDelta ||
+        ev.kind == wqn::WqnAiSseEvent::Kind::kThinkingDelta;
+    if (!is_streaming_delta || now_ms - s_last_delta_mark_ms >= 50) {
+        if (is_streaming_delta) {
+            s_last_delta_mark_ms = now_ms;
+        }
+        MarkChanged();
+    }
     xSemaphoreGive(g_lock);
 }
 
@@ -407,8 +633,9 @@ void TrampolineSseEvent(const wqn::WqnAiSseEvent& ev, void* /*user*/)
 }
 
 // Request-id used by the SSE idempotency header. Same shape as the v1
-// `request_id` (16 hex chars) so server-side logs read consistently.
-std::string GenerateRequestId()
+// `request_id` (16 hex chars) so server-side logs read consistently. The
+// public wrapper lives below; the Agent voice pipe shares this generator.
+std::string GenerateAiRequestId()
 {
     static std::mt19937 rng{static_cast<unsigned>(esp_timer_get_time())};
     char buf[20];
@@ -426,15 +653,19 @@ void FinishPrepareTaskLocked(uint32_t generation)
     if (generation == g_prepare_generation) {
         g_prepare_active = false;
     }
-    if (g_prepare_task == xTaskGetCurrentTaskHandle() || generation == g_prepare_generation) {
-        g_prepare_task = nullptr;
+    if (g_worker_command == AiWorkerCommand::kPrepareRecording) {
+        g_worker_command = AiWorkerCommand::kNone;
     }
+    // Peak-stack evidence for the prepare chain. The worker reuses one stack
+    // for both phases and is never recreated, so this reads the merged-phase
+    // high-water mark, not just this turn's.
+    LogAiMemory("prepare-end");
     ReleaseAiSleepLeaseIfIdleLocked();
 }
 
 bool HasEffectiveSpeech(const wqn::AudioCaptureChunk& audio)
 {
-    return audio.duration_ms >= kMinAudioDurationMs && audio.samples.size() >= kMinAudioSamples &&
+    return audio.duration_ms >= kMinAudioDurationMs && audio.sample_count >= kMinAudioSamples &&
            audio.peak >= kMinAudioPeak &&
            audio.rms >= kMinAudioRms;
 }
@@ -619,56 +850,79 @@ void LoadTodaySessionLocked()
              wqn::GetAiHistory(wqn::AiHistoryChannel::kStdPro).size());
 }
 
-void SubmitTask(void*)
+// One AI submission: stop capture, validate the clip, hand off to the WS
+// transport (FINAL + REMOTE_HANDOFF) or fall back to HTTP SSE upload.
+// Runs on the persistent shared AI worker; returns when terminal state is
+// published and the worker parks again.
+void SubmitSession()
 {
+    LogAiMemory("submit-start");
     wqn::AudioCaptureChunk audio;
     esp_err_t result = wqn::StopAudioCapture(&audio);
 
+    const std::string turn_req_id = g_current_turn_req_id;
+    const bool is_ws_turn = g_turn_ws_capable;
+    const uint32_t turn_gen = g_current_turn_gen;
+
     xSemaphoreTake(g_lock, portMAX_DELAY);
     if (result != ESP_OK) {
+        if (is_ws_turn && !turn_req_id.empty()) {
+            wqn::stdpro_ws::AbortTurn(turn_req_id, turn_gen);
+            g_turn_ws_capable = false;
+        }
         wqn::ReleaseAudioCapturePower();
         SetErrorLocked("录音停止失败");
         FinishSubmitTaskLocked();
         xSemaphoreGive(g_lock);
-        vTaskDelete(nullptr);
         return;
     }
 
     ESP_LOGI(kTag,
-             "audio captured: duration_ms=%d mono_samples=%u peak=%d rms=%d",
+             "record_release: audio captured duration_ms=%d mono_samples=%u peak=%d rms=%d",
              audio.duration_ms,
-             static_cast<unsigned>(audio.samples.size()),
+             static_cast<unsigned>(audio.sample_count),
              static_cast<int>(audio.peak),
              audio.rms);
 
-    if (audio.duration_ms < kMinAudioDurationMs || audio.samples.size() < kMinAudioSamples) {
+    wqn::DumpCapturedPcmForAnalysis(audio.samples, audio.sample_count,
+                                    wqn::kAudioCaptureSampleRate);
+
+    if (audio.duration_ms < kMinAudioDurationMs || audio.sample_count < kMinAudioSamples) {
+        if (is_ws_turn && !turn_req_id.empty()) {
+            wqn::stdpro_ws::AbortTurn(turn_req_id, turn_gen);
+            g_turn_ws_capable = false;
+        }
         wqn::ReleaseAudioCapturePower();
         SetErrorLocked("录音太短");
         FinishSubmitTaskLocked();
         xSemaphoreGive(g_lock);
-        vTaskDelete(nullptr);
         return;
     }
 
     if (!HasEffectiveSpeech(audio)) {
+        if (is_ws_turn && !turn_req_id.empty()) {
+            wqn::stdpro_ws::AbortTurn(turn_req_id, turn_gen);
+            g_turn_ws_capable = false;
+        }
         wqn::ReleaseAudioCapturePower();
         SetErrorLocked("未检测到有效语音");
         FinishSubmitTaskLocked();
         xSemaphoreGive(g_lock);
-        vTaskDelete(nullptr);
         return;
     }
 
     if (audio.duration_ms > kMaxAudioDurationMs) {
         audio.duration_ms = kMaxAudioDurationMs;
     }
-    SetStateLocked(wqn::AiSessionStatus::kWaitingReply, "正在上传语音...", "", "");
-    g_state.toast_label = "● 上传…";
+    SetStateLocked(wqn::AiSessionStatus::kWaitingReply, "正在识别...", "", "");
+    g_state.toast_label = "● 识别中…";
     g_state.toast_visible = true;
     g_state.toast_since_ms = esp_timer_get_time() / 1000;
     g_state.toast_recording_ms = 0;
     MarkChanged();
-    const std::string tier_str = g_state.tier == wqn::AiTier::kPro ? "pro" : "std";
+    // [agent] Only the STD/Pro text turn carries a tier header; Flash is a
+    // separate WebSocket and the Agent tier never reaches this code path.
+    const std::string tier_str = g_state.tier == wqn::AiTier::kStd ? "std" : "pro";
     const wqn::ThinkingLevel thinking_level = g_state.thinking_level;
     const std::string conversation_id = g_conversation_id;
     g_streaming_active = true;
@@ -685,58 +939,78 @@ void SubmitTask(void*)
     std::string token;
     result = wqn::LoadAccessToken(&token);
     if (result != ESP_OK || !wqn::IsValidAccessToken(token)) {
+        if (is_ws_turn && !turn_req_id.empty()) {
+            wqn::stdpro_ws::AbortTurn(turn_req_id, turn_gen);
+            g_turn_ws_capable = false;
+        }
         wqn::ReleaseAudioCapturePower();
         xSemaphoreTake(g_lock, portMAX_DELAY);
         g_streaming_active = false;
         SetErrorLocked("设备未配对");
         FinishSubmitTaskLocked();
         xSemaphoreGive(g_lock);
-        vTaskDelete(nullptr);
         return;
     }
 
     esp_err_t submit_result = ESP_OK;
     wqn::WqnAiChatResponse response;
-    bool used_streaming = false;
+    bool used_streaming = true;
+    bool handoff_to_ws_succeeded = false;
 
-#if CONFIG_WQN_AI_STREAMING_ENABLE
-    // v2 SSE path
-    wqn::WqnAiStreamRequest req;
-    req.token = token;
-    req.pcm = audio.samples;             // vector<int16_t> copy; small relative to 80KB cap
-    req.duration_ms = audio.duration_ms;
-    req.tier = tier_str;
-    req.conversation_id = conversation_id;
-    // Thinking params from the snapshot (tier + thinking_level captured under
-    // lock above). The cloud maps the bounded level to provider parameters.
-    {
-        const char* effort = "medium";
-        switch (thinking_level) {
-            case wqn::ThinkingLevel::kOff: effort = "low"; break;  // StepFun has no off; low is closest
-            case wqn::ThinkingLevel::kLow: effort = "low"; break;
-            case wqn::ThinkingLevel::kMed: effort = "medium"; break;
-            case wqn::ThinkingLevel::kHigh: effort = "high"; break;
-            default: break;
+    if (is_ws_turn) {
+        const auto handoff_res = wqn::stdpro_ws::SendFinalAndWait(
+            turn_req_id, audio.duration_ms, 2000);
+
+        if (handoff_res == wqn::stdpro_ws::FinalHandoffResult::kFinalSent) {
+            ESP_LOGI(kTag, "final_sent: entering REMOTE_HANDOFF for req_id=%s",
+                     turn_req_id.c_str());
+            handoff_to_ws_succeeded = true;
+            // REMOTE_HANDOFF: automatic HTTP fallback is strictly FORBIDDEN.
+            // Wait for WS SSE stream to finish
+            const auto wait_res =
+                wqn::stdpro_ws::WaitForTurnRelease(turn_gen, turn_req_id, WQN_AI_SSE_TIMEOUT_MS);
+            if (wait_res.wait_status == wqn::stdpro_ws::TurnWaitStatus::kTimedOut) {
+                ESP_LOGW(kTag, "WS SSE turn timed out in REMOTE_HANDOFF");
+                submit_result = ESP_ERR_TIMEOUT;
+            }
+        } else if (handoff_res == wqn::stdpro_ws::FinalHandoffResult::kAmbiguous) {
+            ESP_LOGW(kTag, "FINAL result ambiguous, skipping HTTP resubmit to prevent duplicate turn");
+            handoff_to_ws_succeeded = true;
+            wqn::stdpro_ws::WaitForTurnRelease(turn_gen, turn_req_id, 5000);
+        } else {
+            ESP_LOGW(kTag, "FINAL failed to send over WS, falling back to HTTP");
+            handoff_to_ws_succeeded = false;
         }
-        req.reasoning_effort = effort;
-        req.enable_thinking = (thinking_level != wqn::ThinkingLevel::kOff);
     }
-    req.request_id = GenerateRequestId(); // helper below
-    req.callback = &TrampolineSseEvent;
-    req.user_ctx = nullptr;
-    submit_result = wqn::UploadAiAudioChatStream(req, &response);
-    used_streaming = true;
-#else
-    // v1 fallback path (kept behind CONFIG_WQN_AI_V1_FALLBACK for debug compare).
-    submit_result = wqn::UploadAiAudioChat(
-        token,
-        reinterpret_cast<const uint8_t*>(audio.samples.data()),
-        audio.samples.size() * sizeof(int16_t),
-        audio.duration_ms,
-        conversation_id,
-        tier_str,
-        &response);
-#endif
+
+    if (!handoff_to_ws_succeeded) {
+        // Fallback HTTP POST path
+        wqn::WqnAiStreamRequest req;
+        req.token = token;
+        req.pcm_data = audio.samples;
+        req.pcm_sample_count = audio.sample_count;
+        req.duration_ms = audio.duration_ms;
+        req.tier = tier_str;
+        req.conversation_id = conversation_id;
+        {
+            const char* effort = "medium";
+            switch (thinking_level) {
+                case wqn::ThinkingLevel::kOff: effort = "low"; break;
+                case wqn::ThinkingLevel::kLow: effort = "low"; break;
+                case wqn::ThinkingLevel::kMed: effort = "medium"; break;
+                case wqn::ThinkingLevel::kHigh: effort = "high"; break;
+                default: break;
+            }
+            req.reasoning_effort = effort;
+            req.enable_thinking = (thinking_level != wqn::ThinkingLevel::kOff);
+        }
+        req.request_id = turn_req_id.empty() ? GenerateAiRequestId() : turn_req_id;
+        req.callback = &TrampolineSseEvent;
+        req.user_ctx = nullptr;
+        LogAiMemory("before-sse-upload");
+        submit_result = wqn::UploadAiAudioChatStream(req, &response);
+        LogAiMemory("after-sse-upload");
+    }
 
     wqn::ReleaseAudioCapturePower();
 
@@ -751,6 +1025,9 @@ void SubmitTask(void*)
                     ? response.error_code
                     : response.error_message;
                 SetErrorLocked(msg.empty() ? "AI 请求失败" : ("AI 请求失败: " + msg));
+                // [dev-diag] Server-side cause would otherwise be overwritten
+                // by the next turn's state.
+                wqn::RecordError("ai", "request failed %s", msg.c_str());
             }
         } else if (g_state.status != wqn::AiSessionStatus::kReplyReady) {
             // Stream finished cleanly but never delivered a `final` event: surface a
@@ -842,14 +1119,15 @@ void SubmitTask(void*)
         }
     }
 
+    // Peak-stack evidence for whichever submission path ran (WS handoff wait
+    // or HTTP/TLS fallback). HWM is monotonic for this task instance.
+    LogAiMemory("submit-end");
     FinishSubmitTaskLocked();
     xSemaphoreGive(g_lock);
-    vTaskDelete(nullptr);
 }
 
-void PrepareRecordingTask(void* parameter)
+void PrepareRecordingSession(uint32_t generation)
 {
-    const uint32_t generation = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(parameter));
     std::string token;
     enum class PrepareFailure {
         kNone,
@@ -858,6 +1136,8 @@ void PrepareRecordingTask(void* parameter)
         kWifi,
     };
     PrepareFailure failure = PrepareFailure::kNone;
+    wqn::services::ConnectivityWaitResult wifi_result =
+        wqn::services::ConnectivityWaitResult::kCancelled;
 
     esp_err_t result = wqn::LoadAccessToken(&token);
     if (result != ESP_OK || token.empty()) {
@@ -867,23 +1147,57 @@ void PrepareRecordingTask(void* parameter)
         failure = PrepareFailure::kInvalidToken;
         result = ESP_ERR_INVALID_STATE;
     } else {
-        result = wqn::services::StartConnectivity();
-        if (result == ESP_OK && !wqn::services::IsConnectivityOnline()) {
-            result = wqn::services::WaitForConnectivity(kWifiReadyWait);
+        wqn::services::ConnectivityDemand connectivity_demand =
+            wqn::services::AcquireConnectivityDemand(
+                wqn::services::ConnectivityDemandReason::kAiInteractive,
+                "ai-session",
+                __FILE__,
+                __LINE__);
+        wqn::services::ConnectivityDemandTicket ticket;
+        xSemaphoreTake(g_lock, portMAX_DELAY);
+        if (connectivity_demand && IsCurrentPrepareTaskLocked(generation) &&
+            g_recording_requested) {
+            g_ai_connectivity_demand = std::move(connectivity_demand);
+            ticket = g_ai_connectivity_demand.ticket();
         }
+        xSemaphoreGive(g_lock);
+        wifi_result = wqn::services::WaitForConnectivity(ticket, kWifiReadyWait);
+        result = wqn::services::ConnectivityWaitResultToEspErr(wifi_result);
         if (result != ESP_OK) {
             failure = PrepareFailure::kWifi;
         }
     }
 
     bool should_start_capture = false;
+    std::string req_id;
+    std::string tier_str;
+    std::string conv_id;
+    bool enable_thinking = false;
+    const char* effort = "medium";
+
     if (result == ESP_OK) {
         xSemaphoreTake(g_lock, portMAX_DELAY);
         should_start_capture = g_recording_requested && IsCurrentPrepareTaskLocked(generation) &&
-                               g_state.status == wqn::AiSessionStatus::kPreparingCapture && g_submit_task == nullptr;
+                               g_state.status == wqn::AiSessionStatus::kPreparingCapture && !SubmitDispatchedLocked();
         if (should_start_capture) {
             g_state.pending_text = "正在启动录音...";
             g_state.status_since_ms = esp_timer_get_time() / 1000;
+            // [capture-first] Identity commits here; the WS capability flag is
+            // published only after StartTurn so no other stage can act on a
+            // turn that does not exist yet. I2S DMA must be placed before the
+            // TLS handshake claims its share of the pool.
+            req_id = GenerateAiRequestId();
+            g_current_turn_req_id = req_id;
+            tier_str = (g_state.tier == wqn::AiTier::kStd) ? "std" : "pro";
+            conv_id = g_conversation_id;
+            enable_thinking = (g_state.thinking_level != wqn::ThinkingLevel::kOff);
+            switch (g_state.thinking_level) {
+                case wqn::ThinkingLevel::kOff: effort = "low"; break;
+                case wqn::ThinkingLevel::kLow: effort = "low"; break;
+                case wqn::ThinkingLevel::kMed: effort = "medium"; break;
+                case wqn::ThinkingLevel::kHigh: effort = "high"; break;
+                default: break;
+            }
             MarkChanged();
         }
         xSemaphoreGive(g_lock);
@@ -901,27 +1215,107 @@ void PrepareRecordingTask(void* parameter)
                 SetErrorLocked("设备未配对，请先在 Web 端创建配对");
                 ESP_LOGW(kTag, "AI recording blocked: no valid token");
             } else {
-                SetErrorLocked("WiFi 未连接或未配置");
-                ESP_LOGW(kTag, "AI recording blocked: WiFi unavailable: %s", esp_err_to_name(result));
+                switch (wifi_result) {
+                    case wqn::services::ConnectivityWaitResult::kNeedsProvisioning:
+                        SetErrorLocked("未配置 WiFi，请先在设置中配网");
+                        break;
+                    case wqn::services::ConnectivityWaitResult::kAuthFailed:
+                        SetErrorLocked("WiFi 密码错误，请重新配网");
+                        break;
+                    case wqn::services::ConnectivityWaitResult::kTimedOut:
+                        SetErrorLocked("WiFi 连接超时，请稍后重试");
+                        break;
+                    case wqn::services::ConnectivityWaitResult::kCancelled:
+                        SetCancelledBeforeRecordingLocked();
+                        break;
+                    default:
+                        SetErrorLocked("WiFi 暂时不可用，请稍后重试");
+                        break;
+                }
+                ESP_LOGW(
+                    kTag,
+                    "AI recording blocked: WiFi result=%s error=%s",
+                    wqn::services::ConnectivityWaitResultName(wifi_result),
+                    esp_err_to_name(result));
             }
         } else if (current && !g_recording_requested && g_state.status == wqn::AiSessionStatus::kPreparingCapture) {
             SetCancelledBeforeRecordingLocked();
         }
         if (current) {
             g_recording_requested = false;
+            g_turn_ws_capable = false;
         }
         FinishPrepareTaskLocked(generation);
         xSemaphoreGive(g_lock);
-        vTaskDelete(nullptr);
         return;
     }
 
+    // [capture-first] WiFi association is already complete, but bring up I2S
+    // before the memory-heavy WS/TLS handshake. The RX channel needs ~3.5 KiB
+    // of contiguous DMA memory while TLS transiently holds ~17 KiB
+    // (device-measured: post-connect dma_largest pinned at 736 B). PCM captured
+    // before voice.turn.start commits is dropped by PushPcm's turn-state gate.
     result = wqn::StartAudioCapture();
+
+    bool ws_ready = false;
+    if (result == ESP_OK) {
+        // Skip the expensive handshake entirely when the user already
+        // cancelled during codec bring-up.
+        bool proceed_network = false;
+        xSemaphoreTake(g_lock, portMAX_DELAY);
+        proceed_network =
+            g_recording_requested && IsCurrentPrepareTaskLocked(generation) &&
+            g_state.status == wqn::AiSessionStatus::kPreparingCapture && !SubmitDispatchedLocked();
+        xSemaphoreGive(g_lock);
+
+        if (proceed_network) {
+            ws_ready = (wqn::stdpro_ws::EnsureConnected(token, 2500) == ESP_OK);
+            ESP_LOGI(kTag,
+                     "[dma-attrib] post-connect ws=%d dma_free=%u dma_largest=%u",
+                     ws_ready ? 1 : 0,
+                     static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_DMA)),
+                     static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_DMA)));
+            if (ws_ready) {
+                ESP_LOGI(kTag, "STD/PRO WebSocket transport ready for this turn");
+            } else {
+                ESP_LOGW(kTag, "STD/PRO WebSocket transport unavailable; using HTTP fallback");
+            }
+        }
+    }
+
+    if (ws_ready) {
+        wqn::stdpro_ws::SetSseCallback(&TrampolineSseEvent, nullptr);
+        // Arm the replay BEFORE StartTurn: the transport flips the turn to
+        // kRecording internally, and the capture task outranks this worker, so
+        // the tap can deliver a live block before StartTurn even returns.
+        // Arming first is what keeps the backlog ahead of the live audio.
+        g_preroll_pending.store(true, std::memory_order_release);
+        esp_err_t start_turn_err = wqn::stdpro_ws::StartTurn(
+            req_id, tier_str, conv_id, enable_thinking, effort, &g_current_turn_gen);
+        if (start_turn_err == ESP_OK) {
+            xSemaphoreTake(g_lock, portMAX_DELAY);
+            g_turn_ws_capable = true;
+            xSemaphoreGive(g_lock);
+        } else {
+            g_preroll_pending.store(false, std::memory_order_release);
+            ESP_LOGW(kTag, "StartTurn failed (%s); disabling WS for this turn",
+                     esp_err_to_name(start_turn_err));
+            if (start_turn_err == ESP_ERR_TIMEOUT) {
+                // [turn-lifecycle] The owner may still commit the turn after
+                // the caller timed out; an identity-bound abort no-ops when
+                // nothing was committed and tears down a late commit.
+                wqn::stdpro_ws::AbortTurn(req_id);
+            }
+            xSemaphoreTake(g_lock, portMAX_DELAY);
+            g_turn_ws_capable = false;
+            xSemaphoreGive(g_lock);
+        }
+    }
 
     bool stop_started_capture = false;
     xSemaphoreTake(g_lock, portMAX_DELAY);
     const bool still_requested = g_recording_requested && IsCurrentPrepareTaskLocked(generation) &&
-                                 g_state.status == wqn::AiSessionStatus::kPreparingCapture && g_submit_task == nullptr;
+                                 g_state.status == wqn::AiSessionStatus::kPreparingCapture && !SubmitDispatchedLocked();
     if (result == ESP_OK && still_requested) {
         g_recording_requested = false;
         g_state.status = wqn::AiSessionStatus::kListening;
@@ -933,6 +1327,8 @@ void PrepareRecordingTask(void* parameter)
         g_state.conversation_id = g_conversation_id;
         g_state.page = 0;
         g_state.scroll_offset_lines = 0;
+        // [follow] Capture started: arm the viewport follow for this turn.
+        ArmAiFollowLocked();
         g_state.toast_label = "● 录音中 00:00";
         g_state.toast_visible = true;
         g_state.toast_since_ms = esp_timer_get_time() / 1000;
@@ -941,18 +1337,27 @@ void PrepareRecordingTask(void* parameter)
         MarkChanged();
         FinishPrepareTaskLocked(generation);
         xSemaphoreGive(g_lock);
-        ESP_LOGI(kTag, "AI recording started after WiFi ready; toast=录音中");
-        vTaskDelete(nullptr);
+        ESP_LOGI(kTag, "record_start: generation=%lu req_id=%s ws=%d; toast=录音中",
+                 static_cast<unsigned long>(generation), req_id.c_str(), ws_ready);
         return;
     }
 
     const bool current = IsCurrentPrepareTaskLocked(generation);
     if (result != ESP_OK && still_requested) {
         SetErrorLocked(std::string("录音启动失败: ") + esp_err_to_name(result));
+        // [dev-diag] Mic bring-up failure detail (dev diagnostics §5).
+        wqn::RecordError("ai", "record start failed %s", esp_err_to_name(result));
     } else if (current && !still_requested && g_state.status == wqn::AiSessionStatus::kPreparingCapture) {
         SetCancelledBeforeRecordingLocked();
     }
     stop_started_capture = result == ESP_OK;
+    // [turn-lifecycle] Abort on the committed identity even when a concurrent
+    // stop bumped the generation: StartTurn may already have committed this
+    // task's turn on the transport, and only this req_id can tear it down.
+    if (g_turn_ws_capable && !req_id.empty()) {
+        wqn::stdpro_ws::AbortTurn(req_id, g_current_turn_gen);
+        g_turn_ws_capable = false;
+    }
     if (current) {
         g_recording_requested = false;
     }
@@ -964,7 +1369,32 @@ void PrepareRecordingTask(void* parameter)
         wqn::StopAudioCapture(&discarded);
         wqn::ReleaseAudioCapturePower();
     }
-    vTaskDelete(nullptr);
+}
+
+void AiSessionWorkerTask(void*)
+{
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        xSemaphoreTake(g_lock, portMAX_DELAY);
+        const AiWorkerCommand command = g_worker_command;
+        const uint32_t generation = g_prepare_command_generation;
+        xSemaphoreGive(g_lock);
+        switch (command) {
+            case AiWorkerCommand::kPrepareRecording:
+                PrepareRecordingSession(generation);
+                break;
+            case AiWorkerCommand::kSubmitSession:
+                SubmitSession();
+                break;
+            case AiWorkerCommand::kNone:
+                // Woken with nothing to do: either a duplicate notification or
+                // a command that was cleared before this wake-up. Loud, because
+                // a genuinely lost dispatch is otherwise invisible.
+                ESP_LOGW(kTag, "AI worker woken with no command; command=%d",
+                         static_cast<int>(command));
+                break;
+        }
+    }
 }
 
 }  // namespace
@@ -973,16 +1403,57 @@ namespace wqn {
 
 esp_err_t InitAiSession()
 {
+    SetAiAudioCaptureTapEnabled(true);
+    const esp_err_t capture_buffer_result = InitAudioCaptureBuffer();
+    if (capture_buffer_result != ESP_OK) {
+        // Keep the rest of the device bootable. StartAudioCapture retries and
+        // reports a precise memory error if the early reservation ever fails.
+        ESP_LOGW(kTag, "early AI capture buffer reservation failed: %s",
+                 esp_err_to_name(capture_buffer_result));
+    }
     if (g_lock == nullptr) {
         g_lock = xSemaphoreCreateMutex();
         if (g_lock == nullptr) {
             return ESP_ERR_NO_MEM;
         }
     }
+    if (g_ai_worker == nullptr) {
+        g_ai_worker = xTaskCreateStatic(
+            AiSessionWorkerTask,
+            "wqn_ai_worker",
+            kAiWorkerStackBytes,
+            nullptr,
+            5,
+            g_ai_worker_stack,
+            &g_ai_worker_tcb);
+        if (g_ai_worker == nullptr) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    ESP_LOGI(kTag, "ai-session build: %s %s", __DATE__, __TIME__);
     xSemaphoreTake(g_lock, portMAX_DELAY);
     LoadTodaySessionLocked();
     xSemaphoreGive(g_lock);
     return ESP_OK;
+}
+
+void SetAiAudioCaptureTapEnabled(bool enabled)
+{
+    wqn::SetAudioCaptureTap(enabled ? &AudioCaptureTapHandler : nullptr, nullptr);
+}
+
+// [agent-voice] See the declarations in ai_session.h. The Agent voice pipe
+// drives its own stdpro_ws turn, so it needs the preroll arm and the request-id
+// generator without any of the STD session state that PrepareRecordingSession
+// installs.
+void ArmAiVoicePreroll()
+{
+    g_preroll_pending.store(true, std::memory_order_release);
+}
+
+std::string GenerateRequestId()
+{
+    return GenerateAiRequestId();
 }
 
 esp_err_t StartAiRecordingSession()
@@ -992,7 +1463,13 @@ esp_err_t StartAiRecordingSession()
     xSemaphoreTake(g_lock, portMAX_DELAY);
     if (g_state.status == AiSessionStatus::kPreparingCapture ||
         g_state.status == AiSessionStatus::kListening || g_state.status == AiSessionStatus::kWaitingReply ||
-        g_submit_task != nullptr || g_prepare_task != nullptr || g_prepare_active) {
+        g_prepare_active || g_worker_command != AiWorkerCommand::kNone) {
+        ReportStuckWorkerIfAnyLocked("start");
+        ESP_LOGW(kTag,
+                 "record start rejected: status=%d prepare_active=%d command=%d age_ms=%lu",
+                 static_cast<int>(g_state.status), g_prepare_active ? 1 : 0,
+                 static_cast<int>(g_worker_command),
+                 static_cast<unsigned long>(WorkerCommandAgeMsLocked()));
         xSemaphoreGive(g_lock);
         return ESP_ERR_INVALID_STATE;
     }
@@ -1013,33 +1490,26 @@ esp_err_t StartAiRecordingSession()
     g_state.conversation_id = g_conversation_id;
     g_state.page = 0;
     g_state.scroll_offset_lines = 0;
+    // [follow] A fresh recording request starts a turn: arm the follow here as
+    // well as at the kListening transition, so a capture that fails to start
+    // still leaves the viewport watching for the reply.
+    ArmAiFollowLocked();
     g_state.status_since_ms = esp_timer_get_time() / 1000;
     g_prepare_active = true;
     g_recording_requested = true;
+    // No backlog yet: anything still armed belongs to an earlier turn that
+    // never got a capture block to replay into.
+    g_preroll_pending.store(false, std::memory_order_release);
     const uint32_t prepare_generation = ++g_prepare_generation;
-    g_prepare_task = nullptr;
+    g_prepare_command_generation = prepare_generation;
+    g_worker_command = AiWorkerCommand::kPrepareRecording;
+    g_worker_command_since_ms = static_cast<uint32_t>(esp_timer_get_time() / 1000);
     MarkChanged();
     xSemaphoreGive(g_lock);
-
-    TaskHandle_t task = nullptr;
-    const BaseType_t created = xTaskCreate(PrepareRecordingTask,
-                                           "wqn_ai_prepare",
-                                           6144,
-                                           reinterpret_cast<void*>(static_cast<uintptr_t>(prepare_generation)),
-                                           5,
-                                           &task);
-    xSemaphoreTake(g_lock, portMAX_DELAY);
-    if (created != pdPASS) {
-        g_recording_requested = false;
-        FinishPrepareTaskLocked(prepare_generation);
-        SetErrorLocked("AI 任务创建失败");
-        xSemaphoreGive(g_lock);
-        return ESP_ERR_NO_MEM;
-    }
-    if (IsCurrentPrepareTaskLocked(prepare_generation)) {
-        g_prepare_task = task;
-    }
-    xSemaphoreGive(g_lock);
+    // InitAiSession() only returns ESP_OK with a live worker, so g_ai_worker
+    // is non-null here. Do not add a null check after this point: the state
+    // above is already published and bailing out would wedge the session.
+    xTaskNotifyGive(g_ai_worker);
     return ESP_OK;
 }
 
@@ -1047,7 +1517,8 @@ esp_err_t StopAiRecordingAndSubmit()
 {
     ESP_RETURN_ON_ERROR(InitAiSession(), kTag, "init AI session");
     xSemaphoreTake(g_lock, portMAX_DELAY);
-    if (g_submit_task != nullptr) {
+    if (SubmitDispatchedLocked()) {
+        // A submission is already in flight; the stop that dispatched it wins.
         xSemaphoreGive(g_lock);
         return ESP_OK;
     }
@@ -1055,6 +1526,9 @@ esp_err_t StopAiRecordingAndSubmit()
         g_recording_requested = false;
         ++g_prepare_generation;
         g_prepare_active = false;
+        // Cancels the typed WiFi wait within its 200 ms wake bound without
+        // touching the shared worker task from the UI task.
+        g_ai_connectivity_demand.Reset();
         SetCancelledBeforeRecordingLocked();
         xSemaphoreGive(g_lock);
         return ESP_OK;
@@ -1072,19 +1546,23 @@ esp_err_t StopAiRecordingAndSubmit()
         xSemaphoreGive(g_lock);
         return ESP_ERR_INVALID_STATE;
     }
+    if (g_worker_command != AiWorkerCommand::kNone || g_ai_worker == nullptr) {
+        ReportStuckWorkerIfAnyLocked("stop");
+        ESP_LOGW(kTag,
+                 "record stop rejected: command=%d age_ms=%lu worker=%p",
+                 static_cast<int>(g_worker_command),
+                 static_cast<unsigned long>(WorkerCommandAgeMsLocked()),
+                 static_cast<void*>(g_ai_worker));
+        xSemaphoreGive(g_lock);
+        return ESP_ERR_INVALID_STATE;
+    }
     SetStateLocked(AiSessionStatus::kWaitingReply, "正在停止录音...", "", "");
+    g_worker_command = AiWorkerCommand::kSubmitSession;
+    g_worker_command_since_ms = static_cast<uint32_t>(esp_timer_get_time() / 1000);
     xSemaphoreGive(g_lock);
 
-    const BaseType_t created = xTaskCreate(SubmitTask, "wqn_ai_submit", 12288, nullptr, 5, &g_submit_task);
-    if (created != pdPASS) {
-        AudioCaptureChunk discarded;
-        StopAudioCapture(&discarded);
-        ReleaseAudioCapturePower();
-        xSemaphoreTake(g_lock, portMAX_DELAY);
-        SetErrorLocked("AI 任务创建失败");
-        xSemaphoreGive(g_lock);
-        return ESP_ERR_NO_MEM;
-    }
+    LogAiMemory("before-submit-dispatch");
+    xTaskNotifyGive(g_ai_worker);
     return ESP_OK;
 }
 
@@ -1162,6 +1640,34 @@ void SetAiExpandContent(bool expanded)
     xSemaphoreGive(g_lock);
 }
 
+void SetAiAutoFollow(bool follow)
+{
+    if (g_lock == nullptr) {
+        return;
+    }
+    xSemaphoreTake(g_lock, portMAX_DELAY);
+    g_state.auto_follow = follow;
+    MarkChanged();
+    xSemaphoreGive(g_lock);
+}
+
+// [follow] Per-turn follow state. Mark only on a real change: the per-tick
+// follow step calls this to retire the follow when the answer lands, and a
+// redundant mark would cost an EPD refresh on every later tick.
+void SetAiFollowState(bool active, bool user_moved)
+{
+    if (g_lock == nullptr) {
+        return;
+    }
+    xSemaphoreTake(g_lock, portMAX_DELAY);
+    if (g_state.follow_active != active || g_state.user_moved != user_moved) {
+        g_state.follow_active = active;
+        g_state.user_moved = user_moved;
+        MarkChanged();
+    }
+    xSemaphoreGive(g_lock);
+}
+
 void ClearAiConversationContext()
 {
     if (g_lock == nullptr) {
@@ -1233,7 +1739,7 @@ bool IsAiSessionActive()
     }
     xSemaphoreTake(g_lock, portMAX_DELAY);
     const bool active =
-        g_prepare_active || g_prepare_task != nullptr || g_submit_task != nullptr ||
+        g_prepare_active || g_worker_command != AiWorkerCommand::kNone ||
         g_streaming_active || g_state.status == AiSessionStatus::kPreparingCapture ||
         g_state.status == AiSessionStatus::kListening ||
         g_state.status == AiSessionStatus::kWaitingReply;
@@ -1317,56 +1823,25 @@ void ResetAiScroll()
     xSemaphoreGive(g_lock);
 }
 
-void RequestAiScrollUp(int32_t lines)
-{
-    if (g_lock == nullptr || lines <= 0) {
-        return;
-    }
-    xSemaphoreTake(g_lock, portMAX_DELAY);
-    int32_t target = g_state.scroll_offset_lines + lines;
-    constexpr int32_t kMaxScrollRows = 256;
-    if (target > kMaxScrollRows) {
-        target = kMaxScrollRows;
-    }
-    if (target < -kMaxScrollRows) {
-        target = -kMaxScrollRows;
-    }
-    if (target != g_state.scroll_offset_lines) {
-        g_state.scroll_offset_lines = target;
-        MarkChanged();
-    }
-    xSemaphoreGive(g_lock);
-}
-
-void RequestAiScrollDown(int32_t lines)
-{
-    if (g_lock == nullptr || lines <= 0) {
-        return;
-    }
-    xSemaphoreTake(g_lock, portMAX_DELAY);
-    int32_t target = g_state.scroll_offset_lines - lines;
-    constexpr int32_t kMaxScrollRows = 256;
-    if (target > kMaxScrollRows) {
-        target = kMaxScrollRows;
-    }
-    if (target < -kMaxScrollRows) {
-        target = -kMaxScrollRows;
-    }
-    if (target != g_state.scroll_offset_lines) {
-        g_state.scroll_offset_lines = target;
-        MarkChanged();
-    }
-    xSemaphoreGive(g_lock);
-}
-
-void SetAiScrollOffsetLines(int32_t val)
+void SetAiScrollOffsetLinesClamped(int32_t target, int32_t min_scroll, int32_t max_scroll)
 {
     if (g_lock == nullptr) {
         return;
     }
+    if (min_scroll > max_scroll) {
+        return;  // degenerate bounds: fail open, leave the offset untouched
+    }
     xSemaphoreTake(g_lock, portMAX_DELAY);
-    constexpr int32_t kMaxScrollRows = 256;
-    int32_t target = val;
+    // Read-clamp-write stays inside ONE lock hold so a streaming auto-follow
+    // cannot interleave between reading and writing the offset (a split
+    // Get/Set across locks reintroduces a TOCTOU on the scroll state).
+    if (target > max_scroll) {
+        target = max_scroll;
+    }
+    if (target < min_scroll) {
+        target = min_scroll;
+    }
+    constexpr int32_t kMaxScrollRows = 4096;
     if (target > kMaxScrollRows) {
         target = kMaxScrollRows;
     }
@@ -1429,6 +1904,18 @@ esp_err_t InitAiSession()
     return ESP_OK;
 }
 
+void SetAiAudioCaptureTapEnabled(bool) {}
+
+// [agent-voice] Stubs: the Agent tier is unreachable without AI features
+// (CONFIG_WQN_AGENT_ENABLE depends on WQN_AI_ENABLE), but agent_voice_pipe.cpp
+// keeps its signatures so both halves build against the same header.
+void ArmAiVoicePreroll() {}
+
+std::string GenerateRequestId()
+{
+    return std::string();
+}
+
 esp_err_t StartAiRecordingSession()
 {
     return ESP_ERR_NOT_SUPPORTED;
@@ -1459,6 +1946,8 @@ AiTier GetAiTier()
 void SetAiThinkingLevel(ThinkingLevel) {}
 void SetAiTtsOn(bool) {}
 void SetAiExpandContent(bool) {}
+void SetAiAutoFollow(bool) {}
+void SetAiFollowState(bool, bool) {}
 
 int32_t GetAiScrollOffsetLines()
 {
@@ -1481,9 +1970,7 @@ void ShowAiToast(const std::string&) {}
 void HideAiToast() {}
 void SetAiRecordingLabel(int32_t) {}
 void ResetAiScroll() {}
-void RequestAiScrollUp(int32_t) {}
-void RequestAiScrollDown(int32_t) {}
-void SetAiScrollOffsetLines(int32_t) {}
+void SetAiScrollOffsetLinesClamped(int32_t, int32_t, int32_t) {}
 void StampScrollNoOpHint() {}
 bool IsAiToastVisible() { return false; }
 const std::string& CurrentAiToastLabel()

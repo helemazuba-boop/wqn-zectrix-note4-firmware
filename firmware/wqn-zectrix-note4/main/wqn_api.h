@@ -13,55 +13,6 @@
 
 namespace wqn {
 
-struct WqnAssetManifestItem {
-    std::string role;
-    std::string kind;
-    std::string mime_type;
-    std::string url;
-    std::string sha256;
-    int width = 0;
-    int height = 0;
-    int bytes = 0;
-};
-
-struct WqnProblem {
-    std::string id;
-    std::string title;
-    std::string problem_type;
-    std::string status;
-    std::string subject_id;
-    std::string subject_name;
-    std::string updated_at;
-    std::string next_review_at;
-    std::string content_text;
-    std::string solution_text;
-    int asset_count = 0;
-    int solution_asset_count = 0;
-    std::vector<WqnAssetManifestItem> assets;
-    std::vector<WqnAssetManifestItem> solution_assets;
-};
-
-struct WqnProblemIndexRequest {
-    std::string cursor;
-    std::string status;
-    std::string subject_id;
-    int limit = 50;
-};
-
-struct WqnProblemIndexPage {
-    std::vector<WqnProblem> problems;
-    std::string next_cursor;
-    bool has_more = false;
-    int total = 0;
-};
-
-struct WqnReviewResult {
-    std::string problem_id;
-    std::string selected_status;
-    std::string reviewed_at;
-    int duration_ms = 0;
-};
-
 struct WqnTodoItem {
     std::string id;
     std::string title;
@@ -106,18 +57,6 @@ struct WqnWordEntry {
     std::string due_at;
     bool deleted = false;
     int revision = 0;
-};
-
-struct WqnWordSearchRequest {
-    std::string query;
-    std::string prefix;
-    int limit = 8;
-};
-
-struct WqnWordSearchResult {
-    std::string prefix;
-    std::vector<WqnWordEntry> words;
-    std::vector<std::string> next_letters;
 };
 
 struct WqnWordPackManifestItem {
@@ -168,6 +107,8 @@ struct WqnNotePackManifestNotebook {
 struct WqnNotePackManifest {
     uint64_t cursor = 0;
     bool has_more = false;
+    uint64_t revision = 0;
+    std::string snapshot_id;
     std::vector<WqnNotePackManifestNotebook> notebooks;
 };
 
@@ -194,6 +135,8 @@ struct WqnProblemPackManifestSet {
 struct WqnProblemPackManifest {
     uint64_t cursor = 0;
     bool has_more = false;
+    uint64_t revision = 0;
+    std::string snapshot_id;
     std::vector<WqnProblemPackManifestSet> problem_sets;
 };
 
@@ -202,16 +145,6 @@ struct WqnProblemPackManifest {
 enum class WqnProblemImageKind : uint8_t {
     kAssets,
     kSolution,
-};
-
-struct WqnWordAiLookupRequest {
-    std::string query;
-    std::string prefix;
-};
-
-struct WqnWordAiLookupResult {
-    WqnWordEntry word;
-    std::string reply_text;
 };
 
 struct WqnAiAction {
@@ -288,18 +221,14 @@ esp_err_t BootstrapDeviceControlV3(
 esp_err_t SyncDeviceControlV3(
     const std::string& token,
     const protocol::v3::RequestMetadata& metadata,
+    uint32_t auto_sync_interval_minutes,
     protocol::v3::SyncData* data,
     protocol::v3::Error* error);
 esp_err_t ProbeSyncAndClearTokenOnUnauthorized(const std::string& token);
-esp_err_t SyncDueProblemIds(const std::string& token, std::vector<std::string>* due_problem_ids, int* total);
-esp_err_t FetchProblems(const std::string& token, const std::vector<std::string>& problem_ids, std::vector<WqnProblem>* problems);
-esp_err_t FetchProblemIndex(const std::string& token, const WqnProblemIndexRequest& request, WqnProblemIndexPage* page);
-esp_err_t UploadReviewComplete(const std::string& token, const std::vector<WqnReviewResult>& results);
 esp_err_t FetchTodoTimeline(const std::string& token, const WqnTodoTimelineRequest& request, WqnTodoListPage* page);
 esp_err_t FetchTodoTimeline(const std::string& token, WqnTodoListPage* page);
 esp_err_t FetchTodayPendingTodos(const std::string& token, WqnTodoListPage* page);
 esp_err_t CompleteTodo(const std::string& token, const std::string& todo_id, WqnTodoItem* todo);
-esp_err_t SearchWords(const std::string& token, const WqnWordSearchRequest& request, WqnWordSearchResult* result);
 esp_err_t FetchWordPackManifest(
     const std::string& token,
     const protocol::v3::RequestMetadata& metadata,
@@ -339,6 +268,10 @@ using WqnHttpChunkSink = esp_err_t (*)(
 using WqnTransferProgressSink = void (*)(
     uint32_t done_bytes,
     uint32_t total_bytes);
+enum class WqnImagePixelFormat : uint8_t {
+    kBw1 = 1,
+    kGray4 = 2,
+};
 esp_err_t DownloadWordPackStream(
     const std::string& token,
     const protocol::v3::RequestMetadata& metadata,
@@ -352,7 +285,9 @@ esp_err_t FetchNoteStudyManifest(
     const std::string& token,
     const protocol::v3::RequestMetadata& metadata,
     uint64_t cursor,
-    WqnNotePackManifest* manifest);
+    WqnNotePackManifest* manifest,
+    const std::string& snapshot_id = {},
+    protocol::v3::Error* error_out = nullptr);
 // Streams one notebook's note pack (application/x-ndjson) into `sink`. Bounded by
 // the manifest byte_size and the note-study-v1 pack cap.
 esp_err_t DownloadNotePackStream(
@@ -362,8 +297,8 @@ esp_err_t DownloadNotePackStream(
     WqnHttpChunkSink sink,
     void* context,
     WqnTransferProgressSink progress = nullptr);
-// Downloads one note image as a WQNI file (20-byte header + 15000-byte 1-bpp
-// payload) from /v3/notes/images/{note_id}/{image_index}. Verifies the exact
+// Downloads one note image as a WQNI file (20-byte header + payload) from the
+// content-addressed /v3/images/{expected_image_id} endpoint. Verifies the exact
 // file size and that sha256(bytes) == expected_image_id (the content address
 // carried by the pack line); WQNI header/CRC validation is the caller's job
 // via wqn::ValidateNoteImageWqni.
@@ -374,7 +309,8 @@ esp_err_t DownloadNoteImageV1(
     uint8_t image_index,
     const std::string& expected_image_id,
     std::vector<uint8_t>* wqni,
-    WqnTransferProgressSink progress = nullptr);
+    WqnTransferProgressSink progress = nullptr,
+    WqnImagePixelFormat pixel_format = WqnImagePixelFormat::kBw1);
 esp_err_t CreateNoteStudySessionV1(
     const std::string& token,
     const protocol::note_study_v1::CreateSessionRequest& request,
@@ -411,7 +347,9 @@ esp_err_t FetchProblemStudyManifest(
     const std::string& token,
     const protocol::v3::RequestMetadata& metadata,
     uint64_t cursor,
-    WqnProblemPackManifest* manifest);
+    WqnProblemPackManifest* manifest,
+    const std::string& snapshot_id = {},
+    protocol::v3::Error* error_out = nullptr);
 // Streams one problem set's pack (zlib transport, sha256 over the plaintext)
 // into `sink`. Bounded by the manifest byte_size and the contract pack cap.
 esp_err_t DownloadProblemPackStream(
@@ -420,8 +358,8 @@ esp_err_t DownloadProblemPackStream(
     const WqnProblemPackManifestSet& set,
     WqnHttpChunkSink sink,
     void* context);
-// Downloads one problem image as a WQNI file from
-// /v3/problems/images/{problem_id}/{assets|solution}/{image_index}. Inflates
+// Downloads one problem image as a WQNI file from the content-addressed
+// /v3/images/{expected_image_id} endpoint. Inflates
 // the zlib body with the heap-backed inflater and verifies sha256(bytes) ==
 // expected_image_id; WQNI header/CRC validation is the caller's job via
 // wqn::ValidateNoteImageWqni.
@@ -432,7 +370,8 @@ esp_err_t DownloadProblemImageV1(
     WqnProblemImageKind kind,
     uint8_t image_index,
     const std::string& expected_image_id,
-    std::vector<uint8_t>* wqni);
+    std::vector<uint8_t>* wqni,
+    WqnImagePixelFormat pixel_format = WqnImagePixelFormat::kBw1);
 // Uploads one durable self-assessment verdict (correct/hesitant/wrong/skip).
 // `transport_failure` distinguishes a network fault (retry) from a server
 // rejection (inspect error.retryable / error.code).
@@ -442,8 +381,6 @@ esp_err_t SubmitProblemReviewObservationV1(
     protocol::problem_study_v1::ObservationData* observation,
     protocol::v3::Error* error,
     bool* transport_failure);
-esp_err_t LookupWordWithAi(const std::string& token, const WqnWordAiLookupRequest& request, WqnWordAiLookupResult* result);
-esp_err_t SyncDueProblemsAndLog(const std::string& token);
 
 // === v2 SSE streaming (Std/Pro tier, default path when WQN_AI_STREAMING_ENABLE=y) ===
 //
@@ -496,6 +433,7 @@ struct WqnAiSseEvent {
     std::string error_message;
     std::string error_stage;
     std::string conversation_id;
+    std::string request_id;
     int latency_ms = 0;
     // final
     std::vector<WqnAiAction> actions;
@@ -506,7 +444,10 @@ typedef void (*WqnAiSseCallback)(const WqnAiSseEvent& event, void* user_ctx);
 
 struct WqnAiStreamRequest {
     std::string token;
-    std::vector<int16_t> pcm;        // mono s16le 16 kHz
+    // Borrowed mono s16le 16 kHz samples. UploadAiAudioChatStream is
+    // synchronous; the caller keeps this storage valid until it returns.
+    const int16_t* pcm_data = nullptr;
+    size_t pcm_sample_count = 0;
     int duration_ms = 0;
     std::string tier = "std";        // "std" | "pro"
     std::string conversation_id;     // optional
@@ -543,9 +484,7 @@ esp_err_t UploadAiAudioChat(
 
 esp_err_t ParseTodoListResponse(const std::string& body, WqnTodoListPage* page);
 esp_err_t ParseTodoCompleteResponse(const std::string& body, WqnTodoItem* todo);
-esp_err_t ParseWordSearchResponse(const std::string& body, WqnWordSearchResult* result);
 esp_err_t ParseWordPackManifestResponse(const std::string& body, WqnWordPackManifest* manifest);
-esp_err_t ParseWordAiLookupResponse(const std::string& body, WqnWordAiLookupResult* result);
 esp_err_t ParseAiChatResponseBody(const std::string& body, WqnAiChatResponse* response);
 
 }  // namespace wqn

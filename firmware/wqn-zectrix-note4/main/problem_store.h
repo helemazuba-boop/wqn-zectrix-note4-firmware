@@ -5,6 +5,7 @@
 
 #include "device_protocol/problem_study.h"
 #include "esp_err.h"
+#include "outbox_suspend_reason.h"
 
 namespace wqn {
 
@@ -22,6 +23,9 @@ struct DurableProblemObservation {
 
 struct ProblemOutboxSnapshot {
     size_t pending_count = 0;
+    // Verdicts parked by SuspendPendingProblemObservation: excluded from the
+    // upload queue but still resident on device awaiting intervention.
+    size_t suspended_count = 0;
     size_t capacity = 0;
 };
 
@@ -35,6 +39,13 @@ esp_err_t AcknowledgeProblemObservation(const std::string& request_id);
 // then removes it from the upload queue so a terminal server error cannot
 // wedge the durable head.
 esp_err_t QuarantinePendingProblemObservation(const std::string& request_id);
+// Parks one verdict whose server-side disposition forbids unilateral deletion
+// (idempotency conflict, protocol block). The payload stays in the durable
+// queue journal; PeekPendingProblemObservation skips parked request_ids so
+// the queue keeps advancing, and the park marker survives in its own journal.
+esp_err_t SuspendPendingProblemObservation(
+    const std::string& request_id,
+    OutboxSuspendReason reason);
 esp_err_t ReadProblemOutboxSnapshot(ProblemOutboxSnapshot* snapshot);
 
 }  // namespace wqn

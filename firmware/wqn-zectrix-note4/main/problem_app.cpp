@@ -11,6 +11,8 @@
 #include "esp_timer.h"
 
 #include "display_service.h"
+#include "ui/markdown_layout.h"
+#include "ui/ui_layout.h"
 
 namespace {
 
@@ -22,9 +24,10 @@ using wqn::protocol::problem_study_v1::ReviewAction;
 // Visible rows on the problem title list; mirrors page_problem.cpp geometry
 // (same list layout as the note lists).
 constexpr size_t kProblemListVisibleRows = 8;
-// Body/answer faces show 13 wrapped lines (no image entry row: attachments
-// live on their own ring segments); must match page_problem.cpp.
-constexpr uint32_t kProblemFaceVisibleLines = 13;
+// Body/answer faces show 12 wrapped lines; the final row is reserved for the
+// persistent control/status rail. Attachments live on their own ring segments.
+// Must match page_problem.cpp.
+constexpr uint32_t kProblemFaceVisibleLines = 12;
 constexpr uint32_t kProblemFaceScrollStep = 4;
 
 // Edge-triggered viewport (see note_app.cpp UpdateListViewport for the
@@ -103,6 +106,22 @@ const char* ProblemStatusLabel(uint8_t status)
     return "";
 }
 
+// MCQ options render as markdown list items so long option text wraps with a
+// hanging indent ("- A. 选项文字"). The first line never gets a leading
+// newline so a choices-only part does not start with a blank row.
+void AppendChoiceLines(std::string* section, const wqn::WqnProblemPackPart& part)
+{
+    for (const wqn::WqnProblemPackChoice& choice : part.choices) {
+        if (!section->empty()) {
+            section->push_back('\n');
+        }
+        *section += "- ";
+        *section += choice.id;
+        *section += ". ";
+        *section += choice.text;
+    }
+}
+
 // 题面: the gaokao shell model splits the text across the shell's shared
 // stem (content_text, may be empty) and every part's own body. Rendering only
 // the shell stem dropped the actual questions -- single-part problems (whose
@@ -133,6 +152,7 @@ std::string ComposeBodyText(const wqn::WqnProblemEntry& entry)
         } else {
             section = part.content_text;
         }
+        AppendChoiceLines(&section, part);
         if (section.empty()) continue;
         if (!text.empty()) {
             text += "\n\n";
@@ -140,6 +160,40 @@ std::string ComposeBodyText(const wqn::WqnProblemEntry& entry)
         text += section;
     }
     return text;
+}
+
+// Echoes the correct option's text on the answer face: single choice inline
+// ("答案：B. 文字"), multi choice as one list line per selected id. Multi
+// choice matches ids by substring against the joined letters, so ids longer
+// than one character could collide -- the form's default ids are A-D.
+std::string CorrectChoiceSuffix(const wqn::WqnProblemPackPart& part)
+{
+    if (part.choices.empty() || part.answer_text.empty()) {
+        return {};
+    }
+    std::string suffix;
+    if (part.type == "single_choice") {
+        for (const wqn::WqnProblemPackChoice& choice : part.choices) {
+            if (choice.id == part.answer_text) {
+                suffix = ". ";
+                suffix += choice.text;
+                break;
+            }
+        }
+        return suffix;
+    }
+    if (part.type == "multi_choice") {
+        for (const wqn::WqnProblemPackChoice& choice : part.choices) {
+            if (!choice.id.empty() &&
+                part.answer_text.find(choice.id) != std::string::npos) {
+                suffix += "\n- ";
+                suffix += choice.id;
+                suffix += ". ";
+                suffix += choice.text;
+            }
+        }
+    }
+    return suffix;
 }
 
 // 答案面: 逐问 label · 分值 · 正确答案, one blank line between parts.
@@ -158,10 +212,14 @@ std::string ComposeAnswerText(const wqn::WqnProblemEntry& entry)
         text.push_back('\n');
         text += "答案：";
         text += part.answer_text.empty() ? "（见解析图）" : part.answer_text;
+        text += CorrectChoiceSuffix(part);
         text.push_back('\n');
         text.push_back('\n');
     }
-    if (!text.empty()) {
+    // Each part appends a "\n\n" separator; drop the whole trailing one so
+    // the text ends on the last answer line (parts stay blank-separated).
+    if (text.size() >= 2) {
+        text.pop_back();
         text.pop_back();
     }
     return text;
@@ -172,6 +230,7 @@ void ResetProblemImageViewer(wqn::ProblemAppState* state)
     state->image_request = false;
     state->image_in_flight = false;
     state->image_error = false;
+    state->image_expected_gray4 = false;
     state->image_is_solution = false;
     state->image_index = 0;
     state->image_expected_id.clear();
@@ -186,14 +245,23 @@ void ResetProblemImageViewer(wqn::ProblemAppState* state)
 // problem cloud lane (shared ni_ SPIFFS cache first, then download).
 void RequestCurrentProblemImage(wqn::ProblemAppState* state)
 {
-    const auto& ids = state->image_is_solution
+    const auto& bw1_ids = state->image_is_solution
         ? state->current.solution_image_ids
         : state->current.image_ids;
-    if (state->image_index >= ids.size()) {
+    const auto& gray4_ids = state->image_is_solution
+        ? state->current.solution_gray4_image_ids
+        : state->current.gray4_image_ids;
+    if (state->image_index >= bw1_ids.size()) {
         state->image_error = true;
         return;
     }
-    const std::string& id = ids[state->image_index];
+    const bool has_gray4 = state->image_index < gray4_ids.size() &&
+        !gray4_ids[state->image_index].empty();
+    state->image_expected_gray4 =
+        state->image_render_mode == wqn::ImageRenderMode::kGray16 && has_gray4;
+    const std::string& id = state->image_expected_gray4
+        ? gray4_ids[state->image_index]
+        : bw1_ids[state->image_index];
     state->image_expected_id = id;
     state->image_error = false;
     if (state->image_loaded_id == id && state->image_wqni != nullptr) {
@@ -202,6 +270,23 @@ void RequestCurrentProblemImage(wqn::ProblemAppState* state)
     }
     if (!state->image_in_flight) {
         state->image_request = true;
+    }
+}
+
+void SetProblemImageRenderModeImpl(wqn::ProblemAppState* state, wqn::ImageRenderMode mode)
+{
+    if (state == nullptr || state->image_render_mode == mode) return;
+    state->image_render_mode = mode;
+    state->image_in_flight = false;
+    state->image_dispatched_id.clear();
+    state->image_loaded_id.clear();
+    state->image_wqni.reset();
+    if (state->active && state->mode == wqn::ProblemAppMode::kProblemView) {
+        const wqn::ProblemFace face = SegmentFace(*state, state->ring_segment);
+        if (face == wqn::ProblemFace::kProblemImage ||
+            face == wqn::ProblemFace::kSolutionImage) {
+            RequestCurrentProblemImage(state);
+        }
     }
 }
 
@@ -269,14 +354,18 @@ void LoadCurrentProblem(wqn::ProblemAppState* state)
     const esp_err_t read_result = wqn::ReadProblemPackEntry(entry, &state->current);
     if (read_result == ESP_OK) {
         state->current_loaded = true;
-        // Precompute wrapped line counts with the SAME width as the renderer
-        // (page_problem.cpp: kContentW - 14 = 370 px) so scroll clamps match.
+        // Precompute Markdown row counts with the SAME width, layout and opts
+        // as the renderer (page_problem.cpp: kMarkdownWidthDense,
+        // kMdNoSingleEmphasis) so scroll clamps match. Single * / _ stay
+        // literal: problem bodies are math-heavy plain text.
         state->body_text = ComposeBodyText(state->current);
         state->body_total_lines = static_cast<uint32_t>(
-            wqn::WrapUtf8TextToWidth(state->body_text, 370, 4096).size());
+            device_ui_internal::CountMarkdownLines(
+                state->body_text, device_ui_internal::kMarkdownWidthDense, device_ui_internal::kMdNoSingleEmphasis));
         state->answer_text = ComposeAnswerText(state->current);
         state->answer_total_lines = static_cast<uint32_t>(
-            wqn::WrapUtf8TextToWidth(state->answer_text, 370, 4096).size());
+            device_ui_internal::CountMarkdownLines(
+                state->answer_text, device_ui_internal::kMarkdownWidthDense, device_ui_internal::kMdNoSingleEmphasis));
         ESP_LOGI(
             kTag, "problem opened: id=%.8s images=%u/%u parts=%u body_bytes=%u",
             state->current.problem_id.c_str(),
@@ -575,6 +664,11 @@ void AdvanceAfterVerdict(wqn::ProblemAppState* state)
 
 namespace wqn {
 
+void SetProblemImageRenderMode(ProblemAppState* state, ImageRenderMode mode)
+{
+    SetProblemImageRenderModeImpl(state, mode);
+}
+
 esp_err_t InitProblemApp(ProblemAppState* state)
 {
     if (state == nullptr) return ESP_ERR_INVALID_ARG;
@@ -597,6 +691,7 @@ esp_err_t InitProblemApp(ProblemAppState* state)
     ProblemOutboxSnapshot outbox;
     if (ReadProblemOutboxSnapshot(&outbox) == ESP_OK) {
         state->outbox.pending_count = outbox.pending_count;
+        state->outbox.suspended_count = outbox.suspended_count;
         state->outbox.capacity = outbox.capacity;
     }
 
@@ -696,10 +791,11 @@ bool TakeProblemImageRequest(
     std::string* problem_id,
     bool* is_solution,
     uint8_t* image_index,
-    std::string* image_id)
+    std::string* image_id,
+    bool* gray4)
 {
     if (state == nullptr || problem_id == nullptr || is_solution == nullptr ||
-        image_index == nullptr || image_id == nullptr) {
+        image_index == nullptr || image_id == nullptr || gray4 == nullptr) {
         return false;
     }
     EnsureProblemImageRequest(state);
@@ -716,6 +812,7 @@ bool TakeProblemImageRequest(
     *is_solution = state->image_is_solution;
     *image_index = state->image_index;
     *image_id = state->image_expected_id;
+    *gray4 = state->image_expected_gray4;
     state->image_request = false;
     state->image_in_flight = true;
     state->image_dispatch_us = esp_timer_get_time();
@@ -763,6 +860,20 @@ void ApplyProblemImageResult(
     const std::string& failed_id =
         image_id.empty() ? state->image_dispatched_id : image_id;
     if (!state->image_request && failed_id == state->image_expected_id) {
+        if (result == ESP_ERR_NOT_FOUND && state->image_expected_gray4) {
+            const auto& bw1_ids = state->image_is_solution
+                ? state->current.solution_image_ids
+                : state->current.image_ids;
+            if (state->image_index < bw1_ids.size()) {
+                state->image_expected_gray4 = false;
+                state->image_expected_id = bw1_ids[state->image_index];
+                state->image_dispatched_id.clear();
+                state->image_error = false;
+                state->image_request = true;
+                ESP_LOGW(kTag, "gray16 problem derivative missing; falling back to BW1");
+                return;
+            }
+        }
         state->image_error = true;
         ESP_LOGW(kTag, "problem image fetch failed: %s id=%.12s",
                  esp_err_to_name(result), failed_id.c_str());
@@ -870,7 +981,8 @@ void ApplyProblemVerdictCommitResult(ProblemAppState* state, esp_err_t result)
     }
     state->pending_verdict = {};
     state->commit_state = ProblemVerdictCommitState::kCloudPending;
-    if (state->outbox.pending_count < state->outbox.capacity) {
+    if (state->outbox.pending_count + state->outbox.suspended_count <
+        state->outbox.capacity) {
         ++state->outbox.pending_count;
     }
     if (state->advance_after_commit) {
@@ -885,8 +997,9 @@ void RefreshProblemOutboxState(ProblemAppState* state)
     ProblemOutboxSnapshot snapshot;
     if (ReadProblemOutboxSnapshot(&snapshot) != ESP_OK) return;
     state->outbox.pending_count = snapshot.pending_count;
+    state->outbox.suspended_count = snapshot.suspended_count;
     state->outbox.capacity = snapshot.capacity;
-    if (snapshot.pending_count == 0 &&
+    if (snapshot.pending_count == 0 && snapshot.suspended_count == 0 &&
         state->commit_state == ProblemVerdictCommitState::kCloudPending) {
         state->commit_state = ProblemVerdictCommitState::kCloudAcknowledged;
     }
@@ -952,6 +1065,8 @@ ProblemAppSnapshot BuildProblemAppSnapshot(const ProblemAppState& state)
     }
     snapshot.verdict_selected = state.verdict_selected;
     snapshot.commit_state = state.commit_state;
+    snapshot.outbox_pending_count = state.outbox.pending_count;
+    snapshot.outbox_suspended_count = state.outbox.suspended_count;
     snapshot.status_line = ProblemAppStatusLine(state);
     switch (state.mode) {
         case ProblemAppMode::kProblemList:
@@ -971,6 +1086,9 @@ ProblemAppSnapshot BuildProblemAppSnapshot(const ProblemAppState& state)
 
 std::string ProblemAppStatusLine(const ProblemAppState& state)
 {
+    if (state.outbox.suspended_count > 0) {
+        return "同步挂起 " + std::to_string(state.outbox.suspended_count) + " 条";
+    }
     if (!state.message.empty()) return state.message;
     switch (state.mode) {
         case ProblemAppMode::kProblemList:
@@ -988,11 +1106,11 @@ std::string ProblemAppSignature(const ProblemAppState& state)
     // Compact identity for the render layer to detect meaningful frame
     // changes; every navigation/unlock/verdict/image transition must land
     // here or the dedup pipeline freezes the page.
-    char buffer[128] = {};
+    char buffer[160] = {};
     std::snprintf(
         buffer,
         sizeof(buffer),
-        "%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u",
+        "%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u",
         static_cast<unsigned>(state.active ? 1 : 0),
         static_cast<unsigned>(state.mode),
         static_cast<unsigned>(state.list_selected),
@@ -1002,6 +1120,9 @@ std::string ProblemAppSignature(const ProblemAppState& state)
         static_cast<unsigned>(state.answer_unlocked ? 1 : 0),
         static_cast<unsigned>(state.verdict_selected),
         static_cast<unsigned>(state.commit_state),
+        static_cast<unsigned>(state.outbox.pending_count),
+        static_cast<unsigned>(state.outbox.suspended_count),
+        static_cast<unsigned>(state.cloud_sync_failed ? 1 : 0),
         static_cast<unsigned>(state.image_error ? 1 : 0),
         static_cast<unsigned>(state.pack_index.sets.size()));
     return std::string(buffer);
@@ -1056,6 +1177,13 @@ bool RunProblemPageStateSelfTest()
     ProblemPageFixture idle;
     if (!idle) return require(false, "allocate idle fixture");
     idle.get().initialized = true;
+    const std::string healthy_signature = ProblemAppSignature(idle.get());
+    idle.get().cloud_sync_failed = true;
+    if (!require(ProblemAppSignature(idle.get()) != healthy_signature,
+                 "sync failure invalidates the render signature")) {
+        return false;
+    }
+    idle.get().cloud_sync_failed = false;
     for (size_t index = 0; index < 100; ++index) {
         const ProblemInput input = (index % 2 == 0) ? ProblemInput::kDown : ProblemInput::kUp;
         if (HandleProblemAppInput(&idle.get(), input) != ESP_OK) return false;
@@ -1225,6 +1353,60 @@ bool RunProblemPageStateSelfTest()
     if (!require(f.commit_state == ProblemVerdictCommitState::kFailed,
                  "failed commit is terminal") ||
         !require(f.list_selected == 0, "failed commit does not advance")) {
+        return false;
+    }
+
+    // Choice rendering: MCQ options join the 题面 as "- A. 文字" list lines
+    // (a choices-only part still renders) and the answer face echoes the
+    // correct option's text -- inline for single choice, one list line per
+    // selected id for multi choice.
+    wqn::WqnProblemEntry single;
+    {
+        wqn::WqnProblemPackPart part;
+        part.index = 1;
+        part.type = "single_choice";
+        part.content_text = "题干";
+        part.answer_text = "B";
+        part.choices = {{"A", "甲选项"}, {"B", "乙选项"}};
+        single.parts.push_back(std::move(part));
+    }
+    if (!require(
+            ComposeBodyText(single) == "题干\n- A. 甲选项\n- B. 乙选项",
+            "choices render as a list under the part body") ||
+        !require(
+            ComposeAnswerText(single) == "第1问\n答案：B. 乙选项",
+            "single choice answer echoes the option text")) {
+        return false;
+    }
+    wqn::WqnProblemEntry multi;
+    {
+        wqn::WqnProblemPackPart part;
+        part.index = 1;
+        part.label = "多选";
+        part.type = "multi_choice";
+        part.content_text = "题干";
+        part.answer_text = "BD";
+        part.choices = {{"A", "甲选项"}, {"B", "乙选项"}, {"D", "丁选项"}};
+        multi.parts.push_back(std::move(part));
+    }
+    if (!require(
+            ComposeAnswerText(multi) ==
+                "第1问 · 多选\n答案：BD\n- B. 乙选项\n- D. 丁选项",
+            "multi choice answer lists the selected options")) {
+        return false;
+    }
+    wqn::WqnProblemEntry choices_only;
+    {
+        wqn::WqnProblemPackPart part;
+        part.index = 1;
+        part.type = "single_choice";
+        part.answer_text = "A";
+        part.choices = {{"A", "甲选项"}};
+        choices_only.parts.push_back(std::move(part));
+    }
+    if (!require(
+            ComposeBodyText(choices_only) == "- A. 甲选项",
+            "choices-only part still renders")) {
         return false;
     }
     return true;

@@ -2,6 +2,8 @@
 // All other responsibilities (rendering, refresh, cloud, state, input) live in main/ui/.
 
 #include <array>
+#include <algorithm>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -17,7 +19,9 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "flash_session.h"
+#include "opencode_session.h"
 #include "power_manager.h"
+#include "runtime/sleep_coordinator.h"
 #include "runtime/wake_context.h"
 #include "services/sync_service.h"
 #include "ui/persist_worker.h"
@@ -25,6 +29,7 @@
 #include "ui/ui_runtime.h"
 #include "ui_model.h"
 #include "wqn_api.h"
+#include "error_recorder.h"
 
 namespace device_ui_internal {
 // Last screen survives deep sleep via RTC slow memory. Initialized to kHome (=3)
@@ -32,14 +37,15 @@ namespace device_ui_internal {
 // LoadUiState() validates the restored value before use.
 RTC_DATA_ATTR int g_rtc_screen_val = static_cast<int>(wqn::UiScreen::kHome);
 
-// [timer-skip] Last successfully-rendered (screen, clock-label) pair, stored
-// in RTC slow memory. On a timer wake-up we compare the freshly-rendered
-// frame's clock label + screen against these and skip the entire refresh
-// pipeline if both match -- the panel already shows this content.
+// [timer-skip] Last successfully-rendered screen, clock label and full frame
+// signature hash, stored in RTC slow memory. On a timer wake-up we compare the
+// freshly-rendered frame against this physical-display commit record and skip
+// the refresh pipeline only when the actual pixels are still represented.
 // Initialized to a sentinel screen value so the first wake-up after a cold
 // boot / RTC reset is never mistakenly skipped.
 RTC_DATA_ATTR int g_rtc_last_rendered_screen_id = -1;
 RTC_DATA_ATTR char g_rtc_last_rendered_clock[8] = {};
+RTC_DATA_ATTR uint32_t g_rtc_last_rendered_frame_hash = 0;
 } // namespace device_ui_internal
 
 namespace {
@@ -86,10 +92,67 @@ bool ScreenSupportsTimerSkip(wqn::UiScreen screen)
            screen == wqn::UiScreen::kTodo;
 }
 
-bool TrySkipInitRefresh(wqn::UiScreen screen, const char* clock_label)
+wqn::DeepSleepUiPolicy DeepSleepPolicyForUiState(const wqn::AppState& state)
+{
+    switch (state.screen) {
+        case wqn::UiScreen::kProvisioning:
+            // An unpaired device on battery keeps the existing slow
+            // maintenance cadence; an active portal still owns a blocker.
+            return wqn::DeepSleepUiPolicy::kDeepSleepNoDisplayTimer;
+        case wqn::UiScreen::kHome:
+        case wqn::UiScreen::kTime:
+        case wqn::UiScreen::kAi:
+        case wqn::UiScreen::kTodo:
+        case wqn::UiScreen::kSettings:
+        case wqn::UiScreen::kWord:
+        case wqn::UiScreen::kNote:
+        case wqn::UiScreen::kOpenCode:
+            // [agent] kOpenCode is a reserved, unreachable ID: the Agent page
+            // lives on the AI screen and is covered by the kAi case above.
+            // Ordinary application pages enter retained standby. This
+            // firmware intentionally exposes no application-page hibernate
+            // policy: page identity alone cannot make deep sleep safe because
+            // it drops RAM/PSRAM state and GPIO39 wake functionality.
+            return wqn::DeepSleepUiPolicy::kRetainedStandbyOnly;
+    }
+    return wqn::DeepSleepUiPolicy::kRetainedStandbyOnly;
+}
+
+bool IsBackgroundSyncTimerWake(
+    const wqn::runtime::WakeContext& wake)
+{
+    if (wake.kind != wqn::runtime::WakeKind::kScheduledTimer ||
+        !wake.panel_cache_trusted || !wake.requested_timer_wakeup ||
+        wake.requested_display_timer_wakeup) {
+        return false;
+    }
+    // A calendar alarm shares the RTC interrupt pin with the countdown timer.
+    // Only suppress the panel for the exact timer source armed by the sync
+    // scheduler; a coincident/independent alarm stays conservative and renders.
+    return wake.raw_cause == ESP_SLEEP_WAKEUP_TIMER ||
+        (wake.raw_cause == ESP_SLEEP_WAKEUP_EXT1 && wake.pcf_flags_valid &&
+         wake.pcf_timer && !wake.pcf_alarm);
+}
+
+uint32_t FrameSignatureHash(const std::string& signature)
+{
+    constexpr uint32_t kFnvOffset = 2166136261U;
+    constexpr uint32_t kFnvPrime = 16777619U;
+    uint32_t hash = kFnvOffset;
+    for (const unsigned char byte : signature) {
+        hash = (hash ^ byte) * kFnvPrime;
+    }
+    return hash;
+}
+
+bool TrySkipInitRefresh(
+    wqn::UiScreen screen,
+    const char* clock_label,
+    const std::string& frame_signature)
 {
     using device_ui_internal::g_rtc_last_rendered_screen_id;
     using device_ui_internal::g_rtc_last_rendered_clock;
+    using device_ui_internal::g_rtc_last_rendered_frame_hash;
     const wqn::runtime::WakeContext& wake = wqn::runtime::GetWakeContext();
     ESP_LOGI("wqn_ui",
              "TrySkipInitRefresh: wake=%s raw=%d ext1=0x%llx cache=%d screen=%d clock=%s "
@@ -100,6 +163,13 @@ bool TrySkipInitRefresh(wqn::UiScreen screen, const char* clock_label)
              g_rtc_last_rendered_screen_id, g_rtc_last_rendered_clock);
     if (wake.kind != wqn::runtime::WakeKind::kScheduledTimer || !wake.panel_cache_trusted) {
         return false;
+    }
+    if (IsBackgroundSyncTimerWake(wake) &&
+        !device_ui_internal::HasRetainedTimeApp()) {
+        ESP_LOGI(
+            "wqn_ui",
+            "Init refresh skipped: background sync timer wake keeps cached panel untouched");
+        return true;
     }
     if (!ScreenSupportsTimerSkip(screen)) {
         return false;
@@ -114,7 +184,13 @@ bool TrySkipInitRefresh(wqn::UiScreen screen, const char* clock_label)
     if (static_cast<int>(screen) != g_rtc_last_rendered_screen_id) {
         return false;
     }
-    if (std::strcmp(clock_label, g_rtc_last_rendered_clock) != 0) {
+    // The frame signature already contains the clock on every page that
+    // actually renders it. Do not require the minute label separately here:
+    // an active timer page deliberately omits wall-clock minutes, so an
+    // unchanged progress bucket remains the exact same physical frame.
+    const uint32_t frame_hash = FrameSignatureHash(frame_signature);
+    if (g_rtc_last_rendered_frame_hash == 0 ||
+        frame_hash != g_rtc_last_rendered_frame_hash) {
         return false;
     }
     ESP_LOGI("wqn_ui", "Init refresh skipped: panel already shows this exact frame (screen=%d clock=%s wake=%s ext1=0x%llx)",
@@ -123,16 +199,21 @@ bool TrySkipInitRefresh(wqn::UiScreen screen, const char* clock_label)
     return true;
 }
 
-void RecordPresentedRefresh(wqn::UiScreen screen, const char* clock_label)
+void RecordPresentedRefresh(
+    wqn::UiScreen screen,
+    const char* clock_label,
+    const std::string& frame_signature)
 {
     using device_ui_internal::g_rtc_last_rendered_screen_id;
     using device_ui_internal::g_rtc_last_rendered_clock;
+    using device_ui_internal::g_rtc_last_rendered_frame_hash;
     if (!ScreenSupportsTimerSkip(screen) || clock_label == nullptr || clock_label[0] == '\0') {
         return;
     }
     g_rtc_last_rendered_screen_id = static_cast<int>(screen);
     std::strncpy(g_rtc_last_rendered_clock, clock_label, sizeof(g_rtc_last_rendered_clock) - 1);
     g_rtc_last_rendered_clock[sizeof(g_rtc_last_rendered_clock) - 1] = '\0';
+    g_rtc_last_rendered_frame_hash = FrameSignatureHash(frame_signature);
 }
 
 // [timer-skip] Main-loop minute-tick gate. Returns true when the minute has
@@ -166,7 +247,69 @@ constexpr TickType_t kStatusRefreshDelayTicks = pdMS_TO_TICKS(60000);
 // Full UI snapshot reloads touch several persistent domains. Keep them out of
 // the word interaction window; typed sync events already update live status.
 constexpr int64_t kStatusReloadInteractionQuietUs = 5LL * 1000LL * 1000LL;
-constexpr UBaseType_t kSyncEventQueueDepth = 4;
+
+TickType_t DelayMsToTicks(int64_t delay_ms)
+{
+    if (delay_ms <= 0) {
+        return 1;
+    }
+    const uint64_t ticks =
+        (static_cast<uint64_t>(delay_ms) + portTICK_PERIOD_MS - 1) /
+        portTICK_PERIOD_MS;
+    return ticks >= static_cast<uint64_t>(portMAX_DELAY)
+        ? portMAX_DELAY - 1
+        : static_cast<TickType_t>(std::max<uint64_t>(1, ticks));
+}
+
+TickType_t TicksUntilNextClockMinute()
+{
+    const std::time_t now = std::time(nullptr);
+    int64_t second = static_cast<int64_t>(now % 60);
+    if (second < 0) {
+        second += 60;
+    }
+    // Cross the wall-clock boundary rather than waking exactly on it; this
+    // avoids a scheduler/RTC rounding edge that would reproduce the old label
+    // and immediately arm another near-full-minute wait.
+    return DelayMsToTicks((60 - second) * 1000 + 25);
+}
+
+bool RetainedStandbyIdleWindow(const wqn::AppState& state)
+{
+    return DeepSleepPolicyForUiState(state) ==
+            wqn::DeepSleepUiPolicy::kRetainedStandbyOnly &&
+        wqn::IsUiIdleForRetainedStandby() &&
+        !wqn::TimeAppHasActiveTimer(state.time_app) &&
+        !state.status_edit.active;
+}
+
+bool CanWaitInRetainedStandby(const wqn::AppState& state)
+{
+    return RetainedStandbyIdleWindow(state) &&
+        !wqn::runtime::HasActiveSleepBlockers();
+}
+
+TickType_t RetainedStandbyWaitTicks(
+    const wqn::AppState& state,
+    uint64_t todo_desired_revision,
+    uint64_t todo_applied_revision,
+    int64_t todo_retry_not_before_ms)
+{
+    TickType_t wait_ticks = portMAX_DELAY;
+    if (device_ui_internal::ScreenUsesClockMinute(state)) {
+        wait_ticks = TicksUntilNextClockMinute();
+    }
+    if (todo_desired_revision > todo_applied_revision &&
+        todo_retry_not_before_ms > 0) {
+        const int64_t retry_delay_ms =
+            todo_retry_not_before_ms - esp_timer_get_time() / 1000;
+        if (retry_delay_ms > 0) {
+            wait_ticks = std::min(
+                wait_ticks, DelayMsToTicks(retry_delay_ms));
+        }
+    }
+    return wait_ticks;
+}
 
 using device_ui_internal::BuildHomeSummary;
 using device_ui_internal::CheckBatteryProtection;
@@ -221,24 +364,6 @@ struct DisplayTrackingState {
 DisplayTrackingState g_display_tracking;
 device_ui_internal::UiRuntime g_ui_runtime;
 wqn::AppState g_ui_reload_snapshot;
-StaticQueue_t g_sync_event_queue_storage;
-uint8_t g_sync_event_queue_buffer[
-    kSyncEventQueueDepth * sizeof(wqn::services::SyncEvent)] = {};
-QueueHandle_t g_sync_event_queue = nullptr;
-
-void UiSyncEventSink(const wqn::services::SyncEvent& event)
-{
-    if (g_sync_event_queue == nullptr ||
-        xQueueSend(g_sync_event_queue, &event, 0) != pdTRUE) {
-        ESP_LOGW(kTag, "drop sync event: sequence=%lu",
-                 static_cast<unsigned long>(event.sequence));
-    } else {
-        // [input-capture] Wake the UI so a sync completion is applied promptly
-        // instead of waiting for the next idle poll.
-        device_ui_internal::NotifyUiTask();
-    }
-}
-
 void LogUiStackHighWater(const char* phase)
 {
     const UBaseType_t high_water_words = uxTaskGetStackHighWaterMark(nullptr);
@@ -381,7 +506,7 @@ void DrainDisplayResults(
             tracking->presented_signature = record->signature;
             // RTC state is a physical-display commit record. It must never be
             // advanced merely because a request entered the refresh pipeline.
-            RecordPresentedRefresh(record->screen, record->clock_label);
+            RecordPresentedRefresh(record->screen, record->clock_label, record->signature);
         } else if (result.status == wqn::display::DisplayStatus::kFailed) {
             tracking->force_next_submission = true;
         }
@@ -415,6 +540,7 @@ void DeviceUiTask(void*)
     esp_err_t result = wqn::InitButtonInput();
     if (result != ESP_OK) {
         ESP_LOGE(kTag, "button input init failed: %s", esp_err_to_name(result));
+        wqn::RecordError("ui", "button init failed %s", esp_err_to_name(result));
         vTaskDelete(nullptr);
         return;
     }
@@ -423,24 +549,39 @@ void DeviceUiTask(void*)
     result = wqn::StartButtonInputTask(xTaskGetCurrentTaskHandle());
     if (result != ESP_OK) {
         ESP_LOGE(kTag, "button task start failed: %s", esp_err_to_name(result));
+        wqn::RecordError("ui", "button task start failed %s", esp_err_to_name(result));
         vTaskDelete(nullptr);
         return;
     }
     // [input-capture] Cloud results and sync events wake this same task.
     device_ui_internal::SetUiTaskToNotify(xTaskGetCurrentTaskHandle());
+    wqn::services::SetSyncEventSink(&device_ui_internal::NotifyUiTask);
 
-    result = wqn::InitEpdDisplay();
-    if (result != ESP_OK) {
-        ESP_LOGE(kTag, "EPD display init failed: %s", esp_err_to_name(result));
-        vTaskDelete(nullptr);
-        return;
+    const wqn::runtime::WakeContext& wake = wqn::runtime::GetWakeContext();
+    // An active retained timer may have crossed a visual milestone or its
+    // endpoint while asleep. In that case the frame hash, not the sync wake
+    // classification, decides whether the cached panel is still current.
+    const bool background_timer_wake =
+        IsBackgroundSyncTimerWake(wake) &&
+        !device_ui_internal::HasRetainedTimeApp();
+    if (!background_timer_wake) {
+        result = wqn::InitEpdDisplay();
+        if (result != ESP_OK) {
+            ESP_LOGE(kTag, "EPD display init failed: %s", esp_err_to_name(result));
+            wqn::RecordError("ui", "EPD init failed %s", esp_err_to_name(result));
+            vTaskDelete(nullptr);
+            return;
+        }
+    } else {
+        ESP_LOGI(kTag, "background sync timer wake: deferring EPD initialization");
     }
-    ESP_LOGI(kTag, "EPD display init OK, preparing first frame");
+    ESP_LOGI(kTag, "EPD display setup ready, preparing first frame");
 
     device_ui_internal::UiRuntime& ui_runtime = g_ui_runtime;
     ESP_LOGI(kTag, "DeviceUiTask: calling LoadUiState");
     const bool state_loaded =
-        device_ui_internal::LoadUiState(&g_ui_reload_snapshot);
+        device_ui_internal::LoadUiState(
+            &g_ui_reload_snapshot, /*restore_screen_from_rtc=*/true);
     ui_runtime.Initialize(std::move(g_ui_reload_snapshot));
     const wqn::AppState& state = ui_runtime.state();
     ESP_LOGI(kTag, "DeviceUiTask: LoadUiState done");
@@ -448,13 +589,10 @@ void DeviceUiTask(void*)
         ESP_LOGW(kTag, "UI state loaded in degraded mode");
     }
     LogUiStackHighWater("state-loaded");
-    // [power-fix] Do NOT seed g_last_rendered_screen from state.screen here:
-    // a deep-sleep wake-up that goes through USB_UART_CHIP_RESET loses this
-    // RAM variable, and unconditionally re-writing it from the freshly loaded
-    // UI state would later trip the "screen change detected" branch in
-    // RefreshFrame() and force a full refresh on every wake-up. Treat -1 as
-    // "unknown", which forces the first refresh to be full but keeps subsequent
-    // wake-ups inside the same screen and clock label on the RTC-CRC fast path.
+    // Do not seed g_last_rendered_screen from freshly loaded logical state.
+    // The refresh task retains that value as a physical-display commit and
+    // advances it only after a successful panel update; overwriting it here
+    // would hide a real screen transition or manufacture one after deep sleep.
     CheckBatteryProtection();
     ESP_LOGI(kTag, "DeviceUiTask: CheckBatteryProtection done");
     std::string last_clock_label = CurrentClockLabel();
@@ -480,7 +618,10 @@ void DeviceUiTask(void*)
         // skip the refresh pipeline entirely. The panel already shows this
         // content, so we avoid any SPI traffic and any flicker.
         const char* const init_clock = last_clock_label.c_str();
-        const bool skip_init_refresh = TrySkipInitRefresh(state.screen, init_clock);
+        const bool skip_init_refresh = TrySkipInitRefresh(
+            state.screen,
+            init_clock,
+            display_tracking.desired_signature);
         ESP_LOGI(kTag, "Requesting initial EPD refresh: signature_len=%zu schedule=%s skip=%d",
                  display_tracking.desired_signature.size(),
                  device_ui_internal::RefreshScheduleName(init_schedule),
@@ -509,9 +650,11 @@ void DeviceUiTask(void*)
     TickType_t last_status_refresh = xTaskGetTickCount();
     g_last_active_us_local = esp_timer_get_time();
     TickType_t poll_delay = kUiPollDelayTicks;
-    bool word_pack_refresh_pending = false;
-    bool note_pack_refresh_pending = false;
-    bool problem_pack_refresh_pending = false;
+    uint32_t last_sync_event_sequence = 0;
+    uint64_t todo_desired_revision = 0;
+    uint64_t todo_applied_revision = 0;
+    int64_t todo_retry_not_before_ms = 0;
+    uint8_t todo_retry_attempt = 0;
 
     while (true) {
         RefreshSchedule refresh_schedule = pending_refresh_schedule;
@@ -519,56 +662,21 @@ void DeviceUiTask(void*)
         DrainDisplayResults(&ui_runtime, &display_tracking, &refresh_schedule);
         bool todo_cloud_completed = false;
         bool word_cloud_completed = false;
+        bool word_bulk_completed = false;
         bool note_cloud_completed = false;
+        bool note_bulk_completed = false;
         bool problem_cloud_completed = false;
-        if (g_sync_event_queue != nullptr) {
-            wqn::services::SyncEvent sync_event;
-            while (xQueuePeek(g_sync_event_queue, &sync_event, 0) == pdTRUE) {
-                // [persist-worker] A succeeded sync reads the three outboxes
-                // synchronously in DispatchSyncResult; while a word/note/problem
-                // commit is pending or any persist is in flight, that read would
-                // queue behind the observation transaction and re-freeze the UI.
-                // Leave the event queued (peek, do not receive) and consume it a
-                // later iteration once persistence is idle. Failed /
-                // AwaitingClaim touch no storage, so process them now. Peeking
-                // rather than receive-then-discard preserves the terminal event.
-                if (sync_event.status ==
-                        wqn::services::SyncEventStatus::kSucceeded &&
-                    (state.word_app.session.commit_state ==
-                         wqn::WordObservationCommitState::kPersisting ||
-                     state.note_app.session.commit_state ==
-                         wqn::NoteObservationCommitState::kPersisting ||
-                     state.problem_app.commit_state ==
-                         wqn::ProblemVerdictCommitState::kPersisting ||
-                     device_ui_internal::IsAnyPersistBusy())) {
-                    break;
-                }
-                xQueueReceive(g_sync_event_queue, &sync_event, 0);
-                const device_ui_internal::UiUpdate update =
-                    ui_runtime.DispatchSyncResult(sync_event);
-                refresh_schedule =
-                    StrongerSchedule(refresh_schedule, update.refresh);
-                if (sync_event.status ==
-                        wqn::services::SyncEventStatus::kSucceeded &&
-                    sync_event.scope ==
-                        wqn::services::SyncEventScope::kFull) {
-                    // Sync notifications can arrive while a session page,
-                    // search, or an earlier pack refresh owns WordCloud. Keep
-                    // one coalesced refresh request instead of misreporting
-                    // the busy owner as a full queue.
-                    word_pack_refresh_pending = true;
-                    // Notes used to sync only when the local cache was missing
-                    // or broken, so an attach/edit on the web never reached a
-                    // device that already held a pack (HIL: image_ids stuck at
-                    // 0 while the cloud change_log had advanced). Mirror the
-                    // word lane: one coalesced manifest check per sync cycle;
-                    // an unchanged manifest ends the round trip immediately.
-                    note_pack_refresh_pending = true;
-                    // Problem sets ride the same cadence: the manifest sha
-                    // comparison keeps unchanged packs download-free.
-                    problem_pack_refresh_pending = true;
-                }
-            }
+        bool problem_bulk_completed = false;
+        wqn::services::SyncEvent sync_event;
+        wqn::services::GetLatestSyncEvent(&sync_event);
+        if (sync_event.sequence != 0 &&
+            sync_event.sequence != last_sync_event_sequence) {
+            last_sync_event_sequence = sync_event.sequence;
+            todo_desired_revision = std::max(
+                todo_desired_revision, sync_event.todo_revision);
+            const device_ui_internal::UiUpdate update =
+                ui_runtime.DispatchSyncResult(sync_event);
+            refresh_schedule = StrongerSchedule(refresh_schedule, update.refresh);
         }
         // [input-capture] Consume up to a small batch of ring events per loop
         // iteration; each one runs the full dispatch path below. Stale-gesture
@@ -594,8 +702,10 @@ void DeviceUiTask(void*)
             wqn::NoteEpdActivity();
             if (state.screen == wqn::UiScreen::kWord ||
                 state.screen == wqn::UiScreen::kNote) {
-                // Both study screens feed a durable outbox; an in-flight upload
-                // batch yields to active input, then resumes after a quiet gap.
+                // Word and Note feed durable outboxes. Problem is an embedded
+                // mode of the Note top-level screen (`problem_app.active`), so
+                // it intentionally shares this exact interaction generation:
+                // all three domains yield an upload batch on active input.
                 wqn::services::NoteWordInteraction();
             }
             poll_delay = kUiPollDelayTicks;
@@ -633,11 +743,14 @@ void DeviceUiTask(void*)
         // consumed the result, so nothing is lost even if a new request is
         // ready to fire the instant Finish* clears busy.
         {
-            static const device_ui_internal::CloudDomain kResultDomains[4] = {
+            static const device_ui_internal::CloudDomain kResultDomains[7] = {
                 device_ui_internal::CloudDomain::kTodo,
                 device_ui_internal::CloudDomain::kWord,
                 device_ui_internal::CloudDomain::kNote,
                 device_ui_internal::CloudDomain::kProblem,
+                device_ui_internal::CloudDomain::kWordBulk,
+                device_ui_internal::CloudDomain::kNoteBulk,
+                device_ui_internal::CloudDomain::kProblemBulk,
             };
             // [persist-worker] Unified pending gate: commit_state == kPersisting
             // spans the whole answer (button Prepare -> worker Apply), so it
@@ -670,11 +783,13 @@ void DeviceUiTask(void*)
                 // domain busy (xxx_cloud_completed stays false, so no Finish);
                 // the persist result is applied+acked just below this scan, so
                 // next iteration this result merges onto the advanced session.
-                if (result_domain == device_ui_internal::CloudDomain::kWord &&
+                if ((result_domain == device_ui_internal::CloudDomain::kWord ||
+                     result_domain == device_ui_internal::CloudDomain::kWordBulk) &&
                     word_commit_pending) {
                     continue;
                 }
-                if (result_domain == device_ui_internal::CloudDomain::kNote &&
+                if ((result_domain == device_ui_internal::CloudDomain::kNote ||
+                     result_domain == device_ui_internal::CloudDomain::kNoteBulk) &&
                     note_commit_pending) {
                     continue;
                 }
@@ -690,6 +805,27 @@ void DeviceUiTask(void*)
                         const device_ui_internal::TodoCloudResult* todo_result =
                             device_ui_internal::PeekTodoCloudResult(ready.generation);
                         if (todo_result != nullptr) {
+                            if (todo_result->content_target_revision != 0) {
+                                if (todo_result->result == ESP_OK) {
+                                    todo_applied_revision = std::max(
+                                        todo_applied_revision,
+                                        todo_result->content_target_revision);
+                                    todo_retry_attempt = 0;
+                                    todo_retry_not_before_ms = 0;
+                                } else {
+                                    if (todo_retry_attempt < 7) {
+                                        ++todo_retry_attempt;
+                                    }
+                                    const uint8_t shift =
+                                        todo_retry_attempt == 0
+                                            ? 0
+                                            : todo_retry_attempt - 1;
+                                    const uint32_t delay_ms = std::min<uint32_t>(
+                                        5000u << shift, 300000u);
+                                    todo_retry_not_before_ms =
+                                        esp_timer_get_time() / 1000 + delay_ms;
+                                }
+                            }
                             const device_ui_internal::UiUpdate update =
                                 ui_runtime.DispatchTodoCloudResult(*todo_result);
                             refresh_schedule =
@@ -700,10 +836,16 @@ void DeviceUiTask(void*)
                         }
                         break;
                     }
-                    case device_ui_internal::CloudDomain::kWord: {
-                        word_cloud_completed = true;
+                    case device_ui_internal::CloudDomain::kWord:
+                    case device_ui_internal::CloudDomain::kWordBulk: {
+                        if (ready.domain == device_ui_internal::CloudDomain::kWord) {
+                            word_cloud_completed = true;
+                        } else {
+                            word_bulk_completed = true;
+                        }
                         device_ui_internal::WordCloudResult* word_result =
-                            device_ui_internal::PeekWordCloudResult(ready.generation);
+                            device_ui_internal::PeekWordCloudResult(
+                                ready.domain, ready.generation);
                         if (word_result != nullptr) {
                             const device_ui_internal::UiUpdate update =
                                 ui_runtime.DispatchWordCloudResult(*word_result);
@@ -715,10 +857,16 @@ void DeviceUiTask(void*)
                         }
                         break;
                     }
-                    case device_ui_internal::CloudDomain::kNote: {
-                        note_cloud_completed = true;
+                    case device_ui_internal::CloudDomain::kNote:
+                    case device_ui_internal::CloudDomain::kNoteBulk: {
+                        if (ready.domain == device_ui_internal::CloudDomain::kNote) {
+                            note_cloud_completed = true;
+                        } else {
+                            note_bulk_completed = true;
+                        }
                         device_ui_internal::NoteCloudResult* note_result =
-                            device_ui_internal::PeekNoteCloudResult(ready.generation);
+                            device_ui_internal::PeekNoteCloudResult(
+                                ready.domain, ready.generation);
                         if (note_result != nullptr) {
                             const device_ui_internal::UiUpdate update =
                                 ui_runtime.DispatchNoteCloudResult(*note_result);
@@ -730,10 +878,16 @@ void DeviceUiTask(void*)
                         }
                         break;
                     }
-                    case device_ui_internal::CloudDomain::kProblem: {
-                        problem_cloud_completed = true;
+                    case device_ui_internal::CloudDomain::kProblem:
+                    case device_ui_internal::CloudDomain::kProblemBulk: {
+                        if (ready.domain == device_ui_internal::CloudDomain::kProblem) {
+                            problem_cloud_completed = true;
+                        } else {
+                            problem_bulk_completed = true;
+                        }
                         device_ui_internal::ProblemCloudResult* problem_result =
-                            device_ui_internal::PeekProblemCloudResult(ready.generation);
+                            device_ui_internal::PeekProblemCloudResult(
+                                ready.domain, ready.generation);
                         if (problem_result != nullptr) {
                             const device_ui_internal::UiUpdate update =
                                 ui_runtime.DispatchProblemCloudResult(*problem_result);
@@ -812,8 +966,10 @@ void DeviceUiTask(void*)
             }
         }
 
+        const int64_t now_ms = esp_timer_get_time() / 1000;
+
         // [persist-worker] Drain the async settings save results (c4). Success
-        // installs the value + "已保存" (auto-sync also kicks RequestSyncNow);
+        // installs the value + "已保存" and re-arms the durable schedule;
         // failure keeps the displayed value and asks for a re-Confirm.
         {
             device_ui_internal::PersistResultReceipt settings_persist;
@@ -827,6 +983,18 @@ void DeviceUiTask(void*)
                     StrongerSchedule(refresh_schedule, persist_update.refresh);
                 device_ui_internal::AckPersistResult(
                     device_ui_internal::PersistKind::kSettingsAutoSync,
+                    settings_persist.generation, settings_persist.operation_id);
+            }
+            if (device_ui_internal::TakePersistResultToApply(
+                    device_ui_internal::PersistKind::kSettingsImageRender,
+                    &settings_persist)) {
+                const device_ui_internal::UiUpdate persist_update =
+                    ui_runtime.DispatchImageRenderSaveResult(
+                        settings_persist.result, settings_persist.operation_id);
+                refresh_schedule =
+                    StrongerSchedule(refresh_schedule, persist_update.refresh);
+                device_ui_internal::AckPersistResult(
+                    device_ui_internal::PersistKind::kSettingsImageRender,
                     settings_persist.generation, settings_persist.operation_id);
             }
             if (device_ui_internal::TakePersistResultToApply(
@@ -853,9 +1021,46 @@ void DeviceUiTask(void*)
                     device_ui_internal::PersistKind::kSettingsDefaultDeck,
                     settings_persist.generation, settings_persist.operation_id);
             }
+            // [ai-follow] Durable follow toggle: installs the armed choice and
+            // pushes it to the worker, or asks for a re-Confirm.
+            if (device_ui_internal::TakePersistResultToApply(
+                    device_ui_internal::PersistKind::kSettingsAiFollow,
+                    &settings_persist)) {
+                const device_ui_internal::UiUpdate persist_update =
+                    ui_runtime.DispatchAiFollowSaveResult(
+                        settings_persist.result, settings_persist.operation_id);
+                refresh_schedule =
+                    StrongerSchedule(refresh_schedule, persist_update.refresh);
+                device_ui_internal::AckPersistResult(
+                    device_ui_internal::PersistKind::kSettingsAiFollow,
+                    settings_persist.generation, settings_persist.operation_id);
+            }
+            // [detail] Agent detail tier: no Confirm gesture, so the write is
+            // submitted by a debounce hook below. A failure only logs (the
+            // status bar already shows the value the user picked) and the hook
+            // retries.
+            if (device_ui_internal::TakePersistResultToApply(
+                    device_ui_internal::PersistKind::kSettingsAgentDetail,
+                    &settings_persist)) {
+                const device_ui_internal::UiUpdate persist_update =
+                    ui_runtime.DispatchAgentDetailSaveResult(
+                        settings_persist.result, settings_persist.operation_id,
+                        now_ms);
+                refresh_schedule =
+                    StrongerSchedule(refresh_schedule, persist_update.refresh);
+                device_ui_internal::AckPersistResult(
+                    device_ui_internal::PersistKind::kSettingsAgentDetail,
+                    settings_persist.generation, settings_persist.operation_id);
+            }
+            // [detail] Per-tick debounce hook (runs whether or not anything was
+            // drained): submits the pending tier once it has been stable for a
+            // window, and retries a rejected/failed write the same way.
+            const device_ui_internal::UiUpdate detail_persist_update =
+                ui_runtime.DispatchAgentDetailPersist(now_ms);
+            refresh_schedule =
+                StrongerSchedule(refresh_schedule, detail_persist_update.refresh);
         }
 
-        const int64_t now_ms = esp_timer_get_time() / 1000;
         const device_ui_internal::UiUpdate time_update =
             ui_runtime.DispatchTimeTick(now_ms);
         refresh_schedule = StrongerSchedule(refresh_schedule, time_update.refresh);
@@ -911,6 +1116,24 @@ wqn::AiStreamingStatusView streaming_view{};
         }
 #endif
 
+        wqn::AgentSessionState agent_snapshot;
+        if (wqn::CopyOpenCodeSessionToUi(&agent_snapshot)) {
+            const device_ui_internal::UiUpdate update =
+                ui_runtime.DispatchAgentSnapshot(agent_snapshot);
+            refresh_schedule = StrongerSchedule(refresh_schedule, update.refresh);
+        }
+
+        // [follow] Auto-follow step. Runs on EVERY tick (not only when a
+        // refresh is already pending): the whole point is to notice that the
+        // answer body landed and move the viewport without waiting for another
+        // event. Placed after both session snapshots -- it reads their flags --
+        // and before the render below, which must see the offset it writes.
+        {
+            const device_ui_internal::UiUpdate update =
+                ui_runtime.DispatchAiViewportFollow();
+            refresh_schedule = StrongerSchedule(refresh_schedule, update.refresh);
+        }
+
         const std::string clock_label = CurrentClockLabel();
         if (clock_label != last_clock_label) {
             last_clock_label = clock_label;
@@ -919,8 +1142,17 @@ wqn::AiStreamingStatusView streaming_view{};
             // state.time_app / home.primary_time_line above, but the on-screen
             // pixels are already correct -- suppress the refresh request so we
             // don't fall into the deep-sleep-induced forced-full-refresh path.
+            // A minute tick and the default deep-sleep idle threshold both
+            // occur at 60 seconds. Letting this cosmetic refresh acquire the
+            // display SleepLease first can starve quiesce forever: every
+            // minute creates another render just as sleep becomes eligible.
+            // Keep state.time_app current, but yield the panel update once the
+            // battery-powered device is actually ready to sleep. A timer wake
+            // still renders the current minute through the initial-refresh
+            // path before this loop runs.
             const bool minute_changed_on_panel =
-                !ShouldSkipMinuteTickRefresh(state.screen, clock_label.c_str());
+                !ShouldSkipMinuteTickRefresh(state.screen, clock_label.c_str()) &&
+                !wqn::ShouldYieldClockRefreshToDeepSleep();
             const device_ui_internal::UiUpdate update =
                 ui_runtime.DispatchClockMinute(minute_changed_on_panel);
             refresh_schedule = StrongerSchedule(refresh_schedule, update.refresh);
@@ -929,6 +1161,9 @@ wqn::AiStreamingStatusView streaming_view{};
         const TickType_t now = xTaskGetTickCount();
         const bool status_reload_due =
             now - last_status_refresh >= kStatusRefreshDelayTicks;
+        const bool retained_standby_candidate =
+            refresh_schedule == RefreshSchedule::kNone &&
+            RetainedStandbyIdleWindow(state);
         const bool interaction_quiet =
             esp_timer_get_time() - g_last_active_us_local >=
             kStatusReloadInteractionQuietUs;
@@ -962,7 +1197,8 @@ wqn::AiStreamingStatusView streaming_view{};
         // [hang-fix] Surface domains stuck busy past their lane budget; a
         // silent stuck domain looks identical to "cloud slow" from the UI.
         device_ui_internal::WarnStuckCloudDomains();
-        if (status_reload_due && refresh_schedule == RefreshSchedule::kNone &&
+        if (status_reload_due && !retained_standby_candidate &&
+            refresh_schedule == RefreshSchedule::kNone &&
             !button_consumed_this_iter && interaction_quiet && cloud_quiet &&
             persist_quiet) {
             if (state.screen != wqn::UiScreen::kWord) {
@@ -972,7 +1208,8 @@ wqn::AiStreamingStatusView streaming_view{};
                 // its session has one live owner and receives typed sync
                 // events, so reloading every persistent domain is stale work.
                 g_ui_reload_snapshot = state;
-                device_ui_internal::LoadUiState(&g_ui_reload_snapshot);
+                device_ui_internal::LoadUiState(
+                    &g_ui_reload_snapshot, /*restore_screen_from_rtc=*/false);
                 const device_ui_internal::UiUpdate update =
                     ui_runtime.DispatchStatusReload(
                         std::move(g_ui_reload_snapshot));
@@ -1053,9 +1290,25 @@ wqn::AiStreamingStatusView streaming_view{};
                     } else {
                         last_flash_render_ms = now_ms_d;
                     }
+                } else if (state.screen == wqn::UiScreen::kAi &&
+                           state.ai.tier == wqn::AiTier::kAgent &&
+                           (state.agent.stream_active ||
+                            state.agent.ui.phase == wqn::AiFeaturePhase::kTranscribing)) {
+                    // Agent events can arrive at token/tool cadence. A 500 ms
+                    // sampling floor keeps EPD partial refreshes bounded.
+                    // [voice-pipe] The voice-transcribe phase streams ASR
+                    // deltas into the pending bubble, so it coalesces under the
+                    // same floor.
+                    static int64_t last_agent_render_ms = 0;
+                    const int64_t now_ms_d = esp_timer_get_time() / 1000;
+                    if (now_ms_d - last_agent_render_ms < 500) {
+                        skip_for_throttle = true;
+                    } else {
+                        last_agent_render_ms = now_ms_d;
+                    }
                 }
                 if (skip_for_throttle) {
-                    ESP_LOGI(kTag, "Flash refresh throttled (coalescing streaming deltas)");
+                    ESP_LOGI(kTag, "stream refresh throttled (coalescing deltas)");
                     pending_refresh_schedule = StrongerSchedule(
                         pending_refresh_schedule, refresh_schedule);
                     display_tracking.force_next_submission = force_submission;
@@ -1098,11 +1351,20 @@ wqn::AiStreamingStatusView streaming_view{};
         if (word_cloud_completed) {
             FinishWordCloudRequest();
         }
+        if (word_bulk_completed) {
+            FinishWordCloudRequest(device_ui_internal::CloudDomain::kWordBulk);
+        }
         if (note_cloud_completed) {
             FinishNoteCloudRequest();
         }
+        if (note_bulk_completed) {
+            FinishNoteCloudRequest(device_ui_internal::CloudDomain::kNoteBulk);
+        }
         if (problem_cloud_completed) {
             FinishProblemCloudRequest();
+        }
+        if (problem_bulk_completed) {
+            FinishProblemCloudRequest(device_ui_internal::CloudDomain::kProblemBulk);
         }
         device_ui_internal::PumpWordCandidatePrefetch(&ui_runtime);
         pending_refresh_schedule = device_ui_internal::StrongerSchedule(
@@ -1134,24 +1396,19 @@ wqn::AiStreamingStatusView streaming_view{};
         pending_refresh_schedule = device_ui_internal::StrongerSchedule(
             pending_refresh_schedule,
             device_ui_internal::PumpProblemVerdictCommit(&ui_runtime));
-        if (word_pack_refresh_pending &&
-            !device_ui_internal::IsWordCloudBusy() &&
-            device_ui_internal::QueueWordReviewRefresh()) {
-            word_pack_refresh_pending = false;
-            ESP_LOGI(kTag, "queued coalesced word pack refresh after sync");
+        // Content convergence is level-triggered by SyncCoordinator's durable
+        // desired/applied journal. Bulk has independent admission/result
+        // slots, so an image/session request cannot suppress convergence and
+        // a multi-MB pack transfer cannot block interactive work.
+        const int64_t todo_now_ms = esp_timer_get_time() / 1000;
+        if (todo_desired_revision > todo_applied_revision &&
+            todo_now_ms >= todo_retry_not_before_ms) {
+            device_ui_internal::QueueTodoRefreshForRevision(
+                todo_desired_revision);
         }
-        if (note_pack_refresh_pending &&
-            !device_ui_internal::IsNoteCloudBusy() &&
-            device_ui_internal::QueueNotePackSync()) {
-            note_pack_refresh_pending = false;
-            ESP_LOGI(kTag, "queued coalesced note pack refresh after sync");
-        }
-        if (problem_pack_refresh_pending &&
-            !device_ui_internal::IsProblemCloudBusy() &&
-            device_ui_internal::QueueProblemPackSync()) {
-            problem_pack_refresh_pending = false;
-            ESP_LOGI(kTag, "queued coalesced problem pack refresh after sync");
-        }
+        device_ui_internal::QueueWordReviewRefresh();
+        device_ui_internal::QueueNotePackSync();
+        device_ui_internal::QueueProblemPackSync();
 
         // [epd-owner] Idle power-off / heavy-partial cleanup is the EPD refresh
         // task's job now (it is the sole panel owner). The UI task only asks;
@@ -1161,21 +1418,38 @@ wqn::AiStreamingStatusView streaming_view{};
         // cleanup full refresh no longer blocks the UI task.
         device_ui_internal::RequestEpdIdleMaintenance();
 
-        // Automatic light sleep is owned by ESP-IDF tickless idle. SleepLease
-        // maps active service work to ESP_PM_NO_LIGHT_SLEEP; GPIO17 sleep-mode
-        // selection is disabled by the Note4 HAL.
-        vTaskDelay(pdMS_TO_TICKS(10));
-
         g_rtc_screen_val = static_cast<int>(state.screen);
-        const bool enable_timer_wakeup = (state.screen == wqn::UiScreen::kHome ||
-                                          state.screen == wqn::UiScreen::kTime);
-        wqn::SetDeepSleepTimerWakePreference(enable_timer_wakeup);
+        wqn::SetDeepSleepUiPolicy(DeepSleepPolicyForUiState(state));
 
         const int64_t idle_ms = (esp_timer_get_time() - g_last_active_us_local) / 1000;
         const bool screen_active = (state.screen == wqn::UiScreen::kTime ||
                                     state.screen == wqn::UiScreen::kAi ||
                                     state.screen == wqn::UiScreen::kWord);
-        if (refresh_schedule != RefreshSchedule::kNone || screen_active) {
+        const bool todo_convergence_due =
+            todo_desired_revision > todo_applied_revision &&
+            esp_timer_get_time() / 1000 >= todo_retry_not_before_ms;
+        const bool retained_standby_ready =
+            refresh_schedule == RefreshSchedule::kNone &&
+            pending_refresh_schedule == RefreshSchedule::kNone &&
+            !todo_convergence_due &&
+            CanWaitInRetainedStandby(state);
+        // Keep the managed retained-standby state armed across selective
+        // minute/sync/display work. Its SleepLease temporarily prevents light
+        // sleep; treating that short wake as a standby exit would spam the RTC
+        // diagnostic ring twice per minute and obscure real user exits.
+        wqn::SetRetainedStandbyUiReady(RetainedStandbyIdleWindow(state));
+
+        if (retained_standby_ready) {
+            // Automatic ESP-PM light sleep owns the actual sleep entry. The
+            // UI contributes only real deadlines, so GPIO input/cloud/sync/
+            // persist notifications remain ordinary FreeRTOS wakeups and all
+            // RAM/PSRAM/framebuffer state stays live.
+            poll_delay = RetainedStandbyWaitTicks(
+                state,
+                todo_desired_revision,
+                todo_applied_revision,
+                todo_retry_not_before_ms);
+        } else if (refresh_schedule != RefreshSchedule::kNone || screen_active) {
             poll_delay = kUiPollDelayTicks;
         } else if (idle_ms < 3000) {
             poll_delay = kUiPollDelayTicks;
@@ -1184,10 +1458,9 @@ wqn::AiStreamingStatusView streaming_view{};
         }
 
         // [input-capture] Wait for the next button/cloud/sync notify or the
-        // poll deadline, whichever comes first. The button task, Send*Result
-        // and the sync-event sink all NotifyUiTask on arrival, so a queued
-        // event is consumed within one scheduler hop instead of up to the
-        // 500 ms idle poll period.
+        // nearest real deadline. Before retained standby the short timeout
+        // preserves legacy pump/tick behavior; in retained standby the wait is
+        // minute/retry/notification driven and may be indefinite.
         ulTaskNotifyTake(pdTRUE, poll_delay);
     }
 }
@@ -1237,18 +1510,6 @@ esp_err_t StartDeviceUiIfEnabled()
     const esp_err_t display_result = EnsureDisplayPipelineStarted();
     if (display_result != ESP_OK) {
         return display_result;
-    }
-
-    if (g_sync_event_queue == nullptr) {
-        g_sync_event_queue = xQueueCreateStatic(
-            kSyncEventQueueDepth,
-            sizeof(wqn::services::SyncEvent),
-            g_sync_event_queue_buffer,
-            &g_sync_event_queue_storage);
-        if (g_sync_event_queue == nullptr) {
-            return ESP_ERR_NO_MEM;
-        }
-        wqn::services::SetSyncEventSink(UiSyncEventSink);
     }
 
     // One two-lane runner replaces the three per-domain cloud tasks; see

@@ -63,6 +63,8 @@ struct ManifestSet {
 struct ManifestData {
     uint64_t cursor = 0;
     bool has_more = false;
+    uint64_t revision = 0;
+    std::string snapshot_id;
     std::vector<ManifestSet> problem_sets;
 };
 
@@ -100,7 +102,8 @@ esp_err_t BuildManifestRequest(
     const v3::RequestMetadata& metadata,
     uint64_t cursor,
     int limit,
-    std::string* body);
+    std::string* body,
+    const std::string& snapshot_id = {});
 esp_err_t BuildObservationRequest(
     const ObservationRequest& request,
     std::string* body);

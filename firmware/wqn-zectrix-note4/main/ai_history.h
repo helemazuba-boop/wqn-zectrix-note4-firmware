@@ -1,5 +1,6 @@
 // AI conversation history: PSRAM-backed ring buffer for chat messages and tool blocks.
-// Rebuilt each boot — no NVS persistence. STD/Pro and Flash use independent histories.
+// Rebuilt each boot — no NVS persistence. STD/Pro, Flash and Agent (OpenCode)
+// use independent histories.
 
 #pragma once
 
@@ -29,9 +30,14 @@ enum class ChatMessageKind : uint8_t {
     kToolResult,
 };
 
+// [agent] One channel per AI-page tier. kAgent carries the OpenCode gateway
+// conversation, which shares the chat bubble / markdown / tool-block renderer
+// with kStdPro but must never be merged into it: the two backends answer the
+// same prompts with completely different content and lifetimes.
 enum class AiHistoryChannel : uint8_t {
     kStdPro,
     kFlash,
+    kAgent,
 };
 
 struct ChatMessage {
@@ -121,6 +127,10 @@ private:
 
     PsramMemoryResource heap_;
     std::deque<ChatMessage> messages_;
+    // Built lazily and reused until revision_ changes. Protected by mutex_.
+    // UiFrame instances keep their own shared reference after the lock drops.
+    mutable std::shared_ptr<const AiHistorySnapshot> cached_snapshot_;
+    mutable uint64_t cached_snapshot_revision_ = UINT64_MAX;
     mutable StaticSemaphore_t mutex_storage_{};
     mutable SemaphoreHandle_t mutex_ = nullptr;
     size_t byte_size_ = 0;
