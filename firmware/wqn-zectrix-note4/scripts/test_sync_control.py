@@ -12,10 +12,15 @@ from test_sync_retry import section
 def main():
     root = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--mutation', choices=('mutable-sync-metadata', 'publish-before-commit'))
+    parser.add_argument('--mutation', choices=('mutable-sync-metadata', 'publish-before-commit',
+                                               'drop-local-retry', 'early-completion', 'cache-failed-write',
+                                               'replay-successful-rpc'))
     args = parser.parse_args()
     sync = (root / 'main/services/sync_service.cpp').read_text()
     store = (root / 'main/storage.cpp').read_text()
+    dispatch = section(sync, 'void SyncServiceTask(', '\n#endif  // CONFIG_WQN_WIFI_STA_ENABLE')
+    if dispatch.index('RetryCachedControlResponseIfDue();') >= dispatch.index('AcquireConnectivityDemand('):
+        raise SystemExit('FAIL: local control commit is behind connectivity admission')
     boundaries = [
         (sync, 'class SyncJournalLock {', '\nsize_t ContentDomainIndex('),
         (sync, 'size_t ContentDomainIndex(', '\nstd::time_t CurrentUnixSeconds()'),
@@ -24,15 +29,20 @@ def main():
         (sync, 'wqn::services::SyncContentSnapshot* ContentSnapshotForKind(', '\nvoid WordOutboxTimerCallback('),
         (sync, 'std::string g_bootstrap_request_id;', '\nwqn::protocol::v3::ClaimKeyPair'),
         (sync, 'void CopyOutboxRetryCheckpoint(', '\nvoid SetOutboxProtocolSuspended('),
+        (sync, 'void SetOutboxProtocolSuspended(', '\nvoid ResetWordOutboxRetryBackoff('),
         (sync, 'esp_err_t EnsureControlStateLoaded()', '\nstd::string RandomControlId('),
         (sync, 'wqn::protocol::v3::RequestMetadata MakeControlMetadata()', '\nstd::string DeviceHardwareId('),
         (store, 'esp_err_t JsonToString(', '\nesp_err_t ReadStorageTextFile('),
-        (store, 'void AddJournalContentState(', '\nbool ReadJournalU64('),
-        (store, 'esp_err_t SaveSyncJournalRaw(', '\nesp_err_t SaveSyncJournalTransaction('),
+        (store, 'void AddJournalContentState(', '\nesp_err_t RemovePrototypeProblemFile('),
+        (store, 'std::string g_sync_journal_durable_payload;', '\nstruct SyncJournalSaveContext'),
+        (sync, 'TickType_t SchedulerWaitDelay()', '\nuint32_t FullSyncFailureRetryMs('),
         (sync, 'esp_err_t BootstrapControlV3(', '\n#endif\n\n#if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE\nWordOutboxUploadState UploadPendingWordObservations('),
     ]
     parts = [section(*item) for item in boundaries]
-    public = section(sync, 'esp_err_t BeginContentInstall(', '\nvoid NoteWordInteraction(')
+    for domain in ('Word', 'Note', 'Problem'):
+        parts.append(section(sync, f'void Reset{domain}OutboxRetryBackoff()',
+                             f'\nTickType_t {domain}OutboxRetryWaitDelay()'))
+    public = section(sync, 'SyncContentTicket TryClaimContentRefresh(', '\nvoid NoteWordInteraction(')
     parts.append('namespace wqn::services {\n' + public + '\n}')
     fixture = (root / 'scripts/testdata/sync_control.cpp').read_text()
     configs = {
@@ -54,6 +64,18 @@ def main():
         if fixture.count(needle) != 1:
             raise SystemExit('FAIL: publication mutation drift')
         fixture = fixture.replace(needle, 'g_config_revision=checkpoint.config_revision; g_sync_cursor=checkpoint.sync_cursor; PublishContentTargets(targets);\n    '+needle)
+    for mutation, needle, replacement in (
+        ('drop-local-retry', 'else JournalCommitFailedLocked();', 'else {}'),
+        ('early-completion', 'g_content_completed_snapshot[index] = completed;',
+         '*live_snapshot = completed; g_content_completed_snapshot[index] = completed;'),
+        ('cache-failed-write', 'g_sync_journal_durable_payload_valid = false;\n    }',
+         'g_sync_journal_durable_payload = payload; g_sync_journal_durable_payload_valid = true;\n    }'),
+        ('replay-successful-rpc', 'if (!g_sync_response_ready) {', 'if (true) {'),
+    ):
+        if args.mutation == mutation:
+            if fixture.count(needle) != 1:
+                raise SystemExit(f'FAIL: mutation drift: {mutation}')
+            fixture = fixture.replace(needle, replacement)
     cjson = Path(os.environ.get('IDF_PATH', '/home/unknow/esp/esp-idf-v5.5')) / 'components/json/cJSON'
     if not (cjson / 'cJSON.c').is_file():
         raise SystemExit('FAIL: activate the project ESP-IDF environment for cJSON')

@@ -74,6 +74,7 @@ constexpr char kStorageBasePath[] = "/storage";
 constexpr char kSyncJournalPath[] = "/storage/sync_journal.json";
 constexpr char kSyncJournalTempPath[] = "/storage/sync_journal.tmp";
 constexpr char kSyncJournalBackupPath[] = "/storage/sync_journal.bak";
+constexpr size_t kSyncJournalMaxBytes = 8192;
 constexpr size_t kPackGcAttemptBytes = 1024U * 1024U;
 constexpr time_t kStaleTempAgeSeconds = 5 * 60;
 
@@ -552,6 +553,10 @@ esp_err_t ReadStorageTextFile(const char* path, std::string* output)
         return ESP_FAIL;
     }
     const long length = std::ftell(file);
+    if (length >= 0 && static_cast<size_t>(length) > kSyncJournalMaxBytes) {
+        std::fclose(file);
+        return ESP_ERR_INVALID_STATE;
+    }
     if (length < 0 || std::fseek(file, 0, SEEK_SET) != 0) {
         std::fclose(file);
         return ESP_FAIL;
@@ -565,6 +570,8 @@ esp_err_t ReadStorageTextFile(const char* path, std::string* output)
     }
     return std::fclose(file) == 0 ? ESP_OK : ESP_FAIL;
 }
+
+esp_err_t ParseSyncJournalPayload(const std::string& payload, wqn::SyncJournal* journal);
 
 esp_err_t WriteSyncJournalFileAtomic(const std::string& payload)
 {
@@ -581,13 +588,31 @@ esp_err_t WriteSyncJournalFileAtomic(const std::string& payload)
         std::remove(kSyncJournalTempPath);
         return ESP_FAIL;
     }
-    std::remove(kSyncJournalBackupPath);
-    if (std::rename(kSyncJournalPath, kSyncJournalBackupPath) != 0 && errno != ENOENT) {
+    // Never rotate a corrupt primary over the valid backup we recovered from.
+    // Until the new primary is published, retain at least the previous valid
+    // source. API-call fault seams verify this ordering, not NOR power safety.
+    std::string previous_payload;
+    wqn::SyncJournal previous;
+    const esp_err_t read_result = ReadStorageTextFile(kSyncJournalPath, &previous_payload);
+    const bool primary_valid = read_result == ESP_OK &&
+        ParseSyncJournalPayload(previous_payload, &previous) == ESP_OK;
+    if (read_result != ESP_OK && read_result != ESP_ERR_NOT_FOUND &&
+        read_result != ESP_ERR_INVALID_STATE) {
+        std::remove(kSyncJournalTempPath);
+        return ESP_FAIL;
+    }
+    if (primary_valid) {
+        if ((std::remove(kSyncJournalBackupPath) != 0 && errno != ENOENT) ||
+            std::rename(kSyncJournalPath, kSyncJournalBackupPath) != 0) {
+            std::remove(kSyncJournalTempPath);
+            return ESP_FAIL;
+        }
+    } else if (std::remove(kSyncJournalPath) != 0 && errno != ENOENT) {
         std::remove(kSyncJournalTempPath);
         return ESP_FAIL;
     }
     if (std::rename(kSyncJournalTempPath, kSyncJournalPath) != 0) {
-        std::rename(kSyncJournalBackupPath, kSyncJournalPath);
+        if (primary_valid) std::rename(kSyncJournalBackupPath, kSyncJournalPath);
         return ESP_FAIL;
     }
     return ESP_OK;
@@ -614,7 +639,7 @@ void AddJournalContentState(cJSON* parent, const char* key,
         static_cast<double>(state.retry_not_before_unix_seconds));
     cJSON_AddStringToObject(object, "desired_snapshot_id", state.desired_snapshot_id);
     cJSON_AddStringToObject(object, "active_snapshot_id", state.active_snapshot_id);
-    cJSON_AddItemToObject(parent, key, object);
+    if (!cJSON_AddItemToObject(parent, key, object)) cJSON_Delete(object);
 }
 
 void AddJournalRetryState(cJSON* parent, const char* key,
@@ -629,7 +654,7 @@ void AddJournalRetryState(cJSON* parent, const char* key,
         "not_before_unix_seconds",
         static_cast<double>(state.not_before_unix_seconds));
     cJSON_AddNumberToObject(object, "attempt", state.attempt);
-    cJSON_AddItemToObject(parent, key, object);
+    if (!cJSON_AddItemToObject(parent, key, object)) cJSON_Delete(object);
 }
 
 void AddJournalOutboxRetryState(
@@ -648,7 +673,7 @@ void AddJournalOutboxRetryState(
         static_cast<double>(state.not_before_unix_seconds));
     cJSON_AddNumberToObject(object, "attempt", state.attempt);
     cJSON_AddNumberToObject(object, "cause", state.cause);
-    cJSON_AddItemToObject(parent, key, object);
+    if (!cJSON_AddItemToObject(parent, key, object)) cJSON_Delete(object);
 }
 
 bool ReadJournalU64(cJSON* object, const char* key, uint64_t* value)
@@ -713,7 +738,10 @@ bool ReadJournalContentState(cJSON* parent, const char* key,
     }
     const std::string desired_snapshot = ReadJournalString(object, "desired_snapshot_id");
     const std::string active_snapshot = ReadJournalString(object, "active_snapshot_id");
-    if (!valid_snapshot_id(desired_snapshot) ||
+    if ((schema >= 2 &&
+         (!cJSON_IsString(cJSON_GetObjectItemCaseSensitive(object, "desired_snapshot_id")) ||
+          !cJSON_IsString(cJSON_GetObjectItemCaseSensitive(object, "active_snapshot_id")))) ||
+        !valid_snapshot_id(desired_snapshot) ||
         !valid_snapshot_id(active_snapshot)) {
         return false;
     }
@@ -761,7 +789,9 @@ bool ReadJournalOutboxRetryState(
     uint64_t attempt = 0;
     uint64_t cause = 0;
     const std::string request_id = ReadJournalString(object, "request_id");
-    if (!cJSON_IsObject(object) || request_id.size() > 64 ||
+    if (!cJSON_IsObject(object) ||
+        !cJSON_IsString(cJSON_GetObjectItemCaseSensitive(object, "request_id")) ||
+        request_id.size() > 64 ||
         !ReadJournalU64(object, "not_before_unix_seconds", &not_before) ||
         !ReadJournalU64(object, "attempt", &attempt) ||
         !ReadJournalU64(object, "cause", &cause) || attempt > UINT8_MAX ||
@@ -1360,17 +1390,41 @@ esp_err_t LoadSyncJournal(SyncJournal* journal)
 }
 
 namespace {
+// StorageService owns these bytes. Never seed them from RAM intent or a
+// fallback backup: the first save after boot must repair/create the primary.
+std::string g_sync_journal_durable_payload;
+bool g_sync_journal_durable_payload_valid = false;
+
+uint32_t SyncJournalPayloadHash(const std::string& payload)
+{
+    // Diagnostic fingerprint only; equality below compares every byte.
+    uint32_t hash = 2166136261u;
+    for (const unsigned char byte : payload) hash = (hash ^ byte) * 16777619u;
+    return hash;
+}
+
 // [storage-single-writer] File-local on purpose: the only supported entry point
 // is SaveSyncJournalThroughStorageService below, so no other task can
 // reintroduce a raw SPIFFS commit outside StorageService. No StorageWriteGuard
 // here on purpose -- the caller's lease already spans the queue wait and this
 // body runs after it was granted, so the commit cannot be refused by a quiesce
 // that started in between. Control state and content intent share this commit.
-esp_err_t SaveSyncJournalRaw(const SyncJournal& journal)
+esp_err_t SaveSyncJournalRaw(const SyncJournal& journal, const char* reason)
 {
+    const int64_t started_us = esp_timer_get_time();
     if (journal.schema_version != 2) {
         return ESP_ERR_INVALID_ARG;
     }
+    const auto terminated = [](const auto& value) {
+        return std::memchr(value, '\0', sizeof(value)) != nullptr;
+    };
+    const auto valid_strings = [&](const SyncJournalContentState& state) {
+        return terminated(state.desired_snapshot_id) && terminated(state.active_snapshot_id);
+    };
+    if (!valid_strings(journal.word_packs) || !valid_strings(journal.note_packs) ||
+        !valid_strings(journal.problem_packs) || !terminated(journal.word_outbox.request_id) ||
+        !terminated(journal.note_outbox.request_id) || !terminated(journal.problem_outbox.request_id) ||
+        !terminated(journal.protocol_blocked_image_id)) return ESP_ERR_INVALID_ARG;
     cJSON* root = cJSON_CreateObject();
     if (root == nullptr) {
         return ESP_ERR_NO_MEM;
@@ -1387,26 +1441,72 @@ esp_err_t SaveSyncJournalRaw(const SyncJournal& journal)
     AddJournalOutboxRetryState(root, "word_outbox", journal.word_outbox);
     AddJournalOutboxRetryState(root, "note_outbox", journal.note_outbox);
     AddJournalOutboxRetryState(root, "problem_outbox", journal.problem_outbox);
-    cJSON_AddStringToObject(
+    const bool blocked_added = cJSON_AddStringToObject(
         root,
         "protocol_blocked_image_id",
-        journal.protocol_blocked_image_id);
+        journal.protocol_blocked_image_id) != nullptr;
     std::string payload;
     const esp_err_t render_result = JsonToString(root, &payload);
     cJSON_Delete(root);
-    if (render_result != ESP_OK) {
-        return render_result;
+    if (render_result != ESP_OK || !blocked_added) {
+        return render_result != ESP_OK ? render_result : ESP_ERR_NO_MEM;
     }
-    return WriteSyncJournalFileAtomic(payload);
+    SyncJournal validated;
+    if (payload.size() > kSyncJournalMaxBytes ||
+        ParseSyncJournalPayload(payload, &validated) != ESP_OK) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    // cJSON's floating-point renderer may round very large integral values.
+    // A readable but different checkpoint is not a successful commit either.
+    const auto same_content_numbers = [](const auto& a, const auto& b) {
+        return a.desired_revision == b.desired_revision &&
+            a.applied_revision == b.applied_revision &&
+            a.retry_not_before_unix_seconds == b.retry_not_before_unix_seconds;
+    };
+    if (validated.config_revision != journal.config_revision ||
+        validated.sync_cursor != journal.sync_cursor ||
+        validated.full_sync_retry.not_before_unix_seconds != journal.full_sync_retry.not_before_unix_seconds ||
+        !same_content_numbers(validated.word_packs, journal.word_packs) ||
+        !same_content_numbers(validated.note_packs, journal.note_packs) ||
+        !same_content_numbers(validated.problem_packs, journal.problem_packs) ||
+        validated.word_outbox.not_before_unix_seconds != journal.word_outbox.not_before_unix_seconds ||
+        validated.note_outbox.not_before_unix_seconds != journal.note_outbox.not_before_unix_seconds ||
+        validated.problem_outbox.not_before_unix_seconds != journal.problem_outbox.not_before_unix_seconds) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    const bool skipped = g_sync_journal_durable_payload_valid &&
+        payload == g_sync_journal_durable_payload;
+    const esp_err_t result = skipped ? ESP_OK : WriteSyncJournalFileAtomic(payload);
+    if (result == ESP_OK) {
+        g_sync_journal_durable_payload = payload;
+        g_sync_journal_durable_payload_valid = true;
+    } else {
+        // A failed rename/restore can still alter primary/backup visibility.
+        g_sync_journal_durable_payload_valid = false;
+    }
+    ESP_LOGI(kTag,
+        "sync journal save: reason=%s outcome=%s bytes=%u payload_hash=%08lx total_us=%lld result=%s",
+        reason == nullptr ? "unspecified" : reason,
+        result != ESP_OK ? "failed" : skipped ? "skipped" : "written",
+        static_cast<unsigned>(payload.size()),
+        static_cast<unsigned long>(SyncJournalPayloadHash(payload)),
+        esp_timer_get_time() - started_us, esp_err_to_name(result));
+    return result;
 }
+
+struct SyncJournalSaveContext {
+    const SyncJournal* journal;
+    const char* reason;
+};
 
 esp_err_t SaveSyncJournalTransaction(void* opaque)
 {
-    return SaveSyncJournalRaw(*static_cast<const SyncJournal*>(opaque));
+    const auto& context = *static_cast<const SyncJournalSaveContext*>(opaque);
+    return SaveSyncJournalRaw(*context.journal, context.reason);
 }
 }  // namespace
 
-esp_err_t SaveSyncJournalThroughStorageService(const SyncJournal& journal)
+esp_err_t SaveSyncJournalThroughStorageService(const SyncJournal& journal, const char* reason)
 {
     // [storage-single-writer] The kStorage lease is taken HERE, on the caller,
     // so it spans the queue wait. A lease acquired only inside the transaction
@@ -1423,9 +1523,10 @@ esp_err_t SaveSyncJournalThroughStorageService(const SyncJournal& journal)
     // Background queue with an unbounded wait: no journal writer owns a UI
     // thread, and a foreground budget could abandon the command while it is
     // still queued and report a marker as failed that will in fact be written.
+    SyncJournalSaveContext context{&journal, reason};
     return services::ExecuteStorageTransactionNamed(
         SaveSyncJournalTransaction,
-        const_cast<SyncJournal*>(&journal),
+        &context,
         "save-sync-journal");
 }
 

@@ -143,7 +143,11 @@ esp_err_t LoadSyncJournal(SyncJournal* journal);
 // from another task. The kStorage lease is held by the caller across the queue
 // wait, so the write is never refused by a quiesce it should have blocked.
 // The raw entry point is file-local on purpose.
-esp_err_t SaveSyncJournalThroughStorageService(const SyncJournal& journal);
+// Exact-byte deduplication is against the last successful commit only. Any
+// failed filesystem commit invalidates that cache. reason is a static label,
+// not a request identity or credential; it is used only for diagnostics.
+esp_err_t SaveSyncJournalThroughStorageService(
+    const SyncJournal& journal, const char* reason = "unspecified");
 
 esp_err_t LoadAutoSyncIntervalMinutes(uint32_t* minutes);
 esp_err_t SaveAutoSyncIntervalMinutes(uint32_t minutes);

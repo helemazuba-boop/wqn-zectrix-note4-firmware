@@ -115,6 +115,11 @@ StaticSemaphore_t g_sync_journal_mutex_storage;
 SemaphoreHandle_t g_sync_journal_mutex = nullptr;
 uint32_t g_content_claim_generation[3] = {};
 uint32_t g_content_active_generation[3] = {};
+bool g_content_completion_pending[3] = {};
+wqn::services::SyncContentSnapshot g_content_completed_snapshot[3] = {};
+std::atomic<int64_t> g_sync_journal_retry_not_before_ms{0};
+std::atomic<int64_t> g_control_journal_retry_not_before_ms{0};
+uint8_t g_sync_journal_retry_attempt = 0;  // journal mutex owns mutation
 
 // [sync-checkpoint] Serialize mutation + snapshot + commit, not just the I/O.
 // Otherwise a content lane can overwrite a control candidate while it saves.
@@ -130,7 +135,7 @@ private:
     bool locked_;
 };
 
-esp_err_t PersistLatestSyncJournalLocked();
+esp_err_t PersistLatestSyncJournalLocked(const char* reason);
 esp_err_t EnsureSyncJournalLoaded();
 
 size_t ContentDomainIndex(wqn::services::SyncContentDomain domain)
@@ -210,7 +215,7 @@ void PersistFullSyncRetryCheckpoint()
         retry_unix_seconds > 0 ? static_cast<uint64_t>(retry_unix_seconds) : 0;
     g_sync_journal.full_sync_retry.attempt = g_full_sync_retry_attempts;
     taskEXIT_CRITICAL(&g_sync_snapshot_lock);
-    if (PersistLatestSyncJournalLocked() != ESP_OK) {
+    if (PersistLatestSyncJournalLocked("full-retry") != ESP_OK) {
         ESP_LOGW(kTag, "full-sync retry journal save failed");
     }
 }
@@ -674,13 +679,94 @@ wqn::SyncJournalContentState* JournalStateForDomain(
     }
 }
 
-esp_err_t PersistLatestSyncJournalLocked()
+void JournalCommitSucceededLocked()
+{
+    g_sync_journal_retry_attempt = 0;
+    g_sync_journal_retry_not_before_ms.store(0, std::memory_order_release);
+    taskENTER_CRITICAL(&g_sync_snapshot_lock);
+    const bool pending =
+        g_control_journal_retry_not_before_ms.load(std::memory_order_acquire) != 0;
+    if (g_sync_snapshot.journal_pending != pending) ++g_sync_snapshot.state_sequence;
+    g_sync_snapshot.journal_pending = pending;
+    for (size_t index = 0; index < 3; ++index) {
+        if (!g_content_completion_pending[index]) continue;
+        const auto domain = static_cast<wqn::services::SyncContentDomain>(index);
+        auto* snapshot = ContentSnapshotForDomain(domain);
+        const auto* journal = JournalStateForDomain(domain);
+        *snapshot = g_content_completed_snapshot[index];
+        // A control response may have raised the target during a failed local
+        // completion. Publish the current durable intent, not a stale copy.
+        snapshot->desired_revision = journal->desired_revision;
+        snapshot->applied_revision = journal->applied_revision;
+        snapshot->phase = static_cast<wqn::services::SyncContentPhase>(journal->phase);
+        snapshot->retry_attempt = journal->retry_attempt;
+        if (journal->phase != wqn::SyncJournalPhase::kBackoff) {
+            snapshot->next_retry_ms = 0;
+            snapshot->last_error[0] = '\0';
+        }
+        g_content_completion_pending[index] = false;
+        ++g_sync_snapshot.state_sequence;
+    }
+    taskEXIT_CRITICAL(&g_sync_snapshot_lock);
+}
+
+void ScheduleLocalJournalRetry(uint8_t* attempt, std::atomic<int64_t>* deadline)
+{
+    constexpr uint32_t delays_ms[] = {5000, 15000, 60000};
+    const size_t index = std::min<size_t>(*attempt, 2);
+    if (*attempt < UINT8_MAX) ++*attempt;
+    deadline->store(
+        esp_timer_get_time() / 1000 + delays_ms[index], std::memory_order_release);
+    taskENTER_CRITICAL(&g_sync_snapshot_lock);
+    g_sync_snapshot.journal_pending = true;
+    ++g_sync_snapshot.state_sequence;
+    taskEXIT_CRITICAL(&g_sync_snapshot_lock);
+    if (g_sync_service_task != nullptr) xTaskNotifyGive(g_sync_service_task);
+}
+
+void JournalCommitFailedLocked()
+{
+    ScheduleLocalJournalRetry(&g_sync_journal_retry_attempt, &g_sync_journal_retry_not_before_ms);
+}
+
+esp_err_t PersistLatestSyncJournalLocked(const char* reason)
 {
     wqn::SyncJournal snapshot;
     taskENTER_CRITICAL(&g_sync_snapshot_lock);
     snapshot = g_sync_journal;
     taskEXIT_CRITICAL(&g_sync_snapshot_lock);
-    return wqn::SaveSyncJournalThroughStorageService(snapshot);
+    const esp_err_t result = wqn::SaveSyncJournalThroughStorageService(snapshot, reason);
+    if (result == ESP_OK) JournalCommitSucceededLocked();
+    else JournalCommitFailedLocked();
+    return result;
+}
+
+TickType_t LocalJournalRetryWaitDelay(const std::atomic<int64_t>& retry_deadline)
+{
+    const int64_t deadline = retry_deadline.load(std::memory_order_acquire);
+    if (deadline == 0) return portMAX_DELAY;
+    const int64_t remaining_ms = deadline - esp_timer_get_time() / 1000;
+    return remaining_ms <= 0 ? 0 : std::max<TickType_t>(1, pdMS_TO_TICKS(remaining_ms));
+}
+
+TickType_t JournalRetryWaitDelay()
+{
+    return LocalJournalRetryWaitDelay(g_sync_journal_retry_not_before_ms);
+}
+
+TickType_t ControlJournalRetryWaitDelay()
+{
+    return LocalJournalRetryWaitDelay(g_control_journal_retry_not_before_ms);
+}
+
+void RetryDirtySyncJournalIfDue()
+{
+    if (JournalRetryWaitDelay() != 0) return;
+    SyncJournalLock journal_lock;
+    if (!journal_lock) return;
+    // Another writer may have committed while we waited for the mutex.
+    if (!g_sync_journal_loaded || JournalRetryWaitDelay() != 0) return;
+    (void)PersistLatestSyncJournalLocked("local-retry");
 }
 
 void PublishContentTargets(
@@ -750,6 +836,7 @@ wqn::protocol::v3::BootstrapData g_bootstrap_response;
 wqn::protocol::v3::SyncData g_sync_response;
 bool g_bootstrap_response_ready = false;
 bool g_sync_response_ready = false;
+uint8_t g_control_journal_retry_attempt = 0;
 
 void ResetControlExchanges()
 {
@@ -762,6 +849,14 @@ void ResetControlExchanges()
     g_bootstrap_response_ready = false;
     g_sync_response_ready = false;
     g_sync_request_auto_interval_minutes = 0;
+    g_control_journal_retry_attempt = 0;
+    g_control_journal_retry_not_before_ms.store(0, std::memory_order_release);
+    taskENTER_CRITICAL(&g_sync_snapshot_lock);
+    const bool pending =
+        g_sync_journal_retry_not_before_ms.load(std::memory_order_acquire) != 0;
+    if (g_sync_snapshot.journal_pending != pending) ++g_sync_snapshot.state_sequence;
+    g_sync_snapshot.journal_pending = pending;
+    taskEXIT_CRITICAL(&g_sync_snapshot_lock);
 }
 wqn::protocol::v3::ClaimKeyPair g_claim_key_pair;
 std::string g_claim_start_request_id;
@@ -1074,7 +1169,7 @@ void PersistOutboxRetryCheckpoint()
     g_sync_journal.note_outbox = note;
     g_sync_journal.problem_outbox = problem;
     taskEXIT_CRITICAL(&g_sync_snapshot_lock);
-    if (PersistLatestSyncJournalLocked() != ESP_OK) {
+    if (PersistLatestSyncJournalLocked("outbox-retry") != ESP_OK) {
         ESP_LOGW(kTag, "outbox retry journal save failed");
     }
 }
@@ -1099,7 +1194,7 @@ void SetOutboxProtocolSuspended(bool suspended)
         "%s",
         blocked_image_id);
     taskEXIT_CRITICAL(&g_sync_snapshot_lock);
-    if (PersistLatestSyncJournalLocked() != ESP_OK) {
+    if (PersistLatestSyncJournalLocked("protocol-latch") != ESP_OK) {
         ESP_LOGW(kTag, "protocol suspension journal save failed");
     }
 }
@@ -1557,7 +1652,7 @@ esp_err_t EnsureSyncJournalLoaded()
     g_sync_journal_loaded = true;
     if (journal_changed) {
         ESP_LOGW(kTag, "sync journal recovered or migrated during startup");
-        result = PersistLatestSyncJournalLocked();
+        result = PersistLatestSyncJournalLocked("startup-recovery");
         if (result != ESP_OK) {
             g_sync_journal_loaded = false;
             return result;
@@ -1622,13 +1717,19 @@ esp_err_t CommitControlResponse(
     }
     // One authority/one durable publication: no NVS cursor can outrun intent.
     // Failed candidates are not installed in RAM or saved by another lane.
-    ESP_RETURN_ON_ERROR(wqn::SaveSyncJournalThroughStorageService(candidate),
-                        kTag, "commit bundled control response");
+    const esp_err_t result = wqn::SaveSyncJournalThroughStorageService(candidate, "control-response");
+    if (result != ESP_OK) {
+        ScheduleLocalJournalRetry(&g_control_journal_retry_attempt, &g_control_journal_retry_not_before_ms);
+        return result;
+    }
     taskENTER_CRITICAL(&g_sync_snapshot_lock);
     g_sync_journal = candidate;
     taskEXIT_CRITICAL(&g_sync_snapshot_lock);
     g_config_revision = checkpoint.config_revision;
     g_sync_cursor = checkpoint.sync_cursor;
+    g_control_journal_retry_attempt = 0;
+    g_control_journal_retry_not_before_ms.store(0, std::memory_order_release);
+    JournalCommitSucceededLocked();
     PublishContentTargets(targets);
     return ESP_OK;
 }
@@ -2144,6 +2245,20 @@ esp_err_t SyncControlPlaneV3(const std::string& token)
         static_cast<unsigned long long>(g_config_revision),
         static_cast<unsigned long long>(g_sync_cursor));
     return ESP_OK;
+}
+void RetryCachedControlResponseIfDue()
+{
+    if ((g_full_sync_reasons.load(std::memory_order_acquire) & kFullSyncCredentials) != 0) {
+        ResetControlExchanges();
+        g_bootstrap_complete = false;
+        return;
+    }
+    if (ControlJournalRetryWaitDelay() != 0) return;
+    // Both entry points skip their RPC when a response is ready. This pump
+    // runs before ConnectivityDemand admission, so offline flash recovery does
+    // not depend on WiFi or replay an already-successful server request.
+    if (g_bootstrap_response_ready) (void)BootstrapControlV3("");
+    else if (g_sync_response_ready) (void)SyncControlPlaneV3("");
 }
 #endif
 
@@ -3190,15 +3305,15 @@ TickType_t OutboxWaitDelay()
 
 TickType_t SchedulerWaitDelay()
 {
-    // Protocol suspension parks the whole scheduler: nothing time-based may
-    // wake it. A manual request may explicitly re-probe the same firmware;
+    // Protocol suspension parks networking, not local checkpoint durability.
+    // A manual request may explicitly re-probe the same firmware;
     // boot/content/credential reasons remain parked until an OTA changes the
     // persisted firmware-version key.
     if (g_outbox_protocol_suspended) {
         return (g_full_sync_reasons.load(std::memory_order_acquire) &
                 kFullSyncManual) != 0
             ? 0
-            : portMAX_DELAY;
+            : std::min(JournalRetryWaitDelay(), ControlJournalRetryWaitDelay());
     }
     if (g_full_sync_reasons.load(std::memory_order_acquire) != 0) {
         return 0;
@@ -3210,7 +3325,8 @@ TickType_t SchedulerWaitDelay()
               g_auto_sync_interval_minutes.load(std::memory_order_acquire));
     return std::min(
         std::min(full_delay, OutboxWaitDelay()),
-        OutboxQuietLeaseWaitDelay());
+        std::min(OutboxQuietLeaseWaitDelay(),
+                 std::min(JournalRetryWaitDelay(), ControlJournalRetryWaitDelay())));
 }
 
 uint32_t FullSyncFailureRetryMs(bool has_token_after_round)
@@ -3251,6 +3367,11 @@ void SyncServiceTask(void*)
     // RAII object across the UI, timer-service and sync tasks.
     wqn::runtime::SleepLease outbox_quiet_lease;
     while (true) {
+        // Local durability retry owns only the storage lease, never WiFi.
+#if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
+        RetryCachedControlResponseIfDue();
+#endif
+        RetryDirtySyncJournalIfDue();
         if (g_outbox_transport_resume_requested.exchange(
                 false, std::memory_order_acq_rel)) {
 #if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
@@ -3750,6 +3871,13 @@ uint32_t SecondsUntilNextSyncWake()
     include_content(g_sync_snapshot.problem_packs);
     taskEXIT_CRITICAL(&g_sync_snapshot_lock);
     next_seconds = std::min(next_seconds, content_seconds);
+    const TickType_t journal_ticks = std::min(
+        JournalRetryWaitDelay(), ControlJournalRetryWaitDelay());
+    if (journal_ticks != portMAX_DELAY) {
+        next_seconds = std::min(next_seconds, static_cast<uint32_t>(
+            std::max<uint64_t>(1, (static_cast<uint64_t>(journal_ticks) *
+                portTICK_PERIOD_MS + 999) / 1000)));
+    }
 
     const std::time_t now = CurrentUnixSeconds();
     const auto seconds_until = [now](int64_t due_seconds) -> uint32_t {
@@ -3869,6 +3997,7 @@ SyncContentTicket TryClaimContentRefresh(SyncContentDomain domain)
         snapshot->desired_revision > snapshot->applied_revision;
     const size_t index = ContentDomainIndex(domain);
     if (snapshot != nullptr && g_content_active_generation[index] == 0 &&
+        !g_content_completion_pending[index] &&
         (forced || (due && needs_convergence))) {
         uint32_t generation = ++g_content_claim_generation[index];
         if (generation == 0) {
@@ -3941,7 +4070,7 @@ esp_err_t BeginContentInstall(const SyncContentTicket& ticket)
     if (!accepted) {
         return ESP_ERR_INVALID_STATE;
     }
-    return PersistLatestSyncJournalLocked();
+    return PersistLatestSyncJournalLocked("install-marker");
 #else
     (void)ticket;
     return ESP_ERR_NOT_SUPPORTED;
@@ -3966,7 +4095,12 @@ void CompleteContentRefresh(
     taskENTER_CRITICAL(&g_sync_snapshot_lock);
     if (g_content_active_generation[index] == ticket.generation) {
         g_content_active_generation[index] = 0;
-        SyncContentSnapshot* snapshot = ContentSnapshotForDomain(ticket.domain);
+        SyncContentSnapshot* live_snapshot = ContentSnapshotForDomain(ticket.domain);
+        // Prepare completion locally. Never expose Clean/applied before the
+        // journal accepts it; retain one bounded pending slot per domain.
+        SyncContentSnapshot completed = live_snapshot == nullptr
+            ? SyncContentSnapshot{} : *live_snapshot;
+        SyncContentSnapshot* snapshot = live_snapshot == nullptr ? nullptr : &completed;
         wqn::SyncJournalContentState* journal = JournalStateForDomain(ticket.domain);
         if (snapshot != nullptr && journal != nullptr) {
             if (result == ESP_OK) {
@@ -4015,18 +4149,22 @@ void CompleteContentRefresh(
                         static_cast<uint64_t>((delay_ms + 999) / 1000)
                     : 0;
             }
+            g_content_completed_snapshot[index] = completed;
+            g_content_completion_pending[index] = true;
             ++g_sync_snapshot.state_sequence;
             accepted = true;
         }
     }
     taskEXIT_CRITICAL(&g_sync_snapshot_lock);
-    if (accepted && PersistLatestSyncJournalLocked() != ESP_OK) {
+    const esp_err_t persist_result = accepted
+        ? PersistLatestSyncJournalLocked("content-complete") : ESP_OK;
+    if (persist_result != ESP_OK) {
         ESP_LOGE(kTag, "content completion journal save failed: domain=%u",
                  static_cast<unsigned>(ticket.domain));
     }
-    if (accepted && result != ESP_OK) {
+    if (accepted && (result != ESP_OK || persist_result != ESP_OK)) {
         // Content lanes converge independently from the control plane and
-        // outboxes. Surface their durable backoff as partial completion; a
+        // outboxes. Surface backoff or pending durability as partial completion; a
         // single pack failure must not relabel already-synced domains as a
         // failed global round.
         const int64_t finished_ms = esp_timer_get_time() / 1000;

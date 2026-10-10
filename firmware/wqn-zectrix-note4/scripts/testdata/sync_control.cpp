@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -10,9 +11,11 @@
 #include <string>
 #include <vector>
 #include "cJSON.h"
+#include "device_protocol/json_depth_guard.h"
 #include "storage.h"
 #include "services/sync_service.h"
 using wqn::SyncJournal;
+using wqn::SyncJournalContentState;
 
 #define CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE 1
 #define CONFIG_WQN_WIFI_STA_ENABLE 1
@@ -72,6 +75,20 @@ wqn::SyncJournal g_sync_journal;
 bool g_sync_journal_loaded=true,g_outbox_protocol_suspended=false;
 wqn::services::SyncSnapshot g_sync_snapshot;
 uint32_t g_content_active_generation[3]={0,0,0};
+uint32_t g_content_claim_generation[3]={0,0,0};
+bool g_content_completion_pending[3]={};
+wqn::services::SyncContentSnapshot g_content_completed_snapshot[3]={};
+std::atomic<int64_t> g_sync_journal_retry_not_before_ms{0};
+std::atomic<int64_t> g_control_journal_retry_not_before_ms{0};
+uint8_t g_sync_journal_retry_attempt=0;
+std::atomic<uint32_t> g_full_sync_reasons{0},g_content_refresh_requested{0};
+constexpr uint32_t kFullSyncManual=1,kFullSyncCredentials=4;
+void* g_sync_service_task=nullptr;
+void xTaskNotifyGive(void*) {}
+TickType_t PeriodicSyncWaitDelay(uint32_t) { return portMAX_DELAY; }
+TickType_t OutboxWaitDelay() { return portMAX_DELAY; }
+TickType_t OutboxQuietLeaseWaitDelay() { return portMAX_DELAY; }
+constexpr size_t kSyncJournalMaxBytes=8192;
 std::string g_word_outbox_retry_request_id,g_note_outbox_retry_request_id,g_problem_outbox_retry_request_id;
 int64_t g_word_outbox_retry_not_before_ms=0,g_note_outbox_retry_not_before_ms=0,g_problem_outbox_retry_not_before_ms=0;
 uint8_t g_word_outbox_retry_attempts=0,g_note_outbox_retry_attempts=0,g_problem_outbox_retry_attempts=0;
@@ -112,13 +129,13 @@ int WriteSyncJournalFileAtomic(const std::string& payload) {
     if(fail_journal_calls.count(journal_calls)) return ESP_FAIL;
     durable_payload=payload; committed_payloads.push_back(payload); return ESP_OK;
 }
-int SaveSyncJournalRaw(const wqn::SyncJournal&);
+int SaveSyncJournalRaw(const wqn::SyncJournal&,const char*);
 namespace wqn {
 void SetWordReviewDueCount(int) {}
 void SetWordMistakeCount(int) {}
-int SaveSyncJournalThroughStorageService(const SyncJournal& value) {
+int SaveSyncJournalThroughStorageService(const SyncJournal& value,const char* reason) {
     if(mock_lock_depth!=1) ++lock_errors;
-    const int result=SaveSyncJournalRaw(value);
+    const int result=SaveSyncJournalRaw(value,reason);
     if(result==ESP_OK) { durable_journal=value; if(journal_calls==cut_after_save_at) throw PowerCut{}; }
     return result;
 }
@@ -182,6 +199,9 @@ void Reset() {
     g_control_retry_after_ms=0; g_auto_sync_interval_minutes=15; ResetControlExchanges();
     g_sync_journal={}; g_sync_journal.config_revision=1; g_sync_journal.sync_cursor=10;
     g_sync_snapshot={}; g_content_active_generation[0]=g_content_active_generation[1]=g_content_active_generation[2]=0;
+    for(size_t i=0;i<3;++i) { g_content_completion_pending[i]=false; g_content_completed_snapshot[i]={}; }
+    g_sync_journal_retry_not_before_ms=0; g_sync_journal_retry_attempt=0;
+    g_full_sync_reasons=0; g_content_refresh_requested=0;
     g_sync_journal_loaded=true; g_outbox_protocol_suspended=false;
     g_word_outbox_retry_request_id.clear(); g_note_outbox_retry_request_id.clear(); g_problem_outbox_retry_request_id.clear();
     g_word_outbox_retry_not_before_ms=g_note_outbox_retry_not_before_ms=g_problem_outbox_retry_not_before_ms=0;
@@ -191,7 +211,9 @@ void Reset() {
     remote_sync={}; remote_sync.config_revision=2; remote_sync.sync_cursor=11; remote_sync.auto_sync_interval_minutes=15;
     remote_bootstrap={}; remote_bootstrap.config_revision=2; remote_bootstrap.sync_cursor=11;
     transport_failures=0; rpc_error.clear(); reject_changed_body=true; rpc_ids.clear(); rpc_bodies.clear(); server_replays.clear();
-    SaveSyncJournalRaw(g_sync_journal); durable_journal=g_sync_journal;
+    g_sync_journal_durable_payload_valid=false;
+    SaveSyncJournalRaw(g_sync_journal,"fixture-seed"); durable_journal=g_sync_journal;
+    g_sync_journal_durable_payload_valid=false;
     journal_calls=0; attempted_payloads.clear(); committed_payloads.clear();
 }
 int main() {
@@ -223,6 +245,26 @@ int main() {
     Check(nvs_calls==0 && mock_nvs.at(kControlSyncCursorKey)==100,
         "control commit never advances legacy NVS scalar keys");
     Check(g_sync_request_id.empty() && !g_sync_response_ready,"successful local commit retires response and request together");
+    Reset(); fail_journal_calls={1}; SyncControlPlaneV3("host-placeholder");
+    const int64_t control_due=g_control_journal_retry_not_before_ms;
+    fail_journal_calls.clear(); PersistOutboxRetryCheckpoint();
+    Check(control_due==mock_ms+5000 && g_control_journal_retry_not_before_ms==control_due &&
+        g_sync_snapshot.journal_pending,
+        "another lane's save cannot cancel a pending control response commit");
+    rpc_error="NETWORK_UNAVAILABLE"; mock_ms=control_due; RetryCachedControlResponseIfDue();
+    Check(g_sync_cursor==11 && rpc_ids.size()==1 && !g_sync_response_ready &&
+        !g_sync_snapshot.journal_pending && ControlJournalRetryWaitDelay()==portMAX_DELAY,
+        "cached successful control response commits on its local timer even while networking is unavailable");
+    Reset(); fail_journal_calls={1}; BootstrapControlV3("host-placeholder");
+    fail_journal_calls.clear(); rpc_error="NETWORK_UNAVAILABLE";
+    mock_ms=g_control_journal_retry_not_before_ms; RetryCachedControlResponseIfDue();
+    Check(g_bootstrap_complete && rpc_ids.size()==1 && !g_bootstrap_response_ready,
+        "cached bootstrap response also commits without connectivity admission");
+    Reset(); fail_journal_calls={1}; SyncControlPlaneV3("host-placeholder");
+    g_full_sync_reasons=kFullSyncCredentials; mock_ms=g_control_journal_retry_not_before_ms;
+    RetryCachedControlResponseIfDue();
+    Check(g_sync_cursor==10 && !g_sync_response_ready && ControlJournalRetryWaitDelay()==portMAX_DELAY,
+        "credential change discards cached old response before the offline commit pump");
     Reset(); fail_journal_calls={1}; BootstrapControlV3("host-placeholder");
     fail_journal_calls.clear();
     Check(BootstrapControlV3("host-placeholder")==ESP_OK && rpc_ids.size()==1 &&
@@ -265,6 +307,8 @@ int main() {
     Check(EnsureSyncJournalLoaded()==ESP_OK && durable_journal.problem_packs.phase==wqn::SyncJournalPhase::kPending,
         "startup recovery is retried and committed before readiness");
     Reset(); g_content_active_generation[2]=1;
+    g_sync_journal.problem_packs.desired_revision=7;
+    g_sync_snapshot.problem_packs.desired_revision=7;
     const wqn::services::SyncContentTicket ticket{wqn::services::SyncContentDomain::kProblemPacks,1,7};
     fail_journal_calls={1};
     Check(wqn::services::BeginContentInstall(ticket)!=ESP_OK && durable_journal.problem_packs.phase==wqn::SyncJournalPhase::kClean,
@@ -274,6 +318,100 @@ int main() {
         "installation marker is durable before installation proceeds");
     const std::string hash(64,'a'); wqn::services::CompleteContentRefresh(ticket,ESP_OK,hash.c_str());
     Check(durable_journal.problem_packs.applied_revision==7,"successful content completion becomes durable");
+
+    Reset(); g_content_active_generation[2]=1;
+    g_sync_journal.problem_packs.desired_revision=7;
+    g_sync_snapshot.problem_packs.desired_revision=7;
+    wqn::services::BeginContentInstall(ticket); fail_journal_calls={2};
+    wqn::services::CompleteContentRefresh(ticket,ESP_OK,hash.c_str());
+    Check(g_sync_snapshot.journal_pending && g_content_completion_pending[2] &&
+        g_sync_snapshot.problem_packs.applied_revision==0 &&
+        g_sync_snapshot.problem_packs.phase==wqn::services::SyncContentPhase::kInstalling &&
+        durable_journal.problem_packs.applied_revision==0,
+        "failed completion keeps applied/Clean unpublished and marks local durability pending");
+    g_content_refresh_requested=kProblemPacksRefreshBit;
+    Check(!wqn::services::TryClaimContentRefresh(wqn::services::SyncContentDomain::kProblemPacks),
+        "even a forced refresh cannot reinstall while completion awaits local durability");
+    const int saves=journal_calls; RetryDirtySyncJournalIfDue();
+    Check(journal_calls==saves && SchedulerWaitDelay()==5000,"local retry waits without busy-looping");
+    fail_journal_calls.clear(); mock_ms+=5000; RetryDirtySyncJournalIfDue();
+    Check(durable_journal.problem_packs.applied_revision==7 &&
+        g_sync_snapshot.problem_packs.applied_revision==7 && !g_sync_snapshot.journal_pending &&
+        !g_content_completion_pending[2] && rpc_ids.empty(),
+        "local completion retry publishes only after commit, without a network RPC");
+
+    Reset(); fail_journal_calls={1,2,3,4};
+    PersistOutboxRetryCheckpoint();
+    const int64_t first_due=g_sync_journal_retry_not_before_ms;
+    Check(first_due==mock_ms+5000,"failed retry checkpoint arms five-second local retry");
+    // A RAM-only no-change clear cannot disarm the separate dirty deadline.
+    PersistOutboxRetryCheckpoint();
+    mock_ms=g_sync_journal_retry_not_before_ms; RetryDirtySyncJournalIfDue();
+    Check(g_sync_journal_retry_not_before_ms==mock_ms+60000,"local retry escalation caps at sixty seconds");
+    g_outbox_protocol_suspended=true;
+    Check(SchedulerWaitDelay()==60000,"protocol suspension parks networking but permits local durability retry");
+    fail_journal_calls.clear(); mock_ms=g_sync_journal_retry_not_before_ms;
+    RetryDirtySyncJournalIfDue();
+    Check(!g_sync_snapshot.journal_pending && SchedulerWaitDelay()==portMAX_DELAY,
+        "successful local retry disarms the deadline even while protocol is suspended");
+
+    for(const auto reset:{ResetWordOutboxRetryBackoff,ResetNoteOutboxRetryBackoff,ResetProblemOutboxRetryBackoff}) {
+        Reset();
+        g_word_outbox_retry_request_id="word-id";
+        g_note_outbox_retry_request_id="note-id";
+        g_problem_outbox_retry_request_id="problem-id";
+        PersistOutboxRetryCheckpoint(); fail_journal_calls={2}; reset();
+        const int failed_saves=journal_calls; const int64_t due=g_sync_journal_retry_not_before_ms;
+        reset();
+        Check(journal_calls==failed_saves && due==mock_ms+5000 && g_sync_snapshot.journal_pending,
+            "unchanged RAM-only outbox reset preserves a failed durable-clear obligation");
+        fail_journal_calls.clear(); mock_ms=due; RetryDirtySyncJournalIfDue();
+        Check(!g_sync_snapshot.journal_pending &&
+            std::string(durable_journal.word_outbox.request_id)==g_word_outbox_retry_request_id &&
+            std::string(durable_journal.note_outbox.request_id)==g_note_outbox_retry_request_id &&
+            std::string(durable_journal.problem_outbox.request_id)==g_problem_outbox_retry_request_id,
+            "failed outbox clear becomes durable without another reset or network round");
+    }
+    Reset(); fail_journal_calls={1}; SetOutboxProtocolSuspended(true);
+    const int failed_latch_saves=journal_calls; SetOutboxProtocolSuspended(true);
+    Check(journal_calls==failed_latch_saves && g_sync_snapshot.journal_pending,
+        "unchanged protocol latch cannot hide a failed durable save");
+    fail_journal_calls.clear(); mock_ms=g_sync_journal_retry_not_before_ms; RetryDirtySyncJournalIfDue();
+    Check(std::string(durable_journal.protocol_blocked_image_id)==CurrentFirmwareImageId() && !g_sync_snapshot.journal_pending,
+        "protocol latch retry persists locally while network rounds stay suspended");
+
+    Reset(); g_content_active_generation[2]=1;
+    g_sync_journal.problem_packs.desired_revision=7; g_sync_snapshot.problem_packs.desired_revision=7;
+    wqn::services::BeginContentInstall(ticket); fail_journal_calls={2};
+    wqn::services::CompleteContentRefresh(ticket,ESP_OK,hash.c_str());
+    fail_journal_calls.clear();
+    remote_sync.content_targets={{wqn::protocol::v3::SyncContentKind::kProblemPacks,9,""}};
+    Check(SyncControlPlaneV3("host-placeholder")==ESP_OK &&
+        g_sync_snapshot.problem_packs.applied_revision==7 &&
+        g_sync_snapshot.problem_packs.desired_revision==9 &&
+        g_sync_snapshot.problem_packs.phase==wqn::services::SyncContentPhase::kPending &&
+        !g_sync_snapshot.journal_pending,
+        "a concurrent higher control target flushes completion without publishing stale intent");
+
+    Reset(); SyncControlPlaneV3("host-placeholder"); const int written=journal_calls;
+    { SyncJournalLock lock; PersistLatestSyncJournalLocked("unchanged"); }
+    Check(journal_calls==written,"byte-identical durable checkpoint skips metadata I/O");
+    fail_journal_calls={written+1};
+    g_sync_journal.full_sync_retry.attempt=1;
+    { SyncJournalLock lock; PersistLatestSyncJournalLocked("changed"); }
+    fail_journal_calls.clear();
+    { SyncJournalLock lock; PersistLatestSyncJournalLocked("changed-retry"); }
+    Check(journal_calls==written+2 && durable_journal.full_sync_retry.attempt==1,
+        "failed save is never cached as durable or silently skipped on retry");
+    Reset(); remote_sync.config_revision=remote_bootstrap.config_revision=1;
+    remote_sync.sync_cursor=remote_bootstrap.sync_cursor=10;
+    ClearFullSyncRetry(); BootstrapControlV3("host-placeholder");
+    SyncControlPlaneV3("host-placeholder"); ClearFullSyncRetry(); SetOutboxProtocolSuspended(false);
+    Check(journal_calls==1,"unchanged cold control cycle performs one repairing write, not repeated identical rotations");
+    remote_sync.content_targets={{wqn::protocol::v3::SyncContentKind::kProblemPacks,7,""}};
+    const int before_target=journal_calls; SyncControlPlaneV3("host-placeholder");
+    Check(journal_calls==before_target+1 && durable_journal.problem_packs.desired_revision==7,
+        "new control target needs one bundled write, never a separate intent rotation");
     Check(lock_errors==0 && mock_lock_depth==0,"every save holds one non-recursive mutation/commit lock, released on all exits");
     std::printf("%d PASS / %d FAIL (production control paths; NOT HIL)\n",checks-failures,failures);
     return failures?1:0;

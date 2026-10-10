@@ -74,6 +74,9 @@ struct SyncSnapshot {
     SyncOutboxSnapshot word_outbox = {};
     SyncOutboxSnapshot note_outbox = {};
     SyncOutboxSnapshot problem_outbox = {};
+    // Runtime intent has not yet reached a successful journal commit. This
+    // flag is not itself durable; restart recovers the last valid checkpoint.
+    bool journal_pending = false;
 };
 
 enum class SyncEventStatus : uint8_t {
@@ -133,7 +136,9 @@ uint32_t SecondsUntilNextSyncWake();
 void RequestContentRefresh(SyncContentDomain domain);
 // Bulk-worker dispatch handshake. Claim moves Pending/Backoff -> Fetching;
 // completion is called by the bulk worker before it publishes its UI result,
-// so durable applied state never depends on the UI event loop.
+// so durable applied state never depends on the UI event loop. A failed local
+// completion commit keeps applied/phase unpublished and blocks another claim
+// for that domain until bounded local checkpoint retry succeeds.
 SyncContentTicket TryClaimContentRefresh(SyncContentDomain domain);
 void CancelContentRefreshClaim(const SyncContentTicket& ticket);
 esp_err_t BeginContentInstall(const SyncContentTicket& ticket);
