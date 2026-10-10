@@ -54,7 +54,8 @@ std::atomic<wqn::services::SyncEventSink> g_sync_event_sink{nullptr};
 // retry cadence at 10s forever, keeping the radio hot across deep-sleep cycles
 // (2026-08-19 sync liveness audit). Consecutive nominal-path failures escalate
 // through this ladder and cap at 15 minutes; ClearFullSyncRetry() resets the
-// attempt count on success or when an explicit manual/boot reason runs.
+// attempt count on success or an explicit manual/credential reset. Boot,
+// content and timer admission must preserve a restored failure attempt.
 constexpr uint32_t kFullSyncRetryLadderMs[] = {
     10000, 30000, 60000, 300000, 900000};
 constexpr size_t kFullSyncRetryLadderSize =
@@ -3182,7 +3183,9 @@ uint32_t FullSyncFailureRetryMs(bool has_token_after_round)
     const uint8_t ladder_index = static_cast<uint8_t>(
         std::min<uint8_t>(g_full_sync_retry_attempts,
                           static_cast<uint8_t>(kFullSyncRetryLadderSize - 1)));
-    ++g_full_sync_retry_attempts;
+    if (g_full_sync_retry_attempts < UINT8_MAX) {
+        ++g_full_sync_retry_attempts;
+    }
     ESP_LOGW(
         kTag,
         "full-sync nominal retry escalated: attempt=%u delay_ms=%lu",
@@ -3263,7 +3266,11 @@ void SyncServiceTask(void*)
             PeriodicScheduleDue(interval_minutes);
         bool full_requested =
             admitted_full_reasons != 0 || retry_due || periodic_due;
-        if (full_requested) {
+        // [sync-retry] Consuming a due deadline is not a successful round.
+        // Clearing here used to restart every automatic failure at 10s, and
+        // also discarded the checkpoint restored after a reboot.
+        if ((admitted_full_reasons &
+             (kFullSyncManual | kFullSyncCredentials)) != 0) {
             ClearFullSyncRetry();
         }
         bool word_outbox_requested = false;
