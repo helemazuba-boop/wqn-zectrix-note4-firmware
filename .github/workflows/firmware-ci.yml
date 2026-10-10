@@ -35,6 +35,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      - name: Run HIL checker selftests
+        run: python3 firmware/wqn-zectrix-note4/scripts/hil_check.py --selftest
+
       - name: Run hil_check on the smoke fixture
         run: |
           python3 firmware/wqn-zectrix-note4/scripts/hil_check.py \
@@ -77,6 +80,8 @@ jobs:
       # as part of the build.
       - name: Build
         working-directory: firmware/wqn-zectrix-note4
+        shell: bash
         run: |
+          source "$IDF_PATH/export.sh"
           idf.py -B build-ci set-target esp32s3
           idf.py -B build-ci build

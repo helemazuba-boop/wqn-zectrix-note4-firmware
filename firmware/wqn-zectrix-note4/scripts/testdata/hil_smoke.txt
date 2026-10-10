@@ -8,6 +8,7 @@
 I (1000) wqn_ui_gates: commit_state gate self-test passed
 
 I (1100) RenderFrameToEpd: stack HWM before render: 8584 bytes free
+I (1150) wqn_ui: UI stack HWM: phase=frame-dispatched free_bytes=4096
 
 I (1200) storage_service: storage transaction complete: request=1 owner=word-observation-commit queue_wait_ms=0 elapsed_ms=12 result=ESP_OK
 I (1400) storage_service: storage transaction complete: request=2 owner=word-scope-reset queue_wait_ms=0 elapsed_ms=18 result=ESP_OK
