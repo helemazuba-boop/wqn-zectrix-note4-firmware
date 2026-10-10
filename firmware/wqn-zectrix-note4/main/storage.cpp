@@ -522,30 +522,6 @@ esp_err_t ClearAccessTokenKeys()
         nullptr, "clear-identity-state");
 }
 
-esp_err_t SaveDeviceControlStateRaw(const wqn::DeviceControlState& state)
-{
-    NvsHandle nvs;
-    ESP_RETURN_ON_ERROR(
-        nvs_open(WQN_NVS_NAMESPACE, NVS_READWRITE, &nvs.handle),
-        kTag,
-        "open NVS namespace");
-    ESP_RETURN_ON_ERROR(
-        nvs_set_u64(nvs.handle, kControlConfigRevisionKey, state.config_revision),
-        kTag,
-        "stage v3 config revision");
-    ESP_RETURN_ON_ERROR(
-        nvs_set_u64(nvs.handle, kControlSyncCursorKey, state.sync_cursor),
-        kTag,
-        "stage v3 sync cursor");
-    return nvs_commit(nvs.handle);
-}
-
-esp_err_t SaveDeviceControlStateTransaction(void* opaque)
-{
-    return SaveDeviceControlStateRaw(
-        *static_cast<const wqn::DeviceControlState*>(opaque));
-}
-
 esp_err_t JsonToString(cJSON* root, std::string* output)
 {
     if (root == nullptr || output == nullptr) {
@@ -1347,40 +1323,6 @@ std::string MaskTokenForLog(const std::string& token)
     return token.substr(0, 4) + "..." + token.substr(token.size() - 4);
 }
 
-esp_err_t LoadDeviceControlState(DeviceControlState* state)
-{
-    if (state == nullptr) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    *state = {};
-    bool config_found = false;
-    bool cursor_found = false;
-    ESP_RETURN_ON_ERROR(
-        LoadU64FromNvs(kControlConfigRevisionKey, &state->config_revision, &config_found),
-        kTag,
-        "load v3 config revision");
-    ESP_RETURN_ON_ERROR(
-        LoadU64FromNvs(kControlSyncCursorKey, &state->sync_cursor, &cursor_found),
-        kTag,
-        "load v3 sync cursor");
-    if (config_found != cursor_found) {
-        ESP_LOGW(kTag, "incomplete v3 control checkpoint; resetting both values");
-        *state = {};
-    }
-    return ESP_OK;
-}
-
-esp_err_t SaveDeviceControlState(const DeviceControlState& state)
-{
-    StorageWriteGuard write("save-v3-control-state", __FILE__, __LINE__);
-    if (!write) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    return services::ExecuteStorageTransactionNamed(
-        SaveDeviceControlStateTransaction,
-        const_cast<DeviceControlState*>(&state), "save-device-control");
-}
-
 esp_err_t LoadSyncJournal(SyncJournal* journal)
 {
     if (journal == nullptr) {
@@ -1423,7 +1365,7 @@ namespace {
 // reintroduce a raw SPIFFS commit outside StorageService. No StorageWriteGuard
 // here on purpose -- the caller's lease already spans the queue wait and this
 // body runs after it was granted, so the commit cannot be refused by a quiesce
-// that started in between. Mirrors SaveDeviceControlState/SaveDeviceControlStateRaw.
+// that started in between. Control state and content intent share this commit.
 esp_err_t SaveSyncJournalRaw(const SyncJournal& journal)
 {
     if (journal.schema_version != 2) {

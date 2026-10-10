@@ -116,7 +116,22 @@ SemaphoreHandle_t g_sync_journal_mutex = nullptr;
 uint32_t g_content_claim_generation[3] = {};
 uint32_t g_content_active_generation[3] = {};
 
-esp_err_t PersistLatestSyncJournal();
+// [sync-checkpoint] Serialize mutation + snapshot + commit, not just the I/O.
+// Otherwise a content lane can overwrite a control candidate while it saves.
+class SyncJournalLock {
+public:
+    SyncJournalLock() : locked_(g_sync_journal_mutex != nullptr &&
+        xSemaphoreTake(g_sync_journal_mutex, portMAX_DELAY) == pdTRUE) {}
+    ~SyncJournalLock() { if (locked_) xSemaphoreGive(g_sync_journal_mutex); }
+    explicit operator bool() const { return locked_; }
+    SyncJournalLock(const SyncJournalLock&) = delete;
+    SyncJournalLock& operator=(const SyncJournalLock&) = delete;
+private:
+    bool locked_;
+};
+
+esp_err_t PersistLatestSyncJournalLocked();
+esp_err_t EnsureSyncJournalLoaded();
 
 size_t ContentDomainIndex(wqn::services::SyncContentDomain domain)
 {
@@ -184,6 +199,8 @@ void PersistFullSyncRetryCheckpoint()
     if (!g_sync_journal_loaded) {
         return;
     }
+    SyncJournalLock journal_lock;
+    if (!journal_lock) return;
     int64_t retry_unix_seconds = 0;
     taskENTER_CRITICAL(&g_periodic_schedule_lock);
     retry_unix_seconds = g_full_sync_retry_unix_seconds;
@@ -193,7 +210,7 @@ void PersistFullSyncRetryCheckpoint()
         retry_unix_seconds > 0 ? static_cast<uint64_t>(retry_unix_seconds) : 0;
     g_sync_journal.full_sync_retry.attempt = g_full_sync_retry_attempts;
     taskEXIT_CRITICAL(&g_sync_snapshot_lock);
-    if (PersistLatestSyncJournal() != ESP_OK) {
+    if (PersistLatestSyncJournalLocked() != ESP_OK) {
         ESP_LOGW(kTag, "full-sync retry journal save failed");
     }
 }
@@ -612,15 +629,16 @@ wqn::services::SyncContentSnapshot* ContentSnapshotForKind(
 }
 
 wqn::SyncJournalContentState* JournalStateForKind(
-    wqn::protocol::v3::SyncContentKind kind)
+    wqn::protocol::v3::SyncContentKind kind,
+    wqn::SyncJournal* journal = &g_sync_journal)
 {
     switch (kind) {
         case wqn::protocol::v3::SyncContentKind::kWordPacks:
-            return &g_sync_journal.word_packs;
+            return &journal->word_packs;
         case wqn::protocol::v3::SyncContentKind::kNotePacks:
-            return &g_sync_journal.note_packs;
+            return &journal->note_packs;
         case wqn::protocol::v3::SyncContentKind::kProblemPacks:
-            return &g_sync_journal.problem_packs;
+            return &journal->problem_packs;
         default:
             return nullptr;
     }
@@ -656,25 +674,19 @@ wqn::SyncJournalContentState* JournalStateForDomain(
     }
 }
 
-esp_err_t PersistLatestSyncJournal()
+esp_err_t PersistLatestSyncJournalLocked()
 {
-    if (g_sync_journal_mutex == nullptr ||
-        xSemaphoreTake(g_sync_journal_mutex, portMAX_DELAY) != pdTRUE) {
-        return ESP_ERR_INVALID_STATE;
-    }
     wqn::SyncJournal snapshot;
     taskENTER_CRITICAL(&g_sync_snapshot_lock);
     snapshot = g_sync_journal;
     taskEXIT_CRITICAL(&g_sync_snapshot_lock);
-    const esp_err_t result = wqn::SaveSyncJournalThroughStorageService(snapshot);
-    xSemaphoreGive(g_sync_journal_mutex);
-    return result;
+    return wqn::SaveSyncJournalThroughStorageService(snapshot);
 }
 
 void PublishContentTargets(
     const std::vector<wqn::protocol::v3::SyncContentTarget>& targets)
 {
-    bool changed = false;
+    // Runtime publication only, after the bundled journal commit succeeded.
     taskENTER_CRITICAL(&g_sync_snapshot_lock);
     for (const auto& target : targets) {
         if (target.kind == wqn::protocol::v3::SyncContentKind::kTodos) {
@@ -695,23 +707,10 @@ void PublishContentTargets(
             snapshot->retry_attempt = 0;
             snapshot->next_retry_ms = 0;
             snapshot->last_error[0] = '\0';
-            wqn::SyncJournalContentState* journal_state =
-                JournalStateForKind(target.kind);
-            if (journal_state != nullptr) {
-                journal_state->desired_revision = target.revision;
-                journal_state->phase = wqn::SyncJournalPhase::kPending;
-                journal_state->retry_attempt = 0;
-                journal_state->retry_not_before_unix_seconds = 0;
-                journal_state->desired_snapshot_id[0] = '\0';
-            }
             ++g_sync_snapshot.state_sequence;
-            changed = true;
         }
     }
     taskEXIT_CRITICAL(&g_sync_snapshot_lock);
-    if (changed && PersistLatestSyncJournal() != ESP_OK) {
-        ESP_LOGW(kTag, "content target journal save failed");
-    }
 }
 
 void WordOutboxTimerCallback(TimerHandle_t)
@@ -745,6 +744,25 @@ constexpr uint8_t kWordOutboxSequenceGapEscalation = 5;
 std::string g_bootstrap_request_id;
 std::string g_sync_request_id;
 uint32_t g_sync_request_auto_interval_minutes = 0;
+wqn::protocol::v3::RequestMetadata g_bootstrap_request_metadata;
+wqn::protocol::v3::RequestMetadata g_sync_request_metadata;
+wqn::protocol::v3::BootstrapData g_bootstrap_response;
+wqn::protocol::v3::SyncData g_sync_response;
+bool g_bootstrap_response_ready = false;
+bool g_sync_response_ready = false;
+
+void ResetControlExchanges()
+{
+    g_bootstrap_request_id.clear();
+    g_sync_request_id.clear();
+    g_bootstrap_request_metadata = {};
+    g_sync_request_metadata = {};
+    g_bootstrap_response = {};
+    g_sync_response = {};
+    g_bootstrap_response_ready = false;
+    g_sync_response_ready = false;
+    g_sync_request_auto_interval_minutes = 0;
+}
 wqn::protocol::v3::ClaimKeyPair g_claim_key_pair;
 std::string g_claim_start_request_id;
 std::string g_claim_id;
@@ -1028,6 +1046,8 @@ void PersistOutboxRetryCheckpoint()
     if (!g_sync_journal_loaded) {
         return;
     }
+    SyncJournalLock journal_lock;
+    if (!journal_lock) return;
     wqn::SyncJournalOutboxRetryState word;
     wqn::SyncJournalOutboxRetryState note;
     wqn::SyncJournalOutboxRetryState problem;
@@ -1054,13 +1074,15 @@ void PersistOutboxRetryCheckpoint()
     g_sync_journal.note_outbox = note;
     g_sync_journal.problem_outbox = problem;
     taskEXIT_CRITICAL(&g_sync_snapshot_lock);
-    if (PersistLatestSyncJournal() != ESP_OK) {
+    if (PersistLatestSyncJournalLocked() != ESP_OK) {
         ESP_LOGW(kTag, "outbox retry journal save failed");
     }
 }
 
 void SetOutboxProtocolSuspended(bool suspended)
 {
+    SyncJournalLock journal_lock;
+    if (!journal_lock) return;
     const char* const blocked_image_id = suspended ? CurrentFirmwareImageId() : "";
     const bool journal_changed = std::strcmp(
         g_sync_journal.protocol_blocked_image_id,
@@ -1077,7 +1099,7 @@ void SetOutboxProtocolSuspended(bool suspended)
         "%s",
         blocked_image_id);
     taskEXIT_CRITICAL(&g_sync_snapshot_lock);
-    if (PersistLatestSyncJournal() != ESP_OK) {
+    if (PersistLatestSyncJournalLocked() != ESP_OK) {
         ESP_LOGW(kTag, "protocol suspension journal save failed");
     }
 }
@@ -1393,13 +1415,12 @@ esp_err_t EnsureControlStateLoaded()
     if (g_control_state_loaded) {
         return ESP_OK;
     }
-    wqn::DeviceControlState state;
-    ESP_RETURN_ON_ERROR(
-        wqn::LoadDeviceControlState(&state),
-        kTag,
-        "load v3 control checkpoint");
-    g_config_revision = state.config_revision;
-    g_sync_cursor = state.sync_cursor;
+    ESP_RETURN_ON_ERROR(EnsureSyncJournalLoaded(), kTag, "load control journal");
+    // Existing v1/v2 journals already contain both fields and content intent.
+    // They are authoritative even if legacy NVS advanced past a failed save.
+    // With no journal, bootstrap from zero; never import a torn two-key pair.
+    g_config_revision = g_sync_journal.config_revision;
+    g_sync_cursor = g_sync_journal.sync_cursor;
     g_control_state_loaded = true;
     return ESP_OK;
 }
@@ -1409,6 +1430,8 @@ esp_err_t EnsureSyncJournalLoaded()
     if (g_sync_journal_loaded) {
         return ESP_OK;
     }
+    SyncJournalLock journal_lock;
+    if (!journal_lock) return ESP_ERR_INVALID_STATE;
     esp_err_t result = wqn::LoadSyncJournal(&g_sync_journal);
     if (result != ESP_OK) {
         ESP_LOGE(kTag, "sync journal invalid: %s", esp_err_to_name(result));
@@ -1534,8 +1557,11 @@ esp_err_t EnsureSyncJournalLoaded()
     g_sync_journal_loaded = true;
     if (journal_changed) {
         ESP_LOGW(kTag, "sync journal recovered or migrated during startup");
-        ESP_RETURN_ON_ERROR(
-            PersistLatestSyncJournal(), kTag, "persist recovered sync journal");
+        result = PersistLatestSyncJournalLocked();
+        if (result != ESP_OK) {
+            g_sync_journal_loaded = false;
+            return result;
+        }
     }
     return ESP_OK;
 }
@@ -1571,6 +1597,40 @@ wqn::protocol::v3::RequestMetadata MakeControlMetadata()
     metadata.sync_cursor = g_sync_cursor;
     metadata.limit = WQN_SYNC_LIMIT;
     return metadata;
+}
+
+esp_err_t CommitControlResponse(
+    const wqn::DeviceControlState& checkpoint,
+    const std::vector<wqn::protocol::v3::SyncContentTarget>& targets)
+{
+    SyncJournalLock journal_lock;
+    if (!journal_lock || !g_sync_journal_loaded) return ESP_ERR_INVALID_STATE;
+    wqn::SyncJournal candidate;
+    taskENTER_CRITICAL(&g_sync_snapshot_lock);
+    candidate = g_sync_journal;
+    taskEXIT_CRITICAL(&g_sync_snapshot_lock);
+    candidate.config_revision = checkpoint.config_revision;
+    candidate.sync_cursor = checkpoint.sync_cursor;
+    for (const auto& target : targets) {
+        auto* state = JournalStateForKind(target.kind, &candidate);
+        if (state == nullptr || target.revision <= state->desired_revision) continue;
+        state->desired_revision = target.revision;
+        state->phase = wqn::SyncJournalPhase::kPending;
+        state->retry_attempt = 0;
+        state->retry_not_before_unix_seconds = 0;
+        state->desired_snapshot_id[0] = '\0';
+    }
+    // One authority/one durable publication: no NVS cursor can outrun intent.
+    // Failed candidates are not installed in RAM or saved by another lane.
+    ESP_RETURN_ON_ERROR(wqn::SaveSyncJournalThroughStorageService(candidate),
+                        kTag, "commit bundled control response");
+    taskENTER_CRITICAL(&g_sync_snapshot_lock);
+    g_sync_journal = candidate;
+    taskEXIT_CRITICAL(&g_sync_snapshot_lock);
+    g_config_revision = checkpoint.config_revision;
+    g_sync_cursor = checkpoint.sync_cursor;
+    PublishContentTargets(targets);
+    return ESP_OK;
 }
 
 std::string DeviceHardwareId()
@@ -1745,9 +1805,7 @@ esp_err_t RunDeviceClaimRoundV3()
         return ESP_OK;
     }
     g_bootstrap_complete = false;
-    g_bootstrap_request_id.clear();
-    g_sync_request_id.clear();
-    g_sync_request_auto_interval_minutes = 0;
+    ResetControlExchanges();
     g_config_revision = 0;
     g_sync_cursor = 0;
     return g_claim_active ? PollClaimSession() : StartClaimSession();
@@ -1971,43 +2029,40 @@ esp_err_t BootstrapControlV3(const std::string& token)
     }
     if (g_bootstrap_request_id.empty()) {
         g_bootstrap_request_id = RandomControlId("req_bootstrap_");
+        g_bootstrap_request_metadata = MakeControlMetadata();
+        g_bootstrap_request_metadata.request_id = g_bootstrap_request_id;
     }
-    wqn::protocol::v3::RequestMetadata metadata = MakeControlMetadata();
-    metadata.request_id = g_bootstrap_request_id;
-    wqn::protocol::v3::BootstrapData bootstrap;
-    wqn::protocol::v3::Error error;
-    const esp_err_t result = wqn::BootstrapDeviceControlV3(
-        token, metadata, &bootstrap, &error);
-    if (result != ESP_OK) {
-        if (error.code == "UPGRADE_REQUIRED") {
-            g_control_protocol_blocked_this_round = true;
+    if (!g_bootstrap_response_ready) {
+        wqn::protocol::v3::Error error;
+        const esp_err_t result = wqn::BootstrapDeviceControlV3(
+            token, g_bootstrap_request_metadata, &g_bootstrap_response, &error);
+        if (result != ESP_OK) {
+            if (error.code == "UPGRADE_REQUIRED") {
+                g_control_protocol_blocked_this_round = true;
+            }
+            if (error.retryable) g_control_retry_after_ms = error.retry_after_ms;
+            if (error.code == "REQUEST_ID_REUSED") {
+                g_bootstrap_request_id.clear();
+                g_bootstrap_request_metadata = {};
+            }
+            return result;
         }
-        if (error.retryable) {
-            g_control_retry_after_ms = error.retry_after_ms;
-        }
-        return result;
+        g_bootstrap_response_ready = true;
     }
     const wqn::DeviceControlState checkpoint = {
-        bootstrap.config_revision,
-        bootstrap.sync_cursor,
+        g_bootstrap_response.config_revision,
+        g_bootstrap_response.sync_cursor,
     };
+    // A successful RPC is an immutable response awaiting a local commit.
+    // Local I/O failure retries only this commit, never a different request.
     ESP_RETURN_ON_ERROR(
-        wqn::SaveDeviceControlState(checkpoint),
-        kTag,
-        "save v3 bootstrap checkpoint");
+        CommitControlResponse(checkpoint, {}), kTag, "save bootstrap journal");
     g_control_retry_after_ms = 0;
-    g_config_revision = checkpoint.config_revision;
-    g_sync_cursor = checkpoint.sync_cursor;
-    taskENTER_CRITICAL(&g_sync_snapshot_lock);
-    g_sync_journal.config_revision = checkpoint.config_revision;
-    g_sync_journal.sync_cursor = checkpoint.sync_cursor;
-    taskEXIT_CRITICAL(&g_sync_snapshot_lock);
-    ESP_RETURN_ON_ERROR(
-        PersistLatestSyncJournal(),
-        kTag,
-        "save bootstrap sync journal");
     g_bootstrap_complete = true;
     g_bootstrap_request_id.clear();
+    g_bootstrap_request_metadata = {};
+    g_bootstrap_response = {};
+    g_bootstrap_response_ready = false;
     ESP_LOGI(
         kTag,
         "v3 bootstrap complete: config_revision=%llu sync_cursor=%llu",
@@ -2020,32 +2075,39 @@ esp_err_t SyncControlPlaneV3(const std::string& token)
 {
     if (g_sync_request_id.empty()) {
         g_sync_request_id = RandomControlId("req_sync_");
-        // The request id and its fingerprint are an immutable retry unit.
-        // Freeze the locally-authoritative setting with the id: changing the
-        // setting while a transport retry is pending must not reuse the same
-        // id with a different JSON body and trigger REQUEST_ID_REUSED.
+        // Freeze every body field with the ID, not just the local setting.
+        g_sync_request_metadata = MakeControlMetadata();
+        g_sync_request_metadata.request_id = g_sync_request_id;
         g_sync_request_auto_interval_minutes =
             g_auto_sync_interval_minutes.load(std::memory_order_acquire);
     }
-    wqn::protocol::v3::RequestMetadata metadata = MakeControlMetadata();
-    metadata.request_id = g_sync_request_id;
-    wqn::protocol::v3::SyncData sync;
-    wqn::protocol::v3::Error error;
-    const esp_err_t sync_result =
-        wqn::SyncDeviceControlV3(
-            token, metadata, g_sync_request_auto_interval_minutes, &sync, &error);
-    if (sync_result != ESP_OK) {
-        if (error.code == "UPGRADE_REQUIRED") {
-            g_control_protocol_blocked_this_round = true;
+    if (!g_sync_response_ready) {
+        wqn::protocol::v3::Error error;
+        const esp_err_t sync_result = wqn::SyncDeviceControlV3(
+            token, g_sync_request_metadata, g_sync_request_auto_interval_minutes,
+            &g_sync_response, &error);
+        if (sync_result != ESP_OK) {
+            if (error.code == "UPGRADE_REQUIRED") {
+                g_control_protocol_blocked_this_round = true;
+            }
+            if (error.retryable) g_control_retry_after_ms = error.retry_after_ms;
+            if (error.code == "REQUEST_ID_REUSED") {
+                g_sync_request_id.clear();
+                g_sync_request_metadata = {};
+                g_sync_request_auto_interval_minutes = 0;
+            }
+            ESP_LOGW(kTag, "v3 sync failed: %s", esp_err_to_name(sync_result));
+            return sync_result;
         }
-        if (error.retryable) {
-            g_control_retry_after_ms = error.retry_after_ms;
-        }
-        ESP_LOGW(kTag, "v3 sync failed: %s", esp_err_to_name(sync_result));
-        return sync_result;
+        g_sync_response_ready = true;
     }
+    const auto& sync = g_sync_response;
+    const wqn::DeviceControlState checkpoint = {
+        sync.config_revision, sync.sync_cursor,
+    };
+    ESP_RETURN_ON_ERROR(CommitControlResponse(checkpoint, sync.content_targets),
+                        kTag, "commit sync journal checkpoint");
     g_control_retry_after_ms = 0;
-    PublishContentTargets(sync.content_targets);
     // Device settings are local-authoritative. The server echoes the reported
     // value for protocol observability but must never overwrite the NVS value
     // selected on the device.
@@ -2071,25 +2133,10 @@ esp_err_t SyncControlPlaneV3(const std::string& token)
     // Same hint pattern for the mistakes card; -1 (field absent) keeps the
     // card on the pack size instead of advertising an unknown pool.
     wqn::SetWordMistakeCount(sync.word_mistake_count);
-    const wqn::DeviceControlState checkpoint = {
-        sync.config_revision,
-        sync.sync_cursor,
-    };
-    ESP_RETURN_ON_ERROR(
-        wqn::SaveDeviceControlState(checkpoint),
-        kTag,
-        "commit v3 sync checkpoint");
-    g_config_revision = checkpoint.config_revision;
-    g_sync_cursor = checkpoint.sync_cursor;
-    taskENTER_CRITICAL(&g_sync_snapshot_lock);
-    g_sync_journal.config_revision = checkpoint.config_revision;
-    g_sync_journal.sync_cursor = checkpoint.sync_cursor;
-    taskEXIT_CRITICAL(&g_sync_snapshot_lock);
-    ESP_RETURN_ON_ERROR(
-        PersistLatestSyncJournal(),
-        kTag,
-        "commit sync journal checkpoint");
     g_sync_request_id.clear();
+    g_sync_request_metadata = {};
+    g_sync_response = {};
+    g_sync_response_ready = false;
     g_sync_request_auto_interval_minutes = 0;
     ESP_LOGI(
         kTag,
@@ -3273,6 +3320,12 @@ void SyncServiceTask(void*)
              (kFullSyncManual | kFullSyncCredentials)) != 0) {
             ClearFullSyncRetry();
         }
+#if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
+        if ((admitted_full_reasons & kFullSyncCredentials) != 0) {
+            ResetControlExchanges();
+            g_bootstrap_complete = false;
+        }
+#endif
         bool word_outbox_requested = false;
         if (!protocol_suppressed && (full_requested || OutboxWaitDelay() == 0)) {
             // Consume the urgency payload before the release-published ready
@@ -3868,6 +3921,8 @@ esp_err_t BeginContentInstall(const SyncContentTicket& ticket)
     if (!ticket || ContentRefreshBit(ticket.domain) == 0) {
         return ESP_ERR_INVALID_ARG;
     }
+    SyncJournalLock journal_lock;
+    if (!journal_lock) return ESP_ERR_INVALID_STATE;
     bool accepted = false;
     const size_t index = ContentDomainIndex(ticket.domain);
     taskENTER_CRITICAL(&g_sync_snapshot_lock);
@@ -3886,7 +3941,7 @@ esp_err_t BeginContentInstall(const SyncContentTicket& ticket)
     if (!accepted) {
         return ESP_ERR_INVALID_STATE;
     }
-    return PersistLatestSyncJournal();
+    return PersistLatestSyncJournalLocked();
 #else
     (void)ticket;
     return ESP_ERR_NOT_SUPPORTED;
@@ -3903,6 +3958,8 @@ void CompleteContentRefresh(
     if (!ticket || ContentRefreshBit(ticket.domain) == 0) {
         return;
     }
+    SyncJournalLock journal_lock;
+    if (!journal_lock) return;
     const size_t index = ContentDomainIndex(ticket.domain);
     bool accepted = false;
     const std::time_t completion_unix_seconds = CurrentUnixSeconds();
@@ -3963,7 +4020,7 @@ void CompleteContentRefresh(
         }
     }
     taskEXIT_CRITICAL(&g_sync_snapshot_lock);
-    if (accepted && PersistLatestSyncJournal() != ESP_OK) {
+    if (accepted && PersistLatestSyncJournalLocked() != ESP_OK) {
         ESP_LOGE(kTag, "content completion journal save failed: domain=%u",
                  static_cast<unsigned>(ticket.domain));
     }

@@ -133,10 +133,10 @@ esp_err_t SaveAccessToken(const std::string& token);
 esp_err_t ClearAccessToken();
 bool IsValidAccessToken(const std::string& token);
 std::string MaskTokenForLog(const std::string& token);
-esp_err_t LoadDeviceControlState(DeviceControlState* state);
-esp_err_t SaveDeviceControlState(const DeviceControlState& state);
-// Durable coordinator checkpoint. The file is committed through a
-// temp/backup/rename sequence and is safe to replay after a power cut.
+// The journal is the sole control/content checkpoint. Legacy v3 NVS scalar
+// keys are not advanced or imported: they cannot represent an atomic pair.
+// With no journal bootstrap starts at zero; valid v1/v2 journals stay readable.
+// The temp/backup/rename recovery still requires physical power-cut HIL.
 esp_err_t LoadSyncJournal(SyncJournal* journal);
 // [storage-single-writer] Dispatches the commit to the StorageService task so
 // the journal's rename sequence can never interleave with a pack or NVS write

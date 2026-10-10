@@ -24,6 +24,8 @@ uint32_t g_full_sync_retry_magic=0,g_control_retry_after_ms=0;
 int64_t g_full_sync_retry_unix_seconds=0,now_ms=0;
 std::atomic<int64_t> g_full_sync_retry_not_before_ms{0};
 bool g_claim_active=false;
+bool g_bootstrap_complete=false;
+void ResetControlExchanges() {}
 std::time_t CurrentUnixSeconds() { return 1705000000+now_ms/1000; }
 int64_t esp_timer_get_time() { return now_ms*1000; }
 uint32_t esp_random() { return 0; }
