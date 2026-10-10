@@ -23,12 +23,14 @@ constexpr UBaseType_t kForegroundQueueDepth = 4;
 constexpr uint32_t kTaskStackBytes = 20 * 1024;
 constexpr UBaseType_t kStackWarningBytes = 4 * 1024;
 constexpr UBaseType_t kTaskPriority = 6;
-// [hang-fix] Foreground (UI-facing) transactions bound their queue and
-// completion waits. During a pack-sync write storm the service runs
+// [hang-fix] Foreground (UI-facing) transactions budget queue admission and
+// the queued completion wait separately. This is NOT a completion deadline:
+// once kRunning wins, the caller waits portMAX_DELAY to keep its context alive.
+// During a pack-sync write storm the service runs
 // back-to-back ~0.5-1s background writes and HIL showed foreground callers
 // serialized behind them for 12s+; the worst measured single wait was
 // queue_wait 1.7s + transaction 3.2s, so 15s is generous headroom while
-// still turning a wedged SPIFFS into an error instead of a frozen UI.
+// still allowing an unstarted queued command to be abandoned with an error.
 // Background callers keep unbounded waits: they own no UI thread.
 constexpr TickType_t kForegroundWaitTicks = pdMS_TO_TICKS(15000);
 
@@ -142,14 +144,15 @@ void StorageServiceTask(void*)
         esp_err_t result = ESP_FAIL;
         {
             // Serialization, checksums and SPIFFS/NVS bookkeeping otherwise
-            // run at the 40 MHz DFS floor. Boost only for the bounded
-            // transaction; idle operation remains free to downclock.
+            // run at the 40 MHz DFS floor. Boost for this transaction (which
+            // has no running-time bound); idle operation may downclock.
             auto cpu_lease = wqn::runtime::CpuPerformanceLease::TryAcquire();
             result = command.transaction == nullptr
                 ? ESP_ERR_INVALID_ARG
                 : command.transaction(command.context);
         }
-        const int64_t elapsed_ms = (esp_timer_get_time() - started_us) / 1000;
+        const int64_t completed_us = esp_timer_get_time();
+        const int64_t elapsed_ms = (completed_us - started_us) / 1000;
         // ESP-IDF reports this high-water mark in bytes, unlike upstream
         // FreeRTOS which documents stack words.
         const UBaseType_t free_stack_bytes = uxTaskGetStackHighWaterMark(nullptr);
@@ -163,13 +166,15 @@ void StorageServiceTask(void*)
         } else {
             ESP_LOGI(
                 kTag,
-                "storage transaction complete: request=%lu owner=%s queue_wait_ms=%lld elapsed_ms=%lld result=%s stack_free_bytes=%u",
+                "storage transaction complete: request=%lu owner=%s queue_wait_ms=%lld elapsed_ms=%lld result=%s stack_free_bytes=%u clock=esp_timer exec_start_us=%lld exec_end_us=%lld",
                 static_cast<unsigned long>(command.request_id),
                 command.owner == nullptr ? "unknown" : command.owner,
                 static_cast<long long>(queue_wait_ms),
                 static_cast<long long>(elapsed_ms),
                 esp_err_to_name(result),
-                static_cast<unsigned>(free_stack_bytes));
+                static_cast<unsigned>(free_stack_bytes),
+                static_cast<long long>(started_us),
+                static_cast<long long>(completed_us));
         }
         completion->result = result;
         completion->state.store(kCompletionDone, std::memory_order_release);
@@ -267,6 +272,17 @@ esp_err_t ExecuteStorageTransactionInternal(
 
 }  // namespace
 
+// [measure] Global scope on purpose: this file's body is inside
+// namespace wqn::services, so a declaration placed there would declare
+// wqn::services::wqn::StartStorageWriteBench and fail to link. Forward-declared
+// rather than included because the service must not depend upward on the store
+// layer, and this hook is temporary scaffolding for the rewrite measurement
+// (doc/1005-storage-rewrite-todo.md §四). Delete it with the [measure] block in
+// word_study_store.cpp.
+namespace wqn {
+void StartStorageWriteBench();
+}
+
 namespace wqn::services {
 
 esp_err_t StartStorageService()
@@ -321,6 +337,10 @@ esp_err_t StartStorageService()
     g_task = created_task;
     g_starting = false;
     taskEXIT_CRITICAL(&g_start_lock);
+    // [measure] Kick the write bench once the task handle exists. It delays
+    // itself ~25 s first so boot storage traffic has drained and the numbers
+    // are not polluted by startup queue_wait.
+    wqn::StartStorageWriteBench();
     return ESP_OK;
 }
 

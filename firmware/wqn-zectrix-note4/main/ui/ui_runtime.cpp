@@ -21,6 +21,12 @@ constexpr char kTag[] = "wqn_ui_runtime";
 // the window means a double-click writes nothing at all.
 constexpr int64_t kAgentDetailSaveDebounceMs = 500;
 
+// [picker-stale] How long the session picker's rows may keep claiming 运行中
+// before the UI re-reads them. Long enough that an actively-pressing user is not
+// racing a 1-2 s list load, short enough to matter for a list the user is
+// reading rather than glancing at.
+constexpr int64_t kAgentListPollIntervalMs = 10000;
+
 }  // namespace
 
 const char* AppEventKindName(AppEventKind event)
@@ -72,6 +78,10 @@ const char* AppEventKindName(AppEventKind event)
             return "problem-persist";
         case AppEventKind::kSettingsPersist:
             return "settings-persist";
+        case AppEventKind::kAgentListPoll:
+            return "agent-list-poll";
+        case AppEventKind::kWordCardPrefetch:
+            return "word-card-prefetch";
         default:
             return "unknown";
     }
@@ -129,6 +139,17 @@ UiUpdate UiRuntime::DispatchButton(
     const wqn::ButtonEvent& event,
     int64_t event_time_ms)
 {
+    if (wqn::HasBufferedWordObservations(state_.word_app) &&
+        event.type == wqn::ButtonEventType::kLongPress) {
+        if (!word_boundary_pending_) {
+            word_boundary_pending_ = true;
+            word_boundary_event_ = event;
+        }
+        state_.word_app.session.batch_flush_requested = true;
+        state_.word_app.session.batch_retry_after_ms = 0;
+        state_.word_app.message = "正在保存暂存，请稍后重试";
+        return FinishEvent(AppEventKind::kButton, RefreshSchedule::kSelection, true);
+    }
     const RefreshSchedule refresh = ApplyButtonEvent(event, event_time_ms, &state_);
     RetainTimeAppState(state_.time_app);
     return FinishEvent(
@@ -159,12 +180,24 @@ UiUpdate UiRuntime::DispatchWordCloudResult(WordCloudResult& result)
     return FinishEvent(AppEventKind::kWordCloudResult, refresh, changed);
 }
 
+bool UiRuntime::TakeWordSessionStartRequest(
+    wqn::protocol::word_study_v1::CreateSessionRequest* request)
+{
+    return wqn::TakeWordSessionStartRequest(&state_.word_app, request);
+}
+
+void UiRuntime::RestoreWordSessionStartRequest()
+{
+    wqn::RestoreWordSessionStartRequest(&state_.word_app);
+}
+
 bool UiRuntime::TakeWordCandidatePageRequest(
     wqn::protocol::word_study_v1::CandidatePageRequest* request,
+    wqn::PersistedWordSession* snapshot,
     std::string* session_id)
 {
     return wqn::TakeWordCandidatePageRequest(
-        &state_.word_app, request, session_id);
+        &state_.word_app, request, snapshot, session_id);
 }
 
 void UiRuntime::RestoreWordCandidatePageRequest()
@@ -324,6 +357,25 @@ bool UiRuntime::TakeWordObservationEffect(
 UiUpdate UiRuntime::DispatchWordObservationPersistResult(
     esp_err_t result, uint32_t operation_id)
 {
+    if (state_.word_app.session.batch_operation_id == operation_id &&
+        state_.word_app.session.batch_in_flight != 0) {
+        const bool applied = wqn::ApplyWordObservationBatchResult(&state_.word_app, result,
+            operation_id, esp_timer_get_time() / 1000);
+        if (applied && result == ESP_OK) wqn::services::RequestWordOutboxUpload();
+        RefreshSchedule boundary_refresh = RefreshSchedule::kNone;
+        if (applied && result == ESP_OK && !wqn::HasBufferedWordObservations(state_.word_app) &&
+            !state_.word_app.session.observation_effect_ready && word_boundary_pending_) {
+            word_boundary_pending_ = false;
+            // Apply the original navigation/pause gesture once, only after
+            // all buffered events are durable. No second user press required.
+            boundary_refresh = ApplyButtonEvent(word_boundary_event_, esp_timer_get_time() / 1000, &state_);
+        }
+        BuildHomeSummary(&state_);
+        return FinishEvent(AppEventKind::kWordObservationPersist,
+            StrongerSchedule(boundary_refresh,
+                state_.screen == wqn::UiScreen::kWord ? RefreshSchedule::kSelection : RefreshSchedule::kNone),
+            applied);
+    }
     // [persist-worker] Bind the result to the word state it was taken from.
     // The worker ran async; the user may have left the scoped page or switched
     // decks (ResetWordSessionsForScopeChange resets the session, clearing the
@@ -360,6 +412,46 @@ UiUpdate UiRuntime::DispatchWordObservationPersistResult(
         ? RefreshSchedule::kSelection
         : RefreshSchedule::kNone;
     return FinishEvent(AppEventKind::kWordObservationPersist, refresh, true);
+}
+
+UiUpdate UiRuntime::DispatchWordObservationBuffered(const std::string& request_id,
+    const std::string& occurred_at, int64_t now_ms)
+{
+    const bool accepted = wqn::BufferWordObservationEffect(&state_.word_app, request_id, occurred_at, now_ms);
+    if (!accepted) return DispatchWordObservationTakeFailed();
+    BuildHomeSummary(&state_);
+    return FinishEvent(AppEventKind::kWordObservationPersist,
+        state_.screen == wqn::UiScreen::kWord ? RefreshSchedule::kSelection : RefreshSchedule::kNone, true);
+}
+
+bool UiRuntime::TakeWordObservationBatch(uint32_t operation_id, int64_t now_ms,
+    std::vector<wqn::DurableWordObservation>* observations,
+    wqn::PersistedWordSession* advanced_session)
+{
+    return wqn::TakeWordObservationBatch(&state_.word_app, operation_id, now_ms,
+        observations, advanced_session);
+}
+
+void UiRuntime::RequestWordBatchFlush()
+{
+    if (wqn::HasBufferedWordObservations(state_.word_app))
+        state_.word_app.session.batch_flush_requested = true;
+}
+
+bool UiRuntime::TakeWordCardPrefetchEntry(uint32_t operation_id, int64_t now_ms,
+    wqn::WordPackIndexEntry* entry)
+{
+    return wqn::TakeWordCardPrefetchEntry(&state_.word_app, operation_id, now_ms, entry);
+}
+
+UiUpdate UiRuntime::DispatchWordCardPrefetchResult(esp_err_t result, uint32_t operation_id,
+    wqn::WqnWordEntry entry)
+{
+    const bool applied = wqn::ApplyWordCardPrefetchResult(&state_.word_app, operation_id, result,
+        std::move(entry), esp_timer_get_time() / 1000);
+    // A ready cache is invisible; do not trigger an extra EPD refresh/revision.
+    if (applied) ESP_LOGD(kTag, "word RAM prefetch ready: op=%lu", static_cast<unsigned long>(operation_id));
+    return FinishEvent(AppEventKind::kWordCardPrefetch, RefreshSchedule::kNone, false);
 }
 
 UiUpdate UiRuntime::DispatchWordObservationTakeFailed()
@@ -495,6 +587,56 @@ UiUpdate UiRuntime::DispatchAutoSyncSaveResult(esp_err_t result, uint32_t operat
         ? RefreshSchedule::kConfig
         : RefreshSchedule::kNone;
     return FinishEvent(AppEventKind::kSettingsPersist, refresh, true);
+}
+
+UiUpdate UiRuntime::DispatchWordSessionResetResult(
+    esp_err_t result, uint32_t operation_id)
+{
+    wqn::WordAppState& word_app = state_.word_app;
+    if (word_app.scope_reset_save_op_id == 0 ||
+        word_app.scope_reset_save_op_id != operation_id) {
+        ESP_LOGW(kTag, "stale word scope reset result: op=%lu expected=%lu",
+                 static_cast<unsigned long>(operation_id),
+                 static_cast<unsigned long>(word_app.scope_reset_save_op_id));
+        return FinishEvent(AppEventKind::kWordObservationPersist, RefreshSchedule::kNone, false);
+    }
+    word_app.scope_reset_save_op_id = 0;
+    if (result == ESP_OK) {
+        // Durable state is committed (new scope generation, four session files
+        // and the walk cursor gone). NOW install the in-memory half and switch
+        // screens -- the reset never blocked the UI task.
+        // The pending deck is only installed when the user is still on the note
+        // screen waiting for it (the [词] row switches screens on success). The
+        // leave-word-page tail clears the override immediately and submits with
+        // an empty pending deck, so an ACK landing later must not re-install a
+        // scope the user already left, nor yank them back to the word page.
+        const bool switching_screens = !word_app.scope_reset_pending_deck_id.empty();
+        if (switching_screens) {
+            word_app.scoped_deck_id = word_app.scope_reset_pending_deck_id;
+            word_app.scoped_deck_title = word_app.scope_reset_pending_deck_title;
+            state_.screen = wqn::UiScreen::kWord;
+        }
+        wqn::ResetWordSessionsInMemory(&word_app);
+        word_app.scope_reset_pending_deck_id.clear();
+        word_app.scope_reset_pending_deck_title.clear();
+        word_app.scope_reset_pending_valid = false;
+        state_.note_app.message = "词库范围已切换";
+        ESP_LOGI(kTag, "word scope reset committed: switching=%s deck=%s",
+                 switching_screens ? "yes" : "no",
+                 word_app.scoped_deck_id.empty() ? "all"
+                                                 : word_app.scoped_deck_id.c_str());
+    } else {
+        // Keep the old scope AND the armed pending pair so the user can retry
+        // without re-picking the deck. If the transaction died mid-way the new
+        // scope generation is already committed, so every old session file is
+        // inert and boot cannot resume a half-switched scope.
+        state_.note_app.message = "词库切换未保存，请重试";
+        ESP_LOGW(kTag, "word scope reset failed: %s", esp_err_to_name(result));
+    }
+    const RefreshSchedule refresh = state_.screen == wqn::UiScreen::kWord
+        ? RefreshSchedule::kConfig
+        : RefreshSchedule::kNone;
+    return FinishEvent(AppEventKind::kWordObservationPersist, refresh, true);
 }
 
 UiUpdate UiRuntime::DispatchVolumeSaveResult(esp_err_t result, uint32_t operation_id)
@@ -691,6 +833,81 @@ UiUpdate UiRuntime::DispatchAgentDetailPersist(int64_t now_ms)
                        RefreshSchedule::kNone, true);
 }
 
+UiUpdate UiRuntime::DispatchAgentSessionListPoll(int64_t now_ms)
+{
+    // [picker-stale] The picker's 运行中 marker is drawn from each row's
+    // `outcome`, and g_state.sessions has exactly two writers: a list load, and
+    // the terminal-status path that settles the ATTACHED session's row. With the
+    // picker open the device is attached to nothing, so the second cannot run,
+    // and both list-load paths are user gestures (tier cycle onto the tier with
+    // no session locked, status-bar slot 1) that the open picker makes
+    // unreachable -- it returns kHandled ahead of both. So the marker is a fixed
+    // point: it can say 运行中 about a session that finished while the user was
+    // reading the list, and nothing on the device can discover otherwise.
+    //
+    // The user then acts on it. In one direction they lock a session they believe
+    // is live and watch it say nothing; in the other they skip one that just
+    // started. The attach corrects both within a frame or two, but the marker
+    // exists precisely so the user does not have to find out by locking (D-which).
+    //
+    // So the only writer that can reach this state is this tick. Conditions, in
+    // order of how much they narrow it:
+    //
+    //   picker open, list non-empty, at least one row claims running
+    //
+    // The running-row gate is what bounds the cost: the poll fires at most a
+    // couple of times per picker opening and then disarms itself permanently,
+    // because a list with no running row is a list with no marker that can be
+    // lying. A poll is a non-blocking arm (RequestOpenCodeSessionList takes
+    // g_lock briefly and posts to the same single agent worker -- AGENTS.md §5:
+    // no second task, no second TLS session), and when the worker already holds
+    // the slot it degrades to a deferred switch whose tail runs the same load,
+    // so a busy worker costs a retry rather than a lost refresh.
+    //
+    // The trade, stated plainly: while a load is in flight a confirm press is
+    // refused with kWorkerBusy and only logged. That race already exists for the
+    // user-initiated list load, and the running-row gate means a background load
+    // can be in flight for a second or two at most a couple of times per picker
+    // opening. A failed poll is invisible here on purpose -- DrawAgentSessionPicker
+    // reads only the rows, and a list that has not been replaced is still the
+    // list it was drawing.
+    if (state_.screen != wqn::UiScreen::kAi ||
+        state_.ai.tier != wqn::AiTier::kAgent ||
+        state_.agent.session_locked ||
+        state_.agent.sessions.empty()) {
+        return FinishEvent(AppEventKind::kAgentListPoll, RefreshSchedule::kNone, false);
+    }
+    if (now_ms - agent_list_poll_at_ms_ < kAgentListPollIntervalMs) {
+        return FinishEvent(AppEventKind::kAgentListPoll, RefreshSchedule::kNone, false);
+    }
+    bool any_running = false;
+    for (const wqn::AgentSessionOption& option : state_.agent.sessions) {
+        if (option.outcome == wqn::OpenCodeSessionOutcome::kRunning) {
+            any_running = true;
+            break;
+        }
+    }
+    if (!any_running) {
+        // [picker-stale] Disarmed for this picker opening: nothing is claiming a
+        // run, so nothing can be lying. Not latched -- a later fetch may bring
+        // the marker back, and it should be polled again if it does.
+        return FinishEvent(AppEventKind::kAgentListPoll, RefreshSchedule::kNone, false);
+    }
+    // Set on attempt, not on success: a rejected poll (worker busy) must not
+    // retry on the next tick, or a chain that outlives one interval spins.
+    agent_list_poll_at_ms_ = now_ms;
+    wqn::OpenCodeRejectReason reason = wqn::OpenCodeRejectReason::kNone;
+    if (wqn::RequestOpenCodeSessionList(&reason) != ESP_OK) {
+        ESP_LOGW(kTag, "Agent picker: stale-marker refresh refused (%s)",
+                 AgentRejectLabel(reason));
+        return FinishEvent(AppEventKind::kAgentListPoll, RefreshSchedule::kNone, false);
+    }
+    ESP_LOGI(kTag, "Agent picker: stale-marker refresh requested");
+    // The next snapshot carries the new rows; the renderer's signature already
+    // carries each row's running bit, so the repaint needs no extra push here.
+    return FinishEvent(AppEventKind::kAgentListPoll, RefreshSchedule::kNone, false);
+}
+
 UiUpdate UiRuntime::DispatchTimeTick(int64_t now_ms)
 {
     const wqn::TimeAppState before = state_.time_app;
@@ -854,15 +1071,26 @@ UiUpdate UiRuntime::DispatchAiViewportFollow()
     }
     int32_t min_scroll = 0;
     int32_t max_scroll = 0;
-    GetAiScrollBounds(snapshot, state_.ai.expand_content, &min_scroll, &max_scroll);
+    // The Agent tier's band is only up while there is something to answer, so
+    // the reserve the follow computes with is the one the renderer draws with.
+    GetAiScrollBounds(snapshot, state_.ai.expand_content,
+                      agent_tier ? AiBottomReserve(state_.agent) : 0, &min_scroll,
+                      &max_scroll);
 
-    // Has the answer body started? The Agent mirrors its text straight into
-    // the history, so the newest entry IS the body. STD/Pro streams into
-    // assistant_partial until the seal, so the mirror alone cannot answer this
-    // -- a partial that has not been sealed yet is still a started body.
+    // Has the answer body started? Both tiers now mirror their streamed text
+    // straight into history, so the newest non-empty assistant entry IS the body
+    // on either one and GetAiNewestAnswerTopOffsetLines can answer it directly.
+    // assistant_partial stays in the predicate as the tier-independent fallback:
+    // it is set unconditionally on every delta while the mirror rides the 50 ms
+    // render watermark (ai_session.cpp), so on the tick a body starts it can be
+    // non-empty up to a watermark period before the history write lands.
+    // `answer_top` is still consumed only by the Agent tier -- the STD viewport
+    // follow has no per-tier scroll offset of its own to park.
     int32_t answer_top = 0;
     const bool body_started =
-        GetAiNewestAnswerTopOffsetLines(snapshot, state_.ai.expand_content, &answer_top) ||
+        GetAiNewestAnswerTopOffsetLines(snapshot, state_.ai.expand_content,
+                                        agent_tier ? AiBottomReserve(state_.agent) : 0,
+                                        &answer_top) ||
         (!agent_tier && !state_.ai.assistant_partial.empty());
 
     if (body_started) {

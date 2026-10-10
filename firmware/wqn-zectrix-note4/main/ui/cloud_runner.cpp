@@ -212,6 +212,14 @@ bool TakeCloudResultToApply(CloudDomain domain, uint32_t* generation)
     return true;
 }
 
+bool HasCloudResultPending(CloudDomain domain)
+{
+    const DomainResultMailbox& box = g_result_mailbox[static_cast<size_t>(domain)];
+    const uint32_t pending = box.pending_generation.load(std::memory_order_acquire);
+    return pending != 0 &&
+           pending != box.acked_generation.load(std::memory_order_relaxed);
+}
+
 void AckCloudResult(CloudDomain domain, uint32_t generation)
 {
     g_result_mailbox[static_cast<size_t>(domain)].acked_generation.store(

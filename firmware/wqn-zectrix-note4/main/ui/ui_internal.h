@@ -37,6 +37,13 @@
 #include "ui/assets/wqn_bitmap_asset.h"
 #include "display/display_types.h"
 
+// [agent] Forward-declared rather than including opencode_session.h here: this
+// header only needs the type for the label below, and the enum has an explicit
+// underlying type so the declaration is complete on its own.
+namespace wqn {
+enum class OpenCodeRejectReason : uint8_t;
+}  // namespace wqn
+
 namespace device_ui_internal {
 
 class UiRuntime;
@@ -186,6 +193,12 @@ struct WordCloudRequest {
     // -- but without carrying the id the device's deck choice silently never
     // reached the server at all. Mirrors NoteCloudRequest::notebook_id.
     char deck_id[37] = {};
+    // [ui-gates] kFetchSessionPage only: handle of the session snapshot parked
+    // for this page (see g_page_extension in word_cloud.cpp). The snapshot is
+    // 168 bytes but not trivially copyable, and CloudJob must stay POD for the
+    // union -- and only one candidate page is ever in flight, so a handle is
+    // cheaper than a copy and just as safe.
+    uint32_t page_extension_handle = 0;
     // [deck-scope] Scope epoch sampled when the request was QUEUED (session
     // ops only). The runner stamps it into the persisted session (the store
     // rejects a save whose epoch is stale) and echoes it in the result so the
@@ -400,6 +413,12 @@ void NotifyUiTask();
 void PublishCloudResult(CloudDomain domain, uint32_t generation);
 bool TakeCloudResultToApply(CloudDomain domain, uint32_t* generation);
 void AckCloudResult(CloudDomain domain, uint32_t generation);
+// [deferral-observability] Non-consuming twin of TakeCloudResultToApply: is a
+// published result still waiting to be applied? Needed because the
+// commit-pending deferral in DeviceUiTask only misbehaves when it is actually
+// holding a result back -- probing with Take* would consume it. Same mailbox
+// state, same atomics, no side effects.
+bool HasCloudResultPending(CloudDomain domain);
 
 static_assert(std::is_trivially_copyable_v<TodoCloudResultReady>);
 static_assert(std::is_trivially_copyable_v<WordCloudResultReady>);
@@ -441,10 +460,16 @@ bool QueueTodoComplete(const std::string& todo_id);
 bool QueueWordReviewRefresh();
 bool QueueWordSessionStart(
     const wqn::protocol::word_study_v1::CreateSessionRequest& request);
+// [ui-gates] `snapshot` is the session as of THIS request: the runner extends
+// and persists it, so a page that lands after the user has answered more words
+// cannot clobber the newer durable state (the apply step stamps it).
 bool QueueWordCandidatePage(
     const std::string& session_id,
-    const wqn::protocol::word_study_v1::CandidatePageRequest& request);
+    const wqn::protocol::word_study_v1::CandidatePageRequest& request,
+    const wqn::PersistedWordSession& snapshot);
+void PumpWordSessionStart(UiRuntime* runtime);
 void PumpWordCandidatePrefetch(UiRuntime* runtime);
+void PumpWordCardPrefetch(UiRuntime* runtime);
 // Rebuilds the note screen's [词] rows from word_app.deck_catalog, excluding
 // the current default deck (it lives on the word page itself).
 void RebuildNoteWordDeckRows(wqn::UiState* state);
@@ -649,6 +674,7 @@ const char* AiStatusLabel(wqn::AiSessionStatus status);
 void GetAiScrollBounds(
     std::shared_ptr<const wqn::AiHistorySnapshot> snapshot,
     bool expand_content,
+    int bottom_pad,
     int32_t* out_min_scroll,
     int32_t* out_max_scroll);
 
@@ -670,6 +696,7 @@ AiHistoryLayout ComputeAiHistoryLayout(
 bool GetAiTurnJumpOffsetLines(
     std::shared_ptr<const wqn::AiHistorySnapshot> snapshot,
     bool expand_content,
+    int bottom_pad,
     int32_t current_scroll,
     int direction,
     int32_t* out_scroll);
@@ -681,6 +708,7 @@ bool GetAiTurnJumpOffsetLines(
 bool GetAiNewestAnswerTopOffsetLines(
     std::shared_ptr<const wqn::AiHistorySnapshot> snapshot,
     bool expand_content,
+    int bottom_pad,
     int32_t* out_scroll);
 
 // [agent] The Agent tier is rendered by the AI page; this is its branch.
@@ -688,9 +716,16 @@ esp_err_t RenderAgentAiToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule
 // Shared chat-viewport draw (page_ai.cpp). The Agent tier renders its own
 // status bar and bottom band but reuses this verbatim, so the two tiers can
 // never disagree about how a bubble or a tool block looks.
+//
+// `bottom_pad` is what this frame leaves clear at the panel's bottom. Pass 0
+// unless the caller actually draws something there: RenderAiHistoryViewport and
+// the three scroll helpers above all read the same value, and a caller that
+// answers it one way for the renderer and another for the clamp is the desync
+// their comments warn about.
 void RenderAiHistoryViewport(const wqn::AiSessionState& ai,
                              const std::shared_ptr<const wqn::AiHistorySnapshot>& snapshot,
-                             int32_t scroll_offset_lines);
+                             int32_t scroll_offset_lines,
+                             int bottom_pad);
 // Option-bar slots for the Agent tier's two-choice states. The order is the
 // ↑/↓ cycle order and the confirm action runs the focused slot.
 //
@@ -715,6 +750,22 @@ enum class AgentOptionMode : uint8_t {
     kQuestion,      // gateway form pending: projected options + 自定义回答
 };
 AgentOptionMode AgentOptionModeFor(const wqn::AgentSessionState& agent);
+// [band] How much of the panel's bottom the current frame leaves clear for the
+// Agent tier's option bar: its full height while there is something to answer,
+// and 0 for everything else -- including on the STD/Flash tier, which has no
+// bottom band at all.
+//
+// Every caller that needs this number asks here rather than deriving it, because
+// the renderer and the scroll clamp must agree. A tier that reserved 22 for the
+// clip and 0 for the clamp would let a keypress ask for a window the viewport
+// cannot draw -- which is precisely the desync page_ai.cpp's geometry comments
+// have been warning about for five rounds.
+int AiBottomReserve(const wqn::AgentSessionState& agent);
+// [agent] Names why an Agent request was refused. Every one of these used to
+// log the same "busy or empty list", which is indistinguishable when reading a
+// device log after the fact. Was static in ui_input.cpp; promoted when the
+// picker's stale-marker refresh (ui_runtime.cpp) became a second caller.
+const char* AgentRejectLabel(wqn::OpenCodeRejectReason reason);
 // The focused slot, clamped to the two the current mode actually offers.
 AgentOption AgentFocusedOption(AgentOptionMode mode, uint8_t focused);
 const char* AgentOptionLabel(AgentOption option);

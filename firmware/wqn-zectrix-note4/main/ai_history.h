@@ -98,8 +98,34 @@ public:
 
     // Replace a known message without changing order. The kind guard prevents a
     // late event from overwriting a different message after eviction/clear.
+    //
+    // [evict-recovery] The id can be gone for two very different reasons -- the ring
+    // evicted it, or it never belonged to this kind -- and the return value
+    // cannot tell them apart, which mattered once AiSession began mirroring
+    // streamed text into history on every render tick (doc/1005 item D1): a
+    // long answer grows one entry for its whole lifetime, so eviction became
+    // reachable mid-answer, and a caller that mistook "evicted" for "kind
+    // mismatch" would re-append and duplicate the bubble while a caller that
+    // mistook it for success would lose the answer outright. Contains()
+    // answers which of the two it was.
     bool ReplaceText(ChatMessageId id, ChatMessageKind expected_kind,
                      std::string_view text, int64_t now_ms);
+
+    // True while `id` is still in the ring AT ALL, with any kind. The streaming
+    // mirror needs to know which of two very different things ReplaceText's
+    // false return meant -- "the ring evicted the entry I have been growing for
+    // the whole answer" (safe to re-append) or "this id belongs to some other
+    // message" (a logic error; re-appending duplicates the bubble) -- and the
+    // bare bool cannot tell them apart.
+    //
+    // [evict-recovery] There is deliberately no kind parameter. The caller has
+    // just been told the entry does not carry the kind it expected, so "is it
+    // here with that kind?" is a question the false it already holds answers.
+    // The discriminator has to be presence alone; an earlier version took the
+    // kind and therefore returned false for BOTH cases, which made the recovery
+    // branch unconditional -- exactly the duplicate-bubble behaviour it was
+    // written to prevent.
+    bool Contains(ChatMessageId id) const;
 
     bool PopLastIf(ChatMessageKind kind);
     std::shared_ptr<const AiHistorySnapshot> Snapshot() const;

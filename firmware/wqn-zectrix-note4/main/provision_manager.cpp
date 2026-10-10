@@ -77,6 +77,12 @@ void ProvisionTask(void*)
         }
 
         portal_ptr->SetSsidPrefix(kApSsidPrefix);
+        // [wifi-redundancy] The legacy-key migration normally already ran in
+        // InitStorage. Re-run it here (idempotent, three NVS reads when there is
+        // nothing to do) so a device whose boot attempt was refused still shows
+        // its stored networks in the portal instead of an empty list. This runs
+        // on the wqn_prov task, never the UI task.
+        wqn::MigrateLegacyWifiCredentialsIfNeeded();
         wqn::WifiCredentialStore initial_store;
         const esp_err_t load_result = wqn::LoadWifiCredentialStore(&initial_store);
         if (load_result != ESP_OK) {
@@ -107,6 +113,11 @@ void ProvisionTask(void*)
                 role == wqn::provision::NetworkRole::kPrimary
                 ? wqn::WifiCredentialRole::kPrimary
                 : wqn::WifiCredentialRole::kBackup;
+            // [wifi-redundancy] Migrate first, for the same reason the
+            // connectivity path does: a role write over an unmigrated legacy
+            // store would otherwise reject a backup slot (the store looks empty)
+            // or drop the legacy network. Runs on the portal's httpd task.
+            wqn::MigrateLegacyWifiCredentialsIfNeeded();
             const esp_err_t result = wqn::SetWifiCredentialForRole(
                 storage_role, ssid, password, keep_existing_password);
             if (result != ESP_OK) {

@@ -15,12 +15,71 @@
 #include "opencode_session.h"
 #include "power_manager.h"
 #include "runtime/sleep_diagnostics.h"
+#include "word_pack.h"
 #include "services/connectivity_service.h"
 #include "services/sync_service.h"
 
 namespace device_ui_internal {
 
 constexpr char kTag[] = "wqn_ui";
+
+// [persist-worker] The §4.2 window for settings-page actions: the persist
+// worker's busy flag OR any domain's commit_state == kPersisting, which is
+// wider than "worker busy" because it also covers the Prepare->reserve gap
+// where the effect is armed but not yet enqueued.
+//
+// Both the settings-row Confirm and the factory-reset dialog must use this one
+// predicate. The dialog used to test only IsAnyPersistBusy(), so it would erase
+// NVS underneath an observation that was armed but not yet enqueued.
+bool AnyLocalPersistPending(const wqn::UiState& state)
+{
+    return device_ui_internal::IsAnyPersistBusy() ||
+        wqn::HasBufferedWordObservations(state.word_app) ||
+        state.word_app.session.commit_state ==
+            wqn::WordObservationCommitState::kPersisting ||
+        state.note_app.session.commit_state ==
+            wqn::NoteObservationCommitState::kPersisting ||
+        state.problem_app.commit_state ==
+            wqn::ProblemVerdictCommitState::kPersisting;
+}
+
+// [dev-diag] Forces a full word-pack re-download so a HIL run can hold a
+// multi-MB pack write in flight while an observation advances -- the load the
+// C.2 acceptance criterion measures, and which no production path generates on a
+// healthy device. Production calls only, no test-only branch:
+//   1. InvalidateWordPackManifest() drops ONLY the manifest, so
+//      `!had_local_manifest` makes the next pack sync re-fetch everything. The
+//      pack files are left for the lane to clear: resetting the whole cache here
+//      measured 25.7 s on a device holding multi-MB packs, which froze the UI
+//      task this action runs on.
+//   2. RequestContentRefresh(kWordPacks) marks the phase pending and wakes the
+//      sync task;
+//   3. QueueWordReviewRefresh() claims the ticket and queues the bulk-lane pack
+//      sync -- the same call the word page makes on entry, and whose own
+//      NOT_FOUND branch clears the leftover pack files off the UI task.
+// Only the content phase is forced; nothing else about the sync round changes.
+void RequestWordPackRedownload(wqn::UiState* state)
+{
+    if (state == nullptr) {
+        return;
+    }
+    const esp_err_t invalidate_result = wqn::InvalidateWordPackManifest();
+    if (invalidate_result != ESP_OK) {
+        state->settings.notice = "词库包清单清除失败";
+        ESP_LOGE(
+            kTag,
+            "word pack manifest invalidate failed: %s",
+            esp_err_to_name(invalidate_result));
+        return;
+    }
+    wqn::services::RequestContentRefresh(wqn::services::SyncContentDomain::kWordPacks);
+    if (QueueWordReviewRefresh()) {
+        state->settings.notice = "已重下词库包，去词页看";
+        ESP_LOGW(kTag, "dev: word pack redownload requested");
+    } else {
+        state->settings.notice = IsWordCloudBusy() ? "单词同步中" : "词库包同步失败";
+    }
+}
 
 RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiState* state)
 {
@@ -218,8 +277,9 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
         }
         if (short_press && event.button == wqn::ButtonId::kConfirm) {
             if (settings.word_deck_selected < settings.word_deck_options.size() &&
-                state->word_app.session.commit_state ==
-                    wqn::WordObservationCommitState::kPersisting) {
+                (wqn::HasBufferedWordObservations(state->word_app) ||
+                 state->word_app.session.commit_state == wqn::WordObservationCommitState::kPersisting)) {
+                state->word_app.session.batch_flush_requested = true;
                 // A word answer is still pending (kPersisting spans Prepare ->
                 // worker Apply, so it also covers the Prepare->reserve gap where
                 // persist-busy is briefly false but the effect is still armed):
@@ -275,15 +335,39 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
         return RefreshSchedule::kNone;
     }
 
-    // [dev-diag] kBattery/kStorage/kDevInfo/kDevSync/kDevErrors/kSleepDiag
-    // share the read-only dialog contract: confirm (short or long) closes;
-    // up/down do nothing.
+    // [dev-diag] kBattery/kStorage/kDevInfo/kDevErrors/kSleepDiag share the
+    // read-only dialog contract: confirm (short or long) closes; up/down do
+    // nothing. kDevSync is deliberately NOT in this list -- see its own block
+    // below, which is the one dev dialog that can act.
     if (state->settings.dialog == wqn::SettingsDialog::kBattery ||
         state->settings.dialog == wqn::SettingsDialog::kStorage ||
         state->settings.dialog == wqn::SettingsDialog::kDevInfo ||
-        state->settings.dialog == wqn::SettingsDialog::kDevSync ||
         state->settings.dialog == wqn::SettingsDialog::kDevErrors ||
         state->settings.dialog == wqn::SettingsDialog::kSleepDiag) {
+        if (event.button == wqn::ButtonId::kConfirm && (short_press || long_press)) {
+            state->settings.dialog = wqn::SettingsDialog::kNone;
+            return RefreshSchedule::kConfig;
+        }
+        return RefreshSchedule::kNone;
+    }
+
+    // [dev-diag] The sync dialog is the one dev dialog that can act: a double
+    // Confirm re-downloads the word packs. That is the only way to hold a
+    // multi-MB pack write in flight on demand -- the load the C.2 HIL criterion
+    // measures, and which no production path generates on a healthy device (the
+    // word page only syncs when its local manifest is missing or in error).
+    //
+    // Double-press, not long-press: long-press Confirm is the "leave/back"
+    // gesture throughout the settings tree, so hijacking it for an action that
+    // throws away downloaded content would break that convention and invite
+    // misfires. Double-press Confirm is unused in the settings tree and is a
+    // deliberate gesture, which is what this wants.
+    if (state->settings.dialog == wqn::SettingsDialog::kDevSync) {
+        if (event.button == wqn::ButtonId::kConfirm &&
+            event.type == wqn::ButtonEventType::kDoublePress) {
+            RequestWordPackRedownload(state);
+            return RefreshSchedule::kConfig;
+        }
         if (event.button == wqn::ButtonId::kConfirm && (short_press || long_press)) {
             state->settings.dialog = wqn::SettingsDialog::kNone;
             return RefreshSchedule::kConfig;
@@ -295,8 +379,12 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
         if (long_press && event.button == wqn::ButtonId::kConfirm) {
             // [persist-worker] Defensive second line behind the main-page gate:
             // a factory reset erases NVS and reboots -- never do it while a
-            // durable local write is still in flight on the persist worker.
-            if (device_ui_internal::IsAnyPersistBusy()) {
+            // durable local write is in flight or armed. Uses the full §4.2
+            // window (worker busy OR any domain armed), not just the worker
+            // flag, so an armed observation cannot be erased underneath the
+            // user.
+            if (AnyLocalPersistPending(*state)) {
+                state->word_app.session.batch_flush_requested = true;
                 state->settings.notice = "正在保存，请稍后";
                 return RefreshSchedule::kConfig;
             }
@@ -317,6 +405,11 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
 
     if (state->settings.dialog == wqn::SettingsDialog::kPowerOff) {
         if (long_press && event.button == wqn::ButtonId::kConfirm) {
+            if (wqn::HasBufferedWordObservations(state->word_app)) {
+                state->word_app.session.batch_flush_requested = true;
+                state->settings.notice = "正在保存暂存，请稍后关机";
+                return RefreshSchedule::kConfig;
+            }
             // [power-fix] Hand off to the PowerCoordinator: it whites the
             // panel on the EPD owner task, quiesces services and cuts the
             // latch. The request re-arms itself while quiesce is busy, so
@@ -443,15 +536,8 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
     // Prepare->reserve gap -- that work would contend with or queue behind the
     // persist worker's transaction and re-stall the UI. Refuse the action with
     // a notice; nothing is opened, read or written.
-    const bool persist_pending =
-        device_ui_internal::IsAnyPersistBusy() ||
-        state->word_app.session.commit_state ==
-            wqn::WordObservationCommitState::kPersisting ||
-        state->note_app.session.commit_state ==
-            wqn::NoteObservationCommitState::kPersisting ||
-        state->problem_app.commit_state ==
-            wqn::ProblemVerdictCommitState::kPersisting;
-    if (persist_pending) {
+    if (AnyLocalPersistPending(*state)) {
+        state->word_app.session.batch_flush_requested = true;
         state->settings.notice = "正在保存，请稍后";
         return RefreshSchedule::kConfig;
     }
@@ -620,7 +706,7 @@ static bool AnswerBodyStarted(
 {
     int32_t probe = 0;
     if (device_ui_internal::GetAiNewestAnswerTopOffsetLines(
-            snapshot, ai.expand_content, &probe)) {
+            snapshot, ai.expand_content, /*bottom_pad=*/0, &probe)) {
         return true;
     }
     return ai.tier != wqn::AiTier::kAgent && !ai.assistant_partial.empty();
@@ -640,8 +726,9 @@ static bool ApplyAgentTurnJump(wqn::UiState* state, int direction)
     }
     int32_t next = 0;
     if (!device_ui_internal::GetAiTurnJumpOffsetLines(
-            snapshot, state->ai.expand_content, state->agent.ui.scroll_offset_lines,
-            direction, &next)) {
+            snapshot, state->ai.expand_content,
+            device_ui_internal::AiBottomReserve(state->agent),
+            state->agent.ui.scroll_offset_lines, direction, &next)) {
         return false;
     }
     // [follow] Write through the backend, not the UI copy: the next
@@ -652,7 +739,9 @@ static bool ApplyAgentTurnJump(wqn::UiState* state, int direction)
     int32_t min_scroll = 0;
     int32_t max_scroll = 0;
     device_ui_internal::GetAiScrollBounds(
-        snapshot, state->ai.expand_content, &min_scroll, &max_scroll);
+        snapshot, state->ai.expand_content,
+        device_ui_internal::AiBottomReserve(state->agent), &min_scroll,
+        &max_scroll);
     wqn::SetOpenCodeScrollOffsetClamped(next, min_scroll, max_scroll);
     wqn::SetOpenCodeFollowState(false, /*user_moved=*/true);
     state->agent.ui.scroll_offset_lines = next;
@@ -777,6 +866,28 @@ static RefreshSchedule ApplyAgentOptionBarEvent(
     return RefreshSchedule::kNone;
 }
 
+// [agent] Names why an Agent request was refused. Every one of these used to
+// log the same "busy or empty list", which is indistinguishable when reading a
+// device log after the fact. Switching away from a run is no longer one of
+// them: with a stream attached the entry points detach and carry on. Declared in
+// ui_internal.h since the picker's stale-marker refresh became a second caller.
+const char* AgentRejectLabel(wqn::OpenCodeRejectReason reason)
+{
+    switch (reason) {
+        case wqn::OpenCodeRejectReason::kWorkerBusy:
+            return "worker busy with a bounded read";
+        case wqn::OpenCodeRejectReason::kLeaseBusy:
+            return "sleep lease held elsewhere";
+        case wqn::OpenCodeRejectReason::kNoSelection:
+            return "no session selected";
+        case wqn::OpenCodeRejectReason::kNoSession:
+            return "no current session";
+        case wqn::OpenCodeRejectReason::kNone:
+            break;
+    }
+    return "unspecified";
+}
+
 // Session picker: confirm locks the focused session, a second confirm within
 // the window re-attaches to its live stream, long-confirm creates a new one.
 // Same gesture map the retired standalone page used, so nothing has to be
@@ -789,10 +900,12 @@ static RefreshSchedule ApplyAgentPickerEvent(
     constexpr int64_t kAgentPickerWindowMs = 1000;
     if (event.button == wqn::ButtonId::kConfirm) {
         if (event.type == wqn::ButtonEventType::kLongRelease) {
-            if (wqn::CreateNewOpenCodeSession() == ESP_OK) {
+            wqn::OpenCodeRejectReason reason = wqn::OpenCodeRejectReason::kNone;
+            if (wqn::CreateNewOpenCodeSession(&reason) == ESP_OK) {
                 ESP_LOGI(kTag, "Agent picker: new session");
             } else {
-                ESP_LOGW(kTag, "Agent picker: new session rejected");
+                ESP_LOGW(kTag, "Agent picker: new session rejected (%s)",
+                         AgentRejectLabel(reason));
             }
             SyncAgentSnapshot(state);
             return RefreshSchedule::kAi;
@@ -801,30 +914,36 @@ static RefreshSchedule ApplyAgentPickerEvent(
             if (state->gestures.last_agent_confirm_tap_ms > 0 &&
                 now_ms - state->gestures.last_agent_confirm_tap_ms <= kAgentPickerWindowMs) {
                 state->gestures.last_agent_confirm_tap_ms = 0;
-                if (wqn::ObserveOpenCodeSession() == ESP_OK) {
+                wqn::OpenCodeRejectReason reason = wqn::OpenCodeRejectReason::kNone;
+                if (wqn::ObserveOpenCodeSession(&reason) == ESP_OK) {
                     ESP_LOGI(kTag, "Agent picker: observe");
                 } else {
-                    ESP_LOGW(kTag, "Agent picker: observe rejected");
+                    ESP_LOGW(kTag, "Agent picker: observe rejected (%s)",
+                             AgentRejectLabel(reason));
                 }
                 SyncAgentSnapshot(state);
                 return RefreshSchedule::kAi;
             }
             state->gestures.last_agent_confirm_tap_ms = now_ms;
-            if (wqn::LockSelectedOpenCodeSession() == ESP_OK) {
+            wqn::OpenCodeRejectReason reason = wqn::OpenCodeRejectReason::kNone;
+            if (wqn::LockSelectedOpenCodeSession(&reason) == ESP_OK) {
                 ESP_LOGI(kTag, "Agent picker: lock session");
                 state->agent_option.focused = 0;
             } else {
-                ESP_LOGW(kTag, "Agent picker: lock rejected (busy or empty list)");
+                ESP_LOGW(kTag, "Agent picker: lock rejected (%s)",
+                         AgentRejectLabel(reason));
             }
             SyncAgentSnapshot(state);
             return RefreshSchedule::kAi;
         }
         if (event.type == wqn::ButtonEventType::kDoublePress) {
             state->gestures.last_agent_confirm_tap_ms = 0;
-            if (wqn::ObserveOpenCodeSession() == ESP_OK) {
+            wqn::OpenCodeRejectReason reason = wqn::OpenCodeRejectReason::kNone;
+            if (wqn::ObserveOpenCodeSession(&reason) == ESP_OK) {
                 ESP_LOGI(kTag, "Agent picker: observe (fast)");
             } else {
-                ESP_LOGW(kTag, "Agent picker: observe rejected");
+                ESP_LOGW(kTag, "Agent picker: observe rejected (%s)",
+                         AgentRejectLabel(reason));
             }
             SyncAgentSnapshot(state);
             return RefreshSchedule::kAi;
@@ -920,13 +1039,45 @@ static RefreshSchedule ApplyStatusBarEditEvent(
                 if (prev_tier == wqn::AiTier::kFlash && next != wqn::AiTier::kFlash) {
                     wqn::StopFlashSession();
                 }
+                // [agent] B3 / D-lease: leaving the Agent tier drops its stream
+                // and its sleep lease. The cloud run, if any, keeps going --
+                // detaching is not a cancel. Coming back re-attaches below, so
+                // this is a release rather than a teardown.
+                if (prev_tier == wqn::AiTier::kAgent && next != wqn::AiTier::kAgent) {
+                    wqn::LeaveOpenCodeAgentTier();
+                }
                 // [agent] Arriving on the Agent tier with no locked session shows
                 // the picker, so fetch the list now rather than making the user
                 // press the session button first. Failure is not fatal: the
                 // picker renders the backend's last activity text instead.
                 if (next == wqn::AiTier::kAgent && state->agent.current_session_id.empty()) {
-                    if (wqn::RequestOpenCodeSessionList() != ESP_OK) {
-                        ESP_LOGW(kTag, "AI status-bar: agent session list request failed");
+                    wqn::OpenCodeRejectReason reason =
+                        wqn::OpenCodeRejectReason::kNone;
+                    if (wqn::RequestOpenCodeSessionList(&reason) != ESP_OK) {
+                        ESP_LOGW(kTag,
+                                 "AI status-bar: agent session list request failed (%s)",
+                                 AgentRejectLabel(reason));
+                    }
+                } else if (next == wqn::AiTier::kAgent &&
+                           state->agent.session_locked && !state->agent.stream_active) {
+                    // [agent] B1: arriving on the Agent tier with a session
+                    // already locked but no stream behind it re-attaches. Without
+                    // this, leaving and coming back left the previous session's
+                    // transcript on screen with nothing feeding it -- which is
+                    // symptom 3 ("entering a running session receives nothing"),
+                    // just re-reachable through a tier cycle instead of a page
+                    // entry. The transcript lives in the history channel and is
+                    // not cleared, so this re-reads the stream, not the bubbles.
+                    //
+                    // The !stream_active half matters: a stream still attached
+                    // needs nothing, and ObserveOpenCodeSession would refuse on
+                    // the busy worker anyway -- but asserting it here keeps the
+                    // log quiet about a state that is not a failure.
+                    wqn::OpenCodeRejectReason reason =
+                        wqn::OpenCodeRejectReason::kNone;
+                    if (wqn::ObserveOpenCodeSession(&reason) != ESP_OK) {
+                        ESP_LOGW(kTag, "AI status-bar: agent re-attach refused (%s)",
+                                 AgentRejectLabel(reason));
                     }
                 }
                 // A stale option-bar focus must not survive a tier change: the
@@ -954,12 +1105,16 @@ static RefreshSchedule ApplyStatusBarEditEvent(
                     // accepted: a picker over an in-flight command could lock a
                     // session the worker is not ready to backfill, and Observe
                     // is only reachable from the picker.
-                    if (wqn::RequestOpenCodeSessionList() == ESP_OK) {
+                    wqn::OpenCodeRejectReason reason =
+                        wqn::OpenCodeRejectReason::kNone;
+                    if (wqn::RequestOpenCodeSessionList(&reason) == ESP_OK) {
                         state->agent.session_locked = false;
                         state->agent.selected_session = 0;
                         ESP_LOGI(kTag, "AI status-bar: agent session picker");
                     } else {
-                        ESP_LOGW(kTag, "AI status-bar: agent session list request failed");
+                        ESP_LOGW(kTag,
+                                 "AI status-bar: agent session list request failed (%s)",
+                                 AgentRejectLabel(reason));
                     }
                     return RefreshSchedule::kAi;
                 }
@@ -1378,7 +1533,9 @@ RefreshSchedule ApplyButtonEvent(
         int32_t min_scroll = 0;
         int32_t max_scroll = 0;
         device_ui_internal::GetAiScrollBounds(
-            snapshot, state->ai.expand_content, &min_scroll, &max_scroll);
+            snapshot, state->ai.expand_content,
+            device_ui_internal::AiBottomReserve(state->agent), &min_scroll,
+            &max_scroll);
         // [follow] A manual scroll is the user taking the viewport back: the
         // follow retires for the rest of the turn and the conditional recenter
         // must leave the viewport where the user put it. The one exception is a
@@ -1443,8 +1600,10 @@ RefreshSchedule ApplyButtonEvent(
         if (snapshot != nullptr && !snapshot->messages.empty()) {
             int32_t min_scroll = 0;
             int32_t max_scroll = 0;
+            // 0: this tier has no bottom band, so it reserves nothing.
             device_ui_internal::GetAiScrollBounds(
-                snapshot, state->ai.expand_content, &min_scroll, &max_scroll);
+                snapshot, state->ai.expand_content, /*bottom_pad=*/0, &min_scroll,
+                &max_scroll);
             const int32_t current = wqn::GetAiScrollOffsetLines();
             if (event.button == wqn::ButtonId::kUp) {
                 // Up = "older" content above. Scroll band shifts content down.
@@ -1640,22 +1799,12 @@ RefreshSchedule ApplyButtonEvent(
     }
     if (state->screen == wqn::UiScreen::kWord &&
         wqn::WordAppSignature(state->word_app) != old_word_signature) {
-        wqn::protocol::word_study_v1::CreateSessionRequest session_request;
-        session_request.metadata = wqn::services::MakeDeviceRequestMetadata();
-        if (wqn::TakeWordSessionStartRequest(&state->word_app, &session_request) &&
-            !QueueWordSessionStart(session_request)) {
-            wqn::CancelWordSessionStartResult(&state->word_app);
-            state->word_app.mode = wqn::WordAppMode::kHome;
-            state->word_app.message = IsWordCloudBusy()
-                ? "单词服务忙，请重试"
-                : "本轮准备失败，请重试";
-        }
-        // [persist-worker] The word observation commit (durable outbox append +
-        // session-cursor snapshot) no longer runs synchronously here -- it used
-        // to block the UI task on foreground storage. PumpWordObservationCommit
-        // now hands it to the persist worker; the card stays in kPersisting
-        // ("正在保存") until the worker's result is applied (advance card / retry)
-        // on the UI task via DispatchWordObservationPersistResult.
+        // Session starts are effects, not button-only work. The event-loop
+        // pump also dispatches continuations armed by cloud/persist results.
+        // The word pump accepts this effect into the bounded RAM buffer before
+        // rendering, then advances the card without claiming durability. A
+        // later worker batch ACK releases only its immutable prefix. Failed
+        // flushes retain identities and block lifecycle changes, not UI I/O.
         BuildHomeSummary(state);
         return RefreshSchedule::kSelection;
     }

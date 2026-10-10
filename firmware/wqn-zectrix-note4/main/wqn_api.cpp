@@ -139,6 +139,7 @@ namespace {
 constexpr char kTag[] = "wqn_api";
 constexpr int kHttpTimeoutMs = 10000;
 constexpr int kWordSessionHttpTimeoutMs = 30000;
+constexpr int kWordCandidateCoalesceTimeoutMs = 1000;
 // One owner round may spend 15 s associating and another 15 s on DHCP. Leave
 // a bounded margin for ConnectivityTask dispatch so callers do not time out a
 // healthy connection just before GOT_IP is published.
@@ -1692,12 +1693,13 @@ esp_err_t CreateWordStudySessionV1(
     return ESP_OK;
 }
 
-esp_err_t FetchWordStudyCandidatePageV1(
+static esp_err_t FetchWordStudyCandidatePageV1Impl(
     const std::string& token,
     const std::string& session_id,
     const protocol::word_study_v1::CandidatePageRequest& request,
     protocol::word_study_v1::CandidatePageData* page,
-    protocol::v3::Error* error)
+    protocol::v3::Error* error,
+    bool opportunistic)
 {
     if (page == nullptr || error == nullptr || token.empty() ||
         session_id.size() != 36) {
@@ -1709,10 +1711,19 @@ esp_err_t FetchWordStudyCandidatePageV1(
         ValidateTokenOrClear(token, "word-study-candidates"),
         kTag,
         "validate word candidate token");
-    ESP_RETURN_ON_ERROR(
-        WaitForNetworkReadyForHttps(),
-        kTag,
-        "prepare network for word candidates");
+    if (opportunistic) {
+        // The create request just established readiness. Never add a fresh
+        // 35 s connection / 15 s SNTP wait to this speculative second page.
+        ESP_RETURN_ON_ERROR(
+            wqn::services::WaitForConnectivity(0), kTag,
+            "require online demand for initial word candidates");
+        if (!IsClockReasonable()) return ESP_ERR_INVALID_STATE;
+    } else {
+        ESP_RETURN_ON_ERROR(
+            WaitForNetworkReadyForHttps(),
+            kTag,
+            "prepare network for word candidates");
+    }
 
     std::string request_body;
     ESP_RETURN_ON_ERROR(
@@ -1732,7 +1743,8 @@ esp_err_t FetchWordStudyCandidatePageV1(
         &status_code,
         &body,
         protocol::v3::kProtocolHeader,
-        &request.metadata.request_id);
+        &request.metadata.request_id,
+        opportunistic ? kWordCandidateCoalesceTimeoutMs : kHttpTimeoutMs);
     if (http_result != ESP_OK) return http_result;
     if (status_code == 401) {
         return ClearTokenOnUnauthorized("word-study-candidates");
@@ -1751,6 +1763,26 @@ esp_err_t FetchWordStudyCandidatePageV1(
         return parse_result == ESP_OK ? ESP_FAIL : parse_result;
     }
     return ESP_OK;
+}
+
+esp_err_t FetchWordStudyCandidatePageV1(
+    const std::string& token,
+    const std::string& session_id,
+    const protocol::word_study_v1::CandidatePageRequest& request,
+    protocol::word_study_v1::CandidatePageData* page,
+    protocol::v3::Error* error)
+{
+    return FetchWordStudyCandidatePageV1Impl(token, session_id, request, page, error, false);
+}
+
+esp_err_t TryFetchWordStudyCandidatePageV1(
+    const std::string& token,
+    const std::string& session_id,
+    const protocol::word_study_v1::CandidatePageRequest& request,
+    protocol::word_study_v1::CandidatePageData* page,
+    protocol::v3::Error* error)
+{
+    return FetchWordStudyCandidatePageV1Impl(token, session_id, request, page, error, true);
 }
 
 esp_err_t SubmitWordStudyObservationV1AtPath(
@@ -1922,14 +1954,51 @@ esp_err_t DownloadWordPackStream(
         result = inflater.Init(item.byte_size);
     }
     size_t received = 0;
+    // [measure][P1b-B] 1005.19 RESULT: a 32 KB heap buffer here cut the
+    // wp-stream transaction count 162 -> 37 but left the per-byte cost
+    // unchanged (0.405 -> 0.414 ms/B), so the transfer finished at 22.0%
+    // instead of 20.8%. Cost tracks BYTES, not transaction count, so the
+    // buffer size is not a lever. Reverted to the original 2 KB stack array;
+    // it fits the 8192 B cloud lane stack (cloud_runner.cpp:234) and nothing
+    // here is worth a heap allocation.
     std::array<uint8_t, 2048> buffer = {};
-    // [stream-deadline] Overall transfer budget: a slow-drip peer that
-    // sends one byte per socket timeout could otherwise pin the cloud
-    // lane indefinitely (per-read timeout_ms never fires).
-    const int64_t stream_deadline_us =
-        esp_timer_get_time() + 120LL * 1000 * 1000;
+    // [stream-deadline] Two guards, not one overall budget.
+    //
+    // The old code used a single absolute 120 s budget. That number was sized
+    // against a slow-drip NETWORK peer, but 1005.19 measured the transfer as
+    // 93% local storage (120.8 s of a 131.3 s window; network + handshake only
+    // ~11 s). A 1.28 MiB pack needs ~137-163 s of storage appends, ~27 s of
+    // network and ~17-21 s to close the file (~182-211 s total), so a 120 s
+    // budget made the pack UNDOWNLOADABLE, not merely slow: every attempt died
+    // at ~88% plaintext progress and left no resumable state.
+    //
+    // Splitting the guard is strictly better than raising the one number:
+    //   - no-progress 30 s catches the stalled/drip peer the old budget was
+    //     really there for, and catches it FASTER (a peer sending one byte per
+    //     10 s socket timeout now trips in 30 s of real idling, not 120 s).
+    //     It cannot starve the slow-but-flowing case: any byte received resets
+    //     it, so a transfer that keeps moving is bounded only by the 900 s cap.
+    //   - absolute 900 s is only a backstop. It is deliberately LOOSE: the
+    //     measured need is 182-211 s but depends on an unmeasured decompressed
+    //     chunk size, so 900 s is not a validated budget -- tighten it to
+    //     ~1.35x the measured figure once `word pack stream append:
+    //     chunk_bytes=` is read off a real log (doc 1005-storage-rewrite-todo.md
+    //     section 五之八).
+    // The bulk lane is separate from the interactive lane (wqn_cloud_int vs
+    // wqn_cloud_blk), so a pinned bulk lane cannot block interactive requests.
+    constexpr int64_t kStreamNoProgressUs = 30LL * 1000 * 1000;
+    constexpr int64_t kStreamTotalBudgetUs = 900LL * 1000 * 1000;
+    const int64_t stream_started_us = esp_timer_get_time();
+    int64_t last_progress_us = stream_started_us;
+    bool deadline_hit_no_progress = false;
     while (result == ESP_OK && status_code == 200) {
-        if (esp_timer_get_time() >= stream_deadline_us) {
+        const int64_t now_us = esp_timer_get_time();
+        if (now_us - last_progress_us >= kStreamNoProgressUs) {
+            deadline_hit_no_progress = true;
+            result = ESP_ERR_TIMEOUT;
+            break;
+        }
+        if (now_us - stream_started_us >= kStreamTotalBudgetUs) {
             result = ESP_ERR_TIMEOUT;
             break;
         }
@@ -1945,6 +2014,9 @@ esp_err_t DownloadWordPackStream(
         if (read == 0) {
             break;
         }
+        // Any byte received counts as progress; the guard is about a peer that
+        // has gone quiet, not about one that is merely slow.
+        last_progress_us = esp_timer_get_time();
         if (received + static_cast<size_t>(read) >
             protocol::word_study_v1::kMaxPackBytes) {
             result = ESP_ERR_INVALID_SIZE;
@@ -1972,12 +2044,76 @@ esp_err_t DownloadWordPackStream(
         return ESP_FAIL;
     }
     if (result != ESP_OK) {
+        // Stating which guard fired and the achieved rate matters: with two
+        // guards, "timeout" alone no longer says whether the peer went quiet
+        // or the transfer was simply too slow, and those need opposite fixes.
+        const int64_t elapsed_ms =
+            (esp_timer_get_time() - stream_started_us) / 1000;
+        const int64_t bytes_per_s =
+            elapsed_ms > 0 ? (static_cast<int64_t>(received) * 1000) / elapsed_ms
+                           : 0;
+        // `inflater.total_out()` is the decompressed byte count and the only
+        // honest progress figure here: `received` counts compressed bytes off
+        // the wire (see the kAppend note in word_pack.cpp), so
+        // `received / byte_size` silently mixes units.
+        const uint64_t plain_bytes = inflater.total_out();
+        const int pct =
+            item.byte_size > 0
+                ? static_cast<int>((plain_bytes * 100) / item.byte_size)
+                : 0;
+        // Idle time at the moment the guard fired. This is what separates a
+        // peer that went quiet from one that was merely slow: the average rate
+        // over the whole window cannot, because a transfer that made 50% and
+        // then died still reports a healthy average while being correctly
+        // caught by the no-progress guard. Logging the idle gap is what makes
+        // that case judgeable from the log alone.
+        const int64_t idle_ms =
+            (esp_timer_get_time() - last_progress_us) / 1000;
         ESP_LOGW(
             kTag,
-            "word-pack-download failed: %s url=%s received=%u",
+            "word-pack-download failed: %s url=%s received=%u plain=%llu of %lu "
+            "(%d%%) elapsed_ms=%lld idle_ms=%lld bytes_per_s=%lld "
+            "plain_bytes_per_s=%lld reason=%s",
             esp_err_to_name(result),
             url.c_str(),
-            static_cast<unsigned>(received));
+            static_cast<unsigned>(received),
+            static_cast<unsigned long long>(plain_bytes),
+            static_cast<unsigned long>(item.byte_size),
+            pct,
+            static_cast<long long>(elapsed_ms),
+            static_cast<long long>(idle_ms),
+            static_cast<long long>(bytes_per_s),
+            static_cast<long long>(
+                elapsed_ms > 0
+                    ? (static_cast<int64_t>(plain_bytes) * 1000) / elapsed_ms
+                    : 0),
+            result != ESP_ERR_TIMEOUT ? "error"
+                                      : (deadline_hit_no_progress
+                                             ? "no-progress-30s"
+                                             : "total-budget-900s"));
+    }
+    if (result == ESP_OK) {
+        // Plaintext bytes, not wire bytes: `received` is compressed (see the
+        // kAppend note in word_pack.cpp). Reporting both keeps the download's
+        // real throughput comparable with the bench's per-byte figures.
+        const int64_t done_ms =
+            (esp_timer_get_time() - stream_started_us) / 1000;
+        ESP_LOGI(
+            kTag,
+            "word-pack-download completed: plain=%llu of %lu wire=%u "
+            "elapsed_ms=%lld wire_bytes_per_s=%lld plain_bytes_per_s=%lld",
+            static_cast<unsigned long long>(inflater.total_out()),
+            static_cast<unsigned long>(item.byte_size),
+            static_cast<unsigned>(received),
+            static_cast<long long>(done_ms),
+            static_cast<long long>(
+                done_ms > 0 ? (static_cast<int64_t>(received) * 1000) / done_ms
+                            : 0),
+            static_cast<long long>(
+                done_ms > 0
+                    ? (static_cast<int64_t>(inflater.total_out()) * 1000) /
+                          done_ms
+                    : 0));
     }
     return result;
 }

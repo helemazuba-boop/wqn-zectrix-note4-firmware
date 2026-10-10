@@ -12,6 +12,7 @@
 #include <utility>
 
 #include "ai_history.h"
+#include "agent_round_policy.h"
 #include "audio_capture.h"
 #include "audio_pcm_dump.h"
 #include "config.h"
@@ -40,6 +41,14 @@ constexpr int kMaxAudioDurationMs = 20000;
 constexpr int kMinAudioPeak = 80;
 constexpr int kMinAudioRms = 8;
 constexpr TickType_t kWifiReadyWait = pdMS_TO_TICKS(35000);
+// [mirror-cap] Bound on the streamed answer's accumulated text, and on the
+// one history entry that grows with it. The same figure the Agent tier uses,
+// for the same reason: an entry larger than this evicts the ring's head before
+// the reply finishes. Declared as an alias of the Agent constant rather than a
+// copy so the two tiers cannot drift -- if one is ever retuned, the other
+// moves with it, and the plan's "same shape as Agent" stays true by
+// construction rather than by review.
+constexpr size_t kMaxStreamingAnswerBytes = wqn::kMaxAgentTextBytes;
 
 SemaphoreHandle_t g_lock = nullptr;
 TaskHandle_t g_ai_worker = nullptr;
@@ -80,7 +89,7 @@ bool g_streaming_active = false;        // true while the AI worker is parsing S
 bool g_streaming_force_full_render = false; // when true the next UI tick does a full refresh
 wqn::runtime::SleepLease g_ai_sleep_lease;
 wqn::services::ConnectivityDemand g_ai_connectivity_demand;
-std::string g_pending_tool_label;        // "🔧 create_todo…" or "✅ ..." for status bar
+std::string g_pending_tool_label;        // "create_todo…" or "create_todo done" for status bar
 int64_t g_tool_clear_at_ms = 0;          // scheduled status-bar clear
 
 bool g_turn_ws_capable = false;
@@ -153,9 +162,16 @@ void LogAiMemory(const char* stage)
         static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
 }
 
+// [font-fix] The 💭 prefix this used to carry cannot be drawn: U+1F4AD is not in
+// SourceHanSansSC_Regular_slim, and MeasureGlyphWidthInFont returns 0 on a miss
+// while DrawGlyphFromFont skips it -- so the prefix cost 5 bytes per entry in the
+// ring and rendered as nothing. The thinking block already draws its own marker
+// (m01_ai_thinking_marker_12 at page_ai.cpp:367) into the inset it reserves, so
+// the glyph was doing nothing visible. Do not re-add a character here without
+// checking the font's cmap first.
 std::string ThinkingLabel(const std::string& text)
 {
-    return text.empty() ? std::string() : std::string("💭 ") + text;
+    return text;
 }
 
 void ResetTurnAssemblyLocked()
@@ -181,7 +197,14 @@ bool FinalizeThinkingLocked(wqn::AiHistory& history, const std::string& authorit
                             int64_t now_ms)
 {
     if (!authoritative.empty()) {
-        g_turn.thinking_text = authoritative;
+        // [mirror-cap] The authoritative thinking gets the same bound the streamed
+        // deltas do, for the same reason FinalizeAssistantLocked needs one: the
+        // terminal frame is the write that actually reaches history, and capping
+        // only the accumulation leaves kThinkingDone's full_text free to blow
+        // straight through the budget the accumulation was keeping.
+        g_turn.thinking_text.assign(
+            authoritative.data(),
+            wqn::Utf8SafePrefixBytes(authoritative, wqn::kMaxThinkingBytes));
     }
     return EnsureThinkingHistoryLocked(history, now_ms);
 }
@@ -190,7 +213,28 @@ bool FinalizeAssistantLocked(wqn::AiHistory& history, const std::string& authori
                              int64_t now_ms)
 {
     if (!authoritative.empty()) {
-        g_turn.assistant_text = authoritative;
+        // [mirror-cap] The authoritative text gets the same bound the streamed
+        // accumulation does -- and this is where that bound actually matters most,
+        // not in kTextDelta. Capping only the deltas looked sufficient because
+        // kTextEnd is "a whole-text overwrite", but the overwrite is exactly what
+        // lands in history: ResolveSegmentTextLocked hands back the server's full
+        // text whenever no tool sealed a segment (the plain-text answer, i.e. the
+        // common case), so a turn that streamed under the cap still wrote an
+        // uncapped 30 KiB entry at the terminal frame and evicted the
+        // conversation's head -- the precise failure the cap exists to prevent,
+        // arriving through the one path explicitly declared not to need it.
+        //
+        // Truncating here rather than in the callers covers kTextEnd and kFinal in
+        // one place. kTurnDone passes ResolveSegmentTextLocked's fallback, which is
+        // the already-capped streamed text, so capping it again is a no-op; the
+        // streaming call sites pass the capped accumulation for the same reason.
+        //
+        // Prefer the authoritative text over the streamed prefix when both fit:
+        // it is the server's own reconciliation and carries anything the deltas
+        // dropped. Keeping its first 12 KiB beats keeping the stream's first 12 KiB.
+        g_turn.assistant_text.assign(
+            authoritative.data(),
+            wqn::Utf8SafePrefixBytes(authoritative, kMaxStreamingAnswerBytes));
     }
     if (!g_turn.user_committed || g_turn.assistant_text.empty()) {
         return false;
@@ -199,8 +243,37 @@ bool FinalizeAssistantLocked(wqn::AiHistory& history, const std::string& authori
         g_turn.assistant_id = history.AppendAssistant(g_turn.assistant_text, now_ms);
         return g_turn.assistant_id != wqn::kInvalidChatMessageId;
     }
-    return history.ReplaceText(g_turn.assistant_id, wqn::ChatMessageKind::kAssistant,
-                               g_turn.assistant_text, now_ms);
+    if (history.ReplaceText(g_turn.assistant_id, wqn::ChatMessageKind::kAssistant,
+                            g_turn.assistant_text, now_ms)) {
+        return true;
+    }
+    // [evict-recovery] The id is no longer in the ring with the kind we expect. Before item
+    // D1 of doc/1005 this was unreachable for a growing entry, because every
+    // write came with a fresh id from a seal -- so a false return was always a
+    // kind mismatch and correctly a no-op. The mirror changes that: one entry
+    // now grows for the whole streamed answer, and a long conversation can evict
+    // it mid-answer. Left as a silent false return, every subsequent Replace --
+    // including the one kTextEnd makes -- is a no-op and the ENTIRE answer
+    // vanishes from history, which is worse than the bug D1 fixes.
+    //
+    // Re-append, but only for eviction. A kind mismatch is a real logic error
+    // (this id belongs to some other message) and re-appending against it would
+    // duplicate the bubble -- the one symptom this plan exists to remove.
+    //
+    // Contains() answers presence, NOT presence-with-kind. This distinction is
+    // the whole branch: ReplaceText has already established that the entry is
+    // not here as an assistant, so asking "is it here as an assistant?" is
+    // answered "no" for an evicted entry AND for a mismatched one, which makes
+    // the branch unconditional re-append. Presence alone separates them: the
+    // mismatched id is still in the ring under another kind.
+    if (history.Contains(g_turn.assistant_id)) {
+        return false;
+    }
+    ESP_LOGW(kTag, "assistant entry %llu evicted mid-answer; re-appending %u B",
+             static_cast<unsigned long long>(g_turn.assistant_id),
+             static_cast<unsigned>(g_turn.assistant_text.size()));
+    g_turn.assistant_id = history.AppendAssistant(g_turn.assistant_text, now_ms);
+    return g_turn.assistant_id != wqn::kInvalidChatMessageId;
 }
 
 // [tool-order] Commit the open text run as its own assistant history entry so
@@ -415,6 +488,27 @@ void OnSseEvent(const wqn::WqnAiSseEvent& ev)
         g_turn.last_event_id = ev.event_id;
     }
 
+    // [ui-throttle] Streaming deltas land every ~15 ms; the EPD cannot render
+    // that fast and every changed-flag round-trip costs a full state copy on
+    // the UI task. Coalesce delta-only marks to 50 ms; terminal / stage /
+    // tool events always mark immediately so completion never lags. Runs
+    // under g_lock with one producer per turn, so the watermark is stable.
+    //
+    // [D1/D4] Hoisted above the switch because the kTextDelta case needs the
+    // same predicate: item D1 of doc/1005 mirrors the streamed text into
+    // AiHistory, and the mirror has to ride this watermark rather than the SSE
+    // rate. Every ReplaceText bumps the history's revision, which makes
+    // AiHistory::Snapshot() recopy the whole message vector on the next tick --
+    // so an unthrottled mirror would trade one wasted EPD refresh for a full
+    // vector copy per token. Sharing the watermark is what makes the mirror and
+    // the mark advance together: one tick, one write, one mark.
+    static int64_t s_last_delta_mark_ms = -1000;
+    const bool is_streaming_delta =
+        ev.kind == wqn::WqnAiSseEvent::Kind::kTextDelta ||
+        ev.kind == wqn::WqnAiSseEvent::Kind::kAsrDelta ||
+        ev.kind == wqn::WqnAiSseEvent::Kind::kThinkingDelta;
+    const bool delta_watermark_open = now_ms - s_last_delta_mark_ms >= 50;
+
     switch (ev.kind) {
         case wqn::WqnAiSseEvent::Kind::kUnknown:
             ESP_LOGD(kTag, "ignore unknown SSE event id=%llu",
@@ -423,7 +517,7 @@ void OnSseEvent(const wqn::WqnAiSseEvent& ev)
         case wqn::WqnAiSseEvent::Kind::kReady:
             g_state.status = wqn::AiSessionStatus::kStreaming;
             g_state.pending_text = "已连接 · 等待模型…";
-            g_state.toast_label = "● 服务器处理中";
+            g_state.toast_label = "服务器处理中";
             g_state.toast_visible = true;
             g_state.toast_since_ms = now_ms;
             if (!ev.conversation_id.empty()) g_conversation_id = ev.conversation_id;
@@ -464,6 +558,21 @@ void OnSseEvent(const wqn::WqnAiSseEvent& ev)
             if (!g_turn.thinking_done && !ev.delta.empty()) {
                 g_turn.thinking_seen = true;
                 g_turn.thinking_text += ev.delta;
+                // [mirror-cap] Bound the streamed thinking at the same 2 KiB the
+                // Agent tier uses (kMaxThinkingBytes in agent_round_policy.h).
+                // The answer cap below was written for assistant_text and left
+                // this accumulator untouched, which is the same hole one tier
+                // over: EnsureThinkingHistoryLocked writes `thinking_text` into
+                // a history entry, so an unbounded reasoning stream grows one
+                // entry without limit and evicts the ring's head before the
+                // answer has even started. The reasoning model is where the
+                // longest streams live, so this was the likelier of the two to
+                // fire. Cut on a character boundary, as the answer cap does.
+                if (g_turn.thinking_text.size() > wqn::kMaxThinkingBytes) {
+                    g_turn.thinking_text.resize(
+                        wqn::Utf8SafePrefixBytes(g_turn.thinking_text,
+                                                 wqn::kMaxThinkingBytes));
+                }
                 if (g_turn.thinking_id == wqn::kInvalidChatMessageId) {
                     EnsureThinkingHistoryLocked(history, now_ms);  // first visible prefix only
                     g_streaming_force_full_render = true;
@@ -502,8 +611,65 @@ void OnSseEvent(const wqn::WqnAiSseEvent& ev)
                 SealAssistantSegmentLocked(history, now_ms);
                 g_turn.text_started = true;
             }
+            // [mirror-cap] assistant_partial is deliberately NOT bounded here. Its two
+            // consumers (ui_runtime.cpp body_started, ui_input.cpp
+            // AnswerBodyStarted) only test whether it is non-empty, so a bound
+            // would be harmless to them -- but it is also the field the plan
+            // measured as having no renderer, and bounding a field nobody reads
+            // while leaving the one that costs the ring unbounded would be the
+            // wrong fix in the right place. It is cleared at every seal and at
+            // kTextEnd, so its lifetime is one segment, not one answer.
             g_state.assistant_partial += ev.delta;
             g_turn.assistant_text += ev.delta;
+            // [mirror-cap] Bound the streamed answer at the same 12 KiB the Agent
+            // tier uses (kMaxAgentTextBytes in agent_round_policy.h). This is not
+            // defensive tidying: with item D1 one entry grows for the whole
+            // answer, and an unbounded entry evicts the ring's head -- the rest
+            // of the conversation -- before the reply finishes. The bound is on
+            // this line because this is the accumulation that feeds the mirror;
+            // the authoritative-text path is bounded in FinalizeAssistantLocked,
+            // which is where an uncapped write actually reached history (see the
+            // [mirror-cap] note there -- bounding only this line left that hole).
+            //
+            // Cut on a character boundary, never through one: the Agent tier
+            // already does this with Utf8SafePrefixBytes and that helper is the
+            // existing implementation (it moved into the shared, ESP-IDF-free
+            // header in f5ff266, so there is nothing to copy -- the plan's D2
+            // note about having to duplicate ~22 lines predates that).
+            if (g_turn.assistant_text.size() > kMaxStreamingAnswerBytes) {
+                g_turn.assistant_text.resize(
+                    wqn::Utf8SafePrefixBytes(g_turn.assistant_text,
+                                             kMaxStreamingAnswerBytes));
+            }
+            // [stream-mirror] Symptom 1's fix: mirror the streamed text into history as
+            // arrives, so a batched download is reusable by the STD model and a
+            // tool-interleaved turn lands in ITS OWN entries rather than one
+            // lump at the end. Without this, only a seal or a terminal writes
+            // AiHistory, so a long reply's streamed prefix exists nowhere but
+            // `assistant_text` -- and `assistant_partial`, which the plan
+            // measured has no renderer at all.
+            //
+            // FinalizeAssistantLocked is the existing mirror: AppendAssistant on
+            // the first call, ReplaceText on every one after, both over
+            // `g_turn.assistant_text`. It is the same shape as
+            // MirrorAgentTextLocked on the Agent side, and reusing it means no
+            // new mechanism -- only the missing call site.
+            //
+            // Deliberately NOT SealAssistantSegmentLocked: that resets the
+            // segment state (and hands out a fresh assistant id), which would
+            // make every delta open a new entry and defeat the point. This
+            // keeps the segment open and grows it in place.
+            //
+            // On the 50 ms watermark, not per delta -- see D4 above. The guard
+            // is on the same bool MarkChanged uses below, so a delta that does
+            // not advance the watermark does not write either.
+            //
+            // A no-op when no user turn was committed (FinalizeAssistantLocked
+            // checks), which is what keeps a stray delta before the user's turn
+            // from creating an entry.
+            if (delta_watermark_open) {
+                FinalizeAssistantLocked(history, std::string(), now_ms);
+            }
             g_state.last_render_ms = now_ms;
             break;
         case wqn::WqnAiSseEvent::Kind::kTextEnd: {
@@ -521,7 +687,8 @@ void OnSseEvent(const wqn::WqnAiSseEvent& ev)
             // [tool-order] Seal before appending so pre-tool text stays above
             // this block.
             SealAssistantSegmentLocked(history, now_ms);
-            std::string label = "🔧 " + (ev.tool_name.empty() ? std::string("tool") : ev.tool_name) + "…";
+            std::string label =
+                (ev.tool_name.empty() ? std::string("tool") : ev.tool_name) + "…";
             g_pending_tool_label = label;
             g_tool_clear_at_ms = 0;
             g_state.function_call_summaries.push_back(ev.tool_name.empty() ? "tool" : ev.tool_name);
@@ -537,7 +704,7 @@ void OnSseEvent(const wqn::WqnAiSseEvent& ev)
             // must sit between the placeholder and the result block.
             history.PopLastIf(wqn::ChatMessageKind::kToolStart);
             SealAssistantSegmentLocked(history, now_ms);
-            std::string label = ev.tool_ok ? "✅ " : "❌ ";
+            std::string label = ev.tool_ok ? "ok " : "fail ";
             label += ev.tool_display.empty() ? ev.tool_name : ev.tool_display;
             g_pending_tool_label = label;
             g_tool_clear_at_ms = now_ms + 2000;
@@ -612,12 +779,7 @@ void OnSseEvent(const wqn::WqnAiSseEvent& ev)
     // the UI task. Coalesce delta-only marks to 50 ms; terminal / stage /
     // tool events always mark immediately so completion never lags. Runs
     // under g_lock with one producer per turn, so the watermark is stable.
-    static int64_t s_last_delta_mark_ms = -1000;
-    const bool is_streaming_delta =
-        ev.kind == wqn::WqnAiSseEvent::Kind::kTextDelta ||
-        ev.kind == wqn::WqnAiSseEvent::Kind::kAsrDelta ||
-        ev.kind == wqn::WqnAiSseEvent::Kind::kThinkingDelta;
-    if (!is_streaming_delta || now_ms - s_last_delta_mark_ms >= 50) {
+    if (!is_streaming_delta || delta_watermark_open) {
         if (is_streaming_delta) {
             s_last_delta_mark_ms = now_ms;
         }
@@ -915,7 +1077,7 @@ void SubmitSession()
         audio.duration_ms = kMaxAudioDurationMs;
     }
     SetStateLocked(wqn::AiSessionStatus::kWaitingReply, "正在识别...", "", "");
-    g_state.toast_label = "● 识别中…";
+    g_state.toast_label = "识别中…";
     g_state.toast_visible = true;
     g_state.toast_since_ms = esp_timer_get_time() / 1000;
     g_state.toast_recording_ms = 0;
@@ -1329,7 +1491,7 @@ void PrepareRecordingSession(uint32_t generation)
         g_state.scroll_offset_lines = 0;
         // [follow] Capture started: arm the viewport follow for this turn.
         ArmAiFollowLocked();
-        g_state.toast_label = "● 录音中 00:00";
+        g_state.toast_label = "录音中 00:00";
         g_state.toast_visible = true;
         g_state.toast_since_ms = esp_timer_get_time() / 1000;
         g_state.toast_recording_ms = 0;
@@ -1694,6 +1856,17 @@ void ClearAiConversationContext()
     g_state.toast_visible = false;
     g_state.toast_label.clear();
     wqn::GetAiHistory(wqn::AiHistoryChannel::kStdPro).Clear();
+    // [context-clear] Drop the in-flight turn's own state too, not just the ring.
+    // This function clears the kStdPro channel but leaves g_turn standing, and
+    // g_turn is what decides how the next mirrored frame writes: assistant_id
+    // still names an entry that has just been evicted, and assistant_text still
+    // holds the whole previous answer. The next kTextDelta therefore takes the
+    // "my entry vanished" path in FinalizeAssistantLocked -- correctly, since it
+    // did -- and re-appends the PREVIOUS answer into the ring the user just
+    // asked to empty. Clearing and then streaming one delta resurrects the turn
+    // that was cleared. ResetTurnAssemblyLocked is the same reset the turn's own
+    // start applies; the ring clear was simply never paired with it.
+    ResetTurnAssemblyLocked();
     ReleaseAiSleepLeaseIfIdleLocked();
     MarkChanged();
     xSemaphoreGive(g_lock);

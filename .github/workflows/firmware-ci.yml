@@ -1,0 +1,87 @@
+name: Firmware CI
+
+on:
+  push:
+    branches:
+      - main
+      - release/note-baseline-prod
+      - refactor/ai-agent-tier
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  contract:
+    name: Architecture gate fixtures
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # The same cmake -P entry point the local flow uses; it needs no
+      # ESP-IDF environment, only cmake.
+      - name: Run M8 gate fixture tests
+        run: |
+          cmake \
+            -DQN_REPO_DIR="$PWD/firmware/wqn-zectrix-note4" \
+            -DQN_BUILD_DIR="$RUNNER_TEMP/m8-fixtures" \
+            -P firmware/wqn-zectrix-note4/cmake/tests/run_gate_fixture.cmake
+
+  hil-log:
+    name: HIL log parser smoke
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Run HIL checker selftests
+        run: python3 firmware/wqn-zectrix-note4/scripts/hil_check.py --selftest
+
+      - name: Run hil_check on the smoke fixture
+        run: |
+          python3 firmware/wqn-zectrix-note4/scripts/hil_check.py \
+            firmware/wqn-zectrix-note4/scripts/testdata/hil_smoke.txt \
+            > "$RUNNER_TEMP/hil.txt" 2>&1
+          cat "$RUNNER_TEMP/hil.txt"
+
+      # The fixture pins the parser; if one of these flips to SKIP/FAIL the
+      # line formats or the regular expressions drifted.
+      - name: Assert pinned criteria still pass
+        run: |
+          grep -q '\[PASS\] GATES:self-test-green' "$RUNNER_TEMP/hil.txt"
+          grep -q '\[PASS\] P0-c5:word-domain-serialized' "$RUNNER_TEMP/hil.txt"
+          grep -q '\[PASS\] P0-c5:note-domain-serialized' "$RUNNER_TEMP/hil.txt"
+          grep -q '\[PASS\] C6b:reset-succeeded' "$RUNNER_TEMP/hil.txt"
+          grep -q '\[PASS\] STAB:stack-hwm-healthy' "$RUNNER_TEMP/hil.txt"
+
+  build:
+    name: ESP-IDF build (esp32s3)
+    runs-on: ubuntu-latest
+    container:
+      image: espressif/idf:v5.5.4
+    env:
+      IDF_CCACHE_ENABLE: '1'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Cache ccache and managed components
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.ccache
+            firmware/wqn-zectrix-note4/managed_components
+          key: idf-${{ hashFiles('firmware/wqn-zectrix-note4/dependencies.lock') }}
+          restore-keys: |
+            idf-
+
+      # wqn_architecture_check is an ALL target, so the M8 ownership gate runs
+      # as part of the build.
+      - name: Build
+        working-directory: firmware/wqn-zectrix-note4
+        shell: bash
+        run: |
+          source "$IDF_PATH/export.sh"
+          idf.py -B build-ci set-target esp32s3
+          idf.py -B build-ci build

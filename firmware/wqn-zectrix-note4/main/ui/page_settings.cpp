@@ -204,12 +204,12 @@ esp_err_t RenderSettingsDialog(const wqn::SettingsAppState& settings)
                 "draw image rendering dialog");
             ESP_RETURN_ON_ERROR(
                 DrawSettingsOptionCard(
-                    88, 112, 224, "黑白｜快速省电",
+                    88, 112, 224, "黑白·快速省电",
                     settings.image_render_selected == 0),
                 kTag, "draw BW image option");
             ESP_RETURN_ON_ERROR(
                 DrawSettingsOptionCard(
-                    88, 156, 224, "16阶灰度｜细节优先",
+                    88, 156, 224, "16阶灰度·细节优先",
                     settings.image_render_selected == 1),
                 kTag, "draw gray image option");
             ESP_RETURN_ON_ERROR(
@@ -223,12 +223,12 @@ esp_err_t RenderSettingsDialog(const wqn::SettingsAppState& settings)
                 "draw ai follow dialog");
             ESP_RETURN_ON_ERROR(
                 DrawSettingsOptionCard(
-                    88, 112, 224, "开｜自动跟到最新",
+                    88, 112, 224, "开·自动跟到最新",
                     settings.ai_follow_selected == 0),
                 kTag, "draw ai follow on option");
             ESP_RETURN_ON_ERROR(
                 DrawSettingsOptionCard(
-                    88, 156, 224, "关｜保持当前位置",
+                    88, 156, 224, "关·保持当前位置",
                     settings.ai_follow_selected == 1),
                 kTag, "draw ai follow off option");
             ESP_RETURN_ON_ERROR(

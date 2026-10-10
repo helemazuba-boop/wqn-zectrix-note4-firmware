@@ -352,10 +352,23 @@ esp_err_t LoadCurrentReviewWord(wqn::WordAppState* state)
         state->pack_index.entries.begin(),
         state->pack_index.entries.end(),
         [&](const wqn::WordPackIndexEntry& value) {
-            return std::strcmp(item_id, value.word_id) == 0;
+            return std::strcmp(item_id, value.word_id) == 0 &&
+                std::strcmp(session.remote.items[session.position].deck_id, value.deck_id) == 0;
         });
     if (entry == state->pack_index.entries.end()) {
         return ESP_ERR_NOT_FOUND;
+    }
+    auto& prefetched = state->card_prefetch;
+    if (prefetched.ready && prefetched.session_id == session.remote.session_id &&
+        prefetched.scope_generation == session.deck_scope_generation &&
+        prefetched.scope_generation == wqn::GetDeckScopeGeneration() &&
+        wqn::SameWordCardPrefetchIndex(prefetched.index, *entry)) {
+        state->current_word = std::move(prefetched.entry);
+        prefetched.ready = false;
+        ESP_LOGI(kTag, "word card RAM hit: ordinal=%llu session=%s",
+            static_cast<unsigned long long>(session.remote.items[session.position].ordinal),
+            session.remote.session_id.c_str());
+        return ESP_OK;
     }
     return wqn::ReadWordPackEntry(*entry, &state->current_word);
 }
@@ -430,6 +443,14 @@ void PrepareObservation(
     }
     const auto& remote = state->session.persisted.remote;
     const size_t position = state->session.persisted.position;
+    if (!wqn::WordBatchPolicy::CanAccept(state->session.buffered_observations.size(),
+            state->session.batch_error != ESP_OK) ||
+        state->outbox.pending_count + state->outbox.suspended_count +
+            state->session.buffered_observations.size() >= state->outbox.capacity) {
+        state->session.batch_flush_requested = true;
+        state->message = "暂存已满，等待保存";
+        return;
+    }
     uint64_t next_ordinal = remote.items[position].ordinal;
     if (target == wqn::WordObservationTarget::kAdvance) {
         next_ordinal = PlannedNextOrdinal(state);
@@ -547,24 +568,6 @@ bool SetSessionCursorOrdinal(
     return false;
 }
 
-bool SnapshotMatches(
-    const wqn::StoredWordSessionData& session,
-    const wqn::protocol::word_study_v1::CandidatePageData& page)
-{
-    if (session.snapshot.size() != page.snapshot.size()) return false;
-    for (size_t index = 0; index < session.snapshot.size(); ++index) {
-        const auto& stored = session.snapshot[index];
-        const auto& remote = page.snapshot[index];
-        if (remote.deck_id != stored.deck_id ||
-            remote.content_revision != stored.content_revision ||
-            remote.pack_revision != stored.pack_revision ||
-            remote.sha256 != stored.sha256) {
-            return false;
-        }
-    }
-    return true;
-}
-
 uint16_t ClampUint16(size_t value)
 {
     return static_cast<uint16_t>(std::min<size_t>(value, UINT16_MAX));
@@ -579,6 +582,7 @@ void InstallWordPackIndex(
     const bool pack_error = index.pack_error;
     const std::string status_message = index.status_message;
     state->pack_index = std::move(index);
+    state->card_prefetch = {};
     // Every install lands the library index unless the caller re-pins it
     // immediately (the resumed-session path below does).
     state->pack_index_pinned = false;
@@ -767,6 +771,11 @@ void FinishOrLoadAdvancedReview(wqn::WordAppState* state)
 void PauseWordSession(wqn::WordAppState* state)
 {
     if (state == nullptr) return;
+    if (wqn::HasBufferedWordObservations(*state)) {
+        state->session.batch_flush_requested = true;
+        state->message = "正在保存暂存，请稍后暂停";
+        return;
+    }
     state->session.persisted.paused = true;
     SetStudySessionResumable(state, state->session.persisted.remote.mode, true);
     SaveSequentialCursor(state);
@@ -1008,6 +1017,21 @@ esp_err_t HandleWordAppInput(WordAppState* state, WordInput input)
         ESP_RETURN_ON_ERROR(InitWordApp(state), kTag, "init word app");
     }
     ActivatePendingWordPackIndex(state);
+
+    if (state->session.batch_error != ESP_OK && HasBufferedWordObservations(*state)) {
+        if (input == WordInput::kConfirm || input == WordInput::kLongConfirm) {
+            state->session.batch_retry_after_ms = 0;
+            state->session.batch_flush_requested = true;
+            state->message = "正在重试暂存，尚未保存";
+        }
+        return ESP_OK;
+    }
+    if (HasBufferedWordObservations(*state) &&
+        (input == WordInput::kLongConfirm || state->mode != WordAppMode::kWordCard)) {
+        state->session.batch_flush_requested = true;
+        state->message = "正在保存暂存，请稍后重试";
+        return ESP_OK;
+    }
 
     switch (state->mode) {
         case WordAppMode::kHome: {
@@ -1272,23 +1296,36 @@ void ResetWordSessionsForScopeChange(WordAppState* state, bool clear_persisted)
             : state->session.persisted.remote.session_id.c_str(),
         clear_persisted ? 1 : 0);
     if (clear_persisted) {
-        for (const auto mode : kPersistedSessionModes) {
-            ESP_ERROR_CHECK_WITHOUT_ABORT(ClearPersistedWordSession(mode));
-        }
+        // [word-scope-reset] ONE transaction: commit the new scope generation
+        // first (so every existing session file is inert from that instant),
+        // then remove the four session files and the walk cursor. The old form
+        // was four independent background transactions plus a raw NVS write, so
+        // it could stop between clears and leave a half-wiped scope behind.
+        ESP_ERROR_CHECK_WITHOUT_ABORT(wqn::ResetWordSessionScope());
+    } else {
+        // The durable half already ran inside the default-deck transaction; the
+        // walk cursor is the only piece that one does not reset.
+        ESP_ERROR_CHECK_WITHOUT_ABORT(SaveWordSequentialCursor(0));
+    }
+    ResetWordSessionsInMemory(state);
+    state->message = "词库范围已切换";
+}
+
+void ResetWordSessionsInMemory(WordAppState* state)
+{
+    if (state == nullptr) {
+        return;
     }
     state->session = WordSessionState{};
+    state->card_prefetch = {};
     state->review = WordReviewRuntime{};
     state->chain = WordSessionChain{};
-    // The library walk's cursor indexes the scoped library, so a scope switch
-    // invalidates it.
-    ESP_ERROR_CHECK_WITHOUT_ABORT(SaveWordSequentialCursor(0));
     state->review_session_resumable = false;
     state->shuffle_session_resumable = false;
     state->mistakes_session_resumable = false;
     state->card_phase = WordCardPhase::kFront;
     state->current_word = WqnWordEntry{};
     state->mode = WordAppMode::kHome;
-    state->message = "词库范围已切换";
 }
 
 void ApplyWordPackIndex(WordAppState* state, WordPackIndex index, const std::string& message)
@@ -1470,6 +1507,17 @@ bool ApplyWordSessionStartResult(
     return true;
 }
 
+void RestoreWordSessionStartRequest(WordAppState* state)
+{
+    if (state == nullptr || !state->session.start_result_expected) return;
+    state->session.start_result_expected = false;
+    if (state->mode == WordAppMode::kSessionStarting) {
+        // A rejected enqueue never reached the server. Keep the request ID
+        // and parameters for the next attempt; cancellation clears them.
+        state->session.start_requested = true;
+    }
+}
+
 void CancelWordSessionStartResult(WordAppState* state)
 {
     if (state == nullptr) return;
@@ -1505,9 +1553,11 @@ void ResetWordSessionForServerInvalid(WordAppState* state)
 bool TakeWordCandidatePageRequest(
     WordAppState* state,
     protocol::word_study_v1::CandidatePageRequest* request,
+    PersistedWordSession* snapshot,
     std::string* session_id)
 {
-    if (state == nullptr || request == nullptr || session_id == nullptr ||
+    if (state == nullptr || request == nullptr || snapshot == nullptr ||
+        session_id == nullptr ||
         !state->session.page_requested || state->session.page_in_flight ||
         !state->session.persisted.active ||
         state->session.persisted.paused ||
@@ -1518,6 +1568,10 @@ bool TakeWordCandidatePageRequest(
     request->cursor = state->session.persisted.remote.cursor;
     request->limit = static_cast<int>(
         protocol::word_study_v1::kCandidatePrefetchPageSize);
+    // [ui-gates] Snapshot as of this take: the runner persists THIS one, so it
+    // must be the state the page was asked for, not whatever the user has
+    // advanced to by the time the page comes back.
+    *snapshot = state->session.persisted;
     *session_id = state->session.persisted.remote.session_id;
     state->session.page_requested = false;
     state->session.page_in_flight = true;
@@ -1535,15 +1589,36 @@ void RestoreWordCandidatePageRequest(WordAppState* state)
     }
 }
 
+// [ui-gates] The runner's extend/persist outcomes transport the UI messages the
+// old inline apply produced; keeping them in one place stops the two paths from
+// drifting apart in wording.
+const char* WordPageExtendMessage(esp_err_t compact_result)
+{
+    switch (compact_result) {
+        case ESP_ERR_INVALID_RESPONSE:
+            return "后续单词快照不一致";
+        case ESP_ERR_INVALID_STATE:
+            return "会话游标损坏";
+        case ESP_ERR_INVALID_SIZE:
+            return "候选窗口超限";
+        case ESP_ERR_INVALID_ARG:
+            return "候选页顺序无效";
+        default:
+            return "后续单词已就绪";
+    }
+}
+
 void ApplyWordCandidatePageResult(
     WordAppState* state,
     esp_err_t result,
+    esp_err_t compact_result,
+    esp_err_t persist_result,
+    const PersistedWordSession& runner_snapshot,
     protocol::word_study_v1::CandidatePageData page)
 {
     if (state == nullptr) return;
     state->session.page_in_flight = false;
     auto& persisted = state->session.persisted;
-    auto& remote = persisted.remote;
     if (!persisted.active || persisted.paused) {
         // The user left or paused while this bounded prefetch was in flight.
         // Its result belongs to the old interaction context and must not
@@ -1555,54 +1630,42 @@ void ApplyWordCandidatePageResult(
         state->message = "后续单词加载失败，继续时重试";
         return;
     }
-    if (page.session_id != remote.session_id || page.ordering != remote.ordering ||
-        page.candidate_policy_version !=
-            protocol::word_study_v1::CandidatePolicyVersionName(remote.ordering) ||
-        page.seed != remote.seed || page.progress_revision != remote.progress_revision ||
-        page.cursor != remote.cursor || !SnapshotMatches(remote, page)) {
-        state->message = "后续单词快照不一致";
+    // [word-batch] RAM-ahead progress does not prove this candidate page was
+    // saved. Check the runner's durable-page result BEFORE either install or
+    // stale merge: ordinary batches append events, not the new candidate window.
+    // An empty/mismatched snapshot cannot supply proof via default ESP_OK flags.
+    if (compact_result != ESP_OK) {
+        state->message = WordPageExtendMessage(compact_result);
         return;
     }
-
-    if (persisted.position > remote.items.size()) {
-        state->message = "会话游标损坏";
-        return;
-    }
-    PersistedWordSession updated = persisted;
-    auto& updated_remote = updated.remote;
-    if (updated.position > 0) {
-        updated_remote.items.erase(
-            updated_remote.items.begin(),
-            updated_remote.items.begin() + updated.position);
-        updated.position = 0;
-    }
-    if (updated_remote.items.size() + page.items.size() >
-        protocol::word_study_v1::kCandidateWindowSize) {
-        state->message = "候选窗口超限";
-        return;
-    }
-    uint64_t expected_ordinal = updated_remote.items.empty()
-        ? (page.items.empty() ? 0 : page.items.front().ordinal)
-        : updated_remote.items.back().ordinal + 1;
-    for (const auto& source : page.items) {
-        if (source.ordinal != expected_ordinal || source.item_id.size() != 36 ||
-            source.deck_id.size() != 36) {
-            state->message = "候选页顺序无效";
-            return;
-        }
-        StoredWordSessionItem item;
-        std::snprintf(item.item_id, sizeof(item.item_id), "%s", source.item_id.c_str());
-        std::snprintf(item.deck_id, sizeof(item.deck_id), "%s", source.deck_id.c_str());
-        item.ordinal = source.ordinal;
-        updated_remote.items.push_back(item);
-        ++expected_ordinal;
-    }
-    updated_remote.cursor = page.next_cursor;
-    updated_remote.has_more = page.has_more;
-    result = SavePersistedWordSession(updated);
-    if (result != ESP_OK) {
+    if (persist_result != ESP_OK || !runner_snapshot.active ||
+        runner_snapshot.remote.session_id != persisted.remote.session_id ||
+        runner_snapshot.deck_scope_generation != persisted.deck_scope_generation) {
         state->message = "后续单词未保存";
         return;
+    }
+    // [ui-gates] The runner saved the window captured at queue time. Answers
+    // may meanwhile have advanced RAM (and possibly durable journal progress).
+    // Do not reinstall that older cursor; merge the saved page over current RAM
+    // while leaving its buffered observations and phase intact.
+    const bool runner_snapshot_current =
+        persisted.remote.session_id == runner_snapshot.remote.session_id &&
+        persisted.position == runner_snapshot.position;
+    PersistedWordSession updated;
+    if (runner_snapshot_current) {
+        updated = runner_snapshot;
+    } else {
+        const esp_err_t merge_result = wqn::ExtendPersistedWordSessionWithPage(
+            persisted, page, &updated);
+        if (merge_result != ESP_OK) {
+            state->message = WordPageExtendMessage(merge_result);
+            return;
+        }
+        ESP_LOGI(
+            kTag,
+            "candidate page merged over an advanced session: position=%lu runner=%lu",
+            static_cast<unsigned long>(persisted.position),
+            static_cast<unsigned long>(runner_snapshot.position));
     }
     persisted = std::move(updated);
     PruneSessionOrdinals(state);
@@ -1678,7 +1741,7 @@ bool TakeWordObservationEffect(
     return true;
 }
 
-void ApplyWordObservationCommitResult(WordAppState* state, esp_err_t result)
+void ApplyWordObservationState(WordAppState* state, esp_err_t result, bool durable)
 {
     if (state == nullptr) return;
     // The bound dispatch has now been consumed; clear it so a duplicate/late
@@ -1705,8 +1768,9 @@ void ApplyWordObservationCommitResult(WordAppState* state, esp_err_t result)
     state->session.persisted = std::move(state->session.pending_advanced_session);
     state->session.pending_advanced_session = {};
     state->session.pending_observation = {};
-    state->session.commit_state = WordObservationCommitState::kCloudPending;
-    if (state->outbox.pending_count + state->outbox.suspended_count <
+    state->session.commit_state = durable ? WordObservationCommitState::kCloudPending
+                                         : WordObservationCommitState::kBuffered;
+    if (durable && state->outbox.pending_count + state->outbox.suspended_count <
         state->outbox.capacity) {
         ++state->outbox.pending_count;
     }
@@ -1722,6 +1786,7 @@ void ApplyWordObservationCommitResult(WordAppState* state, esp_err_t result)
     } else {
         state->message = "已保存，待同步";
     }
+    if (!durable) state->message = "已暂存，待保存";
     if (observation_mode == protocol::word_study_v1::Mode::kReview &&
         action != protocol::word_study_v1::ObservationAction::kRevealed) {
         ApplyWordReviewBookkeeping(state, action, answered_ordinal);
@@ -1737,25 +1802,190 @@ void ApplyWordObservationCommitResult(WordAppState* state, esp_err_t result)
         ShowStudyCard(state);
         return;
     }
+    if (!durable && (!state->session.persisted.active ||
+        (state->session.persisted.position >= state->session.persisted.remote.items.size() &&
+         !state->session.persisted.remote.has_more && state->review.pool.empty()))) {
+        // Finishing can write a sequential cursor or replace the SID for an
+        // intake chain. Keep those lifecycle effects behind the durable fence.
+        state->session.batch_finish_pending = true;
+        state->session.batch_flush_requested = true;
+        state->mode = WordAppMode::kSessionStarting;
+        state->message = "正在保存最后的暂存";
+        return;
+    }
     FinishOrLoadAdvancedReview(state);
 }
 
-void RefreshWordOutboxState(WordAppState* state)
+void ApplyWordObservationCommitResult(WordAppState* state, esp_err_t result)
 {
-    if (state == nullptr) return;
-    WordOutboxSnapshot snapshot;
-    if (ReadWordOutboxSnapshot(&snapshot) != ESP_OK) return;
-    state->outbox.pending_count = snapshot.pending_count;
-    state->outbox.suspended_count = snapshot.suspended_count;
-    state->outbox.blocked_count = snapshot.blocked_count;
-    state->outbox.capacity = snapshot.capacity;
-    if (snapshot.pending_count == 0 && snapshot.suspended_count == 0 &&
-        state->session.commit_state == WordObservationCommitState::kCloudPending) {
-        state->session.commit_state = WordObservationCommitState::kCloudAcknowledged;
-        if (state->mode == WordAppMode::kWordCard) {
-            state->message = "已同步";
-        }
+    ApplyWordObservationState(state, result, true);
+}
+
+bool HasBufferedWordObservations(const WordAppState& state)
+{
+    return !state.session.buffered_observations.empty();
+}
+
+bool BufferWordObservationEffect(WordAppState* state, const std::string& request_id,
+    const std::string& occurred_at, int64_t now_ms)
+{
+    if (state == nullptr || !WordBatchPolicy::CanAccept(state->session.buffered_observations.size(),
+            state->session.batch_error != ESP_OK)) return false;
+    DurableWordObservation observation;
+    PersistedWordSession advanced;
+    if (!TakeWordObservationEffect(state, request_id, occurred_at, 0, &observation, &advanced)) return false;
+    state->session.buffered_observations.push_back({std::move(observation), now_ms});
+    state->session.buffered_advanced_session = std::move(advanced);
+    ApplyWordObservationState(state, ESP_OK, false);
+    ESP_LOGI(kTag, "word observation RAM accepted: sequence=%llu pending=%u inflight=%u session=%s",
+        static_cast<unsigned long long>(state->session.buffered_observations.back().observation.sequence),
+        static_cast<unsigned>(state->session.buffered_observations.size()),
+        static_cast<unsigned>(state->session.batch_in_flight),
+        state->session.buffered_observations.back().observation.session_id.c_str());
+    return true;
+}
+
+bool TakeWordObservationBatch(WordAppState* state, uint32_t operation_id, int64_t now_ms,
+    std::vector<DurableWordObservation>* observations, PersistedWordSession* advanced_session)
+{
+    if (state == nullptr || observations == nullptr || advanced_session == nullptr || operation_id == 0)
+        return false;
+    auto& session = state->session;
+    // Do not snapshot across a Prepared-but-not-yet-accepted cursor change.
+    if (session.observation_effect_ready || session.buffered_observations.empty() ||
+        !WordBatchPolicy::FlushDue(session.buffered_observations.size(), session.batch_in_flight,
+            session.buffered_observations.front().accepted_ms, now_ms, session.batch_retry_after_ms,
+            session.batch_flush_requested)) return false;
+    observations->clear();
+    observations->reserve(session.buffered_observations.size());
+    for (const auto& value : session.buffered_observations) observations->push_back(value.observation);
+    *advanced_session = session.buffered_advanced_session;
+    session.batch_in_flight = observations->size();
+    session.batch_operation_id = operation_id;
+    ESP_LOGI(kTag, "word observation batch queued: count=%u oldest_age_ms=%lld forced=%u op=%lu session=%s",
+        static_cast<unsigned>(observations->size()),
+        static_cast<long long>(now_ms - session.buffered_observations.front().accepted_ms),
+        session.batch_flush_requested ? 1U : 0U, static_cast<unsigned long>(operation_id),
+        observations->front().session_id.c_str());
+    return true;
+}
+
+bool ApplyWordObservationBatchResult(WordAppState* state, esp_err_t result,
+    uint32_t operation_id, int64_t now_ms)
+{
+    if (state == nullptr || operation_id == 0 || state->session.batch_operation_id != operation_id ||
+        state->session.batch_in_flight == 0 ||
+        state->session.batch_in_flight > state->session.buffered_observations.size()) return false;
+    auto& session = state->session;
+    const size_t count = session.batch_in_flight;
+    session.batch_operation_id = 0;
+    session.batch_in_flight = 0;
+    session.batch_error = result;
+    if (result != ESP_OK) {
+        session.batch_retry_after_ms = now_ms + WordBatchPolicy::kRetryMs;
+        session.batch_flush_requested = true;
+        state->message = "暂存未保存，确认重试";
+        return true;
     }
+    session.buffered_observations.erase(session.buffered_observations.begin(),
+        session.buffered_observations.begin() + count);
+    state->outbox.pending_count = std::min(state->outbox.capacity,
+        state->outbox.pending_count + count);
+    session.batch_retry_after_ms = 0;
+    if (session.buffered_observations.empty()) {
+        session.buffered_advanced_session = {};
+        session.batch_flush_requested = false;
+        // A newer effect may already be Prepared. Its kPersisting fence and
+        // message must survive this older batch completion.
+        if (!session.observation_effect_ready) {
+            session.commit_state = WordObservationCommitState::kCloudPending;
+            state->message = "已保存，待同步";
+        }
+        if (session.batch_finish_pending) {
+            session.batch_finish_pending = false;
+            FinishOrLoadAdvancedReview(state);
+        }
+    } else {
+        state->message = "已暂存，待保存";
+    }
+    return true;
+}
+
+bool SameWordCardPrefetchIndex(const WordPackIndexEntry& left, const WordPackIndexEntry& right)
+{
+    return left.file_offset == right.file_offset &&
+        std::strcmp(left.word_id, right.word_id) == 0 && std::strcmp(left.deck_id, right.deck_id) == 0 &&
+        std::strcmp(left.pack_stem, right.pack_stem) == 0;
+}
+
+bool GetWordCardPrefetchEntry(const WordAppState& state, int64_t now_ms, WordPackIndexEntry* entry)
+{
+    if (entry == nullptr || state.mode != WordAppMode::kWordCard || !state.session.persisted.active ||
+        state.card_prefetch.operation_id != 0 || now_ms < state.card_prefetch.retry_after_ms) return false;
+    const auto& session = state.session.persisted;
+    if (session.position >= session.remote.items.size() ||
+        session.deck_scope_generation != GetDeckScopeGeneration()) return false;
+    // Only predict the ordinary queue/return path. Do NOT draw replay RNG or
+    // alter its spacing/bookkeeping just to speculate about the next card.
+    const size_t position = state.review.replay_in_flight
+        ? SessionIndexOfOrdinal(session.remote, state.review.replay_return_ordinal)
+        : NextQueuePosition(state, session.position + 1);
+    if (position >= session.remote.items.size()) return false;
+    const auto& item = session.remote.items[position];
+    const auto found = std::find_if(state.pack_index.entries.begin(), state.pack_index.entries.end(),
+        [&](const auto& candidate) {
+            return std::strcmp(candidate.word_id, item.item_id) == 0 &&
+                std::strcmp(candidate.deck_id, item.deck_id) == 0;
+        });
+    if (found == state.pack_index.entries.end()) return false;
+    if (state.card_prefetch.ready && state.card_prefetch.session_id == session.remote.session_id &&
+        state.card_prefetch.scope_generation == session.deck_scope_generation &&
+        SameWordCardPrefetchIndex(state.card_prefetch.index, *found)) return false;
+    *entry = *found;
+    return true;
+}
+
+bool TakeWordCardPrefetchEntry(WordAppState* state, uint32_t operation_id, int64_t now_ms,
+    WordPackIndexEntry* entry)
+{
+    if (state == nullptr || operation_id == 0 || !GetWordCardPrefetchEntry(*state, now_ms, entry)) return false;
+    auto& prefetch = state->card_prefetch;
+    prefetch.entry = {};
+    prefetch.ready = false;
+    prefetch.operation_id = operation_id;
+    prefetch.session_id = state->session.persisted.remote.session_id;
+    prefetch.scope_generation = state->session.persisted.deck_scope_generation;
+    prefetch.index = *entry;
+    return true;
+}
+
+bool ApplyWordCardPrefetchResult(WordAppState* state, uint32_t operation_id, esp_err_t result,
+    WqnWordEntry entry, int64_t now_ms)
+{
+    if (state == nullptr || operation_id == 0 || state->card_prefetch.operation_id != operation_id) return false;
+    auto& prefetch = state->card_prefetch;
+    prefetch.operation_id = 0;
+    if (prefetch.session_id != state->session.persisted.remote.session_id ||
+        prefetch.scope_generation != state->session.persisted.deck_scope_generation ||
+        prefetch.scope_generation != GetDeckScopeGeneration()) {
+        prefetch = {};
+        return false;
+    }
+    if (result != ESP_OK || entry.id != prefetch.index.word_id || entry.deck_id != prefetch.index.deck_id) {
+        prefetch.ready = false;
+        prefetch.retry_after_ms = now_ms + 5000;
+        return false;
+    }
+    const auto found = std::find_if(state->pack_index.entries.begin(), state->pack_index.entries.end(),
+        [&](const auto& candidate) { return SameWordCardPrefetchIndex(candidate, prefetch.index); });
+    if (found == state->pack_index.entries.end()) {
+        prefetch = {};
+        return false;
+    }
+    prefetch.entry = std::move(entry);
+    prefetch.ready = true;
+    prefetch.retry_after_ms = 0;
+    return true;
 }
 
 WordAppSnapshot BuildWordAppSnapshot(const WordAppState& state)

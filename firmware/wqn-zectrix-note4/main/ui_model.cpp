@@ -5,7 +5,10 @@
 
 #include "ai_session.h"
 #include "display_service.h"
+#include "esp_log.h"
 #include "flash_session.h"
+#include "opencode_session.h"
+#include "ui/persist_worker.h"
 #include "provision_manager.h"
 
 namespace {
@@ -506,27 +509,52 @@ void HandleUiInput(UiState* state, UiInput input)
                 // switches screens; the word page's own UI takes over.
                 std::string requested_deck_id;
                 if (TakeNoteWordDeckOpenRequest(&state->note_app, &requested_deck_id)) {
+                    // AGENTS §4.2, [词]-row: this path breaks the gate twice over.
+                    // (a) SubmitWordSessionReset resets the word session, and the
+                    //     observation armed by the worker is still between here
+                    //     and the reserve -- commit_state already reads kPersisting
+                    //     while the word domain still looks free, so TryReserve
+                    //     cannot see the window and the reset's generation bump
+                    //     would clear the session out from under the commit.
+                    // (b) The durable ACK switches screens, which navigates away
+                    //     from the note screen's answering context.
+                    // Consume the request and say nothing else, so a retry is the
+                    // only thing left to do. Mirrors the top-nav guards above.
                     if (state->word_app.session.commit_state ==
-                        wqn::WordObservationCommitState::kPersisting) {
-                        // A previous word answer is still persisting; scoping now
-                        // runs ResetWordSessionsForScopeChange synchronously and
-                        // would queue behind the in-flight persist transaction.
-                        // Consume the request (so it does not re-fire) and ask
-                        // the user to retry after the save completes.
+                            wqn::WordObservationCommitState::kPersisting ||
+                        (state->problem_app.active &&
+                         state->problem_app.commit_state ==
+                             wqn::ProblemVerdictCommitState::kPersisting)) {
                         state->note_app.message = "正在保存，请稍后";
-                    } else {
-                        state->word_app.scoped_deck_id = requested_deck_id;
-                        state->word_app.scoped_deck_title.clear();
-                        for (const WordDeckInfo& deck : state->word_app.deck_catalog) {
-                            if (deck.deck_id == requested_deck_id) {
-                                state->word_app.scoped_deck_title = deck.title;
-                                break;
-                            }
+                        break;
+                    }
+                    // Arm + submit; nothing is installed until
+                    // the durable ACK (DispatchWordSessionResetResult), so a scope
+                    // switch never blocks the UI task on the reset transaction.
+                    // The pending pair stays armed on a submit reject or a write
+                    // failure, exactly like the default-deck switch, so the user
+                    // re-picks the row and retries.
+                    std::string requested_deck_title;
+                    for (const WordDeckInfo& deck : state->word_app.deck_catalog) {
+                        if (deck.deck_id == requested_deck_id) {
+                            requested_deck_title = deck.title;
+                            break;
                         }
-                        // The restored session is pinned to the previous scope;
-                        // starting the deck study must not resume it.
-                        ResetWordSessionsForScopeChange(&state->word_app, true);
-                        state->screen = UiScreen::kWord;
+                    }
+                    state->word_app.scope_reset_pending_deck_id = requested_deck_id;
+                    state->word_app.scope_reset_pending_deck_title = requested_deck_title;
+                    const uint32_t op_id = device_ui_internal::SubmitWordSessionReset(requested_deck_id);
+                    if (op_id != 0) {
+                        state->word_app.scope_reset_pending_valid = true;
+                        state->word_app.scope_reset_save_op_id = op_id;
+                        state->note_app.message = "正在切换词库…";
+                    } else {
+                        state->word_app.scope_reset_save_op_id = 0;
+                        state->note_app.message =
+                            device_ui_internal::IsPersistDomainBusy(
+                                device_ui_internal::PersistDomain::kWord)
+                                ? "正在保存，请稍后"
+                                : "切换繁忙，请重试";
                     }
                 }
                 break;
@@ -629,13 +657,31 @@ void HandleUiInput(UiState* state, UiInput input)
     if (screen_before == wqn::UiScreen::kWord &&
         state->screen != wqn::UiScreen::kWord &&
         !state->word_app.scoped_deck_id.empty()) {
-        // The kTopPrevious/kTopNext guards block leaving a scoped word page
-        // while a commit is persisting, so this cleanup only runs once the
-        // session is safe to drop -- there is no in-flight persist transaction
-        // for the synchronous clears to queue behind.
+        // [word-scope-reset] Leaving the scoped word page drops the scope
+        // override and the sessions with it. Same arm+submit shape as the [词]
+        // row above: the durable half runs on the worker, so leaving a word page
+        // never blocks the UI task on the reset transaction. The in-memory half
+        // is applied by the ACK dispatch -- but the scope must clear NOW,
+        // because the user is already on another screen and the next direct
+        // word entry must study the default deck, not the override they left.
+        //
+        // The kTopPrevious/kTopNext guards already block leaving a scoped word
+        // page while a commit is persisting, so there is no in-flight persist
+        // transaction for this to queue behind.
+        const std::string leaving_deck_id = state->word_app.scoped_deck_id;
         state->word_app.scoped_deck_id.clear();
         state->word_app.scoped_deck_title.clear();
-        ResetWordSessionsForScopeChange(&state->word_app, true);
+        const uint32_t op_id = device_ui_internal::SubmitWordSessionReset(leaving_deck_id);
+        if (op_id != 0) {
+            state->word_app.scope_reset_pending_deck_id = leaving_deck_id;
+            state->word_app.scope_reset_pending_deck_title.clear();
+            state->word_app.scope_reset_pending_valid = true;
+            state->word_app.scope_reset_save_op_id = op_id;
+        }
+        // A submit reject is tolerable here: the scope override is already gone
+        // in memory, the durable reset will be retried by the next scope change,
+        // and the sessions it failed to drop are inert the moment any later
+        // reset commits a generation.
     }
 #if CONFIG_WQN_AI_ENABLE
     // Leaving the AI screen while in Flash tier must tear down the WebSocket
@@ -644,6 +690,64 @@ void HandleUiInput(UiState* state, UiInput input)
     if (screen_before == wqn::UiScreen::kAi && state->screen != wqn::UiScreen::kAi &&
         state->ai.tier == wqn::AiTier::kFlash) {
         wqn::StopFlashSession();
+    }
+    // [agent] B3 / D-lease: leaving the AI screen from the Agent tier drops its
+    // event stream and the sleep lease behind it. Not gated on the tier being
+    // current -- a user who cycles to another tier and then leaves hits the tier
+    // cycle first, which already released; this is the same release for the user
+    // who leaves straight from the Agent tier.
+    if (screen_before == wqn::UiScreen::kAi && state->screen != wqn::UiScreen::kAi) {
+        wqn::LeaveOpenCodeAgentTier();
+    }
+    // [agent] The B1 counterpart on SCREEN ENTRY. The tier-cycle handler in
+    // ui_input.cpp re-fetches the list / re-attaches on arriving at the Agent
+    // tier; entering the AI screen from another screen runs no tier logic at
+    // all, so a return left one of two stale states behind:
+    //
+    //   - the leave path that found no stream attached clears NOTHING -- it only
+    //     refreshes the lease -- so session_locked, current_session_id, the
+    //     transcript and the scroll offset all survive the round trip. The user
+    //     comes back to a locked view with no stream behind it: symptom 3
+    //     ("entering a running session receives nothing"), reached through a
+    //     screen change instead of a tier cycle.
+    //   - the leave path that did find a stream clears the lock but leaves
+    //     g_state.sessions exactly as it was, and no gesture can refresh it while
+    //     the picker is up (see DispatchAgentSessionListPoll). The picker's 运行中
+    //     marker is then as old as the last fetch -- hours, if the device slept.
+    //
+    // Exactly the two branches the tier cycle runs, so the two entry points
+    // cannot drift: no session locked means fetch the list, a locked session with
+    // no stream means attach to it.
+    if (state->screen == wqn::UiScreen::kAi && screen_before != wqn::UiScreen::kAi &&
+        state->ai.tier == wqn::AiTier::kAgent) {
+        if (state->agent.current_session_id.empty()) {
+            const esp_err_t result = wqn::RequestOpenCodeSessionList();
+            if (result != ESP_OK) {
+                ESP_LOGW("ui_model", "Agent screen entry: session list refused (%s)",
+                         esp_err_to_name(result));
+            }
+        } else if (state->agent.session_locked && !state->agent.stream_active) {
+            const esp_err_t result = wqn::ObserveOpenCodeSession();
+            if (result != ESP_OK) {
+                // The worker slot is taken -- kNoSession cannot happen, this
+                // branch requires current_session_id to be non-empty. What holds
+                // it is a backfill still reading the transcript the last entry
+                // armed, or a run, or a list load whose success branch has not
+                // cleared session_locked yet. Logged rather than retried: the
+                // tier-cycle path accepts the same race, and a retry loop would
+                // fight the single-slot command gate.
+                //
+                // The third case is deliberate and silent. A leaving attach that
+                // has not finished detaching still reads stream_active true, so
+                // neither branch here fires and nothing is logged -- re-attaching
+                // then would be refused on the same slot anyway, and the tail
+                // will clear the flag on its own. An earlier version of this
+                // comment claimed that case reaches the log below; it cannot,
+                // the branch condition excludes it.
+                ESP_LOGW("ui_model", "Agent screen entry: re-attach refused (%s)",
+                         esp_err_to_name(result));
+            }
+        }
     }
 #endif
 }

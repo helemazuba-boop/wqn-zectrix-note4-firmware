@@ -500,7 +500,8 @@ AiHistoryLayout ComputeAiHistoryLayout(
 
 void RenderAiHistoryViewport(const wqn::AiSessionState& ai,
                             const std::shared_ptr<const wqn::AiHistorySnapshot>& snapshot,
-                            int32_t scroll_offset_lines)
+                            int32_t scroll_offset_lines,
+                            int bottom_pad)
 {
     // Clear the viewport region explicitly (partial-region contract).
     DrawHistoryClear(kAiViewportY, wqn::kEpdHeight);
@@ -509,7 +510,15 @@ void RenderAiHistoryViewport(const wqn::AiSessionState& ai,
     static const std::vector<wqn::ChatMessageSnapshot> kEmpty;
     const auto& messages = snapshot ? snapshot->messages : kEmpty;
     if (messages.empty() && ai.status == wqn::AiSessionStatus::kIdle) {
-        const std::string hint = "长按确认键开始语音提问";
+        // [agent] This branch is shared with the STD/Flash tiers, and that is
+        // how the Agent tier came to be told "长按确认键开始语音提问" -- the STD
+        // tier's gesture, offered by a tier whose unit of input is a task
+        // rather than a question. Its own empty state says what is actually
+        // true instead. Gesture instructions have left this tier entirely; the
+        // manual owns them.
+        const std::string hint = ai.tier == wqn::AiTier::kAgent
+            ? std::string("这个任务还没有记录")
+            : std::string("长按确认键开始语音提问");
         const auto lines = WrapForViewport(hint, kAiAssistantW - kAiAssistantLeftBorder - 6, 4);
         int y = kAiViewportY + 30;
         for (const auto& l : lines) {
@@ -541,7 +550,13 @@ void RenderAiHistoryViewport(const wqn::AiSessionState& ai,
     // anchor: positive means "scroll up into older history", negative means
     // "scroll down past the latest content" (clamped at 0).
     // All messages are laid out in a virtual canvas from oldest to newest.
-    const int effective_bottom = wqn::kEpdHeight - kAiViewportBottomPad;
+    //
+    // `bottom_pad` is what this frame leaves clear at the panel's bottom: the
+    // Agent tier's option bar while there is something to answer, 0 otherwise
+    // (see kAiBottomBandH). It arrives as a parameter because three other
+    // functions derive the scroll clamp from this same number, and the two must
+    // not be allowed to answer the question differently.
+    const int effective_bottom = wqn::kEpdHeight - bottom_pad;
     const int viewport_h = effective_bottom - kAiViewportY;
 
     int max_window_top = layout.total_content_h - viewport_h;
@@ -610,24 +625,46 @@ void RenderAiHistoryViewport(const wqn::AiSessionState& ai,
         }
     }
 
-    // 3. Scroll chevrons. We place ▼ at the bottom-right corner inside the
-    // `kAiViewportBottomPad` slack so it never overlaps content. ▲ sits in
-    // the top-right corner when there's more above. The indicator strip is
-    // cleared each tick to avoid ghosting on the E-ink panel.
+    // 3. Scroll chevrons. ▲ sits in the top-right corner when there's more
+    // above; ▼ sits in the bottom-right corner when there's more below. Each
+    // owns its own strip: the strip is cleared every tick before the icon is
+    // drawn into it, which is what keeps a disappearing indicator from leaving a
+    // phantom on the E-ink panel.
+    //
+    // Neither strip reserves viewport height, and ▲ never did -- it has always
+    // cleared the top-right corner over whatever the first line put there. That
+    // is the established design here, not an oversight. ▼ does the same now that
+    // the bottom is reserved only while the Agent tier's band is up: deriving
+    // its clear from the bottom pad made the clear and the chevron drift apart
+    // the moment a frame reserved nothing, and a ▼ drawn outside its own clear
+    // would eat the tail of the last line nobody cleared.
+    //
+    // [scroll-indicator] Each icon's left edge is clamped to the strip the clear
+    // above reserves. Both were `kEpdWidth - count_w - 18`, which walks LEFT as
+    // the hidden-line count grows: a 3-digit count puts the icon at x=358,
+    // outside the [360, 400) strip just cleared, so it drew over message text
+    // nobody cleared. Clamping keeps the icon inside its strip and lets the
+    // count clip at the panel edge -- the icon is what says "there is more" and
+    // the number is the refinement, so losing digits is the cheaper loss.
+    constexpr int kIndicatorColumnLeft = wqn::kEpdWidth - 40;
+    // ▼'s strip: bottom-right corner, 2 px above the panel's bottom edge. This
+    // is exactly where it has always been; only its source changed.
+    constexpr int kIndicatorBottomStripH = 20;
     if (messages.size() > 1) {
         const bool more_above = !oldest_fully_visible;
         const bool more_below = (window_top < max_window_top);
-        // Reserve a right-edge indicator region; clear it before
+        // Clear a right-edge indicator region; clear it before
         // drawing so a disappearing indicator does not leave a phantom.
-        FillRect(wqn::kEpdWidth - 40, wqn::kEpdHeight - kAiViewportBottomPad + 2,
-                 36, kAiViewportBottomPad - 4, false);
+        FillRect(wqn::kEpdWidth - 40, wqn::kEpdHeight - kIndicatorBottomStripH,
+                 36, kIndicatorBottomStripH - 2, false);
         FillRect(wqn::kEpdWidth - 40, kAiViewportY + 1, 36, 14, false);
         if (more_below) {
             char count[12];
             std::snprintf(count, sizeof(count), "%ld",
                           static_cast<long>((max_window_top - window_top + line_h - 1) / line_h));
             const int count_w = wqn::MeasureUtf8TextWidth(count);
-            const int x = wqn::kEpdWidth - count_w - 18;
+            const int x = std::max<int>(kIndicatorColumnLeft,
+                                        wqn::kEpdWidth - count_w - 18);
             // Bottom-right, 2 px above the panel bottom.
             DrawWqnBitmapAsset(x, wqn::kEpdHeight - 16, m06_chevron_down_12_asset, true);
             DRC(x + 14, wqn::kEpdHeight - 18, count, true);
@@ -638,7 +675,8 @@ void RenderAiHistoryViewport(const wqn::AiSessionState& ai,
             char count[12];
             std::snprintf(count, sizeof(count), "%ld", static_cast<long>(window_top / line_h));
             const int count_w = wqn::MeasureUtf8TextWidth(count);
-            const int x = wqn::kEpdWidth - count_w - 18;
+            const int x = std::max<int>(kIndicatorColumnLeft,
+                                        wqn::kEpdWidth - count_w - 18);
             DrawWqnBitmapAsset(x, kAiViewportY + 3, m07_chevron_up_12_asset, true);
             DRC(x + 14, kAiViewportY + 4, count, true);
         }
@@ -649,11 +687,13 @@ void RenderAiHistoryViewport(const wqn::AiSessionState& ai,
     if (ai.scroll_no_op_hint_ms > 0) {
         const int64_t now_ms = esp_timer_get_time() / 1000;
         if (now_ms - ai.scroll_no_op_hint_ms <= 1000) {
-            // Centre the label horizontally, just above the bottom pad band.
+            // Centre the label horizontally, sitting on the last line the
+            // bottom pad leaves clear. With no pad that is the panel's last
+            // line, which is where "you are at the newest" belongs.
             const char* hint = "\xe5\xb7\xb2\xe6\x9c\x80\xe6\x96\xb0";  // 已最新
             const int w = wqn::MeasureUtf8TextWidth(hint);
             const int cx = std::max(70, (wqn::kEpdWidth - w) / 2);
-            DRC(cx, wqn::kEpdHeight - kAiViewportBottomPad - 18, hint, true);
+            DRC(cx, wqn::kEpdHeight - bottom_pad - kAiLineH, hint, true);
         }
     }
 }
@@ -661,6 +701,7 @@ void RenderAiHistoryViewport(const wqn::AiSessionState& ai,
 void GetAiScrollBounds(
     std::shared_ptr<const wqn::AiHistorySnapshot> snapshot,
     bool expand_content,
+    int bottom_pad,
     int32_t* out_min_scroll,
     int32_t* out_max_scroll)
 {
@@ -672,7 +713,7 @@ void GetAiScrollBounds(
     const AiHistoryLayout layout = ComputeAiHistoryLayout(snapshot->messages, expand_content);
 
     const int line_h = kAiLineH;
-    const int viewport_h = wqn::kEpdHeight - kAiViewportY - kAiViewportBottomPad;
+    const int viewport_h = wqn::kEpdHeight - kAiViewportY - bottom_pad;
     int max_window_top = layout.total_content_h - viewport_h;
     if (max_window_top < 0) {
         max_window_top = 0;
@@ -700,6 +741,7 @@ void GetAiScrollBounds(
 bool GetAiTurnJumpOffsetLines(
     std::shared_ptr<const wqn::AiHistorySnapshot> snapshot,
     bool expand_content,
+    int bottom_pad,
     int32_t current_scroll,
     int direction,
     int32_t* out_scroll)
@@ -710,7 +752,7 @@ bool GetAiTurnJumpOffsetLines(
     const AiHistoryLayout layout = ComputeAiHistoryLayout(snapshot->messages, expand_content);
 
     const int line_h = kAiLineH;
-    const int viewport_h = wqn::kEpdHeight - kAiViewportY - kAiViewportBottomPad;
+    const int viewport_h = wqn::kEpdHeight - kAiViewportY - bottom_pad;
     int max_window_top = layout.total_content_h - viewport_h;
     if (max_window_top < 0) {
         max_window_top = 0;
@@ -791,6 +833,7 @@ bool GetAiTurnJumpOffsetLines(
 bool GetAiNewestAnswerTopOffsetLines(
     std::shared_ptr<const wqn::AiHistorySnapshot> snapshot,
     bool expand_content,
+    int bottom_pad,
     int32_t* out_scroll)
 {
     if (out_scroll == nullptr || !snapshot || snapshot->messages.empty()) {
@@ -803,7 +846,7 @@ bool GetAiNewestAnswerTopOffsetLines(
     const AiHistoryLayout layout = ComputeAiHistoryLayout(snapshot->messages, expand_content);
 
     const int line_h = kAiLineH;
-    const int viewport_h = wqn::kEpdHeight - kAiViewportY - kAiViewportBottomPad;
+    const int viewport_h = wqn::kEpdHeight - kAiViewportY - bottom_pad;
     int max_window_top = layout.total_content_h - viewport_h;
     if (max_window_top < 0) {
         max_window_top = 0;
@@ -840,7 +883,11 @@ esp_err_t RenderAiToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
     DrawAiStatusBar(ai, frame.home, frame.status_edit);
 
     // Section 2: viewport (no bottom input bar, no separate toast strip).
-    RenderAiHistoryViewport(ai, frame.ai_history, ai.scroll_offset_lines);
+    // 0: this tier has no bottom band, so it reserves nothing. It used to
+    // reserve 22 px here, which was the Agent tier's option bar charged to a
+    // page that never drew one -- a permanent blank strip at the bottom of every
+    // STD/Flash transcript.
+    RenderAiHistoryViewport(ai, frame.ai_history, ai.scroll_offset_lines, 0);
 
     return RefreshFrame(frame, schedule);
 }

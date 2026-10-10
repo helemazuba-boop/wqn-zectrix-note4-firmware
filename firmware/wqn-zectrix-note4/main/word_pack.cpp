@@ -771,6 +771,35 @@ esp_err_t InitWordPackStorage()
     return ESP_OK;
 }
 
+esp_err_t InvalidateWordPackManifestTransaction(void*)
+{
+    // Drops ONLY the manifest. The pack files are deliberately left behind: the
+    // pack sync's own NOT_FOUND branch already calls ResetWordPackStorageCache
+    // to clear them, and it does so on the cloud lane rather than on whatever
+    // task asked for the invalidation.
+    const char* manifest_paths[] = {
+        kManifestPath,
+        kManifestTempPath,
+        kManifestBackupPath,
+    };
+    for (const char* path : manifest_paths) {
+        if (std::remove(path) != 0 && errno != ENOENT) {
+            return ESP_FAIL;
+        }
+    }
+    return ESP_OK;
+}
+
+esp_err_t InvalidateWordPackManifest()
+{
+    // [dev-diag] Used by the sync dialog's "re-download word packs" action.
+    // Measured on a device holding multi-MB packs: dropping the whole cache from
+    // the UI task took 25.7 s and froze it, while this manifest-only variant is
+    // ~1.5 s and leaves the expensive part to the lane.
+    return services::ExecuteStorageTransactionNamed(
+        InvalidateWordPackManifestTransaction, nullptr, "wp-manifest-invalidate");
+}
+
 esp_err_t ResetWordPackStorageCache()
 {
     runtime::SleepLease storage_lease = runtime::SleepLease::TryAcquire(
@@ -781,8 +810,8 @@ esp_err_t ResetWordPackStorageCache()
     if (!storage_lease) {
         return ESP_ERR_INVALID_STATE;
     }
-    const esp_err_t result = services::ExecuteStorageTransaction(
-        ResetWordPackStorageCacheRaw, nullptr);
+    const esp_err_t result = services::ExecuteStorageTransactionNamed(
+        ResetWordPackStorageCacheRaw, nullptr, "wp-cache-reset");
     if (result == ESP_OK) {
         ESP_LOGW(kTag, "cleared incompatible word pack cache; cloud content is recoverable");
     }
@@ -956,9 +985,9 @@ esp_err_t SaveWordPackManifest(const WqnWordPackManifest& manifest)
     if (!storage_lease) {
         return ESP_ERR_INVALID_STATE;
     }
-    return services::ExecuteStorageTransaction(
+    return services::ExecuteStorageTransactionNamed(
         SaveWordPackManifestTransaction,
-        const_cast<WqnWordPackManifest*>(&manifest));
+        const_cast<WqnWordPackManifest*>(&manifest), "wp-manifest-save");
 }
 
 esp_err_t LoadWordPackIndexInternal(
@@ -1252,6 +1281,21 @@ esp_err_t WordPackStreamTransaction(void* opaque)
                 return ESP_FAIL;
             }
             context->bytes_written += context->chunk_size;
+            // [measure] The decompressed chunk size has to be logged, because
+            // nothing else in the system records it and every per-byte cost
+            // depends on it. The transport is zlib (`received` in wqn_api.cpp
+            // counts COMPRESSED bytes from esp_http_client_read), so the
+            // download's own progress line mixes units: 1005.19 printed
+            // `received=294912` against `bytes_expected=1341248`, which reads
+            // as 22.0% but is bytes-off-the-wire over plaintext bytes. The
+            // decompressed truth was ~88%. Without this line, a per-byte
+            // figure can be off by 4x and no log can show which is right.
+            ESP_LOGI(kTag,
+                     "word pack stream append: chunk_bytes=%u total_bytes=%u "
+                     "of %lu",
+                     static_cast<unsigned>(context->chunk_size),
+                     static_cast<unsigned>(context->bytes_written),
+                     static_cast<unsigned long>(context->item->byte_size));
             return ESP_OK;
 
         case WordPackStreamOperation::kCommit: {
@@ -1319,8 +1363,8 @@ esp_err_t AppendWordPackStream(
     context->operation = WordPackStreamOperation::kAppend;
     context->chunk = bytes;
     context->chunk_size = size;
-    return services::ExecuteStorageTransaction(
-        WordPackStreamTransaction, context);
+    return services::ExecuteStorageTransactionNamed(
+        WordPackStreamTransaction, context, "wp-stream");
 }
 
 esp_err_t DownloadWordPackToStorage(
@@ -1346,22 +1390,22 @@ esp_err_t DownloadWordPackToStorage(
     context.item = &item;
     mbedtls_sha256_init(&context.sha);
     context.operation = WordPackStreamOperation::kBegin;
-    esp_err_t result = services::ExecuteStorageTransaction(
-        WordPackStreamTransaction, &context);
+    esp_err_t result = services::ExecuteStorageTransactionNamed(
+        WordPackStreamTransaction, &context, "wp-stream");
     if (result == ESP_OK) {
         result = DownloadWordPackStream(
             token, metadata, item, AppendWordPackStream, &context);
     }
     if (result == ESP_OK) {
         context.operation = WordPackStreamOperation::kCommit;
-        result = services::ExecuteStorageTransaction(
-            WordPackStreamTransaction, &context);
+        result = services::ExecuteStorageTransactionNamed(
+            WordPackStreamTransaction, &context, "wp-stream");
     }
     if (result != ESP_OK) {
         context.operation = WordPackStreamOperation::kAbort;
         ESP_ERROR_CHECK_WITHOUT_ABORT(
-            services::ExecuteStorageTransaction(
-                WordPackStreamTransaction, &context));
+            services::ExecuteStorageTransactionNamed(
+                WordPackStreamTransaction, &context, "wp-stream"));
     }
     mbedtls_sha256_free(&context.sha);
     return result;
@@ -1373,7 +1417,8 @@ bool WordPackNeedsDownload(const WqnWordPackManifestItem& item)
     return !FileExists(path) || !VerifyFileSha256(path, item.sha256);
 }
 
-esp_err_t ReadWordPackEntry(const WordPackIndexEntry& index_entry, WqnWordEntry* entry)
+static esp_err_t ReadWordPackEntryImpl(const WordPackIndexEntry& index_entry, WqnWordEntry* entry,
+    const char* source)
 {
     if (entry == nullptr || index_entry.pack_stem[0] == '\0') {
         return ESP_ERR_INVALID_ARG;
@@ -1385,7 +1430,13 @@ esp_err_t ReadWordPackEntry(const WordPackIndexEntry& index_entry, WqnWordEntry*
     *entry = WqnWordEntry{};
 
     const std::string path = PackPathForStem(index_entry.pack_stem);
+    // [measure] §四.6: split the open_seek_ms the rewrite has been attributing
+    // to "opening" into the fopen and the fseek halves. The split is appended
+    // after total_ms so the existing `word card loaded` fields -- and the
+    // PK:open-seek-not-regressed criterion that reads them -- stay byte-identical.
+    const int64_t before_fopen_us = esp_timer_get_time();
     FILE* file = std::fopen(path.c_str(), "rb");
+    const int64_t after_fopen_us = esp_timer_get_time();
     if (file == nullptr) {
         return ESP_ERR_NOT_FOUND;
     }
@@ -1416,12 +1467,25 @@ esp_err_t ReadWordPackEntry(const WordPackIndexEntry& index_entry, WqnWordEntry*
     const int64_t finished_us = esp_timer_get_time();
     ESP_LOGI(
         kTag,
-        "word card loaded: open_seek_ms=%lld read_close_ms=%lld parse_ms=%lld total_ms=%lld",
+        "word card loaded: open_seek_ms=%lld read_close_ms=%lld parse_ms=%lld "
+        "total_ms=%lld fopen_ms=%lld fseek_ms=%lld source=%s",
         static_cast<long long>((opened_us - started_us) / 1000),
         static_cast<long long>((read_us - opened_us) / 1000),
         static_cast<long long>((finished_us - read_us) / 1000),
-        static_cast<long long>((finished_us - started_us) / 1000));
+        static_cast<long long>((finished_us - started_us) / 1000),
+        static_cast<long long>((after_fopen_us - before_fopen_us) / 1000),
+        static_cast<long long>((opened_us - after_fopen_us) / 1000), source);
     return ESP_OK;
+}
+
+esp_err_t ReadWordPackEntry(const WordPackIndexEntry& index_entry, WqnWordEntry* entry)
+{
+    return ReadWordPackEntryImpl(index_entry, entry, "foreground");
+}
+
+esp_err_t ReadWordPackEntryPrefetch(const WordPackIndexEntry& index_entry, WqnWordEntry* entry)
+{
+    return ReadWordPackEntryImpl(index_entry, entry, "prefetch");
 }
 
 }  // namespace wqn

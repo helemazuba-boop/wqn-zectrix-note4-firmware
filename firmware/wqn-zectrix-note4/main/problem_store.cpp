@@ -39,6 +39,13 @@ constexpr size_t kMaxParkedRecords = wqn::kProblemObservationOutboxCapacity;
 constexpr size_t kMaxLineBytes = 512;
 constexpr size_t kMaxParkedLineBytes = 96;
 
+// Owner-task-only negative cache, not a count of uploadable records. Publish
+// only after successful reads of both journals find no payload bytes. Parked
+// or malformed nonempty payloads must keep the ordinary read/validation path.
+// Every payload/marker write primitive invalidates this BEFORE attempting I/O,
+// including failures that may already have appended partial bytes.
+bool g_empty_problem_outbox_known = false;
+
 bool IsValidRequestId(const std::string& value)
 {
     if (value.size() < 16 || value.size() > 64) return false;
@@ -149,15 +156,20 @@ bool DecodeObservationLine(
 
 // Reads every journal line (bounded); malformed lines are dropped so one
 // corrupt record cannot wedge the queue forever.
-esp_err_t ReadOutboxLines(std::vector<std::string>* lines)
+esp_err_t ReadOutboxLines(
+    std::vector<std::string>* lines, bool* physically_empty = nullptr)
 {
+    if (physically_empty != nullptr) *physically_empty = false;
     lines->clear();
     FILE* file = std::fopen(kOutboxPath, "rb");
     if (file == nullptr) {
+        if (errno == ENOENT && physically_empty != nullptr) *physically_empty = true;
         return errno == ENOENT ? ESP_OK : ESP_FAIL;
     }
     std::vector<char> buffer(kMaxLineBytes + 2, 0);
+    bool saw_bytes = false;
     while (std::fgets(buffer.data(), buffer.size(), file) != nullptr) {
+        saw_bytes = true;
         size_t length = std::strlen(buffer.data());
         while (length > 0 &&
                (buffer[length - 1] == '\n' || buffer[length - 1] == '\r')) {
@@ -174,12 +186,15 @@ esp_err_t ReadOutboxLines(std::vector<std::string>* lines)
             return ESP_ERR_INVALID_SIZE;
         }
     }
-    std::fclose(file);
-    return ESP_OK;
+    const bool read_ok = std::ferror(file) == 0;
+    const bool closed = std::fclose(file) == 0;
+    if (read_ok && closed && physically_empty != nullptr) *physically_empty = !saw_bytes;
+    return read_ok && closed ? ESP_OK : ESP_FAIL;
 }
 
 esp_err_t WriteOutboxLines(const std::vector<std::string>& lines)
 {
+    g_empty_problem_outbox_known = false;
     if (lines.empty()) {
         if (std::remove(kOutboxPath) != 0 && errno != ENOENT) {
             return ESP_FAIL;
@@ -254,8 +269,9 @@ esp_err_t ReadParkedRequestIds(std::vector<std::string>* request_ids)
         }
         if (ch == EOF) break;
     }
-    std::fclose(file);
-    return ESP_OK;
+    const bool read_ok = std::ferror(file) == 0;
+    const bool closed = std::fclose(file) == 0;
+    return read_ok && closed ? ESP_OK : ESP_FAIL;
 }
 
 // Best-effort bounded append of one park marker. Returns ESP_ERR_NO_MEM when
@@ -264,6 +280,7 @@ esp_err_t ReadParkedRequestIds(std::vector<std::string>* request_ids)
 esp_err_t AppendParkedEntry(
     const std::string& request_id, wqn::OutboxSuspendReason reason)
 {
+    g_empty_problem_outbox_known = false;
     const std::string reason_name = wqn::OutboxSuspendReasonName(reason);
     if (!IsValidRequestId(request_id) || !IsValidSuspendReasonName(reason_name)) {
         return ESP_ERR_INVALID_ARG;
@@ -318,6 +335,27 @@ esp_err_t AppendParkedEntry(
     return ESP_OK;
 }
 
+esp_err_t ReadOutboxForQuery(
+    std::vector<std::string>* lines, std::vector<std::string>* parked)
+{
+    if (lines == nullptr || parked == nullptr) return ESP_ERR_INVALID_ARG;
+    lines->clear();
+    parked->clear();
+    if (g_empty_problem_outbox_known) return ESP_OK;
+    bool physically_empty = false;
+    esp_err_t result = ReadOutboxLines(lines, &physically_empty);
+    if (result != ESP_OK) return result;
+    result = ReadParkedRequestIds(parked);
+    if (result != ESP_OK) return result;
+    g_empty_problem_outbox_known = physically_empty;
+    ESP_LOGI(
+        kTag, "problem outbox query read: lines=%u parked=%u empty_cached=%u",
+        static_cast<unsigned>(lines->size()),
+        static_cast<unsigned>(parked->size()),
+        static_cast<unsigned>(g_empty_problem_outbox_known));
+    return ESP_OK;
+}
+
 struct CommitContext {
     const wqn::DurableProblemObservation* observation;
 };
@@ -325,6 +363,9 @@ struct CommitContext {
 esp_err_t CommitTransaction(void* opaque)
 {
     auto* context = static_cast<CommitContext*>(opaque);
+    // Also invalidate if a preparatory read fails: a later query must not
+    // hide that storage error behind the older successful empty probe.
+    g_empty_problem_outbox_known = false;
     std::vector<std::string> lines;
     esp_err_t result = ReadOutboxLines(&lines);
     if (result != ESP_OK) return result;
@@ -359,10 +400,8 @@ esp_err_t PeekTransaction(void* opaque)
 {
     auto* observation = static_cast<wqn::DurableProblemObservation*>(opaque);
     std::vector<std::string> lines;
-    esp_err_t result = ReadOutboxLines(&lines);
-    if (result != ESP_OK) return result;
     std::vector<std::string> parked;
-    result = ReadParkedRequestIds(&parked);
+    const esp_err_t result = ReadOutboxForQuery(&lines, &parked);
     if (result != ESP_OK) return result;
     for (const std::string& line : lines) {
         if (!DecodeObservationLine(line, observation)) {
@@ -388,6 +427,7 @@ struct RequestIdContext {
 esp_err_t RemoveTransaction(void* opaque)
 {
     auto* context = static_cast<RequestIdContext*>(opaque);
+    g_empty_problem_outbox_known = false;
     std::vector<std::string> lines;
     esp_err_t result = ReadOutboxLines(&lines);
     if (result != ESP_OK) return result;
@@ -435,10 +475,8 @@ esp_err_t SnapshotTransaction(void* opaque)
 {
     auto* snapshot = static_cast<wqn::ProblemOutboxSnapshot*>(opaque);
     std::vector<std::string> lines;
-    esp_err_t result = ReadOutboxLines(&lines);
-    if (result != ESP_OK) return result;
     std::vector<std::string> parked;
-    result = ReadParkedRequestIds(&parked);
+    const esp_err_t result = ReadOutboxForQuery(&lines, &parked);
     if (result != ESP_OK) return result;
     size_t valid = 0;
     size_t suspended = 0;
@@ -472,6 +510,7 @@ esp_err_t SuspendTransaction(void* opaque)
         context->request_id->empty()) {
         return ESP_ERR_INVALID_ARG;
     }
+    g_empty_problem_outbox_known = false;
     std::vector<std::string> parked;
     esp_err_t result = ReadParkedRequestIds(&parked);
     if (result != ESP_OK) return result;
@@ -507,9 +546,13 @@ esp_err_t ExecuteWithStorageLease(
     if (!storage_lease) {
         return ESP_ERR_INVALID_STATE;
     }
+    // [measure] Pass `label` on the background path too. word_study_store.cpp
+    // and note_store.cpp both forward their holder here; this one did not, so
+    // every background problem transaction was logged with the default owner
+    // "background" and the §一 table could not tell problem traffic apart.
     return foreground
         ? wqn::services::ExecuteForegroundStorageTransaction(transaction, context, label)
-        : wqn::services::ExecuteStorageTransaction(transaction, context);
+        : wqn::services::ExecuteStorageTransactionNamed(transaction, context, label);
 }
 
 }  // namespace

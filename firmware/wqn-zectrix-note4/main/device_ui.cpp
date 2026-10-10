@@ -524,6 +524,85 @@ void DrainDisplayResults(
     }
 }
 
+namespace {
+// [deferral-observability] The commit-pending skip in DeviceUiTask's result
+// scan is correct but used to be completely silent: while a word observation
+// commit never clears, every Word/WordBulk result was dropped from that scan
+// with no trace at all, so the word session-start result never landed and the
+// word page sat in kSessionStarting ("正在准备") forever with nothing in the
+// log to explain it.
+//
+// This only *observes*; it changes no control flow. It stays quiet during
+// normal operation because a healthy observation commit finishes in tens of
+// milliseconds (worst measured tier 1224 ms), so a result merely being held
+// back for one scan is the intended ordering, not a defect. Only a hold that
+// outlasts every healthy commit -- i.e. the commit ACK never arrived -- is
+// worth shouting about, and it reports how long the result has actually been
+// held rather than claiming to know the root cause.
+constexpr int64_t kHeldResultWarnMs = 3000;
+constexpr int64_t kHeldResultRepeatMs = 2000;
+
+// Reset to 0 whenever nothing is held, so a later hold is timed from its own
+// start instead of inheriting an earlier episode's timestamp.
+// Plain int64_t, NOT std::atomic (§4.7): these are touched only from
+// DeviceUiTask, the single UI owner, in its result scan. If a second task ever
+// reads or writes them, make them atomic first.
+int64_t g_held_result_since_ms[device_ui_internal::kCloudDomainCount] = {};
+int64_t g_held_result_last_log_ms[device_ui_internal::kCloudDomainCount] = {};
+
+const char* CloudDomainName(device_ui_internal::CloudDomain domain)
+{
+    switch (domain) {
+        case device_ui_internal::CloudDomain::kTodo:
+            return "todo";
+        case device_ui_internal::CloudDomain::kWord:
+            return "word";
+        case device_ui_internal::CloudDomain::kNote:
+            return "note";
+        case device_ui_internal::CloudDomain::kProblem:
+            return "problem";
+        case device_ui_internal::CloudDomain::kWordBulk:
+            return "word-bulk";
+        case device_ui_internal::CloudDomain::kNoteBulk:
+            return "note-bulk";
+        case device_ui_internal::CloudDomain::kProblemBulk:
+            return "problem-bulk";
+    }
+    return "unknown";
+}
+
+void TrackHeldCloudResult(device_ui_internal::CloudDomain domain, bool gated)
+{
+    const size_t i = static_cast<size_t>(domain);
+    // Reset must happen for the UNGATED case too. When the gate opens the
+    // result is taken and acked on this same pass, so without this branch the
+    // stale timestamp survives and the next unrelated hold would immediately
+    // report "held for 99997 ms" -- a false reading from our own probe.
+    if (!gated || !device_ui_internal::HasCloudResultPending(domain)) {
+        g_held_result_since_ms[i] = 0;
+        return;
+    }
+    const int64_t now_ms = esp_timer_get_time() / 1000;
+    if (g_held_result_since_ms[i] == 0) {
+        g_held_result_since_ms[i] = now_ms;
+        return;
+    }
+    const int64_t held_ms = now_ms - g_held_result_since_ms[i];
+    if (held_ms < kHeldResultWarnMs) {
+        return;
+    }
+    if (now_ms - g_held_result_last_log_ms[i] < kHeldResultRepeatMs) {
+        return;
+    }
+    g_held_result_last_log_ms[i] = now_ms;
+    ESP_LOGW(kTag,
+             "cloud result held for %lld ms by commit-pending gate (domain=%s) "
+             "-- the persist ACK for that domain has not arrived, so this "
+             "result will never be applied until it does",
+             static_cast<long long>(held_ms), CloudDomainName(domain));
+}
+}  // namespace
+
 void DeviceUiTask(void*)
 {
     ESP_LOGI(kTag, "device UI task started");
@@ -598,7 +677,10 @@ void DeviceUiTask(void*)
     std::string last_clock_label = CurrentClockLabel();
     DisplayTrackingState& display_tracking = g_display_tracking;
     RefreshSchedule pending_refresh_schedule = RefreshSchedule::kNone;
-    {
+    // [ui-stack] Keep the >4 KiB frame out of this long-lived task's fixed
+    // stack frame. noinline is intentional: lexical braces alone did not
+    // prevent it from consuming stack during unrelated state-load/dispatch.
+    [&]() __attribute__((noinline)) {
         const wqn::UiFrame frame = wqn::RenderUiFrame(state);
         display_tracking.desired_signature = FrameSignature(frame);
         RefreshSchedule init_schedule = RefreshSchedule::kImmediate;
@@ -646,7 +728,8 @@ void DeviceUiTask(void*)
                 pending_refresh_schedule = init_schedule;
             }
         }
-    }
+    }();
+    LogUiStackHighWater("initial-frame-dispatched");
     TickType_t last_status_refresh = xTaskGetTickCount();
     g_last_active_us_local = esp_timer_get_time();
     TickType_t poll_delay = kUiPollDelayTicks;
@@ -758,6 +841,7 @@ void DeviceUiTask(void*)
             // false but the effect is still armed. Read fresh here, after the
             // button drain that may have just armed a new answer.
             const bool word_commit_pending =
+                wqn::HasBufferedWordObservations(state.word_app) ||
                 state.word_app.session.commit_state ==
                 wqn::WordObservationCommitState::kPersisting ||
                 // [deck-scope] A default-deck switch in flight wipes and
@@ -783,14 +867,27 @@ void DeviceUiTask(void*)
                 // domain busy (xxx_cloud_completed stays false, so no Finish);
                 // the persist result is applied+acked just below this scan, so
                 // next iteration this result merges onto the advanced session.
-                if ((result_domain == device_ui_internal::CloudDomain::kWord ||
-                     result_domain == device_ui_internal::CloudDomain::kWordBulk) &&
-                    word_commit_pending) {
-                    continue;
-                }
-                if ((result_domain == device_ui_internal::CloudDomain::kNote ||
-                     result_domain == device_ui_internal::CloudDomain::kNoteBulk) &&
-                    note_commit_pending) {
+                //
+                // [worker-domain-gate] This is now the THIRD line of defense on
+                // this ordering, not the only one. The persist worker refuses a
+                // second command in the same domain, so a session-writing kind
+                // can no longer even reserve while the observation is in flight;
+                // and the candidate-page apply stamps the snapshot it was queued
+                // with and merges instead of installing when the session moved.
+                // Keep it: it is what makes the ordering visible in one place,
+                // and the merge path logs when it fires.
+                // [deferral-observability] Observe (never alter) this gate. A
+                // domain is either word-ish or note-ish, never both, so the
+                // boolean below is exactly the old two-if skip's condition.
+                const bool result_gated =
+                    ((result_domain == device_ui_internal::CloudDomain::kWord ||
+                      result_domain == device_ui_internal::CloudDomain::kWordBulk) &&
+                     word_commit_pending) ||
+                    ((result_domain == device_ui_internal::CloudDomain::kNote ||
+                      result_domain == device_ui_internal::CloudDomain::kNoteBulk) &&
+                     note_commit_pending);
+                TrackHeldCloudResult(result_domain, result_gated);
+                if (result_gated) {
                     continue;
                 }
                 device_ui_internal::CloudResultReady ready;
@@ -906,6 +1003,20 @@ void DeviceUiTask(void*)
             }
         }
 
+        // Read-only cache results are independent of RAM/durable word gates.
+        // The command owns its card until the generation/op/slot fenced ACK.
+        {
+            device_ui_internal::PersistResultReceipt receipt;
+            wqn::WqnWordEntry entry;
+            if (device_ui_internal::TakeWordCardPrefetchResult(&receipt, &entry)) {
+                ui_runtime.DispatchWordCardPrefetchResult(receipt.result,
+                    receipt.operation_id, std::move(entry));
+                device_ui_internal::AckPersistResult(
+                    device_ui_internal::PersistKind::kWordCardPrefetch,
+                    receipt.generation, receipt.operation_id);
+            }
+        }
+
         // [persist-worker] Drain the word observation commit result (moved off
         // the UI task in commit #2). Apply on the UI task, ack with
         // generation+operation_id (only a matching ack frees the slot), and
@@ -923,6 +1034,26 @@ void DeviceUiTask(void*)
                 device_ui_internal::AckPersistResult(
                     device_ui_internal::PersistKind::kWordObservation,
                     word_persist.generation, word_persist.operation_id);
+            }
+        }
+
+        // [persist-worker] Drain the word-page scope-switch result (C6b). The
+        // durable half -- new scope generation, four session clears, walk cursor
+        // -- already ran on the worker; this installs the in-memory half and
+        // switches screens, so the scope switch never blocked the UI task.
+        {
+            device_ui_internal::PersistResultReceipt scope_reset;
+            if (device_ui_internal::TakePersistResultToApply(
+                    device_ui_internal::PersistKind::kWordSessionReset,
+                    &scope_reset)) {
+                const device_ui_internal::UiUpdate persist_update =
+                    ui_runtime.DispatchWordSessionResetResult(
+                        scope_reset.result, scope_reset.operation_id);
+                refresh_schedule =
+                    StrongerSchedule(refresh_schedule, persist_update.refresh);
+                device_ui_internal::AckPersistResult(
+                    device_ui_internal::PersistKind::kWordSessionReset,
+                    scope_reset.generation, scope_reset.operation_id);
             }
         }
 
@@ -1076,7 +1207,7 @@ void DeviceUiTask(void*)
             refresh_schedule, status_timeout_update.refresh);
 
         // v2: while the user is recording, the top toast label needs to tick
-        // up so "● 录音中 00:04" advances once a second. We do this here on
+        // up so "录音中 00:04" advances once a second. We do this here on
         // the UI task (the audio task only knows about stream samples).
         if (state.screen == wqn::UiScreen::kAi &&
             state.ai.status == wqn::AiSessionStatus::kListening) {
@@ -1134,6 +1265,17 @@ wqn::AiStreamingStatusView streaming_view{};
             refresh_schedule = StrongerSchedule(refresh_schedule, update.refresh);
         }
 
+        // [picker-stale] Session-picker self-refresh. Runs on the same tick as
+        // the follow step and for the same reason: the thing it corrects (a
+        // 运行中 marker for a session that already finished) is only wrong
+        // because time passed, so nothing but a tick can notice. It no-ops unless
+        // the picker is open AND a row claims a run.
+        {
+            const device_ui_internal::UiUpdate update =
+                ui_runtime.DispatchAgentSessionListPoll(now_ms);
+            refresh_schedule = StrongerSchedule(refresh_schedule, update.refresh);
+        }
+
         const std::string clock_label = CurrentClockLabel();
         if (clock_label != last_clock_label) {
             last_clock_label = clock_label;
@@ -1188,6 +1330,7 @@ wqn::AiStreamingStatusView streaming_view{};
         // read/write -- reload even runs InitNoteApp() -- would otherwise race
         // the pending commit).
         const bool persist_quiet = !device_ui_internal::IsAnyPersistBusy() &&
+            !wqn::HasBufferedWordObservations(state.word_app) &&
             state.word_app.session.commit_state !=
                 wqn::WordObservationCommitState::kPersisting &&
             state.note_app.session.commit_state !=
@@ -1220,6 +1363,11 @@ wqn::AiStreamingStatusView streaming_view{};
             last_status_refresh = now;
         }
 
+        // Fold RAM acceptance into this frame; do not paint "saving" and then
+        // schedule a second e-ink refresh just to advance the card. The buffer
+        // lease is acquired before acceptance; durable work stays off UI.
+        refresh_schedule = StrongerSchedule(refresh_schedule,
+            device_ui_internal::PumpWordObservationCommit(&ui_runtime));
         if (refresh_schedule != RefreshSchedule::kNone &&
             state.screen == wqn::UiScreen::kNote &&
             (wqn::NoteImageLoadingGraceActive(
@@ -1236,6 +1384,9 @@ wqn::AiStreamingStatusView streaming_view{};
             refresh_schedule = RefreshSchedule::kNone;
         }
         if (refresh_schedule != RefreshSchedule::kNone) {
+            // [ui-stack] As above, the frame lives only on this out-of-line
+            // render/submit call; it must not inflate DeviceUiTask's frame.
+            [&]() __attribute__((noinline)) {
             wqn::UiFrame frame = wqn::RenderUiFrame(state);
             // [force-full-fix] Consume the one-shot flag HERE, after the final
             // render frame is built. RenderUiFrame above checks (but doesn't
@@ -1306,6 +1457,31 @@ wqn::AiStreamingStatusView streaming_view{};
                     } else {
                         last_agent_render_ms = now_ms_d;
                     }
+                } else if (state.screen == wqn::UiScreen::kAi &&
+                           state.ai.tier == wqn::AiTier::kStd &&
+                           (state.ai.status == wqn::AiSessionStatus::kStreaming ||
+                            state.ai.status == wqn::AiSessionStatus::kListening)) {
+                    // [std-throttle] STD/Pro had no merge floor at all, so every SSE delta
+                    // reached the panel: each ReplaceText on the mirrored answer
+                    // bumps the history revision, which invalidates the snapshot
+                    // cache and re-copies the whole message vector. The panel
+                    // partial is ~734 ms, so a token-cadence stream kept the EPD
+                    // owner permanently behind. Same 300 ms tier as Flash, not
+                    // the Agent's 500 ms: STD carries text only -- no tool frames
+                    // -- so its cadence is Flash's cadence. (Flash keeps its own
+                    // branch above, keyed on flash_is_streaming, which also
+                    // covers its kWaitingReply gap; that is Flash's business,
+                    // not this change's.)
+                    // kListening is in the gate on purpose: asr.delta grows the
+                    // pending user bubble at recognizer cadence, which is the
+                    // same burn through a different buffer.
+                    static int64_t last_std_render_ms = 0;
+                    const int64_t now_ms_d = esp_timer_get_time() / 1000;
+                    if (now_ms_d - last_std_render_ms < 300) {
+                        skip_for_throttle = true;
+                    } else {
+                        last_std_render_ms = now_ms_d;
+                    }
                 }
                 if (skip_for_throttle) {
                     ESP_LOGI(kTag, "stream refresh throttled (coalescing deltas)");
@@ -1340,6 +1516,8 @@ wqn::AiStreamingStatusView streaming_view{};
             } else {
                 ESP_LOGI(kTag, "display submission skipped: desired state already represented");
             }
+            }();
+            LogUiStackHighWater("frame-dispatched");
         }
 
         // Hand cloud ownership to the display pipeline without an unguarded
@@ -1366,10 +1544,12 @@ wqn::AiStreamingStatusView streaming_view{};
         if (problem_bulk_completed) {
             FinishProblemCloudRequest(device_ui_internal::CloudDomain::kProblemBulk);
         }
+        // Result reducers can arm the next intake/sequential stage. Dispatch
+        // only after the previous cloud result has released its busy/lease.
+        device_ui_internal::PumpWordSessionStart(&ui_runtime);
         device_ui_internal::PumpWordCandidatePrefetch(&ui_runtime);
-        pending_refresh_schedule = device_ui_internal::StrongerSchedule(
-            pending_refresh_schedule,
-            device_ui_internal::PumpWordObservationCommit(&ui_runtime));
+        // Speculation begins only after this frame's display submission.
+        device_ui_internal::PumpWordCardPrefetch(&ui_runtime);
         device_ui_internal::PumpNoteCandidatePrefetch(&ui_runtime);
         device_ui_internal::PumpNoteImageFetch(&ui_runtime);
         device_ui_internal::PumpNoteBodyPackFetch(&ui_runtime);

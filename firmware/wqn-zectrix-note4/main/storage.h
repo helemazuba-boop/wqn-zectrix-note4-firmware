@@ -3,7 +3,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
-#include <vector>
 
 #include "esp_err.h"
 
@@ -24,15 +23,52 @@ struct StorageCapacitySnapshot {
     size_t nvs_total_entries = 0;
 };
 
-struct CachedAiSession {
-    std::string day;
-    std::string conversation_id;
-    std::string transcript;
-    std::string reply_text;
-    std::string status_detail;
-    std::vector<std::string> function_call_summaries;
-    int latency_ms = 0;
+// [measure] §五之十 §6 probe contract. `nvs write:` is emitted per NVS write and
+// is folded into WRITE:parts-account-for-transaction's sum automatically by
+// hil_check.py, so the judge keeps working after the 52 B cursor leaves SPIFFS
+// and `atomic write:` drops from 2 rows to 1 per answer. Do not rename the field
+// names -- the criteria grep for them literally and a rename is a silent SKIP.
+struct NvsWriteProbe {
+    const char* key = nullptr;
+    size_t bytes = 0;
+    int64_t total_ms = 0;
+    // False when the value already matched what NVS holds, which is also the
+    // case IDF itself short-circuits in (nvs_storage.cpp:504-507 / :478-480).
+    bool changed = false;
 };
+
+// Emits `nvs write:`. Any task may call; it only formats a log line.
+void LogNvsWriteProbe(const NvsWriteProbe& probe);
+// Emits `nvs stats: used_entries=… free_entries=… available_entries=… total_entries=…`
+// from nvs_get_stats. This is the line that turns §五之十's derived NVS
+// arithmetic ("~4.7 writes", "21.2%", 504 entries) into a measurement: if the
+// measured total_entries is not 504, every percentage in that section is wrong.
+void LogNvsStatsProbe();
+
+// [word-session-cursor-nvs] The 52 B pause/resume cursor, moved off SPIFFS
+// (doc/1005-storage-rewrite-todo.md §五之十). It used to cost a 1,766 ms median
+// AtomicWrite per answer, which is half of the "answering takes 4.3 s" symptom.
+//
+// The NVS primitives run inline because the caller is already the storage owner
+// task; re-queuing through SaveBlobToNvs would nest a second writer inside a
+// transaction (§7.4). `key` comes from the caller's per-mode table so this
+// header keeps no dependency on the word protocol types.
+// Emits the `nvs write:` / `nvs stats:` probes of §五之十 §6.
+esp_err_t SaveWordSessionCursorNvs(const char* key, const void* record, size_t size);
+// `*found` stays false and the result stays ESP_OK when no cursor is stored --
+// that is the "this mode is unused / not migrated yet" case, not an error. The
+// caller then falls back to the legacy .cur file. found must not be null.
+esp_err_t LoadWordSessionCursorNvs(const char* key, void* record, size_t size, bool* found);
+// [word-session-cursor-nvs] Erase one mode's cursor. ClearSessionTransaction
+// needs this because it used to unlink .cur/.ctp/.cbk, and once the value moved
+// to NVS those file removals clear nothing and the erased session leaves an
+// orphan blob behind (4 entries of the 504-entry budget, §五之十). NOT_FOUND is
+// success: clearing a mode that never had a cursor is the normal case.
+esp_err_t ClearWordSessionCursorNvs(const char* key);
+// [measure] Owner-task-only synthetic 52 B CRUD smoke test. Refuses an
+// existing scratch key, never uses a real mode key, and cleans up its own key.
+// This is not a word-session migration/clear or physical power-loss test.
+esp_err_t RunWordCursorNvsSmokeProbe(void* context);
 
 struct DeviceControlState {
     uint64_t config_revision = 0;
@@ -97,16 +133,21 @@ esp_err_t SaveAccessToken(const std::string& token);
 esp_err_t ClearAccessToken();
 bool IsValidAccessToken(const std::string& token);
 std::string MaskTokenForLog(const std::string& token);
-esp_err_t LoadDeviceControlState(DeviceControlState* state);
-esp_err_t SaveDeviceControlState(const DeviceControlState& state);
-// Durable coordinator checkpoint. The file is committed through a
-// temp/backup/rename sequence and is safe to replay after a power cut.
+// The journal is the sole control/content checkpoint. Legacy v3 NVS scalar
+// keys are not advanced or imported: they cannot represent an atomic pair.
+// With no journal bootstrap starts at zero; valid v1/v2 journals stay readable.
+// The temp/backup/rename recovery still requires physical power-cut HIL.
 esp_err_t LoadSyncJournal(SyncJournal* journal);
-esp_err_t SaveSyncJournal(const SyncJournal& journal);
-
-esp_err_t SaveAiSessionForDay(const CachedAiSession& session);
-esp_err_t LoadAiSessionForDay(const std::string& day, CachedAiSession* session);
-esp_err_t ClearAiSession();
+// [storage-single-writer] Dispatches the commit to the StorageService task so
+// the journal's rename sequence can never interleave with a pack or NVS write
+// from another task. The kStorage lease is held by the caller across the queue
+// wait, so the write is never refused by a quiesce it should have blocked.
+// The raw entry point is file-local on purpose.
+// Exact-byte deduplication is against the last successful commit only. Any
+// failed filesystem commit invalidates that cache. reason is a static label,
+// not a request identity or credential; it is used only for diagnostics.
+esp_err_t SaveSyncJournalThroughStorageService(
+    const SyncJournal& journal, const char* reason = "unspecified");
 
 esp_err_t LoadAutoSyncIntervalMinutes(uint32_t* minutes);
 esp_err_t SaveAutoSyncIntervalMinutes(uint32_t minutes);
@@ -139,6 +180,9 @@ esp_err_t SaveAgentDetailLevelForeground(uint8_t level);
 // session record, so it survives a finished/cleared session. Reset to 0 when
 // the deck scope changes (the index is relative to the scoped library).
 esp_err_t LoadWordSequentialCursor(uint32_t* cursor);
+// [storage-single-writer] Foreground storage write: a tiny NVS value that must
+// not queue behind a multi-MB pack sync. It used to run the NVS primitives
+// inline on the caller's task, which is the UI task for most callers.
 esp_err_t SaveWordSequentialCursor(uint32_t cursor);
 
 // Default word deck for the device (empty = all decks). The word page's
@@ -163,6 +207,12 @@ esp_err_t RecoverDefaultDeckScopeChange();
 // rejected on load when it no longer matches (second line of defense behind
 // the marker protocol). Atomic; safe from any task.
 uint32_t GetDeckScopeGeneration();
+// [word-scope-reset] Drops every word session after a word-page scope switch
+// that does not change the default deck: commits a new scope generation first
+// (making existing session files inert), then removes the four session files and
+// the walk cursor. One foreground storage transaction; blocks its caller, which
+// today is the UI task.
+esp_err_t ResetWordSessionScope();
 esp_err_t LoadVolumePercent(int* percent);
 esp_err_t SaveVolumePercent(int percent);
 // [persist-worker] Worker-dedicated variant (see SaveAutoSyncIntervalMinutesForeground).
@@ -177,15 +227,13 @@ void SetPlaybackVolumeCache(int percent);
 esp_err_t FactoryResetNvsAndRestart();
 
 esp_err_t LoadWifiCredentials(std::string* ssid, std::string* password);
-esp_err_t SaveWifiCredentials(const std::string& ssid, const std::string& password);
-esp_err_t ClearWifiCredentials();
-bool HasWifiCredentials();
 
 // [wifi-redundancy] Dual-slot WiFi credential store. The store is a versioned
 // NVS blob holding up to two (ssid, password) slots plus a `preferred` index
 // pointing at the last slot that connected successfully. Persistence is a
 // single atomic blob commit (the legacy per-key wifi_ssid/wifi_pass pair could
-// tear across power loss). Load migrates legacy keys on first read.
+// tear across power loss). Load is a pure read; MigrateLegacyWifiCredentialsIfNeeded
+// performs the legacy-key migration explicitly.
 struct WifiCredentialSlot {
     char ssid[33];       // 32 + NUL
     char password[65];   // 64 + NUL
@@ -205,12 +253,31 @@ enum class WifiCredentialRole : uint8_t {
     kBackup,
 };
 
-// Loads the store, validating the blob and migrating legacy wifi_ssid/wifi_pass
-// keys when the blob is absent. On success `store` always holds a coherent
-// (possibly empty) store with version == 1. Returns ESP_OK when a valid store
-// (blob or migrated) was loaded; legacy migration with no keys yields an empty
-// store and ESP_OK.
+// Outcome of MigrateLegacyWifiCredentialsIfNeeded. kRetryLater means nothing
+// durable changed and the caller is expected to try again later; kMigrated and
+// kNothingToMigrate are both terminal (the store on flash is already correct),
+// so callers normally only branch on kRetryLater.
+enum class WifiLegacyMigrationResult : uint8_t {
+    kNothingToMigrate,
+    kMigrated,
+    kRetryLater,
+};
+
+// Pure read of the store. Validates the blob; an absent, size-mismatched or
+// invalid blob yields an empty versioned store (count == 0) and ESP_OK, because
+// this runs on the UI task and must never write. A genuine NVS read failure is
+// returned to the caller instead of being reported as an empty store, so an
+// upsert cannot write over a store it failed to read.
 esp_err_t LoadWifiCredentialStore(WifiCredentialStore* store);
+// [wifi-redundancy] Migrates the legacy wifi_ssid/wifi_pass pair into the
+// versioned blob, then erases whichever legacy keys were actually present (an
+// empty-valued key is left behind rather than costing an extra NVS commit). Also
+// clears orphan legacy keys when a valid blob already exists. Idempotent: the
+// durable end state is the same however often it runs, and a device with nothing
+// to migrate performs no write and takes no lease. It DOES block its caller on
+// the storage queue while it writes, so only app_main / boot-time init and the
+// connectivity and provisioning tasks may call it -- never the UI task.
+WifiLegacyMigrationResult MigrateLegacyWifiCredentialsIfNeeded();
 // Persists the whole store as one atomic NVS blob commit.
 esp_err_t SaveWifiCredentialStore(const WifiCredentialStore& store);
 // Insert or update a credential: same-SSID slots get their password refreshed,
