@@ -20,9 +20,9 @@ The detailed English firmware README is `firmware/wqn-zectrix-note4/README.md`;
 comments are mixed Chinese/English; identifiers are English.
 
 > Environment note: the tracked READMEs and `BUILD_HERE.md` were written for the
-> maintainer's Windows workspace and reference `D:\projects\wqn-zectrix-note4-firmware`
-> plus `D:\Program\Espressif\frameworks\esp-idf-v5.5.4`. This checkout lives at
-> `/home/unknow/projects/firmware` (WSL). The `idf.py` commands below are
+> maintainer's Windows workspace and reference `<repo-root>`
+> plus `<esp-idf-dir>`. This checkout lives at
+> `<repo-root>` (WSL). The `idf.py` commands below are
 > environment-agnostic once the ESP-IDF env is activated; adjust the `cd` and IDF
 > activation path to wherever ESP-IDF lives in the current environment.
 
@@ -54,9 +54,9 @@ deploy.bat
 
 - **Dev port is `COM7`.** `COM5` is the official-firmware checkpoint; the portable
   flasher refuses `COM5`. Do not flash `COM5`.
-- `deploy.bat` ends by running `listen_usb.py` (writes serial output to `wqn.log`)
+- `deploy.bat` ends by opening `scripts\monitor_serial.bat` (no-reset serial monitor)
   because **`idf.py monitor` is broken over the chip's Native USB-Serial-JTAG
-  interface**. Use `listen_usb.py` / `scripts\monitor.bat` for live logs.
+  interface**. Use `scripts\monitor_serial.bat` / `scripts\monitor.bat` for live logs.
 - Granular helpers live in `firmware/wqn-zectrix-note4/scripts/` (`flash-fix.bat`,
   `erase_reflash.bat`, `monitor.bat`, `read_flash.bat`, …). **Do not drop new `.bat`
   files in the repo root** — only `deploy.bat` belongs there.

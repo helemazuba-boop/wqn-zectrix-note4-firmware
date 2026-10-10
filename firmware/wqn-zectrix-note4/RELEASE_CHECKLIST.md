@@ -3,7 +3,7 @@
 Firmware and WQN control-plane v3 are one release unit. Do not point production
 traffic at a firmware/cloud pair that was not tested together. The authoritative
 self-hosted database and proxy procedure is
-`/home/unknow/projects/WQN/deploy/supabase-selfhost/README.md`.
+`<WQN-checkout>/deploy/supabase-selfhost/README.md`.
 
 ## 1. Freeze the candidate
 
@@ -23,8 +23,8 @@ self-hosted database and proxy procedure is
 Firmware:
 
 ```bash
-cd /home/unknow/projects/firmware/firmware/wqn-zectrix-note4
-source /home/unknow/esp/esp-idf-v5.5/export.sh
+cd <repo-root>/firmware/wqn-zectrix-note4
+source <esp-idf-dir>/export.sh
 idf.py --no-ccache -B build-ai-local-s3 build
 git diff --check
 ```
@@ -35,7 +35,7 @@ size and SHA-256.
 WQN:
 
 ```bash
-cd /home/unknow/projects/WQN/web
+cd <WQN-checkout>/web
 npm run prepush
 npm run smoke:m7-cutover
 ```
