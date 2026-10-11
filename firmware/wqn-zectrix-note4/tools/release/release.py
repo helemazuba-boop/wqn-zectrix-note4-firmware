@@ -280,24 +280,27 @@ def app_artifact(build_dir: str | None) -> dict | None:
 
 
 def cmd_record_flash(args: argparse.Namespace) -> int:
-    info = collect_identity(args.build_dir, "dev")
+    # The tree/IDF environment may have moved on since this image was built
+    # (SKIP_BUILD or a concurrent edit). Record the verified artifact's identity
+    # instead of assigning a fresh source version to an older binary.
+    baked, info, actual_app = verified_build_identity(args)
     entry = {
         "ts": V.utc_now_iso(),
         "machine": args.machine or socket.gethostname(),
         "port": args.port,
         "status": args.status,
-        "version": info["version"],
+        "version": baked,
         "fingerprint": info["fingerprint"],
         "base_commit": info["base_commit_short"],
         "dirty": info["dirty"],
-        "app_sha256": (app_artifact(args.build_dir) or {}).get("sha256"),
-        "record_dir": f"dist/{info['version']}",
+        "app_sha256": actual_app,
+        "record_dir": f"dist/{baked}",
     }
     history = dist_dir() / HISTORY_NAME
     history.parent.mkdir(parents=True, exist_ok=True)
     with history.open("a", encoding="utf-8") as f:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-    print(f"Flash recorded: {info['version']} on {args.port} ({args.status})", file=sys.stderr)
+    print(f"Flash recorded: {baked} on {args.port} ({args.status})", file=sys.stderr)
     return 0
 
 
@@ -306,7 +309,7 @@ def cmd_record_flash(args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------
 
 
-def cmd_verify_build(args: argparse.Namespace) -> int:
+def verified_build_identity(args: argparse.Namespace) -> tuple[str, dict, str]:
     """Refuse a build dir whose artifacts do not match the version baked into them.
 
     PROJECT_VER lives in the cmake cache and only changes when cmake
@@ -343,8 +346,12 @@ def cmd_verify_build(args: argparse.Namespace) -> int:
     actual_app = (app_artifact(args.build_dir) or {}).get("sha256")
     if not actual_app:
         raise SystemExit(f"Cannot read the app image under {build_dir}; nothing to verify")
+    if identity.get("version") != baked:
+        raise SystemExit(f"Build record version does not match {baked}; re-run: {hint}")
     recorded_app = (identity.get("app") or {}).get("sha256")
-    if recorded_app and recorded_app != actual_app:
+    if not recorded_app:
+        raise SystemExit(f"No recorded app SHA256 for {baked}; re-run: {hint}")
+    if recorded_app != actual_app:
         raise SystemExit(
             f"{args.build_dir} is stamped {baked}, but its app image is not the one\n"
             f"  recorded for that version ({recorded_app[:12]} != {actual_app[:12]}).\n"
@@ -353,6 +360,12 @@ def cmd_verify_build(args: argparse.Namespace) -> int:
             f"  Re-run: {hint}"
         )
 
+    return baked, identity, actual_app
+
+
+def cmd_verify_build(args: argparse.Namespace) -> int:
+    baked, identity, actual_app = verified_build_identity(args)
+    record_dir = release_dir(baked)
     print(
         f"Verified: {args.build_dir} app matches the record for {baked} "
         f"[{identity.get('base_commit_short', '?')}, "
