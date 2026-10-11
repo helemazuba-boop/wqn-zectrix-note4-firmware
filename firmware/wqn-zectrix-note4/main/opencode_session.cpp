@@ -12,12 +12,14 @@
 #include "agent_voice_pipe.h"
 #include "audio_capture.h"
 #include "esp_check.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "opencode_client.h"
+#include "psram_task_stack.h"
 #include "runtime/sleep_coordinator.h"
 #include "services/connectivity_service.h"
 #include "storage.h"
@@ -49,7 +51,9 @@ enum class WorkerCommand : uint8_t {
 StaticSemaphore_t g_lock_storage = {};
 SemaphoreHandle_t g_lock = nullptr;
 StaticTask_t g_worker_tcb = {};
-StackType_t g_worker_stack[kWorkerStackBytes / sizeof(StackType_t)] = {};
+// NVS reads and writes are dispatched to StorageService; retain the full stack
+// in PSRAM while keeping its TCB internal.
+StackType_t* g_worker_stack = nullptr;
 TaskHandle_t g_worker = nullptr;
 wqn::AgentSessionState g_state;
 WorkerCommand g_command = WorkerCommand::kNone;
@@ -673,7 +677,7 @@ esp_err_t LoadToken(std::string* token)
     if (token == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
-    const esp_err_t result = wqn::LoadAccessToken(token);
+    const esp_err_t result = wqn::LoadAccessTokenFromStorageService(token);
     if (result != ESP_OK || !wqn::IsValidAccessToken(*token)) {
         return ESP_ERR_INVALID_STATE;
     }
@@ -2328,6 +2332,9 @@ void WorkerTask(void*)
                 break;
         }
         FinishCommand(command);
+        ESP_LOGI(kTag, "Agent worker stack HWM: command=%d free_bytes=%u",
+                 static_cast<int>(command),
+                 static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
     }
 }
 
@@ -2373,15 +2380,22 @@ esp_err_t InitOpenCodeSession()
         g_changed = true;
     }
     if (g_worker == nullptr) {
+        bool in_psram = false;
+        g_worker_stack = AllocTaskStack(kWorkerStackBytes, "wqn_agent", &in_psram);
+        if (g_worker_stack == nullptr) {
+            return ESP_ERR_NO_MEM;
+        }
         g_worker = xTaskCreateStatic(
             WorkerTask,
             "wqn_agent",
-            kWorkerStackBytes,
+            TaskStackWords(kWorkerStackBytes),
             nullptr,
             5,
             g_worker_stack,
             &g_worker_tcb);
         if (g_worker == nullptr) {
+            heap_caps_free(g_worker_stack);
+            g_worker_stack = nullptr;
             return ESP_ERR_NO_MEM;
         }
     }

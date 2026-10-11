@@ -10,6 +10,7 @@
 #include "opencode_session.h"
 #include "ui/persist_worker.h"
 #include "provision_manager.h"
+#include "stdpro_ws_transport.h"
 
 namespace {
 
@@ -697,6 +698,7 @@ void HandleUiInput(UiState* state, UiInput input)
     // cycle first, which already released; this is the same release for the user
     // who leaves straight from the Agent tier.
     if (screen_before == wqn::UiScreen::kAi && state->screen != wqn::UiScreen::kAi) {
+        wqn::stdpro_ws::RequestIdleDisconnect();
         wqn::LeaveOpenCodeAgentTier();
     }
     // [agent] The B1 counterpart on SCREEN ENTRY. The tier-cycle handler in

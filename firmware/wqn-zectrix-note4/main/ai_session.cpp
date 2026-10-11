@@ -23,6 +23,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "psram_task_stack.h"
 #include "runtime/sleep_coordinator.h"
 #include "services/connectivity_service.h"
 #include "stdpro_ws_transport.h"
@@ -68,15 +69,16 @@ uint32_t g_worker_command_since_ms = 0;
 // an unbounded call would wedge both entry points forever with a W line per
 // rejected attempt and no clue as to why. Past this age, report at E level.
 constexpr uint32_t kWorkerStuckReportMs = 60000;
-// [ai-worker-reserve] Statically-stored stack/TCB for the AI worker. Field data
+// [ai-worker-reserve] Retained stack and internal TCB for the AI worker. Field data
 // (wqn-device 2026-08-23): after the
 // first TLS upload the internal largest free block settles at 6.4-6.9 KiB, so
 // transient xTaskCreate calls deterministically fail on later turns. A single
 // once-created worker removes both prepare and submit stacks from that failure
-// surface without reserving a second permanent 6 KiB internal stack.
+// surface without reserving a second permanent 6 KiB internal stack. Token
+// reads run on StorageService, so this stack can live in PSRAM safely.
 constexpr uint32_t kAiWorkerStackBytes = 7168;
 StaticTask_t g_ai_worker_tcb = {};
-StackType_t g_ai_worker_stack[kAiWorkerStackBytes / sizeof(StackType_t)] = {};
+StackType_t* g_ai_worker_stack = nullptr;
 wqn::AiSessionState g_state;
 std::string g_conversation_id;
 bool g_changed = false;
@@ -1099,7 +1101,7 @@ void SubmitSession()
     xSemaphoreGive(g_lock);
 
     std::string token;
-    result = wqn::LoadAccessToken(&token);
+    result = wqn::LoadAccessTokenFromStorageService(&token);
     if (result != ESP_OK || !wqn::IsValidAccessToken(token)) {
         if (is_ws_turn && !turn_req_id.empty()) {
             wqn::stdpro_ws::AbortTurn(turn_req_id, turn_gen);
@@ -1301,7 +1303,7 @@ void PrepareRecordingSession(uint32_t generation)
     wqn::services::ConnectivityWaitResult wifi_result =
         wqn::services::ConnectivityWaitResult::kCancelled;
 
-    esp_err_t result = wqn::LoadAccessToken(&token);
+    esp_err_t result = wqn::LoadAccessTokenFromStorageService(&token);
     if (result != ESP_OK || token.empty()) {
         failure = PrepareFailure::kNoToken;
         result = ESP_ERR_INVALID_STATE;
@@ -1556,6 +1558,9 @@ void AiSessionWorkerTask(void*)
                          static_cast<int>(command));
                 break;
         }
+        ESP_LOGI(kTag, "AI worker stack HWM: command=%d free_bytes=%u",
+                 static_cast<int>(command),
+                 static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
     }
 }
 
@@ -1580,15 +1585,23 @@ esp_err_t InitAiSession()
         }
     }
     if (g_ai_worker == nullptr) {
+        bool in_psram = false;
+        g_ai_worker_stack = AllocTaskStack(
+            kAiWorkerStackBytes, "wqn_ai_worker", &in_psram);
+        if (g_ai_worker_stack == nullptr) {
+            return ESP_ERR_NO_MEM;
+        }
         g_ai_worker = xTaskCreateStatic(
             AiSessionWorkerTask,
             "wqn_ai_worker",
-            kAiWorkerStackBytes,
+            TaskStackWords(kAiWorkerStackBytes),
             nullptr,
             5,
             g_ai_worker_stack,
             &g_ai_worker_tcb);
         if (g_ai_worker == nullptr) {
+            heap_caps_free(g_ai_worker_stack);
+            g_ai_worker_stack = nullptr;
             return ESP_ERR_NO_MEM;
         }
     }
@@ -1977,8 +1990,12 @@ void SetAiRecordingLabel(int32_t elapsed_ms)
         const int minutes = seconds / 60;
         const int s = seconds % 60;
         std::snprintf(buf, sizeof(buf), "\xe2\x97\x8f 录音中 %02d:%02d", minutes, s);
-        g_state.toast_label = buf;
-        MarkChanged();
+        // Keep millisecond precision in the state, but notify the UI only
+        // when the visible clock changes (including the first 00:00 label).
+        if (g_state.toast_label != buf) {
+            g_state.toast_label = buf;
+            MarkChanged();
+        }
     }
     xSemaphoreGive(g_lock);
 }

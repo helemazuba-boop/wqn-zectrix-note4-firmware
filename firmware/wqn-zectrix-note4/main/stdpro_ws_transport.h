@@ -46,6 +46,9 @@ struct TurnWaitResult {
 esp_err_t EnsureConnected(const std::string& token, uint32_t timeout_ms);
 bool IsConnected();
 void Disconnect();
+// Nonblocking: close only an idle connection on the transport owner. A later
+// connect/start operation supersedes this request; active turns finish first.
+void RequestIdleDisconnect();
 
 esp_err_t StartTurn(const std::string& request_id,
                     const std::string& tier,

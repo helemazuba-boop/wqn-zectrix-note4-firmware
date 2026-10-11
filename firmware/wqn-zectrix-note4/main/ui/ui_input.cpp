@@ -18,6 +18,7 @@
 #include "word_pack.h"
 #include "services/connectivity_service.h"
 #include "services/sync_service.h"
+#include "stdpro_ws_transport.h"
 
 namespace device_ui_internal {
 
@@ -1033,11 +1034,12 @@ static RefreshSchedule ApplyStatusBarEditEvent(
                 // AudioStreamingTask + 常驻 I2S duplex channels, otherwise they
                 // keep I2S_NUM_0 occupied and STD/Pro's InitI2s fails with
                 // ESP_ERR_NOT_FOUND (-> 0 ms stale-listening submit). Mirrors
-                // the screen-leave teardown in ui_model.cpp. STD/Pro->Flash
-                // needs nothing: Flash starts lazily on first PTT and already
-                // calls StopAudioPlayback to release the TX slot.
+                // the screen-leave teardown in ui_model.cpp.
                 if (prev_tier == wqn::AiTier::kFlash && next != wqn::AiTier::kFlash) {
                     wqn::StopFlashSession();
+                }
+                if (next == wqn::AiTier::kFlash) {
+                    wqn::stdpro_ws::RequestIdleDisconnect();
                 }
                 // [agent] B3 / D-lease: leaving the Agent tier drops its stream
                 // and its sleep lease. The cloud run, if any, keeps going --

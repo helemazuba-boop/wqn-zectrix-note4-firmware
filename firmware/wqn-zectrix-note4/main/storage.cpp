@@ -1309,6 +1309,24 @@ esp_err_t LoadAccessToken(std::string* token)
     return LoadStringFromNvs(WQN_NVS_ACCESS_TOKEN_KEY, token);
 }
 
+esp_err_t LoadAccessTokenFromStorageService(std::string* token)
+{
+    if (token == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    token->clear();
+    auto read = runtime::SleepLease::TryAcquire(
+        runtime::SleepBlocker::kStorage, "load-access-token", __FILE__, __LINE__);
+    if (!read) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    return services::ExecuteForegroundStorageTransaction(
+        [](void* context) -> esp_err_t {
+            return LoadAccessToken(static_cast<std::string*>(context));
+        },
+        token, "load-access-token");
+}
+
 esp_err_t SaveAccessToken(const std::string& token)
 {
     StorageWriteGuard write("save-access-token", __FILE__, __LINE__);

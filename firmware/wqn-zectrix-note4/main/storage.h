@@ -129,6 +129,11 @@ esp_err_t EnsurePackDownloadCapacity(
     size_t required_bytes,
     size_t safety_reserve_bytes = 256U * 1024U);
 esp_err_t LoadAccessToken(std::string* token);
+// Audio workers may have PSRAM stacks. Dispatch NVS reads to the internal-stack
+// storage owner; never call from the UI. Queued foreground work can time out,
+// but a started transaction completes before the caller's context is released.
+// Holds the storage sleep lease across the queued read and its completion.
+esp_err_t LoadAccessTokenFromStorageService(std::string* token);
 esp_err_t SaveAccessToken(const std::string& token);
 esp_err_t ClearAccessToken();
 bool IsValidAccessToken(const std::string& token);
