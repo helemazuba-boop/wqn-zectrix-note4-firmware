@@ -30,13 +30,9 @@ constexpr size_t kMaxCaptureSamples =
 constexpr size_t kReadFrames = 240;
 constexpr size_t kReadSamples = kReadFrames * kStereoChannels;
 constexpr int kAdcWarmupReadCount = 4;
-// [dma-footprint] The RX DMA pool is 6 descriptors x this frame count x 4 B.
-// 256 frames asked for ~6 KiB of DMA-capable internal memory per capture;
-// after the first AI turn fragments the heap (device-observed largest block
-// dropping to 4352 B) those allocations fail and every later recording dies
-// at init step=i2s. 128 frames keeps ~48 ms of buffering (the read cadence is
-// 15 ms) while shrinking each descriptor request to ~0.5 KiB / ~3 KiB total,
-// which stays placeable on a fragmented heap.
+// The normal RX DMA pool is 6 x 128 stereo frames (48 ms at 16 kHz).
+// AudioService can split the same capacity into smaller buffers on a
+// fragmented heap. Keep this capacity above the 15 ms read cadence.
 constexpr uint32_t kI2sDmaFrameNum = 128;
 constexpr int kMaxConsecutiveReadTimeouts = 5;
 constexpr int kI2sClockWarmupMs = 20;
