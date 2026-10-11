@@ -12,6 +12,8 @@
 #include "esp_memory_utils.h"
 #include "esp_timer.h"
 #include "esp_websocket_client.h"
+#include "audio_capture.h"
+#include "voice_idle_disconnect.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
@@ -170,6 +172,29 @@ std::atomic<bool> g_session_ready{false};
 std::atomic<uint32_t> g_seq{0};
 std::atomic<bool> g_prefinal_pcm_lost{false};
 
+portMUX_TYPE g_idle_disconnect_mux = portMUX_INITIALIZER_UNLOCKED;
+wqn::stdpro_ws::IdleDisconnectGate g_idle_disconnect_gate;
+
+class TransportUseRegistration {
+public:
+    TransportUseRegistration()
+    {
+        portENTER_CRITICAL(&g_idle_disconnect_mux);
+        g_idle_disconnect_gate.BeginUse();
+        portEXIT_CRITICAL(&g_idle_disconnect_mux);
+    }
+
+    ~TransportUseRegistration()
+    {
+        portENTER_CRITICAL(&g_idle_disconnect_mux);
+        g_idle_disconnect_gate.EndUse();
+        portEXIT_CRITICAL(&g_idle_disconnect_mux);
+    }
+
+    TransportUseRegistration(const TransportUseRegistration&) = delete;
+    TransportUseRegistration& operator=(const TransportUseRegistration&) = delete;
+};
+
 wqn::stdpro_ws::FinalHandoffResult g_final_result =
     wqn::stdpro_ws::FinalHandoffResult::kDefinitelyNotSent;
 
@@ -261,7 +286,9 @@ void LogTransportMemory(const char* stage)
 }
 
 // Defined after AllocPrefersPsram, which it uses for the task array.
+#if CONFIG_WQN_AUDIO_RESOURCE_DIAGNOSTICS
 void DumpResourceLedger(const char* stage);
+#endif
 
 void DoDestroyWs()
 {
@@ -302,6 +329,46 @@ void DoDestroyWs()
         // it; keep it when renaming stages.
         LogTransportMemory("[dma-attrib] after-do-destroy-ws");
     }
+}
+
+void TryIdleDisconnect()
+{
+    uint32_t generation = 0;
+    portENTER_CRITICAL(&g_idle_disconnect_mux);
+    const bool claimed = g_idle_disconnect_gate.TryClaim(
+        g_turn_state.load(std::memory_order_acquire) == TurnState::kIdle &&
+        g_conn_state.load(std::memory_order_acquire) != ConnectionState::kConnecting &&
+        g_active_conn_op_gen == 0,
+        &generation);
+    if (claimed) {
+        // Publish the claim before a new caller can register its intent. Its
+        // connect command will run after this owner's teardown; StartTurn
+        // cannot mistake the old connection for a ready new one.
+        g_session_ready.store(false, std::memory_order_release);
+        g_is_connected.store(false, std::memory_order_release);
+    }
+    portEXIT_CRITICAL(&g_idle_disconnect_mux);
+    if (!claimed) {
+        return;
+    }
+    DoDestroyWs();
+    ESP_LOGI(kTag, "idle connection released: intent=%lu",
+             static_cast<unsigned long>(generation));
+}
+
+void LogSendFailure(const char* kind, int sent, size_t expected,
+                    uint32_t seq, int64_t started_us)
+{
+    ESP_LOGW(kTag,
+             "%s send failed: req=%s sent=%d expected=%u seq=%lu elapsed_ms=%lld "
+             "internal_free=%u internal_largest=%u dma_free=%u dma_largest=%u",
+             kind, g_current_req_id.c_str(), sent,
+             static_cast<unsigned>(expected), static_cast<unsigned long>(seq),
+             static_cast<long long>((esp_timer_get_time() - started_us) / 1000),
+             static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
+             static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)),
+             static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_DMA)),
+             static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_DMA)));
 }
 
 enum class TeardownReason : uint8_t {
@@ -377,6 +444,11 @@ void WebsocketEventHandler(void*, esp_event_base_t, int32_t event_id,
 
     switch (static_cast<esp_websocket_event_id_t>(event_id)) {
         case WEBSOCKET_EVENT_CONNECTED: {
+            const esp_err_t result = esp_websocket_client_set_tcp_nodelay(
+                event->client, true);
+            if (result != ESP_OK) {
+                ESP_LOGW(kTag, "set TCP_NODELAY failed: %s", esp_err_to_name(result));
+            }
             xTaskNotify(g_transport_task, kEvtBitWsConnected, eSetBits);
             break;
         }
@@ -628,7 +700,11 @@ void ExecuteCtrlCmdSingleStep(const CtrlCmd& cmd)
                 WebsocketEventHandler, nullptr);
 
             LogTransportMemory("before-ws-task-start");
-            DumpResourceLedger("before-ws-task-start");
+#if CONFIG_WQN_AUDIO_RESOURCE_DIAGNOSTICS
+            if (!wqn::IsAudioCaptureRunning()) {
+                DumpResourceLedger("before-ws-task-start");
+            }
+#endif
             const esp_err_t start_err =
                 esp_websocket_client_start(g_ws_client);
             if (start_err != ESP_OK) {
@@ -901,6 +977,7 @@ void VoiceWsTransportTask(void*)
         }
 
         // Single PCM / FINAL frame step: process at most ONE block per root loop iteration
+        TryIdleDisconnect();
         if (g_turn_state.load(std::memory_order_acquire) == TurnState::kRecording &&
             g_pcm_queue != nullptr) {
             PcmBlock block;
@@ -912,6 +989,7 @@ void VoiceWsTransportTask(void*)
                     wqn::EncodeWflvHeader(frame, wqn::kWflvFlagFinal, block.seq, 16000, 1);
                     const size_t total_len = wqn::kWflvHeaderBytes;
 
+                    const int64_t send_started_us = esp_timer_get_time();
                     const int sent = esp_websocket_client_send_bin(
                         g_ws_client, reinterpret_cast<const char*>(frame),
                         total_len, pdMS_TO_TICKS(2000));
@@ -928,10 +1006,8 @@ void VoiceWsTransportTask(void*)
                             xSemaphoreGive(g_final_sem);
                         }
                     } else {
-                        ESP_LOGW(kTag,
-                                 "FINAL send failed (sent=%d): marking "
-                                 "ambiguous",
-                                 sent);
+                        LogSendFailure("FINAL", sent, total_len, block.seq,
+                                       send_started_us);
                         TeardownFailedTurn();
                     }
                 } else {
@@ -945,15 +1021,14 @@ void VoiceWsTransportTask(void*)
                     }
                     const size_t total_len = wqn::kWflvHeaderBytes + payload_bytes;
 
+                    const int64_t send_started_us = esp_timer_get_time();
                     const int sent = esp_websocket_client_send_bin(
                         g_ws_client, reinterpret_cast<const char*>(frame),
                         total_len, pdMS_TO_TICKS(1500));
 
                     if (sent != static_cast<int>(total_len)) {
-                        ESP_LOGW(kTag,
-                                 "PCM send failed: sent=%d expected=%u seq=%lu",
-                                 sent, static_cast<unsigned>(total_len),
-                                 static_cast<unsigned long>(block.seq));
+                        LogSendFailure("PCM", sent, total_len, block.seq,
+                                       send_started_us);
                         TeardownFailedTurn();
                     } else if (block.seq == 0) {
                         ESP_LOGI(kTag, "first_ws_pcm_sent: seq=0");
@@ -1018,6 +1093,7 @@ void* AllocPrefersPsram(size_t size, bool* in_psram = nullptr)
 // totals have to come from a source census (see the investigation notes).
 // Requires CONFIG_FREERTOS_USE_TRACE_FACILITY for uxTaskGetSystemState.
 // Remove together with that [diag] option once the investigation is done.
+#if CONFIG_WQN_AUDIO_RESOURCE_DIAGNOSTICS
 void DumpResourceLedger(const char* stage)
 {
     ESP_LOGI(kTag, "[diag] ledger stage=%s begin", stage);
@@ -1054,6 +1130,7 @@ void DumpResourceLedger(const char* stage)
              stage, static_cast<unsigned>(found), internal_stacked);
     heap_caps_free(tasks);
 }
+#endif
 
 // Init is transactional: every handle below is either committed as a set or
 // released by DeleteUncommittedPrimitives. Grouping them keeps the teardown
@@ -1241,6 +1318,7 @@ namespace wqn::stdpro_ws {
 
 esp_err_t EnsureConnected(const std::string& token, uint32_t timeout_ms)
 {
+    TransportUseRegistration use;
     const esp_err_t init_result = InitPrimitives();
     if (init_result != ESP_OK) {
         return init_result;
@@ -1306,6 +1384,15 @@ bool IsConnected()
            g_session_ready.load(std::memory_order_acquire);
 }
 
+void RequestIdleDisconnect()
+{
+    // No initialization, allocation, semaphore wait or driver call on the UI
+    // path. The owner observes the request on its next root-loop poll.
+    portENTER_CRITICAL(&g_idle_disconnect_mux);
+    g_idle_disconnect_gate.Request();
+    portEXIT_CRITICAL(&g_idle_disconnect_mux);
+}
+
 void Disconnect()
 {
     if (g_transport_mutex == nullptr || g_sync_op_sem == nullptr ||
@@ -1361,6 +1448,7 @@ esp_err_t StartTurn(const std::string& request_id,
                     const char* reasoning_effort,
                     uint32_t* out_turn_gen)
 {
+    TransportUseRegistration use;
     const esp_err_t init_result = InitPrimitives();
     if (init_result != ESP_OK) {
         return init_result;

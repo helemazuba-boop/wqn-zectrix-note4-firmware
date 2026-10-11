@@ -704,12 +704,13 @@ wqn::services::AudioState StateForActivity(
     }
 }
 
-i2s_chan_config_t MakeChannelConfig(uint32_t dma_frame_count)
+i2s_chan_config_t MakeChannelConfig(
+    uint32_t dma_frame_count, uint32_t dma_desc_count = kI2sDmaDescNum)
 {
     i2s_chan_config_t config = {};
     config.id = I2S_NUM_0;
     config.role = I2S_ROLE_MASTER;
-    config.dma_desc_num = kI2sDmaDescNum;
+    config.dma_desc_num = dma_desc_count;
     config.dma_frame_num = dma_frame_count;
     config.auto_clear_after_cb = true;
     config.auto_clear_before_cb = false;
@@ -1744,32 +1745,87 @@ esp_err_t CreateAudioRxChannel(
         return ESP_ERR_INVALID_STATE;
     }
     i2s_chan_handle_t channel = nullptr;
-    i2s_chan_config_t channel_config = MakeChannelConfig(dma_frame_count);
-    esp_err_t result = i2s_new_channel(
-        &channel_config, nullptr, &channel);
-    ESP_LOGI(kTag, "create I2S RX: i2s_new_channel result=%s (%d) channel=%p",
-             esp_err_to_name(result), static_cast<int>(result), channel);
-    if (result == ESP_OK) {
-        i2s_std_config_t standard = MakeStandardConfig(
-            sample_rate_hz, left_aligned, true);
-        result = i2s_channel_init_std_mode(channel, &standard);
+    esp_err_t result = ESP_ERR_NO_MEM;
+    // Keep the same number of buffered frames when a fragmented DMA heap
+    // cannot fit six large buffers.  For 16 kHz capture these shapes all hold
+    // 768 stereo frames / 48 ms: 6x128, 12x64 and 24x32.  Merely halving the
+    // frame count would halve the scheduling margin and risk dropped audio.
+    // Limit retries to allocation failures; codec/driver state errors must
+    // surface directly. Other RX clients retain their requested ring capacity.
+    constexpr uint32_t kRxDmaSplitFactors[] = {1, 2, 4};
+    constexpr uint32_t kMinSplitDmaFrames = 32;
+    for (const uint32_t split : kRxDmaSplitFactors) {
+        if (split != 1 &&
+            (dma_frame_count % split != 0 ||
+             dma_frame_count / split < kMinSplitDmaFrames)) {
+            break;
+        }
+        const uint32_t frames = dma_frame_count / split;
+        const uint32_t descriptors = kI2sDmaDescNum * split;
         ESP_LOGI(kTag,
-                 "create I2S RX: i2s_channel_init_std_mode result=%s (%d) channel=%p",
+                 "RX DMA plan: split=%lu desc=%lu frames=%lu bytes_per_buffer=%lu "
+                 "dma_free=%u dma_largest=%u",
+                 static_cast<unsigned long>(split),
+                 static_cast<unsigned long>(descriptors),
+                 static_cast<unsigned long>(frames),
+                 static_cast<unsigned long>(frames * kDuplexBytesPerFrame),
+                 static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_DMA)),
+                 static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_DMA)));
+        i2s_chan_config_t channel_config = MakeChannelConfig(frames, descriptors);
+        result = i2s_new_channel(&channel_config, nullptr, &channel);
+        ESP_LOGI(kTag, "create I2S RX: i2s_new_channel result=%s (%d) channel=%p",
                  esp_err_to_name(result), static_cast<int>(result), channel);
-    }
-    if (result == ESP_OK) {
-        result = i2s_channel_enable(channel);
-        ESP_LOGI(kTag, "create I2S RX: i2s_channel_enable result=%s (%d) channel=%p",
-                 esp_err_to_name(result), static_cast<int>(result), channel);
-    }
-    if (result != ESP_OK) {
+        if (result == ESP_OK) {
+            i2s_std_config_t standard = MakeStandardConfig(
+                sample_rate_hz, left_aligned, true);
+            result = i2s_channel_init_std_mode(channel, &standard);
+            ESP_LOGI(kTag,
+                     "create I2S RX: i2s_channel_init_std_mode result=%s (%d) channel=%p",
+                     esp_err_to_name(result), static_cast<int>(result), channel);
+        }
+        if (result == ESP_OK) {
+            result = i2s_channel_enable(channel);
+            ESP_LOGI(kTag, "create I2S RX: i2s_channel_enable result=%s (%d) channel=%p",
+                     esp_err_to_name(result), static_cast<int>(result), channel);
+        }
+        if (result == ESP_OK) {
+            break;
+        }
         if (channel != nullptr) {
             const esp_err_t cleanup_result = i2s_del_channel(channel);
             ESP_LOGI(kTag,
                      "create I2S RX: cleanup i2s_del_channel result=%s (%d) channel=%p",
                      esp_err_to_name(cleanup_result),
                      static_cast<int>(cleanup_result), channel);
+            if (cleanup_result != ESP_OK) {
+                // Do not allocate another channel while the failed one still
+                // owns the I2S slot. Retain its session handle for caller cleanup.
+                const esp_err_t register_result = RegisterResource(
+                    g_channel_slots, kMaxChannelHandles, session, channel);
+                if (register_result == ESP_OK) {
+                    *rx = reinterpret_cast<AudioChannelHandle>(channel);
+                }
+                ESP_LOGE(kTag, "RX cleanup failed: retain=%s (%d)",
+                         esp_err_to_name(register_result), static_cast<int>(register_result));
+                return cleanup_result;
+            }
+            channel = nullptr;
         }
+        if (result != ESP_ERR_NO_MEM) {
+            return result;
+        }
+    }
+    if (result != ESP_OK) {
+        // Use the driver's exact allocation capabilities, including 8BIT.
+        // The free-block count adds context that the largest block alone lacks.
+        multi_heap_info_t heap = {};
+        heap_caps_get_info(&heap, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+        ESP_LOGE(kTag,
+                 "RX DMA exhausted: free=%u largest=%u free_blocks=%u minimum_free=%u",
+                 static_cast<unsigned>(heap.total_free_bytes),
+                 static_cast<unsigned>(heap.largest_free_block),
+                 static_cast<unsigned>(heap.free_blocks),
+                 static_cast<unsigned>(heap.minimum_free_bytes));
         return result;
     }
     result = RegisterResource(

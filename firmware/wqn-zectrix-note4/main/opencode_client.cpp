@@ -71,6 +71,40 @@ constexpr size_t kMaxHistoryResponseBytes = 12 * 1024;
 // unbounded heap allocation on a 4 KB-stack worker.
 constexpr int kMaxHistoryMessages = 24;
 constexpr int kMaxHistoryTools = 8;
+// The manifest's `sessions_listed`. Was the bare literal 12 in the row walk
+// below, which is exactly the problem: a limit that decides how much of the
+// picker the device can hold had no name to check the manifest against.
+constexpr int kMaxSessionsListed = 12;
+// The manifest's `text_event_bytes` (`agent.text`) and `delta_event_bytes`
+// (`agent.text.delta`). MEASURED, NOT ENFORCED, and that asymmetry is
+// deliberate -- see the warning at the frame parser.
+//
+// The stream already refuses a frame past the 16 KiB SSE budget
+// (kMaxSseFrameBytes in sse_chunk.h), so these two are a tighter per-event
+// contract the device currently only observes. Turning them into refusals would
+// be a behaviour change against a gateway nobody has measured the largest frame
+// of from here; the answer is a log line that says the peer is over, so the
+// number stops being a manifest entry nobody reads.
+constexpr size_t kMaxTextEventBytes = 8 * 1024;
+constexpr size_t kMaxDeltaEventBytes = 2 * 1024;
+// The manifest's `question_frame_bytes`. OBSERVED like the two text bounds, and
+// that used to be a refusal -- see the warning at the frame parser for why that
+// was wrong in both directions: the bound is reachable by a conformant CJK peer
+// (the worst schema-legal questionData is 10,265 B with 3-byte characters and
+// 13,561 B with 4-byte, against 10,240), and refusing the frame dropped the ask,
+// which is the one outcome the guard was meant to prevent.
+constexpr size_t kMaxQuestionFrameBytes = 10 * 1024;
+// How many bytes `{"<field>":""}` costs around the field the manifest actually
+// caps. The manifest's `text_event_bytes` / `delta_event_bytes` bound a STRING
+// (`agent.text.data.text`, `agent.text.delta.data.delta`); the warning below
+// measures `payload.size()`, which is the whole JSON envelope. Comparing them
+// directly made the effective cap that many bytes tighter than the manifest, so
+// a conformant peer sitting at the schema's own `maxLength` ceiling warned on
+// every frame: `{"delta":<2048 chars>}` is 2,060 B against a 2,048 bound.
+// `maxLength` also counts CODE POINTS while this counts BYTES, so multibyte
+// text still overruns -- that part is a real property of the UTF-8 wire and is
+// what the warning is for. This only removes the part that is pure arithmetic.
+constexpr size_t kJsonFieldEnvelopeBytes = 16;
 }  // namespace wqn
 
 namespace {
@@ -82,6 +116,11 @@ using wqn::kMaxPromptBytes;
 using wqn::kMaxHistoryResponseBytes;
 using wqn::kMaxHistoryMessages;
 using wqn::kMaxHistoryTools;
+using wqn::kMaxSessionsListed;
+using wqn::kMaxTextEventBytes;
+using wqn::kMaxDeltaEventBytes;
+using wqn::kMaxQuestionFrameBytes;
+using wqn::kJsonFieldEnvelopeBytes;
 
 constexpr char kTag[] = "wqn_opencode_api";
 
@@ -365,6 +404,16 @@ struct AgentStreamRequest {
     // Set by the worker once it has actually delivered the interrupt, so the
     // session layer can report "已中止" instead of a transport failure.
     std::atomic<bool>* interrupt_delivered = nullptr;
+    // [agent] Set by the session layer to ask the worker to detach from this
+    // stream *without* asking upstream to stop the run. Switching session is a
+    // change of local view and the cloud keeps executing (§0), so this is the
+    // whole difference from `interrupt_requested`: a switch performs no POST at
+    // all, so nothing upstream ever learns the device left.
+    std::atomic<bool>* switch_requested = nullptr;
+    // Set by the worker once it has actually detached, so the session layer can
+    // say "已切换" and chain its follow-up instead of reporting an incomplete
+    // stream.
+    std::atomic<bool>* switch_delivered = nullptr;
 };
 
 void DrainOutboundReplies(const AgentStreamRequest& request)
@@ -452,10 +501,26 @@ esp_err_t ReadAgentEventStream(const AgentStreamRequest& request)
             // also the only place that can perform the interrupt. Without it a
             // cancel press would be invisible until the gateway itself closed
             // the run, i.e. up to the 30-minute outer timeout.
+            //
+            // Checked BEFORE the switch below, and that ordering is deliberate:
+            // an explicit cancel must never be swallowed by a pending switch, or
+            // the run the user asked to stop keeps executing. Both requests can
+            // be armed at once -- the caller honours the switch from its tail
+            // even when this branch is the one that ends the stream -- so
+            // checking the destructive intent first loses nothing.
             const esp_err_t interrupt_error =
                 wqn::InterruptOpenCodeSession(request.token, request.session_id, nullptr);
             if (interrupt_error == ESP_OK && request.interrupt_delivered != nullptr) {
                 request.interrupt_delivered->store(true, std::memory_order_release);
+            }
+            break;
+        }
+        if (request.switch_requested != nullptr &&
+            request.switch_requested->load(std::memory_order_acquire)) {
+            // [agent] Detaching is deliberately NOT an interrupt: no POST, so
+            // no upstream state changes and the run keeps going in the cloud.
+            if (request.switch_delivered != nullptr) {
+                request.switch_delivered->store(true, std::memory_order_release);
             }
             break;
         }
@@ -524,6 +589,14 @@ esp_err_t ReadAgentEventStream(const AgentStreamRequest& request)
         // over because the user stopped it.
         return ESP_OK;
     }
+    if (request.switch_delivered != nullptr &&
+        request.switch_delivered->load(std::memory_order_acquire)) {
+        // [agent] Same for a switch, and the distinction matters more here: the
+        // run is still executing upstream, so reporting `stream_incomplete`
+        // would put an error on screen for a run the user merely navigated away
+        // from. ESP_OK says only that this device's delivery ended on purpose.
+        return ESP_OK;
+    }
     if (request_result == ESP_OK && !terminal_seen) {
         SetResultError(request.result, request.result->http_status, "stream_incomplete", "Agent stream ended before idle");
         return ESP_FAIL;
@@ -534,6 +607,97 @@ esp_err_t ReadAgentEventStream(const AgentStreamRequest& request)
 }  // namespace
 
 namespace wqn {
+
+// Maps one device-contract `outcome` string onto the enum. Unrecognised and
+// absent both land on kUnknown, which the callers must read as "no run in
+// flight" -- see OpenCodeSessionOutcome. The gateway is the only place that can
+// distinguish the reasons, and it already collapsed them.
+//
+// Every unrecognised value lands on kUnknown rather than an error, and that
+// includes the invalid fixture below: a row the device cannot classify must be
+// loadable, because dropping the whole list would take the readable rows with
+// it. The direction is the same fail-safe the picker marker and the lease
+// criterion use -- an unknown outcome costs a missing glyph, never a device
+// that never sleeps.
+wqn::OpenCodeSessionOutcome ParseSessionOutcome(std::string_view value)
+{
+    if (value == "running") {
+        return wqn::OpenCodeSessionOutcome::kRunning;
+    }
+    if (value == "succeeded") {
+        return wqn::OpenCodeSessionOutcome::kSucceeded;
+    }
+    if (value == "interrupted") {
+        return wqn::OpenCodeSessionOutcome::kInterrupted;
+    }
+    if (value == "failed") {
+        return wqn::OpenCodeSessionOutcome::kFailed;
+    }
+    return wqn::OpenCodeSessionOutcome::kUnknown;
+}
+
+// The body of `GET /agent/sessions`. Split out of ListOpenCodeSessions exactly
+// the way ParseOpenCodeHistoryBody is split out of GetOpenCodeHistory, and for
+// the same reason: the row walk decides which sessions the picker offers, how
+// the 运行中 marker is drawn, and whether the device holds its sleep lease --
+// and until it lived in a function that needs a token and a socket, ZERO of
+// that was covered by any test. Every assertion in the boot self-test that
+// touches `outcome` today was written against a hand-rolled copy of this loop,
+// which tests the copy.
+esp_err_t ParseOpenCodeSessionsBody(
+    const std::string& body,
+    std::vector<OpenCodeSessionInfo>* sessions,
+    OpenCodeResult* result)
+{
+    if (sessions == nullptr || result == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    // Carried over from the request, if there was one: the self-test calls this
+    // with a bare body, where it stays 0.
+    const int http_status = result->http_status;
+    *result = OpenCodeResult{};
+    sessions->clear();
+    if (body.size() > kMaxJsonResponseBytes) {
+        SetResultError(result, http_status, "invalid_size", "Session list is too large");
+        return ESP_ERR_INVALID_SIZE;
+    }
+    cJSON* root = protocol::JsonNestingWithinLimit(body.data(), body.size())
+        ? cJSON_ParseWithLength(body.data(), body.size())
+        : nullptr;
+    cJSON* data = root != nullptr ? cJSON_GetObjectItemCaseSensitive(root, "data") : nullptr;
+    cJSON* rows = data != nullptr ? cJSON_GetObjectItemCaseSensitive(data, "sessions") : nullptr;
+    if (!cJSON_IsArray(rows)) {
+        cJSON_Delete(root);
+        SetResultError(result, http_status, "invalid_response", "Session list is invalid");
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    // The manifest's `sessions_listed`: the picker windows four rows and the
+    // snapshot rides the UI copy verbatim, so an unbounded list is an unbounded
+    // PSRAM cost and an unbounded frame signature. Rows past the cap are
+    // ignored, not an error -- the gateway is the side that trims.
+    const int available = cJSON_GetArraySize(rows);
+    const int count = std::min(available, kMaxSessionsListed);
+    sessions->reserve(static_cast<size_t>(count));
+    for (int index = 0; index < count; ++index) {
+        cJSON* row = cJSON_GetArrayItem(rows, index);
+        OpenCodeSessionInfo session;
+        session.id = JsonString(row, "id");
+        session.title = JsonString(row, "title");
+        cJSON* updated = cJSON_GetObjectItemCaseSensitive(row, "updatedAt");
+        if (cJSON_IsNumber(updated)) {
+            session.updated_at = static_cast<int64_t>(updated->valuedouble);
+        }
+        session.outcome = ParseSessionOutcome(JsonString(row, "outcome"));
+        // A row without a usable id is not a session this device can attach to,
+        // and OfferSessionOptions would offer one anyway. Dropped silently: the
+        // rest of the list is still worth showing.
+        if (session.id.rfind("ses_", 0) == 0) {
+            sessions->push_back(std::move(session));
+        }
+    }
+    cJSON_Delete(root);
+    return ESP_OK;
+}
 
 esp_err_t ListOpenCodeSessions(
     const std::string& token,
@@ -551,33 +715,7 @@ esp_err_t ListOpenCodeSessions(
     if (request_result != ESP_OK) {
         return request_result;
     }
-    cJSON* root = protocol::JsonNestingWithinLimit(body.data(), body.size())
-        ? cJSON_ParseWithLength(body.data(), body.size())
-        : nullptr;
-    cJSON* data = root != nullptr ? cJSON_GetObjectItemCaseSensitive(root, "data") : nullptr;
-    cJSON* rows = data != nullptr ? cJSON_GetObjectItemCaseSensitive(data, "sessions") : nullptr;
-    if (!cJSON_IsArray(rows)) {
-        cJSON_Delete(root);
-        SetResultError(result, result->http_status, "invalid_response", "Session list is invalid");
-        return ESP_ERR_INVALID_RESPONSE;
-    }
-    const int count = std::min(cJSON_GetArraySize(rows), 12);
-    sessions->reserve(static_cast<size_t>(count));
-    for (int index = 0; index < count; ++index) {
-        cJSON* row = cJSON_GetArrayItem(rows, index);
-        OpenCodeSessionInfo session;
-        session.id = JsonString(row, "id");
-        session.title = JsonString(row, "title");
-        cJSON* updated = cJSON_GetObjectItemCaseSensitive(row, "updatedAt");
-        if (cJSON_IsNumber(updated)) {
-            session.updated_at = static_cast<int64_t>(updated->valuedouble);
-        }
-        if (session.id.rfind("ses_", 0) == 0) {
-            sessions->push_back(std::move(session));
-        }
-    }
-    cJSON_Delete(root);
-    return ESP_OK;
+    return ParseOpenCodeSessionsBody(body, sessions, result);
 }
 
 esp_err_t TranscribeOpenCodeAudio(
@@ -669,6 +807,8 @@ esp_err_t RunOpenCodePrompt(
     void* reply_failed_ctx,
     std::atomic<bool>* interrupt_requested,
     std::atomic<bool>* interrupt_delivered,
+    std::atomic<bool>* switch_requested,
+    std::atomic<bool>* switch_delivered,
     OpenCodeEventCallback callback,
     void* callback_ctx,
     OpenCodeResult* result)
@@ -709,7 +849,9 @@ esp_err_t RunOpenCodePrompt(
         callback_ctx,
         result,
         interrupt_requested,
-        interrupt_delivered};
+        interrupt_delivered,
+        switch_requested,
+        switch_delivered};
     return ReadAgentEventStream(request);
 }
 
@@ -722,6 +864,8 @@ esp_err_t WatchOpenCodeSession(
     void* reply_failed_ctx,
     std::atomic<bool>* interrupt_requested,
     std::atomic<bool>* interrupt_delivered,
+    std::atomic<bool>* switch_requested,
+    std::atomic<bool>* switch_delivered,
     OpenCodeEventCallback callback,
     void* callback_ctx,
     OpenCodeResult* result)
@@ -743,7 +887,9 @@ esp_err_t WatchOpenCodeSession(
         callback_ctx,
         result,
         interrupt_requested,
-        interrupt_delivered};
+        interrupt_delivered,
+        switch_requested,
+        switch_delivered};
     return ReadAgentEventStream(request);
 }
 
@@ -801,6 +947,10 @@ esp_err_t CreateOpenCodeSession(
         if (cJSON_IsNumber(updated)) {
             session->updated_at = static_cast<int64_t>(updated->valuedouble);
         }
+        // A brand-new session has no run and no settle, so the gateway answers
+        // `unknown`; parsing it rather than assuming it keeps one code path for
+        // "what the row said" and lets the create path disagree later.
+        session->outcome = ParseSessionOutcome(JsonString(row, "outcome"));
     }
     cJSON_Delete(root);
     if (session->id.rfind("ses_", 0) != 0) {
@@ -808,7 +958,7 @@ esp_err_t CreateOpenCodeSession(
         return ESP_ERR_INVALID_RESPONSE;
     }
     if (session->title.empty()) {
-        session->title = "新 Session";
+        session->title = "新任务";
     }
     return ESP_OK;
 }
@@ -936,8 +1086,78 @@ esp_err_t ParseOpenCodeAgentFrame(
         return ESP_ERR_INVALID_ARG;
     }
     *out_event = wqn::OpenCodeEvent{};
-    cJSON* root = wqn::protocol::JsonNestingWithinLimit(data.data(), data.size())
-        ? cJSON_ParseWithLength(data.data(), data.size())
+    // [contract-ack] `data` is OPTIONAL in streamFrame -- the schema requires only
+    // `event` -- and its own description says "Empty for the two
+    // acknowledgements". So `agent.accepted` / `agent.attached` arriving with the
+    // field absent entirely (no `data:` line in the SSE frame, which is what the
+    // gateway's own shape allows) is a CONTRACT-VALID frame, and parsing an empty
+    // string as JSON returned null here, so the device dropped it as
+    // invalid_response: the acknowledgement was lost, and with it the state
+    // transition that is the only thing the frame was for.
+    //
+    // Whitelisted to those two events on purpose. They are the two whose payload
+    // the schema documents as empty, they are the two that read nothing out of
+    // `data`, and every other event's data is REQUIRED (agent.status needs
+    // `status`, agent.text needs `text`, ...). Accepting an empty payload for
+    // those would silently swallow a frame the device needs but cannot act on --
+    // a delta with no text is a dropped answer, not an empty one. The negatives
+    // below pin that line.
+    const bool acknowledgement =
+        event_name == "agent.accepted" || event_name == "agent.attached";
+    std::string payload = data;
+    if (acknowledgement && payload.find_first_not_of(" \t\r\n") == std::string::npos) {
+        payload = "{}";
+    }
+    // [bounds] The manifest's `text_event_bytes` / `delta_event_bytes`, OBSERVED
+    // and not enforced. The two sides of that sentence are the whole point:
+    //
+    //   observed  -- a frame over the bound is logged once, at warning, naming
+    //                the event, the size and the bound. The manifest entry was
+    //                unread; now a peer that outgrows it says so.
+    //   not enforced -- the frame is still parsed and still acted on.
+    //
+    // Enforcing would be the stricter-looking and wronger choice HERE, which is
+    // the opposite of what this file used to do for `agent.question` and for a
+    // reason worth stating:
+    // nobody has measured the v2 gateway's largest text frame from this
+    // checkout, and refusing one over 8 KiB would drop the tail of a real
+    // answer to protect against a bound the peer may already exceed. A dropped
+    // answer is unrecoverable; an over-long one is merely unplanned. The 16 KiB
+    // SSE budget is what the device actually refuses, so the exposure stays
+    // bounded either way.
+    //
+    // `agent.question` USED to be "the exception and is refused further down",
+    // on the claim that its bound was unreachable by a conformant peer. It is
+    // reachable -- see kMaxQuestionFrameBytes -- and the refusal dropped the
+    // ask, so it is no longer an exception.
+    //
+    // The envelope slack: the manifest caps the FIELD, this measures the whole
+    // JSON envelope, and comparing them directly made the effective cap that
+    // many bytes tighter than the manifest intended -- a conformant peer
+    // sitting at the schema's own `maxLength` warned on every frame. See
+    // kJsonFieldEnvelopeBytes. What is left over after removing it is real:
+    // `maxLength` counts code points and this counts bytes, so multibyte text
+    // at the ceiling still warns, which is the point of the warning.
+    const size_t text_envelope = kMaxTextEventBytes + kJsonFieldEnvelopeBytes;
+    const size_t delta_envelope = kMaxDeltaEventBytes + kJsonFieldEnvelopeBytes;
+    if (!acknowledgement && payload.size() > text_envelope &&
+        (event_name == "agent.text" || event_name == "agent.reasoning")) {
+        ESP_LOGW(kTag,
+                 "agent frame %s is %u B, over the manifest's text_event_bytes=%u "
+                 "plus its JSON envelope -- parsing anyway",
+                 event_name.c_str(), static_cast<unsigned>(payload.size()),
+                 static_cast<unsigned>(kMaxTextEventBytes));
+    }
+    if (!acknowledgement && payload.size() > delta_envelope &&
+        (event_name == "agent.text.delta" || event_name == "agent.reasoning.delta")) {
+        ESP_LOGW(kTag,
+                 "agent frame %s is %u B, over the manifest's delta_event_bytes=%u "
+                 "plus its JSON envelope -- parsing anyway",
+                 event_name.c_str(), static_cast<unsigned>(payload.size()),
+                 static_cast<unsigned>(kMaxDeltaEventBytes));
+    }
+    cJSON* root = wqn::protocol::JsonNestingWithinLimit(payload.data(), payload.size())
+        ? cJSON_ParseWithLength(payload.data(), payload.size())
         : nullptr;
     if (root == nullptr) {
         return ESP_ERR_INVALID_RESPONSE;
@@ -990,6 +1210,40 @@ esp_err_t ParseOpenCodeAgentFrame(
             return ESP_ERR_INVALID_RESPONSE;
         }
     } else if (event_name == "agent.question") {
+        // [bounds] The manifest's `question_frame_bytes`, OBSERVED like the two
+        // text bounds above -- and it used to be ENFORCED here, which was wrong
+        // twice over.
+        //
+        // (1) The bound is reachable by a conformant peer, so the refusal fired
+        // on legal traffic. `maxLength` counts CODE POINTS and the wire is UTF-8:
+        // computing the worst schema-legal `questionData` (session_id 128 ASCII
+        // by pattern, question_id 128, title 160, 8 x {value 256, label 120})
+        // gives 3,673 B all-ASCII, 10,265 B with CJK and 13,561 B with astral
+        // characters -- against a 10,240 B bound. CJK is the ordinary case for a
+        // Chinese-language product, not the exotic one. The first version of
+        // this check measured only the ASCII worst case and concluded the bound
+        // was unreachable.
+        //
+        // (2) Refusing it dropped the ask, and a dropped ask is the one outcome
+        // the original comment claimed to prevent. DispatchAgentEvent logs a
+        // refused frame and returns; it does not end the stream. So the run
+        // continued, the user never saw the question, and no reply was ever
+        // POSTed -- the gateway sat waiting on an answer the device had thrown
+        // away. Parsing it instead renders each label through
+        // AgentOneLine(label, 88), which truncates to one line, so the user can
+        // still answer or take the 自定义回答 pseudo-option that interrupts.
+        // "Cannot hold" and "cannot dismiss" were being conflated: parsing is
+        // what makes it dismissable.
+        //
+        // What is left of the bound is the diagnostic: a frame over it is logged
+        // once, naming the event, the size and the bound.
+        if (payload.size() > kMaxQuestionFrameBytes) {
+            ESP_LOGW(kTag,
+                     "agent frame %s is %u B, over the manifest's "
+                     "question_frame_bytes=%u -- parsing anyway",
+                     event_name.c_str(), static_cast<unsigned>(payload.size()),
+                     static_cast<unsigned>(kMaxQuestionFrameBytes));
+        }
         // One step of a question sequence: the gateway walks a multi-field
         // form one field at a time and reuses `question_id` as the step id
         // (`{formId}#{step}`, opaque to the device). Up to

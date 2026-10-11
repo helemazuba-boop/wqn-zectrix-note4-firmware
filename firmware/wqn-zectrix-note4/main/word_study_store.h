@@ -106,6 +106,16 @@ struct PersistedWordSession {
     StoredWordSessionData remote;
 };
 
+// [ui-gates] Validates a candidate page against the snapshot it was fetched for
+// and returns the extended snapshot (answered prefix trimmed, page items
+// appended, cursor advanced). Pure, so the cloud runner can persist the result
+// and the UI can merge it. Error codes: INVALID_RESPONSE = snapshot mismatch,
+// INVALID_STATE = cursor past the window, INVALID_SIZE = window overflow,
+// INVALID_ARG = page ordering invalid.
+esp_err_t ExtendPersistedWordSessionWithPage(
+    const PersistedWordSession& persisted,
+    const protocol::word_study_v1::CandidatePageData& page,
+    PersistedWordSession* updated);
 esp_err_t CompactWordSessionData(
     const protocol::word_study_v1::SessionData& source,
     StoredWordSessionData* destination);
@@ -137,6 +147,10 @@ struct WordOutboxSnapshot {
     size_t capacity = 0;
 };
 
+// Live capacity counts pending + parked observations, not historical ACKs.
+// A separate physical-byte bound reserves their terminal-marker slots. New
+// submissions can return INVALID_SIZE under unreclaimed space pressure; no
+// accepted observation is silently evicted to make room.
 inline constexpr size_t kWordObservationOutboxCapacity = 1000;
 
 // Every resumable word mode (sequential, review, shuffle, mistakes) has its own
@@ -152,14 +166,44 @@ esp_err_t SavePersistedWordSession(const PersistedWordSession& session);
 esp_err_t SaveWordSessionCursor(const PersistedWordSession& session);
 esp_err_t ClearPersistedWordSession(protocol::word_study_v1::Mode mode);
 
-// Commits the observation first, then the advanced session cursor. Retrying
-// the same request_id is idempotent. If the second write is interrupted, load
-// reconciliation advances the session from the durable outbox record.
+// A normal new observation durably includes the advanced position/phase/sequence
+// in its outbox record; it does not rewrite the complete candidate snapshot or
+// the pause-only NVS cursor. Retrying the same request_id is idempotent (existing
+// record retries may checkpoint the supplied session). Loads replay retained
+// observations, and maintenance checkpoints before reclaiming their progress.
 esp_err_t CommitWordObservation(
     const DurableWordObservation& observation,
     const PersistedWordSession& advanced_session);
+// Bounded, same-session consecutive events share one journal flush. Success
+// means every supplied event is durable (possibly already present on retry).
+// Failure may leave a complete prefix; retry the SAME identities, never mint
+// new request_ids. This API does not accept RAM-only events or upload them.
+esp_err_t CommitWordObservations(
+    const std::vector<DurableWordObservation>& observations,
+    const PersistedWordSession& advanced_session);
 esp_err_t PeekPendingWordObservation(DurableWordObservation* observation);
+// Skip only the bounded list already accepted by the server in this upload
+// round. They remain durable pending records until the batch ACK succeeds.
+esp_err_t PeekPendingWordObservationExcluding(
+    const std::vector<std::string>& request_ids, DurableWordObservation* observation);
 esp_err_t AcknowledgeWordObservation(const std::string& request_id);
+esp_err_t AcknowledgeWordObservations(const std::vector<std::string>& request_ids);
+// Advisory admission for routine maintenance only. StorageService invokes
+// this at each step, including after queue wait. The callback/context remain
+// caller-owned until this synchronous call returns; they must be thread-safe
+// and perform no I/O. It cannot cancel a VFS operation already in progress.
+// Space/repair work and sleep preparation bypass this advisory gate.
+struct WordOutboxMaintenanceGate {
+    bool (*should_defer)(void* context) = nullptr;
+    void* context = nullptr;
+};
+esp_err_t AcknowledgeWordObservations(
+    const std::vector<std::string>& request_ids,
+    const WordOutboxMaintenanceGate& maintenance_gate);
+// Retries deferred maintenance even when no new ACK remains to trigger it.
+// Deferral retains the journal and returns ESP_OK; actual I/O errors propagate.
+esp_err_t MaintainWordObservationOutbox(
+    const WordOutboxMaintenanceGate& maintenance_gate, bool* deferred);
 // Moves one permanently rejected observation to the bounded forensic journal
 // before removing it from the upload queue. Other sessions and observations
 // remain available and no restart is required.

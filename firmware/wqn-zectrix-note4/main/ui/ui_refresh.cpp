@@ -284,7 +284,7 @@ DisplayIntent NewDisplayIntent(
 
 void MergeDisplayPolicy(
     const DisplayIntent& old_intent,
-    wqn::UiFrame* latest_frame,
+    bool* prefer_full_refresh,
     DisplayIntent* latest_intent,
     TickType_t* latest_deadline)
 {
@@ -294,7 +294,7 @@ void MergeDisplayPolicy(
                                        *latest_deadline);
     latest_intent->deadline_tick = static_cast<uint32_t>(*latest_deadline);
     if (latest_intent->waveform == WaveformRequirement::kFull) {
-        latest_frame->prefer_full_refresh = true;
+        *prefer_full_refresh = true;
     }
 }
 
@@ -521,8 +521,20 @@ std::string FrameSignature(const wqn::UiFrame& frame)
         signature.push_back('/');
         signature.append(agent.ui.activity_text);
         signature.push_back('/');
-        signature.append(agent.ui.action_hint);
-        signature.push_back('/');
+        // [banner] The stamp, not the text. A stamped line disappears purely
+        // because time passed, so a signature that only tracked the string
+        // would stop changing at the exact moment the banner should vanish --
+        // and the repaint that erases it would never be built. Bucketed rather
+        // than raw so the frame rate is bounded, and only while a line is
+        // actually on screen: once the stamp is stale this appends nothing at
+        // all and the page goes quiet again.
+        if (agent.ui.activity_text_ms > 0) {
+            constexpr int64_t kAgentBannerBucketMs = 500;
+            signature.append("|banner");
+            signature.append(std::to_string(
+                (esp_timer_get_time() / 1000 - agent.ui.activity_text_ms) /
+                    kAgentBannerBucketMs));
+        }
         signature.append(std::to_string(agent.ui.scroll_offset_lines));
         signature.push_back('/');
         signature.append(agent.ui.requires_confirmation ? "1" : "0");
@@ -560,12 +572,30 @@ std::string FrameSignature(const wqn::UiFrame& frame)
         signature.push_back('/');
         signature.append(std::to_string(agent.selected_session));
         signature.push_back('/');
+        // [run-live] Not here any more. This bit used to carry the bottom band's
+        // gesture hint, and the band is interactive-only now, so a flip of it
+        // changes no pixel -- while still building a frame from a worker tail that
+        // may have changed nothing else either. Keeping it would have been the
+        // same dead signature entry as action_hint, in the other direction: there
+        // it suppressed a needed repaint, here it manufactures an unneeded one.
+        //
+        // Every site that flips it also writes phase / status_label /
+        // activity_text or rewrites the session rows below, all of which are still
+        // in this signature, so no repaint is lost.
         signature.append(agent.current_session_id);
         for (const wqn::AgentSessionOption& session : agent.sessions) {
             signature.push_back('/');
             signature.append(session.id);
             signature.push_back(':');
             signature.append(session.title);
+            // [D-which] The picker's running marker is drawn from `outcome`
+            // (page_ai_agent.cpp), so a row transitioning running -> settled
+            // must reach the signature or layer-1 dedup skips the repaint and
+            // the glyph stays over a session whose run has ended. Only kRunning
+            // reaches that glyph, so the bit is one state deep on purpose.
+            signature.push_back(session.outcome == wqn::OpenCodeSessionOutcome::kRunning
+                                    ? 'R'
+                                    : '.');
         }
     }
     if (frame.screen == wqn::UiScreen::kTodo) {
@@ -952,7 +982,10 @@ wqn::display::DisplaySubmission RequestEpdUiRefresh(
         g_display_sleep_lease = std::move(lease);
     }
 
-    wqn::UiFrame merged_frame = frame;
+    // [ui-stack] A UiFrame is >4 KiB. Merge only the scalar safety policy;
+    // copy pixels/state directly into the existing slot after supersession
+    // succeeds, under the same mutex. Failed supersession leaves slots intact.
+    bool merged_prefer_full_refresh = frame.prefer_full_refresh;
     wqn::display::DisplayIntent merged_intent =
         NewDisplayIntent(revision, schedule, due_tick, waveform);
 
@@ -962,7 +995,7 @@ wqn::display::DisplaySubmission RequestEpdUiRefresh(
         // policy is monotonic: never weaken its waveform and never postpone its deadline.
         if (g_secondary.pending) {
             MergeDisplayPolicy(g_secondary.intent,
-                               &merged_frame, &merged_intent, &due_tick);
+                               &merged_prefer_full_refresh, &merged_intent, &due_tick);
             if (!PublishDisplayResult(
                     SupersededResult(g_secondary.intent.revision, revision), 0)) {
                 xSemaphoreGive(g_refresh_mutex);
@@ -978,7 +1011,8 @@ wqn::display::DisplaySubmission RequestEpdUiRefresh(
                  static_cast<unsigned>(due_tick),
                  static_cast<unsigned long>(merged_intent.reason_mask),
                  static_cast<int>(merged_intent.waveform), signature.size());
-        g_secondary.frame = std::move(merged_frame);
+        g_secondary.frame = frame;
+        g_secondary.frame.prefer_full_refresh = merged_prefer_full_refresh;
         g_secondary.signature = signature;
         g_secondary.intent = merged_intent;
         g_secondary.schedule = effective_schedule;
@@ -1009,7 +1043,7 @@ wqn::display::DisplaySubmission RequestEpdUiRefresh(
     const int producer_slot = 1 - consumer_holds;
     if (g_refresh_pending) {
         MergeDisplayPolicy(g_pending_intents[consumer_holds],
-                           &merged_frame, &merged_intent, &due_tick);
+                           &merged_prefer_full_refresh, &merged_intent, &due_tick);
         if (!PublishDisplayResult(
                 SupersededResult(g_pending_intents[consumer_holds].revision, revision), 0)) {
             xSemaphoreGive(g_refresh_mutex);
@@ -1025,7 +1059,8 @@ wqn::display::DisplaySubmission RequestEpdUiRefresh(
              static_cast<unsigned>(due_tick),
              static_cast<unsigned long>(merged_intent.reason_mask),
              static_cast<int>(merged_intent.waveform), signature.size(), producer_slot);
-    g_pending_frames[producer_slot] = std::move(merged_frame);
+    g_pending_frames[producer_slot] = frame;
+    g_pending_frames[producer_slot].prefer_full_refresh = merged_prefer_full_refresh;
     g_pending_signatures[producer_slot] = signature;
     g_pending_intents[producer_slot] = merged_intent;
     g_refresh_pending = true;

@@ -771,8 +771,8 @@ esp_err_t ResetProblemPackStorageCache()
     if (!storage_lease) {
         return ESP_ERR_INVALID_STATE;
     }
-    const esp_err_t result = services::ExecuteStorageTransaction(
-        ResetProblemPackStorageCacheRaw, nullptr);
+    const esp_err_t result = services::ExecuteStorageTransactionNamed(
+        ResetProblemPackStorageCacheRaw, nullptr, "pp-cache-reset");
     if (result == ESP_OK) {
         ESP_LOGW(kTag, "cleared incompatible problem pack cache; cloud content is recoverable");
     }
@@ -954,9 +954,9 @@ esp_err_t SaveProblemPackManifest(const WqnProblemPackManifest& manifest)
     if (!storage_lease) {
         return ESP_ERR_INVALID_STATE;
     }
-    return services::ExecuteStorageTransaction(
+    return services::ExecuteStorageTransactionNamed(
         SaveProblemPackManifestTransaction,
-        const_cast<WqnProblemPackManifest*>(&manifest));
+        const_cast<WqnProblemPackManifest*>(&manifest), "pp-manifest-save");
 }
 
 esp_err_t ParseProblemRecordLine(const char* line, WqnProblemEntry* entry, bool include_content)
@@ -1360,7 +1360,7 @@ esp_err_t AppendProblemPackStream(void* opaque, const uint8_t* bytes, size_t siz
     context->operation = ProblemPackStreamOperation::kAppend;
     context->chunk = bytes;
     context->chunk_size = size;
-    return services::ExecuteStorageTransaction(ProblemPackStreamTransaction, context);
+    return services::ExecuteStorageTransactionNamed(ProblemPackStreamTransaction, context, "pp-stream");
 }
 
 esp_err_t DownloadProblemPackToStorage(
@@ -1387,21 +1387,21 @@ esp_err_t DownloadProblemPackToStorage(
     context.set = &set;
     mbedtls_sha256_init(&context.sha);
     context.operation = ProblemPackStreamOperation::kBegin;
-    esp_err_t result = services::ExecuteStorageTransaction(
-        ProblemPackStreamTransaction, &context);
+    esp_err_t result = services::ExecuteStorageTransactionNamed(
+        ProblemPackStreamTransaction, &context, "pp-stream");
     if (result == ESP_OK) {
         result = DownloadProblemPackStream(
             token, metadata, set, AppendProblemPackStream, &context);
     }
     if (result == ESP_OK) {
         context.operation = ProblemPackStreamOperation::kCommit;
-        result = services::ExecuteStorageTransaction(
-            ProblemPackStreamTransaction, &context);
+        result = services::ExecuteStorageTransactionNamed(
+            ProblemPackStreamTransaction, &context, "pp-stream");
     }
     if (result != ESP_OK) {
         context.operation = ProblemPackStreamOperation::kAbort;
         ESP_ERROR_CHECK_WITHOUT_ABORT(
-            services::ExecuteStorageTransaction(ProblemPackStreamTransaction, &context));
+            services::ExecuteStorageTransactionNamed(ProblemPackStreamTransaction, &context, "pp-stream"));
     }
     mbedtls_sha256_free(&context.sha);
     return result;

@@ -245,6 +245,15 @@ esp_err_t FetchWordStudyCandidatePageV1(
     const protocol::word_study_v1::CandidatePageRequest& request,
     protocol::word_study_v1::CandidatePageData* page,
     protocol::v3::Error* error);
+// Opportunistic initial-window coalescing: require an already-online demand
+// and reasonable clock, with short socket waits. This is NOT a wall deadline;
+// TLS/headers/body work still runs synchronously on the existing cloud lane.
+esp_err_t TryFetchWordStudyCandidatePageV1(
+    const std::string& token,
+    const std::string& session_id,
+    const protocol::word_study_v1::CandidatePageRequest& request,
+    protocol::word_study_v1::CandidatePageData* page,
+    protocol::v3::Error* error);
 esp_err_t SubmitWordStudyObservationV1(
     const std::string& token,
     const protocol::word_study_v1::ObservationRequest& request,

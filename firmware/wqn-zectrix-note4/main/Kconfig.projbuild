@@ -162,6 +162,15 @@ menu "WQN firmware"
             Enable experimental AI support modules. Provider secrets must stay
             on the WQN server and must never be embedded in firmware.
 
+    config WQN_AUDIO_RESOURCE_DIAGNOSTICS
+        bool "Enable detailed audio heap/task diagnostics"
+        default n
+        depends on WQN_AI_ENABLE && FREERTOS_USE_TRACE_FACILITY
+        help
+            Print the full heap and task ledger only while capture is inactive.
+            Keep disabled for recording acceptance: the serial dump can occupy
+            hundreds of milliseconds and interfere with DMA draining.
+
     config WQN_AGENT_ENABLE
         bool "Enable the Agent tier (OpenCode gateway)"
         default y

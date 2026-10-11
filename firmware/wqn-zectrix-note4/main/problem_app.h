@@ -204,7 +204,6 @@ bool TakeProblemVerdictEffect(
     DurableProblemObservation* observation);
 void ApplyProblemVerdictCommitResult(ProblemAppState* state, esp_err_t result);
 
-void RefreshProblemOutboxState(ProblemAppState* state);
 ProblemAppSnapshot BuildProblemAppSnapshot(const ProblemAppState& state);
 std::string ProblemAppStatusLine(const ProblemAppState& state);
 std::string ProblemAppSignature(const ProblemAppState& state);

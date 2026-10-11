@@ -12,7 +12,7 @@
 4. **电量/存储的原始数字是多少**（电量原始、存储详情；两者原本平铺在一级）；
 5. **睡眠为什么没进去**（电源睡眠诊断）。
 
-**v1 边界（明确不做）**：只读。无写操作、无危险动作、无持久化、无自动刷新、不做 `esp_log` vprintf 全量捕获、不触碰 persist-worker 事务协议。要加可写操作时先扩展本文档。
+**v1 边界**：除 §4.2 同步诊断的「双击确认重下词库包」外，全部只读。无其它写操作、无其它危险动作、无自动刷新、不做 `esp_log` vprintf 全量捕获、不触碰 persist-worker 事务协议。要加可写操作时先扩展本文档（该动作是 2026-10-04 首个例外，动因是 HIL 需要可复现的多 MB 包写负载）。
 
 ## 2. 配置与发布策略
 
@@ -27,7 +27,7 @@
 
 | 一级行 | 标题 | 值列 | 动作 |
 |---|---|---|---|
-| +1 | 开发者选项 | `只读诊断` | 进入二级列表（`SettingsView::kDev`） |
+| +1 | 开发者选项 | `只读诊断` | 进入二级列表（`SettingsView::kDev`）；其中「同步诊断」有一个动作，见 §4.2 |
 
 确认该行进入二级列表（`dev_titles`/`dev_values`，六行 = 面板 6 行窗口，不需要滚动）：
 
@@ -42,7 +42,7 @@
 
 一级「电量」行保留用户可见的百分比，确认只写 notice（`电量 87%`，照「固件版本」行的做法）；原始数字移到二级。
 
-**导航**：上下移动 `dev_selected`（环绕），确认打开对应的只读对话框，**长按确认返回一级**（一级长按确认仍是回首页）。
+**导航**：上下移动 `dev_selected`（环绕），确认打开对应的对话框，**长按确认返回一级**（一级长按确认仍是回首页）。对话框除 §4.2 外均为只读。
 
 **为什么是二级而不是平铺**：一级已有 12 行（「AI 回复时翻页」加入后），而 dev 信息还在增长（电源睡眠诊断是第六项），平铺会把「恢复出厂」「关机」推得更远；二级把 dev 信息收敛到一屏，且门控只需挡住一行入口。
 
@@ -50,7 +50,7 @@
 
 **扩展规则**：新的调试信息一律加进这六个对话框之一（数据面进 `SettingsDiagnosticsSnapshot` + `UpdateSettingsDiagnostics`，登记 `FrameSignature`）。要加第七行，必须先修订本文档并说明为何六行装不下（超过 6 行需启用现成的 selection-following 窗口逻辑）。
 
-六个对话框全部沿用 **kBattery/kStorage 只读模式**（`ui_input.cpp` 的 `kBattery || kStorage || ...` 输入块）：确认（短按或长按）关闭，Up/Down 无操作，无滚动，快照在打开时取一次；驻留设置页时由既有的 60s 状态重载（`device_ui.cpp` `kStatusRefreshDelayTicks` → `LoadUiState`）被动更新。
+五个对话框（`kBattery/kStorage/kDevInfo/kDevErrors/kSleepDiag`）沿用 **只读模式**（`ui_input.cpp` 的对应输入块）：确认（短按或长按）关闭，Up/Down 无操作，无滚动，快照在打开时取一次。`kDevSync` 单独一块：短按/长按确认同样关闭，另加**双击确认 = 重下词库包**（§4.2）。驻留设置页时由既有的 60s 状态重载（`device_ui.cpp` `kStatusRefreshDelayTicks` → `LoadUiState`）被动更新。
 
 **新增可见状态必须登记**：`view` 与 `dev_selected` 已进 `FrameSignature`；以后再加二级状态同理，否则 dedup 会吞掉重绘。
 
@@ -71,6 +71,18 @@
 - 词箱 / 笔箱 / 题箱 outbox：`SyncOutboxPhase` 标签 + 重试次数 + `last_error`。
 
 phase 标签 helper 放 `ui/diagnostics.cpp`（照 `OnlineSyncStatusLabel` 风格）。超宽用 `DrawClippedText` 截断。
+
+**本对话框是全菜单唯一能执行动作的对话框：双击确认 = 重下词库包。**
+
+- 动作内容（`ui_input.cpp` `RequestWordPackRedownload`，三个既有调用，无测试专用分支）：
+  1. `wqn::ResetWordPackStorageCache()` 删本地 manifest + 包文件 → `!had_local_manifest`；
+  2. `wqn::services::RequestContentRefresh(kWordPacks)` 置内容相 pending 并叫醒 sync task；
+  3. `QueueWordReviewRefresh()` claim 刷新票据并排 bulk lane 的 `kPackSync`——与词页进屏时同一个调用。
+- **为什么需要它**：健康设备上没有任何生产路径能按需造出多 MB 包写负载。词页只在 `cloud_sync_requested`（本地无 manifest / 包错误 / 无词可学）为真时才同步；`RequestSyncNow` 走 full sync 且只在服务端 revision 更新时才真正收敛；`RequestContentRefresh` 也只能在 claim 层绕过 revision 门，manifest 不变时仍走「词库无变更」分支、不下载包体。C.2 HIL 判据（测量 foreground cursor 写在包写进行中的 `queue_wait_ms`）因此无法运行。
+- **为什么是双击而非长按**：长按确认在这套设置树里是「离开/返回」的通用手势（一级回首页、二级回一级），拿它触发一个会丢弃已下载内容的动作既违背惯例又易误触。双击确认在设置树里空闲（仅 AI 页用于状态栏编辑），且是刻意手势，适合破坏性动作。
+- **操作序列**：开发者选项 → 同步诊断 → 双击确认 → notice「已重下词库包，去词页看」→ 去词页开始答题，包在后台全量重下。
+- 成功后 `ResetWordPackStorageCache` 会打 `cleared incompatible word pack cache` 警告，动作本身打 `dev: word pack redownload requested`，两者都是 HIL 的 grep 锚点。
+- 只影响词包内容相；同步轮次的其它部分不变。
 
 ### 4.3 错误记录（`kDevErrors`，≤6 行）
 

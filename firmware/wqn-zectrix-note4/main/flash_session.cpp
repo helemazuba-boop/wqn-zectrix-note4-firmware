@@ -29,6 +29,7 @@
 #include "freertos/ringbuf.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "psram_task_stack.h"
 #include "services/audio_service.h"
 #include "services/connectivity_service.h"
 #include "storage.h"
@@ -216,8 +217,8 @@ enum class FlashTerminalReason : uint8_t {
 };
 
 StaticTask_t g_lifecycle_task_tcb;
-StackType_t g_lifecycle_task_stack[
-    kLifecycleTaskStackBytes / sizeof(StackType_t)] = {};
+// Token reads execute on StorageService, not this PSRAM-backed lifecycle stack.
+StackType_t* g_lifecycle_task_stack = nullptr;
 TaskHandle_t g_lifecycle_task = nullptr;
 // These realtime workers exist only while Flash is active, but allocating
 // their 12 KiB of stacks from the default internal heap made that memory also
@@ -292,6 +293,8 @@ void FlashLifecycleTask(void*)
                 g_start_generation.load(std::memory_order_acquire);
             const esp_err_t start_result =
                 wqn::StartFlashSessionNow(generation);
+            ESP_LOGI(kTag, "Flash lifecycle stack HWM: phase=start free_bytes=%u",
+                     static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
             if (start_result != ESP_OK &&
                 !g_teardown_pending.load(std::memory_order_acquire)) {
                 xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
@@ -353,6 +356,8 @@ void FlashLifecycleTask(void*)
         }
 
         g_teardown_pending.store(false, std::memory_order_release);
+        ESP_LOGI(kTag, "Flash lifecycle stack HWM: phase=stop free_bytes=%u",
+                 static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
         g_intentional_stop.store(false, std::memory_order_release);
         const bool restart =
             g_restart_after_teardown.exchange(false, std::memory_order_acq_rel);
@@ -376,15 +381,26 @@ esp_err_t EnsureFlashLifecycleTask()
     if (g_lifecycle_task != nullptr) {
         return ESP_OK;
     }
+    bool in_psram = false;
+    g_lifecycle_task_stack = wqn::AllocTaskStack(
+        kLifecycleTaskStackBytes, "flash_lifecycle", &in_psram);
+    if (g_lifecycle_task_stack == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
     g_lifecycle_task = xTaskCreateStatic(
         FlashLifecycleTask,
         "flash_lifecycle",
-        kLifecycleTaskStackBytes,
+        wqn::TaskStackWords(kLifecycleTaskStackBytes),
         nullptr,
         kLifecycleTaskPriority,
         g_lifecycle_task_stack,
         &g_lifecycle_task_tcb);
-    return g_lifecycle_task == nullptr ? ESP_ERR_NO_MEM : ESP_OK;
+    if (g_lifecycle_task == nullptr) {
+        heap_caps_free(g_lifecycle_task_stack);
+        g_lifecycle_task_stack = nullptr;
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
 }
 
 void RequestFlashTerminalStop(FlashTerminalReason reason)
@@ -411,7 +427,7 @@ bool EnsureFlashThinkingHistoryLocked(int64_t now_ms)
     if (!g_flash.history_user_committed || g_flash.thinking_text.empty()) {
         return false;
     }
-    const std::string label = "💭 " + g_flash.thinking_text;
+    const std::string label = g_flash.thinking_text;
     wqn::AiHistory& history = wqn::GetAiHistory(wqn::AiHistoryChannel::kFlash);
     if (g_flash.thinking_message_id == wqn::kInvalidChatMessageId) {
         g_flash.thinking_message_id = history.AppendThinking(label, now_ms);
@@ -1256,6 +1272,8 @@ void AudioStreamingTask(void* param)
             sizeof(i2s_buf), &warmup_bytes, pdMS_TO_TICKS(100));
     }
 
+    const int64_t capture_started_us = esp_timer_get_time();
+    uint64_t capture_samples = 0;
     while (true) {
         // Check if capture should stop
         bool should_capture = false;
@@ -1303,6 +1321,7 @@ void AudioStreamingTask(void* param)
         // I2S stereo 16-bit layout: [L0 R0 L1 R1 ...] (2 bytes/sample).
         const int stereo_frames = static_cast<int>(bytes_read / 4);
         const int frames = std::min(stereo_frames, kStreamChunkFrames);
+        capture_samples += static_cast<uint64_t>(frames);
         int16_t mono_buf[kStreamChunkFrames];
         const int16_t* stereo_samples = reinterpret_cast<const int16_t*>(i2s_buf);
         // [mic-fix] Mic is on the L channel; R floats (pcm diag confirms
@@ -1413,6 +1432,13 @@ void AudioStreamingTask(void* param)
         }
     }
 
+    ESP_LOGI(kTag,
+             "Flash capture stop: duration_ms=%llu wall_duration_ms=%lld "
+             "mono_samples=%llu stack_hwm=%u",
+             static_cast<unsigned long long>(capture_samples * 1000 / kSampleRate),
+             static_cast<long long>((esp_timer_get_time() - capture_started_us) / 1000),
+             static_cast<unsigned long long>(capture_samples),
+             static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
     ESP_LOGI(kTag, "audio streaming task exiting");
     // Clear the global handle before self-deletion so StopAudioStreaming can
     // detect every exit path, including hardware-init failures above.
@@ -1722,7 +1748,7 @@ void ParseAndHandleEvent(const char* data, size_t len)
     if (std::strcmp(type, "tool.start") == 0) {
         const char* name = JsonStr(g.p, "name");
         xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
-        g_flash.tool_label = std::string("🔧 ") + (name ? name : "tool") + "…";
+        g_flash.tool_label = std::string(name ? name : "tool") + "…";
         g_flash.status_since_ms = esp_timer_get_time() / 1000;
         MarkChanged();
         xSemaphoreGive(g_flash.mutex);
@@ -1734,7 +1760,7 @@ void ParseAndHandleEvent(const char* data, size_t len)
         const char* name = JsonStr(g.p, "name");
         const bool ok = std::strcmp(type, "tool.result") == 0;
         xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
-        g_flash.tool_label = std::string(ok ? "✅ " : "❌ ") +
+        g_flash.tool_label = std::string(ok ? "ok " : "fail ") +
                              (display && display[0] ? display : (name ? name : "tool"));
         g_flash.status_since_ms = esp_timer_get_time() / 1000;
         MarkChanged();
@@ -2193,7 +2219,7 @@ esp_err_t StartFlashSessionNow(uint32_t generation)
         return ESP_ERR_INVALID_STATE;
     }
     std::string access_token;
-    esp_err_t tok_err = wqn::LoadAccessToken(&access_token);
+    esp_err_t tok_err = wqn::LoadAccessTokenFromStorageService(&access_token);
     if (tok_err != ESP_OK || access_token.empty()) {
         xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
         SetErrorLocked("未登录，请先完成账号配对");

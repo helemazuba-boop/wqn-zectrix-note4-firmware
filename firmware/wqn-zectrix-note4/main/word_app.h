@@ -10,6 +10,8 @@
 #include "word_study_store.h"
 #include "wqn_api.h"
 
+#include "word_batch_policy.h"
+
 namespace wqn {
 
 enum class WordInput {
@@ -62,6 +64,7 @@ enum class WordObservationCommitState : uint8_t {
     kCloudPending,
     kCloudAcknowledged,
     kFailed,
+    kBuffered,
 };
 
 // One word the user failed to recognize during a review session. It is
@@ -132,6 +135,20 @@ struct WordSessionState {
     // submit invalidates a late result, preventing it from installing a stale
     // or empty advanced session over freshly-reset state.
     uint32_t pending_persist_operation_id = 0;
+    struct BufferedObservation {
+        DurableWordObservation observation;
+        int64_t accepted_ms = 0;
+    };
+    // UI-owned immutable events, INCLUDING the worker's in-flight prefix.
+    // No worker result installs an older cursor over RAM-ahead progress.
+    std::vector<BufferedObservation> buffered_observations;
+    PersistedWordSession buffered_advanced_session;
+    size_t batch_in_flight = 0;
+    uint32_t batch_operation_id = 0;
+    int64_t batch_retry_after_ms = 0;
+    esp_err_t batch_error = ESP_OK;
+    bool batch_flush_requested = false;
+    bool batch_finish_pending = false;
 };
 
 struct WordOutboxState {
@@ -147,6 +164,16 @@ struct WordDeckInfo {
     std::string deck_id;
     std::string title;
     size_t entry_count = 0;
+};
+
+struct WordCardPrefetchState {
+    uint32_t operation_id = 0;
+    uint32_t scope_generation = 0;
+    std::string session_id;
+    WordPackIndexEntry index{};
+    WqnWordEntry entry;
+    bool ready = false;
+    int64_t retry_after_ms = 0;
 };
 
 struct WordAppState {
@@ -172,6 +199,7 @@ struct WordAppState {
     // index re-read when the session finishes.
     bool pack_index_pinned = false;
     WqnWordEntry current_word;
+    WordCardPrefetchState card_prefetch;
 
     bool cloud_sync_requested = false;
     bool cloud_sync_failed = false;
@@ -188,6 +216,16 @@ struct WordAppState {
     std::string default_deck_title;
     std::string scoped_deck_id;
     std::string scoped_deck_title;
+    // [word-scope-reset] In-flight scope switch. The durable half (new scope
+    // generation, four session clears, walk cursor) runs on the persist worker;
+    // nothing is installed optimistically -- the scope, the screen switch and
+    // the in-memory reset all wait for the durable ACK, mirroring the
+    // default-deck switch's pending pair. On failure the pending pair stays
+    // armed so a retry re-scopes without re-picking the deck.
+    std::string scope_reset_pending_deck_id;
+    std::string scope_reset_pending_deck_title;
+    bool scope_reset_pending_valid = false;
+    uint32_t scope_reset_save_op_id = 0;
     std::vector<WordDeckInfo> deck_catalog;
 };
 
@@ -266,9 +304,16 @@ void SetDefaultWordDeck(
 // scope, so resuming it would keep studying the previous deck set. Returns
 // to the word home; clear_persisted also drops the durable session records.
 void ResetWordSessionsForScopeChange(WordAppState* state, bool clear_persisted);
+// [word-scope-reset] In-memory half only: drops the session/review/chain state
+// and switches the card phase. The durable half is the worker's
+// kWordSessionReset transaction, and this must not run before its ACK.
+void ResetWordSessionsInMemory(WordAppState* state);
 bool TakeWordSessionStartRequest(
     WordAppState* state,
     protocol::word_study_v1::CreateSessionRequest* request);
+// Re-arm only a rejected enqueue, retaining its request ID and parameters.
+// This is not a retry of an accepted/in-flight cloud request.
+void RestoreWordSessionStartRequest(WordAppState* state);
 // The runner thread already compacted (compact_result) and, for active
 // sessions, persisted (persist_result) the snapshot; apply only installs it in
 // memory so the UI task never runs the snapshot fsync.
@@ -286,11 +331,18 @@ void ResetWordSessionForServerInvalid(WordAppState* state);
 bool TakeWordCandidatePageRequest(
     WordAppState* state,
     protocol::word_study_v1::CandidatePageRequest* request,
+    PersistedWordSession* snapshot,
     std::string* session_id);
 void RestoreWordCandidatePageRequest(WordAppState* state);
+// [ui-gates] `runner_snapshot` is the snapshot the runner extended and
+// persisted; when the in-memory session has advanced past it the page is merged
+// in memory instead and nothing is written here.
 void ApplyWordCandidatePageResult(
     WordAppState* state,
     esp_err_t result,
+    esp_err_t compact_result,
+    esp_err_t persist_result,
+    const PersistedWordSession& runner_snapshot,
     protocol::word_study_v1::CandidatePageData page);
 bool TakeWordObservationEffect(
     WordAppState* state,
@@ -300,7 +352,19 @@ bool TakeWordObservationEffect(
     DurableWordObservation* observation,
     PersistedWordSession* advanced_session);
 void ApplyWordObservationCommitResult(WordAppState* state, esp_err_t result);
-void RefreshWordOutboxState(WordAppState* state);
+bool HasBufferedWordObservations(const WordAppState& state);
+bool BufferWordObservationEffect(WordAppState* state, const std::string& request_id,
+    const std::string& occurred_at, int64_t now_ms);
+bool TakeWordObservationBatch(WordAppState* state, uint32_t operation_id, int64_t now_ms,
+    std::vector<DurableWordObservation>* observations, PersistedWordSession* advanced_session);
+bool ApplyWordObservationBatchResult(WordAppState* state, esp_err_t result,
+    uint32_t operation_id, int64_t now_ms);
+bool SameWordCardPrefetchIndex(const WordPackIndexEntry& left, const WordPackIndexEntry& right);
+bool GetWordCardPrefetchEntry(const WordAppState& state, int64_t now_ms, WordPackIndexEntry* entry);
+bool TakeWordCardPrefetchEntry(WordAppState* state, uint32_t operation_id, int64_t now_ms,
+    WordPackIndexEntry* entry);
+bool ApplyWordCardPrefetchResult(WordAppState* state, uint32_t operation_id, esp_err_t result,
+    WqnWordEntry entry, int64_t now_ms);
 WordAppSnapshot BuildWordAppSnapshot(const WordAppState& state);
 std::string WordAppProgressLabel(const WordAppState& state);
 std::string WordAppStatusLine(const WordAppState& state);

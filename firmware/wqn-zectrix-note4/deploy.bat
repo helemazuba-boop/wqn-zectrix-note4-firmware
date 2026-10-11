@@ -140,14 +140,14 @@ set "FLASH_RC=%ERRORLEVEL%"
 popd
 if not "%FLASH_RC%"=="0" (
     echo   ERROR: Flash failed ^(esptool exit %FLASH_RC%^)^!
-    wsl -d %WSL_DISTRO% -- bash -c "cd %WSL_FW_DIR% && python3 tools/release/release.py record-flash --build-dir %BUILD_DIR% --port %COM_PORT% --status failed"
+    wsl -d %WSL_DISTRO% -- bash -c "cd %WSL_FW_DIR% && . %WSL_IDF_EXPORT% && python3 tools/release/release.py record-flash --build-dir %BUILD_DIR% --port %COM_PORT% --status failed"
     pause
     exit /b 1
 )
 :: Append to dist/flash-history.jsonl so we can always answer "which source is
 :: on this device right now" -- the version alone is not enough, the tree is
 :: usually dirty when we flash.
-wsl -d %WSL_DISTRO% -- bash -c "cd %WSL_FW_DIR% && python3 tools/release/release.py record-flash --build-dir %BUILD_DIR% --port %COM_PORT% --status ok"
+wsl -d %WSL_DISTRO% -- bash -c "cd %WSL_FW_DIR% && . %WSL_IDF_EXPORT% && python3 tools/release/release.py record-flash --build-dir %BUILD_DIR% --port %COM_PORT% --status ok"
 echo   Done.
 
 echo.

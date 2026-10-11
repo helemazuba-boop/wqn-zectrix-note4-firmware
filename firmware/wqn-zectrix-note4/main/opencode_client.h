@@ -12,10 +12,34 @@
 
 namespace wqn {
 
+/**
+ * Whether a session has a run in flight, and how its last run ended.
+ * `contracts/agent-gateway-v0` (2.2) `$defs/session.outcome`.
+ *
+ * The gateway resolves this from two reads; the device receives the answer
+ * and does not re-derive it. The only rule the device has to get right is
+ * about the two "not running" spellings: `kUnknown` and a field the relay
+ * never sent both mean NO run in flight. Reading either as running would
+ * hold the sleep lease on a session that is merely fresh, and the device
+ * would never sleep again -- which is why the mapping is one-way here and
+ * the fallback is the safe direction.
+ */
+enum class OpenCodeSessionOutcome : uint8_t {
+    // No run in flight and no settle recorded: never prompted, an upstream
+    // vocabulary this contract predates, or a relay that predates the field.
+    kUnknown = 0,
+    kRunning,
+    kSucceeded,
+    kInterrupted,
+    kFailed,
+};
+
 struct OpenCodeSessionInfo {
     std::string id;
     std::string title;
     int64_t updated_at = 0;
+    // Absent from a relay predating the field; see OpenCodeSessionOutcome.
+    OpenCodeSessionOutcome outcome = OpenCodeSessionOutcome::kUnknown;
 };
 
 // One answerable option of an `agent.question` ask. The gateway projects one
@@ -166,6 +190,21 @@ esp_err_t ListOpenCodeSessions(
     const std::string& token,
     std::vector<OpenCodeSessionInfo>* sessions,
     OpenCodeResult* result);
+// Parse a `GET /agent/sessions` response body. Split out of ListOpenCodeSessions
+// exactly the way ParseOpenCodeHistoryBody is split out of GetOpenCodeHistory:
+// the row walk below decides which sessions the picker offers, how the 运行中
+// marker is drawn and whether the device holds its sleep lease, and while it
+// lived inside a function that needs a token and a socket none of that had any
+// coverage at all.
+esp_err_t ParseOpenCodeSessionsBody(
+    const std::string& body,
+    std::vector<OpenCodeSessionInfo>* sessions,
+    OpenCodeResult* result);
+// Maps one device-contract `outcome` string onto the enum. Exported so the boot
+// self-test can pin the table: an unrecognised value must land on kUnknown
+// (no marker, no lease) rather than on an error that would take the whole list
+// down with one bad row.
+OpenCodeSessionOutcome ParseSessionOutcome(std::string_view value);
 esp_err_t CreateOpenCodeSession(
     const std::string& token,
     OpenCodeSessionInfo* session,
@@ -180,6 +219,18 @@ esp_err_t TranscribeOpenCodeAudio(
 // `interrupt_delivered` afterwards to tell "stopped on request" from "the
 // stream died". The streaming worker performs the interrupt POST itself, so no
 // caller ever opens a connection of its own while a stream is attached.
+//
+// They also share a *switch* contract, which is the same shape with the
+// opposite intent: `switch_requested` detaches the device from the stream
+// without asking upstream to stop anything, so the run keeps executing in the
+// cloud while only the local view moves on. `switch_delivered` then reads back
+// as ESP_OK rather than `stream_incomplete`.
+//
+// Both can be armed at once, and the INTERRUPT is the one checked first. That
+// ordering is the point: an explicit cancel must never be swallowed by a
+// pending switch, or the run the user asked to stop keeps going. A switch left
+// armed under a cancel is still honoured by the caller's tail, so the user gets
+// the picker they asked for as well as the stop they asked for.
 //
 // `detail` is the requested cloud detail tier (kOpenCodeDetailDefault in
 // opencode_model.h). It rides the request as `?detail=N` and only shapes what
@@ -197,6 +248,8 @@ esp_err_t RunOpenCodePrompt(
     void* reply_failed_ctx,
     std::atomic<bool>* interrupt_requested,
     std::atomic<bool>* interrupt_delivered,
+    std::atomic<bool>* switch_requested,
+    std::atomic<bool>* switch_delivered,
     OpenCodeEventCallback callback,
     void* callback_ctx,
     OpenCodeResult* result);
@@ -209,6 +262,8 @@ esp_err_t WatchOpenCodeSession(
     void* reply_failed_ctx,
     std::atomic<bool>* interrupt_requested,
     std::atomic<bool>* interrupt_delivered,
+    std::atomic<bool>* switch_requested,
+    std::atomic<bool>* switch_delivered,
     OpenCodeEventCallback callback,
     void* callback_ctx,
     OpenCodeResult* result);

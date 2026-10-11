@@ -414,6 +414,10 @@ esp_err_t LoadSessionFile(const char* path, wqn::PersistedNoteSession* session)
     return DecodeSession(payload, session) ? ESP_OK : ESP_ERR_INVALID_RESPONSE;
 }
 
+// [load-repair] Writes: same backup promotion as the word store -- when the
+// primary note session file is torn and the backup is intact, re-save the backup
+// as primary so one consistent file remains. It is the healing of this read and
+// must run on the storage task that owns the file.
 esp_err_t LoadSessionRaw(wqn::PersistedNoteSession* session)
 {
     if (session == nullptr) return ESP_ERR_INVALID_ARG;
@@ -914,6 +918,11 @@ esp_err_t MaybeCompactCachedOutbox(OutboxScan* scan)
     return ESP_OK;
 }
 
+// [load-repair] Writes: reconciles the note session it just read against the
+// durable outbox -- re-derives the cursor when the outbox recorded more acks,
+// checkpoints the session from the outbox before repairing its tail, and
+// compacts the outbox when it came from a backup or ended mid-record. The UI
+// must never see a snapshot that disagrees with what will be uploaded.
 esp_err_t LoadSessionTransaction(void* opaque)
 {
     auto* session = static_cast<wqn::PersistedNoteSession*>(opaque);

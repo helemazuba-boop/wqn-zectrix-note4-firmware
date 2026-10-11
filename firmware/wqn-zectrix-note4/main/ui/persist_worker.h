@@ -8,6 +8,7 @@
 #include "note_store.h"
 #include "problem_store.h"
 #include "word_study_store.h"
+#include "word_pack.h"
 
 // [persist-worker] Dedicated local-write worker. Word/note observation commits
 // and the problem verdict commit run here; settings saves follow (c4). It moves
@@ -38,6 +39,9 @@
 //       return;
 //   }
 //   EnqueueReserved...(t, std::move(payload));    // cannot fail after reserve
+// Word batching additionally has an explicit UI-owned RAM acceptance stage.
+// Its separate buffer lease and capacity include the in-flight prefix; this
+// worker ACK proves durability only and never reinstalls an older RAM cursor.
 
 namespace device_ui_internal {
 
@@ -51,8 +55,40 @@ enum class PersistKind : uint8_t {
     kSettingsDefaultDeck,
     kSettingsAiFollow,
     kSettingsAgentDetail,
+    // [word-scope-reset] Word-page scope switch that does not change the
+    // default deck. One foreground transaction: commit the new scope
+    // generation, then the four session clears and the walk cursor.
+    kWordSessionReset,
+    // Read-only, immutable pack speculation. Reuses the worker and ACK mailbox;
+    // no word mutation domain and no additional task/storage owner.
+    kWordCardPrefetch,
     kCount,
 };
+
+// [worker-domain-gate] Coarser gate over PersistKind. Two kinds in the same
+// domain mutate the SAME durable session snapshot, so letting them overlap
+// re-opens the lost-update window the persist worker exists to close: the
+// per-kind busy flag alone allows kWordObservation and a future word session
+// reset to run concurrently, and whichever writes second silently rolls the
+// other back. Settings collapses to one domain on purpose -- the settings UI
+// only ever arms one dialog at a time, so the domain gate is a no-op there and
+// costs nothing.
+enum class PersistDomain : uint8_t {
+    kWord = 0,
+    kNote,
+    kProblem,
+    kSettings,
+    kCount,
+};
+
+// Which domain a kind belongs to. Public so the UI layer can ask "is this domain
+// busy" without learning the kind list. kCount is rejected by ValidKind before
+// this is reached.
+PersistDomain DomainForKind(PersistKind kind);
+
+// True while any kind in this domain is in flight. The per-kind flag is the
+// narrow question; this is the one the UI's gates should ask.
+bool IsPersistDomainBusy(PersistDomain domain);
 
 // Handle to a reserved pool slot that already holds the per-kind busy gate and
 // a storage SleepLease. Invalid when reservation failed.
@@ -90,6 +126,12 @@ void EnqueueReservedWordObservation(
     const PersistTicket& ticket,
     wqn::DurableWordObservation observation,
     wqn::PersistedWordSession advanced_session);
+void EnqueueReservedWordObservations(
+    const PersistTicket& ticket,
+    std::vector<wqn::DurableWordObservation> observations,
+    wqn::PersistedWordSession advanced_session);
+void EnqueueReservedWordCardPrefetch(const PersistTicket& ticket,
+    const wqn::WordPackIndexEntry& index);
 void EnqueueReservedNoteObservation(
     const PersistTicket& ticket,
     wqn::DurableNoteObservation observation,
@@ -113,10 +155,17 @@ uint32_t SubmitAgentDetailLevelSave(uint8_t level);
 // (ChangeDefaultWordDeckForeground) on the worker. deck_id empty = all decks.
 // The UI installs the new deck ONLY after the durable ACK.
 uint32_t SubmitDefaultDeckChange(const std::string& deck_id);
+// [word-scope-reset] Scope switch without a deck change. The durable half runs
+// on the worker; the UI arms the scope and installs it only on the durable ACK,
+// so the scope switch never blocks the UI task on storage.
+uint32_t SubmitWordSessionReset(const std::string& deck_id);
 
 // --- Consumer side (UI task). ---
 // True when an unapplied terminal result is waiting for `kind`; copies it out.
 bool TakePersistResultToApply(PersistKind kind, PersistResultReceipt* out);
+// Copies the owned read result without consuming it. The slot retains it until
+// the fully fenced ACK, so repeat reads and a delayed UI cannot lose the card.
+bool TakeWordCardPrefetchResult(PersistResultReceipt* out, wqn::WqnWordEntry* entry);
 // Validates generation + operation_id + slot ownership; only a fully matching
 // ACK frees the slot and clears busy. Stale/duplicate ACKs are logged and
 // ignored (returns false), never mutating state.

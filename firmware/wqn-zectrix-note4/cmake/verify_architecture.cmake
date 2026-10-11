@@ -64,6 +64,17 @@ file(GLOB_RECURSE firmware_sources
     "${WQN_PROJECT_DIR}/components/*.cpp"
     "${WQN_PROJECT_DIR}/components/*.h")
 
+# [storage-single-writer] The only files allowed to contain a SPIFFS mutation
+# primitive. Each is reached through a StorageService transaction.
+set(spiffs_writer_files
+    main/storage.cpp
+    main/word_study_store.cpp
+    main/note_store.cpp
+    main/problem_store.cpp
+    main/word_pack.cpp
+    main/note_pack.cpp
+    main/problem_pack.cpp)
+
 set(deep_sleep_call_count 0)
 foreach(source IN LISTS firmware_sources)
     wqn_read("${source}" contents)
@@ -117,6 +128,110 @@ foreach(source IN LISTS firmware_sources)
        NOT source STREQUAL "main/runtime/storage_schema.cpp")
         message(FATAL_ERROR
             "M8 architecture gate: ${source}: NVS write bypasses StorageService/schema bootstrap")
+    endif()
+
+    # [storage-single-writer] SPIFFS mutation primitives are confined to the
+    # seven files that own durable pack/store I/O; every one of them is reached
+    # through a StorageService transaction. The journal's raw rename sequence
+    # was the one path that bypassed the owner task, and this is what keeps the
+    # next one from being added silently. Balanced against the NVS rule above,
+    # which already had a file allowlist.
+    #
+    # NOT enforced here: which task performs the write. A caller-level check
+    # belongs to the STORAGE-ENTRYPOINT rule and to the storage service's own
+    # caller accounting, not to a text scan.
+    #
+    # Pattern notes, all verified against the tree:
+    #  * fopen: any mode containing w, a or + is a writing mode ("rb" is not).
+    #  * std::remove is constrained to a path-looking argument, because the
+    #    <algorithm> erase-remove idiom shares the name; the writer files always
+    #    pass a *Path variable or a .c_str() path, the idiom never does.
+    #  * bare rename/unlink are constrained the same way.
+    if(NOT source IN_LIST spiffs_writer_files)
+        if(contents MATCHES "fopen[ \t\r\n]*\\([^;]*\"[^\"]*[wa+][^\"]*\"")
+            message(FATAL_ERROR
+                "M8 architecture gate: ${source}: rule SPIFFS-WRITER: fopen with a writing mode -- route durable writes through StorageService")
+        endif()
+        if(contents MATCHES "std::rename[ \t\r\n]*\\(")
+            message(FATAL_ERROR
+                "M8 architecture gate: ${source}: rule SPIFFS-WRITER: std::rename -- route file replacement through StorageService")
+        endif()
+        if(contents MATCHES "unlink[ \t\r\n]*\\(")
+            message(FATAL_ERROR
+                "M8 architecture gate: ${source}: rule SPIFFS-WRITER: unlink -- route file removal through StorageService")
+        endif()
+        if(contents MATCHES "std::remove[ \t\r\n]*\\([^;]*([Pp]ath|c_str)")
+            message(FATAL_ERROR
+                "M8 architecture gate: ${source}: rule SPIFFS-WRITER: std::remove on a path -- route file removal through StorageService")
+        endif()
+        if(contents MATCHES "(^|[^:_[:alnum:]])rename[ \t\r\n]*\\([^;]*([Pp]ath|c_str)")
+            message(FATAL_ERROR
+                "M8 architecture gate: ${source}: rule SPIFFS-WRITER: rename on a path -- route file replacement through StorageService")
+        endif()
+    endif()
+endforeach()
+
+# [load-repair] Functions named Load* that nevertheless write. They are not
+# accidents and not laziness: each one is a recovery or repair step that has to
+# run on the same task that owns the read, because the write it performs is the
+# healing of the thing it just read (promote the backup, re-derive the cursor
+# from the durable outbox, drop a corrupt cache entry). Splitting them is future
+# work; until then they must stay annotated so nobody mistakes one for a pure
+# read -- and so the build can tell the day the split actually lands.
+#
+# Format: <relative path>|<function name>, one per declared writable Load. The
+# annotation requirement is per FILE and counted, so removing the annotation on
+# the second Load in a file is caught, not just the first.
+set(declared_load_repairs
+    main/word_study_store.cpp|LoadSessionSlotRaw
+    main/word_study_store.cpp|LoadSessionTransaction
+    main/note_store.cpp|LoadSessionRaw
+    main/note_store.cpp|LoadSessionTransaction
+    main/note_pack.cpp|LoadNoteImageTransaction
+    main/note_pack.cpp|LoadCachedNoteImage)
+
+set(load_repair_files "")
+foreach(entry IN LISTS declared_load_repairs)
+    string(REPLACE "|" ";" parts "${entry}")
+    list(GET parts 0 repair_file)
+    if(NOT repair_file IN_LIST load_repair_files)
+        list(APPEND load_repair_files "${repair_file}")
+    endif()
+endforeach()
+
+foreach(repair_file IN LISTS load_repair_files)
+    set(repair_required 0)
+    foreach(entry IN LISTS declared_load_repairs)
+        string(REPLACE "|" ";" parts "${entry}")
+        list(GET parts 0 declared_file)
+        if(declared_file STREQUAL repair_file)
+            math(EXPR repair_required "${repair_required} + 1")
+        endif()
+    endforeach()
+
+    wqn_read("${repair_file}" contents)
+
+    # Every declared function must still be defined here -- a rename, or a split
+    # into a pure read plus a separate repair, has to update this list rather
+    # than leave a stale entry pointing at nothing.
+    foreach(entry IN LISTS declared_load_repairs)
+        string(REPLACE "|" ";" parts "${entry}")
+        list(GET parts 0 declared_file)
+        list(GET parts 1 declared_function)
+        if(declared_file STREQUAL repair_file)
+            string(FIND "${contents}" "esp_err_t ${declared_function}(" definition_at)
+            if(definition_at EQUAL -1)
+                message(FATAL_ERROR
+                    "M8 architecture gate: ${repair_file}: rule LOAD-REPAIR: ${declared_function} is declared as a writable Load but is no longer defined -- update declared_load_repairs when the read/write split lands")
+            endif()
+        endif()
+    endforeach()
+
+    string(REGEX MATCHALL "\\[load-repair\\]" repair_markers "${contents}")
+    list(LENGTH repair_markers repair_marker_count)
+    if(repair_marker_count LESS repair_required)
+        message(FATAL_ERROR
+            "M8 architecture gate: ${repair_file}: rule LOAD-REPAIR: ${repair_required} writable Load(s) but ${repair_marker_count} // [load-repair] annotation(s) -- name the write each one performs")
     endif()
 endforeach()
 

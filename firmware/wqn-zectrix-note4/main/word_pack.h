@@ -88,6 +88,9 @@ struct WordPackIndex {
 };
 
 esp_err_t InitWordPackStorage();
+// [dev-diag] Drops only the manifest (cheap), leaving the pack files for the
+// pack sync to clear on its lane. See the .cpp for the measured difference.
+esp_err_t InvalidateWordPackManifest();
 esp_err_t ResetWordPackStorageCache();
 esp_err_t LoadWordPackManifest(WqnWordPackManifest* manifest);
 esp_err_t MergeWordPackManifestDelta(
@@ -107,5 +110,6 @@ esp_err_t DownloadWordPackToStorage(
     const WqnWordPackManifestItem& item);
 bool WordPackNeedsDownload(const WqnWordPackManifestItem& item);
 esp_err_t ReadWordPackEntry(const WordPackIndexEntry& index_entry, WqnWordEntry* entry);
+esp_err_t ReadWordPackEntryPrefetch(const WordPackIndexEntry& index_entry, WqnWordEntry* entry);
 
 }  // namespace wqn

@@ -19,6 +19,7 @@
 #include "text_render.h"
 #include "time_app.h"
 #include "ui/markdown_layout.h"
+#include "ui/ui_gates_selftest.h"
 #include "word_app.h"
 #include "wqn_api.h"
 #include "wqn_api_stream_internal.h"
@@ -1873,6 +1874,56 @@ constexpr char kAgentErrorRetryStream[] = R"json([
   { "event": "agent.status", "data": { "status": "idle", "message": "执行完成" } }
 ])json";
 
+// `valid/round-boundary-stream.json`. The frame pair that ends every round at
+// detail >= 1, and the reason the C1/C2 pair of this plan had to ship in order:
+// the gateway emits BOTH channels' commit frame with an empty string, and a
+// device that receives it before its firmware half has retired the round's
+// message ids writes the next round's answer into the entry still holding the
+// previous round's.
+//
+// The payload is legal -- the schema requires `text` present but puts no
+// minLength on it -- so this is a frame the parser must accept, not one it may
+// drop. This is the fixture the plan's §七 L2 called for: until it existed,
+// nothing on the host side had ever replayed an empty stream frame, and the
+// whole of Stage A went in with zero parser coverage. The one "text": "" that
+// did exist here is a history assistant row, which is a different shape over a
+// different route.
+constexpr char kAgentRoundBoundaryStream[] = R"json([
+  { "event": "agent.accepted", "data": {} },
+  { "event": "agent.status", "data": { "status": "running", "message": "已接取任务" } },
+  { "event": "agent.reasoning.delta", "data": { "delta": "第一轮：先判断极限类型。" } },
+  { "event": "agent.text.delta", "data": { "delta": "第一种做法是洛必达法则。" } },
+  { "event": "agent.reasoning", "data": { "text": "" } },
+  { "event": "agent.text", "data": { "text": "" } },
+  { "event": "agent.reasoning.delta", "data": { "delta": "第二轮：再检查分母导数。" } },
+  { "event": "agent.text.delta", "data": { "delta": "分子分母同时求导。" } },
+  { "event": "agent.reasoning", "data": { "text": "" } },
+  { "event": "agent.text", "data": { "text": "" } },
+  { "event": "agent.status", "data": { "status": "idle", "message": "执行完成" } }
+])json";
+
+// `valid/accepted-without-data-stream.json`. The shape that proved the parser
+// disagreed with its own schema. streamFrame requires only `event` and lists
+// `data` as optional, with the description "Empty for the two acknowledgements" --
+// so a gateway that omits the field entirely is conformant, and the device parsed
+// an absent payload as an empty JSON document, got null, and dropped BOTH
+// acknowledgements as invalid_response. Losing `agent.accepted` loses the
+// transition into kRunning and "Agent 执行中"; losing `agent.attached` loses the
+// one frame that says the observe stream is connected. Neither had a symptom the
+// user could report beyond "nothing happened", which is why nothing caught it.
+//
+// Note how the first two frames differ from every other fixture in this file:
+// they carry NO `data` key, and ReplayAgentStream hands the parser an empty string
+// for exactly that reason. `"data": {}` was always accepted -- this fixture is
+// the case that was not.
+constexpr char kAgentAcceptedWithoutDataStream[] = R"json([
+  { "event": "agent.accepted" },
+  { "event": "agent.attached" },
+  { "event": "agent.status", "data": { "status": "running", "message": "已在别处开始" } },
+  { "event": "agent.text.delta", "data": { "delta": "继续整理第 2 题。" } },
+  { "event": "agent.status", "data": { "status": "idle", "message": "观察结束" } }
+])json";
+
 // `valid/history-response.json`.
 constexpr char kAgentHistory[] = R"json({
   "success": true,
@@ -1909,6 +1960,79 @@ constexpr char kAgentRunRequestWithId[] = R"json({
   "text": "帮我把这道极限题的步骤整理成错题本",
   "confirmed": true,
   "request_id": "0123456789abcdef"
+})json";
+
+// `valid/sessions-list-response.json`. Until the row walk was split out of
+// ListOpenCodeSessions into ParseOpenCodeSessionsBody, ZERO assertions in this
+// self-test touched `outcome` -- the field the picker's 运行中 marker is drawn
+// from and the field AgentRunInFlightLocked reads to decide whether the device
+// sleeps. Four rows on purpose, because each is a different answer:
+//   running    -> kRunning  : the only value that produces a marker or holds a lease
+//   succeeded  -> kSucceeded: settled, no marker
+//   unknown    -> kUnknown  : the explicit unknown
+//   absent     -> kUnknown  : a relay predating the field, and it must still load
+constexpr char kAgentSessionsList[] = R"json({
+  "success": true,
+  "data": {
+    "sessions": [
+      {
+        "id": "ses_01J8ZQ4K7V2N9X0M3B6C5D4E7F",
+        "title": "考研数学 · 强化班错题整理",
+        "updatedAt": 1758432000000,
+        "outcome": "running"
+      },
+      {
+        "id": "ses_01J8ZQ4K7V2N9X0M3B6C5D4E8A",
+        "title": "英语作文批改",
+        "updatedAt": 1758345600000,
+        "outcome": "succeeded"
+      },
+      {
+        "id": "ses_01J8ZQ4K7V2N9X0M3B6C5D4E9B",
+        "title": "新 Session",
+        "updatedAt": 1758262400000,
+        "outcome": "unknown"
+      },
+      {
+        "id": "ses_01J8ZQ4K7V2N9X0M3B6C5D4EAC",
+        "updatedAt": 1758178800000
+      }
+    ]
+  }
+})json";
+
+// `invalid/sessions-list-bad-outcome.json`. INVALID per the schema -- `outcome`
+// is an enum of five values (running / succeeded / interrupted / failed /
+// unknown), and "running-maybe" is not one of them, which is why this file
+// lives under `invalid/` and not `valid/`.
+//
+// The device must still NOT fail the request on it: the readable rows are worth
+// showing, and one unclassifiable row taking the whole picker down is strictly
+// worse than a missing marker. That tolerance is defence in depth, not a
+// reading of the schema -- a gateway running a newer vocabulary, or one that
+// predates this enum, sends exactly this shape. ParseSessionOutcome maps every
+// unrecognised value to kUnknown, which is also the direction that fails safe
+// for the sleep lease: no marker, no lease.
+//
+// This fixture is the zero-coverage bug's other half: without it,
+// "unknown maps to unknown" was an assumption rather than a measured fact.
+//
+// (The first version of this comment claimed the schema types `outcome` as an
+// open string. It does not -- it is the enum above. The behaviour being tested
+// was right; the reason written next to it was not, and a reader who trusted it
+// would conclude the fixture belonged in `valid/` and move it.)
+constexpr char kAgentSessionsBadOutcome[] = R"json({
+  "success": true,
+  "data": {
+    "sessions": [
+      {
+        "id": "ses_01J8ZQ4K7V2N9X0M3B6C5D4E7F",
+        "title": "x",
+        "updatedAt": 1758432000000,
+        "outcome": "running-maybe"
+      }
+    ]
+  }
 })json";
 
 // Replay one fixture's `{event, data}` pairs through the frame parser, handing
@@ -2242,6 +2366,215 @@ bool CheckAgentGatewayV0Contract()
         return false;
     }
 
+    // --- the round-boundary commit frames, both channels empty --------------
+    //
+    // Section seven item L2 of doc/1005: the gateway's round boundary is BOTH
+    // channels' commit frame sent with an empty string, and nothing on the host
+    // side had ever replayed one. The parser half is what lives here -- an empty
+    // `text` is schema-legal, so the frame must arrive as kText/kReasoning with
+    // an empty string, not as ESP_ERR_INVALID_RESPONSE. Dropping it would leave
+    // the device waiting for a boundary that never comes, which is the splice
+    // this plan exists to remove.
+    //
+    // What is deliberately NOT asserted here: the id retirement that C2 added on
+    // top of the parse (A4/A5/A6 in opencode_session.cpp). Those live in a
+    // static frame handler the fixture cannot reach, so this pins the wire half
+    // only. The invariant they must preserve -- "clear buffer and invalidate the
+    // id always appear together" -- is item L1's, and L1 extracted it as a pure
+    // function for exactly that reason.
+    int boundary_empty_text = 0;
+    int boundary_empty_reasoning = 0;
+    bool boundary_ok = true;
+    if (!ReplayAgentStream(kAgentRoundBoundaryStream,
+                           [&](int index, esp_err_t result, const wqn::OpenCodeEvent& event) {
+                               if (!Require(result == ESP_OK,
+                                            "agent round-boundary frame parses")) {
+                                   boundary_ok = false;
+                                   return false;
+                               }
+                               // Both channels' commit frames are the empty ones
+                               // at indices 4, 5, 8 and 9. The deltas around them
+                               // carry the round's text, so a parser that
+                               // silently swallowed an empty payload would still
+                               // see a plausible stream -- which is why the empty
+                               // ones are counted rather than assumed.
+                               if (index == 4 || index == 8) {
+                                   if (event.kind != wqn::OpenCodeEventKind::kReasoning ||
+                                       !event.text.empty()) {
+                                       boundary_ok = false;
+                                       return false;
+                                   }
+                                   ++boundary_empty_reasoning;
+                                   return true;
+                               }
+                               if (index == 5 || index == 9) {
+                                   if (event.kind != wqn::OpenCodeEventKind::kText ||
+                                       !event.text.empty()) {
+                                       boundary_ok = false;
+                                       return false;
+                                   }
+                                   ++boundary_empty_text;
+                                   return true;
+                               }
+                               // The deltas keep their payload: an empty-string
+                               // check alone cannot tell "the boundary frame"
+                               // from "every frame arrived blank".
+                               if (index == 2 && event.text != "第一轮：先判断极限类型。") {
+                                   boundary_ok = false;
+                                   return false;
+                               }
+                               if (index == 3 && event.text != "第一种做法是洛必达法则。") {
+                                   boundary_ok = false;
+                                   return false;
+                               }
+                               if (index == 6 && event.text != "第二轮：再检查分母导数。") {
+                                   boundary_ok = false;
+                                   return false;
+                               }
+                               if (index == 7 && event.text != "分子分母同时求导。") {
+                                   boundary_ok = false;
+                                   return false;
+                               }
+                               // The terminator is still idle: the boundary
+                               // frames are not the end of the stream, and
+                               // without this the device would sit out the
+                               // five-minute socket timeout.
+                               if (index == 10 &&
+                                   !Require(event.kind == wqn::OpenCodeEventKind::kStatus &&
+                                                    event.status == "idle",
+                                            "agent round-boundary stream still terminates on "
+                                            "idle")) {
+                                   boundary_ok = false;
+                                   return false;
+                               }
+                               return true;
+                           }) ||
+        !Require(boundary_ok, "agent round-boundary frames are accepted as empty") ||
+        !Require(boundary_empty_reasoning == 2,
+                 "agent round boundary empties the reasoning channel twice") ||
+        !Require(boundary_empty_text == 2,
+                 "agent round boundary empties the text channel twice")) {
+        return false;
+    }
+
+    // --- the two acknowledgements are legal with NO `data` at all ------------
+    //
+    // [contract-ack] The schema requires only `event`; `data` is optional and
+    // described as "Empty for the two acknowledgements". The parser used to
+    // parse the absent payload as an empty document and drop the frame as
+    // invalid_response, so a conformant gateway lost both acknowledgements. The
+    // positives below pin the fix; the negatives pin the line it is NOT allowed
+    // to cross, because accepting an empty payload for an event whose data the
+    // schema requires would silently swallow a frame the device needs but cannot
+    // act on -- a delta with no text is a dropped answer, not an empty one.
+    {
+        bool ack_ok = true;
+        int ack_frames = 0;
+        int accepted_seen = 0;
+        int attached_seen = 0;
+        if (!ReplayAgentStream(kAgentAcceptedWithoutDataStream,
+                               [&](int index, esp_err_t result,
+                                   const wqn::OpenCodeEvent& event) {
+                                   ++ack_frames;
+                                   if (!Require(result == ESP_OK,
+                                                "agent frame with absent data parses")) {
+                                       ack_ok = false;
+                                       return false;
+                                   }
+                                   if (index == 0) {
+                                       if (event.kind !=
+                                           wqn::OpenCodeEventKind::kAccepted) {
+                                           ack_ok = false;
+                                           return false;
+                                       }
+                                       ++accepted_seen;
+                                       return true;
+                                   }
+                                   if (index == 1) {
+                                       if (event.kind !=
+                                           wqn::OpenCodeEventKind::kAttached) {
+                                           ack_ok = false;
+                                           return false;
+                                       }
+                                       ++attached_seen;
+                                       return true;
+                                   }
+                                   // The stream is still a well-formed run
+                                   // around the two bare frames: the terminator
+                                   // matters most, since a stream that does not
+                                   // end on idle is stream_incomplete and the
+                                   // device sits out the socket timeout.
+                                   if (index == 2 &&
+                                       (event.kind != wqn::OpenCodeEventKind::kStatus ||
+                                        event.status != "running")) {
+                                       ack_ok = false;
+                                       return false;
+                                   }
+                                   if (index == 3 &&
+                                       (event.kind !=
+                                            wqn::OpenCodeEventKind::kTextDelta ||
+                                        event.text != "继续整理第 2 题。")) {
+                                       ack_ok = false;
+                                       return false;
+                                   }
+                                   if (index == 4 &&
+                                       (event.kind != wqn::OpenCodeEventKind::kStatus ||
+                                        event.status != "idle")) {
+                                       ack_ok = false;
+                                       return false;
+                                   }
+                                   return true;
+                               }) ||
+            !Require(ack_ok, "agent acknowledgements parse with no data") ||
+            !Require(ack_frames == 5, "agent ack stream replays all five frames") ||
+            !Require(accepted_seen == 1, "agent accepted survives an absent data") ||
+            !Require(attached_seen == 1, "agent attached survives an absent data")) {
+            return false;
+        }
+        // The negatives. Each is a direct call rather than a fixture, because
+        // none of them is a legal stream: they are the shapes the whitelist must
+        // still refuse, replayed one frame at a time.
+        wqn::OpenCodeEvent dropped;
+        if (!Require(wqn::ParseOpenCodeAgentFrame("agent.text", "", &dropped) ==
+                         ESP_ERR_INVALID_RESPONSE,
+                     "agent text with absent data is refused") ||
+            !Require(wqn::ParseOpenCodeAgentFrame("agent.status", "", &dropped) ==
+                         ESP_ERR_INVALID_RESPONSE,
+                     "agent status with absent data is refused") ||
+            !Require(wqn::ParseOpenCodeAgentFrame(
+                         "agent.not_a_real_event", "{}", &dropped) ==
+                         ESP_ERR_NOT_SUPPORTED,
+                     "an unknown agent event is refused as unsupported")) {
+            return false;
+        }
+    }
+
+    // --- an absent `text` reads as an empty one, and that is the safe way ---
+    //
+    // Noted here because the replay above cannot tell the two apart, and a
+    // reader who assumes the parser checks presence would conclude this fixture
+    // proves something it does not. JsonString returns "" for a missing key, so
+    // `{"text": ""}` and `{}` both arrive as kText with an empty string.
+    //
+    // The direction is the safe one: reading an absent field as empty can only
+    // cause an EXTRA round boundary -- retire the id, clear the visible buffer,
+    // let the next delta append at the tail -- whereas treating an empty string
+    // as absent would skip a boundary the cloud really sent and reproduce the
+    // splice this plan removes. The same tolerance the status frame has always
+    // had. Adding a presence check would be the stricter-looking and wronger
+    // choice.
+    wqn::OpenCodeEvent absent_text_event;
+    if (!Require(
+            wqn::ParseOpenCodeAgentFrame("agent.text", R"json({})json",
+                                         &absent_text_event) == ESP_OK,
+            "agent text without a payload still parses") ||
+        !Require(absent_text_event.kind == wqn::OpenCodeEventKind::kText,
+                 "agent text without a payload is still a text frame") ||
+        !Require(absent_text_event.text.empty(),
+                 "agent text without a payload reads as empty")) {
+        return false;
+    }
+
     // --- `fatal` is opt-out: absent means the run is over --------------------
     //
     // A gateway that predates the field must keep its original meaning, so an
@@ -2331,10 +2664,17 @@ bool CheckAgentGatewayV0Contract()
         return false;
     }
 
-    // --- question without options: the fixture's negative case --------------
+    // --- question without options: the abort-only ask ----------------------
     //
-    // The gateway is what projects a form into two options, so a question frame
-    // with none is a malformed frame, not a question with no choices.
+    // A form field with nothing to choose between projects to an EMPTY option
+    // list, not to a malformed frame: the ask must still reach the UI so the
+    // user can escape it (opencode_client.cpp states this as the contract). Only
+    // a missing question_id makes the frame unanswerable.
+    //
+    // This block used to assert the opposite -- "a question frame with none is a
+    // malformed frame" -- which 56c87bd invalidated when it made empty options
+    // valid. The stale assertion kept the whole boot self-test red, which in turn
+    // masked every check appended after it in the chain.
     std::string empty_options = kAgentQuestionStream;
     const size_t options_start = empty_options.find("\"options\": [");
     if (!Require(options_start != std::string::npos, "agent options mutation anchor")) {
@@ -2357,8 +2697,26 @@ bool CheckAgentGatewayV0Contract()
     cJSON_Delete(frames);
     if (!Require(
             wqn::ParseOpenCodeAgentFrame("agent.question", question_data, &unknown_event) ==
-                ESP_ERR_INVALID_RESPONSE,
-            "agent question with no options is rejected")) {
+                ESP_OK,
+            "agent question with no options parses as the abort-only ask") ||
+        !Require(unknown_event.kind == wqn::OpenCodeEventKind::kQuestion,
+                 "abort-only ask is still a question") ||
+        !Require(unknown_event.question_options.empty(),
+                 "abort-only ask carries no options")) {
+        return false;
+    }
+
+    // --- question without an id: unanswerable, so refused -------------------
+    //
+    // The reply route needs the id, so arming an id-less ask would hold the
+    // option bar for the rest of the run with no way to clear it. This is the
+    // genuine negative case for the question frame.
+    if (!Require(
+            wqn::ParseOpenCodeAgentFrame(
+                "agent.question",
+                R"json({"session_id":"ses_a","title":"哪个？","options":[]})json",
+                &unknown_event) == ESP_ERR_INVALID_RESPONSE,
+            "agent question without an id is rejected")) {
         return false;
     }
 
@@ -2468,6 +2826,202 @@ bool CheckAgentGatewayV0Contract()
         return false;
     }
 
+    // --- session list, and the outcome field the picker reads ----------------
+    //
+    // [outcome-coverage] `outcome` had no coverage of any kind. It is the field
+    // the picker's 运行中 marker is drawn from AND the field AgentRunInFlightLocked
+    // reads to decide whether the device holds its sleep lease -- so the one
+    // table with a power consequence was the one table nothing replayed. These
+    // assertions go through the real row walk (ParseOpenCodeSessionsBody),
+    // which exists now precisely so they can.
+    {
+        std::vector<wqn::OpenCodeSessionInfo> sessions;
+        wqn::OpenCodeResult list_result;
+        if (!Require(wqn::ParseOpenCodeSessionsBody(kAgentSessionsList, &sessions,
+                                                    &list_result) == ESP_OK,
+                     "agent session list parses") ||
+            !Require(sessions.size() == 4, "agent session list row count") ||
+            !Require(sessions[0].id == "ses_01J8ZQ4K7V2N9X0M3B6C5D4E7F",
+                     "agent session list first id") ||
+            !Require(sessions[0].title == "考研数学 · 强化班错题整理",
+                     "agent session list title") ||
+            !Require(sessions[0].updated_at == 1758432000000LL,
+                     "agent session list updatedAt") ||
+            !Require(sessions[0].outcome == wqn::OpenCodeSessionOutcome::kRunning,
+                     "agent session outcome running") ||
+            !Require(sessions[1].outcome == wqn::OpenCodeSessionOutcome::kSucceeded,
+                     "agent session outcome succeeded") ||
+            !Require(sessions[2].outcome == wqn::OpenCodeSessionOutcome::kUnknown,
+                     "agent session outcome unknown") ||
+            // The relay that predates the field: absent is kUnknown, and the row
+            // must still be offered. A device that dropped it would hide every
+            // session an older gateway created.
+            !Require(sessions[3].outcome == wqn::OpenCodeSessionOutcome::kUnknown,
+                     "agent session absent outcome is unknown") ||
+            !Require(sessions[3].title.empty(), "agent session absent title is empty")) {
+            return false;
+        }
+        // The unrecognised value is not an error. One bad row costs a missing
+        // marker; failing the request would cost the whole picker.
+        if (!Require(wqn::ParseOpenCodeSessionsBody(kAgentSessionsBadOutcome, &sessions,
+                                                    &list_result) == ESP_OK,
+                     "agent session list accepts an unknown outcome") ||
+            !Require(sessions.size() == 1, "agent unknown outcome keeps its row") ||
+            !Require(sessions[0].outcome == wqn::OpenCodeSessionOutcome::kUnknown,
+                     "agent unknown outcome maps to unknown")) {
+            return false;
+        }
+        // The table itself, one call per value. The point of pinning it directly
+        // rather than only through the fixture: the fixture proves the row walk,
+        // and these prove the mapping, so a future edit that adds a value to the
+        // enum and forgets the table fails here rather than on a device.
+        if (!Require(wqn::ParseSessionOutcome("running") ==
+                         wqn::OpenCodeSessionOutcome::kRunning &&
+                     wqn::ParseSessionOutcome("succeeded") ==
+                         wqn::OpenCodeSessionOutcome::kSucceeded &&
+                     wqn::ParseSessionOutcome("interrupted") ==
+                         wqn::OpenCodeSessionOutcome::kInterrupted &&
+                     wqn::ParseSessionOutcome("failed") ==
+                         wqn::OpenCodeSessionOutcome::kFailed &&
+                     wqn::ParseSessionOutcome("unknown") ==
+                         wqn::OpenCodeSessionOutcome::kUnknown &&
+                     wqn::ParseSessionOutcome("") ==
+                         wqn::OpenCodeSessionOutcome::kUnknown &&
+                     wqn::ParseSessionOutcome("Running") ==
+                         wqn::OpenCodeSessionOutcome::kUnknown &&
+                     wqn::ParseSessionOutcome("running-maybe") ==
+                         wqn::OpenCodeSessionOutcome::kUnknown,
+                     "agent outcome table maps every value and only those")) {
+            return false;
+        }
+        // A body that is not a session list is refused, not rendered as empty --
+        // an empty picker and a network failure would look the same on screen.
+        if (!Require(wqn::ParseOpenCodeSessionsBody(R"json({"data":{"sessions":{}}})json",
+                                                   &sessions,
+                                                   &list_result) ==
+                         ESP_ERR_INVALID_RESPONSE,
+                     "agent session list rejects non-array sessions")) {
+            return false;
+        }
+    }
+
+    // --- the question frame's size bound -------------------------------------
+    //
+    // [bounds] The manifest's `question_frame_bytes`. This is NOT a golden
+    // conformant frame: the labels below are 1400 characters, over the schema's
+    // 120, precisely to reach 10 KiB so the bound can be crossed at all.
+    //
+    // What is asserted CHANGED. This block used to require
+    // ESP_ERR_INVALID_SIZE, on the reasoning that the bound was unreachable by
+    // a conformant peer ("~3.7 KB at the very most"). That was measured in
+    // ASCII only. `maxLength` counts code points and the wire is UTF-8, so the
+    // worst schema-legal questionData is 3,673 B all-ASCII, 10,265 B with CJK
+    // and 13,561 B with astral characters -- against a 10,240 B bound. CJK is
+    // the ordinary case for this product. And refusing the frame dropped the
+    // ask (DispatchAgentEvent logs and returns; it does not end the stream), so
+    // the run continued with no reply ever POSTed and the user never saw the
+    // question -- the exact outcome "an ask the user cannot dismiss" was
+    // supposed to prevent, produced by the guard.
+    //
+    // So the frame is now parsed anyway, and this asserts that plus the two
+    // things that make it safe: the options survive the over-bound parse, and
+    // the ask is still answerable (its id is what the reply routes on). The
+    // size assertion before the parse is what keeps the fixture honest: if the
+    // construction ever stops clearing the bound, the self-test fails here
+    // instead of quietly passing.
+    {
+        wqn::OpenCodeEvent oversized_question;
+        std::string big_options;
+        for (int i = 0; i < 8; ++i) {
+            big_options += "{\"value\":\"v" + std::to_string(i) + "\",\"label\":\"";
+            big_options.append(1400, 'x');
+            big_options += "\"},";
+        }
+        big_options.pop_back();
+        const std::string question_body =
+            R"json({"session_id":"ses_01J8ZQ4K7V2N9X0M3B6C5D4E7F","question_id":"frm_01J8ZQ5R8W3P1Y4N7C0D2E6F9G#0","title":"t","options":[)json" +
+            big_options + "]}";
+        if (!Require(question_body.size() > 10 * 1024,
+                     "agent question fixture is over the bound") ||
+            !Require(wqn::ParseOpenCodeAgentFrame("agent.question", question_body,
+                                                  &oversized_question) == ESP_OK,
+                     "agent question frame over the bound is parsed, not refused") ||
+            !Require(oversized_question.kind ==
+                         wqn::OpenCodeEventKind::kQuestion,
+                     "agent over-bound question is still an ask") ||
+            !Require(oversized_question.question_id ==
+                         "frm_01J8ZQ5R8W3P1Y4N7C0D2E6F9G#0",
+                     "agent over-bound question keeps the id the reply routes on") ||
+            !Require(oversized_question.question_options.size() == 8,
+                     "agent over-bound question keeps all eight options")) {
+            return false;
+        }
+    }
+
+    // --- the same bound, crossed by a frame the schema ALLOWS -----------------
+    //
+    // [bounds] The bug the oversized block above used to be testing for the
+    // wrong reason. Its comment claimed the bound was unreachable by a
+    // conformant peer, having measured only the ASCII worst case (3,673 B). It
+    // is not: `maxLength` counts code points and the wire is UTF-8, so the worst
+    // schema-legal questionData is 10,265 B with CJK and 13,561 B with astral
+    // characters, against a 10,240 B bound.
+    //
+    // This frame is built at EXACTLY the schema's ceilings -- session_id 128
+    // ASCII (the pattern forces it), question_id 128, title 160, 8 options of
+    // value 256 + label 120 -- with a 3-byte character. It is schema-LEGAL, it
+    // is 25 bytes over the bound, and the old code refused it with
+    // ESP_ERR_INVALID_SIZE, which dropped the ask and stalled the run. For a
+    // Chinese-language product this is the ordinary frame, not a hostile one.
+    {
+        wqn::OpenCodeEvent cjk_question;
+        // One UTF-8 encoded CJK character (3 bytes) as a STRING literal. A
+        // narrow char literal would be a multi-character constant -- the
+        // compiler is happy to fold the three bytes into one int and then
+        // truncate it, which is how the first version of this block built a
+        // string of 0xAD.
+        const char kCjkUnit[] = "\u4e2d";
+        const auto kCjkRepeat = [&kCjkUnit](int count) {
+            std::string out;
+            out.reserve(static_cast<size_t>(count) * 3);
+            for (int i = 0; i < count; ++i) {
+                out += kCjkUnit;
+            }
+            return out;
+        };
+        const std::string kCjkQuestionId = kCjkRepeat(128);
+        const std::string kCjkTitle = kCjkRepeat(160);
+        const std::string kCjkValue = kCjkRepeat(256);
+        const std::string kCjkLabel = kCjkRepeat(120);
+        std::string cjk_options;
+        for (int i = 0; i < 8; ++i) {
+            cjk_options += "{\"value\":\"" + kCjkValue + "\",\"label\":\"" +
+                           kCjkLabel + "\"},";
+        }
+        cjk_options.pop_back();
+        const std::string cjk_question_body =
+            "{\"session_id\":\"ses_" + std::string(124, 'a') + "\",\"question_id\":\"" +
+            kCjkQuestionId + "\",\"title\":\"" + kCjkTitle + "\",\"options\":[" +
+            cjk_options + "]}";
+        if (!Require(cjk_question_body.size() > 10 * 1024,
+                     "agent CJK question fixture is over the bound") ||
+            !Require(cjk_question_body.size() < 16 * 1024,
+                     "agent CJK question fixture still fits the SSE budget") ||
+            !Require(wqn::ParseOpenCodeAgentFrame("agent.question", cjk_question_body,
+                                                  &cjk_question) == ESP_OK,
+                     "agent schema-legal CJK question is parsed, not refused") ||
+            !Require(cjk_question.question_id == kCjkQuestionId,
+                     "agent CJK question keeps its 128-char id") ||
+            !Require(cjk_question.text == kCjkTitle,
+                     "agent CJK question keeps its 160-char title") ||
+            !Require(cjk_question.question_options.size() == 8,
+                     "agent CJK question keeps all eight options") ||
+            !Require(cjk_question.question_options[0].label == kCjkLabel,
+                     "agent CJK question keeps its 120-char label")) {
+            return false;
+        }
+    }
+
     // --- run request idempotency key: 16 lowercase hex chars ----------------
     //
     // The schema carries the pattern but nothing in the firmware validates a
@@ -2517,7 +3071,7 @@ namespace wqn {
 
 bool RunContractFixtureSelfTest()
 {
-    const bool ok =
+    bool contract_ok =
         CheckPollPaired() &&
         CheckPollNoPending() &&
         CheckPollAlreadyPaired() &&
@@ -2539,6 +3093,14 @@ bool RunContractFixtureSelfTest()
         RunWordPageStateSelfTest() &&
         RunNotePageStateSelfTest() &&
         RunProblemPageStateSelfTest();
+
+    // [ui-gates] Runs OUTSIDE the && chain on purpose. The chain short-circuits
+    // on the first failing contract check, and one contract fixture was already
+    // red on the agent gateway, so a gate assertion appended to the end was
+    // never reached -- the §4.2 acceptance tests were silent on exactly the
+    // device that needed them. A red contract must not hide a red gate.
+    const bool gates_ok = RunUiGateSelfTest();
+    const bool ok = contract_ok && gates_ok;
 
     if (ok) {
         ESP_LOGI(kTag, "contract fixture self-test passed");

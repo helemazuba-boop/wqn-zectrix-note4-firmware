@@ -331,7 +331,6 @@ bool UpdateNoteTransferProgress(
 // window: the display loop holds the loading-page commit briefly so a fast
 // cache hit paints the image with ONE full refresh instead of two.
 bool NoteImageLoadingGraceActive(const NoteAppState& state, int64_t now_us);
-void RefreshNoteOutboxState(NoteAppState* state);
 NoteAppSnapshot BuildNoteAppSnapshot(const NoteAppState& state);
 std::string NoteAppStatusLine(const NoteAppState& state);
 std::string NoteAppSignature(const NoteAppState& state);
