@@ -198,16 +198,17 @@ class Session {
 
     // The kTool branch's "different call" path: close the previous block
     // unconditionally (CloseAgentToolBlockLocked early-returns when nothing is
-    // open), drop the accumulated answer text, then open a new block.
+    // open), drop both accumulated text buffers, then open a new block.
     void ToolBoundary()
     {
         history.CloseToolBlock();
         bool assistant_flag = assistant_open;
         bool thinking_flag = thinking_open;
-        wqn::AgentRoundToolBoundary(answer, assistant_flag, thinking_flag);
+        wqn::AgentRoundToolBoundary(answer, thinking, assistant_flag, thinking_flag);
         CHECK(!assistant_flag);
         CHECK(!thinking_flag);
         CHECK(answer.empty());
+        CHECK(thinking.empty());
         assistant_open = false;
         thinking_open = false;
         history.assistant = -1;
@@ -412,14 +413,21 @@ void TestBoundedAppendMirrorsInPlace()
     full.ReasoningDelta("0123456789");
     CHECK(full.thinking.size() == thinking_budget);
     CHECK(full.history.entries().size() == 1);
+    full.ReasoningDelta("MORE");
+    CHECK(full.thinking == "01234567");
+    CHECK(full.history.entries().size() == 1);
     full.ToolBoundary();
     CHECK(full.tool_open);
     full.ReasoningDelta("MORE");
-    CHECK(full.thinking.size() == thinking_budget);
-    // The tool block is still open: the thinking channel did not mirror, so it
-    // did not close it either.
-    CHECK(full.tool_open);
-    CHECK(full.history.entries().size() == 2);
+    // A tool boundary gives the next segment its own budget, even when the
+    // previous thinking segment exhausted its budget completely.
+    CHECK(full.thinking == "MORE");
+    CHECK(!full.tool_open);
+    CHECK(full.history.entries().size() == 4);
+    CHECK(full.history.entries()[0].text == ThinkingLabel("01234567"));
+    if (full.history.entries().size() == 4) {
+        CHECK(full.history.entries()[3].text == ThinkingLabel("MORE"));
+    }
 
     // The answer channel on the same shape DOES mirror, and does close it.
     Session answer_side(wqn::AgentRoundBudgets{2, thinking_budget, wqn::kMaxThinkingBytes});
@@ -492,6 +500,33 @@ void TestOpOrderAndExclusivity()
     }
 }
 
+// Reasoning on both sides of multiple tools must stay in distinct bubbles.
+// The cloud does not send an empty reasoning frame at these tool boundaries.
+void TestThinkingAcrossTools()
+{
+    Session session(BudgetsFor(2));
+    session.ReasoningDelta("BEFORE");
+    session.TextDelta("ANSWER-BEFORE");
+    session.ToolBoundary();
+    session.ReasoningDelta("AFTER-");
+    session.ReasoningDelta("ONE");
+    CHECK(session.thinking == "AFTER-ONE");
+    session.TextDelta("ANSWER-AFTER");
+    session.ToolBoundary();
+    session.ReasoningDelta("LAST");
+    CHECK(session.thinking == "LAST");
+    CHECK(session.history.Bubbles() == "ANSWER-BEFORE|ANSWER-AFTER");
+
+    std::vector<std::string> thinking_bubbles;
+    for (const auto& entry : session.history.entries()) {
+        if (entry.kind == "thinking") {
+            thinking_bubbles.push_back(entry.text);
+        }
+    }
+    CHECK(thinking_bubbles == std::vector<std::string>({
+        ThinkingLabel("BEFORE"), ThinkingLabel("AFTER-ONE"), ThinkingLabel("LAST")}));
+}
+
 }  // namespace
 
 int main()
@@ -502,6 +537,7 @@ int main()
     TestRoundShapeMatrix();
     TestBoundedAppendMirrorsInPlace();
     TestOpOrderAndExclusivity();
+    TestThinkingAcrossTools();
     std::printf("%d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
 }

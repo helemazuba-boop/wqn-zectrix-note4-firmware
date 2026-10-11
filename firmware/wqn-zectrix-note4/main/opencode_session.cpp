@@ -1547,8 +1547,8 @@ void OnOpenCodeEvent(const wqn::OpenCodeEvent& event, void*)
                 // in agent_round_policy.h, so the host matrix covers the pair.
                 bool assistant_open = (g_agent_assistant_id != wqn::kInvalidChatMessageId);
                 bool thinking_open = (g_agent_thinking_id != wqn::kInvalidChatMessageId);
-                wqn::AgentRoundToolBoundary(g_state.ui.response_text, assistant_open,
-                                            thinking_open);
+                wqn::AgentRoundToolBoundary(g_state.ui.response_text, g_agent_thinking_text,
+                                            assistant_open, thinking_open);
                 // The close above retires both entries only when a block was
                 // actually open, so this write-back is load-bearing for the
                 // first tool frame of a run rather than being belt and braces.

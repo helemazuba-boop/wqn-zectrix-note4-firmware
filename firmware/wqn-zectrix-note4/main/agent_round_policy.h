@@ -243,10 +243,12 @@ inline AgentRoundOps ApplyAgentRoundFrame(std::string& answer,
 }
 
 inline void AgentRoundToolBoundary(std::string& answer,
+                                   std::string& thinking,
                                    bool& assistant_entry_open,
                                    bool& thinking_entry_open)
 {
     answer.clear();
+    thinking.clear();
     assistant_entry_open = false;
     thinking_entry_open = false;
 }
