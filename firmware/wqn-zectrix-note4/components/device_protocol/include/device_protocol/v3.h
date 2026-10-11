@@ -65,17 +65,44 @@ struct BootstrapData {
     uint64_t sync_cursor = 0;
 };
 
+enum class SyncContentKind : uint8_t {
+    kUnknown,
+    kProblems,
+    kTodos,
+    kWords,
+    kWordPacks,
+    kNotePacks,
+    kProblemPacks,
+};
+
+struct SyncContentTarget {
+    SyncContentKind kind = SyncContentKind::kUnknown;
+    uint64_t revision = 0;
+    std::string cursor;
+};
+
 struct SyncData {
     uint64_t config_revision = 0;
     uint64_t sync_cursor = 0;
     uint32_t auto_sync_interval_minutes = 0;
     int todo_count = 0;
     int word_due_count = 0;
+    // Mistakes-mode pool size (words answered "unknown" that are not mastered
+    // yet). -1 means an older server omitted the field; the home card then
+    // falls back to the pack size instead of advertising an unknown pool.
+    int word_mistake_count = -1;
     std::vector<std::string> due_problem_ids;
+    // Additive v3 content targets. Older servers may omit the field and
+    // older firmware ignores unknown kinds, so control sync remains
+    // backwards-compatible while the coordinator converges packs by target.
+    std::vector<SyncContentTarget> content_targets;
 };
 
 esp_err_t BuildBootstrapRequest(const RequestMetadata& metadata, std::string* body);
-esp_err_t BuildSyncRequest(const RequestMetadata& metadata, std::string* body);
+esp_err_t BuildSyncRequest(
+    const RequestMetadata& metadata,
+    uint32_t auto_sync_interval_minutes,
+    std::string* body);
 esp_err_t BuildClaimStartRequest(
     const RequestMetadata& metadata,
     const std::string& hardware_id,

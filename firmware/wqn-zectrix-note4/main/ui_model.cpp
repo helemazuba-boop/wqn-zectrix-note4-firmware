@@ -5,12 +5,15 @@
 
 #include "ai_session.h"
 #include "display_service.h"
+#include "esp_log.h"
 #include "flash_session.h"
+#include "opencode_session.h"
+#include "ui/persist_worker.h"
 #include "provision_manager.h"
+#include "stdpro_ws_transport.h"
 
 namespace {
 
-constexpr size_t kPreviewChars = 96;
 constexpr int64_t kAiMockReplyDelayMs = 1300;
 
 bool DecodeUtf8(const char*& cursor, uint32_t* codepoint)
@@ -126,37 +129,29 @@ const char* ScreenName(wqn::UiScreen screen)
             return "单词";
         case wqn::UiScreen::kNote:
             return "笔记";
-        case wqn::UiScreen::kLibrary:
-            return "题库";
-        case wqn::UiScreen::kProblem:
-            return "题目";
-        case wqn::UiScreen::kSolution:
-            return "解析";
-        case wqn::UiScreen::kReviewQueue:
-            return "上传队列";
-        case wqn::UiScreen::kReviewScore:
-            return "复习反馈";
-        case wqn::UiScreen::kReviewQueued:
-            return "已记录";
         case wqn::UiScreen::kProvisioning:
             return "配网";
+        case wqn::UiScreen::kOpenCode:
+            // [agent] Unreachable reserved ID (the page now lives on the AI
+            // screen as AiTier::kAgent). Kept so the default-less switch stays
+            // exhaustive.
+            return "Agent";
     }
     return "WQN";
 }
 
+// Inverse of NextTopScreen: the page you would have come FROM by pressing
+// "next". These two must stay exact inverses -- when they agree, long-press Up
+// and long-press Down do the same thing and half the ring becomes unreachable.
+// Derivation after kOpenCode was demoted into the AI page: the forward ring is
+// Ai -> Settings -> Home -> Time -> Word -> Note -> Todo -> Ai, so the reverse
+// ring is that same list walked backwards.
 wqn::UiScreen PreviousTopScreen(wqn::UiScreen screen)
 {
     switch (screen) {
         case wqn::UiScreen::kAi:
             return wqn::UiScreen::kTodo;
         case wqn::UiScreen::kSettings:
-            return wqn::UiScreen::kAi;
-        case wqn::UiScreen::kLibrary:
-        case wqn::UiScreen::kProblem:
-        case wqn::UiScreen::kSolution:
-        case wqn::UiScreen::kReviewQueue:
-        case wqn::UiScreen::kReviewScore:
-        case wqn::UiScreen::kReviewQueued:
             return wqn::UiScreen::kAi;
         case wqn::UiScreen::kHome:
             return wqn::UiScreen::kSettings;
@@ -168,6 +163,10 @@ wqn::UiScreen PreviousTopScreen(wqn::UiScreen screen)
             return wqn::UiScreen::kWord;
         case wqn::UiScreen::kTodo:
             return wqn::UiScreen::kNote;
+        case wqn::UiScreen::kOpenCode:
+            // [agent] Reserved, unreachable. Kept so the default-less switch
+            // stays exhaustive; IsRestorableScreen rejects ID 14.
+            return wqn::UiScreen::kAi;
         case wqn::UiScreen::kProvisioning:
             return wqn::UiScreen::kHome;
     }
@@ -181,13 +180,6 @@ wqn::UiScreen NextTopScreen(wqn::UiScreen screen)
             return wqn::UiScreen::kSettings;
         case wqn::UiScreen::kSettings:
             return wqn::UiScreen::kHome;
-        case wqn::UiScreen::kLibrary:
-        case wqn::UiScreen::kProblem:
-        case wqn::UiScreen::kSolution:
-        case wqn::UiScreen::kReviewQueue:
-        case wqn::UiScreen::kReviewScore:
-        case wqn::UiScreen::kReviewQueued:
-            return wqn::UiScreen::kHome;
         case wqn::UiScreen::kHome:
             return wqn::UiScreen::kTime;
         case wqn::UiScreen::kTime:
@@ -198,36 +190,13 @@ wqn::UiScreen NextTopScreen(wqn::UiScreen screen)
             return wqn::UiScreen::kTodo;
         case wqn::UiScreen::kTodo:
             return wqn::UiScreen::kAi;
+        case wqn::UiScreen::kOpenCode:
+            // [agent] Reserved, unreachable. The ring is Ai -> Settings.
+            return wqn::UiScreen::kHome;
         case wqn::UiScreen::kProvisioning:
             return wqn::UiScreen::kHome;
     }
     return wqn::UiScreen::kHome;
-}
-
-wqn::ReviewChoice PreviousReviewChoice(wqn::ReviewChoice choice)
-{
-    switch (choice) {
-        case wqn::ReviewChoice::kWrong:
-            return wqn::ReviewChoice::kMastered;
-        case wqn::ReviewChoice::kNeedsReview:
-            return wqn::ReviewChoice::kWrong;
-        case wqn::ReviewChoice::kMastered:
-            return wqn::ReviewChoice::kNeedsReview;
-    }
-    return wqn::ReviewChoice::kNeedsReview;
-}
-
-wqn::ReviewChoice NextReviewChoice(wqn::ReviewChoice choice)
-{
-    switch (choice) {
-        case wqn::ReviewChoice::kWrong:
-            return wqn::ReviewChoice::kNeedsReview;
-        case wqn::ReviewChoice::kNeedsReview:
-            return wqn::ReviewChoice::kMastered;
-        case wqn::ReviewChoice::kMastered:
-            return wqn::ReviewChoice::kWrong;
-    }
-    return wqn::ReviewChoice::kNeedsReview;
 }
 
 void AddLine(wqn::UiFrame* frame, wqn::UiTextStyle style, const std::string& text)
@@ -236,28 +205,6 @@ void AddLine(wqn::UiFrame* frame, wqn::UiTextStyle style, const std::string& tex
         return;
     }
     frame->lines.push_back(wqn::UiLine{style, text});
-}
-
-const wqn::CachedProblem* SelectedProblem(const wqn::UiState& state)
-{
-    if (state.problems.empty() || state.selected_problem >= state.problems.size()) {
-        return nullptr;
-    }
-    return &state.problems[state.selected_problem];
-}
-
-std::string StatusLabel(const std::string& status)
-{
-    if (status == "wrong") {
-        return "错题";
-    }
-    if (status == "needs_review") {
-        return "待复习";
-    }
-    if (status == "mastered") {
-        return "已掌握";
-    }
-    return status;
 }
 
 void RenderAi(const wqn::UiState& state, wqn::UiFrame* frame)
@@ -356,145 +303,9 @@ void RenderNote(const wqn::UiState& state, wqn::UiFrame* frame)
     frame->problem_app = wqn::BuildProblemAppSnapshot(state.problem_app);
 }
 
-void RenderLibrary(const wqn::UiState& state, wqn::UiFrame* frame)
-{
-    AddLine(frame, wqn::UiTextStyle::kTitle, "错题列表");
-    if (state.problems.empty()) {
-        AddLine(frame, wqn::UiTextStyle::kWarning, "暂无本地题目");
-        AddLine(frame, wqn::UiTextStyle::kMeta, "配对后同步题目");
-        return;
-    }
-
-    const size_t window_start = state.selected_problem > 3 ? state.selected_problem - 3 : 0;
-    const size_t window_end = std::min(state.problems.size(), window_start + 7);
-    for (size_t i = window_start; i < window_end; ++i) {
-        const wqn::CachedProblem& problem = state.problems[i];
-        const std::string title = problem.title.empty() ? problem.id : problem.title;
-        const std::string status = problem.status.empty() ? "" : " [" + StatusLabel(problem.status) + "]";
-        const std::string prefix = i == state.selected_problem ? "> " : "  ";
-        AddLine(frame, i == state.selected_problem ? wqn::UiTextStyle::kSelected : wqn::UiTextStyle::kBody,
-                prefix + Truncate(title + status, 34));
-    }
-    AddLine(frame, wqn::UiTextStyle::kMeta,
-            std::to_string(state.selected_problem + 1) + "/" + std::to_string(state.problems.size()) +
-                "  确认：打开");
-}
-
-void RenderProblemDetail(const wqn::UiState& state, wqn::UiFrame* frame)
-{
-    const wqn::CachedProblem* problem = SelectedProblem(state);
-    AddLine(frame, wqn::UiTextStyle::kTitle, "题目");
-    if (problem == nullptr) {
-        AddLine(frame, wqn::UiTextStyle::kWarning, "未选择题目");
-        return;
-    }
-
-    AddLine(frame, wqn::UiTextStyle::kMeta, Truncate(problem->title.empty() ? problem->id : problem->title, 42));
-    if (!problem->type.empty()) {
-        AddLine(frame, wqn::UiTextStyle::kMeta, "类型：" + problem->type);
-    }
-    if (!problem->status.empty()) {
-        AddLine(frame, wqn::UiTextStyle::kMeta, "状态：" + StatusLabel(problem->status));
-    }
-    if (problem->asset_count > 0) {
-        AddLine(frame, wqn::UiTextStyle::kMeta, "图片：" + std::to_string(problem->asset_count) + " 张，待下载渲染");
-    }
-    AddLine(frame, wqn::UiTextStyle::kWrappedBody, Truncate(problem->content_text, kPreviewChars));
-    AddLine(frame, wqn::UiTextStyle::kMeta, "确认：解析  长按：题库");
-}
-
-void RenderSolution(const wqn::UiState& state, wqn::UiFrame* frame)
-{
-    const wqn::CachedProblem* problem = SelectedProblem(state);
-    AddLine(frame, wqn::UiTextStyle::kTitle, "解析");
-    if (problem == nullptr) {
-        AddLine(frame, wqn::UiTextStyle::kWarning, "未选择题目");
-        return;
-    }
-
-    AddLine(frame, wqn::UiTextStyle::kWrappedBody,
-            problem->solution_text.empty() ? "暂无解析文本" : Truncate(problem->solution_text, kPreviewChars));
-    if (problem->solution_asset_count > 0) {
-        AddLine(frame, wqn::UiTextStyle::kMeta, "解析图片：" + std::to_string(problem->solution_asset_count) + " 张，待下载渲染");
-    }
-    AddLine(frame, wqn::UiTextStyle::kMeta, "确认：复习反馈  长按：题库");
-}
-
-void RenderReviewQueue(const wqn::UiState& state, wqn::UiFrame* frame)
-{
-    AddLine(frame, wqn::UiTextStyle::kTitle, "上传队列");
-    AddLine(frame, wqn::UiTextStyle::kBody,
-            "待上传复习结果：" + std::to_string(state.status.pending_reviews));
-    AddLine(frame, wqn::UiTextStyle::kMeta,
-            state.status.pending_reviews > 0 ? "联网后自动上传" : "没有本地复习结果");
-    AddLine(frame, wqn::UiTextStyle::kMeta, "确认：题库  长按：状态");
-}
-
-void RenderReviewScore(const wqn::UiState& state, wqn::UiFrame* frame)
-{
-    const wqn::CachedProblem* problem = SelectedProblem(state);
-    AddLine(frame, wqn::UiTextStyle::kTitle, "复习反馈");
-    if (problem == nullptr) {
-        AddLine(frame, wqn::UiTextStyle::kWarning, "未选择题目");
-        return;
-    }
-
-    AddLine(frame, wqn::UiTextStyle::kMeta, Truncate(problem->title.empty() ? problem->id : problem->title, 42));
-    const wqn::ReviewChoice choices[] = {
-        wqn::ReviewChoice::kWrong,
-        wqn::ReviewChoice::kNeedsReview,
-        wqn::ReviewChoice::kMastered,
-    };
-    for (const wqn::ReviewChoice choice : choices) {
-        const bool selected = choice == state.selected_review;
-        AddLine(frame, selected ? wqn::UiTextStyle::kSelected : wqn::UiTextStyle::kBody,
-                std::string(selected ? "> " : "  ") + wqn::ReviewChoiceLabel(choice));
-    }
-    AddLine(frame, wqn::UiTextStyle::kMeta, "上下：选择  确认：保存");
-}
-
-void RenderReviewQueued(const wqn::UiState& state, wqn::UiFrame* frame)
-{
-    AddLine(frame, wqn::UiTextStyle::kTitle, "已记录");
-    if (!state.last_review_message.empty()) {
-        AddLine(frame, wqn::UiTextStyle::kBody, state.last_review_message);
-    } else {
-        AddLine(frame, wqn::UiTextStyle::kBody, "已保存，等待上传");
-    }
-    AddLine(frame, wqn::UiTextStyle::kMeta,
-            "待上传：" + std::to_string(state.status.pending_reviews));
-    AddLine(frame, wqn::UiTextStyle::kMeta, "确认：题库  上：题目");
-}
-
 }  // namespace
 
 namespace wqn {
-
-const char* ReviewChoiceLabel(ReviewChoice choice)
-{
-    switch (choice) {
-        case ReviewChoice::kWrong:
-            return "还是错了";
-        case ReviewChoice::kNeedsReview:
-            return "需要再复习";
-        case ReviewChoice::kMastered:
-            return "已经掌握";
-    }
-    return "需要再复习";
-}
-
-const char* ReviewChoiceStatus(ReviewChoice choice)
-{
-    switch (choice) {
-        case ReviewChoice::kWrong:
-            return "wrong";
-        case ReviewChoice::kNeedsReview:
-            return "needs_review";
-        case ReviewChoice::kMastered:
-            return "mastered";
-    }
-    return "needs_review";
-}
 
 size_t AiSessionTextPageCount(const AiSessionState& ai)
 {
@@ -537,19 +348,22 @@ void ClampUiSelection(UiState* state)
     } else if (state->selected_home_task >= state->home.tasks.size()) {
         state->selected_home_task = state->home.tasks.size() - 1;
     }
-    if (state->problems.empty()) {
-        state->selected_problem = 0;
-    } else if (state->selected_problem >= state->problems.size()) {
-        state->selected_problem = state->problems.size() - 1;
-    }
     if (state->todo.todos.empty()) {
         state->todo.selected = 0;
     } else if (state->todo.selected >= state->todo.todos.size()) {
         state->todo.selected = state->todo.todos.size() - 1;
     }
-    if (state->settings.selected >= 8) {
-        state->settings.selected = 7;
+    if (state->settings.selected >= kSettingsItemCount) {
+        state->settings.selected = kSettingsItemCount - 1;
     }
+    if (state->settings.dev_selected >= kDevItemCount) {
+        state->settings.dev_selected = kDevItemCount - 1;
+    }
+#if !CONFIG_WQN_DEV_MENU_ENABLE
+    // The dev list is only reachable through the flag-gated root row, so a
+    // firmware built without it must never be left in the second level.
+    state->settings.view = SettingsView::kRoot;
+#endif
     const size_t ai_pages = AiSessionPageCount(state->ai);
     if (state->ai.page >= ai_pages) {
         state->ai.page = ai_pages > 0 ? ai_pages - 1 : 0;
@@ -639,14 +453,6 @@ void HandleUiInput(UiState* state, UiInput input)
                 if (state->settings.selected > 0) {
                     --state->settings.selected;
                 }
-            } else if (state->screen == UiScreen::kReviewScore) {
-                state->selected_review = PreviousReviewChoice(state->selected_review);
-            } else if (state->screen == UiScreen::kLibrary && state->selected_problem > 0) {
-                --state->selected_problem;
-            } else if (state->screen == UiScreen::kSolution) {
-                state->screen = UiScreen::kProblem;
-            } else if (state->screen == UiScreen::kReviewQueued) {
-                state->screen = UiScreen::kProblem;
             }
             break;
 
@@ -673,15 +479,9 @@ void HandleUiInput(UiState* state, UiInput input)
             } else if (state->screen == UiScreen::kTodo && state->todo.selected + 1 < state->todo.todos.size()) {
                 ++state->todo.selected;
             } else if (state->screen == UiScreen::kSettings) {
-                if (state->settings.selected + 1 < 8) {
+                if (state->settings.selected + 1 < kSettingsItemCount) {
                     ++state->settings.selected;
                 }
-            } else if (state->screen == UiScreen::kReviewScore) {
-                state->selected_review = NextReviewChoice(state->selected_review);
-            } else if (state->screen == UiScreen::kLibrary && state->selected_problem + 1 < state->problems.size()) {
-                ++state->selected_problem;
-            } else if (state->screen == UiScreen::kProblem) {
-                state->screen = UiScreen::kSolution;
             }
             break;
 
@@ -710,45 +510,59 @@ void HandleUiInput(UiState* state, UiInput input)
                 // switches screens; the word page's own UI takes over.
                 std::string requested_deck_id;
                 if (TakeNoteWordDeckOpenRequest(&state->note_app, &requested_deck_id)) {
+                    // AGENTS §4.2, [词]-row: this path breaks the gate twice over.
+                    // (a) SubmitWordSessionReset resets the word session, and the
+                    //     observation armed by the worker is still between here
+                    //     and the reserve -- commit_state already reads kPersisting
+                    //     while the word domain still looks free, so TryReserve
+                    //     cannot see the window and the reset's generation bump
+                    //     would clear the session out from under the commit.
+                    // (b) The durable ACK switches screens, which navigates away
+                    //     from the note screen's answering context.
+                    // Consume the request and say nothing else, so a retry is the
+                    // only thing left to do. Mirrors the top-nav guards above.
                     if (state->word_app.session.commit_state ==
-                        wqn::WordObservationCommitState::kPersisting) {
-                        // A previous word answer is still persisting; scoping now
-                        // runs ResetWordSessionsForScopeChange synchronously and
-                        // would queue behind the in-flight persist transaction.
-                        // Consume the request (so it does not re-fire) and ask
-                        // the user to retry after the save completes.
+                            wqn::WordObservationCommitState::kPersisting ||
+                        (state->problem_app.active &&
+                         state->problem_app.commit_state ==
+                             wqn::ProblemVerdictCommitState::kPersisting)) {
                         state->note_app.message = "正在保存，请稍后";
-                    } else {
-                        state->word_app.scoped_deck_id = requested_deck_id;
-                        state->word_app.scoped_deck_title.clear();
-                        for (const WordDeckInfo& deck : state->word_app.deck_catalog) {
-                            if (deck.deck_id == requested_deck_id) {
-                                state->word_app.scoped_deck_title = deck.title;
-                                break;
-                            }
+                        break;
+                    }
+                    // Arm + submit; nothing is installed until
+                    // the durable ACK (DispatchWordSessionResetResult), so a scope
+                    // switch never blocks the UI task on the reset transaction.
+                    // The pending pair stays armed on a submit reject or a write
+                    // failure, exactly like the default-deck switch, so the user
+                    // re-picks the row and retries.
+                    std::string requested_deck_title;
+                    for (const WordDeckInfo& deck : state->word_app.deck_catalog) {
+                        if (deck.deck_id == requested_deck_id) {
+                            requested_deck_title = deck.title;
+                            break;
                         }
-                        // The restored session is pinned to the previous scope;
-                        // starting the deck study must not resume it.
-                        ResetWordSessionsForScopeChange(&state->word_app, true);
-                        state->screen = UiScreen::kWord;
+                    }
+                    state->word_app.scope_reset_pending_deck_id = requested_deck_id;
+                    state->word_app.scope_reset_pending_deck_title = requested_deck_title;
+                    const uint32_t op_id = device_ui_internal::SubmitWordSessionReset(requested_deck_id);
+                    if (op_id != 0) {
+                        state->word_app.scope_reset_pending_valid = true;
+                        state->word_app.scope_reset_save_op_id = op_id;
+                        state->note_app.message = "正在切换词库…";
+                    } else {
+                        state->word_app.scope_reset_save_op_id = 0;
+                        state->note_app.message =
+                            device_ui_internal::IsPersistDomainBusy(
+                                device_ui_internal::PersistDomain::kWord)
+                                ? "正在保存，请稍后"
+                                : "切换繁忙，请重试";
                     }
                 }
                 break;
             } else if (state->screen == UiScreen::kHome) {
-                if (state->selected_home_task == 1) {
-                    state->screen = UiScreen::kWord;
-                } else {
-                    state->screen = (state->selected_home_task == 0 && !state->problems.empty()) ? UiScreen::kProblem :
-                                                                                                     UiScreen::kLibrary;
-                }
-            } else if (state->screen == UiScreen::kLibrary && !state->problems.empty()) {
-                state->screen = UiScreen::kProblem;
-            } else if (state->screen == UiScreen::kProblem) {
-                state->screen = UiScreen::kSolution;
-            } else if (state->screen == UiScreen::kSolution) {
-                state->screen = UiScreen::kReviewScore;
-            } else if (state->screen == UiScreen::kReviewQueue || state->screen == UiScreen::kReviewQueued) {
-                state->screen = UiScreen::kLibrary;
+                state->screen = state->selected_home_task == 1
+                    ? UiScreen::kWord
+                    : UiScreen::kNote;
             } else if (state->screen == UiScreen::kSettings) {
                 // Settings actions are handled in device_ui.cpp because they need storage and diagnostics.
             }
@@ -782,7 +596,13 @@ void HandleUiInput(UiState* state, UiInput input)
                 }
                 break;
             } else if (state->screen == UiScreen::kAi) {
-                if (state->ai.status != AiSessionStatus::kListening &&
+                // [agent-fix] The Agent tier runs its own hold-to-record PTT
+                // and its long-confirm interrupt gesture (ui_input.cpp); it
+                // never populates ai.status, so this legacy branch would read
+                // as idle and start a STD recording behind a running Agent
+                // run. Skip the branch entirely for kAgent.
+                if (state->ai.tier != AiTier::kAgent &&
+                    state->ai.status != AiSessionStatus::kListening &&
                     state->ai.status != AiSessionStatus::kPreparingCapture &&
                     state->ai.status != AiSessionStatus::kWaitingReply) {
 #if CONFIG_WQN_AI_ENABLE
@@ -818,7 +638,7 @@ void HandleUiInput(UiState* state, UiInput input)
             } else if (state->screen == UiScreen::kSettings) {
                 state->screen = UiScreen::kHome;
             } else {
-                state->screen = UiScreen::kLibrary;
+                state->screen = UiScreen::kHome;
             }
             break;
     }
@@ -838,13 +658,31 @@ void HandleUiInput(UiState* state, UiInput input)
     if (screen_before == wqn::UiScreen::kWord &&
         state->screen != wqn::UiScreen::kWord &&
         !state->word_app.scoped_deck_id.empty()) {
-        // The kTopPrevious/kTopNext guards block leaving a scoped word page
-        // while a commit is persisting, so this cleanup only runs once the
-        // session is safe to drop -- there is no in-flight persist transaction
-        // for the synchronous clears to queue behind.
+        // [word-scope-reset] Leaving the scoped word page drops the scope
+        // override and the sessions with it. Same arm+submit shape as the [词]
+        // row above: the durable half runs on the worker, so leaving a word page
+        // never blocks the UI task on the reset transaction. The in-memory half
+        // is applied by the ACK dispatch -- but the scope must clear NOW,
+        // because the user is already on another screen and the next direct
+        // word entry must study the default deck, not the override they left.
+        //
+        // The kTopPrevious/kTopNext guards already block leaving a scoped word
+        // page while a commit is persisting, so there is no in-flight persist
+        // transaction for this to queue behind.
+        const std::string leaving_deck_id = state->word_app.scoped_deck_id;
         state->word_app.scoped_deck_id.clear();
         state->word_app.scoped_deck_title.clear();
-        ResetWordSessionsForScopeChange(&state->word_app, true);
+        const uint32_t op_id = device_ui_internal::SubmitWordSessionReset(leaving_deck_id);
+        if (op_id != 0) {
+            state->word_app.scope_reset_pending_deck_id = leaving_deck_id;
+            state->word_app.scope_reset_pending_deck_title.clear();
+            state->word_app.scope_reset_pending_valid = true;
+            state->word_app.scope_reset_save_op_id = op_id;
+        }
+        // A submit reject is tolerable here: the scope override is already gone
+        // in memory, the durable reset will be retried by the next scope change,
+        // and the sessions it failed to drop are inert the moment any later
+        // reset commits a generation.
     }
 #if CONFIG_WQN_AI_ENABLE
     // Leaving the AI screen while in Flash tier must tear down the WebSocket
@@ -853,6 +691,65 @@ void HandleUiInput(UiState* state, UiInput input)
     if (screen_before == wqn::UiScreen::kAi && state->screen != wqn::UiScreen::kAi &&
         state->ai.tier == wqn::AiTier::kFlash) {
         wqn::StopFlashSession();
+    }
+    // [agent] B3 / D-lease: leaving the AI screen from the Agent tier drops its
+    // event stream and the sleep lease behind it. Not gated on the tier being
+    // current -- a user who cycles to another tier and then leaves hits the tier
+    // cycle first, which already released; this is the same release for the user
+    // who leaves straight from the Agent tier.
+    if (screen_before == wqn::UiScreen::kAi && state->screen != wqn::UiScreen::kAi) {
+        wqn::stdpro_ws::RequestIdleDisconnect();
+        wqn::LeaveOpenCodeAgentTier();
+    }
+    // [agent] The B1 counterpart on SCREEN ENTRY. The tier-cycle handler in
+    // ui_input.cpp re-fetches the list / re-attaches on arriving at the Agent
+    // tier; entering the AI screen from another screen runs no tier logic at
+    // all, so a return left one of two stale states behind:
+    //
+    //   - the leave path that found no stream attached clears NOTHING -- it only
+    //     refreshes the lease -- so session_locked, current_session_id, the
+    //     transcript and the scroll offset all survive the round trip. The user
+    //     comes back to a locked view with no stream behind it: symptom 3
+    //     ("entering a running session receives nothing"), reached through a
+    //     screen change instead of a tier cycle.
+    //   - the leave path that did find a stream clears the lock but leaves
+    //     g_state.sessions exactly as it was, and no gesture can refresh it while
+    //     the picker is up (see DispatchAgentSessionListPoll). The picker's 运行中
+    //     marker is then as old as the last fetch -- hours, if the device slept.
+    //
+    // Exactly the two branches the tier cycle runs, so the two entry points
+    // cannot drift: no session locked means fetch the list, a locked session with
+    // no stream means attach to it.
+    if (state->screen == wqn::UiScreen::kAi && screen_before != wqn::UiScreen::kAi &&
+        state->ai.tier == wqn::AiTier::kAgent) {
+        if (state->agent.current_session_id.empty()) {
+            const esp_err_t result = wqn::RequestOpenCodeSessionList();
+            if (result != ESP_OK) {
+                ESP_LOGW("ui_model", "Agent screen entry: session list refused (%s)",
+                         esp_err_to_name(result));
+            }
+        } else if (state->agent.session_locked && !state->agent.stream_active) {
+            const esp_err_t result = wqn::ObserveOpenCodeSession();
+            if (result != ESP_OK) {
+                // The worker slot is taken -- kNoSession cannot happen, this
+                // branch requires current_session_id to be non-empty. What holds
+                // it is a backfill still reading the transcript the last entry
+                // armed, or a run, or a list load whose success branch has not
+                // cleared session_locked yet. Logged rather than retried: the
+                // tier-cycle path accepts the same race, and a retry loop would
+                // fight the single-slot command gate.
+                //
+                // The third case is deliberate and silent. A leaving attach that
+                // has not finished detaching still reads stream_active true, so
+                // neither branch here fires and nothing is logged -- re-attaching
+                // then would be refused on the same slot anyway, and the tail
+                // will clear the flag on its own. An earlier version of this
+                // comment claimed that case reaches the log below; it cannot,
+                // the branch condition excludes it.
+                ESP_LOGW("ui_model", "Agent screen entry: re-attach refused (%s)",
+                         esp_err_to_name(result));
+            }
+        }
     }
 #endif
 }
@@ -917,16 +814,23 @@ UiFrame RenderUiFrame(const UiState& state)
     frame.claim_code = state.status.claim_code;
     frame.home = state.home;
     frame.ai = state.ai;
+    frame.agent = state.agent;
     if (state.screen == UiScreen::kAi) {
-        const AiHistoryChannel channel = state.ai.tier == AiTier::kFlash
-            ? AiHistoryChannel::kFlash
-            : AiHistoryChannel::kStdPro;
+        // [agent] Explicit channel selection: a background Agent stream must
+        // never write into the history of whichever tier happens to be visible.
+        AiHistoryChannel channel = AiHistoryChannel::kStdPro;
+        if (state.ai.tier == AiTier::kFlash) {
+            channel = AiHistoryChannel::kFlash;
+        } else if (state.ai.tier == AiTier::kAgent) {
+            channel = AiHistoryChannel::kAgent;
+        }
         frame.ai_history = GetAiHistorySnapshot(channel);
         if (frame.ai_history) {
             frame.ai_history_revision = frame.ai_history->revision;
         }
     }
     frame.status_edit = state.status_edit;  // [shell] status-bar edit mode
+    frame.agent_option = state.agent_option;  // [agent] option-bar focus
     frame.todo = state.todo;
     frame.word_app = BuildWordAppSnapshot(state.word_app);
     frame.settings = state.settings;
@@ -963,26 +867,11 @@ UiFrame RenderUiFrame(const UiState& state)
         case UiScreen::kNote:
             RenderNote(state, &frame);
             break;
-        case UiScreen::kLibrary:
-            RenderLibrary(state, &frame);
-            break;
-        case UiScreen::kProblem:
-            RenderProblemDetail(state, &frame);
-            break;
-        case UiScreen::kSolution:
-            RenderSolution(state, &frame);
-            break;
-        case UiScreen::kReviewQueue:
-            RenderReviewQueue(state, &frame);
-            break;
-        case UiScreen::kReviewScore:
-            RenderReviewScore(state, &frame);
-            break;
-        case UiScreen::kReviewQueued:
-            RenderReviewQueued(state, &frame);
-            break;
         case UiScreen::kProvisioning:
             // Handled by the provisioning early-return above; unreachable here.
+            break;
+        case UiScreen::kOpenCode:
+            // [agent] Reserved, unreachable (demoted into the AI page).
             break;
     }
 
@@ -995,13 +884,14 @@ namespace wqn {
 
 AiTier NextAiTier(AiTier current)
 {
+#if CONFIG_WQN_AGENT_ENABLE
     return static_cast<AiTier>((static_cast<uint8_t>(current) + 1) % static_cast<uint8_t>(AiTier::kCount));
-}
-
-AiTier PrevAiTier(AiTier current)
-{
-    const uint8_t val = static_cast<uint8_t>(current);
-    return static_cast<AiTier>((val + static_cast<uint8_t>(AiTier::kCount) - 1) % static_cast<uint8_t>(AiTier::kCount));
+#else
+    // [agent] Without the gateway compiled in, kAgent must not be offered: the
+    // tier would render a page whose every action returns ESP_ERR_NOT_SUPPORTED.
+    // The ring collapses to Flash <-> Std, which is exactly the pre-Agent set.
+    return (current == AiTier::kStd) ? AiTier::kFlash : AiTier::kStd;
+#endif
 }
 
 const char* AiTierLabel(AiTier tier)
@@ -1011,8 +901,8 @@ const char* AiTierLabel(AiTier tier)
             return "Flash";
         case AiTier::kStd:
             return "STD";
-        case AiTier::kPro:
-            return "Pro";
+        case AiTier::kAgent:
+            return "Agent";
         default:
             return "???";
     }

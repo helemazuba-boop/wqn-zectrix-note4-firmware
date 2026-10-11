@@ -20,7 +20,16 @@ std::atomic<uint32_t> g_total_blockers{0};
 std::atomic<bool> g_quiescing{false};
 std::atomic<uint32_t> g_quiesce_generation{0};
 
-constexpr size_t kMaxLeaseRecords = 32;
+// Static occupancy is ~16 slots (usb-power, connectivity, display, ai x2,
+// provisioning, audio, cloud x7, sync x2); transient bursts add the persist
+// worker (one per kind) and pack downloads, which hold kStorage across an
+// HTTPS transfer. 32 was reachable, and a full registry silently drops work
+// (TryAcquire returns empty and callers such as StorageWriteGuard or
+// RequestEpdUiRefresh discard what they were doing).
+constexpr size_t kMaxLeaseRecords = 64;
+// High-water mark of concurrently held leases; drives the near-capacity dump.
+std::atomic<uint32_t> g_lease_high_water{0};
+int64_t g_lease_dump_not_before_us = 0;
 
 struct LeaseRecord {
     bool active = false;
@@ -271,6 +280,10 @@ SleepLease SleepLease::TryAcquire(
             g_blocker_counts[index].fetch_add(1, std::memory_order_acq_rel);
             const uint32_t total_previous =
                 g_total_blockers.fetch_add(1, std::memory_order_acq_rel);
+            const uint32_t total_now = total_previous + 1;
+            if (total_now > g_lease_high_water.load(std::memory_order_relaxed)) {
+                g_lease_high_water.store(total_now, std::memory_order_relaxed);
+            }
 #if CONFIG_PM_ENABLE
             acquire_pm_lock = total_previous == 0 && g_no_light_sleep_lock != nullptr;
 #endif
@@ -280,8 +293,13 @@ SleepLease SleepLease::TryAcquire(
     taskEXIT_CRITICAL(&g_lease_lock);
     if (slot == UINT8_MAX) {
         if (!g_quiescing.load(std::memory_order_acquire)) {
-            ESP_LOGE(kTag, "sleep lease registry exhausted: blocker=%s holder=%s",
-                     SleepBlockerName(blocker), holder == nullptr ? "unspecified" : holder);
+            ESP_LOGE(kTag,
+                     "sleep lease registry exhausted: blocker=%s holder=%s "
+                     "high_water=%u/%u at=%s:%d",
+                     SleepBlockerName(blocker), holder == nullptr ? "unspecified" : holder,
+                     static_cast<unsigned>(g_lease_high_water.load(std::memory_order_relaxed)),
+                     static_cast<unsigned>(kMaxLeaseRecords),
+                     file == nullptr ? "unknown" : file, line);
         }
         return {};
     }
@@ -395,10 +413,28 @@ void LogLongHeldSleepLeases(int64_t now_us, int64_t warning_after_us)
         return;
     }
 
+    // [lease-watermark] Near capacity, dump every active slot rather than only
+    // the long-held ones: the interesting holder is often short-lived (a pack
+    // download pinned across an HTTPS transfer) and never trips the long-held
+    // warning, yet it is what pushes the registry over the edge. The existing
+    // `warnings` array is reused so this costs no extra stack.
+    const uint32_t high_water = g_lease_high_water.load(std::memory_order_relaxed);
+    const bool near_capacity = high_water * 4 >= kMaxLeaseRecords * 3;
+    const bool dump_all = near_capacity && now_us >= g_lease_dump_not_before_us;
+
     std::array<LeaseWarning, kMaxLeaseRecords> warnings{};
     taskENTER_CRITICAL(&g_lease_lock);
     for (size_t i = 0; i < g_lease_records.size(); ++i) {
         LeaseRecord& record = g_lease_records[i];
+        if (record.active && dump_all) {
+            warnings[i].valid = true;
+            warnings[i].blocker = record.blocker;
+            warnings[i].holder = record.holder;
+            warnings[i].file = record.file;
+            warnings[i].line = record.line;
+            warnings[i].held_us = now_us - record.acquired_us;
+            continue;
+        }
         // External USB power is a policy lease, not a work transaction. It is
         // expected to remain held for the full duration of a development or
         // charging session, so it must not generate a false stuck-work alarm.
@@ -417,17 +453,34 @@ void LogLongHeldSleepLeases(int64_t now_us, int64_t warning_after_us)
     }
     taskEXIT_CRITICAL(&g_lease_lock);
 
+    if (dump_all) {
+        g_lease_dump_not_before_us = now_us + warning_after_us;
+        ESP_LOGW(kTag, "sleep lease registry near capacity: high_water=%u/%u",
+                 static_cast<unsigned>(high_water),
+                 static_cast<unsigned>(kMaxLeaseRecords));
+    }
+
     for (const LeaseWarning& warning : warnings) {
         if (!warning.valid) {
             continue;
         }
-        ESP_LOGW(kTag,
-                 "long-held sleep lease: blocker=%s holder=%s held_ms=%lld at=%s:%d",
-                 SleepBlockerName(warning.blocker),
-                 warning.holder,
-                 static_cast<long long>(warning.held_us / 1000),
-                 warning.file,
-                 warning.line);
+        if (dump_all) {
+            ESP_LOGW(kTag,
+                     "lease slot: blocker=%s holder=%s held_ms=%lld at=%s:%d",
+                     SleepBlockerName(warning.blocker),
+                     warning.holder,
+                     static_cast<long long>(warning.held_us / 1000),
+                     warning.file,
+                     warning.line);
+        } else {
+            ESP_LOGW(kTag,
+                     "long-held sleep lease: blocker=%s holder=%s held_ms=%lld at=%s:%d",
+                     SleepBlockerName(warning.blocker),
+                     warning.holder,
+                     static_cast<long long>(warning.held_us / 1000),
+                     warning.file,
+                     warning.line);
+        }
     }
 }
 

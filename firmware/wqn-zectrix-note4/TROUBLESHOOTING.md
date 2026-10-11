@@ -199,10 +199,10 @@ gate enforces this.
 ## Useful local checks
 
 ```bash
-cd /home/unknow/projects/firmware/firmware/wqn-zectrix-note4
+cd <repo-root>/firmware/wqn-zectrix-note4
 cmake -DWQN_PROJECT_DIR="$PWD" -P cmake/verify_architecture.cmake
 git diff --check
-source /home/unknow/esp/esp-idf-v5.5/export.sh
+source <esp-idf-dir>/export.sh
 idf.py --no-ccache -B build-ai-local-s3 build
 ```
 

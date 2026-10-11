@@ -31,7 +31,9 @@ enum class AppEventKind : uint8_t {
     kAiTick,
     kAiStreamingSnapshot,
     kAiSessionSnapshot,
+    kAiViewportFollow,
     kFlashSnapshot,
+    kAgentSnapshot,
     kClockMinute,
     kStatusEditTimeout,
     kStatusReload,
@@ -42,6 +44,9 @@ enum class AppEventKind : uint8_t {
     kNoteObservationPersist,
     kProblemVerdictPersist,
     kSettingsPersist,
+    // [picker-stale] Diagnose-only marker for the picker's self-refresh arm.
+    kAgentListPoll,
+    kWordCardPrefetch,
 };
 
 struct UiUpdate {
@@ -75,7 +80,14 @@ public:
     UiUpdate DispatchAiTick(int64_t now_ms);
     UiUpdate DispatchAiStreamingSnapshot(const wqn::AiStreamingStatusView& view);
     UiUpdate DispatchAiSessionSnapshot(const wqn::AiSessionState& snapshot);
+    // [follow] Per-tick auto-follow step. Must run after the session/agent
+    // snapshots (it reads their flags) and before RenderUiFrame (it mirrors the
+    // offset it writes into the UI copy so this tick renders the new position).
+    // Safe to call unconditionally: it no-ops unless the AI screen is up, the
+    // auto-follow setting is on and a turn has armed the follow.
+    UiUpdate DispatchAiViewportFollow();
     UiUpdate DispatchFlashSnapshot(const wqn::FlashUiState& snapshot);
+    UiUpdate DispatchAgentSnapshot(const wqn::AgentSessionState& snapshot);
     UiUpdate DispatchClockMinute(bool panel_needs_refresh);
     UiUpdate DispatchStatusEditTimeout(int64_t now_ms);
     UiUpdate DispatchStatusReload(wqn::AppState&& snapshot);
@@ -89,8 +101,12 @@ public:
         uint32_t done_bytes,
         uint32_t total_bytes,
         int64_t now_us);
+    bool TakeWordSessionStartRequest(
+        wqn::protocol::word_study_v1::CreateSessionRequest* request);
+    void RestoreWordSessionStartRequest();
     bool TakeWordCandidatePageRequest(
         wqn::protocol::word_study_v1::CandidatePageRequest* request,
+        wqn::PersistedWordSession* snapshot,
         std::string* session_id);
     void RestoreWordCandidatePageRequest();
     bool TakeNoteCandidatePageRequest(
@@ -99,6 +115,7 @@ public:
     void RestoreNoteCandidatePageRequest();
     bool TakeNoteImageRequest(
         std::string* note_id, uint8_t* image_index, std::string* image_id,
+        bool* gray4,
         uint32_t* progress_generation);
     void RestoreNoteImageRequest();
     bool TakeNoteBodyFetchRequest(std::string* notebook_id,
@@ -114,7 +131,8 @@ public:
         std::string* problem_id,
         bool* is_solution,
         uint8_t* image_index,
-        std::string* image_id);
+        std::string* image_id,
+        bool* gray4);
     void RestoreProblemImageRequest();
     bool TakeProblemVerdictEffect(
         const std::string& request_id,
@@ -133,6 +151,16 @@ public:
         wqn::DurableWordObservation* observation,
         wqn::PersistedWordSession* advanced_session);
     UiUpdate DispatchWordObservationPersistResult(esp_err_t result, uint32_t operation_id);
+    UiUpdate DispatchWordObservationBuffered(const std::string& request_id,
+        const std::string& occurred_at, int64_t now_ms);
+    bool TakeWordObservationBatch(uint32_t operation_id, int64_t now_ms,
+        std::vector<wqn::DurableWordObservation>* observations,
+        wqn::PersistedWordSession* advanced_session);
+    void RequestWordBatchFlush();
+    bool TakeWordCardPrefetchEntry(uint32_t operation_id, int64_t now_ms,
+        wqn::WordPackIndexEntry* entry);
+    UiUpdate DispatchWordCardPrefetchResult(esp_err_t result, uint32_t operation_id,
+        wqn::WqnWordEntry entry);
     // Take failed inside the pump (cursor desync -> session already moved to
     // kFailed). Route it through FinishEvent so the revision advances and the
     // failure frame is not deduped against the "正在保存" frame's revision.
@@ -157,12 +185,40 @@ public:
     // additionally triggers RequestSyncNow), failure keeps the displayed value
     // untouched and asks for a re-Confirm. Settings-area refresh either way.
     UiUpdate DispatchAutoSyncSaveResult(esp_err_t result, uint32_t operation_id);
+    UiUpdate DispatchImageRenderSaveResult(esp_err_t result, uint32_t operation_id);
     UiUpdate DispatchVolumeSaveResult(esp_err_t result, uint32_t operation_id);
     // [deck-scope] Default-deck switch result (c5). Success installs the deck,
     // resets the in-memory word session (the durable clears already happened
     // inside the worker's marker transaction) and rebuilds the [词] rows;
     // failure keeps the displayed deck and the armed pending pair for retry.
     UiUpdate DispatchDefaultDeckChangeResult(esp_err_t result, uint32_t operation_id);
+    // [word-scope-reset] Applies the durable ACK of a word-page scope switch.
+    UiUpdate DispatchWordSessionResetResult(esp_err_t result, uint32_t operation_id);
+    // [ai-follow] Durable follow-toggle result (c4 shape). Success installs the
+    // armed choice, pushes it to the worker (SetAiAutoFollow, the only bridge to
+    // the copy the follow step reads) and relabels the row; a failure keeps the
+    // durable value displayed and the armed choice for a re-Confirm.
+    UiUpdate DispatchAiFollowSaveResult(esp_err_t result, uint32_t operation_id);
+    // [detail] Debounced detail-tier write result. The status-bar value is
+    // already mirrored (it has to draw on the cycle's own tick); this only moves
+    // the durable bookkeeping. A failure re-anchors the debounce so the retry
+    // waits a full window instead of spinning on a failing NVS commit.
+    UiUpdate DispatchAgentDetailSaveResult(
+        esp_err_t result, uint32_t operation_id, int64_t now_ms);
+    // [detail] Per-tick debounce hook -- there is no Confirm gesture to hang the
+    // write off. Submits the pending tier once it has been stable for
+    // kAgentDetailSaveDebounceMs; a no-op while a write is in flight or when the
+    // desired value is already the persisted one.
+    UiUpdate DispatchAgentDetailPersist(int64_t now_ms);
+    // [picker-stale] Per-tick hook that refreshes the session list while the
+    // picker is open and claims a run it cannot re-check. No gesture can do it:
+    // the picker is a modal surface that answers only confirm and up/down, so the
+    // status-bar slot that reloads the list is unreachable while it is up and the
+    // screen-navigation long-press is swallowed by it. The list is therefore
+    // frozen for as long as the user sits there, and every row's 运行中 marker is
+    // a claim about the moment the list was fetched. See ui_runtime.cpp for the
+    // conditions and their cost.
+    UiUpdate DispatchAgentSessionListPoll(int64_t now_ms);
 
 private:
     UiUpdate FinishEvent(
@@ -173,7 +229,12 @@ private:
     uint64_t NextRevision();
 
     wqn::AppState state_;
+    bool word_boundary_pending_ = false;
+    wqn::ButtonEvent word_boundary_event_{};
     uint64_t event_sequence_ = 0;
+    // [picker-stale] Last attempt at the picker's self-refresh, whether or not
+    // the worker accepted it: a rejected poll must not retry on the next tick.
+    int64_t agent_list_poll_at_ms_ = 0;
 };
 
 const char* AppEventKindName(AppEventKind event);

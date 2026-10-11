@@ -32,11 +32,12 @@ constexpr int kRoundedOuterRadius = 6;
 constexpr int kChipRadius = 4;
 
 // Draw the focus decoration for a control occupying `rect`, in the given
-// style. kNone draws nothing. For kInnerBorder the decoration is the control
-// outline + a 2px-inset inner outline (the concentric double border). For
-// kRoundedInnerBorder the same but rounded (outer r6, inner r4). For kInvert
-// the rect is reverse-filled (ink background); the caller then draws its
-// content in paper color on top.
+// style. kNone draws nothing. kInvert and kRowFill both paint a rounded
+// reverse-fill block (kInvert for will-execute actions like buttons/config
+// fields, kRowFill for density-list row browsing selection); the caller then
+// draws its content in paper color on top. kRoundedInnerBorder draws the
+// rounded outline + a 2px-inset inner outline (the persistent-selection
+// concentric double border) for card-style rows.
 //
 // The rect is the FULL control bounds (including the outer outline). Content
 // passed to DrawClippedText/DrawCenteredText by the page must be inset to
@@ -58,6 +59,23 @@ void DrawSelectableIcon(int x, int y, const WqnBitmapAsset& asset, bool focused,
 // by design -- a chip is a read-only status badge, not a focusable control.
 // `text` is centered and truncated to fit the chip width.
 void DrawStatusChip(int x, int y, int width, int height, int radius, const std::string& text);
+
+// [v2] Unified tag/label chip: rounded badge with centered text, used for row
+// tags (home task tag, settings row tag) and inline status labels. Replaces the
+// per-page inline rounded-rect + centered-text tag implementations. Width is
+// caller-chosen (fixed for settings rows, content-measured for home rows).
+void DrawChip(int x, int y, int width, int height, const std::string& text);
+
+// [v2] Unified empty/error state: a rounded container with a centered title,
+// an optional body line, and an optional status/hint line. Replaces the three
+// divergent empty states (todo's boxed card vs note/problem/word's bare text)
+// so every "nothing to show / failed / not paired" surface looks the same.
+// Pass empty body/hint to omit those lines. Returns ESP_OK (drawing is
+// best-effort; text helpers log their own errors).
+esp_err_t DrawEmptyState(
+    const std::string& title,
+    const std::string& body = "",
+    const std::string& hint = "");
 
 // Draw the page footer hint line at the shared footer y (kBottomHintY) across
 // the standard content width. Replaces per-page DrawClippedText(..., 12, 278, 376, ...)

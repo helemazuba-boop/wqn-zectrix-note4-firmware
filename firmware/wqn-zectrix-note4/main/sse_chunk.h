@@ -10,8 +10,21 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include "wqn_api.h"
+
+struct cJSON;
 
 namespace wqn {
+
+// [agent] Hard ceiling on one unterminated line and on one accumulated frame,
+// set to the device's JSON response budget (16 KiB) rather than to a round
+// number: a frame that cannot fit the budget could never be parsed even if it
+// arrived complete, so anything past it is garbage by definition. Without this
+// an upstream that never sends the frame terminator grows an internal-RAM
+// buffer until allocation fails. v2 raises the exposure -- one `agent.tool`
+// payload can carry a whole file read.
+constexpr size_t kMaxSseLineBytes = 16 * 1024;
+constexpr size_t kMaxSseFrameBytes = 16 * 1024;
 
 // LineStreamingBuffer accumulates bytes from many esp_http_client_read()
 // calls and yields one line at a time to the SSE parser.  Lines are split on
@@ -19,7 +32,10 @@ namespace wqn {
 // chunked-encoding CRLFs or LF separators.
 class LineStreamingBuffer {
 public:
-  void feed(const char* data, size_t len);
+  // Returns false when the chunk would push the unterminated line past
+  // kMaxSseLineBytes; the buffer is cleared, so the caller must treat the
+  // stream as broken rather than resynchronising.
+  bool feed(const char* data, size_t len);
   bool take_line(std::string* out);   // returns false when no full line remains
   void clear() { buffer_.clear(); }
 
@@ -45,10 +61,19 @@ public:
     kComplete,
   };
 
-  void feed(const char* data, size_t len);
+  // feed() returns false when the chunk would push the unterminated line past
+  // kMaxSseLineBytes; the buffer is cleared, so the caller must treat the
+  // stream as broken rather than resynchronising.
+  bool feed(const char* data, size_t len);
   FrameState extract(std::string* event_name, uint64_t* event_id, std::string* data_json);
 
   void clear();
+
+  // True once a frame was dropped for exceeding kMaxSseFrameBytes. Sticky: it
+  // survives clear() on purpose, because the caller's recovery is to fail the
+  // request -- the dropped frame's remainder is gone, so anything parsed after
+  // it may be spliced garbage.
+  bool overflowed() const { return overflowed_; }
 
 private:
   LineStreamingBuffer lines_;
@@ -56,6 +81,15 @@ private:
   uint64_t id_ = 0;
   std::string data_;
   bool id_seen_ = false;
+  bool overflowed_ = false;
 };
+
+// Decodes an SSE frame into WqnAiSseEvent.
+// Returns true on success. If out_root is provided, caller owns the returned cJSON* (must cJSON_Delete).
+bool DecodeSseEvent(const std::string& event_name,
+                    uint64_t event_id,
+                    const std::string& data_json,
+                    WqnAiSseEvent* out_ev,
+                    ::cJSON** out_root = nullptr);
 
 }  // namespace wqn

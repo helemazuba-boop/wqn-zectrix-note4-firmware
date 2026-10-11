@@ -5,6 +5,8 @@
 #include <cstdio>
 #include <array>
 #include <cstdint>
+#include <cstring>
+#include <ctime>
 #include <limits>
 #include <string>
 #include <utility>
@@ -12,6 +14,8 @@
 
 #include "config.h"
 #include "device_protocol/claim_crypto.h"
+#include "esp_attr.h"
+#include "esp_app_desc.h"
 #include "esp_check.h"
 #include "esp_err.h"
 #include "esp_log.h"
@@ -19,15 +23,22 @@
 #include "esp_random.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "freertos/timers.h"
 #include "nvs.h"
 #include "runtime/sleep_coordinator.h"
+#include "runtime/wake_context.h"
 #include "storage.h"
 #include "note_store.h"
+#include "outbox_suspend_reason.h"
 #include "problem_store.h"
+#include "services/connectivity_service.h"
+#include "services/server_error_codes.h"
+#include "word_app.h"
 #include "word_study_store.h"
 #include "wqn_api.h"
+#include "error_recorder.h"
 
 namespace {
 
@@ -36,24 +47,761 @@ constexpr char kTag[] = "sync_service";
 #if CONFIG_WQN_WIFI_STA_ENABLE
 wqn::services::SyncSnapshot g_sync_snapshot = {};
 portMUX_TYPE g_sync_snapshot_lock = portMUX_INITIALIZER_UNLOCKED;
-std::atomic<wqn::services::SyncEventSink> g_sync_event_sink{nullptr};
 uint32_t g_sync_event_sequence = 1;
-constexpr TickType_t kSyncRetryDelay = pdMS_TO_TICKS(10000);
+wqn::services::SyncEvent g_latest_sync_event = {};
+std::atomic<wqn::services::SyncEventSink> g_sync_event_sink{nullptr};
+// [gap-1] Nominal full-sync retry ladder: a persistent failure used to pin the
+// retry cadence at 10s forever, keeping the radio hot across deep-sleep cycles
+// (2026-08-19 sync liveness audit). Consecutive nominal-path failures escalate
+// through this ladder and cap at 15 minutes; ClearFullSyncRetry() resets the
+// attempt count on success or an explicit manual/credential reset. Boot,
+// content and timer admission must preserve a restored failure attempt.
+constexpr uint32_t kFullSyncRetryLadderMs[] = {
+    10000, 30000, 60000, 300000, 900000};
+constexpr size_t kFullSyncRetryLadderSize =
+    sizeof(kFullSyncRetryLadderMs) / sizeof(kFullSyncRetryLadderMs[0]);
+// RTC retention keeps the escalation alive across deep-sleep wake cycles;
+// only the sync task touches it (schedule/retry decisions are single-tasked).
+RTC_DATA_ATTR uint8_t g_full_sync_retry_attempts = 0;
 bool LoadUsableToken(std::string* token);
 TaskHandle_t g_sync_service_task = nullptr;
-std::atomic<bool> g_full_sync_requested{false};
+enum FullSyncReason : uint32_t {
+    kFullSyncManual = 1u << 0,
+    kFullSyncBoot = 1u << 1,
+    kFullSyncCredentials = 1u << 2,
+    kFullSyncContentRefresh = 1u << 3,
+};
+std::atomic<uint32_t> g_full_sync_reasons{0};
 std::atomic<bool> g_word_outbox_sync_requested{false};
+std::atomic<bool> g_outbox_immediate_requested{false};
+std::atomic<bool> g_outbox_transport_resume_requested{false};
+std::atomic<uint32_t> g_auto_sync_interval_minutes{0};
+std::atomic<int64_t> g_next_periodic_sync_not_before_ms{0};
+std::atomic<bool> g_boot_outbox_pending{false};
+std::atomic<bool> g_boot_policy_evaluated{false};
+constexpr uint32_t kPeriodicScheduleMagic = 0x57514E53;  // "WQNS"
+constexpr uint32_t kFullRetryMagic = 0x57514E52;  // "WQNR"
+constexpr std::time_t kMinScheduleUnixTime = 1704067200;  // 2024-01-01 UTC
+constexpr int64_t kBootFullSyncMinIntervalSeconds = 5 * 60;
+RTC_DATA_ATTR uint32_t g_periodic_schedule_magic = 0;
+RTC_DATA_ATTR uint32_t g_periodic_schedule_interval_minutes = 0;
+RTC_DATA_ATTR int64_t g_next_periodic_sync_unix_seconds = 0;
+RTC_DATA_ATTR uint32_t g_full_sync_retry_magic = 0;
+RTC_DATA_ATTR int64_t g_full_sync_retry_unix_seconds = 0;
+std::atomic<int64_t> g_full_sync_retry_not_before_ms{0};
+portMUX_TYPE g_periodic_schedule_lock = portMUX_INITIALIZER_UNLOCKED;
+std::atomic<uint32_t> g_content_refresh_requested{0};
+constexpr uint32_t kWordPacksRefreshBit = 1u << 0;
+constexpr uint32_t kNotePacksRefreshBit = 1u << 1;
+constexpr uint32_t kProblemPacksRefreshBit = 1u << 2;
 std::atomic<uint32_t> g_word_interaction_generation{0};
 constexpr uint32_t kWordOutboxQuietPeriodMs = 5000;
+// A steady stream of study input may keep resetting the 5-second debounce.
+// Bound the pre-upload sleep lease so active use still makes durable progress
+// without turning a non-empty outbox into a permanent sleep blocker.
+constexpr uint32_t kOutboxFlushLeaseMaxMs = 15000;
 StaticTimer_t g_word_outbox_timer_storage;
 TimerHandle_t g_word_outbox_timer = nullptr;
+portMUX_TYPE g_outbox_quiet_lock = portMUX_INITIALIZER_UNLOCKED;
+bool g_outbox_quiet_active = false;
+int64_t g_outbox_quiet_due_ms = 0;
+int64_t g_outbox_quiet_deadline_ms = 0;
+uint32_t g_outbox_quiet_generation = 0;
+uint32_t g_outbox_ready_generation = 0;
+bool g_outbox_lease_cycle_expired = false;
+wqn::SyncJournal g_sync_journal = {};
+bool g_sync_journal_loaded = false;
+StaticSemaphore_t g_sync_journal_mutex_storage;
+SemaphoreHandle_t g_sync_journal_mutex = nullptr;
+uint32_t g_content_claim_generation[3] = {};
+uint32_t g_content_active_generation[3] = {};
+bool g_content_completion_pending[3] = {};
+wqn::services::SyncContentSnapshot g_content_completed_snapshot[3] = {};
+std::atomic<int64_t> g_sync_journal_retry_not_before_ms{0};
+std::atomic<int64_t> g_control_journal_retry_not_before_ms{0};
+uint8_t g_sync_journal_retry_attempt = 0;  // journal mutex owns mutation
 
-void WordOutboxTimerCallback(TimerHandle_t)
+// [sync-checkpoint] Serialize mutation + snapshot + commit, not just the I/O.
+// Otherwise a content lane can overwrite a control candidate while it saves.
+class SyncJournalLock {
+public:
+    SyncJournalLock() : locked_(g_sync_journal_mutex != nullptr &&
+        xSemaphoreTake(g_sync_journal_mutex, portMAX_DELAY) == pdTRUE) {}
+    ~SyncJournalLock() { if (locked_) xSemaphoreGive(g_sync_journal_mutex); }
+    explicit operator bool() const { return locked_; }
+    SyncJournalLock(const SyncJournalLock&) = delete;
+    SyncJournalLock& operator=(const SyncJournalLock&) = delete;
+private:
+    bool locked_;
+};
+
+esp_err_t PersistLatestSyncJournalLocked(const char* reason);
+esp_err_t EnsureSyncJournalLoaded();
+
+size_t ContentDomainIndex(wqn::services::SyncContentDomain domain)
 {
+    return static_cast<size_t>(domain);
+}
+
+uint32_t ContentRefreshBit(wqn::services::SyncContentDomain domain)
+{
+    switch (domain) {
+        case wqn::services::SyncContentDomain::kWordPacks:
+            return kWordPacksRefreshBit;
+        case wqn::services::SyncContentDomain::kNotePacks:
+            return kNotePacksRefreshBit;
+        case wqn::services::SyncContentDomain::kProblemPacks:
+            return kProblemPacksRefreshBit;
+        default:
+            return 0;
+    }
+}
+
+std::time_t CurrentUnixSeconds()
+{
+    std::time_t now = 0;
+    std::time(&now);
+    return now;
+}
+
+uint64_t DurableRetryDeadline(int64_t monotonic_deadline_ms)
+{
+    const std::time_t now = CurrentUnixSeconds();
+    if (monotonic_deadline_ms <= 0 || now < kMinScheduleUnixTime) {
+        return 0;
+    }
+    const int64_t remaining_ms = std::max<int64_t>(
+        0, monotonic_deadline_ms - esp_timer_get_time() / 1000);
+    return static_cast<uint64_t>(now) +
+        static_cast<uint64_t>((remaining_ms + 999) / 1000);
+}
+
+int64_t RestoreMonotonicRetryDeadline(
+    uint64_t unix_deadline_seconds,
+    uint32_t fallback_delay_ms,
+    uint32_t maximum_delay_ms)
+{
+    const int64_t now_ms = esp_timer_get_time() / 1000;
+    const std::time_t now = CurrentUnixSeconds();
+    if (unix_deadline_seconds >=
+            static_cast<uint64_t>(kMinScheduleUnixTime) &&
+        now >= kMinScheduleUnixTime) {
+        const uint64_t remaining_seconds = unix_deadline_seconds >
+                static_cast<uint64_t>(now)
+            ? unix_deadline_seconds - static_cast<uint64_t>(now)
+            : 0;
+        const uint64_t remaining_ms = std::min<uint64_t>(
+            remaining_seconds * 1000ULL, maximum_delay_ms);
+        return now_ms + static_cast<int64_t>(remaining_ms);
+    }
+    // A v1 checkpoint or an early-boot write has no usable wall deadline.
+    // Reapply one conservative local interval instead of bypassing backoff.
+    return now_ms + static_cast<int64_t>(fallback_delay_ms);
+}
+
+void PersistFullSyncRetryCheckpoint()
+{
+    if (!g_sync_journal_loaded) {
+        return;
+    }
+    SyncJournalLock journal_lock;
+    if (!journal_lock) return;
+    int64_t retry_unix_seconds = 0;
+    taskENTER_CRITICAL(&g_periodic_schedule_lock);
+    retry_unix_seconds = g_full_sync_retry_unix_seconds;
+    taskEXIT_CRITICAL(&g_periodic_schedule_lock);
+    taskENTER_CRITICAL(&g_sync_snapshot_lock);
+    g_sync_journal.full_sync_retry.not_before_unix_seconds =
+        retry_unix_seconds > 0 ? static_cast<uint64_t>(retry_unix_seconds) : 0;
+    g_sync_journal.full_sync_retry.attempt = g_full_sync_retry_attempts;
+    taskEXIT_CRITICAL(&g_sync_snapshot_lock);
+    if (PersistLatestSyncJournalLocked("full-retry") != ESP_OK) {
+        ESP_LOGW(kTag, "full-sync retry journal save failed");
+    }
+}
+
+bool PeriodicScheduleDue(uint32_t interval_minutes)
+{
+    if (interval_minutes == 0) {
+        return false;
+    }
+    uint32_t magic = 0;
+    uint32_t scheduled_interval = 0;
+    int64_t due_seconds = 0;
+    taskENTER_CRITICAL(&g_periodic_schedule_lock);
+    magic = g_periodic_schedule_magic;
+    scheduled_interval = g_periodic_schedule_interval_minutes;
+    due_seconds = g_next_periodic_sync_unix_seconds;
+    taskEXIT_CRITICAL(&g_periodic_schedule_lock);
+    const std::time_t now = CurrentUnixSeconds();
+    // Missing/old schedule state is due once. A successful round writes the
+    // first valid absolute deadline, which then survives deep sleep.
+    if (magic != kPeriodicScheduleMagic ||
+        scheduled_interval != interval_minutes) {
+        return true;
+    }
+    if (due_seconds < static_cast<int64_t>(kMinScheduleUnixTime) ||
+        now < kMinScheduleUnixTime) {
+        return g_next_periodic_sync_not_before_ms.load(
+                   std::memory_order_acquire) <=
+            esp_timer_get_time() / 1000;
+    }
+    return static_cast<int64_t>(now) >= due_seconds;
+}
+
+void ScheduleNextPeriodicSync(uint32_t interval_minutes)
+{
+    const std::time_t now = CurrentUnixSeconds();
+    g_next_periodic_sync_not_before_ms.store(
+        interval_minutes == 0
+            ? 0
+            : esp_timer_get_time() / 1000 +
+                static_cast<int64_t>(interval_minutes) * 60 * 1000,
+        std::memory_order_release);
+    taskENTER_CRITICAL(&g_periodic_schedule_lock);
+    if (interval_minutes == 0) {
+        g_periodic_schedule_magic = 0;
+        g_periodic_schedule_interval_minutes = interval_minutes;
+        g_next_periodic_sync_unix_seconds = 0;
+    } else {
+        g_periodic_schedule_interval_minutes = interval_minutes;
+        // The UI seeds wall time after app_main starts the services. If a
+        // successful cold-boot sync wins that race, keep a valid relative
+        // schedule marker instead of clearing the schedule and immediately
+        // spinning another full round. Once wall time is valid, later rounds
+        // replace this zero sentinel with the absolute deadline.
+        g_next_periodic_sync_unix_seconds = now >= kMinScheduleUnixTime
+            ? static_cast<int64_t>(now) +
+                static_cast<int64_t>(interval_minutes) * 60
+            : 0;
+        g_periodic_schedule_magic = kPeriodicScheduleMagic;
+    }
+    taskEXIT_CRITICAL(&g_periodic_schedule_lock);
+}
+
+TickType_t PeriodicSyncWaitDelay(uint32_t interval_minutes)
+{
+    if (interval_minutes == 0) {
+        return portMAX_DELAY;
+    }
+    uint32_t magic = 0;
+    uint32_t scheduled_interval = 0;
+    int64_t due_seconds = 0;
+    taskENTER_CRITICAL(&g_periodic_schedule_lock);
+    magic = g_periodic_schedule_magic;
+    scheduled_interval = g_periodic_schedule_interval_minutes;
+    due_seconds = g_next_periodic_sync_unix_seconds;
+    taskEXIT_CRITICAL(&g_periodic_schedule_lock);
+    const std::time_t now = CurrentUnixSeconds();
+    if (magic != kPeriodicScheduleMagic ||
+        scheduled_interval != interval_minutes) {
+        return 0;
+    }
+    if (due_seconds < static_cast<int64_t>(kMinScheduleUnixTime) ||
+        now < kMinScheduleUnixTime) {
+        const int64_t remaining_ms =
+            g_next_periodic_sync_not_before_ms.load(
+                std::memory_order_acquire) -
+            esp_timer_get_time() / 1000;
+        if (remaining_ms <= 0) {
+            return 0;
+        }
+        const uint64_t fallback_ticks =
+            static_cast<uint64_t>(remaining_ms) / portTICK_PERIOD_MS;
+        return fallback_ticks >= static_cast<uint64_t>(portMAX_DELAY)
+            ? portMAX_DELAY - 1
+            : std::max<TickType_t>(1, static_cast<TickType_t>(fallback_ticks));
+    }
+    if (static_cast<int64_t>(now) >= due_seconds) {
+        return 0;
+    }
+    const uint64_t remaining_ms =
+        static_cast<uint64_t>(due_seconds - static_cast<int64_t>(now)) * 1000ULL;
+    const uint64_t ticks = remaining_ms / portTICK_PERIOD_MS;
+    return ticks >= static_cast<uint64_t>(portMAX_DELAY)
+        ? portMAX_DELAY - 1
+        : std::max<TickType_t>(1, static_cast<TickType_t>(ticks));
+}
+
+void ClearFullSyncRetry()
+{
+    taskENTER_CRITICAL(&g_periodic_schedule_lock);
+    g_full_sync_retry_magic = 0;
+    g_full_sync_retry_unix_seconds = 0;
+    taskEXIT_CRITICAL(&g_periodic_schedule_lock);
+    g_full_sync_retry_not_before_ms.store(0, std::memory_order_release);
+    g_full_sync_retry_attempts = 0;
+    PersistFullSyncRetryCheckpoint();
+}
+
+void ScheduleFullSyncRetry(uint32_t delay_ms)
+{
+    const std::time_t now = CurrentUnixSeconds();
+    const int64_t delay_seconds = std::max<int64_t>(1, (delay_ms + 999) / 1000);
+    g_full_sync_retry_not_before_ms.store(
+        esp_timer_get_time() / 1000 + delay_seconds * 1000,
+        std::memory_order_release);
+    taskENTER_CRITICAL(&g_periodic_schedule_lock);
+    g_full_sync_retry_unix_seconds = now >= kMinScheduleUnixTime
+        ? static_cast<int64_t>(now) + delay_seconds
+        : 0;
+    // Keep the retry marker even before wall time is seeded. The in-boot
+    // monotonic deadline drives the wait; if deep sleep/restart resets that
+    // scalar, the retained zero wall deadline is conservatively due once.
+    g_full_sync_retry_magic = kFullRetryMagic;
+    taskEXIT_CRITICAL(&g_periodic_schedule_lock);
+    PersistFullSyncRetryCheckpoint();
+}
+
+TickType_t FullSyncRetryWaitDelay()
+{
+    uint32_t retry_magic = 0;
+    int64_t due_seconds = 0;
+    taskENTER_CRITICAL(&g_periodic_schedule_lock);
+    retry_magic = g_full_sync_retry_magic;
+    due_seconds = g_full_sync_retry_unix_seconds;
+    taskEXIT_CRITICAL(&g_periodic_schedule_lock);
+    if (retry_magic != kFullRetryMagic) {
+        return portMAX_DELAY;
+    }
+    const std::time_t now = CurrentUnixSeconds();
+    if (due_seconds == 0 || now < kMinScheduleUnixTime) {
+        const int64_t remaining_ms =
+            g_full_sync_retry_not_before_ms.load(std::memory_order_acquire) -
+            esp_timer_get_time() / 1000;
+        if (remaining_ms <= 0) {
+            return 0;
+        }
+        const uint64_t ticks =
+            static_cast<uint64_t>(remaining_ms) / portTICK_PERIOD_MS;
+        return ticks >= static_cast<uint64_t>(portMAX_DELAY)
+            ? portMAX_DELAY - 1
+            : std::max<TickType_t>(1, static_cast<TickType_t>(ticks));
+    }
+    if (static_cast<int64_t>(now) >= due_seconds) {
+        return 0;
+    }
+    const uint64_t remaining_ms =
+        static_cast<uint64_t>(due_seconds - static_cast<int64_t>(now)) * 1000ULL;
+    const uint64_t ticks = remaining_ms / portTICK_PERIOD_MS;
+    return ticks >= static_cast<uint64_t>(portMAX_DELAY)
+        ? portMAX_DELAY - 1
+        : std::max<TickType_t>(1, static_cast<TickType_t>(ticks));
+}
+
+bool FullSyncRetryDue()
+{
+    return FullSyncRetryWaitDelay() == 0;
+}
+
+bool BootFullSyncDue()
+{
+    const std::time_t now = CurrentUnixSeconds();
+    if (now < kMinScheduleUnixTime) {
+        return true;
+    }
+    int64_t last_attempt = 0;
+    const esp_err_t result =
+        wqn::LoadBootFullSyncAttemptUnixSeconds(&last_attempt);
+    if (result != ESP_OK) {
+        ESP_LOGW(kTag, "boot full-sync throttle read failed: %s",
+                 esp_err_to_name(result));
+        return true;
+    }
+    return last_attempt < static_cast<int64_t>(kMinScheduleUnixTime) ||
+        static_cast<int64_t>(now) < last_attempt ||
+        static_cast<int64_t>(now) - last_attempt >=
+            kBootFullSyncMinIntervalSeconds;
+}
+
+bool JournalHasPendingContent(const wqn::SyncJournal& journal)
+{
+    const auto pending = [](const wqn::SyncJournalContentState& state) {
+        return state.desired_revision > state.applied_revision &&
+            state.phase != wqn::SyncJournalPhase::kBlocked;
+    };
+    return pending(journal.word_packs) || pending(journal.note_packs) ||
+        pending(journal.problem_packs);
+}
+
+bool ProbeDurableOutboxWork()
+{
+#if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
+    wqn::DurableWordObservation word;
+    esp_err_t result = wqn::PeekPendingWordObservation(&word);
+    if (result == ESP_OK) {
+        return true;
+    }
+    if (result != ESP_ERR_NOT_FOUND) {
+        ESP_LOGW(kTag, "word outbox boot probe failed: %s",
+                 esp_err_to_name(result));
+        return true;
+    }
+    wqn::DurableNoteObservation note;
+    result = wqn::PeekPendingNoteObservation(&note);
+    if (result == ESP_OK) {
+        return true;
+    }
+    if (result != ESP_ERR_NOT_FOUND) {
+        ESP_LOGW(kTag, "note outbox boot probe failed: %s",
+                 esp_err_to_name(result));
+        return true;
+    }
+    wqn::DurableProblemObservation problem;
+    result = wqn::PeekPendingProblemObservation(&problem);
+    if (result == ESP_OK) {
+        return true;
+    }
+    if (result != ESP_ERR_NOT_FOUND) {
+        ESP_LOGW(kTag, "problem outbox boot probe failed: %s",
+                 esp_err_to_name(result));
+        return true;
+    }
+#endif
+    return false;
+}
+
+uint32_t ArmOutboxQuietWindow()
+{
+    const int64_t now_ms = esp_timer_get_time() / 1000;
+    uint32_t generation = 0;
+    taskENTER_CRITICAL(&g_outbox_quiet_lock);
+    generation = ++g_outbox_quiet_generation;
+    if (generation == 0) {
+        generation = ++g_outbox_quiet_generation;
+    }
+    if (!g_outbox_quiet_active) {
+        g_outbox_quiet_deadline_ms =
+            now_ms + static_cast<int64_t>(kOutboxFlushLeaseMaxMs);
+    }
+    g_outbox_quiet_due_ms =
+        now_ms + static_cast<int64_t>(kWordOutboxQuietPeriodMs);
+    g_outbox_quiet_active = true;
+    taskEXIT_CRITICAL(&g_outbox_quiet_lock);
+    return generation;
+}
+
+void PublishOutboxReadyGeneration(uint32_t generation)
+{
+    taskENTER_CRITICAL(&g_outbox_quiet_lock);
+    g_outbox_ready_generation = generation;
+    taskEXIT_CRITICAL(&g_outbox_quiet_lock);
+    // Publish urgency before the ready flag. A consumer that observes the flag
+    // must also observe that this round is due now rather than retry-deferred.
+    g_outbox_immediate_requested.store(true, std::memory_order_relaxed);
     g_word_outbox_sync_requested.store(true, std::memory_order_release);
     if (g_sync_service_task != nullptr) {
         xTaskNotifyGive(g_sync_service_task);
     }
+}
+
+void PublishCurrentOutboxQuietWindowReady()
+{
+    uint32_t generation = 0;
+    bool ready = false;
+    taskENTER_CRITICAL(&g_outbox_quiet_lock);
+    if (g_outbox_quiet_active) {
+        generation = g_outbox_quiet_generation;
+        g_outbox_ready_generation = generation;
+        ready = true;
+    }
+    taskEXIT_CRITICAL(&g_outbox_quiet_lock);
+    if (!ready) {
+        return;
+    }
+    g_outbox_immediate_requested.store(true, std::memory_order_relaxed);
+    g_word_outbox_sync_requested.store(true, std::memory_order_release);
+    if (g_sync_service_task != nullptr) {
+        xTaskNotifyGive(g_sync_service_task);
+    }
+}
+
+bool OutboxQuietWindowActive()
+{
+    bool active = false;
+    taskENTER_CRITICAL(&g_outbox_quiet_lock);
+    active = g_outbox_quiet_active;
+    taskEXIT_CRITICAL(&g_outbox_quiet_lock);
+    return active;
+}
+
+TickType_t OutboxQuietLeaseWaitDelay()
+{
+    bool active = false;
+    int64_t deadline_ms = 0;
+    taskENTER_CRITICAL(&g_outbox_quiet_lock);
+    active = g_outbox_quiet_active;
+    deadline_ms = g_outbox_quiet_deadline_ms;
+    taskEXIT_CRITICAL(&g_outbox_quiet_lock);
+    if (!active) {
+        return portMAX_DELAY;
+    }
+    const int64_t remaining_ms = deadline_ms - esp_timer_get_time() / 1000;
+    if (remaining_ms <= 0) {
+        return 0;
+    }
+    return pdMS_TO_TICKS(static_cast<uint32_t>(std::min<int64_t>(
+        remaining_ms, kOutboxFlushLeaseMaxMs)));
+}
+
+uint32_t SecondsUntilOutboxQuietWake()
+{
+    bool active = false;
+    int64_t due_ms = 0;
+    taskENTER_CRITICAL(&g_outbox_quiet_lock);
+    active = g_outbox_quiet_active;
+    due_ms = g_outbox_quiet_due_ms;
+    taskEXIT_CRITICAL(&g_outbox_quiet_lock);
+    if (!active) {
+        return UINT32_MAX;
+    }
+    const int64_t remaining_ms = due_ms - esp_timer_get_time() / 1000;
+    return remaining_ms <= 0
+        ? 1
+        : static_cast<uint32_t>(std::max<int64_t>(
+              1, (remaining_ms + 999) / 1000));
+}
+
+void ForceExpiredOutboxQuietWindow()
+{
+    bool expired = false;
+    uint32_t generation = 0;
+    const int64_t now_ms = esp_timer_get_time() / 1000;
+    taskENTER_CRITICAL(&g_outbox_quiet_lock);
+    if (g_outbox_quiet_active && g_outbox_quiet_deadline_ms <= now_ms) {
+        generation = g_outbox_quiet_generation;
+        g_outbox_ready_generation = generation;
+        g_outbox_quiet_active = false;
+        g_outbox_quiet_due_ms = 0;
+        g_outbox_quiet_deadline_ms = 0;
+        g_outbox_lease_cycle_expired = true;
+        expired = true;
+    }
+    taskEXIT_CRITICAL(&g_outbox_quiet_lock);
+    if (!expired) {
+        return;
+    }
+    ESP_LOGI(
+        kTag,
+        "outbox quiet window capped; forcing bounded progress: generation=%lu",
+        static_cast<unsigned long>(generation));
+    g_outbox_immediate_requested.store(true, std::memory_order_relaxed);
+    g_word_outbox_sync_requested.store(true, std::memory_order_release);
+    if (g_sync_service_task != nullptr) {
+        xTaskNotifyGive(g_sync_service_task);
+    }
+}
+
+void ClaimOutboxReadyGeneration()
+{
+    taskENTER_CRITICAL(&g_outbox_quiet_lock);
+    const uint32_t ready_generation = g_outbox_ready_generation;
+    g_outbox_ready_generation = 0;
+    // A newer durable observation may have reset the timer after an older
+    // callback fired. Keep that newer quiet window (and its lease) armed.
+    if (ready_generation != 0 &&
+        ready_generation == g_outbox_quiet_generation) {
+        g_outbox_quiet_active = false;
+        g_outbox_quiet_due_ms = 0;
+        g_outbox_quiet_deadline_ms = 0;
+    }
+    taskEXIT_CRITICAL(&g_outbox_quiet_lock);
+}
+
+bool TakeOutboxLeaseCycleExpired()
+{
+    bool expired = false;
+    taskENTER_CRITICAL(&g_outbox_quiet_lock);
+    expired = g_outbox_lease_cycle_expired;
+    g_outbox_lease_cycle_expired = false;
+    taskEXIT_CRITICAL(&g_outbox_quiet_lock);
+    return expired;
+}
+
+wqn::services::SyncContentSnapshot* ContentSnapshotForKind(
+    wqn::protocol::v3::SyncContentKind kind)
+{
+    switch (kind) {
+        case wqn::protocol::v3::SyncContentKind::kWordPacks:
+            return &g_sync_snapshot.word_packs;
+        case wqn::protocol::v3::SyncContentKind::kNotePacks:
+            return &g_sync_snapshot.note_packs;
+        case wqn::protocol::v3::SyncContentKind::kProblemPacks:
+            return &g_sync_snapshot.problem_packs;
+        default:
+            return nullptr;
+    }
+}
+
+wqn::SyncJournalContentState* JournalStateForKind(
+    wqn::protocol::v3::SyncContentKind kind,
+    wqn::SyncJournal* journal = &g_sync_journal)
+{
+    switch (kind) {
+        case wqn::protocol::v3::SyncContentKind::kWordPacks:
+            return &journal->word_packs;
+        case wqn::protocol::v3::SyncContentKind::kNotePacks:
+            return &journal->note_packs;
+        case wqn::protocol::v3::SyncContentKind::kProblemPacks:
+            return &journal->problem_packs;
+        default:
+            return nullptr;
+    }
+}
+
+wqn::services::SyncContentSnapshot* ContentSnapshotForDomain(
+    wqn::services::SyncContentDomain domain)
+{
+    switch (domain) {
+        case wqn::services::SyncContentDomain::kWordPacks:
+            return &g_sync_snapshot.word_packs;
+        case wqn::services::SyncContentDomain::kNotePacks:
+            return &g_sync_snapshot.note_packs;
+        case wqn::services::SyncContentDomain::kProblemPacks:
+            return &g_sync_snapshot.problem_packs;
+        default:
+            return nullptr;
+    }
+}
+
+wqn::SyncJournalContentState* JournalStateForDomain(
+    wqn::services::SyncContentDomain domain)
+{
+    switch (domain) {
+        case wqn::services::SyncContentDomain::kWordPacks:
+            return &g_sync_journal.word_packs;
+        case wqn::services::SyncContentDomain::kNotePacks:
+            return &g_sync_journal.note_packs;
+        case wqn::services::SyncContentDomain::kProblemPacks:
+            return &g_sync_journal.problem_packs;
+        default:
+            return nullptr;
+    }
+}
+
+void JournalCommitSucceededLocked()
+{
+    g_sync_journal_retry_attempt = 0;
+    g_sync_journal_retry_not_before_ms.store(0, std::memory_order_release);
+    taskENTER_CRITICAL(&g_sync_snapshot_lock);
+    const bool pending =
+        g_control_journal_retry_not_before_ms.load(std::memory_order_acquire) != 0;
+    if (g_sync_snapshot.journal_pending != pending) ++g_sync_snapshot.state_sequence;
+    g_sync_snapshot.journal_pending = pending;
+    for (size_t index = 0; index < 3; ++index) {
+        if (!g_content_completion_pending[index]) continue;
+        const auto domain = static_cast<wqn::services::SyncContentDomain>(index);
+        auto* snapshot = ContentSnapshotForDomain(domain);
+        const auto* journal = JournalStateForDomain(domain);
+        *snapshot = g_content_completed_snapshot[index];
+        // A control response may have raised the target during a failed local
+        // completion. Publish the current durable intent, not a stale copy.
+        snapshot->desired_revision = journal->desired_revision;
+        snapshot->applied_revision = journal->applied_revision;
+        snapshot->phase = static_cast<wqn::services::SyncContentPhase>(journal->phase);
+        snapshot->retry_attempt = journal->retry_attempt;
+        if (journal->phase != wqn::SyncJournalPhase::kBackoff) {
+            snapshot->next_retry_ms = 0;
+            snapshot->last_error[0] = '\0';
+        }
+        g_content_completion_pending[index] = false;
+        ++g_sync_snapshot.state_sequence;
+    }
+    taskEXIT_CRITICAL(&g_sync_snapshot_lock);
+}
+
+void ScheduleLocalJournalRetry(uint8_t* attempt, std::atomic<int64_t>* deadline)
+{
+    constexpr uint32_t delays_ms[] = {5000, 15000, 60000};
+    const size_t index = std::min<size_t>(*attempt, 2);
+    if (*attempt < UINT8_MAX) ++*attempt;
+    deadline->store(
+        esp_timer_get_time() / 1000 + delays_ms[index], std::memory_order_release);
+    taskENTER_CRITICAL(&g_sync_snapshot_lock);
+    g_sync_snapshot.journal_pending = true;
+    ++g_sync_snapshot.state_sequence;
+    taskEXIT_CRITICAL(&g_sync_snapshot_lock);
+    if (g_sync_service_task != nullptr) xTaskNotifyGive(g_sync_service_task);
+}
+
+void JournalCommitFailedLocked()
+{
+    ScheduleLocalJournalRetry(&g_sync_journal_retry_attempt, &g_sync_journal_retry_not_before_ms);
+}
+
+esp_err_t PersistLatestSyncJournalLocked(const char* reason)
+{
+    wqn::SyncJournal snapshot;
+    taskENTER_CRITICAL(&g_sync_snapshot_lock);
+    snapshot = g_sync_journal;
+    taskEXIT_CRITICAL(&g_sync_snapshot_lock);
+    const esp_err_t result = wqn::SaveSyncJournalThroughStorageService(snapshot, reason);
+    if (result == ESP_OK) JournalCommitSucceededLocked();
+    else JournalCommitFailedLocked();
+    return result;
+}
+
+TickType_t LocalJournalRetryWaitDelay(const std::atomic<int64_t>& retry_deadline)
+{
+    const int64_t deadline = retry_deadline.load(std::memory_order_acquire);
+    if (deadline == 0) return portMAX_DELAY;
+    const int64_t remaining_ms = deadline - esp_timer_get_time() / 1000;
+    return remaining_ms <= 0 ? 0 : std::max<TickType_t>(1, pdMS_TO_TICKS(remaining_ms));
+}
+
+TickType_t JournalRetryWaitDelay()
+{
+    return LocalJournalRetryWaitDelay(g_sync_journal_retry_not_before_ms);
+}
+
+TickType_t ControlJournalRetryWaitDelay()
+{
+    return LocalJournalRetryWaitDelay(g_control_journal_retry_not_before_ms);
+}
+
+void RetryDirtySyncJournalIfDue()
+{
+    if (JournalRetryWaitDelay() != 0) return;
+    SyncJournalLock journal_lock;
+    if (!journal_lock) return;
+    // Another writer may have committed while we waited for the mutex.
+    if (!g_sync_journal_loaded || JournalRetryWaitDelay() != 0) return;
+    (void)PersistLatestSyncJournalLocked("local-retry");
+}
+
+void PublishContentTargets(
+    const std::vector<wqn::protocol::v3::SyncContentTarget>& targets)
+{
+    // Runtime publication only, after the bundled journal commit succeeded.
+    taskENTER_CRITICAL(&g_sync_snapshot_lock);
+    for (const auto& target : targets) {
+        if (target.kind == wqn::protocol::v3::SyncContentKind::kTodos) {
+            if (target.revision > g_sync_snapshot.todo_revision) {
+                g_sync_snapshot.todo_revision = target.revision;
+                ++g_sync_snapshot.state_sequence;
+            }
+            continue;
+        }
+        wqn::services::SyncContentSnapshot* snapshot =
+            ContentSnapshotForKind(target.kind);
+        if (snapshot == nullptr || target.revision == 0) {
+            continue;
+        }
+        if (target.revision > snapshot->desired_revision) {
+            snapshot->desired_revision = target.revision;
+            snapshot->phase = wqn::services::SyncContentPhase::kPending;
+            snapshot->retry_attempt = 0;
+            snapshot->next_retry_ms = 0;
+            snapshot->last_error[0] = '\0';
+            ++g_sync_snapshot.state_sequence;
+        }
+    }
+    taskEXIT_CRITICAL(&g_sync_snapshot_lock);
+}
+
+void WordOutboxTimerCallback(TimerHandle_t)
+{
+    PublishCurrentOutboxQuietWindowReady();
 }
 #endif
 
@@ -62,35 +810,268 @@ uint64_t g_config_revision = 0;
 uint64_t g_sync_cursor = 0;
 bool g_bootstrap_complete = false;
 bool g_control_state_loaded = false;
+// Per-dispatch signal from claim/bootstrap/sync. The scheduler converts it to
+// the same sticky protocol-blocked latch used by observation uploads.
+bool g_control_protocol_blocked_this_round = false;
 uint32_t g_control_retry_after_ms = 0;
 constexpr uint32_t kClaimPollFloorMs = 10000;
 constexpr uint32_t kClaimPollJitterMaxMs = 2000;
 constexpr uint32_t kClaimRetryBaseMs = 15000;
 constexpr uint32_t kClaimRetryMaxMs = 5 * 60 * 1000;
-constexpr uint32_t kStorageCapacityRetryMs = 5 * 60 * 1000;
 constexpr uint8_t kClaimRetryMaxShift = 4;
 constexpr uint32_t kWordOutboxRetryBaseMs = 30000;
 constexpr uint32_t kWordOutboxRetryMaxMs = 5 * 60 * 1000;
 constexpr uint32_t kWordOutboxRetryJitterMaxMs = 2000;
 constexpr uint8_t kWordOutboxRetryMaxShift = 4;
+// Retry ladder reaches ~5 minutes by the 4th attempt; 5 attempts covers a
+// genuine in-flight race (an earlier record still uploading on a slow link)
+// while bounding a permanent gap to roughly 15 minutes instead of forever.
+constexpr uint8_t kWordOutboxSequenceGapEscalation = 5;
 std::string g_bootstrap_request_id;
 std::string g_sync_request_id;
+uint32_t g_sync_request_auto_interval_minutes = 0;
+wqn::protocol::v3::RequestMetadata g_bootstrap_request_metadata;
+wqn::protocol::v3::RequestMetadata g_sync_request_metadata;
+wqn::protocol::v3::BootstrapData g_bootstrap_response;
+wqn::protocol::v3::SyncData g_sync_response;
+bool g_bootstrap_response_ready = false;
+bool g_sync_response_ready = false;
+uint8_t g_control_journal_retry_attempt = 0;
+
+void ResetControlExchanges()
+{
+    g_bootstrap_request_id.clear();
+    g_sync_request_id.clear();
+    g_bootstrap_request_metadata = {};
+    g_sync_request_metadata = {};
+    g_bootstrap_response = {};
+    g_sync_response = {};
+    g_bootstrap_response_ready = false;
+    g_sync_response_ready = false;
+    g_sync_request_auto_interval_minutes = 0;
+    g_control_journal_retry_attempt = 0;
+    g_control_journal_retry_not_before_ms.store(0, std::memory_order_release);
+    taskENTER_CRITICAL(&g_sync_snapshot_lock);
+    const bool pending =
+        g_sync_journal_retry_not_before_ms.load(std::memory_order_acquire) != 0;
+    if (g_sync_snapshot.journal_pending != pending) ++g_sync_snapshot.state_sequence;
+    g_sync_snapshot.journal_pending = pending;
+    taskEXIT_CRITICAL(&g_sync_snapshot_lock);
+}
 wqn::protocol::v3::ClaimKeyPair g_claim_key_pair;
 std::string g_claim_start_request_id;
 std::string g_claim_id;
 uint32_t g_claim_poll_interval_ms = kClaimPollFloorMs;
 uint8_t g_claim_retry_attempts = 0;
 bool g_claim_active = false;
-std::string g_word_outbox_retry_request_id;
-int64_t g_word_outbox_retry_not_before_ms = 0;
-uint8_t g_word_outbox_retry_attempts = 0;
 
 enum class WordOutboxUploadState : uint8_t {
     kDrained,
     kPending,
     kYielded,
+    kAuthenticationRequired,
+    // The server rejected the request at the protocol level (426
+    // UPGRADE_REQUIRED). Outbound polling suspends until OTA; records stay.
+    kProtocolBlocked,
     kFailed,
 };
+
+enum class OutboxRetryCause : uint8_t {
+    kNone,
+    kTransport,
+    kServer,
+    kLocalStorage,
+};
+
+enum class OutboxFailureDisposition : uint8_t {
+    kAuthenticationRequired,
+    kTransientTransport,
+    kTransientServer,
+    // Terminal classes (audit §16.B). The first three can still make queue
+    // progress; the last two must not delete or wedge the head.
+    kTombstoneRecoverable,
+    kSequenceResolved,
+    kSessionTerminal,
+    kProtocolBlocked,
+    kProtocolIntegrity,
+};
+
+// Maps a raw failure onto the seven-class taxonomy. Transport/retryable
+// ambiguity is resolved before the code table: a damaged envelope retries
+// because the server may have consumed the idempotency key already. An
+// unrecognized non-retryable code is conservatively treated as protocol
+// integrity (park, never delete) until a firmware update teaches us better.
+constexpr OutboxFailureDisposition ClassifyOutboxFailure(
+    bool authentication_required,
+    bool transport_failure,
+    bool server_retryable,
+    wqn::services::ServerErrorClass code_class)
+{
+    using wqn::services::ServerErrorClass;
+    if (authentication_required ||
+        code_class == ServerErrorClass::kAuthRequired) {
+        return OutboxFailureDisposition::kAuthenticationRequired;
+    }
+    if (transport_failure) {
+        return OutboxFailureDisposition::kTransientTransport;
+    }
+    if (server_retryable) {
+        return OutboxFailureDisposition::kTransientServer;
+    }
+    switch (code_class) {
+        case ServerErrorClass::kSequenceResolved:
+            return OutboxFailureDisposition::kSequenceResolved;
+        case ServerErrorClass::kSessionTerminal:
+            return OutboxFailureDisposition::kSessionTerminal;
+        case ServerErrorClass::kTombstoneRecoverable:
+            return OutboxFailureDisposition::kTombstoneRecoverable;
+        case ServerErrorClass::kProtocolBlocked:
+            return OutboxFailureDisposition::kProtocolBlocked;
+        case ServerErrorClass::kProtocolIntegrity:
+        case ServerErrorClass::kUnknownCode:
+            // Unrecognized non-empty terminal codes park conservatively
+            // until a firmware update teaches us the semantics.
+            return OutboxFailureDisposition::kProtocolIntegrity;
+        case ServerErrorClass::kAuthRequired:
+            return OutboxFailureDisposition::kAuthenticationRequired;
+        case ServerErrorClass::kUnrecognized:
+        case ServerErrorClass::kTransientRetry:
+            break;
+    }
+    return OutboxFailureDisposition::kTransientServer;
+}
+
+static_assert(
+    ClassifyOutboxFailure(
+        false,
+        false,
+        false,
+        wqn::services::ClassifyServerErrorCode("UNAUTHORIZED")) ==
+    OutboxFailureDisposition::kAuthenticationRequired);
+static_assert(
+    ClassifyOutboxFailure(false, true, false,
+                          wqn::services::ServerErrorClass::kUnrecognized) ==
+    OutboxFailureDisposition::kTransientTransport);
+static_assert(
+    ClassifyOutboxFailure(false, false, true,
+                          wqn::services::ServerErrorClass::kUnrecognized) ==
+    OutboxFailureDisposition::kTransientServer);
+static_assert(
+    ClassifyOutboxFailure(
+        false,
+        false,
+        false,
+        wqn::services::ClassifyServerErrorCode("SEQUENCE_ALREADY_APPLIED")) ==
+    OutboxFailureDisposition::kSequenceResolved);
+static_assert(
+    ClassifyOutboxFailure(
+        false, false, false,
+        wqn::services::ClassifyServerErrorCode("SESSION_NOT_ACTIVE")) ==
+    OutboxFailureDisposition::kSessionTerminal);
+static_assert(
+    ClassifyOutboxFailure(
+        false, false, false,
+        wqn::services::ClassifyServerErrorCode("ITEM_NOT_VISIBLE")) ==
+    OutboxFailureDisposition::kTombstoneRecoverable);
+static_assert(
+    ClassifyOutboxFailure(
+        false, false, false,
+        wqn::services::ClassifyServerErrorCode("UPGRADE_REQUIRED")) ==
+    OutboxFailureDisposition::kProtocolBlocked);
+static_assert(
+    ClassifyOutboxFailure(
+        false, false, false,
+        wqn::services::ClassifyServerErrorCode("REQUEST_ID_REUSED")) ==
+    OutboxFailureDisposition::kProtocolIntegrity);
+static_assert(
+    ClassifyOutboxFailure(
+        false,
+        false,
+        false,
+        wqn::services::ClassifyServerErrorCode("SOME_FUTURE_CODE")) ==
+    OutboxFailureDisposition::kProtocolIntegrity);
+
+OutboxFailureDisposition ClassifyOutboxFailure(
+    const wqn::protocol::v3::Error& error,
+    bool transport_failure,
+    bool force_retryable = false)
+{
+    return ClassifyOutboxFailure(
+        error.code == "UNAUTHORIZED",
+        transport_failure,
+        error.retryable || force_retryable,
+        wqn::services::ClassifyServerErrorCode(error.code));
+}
+
+OutboxRetryCause RetryCauseFor(OutboxFailureDisposition disposition)
+{
+    return disposition == OutboxFailureDisposition::kTransientTransport
+        ? OutboxRetryCause::kTransport
+        : OutboxRetryCause::kServer;
+}
+
+// Picks the durable park reason recorded next to a suspended observation.
+wqn::OutboxSuspendReason SuspendReasonFor(const std::string& code)
+{
+    if (code == "REQUEST_ID_REUSED") {
+        return wqn::OutboxSuspendReason::kIdempotencyConflict;
+    }
+    if (code == "SESSION_ACTOR_MISMATCH") {
+        return wqn::OutboxSuspendReason::kActorOwnership;
+    }
+    if (code == "INVALID_STUDY_OBSERVATION" ||
+        code == "INVALID_REQUEST") {
+        return wqn::OutboxSuspendReason::kInvalidIdentity;
+    }
+    if (code == "UPGRADE_REQUIRED") {
+        return wqn::OutboxSuspendReason::kProtocolBlocked;
+    }
+    return wqn::OutboxSuspendReason::kUnknownTerminal;
+}
+
+const char* OutboxRetryCauseName(OutboxRetryCause cause)
+{
+    switch (cause) {
+        case OutboxRetryCause::kTransport:
+            return "transport";
+        case OutboxRetryCause::kServer:
+            return "server";
+        case OutboxRetryCause::kLocalStorage:
+            return "local-storage";
+        case OutboxRetryCause::kNone:
+        default:
+            return "none";
+    }
+}
+
+std::string g_word_outbox_retry_request_id;
+int64_t g_word_outbox_retry_not_before_ms = 0;
+uint8_t g_word_outbox_retry_attempts = 0;
+OutboxRetryCause g_word_outbox_retry_cause = OutboxRetryCause::kNone;
+
+// A STUDY_SEQUENCE_GAP on a session that already survived
+// kWordOutboxSequenceGapEscalation attempts is not a race: the earlier record
+// is gone (parked at the identity level, lost from storage, or stranded on a
+// retired session), so no future upload can close the hole. Remembering the
+// session lets every remaining record of it be quarantined immediately instead
+// of each one burning its own retry ladder against the same dead gap.
+std::string g_word_outbox_gap_terminal_session_id;
+
+enum class SyncRoundOutcome : uint8_t {
+    kSucceeded,
+    kPartial,
+    kPartialNeedsFullRetry,
+    // The server rejected outbound traffic at the protocol level (426
+    // UPGRADE_REQUIRED): suspend retry polling until an OTA lands instead
+    // of burning the retry ladder against a contract we cannot satisfy.
+    kProtocolBlocked,
+    kFailed,
+};
+
+// Runtime mirror of the durable CLIENT_PROTOCOL_BLOCKED latch. The journal
+// binds it to the running ELF hash so resets stay parked and a different OTA
+// image receives exactly one fresh probe.
+bool g_outbox_protocol_suspended = false;
 
 WordOutboxUploadState g_last_word_outbox_upload_state =
     WordOutboxUploadState::kDrained;
@@ -102,6 +1083,7 @@ WordOutboxUploadState g_last_word_outbox_upload_state =
 std::string g_note_outbox_retry_request_id;
 int64_t g_note_outbox_retry_not_before_ms = 0;
 uint8_t g_note_outbox_retry_attempts = 0;
+OutboxRetryCause g_note_outbox_retry_cause = OutboxRetryCause::kNone;
 WordOutboxUploadState g_last_note_outbox_upload_state =
     WordOutboxUploadState::kDrained;
 
@@ -111,14 +1093,125 @@ WordOutboxUploadState g_last_note_outbox_upload_state =
 std::string g_problem_outbox_retry_request_id;
 int64_t g_problem_outbox_retry_not_before_ms = 0;
 uint8_t g_problem_outbox_retry_attempts = 0;
+OutboxRetryCause g_problem_outbox_retry_cause = OutboxRetryCause::kNone;
 WordOutboxUploadState g_last_problem_outbox_upload_state =
     WordOutboxUploadState::kDrained;
 
+static_assert(static_cast<uint8_t>(OutboxRetryCause::kNone) == 0);
+static_assert(static_cast<uint8_t>(OutboxRetryCause::kTransport) == 1);
+static_assert(static_cast<uint8_t>(OutboxRetryCause::kServer) == 2);
+static_assert(static_cast<uint8_t>(OutboxRetryCause::kLocalStorage) == 3);
+
+const char* CurrentFirmwareImageId()
+{
+    static char image_id[65] = {};
+    if (image_id[0] == '\0') {
+        const int written = esp_app_get_elf_sha256(image_id, sizeof(image_id));
+        if (written <= 1) {
+            std::snprintf(
+                image_id, sizeof(image_id), "version:%s", WQN_FIRMWARE_VERSION);
+        }
+    }
+    return image_id;
+}
+
+void CopyOutboxRetryCheckpoint(
+    wqn::SyncJournalOutboxRetryState* target,
+    const std::string& request_id,
+    int64_t not_before_ms,
+    uint8_t attempts,
+    OutboxRetryCause cause)
+{
+    if (target == nullptr) {
+        return;
+    }
+    std::snprintf(
+        target->request_id, sizeof(target->request_id), "%s", request_id.c_str());
+    target->not_before_unix_seconds = request_id.empty()
+        ? 0
+        : DurableRetryDeadline(not_before_ms);
+    target->attempt = request_id.empty() ? 0 : attempts;
+    target->cause = request_id.empty()
+        ? 0
+        : static_cast<uint8_t>(cause);
+}
+
+void PersistOutboxRetryCheckpoint()
+{
+    if (!g_sync_journal_loaded) {
+        return;
+    }
+    SyncJournalLock journal_lock;
+    if (!journal_lock) return;
+    wqn::SyncJournalOutboxRetryState word;
+    wqn::SyncJournalOutboxRetryState note;
+    wqn::SyncJournalOutboxRetryState problem;
+    CopyOutboxRetryCheckpoint(
+        &word,
+        g_word_outbox_retry_request_id,
+        g_word_outbox_retry_not_before_ms,
+        g_word_outbox_retry_attempts,
+        g_word_outbox_retry_cause);
+    CopyOutboxRetryCheckpoint(
+        &note,
+        g_note_outbox_retry_request_id,
+        g_note_outbox_retry_not_before_ms,
+        g_note_outbox_retry_attempts,
+        g_note_outbox_retry_cause);
+    CopyOutboxRetryCheckpoint(
+        &problem,
+        g_problem_outbox_retry_request_id,
+        g_problem_outbox_retry_not_before_ms,
+        g_problem_outbox_retry_attempts,
+        g_problem_outbox_retry_cause);
+    taskENTER_CRITICAL(&g_sync_snapshot_lock);
+    g_sync_journal.word_outbox = word;
+    g_sync_journal.note_outbox = note;
+    g_sync_journal.problem_outbox = problem;
+    taskEXIT_CRITICAL(&g_sync_snapshot_lock);
+    if (PersistLatestSyncJournalLocked("outbox-retry") != ESP_OK) {
+        ESP_LOGW(kTag, "outbox retry journal save failed");
+    }
+}
+
+void SetOutboxProtocolSuspended(bool suspended)
+{
+    SyncJournalLock journal_lock;
+    if (!journal_lock) return;
+    const char* const blocked_image_id = suspended ? CurrentFirmwareImageId() : "";
+    const bool journal_changed = std::strcmp(
+        g_sync_journal.protocol_blocked_image_id,
+        blocked_image_id) != 0;
+    const bool runtime_changed = g_outbox_protocol_suspended != suspended;
+    g_outbox_protocol_suspended = suspended;
+    if (!g_sync_journal_loaded || (!journal_changed && !runtime_changed)) {
+        return;
+    }
+    taskENTER_CRITICAL(&g_sync_snapshot_lock);
+    std::snprintf(
+        g_sync_journal.protocol_blocked_image_id,
+        sizeof(g_sync_journal.protocol_blocked_image_id),
+        "%s",
+        blocked_image_id);
+    taskEXIT_CRITICAL(&g_sync_snapshot_lock);
+    if (PersistLatestSyncJournalLocked("protocol-latch") != ESP_OK) {
+        ESP_LOGW(kTag, "protocol suspension journal save failed");
+    }
+}
+
 void ResetWordOutboxRetryBackoff()
 {
+    const bool changed = !g_word_outbox_retry_request_id.empty() ||
+        g_word_outbox_retry_not_before_ms != 0 ||
+        g_word_outbox_retry_attempts != 0 ||
+        g_word_outbox_retry_cause != OutboxRetryCause::kNone;
     g_word_outbox_retry_request_id.clear();
     g_word_outbox_retry_not_before_ms = 0;
     g_word_outbox_retry_attempts = 0;
+    g_word_outbox_retry_cause = OutboxRetryCause::kNone;
+    if (changed) {
+        PersistOutboxRetryCheckpoint();
+    }
 }
 
 bool WordOutboxRetryDeferred(
@@ -134,10 +1227,13 @@ bool WordOutboxRetryDeferred(
 
 void ScheduleWordOutboxRetry(
     const std::string& request_id,
-    uint32_t server_retry_after_ms)
+    uint32_t server_retry_after_ms,
+    OutboxRetryCause cause)
 {
     if (g_word_outbox_retry_request_id != request_id) {
-        ResetWordOutboxRetryBackoff();
+        g_word_outbox_retry_not_before_ms = 0;
+        g_word_outbox_retry_attempts = 0;
+        g_word_outbox_retry_cause = OutboxRetryCause::kNone;
         g_word_outbox_retry_request_id = request_id;
     }
     const uint8_t shift =
@@ -159,10 +1255,13 @@ void ScheduleWordOutboxRetry(
     }
     g_word_outbox_retry_not_before_ms =
         esp_timer_get_time() / 1000 + static_cast<int64_t>(delay_ms);
+    g_word_outbox_retry_cause = cause;
+    PersistOutboxRetryCheckpoint();
     ESP_LOGW(
         kTag,
-        "word outbox retry scheduled: request=%s attempt=%u retry_after_ms=%lu",
+        "word outbox retry scheduled: request=%s cause=%s attempt=%u retry_after_ms=%lu",
         request_id.c_str(),
+        OutboxRetryCauseName(cause),
         static_cast<unsigned>(g_word_outbox_retry_attempts),
         static_cast<unsigned long>(delay_ms));
 }
@@ -175,7 +1274,7 @@ TickType_t WordOutboxRetryWaitDelay()
     const int64_t remaining_ms =
         g_word_outbox_retry_not_before_ms - esp_timer_get_time() / 1000;
     if (remaining_ms <= 0) {
-        return 1;
+        return 0;
     }
     return pdMS_TO_TICKS(
         static_cast<uint32_t>(
@@ -184,9 +1283,17 @@ TickType_t WordOutboxRetryWaitDelay()
 
 void ResetNoteOutboxRetryBackoff()
 {
+    const bool changed = !g_note_outbox_retry_request_id.empty() ||
+        g_note_outbox_retry_not_before_ms != 0 ||
+        g_note_outbox_retry_attempts != 0 ||
+        g_note_outbox_retry_cause != OutboxRetryCause::kNone;
     g_note_outbox_retry_request_id.clear();
     g_note_outbox_retry_not_before_ms = 0;
     g_note_outbox_retry_attempts = 0;
+    g_note_outbox_retry_cause = OutboxRetryCause::kNone;
+    if (changed) {
+        PersistOutboxRetryCheckpoint();
+    }
 }
 
 bool NoteOutboxRetryDeferred(
@@ -202,10 +1309,13 @@ bool NoteOutboxRetryDeferred(
 
 void ScheduleNoteOutboxRetry(
     const std::string& request_id,
-    uint32_t server_retry_after_ms)
+    uint32_t server_retry_after_ms,
+    OutboxRetryCause cause)
 {
     if (g_note_outbox_retry_request_id != request_id) {
-        ResetNoteOutboxRetryBackoff();
+        g_note_outbox_retry_not_before_ms = 0;
+        g_note_outbox_retry_attempts = 0;
+        g_note_outbox_retry_cause = OutboxRetryCause::kNone;
         g_note_outbox_retry_request_id = request_id;
     }
     const uint8_t shift =
@@ -227,10 +1337,13 @@ void ScheduleNoteOutboxRetry(
     }
     g_note_outbox_retry_not_before_ms =
         esp_timer_get_time() / 1000 + static_cast<int64_t>(delay_ms);
+    g_note_outbox_retry_cause = cause;
+    PersistOutboxRetryCheckpoint();
     ESP_LOGW(
         kTag,
-        "note outbox retry scheduled: request=%s attempt=%u retry_after_ms=%lu",
+        "note outbox retry scheduled: request=%s cause=%s attempt=%u retry_after_ms=%lu",
         request_id.c_str(),
+        OutboxRetryCauseName(cause),
         static_cast<unsigned>(g_note_outbox_retry_attempts),
         static_cast<unsigned long>(delay_ms));
 }
@@ -243,7 +1356,7 @@ TickType_t NoteOutboxRetryWaitDelay()
     const int64_t remaining_ms =
         g_note_outbox_retry_not_before_ms - esp_timer_get_time() / 1000;
     if (remaining_ms <= 0) {
-        return 1;
+        return 0;
     }
     return pdMS_TO_TICKS(
         static_cast<uint32_t>(
@@ -252,9 +1365,17 @@ TickType_t NoteOutboxRetryWaitDelay()
 
 void ResetProblemOutboxRetryBackoff()
 {
+    const bool changed = !g_problem_outbox_retry_request_id.empty() ||
+        g_problem_outbox_retry_not_before_ms != 0 ||
+        g_problem_outbox_retry_attempts != 0 ||
+        g_problem_outbox_retry_cause != OutboxRetryCause::kNone;
     g_problem_outbox_retry_request_id.clear();
     g_problem_outbox_retry_not_before_ms = 0;
     g_problem_outbox_retry_attempts = 0;
+    g_problem_outbox_retry_cause = OutboxRetryCause::kNone;
+    if (changed) {
+        PersistOutboxRetryCheckpoint();
+    }
 }
 
 bool ProblemOutboxRetryDeferred(
@@ -270,10 +1391,13 @@ bool ProblemOutboxRetryDeferred(
 
 void ScheduleProblemOutboxRetry(
     const std::string& request_id,
-    uint32_t server_retry_after_ms)
+    uint32_t server_retry_after_ms,
+    OutboxRetryCause cause)
 {
     if (g_problem_outbox_retry_request_id != request_id) {
-        ResetProblemOutboxRetryBackoff();
+        g_problem_outbox_retry_not_before_ms = 0;
+        g_problem_outbox_retry_attempts = 0;
+        g_problem_outbox_retry_cause = OutboxRetryCause::kNone;
         g_problem_outbox_retry_request_id = request_id;
     }
     const uint8_t shift =
@@ -295,10 +1419,13 @@ void ScheduleProblemOutboxRetry(
     }
     g_problem_outbox_retry_not_before_ms =
         esp_timer_get_time() / 1000 + static_cast<int64_t>(delay_ms);
+    g_problem_outbox_retry_cause = cause;
+    PersistOutboxRetryCheckpoint();
     ESP_LOGW(
         kTag,
-        "problem outbox retry scheduled: request=%s attempt=%u retry_after_ms=%lu",
+        "problem outbox retry scheduled: request=%s cause=%s attempt=%u retry_after_ms=%lu",
         request_id.c_str(),
+        OutboxRetryCauseName(cause),
         static_cast<unsigned>(g_problem_outbox_retry_attempts),
         static_cast<unsigned long>(delay_ms));
 }
@@ -311,33 +1438,38 @@ TickType_t ProblemOutboxRetryWaitDelay()
     const int64_t remaining_ms =
         g_problem_outbox_retry_not_before_ms - esp_timer_get_time() / 1000;
     if (remaining_ms <= 0) {
-        return 1;
+        return 0;
     }
     return pdMS_TO_TICKS(
         static_cast<uint32_t>(
             std::min<int64_t>(remaining_ms, kWordOutboxRetryMaxMs)));
 }
 
-bool IsStorageCapacityError(esp_err_t error)
+void ResumeTransportDeferredOutboxes()
 {
-    return error == ESP_ERR_NO_MEM || error == ESP_ERR_INVALID_SIZE ||
-        error == ESP_ERR_NVS_NOT_ENOUGH_SPACE;
-}
-
-void ApplyStorageCapacityBackoff(esp_err_t error, const char* stage)
-{
-    if (!IsStorageCapacityError(error)) {
+    bool resumed = false;
+    if (!g_word_outbox_retry_request_id.empty() &&
+        g_word_outbox_retry_cause == OutboxRetryCause::kTransport) {
+        g_word_outbox_retry_not_before_ms = 0;
+        resumed = true;
+    }
+    if (!g_note_outbox_retry_request_id.empty() &&
+        g_note_outbox_retry_cause == OutboxRetryCause::kTransport) {
+        g_note_outbox_retry_not_before_ms = 0;
+        resumed = true;
+    }
+    if (!g_problem_outbox_retry_request_id.empty() &&
+        g_problem_outbox_retry_cause == OutboxRetryCause::kTransport) {
+        g_problem_outbox_retry_not_before_ms = 0;
+        resumed = true;
+    }
+    if (!resumed) {
         return;
     }
-    g_control_retry_after_ms = std::max(
-        g_control_retry_after_ms,
-        kStorageCapacityRetryMs);
-    ESP_LOGW(
-        kTag,
-        "sync storage-full: stage=%s error=%s retry_after_ms=%lu",
-        stage,
-        esp_err_to_name(error),
-        static_cast<unsigned long>(g_control_retry_after_ms));
+    PersistOutboxRetryCheckpoint();
+    ESP_LOGI(kTag, "connectivity restored; resuming transport-deferred outboxes");
+    g_outbox_immediate_requested.store(true, std::memory_order_relaxed);
+    g_word_outbox_sync_requested.store(true, std::memory_order_release);
 }
 
 uint32_t AddClaimJitter(uint32_t base_ms)
@@ -378,14 +1510,154 @@ esp_err_t EnsureControlStateLoaded()
     if (g_control_state_loaded) {
         return ESP_OK;
     }
-    wqn::DeviceControlState state;
-    ESP_RETURN_ON_ERROR(
-        wqn::LoadDeviceControlState(&state),
-        kTag,
-        "load v3 control checkpoint");
-    g_config_revision = state.config_revision;
-    g_sync_cursor = state.sync_cursor;
+    ESP_RETURN_ON_ERROR(EnsureSyncJournalLoaded(), kTag, "load control journal");
+    // Existing v1/v2 journals already contain both fields and content intent.
+    // They are authoritative even if legacy NVS advanced past a failed save.
+    // With no journal, bootstrap from zero; never import a torn two-key pair.
+    g_config_revision = g_sync_journal.config_revision;
+    g_sync_cursor = g_sync_journal.sync_cursor;
     g_control_state_loaded = true;
+    return ESP_OK;
+}
+
+esp_err_t EnsureSyncJournalLoaded()
+{
+    if (g_sync_journal_loaded) {
+        return ESP_OK;
+    }
+    SyncJournalLock journal_lock;
+    if (!journal_lock) return ESP_ERR_INVALID_STATE;
+    esp_err_t result = wqn::LoadSyncJournal(&g_sync_journal);
+    if (result != ESP_OK) {
+        ESP_LOGE(kTag, "sync journal invalid: %s", esp_err_to_name(result));
+        return result;
+    }
+    bool journal_changed = false;
+    const auto recover = [&](wqn::SyncJournalContentState* state) {
+        if (state->phase == wqn::SyncJournalPhase::kFetching ||
+            state->phase == wqn::SyncJournalPhase::kInstalling) {
+            state->phase = wqn::SyncJournalPhase::kPending;
+            state->retry_not_before_unix_seconds = 0;
+            journal_changed = true;
+        }
+    };
+    recover(&g_sync_journal.word_packs);
+    recover(&g_sync_journal.note_packs);
+    recover(&g_sync_journal.problem_packs);
+    const auto publish = [&](const wqn::SyncJournalContentState& source,
+                             wqn::services::SyncContentSnapshot* target) {
+        target->desired_revision = source.desired_revision;
+        target->applied_revision = source.applied_revision;
+        target->phase = static_cast<wqn::services::SyncContentPhase>(source.phase);
+        target->retry_attempt = source.retry_attempt;
+        if (source.phase == wqn::SyncJournalPhase::kBackoff) {
+            const uint8_t shift = source.retry_attempt == 0
+                ? 0
+                : std::min<uint8_t>(source.retry_attempt - 1, 7);
+            const uint32_t fallback_ms =
+                std::min<uint32_t>(5000u << shift, 900000u);
+            target->next_retry_ms = RestoreMonotonicRetryDeadline(
+                source.retry_not_before_unix_seconds,
+                fallback_ms,
+                900000u);
+        }
+        std::snprintf(target->snapshot_id, sizeof(target->snapshot_id), "%s",
+                      source.desired_snapshot_id);
+    };
+    taskENTER_CRITICAL(&g_sync_snapshot_lock);
+    publish(g_sync_journal.word_packs, &g_sync_snapshot.word_packs);
+    publish(g_sync_journal.note_packs, &g_sync_snapshot.note_packs);
+    publish(g_sync_journal.problem_packs, &g_sync_snapshot.problem_packs);
+    if (g_sync_snapshot.word_packs.desired_revision >
+            g_sync_snapshot.word_packs.applied_revision ||
+        g_sync_snapshot.note_packs.desired_revision >
+            g_sync_snapshot.note_packs.applied_revision ||
+        g_sync_snapshot.problem_packs.desired_revision >
+            g_sync_snapshot.problem_packs.applied_revision) {
+        g_sync_snapshot.state_sequence = 1;
+    }
+    taskEXIT_CRITICAL(&g_sync_snapshot_lock);
+
+    const auto& full_retry = g_sync_journal.full_sync_retry;
+    if (full_retry.not_before_unix_seconds != 0 || full_retry.attempt != 0) {
+        const uint8_t fallback_index = full_retry.attempt == 0
+            ? 0
+            : static_cast<uint8_t>(std::min<size_t>(
+                  full_retry.attempt - 1, kFullSyncRetryLadderSize - 1));
+        g_full_sync_retry_attempts = full_retry.attempt;
+        g_full_sync_retry_not_before_ms.store(
+            RestoreMonotonicRetryDeadline(
+                full_retry.not_before_unix_seconds,
+                kFullSyncRetryLadderMs[fallback_index],
+                kFullSyncRetryLadderMs[kFullSyncRetryLadderSize - 1]),
+            std::memory_order_release);
+        taskENTER_CRITICAL(&g_periodic_schedule_lock);
+        g_full_sync_retry_magic = kFullRetryMagic;
+        g_full_sync_retry_unix_seconds = static_cast<int64_t>(
+            full_retry.not_before_unix_seconds);
+        taskEXIT_CRITICAL(&g_periodic_schedule_lock);
+    }
+
+    const auto restore_outbox = [](
+        const wqn::SyncJournalOutboxRetryState& source,
+        std::string* request_id,
+        int64_t* not_before_ms,
+        uint8_t* attempts,
+        OutboxRetryCause* cause) {
+        if (source.request_id[0] == '\0') {
+            return;
+        }
+        *request_id = source.request_id;
+        *not_before_ms = RestoreMonotonicRetryDeadline(
+            source.not_before_unix_seconds,
+            kWordOutboxRetryBaseMs,
+            kWordOutboxRetryMaxMs);
+        *attempts = source.attempt;
+        *cause = static_cast<OutboxRetryCause>(source.cause);
+    };
+    restore_outbox(
+        g_sync_journal.word_outbox,
+        &g_word_outbox_retry_request_id,
+        &g_word_outbox_retry_not_before_ms,
+        &g_word_outbox_retry_attempts,
+        &g_word_outbox_retry_cause);
+    restore_outbox(
+        g_sync_journal.note_outbox,
+        &g_note_outbox_retry_request_id,
+        &g_note_outbox_retry_not_before_ms,
+        &g_note_outbox_retry_attempts,
+        &g_note_outbox_retry_cause);
+    restore_outbox(
+        g_sync_journal.problem_outbox,
+        &g_problem_outbox_retry_request_id,
+        &g_problem_outbox_retry_not_before_ms,
+        &g_problem_outbox_retry_attempts,
+        &g_problem_outbox_retry_cause);
+    const char* const blocked_image_id =
+        g_sync_journal.protocol_blocked_image_id;
+    const char* const current_image_id = CurrentFirmwareImageId();
+    if (blocked_image_id[0] != '\0' &&
+        std::strcmp(blocked_image_id, current_image_id) == 0) {
+        g_outbox_protocol_suspended = true;
+        ESP_LOGW(
+            kTag,
+            "protocol suspension restored for current firmware image");
+    } else if (blocked_image_id[0] != '\0') {
+        ESP_LOGI(
+            kTag,
+            "clearing protocol suspension after firmware image change");
+        g_sync_journal.protocol_blocked_image_id[0] = '\0';
+        journal_changed = true;
+    }
+    g_sync_journal_loaded = true;
+    if (journal_changed) {
+        ESP_LOGW(kTag, "sync journal recovered or migrated during startup");
+        result = PersistLatestSyncJournalLocked("startup-recovery");
+        if (result != ESP_OK) {
+            g_sync_journal_loaded = false;
+            return result;
+        }
+    }
     return ESP_OK;
 }
 
@@ -420,6 +1692,46 @@ wqn::protocol::v3::RequestMetadata MakeControlMetadata()
     metadata.sync_cursor = g_sync_cursor;
     metadata.limit = WQN_SYNC_LIMIT;
     return metadata;
+}
+
+esp_err_t CommitControlResponse(
+    const wqn::DeviceControlState& checkpoint,
+    const std::vector<wqn::protocol::v3::SyncContentTarget>& targets)
+{
+    SyncJournalLock journal_lock;
+    if (!journal_lock || !g_sync_journal_loaded) return ESP_ERR_INVALID_STATE;
+    wqn::SyncJournal candidate;
+    taskENTER_CRITICAL(&g_sync_snapshot_lock);
+    candidate = g_sync_journal;
+    taskEXIT_CRITICAL(&g_sync_snapshot_lock);
+    candidate.config_revision = checkpoint.config_revision;
+    candidate.sync_cursor = checkpoint.sync_cursor;
+    for (const auto& target : targets) {
+        auto* state = JournalStateForKind(target.kind, &candidate);
+        if (state == nullptr || target.revision <= state->desired_revision) continue;
+        state->desired_revision = target.revision;
+        state->phase = wqn::SyncJournalPhase::kPending;
+        state->retry_attempt = 0;
+        state->retry_not_before_unix_seconds = 0;
+        state->desired_snapshot_id[0] = '\0';
+    }
+    // One authority/one durable publication: no NVS cursor can outrun intent.
+    // Failed candidates are not installed in RAM or saved by another lane.
+    const esp_err_t result = wqn::SaveSyncJournalThroughStorageService(candidate, "control-response");
+    if (result != ESP_OK) {
+        ScheduleLocalJournalRetry(&g_control_journal_retry_attempt, &g_control_journal_retry_not_before_ms);
+        return result;
+    }
+    taskENTER_CRITICAL(&g_sync_snapshot_lock);
+    g_sync_journal = candidate;
+    taskEXIT_CRITICAL(&g_sync_snapshot_lock);
+    g_config_revision = checkpoint.config_revision;
+    g_sync_cursor = checkpoint.sync_cursor;
+    g_control_journal_retry_attempt = 0;
+    g_control_journal_retry_not_before_ms.store(0, std::memory_order_release);
+    JournalCommitSucceededLocked();
+    PublishContentTargets(targets);
+    return ESP_OK;
 }
 
 std::string DeviceHardwareId()
@@ -493,6 +1805,9 @@ esp_err_t StartClaimSession()
         &claim,
         &error);
     if (result != ESP_OK) {
+        if (error.code == "UPGRADE_REQUIRED") {
+            g_control_protocol_blocked_this_round = true;
+        }
         g_control_retry_after_ms = NextClaimRetryDelayMs(
             error.retryable ? error.retry_after_ms : 0);
         ESP_LOGW(
@@ -531,6 +1846,9 @@ esp_err_t PollClaimSession()
     const esp_err_t result =
         wqn::PollDeviceClaimV3(metadata, g_claim_id, &poll, &error);
     if (result != ESP_OK) {
+        if (error.code == "UPGRADE_REQUIRED") {
+            g_control_protocol_blocked_this_round = true;
+        }
         g_control_retry_after_ms = NextClaimRetryDelayMs(
             error.retryable ? error.retry_after_ms : 0);
         ESP_LOGW(
@@ -588,8 +1906,7 @@ esp_err_t RunDeviceClaimRoundV3()
         return ESP_OK;
     }
     g_bootstrap_complete = false;
-    g_bootstrap_request_id.clear();
-    g_sync_request_id.clear();
+    ResetControlExchanges();
     g_config_revision = 0;
     g_sync_cursor = 0;
     return g_claim_active ? PollClaimSession() : StartClaimSession();
@@ -619,18 +1936,131 @@ void SetSyncRoundStarted(int64_t started_ms)
     taskEXIT_CRITICAL(&g_sync_snapshot_lock);
 }
 
-void CompleteSyncRound(int64_t finished_ms, bool synced)
+void CompleteSyncRound(int64_t finished_ms, SyncRoundOutcome outcome)
 {
     taskENTER_CRITICAL(&g_sync_snapshot_lock);
     g_sync_snapshot.last_finished_ms = finished_ms;
-    g_sync_snapshot.last_round_success = synced;
-    if (synced) {
+    g_sync_snapshot.last_round_success = outcome == SyncRoundOutcome::kSucceeded;
+    if (outcome == SyncRoundOutcome::kSucceeded) {
         ++g_sync_snapshot.success_count;
+    } else if (outcome == SyncRoundOutcome::kPartial ||
+               outcome == SyncRoundOutcome::kPartialNeedsFullRetry) {
+        ++g_sync_snapshot.partial_count;
     } else {
         ++g_sync_snapshot.failure_count;
     }
     taskEXIT_CRITICAL(&g_sync_snapshot_lock);
 }
+
+#if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
+wqn::services::SyncOutboxPhase PublicOutboxPhase(WordOutboxUploadState state)
+{
+    switch (state) {
+        case WordOutboxUploadState::kDrained:
+            return wqn::services::SyncOutboxPhase::kDrained;
+        case WordOutboxUploadState::kPending:
+        case WordOutboxUploadState::kAuthenticationRequired:
+            return wqn::services::SyncOutboxPhase::kPending;
+        case WordOutboxUploadState::kYielded:
+            return wqn::services::SyncOutboxPhase::kYielded;
+        case WordOutboxUploadState::kProtocolBlocked:
+        case WordOutboxUploadState::kFailed:
+        default:
+            return wqn::services::SyncOutboxPhase::kBlocked;
+    }
+}
+
+void FillOutboxSnapshot(
+    wqn::services::SyncOutboxSnapshot* snapshot,
+    WordOutboxUploadState state,
+    uint8_t retry_attempt,
+    int64_t next_retry_ms)
+{
+    if (snapshot == nullptr) {
+        return;
+    }
+    snapshot->phase = PublicOutboxPhase(state);
+    snapshot->retry_attempt = retry_attempt;
+    snapshot->next_retry_ms = next_retry_ms;
+    const char* detail = "";
+    switch (state) {
+        case WordOutboxUploadState::kPending:
+            detail = "retry pending";
+            break;
+        case WordOutboxUploadState::kYielded:
+            detail = "yielded for interaction";
+            break;
+        case WordOutboxUploadState::kAuthenticationRequired:
+            detail = "authentication recovery";
+            break;
+        case WordOutboxUploadState::kProtocolBlocked:
+            detail = "firmware update required";
+            break;
+        case WordOutboxUploadState::kFailed:
+            detail = "queue blocked";
+            break;
+        case WordOutboxUploadState::kDrained:
+        default:
+            break;
+    }
+    std::snprintf(snapshot->last_error, sizeof(snapshot->last_error), "%s", detail);
+}
+
+void PublishOutboxSnapshots()
+{
+    taskENTER_CRITICAL(&g_sync_snapshot_lock);
+    FillOutboxSnapshot(
+        &g_sync_snapshot.word_outbox,
+        g_last_word_outbox_upload_state,
+        g_word_outbox_retry_attempts,
+        g_word_outbox_retry_not_before_ms);
+    FillOutboxSnapshot(
+        &g_sync_snapshot.note_outbox,
+        g_last_note_outbox_upload_state,
+        g_note_outbox_retry_attempts,
+        g_note_outbox_retry_not_before_ms);
+    FillOutboxSnapshot(
+        &g_sync_snapshot.problem_outbox,
+        g_last_problem_outbox_upload_state,
+        g_problem_outbox_retry_attempts,
+        g_problem_outbox_retry_not_before_ms);
+    taskEXIT_CRITICAL(&g_sync_snapshot_lock);
+}
+
+bool AllOutboxesDrained()
+{
+    return g_last_word_outbox_upload_state == WordOutboxUploadState::kDrained &&
+        g_last_note_outbox_upload_state == WordOutboxUploadState::kDrained &&
+        g_last_problem_outbox_upload_state == WordOutboxUploadState::kDrained;
+}
+
+SyncRoundOutcome CurrentOutboxOutcome()
+{
+    if (g_last_word_outbox_upload_state ==
+            WordOutboxUploadState::kProtocolBlocked ||
+        g_last_note_outbox_upload_state ==
+            WordOutboxUploadState::kProtocolBlocked ||
+        g_last_problem_outbox_upload_state ==
+            WordOutboxUploadState::kProtocolBlocked) {
+        return SyncRoundOutcome::kProtocolBlocked;
+    }
+    if (AllOutboxesDrained()) {
+        return SyncRoundOutcome::kSucceeded;
+    }
+    if (g_last_word_outbox_upload_state == WordOutboxUploadState::kFailed ||
+        g_last_note_outbox_upload_state == WordOutboxUploadState::kFailed ||
+        g_last_problem_outbox_upload_state == WordOutboxUploadState::kFailed ||
+        g_last_word_outbox_upload_state ==
+            WordOutboxUploadState::kAuthenticationRequired ||
+        g_last_note_outbox_upload_state ==
+            WordOutboxUploadState::kAuthenticationRequired ||
+        g_last_problem_outbox_upload_state ==
+            WordOutboxUploadState::kAuthenticationRequired) {
+        return SyncRoundOutcome::kPartialNeedsFullRetry;
+    }
+    return SyncRoundOutcome::kPartial;
+}
+#endif
 
 void PublishSyncEvent(
     wqn::services::SyncEventStatus status,
@@ -640,24 +2070,31 @@ void PublishSyncEvent(
     wqn::services::SyncEvent event;
     event.status = status;
     event.scope = scope;
+    event.finished_ms = finished_ms;
+    taskENTER_CRITICAL(&g_sync_snapshot_lock);
+    // SyncService and the independent bulk content lane can both publish.
+    // Assign the sequence under the same lock as the mailbox write so a later
+    // sequence can never be overwritten by an earlier publisher.
     event.sequence = g_sync_event_sequence++;
     if (event.sequence == 0) {
         event.sequence = g_sync_event_sequence++;
     }
-    event.finished_ms = finished_ms;
-    taskENTER_CRITICAL(&g_sync_snapshot_lock);
     std::snprintf(
         event.claim_code,
         sizeof(event.claim_code),
         "%s",
         g_sync_snapshot.claim_code);
     event.claim_expires_at_ms = g_sync_snapshot.claim_expires_at_ms;
+    event.todo_revision = g_sync_snapshot.todo_revision;
+    g_latest_sync_event = event;
     taskEXIT_CRITICAL(&g_sync_snapshot_lock);
-
+    // The mailbox payload is complete before the sink is observed/called. A
+    // task notification may coalesce, which is safe because consumers compare
+    // the overwrite-safe sequence rather than expecting one wake per event.
     const wqn::services::SyncEventSink sink =
         g_sync_event_sink.load(std::memory_order_acquire);
     if (sink != nullptr) {
-        sink(event);
+        sink();
     }
 }
 
@@ -685,212 +2122,6 @@ bool LoadUsableToken(std::string* token)
     return true;
 }
 
-std::vector<wqn::CachedProblem> ToCachedProblems(const std::vector<wqn::WqnProblem>& problems)
-{
-    std::vector<wqn::CachedProblem> cached;
-    cached.reserve(problems.size());
-    for (const wqn::WqnProblem& problem : problems) {
-        wqn::CachedProblem item;
-        item.id = problem.id;
-        item.title = problem.title;
-        item.type = problem.problem_type;
-        item.status = problem.status;
-        item.content_text = problem.content_text;
-        item.solution_text = problem.solution_text;
-        item.asset_count = problem.asset_count;
-        item.solution_asset_count = problem.solution_asset_count;
-        item.updated_at = problem.updated_at;
-        cached.push_back(std::move(item));
-    }
-    return cached;
-}
-
-bool UpsertProblem(std::vector<wqn::CachedProblem>* cached, wqn::CachedProblem problem)
-{
-    if (cached == nullptr || problem.id.empty()) {
-        return false;
-    }
-
-    for (wqn::CachedProblem& item : *cached) {
-        if (item.id == problem.id) {
-            bool changed = false;
-            if (!problem.title.empty() && item.title != problem.title) {
-                item.title = std::move(problem.title);
-                changed = true;
-            }
-            if (!problem.type.empty() && item.type != problem.type) {
-                item.type = std::move(problem.type);
-                changed = true;
-            }
-            if (!problem.status.empty() && item.status != problem.status) {
-                item.status = std::move(problem.status);
-                changed = true;
-            }
-            if (!problem.content_text.empty() && item.content_text != problem.content_text) {
-                item.content_text = std::move(problem.content_text);
-                changed = true;
-            }
-            if (!problem.solution_text.empty() && item.solution_text != problem.solution_text) {
-                item.solution_text = std::move(problem.solution_text);
-                changed = true;
-            }
-            if (item.asset_count != problem.asset_count) {
-                item.asset_count = problem.asset_count;
-                changed = true;
-            }
-            if (item.solution_asset_count != problem.solution_asset_count) {
-                item.solution_asset_count = problem.solution_asset_count;
-                changed = true;
-            }
-            if (!problem.updated_at.empty() && item.updated_at != problem.updated_at) {
-                item.updated_at = std::move(problem.updated_at);
-                changed = true;
-            }
-            return changed;
-        }
-    }
-    cached->push_back(std::move(problem));
-    return true;
-}
-
-esp_err_t MergeProblemCache(const std::vector<wqn::WqnProblem>& fresh, const char* source)
-{
-    if (fresh.empty()) {
-        return ESP_OK;
-    }
-
-    std::vector<wqn::CachedProblem> cached;
-    const esp_err_t load_result = wqn::LoadProblems(&cached);
-    if (load_result != ESP_OK) {
-        ESP_LOGW(kTag, "dropping unreadable problem cache before merge: %s", esp_err_to_name(load_result));
-        cached.clear();
-    }
-
-    std::vector<wqn::CachedProblem> incoming = ToCachedProblems(fresh);
-    bool changed = false;
-    for (wqn::CachedProblem& problem : incoming) {
-        changed = UpsertProblem(&cached, std::move(problem)) || changed;
-    }
-    if (!changed) {
-        ESP_LOGI(
-            kTag,
-            "%s cache unchanged: fresh=%u total_cached=%u; write skipped",
-            source,
-            static_cast<unsigned>(fresh.size()),
-            static_cast<unsigned>(cached.size()));
-        return ESP_OK;
-    }
-
-    const esp_err_t save_result = wqn::SaveProblems(cached);
-    if (save_result != ESP_OK) {
-        ESP_LOGW(kTag, "save problem cache failed: %s", esp_err_to_name(save_result));
-        return save_result;
-    }
-
-    ESP_LOGI(
-        kTag,
-        "%s cached: fresh=%u total_cached=%u",
-        source,
-        static_cast<unsigned>(fresh.size()),
-        static_cast<unsigned>(cached.size()));
-    return ESP_OK;
-}
-
-esp_err_t UploadPendingReviewsIfAny(const std::string& token)
-{
-    std::vector<wqn::PendingReviewResult> pending;
-    esp_err_t result = wqn::LoadPendingReviewResults(&pending);
-    if (result != ESP_OK) {
-        return result;
-    }
-    if (pending.empty()) {
-        ESP_LOGI(kTag, "no pending review uploads");
-        return ESP_OK;
-    }
-
-    std::vector<wqn::WqnReviewResult> uploads;
-    uploads.reserve(pending.size());
-    for (const wqn::PendingReviewResult& item : pending) {
-        if (item.problem_id.empty() || item.selected_status.empty()) {
-            ESP_LOGW(kTag, "pending review queue contains an invalid item; keeping queue");
-            return ESP_ERR_INVALID_STATE;
-        }
-
-        wqn::WqnReviewResult upload;
-        upload.problem_id = item.problem_id;
-        upload.selected_status = item.selected_status;
-        upload.reviewed_at = item.created_at;
-        uploads.push_back(std::move(upload));
-    }
-
-    result = wqn::UploadReviewComplete(token, uploads);
-    if (result != ESP_OK) {
-        ESP_LOGW(kTag, "pending review upload kept for retry: %s", esp_err_to_name(result));
-        return result;
-    }
-
-    result = wqn::ClearPendingReviewResults();
-    if (result != ESP_OK) {
-        ESP_LOGW(kTag, "clear uploaded review queue failed: %s", esp_err_to_name(result));
-        return result;
-    }
-
-    ESP_LOGI(kTag, "pending review uploads complete: count=%u", static_cast<unsigned>(uploads.size()));
-    return ESP_OK;
-}
-
-#if !CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
-esp_err_t SyncDueProblemsAndCache(const std::string& token)
-{
-    std::vector<std::string> due_problem_ids;
-    int total = 0;
-    esp_err_t result = wqn::SyncDueProblemIds(token, &due_problem_ids, &total);
-    if (result != ESP_OK) {
-        return result;
-    }
-
-    ESP_LOGI(kTag, "due problem sync: returned=%u total=%d", static_cast<unsigned>(due_problem_ids.size()), total);
-    if (due_problem_ids.empty()) {
-        return ESP_OK;
-    }
-
-    std::vector<wqn::WqnProblem> problems;
-    result = wqn::FetchProblems(token, due_problem_ids, &problems);
-    if (result != ESP_OK) {
-        return result;
-    }
-
-    for (const wqn::WqnProblem& problem : problems) {
-        ESP_LOGI(kTag, "due problem ready: id=%s title=%s", problem.id.c_str(), problem.title.c_str());
-    }
-    return MergeProblemCache(problems, "due problems");
-}
-#endif
-
-esp_err_t RefreshProblemIndexIfAvailable(const std::string& token)
-{
-    wqn::WqnProblemIndexRequest request;
-    request.limit = WQN_SYNC_LIMIT;
-
-    wqn::WqnProblemIndexPage page;
-    const esp_err_t result = wqn::FetchProblemIndex(token, request, &page);
-    if (result == ESP_ERR_NOT_SUPPORTED) {
-        ESP_LOGI(kTag, "problem index endpoint is not available yet; will retry next sync round");
-        return ESP_OK;
-    }
-    if (result != ESP_OK) {
-        return result;
-    }
-
-    ESP_LOGI(
-        kTag,
-        "problem index fetched: count=%u total=%d has_more=%s",
-        static_cast<unsigned>(page.problems.size()),
-        page.total,
-        page.has_more ? "true" : "false");
-    return MergeProblemCache(page.problems, "problem index");
-}
-
 #if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
 esp_err_t BootstrapControlV3(const std::string& token)
 {
@@ -899,32 +2130,40 @@ esp_err_t BootstrapControlV3(const std::string& token)
     }
     if (g_bootstrap_request_id.empty()) {
         g_bootstrap_request_id = RandomControlId("req_bootstrap_");
+        g_bootstrap_request_metadata = MakeControlMetadata();
+        g_bootstrap_request_metadata.request_id = g_bootstrap_request_id;
     }
-    wqn::protocol::v3::RequestMetadata metadata = MakeControlMetadata();
-    metadata.request_id = g_bootstrap_request_id;
-    wqn::protocol::v3::BootstrapData bootstrap;
-    wqn::protocol::v3::Error error;
-    const esp_err_t result = wqn::BootstrapDeviceControlV3(
-        token, metadata, &bootstrap, &error);
-    if (result != ESP_OK) {
-        if (error.retryable) {
-            g_control_retry_after_ms = error.retry_after_ms;
+    if (!g_bootstrap_response_ready) {
+        wqn::protocol::v3::Error error;
+        const esp_err_t result = wqn::BootstrapDeviceControlV3(
+            token, g_bootstrap_request_metadata, &g_bootstrap_response, &error);
+        if (result != ESP_OK) {
+            if (error.code == "UPGRADE_REQUIRED") {
+                g_control_protocol_blocked_this_round = true;
+            }
+            if (error.retryable) g_control_retry_after_ms = error.retry_after_ms;
+            if (error.code == "REQUEST_ID_REUSED") {
+                g_bootstrap_request_id.clear();
+                g_bootstrap_request_metadata = {};
+            }
+            return result;
         }
-        return result;
+        g_bootstrap_response_ready = true;
     }
     const wqn::DeviceControlState checkpoint = {
-        bootstrap.config_revision,
-        bootstrap.sync_cursor,
+        g_bootstrap_response.config_revision,
+        g_bootstrap_response.sync_cursor,
     };
+    // A successful RPC is an immutable response awaiting a local commit.
+    // Local I/O failure retries only this commit, never a different request.
     ESP_RETURN_ON_ERROR(
-        wqn::SaveDeviceControlState(checkpoint),
-        kTag,
-        "save v3 bootstrap checkpoint");
+        CommitControlResponse(checkpoint, {}), kTag, "save bootstrap journal");
     g_control_retry_after_ms = 0;
-    g_config_revision = checkpoint.config_revision;
-    g_sync_cursor = checkpoint.sync_cursor;
     g_bootstrap_complete = true;
     g_bootstrap_request_id.clear();
+    g_bootstrap_request_metadata = {};
+    g_bootstrap_response = {};
+    g_bootstrap_response_ready = false;
     ESP_LOGI(
         kTag,
         "v3 bootstrap complete: config_revision=%llu sync_cursor=%llu",
@@ -933,76 +2172,73 @@ esp_err_t BootstrapControlV3(const std::string& token)
     return ESP_OK;
 }
 
-esp_err_t SyncDueProblemsAndCacheV3(const std::string& token)
+esp_err_t SyncControlPlaneV3(const std::string& token)
 {
     if (g_sync_request_id.empty()) {
         g_sync_request_id = RandomControlId("req_sync_");
+        // Freeze every body field with the ID, not just the local setting.
+        g_sync_request_metadata = MakeControlMetadata();
+        g_sync_request_metadata.request_id = g_sync_request_id;
+        g_sync_request_auto_interval_minutes =
+            g_auto_sync_interval_minutes.load(std::memory_order_acquire);
     }
-    wqn::protocol::v3::RequestMetadata metadata = MakeControlMetadata();
-    metadata.request_id = g_sync_request_id;
-    wqn::protocol::v3::SyncData sync;
-    wqn::protocol::v3::Error error;
-    const esp_err_t sync_result =
-        wqn::SyncDeviceControlV3(token, metadata, &sync, &error);
-    if (sync_result != ESP_OK) {
-        if (error.retryable) {
-            g_control_retry_after_ms = error.retry_after_ms;
+    if (!g_sync_response_ready) {
+        wqn::protocol::v3::Error error;
+        const esp_err_t sync_result = wqn::SyncDeviceControlV3(
+            token, g_sync_request_metadata, g_sync_request_auto_interval_minutes,
+            &g_sync_response, &error);
+        if (sync_result != ESP_OK) {
+            if (error.code == "UPGRADE_REQUIRED") {
+                g_control_protocol_blocked_this_round = true;
+            }
+            if (error.retryable) g_control_retry_after_ms = error.retry_after_ms;
+            if (error.code == "REQUEST_ID_REUSED") {
+                g_sync_request_id.clear();
+                g_sync_request_metadata = {};
+                g_sync_request_auto_interval_minutes = 0;
+            }
+            ESP_LOGW(kTag, "v3 sync failed: %s", esp_err_to_name(sync_result));
+            return sync_result;
         }
-        ESP_LOGW(kTag, "v3 sync failed: %s", esp_err_to_name(sync_result));
-        return sync_result;
+        g_sync_response_ready = true;
     }
+    const auto& sync = g_sync_response;
+    const wqn::DeviceControlState checkpoint = {
+        sync.config_revision, sync.sync_cursor,
+    };
+    ESP_RETURN_ON_ERROR(CommitControlResponse(checkpoint, sync.content_targets),
+                        kTag, "commit sync journal checkpoint");
     g_control_retry_after_ms = 0;
-    if (sync.auto_sync_interval_minutes == 0 ||
-        sync.auto_sync_interval_minutes == 15 ||
-        sync.auto_sync_interval_minutes == 30 ||
-        sync.auto_sync_interval_minutes == 60 ||
-        sync.auto_sync_interval_minutes == 240) {
-        uint32_t current_interval = 0;
-        ESP_RETURN_ON_ERROR(
-            wqn::LoadAutoSyncIntervalMinutes(&current_interval),
+    // Device settings are local-authoritative. The server echoes the reported
+    // value for protocol observability but must never overwrite the NVS value
+    // selected on the device.
+    if (sync.auto_sync_interval_minutes !=
+        g_sync_request_auto_interval_minutes) {
+        ESP_LOGW(
             kTag,
-            "load v3 auto-sync configuration");
-        if (current_interval != sync.auto_sync_interval_minutes) {
-            ESP_RETURN_ON_ERROR(
-                wqn::SaveAutoSyncIntervalMinutes(sync.auto_sync_interval_minutes),
-                kTag,
-                "save v3 auto-sync configuration");
-        }
+            "server auto-sync echo mismatch: reported=%u echoed=%u (ignored)",
+            static_cast<unsigned>(g_sync_request_auto_interval_minutes),
+            static_cast<unsigned>(sync.auto_sync_interval_minutes));
     }
     ESP_LOGI(
         kTag,
-        "v3 sync summary: due=%u todos=%d words=%d cursor=%llu",
+        "v3 sync summary: due=%u todos=%d words=%d mistakes=%d cursor=%llu",
         static_cast<unsigned>(sync.due_problem_ids.size()),
         sync.todo_count,
         sync.word_due_count,
+        sync.word_mistake_count,
         static_cast<unsigned long long>(sync.sync_cursor));
-    if (!sync.due_problem_ids.empty()) {
-        std::vector<wqn::WqnProblem> problems;
-        ESP_RETURN_ON_ERROR(
-            wqn::FetchProblems(token, sync.due_problem_ids, &problems),
-            kTag,
-            "fetch v3 manifest problems");
-        const esp_err_t cache_result = MergeProblemCache(problems, "v3 due problems");
-        if (cache_result != ESP_OK) {
-            ApplyStorageCapacityBackoff(cache_result, "problem-cache");
-            ESP_RETURN_ON_ERROR(
-                cache_result,
-                kTag,
-                "commit v3 manifest problems");
-        }
-    }
-
-    const wqn::DeviceControlState checkpoint = {
-        sync.config_revision,
-        sync.sync_cursor,
-    };
-    ESP_RETURN_ON_ERROR(
-        wqn::SaveDeviceControlState(checkpoint),
-        kTag,
-        "commit v3 sync checkpoint");
-    g_config_revision = checkpoint.config_revision;
-    g_sync_cursor = checkpoint.sync_cursor;
+    // Surface the due-word count on the review home card; it is only a hint
+    // (the queue itself comes from the word-study session request).
+    wqn::SetWordReviewDueCount(sync.word_due_count);
+    // Same hint pattern for the mistakes card; -1 (field absent) keeps the
+    // card on the pack size instead of advertising an unknown pool.
+    wqn::SetWordMistakeCount(sync.word_mistake_count);
     g_sync_request_id.clear();
+    g_sync_request_metadata = {};
+    g_sync_response = {};
+    g_sync_response_ready = false;
+    g_sync_request_auto_interval_minutes = 0;
     ESP_LOGI(
         kTag,
         "v3 sync checkpoint committed: config_revision=%llu sync_cursor=%llu",
@@ -1010,18 +2246,64 @@ esp_err_t SyncDueProblemsAndCacheV3(const std::string& token)
         static_cast<unsigned long long>(g_sync_cursor));
     return ESP_OK;
 }
+void RetryCachedControlResponseIfDue()
+{
+    if ((g_full_sync_reasons.load(std::memory_order_acquire) & kFullSyncCredentials) != 0) {
+        ResetControlExchanges();
+        g_bootstrap_complete = false;
+        return;
+    }
+    if (ControlJournalRetryWaitDelay() != 0) return;
+    // Both entry points skip their RPC when a response is ready. This pump
+    // runs before ConnectivityDemand admission, so offline flash recovery does
+    // not depend on WiFi or replay an already-successful server request.
+    if (g_bootstrap_response_ready) (void)BootstrapControlV3("");
+    else if (g_sync_response_ready) (void)SyncControlPlaneV3("");
+}
 #endif
 
 #if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
 WordOutboxUploadState UploadPendingWordObservations(const std::string& token)
 {
-    constexpr size_t kMaxWordObservationsPerRound = 64;
-    const uint32_t interaction_generation =
+    uint32_t interaction_generation =
         g_word_interaction_generation.load(std::memory_order_acquire);
+    const wqn::WordOutboxMaintenanceGate maintenance_gate{
+        [](void* context) {
+            return g_word_interaction_generation.load(std::memory_order_acquire) !=
+                *static_cast<const uint32_t*>(context);
+        }, &interaction_generation};
+    std::vector<std::string> acknowledgements;
+    acknowledgements.reserve(5);
+    bool ack_flush_failed = false;
+    int64_t oldest_ack_ms = 0;
+    const auto flush_acknowledgements = [&]() -> esp_err_t {
+        if (acknowledgements.empty()) return ESP_OK;
+        if (ack_flush_failed) return ESP_FAIL;
+        const esp_err_t result = wqn::AcknowledgeWordObservations(acknowledgements, maintenance_gate);
+        if (result != ESP_OK) {
+            ack_flush_failed = true;
+            ScheduleWordOutboxRetry(acknowledgements.front(), 0, OutboxRetryCause::kLocalStorage);
+            ESP_LOGW(kTag, "word ACK batch failed: count=%u error=%s; durable payloads retained",
+                static_cast<unsigned>(acknowledgements.size()), esp_err_to_name(result));
+            return result;
+        }
+        acknowledgements.clear();
+        oldest_ack_ms = 0;
+        return ESP_OK;
+    };
+    // A single exit funnel flushes successes on every return, including a
+    // yield, HTTP error and empty queue. Never rely on a destructor whose I/O
+    // error cannot change the return value. Failed ACKs remain uploadable with
+    // the original identities; a reset can safely replay them to the server.
+    const auto upload_round = [&]() -> WordOutboxUploadState {
+    constexpr size_t kMaxWordObservationsPerRound = 64;
     size_t processed = 0;
     size_t uploaded = 0;
     size_t quarantined = 0;
     for (; processed < kMaxWordObservationsPerRound;) {
+        if (!acknowledgements.empty() &&
+            esp_timer_get_time() / 1000 - oldest_ack_ms >= 30000 &&
+            flush_acknowledgements() != ESP_OK) return WordOutboxUploadState::kPending;
         if (g_word_interaction_generation.load(std::memory_order_acquire) !=
             interaction_generation) {
             ESP_LOGI(
@@ -1032,9 +2314,12 @@ WordOutboxUploadState UploadPendingWordObservations(const std::string& token)
             return WordOutboxUploadState::kYielded;
         }
         wqn::DurableWordObservation pending;
-        esp_err_t result = wqn::PeekPendingWordObservation(&pending);
+        esp_err_t result = wqn::PeekPendingWordObservationExcluding(acknowledgements, &pending);
         if (result == ESP_ERR_NOT_FOUND) {
             ResetWordOutboxRetryBackoff();
+            // The queue is empty, so no record of the retired session is left
+            // to skip the retry ladder for.
+            g_word_outbox_gap_terminal_session_id.clear();
             if (processed > 0) {
                 ESP_LOGI(
                     kTag,
@@ -1074,10 +2359,124 @@ WordOutboxUploadState UploadPendingWordObservations(const std::string& token)
         result = wqn::SubmitWordStudyObservationV1(
             token, request, &response, &word_error, &transport_failure);
         if (result != ESP_OK) {
-            if (!transport_failure && !word_error.retryable) {
+            OutboxFailureDisposition disposition =
+                ClassifyOutboxFailure(word_error, transport_failure);
+            // Persist prior successes before parking/quarantining this head.
+            // A genuine 401 must still reach credential recovery if local ACK
+            // storage fails; timeouts/429/5xx never gain that authority.
+            if (flush_acknowledgements() != ESP_OK) {
+                return disposition == OutboxFailureDisposition::kAuthenticationRequired
+                    ? WordOutboxUploadState::kAuthenticationRequired
+                    : WordOutboxUploadState::kPending;
+            }
+            // Audit §14 Case B: SEQUENCE_GAP is classified kTransientRetry on
+            // the assumption that an earlier record is still in flight and
+            // will close the hole. Once this head has retried that many times
+            // no earlier record is coming -- the local counter ran ahead of
+            // the server (parked identity failure, storage loss, or a retired
+            // session) and uploading can never fill the gap. Retire the
+            // session so its whole backlog quarantines instead of the head
+            // retrying forever and wedging the FIFO queue (observed in the
+            // field: attempt=255, 5-minute backoff, word study silent for
+            // days while note sync kept working on its own outbox).
+            if (disposition == OutboxFailureDisposition::kTransientServer &&
+                word_error.code == "SEQUENCE_GAP") {
+                if (!g_word_outbox_gap_terminal_session_id.empty() &&
+                    pending.session_id ==
+                        g_word_outbox_gap_terminal_session_id) {
+                    disposition = OutboxFailureDisposition::kSessionTerminal;
+                } else if (g_word_outbox_retry_attempts >=
+                           kWordOutboxSequenceGapEscalation) {
+                    g_word_outbox_gap_terminal_session_id = pending.session_id;
+                    ESP_LOGW(
+                        kTag,
+                        "word observation gap unrecoverable after %u attempts; retiring session: request=%s sequence=%llu session=%s",
+                        static_cast<unsigned>(g_word_outbox_retry_attempts),
+                        pending.request_id.c_str(),
+                        static_cast<unsigned long long>(pending.sequence),
+                        pending.session_id.c_str());
+                    disposition = OutboxFailureDisposition::kSessionTerminal;
+                }
+            }
+            if (disposition ==
+                OutboxFailureDisposition::kAuthenticationRequired) {
+                ResetWordOutboxRetryBackoff();
                 ESP_LOGW(
                     kTag,
-                    "terminal word observation rejected; advancing sequence before quarantine: request=%s sequence=%llu code=%s",
+                    "word outbox paused for credential recovery: request=%s",
+                    pending.request_id.c_str());
+                return WordOutboxUploadState::kAuthenticationRequired;
+            }
+            if (disposition == OutboxFailureDisposition::kProtocolBlocked) {
+                ESP_LOGE(
+                    kTag,
+                    "word outbox suspended: server requires newer firmware: request=%s",
+                    pending.request_id.c_str());
+                return WordOutboxUploadState::kProtocolBlocked;
+            }
+            if (disposition == OutboxFailureDisposition::kProtocolIntegrity) {
+                // Audit §16.D: identity-level failures (idempotency conflict,
+                // actor ownership, corrupt identity) forbid unilateral
+                // deletion -- the server never consumed this sequence, so a
+                // local drop would strand later same-session records in
+                // STUDY_SEQUENCE_GAP forever (Case B). Park durably instead.
+                ESP_LOGE(
+                    kTag,
+                    "word observation parked (%s): integrity failure forbids deletion: request=%s code=%s",
+                    wqn::OutboxSuspendReasonName(SuspendReasonFor(word_error.code)),
+                    pending.request_id.c_str(),
+                    word_error.code.c_str());
+                const esp_err_t suspend_result =
+                    wqn::SuspendPendingWordObservation(
+                        pending.request_id,
+                        SuspendReasonFor(word_error.code));
+                ResetWordOutboxRetryBackoff();
+                if (suspend_result != ESP_OK) {
+                    ESP_LOGE(
+                        kTag,
+                        "word observation park failed: request=%s error=%s",
+                        pending.request_id.c_str(),
+                        esp_err_to_name(suspend_result));
+                    ScheduleWordOutboxRetry(
+                        pending.request_id, 0, OutboxRetryCause::kLocalStorage);
+                    return WordOutboxUploadState::kPending;
+                }
+                ++processed;
+                continue;
+            }
+            if (disposition == OutboxFailureDisposition::kSequenceResolved ||
+                disposition == OutboxFailureDisposition::kSessionTerminal) {
+                // The server proved this sequence was already consumed (or
+                // its whole session is permanently gone): local quarantine
+                // is safe and restores queue progress without a tombstone
+                // round trip.
+                ESP_LOGW(
+                    kTag,
+                    "word observation %s; quarantining head: request=%s code=%s",
+                    disposition == OutboxFailureDisposition::kSessionTerminal
+                        ? "session terminally closed"
+                        : "sequence already resolved",
+                    pending.request_id.c_str(),
+                    word_error.code.c_str());
+                const esp_err_t resolved_quarantine_result =
+                    wqn::QuarantinePendingWordObservation(pending.request_id);
+                ResetWordOutboxRetryBackoff();
+                if (resolved_quarantine_result != ESP_OK) {
+                    ESP_LOGE(
+                        kTag,
+                        "word observation quarantine failed: request=%s error=%s",
+                        pending.request_id.c_str(),
+                        esp_err_to_name(resolved_quarantine_result));
+                    return WordOutboxUploadState::kFailed;
+                }
+                ++processed;
+                ++quarantined;
+                continue;
+            }
+            if (disposition == OutboxFailureDisposition::kTombstoneRecoverable) {
+                ESP_LOGW(
+                    kTag,
+                    "terminal word observation rejected; advancing sequence via tombstone: request=%s sequence=%llu code=%s",
                     pending.request_id.c_str(),
                     static_cast<unsigned long long>(pending.sequence),
                     word_error.code.c_str());
@@ -1097,11 +2496,64 @@ WordOutboxUploadState UploadPendingWordObservations(const std::string& token)
                         &skip_response,
                         &skip_error,
                         &skip_transport_failure);
+                const OutboxFailureDisposition skip_disposition =
+                    ClassifyOutboxFailure(skip_error, skip_transport_failure);
                 const bool sequence_consumed =
                     skip_result == ESP_OK ||
-                    skip_error.code == "SEQUENCE_ALREADY_APPLIED" ||
-                    skip_error.code == "SESSION_NOT_ACTIVE";
+                    skip_disposition ==
+                        OutboxFailureDisposition::kSequenceResolved ||
+                    skip_disposition ==
+                        OutboxFailureDisposition::kSessionTerminal;
                 if (!sequence_consumed) {
+                    if (skip_disposition ==
+                        OutboxFailureDisposition::kAuthenticationRequired) {
+                        ResetWordOutboxRetryBackoff();
+                        return WordOutboxUploadState::kAuthenticationRequired;
+                    }
+                    if (skip_disposition ==
+                        OutboxFailureDisposition::kProtocolBlocked) {
+                        ESP_LOGE(
+                            kTag,
+                            "word outbox suspended: server requires newer firmware: request=%s",
+                            pending.request_id.c_str());
+                        return WordOutboxUploadState::kProtocolBlocked;
+                    }
+                    if (skip_disposition ==
+                        OutboxFailureDisposition::kProtocolIntegrity) {
+                        // [gap-1] The tombstone itself was rejected at the
+                        // identity level: the sequence can never be consumed
+                        // by this device. Park the head durably so the queue
+                        // advances without deleting evidence.
+                        ESP_LOGE(
+                            kTag,
+                            "word observation parked (%s): tombstone rejected at identity level: request=%s code=%s",
+                            wqn::OutboxSuspendReasonName(
+                                SuspendReasonFor(skip_error.code)),
+                            pending.request_id.c_str(),
+                            skip_error.code.c_str());
+                        const esp_err_t suspend_result =
+                            wqn::SuspendPendingWordObservation(
+                                pending.request_id,
+                                SuspendReasonFor(skip_error.code));
+                        ResetWordOutboxRetryBackoff();
+                        if (suspend_result != ESP_OK) {
+                            ESP_LOGE(
+                                kTag,
+                                "word observation park failed: request=%s error=%s",
+                                pending.request_id.c_str(),
+                                esp_err_to_name(suspend_result));
+                            ScheduleWordOutboxRetry(
+                                pending.request_id,
+                                0,
+                                OutboxRetryCause::kLocalStorage);
+                            return WordOutboxUploadState::kPending;
+                        }
+                        ++processed;
+                        continue;
+                    }
+                    // Transport/server backoff, or a tombstone-recoverable
+                    // code on the tombstone endpoint itself (post-relaxation
+                    // drift): bounded exponential retry keeps attempting.
                     ESP_LOGW(
                         kTag,
                         "word observation skip deferred: request=%s sequence=%llu code=%s error=%s",
@@ -1109,19 +2561,11 @@ WordOutboxUploadState UploadPendingWordObservations(const std::string& token)
                         static_cast<unsigned long long>(pending.sequence),
                         skip_error.code.empty() ? "TRANSPORT" : skip_error.code.c_str(),
                         esp_err_to_name(skip_result));
-                    if (skip_transport_failure || skip_error.retryable ||
-                        skip_error.code == "SEQUENCE_GAP") {
-                        ScheduleWordOutboxRetry(
-                            pending.request_id,
-                            skip_error.retryable ? skip_error.retry_after_ms : 0);
-                        return WordOutboxUploadState::kPending;
-                    }
-                    ESP_LOGE(
-                        kTag,
-                        "word observation skip failed terminally; leaving head for inspection: request=%s code=%s",
-                        pending.request_id.c_str(),
-                        skip_error.code.c_str());
-                    return WordOutboxUploadState::kFailed;
+                    ScheduleWordOutboxRetry(
+                        pending.request_id,
+                        skip_error.retryable ? skip_error.retry_after_ms : 0,
+                        RetryCauseFor(skip_disposition));
+                    return WordOutboxUploadState::kPending;
                 }
                 const esp_err_t quarantine_result =
                     wqn::QuarantinePendingWordObservation(pending.request_id);
@@ -1147,27 +2591,22 @@ WordOutboxUploadState UploadPendingWordObservations(const std::string& token)
                 esp_err_to_name(result));
             ScheduleWordOutboxRetry(
                 pending.request_id,
-                word_error.retryable ? word_error.retry_after_ms : 0);
+                word_error.retryable ? word_error.retry_after_ms : 0,
+                RetryCauseFor(disposition));
             return WordOutboxUploadState::kPending;
         }
-        result = wqn::AcknowledgeWordObservation(pending.request_id);
-        if (result != ESP_OK) {
-            ESP_LOGW(
-                kTag,
-                "word outbox ack failed: request=%s error=%s",
-                pending.request_id.c_str(),
-                esp_err_to_name(result));
-            ScheduleWordOutboxRetry(pending.request_id, 0);
-            return WordOutboxUploadState::kPending;
-        }
+        if (acknowledgements.empty()) oldest_ack_ms = esp_timer_get_time() / 1000;
+        acknowledgements.push_back(pending.request_id);
         ResetWordOutboxRetryBackoff();
         ++processed;
         ++uploaded;
+        if (acknowledgements.size() >= 5 && flush_acknowledgements() != ESP_OK)
+            return WordOutboxUploadState::kPending;
     }
 
     wqn::DurableWordObservation remaining;
     const esp_err_t remaining_result =
-        wqn::PeekPendingWordObservation(&remaining);
+        wqn::PeekPendingWordObservationExcluding(acknowledgements, &remaining);
     if (processed > 0) {
         ESP_LOGI(
             kTag,
@@ -1182,6 +2621,28 @@ WordOutboxUploadState UploadPendingWordObservations(const std::string& token)
     return remaining_result == ESP_OK
         ? WordOutboxUploadState::kPending
         : WordOutboxUploadState::kFailed;
+    };
+    const auto state = upload_round();
+    if (flush_acknowledgements() != ESP_OK &&
+        state != WordOutboxUploadState::kAuthenticationRequired &&
+        state != WordOutboxUploadState::kProtocolBlocked) return WordOutboxUploadState::kPending;
+    if (!ack_flush_failed && state != WordOutboxUploadState::kAuthenticationRequired &&
+        state != WordOutboxUploadState::kProtocolBlocked) {
+        // An earlier ACK may already be durable while its maintenance was
+        // deferred. An empty upload queue must still retry that obligation.
+        bool maintenance_deferred = false;
+        const esp_err_t result = wqn::MaintainWordObservationOutbox(
+            maintenance_gate, &maintenance_deferred);
+        if (result != ESP_OK) {
+            ESP_LOGW(kTag, "word outbox maintenance failed: error=%s; journal retained",
+                     esp_err_to_name(result));
+            return WordOutboxUploadState::kFailed;
+        }
+        // Reuse the existing bounded quiet-window retry, including proof
+        // invalidation with no new input. Never turn deferral into a busy loop.
+        if (maintenance_deferred) return WordOutboxUploadState::kYielded;
+    }
+    return state;
 }
 
 // Uploads pending problem verdicts (32-record batches, interaction-yield,
@@ -1246,7 +2707,65 @@ WordOutboxUploadState UploadPendingProblemObservations(const std::string& token)
         result = wqn::SubmitProblemReviewObservationV1(
             token, request, &response, &problem_error, &transport_failure);
         if (result != ESP_OK) {
-            if (!transport_failure && !problem_error.retryable) {
+            const OutboxFailureDisposition disposition =
+                ClassifyOutboxFailure(problem_error, transport_failure);
+            if (disposition ==
+                OutboxFailureDisposition::kAuthenticationRequired) {
+                ResetProblemOutboxRetryBackoff();
+                ESP_LOGW(
+                    kTag,
+                    "problem outbox paused for credential recovery: request=%s",
+                    pending.request_id.c_str());
+                return WordOutboxUploadState::kAuthenticationRequired;
+            }
+            if (disposition == OutboxFailureDisposition::kProtocolBlocked) {
+                ESP_LOGE(
+                    kTag,
+                    "problem outbox suspended: server requires newer firmware: request=%s",
+                    pending.request_id.c_str());
+                return WordOutboxUploadState::kProtocolBlocked;
+            }
+            if (disposition == OutboxFailureDisposition::kProtocolIntegrity) {
+                // Verdicts have no session sequence, so a park here cannot
+                // wedge successors -- but an idempotency conflict still
+                // forbids unilateral deletion (audit §16.D): the server may
+                // hold a different payload under this key.
+                ESP_LOGE(
+                    kTag,
+                    "problem verdict parked (%s): integrity failure forbids deletion: request=%s code=%s",
+                    wqn::OutboxSuspendReasonName(SuspendReasonFor(problem_error.code)),
+                    pending.request_id.c_str(),
+                    problem_error.code.c_str());
+                const esp_err_t suspend_result =
+                    wqn::SuspendPendingProblemObservation(
+                        pending.request_id,
+                        SuspendReasonFor(problem_error.code));
+                ResetProblemOutboxRetryBackoff();
+                if (suspend_result != ESP_OK) {
+                    ESP_LOGE(
+                        kTag,
+                        "problem verdict park failed: request=%s error=%s",
+                        pending.request_id.c_str(),
+                        esp_err_to_name(suspend_result));
+                    ScheduleProblemOutboxRetry(
+                        pending.request_id, 0, OutboxRetryCause::kLocalStorage);
+                    return WordOutboxUploadState::kPending;
+                }
+                ++processed;
+                continue;
+            }
+            if (disposition ==
+                    OutboxFailureDisposition::kTombstoneRecoverable ||
+                disposition ==
+                    OutboxFailureDisposition::kSequenceResolved ||
+                disposition ==
+                    OutboxFailureDisposition::kSessionTerminal) {
+                // Standalone idempotent observation: business-level terminal
+                // rejections (not visible / malformed / already applied)
+                // cannot wedge any successor, so quarantine restores queue
+                // progress without losing the forensic copy. Unrecognized
+                // future terminal codes classify as protocol integrity and
+                // park above instead.
                 ESP_LOGW(
                     kTag,
                     "terminal problem verdict rejected; quarantining: request=%s code=%s",
@@ -1275,7 +2794,8 @@ WordOutboxUploadState UploadPendingProblemObservations(const std::string& token)
                 esp_err_to_name(result));
             ScheduleProblemOutboxRetry(
                 pending.request_id,
-                problem_error.retryable ? problem_error.retry_after_ms : 0);
+                problem_error.retryable ? problem_error.retry_after_ms : 0,
+                RetryCauseFor(disposition));
             return WordOutboxUploadState::kPending;
         }
         result = wqn::AcknowledgeProblemObservation(pending.request_id);
@@ -1285,7 +2805,8 @@ WordOutboxUploadState UploadPendingProblemObservations(const std::string& token)
                 "problem outbox ack failed: request=%s error=%s",
                 pending.request_id.c_str(),
                 esp_err_to_name(result));
-            ScheduleProblemOutboxRetry(pending.request_id, 0);
+            ScheduleProblemOutboxRetry(
+                pending.request_id, 0, OutboxRetryCause::kLocalStorage);
             return WordOutboxUploadState::kPending;
         }
         ResetProblemOutboxRetryBackoff();
@@ -1373,10 +2894,79 @@ WordOutboxUploadState UploadPendingNoteObservations(const std::string& token)
         result = wqn::SubmitNoteStudyObservationV1(
             token, request, &response, &note_error, &transport_failure);
         if (result != ESP_OK) {
-            if (!transport_failure && !note_error.retryable) {
+            const OutboxFailureDisposition disposition =
+                ClassifyOutboxFailure(note_error, transport_failure);
+            if (disposition ==
+                OutboxFailureDisposition::kAuthenticationRequired) {
+                ResetNoteOutboxRetryBackoff();
                 ESP_LOGW(
                     kTag,
-                    "terminal note observation rejected; advancing sequence before quarantine: request=%s sequence=%llu code=%s",
+                    "note outbox paused for credential recovery: request=%s",
+                    pending.request_id.c_str());
+                return WordOutboxUploadState::kAuthenticationRequired;
+            }
+            if (disposition == OutboxFailureDisposition::kProtocolBlocked) {
+                ESP_LOGE(
+                    kTag,
+                    "note outbox suspended: server requires newer firmware: request=%s",
+                    pending.request_id.c_str());
+                return WordOutboxUploadState::kProtocolBlocked;
+            }
+            if (disposition == OutboxFailureDisposition::kProtocolIntegrity) {
+                // Audit §16.D / Case B mirror of the word domain.
+                ESP_LOGE(
+                    kTag,
+                    "note observation parked (%s): integrity failure forbids deletion: request=%s code=%s",
+                    wqn::OutboxSuspendReasonName(SuspendReasonFor(note_error.code)),
+                    pending.request_id.c_str(),
+                    note_error.code.c_str());
+                const esp_err_t suspend_result =
+                    wqn::SuspendPendingNoteObservation(
+                        pending.request_id,
+                        SuspendReasonFor(note_error.code));
+                ResetNoteOutboxRetryBackoff();
+                if (suspend_result != ESP_OK) {
+                    ESP_LOGE(
+                        kTag,
+                        "note observation park failed: request=%s error=%s",
+                        pending.request_id.c_str(),
+                        esp_err_to_name(suspend_result));
+                    ScheduleNoteOutboxRetry(
+                        pending.request_id, 0, OutboxRetryCause::kLocalStorage);
+                    return WordOutboxUploadState::kPending;
+                }
+                ++processed;
+                continue;
+            }
+            if (disposition == OutboxFailureDisposition::kSequenceResolved ||
+                disposition == OutboxFailureDisposition::kSessionTerminal) {
+                ESP_LOGW(
+                    kTag,
+                    "note observation %s; quarantining head: request=%s code=%s",
+                    disposition == OutboxFailureDisposition::kSessionTerminal
+                        ? "session terminally closed"
+                        : "sequence already resolved",
+                    pending.request_id.c_str(),
+                    note_error.code.c_str());
+                const esp_err_t resolved_quarantine_result =
+                    wqn::QuarantinePendingNoteObservation(pending.request_id);
+                ResetNoteOutboxRetryBackoff();
+                if (resolved_quarantine_result != ESP_OK) {
+                    ESP_LOGE(
+                        kTag,
+                        "note observation quarantine failed: request=%s error=%s",
+                        pending.request_id.c_str(),
+                        esp_err_to_name(resolved_quarantine_result));
+                    return WordOutboxUploadState::kFailed;
+                }
+                ++processed;
+                ++quarantined;
+                continue;
+            }
+            if (disposition == OutboxFailureDisposition::kTombstoneRecoverable) {
+                ESP_LOGW(
+                    kTag,
+                    "terminal note observation rejected; advancing sequence via tombstone: request=%s sequence=%llu code=%s",
                     pending.request_id.c_str(),
                     static_cast<unsigned long long>(pending.sequence),
                     note_error.code.c_str());
@@ -1395,11 +2985,61 @@ WordOutboxUploadState UploadPendingNoteObservations(const std::string& token)
                         &skip_response,
                         &skip_error,
                         &skip_transport_failure);
+                const OutboxFailureDisposition skip_disposition =
+                    ClassifyOutboxFailure(skip_error, skip_transport_failure);
                 const bool sequence_consumed =
                     skip_result == ESP_OK ||
-                    skip_error.code == "SEQUENCE_ALREADY_APPLIED" ||
-                    skip_error.code == "SESSION_NOT_ACTIVE";
+                    skip_disposition ==
+                        OutboxFailureDisposition::kSequenceResolved ||
+                    skip_disposition ==
+                        OutboxFailureDisposition::kSessionTerminal;
                 if (!sequence_consumed) {
+                    if (skip_disposition ==
+                        OutboxFailureDisposition::kAuthenticationRequired) {
+                        ResetNoteOutboxRetryBackoff();
+                        return WordOutboxUploadState::kAuthenticationRequired;
+                    }
+                    if (skip_disposition ==
+                        OutboxFailureDisposition::kProtocolBlocked) {
+                        ESP_LOGE(
+                            kTag,
+                            "note outbox suspended: server requires newer firmware: request=%s",
+                            pending.request_id.c_str());
+                        return WordOutboxUploadState::kProtocolBlocked;
+                    }
+                    if (skip_disposition ==
+                        OutboxFailureDisposition::kProtocolIntegrity) {
+                        // [gap-1] Tombstone rejected at identity level: park
+                        // the head durably instead of deleting evidence.
+                        ESP_LOGE(
+                            kTag,
+                            "note observation parked (%s): tombstone rejected at identity level: request=%s code=%s",
+                            wqn::OutboxSuspendReasonName(
+                                SuspendReasonFor(skip_error.code)),
+                            pending.request_id.c_str(),
+                            skip_error.code.c_str());
+                        const esp_err_t suspend_result =
+                            wqn::SuspendPendingNoteObservation(
+                                pending.request_id,
+                                SuspendReasonFor(skip_error.code));
+                        ResetNoteOutboxRetryBackoff();
+                        if (suspend_result != ESP_OK) {
+                            ESP_LOGE(
+                                kTag,
+                                "note observation park failed: request=%s error=%s",
+                                pending.request_id.c_str(),
+                                esp_err_to_name(suspend_result));
+                            ScheduleNoteOutboxRetry(
+                                pending.request_id,
+                                0,
+                                OutboxRetryCause::kLocalStorage);
+                            return WordOutboxUploadState::kPending;
+                        }
+                        ++processed;
+                        continue;
+                    }
+                    // Transport/server backoff or post-relaxation drift on
+                    // the tombstone endpoint: bounded retry.
                     ESP_LOGW(
                         kTag,
                         "note observation skip deferred: request=%s sequence=%llu code=%s error=%s",
@@ -1407,19 +3047,11 @@ WordOutboxUploadState UploadPendingNoteObservations(const std::string& token)
                         static_cast<unsigned long long>(pending.sequence),
                         skip_error.code.empty() ? "TRANSPORT" : skip_error.code.c_str(),
                         esp_err_to_name(skip_result));
-                    if (skip_transport_failure || skip_error.retryable ||
-                        skip_error.code == "SEQUENCE_GAP") {
-                        ScheduleNoteOutboxRetry(
-                            pending.request_id,
-                            skip_error.retryable ? skip_error.retry_after_ms : 0);
-                        return WordOutboxUploadState::kPending;
-                    }
-                    ESP_LOGE(
-                        kTag,
-                        "note observation skip failed terminally; leaving head for inspection: request=%s code=%s",
-                        pending.request_id.c_str(),
-                        skip_error.code.c_str());
-                    return WordOutboxUploadState::kFailed;
+                    ScheduleNoteOutboxRetry(
+                        pending.request_id,
+                        skip_error.retryable ? skip_error.retry_after_ms : 0,
+                        RetryCauseFor(skip_disposition));
+                    return WordOutboxUploadState::kPending;
                 }
                 const esp_err_t quarantine_result =
                     wqn::QuarantinePendingNoteObservation(pending.request_id);
@@ -1445,7 +3077,8 @@ WordOutboxUploadState UploadPendingNoteObservations(const std::string& token)
                 esp_err_to_name(result));
             ScheduleNoteOutboxRetry(
                 pending.request_id,
-                note_error.retryable ? note_error.retry_after_ms : 0);
+                note_error.retryable ? note_error.retry_after_ms : 0,
+                RetryCauseFor(disposition));
             return WordOutboxUploadState::kPending;
         }
         result = wqn::AcknowledgeNoteObservation(pending.request_id);
@@ -1455,7 +3088,8 @@ WordOutboxUploadState UploadPendingNoteObservations(const std::string& token)
                 "note outbox ack failed: request=%s error=%s",
                 pending.request_id.c_str(),
                 esp_err_to_name(result));
-            ScheduleNoteOutboxRetry(pending.request_id, 0);
+            ScheduleNoteOutboxRetry(
+                pending.request_id, 0, OutboxRetryCause::kLocalStorage);
             return WordOutboxUploadState::kPending;
         }
         ResetNoteOutboxRetryBackoff();
@@ -1482,151 +3116,245 @@ WordOutboxUploadState UploadPendingNoteObservations(const std::string& token)
         : WordOutboxUploadState::kFailed;
 }
 
-bool RunWordOutboxOnlyRound()
+SyncRoundOutcome RunWordOutboxOnlyRound()
 {
     std::string token;
     if (!LoadUsableToken(&token)) {
         // Pairing/bootstrap owns identity recovery. Escalate the next round
         // instead of making the outbox-only path imitate the control plane.
-        g_full_sync_requested.store(true, std::memory_order_release);
-        g_last_word_outbox_upload_state = WordOutboxUploadState::kPending;
-        return false;
+        // Mark the upload pass drained-for-now so the generic outbox re-arm
+        // does not create an immediate no-token loop that bypasses claim
+        // polling backoff. The durable heads remain on flash; the escalated
+        // full round uploads them after identity recovery (and boot probes
+        // re-arm them if the device sleeps/restarts first).
+        g_full_sync_reasons.fetch_or(
+            kFullSyncCredentials, std::memory_order_release);
+        g_last_word_outbox_upload_state = WordOutboxUploadState::kDrained;
+        g_last_note_outbox_upload_state = WordOutboxUploadState::kDrained;
+        g_last_problem_outbox_upload_state = WordOutboxUploadState::kDrained;
+        return SyncRoundOutcome::kFailed;
     }
     g_last_word_outbox_upload_state = UploadPendingWordObservations(token);
+    if (g_last_word_outbox_upload_state ==
+        WordOutboxUploadState::kProtocolBlocked) {
+        return CurrentOutboxOutcome();
+    }
+    if (g_last_word_outbox_upload_state ==
+        WordOutboxUploadState::kAuthenticationRequired) {
+        g_last_note_outbox_upload_state =
+            WordOutboxUploadState::kAuthenticationRequired;
+        g_last_problem_outbox_upload_state =
+            WordOutboxUploadState::kAuthenticationRequired;
+        return CurrentOutboxOutcome();
+    }
     g_last_note_outbox_upload_state = UploadPendingNoteObservations(token);
+    if (g_last_note_outbox_upload_state ==
+        WordOutboxUploadState::kProtocolBlocked) {
+        return CurrentOutboxOutcome();
+    }
+    if (g_last_note_outbox_upload_state ==
+        WordOutboxUploadState::kAuthenticationRequired) {
+        g_last_problem_outbox_upload_state =
+            WordOutboxUploadState::kAuthenticationRequired;
+        return CurrentOutboxOutcome();
+    }
     g_last_problem_outbox_upload_state = UploadPendingProblemObservations(token);
-    return g_last_word_outbox_upload_state != WordOutboxUploadState::kFailed &&
-        g_last_note_outbox_upload_state != WordOutboxUploadState::kFailed &&
-        g_last_problem_outbox_upload_state != WordOutboxUploadState::kFailed;
+    return CurrentOutboxOutcome();
 }
 #endif
 
-bool RunSyncRound()
+SyncRoundOutcome RunSyncRound()
 {
 #if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
+    g_control_protocol_blocked_this_round = false;
     esp_err_t result = EnsureControlStateLoaded();
     if (result != ESP_OK) {
         ESP_LOGW(kTag, "v3 control checkpoint unavailable: %s", esp_err_to_name(result));
-        return false;
+        return SyncRoundOutcome::kFailed;
     }
     result = RunDeviceClaimRoundV3();
     if (result == ESP_ERR_NOT_FINISHED) {
         ESP_LOGI(kTag, "v3 claim awaiting physical approval");
-        return false;
+        return SyncRoundOutcome::kFailed;
     }
     if (result != ESP_OK) {
         ESP_LOGW(kTag, "v3 claim round deferred: %s", esp_err_to_name(result));
-        return false;
+        return g_control_protocol_blocked_this_round
+            ? SyncRoundOutcome::kProtocolBlocked
+            : SyncRoundOutcome::kFailed;
     }
 #else
     esp_err_t result = wqn::RunPairingFlowIfNeeded();
     if (result != ESP_OK) {
         ESP_LOGW(kTag, "pairing round deferred: %s", esp_err_to_name(result));
-        return false;
+        return SyncRoundOutcome::kFailed;
     }
 #endif
 
     std::string token;
     if (!LoadUsableToken(&token)) {
         ESP_LOGI(kTag, "WQN online sync waiting for pairing");
-        return false;
+        return SyncRoundOutcome::kFailed;
     }
 
 #if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
     result = BootstrapControlV3(token);
     if (result != ESP_OK) {
         ESP_LOGW(kTag, "v3 bootstrap round failed: %s", esp_err_to_name(result));
-        return false;
+        return g_control_protocol_blocked_this_round
+            ? SyncRoundOutcome::kProtocolBlocked
+            : SyncRoundOutcome::kFailed;
     }
 #endif
-
-    result = UploadPendingReviewsIfAny(token);
-    if (result != ESP_OK) {
-        ESP_LOGW(kTag, "pending review upload round failed: %s", esp_err_to_name(result));
-        return false;
-    }
 
 #if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
     g_last_word_outbox_upload_state = UploadPendingWordObservations(token);
-    g_last_note_outbox_upload_state = UploadPendingNoteObservations(token);
-    g_last_problem_outbox_upload_state = UploadPendingProblemObservations(token);
+    if (g_last_word_outbox_upload_state ==
+        WordOutboxUploadState::kProtocolBlocked) {
+        return CurrentOutboxOutcome();
+    }
+    if (g_last_word_outbox_upload_state !=
+        WordOutboxUploadState::kAuthenticationRequired) {
+        g_last_note_outbox_upload_state = UploadPendingNoteObservations(token);
+    } else {
+        g_last_note_outbox_upload_state =
+            WordOutboxUploadState::kAuthenticationRequired;
+    }
+    if (g_last_note_outbox_upload_state ==
+        WordOutboxUploadState::kProtocolBlocked) {
+        return CurrentOutboxOutcome();
+    }
+    if (g_last_word_outbox_upload_state !=
+            WordOutboxUploadState::kAuthenticationRequired &&
+        g_last_note_outbox_upload_state !=
+            WordOutboxUploadState::kAuthenticationRequired) {
+        g_last_problem_outbox_upload_state =
+            UploadPendingProblemObservations(token);
+    } else {
+        g_last_problem_outbox_upload_state =
+            WordOutboxUploadState::kAuthenticationRequired;
+    }
+    if (g_last_problem_outbox_upload_state ==
+        WordOutboxUploadState::kProtocolBlocked) {
+        return CurrentOutboxOutcome();
+    }
 #endif
 
     if (!LoadUsableToken(&token)) {
-        ESP_LOGI(kTag, "token cleared during review upload round");
-        return false;
+        ESP_LOGI(kTag, "token cleared during observation upload round");
+        return SyncRoundOutcome::kFailed;
     }
 
 #if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
-    result = SyncDueProblemsAndCacheV3(token);
+    result = SyncControlPlaneV3(token);
+    if (result != ESP_OK) {
+        ESP_LOGW(kTag, "control sync round failed: %s", esp_err_to_name(result));
+        // The three outboxes already ran independently. Preserve that
+        // progress and report partial completion, while retaining a full-sync
+        // retry obligation for the failed control plane.
+        return g_control_protocol_blocked_this_round
+            ? SyncRoundOutcome::kProtocolBlocked
+            : SyncRoundOutcome::kPartialNeedsFullRetry;
+    }
+#endif
+
+#if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
+    return CurrentOutboxOutcome();
 #else
-    result = SyncDueProblemsAndCache(token);
+    return SyncRoundOutcome::kSucceeded;
 #endif
-    if (result != ESP_OK) {
-        ESP_LOGW(kTag, "due problem sync round failed: %s", esp_err_to_name(result));
-        return false;
-    }
-
-    if (!LoadUsableToken(&token)) {
-        ESP_LOGI(kTag, "token cleared during due problem sync round");
-        return false;
-    }
-
-    result = RefreshProblemIndexIfAvailable(token);
-    if (result != ESP_OK) {
-#if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
-        ApplyStorageCapacityBackoff(result, "problem-index-cache");
-#endif
-        ESP_LOGW(kTag, "problem index refresh round failed: %s", esp_err_to_name(result));
-        return false;
-    }
-
-    return true;
 }
 
-TickType_t NextSyncWaitDelay(bool round_synced, bool has_token_after_round)
+TickType_t OutboxWaitDelay()
 {
-    TickType_t wait_delay = portMAX_DELAY;
+#if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
+    if (!g_word_outbox_sync_requested.load(std::memory_order_acquire)) {
+        return portMAX_DELAY;
+    }
+    if (g_outbox_immediate_requested.load(std::memory_order_acquire)) {
+        return 0;
+    }
+    const TickType_t word_delay = WordOutboxRetryWaitDelay();
+    const TickType_t note_delay = NoteOutboxRetryWaitDelay();
+    const TickType_t problem_delay = ProblemOutboxRetryWaitDelay();
+    // [fix-b] A domain with backlog but NO armed backoff cursor is ready
+    // work: it must not inherit another domain's backoff as its own wake-up
+    // delay (audit FINDING B -- up to 300 s of cross-domain scheduling
+    // latency coupling). Ready domains contribute 0; cursorless-idle
+    // domains stay out of the minimum entirely.
+    const auto effective_delay =
+        [](TickType_t delay, WordOutboxUploadState last_state) {
+            if (delay != portMAX_DELAY) return delay;
+            return last_state == WordOutboxUploadState::kPending
+                ? static_cast<TickType_t>(0)
+                : portMAX_DELAY;
+        };
+    const TickType_t retry_delay = std::min(
+        std::min(
+            effective_delay(word_delay, g_last_word_outbox_upload_state),
+            effective_delay(note_delay, g_last_note_outbox_upload_state)),
+        effective_delay(problem_delay, g_last_problem_outbox_upload_state));
+    // A requested outbox round with no retry cursor is new work (or another
+    // batch behind the per-round cap), not an infinite wait. A finite cursor
+    // is a real transport/server backoff and remains authoritative.
+    return retry_delay == portMAX_DELAY ? 0 : retry_delay;
+#else
+    return portMAX_DELAY;
+#endif
+}
+
+TickType_t SchedulerWaitDelay()
+{
+    // Protocol suspension parks networking, not local checkpoint durability.
+    // A manual request may explicitly re-probe the same firmware;
+    // boot/content/credential reasons remain parked until an OTA changes the
+    // persisted firmware-version key.
+    if (g_outbox_protocol_suspended) {
+        return (g_full_sync_reasons.load(std::memory_order_acquire) &
+                kFullSyncManual) != 0
+            ? 0
+            : std::min(JournalRetryWaitDelay(), ControlJournalRetryWaitDelay());
+    }
+    if (g_full_sync_reasons.load(std::memory_order_acquire) != 0) {
+        return 0;
+    }
+    const TickType_t retry_delay = FullSyncRetryWaitDelay();
+    const TickType_t full_delay = retry_delay != portMAX_DELAY
+        ? retry_delay
+        : PeriodicSyncWaitDelay(
+              g_auto_sync_interval_minutes.load(std::memory_order_acquire));
+    return std::min(
+        std::min(full_delay, OutboxWaitDelay()),
+        std::min(OutboxQuietLeaseWaitDelay(),
+                 std::min(JournalRetryWaitDelay(), ControlJournalRetryWaitDelay())));
+}
+
+uint32_t FullSyncFailureRetryMs(bool has_token_after_round)
+{
 #if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
     if (g_control_retry_after_ms > 0) {
         const uint32_t retry_after_ms = g_control_retry_after_ms;
         g_control_retry_after_ms = 0;
-        wait_delay = pdMS_TO_TICKS(retry_after_ms);
-    } else
-#endif
+        return std::max<uint32_t>(1000, retry_after_ms);
+    }
     if (!has_token_after_round) {
-#if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
-        const uint32_t wait_ms = g_claim_active
+        return g_claim_active
             ? ClaimPollDelayMs()
             : AddClaimJitter(kClaimRetryBaseMs);
-        wait_delay = pdMS_TO_TICKS(wait_ms);
-#else
-        // [power-fix] Once the device has lost (or never had) an access
-        // token it is in provisioning mode. Polling the server every 2s
-        // serves no purpose -- the device cannot authenticate -- and it
-        // keeps the CPU + radio hot for no benefit. Block on the
-        // notification until something (e.g. a fresh token save in
-        // wqn::SaveAccessToken) wakes us back up.
-        wait_delay = portMAX_DELAY;
-#endif
-    } else if (round_synced) {
-        wait_delay = wqn::services::GetConfiguredSyncDelayTicks();
-    } else {
-        const TickType_t configured_delay =
-            wqn::services::GetConfiguredSyncDelayTicks();
-        wait_delay = configured_delay == portMAX_DELAY
-            ? portMAX_DELAY
-            : kSyncRetryDelay;
-    }
-
-#if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
-    if (has_token_after_round) {
-        wait_delay = std::min(wait_delay, WordOutboxRetryWaitDelay());
-        wait_delay = std::min(wait_delay, NoteOutboxRetryWaitDelay());
-        wait_delay = std::min(wait_delay, ProblemOutboxRetryWaitDelay());
     }
 #endif
-    return wait_delay;
+    const uint8_t ladder_index = static_cast<uint8_t>(
+        std::min<uint8_t>(g_full_sync_retry_attempts,
+                          static_cast<uint8_t>(kFullSyncRetryLadderSize - 1)));
+    if (g_full_sync_retry_attempts < UINT8_MAX) {
+        ++g_full_sync_retry_attempts;
+    }
+    ESP_LOGW(
+        kTag,
+        "full-sync nominal retry escalated: attempt=%u delay_ms=%lu",
+        static_cast<unsigned>(ladder_index),
+        static_cast<unsigned long>(kFullSyncRetryLadderMs[ladder_index]));
+    return kFullSyncRetryLadderMs[ladder_index];
 }
 
 void SyncServiceTask(void*)
@@ -1634,17 +3362,131 @@ void SyncServiceTask(void*)
     ESP_LOGI(kTag, "SyncService task started");
     SetSyncTaskRunning();
     SetSyncStatus("idle");
-    bool first_round = true;
+    // Owned only by SyncServiceTask. Producers publish a quiet-window intent
+    // and notify this task; keeping the move-only lease here avoids sharing an
+    // RAII object across the UI, timer-service and sync tasks.
+    wqn::runtime::SleepLease outbox_quiet_lease;
     while (true) {
-        if (first_round && wqn::services::GetConfiguredSyncDelayTicks() == portMAX_DELAY && wqn::services::HasUsableStoredToken()) {
-            ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        // Local durability retry owns only the storage lease, never WiFi.
+#if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
+        RetryCachedControlResponseIfDue();
+#endif
+        RetryDirtySyncJournalIfDue();
+        if (g_outbox_transport_resume_requested.exchange(
+                false, std::memory_order_acq_rel)) {
+#if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
+            ResumeTransportDeferredOutboxes();
+#endif
         }
-        first_round = false;
+        ForceExpiredOutboxQuietWindow();
+        if (OutboxQuietWindowActive() && !outbox_quiet_lease) {
+            outbox_quiet_lease = wqn::runtime::SleepLease::TryAcquire(
+                wqn::runtime::SleepBlocker::kOnlineSync,
+                "outbox-quiet",
+                __FILE__,
+                __LINE__);
+        }
+        const TickType_t wait_delay = SchedulerWaitDelay();
+        if (wait_delay != 0) {
+            SetSyncStatus(wait_delay == portMAX_DELAY ? "idle" : "scheduled-wait");
+            ulTaskNotifyTake(pdTRUE, wait_delay);
+            continue;
+        }
 
-        const bool full_requested =
-            g_full_sync_requested.exchange(false, std::memory_order_acq_rel);
-        const bool word_outbox_requested =
-            g_word_outbox_sync_requested.exchange(false, std::memory_order_acq_rel);
+        wqn::runtime::SleepLease sleep_lease;
+        if (outbox_quiet_lease) {
+            // Transfer quiet-window ownership directly into the upload round;
+            // there is no lease-free gap in which PowerCoordinator can sleep.
+            sleep_lease = std::move(outbox_quiet_lease);
+        } else {
+            sleep_lease = wqn::runtime::SleepLease::TryAcquire(
+                wqn::runtime::SleepBlocker::kOnlineSync,
+                "sync-service",
+                __FILE__,
+                __LINE__);
+        }
+        if (!sleep_lease) {
+            SetSyncStatus("sleep-quiescing");
+            ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        // Claim request intents only after the online-sync lease is owned.
+        // A lease failure means the device is quiescing; consuming these
+        // flags before that point used to silently lose manual sync and
+        // outbox requests.
+        const uint32_t full_reasons =
+            g_full_sync_reasons.exchange(0, std::memory_order_acq_rel);
+        // CLIENT_PROTOCOL_BLOCKED is durable for this firmware version.
+        // Automatic boot/content/credential reasons must not bypass it; an
+        // explicit manual request may re-probe once, and an OTA clears the
+        // latch while loading the journal because the version key changes.
+        const bool protocol_suppressed = g_outbox_protocol_suspended &&
+            (full_reasons & kFullSyncManual) == 0;
+        const uint32_t admitted_full_reasons = protocol_suppressed
+            ? 0
+            : full_reasons;
+        const bool retry_due = !protocol_suppressed && FullSyncRetryDue();
+        const uint32_t interval_minutes =
+            g_auto_sync_interval_minutes.load(std::memory_order_acquire);
+        const bool periodic_due = !protocol_suppressed && !retry_due &&
+            FullSyncRetryWaitDelay() == portMAX_DELAY &&
+            PeriodicScheduleDue(interval_minutes);
+        bool full_requested =
+            admitted_full_reasons != 0 || retry_due || periodic_due;
+        // [sync-retry] Consuming a due deadline is not a successful round.
+        // Clearing here used to restart every automatic failure at 10s, and
+        // also discarded the checkpoint restored after a reboot.
+        if ((admitted_full_reasons &
+             (kFullSyncManual | kFullSyncCredentials)) != 0) {
+            ClearFullSyncRetry();
+        }
+#if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
+        if ((admitted_full_reasons & kFullSyncCredentials) != 0) {
+            ResetControlExchanges();
+            g_bootstrap_complete = false;
+        }
+#endif
+        bool word_outbox_requested = false;
+        if (!protocol_suppressed && (full_requested || OutboxWaitDelay() == 0)) {
+            // Consume the urgency payload before the release-published ready
+            // flag. If a producer lands between these exchanges, its ready
+            // flag is either consumed with urgency left armed for one harmless
+            // follow-up, or remains set for the next round; it is never lost.
+            g_outbox_immediate_requested.exchange(
+                false, std::memory_order_acq_rel);
+            word_outbox_requested =
+                g_word_outbox_sync_requested.exchange(
+                    false, std::memory_order_acq_rel);
+            if (word_outbox_requested) {
+                ClaimOutboxReadyGeneration();
+            }
+        }
+        if (!full_requested && !word_outbox_requested) {
+            sleep_lease.Reset();
+            continue;
+        }
+        if ((admitted_full_reasons & kFullSyncBoot) != 0) {
+            const std::time_t now = CurrentUnixSeconds();
+            if (now >= kMinScheduleUnixTime) {
+                const esp_err_t saved =
+                    wqn::SaveBootFullSyncAttemptUnixSeconds(
+                        static_cast<int64_t>(now));
+                if (saved != ESP_OK) {
+                    ESP_LOGW(kTag, "boot full-sync throttle write failed: %s",
+                             esp_err_to_name(saved));
+                }
+            }
+        }
+        ESP_LOGI(
+            kTag,
+            "sync dispatch: full=%d reasons=0x%lx periodic=%d retry=%d outbox=%d interval=%u",
+            full_requested ? 1 : 0,
+            static_cast<unsigned long>(admitted_full_reasons),
+            periodic_due ? 1 : 0,
+            retry_due ? 1 : 0,
+            word_outbox_requested ? 1 : 0,
+            static_cast<unsigned>(interval_minutes));
 #if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
         const bool outbox_only = word_outbox_requested && !full_requested;
 #else
@@ -1652,28 +3494,52 @@ void SyncServiceTask(void*)
         (void)word_outbox_requested;
 #endif
 
-        wqn::runtime::SleepLease sleep_lease =
-            wqn::runtime::SleepLease::TryAcquire(
-                wqn::runtime::SleepBlocker::kOnlineSync, "sync-service", __FILE__, __LINE__);
-        if (!sleep_lease) {
-            SetSyncStatus("sleep-quiescing");
-            ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000));
-            continue;
+        const bool interactive_sync =
+            (admitted_full_reasons &
+             (kFullSyncManual | kFullSyncCredentials)) != 0;
+        wqn::services::ConnectivityDemand connectivity_demand =
+            wqn::services::AcquireConnectivityDemand(
+                interactive_sync
+                    ? wqn::services::ConnectivityDemandReason::kSyncInteractive
+                    : wqn::services::ConnectivityDemandReason::kSyncBackground,
+                interactive_sync ? "sync-interactive" : "sync-background",
+                __FILE__,
+                __LINE__);
+        if (!connectivity_demand) {
+            ESP_LOGW(kTag, "sync round could not acquire connectivity demand");
         }
 
         SetSyncRoundStarted(esp_timer_get_time() / 1000);
         SetSyncStatus(outbox_only ? "word-outbox" : "syncing");
 #if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
-        const bool synced = outbox_only
+        const SyncRoundOutcome outcome = outbox_only
             ? RunWordOutboxOnlyRound()
             : RunSyncRound();
 #else
-        const bool synced = RunSyncRound();
+        const SyncRoundOutcome outcome = RunSyncRound();
 #endif
         const int64_t finished_ms = esp_timer_get_time() / 1000;
-        CompleteSyncRound(finished_ms, synced);
+        CompleteSyncRound(finished_ms, outcome);
+#if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
+        PublishOutboxSnapshots();
+#endif
         const bool has_token_after_round = wqn::services::HasUsableStoredToken();
-        if (synced) {
+        if (outcome == SyncRoundOutcome::kProtocolBlocked) {
+            // CLIENT_PROTOCOL_BLOCKED: latch suspension. No retry ladder,
+            // no periodic re-arm, no outbox self-wake. A manual request may
+            // re-probe explicitly; otherwise records stay parked until the
+            // running firmware image changes.
+            SetOutboxProtocolSuspended(true);
+            SetSyncStatus("protocol-blocked");
+            PublishSyncEvent(
+                wqn::services::SyncEventStatus::kFailed,
+                finished_ms,
+                outbox_only
+                    ? wqn::services::SyncEventScope::kWordOutbox
+                    : wqn::services::SyncEventScope::kFull);
+            ClearFullSyncRetry();
+        } else if (outcome == SyncRoundOutcome::kSucceeded) {
+            SetOutboxProtocolSuspended(false);
             SetSyncStatus("success");
             PublishSyncEvent(
                 wqn::services::SyncEventStatus::kSucceeded,
@@ -1681,8 +3547,25 @@ void SyncServiceTask(void*)
                 outbox_only
                     ? wqn::services::SyncEventScope::kWordOutbox
                     : wqn::services::SyncEventScope::kFull);
+        } else if (outcome == SyncRoundOutcome::kPartial ||
+                   outcome == SyncRoundOutcome::kPartialNeedsFullRetry) {
+            SetSyncStatus("partial");
+            PublishSyncEvent(
+                wqn::services::SyncEventStatus::kPartial,
+                finished_ms,
+                outbox_only
+                    ? wqn::services::SyncEventScope::kWordOutbox
+                    : wqn::services::SyncEventScope::kFull);
         } else {
             SetSyncStatus(has_token_after_round ? "failed" : "waiting-pair");
+            if (has_token_after_round) {
+                // [dev-diag] The full-round failure detail otherwise only
+                // reaches the serial log; the per-domain last_error fields do
+                // not cover the control plane (DEV_DIAGNOSTICS.md §5).
+                wqn::RecordError(
+                    "sync", "round failed outcome=%d",
+                    static_cast<int>(outcome));
+            }
             PublishSyncEvent(
                 has_token_after_round
                     ? wqn::services::SyncEventStatus::kFailed
@@ -1692,36 +3575,63 @@ void SyncServiceTask(void*)
                     ? wqn::services::SyncEventScope::kWordOutbox
                     : wqn::services::SyncEventScope::kFull);
         }
-        sleep_lease.Reset();
-        TickType_t delay = NextSyncWaitDelay(synced, has_token_after_round);
+        if (!outbox_only) {
+            if (outcome == SyncRoundOutcome::kSucceeded ||
+                outcome == SyncRoundOutcome::kPartial) {
+                ClearFullSyncRetry();
+                ScheduleNextPeriodicSync(
+                    g_auto_sync_interval_minutes.load(std::memory_order_acquire));
+            } else if (outcome != SyncRoundOutcome::kProtocolBlocked) {
+                ScheduleFullSyncRetry(
+                    FullSyncFailureRetryMs(has_token_after_round));
+            }
+        } else if (outcome == SyncRoundOutcome::kPartialNeedsFullRetry) {
+            // A local queue/storage failure has no per-item retry cursor.
+            // Escalate it to the bounded full-round backoff so the durable
+            // head cannot remain stranded when periodic sync is disabled.
+            ScheduleFullSyncRetry(FullSyncFailureRetryMs(has_token_after_round));
+        }
 #if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
-        if (g_last_word_outbox_upload_state == WordOutboxUploadState::kYielded ||
+        if (g_outbox_protocol_suspended &&
+            !g_full_sync_reasons.load(std::memory_order_acquire)) {
+            // Suppressed: neither the retry deadline nor the outbox flag may
+            // wake the task while protocol-blocked. A manual full-sync reason
+            // still dispatches (checked at the loop head).
+        } else if (
+            g_last_word_outbox_upload_state == WordOutboxUploadState::kYielded ||
             g_last_note_outbox_upload_state == WordOutboxUploadState::kYielded ||
             g_last_problem_outbox_upload_state == WordOutboxUploadState::kYielded) {
             // Do not turn a user-induced yield into the old 100 ms upload
             // loop. Resume only after another complete quiet period.
+            const uint32_t generation = ArmOutboxQuietWindow();
             if (g_word_outbox_timer == nullptr ||
                 xTimerReset(g_word_outbox_timer, 0) != pdPASS) {
-                g_word_outbox_sync_requested.store(true, std::memory_order_release);
-                delay = std::min(delay, pdMS_TO_TICKS(100));
+                PublishOutboxReadyGeneration(generation);
             }
         } else if (
             g_last_word_outbox_upload_state == WordOutboxUploadState::kPending ||
             g_last_note_outbox_upload_state == WordOutboxUploadState::kPending ||
             g_last_problem_outbox_upload_state == WordOutboxUploadState::kPending) {
             g_word_outbox_sync_requested.store(true, std::memory_order_release);
-            const TickType_t retry_delay = std::min(
-                std::min(WordOutboxRetryWaitDelay(), NoteOutboxRetryWaitDelay()),
-                ProblemOutboxRetryWaitDelay());
-            delay = std::min(
-                delay,
-                retry_delay == portMAX_DELAY ? pdMS_TO_TICKS(100) : retry_delay);
+            if (g_sync_service_task != nullptr) {
+                xTaskNotifyGive(g_sync_service_task);
+            }
         }
 #endif
-        if (delay == portMAX_DELAY) {
-            ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        // Publish every retry/outbox/timer-wake obligation before releasing
+        // the online-sync SleepLease. Otherwise PowerCoordinator could close
+        // quiesce in the tiny gap and sleep without the wake reason installed.
+        const bool lease_cycle_expired = TakeOutboxLeaseCycleExpired();
+        if (OutboxQuietWindowActive() && !lease_cycle_expired) {
+            // A newer observation landed while this round was running. Carry
+            // the same lease into its debounce window instead of releasing and
+            // immediately reacquiring it on the next loop iteration.
+            outbox_quiet_lease = std::move(sleep_lease);
         } else {
-            ulTaskNotifyTake(pdTRUE, delay);
+            // A max-duration quiet cycle releases at least once after its
+            // bounded upload attempt. If newer work is active, the next loop
+            // starts a fresh lease rather than extending this one forever.
+            sleep_lease.Reset();
         }
     }
 }
@@ -1753,8 +3663,75 @@ wqn::protocol::v3::RequestMetadata MakeDeviceRequestMetadata()
 
 #if CONFIG_WQN_WIFI_STA_ENABLE
 
+bool EvaluateSyncWorkAtBoot()
+{
+    uint32_t interval_minutes = 0;
+    if (wqn::LoadAutoSyncIntervalMinutes(&interval_minutes) != ESP_OK) {
+        // A settings read failure is not a reason to make a timer wake go
+        // offline forever; connect once so diagnostics/control can recover.
+        interval_minutes = 0;
+        g_auto_sync_interval_minutes.store(0, std::memory_order_release);
+        g_boot_outbox_pending.store(true, std::memory_order_release);
+        g_boot_policy_evaluated.store(true, std::memory_order_release);
+        return true;
+    }
+    g_auto_sync_interval_minutes.store(interval_minutes, std::memory_order_release);
+    const bool outbox_pending = ProbeDurableOutboxWork();
+    g_boot_outbox_pending.store(outbox_pending, std::memory_order_release);
+
+    wqn::SyncJournal journal;
+    const esp_err_t journal_result = wqn::LoadSyncJournal(&journal);
+    const bool content_pending = journal_result != ESP_OK ||
+        JournalHasPendingContent(journal);
+    g_boot_policy_evaluated.store(true, std::memory_order_release);
+
+    const wqn::runtime::WakeContext& wake = wqn::runtime::GetWakeContext();
+    if (wake.kind != wqn::runtime::WakeKind::kScheduledTimer) {
+        return true;
+    }
+    if (!HasUsableStoredToken()) {
+        ESP_LOGI(kTag, "timer wake keeps WiFi off: device is not paired");
+        return false;
+    }
+    const bool periodic_due = PeriodicScheduleDue(interval_minutes);
+    const bool retry_due = FullSyncRetryDue();
+    const bool should_connect = periodic_due || retry_due || outbox_pending ||
+        content_pending;
+    ESP_LOGI(
+        kTag,
+        "timer-wake connectivity admission: connect=%d periodic=%d retry=%d outbox=%d content=%d interval=%u",
+        should_connect ? 1 : 0,
+        periodic_due ? 1 : 0,
+        retry_due ? 1 : 0,
+        outbox_pending ? 1 : 0,
+        content_pending ? 1 : 0,
+        static_cast<unsigned>(interval_minutes));
+    return should_connect;
+}
+
 esp_err_t StartSyncService()
 {
+    if (!g_boot_policy_evaluated.load(std::memory_order_acquire)) {
+        (void)EvaluateSyncWorkAtBoot();
+    }
+    if (g_sync_journal_mutex == nullptr) {
+        g_sync_journal_mutex =
+            xSemaphoreCreateMutexStatic(&g_sync_journal_mutex_storage);
+        if (g_sync_journal_mutex == nullptr) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    ESP_RETURN_ON_ERROR(EnsureSyncJournalLoaded(), kTag, "load sync journal");
+    if (!wqn::runtime::GetWakeContext().deep_sleep_resume &&
+        BootFullSyncDue()) {
+        g_full_sync_reasons.fetch_or(kFullSyncBoot, std::memory_order_release);
+    }
+    if (g_boot_outbox_pending.load(std::memory_order_acquire)) {
+        // A durable record is pending work, not an instruction to bypass an
+        // existing transport/server retry cursor. OutboxWaitDelay owns due
+        // admission; explicit producers still use the immediate flag.
+        g_word_outbox_sync_requested.store(true, std::memory_order_release);
+    }
     if (g_word_outbox_timer == nullptr) {
         g_word_outbox_timer = xTimerCreateStatic(
             "word_outbox",
@@ -1786,10 +3763,419 @@ esp_err_t StartSyncService()
 void RequestSyncNow()
 {
 #if CONFIG_WQN_WIFI_STA_ENABLE
-    g_full_sync_requested.store(true, std::memory_order_release);
+    g_full_sync_reasons.fetch_or(kFullSyncManual, std::memory_order_release);
     if (g_sync_service_task != nullptr) {
         xTaskNotifyGive(g_sync_service_task);
     }
+#endif
+}
+
+void NotifySyncCredentialsChanged()
+{
+#if CONFIG_WQN_WIFI_STA_ENABLE
+    g_full_sync_reasons.fetch_or(
+        kFullSyncCredentials, std::memory_order_release);
+    if (g_sync_service_task != nullptr) {
+        xTaskNotifyGive(g_sync_service_task);
+    }
+#endif
+}
+
+void NotifySyncConnectivityAvailable()
+{
+#if CONFIG_WQN_WIFI_STA_ENABLE
+    // Readiness must not invent a full-sync reason, but it may release an
+    // outbox transport backoff that was created solely because WiFi was down.
+    // The sync task owns the non-atomic retry cursors and applies this intent.
+    g_outbox_transport_resume_requested.store(true, std::memory_order_release);
+    if (g_sync_service_task != nullptr) {
+        xTaskNotifyGive(g_sync_service_task);
+    }
+#endif
+}
+
+void NotifyAutoSyncIntervalChanged(uint32_t minutes)
+{
+#if CONFIG_WQN_WIFI_STA_ENABLE
+    if (minutes != 0 && minutes != 15 && minutes != 30 && minutes != 60 &&
+        minutes != 240) {
+        ESP_LOGW(kTag, "ignore invalid auto-sync interval: %u",
+                 static_cast<unsigned>(minutes));
+        return;
+    }
+    g_auto_sync_interval_minutes.store(minutes, std::memory_order_release);
+    ScheduleNextPeriodicSync(minutes);
+    if (g_sync_service_task != nullptr) {
+        xTaskNotifyGive(g_sync_service_task);
+    }
+#else
+    (void)minutes;
+#endif
+}
+
+uint32_t SecondsUntilNextSyncWake()
+{
+#if CONFIG_WQN_WIFI_STA_ENABLE
+    if (g_full_sync_reasons.load(std::memory_order_acquire) != 0) {
+        return 1;
+    }
+    // Normally the task-owned quiet lease prevents sleep. This retained wake
+    // deadline closes the producer->task acquisition race: if quiesce wins,
+    // deep sleep wakes when the debounce would have fired and the boot outbox
+    // probe immediately resumes the durable records.
+    uint32_t next_seconds = SecondsUntilOutboxQuietWake();
+    if (g_word_outbox_sync_requested.load(std::memory_order_acquire)) {
+        const TickType_t outbox_ticks = OutboxWaitDelay();
+        next_seconds = outbox_ticks == 0
+            ? 1
+            : (outbox_ticks == portMAX_DELAY
+                   ? 60
+                   : std::max<uint32_t>(
+                         1,
+                         (static_cast<uint64_t>(outbox_ticks) *
+                              portTICK_PERIOD_MS +
+                          999) /
+                             1000));
+    }
+    uint32_t retry_magic = 0;
+    int64_t retry_due_seconds = 0;
+    uint32_t schedule_magic = 0;
+    uint32_t scheduled_interval = 0;
+    int64_t periodic_due_seconds = 0;
+    taskENTER_CRITICAL(&g_periodic_schedule_lock);
+    retry_magic = g_full_sync_retry_magic;
+    retry_due_seconds = g_full_sync_retry_unix_seconds;
+    schedule_magic = g_periodic_schedule_magic;
+    scheduled_interval = g_periodic_schedule_interval_minutes;
+    periodic_due_seconds = g_next_periodic_sync_unix_seconds;
+    taskEXIT_CRITICAL(&g_periodic_schedule_lock);
+    uint32_t content_seconds = UINT32_MAX;
+    const int64_t now_ms = esp_timer_get_time() / 1000;
+    taskENTER_CRITICAL(&g_sync_snapshot_lock);
+    const auto include_content =
+        [now_ms, &content_seconds](const SyncContentSnapshot& snapshot) {
+            if (snapshot.desired_revision <= snapshot.applied_revision ||
+                snapshot.phase == SyncContentPhase::kBlocked) {
+                return;
+            }
+            uint32_t seconds = 1;
+            if (snapshot.phase == SyncContentPhase::kBackoff &&
+                snapshot.next_retry_ms > now_ms) {
+                seconds = static_cast<uint32_t>(std::max<int64_t>(
+                    1, (snapshot.next_retry_ms - now_ms + 999) / 1000));
+            }
+            content_seconds = std::min(content_seconds, seconds);
+        };
+    include_content(g_sync_snapshot.word_packs);
+    include_content(g_sync_snapshot.note_packs);
+    include_content(g_sync_snapshot.problem_packs);
+    taskEXIT_CRITICAL(&g_sync_snapshot_lock);
+    next_seconds = std::min(next_seconds, content_seconds);
+    const TickType_t journal_ticks = std::min(
+        JournalRetryWaitDelay(), ControlJournalRetryWaitDelay());
+    if (journal_ticks != portMAX_DELAY) {
+        next_seconds = std::min(next_seconds, static_cast<uint32_t>(
+            std::max<uint64_t>(1, (static_cast<uint64_t>(journal_ticks) *
+                portTICK_PERIOD_MS + 999) / 1000)));
+    }
+
+    const std::time_t now = CurrentUnixSeconds();
+    const auto seconds_until = [now](int64_t due_seconds) -> uint32_t {
+        if (due_seconds == 0) {
+            return UINT32_MAX;
+        }
+        if (now < kMinScheduleUnixTime || static_cast<int64_t>(now) >= due_seconds) {
+            return 1;
+        }
+        return static_cast<uint32_t>(std::min<int64_t>(
+            UINT32_MAX,
+            due_seconds - static_cast<int64_t>(now)));
+    };
+    if (retry_magic == kFullRetryMagic) {
+        uint32_t retry_seconds = UINT32_MAX;
+        if (retry_due_seconds >= static_cast<int64_t>(kMinScheduleUnixTime) &&
+            now >= kMinScheduleUnixTime) {
+            retry_seconds = seconds_until(retry_due_seconds);
+        } else {
+            const int64_t remaining_ms =
+                g_full_sync_retry_not_before_ms.load(std::memory_order_acquire) -
+                esp_timer_get_time() / 1000;
+            retry_seconds = remaining_ms <= 0
+                ? 1
+                : static_cast<uint32_t>(std::min<int64_t>(
+                      UINT32_MAX, (remaining_ms + 999) / 1000));
+        }
+        next_seconds = std::min(next_seconds, retry_seconds);
+    }
+    const uint32_t interval_minutes =
+        g_auto_sync_interval_minutes.load(std::memory_order_acquire);
+    if (interval_minutes != 0) {
+        const bool schedule_matches =
+            schedule_magic == kPeriodicScheduleMagic &&
+            scheduled_interval == interval_minutes;
+        const uint32_t periodic_seconds = !schedule_matches
+            ? 1
+            : periodic_due_seconds >= static_cast<int64_t>(kMinScheduleUnixTime) &&
+                    now >= kMinScheduleUnixTime
+                ? seconds_until(periodic_due_seconds)
+                : [&]() -> uint32_t {
+                    const int64_t remaining_ms =
+                        g_next_periodic_sync_not_before_ms.load(
+                            std::memory_order_acquire) -
+                        esp_timer_get_time() / 1000;
+                    return remaining_ms <= 0
+                        ? 1
+                        : static_cast<uint32_t>(std::min<int64_t>(
+                              UINT32_MAX, (remaining_ms + 999) / 1000));
+                }();
+        next_seconds = std::min(next_seconds, periodic_seconds);
+    }
+    return next_seconds == UINT32_MAX ? 0 : next_seconds;
+#else
+    return 0;
+#endif
+}
+
+void RequestContentRefresh(SyncContentDomain domain)
+{
+#if CONFIG_WQN_WIFI_STA_ENABLE
+    const uint32_t bit = ContentRefreshBit(domain);
+    if (bit == 0) {
+        return;
+    }
+    g_content_refresh_requested.fetch_or(bit, std::memory_order_release);
+    g_full_sync_reasons.fetch_or(
+        kFullSyncContentRefresh, std::memory_order_release);
+    taskENTER_CRITICAL(&g_sync_snapshot_lock);
+    SyncContentSnapshot* snapshot = nullptr;
+    switch (domain) {
+        case SyncContentDomain::kWordPacks:
+            snapshot = &g_sync_snapshot.word_packs;
+            break;
+        case SyncContentDomain::kNotePacks:
+            snapshot = &g_sync_snapshot.note_packs;
+            break;
+        case SyncContentDomain::kProblemPacks:
+            snapshot = &g_sync_snapshot.problem_packs;
+            break;
+    }
+    if (snapshot != nullptr &&
+        snapshot->phase != SyncContentPhase::kFetching &&
+        snapshot->phase != SyncContentPhase::kInstalling) {
+        snapshot->phase = SyncContentPhase::kPending;
+        snapshot->next_retry_ms = 0;
+        ++g_sync_snapshot.state_sequence;
+    }
+    taskEXIT_CRITICAL(&g_sync_snapshot_lock);
+    if (g_sync_service_task != nullptr) {
+        xTaskNotifyGive(g_sync_service_task);
+    }
+#else
+    (void)domain;
+#endif
+}
+
+SyncContentTicket TryClaimContentRefresh(SyncContentDomain domain)
+{
+    SyncContentTicket ticket;
+    ticket.domain = domain;
+#if CONFIG_WQN_WIFI_STA_ENABLE
+    const uint32_t bit = ContentRefreshBit(domain);
+    if (bit == 0) {
+        return ticket;
+    }
+    const bool forced =
+        (g_content_refresh_requested.fetch_and(~bit, std::memory_order_acq_rel) & bit) != 0;
+    const int64_t now_ms = esp_timer_get_time() / 1000;
+    taskENTER_CRITICAL(&g_sync_snapshot_lock);
+    SyncContentSnapshot* snapshot = ContentSnapshotForDomain(domain);
+    const bool due = snapshot != nullptr &&
+        (snapshot->phase == SyncContentPhase::kPending ||
+         (snapshot->phase == SyncContentPhase::kBackoff &&
+          snapshot->next_retry_ms <= now_ms));
+    const bool needs_convergence = snapshot != nullptr &&
+        snapshot->desired_revision > snapshot->applied_revision;
+    const size_t index = ContentDomainIndex(domain);
+    if (snapshot != nullptr && g_content_active_generation[index] == 0 &&
+        !g_content_completion_pending[index] &&
+        (forced || (due && needs_convergence))) {
+        uint32_t generation = ++g_content_claim_generation[index];
+        if (generation == 0) {
+            generation = ++g_content_claim_generation[index];
+        }
+        g_content_active_generation[index] = generation;
+        snapshot->phase = SyncContentPhase::kFetching;
+        snapshot->next_retry_ms = 0;
+        ++g_sync_snapshot.state_sequence;
+        ticket.generation = generation;
+        ticket.target_revision = snapshot->desired_revision;
+    }
+    taskEXIT_CRITICAL(&g_sync_snapshot_lock);
+    if (!ticket && forced) {
+        g_content_refresh_requested.fetch_or(bit, std::memory_order_release);
+    }
+#else
+    (void)domain;
+#endif
+    return ticket;
+}
+
+void CancelContentRefreshClaim(const SyncContentTicket& ticket)
+{
+#if CONFIG_WQN_WIFI_STA_ENABLE
+    if (!ticket || ContentRefreshBit(ticket.domain) == 0) {
+        return;
+    }
+    const size_t index = ContentDomainIndex(ticket.domain);
+    taskENTER_CRITICAL(&g_sync_snapshot_lock);
+    if (g_content_active_generation[index] == ticket.generation) {
+        g_content_active_generation[index] = 0;
+        SyncContentSnapshot* snapshot = ContentSnapshotForDomain(ticket.domain);
+        if (snapshot != nullptr) {
+            snapshot->phase = SyncContentPhase::kPending;
+            ++g_sync_snapshot.state_sequence;
+        }
+    }
+    taskEXIT_CRITICAL(&g_sync_snapshot_lock);
+    g_content_refresh_requested.fetch_or(
+        ContentRefreshBit(ticket.domain), std::memory_order_release);
+#else
+    (void)ticket;
+#endif
+}
+
+esp_err_t BeginContentInstall(const SyncContentTicket& ticket)
+{
+#if CONFIG_WQN_WIFI_STA_ENABLE
+    if (!ticket || ContentRefreshBit(ticket.domain) == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    SyncJournalLock journal_lock;
+    if (!journal_lock) return ESP_ERR_INVALID_STATE;
+    bool accepted = false;
+    const size_t index = ContentDomainIndex(ticket.domain);
+    taskENTER_CRITICAL(&g_sync_snapshot_lock);
+    if (g_content_active_generation[index] == ticket.generation) {
+        SyncContentSnapshot* snapshot = ContentSnapshotForDomain(ticket.domain);
+        wqn::SyncJournalContentState* journal = JournalStateForDomain(ticket.domain);
+        if (snapshot != nullptr && journal != nullptr) {
+            snapshot->phase = SyncContentPhase::kInstalling;
+            journal->phase = wqn::SyncJournalPhase::kInstalling;
+            journal->retry_not_before_unix_seconds = 0;
+            ++g_sync_snapshot.state_sequence;
+            accepted = true;
+        }
+    }
+    taskEXIT_CRITICAL(&g_sync_snapshot_lock);
+    if (!accepted) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    return PersistLatestSyncJournalLocked("install-marker");
+#else
+    (void)ticket;
+    return ESP_ERR_NOT_SUPPORTED;
+#endif
+}
+
+void CompleteContentRefresh(
+    const SyncContentTicket& ticket,
+    esp_err_t result,
+    const char* snapshot_id,
+    const char* error)
+{
+#if CONFIG_WQN_WIFI_STA_ENABLE
+    if (!ticket || ContentRefreshBit(ticket.domain) == 0) {
+        return;
+    }
+    SyncJournalLock journal_lock;
+    if (!journal_lock) return;
+    const size_t index = ContentDomainIndex(ticket.domain);
+    bool accepted = false;
+    const std::time_t completion_unix_seconds = CurrentUnixSeconds();
+    taskENTER_CRITICAL(&g_sync_snapshot_lock);
+    if (g_content_active_generation[index] == ticket.generation) {
+        g_content_active_generation[index] = 0;
+        SyncContentSnapshot* live_snapshot = ContentSnapshotForDomain(ticket.domain);
+        // Prepare completion locally. Never expose Clean/applied before the
+        // journal accepts it; retain one bounded pending slot per domain.
+        SyncContentSnapshot completed = live_snapshot == nullptr
+            ? SyncContentSnapshot{} : *live_snapshot;
+        SyncContentSnapshot* snapshot = live_snapshot == nullptr ? nullptr : &completed;
+        wqn::SyncJournalContentState* journal = JournalStateForDomain(ticket.domain);
+        if (snapshot != nullptr && journal != nullptr) {
+            if (result == ESP_OK) {
+                snapshot->applied_revision = std::max(
+                    snapshot->applied_revision, ticket.target_revision);
+                snapshot->retry_attempt = 0;
+                snapshot->next_retry_ms = 0;
+                snapshot->last_error[0] = '\0';
+                if (snapshot_id != nullptr && std::strlen(snapshot_id) == 64) {
+                    std::snprintf(snapshot->snapshot_id,
+                                  sizeof(snapshot->snapshot_id), "%s", snapshot_id);
+                    std::snprintf(journal->desired_snapshot_id,
+                                  sizeof(journal->desired_snapshot_id), "%s", snapshot_id);
+                    std::snprintf(journal->active_snapshot_id,
+                                  sizeof(journal->active_snapshot_id), "%s", snapshot_id);
+                }
+                snapshot->phase = snapshot->desired_revision > snapshot->applied_revision
+                    ? SyncContentPhase::kPending
+                    : SyncContentPhase::kClean;
+                journal->applied_revision = snapshot->applied_revision;
+                journal->phase = snapshot->phase == SyncContentPhase::kClean
+                    ? wqn::SyncJournalPhase::kClean
+                    : wqn::SyncJournalPhase::kPending;
+                journal->retry_attempt = 0;
+                journal->retry_not_before_unix_seconds = 0;
+            } else {
+                if (snapshot->retry_attempt < UINT8_MAX) {
+                    ++snapshot->retry_attempt;
+                }
+                const uint8_t shift = std::min<uint8_t>(snapshot->retry_attempt - 1, 7);
+                const uint32_t base_ms = std::min<uint32_t>(5000u << shift, 900000u);
+                const uint32_t low_ms = base_ms * 4u / 5u;
+                const uint32_t spread_ms = base_ms * 2u / 5u;
+                const uint32_t delay_ms = low_ms + esp_random() % (spread_ms + 1u);
+                snapshot->next_retry_ms =
+                    esp_timer_get_time() / 1000 + static_cast<int64_t>(delay_ms);
+                snapshot->phase = SyncContentPhase::kBackoff;
+                std::snprintf(snapshot->last_error,
+                              sizeof(snapshot->last_error), "%s",
+                              error == nullptr ? esp_err_to_name(result) : error);
+                journal->phase = wqn::SyncJournalPhase::kBackoff;
+                journal->retry_attempt = snapshot->retry_attempt;
+                journal->retry_not_before_unix_seconds =
+                    completion_unix_seconds >= kMinScheduleUnixTime
+                    ? static_cast<uint64_t>(completion_unix_seconds) +
+                        static_cast<uint64_t>((delay_ms + 999) / 1000)
+                    : 0;
+            }
+            g_content_completed_snapshot[index] = completed;
+            g_content_completion_pending[index] = true;
+            ++g_sync_snapshot.state_sequence;
+            accepted = true;
+        }
+    }
+    taskEXIT_CRITICAL(&g_sync_snapshot_lock);
+    const esp_err_t persist_result = accepted
+        ? PersistLatestSyncJournalLocked("content-complete") : ESP_OK;
+    if (persist_result != ESP_OK) {
+        ESP_LOGE(kTag, "content completion journal save failed: domain=%u",
+                 static_cast<unsigned>(ticket.domain));
+    }
+    if (accepted && (result != ESP_OK || persist_result != ESP_OK)) {
+        // Content lanes converge independently from the control plane and
+        // outboxes. Surface backoff or pending durability as partial completion; a
+        // single pack failure must not relabel already-synced domains as a
+        // failed global round.
+        const int64_t finished_ms = esp_timer_get_time() / 1000;
+        SetSyncStatus("partial");
+        PublishSyncEvent(SyncEventStatus::kPartial, finished_ms, SyncEventScope::kFull);
+    }
+#else
+    (void)ticket;
+    (void)result;
+    (void)snapshot_id;
+    (void)error;
 #endif
 }
 
@@ -1803,16 +4189,19 @@ void NoteWordInteraction()
 void RequestWordOutboxUpload()
 {
 #if CONFIG_WQN_WIFI_STA_ENABLE && CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
+    const uint32_t generation = ArmOutboxQuietWindow();
     if (g_word_outbox_timer != nullptr &&
         xTimerReset(g_word_outbox_timer, 0) == pdPASS) {
+        // Wake SyncService now so it acquires the bounded quiet-window lease;
+        // the timer callback still owns publication of the upload-ready flag.
+        if (g_sync_service_task != nullptr) {
+            xTaskNotifyGive(g_sync_service_task);
+        }
         return;
     }
     // Timer command queue pressure must not strand a durable observation.
     // Fall back to an immediate outbox-only notification.
-    g_word_outbox_sync_requested.store(true, std::memory_order_release);
-    if (g_sync_service_task != nullptr) {
-        xTaskNotifyGive(g_sync_service_task);
-    }
+    PublishOutboxReadyGeneration(generation);
 #endif
 }
 
@@ -1821,16 +4210,17 @@ void RequestNoteOutboxUpload()
     // Note observations share word's quiet-window timer and outbox-only round
     // (the round uploads both queues), so this reuses the same trigger path.
 #if CONFIG_WQN_WIFI_STA_ENABLE && CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
+    const uint32_t generation = ArmOutboxQuietWindow();
     if (g_word_outbox_timer != nullptr &&
         xTimerReset(g_word_outbox_timer, 0) == pdPASS) {
+        if (g_sync_service_task != nullptr) {
+            xTaskNotifyGive(g_sync_service_task);
+        }
         return;
     }
     // Timer command queue pressure must not strand a durable observation.
     // Fall back to an immediate outbox-only notification.
-    g_word_outbox_sync_requested.store(true, std::memory_order_release);
-    if (g_sync_service_task != nullptr) {
-        xTaskNotifyGive(g_sync_service_task);
-    }
+    PublishOutboxReadyGeneration(generation);
 #endif
 }
 
@@ -1839,16 +4229,17 @@ void RequestProblemOutboxUpload()
     // Problem verdicts share the same quiet-window timer and outbox-only
     // round (the round uploads all three queues).
 #if CONFIG_WQN_WIFI_STA_ENABLE && CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
+    const uint32_t generation = ArmOutboxQuietWindow();
     if (g_word_outbox_timer != nullptr &&
         xTimerReset(g_word_outbox_timer, 0) == pdPASS) {
+        if (g_sync_service_task != nullptr) {
+            xTaskNotifyGive(g_sync_service_task);
+        }
         return;
     }
     // Timer command queue pressure must not strand a durable observation.
     // Fall back to an immediate outbox-only notification.
-    g_word_outbox_sync_requested.store(true, std::memory_order_release);
-    if (g_sync_service_task != nullptr) {
-        xTaskNotifyGive(g_sync_service_task);
-    }
+    PublishOutboxReadyGeneration(generation);
 #endif
 }
 
@@ -1861,30 +4252,31 @@ void GetSyncSnapshot(SyncSnapshot* snapshot)
     taskENTER_CRITICAL(&g_sync_snapshot_lock);
     *snapshot = g_sync_snapshot;
     taskEXIT_CRITICAL(&g_sync_snapshot_lock);
+    snapshot->interval_minutes =
+        g_auto_sync_interval_minutes.load(std::memory_order_acquire);
 #else
     *snapshot = {};
     std::snprintf(snapshot->status, sizeof(snapshot->status), "%s", "wifi-disabled");
 #endif
-    uint32_t minutes = 0;
-    if (LoadAutoSyncIntervalMinutes(&minutes) == ESP_OK) {
-        snapshot->interval_minutes = minutes;
-    }
-}
-
-TickType_t GetConfiguredSyncDelayTicks()
-{
-    uint32_t minutes = 0;
-    if (LoadAutoSyncIntervalMinutes(&minutes) != ESP_OK || minutes == 0) {
-        return portMAX_DELAY;
-    }
-    const uint64_t milliseconds = static_cast<uint64_t>(minutes) * 60ULL * 1000ULL;
-    const uint64_t ticks = milliseconds / portTICK_PERIOD_MS;
-    return ticks > static_cast<uint64_t>(portMAX_DELAY - 1) ? portMAX_DELAY - 1 : static_cast<TickType_t>(ticks);
 }
 
 }  // namespace wqn::services
 
 namespace wqn::services {
+
+void GetLatestSyncEvent(SyncEvent* event)
+{
+    if (event == nullptr) {
+        return;
+    }
+#if CONFIG_WQN_WIFI_STA_ENABLE
+    taskENTER_CRITICAL(&g_sync_snapshot_lock);
+    *event = g_latest_sync_event;
+    taskEXIT_CRITICAL(&g_sync_snapshot_lock);
+#else
+    *event = SyncEvent{};
+#endif
+}
 
 void SetSyncEventSink(SyncEventSink sink)
 {

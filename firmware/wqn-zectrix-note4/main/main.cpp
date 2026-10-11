@@ -1,6 +1,4 @@
 #include <string>
-#include <utility>
-#include <vector>
 
 #include "ai_session.h"
 #include "audio_selftest.h"
@@ -20,10 +18,13 @@
 #include "freertos/task.h"
 #include "services/sync_service.h"
 #include "power_manager.h"
+#include "opencode_session.h"
+#include "power/rtc_timekeep.h"
 #include "power/wake_controller.h"
 #include "runtime/sleep_coordinator.h"
 #include "runtime/storage_schema.h"
 #include "runtime/wake_context.h"
+#include "sdkconfig.h"
 #include "services/audio_service.h"
 #include "services/connectivity_service.h"
 #include "storage.h"
@@ -32,28 +33,6 @@
 namespace {
 
 constexpr char kTag[] = "wqn_main";
-
-void LogCachedProblemState()
-{
-    std::vector<wqn::CachedProblem> problems;
-    const esp_err_t result = wqn::LoadProblems(&problems);
-    if (result == ESP_OK) {
-        ESP_LOGI(kTag, "cached problems: count=%u", static_cast<unsigned>(problems.size()));
-    } else {
-        ESP_LOGW(kTag, "problem cache load failed: %s", esp_err_to_name(result));
-    }
-}
-
-void LogPendingReviewState()
-{
-    std::vector<wqn::PendingReviewResult> reviews;
-    const esp_err_t result = wqn::LoadPendingReviewResults(&reviews);
-    if (result == ESP_OK) {
-        ESP_LOGI(kTag, "pending review uploads: count=%u", static_cast<unsigned>(reviews.size()));
-    } else {
-        ESP_LOGW(kTag, "pending review queue load failed: %s", esp_err_to_name(result));
-    }
-}
 
 void LogTokenState()
 {
@@ -124,6 +103,19 @@ extern "C" void app_main(void)
         wqn::kNote4I2cScl,
         wqn::kNote4I2cClockHz));
     wqn::power::CaptureWakeContext();
+#if CONFIG_WQN_RTC_TIMEKEEP_ENABLE
+    // [rtc-timekeep] Earliest safe wall-clock calibration point: the shared
+    // I2C bus and the PCF8563 are up, and nothing downstream (sync deadlines,
+    // outbox stamps, retained timer math, UI clock seeding, HTTPS clock
+    // gating) has read the system time yet. When this restores a trusted RTC
+    // value, SeedClockFromBuildTimeIfNeeded() later becomes a no-op because
+    // its reasonableness check passes.
+    wqn::power::timekeep::RestoreSystemTimeFromRtc();
+#endif
+    // Sync admission runs before the UI task. Give every scheduler a
+    // reasonable wall-clock lower bound even when RTC restore is disabled or
+    // rejected; HTTPS/SNTP can refine it after connectivity is admitted.
+    wqn::power::timekeep::SeedSystemTimeFromBuildTimeIfNeeded();
     wqn::LogWakeupCause();
     wqn::PrintBootDiagnostics();
 
@@ -181,8 +173,6 @@ extern "C" void app_main(void)
     ESP_ERROR_CHECK(wqn::services::StartAudioService());
     LogTokenState();
     LogWifiCredentialState();
-    LogCachedProblemState();
-    LogPendingReviewState();
 
     // [volume] Restore persisted playback volume into the process-wide cache so
     // the first playback after boot uses the user's level, not the 100% default.
@@ -204,10 +194,20 @@ extern "C" void app_main(void)
 
     ConfirmRunningApp();
     ESP_ERROR_CHECK(wqn::InitAiSession());
+#if CONFIG_WQN_AGENT_ENABLE
+    // [agent] Gated with the tier itself: an Agent-disabled build must not
+    // start the gateway worker task or reserve its 9 KB static stack.
+    ESP_ERROR_CHECK(wqn::InitOpenCodeSession());
+#endif
 
-    // ConnectivityService is the sole owner of station, provisioning and
-    // reconnect policy. app_main only starts the service.
-    ESP_ERROR_CHECK_WITHOUT_ABORT(wqn::services::StartConnectivity());
+    // Seed the durable sync admission cache, but do not start WiFi here.
+    // Connectivity is demand-owned: SyncService, AI and cloud lanes acquire
+    // the radio only around actual work, and the last release arms idle-off.
+#if CONFIG_WQN_WIFI_STA_ENABLE
+    if (!wqn::services::EvaluateSyncWorkAtBoot()) {
+        ESP_LOGI(kTag, "scheduled timer wake: connectivity deferred");
+    }
+#endif
 
     ESP_ERROR_CHECK(wqn::StartDeviceUiIfEnabled());
     ESP_ERROR_CHECK_WITHOUT_ABORT(wqn::RunAudioSelfTestIfEnabled());

@@ -17,6 +17,10 @@ namespace {
 
 constexpr char kTag[] = "wqn_diag";
 
+}  // namespace
+
+namespace wqn {
+
 const char* ResetReasonToString(esp_reset_reason_t reason)
 {
     switch (reason) {
@@ -54,10 +58,6 @@ const char* ResetReasonToString(esp_reset_reason_t reason)
             return "unknown";
     }
 }
-
-}  // namespace
-
-namespace wqn {
 
 bool ReadPlatformDiagnosticsSnapshot(PlatformDiagnosticsSnapshot* snapshot)
 {

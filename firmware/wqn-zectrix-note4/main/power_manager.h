@@ -28,13 +28,37 @@ void NoteUserActivityAtMs(int64_t occurred_at_ms);
 void CheckBatteryAfterUserActivity();
 bool IsUiIdleForSleep();
 bool IsUiIdleForSleepEx(int extra_idle_ms);
+// True after the shorter retained-standby idle threshold. Unlike deep sleep,
+// this is only a scheduling hint: automatic ESP-PM light sleep keeps lease
+// admission open and retains RAM/PSRAM/framebuffer state.
+bool IsUiIdleForRetainedStandby();
+// True when an idle, battery-powered device is ready to enter deep sleep and
+// a cosmetic minute refresh should yield instead of acquiring a display
+// lease at the same threshold.
+bool ShouldYieldClockRefreshToDeepSleep();
+
+// Foreground UI policy for automatic idle deep sleep. Ordinary paired pages
+// use retained standby; the current firmware permits automatic deep sleep only
+// for the stateless provisioning/background-maintenance screen. There is no
+// application-page hibernate contract. Emergency/user shutdown ignores this.
+enum class DeepSleepUiPolicy : uint8_t {
+    kRetainedStandbyOnly = 0,
+    kDeepSleepNoDisplayTimer,
+};
 
 esp_err_t StartPowerCoordinator();
 // Synchronizes USB/charger status with the global sleep policy. Call once
 // after InitSleepCoordinator(), then periodically from PowerCoordinator.
 void RefreshUsbPowerSleepPolicy();
-void SetDeepSleepTimerWakePreference(bool enabled);
+void SetDeepSleepUiPolicy(DeepSleepUiPolicy policy);
+// UI-owned readiness signal used to lengthen coordinator polling and record
+// retained-standby transitions. It does not close SleepLease admission.
+void SetRetainedStandbyUiReady(bool ready);
 void ShutdownForBatteryDepleted();
+// [power-fix] User-initiated power-off (settings page): the coordinator
+// clears the panel on the EPD owner task, quiesces services, then cuts the
+// board power latch. Safe to call from any task; re-request if busy.
+void RequestUserPowerOff();
 
 esp_err_t InitPowerHardware(i2c_port_t i2c_port, gpio_num_t i2c_sda, gpio_num_t i2c_scl, int i2c_clk_hz);
 
@@ -46,8 +70,11 @@ struct PowerStatusSnapshot {
     int adc_mv = 0;
     int battery_mv = 0;
     int battery_percent = 0;
+    bool usb_host_connected = false;
     bool charging = false;
     bool fully_charged = false;
+    // Unified policy result: USB SOF or CHRG_L, never /STDBY alone.
+    bool external_power_present = false;
 };
 
 // Returns a value snapshot; callers never receive ADC/GPIO driver handles.
@@ -60,6 +87,9 @@ bool IsFullyCharged();
 // True only while the ESP32-S3 USB Serial/JTAG peripheral is receiving host
 // SOF frames. This distinguishes a connected PC from charger-status GPIOs.
 bool IsUsbHostConnected();
+// True when USB SOF or active-low CHRG_L confirms external power. /STDBY is a
+// charge-complete status only and may remain asserted after cable removal, so
+// it does not independently block sleep.
 bool IsUsbPowered();
 bool IsBatteryLow();
 bool IsBatteryVeryLow();

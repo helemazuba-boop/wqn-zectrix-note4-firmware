@@ -5,10 +5,13 @@
 #include "ui_internal.h"
 #include "ui_widgets.h"
 
+#include "markdown_layout.h"
+
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <ctime>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -17,7 +20,7 @@ namespace device_ui_internal {
 namespace {
 
 constexpr char kTag[] = "wqn_note_page";
-constexpr int kNoteMarginX = 8;
+constexpr int kNoteMarginX = kMarginDense;  // [v2] density-page margin (was 8)
 constexpr int kContentW = wqn::kEpdWidth - 2 * kNoteMarginX;
 constexpr int kContentTop = 32;
 // No footer line: lists and the body run down to the panel edge. The body
@@ -97,7 +100,8 @@ std::string LastViewedLabel(const std::string& last_opened_at)
 esp_err_t DrawListRow(int y, const std::string& primary, const std::string& trailing, bool selected)
 {
     if (selected) {
-        DrawSelectedFill(kNoteMarginX, y, kContentW, kListRowH - 4);
+        // [v2] density-list row selection: rounded reverse-fill block.
+        DrawSelectionDecoration(kNoteMarginX, y, kContentW, kListRowH - 4, SelectionStyle::kRowFill);
     }
     const bool black = !selected;
     const int trailing_w = 108;
@@ -213,16 +217,28 @@ esp_err_t RenderNoteBody(const wqn::NoteAppSnapshot& note)
         body_top += kBodyLineH;
     }
     const int visible = std::max(1, (kBodyBottom - body_top) / kBodyLineH);
-    // Wrap the body once per opened note. Re-running WrapUtf8TextToWidth over a
-    // body of up to 16 KB on every frame pegged the CPU while scrolling; cache the
-    // wrapped lines keyed by note_id so scrolling only re-reads them.
-    static std::string s_wrapped_note_id;
-    static std::vector<std::string> s_wrapped_lines;
-    if (note.note_id != s_wrapped_note_id) {
-        s_wrapped_lines = wqn::WrapUtf8TextToWidth(note.note_body, kContentW - 14, 4096);
-        s_wrapped_note_id = note.note_id;
+    // Lay the body out (Markdown subset) once per opened note; scrolling only
+    // re-reads the cached rows. LayoutMarkdown is a pure fixed-width pass and
+    // MUST use the same width as note_app.cpp's scroll-clamp count (kMarkdownWidthDense), or
+    // Down-scroll clamps to the wrong last page.
+    //
+    // Identity is keyed on note_id + body size + hash: the cache must notice
+    // a same-id content update (cloud sync) WITHOUT pinning a second full
+    // copy of the body text in static storage.
+    static std::string s_layout_note_id;
+    static size_t s_layout_body_size = 0;
+    static size_t s_layout_body_hash = 0;
+    static std::vector<MdLine> s_md_lines;
+    const size_t body_hash = std::hash<std::string>{}(note.note_body);
+    if (note.note_id != s_layout_note_id ||
+        note.note_body.size() != s_layout_body_size ||
+        body_hash != s_layout_body_hash) {
+        s_md_lines = LayoutMarkdown(note.note_body, kMarkdownWidthDense);
+        s_layout_note_id = note.note_id;
+        s_layout_body_size = note.note_body.size();
+        s_layout_body_hash = body_hash;
     }
-    const std::vector<std::string>& lines = s_wrapped_lines;
+    const std::vector<MdLine>& lines = s_md_lines;
     const int total = static_cast<int>(lines.size());
     const int max_top = total > visible ? total - visible : 0;
     int top = static_cast<int>(note.note_scroll_offset_lines);
@@ -230,7 +246,9 @@ esp_err_t RenderNoteBody(const wqn::NoteAppSnapshot& note)
     if (top < 0) top = 0;
     for (int i = 0; i < visible && top + i < total; ++i) {
         ESP_RETURN_ON_ERROR(
-            DrawClippedText(kNoteMarginX + 2, body_top + i * kBodyLineH, kContentW - 14, lines[top + i]),
+            DrawMarkdownLine(
+                lines[top + i], kNoteMarginX + 2, body_top + i * kBodyLineH,
+                kMarkdownWidthDense, kBodyLineH),
             kTag, "draw note body line");
     }
     // Proportional scrollbar (font-independent) when the body overflows.
@@ -261,6 +279,23 @@ esp_err_t RenderNoteToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
     // [status-bar-progress] A flip to a not-yet-downloaded image keeps the
     // PREVIOUS image on screen (payload carried stale) with a slim top
     // banner tracking the download, instead of a blocking loading page.
+    if (note.mode == wqn::NoteAppMode::kNoteImageView && !note.note_image_error &&
+        note.note_image_wqni != nullptr &&
+        note.note_image_wqni->size() >= wqn::kNoteImageHeaderBytes &&
+        note.note_image_wqni->data()[5] == 2 &&
+        note.note_image_wqni->size() ==
+            wqn::kNoteImageHeaderBytes + wqn::kNoteImageGray4PayloadBytes) {
+        // A gray download may expose the previous payload while progress is
+        // being reported. Re-running four waveform passes for every progress
+        // bucket would flash the panel and waste minutes of battery; keep the
+        // previous physical image until the variant is complete.
+        if (!note.note_image_ready) {
+            return ESP_OK;
+        }
+        return wqn::RefreshEpdGray16(
+            note.note_image_wqni->data() + wqn::kNoteImageHeaderBytes,
+            wqn::kNoteImageGray4PayloadBytes);
+    }
     if (note.mode == wqn::NoteAppMode::kNoteImageView && !note.note_image_error &&
         note.note_image_wqni != nullptr &&
         note.note_image_wqni->size() ==

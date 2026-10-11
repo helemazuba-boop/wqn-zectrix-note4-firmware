@@ -1,8 +1,24 @@
 #pragma once
 
 #define WQN_FIRMWARE_NAME "wqn-zectrix-note4"
-#define WQN_FIRMWARE_VERSION "0.1.0"
+// [release] Injected by main/CMakeLists.txt from PROJECT_VER, which the release
+// tooling derives from a content fingerprint. The fallback only exists so tools
+// that parse config.h without the build's compile definitions still compile.
+#ifndef WQN_FIRMWARE_VERSION
+#define WQN_FIRMWARE_VERSION "0.1.0-dev"
+#endif
 #define WQN_BOARD_ID "zectrix-s3-epaper-4.2"
+
+// [dev-diag] Configure-time build identity injected by main/CMakeLists.txt.
+// The #ifndef fallbacks cover tooling that parses config.h without the build's
+// compile definitions. NOT appended to WQN_FIRMWARE_VERSION: that string is
+// part of the sync image_id and the EPD frame signature.
+#ifndef WQN_GIT_COMMIT
+#define WQN_GIT_COMMIT "unknown"
+#endif
+#ifndef WQN_BUILD_TIME
+#define WQN_BUILD_TIME "unknown"
+#endif
 
 #ifndef WQN_API_BASE
 #define WQN_API_BASE "https://wqn.helema.cn/api/esp32"
@@ -19,10 +35,6 @@
 #define WQN_NVS_ACCESS_TOKEN_KEY "access_token"
 
 #define WQN_SYNC_LIMIT 20
-
-#ifndef WQN_DEBUG_PROBLEM_IDS
-#define WQN_DEBUG_PROBLEM_IDS ""
-#endif
 
 // ============================================================================
 // AI v2 SSE streaming protocol (STD/PRO tier) — see docs/04-std-pro-streaming-protocol.md
@@ -67,6 +79,10 @@
 #endif
 #ifndef WQN_FLASH_WS_SUBPROTOCOL
 #define WQN_FLASH_WS_SUBPROTOCOL "wqn-flash-v2"
+#endif
+
+#ifndef WQN_VOICE_WS_SUBPROTOCOL
+#define WQN_VOICE_WS_SUBPROTOCOL "wqn-voice-v2"
 #endif
 
 #ifndef WQN_FLASH_VOICE

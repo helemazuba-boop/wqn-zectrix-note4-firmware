@@ -13,6 +13,10 @@
 #include "runtime/sleep_coordinator.h"
 #include "storage.h"
 #include "ui_internal.h"  // NotifyUiTask
+#include "error_recorder.h"
+#include "psram_task_stack.h"
+#include "services/storage_service.h"
+#include "word_pack.h"
 
 namespace device_ui_internal {
 namespace {
@@ -40,6 +44,7 @@ enum SlotState : uint32_t {
     kSlotQueued,
     kSlotRunning,
     kSlotResultPending,
+    kSlotAcknowledging,
 };
 
 struct PersistCommand {
@@ -52,7 +57,10 @@ struct PersistCommand {
     // strings keep their heap data, so holding every kind's members inline
     // costs headers (a few hundred bytes) not the session arrays.
     wqn::DurableWordObservation word_obs;
+    std::vector<wqn::DurableWordObservation> word_batch;
     wqn::PersistedWordSession word_advanced;
+    wqn::WordPackIndexEntry word_card_index{};
+    wqn::WqnWordEntry word_card_result;
     wqn::DurableNoteObservation note_obs;
     wqn::PersistedNoteSession note_advanced;
     wqn::DurableProblemObservation problem_obs;
@@ -63,6 +71,12 @@ struct PersistCommand {
 PersistCommand g_pool[kPoolDepth];
 QueueHandle_t g_worker_queue = nullptr;  // carries slot indices (uint8_t)
 TaskHandle_t g_worker_task = nullptr;
+// [psram-stack] Safe to keep in PSRAM: all nine PersistKind command paths
+// dispatch through ExecuteStorageTransaction, so the actual NVS/SPIFFS work
+// runs on the storage service task's internal stack, not this one. Verified
+// per kind in persist_worker.cpp ExecutePersistCommand. See psram_task_stack.cpp.
+StaticTask_t g_worker_tcb = {};
+StackType_t* g_worker_stack = nullptr;
 portMUX_TYPE g_start_lock = portMUX_INITIALIZER_UNLOCKED;
 bool g_starting = false;
 std::atomic<uint32_t> g_next_operation_id{1};
@@ -70,6 +84,14 @@ std::atomic<uint32_t> g_next_operation_id{1};
 // Per-kind busy: set when a reservation is taken, cleared only at UI ack (NOT
 // at worker finish). One in-flight per kind + duplicate-Confirm guard.
 std::atomic<bool> g_kind_busy[static_cast<size_t>(PersistKind::kCount)];
+
+// [worker-domain-gate] Per-domain busy, strictly coarser than per-kind. The
+// reservation takes the kind first and the domain second, releasing the kind
+// again when the domain is taken -- so the two are only ever held together.
+// Because the domain gate admits at most one kind per domain, releasing the
+// domain alongside its kind is exact: there is never a second kind in that
+// domain still relying on it.
+std::atomic<bool> g_domain_busy[static_cast<size_t>(PersistDomain::kCount)];
 
 // Per-kind ACK mailbox. result/operation_id/slot are written before
 // pending_generation (release) and read after it (acquire); the busy gate keeps
@@ -100,17 +122,38 @@ uint32_t NextOperationId()
     return id;
 }
 
-// Reserve the per-kind busy gate (one in-flight per kind). False if already busy.
+// [worker-domain-gate] Reserve the per-kind gate AND the per-domain gate. The
+// kind CAS comes first so the common single-kind case is unchanged; the domain
+// CAS is what rejects a second command that would mutate the same session
+// snapshot. On a domain rejection the kind is released immediately, so the
+// caller sees exactly the same "busy, retry later" answer it always did.
 bool ReserveKind(PersistKind kind)
 {
     bool expected = false;
-    return g_kind_busy[KindIndex(kind)].compare_exchange_strong(
-        expected, true, std::memory_order_acq_rel, std::memory_order_acquire);
+    if (!g_kind_busy[KindIndex(kind)].compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        return false;
+    }
+    const PersistDomain domain = DomainForKind(kind);
+    if (domain != PersistDomain::kCount) {
+        bool domain_expected = false;
+        if (!g_domain_busy[static_cast<size_t>(domain)].compare_exchange_strong(
+                domain_expected, true, std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+            g_kind_busy[KindIndex(kind)].store(false, std::memory_order_release);
+            return false;
+        }
+    }
+    return true;
 }
 
 void ReleaseKind(PersistKind kind)
 {
     g_kind_busy[KindIndex(kind)].store(false, std::memory_order_release);
+    const PersistDomain domain = DomainForKind(kind);
+    if (domain != PersistDomain::kCount) {
+        g_domain_busy[static_cast<size_t>(domain)].store(false, std::memory_order_release);
+    }
 }
 
 // Acquire a Free slot and move it to Filling. UI task only. Null when full.
@@ -170,10 +213,18 @@ void EnqueueReserved(PersistCommand& command, uint8_t slot_index, PersistKind ki
 
 // Runs the owned storage transaction. WORKER TASK ONLY. Every kind calls a
 // foreground/worker-dedicated storage entry so the queue wait stays bounded.
+esp_err_t ReadWordCardPrefetchTransaction(void* context)
+{
+    auto& command = *static_cast<PersistCommand*>(context);
+    return wqn::ReadWordPackEntryPrefetch(command.word_card_index, &command.word_card_result);
+}
+
 esp_err_t ExecutePersistCommand(PersistCommand& command)
 {
     switch (command.kind) {
         case PersistKind::kWordObservation:
+            if (!command.word_batch.empty())
+                return wqn::CommitWordObservations(command.word_batch, command.word_advanced);
             return wqn::CommitWordObservation(command.word_obs, command.word_advanced);
         case PersistKind::kNoteObservation:
             return wqn::CommitNoteObservation(command.note_obs, command.note_advanced);
@@ -182,12 +233,29 @@ esp_err_t ExecutePersistCommand(PersistCommand& command)
         case PersistKind::kSettingsAutoSync:
             return wqn::SaveAutoSyncIntervalMinutesForeground(
                 static_cast<uint32_t>(command.settings_int));
+        case PersistKind::kSettingsImageRender:
+            return wqn::SaveImageRenderModeForeground(
+                static_cast<wqn::ImageRenderMode>(command.settings_int));
         case PersistKind::kSettingsVolume:
             return wqn::SaveVolumePercentForeground(command.settings_int);
         case PersistKind::kSettingsDefaultDeck:
             // Recoverable marker protocol; one foreground storage transaction
             // (marker -> session clears -> deck+generation -> marker clear).
             return wqn::ChangeDefaultWordDeckForeground(command.settings_str);
+        case PersistKind::kWordSessionReset:
+            // Generation-first scope reset; one foreground storage transaction.
+            return wqn::ResetWordSessionScope();
+        case PersistKind::kWordCardPrefetch:
+            // The worker's stack is in PSRAM. All flash I/O must stay on the
+            // storage task's internal stack; background priority yields to
+            // foreground transactions before this read starts (not during it).
+            return wqn::services::ExecuteStorageTransactionNamed(
+                ReadWordCardPrefetchTransaction, &command, "word-card-prefetch");
+        case PersistKind::kSettingsAiFollow:
+            return wqn::SaveAiAutoFollowForeground(command.settings_int != 0);
+        case PersistKind::kSettingsAgentDetail:
+            return wqn::SaveAgentDetailLevelForeground(
+                static_cast<uint8_t>(command.settings_int));
         case PersistKind::kCount:
             return ESP_ERR_NOT_SUPPORTED;
     }
@@ -215,10 +283,15 @@ void PublishPersistResult(PersistCommand& command, uint8_t slot_index)
 // exact slot; across 8 slots and interleaved domains that is hundreds of KB of
 // heap/PSRAM held for nothing. The result mailbox carries only
 // result/op_id/slot, so clearing before publishing is safe.
-void ClearCommandPayload(PersistCommand& command)
+void ClearCommandPayload(PersistCommand& command, bool retain_read_result = false)
 {
     command.word_obs = {};
+    command.word_batch.clear();
     command.word_advanced = {};
+    if (!retain_read_result) {
+        command.word_card_index = {};
+        command.word_card_result = {};
+    }
     command.note_obs = {};
     command.note_advanced = {};
     command.problem_obs = {};
@@ -250,10 +323,18 @@ void PersistWorkerTask(void*)
             continue;
         }
         command.result = ExecutePersistCommand(command);
+        if (command.result != ESP_OK) {
+            // [dev-diag] One hook covers every domain's durable-write failure
+            // (DEV_DIAGNOSTICS.md §5); the ring keeps the kind + esp_err that
+            // the transient notice drops.
+            wqn::RecordError(
+                "persist", "kind=%u %s", static_cast<unsigned>(command.kind),
+                esp_err_to_name(command.result));
+        }
         // Storage has ended: the SleepLease lifetime ends with the write, NOT
         // with the UI ack. Release it here; the busy gate stays set until ack.
         command.lease.Reset();
-        ClearCommandPayload(command);
+        ClearCommandPayload(command, command.kind == PersistKind::kWordCardPrefetch);
         const UBaseType_t stack_free = uxTaskGetStackHighWaterMark(nullptr);
         ESP_LOGI(kTag, "persist done: kind=%u op=%lu result=%s stack_free=%u",
                  static_cast<unsigned>(command.kind),
@@ -291,8 +372,20 @@ esp_err_t StartPersistWorker()
         }
     }
     TaskHandle_t created = nullptr;
-    if (xTaskCreate(PersistWorkerTask, "wqn_persist", kTaskStackBytes, nullptr,
-                    kTaskPriority, &created) != pdPASS) {
+    if (g_worker_stack == nullptr) {
+        g_worker_stack = wqn::AllocTaskStack(
+            kTaskStackBytes, "wqn_persist", nullptr);
+    }
+    if (g_worker_stack == nullptr) {
+        taskENTER_CRITICAL(&g_start_lock);
+        g_starting = false;
+        taskEXIT_CRITICAL(&g_start_lock);
+        return ESP_ERR_NO_MEM;
+    }
+    created = xTaskCreateStatic(
+        PersistWorkerTask, "wqn_persist", wqn::TaskStackWords(kTaskStackBytes),
+        nullptr, kTaskPriority, g_worker_stack, &g_worker_tcb);
+    if (created == nullptr) {
         taskENTER_CRITICAL(&g_start_lock);
         g_starting = false;
         taskEXIT_CRITICAL(&g_start_lock);
@@ -370,6 +463,18 @@ void EnqueueReservedWordObservation(
     EnqueueReserved(*command, ticket.slot_index, ticket.kind);
 }
 
+void EnqueueReservedWordObservations(
+    const PersistTicket& ticket,
+    std::vector<wqn::DurableWordObservation> observations,
+    wqn::PersistedWordSession advanced_session)
+{
+    PersistCommand* command = ReservedCommand(ticket);
+    if (command == nullptr || ticket.kind != PersistKind::kWordObservation) return;
+    command->word_batch = std::move(observations);
+    command->word_advanced = std::move(advanced_session);
+    EnqueueReserved(*command, ticket.slot_index, ticket.kind);
+}
+
 void EnqueueReservedNoteObservation(
     const PersistTicket& ticket,
     wqn::DurableNoteObservation observation,
@@ -410,6 +515,22 @@ uint32_t SubmitAutoSyncIntervalSave(uint32_t minutes)
     return ticket.operation_id;
 }
 
+uint32_t SubmitImageRenderModeSave(wqn::ImageRenderMode mode)
+{
+    if (mode != wqn::ImageRenderMode::kBlackWhite &&
+        mode != wqn::ImageRenderMode::kGray16) {
+        return 0;
+    }
+    PersistTicket ticket = TryReservePersist(PersistKind::kSettingsImageRender);
+    if (!ticket.valid()) {
+        return 0;
+    }
+    PersistCommand& command = g_pool[ticket.slot_index];
+    command.settings_int = static_cast<int>(mode);
+    EnqueueReserved(command, ticket.slot_index, ticket.kind);
+    return ticket.operation_id;
+}
+
 uint32_t SubmitVolumeSave(int percent)
 {
     PersistTicket ticket = TryReservePersist(PersistKind::kSettingsVolume);
@@ -422,6 +543,48 @@ uint32_t SubmitVolumeSave(int percent)
     // playback uses the new level regardless of how long the durable NVS write
     // waits behind other worker commands.
     wqn::SetPlaybackVolumeCache(percent);
+    EnqueueReserved(command, ticket.slot_index, ticket.kind);
+    return ticket.operation_id;
+}
+
+uint32_t SubmitAiFollowSave(bool follow)
+{
+    PersistTicket ticket = TryReservePersist(PersistKind::kSettingsAiFollow);
+    if (!ticket.valid()) {
+        return 0;
+    }
+    PersistCommand& command = g_pool[ticket.slot_index];
+    command.settings_int = follow ? 1 : 0;
+    EnqueueReserved(command, ticket.slot_index, ticket.kind);
+    return ticket.operation_id;
+}
+
+uint32_t SubmitAgentDetailLevelSave(uint8_t level)
+{
+    if (level > 2) {
+        return 0;
+    }
+    PersistTicket ticket = TryReservePersist(PersistKind::kSettingsAgentDetail);
+    if (!ticket.valid()) {
+        return 0;
+    }
+    PersistCommand& command = g_pool[ticket.slot_index];
+    command.settings_int = static_cast<int>(level);
+    EnqueueReserved(command, ticket.slot_index, ticket.kind);
+    return ticket.operation_id;
+}
+
+uint32_t SubmitWordSessionReset(const std::string& deck_id)
+{
+    if (deck_id.empty() || deck_id.size() != 36) {
+        return 0;
+    }
+    PersistTicket ticket = TryReservePersist(PersistKind::kWordSessionReset);
+    if (!ticket.valid()) {
+        return 0;
+    }
+    PersistCommand& command = g_pool[ticket.slot_index];
+    command.settings_str = deck_id;
     EnqueueReserved(command, ticket.slot_index, ticket.kind);
     return ticket.operation_id;
 }
@@ -441,6 +604,16 @@ uint32_t SubmitDefaultDeckChange(const std::string& deck_id)
     return ticket.operation_id;
 }
 
+void EnqueueReservedWordCardPrefetch(const PersistTicket& ticket,
+    const wqn::WordPackIndexEntry& index)
+{
+    PersistCommand* command = ReservedCommand(ticket);
+    if (command == nullptr || ticket.kind != PersistKind::kWordCardPrefetch) return;
+    command->word_card_index = index;
+    command->word_card_result = {};
+    EnqueueReserved(*command, ticket.slot_index, ticket.kind);
+}
+
 bool TakePersistResultToApply(PersistKind kind, PersistResultReceipt* out)
 {
     if (!ValidKind(kind)) {
@@ -457,6 +630,19 @@ bool TakePersistResultToApply(PersistKind kind, PersistResultReceipt* out)
         out->operation_id = box.operation_id;
         out->generation = pending;
     }
+    return true;
+}
+
+bool TakeWordCardPrefetchResult(PersistResultReceipt* out, wqn::WqnWordEntry* entry)
+{
+    if (out == nullptr || entry == nullptr ||
+        !TakePersistResultToApply(PersistKind::kWordCardPrefetch, out)) return false;
+    const auto& box = g_mailbox[KindIndex(PersistKind::kWordCardPrefetch)];
+    if (box.slot_index >= kPoolDepth) return false;
+    const auto& command = g_pool[box.slot_index];
+    if (command.kind != PersistKind::kWordCardPrefetch || command.operation_id != out->operation_id ||
+        command.state.load(std::memory_order_acquire) != kSlotResultPending) return false;
+    *entry = command.word_card_result;
     return true;
 }
 
@@ -496,13 +682,17 @@ bool AckPersistResult(PersistKind kind, uint32_t generation, uint32_t operation_
     // that observes "not busy" is guaranteed to find this slot free.
     uint32_t expected = kSlotResultPending;
     if (!command.state.compare_exchange_strong(
-            expected, kSlotFree,
+            expected, kSlotAcknowledging,
             std::memory_order_acq_rel, std::memory_order_acquire)) {
         ESP_LOGE(kTag, "ack: slot %u not ResultPending (state=%lu)",
                  static_cast<unsigned>(slot_index),
                  static_cast<unsigned long>(expected));
         return false;
     }
+    // Do not publish Free before clearing the retained read result: a different
+    // kind could reserve that slot immediately and race this cleanup.
+    ClearCommandPayload(command);
+    command.state.store(kSlotFree, std::memory_order_release);
     box.acked_generation.store(generation, std::memory_order_release);
     ReleaseKind(kind);
     return true;
@@ -524,6 +714,38 @@ bool IsAnyPersistBusy()
         }
     }
     return false;
+}
+
+PersistDomain DomainForKind(PersistKind kind)
+{
+    switch (kind) {
+        case PersistKind::kWordObservation:
+        case PersistKind::kWordSessionReset:
+            return PersistDomain::kWord;
+        case PersistKind::kNoteObservation:
+            return PersistDomain::kNote;
+        case PersistKind::kProblemVerdict:
+            return PersistDomain::kProblem;
+        case PersistKind::kSettingsAutoSync:
+        case PersistKind::kSettingsImageRender:
+        case PersistKind::kSettingsVolume:
+        case PersistKind::kSettingsDefaultDeck:
+        case PersistKind::kSettingsAiFollow:
+        case PersistKind::kSettingsAgentDetail:
+            return PersistDomain::kSettings;
+        case PersistKind::kWordCardPrefetch:
+        case PersistKind::kCount:
+            break;
+    }
+    return PersistDomain::kCount;
+}
+
+bool IsPersistDomainBusy(PersistDomain domain)
+{
+    if (domain == PersistDomain::kCount) {
+        return false;
+    }
+    return g_domain_busy[static_cast<size_t>(domain)].load(std::memory_order_acquire);
 }
 
 }  // namespace device_ui_internal

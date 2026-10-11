@@ -1,20 +1,25 @@
 idf_component_register(
     SRCS
         "main.cpp"
+        "ai_feature.cpp"
         "ai_history.cpp"
         "ai_session.cpp"
+        "agent_voice_pipe.cpp"
         "audio_capture.cpp"
         "audio_player.cpp"
-        "audio_volume.cpp"
         "audio_selftest.cpp"
+        "audio_pcm_dump.cpp"
+        "psram_task_stack.cpp"
         "button_input.cpp"
         "contract_fixtures.cpp"
         "device_ui.cpp"
         "diagnostics.cpp"
+        "error_recorder.cpp"
+        "i2c_bus_lock.cpp"
         "power_manager.cpp"
+        "power/rtc_timekeep.cpp"
         "power/wake_controller.cpp"
         "pcf8563.cpp"
-        "problem_cache.cpp"
         "provision_manager.cpp"
         "runtime/storage_schema.cpp"
         "services/connectivity_service.cpp"
@@ -23,6 +28,7 @@ idf_component_register(
         "services/sync_service.cpp"
         "sse_chunk.cpp"
         "storage.cpp"
+        "storage_io_probe.cpp"
         "text_render.cpp"
         "time_app.cpp"
         "ui/battery.cpp"
@@ -31,7 +37,11 @@ idf_component_register(
         "ui/persist_worker.cpp"
         "ui/diagnostics.cpp"
         "ui/graphics.cpp"
+        "ui/ui_gates_selftest.cpp"
+        "ui/markdown_layout.cpp"
+        "ui/markdown_render.cpp"
         "ui/page_ai.cpp"
+        "ui/page_ai_agent.cpp"
         "ui/page_home.cpp"
         "ui/page_settings.cpp"
         "ui/page_time.cpp"
@@ -39,6 +49,7 @@ idf_component_register(
         "ui/page_word.cpp"
         "ui/seven_segment.cpp"
         "ui/text_wrappers.cpp"
+        "ui/time_app_retention.cpp"
         "ui/todo_cloud.cpp"
         "ui/note_cloud.cpp"
         "ui/page_note.cpp"
@@ -57,6 +68,8 @@ idf_component_register(
         "note_cloud.cpp"
         "note_store.cpp"
         "note_app.cpp"
+        "opencode_client.cpp"
+        "opencode_session.cpp"
         "problem_pack.cpp"
         "problem_cloud.cpp"
         "problem_store.cpp"
@@ -67,6 +80,7 @@ idf_component_register(
         "wqn_api.cpp"
         "wqn_api_stream.cpp"
         "flash_session.cpp"
+        "stdpro_ws_transport.cpp"
     INCLUDE_DIRS "."
     REQUIRES
         driver
@@ -98,19 +112,75 @@ idf_component_register(
         spiffs
 )
 
+# [measure] Read-only private ABI dependency, pinned to the local IDF 5.5.4
+# SPIFFS adapter. SDK sources/config stay untouched; remove with this probe.
+target_include_directories(${COMPONENT_LIB} PRIVATE
+    "${IDF_PATH}/components/spiffs"
+    "${IDF_PATH}/components/spiffs/spiffs/src"
+)
+# Scope-filtered partition API and GC function pass-through probes.
+# --wrap rewrites SDK references after libmain has been scanned. Explicit roots
+# pull the wrappers from that archive even when the boot bench is disabled;
+# otherwise their incidental InitializePartitionIoProbe reference was required
+# just to link. Outside a measurement scope they still forward unchanged.
+target_link_options(${COMPONENT_LIB} INTERFACE
+    "-Wl,--wrap=esp_partition_read"
+    "-Wl,--undefined=__wrap_esp_partition_read"
+    "-Wl,--wrap=esp_partition_write"
+    "-Wl,--undefined=__wrap_esp_partition_write"
+    "-Wl,--wrap=esp_partition_erase_range"
+    "-Wl,--undefined=__wrap_esp_partition_erase_range"
+    "-Wl,--wrap=spiffs_gc_check"
+    "-Wl,--undefined=__wrap_spiffs_gc_check"
+    "-Wl,--wrap=spiffs_gc_quick"
+    "-Wl,--undefined=__wrap_spiffs_gc_quick"
+)
+
 if(CONFIG_WQN_WIFI_STA_ENABLE AND NOT CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE)
     message(FATAL_ERROR
         "WiFi-enabled firmware must use device-control v3; legacy /poll pairing returns HTTP 426")
 endif()
 
 set(WQN_API_BASE "" CACHE STRING "Override the WQN ESP32 API base URL")
-set(WQN_DEBUG_PROBLEM_IDS "" CACHE STRING "Local-only comma-separated ESP32 debug problem IDs")
+
+# [dev-diag] Build identity for the Dev info dialog (DEV_DIAGNOSTICS.md §4.1).
+# Both values are configure-time snapshots: a commit made after configure only
+# shows up on the next reconfigure. Git absence (building from an export)
+# degrades to "unknown". Deliberately separate from WQN_FIRMWARE_VERSION --
+# that string feeds the sync image_id and the EPD frame signature and must not
+# change on every commit.
+execute_process(
+    COMMAND git -C ${CMAKE_CURRENT_LIST_DIR}/../.. describe --always --dirty --abbrev=8
+    OUTPUT_VARIABLE WQN_GIT_COMMIT
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+    RESULT_VARIABLE WQN_GIT_COMMIT_RESULT
+)
+if(NOT WQN_GIT_COMMIT_RESULT EQUAL 0 OR NOT WQN_GIT_COMMIT)
+    set(WQN_GIT_COMMIT "unknown")
+endif()
+# The release tooling pins this to the version's original timestamp so both
+# machines report the same build time for the same version.
+if(DEFINED ENV{WQN_BUILD_TIME} AND NOT "$ENV{WQN_BUILD_TIME}" STREQUAL "")
+    set(WQN_BUILD_TIME "$ENV{WQN_BUILD_TIME}")
+else()
+    string(TIMESTAMP WQN_BUILD_TIME "%Y-%m-%d %H:%M" UTC)
+endif()
+
+# [release] Single source of truth for the firmware version: PROJECT_VER is set
+# in the top-level CMakeLists.txt from WQN_RELEASE_VERSION. It feeds the sync
+# image_id and the EPD frame signature, so it must not drift from the release
+# record. main/config.h keeps an #ifndef fallback for standalone parsers.
+idf_build_get_property(WQN_PROJECT_VER PROJECT_VER)
 
 target_compile_definitions(
     ${COMPONENT_LIB}
     PRIVATE
         BOARD_TYPE=\"zectrix-s3-epaper-4.2\"
         BOARD_NAME=\"ZecTrix_Note4\"
+        WQN_GIT_COMMIT=\"${WQN_GIT_COMMIT}\"
+        WQN_BUILD_TIME=\"${WQN_BUILD_TIME}\"
+        WQN_FIRMWARE_VERSION=\"${WQN_PROJECT_VER}\"
 )
 
 if(WQN_API_BASE)
@@ -118,13 +188,5 @@ if(WQN_API_BASE)
         ${COMPONENT_LIB}
         PRIVATE
             WQN_API_BASE=\"${WQN_API_BASE}\"
-    )
-endif()
-
-if(WQN_DEBUG_PROBLEM_IDS)
-    target_compile_definitions(
-        ${COMPONENT_LIB}
-        PRIVATE
-            WQN_DEBUG_PROBLEM_IDS=\"${WQN_DEBUG_PROBLEM_IDS}\"
     )
 endif()

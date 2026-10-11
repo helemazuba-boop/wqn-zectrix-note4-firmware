@@ -1,4 +1,5 @@
 #include "device_protocol/claim_crypto.h"
+#include "device_protocol/json_depth_guard.h"
 
 #include <algorithm>
 #include <array>
@@ -375,8 +376,12 @@ esp_err_t OpenSealedCredential(
         }
         plaintext[encrypted_size] = '\0';
 
-        cJSON* root = cJSON_ParseWithLength(
-            reinterpret_cast<const char*>(plaintext.data()), encrypted_size);
+        const char* plaintext_json =
+            reinterpret_cast<const char*>(plaintext.data());
+        cJSON* root = wqn::protocol::JsonNestingWithinLimit(
+                           plaintext_json, encrypted_size)
+            ? cJSON_ParseWithLength(plaintext_json, encrypted_size)
+            : nullptr;
         cJSON* protocol = cJSON_GetObjectItemCaseSensitive(root, "protocol");
         cJSON* parsed_device_id =
             cJSON_GetObjectItemCaseSensitive(root, "device_id");

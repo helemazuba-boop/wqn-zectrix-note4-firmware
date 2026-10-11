@@ -1,0 +1,10 @@
+{
+  "version": "5.2.0",
+  "asset": "esptool-v5.2.0-windows-amd64.zip",
+  "url": "https://github.com/espressif/esptool/releases/download/v5.2.0/esptool-v5.2.0-windows-amd64.zip",
+  "member": "esptool-windows-amd64/esptool.exe",
+  "size": 12681976,
+  "sha256": "232677fec8d846c0f621704689db099ee676fa2ae927a795a99c530c1b983ae6",
+  "mirror_name": "esptool-v5.2.0.exe",
+  "note": "Pinned to the version used on Windows by deploy.bat. PyInstaller cannot cross-build a Windows exe from WSL, so we ship the official prebuilt binary instead."
+}

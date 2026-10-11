@@ -1,13 +1,17 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
 
+#include "sdkconfig.h"
+
 #include "ai_history.h"
 #include "note_app.h"
+#include "opencode_model.h"
 #include "problem_app.h"
 #include "storage.h"
 #include "time_app.h"
@@ -16,21 +20,25 @@
 
 namespace wqn {
 
-enum class UiScreen {
-    kAi,
-    kTodo,
-    kSettings,
-    kHome,
-    kTime,
-    kWord,
-    kNote,
-    kLibrary,
-    kProblem,
-    kSolution,
-    kReviewQueue,
-    kReviewScore,
-    kReviewQueued,
-    kProvisioning,
+enum class UiScreen : uint8_t {
+    // Values are persisted in RTC slow memory across deep sleep. Keep retained
+    // IDs stable so firmware updates can reject removed prototype screens 7-12
+    // instead of reinterpreting them as another page.
+    kAi = 0,
+    kTodo = 1,
+    kSettings = 2,
+    kHome = 3,
+    kTime = 4,
+    kWord = 5,
+    kNote = 6,
+    kProvisioning = 13,
+    // [agent] Reserved. The standalone OpenCode Agent page was demoted into
+    // the AI page as AiTier::kAgent, so this screen is no longer reachable
+    // from the page ring. The ID stays occupied for the same reason 7-12 do:
+    // a device that wakes from deep sleep with 14 in RTC memory must reject it
+    // (see IsRestorableScreen in ui_state.cpp) instead of rendering a page
+    // that no longer exists.
+    kOpenCode = 14,
 };
 
 enum class UiInput {
@@ -51,12 +59,6 @@ enum class UiTextStyle {
     kWrappedBody,
 };
 
-enum class ReviewChoice {
-    kWrong,
-    kNeedsReview,
-    kMastered,
-};
-
 enum class AiSessionStatus {
     kIdle,
     // WiFi/audio hardware preparation is in progress. Keep this separate
@@ -70,15 +72,20 @@ enum class AiSessionStatus {
     kError,
 };
 
+// [agent] Tier 2 was Pro: a cloud-side model swap behind the exact same
+// endpoint, prompts and reasoning-effort mapping as STD, selected only by an
+// `X-WQN-Ai-Tier: pro` header no other client ever sends. It is deprecated and
+// replaced by Agent, the OpenCode gateway tier, where the model is chosen
+// server-side by the WQN binding. AiTier is never persisted (no NVS field and
+// SetAiTier has exactly one caller), so this is a pure in-memory rename.
 enum class AiTier : uint8_t {
     kFlash = 0,
     kStd = 1,
-    kPro = 2,
+    kAgent = 2,
     kCount = 3,
 };
 
 AiTier NextAiTier(AiTier current);
-AiTier PrevAiTier(AiTier current);
 const char* AiTierLabel(AiTier tier);
 
 // [shell] Thinking effort level shown as the status-bar lightbulb icon
@@ -124,6 +131,14 @@ struct AiSessionState {
     // elapsed-seconds counter by design; the user reaches "still working"
     // signal by the toast being present at all, with a blink dot.
     int32_t scroll_offset_lines = 0;
+    // [follow] Per-turn viewport-follow state, owned here because this struct
+    // owns the offset it drives. follow_active: the viewport is still chasing
+    // the newest content this turn (cleared when the answer text arrives, so
+    // the reply stays readable). user_moved: the user moved the viewport this
+    // turn, which disables the follow AND the completion recenter. Both are
+    // armed by the turn-start paths in ai_session.cpp.
+    bool follow_active = false;
+    bool user_moved = false;
     bool toast_visible = false;
     std::string toast_label;       // e.g. "\xe2\x97\x8f 录音中 00:04" / "\xe2\x97\x8f 上传…"
     int64_t toast_since_ms = 0;
@@ -136,6 +151,10 @@ struct AiSessionState {
     ThinkingLevel thinking_level = ThinkingLevel::kMed;
     bool tts_on = false;
     bool expand_content = true;   // [expand] default full thinking/tool display (Flash can't toggle)
+    // [follow] Auto-follow the newest content while a reply streams, stopping
+    // when the answer text (正文) arrives. Exposed as the 4th edit-cluster
+    // toggle; STD/Pro and Agent only (Flash hides the whole cluster).
+    bool auto_follow = true;
 };
 
 // Returns the current scroll offset in 18-px line units (0 == bottom / newest).
@@ -181,6 +200,7 @@ struct HomeSummary {
     std::string wifi_label = "WiFi";
     std::string battery_label = "--%";
     std::string primary_time_line = "--:--";
+    bool timer_status_only = false;
     // Raw state for status-bar icons (font_zectrix). Populated by BuildHomeSummary.
     int battery_percent = 0;
     bool charging = false;
@@ -194,14 +214,96 @@ struct HomeSummary {
     std::vector<HomeTask> tasks;
 };
 
+// Settings-page row count, the single source of truth for every layer that
+// indexes settings rows (model clamps, button dispatch, row rendering). It
+// lives here — not in device_ui_internal — because the model layer
+// (ui_model.cpp) clamps the selection without including ui/ headers.
+// Structure (rows, order, dialogs) is specified by DEV_DIAGNOSTICS.md.
+#if CONFIG_WQN_DEV_MENU_ENABLE
+constexpr size_t kSettingsItemCount = 12;
+#else
+constexpr size_t kSettingsItemCount = 11;
+#endif
+
+// Row indices as named constants — dispatch and chip-tag code must reference
+// these, never row-number literals (the historical hardcoded 9/8 clamp in
+// ui_model.cpp is why this rule exists).
+constexpr size_t kSettingsRowWifi = 0;
+constexpr size_t kSettingsRowSyncNow = 1;
+constexpr size_t kSettingsRowAutoSync = 2;
+constexpr size_t kSettingsRowBattery = 3;
+constexpr size_t kSettingsRowImageRender = 4;
+constexpr size_t kSettingsRowVolume = 5;
+constexpr size_t kSettingsRowWordDeck = 6;
+// [ai-follow] The auto-follow toggle's new home: it left the AI status-bar
+// cluster (where a set-once preference did not belong) for the settings page.
+constexpr size_t kSettingsRowAiFollow = 7;
+constexpr size_t kSettingsRowVersion = 8;
+#if CONFIG_WQN_DEV_MENU_ENABLE
+constexpr size_t kSettingsRowDevMenu = 9;
+constexpr size_t kSettingsRowFactoryReset = 10;
+constexpr size_t kSettingsRowPowerOff = 11;
+#else
+constexpr size_t kSettingsRowFactoryReset = 9;
+constexpr size_t kSettingsRowPowerOff = 10;
+#endif
+
+// Second-level dev list (DEV_DIAGNOSTICS.md §3): six rows, which is exactly the
+// panel's 6-row window, so it needs no scrolling. kDevRowBatteryRaw and
+// kDevRowStorage carry the two detail dialogs that used to sit on the root
+// list; the flag gates only the root entry row, not these constants.
+constexpr size_t kDevItemCount = 6;
+constexpr size_t kDevRowDevInfo = 0;
+constexpr size_t kDevRowDevSync = 1;
+constexpr size_t kDevRowDevErrors = 2;
+constexpr size_t kDevRowBatteryRaw = 3;
+constexpr size_t kDevRowStorage = 4;
+constexpr size_t kDevRowSleepDiag = 5;
+// On-panel sleep/power diagnostic lines (DEV_DIAGNOSTICS.md §4.6).
+constexpr size_t kSleepDiagLines = 6;
+
+// Which row list the settings page is showing. The dev list is a second-level
+// view inside the same UiScreen -- deliberately not a new UiScreen, so the
+// top-level navigation ring, the retained deep-sleep screen ID and the sleep
+// policy per screen all stay untouched.
+enum class SettingsView {
+    kRoot,
+    kDev,
+};
+
 enum class SettingsDialog {
     kNone,
+    kWifiManage,
     kAutoSync,
     kBattery,
     kStorage,
+    kImageRendering,
     kVolume,
     kDefaultWordDeck,
+    kAiFollow,
+    kDevInfo,
+    kDevSync,
+    kDevErrors,
+    kSleepDiag,
     kFactoryReset,
+    kPowerOff,
+};
+
+// [dev-diag] One formatted error-log line for the Dev error dialog, built at
+// snapshot time by UpdateSettingsDiagnostics from a wqn::ErrorRecord copy.
+// POD with a fixed buffer: SettingsAppState (and UiFrame) are copied by value
+// on every render, so published payloads stay trivially copyable.
+struct SettingsErrorLine {
+    bool valid = false;
+    char text[96] = {};
+};
+
+// [dev-diag] One formatted sleep/power diagnostic line, built at snapshot time
+// by UpdateSettingsDiagnostics from a wqn::runtime::SleepDiagnosticEvent copy.
+// POD with a fixed buffer for the same reason as SettingsErrorLine above.
+struct SettingsSleepDiagLine {
+    bool valid = false;
+    char text[96] = {};
 };
 
 struct SettingsDiagnosticsSnapshot {
@@ -222,15 +324,47 @@ struct SettingsDiagnosticsSnapshot {
     std::string firmware_version;
     std::string board_id;
     std::string idf_target;
+    std::string content_sync_label;
+    // [dev-diag] Dev-menu fields (structure fixed by DEV_DIAGNOSTICS.md).
+    // Filled by UpdateSettingsDiagnostics on dialog open / state reload; the
+    // Kconfig flag only gates the visible rows, these fields always exist.
+    std::string git_commit;  // configure-time git describe, "unknown" fallback
+    std::string build_time;  // configure-time build timestamp
+    std::string reset_reason_label;
+    std::string uptime_label;
+    size_t heap_free = 0;
+    size_t heap_min_free = 0;
+    // Sync diagnostics, formatted into fixed display lines at snapshot time
+    // (render draws them verbatim; DrawClippedText clips overflow).
+    std::string sync_diag_summary;               // row value: last round result
+    std::array<std::string, 7> sync_diag_lines;  // dialog body, top to bottom
+    // Error-log ring copy, oldest first, formatted one line per record.
+    std::string error_count_label;      // row value: "3 条" / "无"
+    size_t error_line_count = 0;
+    SettingsErrorLine error_lines[6];
+    // [dev-diag] Sleep/power diagnostics (DEV_DIAGNOSTICS.md §4.6): the ring
+    // lives in RTC slow memory and is only readable through
+    // CopySleepDiagnosticEntries, so this copy is the on-panel view of it.
+    // Newest first, formatted at snapshot time like the error lines.
+    std::string sleep_diag_count_label;  // row value: "12 条" / "无"
+    size_t sleep_diag_line_count = 0;
+    SettingsSleepDiagLine sleep_diag_lines[kSleepDiagLines];
 };
 
 struct SettingsAppState {
     size_t selected = 0;
+    // Second-level dev list (kDevItemCount rows) opened from the root row
+    // kSettingsRowDevMenu; long-Confirm returns to kRoot. Defaults to kRoot so
+    // a deep-sleep wake or a fresh state reload never lands in the dev list.
+    SettingsView view = SettingsView::kRoot;
+    size_t dev_selected = 0;
     SettingsDialog dialog = SettingsDialog::kNone;
     size_t auto_sync_selected = 0;
     uint32_t auto_sync_interval_min = 0;
     int volume_percent = 100;
     size_t volume_selected = 0;
+    ImageRenderMode image_render_mode = ImageRenderMode::kGray16;
+    size_t image_render_selected = 1;
     // 「WQN Word 默认词库」单选对话框: option 0 is the fixed 「全部词库」
     // (empty id), the rest mirror the mounted word deck catalog.
     std::vector<WordDeckInfo> word_deck_options;
@@ -239,10 +373,37 @@ struct SettingsAppState {
     std::string default_word_deck_title;
     std::string sync_status;
     std::string notice;
+    // [ai-follow] 「AI 回复时翻页」 row (settings index kSettingsRowAiFollow).
+    // auto_follow is the durable value the row displays and the value the ACK
+    // installs; the worker's AiSessionState::auto_follow is the copy the follow
+    // step actually reads, and SetAiAutoFollow is the only bridge. The dialog
+    // focus is separate so an Up/Down repaint cannot be deduped away. The
+    // pending trio follows the c4 shape: Confirm arms the choice, a successful
+    // submit records its op id, and only the matching ACK installs it (a failed
+    // one keeps the armed choice so a re-open preselects it).
+    bool auto_follow = true;
+    size_t ai_follow_selected = 0;  // option index: 0 = 开 (the default), 1 = 关
+    bool pending_auto_follow = true;
+    bool auto_follow_pending_valid = false;
+    uint32_t auto_follow_save_op_id = 0;
+    // [detail] Agent-tier detail tier (0 简要 / 1 标准 / 2 详细). There is no
+    // Confirm gesture here: a status-bar cycle mirrors the value into the worker
+    // and into the UI copy immediately (it has to draw on this tick), and only
+    // the DURABLE write is deferred. Rapid cycles -- and the double-confirm
+    // undo, which lands back on the persisted value -- therefore collapse into
+    // at most one write of the value the user settles on. desired is what the
+    // status bar shows, persisted is what NVS holds, and a nonzero save op id
+    // means `inflight` is the value being written right now. The defaults match
+    // kOpenCodeDetailDefault so an absent key is a no-op at boot.
+    uint8_t agent_detail_desired = kOpenCodeDetailDefault;
+    uint8_t agent_detail_persisted = kOpenCodeDetailDefault;
+    uint8_t agent_detail_inflight = 0;
+    uint32_t agent_detail_save_op_id = 0;
+    int64_t agent_detail_last_change_ms = 0;
     // [persist-worker] In-flight/failed async settings saves (c4). Confirm arms
     // the chosen value here (pending_* + *_pending_valid) and, on a successful
     // submit, its dispatch operation id. The UI shows "正在保存" and only installs
-    // the value ("已保存", auto-sync also kicks RequestSyncNow) when the durable
+    // the value ("已保存" and re-arms auto-sync) when the durable
     // result comes back with a matching id. A submit reject or a write failure
     // KEEPS the armed value (*_pending_valid stays true, op id back to 0) so a
     // re-open preselects it and the user re-Confirms; only success/cancel
@@ -254,6 +415,9 @@ struct SettingsAppState {
     int pending_volume_percent = 0;
     bool volume_pending_valid = false;
     uint32_t volume_save_op_id = 0;
+    ImageRenderMode pending_image_render_mode = ImageRenderMode::kGray16;
+    bool image_render_pending_valid = false;
+    uint32_t image_render_save_op_id = 0;
     // [deck-scope] In-flight/failed default-deck switch (c5). NOTHING is
     // installed optimistically: the deck, the session reset and the [词] rows
     // all wait for the durable ACK of the worker's marker-protocol
@@ -263,6 +427,10 @@ struct SettingsAppState {
     std::string pending_word_deck_title;
     bool word_deck_pending_valid = false;
     uint32_t word_deck_save_op_id = 0;
+    // [wifi-redundancy] Render-side cache of the stored WiFi identity, filled by
+    // UpdateSettingsDiagnostics for the WiFi-manage row/dialog. Empty = not set.
+    char wifi_primary_ssid[33] = {};
+    char wifi_backup_ssid[33] = {};
     SettingsDiagnosticsSnapshot diagnostics;
 };
 
@@ -271,7 +439,6 @@ struct UiRuntimeStatus {
     bool wifi_connected = false;
     bool paired = false;
     bool syncing = false;
-    int pending_reviews = 0;
     std::string token_mask;
     std::string claim_code;
     std::string last_sync_status;
@@ -289,12 +456,27 @@ struct StatusBarEditState {
                                 // confirm within kStatusBarEditDblMs = save & exit
 };
 
+// [agent] Focus inside the Agent tier's bottom option bar (the two-choice
+// pending states: 发送/重新输入 and 同意/拒绝). 0 = first slot, 1 = second.
+// Purely UI-owned -- the OpenCode session layer never sees it -- and reset by
+// the input path whenever the pending state changes, so the focus can never
+// point at a slot that no longer exists.
+struct AgentOptionState {
+    uint8_t focused = 0;
+};
+
 // Reducer-owned gesture memory. Keeping these values inside AppState removes
 // hidden file-static history from button reduction, so replaying the same
 // timestamped input sequence starts from and produces the same state.
 struct UiGestureState {
     bool flash_ptt_started = false;
+    bool agent_ptt_started = false;
     int64_t last_ai_confirm_tap_ms = 0;
+    // [agent] Separate from last_ai_confirm_tap_ms on purpose: on the AI page a
+    // double-confirm enters status-bar edit mode, but in the Agent session
+    // picker the same gesture re-attaches to a running stream. Sharing one
+    // timestamp would let a tap in one mode satisfy the other's window.
+    int64_t last_agent_confirm_tap_ms = 0;
 };
 
 // M4: the application state has exactly one owner (UiRuntime on DeviceUiTask).
@@ -307,12 +489,11 @@ struct AppState {
     UiScreen screen = UiScreen::kHome;
     StatusBarEditState status_edit;
     UiGestureState gestures;
+    AgentOptionState agent_option;  // [agent] option-bar focus
     size_t selected_home_task = 0;
-    size_t selected_problem = 0;
-    ReviewChoice selected_review = ReviewChoice::kNeedsReview;
-    std::string last_review_message;
     UiRuntimeStatus status;
     AiSessionState ai;
+    AgentSessionState agent;
     TimeAppState time_app;
     WordAppState word_app;
     NoteAppState note_app;
@@ -321,7 +502,6 @@ struct AppState {
     TodoUiState todo;
     SettingsAppState settings;
     HomeSummary home;
-    std::vector<CachedProblem> problems;
 };
 
 using UiState = AppState;
@@ -337,8 +517,10 @@ struct UiFrame {
     bool paired = false;
     std::string claim_code;
     StatusBarEditState status_edit;  // [shell] status-bar edit mode for render
+    AgentOptionState agent_option;   // [agent] option-bar focus for render
     HomeSummary home;
     AiSessionState ai;
+    AgentSessionState agent;
     std::shared_ptr<const AiHistorySnapshot> ai_history;
     uint64_t ai_history_revision = 0;
     TodoUiState todo;
@@ -359,7 +541,5 @@ bool TickAiSession(UiState* state, int64_t now_ms);
 UiFrame RenderUiFrame(const UiState& state);
 void RequestForceFullRefresh();  // one-shot: next RenderUiFrame forces full refresh
 bool ConsumeForceFullRefresh();  // returns true if flag was set, then clears it
-const char* ReviewChoiceLabel(ReviewChoice choice);
-const char* ReviewChoiceStatus(ReviewChoice choice);
 
 }  // namespace wqn
