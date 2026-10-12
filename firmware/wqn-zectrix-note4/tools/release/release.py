@@ -465,7 +465,19 @@ def ensure_esptool() -> None:
 
 
 def cmd_package(args: argparse.Namespace) -> int:
-    info = collect_identity(args.build_dir, "release")
+    # A package must retain the identity baked into the verified image. Never
+    # assign today's source identity to binaries left by an earlier build.
+    baked, identity, _ = verified_build_identity(args)
+    manifest = V.source_manifest()
+    actual = V.fingerprint(
+        manifest, V.profile_from_build_dir(args.build_dir), identity["idf"]
+    )
+    if actual != identity["fingerprint"]:
+        raise SystemExit(
+            f"Sources or build profile changed since {baked} was built; "
+            f"re-run: python3 tools/release/release.py build --build-dir {args.build_dir} --kind release"
+        )
+    info = {**identity, "kind": "release"}
     target = write_record(info, args.build_dir)
     V.write_source_snapshot(target / "source-snapshot.tgz")
     ensure_esptool()
