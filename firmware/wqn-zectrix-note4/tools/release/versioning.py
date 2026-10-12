@@ -29,7 +29,7 @@ DEFAULT_BUILD_DIR = "build-ai-local-s3"
 # produce a different firmware with an unchanged version.
 EXTRA_BUILD_INPUTS = ("sdkconfig",)
 
-MANIFEST_EXCLUDE_SUFFIX = (".log", ".bin", ".elf", ".map", ".lock", ".tmp", ".tgz", ".zip")
+MANIFEST_EXCLUDE_SUFFIX = (".log", ".bin", ".elf", ".map", ".tmp", ".tgz", ".zip")
 MANIFEST_EXCLUDE_DIRS = {
     "dist",
     "backups",
@@ -45,6 +45,7 @@ MANIFEST_EXCLUDE_DIRS = {
 SNAPSHOT_DIRS = ("main", "components", "partitions", "cmake", "tools")
 SNAPSHOT_FILES = (
     "CMakeLists.txt",
+    "dependencies.lock",
     "sdkconfig",
     "sdkconfig.defaults",
     "sdkconfig.ai-local.defaults",
@@ -137,7 +138,11 @@ def _excluded(rel_path: str) -> bool:
     parts = rel_path.split("/")
     if any(p in MANIFEST_EXCLUDE_DIRS or p.startswith("build-") or p == "build" for p in parts):
         return True
-    return rel_path.endswith(MANIFEST_EXCLUDE_SUFFIX)
+    # ESP-IDF's tracked dependency lock selects component versions and is a
+    # build input. Other lock files are transient coordination artifacts.
+    return rel_path.endswith(MANIFEST_EXCLUDE_SUFFIX) or (
+        rel_path.endswith(".lock") and rel_path != "dependencies.lock"
+    )
 
 
 def source_manifest() -> dict[str, str]:
