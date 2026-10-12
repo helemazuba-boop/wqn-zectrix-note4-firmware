@@ -238,21 +238,39 @@ def assign_version(
     kind: str,
     date: str | None = None,
     remote_max_serial: int = 0,
+    remote_index: dict | None = None,
 ) -> tuple[str, bool]:
     """Return (version, reused). Reuses the serial when the fingerprint is known."""
     date = date or datetime.now().strftime("%Y%m%d")
     index = load_version_index()
     day = index.setdefault("days", {}).setdefault(date, {})
+    remote_day = (remote_index or {}).get("days", {}).get(date, {})
+
+    # A serial remembered locally can belong to another image on the server.
+    # Keep its historical record, but never select it again for a new build.
+    for serial, record in day.items():
+        remote = remote_day.get(serial)
+        if remote is not None and remote.get("fingerprint") != record.get("fingerprint"):
+            record["remote_conflict"] = True
 
     for serial, record in day.items():
-        if not serial.isdigit() or record.get("fingerprint") != fingerprint:
+        if (not serial.isdigit() or record.get("fingerprint") != fingerprint
+                or record.get("remote_conflict")):
             continue
         if kind == "release" and record.get("kind") != "release":
             record["kind"] = "release"
-            save_version_index(index)
+        save_version_index(index)
         return f"{date}.{serial}", True
 
-    used = [int(s) for s in day if s.isdigit()]
+    # A fresh machine can reuse the server's identity for the same content.
+    for serial, record in remote_day.items():
+        if (serial.isdigit() and record.get("fingerprint") == fingerprint
+                and serial not in day):
+            day[serial] = {**record, "kind": kind}
+            save_version_index(index)
+            return f"{date}.{serial}", True
+
+    used = [int(s) for s in (*day, *remote_day) if s.isdigit()]
     serial = str(max([*used, remote_max_serial], default=0) + 1)
     day[serial] = {
         "fingerprint": fingerprint,

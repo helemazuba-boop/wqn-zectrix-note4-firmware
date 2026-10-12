@@ -47,7 +47,10 @@ def run(cmd: list[str], env: dict[str, str] | None = None, cwd: Path | None = No
     subprocess.run(cmd, env=env, cwd=str(cwd or V.PROJECT_DIR), check=True)
 
 
-def collect_identity(build_dir: str | None, kind: str, remote_max_serial: int = 0) -> dict:
+def collect_identity(
+    build_dir: str | None, kind: str, remote_max_serial: int = 0,
+    *, remote_index: dict | None = None,
+) -> dict:
     manifest = V.source_manifest()
     profile = V.profile_from_build_dir(build_dir)
     idf = V.idf_version()
@@ -60,6 +63,7 @@ def collect_identity(build_dir: str | None, kind: str, remote_max_serial: int = 
         dirty=dirty,
         kind=kind,
         remote_max_serial=remote_max_serial,
+        remote_index=remote_index,
     )
     # A reused version keeps its original timestamp so both machines report the
     # same build time for the same content.
@@ -145,7 +149,9 @@ def run_architecture_gate() -> None:
 
 
 def cmd_build(args: argparse.Namespace) -> int:
-    info = collect_identity(args.build_dir, args.kind)
+    info = collect_identity(
+        args.build_dir, args.kind, remote_index=getattr(args, "remote_index", None)
+    )
     print(f"Building {info['version']} ({info['fingerprint'][:12]})", file=sys.stderr)
     env = build_env(info)
     # A plain `idf.py build` skips cmake when no CMakeLists changed, which would
@@ -424,10 +430,16 @@ def scp_to(host: str, local: Path, remote: str) -> None:
 
 
 def load_remote_index(host: str, base: str) -> dict:
-    raw = ssh_capture(host, f"cat {shlex.quote(remote_join(base, 'index.json'))}")
-    if not raw.strip():
-        return {"schema": 1, "project": V.PROJECT_DIR.name, "latest": None, "days": {}}
-    return json.loads(raw)
+    empty = {"schema": 1, "project": V.PROJECT_DIR.name, "latest": None, "days": {}}
+    path = shlex.quote(remote_join(base, "index.json"))
+    # Only a genuinely absent index means an empty server. An SSH/read failure
+    # must stop publishing rather than discard the existing release registry.
+    result = subprocess.run(
+        ["ssh", host, f"if [ -f {path} ]; then cat {path}; elif [ -e {path} ]; then exit 1; "
+         f"else printf '%s\\n' {shlex.quote(json.dumps(empty))}; fi"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True,
+    )
+    return json.loads(result.stdout)
 
 
 def store_remote_file(host: str, base: str, name: str, text: str) -> None:
@@ -504,18 +516,36 @@ def cmd_package(args: argparse.Namespace) -> int:
 
 
 def cmd_publish(args: argparse.Namespace) -> int:
-    info = collect_identity(args.build_dir, "release")
+    _, identity, _ = verified_build_identity(args)
+    info = identity
     target = release_dir(info["version"])
-    identity = load_json(target / "identity.json")
-    if identity is None:
-        raise SystemExit(f"No local record for {info['version']}; run `package` first")
 
     zip_path = find_zip(target)
     zip_sha = V.sha256_file(zip_path)
     remote_ver = remote_join(args.remote_base, "v", info["version"])
+    index = load_remote_index(args.ssh_host, args.remote_base)
+    date, _, serial = info["version"].rpartition(".")
+    day = index.setdefault("days", {}).setdefault(date, {})
+    existing = day.get(serial)
+    if existing is not None:
+        if existing.get("fingerprint") != info["fingerprint"]:
+            raise SystemExit(
+                f"Version {info['version']} is already published with a different fingerprint; "
+                "run `release` to rebuild with a serial allocated from the remote index"
+            )
+        if existing.get("zip_sha256") != zip_sha:
+            raise SystemExit(
+                f"Version {info['version']} is immutable and already has a different package"
+            )
+        print(f"Already published {info['version']}; files preserved", file=sys.stderr)
+        return 0
 
     print(f"Publishing {info['version']} -> {args.ssh_host}:{remote_ver}", file=sys.stderr)
-    run(["ssh", args.ssh_host, f"mkdir -p {shlex.quote(remote_ver)}"])
+    # Exclusive directory creation also protects against another publisher or
+    # an incomplete upload not yet represented in index.json. Never overwrite.
+    parent = remote_join(args.remote_base, "v")
+    run(["ssh", args.ssh_host,
+         f"mkdir -p {shlex.quote(parent)} && mkdir {shlex.quote(remote_ver)}"])
     for path in sorted(target.iterdir()):
         if path.is_file():
             scp_to(args.ssh_host, path, f"{remote_ver}/{path.name}")
@@ -526,15 +556,13 @@ def cmd_publish(args: argparse.Namespace) -> int:
     if not remote_sha or remote_sha[0] != zip_sha:
         raise SystemExit(f"Remote sha256 mismatch for {zip_path.name}")
 
+    # Preserve releases added while this package was uploading. The exclusive
+    # version directory prevents a competing upload from changing our files.
     index = load_remote_index(args.ssh_host, args.remote_base)
-    date, _, serial = info["version"].rpartition(".")
     day = index.setdefault("days", {}).setdefault(date, {})
-    existing = day.get(serial)
-    if existing and existing.get("fingerprint") != info["fingerprint"]:
-        raise SystemExit(
-            f"Version {info['version']} is already published with a different fingerprint; "
-            f"re-run to allocate a fresh serial"
-        )
+    if serial in day:
+        raise SystemExit(f"Remote index changed for {info['version']}; publication stopped")
+
     day[serial] = {
         "version": info["version"],
         "kind": "release",
@@ -546,7 +574,7 @@ def cmd_publish(args: argparse.Namespace) -> int:
         "chip": (load_json(resolve_build_dir(args.build_dir) / "flasher_args.json") or {})
         .get("extra_esptool_args", {})
         .get("chip", "esp32s3"),
-        "app": app_artifact(args.build_dir),
+        "app": identity["app"],
         "zip": f"v/{info['version']}/{zip_path.name}",
         "zip_sha256": zip_sha,
         "created_at": identity.get("created_at", V.utc_now_iso()),
@@ -590,6 +618,9 @@ def cmd_publish(args: argparse.Namespace) -> int:
 
 def cmd_release(args: argparse.Namespace) -> int:
     """One-click: build, record, package and publish the current working tree."""
+    # Allocate the version before it is baked into the image. A packaged image
+    # cannot safely be renumbered after discovering a remote serial collision.
+    args.remote_index = load_remote_index(args.ssh_host, args.remote_base)
     args.kind = "release"
     cmd_build(args)
     cmd_package(args)
