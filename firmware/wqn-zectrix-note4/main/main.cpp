@@ -170,6 +170,15 @@ extern "C" void app_main(void)
             storage_init_result,
             wqn::runtime::kStorageSchemaGeneration);
     }
+    // A corrupt/unrecoverable sync checkpoint must enter the same inert
+    // recovery mode as a failed storage schema, before UI/cloud/audio tasks
+    // can accept new work. The preparation step starts no synchronization.
+    const esp_err_t sync_boot_result = wqn::services::PrepareSyncServiceAtBoot();
+    if (sync_boot_result != ESP_OK) {
+        EnterStorageRecoveryMode(
+            sync_boot_result,
+            wqn::runtime::kStorageSchemaGeneration);
+    }
     ESP_ERROR_CHECK(wqn::services::StartAudioService());
     LogTokenState();
     LogWifiCredentialState();
@@ -213,7 +222,7 @@ extern "C" void app_main(void)
     ESP_ERROR_CHECK_WITHOUT_ABORT(wqn::RunAudioSelfTestIfEnabled());
 
 #if CONFIG_WQN_WIFI_STA_ENABLE
-    ESP_ERROR_CHECK_WITHOUT_ABORT(wqn::services::StartSyncService());
+    ESP_ERROR_CHECK(wqn::services::StartSyncService());
 #else
     ESP_LOGI(kTag, "pairing flow disabled because WiFi STA is disabled");
 #endif

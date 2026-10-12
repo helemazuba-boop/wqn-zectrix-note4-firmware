@@ -3661,6 +3661,22 @@ wqn::protocol::v3::RequestMetadata MakeDeviceRequestMetadata()
 #endif
 }
 
+esp_err_t PrepareSyncServiceAtBoot()
+{
+#if CONFIG_WQN_WIFI_STA_ENABLE
+    if (g_sync_journal_mutex == nullptr) {
+        g_sync_journal_mutex =
+            xSemaphoreCreateMutexStatic(&g_sync_journal_mutex_storage);
+        if (g_sync_journal_mutex == nullptr) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    return EnsureSyncJournalLoaded();
+#else
+    return ESP_OK;
+#endif
+}
+
 #if CONFIG_WQN_WIFI_STA_ENABLE
 
 bool EvaluateSyncWorkAtBoot()
@@ -3711,17 +3727,10 @@ bool EvaluateSyncWorkAtBoot()
 
 esp_err_t StartSyncService()
 {
+    ESP_RETURN_ON_ERROR(PrepareSyncServiceAtBoot(), kTag, "prepare sync journal");
     if (!g_boot_policy_evaluated.load(std::memory_order_acquire)) {
         (void)EvaluateSyncWorkAtBoot();
     }
-    if (g_sync_journal_mutex == nullptr) {
-        g_sync_journal_mutex =
-            xSemaphoreCreateMutexStatic(&g_sync_journal_mutex_storage);
-        if (g_sync_journal_mutex == nullptr) {
-            return ESP_ERR_NO_MEM;
-        }
-    }
-    ESP_RETURN_ON_ERROR(EnsureSyncJournalLoaded(), kTag, "load sync journal");
     if (!wqn::runtime::GetWakeContext().deep_sleep_resume &&
         BootFullSyncDue()) {
         g_full_sync_reasons.fetch_or(kFullSyncBoot, std::memory_order_release);
