@@ -1,11 +1,14 @@
 @echo off
 REM Thin .bat launcher for monitor_serial.ps1.
 REM Usage:
-REM   scripts\monitor_serial.bat                        (COM7 @ 115200, log to scripts\..\logs\)
+REM   scripts\monitor_serial.bat                        (COM7 @ 115200, log to WSL)
 REM   scripts\monitor_serial.bat COM5
 REM   scripts\monitor_serial.bat COM7 921600
-REM   scripts\monitor_serial.bat COM7 921600 D:\logs\myrun.log
-REM   scripts\monitor_serial.bat COM7 115200 D:\logs\myrun.log 240
+REM   scripts\monitor_serial.bat COM7 115200 "" 240
+REM Default WSL log directory: configured once in monitor_serial.ps1.
+REM Both WSL and D: copies use it. An explicit third argument overrides it.
+REM F2 resets once per press; Ctrl+C exits. Opening/reconnecting never resets.
+REM Offline errors are deduped with 60s summaries.
 REM The optional fourth argument bounds capture in seconds (0 = unlimited).
 REM The log path is echoed at startup and repeated on exit, so it can be copied
 REM without hunting for it. Device lines are written verbatim (no timestamp
@@ -25,4 +28,5 @@ if "%~3"=="" (
 ) else (
     powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0monitor_serial.ps1" -Port "%PORT%" -Baud %BAUD% -LogPath "%~3" -DurationSeconds "%DURATION%"
 )
-endlocal
+set "MONITOR_RC=%ERRORLEVEL%"
+endlocal & exit /b %MONITOR_RC%

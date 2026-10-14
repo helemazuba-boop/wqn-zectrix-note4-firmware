@@ -9,6 +9,7 @@ $psExe = (Get-Process -Id $PID).Path
 $testDir = Join-Path ([System.IO.Path]::GetTempPath()) ('wqn-monitor-test-' + [guid]::NewGuid())
 New-Item -ItemType Directory -Path $testDir | Out-Null
 $passed = 0
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
 function Check([bool]$condition, [string]$name) {
     if (-not $condition) { throw "FAIL: $name" }
@@ -19,13 +20,13 @@ function Check([bool]$condition, [string]$name) {
 try {
     $parseErrors = $null
     $tokens = $null
-    [void][System.Management.Automation.Language.Parser]::ParseFile($monitor, [ref]$tokens, [ref]$parseErrors)
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($monitor, [ref]$tokens, [ref]$parseErrors)
     Check ($parseErrors.Count -eq 0) 'PowerShell syntax'
 
     $missing = Join-Path $testDir 'missing-port.log'
     $timer = [System.Diagnostics.Stopwatch]::StartNew()
     $output = & $psExe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $monitor `
-        -Port 'WQN_MONITOR_TEST_MISSING' -DurationSeconds 2 -LogPath $missing 2>&1
+        -Port 'COM98765' -DurationSeconds 2 -LogPath $missing 2>&1
     $exitCode = $LASTEXITCODE
     $timer.Stop()
     Check ($exitCode -eq 0 -and $timer.Elapsed.TotalSeconds -lt 10) 'missing port stops within bounded capture'
@@ -38,7 +39,7 @@ try {
 
     $before = [Convert]::ToBase64String($raw)
     $output = & $psExe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $monitor `
-        -Port 'WQN_MONITOR_TEST_MISSING' -DurationSeconds 1 -LogPath $missing 2>&1
+        -Port 'COM98765' -DurationSeconds 1 -LogPath $missing 2>&1
     $exitCode = $LASTEXITCODE
     $after = [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($missing))
     Check ($exitCode -ne 0 -and $before -ceq $after) 'existing evidence is not overwritten'
@@ -48,10 +49,258 @@ try {
     # not a terminating PowerShell pipeline error on Windows PowerShell 5.1.
     $ErrorActionPreference = 'Continue'
     $output = & $psExe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $monitor `
-        -Port 'WQN_MONITOR_TEST_MISSING' -DurationSeconds -1 -LogPath $invalid 2>&1
+        -Port 'COM98765' -DurationSeconds -1 -LogPath $invalid 2>&1
     $exitCode = $LASTEXITCODE
     $ErrorActionPreference = 'Stop'
     Check ($exitCode -ne 0 -and -not (Test-Path $invalid)) 'invalid duration fails before opening a log or port'
+
+    # Load only the production functions, never the real-port entrypoint.
+    foreach ($fn in $ast.FindAll({ param($node)
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst]
+    }, $false)) {
+        . ([scriptblock]::Create($fn.Extent.Text))
+    }
+    $Port = 'COM7'
+    $ResetOnStart = [switch]$false
+    $DurationSeconds = 2
+    $script:pendingLine = ''
+    $script:logFailed = $false
+    $script:writer = New-Object System.IO.StringWriter
+    Check ((Get-MonitorLogDirectory) -eq '\\wsl.localhost\Ubuntu\home\unknow\projects\firmware\firmware\wqn-zectrix-note4\logs') 'default logs go to WSL regardless of launcher location'
+
+    $outage = New-OutageState
+    $missingError = New-Object System.ComponentModel.Win32Exception(2)
+    Note-SerialFailure $outage $missingError 0
+    foreach ($second in 1..59) { Note-SerialFailure $outage $missingError $second }
+    Check (([regex]::Matches($script:writer.ToString(), 'COM7 unavailable:')).Count -eq 1) 'identical offline errors are quiet between summaries'
+    Note-SerialFailure $outage $missingError 60
+    Check ($script:writer.ToString() -match 'failed attempts=61; offline=60s; repeated failures suppressed=60') '60s heartbeat preserves attempts and suppressed count'
+    $occupiedError = New-Object System.ComponentModel.Win32Exception(5)
+    Note-SerialFailure $outage $occupiedError 61
+    Check ($script:writer.ToString() -match 'reason changed') 'changed OS error is reported immediately'
+    $wrappedError = New-Object System.Exception('changing wrapper text', $occupiedError)
+    Note-SerialFailure $outage $wrappedError 62
+    Check (([regex]::Matches($script:writer.ToString(), 'reason changed')).Count -eq 1) 'exception wrapper text does not defeat deduplication'
+    foreach ($press in 1..3) { Note-OfflineReset $outage }
+    Check (([regex]::Matches($script:writer.ToString(), 'F2 ignored:')).Count -eq 1 -and $outage.IgnoredF2 -eq 3) 'offline F2 requests are counted with one prompt'
+    Note-ListenerAttached $outage 76
+    Check ($script:writer.ToString() -match 'listener attached: COM7; offline=76s; failed attempts=63; ignored F2=3' -and -not $outage.Active) 'recovery summarizes outage and clears dedup state'
+    Note-SerialFailure $outage $missingError 80
+    Note-OfflineReset $outage
+    Write-OutageSummary $outage 82 'final summary'
+    Check (([regex]::Matches($script:writer.ToString(), 'F2 ignored:')).Count -eq 2 -and $script:writer.ToString() -match 'final summary') 'new outage prompts again and exit preserves final counts'
+
+    $script:writer = New-Object System.IO.StringWriter
+    $chinese = ([char]0x4E2D).ToString() + [char]0x6587
+    Write-DeviceChunk 'I (1) same'
+    Write-DeviceChunk ([string][char]13 + [char]10 + 'I (1) same' + [char]10 + 'I (2) ' + $chinese)
+    Write-DeviceChunk ([string][char]10)
+    Check (([regex]::Matches($script:writer.ToString(), '(?m)^I \(1\) same')).Count -eq 2 -and $script:writer.ToString().Contains($chinese)) 'partial and repeated device lines survive without dedup or prefixes'
+    Write-DeviceChunk 'partial device text'
+    Say 'listener status'
+    Check ($script:writer.ToString() -match 'partial device text\r?\n\[') 'listener status cannot contaminate a partial device line'
+
+    Add-Type -TypeDefinition (Get-MonitorKeyboardSource)
+    $latch = New-Object Wqn.SerialMonitor.F2Latch
+    Check ($latch.Feed($true, 0x71)) 'first F2 keydown requests reset'
+    $repeats = 0
+    foreach ($repeat in 1..20) { if ($latch.Feed($true, 0x71)) { $repeats++ } }
+    Check ($repeats -eq 0) 'held F2 never requests repeated resets'
+    [void]$latch.Feed($false, 0x71)
+    Check ($latch.Feed($true, 0x71) -and -not $latch.Feed($true, 0x52)) 'release rearms F2 and other keys never reset'
+
+    if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+        # Exercise the real Win32 event reader in an owned, hidden console.
+        # Injected keyboard events never touch a real device.
+        $keyboardTest = Join-Path $testDir 'native-keyboard.ps1'
+        $keyboardResult = Join-Path $testDir 'native-keyboard-result.txt'
+        $keyboardScript = @'
+param([string]$MonitorPath, [string]$ResultPath)
+$ErrorActionPreference = 'Stop'
+try {
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($MonitorPath, [ref]$null, [ref]$null)
+    $fn = $ast.Find({ param($node)
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -eq 'Get-MonitorKeyboardSource'
+    }, $false)
+    . ([scriptblock]::Create($fn.Extent.Text))
+    Add-Type -TypeDefinition (Get-MonitorKeyboardSource)
+    Add-Type -TypeDefinition @"
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+public static class ConsoleTestInput {
+    [StructLayout(LayoutKind.Explicit, Size = 20)]
+    public struct Record {
+        [FieldOffset(0)] public ushort Type;
+        [FieldOffset(4)] public int Down;
+        [FieldOffset(8)] public ushort Repeat;
+        [FieldOffset(10)] public ushort Key;
+    }
+    [DllImport("kernel32.dll")] public static extern bool FreeConsole();
+    [DllImport("kernel32.dll", SetLastError = true)] public static extern bool AllocConsole();
+    [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
+    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr window, int show);
+    [DllImport("kernel32.dll")] public static extern IntPtr GetStdHandle(int id);
+    [DllImport("kernel32.dll", EntryPoint = "WriteConsoleInputW", SetLastError = true)]
+    private static extern bool WriteInput(IntPtr input, Record[] events, uint count, out uint written);
+    public static void Feed(bool down, ushort key, ushort repeats) {
+        Record record = new Record();
+        record.Type = 1; record.Down = down ? 1 : 0; record.Key = key; record.Repeat = repeats;
+        uint written;
+        if (!WriteInput(GetStdHandle(-10), new Record[] { record }, 1, out written) || written != 1)
+            throw new Win32Exception();
+    }
+}
+"@
+    [void][ConsoleTestInput]::FreeConsole()
+    if (-not [ConsoleTestInput]::AllocConsole()) { throw 'Cannot allocate test console' }
+    [void][ConsoleTestInput]::ShowWindow([ConsoleTestInput]::GetConsoleWindow(), 0)
+    $keyboard = New-Object Wqn.SerialMonitor.ConsoleKeyboard
+    [void]$keyboard.Poll()
+    [ConsoleTestInput]::Feed($true, 0x71, 20)
+    if (-not $keyboard.Poll()) { throw 'F2 down was not detected' }
+    [ConsoleTestInput]::Feed($true, 0x71, 1)
+    if ($keyboard.Poll()) { throw 'Held F2 generated a second reset' }
+    [ConsoleTestInput]::Feed($false, 0x71, 1)
+    if ($keyboard.Poll()) { throw 'F2 release generated a reset' }
+    [ConsoleTestInput]::Feed($true, 0x71, 1)
+    if (-not $keyboard.Poll()) { throw 'F2 release did not rearm' }
+    [ConsoleTestInput]::Feed($true, 0x52, 1)
+    if ($keyboard.Poll()) { throw 'Other key generated a reset' }
+    [System.IO.File]::WriteAllText($ResultPath, 'PASS')
+}
+catch {
+    [System.IO.File]::WriteAllText($ResultPath, $_.ToString())
+    exit 1
+}
+finally {
+    if ($null -ne ('ConsoleTestInput' -as [type])) { [void][ConsoleTestInput]::FreeConsole() }
+}
+'@
+        [System.IO.File]::WriteAllText($keyboardTest, $keyboardScript)
+        $arguments = @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File',
+            ('"' + $keyboardTest + '"'), '-MonitorPath', ('"' + $monitor + '"'),
+            '-ResultPath', ('"' + $keyboardResult + '"'))
+        $child = Start-Process -FilePath $psExe -ArgumentList $arguments -WindowStyle Hidden -PassThru -Wait
+        $result = [System.IO.File]::ReadAllText($keyboardResult)
+        Check ($child.ExitCode -eq 0 -and $result -eq 'PASS') "native Windows console F2 events ($result)"
+    }
+
+    Add-Type -TypeDefinition @'
+using System;
+using System.IO;
+using System.Collections.Generic;
+public sealed class MonitorTestPort {
+    public readonly List<string> Events = new List<string>();
+    public readonly Queue<string> Chunks = new Queue<string>();
+    public bool IsOpen { get; private set; }
+    public int ResetPulses { get; private set; }
+    public bool DisconnectOnRead;
+    public bool FailReset;
+    private bool dtr, rts;
+    public bool DtrEnable {
+        get { return dtr; }
+        set { dtr = value; Events.Add("DTR=" + value); }
+    }
+    public bool RtsEnable {
+        get { return rts; }
+        set {
+            rts = value; Events.Add("RTS=" + value);
+            if (IsOpen && value) {
+                ResetPulses++;
+                if (FailReset) throw new IOException("reset I/O failure");
+            }
+        }
+    }
+    public void Open() { IsOpen = true; Events.Add("OPEN"); }
+    public void Close() { IsOpen = false; Events.Add("CLOSE"); }
+    public void Dispose() { Events.Add("DISPOSE"); }
+    public string ReadExisting() {
+        if (DisconnectOnRead) {
+            DisconnectOnRead = false;
+            IsOpen = false;
+            throw new IOException("device unplugged");
+        }
+        return Chunks.Count == 0 ? "" : Chunks.Dequeue();
+    }
+}
+public sealed class FailingMonitorWriter : StringWriter {
+    public int Writes;
+    public override void WriteLine(string line) {
+        if (++Writes > 2) throw new IOException("WSL log unavailable");
+        base.WriteLine(line);
+    }
+}
+'@
+    $fake = New-Object MonitorTestPort
+    Open-MonitorPort $fake
+    Check ($fake.ResetPulses -eq 0 -and -not $fake.DtrEnable -and -not $fake.RtsEnable) 'opening releases both lines without an in-session reset pulse'
+    Send-DeviceReset $fake 'manual'
+    Check ($fake.ResetPulses -eq 1 -and -not $fake.DtrEnable -and -not $fake.RtsEnable -and $script:writer.ToString() -match 'manual reset requested: COM7') 'explicit manual reset sends one pulse and records its source'
+    $fake.FailReset = $true
+    $failedReset = $false
+    try { Send-DeviceReset $fake 'manual' } catch { $failedReset = $true }
+    Check ($failedReset -and -not $fake.RtsEnable) 'failed reset still attempts to release RTS'
+
+    $script:writer = New-Object System.IO.StringWriter
+    $script:pendingLine = ''
+    $script:ports = @((New-Object MonitorTestPort), (New-Object MonitorTestPort))
+    $script:ports[0].DisconnectOnRead = $true
+    $script:ports[1].Chunks.Enqueue('I (3) recovered' + [char]10)
+    $script:created = 0
+    $script:keyCalls = 0
+    $keys = New-Object PSObject
+    $keys | Add-Member ScriptMethod Poll {
+        $script:keyCalls++
+        # Requests both before and during initial Open are offline requests.
+        return ($script:keyCalls -le 2)
+    }
+    $script:captureTimer = [System.Diagnostics.Stopwatch]::StartNew()
+    Invoke-MonitorLoop {
+        $serial = $script:ports[$script:created]
+        $script:created++
+        return $serial
+    } $keys
+    Check ($script:created -eq 2 -and $script:ports[0].ResetPulses -eq 0 -and $script:ports[1].ResetPulses -eq 0) 'offline requests are discarded and reconnect does not reset'
+    Check ($script:writer.ToString() -match 'I \(3\) recovered' -and $script:writer.ToString() -notmatch 'reset pulse sent') 'reconnected device logs continue without a synthetic reset'
+
+    $script:writer = New-Object System.IO.StringWriter
+    $script:pendingLine = ''
+    $DurationSeconds = 1
+    $fake = New-Object MonitorTestPort
+    $script:keyCalls = 0
+    $keys = New-Object PSObject
+    $keys | Add-Member ScriptMethod Poll {
+        $script:keyCalls++
+        return ($script:keyCalls -eq 3 -or $script:keyCalls -eq 4)
+    }
+    $script:captureTimer = [System.Diagnostics.Stopwatch]::StartNew()
+    Invoke-MonitorLoop { return $fake } $keys
+    Check ($fake.ResetPulses -eq 1 -and ([regex]::Matches($script:writer.ToString(), 'source=manual')).Count -eq 1) 'connected F2 resets once and keys queued during the pulse are discarded'
+
+    $script:writer = New-Object System.IO.StringWriter
+    $script:pendingLine = ''
+    $fake = New-Object MonitorTestPort
+    $keys = New-Object PSObject
+    $keys | Add-Member ScriptMethod Poll { throw [System.IO.IOException]::new('console input lost') }
+    $script:captureTimer = [System.Diagnostics.Stopwatch]::StartNew()
+    Invoke-MonitorLoop { return $fake } $keys
+    Check (([regex]::Matches($script:writer.ToString(), 'listener attached:')).Count -eq 1 -and $script:writer.ToString() -match 'F2 disabled:' -and $script:writer.ToString() -notmatch 'unavailable:') 'keyboard input failure disables F2 without reopening the serial port'
+
+    $script:writer = New-Object FailingMonitorWriter
+    $script:pendingLine = ''
+    $script:logFailed = $false
+    $fake = New-Object MonitorTestPort
+    $fake.Chunks.Enqueue('I (4) first device line' + [char]10 + 'I (5) log write must fail' + [char]10)
+    $script:captureTimer = [System.Diagnostics.Stopwatch]::StartNew()
+    $writeFailed = $false
+    try { Invoke-MonitorLoop { return $fake } $null } catch { $writeFailed = $true }
+    Check ($writeFailed -and $script:logFailed -and $script:writer.Writes -eq 3 -and -not $fake.IsOpen) 'WSL write failure during device output stops capture and releases the port'
+
+    $badLog = Join-Path $testDir 'missing-directory\capture.log'
+    $output = & $psExe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $monitor -Port 'COM98765' -DurationSeconds 1 -LogPath $badLog 2>&1
+    Check ($LASTEXITCODE -ne 0 -and ($output -join [char]10) -notmatch 'unavailable:|listener attached:') 'log creation failure exits before attempting serial connection'
 
     Write-Host "$passed PASS / 0 FAIL; test artifacts: $testDir"
 }
