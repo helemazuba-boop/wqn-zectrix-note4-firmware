@@ -362,23 +362,10 @@ std::string FrameSignature(const wqn::UiFrame& frame)
         signature.push_back('/');
         signature.append(CurrentClockLabel());
         signature.push_back('/');
-        signature.append(frame.home.review_metric.value);
-        signature.push_back('/');
-        signature.append(frame.home.todo_metric.value);
-        signature.push_back('/');
-        signature.append(frame.home.word_metric.value);
-        signature.push_back('/');
-        signature.append(frame.home.current_status);
-        signature.push_back('/');
+        signature.append(CurrentDateLabel());
         signature.append(std::to_string(frame.selected_home_task));
-        for (const wqn::HomeTask& task : frame.home.tasks) {
-            signature.push_back('/');
-            signature.append(task.title);
-            signature.push_back(':');
-            signature.append(task.subtitle);
-            signature.push_back(':');
-            signature.append(task.tag);
-        }
+        signature.append(wqn::HomeContentSignature(frame.home.ai, frame.home.study,
+            frame.home.review_label, frame.home.todo_label, frame.home.notice));
     }
     if (frame.screen == wqn::UiScreen::kTime) {
         const wqn::TimeAppState& time_app = frame.time_app;

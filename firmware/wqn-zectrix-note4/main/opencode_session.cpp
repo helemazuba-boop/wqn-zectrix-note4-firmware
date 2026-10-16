@@ -46,6 +46,7 @@ enum class WorkerCommand : uint8_t {
     kRunPrompt,
     kObserveSession,
     kLoadHistory,
+    kHomeStatus,
 };
 
 StaticSemaphore_t g_lock_storage = {};
@@ -709,6 +710,41 @@ void FinishCommand(WorkerCommand completed)
     if (g_command == completed) {
         g_command = WorkerCommand::kNone;
     }
+    xSemaphoreGive(g_lock);
+}
+
+void LoadHomeStatus()
+{
+    std::string target;
+    xSemaphoreTake(g_lock, portMAX_DELAY);
+    target = g_state.current_session_id.empty() ? g_state.home.session.id : g_state.current_session_id;
+    xSemaphoreGive(g_lock);
+    std::string token;
+    esp_err_t result = LoadToken(&token);
+    if (result == ESP_OK) result = AcquireNetwork();
+    std::vector<wqn::OpenCodeSessionInfo> sessions;
+    wqn::OpenCodeResult api_result;
+    if (result == ESP_OK) result = wqn::ListOpenCodeSessions(token, &sessions, &api_result);
+    wqn::AgentSessionOption selected;
+    if (result == ESP_OK && !sessions.empty()) {
+        auto found = std::find_if(sessions.begin(), sessions.end(),
+            [&target](const wqn::OpenCodeSessionInfo& item) { return item.id == target; });
+        if (found != sessions.end() || target.empty()) {
+            const auto& item = found == sessions.end() ? sessions.front() : *found;
+            selected = {item.id, item.title, item.updated_at, item.outcome};
+        }
+    }
+    xSemaphoreTake(g_lock, portMAX_DELAY);
+    if (result == ESP_OK) g_state.home.session = std::move(selected);
+    g_state.home.failed = result != ESP_OK;
+    g_state.home.loaded = true;
+    g_state.home.checked_at_ms = esp_timer_get_time() / 1000;
+    // Complete ownership before publishing. A UI screen-entry retry observing
+    // this snapshot must see a free command slot, never the query's tail.
+    g_connectivity_demand.Reset();
+    RefreshAgentRunLeaseLocked();
+    g_command = WorkerCommand::kNone;
+    MarkChangedLocked();
     xSemaphoreGive(g_lock);
 }
 
@@ -2307,6 +2343,9 @@ void WorkerTask(void*)
             case WorkerCommand::kLoadSessions:
                 LoadSessions();
                 break;
+            case WorkerCommand::kHomeStatus:
+                LoadHomeStatus();
+                break;
             case WorkerCommand::kCreateSession:
                 CreateSession();
                 break;
@@ -2483,19 +2522,20 @@ esp_err_t MoveOpenCodeSessionSelection(int direction)
     return ESP_OK;
 }
 
-esp_err_t LockSelectedOpenCodeSession(OpenCodeRejectReason* reason)
+static void RememberAttachedSessionLocked(const AgentSessionOption& selected)
 {
-    ESP_RETURN_ON_ERROR(InitOpenCodeSession(), kTag, "init OpenCode session");
-    xSemaphoreTake(g_lock, portMAX_DELAY);
-    if (g_state.sessions.empty() || g_state.selected_session >= g_state.sessions.size()) {
-        xSemaphoreGive(g_lock);
-        return ESP_ERR_NOT_FOUND;
-    }
+    const auto row = std::find_if(g_state.sessions.begin(), g_state.sessions.end(),
+        [&selected](const AgentSessionOption& item) { return item.id == selected.id; });
+    if (row == g_state.sessions.end()) g_state.sessions.push_back(selected);
+    else *row = selected;
+}
+
+static esp_err_t LockSessionAndUnlock(const AgentSessionOption& selected, OpenCodeRejectReason* reason)
+{
     // Ownership first: locking arms the backfill, so a lock that cannot start
     // one must not touch any state at all. Mutating first and failing later
     // would leave the view pointing at a session whose transcript and stream
     // still belong to the previous one.
-    const AgentSessionOption& selected = g_state.sessions[g_state.selected_session];
     if (g_command != WorkerCommand::kNone) {
         // [agent] Deliberately NOT a switch, unlike RequestOpenCodeSessionList.
         // The switch could detach the stream, but the state transition a lock
@@ -2530,6 +2570,9 @@ esp_err_t LockSelectedOpenCodeSession(OpenCodeRejectReason* reason)
         xSemaphoreGive(g_lock);
         return result;
     }
+    // Home can attach a session that was never opened in the picker. Seed its
+    // already-queried outcome for the unchanged observe/run-live criterion.
+    RememberAttachedSessionLocked(selected);
     g_state.current_session_id = selected.id;
     g_state.current_session_title = selected.title;
     g_state.session_locked = true;
@@ -2581,6 +2624,53 @@ esp_err_t LockSelectedOpenCodeSession(OpenCodeRejectReason* reason)
     MarkChangedLocked();
     xSemaphoreGive(g_lock);
     return ESP_OK;
+}
+
+esp_err_t LockSelectedOpenCodeSession(OpenCodeRejectReason* reason)
+{
+    ESP_RETURN_ON_ERROR(InitOpenCodeSession(), kTag, "init OpenCode session");
+    xSemaphoreTake(g_lock, portMAX_DELAY);
+    if (g_state.selected_session >= g_state.sessions.size()) {
+        xSemaphoreGive(g_lock);
+        return ESP_ERR_NOT_FOUND;
+    }
+    const AgentSessionOption selected = g_state.sessions[g_state.selected_session];
+    return LockSessionAndUnlock(selected, reason);
+}
+
+esp_err_t OpenCodeHomeSession(const std::string& session_id, const std::string& title,
+                              OpenCodeRejectReason* reason)
+{
+    ESP_RETURN_ON_ERROR(InitOpenCodeSession(), kTag, "init OpenCode session");
+    xSemaphoreTake(g_lock, portMAX_DELAY);
+    AgentSessionOption selected;
+    selected.id = session_id;
+    selected.title = title;
+    if (session_id == g_state.home.session.id) selected.outcome = g_state.home.session.outcome;
+    if (selected.id.empty()) {
+        xSemaphoreGive(g_lock);
+        return ESP_ERR_NOT_FOUND;
+    }
+    return LockSessionAndUnlock(selected, reason);
+}
+
+esp_err_t RequestOpenCodeHomeStatus()
+{
+    ESP_RETURN_ON_ERROR(InitOpenCodeSession(), kTag, "init OpenCode session");
+    xSemaphoreTake(g_lock, portMAX_DELAY);
+    // Unlike a picker-open command, a background Home query cannot detach or
+    // replace work. Acquire ownership only after checking that the slot is free.
+    if (g_command != WorkerCommand::kNone || g_state.stream_active) {
+        xSemaphoreGive(g_lock);
+        return ESP_ERR_INVALID_STATE;
+    }
+    esp_err_t result = AcquireAgentLeaseLocked();
+    if (result == ESP_OK && !ArmWorkerLocked(WorkerCommand::kHomeStatus)) {
+        ReleaseWorkOwnershipLocked();
+        result = ESP_ERR_INVALID_STATE;
+    }
+    xSemaphoreGive(g_lock);
+    return result;
 }
 
 esp_err_t CreateNewOpenCodeSession(OpenCodeRejectReason* reason)
@@ -3190,6 +3280,8 @@ void SetOpenCodeDetailLevel(uint8_t level)
 namespace wqn {
 
 esp_err_t InitOpenCodeSession() { return ESP_ERR_NOT_SUPPORTED; }
+esp_err_t RequestOpenCodeHomeStatus() { return ESP_ERR_NOT_SUPPORTED; }
+esp_err_t OpenCodeHomeSession(const std::string&, const std::string&, OpenCodeRejectReason*) { return ESP_ERR_NOT_SUPPORTED; }
 esp_err_t RequestOpenCodeSessionList(OpenCodeRejectReason*) { return ESP_ERR_NOT_SUPPORTED; }
 esp_err_t MoveOpenCodeSessionSelection(int) { return ESP_ERR_NOT_SUPPORTED; }
 esp_err_t LockSelectedOpenCodeSession(OpenCodeRejectReason*) { return ESP_ERR_NOT_SUPPORTED; }

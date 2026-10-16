@@ -35,6 +35,13 @@ struct AgentSessionOption {
 constexpr uint8_t kOpenCodeDetailDefault = 2;
 
 struct AgentSessionState {
+    // A bounded Home query does not change the picker, transcript or attachment.
+    struct HomeStatus {
+        AgentSessionOption session;
+        int64_t checked_at_ms = 0;
+        bool loaded = false;
+        bool failed = false;
+    } home;
     AiFeatureUiState ui;
     std::vector<AgentSessionOption> sessions;
     size_t selected_session = 0;

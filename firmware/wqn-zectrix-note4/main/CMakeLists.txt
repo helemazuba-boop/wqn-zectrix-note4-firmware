@@ -38,6 +38,7 @@ idf_component_register(
         "ui/diagnostics.cpp"
         "ui/graphics.cpp"
         "ui/navigation_model.cpp"
+        "ui/home_model.cpp"
         "ui/navigation_view.cpp"
         "ui/ui_gates_selftest.cpp"
         "ui/markdown_layout.cpp"

@@ -294,11 +294,7 @@ void ClampUiSelection(UiState* state)
     if (state == nullptr) {
         return;
     }
-    if (state->home.tasks.empty()) {
-        state->selected_home_task = 0;
-    } else if (state->selected_home_task >= state->home.tasks.size()) {
-        state->selected_home_task = state->home.tasks.size() - 1;
-    }
+    state->selected_home_task = std::min<size_t>(state->selected_home_task, 1);
     if (state->todo.todos.empty()) {
         state->todo.selected = 0;
     } else if (state->todo.selected >= state->todo.todos.size()) {
@@ -524,7 +520,7 @@ void HandleUiInput(UiState* state, UiInput input)
                 if (state->ai.page + 1 < AiSessionPageCount(state->ai)) {
                     ++state->ai.page;
                 }
-            } else if (state->screen == UiScreen::kHome && state->selected_home_task + 1 < state->home.tasks.size()) {
+            } else if (state->screen == UiScreen::kHome && state->selected_home_task < 1) {
                 ++state->selected_home_task;
             } else if (state->screen == UiScreen::kTodo && state->todo.selected + 1 < state->todo.todos.size()) {
                 ++state->todo.selected;
@@ -610,9 +606,9 @@ void HandleUiInput(UiState* state, UiInput input)
                 }
                 break;
             } else if (state->screen == UiScreen::kHome) {
-                state->screen = state->selected_home_task == 1
-                    ? UiScreen::kWord
-                    : UiScreen::kNote;
+                NavigateUiToScreen(state, state->selected_home_task == 0
+                    ? state->home.ai.target : state->home.study.target);
+                return;
             } else if (state->screen == UiScreen::kSettings) {
                 // Settings actions are handled in device_ui.cpp because they need storage and diagnostics.
             }
@@ -784,7 +780,7 @@ UiFrame RenderUiFrame(const UiState& state)
     // Consumption is deferred to ConsumeForceFullRefresh() called by the
     // render path in device_ui.cpp after it has the final frame.
     frame.prefer_full_refresh =
-        (state.screen == UiScreen::kHome && !state.navigation.visible) || g_force_full_refresh_next;
+        g_force_full_refresh_next;
     if (state.screen != UiScreen::kHome) {
         AddLine(&frame, UiTextStyle::kMeta, ScreenName(state.screen));
     }

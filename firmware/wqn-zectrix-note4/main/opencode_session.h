@@ -26,6 +26,10 @@ enum class OpenCodeRejectReason : uint8_t {
 };
 
 esp_err_t InitOpenCodeSession();
+// Bounded query on the existing worker; refuses busy work, never detaches it.
+esp_err_t RequestOpenCodeHomeStatus();
+esp_err_t OpenCodeHomeSession(const std::string& session_id, const std::string& title,
+                              OpenCodeRejectReason* reason = nullptr);
 // `reason` (optional) is written only when the call fails, so a caller that does
 // not care can pass nullptr. When a stream is attached, the list request is not
 // refused at all: it detaches from that stream -- leaving the run going in the

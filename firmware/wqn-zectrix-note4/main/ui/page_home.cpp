@@ -1,97 +1,70 @@
-// Home page rendering: metric cards, task list, primary time region.
-// Extracted from device_ui.cpp.
-
+// Home reference A: clock, Agent task, then a concrete study continuation.
 #include "ui_internal.h"
-#include "ui_widgets.h"
+#include "display_service.h"
 
 #include <algorithm>
 
-#include "display_service.h"
-#include "esp_log.h"
-
 namespace device_ui_internal {
+namespace {
 
-constexpr char kTag[] = "wqn_ui";
-
-// [v2] Home content horizontal bounds aligned to the AI page's flush 6px edges
-// (kMarginDense): x=6, width 388 (6..394). Vertical layout is unchanged.
-constexpr int kHomeContentX = kMarginDense;                       // 6
-constexpr int kHomeContentW = wqn::kEpdWidth - 2 * kMarginDense;  // 388
-
-esp_err_t DrawMetricCard(int x, int y, int width, const wqn::HomeMetric& metric)
+void HomeText(int x, int y, int width, const std::string& text, int size = 16,
+              bool bold = false, bool black = true)
 {
-    constexpr int kCardHeight = 55;
-    // Metric card uses the rounded container language (same r6 as todo/word cards).
-    DrawRoundedRect(x, y, width, kCardHeight, kRoundedOuterRadius);
-    ESP_RETURN_ON_ERROR(DrawCenteredText(x, y + 8, width, metric.value), kTag, "draw home metric value");
-    ESP_RETURN_ON_ERROR(DrawCenteredText(x, y + 31, width, metric.label), kTag, "draw home metric label");
-    return ESP_OK;
+    // Clip in the same font used for rendering; the body fallback's 5x7 Latin
+    // metrics are deliberately not used for these mixed-language headings.
+    std::string clipped = text;
+    const auto fits = [width, size, bold](const std::string& value) {
+        return wqn::MeasureTextWithFont(wqn::PrimaryUiFont(), value.c_str()) * size / 16 +
+            (bold ? 1 : 0) <= width;
+    };
+    if (!fits(clipped)) {
+        while (!clipped.empty() && !fits(clipped + "...")) {
+            size_t end = clipped.size() - 1;
+            while (end != 0 && (static_cast<unsigned char>(clipped[end]) & 0xc0) == 0x80) --end;
+            clipped.resize(end);
+        }
+        clipped += "...";
+    }
+    wqn::DrawTextWithFontSized(x, y, width, wqn::PrimaryUiFont(), clipped.c_str(), size, bold, black);
 }
 
-esp_err_t DrawHomeTaskRow(int x, int y, int width, int index, const wqn::HomeTask& task, bool selected)
+void DrawHomeClock(const wqn::HomeSummary& home)
 {
-    constexpr int kRowHeight = 47;
-    // Index gutter: the task number is also the selection marker (same language
-    // as settings rows). Selected -> number sits on a reverse-filled rounded
-    // block; unselected -> plain number, no block.
-    constexpr int kIndexBlockW = 18;
-    constexpr int kIndexBlockH = 24;
-    constexpr int kIndexBlockYOff = (kRowHeight - kIndexBlockH) / 2;  // 11, vertically centered
-    if (selected) {
-        // [v2] Task row is a card-style persistent-browse row: rounded double
-        // border (the square kInnerBorder is retired). The index block stays a
-        // reverse-fill chip (now rounded via kInvert).
-        DrawSelectionDecoration(x, y, width, kRowHeight, SelectionStyle::kRoundedInnerBorder);
-        // Index block: reverse-fill rounded chip behind the task number.
-        DrawSelectionDecoration(x, y + kIndexBlockYOff, kIndexBlockW, kIndexBlockH, SelectionStyle::kInvert);
-        // Index number in paper (white) on the block, centered in it.
-        ESP_RETURN_ON_ERROR(
-            DrawCenteredText(x, y + kIndexBlockYOff + 4, kIndexBlockW, std::to_string(index), false),
-            kTag,
-            "draw home task index");
-    } else {
-        // Unselected: plain ink number in its original position (left-aligned).
-        ESP_RETURN_ON_ERROR(
-            wqn::DrawUtf8Text(x, y + 4, std::to_string(index).c_str(), true),
-            kTag,
-            "draw home task index");
-    }
-    ESP_RETURN_ON_ERROR(DrawClippedText(x + 20, y + 3, width - 58, task.title, true), kTag, "draw home task title");
-    ESP_RETURN_ON_ERROR(
-        DrawClippedText(x + 20, y + 24, width - 58, task.subtitle, true),
-        kTag,
-        "draw home task subtitle");
-    if (!task.tag.empty()) {
-        const int tag_width = std::min(48, std::max(32, wqn::MeasureUtf8TextWidth(task.tag.c_str()) + 8));
-        DrawChip(x + width - tag_width, y + 4, tag_width, 18, task.tag);
-    }
-    return ESP_OK;
+    const std::string clock = CurrentClockLabel();
+    if (clock.find('-') == std::string::npos) DrawDigit48Run(kHomeLeft, kHomeClockY, clock);
+    else HomeText(kHomeLeft, kHomeClockY, 230, clock, 48);
+    const std::string date = CurrentDateLabel();
+    const size_t split = date.find(' ');
+    HomeText(kHomeDateX, 58, 104, date.substr(0, split), 14);
+    if (split != std::string::npos) HomeText(kHomeDateX, 78, 104, date.substr(split + 1), 14);
+    if (home.timer_status_only) HomeText(kHomeDateX, 96, 104, home.primary_time_line, 12);
 }
+
+void DrawHomeHeader(const wqn::HomeSummary& home)
+{
+    wqn::DrawUtf8Text(kHomeLeft, 6, "WQN / NOTE 04", true);
+    DrawStatusBarIcons(384, 7, home);
+    DrawHorizontalLine(kHomeLeft, 31, kHomeWidth);
+}
+
+}  // namespace
 
 esp_err_t RenderHomePrimaryRegion(const wqn::HomeSummary& home, RefreshSchedule schedule)
 {
     ClearRect(kHomePrimaryRect);
-    if (!home.timer_status_only) {
-        DrawRoundedRect(kHomeContentX, 35, kHomeContentW, 26, kRoundedOuterRadius);
-    }
-    ESP_RETURN_ON_ERROR(DrawCenteredText(kHomeContentX, 39, kHomeContentW, home.primary_time_line), kTag, "draw home primary time region");
+    DrawHomeClock(home);
+    DrawHorizontalLine(kHomeLeft, kHomeAiDividerY, kHomeWidth);
     return RefreshRegion(kHomePrimaryRect, schedule);
 }
 
 esp_err_t RenderHomeStatusBarRegion(const wqn::HomeSummary& home, RefreshSchedule schedule)
 {
-    // On a deep-sleep timer wake the retained timer may have crossed into its
-    // terminal state while the panel still shows “进行中”. Redraw both the
-    // minute clock and the plain timer sentence; ordinary minute ticks only
-    // dirty the status-bar pixels because the sentence is unchanged.
-    constexpr UiRect kHomeClockAndTimerRect = {0, 0, wqn::kEpdWidth, 64, "home-clock-and-timer"};
-    ClearRect(kHomeClockAndTimerRect);
-    DrawStatusBar("首页", home);
-    ESP_RETURN_ON_ERROR(
-        DrawCenteredText(kHomeContentX, 39, kHomeContentW, home.primary_time_line),
-        kTag,
-        "draw home timer status on clock tick");
-    return RefreshRegion(kHomeClockAndTimerRect, schedule);
+    constexpr UiRect region = {0, 0, wqn::kEpdWidth, 114, "home-header-clock"};
+    ClearRect(region);
+    DrawHomeHeader(home);
+    DrawHomeClock(home);
+    DrawHorizontalLine(kHomeLeft, kHomeAiDividerY, kHomeWidth);
+    return RefreshRegion(region, schedule);
 }
 
 UiRect ConfigRefreshRect(const wqn::TimeAppState& time_app)
@@ -101,48 +74,38 @@ UiRect ConfigRefreshRect(const wqn::TimeAppState& time_app)
 
 esp_err_t RenderHomeToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
 {
-    ESP_LOGI(kTag, "RenderHomeToEpd: enter schedule=%s", RefreshScheduleName(schedule));
-    const wqn::HomeSummary& home = frame.home;
+    const auto& home = frame.home;
     wqn::ClearEpdFramebuffer(true);
+    DrawHomeHeader(home);
+    DrawHomeClock(home);
+    DrawHorizontalLine(kHomeLeft, kHomeAiDividerY, kHomeWidth);
+    if (frame.selected_home_task == 0) FillRect(7, 124, 3, 90, true);
+    else FillRect(7, 232, 3, 42, true);
 
-    DrawStatusBar("首页", home);
-
-    if (!home.timer_status_only) {
-        DrawRoundedRect(kHomeContentX, 35, kHomeContentW, 26, kRoundedOuterRadius);
+    wqn::DrawUtf8Text(kHomeLeft, kHomeAiCaptionY,
+                     home.ai.session_id.empty() ? "01 / AI" : "01 / AI AGENT", true);
+    const int badge_width = std::min(120, wqn::MeasureTextWithFont(
+        wqn::PrimaryUiFont(), home.ai.badge.c_str()) + 12);
+    FillRect(384 - badge_width, 120, badge_width, 24, true);
+    HomeText(390 - badge_width, 124, badge_width - 12, home.ai.badge, 16, false, false);
+    HomeText(kHomeLeft, kHomeAiTitleY, kHomeWidth, home.ai.title, 24, true);
+    HomeText(kHomeLeft, kHomeAiActionY, kHomeWidth - 28, home.ai.action, 14);
+    for (int i = 0; i < 5; ++i) {
+        wqn::DrawEpdPixel(373 + i, 195 + i, true);
+        wqn::DrawEpdPixel(373 + i, 203 - i, true);
     }
-    ESP_RETURN_ON_ERROR(DrawCenteredText(kHomeContentX, 39, kHomeContentW, home.primary_time_line), kTag, "draw home primary time");
-
-    // Three metric cards distributed across the 388px content width with a
-    // kGutterCard gap: width 121 each, x = 6 / 139 / 272.
-    constexpr int kCardY = 69;
-    constexpr int kCardWidth = 121;
-    constexpr int kCardStep = kCardWidth + kGutterCard;  // 133
-    ESP_RETURN_ON_ERROR(DrawMetricCard(kHomeContentX, kCardY, kCardWidth, home.review_metric), kTag, "draw review metric");
-    ESP_RETURN_ON_ERROR(DrawMetricCard(kHomeContentX + kCardStep, kCardY, kCardWidth, home.todo_metric), kTag, "draw todo metric");
-    ESP_RETURN_ON_ERROR(DrawMetricCard(kHomeContentX + 2 * kCardStep, kCardY, kCardWidth, home.word_metric), kTag, "draw word metric");
-
-    ESP_RETURN_ON_ERROR(wqn::DrawUtf8Text(kHomeContentX, 138, "当前进行", true), kTag, "draw home section title");
-    const std::string subtitle = wqn::TruncateUtf8TextToWidth(home.current_status, 210);
-    const int subtitle_width = wqn::MeasureUtf8TextWidth(subtitle.c_str());
-    ESP_RETURN_ON_ERROR(
-        wqn::DrawUtf8Text(std::max(kHomeContentX, wqn::kEpdWidth - subtitle_width - kHomeContentX), 138, subtitle.c_str(), true),
-        kTag,
-        "draw home section status");
-
-    DrawHorizontalLine(kHomeContentX, 161, kHomeContentW);
-    int y = 168;
-    const size_t visible_tasks = std::min<size_t>(home.tasks.size(), 2);
-    if (visible_tasks == 0) {
-        ESP_RETURN_ON_ERROR(wqn::DrawUtf8Text(kHomeContentX, y, "暂无当前任务", true), kTag, "draw home empty");
+    DrawHorizontalLine(kHomeLeft, kHomeStudyDividerY, kHomeWidth);
+    HomeText(kHomeLeft, kHomeStudyCaptionY, 300,
+             home.study.resumable ? "02 / 继续学习" : "02 / 学习内容", 12);
+    HomeText(kHomeLeft, kHomeStudyTitleY, kHomeWidth - 86, home.study.title, 20);
+    HomeText(310, 252, 74, home.study.progress, 12);
+    if (home.study.progress_percent >= 0) {
+        FillRect(kHomeLeft, 274, kHomeWidth * std::clamp(home.study.progress_percent, 0, 100) / 100, 2, true);
     }
-    for (size_t i = 0; i < visible_tasks; ++i) {
-        ESP_RETURN_ON_ERROR(
-            DrawHomeTaskRow(kHomeContentX + 4, y, kHomeContentW - 8, static_cast<int>(i + 1), home.tasks[i], i == frame.selected_home_task),
-            kTag,
-            "draw home task");
-        y += 53;
-    }
-
+    HomeText(kHomeLeft, kHomeFooterY, 230,
+             home.notice.empty() ? home.review_label : home.notice, 12);
+    const int todo_width = wqn::MeasureTextWithFont(wqn::PrimaryUiFont(), home.todo_label.c_str()) * 12 / 16;
+    HomeText(384 - todo_width, kHomeFooterY, todo_width + 1, home.todo_label, 12);
     return RefreshFrame(frame, schedule);
 }
 

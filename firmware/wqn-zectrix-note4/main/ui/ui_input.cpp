@@ -1192,6 +1192,7 @@ static RefreshSchedule ApplyStatusBarEditEvent(
 static RefreshSchedule FinishScreenNavigation(wqn::UiState* state, wqn::UiScreen old_screen)
 {
     if (state->screen != old_screen) {
+        if (state->screen == wqn::UiScreen::kHome) state->selected_home_task = 0;
         if (old_screen == wqn::UiScreen::kTime) {
             wqn::DisarmTimeAppAction(&state->time_app);
         }
@@ -1737,6 +1738,41 @@ RefreshSchedule ApplyButtonEvent(
         event.button == wqn::ButtonId::kConfirm) {
         return RefreshSchedule::kNone;
     }
+
+    // [home-actions] Bind shortcuts to the card that was projected, never to
+    // a worker's newer selection. The navigation guard also owns their tails.
+    if (state->screen == wqn::UiScreen::kHome) {
+        const bool click = event.type == wqn::ButtonEventType::kShortPress ||
+                           event.type == wqn::ButtonEventType::kDoublePress;
+        if (click && (event.button == wqn::ButtonId::kUp || event.button == wqn::ButtonId::kDownPower)) {
+            state->selected_home_task = (state->selected_home_task + 1) % 2;
+            return RefreshSchedule::kSelection;
+        }
+        if (event.type == wqn::ButtonEventType::kShortPress && event.button == wqn::ButtonId::kConfirm) {
+            const auto card = state->home.ai;
+            const auto target = state->selected_home_task == 0 ? card.target : state->home.study.target;
+            if (state->selected_home_task == 0 && target == wqn::UiScreen::kAi && !card.session_id.empty()) {
+                const esp_err_t result = wqn::OpenCodeHomeSession(card.session_id, card.session_title);
+                if (result != ESP_OK) {
+                    state->home.notice = "任务繁忙，请稍后重试";
+                    return RefreshSchedule::kSelection;
+                }
+                state->ai.tier = wqn::AiTier::kAgent;
+                SyncAgentSnapshot(state);
+            }
+            if (!wqn::NavigateUiToScreen(state, target)) return RefreshSchedule::kSelection;
+            if (state->selected_home_task == 0 && card.status == wqn::HomeAiStatus::kComplete) {
+                state->home_viewed_session_id = card.session_id;
+                state->home_viewed_result_version = card.result_version;
+            }
+            state->navigation.blocked_mask |= state->navigation.held_mask |
+                (1U << static_cast<unsigned>(wqn::ButtonId::kConfirm));
+            state->navigation.guard_confirm_double = true;
+            state->navigation.confirmed_at_ms = event_time_ms;
+            return FinishScreenNavigation(state, wqn::UiScreen::kHome);
+        }
+    }
+    // [home-actions-end]
 
     const wqn::UiScreen old_screen = state->screen;
     const size_t old_home_task = state->selected_home_task;

@@ -9,6 +9,7 @@
 
 #include "sdkconfig.h"
 #include "ui/navigation_model.h"
+#include "ui/home_model.h"
 
 #include "ai_history.h"
 #include "note_app.h"
@@ -165,17 +166,6 @@ struct TodoUiState {
     bool has_later = false;
 };
 
-struct HomeMetric {
-    std::string value;
-    std::string label;
-};
-
-struct HomeTask {
-    std::string title;
-    std::string subtitle;
-    std::string tag;
-};
-
 struct HomeSummary {
     std::string wifi_label = "WiFi";
     std::string battery_label = "--%";
@@ -187,11 +177,11 @@ struct HomeSummary {
     bool full = false;
     bool wifi_connected = false;
     int wifi_rssi = 0;  // dBm (e.g. -65); 0 if not connected.
-    HomeMetric review_metric = {"0", "今日复习"};
-    HomeMetric todo_metric = {"--", "今日 Todo"};
-    HomeMetric word_metric = {"--%", "单词进度"};
-    std::string current_status = "当前进行";
-    std::vector<HomeTask> tasks;
+    HomeAiCard ai;
+    HomeStudyCard study;
+    std::string review_label;
+    std::string todo_label;
+    std::string notice;
 };
 
 // Settings-page row count, the single source of truth for every layer that
@@ -472,6 +462,8 @@ struct AppState {
     UiGestureState gestures;
     AgentOptionState agent_option;  // [agent] option-bar focus
     size_t selected_home_task = 0;
+    std::string home_viewed_session_id;
+    int64_t home_viewed_result_version = 0;
     UiRuntimeStatus status;
     AiSessionState ai;
     AgentSessionState agent;

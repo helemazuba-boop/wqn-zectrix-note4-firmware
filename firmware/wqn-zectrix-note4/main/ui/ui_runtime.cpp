@@ -3,6 +3,7 @@
 #include <utility>
 
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "opencode_session.h"  // [follow] Agent viewport setters
 #include "persist_worker.h"    // [detail] SubmitAgentDetailLevelSave
 #include "ui_internal.h"
@@ -131,6 +132,7 @@ void UiRuntime::Initialize(wqn::AppState&& initial_state)
 {
     state_ = std::move(initial_state);
     state_.navigation = {};
+    home_activity_at_ms_ = esp_timer_get_time() / 1000;
     // Bootstrap always owns revision 1, including a degraded load. The UI can
     // therefore submit its recovery frame without using reserved revision 0.
     FinishEvent(AppEventKind::kBootstrap, RefreshSchedule::kImmediate, true);
@@ -140,6 +142,12 @@ UiUpdate UiRuntime::DispatchButton(
     const wqn::ButtonEvent& event,
     int64_t event_time_ms)
 {
+    if (event.HasEvent() && !event.repeat && event_time_ms >= home_activity_at_ms_) {
+        if (event_time_ms - home_activity_at_ms_ >= wqn::kHomeAgentActiveMs ||
+            event_time_ms - state_.agent.home.checked_at_ms >= wqn::kHomeAgentFreshMs)
+            home_poll_next_ms_ = 0;
+        home_activity_at_ms_ = event_time_ms;
+    }
     if (wqn::HasBufferedWordObservations(state_.word_app) &&
         event.type == wqn::ButtonEventType::kLongPress &&
         event.button == wqn::ButtonId::kConfirm && !state_.navigation.visible &&
@@ -836,6 +844,31 @@ UiUpdate UiRuntime::DispatchAgentDetailPersist(int64_t now_ms)
                        RefreshSchedule::kNone, true);
 }
 
+UiUpdate UiRuntime::DispatchHomeStatusPoll(int64_t now_ms)
+{
+    if (state_.screen != wqn::UiScreen::kHome) {
+        home_poll_next_ms_ = 0;
+        return FinishEvent(AppEventKind::kAgentListPoll, RefreshSchedule::kNone, false);
+    }
+    const std::string before = wqn::HomeContentSignature(state_.home.ai, state_.home.study,
+        state_.home.review_label, state_.home.todo_label, state_.home.notice);
+    UpdateHomeAiSummary(&state_, now_ms);
+#if CONFIG_WQN_AGENT_ENABLE
+    if (wqn::ShouldPollHomeAgent(now_ms, home_activity_at_ms_, home_poll_next_ms_,
+        true, state_.navigation.visible, state_.status.paired, state_.status.wifi_connected,
+        state_.home.ai.status == wqn::HomeAiStatus::kRunning)) {
+        const esp_err_t result = wqn::RequestOpenCodeHomeStatus();
+        // A busy slot retries within the active window; no input/activity is
+        // produced by this timer, and no dedicated wake source is installed.
+        if (result == ESP_OK) home_poll_next_ms_ = now_ms + wqn::kHomeAgentPollMs;
+    }
+#endif
+    const bool changed = before != wqn::HomeContentSignature(state_.home.ai, state_.home.study,
+        state_.home.review_label, state_.home.todo_label, state_.home.notice);
+    return FinishEvent(AppEventKind::kAgentListPoll,
+        changed ? RefreshSchedule::kSelection : RefreshSchedule::kNone, changed);
+}
+
 UiUpdate UiRuntime::DispatchAgentSessionListPoll(int64_t now_ms)
 {
     // [picker-stale] The picker's 运行中 marker is drawn from each row's
@@ -1195,7 +1228,21 @@ UiUpdate UiRuntime::DispatchFlashSnapshot(const wqn::FlashUiState& flash)
 UiUpdate UiRuntime::DispatchAgentSnapshot(const wqn::AgentSessionState& snapshot)
 {
     const wqn::AiFeaturePhase previous_phase = state_.agent.ui.phase;
+    const bool home_query_finished = snapshot.home.checked_at_ms != state_.agent.home.checked_at_ms;
     state_.agent = snapshot;
+    const auto previous_home = state_.home.ai;
+    UpdateHomeAiSummary(&state_, esp_timer_get_time() / 1000);
+    if (home_query_finished && state_.screen == wqn::UiScreen::kAi &&
+        state_.ai.tier == wqn::AiTier::kAgent && !snapshot.stream_active &&
+        (snapshot.ui.phase == wqn::AiFeaturePhase::kIdle ||
+         snapshot.ui.phase == wqn::AiFeaturePhase::kComplete ||
+         snapshot.ui.phase == wqn::AiFeaturePhase::kRunning ||
+         snapshot.ui.phase == wqn::AiFeaturePhase::kError)) {
+        // A menu jump may have reached AI while the bounded Home query owned
+        // the single worker. Re-arm entry after that query publishes its tail.
+        if (snapshot.current_session_id.empty()) wqn::RequestOpenCodeSessionList();
+        else wqn::ObserveOpenCodeSession();
+    }
     // Keep the logical state current while the codec is being initialized,
     // but avoid overlapping that hardware transaction with an EPD refresh.
     const bool defer_refresh_for_audio_init =
@@ -1212,6 +1259,9 @@ UiUpdate UiRuntime::DispatchAgentSnapshot(const wqn::AgentSessionState& snapshot
             ? RefreshSchedule::kCommit
             : RefreshSchedule::kAi;
     }
+    if (state_.screen == wqn::UiScreen::kHome &&
+        (previous_home.title != state_.home.ai.title || previous_home.badge != state_.home.ai.badge ||
+         previous_home.action != state_.home.ai.action)) refresh = RefreshSchedule::kSelection;
     return FinishEvent(
         AppEventKind::kAgentSnapshot,
         refresh,
@@ -1250,10 +1300,16 @@ UiUpdate UiRuntime::DispatchStatusReload(wqn::AppState&& snapshot)
     // supplies a stale/default screen value.
     snapshot.screen = state_.screen;
     snapshot.navigation = state_.navigation;
+    snapshot.home_viewed_session_id = state_.home_viewed_session_id;
+    snapshot.home_viewed_result_version = state_.home_viewed_result_version;
+    snapshot.selected_home_task = state_.selected_home_task;
+    if (snapshot.agent.home.checked_at_ms < state_.agent.home.checked_at_ms)
+        snapshot.agent.home = state_.agent.home;
     const std::string before = FrameSignature(wqn::RenderUiFrame(state_));
     const uint64_t revision = state_.revision;
     state_ = std::move(snapshot);
     state_.revision = revision;
+    UpdateHomeAiSummary(&state_, esp_timer_get_time() / 1000);
     const std::string after = FrameSignature(wqn::RenderUiFrame(state_));
     const bool changed = before != after;
     return FinishEvent(

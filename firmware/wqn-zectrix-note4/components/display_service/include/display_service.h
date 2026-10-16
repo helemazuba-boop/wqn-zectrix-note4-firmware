@@ -43,6 +43,9 @@ int MeasureUtf8TextWidth(const char* text);
 // real Latin glyphs instead of the compact 5x7 body-text fallback.
 const lv_font_t* PrimaryUiFont();
 void DrawTextWithFont(int x, int y, const lv_font_t* font, const char* text, bool black = true);
+// CPU-only nearest-neighbour sizing of existing 1bpp glyphs; no new font blob.
+void DrawTextWithFontSized(int x, int y, int width, const lv_font_t* font,
+                          const char* text, int size_px, bool bold = false, bool black = true);
 int MeasureTextWithFont(const lv_font_t* font, const char* text);
 void DrawTextWithFontCentered(int x, int y, int width, const lv_font_t* font, const char* text, bool black = true);
 // Nearest-neighbour bitmap scaling is intended for short, static hero labels

@@ -114,11 +114,18 @@ int PomodoroStartField()
 
 std::string ChooseHomePrimaryTimeLine(const wqn::TimeAppState& time_app)
 {
-    const std::string active_timer = wqn::TimeAppPrimaryLine(time_app);
-    if (!active_timer.empty()) {
-        return active_timer;
+    if (!wqn::TimeAppHasActiveTimer(time_app)) return "";
+    if (time_app.status == wqn::TimerStatus::kPaused) return "已暂停";
+    if (time_app.status == wqn::TimerStatus::kAlerting) return "计时结束";
+    if (time_app.phase_ends_unix_seconds >= kMinReasonableUnixTime) {
+        const std::time_t end = time_app.phase_ends_unix_seconds;
+        std::tm info = {};
+        localtime_r(&end, &info);
+        char label[24] = {};
+        std::strftime(label, sizeof(label), "%H:%M 结束", &info);
+        return label;
     }
-    return CurrentClockLabel();
+    return "计时进行中";
 }
 
 void UpdateHomePrimaryTimeLine(wqn::UiState* state)

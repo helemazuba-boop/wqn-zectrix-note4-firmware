@@ -1255,6 +1255,11 @@ wqn::AiStreamingStatusView streaming_view{};
             refresh_schedule = StrongerSchedule(refresh_schedule, update.refresh);
         }
 
+        {
+            const auto update = ui_runtime.DispatchHomeStatusPoll(now_ms);
+            refresh_schedule = StrongerSchedule(refresh_schedule, update.refresh);
+        }
+
         // [follow] Auto-follow step. Runs on EVERY tick (not only when a
         // refresh is already pending): the whole point is to notice that the
         // answer body landed and move the viewport without waiting for another

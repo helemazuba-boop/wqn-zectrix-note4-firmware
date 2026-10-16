@@ -43,6 +43,20 @@ constexpr int kBottomHintY = 278;               // 底部提示/脚注行 y
 constexpr int kGutterCard = 12;                 // 卡片垂直间距
 constexpr int kGutterRow = 8;                   // 列表行垂直间距
 
+// ---- Home, reference A: ink on paper ----
+constexpr int kHomeLeft = 16;
+constexpr int kHomeWidth = 368;
+constexpr int kHomeClockY = 50;
+constexpr int kHomeDateX = 280;
+constexpr int kHomeAiCaptionY = 122;
+constexpr int kHomeAiTitleY = 151;
+constexpr int kHomeAiActionY = 194;
+constexpr int kHomeStudyCaptionY = 230;
+constexpr int kHomeStudyTitleY = 250;
+constexpr int kHomeFooterY = 284;
+constexpr int kHomeAiDividerY = 112;
+constexpr int kHomeStudyDividerY = 220;
+
 // ---- Global page navigation ----
 constexpr int kNavigationX = 8;
 constexpr int kNavigationY = 214;

@@ -71,6 +71,7 @@ struct ProblemState {
 struct TimeState { bool editing = false; };
 struct UiState {
     UiScreen screen = UiScreen::kHome;
+    size_t selected_home_task = 0;
     NavigationState navigation;
     WordState word_app;
     NoteState note_app;

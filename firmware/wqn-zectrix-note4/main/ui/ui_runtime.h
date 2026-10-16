@@ -219,6 +219,7 @@ public:
     // a claim about the moment the list was fetched. See ui_runtime.cpp for the
     // conditions and their cost.
     UiUpdate DispatchAgentSessionListPoll(int64_t now_ms);
+    UiUpdate DispatchHomeStatusPoll(int64_t now_ms);
 
 private:
     UiUpdate FinishEvent(
@@ -232,6 +233,8 @@ private:
     bool word_boundary_pending_ = false;
     wqn::ButtonEvent word_boundary_event_{};
     uint64_t event_sequence_ = 0;
+    int64_t home_poll_next_ms_ = 0;
+    int64_t home_activity_at_ms_ = 0;
     // [picker-stale] Last attempt at the picker's self-refresh, whether or not
     // the worker accepted it: a rejected poll must not retry on the next tick.
     int64_t agent_list_poll_at_ms_ = 0;
