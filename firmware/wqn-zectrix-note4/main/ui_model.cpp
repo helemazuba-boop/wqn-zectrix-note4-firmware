@@ -140,63 +140,14 @@ const char* ScreenName(wqn::UiScreen screen)
     return "WQN";
 }
 
-// Inverse of NextTopScreen: the page you would have come FROM by pressing
-// "next". These two must stay exact inverses -- when they agree, long-press Up
-// and long-press Down do the same thing and half the ring becomes unreachable.
-// Derivation after kOpenCode was demoted into the AI page: the forward ring is
-// Ai -> Settings -> Home -> Time -> Word -> Note -> Todo -> Ai, so the reverse
-// ring is that same list walked backwards.
 wqn::UiScreen PreviousTopScreen(wqn::UiScreen screen)
 {
-    switch (screen) {
-        case wqn::UiScreen::kAi:
-            return wqn::UiScreen::kTodo;
-        case wqn::UiScreen::kSettings:
-            return wqn::UiScreen::kAi;
-        case wqn::UiScreen::kHome:
-            return wqn::UiScreen::kSettings;
-        case wqn::UiScreen::kTime:
-            return wqn::UiScreen::kHome;
-        case wqn::UiScreen::kWord:
-            return wqn::UiScreen::kTime;
-        case wqn::UiScreen::kNote:
-            return wqn::UiScreen::kWord;
-        case wqn::UiScreen::kTodo:
-            return wqn::UiScreen::kNote;
-        case wqn::UiScreen::kOpenCode:
-            // [agent] Reserved, unreachable. Kept so the default-less switch
-            // stays exhaustive; IsRestorableScreen rejects ID 14.
-            return wqn::UiScreen::kAi;
-        case wqn::UiScreen::kProvisioning:
-            return wqn::UiScreen::kHome;
-    }
-    return wqn::UiScreen::kHome;
+    return wqn::AdjacentNavigationPage(screen, -1);
 }
 
 wqn::UiScreen NextTopScreen(wqn::UiScreen screen)
 {
-    switch (screen) {
-        case wqn::UiScreen::kAi:
-            return wqn::UiScreen::kSettings;
-        case wqn::UiScreen::kSettings:
-            return wqn::UiScreen::kHome;
-        case wqn::UiScreen::kHome:
-            return wqn::UiScreen::kTime;
-        case wqn::UiScreen::kTime:
-            return wqn::UiScreen::kWord;
-        case wqn::UiScreen::kWord:
-            return wqn::UiScreen::kNote;
-        case wqn::UiScreen::kNote:
-            return wqn::UiScreen::kTodo;
-        case wqn::UiScreen::kTodo:
-            return wqn::UiScreen::kAi;
-        case wqn::UiScreen::kOpenCode:
-            // [agent] Reserved, unreachable. The ring is Ai -> Settings.
-            return wqn::UiScreen::kHome;
-        case wqn::UiScreen::kProvisioning:
-            return wqn::UiScreen::kHome;
-    }
-    return wqn::UiScreen::kHome;
+    return wqn::AdjacentNavigationPage(screen, 1);
 }
 
 void AddLine(wqn::UiFrame* frame, wqn::UiTextStyle style, const std::string& text)
@@ -370,6 +321,146 @@ void ClampUiSelection(UiState* state)
     }
 }
 
+static void ApplyUiScreenTransition(UiState* state, UiScreen screen_before)
+{
+    ClampUiSelection(state);
+    // Leaving the note screen drops the 15 KB image payload: internal SRAM is
+    // too scarce to park it behind an invisible page. Re-entry reloads it
+    // from the SPIFFS cache via the viewer's normal request path.
+    if (screen_before == wqn::UiScreen::kNote &&
+        state->screen != wqn::UiScreen::kNote) {
+        ReleaseNoteImagePayload(&state->note_app);
+        ReleaseProblemImagePayload(&state->problem_app);
+    }
+    // Leaving the word screen drops the [词]-row deck override so the next
+    // direct entry studies the settings default again. The session built for
+    // the scoped deck is dropped with it (progress lives in the observation
+    // outbox; the session is only a browse cursor).
+    if (screen_before == wqn::UiScreen::kWord &&
+        state->screen != wqn::UiScreen::kWord &&
+        !state->word_app.scoped_deck_id.empty()) {
+        // [word-scope-reset] Leaving the scoped word page drops the scope
+        // override and the sessions with it. Same arm+submit shape as the [词]
+        // row above: the durable half runs on the worker, so leaving a word page
+        // never blocks the UI task on the reset transaction. The in-memory half
+        // is applied by the ACK dispatch -- but the scope must clear NOW,
+        // because the user is already on another screen and the next direct
+        // word entry must study the default deck, not the override they left.
+        //
+        // NavigateUiToScreen blocks leaving a scoped word page while a
+        // commit is persisting, so there is no in-flight persist
+        // transaction for this to queue behind.
+        const std::string leaving_deck_id = state->word_app.scoped_deck_id;
+        state->word_app.scoped_deck_id.clear();
+        state->word_app.scoped_deck_title.clear();
+        const uint32_t op_id = device_ui_internal::SubmitWordSessionReset(leaving_deck_id);
+        if (op_id != 0) {
+            state->word_app.scope_reset_pending_deck_id = leaving_deck_id;
+            state->word_app.scope_reset_pending_deck_title.clear();
+            state->word_app.scope_reset_pending_valid = true;
+            state->word_app.scope_reset_save_op_id = op_id;
+        }
+        // A submit reject is tolerable here: the scope override is already gone
+        // in memory, the durable reset will be retried by the next scope change,
+        // and the sessions it failed to drop are inert the moment any later
+        // reset commits a generation.
+    }
+#if CONFIG_WQN_AI_ENABLE
+    // Leaving the AI screen while in Flash tier must tear down the WebSocket
+    // and the audio streaming task — otherwise they keep running in the
+    // background and drain the battery.
+    if (screen_before == wqn::UiScreen::kAi && state->screen != wqn::UiScreen::kAi &&
+        state->ai.tier == wqn::AiTier::kFlash) {
+        wqn::StopFlashSession();
+    }
+    // [agent] B3 / D-lease: leaving the AI screen from the Agent tier drops its
+    // event stream and the sleep lease behind it. Not gated on the tier being
+    // current -- a user who cycles to another tier and then leaves hits the tier
+    // cycle first, which already released; this is the same release for the user
+    // who leaves straight from the Agent tier.
+    if (screen_before == wqn::UiScreen::kAi && state->screen != wqn::UiScreen::kAi) {
+        wqn::stdpro_ws::RequestIdleDisconnect();
+        wqn::LeaveOpenCodeAgentTier();
+    }
+    // [agent] The B1 counterpart on SCREEN ENTRY. The tier-cycle handler in
+    // ui_input.cpp re-fetches the list / re-attaches on arriving at the Agent
+    // tier; entering the AI screen from another screen runs no tier logic at
+    // all, so a return left one of two stale states behind:
+    //
+    //   - the leave path that found no stream attached clears NOTHING -- it only
+    //     refreshes the lease -- so session_locked, current_session_id, the
+    //     transcript and the scroll offset all survive the round trip. The user
+    //     comes back to a locked view with no stream behind it: symptom 3
+    //     ("entering a running session receives nothing"), reached through a
+    //     screen change instead of a tier cycle.
+    //   - the leave path that did find a stream clears the lock but leaves
+    //     g_state.sessions exactly as it was, and no gesture can refresh it while
+    //     the picker is up (see DispatchAgentSessionListPoll). The picker's 运行中
+    //     marker is then as old as the last fetch -- hours, if the device slept.
+    //
+    // Exactly the two branches the tier cycle runs, so the two entry points
+    // cannot drift: no session locked means fetch the list, a locked session with
+    // no stream means attach to it.
+    if (state->screen == wqn::UiScreen::kAi && screen_before != wqn::UiScreen::kAi &&
+        state->ai.tier == wqn::AiTier::kAgent) {
+        if (state->agent.current_session_id.empty()) {
+            const esp_err_t result = wqn::RequestOpenCodeSessionList();
+            if (result != ESP_OK) {
+                ESP_LOGW("ui_model", "Agent screen entry: session list refused (%s)",
+                         esp_err_to_name(result));
+            }
+        } else if (state->agent.session_locked && !state->agent.stream_active) {
+            const esp_err_t result = wqn::ObserveOpenCodeSession();
+            if (result != ESP_OK) {
+                // The worker slot is taken -- kNoSession cannot happen, this
+                // branch requires current_session_id to be non-empty. What holds
+                // it is a backfill still reading the transcript the last entry
+                // armed, or a run, or a list load whose success branch has not
+                // cleared session_locked yet. Logged rather than retried: the
+                // tier-cycle path accepts the same race, and a retry loop would
+                // fight the single-slot command gate.
+                //
+                // The third case is deliberate and silent. A leaving attach that
+                // has not finished detaching still reads stream_active true, so
+                // neither branch here fires and nothing is logged -- re-attaching
+                // then would be refused on the same slot anyway, and the tail
+                // will clear the flag on its own. An earlier version of this
+                // comment claimed that case reaches the log below; it cannot,
+                // the branch condition excludes it.
+                ESP_LOGW("ui_model", "Agent screen entry: re-attach refused (%s)",
+                         esp_err_to_name(result));
+            }
+        }
+    }
+#endif
+}
+
+bool NavigateUiToScreen(UiState* state, UiScreen target)
+{
+    if (state == nullptr || NavigationPageIndex(target) == kNavigationPages.size()) return false;
+    if (state->screen == target) return true;
+    if (state->screen == UiScreen::kWord &&
+        (state->word_app.session.commit_state == WordObservationCommitState::kPersisting ||
+         HasBufferedWordObservations(state->word_app))) {
+        state->word_app.session.batch_flush_requested = true;
+        state->word_app.session.batch_retry_after_ms = 0;
+        state->word_app.message = "正在保存，请稍后离开";
+        return false;
+    }
+    if (state->screen == UiScreen::kNote &&
+        (state->note_app.session.commit_state == NoteObservationCommitState::kPersisting ||
+         (state->problem_app.active &&
+          state->problem_app.commit_state == ProblemVerdictCommitState::kPersisting))) {
+        state->note_app.message = "正在保存，请稍后离开";
+        state->problem_app.message = "正在保存，请稍后离开";
+        return false;
+    }
+    const UiScreen previous = state->screen;
+    state->screen = target;
+    ApplyUiScreenTransition(state, previous);
+    return true;
+}
+
 void HandleUiInput(UiState* state, UiInput input)
 {
     if (state == nullptr) {
@@ -380,52 +471,11 @@ void HandleUiInput(UiState* state, UiInput input)
 
     switch (input) {
         case UiInput::kTopPrevious:
-            // [persist-worker] Do not leave a scoped word page while its
-            // observation is still persisting: leaving triggers a synchronous
-            // ResetWordSessionsForScopeChange (two session-file clears) that
-            // would queue behind the in-flight persist transaction and stall
-            // the UI, and drop session ownership out from under the worker.
-            // Within-word input stays responsive; only the top-screen switch
-            // waits. Uses commit_state so the model layer stays unaware of the
-            // task infrastructure.
-            if (state->screen == wqn::UiScreen::kWord &&
-                !state->word_app.scoped_deck_id.empty() &&
-                state->word_app.session.commit_state ==
-                    wqn::WordObservationCommitState::kPersisting) {
-                state->word_app.message = "正在保存，请稍后离开";
-                break;
-            }
-            // Same contract for a problem verdict: the in-layer LongConfirm
-            // gate blocks the escape chain, but a long UP/DOWN maps straight to
-            // top-screen navigation and would bypass it, hiding the saving
-            // status mid-commit.
-            if (state->screen == wqn::UiScreen::kNote &&
-                state->problem_app.active &&
-                state->problem_app.commit_state ==
-                    wqn::ProblemVerdictCommitState::kPersisting) {
-                state->problem_app.message = "正在保存，请稍后离开";
-                break;
-            }
-            state->screen = PreviousTopScreen(state->screen);
-            break;
-
+            NavigateUiToScreen(state, PreviousTopScreen(state->screen));
+            return;
         case UiInput::kTopNext:
-            if (state->screen == wqn::UiScreen::kWord &&
-                !state->word_app.scoped_deck_id.empty() &&
-                state->word_app.session.commit_state ==
-                    wqn::WordObservationCommitState::kPersisting) {
-                state->word_app.message = "正在保存，请稍后离开";
-                break;
-            }
-            if (state->screen == wqn::UiScreen::kNote &&
-                state->problem_app.active &&
-                state->problem_app.commit_state ==
-                    wqn::ProblemVerdictCommitState::kPersisting) {
-                state->problem_app.message = "正在保存，请稍后离开";
-                break;
-            }
-            state->screen = NextTopScreen(state->screen);
-            break;
+            NavigateUiToScreen(state, NextTopScreen(state->screen));
+            return;
 
         case UiInput::kUp:
             if (state->screen == UiScreen::kTime) {
@@ -642,116 +692,7 @@ void HandleUiInput(UiState* state, UiInput input)
             }
             break;
     }
-    ClampUiSelection(state);
-    // Leaving the note screen drops the 15 KB image payload: internal SRAM is
-    // too scarce to park it behind an invisible page. Re-entry reloads it
-    // from the SPIFFS cache via the viewer's normal request path.
-    if (screen_before == wqn::UiScreen::kNote &&
-        state->screen != wqn::UiScreen::kNote) {
-        ReleaseNoteImagePayload(&state->note_app);
-        ReleaseProblemImagePayload(&state->problem_app);
-    }
-    // Leaving the word screen drops the [词]-row deck override so the next
-    // direct entry studies the settings default again. The session built for
-    // the scoped deck is dropped with it (progress lives in the observation
-    // outbox; the session is only a browse cursor).
-    if (screen_before == wqn::UiScreen::kWord &&
-        state->screen != wqn::UiScreen::kWord &&
-        !state->word_app.scoped_deck_id.empty()) {
-        // [word-scope-reset] Leaving the scoped word page drops the scope
-        // override and the sessions with it. Same arm+submit shape as the [词]
-        // row above: the durable half runs on the worker, so leaving a word page
-        // never blocks the UI task on the reset transaction. The in-memory half
-        // is applied by the ACK dispatch -- but the scope must clear NOW,
-        // because the user is already on another screen and the next direct
-        // word entry must study the default deck, not the override they left.
-        //
-        // The kTopPrevious/kTopNext guards already block leaving a scoped word
-        // page while a commit is persisting, so there is no in-flight persist
-        // transaction for this to queue behind.
-        const std::string leaving_deck_id = state->word_app.scoped_deck_id;
-        state->word_app.scoped_deck_id.clear();
-        state->word_app.scoped_deck_title.clear();
-        const uint32_t op_id = device_ui_internal::SubmitWordSessionReset(leaving_deck_id);
-        if (op_id != 0) {
-            state->word_app.scope_reset_pending_deck_id = leaving_deck_id;
-            state->word_app.scope_reset_pending_deck_title.clear();
-            state->word_app.scope_reset_pending_valid = true;
-            state->word_app.scope_reset_save_op_id = op_id;
-        }
-        // A submit reject is tolerable here: the scope override is already gone
-        // in memory, the durable reset will be retried by the next scope change,
-        // and the sessions it failed to drop are inert the moment any later
-        // reset commits a generation.
-    }
-#if CONFIG_WQN_AI_ENABLE
-    // Leaving the AI screen while in Flash tier must tear down the WebSocket
-    // and the audio streaming task — otherwise they keep running in the
-    // background and drain the battery.
-    if (screen_before == wqn::UiScreen::kAi && state->screen != wqn::UiScreen::kAi &&
-        state->ai.tier == wqn::AiTier::kFlash) {
-        wqn::StopFlashSession();
-    }
-    // [agent] B3 / D-lease: leaving the AI screen from the Agent tier drops its
-    // event stream and the sleep lease behind it. Not gated on the tier being
-    // current -- a user who cycles to another tier and then leaves hits the tier
-    // cycle first, which already released; this is the same release for the user
-    // who leaves straight from the Agent tier.
-    if (screen_before == wqn::UiScreen::kAi && state->screen != wqn::UiScreen::kAi) {
-        wqn::stdpro_ws::RequestIdleDisconnect();
-        wqn::LeaveOpenCodeAgentTier();
-    }
-    // [agent] The B1 counterpart on SCREEN ENTRY. The tier-cycle handler in
-    // ui_input.cpp re-fetches the list / re-attaches on arriving at the Agent
-    // tier; entering the AI screen from another screen runs no tier logic at
-    // all, so a return left one of two stale states behind:
-    //
-    //   - the leave path that found no stream attached clears NOTHING -- it only
-    //     refreshes the lease -- so session_locked, current_session_id, the
-    //     transcript and the scroll offset all survive the round trip. The user
-    //     comes back to a locked view with no stream behind it: symptom 3
-    //     ("entering a running session receives nothing"), reached through a
-    //     screen change instead of a tier cycle.
-    //   - the leave path that did find a stream clears the lock but leaves
-    //     g_state.sessions exactly as it was, and no gesture can refresh it while
-    //     the picker is up (see DispatchAgentSessionListPoll). The picker's 运行中
-    //     marker is then as old as the last fetch -- hours, if the device slept.
-    //
-    // Exactly the two branches the tier cycle runs, so the two entry points
-    // cannot drift: no session locked means fetch the list, a locked session with
-    // no stream means attach to it.
-    if (state->screen == wqn::UiScreen::kAi && screen_before != wqn::UiScreen::kAi &&
-        state->ai.tier == wqn::AiTier::kAgent) {
-        if (state->agent.current_session_id.empty()) {
-            const esp_err_t result = wqn::RequestOpenCodeSessionList();
-            if (result != ESP_OK) {
-                ESP_LOGW("ui_model", "Agent screen entry: session list refused (%s)",
-                         esp_err_to_name(result));
-            }
-        } else if (state->agent.session_locked && !state->agent.stream_active) {
-            const esp_err_t result = wqn::ObserveOpenCodeSession();
-            if (result != ESP_OK) {
-                // The worker slot is taken -- kNoSession cannot happen, this
-                // branch requires current_session_id to be non-empty. What holds
-                // it is a backfill still reading the transcript the last entry
-                // armed, or a run, or a list load whose success branch has not
-                // cleared session_locked yet. Logged rather than retried: the
-                // tier-cycle path accepts the same race, and a retry loop would
-                // fight the single-slot command gate.
-                //
-                // The third case is deliberate and silent. A leaving attach that
-                // has not finished detaching still reads stream_active true, so
-                // neither branch here fires and nothing is logged -- re-attaching
-                // then would be refused on the same slot anyway, and the tail
-                // will clear the flag on its own. An earlier version of this
-                // comment claimed that case reaches the log below; it cannot,
-                // the branch condition excludes it.
-                ESP_LOGW("ui_model", "Agent screen entry: re-attach refused (%s)",
-                         esp_err_to_name(result));
-            }
-        }
-    }
-#endif
+    ApplyUiScreenTransition(state, screen_before);
 }
 
 bool TickAiSession(UiState* state, int64_t now_ms)
@@ -810,6 +751,7 @@ UiFrame RenderUiFrame(const UiState& state)
     }
 
     frame.screen = state.screen;
+    frame.navigation = state.navigation;
     frame.paired = state.status.paired;
     frame.claim_code = state.status.claim_code;
     frame.home = state.home;
@@ -841,7 +783,8 @@ UiFrame RenderUiFrame(const UiState& state)
     // call eats the flag and the actual render frame gets prefer_full=false.
     // Consumption is deferred to ConsumeForceFullRefresh() called by the
     // render path in device_ui.cpp after it has the final frame.
-    frame.prefer_full_refresh = (state.screen == UiScreen::kHome) || g_force_full_refresh_next;
+    frame.prefer_full_refresh =
+        (state.screen == UiScreen::kHome && !state.navigation.visible) || g_force_full_refresh_next;
     if (state.screen != UiScreen::kHome) {
         AddLine(&frame, UiTextStyle::kMeta, ScreenName(state.screen));
     }

@@ -134,13 +134,13 @@ void DrawRoundedRect(int x, int y, int width, int height, int radius)
 // ink-filled, the caller draws its content in paper color on top. Corners use
 // the same midpoint-circle walk as DrawRoundedRect but fill the interior rows
 // between the left/right arc spans. radius<=0 degrades to FillRect.
-void FillRoundedRect(int x, int y, int width, int height, int radius)
+void FillRoundedRect(int x, int y, int width, int height, int radius, bool black)
 {
     if (width <= 0 || height <= 0) {
         return;
     }
     if (radius <= 0) {
-        FillRect(x, y, width, height, true);
+        FillRect(x, y, width, height, black);
         return;
     }
     const int r = std::min(radius, std::min(width, height) / 2);
@@ -159,7 +159,7 @@ void FillRoundedRect(int x, int y, int width, int height, int radius)
             const int span = static_cast<int>(std::sqrt(static_cast<double>(r * r - dy * dy)) + 0.5);
             inset = r - span;
         }
-        DrawHorizontalLine(x + inset, y + yy, width - 2 * inset);
+        FillRect(x + inset, y + yy, width - 2 * inset, 1, black);
     }
 }
 
@@ -235,6 +235,7 @@ esp_err_t RefreshStableRegion(const UiRect& rect, RefreshSchedule schedule)
 
 esp_err_t RefreshFrame(const wqn::UiFrame& frame, RefreshSchedule schedule)
 {
+    ESP_RETURN_ON_ERROR(DrawNavigationOverlay(frame), kTag, "draw page navigation");
     ESP_LOGI(kTag, "RefreshFrame: enter schedule=%s screen=%d last_rendered_screen=%d",
              RefreshScheduleName(schedule), static_cast<int>(frame.screen),
              static_cast<int>(g_last_rendered_screen));
@@ -260,7 +261,8 @@ esp_err_t RefreshFrame(const wqn::UiFrame& frame, RefreshSchedule schedule)
     //   when nothing changed.
     const bool prefer_full_for_schedule = frame.prefer_full_refresh &&
         schedule != RefreshSchedule::kClock &&
-        schedule != RefreshSchedule::kTimer;
+        schedule != RefreshSchedule::kTimer &&
+        schedule != RefreshSchedule::kNavigation;
     const bool force_full_refresh =
         frame.screen != g_last_rendered_screen ||
         schedule == RefreshSchedule::kCommit ||

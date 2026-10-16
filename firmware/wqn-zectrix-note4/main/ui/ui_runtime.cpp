@@ -130,6 +130,7 @@ UiUpdate UiRuntime::FinishEvent(
 void UiRuntime::Initialize(wqn::AppState&& initial_state)
 {
     state_ = std::move(initial_state);
+    state_.navigation = {};
     // Bootstrap always owns revision 1, including a degraded load. The UI can
     // therefore submit its recovery frame without using reserved revision 0.
     FinishEvent(AppEventKind::kBootstrap, RefreshSchedule::kImmediate, true);
@@ -140,7 +141,9 @@ UiUpdate UiRuntime::DispatchButton(
     int64_t event_time_ms)
 {
     if (wqn::HasBufferedWordObservations(state_.word_app) &&
-        event.type == wqn::ButtonEventType::kLongPress) {
+        event.type == wqn::ButtonEventType::kLongPress &&
+        event.button == wqn::ButtonId::kConfirm && !state_.navigation.visible &&
+        (state_.navigation.blocked_mask & (1U << static_cast<unsigned>(event.button))) == 0) {
         if (!word_boundary_pending_) {
             word_boundary_pending_ = true;
             word_boundary_event_ = event;
@@ -1246,6 +1249,7 @@ UiUpdate UiRuntime::DispatchStatusReload(wqn::AppState&& snapshot)
     // Preserve the foreground screen even if a snapshot loader regresses and
     // supplies a stale/default screen value.
     snapshot.screen = state_.screen;
+    snapshot.navigation = state_.navigation;
     const std::string before = FrameSignature(wqn::RenderUiFrame(state_));
     const uint64_t revision = state_.revision;
     state_ = std::move(snapshot);

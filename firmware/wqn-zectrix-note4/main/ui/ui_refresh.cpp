@@ -26,6 +26,7 @@ constexpr int64_t kStatusRefreshDelay = pdMS_TO_TICKS(60000);
 
 // ---- Global refresh state (definitions live here) --------------------------
 
+bool g_last_rendered_navigation_visible = false;
 SemaphoreHandle_t g_refresh_mutex = nullptr;
 TaskHandle_t g_refresh_task = nullptr;
 QueueHandle_t g_display_result_queue = nullptr;
@@ -63,6 +64,7 @@ int RefreshRank(RefreshSchedule schedule)
     switch (schedule) {
         case RefreshSchedule::kConfig:
             return 1;
+        case RefreshSchedule::kNavigation:
         case RefreshSchedule::kAi:
             return 2;
         case RefreshSchedule::kClock:
@@ -88,6 +90,8 @@ const char* RefreshScheduleName(RefreshSchedule schedule)
     switch (schedule) {
         case RefreshSchedule::kConfig:
             return "config";
+        case RefreshSchedule::kNavigation:
+            return "navigation";
         case RefreshSchedule::kAi:
             return "ai";
         case RefreshSchedule::kSelection:
@@ -117,6 +121,7 @@ TickType_t RefreshDelay(RefreshSchedule schedule)
             return kConfigRefreshDelay;
         case RefreshSchedule::kAi:
             return kAiRefreshDelay;
+        case RefreshSchedule::kNavigation:
         case RefreshSchedule::kSelection:
             return kSelectionRefreshDelay;
         case RefreshSchedule::kClock:
@@ -342,6 +347,8 @@ std::string FrameSignature(const wqn::UiFrame& frame)
             break;
     }
     std::string signature = std::to_string(static_cast<int>(frame.screen));
+    signature.append(frame.navigation.visible ? "|nav:1/" : "|nav:0/");
+    if (frame.navigation.visible) signature.append(std::to_string(frame.navigation.selected));
     const bool time_config_mode = frame.screen == wqn::UiScreen::kTime && frame.time_app.config_mode;
     if (frame.screen == wqn::UiScreen::kHome) {
         signature.append("|home:");
@@ -1303,6 +1310,7 @@ void EpdRefreshTask(void*)
             if (render_result == ESP_OK) {
                 displayed_signature = local_sig;
                 g_last_rendered_screen = frame.screen;
+                g_last_rendered_navigation_visible = frame.navigation.visible;
                 wqn::NoteEpdActivity();
                 ESP_LOGI(
                     kTag,

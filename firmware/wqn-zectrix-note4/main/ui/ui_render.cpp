@@ -36,6 +36,13 @@ esp_err_t RenderFrameToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
     ESP_LOGI(kTag, "RenderFrameToEpd: enter schedule=%s screen=%d", RefreshScheduleName(schedule), static_cast<int>(frame.screen));
     const UBaseType_t hwm_before_render = uxTaskGetStackHighWaterMark(nullptr);
     ESP_LOGI(kTag, "RenderFrameToEpd: stack HWM before render: %u bytes free", static_cast<unsigned>(hwm_before_render * sizeof(StackType_t)));
+    // A modal overlay must be composed after a complete base page, including
+    // clock/config updates whose regional renderer would bypass RefreshFrame.
+    if ((frame.navigation.visible || g_last_rendered_navigation_visible) &&
+        schedule != RefreshSchedule::kCommit &&
+        schedule != RefreshSchedule::kImmediate) {
+        schedule = RefreshSchedule::kNavigation;
+    }
     const bool region_frame_available = wqn::IsEpdFramebufferSynchronized();
     const bool region_schedule =
         schedule == RefreshSchedule::kClock ||

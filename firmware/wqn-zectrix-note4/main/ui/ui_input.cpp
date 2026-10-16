@@ -14,6 +14,7 @@
 #include "flash_session.h"
 #include "opencode_session.h"
 #include "power_manager.h"
+#include "provision_manager.h"
 #include "runtime/sleep_diagnostics.h"
 #include "word_pack.h"
 #include "services/connectivity_service.h"
@@ -494,17 +495,6 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
         BuildHomeSummary(state);
         return RefreshSchedule::kCommit;
     }
-    if (long_press && event.button == wqn::ButtonId::kUp) {
-        wqn::HandleUiInput(state, wqn::UiInput::kTopPrevious);
-        BuildHomeSummary(state);
-        return RefreshSchedule::kCommit;
-    }
-    if (long_press && event.button == wqn::ButtonId::kDownPower) {
-        wqn::HandleUiInput(state, wqn::UiInput::kTopNext);
-        BuildHomeSummary(state);
-        return RefreshSchedule::kCommit;
-    }
-
     if (!short_press) {
         return RefreshSchedule::kNone;
     }
@@ -1199,6 +1189,71 @@ static RefreshSchedule ApplyStatusBarEditEvent(
     return RefreshSchedule::kNone;
 }
 
+static RefreshSchedule FinishScreenNavigation(wqn::UiState* state, wqn::UiScreen old_screen)
+{
+    if (state->screen != old_screen) {
+        if (old_screen == wqn::UiScreen::kTime) {
+            wqn::DisarmTimeAppAction(&state->time_app);
+        }
+        state->gestures.flash_ptt_started = false;
+        state->gestures.agent_ptt_started = false;
+        state->gestures.last_ai_confirm_tap_ms = 0;
+        // [agent] The OpenCode session list is no longer loaded on screen
+        // entry: the picker opens from the AI page's status-bar edit mode and
+        // that path issues the request itself.
+        if (state->screen == wqn::UiScreen::kTodo) {
+            RefreshTodosFromCloud(state);
+        } else if (state->screen == wqn::UiScreen::kWord && state->word_app.cloud_sync_requested) {
+            wqn::services::RequestContentRefresh(
+                wqn::services::SyncContentDomain::kWordPacks);
+            if (!QueueWordReviewRefresh()) {
+                state->word_app.message = IsWordCloudBusy() ? "单词同步中" : "单词同步失败";
+            } else {
+                state->word_app.message = "单词同步中";
+            }
+        } else if (state->screen == wqn::UiScreen::kNote &&
+                   state->note_app.cloud_sync_requested) {
+            wqn::services::RequestContentRefresh(
+                wqn::services::SyncContentDomain::kNotePacks);
+            if (!QueueNotePackSync()) {
+                state->note_app.message = IsNoteCloudBusy() ? "笔记同步中" : "笔记同步失败";
+            } else {
+                state->note_app.message = "笔记同步中";
+            }
+            // The mixed list also carries the [题] rows: give the problem
+            // packs the same entry refresh (coalesced by the busy CAS).
+            if (state->problem_app.cloud_sync_requested) {
+                wqn::services::RequestContentRefresh(
+                    wqn::services::SyncContentDomain::kProblemPacks);
+                QueueProblemPackSync();
+            }
+        }
+        BuildHomeSummary(state);
+        return RefreshSchedule::kCommit;
+    }
+    return RefreshSchedule::kNone;
+}
+
+static bool CanOpenNavigation(const wqn::UiState& state)
+{
+    if (wqn::IsProvisioningActive()) return false;
+    if (state.screen == wqn::UiScreen::kSettings &&
+        state.settings.dialog != wqn::SettingsDialog::kNone) return false;
+    if (state.screen == wqn::UiScreen::kTime &&
+        wqn::TimeAppIsEditingValue(state.time_app)) return false;
+    if (state.screen == wqn::UiScreen::kAi) {
+        if (state.status_edit.active || state.gestures.flash_ptt_started ||
+            state.gestures.agent_ptt_started ||
+            (state.ai.tier == wqn::AiTier::kStd &&
+             (state.ai.status == wqn::AiSessionStatus::kPreparingCapture ||
+              state.ai.status == wqn::AiSessionStatus::kListening))) return false;
+        if (state.ai.tier == wqn::AiTier::kAgent &&
+            (state.agent.ui.phase == wqn::AiFeaturePhase::kRecording ||
+             AgentOptionModeFor(state.agent) != AgentOptionMode::kNone)) return false;
+    }
+    return wqn::NavigationPageIndex(state.screen) < wqn::kNavigationPages.size();
+}
+
 RefreshSchedule ApplyButtonEvent(
     const wqn::ButtonEvent& event,
     int64_t event_time_ms,
@@ -1207,6 +1262,17 @@ RefreshSchedule ApplyButtonEvent(
     if (state == nullptr || !event.HasEvent()) {
         return RefreshSchedule::kNone;
     }
+
+    const wqn::NavigationAction navigation = wqn::ReduceNavigationInput(
+        &state->navigation, state->screen, event, event_time_ms, CanOpenNavigation(*state));
+    if (navigation == wqn::NavigationAction::kConfirm) {
+        const wqn::UiScreen previous = state->screen;
+        wqn::NavigateUiToScreen(state, wqn::kNavigationPages[state->navigation.selected].screen);
+        const RefreshSchedule entered = FinishScreenNavigation(state, previous);
+        return entered == RefreshSchedule::kNone ? RefreshSchedule::kNavigation : entered;
+    }
+    if (navigation == wqn::NavigationAction::kRepaint) return RefreshSchedule::kNavigation;
+    if (navigation == wqn::NavigationAction::kConsumed) return RefreshSchedule::kNone;
 
     // [shell] Status-bar edit mode intercepts all input on the AI page.
     if (state->screen == wqn::UiScreen::kAi && state->status_edit.active) {
@@ -1719,14 +1785,14 @@ RefreshSchedule ApplyButtonEvent(
             if (long_press && state->screen == wqn::UiScreen::kTime && wqn::TimeAppIsEditingValue(state->time_app)) {
                 wqn::HandleTimeAppInput(&state->time_app, wqn::TimeInput::kLongUp);
             } else {
-                wqn::HandleUiInput(state, long_press ? wqn::UiInput::kTopPrevious : wqn::UiInput::kUp);
+                if (!long_press) wqn::HandleUiInput(state, wqn::UiInput::kUp);
             }
             break;
         case wqn::ButtonId::kDownPower:
             if (long_press && state->screen == wqn::UiScreen::kTime && wqn::TimeAppIsEditingValue(state->time_app)) {
                 wqn::HandleTimeAppInput(&state->time_app, wqn::TimeInput::kLongDown);
             } else {
-                wqn::HandleUiInput(state, long_press ? wqn::UiInput::kTopNext : wqn::UiInput::kDown);
+                if (!long_press) wqn::HandleUiInput(state, wqn::UiInput::kDown);
             }
             break;
         case wqn::ButtonId::kConfirm:
@@ -1741,44 +1807,7 @@ RefreshSchedule ApplyButtonEvent(
     }
 
     if (state->screen != old_screen) {
-        if (old_screen == wqn::UiScreen::kTime) {
-            wqn::DisarmTimeAppAction(&state->time_app);
-        }
-        state->gestures.flash_ptt_started = false;
-        state->gestures.agent_ptt_started = false;
-        state->gestures.last_ai_confirm_tap_ms = 0;
-        // [agent] The OpenCode session list is no longer loaded on screen
-        // entry: the picker opens from the AI page's status-bar edit mode and
-        // that path issues the request itself.
-        if (state->screen == wqn::UiScreen::kTodo) {
-            RefreshTodosFromCloud(state);
-        } else if (state->screen == wqn::UiScreen::kWord && state->word_app.cloud_sync_requested) {
-            wqn::services::RequestContentRefresh(
-                wqn::services::SyncContentDomain::kWordPacks);
-            if (!QueueWordReviewRefresh()) {
-                state->word_app.message = IsWordCloudBusy() ? "单词同步中" : "单词同步失败";
-            } else {
-                state->word_app.message = "单词同步中";
-            }
-        } else if (state->screen == wqn::UiScreen::kNote &&
-                   state->note_app.cloud_sync_requested) {
-            wqn::services::RequestContentRefresh(
-                wqn::services::SyncContentDomain::kNotePacks);
-            if (!QueueNotePackSync()) {
-                state->note_app.message = IsNoteCloudBusy() ? "笔记同步中" : "笔记同步失败";
-            } else {
-                state->note_app.message = "笔记同步中";
-            }
-            // The mixed list also carries the [题] rows: give the problem
-            // packs the same entry refresh (coalesced by the busy CAS).
-            if (state->problem_app.cloud_sync_requested) {
-                wqn::services::RequestContentRefresh(
-                    wqn::services::SyncContentDomain::kProblemPacks);
-                QueueProblemPackSync();
-            }
-        }
-        BuildHomeSummary(state);
-        return RefreshSchedule::kCommit;
+        return FinishScreenNavigation(state, old_screen);
     }
     if (state->screen == wqn::UiScreen::kAi) {
         if (state->ai.page != old_page || state->ai.tier != old_ai_tier) {

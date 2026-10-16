@@ -43,6 +43,21 @@ constexpr int kBottomHintY = 278;               // 底部提示/脚注行 y
 constexpr int kGutterCard = 12;                 // 卡片垂直间距
 constexpr int kGutterRow = 8;                   // 列表行垂直间距
 
+// ---- Global page navigation ----
+constexpr int kNavigationX = 8;
+constexpr int kNavigationY = 214;
+constexpr int kNavigationWidth = 384;
+constexpr int kNavigationHeight = 78;
+constexpr int kNavigationRadius = 6;
+constexpr int kNavigationItemX = 20;
+constexpr int kNavigationItemY = 222;
+constexpr int kNavigationItemWidth = 48;
+constexpr int kNavigationItemHeight = 60;
+constexpr int kNavigationItemStep = 52;
+constexpr int kNavigationIconY = 228;
+constexpr int kNavigationLabelY = 260;
+constexpr int kNavigationCurrentY = 285;
+
 // ---- AI page ---------------------------------------------------------------
 // [agent] Shared by page_ai.cpp (STD/Pro + Flash tiers) and page_ai_agent.cpp
 // (Agent tier): the Agent tier renders through the same viewport, so the two

@@ -460,7 +460,8 @@ wqn::display::WaveformRequirement RequestedWaveform(
     }
     // Home frames prefer full redraws for general changes, while clock/timer
     // schedules deliberately use a small regional refresh.
-    if (schedule == RefreshSchedule::kClock || schedule == RefreshSchedule::kTimer) {
+    if (schedule == RefreshSchedule::kClock || schedule == RefreshSchedule::kTimer ||
+        schedule == RefreshSchedule::kNavigation) {
         return wqn::display::WaveformRequirement::kPartial;
     }
     if (frame.prefer_full_refresh) {

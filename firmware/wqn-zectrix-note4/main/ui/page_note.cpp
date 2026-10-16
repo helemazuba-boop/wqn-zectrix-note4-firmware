@@ -289,11 +289,12 @@ esp_err_t RenderNoteToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
         // being reported. Re-running four waveform passes for every progress
         // bucket would flash the panel and waste minutes of battery; keep the
         // previous physical image until the variant is complete.
-        if (!note.note_image_ready) {
+        if (!note.note_image_ready && !frame.navigation.visible &&
+            !g_last_rendered_navigation_visible) {
             return ESP_OK;
         }
-        return wqn::RefreshEpdGray16(
-            note.note_image_wqni->data() + wqn::kNoteImageHeaderBytes,
+        return RefreshNavigationGrayImage(
+            frame, note.note_image_wqni->data() + wqn::kNoteImageHeaderBytes,
             wqn::kNoteImageGray4PayloadBytes);
     }
     if (note.mode == wqn::NoteAppMode::kNoteImageView && !note.note_image_error &&

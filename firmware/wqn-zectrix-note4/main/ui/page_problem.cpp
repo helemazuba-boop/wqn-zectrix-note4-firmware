@@ -249,8 +249,8 @@ esp_err_t RenderProblemBrowseToEpd(const wqn::UiFrame& frame, RefreshSchedule sc
         problem.image_wqni->data()[5] == 2 &&
         problem.image_wqni->size() ==
             wqn::kNoteImageHeaderBytes + wqn::kNoteImageGray4PayloadBytes) {
-        return wqn::RefreshEpdGray16(
-            problem.image_wqni->data() + wqn::kNoteImageHeaderBytes,
+        return RefreshNavigationGrayImage(
+            frame, problem.image_wqni->data() + wqn::kNoteImageHeaderBytes,
             wqn::kNoteImageGray4PayloadBytes);
     }
     if (problem.mode == wqn::ProblemAppMode::kProblemView &&

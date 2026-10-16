@@ -27,6 +27,8 @@ bool IsEpdFramebufferSynchronized();
 // private to the service; clients receive drawing operations, not a pointer.
 void ClearEpdFramebuffer(bool white = true);
 void DrawEpdPixel(int x, int y, bool black);
+// CPU framebuffer readback for owner-task composition; no panel I/O.
+bool ReadEpdPixel(int x, int y);
 // Copies a full pre-rendered 1bpp frame (kEpdFramebufferSize bytes, same
 // row-major/MSB-first/1=white layout as the framebuffer) in one memcpy.
 // Server-rendered note images (WQNI payloads) display through this.

@@ -62,6 +62,7 @@ enum class RefreshSchedule {
     kCoalesced,
     kCommit,
     kImmediate,
+    kNavigation,
 };
 
 int RefreshRank(RefreshSchedule schedule);
@@ -560,6 +561,10 @@ void OpenSettingsDialog(wqn::UiState* state, wqn::SettingsDialog dialog);
 
 // ---- Render -----------------------------------------------------------------
 
+// Read/written only by the EPD owner, never retained across sleep.
+extern bool g_last_rendered_navigation_visible;
+esp_err_t DrawNavigationOverlay(const wqn::UiFrame& frame);
+esp_err_t RefreshNavigationGrayImage(const wqn::UiFrame& frame, const uint8_t* gray4, size_t size);
 esp_err_t RenderFrameToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule);
 wqn::display::DisplaySubmission RequestEpdUiRefresh(
     const wqn::UiFrame& frame,
@@ -606,7 +611,7 @@ void DrawDashedRect(int x, int y, int width, int height);
 void DrawRoundedRect(int x, int y, int width, int height, int radius);
 // [rowfill] Filled rounded rect: the density-list row selection block and the
 // rounded reverse-fill action block (SelectionStyle::kRowFill / kInvert).
-void FillRoundedRect(int x, int y, int width, int height, int radius);
+void FillRoundedRect(int x, int y, int width, int height, int radius, bool black = true);
 void FillRect(int x, int y, int width, int height, bool black);
 void ClearRect(const UiRect& rect);
 // [L3-semantics] Named black-fill wrappers (defined in graphics.cpp). L2 migrates call sites.

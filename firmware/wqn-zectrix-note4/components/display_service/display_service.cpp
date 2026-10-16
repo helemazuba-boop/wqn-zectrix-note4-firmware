@@ -1331,6 +1331,13 @@ void BlitEpdFramebuffer(const uint8_t* bitmap, size_t size)
     std::memcpy(g_framebuffer, bitmap, kEpdFramebufferSize);
 }
 
+bool ReadEpdPixel(int x, int y)
+{
+    if (g_framebuffer == nullptr || x < 0 || x >= kEpdWidth || y < 0 || y >= kEpdHeight) return false;
+    const size_t index = static_cast<size_t>(y) * kEpdBytesPerRow + static_cast<size_t>(x / 8);
+    return (g_framebuffer[index] & (0x80U >> (x & 7))) == 0;
+}
+
 void DrawEpdPixel(int x, int y, bool black)
 {
     if (g_framebuffer == nullptr || x < 0 || x >= kEpdWidth || y < 0 || y >= kEpdHeight) {
