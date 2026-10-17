@@ -10,7 +10,7 @@
 </head>
 <body><main class="card">
   <h1>WQN Note4</h1>
-  <p class="sub">编辑主网络，或添加一个断网时自动切换的备用网络</p>
+  <p class="sub">分别保存主网络和备用网络，完成后再连接</p>
 
   <div class="roles" aria-label="WiFi 槽位">
     <button class="role active" id="primary-role" type="button">
@@ -34,7 +34,7 @@
     </label>
 
     <div class="actions">
-      <button id="submit" type="submit">保存主 WiFi 并连接</button>
+      <button id="submit" type="submit">保存主 WiFi</button>
       <button class="secondary" id="finish" type="button" hidden>完成，连接主 WiFi</button>
     </div>
     <div class="msg" id="msg"></div>
@@ -45,15 +45,19 @@ const byId=id=>document.getElementById(id);
 const ssid=byId('ssid'),password=byId('password'),msg=byId('msg'),submit=byId('submit');
 const keepRow=byId('keep-row'),keepPassword=byId('keep-password'),finish=byId('finish');
 const roleButtons={primary:byId('primary-role'),backup:byId('backup-role')};
-let role='primary',networks={primary_ssid:'',backup_ssid:''},aps=[];
+let role='primary',networks={primary_ssid:'',backup_ssid:''},aps=[],drafts={},ready=false,busy=false;
 
 function show(text,kind=''){msg.textContent=text;msg.className='msg '+kind}
 function savedSsid(target=role){return networks[target+'_ssid']||''}
 function renderRoles(){
   byId('primary-label').textContent=networks.primary_ssid||'未设置';
   byId('backup-label').textContent=networks.backup_ssid||'未设置';
-  roleButtons.backup.disabled=!networks.primary_ssid;
+  roleButtons.primary.disabled=!ready||busy;
+  roleButtons.backup.disabled=!ready||busy||!networks.primary_ssid;
   finish.hidden=!networks.primary_ssid;
+  finish.disabled=!ready||busy;
+  submit.disabled=!ready||busy;
+  ssid.disabled=!ready||busy;
 }
 function renderScan(){
   const list=byId('wifi-list');list.innerHTML='';
@@ -66,28 +70,42 @@ function renderScan(){
 function updatePasswordMode(reset=false){
   const canKeep=Boolean(savedSsid())&&ssid.value===savedSsid();
   keepRow.hidden=!canKeep;
-  keepPassword.disabled=!canKeep;
+  keepPassword.disabled=!canKeep||busy||!ready;
   if(reset)keepPassword.checked=canKeep;
   if(!canKeep)keepPassword.checked=false;
-  password.disabled=canKeep&&keepPassword.checked;
+  password.disabled=!ready||busy||(canKeep&&keepPassword.checked);
   password.placeholder=canKeep?'输入新密码，或选择保留当前密码':'开放网络留空';
-  if(password.disabled)password.value='';
+  if(canKeep&&keepPassword.checked)password.value='';
+}
+function rememberDraft(){
+  if(ready)drafts[role]={ssid:ssid.value,password:password.value,keep:keepPassword.checked};
+}
+function defaultDraft(target){return {ssid:savedSsid(target),password:'',keep:Boolean(savedSsid(target))}}
+function dirty(target){
+  const d=drafts[target];
+  return d&&(d.ssid!==savedSsid(target)||(Boolean(savedSsid(target))&&!d.keep)||Boolean(d.password));
 }
 function chooseRole(next){
+  if(!ready||busy)return;
   if(next==='backup'&&!networks.primary_ssid){show('请先设置主 WiFi','error');return}
+  rememberDraft();
   role=next;
   for(const name of Object.keys(roleButtons))roleButtons[name].classList.toggle('active',name===role);
-  ssid.value=savedSsid();password.value='';
-  submit.textContent=role==='primary'?'保存主 WiFi 并连接':'保存备用 WiFi';
-  updatePasswordMode(true);show('');
+  const draft=drafts[role]||defaultDraft(role);
+  ssid.value=draft.ssid;password.value=draft.password;keepPassword.checked=draft.keep;
+  submit.textContent=role==='primary'?'保存主 WiFi':'保存备用 WiFi';
+  updatePasswordMode();show('');
 }
 async function loadNetworks(){
   try{
     const r=await fetch('/networks',{cache:'no-store'}),d=await r.json();
     if(!r.ok)throw new Error();
     networks={primary_ssid:d.primary_ssid||'',backup_ssid:d.backup_ssid||''};
-    renderRoles();renderScan();chooseRole(role==='backup'&&networks.primary_ssid?'backup':'primary');
-  }catch(e){show('读取已保存网络失败','error')}
+    drafts={primary:defaultDraft('primary'),backup:defaultDraft('backup')};
+    ready=true;
+    ssid.value=drafts.primary.ssid;keepPassword.checked=drafts.primary.keep;
+    renderRoles();renderScan();chooseRole('primary');
+  }catch(e){show('读取已保存网络失败，请刷新页面重试','error')}
 }
 async function scan(){
   try{
@@ -99,25 +117,35 @@ async function scan(){
 
 roleButtons.primary.addEventListener('click',()=>chooseRole('primary'));
 roleButtons.backup.addEventListener('click',()=>chooseRole('backup'));
-ssid.addEventListener('input',()=>updatePasswordMode(false));
-keepPassword.addEventListener('change',()=>updatePasswordMode(false));
-finish.addEventListener('click',()=>{location.href='/done.html'});
+ssid.addEventListener('input',()=>{updatePasswordMode(false);rememberDraft()});
+password.addEventListener('input',rememberDraft);
+keepPassword.addEventListener('change',()=>{updatePasswordMode(false);rememberDraft()});
+finish.addEventListener('click',()=>{
+  if(!ready||busy)return;
+  rememberDraft();
+  if(dirty('primary')||dirty('backup')){show('还有未保存的修改，请先保存对应网络','error');return}
+  location.href='/done.html';
+});
 byId('form').addEventListener('submit',async event=>{
-  event.preventDefault();const name=ssid.value;
+  event.preventDefault();if(!ready||busy)return;
+  const submittedRole=role,name=ssid.value;
   if(!name){show('请选择或输入 WiFi 名称','error');return}
-  if(name.length>32){show('WiFi 名称不能超过 32 个字符','error');return}
+  if(new TextEncoder().encode(name).length>32){show('WiFi 名称不能超过 32 字节','error');return}
   const other=role==='primary'?networks.backup_ssid:networks.primary_ssid;
   if(other&&name===other){show('主 WiFi 与备用 WiFi 不能相同','error');return}
-  submit.disabled=true;show('正在保存…');
+  const keep_password=!keepPassword.disabled&&keepPassword.checked;
+  const submittedPassword=password.value;
+  rememberDraft();busy=true;renderRoles();updatePasswordMode();show('正在保存…');
   try{
-    const keep_password=!keepPassword.disabled&&keepPassword.checked;
-    const r=await fetch('/submit',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({role,ssid:name,password:password.value,keep_password})});
+    const r=await fetch('/submit',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({role:submittedRole,ssid:name,password:submittedPassword,keep_password})});
     const d=await r.json();if(!r.ok||!d.success)throw new Error(d.error||'保存失败');
-    networks[role+'_ssid']=name;renderRoles();renderScan();updatePasswordMode(true);
-    if(d.connect){show('主 WiFi 已保存，设备即将连接','ok');setTimeout(()=>location.href='/done.html',300);return}
-    show('备用 WiFi 已保存，不会改变当前主网络','ok');submit.disabled=false;
-  }catch(e){show(e.message||'保存失败','error');submit.disabled=false}
+    networks[submittedRole+'_ssid']=name;drafts[submittedRole]=defaultDraft(submittedRole);
+    password.value='';keepPassword.checked=true;
+    renderScan();
+    show(submittedRole==='primary'?'主 WiFi 已保存，可继续设置备用 WiFi，或点击完成':'备用 WiFi 已保存，点击完成后连接','ok');
+  }catch(e){show(e.message||'保存失败','error')}
+  finally{busy=false;renderRoles();updatePasswordMode()}
 });
 
-loadNetworks();scan();setInterval(scan,5000);
+renderRoles();updatePasswordMode();loadNetworks();scan();setInterval(scan,5000);
 </script></body></html>

@@ -428,6 +428,11 @@ void ScheduleBackoff(
 esp_err_t EnsureServiceStarted();
 void ReleaseDemand(uint32_t id);
 
+bool HasPendingUserConnection()
+{
+    return wqn::GetProvisioningState() == wqn::ProvisionState::kConnecting;
+}
+
 // [wifi-redundancy] Publishes the active/backup SSID identity for snapshots.
 // Runs on ConnectivityTask; the copy is short and under a spinlock so a reader
 // on the other core (UI snapshot) never sees a torn string.
@@ -583,7 +588,9 @@ void ProvisionDone(const std::string& ssid, const std::string& password)
     command.type = CommandType::kProvisioned;
     CopyCredential(command.ssid, sizeof(command.ssid), ssid.c_str());
     CopyCredential(command.password, sizeof(command.password), password.c_str());
-    PostAsyncCommand(command);
+    if (!PostAsyncCommand(command)) {
+        wqn::ReportProvisioningConnectionResult(false);
+    }
 }
 #endif
 
@@ -635,6 +642,7 @@ esp_err_t BeginConnectionAttempt()
 
 void ScheduleBackoff(wqn::services::ConnectivityWaitResult failure)
 {
+    wqn::ReportProvisioningConnectionResult(false);
     PublishFailure(failure);
     SetOnline(false);
     g_attempt_active = false;
@@ -734,6 +742,13 @@ esp_err_t BeginProvisioning()
     g_attempt_active = false;
     ClearScheduledAction();
     SetState(wqn::services::ConnectivityState::kProvisioning);
+    // Stop the previous STA before APSTA starts so old association/IP events
+    // cannot race the provisioning owner's scans and handoff.
+    const esp_err_t stop_result = wqn::StopWifiStationRadio();
+    if (stop_result != ESP_OK) {
+        SetState(wqn::services::ConnectivityState::kOff);
+        return stop_result;
+    }
     const esp_err_t result = wqn::StartProvisioningMode();
     if (result != ESP_OK) {
         SetState(wqn::services::ConnectivityState::kOff);
@@ -884,6 +899,9 @@ void HandleDemandPolicyChanged()
     const wqn::services::ConnectivityState state =
         g_state.load(std::memory_order_acquire);
     if (current.count == 0) {
+        if (HasPendingUserConnection()) {
+            return;  // The bounded provisioning handoff owns its connect lease.
+        }
         if (state == wqn::services::ConnectivityState::kOnline) {
             SetState(wqn::services::ConnectivityState::kOnlineIdleTail);
             ScheduleAction(
@@ -965,6 +983,7 @@ esp_err_t StartWithCredentials(const ConnectivityCommand& command)
     // A credential change is an explicit user action: restart the backoff
     // ladder from rung 0 and lift any auto-retry suspension.
     ResetBackoffEscalation();
+    SetOnline(false);
 
     // [wifi-redundancy] Persist first (dedup by SSID, the new credential becomes
     // preferred), then connect from the refreshed store. If the upsert fails we
@@ -1129,7 +1148,10 @@ esp_err_t HandleCommand(const ConnectivityCommand& command)
             return ESP_OK;
         case CommandType::kWifiGotIp:
             if (state == wqn::services::ConnectivityState::kQuiescing ||
-                state == wqn::services::ConnectivityState::kBackoff) {
+                state == wqn::services::ConnectivityState::kBackoff ||
+                state == wqn::services::ConnectivityState::kProvisioning ||
+                state == wqn::services::ConnectivityState::kOff ||
+                !wqn::IsWifiStationConnected()) {
                 return ESP_OK;
             }
             g_attempt_active = false;
@@ -1145,18 +1167,9 @@ esp_err_t HandleCommand(const ConnectivityCommand& command)
             } else {
                 SetState(wqn::services::ConnectivityState::kOnline);
             }
-            // [wifi-redundancy] The slot that just connected becomes the next
-            // cycle's first try; the NVS write is skipped when unchanged.
-            if (g_cred_store.count > 0 && g_active_slot < g_cred_store.count) {
-                const esp_err_t preferred_result =
-                    wqn::MarkWifiSlotPreferred(g_active_slot);
-                if (preferred_result != ESP_OK) {
-                    ESP_LOGW(
-                        kTag,
-                        "mark WiFi slot preferred failed: %s",
-                        esp_err_to_name(preferred_result));
-                }
-            }
+            // [wifi-roles] Association changes the active link, never the
+            // configured primary/backup identities or their durable priority.
+            wqn::ReportProvisioningConnectionResult(true);
             // Connectivity is readiness, not a synchronization intent. The
             // sync scheduler wakes and runs only if a manual/periodic/retry/
             // outbox reason is already pending; reconnecting by itself must
@@ -1171,7 +1184,8 @@ esp_err_t HandleCommand(const ConnectivityCommand& command)
                 state == wqn::services::ConnectivityState::kOff) {
                 return ESP_OK;
             }
-            if (g_demand_count.load(std::memory_order_acquire) == 0) {
+            if (g_demand_count.load(std::memory_order_acquire) == 0 &&
+                !HasPendingUserConnection()) {
                 return StopRadioAndSetOff("disconnect-no-demand");
             }
             ESP_LOGW(

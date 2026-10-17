@@ -240,7 +240,7 @@ int main(int argc,char** argv) {
         f.settings.word_deck_status=status;RenderSettingsToEpd(f,RefreshSchedule::kConfig);save_frame(directory,"deck-state-"+std::to_string(static_cast<int>(status)));
     }
     f.settings.word_deck_status=wqn::SettingsDeckStatus::kReady;
-    f.settings.dialog=Dialog::kProvisioningResult;f.provisioning_phase=wqn::ProvisionState::kFailed;RenderSettingsToEpd(f,RefreshSchedule::kConfig);CHECK(has_text("配网未完成"));save_frame(directory,"provision-failed");f.provisioning_phase=wqn::ProvisionState::kConnected;RenderSettingsToEpd(f,RefreshSchedule::kConfig);CHECK(has_text("配置已保存"));f.provisioning_phase=wqn::ProvisionState::kIdle;
+    f.settings.dialog=Dialog::kProvisioningResult;f.provisioning_phase=wqn::ProvisionState::kFailed;RenderSettingsToEpd(f,RefreshSchedule::kConfig);CHECK(has_text("配网未完成"));save_frame(directory,"provision-failed");f.provisioning_phase=wqn::ProvisionState::kConnecting;RenderSettingsToEpd(f,RefreshSchedule::kConfig);CHECK(has_text("正在连接 WiFi")&&!has_text("WiFi 已连接"));f.provisioning_phase=wqn::ProvisionState::kConnected;RenderSettingsToEpd(f,RefreshSchedule::kConfig);CHECK(has_text("WiFi 已连接"));f.provisioning_phase=wqn::ProvisionState::kIdle;
     f.settings.dialog=Dialog::kAbout;RenderSettingsToEpd(f,RefreshSchedule::kConfig);
     CHECK(has_text("rongNoteBook")&&has_text("v0.1.0-live")&&has_text("ESP-IDF v5.5.4"));
     CHECK(std::all_of(pixels.begin()+274*400,pixels.end(),[](auto p){return p==0;}));

@@ -230,6 +230,15 @@ void WifiEventHandler(void*, esp_event_base_t event_base, int32_t event_id, void
             return;
         }
 
+        wifi_ap_record_t current_ap = {};
+        if (!g_wifi_associated.load(std::memory_order_acquire) ||
+            esp_wifi_sta_get_ap_info(&current_ap) != ESP_OK ||
+            !MatchesConfiguredSsid(current_ap.ssid, static_cast<uint8_t>(
+                strnlen(reinterpret_cast<const char*>(current_ap.ssid), sizeof(current_ap.ssid))))) {
+            ESP_LOGI(kTag, "ignore stale IP event without current association");
+            return;
+        }
+
         ESP_LOGI(
             kTag,
             "WiFi got IP: ip=" IPSTR " netmask=" IPSTR " gateway=" IPSTR,
@@ -272,6 +281,11 @@ esp_err_t StartWifiWithCredentials(const char* ssid, const char* password)
     }
     if (ssid == nullptr || ssid[0] == '\0') {
         ESP_LOGW(kTag, "cannot start WiFi: empty SSID");
+        return ESP_ERR_INVALID_ARG;
+    }
+    const size_t ssid_length = strnlen(ssid, 33);
+    const size_t password_length = password == nullptr ? 0 : strnlen(password, 65);
+    if (ssid_length > 32 || password_length > 64) {
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -322,8 +336,11 @@ esp_err_t StartWifiWithCredentials(const char* ssid, const char* password)
             ESP_RETURN_ON_ERROR(init_ret, kTag, "init WiFi");
         }
         ESP_RETURN_ON_ERROR(RegisterHandlers(), kTag, "register WiFi handlers");
-        ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_STA), kTag, "set WiFi STA mode");
     }
+
+    // [prov-handoff] A reused driver may still be in APSTA mode after portal
+    // teardown. Restore STA on every handoff, including re-provisioning.
+    ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_STA), kTag, "set WiFi STA mode");
 
     if (g_wifi_event_group == nullptr) {
         g_wifi_event_group = xEventGroupCreate();
@@ -333,9 +350,9 @@ esp_err_t StartWifiWithCredentials(const char* ssid, const char* password)
     }
 
     wifi_config_t wifi_config = {};
-    std::strncpy(reinterpret_cast<char*>(wifi_config.sta.ssid), ssid, sizeof(wifi_config.sta.ssid) - 1);
+    std::memcpy(wifi_config.sta.ssid, ssid, ssid_length);
     if (password != nullptr && password[0] != '\0') {
-        std::strncpy(reinterpret_cast<char*>(wifi_config.sta.password), password, sizeof(wifi_config.sta.password) - 1);
+        std::memcpy(wifi_config.sta.password, password, password_length);
     }
     wifi_config.sta.threshold.authmode =
         (password == nullptr || password[0] == '\0') ? WIFI_AUTH_OPEN : WIFI_AUTH_WPA2_PSK;

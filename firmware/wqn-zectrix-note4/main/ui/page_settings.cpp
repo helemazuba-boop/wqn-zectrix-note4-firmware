@@ -287,7 +287,9 @@ void DrawSettingsDetail(const wqn::UiFrame& frame)
             SettingsHeading(frame, "设置 / 网络", "手机配网", "使用手机完成网络配置");
             if (frame.provisioning_phase == wqn::ProvisionState::kFailed)
                 SettingsEmpty("配网未完成", "确认重试，或长按返回 WiFi 管理。");
-            else SettingsEmpty("配置已保存", "确认返回 WiFi 管理。");
+            else if (frame.provisioning_phase == wqn::ProvisionState::kConnecting)
+                SettingsEmpty("正在连接 WiFi", "配置已保存，正在尝试主网络和备用网络。");
+            else SettingsEmpty("WiFi 已连接", "确认返回 WiFi 管理。");
             break;
         case Dialog::kAbout:
             SettingsText(kSettingsDetailX, kSettingsHeaderTextBaseline, "关于设备", 16); DrawStatusBarIcons(kSettingsRight, kStatusBarIconY, frame.home); DrawHorizontalLine(0, kSettingsHeaderDividerY, kScreenWidth);
@@ -394,7 +396,9 @@ esp_err_t RenderProvisioningToEpd(const wqn::UiFrame& frame, RefreshSchedule sch
     else if (frame.provisioning_phase == wqn::ProvisionState::kFailed)
         SettingsEmpty("热点未能启动", "确认重试，检查网络配置。");
     else if (frame.provisioning_phase == wqn::ProvisionState::kConnected)
-        SettingsEmpty("配置已保存", "正在连接网络，请稍候。");
+        SettingsEmpty("WiFi 已连接", "确认返回 WiFi 管理。");
+    else if (frame.provisioning_phase == wqn::ProvisionState::kConnecting)
+        SettingsEmpty("正在连接 WiFi", "配置已保存，正在尝试连接网络。");
     else {
         SettingsText(kSettingsDetailX, 126, "1  连接设备热点"); SettingsText(kSettingsDetailX + 22, 153, frame.provisioning_ssid, 16, 330); SettingsLine(166);
         SettingsText(kSettingsDetailX, 190, "2  打开浏览器地址"); SettingsText(kSettingsDetailX + 22, 216, "192.168.4.1", 16, 330);

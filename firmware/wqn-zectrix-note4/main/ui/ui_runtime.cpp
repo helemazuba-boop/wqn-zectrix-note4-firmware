@@ -1328,7 +1328,8 @@ UiUpdate UiRuntime::DispatchSettingsTick(int64_t now_ms)
         settings_provision_active_ = active;
         settings_provision_ssid_ = ssid;
         if (state_.screen == wqn::UiScreen::kSettings &&
-            (phase == wqn::ProvisionState::kFailed || phase == wqn::ProvisionState::kConnected)) {
+            (phase == wqn::ProvisionState::kFailed || phase == wqn::ProvisionState::kConnected ||
+             (phase == wqn::ProvisionState::kConnecting && !active))) {
             settings.dialog = wqn::SettingsDialog::kProvisioningResult;
             settings.notice.clear();
         }

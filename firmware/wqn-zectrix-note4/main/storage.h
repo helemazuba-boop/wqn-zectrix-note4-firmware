@@ -235,7 +235,9 @@ esp_err_t LoadWifiCredentials(std::string* ssid, std::string* password);
 
 // [wifi-redundancy] Dual-slot WiFi credential store. The store is a versioned
 // NVS blob holding up to two (ssid, password) slots plus a `preferred` index
-// pointing at the last slot that connected successfully. Persistence is a
+// pointing at the configured primary network. Automatic failover never changes
+// this identity. Existing blobs retain their current preferred slot as primary;
+// the layout and version are unchanged. Persistence is a
 // single atomic blob commit (the legacy per-key wifi_ssid/wifi_pass pair could
 // tear across power loss). Load is a pure read; MigrateLegacyWifiCredentialsIfNeeded
 // performs the legacy-key migration explicitly.
@@ -245,7 +247,7 @@ struct WifiCredentialSlot {
 };
 struct WifiCredentialStore {
     uint8_t version = 0;    // kWifiCredentialStoreVersion when valid
-    uint8_t preferred = 0;  // index of last successfully-connected slot
+    uint8_t preferred = 0;  // index of the configured primary slot
     uint8_t count = 0;      // 0..2 occupied slots
     WifiCredentialSlot slots[2] = {};
 };
@@ -298,7 +300,7 @@ esp_err_t SetWifiCredentialForRole(
     const std::string& ssid,
     const std::string& password,
     bool keep_existing_password);
-// Marks `index` as the preferred (last-good) slot. Writes only when the value
+// Explicitly makes `index` the configured primary slot. Writes only when the value
 // actually changes, to bound NVS wear.
 esp_err_t MarkWifiSlotPreferred(uint8_t index);
 

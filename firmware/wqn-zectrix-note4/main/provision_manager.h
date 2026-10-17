@@ -29,5 +29,8 @@ bool IsProvisioningActive();
 std::string GetProvisioningApSsid();
 const char* ProvisionStateLabel(ProvisionState state);
 void SetProvisionDoneCallback(ProvisionDoneCallback callback);
+// Connectivity owner reports the terminal STA result after the portal closes.
+// A saved credential alone is not a successful connection.
+void ReportProvisioningConnectionResult(bool connected);
 
 }
