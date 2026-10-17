@@ -30,7 +30,7 @@
 
 ## 原生字库
 
-`main/ui/ui_fonts.c` 是离线生成、未压缩 1bpp 数据；不引入 LVGL widget/runtime 字体引擎。常规 16px 继续用已有通用字库的原生 glyph；设置页不调用字号缩放函数。20px 离线字模补齐设置列表 / 单选项，12px 仅用于必要辅助信息。
+`main/ui/ui_fonts.c` 是离线生成、未压缩 1bpp 数据；不引入 LVGL widget/runtime 字体引擎。常规 16px 继续用已有通用字库的原生 glyph；设置页与主页均不调用字号缩放函数。20px 离线字模补齐设置列表 / 单选项及主页学习标题，12px 仅用于必要辅助信息。
 
 | 资源 | 覆盖 | 纯位图字节 |
 | --- | --- | ---: |
@@ -41,7 +41,7 @@
 | Noto Sans Bold 32px | 95 个 ASCII，型号与配对码 | 3903 |
 | Noto Sans Bold 48px | 95 个 ASCII，电量数字 | 8737 |
 
-纯位图共 883370 B，另有字形描述符与映射表；最终 Flash 以链接产物为准。W 图形由本地 SVG 的相同八条浏览器路径生成 28px 掩码，不依赖在线资源。源字体已在工作区存在，本轮未下载新字体，Medium 仍是未来字重对照候选。12 / 20 / 24px 字库已为主页迁移准备；主页的原生字号与上移布局单独提交。动态音标和单词页迁移仍为待办；随固件提交的资源清单见 [UI_FONT_RESOURCES.md](UI_FONT_RESOURCES.md)。
+纯位图共 883370 B，另有字形描述符与映射表；最终 Flash 以链接产物为准。W 图形由本地 SVG 的相同八条浏览器路径生成 28px 掩码，不依赖在线资源。源字体已在工作区存在，本轮未下载新字体，Medium 仍是未来字重对照候选。12 / 20 / 24px 字库同时被主页使用；主页日期 / 动作说明归并为 16px，取消原来的 14px 缩放，未再用模拟加粗处理标题。动态音标和单词页迁移仍为待办；随固件提交的资源清单见 [UI_FONT_RESOURCES.md](UI_FONT_RESOURCES.md)。
 
 再生成要求 Pillow 11.3.0、fonttools 4.67.0。生成器支持指定源文件，验证 SHA-256，拒绝误用不同字重或版本；源许可证随 `tools/ui/font-licenses` 保留。
 
@@ -57,7 +57,7 @@ python3 scripts/test_ui_settings.py --render-dir /home/unknow/projects/doc/asset
 
 - `scripts/test_ui_settings.py`：Dev 关闭 202、开启 217，共 **419 项断言通过**；覆盖原生字模、与其他页面一致的全宽状态栏、字号 / 边距、动态单行文本、根目录 / 二级滚动、已保存值与焦点、全部详情、未知电量、外部电源与满电、词库状态 / 目录更新、真实输入桥接、取消 / ACK / 失败 / 忙碌、跨页尾随、单 / 双击、重载候选、持久化与危险动作保护。
 - 临时源码变体分别破坏取消、已保存勾选和电量有效性签名，三者均被断言检出。正式源码保持完整，未将故障变体写入仓库。该变体检查属于最初设置重写轮次，记录保留在此前 V1 验证报告中。
-- 快捷菜单 1308、主页 88、display submit 96、栈检查 17、单词 start / cursor / RAM batch 26 / 34 / 32，通过；M8 fixture 实际运行 1 项并通过。
+- 快捷菜单 1308、主页 139、display submit 96、栈检查 17、单词 start / cursor / RAM batch 26 / 34 / 32，通过；M8 fixture 实际运行 1 项并通过。
 - ESP-IDF Dev 开 / 关两配置构建均需零警告、M8 与编译 UI 栈门禁通过；结果、产物大小和 SHA-256 见 `/home/unknow/projects/doc/assets/ui-layout-device-feedback/verification.json`。临时切换配置后恢复原 `sdkconfig`，最终产物为原 Dev 开启配置。
 - `git -c core.whitespace=cr-at-eol diff --check` 干净。构建日志位于 `/tmp/note4-ui-feedback-dev-off-build.log` 与 `/tmp/note4-ui-feedback-dev-on-build.log`。
 

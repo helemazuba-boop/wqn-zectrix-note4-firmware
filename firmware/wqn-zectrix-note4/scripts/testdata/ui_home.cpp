@@ -9,6 +9,7 @@
 #include <vector>
 #include "font_fmt.h"
 #include "font_zectrix.h"
+#include "ui_fonts.h"
 #include "ui/home_model.h"
 #include "ui/navigation_model.h"
 #include "ai_feature.h"
@@ -290,14 +291,24 @@ int main(int argc,char** argv) {
         for(size_t focus=0;focus<2;++focus) {
             frame.selected_home_task=focus;
             CHECK(RenderHomeToEpd(frame,RefreshSchedule::kSelection)==ESP_OK);
-            CHECK(pixels[124*400+7]==(focus==0));
-            CHECK(pixels[232*400+7]==(focus==1));
+            CHECK(pixels[114*400+7]==(focus==0));
+            CHECK(pixels[222*400+7]==(focus==1));
+            CHECK(std::all_of(pixels.begin()+27*400, pixels.begin()+28*400, [](auto p){return p==1;}));
+            const auto full=pixels;
+            CHECK(RenderHomePrimaryRegion(frame.home,RefreshSchedule::kClock)==ESP_OK);
+            CHECK(full==pixels); // Clock updates must not erase the raised Agent section.
+            CHECK(RenderHomeStatusBarRegion(frame.home,RefreshSchedule::kClock)==ESP_OK);
+            CHECK(full==pixels);
             if(argc>1) Save(std::string(argv[1])+"/home-"+std::to_string(static_cast<int>(status))+"-"+std::to_string(focus)+".pbm");
         }
     }
     frame.home.ai.title=std::string(2000,'W')+"中文长标题";
     CHECK(RenderHomeToEpd(frame,RefreshSchedule::kSelection)==ESP_OK);
     CHECK(pixels[151*400+399]==0); // Sized text remains inside the content bounds.
+    frame.home.ai.title="第一行 第二行";
+    RenderHomeToEpd(frame,RefreshSchedule::kSelection); const auto single_line=pixels;
+    frame.home.ai.title="第一行\n第二行";
+    RenderHomeToEpd(frame,RefreshSchedule::kSelection); CHECK(single_line==pixels);
     const auto before=pixels;
     wqn::DrawTextWithFontSized(1,1,1,nullptr,"x",24,false,true);
     CHECK(before==pixels);

@@ -99,7 +99,8 @@ constexpr std::size_t kVolumeOptionsCount = sizeof(kVolumeOptions) / sizeof(kVol
 
 // kStatusBarRect removed: dead constant (height 30 was never referenced).
 // Use kStatusBarHeight / kStatusBarDividerY in ui_layout.h instead.
-constexpr UiRect kHomePrimaryRect = {0, 32, wqn::kEpdWidth, 82, "home-clock-and-date"};
+constexpr UiRect kHomePrimaryRect = {0, kStatusBarHeight, wqn::kEpdWidth,
+                                   kHomeAiDividerY + 2 - kStatusBarHeight, "home-clock-and-date"};
 constexpr UiRect kTimeStandbyRect = {0, 42, wqn::kEpdWidth, 172, "time-standby"};
 constexpr UiRect kTimerRunRect = {0, 32, wqn::kEpdWidth, 268, "timer-run"};
 constexpr UiRect kCountdownConfigRect = {0, 70, wqn::kEpdWidth, 205, "countdown-config"};

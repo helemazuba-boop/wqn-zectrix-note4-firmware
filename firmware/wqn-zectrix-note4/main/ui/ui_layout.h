@@ -18,7 +18,7 @@ constexpr int kScreenHeight = wqn::kEpdHeight;  // 300
 
 // ---- Status bar ----
 // Replaces the dead kStatusBarRect={0,0,400,30} (height 30 was never used).
-// Settings uses the same full-width divider as Todo and AI.
+// Home and Settings use the same full-width divider as Todo and AI.
 constexpr int kStatusBarHeight = 28;            // visual height of the top status band
 constexpr int kStatusBarDividerY = 27;          // y of the separator line under the status bar
 constexpr int kStatusBarTitleX = 10;            // left x of the status bar title (= kMarginX)
@@ -46,16 +46,16 @@ constexpr int kGutterRow = 8;                   // 列表行垂直间距
 // ---- Home, reference A: ink on paper ----
 constexpr int kHomeLeft = 16;
 constexpr int kHomeWidth = 368;
-constexpr int kHomeClockY = 50;
+constexpr int kHomeClockY = 40;
 constexpr int kHomeDateX = 280;
-constexpr int kHomeAiCaptionY = 122;
-constexpr int kHomeAiTitleY = 151;
-constexpr int kHomeAiActionY = 194;
-constexpr int kHomeStudyCaptionY = 230;
-constexpr int kHomeStudyTitleY = 250;
-constexpr int kHomeFooterY = 284;
-constexpr int kHomeAiDividerY = 112;
-constexpr int kHomeStudyDividerY = 220;
+constexpr int kHomeAiCaptionY = 112;
+constexpr int kHomeAiTitleY = 141;
+constexpr int kHomeAiActionY = 184;
+constexpr int kHomeStudyCaptionY = 220;
+constexpr int kHomeStudyTitleY = 240;
+constexpr int kHomeFooterY = 276;
+constexpr int kHomeAiDividerY = 102;
+constexpr int kHomeStudyDividerY = 210;
 
 // ---- Settings: approved B layout, native type, no persistent help footer ----
 constexpr int kSettingsListX = kMarginX;
