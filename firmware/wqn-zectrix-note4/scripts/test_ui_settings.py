@@ -40,6 +40,7 @@ def main():
     model_cpp = (root/'main/ui_model.cpp').read_text()
     fixture = (root/'scripts/testdata/ui_settings.cpp').read_text()
     parts = {
+        '@@WIFI_API@@': section((root/'main/services/connectivity_service.h').read_text(), 'enum class WifiNetworkRole', 'class ConnectivityDemand'),
         '@@MODEL@@': section(model, '// Settings-page row count', 'struct UiRuntimeStatus'),
         '@@FONT_LOOKUP@@': section(display, 'const lv_font_fmt_txt_glyph_dsc_t* FindGlyphInFont(', 'int MeasureCodepointWidth('),
         '@@FONT_DRAW@@': section(display, 'void DrawGlyphFromFont(', 'void DrawGlyphFromFontScaled('),

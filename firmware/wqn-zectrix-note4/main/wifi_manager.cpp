@@ -27,6 +27,7 @@ constexpr char kTag[] = "wqn_wifi";
 constexpr EventBits_t kWifiConnectedBit = BIT0;
 
 std::atomic<bool> g_initialized{false};
+std::atomic<uint32_t> g_station_generation{0};
 std::atomic<bool> g_wifi_associated{false};
 std::atomic<bool> g_wifi_connected{false};
 // A credential switch deliberately leaves the current AP. Suppress only the
@@ -110,12 +111,12 @@ const char* DisconnectReasonName(uint8_t reason)
     }
 }
 
-void PublishStationEvent(wqn::WifiStationEvent event, int reason = 0, int rssi = 0)
+void PublishStationEvent(wqn::WifiStationEvent event, uint32_t generation, int reason = 0, int rssi = 0)
 {
     const wqn::WifiStationEventSink sink =
         g_event_sink.load(std::memory_order_acquire);
     if (sink != nullptr) {
-        sink(event, reason, rssi);
+        sink(event, reason, rssi, generation);
     }
 }
 
@@ -168,9 +169,10 @@ void StartSntpOnce()
 
 void WifiEventHandler(void*, esp_event_base_t event_base, int32_t event_id, void* event_data)
 {
+    const uint32_t generation = g_station_generation.load(std::memory_order_acquire);
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         ESP_LOGI(kTag, "WiFi station started");
-        PublishStationEvent(wqn::WifiStationEvent::kStarted);
+        PublishStationEvent(wqn::WifiStationEvent::kStarted, generation);
         return;
     }
 
@@ -187,7 +189,7 @@ void WifiEventHandler(void*, esp_event_base_t event_base, int32_t event_id, void
             kTag,
             "WiFi associated: channel=%u",
             event == nullptr ? 0U : static_cast<unsigned>(event->channel));
-        PublishStationEvent(wqn::WifiStationEvent::kAssociated);
+        PublishStationEvent(wqn::WifiStationEvent::kAssociated, generation);
         return;
     }
 
@@ -218,6 +220,7 @@ void WifiEventHandler(void*, esp_event_base_t event_base, int32_t event_id, void
         }
         PublishStationEvent(
             wqn::WifiStationEvent::kDisconnected,
+            generation,
             event ? event->reason : 0,
             event ? event->rssi : 0);
         return;
@@ -250,7 +253,7 @@ void WifiEventHandler(void*, esp_event_base_t event_base, int32_t event_id, void
             xEventGroupSetBits(g_wifi_event_group, kWifiConnectedBit);
         }
         StartSntpOnce();
-        PublishStationEvent(wqn::WifiStationEvent::kGotIp);
+        PublishStationEvent(wqn::WifiStationEvent::kGotIp, generation);
     }
 }
 
@@ -359,6 +362,9 @@ esp_err_t StartWifiWithCredentials(const char* ssid, const char* password)
     wifi_config.sta.sae_pwe_h2e = WPA3_SAE_PWE_BOTH;
 
     ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_STA, &wifi_config), kTag, "set WiFi STA config");
+    // Publish the new generation only after the driver accepts its identity.
+    // A disconnect emitted by the previous configuration retains its old one.
+    g_station_generation.fetch_add(1, std::memory_order_acq_rel);
     const wifi_ps_type_t power_save =
         g_power_save_enabled.load(std::memory_order_acquire)
         ? WIFI_PS_MIN_MODEM : WIFI_PS_NONE;
@@ -586,6 +592,15 @@ bool IsWifiCredentialFailureReason(int reason)
 #else
     (void)reason;
     return false;
+#endif
+}
+
+uint32_t GetWifiStationGeneration()
+{
+#if CONFIG_WQN_WIFI_STA_ENABLE
+    return g_station_generation.load(std::memory_order_acquire);
+#else
+    return 0;
 #endif
 }
 

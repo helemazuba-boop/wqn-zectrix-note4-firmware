@@ -2,9 +2,11 @@
 #include "ui_internal.h"
 #include "ui_fonts.h"
 #include "ui/assets/brand_logo.h"
+#include "services/connectivity_service.h"
 
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <string>
 
 namespace device_ui_internal {
@@ -265,12 +267,20 @@ void DrawSettingsDetail(const wqn::UiFrame& frame)
         }
         case Dialog::kWifiManage: {
             const bool configured = s.wifi_primary_ssid[0] != '\0';
-            SettingsHeading(frame, "设置 / 网络", "WiFi 管理", frame.home.wifi_connected ? "网络已连接" : configured ? "暂未连接网络" : "尚未配置网络");
-            SettingsText(kSettingsDetailX, 125, "主网络", 12); SettingsText(kSettingsDetailX, 149, configured ? s.wifi_primary_ssid : "未配置"); SettingsLine(161);
-            SettingsText(kSettingsDetailX, 181, "备用网络", 12); SettingsText(kSettingsDetailX, 205, s.wifi_backup_ssid[0] ? s.wifi_backup_ssid : "未配置");
+            SettingsHeading(frame, "设置 / 网络", "WiFi 管理", s.wifi_online ? "选择网络可直接切换" : configured ? "暂未连接网络" : "尚未配置网络");
             for (size_t i = 0; i < 2; ++i) {
-                const int y = 224 + static_cast<int>(i) * 37;
+                const int y = 105 + static_cast<int>(i) * 54;
+                const char* ssid = i == 0 ? s.wifi_primary_ssid : s.wifi_backup_ssid;
                 const bool focused = s.wifi_action_selected == i;
+                const bool connected = s.wifi_online && ssid[0] != '\0' && std::strcmp(ssid, s.wifi_active_ssid) == 0;
+                if (focused) FillRect(kSettingsDetailX, y, kSettingsDetailWidth, 49, true); else DrawRect(kSettingsDetailX, y, kSettingsDetailWidth, 49);
+                SettingsText(kSettingsDetailX + 12, y + 17, i == 0 ? "连接主 WiFi" : "连接备用 WiFi", 12, 240, false, !focused);
+                if (connected) SettingsText(kSettingsRight - 12, y + 17, "已连接", 12, 80, true, !focused);
+                SettingsText(kSettingsDetailX + 12, y + 39, ssid[0] ? ssid : "未配置", 16, 328, false, !focused);
+            }
+            for (size_t i = 0; i < 2; ++i) {
+                const int y = 216 + static_cast<int>(i) * 37;
+                const bool focused = s.wifi_action_selected == i + 2;
                 if (focused) FillRect(kSettingsDetailX, y, kSettingsDetailWidth, 30, true); else DrawRect(kSettingsDetailX, y, kSettingsDetailWidth, 30);
                 SettingsText(kSettingsDetailX + 12, y + 22, i == 0 ? (configured ? "重新配网" : "开始配网") : "设备配对", 16, 328, false, !focused);
             }
@@ -454,7 +464,12 @@ void OpenSettingsDialog(wqn::UiState* state, wqn::SettingsDialog dialog)
     state->settings.notice.clear();
     state->settings.sync_confirm_pending = false;
     state->settings.default_word_deck_id = state->word_app.default_deck_id;
-    if (dialog == wqn::SettingsDialog::kWifiManage) state->settings.wifi_action_selected = 0;
+    if (dialog == wqn::SettingsDialog::kWifiManage) {
+        state->settings.wifi_action_selected = 0;
+        const auto network = wqn::services::GetWifiSwitchSnapshot();
+        state->settings.wifi_online = network.online;
+        std::snprintf(state->settings.wifi_active_ssid, sizeof(state->settings.wifi_active_ssid), "%s", network.active_ssid);
+    }
     if (dialog == wqn::SettingsDialog::kAutoSync) {
         // [persist-worker] Preselect an armed-but-unsaved value (submit rejected
         // or write failed) over the durable one so a re-Confirm retries the

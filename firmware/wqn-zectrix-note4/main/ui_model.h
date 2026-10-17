@@ -421,6 +421,9 @@ struct SettingsAppState {
     // UpdateSettingsDiagnostics for the WiFi-manage row/dialog. Empty = not set.
     char wifi_primary_ssid[33] = {};
     char wifi_backup_ssid[33] = {};
+    char wifi_active_ssid[33] = {};
+    bool wifi_online = false;
+    uint32_t wifi_switch_op_id = 0;
     SettingsDiagnosticsSnapshot diagnostics;
 };
 

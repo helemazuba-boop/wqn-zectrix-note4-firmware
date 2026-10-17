@@ -90,6 +90,13 @@ void SetProblemImageRenderMode(ProblemState*,ImageRenderMode) {}
 void SetAiAutoFollow(bool) { ++follows; }
 @@LABELS@@
 namespace services {
+@@WIFI_API@@
+WifiSwitchSnapshot network;
+uint32_t switch_id=91;
+int switches=0;
+WifiNetworkRole last_target=WifiNetworkRole::kPrimary;
+uint32_t RequestWifiNetworkSwitch(WifiNetworkRole role) {++switches;last_target=role;network.operation_id=switch_id;network.state=WifiSwitchState::kQueued;return switch_id;}
+WifiSwitchSnapshot GetWifiSwitchSnapshot() {return network;}
 enum class SyncContentDomain { kWordPacks };
 void RequestContentRefresh(SyncContentDomain) {}
 void RequestSyncNow() { ++syncs; }
@@ -271,7 +278,7 @@ int main(int argc,char** argv) {
     state.note_app.session.commit_state=wqn::NoteObservationCommitState::kPersisting;event(state,Button::kConfirm,Event::kShortPress);CHECK(reads==before);state.note_app.session.commit_state=wqn::NoteObservationCommitState::kIdle;
     s.dialog=Dialog::kFactoryReset;state.problem_app.commit_state=wqn::ProblemVerdictCommitState::kPersisting;before=resets;event(state,Button::kConfirm,Event::kLongPress);CHECK(resets==before);state.problem_app.commit_state=wqn::ProblemVerdictCommitState::kIdle;
     s.dialog=Dialog::kPowerOff;state.word_app.buffered=true;before=powers;event(state,Button::kConfirm,Event::kLongPress);CHECK(powers==before&&state.word_app.session.batch_flush_requested);state.word_app.buffered=false;event(state,Button::kConfirm,Event::kShortPress);CHECK(s.dialog==Dialog::kNone&&powers==before);
-    OpenSettingsDialog(&state,Dialog::kWifiManage);event(state,Button::kDownPower,Event::kShortPress);CHECK(s.wifi_action_selected==1);event(state,Button::kConfirm,Event::kShortPress);CHECK(s.dialog==Dialog::kPairing);event(state,Button::kConfirm,Event::kShortPress);CHECK(s.dialog==Dialog::kWifiManage);before=provisions;event(state,Button::kConfirm,Event::kShortPress);CHECK(provisions==before+1);
+    OpenSettingsDialog(&state,Dialog::kWifiManage);for(int i=0;i<3;++i)event(state,Button::kDownPower,Event::kShortPress);CHECK(s.wifi_action_selected==3);event(state,Button::kConfirm,Event::kShortPress);CHECK(s.dialog==Dialog::kPairing);event(state,Button::kConfirm,Event::kShortPress);CHECK(s.dialog==Dialog::kWifiManage);for(int i=0;i<2;++i)event(state,Button::kDownPower,Event::kShortPress);before=provisions;event(state,Button::kConfirm,Event::kShortPress);CHECK(provisions==before+1);
     persist_busy=true;before=reads;OpenSettingsDialog(&state,Dialog::kPairing);CHECK(reads==before&&s.dialog==Dialog::kNone);persist_busy=false;
     const std::array<Dialog,5> choices={Dialog::kAutoSync,Dialog::kVolume,Dialog::kImageRendering,Dialog::kAiFollow,Dialog::kDefaultWordDeck};
     for(auto dialog:choices){
@@ -312,5 +319,28 @@ int main(int argc,char** argv) {
     wqn::ButtonEvent boundary{Button::kUp,Event::kShortPress,0,false,6500,0};
     CHECK(ApplySettingsButtonEvent(boundary,&state)==RefreshSchedule::kConfig&&s.notice.empty());
     wqn::phase=wqn::ProvisionState::kStarting;runtime.DispatchSettingsTick(clock_ms);wqn::phase=wqn::ProvisionState::kScanning;wqn::ap="WQN_N4_REAL";CHECK(runtime.DispatchSettingsTick(clock_ms).refresh==RefreshSchedule::kConfig);wqn::phase=wqn::ProvisionState::kFailed;runtime.DispatchSettingsTick(clock_ms);CHECK(s.dialog==Dialog::kProvisioningResult);event(state,Button::kConfirm,Event::kLongPress);CHECK(s.dialog==Dialog::kWifiManage);wqn::phase=wqn::ProvisionState::kIdle;wqn::ap.clear();
+    using Switch=wqn::services::WifiSwitchState;
+    OpenSettingsDialog(&state,Dialog::kWifiManage);
+    std::snprintf(s.wifi_primary_ssid,33,"Primary");s.wifi_backup_ssid[0]=0;
+    event(state,Button::kDownPower,Event::kShortPress);before=wqn::services::switches;
+    event(state,Button::kConfirm,Event::kShortPress);CHECK(wqn::services::switches==before&&s.notice=="尚未配置备用 WiFi");
+    std::snprintf(s.wifi_backup_ssid,33,"Backup");
+    state.word_app.buffered=true;event(state,Button::kConfirm,Event::kShortPress);CHECK(wqn::services::switches==before);state.word_app.buffered=false;
+    event(state,Button::kConfirm,Event::kShortPress);CHECK(s.wifi_switch_op_id==91&&wqn::services::last_target==wqn::services::WifiNetworkRole::kBackup);
+    before=wqn::services::switches;event(state,Button::kConfirm,Event::kShortPress);CHECK(wqn::services::switches==before);
+    wqn::services::network.operation_id=90;wqn::services::network.state=Switch::kConnected;
+    runtime.DispatchSettingsTick(clock_ms);CHECK(s.wifi_switch_op_id==91);
+    wqn::services::network.operation_id=91;wqn::services::network.state=Switch::kRestored;
+    wqn::services::network.online=true;std::snprintf(wqn::services::network.active_ssid,33,"Primary");
+    CHECK(runtime.DispatchSettingsTick(clock_ms).refresh==RefreshSchedule::kConfig);
+    CHECK(s.wifi_switch_op_id==0&&s.notice=="目标连接失败，已回退到另一网络"&&s.wifi_online&&std::string(s.wifi_active_ssid)=="Primary");
+    event(state,Button::kUp,Event::kShortPress);CHECK(s.wifi_action_selected==0);
+    event(state,Button::kUp,Event::kShortPress);CHECK(s.wifi_action_selected==3);
+    event(state,Button::kDownPower,Event::kShortPress);CHECK(s.wifi_action_selected==0);
+    const auto signature_before=SettingsSignature(wqn::UiFrame{});
+    wqn::UiFrame network_frame;network_frame.settings.wifi_online=true;std::snprintf(network_frame.settings.wifi_active_ssid,33,"Primary");
+    CHECK(SettingsSignature(network_frame)!=signature_before);
+    network_frame.settings=s;network_frame.settings.notice.clear();network_frame.settings.dialog=Dialog::kWifiManage;
+    RenderSettingsToEpd(network_frame,RefreshSchedule::kConfig);CHECK(has_text("连接主 WiFi")&&has_text("连接备用 WiFi")&&has_text("已连接"));save_frame(directory,"wifi-switch");
     std::printf("Settings dev=%d: %d checks PASS; production input/ACK/signature/native pixels, host ports only\n",CONFIG_WQN_DEV_MENU_ENABLE,checks);
 }

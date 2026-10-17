@@ -366,11 +366,34 @@ static RefreshSchedule ReduceSettingsButtonEvent(const wqn::ButtonEvent& event, 
             return RefreshSchedule::kConfig;
         }
         if (move_press && (event.button == wqn::ButtonId::kUp || event.button == wqn::ButtonId::kDownPower)) {
-            state->settings.wifi_action_selected = event.button == wqn::ButtonId::kUp ? 0 : 1;
+            auto& selected = state->settings.wifi_action_selected;
+            selected = event.button == wqn::ButtonId::kUp ? (selected + 3) % 4 : (selected + 1) % 4;
             return RefreshSchedule::kConfig;
         }
         if (event.button == wqn::ButtonId::kConfirm && short_press) {
-            if (state->settings.wifi_action_selected == 1) {
+            auto& settings = state->settings;
+            if (settings.wifi_switch_op_id != 0) {
+                settings.notice = "正在切换 WiFi，请稍候";
+                return RefreshSchedule::kConfig;
+            }
+            if (settings.wifi_action_selected < 2) {
+                const bool primary = settings.wifi_action_selected == 0;
+                if ((primary ? settings.wifi_primary_ssid : settings.wifi_backup_ssid)[0] == '\0') {
+                    settings.notice = primary ? "请先配置主 WiFi" : "尚未配置备用 WiFi";
+                    return RefreshSchedule::kConfig;
+                }
+                if (AnyLocalPersistPending(*state)) {
+                    state->word_app.session.batch_flush_requested = true;
+                    settings.notice = "正在保存，请稍后切换";
+                    return RefreshSchedule::kConfig;
+                }
+                settings.wifi_switch_op_id = wqn::services::RequestWifiNetworkSwitch(primary
+                    ? wqn::services::WifiNetworkRole::kPrimary : wqn::services::WifiNetworkRole::kBackup);
+                settings.notice = settings.wifi_switch_op_id != 0
+                    ? "正在切换 WiFi…" : "网络正忙，请稍后重试";
+                return RefreshSchedule::kConfig;
+            }
+            if (settings.wifi_action_selected == 3) {
                 OpenSettingsDialog(state, wqn::SettingsDialog::kPairing);
                 return RefreshSchedule::kConfig;
             }

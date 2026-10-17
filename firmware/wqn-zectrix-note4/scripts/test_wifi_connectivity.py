@@ -20,7 +20,7 @@ def main():
     store_header = (root/'main/storage.h').read_text()
     provision = (root/'main/provision_manager.cpp').read_text()
     definitions = ('namespace wqn::services {\n' + section(header, 'enum class ConnectivityState',
-                    'struct ConnectivityDemandTicket') + '}\nnamespace wqn {\n' +
+                    'struct ConnectivityDemandTicket') + section(header, 'enum class WifiNetworkRole', 'class ConnectivityDemand') + '}\nnamespace wqn {\n' +
                    section(store_header, 'struct WifiCredentialSlot', '// Outcome of MigrateLegacy') +
                    section(storage, 'void CopyWifiCredentialField(', '\nwqn::WifiCredentialStore EmptyWifiCredentialStore()') + '}\n')
     constants = section(service, 'constexpr char kTag[]', '\nStaticQueue_t g_command_queue_storage;')
@@ -44,10 +44,13 @@ def main():
         ('esp_err_t StartWithCredentials(', '\nesp_err_t PrepareForSleep('),
         ('esp_err_t HandleCommand(', '\nvoid HandleScheduledAction()'),
     ))
+    # StartWithCredentials's extraction includes SwitchStoredNetwork as well.
+    public_api = section(service, 'uint32_t RequestWifiNetworkSwitch(', '\nvoid SetConnectivityProvisioning()')
     report = section(provision, 'void ReportProvisioningConnectionResult(', '\n}  // namespace wqn')
     fixture = (root/'scripts/testdata/wifi_connectivity.cpp').read_text()
     for key, value in {'@@DEFINITIONS@@':definitions, '@@CONSTANTS@@':constants,
-                       '@@STORAGE@@':storage_paths, '@@REPORT@@':report, '@@FUNCTIONS@@':functions}.items():
+                       '@@STORAGE@@':storage_paths, '@@REPORT@@':report, '@@FUNCTIONS@@':functions,
+                       '@@PUBLIC_API@@':public_api}.items():
         assert fixture.count(key) == 1, key
         fixture = fixture.replace(key, value)
     with tempfile.TemporaryDirectory(prefix='wqn-wifi-host-') as temporary:

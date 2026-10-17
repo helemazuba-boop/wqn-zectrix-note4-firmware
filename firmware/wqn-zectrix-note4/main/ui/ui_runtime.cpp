@@ -1,6 +1,8 @@
 #include "ui_runtime.h"
 
 #include <utility>
+#include <cstdio>
+#include <cstring>
 
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -8,6 +10,7 @@
 #include "persist_worker.h"    // [detail] SubmitAgentDetailLevelSave
 #include "ui_internal.h"
 #include "services/sync_service.h"
+#include "services/connectivity_service.h"
 #include "storage.h"
 #include "word_app.h"
 
@@ -1309,6 +1312,30 @@ UiUpdate UiRuntime::DispatchSettingsTick(int64_t now_ms)
 {
     RefreshSchedule refresh = RefreshSchedule::kNone;
     auto& settings = state_.settings;
+    if (state_.screen == wqn::UiScreen::kSettings && settings.dialog == wqn::SettingsDialog::kWifiManage) {
+        const auto network = wqn::services::GetWifiSwitchSnapshot();
+        if (settings.wifi_online != network.online ||
+            std::strcmp(settings.wifi_active_ssid, network.active_ssid) != 0) {
+            settings.wifi_online = network.online;
+            std::snprintf(settings.wifi_active_ssid, sizeof(settings.wifi_active_ssid), "%s", network.active_ssid);
+            refresh = RefreshSchedule::kConfig;
+        }
+        if (settings.wifi_switch_op_id != 0 && settings.wifi_switch_op_id == network.operation_id) {
+            using wqn::services::WifiSwitchState;
+            const bool terminal = network.state != WifiSwitchState::kQueued &&
+                network.state != WifiSwitchState::kConnecting && network.state != WifiSwitchState::kIdle;
+            if (terminal) {
+                settings.wifi_switch_op_id = 0;
+                switch (network.state) {
+                    case WifiSwitchState::kConnected: settings.notice = "已连接所选 WiFi"; break;
+                    case WifiSwitchState::kRestored: settings.notice = "目标连接失败，已回退到另一网络"; break;
+                    case WifiSwitchState::kBusy: settings.notice = "联网任务进行中，请稍后切换"; break;
+                    default: settings.notice = "WiFi 切换失败，请检查网络后重试"; break;
+                }
+                refresh = RefreshSchedule::kConfig;
+            }
+        }
+    }
     if (state_.screen == wqn::UiScreen::kSettings && settings.dialog == wqn::SettingsDialog::kDefaultWordDeck &&
         UpdateSettingsDeckStatus(&state_)) refresh = RefreshSchedule::kConfig;
     if (settings.sync_confirm_pending &&

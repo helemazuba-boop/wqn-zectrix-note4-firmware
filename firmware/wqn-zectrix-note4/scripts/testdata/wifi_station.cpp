@@ -16,6 +16,7 @@ void Log(const char*,const char*,...) {}
 #define ESP_LOGW(...) Log(__VA_ARGS__)
 const char* kTag="station-host";
 std::atomic<bool> g_sleep_quiescing{false},g_initialized{false},g_reconfigure_disconnect_pending{false},g_wifi_associated{false},g_wifi_connected{false},g_power_save_enabled{true};
+std::atomic<uint32_t> g_station_generation{0};
 void* g_wifi_event_group=nullptr;
 constexpr int kWifiConnectedBit=1;
 wifi_config_t configured{};

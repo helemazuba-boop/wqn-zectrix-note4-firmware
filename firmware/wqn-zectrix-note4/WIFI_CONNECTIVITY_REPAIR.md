@@ -34,3 +34,36 @@ primary with working backup; both APs absent/wrong password; loss of the phone's
 exit response; repeated re-provisioning with no residual hotspot; full-length
 credentials; and subsequent idle/deep-sleep/wake connectivity. No flash or HIL
 was performed for this local change.
+
+## Direct network switching
+
+WiFi management now offers Connect primary, Connect backup, Re-provision and
+Device pairing. Each network shows its saved SSID and whether it is connected.
+The UI submits an operation ID and consumes only that operation's terminal
+snapshot; leaving the page does not turn the operation into an unbounded lease.
+
+`ConnectivityTask` loads the saved credentials and owns all driver calls.
+Existing cloud/AI/sync demand, provisioning and sleep quiesce reject the switch
+without interrupting the current link. Selecting the current online network is
+a no-op. A different target gets one attempt; failure tries the other saved
+network once, with the existing 15-second association and 15-second DHCP budgets.
+Success, fallback and total failure are distinct results. Queuing failure,
+rejection and every terminal result release the request's connectivity lease.
+No new wake source or background polling is added.
+
+The successful manual choice is retained for subsequent radio admissions in the
+same boot. Restart and deep-sleep wake restore the configured primary priority.
+Neither manual switching nor fallback writes credentials or exchanges roles.
+Already-queued radio events from previous credential generations are ignored.
+
+Final offline checks: 60 role/connectivity assertions, 10 driver-handoff
+assertions, 24 portal-JavaScript assertions, and 217/232 settings assertions with
+the developer menu off/on. The settings test also renders the native WiFi page
+and checks current-link indicators and stale operation IDs. ESP-IDF build,
+zero-warning, M8 ownership and compiled UI-stack gates pass.
+
+Additional device acceptance: primary-to-backup and reverse, selecting the
+current network, missing backup, active AI/sync/download, target failure with
+successful fallback, both networks failing, rapid repeated requests, old radio
+events during handoff, and sleep admission after each terminal outcome. These
+remain HIL work; no device flash was performed.

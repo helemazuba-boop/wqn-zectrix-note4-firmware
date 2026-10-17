@@ -50,6 +50,24 @@ struct ConnectivityDemandTicket {
     ConnectivityDemandReason reason = ConnectivityDemandReason::kSyncBackground;
 };
 
+enum class WifiNetworkRole : uint8_t { kPrimary, kBackup };
+enum class WifiSwitchState : uint8_t {
+    kIdle, kQueued, kConnecting, kConnected, kRestored, kFailed, kBusy,
+};
+struct WifiSwitchSnapshot {
+    uint32_t operation_id = 0;
+    WifiNetworkRole target = WifiNetworkRole::kPrimary;
+    WifiSwitchState state = WifiSwitchState::kIdle;
+    esp_err_t error = ESP_OK;
+    bool online = false;
+    char active_ssid[33] = {};
+};
+
+// Enqueue an explicit switch using credentials already on the device. Returns
+// zero on admission failure. Never waits for the radio or writes credentials.
+uint32_t RequestWifiNetworkSwitch(WifiNetworkRole role);
+WifiSwitchSnapshot GetWifiSwitchSnapshot();
+
 class ConnectivityDemand {
 public:
     ConnectivityDemand() = default;
@@ -96,7 +114,8 @@ struct ConnectivitySnapshot {
     // SSID of the slot currently connected or being attempted ("" when unknown,
     // e.g. compile-time developer credentials).
     char active_ssid[33] = {};
-    // SSID of the other stored credential ("" when there is no second slot).
+    // Configured role identities, independent of the active connection.
+    char primary_ssid[33] = {};
     char backup_ssid[33] = {};
     // True when a second stored credential is available for failover.
     bool has_backup = false;

@@ -859,6 +859,7 @@ std::string FrameSignature(const wqn::UiFrame& frame)
             }
         }
         text(s.sync_status); text(s.notice); text(s.wifi_primary_ssid); text(s.wifi_backup_ssid);
+        text(s.wifi_active_ssid); number(s.wifi_online); number(s.wifi_switch_op_id);
         number(frame.paired); text(frame.claim_code); number(static_cast<int>(frame.provisioning_phase));
         number(frame.home.wifi_connected); number(frame.home.wifi_rssi);
         number(frame.home.battery_percent); number(frame.home.charging); number(frame.home.full);

@@ -15,7 +15,7 @@ enum class WifiStationEvent : uint8_t {
     kDisconnected,
 };
 
-using WifiStationEventSink = void (*)(WifiStationEvent event, int reason, int rssi);
+using WifiStationEventSink = void (*)(WifiStationEvent event, int reason, int rssi, uint32_t generation);
 
 esp_err_t StartWifiStationIfEnabled();
 esp_err_t StartWifiWithCredentials(const char* ssid, const char* password);
@@ -31,6 +31,7 @@ esp_err_t WaitForWifiStationConnected(TickType_t timeout);
 bool IsWifiStationConnected();
 bool IsWifiStationInitialized();
 void SetWifiStationEventSink(WifiStationEventSink sink);
+uint32_t GetWifiStationGeneration();
 
 // True for disconnect reasons that mean the credential/AP itself is unusable
 // (auth failure, AP not found) rather than transient signal loss. The
