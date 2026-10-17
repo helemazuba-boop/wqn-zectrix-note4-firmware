@@ -1,0 +1,43 @@
+{
+  "source_han_sha256": "1ee89e1669362dee13851129c0a8a791a87521eb4148e5efbf5d26596738e25b",
+  "noto_bold_sha256": "13a813c49624ae3ba3c5c6e72c5ebffc4b9e1e6ea32f421c04069b037c6ad431",
+  "threshold": 96,
+  "fonts": [
+    {
+      "name": "wqn_ui_sans_12",
+      "size_px": 12,
+      "glyphs": 7542,
+      "bitmap_bytes": 112483
+    },
+    {
+      "name": "wqn_ui_sans_20",
+      "size_px": 20,
+      "glyphs": 7542,
+      "bitmap_bytes": 309436
+    },
+    {
+      "name": "wqn_ui_sans_24",
+      "size_px": 24,
+      "glyphs": 7542,
+      "bitmap_bytes": 446623
+    },
+    {
+      "name": "wqn_ui_latin_24",
+      "size_px": 24,
+      "glyphs": 95,
+      "bitmap_bytes": 2188
+    },
+    {
+      "name": "wqn_ui_latin_32",
+      "size_px": 32,
+      "glyphs": 95,
+      "bitmap_bytes": 3903
+    },
+    {
+      "name": "wqn_ui_latin_48",
+      "size_px": 48,
+      "glyphs": 95,
+      "bitmap_bytes": 8737
+    }
+  ]
+}

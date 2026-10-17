@@ -37,6 +37,7 @@ idf_component_register(
         "ui/persist_worker.cpp"
         "ui/diagnostics.cpp"
         "ui/graphics.cpp"
+        "ui/ui_fonts.c"
         "ui/navigation_model.cpp"
         "ui/home_model.cpp"
         "ui/navigation_view.cpp"
