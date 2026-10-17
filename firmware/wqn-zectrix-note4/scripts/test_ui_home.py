@@ -49,7 +49,7 @@ def main():
         '@@QUERY_REQUEST@@': part(worker, 'esp_err_t RequestOpenCodeHomeStatus()', 'esp_err_t CreateNewOpenCodeSession('),
         '@@OPEN@@': part(worker, 'esp_err_t OpenCodeHomeSession(', 'esp_err_t RequestOpenCodeHomeStatus()'),
         '@@ATTACHED_ROW@@': part(worker, 'static void RememberAttachedSessionLocked(', 'static esp_err_t LockSessionAndUnlock('),
-        '@@LAYOUT@@': part(layout, '// ---- Home, reference A:', '// ---- Global page navigation ----'),
+        '@@LAYOUT@@': part(layout, '// ---- Screen (re-exported', '// ---- Global page navigation ----'),
         '@@RECT@@': re.search(r'constexpr UiRect kHomePrimaryRect[^;]+;', internal).group(),
         '@@PAGE@@': re.sub(r'^#include[^\n]*\n', '', page, flags=re.M),
         '@@BATTERY@@': part(digits, 'const char* BatteryIconGlyph(', '\n}  // namespace\n'),
@@ -63,6 +63,7 @@ def main():
         (folder/'lvgl.h').write_text('#include "font_fmt.h"\n')
         font = folder/'font.o'
         icon_font = folder/'icons.o'
+        native_font = folder/'native.o'
         inc = root/'components/display_service/include'
         subprocess.run(['gcc','-std=c99','-Wall','-Wextra','-Werror','-I',str(folder),'-I',str(inc),
                         '-c',str(root/'components/display_service/fonts/SourceHanSansSC_Regular_slim.c'),
@@ -70,11 +71,14 @@ def main():
         subprocess.run(['gcc','-std=c99','-Wall','-Wextra','-Werror','-I',str(folder),'-I',str(inc),
                         '-c',str(root/'components/display_service/fonts/font_zectrix_16_1.c'),
                         '-o',str(icon_font)], check=True, timeout=30)
+        subprocess.run(['gcc','-std=c99','-Wall','-Wextra','-Werror','-I',str(folder),'-I',str(inc),
+                        '-I',str(root/'main/ui'),'-c',str(root/'main/ui/ui_fonts.c'),
+                        '-o',str(native_font)], check=True, timeout=30)
         (folder/'home.cpp').write_text(fixture)
         binary = folder/'home'
         subprocess.run(['g++','-std=c++17','-Wall','-Wextra','-Werror','-I',str(inc),
                         '-I',str(folder),'-I',str(root/'main'),'-I',str(root/'main/ui'),str(folder/'home.cpp'),str(args.model_source),
-                        str(root/'main/ui/navigation_model.cpp'),str(font),str(icon_font),'-o',str(binary)], check=True, timeout=30)
+                        str(root/'main/ui/navigation_model.cpp'),str(font),str(icon_font),str(native_font),'-o',str(binary)], check=True, timeout=30)
         command = [str(binary)]
         if args.render_dir:
             args.render_dir.mkdir(parents=True, exist_ok=True)

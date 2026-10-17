@@ -473,6 +473,7 @@ bool ApplyWordCloudResult(wqn::UiState* state, WordCloudResult& result)
             RebuildNoteWordDeckRows(state);
             // Keep the settings row value in step (a cloud-deleted default
             // falls back to 全部词库 inside InstallWordDeckCatalog).
+            state->settings.default_word_deck_id = state->word_app.default_deck_id;
             state->settings.default_word_deck_title =
                 state->word_app.default_deck_title;
         } else {

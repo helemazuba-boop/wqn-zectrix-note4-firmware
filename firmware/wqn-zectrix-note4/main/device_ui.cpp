@@ -1197,6 +1197,13 @@ void DeviceUiTask(void*)
             ui_runtime.DispatchTimeTick(now_ms);
         refresh_schedule = StrongerSchedule(refresh_schedule, time_update.refresh);
 
+        // Drain captured gestures before expiring the diagnostic double-click
+        // window; a queued second tap still belongs to its production time.
+        if (!button_consumed_this_iter) {
+            const auto settings_update = ui_runtime.DispatchSettingsTick(now_ms);
+            refresh_schedule = StrongerSchedule(refresh_schedule, settings_update.refresh);
+        }
+
         const device_ui_internal::UiUpdate ai_tick_update =
             ui_runtime.DispatchAiTick(now_ms);
         refresh_schedule = StrongerSchedule(refresh_schedule, ai_tick_update.refresh);

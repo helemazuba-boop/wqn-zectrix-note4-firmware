@@ -1,534 +1,436 @@
-// Settings page rendering: row list, dialog boxes, progress bars.
-// Extracted from device_ui.cpp.
-
+// Settings B: native typography, paper lists, full-page details, no help footer.
 #include "ui_internal.h"
-#include "ui_widgets.h"
+#include "ui_fonts.h"
+#include "ui/assets/brand_logo.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <string>
 
-#include "display_service.h"
-#include "esp_log.h"
-
 namespace device_ui_internal {
+namespace {
 
-constexpr char kTag[] = "wqn_ui";
-
-esp_err_t DrawSettingsRow(wqn::SettingsView view, size_t row_index, int y, const std::string& title, const std::string& value, bool selected)
+const lv_font_t* SettingsFont(int size)
 {
-    // [v2] Row horizontal bounds aligned to the AI page's flush 6px edges
-    // (kMarginDense): left x=6, width 388 (6..394). Vertical geometry (y, 36px
-    // row height, 38px pitch) is unchanged per the agreed left/right-only fix.
-    constexpr int kX = kMarginDense;
-    constexpr int kContentX = kX;               // row body starts at the flush edge
-    constexpr int kWidth = wqn::kEpdWidth - 2 * kMarginDense;  // 388
-    constexpr int kContentWidth = kWidth;
-    constexpr int kHeight = 36;
-    // Index gutter: the row's 2-digit index is also the selection marker. When
-    // selected the index sits in a rounded reverse-fill block (the kInvert
-    // will-execute language, rounded chip shape) so the active row is obvious;
-    // unselected shows the plain index with no block.
-    constexpr int kIndexBlockX = kContentX + 6;  // 6px inside the row body
-    constexpr int kIndexBlockYOff = 6;            // offset from row top, centered in 36h
-    constexpr int kIndexBlockW = 36;
-    constexpr int kIndexBlockH = 24;
-    // [v2] Row outline: rounded double border (kRoundedInnerBorder) when selected,
-    // plain rounded outline otherwise -- the whole settings page uses the rounded
-    // container language; the square kInnerBorder/DrawRect mix is retired.
-    if (selected) {
-        DrawSelectionDecoration(kContentX, y, kContentWidth, kHeight, SelectionStyle::kRoundedInnerBorder);
-        // Index block: rounded reverse-fill chip behind the index number.
-        DrawSelectionDecoration(kIndexBlockX, y + kIndexBlockYOff, kIndexBlockW, kIndexBlockH, SelectionStyle::kInvert);
-    } else {
-        DrawRoundedRect(kContentX, y, kContentWidth, kHeight, kRoundedOuterRadius);
-    }
-    char index_label[4] = {};
-    std::snprintf(index_label, sizeof(index_label), "%02u", static_cast<unsigned>(row_index + 1));
-    if (selected) {
-        // Index number in paper (white) on the reverse-fill block, centered in it.
-        ESP_RETURN_ON_ERROR(DrawCenteredText(kIndexBlockX, y + kIndexBlockYOff + 4, kIndexBlockW, index_label, false), kTag, "draw settings index");
-    } else {
-        // Unselected: plain ink index, left-aligned in the index gutter.
-        ESP_RETURN_ON_ERROR(DrawClippedText(kContentX + 12, y + 10, 28, index_label), kTag, "draw settings index");
-    }
-    // Title / value sit right of the 48px index gutter; tag is pinned to the
-    // row's right edge (right-aligned at kContentX + kContentWidth - 6 inset).
-    ESP_RETURN_ON_ERROR(DrawClippedText(kContentX + 48, y + 4, 220, title), kTag, "draw settings title");
-    if (!value.empty()) {
-        ESP_RETURN_ON_ERROR(DrawClippedText(kContentX + 48, y + 20, 250, value), kTag, "draw settings value");
-    }
-    const char* tag = "菜单";
-    if (view == wqn::SettingsView::kDev) {
-        tag = "查看";  // every dev row opens a read-only dialog
-    } else if (row_index == wqn::kSettingsRowWifi) {
-        tag = "设置";  // WiFi manage
-    } else if (row_index == wqn::kSettingsRowSyncNow) {
-        tag = "执行";  // sync now
-    } else if (row_index == wqn::kSettingsRowAutoSync ||
-               row_index == wqn::kSettingsRowImageRender ||
-               row_index == wqn::kSettingsRowVolume ||
-               row_index == wqn::kSettingsRowWordDeck ||
-               row_index == wqn::kSettingsRowAiFollow) {
-        tag = "设置";
-    } else if (row_index == wqn::kSettingsRowBattery) {
-        tag = "查看";  // read-only notice, the raw numbers live in the dev list
-    } else if (row_index == wqn::kSettingsRowVersion) {
-        tag = "系统";  // firmware version
-#if CONFIG_WQN_DEV_MENU_ENABLE
-    } else if (row_index == wqn::kSettingsRowDevMenu) {
-        tag = "菜单";  // opens the second-level dev list
-#endif
-    } else if (row_index == wqn::kSettingsRowFactoryReset) {
-        tag = "重置";  // factory reset
-    } else if (row_index == wqn::kSettingsRowPowerOff) {
-        tag = "电源";  // power off
-    }
-    DrawChip(kContentX + kContentWidth - 6 - 54, y + 8, 54, 20, tag);
-    return ESP_OK;
+    if (size == 12) return &wqn_ui_sans_12;
+    if (size == 20) return &wqn_ui_sans_20;
+    if (size == 24) return &wqn_ui_sans_24;
+    if (size == 32) return &wqn_ui_latin_32;
+    if (size == 48) return &wqn_ui_latin_48;
+    return wqn::PrimaryUiFont();
 }
 
-esp_err_t DrawSettingsDialogBox(const std::string& title, const char* footer)
+void RemoveLastCodepoint(std::string* text)
 {
-    FillRect(68, 48, 264, 206, false);
-    // [v2] Dialog container: single rounded outline. The double-outline was the
-    // 双线二义 source (双线 both decorated dialogs AND signalled selection);
-    // double border is now reserved for selection only, dialogs use one line.
-    DrawRoundedRect(68, 48, 264, 206, kRoundedOuterRadius);
-    DrawHorizontalLine(86, 80, 228);
-    DrawHorizontalLine(86, 220, 228);
-    ESP_RETURN_ON_ERROR(DrawCenteredText(86, 60, 228, title), kTag, "draw settings dialog title");
-    return DrawCenteredText(86, 230, 228, footer);
+    if (text->empty()) return;
+    size_t end = text->size() - 1;
+    while (end && (static_cast<unsigned char>((*text)[end]) & 0xc0) == 0x80) --end;
+    text->resize(end);
 }
 
-esp_err_t DrawSettingsOptionCard(int x, int y, int width, const std::string& label, bool selected)
+std::string SettingsClip(const std::string& value, int width, const lv_font_t* font)
 {
-    constexpr int kHeight = 32;
-    // [v2] Focus: rounded reverse-fill (kInvert) when selected -- these dialog
-    // options execute-on-confirm (上下选择 确认保存), which is the will-execute
-    // action language, not the persistent-browse double border. Unselected is a
-    // plain rounded chip outline.
-    if (selected) {
-        DrawSelectionDecoration(x, y, width, kHeight, SelectionStyle::kInvert);
-    } else {
-        DrawRoundedRect(x, y, width, kHeight, kChipRadius);
-    }
-    return DrawCenteredText(x, y + 9, width, label, !selected);
+    if (width <= 0) return {};
+    std::string text = value;
+    std::replace_if(text.begin(), text.end(), [](unsigned char c) {
+        return c < 0x20 || c == 0x7f;
+    }, ' ');
+    if (wqn::MeasureTextWithFont(font, text.c_str()) <= width) return text;
+    while (!text.empty() && wqn::MeasureTextWithFont(font, (text + "...").c_str()) > width)
+        RemoveLastCodepoint(&text);
+    return wqn::MeasureTextWithFont(font, "...") <= width ? text + "..." : "";
 }
 
-esp_err_t RenderSettingsDialog(const wqn::SettingsAppState& settings)
+void SettingsText(int x, int baseline, const std::string& value, int size = 16,
+                  int width = kSettingsDetailWidth, bool right = false, bool ink = true,
+                  const lv_font_t* face = nullptr)
 {
-    const wqn::SettingsDiagnosticsSnapshot& diag = settings.diagnostics;
-    switch (settings.dialog) {
-        case wqn::SettingsDialog::kWifiManage: {
-            ESP_RETURN_ON_ERROR(DrawSettingsDialogBox("WiFi 管理", "确认进入配网"), kTag, "draw wifi dialog");
-            const bool has_primary = settings.wifi_primary_ssid[0] != '\0';
-            const bool has_backup = settings.wifi_backup_ssid[0] != '\0';
-            ESP_RETURN_ON_ERROR(
-                DrawClippedText(
-                    88, 94, 224,
-                    std::string("主网络: ") + (has_primary ? settings.wifi_primary_ssid : "未配置")),
-                kTag,
-                "draw wifi primary");
-            if (has_backup) {
-                ESP_RETURN_ON_ERROR(
-                    DrawClippedText(88, 116, 224, std::string("备用:   ") + settings.wifi_backup_ssid),
-                    kTag,
-                    "draw wifi backup");
-            }
-            // Single focused action: start the SoftAP provisioning portal.
-            ESP_RETURN_ON_ERROR(
-                DrawSettingsOptionCard(88, 150, 224, "重新配网", true),
-                kTag,
-                "draw wifi provision action");
-            ESP_RETURN_ON_ERROR(
-                DrawCenteredText(86, 196, 228, "确认启动配网  上下关闭"),
-                kTag,
-                "draw wifi help");
-            break;
-        }
-        case wqn::SettingsDialog::kAutoSync: {
-            ESP_RETURN_ON_ERROR(DrawSettingsDialogBox("自动同步间隔"), kTag, "draw auto sync dialog");
-            for (size_t i = 0; i < kAutoSyncOptionsCount; ++i) {
-                const int x = (i % 2 == 0) ? 88 : 204;
-                const int y = 94 + static_cast<int>(i / 2) * 40;
-                const bool selected = i == settings.auto_sync_selected;
-                ESP_RETURN_ON_ERROR(
-                    DrawSettingsOptionCard(x, y, 96, wqn::AutoSyncIntervalLabel(kAutoSyncOptions[i]), selected),
-                    kTag,
-                    "draw auto sync option");
-            }
-            ESP_RETURN_ON_ERROR(DrawCenteredText(86, 202, 228, "上下选择  确认保存"), kTag, "draw auto sync help");
-            break;
-        }
-        case wqn::SettingsDialog::kBattery: {
-            ESP_RETURN_ON_ERROR(DrawSettingsDialogBox("电量详情"), kTag, "draw battery dialog");
-            ESP_RETURN_ON_ERROR(DrawClippedText(88, 94, 224, "adc_raw: " + std::to_string(diag.adc_raw)), kTag, "draw battery raw");
-            ESP_RETURN_ON_ERROR(DrawClippedText(88, 114, 224, "adc_mv: " + std::to_string(diag.adc_mv)), kTag, "draw battery adc");
-            ESP_RETURN_ON_ERROR(DrawClippedText(88, 134, 224, "battery_mv: " + std::to_string(diag.battery_mv)), kTag, "draw battery mv");
-            ESP_RETURN_ON_ERROR(DrawClippedText(88, 154, 224, "percent: " + std::to_string(diag.battery_percent) + "%"), kTag, "draw battery percent");
-            ESP_RETURN_ON_ERROR(
-                DrawClippedText(88, 174, 224, std::string("charging/full: ") + (diag.charging ? "1" : "0") + "/" + (diag.full ? "1" : "0")),
-                kTag,
-                "draw battery flags");
-            ESP_RETURN_ON_ERROR(DrawClippedText(88, 198, 224, "(-V^2+9016V-19189000)/10000"), kTag, "draw battery formula");
-            break;
-        }
-        case wqn::SettingsDialog::kStorage: {
-            ESP_RETURN_ON_ERROR(DrawSettingsDialogBox("存储详情"), kTag, "draw storage dialog");
-            ESP_RETURN_ON_ERROR(DrawClippedText(88, 94, 224, "Flash: " + BytesLabel(diag.flash_size)), kTag, "draw flash size");
-            ESP_RETURN_ON_ERROR(
-                DrawClippedText(88, 112, 224, diag.content_sync_label),
-                kTag,
-                "draw content sync revisions");
-            ESP_RETURN_ON_ERROR(
-                DrawClippedText(
-                    88,
-                    132,
-                    224,
-                    "NVS entries: " + std::to_string(diag.nvs_used_entries) + "/" + std::to_string(diag.nvs_total_entries)),
-                kTag,
-                "draw nvs entries");
-            const int nvs_used = static_cast<int>(diag.nvs_used_entries);
-            const int nvs_total = static_cast<int>(std::max<size_t>(1, diag.nvs_total_entries));
-            DrawProgressBar(88, 152, 224, 9, nvs_used, nvs_total);
-            ESP_RETURN_ON_ERROR(DrawClippedText(88, 168, 224, "PSRAM used: " + BytesLabel(diag.psram_used)), kTag, "draw psram used");
-            const int psram_used_kb = static_cast<int>(diag.psram_used / 1024);
-            const int psram_total_kb = static_cast<int>(std::max<size_t>(1, diag.psram_total / 1024));
-            DrawProgressBar(88, 188, 224, 9, psram_used_kb, psram_total_kb);
-            ESP_RETURN_ON_ERROR(DrawClippedText(88, 202, 224, "PSRAM free: " + BytesLabel(diag.psram_free)), kTag, "draw psram free");
-            break;
-        }
-        case wqn::SettingsDialog::kImageRendering: {
-            ESP_RETURN_ON_ERROR(
-                DrawSettingsDialogBox("图片渲染方式"), kTag,
-                "draw image rendering dialog");
-            ESP_RETURN_ON_ERROR(
-                DrawSettingsOptionCard(
-                    88, 112, 224, "黑白·快速省电",
-                    settings.image_render_selected == 0),
-                kTag, "draw BW image option");
-            ESP_RETURN_ON_ERROR(
-                DrawSettingsOptionCard(
-                    88, 156, 224, "16阶灰度·细节优先",
-                    settings.image_render_selected == 1),
-                kTag, "draw gray image option");
-            ESP_RETURN_ON_ERROR(
-                DrawCenteredText(86, 202, 228, "上下选择  确认保存"), kTag,
-                "draw image rendering help");
-            break;
-        }
-        case wqn::SettingsDialog::kAiFollow: {
-            ESP_RETURN_ON_ERROR(
-                DrawSettingsDialogBox("AI 回复时翻页"), kTag,
-                "draw ai follow dialog");
-            ESP_RETURN_ON_ERROR(
-                DrawSettingsOptionCard(
-                    88, 112, 224, "开·自动跟到最新",
-                    settings.ai_follow_selected == 0),
-                kTag, "draw ai follow on option");
-            ESP_RETURN_ON_ERROR(
-                DrawSettingsOptionCard(
-                    88, 156, 224, "关·保持当前位置",
-                    settings.ai_follow_selected == 1),
-                kTag, "draw ai follow off option");
-            ESP_RETURN_ON_ERROR(
-                DrawCenteredText(86, 202, 228, "上下选择  确认保存"), kTag,
-                "draw ai follow help");
-            break;
-        }
-        case wqn::SettingsDialog::kVolume: {
-            ESP_RETURN_ON_ERROR(DrawSettingsDialogBox("音量"), kTag, "draw volume dialog");
-            for (size_t i = 0; i < kVolumeOptionsCount; ++i) {
-                const int x = (i % 2 == 0) ? 88 : 204;
-                const int y = 94 + static_cast<int>(i / 2) * 40;
-                const bool selected = i == settings.volume_selected;
-                ESP_RETURN_ON_ERROR(
-                    DrawSettingsOptionCard(x, y, 96, wqn::VolumeLabel(kVolumeOptions[i]), selected),
-                    kTag,
-                    "draw volume option");
-            }
-            ESP_RETURN_ON_ERROR(DrawCenteredText(86, 202, 228, "上下选择  确认保存"), kTag, "draw volume help");
-            break;
-        }
-        case wqn::SettingsDialog::kDefaultWordDeck: {
-            ESP_RETURN_ON_ERROR(DrawSettingsDialogBox("Word 默认词库"), kTag, "draw word deck dialog");
-            const auto& options = settings.word_deck_options;
-            if (options.empty()) {
-                ESP_RETURN_ON_ERROR(
-                    DrawCenteredText(86, 140, 228, "词库尚未同步"), kTag, "draw word deck empty");
-                break;
-            }
-            // Scrollable single-select list: the deck count is unbounded, so a
-            // selection-following 5-row window instead of fixed option cards.
-            constexpr size_t kVisible = 5;
-            constexpr int kRowH = 26;
-            size_t start = 0;
-            if (options.size() > kVisible && settings.word_deck_selected >= kVisible) {
-                start = std::min(
-                    settings.word_deck_selected + 1 - kVisible,
-                    options.size() - kVisible);
-            }
-            for (size_t i = 0; i < kVisible && start + i < options.size(); ++i) {
-                const size_t index = start + i;
-                const bool selected = index == settings.word_deck_selected;
-                const int y = 92 + static_cast<int>(i) * kRowH;
-                if (selected) {
-                    // [v2] density word-deck list row selection: rounded reverse-fill.
-                    DrawSelectionDecoration(84, y, 232, kRowH - 4, SelectionStyle::kRowFill);
-                }
-                const std::string& label = options[index].deck_id.empty()
-                    ? std::string("全部词库")
-                    : options[index].title;
-                ESP_RETURN_ON_ERROR(
-                    DrawClippedText(92, y + 4, 216, label.empty() ? "(未命名词库)" : label, !selected),
-                    kTag, "draw word deck option");
-            }
-            ESP_RETURN_ON_ERROR(DrawCenteredText(86, 226, 228, "上下选择  确认保存"), kTag, "draw word deck help");
-            break;
-        }
-        case wqn::SettingsDialog::kDevInfo: {
-            // [dev-diag] Read-only build/runtime snapshot (DEV_DIAGNOSTICS.md
-            // §4.1). Six clipped lines at the kBattery 20px pitch.
-            ESP_RETURN_ON_ERROR(DrawSettingsDialogBox("Dev 信息"), kTag, "draw dev info dialog");
-            const std::string dev_version =
-                diag.firmware_version.empty() ? WQN_FIRMWARE_VERSION : diag.firmware_version;
-            ESP_RETURN_ON_ERROR(
-                DrawClippedText(88, 94, 224, "固件 " + dev_version + " @ " + diag.git_commit),
-                kTag, "draw dev build id");
-            ESP_RETURN_ON_ERROR(
-                DrawClippedText(88, 114, 224, "构建 " + diag.build_time), kTag, "draw dev build time");
-            ESP_RETURN_ON_ERROR(
-                DrawClippedText(88, 134, 224, "复位 " + diag.reset_reason_label),
-                kTag, "draw dev reset reason");
-            ESP_RETURN_ON_ERROR(
-                DrawClippedText(88, 154, 224, "运行 " + diag.uptime_label), kTag, "draw dev uptime");
-            ESP_RETURN_ON_ERROR(
-                DrawClippedText(
-                    88, 174, 224,
-                    "堆 " + BytesLabel(diag.heap_free) + " 最小 " + BytesLabel(diag.heap_min_free)),
-                kTag, "draw dev heap");
-            ESP_RETURN_ON_ERROR(
-                DrawClippedText(
-                    88, 194, 224,
-                    "PSRAM " + BytesLabel(diag.psram_free) + "/" + BytesLabel(diag.psram_total)),
-                kTag, "draw dev psram");
-            break;
-        }
-        case wqn::SettingsDialog::kDevSync: {
-            // [dev-diag] Sync snapshot pre-formatted at
-            // UpdateSettingsDiagnostics time; the dialog only draws the seven
-            // prepared lines (DEV_DIAGNOSTICS.md §4.2).
-            ESP_RETURN_ON_ERROR(DrawSettingsDialogBox("同步诊断"), kTag, "draw dev sync dialog");
-            for (size_t i = 0; i < diag.sync_diag_lines.size(); ++i) {
-                if (diag.sync_diag_lines[i].empty()) {
-                    continue;
-                }
-                ESP_RETURN_ON_ERROR(
-                    DrawClippedText(88, 94 + static_cast<int>(i) * 18, 224, diag.sync_diag_lines[i]),
-                    kTag, "draw dev sync line");
-            }
-            break;
-        }
-        case wqn::SettingsDialog::kDevErrors: {
-            // [dev-diag] Recent-error list from the error_recorder ring copy
-            // (§4.3). Static like kBattery: no scrolling, closing and
-            // reopening takes a fresh snapshot.
-            ESP_RETURN_ON_ERROR(DrawSettingsDialogBox("错误记录"), kTag, "draw dev errors dialog");
-            if (diag.error_line_count == 0) {
-                ESP_RETURN_ON_ERROR(
-                    DrawCenteredText(86, 148, 228, "暂无错误记录"), kTag, "draw dev errors empty");
-            } else {
-                const size_t shown = std::min<size_t>(diag.error_line_count, 6);
-                for (size_t i = 0; i < shown; ++i) {
-                    if (!diag.error_lines[i].valid) {
-                        continue;
-                    }
-                    ESP_RETURN_ON_ERROR(
-                        DrawClippedText(
-                            88, 94 + static_cast<int>(i) * 18, 224, diag.error_lines[i].text),
-                        kTag, "draw dev error line");
-                }
-            }
-            break;
-        }
-        case wqn::SettingsDialog::kSleepDiag: {
-            // [dev-diag] Sleep/power diagnostics (DEV_DIAGNOSTICS.md §4.6). The
-            // ring lives in RTC slow memory, so this is the on-battery view of
-            // it; opening the dialog also asks the power coordinator to dump
-            // the full ring to the log, which only helps with a USB console.
-            ESP_RETURN_ON_ERROR(DrawSettingsDialogBox("电源睡眠诊断"), kTag, "draw sleep diag dialog");
-            if (diag.sleep_diag_line_count == 0) {
-                ESP_RETURN_ON_ERROR(
-                    DrawCenteredText(86, 148, 228, "暂无睡眠记录"), kTag, "draw sleep diag empty");
-                break;
-            }
-            for (size_t i = 0; i < diag.sleep_diag_line_count; ++i) {
-                if (!diag.sleep_diag_lines[i].valid) {
-                    continue;
-                }
-                ESP_RETURN_ON_ERROR(
-                    DrawClippedText(
-                        88, 94 + static_cast<int>(i) * 18, 224, diag.sleep_diag_lines[i].text),
-                    kTag, "draw sleep diag line");
-            }
-            break;
-        }
-        case wqn::SettingsDialog::kFactoryReset:
-            ESP_RETURN_ON_ERROR(DrawSettingsDialogBox("恢复出厂"), kTag, "draw factory reset dialog");
-            ESP_RETURN_ON_ERROR(DrawWrappedText(54, 98, 292, "将清除 NVS 中的配对、缓存、待上传、AI 会话、单词进度和设置。", 3), kTag, "draw reset body");
-            ESP_RETURN_ON_ERROR(DrawCenteredText(44, 176, 312, "这是不可撤销操作"), kTag, "draw reset warning");
-            ESP_RETURN_ON_ERROR(DrawCenteredText(44, 200, 312, "长按确认执行，短按确认取消"), kTag, "draw reset help");
-            break;
-        case wqn::SettingsDialog::kPowerOff:
-            ESP_RETURN_ON_ERROR(DrawSettingsDialogBox("关机"), kTag, "draw power off dialog");
-            ESP_RETURN_ON_ERROR(DrawWrappedText(54, 98, 292, "将清屏并彻底断电，屏幕保留关机提示。重新开机：长按下方翻页键（下页/电源键）。", 3), kTag, "draw power off body");
-            ESP_RETURN_ON_ERROR(DrawCenteredText(44, 176, 312, "注意：确认键无法开机"), kTag, "draw power off note");
-            ESP_RETURN_ON_ERROR(DrawCenteredText(44, 200, 312, "长按确认关机，短按确认取消"), kTag, "draw power off help");
-            break;
-        case wqn::SettingsDialog::kNone:
-        default:
-            break;
-    }
-    return ESP_OK;
+    const lv_font_t* font = face ? face : SettingsFont(size);
+    const std::string text = SettingsClip(value, width, font);
+    const int start = right ? x - wqn::MeasureTextWithFont(font, text.c_str()) : x;
+    wqn::DrawTextWithFont(start, baseline - font->line_height + font->base_line,
+                          font, text.c_str(), ink);
 }
 
-esp_err_t RenderSettingsToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
+void SettingsLine(int y, int x = kSettingsDetailX, int width = kSettingsDetailWidth)
 {
-    const wqn::SettingsAppState& settings = frame.settings;
-    const wqn::SettingsDiagnosticsSnapshot& diag = settings.diagnostics;
-    const bool partial_settings = schedule == RefreshSchedule::kSelection || schedule == RefreshSchedule::kConfig;
-    if (partial_settings) {
-        ClearRect(kSettingsContentRect);
-    } else {
-        wqn::ClearEpdFramebuffer(true);
-    }
+    DrawHorizontalLine(x, y, width);
+}
 
-    if (!partial_settings) {
-        DrawHorizontalLine(0, 27, wqn::kEpdWidth);
-        std::string title = "设置";
-        if (!frame.claim_code.empty()) {
-            title += " (授权码: " + frame.claim_code + ")";
-        } else if (frame.paired) {
-            title += " (已配对)";
-        } else {
-            title += " (授权码获取中)";
+void SettingsHeading(const wqn::UiFrame& frame, const std::string& section,
+                     const std::string& title, const std::string& subtitle)
+{
+    SettingsText(kSettingsDetailX, kSettingsHeaderTextBaseline, section, 16, 280);
+    DrawStatusBarIcons(kSettingsRight, kStatusBarIconY, frame.home);
+    DrawHorizontalLine(0, kSettingsHeaderDividerY, kScreenWidth);
+    SettingsText(kSettingsDetailX, kSettingsTitleBaseline, title, 24);
+    SettingsText(kSettingsDetailX, kSettingsSubtitleBaseline,
+                 frame.settings.notice.empty() ? subtitle : frame.settings.notice, 12);
+    SettingsLine(kSettingsContentDividerY);
+}
+
+void SettingsWrapped(const std::string& value, int baseline = 177, int max_lines = 3)
+{
+    std::string row;
+    int used = 0;
+    for (size_t i = 0; i < value.size();) {
+        const unsigned char byte = value[i];
+        const size_t step = byte < 0x80 ? 1 : byte < 0xe0 ? 2 : byte < 0xf0 ? 3 : 4;
+        const std::string cp = value.substr(i, step);
+        i += step;
+        if (cp == "\n" || wqn::MeasureTextWithFont(SettingsFont(16), (row + cp).c_str()) > kSettingsDetailWidth) {
+            SettingsText(kSettingsDetailX, baseline + used * 25, row);
+            row.clear();
+            if (++used >= max_lines) return;
         }
-        ESP_RETURN_ON_ERROR(DrawClippedText(10, 6, 250, title), kTag, "draw settings title");
-        // Right-edge icon cluster (wifi + battery); time right-aligned to its left.
-        const int icons_left = DrawStatusBarIcons(wqn::kEpdWidth - 10, 6, frame.home);
-        const std::string time_str = CurrentClockLabel();
-        const int time_w = wqn::MeasureUtf8TextWidth(time_str.c_str());
-        const int time_x = std::max(10, icons_left - 6 - time_w);
-        ESP_RETURN_ON_ERROR(
-            DrawClippedText(time_x, 6, std::min(180, time_w + 4), time_str),
-            kTag,
-            "draw settings status");
+        if (cp != "\n") row += cp;
     }
+    if (!row.empty() && used < max_lines) SettingsText(kSettingsDetailX, baseline + used * 25, row);
+}
 
-    const std::string auto_sync_label = wqn::AutoSyncIntervalLabel(settings.auto_sync_interval_min);
-    const std::string volume_label = wqn::VolumeLabel(settings.volume_percent);
-    const std::string image_render_label =
-        wqn::ImageRenderModeLabel(settings.image_render_mode);
-    const std::string battery_value =
-        diag.full ? "满电" : (diag.charging ? "充电 " + std::to_string(diag.battery_percent) + "%" : std::to_string(diag.battery_percent) + "%");
-    const std::string storage_value = "NVS " + std::to_string(diag.nvs_used_entries) + "/" + std::to_string(diag.nvs_total_entries);
-    const std::string version_value = diag.firmware_version.empty() ? WQN_FIRMWARE_VERSION : diag.firmware_version;
+void SettingsEmpty(const std::string& title, const std::string& body)
+{
+    SettingsText(kSettingsDetailX, 157, title, 24);
+    SettingsWrapped(body, 190);
+}
 
-    const std::string root_titles[kSettingsItemCount] = {
-        "WiFi 管理",
-        "立即同步",
-        "自动同步间隔",
-        "电量",
-        "图片渲染",
-        "音量",
-        "Word 默认词库",
-        "AI 回复时翻页",
-        "固件版本",
+void SettingsCheck(int x, int y, bool saved)
+{
+    DrawRect(x, y, 18, 18);
+    if (!saved) return;
+    FillRect(x, y, 18, 18, true);
+    for (int i = 0; i < 4; ++i) FillRect(x + 4 + i, y + 8 + i, 2, 2, false);
+    for (int i = 0; i < 7; ++i) FillRect(x + 7 + i, y + 11 - i, 2, 2, false);
+}
+
+void SettingsOption(size_t index, const std::string& label, const std::string& note,
+                    bool saved, bool focused, int top = kSettingsOptionTop,
+                    int pitch = kSettingsOptionPitch)
+{
+    const int y = top + static_cast<int>(index) * pitch;
+    SettingsCheck(kSettingsDetailX, y + 4, saved);
+    SettingsText(kSettingsOptionTextX, y + 21, label, 20, kSettingsRight - kSettingsOptionTextX);
+    if (!note.empty()) SettingsText(kSettingsOptionTextX, y + 43, note, 16, kSettingsRight - kSettingsOptionTextX);
+    FillRect(kSettingsOptionTextX, y + pitch - 2, kSettingsRight - kSettingsOptionTextX, focused ? 2 : 1, true);
+}
+
+void SettingsValue(const std::string& label, const std::string& value, int baseline)
+{
+    SettingsText(kSettingsDetailX, baseline, label, 16, 156);
+    SettingsText(kSettingsRight, baseline, value, 16, 188, true);
+    SettingsLine(baseline + 9);
+}
+
+void SettingsBar(int x, int y, int width, int height, bool known, size_t used, size_t total)
+{
+    DrawRect(x, y, width, height);
+    if (known && total) {
+        const int filled = static_cast<int>(static_cast<uint64_t>(width - 6) * std::min(used, total) / total);
+        FillRect(x + 3, y + 3, filled, std::max(1, height - 6), true);
+    } else SettingsLine(y + height / 2, x + 4, width - 8);
+}
+
+std::string MiBLabel(size_t value)
+{
+    char text[32] = {};
+    std::snprintf(text, sizeof(text), "%u.%u MiB", static_cast<unsigned>(value / 1048576),
+                  static_cast<unsigned>((value % 1048576) * 10 / 1048576));
+    return text;
+}
+
+std::string SettingsBatteryValue(const wqn::SettingsDiagnosticsSnapshot& d)
+{
+    return d.battery_valid ? std::to_string(std::clamp(d.battery_percent, 0, 100)) + "%" : "--%";
+}
+
+std::string SettingsIntervalLabel(uint32_t minutes)
+{
+    if (!minutes) return "关闭自动同步";
+    if (minutes >= 60 && minutes % 60 == 0) return "每 " + std::to_string(minutes / 60) + " 小时";
+    return "每 " + std::to_string(minutes) + " 分钟";
+}
+
+void DrawSettingsMenu(const wqn::UiFrame& frame)
+{
+    const auto& s = frame.settings;
+    const auto& d = s.diagnostics;
+    const bool dev = s.view == wqn::SettingsView::kDev;
+    const char* root_titles[] = {"WiFi 管理", "立即同步", "自动同步间隔", "电量", "图片渲染方式",
+        "音量", "默认词库", "AI 回复时翻页", "关于设备",
 #if CONFIG_WQN_DEV_MENU_ENABLE
         "开发者选项",
 #endif
-        "恢复出厂",
-        "关机",
-    };
-    const std::string root_values[kSettingsItemCount] = {
-        settings.wifi_primary_ssid[0] != '\0' ? settings.wifi_primary_ssid : "未配置",
-        settings.sync_status.empty() ? "空闲" : settings.sync_status,
-        auto_sync_label,
-        battery_value,
-        image_render_label,
-        volume_label,
-        settings.default_word_deck_title.empty() ? "全部词库" : settings.default_word_deck_title,
-        settings.auto_follow ? "开" : "关",
-        version_value,
+        "恢复出厂", "关机"};
+    static_assert(sizeof(root_titles) / sizeof(root_titles[0]) == wqn::kSettingsItemCount);
+    const char* dev_titles[] = {"构建与运行信息", "同步诊断", "错误记录", "电量原始", "存储详情", "睡眠诊断"};
+    const size_t count = dev ? wqn::kDevItemCount : wqn::kSettingsItemCount;
+    const size_t selected = std::min(dev ? s.dev_selected : s.selected, count - 1);
+    SettingsText(kSettingsDetailX, kSettingsHeaderTextBaseline, dev ? "设置 / 开发者" : frame.paired ? "设备设置 · 已配对" : "设备设置 · 待配对", 16, 280);
+    DrawStatusBarIcons(kSettingsRight, kStatusBarIconY, frame.home);
+    DrawHorizontalLine(0, kSettingsHeaderDividerY, kScreenWidth);
+    SettingsText(kSettingsListX, kSettingsTitleBaseline, dev ? "开发者选项" : "设置", 24, 275);
+    char position[20] = {};
+    std::snprintf(position, sizeof(position), "%02u / %u", static_cast<unsigned>(selected + 1), static_cast<unsigned>(count));
+    SettingsText(kSettingsRight, kSettingsTitleBaseline, position, 16, 95, true);
+    SettingsText(kSettingsListX, kSettingsSubtitleBaseline, s.notice.empty() ? (dev ? "设备运行信息与诊断" : "学习、设备与同步") : s.notice, 12, kSettingsDetailWidth);
+    SettingsLine(kSettingsContentDividerY, kSettingsListX, kSettingsDetailWidth);
+    const size_t start = selected < kSettingsVisibleRows ? 0 : std::min(selected + 1 - kSettingsVisibleRows, count - kSettingsVisibleRows);
+    for (size_t i = 0; i < kSettingsVisibleRows && start + i < count; ++i) {
+        const size_t index = start + i;
+        const int y = kSettingsRowTop + static_cast<int>(i) * kSettingsRowPitch;
+        char number[4] = {};
+        std::snprintf(number, sizeof(number), "%02u", static_cast<unsigned>(index + 1));
+        if (index == selected) FillRect(kSettingsListX, y + 7, 22, 22, true);
+        SettingsText(kSettingsListX + 4, y + 23, number, 12, 18, false, index != selected);
+        SettingsText(kSettingsTextX, y + 25, dev ? dev_titles[index] : root_titles[index], 20, 190);
+        if (!dev) {
+            std::string value;
+            switch (index) {
+                case wqn::kSettingsRowWifi: value = frame.home.wifi_connected ? "已连接" : s.wifi_primary_ssid[0] ? "未连接" : "未配置"; break;
+                case wqn::kSettingsRowSyncNow: value = s.sync_status.empty() ? "空闲" : s.sync_status; break;
+                case wqn::kSettingsRowAutoSync: value = s.auto_sync_interval_min ? SettingsIntervalLabel(s.auto_sync_interval_min) : "关闭"; break;
+                case wqn::kSettingsRowBattery: value = SettingsBatteryValue(d); break;
+                case wqn::kSettingsRowImageRender: value = s.image_render_mode == wqn::ImageRenderMode::kBlackWhite ? "黑白" : "16 阶灰度"; break;
+                case wqn::kSettingsRowVolume: value = wqn::VolumeLabel(s.volume_percent); break;
+                case wqn::kSettingsRowWordDeck: value = s.default_word_deck_title.empty() ? "全部词库" : s.default_word_deck_title; break;
+                case wqn::kSettingsRowAiFollow: value = s.auto_follow ? "自动跟随" : "保持位置"; break;
+                case wqn::kSettingsRowAbout: value = "Note4"; break;
 #if CONFIG_WQN_DEV_MENU_ENABLE
-        "只读诊断",
+                case wqn::kSettingsRowDevMenu: value = "诊断与记录"; break;
 #endif
-        "",
-        "",
-    };
-    // [dev-diag] Second-level list (DEV_DIAGNOSTICS.md §3): six rows, which is
-    // exactly the panel window, so it never needs to scroll. 电量原始 and
-    // 存储详情 are the two detail dialogs that used to sit on the root list.
-    const std::string dev_titles[wqn::kDevItemCount] = {
-        "Dev 信息",
-        "同步诊断",
-        "错误记录",
-        "电量原始",
-        "存储详情",
-        "电源睡眠诊断",
-    };
-    const std::string dev_values[wqn::kDevItemCount] = {
-        diag.git_commit,
-        diag.sync_diag_summary,
-        diag.error_count_label,
-        std::to_string(diag.battery_mv) + " mV",
-        storage_value,
-        diag.sleep_diag_count_label,
-    };
-    const bool dev_view = settings.view == wqn::SettingsView::kDev;
-    const std::string* titles = dev_view ? dev_titles : root_titles;
-    const std::string* values = dev_view ? dev_values : root_values;
-    const size_t item_count = dev_view ? wqn::kDevItemCount : kSettingsItemCount;
-    const size_t selected = dev_view ? settings.dev_selected : settings.selected;
-    // Rows no longer fit the 300px panel at the 38px pitch; draw a
-    // selection-following window instead (deterministic from the selection so
-    // partial refreshes repaint consistently).
-    size_t window_start = 0;
-    if (selected >= kSettingsVisibleRows) {
-        window_start = std::min(
-            selected + 1 - kSettingsVisibleRows,
-            item_count - kSettingsVisibleRows);
+                default: break;
+            }
+            SettingsText(kSettingsRight - 18, y + 24, value, 16, 132, true);
+        }
+        for (int p = 0; p < 5; ++p) {
+            wqn::DrawEpdPixel(kSettingsRight - 5 + p, y + 13 + p, true);
+            wqn::DrawEpdPixel(kSettingsRight - 5 + p, y + 21 - p, true);
+        }
+        SettingsLine(y + kSettingsRowPitch - 1, kSettingsListX, kSettingsDetailWidth);
     }
-    int y = 42;
-    for (size_t i = 0; i < kSettingsVisibleRows && window_start + i < item_count; ++i) {
-        const size_t index = window_start + i;
-        ESP_RETURN_ON_ERROR(
-            DrawSettingsRow(settings.view, index, y, titles[index], values[index], index == selected),
-            kTag, "draw settings row");
-        y += 38;
+    if (count > kSettingsVisibleRows) {
+        FillRect(397, kSettingsRowTop + 5, 1, 170, true);
+        FillRect(396, kSettingsRowTop + 5 + static_cast<int>(start * 102 / (count - kSettingsVisibleRows)), 3, 68, true);
     }
-    // The dev list is a second level, so its escape hint differs. The title bar
-    // above y=32 is outside kSettingsContentRect and is therefore never redrawn
-    // on a kConfig partial refresh -- the orientation cue lives here instead.
-    const std::string help_line =
-        !settings.notice.empty() ? settings.notice
-        : dev_view ? std::string("上下选择，确认查看，长按确认返回设置")
-                   : std::string("上下选择，确认操作，长按确认返回首页");
-    ESP_RETURN_ON_ERROR(
-        DrawClippedText(kMarginDense, 274, wqn::kEpdWidth - 2 * kMarginDense, help_line),
-        kTag,
-        "draw settings help");
+}
 
-    if (settings.dialog != wqn::SettingsDialog::kNone) {
-        ESP_RETURN_ON_ERROR(RenderSettingsDialog(settings), kTag, "draw settings dialog");
+void DrawSettingsDetail(const wqn::UiFrame& frame)
+{
+    const auto& s = frame.settings;
+    const auto& d = s.diagnostics;
+    using Dialog = wqn::SettingsDialog;
+    switch (s.dialog) {
+        case Dialog::kAutoSync:
+            SettingsHeading(frame, "设置 / 学习", "自动同步间隔", "选择自动获取学习内容的频率");
+            for (size_t i = 0; i < kAutoSyncOptionsCount; ++i)
+                SettingsOption(i, SettingsIntervalLabel(kAutoSyncOptions[i]), "", kAutoSyncOptions[i] == s.auto_sync_interval_min, i == s.auto_sync_selected);
+            break;
+        case Dialog::kVolume:
+            SettingsHeading(frame, "设置 / 学习", "音量", "选择设备播放音量");
+            for (size_t i = 0; i < kVolumeOptionsCount; ++i)
+                SettingsOption(i, wqn::VolumeLabel(kVolumeOptions[i]), "", kVolumeOptions[i] == s.volume_percent, i == s.volume_selected);
+            break;
+        case Dialog::kImageRendering:
+            SettingsHeading(frame, "设置 / 显示", "图片渲染方式", "选择墨水屏图片的显示方式");
+            SettingsOption(0, "黑白", "快速、省电", s.image_render_mode == wqn::ImageRenderMode::kBlackWhite, s.image_render_selected == 0, kSettingsOptionTop, 62);
+            SettingsOption(1, "16 阶灰度", "保留更多明暗细节", s.image_render_mode == wqn::ImageRenderMode::kGray16, s.image_render_selected == 1, kSettingsOptionTop, 62);
+            break;
+        case Dialog::kAiFollow:
+            SettingsHeading(frame, "设置 / AI", "AI 回复时翻页", "选择新回复到达时的阅读位置");
+            SettingsOption(0, "自动跟到最新", "跟随正在生成的回复", s.auto_follow, s.ai_follow_selected == 0, kSettingsOptionTop, 62);
+            SettingsOption(1, "保持当前位置", "继续阅读当前内容", !s.auto_follow, s.ai_follow_selected == 1, kSettingsOptionTop, 62);
+            break;
+        case Dialog::kDefaultWordDeck: {
+            SettingsHeading(frame, "设置 / 学习", "默认词库", "选择进入单词页时使用的词库");
+            if (s.word_deck_status != wqn::SettingsDeckStatus::kReady) {
+                if (s.word_deck_status == wqn::SettingsDeckStatus::kLoading)
+                    SettingsEmpty("正在同步词库", "同步完成后显示可选词库。");
+                else if (s.word_deck_status == wqn::SettingsDeckStatus::kFailed)
+                    SettingsEmpty("词库列表未取得", "确认重试，或稍后再次同步。");
+                else SettingsEmpty("词库尚未同步", "确认请求同步学习内容。");
+                break;
+            }
+            const auto& options = s.word_deck_options;
+            if (options.empty()) { SettingsEmpty("词库尚未同步", "先同步学习内容，再来选择默认词库。"); break; }
+            const size_t selected = std::min(s.word_deck_selected, options.size() - 1);
+            const size_t start = selected < 5 ? 0 : std::min(selected - 4, options.size() - 5);
+            SettingsText(kSettingsRight, kSettingsTitleBaseline, std::to_string(selected + 1) + "/" + std::to_string(options.size()), 12, 70, true);
+            for (size_t i = 0; i < 5 && start + i < options.size(); ++i) {
+                const auto& option = options[start + i];
+                const std::string title = option.deck_id.empty() ? "全部词库" : option.title.empty() ? "未命名词库" : option.title;
+                const bool saved = option.deck_id == s.default_word_deck_id;
+                SettingsOption(i, title, "", saved, start + i == selected);
+            }
+            break;
+        }
+        case Dialog::kWifiManage: {
+            const bool configured = s.wifi_primary_ssid[0] != '\0';
+            SettingsHeading(frame, "设置 / 网络", "WiFi 管理", frame.home.wifi_connected ? "网络已连接" : configured ? "暂未连接网络" : "尚未配置网络");
+            SettingsText(kSettingsDetailX, 125, "主网络", 12); SettingsText(kSettingsDetailX, 149, configured ? s.wifi_primary_ssid : "未配置"); SettingsLine(161);
+            SettingsText(kSettingsDetailX, 181, "备用网络", 12); SettingsText(kSettingsDetailX, 205, s.wifi_backup_ssid[0] ? s.wifi_backup_ssid : "未配置");
+            for (size_t i = 0; i < 2; ++i) {
+                const int y = 224 + static_cast<int>(i) * 37;
+                const bool focused = s.wifi_action_selected == i;
+                if (focused) FillRect(kSettingsDetailX, y, kSettingsDetailWidth, 30, true); else DrawRect(kSettingsDetailX, y, kSettingsDetailWidth, 30);
+                SettingsText(kSettingsDetailX + 12, y + 22, i == 0 ? (configured ? "重新配网" : "开始配网") : "设备配对", 16, 328, false, !focused);
+            }
+            break;
+        }
+        case Dialog::kPairing:
+            SettingsHeading(frame, "设置 / 网络", "设备配对", "在账号的设备页输入配对码");
+            if (frame.paired) SettingsEmpty("已配对", "设备已与账号关联。");
+            else if (!frame.home.wifi_connected) SettingsEmpty("先连接网络", "连接 WiFi 后可获取配对码。");
+            else if (frame.claim_code.empty()) SettingsEmpty("正在获取配对码", "联网后自动获取，请稍候。");
+            else { SettingsText(kSettingsDetailX, 157, frame.claim_code, 32); SettingsText(kSettingsDetailX, 191, "请在浏览器中完成配对"); }
+            break;
+        case Dialog::kProvisioningResult:
+            SettingsHeading(frame, "设置 / 网络", "手机配网", "使用手机完成网络配置");
+            if (frame.provisioning_phase == wqn::ProvisionState::kFailed)
+                SettingsEmpty("配网未完成", "确认重试，或长按返回 WiFi 管理。");
+            else SettingsEmpty("配置已保存", "确认返回 WiFi 管理。");
+            break;
+        case Dialog::kAbout:
+            SettingsText(kSettingsDetailX, kSettingsHeaderTextBaseline, "关于设备", 16); DrawStatusBarIcons(kSettingsRight, kStatusBarIconY, frame.home); DrawHorizontalLine(0, kSettingsHeaderDividerY, kScreenWidth);
+            DrawWqnBitmapAsset(kSettingsDetailX, 37, kWLogo, true);
+            SettingsText(kSettingsDetailX + 26, 62, "rongNoteBook", 24, kSettingsDetailWidth - 26, false, true, &wqn_ui_latin_24);
+            SettingsText(kSettingsDetailX, 105, "Note4", 32);
+            SettingsText(kSettingsDetailX, 130, "4.2 英寸墨水屏 · 400 × 300", 12); SettingsLine(149);
+            SettingsValue("固件版本", d.firmware_version.empty() ? WQN_FIRMWARE_VERSION : d.firmware_version, 179);
+            SettingsValue("处理器", d.idf_target == "esp32s3" ? "ESP32-S3" : d.idf_target, 211);
+            SettingsValue("运行环境", "ESP-IDF " + d.idf_version, 243);
+            break;
+        case Dialog::kBatterySummary: {
+            SettingsHeading(frame, "设置 / 设备", "电量详情", "查看剩余电量与充电状态");
+            const std::string value = d.battery_valid ? std::to_string(std::clamp(d.battery_percent, 0, 100)) : "--";
+            SettingsText(kSettingsDetailX, 166, value, 48, 180);
+            SettingsText(kSettingsDetailX + 10 + wqn::MeasureTextWithFont(SettingsFont(48), value.c_str()), 165, "%", 16, 30);
+            SettingsBar(215, 137, kSettingsRight - 215, 14, d.battery_valid, std::clamp(d.battery_percent, 0, 100), 100);
+            SettingsText(kSettingsDetailX, 206, !d.battery_valid ? "暂未取得电量读数" : d.charging ? "正在充电" : d.full && d.external_power_present ? "电池已充满" : "未充电，运行正常");
+            SettingsLine(223); SettingsText(kSettingsDetailX, 250, "充电状态与电量读数分别显示", 12);
+            break;
+        }
+        case Dialog::kBattery:
+            SettingsHeading(frame, "设置 / 开发者", "电量原始", "设备运行快照");
+            SettingsValue("ADC 原始", d.battery_valid ? std::to_string(d.adc_raw) : "--", 129);
+            SettingsValue("ADC 电压", d.battery_valid ? std::to_string(d.adc_mv) + " mV" : "--", 154);
+            SettingsValue("电池电压", d.battery_valid ? std::to_string(d.battery_mv) + " mV" : "--", 179);
+            SettingsValue("电量", SettingsBatteryValue(d), 204);
+            SettingsValue("正在充电", !d.battery_valid ? "--" : d.charging ? "是" : "否", 229);
+            SettingsValue("已充满", !d.battery_valid ? "--" : d.full ? "是" : "否", 254);
+            SettingsText(kSettingsDetailX, 285, "(-V^2+9016V-19189000)/10000", 12);
+            break;
+        case Dialog::kStorage:
+            SettingsHeading(frame, "设置 / 开发者", "存储详情", "容量、条目数与运行内存");
+            SettingsValue("Flash 容量", d.flash_valid ? MiBLabel(d.flash_size) : "--", 128);
+            SettingsText(kSettingsDetailX, 166, "NVS 条目"); SettingsText(kSettingsRight, 166, d.nvs_valid ? std::to_string(d.nvs_used_entries) + " / " + std::to_string(d.nvs_total_entries) : "-- / --", 16, 180, true);
+            SettingsBar(kSettingsDetailX, 179, kSettingsDetailWidth, 10, d.nvs_valid, d.nvs_used_entries, d.nvs_total_entries);
+            SettingsText(kSettingsDetailX, 217, "PSRAM 运行内存"); SettingsText(kSettingsRight, 240, d.psram_valid ? MiBLabel(d.psram_used) + " / " + MiBLabel(d.psram_total) : "-- / --", 16, 300, true);
+            SettingsBar(kSettingsDetailX, 248, kSettingsDetailWidth, 10, d.psram_valid, d.psram_used, d.psram_total);
+            SettingsText(kSettingsDetailX, 286, d.content_sync_label, 12);
+            break;
+        case Dialog::kDevInfo:
+            SettingsHeading(frame, "设置 / 开发者", "构建与运行信息", "设备运行快照");
+            SettingsValue("固件", d.firmware_version, 129); SettingsValue("提交", d.git_commit, 154);
+            SettingsValue("构建", d.build_time, 179); SettingsValue("复位原因", d.reset_reason_label, 204);
+            SettingsValue("运行时长", d.uptime_label, 229); SettingsValue("可用堆", BytesLabel(d.heap_free), 254);
+            SettingsText(kSettingsDetailX, 286, "最小堆 " + BytesLabel(d.heap_min_free) + "  PSRAM " + BytesLabel(d.psram_free), 12);
+            break;
+        case Dialog::kDevSync:
+            SettingsHeading(frame, "设置 / 开发者", "同步诊断", "同步状态与最近一次结果");
+            for (size_t i = 0; i < d.sync_diag_lines.size(); ++i) {
+                SettingsText(kSettingsDetailX, 127 + static_cast<int>(i) * 22, d.sync_diag_lines[i]);
+                SettingsLine(130 + static_cast<int>(i) * 22);
+            }
+            break;
+        case Dialog::kDevErrors:
+        case Dialog::kSleepDiag: {
+            const bool errors = s.dialog == Dialog::kDevErrors;
+            SettingsHeading(frame, "设置 / 开发者", errors ? "错误记录" : "睡眠诊断", "设备运行快照");
+            const size_t count = errors ? d.error_line_count : d.sleep_diag_line_count;
+            if (!count) SettingsEmpty(errors ? "暂无错误记录" : "暂无睡眠记录", "新的记录会显示在这里。");
+            for (size_t i = 0; i < std::min<size_t>(count, 6); ++i) {
+                const bool valid = errors ? d.error_lines[i].valid : d.sleep_diag_lines[i].valid;
+                if (!valid) continue;
+                SettingsText(kSettingsDetailX, 129 + static_cast<int>(i) * 25, errors ? d.error_lines[i].text : d.sleep_diag_lines[i].text);
+                SettingsLine(138 + static_cast<int>(i) * 25);
+            }
+            break;
+        }
+        case Dialog::kFactoryReset:
+        case Dialog::kPowerOff: {
+            const bool reset = s.dialog == Dialog::kFactoryReset;
+            SettingsHeading(frame, "设置 / 系统", reset ? "恢复出厂" : "关机", reset ? "将清除本机学习与配对数据" : "结束使用并关闭设备");
+            FillRect(kSettingsDetailX, 119, 28, 28, true);
+            SettingsText(kSettingsDetailX + 8, 141, "!", 24, 20, false, false, &wqn_ui_latin_24);
+            SettingsText(kSettingsDetailX + 38, 140, reset ? "此操作不可撤销" : "确认键无法重新开机", 16, 310);
+            SettingsWrapped(reset ? "配对、缓存、待上传内容、AI 会话、\n单词进度和设置将被清除。" : "将清屏并关闭电源。\n重新开机：长按下方翻页键。");
+            break;
+        }
+        case Dialog::kNone: break;
     }
-    if (schedule == RefreshSchedule::kSelection) {
+}
+
+}  // namespace
+
+esp_err_t RenderSettingsToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
+{
+    // Compose the complete framebuffer even on config/selection updates: the
+    // section header changes with the page, and a cold framebuffer has no base.
+    // RefreshStableRegion retains the existing display-owner/waveform policy.
+    wqn::ClearEpdFramebuffer(true);
+    if (frame.settings.dialog == wqn::SettingsDialog::kNone) DrawSettingsMenu(frame);
+    else DrawSettingsDetail(frame);
+    if (!frame.navigation.visible && (schedule == RefreshSchedule::kSelection || schedule == RefreshSchedule::kConfig))
         return RefreshStableRegion(kSettingsContentRect, schedule);
-    }
-    if (schedule == RefreshSchedule::kConfig) {
-        return RefreshStableRegion(kSettingsContentRect, schedule);
+    return RefreshFrame(frame, schedule);
+}
+
+esp_err_t RenderProvisioningToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
+{
+    wqn::ClearEpdFramebuffer(true);
+    SettingsHeading(frame, "设置 / 网络", "手机配网", "使用手机完成网络配置");
+    if (frame.provisioning_phase == wqn::ProvisionState::kStarting)
+        SettingsEmpty("正在准备热点", "请稍候，设备正在启动配网。");
+    else if (frame.provisioning_phase == wqn::ProvisionState::kFailed)
+        SettingsEmpty("热点未能启动", "确认重试，检查网络配置。");
+    else if (frame.provisioning_phase == wqn::ProvisionState::kConnected)
+        SettingsEmpty("配置已保存", "正在连接网络，请稍候。");
+    else {
+        SettingsText(kSettingsDetailX, 126, "1  连接设备热点"); SettingsText(kSettingsDetailX + 22, 153, frame.provisioning_ssid, 16, 330); SettingsLine(166);
+        SettingsText(kSettingsDetailX, 190, "2  打开浏览器地址"); SettingsText(kSettingsDetailX + 22, 216, "192.168.4.1", 16, 330);
+        SettingsText(kSettingsDetailX, 250, "保存 WiFi 后返回设备", 12);
     }
     return RefreshFrame(frame, schedule);
+}
+
+bool UpdateSettingsDeckStatus(wqn::UiState* state)
+{
+    auto& settings = state->settings;
+    const auto& word = state->word_app;
+    const auto status = !word.deck_catalog.empty() || (word.pack_index.has_manifest && !word.pack_index.pack_error)
+        ? wqn::SettingsDeckStatus::kReady
+        : IsWordPackCloudBusy() ? wqn::SettingsDeckStatus::kLoading
+        : word.cloud_sync_failed || word.pack_index.pack_error ? wqn::SettingsDeckStatus::kFailed
+        : wqn::SettingsDeckStatus::kEmpty;
+    const bool changed = settings.word_deck_status != status;
+    settings.word_deck_status = status;
+    return changed;
+}
+
+void InstallSettingsDeckOptions(wqn::UiState* state, bool preserve_focus)
+{
+    auto& settings = state->settings;
+    std::string selected_id = settings.word_deck_pending_valid ? settings.pending_word_deck_id : state->word_app.default_deck_id;
+    if (preserve_focus && settings.word_deck_selected < settings.word_deck_options.size())
+        selected_id = settings.word_deck_options[settings.word_deck_selected].deck_id;
+    settings.word_deck_options.clear();
+    settings.word_deck_options.push_back(wqn::WordDeckInfo{});
+    settings.word_deck_selected = 0;
+    for (const auto& deck : state->word_app.deck_catalog) {
+        if (deck.deck_id == selected_id) settings.word_deck_selected = settings.word_deck_options.size();
+        settings.word_deck_options.push_back(deck);
+    }
+    UpdateSettingsDeckStatus(state);
 }
 
 void OpenSettingsDialog(wqn::UiState* state, wqn::SettingsDialog dialog)
@@ -536,8 +438,19 @@ void OpenSettingsDialog(wqn::UiState* state, wqn::SettingsDialog dialog)
     if (state == nullptr) {
         return;
     }
+    // Every entry, including the WiFi -> pairing -> WiFi path, shares the
+    // Prepare/reserve/apply gate before reading durable settings snapshots.
+    if (AnyLocalPersistPending(*state)) {
+        state->word_app.session.batch_flush_requested = true;
+        state->settings.notice = "正在保存，请稍后";
+        return;
+    }
     UpdateSettingsDiagnostics(state);
     state->settings.dialog = dialog;
+    state->settings.notice.clear();
+    state->settings.sync_confirm_pending = false;
+    state->settings.default_word_deck_id = state->word_app.default_deck_id;
+    if (dialog == wqn::SettingsDialog::kWifiManage) state->settings.wifi_action_selected = 0;
     if (dialog == wqn::SettingsDialog::kAutoSync) {
         // [persist-worker] Preselect an armed-but-unsaved value (submit rejected
         // or write failed) over the durable one so a re-Confirm retries the
@@ -571,19 +484,7 @@ void OpenSettingsDialog(wqn::UiState* state, wqn::SettingsDialog dialog)
         // catalog. Preselect an armed-but-unsaved switch (submit rejected or
         // transaction failed) over the installed default so a re-Confirm
         // retries the intended deck.
-        auto& settings = state->settings;
-        const std::string& preselect_id = settings.word_deck_pending_valid
-            ? settings.pending_word_deck_id
-            : state->word_app.default_deck_id;
-        settings.word_deck_options.clear();
-        settings.word_deck_options.push_back(wqn::WordDeckInfo{});
-        settings.word_deck_selected = 0;
-        for (const wqn::WordDeckInfo& deck : state->word_app.deck_catalog) {
-            if (deck.deck_id == preselect_id) {
-                settings.word_deck_selected = settings.word_deck_options.size();
-            }
-            settings.word_deck_options.push_back(deck);
-        }
+        InstallSettingsDeckOptions(state, false);
     }
 }
 

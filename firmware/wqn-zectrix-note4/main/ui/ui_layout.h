@@ -18,12 +18,12 @@ constexpr int kScreenHeight = wqn::kEpdHeight;  // 300
 
 // ---- Status bar ----
 // Replaces the dead kStatusBarRect={0,0,400,30} (height 30 was never used).
-// Real divider line is at y=27 across all pages (AI's y=26 is the 1px outlier
-// to be fixed in L2).
+// Settings uses the same full-width divider as Todo and AI.
 constexpr int kStatusBarHeight = 28;            // visual height of the top status band
 constexpr int kStatusBarDividerY = 27;          // y of the separator line under the status bar
 constexpr int kStatusBarTitleX = 10;            // left x of the status bar title (= kMarginX)
-constexpr int kStatusBarTitleY = 6;             // text baseline y of the status bar title
+constexpr int kStatusBarTitleY = 6;             // font line-box top, not alphabetic baseline
+constexpr int kStatusBarIconY = 6;
 constexpr int kStatusBarRightInset = 10;        // right inset for status text (x = kScreenWidth - inset)
 
 // ---- Content margins (two tiers, by page density) ----
@@ -56,6 +56,23 @@ constexpr int kHomeStudyTitleY = 250;
 constexpr int kHomeFooterY = 284;
 constexpr int kHomeAiDividerY = 112;
 constexpr int kHomeStudyDividerY = 220;
+
+// ---- Settings: approved B layout, native type, no persistent help footer ----
+constexpr int kSettingsListX = kMarginX;
+constexpr int kSettingsDetailX = kMarginX;
+constexpr int kSettingsRight = kScreenWidth - kMarginX;
+constexpr int kSettingsTextX = kSettingsListX + 30;
+constexpr int kSettingsOptionTextX = kSettingsDetailX + 30;
+constexpr int kSettingsHeaderDividerY = kStatusBarDividerY;
+constexpr int kSettingsHeaderTextBaseline = kStatusBarTitleY + 14;
+constexpr int kSettingsTitleBaseline = 61;
+constexpr int kSettingsSubtitleBaseline = 84;
+constexpr int kSettingsContentDividerY = 95;
+constexpr int kSettingsRowTop = 96;
+constexpr int kSettingsRowPitch = 36;
+constexpr int kSettingsOptionTop = 111;
+constexpr int kSettingsOptionPitch = 31;
+constexpr int kSettingsDetailWidth = kContentWidth;
 
 // ---- Global page navigation ----
 constexpr int kNavigationX = 8;

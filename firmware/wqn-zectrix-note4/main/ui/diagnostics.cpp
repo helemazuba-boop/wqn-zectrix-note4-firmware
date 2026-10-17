@@ -173,19 +173,15 @@ void UpdateSettingsDiagnostics(wqn::UiState* state)
     uint32_t minutes = 0;
     if (wqn::LoadAutoSyncIntervalMinutes(&minutes) == ESP_OK) {
         state->settings.auto_sync_interval_min = minutes;
-        state->settings.auto_sync_selected = AutoSyncOptionIndex(minutes);
     } else {
         state->settings.auto_sync_interval_min = 0;
-        state->settings.auto_sync_selected = 0;
     }
 
     int volume_percent = 100;
     if (wqn::LoadVolumePercent(&volume_percent) == ESP_OK) {
         state->settings.volume_percent = volume_percent;
-        state->settings.volume_selected = VolumeOptionIndex(volume_percent);
     } else {
         state->settings.volume_percent = 100;
-        state->settings.volume_selected = VolumeOptionIndex(100);
     }
 
     wqn::ImageRenderMode image_mode = wqn::ImageRenderMode::kGray16;
@@ -193,8 +189,8 @@ void UpdateSettingsDiagnostics(wqn::UiState* state)
         image_mode = wqn::ImageRenderMode::kGray16;
     }
     state->settings.image_render_mode = image_mode;
-    state->settings.image_render_selected =
-        image_mode == wqn::ImageRenderMode::kBlackWhite ? 0 : 1;
+    // Cursor seeding belongs to OpenSettingsDialog. A 60s status reload must
+    // refresh durable values without moving a candidate the user is browsing.
 
     // [ai-follow] Durable follow toggle: the value the settings row displays.
     // The worker's own copy is seeded once at boot (LoadUiState's restore pass)
@@ -244,17 +240,22 @@ void UpdateSettingsDiagnostics(wqn::UiState* state)
 
     wqn::SettingsDiagnosticsSnapshot& snapshot = state->settings.diagnostics;
     BatteryReading battery = {};
-    if (ReadBatteryStatus(&battery)) {
+    snapshot.battery_valid = ReadBatteryStatus(&battery);
+    if (snapshot.battery_valid) {
         snapshot.adc_raw = battery.raw;
         snapshot.adc_mv = battery.adc_mv;
         snapshot.battery_mv = battery.battery_mv;
         snapshot.battery_percent = battery.percent;
         snapshot.charging = battery.charging;
         snapshot.full = battery.full;
+        snapshot.external_power_present = battery.external_power_present;
     }
 
     wqn::PlatformDiagnosticsSnapshot platform;
-    if (wqn::ReadPlatformDiagnosticsSnapshot(&platform)) {
+    const bool platform_valid = wqn::ReadPlatformDiagnosticsSnapshot(&platform);
+    snapshot.flash_valid = platform_valid && platform.flash_valid;
+    snapshot.psram_valid = platform_valid && platform.psram_valid;
+    if (platform_valid) {
         if (platform.flash_valid) {
             snapshot.flash_size = platform.flash_size;
         }
@@ -287,7 +288,8 @@ void UpdateSettingsDiagnostics(wqn::UiState* state)
     }
 
     wqn::StorageCapacitySnapshot storage;
-    if (wqn::ReadStorageCapacitySnapshot(&storage) && storage.nvs_valid) {
+    snapshot.nvs_valid = wqn::ReadStorageCapacitySnapshot(&storage) && storage.nvs_valid;
+    if (snapshot.nvs_valid) {
         snapshot.nvs_used_entries = storage.nvs_used_entries;
         snapshot.nvs_free_entries = storage.nvs_free_entries;
         snapshot.nvs_total_entries = storage.nvs_total_entries;
@@ -296,6 +298,7 @@ void UpdateSettingsDiagnostics(wqn::UiState* state)
     snapshot.firmware_version = WQN_FIRMWARE_VERSION;
     snapshot.board_id = WQN_BOARD_ID;
     snapshot.idf_target = CONFIG_IDF_TARGET;
+    snapshot.idf_version = esp_get_idf_version();
 
     // [dev-diag] Dev info dialog fields (DEV_DIAGNOSTICS.md §4.1). All cheap
     // queries on the UI task; no locks beyond the spinlocks inside the heap

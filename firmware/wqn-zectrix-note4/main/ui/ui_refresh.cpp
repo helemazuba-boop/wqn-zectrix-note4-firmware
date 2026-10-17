@@ -5,6 +5,7 @@
 #include "ui_internal.h"
 
 #include <array>
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <functional>
@@ -822,103 +823,58 @@ std::string FrameSignature(const wqn::UiFrame& frame)
             }
         }
     }
+    if (frame.screen == wqn::UiScreen::kProvisioning) {
+        signature.append("|provision:");
+        signature.append(std::to_string(static_cast<int>(frame.provisioning_phase)));
+        signature.push_back('/');
+        signature.append(std::to_string(frame.provisioning_ssid.size()));
+        signature.push_back(':');
+        signature.append(frame.provisioning_ssid);
+    }
     if (frame.screen == wqn::UiScreen::kSettings) {
-        const wqn::SettingsDiagnosticsSnapshot& diag = frame.settings.diagnostics;
+        const auto& s = frame.settings;
+        const auto& d = s.diagnostics;
         signature.append("|settings:");
-        signature.append(std::to_string(frame.settings.selected));
-        signature.push_back('/');
-        // Second-level dev list: which list is drawn and which row is selected
-        // are both visible state; leaving them out would dedup the switch into
-        // the dev list and every UP/DOWN inside it.
-        signature.append(std::to_string(static_cast<int>(frame.settings.view)));
-        signature.push_back('/');
-        signature.append(std::to_string(frame.settings.dev_selected));
-        signature.push_back('/');
-        signature.append(std::to_string(static_cast<int>(frame.settings.dialog)));
-        signature.push_back('/');
-        signature.append(std::to_string(frame.settings.auto_sync_selected));
-        signature.push_back('/');
-        signature.append(std::to_string(frame.settings.auto_sync_interval_min));
-        signature.push_back('/');
-        signature.append(std::to_string(
-            static_cast<int>(frame.settings.image_render_mode)));
-        signature.push_back('/');
-        signature.append(std::to_string(frame.settings.image_render_selected));
-        signature.push_back('/');
-        signature.append(std::to_string(frame.settings.volume_percent));
-        signature.push_back('/');
-        signature.append(std::to_string(frame.settings.volume_selected));
-        signature.push_back('/');
-        // Default-word-deck dialog: the moving selection and the row value
-        // must repaint (missing them froze the dialog cursor -- every UP/DOWN
-        // was deduped as "desired state already represented").
-        signature.append(std::to_string(frame.settings.word_deck_selected));
-        signature.push_back('/');
-        signature.append(frame.settings.default_word_deck_title);
-        signature.push_back('/');
-        // [ai-follow] The new row's value and its dialog cursor are both visible
-        // state; a missing cursor froze the word-deck dialog the same way.
-        signature.append(frame.settings.auto_follow ? "1" : "0");
-        signature.push_back('/');
-        signature.append(std::to_string(frame.settings.ai_follow_selected));
-        signature.push_back('/');
-        signature.append(frame.settings.sync_status);
-        signature.push_back('/');
-        signature.append(frame.settings.notice);
-        signature.push_back('/');
-        signature.append(frame.paired ? "paired" : "unpaired");
-        signature.push_back('/');
-        signature.append(frame.claim_code);
-        signature.push_back('/');
-        signature.append(std::to_string(diag.flash_size));
-        signature.push_back('/');
-        signature.append(std::to_string(diag.nvs_total_entries));
-        signature.push_back('/');
-        signature.append(std::to_string(diag.psram_total));
-        signature.push_back('/');
-        signature.append(diag.firmware_version);
-        signature.push_back('/');
-        signature.append(frame.home.wifi_label);
-        signature.push_back('/');
-        signature.append(WQN_FIRMWARE_VERSION);
-        signature.push_back('/');
-        // [dev-diag] Dev-menu snapshot fields: a parked 60s reload that
-        // changes any of them must invalidate the signature, or the dedup
-        // would swallow the repaint.
-        signature.append(diag.git_commit);
-        signature.push_back('/');
-        signature.append(diag.build_time);
-        signature.push_back('/');
-        signature.append(diag.reset_reason_label);
-        signature.push_back('/');
-        signature.append(diag.uptime_label);
-        signature.push_back('/');
-        signature.append(std::to_string(diag.heap_free));
-        signature.push_back('/');
-        signature.append(std::to_string(diag.heap_min_free));
-        signature.push_back('/');
-        signature.append(diag.sync_diag_summary);
-        signature.push_back('/');
-        for (const std::string& sync_line : diag.sync_diag_lines) {
-            signature.append(sync_line);
-            signature.push_back('|');
+        // Length-prefix every text field so SSIDs, titles and errors containing
+        // separators cannot collide with a different visible field sequence.
+        const auto text = [&signature](const std::string& value) {
+            signature.append(std::to_string(value.size()));
+            signature.push_back(':'); signature.append(value); signature.push_back('|');
+        };
+        const auto number = [&text](auto value) { text(std::to_string(value)); };
+        number(s.selected); number(static_cast<int>(s.view)); number(s.dev_selected); number(static_cast<int>(s.dialog));
+        number(s.auto_sync_selected); number(s.auto_sync_interval_min);
+        number(s.volume_selected); number(s.volume_percent);
+        number(s.image_render_selected); number(static_cast<int>(s.image_render_mode));
+        number(s.ai_follow_selected); number(s.auto_follow); number(s.wifi_action_selected);
+        number(s.word_deck_selected); text(s.default_word_deck_id); text(s.default_word_deck_title);
+        if (s.dialog == wqn::SettingsDialog::kDefaultWordDeck) {
+            number(static_cast<int>(s.word_deck_status));
+            const size_t count = s.word_deck_options.size();
+            number(count);
+            const size_t selected = count ? std::min(s.word_deck_selected, count - 1) : 0;
+            const size_t start = selected < 5 ? 0 : std::min(selected - 4, count - 5);
+            for (size_t i = start; i < count && i < start + 5; ++i) {
+                text(s.word_deck_options[i].deck_id); text(s.word_deck_options[i].title);
+            }
         }
-        signature.push_back('/');
-        signature.append(diag.error_count_label);
-        signature.push_back('/');
-        signature.append(std::to_string(diag.error_line_count));
-        for (const wqn::SettingsErrorLine& error_line : diag.error_lines) {
-            signature.push_back('|');
-            signature.append(error_line.text);
-        }
-        signature.push_back('/');
-        signature.append(diag.sleep_diag_count_label);
-        signature.push_back('/');
-        signature.append(std::to_string(diag.sleep_diag_line_count));
-        for (const wqn::SettingsSleepDiagLine& sleep_line : diag.sleep_diag_lines) {
-            signature.push_back('|');
-            signature.append(sleep_line.text);
-        }
+        text(s.sync_status); text(s.notice); text(s.wifi_primary_ssid); text(s.wifi_backup_ssid);
+        number(frame.paired); text(frame.claim_code); number(static_cast<int>(frame.provisioning_phase));
+        number(frame.home.wifi_connected); number(frame.home.wifi_rssi);
+        number(frame.home.battery_percent); number(frame.home.charging); number(frame.home.full);
+        number(d.battery_valid); number(d.flash_valid); number(d.nvs_valid); number(d.psram_valid);
+        number(d.adc_raw); number(d.adc_mv); number(d.battery_mv); number(d.battery_percent);
+        number(d.charging); number(d.full); number(d.external_power_present); number(d.flash_size);
+        number(d.nvs_used_entries); number(d.nvs_total_entries);
+        number(d.psram_total); number(d.psram_used); number(d.psram_free);
+        text(d.firmware_version); text(d.idf_target); text(d.idf_version); text(d.content_sync_label);
+        text(d.git_commit); text(d.build_time); text(d.reset_reason_label); text(d.uptime_label);
+        number(d.heap_free); number(d.heap_min_free); text(d.sync_diag_summary);
+        for (const auto& line : d.sync_diag_lines) text(line);
+        number(d.error_line_count);
+        for (const auto& line : d.error_lines) { number(line.valid); text(line.text); }
+        number(d.sleep_diag_line_count);
+        for (const auto& line : d.sleep_diag_lines) { number(line.valid); text(line.text); }
     }
     for (const wqn::UiLine& line : frame.lines) {
         signature.push_back('|');

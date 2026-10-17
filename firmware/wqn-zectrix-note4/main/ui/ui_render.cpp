@@ -111,6 +111,10 @@ esp_err_t RenderFrameToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
     if (frame.screen == wqn::UiScreen::kSettings) {
         return RenderSettingsToEpd(frame, schedule);
     }
+    if (frame.screen == wqn::UiScreen::kProvisioning &&
+        frame.provisioning_phase != wqn::ProvisionState::kIdle) {
+        return RenderProvisioningToEpd(frame, schedule);
+    }
 
     wqn::ClearEpdFramebuffer(true);
 

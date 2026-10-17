@@ -91,9 +91,7 @@ constexpr TickType_t kAiRefreshDelay = pdMS_TO_TICKS(120);
 // Aliases the model-layer constant (ui_model.h) — the row count must have
 // exactly one definition because ui_model.cpp clamps against it too.
 constexpr size_t kSettingsItemCount = wqn::kSettingsItemCount;
-// Settings rows overflow the panel at 38px pitch; the list renders a
-// selection-following window of this many rows.
-constexpr size_t kSettingsVisibleRows = 6;
+constexpr size_t kSettingsVisibleRows = 5;
 constexpr uint32_t kAutoSyncOptions[] = {0, 15, 30, 60, 240};
 constexpr std::size_t kAutoSyncOptionsCount = sizeof(kAutoSyncOptions) / sizeof(kAutoSyncOptions[0]);
 constexpr int kVolumeOptions[] = {0, 25, 50, 75, 100};
@@ -106,7 +104,7 @@ constexpr UiRect kTimeStandbyRect = {0, 42, wqn::kEpdWidth, 172, "time-standby"}
 constexpr UiRect kTimerRunRect = {0, 32, wqn::kEpdWidth, 268, "timer-run"};
 constexpr UiRect kCountdownConfigRect = {0, 70, wqn::kEpdWidth, 205, "countdown-config"};
 constexpr UiRect kPomodoroConfigRect = {0, 54, wqn::kEpdWidth, 218, "pomodoro-config"};
-constexpr UiRect kSettingsContentRect = {0, 32, wqn::kEpdWidth, 252, "settings-content"};
+constexpr UiRect kSettingsContentRect = {0, 0, wqn::kEpdWidth, wqn::kEpdHeight, "settings-page"};
 
 UiRect ConfigRefreshRect(const wqn::TimeAppState& time_app);
 
@@ -796,15 +794,11 @@ esp_err_t RenderProblemBrowseToEpd(const wqn::UiFrame& frame, RefreshSchedule sc
 
 // ---- Settings page ----------------------------------------------------------
 
-// `view` selects the row list semantics: the root list tags rows by the kind
-// of action they perform, the dev list (kDev) is uniformly read-only.
-esp_err_t DrawSettingsRow(wqn::SettingsView view, size_t row_index, int y, const std::string& title, const std::string& value, bool selected);
-// Footer defaults to the dismiss hint ("确认关闭"); action dialogs pass their
-// own (e.g. "确认进入配网").
-esp_err_t DrawSettingsDialogBox(const std::string& title, const char* footer = "确认关闭");
-esp_err_t DrawSettingsOptionCard(int x, int y, int width, const std::string& label, bool selected);
-esp_err_t RenderSettingsDialog(const wqn::SettingsAppState& settings);
 esp_err_t RenderSettingsToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule);
+esp_err_t RenderProvisioningToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule);
+bool UpdateSettingsDeckStatus(wqn::UiState* state);
+bool AnyLocalPersistPending(const wqn::UiState& state);
+void InstallSettingsDeckOptions(wqn::UiState* state, bool preserve_focus);
 
 // ---- Todo page --------------------------------------------------------------
 

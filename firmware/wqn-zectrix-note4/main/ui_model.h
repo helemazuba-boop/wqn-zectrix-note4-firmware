@@ -15,6 +15,7 @@
 #include "note_app.h"
 #include "opencode_model.h"
 #include "problem_app.h"
+#include "provision_manager.h"
 #include "storage.h"
 #include "time_app.h"
 #include "word_app.h"
@@ -208,7 +209,7 @@ constexpr size_t kSettingsRowWordDeck = 6;
 // [ai-follow] The auto-follow toggle's new home: it left the AI status-bar
 // cluster (where a set-once preference did not belong) for the settings page.
 constexpr size_t kSettingsRowAiFollow = 7;
-constexpr size_t kSettingsRowVersion = 8;
+constexpr size_t kSettingsRowAbout = 8;
 #if CONFIG_WQN_DEV_MENU_ENABLE
 constexpr size_t kSettingsRowDevMenu = 9;
 constexpr size_t kSettingsRowFactoryReset = 10;
@@ -218,8 +219,8 @@ constexpr size_t kSettingsRowFactoryReset = 9;
 constexpr size_t kSettingsRowPowerOff = 10;
 #endif
 
-// Second-level dev list (DEV_DIAGNOSTICS.md §3): six rows, which is exactly the
-// panel's 6-row window, so it needs no scrolling. kDevRowBatteryRaw and
+// Second-level dev list (DEV_DIAGNOSTICS.md §3): six rows in the five-row
+// selection-following window. kDevRowBatteryRaw and
 // kDevRowStorage carry the two detail dialogs that used to sit on the root
 // list; the flag gates only the root entry row, not these constants.
 constexpr size_t kDevItemCount = 6;
@@ -241,6 +242,8 @@ enum class SettingsView {
     kDev,
 };
 
+enum class SettingsDeckStatus { kReady, kEmpty, kLoading, kFailed };
+
 enum class SettingsDialog {
     kNone,
     kWifiManage,
@@ -257,6 +260,10 @@ enum class SettingsDialog {
     kSleepDiag,
     kFactoryReset,
     kPowerOff,
+    kAbout,
+    kBatterySummary,
+    kPairing,
+    kProvisioningResult,
 };
 
 // [dev-diag] One formatted error-log line for the Dev error dialog, built at
@@ -277,6 +284,11 @@ struct SettingsSleepDiagLine {
 };
 
 struct SettingsDiagnosticsSnapshot {
+    bool battery_valid = false;
+    bool external_power_present = false;
+    bool flash_valid = false;
+    bool nvs_valid = false;
+    bool psram_valid = false;
     int adc_raw = 0;
     int adc_mv = 0;
     int battery_mv = 0;
@@ -294,6 +306,7 @@ struct SettingsDiagnosticsSnapshot {
     std::string firmware_version;
     std::string board_id;
     std::string idf_target;
+    std::string idf_version;
     std::string content_sync_label;
     // [dev-diag] Dev-menu fields (structure fixed by DEV_DIAGNOSTICS.md).
     // Filled by UpdateSettingsDiagnostics on dialog open / state reload; the
@@ -328,6 +341,11 @@ struct SettingsAppState {
     // a deep-sleep wake or a fresh state reload never lands in the dev list.
     SettingsView view = SettingsView::kRoot;
     size_t dev_selected = 0;
+    size_t wifi_action_selected = 0;
+    // A single diagnostic Confirm waits out the driver's double-click window.
+    // Transient interaction state, never persisted or restored across sleep.
+    bool sync_confirm_pending = false;
+    int64_t sync_confirm_at_ms = 0;
     SettingsDialog dialog = SettingsDialog::kNone;
     size_t auto_sync_selected = 0;
     uint32_t auto_sync_interval_min = 0;
@@ -338,8 +356,10 @@ struct SettingsAppState {
     // 「WQN Word 默认词库」单选对话框: option 0 is the fixed 「全部词库」
     // (empty id), the rest mirror the mounted word deck catalog.
     std::vector<WordDeckInfo> word_deck_options;
+    SettingsDeckStatus word_deck_status = SettingsDeckStatus::kReady;
     size_t word_deck_selected = 0;
     // Display value of the settings row (empty = 全部词库).
+    std::string default_word_deck_id;
     std::string default_word_deck_title;
     std::string sync_status;
     std::string notice;
@@ -490,6 +510,8 @@ struct UiFrame {
     bool prefer_full_refresh = false;
     bool paired = false;
     std::string claim_code;
+    ProvisionState provisioning_phase = ProvisionState::kIdle;
+    std::string provisioning_ssid;
     StatusBarEditState status_edit;  // [shell] status-bar edit mode for render
     AgentOptionState agent_option;   // [agent] option-bar focus for render
     HomeSummary home;

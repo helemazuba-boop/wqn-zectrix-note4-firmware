@@ -47,6 +47,7 @@ enum class AppEventKind : uint8_t {
     // [picker-stale] Diagnose-only marker for the picker's self-refresh arm.
     kAgentListPoll,
     kWordCardPrefetch,
+    kSettingsTick,
 };
 
 struct UiUpdate {
@@ -90,6 +91,7 @@ public:
     UiUpdate DispatchAgentSnapshot(const wqn::AgentSessionState& snapshot);
     UiUpdate DispatchClockMinute(bool panel_needs_refresh);
     UiUpdate DispatchStatusEditTimeout(int64_t now_ms);
+    UiUpdate DispatchSettingsTick(int64_t now_ms);
     UiUpdate DispatchStatusReload(wqn::AppState&& snapshot);
     UiUpdate DispatchSyncResult(const wqn::services::SyncEvent& event);
     UiUpdate DispatchDisplayResult(const wqn::display::DisplayResult& result);
@@ -238,6 +240,9 @@ private:
     // [picker-stale] Last attempt at the picker's self-refresh, whether or not
     // the worker accepted it: a rejected poll must not retry on the next tick.
     int64_t agent_list_poll_at_ms_ = 0;
+    wqn::ProvisionState settings_provision_phase_ = wqn::ProvisionState::kIdle;
+    bool settings_provision_active_ = false;
+    std::string settings_provision_ssid_;
 };
 
 const char* AppEventKindName(AppEventKind event);

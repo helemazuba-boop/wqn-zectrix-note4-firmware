@@ -83,13 +83,14 @@ void RequestWordPackRedownload(wqn::UiState* state)
     }
 }
 
-RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiState* state)
+static RefreshSchedule ReduceSettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiState* state)
 {
     if (state == nullptr || state->screen != wqn::UiScreen::kSettings || !event.HasEvent()) {
         return RefreshSchedule::kNone;
     }
 
     const bool short_press = event.type == wqn::ButtonEventType::kShortPress;
+    const bool move_press = short_press || event.type == wqn::ButtonEventType::kDoublePress;
     const bool long_press = event.type == wqn::ButtonEventType::kLongPress;
     // [longpress-fix] Driver-marked auto-repeat; the old duration-based gate
     // (>=1150ms) let the 2nd repeat (650+260=910ms) through as a fresh long
@@ -103,15 +104,44 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
         return RefreshSchedule::kNone;
     }
 
+    auto& settings = state->settings;
+    const bool saving = settings.auto_sync_save_op_id || settings.volume_save_op_id ||
+        settings.image_render_save_op_id || settings.word_deck_save_op_id || settings.auto_follow_save_op_id;
+    if (saving && event.button == wqn::ButtonId::kConfirm && (short_press || long_press)) {
+        settings.notice = "正在保存，请稍候";
+        return RefreshSchedule::kConfig;
+    }
+    if (move_press && event.button != wqn::ButtonId::kConfirm && !saving) settings.notice.clear();
+
+    // The candidate is separate from the durable value. Cancel drops only an
+    // unsaved draft; it never resets an operation id awaiting the worker ACK.
+    if (long_press && event.button == wqn::ButtonId::kConfirm) {
+        bool choice = true;
+        switch (settings.dialog) {
+            case wqn::SettingsDialog::kAutoSync: settings.auto_sync_pending_valid = false; break;
+            case wqn::SettingsDialog::kVolume: settings.volume_pending_valid = false; break;
+            case wqn::SettingsDialog::kImageRendering: settings.image_render_pending_valid = false; break;
+            case wqn::SettingsDialog::kAiFollow: settings.auto_follow_pending_valid = false; break;
+            case wqn::SettingsDialog::kDefaultWordDeck:
+                settings.word_deck_pending_valid = false;
+                settings.pending_word_deck_id.clear(); settings.pending_word_deck_title.clear(); break;
+            default: choice = false; break;
+        }
+        if (choice) {
+            settings.dialog = wqn::SettingsDialog::kNone; settings.notice.clear();
+            return RefreshSchedule::kConfig;
+        }
+    }
+
     if (state->settings.dialog == wqn::SettingsDialog::kAutoSync) {
-        if (short_press && event.button == wqn::ButtonId::kUp) {
+        if (move_press && event.button == wqn::ButtonId::kUp) {
             if (state->settings.auto_sync_selected == 0) {
                 return RefreshSchedule::kNone;
             }
             --state->settings.auto_sync_selected;
             return RefreshSchedule::kConfig;
         }
-        if (short_press && event.button == wqn::ButtonId::kDownPower) {
+        if (move_press && event.button == wqn::ButtonId::kDownPower) {
             if (state->settings.auto_sync_selected + 1 >= kAutoSyncOptionsCount) {
                 return RefreshSchedule::kNone;
             }
@@ -145,14 +175,14 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
     }
 
     if (state->settings.dialog == wqn::SettingsDialog::kVolume) {
-        if (short_press && event.button == wqn::ButtonId::kUp) {
+        if (move_press && event.button == wqn::ButtonId::kUp) {
             if (state->settings.volume_selected == 0) {
                 return RefreshSchedule::kNone;
             }
             --state->settings.volume_selected;
             return RefreshSchedule::kConfig;
         }
-        if (short_press && event.button == wqn::ButtonId::kDownPower) {
+        if (move_press && event.button == wqn::ButtonId::kDownPower) {
             if (state->settings.volume_selected + 1 >= kVolumeOptionsCount) {
                 return RefreshSchedule::kNone;
             }
@@ -181,14 +211,14 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
     }
 
     if (state->settings.dialog == wqn::SettingsDialog::kImageRendering) {
-        if (short_press && event.button == wqn::ButtonId::kUp) {
+        if (move_press && event.button == wqn::ButtonId::kUp) {
             if (state->settings.image_render_selected == 0) {
                 return RefreshSchedule::kNone;
             }
             --state->settings.image_render_selected;
             return RefreshSchedule::kConfig;
         }
-        if (short_press && event.button == wqn::ButtonId::kDownPower) {
+        if (move_press && event.button == wqn::ButtonId::kDownPower) {
             if (state->settings.image_render_selected >= 1) {
                 return RefreshSchedule::kNone;
             }
@@ -220,14 +250,14 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
     }
 
     if (state->settings.dialog == wqn::SettingsDialog::kAiFollow) {
-        if (short_press && event.button == wqn::ButtonId::kUp) {
+        if (move_press && event.button == wqn::ButtonId::kUp) {
             if (state->settings.ai_follow_selected == 0) {
                 return RefreshSchedule::kNone;
             }
             --state->settings.ai_follow_selected;
             return RefreshSchedule::kConfig;
         }
-        if (short_press && event.button == wqn::ButtonId::kDownPower) {
+        if (move_press && event.button == wqn::ButtonId::kDownPower) {
             if (state->settings.ai_follow_selected >= 1) {
                 return RefreshSchedule::kNone;
             }
@@ -263,14 +293,25 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
 
     if (state->settings.dialog == wqn::SettingsDialog::kDefaultWordDeck) {
         auto& settings = state->settings;
-        if (short_press && event.button == wqn::ButtonId::kUp) {
+        if (settings.word_deck_status != wqn::SettingsDeckStatus::kReady) {
+            if (short_press && event.button == wqn::ButtonId::kConfirm &&
+                settings.word_deck_status != wqn::SettingsDeckStatus::kLoading) {
+                wqn::services::RequestContentRefresh(wqn::services::SyncContentDomain::kWordPacks);
+                const bool queued = QueueWordReviewRefresh();
+                UpdateSettingsDeckStatus(state);
+                settings.notice = queued ? "正在同步词库…" : "已请求同步，请稍候";
+                return RefreshSchedule::kConfig;
+            }
+            return RefreshSchedule::kNone;
+        }
+        if (move_press && event.button == wqn::ButtonId::kUp) {
             if (settings.word_deck_selected == 0) {
                 return RefreshSchedule::kNone;
             }
             --settings.word_deck_selected;
             return RefreshSchedule::kConfig;
         }
-        if (short_press && event.button == wqn::ButtonId::kDownPower) {
+        if (move_press && event.button == wqn::ButtonId::kDownPower) {
             if (settings.word_deck_selected + 1 >= settings.word_deck_options.size()) {
                 return RefreshSchedule::kNone;
             }
@@ -320,7 +361,19 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
     }
 
     if (state->settings.dialog == wqn::SettingsDialog::kWifiManage) {
+        if (long_press && event.button == wqn::ButtonId::kConfirm) {
+            state->settings.dialog = wqn::SettingsDialog::kNone;
+            return RefreshSchedule::kConfig;
+        }
+        if (move_press && (event.button == wqn::ButtonId::kUp || event.button == wqn::ButtonId::kDownPower)) {
+            state->settings.wifi_action_selected = event.button == wqn::ButtonId::kUp ? 0 : 1;
+            return RefreshSchedule::kConfig;
+        }
         if (event.button == wqn::ButtonId::kConfirm && short_press) {
+            if (state->settings.wifi_action_selected == 1) {
+                OpenSettingsDialog(state, wqn::SettingsDialog::kPairing);
+                return RefreshSchedule::kConfig;
+            }
             // [wifi-redundancy] Route through the connectivity service rather
             // than the provisioning component directly, keeping the
             // UI -> services dependency direction.
@@ -329,9 +382,23 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
             wqn::services::SetConnectivityProvisioning();
             return RefreshSchedule::kConfig;
         }
-        if ((event.button == wqn::ButtonId::kUp || event.button == wqn::ButtonId::kDownPower) &&
-            short_press) {
-            state->settings.dialog = wqn::SettingsDialog::kNone;
+        return RefreshSchedule::kNone;
+    }
+
+    if (state->settings.dialog == wqn::SettingsDialog::kPairing) {
+        if (event.button == wqn::ButtonId::kConfirm && (short_press || long_press)) {
+            OpenSettingsDialog(state, wqn::SettingsDialog::kWifiManage);
+            return RefreshSchedule::kConfig;
+        }
+        return RefreshSchedule::kNone;
+    }
+    if (state->settings.dialog == wqn::SettingsDialog::kProvisioningResult) {
+        if (event.button == wqn::ButtonId::kConfirm && (short_press || long_press)) {
+            if (short_press && wqn::GetProvisioningState() == wqn::ProvisionState::kFailed) {
+                state->settings.dialog = wqn::SettingsDialog::kNone;
+                state->settings.notice = "正在启动配网…";
+                wqn::services::SetConnectivityProvisioning();
+            } else OpenSettingsDialog(state, wqn::SettingsDialog::kWifiManage);
             return RefreshSchedule::kConfig;
         }
         return RefreshSchedule::kNone;
@@ -342,6 +409,8 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
     // nothing. kDevSync is deliberately NOT in this list -- see its own block
     // below, which is the one dev dialog that can act.
     if (state->settings.dialog == wqn::SettingsDialog::kBattery ||
+        state->settings.dialog == wqn::SettingsDialog::kBatterySummary ||
+        state->settings.dialog == wqn::SettingsDialog::kAbout ||
         state->settings.dialog == wqn::SettingsDialog::kStorage ||
         state->settings.dialog == wqn::SettingsDialog::kDevInfo ||
         state->settings.dialog == wqn::SettingsDialog::kDevErrors ||
@@ -367,10 +436,25 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
     if (state->settings.dialog == wqn::SettingsDialog::kDevSync) {
         if (event.button == wqn::ButtonId::kConfirm &&
             event.type == wqn::ButtonEventType::kDoublePress) {
+            const int64_t elapsed = event.occurred_at_ms - state->settings.sync_confirm_at_ms;
+            if (!state->settings.sync_confirm_pending || elapsed < 0 || elapsed > wqn::kButtonDoublePressWindowMs)
+                return RefreshSchedule::kNone;
+            state->settings.sync_confirm_pending = false;
+            if (AnyLocalPersistPending(*state)) {
+                state->word_app.session.batch_flush_requested = true;
+                state->settings.notice = "正在保存，请稍后";
+                return RefreshSchedule::kConfig;
+            }
             RequestWordPackRedownload(state);
             return RefreshSchedule::kConfig;
         }
-        if (event.button == wqn::ButtonId::kConfirm && (short_press || long_press)) {
+        if (event.button == wqn::ButtonId::kConfirm && short_press) {
+            state->settings.sync_confirm_pending = true;
+            state->settings.sync_confirm_at_ms = event.occurred_at_ms;
+            return RefreshSchedule::kNone;
+        }
+        if (event.button == wqn::ButtonId::kConfirm && long_press) {
+            state->settings.sync_confirm_pending = false;
             state->settings.dialog = wqn::SettingsDialog::kNone;
             return RefreshSchedule::kConfig;
         }
@@ -441,7 +525,7 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
             state->settings.notice.clear();
             return RefreshSchedule::kConfig;
         }
-        if (!short_press) {
+        if (!short_press && !(move_press && event.button != wqn::ButtonId::kConfirm)) {
             return RefreshSchedule::kNone;
         }
         if (event.button == wqn::ButtonId::kUp) {
@@ -495,7 +579,7 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
         BuildHomeSummary(state);
         return RefreshSchedule::kCommit;
     }
-    if (!short_press) {
+    if (!short_press && !(move_press && event.button != wqn::ButtonId::kConfirm)) {
         return RefreshSchedule::kNone;
     }
 
@@ -546,12 +630,7 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
             OpenSettingsDialog(state, wqn::SettingsDialog::kAutoSync);
             return RefreshSchedule::kConfig;
         case wqn::kSettingsRowBattery:
-            // [dev-diag] The raw ADC numbers and the fit formula moved to the
-            // second-level dev list (电量原始); the root row keeps the
-            // user-facing percent and just reports it in the notice line.
-            UpdateSettingsDiagnostics(state);
-            state->settings.notice =
-                "电量 " + std::to_string(state->settings.diagnostics.battery_percent) + "%";
+            OpenSettingsDialog(state, wqn::SettingsDialog::kBatterySummary);
             return RefreshSchedule::kConfig;
         case wqn::kSettingsRowImageRender:
             OpenSettingsDialog(state, wqn::SettingsDialog::kImageRendering);
@@ -565,9 +644,8 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
         case wqn::kSettingsRowAiFollow:
             OpenSettingsDialog(state, wqn::SettingsDialog::kAiFollow);
             return RefreshSchedule::kConfig;
-        case wqn::kSettingsRowVersion:
-            UpdateSettingsDiagnostics(state);
-            state->settings.notice = "固件 " + state->settings.diagnostics.firmware_version;
+        case wqn::kSettingsRowAbout:
+            OpenSettingsDialog(state, wqn::SettingsDialog::kAbout);
             return RefreshSchedule::kConfig;
 #if CONFIG_WQN_DEV_MENU_ENABLE
         case wqn::kSettingsRowDevMenu:
@@ -590,6 +668,26 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
         default:
             return RefreshSchedule::kNone;
     }
+}
+
+RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiState* state)
+{
+    if (state == nullptr) return RefreshSchedule::kNone;
+    const auto before_dialog = state->settings.dialog;
+    const auto before_view = state->settings.view;
+    const auto before_screen = state->screen;
+    const bool had_notice = !state->settings.notice.empty();
+    auto refresh = ReduceSettingsButtonEvent(event, state);
+    if (had_notice && state->settings.notice.empty() && refresh == RefreshSchedule::kNone)
+        refresh = RefreshSchedule::kConfig;
+    if (before_dialog != state->settings.dialog || before_view != state->settings.view || before_screen != state->screen) {
+        state->navigation.blocked_mask |= state->navigation.held_mask;
+        if (event.button == wqn::ButtonId::kConfirm) {
+            state->navigation.guard_confirm_double = true;
+            state->navigation.confirmed_at_ms = event.occurred_at_ms;
+        }
+    }
+    return refresh;
 }
 
 // [detail] Cycle the Agent tier's cloud detail level (0 简要 / 1 标准 / 2 详细,
@@ -1261,6 +1359,16 @@ RefreshSchedule ApplyButtonEvent(
     wqn::UiState* state)
 {
     if (state == nullptr || !event.HasEvent()) {
+        return RefreshSchedule::kNone;
+    }
+    // The portal owns the visible screen. Do not activate hidden root rows
+    // while its owner task is still configuring WiFi.
+    if (wqn::IsProvisioningActive()) {
+        if (event.type == wqn::ButtonEventType::kRelease) {
+            const uint8_t bit = 1U << static_cast<unsigned>(event.button);
+            state->navigation.held_mask &= ~bit;
+            state->navigation.blocked_mask &= ~bit;
+        }
         return RefreshSchedule::kNone;
     }
 

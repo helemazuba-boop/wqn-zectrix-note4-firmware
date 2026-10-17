@@ -83,6 +83,8 @@ const char* AppEventKindName(AppEventKind event)
             return "agent-list-poll";
         case AppEventKind::kWordCardPrefetch:
             return "word-card-prefetch";
+        case AppEventKind::kSettingsTick:
+            return "settings-tick";
         default:
             return "unknown";
     }
@@ -132,6 +134,10 @@ void UiRuntime::Initialize(wqn::AppState&& initial_state)
 {
     state_ = std::move(initial_state);
     state_.navigation = {};
+    state_.settings.sync_confirm_pending = false;
+    settings_provision_phase_ = wqn::ProvisionState::kIdle;
+    settings_provision_active_ = false;
+    settings_provision_ssid_.clear();
     home_activity_at_ms_ = esp_timer_get_time() / 1000;
     // Bootstrap always owns revision 1, including a degraded load. The UI can
     // therefore submit its recovery frame without using reserved revision 0.
@@ -183,11 +189,16 @@ UiUpdate UiRuntime::DispatchTodoCloudResult(const TodoCloudResult& result)
 
 UiUpdate UiRuntime::DispatchWordCloudResult(WordCloudResult& result)
 {
+    const bool settings_visible = state_.screen == wqn::UiScreen::kSettings &&
+        state_.settings.dialog == wqn::SettingsDialog::kDefaultWordDeck && result.op == WordCloudOp::kPackSync;
+    const std::string before = settings_visible ? FrameSignature(wqn::RenderUiFrame(state_)) : std::string();
     const bool changed = ApplyWordCloudResult(&state_, result);
-    const RefreshSchedule refresh =
+    if (settings_visible) InstallSettingsDeckOptions(&state_, true);
+    RefreshSchedule refresh =
         changed && state_.screen == wqn::UiScreen::kWord
             ? RefreshSchedule::kCommit
             : RefreshSchedule::kNone;
+    if (settings_visible && before != FrameSignature(wqn::RenderUiFrame(state_))) refresh = RefreshSchedule::kConfig;
     return FinishEvent(AppEventKind::kWordCloudResult, refresh, changed);
 }
 
@@ -735,6 +746,7 @@ UiUpdate UiRuntime::DispatchDefaultDeckChangeResult(
         wqn::SetDefaultWordDeck(
             &state_.word_app, settings.pending_word_deck_id,
             settings.pending_word_deck_title);
+        settings.default_word_deck_id = state_.word_app.default_deck_id;
         settings.default_word_deck_title = state_.word_app.default_deck_title;
         wqn::ResetWordSessionsForScopeChange(&state_.word_app, false);
         RebuildNoteWordDeckRows(&state_);
@@ -1291,6 +1303,38 @@ UiUpdate UiRuntime::DispatchStatusEditTimeout(int64_t now_ms)
         AppEventKind::kStatusEditTimeout,
         expired ? RefreshSchedule::kSelection : RefreshSchedule::kNone,
         expired);
+}
+
+UiUpdate UiRuntime::DispatchSettingsTick(int64_t now_ms)
+{
+    RefreshSchedule refresh = RefreshSchedule::kNone;
+    auto& settings = state_.settings;
+    if (state_.screen == wqn::UiScreen::kSettings && settings.dialog == wqn::SettingsDialog::kDefaultWordDeck &&
+        UpdateSettingsDeckStatus(&state_)) refresh = RefreshSchedule::kConfig;
+    if (settings.sync_confirm_pending &&
+        (state_.screen != wqn::UiScreen::kSettings || settings.dialog != wqn::SettingsDialog::kDevSync))
+        settings.sync_confirm_pending = false;
+    if (settings.sync_confirm_pending && now_ms - settings.sync_confirm_at_ms > wqn::kButtonDoublePressWindowMs) {
+        settings.sync_confirm_pending = false;
+        settings.dialog = wqn::SettingsDialog::kNone;
+        refresh = RefreshSchedule::kConfig;
+    }
+    const auto phase = wqn::GetProvisioningState();
+    const bool active = wqn::IsProvisioningActive();
+    const std::string ssid = wqn::GetProvisioningApSsid();
+    const bool provision_changed = phase != settings_provision_phase_ || active != settings_provision_active_ || ssid != settings_provision_ssid_;
+    if (provision_changed) {
+        settings_provision_phase_ = phase;
+        settings_provision_active_ = active;
+        settings_provision_ssid_ = ssid;
+        if (state_.screen == wqn::UiScreen::kSettings &&
+            (phase == wqn::ProvisionState::kFailed || phase == wqn::ProvisionState::kConnected)) {
+            settings.dialog = wqn::SettingsDialog::kProvisioningResult;
+            settings.notice.clear();
+        }
+        refresh = RefreshSchedule::kConfig;
+    }
+    return FinishEvent(AppEventKind::kSettingsTick, refresh, refresh != RefreshSchedule::kNone);
 }
 
 UiUpdate UiRuntime::DispatchStatusReload(wqn::AppState&& snapshot)

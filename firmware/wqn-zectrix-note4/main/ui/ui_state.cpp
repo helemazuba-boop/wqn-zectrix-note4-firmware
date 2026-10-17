@@ -226,6 +226,7 @@ bool LoadUiState(wqn::UiState* state, bool restore_screen_from_rtc)
     // Mixed [词] rows + the settings row value both mirror the word deck
     // catalog loaded by InitWordApp above.
     RebuildNoteWordDeckRows(state);
+    state->settings.default_word_deck_id = state->word_app.default_deck_id;
     state->settings.default_word_deck_title = state->word_app.default_deck_title;
 
     std::string token;

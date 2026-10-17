@@ -728,21 +728,17 @@ UiFrame RenderUiFrame(const UiState& state)
 {
     UiFrame frame;
 
-    // [fix] While WiFi provisioning is active, override the screen with a
-    // provisioning prompt (which SoftAP to join + captive-portal URL). The
-    // generic fallback in RenderFrameToEpd draws frame.lines for screens it
-    // doesn't specialise, so no new renderer/dispatch is needed.
+    // Project the existing provisioning owner's state; rendering never drives
+    // the portal. Storage recovery also uses kProvisioning, with phase Idle,
+    // and must continue through the generic recovery renderer.
+    const wqn::ProvisionState provisioning_phase = wqn::GetProvisioningState();
     const std::string provisioning_ssid = wqn::GetProvisioningApSsid();
-    if (wqn::GetProvisioningState() != wqn::ProvisionState::kIdle &&
-        !provisioning_ssid.empty()) {
+    frame.provisioning_phase = provisioning_phase;
+    if (wqn::IsProvisioningActive() && provisioning_phase != wqn::ProvisionState::kIdle) {
         frame.screen = UiScreen::kProvisioning;
         frame.prefer_full_refresh = true;
-        AddLine(&frame, UiTextStyle::kTitle, "设备配网");
-        AddLine(&frame, UiTextStyle::kBody, "请用手机连接 WiFi 热点:");
-        AddLine(&frame, UiTextStyle::kSelected, provisioning_ssid);
-        AddLine(&frame, UiTextStyle::kBody, "然后浏览器访问:");
-        AddLine(&frame, UiTextStyle::kSelected, "192.168.4.1");
-        AddLine(&frame, UiTextStyle::kMeta, "输入家庭 WiFi 完成配网");
+        frame.provisioning_ssid = provisioning_ssid;
+        frame.home = state.home;
         return frame;
     }
 
