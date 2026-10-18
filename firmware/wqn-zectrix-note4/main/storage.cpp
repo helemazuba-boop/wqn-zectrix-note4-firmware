@@ -1862,10 +1862,10 @@ std::string AutoSyncIntervalLabel(uint32_t minutes)
 constexpr int kVolumeDefaultPercent = 100;
 constexpr const char* kAudioNamespace = "audio";
 constexpr const char* kVolumeNvsKey = "output_volume";
-// [persist-worker] Read by the audio task, written by the UI task (the sync
-// SaveVolumePercent and SubmitVolumeSave's post-reserve update via
-// SetPlaybackVolumeCache) plus the boot restore in main.cpp. Atomic + relaxed
-// removes the cross-task data race; the value is a self-contained scalar so no
+// [persist-worker] Read by the audio task, written by the UI task after
+// SubmitVolumeSave reserves/enqueues via SetPlaybackVolumeCache, plus the
+// boot restore in main.cpp. Atomic + relaxed removes the cross-task data race;
+// the value is a self-contained scalar so no
 // ordering with other state is needed.
 std::atomic<int> g_volume_percent_cache{kVolumeDefaultPercent};
 

@@ -1780,7 +1780,9 @@ esp_err_t CommitObservationTransaction(void* opaque)
         "append word observation");
     scan->pending.push_back(record);
     ++scan->total_records;
-    ESP_LOGD(kTag, "word observation durable: sequence=%llu mode=%u session=%s",
+    // Summary traces deliberately use a different prefix from the retired
+    // measurement schema consumed by hil_check.py (no duration/byte fields).
+    ESP_LOGD(kTag, "word observation committed: sequence=%llu mode=%u session=%s",
         static_cast<unsigned long long>(observation.sequence),
         static_cast<unsigned>(observation.mode), observation.session_id.c_str());
     // The durable record includes next_position, next_phase, and sequence.
@@ -1864,7 +1866,7 @@ esp_err_t CommitObservationBatchTransaction(void* opaque)
     }
     scan->pending.insert(scan->pending.end(), records.begin(), records.end());
     scan->total_records += records.size();
-    ESP_LOGD(kTag, "word observation batch durable: count=%u appended=%u "
+    ESP_LOGD(kTag, "word observation batch committed: count=%u appended=%u "
                   "first_sequence=%llu last_sequence=%llu mode=%u session=%s",
         static_cast<unsigned>(observations.size()), static_cast<unsigned>(records.size()),
         static_cast<unsigned long long>(observations.front().sequence),
@@ -1973,7 +1975,7 @@ esp_err_t AckObservationBatchTransaction(void* opaque)
     }
     scan->ack_records += records.size();
     scan->total_records += records.size();
-    ESP_LOGD(kTag, "word ACK batch durable: count=%u", static_cast<unsigned>(records.size()));
+    ESP_LOGD(kTag, "word ACK batch committed: count=%u", static_cast<unsigned>(records.size()));
     return ESP_OK;
 }
 
