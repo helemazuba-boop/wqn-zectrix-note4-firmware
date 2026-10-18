@@ -26,6 +26,7 @@ struct Entry {
     int width;
     const lv_font_t* font;
     size_t max_rows;
+    uint8_t markdown_options;
     size_t bytes;
     std::shared_ptr<const AiTextLayout> layout;
 };
@@ -101,12 +102,13 @@ std::vector<std::string> WrapAiNativeText(const std::string& text, int width,
 
 std::shared_ptr<const AiTextLayout> GetAiTextLayout(
     uint64_t message_id, const std::string& text, AiTextKind kind, int width,
-    const lv_font_t* font, size_t max_rows)
+    const lv_font_t* font, size_t max_rows, uint8_t markdown_options)
 {
     max_rows = std::min(max_rows, kAiTextMaxRows);
     const auto match = [&](const Entry& entry) {
         return entry.id == message_id && entry.kind == kind && entry.width == width &&
-            entry.font == font && entry.max_rows == max_rows && entry.source == text;
+            entry.font == font && entry.max_rows == max_rows &&
+            entry.markdown_options == markdown_options && entry.source == text;
     };
     {
         const std::lock_guard<std::mutex> guard(cache_mutex);
@@ -124,7 +126,7 @@ std::shared_ptr<const AiTextLayout> GetAiTextLayout(
     // the second publisher rechecks and adopts the first immutable result.
     auto next = std::make_shared<AiTextLayout>();
     if (kind == AiTextKind::kMarkdown) {
-        next->markdown = LayoutMarkdown(text, width, 0, font, &next->truncated);
+        next->markdown = LayoutMarkdown(text, width, markdown_options, font, &next->truncated);
         if (next->truncated && !next->markdown.empty()) {
             MdLine notice;
             notice.text = AiNativeClip("内容过长，后续未显示", width, font);
@@ -150,7 +152,7 @@ std::shared_ptr<const AiTextLayout> GetAiTextLayout(
         cached_bytes -= cache.front().bytes;
         cache.erase(cache.begin());
     }
-    cache.push_back({message_id, text, kind, width, font, max_rows, bytes, next});
+    cache.push_back({message_id, text, kind, width, font, max_rows, markdown_options, bytes, next});
     cached_bytes += bytes;
     return next;
 }

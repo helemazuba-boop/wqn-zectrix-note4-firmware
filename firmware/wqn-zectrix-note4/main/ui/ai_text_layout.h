@@ -27,7 +27,8 @@ std::vector<std::string> WrapAiNativeText(const std::string& text, int width,
                                          bool* truncated = nullptr);
 std::shared_ptr<const AiTextLayout> GetAiTextLayout(
     uint64_t message_id, const std::string& text, AiTextKind kind, int width,
-    const lv_font_t* font, size_t max_rows = kAiTextMaxRows);
+    const lv_font_t* font, size_t max_rows = kAiTextMaxRows,
+    uint8_t markdown_options = 0);
 
 #ifdef WQN_HOST_TEST
 struct AiTextCacheStats {

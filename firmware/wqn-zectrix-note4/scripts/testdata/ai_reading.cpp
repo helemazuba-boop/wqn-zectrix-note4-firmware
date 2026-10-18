@@ -176,6 +176,15 @@ int main(int argc,char**argv) {
     }
     RenderAiHistoryViewport(ai,mixed,minimum,0);Save(folder,"mixed-markdown-tail");
     std::string huge;for(int i=0;i<4100;++i)huge+="budget row\n";
+    // Identical ids/text/fonts with different math rules must not share rows.
+    const std::string formula="x*y*z + a_b_c";
+    auto normal_math=GetAiTextLayout(98,formula,AiTextKind::kMarkdown,378,font);
+    auto literal_math=GetAiTextLayout(98,formula,AiTextKind::kMarkdown,378,font,kAiTextMaxRows,kMdNoSingleEmphasis);
+    CHECK(normal_math!=literal_math);
+    CHECK(literal_math->markdown[0].text==formula);
+    CHECK(normal_math->markdown[0].text!=formula);
+    CHECK(GetAiTextLayout(98,formula,AiTextKind::kMarkdown,378,font,kAiTextMaxRows,kMdNoSingleEmphasis)==literal_math);
+    CHECK(GetAiTextLayout(98,formula,AiTextKind::kMarkdown,378,font)==normal_math);
     auto limited=GetAiTextLayout(99,huge,AiTextKind::kMarkdown,378,font);
     CHECK(limited->truncated&&limited->markdown.size()<=4096);
     CHECK(limited->markdown.back().text.find("后续未显示")!=std::string::npos);
