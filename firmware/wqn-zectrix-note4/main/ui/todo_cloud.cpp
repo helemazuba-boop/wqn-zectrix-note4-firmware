@@ -98,13 +98,14 @@ bool QueueTodoRefreshCursor(const std::string& cursor)
     return QueueTodoCloudRequest(request);
 }
 
-bool QueueTodoComplete(const std::string& todo_id)
+bool QueueTodoComplete(const std::string& todo_id, const std::string& cursor)
 {
     if (todo_id.empty()) {
         return false;
     }
     TodoCloudRequest request;
     request.op = TodoCloudOp::kComplete;
+    std::snprintf(request.cursor, sizeof(request.cursor), "%s", cursor.c_str());
     std::snprintf(request.todo_id, sizeof(request.todo_id), "%s", todo_id.c_str());
     return QueueTodoCloudRequest(request);
 }
@@ -144,6 +145,7 @@ void ApplyTodoList(wqn::UiState* state, wqn::WqnTodoListPage page, bool cursor_r
     if (cursor_request) state->todo.window_start = 0;
     state->todo.todos = std::move(page.todos);
     state->todo.loaded_once = true;
+    state->todo.paging_stale = false;
     state->todo.total_pending = page.total > 0 ? page.total : static_cast<int>(state->todo.todos.size());
     state->todo.previous_cursor = page.previous_cursor;
     state->todo.next_cursor = page.next_cursor;
@@ -202,6 +204,8 @@ bool ApplyTodoCloudResult(
 
     if (result.op == TodoCloudOp::kRefresh) {
         if (result.result == ESP_OK) {
+            state->todo.current_cursor = result.cursor;
+            const bool was_stale = state->todo.paging_stale;
             if (!result.cursor_request && state->todo.loaded_once &&
                 TodoPageMatchesState(*state, result.page)) {
                 // Nothing the user can see changed; just retire the "syncing"
@@ -211,13 +215,14 @@ bool ApplyTodoCloudResult(
                     state->todo.sync_status != wqn::TodoSyncStatus::kReady ||
                     !state->todo.status_message.empty();
                 state->todo.sync_status = wqn::TodoSyncStatus::kReady;
+                state->todo.paging_stale = false;
                 state->todo.status_message.clear();
                 if (content_changed != nullptr) {
                     *content_changed = false;
                 }
                 return hint_was_visible;
             }
-            ApplyTodoList(state, result.page, result.cursor_request);
+            ApplyTodoList(state, result.page, result.cursor_request && !was_stale);
         } else if (result.auth_required) {
             state->todo.sync_status = wqn::TodoSyncStatus::kAuthRequired;
             state->todo.status_message = "Pair again";
@@ -243,6 +248,7 @@ bool ApplyTodoCloudResult(
             // The accepted request owns the operation. A malformed response ID
             // must not erase some other task from the visible page.
             const std::string completed_id(result.todo_id);
+            const size_t selected_before = state->todo.selected;
             auto it = std::find_if(
                 state->todo.todos.begin(),
                 state->todo.todos.end(),
@@ -252,7 +258,21 @@ bool ApplyTodoCloudResult(
                 state->todo.todos.erase(it);
                 if (state->todo.total_pending > 0) --state->todo.total_pending;
             }
+            const std::string completed_title = state->todo.completion_title;
+            const bool had_next = selected_before < state->todo.todos.size();
+            wqn::ClampUiSelection(state);
+            if (result.has_refreshed_page) {
+                // Deleting a task shifts the server's offset-based cursors.
+                // Install fresh neighbours before permitting a remote page jump.
+                ApplyTodoList(state, result.page, false);
+                if (!had_next && !state->todo.todos.empty()) {
+                    state->todo.selected = std::min(selected_before, state->todo.todos.size() - 1);
+                }
+            } else {
+                state->todo.paging_stale = true;
+            }
             state->todo.completion_task_id = completed_id;
+            state->todo.completion_title = completed_title;
             state->todo.sync_status = wqn::TodoSyncStatus::kCompleted;
             state->todo.status_message = "Completed";
         } else if (result.auth_required) {
@@ -322,7 +342,7 @@ RefreshSchedule CompleteSelectedTodo(wqn::UiState* state)
     }
 
     const std::string todo_id = state->todo.todos[selected].id;
-    if (!QueueTodoComplete(todo_id)) {
+    if (!QueueTodoComplete(todo_id, state->todo.current_cursor)) {
         if (IsTodoCloudBusy()) return RefreshSchedule::kNone;
         state->todo.completion_task_id = todo_id;
         state->todo.completion_title = state->todo.todos[selected].title;
@@ -354,7 +374,12 @@ RefreshSchedule HandleTodoInput(wqn::UiState* state, wqn::UiInput input)
     const std::string& cursor = up ? todo.previous_cursor : todo.next_cursor;
     if (boundary && has_page && !cursor.empty()) {
         if (IsTodoCloudBusy()) return RefreshSchedule::kNone;
-        if (QueueTodoRefreshCursor(cursor)) {
+        // If the post-completion reload failed, repair the current window
+        // first. Never consume an offset cursor computed before the deletion.
+        const bool queued = todo.paging_stale
+            ? (todo.current_cursor.empty() ? QueueTodoRefresh() : QueueTodoRefreshCursor(todo.current_cursor))
+            : QueueTodoRefreshCursor(cursor);
+        if (queued) {
             todo.sync_status = wqn::TodoSyncStatus::kLoading;
             todo.status_message = "正在加载待办";
         } else {
@@ -387,7 +412,8 @@ void ExecuteTodoCloudRequest(const TodoCloudRequest& request)
     }
     TodoCloudResult& result = g_todo_result_slot;
     result.op = request.op;
-    result.cursor_request = request.cursor[0] != '\0';
+    result.cursor_request = request.op == TodoCloudOp::kRefresh && request.cursor[0] != '\0';
+    std::snprintf(result.cursor, sizeof(result.cursor), "%s", request.cursor);
     result.content_target_revision = request.content_target_revision;
     std::snprintf(result.todo_id, sizeof(result.todo_id), "%s", request.todo_id);
 
@@ -406,6 +432,13 @@ void ExecuteTodoCloudRequest(const TodoCloudRequest& request)
         result.result = wqn::FetchTodoTimeline(token, timeline_request, &result.page);
     } else if (request.op == TodoCloudOp::kComplete) {
         result.result = wqn::CompleteTodo(token, request.todo_id, &result.todo);
+        if (result.result == ESP_OK && result.todo.id == request.todo_id) {
+            wqn::WqnTodoTimelineRequest timeline_request;
+            timeline_request.cursor = request.cursor;
+            timeline_request.limit = 24;
+            result.has_refreshed_page =
+                wqn::FetchTodoTimeline(token, timeline_request, &result.page) == ESP_OK;
+        }
     } else {
         result.result = ESP_ERR_INVALID_ARG;
     }

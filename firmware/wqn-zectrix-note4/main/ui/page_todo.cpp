@@ -1,8 +1,7 @@
-// Todo page rendering: status bar, timeline nodes, cards, due-time parsing, sync status text.
-// Extracted from device_ui.cpp.
-
+// Todo Editorial reference: native four-row task sheet and async feedback.
 #include "ui_internal.h"
 #include "ui_widgets.h"
+#include "ai_native_text.h"
 
 #include <algorithm>
 #include <cctype>
@@ -10,340 +9,266 @@
 #include <ctime>
 #include <string>
 
-#include "display_service.h"
-#include "esp_log.h"
-
 namespace device_ui_internal {
+namespace {
+constexpr int64_t kBeijingOffset = 8 * 3600;
 
-constexpr char kTag[] = "wqn_ui";
+struct TodoDue {
+    std::time_t instant = 0;
+    std::tm local = {};
+    bool timed = false;
+};
 
-bool IsAsciiDigit(char c)
+bool ReadDigits(const std::string& text, size_t offset, size_t count, int* value)
 {
-    return c >= '0' && c <= '9';
+    if (offset + count > text.size()) return false;
+    *value = 0;
+    for (size_t i = offset; i < offset + count; ++i) {
+        if (text[i] < '0' || text[i] > '9') return false;
+        *value = *value * 10 + text[i] - '0';
+    }
+    return true;
 }
 
-std::string TodoDueTimeLabel(const std::string& due_at)
+// Wire instants retain their zone; date-only values retain their calendar day.
+// Do not feed UTC wall-clock fields to mktime() under the device's CST-8 TZ.
+bool ParseTodoDue(const std::string& text, TodoDue* due)
 {
-    for (size_t i = 0; i + 4 < due_at.size(); ++i) {
-        if (!IsAsciiDigit(due_at[i]) || !IsAsciiDigit(due_at[i + 1]) || due_at[i + 2] != ':' ||
-            !IsAsciiDigit(due_at[i + 3]) || !IsAsciiDigit(due_at[i + 4])) {
-            continue;
+    int year = 0, month = 0, day = 0, hour = 23, minute = 59, second = 59;
+    if (!due || text.size() < 10 || text[4] != '-' || text[7] != '-' ||
+        !ReadDigits(text, 0, 4, &year) || !ReadDigits(text, 5, 2, &month) ||
+        !ReadDigits(text, 8, 2, &day) || year < 1970 || month < 1 || month > 12) return false;
+    constexpr int days_per_month[] = {31,28,31,30,31,30,31,31,30,31,30,31};
+    const bool leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    if (day < 1 || day > days_per_month[month - 1] + (month == 2 && leap)) return false;
+    const bool timed = text.size() != 10;
+    int offset = static_cast<int>(kBeijingOffset);
+    if (timed) {
+        if (text.size() < 16 || (text[10] != 'T' && text[10] != ' ') || text[13] != ':' ||
+            !ReadDigits(text, 11, 2, &hour) || !ReadDigits(text, 14, 2, &minute)) return false;
+        size_t cursor = 16;
+        second = 0;
+        if (cursor < text.size() && text[cursor] == ':') {
+            if (!ReadDigits(text, cursor + 1, 2, &second)) return false;
+            cursor += 3;
         }
-        const int hour = (due_at[i] - '0') * 10 + (due_at[i + 1] - '0');
-        const int minute = (due_at[i + 3] - '0') * 10 + (due_at[i + 4] - '0');
-        if (hour >= 0 && hour <= 23 && minute >= 0 && minute <= 59) {
-            return due_at.substr(i, 5);
+        if (cursor < text.size() && text[cursor] == '.') {
+            const size_t first = ++cursor;
+            while (cursor < text.size() && std::isdigit(static_cast<unsigned char>(text[cursor]))) ++cursor;
+            if (cursor == first) return false;
         }
+        if (cursor < text.size() && (text[cursor] == 'Z' || text[cursor] == 'z')) {
+            offset = 0;
+            ++cursor;
+        } else if (cursor < text.size() && (text[cursor] == '+' || text[cursor] == '-')) {
+            const int sign = text[cursor] == '+' ? 1 : -1;
+            int zone_hour = 0, zone_minute = 0;
+            if (text.size() - cursor != 6 || text[cursor + 3] != ':' ||
+                !ReadDigits(text, cursor + 1, 2, &zone_hour) ||
+                !ReadDigits(text, cursor + 4, 2, &zone_minute) || zone_hour > 23 || zone_minute > 59) return false;
+            offset = sign * (zone_hour * 3600 + zone_minute * 60);
+            cursor += 6;
+        }
+        if (cursor != text.size() || hour > 23 || minute > 59 || second > 59) return false;
     }
-    return "--:--";
+    const int adjusted_year = year - (month <= 2);
+    const int era = adjusted_year / 400;
+    const unsigned yoe = static_cast<unsigned>(adjusted_year - era * 400);
+    const unsigned doy = (153u * static_cast<unsigned>(month + (month > 2 ? -3 : 9)) + 2u) / 5u + day - 1;
+    const unsigned doe = yoe * 365u + yoe / 4u - yoe / 100u + doy;
+    const int64_t days = static_cast<int64_t>(era) * 146097 + doe - 719468;
+    due->instant = static_cast<std::time_t>(days * 86400 + hour * 3600 + minute * 60 + second - offset);
+    const std::time_t local = due->instant + kBeijingOffset;
+    if (!gmtime_r(&local, &due->local)) return false;
+    due->timed = timed;
+    return true;
 }
 
-std::string TodoDueDateLabel(const std::string& due_at)
+bool TodoIsOverdue(const wqn::WqnTodoItem& item)
 {
-    if (due_at.size() >= 10 && IsAsciiDigit(due_at[0]) && IsAsciiDigit(due_at[1]) &&
-        IsAsciiDigit(due_at[2]) && IsAsciiDigit(due_at[3]) && due_at[4] == '-' &&
-        IsAsciiDigit(due_at[5]) && IsAsciiDigit(due_at[6]) && due_at[7] == '-' &&
-        IsAsciiDigit(due_at[8]) && IsAsciiDigit(due_at[9])) {
-        return due_at.substr(0, 10);
-    }
-    return "无到期日期";
+    if (!item.completed_at.empty() || item.status == "completed" || item.status == "done" ||
+        item.status == "cancelled" || item.status == "canceled") return false;
+    if (item.status == "overdue") return true;
+    TodoDue due;
+    const std::time_t now = CurrentUnixTime();
+    return now >= kMinReasonableUnixTime && ParseTodoDue(item.due_at, &due) && due.instant < now;
 }
 
-const char* TodoSyncStatusText(wqn::TodoSyncStatus status)
+std::string TodoDueTimeLabel(const std::string& text)
 {
-    switch (status) {
-        case wqn::TodoSyncStatus::kLoading:
-            return "同步中";
-        case wqn::TodoSyncStatus::kReady:
-            return "已同步";
-        case wqn::TodoSyncStatus::kSyncFailed:
-            return "同步失败";
-        case wqn::TodoSyncStatus::kCompleting:
-            return "完成中";
-        case wqn::TodoSyncStatus::kCompleteFailed:
-            return "完成失败";
-        case wqn::TodoSyncStatus::kCompleted:
-            return "已完成";
-        case wqn::TodoSyncStatus::kAuthRequired:
-            return "未配对";
-        case wqn::TodoSyncStatus::kIdle:
-        default:
-            return "待同步";
-    }
+    TodoDue due;
+    if (!ParseTodoDue(text, &due) || !due.timed) return "--:--";
+    char label[8] = {};
+    std::strftime(label, sizeof(label), "%H:%M", &due.local);
+    return label;
 }
 
-std::string TodoItemStatusText(const wqn::WqnTodoItem& item, bool selected, wqn::TodoSyncStatus sync_status)
+std::string TodoDueDateLabel(const std::string& text)
 {
-    if (sync_status == wqn::TodoSyncStatus::kLoading) {
-        return "同步中";
-    }
-    if (sync_status == wqn::TodoSyncStatus::kSyncFailed) {
-        return "同步失败";
-    }
-    if (selected && sync_status == wqn::TodoSyncStatus::kCompleting) {
-        return "完成中";
-    }
-    if (selected && sync_status == wqn::TodoSyncStatus::kCompleteFailed) {
-        return "完成失败";
-    }
-    if (!item.completed_at.empty() || item.status == "completed" || item.status == "done") {
-        return "已完成";
-    }
-    if (item.status == "cancelled" || item.status == "canceled") {
-        return "已取消";
-    }
-    if (item.status == "overdue") {
-        return "已逾期";
-    }
-    if (item.status == "pending" || item.status.empty()) {
-        return "待完成";
-    }
-    return item.status;
-}
-
-std::string TodoCardMetaLabel(const wqn::WqnTodoItem& item, bool selected, wqn::TodoSyncStatus sync_status)
-{
-    const std::string subject = item.subject_name.empty() ? "未分类" : item.subject_name;
-    return subject + " · " + TodoItemStatusText(item, selected, sync_status) + " · " + TodoDueDateLabel(item.due_at);
+    TodoDue due;
+    if (!ParseTodoDue(text, &due)) return "无到期日期";
+    char label[32] = {};
+    std::snprintf(label, sizeof(label), "%d月%d日", due.local.tm_mon + 1, due.local.tm_mday);
+    return label;
 }
 
 std::string TodoStatusNote(const wqn::TodoUiState& todo)
 {
     switch (todo.sync_status) {
-        case wqn::TodoSyncStatus::kLoading:
-            return "正在同步 Todo";
-        case wqn::TodoSyncStatus::kCompleting:
-            return "正在完成选中待办";
-        case wqn::TodoSyncStatus::kCompleteFailed:
-            return "完成失败，请稍后重试";
-        case wqn::TodoSyncStatus::kCompleted:
-            return "已完成选中待办";
-        case wqn::TodoSyncStatus::kSyncFailed:
-            return "同步失败，显示当前缓存";
-        case wqn::TodoSyncStatus::kAuthRequired:
-            return "请重新配对后同步";
-        case wqn::TodoSyncStatus::kReady:
-        case wqn::TodoSyncStatus::kIdle:
-        default:
-            break;
+        case wqn::TodoSyncStatus::kLoading: return "正在同步";
+        case wqn::TodoSyncStatus::kReady: return todo.paging_stale ? "列表待刷新" : "已同步";
+        case wqn::TodoSyncStatus::kSyncFailed: return "同步失败 · 当前缓存";
+        case wqn::TodoSyncStatus::kCompleting: return "正在完成";
+        case wqn::TodoSyncStatus::kCompleteFailed: return "完成失败 · 确认重试";
+        case wqn::TodoSyncStatus::kCompleted: return todo.paging_stale
+            ? "已完成 · 列表待刷新" : "已完成 · " + todo.completion_title;
+        case wqn::TodoSyncStatus::kAuthRequired: return "未配对";
+        default: return "待同步";
     }
-    return todo.status_message;
 }
 
-int TodoPendingCount(const wqn::TodoUiState& todo)
+void DrawTodoStatusBar(const wqn::HomeSummary& home)
 {
-    if (todo.total_pending > 0) {
-        return todo.total_pending;
-    }
-    return static_cast<int>(todo.todos.size());
+    DrawHorizontalLine(0, kStatusBarDividerY, kScreenWidth);
+    const int icons_left = DrawStatusBarIcons(kScreenWidth - kStatusBarRightInset, kStatusBarIconY, home);
+    const auto* font = AiNativeFont(12);
+    const std::string clock = CurrentClockLabel();
+    const int width = wqn::MeasureTextWithFont(font, clock.c_str());
+    AiNativeText(icons_left - 7 - width, kStatusBarTitleY, width, clock, 12);
+    AiNativeText(kStatusBarTitleX, kStatusBarTitleY, icons_left - width - 25, "Todo", 12);
 }
 
-bool ParseTodoDueTime(const std::string& due_at, std::tm* due_tm)
+void DrawTodoSummary(const wqn::TodoUiState& todo)
 {
-    if (due_tm == nullptr || due_at.size() < 10 || !IsAsciiDigit(due_at[0]) || !IsAsciiDigit(due_at[1]) ||
-        !IsAsciiDigit(due_at[2]) || !IsAsciiDigit(due_at[3]) || due_at[4] != '-' || !IsAsciiDigit(due_at[5]) ||
-        !IsAsciiDigit(due_at[6]) || due_at[7] != '-' || !IsAsciiDigit(due_at[8]) || !IsAsciiDigit(due_at[9])) {
-        return false;
-    }
-
-    std::tm parsed = {};
-    parsed.tm_year = (due_at[0] - '0') * 1000 + (due_at[1] - '0') * 100 + (due_at[2] - '0') * 10 +
-                     (due_at[3] - '0') - 1900;
-    parsed.tm_mon = (due_at[5] - '0') * 10 + (due_at[6] - '0') - 1;
-    parsed.tm_mday = (due_at[8] - '0') * 10 + (due_at[9] - '0');
-    parsed.tm_hour = 23;
-    parsed.tm_min = 59;
-    parsed.tm_sec = 59;
-
-    if (due_at.size() >= 16 && due_at[10] == 'T' && IsAsciiDigit(due_at[11]) && IsAsciiDigit(due_at[12]) &&
-        due_at[13] == ':' && IsAsciiDigit(due_at[14]) && IsAsciiDigit(due_at[15])) {
-        parsed.tm_hour = (due_at[11] - '0') * 10 + (due_at[12] - '0');
-        parsed.tm_min = (due_at[14] - '0') * 10 + (due_at[15] - '0');
-        if (due_at.size() >= 19 && due_at[16] == ':' && IsAsciiDigit(due_at[17]) && IsAsciiDigit(due_at[18])) {
-            parsed.tm_sec = (due_at[17] - '0') * 10 + (due_at[18] - '0');
-        } else {
-            parsed.tm_sec = 0;
+    AiNativeText(kTodoLeft, kTodoMetaY, 144, CurrentDateLabel(), 12);
+    const auto* font = AiNativeFont(12);
+    const std::string note = AiNativeClip(TodoStatusNote(todo), kTodoWidth - 152, font);
+    const int note_width = wqn::MeasureTextWithFont(font, note.c_str());
+    AiNativeText(kTodoLeft + kTodoWidth - note_width, kTodoMetaY, note_width, note, 12);
+    const bool unpaired = todo.sync_status == wqn::TodoSyncStatus::kAuthRequired;
+    const bool no_pending = todo.loaded_once && todo.total_pending == 0 && todo.todos.empty() &&
+        !todo.has_earlier && !todo.has_later;
+    const std::string title = unpaired ? "设备未配对" : no_pending ? "暂无待办" : "待办事项";
+    int title_width = kTodoWidth;
+    if (!unpaired) {
+        const int pending = std::max(todo.total_pending, static_cast<int>(todo.todos.size()));
+        std::string number = std::to_string(pending);
+        if (number.size() < 2) number.insert(0, "0");
+        std::string caption = "待完成";
+        // No global overdue aggregate exists on the timeline API. Show it only
+        // when the loaded page contains the whole result, never as a page count.
+        if (!todo.has_earlier && !todo.has_later) {
+            const int overdue = static_cast<int>(std::count_if(todo.todos.begin(), todo.todos.end(), TodoIsOverdue));
+            if (overdue) caption += " · 逾期 " + std::to_string(overdue);
         }
+        const int number_width = wqn::MeasureTextWithFont(&wqn_ui_latin_32, number.c_str());
+        const int caption_width = wqn::MeasureTextWithFont(font, caption.c_str());
+        const int number_x = kTodoLeft + kTodoWidth - caption_width - 7 - number_width;
+        title_width = std::max(0, number_x - kTodoLeft - 10);
+        wqn::DrawTextWithFont(number_x, kTodoTitleY, &wqn_ui_latin_32, number.c_str(), true);
+        AiNativeText(number_x + number_width + 7, kTodoTitleY + 15, caption_width, caption, 12);
     }
-
-    if (parsed.tm_mon < 0 || parsed.tm_mon > 11 || parsed.tm_mday < 1 || parsed.tm_mday > 31 ||
-        parsed.tm_hour < 0 || parsed.tm_hour > 23 || parsed.tm_min < 0 || parsed.tm_min > 59 ||
-        parsed.tm_sec < 0 || parsed.tm_sec > 59) {
-        return false;
-    }
-    *due_tm = parsed;
-    return true;
+    AiNativeText(kTodoLeft, kTodoTitleY, title_width, title, 24);
+    DrawHorizontalLine(kTodoLeft, kTodoDividerY, kTodoWidth);
 }
 
-int TodoOverdueCount(const wqn::TodoUiState& todo)
+void DrawTodoRow(const wqn::WqnTodoItem& item, size_t index, bool selected,
+                 const wqn::TodoUiState& todo, int y)
 {
-    int count = 0;
-    const std::time_t now = CurrentUnixTime();
-    const bool has_valid_clock = now >= kMinReasonableUnixTime;
-    for (const wqn::WqnTodoItem& item : todo.todos) {
-        if (item.status == "overdue") {
-            ++count;
-            continue;
-        }
-        if (!has_valid_clock || item.due_at.empty() || item.status == "completed" || item.status == "done" ||
-            item.status == "cancelled" || item.status == "canceled") {
-            continue;
-        }
-        std::tm due_tm = {};
-        if (!ParseTodoDueTime(item.due_at, &due_tm)) {
-            continue;
-        }
-        const std::time_t due_time = mktime(&due_tm);
-        if (due_time != static_cast<std::time_t>(-1) && due_time < now) {
-            ++count;
-        }
-    }
-    return count;
-}
-
-size_t TodoVisibleStart(const wqn::TodoUiState& todo, size_t selected, size_t visible_count)
-{
-    if (visible_count == 0) return 0;
-    return wqn::ClampTodoListWindow(todo.window_start, selected, todo.todos.size());
-}
-
-void DrawDashedVerticalLine(int x, int y, int height)
-{
-    constexpr int kDash = 6;
-    constexpr int kGap = 5;
-    for (int offset = 0; offset < height; offset += kDash + kGap) {
-        DrawVerticalLine(x, y + offset, std::min(kDash, height - offset));
+    if (selected) FillRect(kTodoLeft, y, kTodoWidth, kTodoRowPitch - 1, true);
+    DrawHorizontalLine(kTodoLeft, y + kTodoRowPitch - 1, kTodoWidth);
+    const bool ink = !selected;
+    char number[24] = {};
+    std::snprintf(number, sizeof(number), "%02u", static_cast<unsigned>(index + 1));
+    AiNativeText(kTodoLeft + 8, y + 16, 27, number, 12, ink);
+    constexpr int text_x = kTodoLeft + 37;
+    constexpr int due_x = kTodoLeft + kTodoWidth - 79;
+    constexpr int text_width = due_x - text_x - 8;
+    AiNativeText(text_x, y + 3, text_width, item.title.empty() ? "未命名待办" : item.title, 16, ink);
+    const std::string meta = (item.subject_name.empty() ? "未分类" : item.subject_name) +
+        " · " + TodoDueDateLabel(item.due_at);
+    AiNativeText(text_x, y + 25, text_width, meta, 12, ink);
+    const bool target = !todo.completion_task_id.empty() && item.id == todo.completion_task_id;
+    const bool pending = target && todo.sync_status == wqn::TodoSyncStatus::kCompleting;
+    const bool failed = target && todo.sync_status == wqn::TodoSyncStatus::kCompleteFailed;
+    const bool overdue = TodoIsOverdue(item);
+    const std::string status = pending ? "完成中" : failed ? "重试" : overdue ? "逾期" : TodoDueTimeLabel(item.due_at);
+    const auto* font = AiNativeFont(12);
+    const int right = kTodoLeft + kTodoWidth - 8;
+    const auto right_text = [&](int top, const std::string& text) {
+        const auto clipped = AiNativeClip(text, 71, font);
+        const int width = wqn::MeasureTextWithFont(font, clipped.c_str());
+        AiNativeText(right - width, top, width, clipped, 12, ink);
+        return width;
+    };
+    const bool two_lines = overdue && !pending && !failed;
+    const int width = right_text(y + (two_lines ? 7 : 16), status);
+    if (two_lines) {
+        right_text(y + 26, TodoDueTimeLabel(item.due_at));
+        if (!selected) FillRect(right - width, y + 21, width, 1, true);
     }
 }
 
-void DrawTimelineNode(int cx, int cy, bool selected)
+void DrawTodoScroll(const wqn::TodoUiState& todo, size_t start)
 {
-    constexpr int kRadius = 6;
-    constexpr int kInnerRadius = 3;
-    for (int dy = -kRadius; dy <= kRadius; ++dy) {
-        for (int dx = -kRadius; dx <= kRadius; ++dx) {
-            const int distance = dx * dx + dy * dy;
-            if (distance > kRadius * kRadius) {
-                continue;
-            }
-            // [L3-cleanup] Removed a dead white-pixel write that was immediately
-            // overwritten by the black/white write below. Selected = solid black
-            // disc; unselected = black ring (distance >= inner^2) + white core.
-            const bool black = selected || distance >= kInnerRadius * kInnerRadius;
-            wqn::DrawEpdPixel(cx + dx, cy + dy, black);
-        }
+    constexpr int height = static_cast<int>(wqn::kTodoListVisibleRows) * kTodoRowPitch;
+    const size_t count = todo.todos.size();
+    if (count > wqn::kTodoListVisibleRows) {
+        // One-bit dashed track, solid thumb. No grayscale asset or waveform.
+        for (int y = 0; y < height; y += 4) FillRect(kTodoScrollX, kTodoListTop + y, 1, 1, true);
+        const int thumb = std::max(18, height * static_cast<int>(wqn::kTodoListVisibleRows) / static_cast<int>(count));
+        const int top = (height - thumb) * static_cast<int>(start) / static_cast<int>(count - wqn::kTodoListVisibleRows);
+        FillRect(kTodoScrollX - 1, kTodoListTop + top, 3, thumb, true);
+    }
+    for (int step = 0; step < 3; ++step) {
+        if (todo.has_earlier) FillRect(kTodoScrollX - step, kTodoListTop - 7 + step, 2 * step + 1, 1, true);
+        if (todo.has_later) FillRect(kTodoScrollX - step, kTodoListTop + height + 6 - step, 2 * step + 1, 1, true);
     }
 }
 
-esp_err_t DrawTodoStatusBar(const wqn::TodoUiState& todo, const wqn::HomeSummary& home)
+void DrawTodoEmptyState(const wqn::TodoUiState& todo)
 {
-    DrawHorizontalLine(0, kStatusBarDividerY, wqn::kEpdWidth);
-    ESP_RETURN_ON_ERROR(wqn::DrawUtf8Text(kMarginX, 6, "Todo", true), kTag, "draw todo title");
-
-    // [v2] Status bar carries only the global four-piece set (title + clock +
-    // wifi + battery). The 今日/逾期 counts that used to crowd here (and get
-    // truncated) move into the content area as a summary line under the cards;
-    // the sync status stays visible there too. Right inset aligned to kMarginX.
-    const int icons_left = DrawStatusBarIcons(wqn::kEpdWidth - kMarginX, 6, home);
-    std::string status = TodoSyncStatusText(todo.sync_status);
-    status += "  " + CurrentClockLabel();
-    const int max_width = std::max(0, icons_left - 6 - kMarginX);
-    const std::string clipped = wqn::TruncateUtf8TextToWidth(status, max_width);
-    const int status_width = wqn::MeasureUtf8TextWidth(clipped.c_str());
-    ESP_RETURN_ON_ERROR(
-        wqn::DrawUtf8Text(std::max(kMarginX, icons_left - 6 - status_width), 6, clipped.c_str(), true),
-        kTag,
-        "draw todo status");
-    return ESP_OK;
-}
-
-esp_err_t DrawTodoCard(const wqn::WqnTodoItem& item, bool selected, wqn::TodoSyncStatus sync_status, int x, int y, int width, int height)
-{
-    // Card outline: drawn by the focus decoration when selected (rounded outer
-    // r6 + 2px-inset concentric inner), or as a plain rounded outline when not,
-    // so the todo cards share the product's rounded-card visual language with
-    // the word home cards. One path owns the outline.
-    if (selected) {
-        DrawSelectionDecoration(x, y, width, height, SelectionStyle::kRoundedInnerBorder);
-    } else {
-        DrawRoundedRect(x, y, width, height, kRoundedOuterRadius);
-    }
-
-    const std::string title = item.title.empty() ? "未命名 Todo" : item.title;
-    ESP_RETURN_ON_ERROR(DrawClippedText(x + 8, y + 7, 48, TodoDueTimeLabel(item.due_at)), kTag, "draw todo time");
-    ESP_RETURN_ON_ERROR(DrawClippedText(x + 62, y + 7, width - 70, title), kTag, "draw todo title text");
-    ESP_RETURN_ON_ERROR(
-        DrawClippedText(x + 8, y + 31, width - 16, TodoCardMetaLabel(item, selected, sync_status)),
-        kTag,
-        "draw todo meta");
-    return ESP_OK;
-}
-
-esp_err_t DrawTodoEmptyState(const wqn::TodoUiState& todo)
-{
-    std::string title = "暂无 Todo";
-    std::string body = "今天没有待办事项";
+    std::string title = "事情都处理好了。";
+    std::string detail = "当前没有待完成的任务。";
     if (todo.sync_status == wqn::TodoSyncStatus::kAuthRequired) {
-        title = "设备未配对";
-        body = "请先在网页端扫码配对";
-    } else if (todo.sync_status == wqn::TodoSyncStatus::kSyncFailed) {
-        title = "Todo 同步失败";
-        body = "请检查 WiFi 后重试";
+        title = "请先连接账户";
+        detail = "在网页端完成设备配对后同步待办。";
     } else if (todo.sync_status == wqn::TodoSyncStatus::kLoading) {
-        title = "正在同步 Todo";
-        body = "正在从云端获取今天的待办";
+        title = "正在同步待办";
+        detail = "任务加载后会显示在这里。";
+    } else if (todo.sync_status == wqn::TodoSyncStatus::kSyncFailed) {
+        title = "待办同步失败";
+        detail = "请检查网络后重新进入待办。";
+    } else if (todo.has_earlier || todo.has_later) {
+        title = "本页已完成";
+        detail = todo.has_later ? "按下键加载后面的待办。" : "按上键加载前面的待办。";
+    } else if (!todo.loaded_once) {
+        title = "待办尚未加载";
+        detail = "连接网络后重新进入待办。";
     }
-    // [v2] Unified empty-state surface (rounded container, title/body/hint).
-    return DrawEmptyState(title, body, TodoSyncStatusText(todo.sync_status));
+    AiNativeText(16, 151, 368, title, 24);
+    DrawHorizontalLine(16, 191, 40);
+    AiNativeText(16, 207, 368, detail, 12);
 }
+}  // namespace
 
 esp_err_t RenderTodoToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
 {
-    const wqn::TodoUiState& todo = frame.todo;
+    const auto& todo = frame.todo;
     wqn::ClearEpdFramebuffer(true);
-    ESP_RETURN_ON_ERROR(DrawTodoStatusBar(todo, frame.home), kTag, "draw todo status bar");
-
+    DrawTodoStatusBar(frame.home);
+    DrawTodoSummary(todo);
     if (todo.sync_status == wqn::TodoSyncStatus::kAuthRequired || todo.todos.empty()) {
-        ESP_RETURN_ON_ERROR(DrawTodoEmptyState(todo), kTag, "draw todo empty state");
-        return RefreshFrame(frame, schedule);
+        DrawTodoEmptyState(todo);
+    } else {
+        const size_t selected = std::min(todo.selected, todo.todos.size() - 1);
+        const size_t start = wqn::ClampTodoListWindow(todo.window_start, selected, todo.todos.size());
+        for (size_t row = 0; row < wqn::kTodoListVisibleRows && start + row < todo.todos.size(); ++row) {
+            const size_t index = start + row;
+            DrawTodoRow(todo.todos[index], index, index == selected, todo, kTodoListTop + static_cast<int>(row) * kTodoRowPitch);
+        }
+        DrawTodoScroll(todo, start);
     }
-
-    constexpr size_t kMaxVisibleTodos = 4;
-    constexpr int kTimelineX = 34;
-    constexpr int kCardX = 54;
-    constexpr int kCardY = 38;
-    constexpr int kCardWidth = 336;
-    constexpr int kCardHeight = 54;
-    constexpr int kCardGap = 8;
-
-    const size_t selected = std::min(todo.selected, todo.todos.size() - 1);
-    const size_t visible_count = std::min(kMaxVisibleTodos, todo.todos.size());
-    const size_t start = TodoVisibleStart(todo, selected, visible_count);
-    const int timeline_start_y = kCardY + 13;
-    const int timeline_height = static_cast<int>((visible_count - 1) * (kCardHeight + kCardGap)) + 1;
-    DrawDashedVerticalLine(kTimelineX, timeline_start_y, std::max(1, timeline_height));
-
-    for (size_t visible_index = 0; visible_index < visible_count; ++visible_index) {
-        const size_t item_index = start + visible_index;
-        const bool is_selected = item_index == selected;
-        const int y = kCardY + static_cast<int>(visible_index) * (kCardHeight + kCardGap);
-        DrawTimelineNode(kTimelineX, y + 13, is_selected);
-        ESP_RETURN_ON_ERROR(
-            DrawTodoCard(todo.todos[item_index], is_selected, todo.sync_status, kCardX, y, kCardWidth, kCardHeight),
-            kTag,
-            "draw todo card");
-    }
-
-    // [v2] Footer summary line: the 今日/逾期 counts moved out of the status bar
-    // live here, joined with any transient sync note.
-    std::string footer = "今日 " + std::to_string(TodoPendingCount(todo));
-    footer += " · 逾期 " + std::to_string(TodoOverdueCount(todo));
-    const std::string note = TodoStatusNote(todo);
-    if (!note.empty()) {
-        footer += " · " + note;
-    }
-    ESP_RETURN_ON_ERROR(DrawClippedText(kCardX, 282, kCardWidth, footer), kTag, "draw todo footer");
     return RefreshFrame(frame, schedule);
 }
-
 }  // namespace device_ui_internal

@@ -160,6 +160,8 @@ struct TodoCloudRequest {
 struct TodoCloudResult {
     TodoCloudOp op = TodoCloudOp::kRefresh;
     bool cursor_request = false;
+    bool has_refreshed_page = false;
+    char cursor[160] = {};
     esp_err_t result = ESP_FAIL;
     bool auth_required = false;
     char todo_id[64] = {};
@@ -452,7 +454,7 @@ bool QueueProblemCloudRequest(const ProblemCloudRequest& request);
 bool QueueTodoRefresh();
 bool QueueTodoRefreshForRevision(uint64_t target_revision);
 bool QueueTodoRefreshCursor(const std::string& cursor);
-bool QueueTodoComplete(const std::string& todo_id);
+bool QueueTodoComplete(const std::string& todo_id, const std::string& cursor);
 
 bool QueueWordReviewRefresh();
 bool QueueWordSessionStart(
@@ -792,22 +794,7 @@ void InstallSettingsDeckOptions(wqn::UiState* state, bool preserve_focus);
 
 // ---- Todo page --------------------------------------------------------------
 
-void DrawDashedVerticalLine(int x, int y, int height);
-void DrawTimelineNode(int cx, int cy, bool selected);
-esp_err_t DrawTodoStatusBar(const wqn::TodoUiState& todo, const wqn::HomeSummary& home);
-esp_err_t DrawTodoCard(const wqn::WqnTodoItem& item, bool selected, wqn::TodoSyncStatus sync_status, int x, int y, int width, int height);
-esp_err_t DrawTodoEmptyState(const wqn::TodoUiState& todo);
 esp_err_t RenderTodoToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule);
-std::string TodoDueTimeLabel(const std::string& due_at);
-std::string TodoDueDateLabel(const std::string& due_at);
-const char* TodoSyncStatusText(wqn::TodoSyncStatus status);
-std::string TodoItemStatusText(const wqn::WqnTodoItem& item, bool selected, wqn::TodoSyncStatus sync_status);
-std::string TodoCardMetaLabel(const wqn::WqnTodoItem& item, bool selected, wqn::TodoSyncStatus sync_status);
-std::string TodoStatusNote(const wqn::TodoUiState& todo);
-int TodoPendingCount(const wqn::TodoUiState& todo);
-int TodoOverdueCount(const wqn::TodoUiState& todo);
-bool ParseTodoDueTime(const std::string& due_at, std::tm* due_tm);
-size_t TodoVisibleStart(const wqn::TodoUiState& todo, size_t selected, size_t visible_count);
 
 // ---- Extern globals (defined in ui_refresh.cpp) ----------------------------
 

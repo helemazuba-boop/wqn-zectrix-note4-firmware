@@ -602,42 +602,25 @@ std::string FrameSignature(const wqn::UiFrame& frame)
     }
     if (frame.screen == wqn::UiScreen::kTodo) {
         signature.append("|todo:");
-        signature.append(std::to_string(static_cast<int>(frame.todo.sync_status)));
-        signature.push_back('/');
-        signature.append(std::to_string(frame.todo.selected));
-        signature.push_back('/');
-        signature.append(std::to_string(frame.todo.window_start));
-        signature.push_back('/');
-        signature.append(std::to_string(frame.todo.has_earlier));
-        signature.append(std::to_string(frame.todo.has_later));
-        signature.push_back('/');
-        signature.append(std::to_string(frame.todo.total_pending));
-        signature.push_back('/');
-        signature.append(frame.todo.status_message);
-        signature.push_back('/');
-        signature.append(std::to_string(frame.todo.completion_task_id.size()));
-        signature.push_back(':');
-        signature.append(frame.todo.completion_task_id);
-        signature.append(std::to_string(frame.todo.completion_title.size()));
-        signature.push_back(':');
-        signature.append(frame.todo.completion_title);
-        signature.push_back('/');
-        signature.append(CurrentClockLabel());
-        signature.push_back('/');
-        signature.append(frame.home.wifi_label);
-        signature.push_back('/');
-        signature.append(frame.home.battery_label);
-        for (const wqn::WqnTodoItem& item : frame.todo.todos) {
-            signature.push_back('/');
-            signature.append(item.id);
-            signature.push_back(':');
-            signature.append(item.title);
-            signature.push_back(':');
-            signature.append(item.status);
-            signature.push_back(':');
-            signature.append(item.due_at);
-            signature.push_back(':');
-            signature.append(item.subject_name);
+        const auto text = [&signature](const std::string& value) {
+            signature.append(std::to_string(value.size()));
+            signature.push_back(':'); signature.append(value); signature.push_back('|');
+        };
+        const auto number = [&text](auto value) { text(std::to_string(value)); };
+        number(static_cast<int>(frame.todo.sync_status));
+        number(frame.todo.selected);
+        number(frame.todo.window_start);
+        number(frame.todo.total_pending);
+        number(frame.todo.loaded_once); number(frame.todo.paging_stale);
+        number(frame.todo.has_earlier); number(frame.todo.has_later);
+        text(frame.todo.status_message);
+        text(frame.todo.completion_task_id); text(frame.todo.completion_title);
+        text(CurrentClockLabel()); text(CurrentDateLabel());
+        number(frame.home.wifi_connected); number(frame.home.wifi_rssi);
+        number(frame.home.battery_percent); number(frame.home.charging); number(frame.home.full);
+        for (const auto& item : frame.todo.todos) {
+            text(item.id); text(item.title); text(item.status);
+            text(item.due_at); text(item.subject_name); text(item.completed_at);
         }
     }
     if (frame.screen == wqn::UiScreen::kWord) {

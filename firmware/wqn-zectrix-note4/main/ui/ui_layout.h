@@ -114,6 +114,16 @@ constexpr int kAgentPickerDividerY = 90;
 constexpr int kAgentPickerListY = 96;
 constexpr int kAgentPickerRowStep = 46;
 
+// ---- Todo: approved Editorial sheet, four double-line rows ----
+constexpr int kTodoLeft = 14;
+constexpr int kTodoWidth = kScreenWidth - 2 * kTodoLeft;
+constexpr int kTodoMetaY = 35;
+constexpr int kTodoTitleY = 55;
+constexpr int kTodoDividerY = 96;
+constexpr int kTodoListTop = 97;
+constexpr int kTodoRowPitch = 46;
+constexpr int kTodoScrollX = kScreenWidth - 6;
+
 // ---- Notes: approved four-row list, shared with the Agent picker ----
 constexpr int kNoteListX = kAgentPickerLeft;
 constexpr int kNoteListWidth = kAgentPickerWidth;

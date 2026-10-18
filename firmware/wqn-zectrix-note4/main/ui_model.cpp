@@ -204,20 +204,6 @@ void RenderTodo(const wqn::UiState& state, wqn::UiFrame* frame)
             is_selected ? wqn::UiTextStyle::kSelected : wqn::UiTextStyle::kBody,
             std::string(is_selected ? "> " : "  ") + Truncate(line, 34));
     }
-
-    std::string footer = std::to_string(selected + 1) + "/" + std::to_string(todo.todos.size()) + "  确认：完成";
-    if (todo.sync_status == wqn::TodoSyncStatus::kLoading) {
-        footer += "  同步中";
-    } else if (todo.sync_status == wqn::TodoSyncStatus::kCompleting) {
-        footer += "  完成中";
-    } else if (todo.sync_status == wqn::TodoSyncStatus::kCompleteFailed) {
-        footer += "  完成失败";
-    } else if (todo.sync_status == wqn::TodoSyncStatus::kCompleted) {
-        footer += "  已完成";
-    } else if (todo.sync_status == wqn::TodoSyncStatus::kSyncFailed) {
-        footer += "  同步失败";
-    }
-    AddLine(frame, wqn::UiTextStyle::kMeta, footer);
 }
 
 void RenderHome(const wqn::UiState& state, wqn::UiFrame* frame)
