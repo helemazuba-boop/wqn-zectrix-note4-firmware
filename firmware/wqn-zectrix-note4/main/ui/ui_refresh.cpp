@@ -623,66 +623,56 @@ std::string FrameSignature(const wqn::UiFrame& frame)
     }
     if (frame.screen == wqn::UiScreen::kWord) {
         signature.append("|word:");
-        signature.append(std::to_string(static_cast<int>(frame.word_app.mode)));
-        signature.push_back('/');
-        signature.append(std::to_string(static_cast<int>(frame.word_app.card_phase)));
-        signature.push_back('/');
-        signature.append(std::to_string(static_cast<int>(frame.word_app.commit_state)));
-        signature.push_back('/');
-        signature.append(std::to_string(static_cast<int>(frame.word_app.home_selection)));
-        signature.push_back('/');
-        signature.append(std::to_string(
-            static_cast<int>(frame.word_app.complete_selection)));
-        signature.push_back('/');
-        signature.append(
-            frame.word_app.review_session_resumable ? "1" : "0");
-        signature.append(
-            frame.word_app.shuffle_session_resumable ? "1" : "0");
-        signature.append(
-            frame.word_app.mistakes_session_resumable ? "1" : "0");
-        signature.push_back('/');
-        signature.append(std::to_string(frame.word_app.card_position));
-        signature.push_back('/');
-        signature.append(std::to_string(frame.word_app.card_count));
-        signature.push_back('/');
-        signature.append(std::to_string(frame.word_app.reviewed_today));
-        signature.push_back('/');
-        signature.append(std::to_string(frame.word_app.correct_today));
-        signature.push_back('/');
-        signature.append(std::to_string(frame.word_app.total_count));
-        signature.push_back('/');
-        signature.append(frame.word_app.pack_ready ? "1" : "0");
-        signature.push_back('/');
-        signature.append(frame.word_app.has_card ? "1" : "0");
-        signature.push_back('/');
-        signature.append(frame.word_app.word);
-        signature.push_back('/');
-        signature.append(frame.word_app.phonetic);
-        signature.push_back('/');
-        signature.append(frame.word_app.meaning);
-        signature.push_back('/');
-        signature.append(frame.word_app.example);
-        signature.push_back('/');
-        signature.append(frame.word_app.example_translation);
-        signature.push_back('/');
-        signature.append(frame.word_app.part_of_speech);
-        signature.push_back('/');
-        signature.append(frame.word_app.status_line);
-        signature.push_back('/');
-        signature.append(frame.word_app.progress_line);
-        signature.push_back('/');
-        signature.append(frame.word_app.review_complete_empty ? "1" : "0");
-        signature.append(std::to_string(frame.word_app.review_complete_reviewed));
-        signature.push_back('/');
-        signature.append(std::to_string(frame.word_app.review_complete_unknown));
-        signature.push_back('/');
-        signature.append(std::to_string(frame.word_app.review_complete_replayed));
-        signature.push_back('/');
-        signature.append(std::to_string(frame.word_app.sequential_cursor));
-        signature.push_back('/');
-        signature.append(std::to_string(frame.word_app.sequential_total));
-        signature.push_back('/');
-        signature.append(frame.word_app.hint);
+        // Every visible field, including live count hints and persistence feedback.
+        // Length-prefix text so slashes/newlines in cloud vocabulary cannot alias.
+        const auto text = [&signature](const std::string& value) {
+            signature.append(std::to_string(value.size()));
+            signature.push_back(':'); signature.append(value); signature.push_back('|');
+        };
+        const auto number = [&text](auto value) { text(std::to_string(value)); };
+        number(static_cast<int>(frame.word_app.mode));
+        number(static_cast<int>(frame.word_app.card_phase));
+        number(static_cast<int>(frame.word_app.commit_state));
+        number(static_cast<int>(frame.word_app.home_selection));
+        number(static_cast<int>(frame.word_app.complete_selection));
+        number(frame.word_app.review_session_resumable);
+        number(frame.word_app.shuffle_session_resumable);
+        number(frame.word_app.mistakes_session_resumable);
+        number(frame.word_app.card_position);
+        number(frame.word_app.card_count);
+        number(frame.word_app.reviewed_today);
+        number(frame.word_app.correct_today);
+        number(frame.word_app.total_count);
+        number(frame.word_app.pack_ready);
+        number(frame.word_app.has_card);
+        number(frame.word_app.review_complete_empty);
+        number(frame.word_app.review_complete_reviewed);
+        number(frame.word_app.review_complete_unknown);
+        number(frame.word_app.review_complete_replayed);
+        number(frame.word_app.sequential_cursor);
+        number(frame.word_app.sequential_total);
+        number(frame.word_app.review_due_known);
+        number(frame.word_app.review_due_count);
+        number(frame.word_app.mistake_count);
+        number(frame.word_app.save_failed);
+        number(frame.word_app.saving);
+        text(frame.word_app.word);
+        text(frame.word_app.phonetic);
+        text(frame.word_app.meaning);
+        text(frame.word_app.example);
+        text(frame.word_app.example_translation);
+        text(frame.word_app.part_of_speech);
+        text(frame.word_app.status_line);
+        text(frame.word_app.progress_line);
+        text(frame.word_app.hint);
+        text(frame.word_app.scope_title);
+        text(frame.word_app.mode_label);
+        text(frame.word_app.feedback);
+        number(frame.home.wifi_connected);
+        number(frame.home.wifi_rssi);
+        number(frame.home.battery_percent);
+        number(frame.home.charging);
+        number(frame.home.full);
     }
     if (frame.screen == wqn::UiScreen::kNote) {
         // The note page renders entirely from frame.note_app (RenderNote adds no

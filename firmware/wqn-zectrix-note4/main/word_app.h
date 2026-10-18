@@ -240,6 +240,8 @@ struct WordAppSnapshot {
     bool pack_ready = false;
     bool pack_truncated = false;
     bool cloud_sync_failed = false;
+    bool save_failed = false;
+    bool saving = false;
     bool review_session_resumable = false;
     bool shuffle_session_resumable = false;
     bool mistakes_session_resumable = false;
@@ -257,12 +259,12 @@ struct WordAppSnapshot {
     uint16_t review_complete_replayed = 0;
     uint32_t sequential_cursor = 0;
     uint16_t sequential_total = 0;
-    // Last sync's due-word count, shown on the review home card. 0 means "not
-    // known" and renders as the pack size instead.
+    // Unknown and known-empty are distinct; no pack-size substitution.
+    bool review_due_known = false;
     uint16_t review_due_count = 0;
     // Last sync's mistakes-pool size, shown on the mistakes home card. -1
     // means "not known" (no sync yet, or an older server) and renders as the
-    // pack size; 0 is a known-empty pool and renders as "0 词".
+    // "-- 词"; 0 is a known-empty pool and renders as "0 词".
     int16_t mistake_count = -1;
     size_t pack_count = 0;
     size_t pack_bytes = 0;
@@ -272,6 +274,9 @@ struct WordAppSnapshot {
     std::string example;
     std::string example_translation;
     std::string part_of_speech;
+    std::string scope_title;
+    std::string mode_label;
+    std::string feedback;
     std::string progress_line;
     std::string status_line;
     std::string hint;
