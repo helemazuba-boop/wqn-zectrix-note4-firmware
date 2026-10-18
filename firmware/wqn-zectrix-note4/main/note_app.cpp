@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <functional>
 #include <cstring>
 #include <new>
 #include <utility>
@@ -11,7 +12,9 @@
 #include "esp_timer.h"
 
 #include "display_service.h"
-#include "ui/markdown_layout.h"
+#include "ui/ai_native_text.h"
+#include "ui/ai_text_layout.h"
+#include "ui/note_reading_geometry.h"
 #include "ui/ui_layout.h"
 
 namespace {
@@ -99,6 +102,7 @@ void ArmNoteBodyFetch(wqn::NoteAppState* state, const char* notebook_id)
 void LoadCurrentNoteBody(wqn::NoteAppState* state)
 {
     state->current_note = wqn::WqnNoteEntry{};
+    state->body_layout.reset();
     state->current_note_loaded = false;
     const auto& items = state->session.persisted.remote.items;
     if (state->note_list_selected >= items.size()) return;
@@ -126,16 +130,16 @@ void LoadCurrentNoteBody(wqn::NoteAppState* state)
             state->current_note.note_id.c_str(),
             static_cast<unsigned>(state->current_note.image_ids.size()),
             static_cast<unsigned>(state->current_note.content.size()));
-        // Precompute the Markdown row count with the SAME width and layout as
-        // RenderNoteBody (ui/page_note.cpp: kMarkdownWidthDense) so the scroll handler
-        // can clamp Down to the last page. Both sides MUST route through LayoutMarkdown or the offsets desync.
-        state->note_body_total_lines = static_cast<uint32_t>(
-            device_ui_internal::CountMarkdownLines(state->current_note.content, device_ui_internal::kMarkdownWidthDense));
+        // The shared cache verifies exact source text, width and font. Note
+        // identity is a cache hint only; the immutable result has no UI state.
+        const uint64_t layout_id = std::hash<std::string>{}(state->current_note.note_id);
+        state->body_layout = device_ui_internal::GetAiTextLayout(layout_id,
+            state->current_note.content, device_ui_internal::AiTextKind::kMarkdown,
+            device_ui_internal::kNoteBodyWidth, device_ui_internal::AiNativeFont());
     } else {
         ESP_LOGW(
             "note_app", "note open read failed: id=%.8s err=%s",
             item.item_id, esp_err_to_name(read_result));
-        state->note_body_total_lines = 0;
     }
 }
 
@@ -374,6 +378,7 @@ void HandleNoteListInput(wqn::NoteAppState* state, wqn::NoteInput input)
         }
         case wqn::NoteInput::kLongConfirm:
             state->current_note = wqn::WqnNoteEntry{};
+            state->body_layout.reset();
             state->current_note_loaded = false;
             // Leaving the list abandons the auto-open intent; an in-flight
             // fetch still lands in the index for the next visit.
@@ -459,14 +464,9 @@ void SetNoteImageRenderModeImpl(wqn::NoteAppState* state, wqn::ImageRenderMode m
 
 uint32_t NoteBodyMaxScroll(const wqn::NoteAppState& state)
 {
-    // RenderNoteBody shows 13 body lines (kContentTop=32, no footer line) or
-    // 12 when the image entry line occupies the first row; clamping to the
-    // last page keeps over-scroll from inflating the offset.
-    const uint32_t visible_lines =
-        state.current_note.image_ids.empty() ? 13 : 12;
-    return state.note_body_total_lines > visible_lines
-        ? state.note_body_total_lines - visible_lines
-        : 0;
+    const size_t rows = state.body_layout ? state.body_layout->markdown.size() : 0;
+    return device_ui_internal::ComputeNoteReadingGeometry(rows,
+        !state.current_note.image_ids.empty(), !wqn::NoteAppNotice(state).empty()).max_scroll;
 }
 
 void EnterNoteImageView(wqn::NoteAppState* state, uint8_t index)
@@ -513,6 +513,7 @@ void HandleNoteViewInput(wqn::NoteAppState* state, wqn::NoteInput input)
                 // in_flight stays: a live fetch result still installs the
                 // fresher index; the mode guard keeps view state untouched.
                 state->current_note = wqn::WqnNoteEntry{};
+                state->body_layout.reset();
                 state->current_note_loaded = false;
                 state->note_scroll_offset_lines = 0;
                 ResetNoteImageViewer(state);
@@ -571,6 +572,7 @@ void HandleNoteViewInput(wqn::NoteAppState* state, wqn::NoteInput input)
         }
         case wqn::NoteInput::kLongConfirm:
             state->current_note = wqn::WqnNoteEntry{};
+            state->body_layout.reset();
             state->current_note_loaded = false;
             state->note_scroll_offset_lines = 0;
             ResetNoteImageViewer(state);
@@ -897,6 +899,7 @@ void ResetNoteSessionForServerInvalid(NoteAppState* state)
     state->note_list_selected = 0;
     state->note_scroll_offset_lines = 0;
     state->current_note = WqnNoteEntry{};
+    state->body_layout.reset();
     state->current_note_loaded = false;
     state->mode = NoteAppMode::kNotebookList;
     state->message = "会话已重置，请重新打开";
@@ -1507,7 +1510,7 @@ NoteAppSnapshot BuildNoteAppSnapshot(const NoteAppState& state)
         snapshot.body_fetch_failed =
             !state.current_note_loaded && state.body_fetch_error;
         snapshot.note_title = state.current_note.title;
-        snapshot.note_body = state.current_note.content;
+        snapshot.body_layout = state.body_layout;
         snapshot.note_id = state.current_note.note_id;
         snapshot.note_image_count =
             static_cast<uint8_t>(std::min<size_t>(state.current_note.image_ids.size(), 4));

@@ -122,6 +122,11 @@ constexpr int kNoteListTitleY = kAgentPickerTitleY;
 constexpr int kNoteListDividerY = kAgentPickerDividerY;
 constexpr int kNoteListTop = kAgentPickerListY;
 constexpr int kNoteListPitch = kAgentPickerRowStep;
+constexpr int kNoteBodyX = 8;
+constexpr int kNoteBodyWidth = 378;
+constexpr int kNoteBodyTop = 32;
+constexpr int kNoteBodyBottom = kScreenHeight - 4;
+constexpr int kNoteBodyLineHeight = 20;
 
 // ---- Global page navigation ----
 constexpr int kNavigationX = 8;

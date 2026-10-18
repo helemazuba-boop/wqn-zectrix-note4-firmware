@@ -38,6 +38,10 @@ def main():
         '@@STORE@@': section(store, 'struct StoredNotePackSnapshot {', 'esp_err_t CompactNoteSessionData(') + '\n' + section(store, 'struct DurableNoteObservation {', 'struct NoteOutboxSnapshot {'),
         '@@MODEL@@': section(model, 'enum class NoteInput {', 'esp_err_t InitNoteApp('),
         '@@FIND@@': function(app, 'size_t FindNotebookRow(') + '\n' + function(app, 'const wqn::NotePackIndexEntry* FindPackEntry('),
+        '@@LOAD@@': function(app, 'void LoadCurrentNoteBody('),
+        '@@BOUNDS@@': function(app, 'uint32_t NoteBodyMaxScroll('),
+        '@@BODY@@': section(page, 'void DrawTransferProgressBar(', '\n}  // namespace\n'),
+        '@@MD_RENDER@@': re.sub(r'^#include[^\n]*\n', '', (root/'main/ui/markdown_render.cpp').read_text(), flags=re.M),
         '@@WINDOW@@': function(app, 'void UpdateListViewport('),
         '@@SNAPSHOT@@': section(app, 'NoteAppSnapshot BuildNoteAppSnapshot(', 'std::string NoteAppStatusLine('),
         '@@NOTICE@@': section(app, 'std::string NoteAppStatusLine(', '\nnamespace {\n\nstruct NotePageFixture'),
@@ -70,9 +74,9 @@ def main():
         unit,binary = folder/'note.cpp',folder/'note'
         unit.write_text(fixture)
         sanitize = ['-fsanitize=address,undefined','-fno-omit-frame-pointer'] if args.sanitize else []
-        subprocess.run(['g++','-std=c++17','-O1','-Wall','-Wextra','-Werror','-pthread',*sanitize,
+        subprocess.run(['g++','-std=c++17','-DWQN_HOST_TEST','-O1','-Wall','-Wextra','-Werror','-pthread',*sanitize,
                         '-I',str(folder),'-I',str(inc),'-I',str(root/'main'),'-I',str(root/'main/ui'),
-                        str(unit),*objects,'-o',str(binary)],check=True,timeout=60)
+                        str(unit),str(root/'main/ui/ai_text_layout.cpp'),str(root/'main/ui/markdown_layout.cpp'),*objects,'-o',str(binary)],check=True,timeout=60)
         command = [str(binary)]
         if args.render_dir:
             args.render_dir.mkdir(parents=True,exist_ok=True)

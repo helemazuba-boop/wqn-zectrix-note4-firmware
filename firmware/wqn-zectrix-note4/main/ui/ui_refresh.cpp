@@ -720,6 +720,10 @@ std::string FrameSignature(const wqn::UiFrame& frame)
         signature.append(note.note_title);
         signature.push_back('/');
         signature.append(note.note_id);
+        // The snapshot retains the immutable layout. Its address cannot be
+        // recycled while an older pending/rendered frame still owns it.
+        signature.push_back('/');
+        signature.append(std::to_string(reinterpret_cast<uintptr_t>(note.body_layout.get())));
         // Image layer state: index/id/ready/error all repaint (download
         // completion flips ready with no other field changing -- the classic
         // "missing signature field freezes the page" trap).

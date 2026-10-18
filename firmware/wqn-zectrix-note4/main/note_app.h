@@ -14,6 +14,8 @@
 #include "storage.h"
 #include "wqn_api.h"
 
+namespace device_ui_internal { struct AiTextLayout; }
+
 namespace wqn {
 
 enum class NoteInput {
@@ -97,10 +99,9 @@ struct NoteAppState {
     size_t notebook_window_start = 0;
     size_t note_list_window_start = 0;
     uint32_t note_scroll_offset_lines = 0;
-    // Total wrapped body lines for the open note (computed at load with the same
-    // wrap width as RenderNoteBody). Bounds Down-scroll so over-scrolling past the
-    // end cannot inflate the offset and leave Up-scroll with nothing to repaint.
-    uint32_t note_body_total_lines = 0;
+    // Produced once at body load, then shared immutably with the EPD snapshot.
+    // The same rows determine counting, bounds and native rendering.
+    std::shared_ptr<const device_ui_internal::AiTextLayout> body_layout;
 
     NoteSessionState session;
     NoteOutboxState outbox;
@@ -223,9 +224,8 @@ struct NoteAppSnapshot {
     std::vector<NoteTitleRow> titles;
     bool titles_have_more = false;
     std::string note_title;
-    std::string note_body;
-    // Identity of the currently-open note; the render layer keys its wrapped-line
-    // cache on this so scrolling does not re-wrap the body every frame.
+    std::shared_ptr<const device_ui_internal::AiTextLayout> body_layout;
+    // Content identity remains separate from the immutable text-only layout.
     std::string note_id;
     // Image layer: count enables the body entry line; the payload pointer is
     // only set when ready and matching note_image_id.

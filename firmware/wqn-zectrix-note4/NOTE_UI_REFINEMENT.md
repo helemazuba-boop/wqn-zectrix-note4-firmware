@@ -29,3 +29,24 @@ Builds use the isolated checkout `/home/unknow/projects/.wqn-note-ui-verify`
 shared checkout also contained another storage refactor. Only Note changes are
 copied for validation; the later storage commit `af6db91` is the clean base.
 Host pixels are not physical panel/HIL evidence. No push or flashing requested.
+
+## Batch 2: shared native reading layout
+
+- Body load produces one immutable layout using the existing bounded text cache
+  and real native 16px metrics. State and display snapshots retain that same
+  result for counting, scrolling and rendering; snapshot creation no longer
+  copies the full body or re-hashes it on every scroll.
+- Body geometry is shared: 20px rows, 13 complete rows normally, 12 with an
+  image entry; an actual notice reserves one further row. First/last bounds and
+  the scrollbar use these exact rows. Note images and notices stay outside the
+  text viewport.
+- Markdown supplies its native font explicitly; problem-page legacy metrics
+  remain untouched. Same-id text changes invalidate the layout, old snapshots
+  remain readable after eviction/reset, and the safety limit has an explicit
+  truncation notice. No storage format or background owner was changed.
+
+Validation: 13564 production load/snapshot/native Markdown assertions under
+ASan/UBSan, all scroll offsets with/without image entry and notice, warm reuse
+and same-id content changes.
+AI reading regression: 24427 assertions under ASan/UBSan. The isolated enabled
+build has zero warnings and passes M8 and binary UI entry-frame checks.

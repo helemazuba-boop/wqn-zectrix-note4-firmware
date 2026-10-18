@@ -7,12 +7,12 @@
 
 #include "markdown_layout.h"
 #include "ai_native_text.h"
+#include "note_reading_geometry.h"
 
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <ctime>
-#include <functional>
 #include <string>
 #include <vector>
 
@@ -23,13 +23,6 @@ namespace {
 constexpr char kTag[] = "wqn_note_page";
 constexpr int kNoteMarginX = kMarginDense;  // [v2] density-page margin (was 8)
 constexpr int kContentW = wqn::kEpdWidth - 2 * kNoteMarginX;
-constexpr int kContentTop = 32;
-// No footer line: lists and the body run down to the panel edge. The body
-// line budget ((kContentBottom - kContentTop) / kBodyLineH = 13) must stay in
-// sync with kNoteBodyVisibleLines in note_app.cpp.
-constexpr int kContentBottom = wqn::kEpdHeight - 4;
-constexpr int kBodyLineH = 20;
-constexpr int kBodyBottom = kContentBottom;
 
 // Converts a UTC ISO-8601 instant ("...Z" or "...+00:00") to the Beijing
 // (UTC+8) calendar date. The pin stays UTC in storage and on the wire (the
@@ -195,80 +188,39 @@ void DrawTransferProgressBar(int y, int8_t bucket)
 
 esp_err_t RenderNoteBody(const wqn::NoteAppSnapshot& note)
 {
-    if (!note.has_body) {
-        // [body-fetch] Opening a note whose pack is missing now dispatches a
-        // targeted single-notebook sync; mirror its state instead of the old
-        // dead-end "稍后再试" (which never resolved without leaving the page).
-        if (note.body_fetch_active) {
-            ESP_RETURN_ON_ERROR(
-                DrawCenteredText(kNoteMarginX, 160, kContentW, "正在同步内容…"),
-                kTag, "draw body sync text");
-            DrawTransferProgressBar(196, note.transfer_progress_bucket);
-            return ESP_OK;
-        }
-        if (note.body_fetch_failed) {
-            return DrawCenteredText(
-                kNoteMarginX, 160, kContentW, "同步失败，按确认重试");
-        }
-        return DrawCenteredText(kNoteMarginX, 160, kContentW, "内容未同步，请稍后再试");
+    if (!note.has_body || !note.body_layout) {
+        DrawNoteEmpty(note.body_fetch_active ? "正在同步内容..."
+            : note.body_fetch_failed ? "内容同步失败" : "内容未同步",
+            note.body_fetch_active ? "请稍候，长按确认可返回。" : "确认重试，长按返回列表。");
+        if (note.body_fetch_active) DrawTransferProgressBar(208, note.transfer_progress_bucket);
+        return ESP_OK;
     }
-    // The note title lives in the status bar, so the body uses full height.
-    // Notes with images dedicate the first row to the image entry (按上进入
-    // 全屏图片)；the body clamp in note_app.cpp mirrors the reduced line budget.
-    int body_top = kContentTop;
+    const auto& lines = note.body_layout->markdown;
+    const auto geometry = ComputeNoteReadingGeometry(lines.size(), note.note_image_count > 0, !note.notice.empty());
+    int entry_y = kNoteBodyTop;
     if (note.note_image_count > 0) {
-        char entry[64];
-        std::snprintf(
-            entry, sizeof(entry), "↑ 查看图片(%u)",
-            static_cast<unsigned>(note.note_image_count));
-        ESP_RETURN_ON_ERROR(
-            DrawClippedText(kNoteMarginX + 2, body_top, kContentW - 14, entry),
-            kTag, "draw note image entry");
-        body_top += kBodyLineH;
+        AiNativeText(kNoteBodyX, entry_y, kNoteBodyWidth,
+            "↑ 图片 " + std::to_string(note.note_image_count) + " 张", 12);
+        DrawHorizontalLine(kNoteBodyX, entry_y + kNoteBodyLineHeight - 1, kNoteBodyWidth);
+        entry_y += kNoteBodyLineHeight;
     }
-    const int visible = std::max(1, (kBodyBottom - body_top) / kBodyLineH);
-    // Lay the body out (Markdown subset) once per opened note; scrolling only
-    // re-reads the cached rows. LayoutMarkdown is a pure fixed-width pass and
-    // MUST use the same width as note_app.cpp's scroll-clamp count (kMarkdownWidthDense), or
-    // Down-scroll clamps to the wrong last page.
-    //
-    // Identity is keyed on note_id + body size + hash: the cache must notice
-    // a same-id content update (cloud sync) WITHOUT pinning a second full
-    // copy of the body text in static storage.
-    static std::string s_layout_note_id;
-    static size_t s_layout_body_size = 0;
-    static size_t s_layout_body_hash = 0;
-    static std::vector<MdLine> s_md_lines;
-    const size_t body_hash = std::hash<std::string>{}(note.note_body);
-    if (note.note_id != s_layout_note_id ||
-        note.note_body.size() != s_layout_body_size ||
-        body_hash != s_layout_body_hash) {
-        s_md_lines = LayoutMarkdown(note.note_body, kMarkdownWidthDense);
-        s_layout_note_id = note.note_id;
-        s_layout_body_size = note.note_body.size();
-        s_layout_body_hash = body_hash;
+    if (!note.notice.empty()) AiNativeText(kNoteBodyX, entry_y, kNoteBodyWidth, note.notice, 12);
+    if (lines.empty()) {
+        DrawNoteEmpty("这篇笔记暂无正文", note.note_image_count ? "可从上方入口查看图片。" : "在网页补充内容后同步。");
+        return ESP_OK;
     }
-    const std::vector<MdLine>& lines = s_md_lines;
-    const int total = static_cast<int>(lines.size());
-    const int max_top = total > visible ? total - visible : 0;
-    int top = static_cast<int>(note.note_scroll_offset_lines);
-    if (top > max_top) top = max_top;
-    if (top < 0) top = 0;
-    for (int i = 0; i < visible && top + i < total; ++i) {
-        ESP_RETURN_ON_ERROR(
-            DrawMarkdownLine(
-                lines[top + i], kNoteMarginX + 2, body_top + i * kBodyLineH,
-                kMarkdownWidthDense, kBodyLineH),
-            kTag, "draw note body line");
+    const uint32_t top = std::min(note.note_scroll_offset_lines, geometry.max_scroll);
+    for (uint32_t i = 0; i < geometry.visible && top + i < lines.size(); ++i) {
+        ESP_RETURN_ON_ERROR(DrawMarkdownLine(lines[top + i], kNoteBodyX,
+            geometry.top + static_cast<int>(i) * kNoteBodyLineHeight,
+            kNoteBodyWidth, kNoteBodyLineHeight, AiNativeFont()), kTag, "draw note body line");
     }
-    // Proportional scrollbar (font-independent) when the body overflows.
-    if (total > visible) {
-        const int track_x = wqn::kEpdWidth - 5;
-        const int track_h = visible * kBodyLineH;
-        int thumb_h = std::max(10, track_h * visible / total);
-        int thumb_y = body_top + track_h * top / total;
-        if (thumb_y + thumb_h > body_top + track_h) thumb_y = body_top + track_h - thumb_h;
-        FillRect(track_x, thumb_y, 3, thumb_h, true);
+    if (lines.size() > geometry.visible) {
+        const int track_h = static_cast<int>(geometry.visible) * kNoteBodyLineHeight;
+        const int thumb_h = std::max(10, track_h * static_cast<int>(geometry.visible) / static_cast<int>(lines.size()));
+        const int travel = track_h - thumb_h;
+        const int thumb_y = geometry.top + static_cast<int>(top * travel / geometry.max_scroll);
+        FillRect(wqn::kEpdWidth - 5, thumb_y, 3, thumb_h, true);
     }
     return ESP_OK;
 }
