@@ -65,10 +65,6 @@ esp_err_t LoadWordSessionCursorNvs(const char* key, void* record, size_t size, b
 // orphan blob behind (4 entries of the 504-entry budget, §五之十). NOT_FOUND is
 // success: clearing a mode that never had a cursor is the normal case.
 esp_err_t ClearWordSessionCursorNvs(const char* key);
-// [measure] Owner-task-only synthetic 52 B CRUD smoke test. Refuses an
-// existing scratch key, never uses a real mode key, and cleans up its own key.
-// This is not a word-session migration/clear or physical power-loss test.
-esp_err_t RunWordCursorNvsSmokeProbe(void* context);
 
 struct DeviceControlState {
     uint64_t config_revision = 0;

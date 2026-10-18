@@ -97,7 +97,7 @@ def main():
                 source, 'esp_err_t AcknowledgeWordObservation(',
                 '\nesp_err_t ReadWordOutboxSnapshot(') + section(
                 source, 'esp_err_t PrepareWordObservationOutboxForSleep(',
-                '\n}  // namespace wqn\n\n// [measure] Temporary bench starter.') + '\n}\n'
+                '\n}  // namespace wqn\n') + '\n}\n'
             if 'esp_err_t RunOutboxMaintenance(' in source else ''),
     }
     template = (root / 'scripts/testdata/word_session_replay.cpp').read_text(
