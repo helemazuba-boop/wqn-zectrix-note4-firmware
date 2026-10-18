@@ -79,6 +79,7 @@ namespace wqn {
 @@SNAPSHOT@@
 }
 namespace device_ui_internal {
+@@SCHEDULE@@
 void FillRect(int,int,int,int,bool);
 void DrawHorizontalLine(int,int,int);
 void DrawVerticalLine(int,int,int);
@@ -114,6 +115,46 @@ void Save(const std::string& folder,const std::string& name) {
 }
 bool HasText(const std::string& text) { return std::any_of(drawn.begin(),drawn.end(),[&](const auto& run){return run.text==text;}); }
 void Bounds() { for(const auto& run:drawn){CHECK(run.x>=0&&run.y>=0);CHECK(run.x+wqn::MeasureTextWithFont(run.font,run.text.c_str())<=400);CHECK(run.y+run.font->line_height<=300);CHECK(run.text.find('\n')==std::string::npos);} }
+// Replay the production input reducer and its refresh-policy tail together.
+// Other screens, cloud session submission and hardware are outside this seam.
+device_ui_internal::RefreshSchedule NoteInputRefresh(wqn::NoteAppState& note,wqn::NoteInput input) {
+    using device_ui_internal::RefreshSchedule;
+    struct { wqn::NoteAppState& note_app; } current{note};
+    auto* state=&current;
+    const auto old_note_signature=wqn::NoteAppSignature(note);
+    const auto old_note_mode=note.mode;
+@@OLD_NOTE_WINDOWS@@
+    CHECK(wqn::HandleNoteAppInput(&note,input)==ESP_OK);
+    if(wqn::NoteAppSignature(note)!=old_note_signature) {
+@@NOTE_REFRESH_POLICY@@
+    return RefreshSchedule::kNone;
+}
+void TestListRefresh() {
+    using namespace wqn;using device_ui_internal::RefreshSchedule;
+    for(auto mode:{NoteAppMode::kNotebookList,NoteAppMode::kNoteList}) {
+        NoteAppState state;state.initialized=true;state.mode=mode;
+        for(int i=0;i<12;++i) {
+            NotePackNotebook book;book.notebook_id="book-"+std::to_string(i);state.pack_index.notebooks.push_back(book);
+            StoredNoteSessionItem item;std::snprintf(item.item_id,sizeof(item.item_id),"note-%02d",i);state.session.persisted.remote.items.push_back(item);
+        }
+        const auto selected=[&]{return mode==NoteAppMode::kNotebookList?state.notebook_selected:state.note_list_selected;};
+        const auto window=[&]{return mode==NoteAppMode::kNotebookList?state.notebook_window_start:state.note_list_window_start;};
+        for(size_t i=1;i<12;++i) {
+            const auto schedule=NoteInputRefresh(state,NoteInput::kDown);
+            if(schedule!=RefreshSchedule::kSelection)std::fprintf(stderr,"list refresh: mode=%u selected=%zu window=%zu schedule=%u\n",static_cast<unsigned>(mode),selected(),window(),static_cast<unsigned>(schedule));
+            CHECK(schedule==RefreshSchedule::kSelection);
+            CHECK(selected()==i);CHECK(window()==(i<4?0:i-3));
+        }
+        for(int i=0;i<4;++i)CHECK(NoteInputRefresh(state,NoteInput::kDown)==RefreshSchedule::kNone);
+        for(int i=10;i>=0;--i) {
+            CHECK(NoteInputRefresh(state,NoteInput::kUp)==RefreshSchedule::kSelection);
+            CHECK(selected()==static_cast<size_t>(i));
+        }
+        for(int i=0;i<4;++i)CHECK(NoteInputRefresh(state,NoteInput::kUp)==RefreshSchedule::kNone);
+        CHECK(NoteInputRefresh(state,NoteInput::kConfirm)==(mode==NoteAppMode::kNotebookList?RefreshSchedule::kCommit:RefreshSchedule::kSelection));
+        // A title's missing-content notice still uses normal partial refresh.
+    }
+}
 void Input(wqn::NoteAppState& state,wqn::NoteInput input) { CHECK(wqn::HandleNoteAppInput(&state,input)==ESP_OK); }
 wqn::NoteAppState ReadingFixture(int rows,int images,bool notice) {
     using namespace device_ui_internal;using namespace wqn;
@@ -154,6 +195,17 @@ void TestReadingInteraction(const std::string& folder) {
         // A short confirm retains its established next-page meaning.
         Input(state,NoteInput::kConfirm);CHECK(state.note_scroll_offset_lines==std::min(geometry.step,geometry.max_scroll));
     }
+    // Ordinary body scrolling stays partial; actual mode/image changes retain
+    // the prior full-waveform requirement, including error retries.
+    auto refresh=ReadingFixture(100,3,false);
+    CHECK(NoteInputRefresh(refresh,NoteInput::kDown)==RefreshSchedule::kSelection);
+    CHECK(NoteInputRefresh(refresh,NoteInput::kUp)==RefreshSchedule::kSelection);
+    CHECK(NoteInputRefresh(refresh,NoteInput::kUp)==RefreshSchedule::kCommit);
+    CHECK(NoteInputRefresh(refresh,NoteInput::kDown)==RefreshSchedule::kNone);
+    CHECK(NoteInputRefresh(refresh,NoteInput::kUp)==RefreshSchedule::kCommit);
+    refresh.image_error=true;CHECK(NoteInputRefresh(refresh,NoteInput::kConfirm)==RefreshSchedule::kCommit);
+    CHECK(NoteInputRefresh(refresh,NoteInput::kLongConfirm)==RefreshSchedule::kCommit);
+    CHECK(NoteInputRefresh(refresh,NoteInput::kLongConfirm)==RefreshSchedule::kCommit);
     auto image=ReadingFixture(100,3,true);image.note_scroll_offset_lines=11;
     EnterNoteImageView(&image,2);CHECK(image.note_scroll_offset_lines==11);
     auto last=NoteAppSignature(image);const auto entered=image.image_view_entered_us;
@@ -292,6 +344,6 @@ int main(int argc,char**argv) {
     stored_note.content.clear();for(int i=0;i<4097;++i)stored_note.content+="x\n";LoadCurrentNoteBody(&state);
     CHECK(state.body_layout->truncated);CHECK(state.body_layout->markdown.size()==4096);
     CHECK(state.body_layout->markdown.back().text=="内容过长，后续未显示");
-    TestReadingInteraction(folder);TestListsAndFetch();
+    TestListRefresh();TestReadingInteraction(folder);TestListsAndFetch();
     std::printf("Note production UI: %d assertions passed\n",checks);
 }

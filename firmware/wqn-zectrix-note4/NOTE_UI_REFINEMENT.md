@@ -74,3 +74,30 @@ Home 191 pass. Enabled ESP32-S3 build: zero warnings, M8 and binary UI stack
 checks pass (owner 1616B, submit 176B, render 4816/4784B). CRLF-aware diff check
 passes. Native production pixel samples are local artifacts under
 `doc/assets/ui-notes-firmware-v1/batch3`; they are host evidence, not HIL.
+
+## Follow-up: list edge movement forced full refresh (2026-10-19)
+
+Device evidence: `logs/serial-COM7-261019-001158-018-54996.log`, revisions
+33-37, uptime 106292-110532ms. Consecutive Down presses were classified as
+`commit`, submitting `waveform=2` and rendering `force_full=1`, even with only
+1.06-2.21% changed pixels. The four-row window follows its selection one row
+at a time, but the old input policy treated every window movement as a full
+page replacement. That forced a full waveform on each further edge step.
+
+The Note input policy now uses `selection` for both lists' window movements.
+Mode changes and attachment navigation still commit; the existing display
+owner's full-frame partial path and periodic cleanup limits remain in place.
+Problem UI, panel waveforms, local-partial admission and persist paths are
+unchanged.
+
+The production reducer + refresh policy regression fails against the previous
+input source at selected index 4 / window 1 (`commit`). It covers forward and
+reverse window movement in both lists, repeated real-boundary no-ops, body
+paging and retained full refresh for mode/image changes. Note replay passes
+15639 assertions under ASan/UBSan; navigation/refresh replay passes 1488.
+Enabled ESP32-S3 build (installed ESP-IDF 5.5.6) passes with zero warnings,
+M8 and the compiled UI stack gate. Full IDF activation could not find its
+OpenOCD/ROM tools; the build used the installed compiler bin directory on PATH
+and the existing IDF Python environment explicitly. No debug tools or panel
+code were changed. The supplied device log is pre-fix evidence; post-fix panel
+behavior still needs device confirmation. Nothing was flashed or pushed.

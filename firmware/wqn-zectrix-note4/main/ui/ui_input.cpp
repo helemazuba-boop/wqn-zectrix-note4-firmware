@@ -1925,8 +1925,6 @@ RefreshSchedule ApplyButtonEvent(
     const std::string old_word_signature = wqn::WordAppSignature(state->word_app);
     const std::string old_note_signature = wqn::NoteAppSignature(state->note_app);
     const wqn::NoteAppMode old_note_mode = state->note_app.mode;
-    const size_t old_notebook_window = state->note_app.notebook_window_start;
-    const size_t old_note_list_window = state->note_app.note_list_window_start;
     const std::string old_problem_signature =
         wqn::ProblemAppSignature(state->problem_app);
     const bool old_problem_active = state->problem_app.active;
@@ -2052,19 +2050,13 @@ RefreshSchedule ApplyButtonEvent(
         // UI task: PumpNoteObservationCommit hands it to the persist worker
         // and the kPersisting gate covers the in-flight window.
         BuildHomeSummary(state);
-        // A note mode transition (notebook<->title<->body<->image) or a list
-        // viewport jump repaints most of the screen; do a full refresh so the
-        // panel is cleared (large partial waveforms ghost, and HIL logs show a
-        // windowed local partial issued right after such a full-frame partial
-        // wedges the SSD1683 BUSY line for 4+ s). Every step inside the image
-        // layer is a whole-frame change too, so it always commits. Same-window
-        // navigation -- including body scroll -- uses the fast partial path;
-        // body over-scroll is bounded by the reducer clamp so reverse-scroll
-        // always reveals new content.
+        // Mode changes and attachment navigation keep their full refresh.
+        // List windows follow the selection one row at a time; treating each
+        // movement as a commit forces a full waveform on every edge step.
+        // Use the same full-frame partial path as body/selection scrolling;
+        // the display owner still enforces its periodic full-refresh limits.
         if (state->note_app.mode != old_note_mode ||
-            state->note_app.mode == wqn::NoteAppMode::kNoteImageView ||
-            state->note_app.notebook_window_start != old_notebook_window ||
-            state->note_app.note_list_window_start != old_note_list_window) {
+            state->note_app.mode == wqn::NoteAppMode::kNoteImageView) {
             return RefreshSchedule::kCommit;
         }
         return RefreshSchedule::kSelection;

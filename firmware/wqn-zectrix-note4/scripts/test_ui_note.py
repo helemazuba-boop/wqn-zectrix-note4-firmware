@@ -22,6 +22,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--render-dir', type=Path)
     parser.add_argument('--sanitize', action='store_true')
+    parser.add_argument('--input-source', type=Path, default=root/'main/ui/ui_input.cpp')
     args = parser.parse_args()
     page = (root/'main/ui/page_note.cpp').read_text()
     app = (root/'main/note_app.cpp').read_text()
@@ -31,8 +32,15 @@ def main():
     display = (root/'components/display_service/display_service.cpp').read_text()
     digits = (root/'main/ui/seven_segment.cpp').read_text()
     refresh = (root/'main/ui/ui_refresh.cpp').read_text()
+    inputs = args.input_source.read_text()
+    internal = (root/'main/ui/ui_internal.h').read_text()
     protocol = (root/'components/device_protocol/include/device_protocol/note_study.h').read_text()
     pieces = {
+        '@@SCHEDULE@@': section(internal, 'enum class RefreshSchedule {', '\nint RefreshRank('),
+        '@@OLD_NOTE_WINDOWS@@': '\n'.join(re.findall(r'^    const size_t old_(?:notebook|note_list)_window =[^\n]+', inputs, flags=re.M)),
+        '@@NOTE_REFRESH_POLICY@@': section(inputs,
+            '        if (state->note_app.mode != old_note_mode ||',
+            '    if (state->selected_home_task != old_home_task ||'),
         '@@PROTOCOL@@': section(protocol, 'enum class Mode', 'struct CandidatePageRequest'),
         '@@PACK@@': section(pack, 'struct WqnNoteEntry {', 'esp_err_t InitNotePackStorage();'),
         '@@STORE@@': section(store, 'struct StoredNotePackSnapshot {', 'esp_err_t CompactNoteSessionData(') + '\n' + section(store, 'struct DurableNoteObservation {', 'struct NoteOutboxSnapshot {'),
