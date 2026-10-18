@@ -90,4 +90,49 @@ void TestPaging(){
     admit=false;CHECK(HandleTodoInput(&state,UiInput::kUp)==RefreshSchedule::kSelection);CHECK(state.todo.sync_status==TodoSyncStatus::kSyncFailed);admit=true;
     state.screen=UiScreen::kHome;CHECK(HandleTodoInput(&state,UiInput::kDown)==RefreshSchedule::kNone);
 }
-int main(){TestWindows();TestPaging();std::printf("Todo: %d assertions passed\n",checks);}
+void TestCompletion(){
+    busy=false;token_valid=true;admit=true;
+    UiState state;auto page=Page(8);page.total=60;ApplyTodoList(&state,page,false);
+    state.todo.selected=4;ClampUiSelection(&state);
+    CHECK(HandleTodoInput(&state,UiInput::kConfirm)==RefreshSchedule::kSelection);
+    CHECK(state.todo.completion_task_id=="task-4");CHECK(state.todo.sync_status==TodoSyncStatus::kCompleting);
+    const int before=requests;
+    for(auto key:{UiInput::kUp,UiInput::kDown,UiInput::kConfirm})CHECK(HandleTodoInput(&state,key)==RefreshSchedule::kNone);
+    CHECK(state.todo.selected==4);CHECK(requests==before);
+    CHECK(!RefreshTodosFromCloud(&state));CHECK(state.todo.sync_status==TodoSyncStatus::kCompleting);
+    TodoCloudResult result;result.op=TodoCloudOp::kComplete;result.result=ESP_FAIL;std::snprintf(result.todo_id,sizeof(result.todo_id),"task-4");
+    bool changed=false;CHECK(ApplyTodoCloudResult(&state,result,&changed));busy=false;
+    CHECK(state.todo.todos.size()==8);CHECK(state.todo.total_pending==60);CHECK(state.todo.sync_status==TodoSyncStatus::kCompleteFailed);
+    CHECK(HandleTodoInput(&state,UiInput::kConfirm)==RefreshSchedule::kSelection);CHECK(std::string(last_request.todo_id)=="task-4");
+    result.result=ESP_OK;result.todo.id="task-4";CHECK(ApplyTodoCloudResult(&state,result,&changed));busy=false;
+    CHECK(state.todo.todos.size()==7);CHECK(state.todo.total_pending==59);CHECK(state.todo.todos[4].id=="task-5");CHECK(state.todo.selected==4);
+    CHECK(state.todo.completion_task_id=="task-4");CHECK(state.todo.sync_status==TodoSyncStatus::kCompleted);
+    CHECK(!ApplyTodoCloudResult(&state,result,&changed));CHECK(state.todo.total_pending==59);
+    CHECK(HandleTodoInput(&state,UiInput::kUp)==RefreshSchedule::kSelection);CHECK(state.todo.completion_task_id.empty());
+    // Sync busy must not manufacture an accepted completion or replace its status.
+    state.todo.sync_status=TodoSyncStatus::kLoading;busy=true;
+    CHECK(HandleTodoInput(&state,UiInput::kConfirm)==RefreshSchedule::kNone);CHECK(state.todo.sync_status==TodoSyncStatus::kLoading);CHECK(state.todo.completion_task_id.empty());busy=false;
+    admit=false;CHECK(HandleTodoInput(&state,UiInput::kConfirm)==RefreshSchedule::kSelection);
+    CHECK(state.todo.sync_status==TodoSyncStatus::kCompleteFailed);CHECK(state.todo.completion_task_id=="task-3");admit=true;
+    CHECK(HandleTodoInput(&state,UiInput::kDown)==RefreshSchedule::kSelection);CHECK(state.todo.sync_status==TodoSyncStatus::kReady);CHECK(state.todo.completion_task_id.empty());
+    CHECK(HandleTodoInput(&state,UiInput::kConfirm)==RefreshSchedule::kSelection);
+    std::snprintf(result.todo_id,sizeof(result.todo_id),"task-5");result.todo.id="other-task";
+    CHECK(ApplyTodoCloudResult(&state,result,&changed));busy=false;CHECK(state.todo.todos.size()==7);CHECK(state.todo.sync_status==TodoSyncStatus::kCompleteFailed);
+    // Unrelated or duplicate terminal results cannot affect a newer operation.
+    CHECK(!ApplyTodoCloudResult(&state,result,&changed));
+    CHECK(HandleTodoInput(&state,UiInput::kConfirm)==RefreshSchedule::kSelection);
+    std::snprintf(result.todo_id,sizeof(result.todo_id),"task-3");CHECK(!ApplyTodoCloudResult(&state,result,&changed));CHECK(state.todo.sync_status==TodoSyncStatus::kCompleting);
+    std::snprintf(result.todo_id,sizeof(result.todo_id),"task-5");result.todo.id="task-5";result.result=ESP_FAIL;result.auth_required=true;
+    CHECK(ApplyTodoCloudResult(&state,result,&changed));CHECK(state.todo.sync_status==TodoSyncStatus::kAuthRequired);busy=false;
+    // A transient refresh failure preserves known global totals and every cached row.
+    result={};result.op=TodoCloudOp::kRefresh;result.result=ESP_FAIL;
+    CHECK(ApplyTodoCloudResult(&state,result,&changed));CHECK(state.todo.total_pending==59);CHECK(state.todo.todos.size()==7);
+    token_valid=false;CHECK(RefreshTodosFromCloud(&state));CHECK(state.todo.total_pending==59);token_valid=true;
+    UiState last;ApplyTodoList(&last,Page(1),false);CHECK(HandleTodoInput(&last,UiInput::kConfirm)==RefreshSchedule::kSelection);
+    result={};result.op=TodoCloudOp::kComplete;result.result=ESP_OK;std::snprintf(result.todo_id,sizeof(result.todo_id),"task-0");
+    CHECK(ApplyTodoCloudResult(&last,result,&changed));busy=false;CHECK(last.todo.todos.empty());CHECK(last.todo.selected==0);CHECK(last.todo.window_start==0);CHECK(last.todo.total_pending==0);
+    UiState refreshed;ApplyTodoList(&refreshed,Page(2),false);auto updated=Page(2);updated.todos[0].subject_name="生物";
+    CHECK(!TodoPageMatchesState(refreshed,updated));result={};result.op=TodoCloudOp::kRefresh;result.result=ESP_OK;result.page=updated;
+    CHECK(ApplyTodoCloudResult(&refreshed,result,&changed));CHECK(changed);CHECK(refreshed.todo.todos[0].subject_name=="生物");
+}
+int main(){TestWindows();TestPaging();TestCompletion();std::printf("Todo: %d assertions passed\n",checks);}

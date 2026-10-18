@@ -615,6 +615,13 @@ std::string FrameSignature(const wqn::UiFrame& frame)
         signature.push_back('/');
         signature.append(frame.todo.status_message);
         signature.push_back('/');
+        signature.append(std::to_string(frame.todo.completion_task_id.size()));
+        signature.push_back(':');
+        signature.append(frame.todo.completion_task_id);
+        signature.append(std::to_string(frame.todo.completion_title.size()));
+        signature.push_back(':');
+        signature.append(frame.todo.completion_title);
+        signature.push_back('/');
         signature.append(CurrentClockLabel());
         signature.push_back('/');
         signature.append(frame.home.wifi_label);

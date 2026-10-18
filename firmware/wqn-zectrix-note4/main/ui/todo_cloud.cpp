@@ -157,6 +157,8 @@ void ApplyTodoList(wqn::UiState* state, wqn::WqnTodoListPage page, bool cursor_r
         }
     }
     state->todo.sync_status = wqn::TodoSyncStatus::kReady;
+    state->todo.completion_task_id.clear();
+    state->todo.completion_title.clear();
     state->todo.status_message.clear();
     wqn::ClampUiSelection(state);
 }
@@ -174,7 +176,8 @@ bool TodoPageMatchesState(const wqn::UiState& state, const wqn::WqnTodoListPage&
         const wqn::WqnTodoItem& b = page.todos[i];
         if (a.id != b.id || a.title != b.title || a.status != b.status ||
             a.priority != b.priority || a.due_at != b.due_at ||
-            a.updated_at != b.updated_at) {
+            a.updated_at != b.updated_at || a.subject_name != b.subject_name ||
+            a.completed_at != b.completed_at) {
             return false;
         }
     }
@@ -218,30 +221,38 @@ bool ApplyTodoCloudResult(
         } else if (result.auth_required) {
             state->todo.sync_status = wqn::TodoSyncStatus::kAuthRequired;
             state->todo.status_message = "Pair again";
-            state->todo.total_pending = static_cast<int>(state->todo.todos.size());
         } else {
             state->todo.sync_status = wqn::TodoSyncStatus::kSyncFailed;
             state->todo.status_message = "Todo sync failed";
-            state->todo.total_pending = static_cast<int>(state->todo.todos.size());
         }
         BuildHomeSummary(state);
         return true;
     }
 
     if (result.op == TodoCloudOp::kComplete) {
+        if (state->todo.sync_status != wqn::TodoSyncStatus::kCompleting ||
+            state->todo.completion_task_id != result.todo_id) {
+            return false;
+        }
+        if (result.result == ESP_OK && !result.todo.id.empty() && result.todo.id != result.todo_id) {
+            state->todo.sync_status = wqn::TodoSyncStatus::kCompleteFailed;
+            state->todo.status_message = "完成结果不匹配，确认重试";
+            return true;
+        }
         if (result.result == ESP_OK) {
-            const std::string completed_id =
-                !result.todo.id.empty() ? result.todo.id : std::string(result.todo_id);
+            // The accepted request owns the operation. A malformed response ID
+            // must not erase some other task from the visible page.
+            const std::string completed_id(result.todo_id);
             auto it = std::find_if(
                 state->todo.todos.begin(),
                 state->todo.todos.end(),
                 [&completed_id](const wqn::WqnTodoItem& item) { return item.id == completed_id; });
             if (it != state->todo.todos.end()) {
+                state->todo.completion_title = it->title;
                 state->todo.todos.erase(it);
+                if (state->todo.total_pending > 0) --state->todo.total_pending;
             }
-            if (state->todo.total_pending > 0) {
-                --state->todo.total_pending;
-            }
+            state->todo.completion_task_id = completed_id;
             state->todo.sync_status = wqn::TodoSyncStatus::kCompleted;
             state->todo.status_message = "Completed";
         } else if (result.auth_required) {
@@ -261,6 +272,7 @@ bool ApplyTodoCloudResult(
 
 bool RefreshTodosFromCloud(wqn::UiState* state)
 {
+    if (IsTodoCloudBusy()) return false;  // Keep the accepted operation's status.
     if (state == nullptr) {
         return false;
     }
@@ -270,7 +282,6 @@ bool RefreshTodosFromCloud(wqn::UiState* state)
         if (!LoadValidTokenForTodo(&token)) {
             state->todo.sync_status = wqn::TodoSyncStatus::kAuthRequired;
             state->todo.status_message = "Pair again";
-            state->todo.total_pending = static_cast<int>(state->todo.todos.size());
             return true;
         }
 
@@ -296,6 +307,7 @@ RefreshSchedule CompleteSelectedTodo(wqn::UiState* state)
     if (state == nullptr || state->screen != wqn::UiScreen::kTodo || state->todo.todos.empty()) {
         return RefreshSchedule::kNone;
     }
+    if (IsTodoCloudBusy()) return RefreshSchedule::kNone;
     wqn::ClampUiSelection(state);
     const size_t selected = state->todo.selected;
     if (selected >= state->todo.todos.size()) {
@@ -311,19 +323,19 @@ RefreshSchedule CompleteSelectedTodo(wqn::UiState* state)
 
     const std::string todo_id = state->todo.todos[selected].id;
     if (!QueueTodoComplete(todo_id)) {
-        if (IsTodoCloudBusy()) {
-            state->todo.sync_status = wqn::TodoSyncStatus::kCompleting;
-            state->todo.status_message = "完成中";
-        } else {
-            state->todo.sync_status = wqn::TodoSyncStatus::kCompleteFailed;
-            state->todo.status_message = "Todo 完成排队失败";
-        }
-        return RefreshSchedule::kCommit;
+        if (IsTodoCloudBusy()) return RefreshSchedule::kNone;
+        state->todo.completion_task_id = todo_id;
+        state->todo.completion_title = state->todo.todos[selected].title;
+        state->todo.sync_status = wqn::TodoSyncStatus::kCompleteFailed;
+        state->todo.status_message = "完成失败，确认重试";
+        return RefreshSchedule::kSelection;
     }
 
+    state->todo.completion_task_id = todo_id;
+    state->todo.completion_title = state->todo.todos[selected].title;
     state->todo.sync_status = wqn::TodoSyncStatus::kCompleting;
     state->todo.status_message = "完成中";
-    return RefreshSchedule::kCommit;
+    return RefreshSchedule::kSelection;
 }
 
 // Called after global-navigation and raw/held-key guards have consumed input.
@@ -334,6 +346,7 @@ RefreshSchedule HandleTodoInput(wqn::UiState* state, wqn::UiInput input)
     if (input == wqn::UiInput::kConfirm) return CompleteSelectedTodo(state);
     if (input != wqn::UiInput::kUp && input != wqn::UiInput::kDown) return RefreshSchedule::kNone;
     auto& todo = state->todo;
+    if (todo.sync_status == wqn::TodoSyncStatus::kCompleting) return RefreshSchedule::kNone;
     const bool up = input == wqn::UiInput::kUp;
     const bool boundary = up ? todo.selected == 0
         : todo.todos.empty() || todo.selected + 1 >= todo.todos.size();
@@ -354,7 +367,15 @@ RefreshSchedule HandleTodoInput(wqn::UiState* state, wqn::UiInput input)
     if (up && todo.selected > 0) --todo.selected;
     if (!up && todo.selected + 1 < todo.todos.size()) ++todo.selected;
     wqn::ClampUiSelection(state);
-    return previous == todo.selected ? RefreshSchedule::kNone : RefreshSchedule::kSelection;
+    if (previous == todo.selected) return RefreshSchedule::kNone;
+    if (todo.sync_status == wqn::TodoSyncStatus::kCompleteFailed ||
+        todo.sync_status == wqn::TodoSyncStatus::kCompleted) {
+        todo.sync_status = wqn::TodoSyncStatus::kReady;
+        todo.status_message.clear();
+        todo.completion_task_id.clear();
+        todo.completion_title.clear();
+    }
+    return RefreshSchedule::kSelection;
 }
 
 void ExecuteTodoCloudRequest(const TodoCloudRequest& request)

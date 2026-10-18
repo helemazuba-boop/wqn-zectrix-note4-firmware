@@ -157,6 +157,8 @@ struct TodoUiState {
     std::vector<WqnTodoItem> todos;
     size_t selected = 0;
     size_t window_start = 0;
+    std::string completion_task_id;
+    std::string completion_title;
     TodoSyncStatus sync_status = TodoSyncStatus::kIdle;
     std::string status_message;
     bool loaded_once = false;
