@@ -736,11 +736,15 @@ std::string FrameSignature(const wqn::UiFrame& frame)
         signature.append(note.note_image_error ? "1" : "0");
         signature.push_back(':');
         signature.append(note.note_image_id);
-        // status_line/hint are deliberately NOT part of the signature: the note
-        // page draws no footer, so transient boundary messages (已到顶部...)
-        // must not trigger a refresh that changes nothing visible.
+        // Only visible feedback participates. Routine hints and boundary
+        // messages remain absent, so a no-op edge press costs no refresh.
+        signature.push_back('/');
+        signature.append(note.notice);
+        signature.push_back(note.titles_have_more ? '+' : '-');
         for (const wqn::NoteNotebookRow& row : note.notebooks) {
             signature.push_back('/');
+            signature.append(std::to_string(static_cast<int>(row.kind)));
+            signature.push_back(':');
             signature.append(row.title);
             signature.push_back(':');
             signature.append(std::to_string(row.note_count));
@@ -749,6 +753,7 @@ std::string FrameSignature(const wqn::UiFrame& frame)
         }
         for (const wqn::NoteTitleRow& row : note.titles) {
             signature.push_back('|');
+            signature.push_back(row.content_available ? '1' : '0');
             signature.append(row.title);
             signature.push_back(':');
             signature.append(row.last_opened_at);

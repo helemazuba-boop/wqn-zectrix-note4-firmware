@@ -121,6 +121,15 @@ constexpr int kAgentPickerDividerY = 90;
 constexpr int kAgentPickerListY = 96;
 constexpr int kAgentPickerRowStep = 46;
 
+// ---- Notes: approved four-row list, shared with the Agent picker ----
+constexpr int kNoteListX = kAgentPickerLeft;
+constexpr int kNoteListWidth = kAgentPickerWidth;
+constexpr int kNoteListKickerY = kAgentPickerKickerY;
+constexpr int kNoteListTitleY = kAgentPickerTitleY;
+constexpr int kNoteListDividerY = kAgentPickerDividerY;
+constexpr int kNoteListTop = kAgentPickerListY;
+constexpr int kNoteListPitch = kAgentPickerRowStep;
+
 // ---- Global page navigation ----
 constexpr int kNavigationX = 8;
 constexpr int kNavigationY = 214;

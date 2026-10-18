@@ -6,6 +6,7 @@
 #include "ui_widgets.h"
 
 #include "markdown_layout.h"
+#include "ai_native_text.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -27,27 +28,8 @@ constexpr int kContentTop = 32;
 // line budget ((kContentBottom - kContentTop) / kBodyLineH = 13) must stay in
 // sync with kNoteBodyVisibleLines in note_app.cpp.
 constexpr int kContentBottom = wqn::kEpdHeight - 4;
-constexpr int kListRowH = 30;
 constexpr int kBodyLineH = 20;
 constexpr int kBodyBottom = kContentBottom;
-
-int VisibleListRows()
-{
-    return std::max(1, (kContentBottom - kContentTop) / kListRowH);
-}
-
-// Viewport start comes from app state (edge-triggered; see note_app.cpp
-// UpdateListViewport). Clamp defensively so the selected row is always
-// on-screen even if counts changed after the viewport was last updated.
-size_t ClampListWindowStart(size_t start, size_t selected, size_t count, size_t visible)
-{
-    if (visible == 0 || count <= visible) return 0;
-    const size_t max_start = count - visible;
-    if (start > max_start) start = max_start;
-    if (selected < start) start = selected;
-    else if (selected >= start + visible) start = selected + 1 - visible;
-    return start;
-}
 
 // Converts a UTC ISO-8601 instant ("...Z" or "...+00:00") to the Beijing
 // (UTC+8) calendar date. The pin stays UTC in storage and on the wire (the
@@ -97,71 +79,99 @@ std::string LastViewedLabel(const std::string& last_opened_at)
     return "看过 " + last_opened_at.substr(0, std::min<size_t>(10, last_opened_at.size()));
 }
 
-esp_err_t DrawListRow(int y, const std::string& primary, const std::string& trailing, bool selected)
+void DrawNoteListHeading(const std::string& context, const std::string& title,
+                         const std::string& position, const std::string& notice)
 {
-    if (selected) {
-        // [v2] density-list row selection: rounded reverse-fill block.
-        DrawSelectionDecoration(kNoteMarginX, y, kContentW, kListRowH - 4, SelectionStyle::kRowFill);
+    const int count_width = wqn::MeasureTextWithFont(AiNativeFont(12), position.c_str());
+    AiNativeText(kNoteListX, kNoteListKickerY, kNoteListWidth - count_width - 8, context, 12);
+    AiNativeText(kNoteListX + kNoteListWidth - count_width, kNoteListKickerY, count_width, position, 12);
+    AiNativeText(kNoteListX, kNoteListTitleY, kNoteListWidth,
+                 notice.empty() ? title : notice, notice.empty() ? 24 : 16);
+    DrawHorizontalLine(kNoteListX, kNoteListDividerY, kNoteListWidth);
+}
+
+void DrawNoteListRow(int y, size_t index, const std::string& primary,
+                     const std::string& secondary, bool selected)
+{
+    if (selected) FillRect(kNoteListX, y, kNoteListWidth, kNoteListPitch - 1, true);
+    DrawHorizontalLine(kNoteListX, y + kNoteListPitch - 1, kNoteListWidth);
+    char number[24] = {};
+    std::snprintf(number, sizeof(number), "%02u", static_cast<unsigned>(index + 1));
+    AiNativeText(kNoteListX + 7, y + 14, 27, number, 12, !selected);
+    AiNativeText(kNoteListX + 38, y + 4, kNoteListWidth - 61, primary, 16, !selected);
+    AiNativeText(kNoteListX + 38, y + 25, kNoteListWidth - 61, secondary, 12, !selected);
+    const int arrow_x = kNoteListX + kNoteListWidth - 13;
+    for (int step = 0; step < 5; ++step) {
+        FillRect(arrow_x + step, y + 16 + step, 1, 1, !selected);
+        FillRect(arrow_x + step, y + 24 - step, 1, 1, !selected);
     }
-    const bool black = !selected;
-    const int trailing_w = 108;
-    ESP_RETURN_ON_ERROR(
-        DrawClippedText(kNoteMarginX + 10, y + 7, kContentW - trailing_w - 20, primary, black),
-        kTag, "draw note row primary");
-    if (!trailing.empty()) {
-        ESP_RETURN_ON_ERROR(
-            DrawClippedText(
-                kNoteMarginX + kContentW - trailing_w, y + 7, trailing_w - 6, trailing, black),
-            kTag, "draw note row trailing");
-    }
-    return ESP_OK;
+}
+
+void DrawNoteEmpty(const std::string& title, const std::string& detail)
+{
+    AiNativeText(16, 147, 368, title, 20);
+    AiNativeText(16, 179, 368, detail, 12);
 }
 
 esp_err_t RenderNotebookList(const wqn::NoteAppSnapshot& note)
 {
-    if (note.notebooks.empty()) {
-        ESP_RETURN_ON_ERROR(
-            DrawCenteredText(kNoteMarginX, 150, kContentW, "暂无笔记本"), kTag, "note empty books");
-        return DrawCenteredText(kNoteMarginX, 178, kContentW, "请在网页添加笔记后同步");
+    const size_t count = note.notebooks.size();
+    const size_t selected = count ? std::min(note.notebook_selected, count - 1) : 0;
+    DrawNoteListHeading("笔记本 / 错题本 / 词库", "笔记本",
+        count ? std::to_string(selected + 1) + " / " + std::to_string(count) : "0", note.notice);
+    if (!count) {
+        DrawNoteEmpty("暂无笔记本", "请在网页添加笔记后同步");
+        return ESP_OK;
     }
-    const size_t visible = static_cast<size_t>(VisibleListRows());
-    const size_t start = ClampListWindowStart(
-        note.notebook_window_start, note.notebook_selected, note.notebooks.size(), visible);
-    for (size_t i = 0; i < visible && start + i < note.notebooks.size(); ++i) {
+    const size_t start = wqn::ClampNoteListWindow(note.notebook_window_start, selected, count);
+    for (size_t i = 0; i < wqn::kNoteListVisibleRows && start + i < count; ++i) {
         const size_t index = start + i;
-        const wqn::NoteNotebookRow& row = note.notebooks[index];
-        const std::string count = std::to_string(row.note_count) + " 条";
-        ESP_RETURN_ON_ERROR(
-            DrawListRow(
-                kContentTop + static_cast<int>(i) * kListRowH,
-                row.title.empty() ? "(未命名笔记本)" : row.title,
-                count,
-                index == note.notebook_selected),
-            kTag, "draw notebook row");
+        const auto& row = note.notebooks[index];
+        const char* unit = row.kind == wqn::NoteLibraryRowKind::kProblemSet ? " 道错题"
+            : row.kind == wqn::NoteLibraryRowKind::kWordDeck ? " 个单词" : " 条笔记";
+        std::string detail = std::to_string(row.note_count) + unit;
+        if (!row.has_pack) detail += " / 未同步";
+        DrawNoteListRow(kNoteListTop + static_cast<int>(i) * kNoteListPitch, index,
+            row.title.empty() ? "(未命名)" : row.title, detail, index == selected);
     }
     return ESP_OK;
 }
 
 esp_err_t RenderNoteList(const wqn::NoteAppSnapshot& note)
 {
-    if (note.titles.empty()) {
-        return DrawCenteredText(kNoteMarginX, 160, kContentW, "该笔记本暂无笔记");
+    const size_t count = note.titles.size();
+    const size_t selected = count ? std::min(note.note_list_selected, count - 1) : 0;
+    const std::string summary = (note.titles_have_more ? "已加载 " : "") + std::to_string(count) + " 条笔记";
+    DrawNoteListHeading(summary, note.notebook_title.empty() ? "笔记" : note.notebook_title,
+        count ? std::to_string(selected + 1) + " / " + std::to_string(count) + (note.titles_have_more ? "+" : "") : "0", note.notice);
+    if (!count) {
+        DrawNoteEmpty(note.titles_have_more ? "正在加载笔记..." : "该笔记本暂无笔记",
+            note.titles_have_more ? "已加载的标题会显示在这里。" : "在网页添加笔记后同步到设备。");
+        return ESP_OK;
     }
-    const size_t visible = static_cast<size_t>(VisibleListRows());
-    const size_t start = ClampListWindowStart(
-        note.note_list_window_start, note.note_list_selected, note.titles.size(), visible);
-    for (size_t i = 0; i < visible && start + i < note.titles.size(); ++i) {
+    const size_t start = wqn::ClampNoteListWindow(note.note_list_window_start, selected, count);
+    for (size_t i = 0; i < wqn::kNoteListVisibleRows && start + i < count; ++i) {
         const size_t index = start + i;
-        const wqn::NoteTitleRow& row = note.titles[index];
-        ESP_RETURN_ON_ERROR(
-            DrawListRow(
-                kContentTop + static_cast<int>(i) * kListRowH,
-                row.title.empty() ? "(无标题)" : row.title,
-                LastViewedLabel(row.last_opened_at),
-                index == note.note_list_selected),
-            kTag, "draw note title row");
+        const auto& row = note.titles[index];
+        DrawNoteListRow(kNoteListTop + static_cast<int>(i) * kNoteListPitch, index,
+            row.title.empty() ? "(无标题)" : row.title,
+            row.content_available ? LastViewedLabel(row.last_opened_at) : "内容未同步", index == selected);
     }
     return ESP_OK;
+}
+
+void DrawNoteStatusBar(const wqn::UiFrame& frame)
+{
+    DrawHorizontalLine(0, kStatusBarDividerY, kScreenWidth);
+    const int icons_left = DrawStatusBarIcons(kScreenWidth - kStatusBarRightInset, kStatusBarIconY, frame.home);
+    const std::string clock = CurrentClockLabel();
+    const int clock_width = wqn::MeasureTextWithFont(AiNativeFont(12), clock.c_str());
+    const int clock_x = icons_left - 7 - clock_width;
+    AiNativeText(clock_x, kStatusBarTitleY, clock_width, clock, 12);
+    const auto& note = frame.note_app;
+    const bool reading = note.mode == wqn::NoteAppMode::kNoteView || note.mode == wqn::NoteAppMode::kNoteImageView;
+    AiNativeText(kStatusBarTitleX, kStatusBarTitleY, clock_x - kStatusBarTitleX - 8,
+        reading && !note.note_title.empty() ? note.note_title : "WQN / 笔记", reading ? 16 : 12);
 }
 
 // [transfer-progress] Segmented download bar (5 cells, quantized upstream in
@@ -318,25 +328,7 @@ esp_err_t RenderNoteToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
 
     wqn::ClearEpdFramebuffer(true);
 
-    // The status-bar title carries the page context (priority: note title >
-    // notebook name > "笔记"), so there is no separate header row. Truncate to the
-    // left half of the bar -- DrawStatusBar draws the clock/battery on the right
-    // without clipping the title, so an untrimmed title would overrun them.
-    std::string bar_title = "笔记";
-    if ((note.mode == wqn::NoteAppMode::kNoteList ||
-         note.mode == wqn::NoteAppMode::kNoteView ||
-         note.mode == wqn::NoteAppMode::kNoteImageView) &&
-        !note.notebook_title.empty()) {
-        bar_title = note.notebook_title;
-    }
-    if ((note.mode == wqn::NoteAppMode::kNoteView ||
-         note.mode == wqn::NoteAppMode::kNoteImageView) &&
-        !note.note_title.empty()) {
-        bar_title = note.note_title;
-    }
-    const auto bar_lines = wqn::WrapUtf8TextToWidth(bar_title, wqn::kEpdWidth / 2, 1);
-    DrawStatusBar(
-        bar_lines.empty() ? bar_title.c_str() : bar_lines.front().c_str(), frame.home);
+    DrawNoteStatusBar(frame);
     // [status-bar-progress] Download progress lives IN the status bar (the
     // 4px slack under the text, above the separator at y=27): the user keeps
     // reading/browsing the content below while the strip fills up.
@@ -348,7 +340,7 @@ esp_err_t RenderNoteToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
         // Floor of 12px: the empty-bar phase (request armed, no bytes yet)
         // must still be visible as the button acknowledgement.
         const int filled = std::max(wqn::kEpdWidth * clamped / 5, 12);
-        FillRect(0, 22, filled, 4, true);
+        FillRect(0, 23, filled, 3, true);
     }
 
     switch (note.mode) {
@@ -356,9 +348,7 @@ esp_err_t RenderNoteToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
             ESP_RETURN_ON_ERROR(RenderNotebookList(note), kTag, "render notebook list");
             break;
         case wqn::NoteAppMode::kSessionStarting:
-            ESP_RETURN_ON_ERROR(
-                DrawCenteredText(kNoteMarginX, 160, kContentW, "正在打开笔记本…"),
-                kTag, "render session starting");
+            DrawNoteEmpty("正在打开笔记本...", "请稍候，长按确认可取消。");
             break;
         case wqn::NoteAppMode::kNoteList:
             ESP_RETURN_ON_ERROR(RenderNoteList(note), kTag, "render note list");

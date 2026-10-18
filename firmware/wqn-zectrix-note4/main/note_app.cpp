@@ -36,35 +36,10 @@ size_t FindNotebookRow(const wqn::NoteAppState& state, const std::string& notebo
     return static_cast<size_t>(-1);
 }
 
-// Visible rows on the notebook/title lists; mirrors page_note.cpp geometry
-// ((kHintY - 4 - kContentTop) / kListRowH = (284 - 4 - 32) / 30 = 8).
-constexpr size_t kNoteListVisibleRows = 8;
-
-// Edge-triggered viewport: the window moves only when the selection walks off
-// an edge, and then jumps so the selection lands on the opposite edge. The
-// previous centered window (start = selected - visible/2) shifted the whole
-// window one row on EVERY step past row visible/2, repainting all 8 rows as a
-// heavy full-frame partial per step -- the 4th<->5th row stutter and the long
-// BUSY stretches. With this rule, in-window steps flip just two rows (fast
-// local partial) and sustained scrolling costs one whole-window repaint per 8
-// steps in either direction.
+// The renderer and reducer share the same four-row window contract.
 void UpdateListViewport(size_t selected, size_t count, size_t* start)
 {
-    constexpr size_t visible = kNoteListVisibleRows;
-    if (count <= visible) {
-        *start = 0;
-        return;
-    }
-    const size_t max_start = count - visible;
-    if (*start > max_start) *start = max_start;
-    if (selected < *start) {
-        // Walked off the top: park the selection on the bottom row so the next
-        // 7 up-steps stay in-window.
-        *start = selected + 1 >= visible ? selected + 1 - visible : 0;
-    } else if (selected >= *start + visible) {
-        // Walked off the bottom: park the selection on the top row.
-        *start = std::min(selected, max_start);
-    }
+    *start = wqn::ClampNoteListWindow(*start, selected, count);
 }
 
 // Finds the mounted pack entry for a note id, scanning only its notebook's
@@ -1490,7 +1465,8 @@ NoteAppSnapshot BuildNoteAppSnapshot(const NoteAppState& state)
     // column shows their problem count so the mixed list stays scannable.
     for (const NoteProblemSetRow& set : state.problem_sets) {
         NoteNotebookRow row;
-        row.title = "[题] " + set.name;
+        row.kind = NoteLibraryRowKind::kProblemSet;
+        row.title = set.name;
         row.note_count = set.entry_count;
         row.has_pack = true;
         snapshot.notebooks.push_back(std::move(row));
@@ -1498,7 +1474,8 @@ NoteAppSnapshot BuildNoteAppSnapshot(const NoteAppState& state)
     // Non-default word decks follow as [词] rows (word counts trailing).
     for (const NoteWordDeckRow& deck : state.word_decks) {
         NoteNotebookRow row;
-        row.title = "[词] " + deck.title;
+        row.kind = NoteLibraryRowKind::kWordDeck;
+        row.title = deck.title;
         row.note_count = deck.entry_count;
         row.has_pack = true;
         snapshot.notebooks.push_back(std::move(row));
@@ -1512,10 +1489,12 @@ NoteAppSnapshot BuildNoteAppSnapshot(const NoteAppState& state)
             snapshot.notebook_title = state.pack_index.notebooks[row].title;
         }
         const auto& items = state.session.persisted.remote.items;
+        snapshot.titles_have_more = state.session.persisted.remote.has_more;
         snapshot.titles.reserve(items.size());
         for (const StoredNoteSessionItem& item : items) {
             NoteTitleRow title_row;
             const NotePackIndexEntry* entry = FindPackEntry(state, item.notebook_id, item.item_id);
+            title_row.content_available = entry != nullptr;
             title_row.title = entry != nullptr ? entry->title : std::string("(未同步)");
             title_row.last_opened_at = item.last_opened_at;
             snapshot.titles.push_back(std::move(title_row));
@@ -1553,6 +1532,7 @@ NoteAppSnapshot BuildNoteAppSnapshot(const NoteAppState& state)
     // strip while a body pack downloads behind it.
     snapshot.transfer_progress_bucket = state.transfer_progress_bucket;
     snapshot.status_line = NoteAppStatusLine(state);
+    snapshot.notice = NoteAppNotice(state);
     switch (state.mode) {
         case NoteAppMode::kNotebookList:
             snapshot.hint = "确认进入 · 长按返回";
@@ -1604,6 +1584,25 @@ std::string NoteAppStatusLine(const NoteAppState& state)
     return "";
 }
 
+std::string NoteAppNotice(const NoteAppState& state)
+{
+    if (state.outbox.suspended_count > 0) return NoteAppStatusLine(state);
+    if (state.body_fetch_request || state.body_fetch_in_flight) return "正在同步内容...";
+    const std::string& message = state.message;
+    // Ordinary page labels are not notices. Preserve actual failure reasons
+    // (including pairing and full storage) instead of replacing them by a retry.
+    for (const char* quiet : {"", "已到顶部", "已到底部", "阅读中", "查看图片",
+            "笔记已就绪", "后续笔记已就绪", "内容已就绪", "已恢复上次浏览",
+            "选择笔记本", "选择要看的笔记", "已取消", "该笔记本暂无笔记"}) {
+        if (message != quiet) continue;
+        if (state.session.commit_state == NoteObservationCommitState::kFailed)
+            return "阅读记录未保存，请重新打开重试";
+        if (state.body_fetch_error) return "同步失败，确认重试";
+        return {};
+    }
+    return message;
+}
+
 std::string NoteAppSignature(const NoteAppState& state)
 {
     // Compact identity for the render layer to detect meaningful frame changes.
@@ -1633,7 +1632,7 @@ std::string NoteAppSignature(const NoteAppState& state)
             (state.body_fetch_request || state.body_fetch_in_flight) ? 1 : 0),
         static_cast<unsigned>(state.body_fetch_error ? 1 : 0),
         static_cast<int>(state.transfer_progress_bucket));
-    return std::string(buffer);
+    return std::string(buffer) + "|" + NoteAppNotice(state);
 }
 
 namespace {

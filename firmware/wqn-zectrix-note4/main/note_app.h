@@ -9,6 +9,7 @@
 #include "device_protocol/note_study.h"
 #include "esp_err.h"
 #include "note_pack.h"
+#include "note_list_model.h"
 #include "note_store.h"
 #include "storage.h"
 #include "wqn_api.h"
@@ -184,13 +185,17 @@ struct NoteAppState {
     std::string message;
 };
 
+enum class NoteLibraryRowKind : uint8_t { kNotebook, kProblemSet, kWordDeck };
+
 struct NoteNotebookRow {
+    NoteLibraryRowKind kind = NoteLibraryRowKind::kNotebook;
     std::string title;
     size_t note_count = 0;
     bool has_pack = false;
 };
 
 struct NoteTitleRow {
+    bool content_available = false;
     std::string title;
     // Empty when never viewed; otherwise the pinned last-viewed ISO timestamp.
     std::string last_opened_at;
@@ -216,6 +221,7 @@ struct NoteAppSnapshot {
     std::vector<NoteNotebookRow> notebooks;
     std::string notebook_title;
     std::vector<NoteTitleRow> titles;
+    bool titles_have_more = false;
     std::string note_title;
     std::string note_body;
     // Identity of the currently-open note; the render layer keys its wrapped-line
@@ -233,6 +239,8 @@ struct NoteAppSnapshot {
     // loading page and the body "正在同步内容" page.
     int8_t transfer_progress_bucket = -1;
     std::string status_line;
+    // Actual feedback only; normal navigation hints and boundary no-ops stay hidden.
+    std::string notice;
     std::string hint;
 };
 
@@ -333,6 +341,7 @@ bool UpdateNoteTransferProgress(
 bool NoteImageLoadingGraceActive(const NoteAppState& state, int64_t now_us);
 NoteAppSnapshot BuildNoteAppSnapshot(const NoteAppState& state);
 std::string NoteAppStatusLine(const NoteAppState& state);
+std::string NoteAppNotice(const NoteAppState& state);
 std::string NoteAppSignature(const NoteAppState& state);
 bool RunNotePageStateSelfTest();
 
