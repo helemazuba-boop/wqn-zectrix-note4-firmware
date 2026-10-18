@@ -458,15 +458,14 @@ void SetNoteImageRenderModeImpl(wqn::NoteAppState* state, wqn::ImageRenderMode m
     }
 }
 
-// The note is one vertical ring: [image 1 .. image N] above the body, ends
-// joined. UP always moves up, DOWN always moves down, both wrap around --
-// no dead ends, and leaving the image layer needs no long-press.
+// Body and attachments have independent, bounded navigation. The image
+// entry above the body opens the last attachment without changing its offset.
 
-uint32_t NoteBodyMaxScroll(const wqn::NoteAppState& state)
+device_ui_internal::NoteReadingGeometry NoteBodyReadingGeometry(const wqn::NoteAppState& state)
 {
     const size_t rows = state.body_layout ? state.body_layout->markdown.size() : 0;
     return device_ui_internal::ComputeNoteReadingGeometry(rows,
-        !state.current_note.image_ids.empty(), !wqn::NoteAppNotice(state).empty()).max_scroll;
+        !state.current_note.image_ids.empty(), !wqn::NoteAppNotice(state).empty());
 }
 
 void EnterNoteImageView(wqn::NoteAppState* state, uint8_t index)
@@ -475,7 +474,6 @@ void EnterNoteImageView(wqn::NoteAppState* state, uint8_t index)
     state->image_index = index;
     state->image_view_entered_us = esp_timer_get_time();
     RequestCurrentNoteImage(state);
-    state->message.clear();
 }
 
 void ExitNoteImageViewToBody(wqn::NoteAppState* state, uint32_t scroll_lines)
@@ -486,7 +484,6 @@ void ExitNoteImageViewToBody(wqn::NoteAppState* state, uint32_t scroll_lines)
     state->note_scroll_offset_lines = scroll_lines;
     state->image_request = false;
     state->image_error = false;
-    state->message.clear();
 }
 
 void HandleNoteViewInput(wqn::NoteAppState* state, wqn::NoteInput input)
@@ -525,9 +522,11 @@ void HandleNoteViewInput(wqn::NoteAppState* state, wqn::NoteInput input)
         }
         return;
     }
+    const auto geometry = NoteBodyReadingGeometry(*state);
+    state->note_scroll_offset_lines = std::min(
+        state->note_scroll_offset_lines, geometry.max_scroll);
     switch (input) {
         case wqn::NoteInput::kUp: {
-            constexpr uint32_t kNoteBodyScrollStep = 4;
             if (state->note_scroll_offset_lines == 0) {
                 if (!state->current_note.image_ids.empty()) {
                     // Up from the body top reaches the image directly above
@@ -536,38 +535,21 @@ void HandleNoteViewInput(wqn::NoteAppState* state, wqn::NoteInput input)
                         state,
                         static_cast<uint8_t>(
                             state->current_note.image_ids.size() - 1));
-                } else {
-                    // No images: the ring is just the body; wrap to its end.
-                    state->note_scroll_offset_lines = NoteBodyMaxScroll(*state);
-                    state->message.clear();
                 }
             } else {
                 state->note_scroll_offset_lines =
-                    state->note_scroll_offset_lines > kNoteBodyScrollStep
-                        ? state->note_scroll_offset_lines - kNoteBodyScrollStep
+                    state->note_scroll_offset_lines > geometry.step
+                        ? state->note_scroll_offset_lines - geometry.step
                         : 0;
-                state->message.clear();
             }
             break;
         }
         case wqn::NoteInput::kDown:
         case wqn::NoteInput::kConfirm: {
-            constexpr uint32_t kNoteBodyScrollStep = 4;
-            const uint32_t max_scroll = NoteBodyMaxScroll(*state);
-            if (state->note_scroll_offset_lines >= max_scroll) {
-                if (!state->current_note.image_ids.empty()) {
-                    // Down past the body end wraps around the ring to the
-                    // first image at the very top.
-                    EnterNoteImageView(state, 0);
-                } else {
-                    state->note_scroll_offset_lines = 0;
-                    state->message.clear();
-                }
-            } else {
-                state->note_scroll_offset_lines = std::min<uint32_t>(
-                    state->note_scroll_offset_lines + kNoteBodyScrollStep, max_scroll);
-                state->message.clear();
-            }
+            // Aligned rows retain one complete line between viewports. At
+            // the bottom both inputs are no-ops, including on short notes.
+            state->note_scroll_offset_lines = std::min<uint32_t>(
+                state->note_scroll_offset_lines + geometry.step, geometry.max_scroll);
             break;
         }
         case wqn::NoteInput::kLongConfirm:
@@ -591,29 +573,24 @@ void HandleNoteImageViewInput(wqn::NoteAppState* state, wqn::NoteInput input)
                 --state->image_index;
                 state->image_view_entered_us = esp_timer_get_time();
                 RequestCurrentNoteImage(state);
-            } else {
-                // Up past the first image wraps around the ring to the body
-                // end.
-                ExitNoteImageViewToBody(state, NoteBodyMaxScroll(*state));
             }
             break;
         case wqn::NoteInput::kDown:
         case wqn::NoteInput::kConfirm:
+            if (input == wqn::NoteInput::kConfirm && state->image_error) {
+                // Retrying must keep the failed attachment selected.
+                state->image_view_entered_us = esp_timer_get_time();
+                RequestCurrentNoteImage(state);
+                break;
+            }
             if (count > 0 && static_cast<size_t>(state->image_index) + 1 < count) {
                 ++state->image_index;
                 state->image_view_entered_us = esp_timer_get_time();
                 RequestCurrentNoteImage(state);
-            } else {
-                // Down past the last image lands on the body top right below.
-                ExitNoteImageViewToBody(state, 0);
             }
             break;
         case wqn::NoteInput::kLongConfirm:
-            // Escape hatch kept for muscle memory: straight back to the body.
-            state->mode = wqn::NoteAppMode::kNoteView;
-            state->image_request = false;
-            state->image_error = false;
-            state->message.clear();
+            ExitNoteImageViewToBody(state, state->note_scroll_offset_lines);
             break;
     }
 }
@@ -698,6 +675,15 @@ esp_err_t InitNoteApp(NoteAppState* state)
 esp_err_t HandleNoteAppInput(NoteAppState* state, NoteInput input)
 {
     if (state == nullptr) return ESP_ERR_INVALID_ARG;
+    // Keep the complete Prepare -> reserve -> apply context until its ACK.
+    // Body paging and image browsing remain safe while the open is saving.
+    const bool reading = state->mode == NoteAppMode::kNoteView ||
+                         state->mode == NoteAppMode::kNoteImageView;
+    if (state->session.commit_state == NoteObservationCommitState::kPersisting &&
+        (input == NoteInput::kLongConfirm ||
+         (input == NoteInput::kConfirm && !reading))) {
+        return ESP_OK;
+    }
     if (!state->initialized) {
         ESP_RETURN_ON_ERROR(InitNoteApp(state), kTag, "init note app");
     }

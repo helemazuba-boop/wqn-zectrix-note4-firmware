@@ -225,6 +225,15 @@ esp_err_t RenderNoteBody(const wqn::NoteAppSnapshot& note)
     return ESP_OK;
 }
 
+void RenderNoteImagePlaceholder(const wqn::NoteAppSnapshot& note)
+{
+    DrawNoteEmpty(note.note_image_error ? "图片加载失败" : "正在加载图片...",
+        note.note_image_error ? "确认重试，长按返回正文" : "长按返回正文");
+    if (!note.note_image_error) {
+        DrawTransferProgressBar(208, note.transfer_progress_bucket);
+    }
+}
+
 }  // namespace
 
 esp_err_t RenderNoteToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
@@ -310,21 +319,7 @@ esp_err_t RenderNoteToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
             break;
         case wqn::NoteAppMode::kNoteImageView:
             // Ready images returned above; this is the loading / error page.
-            ESP_RETURN_ON_ERROR(
-                DrawCenteredText(
-                    kNoteMarginX, 148, kContentW,
-                    note.note_image_error ? "图片加载失败" : "正在加载图片…"),
-                kTag, "render note image status");
-            ESP_RETURN_ON_ERROR(
-                DrawCenteredText(
-                    kNoteMarginX, 176, kContentW,
-                    note.note_image_error ? "长按返回正文" : "长按可取消"),
-                kTag, "render note image status hint");
-            if (!note.note_image_error) {
-                // Segmented download progress; hidden (-1) on cache hits and
-                // while the request has not reached the wire yet.
-                DrawTransferProgressBar(208, note.transfer_progress_bucket);
-            }
+            RenderNoteImagePlaceholder(note);
             break;
     }
 
