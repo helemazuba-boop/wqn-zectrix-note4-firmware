@@ -33,7 +33,9 @@ esp_err_t RenderFrameToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
     // after rendering and transmit a blank/incomplete page.
     ESP_RETURN_ON_ERROR(
         wqn::InitEpdDisplay(), kTag, "initialize EPD before frame render");
-    ESP_LOGI(kTag, "RenderFrameToEpd: enter schedule=%s screen=%d", RefreshScheduleName(schedule), static_cast<int>(frame.screen));
+    ESP_LOGI(kTag, "RenderFrameToEpd: enter schedule=%s screen=%d home_focus=%u",
+             RefreshScheduleName(schedule), static_cast<int>(frame.screen),
+             static_cast<unsigned>(frame.selected_home_task));
     const UBaseType_t hwm_before_render = uxTaskGetStackHighWaterMark(nullptr);
     ESP_LOGI(kTag, "RenderFrameToEpd: stack HWM before render: %u bytes free", static_cast<unsigned>(hwm_before_render * sizeof(StackType_t)));
     // A modal overlay must be composed after a complete base page, including

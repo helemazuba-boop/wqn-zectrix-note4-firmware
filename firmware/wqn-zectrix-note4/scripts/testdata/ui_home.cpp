@@ -18,7 +18,13 @@
 #define CONFIG_WQN_AI_ENABLE 1
 #define CONFIG_WQN_AGENT_ENABLE 1
 using esp_err_t = int;
-constexpr int ESP_OK = 0, ESP_ERR_INVALID_STATE = 1, ESP_ERR_NOT_FOUND = 2;
+constexpr int ESP_OK = 0, ESP_ERR_INVALID_STATE = 1, ESP_ERR_NOT_FOUND = 2, ESP_ERR_NO_MEM = 3;
+#define ESP_RETURN_ON_FALSE(value,error,...) do { if(!(value))return error; } while(0)
+template<class... T> void HostLog(T...) {}
+#define ESP_LOGI(...) HostLog(__VA_ARGS__)
+using UBaseType_t=unsigned;
+using StackType_t=uint32_t;
+UBaseType_t uxTaskGetStackHighWaterMark(void*) { return 4096; }
 #define ESP_RETURN_ON_ERROR(expr, ...) do { const auto error = (expr); if (error != ESP_OK) return error; } while (0)
 int assertions = 0;
 #define CHECK(value) do { if (!(value)) { std::fprintf(stderr,"FAIL line %d: %s\n",__LINE__,#value); std::abort(); } ++assertions; } while (0)
@@ -84,9 +90,24 @@ struct UiState {
     std::string home_viewed_session_id;
     int64_t home_viewed_result_version=0;
 };
-struct UiFrame { HomeSummary home; size_t selected_home_task=0; };
-enum class TimeTile { kPomodoro, kCountdown };
-struct TimeAppState { TimeTile tile=TimeTile::kCountdown; };
+enum class TimeTile { kPomodoro, kCountdown, kClock };
+struct TimeAppState { TimeTile tile=TimeTile::kCountdown; bool config_mode=false, active_timer=false; };
+enum class UiTextStyle { kSelected,kWrappedBody,kBody };
+struct UiLine { UiTextStyle style;std::string text; };
+struct UiFrame {
+    UiScreen screen=UiScreen::kHome;HomeSummary home;size_t selected_home_task=0;
+    NavigationState navigation;TimeAppState time_app;bool prefer_full_refresh=false;
+    struct { AiTier tier=AiTier::kStd; } ai;
+    struct ProvisionState { static constexpr int kIdle=0; };
+    int provisioning_phase=0;std::vector<UiLine> lines;
+};
+struct ProvisionState { static constexpr int kIdle=0; };
+struct EpdFrameTransaction { bool locked() const { return true; } };
+bool framebuffer_ready=true;
+int InitEpdDisplay() { return ESP_OK; }
+bool IsEpdFramebufferSynchronized() { return framebuffer_ready; }
+bool TimeAppHasActiveTimer(const TimeAppState& state) { return state.active_timer; }
+std::vector<std::string> WrapUtf8TextToWidth(const std::string& text,int,size_t) { return {text}; }
 bool NavigateUiToScreen(UiState* s, UiScreen target) { s->screen=target; return true; }
 int open_result=ESP_OK, open_calls=0;
 int home_queries=0;
@@ -98,7 +119,9 @@ int OpenCodeHomeSession(const std::string& id, const std::string& title) {
 }
 
 namespace device_ui_internal {
-enum class RefreshSchedule { kNone, kSelection, kCommit, kClock };
+@@SCHEDULE@@
+@@RANK@@
+@@COMBINE@@
 struct UiRect { int x,y,width,height; const char* name; };
 @@LAYOUT@@
 @@RECT@@
@@ -143,6 +166,25 @@ RefreshSchedule HomeShortcut(const wqn::ButtonEvent& event,int64_t event_time_ms
 }
 }
 @@PAGE@@
+namespace device_ui_internal {
+constexpr char kTag[]="host-render";
+bool g_last_rendered_navigation_visible=false;
+const char* RefreshScheduleName(RefreshSchedule) { return "host-schedule"; }
+constexpr int kTextWidth=388,kMaxWrapLines=100,kCjkLineHeight=18;
+std::string LimitForEpd(const std::string& text) { return text; }
+int RenderTimeClockRegion(RefreshSchedule,bool) { return ESP_OK; }
+int RenderTimerRunRegion(const wqn::TimeAppState&,RefreshSchedule) { return ESP_OK; }
+int RenderTimerActionRegion(const wqn::TimeAppState&,RefreshSchedule) { return ESP_OK; }
+int RenderTimeConfigRegion(const wqn::TimeAppState&,RefreshSchedule) { return ESP_OK; }
+int RenderTimeToEpd(const wqn::UiFrame&,RefreshSchedule) { return ESP_OK; }
+int RenderAiToEpd(const wqn::UiFrame&,RefreshSchedule) { return ESP_OK; }
+int RenderTodoToEpd(const wqn::UiFrame&,RefreshSchedule) { return ESP_OK; }
+int RenderWordToEpd(const wqn::UiFrame&,RefreshSchedule) { return ESP_OK; }
+int RenderNoteToEpd(const wqn::UiFrame&,RefreshSchedule) { return ESP_OK; }
+int RenderSettingsToEpd(const wqn::UiFrame&,RefreshSchedule) { return ESP_OK; }
+int RenderProvisioningToEpd(const wqn::UiFrame&,RefreshSchedule) { return ESP_OK; }
+@@RENDER@@
+}
 
 namespace worker_seam {
 using namespace wqn;
@@ -301,6 +343,32 @@ int main(int argc,char** argv) {
             CHECK(full==pixels);
             if(argc>1) Save(std::string(argv[1])+"/home-"+std::to_string(static_cast<int>(status))+"-"+std::to_string(focus)+".pbm");
         }
+    }
+    // Reproduce a pending timer update coinciding with a Home focus move.
+    // The old rank-only merge retained Timer, drew only the clock and then
+    // acknowledged a frame whose newly selected card had never been painted.
+    for(auto pending:{RefreshSchedule::kTimer,RefreshSchedule::kClock,RefreshSchedule::kConfig}) {
+        frame.selected_home_task=0;
+        CHECK(RenderFrameToEpd(frame,RefreshSchedule::kCommit)==ESP_OK);
+        const auto clock_only=pixels;
+        CHECK(RenderFrameToEpd(frame,pending==RefreshSchedule::kConfig?RefreshSchedule::kClock:pending)==ESP_OK);
+        CHECK(clock_only==pixels);
+        frame.selected_home_task=1;
+        const auto combined=StrongerSchedule(pending,RefreshSchedule::kSelection);
+        CHECK(RenderFrameToEpd(frame,combined)==ESP_OK);
+        CHECK(!pixels[114*400+7]&&pixels[222*400+7]);
+        CHECK(combined==RefreshSchedule::kCoalesced);
+        CHECK(StrongerSchedule(RefreshSchedule::kSelection,pending)==combined);
+        frame.selected_home_task=0;
+        CHECK(RenderFrameToEpd(frame,StrongerSchedule(combined,RefreshSchedule::kClock))==ESP_OK);
+        CHECK(pixels[114*400+7]&&!pixels[222*400+7]);
+    }
+    for(auto schedule:{RefreshSchedule::kTimer,RefreshSchedule::kClock,RefreshSchedule::kSelection,RefreshSchedule::kConfig,RefreshSchedule::kNavigation}) {
+        CHECK(StrongerSchedule(schedule,RefreshSchedule::kNone)==schedule);
+        CHECK(StrongerSchedule(RefreshSchedule::kNone,schedule)==schedule);
+        CHECK(StrongerSchedule(schedule,schedule)==schedule);
+        CHECK(StrongerSchedule(schedule,RefreshSchedule::kCommit)==RefreshSchedule::kCommit);
+        CHECK(StrongerSchedule(RefreshSchedule::kImmediate,schedule)==RefreshSchedule::kImmediate);
     }
     frame.home.ai.title=std::string(2000,'W')+"中文长标题";
     CHECK(RenderHomeToEpd(frame,RefreshSchedule::kSelection)==ESP_OK);

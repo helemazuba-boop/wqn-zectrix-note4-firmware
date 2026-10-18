@@ -20,6 +20,7 @@ def main():
     root = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--render-dir', type=Path)
+    parser.add_argument('--refresh-source', type=Path, default=root/'main/ui/ui_refresh.cpp')
     parser.add_argument('--model-source', type=Path, default=root/'main/ui/home_model.cpp')
     parser.add_argument('--worker-source', type=Path, default=root/'main/opencode_session.cpp')
     args = parser.parse_args()
@@ -34,7 +35,12 @@ def main():
     digits = (root/'main/ui/seven_segment.cpp').read_text()
     layout = (root/'main/ui/ui_layout.h').read_text()
     fixture = (root/'scripts/testdata/ui_home.cpp').read_text()
+    refresh = args.refresh_source.read_text()
     pieces = {
+        '@@SCHEDULE@@': part(internal, 'enum class RefreshSchedule {', '\nint RefreshRank('),
+        '@@RANK@@': part(refresh, 'int RefreshRank(', 'const char* RefreshScheduleName('),
+        '@@COMBINE@@': part(refresh, 'RefreshSchedule StrongerSchedule(', '\nnamespace {\n\nusing wqn::display::DisplayIntent;'),
+        '@@RENDER@@': part((root/'main/ui/ui_render.cpp').read_text(), 'esp_err_t RenderFrameToEpd(', '\n}  // namespace device_ui_internal'),
         '@@FONT_LOOKUP@@': part(display, 'const lv_font_fmt_txt_glyph_dsc_t* FindGlyphInFont(', 'int MeasureCodepointWidth('),
         '@@FONT_DRAW@@': part(display, 'void DrawGlyphFromFont(', 'void DrawGlyphFromFontScaled('),
         '@@FONT_SIZE@@': part(display, 'void DrawTextWithFontSized(', 'const lv_font_t* PrimaryUiFont('),

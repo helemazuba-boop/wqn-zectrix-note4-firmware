@@ -155,7 +155,18 @@ TickType_t TicksUntil(TickType_t now, TickType_t due)
 
 RefreshSchedule StrongerSchedule(RefreshSchedule a, RefreshSchedule b)
 {
-    return RefreshRank(a) >= RefreshRank(b) ? a : b;
+    if (a == RefreshSchedule::kNone) return b;
+    if (b == RefreshSchedule::kNone || a == b) return a;
+    if (RefreshRank(a) >= RefreshRank(RefreshSchedule::kCommit) ||
+        RefreshRank(b) >= RefreshRank(RefreshSchedule::kCommit)) {
+        return RefreshRank(a) >= RefreshRank(b) ? a : b;
+    }
+    // A schedule selects both urgency and a drawing path. For example, a
+    // pending Timer and a new Selection have equal rank, but keeping Timer
+    // repaints only Home's clock and then acknowledges the entire new frame.
+    // Match EffectiveSchedule's cross-intent rule within a single UI batch:
+    // different reasons require composing the complete latest page.
+    return RefreshSchedule::kCoalesced;
 }
 
 namespace {
