@@ -67,3 +67,43 @@ current network, missing backup, active AI/sync/download, target failure with
 successful fallback, both networks failing, rapid repeated requests, old radio
 events during handoff, and sleep admission after each terminal outcome. These
 remain HIL work; no device flash was performed.
+
+## Native provisioning screen
+
+The device screen now implements the approved About-page visual language:
+brand mark, wordmark and Note4 identity, without a top status bar or persistent
+bottom action hints. Starting, waiting, connecting, connected and failed states
+share one native renderer. The existing About page and phone portal stay as-is.
+
+Waiting shows two real QR symbols: an open-WiFi join payload for the actual
+provisioning AP SSID, then `http://192.168.4.1/`. Captions retain manual entry.
+The WiFi payload escapes delimiters, accepts up to 32 SSID bytes, and contains
+no saved STA password. An MIT-licensed, unmodified Project Nayuki C encoder is
+vendored in `components/qr_code`; versions 3–6, medium error correction,
+integer pixel scaling and a four-module quiet zone fit the 400x300 display.
+
+The existing settings tick copies primary, backup and active identities from
+the connectivity service into UI state. Connecting shows saved roles;
+Connected shows the actual active SSID, including a successful backup fallback.
+Identity changes participate in frame signatures so late handoff data repaints.
+Rendering performs no storage access or network operations. The existing EPD
+owner, refresh policy, provisioning lifecycle and input behavior are retained;
+there is no new task, lease or wake source.
+
+Validation of this UI change:
+
+- `python3 scripts/test_ui_settings.py --render-dir <output>`: 235 checks with
+  developer menu off, 250 on; native pixels for all five states, no top bar or
+  footer, real SSID projection, late identity updates and no storage submissions.
+- `python3 scripts/test_provision_qr.py`: 25 production encoder/payload checks.
+  With `--verify-frames <output>` (Pillow and zxing-cpp installed), 16 symbols
+  decoded from the actual native framebuffers: hotspot and URL, normal SSID,
+  escaped delimiters, Chinese characters and a maximum-length escaped SSID,
+  in both developer-menu configurations.
+- Navigation: 1308 assertions. Existing connectivity: 60 role/switch checks,
+  10 driver-handoff checks. Portal JavaScript: 24 checks. M8 CTest fixture: 1/1.
+- ESP-IDF `build-wsl`: zero warnings; M8 ownership and compiled UI-stack gates
+  pass. CRLF-aware diff check is clean. Native framebuffer images were inspected.
+
+These are host/build checks. Real-panel appearance, phone-camera scanning and
+end-to-end hotspot/STA handoff still require device HIL; no flash was performed.

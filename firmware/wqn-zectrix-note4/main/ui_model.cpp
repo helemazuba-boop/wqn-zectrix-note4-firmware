@@ -739,6 +739,7 @@ UiFrame RenderUiFrame(const UiState& state)
         frame.prefer_full_refresh = true;
         frame.provisioning_ssid = provisioning_ssid;
         frame.home = state.home;
+        frame.settings = state.settings;
         return frame;
     }
 

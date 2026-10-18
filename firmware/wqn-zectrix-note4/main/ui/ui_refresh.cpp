@@ -820,6 +820,14 @@ std::string FrameSignature(const wqn::UiFrame& frame)
         signature.append(std::to_string(frame.provisioning_ssid.size()));
         signature.push_back(':');
         signature.append(frame.provisioning_ssid);
+        for (const char* ssid : {frame.settings.wifi_primary_ssid,
+                 frame.settings.wifi_backup_ssid, frame.settings.wifi_active_ssid}) {
+            const std::string value(ssid);
+            signature.push_back('/');
+            signature.append(std::to_string(value.size()));
+            signature.push_back(':');
+            signature.append(value);
+        }
     }
     if (frame.screen == wqn::UiScreen::kSettings) {
         const auto& s = frame.settings;

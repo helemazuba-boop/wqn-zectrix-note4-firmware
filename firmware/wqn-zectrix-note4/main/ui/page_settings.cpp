@@ -294,12 +294,7 @@ void DrawSettingsDetail(const wqn::UiFrame& frame)
             else { SettingsText(kSettingsDetailX, 157, frame.claim_code, 32); SettingsText(kSettingsDetailX, 191, "请在浏览器中完成配对"); }
             break;
         case Dialog::kProvisioningResult:
-            SettingsHeading(frame, "设置 / 网络", "手机配网", "使用手机完成网络配置");
-            if (frame.provisioning_phase == wqn::ProvisionState::kFailed)
-                SettingsEmpty("配网未完成", "确认重试，或长按返回 WiFi 管理。");
-            else if (frame.provisioning_phase == wqn::ProvisionState::kConnecting)
-                SettingsEmpty("正在连接 WiFi", "配置已保存，正在尝试主网络和备用网络。");
-            else SettingsEmpty("WiFi 已连接", "确认返回 WiFi 管理。");
+            // The result shares the same header-free provisioning identity.
             break;
         case Dialog::kAbout:
             SettingsText(kSettingsDetailX, kSettingsHeaderTextBaseline, "关于设备", 16); DrawStatusBarIcons(kSettingsRight, kStatusBarIconY, frame.home); DrawHorizontalLine(0, kSettingsHeaderDividerY, kScreenWidth);
@@ -386,6 +381,8 @@ void DrawSettingsDetail(const wqn::UiFrame& frame)
 
 esp_err_t RenderSettingsToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
 {
+    if (frame.settings.dialog == wqn::SettingsDialog::kProvisioningResult)
+        return RenderProvisioningToEpd(frame, schedule);
     // Compose the complete framebuffer even on config/selection updates: the
     // section header changes with the page, and a cold framebuffer has no base.
     // RefreshStableRegion retains the existing display-owner/waveform policy.
@@ -394,26 +391,6 @@ esp_err_t RenderSettingsToEpd(const wqn::UiFrame& frame, RefreshSchedule schedul
     else DrawSettingsDetail(frame);
     if (!frame.navigation.visible && (schedule == RefreshSchedule::kSelection || schedule == RefreshSchedule::kConfig))
         return RefreshStableRegion(kSettingsContentRect, schedule);
-    return RefreshFrame(frame, schedule);
-}
-
-esp_err_t RenderProvisioningToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
-{
-    wqn::ClearEpdFramebuffer(true);
-    SettingsHeading(frame, "设置 / 网络", "手机配网", "使用手机完成网络配置");
-    if (frame.provisioning_phase == wqn::ProvisionState::kStarting)
-        SettingsEmpty("正在准备热点", "请稍候，设备正在启动配网。");
-    else if (frame.provisioning_phase == wqn::ProvisionState::kFailed)
-        SettingsEmpty("热点未能启动", "确认重试，检查网络配置。");
-    else if (frame.provisioning_phase == wqn::ProvisionState::kConnected)
-        SettingsEmpty("WiFi 已连接", "确认返回 WiFi 管理。");
-    else if (frame.provisioning_phase == wqn::ProvisionState::kConnecting)
-        SettingsEmpty("正在连接 WiFi", "配置已保存，正在尝试连接网络。");
-    else {
-        SettingsText(kSettingsDetailX, 126, "1  连接设备热点"); SettingsText(kSettingsDetailX + 22, 153, frame.provisioning_ssid, 16, 330); SettingsLine(166);
-        SettingsText(kSettingsDetailX, 190, "2  打开浏览器地址"); SettingsText(kSettingsDetailX + 22, 216, "192.168.4.1", 16, 330);
-        SettingsText(kSettingsDetailX, 250, "保存 WiFi 后返回设备", 12);
-    }
     return RefreshFrame(frame, schedule);
 }
 

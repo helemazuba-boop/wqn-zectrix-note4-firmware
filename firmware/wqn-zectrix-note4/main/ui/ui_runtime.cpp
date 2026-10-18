@@ -1362,6 +1362,21 @@ UiUpdate UiRuntime::DispatchSettingsTick(int64_t now_ms)
         }
         refresh = RefreshSchedule::kConfig;
     }
+    if (phase != wqn::ProvisionState::kIdle &&
+        (active || settings.dialog == wqn::SettingsDialog::kProvisioningResult)) {
+        // Read cached identities through the service; QR/result rendering never
+        // reloads NVS or starts network work. These fields also feed the normal
+        // frame signature so late STA handoff data gets its own refresh.
+        const auto network = wqn::services::GetConnectivitySnapshot();
+        const auto copy_identity = [&](char* target, size_t size, const char* value) {
+            if (std::strcmp(target, value) == 0) return;
+            std::snprintf(target, size, "%s", value);
+            refresh = RefreshSchedule::kConfig;
+        };
+        copy_identity(settings.wifi_primary_ssid, sizeof(settings.wifi_primary_ssid), network.primary_ssid);
+        copy_identity(settings.wifi_backup_ssid, sizeof(settings.wifi_backup_ssid), network.backup_ssid);
+        copy_identity(settings.wifi_active_ssid, sizeof(settings.wifi_active_ssid), network.active_ssid);
+    }
     return FinishEvent(AppEventKind::kSettingsTick, refresh, refresh != RefreshSchedule::kNone);
 }
 

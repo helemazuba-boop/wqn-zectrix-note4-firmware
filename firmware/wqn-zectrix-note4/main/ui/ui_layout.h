@@ -89,6 +89,29 @@ constexpr int kSettingsOptionTop = 111;
 constexpr int kSettingsOptionPitch = 31;
 constexpr int kSettingsDetailWidth = kContentWidth;
 
+// ---- Provisioning: approved About identity, no status bar or help footer ----
+constexpr int kProvisionLeft = 24;
+constexpr int kProvisionRight = 376;
+constexpr int kProvisionWidth = kProvisionRight - kProvisionLeft;
+constexpr int kProvisionBrandY = 17;
+constexpr int kProvisionBrandBaseline = 45;
+constexpr int kProvisionModelBaseline = 89;
+constexpr int kProvisionStatusBaseline = 86;
+constexpr int kProvisionDividerY = 101;
+constexpr int kProvisionQrColumnWidth = 166;
+constexpr int kProvisionQrSecondX = 210;
+constexpr int kProvisionQrLabelBaseline = 122;
+constexpr int kProvisionQrSlotY = 127;
+constexpr int kProvisionQrSlotSize = 123;
+constexpr int kProvisionQrCaptionBaseline = 267;
+constexpr int kProvisionQrDividerX = 199;
+constexpr int kProvisionQrDividerY = 114;
+constexpr int kProvisionQrDividerHeight = 150;
+constexpr int kProvisionStateTitleBaseline = 150;
+constexpr int kProvisionStateRowBaseline = 190;
+constexpr int kProvisionStateRowPitch = 32;
+constexpr int kProvisionStateNoteBaseline = 258;
+
 // ---- Global page navigation ----
 constexpr int kNavigationX = 8;
 constexpr int kNavigationY = 214;

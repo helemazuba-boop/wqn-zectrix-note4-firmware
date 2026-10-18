@@ -11,6 +11,7 @@
 #include "ui/navigation_model.h"
 #include "ui/ui_fonts.h"
 #include "ui/assets/brand_logo.h"
+#include "ui/provision_qr.h"
 #include "font_zectrix.h"
 
 using esp_err_t = int;
@@ -90,7 +91,11 @@ void SetProblemImageRenderMode(ProblemState*,ImageRenderMode) {}
 void SetAiAutoFollow(bool) { ++follows; }
 @@LABELS@@
 namespace services {
+@@CONNECTIVITY_TYPES@@
 @@WIFI_API@@
+@@CONNECTIVITY_SNAPSHOT@@
+ConnectivitySnapshot connectivity;
+ConnectivitySnapshot GetConnectivitySnapshot() {return connectivity;}
 WifiSwitchSnapshot network;
 uint32_t switch_id=91;
 int switches=0;
@@ -135,6 +140,7 @@ std::string BytesLabel(size_t value) { return std::to_string(value/1024)+" KiB";
 int regional=0,complete=0;
 int RefreshStableRegion(const UiRect& r,RefreshSchedule) { CHECK(r.x==0&&r.y==0&&r.width==400&&r.height==300);++regional;return ESP_OK; }
 int RefreshFrame(const wqn::UiFrame&,RefreshSchedule) { ++complete;return ESP_OK; }
+esp_err_t RenderProvisioningToEpd(const wqn::UiFrame&,RefreshSchedule);
 void UpdateSettingsDiagnostics(wqn::UiState*) { ++reads; }
 void RebuildNoteWordDeckRows(wqn::UiState*) {}
 void BuildHomeSummary(wqn::UiState*) {}
@@ -143,6 +149,7 @@ bool pack_busy=false;
 bool IsWordPackCloudBusy() { return pack_busy; }
 }  // namespace device_ui_internal
 @@PAGE@@
+@@PROVISION_PAGE@@
 
 namespace device_ui_internal {
 enum class PersistKind { kSettingsAutoSync,kSettingsVolume,kSettingsImageRender,kSettingsDefaultDeck,kSettingsAiFollow };
@@ -247,7 +254,25 @@ int main(int argc,char** argv) {
         f.settings.word_deck_status=status;RenderSettingsToEpd(f,RefreshSchedule::kConfig);save_frame(directory,"deck-state-"+std::to_string(static_cast<int>(status)));
     }
     f.settings.word_deck_status=wqn::SettingsDeckStatus::kReady;
-    f.settings.dialog=Dialog::kProvisioningResult;f.provisioning_phase=wqn::ProvisionState::kFailed;RenderSettingsToEpd(f,RefreshSchedule::kConfig);CHECK(has_text("配网未完成"));save_frame(directory,"provision-failed");f.provisioning_phase=wqn::ProvisionState::kConnecting;RenderSettingsToEpd(f,RefreshSchedule::kConfig);CHECK(has_text("正在连接 WiFi")&&!has_text("WiFi 已连接"));f.provisioning_phase=wqn::ProvisionState::kConnected;RenderSettingsToEpd(f,RefreshSchedule::kConfig);CHECK(has_text("WiFi 已连接"));f.provisioning_phase=wqn::ProvisionState::kIdle;
+    f.settings.dialog=Dialog::kProvisioningResult;
+    f.provisioning_phase=wqn::ProvisionState::kFailed;
+    RenderSettingsToEpd(f,RefreshSchedule::kConfig);
+    CHECK(has_text("未能连接 WiFi")&&has_text("未连接"));
+    save_frame(directory,"provision-failed");
+    f.settings.wifi_backup_ssid[0]=0;
+    RenderSettingsToEpd(f,RefreshSchedule::kConfig);CHECK(has_text("未配置"));
+    std::snprintf(f.settings.wifi_backup_ssid,33,"Home_Backup");
+    f.provisioning_phase=wqn::ProvisionState::kConnecting;
+    RenderSettingsToEpd(f,RefreshSchedule::kConfig);
+    CHECK(has_text("正在连接 WiFi")&&!has_text("WiFi 已连接"));
+    CHECK(has_text("Study_Room_2G")&&has_text("Home_Backup"));
+    save_frame(directory,"provision-connecting");
+    f.provisioning_phase=wqn::ProvisionState::kConnected;
+    std::snprintf(f.settings.wifi_active_ssid,33,"Home_Backup");
+    RenderSettingsToEpd(f,RefreshSchedule::kConfig);
+    CHECK(has_text("WiFi 已连接")&&has_text("Home_Backup")&&!has_text("Study_Room_2G"));
+    save_frame(directory,"provision-connected");
+    f.provisioning_phase=wqn::ProvisionState::kIdle;
     f.settings.dialog=Dialog::kAbout;RenderSettingsToEpd(f,RefreshSchedule::kConfig);
     CHECK(has_text("rongNoteBook")&&has_text("v0.1.0-live")&&has_text("ESP-IDF v5.5.4"));
     CHECK(std::all_of(pixels.begin()+274*400,pixels.end(),[](auto p){return p==0;}));
@@ -269,6 +294,29 @@ int main(int argc,char** argv) {
     CHECK(signature!=SettingsSignature(f));
     f.navigation.visible=true;int before=complete;RenderSettingsToEpd(f,RefreshSchedule::kNavigation);CHECK(complete==before+1);f.navigation.visible=false;
     f.settings.notice.clear();f.screen=wqn::UiScreen::kProvisioning;f.provisioning_phase=wqn::ProvisionState::kScanning;f.provisioning_ssid="WQN_N4_LIVE";RenderProvisioningToEpd(f,RefreshSchedule::kCommit);CHECK(has_text("WQN_N4_LIVE")&&has_text("192.168.4.1"));save_frame(directory,"provision");
+    CHECK(has_text("rongNoteBook")&&has_text("Note4")&&has_text("等待配置"));
+    CHECK(!has_text("设备配网")&&!has_text("设备设置 · 已配对"));
+    CHECK(std::all_of(pixels.begin(),pixels.begin()+16*400,[](auto p){return p==0;}));
+    CHECK(std::all_of(pixels.begin()+278*400,pixels.end(),[](auto p){return p==0;}));
+    CHECK(!std::all_of(pixels.begin()+27*400,pixels.begin()+28*400,[](auto p){return p==1;}));
+    for(const auto& sample:std::array<std::pair<const char*,std::string>,3>{{
+        {"provision-escaped","Note;4,Lab:\\\"'"},
+        {"provision-unicode","设备热点-Note4"},
+        {"provision-max",std::string(32,';')}
+    }}) {
+        f.provisioning_ssid=sample.second;
+        RenderProvisioningToEpd(f,RefreshSchedule::kCommit);
+        CHECK(!has_text("请手动连接热点"));save_frame(directory,sample.first);
+    }
+    f.provisioning_ssid.clear();RenderProvisioningToEpd(f,RefreshSchedule::kCommit);
+    CHECK(has_text("正在启动设备热点")&&!has_text("192.168.4.1"));
+    save_frame(directory,"provision-starting");
+    f.provisioning_phase=wqn::ProvisionState::kStarting;f.provisioning_ssid="WQN_PENDING";
+    RenderProvisioningToEpd(f,RefreshSchedule::kCommit);
+    CHECK(has_text("正在启动设备热点")&&has_text("WQN_PENDING"));
+    const auto provision_signature=SettingsSignature(f);
+    std::snprintf(f.settings.wifi_active_ssid,33,"NewLink");
+    CHECK(SettingsSignature(f)!=provision_signature);
 
     UiRuntime runtime;auto& state=runtime.state_;auto& s=state.settings;
     state.settings.selected=wqn::kSettingsRowAbout;event(state,Button::kConfirm,Event::kShortPress);CHECK(s.dialog==Dialog::kAbout);event(state,Button::kConfirm,Event::kShortPress);CHECK(s.dialog==Dialog::kNone);
@@ -313,12 +361,30 @@ int main(int argc,char** argv) {
     OpenSettingsDialog(&state,Dialog::kDevSync);state.navigation={};route(Event::kPress,5000);route(Event::kShortPress,5100);route(Event::kRelease,5110);route(Event::kPress,5200);before=downloads;route(Event::kDoublePress,5250);route(Event::kRelease,5260);CHECK(downloads==before+1);
     s.dialog=Dialog::kNone;s.selected=wqn::kSettingsRowAbout;wqn::provisioning_active=true;before=reads;route(Event::kPress,6000);route(Event::kShortPress,6100);route(Event::kRelease,6110);CHECK(s.dialog==Dialog::kNone&&reads==before);
     wqn::phase=wqn::ProvisionState::kStarting;CHECK(ProjectProvisioning(state).screen==wqn::UiScreen::kProvisioning);
+    std::snprintf(s.wifi_primary_ssid,33,"ProjectedPrimary");
+    CHECK(std::string(ProjectProvisioning(state).settings.wifi_primary_ssid)=="ProjectedPrimary");
     wqn::provisioning_active=false;wqn::phase=wqn::ProvisionState::kConnected;CHECK(ProjectProvisioning(state).screen==wqn::UiScreen::kSettings);wqn::phase=wqn::ProvisionState::kIdle;
     s.auto_sync_selected=4;s.volume_selected=1;s.image_render_selected=0;RefreshDurableSelections(&state);CHECK(s.auto_sync_selected==4&&s.volume_selected==1&&s.image_render_selected==0);
     s.dialog=Dialog::kAutoSync;s.auto_sync_selected=0;s.notice="保存失败";
     wqn::ButtonEvent boundary{Button::kUp,Event::kShortPress,0,false,6500,0};
     CHECK(ApplySettingsButtonEvent(boundary,&state)==RefreshSchedule::kConfig&&s.notice.empty());
     wqn::phase=wqn::ProvisionState::kStarting;runtime.DispatchSettingsTick(clock_ms);wqn::phase=wqn::ProvisionState::kScanning;wqn::ap="WQN_N4_REAL";CHECK(runtime.DispatchSettingsTick(clock_ms).refresh==RefreshSchedule::kConfig);wqn::phase=wqn::ProvisionState::kFailed;runtime.DispatchSettingsTick(clock_ms);CHECK(s.dialog==Dialog::kProvisioningResult);event(state,Button::kConfirm,Event::kLongPress);CHECK(s.dialog==Dialog::kWifiManage);wqn::phase=wqn::ProvisionState::kIdle;wqn::ap.clear();
+    auto& snapshot=wqn::services::connectivity;
+    std::snprintf(snapshot.primary_ssid,33,"RealPrimary");
+    std::snprintf(snapshot.backup_ssid,33,"RealBackup");
+    snapshot.active_ssid[0]=0;
+    const int reads_before=reads,submits_before=submits,provisions_before=provisions;
+    wqn::phase=wqn::ProvisionState::kConnecting;
+    CHECK(runtime.DispatchSettingsTick(clock_ms).refresh==RefreshSchedule::kConfig);
+    CHECK(s.dialog==Dialog::kProvisioningResult);
+    CHECK(std::string(s.wifi_primary_ssid)=="RealPrimary"&&std::string(s.wifi_backup_ssid)=="RealBackup");
+    CHECK(runtime.DispatchSettingsTick(clock_ms).refresh==RefreshSchedule::kNone);
+    // Late current-link identity must repaint even when the phase is unchanged.
+    std::snprintf(snapshot.active_ssid,33,"RealBackup");
+    CHECK(runtime.DispatchSettingsTick(clock_ms).refresh==RefreshSchedule::kConfig);
+    CHECK(std::string(s.wifi_active_ssid)=="RealBackup");
+    CHECK(reads==reads_before&&submits==submits_before&&provisions==provisions_before);
+    wqn::phase=wqn::ProvisionState::kIdle;
     using Switch=wqn::services::WifiSwitchState;
     OpenSettingsDialog(&state,Dialog::kWifiManage);
     std::snprintf(s.wifi_primary_ssid,33,"Primary");s.wifi_backup_ssid[0]=0;

@@ -48,6 +48,8 @@ idf_component_register(
         "ui/page_ai.cpp"
         "ui/page_ai_agent.cpp"
         "ui/page_home.cpp"
+        "ui/page_provisioning.cpp"
+        "ui/provision_qr.cpp"
         "ui/page_settings.cpp"
         "ui/page_time.cpp"
         "ui/page_todo.cpp"
@@ -104,6 +106,7 @@ idf_component_register(
         esp_driver_usb_serial_jtag
         esp_wifi
         wqn_wifi_provision
+        qr_code
         freertos
         json
         lwip

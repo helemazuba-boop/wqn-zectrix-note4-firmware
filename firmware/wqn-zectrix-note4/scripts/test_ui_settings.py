@@ -40,7 +40,9 @@ def main():
     model_cpp = (root/'main/ui_model.cpp').read_text()
     fixture = (root/'scripts/testdata/ui_settings.cpp').read_text()
     parts = {
+        '@@CONNECTIVITY_TYPES@@': section((root/'main/services/connectivity_service.h').read_text(), 'enum class ConnectivityState', 'struct ConnectivityDemandTicket'),
         '@@WIFI_API@@': section((root/'main/services/connectivity_service.h').read_text(), 'enum class WifiNetworkRole', 'class ConnectivityDemand'),
+        '@@CONNECTIVITY_SNAPSHOT@@': section((root/'main/services/connectivity_service.h').read_text(), 'struct ConnectivitySnapshot', 'ConnectivityDemand AcquireConnectivityDemand('),
         '@@MODEL@@': section(model, '// Settings-page row count', 'struct UiRuntimeStatus'),
         '@@FONT_LOOKUP@@': section(display, 'const lv_font_fmt_txt_glyph_dsc_t* FindGlyphInFont(', 'int MeasureCodepointWidth('),
         '@@FONT_DRAW@@': section(display, 'void DrawGlyphFromFont(', 'void DrawGlyphFromFontScaled('),
@@ -53,6 +55,7 @@ def main():
         '@@ICONS@@': section(digits, 'int DrawWifiStatusIcon(', '\n}  // namespace device_ui_internal'),
         '@@OPTIONS_INDEX@@': section(diag, 'size_t AutoSyncOptionIndex(', 'std::string OnlineSyncStatusLabel('),
         '@@PAGE@@': re.sub(r'^#include[^\n]*\n', '', args.page_source.read_text(), flags=re.M),
+        '@@PROVISION_PAGE@@': re.sub(r'^#include[^\n]*\n', '', (root/'main/ui/page_provisioning.cpp').read_text(), flags=re.M),
         '@@INPUT@@': section(inputs, 'bool AnyLocalPersistPending(', '// [detail] Cycle the Agent tier'),
         '@@SIGNATURE@@': section(refresh, '    if (frame.screen == wqn::UiScreen::kProvisioning) {', '    for (const wqn::UiLine& line : frame.lines)'),
         '@@TICK@@': section(runtime, 'UiUpdate UiRuntime::DispatchSettingsTick(', 'UiUpdate UiRuntime::DispatchStatusReload('),
@@ -85,13 +88,19 @@ def main():
             subprocess.run(['gcc', '-std=c99', '-Wall', '-Wextra', '-Werror', '-I', str(folder), '-I', str(inc),
                             '-I', str(root/'main/ui'), '-c', str(source), '-o', str(obj)], check=True, timeout=60)
             objects.append(str(obj))
+        qr_include = root/'components/qr_code/include'
+        qr_object = folder/'qrcodegen.o'
+        subprocess.run(['gcc', '-std=c99', '-Wall', '-Wextra', '-Werror', '-I', str(qr_include),
+                        '-c', str(root/'components/qr_code/qrcodegen.c'), '-o', str(qr_object)], check=True, timeout=30)
+        objects.append(str(qr_object))
         unit = folder/'settings.cpp'
         unit.write_text(fixture)
         for dev in (0, 1):
             binary = folder/f'settings-{dev}'
             subprocess.run(['g++', '-std=c++17', '-Wall', '-Wextra', '-Werror', f'-DCONFIG_WQN_DEV_MENU_ENABLE={dev}',
                             '-I', str(folder), '-I', str(inc), '-I', str(root/'main'), '-I', str(root/'main/ui'),
-                            str(unit), str(root/'main/ui/navigation_model.cpp'), *objects, '-o', str(binary)], check=True, timeout=60)
+                            '-I', str(qr_include), str(unit), str(root/'main/ui/navigation_model.cpp'),
+                            str(root/'main/ui/provision_qr.cpp'), *objects, '-o', str(binary)], check=True, timeout=60)
             command = [str(binary)]
             if args.render_dir:
                 directory = args.render_dir/f'dev-{dev}'
