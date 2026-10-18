@@ -23,6 +23,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include "font_fmt.h"
 
 namespace device_ui_internal {
 
@@ -93,12 +94,15 @@ struct MdLine {
 // unaffected -- they do not occur in math plain text.
 constexpr uint8_t kMdNoSingleEmphasis = 0x01;
 
+// A null font preserves the legacy note/problem metric. AI supplies its native
+// face for both layout and drawing; truncated distinguishes budget exhaustion.
 // Lay a Markdown body out into fixed-height rows for a content_width_px-wide
 // viewport. Deterministic for a given (body, width, opts): the render path and
 // the scroll-clamp count path MUST pass the same width and opts so their row
 // counts agree.
 std::vector<MdLine> LayoutMarkdown(
-    const std::string& body, int content_width_px, uint8_t opts = 0);
+    const std::string& body, int content_width_px, uint8_t opts = 0,
+    const lv_font_t* font = nullptr, bool* truncated = nullptr);
 
 // Row count only (scroll clamp). Equivalent to LayoutMarkdown(...).size().
 std::size_t CountMarkdownLines(

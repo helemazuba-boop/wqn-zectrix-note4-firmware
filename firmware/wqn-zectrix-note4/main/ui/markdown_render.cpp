@@ -11,10 +11,11 @@
 #include "ui_internal.h"
 
 #include "markdown_layout.h"
+#include "ai_native_text.h"
 
 namespace device_ui_internal {
 
-esp_err_t DrawMarkdownLine(const MdLine& line, int x, int y, int content_w, int line_h)
+esp_err_t DrawMarkdownLine(const MdLine& line, int x, int y, int content_w, int line_h, const lv_font_t* font)
 {
     if (line.kind == MdLineKind::kRule) {
         DrawHorizontalLine(x, y + line_h / 2, content_w);
@@ -32,7 +33,9 @@ esp_err_t DrawMarkdownLine(const MdLine& line, int x, int y, int content_w, int 
         for (const MdTableCell& cell : line.cells) {
             if (cell.text.empty()) continue;
             const esp_err_t r =
-                DrawClippedText(x + cell.x, y + 2, line.table_width - cell.x, cell.text);
+                font ? (wqn::DrawTextWithFont(x + cell.x, y + 2, font,
+                    AiNativeClip(cell.text, line.table_width - cell.x, font).c_str(), true), ESP_OK)
+                     : DrawClippedText(x + cell.x, y + 2, line.table_width - cell.x, cell.text);
             if (r != ESP_OK) rc = r;
         }
         if (line.border_bottom) {
@@ -58,7 +61,10 @@ esp_err_t DrawMarkdownLine(const MdLine& line, int x, int y, int content_w, int 
     const int text_x = x + line.indent_px;
     esp_err_t rc = ESP_OK;
     if (!line.text.empty()) {
-        rc = DrawClippedText(text_x, y, content_w - line.indent_px, line.text);
+        if (font) {
+            const std::string clipped = AiNativeClip(line.text, content_w - line.indent_px, font);
+            wqn::DrawTextWithFont(text_x, y, font, clipped.c_str(), true);
+        } else rc = DrawClippedText(text_x, y, content_w - line.indent_px, line.text);
     }
     for (const MdDecoration& deco : line.decorations) {
         const int dx = text_x + deco.x;
@@ -70,7 +76,7 @@ esp_err_t DrawMarkdownLine(const MdLine& line, int x, int y, int content_w, int 
                 DrawHorizontalLine(dx, y + 8, deco.w);
                 break;
             case MdDecoKind::kCodeBox:
-                DrawRect(dx - 1, y - 1, deco.w + 2, 18);
+                DrawRect(dx - 1, font ? y : y - 1, deco.w + 2, 18);
                 break;
         }
     }

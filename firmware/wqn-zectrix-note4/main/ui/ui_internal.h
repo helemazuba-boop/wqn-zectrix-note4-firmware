@@ -23,6 +23,7 @@
 
 #include "ui_model.h"
 #include "markdown_layout.h"
+#include "ai_text_layout.h"
 #include "wqn_api.h"
 #include "config.h"
 #include "display_service.h"
@@ -629,7 +630,8 @@ esp_err_t DrawCenteredText(int x, int y, int width, const std::string& text, boo
 esp_err_t DrawWrappedText(int x, int y, int width, const std::string& text, int max_lines, bool black = true);
 // Shared Markdown row renderer (markdown_render.cpp). The MdLine must come
 // from LayoutMarkdown at the same content_w or geometry desyncs.
-esp_err_t DrawMarkdownLine(const MdLine& line, int x, int y, int content_w, int line_h);
+esp_err_t DrawMarkdownLine(const MdLine& line, int x, int y, int content_w, int line_h,
+                            const lv_font_t* font = nullptr);
 std::string LimitForEpd(const std::string& text);
 std::string Utf8PageSlice(const std::string& text, size_t page, size_t chars_per_page);
 std::string JoinAiFunctionCallSummaries(const std::vector<std::string>& summaries);
@@ -687,11 +689,12 @@ void GetAiScrollBounds(
 struct AiHistoryLayout {
     std::vector<int> heights;       // chronological, per message
     std::vector<int> virtual_tops;  // chronological, includes kAiLineGap
+    std::vector<std::shared_ptr<const AiTextLayout>> text;
     int total_content_h = 0;
     int anchor_top = 0;  // virtual top of the newest user message (0 if none)
 };
-AiHistoryLayout ComputeAiHistoryLayout(
-    const std::vector<wqn::ChatMessageSnapshot>& messages, bool expand_content);
+std::shared_ptr<const AiHistoryLayout> GetAiHistoryLayout(
+    const std::shared_ptr<const wqn::AiHistorySnapshot>& snapshot, bool expand_content);
 // Scroll offset that brings the previous/next answer to the top of the
 // viewport. `direction` < 0 = older, > 0 = newer. Returns false when there is
 // no answer in that direction, so the caller can show the "已最新" style hint

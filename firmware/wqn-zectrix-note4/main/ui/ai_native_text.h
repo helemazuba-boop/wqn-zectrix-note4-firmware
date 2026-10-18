@@ -2,11 +2,30 @@
 
 #include <algorithm>
 #include <string>
+#include <string_view>
 
 #include "display_service.h"
 #include "ui_fonts.h"
 
 namespace device_ui_internal {
+
+inline size_t AiWrapBoundary(const std::string& text, size_t start, size_t overflow,
+                             size_t last_space)
+{
+    if (last_space > start) return last_space;
+    if (overflow <= start) return overflow;
+    size_t previous = overflow - 1;
+    while (previous > start && (static_cast<unsigned char>(text[previous]) & 0xc0) == 0x80) --previous;
+    if (previous == start) return overflow;
+    const unsigned char lead = text[overflow];
+    const size_t bytes = lead < 0x80 ? 1 : lead < 0xe0 ? 2 : lead < 0xf0 ? 3 : 4;
+    constexpr std::string_view closing = ",.!?;:)]}，。！？；：、）》】」』”’";
+    constexpr std::string_view opening = "([{（《【「『“‘";
+    if (closing.find(text.substr(overflow, bytes)) != std::string_view::npos ||
+        opening.find(text.substr(previous, overflow - previous)) != std::string_view::npos)
+        return previous;
+    return overflow;
+}
 
 inline const lv_font_t* AiNativeFont(int size = 16)
 {

@@ -1,0 +1,183 @@
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <fstream>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+#include "display_service.h"
+#include "ai_history.h"
+#include "ui/ai_native_text.h"
+#include "ui/ai_scroll_geometry.h"
+#include "ui/ai_text_layout.h"
+#include "ui/ui_layout.h"
+#include "ui/assets/font_wqn_inline_12_1.h"
+
+int checks=0;
+#define CHECK(c) do { if(!(c)) { std::fprintf(stderr,"FAIL %d: %s\n",__LINE__,#c);std::abort(); } ++checks; } while(0)
+int64_t esp_timer_get_time() { return 2000000; }
+struct TextRun { int x,y; const lv_font_t* font; std::string text; };
+std::vector<TextRun> drawn;
+
+namespace wqn {
+std::array<uint8_t,400*300> pixels;
+extern "C" const lv_font_t SourceHanSansSC_Regular_slim;
+extern "C" bool lv_font_get_glyph_dsc_fmt_txt(const lv_font_t*,lv_font_glyph_dsc_t*,uint32_t,uint32_t) { return false; }
+extern "C" const uint8_t* lv_font_get_bitmap_fmt_txt(const lv_font_t*,uint32_t) { return nullptr; }
+void DrawEpdPixel(int x,int y,bool ink) { if(x>=0&&x<400&&y>=0&&y<300)pixels[y*400+x]=ink; }
+void ClearEpdFramebuffer(bool white) { pixels.fill(!white);drawn.clear(); }
+const lv_font_t* PrimaryUiFont() { return &SourceHanSansSC_Regular_slim; }
+@@FONT_LOOKUP@@
+@@FONT_DRAW@@
+@@FONT_MEASURE@@
+void DrawTextWithFont(int x,int y,const lv_font_t* font,const char* text,bool ink) {
+    drawn.push_back({x,y,font,text});const char* cursor=text;uint32_t cp;
+    while(*cursor&&DecodeUtf8(cursor,&cp)) { DrawGlyphFromFont(x,y,font,cp,ink);x+=MeasureGlyphWidthInFont(font,cp); }
+}
+int MeasureUtf8TextWidth(const char* text) {
+    int width=0;uint32_t cp;const char* cursor=text;
+    while(*cursor&&DecodeUtf8(cursor,&cp))width+=cp<128?6:MeasureGlyphWidthInFont(PrimaryUiFont(),cp);
+    return width;
+}
+esp_err_t DrawUtf8Text(int x,int y,const char* text,bool ink) { DrawTextWithFont(x,y,PrimaryUiFont(),text,ink);return ESP_OK; }
+enum class AiTier { kAgent,kStd,kFlash };
+enum class AiSessionStatus { kIdle,kStreaming };
+struct AiSessionState { AiTier tier=AiTier::kAgent;AiSessionStatus status=AiSessionStatus::kIdle;bool expand_content=true;int64_t scroll_no_op_hint_ms=0; };
+}
+
+namespace device_ui_internal {
+void FillRect(int x,int y,int w,int h,bool ink) { for(int yy=y;yy<y+h;++yy)for(int xx=x;xx<x+w;++xx)wqn::DrawEpdPixel(xx,yy,ink); }
+void DrawHorizontalLine(int x,int y,int w) { FillRect(x,y,w,1,true); }
+void DrawVerticalLine(int x,int y,int h) { FillRect(x,y,1,h,true); }
+void DrawRect(int x,int y,int w,int h) { DrawHorizontalLine(x,y,w);DrawHorizontalLine(x,y+h-1,w);DrawVerticalLine(x,y,h);DrawVerticalLine(x+w-1,y,h); }
+void DrawRoundedRect(int x,int y,int w,int h,int) { DrawRect(x,y,w,h); }
+void DrawHistoryClear(int y0,int y1) { FillRect(0,y0,400,y1-y0,false);drawn.clear(); }
+void DrawWqnBitmapAsset(int x,int y,const WqnBitmapAsset& a,bool ink) {
+    for(int yy=0;yy<a.height;++yy)for(int xx=0;xx<a.width;++xx)
+        if(a.data[yy*a.stride+xx/8]&(0x80>>(xx%8)))wqn::DrawEpdPixel(x+xx,y+yy,ink);
+}
+esp_err_t DrawClippedText(int x,int y,int w,const std::string& text,bool ink=true) { AiNativeText(x,y,w,text,16,ink);return ESP_OK; }
+esp_err_t DrawMarkdownLine(const MdLine&,int,int,int,int,const lv_font_t* font=nullptr);
+@@HISTORY_MODEL@@
+}
+@@MD_RENDER@@
+namespace device_ui_internal {
+#define DRC(...) do { (void)wqn::DrawUtf8Text(__VA_ARGS__); } while(0)
+@@PAGE@@
+}
+
+void Save(const std::string& folder,const std::string& name) {
+    if(folder.empty())return;
+    std::ofstream out(folder+"/"+name+".pgm",std::ios::binary);
+    out<<"P5\n400 300\n255\n";for(auto pixel:wqn::pixels)out.put(pixel?0:255);
+}
+bool HasText(const std::string& text) { return std::any_of(drawn.begin(),drawn.end(),[&](const auto& run){return run.text==text;}); }
+void Bounds(int bottom=300) {
+    for(const auto& run:drawn) {
+        CHECK(run.x>=0&&run.x+wqn::MeasureTextWithFont(run.font,run.text.c_str())<=400);
+        CHECK(run.y>=28&&run.y+run.font->line_height<=bottom);
+    }
+}
+int main(int argc,char**argv) {
+    using namespace device_ui_internal;
+    const std::string folder=argc>1?argv[1]:"";
+    for(int total=0;total<1300;total+=7)for(int anchor=0;anchor<=total;anchor+=31)for(int pad:{0,22}) {
+        auto top=ComputeAiScrollGeometry(total,anchor,272-pad,18,INT32_MAX);
+        auto tail=ComputeAiScrollGeometry(total,anchor,272-pad,18,INT32_MIN);
+        CHECK(top.window_top==0);CHECK(tail.window_top==std::max(0,total-(272-pad)));
+        CHECK(top.min_scroll<=top.max_scroll);
+    }
+    auto snapshot=std::make_shared<wqn::AiHistorySnapshot>();snapshot->revision=1;
+    wqn::ChatMessageSnapshot user;user.id=1;user.kind=wqn::ChatMessageKind::kUser;user.text="Q";
+    wqn::ChatMessageSnapshot reply;reply.id=2;reply.kind=wqn::ChatMessageKind::kAssistant;
+    for(int i=1;i<=14;++i){if(i>1)reply.text+='\n';reply.text+="ROW_"+std::to_string(i);}
+    snapshot->messages={user,reply};wqn::AiSessionState ai;
+    int32_t minimum=0,maximum=0;GetAiScrollBounds(snapshot,true,0,&minimum,&maximum);
+    CHECK(minimum==-1&&maximum==0);
+    RenderAiHistoryViewport(ai,snapshot,minimum,0);CHECK(HasText("ROW_14"));Bounds();Save(folder,"tail-reachable");
+    auto wide_tail=std::make_shared<wqn::AiHistorySnapshot>(*snapshot);wide_tail->revision++;
+    std::string wide;
+    while(wqn::MeasureTextWithFont(AiNativeFont(),(wide+"W").c_str())<=378)wide+='W';
+    auto& wide_body=wide_tail->messages.back().text;
+    wide_body.resize(wide_body.rfind('\n')+1);wide_body+=wide;
+    GetAiScrollBounds(wide_tail,true,0,&minimum,&maximum);RenderAiHistoryViewport(ai,wide_tail,minimum,0);
+    CHECK(HasText(wide));
+    auto target=*std::find_if(drawn.begin(),drawn.end(),[&](const auto& run){return run.text==wide;});
+    CHECK(target.y>=280);Save(folder,"tail-right-edge");
+    const auto actual=wqn::pixels;
+    wqn::ClearEpdFramebuffer();wqn::DrawTextWithFont(target.x,target.y,target.font,wide.c_str());
+    int compared=0;
+    for(int y=target.y;y<target.y+16;++y)for(int x=360;x<394;++x)if(wqn::pixels[y*400+x]){CHECK(actual[y*400+x]);++compared;}
+    CHECK(compared>0);
+    for(int pad:{0,22}) {
+        GetAiScrollBounds(snapshot,true,pad,&minimum,&maximum);
+        RenderAiHistoryViewport(ai,snapshot,minimum,pad);CHECK(HasText("ROW_14"));
+        // Indicator counts live outside the interaction band's text viewport.
+        for(const auto& run:drawn)if(run.text.rfind("ROW_",0)==0)CHECK(run.y+18<=300-pad);
+    }
+    const auto builds=GetAiTextCacheStats().builds;
+    for(int i=0;i<40;++i){GetAiScrollBounds(snapshot,true,0,&minimum,&maximum);RenderAiHistoryViewport(ai,snapshot,minimum,0);}
+    CHECK(GetAiTextCacheStats().builds==builds);
+    auto before=GetAiHistoryLayout(snapshot,true);
+    auto grown=std::make_shared<wqn::AiHistorySnapshot>(*snapshot);grown->revision++;
+    grown->messages.back().text+="\nSTREAM_DELTA";
+    auto after=GetAiHistoryLayout(grown,true);
+    CHECK(before->text[0]==after->text[0]);CHECK(before->text[1]!=after->text[1]);
+    auto prompt=std::make_shared<wqn::AiHistorySnapshot>();prompt->revision=2;
+    user.id=20;user.text.clear();for(int i=1;i<=24;++i){if(i>1)user.text+='\n';user.text+="长提问第 "+std::to_string(i)+" 行";}
+    prompt->messages={user};auto long_layout=GetAiHistoryLayout(prompt,true);
+    CHECK(long_layout->text[0]->plain.size()==24);
+    GetAiScrollBounds(prompt,true,0,&minimum,&maximum);RenderAiHistoryViewport(ai,prompt,minimum,0);
+    CHECK(HasText("长提问第 24 行"));Bounds();Save(folder,"long-prompt-tail");
+    RenderAiHistoryViewport(ai,prompt,maximum,0);CHECK(HasText("长提问第 1 行"));Bounds();Save(folder,"long-prompt-head");
+    const auto* font=AiNativeFont();
+    auto english=WrapAiNativeText("alpha beta gamma",wqn::MeasureTextWithFont(font,"alpha beta"),font,10);
+    CHECK(english.size()==2&&english[0]=="alpha beta"&&english[1]=="gamma");
+    auto punct=WrapAiNativeText("中文标点，不能丢失。",64,font,10);
+    std::string joined;for(const auto& line:punct)joined+=line;CHECK(joined=="中文标点，不能丢失。");
+    auto crlf=WrapAiNativeText("first\r\nsecond",300,font,10);CHECK(crlf.size()==2&&crlf[0]=="first");
+    auto decorated=LayoutMarkdown("~~WWW~~",378,0,font);
+    CHECK(decorated[0].decorations[0].w==wqn::MeasureTextWithFont(font,"WWW"));
+    CHECK(decorated[0].decorations[0].w!=wqn::MeasureUtf8TextWidth("WWW"));
+    CHECK(LayoutMarkdown("~~WWW~~",378)[0].decorations[0].w==wqn::MeasureUtf8TextWidth("WWW"));
+    CHECK(LayoutMarkdown("x*y + z_1",378,kMdNoSingleEmphasis)[0].text=="x*y + z_1");
+    const std::string markdown="# 混排标题\n\n- 第一项 English words remain readable\n- 第二项\n\n> 引用与 `inline code`\n\n```cpp\nstd::string message = \"hello\";\n```\n\n| a long wide heading | b | c | d |\n|---|---|---|---|\n| very long English cell content | 中文 | 123 | end |";
+    auto mixed=std::make_shared<wqn::AiHistorySnapshot>();mixed->revision=3;reply.id=21;reply.text=markdown;mixed->messages={reply};
+    GetAiScrollBounds(mixed,true,0,&minimum,&maximum);
+    for(int offset=minimum;offset<=maximum;++offset){RenderAiHistoryViewport(ai,mixed,offset,0);Bounds();}
+    for(const auto& row:LayoutMarkdown(markdown,378,0,font)) {
+        if(row.kind==MdLineKind::kTableRow)CHECK(row.table_width<=378);
+        else CHECK(row.indent_px+wqn::MeasureTextWithFont(font,row.text.c_str())<=378);
+    }
+    RenderAiHistoryViewport(ai,mixed,minimum,0);Save(folder,"mixed-markdown-tail");
+    std::string huge;for(int i=0;i<4100;++i)huge+="budget row\n";
+    auto limited=GetAiTextLayout(99,huge,AiTextKind::kMarkdown,378,font);
+    CHECK(limited->truncated&&limited->markdown.size()<=4096);
+    CHECK(limited->markdown.back().text.find("后续未显示")!=std::string::npos);
+    bool cut=false;std::string exact;
+    for(int i=0;i<4096;++i)exact+="row\n";
+    auto full_budget=LayoutMarkdown(exact,378,0,font,&cut);
+    CHECK(full_budget.size()==4096&&!cut);
+    auto retained=GetAiTextLayout(100,"retained",AiTextKind::kPlain,378,font);
+    std::atomic<bool> safe{true};std::vector<std::thread> workers;
+    for(int thread=0;thread<6;++thread)workers.emplace_back([&,thread]{for(int i=0;i<180;++i){
+        const std::string word="worker-"+std::to_string(thread)+"-"+std::to_string(i);
+        auto result=GetAiTextLayout(thread,word,AiTextKind::kPlain,378,font);
+        if(result->plain.size()!=1||result->plain.front()!=word)safe=false;
+        if(i%18==0) {
+            auto live=std::make_shared<wqn::AiHistorySnapshot>(*grown);
+            live->revision+=thread*180+i+1;live->messages.back().text=word;
+            auto view=GetAiHistoryLayout(live,true);
+            if(view->text[1]->markdown.front().text!=word)safe=false;
+        }
+    }});
+    for(auto& worker:workers)worker.join();
+    CHECK(safe.load());CHECK(retained->plain.front()=="retained");
+    auto stats=GetAiTextCacheStats();CHECK(stats.entries<=kAiTextCacheMaxEntries&&stats.bytes<=kAiTextCacheMaxBytes);
+    std::printf("AI production reading: %d assertions passed; cache %zu entries / %zu bytes\n",checks,stats.entries,stats.bytes);
+}

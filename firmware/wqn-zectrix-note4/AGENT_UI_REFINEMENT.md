@@ -23,10 +23,27 @@ Validation: production picker/status seams and real font bitmaps: 1470 host
 assertions; navigation 1308; Home 139. `build-wsl`: zero warnings, M8 passed;
 binary UI entry-frame gate passed. Pixel replays are host output, not panel HIL.
 
+## Batch 2: complete reading and reusable layouts
+
+- Outward-rounded scroll limits make the first and last complete rows reachable,
+  including content overflowing by less than one row. Indicator clearing no
+  longer erases the right end of the last row.
+- User prompts retain their full wrapped text instead of stopping at four rows.
+  A 4096-row safety limit produces an explicit truncation notice.
+- AI plain text and Markdown measure and draw with the same native font. The
+  optional Markdown font preserves legacy note/problem layout behavior.
+- Immutable per-message results use a mutex-protected 32-entry / 1 MiB accounted
+  cache. Three immutable snapshot layouts avoid repeating layout on paging;
+  revised replies reuse unchanged prompts. Eviction cannot invalidate readers.
+
+Validation: 24212 production reading assertions, repeated under ASan/UBSan;
+Agent UI 1470, navigation 1308, Settings 235/250. The reading cases cover partial
+row overflow, long prompts, all scroll positions of mixed Markdown, tail pixels,
+cache limits and concurrent readers. `build-wsl`: zero warnings, M8 and binary
+UI entry-frame gates passed. Host pixel replays do not verify the physical EPD.
+
 ## Remaining batches
 
-2. Bounded shared layouts, complete user prompts, reachable first/last rows,
-   consistent native metrics, and synchronized immutable cached results.
 3. Agent viewport paging with one-line overlap; retained task/decision gestures;
    input-state presentation and the no-options question correction.
 4. Actual-capture LED indication, including both acquisition paths and cleanup.

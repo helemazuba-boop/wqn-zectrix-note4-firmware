@@ -45,6 +45,7 @@ idf_component_register(
         "ui/ui_gates_selftest.cpp"
         "ui/markdown_layout.cpp"
         "ui/markdown_render.cpp"
+        "ui/ai_text_layout.cpp"
         "ui/page_ai.cpp"
         "ui/page_ai_agent.cpp"
         "ui/page_home.cpp"
