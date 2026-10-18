@@ -52,9 +52,6 @@ constexpr char kTag[] = "wqn_ui";
 constexpr int kAgentBarY = wqn::kEpdHeight - kAiBottomBandH;  // 278
 constexpr int kAgentBarH = kAiBottomBandH;                    // 22
 constexpr int kAgentBarTextY = kAgentBarY + 3;                      // baseline
-constexpr int kAgentBarMarkerX = 8;
-constexpr int kAgentBarLabelX = kAgentBarMarkerX + 16;
-constexpr int kAgentBarSlotStep = 96;
 // [scroll-indicator] The right-hand column page_ai.cpp reserves for the ▼/▲
 // scroll chevrons (kEpdWidth - 40, 36 px wide). This tier's bottom band sits in
 // the same 22 px strip the ▼ lives in, so the band clears and lays out only the
@@ -175,6 +172,15 @@ AgentOption AgentFocusedOption(AgentOptionMode mode, uint8_t focused)
     return (focused == 0) ? first : second;
 }
 
+static std::string AgentQuestionPrompt(const wqn::AgentSessionState& agent)
+{
+    std::string ask = agent.pending_question_title.empty() ? "等你回答" : agent.pending_question_title;
+    // A pending ask owns the hold gesture. Its only escape interrupts the run;
+    // a new recording is possible after that action completes.
+    if (agent.pending_question_options.empty()) ask = "请选择自己回答后重新输入\n" + ask;
+    return ask;
+}
+
 static void DrawAgentOptionBar(AgentOptionMode mode, uint8_t focused,
                                 const wqn::AgentSessionState& agent)
 {
@@ -199,46 +205,31 @@ static void DrawAgentOptionBar(AgentOptionMode mode, uint8_t focused,
         : (AgentFocusedOption(mode, focused) == AgentFocusedOption(mode, 1) ? 1 : 0);
     const int slot_count = is_question ? std::min(item_count, 2) : 2;
 
+    const int right = wqn::kEpdWidth - kAgentIndicatorColumn - 8;
+    std::string counter;
+    if (is_question) counter = std::to_string(focused_item + 1) + "/" + std::to_string(item_count);
+    const int counter_w = wqn::MeasureTextWithFont(AiNativeFont(12), counter.c_str());
+    const int slots_right = right - (counter.empty() ? 0 : counter_w + 10);
+    const int slot_width = (slots_right - 8) / slot_count;
     for (int i = 0; i < slot_count; ++i) {
         const int item = window_start + i;
-        const int x = kAgentBarLabelX + i * kAgentBarSlotStep;
-        if (item == focused_item) {
-            // ▣ marker: a filled square says "this slot is armed" without
-            // borrowing a directional chevron that would imply something else.
-            FillRect(kAgentBarMarkerX + i * kAgentBarSlotStep, kAgentBarTextY + 3,
-                     8, 8, true);
-        }
+        const int x = 8 + i * slot_width;
+        const bool selected = item == focused_item;
+        if (selected) FillRect(x, kAgentBarY + 2, slot_width - 4, 19, true);
         std::string label;
         if (is_question) {
             if (item < static_cast<int>(agent.pending_question_options.size())) {
-                // The gateway projects {value,label}; an unlabelled option
-                // still shows its value rather than an empty slot.
                 label = agent.pending_question_options[item].label.empty()
                     ? agent.pending_question_options[item].value
                     : agent.pending_question_options[item].label;
-            } else {
-                label = "自己回答";
-            }
+            } else label = "自己回答";
         } else {
-            label = AgentOptionLabel(
-                AgentFocusedOption(mode, static_cast<uint8_t>(i)));
+            label = AgentOptionLabel(AgentFocusedOption(mode, static_cast<uint8_t>(i)));
         }
-        AGENT_TEXT(x, kAgentBarTextY, AgentOneLine(label, 88).c_str(), true);
+        AiNativeText(x + 5, kAgentBarTextY, slot_width - 14, label, 16, !selected);
     }
+    if (!counter.empty()) AiNativeText(right - counter_w, kAgentBarY + 5, counter_w, counter, 12);
 
-    if (is_question) {
-        // Position sense for the walk list: 2/9 while the window moves. This is
-        // the one readout the bar cannot do without -- the two visible options
-        // are a window onto a longer list, and without the counter a long list
-        // looks like a short one that repeats. Right-aligned inside the
-        // indicator column's left edge.
-        const int right = wqn::kEpdWidth - kAgentIndicatorColumn - 8;
-        char counter[16];
-        snprintf(counter, sizeof(counter), "%d/%d", focused_item + 1, item_count);
-        const int counter_w = wqn::MeasureUtf8TextWidth(counter);
-        AGENT_TEXT(right - counter_w, kAgentBarTextY, counter, true);
-        return;
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -254,14 +245,14 @@ static void DrawAgentPendingBubble(const std::string& text, const char* title)
     if (text.empty()) {
         return;
     }
-    const auto lines = wqn::WrapUtf8TextToWidth(
-        text, kAiAssistantW - 2 * kAiAssistantLeftBorder - 8, kAgentBubbleMaxLines);
+    const auto lines = WrapAiNativeText(
+        text, kAiAssistantW - 2 * kAiAssistantLeftBorder - 8, AiNativeFont(), kAgentBubbleMaxLines);
     if (lines.empty()) {
         return;
     }
 
     const int body_h = static_cast<int>(lines.size()) * kAiLineH;
-    const int height = body_h + 8 + 4;  // 4px pad top/bottom + 8px title row
+    const int height = body_h + 4 + 12 + 4 + 4;  // native title, gap, and padding
     const int top = kAgentBarY - kAgentBubbleGap - height;
     const int x = kAiHistoryLeftPad;
     const int width = kAiAssistantW;
@@ -271,10 +262,10 @@ static void DrawAgentPendingBubble(const std::string& text, const char* title)
     FillRect(x + 1, top + 1, width - 2, height - 2, false);
     DrawDashedRect(x, top, width, height);
 
-    AGENT_TEXT(x + kAiAssistantLeftBorder, top + 4, title, true);
-    int y = top + 4 + 8;
+    AiNativeText(x + kAiAssistantLeftBorder, top + 4, width - 16, title, 12);
+    int y = top + 4 + 12 + 4;
     for (const std::string& line : lines) {
-        AGENT_TEXT(x + kAiAssistantLeftBorder, y, line.c_str(), true);
+        AiNativeText(x + kAiAssistantLeftBorder, y, width - 16, line);
         y += kAiLineH;
     }
 }
@@ -450,9 +441,8 @@ esp_err_t RenderAgentAiToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule
     // come before the kNone early return below -- kTranscribing projects no
     // option mode, so without this branch the partial would never render.
     if (agent.ui.phase == wqn::AiFeaturePhase::kTranscribing) {
-        if (!agent.ui.voice_partial.empty()) {
-            DrawAgentPendingBubble(agent.ui.voice_partial, "转写中");
-        }
+        DrawAgentPendingBubble(agent.ui.voice_partial.empty()
+            ? "正在识别刚才说的话..." : agent.ui.voice_partial, "转写中");
         return RefreshFrame(frame, schedule);
     }
 
@@ -521,24 +511,7 @@ esp_err_t RenderAgentAiToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule
             : agent.ui.activity_text;
         DrawAgentPendingBubble(ask, "权限请求");
     } else if (mode == AgentOptionMode::kQuestion) {
-        std::string ask = agent.pending_question_title.empty()
-            ? std::string("等你回答")
-            : agent.pending_question_title;
-        if (agent.pending_question_options.empty()) {
-            // A field with nothing the device can choose between (free text,
-            // an over-long list). Say so instead of showing a bar that looks
-            // broken; 自定义回答 aborts the run so the request can be retyped.
-            //
-            // [font-fix] The gap was an ideographic space (U+3000), which this
-            // font does not contain: MeasureGlyphWidthInFont returns 0 on a miss,
-            // so it contributed no width and no ink, and the advisory butted
-            // straight onto the question title it is appended to. A plain ASCII
-            // space is the smallest separator the font can actually draw. There is
-            // only one candidate here -- `ask` is the title, so the advisory has to
-            // be visually separate from it.
-            ask += " 选项太多，长按说话回答";
-        }
-        DrawAgentPendingBubble(ask, "提问");
+        DrawAgentPendingBubble(AgentQuestionPrompt(agent), "提问");
     } else {
         const std::string prompt = agent.ui.prompt_text.empty()
             ? std::string("(空)")

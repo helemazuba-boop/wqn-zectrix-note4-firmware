@@ -135,6 +135,26 @@ int main(int argc,char**argv) {
     GetAiScrollBounds(prompt,true,0,&minimum,&maximum);RenderAiHistoryViewport(ai,prompt,minimum,0);
     CHECK(HasText("长提问第 24 行"));Bounds();Save(folder,"long-prompt-tail");
     RenderAiHistoryViewport(ai,prompt,maximum,0);CHECK(HasText("长提问第 1 行"));Bounds();Save(folder,"long-prompt-head");
+    // Page in both directions at every block inset. Adjacent pages retain a
+    // complete text row, and every row is visited before reaching either edge.
+    auto pages=std::make_shared<wqn::AiHistorySnapshot>();pages->revision=100;
+    reply.id=100;reply.text.clear();for(int i=0;i<100;++i)reply.text+="PAGE-"+std::to_string(i)+"\n";
+    pages->messages={reply};
+    for(int pad:{0,22}) {
+        GetAiScrollBounds(pages,true,pad,&minimum,&maximum);
+        const int step=AiPageStepRows(300-kAiViewportY-pad,kAiLineH);
+        std::vector<std::string> previous,visited;
+        for(int offset=maximum;;offset=std::max(minimum,offset-step)) {
+            RenderAiHistoryViewport(ai,pages,offset,pad);
+            std::vector<std::string> current;
+            for(const auto& run:drawn)if(run.text.rfind("PAGE-",0)==0)current.push_back(run.text);
+            if(!previous.empty())CHECK(std::any_of(current.begin(),current.end(),[&](const auto& row){
+                return std::find(previous.begin(),previous.end(),row)!=previous.end();}));
+            visited.insert(visited.end(),current.begin(),current.end());previous=std::move(current);
+            if(offset==minimum)break;
+        }
+        for(int i=0;i<100;++i)CHECK(std::find(visited.begin(),visited.end(),"PAGE-"+std::to_string(i))!=visited.end());
+    }
     const auto* font=AiNativeFont();
     auto english=WrapAiNativeText("alpha beta gamma",wqn::MeasureTextWithFont(font,"alpha beta"),font,10);
     CHECK(english.size()==2&&english[0]=="alpha beta"&&english[1]=="gamma");

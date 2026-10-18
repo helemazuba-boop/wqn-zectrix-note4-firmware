@@ -15,6 +15,13 @@ inline int AiCeilDivide(int value, int divisor)
     return -AiFloorDivide(-value, divisor);
 }
 
+// Keep a complete overlap row even when a block inset leaves partial rows at
+// both viewport edges. Only Agent uses viewport paging; other tiers keep theirs.
+inline int AiPageStepRows(int viewport_height, int line_height)
+{
+    return std::max(1, viewport_height / line_height - 2);
+}
+
 struct AiScrollGeometry {
     int max_window_top = 0;
     int min_scroll = 0;

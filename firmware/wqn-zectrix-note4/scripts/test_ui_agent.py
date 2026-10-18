@@ -24,10 +24,15 @@ def main():
     display = (root/'components/display_service/display_service.cpp').read_text()
     refresh = (root/'main/ui/ui_refresh.cpp').read_text()
     fixture = (root/'scripts/testdata/ui_agent.cpp').read_text()
+    input_source = (root/'main/ui/ui_input.cpp').read_text()
     replacements = {
         '@@FONT_LOOKUP@@': section(display, 'const lv_font_fmt_txt_glyph_dsc_t* FindGlyphInFont(', 'int MeasureCodepointWidth('),
         '@@FONT_DRAW@@': section(display, 'void DrawGlyphFromFont(', 'void DrawGlyphFromFontScaled('),
         '@@FONT_MEASURE@@': section(display, 'int MeasureTextWithFont(', 'void DrawTextWithFontCentered('),
+        '@@BAR_CONSTANTS@@': section(page, 'constexpr int kAgentBarY', '#define AGENT_TEXT'),
+        '@@DECISIONS@@': section(page, 'AgentOptionMode AgentOptionModeFor(', '// ---------------------------------------------------------------------------\n// Session picker'),
+        '@@INPUT@@': section(input_source, 'static RefreshSchedule ExecuteAgentOption(', '// [shell] Status-bar edit mode owns'),
+        '@@SCROLL_OWNER@@': section((root/'main/opencode_session.cpp').read_text(), 'bool ScrollOpenCodeResponse(int direction,', 'bool CopyOpenCodeSessionToUi('),
         '@@PICKER@@': section(page, 'static std::string AgentSessionMetadata(', '// ---------------------------------------------------------------------------\n// Status bar'),
         '@@STATUS@@': section(page, 'static const WqnBitmapAsset& AgentDetailAsset(', '// ---------------------------------------------------------------------------\n// Entry point'),
         '@@SIGNATURE@@': section(refresh, '    if (frame.screen == wqn::UiScreen::kAi &&\n        frame.ai.tier == wqn::AiTier::kAgent) {', '    if (frame.screen == wqn::UiScreen::kTodo) {'),
@@ -51,7 +56,7 @@ def main():
         unit.write_text(fixture)
         binary = folder/'agent'
         subprocess.run(['g++','-std=c++17','-Wall','-Wextra','-Werror','-I',str(folder),'-I',str(inc),
-                        '-I',str(root/'main'),'-I',str(root/'main/ui'),str(unit),*objects,'-o',str(binary)],
+                        '-I',str(root/'main'),'-I',str(root/'main/ui'),str(unit),str(root/'main/ui/ai_text_layout.cpp'),str(root/'main/ui/markdown_layout.cpp'),*objects,'-pthread','-o',str(binary)],
                        check=True,timeout=60)
         command = [str(binary)]
         if args.render_dir:

@@ -3168,13 +3168,13 @@ void CancelOpenCodePrompt()
 // page, which measured the offset as "distance from latest" and therefore
 // wanted a floor of 0. On the AI page that same floor made the bottom of the
 // newest reply unreachable, which read as "cannot scroll to the very bottom".
-void ScrollOpenCodeResponse(int direction, int32_t min_scroll, int32_t max_scroll)
+bool ScrollOpenCodeResponse(int direction, int32_t min_scroll, int32_t max_scroll, int step_lines)
 {
-    if (g_lock == nullptr || direction == 0) {
-        return;
+    if (g_lock == nullptr || direction == 0 || step_lines <= 0) {
+        return false;
     }
     xSemaphoreTake(g_lock, portMAX_DELAY);
-    int32_t next = g_state.ui.scroll_offset_lines + direction * 4;
+    int32_t next = g_state.ui.scroll_offset_lines + direction * step_lines;
     if (next < min_scroll) {
         next = min_scroll;
     }
@@ -3183,11 +3183,13 @@ void ScrollOpenCodeResponse(int direction, int32_t min_scroll, int32_t max_scrol
     }
     // Only mark changed when the offset actually moved: a no-op press at either
     // bound must not cost an EPD refresh.
-    if (next != g_state.ui.scroll_offset_lines) {
+    const bool moved = next != g_state.ui.scroll_offset_lines;
+    if (moved) {
         g_state.ui.scroll_offset_lines = next;
         MarkChangedLocked();
     }
     xSemaphoreGive(g_lock);
+    return moved;
 }
 
 bool CopyOpenCodeSessionToUi(AgentSessionState* state)
@@ -3298,7 +3300,7 @@ esp_err_t StopOpenCodeVoiceInput() { return ESP_ERR_NOT_SUPPORTED; }
 esp_err_t ConfirmOpenCodePrompt(int64_t) { return ESP_ERR_NOT_SUPPORTED; }
 void CancelOpenCodePrompt() {}
 void CancelAgentVoiceInput() {}
-void ScrollOpenCodeResponse(int, int32_t, int32_t) {}
+bool ScrollOpenCodeResponse(int, int32_t, int32_t, int) { return false; }
 void SetOpenCodeScrollOffsetClamped(int32_t, int32_t, int32_t) {}
 void SetOpenCodeFollowState(bool, bool) {}
 void SetOpenCodeDetailLevel(uint8_t) {}

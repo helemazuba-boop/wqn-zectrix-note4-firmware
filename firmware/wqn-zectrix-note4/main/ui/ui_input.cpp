@@ -3,6 +3,7 @@
 // Extracted from device_ui.cpp.
 
 #include "ui_internal.h"
+#include "ai_scroll_geometry.h"
 #include "persist_worker.h"
 
 #include <string>
@@ -1453,7 +1454,7 @@ RefreshSchedule ApplyButtonEvent(
 
     // Agent PTT is intentionally a two-step operation. Releasing this gesture
     // can only stop capture and start transcription; it cannot submit a prompt.
-    // The resulting kAwaitingConfirmation state requires a separate Up press.
+    // The resulting kAwaitingConfirmation state requires a separate option-bar confirmation.
     if (is_agent_ptt &&
         (event.type == wqn::ButtonEventType::kPress ||
          event.type == wqn::ButtonEventType::kRelease ||
@@ -1743,7 +1744,13 @@ RefreshSchedule ApplyButtonEvent(
         // started -- that is the user asking to watch the run again, so the
         // follow is re-armed (user_moved stays true: they did move it).
         const bool body_started = AnswerBodyStarted(state->ai, snapshot);
-        wqn::ScrollOpenCodeResponse(direction, min_scroll, max_scroll);
+        const int viewport_height = wqn::kEpdHeight - device_ui_internal::kAiViewportY -
+            device_ui_internal::AiBottomReserve(state->agent);
+        const int step = device_ui_internal::AiPageStepRows(
+            viewport_height, device_ui_internal::kAiLineH);
+        if (!wqn::ScrollOpenCodeResponse(direction, min_scroll, max_scroll, step)) {
+            return RefreshSchedule::kNone;
+        }
         SyncAgentSnapshot(state);
         const bool resumed =
             state->ai.auto_follow && direction < 0 &&

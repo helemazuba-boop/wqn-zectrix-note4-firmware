@@ -42,10 +42,27 @@ row overflow, long prompts, all scroll positions of mixed Markdown, tail pixels,
 cache limits and concurrent readers. `build-wsl`: zero warnings, M8 and binary
 UI entry-frame gates passed. Host pixel replays do not verify the physical EPD.
 
-## Remaining batches
+## Batch 3: Agent paging and decision feedback
 
-3. Agent viewport paging with one-line overlap; retained task/decision gestures;
-   input-state presentation and the no-options question correction.
+- Agent pages by the available viewport, reserving a complete overlap row even
+  with partial rows at both edges. The backend still owns/clamps the offset;
+  an edge press returns no refresh and does not retire follow unnecessarily.
+- Keep existing follow/manual-reading rules, modal decision priority, picker
+  gestures, discard-on-reinput and interrupt-on-custom-answer behavior.
+- Retain the pending bubble and horizontal two-option window. Its title now
+  uses a real 12px row with a gap above the body. Options use measured available
+  widths and inverse selection; their counter stays clear of the scroll arrow.
+- An empty partial transcript shows recognition progress. A question without
+  selectable options directs the user to choose 自己回答 before new input,
+  instead of advertising a hold gesture that the modal itself consumes.
+
+Validation: 1692 production Agent drawing/input assertions; reading 24427,
+including complete coverage and overlap across a 100-row paged answer; Agent
+round policy 1220. `build-wsl`: zero warnings; M8 and binary UI entry-frame gates
+passed. Pending/options host pixel replays inspected; panel HIL remains separate.
+
+## Remaining batch
+
 4. Actual-capture LED indication, including both acquisition paths and cleanup.
 
 No push or device flashing is part of the approved local commit delivery.
