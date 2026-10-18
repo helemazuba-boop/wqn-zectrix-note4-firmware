@@ -60,7 +60,7 @@ def main():
         '@@OUTBOX_QUOTA@@': (
             '#define FIXTURE_OUTBOX_QUOTA 1\n' + section(
                 source, 'constexpr size_t kOutboxMaxRecords =',
-                '\n// [measure] §五之十 §6. `open_ms`')
+                '\n// [word-batch] One open/write/flush/sync/close')
             if 'constexpr size_t kOutboxMaxRecords =' in source else
             '#define FIXTURE_OUTBOX_QUOTA 0\n'),
         '@@MODES@@': section(source,

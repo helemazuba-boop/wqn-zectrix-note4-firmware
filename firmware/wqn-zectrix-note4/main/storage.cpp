@@ -957,11 +957,6 @@ esp_err_t InitStorage()
     ESP_LOGW(kTag, "NVS encryption is disabled; device credentials are stored as plaintext NVS values");
 #endif
     ESP_LOGI(kTag, "NVS ready");
-    // [measure] §五之十 §6: seed the entry-budget baseline before any session
-    // write, so the first per-write delta has something to be a delta against.
-    // total_entries here is the denominator every percentage in §五之十 relies
-    // on and it has so far only been derived (4 pages x 126), never measured.
-    LogNvsStatsProbe();
     ESP_RETURN_ON_ERROR(InitStoragePartition(), kTag, "init storage partition");
     ESP_RETURN_ON_ERROR(services::StartStorageService(), kTag, "start storage service");
     // [deck-scope] Replay an interrupted default-deck change and seed the
@@ -1022,45 +1017,6 @@ bool ReadStorageCapacitySnapshot(StorageCapacitySnapshot* snapshot)
     return snapshot->spiffs_valid || snapshot->nvs_valid;
 }
 
-// [measure] §五之十 §6. Field names are a contract with scripts/hil_check.py:
-// WRITE:nvs-entry-budget-measured greps `nvs stats:` and requires total_entries,
-// and WRITE:parts-account-for-transaction folds `nvs write:`'s total_ms into the
-// per-transaction write sum. Renaming either is a silent SKIP, which this judge
-// has already been bitten by four times (three renames, plus one field INSERTED
-// in the middle of an existing line that a positional regex matched). Do not add
-// fields to the middle of a line: append them at the end.
-void LogNvsWriteProbe(const NvsWriteProbe& probe)
-{
-    ESP_LOGI(
-        kTag,
-        "nvs write: key=%s bytes=%u total_ms=%lld changed=%d",
-        probe.key != nullptr ? probe.key : "?",
-        static_cast<unsigned>(probe.bytes),
-        static_cast<long long>(probe.total_ms),
-        probe.changed ? 1 : 0);
-}
-
-void LogNvsStatsProbe()
-{
-    nvs_stats_t stats = {};
-    // nullptr means "the default NVS partition" (nvs_api.cpp:555 maps it to
-    // NVS_DEFAULT_PART_NAME); spelling "nvs" literally would fail on a partition
-    // table that renames it. A silent return here is unreachable in practice:
-    // every caller has already opened the namespace successfully, and
-    // nvs_get_stats can only fail with NOT_INITIALIZED / INVALID_STATE.
-    if (nvs_get_stats(nullptr, &stats) != ESP_OK) {
-        return;
-    }
-    ESP_LOGI(
-        kTag,
-        "nvs stats: used_entries=%zu free_entries=%zu available_entries=%zu "
-        "total_entries=%zu",
-        stats.used_entries,
-        stats.free_entries,
-        stats.available_entries,
-        stats.total_entries);
-}
-
 // [word-session-cursor-nvs] The 52 B pause/resume cursor used to be a 52 B
 // AtomicWrite on SPIFFS, measured at a 1,766 ms median (n=7 late-boot,
 // doc/1005-storage-rewrite-todo.md §五之八). That write is what made answering
@@ -1074,16 +1030,10 @@ void LogNvsStatsProbe()
 // already execute on the storage owner task. Re-queueing them would nest a
 // second write inside a transaction that is already the single writer (§7.4).
 //
-// Read-then-compare instead of an unconditional set is not a micro-optimization
-// -- it is what makes the probe honest. IDF short-circuits an identical value
-// itself (nvs_storage.cpp:504-507 for a single chunk, :478-480 multi-page), so
-// an unconditional nvs_set_blob would report changed=1 for a write that never
-// touched flash, and the WRITE:parts-account-for-transaction judge could not
-// tell "the cursor was unchanged, so it cost nothing" from "NVS is just fast".
-// Those are different conclusions and only one of them is evidence.
+// Compare before committing so unchanged cursors avoid a write and preserve
+// the existing error and retry behavior.
 esp_err_t SaveWordSessionCursorNvs(const char* key, const void* record, size_t size)
 {
-    const int64_t entered_us = esp_timer_get_time();
     NvsHandle nvs;
     ESP_RETURN_ON_ERROR(
         nvs_open(WQN_NVS_NAMESPACE, NVS_READWRITE, &nvs.handle), kTag, "open NVS namespace");
@@ -1115,15 +1065,6 @@ esp_err_t SaveWordSessionCursorNvs(const char* key, const void* record, size_t s
         }
     }
 
-    NvsWriteProbe probe = {};
-    probe.key = key;
-    probe.bytes = size;
-    probe.total_ms = (esp_timer_get_time() - entered_us) / 1000;
-    probe.changed = changed;
-    LogNvsWriteProbe(probe);
-    // Per-write, not just at boot: the whole point is the free_entries trend
-    // across a run of answers, which is what locates the §五之十 cliff.
-    LogNvsStatsProbe();
     return ESP_OK;
 }
 
@@ -1137,12 +1078,6 @@ esp_err_t SaveWordSessionCursorNvs(const char* key, const void* record, size_t s
 // NOT_FOUND is success: clearing a mode that never had a cursor is normal.
 esp_err_t ClearWordSessionCursorNvs(const char* key)
 {
-    // The window starts before nvs_open, not before nvs_commit: nvs_commit is a
-    // no-op in IDF v5.5 (nvs_api.cpp:411-420, "no-op for now"), so timing only
-    // the commit would report ~0 ms for an operation that really costs an open
-    // plus an erase. SaveWordSessionCursorNvs opens its window the same place, so
-    // the two lines are comparable.
-    const int64_t entered_us = esp_timer_get_time();
     NvsHandle nvs;
     esp_err_t result = nvs_open(WQN_NVS_NAMESPACE, NVS_READWRITE, &nvs.handle);
     if (result == ESP_ERR_NVS_NOT_FOUND) {
@@ -1158,23 +1093,6 @@ esp_err_t ClearWordSessionCursorNvs(const char* key)
         return result;
     }
     result = nvs_commit(nvs.handle);
-    NvsWriteProbe probe = {};
-    probe.key = key;
-    probe.bytes = 0;
-    probe.total_ms = (esp_timer_get_time() - entered_us) / 1000;
-    // changed=true, NOT false: this function returns early on NOT_FOUND without
-    // emitting a probe at all, so reaching the line means the key existed and
-    // three entries were really erased. Reporting changed=0 here would make the
-    // judge's breakdown file this under "same value, flash untouched" (see G.4),
-    // which is the opposite of what an erase does -- and it would hide exactly
-    // the entry consumption that §五之十's 504-entry budget is watching.
-    probe.changed = true;
-    LogNvsWriteProbe(probe);
-    // So the erase shows up on the same free_entries curve the saves do: without
-    // it, the one moment used_entries should DROP is the one moment with no
-    // reading, and an entry leak after a clear would be invisible until the next
-    // answer.
-    LogNvsStatsProbe();
     return result;
 }
 

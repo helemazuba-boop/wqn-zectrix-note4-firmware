@@ -403,68 +403,6 @@ bool DecodeSession(
     return true;
 }
 
-// [measure] Phase-1 write-path instrumentation for the storage rewrite
-// (doc/1005-storage-rewrite-todo.md §四.1). Emits exactly one line per
-// AtomicWrite call -- the destructor fires on every exit path, including the
-// early returns that skip later operations (those fields then read 0).
-// stat_ms is deliberately a sixth field: FileExists(primary) below is itself a
-// SPIFFS metadata operation and is not one of the five §四.1 names an
-// "operation", so leaving it out would silently credit its cost to whatever
-// happens to be measured next.
-// The point is the reconciliation, not the individual numbers: the six parts
-// must be summed and compared against the enclosing transaction's elapsed_ms.
-// If they do not add up to the whole, the cost is not in AtomicWrite and the
-// rewrite has to look somewhere else. Delete this block with the rest of the
-// [measure] tags once the split is recorded in §一.
-class AtomicWriteProbe {
-  public:
-    AtomicWriteProbe(size_t bytes, bool preserve_backup)
-        : bytes_(bytes), preserve_backup_(preserve_backup) {}
-
-    ~AtomicWriteProbe() {
-        ESP_LOGI(
-            kTag,
-            "atomic write: bytes=%u backup=%d fopen_ms=%lld write_ms=%lld "
-            "stat_ms=%lld remove_ms=%lld rename_backup_ms=%lld "
-            "rename_primary_ms=%lld total_ms=%lld",
-            static_cast<unsigned>(bytes_),
-            preserve_backup_ ? 1 : 0,
-            static_cast<long long>(fopen_ms_),
-            static_cast<long long>(write_ms_),
-            static_cast<long long>(stat_ms_),
-            static_cast<long long>(remove_ms_),
-            static_cast<long long>(rename_backup_ms_),
-            static_cast<long long>(rename_primary_ms_),
-            static_cast<long long>((esp_timer_get_time() - entered_us_) / 1000));
-    }
-
-    void AfterFopen() { fopen_ms_ = Delta(); }
-    void AfterWrite() { write_ms_ = Delta(); }
-    void AfterStat() { stat_ms_ = Delta(); }
-    void AfterRemove() { remove_ms_ = Delta(); }
-    void AfterRenameBackup() { rename_backup_ms_ = Delta(); }
-    void AfterRenamePrimary() { rename_primary_ms_ = Delta(); }
-
-  private:
-    int64_t Delta() {
-        const int64_t now_us = esp_timer_get_time();
-        const int64_t elapsed_ms = (now_us - mark_us_) / 1000;
-        mark_us_ = now_us;
-        return elapsed_ms;
-    }
-
-    size_t bytes_;
-    bool preserve_backup_;
-    int64_t entered_us_ = esp_timer_get_time();
-    int64_t mark_us_ = entered_us_;
-    int64_t fopen_ms_ = 0;
-    int64_t write_ms_ = 0;
-    int64_t stat_ms_ = 0;
-    int64_t remove_ms_ = 0;
-    int64_t rename_backup_ms_ = 0;
-    int64_t rename_primary_ms_ = 0;
-};
-
 esp_err_t AtomicWrite(
     const char* primary,
     const char* temporary,
@@ -473,31 +411,25 @@ esp_err_t AtomicWrite(
     size_t size,
     bool preserve_backup = false)
 {
-    AtomicWriteProbe probe(size, preserve_backup);
     FILE* file = std::fopen(temporary, "wb");
-    probe.AfterFopen();
     if (file == nullptr) return ESP_FAIL;
     const bool written = std::fwrite(bytes, 1, size, file) == size;
     const bool durable = written && std::fflush(file) == 0 && ::fsync(fileno(file)) == 0;
     const bool closed = std::fclose(file) == 0;
-    probe.AfterWrite();
     if (!durable || !closed) {
         std::remove(temporary);
         return ESP_FAIL;
     }
     const bool had_primary = FileExists(primary);
-    probe.AfterStat();
     if (preserve_backup) {
         if (had_primary && std::remove(primary) != 0 && errno != ENOENT) {
             std::remove(temporary);
             return ESP_FAIL;
         }
-        probe.AfterRemove();
         if (std::rename(temporary, primary) != 0) {
             std::remove(temporary);
             return ESP_FAIL;
         }
-        probe.AfterRenamePrimary();
         return ESP_OK;
     }
     if (had_primary) {
@@ -505,19 +437,16 @@ esp_err_t AtomicWrite(
             std::remove(temporary);
             return ESP_FAIL;
         }
-        probe.AfterRemove();
         if (std::rename(primary, backup) != 0) {
             std::remove(temporary);
             return ESP_FAIL;
         }
-        probe.AfterRenameBackup();
     }
     if (std::rename(temporary, primary) != 0) {
         if (had_primary) std::rename(backup, primary);
         std::remove(temporary);
         return ESP_FAIL;
     }
-    probe.AfterRenamePrimary();
     return ESP_OK;
 }
 
@@ -1078,18 +1007,6 @@ esp_err_t CheckOutboxAppendBudget(const OutboxScan& scan, bool observation)
     return ESP_OK;
 }
 
-// [measure] §五之十 §6. `open_ms` and `bytes` are out-params because the
-// caller must put them on the SAME log line as append_ms: the claim under test
-// (WRITE:append-open-vs-fopen) is "the append shape's fopen is a different
-// magnitude from AtomicWrite's fopen", and a ratio between two numbers scraped
-// from two different lines cannot be attributed to one write.
-//
-// What this splits is the honest gap in doc/1005-storage-rewrite-todo.md §五之三:
-// the measured 8 ms append was one un-decomposed field, so "the append shape is
-// 234x cheaper than AtomicWrite" never said how much of the gap was fopen
-// mode versus the missing remove + two renames. append_open_ms is the half
-// that isolates it. `bytes` is separate because the record size was implicit in
-// the struct before, and a per-byte claim is meaningless without both numbers.
 // [word-batch] One open/write/flush/sync/close for a bounded contiguous batch.
 // Every record keeps the existing v1 CRC and identity. A failed call may leave
 // a complete prefix plus a torn tail: callers must rescan before any retry.
@@ -1099,20 +1016,15 @@ esp_err_t AppendOutboxRecordsTo(
     const char* path,
     const OutboxRecord* records,
     size_t count,
-    int64_t* open_ms = nullptr,
     size_t* bytes = nullptr,
     size_t max_bytes = 0)
 {
     if (bytes != nullptr) *bytes = 0;
-    if (open_ms != nullptr) *open_ms = 0;
     if (path == nullptr || records == nullptr || count == 0 ||
         count > kOutboxAppendBatchCapacity) return ESP_ERR_INVALID_ARG;
     const size_t requested_bytes = count * sizeof(OutboxRecord);
-    const int64_t entered_us = esp_timer_get_time();
     FILE* file = std::fopen(path, "ab");
     if (file == nullptr) return ESP_FAIL;
-    const int64_t opened_us = esp_timer_get_time();
-    if (open_ms != nullptr) *open_ms = (opened_us - entered_us) / 1000;
     if (max_bytes != 0) {
         struct stat info = {};
         if (::fstat(fileno(file), &info) != 0 || info.st_size < 0) {
@@ -1139,11 +1051,10 @@ esp_err_t AppendOutboxRecordsTo(
 esp_err_t AppendOutboxRecordTo(
     const char* path,
     const OutboxRecord& record,
-    int64_t* open_ms = nullptr,
     size_t* bytes = nullptr,
     size_t max_bytes = 0)
 {
-    return AppendOutboxRecordsTo(path, &record, 1, open_ms, bytes, max_bytes);
+    return AppendOutboxRecordsTo(path, &record, 1, bytes, max_bytes);
 }
 
 // The rejected journal is forensic data, not another upload queue. Keep it as
@@ -1224,10 +1135,10 @@ esp_err_t AppendRejectedOutboxRecord(const OutboxRecord& record)
 
 esp_err_t AppendOutboxRecords(
     const OutboxRecord* records, size_t count,
-    int64_t* open_ms = nullptr, size_t* bytes = nullptr)
+    size_t* bytes = nullptr)
 {
     const esp_err_t result = AppendOutboxRecordsTo(
-        kOutboxPath, records, count, open_ms, bytes, kOutboxMaxBytes);
+        kOutboxPath, records, count, bytes, kOutboxMaxBytes);
     // A failed sync/close can still have written a whole record or a bad tail.
     // Never use pre-write counters for the next budget or idempotence check.
     if (result != ESP_OK) g_outbox_cache_loaded = false;
@@ -1235,10 +1146,10 @@ esp_err_t AppendOutboxRecords(
 }
 
 esp_err_t AppendOutboxRecord(
-    const OutboxRecord& record, int64_t* open_ms = nullptr, size_t* bytes = nullptr)
+    const OutboxRecord& record, size_t* bytes = nullptr)
 {
     const esp_err_t result = AppendOutboxRecordTo(
-        kOutboxPath, record, open_ms, bytes, kOutboxMaxBytes);
+        kOutboxPath, record, bytes, kOutboxMaxBytes);
     if (result != ESP_OK) g_outbox_cache_loaded = false;
     return result;
 }
@@ -1815,11 +1726,9 @@ esp_err_t CommitObservationTransaction(void* opaque)
     if (session.deck_scope_generation != wqn::GetDeckScopeGeneration()) {
         return ESP_ERR_INVALID_STATE;
     }
-    const int64_t started_us = esp_timer_get_time();
     OutboxScan* scan = nullptr;
     ESP_RETURN_ON_ERROR(
         EnsureOutboxCache(&scan), kTag, "load outbox before word observation");
-    const int64_t scanned_us = esp_timer_get_time();
     const auto existing = std::find_if(
         scan->pending.begin(), scan->pending.end(),
         [&](const auto& value) { return observation.request_id == value.request_id; });
@@ -1866,29 +1775,13 @@ esp_err_t CommitObservationTransaction(void* opaque)
         kTag,
         "encode word observation");
     ESP_RETURN_ON_ERROR(CheckOutboxAppendBudget(*scan, true), kTag, "word observation quota");
-    // [measure] §五之十 §6: open_ms and bytes are reported next to append_ms on
-    // the same line so the judge can take their ratio. append_open_ms is a
-    // subset of append_ms (same write, sliced at fopen); it is the half that
-    // says whether the 234x gap in §五之三 came from the open mode or from
-    // AtomicWrite's remove + two renames.
-    int64_t append_open_ms = 0;
-    size_t append_bytes = 0;
     ESP_RETURN_ON_ERROR(
-        AppendOutboxRecord(record, &append_open_ms, &append_bytes), kTag,
+        AppendOutboxRecord(record), kTag,
         "append word observation");
     scan->pending.push_back(record);
     ++scan->total_records;
-    const int64_t appended_us = esp_timer_get_time();
-    ESP_LOGI(
-        kTag,
-        "word observation durable: sequence=%llu lookup_ms=%lld append_ms=%lld "
-        "append_open_ms=%lld append_bytes=%u total_ms=%lld mode=%u session=%s",
+    ESP_LOGD(kTag, "word observation durable: sequence=%llu mode=%u session=%s",
         static_cast<unsigned long long>(observation.sequence),
-        static_cast<long long>((scanned_us - started_us) / 1000),
-        static_cast<long long>((appended_us - scanned_us) / 1000),
-        static_cast<long long>(append_open_ms),
-        static_cast<unsigned>(append_bytes),
-        static_cast<long long>((appended_us - started_us) / 1000),
         static_cast<unsigned>(observation.mode), observation.session_id.c_str());
     // The durable record includes next_position, next_phase, and sequence.
     // LoadSessionTransaction and sleep preparation reconcile an older session
@@ -1964,25 +1857,19 @@ esp_err_t CommitObservationBatchTransaction(void* opaque)
         context->maintenance_required = true;
         return ESP_ERR_INVALID_SIZE;
     }
-    const int64_t started_us = esp_timer_get_time();
-    size_t bytes = 0;
-    const esp_err_t appended = AppendOutboxRecords(records.data(), records.size(), nullptr, &bytes);
+    const esp_err_t appended = AppendOutboxRecords(records.data(), records.size());
     if (appended != ESP_OK) {
         context->maintenance_required = appended == ESP_ERR_INVALID_SIZE;
         return appended;
     }
     scan->pending.insert(scan->pending.end(), records.begin(), records.end());
     scan->total_records += records.size();
-    const int64_t completed_us = esp_timer_get_time();
-    ESP_LOGI(kTag, "word observation batch durable: count=%u appended=%u bytes=%u "
-                  "total_ms=%lld first_sequence=%llu last_sequence=%llu mode=%u session=%s "
-                  "clock=esp_timer append_start_us=%lld append_end_us=%lld",
+    ESP_LOGD(kTag, "word observation batch durable: count=%u appended=%u "
+                  "first_sequence=%llu last_sequence=%llu mode=%u session=%s",
         static_cast<unsigned>(observations.size()), static_cast<unsigned>(records.size()),
-        static_cast<unsigned>(bytes), static_cast<long long>((completed_us - started_us) / 1000),
         static_cast<unsigned long long>(observations.front().sequence),
         static_cast<unsigned long long>(last.sequence), static_cast<unsigned>(last.mode),
-        last.session_id.c_str(), static_cast<long long>(started_us),
-        static_cast<long long>(completed_us));
+        last.session_id.c_str());
     return ESP_OK;
 }
 
@@ -2127,9 +2014,7 @@ esp_err_t AckObservationBatchTransaction(void* opaque)
         context->maintenance_required = true;
         return ESP_ERR_INVALID_SIZE;
     }
-    const int64_t started = esp_timer_get_time();
-    size_t bytes = 0;
-    const esp_err_t result = AppendOutboxRecords(records.data(), records.size(), nullptr, &bytes);
+    const esp_err_t result = AppendOutboxRecords(records.data(), records.size());
     if (result != ESP_OK) {
         context->maintenance_required = result == ESP_ERR_INVALID_SIZE;
         return result;
@@ -2142,12 +2027,7 @@ esp_err_t AckObservationBatchTransaction(void* opaque)
     }
     scan->ack_records += records.size();
     scan->total_records += records.size();
-    const int64_t completed_us = esp_timer_get_time();
-    ESP_LOGI(kTag, "word ACK batch durable: count=%u bytes=%u total_ms=%lld "
-                  "clock=esp_timer append_start_us=%lld append_end_us=%lld",
-        static_cast<unsigned>(records.size()), static_cast<unsigned>(bytes),
-        static_cast<long long>((completed_us - started) / 1000),
-        static_cast<long long>(started), static_cast<long long>(completed_us));
+    ESP_LOGD(kTag, "word ACK batch durable: count=%u", static_cast<unsigned>(records.size()));
     return ESP_OK;
 }
 

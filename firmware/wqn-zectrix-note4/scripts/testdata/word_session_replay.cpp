@@ -21,6 +21,7 @@ constexpr const char* kTag = "replay-fixture";
 @@BATCH_ENABLED@@
 void FixtureLog(const char*, const char*, ...) {}
 #define ESP_LOGI(...) FixtureLog(__VA_ARGS__)
+#define ESP_LOGD(...) FixtureLog(__VA_ARGS__)
 #define ESP_LOGW(...) FixtureLog(__VA_ARGS__)
 #define ESP_LOGE(...) FixtureLog(__VA_ARGS__)
 #define ESP_RETURN_ON_ERROR(expr, ...) do { \
@@ -125,12 +126,12 @@ esp_err_t BuildObservationRecord(const wqn::DurableWordObservation& observation,
     record->mode = static_cast<uint8_t>(observation.mode);
     return ESP_OK;
 }
-esp_err_t AppendOutboxRecord(const OutboxRecord&, int64_t* = nullptr, size_t* = nullptr) {
+esp_err_t AppendOutboxRecord(const OutboxRecord&, size_t* = nullptr) {
     ++appends;
     return append_error;
 }
 [[maybe_unused]] esp_err_t AppendOutboxRecords(const OutboxRecord*, size_t count,
-                                              int64_t* = nullptr, size_t* bytes = nullptr) {
+                                              size_t* bytes = nullptr) {
     ++appends;
     if(bytes) *bytes=count*200;
     return append_error;

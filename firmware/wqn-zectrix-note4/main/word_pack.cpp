@@ -552,8 +552,7 @@ void CopyField(char* dst, size_t dst_size, const std::string& src)
 esp_err_t ScanPackFile(
     const wqn::WqnWordPackManifestItem& item,
     uint32_t deck_order,
-    wqn::WordPackIndex* index,
-    int64_t* parse_us)
+    wqn::WordPackIndex* index)
 {
     if (index == nullptr) {
         return ESP_ERR_INVALID_ARG;
@@ -646,11 +645,7 @@ esp_err_t ScanPackFile(
         }
         wqn::WqnWordEntry entry;
         int32_t sort_index = 0;
-        const int64_t parse_started_us = esp_timer_get_time();
         result = ParsePackEntryLine(line.c_str(), &entry, &sort_index);
-        if (parse_us != nullptr) {
-            *parse_us += esp_timer_get_time() - parse_started_us;
-        }
         if (result != ESP_OK) {
             std::fclose(file);
             return result;
@@ -997,10 +992,6 @@ esp_err_t LoadWordPackIndexInternal(
     if (index == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
-    // [timing] The SHA verify and the JSONL scan each walk the whole pack and
-    // scale with its size, so the watchdog budget of a bigger pack has to be
-    // extrapolated from measured phases rather than guessed.
-    const int64_t index_started_us = esp_timer_get_time();
     // SHA verification and JSONL scanning are CPU-bound.
     // Keep maximum frequency scoped to this rebuild instead of disabling DFS.
     auto cpu_lease = runtime::CpuPerformanceLease::TryAcquire();
@@ -1114,31 +1105,23 @@ esp_err_t LoadWordPackIndexInternal(
     // this guard must run immediately before reserve().
     index->entries.reserve(expected_entries);
 
-    int64_t sha_us_total = 0;
-    int64_t scan_us_total = 0;
-    int64_t parse_us_total = 0;
     for (const WqnWordPackManifestItem& item : manifest.packs) {
         const std::string path = PackPathForItem(item);
         struct stat st = {};
         if (stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode)) {
             index->pack_bytes += static_cast<size_t>(st.st_size);
         }
-        const int64_t sha_started_us = esp_timer_get_time();
         const bool sha_ok = VerifyFileSha256(path, item.sha256);
-        sha_us_total += esp_timer_get_time() - sha_started_us;
         if (!sha_ok) {
             index->pack_error = true;
             index->status_message = "词库校验失败";
             continue;
         }
         index->manifest_revision = std::max(index->manifest_revision, item.change_sequence);
-        const int64_t scan_started_us = esp_timer_get_time();
         const esp_err_t scan_result = ScanPackFile(
             item,
             static_cast<uint32_t>(&item - manifest.packs.data()),
-            index,
-            &parse_us_total);
-        scan_us_total += esp_timer_get_time() - scan_started_us;
+            index);
         if (scan_result != ESP_OK) {
             index->pack_error = true;
             index->status_message = "词库读取失败";
@@ -1158,17 +1141,13 @@ esp_err_t LoadWordPackIndexInternal(
 
     ESP_LOGI(
         kTag,
-        "word pack index: pack_count=%u word_index_count=%u pack_bytes=%u free_internal=%u free_psram=%u truncated=%d total_ms=%lld sha_ms=%lld scan_ms=%lld parse_ms=%lld",
+        "word pack index: pack_count=%u word_index_count=%u pack_bytes=%u free_internal=%u free_psram=%u truncated=%d",
         static_cast<unsigned>(index->pack_count),
         static_cast<unsigned>(index->entries.size()),
         static_cast<unsigned>(index->pack_bytes),
         static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
         static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)),
-        index->truncated ? 1 : 0,
-        static_cast<long long>((esp_timer_get_time() - index_started_us) / 1000),
-        static_cast<long long>(sha_us_total / 1000),
-        static_cast<long long>(scan_us_total / 1000),
-        static_cast<long long>(parse_us_total / 1000));
+        index->truncated ? 1 : 0);
     return ESP_OK;
 }
 
@@ -1417,8 +1396,7 @@ bool WordPackNeedsDownload(const WqnWordPackManifestItem& item)
     return !FileExists(path) || !VerifyFileSha256(path, item.sha256);
 }
 
-static esp_err_t ReadWordPackEntryImpl(const WordPackIndexEntry& index_entry, WqnWordEntry* entry,
-    const char* source)
+static esp_err_t ReadWordPackEntryImpl(const WordPackIndexEntry& index_entry, WqnWordEntry* entry)
 {
     if (entry == nullptr || index_entry.pack_stem[0] == '\0') {
         return ESP_ERR_INVALID_ARG;
@@ -1426,17 +1404,10 @@ static esp_err_t ReadWordPackEntryImpl(const WordPackIndexEntry& index_entry, Wq
     // A card turn performs a bounded SPIFFS seek, JSONL read and cJSON parse.
     // Keep that foreground work off the 40 MHz DFS floor as well.
     auto cpu_lease = runtime::CpuPerformanceLease::TryAcquire();
-    const int64_t started_us = esp_timer_get_time();
     *entry = WqnWordEntry{};
 
     const std::string path = PackPathForStem(index_entry.pack_stem);
-    // [measure] §四.6: split the open_seek_ms the rewrite has been attributing
-    // to "opening" into the fopen and the fseek halves. The split is appended
-    // after total_ms so the existing `word card loaded` fields -- and the
-    // PK:open-seek-not-regressed criterion that reads them -- stay byte-identical.
-    const int64_t before_fopen_us = esp_timer_get_time();
     FILE* file = std::fopen(path.c_str(), "rb");
-    const int64_t after_fopen_us = esp_timer_get_time();
     if (file == nullptr) {
         return ESP_ERR_NOT_FOUND;
     }
@@ -1444,7 +1415,6 @@ static esp_err_t ReadWordPackEntryImpl(const WordPackIndexEntry& index_entry, Wq
         std::fclose(file);
         return ESP_FAIL;
     }
-    const int64_t opened_us = esp_timer_get_time();
     // [stack-fix] 4 KB on the stack + the deep fgets->SPIFFS->esp_partition_read
     // ->tlsf_walk_pool call chain overflowed the 8 KB task stack and corrupted
     // the adjacent heap (crash in tlsf_walk_pool reading a smashed block header).
@@ -1453,7 +1423,6 @@ static esp_err_t ReadWordPackEntryImpl(const WordPackIndexEntry& index_entry, Wq
     std::string line;
     const esp_err_t line_result = ReadBoundedPackLine(file, &line_buffer, &line);
     std::fclose(file);
-    const int64_t read_us = esp_timer_get_time();
     if (line_result != ESP_OK) {
         return line_result;
     }
@@ -1464,28 +1433,17 @@ static esp_err_t ReadWordPackEntryImpl(const WordPackIndexEntry& index_entry, Wq
     }
     entry->id = index_entry.word_id;
     entry->deck_id = index_entry.deck_id;
-    const int64_t finished_us = esp_timer_get_time();
-    ESP_LOGI(
-        kTag,
-        "word card loaded: open_seek_ms=%lld read_close_ms=%lld parse_ms=%lld "
-        "total_ms=%lld fopen_ms=%lld fseek_ms=%lld source=%s",
-        static_cast<long long>((opened_us - started_us) / 1000),
-        static_cast<long long>((read_us - opened_us) / 1000),
-        static_cast<long long>((finished_us - read_us) / 1000),
-        static_cast<long long>((finished_us - started_us) / 1000),
-        static_cast<long long>((after_fopen_us - before_fopen_us) / 1000),
-        static_cast<long long>((opened_us - after_fopen_us) / 1000), source);
     return ESP_OK;
 }
 
 esp_err_t ReadWordPackEntry(const WordPackIndexEntry& index_entry, WqnWordEntry* entry)
 {
-    return ReadWordPackEntryImpl(index_entry, entry, "foreground");
+    return ReadWordPackEntryImpl(index_entry, entry);
 }
 
 esp_err_t ReadWordPackEntryPrefetch(const WordPackIndexEntry& index_entry, WqnWordEntry* entry)
 {
-    return ReadWordPackEntryImpl(index_entry, entry, "prefetch");
+    return ReadWordPackEntryImpl(index_entry, entry);
 }
 
 }  // namespace wqn
