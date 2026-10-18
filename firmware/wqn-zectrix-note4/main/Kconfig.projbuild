@@ -189,27 +189,6 @@ menu "WQN firmware"
             only for builds against a cloud that does not serve the agent
             routes.
 
-    config WQN_AI_STREAMING_ENABLE
-        bool "Enable v2 SSE streaming for Std/Pro AI tier (new default)"
-        default y
-        depends on WQN_AI_ENABLE
-        help
-            When enabled, STD/PRO tiers request X-WQN-Protocol: v2-streaming
-            and consume an SSE event stream from POST /api/esp32/ai/transcribe-chat.
-            The firmware renders partial ASR delta, assistant transcript deltas,
-            tool calls, and incremental status chips to the EPD as events arrive.
-            When disabled, falls back to the legacy v1 one-shot JSON response.
-
-    config WQN_AI_V1_FALLBACK
-        bool "Compile legacy v1 one-shot JSON path (debug fallback)"
-        default y
-        depends on WQN_AI_ENABLE
-        help
-            Keeps the legacy UploadAiAudioChat() + HttpBinaryPost() path compiled
-            behind a macro so the firmware can be temporarily rebuilt for
-            comparison against the v2 SSE stream. Used at runtime only when
-            WQN_AI_STREAMING_ENABLE is n.
-
     config WQN_FLASH_PROTOCOL_V2
         bool "Flash mode uses the wqn-flash-v2 Realtime protocol (WQN proxy)"
         default y
@@ -240,36 +219,6 @@ menu "WQN firmware"
             PCM_DUMP_END markers. Diagnostic only: at 115200 baud this
             blocks the AI worker for roughly 10 s per turn, so never enable
             it outside a targeted capture session.
-
-    config WQN_BATTERY_LOW_THRESHOLD_MV
-        int "Battery low shutdown threshold in millivolts"
-        default 3450
-        help
-            When battery voltage drops below this and USB is not connected,
-            the device shuts down. Official firmware uses 3450mV (3.45V).
-
-    config WQN_BATTERY_OTA_THRESHOLD_PCT
-        int "Minimum battery percent for OTA upgrades"
-        default 50
-        help
-            Prevent OTA upgrades when battery is below this threshold.
-            From official firmware string: "电量不足...请充电至50%%以上"
-
-    config WQN_CHARGING_DEEP_SLEEP_EXTRA_MS
-        int "Extra idle time before deep sleep when charging (ms)"
-        default 300000
-        help
-            When charging, extend deep sleep idle timeout by this amount
-            so the device stays awake longer for syncing/updates.
-            Default 5 minutes extra.
-
-            Currently unused: external power holds the kUsbPower sleep lease,
-            which blocks deep sleep outright, so the idle threshold is never
-            reached while charging. Kept for a future policy change.
-
-            Currently unused: external power holds the kUsbPower sleep lease,
-            which blocks deep sleep outright, so the idle threshold is never
-            reached while charging. Kept for a future policy change.
 
     config WQN_DEV_MENU_ENABLE
         bool "Enable the dev diagnostics submenu in the settings page"

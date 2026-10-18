@@ -44,7 +44,6 @@ struct TurnWaitResult {
 };
 
 esp_err_t EnsureConnected(const std::string& token, uint32_t timeout_ms);
-bool IsConnected();
 void Disconnect();
 // Nonblocking: close only an idle connection on the transport owner. A later
 // connect/start operation supersedes this request; active turns finish first.
@@ -70,8 +69,5 @@ void SetSseCallback(WqnAiSseCallback cb, void* user_ctx);
 TurnWaitResult WaitForTurnRelease(uint32_t expected_turn_gen,
                                  const std::string& expected_request_id,
                                  uint32_t timeout_ms);
-
-bool WaitForTurnComplete(uint32_t timeout_ms);
-void SignalTurnComplete();
 
 } // namespace wqn::stdpro_ws

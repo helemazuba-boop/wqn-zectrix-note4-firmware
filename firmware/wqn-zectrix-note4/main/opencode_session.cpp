@@ -3295,11 +3295,14 @@ esp_err_t LockSelectedOpenCodeSession(OpenCodeRejectReason*) { return ESP_ERR_NO
 esp_err_t CreateNewOpenCodeSession(OpenCodeRejectReason*) { return ESP_ERR_NOT_SUPPORTED; }
 esp_err_t ObserveOpenCodeSession(OpenCodeRejectReason*) { return ESP_ERR_NOT_SUPPORTED; }
 esp_err_t ReplyPendingOpenCodePermission(bool) { return ESP_ERR_NOT_SUPPORTED; }
+esp_err_t ReplyPendingOpenCodeQuestion(int) { return ESP_ERR_NOT_SUPPORTED; }
 esp_err_t StartOpenCodeVoiceInput() { return ESP_ERR_NOT_SUPPORTED; }
 esp_err_t StopOpenCodeVoiceInput() { return ESP_ERR_NOT_SUPPORTED; }
 esp_err_t ConfirmOpenCodePrompt(int64_t) { return ESP_ERR_NOT_SUPPORTED; }
 void CancelOpenCodePrompt() {}
 void CancelAgentVoiceInput() {}
+void LeaveOpenCodeAgentTier() {}
+void InterruptOpenCodeRun() {}
 bool ScrollOpenCodeResponse(int, int32_t, int32_t, int) { return false; }
 void SetOpenCodeScrollOffsetClamped(int32_t, int32_t, int32_t) {}
 void SetOpenCodeFollowState(bool, bool) {}

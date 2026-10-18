@@ -47,10 +47,6 @@
 #define CONFIG_WQN_RETAINED_STANDBY_IDLE_MS 60000
 #endif
 
-#ifndef CONFIG_WQN_BATTERY_LOW_THRESHOLD_MV
-#define CONFIG_WQN_BATTERY_LOW_THRESHOLD_MV 3450
-#endif
-
 namespace {
 
 using wqn::DeepSleepUiPolicy;
@@ -179,8 +175,10 @@ bool g_sleep_diag_policy_initialized = false;
 uint16_t g_sleep_diag_last_policy_flags = 0;
 bool g_sleep_diag_dumped_for_host = false;
 int64_t g_sleep_diag_dump_not_before_us = 0;
+#if CONFIG_WQN_DEEP_SLEEP_ENABLE
 bool g_sleep_diag_admission_blocked = false;
 uint32_t g_sleep_diag_last_blocker_mask = 0;
+#endif
 // [sleep-admission] Set when a sleep transaction was refused because a lease
 // was still held at sampling time, so the coordinator retries on the short
 // poll instead of waiting out the whole retained-standby interval.
@@ -213,6 +211,7 @@ constexpr int64_t PrepareSleepBudgetUs(wqn::power::SleepService service)
 }
 
 // The diagnostic event carries reason[16], so keep the service tag short.
+#if CONFIG_WQN_DEEP_SLEEP_ENABLE
 const char* ShortServiceReason(wqn::power::SleepService service)
 {
     switch (service) {
@@ -229,7 +228,10 @@ const char* ShortServiceReason(wqn::power::SleepService service)
     }
 }
 
+#endif
+
 constexpr int64_t kSleepDiagnosticUsbDumpDelayUs = 2 * 1000 * 1000;
+#if CONFIG_WQN_DEEP_SLEEP_ENABLE
 // [power-fix] Sleep-preparation failure backoff escalates per consecutive
 // system failure (30s -> 60s -> 120s -> 5m cap) so a wedged service cannot
 // pin the coordinator into a 30s retry storm. User-activity rollbacks reset
@@ -251,6 +253,8 @@ int64_t SleepRetryBackoffUs()
         static_cast<uint8_t>(kSleepRetryBackoffLadderSize - 1));
     return kSleepRetryBackoffLadderUs[index];
 }
+
+#endif
 
 // [gap-1] Background-maintenance wake escalation: sync-source timer wakes
 // with no user interaction in between are counted across deep-sleep cycles;
@@ -667,6 +671,7 @@ bool ShouldYieldClockRefreshToDeepSleep()
 #endif
 }
 
+#if CONFIG_WQN_DEEP_SLEEP_ENABLE
 static bool DisplayIsOnlyActiveSleepBlocker()
 {
     if (runtime::ActiveSleepBlockerCount(runtime::SleepBlocker::kDisplay) == 0) {
@@ -683,6 +688,8 @@ static bool DisplayIsOnlyActiveSleepBlocker()
     }
     return true;
 }
+
+#endif
 
 esp_err_t InitPowerHardware(i2c_port_t i2c_port, gpio_num_t i2c_sda, gpio_num_t i2c_scl, int i2c_clk_hz)
 {
@@ -839,12 +846,6 @@ uint16_t GetBatteryVoltageMv()
         : 0;
 }
 
-int GetBatteryPercent()
-{
-    PowerStatusSnapshot snapshot;
-    return ReadPowerStatus(&snapshot) ? snapshot.battery_percent : 0;
-}
-
 bool IsCharging()
 {
     return gpio_get_level(kChargeDetect) == 0;
@@ -936,15 +937,6 @@ void RefreshUsbPowerSleepPolicy()
     g_usb_power_policy_sampled = true;
     ValidateUsbPowerSleepPolicy(host_connected, charging, full);
     RefreshSleepDiagnosticPowerPolicy();
-}
-
-bool IsBatteryLow()
-{
-    const uint16_t mv = GetBatteryVoltageMv();
-    if (mv == 0) {
-        return false;
-    }
-    return mv <= CONFIG_WQN_BATTERY_LOW_THRESHOLD_MV;
 }
 
 bool IsBatteryVeryLow()
@@ -1039,6 +1031,7 @@ static power::PrepareSleepResults BroadcastPrepareSleep(const power::PrepareSlee
     return results;
 }
 
+#if CONFIG_WQN_DEEP_SLEEP_ENABLE
 static bool AllServicesReady(
     const power::PrepareSleepCommand& command,
     const power::PrepareSleepResults& results)
@@ -1052,6 +1045,8 @@ static bool AllServicesReady(
     return true;
 }
 
+#endif
+
 static void PrepareBoardPowerState(power::SleepMode mode)
 {
     HoldOutput(kNfcPower, 0);
@@ -1060,6 +1055,7 @@ static void PrepareBoardPowerState(power::SleepMode mode)
     gpio_deep_sleep_hold_en();
 }
 
+#if CONFIG_WQN_DEEP_SLEEP_ENABLE
 static void RollbackBoardPowerState()
 {
     gpio_deep_sleep_hold_dis();
@@ -1114,6 +1110,8 @@ static void RollbackSleepPreparation(uint32_t generation, const char* reason)
         std::memory_order_relaxed);
     g_deep_sleep_clock_yield.store(false, std::memory_order_release);
 }
+
+#endif
 
 static uint32_t NextSleepGeneration()
 {
@@ -1181,6 +1179,7 @@ static DeepSleepCommitAbortReason CommitDeepSleep(
     esp_deep_sleep_start();
 }
 
+#if CONFIG_WQN_DEEP_SLEEP_ENABLE
 static void RunBatteryEmergencyShutdown()
 {
     const uint32_t generation = NextSleepGeneration();
@@ -1218,6 +1217,8 @@ static void RunBatteryEmergencyShutdown()
     runtime::CommitSleepSnapshot(snapshot);
     CommitDeepSleep(command, nullptr);
 }
+
+#endif
 
 // [power-fix] User-initiated power-off (settings page). Same hard power-cut
 // as the battery-emergency path, but the panel is whited FIRST so the device
@@ -1278,6 +1279,7 @@ static void RunUserPowerOffShutdown()
     CommitDeepSleep(command, nullptr);
 }
 
+#if CONFIG_WQN_DEEP_SLEEP_ENABLE
 static bool PreemptIdleSleepForBatteryEmergency(uint32_t generation)
 {
     if (!g_battery_shutdown_requested.exchange(false, std::memory_order_acq_rel)) {
@@ -1287,6 +1289,8 @@ static bool PreemptIdleSleepForBatteryEmergency(uint32_t generation)
     RunBatteryEmergencyShutdown();
     return true;
 }
+
+#endif
 
 static void EnterDeepSleepIfEnabled(DeepSleepUiPolicy ui_policy)
 {

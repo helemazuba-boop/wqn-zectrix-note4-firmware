@@ -32,7 +32,6 @@
 #include "miniz.h"
 #include "services/connectivity_service.h"
 #include "storage.h"
-#include "text_render.h"
 
 namespace {
 
@@ -452,140 +451,10 @@ esp_err_t HttpRequest(
     return result;
 }
 
-esp_err_t HttpBinaryPost(
-    const std::string& url,
-    const std::string& bearer_token,
-    const uint8_t* request_body,
-    size_t request_body_size,
-    int duration_ms,
-    const std::string& conversation_id,
-    const std::string& tier,
-    int* status_code,
-    std::string* response_body)
-{
-    if (status_code == nullptr || response_body == nullptr || (request_body == nullptr && request_body_size > 0)) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    response_body->clear();
-    esp_http_client_config_t config = {};
-    config.url = url.c_str();
-    config.method = HTTP_METHOD_POST;
-    config.timeout_ms = 600000;  // 10 minutes: covers ASR (up to 90s poll + submit) + LLM (up to 6min)
-    config.crt_bundle_attach = esp_crt_bundle_attach;
-    config.buffer_size = 2048;
-    config.buffer_size_tx = 2048;
-
-    esp_http_client_handle_t client = esp_http_client_init(&config);
-    if (client == nullptr) {
-        return ESP_ERR_NO_MEM;
-    }
-
-    esp_err_t result = esp_http_client_set_header(client, "Accept", "application/json");
-    if (result == ESP_OK) {
-        const std::string auth = "Bearer " + bearer_token;
-        result = esp_http_client_set_header(client, "Authorization", auth.c_str());
-    }
-    if (result == ESP_OK) {
-        result = esp_http_client_set_header(client, "Content-Type", "application/octet-stream");
-    }
-    if (result == ESP_OK) {
-        result = esp_http_client_set_header(client, "X-WQN-Audio-Sample-Rate", "16000");
-    }
-    if (result == ESP_OK) {
-        result = esp_http_client_set_header(client, "X-WQN-Audio-Sample-Format", "s16le");
-    }
-    if (result == ESP_OK) {
-        result = esp_http_client_set_header(client, "X-WQN-Audio-Channels", "1");
-    }
-    char duration_header[16] = {};
-    std::snprintf(duration_header, sizeof(duration_header), "%d", duration_ms);
-    if (result == ESP_OK) {
-        result = esp_http_client_set_header(client, "X-WQN-Audio-Duration-Ms", duration_header);
-    }
-    if (result == ESP_OK && !conversation_id.empty()) {
-        result = esp_http_client_set_header(client, "X-WQN-Conversation-Id", conversation_id.c_str());
-    }
-    if (result == ESP_OK && !tier.empty()) {
-        result = esp_http_client_set_header(client, "X-WQN-Ai-Tier", tier.c_str());
-    }
-    if (result != ESP_OK) {
-        esp_http_client_cleanup(client);
-        return result;
-    }
-
-    result = esp_http_client_open(client, request_body_size);
-    FeedTaskWatchdogIfSubscribed();
-    if (result != ESP_OK) {
-        esp_http_client_cleanup(client);
-        return result;
-    }
-
-    size_t written_total = 0;
-    while (written_total < request_body_size) {
-        const size_t remaining = request_body_size - written_total;
-        const int written = esp_http_client_write(
-            client,
-            reinterpret_cast<const char*>(request_body + written_total),
-            remaining > 2048 ? 2048 : remaining);
-        if (written <= 0) {
-            esp_http_client_close(client);
-            esp_http_client_cleanup(client);
-            return ESP_FAIL;
-        }
-        written_total += static_cast<size_t>(written);
-        FeedTaskWatchdogIfSubscribed();
-    }
-
-    const int content_length = esp_http_client_fetch_headers(client);
-    FeedTaskWatchdogIfSubscribed();
-    *status_code = esp_http_client_get_status_code(client);
-    if (content_length < 0) {
-        ESP_LOGW(kTag, "AI HTTP response has unknown content length");
-    }
-
-    // [hang-fix] Same overall-deadline guard as HttpCall. 120 s bounds the
-    // read phase: the ASR+LLM pipeline streams its answer well within two
-    // minutes once headers arrive; the 10-minute timeout_ms only budgets the
-    // server-side processing gap before the first byte.
-    const int64_t read_deadline_us =
-        esp_timer_get_time() + 120LL * 1000 * 1000;
-    std::array<char, 512> buffer = {};
-    while (true) {
-        const int read = esp_http_client_read(client, buffer.data(), buffer.size() - 1);
-        if (read < 0) {
-            result = ESP_FAIL;
-            break;
-        }
-        if (read == 0) {
-            break;
-        }
-        response_body->append(buffer.data(), read);
-        FeedTaskWatchdogIfSubscribed();
-        if (esp_timer_get_time() >= read_deadline_us) {
-            ESP_LOGW(kTag, "AI HTTP read exceeded overall deadline (120 s)");
-            result = ESP_ERR_TIMEOUT;
-            break;
-        }
-    }
-
-    esp_http_client_close(client);
-    esp_http_client_cleanup(client);
-    return result;
-}
-
 bool GetSuccess(cJSON* root)
 {
     cJSON* success = cJSON_GetObjectItemCaseSensitive(root, "success");
     return cJSON_IsBool(success) && cJSON_IsTrue(success);
-}
-
-std::string TruncateForLog(const std::string& value, size_t max_chars)
-{
-    if (value.size() <= max_chars) {
-        return value;
-    }
-    return value.substr(0, max_chars) + "...";
 }
 
 std::string GetOptionalString(cJSON* object, const char* key)
@@ -1406,41 +1275,6 @@ esp_err_t SyncDeviceControlV3(
     return ESP_OK;
 }
 
-esp_err_t ProbeSyncAndClearTokenOnUnauthorized(const std::string& token)
-{
-    if (token.empty()) {
-        return ESP_OK;
-    }
-    const esp_err_t token_result = ValidateTokenOrClear(token, "sync probe");
-    if (token_result != ESP_OK) {
-        return token_result;
-    }
-
-    ESP_RETURN_ON_ERROR(WaitForNetworkReadyForHttps(), kTag, "prepare network for sync");
-
-    const std::string url = BuildUrl("/sync");
-    const std::string request_body =
-        "{\"firmware_version\":\"" WQN_FIRMWARE_VERSION "\",\"limit\":" + std::to_string(WQN_SYNC_LIMIT) + "}";
-    int status_code = 0;
-    std::string body;
-    esp_err_t result = HttpRequest("POST", url, &token, &request_body, &status_code, &body);
-    if (result != ESP_OK) {
-        ESP_LOGW(kTag, "sync probe failed: %s", esp_err_to_name(result));
-        return result;
-    }
-
-    if (status_code == 401) {
-        return ClearTokenOnUnauthorized("sync probe");
-    }
-    if (status_code != 200) {
-        ESP_LOGW(kTag, "sync probe HTTP status=%d", status_code);
-        return ESP_FAIL;
-    }
-
-    ESP_LOGI(kTag, "sync probe HTTP status=%d", status_code);
-    return ESP_OK;
-}
-
 esp_err_t FetchTodoTimeline(const std::string& token, const WqnTodoTimelineRequest& request, WqnTodoListPage* page)
 {
     if (page == nullptr) {
@@ -1484,17 +1318,6 @@ esp_err_t FetchTodoTimeline(const std::string& token, const WqnTodoTimelineReque
     }
 
     return ParseTodoListResponse(body, page);
-}
-
-esp_err_t FetchTodoTimeline(const std::string& token, WqnTodoListPage* page)
-{
-    WqnTodoTimelineRequest request;
-    return FetchTodoTimeline(token, request, page);
-}
-
-esp_err_t FetchTodayPendingTodos(const std::string& token, WqnTodoListPage* page)
-{
-    return FetchTodoTimeline(token, page);
 }
 
 esp_err_t CompleteTodo(const std::string& token, const std::string& todo_id, WqnTodoItem* todo)
@@ -3298,58 +3121,6 @@ esp_err_t ParseAiChatResponseBody(const std::string& body, WqnAiChatResponse* re
         return ESP_FAIL;
     }
     return ESP_OK;
-}
-
-esp_err_t UploadAiAudioChat(
-    const std::string& token,
-    const uint8_t* pcm_data,
-    size_t pcm_size,
-    int duration_ms,
-    const std::string& conversation_id,
-    const std::string& tier,
-    WqnAiChatResponse* response)
-{
-    if (pcm_data == nullptr || pcm_size == 0 || response == nullptr) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    ESP_RETURN_ON_ERROR(ValidateTokenOrClear(token, "AI audio"), kTag, "validate AI token");
-    ESP_RETURN_ON_ERROR(WaitForNetworkReadyForHttps(), kTag, "prepare network for AI audio");
-
-    const std::string url = BuildUrl("/ai/transcribe-chat");
-    int status_code = 0;
-    std::string body;
-    const esp_err_t result =
-        HttpBinaryPost(url, token, pcm_data, pcm_size, duration_ms, conversation_id, tier, &status_code, &body);
-    if (result != ESP_OK) {
-        ESP_LOGW(kTag, "AI audio upload failed: %s", esp_err_to_name(result));
-        return result;
-    }
-    ESP_LOGI(kTag, "AI audio response: status=%d bytes=%u", status_code, static_cast<unsigned>(body.size()));
-
-    if (status_code == 401) {
-        response->error_code = "unauthorized";
-        response->error_message = "设备授权已失效";
-        return ClearTokenOnUnauthorized("AI audio");
-    }
-    if (status_code < 200 || status_code >= 300) {
-        ESP_LOGW(kTag, "AI audio request rejected: status=%d body=%s", status_code, TruncateForLog(body, 160).c_str());
-        JsonDocument error_document(body);
-        response->error_message = error_document.ok() ? BuildApiErrorMessage(error_document.root(), status_code) : "";
-        if (error_document.ok()) {
-            cJSON* error = cJSON_GetObjectItemCaseSensitive(error_document.root(), "error");
-            if (cJSON_IsObject(error)) {
-                response->error_code = GetOptionalString(error, "code");
-            }
-        }
-        if (response->error_message.empty()) {
-            char fallback[48] = {};
-            std::snprintf(fallback, sizeof(fallback), "HTTP %d", status_code);
-            response->error_message = fallback;
-        }
-        return ESP_FAIL;
-    }
-
-    return ParseAiChatResponseBody(body, response);
 }
 
 }  // namespace wqn

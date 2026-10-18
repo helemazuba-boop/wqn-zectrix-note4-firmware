@@ -16,7 +16,6 @@
 #include "problem_pack.h"
 #include "services/server_error_codes.h"
 #include "sse_chunk.h"
-#include "text_render.h"
 #include "time_app.h"
 #include "ui/markdown_layout.h"
 #include "ui/ui_gates_selftest.h"

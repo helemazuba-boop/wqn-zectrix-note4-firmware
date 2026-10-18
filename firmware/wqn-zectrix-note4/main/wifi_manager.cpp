@@ -538,21 +538,6 @@ esp_err_t SetWifiStationPowerSaveEnabled(bool enabled)
 #endif
 }
 
-esp_err_t WaitForWifiStationConnected(TickType_t timeout)
-{
-#if CONFIG_WQN_WIFI_STA_ENABLE
-    if (g_wifi_event_group == nullptr) {
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    const EventBits_t bits = xEventGroupWaitBits(g_wifi_event_group, kWifiConnectedBit, pdFALSE, pdFALSE, timeout);
-    return (bits & kWifiConnectedBit) ? ESP_OK : ESP_ERR_TIMEOUT;
-#else
-    (void)timeout;
-    return ESP_ERR_INVALID_STATE;
-#endif
-}
-
 bool IsWifiStationConnected()
 {
 #if CONFIG_WQN_WIFI_STA_ENABLE

@@ -24,6 +24,10 @@
 #define CONFIG_WQN_EPD_IDLE_POWER_OFF_MS 1500
 #endif
 
+#ifndef CONFIG_WQN_EPD_IDLE_CLEANUP_MS
+#define CONFIG_WQN_EPD_IDLE_CLEANUP_MS 45000
+#endif
+
 namespace wqn {
 
 static void PowerOffEpd();

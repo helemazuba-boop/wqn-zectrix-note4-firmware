@@ -11,7 +11,6 @@
 #include <utility>
 #include <vector>
 
-#include "audio_player.h"
 #include "audio_capture.h"
 #include "ai_history.h"
 #include "cJSON.h"
@@ -419,6 +418,7 @@ void RequestFlashTerminalStop(FlashTerminalReason reason)
     xTaskNotifyGive(g_lifecycle_task);
 }
 
+#if CONFIG_WQN_FLASH_PROTOCOL_V2
 bool EnsureFlashThinkingHistoryLocked(int64_t now_ms)
 {
     if (!g_flash.history_user_committed || g_flash.thinking_text.empty()) {
@@ -450,6 +450,8 @@ bool FinalizeFlashAssistantLocked(int64_t now_ms)
                                wqn::ChatMessageKind::kAssistant,
                                g_flash.assistant_text, now_ms);
 }
+
+#endif
 
 void ResetFlashTurnAssemblyLocked()
 {
@@ -527,6 +529,7 @@ void SetErrorLocked(const std::string& message)
     return out;
 }
 
+#if CONFIG_WQN_FLASH_PROTOCOL_V2
 // Build a v2 binary uplink frame: little-endian header (24 B) + audio bytes.
 struct AudioFrameHeader {
     uint32_t magic;        // 'WFLV'
@@ -575,6 +578,8 @@ void BuildV2AudioFrame(std::vector<uint8_t>* frame, const uint8_t* pcm,
         std::memcpy(p, pcm, pcm_size);
     }
 }
+
+#endif
 
 [[maybe_unused]] std::vector<uint8_t> DecodeBase64Chunk(const char* encoded, size_t len)
 {
@@ -1061,8 +1066,7 @@ esp_err_t InitStreamI2sDuplex(
     }
     // [duplex-fix] Create BOTH RX and TX channels on I2S_NUM_0 together.
     // This mirrors the official firmware's CreateDuplexChannels pattern and
-    // prevents the port-occupied conflict that occurs when audio_player.cpp
-    // later tries to create a standalone TX on the same I2S port.
+    // avoids a port conflict between independently allocated RX and TX owners.
     return wqn::services::CreateAudioDuplexChannels(
         g_flash_audio_session, kSampleRate, kStreamDmaFrameNum, true,
         rx_handle, &g_flash.stream_tx);
@@ -1257,8 +1261,8 @@ void AudioStreamingTask(void* param)
     // of allocating/freeing a 744-byte vector every 15 ms.
     std::vector<uint8_t> uplink_frame;
     uplink_frame.reserve(sizeof(AudioFrameHeader) + kStreamChunkBytes);
-#endif
     uint32_t uplink_append_count = 0;
+#endif
     if (g_flash.stream_rx == nullptr || g_flash.stream_tx == nullptr) {
         ESP_LOGW(kTag, "stream hardware missing after preflight");
         FinishAudioStreamingTask("音频通道初始化失败");
@@ -1594,8 +1598,6 @@ void ParseAndHandleEvent(const char* data, size_t len)
     }
 #if CONFIG_WQN_FLASH_PROTOCOL_V2
     const char* stage = JsonStr(g.p, "stage");
-#else
-    const char* stage = nullptr;
 #endif
 
     // ============================================================
@@ -2327,14 +2329,6 @@ esp_err_t StartFlashSessionNow(uint32_t generation)
     // Network association happens before I2S ownership. This keeps an absent
     // AP from pinning AudioActivity for the entire connection budget and the
     // lifecycle task, not the UI task, owns every blocking step.
-    const esp_err_t playback_stop_result = wqn::StopAudioPlayback();
-    if (playback_stop_result != ESP_OK) {
-        xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
-        SetErrorLocked("音频资源释放失败");
-        g_flash_connectivity_demand.Reset();
-        xSemaphoreGive(g_flash.mutex);
-        return playback_stop_result;
-    }
     const esp_err_t audio_result = wqn::services::BeginAudioActivity(
         wqn::services::AudioActivity::kFlash, &g_flash_audio_session);
     if (audio_result != ESP_OK) {
@@ -2812,7 +2806,9 @@ void OnFlashButtonReleased(bool submit)
     // release, then send.
     bool should_send = false;
     esp_websocket_client_handle_t client = nullptr;
+#if CONFIG_WQN_FLASH_PROTOCOL_V2
     uint32_t seq = 0;
+#endif
 
     xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
     const bool captured_audio = (g_flash.uplink_seq != g_flash.capture_base_seq);
@@ -2832,7 +2828,9 @@ void OnFlashButtonReleased(bool submit)
         client = g_flash.ws_client;
         g_flash.active_ws_sends.fetch_add(1, std::memory_order_relaxed);
         ++g_flash.uplink_seq;
+#if CONFIG_WQN_FLASH_PROTOCOL_V2
         seq = g_flash.uplink_seq;
+#endif
         g_flash.response_in_flight = true;  // in-flight until response.done/error
         g_flash.response_started = false;   // [phase-fix] no delta for this turn yet
     } else if (was_capturing && captured_audio && prev_in_flight) {

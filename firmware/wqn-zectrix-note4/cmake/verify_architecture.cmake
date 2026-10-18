@@ -26,8 +26,6 @@ set(feature_sources
     main/ai_session.h
     main/audio_capture.cpp
     main/audio_capture.h
-    main/audio_player.cpp
-    main/audio_player.h
     main/audio_selftest.cpp
     main/audio_selftest.h
     main/device_ui.cpp

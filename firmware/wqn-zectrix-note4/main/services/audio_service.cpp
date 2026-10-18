@@ -1860,46 +1860,6 @@ esp_err_t CreateAudioRxChannel(
     return ESP_OK;
 }
 
-esp_err_t CreateAudioTxChannel(
-    const AudioSession& session,
-    uint32_t sample_rate_hz,
-    uint32_t dma_frame_count,
-    bool left_aligned,
-    AudioChannelHandle* tx)
-{
-    DriverOperation operation(session);
-    if (!operation || tx == nullptr || *tx != nullptr) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    i2s_chan_handle_t channel = nullptr;
-    i2s_chan_config_t channel_config = MakeChannelConfig(dma_frame_count);
-    esp_err_t result = i2s_new_channel(
-        &channel_config, &channel, nullptr);
-    if (result == ESP_OK) {
-        i2s_std_config_t standard = MakeStandardConfig(
-            sample_rate_hz, left_aligned, false);
-        result = i2s_channel_init_std_mode(channel, &standard);
-    }
-    if (result == ESP_OK) {
-        result = i2s_channel_enable(channel);
-    }
-    if (result != ESP_OK) {
-        if (channel != nullptr) {
-            i2s_del_channel(channel);
-        }
-        return result;
-    }
-    result = RegisterResource(
-        g_channel_slots, kMaxChannelHandles, session, channel);
-    if (result != ESP_OK) {
-        i2s_channel_disable(channel);
-        i2s_del_channel(channel);
-        return result;
-    }
-    *tx = reinterpret_cast<AudioChannelHandle>(channel);
-    return ESP_OK;
-}
-
 esp_err_t CreateAudioDuplexChannels(
     const AudioSession& session,
     uint32_t sample_rate_hz,

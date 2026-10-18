@@ -88,7 +88,7 @@ struct MdLine {
 // Layout option flags (bitmask).
 //
 // kMdNoSingleEmphasis: single '*' / '_' runs stay literal instead of pairing
-// as italic. Math-heavy plain text (problem bodies come from HtmlToPlainText)
+// as italic. Math-heavy plain text in problem bodies
 // writes "x*y" and "x_1"; stripping those markers corrupts the formula.
 // Double markers (**, __), strike, code, links and all block elements are
 // unaffected -- they do not occur in math plain text.

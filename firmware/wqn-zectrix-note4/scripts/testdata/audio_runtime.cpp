@@ -168,8 +168,8 @@ void MarkChanged() { ++revisions; }
 @@CLOCK@@
 
 enum class ConnectionState { kDisconnected, kConnecting, kReady };
-enum class TurnState { kIdle, kRecording, kFinalQueued, kFinalInFlight,
-                       kRemoteHandoff, kFailedPreFinal, kComplete };
+enum class TurnState { kIdle, kRecording, kFinalInFlight = 3,
+                       kRemoteHandoff, kComplete = 6 };
 std::atomic<TurnState> g_turn_state{TurnState::kIdle};
 std::atomic<ConnectionState> g_conn_state{ConnectionState::kReady};
 std::atomic<bool> g_session_ready{true}, g_is_connected{true};
@@ -252,7 +252,7 @@ int main()
     TryIdleDisconnect();
     CHECK(destroys == 0);
     RequestIdleDisconnect();
-    for (TurnState state : {TurnState::kRecording, TurnState::kFinalQueued,
+    for (TurnState state : {TurnState::kRecording,
                            TurnState::kFinalInFlight, TurnState::kRemoteHandoff}) {
         g_turn_state.store(state);
         TryIdleDisconnect();

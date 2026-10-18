@@ -604,7 +604,8 @@ void TrackHeldCloudResult(device_ui_internal::CloudDomain domain, bool gated)
 }
 }  // namespace
 
-void DeviceUiTask(void*)
+// Entry point retained when the optional EPD UI is disabled.
+[[maybe_unused]] void DeviceUiTask(void*)
 {
     ESP_LOGI(kTag, "device UI task started");
     LogUiStackHighWater("start");
@@ -1658,7 +1659,8 @@ wqn::AiStreamingStatusView streaming_view{};
     }
 }
 
-esp_err_t EnsureDisplayPipelineStarted()
+// Entry point retained when the optional EPD UI is disabled.
+[[maybe_unused]] esp_err_t EnsureDisplayPipelineStarted()
 {
     if (device_ui_internal::g_refresh_mutex == nullptr) {
         device_ui_internal::g_refresh_mutex = xSemaphoreCreateMutex();

@@ -28,7 +28,7 @@ def main():
     config = section(source, 'i2s_chan_config_t MakeChannelConfig(',
                      'i2s_std_config_t MakeStandardConfig(')
     create = section(source, 'esp_err_t CreateAudioRxChannel(',
-                     'esp_err_t CreateAudioTxChannel(')
+                     'esp_err_t CreateAudioDuplexChannels(')
     fixture = (root / 'scripts/testdata/audio_rx_dma.cpp').read_text(encoding='utf-8')
     for marker, body in {'@@CONSTANTS@@': constants,
                          '@@CONFIG@@': config, '@@CREATE@@': create}.items():

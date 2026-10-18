@@ -113,12 +113,6 @@ esp_err_t CreateAudioRxChannel(
     uint32_t dma_frame_count,
     bool left_aligned,
     AudioChannelHandle* rx);
-esp_err_t CreateAudioTxChannel(
-    const AudioSession& session,
-    uint32_t sample_rate_hz,
-    uint32_t dma_frame_count,
-    bool left_aligned,
-    AudioChannelHandle* tx);
 esp_err_t CreateAudioDuplexChannels(
     const AudioSession& session,
     uint32_t sample_rate_hz,

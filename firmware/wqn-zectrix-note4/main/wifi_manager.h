@@ -27,7 +27,6 @@ esp_err_t StartWifiStationRadio();
 // connectivity service disables modem sleep while an interactive demand is
 // active and restores it for background/idle operation.
 esp_err_t SetWifiStationPowerSaveEnabled(bool enabled);
-esp_err_t WaitForWifiStationConnected(TickType_t timeout);
 bool IsWifiStationConnected();
 bool IsWifiStationInitialized();
 void SetWifiStationEventSink(WifiStationEventSink sink);

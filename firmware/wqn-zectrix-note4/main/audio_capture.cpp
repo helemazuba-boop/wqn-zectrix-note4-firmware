@@ -301,8 +301,7 @@ esp_err_t CleanupCaptureHardware(bool keep_power)
     // I2S_NUM_0 RX slot is released for Flash's duplex channels. A disabled
     // channel still holds the port slot (i2s_new_channel returns
     // ESP_ERR_NOT_FOUND/"no available channel"), which is what blocked Flash
-    // after a STD recording. Mirrors audio_player.cpp StopAudioPlayback (which
-    // deletes g_player.tx). InitI2s recreates the channel on next start.
+    // after a STD recording. InitI2s recreates the channel on next start.
     if (g_audio.rx != nullptr) {
         const esp_err_t delete_result =
             wqn::services::DeleteAudioChannel(g_audio.session, &g_audio.rx);
