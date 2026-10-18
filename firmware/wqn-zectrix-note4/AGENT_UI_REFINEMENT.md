@@ -61,8 +61,34 @@ including complete coverage and overlap across a 100-row paged answer; Agent
 round policy 1220. `build-wsl`: zero warnings; M8 and binary UI entry-frame gates
 passed. Pending/options host pixel replays inspected; panel HIL remains separate.
 
-## Remaining batch
+## Batch 4: actual recording LED
 
-4. Actual-capture LED indication, including both acquisition paths and cleanup.
+- The existing GPIO3 LED is active-low. A platform HAL level-write function is
+  reached only through AudioService's Capture/Flash capability-checked API.
+- Standard/Agent capture lights it after codec/I2S warmup succeeds; Flash lights
+  it on its first valid post-warmup PCM read. Admission and connecting stay dark.
+- Release, cancellation, initialization timeout, read failure and cleanup turn
+  it off. A late warmup/read cannot re-arm it after release/error. Flash keeps
+  its duplex channels for TTS without keeping the recording LED lit.
+- Feature mutexes serialize readiness/stop, with stable indicator token copies.
+  The existing driver inflight guard prevents session teardown overtaking an
+  indicator write; stale capabilities cannot change a newer session's LED.
+  EndActivity adds a final off fallback after driver operations drain.
+- No polling task, timer, wake source, GPIO hold policy, rail timing, sleep
+  protocol or PowerCoordinator change was introduced. Existing sleep-off stays.
+
+Validation: 67 production LED/capability/lifecycle assertions under ASan/UBSan;
+audio runtime 75 and RX DMA 98. `build-wsl`: zero warnings; M8 and binary UI
+entry-frame gates passed. Physical LED timing, microphone quality, EPD paging
+latency and device heap/stack peaks still require device observation; host ports
+are not HIL evidence.
+
+## Final regression
+
+Both existing profiles, `build-wsl` (Agent enabled) and `build-agent-off`, build
+with zero warnings and pass M8 plus the compiled UI entry-frame gate. Reading
+24427 assertions also pass under ASan/UBSan. Navigation 1308, display submission
+96, stack-gate fixture 17, Home 139, Settings 235/250 and word UI 292 all pass.
+These are host/build checks; no device flashing or HIL was performed.
 
 No push or device flashing is part of the approved local commit delivery.

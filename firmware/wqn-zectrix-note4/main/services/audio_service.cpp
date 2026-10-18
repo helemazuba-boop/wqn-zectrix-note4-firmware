@@ -6,6 +6,7 @@
 #include <cmath>
 #include <utility>
 
+#include "board_zectrix_note4.h"
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
 #include "driver/i2s_std.h"
@@ -806,6 +807,9 @@ esp_err_t EndActivity(const AudioCommand& command)
         g_accept_operations.store(true, std::memory_order_release);
         return result != ESP_OK ? result : ESP_ERR_INVALID_STATE;
     }
+    // Driver operations have drained. No old readiness write can relight the
+    // indicator after this fallback; LED failure must not retain an audio lease.
+    ESP_ERROR_CHECK_WITHOUT_ABORT(wqn::SetNote4RecordingLed(false));
     result = ApplyAmplifier(false);
     if (result != ESP_OK) {
         g_accept_operations.store(true, std::memory_order_release);
@@ -1346,6 +1350,18 @@ esp_err_t SetAudioAmplifier(const AudioSession& session, bool enabled)
     command.enabled = enabled;
     AudioReply reply;
     return Call(&command, &reply);
+}
+
+esp_err_t SetAudioRecordingIndicator(const AudioSession& session, bool enabled)
+{
+    if (session.activity != AudioActivity::kCapture && session.activity != AudioActivity::kFlash) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    // Shares the driver's session/inflight guard: EndActivity drains this
+    // immediate write before releasing the capability. No queue or wait here.
+    DriverOperation operation(session);
+    if (!operation) return ESP_ERR_INVALID_STATE;
+    return wqn::SetNote4RecordingLed(enabled);
 }
 
 esp_err_t RecoverAudioCodec(const AudioSession& session)

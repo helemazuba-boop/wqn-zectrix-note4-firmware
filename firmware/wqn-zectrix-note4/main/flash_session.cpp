@@ -187,6 +187,9 @@ struct FlashState {
 
 FlashState g_flash;
 wqn::services::AudioSession g_flash_audio_session;
+// Stable copy for the active acquisition turn, protected by g_flash.mutex.
+wqn::services::AudioSession g_flash_indicator_session;
+bool g_flash_indicator_on = false;
 wqn::services::ConnectivityDemand g_flash_connectivity_demand;
 
 class FlashWsSendRegistration {
@@ -471,9 +474,22 @@ void MarkChanged()
     g_flash.changed = true;
 }
 
+// All callers hold g_flash.mutex. A read finishing after release/error cannot
+// re-arm the indicator, even while the duplex channels remain for TTS.
+void SetFlashCaptureIndicatorLocked(bool ready)
+{
+    const bool enabled = ready && g_flash.capture_started && g_flash.ws_connected &&
+        g_flash.status != InternalStatus::kError;
+    if (!g_flash_indicator_session || enabled == g_flash_indicator_on) return;
+    const esp_err_t result = wqn::services::SetAudioRecordingIndicator(g_flash_indicator_session, enabled);
+    if (result == ESP_OK) g_flash_indicator_on = enabled;
+    else ESP_LOGW(kTag, "Flash recording indicator: %s", esp_err_to_name(result));
+}
+
 void SetErrorLocked(const std::string& message)
 {
     g_flash.status = InternalStatus::kError;
+    SetFlashCaptureIndicatorLocked(false);
     g_flash.pending_text.clear();
     g_flash.error_message = message;
     g_flash.response_in_flight = false;  // [inflight-fix] error ends any in-flight response
@@ -1143,6 +1159,7 @@ void FinishAudioStreamingTask(const char* error_message = nullptr)
     CleanupStreamHardware();
     xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
     g_flash.capture_started = false;
+    SetFlashCaptureIndicatorLocked(false);
     g_flash.stream_task = nullptr;
     if (error_message != nullptr) {
         SetErrorLocked(error_message);
@@ -1296,6 +1313,9 @@ void AudioStreamingTask(void* param)
             g_flash_audio_session, g_flash.stream_rx, i2s_buf,
             sizeof(i2s_buf), &bytes_read, pdMS_TO_TICKS(200));
         if (read_err != ESP_OK || bytes_read == 0) {
+            xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+            SetFlashCaptureIndicatorLocked(false);
+            xSemaphoreGive(g_flash.mutex);
             if (read_err == ESP_ERR_TIMEOUT) {
                 // [i2s-diag] Timeout = DMA has no data = ADC path not running.
                 // Distinguishes a dead capture path (timeouts, no pcm diag)
@@ -1314,6 +1334,12 @@ void AudioStreamingTask(void* param)
             vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
+
+        // First valid post-warmup PCM is the actual-ready edge. Merely
+        // connecting or setting capture_started never lights the LED.
+        xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+        SetFlashCaptureIndicatorLocked(true);
+        xSemaphoreGive(g_flash.mutex);
 
         // [channel-fix] Convert stereo interleaved to mono by averaging L+R
         // (matches audio_capture.cpp:476-484). The mic may be routed to either
@@ -1468,6 +1494,8 @@ void StartAudioStreaming()
     g_flash.amp_idle_armed = false;
     SetStreamAudioAmp(false);
 
+    g_flash_indicator_session = g_flash_audio_session;
+    g_flash_indicator_on = false;
     StackType_t* stack = EnsurePsramTaskStack(
         &g_stream_task_stack, kStreamTaskStackBytes, "flash_stream");
     g_flash.stream_task = stack == nullptr ? nullptr
@@ -1477,6 +1505,7 @@ void StartAudioStreaming()
     if (g_flash.stream_task == nullptr) {
         g_flash.stream_task = nullptr;
         g_flash.capture_started = false;
+        SetFlashCaptureIndicatorLocked(false);
         SetErrorLocked("录音任务启动失败");
         ESP_LOGE(kTag, "audio streaming task create failed");
         RequestFlashTerminalStop(FlashTerminalReason::kTransportError);
@@ -1495,6 +1524,7 @@ void StopAudioStreaming()
     // while we also try to delete it) and a double-free of hardware resources.
     xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
     g_flash.capture_started = false;
+    SetFlashCaptureIndicatorLocked(false);
     const TaskHandle_t task = g_flash.stream_task;
     xSemaphoreGive(g_flash.mutex);
     if (task == nullptr) {
@@ -2447,6 +2477,7 @@ esp_err_t StopFlashSessionNow()
     {
         xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
         g_flash.capture_started = false;
+        SetFlashCaptureIndicatorLocked(false);
         g_flash.button_pressed = false;
         bool had_stream_task = (g_flash.stream_task != nullptr);
         xSemaphoreGive(g_flash.mutex);
@@ -2803,6 +2834,7 @@ void OnFlashButtonReleased(bool submit)
         !was_capturing && !g_flash.ws_connected &&
         g_flash.status == InternalStatus::kConnecting;
     g_flash.capture_started = false;
+    SetFlashCaptureIndicatorLocked(false);
     g_flash.button_pressed = false;
     g_flash.status_since_ms = esp_timer_get_time() / 1000;
     MarkChanged();
