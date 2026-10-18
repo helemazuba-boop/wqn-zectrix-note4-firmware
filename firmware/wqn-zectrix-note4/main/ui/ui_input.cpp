@@ -1936,25 +1936,10 @@ RefreshSchedule ApplyButtonEvent(
         static_cast<int>(event.button),
         static_cast<int>(event.type),
         static_cast<long long>(event.duration_ms));
-    if (!long_press && !long_release && event.button == wqn::ButtonId::kConfirm && state->screen == wqn::UiScreen::kTodo) {
-        return CompleteSelectedTodo(state);
-    }
-    if (!long_press && !long_release && state->screen == wqn::UiScreen::kTodo && event.button == wqn::ButtonId::kUp &&
-        state->todo.selected == 0 && state->todo.has_earlier && !state->todo.previous_cursor.empty()) {
-        if (QueueTodoRefreshCursor(state->todo.previous_cursor)) {
-            state->todo.sync_status = wqn::TodoSyncStatus::kLoading;
-            state->todo.status_message = "Todo syncing";
-            return RefreshSchedule::kSelection;
-        }
-    }
-    if (!long_press && !long_release && state->screen == wqn::UiScreen::kTodo && event.button == wqn::ButtonId::kDownPower &&
-        !state->todo.todos.empty() && state->todo.selected + 1 >= state->todo.todos.size() &&
-        state->todo.has_later && !state->todo.next_cursor.empty()) {
-        if (QueueTodoRefreshCursor(state->todo.next_cursor)) {
-            state->todo.sync_status = wqn::TodoSyncStatus::kLoading;
-            state->todo.status_message = "Todo syncing";
-            return RefreshSchedule::kSelection;
-        }
+    if (!long_press && !long_release && state->screen == wqn::UiScreen::kTodo) {
+        const auto input = event.button == wqn::ButtonId::kUp ? wqn::UiInput::kUp
+            : event.button == wqn::ButtonId::kDownPower ? wqn::UiInput::kDown : wqn::UiInput::kConfirm;
+        return HandleTodoInput(state, input);
     }
 
     switch (event.button) {

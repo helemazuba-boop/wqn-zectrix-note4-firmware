@@ -187,8 +187,8 @@ void RenderTodo(const wqn::UiState& state, wqn::UiFrame* frame)
     }
 
     const size_t selected = std::min(todo.selected, todo.todos.size() - 1);
-    const size_t window_start = selected > 3 ? selected - 3 : 0;
-    const size_t window_end = std::min(todo.todos.size(), window_start + static_cast<size_t>(8));
+    const size_t window_start = wqn::ClampTodoListWindow(todo.window_start, selected, todo.todos.size());
+    const size_t window_end = std::min(todo.todos.size(), window_start + wqn::kTodoListVisibleRows);
     for (size_t i = window_start; i < window_end; ++i) {
         const wqn::WqnTodoItem& item = todo.todos[i];
         std::string line = item.title.empty() ? "Todo" : item.title;
@@ -300,6 +300,8 @@ void ClampUiSelection(UiState* state)
     } else if (state->todo.selected >= state->todo.todos.size()) {
         state->todo.selected = state->todo.todos.size() - 1;
     }
+    state->todo.window_start = ClampTodoListWindow(
+        state->todo.window_start, state->todo.selected, state->todo.todos.size());
     if (state->settings.selected >= kSettingsItemCount) {
         state->settings.selected = kSettingsItemCount - 1;
     }

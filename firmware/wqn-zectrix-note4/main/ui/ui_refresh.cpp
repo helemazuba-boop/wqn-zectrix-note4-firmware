@@ -606,6 +606,11 @@ std::string FrameSignature(const wqn::UiFrame& frame)
         signature.push_back('/');
         signature.append(std::to_string(frame.todo.selected));
         signature.push_back('/');
+        signature.append(std::to_string(frame.todo.window_start));
+        signature.push_back('/');
+        signature.append(std::to_string(frame.todo.has_earlier));
+        signature.append(std::to_string(frame.todo.has_later));
+        signature.push_back('/');
         signature.append(std::to_string(frame.todo.total_pending));
         signature.push_back('/');
         signature.append(frame.todo.status_message);

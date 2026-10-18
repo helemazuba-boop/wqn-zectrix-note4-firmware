@@ -159,6 +159,7 @@ struct TodoCloudRequest {
 
 struct TodoCloudResult {
     TodoCloudOp op = TodoCloudOp::kRefresh;
+    bool cursor_request = false;
     esp_err_t result = ESP_FAIL;
     bool auth_required = false;
     char todo_id[64] = {};
@@ -524,6 +525,7 @@ bool ApplyProblemCloudResult(wqn::UiState* state, ProblemCloudResult& result);
 
 bool RefreshTodosFromCloud(wqn::UiState* state);
 RefreshSchedule CompleteSelectedTodo(wqn::UiState* state);
+RefreshSchedule HandleTodoInput(wqn::UiState* state, wqn::UiInput input);
 
 void ExecuteTodoCloudRequest(const TodoCloudRequest& request);
 void ExecuteWordCloudRequest(const WordCloudRequest& request);

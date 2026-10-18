@@ -128,12 +128,20 @@ void SendTodoCloudResult()
     (void)ready;
 }
 
-void ApplyTodoList(wqn::UiState* state, wqn::WqnTodoListPage page)
+void ApplyTodoList(wqn::UiState* state, wqn::WqnTodoListPage page, bool cursor_request)
 {
     if (state == nullptr) {
         return;
     }
-    const int selected_index = page.selected_index;
+    const std::string selected_id = !cursor_request && state->todo.selected < state->todo.todos.size()
+        ? state->todo.todos[state->todo.selected].id : std::string();
+    int selected_index = page.selected_index;
+    if (!selected_id.empty()) {
+        for (size_t i = 0; i < page.todos.size(); ++i) {
+            if (page.todos[i].id == selected_id) { selected_index = static_cast<int>(i); break; }
+        }
+    }
+    if (cursor_request) state->todo.window_start = 0;
     state->todo.todos = std::move(page.todos);
     state->todo.loaded_once = true;
     state->todo.total_pending = page.total > 0 ? page.total : static_cast<int>(state->todo.todos.size());
@@ -191,7 +199,7 @@ bool ApplyTodoCloudResult(
 
     if (result.op == TodoCloudOp::kRefresh) {
         if (result.result == ESP_OK) {
-            if (state->todo.loaded_once &&
+            if (!result.cursor_request && state->todo.loaded_once &&
                 TodoPageMatchesState(*state, result.page)) {
                 // Nothing the user can see changed; just retire the "syncing"
                 // hint. The dispatcher downgrades this to a partial repaint
@@ -206,7 +214,7 @@ bool ApplyTodoCloudResult(
                 }
                 return hint_was_visible;
             }
-            ApplyTodoList(state, result.page);
+            ApplyTodoList(state, result.page, result.cursor_request);
         } else if (result.auth_required) {
             state->todo.sync_status = wqn::TodoSyncStatus::kAuthRequired;
             state->todo.status_message = "Pair again";
@@ -318,6 +326,37 @@ RefreshSchedule CompleteSelectedTodo(wqn::UiState* state)
     return RefreshSchedule::kCommit;
 }
 
+// Called after global-navigation and raw/held-key guards have consumed input.
+RefreshSchedule HandleTodoInput(wqn::UiState* state, wqn::UiInput input)
+{
+    if (state == nullptr || state->screen != wqn::UiScreen::kTodo) return RefreshSchedule::kNone;
+    wqn::ClampUiSelection(state);
+    if (input == wqn::UiInput::kConfirm) return CompleteSelectedTodo(state);
+    if (input != wqn::UiInput::kUp && input != wqn::UiInput::kDown) return RefreshSchedule::kNone;
+    auto& todo = state->todo;
+    const bool up = input == wqn::UiInput::kUp;
+    const bool boundary = up ? todo.selected == 0
+        : todo.todos.empty() || todo.selected + 1 >= todo.todos.size();
+    const bool has_page = up ? todo.has_earlier : todo.has_later;
+    const std::string& cursor = up ? todo.previous_cursor : todo.next_cursor;
+    if (boundary && has_page && !cursor.empty()) {
+        if (IsTodoCloudBusy()) return RefreshSchedule::kNone;
+        if (QueueTodoRefreshCursor(cursor)) {
+            todo.sync_status = wqn::TodoSyncStatus::kLoading;
+            todo.status_message = "正在加载待办";
+        } else {
+            todo.sync_status = wqn::TodoSyncStatus::kSyncFailed;
+            todo.status_message = "加载失败，请重试";
+        }
+        return RefreshSchedule::kSelection;
+    }
+    const size_t previous = todo.selected;
+    if (up && todo.selected > 0) --todo.selected;
+    if (!up && todo.selected + 1 < todo.todos.size()) ++todo.selected;
+    wqn::ClampUiSelection(state);
+    return previous == todo.selected ? RefreshSchedule::kNone : RefreshSchedule::kSelection;
+}
+
 void ExecuteTodoCloudRequest(const TodoCloudRequest& request)
 {
     g_todo_result_slot = TodoCloudResult{};
@@ -327,6 +366,7 @@ void ExecuteTodoCloudRequest(const TodoCloudRequest& request)
     }
     TodoCloudResult& result = g_todo_result_slot;
     result.op = request.op;
+    result.cursor_request = request.cursor[0] != '\0';
     result.content_target_revision = request.content_target_revision;
     std::snprintf(result.todo_id, sizeof(result.todo_id), "%s", request.todo_id);
 

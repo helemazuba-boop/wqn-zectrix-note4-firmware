@@ -203,13 +203,8 @@ int TodoOverdueCount(const wqn::TodoUiState& todo)
 
 size_t TodoVisibleStart(const wqn::TodoUiState& todo, size_t selected, size_t visible_count)
 {
-    if (todo.todos.size() <= visible_count) {
-        return 0;
-    }
-    if (selected + 1 >= visible_count) {
-        return std::min(selected + 1 - visible_count, todo.todos.size() - visible_count);
-    }
-    return 0;
+    if (visible_count == 0) return 0;
+    return wqn::ClampTodoListWindow(todo.window_start, selected, todo.todos.size());
 }
 
 void DrawDashedVerticalLine(int x, int y, int height)

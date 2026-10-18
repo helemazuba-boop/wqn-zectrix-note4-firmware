@@ -10,6 +10,7 @@
 #include "sdkconfig.h"
 #include "ui/navigation_model.h"
 #include "ui/home_model.h"
+#include "todo_list_model.h"
 
 #include "ai_history.h"
 #include "note_app.h"
@@ -155,6 +156,7 @@ enum class TodoSyncStatus {
 struct TodoUiState {
     std::vector<WqnTodoItem> todos;
     size_t selected = 0;
+    size_t window_start = 0;
     TodoSyncStatus sync_status = TodoSyncStatus::kIdle;
     std::string status_message;
     bool loaded_once = false;
