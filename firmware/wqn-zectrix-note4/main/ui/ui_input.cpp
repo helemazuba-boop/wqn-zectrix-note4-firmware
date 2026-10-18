@@ -1315,6 +1315,11 @@ static RefreshSchedule FinishScreenNavigation(wqn::UiState* state, wqn::UiScreen
 {
     if (state->screen != old_screen) {
         if (state->screen == wqn::UiScreen::kHome) state->selected_home_task = 0;
+        if (old_screen == wqn::UiScreen::kSettings) {
+            // A deferred single Confirm must not fire a sync after navigating
+            // away. Preserve candidates and pending worker operation IDs.
+            state->settings.sync_confirm_pending = false;
+        }
         if (old_screen == wqn::UiScreen::kTime) {
             wqn::DisarmTimeAppAction(&state->time_app);
         }
@@ -1360,8 +1365,9 @@ static RefreshSchedule FinishScreenNavigation(wqn::UiState* state, wqn::UiScreen
 static bool CanOpenNavigation(const wqn::UiState& state)
 {
     if (wqn::IsProvisioningActive()) return false;
-    if (state.screen == wqn::UiScreen::kSettings &&
-        state.settings.dialog != wqn::SettingsDialog::kNone) return false;
+    // Settings "dialogs" are full-page detail/choice screens. Their short
+    // presses stay local; Up/Down holds still belong to global navigation.
+    // The active provisioning portal is the exclusive owner checked above.
     if (state.screen == wqn::UiScreen::kTime &&
         wqn::TimeAppIsEditingValue(state.time_app)) return false;
     if (state.screen == wqn::UiScreen::kAi) {

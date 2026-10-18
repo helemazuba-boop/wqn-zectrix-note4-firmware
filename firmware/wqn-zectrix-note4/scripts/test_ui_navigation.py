@@ -21,12 +21,13 @@ def section(source, start, end):
 def main():
     root = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--input-source', type=Path, default=root / 'main/ui/ui_input.cpp')
     parser.add_argument('--navigation-source', type=Path, default=root / 'main/ui/navigation_model.cpp')
     parser.add_argument('--model-source', type=Path, default=root / 'main/ui_model.cpp')
     parser.add_argument('--graphics-source', type=Path, default=root / 'main/ui/graphics.cpp')
     parser.add_argument('--view-source', type=Path, default=root / 'main/ui/navigation_view.cpp')
     args = parser.parse_args()
-    inputs = (root / 'main/ui/ui_input.cpp').read_text()
+    inputs = args.input_source.read_text()
     model = args.model_source.read_text()
     graphics = args.graphics_source.read_text()
     layout = (root / 'main/ui/ui_layout.h').read_text()
@@ -35,6 +36,7 @@ def main():
     display = (root / 'components/display_service/display_service.cpp').read_text()
     fixture = (root / 'scripts/testdata/ui_navigation.cpp').read_text()
     pieces = {
+        '@@SETTINGS_DIALOG@@': section((root/'main/ui_model.h').read_text(), 'enum class SettingsDialog {', '// [dev-diag] One formatted error-log line'),
         '@@TRANSITIONS@@': section(model, 'static void ApplyUiScreenTransition(', '\nvoid HandleUiInput('),
         '@@INPUT@@': section(inputs, 'static RefreshSchedule FinishScreenNavigation(', '\nRefreshSchedule ApplyButtonEvent('),
         '@@BRIDGE@@': section(inputs, '    const wqn::NavigationAction navigation =', '\n    // [shell] Status-bar edit mode intercepts'),

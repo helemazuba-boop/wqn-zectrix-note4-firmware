@@ -40,3 +40,30 @@ and the stack-gate fixture (17) also pass.
 
 No sleep policy, power rail, wake source, EPD driver or waveform timing changes
 are included.
+
+## Settings: full-page subpages were blocked as if they were modals
+
+Device report: holding Up/Down fails to open global navigation on Settings
+subpages. `CanOpenNavigation` rejected every non-None SettingsDialog, including
+read-only details, choices and WiFi management. These are complete pages whose
+short presses can remain local while holds open the global overlay.
+
+Remove that blanket veto. An active provisioning portal still owns all input;
+existing AI capture/decision and time-value editing gates remain. Opening and
+cancelling navigation preserves the Settings subpage and candidates. Leaving
+Settings clears only its deferred single-confirm sync candidate, keeping
+admitted persistence operation IDs and their ACK ownership intact. Navigation
+confirmation and its release/double tail are consumed by the overlay guard.
+
+Validation: `test_ui_navigation.py` passes 1488 assertions, traversing every
+enumerated Settings subpage through the production navigation bridge, opening
+the overlay and confirming Home without local actions. It checks subpage and
+worker-token preservation, deferred-sync cancellation and provisioning veto.
+The old input source fails the new CanOpenNavigation assertion. Existing
+Settings input/ACK/pixels pass 235/250 assertions for dev-off/on. Both firmware
+profiles and M8/UI entry-frame gates pass with zero warnings.
+
+Device acceptance: hold Up and Down from each Settings detail/choice page,
+cancel the overlay, then navigate to another page and back. Candidates must not
+be implicitly saved, the held key's tail must not activate a destination action,
+and any already-admitted save must still receive its normal ACK.

@@ -43,7 +43,7 @@ namespace wqn {
 enum class AiTier { kFlash, kStd, kAgent };
 enum class AiSessionStatus { kIdle, kPreparingCapture, kListening };
 enum class AiFeaturePhase { kIdle, kRecording };
-enum class SettingsDialog { kNone, kWifiManage };
+@@SETTINGS_DIALOG@@
 enum class WordObservationCommitState { kIdle, kPersisting };
 enum class NoteObservationCommitState { kIdle, kPersisting };
 enum class ProblemVerdictCommitState { kIdle, kPersisting };
@@ -83,7 +83,7 @@ struct UiState {
         std::string current_session_id;
         struct { AiFeaturePhase phase = AiFeaturePhase::kIdle; } ui;
     } agent;
-    struct { SettingsDialog dialog = SettingsDialog::kNone; } settings;
+    struct { SettingsDialog dialog = SettingsDialog::kNone; bool sync_confirm_pending = false; unsigned volume_save_op_id = 0; } settings;
     struct { bool active = false; } status_edit;
     struct { bool flash_ptt_started = false, agent_ptt_started = false; int last_ai_confirm_tap_ms = 0; } gestures;
 };
@@ -304,7 +304,28 @@ void CheckGatesAndEffects() {
 
     state = {}; CHECK(CanOpenNavigation(state));
     provisioning = true; CHECK(!CanOpenNavigation(state)); provisioning = false;
-    state.screen = UiScreen::kSettings; state.settings.dialog = SettingsDialog::kWifiManage; CHECK(!CanOpenNavigation(state));
+    // Every settings subpage is a full-page surface, not an input modal.
+    state.screen = UiScreen::kSettings; CHECK(CanOpenNavigation(state));
+    for (int dialog = 1; dialog <= static_cast<int>(SettingsDialog::kProvisioningResult); ++dialog) {
+        state = {}; state.screen = UiScreen::kSettings;
+        state.settings.dialog = static_cast<SettingsDialog>(dialog);
+        state.settings.sync_confirm_pending = true;
+        state.settings.volume_save_op_id = 47; // An admitted worker keeps ownership.
+        CHECK(CanOpenNavigation(state));
+        CHECK(Dispatch({ButtonId::kDownPower, ButtonEventType::kPress}, ++tick, &state) == RefreshSchedule::kNone);
+        CHECK(Dispatch({ButtonId::kDownPower, ButtonEventType::kLongPress}, ++tick, &state) == RefreshSchedule::kNavigation);
+        CHECK(state.navigation.visible && state.screen == UiScreen::kSettings);
+        CHECK(state.settings.dialog == static_cast<SettingsDialog>(dialog));
+        Dispatch({ButtonId::kDownPower, ButtonEventType::kLongRelease}, ++tick, &state);
+        Dispatch({ButtonId::kDownPower, ButtonEventType::kRelease}, ++tick, &state);
+        state.navigation.selected = NavigationPageIndex(UiScreen::kHome);
+        Dispatch({ButtonId::kConfirm, ButtonEventType::kPress}, ++tick, &state);
+        CHECK(Dispatch({ButtonId::kConfirm, ButtonEventType::kShortPress}, ++tick, &state) == RefreshSchedule::kCommit);
+        CHECK(state.screen == UiScreen::kHome && !state.navigation.visible);
+        CHECK(!state.settings.sync_confirm_pending && state.settings.volume_save_op_id == 47);
+        CHECK(state.settings.dialog == static_cast<SettingsDialog>(dialog));
+        provisioning = true; CHECK(!CanOpenNavigation(state)); provisioning = false;
+    }
     state = {}; state.screen = UiScreen::kTime; state.time_app.editing = true; CHECK(!CanOpenNavigation(state));
     for (int mode = 0; mode < 6; ++mode) {
         state = {}; state.screen = UiScreen::kAi;
