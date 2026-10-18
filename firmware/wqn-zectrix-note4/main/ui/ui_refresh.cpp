@@ -798,9 +798,9 @@ std::string FrameSignature(const wqn::UiFrame& frame)
             signature.push_back('/');
             signature.append(problem.problem_title);
             signature.push_back('/');
-            signature.append(std::to_string(std::hash<std::string>{}(problem.body_text)));
+            signature.append(std::to_string(reinterpret_cast<uintptr_t>(problem.body_layout.get())));
             signature.push_back(':');
-            signature.append(std::to_string(std::hash<std::string>{}(problem.answer_text)));
+            signature.append(std::to_string(reinterpret_cast<uintptr_t>(problem.answer_layout.get())));
             signature.push_back('/');
             signature.append(std::to_string(problem.position));
             signature.push_back(':');
@@ -818,7 +818,7 @@ std::string FrameSignature(const wqn::UiFrame& frame)
             signature.push_back(':');
             signature.append(problem.image_id);
             signature.push_back('/');
-            signature.append(problem.status_line);
+            signature.append(problem.notice);
             signature.push_back('/');
             signature.append(problem.hint);
             for (const wqn::ProblemListRow& row : problem.rows) {

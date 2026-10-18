@@ -1930,7 +1930,6 @@ RefreshSchedule ApplyButtonEvent(
     const bool old_problem_active = state->problem_app.active;
     const wqn::ProblemAppMode old_problem_mode = state->problem_app.mode;
     const size_t old_problem_segment = state->problem_app.ring_segment;
-    const size_t old_problem_list_window = state->problem_app.list_window_start;
     ESP_LOGI(
         kTag,
         "button event: id=%d type=%d duration_ms=%lld",
@@ -2021,14 +2020,12 @@ RefreshSchedule ApplyButtonEvent(
         wqn::ProblemAppSignature(state->problem_app) != old_problem_signature) {
         BuildHomeSummary(state);
         // Layer activation, mode transitions (列表<->题目<->弹窗), ring segment
-        // hops (题面<->图<->答案) and list viewport jumps repaint most of the
-        // panel; commit them so the full refresh clears large-partial ghosting
-        // (the note domain's SSD1683 lesson). In-face scrolling and verdict
-        // highlight moves ride the fast partial path.
+        // hops (题面<->图<->答案) keep their full-refresh requirement.
+        // List windows now follow focus one row at a time, using the same
+        // full-frame partial path as text scrolling and verdict selection.
         if (state->problem_app.active != old_problem_active ||
             state->problem_app.mode != old_problem_mode ||
-            state->problem_app.ring_segment != old_problem_segment ||
-            state->problem_app.list_window_start != old_problem_list_window) {
+            state->problem_app.ring_segment != old_problem_segment) {
             return RefreshSchedule::kCommit;
         }
         return RefreshSchedule::kSelection;

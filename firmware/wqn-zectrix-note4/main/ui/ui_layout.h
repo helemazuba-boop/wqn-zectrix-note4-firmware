@@ -128,6 +128,12 @@ constexpr int kNoteBodyTop = 32;
 constexpr int kNoteBodyBottom = kScreenHeight - 4;
 constexpr int kNoteBodyLineHeight = 20;
 
+// ---- Problem review: native Note geometry, dedicated four-action menu ----
+constexpr int kProblemVerdictSubtitleY = 86;
+constexpr int kProblemVerdictDividerY = 112;
+constexpr int kProblemVerdictTop = 122;
+constexpr int kProblemVerdictPitch = 41;
+
 // ---- Global page navigation ----
 constexpr int kNavigationX = 8;
 constexpr int kNavigationY = 214;

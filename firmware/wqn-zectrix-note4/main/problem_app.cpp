@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <new>
 #include <utility>
 
@@ -12,6 +13,10 @@
 
 #include "display_service.h"
 #include "ui/markdown_layout.h"
+#include "ui/ai_native_text.h"
+#include "ui/ai_text_layout.h"
+#include "ui/note_reading_geometry.h"
+#include "note_list_model.h"
 #include "ui/ui_layout.h"
 
 namespace {
@@ -21,31 +26,10 @@ constexpr char kTag[] = "problem_app";
 using wqn::protocol::problem_study_v1::ProblemStatus;
 using wqn::protocol::problem_study_v1::ReviewAction;
 
-// Visible rows on the problem title list; mirrors page_problem.cpp geometry
-// (same list layout as the note lists).
-constexpr size_t kProblemListVisibleRows = 8;
-// Body/answer faces show 12 wrapped lines; the final row is reserved for the
-// persistent control/status rail. Attachments live on their own ring segments.
-// Must match page_problem.cpp.
-constexpr uint32_t kProblemFaceVisibleLines = 12;
-constexpr uint32_t kProblemFaceScrollStep = 4;
-
-// Edge-triggered viewport (see note_app.cpp UpdateListViewport for the
-// repaint rationale).
+// Share the approved four-row edge-following window with the Note lists.
 void UpdateListViewport(size_t selected, size_t count, size_t* start)
 {
-    constexpr size_t visible = kProblemListVisibleRows;
-    if (count <= visible) {
-        *start = 0;
-        return;
-    }
-    const size_t max_start = count - visible;
-    if (*start > max_start) *start = max_start;
-    if (selected < *start) {
-        *start = selected + 1 >= visible ? selected + 1 - visible : 0;
-    } else if (selected >= *start + visible) {
-        *start = std::min(selected, max_start);
-    }
+    *start = wqn::ClampNoteListWindow(*start, selected, count);
 }
 
 size_t ProblemImageCount(const wqn::ProblemAppState& state)
@@ -81,11 +65,14 @@ wqn::ProblemFace SegmentFace(const wqn::ProblemAppState& state, size_t segment)
     return wqn::ProblemFace::kSolutionImage;
 }
 
-uint32_t FaceMaxScroll(uint32_t total_lines)
+device_ui_internal::NoteReadingGeometry ProblemFaceGeometry(
+    const wqn::ProblemAppState& state, bool answer)
 {
-    return total_lines > kProblemFaceVisibleLines
-        ? total_lines - kProblemFaceVisibleLines
-        : 0;
+    const auto& layout = answer ? state.answer_layout : state.body_layout;
+    // Attachments keep their existing ring segments; only a real notice takes
+    // a row from the native text viewport shared with Note.
+    return device_ui_internal::ComputeNoteReadingGeometry(
+        layout ? layout->markdown.size() : 0, false, !wqn::ProblemAppNotice(state).empty());
 }
 
 const wqn::ProblemPackSet* OpenSet(const wqn::ProblemAppState& state)
@@ -331,13 +318,11 @@ void LoadCurrentProblem(wqn::ProblemAppState* state)
 {
     state->current = wqn::WqnProblemEntry{};
     state->current_loaded = false;
-    state->body_text.clear();
-    state->answer_text.clear();
+    state->body_layout.reset();
+    state->answer_layout.reset();
     state->answer_unlocked = false;
     state->body_scroll_lines = 0;
     state->answer_scroll_lines = 0;
-    state->body_total_lines = 0;
-    state->answer_total_lines = 0;
     state->verdict_selected = 0;
     ResetProblemImageViewer(state);
     const wqn::ProblemPackSet* set = OpenSet(*state);
@@ -354,18 +339,15 @@ void LoadCurrentProblem(wqn::ProblemAppState* state)
     const esp_err_t read_result = wqn::ReadProblemPackEntry(entry, &state->current);
     if (read_result == ESP_OK) {
         state->current_loaded = true;
-        // Precompute Markdown row counts with the SAME width, layout and opts
-        // as the renderer (page_problem.cpp: kMarkdownWidthDense,
-        // kMdNoSingleEmphasis) so scroll clamps match. Single * / _ stay
-        // literal: problem bodies are math-heavy plain text.
-        state->body_text = ComposeBodyText(state->current);
-        state->body_total_lines = static_cast<uint32_t>(
-            device_ui_internal::CountMarkdownLines(
-                state->body_text, device_ui_internal::kMarkdownWidthDense, device_ui_internal::kMdNoSingleEmphasis));
-        state->answer_text = ComposeAnswerText(state->current);
-        state->answer_total_lines = static_cast<uint32_t>(
-            device_ui_internal::CountMarkdownLines(
-                state->answer_text, device_ui_internal::kMarkdownWidthDense, device_ui_internal::kMdNoSingleEmphasis));
+        const uint64_t layout_id = std::hash<std::string>{}(state->current.problem_id);
+        state->body_layout = device_ui_internal::GetAiTextLayout(layout_id,
+            ComposeBodyText(state->current), device_ui_internal::AiTextKind::kMarkdown,
+            device_ui_internal::kNoteBodyWidth, device_ui_internal::AiNativeFont(),
+            device_ui_internal::kAiTextMaxRows, device_ui_internal::kMdNoSingleEmphasis);
+        state->answer_layout = device_ui_internal::GetAiTextLayout(layout_id ^ 1,
+            ComposeAnswerText(state->current), device_ui_internal::AiTextKind::kMarkdown,
+            device_ui_internal::kNoteBodyWidth, device_ui_internal::AiNativeFont(),
+            device_ui_internal::kAiTextMaxRows, device_ui_internal::kMdNoSingleEmphasis);
         ESP_LOGI(
             kTag, "problem opened: id=%.8s images=%u/%u parts=%u body_bytes=%u",
             state->current.problem_id.c_str(),
@@ -415,8 +397,8 @@ void ExitToProblemList(wqn::ProblemAppState* state)
 {
     state->current = wqn::WqnProblemEntry{};
     state->current_loaded = false;
-    state->body_text.clear();
-    state->answer_text.clear();
+    state->body_layout.reset();
+    state->answer_layout.reset();
     state->answer_unlocked = false;
     ResetProblemImageViewer(state);
     state->mode = wqn::ProblemAppMode::kProblemList;
@@ -469,15 +451,19 @@ void HandleProblemViewInput(wqn::ProblemAppState* state, wqn::ProblemInput input
     const size_t images = ProblemImageCount(*state);
     const size_t solution_images = SolutionImageCount(*state);
     const wqn::ProblemFace face = SegmentFace(*state, state->ring_segment);
-    const uint32_t body_max = FaceMaxScroll(state->body_total_lines);
-    const uint32_t answer_max = FaceMaxScroll(state->answer_total_lines);
+    const auto body_geometry = ProblemFaceGeometry(*state, false);
+    const auto answer_geometry = ProblemFaceGeometry(*state, true);
+    const uint32_t body_max = body_geometry.max_scroll;
+    const uint32_t answer_max = answer_geometry.max_scroll;
+    state->body_scroll_lines = std::min(state->body_scroll_lines, body_max);
+    state->answer_scroll_lines = std::min(state->answer_scroll_lines, answer_max);
     switch (input) {
         case wqn::ProblemInput::kUp:
             if (face == wqn::ProblemFace::kBody) {
                 if (state->body_scroll_lines > 0) {
                     state->body_scroll_lines =
-                        state->body_scroll_lines > kProblemFaceScrollStep
-                            ? state->body_scroll_lines - kProblemFaceScrollStep
+                        state->body_scroll_lines > body_geometry.step
+                            ? state->body_scroll_lines - body_geometry.step
                             : 0;
                     state->message.clear();
                 } else if (images > 0) {
@@ -498,8 +484,8 @@ void HandleProblemViewInput(wqn::ProblemAppState* state, wqn::ProblemInput input
             } else if (face == wqn::ProblemFace::kAnswer) {
                 if (state->answer_scroll_lines > 0) {
                     state->answer_scroll_lines =
-                        state->answer_scroll_lines > kProblemFaceScrollStep
-                            ? state->answer_scroll_lines - kProblemFaceScrollStep
+                        state->answer_scroll_lines > answer_geometry.step
+                            ? state->answer_scroll_lines - answer_geometry.step
                             : 0;
                     state->message.clear();
                 } else {
@@ -529,7 +515,7 @@ void HandleProblemViewInput(wqn::ProblemAppState* state, wqn::ProblemInput input
             if (face == wqn::ProblemFace::kBody) {
                 if (state->body_scroll_lines < body_max) {
                     state->body_scroll_lines = std::min<uint32_t>(
-                        state->body_scroll_lines + kProblemFaceScrollStep, body_max);
+                        state->body_scroll_lines + body_geometry.step, body_max);
                     state->message.clear();
                 } else if (state->answer_unlocked) {
                     EnterAnswerSegment(state, 0);
@@ -544,7 +530,7 @@ void HandleProblemViewInput(wqn::ProblemAppState* state, wqn::ProblemInput input
             } else if (face == wqn::ProblemFace::kAnswer) {
                 if (state->answer_scroll_lines < answer_max) {
                     state->answer_scroll_lines = std::min<uint32_t>(
-                        state->answer_scroll_lines + kProblemFaceScrollStep, answer_max);
+                        state->answer_scroll_lines + answer_geometry.step, answer_max);
                     state->message.clear();
                 } else if (solution_images > 0) {
                     EnterImageSegment(state, AnswerSegment(*state) + 1);
@@ -628,6 +614,7 @@ void HandleVerdictInput(wqn::ProblemAppState* state, wqn::ProblemInput input)
             pending.action = VerdictAction(state->verdict_selected);
             state->pending_verdict = std::move(pending);
             state->verdict_effect_ready = true;
+            state->verdict_error.clear();
             state->commit_state = wqn::ProblemVerdictCommitState::kPersisting;
             state->advance_after_commit = true;
             state->mode = wqn::ProblemAppMode::kProblemView;
@@ -957,6 +944,7 @@ bool TakeProblemVerdictEffect(
         state->verdict_effect_ready = false;
         state->commit_state = ProblemVerdictCommitState::kFailed;
         state->message = "记录无效";
+        state->verdict_error = state->message;
         return false;
     }
     state->verdict_effect_ready = false;
@@ -977,9 +965,11 @@ void ApplyProblemVerdictCommitResult(ProblemAppState* state, esp_err_t result)
         state->commit_state = ProblemVerdictCommitState::kFailed;
         state->advance_after_commit = false;
         state->message = result == ESP_ERR_NO_MEM ? "记录空间已满" : "记录未保存";
+        state->verdict_error = state->message;
         return;
     }
     state->pending_verdict = {};
+    state->verdict_error.clear();
     state->commit_state = ProblemVerdictCommitState::kCloudPending;
     if (state->outbox.pending_count + state->outbox.suspended_count <
         state->outbox.capacity) {
@@ -1024,8 +1014,8 @@ ProblemAppSnapshot BuildProblemAppSnapshot(const ProblemAppState& state)
         snapshot.has_body = state.current_loaded;
         snapshot.problem_id = state.current.problem_id;
         snapshot.problem_title = state.current.title;
-        snapshot.body_text = state.body_text;
-        snapshot.answer_text = state.answer_text;
+        snapshot.body_layout = state.body_layout;
+        snapshot.answer_layout = state.answer_layout;
         snapshot.body_scroll_lines = state.body_scroll_lines;
         snapshot.answer_scroll_lines = state.answer_scroll_lines;
         snapshot.answer_unlocked = state.answer_unlocked;
@@ -1053,6 +1043,7 @@ ProblemAppSnapshot BuildProblemAppSnapshot(const ProblemAppState& state)
     snapshot.commit_state = state.commit_state;
     snapshot.outbox_pending_count = state.outbox.pending_count;
     snapshot.outbox_suspended_count = state.outbox.suspended_count;
+    snapshot.notice = ProblemAppNotice(state);
     snapshot.status_line = ProblemAppStatusLine(state);
     switch (state.mode) {
         case ProblemAppMode::kProblemList:
@@ -1087,6 +1078,26 @@ std::string ProblemAppStatusLine(const ProblemAppState& state)
     return "";
 }
 
+std::string ProblemAppNotice(const ProblemAppState& state)
+{
+    if (state.commit_state == ProblemVerdictCommitState::kPersisting)
+        return "正在保存...";
+    if (state.commit_state == ProblemVerdictCommitState::kFailed && !state.verdict_error.empty())
+        return state.verdict_error;
+    const std::string& message = state.message;
+    for (const char* quiet : {"", "已到顶部", "已到底部", "选择要练的题",
+            "错题已就绪", "已记录，下一题", "该错题本暂无题目"}) {
+        if (message != quiet) continue;
+        if (state.commit_state == ProblemVerdictCommitState::kFailed)
+            return "记录未保存，确认重新自评";
+        if (state.outbox.suspended_count > 0)
+            return "同步挂起 " + std::to_string(state.outbox.suspended_count) + " 条";
+        if (state.cloud_sync_failed) return "同步异常，可继续离线复习";
+        return {};
+    }
+    return message;
+}
+
 std::string ProblemAppSignature(const ProblemAppState& state)
 {
     // Compact identity for the render layer to detect meaningful frame
@@ -1111,7 +1122,7 @@ std::string ProblemAppSignature(const ProblemAppState& state)
         static_cast<unsigned>(state.cloud_sync_failed ? 1 : 0),
         static_cast<unsigned>(state.image_error ? 1 : 0),
         static_cast<unsigned>(state.pack_index.sets.size()));
-    return std::string(buffer);
+    return std::string(buffer) + "|" + ProblemAppNotice(state);
 }
 
 namespace {

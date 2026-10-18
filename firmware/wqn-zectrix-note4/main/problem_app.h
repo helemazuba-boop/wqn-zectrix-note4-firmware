@@ -11,6 +11,8 @@
 #include "problem_store.h"
 #include "storage.h"
 
+namespace device_ui_internal { struct AiTextLayout; }
+
 namespace wqn {
 
 enum class ProblemInput {
@@ -69,26 +71,26 @@ struct ProblemAppState {
     // Ring position within the open problem (see ProblemFace).
     size_t ring_segment = 0;
     uint32_t body_scroll_lines = 0;
-    uint32_t body_total_lines = 0;
     uint32_t answer_scroll_lines = 0;
-    uint32_t answer_total_lines = 0;
     bool answer_unlocked = false;
     // 0=A对了 1=B还要想想 2=C错了 3=D跳过
     size_t verdict_selected = 0;
 
     WqnProblemEntry current;
     bool current_loaded = false;
-    // Composed 题面 text: shell content followed by every part's own body
-    // (the gaokao shell model keeps the real question text in parts[]).
-    std::string body_text;
-    // Composed 答案面 text (per part: label · 分值 · 正确答案).
-    std::string answer_text;
+    // Immutable native 题面 layout: shell content followed by each part's
+    // own body. Snapshots share these rows without copying/re-hashing text.
+    std::shared_ptr<const device_ui_internal::AiTextLayout> body_layout;
+    // Independently retained 答案 layout (label · 分值 · 正确答案).
+    std::shared_ptr<const device_ui_internal::AiTextLayout> answer_layout;
 
     // Verdict outbox effect (mirrors the note observation effect handshake).
     bool verdict_effect_ready = false;
     DurableProblemObservation pending_verdict;
     bool advance_after_commit = false;
     ProblemVerdictCommitState commit_state = ProblemVerdictCommitState::kIdle;
+    // Retain the specific failure while browsing/cancelling until a new submit.
+    std::string verdict_error;
     // [persist-worker] operation_id of the in-flight verdict persist submit; the
     // worker result is applied only if it still matches (and commit_state is
     // kPersisting), so a late result cannot mis-advance a reset/changed view.
@@ -142,8 +144,8 @@ struct ProblemAppSnapshot {
     std::string problem_title;
     ProblemFace face = ProblemFace::kBody;
     bool has_body = false;
-    std::string body_text;
-    std::string answer_text;
+    std::shared_ptr<const device_ui_internal::AiTextLayout> body_layout;
+    std::shared_ptr<const device_ui_internal::AiTextLayout> answer_layout;
     uint32_t body_scroll_lines = 0;
     uint32_t answer_scroll_lines = 0;
     bool answer_unlocked = false;
@@ -164,6 +166,7 @@ struct ProblemAppSnapshot {
     size_t outbox_pending_count = 0;
     size_t outbox_suspended_count = 0;
     bool cloud_sync_failed = false;
+    std::string notice;
     std::string status_line;
     std::string hint;
 };
@@ -206,6 +209,7 @@ void ApplyProblemVerdictCommitResult(ProblemAppState* state, esp_err_t result);
 
 ProblemAppSnapshot BuildProblemAppSnapshot(const ProblemAppState& state);
 std::string ProblemAppStatusLine(const ProblemAppState& state);
+std::string ProblemAppNotice(const ProblemAppState& state);
 std::string ProblemAppSignature(const ProblemAppState& state);
 bool RunProblemPageStateSelfTest();
 
