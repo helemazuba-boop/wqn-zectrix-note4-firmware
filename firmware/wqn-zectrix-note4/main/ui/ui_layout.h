@@ -57,6 +57,21 @@ constexpr int kHomeFooterY = 276;
 constexpr int kHomeAiDividerY = 102;
 constexpr int kHomeStudyDividerY = 210;
 
+// ---- Word: Home's paper sections, native text, no persistent help footer ----
+constexpr int kWordLeft = kHomeLeft;
+constexpr int kWordWidth = kHomeWidth;
+constexpr int kWordRight = kWordLeft + kWordWidth;
+constexpr int kWordBottom = kScreenHeight - 8;
+constexpr int kWordMetaY = 35;
+constexpr int kWordHeadlineY = 62;
+constexpr int kWordHomeTitleY = 36;
+constexpr int kWordHomeSummaryY = 70;
+constexpr int kWordHomeNoticeY = 91;
+constexpr int kWordMenuTop = 116;
+constexpr int kWordMenuPitch = 56;
+constexpr int kWordChoiceTop = 178;
+constexpr int kWordChoicePitch = 50;
+
 // ---- Settings: approved B layout, native type, no persistent help footer ----
 constexpr int kSettingsListX = kMarginX;
 constexpr int kSettingsDetailX = kMarginX;
