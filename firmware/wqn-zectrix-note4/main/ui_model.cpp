@@ -830,18 +830,4 @@ AiTier NextAiTier(AiTier current)
 #endif
 }
 
-const char* AiTierLabel(AiTier tier)
-{
-    switch (tier) {
-        case AiTier::kFlash:
-            return "Flash";
-        case AiTier::kStd:
-            return "STD";
-        case AiTier::kAgent:
-            return "Agent";
-        default:
-            return "???";
-    }
-}
-
 }  // namespace wqn

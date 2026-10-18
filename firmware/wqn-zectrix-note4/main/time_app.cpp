@@ -456,15 +456,6 @@ bool TickTimeAppAt(
 
 namespace wqn {
 
-void ResetTimeApp(TimeAppState* state)
-{
-    if (state == nullptr) {
-        return;
-    }
-    *state = TimeAppState{};
-    NormalizeCountdownFields(state);
-}
-
 bool HandleTimeAppInput(TimeAppState* state, TimeInput input)
 {
     if (state == nullptr) {
@@ -605,11 +596,6 @@ int TimeAppPresetFieldBase(TimeTile tile)
     return NumericFieldCount(tile);
 }
 
-int TimeAppPresetFieldCount(TimeTile tile)
-{
-    return PresetFieldCount(tile);
-}
-
 int TimeAppStartField(TimeTile tile)
 {
     return StartFieldIndex(tile);
@@ -625,59 +611,6 @@ void DisarmTimeAppAction(TimeAppState* state)
     if (state != nullptr) {
         SetActionArmed(state, false);
     }
-}
-
-std::string FormatTimerDuration(int total_seconds)
-{
-    total_seconds = std::max(0, total_seconds);
-    const int hours = total_seconds / 3600;
-    const int minutes = (total_seconds % 3600) / 60;
-    const int seconds = total_seconds % 60;
-    char buffer[16] = {};
-    if (hours > 0) {
-        std::snprintf(buffer, sizeof(buffer), "%d:%02d:%02d", hours, minutes, seconds);
-    } else {
-        std::snprintf(buffer, sizeof(buffer), "%02d:%02d", minutes, seconds);
-    }
-    return buffer;
-}
-
-std::string TimeAppPrimaryLine(const TimeAppState& state)
-{
-    if (state.status == TimerStatus::kAlerting) {
-        if (state.active_mode == TimerMode::kCountdown) {
-            return "倒计时到点";
-        }
-        if (state.pomodoro_phase == PomodoroPhase::kFocus) {
-            return "番茄钟第 " + std::to_string(state.pomodoro_current_round) + " 轮专注完成";
-        }
-        return state.pomodoro_phase == PomodoroPhase::kLongBreak
-            ? "番茄钟本组完成"
-            : "番茄钟短休息结束";
-    }
-    if (state.active_mode == TimerMode::kPomodoro && TimeAppHasActiveTimer(state)) {
-        if (state.status == TimerStatus::kPaused) {
-            return state.pomodoro_phase == PomodoroPhase::kFocus
-                ? "番茄钟第 " + std::to_string(state.pomodoro_current_round) + " 轮已暂停"
-                : state.pomodoro_phase == PomodoroPhase::kLongBreak
-                    ? "番茄钟长休息已暂停"
-                    : "番茄钟短休息已暂停";
-        }
-        switch (state.pomodoro_phase) {
-            case PomodoroPhase::kBreak:
-                return "番茄钟短休息中";
-            case PomodoroPhase::kLongBreak:
-                return "番茄钟长休息中";
-            case PomodoroPhase::kFocus:
-            default:
-                return "番茄钟第 " + std::to_string(state.pomodoro_current_round) + "/" +
-                       std::to_string(state.pomodoro_rounds) + " 轮专注中";
-        }
-    }
-    if (state.active_mode == TimerMode::kCountdown && TimeAppHasActiveTimer(state)) {
-        return state.status == TimerStatus::kPaused ? "倒计时已暂停" : "倒计时进行中";
-    }
-    return "";
 }
 
 bool PomodoroGroupComplete(const TimeAppState& state)
@@ -754,19 +687,6 @@ void TimeAppVisibleRoundWindow(
     if (last_round != nullptr) {
         *last_round = start + visible;
     }
-}
-
-const char* PomodoroPhaseLabel(PomodoroPhase phase)
-{
-    switch (phase) {
-        case PomodoroPhase::kFocus:
-            return "专注";
-        case PomodoroPhase::kBreak:
-            return "休息";
-        case PomodoroPhase::kLongBreak:
-            return "长休";
-    }
-    return "专注";
 }
 
 bool RunTimeAppStateSelfTest()

@@ -106,9 +106,6 @@ struct ProblemPackIndex {
 esp_err_t InitProblemPackStorage();
 esp_err_t ResetProblemPackStorageCache();
 esp_err_t LoadProblemPackManifest(WqnProblemPackManifest* manifest);
-esp_err_t MergeProblemPackManifestDelta(
-    const WqnProblemPackManifest& delta,
-    WqnProblemPackManifest* merged);
 esp_err_t SaveProblemPackManifest(const WqnProblemPackManifest& manifest);
 esp_err_t LoadProblemPackIndex(ProblemPackIndex* index);
 esp_err_t DownloadProblemPackToStorage(

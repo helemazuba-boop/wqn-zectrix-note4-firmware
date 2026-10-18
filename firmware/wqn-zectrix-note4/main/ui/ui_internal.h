@@ -140,7 +140,6 @@ void UpdateSettingsDiagnostics(wqn::UiState* state);
 
 void DrawStatusBar(const char* title, const wqn::HomeSummary& home);
 void DrawClockStatusBar(const wqn::HomeSummary& home);
-void DrawProgressBar(int x, int y, int width, int height, int current, int total);
 void DrawConfigBox(int x, int y, int width, int height, const std::string& value, const std::string& label, bool selected);
 void DrawActionBox(int x, int y, int width, int height, const std::string& label, bool selected);
 
@@ -329,10 +328,6 @@ struct ProblemCloudResult {
     // kFetchImage: validated WQNI bytes (header + payload) and their id.
     std::string image_id;
     std::shared_ptr<const std::vector<uint8_t>> image_wqni;
-};
-
-struct ProblemCloudResultReady {
-    uint32_t generation = 0;
 };
 
 // --- Unified cloud runner ---------------------------------------------------
@@ -550,7 +545,6 @@ void UpdateHomeAiSummary(wqn::UiState* state, int64_t now_ms);
 
 bool SameTimeAppState(const wqn::TimeAppState& a, const wqn::TimeAppState& b);
 bool TimeAppStructureChanged(const wqn::TimeAppState& before, const wqn::TimeAppState& after);
-bool ShouldRefreshTimeTick(const wqn::UiState& state);
 bool ScreenUsesClockMinute(const wqn::UiState& state);
 
 RefreshSchedule ApplyButtonEvent(
@@ -588,7 +582,6 @@ std::string FrameSignature(const wqn::UiFrame& frame);
 // ---- Clock ------------------------------------------------------------------
 
 std::time_t CurrentUnixTime();
-bool SystemClockIsReasonable();
 std::string CurrentClockLabel();
 std::string CurrentDateLabel();
 std::string CurrentIsoTimestamp();
@@ -616,10 +609,6 @@ void FillRoundedRect(int x, int y, int width, int height, int radius, bool black
 void FillRect(int x, int y, int width, int height, bool black);
 void ClearRect(const UiRect& rect);
 // [L3-semantics] Named black-fill wrappers (defined in graphics.cpp). L2 migrates call sites.
-void DrawSelectedFill(int x, int y, int width, int height);
-void DrawProgressFill(int x, int y, int width, int height);
-void DrawRoleBar(int x, int y, int width, int height);
-void DrawActivityDot(int x, int y, int size);
 void DrawWqnBitmapAsset(int x, int y, const WqnBitmapAsset& asset, bool black = true);
 esp_err_t RefreshRegion(const UiRect& rect, RefreshSchedule schedule);
 esp_err_t RefreshStableRegion(const UiRect& rect, RefreshSchedule schedule);
@@ -627,16 +616,11 @@ esp_err_t RefreshFrame(const wqn::UiFrame& frame, RefreshSchedule schedule);
 
 esp_err_t DrawClippedText(int x, int y, int max_width, const std::string& text, bool black = true);
 esp_err_t DrawCenteredText(int x, int y, int width, const std::string& text, bool black = true);
-esp_err_t DrawWrappedText(int x, int y, int width, const std::string& text, int max_lines, bool black = true);
 // Shared Markdown row renderer (markdown_render.cpp). The MdLine must come
 // from LayoutMarkdown at the same content_w or geometry desyncs.
 esp_err_t DrawMarkdownLine(const MdLine& line, int x, int y, int content_w, int line_h,
                             const lv_font_t* font = nullptr);
 std::string LimitForEpd(const std::string& text);
-std::string Utf8PageSlice(const std::string& text, size_t page, size_t chars_per_page);
-std::string JoinAiFunctionCallSummaries(const std::vector<std::string>& summaries);
-std::string FormatAiFunctionCallSummaries(const std::vector<std::string>& summaries);
-
 // ---- Bitmap digits and status icons ----------------------------------------
 
 void DrawStandbyClockDigits(int y, const std::string& text);

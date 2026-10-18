@@ -72,13 +72,10 @@ void HandleV2DownlinkAudio(const uint8_t* data, size_t len,
 //                means audio; 'WFCJ' + ver=2 means JSON control.
 // ============================================================================
 #if CONFIG_WQN_FLASH_PROTOCOL_V2
-constexpr char kWsHost[] = WQN_API_BASE_HOST;        // https://wqn.helema.cn
-constexpr char kWsPath[] = WQN_FLASH_WS_PATH;        // /api/esp32/realtime
 constexpr char kWsSubprotocol[] = WQN_FLASH_WS_SUBPROTOCOL;  // wqn-flash-v2
 constexpr char kDefaultVoice[] = WQN_FLASH_VOICE;
 constexpr char kDefaultInstructions[] = WQN_FLASH_DEFAULT_INSTRUCTIONS;
 constexpr uint32_t kAudioFrameMagic = 0x57464C56u;   // 'W','F','L','V'
-constexpr uint32_t kControlFrameMagic = 0x5746434Au; // 'W','F','C','J'
 constexpr uint16_t kFrameVersion = 2;
 constexpr uint16_t kFlagStream = 0x0001;
 constexpr uint16_t kFlagFinal = 0x0002;
@@ -90,10 +87,7 @@ constexpr char kDefaultVoice[] = "qingchunshaonv";
 
 constexpr int kSampleRate = 24000;
 constexpr int kChunkFrames = 360;
-constexpr int kChunkBytes = kChunkFrames * 2;
-constexpr int kChunkIntervalMs = 15;
 
-constexpr int kMaxReconnectAttempts = 3;
 constexpr TickType_t kWifiReadyWait = pdMS_TO_TICKS(35000);
 constexpr TickType_t kWsConnectTimeout = pdMS_TO_TICKS(20000);
 constexpr uint32_t kLifecycleTaskStackBytes = 8192;
@@ -2608,40 +2602,6 @@ esp_err_t StopFlashSession()
     return ESP_OK;
 }
 
-FlashStatus GetFlashStatus()
-{
-    if (g_flash.mutex == nullptr) {
-        return FlashStatus::kIdle;
-    }
-    xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
-    InternalStatus s = g_flash.status;
-    xSemaphoreGive(g_flash.mutex);
-
-    switch (s) {
-        case InternalStatus::kIdle:
-            return FlashStatus::kIdle;
-        case InternalStatus::kConnecting:
-        case InternalStatus::kSessionUpdating:
-            return FlashStatus::kConnecting;
-        case InternalStatus::kStreaming:
-            return FlashStatus::kStreaming;
-        case InternalStatus::kError:
-            return FlashStatus::kError;
-    }
-    return FlashStatus::kIdle;
-}
-
-bool IsFlashConnected()
-{
-    if (g_flash.mutex == nullptr) {
-        return false;
-    }
-    xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
-    const bool connected = g_flash.ws_connected;
-    xSemaphoreGive(g_flash.mutex);
-    return connected;
-}
-
 bool CopyFlashStateToUi(FlashUiState* state)
 {
     if (state == nullptr || g_flash.mutex == nullptr) {
@@ -2688,33 +2648,6 @@ bool CopyFlashStateToUi(FlashUiState* state)
     g_flash.changed = false;
     xSemaphoreGive(g_flash.mutex);
     return true;
-}
-
-bool IsFlashTranscribing()
-{
-    if (g_flash.mutex == nullptr) {
-        return false;
-    }
-    xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
-    const bool transcribing = g_flash.capture_started && g_flash.ws_connected;
-    xSemaphoreGive(g_flash.mutex);
-    return transcribing;
-}
-
-bool IsFlashSessionActive()
-{
-    if (g_flash.mutex == nullptr) {
-        return false;
-    }
-    xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
-    const bool active =
-        g_flash.ws_client != nullptr || g_flash.status == InternalStatus::kConnecting ||
-        g_flash.status == InternalStatus::kSessionUpdating ||
-        g_flash.status == InternalStatus::kStreaming || g_flash.capture_started ||
-        g_flash.response_in_flight || g_flash.playback_write_active ||
-        g_flash.playback_queued_bytes.load(std::memory_order_acquire) > 0;
-    xSemaphoreGive(g_flash.mutex);
-    return active;
 }
 
 void PollFlashAmpIdle()
@@ -2969,10 +2902,7 @@ namespace wqn {
 esp_err_t InitFlashSession() { return ESP_OK; }
 esp_err_t StartFlashSession() { return ESP_ERR_NOT_SUPPORTED; }
 esp_err_t StopFlashSession() { return ESP_ERR_NOT_SUPPORTED; }
-FlashStatus GetFlashStatus() { return FlashStatus::kIdle; }
-bool IsFlashConnected() { return false; }
 bool CopyFlashStateToUi(FlashUiState*) { return false; }
-bool IsFlashTranscribing() { return false; }
 void PollFlashAmpIdle() {}
 void OnFlashButtonPressed() {}
 void OnFlashButtonReleased(bool) {}

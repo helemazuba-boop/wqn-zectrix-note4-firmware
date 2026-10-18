@@ -58,7 +58,6 @@ constexpr size_t kMaxSsidBytes = 32;
 // submitting thread must get ESP_ERR_TIMEOUT back instead of hanging
 // forever on g_call_mutex / the reply queue. 30 s matches the STA connect
 // budget (kWifiConnectTimeout in wqn_api.cpp).
-constexpr TickType_t kSubmitCommandTimeout = pdMS_TO_TICKS(30000);
 constexpr size_t kMaxPasswordBytes = 64;
 constexpr EventBits_t kOnlineBit = BIT0;
 constexpr EventBits_t kStateChangedBit = BIT1;

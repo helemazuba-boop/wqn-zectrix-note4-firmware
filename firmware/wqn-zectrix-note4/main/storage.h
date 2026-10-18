@@ -128,7 +128,6 @@ esp_err_t SaveSyncJournalThroughStorageService(
     const SyncJournal& journal, const char* reason = "unspecified");
 
 esp_err_t LoadAutoSyncIntervalMinutes(uint32_t* minutes);
-esp_err_t SaveAutoSyncIntervalMinutes(uint32_t minutes);
 // [persist-worker] Worker-dedicated variant: routes the NVS commit through the
 // FOREGROUND storage queue so the persist worker's wait behind background pack
 // writes is bounded (once a transaction starts it may still wait without a
@@ -167,7 +166,6 @@ esp_err_t SaveWordSequentialCursor(uint32_t cursor);
 // study sessions scope to it; the other decks enter via the note screen's
 // mixed [词] rows.
 esp_err_t LoadDefaultWordDeckId(std::string* deck_id);
-esp_err_t SaveDefaultWordDeckId(const std::string& deck_id);
 // [deck-scope] Recoverable default-deck change protocol (c5). A deck switch
 // must clear both persisted word sessions (SPIFFS) and save the new deck +
 // scope generation (NVS); there is no cross-NVS/SPIFFS atomicity, so a marker
@@ -192,7 +190,6 @@ uint32_t GetDeckScopeGeneration();
 // today is the UI task.
 esp_err_t ResetWordSessionScope();
 esp_err_t LoadVolumePercent(int* percent);
-esp_err_t SaveVolumePercent(int percent);
 // [persist-worker] Worker-dedicated variant (see SaveAutoSyncIntervalMinutesForeground).
 esp_err_t SaveVolumePercentForeground(int percent);
 std::string VolumeLabel(int percent);
@@ -275,8 +272,6 @@ esp_err_t SetWifiCredentialForRole(
     bool keep_existing_password);
 // Explicitly makes `index` the configured primary slot. Writes only when the value
 // actually changes, to bound NVS wear.
-esp_err_t MarkWifiSlotPreferred(uint8_t index);
-
 // PowerCoordinator boundary. Writes are serialized by StorageService and each
 // accepted transaction holds kStorage, so Ready means every commit is durable.
 esp_err_t PrepareStorageForSleep(int64_t deadline_us);

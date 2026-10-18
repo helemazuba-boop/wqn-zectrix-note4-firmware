@@ -141,13 +141,6 @@ struct OpenCodeOutboundReply {
     std::string answer;
 };
 
-// The id of whichever ask a queued reply answers, for logging and for restoring
-// the pending-ask UI when the reply POST fails.
-inline const std::string& OpenCodeReplyId(const OpenCodeOutboundReply& reply)
-{
-    return reply.is_question ? reply.question_id : reply.permission_id;
-}
-
 // The session a reply is POSTed against. The ask's own session wins, because both
 // reply routes are scoped to it and a subagent raises its asks against its own
 // id -- answering on the attached session is a 404 against the ownership check,

@@ -157,8 +157,6 @@ std::string SafeNotePackStem(const WqnNotePackManifestNotebook& notebook);
 inline constexpr size_t kNoteImageHeaderBytes = 20;
 inline constexpr size_t kNoteImagePayloadBytes = 15000;  // 400x300 / 8
 inline constexpr size_t kNoteImageGray4PayloadBytes = 60000;  // 400x300 / 2
-inline constexpr size_t kNoteImageFileBytes =
-    kNoteImageHeaderBytes + kNoteImagePayloadBytes;
 inline constexpr size_t kNoteImageCacheMaxFiles = 64;
 
 // Validates magic/version/format/flags/geometry/length and the payload CRC32.

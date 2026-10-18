@@ -66,11 +66,9 @@ enum class ConnectionState : uint8_t {
 enum class TurnState : uint8_t {
     kIdle,
     kRecording,
-    kFinalQueued,
-    kFinalInFlight,
+    kFinalInFlight = 3,
     kRemoteHandoff,
-    kFailedPreFinal,
-    kComplete,
+    kComplete = 6,
 };
 
 struct PcmBlock {

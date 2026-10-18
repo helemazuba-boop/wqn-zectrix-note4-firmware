@@ -85,7 +85,7 @@ def main():
                             '\nesp_err_t SaveCursorTransaction('),
         '@@COMMIT@@': section(source, 'struct CommitContext {',
                               '\nesp_err_t PeekObservationTransaction('),
-        '@@ACK@@': section(source, 'struct AckContext {', '\nstruct QuarantineContext {'),
+        '@@ACK@@': section(source, 'struct AckBatchContext {', '\nstruct QuarantineContext {'),
         '@@TERMINAL@@': section(source, 'struct QuarantineContext {',
                                 '\nesp_err_t SnapshotTransaction('),
         '@@MAINTENANCE_DRIVER@@': (
@@ -94,7 +94,7 @@ def main():
             if 'esp_err_t RunOutboxMaintenance(' in source else ''),
         '@@PUBLIC_MAINTENANCE@@': (
             'namespace wqn {\n' + section(
-                source, 'esp_err_t AcknowledgeWordObservation(',
+                source, 'esp_err_t AcknowledgeWordObservations(',
                 '\nesp_err_t ReadWordOutboxSnapshot(') + section(
                 source, 'esp_err_t PrepareWordObservationOutboxForSleep(',
                 '\n}  // namespace wqn\n') + '\n}\n'

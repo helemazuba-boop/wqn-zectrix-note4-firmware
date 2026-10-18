@@ -30,18 +30,11 @@ constexpr int kStatusBarRightInset = 10;        // right inset for status text (
 // 标准页(卡片/对话框/配置): 视觉宽松.
 // 密度页(AI/note/problem/word 正文): 信息密度优先, 边距收窄到 6.
 constexpr int kMarginX = 10;                    // 全局标准水平边距(卡片/对话框页)
-constexpr int kMarginPage = kMarginX;           // 标准页边距别名 (=10)
 constexpr int kMarginDense = 6;                 // 密度页边距 (note/problem/word/AI 正文)
-constexpr int kEdgeFlushX = 6;                  // [legacy] AI 助手 role-bar 贴边框阴影专用, == kMarginDense
-constexpr int kContentTopY = 35;                // 状态栏下第一内容行 (divider 27 + 8px gap)
 constexpr int kContentWidth = kScreenWidth - 2 * kMarginX;  // 380 (标准页内容宽)
 constexpr int kContentWidthDense = kScreenWidth - 2 * kMarginDense;  // 388 (密度页内容宽)
 constexpr int kMarkdownWidthDense = kContentWidthDense - 14;  // 374 (密度页 Markdown 绘制宽度)
 constexpr int kBottomHintY = 278;               // 底部提示/脚注行 y
-
-// ---- 组件间距 (gutter) ----
-constexpr int kGutterCard = 12;                 // 卡片垂直间距
-constexpr int kGutterRow = 8;                   // 列表行垂直间距
 
 // ---- Home, reference A: ink on paper ----
 constexpr int kHomeLeft = 16;
@@ -154,7 +147,6 @@ constexpr int kNavigationCurrentY = 285;
 constexpr int kAiStatusBarY = 0;
 constexpr int kAiStatusBarH = kStatusBarHeight;  // 28, divider on kStatusBarDividerY
 constexpr int kAiViewportY = kAiStatusBarY + kAiStatusBarH;  // 27
-constexpr int kAiViewportH = kScreenHeight - kAiViewportY;   // 273
 constexpr int kAiLineH = kCjkLineHeight;                     // 18
 constexpr int kAiLineGap = 4;
 constexpr int kAiAssistantLeftBorder = 4;
@@ -164,7 +156,6 @@ constexpr int kAiHistoryRightEdge = kScreenWidth - kAiHistoryRightPad;  // 394
 constexpr int kAiHistoryUsableW = kAiHistoryRightEdge - kAiHistoryLeftPad;  // 388
 constexpr int kAiUserPillMaxW = kAiHistoryUsableW * 78 / 100;              // ~302
 constexpr int kAiAssistantW = kAiHistoryUsableW;
-constexpr int kAiRowTopPad = 2;
 // [band] The bottom band of the AI transcript. The Agent tier's option bar --
 // asks, confirmations, the question counter -- is exactly this tall.
 //

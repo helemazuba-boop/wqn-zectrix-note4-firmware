@@ -448,21 +448,6 @@ void CancelPersistReservation(const PersistTicket& ticket)
     ReleaseKind(ticket.kind);
 }
 
-void EnqueueReservedWordObservation(
-    const PersistTicket& ticket,
-    wqn::DurableWordObservation observation,
-    wqn::PersistedWordSession advanced_session)
-{
-    PersistCommand* command = ReservedCommand(ticket);
-    if (command == nullptr || ticket.kind != PersistKind::kWordObservation) {
-        ESP_LOGE(kTag, "enqueue word: stale/mismatched ticket");
-        return;
-    }
-    command->word_obs = std::move(observation);
-    command->word_advanced = std::move(advanced_session);
-    EnqueueReserved(*command, ticket.slot_index, ticket.kind);
-}
-
 void EnqueueReservedWordObservations(
     const PersistTicket& ticket,
     std::vector<wqn::DurableWordObservation> observations,

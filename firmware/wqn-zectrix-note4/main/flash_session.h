@@ -35,12 +35,7 @@ struct FlashUiState {
 esp_err_t InitFlashSession();
 esp_err_t StartFlashSession();
 esp_err_t StopFlashSession();
-FlashStatus GetFlashStatus();
-bool IsFlashConnected();
 bool CopyFlashStateToUi(FlashUiState* state);
-bool IsFlashTranscribing();
-bool IsFlashSessionActive();
-
 // Periodically called from the UI task; closes the audio amp after the configured
 // idle tail so long pauses between server audio deltas don't leave the speaker
 // enabled (pop/click at the next turn). Safe to call when flash is idle.

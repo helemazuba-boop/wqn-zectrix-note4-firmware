@@ -64,7 +64,6 @@ constexpr gpio_num_t kLed = GPIO_NUM_3;
 constexpr gpio_num_t kChargeDetect = GPIO_NUM_2;
 constexpr gpio_num_t kChargeFull = GPIO_NUM_1;
 
-constexpr gpio_num_t kBatAdc = GPIO_NUM_4;
 constexpr adc_channel_t kBatAdcChannel = ADC_CHANNEL_3;
 constexpr int kBatAdcAtten = ADC_ATTEN_DB_12;
 constexpr int kBatAdcBitwidth = ADC_BITWIDTH_12;

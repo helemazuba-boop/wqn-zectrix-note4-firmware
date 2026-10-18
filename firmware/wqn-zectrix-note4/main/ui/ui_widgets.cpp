@@ -78,23 +78,6 @@ void DrawStatusChip(int x, int y, int width, int height, int radius, const std::
     DrawCenteredText(x, text_y, width, text);
 }
 
-esp_err_t DrawPageFooterHint(const std::string& text)
-{
-    // Footer hint slot: y = kBottomHintY, content margins per ui_layout.h.
-    return DrawClippedText(kMarginX, kBottomHintY, kContentWidth - 4, text);
-}
-
-void DrawChip(int x, int y, int width, int height, const std::string& text)
-{
-    DrawRoundedRect(x, y, width, height, kChipRadius);
-    // Vertical centering: 16px CJK glyph in an `height`-tall chip. Matches the
-    // legacy inline tags (home used y+5 for an 18px chip, settings y+10 for a
-    // 20px chip); the (height-kCjkFontHeight)/2 + cap-height nudge reproduces
-    // both within a pixel.
-    const int text_y = y + (height - kCjkFontHeight) / 2 + 3;
-    DrawCenteredText(x, text_y, width, text);
-}
-
 esp_err_t DrawEmptyState(const std::string& title, const std::string& body, const std::string& hint)
 {
     // Centered rounded container in the content area (below the status bar).

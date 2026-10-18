@@ -60,8 +60,7 @@ enum class WordCompleteSelection : uint8_t {
 enum class WordObservationCommitState : uint8_t {
     kIdle,
     kPersisting,
-    kLocalCommitted,
-    kCloudPending,
+    kCloudPending = 3,
     kCloudAcknowledged,
     kFailed,
     kBuffered,

@@ -44,21 +44,10 @@ int MeasureUtf8TextWidth(const char* text);
 const lv_font_t* PrimaryUiFont();
 void DrawTextWithFont(int x, int y, const lv_font_t* font, const char* text, bool black = true);
 // CPU-only nearest-neighbour sizing of existing 1bpp glyphs; no new font blob.
-void DrawTextWithFontSized(int x, int y, int width, const lv_font_t* font,
-                          const char* text, int size_px, bool bold = false, bool black = true);
 int MeasureTextWithFont(const lv_font_t* font, const char* text);
-void DrawTextWithFontCentered(int x, int y, int width, const lv_font_t* font, const char* text, bool black = true);
 // Nearest-neighbour bitmap scaling is intended for short, static hero labels
 // such as a vocabulary headword. It changes framebuffer composition only; it
 // does not alter the panel refresh policy or waveform.
-void DrawTextWithFontScaledCentered(
-    int x,
-    int y,
-    int width,
-    const lv_font_t* font,
-    const char* text,
-    uint8_t scale,
-    bool black = true);
 std::string TruncateUtf8TextToWidth(const std::string& text, int max_width_px);
 std::vector<std::string> WrapUtf8TextToWidth(const std::string& text, int max_width_px, size_t max_lines);
 

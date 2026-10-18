@@ -788,63 +788,6 @@ esp_err_t LoadProblemPackManifest(WqnProblemPackManifest* manifest)
     return ParseStoredProblemManifest(manifest);
 }
 
-esp_err_t MergeProblemPackManifestDelta(
-    const WqnProblemPackManifest& delta,
-    WqnProblemPackManifest* merged)
-{
-    if (merged == nullptr || delta.cursor > protocol::v3::kMaxSafeJsonInteger) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    WqnProblemPackManifest current;
-    const esp_err_t load_result = LoadProblemPackManifest(&current);
-    if (load_result != ESP_OK && load_result != ESP_ERR_NOT_FOUND) {
-        return load_result;
-    }
-    if (load_result == ESP_ERR_NOT_FOUND) {
-        current = {};
-    }
-    // No monotonic guard on the cursor: it is a set-list offset (the sync
-    // relists from 0 every cycle), not a change feed, so it legitimately moves
-    // backwards between syncs and shrinks when sets are deleted.
-
-    for (const WqnProblemPackManifestSet& change : delta.problem_sets) {
-        auto existing = std::find_if(
-            current.problem_sets.begin(),
-            current.problem_sets.end(),
-            [&](const WqnProblemPackManifestSet& item) {
-                return item.problem_set_id == change.problem_set_id;
-            });
-        if (change.deleted) {
-            if (existing != current.problem_sets.end()) {
-                current.problem_sets.erase(existing);
-            }
-            continue;
-        }
-        if (change.problem_set_id.size() != 36 ||
-            (change.has_pack && change.pack_id.size() != 36)) {
-            return ESP_ERR_INVALID_RESPONSE;
-        }
-        if (existing == current.problem_sets.end()) {
-            current.problem_sets.push_back(change);
-        } else {
-            *existing = change;
-        }
-    }
-    if (current.problem_sets.size() > kMaxStoredSets) {
-        return ESP_ERR_INVALID_SIZE;
-    }
-    std::sort(
-        current.problem_sets.begin(),
-        current.problem_sets.end(),
-        [](const WqnProblemPackManifestSet& left, const WqnProblemPackManifestSet& right) {
-            return left.problem_set_id < right.problem_set_id;
-        });
-    current.cursor = delta.cursor;
-    current.has_more = delta.has_more;
-    *merged = std::move(current);
-    return ESP_OK;
-}
-
 esp_err_t SaveProblemPackManifestRaw(const WqnProblemPackManifest& manifest)
 {
     cJSON* root = cJSON_CreateObject();

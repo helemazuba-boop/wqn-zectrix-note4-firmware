@@ -68,8 +68,6 @@ enum class AiTier : uint8_t {
 };
 
 AiTier NextAiTier(AiTier current);
-const char* AiTierLabel(AiTier tier);
-
 // [shell] Thinking effort level shown as the status-bar lightbulb icon
 // (off/low/med/high = 0..3 rays). Local-only for now (server controls the real
 // thinking level); the status-bar toggle cycles this for display.

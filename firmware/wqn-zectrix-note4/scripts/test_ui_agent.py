@@ -27,8 +27,8 @@ def main():
     input_source = (root/'main/ui/ui_input.cpp').read_text()
     replacements = {
         '@@FONT_LOOKUP@@': section(display, 'const lv_font_fmt_txt_glyph_dsc_t* FindGlyphInFont(', 'int MeasureCodepointWidth('),
-        '@@FONT_DRAW@@': section(display, 'void DrawGlyphFromFont(', 'void DrawGlyphFromFontScaled('),
-        '@@FONT_MEASURE@@': section(display, 'int MeasureTextWithFont(', 'void DrawTextWithFontCentered('),
+        '@@FONT_DRAW@@': section(display, 'void DrawGlyphFromFont(', 'void DrawCjkGlyph('),
+        '@@FONT_MEASURE@@': section(display, 'int MeasureTextWithFont(', 'std::string TruncateUtf8TextToWidth('),
         '@@BAR_CONSTANTS@@': section(page, 'constexpr int kAgentBarY', '#define AGENT_TEXT'),
         '@@DECISIONS@@': section(page, 'AgentOptionMode AgentOptionModeFor(', '// ---------------------------------------------------------------------------\n// Session picker'),
         '@@INPUT@@': section(input_source, 'static RefreshSchedule ExecuteAgentOption(', '// [shell] Status-bar edit mode owns'),

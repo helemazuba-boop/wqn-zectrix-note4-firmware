@@ -6,7 +6,6 @@
 
 namespace wqn {
 
-constexpr uint32_t kWflvMagic = 0x57464C56; // 'W','F','L','V'
 constexpr uint16_t kWflvVersion = 2;
 constexpr size_t kWflvHeaderBytes = 24;
 

@@ -209,16 +209,6 @@ const char* ReviewActionName(ReviewAction action)
     return "";
 }
 
-const char* ProblemStatusName(ProblemStatus status)
-{
-    switch (status) {
-        case ProblemStatus::kWrong: return "wrong";
-        case ProblemStatus::kNeedsReview: return "needs_review";
-        case ProblemStatus::kMastered: return "mastered";
-    }
-    return "";
-}
-
 bool ParseProblemStatus(const std::string& value, ProblemStatus* status)
 {
     if (status == nullptr) return false;

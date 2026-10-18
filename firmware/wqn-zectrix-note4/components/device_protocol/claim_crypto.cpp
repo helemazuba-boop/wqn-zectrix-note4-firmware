@@ -17,7 +17,6 @@
 namespace {
 
 constexpr char kClaimInfoPrefix[] = "wqn-device-claim-v3:";
-constexpr size_t kP256PrivateKeyBytes = 32;
 constexpr size_t kP256PublicKeyBytes = 65;
 constexpr size_t kClaimSaltBytes = 16;
 constexpr size_t kClaimIvBytes = 12;

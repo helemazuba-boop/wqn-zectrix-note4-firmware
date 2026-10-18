@@ -334,12 +334,6 @@ bool IsStorageServiceTask()
     return g_task != nullptr && xTaskGetCurrentTaskHandle() == g_task;
 }
 
-esp_err_t ExecuteStorageTransaction(StorageTransaction transaction, void* context)
-{
-    return ExecuteStorageTransactionInternal(
-        transaction, context, "background", false);
-}
-
 esp_err_t ExecuteStorageTransactionNamed(
     StorageTransaction transaction,
     void* context,

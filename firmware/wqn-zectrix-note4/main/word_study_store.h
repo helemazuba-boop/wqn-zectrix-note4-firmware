@@ -186,8 +186,6 @@ esp_err_t PeekPendingWordObservation(DurableWordObservation* observation);
 // round. They remain durable pending records until the batch ACK succeeds.
 esp_err_t PeekPendingWordObservationExcluding(
     const std::vector<std::string>& request_ids, DurableWordObservation* observation);
-esp_err_t AcknowledgeWordObservation(const std::string& request_id);
-esp_err_t AcknowledgeWordObservations(const std::vector<std::string>& request_ids);
 // Advisory admission for routine maintenance only. StorageService invokes
 // this at each step, including after queue wait. The callback/context remain
 // caller-owned until this synchronous call returns; they must be thread-safe

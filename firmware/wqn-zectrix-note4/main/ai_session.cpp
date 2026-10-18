@@ -1767,18 +1767,6 @@ void SetAiTier(AiTier tier)
     xSemaphoreGive(g_lock);
 }
 
-AiTier GetAiTier()
-{
-    if (g_lock == nullptr) {
-        return AiTier::kStd;
-    }
-    AiTier result = AiTier::kStd;
-    xSemaphoreTake(g_lock, portMAX_DELAY);
-    result = g_state.tier;
-    xSemaphoreGive(g_lock);
-    return result;
-}
-
 // [shell->wire] Toggle setters (mirror SetAiTier): update g_state under lock +
 // MarkChanged so CopyAiSessionToUi flushes the new value to the UI and the
 // request builder (above) reads the up-to-date g_state.thinking_level.
@@ -1918,21 +1906,6 @@ bool CopyAiStreamingStatus(AiStreamingStatusView* view)
     return true;
 }
 
-bool IsAiSessionActive()
-{
-    if (g_lock == nullptr) {
-        return false;
-    }
-    xSemaphoreTake(g_lock, portMAX_DELAY);
-    const bool active =
-        g_prepare_active || g_worker_command != AiWorkerCommand::kNone ||
-        g_streaming_active || g_state.status == AiSessionStatus::kPreparingCapture ||
-        g_state.status == AiSessionStatus::kListening ||
-        g_state.status == AiSessionStatus::kWaitingReply;
-    xSemaphoreGive(g_lock);
-    return active;
-}
-
 // ============================================================================
 // v2 toast + scroll helpers
 // ============================================================================
@@ -1946,37 +1919,6 @@ bool IsAiSessionActive()
 // v2 design contract. The recording state retains a local elapsed counter so
 // the chip can still flash "录音中 00:04" without that counter being part of
 // the canonical pending_text / toast_label string.
-void ShowAiToast(const std::string& label)
-{
-    if (g_lock == nullptr) {
-        return;
-    }
-    xSemaphoreTake(g_lock, portMAX_DELAY);
-    g_state.toast_label = label;
-    g_state.toast_visible = true;
-    g_state.toast_since_ms = esp_timer_get_time() / 1000;
-    if (label.find("录音") != std::string::npos) {
-        g_state.toast_recording_ms = 0;
-    }
-    MarkChanged();
-    xSemaphoreGive(g_lock);
-}
-
-void HideAiToast()
-{
-    if (g_lock == nullptr) {
-        return;
-    }
-    xSemaphoreTake(g_lock, portMAX_DELAY);
-    if (g_state.toast_visible) {
-        g_state.toast_visible = false;
-        g_state.toast_label.clear();
-        g_state.toast_recording_ms = 0;
-        MarkChanged();
-    }
-    xSemaphoreGive(g_lock);
-}
-
 void SetAiRecordingLabel(int32_t elapsed_ms)
 {
     if (g_lock == nullptr) {
@@ -1996,19 +1938,6 @@ void SetAiRecordingLabel(int32_t elapsed_ms)
             g_state.toast_label = buf;
             MarkChanged();
         }
-    }
-    xSemaphoreGive(g_lock);
-}
-
-void ResetAiScroll()
-{
-    if (g_lock == nullptr) {
-        return;
-    }
-    xSemaphoreTake(g_lock, portMAX_DELAY);
-    if (g_state.scroll_offset_lines != 0) {
-        g_state.scroll_offset_lines = 0;
-        MarkChanged();
     }
     xSemaphoreGive(g_lock);
 }
@@ -2067,22 +1996,6 @@ int32_t GetAiScrollOffsetLines()
     return val;
 }
 
-bool IsAiToastVisible()
-{
-    if (g_lock == nullptr) {
-        return false;
-    }
-    xSemaphoreTake(g_lock, portMAX_DELAY);
-    const bool visible = g_state.toast_visible;
-    xSemaphoreGive(g_lock);
-    return visible;
-}
-
-const std::string& CurrentAiToastLabel()
-{
-    return g_state.toast_label;
-}
-
 }  // namespace wqn
 
 #else
@@ -2128,11 +2041,6 @@ void SetAiTier(AiTier tier)
     (void)tier;
 }
 
-AiTier GetAiTier()
-{
-    return AiTier::kStd;
-}
-
 void SetAiThinkingLevel(ThinkingLevel) {}
 void SetAiTtsOn(bool) {}
 void SetAiExpandContent(bool) {}
@@ -2156,19 +2064,9 @@ bool CopyAiStreamingStatus(AiStreamingStatusView* view)
     return false;
 }
 
-void ShowAiToast(const std::string&) {}
-void HideAiToast() {}
 void SetAiRecordingLabel(int32_t) {}
-void ResetAiScroll() {}
 void SetAiScrollOffsetLinesClamped(int32_t, int32_t, int32_t) {}
 void StampScrollNoOpHint() {}
-bool IsAiToastVisible() { return false; }
-const std::string& CurrentAiToastLabel()
-{
-    static const std::string empty;
-    return empty;
-}
-
 }  // namespace wqn
 
 #endif

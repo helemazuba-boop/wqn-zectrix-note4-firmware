@@ -17,11 +17,6 @@ std::time_t CurrentUnixTime()
     return now;
 }
 
-bool SystemClockIsReasonable()
-{
-    return CurrentUnixTime() >= kMinReasonableUnixTime;
-}
-
 void SeedClockFromBuildTimeIfNeeded()
 {
     (void)wqn::power::timekeep::SeedSystemTimeFromBuildTimeIfNeeded();
@@ -134,14 +129,6 @@ void UpdateHomePrimaryTimeLine(wqn::UiState* state)
         return;
     }
     state->home.primary_time_line = ChooseHomePrimaryTimeLine(state->time_app);
-}
-
-bool ShouldRefreshTimeTick(const wqn::UiState& state)
-{
-    if (state.screen != wqn::UiScreen::kHome && state.screen != wqn::UiScreen::kTime) {
-        return false;
-    }
-    return wqn::TimeAppHasActiveTimer(state.time_app);
 }
 
 bool ScreenUsesClockMinute(const wqn::UiState& state)

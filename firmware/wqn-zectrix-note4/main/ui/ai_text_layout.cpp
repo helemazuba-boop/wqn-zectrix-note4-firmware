@@ -34,7 +34,11 @@ struct Entry {
 // immutable and retain their lifetime independently of LRU eviction.
 std::mutex cache_mutex;
 std::vector<Entry> cache;
-AiTextCacheStats stats;
+size_t cached_bytes = 0;
+#ifdef WQN_HOST_TEST
+uint64_t cache_builds = 0;
+uint64_t cache_hits = 0;
+#endif
 
 size_t LayoutBytes(const AiTextLayout& layout, size_t source_bytes)
 {
@@ -110,7 +114,9 @@ std::shared_ptr<const AiTextLayout> GetAiTextLayout(
         if (found != cache.end()) {
             auto result = found->layout;
             std::rotate(found, found + 1, cache.end());
-            ++stats.hits;
+#ifdef WQN_HOST_TEST
+            ++cache_hits;
+#endif
             return result;
         }
     }
@@ -134,25 +140,27 @@ std::shared_ptr<const AiTextLayout> GetAiTextLayout(
     }
     const size_t bytes = LayoutBytes(*next, text.size());
     const std::lock_guard<std::mutex> guard(cache_mutex);
-    ++stats.builds;
+#ifdef WQN_HOST_TEST
+    ++cache_builds;
+#endif
     const auto existing = std::find_if(cache.begin(), cache.end(), match);
     if (existing != cache.end()) return existing->layout;
     if (bytes > kAiTextCacheMaxBytes) return next;
-    while (!cache.empty() && (cache.size() >= kAiTextCacheMaxEntries || stats.bytes + bytes > kAiTextCacheMaxBytes)) {
-        stats.bytes -= cache.front().bytes;
+    while (!cache.empty() && (cache.size() >= kAiTextCacheMaxEntries || cached_bytes + bytes > kAiTextCacheMaxBytes)) {
+        cached_bytes -= cache.front().bytes;
         cache.erase(cache.begin());
     }
     cache.push_back({message_id, text, kind, width, font, max_rows, bytes, next});
-    stats.bytes += bytes;
+    cached_bytes += bytes;
     return next;
 }
 
+#ifdef WQN_HOST_TEST
 AiTextCacheStats GetAiTextCacheStats()
 {
     const std::lock_guard<std::mutex> guard(cache_mutex);
-    auto result = stats;
-    result.entries = cache.size();
-    return result;
+    return {cache.size(), cached_bytes, cache_builds, cache_hits};
 }
+#endif
 
 }  // namespace device_ui_internal

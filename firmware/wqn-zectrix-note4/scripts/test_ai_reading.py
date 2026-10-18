@@ -27,8 +27,8 @@ def main():
     fixture = (root/'scripts/testdata/ai_reading.cpp').read_text()
     replacements = {
         '@@FONT_LOOKUP@@': section(display, 'const lv_font_fmt_txt_glyph_dsc_t* FindGlyphInFont(', 'int MeasureCodepointWidth('),
-        '@@FONT_DRAW@@': section(display, 'void DrawGlyphFromFont(', 'void DrawGlyphFromFontScaled('),
-        '@@FONT_MEASURE@@': section(display, 'int MeasureTextWithFont(', 'void DrawTextWithFontCentered('),
+        '@@FONT_DRAW@@': section(display, 'void DrawGlyphFromFont(', 'void DrawCjkGlyph('),
+        '@@FONT_MEASURE@@': section(display, 'int MeasureTextWithFont(', 'std::string TruncateUtf8TextToWidth('),
         '@@HISTORY_MODEL@@': section((root/'main/ui/ui_internal.h').read_text(), 'struct AiHistoryLayout {', '// Scroll offset that brings'),
         '@@MD_RENDER@@': re.sub(r'^#include[^\n]*\n', '', (root/'main/ui/markdown_render.cpp').read_text(), flags=re.M),
         '@@PAGE@@': section(page, 'std::vector<std::string> WrapForViewport(', 'esp_err_t RenderAiToEpd('),
@@ -55,7 +55,7 @@ def main():
         unit.write_text(fixture)
         binary = folder/'reading'
         sanitizers = ['-fsanitize=address,undefined','-fno-omit-frame-pointer'] if args.sanitize else []
-        subprocess.run(['g++','-std=c++17','-O1','-Wall','-Wextra','-Werror','-pthread',*sanitizers,
+        subprocess.run(['g++','-DWQN_HOST_TEST=1','-std=c++17','-O1','-Wall','-Wextra','-Werror','-pthread',*sanitizers,
                         '-I',str(folder),'-I',str(inc),'-I',str(root/'main'),'-I',str(root/'main/ui'),
                         str(unit),str(root/'main/ui/ai_text_layout.cpp'),str(root/'main/ui/markdown_layout.cpp'),
                         *objects,'-o',str(binary)],check=True,timeout=60)

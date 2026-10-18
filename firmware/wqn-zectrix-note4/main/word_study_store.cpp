@@ -1921,60 +1921,6 @@ esp_err_t PeekObservationTransaction(void* context)
     return PeekObservationExcludingTransaction(&batch);
 }
 
-struct AckContext {
-    const std::string* request_id;
-    bool maintenance_required = false;
-};
-
-esp_err_t AckObservationTransaction(void* opaque)
-{
-    auto* context = static_cast<AckContext*>(opaque);
-    if (context == nullptr || context->request_id == nullptr || context->request_id->empty()) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    context->maintenance_required = false;
-    OutboxScan* scan = nullptr;
-    ESP_RETURN_ON_ERROR(
-        EnsureOutboxCache(&scan), kTag, "load outbox before word ack");
-    const auto pending = std::find_if(
-        scan->pending.begin(), scan->pending.end(),
-        [&](const auto& value) { return *context->request_id == value.request_id; });
-    if (pending == scan->pending.end()) {
-        return std::find_if(
-                   scan->acknowledged.begin(),
-                   scan->acknowledged.end(),
-                   [&](const auto& value) {
-                       return *context->request_id == value.request_id;
-                   }) != scan->acknowledged.end()
-            ? ESP_OK
-            : ESP_ERR_NOT_FOUND;
-    }
-
-    OutboxRecord record = {};
-    wqn::DurableWordObservation ack = ObservationFromRecord(*pending);
-    const OutboxRecord acknowledged = *pending;
-    if (scan->partial_tail || scan->backup_source || CheckOutboxAppendBudget(*scan, false) != ESP_OK) {
-        context->maintenance_required = true;
-        return ESP_ERR_INVALID_SIZE;
-    }
-    ESP_RETURN_ON_ERROR(
-        BuildObservationRecord(ack, OutboxRecordKind::kAck, &record),
-        kTag,
-        "encode word ack");
-    const esp_err_t appended = AppendOutboxRecord(record);
-    if (appended != ESP_OK) {
-        context->maintenance_required = appended == ESP_ERR_INVALID_SIZE;
-        return appended;
-    }
-    scan->acknowledged.push_back(acknowledged);
-    scan->pending.erase(pending);
-    ++scan->ack_records;
-    ++scan->total_records;
-    // Maintenance follows in separate owner transactions, under the caller's
-    // same SleepLease. This ACK is durable before any checkpoint/reclaim work.
-    return ESP_OK;
-}
-
 struct AckBatchContext {
     const std::vector<std::string>* request_ids;
     bool maintenance_required = false;
@@ -2492,12 +2438,6 @@ esp_err_t PeekPendingWordObservation(DurableWordObservation* observation)
         "word-outbox-peek", PeekObservationTransaction, observation);
 }
 
-esp_err_t AcknowledgeWordObservation(const std::string& request_id)
-{
-    AckContext context{&request_id};
-    return ExecuteWithOutboxMaintenance("word-outbox-ack", AckObservationTransaction, &context);
-}
-
 esp_err_t PeekPendingWordObservationExcluding(
     const std::vector<std::string>& request_ids, DurableWordObservation* observation)
 {
@@ -2505,11 +2445,6 @@ esp_err_t PeekPendingWordObservationExcluding(
     *observation = {};
     PeekBatchContext context{&request_ids, observation};
     return ExecuteWithStorageLease("word-outbox-peek-batch", PeekObservationExcludingTransaction, &context);
-}
-
-esp_err_t AcknowledgeWordObservations(const std::vector<std::string>& request_ids)
-{
-    return AcknowledgeWordObservations(request_ids, {});
 }
 
 esp_err_t AcknowledgeWordObservations(

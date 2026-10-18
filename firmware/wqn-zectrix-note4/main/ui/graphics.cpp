@@ -175,15 +175,6 @@ void ClearRect(const UiRect& rect)
     FillRect(x0, y0, x1 - x0, y1 - y0, false);
 }
 
-// [L3-semantics] Named wrappers for FillRect(..., black=true) so the 4 distinct
-// intents of "black fill" are retrievable at call sites. L2 will migrate the
-// existing FillRect(true) callers (selection / progress / role bar / activity
-// dot) to these. See docs/13-ui-design-language.md §13.4.6.
-void DrawSelectedFill(int x, int y, int width, int height) { FillRect(x, y, width, height, true); }  // reverse-fill selection
-void DrawProgressFill(int x, int y, int width, int height) { FillRect(x, y, width, height, true); }  // progress bar fill
-void DrawRoleBar(int x, int y, int width, int height) { FillRect(x, y, width, height, true); }       // role marker bar (AI assistant)
-void DrawActivityDot(int x, int y, int size) { FillRect(x, y, size, size, true); }                    // activity indicator dot
-
 constexpr bool ScheduleAllowsWindowedPartial(RefreshSchedule schedule)
 {
     return schedule == RefreshSchedule::kClock ||

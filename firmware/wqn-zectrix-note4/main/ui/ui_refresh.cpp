@@ -21,9 +21,6 @@
 namespace device_ui_internal {
 
 constexpr char kTag[] = "wqn_ui";
-constexpr int64_t kUiPollDelay = pdMS_TO_TICKS(50);
-constexpr int64_t kUiIdlePollDelay = pdMS_TO_TICKS(500);
-constexpr int64_t kStatusRefreshDelay = pdMS_TO_TICKS(60000);
 
 // ---- Global refresh state (definitions live here) --------------------------
 

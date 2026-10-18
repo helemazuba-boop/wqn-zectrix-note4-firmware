@@ -1412,18 +1412,6 @@ esp_err_t LoadAutoSyncIntervalMinutes(uint32_t* minutes)
     return ESP_OK;
 }
 
-esp_err_t SaveAutoSyncIntervalMinutes(uint32_t minutes)
-{
-    StorageWriteGuard write("save-sync-interval", __FILE__, __LINE__);
-    if (!write) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    if (!IsValidAutoSyncInterval(minutes)) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    return SaveU64ToNvs(kAutoSyncIntervalMinKey, minutes);
-}
-
 esp_err_t SaveAutoSyncIntervalMinutesForeground(uint32_t minutes)
 {
     StorageWriteGuard write("save-sync-interval", __FILE__, __LINE__);
@@ -1620,22 +1608,6 @@ esp_err_t SaveWordSequentialCursor(uint32_t cursor)
         SaveU64Transaction, &context, "word-sequential-cursor");
 }
 
-esp_err_t SaveDefaultWordDeckId(const std::string& deck_id)
-{
-    StorageWriteGuard write("save-word-deck", __FILE__, __LINE__);
-    if (!write) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    if (deck_id.empty()) {
-        // Empty selection = all decks; drop the key entirely.
-        return ClearNvsKey(kDefaultWordDeckKey);
-    }
-    if (deck_id.size() != 36) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    return SaveStringToNvs(kDefaultWordDeckKey, deck_id);
-}
-
 namespace {
 
 // [deck-scope] Recoverable default-deck change (c5). NVS keys:
@@ -1800,7 +1772,6 @@ esp_err_t ChangeDefaultWordDeckForeground(const std::string& deck_id)
 //
 // kDefaultWordDeckKey is deliberately untouched: this path scopes the word page,
 // it does not change what "default deck" means.
-struct WordSessionScopeResetContext {};
 
 esp_err_t WordSessionScopeResetTransaction(void*)
 {
@@ -1959,19 +1930,6 @@ esp_err_t LoadVolumePercent(int* percent)
     // rolled the audible volume back under the user. Boot explicitly seeds the
     // cache via SetPlaybackVolumeCache (main.cpp).
     return ret;
-}
-
-esp_err_t SaveVolumePercent(int percent)
-{
-    StorageWriteGuard write("save-volume", __FILE__, __LINE__);
-    if (!write) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    if (percent < 0 || percent > 100) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    g_volume_percent_cache.store(percent, std::memory_order_relaxed);
-    return services::ExecuteStorageTransactionNamed(SaveVolumeTransaction, &percent, "save-volume");
 }
 
 esp_err_t SaveVolumePercentForeground(int percent)
@@ -2382,20 +2340,6 @@ esp_err_t SetWifiCredentialForRole(
         store.preferred = target;
     }
     store.version = kWifiCredentialStoreVersion;
-    return SaveWifiCredentialStore(store);
-}
-
-esp_err_t MarkWifiSlotPreferred(uint8_t index)
-{
-    WifiCredentialStore store;
-    ESP_RETURN_ON_ERROR(LoadWifiCredentialStore(&store), kTag, "load store for mark preferred");
-    if (index >= store.count) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    if (store.preferred == index) {
-        return ESP_OK;  // unchanged; skip the NVS commit
-    }
-    store.preferred = index;
     return SaveWifiCredentialStore(store);
 }
 

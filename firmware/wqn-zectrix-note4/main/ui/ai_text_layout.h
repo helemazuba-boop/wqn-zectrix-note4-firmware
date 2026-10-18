@@ -29,6 +29,7 @@ std::shared_ptr<const AiTextLayout> GetAiTextLayout(
     uint64_t message_id, const std::string& text, AiTextKind kind, int width,
     const lv_font_t* font, size_t max_rows = kAiTextMaxRows);
 
+#ifdef WQN_HOST_TEST
 struct AiTextCacheStats {
     size_t entries = 0;
     size_t bytes = 0;
@@ -36,5 +37,6 @@ struct AiTextCacheStats {
     uint64_t hits = 0;
 };
 AiTextCacheStats GetAiTextCacheStats();
+#endif
 
 }  // namespace device_ui_internal

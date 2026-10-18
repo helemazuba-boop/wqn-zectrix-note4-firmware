@@ -26,8 +26,7 @@ def main():
     constants = section(service, 'constexpr char kTag[]', '\nStaticQueue_t g_command_queue_storage;')
     storage_paths = '\n'.join(section(storage, start, end) for start, end in (
         ('esp_err_t UpsertWifiCredential(', '\nesp_err_t SetWifiCredentialForRole('),
-        ('esp_err_t SetWifiCredentialForRole(', '\nesp_err_t MarkWifiSlotPreferred('),
-        ('esp_err_t MarkWifiSlotPreferred(', '\nesp_err_t LoadWifiCredentials('),
+        ('esp_err_t SetWifiCredentialForRole(', '\nesp_err_t LoadWifiCredentials('),
     ))
     functions = '\n'.join(section(service, start, end) for start, end in (
         ('bool HasPendingUserConnection()', '// [wifi-redundancy] Publishes'),

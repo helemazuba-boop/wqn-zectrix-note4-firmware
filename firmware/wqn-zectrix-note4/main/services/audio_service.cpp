@@ -41,7 +41,6 @@ constexpr UBaseType_t kCommandQueueDepth = 12;
 constexpr UBaseType_t kReplyQueueDepth = 8;
 constexpr uint32_t kTaskStackBytes = 4096;
 constexpr UBaseType_t kTaskPriority = 7;
-constexpr TickType_t kCallTimeout = pdMS_TO_TICKS(5000);
 constexpr int64_t kCallTimeoutUs = 5 * 1000 * 1000;
 constexpr int64_t kEmergencyForceCallBudgetUs = 500 * 1000;
 constexpr size_t kMaxCodecHandles = 2;
