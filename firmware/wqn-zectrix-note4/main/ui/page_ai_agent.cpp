@@ -25,6 +25,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <ctime>
 #include <string>
 #include <vector>
 
@@ -34,6 +35,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "opencode_session.h"
+#include "ai_native_text.h"
 #include "ui/assets/font_wqn_inline_12_1.h"
 #include "ui/assets/font_wqn_ui_16_1.h"
 
@@ -78,12 +80,6 @@ constexpr int kAgentIndicatorColumn = 44;
 // Gap between the pending bubble's bottom edge and the option bar.
 constexpr int kAgentBubbleGap = 6;
 constexpr int kAgentBubbleMaxLines = 3;
-
-// Session picker geometry (relocated from the retired standalone page).
-constexpr int kAgentPickerTitleY = 34;
-constexpr int kAgentPickerListY = 60;
-constexpr int kAgentPickerRowStep = 28;
-constexpr int kAgentPickerMaxRows = 7;
 
 #define AGENT_TEXT(...) do { (void)wqn::DrawUtf8Text(__VA_ARGS__); } while (0)
 
@@ -287,97 +283,68 @@ static void DrawAgentPendingBubble(const std::string& text, const char* title)
 // Session picker
 // ---------------------------------------------------------------------------
 
+static std::string AgentSessionMetadata(const wqn::AgentSessionOption& session)
+{
+    std::string result;
+    // Gateway timestamps are Unix milliseconds. Use an absolute Beijing time:
+    // it stays correct even before the device's own clock has been synchronized.
+    if (session.updated_at >= 1704067200000LL && session.updated_at < 4102444800000LL) {
+        const std::time_t stamp = static_cast<std::time_t>(session.updated_at / 1000 + 8 * 3600);
+        std::tm local = {};
+        if (gmtime_r(&stamp, &local)) {
+            char date[24] = {};
+            if (std::strftime(date, sizeof(date), "%m-%d %H:%M", &local)) result = date;
+        }
+    }
+    if (!result.empty()) result += " / ";
+    switch (session.outcome) {
+        case wqn::OpenCodeSessionOutcome::kRunning: result += "进行中"; break;
+        case wqn::OpenCodeSessionOutcome::kSucceeded: result += "已完成"; break;
+        case wqn::OpenCodeSessionOutcome::kInterrupted: result += "已中断"; break;
+        case wqn::OpenCodeSessionOutcome::kFailed: result += "已失败"; break;
+        default: result += "状态未知"; break;
+    }
+    return result;
+}
+
 static void DrawAgentSessionPicker(const wqn::AgentSessionState& agent)
 {
-    AGENT_TEXT(12, kAgentPickerTitleY, "选任务", true);
-    DrawHorizontalLine(8, 52, 384);
+    const int left = kAgentPickerLeft;
+    const int width = kAgentPickerWidth;
+    AiNativeText(left, kAgentPickerKickerY, width, "OPENCODE / TASKS", 12);
+    AiNativeText(left, kAgentPickerTitleY, width, "选择任务", 24);
+    DrawHorizontalLine(left, kAgentPickerDividerY, width);
     if (agent.sessions.empty()) {
-        const std::string empty = agent.ui.activity_text.empty()
-            ? "暂无任务"
-            : agent.ui.activity_text;
-        AGENT_TEXT(12, 82, AgentOneLine(empty, 360).c_str(), true);
+        AiNativeText(left, kAgentPickerListY + 16, width,
+            agent.ui.activity_text.empty() ? "暂无任务" : agent.ui.activity_text);
         return;
     }
     const size_t selected = std::min(agent.selected_session, agent.sessions.size() - 1);
-    // Window the list so the focused row stays visible without scrolling the
-    // whole set; the retired standalone page used the same 4-row look-behind.
-    const size_t start = selected > 3 ? selected - 3 : 0;
-    const size_t end = std::min(agent.sessions.size(),
-                                start + static_cast<size_t>(kAgentPickerMaxRows));
-    int y = kAgentPickerListY;
+    const size_t start = wqn::ClampAgentPickerWindow(
+        agent.session_window_start, selected, agent.sessions.size());
+    const size_t end = std::min(agent.sessions.size(), start + wqn::kAgentPickerVisibleRows);
+    const std::string position = std::to_string(selected + 1) + "/" + std::to_string(agent.sessions.size());
+    const int position_w = wqn::MeasureTextWithFont(AiNativeFont(12), position.c_str());
+    AiNativeText(left + width - position_w, kAgentPickerKickerY, position_w, position, 12);
     for (size_t index = start; index < end; ++index) {
+        const int y = kAgentPickerListY + static_cast<int>(index - start) * kAgentPickerRowStep;
         const bool focused = index == selected;
-        if (focused) {
-            FillRoundedRect(8, y - 3, 384, 25, 5);
+        if (focused) FillRect(left, y, width, kAgentPickerRowStep - 1, true);
+        DrawHorizontalLine(left, y + kAgentPickerRowStep - 1, width);
+        char number[24] = {};
+        std::snprintf(number, sizeof(number), "%02u", static_cast<unsigned>(index + 1));
+        AiNativeText(left + 7, y + 14, 27, number, 12, !focused);
+        const auto& session = agent.sessions[index];
+        const int text_x = left + 38;
+        const int text_w = width - 61;
+        AiNativeText(text_x, y + 4, text_w,
+            session.title.empty() ? session.id : session.title, 16, !focused);
+        AiNativeText(text_x, y + 25, text_w, AgentSessionMetadata(session), 12, !focused);
+        const int arrow_x = left + width - 13;
+        for (int step = 0; step < 5; ++step) {
+            FillRect(arrow_x + step, y + 16 + step, 1, 1, !focused);
+            FillRect(arrow_x + step, y + 24 - step, 1, 1, !focused);
         }
-        // [D-which] The running marker. Item B1 of doc/1005 §0.1 makes attaching
-        // the default, so the picker is no longer where the user goes to start
-        // watching -- it is where they decide which session to look at. Before
-        // this marker, a session with a run in flight was indistinguishable
-        // from one that had never been prompted: the only way to find out was
-        // to lock it and watch nothing happen, and with the picker clearing the
-        // current session, doing that to the wrong row cost a detach.
-        //
-        // Only kRunning gets a marker. `outcome` also carries settled values
-        // (succeeded / interrupted / failed / unknown), and marking those would
-        // make the list say "this one ran" about rows that ran days ago -- a
-        // list where most rows are marked is a list the user learns to ignore.
-        // An absent or unrecognised value is kUnknown, which is no marker; that
-        // direction is the same fail-safe the lease criterion in
-        // opencode_session.cpp uses, and it is why a typo in that table costs a
-        // missing glyph rather than a device that never sleeps.
-        const bool running = agent.sessions[index].outcome ==
-                            wqn::OpenCodeSessionOutcome::kRunning;
-        // [D-which] Marker geometry, measured rather than assumed. The block is
-        // the cloud's own "in flight" icon plus the label, right-aligned against
-        // the panel edge; the title budget is then whatever room is actually
-        // left, so the two can never collide whichever way the title wraps.
-        //
-        // Two things were wrong with the literal that was here:
-        //
-        //   1. The glyph was the character "◆" (U+25C6), which this font does
-        //      not contain. SourceHanSansSC_Regular_slim covers ASCII, a
-        //      ~70-codepoint punctuation/math/arrow set, and GB2312 -- U+25C6
-        //      is in none of them (nor are the obvious substitutes: no U+25CF,
-        //      U+26A1, U+2605). MeasureGlyphWidthInFont returns 0 on a miss and
-        //      DrawGlyphFromFont skips it, so the marker drew as whitespace and
-        //      the label alone carried the meaning -- which is why nobody saw
-        //      the second problem until the glyph was made visible.
-        //   2. The offset was the literal 16 + 6 * 16 + 8 = 120 px: a fixed
-        //      column on a 400 px panel, not a right edge. The title was
-        //      truncated to 300 px at x=16, so it can reach x=316 -- past it. Any
-        //      title longer than ~104 px overlapped the (invisible) glyph.
-        //
-        // m02_ai_tool_running is the icon the tool blocks already use for a
-        // running tool, so the picker says "in flight" with the same mark the
-        // transcript does.
-        static const char kRunningLabel[] = "进行中";
-        const int label_w = wqn::MeasureUtf8TextWidth(kRunningLabel);
-        constexpr int kMarkerIconW = 12;      // m02_ai_tool_running_12
-        constexpr int kMarkerGap = 4;         // icon -> label
-        constexpr int kMarkerRightPad = 8;
-        constexpr int kMarkerTitleGap = 8;
-        const int marker_x = wqn::kEpdWidth - kMarkerRightPad - kMarkerIconW -
-                             kMarkerGap - label_w;
-        const int title_max_w = marker_x - 16 - kMarkerTitleGap;
-        const std::string title = AgentOneLine(
-            agent.sessions[index].title.empty() ? agent.sessions[index].id
-                                                : agent.sessions[index].title,
-            running ? title_max_w : 360);
-        AGENT_TEXT(16, y, title.c_str(), !focused);
-        if (running) {
-            // 12 px icon centred in the 16 px line box.
-            //
-            // `!focused`, like the title and the label beside it. The focused row
-            // is an INK reverse-fill (FillRoundedRect above is the [rowfill] style
-            // -- see graphics.cpp:132), so every element on that row has to be
-            // painted in paper colour. Hardcoding black here drew a black icon
-            // inside a black filled row: on the one row the user is looking at,
-            // the marker said nothing.
-            DrawWqnBitmapAsset(marker_x, y + 2, m02_ai_tool_running_12_asset, !focused);
-            AGENT_TEXT(marker_x + kMarkerIconW + kMarkerGap, y, kRunningLabel, !focused);
-        }
-        y += kAgentPickerRowStep;
     }
 }
 
@@ -437,29 +404,17 @@ static void DrawAgentStatusBar(const wqn::AgentSessionState& agent,
     DrawSelectableIcon(kAiToggleX + 4 * kAiToggleStep, kAiToggleY,
                        a12_ai_clear_context_16_asset, selected(5), 0);
 
-    // Centre column: which session is live. This is the one piece of context
-    // the Agent tier cannot do without -- the same prompt means something
-    // different in a different session. The clamp keeps the title clear of the
-    // five-icon cluster, which still ends at x=118: STD/Pro dropped to four
-    // icons when the follow toggle moved to the settings page, this tier did
-    // not (slot 4 became the detail control).
-    if (!agent.current_session_title.empty()) {
-        const std::string title = AgentOneLine(agent.current_session_title, 150);
-        const int w = wqn::MeasureUtf8TextWidth(title.c_str());
-        const int cx = std::max(122, (wqn::kEpdWidth - w) / 2);
-        AGENT_TEXT(cx, 6, title.c_str(), true);
-    }
-
-    // Right: phase label (status_label overrides the generic phase text).
-    const std::string status = agent.ui.status_label.empty()
+    // Reserve the right-hand status first. The title only uses the remaining
+    // pixels, so a long phase/notice cannot paint over the session identity.
+    const std::string status = AiNativeClip(agent.ui.status_label.empty()
         ? std::string(wqn::AiFeaturePhaseLabel(agent.ui.phase))
-        : agent.ui.status_label;
-    if (!status.empty()) {
-        const std::string line = AgentOneLine(status, 130);
-        const int w = wqn::MeasureUtf8TextWidth(line.c_str());
-        const int x = std::max(0, wqn::kEpdWidth - w - 26);
-        AGENT_TEXT(x, 6, line.c_str(), true);
-    }
+        : agent.ui.status_label, 104, AiNativeFont());
+    const int status_w = wqn::MeasureTextWithFont(AiNativeFont(), status.c_str());
+    const int status_x = wqn::kEpdWidth - 26 - status_w;
+    AiNativeText(status_x, kStatusBarTitleY, status_w, status);
+    constexpr int title_x = 122;
+    AiNativeText(title_x, kStatusBarTitleY, status_x - title_x - 8,
+                 agent.current_session_title, 12);
 
     DrawWifiStatusIcon(wqn::kEpdWidth - 6, 6, home);
 }

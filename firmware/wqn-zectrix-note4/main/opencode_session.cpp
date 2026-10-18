@@ -802,6 +802,9 @@ void LoadSessions()
                     }
                 }
             }
+            g_state.selected_session = std::min(g_state.selected_session, g_state.sessions.size() - 1);
+            g_state.session_window_start = wqn::ClampAgentPickerWindow(
+                g_state.session_window_start, g_state.selected_session, g_state.sessions.size());
             g_state.session_locked = false;
             g_state.current_session_id.clear();
             g_state.current_session_title.clear();
@@ -2517,6 +2520,8 @@ esp_err_t MoveOpenCodeSessionSelection(int direction)
     const int count = static_cast<int>(g_state.sessions.size());
     const int current = static_cast<int>(g_state.selected_session);
     g_state.selected_session = static_cast<size_t>((current + direction + count) % count);
+    g_state.session_window_start = wqn::ClampAgentPickerWindow(
+        g_state.session_window_start, g_state.selected_session, g_state.sessions.size());
     MarkChangedLocked();
     xSemaphoreGive(g_lock);
     return ESP_OK;

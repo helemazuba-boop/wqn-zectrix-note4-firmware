@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "ai_feature.h"
+#include "agent_picker_model.h"
 #include "opencode_client.h"
 
 namespace wqn {
@@ -45,6 +46,7 @@ struct AgentSessionState {
     AiFeatureUiState ui;
     std::vector<AgentSessionOption> sessions;
     size_t selected_session = 0;
+    size_t session_window_start = 0;
     std::string current_session_id;
     std::string current_session_title;
     std::string pending_permission_id;

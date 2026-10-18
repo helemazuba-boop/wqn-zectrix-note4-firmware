@@ -112,6 +112,15 @@ constexpr int kProvisionStateRowBaseline = 190;
 constexpr int kProvisionStateRowPitch = 32;
 constexpr int kProvisionStateNoteBaseline = 258;
 
+// Agent picker follows the approved Editorial reference, with four real rows.
+constexpr int kAgentPickerLeft = 13;
+constexpr int kAgentPickerWidth = kScreenWidth - 2 * kAgentPickerLeft;
+constexpr int kAgentPickerKickerY = 38;
+constexpr int kAgentPickerTitleY = 53;
+constexpr int kAgentPickerDividerY = 90;
+constexpr int kAgentPickerListY = 96;
+constexpr int kAgentPickerRowStep = 46;
+
 // ---- Global page navigation ----
 constexpr int kNavigationX = 8;
 constexpr int kNavigationY = 214;
