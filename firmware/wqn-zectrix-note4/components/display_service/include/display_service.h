@@ -37,7 +37,7 @@ void BlitEpdFramebuffer(const uint8_t* bitmap, size_t size);
 esp_err_t DrawUtf8Text(int x, int y, const char* text, bool black = true);
 int MeasureUtf8TextWidth(const char* text);
 
-// Draw / measure text with an arbitrary LVGL-format font (e.g. font_zectrix_48_1).
+// Draw / measure text with an arbitrary LVGL-format font.
 // Iterates UTF-8 codepoints; missing glyphs are skipped (zero width, nothing drawn).
 // PrimaryUiFont exposes the firmware's 16 px text face so a page can opt into
 // real Latin glyphs instead of the compact 5x7 body-text fallback.

@@ -3,7 +3,6 @@ idf_component_register(
         "display_service.cpp"
         "fonts/SourceHanSansSC_Regular_slim.c"
         "fonts/font_zectrix_16_1.c"
-        "fonts/font_zectrix_48_1.c"
     INCLUDE_DIRS "include" "private_include"
     REQUIRES
         driver

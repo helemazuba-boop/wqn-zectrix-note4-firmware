@@ -51,9 +51,8 @@ extern "C" {
 #define FONT_ZECTRIX_ICON_9 "\xee\xa4\x9d"             // icon-9 (e91d)
 
 
-// Font objects exported by font_zectrix_16_1.c / font_zectrix_48_1.c.
+// Icon font exported by font_zectrix_16_1.c.
 extern const lv_font_t font_zectrix_16_1;
-extern const lv_font_t font_zectrix_48_1;
 
 #ifdef __cplusplus
 }
