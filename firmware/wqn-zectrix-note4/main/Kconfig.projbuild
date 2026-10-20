@@ -1,5 +1,73 @@
 menu "WQN firmware"
 
+    config WQN_MEMORY_DIAGNOSTICS
+        bool "Enable bounded RAM diagnostics"
+        default y
+        help
+            Log internal byte-addressable, internal DMA and PSRAM heap samples
+            periodically and at WiFi/cloud/AI/audio worker boundaries. Failed
+            allocations are captured without logging or allocating in the hook.
+            A low-priority worker drains bounded rings; overwrites are counted.
+            Its 4 KiB stack uses PSRAM when external task stacks are allowed.
+
+    config WQN_MEMORY_SAMPLE_SECONDS
+        int "RAM sample interval in seconds"
+        depends on WQN_MEMORY_DIAGNOSTICS
+        default 30
+        range 5 3600
+
+    config WQN_MEMORY_TRACE_ENABLE
+        bool "Run one short standalone heap trace per boot"
+        depends on WQN_MEMORY_DIAGNOSTICS && HEAP_TRACING_STANDALONE
+        default n
+        help
+            Diagnostic builds only: start a single HEAP_TRACE_LEAKS window after
+            the configured boot delay, then stop automatically and gradually
+            log remaining allocations with caller addresses. Live allocations
+            are not proof of a leak. Buffer overflow is reported explicitly.
+            Enable standalone tracing under Component config / Heap memory
+            debugging first. Normal builds keep heap tracing disabled.
+
+    config WQN_MEMORY_HISTORY_ENABLE
+        bool "Keep RAM diagnostic history in PSRAM for offline tests"
+        depends on WQN_MEMORY_DIAGNOSTICS && SPIRAM && WQN_DEV_MENU_ENABLE
+        default y
+        help
+            Keep one snapshot per minute, 128 recent operation/event snapshots,
+            and 32 recent allocation failures in a fixed PSRAM allocation.
+            Open Developer / Build and runtime info after attaching the no-reset
+            USB monitor to export the retained history. Export is asynchronous
+            and does not erase history. No Flash writes are performed.
+            All history is lost on restart, power loss, or deep sleep.
+
+    config WQN_MEMORY_HISTORY_HOURS
+        int "RAM history retention capacity in hours"
+        depends on WQN_MEMORY_HISTORY_ENABLE
+        default 24
+        range 1 48
+        help
+            Capacity at the default one-minute history interval. With the
+            default 30-second live sampling, 24 hours uses about 112 KiB PSRAM.
+            A live sample interval above 60 seconds reduces history resolution.
+
+    config WQN_MEMORY_TRACE_DELAY_SECONDS
+        int "Heap trace start delay since boot in seconds"
+        depends on WQN_MEMORY_TRACE_ENABLE
+        default 60
+        range 0 86400
+
+    config WQN_MEMORY_TRACE_SECONDS
+        int "Heap trace window in seconds"
+        depends on WQN_MEMORY_TRACE_ENABLE
+        default 5
+        range 1 30
+
+    config WQN_MEMORY_TRACE_RECORDS
+        int "Maximum heap trace records (internal RAM)"
+        depends on WQN_MEMORY_TRACE_ENABLE
+        default 128
+        range 16 256
+
     config WQN_WIFI_STA_ENABLE
         bool "Enable WQN WiFi station"
         default n

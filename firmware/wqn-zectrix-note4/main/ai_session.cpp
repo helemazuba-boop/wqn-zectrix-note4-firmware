@@ -24,6 +24,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "psram_task_stack.h"
+#include "runtime/memory_diagnostics.h"
 #include "runtime/sleep_coordinator.h"
 #include "services/connectivity_service.h"
 #include "stdpro_ws_transport.h"
@@ -1543,6 +1544,8 @@ void AiSessionWorkerTask(void*)
         const AiWorkerCommand command = g_worker_command;
         const uint32_t generation = g_prepare_command_generation;
         xSemaphoreGive(g_lock);
+        const wqn::runtime::MemoryDiagnosticScope memory_scope(
+            wqn::runtime::MemoryStage::kAiBegin, wqn::runtime::MemoryStage::kAiEnd);
         switch (command) {
             case AiWorkerCommand::kPrepareRecording:
                 PrepareRecordingSession(generation);

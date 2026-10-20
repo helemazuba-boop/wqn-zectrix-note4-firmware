@@ -10,6 +10,7 @@
 #include <atomic>
 
 #include "esp_log.h"
+#include "runtime/memory_diagnostics.h"
 #include "esp_timer.h"
 #include "services/connectivity_service.h"
 
@@ -119,6 +120,13 @@ void CloudLaneTask(void* arg)
             continue;
         }
         const CloudLane lane = LaneForJob(job);
+        const wqn::runtime::MemoryDiagnosticScope memory_scope(
+            lane == CloudLane::kInteractive
+                ? wqn::runtime::MemoryStage::kCloudInteractiveBegin
+                : wqn::runtime::MemoryStage::kCloudBulkBegin,
+            lane == CloudLane::kInteractive
+                ? wqn::runtime::MemoryStage::kCloudInteractiveEnd
+                : wqn::runtime::MemoryStage::kCloudBulkEnd);
         wqn::services::ConnectivityDemand connectivity_demand =
             wqn::services::AcquireConnectivityDemand(
                 lane == CloudLane::kInteractive

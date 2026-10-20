@@ -17,6 +17,7 @@
 #include "power_manager.h"
 #include "provision_manager.h"
 #include "runtime/sleep_diagnostics.h"
+#include "runtime/memory_diagnostics.h"
 #include "word_pack.h"
 #include "services/connectivity_service.h"
 #include "services/sync_service.h"
@@ -570,6 +571,7 @@ static RefreshSchedule ReduceSettingsButtonEvent(const wqn::ButtonEvent& event, 
         }
         switch (state->settings.dev_selected) {
             case wqn::kDevRowDevInfo:
+                wqn::runtime::RequestMemoryDiagnosticsDump();
                 OpenSettingsDialog(state, wqn::SettingsDialog::kDevInfo);
                 return RefreshSchedule::kConfig;
             case wqn::kDevRowDevSync:

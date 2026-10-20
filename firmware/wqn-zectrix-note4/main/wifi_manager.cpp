@@ -7,6 +7,7 @@
 #include "esp_check.h"
 #include "esp_event.h"
 #include "esp_log.h"
+#include "runtime/memory_diagnostics.h"
 #include "esp_netif.h"
 #include "esp_netif_sntp.h"
 #include "esp_timer.h"
@@ -80,6 +81,8 @@ void NoteWifiRadioOff()
 const char* DisconnectReasonName(uint8_t reason)
 {
     switch (reason) {
+        case WIFI_REASON_ASSOC_EXPIRE:
+            return "ASSOC_EXPIRE";
         case WIFI_REASON_AUTH_EXPIRE:
             return "AUTH_EXPIRE";
         case WIFI_REASON_AUTH_FAIL:
@@ -211,6 +214,7 @@ void WifiEventHandler(void*, esp_event_base_t event_base, int32_t event_id, void
             event ? event->reason : -1,
             event ? DisconnectReasonName(event->reason) : "NO_EVENT",
             event ? event->rssi : 0);
+        wqn::runtime::RecordMemorySnapshot(wqn::runtime::MemoryStage::kWifiDisconnected);
         const bool reconfigure_disconnect =
             g_reconfigure_disconnect_pending.exchange(false, std::memory_order_acq_rel);
         if (reconfigure_disconnect && event != nullptr &&
@@ -248,6 +252,7 @@ void WifiEventHandler(void*, esp_event_base_t event_base, int32_t event_id, void
             IP2STR(&event->ip_info.ip),
             IP2STR(&event->ip_info.netmask),
             IP2STR(&event->ip_info.gw));
+        wqn::runtime::RecordMemorySnapshot(wqn::runtime::MemoryStage::kWifiGotIp);
         g_wifi_connected.store(true, std::memory_order_release);
         if (g_wifi_event_group != nullptr) {
             xEventGroupSetBits(g_wifi_event_group, kWifiConnectedBit);
@@ -433,6 +438,7 @@ esp_err_t ConnectWifiStationNow()
     if (g_wifi_associated.load(std::memory_order_acquire)) {
         return ESP_OK;
     }
+    wqn::runtime::RecordMemorySnapshot(wqn::runtime::MemoryStage::kWifiConnect);
     const esp_err_t result = esp_wifi_connect();
     return result == ESP_ERR_WIFI_CONN ? ESP_OK : result;
 #else

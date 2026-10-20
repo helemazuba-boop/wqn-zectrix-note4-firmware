@@ -20,6 +20,7 @@
 #include "freertos/task.h"
 #include "opencode_client.h"
 #include "psram_task_stack.h"
+#include "runtime/memory_diagnostics.h"
 #include "runtime/sleep_coordinator.h"
 #include "services/connectivity_service.h"
 #include "storage.h"
@@ -2342,6 +2343,8 @@ void WorkerTask(void*)
         xSemaphoreTake(g_lock, portMAX_DELAY);
         const WorkerCommand command = g_command;
         xSemaphoreGive(g_lock);
+        const wqn::runtime::MemoryDiagnosticScope memory_scope(
+            wqn::runtime::MemoryStage::kAgentBegin, wqn::runtime::MemoryStage::kAgentEnd);
         switch (command) {
             case WorkerCommand::kLoadSessions:
                 LoadSessions();

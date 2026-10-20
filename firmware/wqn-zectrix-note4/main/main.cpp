@@ -23,6 +23,7 @@
 #include "power/wake_controller.h"
 #include "runtime/sleep_coordinator.h"
 #include "runtime/storage_schema.h"
+#include "runtime/memory_diagnostics.h"
 #include "runtime/wake_context.h"
 #include "sdkconfig.h"
 #include "services/audio_service.h"
@@ -118,6 +119,7 @@ extern "C" void app_main(void)
     wqn::power::timekeep::SeedSystemTimeFromBuildTimeIfNeeded();
     wqn::LogWakeupCause();
     wqn::PrintBootDiagnostics();
+    wqn::runtime::InitMemoryDiagnostics();
 
     // The M3 deep-sleep HIL gate passed. Active SleepLeases hold a shared
     // ESP_PM_NO_LIGHT_SLEEP lock; GPIO17 sleep-mode selection is disabled by

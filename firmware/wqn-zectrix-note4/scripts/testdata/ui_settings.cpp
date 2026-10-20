@@ -108,7 +108,11 @@ void RequestSyncNow() { ++syncs; }
 void SetConnectivityProvisioning() { ++provisions; }
 void NotifyAutoSyncIntervalChanged(uint32_t) {}
 }
-namespace runtime { void RequestSleepDiagnosticsDump() {} }
+namespace runtime {
+int memory_dump_requests=0;
+void RequestSleepDiagnosticsDump() {}
+void RequestMemoryDiagnosticsDump() { ++memory_dump_requests; }
+}
 void DrawEpdPixel(int x,int y,bool ink) { if(x>=0&&x<400&&y>=0&&y<300) pixels[y*400+x]=ink; }
 void ClearEpdFramebuffer(bool white) { pixels.fill(!white); drawn.clear(); }
 extern "C" const lv_font_t SourceHanSansSC_Regular_slim;
@@ -319,6 +323,18 @@ int main(int argc,char** argv) {
     CHECK(SettingsSignature(f)!=provision_signature);
 
     UiRuntime runtime;auto& state=runtime.state_;auto& s=state.settings;
+#if CONFIG_WQN_DEV_MENU_ENABLE
+    s.view=wqn::SettingsView::kDev;s.dev_selected=wqn::kDevRowDevInfo;
+    const int dump_requests=wqn::runtime::memory_dump_requests;
+    event(state,Button::kConfirm,Event::kShortPress);
+    CHECK(s.dialog==Dialog::kDevInfo&&wqn::runtime::memory_dump_requests==dump_requests+1);
+    event(state,Button::kUp,Event::kShortPress);
+    event(state,Button::kConfirm,Event::kShortPress);
+    CHECK(s.dialog==Dialog::kNone&&wqn::runtime::memory_dump_requests==dump_requests+1);
+    event(state,Button::kConfirm,Event::kShortPress);
+    CHECK(wqn::runtime::memory_dump_requests==dump_requests+2);
+    state=wqn::UiState{};
+#endif
     state.settings.selected=wqn::kSettingsRowAbout;event(state,Button::kConfirm,Event::kShortPress);CHECK(s.dialog==Dialog::kAbout);event(state,Button::kConfirm,Event::kShortPress);CHECK(s.dialog==Dialog::kNone);
     s.selected=wqn::kSettingsRowBattery;event(state,Button::kConfirm,Event::kShortPress);CHECK(s.dialog==Dialog::kBatterySummary);event(state,Button::kConfirm,Event::kLongPress);CHECK(s.dialog==Dialog::kNone);
     s.selected=0;event(state,Button::kUp,Event::kShortPress);CHECK(s.selected==wqn::kSettingsItemCount-1);event(state,Button::kDownPower,Event::kShortPress);event(state,Button::kDownPower,Event::kDoublePress);CHECK(s.selected==1);

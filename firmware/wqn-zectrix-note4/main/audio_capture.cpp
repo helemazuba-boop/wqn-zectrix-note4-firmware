@@ -10,6 +10,7 @@
 #include "esp_check.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "runtime/memory_diagnostics.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -591,6 +592,8 @@ void CaptureTask(void*)
         // statically-stored stack/TCB are reused with no teardown race and no
         // heap churn between turns.
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        const wqn::runtime::MemoryDiagnosticScope memory_scope(
+            wqn::runtime::MemoryStage::kAudioBegin, wqn::runtime::MemoryStage::kAudioEnd);
         CaptureSession();
     }
 }
