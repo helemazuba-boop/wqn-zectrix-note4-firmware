@@ -1604,13 +1604,8 @@ wqn::AiStreamingStatusView streaming_view{};
         device_ui_internal::QueueNotePackSync();
         device_ui_internal::QueueProblemPackSync();
 
-        // [epd-owner] Idle power-off / heavy-partial cleanup is the EPD refresh
-        // task's job now (it is the sole panel owner). The UI task only asks;
-        // the EPD task runs it from its idle wait after re-checking no frame is
-        // pending and no activity happened since. This removes the UI task's
-        // direct SPI/BUSY call and its scoped-TWDT workaround, and the ~1-3 s
-        // cleanup full refresh no longer blocks the UI task.
-        device_ui_internal::RequestEpdIdleMaintenance();
+        // EPD idle deadlines are owned by the display task. The UI may wait
+        // until its next real event/minute without starving rail maintenance.
 
         g_rtc_screen_val = static_cast<int>(state.screen);
         wqn::SetDeepSleepUiPolicy(DeepSleepPolicyForUiState(state));
@@ -1786,12 +1781,8 @@ esp_err_t ShowStorageRecoveryUi(esp_err_t storage_error)
         return result.error == ESP_OK ? ESP_FAIL : result.error;
     }
 
-    // Give the panel controller its configured cooling interval, then ask the
-    // EPD task (still running) to power the rail down through the same idle
-    // maintenance command as the normal UI, before entering the inert recovery
-    // loop in app_main.
-    vTaskDelay(pdMS_TO_TICKS(CONFIG_WQN_EPD_IDLE_POWER_OFF_MS + 100));
-    device_ui_internal::RequestEpdIdleMaintenance();
+    // The EPD owner continues running its configured idle deadline even when
+    // app_main enters the inert recovery loop and no normal UI task starts.
     return ESP_OK;
 #else
     ESP_LOGE(kTag, "storage recovery UI unavailable because EPD UI is disabled");

@@ -2247,18 +2247,30 @@ static void RunIdleEpdCleanupIfNeeded(int64_t now_ms, int64_t last_activity_ms)
     }
 }
 
-bool IsEpdIdleCleanupDue()
+int64_t EpdIdleMaintenanceDelayMs()
 {
-    const int cleanup_ms = CONFIG_WQN_EPD_IDLE_CLEANUP_MS;
-    if (cleanup_ms <= 0 || !IdleCleanupPending()) {
-        return false;  // legacy mode: the cleanup rides the power-off point
-    }
     const int64_t last_activity_ms =
         g_last_epd_activity_ms.load(std::memory_order_relaxed);
-    if (last_activity_ms == 0) {
-        return false;
+    if (last_activity_ms == 0) return -1;
+    const int off_ms = CONFIG_WQN_EPD_IDLE_POWER_OFF_MS;
+    const int cleanup_ms = CONFIG_WQN_EPD_IDLE_CLEANUP_MS;
+    int64_t deadline_ms = -1;
+    if (off_ms > 0 && g_epd_rail_powered &&
+        !g_epd_idle_cut.load(std::memory_order_relaxed)) {
+        deadline_ms = last_activity_ms + off_ms;
     }
-    return (esp_timer_get_time() / 1000 - last_activity_ms) >= cleanup_ms;
+    if (IdleCleanupPending()) {
+        // Legacy cleanup=0 rides the configured rail-cut deadline, including
+        // a retry after the rail was cut but its preceding cleanup failed.
+        const int delay_ms = cleanup_ms > 0 ? cleanup_ms : off_ms;
+        if (delay_ms > 0) {
+            const int64_t cleanup_deadline = last_activity_ms + delay_ms;
+            deadline_ms = deadline_ms < 0 ? cleanup_deadline
+                : std::min(deadline_ms, cleanup_deadline);
+        }
+    }
+    return deadline_ms < 0 ? -1
+        : std::max<int64_t>(0, deadline_ms - esp_timer_get_time() / 1000);
 }
 
 } // namespace wqn
@@ -2299,29 +2311,14 @@ uint32_t wqn::GetEpdActivityGeneration()
     return g_epd_activity_generation.load(std::memory_order_acquire);
 }
 
-bool wqn::IsEpdIdleMaintenanceDue()
-{
-    const int idle_ms = CONFIG_WQN_EPD_IDLE_POWER_OFF_MS;
-    const int64_t last_activity_ms =
-        g_last_epd_activity_ms.load(std::memory_order_relaxed);
-    if (idle_ms <= 0 || g_epd_idle_cut.load(std::memory_order_relaxed) ||
-        last_activity_ms == 0) {
-        return false;
-    }
-    return (esp_timer_get_time() / 1000 - last_activity_ms) >= idle_ms;
-}
-
 void wqn::PowerOffEpdAfterIdleIfNeeded()
 {
     const int idle_ms_config = CONFIG_WQN_EPD_IDLE_POWER_OFF_MS;
     const int64_t last_activity_ms =
         g_last_epd_activity_ms.load(std::memory_order_relaxed);
     const int64_t now_ms = esp_timer_get_time() / 1000;
-    // Cleanup first, on its own deadline. It must not be gated on
-    // g_epd_idle_cut: once this function has cut the rail, that flag keeps
-    // IsEpdIdleMaintenanceDue() -- and therefore RequestEpdIdleMaintenance --
-    // false for the rest of the idle period, so a cleanup that waited for the
-    // power-off point would never be armed again.
+    // Cleanup first on its independent deadline, even if the rail is already
+    // cut. The owner keeps that deadline alive until the debt is retired.
     RunIdleEpdCleanupIfNeeded(now_ms, last_activity_ms);
     if (idle_ms_config <= 0 || g_epd_idle_cut.load(std::memory_order_relaxed) ||
         last_activity_ms == 0) {
@@ -2422,8 +2419,9 @@ void wqn::RegisterEpdOwnerTask(void* owner_task_handle)
     g_epd_owner_task = static_cast<TaskHandle_t>(owner_task_handle);
 }
 
-bool wqn::ServiceDisplaySleepPrepCommand()
+bool wqn::ServiceDisplaySleepPrepCommand(bool* prepared)
 {
+    if (prepared != nullptr) *prepared = false;
     // Claim a pending request. If it is not Pending (idle, or already cancelled
     // by a power-side timeout), do nothing.
     uint32_t expected = kSleepPrepPending;
@@ -2446,6 +2444,7 @@ bool wqn::ServiceDisplaySleepPrepCommand()
     const esp_err_t result = clear_first
         ? RunShutdownClearLocal(0)
         : RunSleepPrepLocal(0);
+    if (prepared != nullptr) *prepared = result == ESP_OK;
     // Publish order (mirror of the requester's drain-then-post): write the
     // result, GIVE the semaphore, and only THEN drop to Idle. If Idle were
     // published before the give, a new request could enter Pending and then be
