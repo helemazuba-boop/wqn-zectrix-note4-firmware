@@ -120,7 +120,8 @@ struct UiRect { int x,y,width,height; const char* name; };
 @@LAYOUT@@
 @@RECT@@
 constexpr UiRect kPomodoroConfigRect={0,0,1,1,"p"}, kCountdownConfigRect={0,0,1,1,"c"};
-std::string CurrentClockLabel() { return "14:32"; }
+std::string clock_label="14:32";
+std::string CurrentClockLabel() { return clock_label; }
 std::string CurrentDateLabel() { return "10月17日 星期六"; }
 void FillRect(int x,int y,int w,int h,bool ink) { for(int yy=y;yy<y+h;++yy) for(int xx=x;xx<x+w;++xx) wqn::DrawEpdPixel(xx,yy,ink); }
 void DrawHorizontalLine(int x,int y,int w) { FillRect(x,y,w,1,true); }
@@ -339,6 +340,20 @@ int main(int argc,char** argv) {
         }
     }
     // Reproduce a pending timer update coinciding with a Home focus move.
+    // Clearing/repainting the regional clock must produce the same native
+    // pixels as composing a fresh page, including removed digit strokes.
+    for(const auto& change:std::vector<std::pair<std::string,std::string>>{
+            {"00:19","00:20"},{"09:59","10:00"},{"23:59","00:00"},{"--:--","00:01"}}) {
+        clock_label=change.first;
+        CHECK(RenderHomeToEpd(frame,RefreshSchedule::kSelection)==ESP_OK);
+        clock_label=change.second;
+        CHECK(RenderHomePrimaryRegion(frame.home,RefreshSchedule::kClock)==ESP_OK);
+        const auto regional=pixels;
+        CHECK(RenderHomeToEpd(frame,RefreshSchedule::kSelection)==ESP_OK);
+        CHECK(regional==pixels);
+    }
+    clock_label="14:32";
+
     // The old rank-only merge retained Timer, drew only the clock and then
     // acknowledged a frame whose newly selected card had never been painted.
     for(auto pending:{RefreshSchedule::kTimer,RefreshSchedule::kClock,RefreshSchedule::kConfig}) {

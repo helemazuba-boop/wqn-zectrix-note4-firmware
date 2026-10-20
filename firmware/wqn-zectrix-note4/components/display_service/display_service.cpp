@@ -1565,6 +1565,28 @@ esp_err_t PreparePanelForFramebufferWrite()
     return ESP_OK;
 }
 
+esp_err_t SetPartialWindow(const DirtyRect& rect)
+{
+    ESP_RETURN_ON_FALSE(rect.valid, ESP_ERR_INVALID_ARG, kTag, "invalid EPD partial window");
+
+    const uint16_t x_start = static_cast<uint16_t>(rect.x_start_byte * 8);
+    const uint16_t x_end = static_cast<uint16_t>((rect.x_end_byte + 1) * 8 - 1);
+    const uint16_t y_start = static_cast<uint16_t>(rect.y_start);
+    const uint16_t y_end = static_cast<uint16_t>(rect.y_end);
+
+    ESP_RETURN_ON_ERROR(SendCommand(0x83), kTag, "EPD partial window");
+    ESP_RETURN_ON_ERROR(SendData(static_cast<uint8_t>((x_start >> 8) & 0x03)), kTag, "EPD partial x start high");
+    ESP_RETURN_ON_ERROR(SendData(static_cast<uint8_t>(x_start & 0xFF)), kTag, "EPD partial x start low");
+    ESP_RETURN_ON_ERROR(SendData(static_cast<uint8_t>((x_end >> 8) & 0x03)), kTag, "EPD partial x end high");
+    ESP_RETURN_ON_ERROR(SendData(static_cast<uint8_t>(x_end & 0xFF)), kTag, "EPD partial x end low");
+    ESP_RETURN_ON_ERROR(SendData(static_cast<uint8_t>((y_start >> 8) & 0x03)), kTag, "EPD partial y start high");
+    ESP_RETURN_ON_ERROR(SendData(static_cast<uint8_t>(y_start & 0xFF)), kTag, "EPD partial y start low");
+    ESP_RETURN_ON_ERROR(SendData(static_cast<uint8_t>((y_end >> 8) & 0x03)), kTag, "EPD partial y end high");
+    ESP_RETURN_ON_ERROR(SendData(static_cast<uint8_t>(y_end & 0xFF)), kTag, "EPD partial y end low");
+    ESP_RETURN_ON_ERROR(SendData(0x01), kTag, "EPD partial scan data");
+    return ESP_OK;
+}
+
 esp_err_t PreparePanelForHotFramebufferWrite()
 {
     // [epd-temp-fix] Reset the temperature input source to the internal sensor
@@ -1581,6 +1603,12 @@ esp_err_t PreparePanelForHotFramebufferWrite()
     ESP_RETURN_ON_ERROR(SendData(0x00), kTag, "EPD hot CCSET: TSFIX=0 use internal sensor");
     vTaskDelay(pdMS_TO_TICKS(10));
 
+    // 0x83 survives hot reuse. A preceding clock/timer window must not
+    // constrain this 400x300 transfer while the software mirror advances for
+    // the whole frame. Specify the full target before DTM1, just as the local
+    // path always specifies its target. Propagate errors before any RAM write.
+    const DirtyRect full_window{0, kEpdBytesPerRow - 1, 0, kEpdHeight - 1, true};
+    ESP_RETURN_ON_ERROR(SetPartialWindow(full_window), kTag, "set EPD full-frame partial window");
     ESP_RETURN_ON_ERROR(SendCommand(0x10), kTag, "EPD hot DTM1 write");
     ESP_RETURN_ON_ERROR(WaitBusyTimeout(kPartialCommandBusyTimeoutMs), kTag, "wait EPD hot RAM command");
     return ESP_OK;
@@ -1642,28 +1670,6 @@ esp_err_t SendFramebufferToPanel(bool partial, bool hot_update)
     }
 
     return TriggerDisplayUpdate(partial, partial && ShouldKeepEpdPowered());
-}
-
-esp_err_t SetPartialWindow(const DirtyRect& rect)
-{
-    ESP_RETURN_ON_FALSE(rect.valid, ESP_ERR_INVALID_ARG, kTag, "invalid EPD partial window");
-
-    const uint16_t x_start = static_cast<uint16_t>(rect.x_start_byte * 8);
-    const uint16_t x_end = static_cast<uint16_t>((rect.x_end_byte + 1) * 8 - 1);
-    const uint16_t y_start = static_cast<uint16_t>(rect.y_start);
-    const uint16_t y_end = static_cast<uint16_t>(rect.y_end);
-
-    ESP_RETURN_ON_ERROR(SendCommand(0x83), kTag, "EPD partial window");
-    ESP_RETURN_ON_ERROR(SendData(static_cast<uint8_t>((x_start >> 8) & 0x03)), kTag, "EPD partial x start high");
-    ESP_RETURN_ON_ERROR(SendData(static_cast<uint8_t>(x_start & 0xFF)), kTag, "EPD partial x start low");
-    ESP_RETURN_ON_ERROR(SendData(static_cast<uint8_t>((x_end >> 8) & 0x03)), kTag, "EPD partial x end high");
-    ESP_RETURN_ON_ERROR(SendData(static_cast<uint8_t>(x_end & 0xFF)), kTag, "EPD partial x end low");
-    ESP_RETURN_ON_ERROR(SendData(static_cast<uint8_t>((y_start >> 8) & 0x03)), kTag, "EPD partial y start high");
-    ESP_RETURN_ON_ERROR(SendData(static_cast<uint8_t>(y_start & 0xFF)), kTag, "EPD partial y start low");
-    ESP_RETURN_ON_ERROR(SendData(static_cast<uint8_t>((y_end >> 8) & 0x03)), kTag, "EPD partial y end high");
-    ESP_RETURN_ON_ERROR(SendData(static_cast<uint8_t>(y_end & 0xFF)), kTag, "EPD partial y end low");
-    ESP_RETURN_ON_ERROR(SendData(0x01), kTag, "EPD partial scan data");
-    return ESP_OK;
 }
 
 esp_err_t SendDirtyRectToPanel(const DirtyRect& rect)
