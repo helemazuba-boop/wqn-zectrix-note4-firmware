@@ -22,11 +22,17 @@ int checks=0;
 namespace wqn {
 @@ITEM@@
 @@MODEL@@
-enum class UiScreen { kTodo,kHome };
+enum class UiScreen { kTodo,kHome,kTime };
+enum class TimeTile { kCountdown,kPomodoro,kClock };
 enum class UiInput { kUp,kDown,kConfirm,kLongConfirm };
-struct UiState { UiScreen screen=UiScreen::kTodo;TodoUiState todo; };
+struct UiState { UiScreen screen=UiScreen::kTodo;TodoUiState todo;
+    struct { bool visible=false; } navigation;
+    struct { TimeTile tile=TimeTile::kClock;bool config_mode=false; } time_app;
+};
 struct HomeSummary { bool charging=false,full=false,wifi_connected=true;int battery_percent=76,wifi_rssi=-50; };
-struct UiFrame { UiScreen screen=UiScreen::kTodo;TodoUiState todo;HomeSummary home; };
+struct UiFrame { UiScreen screen=UiScreen::kTodo;TodoUiState todo;HomeSummary home;
+    struct { bool visible=false;size_t selected=0; } navigation;
+};
 void ClampUiSelection(UiState* state) {
 @@CLAMP@@
 }
@@ -54,6 +60,17 @@ esp_err_t CompleteTodo(const std::string&,const char* id,WqnTodoItem* task){
 }
 namespace device_ui_internal {
 @@SCHEDULE@@
+@@CLOCK_POLICY@@
+int primary_time_updates=0;
+void UpdateHomePrimaryTimeLine(wqn::UiState*){++primary_time_updates;}
+struct UiUpdate { RefreshSchedule refresh;bool changed; };
+enum class AppEventKind { kClockMinute };
+struct UiRuntime {
+    wqn::UiState state_;
+    UiUpdate FinishEvent(AppEventKind,RefreshSchedule schedule,bool changed){return {schedule,changed};}
+    UiUpdate DispatchClockMinute(bool);
+};
+@@MINUTE@@
 @@RESULT@@
 bool busy=false,admit=true,token_valid=true;
 int requests=0,summaries=0;
@@ -76,11 +93,14 @@ struct TextRun { int x,y;const lv_font_t* font;std::string text;bool ink; };
 std::vector<TextRun> drawn;
 namespace wqn {
 std::array<uint8_t,400*300> pixels;
+bool framebuffer_ready=true;
+int full_clears=0,pixel_writes=0;
+bool IsEpdFramebufferSynchronized(){return framebuffer_ready;}
 extern "C" const lv_font_t SourceHanSansSC_Regular_slim;
 extern "C" bool lv_font_get_glyph_dsc_fmt_txt(const lv_font_t*,lv_font_glyph_dsc_t*,uint32_t,uint32_t) { return false; }
 extern "C" const uint8_t* lv_font_get_bitmap_fmt_txt(const lv_font_t*,uint32_t) { return nullptr; }
-void DrawEpdPixel(int x,int y,bool ink) { if(x>=0&&x<400&&y>=0&&y<300)pixels[y*400+x]=ink; }
-void ClearEpdFramebuffer(bool white) { pixels.fill(!white);drawn.clear(); }
+void DrawEpdPixel(int x,int y,bool ink) { if(x>=0&&x<400&&y>=0&&y<300){pixels[y*400+x]=ink;++pixel_writes;} }
+void ClearEpdFramebuffer(bool white) { ++full_clears;pixels.fill(!white);drawn.clear(); }
 const lv_font_t* PrimaryUiFont() { return &SourceHanSansSC_Regular_slim; }
 @@FONT_LOOKUP@@
 @@FONT_DRAW@@
@@ -99,8 +119,20 @@ std::string CurrentClockLabel(){return clock_label;}
 std::string CurrentDateLabel(){return date_label;}
 void FillRect(int x,int y,int w,int h,bool ink){for(int yy=y;yy<y+h;++yy)for(int xx=x;xx<x+w;++xx)wqn::DrawEpdPixel(xx,yy,ink);}
 void DrawHorizontalLine(int x,int y,int w){FillRect(x,y,w,1,true);}
+void ClearRect(const UiRect& r){FillRect(r.x,r.y,r.width,r.height,false);}
+wqn::UiScreen g_last_rendered_screen=wqn::UiScreen::kTodo;
 int presented=0;RefreshSchedule presented_schedule=RefreshSchedule::kNone;
-esp_err_t RefreshFrame(const wqn::UiFrame&,RefreshSchedule schedule){++presented;presented_schedule=schedule;return ESP_OK;}
+int regional=0,render_result=ESP_OK;
+esp_err_t RefreshFrame(const wqn::UiFrame& frame,RefreshSchedule schedule){
+    ++presented;presented_schedule=schedule;
+    if(frame.navigation.visible)FillRect(kNavigationX,kNavigationY,kNavigationWidth,kNavigationHeight,true);
+    if(render_result==ESP_OK){g_last_rendered_screen=frame.screen;wqn::framebuffer_ready=true;}
+    return render_result;
+}
+esp_err_t RefreshRegion(const UiRect& r,RefreshSchedule schedule){
+    CHECK(r.x==0&&r.y==0&&r.width==400&&r.height==kStatusBarHeight);
+    ++regional;presented_schedule=schedule;return render_result;
+}
 @@BATTERY@@
 @@ICONS@@
 std::string TodoSignature(const wqn::UiFrame& frame){std::string signature;
@@ -295,6 +327,106 @@ void TestRender(const std::string& folder){
         frame.todo.todos=Page(count).todos;frame.todo.selected=selected;frame.todo.window_start=ClampTodoListWindow(0,selected,count);frame.todo.total_pending=count;frame.todo.loaded_once=true;Paint(frame);
     }
 }
+void TestMinutePolicy(){
+    UiRuntime runtime;
+    for(auto screen:{UiScreen::kHome,UiScreen::kTodo,UiScreen::kTime}) {
+        runtime.state_.screen=screen;
+        runtime.state_.navigation.visible=false;
+        CHECK(ScreenUsesClockMinute(runtime.state_));
+        CHECK(runtime.DispatchClockMinute(true).refresh==RefreshSchedule::kClock);
+        CHECK(runtime.DispatchClockMinute(false).refresh==RefreshSchedule::kNone);
+        runtime.state_.navigation.visible=true;
+        const int before=primary_time_updates;
+        CHECK(!ScreenUsesClockMinute(runtime.state_));
+        CHECK(runtime.DispatchClockMinute(true).refresh==RefreshSchedule::kNone);
+        CHECK(primary_time_updates==before+1);
+        runtime.state_.navigation.visible=false;
+        CHECK(runtime.DispatchClockMinute(true).refresh==RefreshSchedule::kClock);
+    }
+    runtime.state_.screen=UiScreen::kTime;runtime.state_.time_app.config_mode=true;
+    CHECK(!ScreenUsesClockMinute(runtime.state_));
+    CHECK(runtime.DispatchClockMinute(true).refresh==RefreshSchedule::kNone);
+    runtime.state_.time_app.config_mode=false;runtime.state_.time_app.tile=TimeTile::kCountdown;
+    CHECK(!ScreenUsesClockMinute(runtime.state_));
+}
+void TestMinuteRender(){
+    UiFrame frame;frame.todo.todos=Page(6).todos;frame.todo.loaded_once=true;
+    frame.todo.sync_status=TodoSyncStatus::kReady;frame.todo.total_pending=6;
+    for(auto& item:frame.todo.todos)item.due_at="2026-10-19T12:40:00Z";
+    TodoDue now;CHECK(ParseTodoDue("2026-10-19T12:00:00Z",&now));clock_now=now.instant;
+    date_label="10月19日 星期一";clock_label="20:00";
+    CHECK(RenderTodoToEpd(frame,RefreshSchedule::kCommit)==ESP_OK);
+    const auto first_frame=pixels;
+    const int old_clears=full_clears,old_presented=presented,old_regions=regional;
+    clock_now+=60;clock_label="20:01";drawn.clear();
+    CHECK(RenderTodoToEpd(frame,RefreshSchedule::kClock)==ESP_OK);
+    CHECK(full_clears==old_clears&&presented==old_presented&&regional==old_regions+1);
+    CHECK(!drawn.empty()&&std::all_of(drawn.begin(),drawn.end(),[](const auto& run){return run.y<kStatusBarHeight;}));
+    CHECK(std::equal(pixels.begin()+kStatusBarHeight*400,pixels.end(),first_frame.begin()+kStatusBarHeight*400));
+    auto clock_frame=pixels;
+    CHECK(RenderTodoToEpd(frame,RefreshSchedule::kCommit)==ESP_OK);
+    CHECK(pixels==clock_frame);
+    // The minute producer pauses cosmetic drawing while navigation is open;
+    // closing the bar composes the current clock instead of the old minute.
+    frame.navigation.visible=true;
+    CHECK(RenderTodoToEpd(frame,RefreshSchedule::kNavigation)==ESP_OK);
+    const auto with_nav=pixels;
+    clock_label="20:17";clock_now+=16*60;
+    UiRuntime runtime;runtime.state_.screen=UiScreen::kTodo;runtime.state_.navigation.visible=true;
+    CHECK(runtime.DispatchClockMinute(true).refresh==RefreshSchedule::kNone);
+    CHECK(pixels==with_nav);
+    frame.navigation.visible=false;
+    int before=presented;
+    CHECK(RenderTodoToEpd(frame,RefreshSchedule::kNavigation)==ESP_OK&&presented==before+1);
+    CHECK(HasText("20:17"));
+    frame.home.battery_percent=20;frame.home.wifi_rssi=-90;clock_label="20:03";
+    const int before_icons=regional;
+    CHECK(RenderTodoToEpd(frame,RefreshSchedule::kClock)==ESP_OK&&regional==before_icons+1);
+    clock_frame=pixels;CHECK(RenderTodoToEpd(frame,RefreshSchedule::kCommit)==ESP_OK);CHECK(pixels==clock_frame);
+
+    // Time affects the body too: a newly overdue visible/hidden task or a
+    // date rollover must repaint the rows/date/aggregate, not just the clock.
+    for(int index:{0,4}) {
+        frame.todo.todos[index].due_at="2026-10-19T12:03:30Z";
+        clock_now=now.instant+180;clock_label="20:03";
+        CHECK(RenderTodoToEpd(frame,RefreshSchedule::kCommit)==ESP_OK);
+        before=presented;clock_now+=60;clock_label="20:04";
+        CHECK(RenderTodoToEpd(frame,RefreshSchedule::kClock)==ESP_OK&&presented==before+1);
+        CHECK(HasText("待完成 · 逾期 "+std::to_string(index==0?1:2)));
+        clock_frame=pixels;CHECK(RenderTodoToEpd(frame,RefreshSchedule::kCommit)==ESP_OK);CHECK(pixels==clock_frame);
+    }
+    before=presented;date_label="10月20日 星期二";
+    CHECK(RenderTodoToEpd(frame,RefreshSchedule::kClock)==ESP_OK&&presented==before+1);
+    CHECK(HasText(date_label));
+    before=presented;frame.todo.selected=1;
+    CHECK(RenderTodoToEpd(frame,RefreshSchedule::kClock)==ESP_OK&&presented==before+1);
+    before=presented;frame.todo.todos[1].title="变更的任务标题";
+    CHECK(RenderTodoToEpd(frame,RefreshSchedule::kClock)==ESP_OK&&presented==before+1);
+    CHECK(HasText("变更的任务标题"));
+
+    // Failures cannot prime the body cache, even when the hardware port still
+    // reports a synchronized mirror. Cold mirrors and other pages also fall back.
+    render_result=ESP_FAIL;const int before_failure=regional;
+    CHECK(RenderTodoToEpd(frame,RefreshSchedule::kClock)==ESP_FAIL&&regional==before_failure+1);
+    render_result=ESP_OK;before=presented;
+    CHECK(RenderTodoToEpd(frame,RefreshSchedule::kClock)==ESP_OK&&presented==before+1);
+    render_result=ESP_FAIL;before=presented;
+    CHECK(RenderTodoToEpd(frame,RefreshSchedule::kCommit)==ESP_FAIL&&presented==before+1);
+    render_result=ESP_OK;before=presented;
+    CHECK(RenderTodoToEpd(frame,RefreshSchedule::kClock)==ESP_OK&&presented==before+1);
+    wqn::framebuffer_ready=false;before=presented;
+    CHECK(RenderTodoToEpd(frame,RefreshSchedule::kClock)==ESP_OK&&presented==before+1);
+    g_last_rendered_screen=UiScreen::kHome;before=presented;
+    CHECK(RenderTodoToEpd(frame,RefreshSchedule::kClock)==ESP_OK&&presented==before+1);
+    // A failed different page can dirty RAM without advancing the successful
+    // screen marker. Dispatcher invalidation prevents retaining that RAM.
+    const auto clean_body=pixels;
+    InvalidateTodoRenderCache();pixels.fill(1);before=presented;
+    CHECK(RenderTodoToEpd(frame,RefreshSchedule::kClock)==ESP_OK&&presented==before+1);
+    CHECK(pixels==clean_body);
+    before=presented;CHECK(RenderTodoToEpd(frame,RefreshSchedule::kSelection)==ESP_OK&&presented==before+1);
+    date_label="10月19日 星期一";clock_label="20:00";clock_now=now.instant;
+}
 void TestSignature(){
     UiFrame frame;frame.todo.todos=Page(2).todos;const auto original=TodoSignature(frame);
     auto changes=[&](auto apply){auto next=frame;apply(next);CHECK(TodoSignature(next)!=original);};
@@ -306,4 +438,4 @@ void TestSignature(){
     const auto date=date_label;date_label="10月20日 星期二";CHECK(TodoSignature(frame)!=original);date_label=date;
     auto one=frame,two=frame;one.todo.todos[0].title="a:b";one.todo.todos[0].status="c";two.todo.todos[0].title="a";two.todo.todos[0].status="b:c";CHECK(TodoSignature(one)!=TodoSignature(two));
 }
-int main(int argc,char** argv){TestWindows();TestPaging();TestCompletion();TestCompletionPaging();TestDates();TestRender(argc>1?argv[1]:"");TestSignature();std::printf("Todo: %d assertions passed\n",checks);}
+int main(int argc,char** argv){TestWindows();TestPaging();TestCompletion();TestCompletionPaging();TestDates();TestRender(argc>1?argv[1]:"");TestMinutePolicy();TestMinuteRender();TestSignature();std::printf("Todo: %d assertions passed\n",checks);}

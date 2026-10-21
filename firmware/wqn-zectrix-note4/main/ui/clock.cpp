@@ -133,6 +133,11 @@ void UpdateHomePrimaryTimeLine(wqn::UiState* state)
 
 bool ScreenUsesClockMinute(const wqn::UiState& state)
 {
+    // The application bar owns the composed page until it closes. A cosmetic
+    // minute tick would become a full-frame partial; switching to a local
+    // window after that partial would instead hit the driver's full-refresh
+    // wedge guard. Closing the bar redraws the current clock/date normally.
+    if (state.navigation.visible) return false;
     if (state.screen == wqn::UiScreen::kHome) {
         // The home primary line becomes a static timer-status sentence while
         // a timer runs, but the status-bar wall clock must keep its normal

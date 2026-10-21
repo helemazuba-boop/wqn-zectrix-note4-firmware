@@ -98,7 +98,8 @@ struct UiFrame {
 struct ProvisionState { static constexpr int kIdle=0; };
 struct EpdFrameTransaction { bool locked() const { return true; } };
 bool framebuffer_ready=true;
-int InitEpdDisplay() { return ESP_OK; }
+int init_result=ESP_OK;
+int InitEpdDisplay() { return init_result; }
 bool IsEpdFramebufferSynchronized() { return framebuffer_ready; }
 bool TimeAppHasActiveTimer(const TimeAppState& state) { return state.active_timer; }
 std::vector<std::string> WrapUtf8TextToWidth(const std::string& text,int,size_t) { return {text}; }
@@ -164,6 +165,8 @@ RefreshSchedule HomeShortcut(const wqn::ButtonEvent& event,int64_t event_time_ms
 namespace device_ui_internal {
 constexpr char kTag[]="host-render";
 bool g_last_rendered_navigation_visible=false;
+int todo_invalidations=0;
+void InvalidateTodoRenderCache(){++todo_invalidations;}
 const char* RefreshScheduleName(RefreshSchedule) { return "host-schedule"; }
 constexpr int kTextWidth=388,kMaxWrapLines=100,kCjkLineHeight=18;
 std::string LimitForEpd(const std::string& text) { return text; }
@@ -392,5 +395,17 @@ int main(int argc,char** argv) {
     ClearEpdFramebuffer(true);
     DrawTextWithFont(10,10,PrimaryUiFont(),"学",true);
     CHECK(std::any_of(pixels.begin(),pixels.end(),[](auto pixel){return pixel!=0;}));
+    // Dispatch invalidates the Todo draw cache before another page can touch
+    // the framebuffer, including a page which fails before presentation.
+    frame.screen=UiScreen::kSettings;
+    int invalidations_before=todo_invalidations;
+    CHECK(RenderFrameToEpd(frame,RefreshSchedule::kSelection)==ESP_OK);
+    CHECK(todo_invalidations==invalidations_before+1);
+    wqn::init_result=ESP_ERR_NO_MEM;invalidations_before=todo_invalidations;
+    CHECK(RenderFrameToEpd(frame,RefreshSchedule::kSelection)==ESP_ERR_NO_MEM);
+    CHECK(todo_invalidations==invalidations_before+1);
+    wqn::init_result=ESP_OK;frame.screen=UiScreen::kTodo;invalidations_before=todo_invalidations;
+    CHECK(RenderFrameToEpd(frame,RefreshSchedule::kClock)==ESP_OK);
+    CHECK(todo_invalidations==invalidations_before);
     std::printf("PASS: Home status, shortcuts, bounded query, idle policy and production pixels (%d assertions; host seams, NOT HIL)\n",assertions);
 }

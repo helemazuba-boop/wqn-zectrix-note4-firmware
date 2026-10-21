@@ -791,6 +791,9 @@ void InstallSettingsDeckOptions(wqn::UiState* state, bool preserve_focus);
 // ---- Todo page --------------------------------------------------------------
 
 esp_err_t RenderTodoToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule);
+// EPD-owner only: another page can replace the current draw buffer even when
+// its presentation fails and g_last_rendered_screen still says Todo.
+void InvalidateTodoRenderCache();
 
 // ---- Extern globals (defined in ui_refresh.cpp) ----------------------------
 

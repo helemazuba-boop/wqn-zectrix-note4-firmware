@@ -33,6 +33,8 @@ def main():
     page = (root/'main/ui/page_todo.cpp').read_text()
     refresh = (root/'main/ui/ui_refresh.cpp').read_text()
     pieces = {
+        '@@CLOCK_POLICY@@': section((root/'main/ui/clock.cpp').read_text(), 'bool ScreenUsesClockMinute(', '\n}  // namespace device_ui_internal'),
+        '@@MINUTE@@': section((root/'main/ui/ui_runtime.cpp').read_text(), 'UiUpdate UiRuntime::DispatchClockMinute(', 'UiUpdate UiRuntime::DispatchStatusEditTimeout('),
         '@@FONT_LOOKUP@@': section(display, 'const lv_font_fmt_txt_glyph_dsc_t* FindGlyphInFont(', 'int MeasureCodepointWidth('),
         '@@FONT_DRAW@@': section(display, 'void DrawGlyphFromFont(', 'void DrawCjkGlyph('),
         '@@FONT_MEASURE@@': section(display, 'int MeasureTextWithFont(', 'std::string TruncateUtf8TextToWidth('),

@@ -27,6 +27,7 @@ esp_err_t RenderFrameToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
     ESP_RETURN_ON_FALSE(
         frame_txn.locked(), ESP_ERR_NO_MEM, kTag,
         "take EPD frame transaction");
+    if (frame.screen != wqn::UiScreen::kTodo) InvalidateTodoRenderCache();
     // A background sync wake deliberately defers panel initialization until
     // pixels actually need to change. Initialize before any draw operation;
     // relying on RefreshEpdFull's later lazy init would clear the framebuffer

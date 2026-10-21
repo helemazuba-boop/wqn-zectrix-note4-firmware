@@ -13,6 +13,11 @@ namespace device_ui_internal {
 namespace {
 constexpr int64_t kBeijingOffset = 8 * 3600;
 
+// EPD-owner-only cache of the successfully drawn body. Clock-only frames may
+// retain it, but a failed presentation must never establish a new baseline.
+std::string g_todo_body_signature;
+bool g_todo_body_valid = false;
+
 struct TodoDue {
     std::time_t instant = 0;
     std::tm local = {};
@@ -92,6 +97,32 @@ bool TodoIsOverdue(const wqn::WqnTodoItem& item)
     TodoDue due;
     const std::time_t now = CurrentUnixTime();
     return now >= kMinReasonableUnixTime && ParseTodoDue(item.due_at, &due) && due.instant < now;
+}
+
+std::string TodoBodySignature(const wqn::UiFrame& frame)
+{
+    const auto& todo = frame.todo;
+    std::string signature;
+    const auto text = [&signature](const std::string& value) {
+        signature.append(std::to_string(value.size()));
+        signature.push_back(':'); signature.append(value); signature.push_back('|');
+    };
+    const auto number = [&text](auto value) { text(std::to_string(value)); };
+    text(CurrentDateLabel());
+    number(static_cast<int>(todo.sync_status));
+    number(todo.selected); number(todo.window_start); number(todo.total_pending);
+    number(todo.loaded_once); number(todo.paging_stale);
+    number(todo.has_earlier); number(todo.has_later);
+    text(todo.status_message); text(todo.completion_task_id); text(todo.completion_title);
+    number(frame.navigation.visible);
+    if (frame.navigation.visible) number(frame.navigation.selected);
+    for (const auto& item : todo.todos) {
+        text(item.id); text(item.title); text(item.status); text(item.due_at);
+        text(item.subject_name); text(item.completed_at);
+        // The list's overdue labels/count can change without a cloud update.
+        number(TodoIsOverdue(item));
+    }
+    return signature;
 }
 
 std::string TodoDueTimeLabel(const std::string& text)
@@ -252,9 +283,27 @@ void DrawTodoEmptyState(const wqn::TodoUiState& todo)
 }
 }  // namespace
 
+void InvalidateTodoRenderCache()
+{
+    g_todo_body_valid = false;
+}
+
 esp_err_t RenderTodoToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
 {
     const auto& todo = frame.todo;
+    const std::string body_signature = TodoBodySignature(frame);
+    const bool header_only =
+        schedule == RefreshSchedule::kClock && g_todo_body_valid &&
+        wqn::IsEpdFramebufferSynchronized() && g_last_rendered_screen == wqn::UiScreen::kTodo &&
+        body_signature == g_todo_body_signature;
+    if (header_only) {
+        constexpr UiRect header = {0, 0, kScreenWidth, kStatusBarHeight, "todo-status-bar"};
+        ClearRect(header);
+        DrawTodoStatusBar(frame.home);
+        const esp_err_t result = RefreshRegion(header, schedule);
+        if (result != ESP_OK) g_todo_body_valid = false;
+        return result;
+    }
     wqn::ClearEpdFramebuffer(true);
     DrawTodoStatusBar(frame.home);
     DrawTodoSummary(todo);
@@ -269,6 +318,9 @@ esp_err_t RenderTodoToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
         }
         DrawTodoScroll(todo, start);
     }
-    return RefreshFrame(frame, schedule);
+    const esp_err_t result = RefreshFrame(frame, schedule);
+    g_todo_body_valid = result == ESP_OK;
+    if (g_todo_body_valid) g_todo_body_signature = body_signature;
+    return result;
 }
 }  // namespace device_ui_internal
