@@ -20,7 +20,7 @@
 
 - 新 Kconfig 开关：`CONFIG_WQN_DEV_MENU_ENABLE`（`main/Kconfig.projbuild`，`depends on WQN_EPD_UI_ENABLE`，**default n**）。
 - 门控语义：开关**只门控设置页一级的「开发者选项」入口行**（`#if` 预处理器裁剪；二级六行随之不可达）；错误捕获（`RecordError`）**常开编译**，发布固件同样保留——失败路径才执行，代价约 1KB flash / 0.8KB RAM 静态环，换来现场设备的问题回溯能力。
-- 发布保障：default n + `RELEASE_CHECKLIST.md` §1 校验步（记录的 sdkconfig 中 `# CONFIG_WQN_DEV_MENU_ENABLE is not set`）。开发机用 menuconfig 打开（写入 gitignored 的 `sdkconfig`，不进版本库）。
+- 发布保障：default n + `../release/RELEASE_CHECKLIST.md` §1 校验步（记录的 sdkconfig 中 `# CONFIG_WQN_DEV_MENU_ENABLE is not set`）。开发机用 menuconfig 打开（写入 gitignored 的 `sdkconfig`，不进版本库）。
 - `sdkconfig.ai-local.defaults` 中保留注释行 `# CONFIG_WQN_DEV_MENU_ENABLE is not set`（照 `WQN_AI_AUDIO_SELFTEST_ENABLE` 先例），显式文档化 off 态。
 
 ## 3. 入口结构：一级一行 + 二级六行（固定）
@@ -155,7 +155,7 @@ size_t CopyRecentErrors(ErrorRecord* out, size_t cap);
 
 1. **双配置构建**：default n（发布等价，Dev 行不可见）与 sdkconfig 置 y（六项可达）都要 0 警告 + M8 通过；对比 bin 大小并记录。
 2. **上机冒烟**（需硬件）：逐个进入六个详情并确认关闭；制造一次可观测失败验证错误记录；驻留设置页 ≥60s 验证候选不跳动、数据重绘、无吞帧或残影。
-3. **发布演练**：按 `RELEASE_CHECKLIST.md` 走一遍 §1 的 flag 校验步。
+3. **发布演练**：按 `../release/RELEASE_CHECKLIST.md` 走一遍 §1 的 flag 校验步。
 
 ## 8. 已知局限（有意为之）
 

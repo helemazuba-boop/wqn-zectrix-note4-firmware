@@ -193,7 +193,7 @@ struct HomeSummary {
 // indexes settings rows (model clamps, button dispatch, row rendering). It
 // lives here — not in device_ui_internal — because the model layer
 // (ui_model.cpp) clamps the selection without including ui/ headers.
-// Structure (rows, order, dialogs) is specified by DEV_DIAGNOSTICS.md.
+// Structure (rows, order, dialogs) is specified by docs/development/DEV_DIAGNOSTICS.md.
 #if CONFIG_WQN_DEV_MENU_ENABLE
 constexpr size_t kSettingsItemCount = 12;
 #else
@@ -223,7 +223,7 @@ constexpr size_t kSettingsRowFactoryReset = 9;
 constexpr size_t kSettingsRowPowerOff = 10;
 #endif
 
-// Second-level dev list (DEV_DIAGNOSTICS.md §3): six rows in the five-row
+// Second-level dev list (docs/development/DEV_DIAGNOSTICS.md §3): six rows in the five-row
 // selection-following window. kDevRowBatteryRaw and
 // kDevRowStorage carry the two detail dialogs that used to sit on the root
 // list; the flag gates only the root entry row, not these constants.
@@ -234,7 +234,7 @@ constexpr size_t kDevRowDevErrors = 2;
 constexpr size_t kDevRowBatteryRaw = 3;
 constexpr size_t kDevRowStorage = 4;
 constexpr size_t kDevRowSleepDiag = 5;
-// On-panel sleep/power diagnostic lines (DEV_DIAGNOSTICS.md §4.6).
+// On-panel sleep/power diagnostic lines (docs/development/DEV_DIAGNOSTICS.md §4.6).
 constexpr size_t kSleepDiagLines = 6;
 
 // Which row list the settings page is showing. The dev list is a second-level
@@ -312,7 +312,7 @@ struct SettingsDiagnosticsSnapshot {
     std::string idf_target;
     std::string idf_version;
     std::string content_sync_label;
-    // [dev-diag] Dev-menu fields (structure fixed by DEV_DIAGNOSTICS.md).
+    // [dev-diag] Dev-menu fields (structure fixed by docs/development/DEV_DIAGNOSTICS.md).
     // Filled by UpdateSettingsDiagnostics on dialog open / state reload; the
     // Kconfig flag only gates the visible rows, these fields always exist.
     std::string git_commit;  // configure-time git describe, "unknown" fallback
@@ -329,7 +329,7 @@ struct SettingsDiagnosticsSnapshot {
     std::string error_count_label;      // row value: "3 条" / "无"
     size_t error_line_count = 0;
     SettingsErrorLine error_lines[6];
-    // [dev-diag] Sleep/power diagnostics (DEV_DIAGNOSTICS.md §4.6): the ring
+    // [dev-diag] Sleep/power diagnostics (docs/development/DEV_DIAGNOSTICS.md §4.6): the ring
     // lives in RTC slow memory and is only readable through
     // CopySleepDiagnosticEntries, so this copy is the on-panel view of it.
     // Newest first, formatted at snapshot time like the error lines.

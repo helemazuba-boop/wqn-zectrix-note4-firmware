@@ -46,7 +46,7 @@ firmware/wqn-zectrix-note4/
 ├── sdkconfig                   # current ESP-IDF config
 ├── CMakeLists.txt
 ├── README.md
-└── BUILD_HERE.md               # this file
+└── docs/development/BUILD_HERE.md # this file
 ```
 
 ---

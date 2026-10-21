@@ -3561,7 +3561,7 @@ void SyncServiceTask(void*)
             if (has_token_after_round) {
                 // [dev-diag] The full-round failure detail otherwise only
                 // reaches the serial log; the per-domain last_error fields do
-                // not cover the control plane (DEV_DIAGNOSTICS.md §5).
+                // not cover the control plane (docs/development/DEV_DIAGNOSTICS.md §5).
                 wqn::RecordError(
                     "sync", "round failed outcome=%d",
                     static_cast<int>(outcome));

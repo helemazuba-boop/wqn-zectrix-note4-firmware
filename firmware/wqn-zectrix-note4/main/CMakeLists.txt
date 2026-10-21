@@ -126,7 +126,7 @@ endif()
 
 set(WQN_API_BASE "" CACHE STRING "Override the WQN ESP32 API base URL")
 
-# [dev-diag] Build identity for the Dev info dialog (DEV_DIAGNOSTICS.md §4.1).
+# [dev-diag] Build identity for the Dev info dialog (docs/development/DEV_DIAGNOSTICS.md §4.1).
 # Both values are configure-time snapshots: a commit made after configure only
 # shows up on the next reconfigure. Git absence (building from an export)
 # degrades to "unknown". Deliberately separate from WQN_FIRMWARE_VERSION --

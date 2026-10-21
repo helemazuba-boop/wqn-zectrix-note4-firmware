@@ -295,7 +295,7 @@ menu "WQN firmware"
             Adds one "开发者选项" row to the settings page that opens a
             second-level read-only list: dev info, sync diagnostics, error log,
             raw battery, storage detail and sleep/power diagnostics. Structure
-            is fixed by DEV_DIAGNOSTICS.md. Error capture (wqn::RecordError) is
+            is fixed by docs/development/DEV_DIAGNOSTICS.md. Error capture (wqn::RecordError) is
             always compiled in; this flag only controls the visible menu entry,
             so release builds keep it n (RELEASE_CHECKLIST.md asserts the
             recorded sdkconfig has it unset).

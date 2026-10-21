@@ -119,7 +119,8 @@ Display · Power · Connectivity
 
 显示、存储、Wi-Fi、音频和电源都有独立 runtime owner，业务功能通过稳定接口访问硬件资源。
 
-详见 [`ARCHITECTURE.md`](firmware/wqn-zectrix-note4/ARCHITECTURE.md)。
+详见 [固件文档索引](firmware/wqn-zectrix-note4/DOCUMENTATION.md) 或
+[架构与资源所有权](firmware/wqn-zectrix-note4/docs/architecture/ARCHITECTURE.md)。
 
 ---
 
@@ -229,13 +230,14 @@ https://wqn.helema.cn/api/esp32
 
 核心文档集中在 [`firmware/wqn-zectrix-note4/`](firmware/wqn-zectrix-note4/)：
 
-* [`ARCHITECTURE.md`](firmware/wqn-zectrix-note4/ARCHITECTURE.md) — Runtime 架构与资源所有权
-* [`RELEASE_CHECKLIST.md`](firmware/wqn-zectrix-note4/RELEASE_CHECKLIST.md) — 固件 / 云端联合发布检查
-* [`TROUBLESHOOTING.md`](firmware/wqn-zectrix-note4/TROUBLESHOOTING.md) — 调试与故障排查
-* [`STUDY_SESSION_PROTOCOL.md`](firmware/wqn-zectrix-note4/STUDY_SESSION_PROTOCOL.md) — Study Session 生命周期
-* [`WORD_PACK_V2.md`](firmware/wqn-zectrix-note4/WORD_PACK_V2.md) — Word Pack 格式
-* [`WORD_OFFLINE_OUTBOX.md`](firmware/wqn-zectrix-note4/WORD_OFFLINE_OUTBOX.md) — 单词离线提交队列
-* [`STUDY_RUNTIME_REUSE.md`](firmware/wqn-zectrix-note4/STUDY_RUNTIME_REUSE.md) — Study Runtime 复用设计
+* [`DOCUMENTATION.md`](firmware/wqn-zectrix-note4/DOCUMENTATION.md) — 文档目录和各类文档的用途
+* [`ARCHITECTURE.md`](firmware/wqn-zectrix-note4/docs/architecture/ARCHITECTURE.md) — Runtime 架构与资源所有权
+* [`RELEASE_CHECKLIST.md`](firmware/wqn-zectrix-note4/docs/release/RELEASE_CHECKLIST.md) — 固件 / 云端联合发布检查
+* [`TROUBLESHOOTING.md`](firmware/wqn-zectrix-note4/docs/development/TROUBLESHOOTING.md) — 调试与故障排查
+* [`STUDY_SESSION_PROTOCOL.md`](firmware/wqn-zectrix-note4/docs/product/word-study/STUDY_SESSION_PROTOCOL.md) — Study Session 生命周期
+* [`WORD_PACK_V2.md`](firmware/wqn-zectrix-note4/docs/product/word-study/WORD_PACK_V2.md) — Word Pack 格式
+* [`WORD_OFFLINE_OUTBOX.md`](firmware/wqn-zectrix-note4/docs/product/word-study/WORD_OFFLINE_OUTBOX.md) — 单词离线提交队列
+* [`STUDY_RUNTIME_REUSE.md`](firmware/wqn-zectrix-note4/docs/architecture/STUDY_RUNTIME_REUSE.md) — Study Runtime 复用设计
 
 
 协议、架构、恢复流程和实现细节以对应专项文档为准。

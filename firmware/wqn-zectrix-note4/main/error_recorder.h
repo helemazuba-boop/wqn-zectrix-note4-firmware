@@ -1,4 +1,4 @@
-// [dev-diag] Central recent-error ring (DEV_DIAGNOSTICS.md §5). Always
+// [dev-diag] Central recent-error ring (docs/development/DEV_DIAGNOSTICS.md §5). Always
 // compiled in: failure paths are rare and the whole module is ~0.8 KB of
 // static storage, so release builds keep the capture even though the Kconfig
 // flag hides the Dev menu rows that display it.
@@ -14,7 +14,7 @@ struct ErrorRecord {
     uint32_t seq = 0;       // 0 = never written; monotonically increasing
     int64_t unix_sec = 0;   // wall clock at record time (unsane before sync)
     int64_t uptime_ms = 0;  // monotonic uptime at record time
-    char tag[12] = {};      // subsystem label, see DEV_DIAGNOSTICS.md §5
+    char tag[12] = {};      // subsystem label, see docs/development/DEV_DIAGNOSTICS.md §5
     char msg[64] = {};      // one-line cause (esp_err_to_name / server code)
 };
 
