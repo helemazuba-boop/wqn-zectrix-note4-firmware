@@ -6,16 +6,21 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <memory>
 #include <string>
 #include <vector>
 #include "ui/navigation_model.h"
 #include "ui/ui_fonts.h"
 #include "ui/assets/brand_logo.h"
+#include "ui/assets/about_logo.h"
 #include "ui/provision_qr.h"
 #include "font_zectrix.h"
 
 using esp_err_t = int;
-constexpr int ESP_OK = 0, ESP_FAIL = 1;
+constexpr int ESP_OK = 0, ESP_FAIL = 1, ESP_ERR_NO_MEM = 2;
+constexpr int MALLOC_CAP_SPIRAM = 1, MALLOC_CAP_8BIT = 2;
+#define ESP_RETURN_ON_FALSE(condition,error,...) do { if(!(condition)){TestLog(__VA_ARGS__);return error;} } while(0)
+#define ESP_RETURN_ON_ERROR(expr,...) do { const int e=(expr); if(e!=ESP_OK){TestLog(__VA_ARGS__);return e;} } while(0)
 #define WQN_FIRMWARE_VERSION "test-live-version"
 template<class... Args> void TestLog(Args...) {}
 #define ESP_LOGW(...) TestLog(__VA_ARGS__)
@@ -30,9 +35,19 @@ std::vector<TextRun> drawn;
 int reads=0, submits=0, resets=0, powers=0, downloads=0, syncs=0, provisions=0, follows=0;
 bool persist_busy=false;
 uint32_t submit_id=71;
+int allocations=0,releases=0,gray_refreshes=0,gray_result=ESP_OK,nav_result=ESP_OK;
+bool allocation_allowed=true,frame_is_gray=false;
+std::vector<uint8_t> gray_presented;
+void* heap_caps_malloc(size_t size,int caps) {
+    CHECK(size==60000&&caps==(MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT));
+    if(!allocation_allowed)return nullptr;
+    ++allocations;return std::malloc(size);
+}
+void heap_caps_free(void* data) { if(data)++releases;std::free(data); }
 
 namespace wqn {
 constexpr int kEpdWidth=400,kEpdHeight=300;
+constexpr size_t kEpdGray4RowBytes=kEpdWidth/2,kEpdGray4PayloadSize=kEpdGray4RowBytes*kEpdHeight;
 constexpr uint8_t kOpenCodeDetailDefault=1;
 enum class ImageRenderMode { kBlackWhite, kGray16 };
 enum class ProvisionState : uint8_t { kIdle,kStarting,kScanning,kConnecting,kConnected,kFailed };
@@ -115,6 +130,11 @@ void RequestMemoryDiagnosticsDump() { ++memory_dump_requests; }
 }
 void DrawEpdPixel(int x,int y,bool ink) { if(x>=0&&x<400&&y>=0&&y<300) pixels[y*400+x]=ink; }
 void ClearEpdFramebuffer(bool white) { pixels.fill(!white); drawn.clear(); }
+bool ReadEpdPixel(int x,int y) { assert(x>=0&&x<400&&y>=0&&y<300);return pixels[y*400+x]!=0; }
+int RefreshEpdGray16(const uint8_t* data,size_t size) {
+    CHECK(size==kEpdGray4PayloadSize);++gray_refreshes;
+    gray_presented.assign(data,data+size);frame_is_gray=true;return gray_result;
+}
 extern "C" const lv_font_t SourceHanSansSC_Regular_slim;
 extern "C" bool lv_font_get_glyph_dsc_fmt_txt(const lv_font_t*,lv_font_glyph_dsc_t*,uint32_t,uint32_t) { return false; }
 extern "C" const uint8_t* lv_font_get_bitmap_fmt_txt(const lv_font_t*,uint32_t) { return nullptr; }
@@ -142,8 +162,13 @@ constexpr size_t kSettingsItemCount=wqn::kSettingsItemCount;
 @@OPTIONS_INDEX@@
 std::string BytesLabel(size_t value) { return std::to_string(value/1024)+" KiB"; }
 int regional=0,complete=0;
-int RefreshStableRegion(const UiRect& r,RefreshSchedule) { CHECK(r.x==0&&r.y==0&&r.width==400&&r.height==300);++regional;return ESP_OK; }
-int RefreshFrame(const wqn::UiFrame&,RefreshSchedule) { ++complete;return ESP_OK; }
+int RefreshStableRegion(const UiRect& r,RefreshSchedule) { CHECK(r.x==0&&r.y==0&&r.width==400&&r.height==300);++regional;frame_is_gray=false;return ESP_OK; }
+int RefreshFrame(const wqn::UiFrame&,RefreshSchedule) { ++complete;frame_is_gray=false;return ESP_OK; }
+int DrawNavigationOverlay(const wqn::UiFrame& frame) {
+    if(nav_result!=ESP_OK)return nav_result;
+    if(frame.navigation.visible)FillRect(4,214,392,78,true);
+    return ESP_OK;
+}
 esp_err_t RenderProvisioningToEpd(const wqn::UiFrame&,RefreshSchedule);
 void UpdateSettingsDiagnostics(wqn::UiState*) { ++reads; }
 void RebuildNoteWordDeckRows(wqn::UiState*) {}
@@ -178,7 +203,7 @@ wqn::UiFrame ProjectProvisioning(const wqn::UiState& state) {
     return frame;
 }
 std::string SettingsSignature(const wqn::UiFrame& frame) {
-    std::string signature;
+@@SIGNATURE_HEADER@@
 @@SIGNATURE@@
     return signature;
 }
@@ -216,6 +241,11 @@ void event(wqn::UiState& state,Button button,Event type,bool repeat=false,int64_
 bool has_text(const std::string& value) { return std::any_of(drawn.begin(),drawn.end(),[&](const auto& r){return r.text==value;}); }
 void save_frame(const std::string& directory,const std::string& name) {
     if(directory.empty())return;
+    if(frame_is_gray) {
+        std::ofstream f(directory+"/"+name+".pgm",std::ios::binary);f<<"P5\n400 300\n255\n";
+        for(auto byte:gray_presented) { f.put(static_cast<char>((byte>>4)*17));f.put(static_cast<char>((byte&15)*17)); }
+        return;
+    }
     std::ofstream f(directory+"/"+name+".pbm",std::ios::binary);f<<"P4\n400 300\n";
     for(int y=0;y<300;++y)for(int x=0;x<400;x+=8){unsigned char b=0;for(int k=0;k<8;++k)b|=pixels[y*400+x+k]<<(7-k);f.put(static_cast<char>(b));}
 }
@@ -280,6 +310,95 @@ int main(int argc,char** argv) {
     f.settings.dialog=Dialog::kAbout;RenderSettingsToEpd(f,RefreshSchedule::kConfig);
     CHECK(has_text("rongNoteBook")&&has_text("v0.1.0-live")&&has_text("ESP-IDF v5.5.4"));
     CHECK(std::all_of(pixels.begin()+274*400,pixels.end(),[](auto p){return p==0;}));
+    // Real native text is composed into 4bpp; intermediate tones are confined
+    // to the original logo bounds, and native ink wins in the overlap.
+    const auto gray_level=[](int x,int y) {
+        const size_t pixel=static_cast<size_t>(y)*400+x;
+        return (pixel&1U)?gray_presented[pixel/2]&15:gray_presented[pixel/2]>>4;
+    };
+    std::array<bool,16> tones{};
+    bool composed_correctly=true;
+    for(int y=0;y<300;++y)for(int x=0;x<400;++x) {
+        const int actual=gray_level(x,y);
+        const bool logo=x>=kSettingsDetailX&&x<kSettingsDetailX+28&&y>=37&&y<65;
+        int expected=pixels[y*400+x]?0:15;
+        if(logo&&!pixels[y*400+x]) {
+            const int source=(y-37)*28+x-kSettingsDetailX;
+            expected=(source&1)?kWLogoGray4[source/2]&15:kWLogoGray4[source/2]>>4;
+        }
+        if(actual!=expected)composed_correctly=false;
+        if(logo)tones[actual]=true;
+    }
+    CHECK(composed_correctly);
+    CHECK(std::count(tones.begin()+1,tones.end()-1,true)>=8);
+    CHECK(allocations==releases);
+    const auto native_about=pixels;
+    const auto plain_about=gray_presented;
+    const auto about_signature=SettingsSignature(f);
+    auto background=f;
+    background.settings.selected=1;background.settings.dev_selected=2;
+    background.settings.notice="后台状态";background.settings.sync_status="同步中";
+    background.settings.diagnostics.uptime_label="2h19m";
+    background.settings.diagnostics.heap_free++;
+    background.settings.diagnostics.psram_free--;
+    background.settings.diagnostics.adc_raw++;
+    background.settings.diagnostics.sync_diag_lines[0]="后台同步";
+    background.home.wifi_rssi=-53;background.home.battery_percent=83;
+    CHECK(SettingsSignature(background)==about_signature);
+    CHECK(RenderSettingsToEpd(background,RefreshSchedule::kSelection)==ESP_OK);
+    CHECK(gray_presented==plain_about&&pixels==native_about);
+    for(const auto change:{0,1,2,3,4,5,6,7}) {
+        auto visible=f;
+        switch(change) {
+            case 0:visible.settings.diagnostics.firmware_version="new-version";break;
+            case 1:visible.settings.diagnostics.idf_target="other-chip";break;
+            case 2:visible.settings.diagnostics.idf_version="new-idf";break;
+            case 3:visible.home.wifi_rssi=-60;break;
+            case 4:visible.home.wifi_connected=false;break;
+            case 5:visible.home.battery_percent=60;break;
+            case 6:visible.home.charging=true;break;
+            case 7:visible.navigation.visible=true;break;
+        }
+        CHECK(SettingsSignature(visible)!=about_signature);
+        CHECK(RenderSettingsToEpd(visible,RefreshSchedule::kConfig)==ESP_OK);
+        CHECK(gray_presented!=plain_about);
+    }
+    auto full_battery=f;full_battery.home.full=true;
+    CHECK(SettingsSignature(full_battery)==about_signature);
+    auto fallback=f;fallback.settings.diagnostics.firmware_version.clear();
+    const auto fallback_signature=SettingsSignature(fallback);
+    fallback.settings.diagnostics.firmware_version=WQN_FIRMWARE_VERSION;
+    CHECK(SettingsSignature(fallback)==fallback_signature);
+    f.navigation.visible=true;f.navigation.selected=0;
+    const auto nav_signature=SettingsSignature(f);
+    f.navigation.selected=1;CHECK(SettingsSignature(f)!=nav_signature);
+    const int old_regional=regional,old_complete=complete,old_gray=gray_refreshes;
+    for(const auto schedule:{RefreshSchedule::kConfig,RefreshSchedule::kSelection,
+                             RefreshSchedule::kNavigation,RefreshSchedule::kCommit}) {
+        CHECK(RenderSettingsToEpd(f,schedule)==ESP_OK);
+        CHECK(gray_level(10,220)==0);
+    }
+    CHECK(regional==old_regional&&complete==old_complete&&gray_refreshes==old_gray+4);
+    f.navigation.visible=false;f.navigation.selected=0;
+    CHECK(RenderSettingsToEpd(f,RefreshSchedule::kNavigation)==ESP_OK);
+    CHECK(gray_presented==plain_about);
+    const int before_failure=gray_refreshes;
+    allocation_allowed=false;
+    CHECK(RenderSettingsToEpd(f,RefreshSchedule::kConfig)==ESP_ERR_NO_MEM);
+    CHECK(gray_refreshes==before_failure&&allocations==releases);
+    allocation_allowed=true;nav_result=ESP_FAIL;
+    CHECK(RenderSettingsToEpd(f,RefreshSchedule::kNavigation)==ESP_FAIL);
+    CHECK(gray_refreshes==before_failure&&allocations==releases);
+    nav_result=ESP_OK;gray_result=ESP_FAIL;
+    CHECK(RenderSettingsToEpd(f,RefreshSchedule::kCommit)==ESP_FAIL);
+    CHECK(allocations==releases);
+    gray_result=ESP_OK;f.settings.image_render_mode=wqn::ImageRenderMode::kBlackWhite;
+    CHECK(RenderSettingsToEpd(f,RefreshSchedule::kCommit)==ESP_OK&&frame_is_gray);
+    save_frame(directory,"about");
+    f.settings.image_render_mode=wqn::ImageRenderMode::kGray16;
+    f.settings.dialog=Dialog::kNone;
+    CHECK(RenderSettingsToEpd(f,RefreshSchedule::kConfig)==ESP_OK&&!frame_is_gray);
+    CHECK(regional==old_regional+1);
     f.settings.dialog=Dialog::kImageRendering;f.settings.image_render_selected=0;
     RenderSettingsToEpd(f,RefreshSchedule::kConfig);CHECK(pixels[178*400+11]==1);CHECK(pixels[116*400+11]==0);
     f.settings.dialog=Dialog::kDefaultWordDeck;f.settings.word_deck_selected=6;RenderSettingsToEpd(f,RefreshSchedule::kConfig);CHECK(has_text("阅读中遇到的生词"));save_frame(directory,"deck-scrolled");

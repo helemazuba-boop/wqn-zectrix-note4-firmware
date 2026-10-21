@@ -16,6 +16,10 @@
 
 主实现是 `main/ui/page_settings.cpp`，几何集中在 `ui_layout.h` 的 Settings 段。全页合成后仍调用原 `RefreshStableRegion` / `RefreshFrame`，不直接访问 SPI、BUSY、EPD 电源或面板波形。完整帧合成不等于每次强制全刷；快捷菜单仍由既有合成路径处理。
 
+2026-10-21 关于页增量：仅 `kAbout` 改为整屏 4bpp / 16 阶灰度，复用现有 `RefreshEpdGray16` 与 demo 同源波形。原生文字、状态图标、坐标与返回语义保持；28×28 Logo 使用标定明度量化的渐变资源（392 字节），配网页原黑白 Logo 保持。绘制阶段临时申请 60,000 字节 PSRAM，应用栏先合成到同一帧，成功或失败都释放。灰阶驱动原有的白底 + 五轮灰阶、结束后失效黑白镜像的行为保持，返回同一 Settings screen 的根列表也会由驱动建立完整黑白基线。运行时长、内存、同步状态等未显示数据不再影响关于页签名；WiFi / 电量在同一图标档内变化不会触发灰阶重绘。
+
+本次 host 设置测试（含 ASan/UBSan）Dev 关 / 开分别 325 / 343 项通过，覆盖完整 4bpp 像素、原生文字覆盖、隐藏状态去重、可见状态变化、应用栏、内存不足和刷新失败传播；导航 1488、EPD 窗口 68 项通过。ESP-IDF 5.5.6 构建零警告，M8 与编译栈门禁通过。资源复现：`python tools/ui/generate_ui_fonts.py --brand-only --check`；预览：`python scripts/test_ui_settings.py --sanitize --render-dir DIR`，再运行 `tools/ui/render_settings_preview.py --input DIR`。预览是 host 像素，未证明物理灰阶或刷新时长。待实机检查进入关于页、状态更新、应用栏开合 / 切换 / 取消、返回设置列表和睡眠唤醒的显示效果；用户在已告知实机验收待执行后授权本地提交，本次未刷机。
+
 ## 输入、保存与后台状态
 
 - 继续复用五类设置的 persist worker 与 operation-id ACK。提交成功先显示保存中，匹配 ACK 才更新已保存值。失败保留旧值和重试候选；长按取消清除未提交候选；在途 ACK 不会被重复确认重置。

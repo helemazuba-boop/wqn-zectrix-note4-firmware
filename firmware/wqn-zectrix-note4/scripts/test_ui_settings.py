@@ -22,6 +22,7 @@ def main():
     root = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--render-dir', type=Path)
+    parser.add_argument('--sanitize', action='store_true', help='enable host address/undefined sanitizers')
     parser.add_argument('--page-source', type=Path, default=root/'main/ui/page_settings.cpp')
     parser.add_argument('--input-source', type=Path, default=root/'main/ui/ui_input.cpp')
     parser.add_argument('--refresh-source', type=Path, default=root/'main/ui/ui_refresh.cpp')
@@ -58,6 +59,7 @@ def main():
         '@@PROVISION_PAGE@@': re.sub(r'^#include[^\n]*\n', '', (root/'main/ui/page_provisioning.cpp').read_text(), flags=re.M),
         '@@INPUT@@': section(inputs, 'bool AnyLocalPersistPending(', '// [detail] Cycle the Agent tier'),
         '@@SIGNATURE@@': section(refresh, '    if (frame.screen == wqn::UiScreen::kProvisioning) {', '    for (const wqn::UiLine& line : frame.lines)'),
+        '@@SIGNATURE_HEADER@@': section(refresh, '    std::string signature = std::to_string(static_cast<int>(frame.screen));', '    const bool time_config_mode ='),
         '@@TICK@@': section(runtime, 'UiUpdate UiRuntime::DispatchSettingsTick(', 'UiUpdate UiRuntime::DispatchStatusReload('),
         '@@AUTO_ACK@@': section(runtime, 'UiUpdate UiRuntime::DispatchAutoSyncSaveResult(', 'UiUpdate UiRuntime::DispatchWordSessionResetResult('),
         '@@OTHER_ACK@@': section(runtime, 'UiUpdate UiRuntime::DispatchVolumeSaveResult(', 'UiUpdate UiRuntime::DispatchAgentDetailSaveResult('),
@@ -97,7 +99,9 @@ def main():
         unit.write_text(fixture)
         for dev in (0, 1):
             binary = folder/f'settings-{dev}'
+            sanitizer_flags = ['-fsanitize=address,undefined', '-fno-sanitize-recover=all'] if args.sanitize else []
             subprocess.run(['g++', '-std=c++17', '-Wall', '-Wextra', '-Werror', f'-DCONFIG_WQN_DEV_MENU_ENABLE={dev}',
+                            *sanitizer_flags,
                             '-I', str(folder), '-I', str(inc), '-I', str(root/'main'), '-I', str(root/'main/ui'),
                             '-I', str(qr_include), str(unit), str(root/'main/ui/navigation_model.cpp'),
                             str(root/'main/ui/provision_qr.cpp'), *objects, '-o', str(binary)], check=True, timeout=60)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate native, unpacked 1bpp UI fonts. Requires Pillow 11.3.0/fonttools 4.67.0.
+"""Generate native 1bpp UI fonts and mono/gray logos (Pillow 11.3.0/fonttools 4.67.0).
 
 The OTF/TTF sources stay outside the firmware; verify their recorded SHA-256.
 No runtime scaling, font engine, SVG decoder or new display owner is added.
@@ -121,7 +121,7 @@ class LogoPen(BasePen):
         self._closePath()
 
 
-def brand_header():
+def brand_mask():
     image = Image.new('L', (112, 112))
     pen = LogoPen(ImageDraw.Draw(image))
     svg = ET.parse(ROOT/'main/ui/assets/brand/w-logo.svg').getroot()
@@ -129,7 +129,11 @@ def brand_header():
     assert svg.attrib['viewBox'] == '2 40 252 176' and len(paths) == 8
     for path in paths:
         parse_path(path.attrib['d'], pen)
-    image = image.resize((28, 28), Image.Resampling.BOX)
+    return image.resize((28, 28), Image.Resampling.BOX)
+
+
+def brand_header():
+    image = brand_mask()
     data = bytearray()
     for y in range(28):
         for x in range(0, 32, 8):
@@ -147,12 +151,51 @@ inline constexpr WqnBitmapAsset kWLogo = {28, 28, 4, sizeof(kWLogoBits), kWLogoB
 '''
 
 
+def about_brand_header():
+    # Measured palette in the demo's ssd2683_waveform.h. Quantise the intended
+    # luminance against it rather than assume evenly spaced physical levels.
+    palette = (0, 56, 134, 204, 225, 359, 394, 465,
+               563, 585, 690, 761, 789, 866, 930, 1000)
+    mask = brand_mask()
+    levels = []
+    for y in range(28):
+        for x in range(28):
+            # Dark-to-mid gray across the original silhouette; coverage gives
+            # antialiased edges on white paper without changing the geometry.
+            ink = 56 + (465 - 56) * (x + y) / 54
+            luminance = 1000 - mask.getpixel((x, y)) / 255 * (1000 - ink)
+            levels.append(min(range(16), key=lambda i: abs(palette[i] - luminance)))
+    data = bytes((levels[i] << 4) | levels[i+1] for i in range(0, len(levels), 2))
+    return '''#pragma once
+// Generated from brand/w-logo.svg by tools/ui/generate_ui_fonts.py --brand-only.
+// About-page 4bpp: high nibble first, 0=black, 15=white. Same 28px silhouette.
+#include "brand_logo.h"
+namespace device_ui_internal {
+inline constexpr uint8_t kWLogoGray4[] = {
+'''+bytes_c(data)+'''
+};
+static_assert(sizeof(kWLogoGray4) == kWLogo.width * kWLogo.height / 2);
+}  // namespace device_ui_internal
+'''
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--source-han', type=Path, default=PROJECTS/'ref/vibecoding-voice/firmware/managed_components/lvgl__lvgl/scripts/built_in_font/SourceHanSansSC-Normal.otf')
     parser.add_argument('--noto-bold', type=Path, default=PROJECTS/'ref/crosspoint-reader/lib/EpdFont/builtinFonts/source/NotoSans/NotoSans-Bold.ttf')
     parser.add_argument('--check', action='store_true')
+    parser.add_argument('--brand-only', action='store_true', help='generate/check logos without loading font sources')
     args = parser.parse_args()
+    if args.brand_only:
+        for name, content in [('brand_logo.h', brand_header()), ('about_logo.h', about_brand_header())]:
+            target = ROOT/'main/ui/assets'/name
+            if args.check:
+                if not target.exists() or target.read_text() != content:
+                    raise SystemExit(f'FAIL: {target} differs; regenerate')
+            else:
+                target.write_text(content)
+        print('Brand assets match' if args.check else 'Generated brand assets')
+        return
     for path, expected in [(args.source_han, SOURCE_HAN_SHA), (args.noto_bold, NOTO_SHA)]:
         if hashlib.sha256(path.read_bytes()).hexdigest() != expected:
             raise ValueError(f'Unexpected source font: {path}')
@@ -168,6 +211,7 @@ def main():
         ROOT/'main/ui/ui_fonts.c': '\n'.join(c),
         ROOT/'main/ui/assets/ui_fonts_manifest.json': json.dumps(manifest, indent=2)+'\n',
         ROOT/'main/ui/assets/brand_logo.h': brand_header(),
+        ROOT/'main/ui/assets/about_logo.h': about_brand_header(),
     }
     for target, content in outputs.items():
         if args.check:

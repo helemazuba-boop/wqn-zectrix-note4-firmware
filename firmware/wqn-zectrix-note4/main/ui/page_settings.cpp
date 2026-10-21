@@ -2,15 +2,56 @@
 #include "ui_internal.h"
 #include "ui_fonts.h"
 #include "ui/assets/brand_logo.h"
+#include "ui/assets/about_logo.h"
 #include "services/connectivity_service.h"
 
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <string>
+
+#include "esp_heap_caps.h"
 
 namespace device_ui_internal {
 namespace {
+
+constexpr int kAboutLogoY = 37;
+constexpr char kAboutTag[] = "wqn_settings";
+
+esp_err_t RefreshSettingsAbout(const wqn::UiFrame& frame)
+{
+    // Called only by the EPD owner, inside RenderFrameToEpd's transaction.
+    // Keep text/layout native; only the final transmit buffer is 4bpp.
+    std::unique_ptr<uint8_t, decltype(&heap_caps_free)> gray(
+        static_cast<uint8_t*>(heap_caps_malloc(wqn::kEpdGray4PayloadSize,
+            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)), &heap_caps_free);
+    ESP_RETURN_ON_FALSE(gray != nullptr, ESP_ERR_NO_MEM, kAboutTag, "allocate gray about page");
+    ESP_RETURN_ON_ERROR(DrawNavigationOverlay(frame), kAboutTag, "draw gray about navigation");
+    for (int y = 0; y < wqn::kEpdHeight; ++y) {
+        for (int x = 0; x < wqn::kEpdWidth; x += 2) {
+            gray.get()[y * wqn::kEpdGray4RowBytes + x / 2] =
+                (wqn::ReadEpdPixel(x, y) ? 0x00 : 0xf0) |
+                (wqn::ReadEpdPixel(x + 1, y) ? 0x00 : 0x0f);
+        }
+    }
+    for (int y = 0; y < kWLogo.height; ++y) {
+        for (int x = 0; x < kWLogo.width; ++x) {
+            const int left = kSettingsDetailX + x;
+            const int top = kAboutLogoY + y;
+            // Native ink wins where the adjacent wordmark meets the logo.
+            if (wqn::ReadEpdPixel(left, top)) continue;
+            const size_t pixel = static_cast<size_t>(y) * kWLogo.width + x;
+            const uint8_t source = kWLogoGray4[pixel / 2];
+            const uint8_t level = (pixel & 1U) ? source & 0x0f : source >> 4;
+            uint8_t& target = gray.get()[top * wqn::kEpdGray4RowBytes + left / 2];
+            target = (left & 1) ? (target & 0xf0) | level : (target & 0x0f) | (level << 4);
+        }
+    }
+    // The existing gray driver invalidates its mono mirror. The next B/W
+    // page therefore establishes a full baseline, including same-screen Back.
+    return wqn::RefreshEpdGray16(gray.get(), wqn::kEpdGray4PayloadSize);
+}
 
 const lv_font_t* SettingsFont(int size)
 {
@@ -298,7 +339,7 @@ void DrawSettingsDetail(const wqn::UiFrame& frame)
             break;
         case Dialog::kAbout:
             SettingsText(kSettingsDetailX, kSettingsHeaderTextBaseline, "关于设备", 16); DrawStatusBarIcons(kSettingsRight, kStatusBarIconY, frame.home); DrawHorizontalLine(0, kSettingsHeaderDividerY, kScreenWidth);
-            DrawWqnBitmapAsset(kSettingsDetailX, 37, kWLogo, true);
+            // The 4bpp compositor places the gray logo under native text.
             SettingsText(kSettingsDetailX + 26, 62, "rongNoteBook", 24, kSettingsDetailWidth - 26, false, true, &wqn_ui_latin_24);
             SettingsText(kSettingsDetailX, 105, "Note4", 32);
             SettingsText(kSettingsDetailX, 130, "4.2 英寸墨水屏 · 400 × 300", 12); SettingsLine(149);
@@ -389,6 +430,8 @@ esp_err_t RenderSettingsToEpd(const wqn::UiFrame& frame, RefreshSchedule schedul
     wqn::ClearEpdFramebuffer(true);
     if (frame.settings.dialog == wqn::SettingsDialog::kNone) DrawSettingsMenu(frame);
     else DrawSettingsDetail(frame);
+    if (frame.settings.dialog == wqn::SettingsDialog::kAbout)
+        return RefreshSettingsAbout(frame);
     if (!frame.navigation.visible && (schedule == RefreshSchedule::kSelection || schedule == RefreshSchedule::kConfig))
         return RefreshStableRegion(kSettingsContentRect, schedule);
     return RefreshFrame(frame, schedule);

@@ -845,6 +845,21 @@ std::string FrameSignature(const wqn::UiFrame& frame)
             signature.push_back(':'); signature.append(value); signature.push_back('|');
         };
         const auto number = [&text](auto value) { text(std::to_string(value)); };
+        if (s.dialog == wqn::SettingsDialog::kAbout) {
+            // About uses a multi-pass gray refresh. Hidden diagnostics (uptime,
+            // heap, sync, etc.) must not repaint it on every status reload.
+            // These buckets match DrawStatusBarIcons; RSSI/percent movement
+            // within the same icon must not trigger another gray sequence.
+            signature.append("about-gray16|");
+            text(d.firmware_version.empty() ? WQN_FIRMWARE_VERSION : d.firmware_version);
+            text(d.idf_target); text(d.idf_version);
+            number(!frame.home.wifi_connected ? 0 : frame.home.wifi_rssi >= -55 ? 3 :
+                frame.home.wifi_rssi >= -70 ? 2 : 1);
+            number(frame.home.charging ? 5 : frame.home.full || frame.home.battery_percent >= 80 ? 4 :
+                frame.home.battery_percent >= 60 ? 3 : frame.home.battery_percent >= 40 ? 2 :
+                frame.home.battery_percent >= 20 ? 1 : 0);
+            return signature;
+        }
         number(s.selected); number(static_cast<int>(s.view)); number(s.dev_selected); number(static_cast<int>(s.dialog));
         number(s.auto_sync_selected); number(s.auto_sync_interval_min);
         number(s.volume_selected); number(s.volume_percent);
