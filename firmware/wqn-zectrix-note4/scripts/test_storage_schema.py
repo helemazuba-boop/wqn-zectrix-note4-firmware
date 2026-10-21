@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Characterize the real boot schema implementation with NVS/SPIFFS fault ports.
+"""Test real boot-schema preservation and authorized reset decisions.
 
-The current destructive decisions are recorded, not endorsed as a new policy.
+Exercise write-through and staged-commit NVS visibility.
 This does not prove NOR power-loss recovery, filesystem integrity or device HIL.
 """
 import argparse
@@ -18,9 +18,22 @@ using esp_err_t = int;
 using nvs_handle_t = uint32_t;
 constexpr int ESP_OK = 0, ESP_FAIL = -1, ESP_ERR_INVALID_ARG = 258;
 constexpr int ESP_ERR_INVALID_STATE = 259, ESP_ERR_INVALID_CRC = 265;
+constexpr int ESP_ERR_NOT_FOUND = 261;
 constexpr int ESP_ERR_NVS_NOT_FOUND = 4354, ESP_ERR_NVS_NOT_INITIALIZED = 4353;
 constexpr int ESP_ERR_NVS_NO_FREE_PAGES = 4365, ESP_ERR_NVS_NEW_VERSION_FOUND = 4368;
 constexpr int NVS_READONLY = 0, NVS_READWRITE = 1;
+enum nvs_type_t { NVS_TYPE_U32 = 4, NVS_TYPE_LEGACY = 65,
+                  NVS_TYPE_BLOB = 66, NVS_TYPE_ANY = 255 };
+struct nvs_stats_t { size_t used_entries = 0, namespace_count = 0; };
+struct nvs_entry_info_t {
+    char namespace_name[16] = {};
+    char key[16] = {};
+    nvs_type_t type = NVS_TYPE_ANY;
+};
+struct HostIterator;
+using nvs_iterator_t = HostIterator*;
+struct esp_partition_t { size_t size = 0; };
+constexpr int ESP_PARTITION_TYPE_DATA = 1, ESP_PARTITION_SUBTYPE_DATA_SPIFFS = 130;
 struct esp_vfs_spiffs_conf_t {
     const char* base_path = nullptr;
     const char* partition_label = nullptr;
@@ -44,6 +57,16 @@ esp_err_t nvs_get_blob(nvs_handle_t, const char*, void*, size_t*);
 esp_err_t nvs_set_u32(nvs_handle_t, const char*, uint32_t);
 esp_err_t nvs_set_blob(nvs_handle_t, const char*, const void*, size_t);
 esp_err_t nvs_commit(nvs_handle_t);
+esp_err_t nvs_erase_key(nvs_handle_t, const char*);
+esp_err_t nvs_erase_all(nvs_handle_t);
+esp_err_t nvs_get_stats(const char*, nvs_stats_t*);
+esp_err_t nvs_get_used_entry_count(nvs_handle_t, size_t*);
+esp_err_t nvs_entry_find(const char*, const char*, nvs_type_t, nvs_iterator_t*);
+esp_err_t nvs_entry_next(nvs_iterator_t*);
+esp_err_t nvs_entry_info(nvs_iterator_t, nvs_entry_info_t*);
+void nvs_release_iterator(nvs_iterator_t);
+const esp_partition_t* esp_partition_find_first(int, int, const char*);
+esp_err_t esp_partition_read(const esp_partition_t*, size_t, void*, size_t);
 bool esp_spiffs_mounted(const char*);
 esp_err_t esp_vfs_spiffs_register(const esp_vfs_spiffs_conf_t*);
 esp_err_t esp_vfs_spiffs_unregister(const char*);
@@ -78,24 +101,38 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--source', type=Path)
     parser.add_argument('--mutation', choices=('accept-stale-schema',
-                                              'ignore-reset-error', 'auto-format'))
+                                              'ignore-reset-error', 'auto-format',
+                                              'ignore-intent', 'allow-future-reset',
+                                              'nonempty-is-fresh', 'drop-intent-early'))
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
     source = args.source or root / 'main/runtime/storage_schema.cpp'
     body = source.read_text()
     mutations = {
         'accept-stale-schema': (
-            'if (!nvs_requires_reset &&\n        IsCurrentSchema(generation_found, generation, reset_id_size))',
-            'if (!nvs_requires_reset)'),
+            'if (!pending && IsCurrentSchema(generation_found, generation, reset_id_size))',
+            'if (!pending)'),
         'ignore-reset-error': ('if (reset_result != ESP_OK)', 'if (false)'),
         'auto-format': ('config.format_if_mount_failed = false;',
                         'config.format_if_mount_failed = true;'),
+        'ignore-intent': (
+            'if (!pending && IsCurrentSchema(generation_found, generation, reset_id_size))',
+            'if (IsCurrentSchema(generation_found, generation, reset_id_size))'),
+        'allow-future-reset': (
+            'if (generation_found && generation > kStorageSchemaGeneration)', 'if (false)'),
+        'nonempty-is-fresh': ('if (bytes[i] != 0xff)', 'if (false)'),
+        'drop-intent-early': (
+            'ESP_RETURN_ON_ERROR(ClearBusinessNvs(), kTag, "clear authorized NVS data");',
+            'ESP_RETURN_ON_ERROR(ClearResetIntent(), kTag, "incorrect early clear");\n'
+            '    ESP_RETURN_ON_ERROR(ClearBusinessNvs(), kTag, "clear authorized NVS data");'),
     }
     if args.mutation:
         old, new = mutations[args.mutation]
         if body.count(old) != 1:
             raise ValueError('schema mutation boundary drift')
         body = body.replace(old, new)
+        if args.mutation == 'drop-intent-early':
+            body = body.replace('return ClearResetIntent();', 'return ESP_OK;')
     compiler = shutil.which('g++')
     if not compiler:
         raise SystemExit('FAIL: g++ unavailable')
@@ -104,7 +141,7 @@ def main():
         (directory / 'runtime').mkdir()
         (directory / 'schema_ports.h').write_text(PORTS)
         for name in ('esp_err.h', 'esp_check.h', 'esp_log.h', 'esp_random.h',
-                     'esp_spiffs.h', 'nvs.h', 'nvs_flash.h'):
+                     'esp_spiffs.h', 'esp_partition.h', 'nvs.h', 'nvs_flash.h'):
             (directory / name).write_text('#pragma once\n#include "schema_ports.h"\n')
         (directory / 'runtime/sleep_coordinator.h').write_text(SLEEP)
         production = source

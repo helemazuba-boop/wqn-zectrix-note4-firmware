@@ -20,6 +20,7 @@ using BaseType_t = int;
 struct StaticTimer_t {};
 struct StaticSemaphore_t {};
 struct RecoveryStop {};
+struct RestartStop {};
 struct Abort { int error; };
 const char* kTag = "host-boot";
 const char* esp_err_to_name(int) { return "host-error"; }
@@ -69,11 +70,11 @@ int xTaskCreate(void (*)(void*), const char*, int, void*, int, TaskHandle_t* han
     return fail_task ? 0 : pdPASS;
 }
 [[noreturn]] void vTaskDelay(int) { throw RecoveryStop{}; }
-void esp_restart() { throw Abort{ESP_FAIL}; }
+void esp_restart() { calls.push_back("restart"); throw RestartStop{}; }
 void uart_wait_tx_idle_polling(int) {}
 void LogTokenState() {}
 void LogWifiCredentialState() {}
-void ConfirmRunningApp() {}
+void ConfirmRunningApp() { calls.push_back("confirm-app"); }
 
 namespace wqn {
 constexpr int kNote4I2cPort = 0, kNote4I2cSda = 47, kNote4I2cScl = 48, kNote4I2cClockHz = 100000;
@@ -103,7 +104,8 @@ struct StorageSchemaBootResult {
     uint32_t observed_generation = 3;
     const char* reset_id = "host";
 };
-StorageSchemaBootResult EnsureStorageSchema() { return {}; }
+StorageSchemaBootResult schema_result;
+StorageSchemaBootResult EnsureStorageSchema() { calls.push_back("schema"); return schema_result; }
 esp_err_t InitSleepCoordinator() { return ESP_OK; }
 // Diagnostics is an independent startup dependency; this fixture exercises
 // journal/startup gates rather than the diagnostic worker implementation.
@@ -143,6 +145,7 @@ void Reset() {
     g_boot_outbox_pending.store(false);
     g_word_outbox_sync_requested.store(false);
     g_full_sync_reasons.store(0);
+    wqn::runtime::schema_result = {};
 }
 bool BootRecovers() {
     try { app_main(); } catch (RecoveryStop&) { return true; }
@@ -153,6 +156,23 @@ bool NoBusiness() {
         !Called("ui") && !Called("sync-task") && !Called("power");
 }
 int main() {
+    for (int error : {ESP_ERR_INVALID_CRC, ESP_ERR_INVALID_STATE}) {
+        Reset();
+        wqn::runtime::schema_result.action = wqn::runtime::StorageSchemaBootAction::kRecoveryRequired;
+        wqn::runtime::schema_result.error = error;
+        Check(BootRecovers() && NoBusiness() && !Called("storage") && !Called("journal"),
+              "schema preservation/replay failure blocks storage and all business startup");
+        Check(Called("recovery-ui") && recovery_error == error,
+              "schema failure reaches recovery UI with original error");
+    }
+    Reset();
+    wqn::runtime::schema_result.action = wqn::runtime::StorageSchemaBootAction::kRestartRequired;
+    bool restarted = false;
+    try { app_main(); } catch (RestartStop&) { restarted = true; }
+    Check(restarted && NoBusiness() && !Called("storage") && !Called("journal") &&
+          std::find(calls.begin(), calls.end(), "confirm-app") <
+          std::find(calls.begin(), calls.end(), "restart"),
+          "completed authorized reset confirms app and restarts before business");
 #if CONFIG_WQN_WIFI_STA_ENABLE
     for (int error : {ESP_ERR_INVALID_CRC, ESP_FAIL}) {
         Reset(); journal_error = error;

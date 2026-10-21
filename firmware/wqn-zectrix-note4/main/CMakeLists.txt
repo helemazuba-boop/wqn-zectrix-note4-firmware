@@ -99,6 +99,7 @@ idf_component_register(
         esp_http_client
         esp_websocket_client
         esp_event
+        esp_partition
         esp_netif
         esp_psram
         esp_rom

@@ -1887,11 +1887,11 @@ esp_err_t SaveVolumeTransaction(void* opaque)
 
 esp_err_t FactoryResetTransaction(void*)
 {
-    ESP_LOGW(kTag, "factory reset requested: invalidating schema marker and restarting");
+    ESP_LOGW(kTag, "factory reset requested: recording reset intent and restarting");
     ESP_RETURN_ON_ERROR(
         wqn::runtime::InvalidateStorageSchemaForFactoryReset(),
         kTag,
-        "invalidate storage schema marker");
+        "record storage reset intent");
     esp_restart();
     return ESP_OK;
 }

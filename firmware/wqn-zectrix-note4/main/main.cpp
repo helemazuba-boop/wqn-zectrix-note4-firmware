@@ -138,9 +138,9 @@ extern "C" void app_main(void)
     ESP_ERROR_CHECK(wqn::runtime::InitSleepCoordinator());
     wqn::RefreshUsbPowerSleepPolicy();
 
-    // M7 boot gate: destructive local migration is complete (including its
-    // durable generation marker) before any audio, storage, network, UI or
-    // synchronization business task can start.
+    // M7 boot gate: validate storage or finish an explicitly authorized reset
+    // (including final marker and intent removal) before any audio, storage,
+    // network, UI or synchronization business task can start.
     const wqn::runtime::StorageSchemaBootResult storage_schema =
         wqn::runtime::EnsureStorageSchema();
     if (storage_schema.action ==
