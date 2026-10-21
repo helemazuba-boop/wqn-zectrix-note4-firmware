@@ -10,7 +10,7 @@
 | 文档基线 | 已本地提交 `6dcbd8a` | 12 个问题、B0–B5 路线与证据边界 |
 | B0 工具链与配置基线 | 已本地提交 `0e81504` | CI 对齐 IDF 5.5.6；干净导出树从 defaults 构建 |
 | B1 音频时间单位 | 已本地提交 `2cf5e97`，设备待测 | 修复 7 处调用及服务 API，补实际边界回归 |
-| B2 启动存储恢复 | 真实实现回归完成，行为未改 | 表征当前数据处置与中断重入；保全策略和 HIL 待后续批次 |
+| B2 启动存储恢复 | 已本地提交 `6a314bb`，行为未改 | 表征当前数据处置与中断重入；保全策略和 HIL 待后续批次 |
 
 本记录中的 host/build 结果不代表设备 HIL、音质/停止延迟、实际功耗或远端 CI。
 
@@ -154,3 +154,34 @@ schema 与既有 startup 回归也已接入 CI。最终默认构建零警告、M
 设备 HIL 均未执行。本机记录为 `/tmp/note4-batch01-storage-schema.log`、
 `/tmp/note4-batch01-schema-mutation-*.log`、`/tmp/note4-batch01-sync-boot*.log`、
 `/tmp/note4-batch01-m8-fixtures.log` 和 `/tmp/note4-batch01-final-build.log`。
+
+## 本批提交与最终构建身份
+
+| 提交 | 内容 |
+|---|---|
+| `6dcbd8a` | 可靠性问题清单、路线与文档入口 |
+| `0e81504` | CI 对齐 IDF 5.5.6；干净 defaults 构建与配置差异基线 |
+| `2cf5e97` | I2S 毫秒契约、7 处调用修复、100/1000 Hz 实际 API 边界回归 |
+| `dfc1b78` | 修复既有 startup/journal fixture 缺少诊断初始化端口的问题 |
+| `6a314bb` | 真实 schema 故障表征、三个错误变体与 CI 接线 |
+
+实现提交完成后，在干净的 `6a314bb` 上执行
+`idf.py -B build-wsl reconfigure build`，修正旧配置留下的
+`WQN_GIT_COMMIT=f9367716-dirty` 显示身份。重配置后的宏为 `6a314bb1`，没有 dirty
+后缀；此后的验收记录更新属于文档提交。运行时代码与 `2cf5e97` 一致，随后两个
+实现提交只改测试/CI。
+
+| 字段 | 本次最终本地构建 |
+|---|---|
+| 源码提交 | `6a314bb`，配置时工作区干净 |
+| SDK | IDF v5.5.6，revision `880a203ae603d08a94d06aa01e0d6761958e5e9e` |
+| 配置 | 原本地配置；100 Hz，RAM diagnostics + 24 h history 开启 |
+| app | `build-wsl/wqn-zectrix-note4.bin`，3,638,784 B |
+| app SHA-256 | `de6c02791fc6fc8586c2c6f15d24bacab287d5f9719a94c905e09a4ddc65a8fe` |
+| ELF SHA-256 | `19b8177fa63e5ddf6e75d467374df281b2c80e4741120ae4dc3dd0f3b9bab37b` |
+| 构建门 | EXIT=0，0 warnings，M8 ownership / 编译后 UI 栈检查 PASS |
+| 日志 | `/tmp/note4-batch01-identity-build.log` |
+
+本批交付是 B0 本地工具链/配置基线、B1 音频代码修复，以及 B2 测试与决策输入。
+REL-001 的设备效果、REL-002 硬件短延时、REL-003 保全行为及后续 B3–B5 仍按路线
+继续验收或实施。没有执行推送、PR、刷机、设备 HIL 或远端 CI。
