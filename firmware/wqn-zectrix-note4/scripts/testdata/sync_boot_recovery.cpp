@@ -105,6 +105,9 @@ struct StorageSchemaBootResult {
 };
 StorageSchemaBootResult EnsureStorageSchema() { return {}; }
 esp_err_t InitSleepCoordinator() { return ESP_OK; }
+// Diagnostics is an independent startup dependency; this fixture exercises
+// journal/startup gates rather than the diagnostic worker implementation.
+void InitMemoryDiagnostics() {}
 struct WakeContext { bool deep_sleep_resume = false; };
 const WakeContext& GetWakeContext() { static WakeContext wake; return wake; }
 }
