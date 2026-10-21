@@ -21,7 +21,7 @@ struct WakeArmResult {
 
 void SetPcf8563WakeAvailable(bool available);
 void CaptureWakeContext();
-WakeArmResult ArmWakeSources(bool enable_timer_wakeup, int64_t deadline_us);
+WakeArmResult ArmWakeSources(uint32_t timer_wakeup_seconds, int64_t deadline_us);
 void DisarmWakeSources();
 const char* TimerWakeSourceName(TimerWakeSource source);
 

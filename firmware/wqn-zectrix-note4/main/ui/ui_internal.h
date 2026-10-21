@@ -22,6 +22,8 @@
 #include "freertos/task.h"
 
 #include "ui_model.h"
+#include "markdown_layout.h"
+#include "ai_text_layout.h"
 #include "wqn_api.h"
 #include "config.h"
 #include "display_service.h"
@@ -35,6 +37,13 @@
 #include "ui/ui_widgets.h"
 #include "ui/assets/wqn_bitmap_asset.h"
 #include "display/display_types.h"
+
+// [agent] Forward-declared rather than including opencode_session.h here: this
+// header only needs the type for the label below, and the enum has an explicit
+// underlying type so the declaration is complete on its own.
+namespace wqn {
+enum class OpenCodeRejectReason : uint8_t;
+}  // namespace wqn
 
 namespace device_ui_internal {
 
@@ -54,6 +63,7 @@ enum class RefreshSchedule {
     kCoalesced,
     kCommit,
     kImmediate,
+    kNavigation,
 };
 
 int RefreshRank(RefreshSchedule schedule);
@@ -79,10 +89,10 @@ constexpr TickType_t kSelectionRefreshDelay = pdMS_TO_TICKS(100);
 constexpr TickType_t kConfigRefreshDelay = pdMS_TO_TICKS(120);
 constexpr TickType_t kAiRefreshDelay = pdMS_TO_TICKS(120);
 
-constexpr size_t kSettingsItemCount = 8;
-// Settings rows overflow the panel at 38px pitch; the list renders a
-// selection-following window of this many rows.
-constexpr size_t kSettingsVisibleRows = 6;
+// Aliases the model-layer constant (ui_model.h) — the row count must have
+// exactly one definition because ui_model.cpp clamps against it too.
+constexpr size_t kSettingsItemCount = wqn::kSettingsItemCount;
+constexpr size_t kSettingsVisibleRows = 5;
 constexpr uint32_t kAutoSyncOptions[] = {0, 15, 30, 60, 240};
 constexpr std::size_t kAutoSyncOptionsCount = sizeof(kAutoSyncOptions) / sizeof(kAutoSyncOptions[0]);
 constexpr int kVolumeOptions[] = {0, 25, 50, 75, 100};
@@ -90,12 +100,13 @@ constexpr std::size_t kVolumeOptionsCount = sizeof(kVolumeOptions) / sizeof(kVol
 
 // kStatusBarRect removed: dead constant (height 30 was never referenced).
 // Use kStatusBarHeight / kStatusBarDividerY in ui_layout.h instead.
-constexpr UiRect kHomePrimaryRect = {8, 33, 384, 31, "home-primary-time"};
+constexpr UiRect kHomePrimaryRect = {0, kStatusBarHeight, wqn::kEpdWidth,
+                                   kHomeAiDividerY + 2 - kStatusBarHeight, "home-clock-and-date"};
 constexpr UiRect kTimeStandbyRect = {0, 42, wqn::kEpdWidth, 172, "time-standby"};
-constexpr UiRect kTimerRunRect = {0, 58, wqn::kEpdWidth, 186, "timer-run"};
+constexpr UiRect kTimerRunRect = {0, 32, wqn::kEpdWidth, 268, "timer-run"};
 constexpr UiRect kCountdownConfigRect = {0, 70, wqn::kEpdWidth, 205, "countdown-config"};
 constexpr UiRect kPomodoroConfigRect = {0, 54, wqn::kEpdWidth, 218, "pomodoro-config"};
-constexpr UiRect kSettingsContentRect = {0, 32, wqn::kEpdWidth, 252, "settings-content"};
+constexpr UiRect kSettingsContentRect = {0, 0, wqn::kEpdWidth, wqn::kEpdHeight, "settings-page"};
 
 UiRect ConfigRefreshRect(const wqn::TimeAppState& time_app);
 
@@ -106,9 +117,10 @@ struct BatteryReading {
     int percent = 0;
     int chrg_l = 1;
     int stdby_h = 0;
+    bool usb_host_connected = false;
     bool charging = false;
     bool full = false;
-    bool power_present_or_status_known = false;
+    bool external_power_present = false;
     const char* pmu_status = "unknown";
     bool pmu_implemented = false;
 };
@@ -128,9 +140,8 @@ void UpdateSettingsDiagnostics(wqn::UiState* state);
 
 void DrawStatusBar(const char* title, const wqn::HomeSummary& home);
 void DrawClockStatusBar(const wqn::HomeSummary& home);
-void DrawProgressBar(int x, int y, int width, int height, int current, int total);
 void DrawConfigBox(int x, int y, int width, int height, const std::string& value, const std::string& label, bool selected);
-void DrawActionBox(int x, int y, int width, const std::string& label, bool selected);
+void DrawActionBox(int x, int y, int width, int height, const std::string& label, bool selected);
 
 // ---- Todo/Word cloud request/result types ----------------------------------
 
@@ -143,13 +154,18 @@ struct TodoCloudRequest {
     TodoCloudOp op = TodoCloudOp::kRefresh;
     char todo_id[64] = {};
     char cursor[160] = {};
+    uint64_t content_target_revision = 0;
 };
 
 struct TodoCloudResult {
     TodoCloudOp op = TodoCloudOp::kRefresh;
+    bool cursor_request = false;
+    bool has_refreshed_page = false;
+    char cursor[160] = {};
     esp_err_t result = ESP_FAIL;
     bool auth_required = false;
     char todo_id[64] = {};
+    uint64_t content_target_revision = 0;
     wqn::WqnTodoListPage page;
     wqn::WqnTodoItem todo;
 };
@@ -158,8 +174,6 @@ enum class WordCloudOp {
     kPackSync,
     kStartSession,
     kFetchSessionPage,
-    kSearch,
-    kAiLookup,
 };
 
 struct WordCloudRequest {
@@ -169,12 +183,33 @@ struct WordCloudRequest {
     char cursor[65] = {};
     uint16_t limit = 0;
     uint8_t study_mode = 0;
-    char query[96] = {};
+    // [word-modes-v2] kStartSession only: the sequential walk's continuation
+    // point and the intake head's daily new-word budget. The runner rebuilds
+    // the protocol request from this struct, so both must travel here.
+    // -1 = unset: only the sequential builder branch serializes start_index,
+    // and a uint32_t here turned the sentinel into a literal 0 the server
+    // rejected (WORD_START_INDEX_UNSUPPORTED).
+    int32_t start_index = -1;
+    uint16_t new_word_limit = 0;
+    // [deck-scope] kStartSession only: the deck the UI scoped the session to.
+    // Empty means "every visible deck", which is what the cloud falls back to
+    // -- but without carrying the id the device's deck choice silently never
+    // reached the server at all. Mirrors NoteCloudRequest::notebook_id.
+    char deck_id[37] = {};
+    // [ui-gates] kFetchSessionPage only: handle of the session snapshot parked
+    // for this page (see g_page_extension in word_cloud.cpp). The snapshot is
+    // 168 bytes but not trivially copyable, and CloudJob must stay POD for the
+    // union -- and only one candidate page is ever in flight, so a handle is
+    // cheaper than a copy and just as safe.
+    uint32_t page_extension_handle = 0;
     // [deck-scope] Scope epoch sampled when the request was QUEUED (session
     // ops only). The runner stamps it into the persisted session (the store
     // rejects a save whose epoch is stale) and echoes it in the result so the
     // apply side drops results that straddled a default-deck switch.
     uint32_t scope_generation = 0;
+    // kPackSync only: coordinator claim bound to this bulk command.
+    uint32_t content_sync_generation = 0;
+    uint64_t content_target_revision = 0;
 };
 
 struct WordCloudResult {
@@ -186,9 +221,6 @@ struct WordCloudResult {
     wqn::protocol::word_study_v1::SessionData session;
     wqn::protocol::word_study_v1::CandidatePageData candidate_page;
     wqn::protocol::v3::Error protocol_error;
-    wqn::WqnWordSearchResult search;
-    wqn::WqnWordAiLookupResult lookup;
-    std::string query;
     std::string message;
     // kStartSession: the compacted session snapshot, already persisted on the
     // runner thread so the 36 KB fsync never runs on the UI task. The apply
@@ -230,10 +262,14 @@ struct NoteCloudRequest {
     char note_id[37] = {};
     char image_id[65] = {};
     uint8_t image_index = 0;
+    bool image_gray4 = false;
     // kFetchImage / kFetchNotebookPack: identity of this dispatch in the
     // transfer-progress mailbox; the UI only consumes progress whose
     // generation matches its own record (stale-download defense).
     uint32_t progress_generation = 0;
+    // kPackSync only: coordinator claim bound to this bulk command.
+    uint32_t content_sync_generation = 0;
+    uint64_t content_target_revision = 0;
 };
 
 struct NoteCloudResult {
@@ -279,6 +315,10 @@ struct ProblemCloudRequest {
     uint8_t image_index = 0;
     // 0 = assets, 1 = solution (the /v3 image route path segment).
     uint8_t image_kind = 0;
+    bool image_gray4 = false;
+    // kPackSync only: coordinator claim bound to this bulk command.
+    uint32_t content_sync_generation = 0;
+    uint64_t content_target_revision = 0;
 };
 
 struct ProblemCloudResult {
@@ -291,10 +331,6 @@ struct ProblemCloudResult {
     // kFetchImage: validated WQNI bytes (header + payload) and their id.
     std::string image_id;
     std::shared_ptr<const std::vector<uint8_t>> image_wqni;
-};
-
-struct ProblemCloudResultReady {
-    uint32_t generation = 0;
 };
 
 // --- Unified cloud runner ---------------------------------------------------
@@ -310,7 +346,11 @@ enum class CloudDomain : uint8_t {
     kWord,
     kNote,
     kProblem,
+    kWordBulk,
+    kNoteBulk,
+    kProblemBulk,
 };
+inline constexpr size_t kCloudDomainCount = 7;
 
 enum class CloudLane : uint8_t {
     kInteractive,
@@ -372,6 +412,12 @@ void NotifyUiTask();
 void PublishCloudResult(CloudDomain domain, uint32_t generation);
 bool TakeCloudResultToApply(CloudDomain domain, uint32_t* generation);
 void AckCloudResult(CloudDomain domain, uint32_t generation);
+// [deferral-observability] Non-consuming twin of TakeCloudResultToApply: is a
+// published result still waiting to be applied? Needed because the
+// commit-pending deferral in DeviceUiTask only misbehaves when it is actually
+// holding a result back -- probing with Take* would consume it. Same mailbox
+// state, same atomics, no side effects.
+bool HasCloudResultPending(CloudDomain domain);
 
 static_assert(std::is_trivially_copyable_v<TodoCloudResultReady>);
 static_assert(std::is_trivially_copyable_v<WordCloudResultReady>);
@@ -380,22 +426,25 @@ static_assert(std::is_trivially_copyable_v<CloudJob>);
 static_assert(std::is_trivially_copyable_v<CloudResultReady>);
 
 void SendTodoCloudResult();
-void SendWordCloudResult();
-void SendNoteCloudResult();
-void SendProblemCloudResult();
+void SendWordCloudResult(CloudDomain domain);
+void SendNoteCloudResult(CloudDomain domain);
+void SendProblemCloudResult(CloudDomain domain);
 const TodoCloudResult* PeekTodoCloudResult(uint32_t generation);
-WordCloudResult* PeekWordCloudResult(uint32_t generation);
-NoteCloudResult* PeekNoteCloudResult(uint32_t generation);
-ProblemCloudResult* PeekProblemCloudResult(uint32_t generation);
+WordCloudResult* PeekWordCloudResult(CloudDomain domain, uint32_t generation);
+NoteCloudResult* PeekNoteCloudResult(CloudDomain domain, uint32_t generation);
+ProblemCloudResult* PeekProblemCloudResult(CloudDomain domain, uint32_t generation);
 
 bool IsTodoCloudBusy();
 bool IsWordCloudBusy();
 bool IsNoteCloudBusy();
 bool IsProblemCloudBusy();
+bool IsWordPackCloudBusy();
+bool IsNotePackCloudBusy();
+bool IsProblemPackCloudBusy();
 void FinishTodoCloudRequest();
-void FinishWordCloudRequest();
-void FinishNoteCloudRequest();
-void FinishProblemCloudRequest();
+void FinishWordCloudRequest(CloudDomain domain = CloudDomain::kWord);
+void FinishNoteCloudRequest(CloudDomain domain = CloudDomain::kNote);
+void FinishProblemCloudRequest(CloudDomain domain = CloudDomain::kProblem);
 
 bool QueueTodoCloudRequest(const TodoCloudRequest& request);
 bool QueueWordCloudRequest(const WordCloudRequest& request);
@@ -403,18 +452,23 @@ bool QueueNoteCloudRequest(const NoteCloudRequest& request);
 bool QueueProblemCloudRequest(const ProblemCloudRequest& request);
 
 bool QueueTodoRefresh();
+bool QueueTodoRefreshForRevision(uint64_t target_revision);
 bool QueueTodoRefreshCursor(const std::string& cursor);
-bool QueueTodoComplete(const std::string& todo_id);
+bool QueueTodoComplete(const std::string& todo_id, const std::string& cursor);
 
 bool QueueWordReviewRefresh();
 bool QueueWordSessionStart(
     const wqn::protocol::word_study_v1::CreateSessionRequest& request);
+// [ui-gates] `snapshot` is the session as of THIS request: the runner extends
+// and persists it, so a page that lands after the user has answered more words
+// cannot clobber the newer durable state (the apply step stamps it).
 bool QueueWordCandidatePage(
     const std::string& session_id,
-    const wqn::protocol::word_study_v1::CandidatePageRequest& request);
+    const wqn::protocol::word_study_v1::CandidatePageRequest& request,
+    const wqn::PersistedWordSession& snapshot);
+void PumpWordSessionStart(UiRuntime* runtime);
 void PumpWordCandidatePrefetch(UiRuntime* runtime);
-bool QueueWordSearch(const wqn::WqnWordSearchRequest& search);
-bool QueueWordAiLookup(const wqn::WqnWordAiLookupRequest& lookup);
+void PumpWordCardPrefetch(UiRuntime* runtime);
 // Rebuilds the note screen's [词] rows from word_app.deck_catalog, excluding
 // the current default deck (it lives on the word page itself).
 void RebuildNoteWordDeckRows(wqn::UiState* state);
@@ -428,6 +482,7 @@ bool QueueNoteCandidatePage(
 void PumpNoteCandidatePrefetch(UiRuntime* runtime);
 bool QueueNoteImageFetch(
     const std::string& note_id, uint8_t image_index, const std::string& image_id,
+    bool gray4,
     uint32_t progress_generation);
 void PumpNoteImageFetch(UiRuntime* runtime);
 bool QueueNoteBodyPackFetch(
@@ -451,7 +506,8 @@ bool QueueProblemImageFetch(
     const std::string& problem_id,
     bool is_solution,
     uint8_t image_index,
-    const std::string& image_id);
+    const std::string& image_id,
+    bool gray4);
 void PumpProblemImageFetch(UiRuntime* runtime);
 // [persist-worker] Problem verdict commit pump (c3). Reserves a persist slot,
 // takes the armed verdict and enqueues it to the worker (was the cloud lane).
@@ -463,11 +519,15 @@ bool ApplyTodoCloudResult(
     const TodoCloudResult& result,
     bool* content_changed = nullptr);
 bool ApplyWordCloudResult(wqn::UiState* state, WordCloudResult& result);
-bool ApplyNoteCloudResult(wqn::UiState* state, NoteCloudResult& result);
+bool ApplyNoteCloudResult(
+    wqn::UiState* state,
+    NoteCloudResult& result,
+    bool* content_changed = nullptr);
 bool ApplyProblemCloudResult(wqn::UiState* state, ProblemCloudResult& result);
 
 bool RefreshTodosFromCloud(wqn::UiState* state);
 RefreshSchedule CompleteSelectedTodo(wqn::UiState* state);
+RefreshSchedule HandleTodoInput(wqn::UiState* state, wqn::UiInput input);
 
 void ExecuteTodoCloudRequest(const TodoCloudRequest& request);
 void ExecuteWordCloudRequest(const WordCloudRequest& request);
@@ -478,13 +538,17 @@ bool LoadValidTokenForTodo(std::string* token);
 
 // ---- State / input ----------------------------------------------------------
 
-bool LoadUiState(wqn::UiState* state);
+bool LoadUiState(
+    wqn::UiState* state,
+    bool restore_screen_from_rtc = false);
+void RetainTimeAppState(const wqn::TimeAppState& state);
+bool RestoreRetainedTimeApp(wqn::TimeAppState* state);
+bool HasRetainedTimeApp();
 void BuildHomeSummary(wqn::UiState* state);
-RefreshSchedule QueueSelectedReview(wqn::UiState* state);
+void UpdateHomeAiSummary(wqn::UiState* state, int64_t now_ms);
 
 bool SameTimeAppState(const wqn::TimeAppState& a, const wqn::TimeAppState& b);
 bool TimeAppStructureChanged(const wqn::TimeAppState& before, const wqn::TimeAppState& after);
-bool ShouldRefreshTimeTick(const wqn::UiState& state);
 bool ScreenUsesClockMinute(const wqn::UiState& state);
 
 RefreshSchedule ApplyButtonEvent(
@@ -496,6 +560,10 @@ void OpenSettingsDialog(wqn::UiState* state, wqn::SettingsDialog dialog);
 
 // ---- Render -----------------------------------------------------------------
 
+// Read/written only by the EPD owner, never retained across sleep.
+extern bool g_last_rendered_navigation_visible;
+esp_err_t DrawNavigationOverlay(const wqn::UiFrame& frame);
+esp_err_t RefreshNavigationGrayImage(const wqn::UiFrame& frame, const uint8_t* gray4, size_t size);
 esp_err_t RenderFrameToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule);
 wqn::display::DisplaySubmission RequestEpdUiRefresh(
     const wqn::UiFrame& frame,
@@ -504,12 +572,8 @@ wqn::display::DisplaySubmission RequestEpdUiRefresh(
     RefreshSchedule schedule,
     wqn::display::WaveformRequirement waveform);
 void AcknowledgeDisplayResult(wqn::display::DisplayRevision revision);
-// [epd-owner] Ask the EPD refresh task (the sole panel owner) to run idle
-// maintenance (heavy-partial cleanup full refresh + rail power-off). The UI
-// task must NOT touch the panel directly: it only sets the request flag and
-// notifies. The EPD task runs it from its idle wait, after re-checking that no
-// frame is pending and no activity happened since the request.
-void RequestEpdIdleMaintenance();
+// [epd-owner] Sole panel owner: renders frames and independently schedules
+// idle maintenance, rechecking queued frames and activity before hardware work.
 void EpdRefreshTask(void*);
 void DeviceUiTask(void*);
 
@@ -518,7 +582,6 @@ std::string FrameSignature(const wqn::UiFrame& frame);
 // ---- Clock ------------------------------------------------------------------
 
 std::time_t CurrentUnixTime();
-bool SystemClockIsReasonable();
 std::string CurrentClockLabel();
 std::string CurrentDateLabel();
 std::string CurrentIsoTimestamp();
@@ -526,7 +589,6 @@ void SeedClockFromBuildTimeIfNeeded();
 const char* TimeTileTitle(wqn::TimeTile tile);
 std::string ChooseHomePrimaryTimeLine(const wqn::TimeAppState& time_app);
 void UpdateHomePrimaryTimeLine(wqn::UiState* state);
-int CountReviewDueLikeProblems(const std::vector<wqn::CachedProblem>& problems);
 int CountdownStartField();
 int PomodoroStartField();
 std::string TwoDigit(int value);
@@ -536,14 +598,17 @@ std::string TwoDigit(int value);
 void DrawHorizontalLine(int x, int y, int width);
 void DrawVerticalLine(int x, int y, int height);
 void DrawRect(int x, int y, int width, int height);
+// [agent] Dashed outline for the Agent tier's pending bubble (uncommitted
+// transcript / permission ask). Same dash/gap cadence as
+// DrawDashedVerticalLine.
+void DrawDashedRect(int x, int y, int width, int height);
 void DrawRoundedRect(int x, int y, int width, int height, int radius);
+// [rowfill] Filled rounded rect: the density-list row selection block and the
+// rounded reverse-fill action block (SelectionStyle::kRowFill / kInvert).
+void FillRoundedRect(int x, int y, int width, int height, int radius, bool black = true);
 void FillRect(int x, int y, int width, int height, bool black);
 void ClearRect(const UiRect& rect);
 // [L3-semantics] Named black-fill wrappers (defined in graphics.cpp). L2 migrates call sites.
-void DrawSelectedFill(int x, int y, int width, int height);
-void DrawProgressFill(int x, int y, int width, int height);
-void DrawRoleBar(int x, int y, int width, int height);
-void DrawActivityDot(int x, int y, int size);
 void DrawWqnBitmapAsset(int x, int y, const WqnBitmapAsset& asset, bool black = true);
 esp_err_t RefreshRegion(const UiRect& rect, RefreshSchedule schedule);
 esp_err_t RefreshStableRegion(const UiRect& rect, RefreshSchedule schedule);
@@ -551,30 +616,32 @@ esp_err_t RefreshFrame(const wqn::UiFrame& frame, RefreshSchedule schedule);
 
 esp_err_t DrawClippedText(int x, int y, int max_width, const std::string& text, bool black = true);
 esp_err_t DrawCenteredText(int x, int y, int width, const std::string& text, bool black = true);
-esp_err_t DrawWrappedText(int x, int y, int width, const std::string& text, int max_lines, bool black = true);
+// Shared Markdown row renderer (markdown_render.cpp). The MdLine must come
+// from LayoutMarkdown at the same content_w or geometry desyncs.
+esp_err_t DrawMarkdownLine(const MdLine& line, int x, int y, int content_w, int line_h,
+                            const lv_font_t* font = nullptr);
 std::string LimitForEpd(const std::string& text);
-std::string Utf8PageSlice(const std::string& text, size_t page, size_t chars_per_page);
-std::string JoinAiFunctionCallSummaries(const std::vector<std::string>& summaries);
-std::string FormatAiFunctionCallSummaries(const std::vector<std::string>& summaries);
-
 // ---- Bitmap digits and status icons ----------------------------------------
 
 void DrawStandbyClockDigits(int y, const std::string& text);
 void DrawConfigDigitsCentered(int x, int y, int width, const std::string& ascii, bool black = true);
-// Draw the running-timer duration with the 48px artistic digit font, centered.
-void DrawTimerDigitsArt(int y, const std::string& ascii_duration);
+// Left-aligned run of the 48px time digits ([0-9:] only) plus its width, for
+// hero lines that compose digits with a drawn sign and a CJK unit.
+void DrawDigit48Run(int x, int y, const std::string& text, bool black = true);
+int MeasureDigit48Run(const std::string& text);
 // Draw the existing WiFi glyph only, right-aligned at right_edge.
 int DrawWifiStatusIcon(int right_edge, int y, const wqn::HomeSummary& home);
+// Draw the existing battery glyph only, right-aligned at right_edge.
+int DrawBatteryStatusIcon(int right_edge, int y, const wqn::HomeSummary& home);
 // Draw [wifi][battery] status icons right-aligned at right_edge.
 // Returns the x just left of the cluster (for drawing time/other text before it).
 int DrawStatusBarIcons(int right_edge, int y, const wqn::HomeSummary& home);
 
 // ---- Home page --------------------------------------------------------------
 
-esp_err_t DrawMetricCard(int x, int y, int width, const wqn::HomeMetric& metric);
-esp_err_t DrawHomeTaskRow(int x, int y, int width, int index, const wqn::HomeTask& task, bool selected);
 esp_err_t RenderHomeToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule);
 esp_err_t RenderHomePrimaryRegion(const wqn::HomeSummary& home, RefreshSchedule schedule);
+esp_err_t RenderHomeStatusBarRegion(const wqn::HomeSummary& home, RefreshSchedule schedule);
 
 // ---- Time page --------------------------------------------------------------
 
@@ -585,6 +652,7 @@ esp_err_t RenderPomodoroConfigToEpd(const wqn::TimeAppState& time_app);
 int TimerInitialSeconds(const wqn::TimeAppState& time_app);
 esp_err_t RenderTimerRunToEpd(const wqn::TimeAppState& time_app);
 esp_err_t RenderTimerRunRegion(const wqn::TimeAppState& time_app, RefreshSchedule schedule);
+esp_err_t RenderTimerActionRegion(const wqn::TimeAppState& time_app, RefreshSchedule schedule);
 esp_err_t RenderTimeConfigRegion(const wqn::TimeAppState& time_app, RefreshSchedule schedule);
 esp_err_t RenderTimeToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule);
 
@@ -592,6 +660,113 @@ esp_err_t RenderTimeToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule);
 
 esp_err_t RenderAiToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule);
 const char* AiStatusLabel(wqn::AiSessionStatus status);
+void GetAiScrollBounds(
+    std::shared_ptr<const wqn::AiHistorySnapshot> snapshot,
+    bool expand_content,
+    int bottom_pad,
+    int32_t* out_min_scroll,
+    int32_t* out_max_scroll);
+
+// [agent] Single source of truth for the AI history's vertical geometry
+// (page_ai.cpp). The turn-jump helper reuses it so the jump target and the
+// scroll clamp can never disagree about where a block sits.
+struct AiHistoryLayout {
+    std::vector<int> heights;       // chronological, per message
+    std::vector<int> virtual_tops;  // chronological, includes kAiLineGap
+    std::vector<std::shared_ptr<const AiTextLayout>> text;
+    int total_content_h = 0;
+    int anchor_top = 0;  // virtual top of the newest user message (0 if none)
+};
+std::shared_ptr<const AiHistoryLayout> GetAiHistoryLayout(
+    const std::shared_ptr<const wqn::AiHistorySnapshot>& snapshot, bool expand_content);
+// Scroll offset that brings the previous/next answer to the top of the
+// viewport. `direction` < 0 = older, > 0 = newer. Returns false when there is
+// no answer in that direction, so the caller can show the "已最新" style hint
+// instead of moving.
+bool GetAiTurnJumpOffsetLines(
+    std::shared_ptr<const wqn::AiHistorySnapshot> snapshot,
+    bool expand_content,
+    int bottom_pad,
+    int32_t current_scroll,
+    int direction,
+    int32_t* out_scroll);
+// [follow] Scroll offset that parks the newest answer's first line at the top
+// of the viewport, or false when the newest entry is not a non-empty assistant
+// body (nothing to park on yet -- keep following the live tail). Same geometry
+// pass and clamp as GetAiScrollBounds, so a follow target and the scroll bounds
+// can never disagree.
+bool GetAiNewestAnswerTopOffsetLines(
+    std::shared_ptr<const wqn::AiHistorySnapshot> snapshot,
+    bool expand_content,
+    int bottom_pad,
+    int32_t* out_scroll);
+
+// [agent] The Agent tier is rendered by the AI page; this is its branch.
+esp_err_t RenderAgentAiToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule);
+// Shared chat-viewport draw (page_ai.cpp). The Agent tier renders its own
+// status bar and bottom band but reuses this verbatim, so the two tiers can
+// never disagree about how a bubble or a tool block looks.
+//
+// `bottom_pad` is what this frame leaves clear at the panel's bottom. Pass 0
+// unless the caller actually draws something there: RenderAiHistoryViewport and
+// the three scroll helpers above all read the same value, and a caller that
+// answers it one way for the renderer and another for the clamp is the desync
+// their comments warn about.
+void RenderAiHistoryViewport(const wqn::AiSessionState& ai,
+                             const std::shared_ptr<const wqn::AiHistorySnapshot>& snapshot,
+                             int32_t scroll_offset_lines,
+                             int bottom_pad);
+// Option-bar slots for the Agent tier's two-choice states. The order is the
+// ↑/↓ cycle order and the confirm action runs the focused slot.
+//
+// kQuestion is deliberately NOT part of this enum: its slots are the options the
+// gateway projected for a form, so their labels are data, not constants. The
+// bar still shows two slots at a time (the geometry and the ↑/↓ arithmetic
+// assume exactly two), but it now walks the whole list as a window: the
+// question item count is the projected options plus one trailing pseudo-option
+// (自定义回答), which escapes the ask by interrupting the run.
+enum class AgentOption : uint8_t {
+    kSend,
+    kReinput,
+    kApprove,
+    kDeny,
+    kCount,
+};
+// Which two-choice state the option bar currently shows, if any.
+enum class AgentOptionMode : uint8_t {
+    kNone,
+    kConfirmSend,   // voice transcript armed: 发送 / 重新输入
+    kPermission,    // gateway ask pending: 同意 / 拒绝
+    kQuestion,      // gateway form pending: projected options + 自定义回答
+};
+AgentOptionMode AgentOptionModeFor(const wqn::AgentSessionState& agent);
+// [band] How much of the panel's bottom the current frame leaves clear for the
+// Agent tier's option bar: its full height while there is something to answer,
+// and 0 for everything else -- including on the STD/Flash tier, which has no
+// bottom band at all.
+//
+// Every caller that needs this number asks here rather than deriving it, because
+// the renderer and the scroll clamp must agree. A tier that reserved 22 for the
+// clip and 0 for the clamp would let a keypress ask for a window the viewport
+// cannot draw -- which is precisely the desync page_ai.cpp's geometry comments
+// have been warning about for five rounds.
+int AiBottomReserve(const wqn::AgentSessionState& agent);
+// [agent] Names why an Agent request was refused. Every one of these used to
+// log the same "busy or empty list", which is indistinguishable when reading a
+// device log after the fact. Was static in ui_input.cpp; promoted when the
+// picker's stale-marker refresh (ui_runtime.cpp) became a second caller.
+const char* AgentRejectLabel(wqn::OpenCodeRejectReason reason);
+// The focused slot, clamped to the two the current mode actually offers.
+AgentOption AgentFocusedOption(AgentOptionMode mode, uint8_t focused);
+const char* AgentOptionLabel(AgentOption option);
+// Question walk-list length: the projected options plus the trailing
+// 自定义回答 escape (so at least one item, even for a zero-option ask).
+int AgentQuestionItemCount(const wqn::AgentSessionState& agent);
+// First item of the two-slot window that keeps the focused item visible.
+int AgentQuestionWindowStart(const wqn::AgentSessionState& agent, uint8_t focused);
+// Focus index shared by the kQuestion render and its confirm action: the item
+// count is dynamic, so this clamps a carried-over focus into range.
+int AgentQuestionFocusedItem(const wqn::AgentSessionState& agent, uint8_t focused);
 
 // ---- Word page --------------------------------------------------------------
 
@@ -607,31 +782,18 @@ esp_err_t RenderProblemBrowseToEpd(const wqn::UiFrame& frame, RefreshSchedule sc
 
 // ---- Settings page ----------------------------------------------------------
 
-esp_err_t DrawSettingsRow(size_t row_index, int y, const std::string& title, const std::string& value, bool selected);
-esp_err_t DrawSettingsDialogBox(const std::string& title);
-esp_err_t DrawSettingsOptionCard(int x, int y, int width, const std::string& label, bool selected);
-void DrawSettingsProgressBar(int x, int y, int width, int current, int total);
-esp_err_t RenderSettingsDialog(const wqn::SettingsAppState& settings);
 esp_err_t RenderSettingsToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule);
+esp_err_t RenderProvisioningToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule);
+bool UpdateSettingsDeckStatus(wqn::UiState* state);
+bool AnyLocalPersistPending(const wqn::UiState& state);
+void InstallSettingsDeckOptions(wqn::UiState* state, bool preserve_focus);
 
 // ---- Todo page --------------------------------------------------------------
 
-void DrawDashedVerticalLine(int x, int y, int height);
-void DrawTimelineNode(int cx, int cy, bool selected);
-esp_err_t DrawTodoStatusBar(const wqn::TodoUiState& todo, const wqn::HomeSummary& home);
-esp_err_t DrawTodoCard(const wqn::WqnTodoItem& item, bool selected, wqn::TodoSyncStatus sync_status, int x, int y, int width, int height);
-esp_err_t DrawTodoEmptyState(const wqn::TodoUiState& todo);
 esp_err_t RenderTodoToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule);
-std::string TodoDueTimeLabel(const std::string& due_at);
-std::string TodoDueDateLabel(const std::string& due_at);
-const char* TodoSyncStatusText(wqn::TodoSyncStatus status);
-std::string TodoItemStatusText(const wqn::WqnTodoItem& item, bool selected, wqn::TodoSyncStatus sync_status);
-std::string TodoCardMetaLabel(const wqn::WqnTodoItem& item, bool selected, wqn::TodoSyncStatus sync_status);
-std::string TodoStatusNote(const wqn::TodoUiState& todo);
-int TodoPendingCount(const wqn::TodoUiState& todo);
-int TodoOverdueCount(const wqn::TodoUiState& todo);
-bool ParseTodoDueTime(const std::string& due_at, std::tm* due_tm);
-size_t TodoVisibleStart(const wqn::TodoUiState& todo, size_t selected, size_t visible_count);
+// EPD-owner only: another page can replace the current draw buffer even when
+// its presentation fails and g_last_rendered_screen still says Todo.
+void InvalidateTodoRenderCache();
 
 // ---- Extern globals (defined in ui_refresh.cpp) ----------------------------
 

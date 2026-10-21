@@ -1,0 +1,525 @@
+// Agent tier on the AI page: the OpenCode gateway rendered through the shared
+// chat viewport, plus the two interaction surfaces the gateway needs that the
+// STD/Pro tiers do not have --
+//
+//   1. a session picker (the gateway's conversations are server-side and
+//      long-lived, so the user must be able to switch and to re-attach), and
+//   2. an option bar (发送/重新输入 for the voice transcript, 同意/拒绝 for a
+//      permission ask) driven by ↑/↓ + confirm. A question ask walks the
+//      gateway's projected options as a two-slot window over the whole list,
+//      with a trailing 自定义回答 pseudo-option that aborts the run.
+//
+// Both are drawn with a dashed outline: they are uncommitted. The transcript
+// and the permission ask only enter history once the user acts on them, so
+// they must not read as settled chat entries.
+//
+// The status bar keeps the same edit-mode slot numbering STD/Pro uses (0 =
+// tier, 1..5 = cluster), so the input path's index arithmetic stays tier-
+// independent -- the cluster LENGTH and the trash index are the two
+// tier-dependent values (five slots here, four on STD/Pro). Slot 4 is this
+// tier's 详细程度 control (the ?detail=N tier the gateway projects at); slot 5
+// (clear) is shared verbatim with STD/Pro.
+
+#include "ui_internal.h"
+#include "ui_widgets.h"
+
+#include <algorithm>
+#include <cstdio>
+#include <ctime>
+#include <string>
+#include <vector>
+
+#include "ai_feature.h"
+#include "ai_history.h"
+#include "display_service.h"
+#include "esp_log.h"
+#include "esp_timer.h"
+#include "opencode_session.h"
+#include "ai_native_text.h"
+#include "ui/assets/font_wqn_inline_12_1.h"
+#include "ui/assets/font_wqn_ui_16_1.h"
+
+namespace device_ui_internal {
+
+constexpr char kTag[] = "wqn_ui";
+
+// [agent] Option bar geometry. It lives in the 22 px bottom band
+// (kAiBottomBandH), reserved only while there is something to answer -- with the
+// band clear the transcript runs to the panel's last pixel instead of stranding
+// that strip. It still leaves the ▼ chevron its column: the band clears and lays
+// out only the width left of kAgentIndicatorColumn below, so a pending decision
+// and the scroll position stay legible together.
+constexpr int kAgentBarY = wqn::kEpdHeight - kAiBottomBandH;  // 278
+constexpr int kAgentBarH = kAiBottomBandH;                    // 22
+constexpr int kAgentBarTextY = kAgentBarY + 3;                      // baseline
+// [scroll-indicator] The right-hand column page_ai.cpp reserves for the ▼/▲
+// scroll chevrons (kEpdWidth - 40, 36 px wide). This tier's bottom band sits in
+// the same 22 px strip the ▼ lives in, so the band clears and lays out only the
+// width LEFT of that column.
+//
+// It used to clear and fill the full 400 px, which wiped the ▼ on every frame it
+// drew -- and the band is drawn on nearly every frame, because every phase
+// projected a gesture hint (B4's whole point). The Agent tier had therefore lost
+// the "more below" indicator entirely while keeping "more above", and the only
+// trace was the top-of-file comment claiming the chevron was "suppressed for
+// that frame", which was true of the erasure and false as a description of a
+// deliberate design.
+//
+// 44 px leaves the 36 px reserve plus an 8 px gutter from the band's own
+// right-aligned text. Everything the band prints still fits: the longest
+// right-aligned string is the question counter ("9/9"), a dozen px.
+//
+// The rule above the bar is drawn to the same 356 px the clear erases, not the
+// full width. A wider rule would outlive the kNone path's clear and leave a
+// permanent line across the panel -- the band is interactive-only now, so that
+// path draws no rule of its own to overwrite it with.
+constexpr int kAgentIndicatorColumn = 44;
+// Gap between the pending bubble's bottom edge and the option bar.
+constexpr int kAgentBubbleGap = 6;
+constexpr int kAgentBubbleMaxLines = 3;
+
+#define AGENT_TEXT(...) do { (void)wqn::DrawUtf8Text(__VA_ARGS__); } while (0)
+
+std::string AgentOneLine(const std::string& text, int width)
+{
+    const std::vector<std::string> lines = wqn::WrapUtf8TextToWidth(text, width, 1);
+    return lines.empty() ? std::string() : lines.front();
+}
+
+// ---------------------------------------------------------------------------
+// Option bar
+// ---------------------------------------------------------------------------
+
+AgentOptionMode AgentOptionModeFor(const wqn::AgentSessionState& agent)
+{
+    // An ask first: either kind can only arrive while a run is live, and a run
+    // blocked on a decision is the more urgent of the two states. An ask with
+    // no id is unanswerable and falls through; a question with no options is
+    // still a question -- the bar then offers only the 自定义回答 escape.
+    if (agent.ui.phase == wqn::AiFeaturePhase::kAwaitingPermission &&
+        !agent.pending_permission_id.empty()) {
+        return AgentOptionMode::kPermission;
+    }
+    if (agent.ui.phase == wqn::AiFeaturePhase::kAwaitingQuestion &&
+        !agent.pending_question_id.empty()) {
+        return AgentOptionMode::kQuestion;
+    }
+    if (agent.ui.requires_confirmation) {
+        return AgentOptionMode::kConfirmSend;
+    }
+    return AgentOptionMode::kNone;
+}
+
+int AiBottomReserve(const wqn::AgentSessionState& agent)
+{
+    return AgentOptionModeFor(agent) == AgentOptionMode::kNone
+        ? 0
+        : kAiBottomBandH;
+}
+
+// The question bar walks `options + 1` items: every projected option, plus a
+// trailing 自定义回答 pseudo-option that escapes the ask by interrupting the
+// run (a pending ask swallows every key, so a long-press cannot reach the
+// interrupt path). Two of them are visible at a time.
+int AgentQuestionItemCount(const wqn::AgentSessionState& agent)
+{
+    return static_cast<int>(agent.pending_question_options.size()) + 1;
+}
+
+int AgentQuestionWindowStart(const wqn::AgentSessionState& agent, uint8_t focused)
+{
+    const int count = AgentQuestionItemCount(agent);
+    if (count <= 2) {
+        return 0;
+    }
+    const int item = std::min<int>(focused, count - 1);
+    // Keep the focused item in the window with the two slots available: the
+    // start trails one behind the focus and stops one short of the end.
+    return std::min(std::max(0, item - 1), count - 2);
+}
+
+int AgentQuestionFocusedItem(const wqn::AgentSessionState& agent, uint8_t focused)
+{
+    const int count = AgentQuestionItemCount(agent);
+    if (count <= 0) {
+        return 0;
+    }
+    return std::min<int>(focused, count - 1);
+}
+
+const char* AgentOptionLabel(AgentOption option)
+{
+    switch (option) {
+        case AgentOption::kSend: return "发送";
+        case AgentOption::kReinput: return "重说";
+        case AgentOption::kApprove: return "同意";
+        case AgentOption::kDeny: return "拒绝";
+        case AgentOption::kCount:
+        default: return "";
+    }
+}
+
+// The focused slot, clamped to the two the current mode actually offers so a
+// focus left over from the other mode cannot index past the end.
+AgentOption AgentFocusedOption(AgentOptionMode mode, uint8_t focused)
+{
+    const AgentOption first = (mode == AgentOptionMode::kPermission)
+        ? AgentOption::kApprove
+        : AgentOption::kSend;
+    const AgentOption second = (mode == AgentOptionMode::kPermission)
+        ? AgentOption::kDeny
+        : AgentOption::kReinput;
+    return (focused == 0) ? first : second;
+}
+
+static std::string AgentQuestionPrompt(const wqn::AgentSessionState& agent)
+{
+    std::string ask = agent.pending_question_title.empty() ? "等你回答" : agent.pending_question_title;
+    // A pending ask owns the hold gesture. Its only escape interrupts the run;
+    // a new recording is possible after that action completes.
+    if (agent.pending_question_options.empty()) ask = "请选择自己回答后重新输入\n" + ask;
+    return ask;
+}
+
+static void DrawAgentOptionBar(AgentOptionMode mode, uint8_t focused,
+                                const wqn::AgentSessionState& agent)
+{
+    // The band is cleared here rather than by the caller so a disappearing
+    // option bar cannot leave a ghost on the E-ink panel. Only the width left of
+    // the scroll-indicator column is cleared -- see kAgentIndicatorColumn.
+    FillRect(0, kAgentBarY, wqn::kEpdWidth - kAgentIndicatorColumn, kAgentBarH, false);
+
+    // A rule above the bar separates it from the transcript above it. Never
+    // wider than the clear above: the kNone path clears 356 px and draws no
+    // rule, so a full-width rule here would survive that clear in the 44 px the
+    // scroll indicator owns and stake a permanent line across the panel.
+    DrawHorizontalLine(0, kAgentBarY, wqn::kEpdWidth - kAgentIndicatorColumn);
+
+    const bool is_question = (mode == AgentOptionMode::kQuestion);
+    const int item_count = is_question ? AgentQuestionItemCount(agent) : 2;
+    const int window_start = is_question
+        ? AgentQuestionWindowStart(agent, focused)
+        : 0;
+    const int focused_item = is_question
+        ? AgentQuestionFocusedItem(agent, focused)
+        : (AgentFocusedOption(mode, focused) == AgentFocusedOption(mode, 1) ? 1 : 0);
+    const int slot_count = is_question ? std::min(item_count, 2) : 2;
+
+    const int right = wqn::kEpdWidth - kAgentIndicatorColumn - 8;
+    std::string counter;
+    if (is_question) counter = std::to_string(focused_item + 1) + "/" + std::to_string(item_count);
+    const int counter_w = wqn::MeasureTextWithFont(AiNativeFont(12), counter.c_str());
+    const int slots_right = right - (counter.empty() ? 0 : counter_w + 10);
+    const int slot_width = (slots_right - 8) / slot_count;
+    for (int i = 0; i < slot_count; ++i) {
+        const int item = window_start + i;
+        const int x = 8 + i * slot_width;
+        const bool selected = item == focused_item;
+        if (selected) FillRect(x, kAgentBarY + 2, slot_width - 4, 19, true);
+        std::string label;
+        if (is_question) {
+            if (item < static_cast<int>(agent.pending_question_options.size())) {
+                label = agent.pending_question_options[item].label.empty()
+                    ? agent.pending_question_options[item].value
+                    : agent.pending_question_options[item].label;
+            } else label = "自己回答";
+        } else {
+            label = AgentOptionLabel(AgentFocusedOption(mode, static_cast<uint8_t>(i)));
+        }
+        AiNativeText(x + 5, kAgentBarTextY, slot_width - 14, label, 16, !selected);
+    }
+    if (!counter.empty()) AiNativeText(right - counter_w, kAgentBarY + 5, counter_w, counter, 12);
+
+}
+
+// ---------------------------------------------------------------------------
+// Pending bubble
+// ---------------------------------------------------------------------------
+
+// Dashed overlay card anchored to the bottom of the viewport, just above the
+// option bar. It deliberately overlays history rather than scrolling it: the
+// user is mid-decision and the newest committed turn is not what they are
+// reading.
+static void DrawAgentPendingBubble(const std::string& text, const char* title)
+{
+    if (text.empty()) {
+        return;
+    }
+    const auto lines = WrapAiNativeText(
+        text, kAiAssistantW - 2 * kAiAssistantLeftBorder - 8, AiNativeFont(), kAgentBubbleMaxLines);
+    if (lines.empty()) {
+        return;
+    }
+
+    const int body_h = static_cast<int>(lines.size()) * kAiLineH;
+    const int height = body_h + 4 + 12 + 4 + 4;  // native title, gap, and padding
+    const int top = kAgentBarY - kAgentBubbleGap - height;
+    const int x = kAiHistoryLeftPad;
+    const int width = kAiAssistantW;
+
+    // White fill first: this is an overlay, and any history underneath it must
+    // not show through the gaps in the dashed outline.
+    FillRect(x + 1, top + 1, width - 2, height - 2, false);
+    DrawDashedRect(x, top, width, height);
+
+    AiNativeText(x + kAiAssistantLeftBorder, top + 4, width - 16, title, 12);
+    int y = top + 4 + 12 + 4;
+    for (const std::string& line : lines) {
+        AiNativeText(x + kAiAssistantLeftBorder, y, width - 16, line);
+        y += kAiLineH;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Session picker
+// ---------------------------------------------------------------------------
+
+static std::string AgentSessionMetadata(const wqn::AgentSessionOption& session)
+{
+    std::string result;
+    // Gateway timestamps are Unix milliseconds. Use an absolute Beijing time:
+    // it stays correct even before the device's own clock has been synchronized.
+    if (session.updated_at >= 1704067200000LL && session.updated_at < 4102444800000LL) {
+        const std::time_t stamp = static_cast<std::time_t>(session.updated_at / 1000 + 8 * 3600);
+        std::tm local = {};
+        if (gmtime_r(&stamp, &local)) {
+            char date[24] = {};
+            if (std::strftime(date, sizeof(date), "%m-%d %H:%M", &local)) result = date;
+        }
+    }
+    if (!result.empty()) result += " / ";
+    switch (session.outcome) {
+        case wqn::OpenCodeSessionOutcome::kRunning: result += "进行中"; break;
+        case wqn::OpenCodeSessionOutcome::kSucceeded: result += "已完成"; break;
+        case wqn::OpenCodeSessionOutcome::kInterrupted: result += "已中断"; break;
+        case wqn::OpenCodeSessionOutcome::kFailed: result += "已失败"; break;
+        default: result += "状态未知"; break;
+    }
+    return result;
+}
+
+static void DrawAgentSessionPicker(const wqn::AgentSessionState& agent)
+{
+    const int left = kAgentPickerLeft;
+    const int width = kAgentPickerWidth;
+    AiNativeText(left, kAgentPickerKickerY, width, "OPENCODE / TASKS", 12);
+    AiNativeText(left, kAgentPickerTitleY, width, "选择任务", 24);
+    DrawHorizontalLine(left, kAgentPickerDividerY, width);
+    if (agent.sessions.empty()) {
+        AiNativeText(left, kAgentPickerListY + 16, width,
+            agent.ui.activity_text.empty() ? "暂无任务" : agent.ui.activity_text);
+        return;
+    }
+    const size_t selected = std::min(agent.selected_session, agent.sessions.size() - 1);
+    const size_t start = wqn::ClampAgentPickerWindow(
+        agent.session_window_start, selected, agent.sessions.size());
+    const size_t end = std::min(agent.sessions.size(), start + wqn::kAgentPickerVisibleRows);
+    const std::string position = std::to_string(selected + 1) + "/" + std::to_string(agent.sessions.size());
+    const int position_w = wqn::MeasureTextWithFont(AiNativeFont(12), position.c_str());
+    AiNativeText(left + width - position_w, kAgentPickerKickerY, position_w, position, 12);
+    for (size_t index = start; index < end; ++index) {
+        const int y = kAgentPickerListY + static_cast<int>(index - start) * kAgentPickerRowStep;
+        const bool focused = index == selected;
+        if (focused) FillRect(left, y, width, kAgentPickerRowStep - 1, true);
+        DrawHorizontalLine(left, y + kAgentPickerRowStep - 1, width);
+        char number[24] = {};
+        std::snprintf(number, sizeof(number), "%02u", static_cast<unsigned>(index + 1));
+        AiNativeText(left + 7, y + 14, 27, number, 12, !focused);
+        const auto& session = agent.sessions[index];
+        const int text_x = left + 38;
+        const int text_w = width - 61;
+        AiNativeText(text_x, y + 4, text_w,
+            session.title.empty() ? session.id : session.title, 16, !focused);
+        AiNativeText(text_x, y + 25, text_w, AgentSessionMetadata(session), 12, !focused);
+        const int arrow_x = left + width - 13;
+        for (int step = 0; step < 5; ++step) {
+            FillRect(arrow_x + step, y + 16 + step, 1, 1, !focused);
+            FillRect(arrow_x + step, y + 24 - step, 1, 1, !focused);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Status bar
+// ---------------------------------------------------------------------------
+
+// [detail] Glyph for a detail tier: 0 简要 / 1 标准 / 2 详细. Unknown values fall
+// back to 详细 -- the same fallback the request path applies to ?detail=N.
+static const WqnBitmapAsset& AgentDetailAsset(uint8_t level)
+{
+    switch (level) {
+        case 0: return a18_ai_detail_brief_16_asset;
+        case 1: return a19_ai_detail_standard_16_asset;
+        case 2:
+        default: return a20_ai_detail_full_16_asset;
+    }
+}
+
+// [agent] Agent-tier status bar. Same edit-mode slot numbering as STD/Pro
+// (0 = tier, 1 = session, 2 = turn up, 3 = turn down, 4 = 详细程度, 5 = clear),
+// so ApplyStatusBarEditEvent's index arithmetic does not need a tier branch --
+// only the trash index and the cluster length differ. The thinking/TTS/expand
+// slots STD/Pro fills are repurposed because they configure the STD/Pro text
+// turn and mean nothing to the gateway; slot 4 carries the detail tier every
+// Agent request is projected at.
+static void DrawAgentStatusBar(const wqn::AgentSessionState& agent,
+                               const wqn::HomeSummary& home,
+                               const wqn::StatusBarEditState& status_edit)
+{
+    DrawHorizontalLine(0, kAiStatusBarH - 1, wqn::kEpdWidth);
+
+    auto selected = [&status_edit](int index) {
+        return status_edit.active && status_edit.selected == index;
+    };
+
+    // Slot 0: tier indicator (brain -- the retired Pro glyph, reused).
+    DrawSelectableIcon(6, kAiToggleY, a03_ai_tier_pro_16_asset, selected(0), 0);
+
+    if (status_edit.active) {
+        DrawRect(kAiToggleX - kAiToggleZonePad, kAiToggleY - kAiToggleZonePad,
+                 kAiToggleZoneWAgent, 16 + 2 * kAiToggleZonePad);
+    }
+    // Slot 1: open the session picker / switch / new session.
+    DrawSelectableIcon(kAiToggleX + 0 * kAiToggleStep, kAiToggleY,
+                       a13_ai_session_list_16_asset, selected(1), 0);
+    // Slots 2/3: jump to the previous / next answer.
+    DrawSelectableIcon(kAiToggleX + 1 * kAiToggleStep, kAiToggleY,
+                       a14_ai_turn_up_16_asset, selected(2), 0);
+    DrawSelectableIcon(kAiToggleX + 2 * kAiToggleStep, kAiToggleY,
+                       a15_ai_turn_down_16_asset, selected(3), 0);
+    // Slot 4: the detail tier (0 简要 / 1 标准 / 2 详细). Agent-only: ?detail=N
+    // shapes the /agent/* projections, which STD/Pro never reads.
+    DrawSelectableIcon(kAiToggleX + 3 * kAiToggleStep, kAiToggleY,
+                       AgentDetailAsset(agent.detail_level), selected(4), 0);
+    // Slot 5: clear the mirrored Agent transcript.
+    DrawSelectableIcon(kAiToggleX + 4 * kAiToggleStep, kAiToggleY,
+                       a12_ai_clear_context_16_asset, selected(5), 0);
+
+    // Reserve the right-hand status first. The title only uses the remaining
+    // pixels, so a long phase/notice cannot paint over the session identity.
+    const std::string status = AiNativeClip(agent.ui.status_label.empty()
+        ? std::string(wqn::AiFeaturePhaseLabel(agent.ui.phase))
+        : agent.ui.status_label, 104, AiNativeFont());
+    const int status_w = wqn::MeasureTextWithFont(AiNativeFont(), status.c_str());
+    const int status_x = wqn::kEpdWidth - 26 - status_w;
+    AiNativeText(status_x, kStatusBarTitleY, status_w, status);
+    constexpr int title_x = 122;
+    AiNativeText(title_x, kStatusBarTitleY, status_x - title_x - 8,
+                 agent.current_session_title, 12);
+
+    DrawWifiStatusIcon(wqn::kEpdWidth - 6, 6, home);
+}
+
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+
+esp_err_t RenderAgentAiToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
+{
+    const wqn::AgentSessionState& agent = frame.agent;
+    wqn::ClearEpdFramebuffer(true);
+
+    DrawAgentStatusBar(agent, frame.home, frame.status_edit);
+
+    if (!agent.session_locked) {
+        // Picker mode owns the whole viewport: there is no conversation to
+        // scroll and no pending decision to act on.
+        DrawAgentSessionPicker(agent);
+        return RefreshFrame(frame, schedule);
+    }
+
+    // [band] The transcript runs to the panel's last pixel unless there is
+    // something to answer. This used to be an unconditional 22 px reservation,
+    // which was correct while the band always drew something and became a blank
+    // strip the answer could not use once it became interactive-only.
+    RenderAiHistoryViewport(frame.ai, frame.ai_history, agent.ui.scroll_offset_lines,
+                            AiBottomReserve(agent));
+
+    // [voice-pipe] While the ASR result streams in, the partial transcript is
+    // the only new content on screen: draw it in the same pending bubble the
+    // asks use, with no option bar (there is nothing to choose yet). This must
+    // come before the kNone early return below -- kTranscribing projects no
+    // option mode, so without this branch the partial would never render.
+    if (agent.ui.phase == wqn::AiFeaturePhase::kTranscribing) {
+        DrawAgentPendingBubble(agent.ui.voice_partial.empty()
+            ? "正在识别刚才说的话..." : agent.ui.voice_partial, "转写中");
+        return RefreshFrame(frame, schedule);
+    }
+
+    // [banner] The one line the user has to read right now, for two seconds.
+    //
+    // The bottom band used to carry every event line and now carries none: an
+    // interactive-only band is the right call, but two things still have to be
+    // said out loud -- a run already in flight turned your press into an
+    // observe, and a capture you released without speaking dropped the
+    // transcript you had already recorded. Neither has a successor frame that
+    // retracts it, so the line expires on its own instead of waiting for one
+    // that never comes.
+    //
+    // Drawn over the bottom of the transcript rather than in a reserved strip:
+    // RenderAgentAiToEpd clears the whole framebuffer every frame, so the line
+    // it covers comes back on its own and the banner needs no clearing logic.
+    // It stops short of the scroll-indicator column, for the same reason the
+    // band does -- the ▼ needs that 44 px to survive.
+    if (agent.ui.activity_text_ms > 0) {
+        const int64_t age_ms =
+            esp_timer_get_time() / 1000 - agent.ui.activity_text_ms;
+        if (age_ms >= 0 && age_ms <= wqn::kAiActivityBannerTtlMs) {
+            const int banner_right =
+                wqn::kEpdWidth - kAgentIndicatorColumn - kMarginDense;
+            const std::string body =
+                AgentOneLine(agent.ui.activity_text, banner_right - kMarginDense);
+            if (!body.empty()) {
+                AGENT_TEXT(kMarginDense, kAgentBarY - kAiLineH + 4,
+                           body.c_str(), true);
+            }
+        }
+    }
+
+    const AgentOptionMode mode = AgentOptionModeFor(agent);
+    if (mode == AgentOptionMode::kNone) {
+        // [band-interactive-only] The band carries one thing: an ask, a
+        // confirmation, or nothing.
+        //
+        // It used to carry every event line as well, and that is exactly what
+        // made it read as a status bar: ~40 writers behind activity_text, none
+        // of them expiring, so "已连接 Session 事件流" sat at the bottom of an
+        // idle session for as long as the user stayed on the page. Lines the
+        // user must read have a surface of their own now (the banner above); the
+        // rest are the model's own record, and the status label's job to
+        // summarise.
+        //
+        // The gesture instructions went in the same cut, from every phase --
+        // four strings, always on. A permanent line saying what the confirm key
+        // is about to do is chrome, not information: long-press-to-talk is this
+        // device's basic design language, and the manual owns the remainder.
+        //
+        // No clear here. With the band interactive-only the transcript owns
+        // these 22 px -- RenderAiHistoryViewport was asked for a reserve of 0
+        // and drew into them -- so an erasing FillRect over
+        // kAgentBarY..kEpdHeight would cut the answer off 22 px short of the
+        // panel's last row and leave exactly the blank strip the user reported.
+        // Nothing needs erasing when a bar goes away: the framebuffer is
+        // cleared at the top of every frame, and the diff refresh sends the
+        // resulting white (or newly drawn) pixels either way.
+        return RefreshFrame(frame, schedule);
+    }
+
+    if (mode == AgentOptionMode::kPermission) {
+        const std::string ask = agent.ui.activity_text.empty()
+            ? std::string("等你允许")
+            : agent.ui.activity_text;
+        DrawAgentPendingBubble(ask, "权限请求");
+    } else if (mode == AgentOptionMode::kQuestion) {
+        DrawAgentPendingBubble(AgentQuestionPrompt(agent), "提问");
+    } else {
+        const std::string prompt = agent.ui.prompt_text.empty()
+            ? std::string("(空)")
+            : agent.ui.prompt_text;
+        DrawAgentPendingBubble(prompt, "确认发送");
+    }
+    DrawAgentOptionBar(mode, frame.agent_option.focused, agent);
+    return RefreshFrame(frame, schedule);
+}
+
+}  // namespace device_ui_internal

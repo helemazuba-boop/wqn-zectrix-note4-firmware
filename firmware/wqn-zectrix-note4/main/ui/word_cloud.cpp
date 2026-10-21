@@ -1,4 +1,4 @@
-// Word review cloud task: pack sync, review submit, online search, AI lookup.
+// Word review cloud task: pack sync, session start/paging, review submit.
 // Extracted from device_ui.cpp.
 
 #include "ui_internal.h"
@@ -13,6 +13,7 @@
 #include <utility>
 
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "runtime/sleep_coordinator.h"
 #include "services/sync_service.h"
 #include "storage.h"
@@ -24,15 +25,22 @@ namespace device_ui_internal {
 constexpr char kTag[] = "wqn_ui";
 
 static std::atomic<bool> g_word_cloud_busy{false};
+static std::atomic<bool> g_word_pack_cloud_busy{false};
 wqn::runtime::SleepLease g_word_sleep_lease;
+wqn::runtime::SleepLease g_word_pack_sleep_lease;
+wqn::runtime::SleepLease g_word_buffer_sleep_lease;
 WordCloudResult g_word_result_slot;
 uint32_t g_word_result_generation = 0;
+WordCloudResult g_word_pack_result_slot;
+uint32_t g_word_pack_result_generation = 0;
 
-void FinishWordCloudRequest()
+void FinishWordCloudRequest(CloudDomain domain)
 {
-    g_word_sleep_lease.Reset();
-    ClearCloudDomainBusyWatch(CloudDomain::kWord);
-    g_word_cloud_busy.store(false, std::memory_order_release);
+    const bool bulk = domain == CloudDomain::kWordBulk;
+    (bulk ? g_word_pack_sleep_lease : g_word_sleep_lease).Reset();
+    ClearCloudDomainBusyWatch(domain);
+    (bulk ? g_word_pack_cloud_busy : g_word_cloud_busy).store(
+        false, std::memory_order_release);
 }
 
 RefreshSchedule PumpWordObservationCommit(UiRuntime* runtime)
@@ -40,48 +48,42 @@ RefreshSchedule PumpWordObservationCommit(UiRuntime* runtime)
     if (runtime == nullptr) {
         return RefreshSchedule::kNone;
     }
-    // One word commit in flight at a time; wait for the UI to ack the last one
-    // (the card stays in kPersisting until then, so no second effect is armed).
-    if (IsPersistKindBusy(PersistKind::kWordObservation)) {
-        return RefreshSchedule::kNone;
+    RefreshSchedule refresh = RefreshSchedule::kNone;
+    const int64_t now_ms = esp_timer_get_time() / 1000;
+    if (runtime->state().word_app.session.observation_effect_ready) {
+        // The RAM buffer needs its own lease BEFORE acceptance; the worker's
+        // lease only covers an individual flush. This prevents normal sleep
+        // or power-off from quiescing over unpersisted events.
+        if (!g_word_buffer_sleep_lease) {
+            g_word_buffer_sleep_lease = wqn::runtime::SleepLease::TryAcquire(
+                wqn::runtime::SleepBlocker::kStorage, "word-RAM-buffer", __FILE__, __LINE__);
+            if (!g_word_buffer_sleep_lease) return refresh;
+        }
+        const auto metadata = wqn::services::MakeDeviceRequestMetadata();
+        std::string occurred_at = CurrentIsoTimestamp();
+        if (occurred_at.empty()) occurred_at = "2024-01-01T00:00:00Z";
+        refresh = runtime->DispatchWordObservationBuffered(metadata.request_id, occurred_at, now_ms).refresh;
     }
-    // Cheap readiness pre-check: reservation takes a SleepLease + pool slot, so
-    // an idle pump must not reserve just to cancel. Reserve happens BEFORE the
-    // effect is pulled from UI state (that mutates it), so we must first know
-    // there is something to commit.
-    if (!runtime->state().word_app.session.observation_effect_ready) {
-        return RefreshSchedule::kNone;
+    const auto& session = runtime->state().word_app.session;
+    if (session.buffered_observations.empty()) {
+        g_word_buffer_sleep_lease.Reset();
+        return refresh;
     }
-    // Phase 1: reserve busy + slot + storage lease. On failure the UI state is
-    // untouched (effect still armed) -- just retry next pump.
+    if (!wqn::WordBatchPolicy::FlushDue(session.buffered_observations.size(), session.batch_in_flight,
+            session.buffered_observations.front().accepted_ms, now_ms, session.batch_retry_after_ms,
+            session.batch_flush_requested) || IsPersistKindBusy(PersistKind::kWordObservation)) return refresh;
+    // Reserve the slot before moving the owned flush payload. RAM acceptance
+    // is already explicit, so a failed reservation retains every identity.
     PersistTicket ticket = TryReservePersist(PersistKind::kWordObservation);
-    if (!ticket.valid()) {
-        return RefreshSchedule::kNone;
-    }
-    const auto metadata = wqn::services::MakeDeviceRequestMetadata();
-    std::string occurred_at = CurrentIsoTimestamp();
-    if (occurred_at.empty()) {
-        // Durable even before SNTP; the server clamps implausible times.
-        occurred_at = "2024-01-01T00:00:00Z";
-    }
-    wqn::DurableWordObservation observation;
+    if (!ticket.valid()) return refresh;
+    std::vector<wqn::DurableWordObservation> observations;
     wqn::PersistedWordSession advanced_session;
-    // Phase 2: only now pull the effect from UI state, binding this dispatch's
-    // operation_id so a late result after a scope reset is rejected.
-    if (!runtime->TakeWordObservationEffect(
-            metadata.request_id, occurred_at, ticket.operation_id,
-            &observation, &advanced_session)) {
-        // Take mutated state to kFailed ("会话游标无效") and cleared the effect;
-        // release the reservation and route the failure through a typed event
-        // so the revision advances (this runs after the display commit, so the
-        // caller folds the returned refresh into the next iteration's pending
-        // schedule instead of leaving a stuck "正在保存").
+    if (!runtime->TakeWordObservationBatch(ticket.operation_id, now_ms, &observations, &advanced_session)) {
         CancelPersistReservation(ticket);
-        return runtime->DispatchWordObservationTakeFailed().refresh;
+        return refresh;
     }
-    EnqueueReservedWordObservation(
-        ticket, std::move(observation), std::move(advanced_session));
-    return RefreshSchedule::kNone;
+    EnqueueReservedWordObservations(ticket, std::move(observations), std::move(advanced_session));
+    return refresh;
 }
 
 bool IsWordCloudBusy()
@@ -89,10 +91,17 @@ bool IsWordCloudBusy()
     return g_word_cloud_busy.load(std::memory_order_acquire);
 }
 
+bool IsWordPackCloudBusy()
+{
+    return g_word_pack_cloud_busy.load(std::memory_order_acquire);
+}
+
 bool QueueWordCloudRequest(const WordCloudRequest& request)
 {
+    const bool bulk = request.op == WordCloudOp::kPackSync;
+    std::atomic<bool>& busy = bulk ? g_word_pack_cloud_busy : g_word_cloud_busy;
     bool expected = false;
-    if (!g_word_cloud_busy.compare_exchange_strong(
+    if (!busy.compare_exchange_strong(
             expected, true, std::memory_order_acq_rel, std::memory_order_acquire)) {
         return false;
     }
@@ -100,15 +109,15 @@ bool QueueWordCloudRequest(const WordCloudRequest& request)
         wqn::runtime::SleepLease::TryAcquire(
             wqn::runtime::SleepBlocker::kWordCloud, "word-cloud", __FILE__, __LINE__);
     if (!lease) {
-        g_word_cloud_busy.store(false, std::memory_order_release);
+        busy.store(false, std::memory_order_release);
         return false;
     }
-    g_word_sleep_lease = std::move(lease);
+    (bulk ? g_word_pack_sleep_lease : g_word_sleep_lease) = std::move(lease);
     CloudJob job;
-    job.domain = CloudDomain::kWord;
+    job.domain = bulk ? CloudDomain::kWordBulk : CloudDomain::kWord;
     job.word = request;
     if (!EnqueueCloudJob(job)) {
-        FinishWordCloudRequest();
+        FinishWordCloudRequest(job.domain);
         return false;
     }
     return true;
@@ -116,9 +125,21 @@ bool QueueWordCloudRequest(const WordCloudRequest& request)
 
 bool QueueWordReviewRefresh()
 {
+    const wqn::services::SyncContentTicket ticket =
+        wqn::services::TryClaimContentRefresh(
+            wqn::services::SyncContentDomain::kWordPacks);
+    if (!ticket) {
+        return false;
+    }
     WordCloudRequest request;
     request.op = WordCloudOp::kPackSync;
-    return QueueWordCloudRequest(request);
+    request.content_sync_generation = ticket.generation;
+    request.content_target_revision = ticket.target_revision;
+    if (!QueueWordCloudRequest(request)) {
+        wqn::services::CancelContentRefreshClaim(ticket);
+        return false;
+    }
+    return true;
 }
 
 bool QueueWordSessionStart(
@@ -139,12 +160,71 @@ bool QueueWordSessionStart(
         "%s",
         session.metadata.request_id.c_str());
     request.study_mode = static_cast<uint8_t>(session.mode);
+    // Carry the -1 "unset" sentinel untouched; collapsing it to 0 here
+    // made every non-sequential start send a literal start_index.
+    request.start_index = session.start_index;
+    request.new_word_limit = session.new_word_limit > 0
+        ? static_cast<uint16_t>(session.new_word_limit)
+        : 0;
+    // [deck-scope] Carry the UI's deck choice across the queue boundary. The
+    // runner rebuilds the request from this struct, so anything left here is
+    // what actually reaches the server. Only a full 36-char UUID is meaningful.
+    if (!session.scope.deck_ids.empty() &&
+        session.scope.deck_ids.front().size() == 36) {
+        std::snprintf(
+            request.deck_id,
+            sizeof(request.deck_id),
+            "%s",
+            session.scope.deck_ids.front().c_str());
+    }
     return QueueWordCloudRequest(request);
+}
+
+
+// [ui-gates] Hand-off slot for the one candidate page in flight.
+// `session.page_in_flight` guarantees only one page is outstanding at a time,
+// and the result is applied before the next can be queued, so a single slot is
+// enough -- and it keeps CloudJob POD (a PersistedWordSession is 168 bytes but
+// not trivially copyable, and the job union needs POD). The handle is the
+// validation: a job whose handle no longer matches must not consume a snapshot
+// parked for a later page.
+struct PageExtensionSlot {
+    std::atomic<uint32_t> handle{0};
+    wqn::PersistedWordSession snapshot;
+};
+PageExtensionSlot g_page_extension;
+
+// Parks the snapshot for a queued page and returns its handle (never 0).
+uint32_t ParkPageExtension(const wqn::PersistedWordSession& snapshot)
+{
+    uint32_t handle = g_page_extension.handle.load(std::memory_order_relaxed) + 1;
+    if (handle == 0) {
+        handle = 1;  // 0 means "empty"
+    }
+    g_page_extension.snapshot = snapshot;
+    g_page_extension.handle.store(handle, std::memory_order_release);
+    return handle;
+}
+
+// Takes the snapshot parked for `handle`, or returns false when it is gone
+// (superseded, or the queue send failed and nothing was parked).
+bool TakePageExtension(uint32_t handle, wqn::PersistedWordSession* snapshot)
+{
+    if (handle == 0 || snapshot == nullptr) {
+        return false;
+    }
+    if (g_page_extension.handle.load(std::memory_order_acquire) != handle) {
+        return false;
+    }
+    *snapshot = g_page_extension.snapshot;
+    g_page_extension.handle.store(0, std::memory_order_release);
+    return true;
 }
 
 bool QueueWordCandidatePage(
     const std::string& session_id,
-    const wqn::protocol::word_study_v1::CandidatePageRequest& page)
+    const wqn::protocol::word_study_v1::CandidatePageRequest& page,
+    const wqn::PersistedWordSession& snapshot)
 {
     if (session_id.size() != 36 || page.metadata.request_id.empty() ||
         page.cursor.empty() || page.limit < 1 ||
@@ -171,61 +251,103 @@ bool QueueWordCandidatePage(
         "%s",
         page.cursor.c_str());
     request.limit = static_cast<uint16_t>(page.limit);
+    request.page_extension_handle = ParkPageExtension(snapshot);
     return QueueWordCloudRequest(request);
+}
+
+void PumpWordSessionStart(UiRuntime* runtime)
+{
+    if (runtime == nullptr || runtime->state().screen != wqn::UiScreen::kWord ||
+        runtime->state().word_app.mode != wqn::WordAppMode::kSessionStarting ||
+        !runtime->state().word_app.session.start_requested || IsWordCloudBusy()) return;
+    const auto& word = runtime->state().word_app;
+    if (wqn::HasBufferedWordObservations(word) || word.session.observation_effect_ready ||
+        word.session.commit_state == wqn::WordObservationCommitState::kPersisting ||
+        IsPersistKindBusy(PersistKind::kWordObservation)) {
+        // The old SID must remain installed until its entire RAM tail is
+        // durable. kPersisting also covers the Prepare-to-reserve gap.
+        runtime->RequestWordBatchFlush();
+        return;
+    }
+    wqn::protocol::word_study_v1::CreateSessionRequest request;
+    request.metadata = wqn::services::MakeDeviceRequestMetadata();
+    if (!runtime->TakeWordSessionStartRequest(&request)) return;
+    if (!QueueWordSessionStart(request)) {
+        runtime->RestoreWordSessionStartRequest();
+        return;
+    }
+    ESP_LOGI(kTag, "word session start queued: mode=%u start_index=%d new_word_limit=%d request=%s",
+        static_cast<unsigned>(request.mode), request.start_index, request.new_word_limit,
+        request.metadata.request_id.c_str());
+}
+
+void PumpWordCardPrefetch(UiRuntime* runtime)
+{
+    if (runtime == nullptr || runtime->state().screen != wqn::UiScreen::kWord ||
+        IsWordCloudBusy() || IsWordPackCloudBusy() ||
+        IsPersistKindBusy(PersistKind::kWordObservation)) return;
+    const auto& session = runtime->state().word_app.session;
+    const int64_t now_ms = esp_timer_get_time() / 1000;
+    // Do not start speculative I/O ahead of an already-due/forced flush. Once
+    // a SPIFFS read starts it is non-preemptible, even on the background lane.
+    if (session.observation_effect_ready || session.batch_flush_requested ||
+        (!session.buffered_observations.empty() && wqn::WordBatchPolicy::FlushDue(
+            session.buffered_observations.size(), session.batch_in_flight,
+            session.buffered_observations.front().accepted_ms, now_ms,
+            session.batch_retry_after_ms, false))) return;
+    wqn::WordPackIndexEntry index{};
+    if (!wqn::GetWordCardPrefetchEntry(runtime->state().word_app, now_ms, &index)) return;
+    const PersistTicket ticket = TryReservePersist(PersistKind::kWordCardPrefetch);
+    if (!ticket.valid()) return;
+    if (!runtime->TakeWordCardPrefetchEntry(ticket.operation_id, now_ms, &index)) {
+        CancelPersistReservation(ticket);
+        return;
+    }
+    EnqueueReservedWordCardPrefetch(ticket, index);
 }
 
 void PumpWordCandidatePrefetch(UiRuntime* runtime)
 {
     if (runtime == nullptr || IsWordCloudBusy()) return;
+    if (wqn::HasBufferedWordObservations(runtime->state().word_app) ||
+        runtime->state().word_app.session.observation_effect_ready) {
+        // A page extension writes a full snapshot. Never publish RAM-ahead
+        // progress or prune the candidate window before the buffer is durable.
+        if (runtime->state().word_app.session.page_requested) runtime->RequestWordBatchFlush();
+        return;
+    }
     wqn::protocol::word_study_v1::CandidatePageRequest request;
     request.metadata = wqn::services::MakeDeviceRequestMetadata();
     std::string session_id;
-    if (!runtime->TakeWordCandidatePageRequest(&request, &session_id)) {
+    wqn::PersistedWordSession snapshot;
+    if (!runtime->TakeWordCandidatePageRequest(&request, &snapshot, &session_id)) {
         return;
     }
-    if (!QueueWordCandidatePage(session_id, request)) {
+    if (!QueueWordCandidatePage(session_id, request, snapshot)) {
         runtime->RestoreWordCandidatePageRequest();
     }
 }
 
-bool QueueWordSearch(const wqn::WqnWordSearchRequest& search)
+WordCloudResult* PeekWordCloudResult(CloudDomain domain, uint32_t generation)
 {
-    if (search.query.empty() && search.prefix.empty()) {
-        return false;
-    }
-    WordCloudRequest request;
-    request.op = WordCloudOp::kSearch;
-    const std::string query = !search.query.empty() ? search.query : search.prefix;
-    std::snprintf(request.query, sizeof(request.query), "%s", query.c_str());
-    return QueueWordCloudRequest(request);
-}
-
-bool QueueWordAiLookup(const wqn::WqnWordAiLookupRequest& lookup)
-{
-    if (lookup.query.empty() && lookup.prefix.empty()) {
-        return false;
-    }
-    WordCloudRequest request;
-    request.op = WordCloudOp::kAiLookup;
-    const std::string query = !lookup.query.empty() ? lookup.query : lookup.prefix;
-    std::snprintf(request.query, sizeof(request.query), "%s", query.c_str());
-    return QueueWordCloudRequest(request);
-}
-
-WordCloudResult* PeekWordCloudResult(uint32_t generation)
-{
-    if (generation == 0 || generation != g_word_result_generation) {
+    const bool bulk = domain == CloudDomain::kWordBulk;
+    const uint32_t current = bulk ? g_word_pack_result_generation
+                                  : g_word_result_generation;
+    if (generation == 0 || generation != current) {
         return nullptr;
     }
-    return &g_word_result_slot;
+    return bulk ? &g_word_pack_result_slot : &g_word_result_slot;
 }
 
-void SendWordCloudResult()
+void SendWordCloudResult(CloudDomain domain)
 {
+    const uint32_t generation = domain == CloudDomain::kWordBulk
+        ? g_word_pack_result_generation
+        : g_word_result_generation;
     CloudResultReady ready;
-    ready.domain = CloudDomain::kWord;
-    ready.generation = g_word_result_generation;
-    PublishCloudResult(CloudDomain::kWord, g_word_result_generation);
+    ready.domain = domain;
+    ready.generation = generation;
+    PublishCloudResult(domain, generation);
     (void)ready;
 }
 
@@ -236,6 +358,66 @@ bool IsWordSessionInvalidError(const wqn::protocol::v3::Error& error)
     return error.code == "SESSION_NOT_FOUND" ||
            error.code == "SESSION_NOT_ACTIVE" ||
            error.code == "WORD_SESSION_SNAPSHOT_INCOMPLETE";
+}
+
+// [snapshot-coalesce] Neither the initial window nor its immediate prefetch
+// has been exposed to UI yet. Build at most one extended window in RAM, then
+// keep the existing durable-before-publish boundary with ONE snapshot save.
+void PersistInitialWordSessionSnapshot(const std::string& token, WordCloudResult* result)
+{
+    if (result == nullptr || result->result != ESP_OK ||
+        result->session_compact_result != ESP_OK || !result->persisted_session.active) return;
+    auto& initial = result->persisted_session;
+    const size_t base_items = initial.remote.items.size();
+    const bool prefetch = !initial.paused && initial.position == 0 &&
+        initial.phase == wqn::WordPresentationPhase::kFront && base_items > 0 &&
+        base_items <= wqn::protocol::word_study_v1::kInitialCandidatePageSize &&
+        initial.remote.has_more && !initial.remote.cursor.empty();
+    bool coalesced = false;
+    esp_err_t prefetch_result = ESP_OK;
+    int64_t prefetch_ms = 0;
+    if (prefetch) {
+        wqn::protocol::word_study_v1::CandidatePageRequest request;
+        request.metadata = wqn::services::MakeDeviceRequestMetadata();
+        request.cursor = initial.remote.cursor;
+        request.limit = static_cast<int>(wqn::protocol::word_study_v1::kCandidatePrefetchPageSize);
+        wqn::protocol::word_study_v1::CandidatePageData page;
+        wqn::protocol::v3::Error error;
+        const int64_t started_us = esp_timer_get_time();
+        prefetch_result = wqn::TryFetchWordStudyCandidatePageV1(
+            token, initial.remote.session_id, request, &page, &error);
+        if (prefetch_result == ESP_OK) {
+            wqn::PersistedWordSession extended;
+            prefetch_result = wqn::ExtendPersistedWordSessionWithPage(initial, page, &extended);
+            if (prefetch_result == ESP_OK) {
+                initial = std::move(extended);
+                coalesced = true;
+            }
+        } else {
+            // Transient or readiness failure falls back to the valid initial
+            // window. Do not revive a server-invalid session or ignore the
+            // existing API's 401 token clearing just to make prefetch succeed.
+            std::string current_token;
+            if (IsWordSessionInvalidError(error) || !LoadValidTokenForTodo(&current_token)) {
+                result->result = prefetch_result;
+                result->protocol_error = std::move(error);
+                ESP_LOGW(kTag, "word initial snapshot rejected: prefetch_result=%s session=%s",
+                    esp_err_to_name(prefetch_result), initial.remote.session_id.c_str());
+                return;
+            }
+        }
+        prefetch_ms = (esp_timer_get_time() - started_us) / 1000;
+    }
+    // The existing store still merges concurrent durable progress and rejects
+    // stale scope before writing. No intermediate window was saved/published.
+    result->session_persist_result = wqn::SavePersistedWordSession(initial);
+    ESP_LOGI(kTag,
+        "word initial snapshot: base_items=%u items=%u coalesced=%d prefetch_attempted=%d "
+        "prefetch_result=%s prefetch_ms=%lld result=%s session=%s",
+        static_cast<unsigned>(base_items), static_cast<unsigned>(initial.remote.items.size()),
+        coalesced ? 1 : 0, prefetch ? 1 : 0, esp_err_to_name(prefetch_result),
+        static_cast<long long>(prefetch_ms), esp_err_to_name(result->session_persist_result),
+        initial.remote.session_id.c_str());
 }
 
 // Rebuilds the note screen's [词] rows from the mounted deck catalog. The
@@ -291,6 +473,7 @@ bool ApplyWordCloudResult(wqn::UiState* state, WordCloudResult& result)
             RebuildNoteWordDeckRows(state);
             // Keep the settings row value in step (a cloud-deleted default
             // falls back to 全部词库 inside InstallWordDeckCatalog).
+            state->settings.default_word_deck_id = state->word_app.default_deck_id;
             state->settings.default_word_deck_title =
                 state->word_app.default_deck_title;
         } else {
@@ -342,7 +525,12 @@ bool ApplyWordCloudResult(wqn::UiState* state, WordCloudResult& result)
                      static_cast<unsigned long>(result.scope_generation),
                      static_cast<unsigned long>(wqn::GetDeckScopeGeneration()));
             wqn::ApplyWordCandidatePageResult(
-                &state->word_app, ESP_ERR_INVALID_STATE, {});
+                &state->word_app,
+                ESP_ERR_INVALID_STATE,
+                ESP_OK,
+                ESP_OK,
+                state->word_app.session.persisted,
+                {});
             return false;
         }
         if (result.result != ESP_OK && IsWordSessionInvalidError(result.protocol_error)) {
@@ -351,40 +539,11 @@ bool ApplyWordCloudResult(wqn::UiState* state, WordCloudResult& result)
             wqn::ApplyWordCandidatePageResult(
                 &state->word_app,
                 result.result,
+                result.session_compact_result,
+                result.session_persist_result,
+                result.persisted_session,
                 std::move(result.candidate_page));
         }
-        BuildHomeSummary(state);
-        return true;
-    }
-    if (result.op == WordCloudOp::kSearch) {
-        if (state->screen != wqn::UiScreen::kWord) {
-            wqn::CancelWordLookupResult(&state->word_app);
-            return false;
-        }
-        const bool applied = result.result == ESP_OK
-            ? wqn::ApplyWordSearchResult(
-                  &state->word_app, result.query, result.search)
-            : wqn::ApplyWordLookupFailure(
-                  &state->word_app,
-                  result.query,
-                  result.auth_required ? "请重新配对" : "在线搜索失败");
-        if (!applied) return false;
-        BuildHomeSummary(state);
-        return true;
-    }
-    if (result.op == WordCloudOp::kAiLookup) {
-        if (state->screen != wqn::UiScreen::kWord) {
-            wqn::CancelWordLookupResult(&state->word_app);
-            return false;
-        }
-        const bool applied = result.result == ESP_OK
-            ? wqn::ApplyWordAiLookupResult(
-                  &state->word_app, result.query, result.lookup)
-            : wqn::ApplyWordLookupFailure(
-                  &state->word_app,
-                  result.query,
-                  result.auth_required ? "请重新配对" : "AI 查词失败");
-        if (!applied) return false;
         BuildHomeSummary(state);
         return true;
     }
@@ -393,14 +552,27 @@ bool ApplyWordCloudResult(wqn::UiState* state, WordCloudResult& result)
 
 void ExecuteWordCloudRequest(const WordCloudRequest& request)
 {
-    g_word_result_slot = WordCloudResult{};
-    ++g_word_result_generation;
-    if (g_word_result_generation == 0) {
-        ++g_word_result_generation;
+    const CloudDomain result_domain = request.op == WordCloudOp::kPackSync
+        ? CloudDomain::kWordBulk
+        : CloudDomain::kWord;
+    const wqn::services::SyncContentTicket content_ticket = {
+        wqn::services::SyncContentDomain::kWordPacks,
+        request.content_sync_generation,
+        request.content_target_revision,
+    };
+    WordCloudResult& result_slot = result_domain == CloudDomain::kWordBulk
+        ? g_word_pack_result_slot
+        : g_word_result_slot;
+    uint32_t& result_generation = result_domain == CloudDomain::kWordBulk
+        ? g_word_pack_result_generation
+        : g_word_result_generation;
+    result_slot = WordCloudResult{};
+    ++result_generation;
+    if (result_generation == 0) {
+        ++result_generation;
     }
-    WordCloudResult& result = g_word_result_slot;
+    WordCloudResult& result = result_slot;
     result.op = request.op;
-    result.query = request.query;
     result.scope_generation = request.scope_generation;
     result.message.clear();
 
@@ -408,22 +580,32 @@ void ExecuteWordCloudRequest(const WordCloudRequest& request)
     if (!LoadValidTokenForTodo(&token)) {
         result.auth_required = true;
         result.result = ESP_ERR_INVALID_STATE;
-        SendWordCloudResult();
+        if (request.op == WordCloudOp::kPackSync) {
+            wqn::services::CompleteContentRefresh(
+                content_ticket, result.result, nullptr, "auth-required");
+        }
+        SendWordCloudResult(result_domain);
         return;
     }
 
     if (request.op == WordCloudOp::kPackSync) {
+        result.result = wqn::services::BeginContentInstall(content_ticket);
+        if (result.result != ESP_OK) {
+            result.message = "词库安装标记失败";
+        }
         wqn::WqnWordPackManifest local_manifest;
         bool had_local_manifest = true;
         bool manifest_content_changed = false;
-        result.result = wqn::LoadWordPackManifest(&local_manifest);
+        if (result.result == ESP_OK) {
+            result.result = wqn::LoadWordPackManifest(&local_manifest);
+        }
         if (result.result == ESP_ERR_NOT_FOUND) {
             had_local_manifest = false;
             result.result = wqn::ResetWordPackStorageCache();
             if (result.result == ESP_OK) {
                 local_manifest = {};
             }
-        } else if (result.result != ESP_OK) {
+        } else if (result.result != ESP_OK && result.message.empty()) {
             ESP_LOGW(
                 kTag,
                 "local word pack manifest is incompatible; reset cache: %s",
@@ -465,18 +647,9 @@ void ExecuteWordCloudRequest(const WordCloudRequest& request)
                 }
             }
             if (total_needed > 0) {
-                wqn::StorageCapacitySnapshot storage;
-                if (wqn::ReadStorageCapacitySnapshot(&storage) && storage.spiffs_valid) {
-                    const size_t available =
-                        storage.spiffs_total_bytes > storage.spiffs_used_bytes
-                            ? storage.spiffs_total_bytes - storage.spiffs_used_bytes
-                            : 0;
-                    if (available < total_needed) {
-                        ESP_LOGW(kTag, "SPIFFS space insufficient: need=%u avail=%u",
-                                 static_cast<unsigned>(total_needed), static_cast<unsigned>(available));
-                        result.result = ESP_ERR_NO_MEM;
-                        result.message = "存储空间不足";
-                    }
+                result.result = wqn::EnsurePackDownloadCapacity(total_needed);
+                if (result.result == ESP_ERR_NO_MEM) {
+                    result.message = "存储空间不足，已保留现有词库";
                 }
             }
 
@@ -533,6 +706,14 @@ void ExecuteWordCloudRequest(const WordCloudRequest& request)
         session.metadata.request_id = request.request_id;
         session.mode = static_cast<wqn::protocol::word_study_v1::Mode>(
             request.study_mode);
+        session.start_index = request.start_index;
+        session.new_word_limit = static_cast<int>(request.new_word_limit);
+        // [deck-scope] The runner rebuilds the request, so the queued deck id
+        // has to be re-attached here or the server sees an empty scope and
+        // silently substitutes the first 32 visible decks.
+        if (std::strlen(request.deck_id) == 36) {
+            session.scope.deck_ids.push_back(request.deck_id);
+        }
         result.result = wqn::CreateWordStudySessionV1(
             token,
             session,
@@ -545,6 +726,10 @@ void ExecuteWordCloudRequest(const WordCloudRequest& request)
             result.persisted_session.active = !result.session.items.empty();
             result.persisted_session.paused = false;
             result.persisted_session.position = 0;
+            // Stored as uint32_t; keep the -1 sentinel out of it.
+            result.persisted_session.start_index = request.start_index > 0
+                ? static_cast<uint32_t>(request.start_index)
+                : 0;
             result.persisted_session.phase = wqn::WordPresentationPhase::kFront;
             // [deck-scope] Pin the session to the epoch it was REQUESTED under;
             // the store rejects the save below if a deck switch landed since.
@@ -552,33 +737,51 @@ void ExecuteWordCloudRequest(const WordCloudRequest& request)
                 request.scope_generation;
             result.session_compact_result = wqn::CompactWordSessionData(
                 result.session, &result.persisted_session.remote);
-            if (result.session_compact_result == ESP_OK &&
-                result.persisted_session.active) {
-                result.session_persist_result =
-                    wqn::SavePersistedWordSession(result.persisted_session);
-            }
+            PersistInitialWordSessionSnapshot(token, &result);
         }
+        // Include empty sessions: they advance the intake->sequential chain
+        // without a snapshot save, so save-only logs cannot diagnose it.
+        ESP_LOGI(kTag,
+            "word session start result: mode=%u items=%u active=%d has_more=%d result=%s "
+            "compact_result=%s persist_result=%s session=%s",
+            static_cast<unsigned>(session.mode), static_cast<unsigned>(result.session.items.size()),
+            result.persisted_session.active ? 1 : 0, result.session.has_more ? 1 : 0,
+            esp_err_to_name(result.result), esp_err_to_name(result.session_compact_result),
+            esp_err_to_name(result.session_persist_result), result.session.session_id.c_str());
     } else if (request.op == WordCloudOp::kFetchSessionPage) {
         wqn::protocol::word_study_v1::CandidatePageRequest page;
         page.metadata = wqn::services::MakeDeviceRequestMetadata();
         page.metadata.request_id = request.request_id;
         page.cursor = request.cursor;
         page.limit = request.limit;
+        // [ui-gates] Take the parked snapshot FIRST, before the network call,
+        // so the slot is free for the next page and a superseded job cannot
+        // consume it.
+        wqn::PersistedWordSession parked;
+        const bool have_parked = TakePageExtension(
+            request.page_extension_handle, &parked);
         result.result = wqn::FetchWordStudyCandidatePageV1(
             token,
             request.session_id,
             page,
             &result.candidate_page,
             &result.protocol_error);
-    } else if (request.op == WordCloudOp::kSearch) {
-        wqn::WqnWordSearchRequest search;
-        search.query = request.query;
-        search.limit = 8;
-        result.result = wqn::SearchWords(token, search, &result.search);
-    } else if (request.op == WordCloudOp::kAiLookup) {
-        wqn::WqnWordAiLookupRequest lookup;
-        lookup.query = request.query;
-        result.result = wqn::LookupWordWithAi(token, lookup, &result.lookup);
+        if (result.result == ESP_OK && have_parked) {
+            // Extend and persist the snapshot this page was queued with, on this
+            // thread. The apply step used to run the multi-second snapshot fsync
+            // on the UI task. When the snapshot is gone the UI merges the page in
+            // memory instead and the next observation commit persists it.
+            result.persisted_session = parked;
+            result.session_compact_result = wqn::ExtendPersistedWordSessionWithPage(
+                parked,
+                result.candidate_page,
+                &result.persisted_session);
+            if (result.session_compact_result == ESP_OK &&
+                result.persisted_session.active) {
+                result.session_persist_result =
+                    wqn::SavePersistedWordSession(result.persisted_session);
+            }
+        }
     } else {
         result.result = ESP_ERR_INVALID_ARG;
     }
@@ -587,7 +790,12 @@ void ExecuteWordCloudRequest(const WordCloudRequest& request)
         std::string after_token;
         result.auth_required = !LoadValidTokenForTodo(&after_token);
     }
-    SendWordCloudResult();
+    if (request.op == WordCloudOp::kPackSync) {
+        wqn::services::CompleteContentRefresh(
+            content_ticket, result.result, nullptr,
+            result.result == ESP_OK ? nullptr : result.message.c_str());
+    }
+    SendWordCloudResult(result_domain);
 }
 
 }  // namespace device_ui_internal

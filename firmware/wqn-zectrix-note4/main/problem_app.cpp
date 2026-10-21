@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <new>
 #include <utility>
 
@@ -11,6 +12,12 @@
 #include "esp_timer.h"
 
 #include "display_service.h"
+#include "ui/markdown_layout.h"
+#include "ui/ai_native_text.h"
+#include "ui/ai_text_layout.h"
+#include "ui/note_reading_geometry.h"
+#include "note_list_model.h"
+#include "ui/ui_layout.h"
 
 namespace {
 
@@ -19,30 +26,10 @@ constexpr char kTag[] = "problem_app";
 using wqn::protocol::problem_study_v1::ProblemStatus;
 using wqn::protocol::problem_study_v1::ReviewAction;
 
-// Visible rows on the problem title list; mirrors page_problem.cpp geometry
-// (same list layout as the note lists).
-constexpr size_t kProblemListVisibleRows = 8;
-// Body/answer faces show 13 wrapped lines (no image entry row: attachments
-// live on their own ring segments); must match page_problem.cpp.
-constexpr uint32_t kProblemFaceVisibleLines = 13;
-constexpr uint32_t kProblemFaceScrollStep = 4;
-
-// Edge-triggered viewport (see note_app.cpp UpdateListViewport for the
-// repaint rationale).
+// Share the approved four-row edge-following window with the Note lists.
 void UpdateListViewport(size_t selected, size_t count, size_t* start)
 {
-    constexpr size_t visible = kProblemListVisibleRows;
-    if (count <= visible) {
-        *start = 0;
-        return;
-    }
-    const size_t max_start = count - visible;
-    if (*start > max_start) *start = max_start;
-    if (selected < *start) {
-        *start = selected + 1 >= visible ? selected + 1 - visible : 0;
-    } else if (selected >= *start + visible) {
-        *start = std::min(selected, max_start);
-    }
+    *start = wqn::ClampNoteListWindow(*start, selected, count);
 }
 
 size_t ProblemImageCount(const wqn::ProblemAppState& state)
@@ -78,11 +65,14 @@ wqn::ProblemFace SegmentFace(const wqn::ProblemAppState& state, size_t segment)
     return wqn::ProblemFace::kSolutionImage;
 }
 
-uint32_t FaceMaxScroll(uint32_t total_lines)
+device_ui_internal::NoteReadingGeometry ProblemFaceGeometry(
+    const wqn::ProblemAppState& state, bool answer)
 {
-    return total_lines > kProblemFaceVisibleLines
-        ? total_lines - kProblemFaceVisibleLines
-        : 0;
+    const auto& layout = answer ? state.answer_layout : state.body_layout;
+    // Attachments keep their existing ring segments; only a real notice takes
+    // a row from the native text viewport shared with Note.
+    return device_ui_internal::ComputeNoteReadingGeometry(
+        layout ? layout->markdown.size() : 0, false, !wqn::ProblemAppNotice(state).empty());
 }
 
 const wqn::ProblemPackSet* OpenSet(const wqn::ProblemAppState& state)
@@ -101,6 +91,22 @@ const char* ProblemStatusLabel(uint8_t status)
         case ProblemStatus::kMastered: return "已掌握";
     }
     return "";
+}
+
+// MCQ options render as markdown list items so long option text wraps with a
+// hanging indent ("- A. 选项文字"). The first line never gets a leading
+// newline so a choices-only part does not start with a blank row.
+void AppendChoiceLines(std::string* section, const wqn::WqnProblemPackPart& part)
+{
+    for (const wqn::WqnProblemPackChoice& choice : part.choices) {
+        if (!section->empty()) {
+            section->push_back('\n');
+        }
+        *section += "- ";
+        *section += choice.id;
+        *section += ". ";
+        *section += choice.text;
+    }
 }
 
 // 题面: the gaokao shell model splits the text across the shell's shared
@@ -133,6 +139,7 @@ std::string ComposeBodyText(const wqn::WqnProblemEntry& entry)
         } else {
             section = part.content_text;
         }
+        AppendChoiceLines(&section, part);
         if (section.empty()) continue;
         if (!text.empty()) {
             text += "\n\n";
@@ -140,6 +147,40 @@ std::string ComposeBodyText(const wqn::WqnProblemEntry& entry)
         text += section;
     }
     return text;
+}
+
+// Echoes the correct option's text on the answer face: single choice inline
+// ("答案：B. 文字"), multi choice as one list line per selected id. Multi
+// choice matches ids by substring against the joined letters, so ids longer
+// than one character could collide -- the form's default ids are A-D.
+std::string CorrectChoiceSuffix(const wqn::WqnProblemPackPart& part)
+{
+    if (part.choices.empty() || part.answer_text.empty()) {
+        return {};
+    }
+    std::string suffix;
+    if (part.type == "single_choice") {
+        for (const wqn::WqnProblemPackChoice& choice : part.choices) {
+            if (choice.id == part.answer_text) {
+                suffix = ". ";
+                suffix += choice.text;
+                break;
+            }
+        }
+        return suffix;
+    }
+    if (part.type == "multi_choice") {
+        for (const wqn::WqnProblemPackChoice& choice : part.choices) {
+            if (!choice.id.empty() &&
+                part.answer_text.find(choice.id) != std::string::npos) {
+                suffix += "\n- ";
+                suffix += choice.id;
+                suffix += ". ";
+                suffix += choice.text;
+            }
+        }
+    }
+    return suffix;
 }
 
 // 答案面: 逐问 label · 分值 · 正确答案, one blank line between parts.
@@ -158,10 +199,14 @@ std::string ComposeAnswerText(const wqn::WqnProblemEntry& entry)
         text.push_back('\n');
         text += "答案：";
         text += part.answer_text.empty() ? "（见解析图）" : part.answer_text;
+        text += CorrectChoiceSuffix(part);
         text.push_back('\n');
         text.push_back('\n');
     }
-    if (!text.empty()) {
+    // Each part appends a "\n\n" separator; drop the whole trailing one so
+    // the text ends on the last answer line (parts stay blank-separated).
+    if (text.size() >= 2) {
+        text.pop_back();
         text.pop_back();
     }
     return text;
@@ -172,6 +217,7 @@ void ResetProblemImageViewer(wqn::ProblemAppState* state)
     state->image_request = false;
     state->image_in_flight = false;
     state->image_error = false;
+    state->image_expected_gray4 = false;
     state->image_is_solution = false;
     state->image_index = 0;
     state->image_expected_id.clear();
@@ -186,14 +232,23 @@ void ResetProblemImageViewer(wqn::ProblemAppState* state)
 // problem cloud lane (shared ni_ SPIFFS cache first, then download).
 void RequestCurrentProblemImage(wqn::ProblemAppState* state)
 {
-    const auto& ids = state->image_is_solution
+    const auto& bw1_ids = state->image_is_solution
         ? state->current.solution_image_ids
         : state->current.image_ids;
-    if (state->image_index >= ids.size()) {
+    const auto& gray4_ids = state->image_is_solution
+        ? state->current.solution_gray4_image_ids
+        : state->current.gray4_image_ids;
+    if (state->image_index >= bw1_ids.size()) {
         state->image_error = true;
         return;
     }
-    const std::string& id = ids[state->image_index];
+    const bool has_gray4 = state->image_index < gray4_ids.size() &&
+        !gray4_ids[state->image_index].empty();
+    state->image_expected_gray4 =
+        state->image_render_mode == wqn::ImageRenderMode::kGray16 && has_gray4;
+    const std::string& id = state->image_expected_gray4
+        ? gray4_ids[state->image_index]
+        : bw1_ids[state->image_index];
     state->image_expected_id = id;
     state->image_error = false;
     if (state->image_loaded_id == id && state->image_wqni != nullptr) {
@@ -202,6 +257,23 @@ void RequestCurrentProblemImage(wqn::ProblemAppState* state)
     }
     if (!state->image_in_flight) {
         state->image_request = true;
+    }
+}
+
+void SetProblemImageRenderModeImpl(wqn::ProblemAppState* state, wqn::ImageRenderMode mode)
+{
+    if (state == nullptr || state->image_render_mode == mode) return;
+    state->image_render_mode = mode;
+    state->image_in_flight = false;
+    state->image_dispatched_id.clear();
+    state->image_loaded_id.clear();
+    state->image_wqni.reset();
+    if (state->active && state->mode == wqn::ProblemAppMode::kProblemView) {
+        const wqn::ProblemFace face = SegmentFace(*state, state->ring_segment);
+        if (face == wqn::ProblemFace::kProblemImage ||
+            face == wqn::ProblemFace::kSolutionImage) {
+            RequestCurrentProblemImage(state);
+        }
     }
 }
 
@@ -246,13 +318,11 @@ void LoadCurrentProblem(wqn::ProblemAppState* state)
 {
     state->current = wqn::WqnProblemEntry{};
     state->current_loaded = false;
-    state->body_text.clear();
-    state->answer_text.clear();
+    state->body_layout.reset();
+    state->answer_layout.reset();
     state->answer_unlocked = false;
     state->body_scroll_lines = 0;
     state->answer_scroll_lines = 0;
-    state->body_total_lines = 0;
-    state->answer_total_lines = 0;
     state->verdict_selected = 0;
     ResetProblemImageViewer(state);
     const wqn::ProblemPackSet* set = OpenSet(*state);
@@ -269,14 +339,15 @@ void LoadCurrentProblem(wqn::ProblemAppState* state)
     const esp_err_t read_result = wqn::ReadProblemPackEntry(entry, &state->current);
     if (read_result == ESP_OK) {
         state->current_loaded = true;
-        // Precompute wrapped line counts with the SAME width as the renderer
-        // (page_problem.cpp: kContentW - 14 = 370 px) so scroll clamps match.
-        state->body_text = ComposeBodyText(state->current);
-        state->body_total_lines = static_cast<uint32_t>(
-            wqn::WrapUtf8TextToWidth(state->body_text, 370, 4096).size());
-        state->answer_text = ComposeAnswerText(state->current);
-        state->answer_total_lines = static_cast<uint32_t>(
-            wqn::WrapUtf8TextToWidth(state->answer_text, 370, 4096).size());
+        const uint64_t layout_id = std::hash<std::string>{}(state->current.problem_id);
+        state->body_layout = device_ui_internal::GetAiTextLayout(layout_id,
+            ComposeBodyText(state->current), device_ui_internal::AiTextKind::kMarkdown,
+            device_ui_internal::kNoteBodyWidth, device_ui_internal::AiNativeFont(),
+            device_ui_internal::kAiTextMaxRows, device_ui_internal::kMdNoSingleEmphasis);
+        state->answer_layout = device_ui_internal::GetAiTextLayout(layout_id ^ 1,
+            ComposeAnswerText(state->current), device_ui_internal::AiTextKind::kMarkdown,
+            device_ui_internal::kNoteBodyWidth, device_ui_internal::AiNativeFont(),
+            device_ui_internal::kAiTextMaxRows, device_ui_internal::kMdNoSingleEmphasis);
         ESP_LOGI(
             kTag, "problem opened: id=%.8s images=%u/%u parts=%u body_bytes=%u",
             state->current.problem_id.c_str(),
@@ -326,8 +397,8 @@ void ExitToProblemList(wqn::ProblemAppState* state)
 {
     state->current = wqn::WqnProblemEntry{};
     state->current_loaded = false;
-    state->body_text.clear();
-    state->answer_text.clear();
+    state->body_layout.reset();
+    state->answer_layout.reset();
     state->answer_unlocked = false;
     ResetProblemImageViewer(state);
     state->mode = wqn::ProblemAppMode::kProblemList;
@@ -380,15 +451,19 @@ void HandleProblemViewInput(wqn::ProblemAppState* state, wqn::ProblemInput input
     const size_t images = ProblemImageCount(*state);
     const size_t solution_images = SolutionImageCount(*state);
     const wqn::ProblemFace face = SegmentFace(*state, state->ring_segment);
-    const uint32_t body_max = FaceMaxScroll(state->body_total_lines);
-    const uint32_t answer_max = FaceMaxScroll(state->answer_total_lines);
+    const auto body_geometry = ProblemFaceGeometry(*state, false);
+    const auto answer_geometry = ProblemFaceGeometry(*state, true);
+    const uint32_t body_max = body_geometry.max_scroll;
+    const uint32_t answer_max = answer_geometry.max_scroll;
+    state->body_scroll_lines = std::min(state->body_scroll_lines, body_max);
+    state->answer_scroll_lines = std::min(state->answer_scroll_lines, answer_max);
     switch (input) {
         case wqn::ProblemInput::kUp:
             if (face == wqn::ProblemFace::kBody) {
                 if (state->body_scroll_lines > 0) {
                     state->body_scroll_lines =
-                        state->body_scroll_lines > kProblemFaceScrollStep
-                            ? state->body_scroll_lines - kProblemFaceScrollStep
+                        state->body_scroll_lines > body_geometry.step
+                            ? state->body_scroll_lines - body_geometry.step
                             : 0;
                     state->message.clear();
                 } else if (images > 0) {
@@ -409,8 +484,8 @@ void HandleProblemViewInput(wqn::ProblemAppState* state, wqn::ProblemInput input
             } else if (face == wqn::ProblemFace::kAnswer) {
                 if (state->answer_scroll_lines > 0) {
                     state->answer_scroll_lines =
-                        state->answer_scroll_lines > kProblemFaceScrollStep
-                            ? state->answer_scroll_lines - kProblemFaceScrollStep
+                        state->answer_scroll_lines > answer_geometry.step
+                            ? state->answer_scroll_lines - answer_geometry.step
                             : 0;
                     state->message.clear();
                 } else {
@@ -440,7 +515,7 @@ void HandleProblemViewInput(wqn::ProblemAppState* state, wqn::ProblemInput input
             if (face == wqn::ProblemFace::kBody) {
                 if (state->body_scroll_lines < body_max) {
                     state->body_scroll_lines = std::min<uint32_t>(
-                        state->body_scroll_lines + kProblemFaceScrollStep, body_max);
+                        state->body_scroll_lines + body_geometry.step, body_max);
                     state->message.clear();
                 } else if (state->answer_unlocked) {
                     EnterAnswerSegment(state, 0);
@@ -455,7 +530,7 @@ void HandleProblemViewInput(wqn::ProblemAppState* state, wqn::ProblemInput input
             } else if (face == wqn::ProblemFace::kAnswer) {
                 if (state->answer_scroll_lines < answer_max) {
                     state->answer_scroll_lines = std::min<uint32_t>(
-                        state->answer_scroll_lines + kProblemFaceScrollStep, answer_max);
+                        state->answer_scroll_lines + answer_geometry.step, answer_max);
                     state->message.clear();
                 } else if (solution_images > 0) {
                     EnterImageSegment(state, AnswerSegment(*state) + 1);
@@ -539,6 +614,7 @@ void HandleVerdictInput(wqn::ProblemAppState* state, wqn::ProblemInput input)
             pending.action = VerdictAction(state->verdict_selected);
             state->pending_verdict = std::move(pending);
             state->verdict_effect_ready = true;
+            state->verdict_error.clear();
             state->commit_state = wqn::ProblemVerdictCommitState::kPersisting;
             state->advance_after_commit = true;
             state->mode = wqn::ProblemAppMode::kProblemView;
@@ -575,6 +651,11 @@ void AdvanceAfterVerdict(wqn::ProblemAppState* state)
 
 namespace wqn {
 
+void SetProblemImageRenderMode(ProblemAppState* state, ImageRenderMode mode)
+{
+    SetProblemImageRenderModeImpl(state, mode);
+}
+
 esp_err_t InitProblemApp(ProblemAppState* state)
 {
     if (state == nullptr) return ESP_ERR_INVALID_ARG;
@@ -597,6 +678,7 @@ esp_err_t InitProblemApp(ProblemAppState* state)
     ProblemOutboxSnapshot outbox;
     if (ReadProblemOutboxSnapshot(&outbox) == ESP_OK) {
         state->outbox.pending_count = outbox.pending_count;
+        state->outbox.suspended_count = outbox.suspended_count;
         state->outbox.capacity = outbox.capacity;
     }
 
@@ -696,10 +778,11 @@ bool TakeProblemImageRequest(
     std::string* problem_id,
     bool* is_solution,
     uint8_t* image_index,
-    std::string* image_id)
+    std::string* image_id,
+    bool* gray4)
 {
     if (state == nullptr || problem_id == nullptr || is_solution == nullptr ||
-        image_index == nullptr || image_id == nullptr) {
+        image_index == nullptr || image_id == nullptr || gray4 == nullptr) {
         return false;
     }
     EnsureProblemImageRequest(state);
@@ -716,6 +799,7 @@ bool TakeProblemImageRequest(
     *is_solution = state->image_is_solution;
     *image_index = state->image_index;
     *image_id = state->image_expected_id;
+    *gray4 = state->image_expected_gray4;
     state->image_request = false;
     state->image_in_flight = true;
     state->image_dispatch_us = esp_timer_get_time();
@@ -763,6 +847,20 @@ void ApplyProblemImageResult(
     const std::string& failed_id =
         image_id.empty() ? state->image_dispatched_id : image_id;
     if (!state->image_request && failed_id == state->image_expected_id) {
+        if (result == ESP_ERR_NOT_FOUND && state->image_expected_gray4) {
+            const auto& bw1_ids = state->image_is_solution
+                ? state->current.solution_image_ids
+                : state->current.image_ids;
+            if (state->image_index < bw1_ids.size()) {
+                state->image_expected_gray4 = false;
+                state->image_expected_id = bw1_ids[state->image_index];
+                state->image_dispatched_id.clear();
+                state->image_error = false;
+                state->image_request = true;
+                ESP_LOGW(kTag, "gray16 problem derivative missing; falling back to BW1");
+                return;
+            }
+        }
         state->image_error = true;
         ESP_LOGW(kTag, "problem image fetch failed: %s id=%.12s",
                  esp_err_to_name(result), failed_id.c_str());
@@ -846,6 +944,7 @@ bool TakeProblemVerdictEffect(
         state->verdict_effect_ready = false;
         state->commit_state = ProblemVerdictCommitState::kFailed;
         state->message = "记录无效";
+        state->verdict_error = state->message;
         return false;
     }
     state->verdict_effect_ready = false;
@@ -866,29 +965,19 @@ void ApplyProblemVerdictCommitResult(ProblemAppState* state, esp_err_t result)
         state->commit_state = ProblemVerdictCommitState::kFailed;
         state->advance_after_commit = false;
         state->message = result == ESP_ERR_NO_MEM ? "记录空间已满" : "记录未保存";
+        state->verdict_error = state->message;
         return;
     }
     state->pending_verdict = {};
+    state->verdict_error.clear();
     state->commit_state = ProblemVerdictCommitState::kCloudPending;
-    if (state->outbox.pending_count < state->outbox.capacity) {
+    if (state->outbox.pending_count + state->outbox.suspended_count <
+        state->outbox.capacity) {
         ++state->outbox.pending_count;
     }
     if (state->advance_after_commit) {
         state->advance_after_commit = false;
         AdvanceAfterVerdict(state);
-    }
-}
-
-void RefreshProblemOutboxState(ProblemAppState* state)
-{
-    if (state == nullptr) return;
-    ProblemOutboxSnapshot snapshot;
-    if (ReadProblemOutboxSnapshot(&snapshot) != ESP_OK) return;
-    state->outbox.pending_count = snapshot.pending_count;
-    state->outbox.capacity = snapshot.capacity;
-    if (snapshot.pending_count == 0 &&
-        state->commit_state == ProblemVerdictCommitState::kCloudPending) {
-        state->commit_state = ProblemVerdictCommitState::kCloudAcknowledged;
     }
 }
 
@@ -925,8 +1014,8 @@ ProblemAppSnapshot BuildProblemAppSnapshot(const ProblemAppState& state)
         snapshot.has_body = state.current_loaded;
         snapshot.problem_id = state.current.problem_id;
         snapshot.problem_title = state.current.title;
-        snapshot.body_text = state.body_text;
-        snapshot.answer_text = state.answer_text;
+        snapshot.body_layout = state.body_layout;
+        snapshot.answer_layout = state.answer_layout;
         snapshot.body_scroll_lines = state.body_scroll_lines;
         snapshot.answer_scroll_lines = state.answer_scroll_lines;
         snapshot.answer_unlocked = state.answer_unlocked;
@@ -952,6 +1041,9 @@ ProblemAppSnapshot BuildProblemAppSnapshot(const ProblemAppState& state)
     }
     snapshot.verdict_selected = state.verdict_selected;
     snapshot.commit_state = state.commit_state;
+    snapshot.outbox_pending_count = state.outbox.pending_count;
+    snapshot.outbox_suspended_count = state.outbox.suspended_count;
+    snapshot.notice = ProblemAppNotice(state);
     snapshot.status_line = ProblemAppStatusLine(state);
     switch (state.mode) {
         case ProblemAppMode::kProblemList:
@@ -971,6 +1063,9 @@ ProblemAppSnapshot BuildProblemAppSnapshot(const ProblemAppState& state)
 
 std::string ProblemAppStatusLine(const ProblemAppState& state)
 {
+    if (state.outbox.suspended_count > 0) {
+        return "同步挂起 " + std::to_string(state.outbox.suspended_count) + " 条";
+    }
     if (!state.message.empty()) return state.message;
     switch (state.mode) {
         case ProblemAppMode::kProblemList:
@@ -983,16 +1078,36 @@ std::string ProblemAppStatusLine(const ProblemAppState& state)
     return "";
 }
 
+std::string ProblemAppNotice(const ProblemAppState& state)
+{
+    if (state.commit_state == ProblemVerdictCommitState::kPersisting)
+        return "正在保存...";
+    if (state.commit_state == ProblemVerdictCommitState::kFailed && !state.verdict_error.empty())
+        return state.verdict_error;
+    const std::string& message = state.message;
+    for (const char* quiet : {"", "已到顶部", "已到底部", "选择要练的题",
+            "错题已就绪", "已记录，下一题", "该错题本暂无题目"}) {
+        if (message != quiet) continue;
+        if (state.commit_state == ProblemVerdictCommitState::kFailed)
+            return "记录未保存，确认重新自评";
+        if (state.outbox.suspended_count > 0)
+            return "同步挂起 " + std::to_string(state.outbox.suspended_count) + " 条";
+        if (state.cloud_sync_failed) return "同步异常，可继续离线复习";
+        return {};
+    }
+    return message;
+}
+
 std::string ProblemAppSignature(const ProblemAppState& state)
 {
     // Compact identity for the render layer to detect meaningful frame
     // changes; every navigation/unlock/verdict/image transition must land
     // here or the dedup pipeline freezes the page.
-    char buffer[128] = {};
+    char buffer[160] = {};
     std::snprintf(
         buffer,
         sizeof(buffer),
-        "%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u",
+        "%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u",
         static_cast<unsigned>(state.active ? 1 : 0),
         static_cast<unsigned>(state.mode),
         static_cast<unsigned>(state.list_selected),
@@ -1002,9 +1117,12 @@ std::string ProblemAppSignature(const ProblemAppState& state)
         static_cast<unsigned>(state.answer_unlocked ? 1 : 0),
         static_cast<unsigned>(state.verdict_selected),
         static_cast<unsigned>(state.commit_state),
+        static_cast<unsigned>(state.outbox.pending_count),
+        static_cast<unsigned>(state.outbox.suspended_count),
+        static_cast<unsigned>(state.cloud_sync_failed ? 1 : 0),
         static_cast<unsigned>(state.image_error ? 1 : 0),
         static_cast<unsigned>(state.pack_index.sets.size()));
-    return std::string(buffer);
+    return std::string(buffer) + "|" + ProblemAppNotice(state);
 }
 
 namespace {
@@ -1056,6 +1174,13 @@ bool RunProblemPageStateSelfTest()
     ProblemPageFixture idle;
     if (!idle) return require(false, "allocate idle fixture");
     idle.get().initialized = true;
+    const std::string healthy_signature = ProblemAppSignature(idle.get());
+    idle.get().cloud_sync_failed = true;
+    if (!require(ProblemAppSignature(idle.get()) != healthy_signature,
+                 "sync failure invalidates the render signature")) {
+        return false;
+    }
+    idle.get().cloud_sync_failed = false;
     for (size_t index = 0; index < 100; ++index) {
         const ProblemInput input = (index % 2 == 0) ? ProblemInput::kDown : ProblemInput::kUp;
         if (HandleProblemAppInput(&idle.get(), input) != ESP_OK) return false;
@@ -1225,6 +1350,60 @@ bool RunProblemPageStateSelfTest()
     if (!require(f.commit_state == ProblemVerdictCommitState::kFailed,
                  "failed commit is terminal") ||
         !require(f.list_selected == 0, "failed commit does not advance")) {
+        return false;
+    }
+
+    // Choice rendering: MCQ options join the 题面 as "- A. 文字" list lines
+    // (a choices-only part still renders) and the answer face echoes the
+    // correct option's text -- inline for single choice, one list line per
+    // selected id for multi choice.
+    wqn::WqnProblemEntry single;
+    {
+        wqn::WqnProblemPackPart part;
+        part.index = 1;
+        part.type = "single_choice";
+        part.content_text = "题干";
+        part.answer_text = "B";
+        part.choices = {{"A", "甲选项"}, {"B", "乙选项"}};
+        single.parts.push_back(std::move(part));
+    }
+    if (!require(
+            ComposeBodyText(single) == "题干\n- A. 甲选项\n- B. 乙选项",
+            "choices render as a list under the part body") ||
+        !require(
+            ComposeAnswerText(single) == "第1问\n答案：B. 乙选项",
+            "single choice answer echoes the option text")) {
+        return false;
+    }
+    wqn::WqnProblemEntry multi;
+    {
+        wqn::WqnProblemPackPart part;
+        part.index = 1;
+        part.label = "多选";
+        part.type = "multi_choice";
+        part.content_text = "题干";
+        part.answer_text = "BD";
+        part.choices = {{"A", "甲选项"}, {"B", "乙选项"}, {"D", "丁选项"}};
+        multi.parts.push_back(std::move(part));
+    }
+    if (!require(
+            ComposeAnswerText(multi) ==
+                "第1问 · 多选\n答案：BD\n- B. 乙选项\n- D. 丁选项",
+            "multi choice answer lists the selected options")) {
+        return false;
+    }
+    wqn::WqnProblemEntry choices_only;
+    {
+        wqn::WqnProblemPackPart part;
+        part.index = 1;
+        part.type = "single_choice";
+        part.answer_text = "A";
+        part.choices = {{"A", "甲选项"}};
+        choices_only.parts.push_back(std::move(part));
+    }
+    if (!require(
+            ComposeBodyText(choices_only) == "- A. 甲选项",
+            "choices-only part still renders")) {
         return false;
     }
     return true;

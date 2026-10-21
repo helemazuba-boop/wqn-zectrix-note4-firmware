@@ -1,12 +1,17 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <string>
-#include <vector>
 
 #include "esp_err.h"
 
 namespace wqn {
+
+enum class ImageRenderMode : uint8_t {
+    kBlackWhite = 0,
+    kGray16 = 1,
+};
 
 struct StorageCapacitySnapshot {
     bool spiffs_valid = false;
@@ -18,76 +23,149 @@ struct StorageCapacitySnapshot {
     size_t nvs_total_entries = 0;
 };
 
-struct CachedProblem {
-    std::string id;
-    std::string title;
-    std::string type;
-    std::string status;
-    std::string content_text;
-    std::string solution_text;
-    int asset_count = 0;
-    int solution_asset_count = 0;
-    std::string updated_at;
-};
-
-struct PendingReviewResult {
-    std::string problem_id;
-    std::string selected_status;
-    bool is_correct = false;
-    std::string submitted_answer;
-    std::string created_at;
-};
-
-struct CachedAiSession {
-    std::string day;
-    std::string conversation_id;
-    std::string transcript;
-    std::string reply_text;
-    std::string status_detail;
-    std::vector<std::string> function_call_summaries;
-    int latency_ms = 0;
-};
+// [word-session-cursor-nvs] The 52 B pause/resume cursor, moved off SPIFFS
+// (doc/1005-storage-rewrite-todo.md §五之十). It used to cost a 1,766 ms median
+// AtomicWrite per answer, which is half of the "answering takes 4.3 s" symptom.
+//
+// The NVS primitives run inline because the caller is already the storage owner
+// task; re-queuing through SaveBlobToNvs would nest a second writer inside a
+// transaction (§7.4). `key` comes from the caller's per-mode table so this
+// header keeps no dependency on the word protocol types.
+esp_err_t SaveWordSessionCursorNvs(const char* key, const void* record, size_t size);
+// `*found` stays false and the result stays ESP_OK when no cursor is stored --
+// that is the "this mode is unused / not migrated yet" case, not an error. The
+// caller then falls back to the legacy .cur file. found must not be null.
+esp_err_t LoadWordSessionCursorNvs(const char* key, void* record, size_t size, bool* found);
+// [word-session-cursor-nvs] Erase one mode's cursor. ClearSessionTransaction
+// needs this because it used to unlink .cur/.ctp/.cbk, and once the value moved
+// to NVS those file removals clear nothing and the erased session leaves an
+// orphan blob behind (4 entries of the 504-entry budget, §五之十). NOT_FOUND is
+// success: clearing a mode that never had a cursor is the normal case.
+esp_err_t ClearWordSessionCursorNvs(const char* key);
 
 struct DeviceControlState {
     uint64_t config_revision = 0;
     uint64_t sync_cursor = 0;
 };
 
+enum class SyncJournalPhase : uint8_t {
+    kClean = 0,
+    kPending = 1,
+    kFetching = 2,
+    kInstalling = 3,
+    kBackoff = 4,
+    kBlocked = 5,
+};
+
+struct SyncJournalContentState {
+    uint64_t desired_revision = 0;
+    uint64_t applied_revision = 0;
+    SyncJournalPhase phase = SyncJournalPhase::kClean;
+    uint8_t retry_attempt = 0;
+    uint64_t retry_not_before_unix_seconds = 0;
+    char desired_snapshot_id[65] = {};
+    char active_snapshot_id[65] = {};
+};
+
+struct SyncJournalRetryState {
+    uint64_t not_before_unix_seconds = 0;
+    uint8_t attempt = 0;
+};
+
+struct SyncJournalOutboxRetryState {
+    char request_id[65] = {};
+    uint64_t not_before_unix_seconds = 0;
+    uint8_t attempt = 0;
+    uint8_t cause = 0;
+};
+
+struct SyncJournal {
+    uint32_t schema_version = 2;
+    uint64_t config_revision = 0;
+    uint64_t sync_cursor = 0;
+    SyncJournalRetryState full_sync_retry = {};
+    SyncJournalContentState word_packs = {};
+    SyncJournalContentState note_packs = {};
+    SyncJournalContentState problem_packs = {};
+    SyncJournalOutboxRetryState word_outbox = {};
+    SyncJournalOutboxRetryState note_outbox = {};
+    SyncJournalOutboxRetryState problem_outbox = {};
+    char protocol_blocked_image_id[65] = {};
+};
+
 esp_err_t InitStorage();
 bool ReadStorageCapacitySnapshot(StorageCapacitySnapshot* snapshot);
+// Reclaims only disposable files (stale temps and the shared note/problem
+// image cache), runs bounded SPIFFS GC, then requires `required_bytes` plus a
+// fixed safety reserve. Referenced pack/manifests are never removed here.
+esp_err_t EnsurePackDownloadCapacity(
+    size_t required_bytes,
+    size_t safety_reserve_bytes = 256U * 1024U);
 esp_err_t LoadAccessToken(std::string* token);
+// Audio workers may have PSRAM stacks. Dispatch NVS reads to the internal-stack
+// storage owner; never call from the UI. Queued foreground work can time out,
+// but a started transaction completes before the caller's context is released.
+// Holds the storage sleep lease across the queued read and its completion.
+esp_err_t LoadAccessTokenFromStorageService(std::string* token);
 esp_err_t SaveAccessToken(const std::string& token);
 esp_err_t ClearAccessToken();
 bool IsValidAccessToken(const std::string& token);
 std::string MaskTokenForLog(const std::string& token);
-esp_err_t LoadDeviceControlState(DeviceControlState* state);
-esp_err_t SaveDeviceControlState(const DeviceControlState& state);
-
-esp_err_t SaveProblems(const std::vector<CachedProblem>& problems);
-esp_err_t LoadProblems(std::vector<CachedProblem>* problems);
-esp_err_t ClearProblems();
-
-esp_err_t EnqueueReviewResult(const PendingReviewResult& result);
-esp_err_t LoadPendingReviewResults(std::vector<PendingReviewResult>* results);
-esp_err_t ClearPendingReviewResults();
-
-esp_err_t SaveAiSessionForDay(const CachedAiSession& session);
-esp_err_t LoadAiSessionForDay(const std::string& day, CachedAiSession* session);
-esp_err_t ClearAiSession();
+// The journal is the sole control/content checkpoint. Legacy v3 NVS scalar
+// keys are not advanced or imported: they cannot represent an atomic pair.
+// With no journal bootstrap starts at zero; valid v1/v2 journals stay readable.
+// The temp/backup/rename recovery still requires physical power-cut HIL.
+esp_err_t LoadSyncJournal(SyncJournal* journal);
+// [storage-single-writer] Dispatches the commit to the StorageService task so
+// the journal's rename sequence can never interleave with a pack or NVS write
+// from another task. The kStorage lease is held by the caller across the queue
+// wait, so the write is never refused by a quiesce it should have blocked.
+// The raw entry point is file-local on purpose.
+// Exact-byte deduplication is against the last successful commit only. Any
+// failed filesystem commit invalidates that cache. reason is a static label,
+// not a request identity or credential; it is used only for diagnostics.
+esp_err_t SaveSyncJournalThroughStorageService(
+    const SyncJournal& journal, const char* reason = "unspecified");
 
 esp_err_t LoadAutoSyncIntervalMinutes(uint32_t* minutes);
-esp_err_t SaveAutoSyncIntervalMinutes(uint32_t minutes);
 // [persist-worker] Worker-dedicated variant: routes the NVS commit through the
 // FOREGROUND storage queue so the persist worker's wait behind background pack
 // writes is bounded (once a transaction starts it may still wait without a
 // fixed deadline). UI code must not call this synchronously.
 esp_err_t SaveAutoSyncIntervalMinutesForeground(uint32_t minutes);
+esp_err_t LoadBootFullSyncAttemptUnixSeconds(int64_t* seconds);
+esp_err_t SaveBootFullSyncAttemptUnixSeconds(int64_t seconds);
 std::string AutoSyncIntervalLabel(uint32_t minutes);
+esp_err_t LoadImageRenderMode(ImageRenderMode* mode);
+esp_err_t SaveImageRenderModeForeground(ImageRenderMode mode);
+std::string ImageRenderModeLabel(ImageRenderMode mode);
+// [ai-follow] 「AI 回复时翻页」: whether a reply drags the viewport to its newest
+// line. A missing key reads as true (the product default). The AI session keeps
+// the copy the follow step actually reads; boot seeds it from here.
+esp_err_t LoadAiAutoFollow(bool* follow);
+// [persist-worker] Worker-dedicated variant (see SaveAutoSyncIntervalMinutesForeground).
+esp_err_t SaveAiAutoFollowForeground(bool follow);
+// [detail] Agent-tier cloud detail tier (0 简要 / 1 标准 / 2 详细). A missing or
+// out-of-range key reads as the full tier (kOpenCodeDetailDefault in
+// opencode_model.h). The opencode session keeps the copy the request builders
+// read; boot seeds it from here.
+esp_err_t LoadAgentDetailLevel(uint8_t* level);
+// [persist-worker] Worker-dedicated variant (see SaveAutoSyncIntervalMinutesForeground).
+esp_err_t SaveAgentDetailLevelForeground(uint8_t level);
+// [word-sequential-chain] How far the library walk (顺序过词库) has come:
+// the index of the next word to study. Device-local and independent of any
+// session record, so it survives a finished/cleared session. Reset to 0 when
+// the deck scope changes (the index is relative to the scoped library).
+esp_err_t LoadWordSequentialCursor(uint32_t* cursor);
+// [storage-single-writer] Foreground storage write: a tiny NVS value that must
+// not queue behind a multi-MB pack sync. It used to run the NVS primitives
+// inline on the caller's task, which is the UI task for most callers.
+esp_err_t SaveWordSequentialCursor(uint32_t cursor);
+
 // Default word deck for the device (empty = all decks). The word page's
 // study sessions scope to it; the other decks enter via the note screen's
 // mixed [词] rows.
 esp_err_t LoadDefaultWordDeckId(std::string* deck_id);
-esp_err_t SaveDefaultWordDeckId(const std::string& deck_id);
 // [deck-scope] Recoverable default-deck change protocol (c5). A deck switch
 // must clear both persisted word sessions (SPIFFS) and save the new deck +
 // scope generation (NVS); there is no cross-NVS/SPIFFS atomicity, so a marker
@@ -105,8 +183,13 @@ esp_err_t RecoverDefaultDeckScopeChange();
 // rejected on load when it no longer matches (second line of defense behind
 // the marker protocol). Atomic; safe from any task.
 uint32_t GetDeckScopeGeneration();
+// [word-scope-reset] Drops every word session after a word-page scope switch
+// that does not change the default deck: commits a new scope generation first
+// (making existing session files inert), then removes the four session files and
+// the walk cursor. One foreground storage transaction; blocks its caller, which
+// today is the UI task.
+esp_err_t ResetWordSessionScope();
 esp_err_t LoadVolumePercent(int* percent);
-esp_err_t SaveVolumePercent(int percent);
 // [persist-worker] Worker-dedicated variant (see SaveAutoSyncIntervalMinutesForeground).
 esp_err_t SaveVolumePercentForeground(int percent);
 std::string VolumeLabel(int percent);
@@ -119,10 +202,76 @@ void SetPlaybackVolumeCache(int percent);
 esp_err_t FactoryResetNvsAndRestart();
 
 esp_err_t LoadWifiCredentials(std::string* ssid, std::string* password);
-esp_err_t SaveWifiCredentials(const std::string& ssid, const std::string& password);
-esp_err_t ClearWifiCredentials();
-bool HasWifiCredentials();
 
+// [wifi-redundancy] Dual-slot WiFi credential store. The store is a versioned
+// NVS blob holding up to two (ssid, password) slots plus a `preferred` index
+// pointing at the configured primary network. Automatic failover never changes
+// this identity. Existing blobs retain their current preferred slot as primary;
+// the layout and version are unchanged. Persistence is a
+// single atomic blob commit (the legacy per-key wifi_ssid/wifi_pass pair could
+// tear across power loss). Load is a pure read; MigrateLegacyWifiCredentialsIfNeeded
+// performs the legacy-key migration explicitly.
+struct WifiCredentialSlot {
+    char ssid[33];       // 32 + NUL
+    char password[65];   // 64 + NUL
+};
+struct WifiCredentialStore {
+    uint8_t version = 0;    // kWifiCredentialStoreVersion when valid
+    uint8_t preferred = 0;  // index of the configured primary slot
+    uint8_t count = 0;      // 0..2 occupied slots
+    WifiCredentialSlot slots[2] = {};
+};
+
+// Stable roles exposed by the provisioning UI. `kPrimary` addresses the
+// preferred slot; `kBackup` addresses the other slot without changing which
+// network is preferred.
+enum class WifiCredentialRole : uint8_t {
+    kPrimary = 0,
+    kBackup,
+};
+
+// Outcome of MigrateLegacyWifiCredentialsIfNeeded. kRetryLater means nothing
+// durable changed and the caller is expected to try again later; kMigrated and
+// kNothingToMigrate are both terminal (the store on flash is already correct),
+// so callers normally only branch on kRetryLater.
+enum class WifiLegacyMigrationResult : uint8_t {
+    kNothingToMigrate,
+    kMigrated,
+    kRetryLater,
+};
+
+// Pure read of the store. Validates the blob; an absent, size-mismatched or
+// invalid blob yields an empty versioned store (count == 0) and ESP_OK, because
+// this runs on the UI task and must never write. A genuine NVS read failure is
+// returned to the caller instead of being reported as an empty store, so an
+// upsert cannot write over a store it failed to read.
+esp_err_t LoadWifiCredentialStore(WifiCredentialStore* store);
+// [wifi-redundancy] Migrates the legacy wifi_ssid/wifi_pass pair into the
+// versioned blob, then erases whichever legacy keys were actually present (an
+// empty-valued key is left behind rather than costing an extra NVS commit). Also
+// clears orphan legacy keys when a valid blob already exists. Idempotent: the
+// durable end state is the same however often it runs, and a device with nothing
+// to migrate performs no write and takes no lease. It DOES block its caller on
+// the storage queue while it writes, so only app_main / boot-time init and the
+// connectivity and provisioning tasks may call it -- never the UI task.
+WifiLegacyMigrationResult MigrateLegacyWifiCredentialsIfNeeded();
+// Persists the whole store as one atomic NVS blob commit.
+esp_err_t SaveWifiCredentialStore(const WifiCredentialStore& store);
+// Insert or update a credential: same-SSID slots get their password refreshed,
+// a free slot is appended when available, otherwise the non-preferred slot is
+// replaced. The touched slot becomes preferred. No-op writes (identical
+// ssid+password already preferred) skip the NVS commit.
+esp_err_t UpsertWifiCredential(const std::string& ssid, const std::string& password);
+// Updates one provisioning role explicitly. `keep_existing_password` is only
+// accepted when the submitted SSID still matches the credential currently in
+// that role. A backup cannot be created before a primary credential exists.
+esp_err_t SetWifiCredentialForRole(
+    WifiCredentialRole role,
+    const std::string& ssid,
+    const std::string& password,
+    bool keep_existing_password);
+// Explicitly makes `index` the configured primary slot. Writes only when the value
+// actually changes, to bound NVS wear.
 // PowerCoordinator boundary. Writes are serialized by StorageService and each
 // accepted transaction holds kStorage, so Ready means every commit is durable.
 esp_err_t PrepareStorageForSleep(int64_t deadline_us);

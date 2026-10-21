@@ -9,8 +9,12 @@
 #include "device_protocol/note_study.h"
 #include "esp_err.h"
 #include "note_pack.h"
+#include "note_list_model.h"
 #include "note_store.h"
+#include "storage.h"
 #include "wqn_api.h"
+
+namespace device_ui_internal { struct AiTextLayout; }
 
 namespace wqn {
 
@@ -62,6 +66,8 @@ struct NoteSessionState {
 
 struct NoteOutboxState {
     size_t pending_count = 0;
+    size_t suspended_count = 0;
+    size_t blocked_count = 0;
     size_t capacity = kNoteObservationOutboxCapacity;
 };
 
@@ -93,10 +99,9 @@ struct NoteAppState {
     size_t notebook_window_start = 0;
     size_t note_list_window_start = 0;
     uint32_t note_scroll_offset_lines = 0;
-    // Total wrapped body lines for the open note (computed at load with the same
-    // wrap width as RenderNoteBody). Bounds Down-scroll so over-scrolling past the
-    // end cannot inflate the offset and leave Up-scroll with nothing to repaint.
-    uint32_t note_body_total_lines = 0;
+    // Produced once at body load, then shared immutably with the EPD snapshot.
+    // The same rows determine counting, bounds and native rendering.
+    std::shared_ptr<const device_ui_internal::AiTextLayout> body_layout;
 
     NoteSessionState session;
     NoteOutboxState outbox;
@@ -149,6 +154,8 @@ struct NoteAppState {
     bool image_request = false;
     bool image_in_flight = false;
     bool image_error = false;
+    ImageRenderMode image_render_mode = ImageRenderMode::kGray16;
+    bool image_expected_gray4 = false;
     // Id the viewer currently wants; results for anything else are dropped.
     std::string image_expected_id;
     // Id handed to the fetcher on the last dispatch: failures that arrive with
@@ -179,13 +186,17 @@ struct NoteAppState {
     std::string message;
 };
 
+enum class NoteLibraryRowKind : uint8_t { kNotebook, kProblemSet, kWordDeck };
+
 struct NoteNotebookRow {
+    NoteLibraryRowKind kind = NoteLibraryRowKind::kNotebook;
     std::string title;
     size_t note_count = 0;
     bool has_pack = false;
 };
 
 struct NoteTitleRow {
+    bool content_available = false;
     std::string title;
     // Empty when never viewed; otherwise the pinned last-viewed ISO timestamp.
     std::string last_opened_at;
@@ -211,10 +222,10 @@ struct NoteAppSnapshot {
     std::vector<NoteNotebookRow> notebooks;
     std::string notebook_title;
     std::vector<NoteTitleRow> titles;
+    bool titles_have_more = false;
     std::string note_title;
-    std::string note_body;
-    // Identity of the currently-open note; the render layer keys its wrapped-line
-    // cache on this so scrolling does not re-wrap the body every frame.
+    std::shared_ptr<const device_ui_internal::AiTextLayout> body_layout;
+    // Content identity remains separate from the immutable text-only layout.
     std::string note_id;
     // Image layer: count enables the body entry line; the payload pointer is
     // only set when ready and matching note_image_id.
@@ -228,6 +239,8 @@ struct NoteAppSnapshot {
     // loading page and the body "正在同步内容" page.
     int8_t transfer_progress_bucket = -1;
     std::string status_line;
+    // Actual feedback only; normal navigation hints and boundary no-ops stay hidden.
+    std::string notice;
     std::string hint;
 };
 
@@ -277,6 +290,7 @@ bool TakeNoteImageRequest(
     std::string* note_id,
     uint8_t* image_index,
     std::string* image_id,
+    bool* gray4,
     uint32_t* progress_generation);
 void RestoreNoteImageRequest(NoteAppState* state);
 // Targeted single-notebook pack fetch for an opened-but-missing note body;
@@ -296,6 +310,7 @@ void ApplyNoteBodyFetchResult(
 // Frees the held WQNI payload (used when the user leaves the note screen);
 // keeps request/in-flight bookkeeping intact.
 void ReleaseNoteImagePayload(NoteAppState* state);
+void SetNoteImageRenderMode(NoteAppState* state, ImageRenderMode mode);
 void ApplyNoteImageResult(
     NoteAppState* state,
     esp_err_t result,
@@ -324,9 +339,9 @@ bool UpdateNoteTransferProgress(
 // window: the display loop holds the loading-page commit briefly so a fast
 // cache hit paints the image with ONE full refresh instead of two.
 bool NoteImageLoadingGraceActive(const NoteAppState& state, int64_t now_us);
-void RefreshNoteOutboxState(NoteAppState* state);
 NoteAppSnapshot BuildNoteAppSnapshot(const NoteAppState& state);
 std::string NoteAppStatusLine(const NoteAppState& state);
+std::string NoteAppNotice(const NoteAppState& state);
 std::string NoteAppSignature(const NoteAppState& state);
 bool RunNotePageStateSelfTest();
 

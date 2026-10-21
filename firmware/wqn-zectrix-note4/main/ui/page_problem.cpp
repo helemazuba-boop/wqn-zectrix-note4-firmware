@@ -1,190 +1,168 @@
-// Problem browse renderer, hosted by the note page: 题目列表 -> 题目页
-// (竖直环: 题图/题面/答案面/答案图) -> 自评弹窗. Text faces reuse the note
-// body's wrapped scroll viewport with a proportional scrollbar; image
-// segments blit the WQNI payload full-screen exactly like the note viewer.
-
+// Native problem review: title list, independently cached text faces and
+// self-assessment. Existing attachment transport and ring semantics are kept.
 #include "ui_internal.h"
 #include "ui_widgets.h"
+#include "ai_native_text.h"
+#include "note_reading_geometry.h"
+#include "note_list_model.h"
 
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <string>
-#include <vector>
 
 namespace device_ui_internal {
-
 namespace {
-
 constexpr char kTag[] = "wqn_problem_page";
-constexpr int kProblemMarginX = 8;
-constexpr int kContentW = wqn::kEpdWidth - 2 * kProblemMarginX;
-constexpr int kContentTop = 32;
-// No footer line (device pages keep no bottom status row); the 13-line face
-// budget must stay in sync with kProblemFaceVisibleLines in problem_app.cpp.
-constexpr int kContentBottom = wqn::kEpdHeight - 4;
-constexpr int kListRowH = 30;
-constexpr int kBodyLineH = 20;
 
-int VisibleListRows()
+void DrawProblemEmpty(const std::string& title, const std::string& detail)
 {
-    return std::max(1, (kContentBottom - kContentTop) / kListRowH);
+    AiNativeText(16, 147, 368, title, 20);
+    AiNativeText(16, 179, 368, detail, 12);
 }
 
-size_t ClampListWindowStart(size_t start, size_t selected, size_t count, size_t visible)
+void DrawProblemStatusBar(const wqn::UiFrame& frame)
 {
-    if (visible == 0 || count <= visible) return 0;
-    const size_t max_start = count - visible;
-    if (start > max_start) start = max_start;
-    if (selected < start) start = selected;
-    else if (selected >= start + visible) start = selected + 1 - visible;
-    return start;
+    DrawHorizontalLine(0, kStatusBarDividerY, kScreenWidth);
+    const int icons_left = DrawStatusBarIcons(kScreenWidth - kStatusBarRightInset,
+        kStatusBarIconY, frame.home);
+    const std::string clock = CurrentClockLabel();
+    const int clock_width = wqn::MeasureTextWithFont(AiNativeFont(12), clock.c_str());
+    const int clock_x = icons_left - 7 - clock_width;
+    AiNativeText(clock_x, kStatusBarTitleY, clock_width, clock, 12);
+    const auto& problem = frame.problem_app;
+    const bool reading = problem.mode == wqn::ProblemAppMode::kProblemView;
+    std::string title = "WQN / 错题";
+    if (reading) {
+        const char* face = problem.face == wqn::ProblemFace::kBody ? "题面"
+            : problem.face == wqn::ProblemFace::kAnswer ? "答案"
+            : problem.face == wqn::ProblemFace::kProblemImage ? "题图" : "答案图";
+        title = face;
+        if (problem.total) title += " " + std::to_string(problem.position) + "/" + std::to_string(problem.total);
+        if (!problem.problem_title.empty()) title += " / " + problem.problem_title;
+    }
+    AiNativeText(kStatusBarTitleX, kStatusBarTitleY,
+        clock_x - kStatusBarTitleX - 8, title, reading ? 16 : 12);
 }
 
-esp_err_t DrawListRow(int y, const std::string& primary, const std::string& trailing, bool selected)
+void DrawProblemHeading(const std::string& context, const std::string& title,
+                        const std::string& position, const std::string& notice)
 {
-    if (selected) {
-        DrawSelectedFill(kProblemMarginX, y, kContentW, kListRowH - 4);
+    const int count_width = wqn::MeasureTextWithFont(AiNativeFont(12), position.c_str());
+    AiNativeText(kNoteListX, kNoteListKickerY, kNoteListWidth - count_width - 8, context, 12);
+    AiNativeText(kNoteListX + kNoteListWidth - count_width, kNoteListKickerY, count_width, position, 12);
+    AiNativeText(kNoteListX, kNoteListTitleY, kNoteListWidth,
+        notice.empty() ? title : notice, notice.empty() ? 24 : 16);
+    DrawHorizontalLine(kNoteListX, kNoteListDividerY, kNoteListWidth);
+}
+
+void DrawProblemTitleRow(int y, size_t index, const wqn::ProblemListRow& row, bool selected)
+{
+    if (selected) FillRect(kNoteListX, y, kNoteListWidth, kNoteListPitch - 1, true);
+    DrawHorizontalLine(kNoteListX, y + kNoteListPitch - 1, kNoteListWidth);
+    char number[24] = {};
+    std::snprintf(number, sizeof(number), "%02u", static_cast<unsigned>(index + 1));
+    AiNativeText(kNoteListX + 7, y + 14, 27, number, 12, !selected);
+    AiNativeText(kNoteListX + 38, y + 4, kNoteListWidth - 61,
+        row.title.empty() ? "(无标题)" : row.title, 16, !selected);
+    AiNativeText(kNoteListX + 38, y + 25, kNoteListWidth - 61, row.status_label, 12, !selected);
+    const int arrow_x = kNoteListX + kNoteListWidth - 13;
+    for (int step = 0; step < 5; ++step) {
+        FillRect(arrow_x + step, y + 16 + step, 1, 1, !selected);
+        FillRect(arrow_x + step, y + 24 - step, 1, 1, !selected);
     }
-    const bool black = !selected;
-    const int trailing_w = 88;
-    ESP_RETURN_ON_ERROR(
-        DrawClippedText(kProblemMarginX + 10, y + 7, kContentW - trailing_w - 20, primary, black),
-        kTag, "draw problem row primary");
-    if (!trailing.empty()) {
-        ESP_RETURN_ON_ERROR(
-            DrawClippedText(
-                kProblemMarginX + kContentW - trailing_w, y + 7, trailing_w - 6, trailing, black),
-            kTag, "draw problem row trailing");
-    }
-    return ESP_OK;
 }
 
 esp_err_t RenderProblemList(const wqn::ProblemAppSnapshot& problem)
 {
-    if (problem.rows.empty()) {
-        return DrawCenteredText(kProblemMarginX, 160, kContentW, "该错题本暂无题目");
+    const size_t count = problem.rows.size();
+    const size_t selected = count ? std::min(problem.list_selected, count - 1) : 0;
+    DrawProblemHeading(std::to_string(count) + " 道错题",
+        problem.set_name.empty() ? "错题本" : problem.set_name,
+        count ? std::to_string(selected + 1) + " / " + std::to_string(count) : "0", problem.notice);
+    if (!count) {
+        DrawProblemEmpty("该错题本暂无题目", "同步错题本后可在设备复习");
+        return ESP_OK;
     }
-    const size_t visible = static_cast<size_t>(VisibleListRows());
-    const size_t start = ClampListWindowStart(
-        problem.list_window_start, problem.list_selected, problem.rows.size(), visible);
-    for (size_t i = 0; i < visible && start + i < problem.rows.size(); ++i) {
+    const size_t start = wqn::ClampNoteListWindow(problem.list_window_start, selected, count);
+    for (size_t i = 0; i < wqn::kNoteListVisibleRows && start + i < count; ++i) {
         const size_t index = start + i;
-        const wqn::ProblemListRow& row = problem.rows[index];
-        ESP_RETURN_ON_ERROR(
-            DrawListRow(
-                kContentTop + static_cast<int>(i) * kListRowH,
-                row.title.empty() ? "(无标题)" : row.title,
-                row.status_label,
-                index == problem.list_selected),
-            kTag, "draw problem title row");
+        DrawProblemTitleRow(kNoteListTop + static_cast<int>(i) * kNoteListPitch,
+            index, problem.rows[index], index == selected);
     }
     return ESP_OK;
 }
 
-// Wrapped scroll viewport shared by the 题面 and 答案面. The wrapped lines are
-// cached per problem+face so scrolling never re-wraps a multi-KB body.
-esp_err_t RenderProblemTextFace(
-    const wqn::ProblemAppSnapshot& problem,
-    bool answer_face)
+esp_err_t RenderProblemTextFace(const wqn::ProblemAppSnapshot& problem, bool answer_face)
 {
-    const std::string& text = answer_face ? problem.answer_text : problem.body_text;
-    const uint32_t scroll = answer_face
-        ? problem.answer_scroll_lines
-        : problem.body_scroll_lines;
     if (!problem.has_body) {
-        return DrawCenteredText(kProblemMarginX, 160, kContentW, "内容未同步，请稍后再试");
+        DrawProblemEmpty(problem.notice.empty() ? "内容未同步" : problem.notice,
+            "请同步错题本后重试");
+        return ESP_OK;
     }
-    if (text.empty()) {
-        return DrawCenteredText(
-            kProblemMarginX, 160, kContentW,
-            answer_face ? "本题暂无文字答案" : "本题为图片题，向上查看题图");
+    const auto& layout = answer_face ? problem.answer_layout : problem.body_layout;
+    const auto geometry = ComputeNoteReadingGeometry(layout ? layout->markdown.size() : 0,
+        false, !problem.notice.empty());
+    if (!problem.notice.empty()) AiNativeText(kNoteBodyX, kNoteBodyTop,
+        kNoteBodyWidth, problem.notice, 12);
+    if (!layout || layout->markdown.empty() ||
+        (layout->markdown.size() == 1 && layout->markdown[0].text.empty())) {
+        DrawProblemEmpty(answer_face ? "本题暂无文字答案" : "本题暂无文字题面",
+            problem.answer_unlocked ? "确认可打开自评" : "确认可查看答案");
+        return ESP_OK;
     }
-    const int body_top = kContentTop;
-    const int visible = std::max(1, (kContentBottom - body_top) / kBodyLineH);
-    static std::string s_wrapped_key;
-    static std::vector<std::string> s_wrapped_lines;
-    const std::string key = problem.problem_id + (answer_face ? "#a" : "#b");
-    if (key != s_wrapped_key) {
-        s_wrapped_lines = wqn::WrapUtf8TextToWidth(text, kContentW - 14, 4096);
-        s_wrapped_key = key;
+    const auto& lines = layout->markdown;
+    const uint32_t offset = std::min(answer_face ? problem.answer_scroll_lines : problem.body_scroll_lines,
+        geometry.max_scroll);
+    for (uint32_t i = 0; i < geometry.visible && offset + i < lines.size(); ++i) {
+        ESP_RETURN_ON_ERROR(DrawMarkdownLine(lines[offset + i], kNoteBodyX,
+            geometry.top + static_cast<int>(i) * kNoteBodyLineHeight,
+            kNoteBodyWidth, kNoteBodyLineHeight, AiNativeFont()), kTag, "draw problem text");
     }
-    const std::vector<std::string>& lines = s_wrapped_lines;
-    const int total = static_cast<int>(lines.size());
-    const int max_top = total > visible ? total - visible : 0;
-    int top = static_cast<int>(scroll);
-    if (top > max_top) top = max_top;
-    if (top < 0) top = 0;
-    for (int i = 0; i < visible && top + i < total; ++i) {
-        ESP_RETURN_ON_ERROR(
-            DrawClippedText(
-                kProblemMarginX + 2, body_top + i * kBodyLineH, kContentW - 14, lines[top + i]),
-            kTag, "draw problem face line");
-    }
-    if (total > visible) {
-        const int track_x = wqn::kEpdWidth - 5;
-        const int track_h = visible * kBodyLineH;
-        int thumb_h = std::max(10, track_h * visible / total);
-        int thumb_y = body_top + track_h * top / total;
-        if (thumb_y + thumb_h > body_top + track_h) thumb_y = body_top + track_h - thumb_h;
-        FillRect(track_x, thumb_y, 3, thumb_h, true);
+    if (geometry.max_scroll) {
+        const int track_h = static_cast<int>(geometry.visible) * kNoteBodyLineHeight;
+        const int thumb_h = std::max(10, track_h * static_cast<int>(geometry.visible) / static_cast<int>(lines.size()));
+        const int thumb_y = geometry.top + static_cast<int>(
+            (static_cast<uint64_t>(track_h - thumb_h) * offset) / geometry.max_scroll);
+        FillRect(kScreenWidth - 5, thumb_y, 3, thumb_h, true);
     }
     return ESP_OK;
 }
 
 esp_err_t RenderProblemImageStatus(const wqn::ProblemAppSnapshot& problem)
 {
-    char label[64];
-    if (problem.image_error) {
-        std::snprintf(label, sizeof(label), "图片加载失败");
-    } else {
-        std::snprintf(
-            label, sizeof(label), "正在加载%s(%u/%u)…",
-            problem.image_is_solution ? "答案图" : "题图",
-            static_cast<unsigned>(problem.image_ordinal),
-            static_cast<unsigned>(problem.image_count));
-    }
-    ESP_RETURN_ON_ERROR(
-        DrawCenteredText(kProblemMarginX, 148, kContentW, label),
-        kTag, "render problem image status");
-    return DrawCenteredText(
-        kProblemMarginX, 176, kContentW,
-        problem.image_error ? "上下可继续浏览" : "长按可返回");
-}
-
-// 自评弹窗: full-screen dialog (mode switches always commit with a full
-// refresh, so no underlay is kept -- large partial overlays ghost).
-esp_err_t RenderVerdictDialog(const wqn::ProblemAppSnapshot& problem)
-{
-    const int box_x = 44;
-    const int box_w = wqn::kEpdWidth - 2 * box_x;
-    const int box_y = 56;
-    const int box_h = 204;
-    DrawRoundedRect(box_x, box_y, box_w, box_h, 6);
-    ESP_RETURN_ON_ERROR(
-        DrawCenteredText(box_x, box_y + 12, box_w, "这道题做得怎么样？"),
-        kTag, "draw verdict title");
-    static const char* kOptions[] = {
-        "A 对了",
-        "B 还要想想",
-        "C 错了",
-        "D 跳过",
-    };
-    const int row_h = 36;
-    const int first_y = box_y + 48;
-    for (size_t index = 0; index < 4; ++index) {
-        const int y = first_y + static_cast<int>(index) * row_h;
-        const bool selected = index == problem.verdict_selected;
-        if (selected) {
-            DrawSelectedFill(box_x + 10, y, box_w - 20, row_h - 6);
-        }
-        ESP_RETURN_ON_ERROR(
-            DrawClippedText(box_x + 24, y + 6, box_w - 48, kOptions[index], !selected),
-            kTag, "draw verdict option");
-    }
+    char label[80] = {};
+    std::snprintf(label, sizeof(label), "正在加载%s (%u/%u)...",
+        problem.image_is_solution ? "答案图" : "题图",
+        static_cast<unsigned>(problem.image_ordinal), static_cast<unsigned>(problem.image_count));
+    DrawProblemEmpty(problem.image_error ? "图片加载失败" : label,
+        problem.image_error ? "上下可继续浏览" : "长按返回题目列表");
     return ESP_OK;
 }
 
+esp_err_t RenderVerdictDialog(const wqn::ProblemAppSnapshot& problem)
+{
+    const std::string position = problem.total
+        ? std::to_string(problem.position) + " / " + std::to_string(problem.total) : "";
+    const int count_width = wqn::MeasureTextWithFont(AiNativeFont(12), position.c_str());
+    AiNativeText(kNoteListX, kNoteListKickerY, kNoteListWidth - count_width - 8,
+        problem.set_name.empty() ? "错题复习" : problem.set_name, 12);
+    AiNativeText(kNoteListX + kNoteListWidth - count_width, kNoteListKickerY, count_width, position, 12);
+    AiNativeText(kNoteListX, kNoteListTitleY, kNoteListWidth, "本题自评", 24);
+    AiNativeText(kNoteListX, kProblemVerdictSubtitleY, kNoteListWidth,
+        problem.notice.empty() ? problem.problem_title : problem.notice,
+        problem.notice.empty() ? 16 : 12);
+    DrawHorizontalLine(kNoteListX, kProblemVerdictDividerY, kNoteListWidth);
+    static const char* options[] = {"A  对了", "B  还要想想", "C  错了", "D  跳过"};
+    for (size_t i = 0; i < 4; ++i) {
+        const int y = kProblemVerdictTop + static_cast<int>(i) * kProblemVerdictPitch;
+        const bool selected = i == problem.verdict_selected;
+        if (selected) FillRect(kNoteListX, y, kNoteListWidth, kProblemVerdictPitch - 1, true);
+        DrawHorizontalLine(kNoteListX, y + kProblemVerdictPitch - 1, kNoteListWidth);
+        AiNativeText(kNoteListX + 12, y + 11, kNoteListWidth - 24, options[i], 16, !selected);
+    }
+    return ESP_OK;
+}
 }  // namespace
 
 esp_err_t RenderProblemBrowseToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
@@ -193,6 +171,18 @@ esp_err_t RenderProblemBrowseToEpd(const wqn::UiFrame& frame, RefreshSchedule sc
 
     // Full-screen image: the WQNI payload IS the frame (no status bar, no
     // margins), so blit it straight into the framebuffer and refresh.
+    if (problem.mode == wqn::ProblemAppMode::kProblemView &&
+        (problem.face == wqn::ProblemFace::kProblemImage ||
+         problem.face == wqn::ProblemFace::kSolutionImage) &&
+        problem.image_ready && problem.image_wqni != nullptr &&
+        problem.image_wqni->size() >= wqn::kNoteImageHeaderBytes &&
+        problem.image_wqni->data()[5] == 2 &&
+        problem.image_wqni->size() ==
+            wqn::kNoteImageHeaderBytes + wqn::kNoteImageGray4PayloadBytes) {
+        return RefreshNavigationGrayImage(
+            frame, problem.image_wqni->data() + wqn::kNoteImageHeaderBytes,
+            wqn::kNoteImageGray4PayloadBytes);
+    }
     if (problem.mode == wqn::ProblemAppMode::kProblemView &&
         (problem.face == wqn::ProblemFace::kProblemImage ||
          problem.face == wqn::ProblemFace::kSolutionImage) &&
@@ -206,48 +196,23 @@ esp_err_t RenderProblemBrowseToEpd(const wqn::UiFrame& frame, RefreshSchedule sc
     }
 
     wqn::ClearEpdFramebuffer(true);
-
-    // Status-bar title: problem title > set name > 错题.
-    std::string bar_title = "错题";
-    if (!problem.set_name.empty()) {
-        bar_title = problem.set_name;
-    }
-    if ((problem.mode == wqn::ProblemAppMode::kProblemView ||
-         problem.mode == wqn::ProblemAppMode::kVerdict) &&
-        !problem.problem_title.empty()) {
-        bar_title = problem.problem_title;
-        if (problem.total > 0) {
-            bar_title += " " + std::to_string(problem.position) + "/" +
-                std::to_string(problem.total);
-        }
-    }
-    const auto bar_lines = wqn::WrapUtf8TextToWidth(bar_title, wqn::kEpdWidth / 2, 1);
-    DrawStatusBar(
-        bar_lines.empty() ? bar_title.c_str() : bar_lines.front().c_str(), frame.home);
-
+    DrawProblemStatusBar(frame);
     switch (problem.mode) {
         case wqn::ProblemAppMode::kProblemList:
             ESP_RETURN_ON_ERROR(RenderProblemList(problem), kTag, "render problem list");
             break;
         case wqn::ProblemAppMode::kProblemView:
-            if (problem.face == wqn::ProblemFace::kBody) {
-                ESP_RETURN_ON_ERROR(
-                    RenderProblemTextFace(problem, false), kTag, "render problem body");
-            } else if (problem.face == wqn::ProblemFace::kAnswer) {
-                ESP_RETURN_ON_ERROR(
-                    RenderProblemTextFace(problem, true), kTag, "render problem answer");
+            if (problem.face == wqn::ProblemFace::kBody || problem.face == wqn::ProblemFace::kAnswer) {
+                ESP_RETURN_ON_ERROR(RenderProblemTextFace(problem,
+                    problem.face == wqn::ProblemFace::kAnswer), kTag, "render problem text face");
             } else {
-                // Ready images returned above; this is the loading/error page.
-                ESP_RETURN_ON_ERROR(
-                    RenderProblemImageStatus(problem), kTag, "render problem image page");
+                ESP_RETURN_ON_ERROR(RenderProblemImageStatus(problem), kTag, "render problem image status");
             }
             break;
         case wqn::ProblemAppMode::kVerdict:
-            ESP_RETURN_ON_ERROR(RenderVerdictDialog(problem), kTag, "render verdict dialog");
+            ESP_RETURN_ON_ERROR(RenderVerdictDialog(problem), kTag, "render problem verdict");
             break;
     }
-
     return RefreshFrame(frame, schedule);
 }
-
 }  // namespace device_ui_internal

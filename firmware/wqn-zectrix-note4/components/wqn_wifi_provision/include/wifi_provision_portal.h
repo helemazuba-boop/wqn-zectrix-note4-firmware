@@ -2,6 +2,7 @@
 
 #include <array>
 #include <atomic>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -18,9 +19,18 @@
 
 namespace wqn::provision {
 
+enum class NetworkRole : uint8_t {
+    kPrimary = 0,
+    kBackup,
+};
+
 class WifiProvisionPortal {
 public:
-    using CredentialsCallback = std::function<esp_err_t(const std::string& ssid, const std::string& password)>;
+    using CredentialsCallback = std::function<esp_err_t(
+        NetworkRole role,
+        const std::string& ssid,
+        const std::string& password,
+        bool keep_existing_password)>;
     using ExitCallback = std::function<void()>;
 
     WifiProvisionPortal();
@@ -30,6 +40,9 @@ public:
     WifiProvisionPortal& operator=(const WifiProvisionPortal&) = delete;
 
     void SetSsidPrefix(std::string prefix);
+    // Passwords deliberately never cross this component boundary. The portal
+    // only needs SSID labels to render the editable primary/backup roles.
+    void SetStoredNetworks(std::string primary_ssid, std::string backup_ssid);
     void SetCredentialsCallback(CredentialsCallback callback);
     void SetExitCallback(ExitCallback callback);
 
@@ -37,8 +50,6 @@ public:
     esp_err_t Stop();
 
     std::string GetSsid() const;
-    bool IsRunning() const { return running_.load(); }
-
 private:
     static void WifiEventHandler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data);
     static void ScanTimerCallback(void* arg);
@@ -49,6 +60,7 @@ private:
     void ScheduleNextScan();
 
     esp_err_t HandleScan(httpd_req_t* req);
+    esp_err_t HandleNetworks(httpd_req_t* req);
     esp_err_t HandleSubmit(httpd_req_t* req);
     esp_err_t HandleExit(httpd_req_t* req);
     esp_err_t HandleCaptiveRedirect(httpd_req_t* req);
@@ -63,6 +75,8 @@ private:
     size_t ap_count_ = 0;
     std::string ssid_prefix_ = "WQN_N4_";
     std::string ap_ssid_;
+    std::string primary_ssid_;
+    std::string backup_ssid_;
     CredentialsCallback credentials_callback_;
     ExitCallback exit_callback_;
     bool credentials_saved_ = false;

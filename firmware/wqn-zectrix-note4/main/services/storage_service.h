@@ -11,7 +11,6 @@ using StorageTransaction = esp_err_t (*)(void* context);
 // use caller-owned contexts and complete synchronously, so the context remains
 // valid until its matching result is returned.
 esp_err_t StartStorageService();
-esp_err_t ExecuteStorageTransaction(StorageTransaction transaction, void* context);
 esp_err_t ExecuteStorageTransactionNamed(
     StorageTransaction transaction,
     void* context,

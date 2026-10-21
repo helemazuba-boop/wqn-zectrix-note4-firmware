@@ -20,7 +20,7 @@ struct FlashUiState {
     std::string user_transcript;   // incremental ASR text
     std::string assistant_text;    // incremental assistant transcript
     std::string pending_text;      // human-readable status
-    std::string tool_label;        // "🔧 tool..." or "✅ tool done"
+    std::string tool_label;        // "tool..." or "tool done"
     std::string error_message;
     int64_t status_since_ms = 0;
     // [phase-fix] kStreaming means "WebSocket connected", not "ASR active".
@@ -35,12 +35,7 @@ struct FlashUiState {
 esp_err_t InitFlashSession();
 esp_err_t StartFlashSession();
 esp_err_t StopFlashSession();
-FlashStatus GetFlashStatus();
-bool IsFlashConnected();
 bool CopyFlashStateToUi(FlashUiState* state);
-bool IsFlashTranscribing();
-bool IsFlashSessionActive();
-
 // Periodically called from the UI task; closes the audio amp after the configured
 // idle tail so long pauses between server audio deltas don't leave the speaker
 // enabled (pop/click at the next turn). Safe to call when flash is idle.

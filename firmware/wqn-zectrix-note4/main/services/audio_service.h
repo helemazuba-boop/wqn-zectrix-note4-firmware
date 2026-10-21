@@ -25,6 +25,15 @@ enum class AudioState : uint8_t {
     kQuiescing,
 };
 
+// AudioService owns the single ES8311 register program used by every feature.
+// Profiles select only the analog paths that differ; clocking, serial format,
+// reset timing, retry and readback policy remain identical.
+enum class AudioCodecProfile : uint8_t {
+    kCapture,
+    kPlayback,
+    kDuplex,
+};
+
 // Fixed-size capability returned by AudioService. A token is valid until the
 // matching EndAudioActivity call succeeds. It deliberately owns no heap data
 // and can be embedded in a long-lived capture/Flash state object.
@@ -60,10 +69,24 @@ esp_err_t EndAudioActivity(AudioSession* session);
 // the sole bootstrap exception before this task starts.
 esp_err_t SetAudioAmplifier(const AudioSession& session, bool enabled);
 
+// Signal actual acquisition readiness, not session admission or network setup.
+// Capture/Flash only. Callers serialize ready/stop transitions with their own
+// capture mutex; stale capabilities cannot change a newer session's indicator.
+// This operation is immediate and adds no task, timer, or sleep policy.
+esp_err_t SetAudioRecordingIndicator(const AudioSession& session, bool enabled);
+
 // Recover the codec rail after a failed/aborted initialization. This is an
 // AudioService operation because GPIO42 is service-owned; callers must not
 // toggle the codec power pin directly.
 esp_err_t RecoverAudioCodec(const AudioSession& session);
+
+// Configure ES8311 after the session's I2S channel(s) have been created and
+// enabled, so the external MCLK/BCLK domain is already stable. volume_percent
+// is applied only by playback/duplex profiles and must be in [0, 100].
+esp_err_t ConfigureAudioCodec(
+    const AudioSession& session,
+    AudioCodecProfile profile,
+    int volume_percent = 100);
 
 esp_err_t GetSharedAudioBus(
     const AudioSession& session, AudioBusHandle* bus);
@@ -90,12 +113,6 @@ esp_err_t CreateAudioRxChannel(
     uint32_t dma_frame_count,
     bool left_aligned,
     AudioChannelHandle* rx);
-esp_err_t CreateAudioTxChannel(
-    const AudioSession& session,
-    uint32_t sample_rate_hz,
-    uint32_t dma_frame_count,
-    bool left_aligned,
-    AudioChannelHandle* tx);
 esp_err_t CreateAudioDuplexChannels(
     const AudioSession& session,
     uint32_t sample_rate_hz,

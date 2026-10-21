@@ -9,6 +9,21 @@
 namespace wqn {
 
 esp_err_t InitAiSession();
+// The shared capture service normally mirrors PCM into the legacy Std/Pro
+// WebSocket transport. A feature that owns the microphone for a DIFFERENT
+// backend can suspend the tap; the Agent voice pipe deliberately keeps it
+// enabled, because its tier=agent turn rides that same transport (the tap
+// feeds stdpro_ws, which drops PCM until a turn reaches kRecording).
+void SetAiAudioCaptureTapEnabled(bool enabled);
+// [agent-voice] Exported for the Agent voice pipe (agent_voice_pipe.cpp),
+// which drives its own stdpro_ws turn and therefore cannot reuse
+// PrepareRecordingSession. ArmAiVoicePreroll only arms the one-shot replay of
+// audio captured before the turn committed -- it must NOT install the STD SSE
+// trampoline (SetSseCallback is a single global slot; the agent path installs
+// its own trampoline).
+void ArmAiVoicePreroll();
+// Request-id used by the SSE idempotency headers: 16 hex chars.
+std::string GenerateRequestId();
 esp_err_t StartAiRecordingSession();
 esp_err_t StopAiRecordingAndSubmit();
 // Clear STD/PRO conversation context (AiHistory + conversation_id + display
@@ -17,13 +32,17 @@ esp_err_t StopAiRecordingAndSubmit();
 void ClearAiConversationContext();
 bool CopyAiSessionToUi(AiSessionState* state);
 void SetAiTier(AiTier tier);
-AiTier GetAiTier();
 // [shell->wire] Status-bar toggle setters: propagate UI changes into g_state so
 // they survive CopyAiSessionToUi's full-struct overwrite and reach the request.
 void SetAiThinkingLevel(ThinkingLevel level);
 void SetAiTtsOn(bool on);
 void SetAiExpandContent(bool expanded);
-int32_t GetAiScrollOffsetLines();
+// [follow] Auto-follow toggle (status-bar edit cluster) and the per-turn
+// viewport-follow state. These MUST be setters, not UI-copy writes:
+// CopyAiSessionToUi overwrites the whole struct, so a write that only touched
+// the UI's copy would be reverted by the next snapshot.
+void SetAiAutoFollow(bool follow);
+void SetAiFollowState(bool active, bool user_moved);
 
 // Lightweight, mutex-free snapshot of v2 SSE streaming bookkeeping. UI calls
 // this from its own task to drive the EPD throttle and the status-bar chip
@@ -40,35 +59,12 @@ struct AiStreamingStatusView {
 
 bool CopyAiStreamingStatus(AiStreamingStatusView* view);
 
-// Power-transition guard. True while preparation, capture submission or SSE
-// response processing owns AI session state.
-bool IsAiSessionActive();
-
-// ---- v2 chat surface (top toast + scrollable viewport) ----------------------
-//
-// The AI page renders a viewport at y=51..299 with the status-bar above it.
-// Status changes flow through a top toast that overrides idle chrome for the
-// duration of recording, upload and waiting/reply states. There is no
-// per-second "3.1s" counter on the wait toast — the cloud pipeline is
-// expected to express state transitions through stage events instead of
-// latency feedback.
-//
-// Callbacks (long-press confirm / long-release confirm) feed these helpers,
-// and the v2 SSE consumer flushes history rows into AiHistory. The UI side
-// renders straight off the history snapshot + scroll offset + toast fields.
-void ShowAiToast(const std::string& label);                   // e.g. "● 上传…"
-void HideAiToast();                                            // for ready / idle
+// Recording feedback and scrolling update the shared session snapshot.
 void SetAiRecordingLabel(int32_t elapsed_ms);                  // updates recording toast
-void ResetAiScroll();                                          // recenter on newest
-void RequestAiScrollUp(int32_t lines);                         // key-driven
-void RequestAiScrollDown(int32_t lines);
-void SetAiScrollOffsetLines(int32_t val);
+// Single-lock read-clamp-write of the scroll offset. Bounds come from the
+// shared AI layout pass (GetAiScrollBounds); degenerate bounds fail open.
+void SetAiScrollOffsetLinesClamped(int32_t target, int32_t min_scroll, int32_t max_scroll);
 void StampScrollNoOpHint();                                    // flash "已最新" hint at bottom
 int32_t GetAiScrollOffsetLines();
-
-// Returns true if there is an active toast (used by the page renderer to draw
-// the y=27..51 region in addition to the viewport).
-bool IsAiToastVisible();
-const std::string& CurrentAiToastLabel();
 
 }  // namespace wqn

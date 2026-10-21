@@ -4,14 +4,11 @@
 #include "ui_internal.h"
 
 #include <cstdio>
-#include <cstring>
 #include <ctime>
 
-#include "esp_log.h"
+#include "power/rtc_timekeep.h"
 
 namespace device_ui_internal {
-
-constexpr char kTag[] = "wqn_ui";
 
 std::time_t CurrentUnixTime()
 {
@@ -20,64 +17,9 @@ std::time_t CurrentUnixTime()
     return now;
 }
 
-bool SystemClockIsReasonable()
-{
-    return CurrentUnixTime() >= kMinReasonableUnixTime;
-}
-
-int MonthIndexFromBuildDate(const char* month)
-{
-    static constexpr const char* kMonths[] = {
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun",
-        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-    };
-    for (int i = 0; i < 12; ++i) {
-        if (strncmp(month, kMonths[i], 3) == 0) {
-            return i;
-        }
-    }
-    return 0;
-}
-
 void SeedClockFromBuildTimeIfNeeded()
 {
-    setenv("TZ", "CST-8", 1);
-    tzset();
-    if (SystemClockIsReasonable()) {
-        return;
-    }
-
-    char month[4] = {};
-    int day = 1;
-    int year = 2026;
-    int hour = 0;
-    int minute = 0;
-    int second = 0;
-    if (std::sscanf(__DATE__, "%3s %d %d", month, &day, &year) != 3 ||
-        std::sscanf(__TIME__, "%d:%d:%d", &hour, &minute, &second) != 3) {
-        ESP_LOGW(kTag, "build time parse failed; clock remains invalid");
-        return;
-    }
-
-    std::tm build_tm = {};
-    build_tm.tm_year = year - 1900;
-    build_tm.tm_mon = MonthIndexFromBuildDate(month);
-    build_tm.tm_mday = day;
-    build_tm.tm_hour = hour;
-    build_tm.tm_min = minute;
-    build_tm.tm_sec = second;
-    build_tm.tm_isdst = -1;
-    const std::time_t build_time = std::mktime(&build_tm);
-    if (build_time < kMinReasonableUnixTime) {
-        ESP_LOGW(kTag, "build time is not reasonable; clock remains invalid");
-        return;
-    }
-    const timeval tv = {
-        .tv_sec = build_time,
-        .tv_usec = 0,
-    };
-    settimeofday(&tv, nullptr);
-    ESP_LOGI(kTag, "clock seeded from build time: %04d-%02d-%02d %02d:%02d:%02d CST", year, build_tm.tm_mon + 1, day, hour, minute, second);
+    (void)wqn::power::timekeep::SeedSystemTimeFromBuildTimeIfNeeded();
 }
 
 std::string CurrentDateLabel()
@@ -157,32 +99,28 @@ std::string TwoDigit(int value)
 
 int CountdownStartField()
 {
-    return 3;
+    return wqn::TimeAppStartField(wqn::TimeTile::kCountdown);
 }
 
 int PomodoroStartField()
 {
-    return 4;
-}
-
-int CountReviewDueLikeProblems(const std::vector<wqn::CachedProblem>& problems)
-{
-    int count = 0;
-    for (const wqn::CachedProblem& problem : problems) {
-        if (problem.status != "mastered") {
-            ++count;
-        }
-    }
-    return count;
+    return wqn::TimeAppStartField(wqn::TimeTile::kPomodoro);
 }
 
 std::string ChooseHomePrimaryTimeLine(const wqn::TimeAppState& time_app)
 {
-    const std::string active_timer = wqn::TimeAppPrimaryLine(time_app);
-    if (!active_timer.empty()) {
-        return active_timer;
+    if (!wqn::TimeAppHasActiveTimer(time_app)) return "";
+    if (time_app.status == wqn::TimerStatus::kPaused) return "已暂停";
+    if (time_app.status == wqn::TimerStatus::kAlerting) return "计时结束";
+    if (time_app.phase_ends_unix_seconds >= kMinReasonableUnixTime) {
+        const std::time_t end = time_app.phase_ends_unix_seconds;
+        std::tm info = {};
+        localtime_r(&end, &info);
+        char label[24] = {};
+        std::strftime(label, sizeof(label), "%H:%M 结束", &info);
+        return label;
     }
-    return CurrentClockLabel();
+    return "计时进行中";
 }
 
 void UpdateHomePrimaryTimeLine(wqn::UiState* state)
@@ -193,18 +131,18 @@ void UpdateHomePrimaryTimeLine(wqn::UiState* state)
     state->home.primary_time_line = ChooseHomePrimaryTimeLine(state->time_app);
 }
 
-bool ShouldRefreshTimeTick(const wqn::UiState& state)
-{
-    if (state.screen != wqn::UiScreen::kHome && state.screen != wqn::UiScreen::kTime) {
-        return false;
-    }
-    return wqn::TimeAppHasActiveTimer(state.time_app);
-}
-
 bool ScreenUsesClockMinute(const wqn::UiState& state)
 {
+    // The application bar owns the composed page until it closes. A cosmetic
+    // minute tick would become a full-frame partial; switching to a local
+    // window after that partial would instead hit the driver's full-refresh
+    // wedge guard. Closing the bar redraws the current clock/date normally.
+    if (state.navigation.visible) return false;
     if (state.screen == wqn::UiScreen::kHome) {
-        return !wqn::TimeAppHasActiveTimer(state.time_app);
+        // The home primary line becomes a static timer-status sentence while
+        // a timer runs, but the status-bar wall clock must keep its normal
+        // minute cadence.
+        return true;
     }
     if (state.screen == wqn::UiScreen::kTodo) {
         return true;

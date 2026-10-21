@@ -20,6 +20,7 @@
 #include "esp_timer.h"
 #include "esp_tls_crypto.h"
 #include "esp_system.h"
+#include "lwip/sockets.h"
 #include <errno.h>
 
 static const char *TAG = "websocket_client";
@@ -35,6 +36,7 @@ static const char *TAG = "websocket_client";
 #define WEBSOCKET_PING_INTERVAL_SEC (10)
 #define WEBSOCKET_EVENT_QUEUE_SIZE (1)
 #define WEBSOCKET_PINGPONG_TIMEOUT_SEC (120)
+#define WEBSOCKET_CONTROL_PAYLOAD_MAX (125)
 #define WEBSOCKET_KEEP_ALIVE_IDLE (5)
 #define WEBSOCKET_KEEP_ALIVE_INTERVAL (5)
 #define WEBSOCKET_KEEP_ALIVE_COUNT (3)
@@ -1063,6 +1065,14 @@ static esp_err_t esp_websocket_client_recv(esp_websocket_client_handle_t client)
  client->last_fin = esp_transport_ws_get_fin_flag(client->transport);
  client->last_opcode = esp_transport_ws_get_read_opcode(client->transport);
 
+ if (client->last_opcode == WS_TRANSPORT_OPCODES_PING &&
+ client->payload_len > WEBSOCKET_CONTROL_PAYLOAD_MAX) {
+ ESP_LOGE(TAG, "Invalid PING payload_len=%d (maximum %d)",
+ client->payload_len, WEBSOCKET_CONTROL_PAYLOAD_MAX);
+ esp_websocket_free_buf(client, false);
+ return ESP_FAIL;
+ }
+
  if (rlen == 0 && client->last_opcode == WS_TRANSPORT_OPCODES_NONE) {
  ESP_LOGV(TAG, "esp_transport_read timeouts");
  esp_websocket_free_buf(client, false);
@@ -1074,8 +1084,13 @@ static esp_err_t esp_websocket_client_recv(esp_websocket_client_handle_t client)
  } while (client->payload_offset < client->payload_len);
 
  if (client->last_opcode == WS_TRANSPORT_OPCODES_PING) {
- const char *data = (client->payload_len == 0) ? NULL : client->rx_buffer;
- ESP_LOGD(TAG, "Sending PONG with payload len=%d", client->payload_len);
+ int pong_len = client->payload_len;
+ if (pong_len > client->buffer_size) {
+ ESP_LOGW(TAG, "PING payload_len=%d exceeds buffer_size=%d, truncating PONG echo", pong_len, client->buffer_size);
+ pong_len = client->buffer_size;
+ }
+ const char *data = (pong_len == 0) ? NULL : client->rx_buffer;
+ ESP_LOGD(TAG, "Sending PONG with payload len=%d", pong_len);
 #ifdef CONFIG_ESP_WS_CLIENT_SEPARATE_TX_LOCK
  xSemaphoreGiveRecursive(client->lock);
 
@@ -1096,11 +1111,11 @@ static esp_err_t esp_websocket_client_recv(esp_websocket_client_handle_t client)
  return ESP_OK;
  }
 
- esp_transport_ws_send_raw(client->transport, WS_TRANSPORT_OPCODES_PONG | WS_TRANSPORT_OPCODES_FIN, data, client->payload_len,
+ esp_transport_ws_send_raw(client->transport, WS_TRANSPORT_OPCODES_PONG | WS_TRANSPORT_OPCODES_FIN, data, pong_len,
  client->config->network_timeout_ms);
  xSemaphoreGiveRecursive(client->tx_lock);
 #else
- esp_transport_ws_send_raw(client->transport, WS_TRANSPORT_OPCODES_PONG | WS_TRANSPORT_OPCODES_FIN, data, client->payload_len,
+ esp_transport_ws_send_raw(client->transport, WS_TRANSPORT_OPCODES_PONG | WS_TRANSPORT_OPCODES_FIN, data, pong_len,
  client->config->network_timeout_ms);
 #endif
  } else if (client->last_opcode == WS_TRANSPORT_OPCODES_PONG) {
@@ -1526,6 +1541,31 @@ bool esp_websocket_client_is_connected(esp_websocket_client_handle_t client)
  return false;
  }
  return client->state == WEBSOCKET_STATE_CONNECTED;
+}
+
+esp_err_t esp_websocket_client_set_tcp_nodelay(
+    esp_websocket_client_handle_t client, bool enabled)
+{
+ if (client == NULL) {
+ return ESP_ERR_INVALID_ARG;
+ }
+ if (xSemaphoreTakeRecursive(client->lock, pdMS_TO_TICKS(1000)) != pdPASS) {
+ return ESP_ERR_TIMEOUT;
+ }
+ esp_err_t result = ESP_ERR_INVALID_STATE;
+ if (client->transport != NULL && client->state == WEBSOCKET_STATE_CONNECTED) {
+ int sock = esp_transport_get_socket(client->transport);
+ int value = enabled ? 1 : 0;
+ if (sock >= 0 && setsockopt(sock, IPPROTO_TCP, TCP_NODELAY,
+ &value, sizeof(value)) == 0) {
+ result = ESP_OK;
+ } else {
+ ESP_LOGW(TAG, "set TCP_NODELAY failed: socket=%d errno=%d", sock, errno);
+ result = ESP_FAIL;
+ }
+ }
+ xSemaphoreGiveRecursive(client->lock);
+ return result;
 }
 
 size_t esp_websocket_client_get_ping_interval_sec(esp_websocket_client_handle_t client)

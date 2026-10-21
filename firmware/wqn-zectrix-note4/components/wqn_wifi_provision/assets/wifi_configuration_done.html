@@ -1,2 +1,22 @@
 <!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>配置完成</title><style>body{margin:0;min-height:100vh;display:grid;place-items:center;font-family:system-ui,sans-serif;background:#f4f4f5}.card{text-align:center;background:#fff;padding:40px;border-radius:14px;box-shadow:0 8px 30px #0002}.mark{font-size:64px;color:#16a34a}h1{margin:8px 0}p{color:#71717a}</style></head><body><main class="card"><div class="mark">✓</div><h1>配置成功</h1><p>可以关闭此页面，设备正在连接 WiFi。</p></main><script>setTimeout(()=>fetch('/exit',{method:'POST',keepalive:true}).catch(()=>{}),600);</script></body></html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>完成配网</title>
+<style>body{margin:0;min-height:100vh;display:grid;place-items:center;font-family:system-ui,sans-serif;background:#f4f4f5;color:#18181b}.card{width:min(420px,calc(100% - 48px));text-align:center;background:#fff;padding:28px;border-radius:14px;box-shadow:0 8px 30px #0002}h1{font-size:24px}p{color:#52525b;line-height:1.6}button{padding:12px 24px;border:0;border-radius:9px;background:#18181b;color:#fff;font-size:16px}</style></head>
+<body><main class="card"><h1 id="title">正在结束配网…</h1><p id="message">正在通知设备连接已保存的主 WiFi。</p><button id="retry" type="button" hidden>重试结束配网</button></main>
+<script>
+const title=document.getElementById('title'),message=document.getElementById('message'),retry=document.getElementById('retry');
+async function finish(){
+  retry.hidden=true;title.textContent='正在结束配网…';
+  try{
+    const r=await fetch('/exit',{method:'POST',keepalive:true}),d=await r.json();
+    if(!r.ok||!d.success)throw new Error(d.error||'设备未确认结束配网');
+    title.textContent='配置已保存';
+    message.textContent='设备正在尝试连接 WiFi。请在设备上查看连接结果，可以关闭此页面。';
+  }catch(e){
+    title.textContent='未收到结束确认';
+    message.textContent='请先查看设备连接状态；如果设备仍在配网，可点击重试。'+(e.message||'');
+    retry.hidden=false;
+  }
+}
+retry.addEventListener('click',finish);finish();
+</script></body></html>

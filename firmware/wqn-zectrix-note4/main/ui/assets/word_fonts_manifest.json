@@ -1,0 +1,31 @@
+{
+  "noto_regular_sha256": "fe8c022f48d8dd29f17b744d16f9346f4357e16f7d4f7be58b000ae7c291b614",
+  "noto_bold_sha256": "13a813c49624ae3ba3c5c6e72c5ebffc4b9e1e6ea32f421c04069b037c6ad431",
+  "threshold": 96,
+  "fonts": [
+    {
+      "name": "wqn_word_regular_16",
+      "size_px": 16,
+      "glyphs": 1495,
+      "bitmap_bytes": 16872
+    },
+    {
+      "name": "wqn_word_regular_20",
+      "size_px": 20,
+      "glyphs": 1495,
+      "bitmap_bytes": 26103
+    },
+    {
+      "name": "wqn_word_bold_24",
+      "size_px": 24,
+      "glyphs": 1495,
+      "bitmap_bytes": 41086
+    },
+    {
+      "name": "wqn_word_bold_32",
+      "size_px": 32,
+      "glyphs": 1495,
+      "bitmap_bytes": 73339
+    }
+  ]
+}

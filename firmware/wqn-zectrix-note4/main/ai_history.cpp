@@ -70,6 +70,8 @@ esp_err_t AiHistory::Init(size_t cap_bytes)
     messages_.clear();
     next_message_id_ = 1;
     revision_ = 0;
+    cached_snapshot_.reset();
+    cached_snapshot_revision_ = UINT64_MAX;
     initialized_ = true;
     ESP_LOGI(kTag, "Init cap=%zu bytes psram=%d", cap_bytes_, heap_.using_psram() ? 1 : 0);
     xSemaphoreGive(mutex_);
@@ -201,7 +203,30 @@ bool AiHistory::ReplaceText(ChatMessageId id, ChatMessageKind expected_kind,
     for (ChatMessage& msg : messages_) {
         if (msg.id != id) continue;
         if (msg.kind != expected_kind) {
+            // Payload first, then release -- same order as the not-found log
+            // below (AGENTS.md §4.7).
+            const ChatMessageKind found_kind = msg.kind;
+            const size_t cap_bytes = cap_bytes_;
+            const size_t message_count = messages_.size();
             xSemaphoreGive(mutex_);
+            // [evict-recovery] This branch was silent, and it had to stop being
+            // the moment the caller's recovery predicate was corrected to test
+            // PRESENCE instead of presence-with-kind. The caller now reaches here
+            // and answers "yes, still in the ring" -> it re-appends nothing and
+            // returns false. That is the right outcome, but it means the caller's
+            // entry is silently not being updated for the rest of the turn --
+            // exactly the failure D3 exists to prevent, arriving by a different
+            // door. Before the correction this branch could not be told apart
+            // from "not found" at the call site, so logging only the not-found
+            // case was enough; now the two must be distinguishable in the log.
+            ESP_LOGW(kTag,
+                     "ReplaceText: id %llu is in the ring as kind %d, not %d -- "
+                     "caller will not re-append (cap %u B, %u msgs)",
+                     static_cast<unsigned long long>(id),
+                     static_cast<int>(found_kind),
+                     static_cast<int>(expected_kind),
+                     static_cast<unsigned>(cap_bytes),
+                     static_cast<unsigned>(message_count));
             return false;
         }
         if (msg.text.size() == text.size() &&
@@ -218,8 +243,42 @@ bool AiHistory::ReplaceText(ChatMessageId id, ChatMessageKind expected_kind,
         xSemaphoreGive(mutex_);
         return true;
     }
+    // Read the ring's own figures out BEFORE releasing it. cap_bytes_ and
+    // messages_ belong to the critical section; sampling them after the give
+    // reads whatever a concurrent Append/Trim left behind, so the log that
+    // exists to explain WHY the entry was gone was the one line in this file
+    // that could describe a different ring than the one it was called on.
+    // Publish the payload first, then release -- the order §4.7 requires.
+    const size_t cap_bytes = cap_bytes_;
+    const size_t message_count = messages_.size();
     xSemaphoreGive(mutex_);
+    // [evict-recovery] This was silent, and it cannot be: the id-not-found case is the one
+    // a streaming mirror hits when the ring evicts the entry it has been
+    // growing for the whole answer. Logged at warning because every caller
+    // that ignores the return value is now losing an entry, and the fix
+    // (re-append) belongs at the call site that knows which entry it was.
+    ESP_LOGW(kTag, "ReplaceText: id %llu not in ring (cap %u B, %u msgs)",
+             static_cast<unsigned long long>(id),
+             static_cast<unsigned>(cap_bytes),
+             static_cast<unsigned>(message_count));
     return false;
+}
+
+bool AiHistory::Contains(ChatMessageId id) const
+{
+    if (id == kInvalidChatMessageId || mutex_ == nullptr) {
+        return false;
+    }
+    xSemaphoreTake(mutex_, portMAX_DELAY);
+    bool found = false;
+    for (const ChatMessage& msg : messages_) {
+        if (msg.id == id) {
+            found = true;
+            break;
+        }
+    }
+    xSemaphoreGive(mutex_);
+    return found;
 }
 
 bool AiHistory::PopLastIf(ChatMessageKind kind)
@@ -239,9 +298,17 @@ bool AiHistory::PopLastIf(ChatMessageKind kind)
 
 std::shared_ptr<const AiHistorySnapshot> AiHistory::Snapshot() const
 {
-    auto snapshot = std::make_shared<AiHistorySnapshot>();
-    if (mutex_ == nullptr) return snapshot;
+    if (mutex_ == nullptr) return std::make_shared<AiHistorySnapshot>();
     xSemaphoreTake(mutex_, portMAX_DELAY);
+    // [ai-memory-fix] RenderUiFrame can be called more than once while
+    // comparing signatures. Reuse the immutable DTO until history changes
+    // instead of rebuilding every string/vector on each comparison.
+    if (cached_snapshot_ != nullptr && cached_snapshot_revision_ == revision_) {
+        const std::shared_ptr<const AiHistorySnapshot> cached = cached_snapshot_;
+        xSemaphoreGive(mutex_);
+        return cached;
+    }
+    auto snapshot = std::make_shared<AiHistorySnapshot>();
     snapshot->revision = revision_;
     snapshot->messages.reserve(messages_.size());
     for (const ChatMessage& msg : messages_) {
@@ -257,6 +324,8 @@ std::shared_ptr<const AiHistorySnapshot> AiHistory::Snapshot() const
         out.tool_ok = msg.tool_ok;
         snapshot->messages.push_back(std::move(out));
     }
+    cached_snapshot_ = snapshot;
+    cached_snapshot_revision_ = revision_;
     xSemaphoreGive(mutex_);
     return snapshot;
 }
@@ -293,13 +362,18 @@ uint64_t AiHistory::revision() const
 namespace {
 AiHistory g_history_stdpro;
 AiHistory g_history_flash;
+AiHistory g_history_agent;
 }  // namespace
 
 AiHistory& GetAiHistory(AiHistoryChannel channel)
 {
+    // [agent] The OpenCode channel shares kCapBytes with the others. The cap is
+    // an upper bound, not a preallocation: each ring only grows as messages
+    // arrive and evicts the oldest ones past the cap, so a third channel costs
+    // PSRAM only in proportion to what the Agent conversation actually holds.
     AiHistory& history = channel == AiHistoryChannel::kFlash
         ? g_history_flash
-        : g_history_stdpro;
+        : (channel == AiHistoryChannel::kAgent ? g_history_agent : g_history_stdpro);
     (void)history.Init(kCapBytes);
     return history;
 }

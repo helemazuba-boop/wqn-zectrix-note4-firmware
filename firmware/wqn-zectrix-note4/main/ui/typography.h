@@ -11,7 +11,6 @@ namespace device_ui_internal {
 // ---- Font metrics (fixed: single 16px CJK + 5x7 ASCII) ----
 constexpr int kCjkFontHeight = 16;
 constexpr int kCjkLineHeight = 18;              // single source for the 18px line height (was duplicated in 4 places)
-constexpr int kAsciiCellWidth = 6;
 
 // ---- Text layout ----
 constexpr int kTextWidth = 388;                 // = kEpdWidth - 12; was duplicated in text_wrappers.cpp + ui_render.cpp

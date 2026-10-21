@@ -16,11 +16,11 @@
 ## 固件职责
 
 - 板级启动和诊断：安全 GPIO 初始化、芯片/Flash/PSRAM 诊断、复位原因、WiFi MAC、电池诊断和串口日志。
-- WQN 云端连接：可选 WiFi STA、配对 token 存储、脱敏 token 日志、待复习题目同步、题目索引刷新、复习结果重试上传、Todo 同步和 AI 请求上传。
-- 电子纸 UI：首页/时间、倒计时、番茄钟、缓存题目、Todo、单词/笔记学习流程，以及 AI 会话状态展示。
+- WQN 云端连接：可选 WiFi STA、配对 token 存储、脱敏 token 日志、problem-study manifest/pack 同步、durable observation 上传、Todo 同步和 AI 请求上传。
+- 电子纸 UI：首页/时间、倒计时、番茄钟、Todo、单词/笔记学习流程、Note 内嵌错题集，以及 AI 会话状态展示。
 - 电子纸刷新控制：全刷、本地局部窗口刷新、刷新冷却和空闲断电。
 - AI 音频路径：长按确认键开始录音，松手上传 16 kHz mono PCM 到 WQN 服务器，然后显示转写、回复和动作摘要。
-- 本地存储：使用 NVS 保存配对 token 和少量设备缓存，用于离线展示和失败重试。
+- 本地存储：NVS 仅保存配对/WiFi 凭据、同步游标和设置等小型控制状态；SPIFFS 保存 durable 内容。当前 problem-study-v1 使用 manifest 与分错题集 WQNP pack，在 PSRAM 建立固定大小索引、按需读取题目正文，并通过 durable observation outbox 保证离线自评最终上传。
 
 
 默认 WQN ESP32 API 地址是：
@@ -44,9 +44,14 @@ idf.py -B build-ai-local-s3 -DWQN_API_BASE=https://your-host.example.com/api/esp
 - `CONFIG_WQN_EPD_UI_ENABLE`：启用电子纸 UI 和按键驱动的设备应用。
 - `CONFIG_WQN_EPD_LOCAL_PARTIAL_ENABLE`：启用 Note4 本地局部窗口刷新。
 - `CONFIG_WQN_EPD_IDLE_POWER_OFF_MS`：UI 空闲后关闭电纸屏电源轨以节省电量。
+- `CONFIG_WQN_EPD_IDLE_CLEANUP_MS`：累积的重局刷债务用一次全刷清偿的空闲门槛。刻意
+  与上面的掉电点分离，短暂停顿不再自己闪屏；设为 `0` 恢复"挂在掉电点"的旧行为。
 - `CONFIG_WQN_DEEP_SLEEP_ENABLE`：启用由 `PowerCoordinator` 独占的两阶段深睡路径。
 - `CONFIG_WQN_AI_ENABLE`：启用 AI 固件模块；provider 密钥仍只存在云端。
 - `CONFIG_WQN_AI_AUDIO_SELFTEST_ENABLE`：启动时采集并打印音频统计，不上传音频。
+- `CONFIG_WQN_DEV_MENU_ENABLE`：设置页增加一个「开发者选项」入口，进入只读二级菜单
+  （Dev 信息 / 同步诊断 / 错误记录 / 电量原始 / 存储详情 / 电源睡眠诊断），结构由
+  `DEV_DIAGNOSTICS.md` 固定；发布构建保持 n，错误捕获始终编译。
 
 ## 架构与发布资料
 

@@ -30,18 +30,20 @@ on the server.
 - Board bring-up and diagnostics: safe GPIO initialization, chip/flash/PSRAM
   diagnostics, reset reason, WiFi MAC, battery diagnostics, and serial logs.
 - WQN cloud connection: optional WiFi station mode, pairing token storage,
-  masked token logging, due problem sync, problem index refresh, review upload
-  retry, Todo sync, and AI request upload.
-- E-paper UI: local device pages for home/time, countdown, pomodoro, cached
-  problems, Todo, word/notebook-facing study flows, and AI conversation status.
+  masked token logging, problem-study manifest/pack sync, durable observation
+  upload, Todo sync, and AI request upload.
+- E-paper UI: local device pages for home/time, countdown, pomodoro, Todo,
+  word/notebook-facing study flows, Note-integrated problem sets, and AI
+  conversation status.
 - E-paper refresh control: full refresh and local partial-window refresh support
   with cooldown and idle power-off controls.
 - AI audio path: long-press confirm to record, release to upload 16 kHz mono PCM
   to the WQN server, then display transcript, reply text, and action summaries.
 - Local storage: NVS holds only small control state (pairing/WiFi credentials,
-  revisions, cursors and settings). Durable content lives on SPIFFS; the problem
-  cache uses the versioned, block-compressed WQPC format with atomic temp/rename
-  commits, while PSRAM is used only for volatile decode/UI snapshots.
+  revisions, cursors and settings). Durable content lives on SPIFFS. The current
+  problem-study-v1 path stores its manifest and per-problem-set WQNP packs there,
+  builds a fixed-size index in PSRAM, reads problem bodies on demand, and records
+  review observations in a durable outbox until upload succeeds.
 
 ## Security Boundary
 
@@ -60,23 +62,23 @@ audio captures, or user data.
 Use ESP-IDF 5.5.4 for this project. The primary WSL environment is:
 
 ```txt
-/home/unknow/esp/esp-idf-v5.5
+<esp-idf-dir>
 ```
 
 Build from WSL with:
 
 ```bash
-cd /home/unknow/projects/firmware/firmware/wqn-zectrix-note4
-source /home/unknow/esp/esp-idf-v5.5/export.sh
+cd <repo-root>/firmware/wqn-zectrix-note4
+source <esp-idf-dir>/export.sh
 idf.py -B build-ai-local-s3 set-target esp32s3
 idf.py -B build-ai-local-s3 build
 ```
 
 The previous Windows checkout remains available for recovery/reference at
-`D:\projects\wqn-zectrix-note4-firmware`. Its ESP-IDF root is:
+`<repo-root>`. Its ESP-IDF root is:
 
 ```txt
-D:\Program\Espressif\frameworks\esp-idf-v5.5.4
+<esp-idf-dir>
 ```
 
 The default WQN ESP32 API base is:
@@ -113,11 +115,20 @@ Configure features through `idf.py menuconfig` under `WQN firmware`:
   refresh path.
 - `CONFIG_WQN_EPD_IDLE_POWER_OFF_MS`: powers off the e-paper rail after UI idle
   time to save battery.
+- `CONFIG_WQN_EPD_IDLE_CLEANUP_MS`: when the accumulated heavy-partial debt is
+  repaid with one full refresh. Kept separate from the rail power-off above so
+  a short pause no longer flashes the panel; `0` restores the old behaviour of
+  cleaning at the power-off point.
 - `CONFIG_WQN_DEEP_SLEEP_ENABLE`: optional experimental deep sleep path.
 - `CONFIG_WQN_AI_ENABLE`: enables AI firmware modules; provider secrets still
   stay server-side.
 - `CONFIG_WQN_AI_AUDIO_SELFTEST_ENABLE`: captures and logs audio statistics at boot
   without uploading audio.
+- `CONFIG_WQN_DEV_MENU_ENABLE`: adds a "开发者选项" (developer options) entry to the
+  settings page that opens a second-level read-only list (dev info / sync
+  diagnostics / error log / raw battery / storage detail / sleep diagnostics);
+  the structure is fixed by `DEV_DIAGNOSTICS.md`. Release builds keep it n;
+  error capture is always compiled.
 
 ## Local Flashing
 
@@ -142,7 +153,7 @@ explicitly changed.
 Keep the verified official backup image outside this repository:
 
 ```txt
-D:\projects\ESP32DOC\zectrix_note4_backup.bin
+<backup-dir>\zectrix_note4_backup.bin
 ```
 
 Known backup facts:
@@ -157,7 +168,7 @@ Command templates:
 python -m esptool --chip esp32s3 -p COMx -b 460800 read_flash 0x0 0x1000000 current_device_backup.bin
 
 # Restore the preserved official backup.
-python -m esptool --chip esp32s3 -p COMx -b 460800 write_flash --flash_mode dio --flash_size 16MB --flash_freq 80m 0x0 D:\projects\ESP32DOC\zectrix_note4_backup.bin
+python -m esptool --chip esp32s3 -p COMx -b 460800 write_flash --flash_mode dio --flash_size 16MB --flash_freq 80m 0x0 <backup-dir>\zectrix_note4_backup.bin
 ```
 
 ## Development Notes

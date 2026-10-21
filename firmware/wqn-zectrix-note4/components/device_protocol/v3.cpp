@@ -3,15 +3,20 @@
 #include <algorithm>
 #include <climits>
 #include <cmath>
+#include <utility>
 
 #include "cJSON.h"
+#include "device_protocol/json_depth_guard.h"
 
 namespace {
 
 class JsonDocument {
 public:
     explicit JsonDocument(cJSON* root) : root_(root) {}
-    explicit JsonDocument(const std::string& body) : root_(cJSON_Parse(body.c_str())) {}
+    explicit JsonDocument(const std::string& body)
+        : root_(wqn::protocol::JsonNestingWithinLimit(body.data(), body.size())
+                    ? cJSON_Parse(body.c_str())
+                    : nullptr) {}
     ~JsonDocument() { cJSON_Delete(root_); }
     cJSON* root() const { return root_; }
 
@@ -80,7 +85,8 @@ esp_err_t AddRequestMetadata(
     cJSON_AddStringToObject(root, "firmware_version", metadata.firmware_version.c_str());
     cJSON_AddItemToObject(root, "capabilities", capabilities);
     const char* values[] = {
-        "display.epd", "sync.v3", "word.study.v1", "ai.sse.v2", "flash.v2"};
+        "display.epd", "sync.v3", "content-sync.v1", "word.study.v1",
+        "ai.sse.v2", "flash.v2"};
     for (const char* value : values) {
         cJSON_AddItemToArray(capabilities, cJSON_CreateString(value));
     }
@@ -167,9 +173,34 @@ esp_err_t BuildBootstrapRequest(const RequestMetadata& metadata, std::string* bo
     return BuildRequest(metadata, false, body);
 }
 
-esp_err_t BuildSyncRequest(const RequestMetadata& metadata, std::string* body)
+esp_err_t BuildSyncRequest(
+    const RequestMetadata& metadata,
+    uint32_t auto_sync_interval_minutes,
+    std::string* body)
 {
-    return BuildRequest(metadata, true, body);
+    if (auto_sync_interval_minutes != 0 && auto_sync_interval_minutes != 15 &&
+        auto_sync_interval_minutes != 30 && auto_sync_interval_minutes != 60 &&
+        auto_sync_interval_minutes != 240) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    esp_err_t result = BuildRequest(metadata, true, body);
+    if (result != ESP_OK) {
+        return result;
+    }
+    JsonDocument document(*body);
+    if (document.root() == nullptr) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    cJSON* configuration = cJSON_CreateObject();
+    if (configuration == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
+    cJSON_AddNumberToObject(
+        configuration,
+        "auto_sync_interval_minutes",
+        static_cast<double>(auto_sync_interval_minutes));
+    cJSON_AddItemToObject(document.root(), "configuration", configuration);
+    return Render(document.root(), body);
 }
 
 esp_err_t BuildClaimStartRequest(
@@ -374,10 +405,25 @@ esp_err_t ParseSyncResponse(
         !U64Field(summaries, "word_due_count", &word_due_count)) {
         return ESP_ERR_INVALID_RESPONSE;
     }
+    if (auto_sync_interval_minutes != 0 && auto_sync_interval_minutes != 15 &&
+        auto_sync_interval_minutes != 30 && auto_sync_interval_minutes != 60 &&
+        auto_sync_interval_minutes != 240) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
     data->auto_sync_interval_minutes = static_cast<uint32_t>(
         std::min<uint64_t>(auto_sync_interval_minutes, UINT32_MAX));
     data->todo_count = static_cast<int>(std::min<uint64_t>(todo_count, INT_MAX));
     data->word_due_count = static_cast<int>(std::min<uint64_t>(word_due_count, INT_MAX));
+    // Additive field: an older server omits it and the hint stays -1, so the
+    // home card keeps rendering the pack size.
+    if (cJSON_GetObjectItemCaseSensitive(summaries, "word_mistake_count") != nullptr) {
+        uint64_t word_mistake_count = 0;
+        if (!U64Field(summaries, "word_mistake_count", &word_mistake_count)) {
+            return ESP_ERR_INVALID_RESPONSE;
+        }
+        data->word_mistake_count =
+            static_cast<int>(std::min<uint64_t>(word_mistake_count, INT_MAX));
+    }
     const int count = cJSON_GetArraySize(due);
     data->due_problem_ids.reserve(count);
     for (int index = 0; index < count; ++index) {
@@ -386,6 +432,63 @@ esp_err_t ParseSyncResponse(
             return ESP_ERR_INVALID_RESPONSE;
         }
         data->due_problem_ids.emplace_back(item->valuestring);
+    }
+
+    cJSON* manifest = cJSON_GetObjectItemCaseSensitive(payload, "content_manifest");
+    if (manifest != nullptr) {
+        if (!cJSON_IsArray(manifest)) {
+            return ESP_ERR_INVALID_RESPONSE;
+        }
+        const int manifest_count = cJSON_GetArraySize(manifest);
+        if (manifest_count > 100) {
+            return ESP_ERR_INVALID_RESPONSE;
+        }
+        bool seen[] = {false, false, false, false, false, false, false};
+        for (int index = 0; index < manifest_count; ++index) {
+            cJSON* entry = cJSON_GetArrayItem(manifest, index);
+            if (!cJSON_IsObject(entry)) {
+                return ESP_ERR_INVALID_RESPONSE;
+            }
+            const std::string kind = StringField(entry, "kind");
+            SyncContentKind parsed_kind = SyncContentKind::kUnknown;
+            if (kind == "problems") parsed_kind = SyncContentKind::kProblems;
+            else if (kind == "todos") parsed_kind = SyncContentKind::kTodos;
+            else if (kind == "words") parsed_kind = SyncContentKind::kWords;
+            else if (kind == "word_packs") parsed_kind = SyncContentKind::kWordPacks;
+            else if (kind == "note_packs") parsed_kind = SyncContentKind::kNotePacks;
+            else if (kind == "problem_packs") parsed_kind = SyncContentKind::kProblemPacks;
+            // Unknown additive targets belong to a newer server and are
+            // intentionally ignored by this firmware.
+            if (parsed_kind == SyncContentKind::kUnknown) {
+                continue;
+            }
+            const size_t seen_index = static_cast<size_t>(parsed_kind);
+            if (seen[seen_index]) {
+                return ESP_ERR_INVALID_RESPONSE;
+            }
+            uint64_t revision = 0;
+            // Revision zero is the protocol's valid "known empty" value. The
+            // authoritative JSON Schema permits non-negative counters and the
+            // server emits zero when a user has no content in a domain.
+            if (!U64Field(entry, "revision", &revision)) {
+                return ESP_ERR_INVALID_RESPONSE;
+            }
+            SyncContentTarget target;
+            target.kind = parsed_kind;
+            target.revision = revision;
+            cJSON* cursor = cJSON_GetObjectItemCaseSensitive(entry, "cursor");
+            // Cursor is optional in device-control-v3. If a server supplies
+            // it, keep validating the declared string type strictly.
+            if (cursor != nullptr &&
+                (!cJSON_IsString(cursor) || cursor->valuestring == nullptr)) {
+                return ESP_ERR_INVALID_RESPONSE;
+            }
+            if (cursor != nullptr) {
+                target.cursor = cursor->valuestring;
+            }
+            seen[seen_index] = true;
+            data->content_targets.push_back(std::move(target));
+        }
     }
     return ESP_OK;
 }

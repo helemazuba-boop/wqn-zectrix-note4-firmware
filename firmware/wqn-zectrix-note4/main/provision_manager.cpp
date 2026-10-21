@@ -15,6 +15,7 @@
 #include "storage.h"
 #include "runtime/sleep_coordinator.h"
 #include "wifi_provision_portal.h"
+#include "error_recorder.h"
 
 #if defined(CONFIG_WQN_WIFI_STA_ENABLE) && defined(CONFIG_WQN_PROVISION_ENABLE)
 
@@ -76,20 +77,78 @@ void ProvisionTask(void*)
         }
 
         portal_ptr->SetSsidPrefix(kApSsidPrefix);
-        portal_ptr->SetCredentialsCallback([](const std::string& ssid, const std::string& password) {
-            const esp_err_t result = wqn::SaveWifiCredentials(ssid, password);
+        // [wifi-redundancy] The legacy-key migration normally already ran in
+        // InitStorage. Re-run it here (idempotent, three NVS reads when there is
+        // nothing to do) so a device whose boot attempt was refused still shows
+        // its stored networks in the portal instead of an empty list. This runs
+        // on the wqn_prov task, never the UI task.
+        wqn::MigrateLegacyWifiCredentialsIfNeeded();
+        wqn::WifiCredentialStore initial_store;
+        const esp_err_t load_result = wqn::LoadWifiCredentialStore(&initial_store);
+        if (load_result != ESP_OK) {
+            ESP_LOGW(kTag, "load WiFi roles for portal failed: %s", esp_err_to_name(load_result));
+            initial_store = wqn::WifiCredentialStore{};
+        }
+        const bool has_primary = initial_store.count > 0 &&
+            initial_store.preferred < initial_store.count;
+        const uint8_t primary_index = has_primary ? initial_store.preferred : 0;
+        const bool has_backup = initial_store.count == 2;
+        const uint8_t backup_index = primary_index == 0 ? 1 : 0;
+        portal_ptr->SetStoredNetworks(
+            has_primary ? initial_store.slots[primary_index].ssid : "",
+            has_backup ? initial_store.slots[backup_index].ssid : "");
+        if (has_primary) {
+            std::lock_guard<std::mutex> lock(g_prov_mutex);
+            g_prov_ssid = initial_store.slots[primary_index].ssid;
+            g_prov_password = initial_store.slots[primary_index].password;
+            xEventGroupSetBits(g_prov_events, kCredentialsSavedBit);
+        }
+
+        portal_ptr->SetCredentialsCallback([](
+            wqn::provision::NetworkRole role,
+            const std::string& ssid,
+            const std::string& password,
+            bool keep_existing_password) {
+            const wqn::WifiCredentialRole storage_role =
+                role == wqn::provision::NetworkRole::kPrimary
+                ? wqn::WifiCredentialRole::kPrimary
+                : wqn::WifiCredentialRole::kBackup;
+            // [wifi-redundancy] Migrate first, for the same reason the
+            // connectivity path does: a role write over an unmigrated legacy
+            // store would otherwise reject a backup slot (the store looks empty)
+            // or drop the legacy network. Runs on the portal's httpd task.
+            wqn::MigrateLegacyWifiCredentialsIfNeeded();
+            const esp_err_t result = wqn::SetWifiCredentialForRole(
+                storage_role, ssid, password, keep_existing_password);
             if (result != ESP_OK) {
                 ESP_LOGE(kTag, "save WiFi credentials failed: %s", esp_err_to_name(result));
+                // [dev-diag] ProvisionState is an atomic enum — the cause
+                // detail would be lost without the ring.
+                wqn::RecordError("provision", "save creds failed %s", esp_err_to_name(result));
                 return result;
+            }
+
+            // Always refresh the eventual STA handoff from the durable primary
+            // slot. Saving a backup must not make it preferred or connect to it.
+            wqn::WifiCredentialStore updated_store;
+            const esp_err_t reload_result = wqn::LoadWifiCredentialStore(&updated_store);
+            if (reload_result != ESP_OK || updated_store.count == 0 ||
+                updated_store.preferred >= updated_store.count) {
+                ESP_LOGE(kTag, "reload WiFi roles after save failed: %s", esp_err_to_name(reload_result));
+                return reload_result == ESP_OK ? ESP_ERR_INVALID_STATE : reload_result;
             }
             {
                 std::lock_guard<std::mutex> lock(g_prov_mutex);
-                g_prov_ssid = ssid;
-                g_prov_password = password;
+                g_prov_ssid = updated_store.slots[updated_store.preferred].ssid;
+                g_prov_password = updated_store.slots[updated_store.preferred].password;
             }
-            g_prov_state = wqn::ProvisionState::kConnecting;
+            g_prov_state = wqn::ProvisionState::kScanning;
             xEventGroupSetBits(g_prov_events, kCredentialsSavedBit);
-            ESP_LOGI(kTag, "WiFi credentials saved: SSID=%s", ssid.c_str());
+            ESP_LOGI(
+                kTag,
+                "%s WiFi credentials saved: SSID=%s",
+                role == wqn::provision::NetworkRole::kPrimary ? "primary" : "backup",
+                ssid.c_str());
             return ESP_OK;
         });
         portal_ptr->SetExitCallback([]() {
@@ -100,6 +159,8 @@ void ProvisionTask(void*)
         const esp_err_t start_result = portal_ptr->Start();
         if (start_result != ESP_OK) {
             ESP_LOGE(kTag, "provisioning portal start failed: %s", esp_err_to_name(start_result));
+            // [dev-diag] SoftAP bring-up failure with its cause.
+            wqn::RecordError("provision", "portal start failed %s", esp_err_to_name(start_result));
             g_prov_state = wqn::ProvisionState::kFailed;
             PublishStopped();
             continue;
@@ -144,10 +205,12 @@ void ProvisionTask(void*)
                 ssid = g_prov_ssid;
                 password = g_prov_password;
             }
-            g_prov_state = wqn::ProvisionState::kConnected;
-            ESP_LOGI(kTag, "provisioning completed: SSID=%s", ssid.c_str());
+            g_prov_state = wqn::ProvisionState::kConnecting;
+            ESP_LOGI(kTag, "provisioning saved; starting STA: SSID=%s", ssid.c_str());
             if (callback && !ssid.empty()) {
                 callback(ssid, password);  // AP/DNS/httpd are stopped before STA handoff.
+            } else {
+                g_prov_state = wqn::ProvisionState::kFailed;
             }
         } else if (cancelled) {
             ESP_LOGI(kTag, "provisioning cancelled");
@@ -297,6 +360,17 @@ void SetProvisionDoneCallback(ProvisionDoneCallback callback)
     g_prov_done_callback = std::move(callback);
 #else
     (void)callback;
+#endif
+}
+
+void ReportProvisioningConnectionResult(bool connected)
+{
+#if defined(CONFIG_WQN_WIFI_STA_ENABLE) && defined(CONFIG_WQN_PROVISION_ENABLE)
+    ProvisionState expected = ProvisionState::kConnecting;
+    g_prov_state.compare_exchange_strong(
+        expected, connected ? ProvisionState::kConnected : ProvisionState::kFailed);
+#else
+    (void)connected;
 #endif
 }
 
