@@ -8,8 +8,8 @@
 | 分组 | 状态 | 内容 |
 |---|---|---|
 | 文档基线 | 已本地提交 `6dcbd8a` | 12 个问题、B0–B5 路线与证据边界 |
-| B0 工具链与配置基线 | 本地验证通过 | CI 对齐 IDF 5.5.6；干净导出树从 defaults 构建 |
-| B1 音频时间单位 | 实施中 | 修复 7 处调用及服务 API，补实际边界回归 |
+| B0 工具链与配置基线 | 已本地提交 `0e81504` | CI 对齐 IDF 5.5.6；干净导出树从 defaults 构建 |
+| B1 音频时间单位 | 代码/host/build 通过，设备待测 | 修复 7 处调用及服务 API，补实际边界回归 |
 | B2 启动存储恢复 | 待实施 | 先执行真实 schema 决策；行为补丁须另有决策与 HIL |
 
 本记录中的 host/build 结果不代表设备 HIL、音质/停止延迟、实际功耗或远端 CI。
@@ -58,3 +58,37 @@ idf.py -B build-wsl set-target esp32s3 build
 本机证据：`/tmp/note4-batch01-baseline-build.log`、
 `/tmp/note4-batch01-fresh-build.log`、`/tmp/note4-batch01-idf-manifest.json`。
 临时目录可能清理；上面的身份、差异和结论保存在此跟踪文档中。
+
+## B1：I2S 超时毫秒契约
+
+`ReadAudioChannel` / `WriteAudioChannel` 改为显式 `uint32_t timeout_ms`，与 IDF
+新 I2S API 一致。STD/Agent 共用采集的两个调用、Flash 的四个读写调用和音频自测
+的一个调用直接传入毫秒。保持原来标称的 100/200/250/1000 ms 预算，消除 100 Hz
+下提前换成 tick 的错误；不改变底层资源 owner、DMA 布局或录音停止状态机。
+
+注释明确这是驱动各等待点的预算，不能推算整个调用或停止响应一定低于 200 ms。
+设备 PCM 连续性、调度抖动和停止响应仍按原音频验收矩阵补测。
+
+新增 `scripts/test_audio_channel_timeout.py`：编译生产服务函数及真实公开头文件，
+提取全部调用点的最后一个实参表达式，在 100/1000 Hz 下检查驱动实际收到的单位。
+driver 与 capability 调度端口是 host 替身；额外验证错误码、部分完成字节数及
+调用期间 operation 的持有/释放，不将其扩大为真实 DriverOperation 并发或 PCM 验证。
+新增 CI job 在 PR 等既有 workflow 触发条件下运行此回归。
+
+| 验证 | 结果 |
+|---|---|
+| 未修复导出基线运行新回归 | 预期 FAIL，100 Hz 的 `driver_timeout_ms == expected_ms` 断言捕获错误 |
+| 修复后新回归 | 100/1000 Hz 各 1,222 检查 PASS，ASan/UBSan |
+| 调用端重新换成 tick 的变体 | 预期 FAIL，100 Hz 捕获 |
+| 驱动边界再次换成 tick 的变体 | 预期 FAIL，100 Hz 捕获 |
+| 既有 audio runtime / RX DMA / recording indicator | 74 / 98 / 67 检查 PASS，ASan/UBSan |
+| Agent disabled | 22 个公开入口链接及拒绝/no-op 行为 PASS |
+| 当前默认 IDF 构建 | EXIT=0、0 warnings，M8 与 UI 栈检查 PASS |
+| 音频设备 HIL | 未执行，未刷机 |
+
+ASan/LeakSanitizer 测试在沙箱 ptrace 下出现环境错误；以上最终结果来自获准的
+沙箱外主机测试，未接触设备。原始代码的失败断言也在导出基线上重新运行确认。
+本机记录为 `/tmp/note4-batch01-audio-*.log`。
+
+REL-002 的 6 个短延时调用位于 ADC、wake assembly 和 EPD 路径。本批只定位并
+保留它们，不统一改成一个 tick；其硬件/睡眠影响需逐调用点判断和相应 HIL。

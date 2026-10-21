@@ -193,7 +193,7 @@ esp_err_t CaptureI2sStats(
         size_t bytes_read = 0;
         result = wqn::services::ReadAudioChannel(
             g_selftest_session, *rx_handle, buffer, sizeof(buffer),
-            &bytes_read, pdMS_TO_TICKS(1000));
+            &bytes_read, 1000);
         if (result != ESP_OK) {
             ESP_LOGE(kTag, "I2S read failed: %s", esp_err_to_name(result));
             break;

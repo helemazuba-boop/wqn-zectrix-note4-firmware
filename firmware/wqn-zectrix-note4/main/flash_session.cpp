@@ -947,7 +947,7 @@ void FlashPlaybackTask(void* /*param*/)
             last_werr = wqn::services::WriteAudioChannel(
                 g_flash_audio_session, g_flash.stream_tx,
                 reinterpret_cast<const uint8_t*>(stereo.data()) + total,
-                total_bytes - total, &written, pdMS_TO_TICKS(250));
+                total_bytes - total, &written, 250);
             if (last_werr != ESP_OK || written == 0) {
                 break;  // channel disabled/closed on stop - drop the rest
             }
@@ -1087,7 +1087,7 @@ esp_err_t WarmupStreamAdc()
         const esp_err_t read_result = wqn::services::ReadAudioChannel(
             g_flash_audio_session, g_flash.stream_rx,
             buffer, sizeof(buffer), &bytes_read,
-            pdMS_TO_TICKS(200));
+            200);
         if (read_result != ESP_OK) {
             ESP_LOGE(kTag,
                      "Flash ADC warmup read failed: result=%s (%d) rx=%p discarded_frames=%u",
@@ -1284,7 +1284,7 @@ void AudioStreamingTask(void* param)
         size_t warmup_bytes = 0;
         wqn::services::ReadAudioChannel(
             g_flash_audio_session, g_flash.stream_rx, i2s_buf,
-            sizeof(i2s_buf), &warmup_bytes, pdMS_TO_TICKS(100));
+            sizeof(i2s_buf), &warmup_bytes, 100);
     }
 
     const int64_t capture_started_us = esp_timer_get_time();
@@ -1303,13 +1303,14 @@ void AudioStreamingTask(void* param)
         size_t bytes_read = 0;
         // [timeout-fix] 200ms (was 20ms). i2s_channel_read returns immediately
         // when DMA data is ready, so a larger timeout adds zero normal-case
-        // latency - it only bounds the worst case. 20ms was too tight: 960 bytes
+        // latency when data is ready. 20ms was too tight: 960 bytes
         // @ 64 B/ms needs 15ms to fill, and EPD/WS preemption of this priority-10
         // task left no margin -> ~98% false timeouts + fragmented audio. 200ms
-        // covers fill time + scheduling jitter; stop latency stays <200ms.
+        // covers fill time + scheduling jitter. This is the driver's per-wait
+        // budget; a read can contain several waits before stop is observed.
         esp_err_t read_err = wqn::services::ReadAudioChannel(
             g_flash_audio_session, g_flash.stream_rx, i2s_buf,
-            sizeof(i2s_buf), &bytes_read, pdMS_TO_TICKS(200));
+            sizeof(i2s_buf), &bytes_read, 200);
         if (read_err != ESP_OK || bytes_read == 0) {
             xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
             SetFlashCaptureIndicatorLocked(false);

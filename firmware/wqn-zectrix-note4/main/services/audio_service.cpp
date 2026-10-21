@@ -2106,7 +2106,7 @@ esp_err_t ReadAudioChannel(
     void* destination,
     size_t bytes,
     size_t* bytes_read,
-    TickType_t timeout)
+    uint32_t timeout_ms)
 {
     DriverOperation operation(
         session, DriverOperation::Kind::kChannel, channel);
@@ -2115,7 +2115,7 @@ esp_err_t ReadAudioChannel(
         return ESP_ERR_INVALID_STATE;
     }
     return i2s_channel_read(
-        AsChannel(channel), destination, bytes, bytes_read, timeout);
+        AsChannel(channel), destination, bytes, bytes_read, timeout_ms);
 }
 
 esp_err_t WriteAudioChannel(
@@ -2124,7 +2124,7 @@ esp_err_t WriteAudioChannel(
     const void* source,
     size_t bytes,
     size_t* bytes_written,
-    TickType_t timeout)
+    uint32_t timeout_ms)
 {
     DriverOperation operation(
         session, DriverOperation::Kind::kChannel, channel);
@@ -2133,7 +2133,7 @@ esp_err_t WriteAudioChannel(
         return ESP_ERR_INVALID_STATE;
     }
     return i2s_channel_write(
-        AsChannel(channel), source, bytes, bytes_written, timeout);
+        AsChannel(channel), source, bytes, bytes_written, timeout_ms);
 }
 
 esp_err_t ResetAudioTxChannel(

@@ -126,20 +126,22 @@ esp_err_t DisableAudioChannel(
     const AudioSession& session, AudioChannelHandle channel);
 esp_err_t DeleteAudioChannel(
     const AudioSession& session, AudioChannelHandle* channel);
+// Match the ESP-IDF I2S API: timeouts are milliseconds, never RTOS ticks.
+// The driver applies this budget to its waits, not as a whole-call deadline.
 esp_err_t ReadAudioChannel(
     const AudioSession& session,
     AudioChannelHandle channel,
     void* destination,
     size_t bytes,
     size_t* bytes_read,
-    TickType_t timeout);
+    uint32_t timeout_ms);
 esp_err_t WriteAudioChannel(
     const AudioSession& session,
     AudioChannelHandle channel,
     const void* source,
     size_t bytes,
     size_t* bytes_written,
-    TickType_t timeout);
+    uint32_t timeout_ms);
 esp_err_t ResetAudioTxChannel(
     const AudioSession& session,
     AudioChannelHandle channel,
