@@ -64,3 +64,4 @@ idf.py -B build-ai-local-s3 -DWQN_API_BASE=https://your-host.example.com/api/esp
 - [Word 学习文档](docs/product/word-study/WORD_BASELINE.md)
 - [界面改版和交互记录](docs/ui/)
 - [工程修复和维护记录](docs/engineering/)
+- [可靠性问题与分批补丁路线](docs/engineering/FIRMWARE_RELIABILITY_PLAN.md)

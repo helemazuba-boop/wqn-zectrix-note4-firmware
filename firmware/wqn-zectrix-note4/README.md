@@ -183,6 +183,7 @@ Current runtime and release references:
 - [Architecture and resource ownership](docs/architecture/ARCHITECTURE.md)
 - [Coordinated firmware/cloud release checklist](docs/release/RELEASE_CHECKLIST.md)
 - [Firmware troubleshooting](docs/development/TROUBLESHOOTING.md)
+- [Reliability findings and patch roadmap](docs/engineering/FIRMWARE_RELIABILITY_PLAN.md)
 
 - Keep firmware-side changes focused on device behavior, transport contracts,
   power control, local rendering, and local caches.

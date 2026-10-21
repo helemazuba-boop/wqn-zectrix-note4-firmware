@@ -16,6 +16,8 @@ contract they describe.
 - `docs/development/TROUBLESHOOTING.md`: symptom-led diagnosis from logs and
   runtime state.
 - `docs/release/RELEASE_CHECKLIST.md`: coordinated firmware/cloud release gates.
+- `docs/engineering/FIRMWARE_RELIABILITY_PLAN.md`: current reliability findings,
+  maintenance gaps, and the staged patch plan for `fix/firmware-reliability`.
 
 ## Architecture
 
@@ -87,6 +89,8 @@ by code, `AGENTS.md`, and the architecture/product references above.
 
 - `docs/engineering/AUDIO_RUNTIME_REPAIR.md` — audio runtime device acceptance
   procedure and evidence boundary.
+- `docs/engineering/FIRMWARE_RELIABILITY_PLAN.md` — dated source/history findings,
+  issue IDs, recovery-policy questions, patch batches, and acceptance criteria.
 - `docs/engineering/DEAD_CODE_CLEANUP.md` — evidence and scope for firmware
   cleanup decisions.
 - `docs/engineering/SYNC_V3_REPAIR.md` — sync repair findings, host checks, and
@@ -114,12 +118,14 @@ versioned contract so the scope is unambiguous.
 
 ## Local-only material
 
-The repository intentionally ignores `docs/`, `analysis/`, and `backups/` at the
-firmware root. They hold maintainer-local handoffs/specifications, investigation
-scratch data and logs, and device backups/validation artifacts. They are not
-part of the tracked documentation set and should not be used as the sole source
-for a firmware contract or release decision. Preserve useful conclusions in a
-tracked reference or report before local material is retired.
+The repository ignore rules still cover newly created files under `docs/`,
+`analysis/`, and `backups/`. The canonical `docs/` references listed above are
+explicitly tracked; deliberately add new shared reports to Git as well. The
+local-only material listed below holds maintainer handoffs/specifications,
+investigation scratch data and logs, and device backups/validation artifacts.
+It is not part of the tracked documentation set and should not be used as the
+sole source for a firmware contract or release decision. Preserve useful
+conclusions in a tracked reference or report before local material is retired.
 
 - `docs/diagnostics/artifact-storage-error-manifest-500-2026-08-25.md` records
   the 2026-08-25 Note/Problem manifest 500 investigation.
