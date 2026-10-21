@@ -6,7 +6,6 @@ idf_component_register(
         "ai_session.cpp"
         "agent_voice_pipe.cpp"
         "audio_capture.cpp"
-        "audio_player.cpp"
         "audio_selftest.cpp"
         "audio_pcm_dump.cpp"
         "psram_task_stack.cpp"
@@ -22,14 +21,13 @@ idf_component_register(
         "pcf8563.cpp"
         "provision_manager.cpp"
         "runtime/storage_schema.cpp"
+        "runtime/memory_diagnostics.cpp"
         "services/connectivity_service.cpp"
         "services/audio_service.cpp"
         "services/storage_service.cpp"
         "services/sync_service.cpp"
         "sse_chunk.cpp"
         "storage.cpp"
-        "storage_io_probe.cpp"
-        "text_render.cpp"
         "time_app.cpp"
         "ui/battery.cpp"
         "ui/clock.cpp"
@@ -37,12 +35,20 @@ idf_component_register(
         "ui/persist_worker.cpp"
         "ui/diagnostics.cpp"
         "ui/graphics.cpp"
+        "ui/ui_fonts.c"
+        "ui/word_fonts.c"
+        "ui/navigation_model.cpp"
+        "ui/home_model.cpp"
+        "ui/navigation_view.cpp"
         "ui/ui_gates_selftest.cpp"
         "ui/markdown_layout.cpp"
         "ui/markdown_render.cpp"
+        "ui/ai_text_layout.cpp"
         "ui/page_ai.cpp"
         "ui/page_ai_agent.cpp"
         "ui/page_home.cpp"
+        "ui/page_provisioning.cpp"
+        "ui/provision_qr.cpp"
         "ui/page_settings.cpp"
         "ui/page_time.cpp"
         "ui/page_todo.cpp"
@@ -99,6 +105,7 @@ idf_component_register(
         esp_driver_usb_serial_jtag
         esp_wifi
         wqn_wifi_provision
+        qr_code
         freertos
         json
         lwip
@@ -110,30 +117,6 @@ idf_component_register(
         device_protocol
         spi_flash
         spiffs
-)
-
-# [measure] Read-only private ABI dependency, pinned to the local IDF 5.5.4
-# SPIFFS adapter. SDK sources/config stay untouched; remove with this probe.
-target_include_directories(${COMPONENT_LIB} PRIVATE
-    "${IDF_PATH}/components/spiffs"
-    "${IDF_PATH}/components/spiffs/spiffs/src"
-)
-# Scope-filtered partition API and GC function pass-through probes.
-# --wrap rewrites SDK references after libmain has been scanned. Explicit roots
-# pull the wrappers from that archive even when the boot bench is disabled;
-# otherwise their incidental InitializePartitionIoProbe reference was required
-# just to link. Outside a measurement scope they still forward unchanged.
-target_link_options(${COMPONENT_LIB} INTERFACE
-    "-Wl,--wrap=esp_partition_read"
-    "-Wl,--undefined=__wrap_esp_partition_read"
-    "-Wl,--wrap=esp_partition_write"
-    "-Wl,--undefined=__wrap_esp_partition_write"
-    "-Wl,--wrap=esp_partition_erase_range"
-    "-Wl,--undefined=__wrap_esp_partition_erase_range"
-    "-Wl,--wrap=spiffs_gc_check"
-    "-Wl,--undefined=__wrap_spiffs_gc_check"
-    "-Wl,--wrap=spiffs_gc_quick"
-    "-Wl,--undefined=__wrap_spiffs_gc_quick"
 )
 
 if(CONFIG_WQN_WIFI_STA_ENABLE AND NOT CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE)

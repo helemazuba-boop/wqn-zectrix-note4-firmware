@@ -11,7 +11,6 @@
 #include <utility>
 #include <vector>
 
-#include "audio_player.h"
 #include "audio_capture.h"
 #include "ai_history.h"
 #include "cJSON.h"
@@ -72,13 +71,10 @@ void HandleV2DownlinkAudio(const uint8_t* data, size_t len,
 //                means audio; 'WFCJ' + ver=2 means JSON control.
 // ============================================================================
 #if CONFIG_WQN_FLASH_PROTOCOL_V2
-constexpr char kWsHost[] = WQN_API_BASE_HOST;        // https://wqn.helema.cn
-constexpr char kWsPath[] = WQN_FLASH_WS_PATH;        // /api/esp32/realtime
 constexpr char kWsSubprotocol[] = WQN_FLASH_WS_SUBPROTOCOL;  // wqn-flash-v2
 constexpr char kDefaultVoice[] = WQN_FLASH_VOICE;
 constexpr char kDefaultInstructions[] = WQN_FLASH_DEFAULT_INSTRUCTIONS;
 constexpr uint32_t kAudioFrameMagic = 0x57464C56u;   // 'W','F','L','V'
-constexpr uint32_t kControlFrameMagic = 0x5746434Au; // 'W','F','C','J'
 constexpr uint16_t kFrameVersion = 2;
 constexpr uint16_t kFlagStream = 0x0001;
 constexpr uint16_t kFlagFinal = 0x0002;
@@ -90,10 +86,7 @@ constexpr char kDefaultVoice[] = "qingchunshaonv";
 
 constexpr int kSampleRate = 24000;
 constexpr int kChunkFrames = 360;
-constexpr int kChunkBytes = kChunkFrames * 2;
-constexpr int kChunkIntervalMs = 15;
 
-constexpr int kMaxReconnectAttempts = 3;
 constexpr TickType_t kWifiReadyWait = pdMS_TO_TICKS(35000);
 constexpr TickType_t kWsConnectTimeout = pdMS_TO_TICKS(20000);
 constexpr uint32_t kLifecycleTaskStackBytes = 8192;
@@ -187,6 +180,9 @@ struct FlashState {
 
 FlashState g_flash;
 wqn::services::AudioSession g_flash_audio_session;
+// Stable copy for the active acquisition turn, protected by g_flash.mutex.
+wqn::services::AudioSession g_flash_indicator_session;
+bool g_flash_indicator_on = false;
 wqn::services::ConnectivityDemand g_flash_connectivity_demand;
 
 class FlashWsSendRegistration {
@@ -422,6 +418,7 @@ void RequestFlashTerminalStop(FlashTerminalReason reason)
     xTaskNotifyGive(g_lifecycle_task);
 }
 
+#if CONFIG_WQN_FLASH_PROTOCOL_V2
 bool EnsureFlashThinkingHistoryLocked(int64_t now_ms)
 {
     if (!g_flash.history_user_committed || g_flash.thinking_text.empty()) {
@@ -454,6 +451,8 @@ bool FinalizeFlashAssistantLocked(int64_t now_ms)
                                g_flash.assistant_text, now_ms);
 }
 
+#endif
+
 void ResetFlashTurnAssemblyLocked()
 {
     g_flash.user_transcript.clear();
@@ -471,9 +470,22 @@ void MarkChanged()
     g_flash.changed = true;
 }
 
+// All callers hold g_flash.mutex. A read finishing after release/error cannot
+// re-arm the indicator, even while the duplex channels remain for TTS.
+void SetFlashCaptureIndicatorLocked(bool ready)
+{
+    const bool enabled = ready && g_flash.capture_started && g_flash.ws_connected &&
+        g_flash.status != InternalStatus::kError;
+    if (!g_flash_indicator_session || enabled == g_flash_indicator_on) return;
+    const esp_err_t result = wqn::services::SetAudioRecordingIndicator(g_flash_indicator_session, enabled);
+    if (result == ESP_OK) g_flash_indicator_on = enabled;
+    else ESP_LOGW(kTag, "Flash recording indicator: %s", esp_err_to_name(result));
+}
+
 void SetErrorLocked(const std::string& message)
 {
     g_flash.status = InternalStatus::kError;
+    SetFlashCaptureIndicatorLocked(false);
     g_flash.pending_text.clear();
     g_flash.error_message = message;
     g_flash.response_in_flight = false;  // [inflight-fix] error ends any in-flight response
@@ -517,6 +529,7 @@ void SetErrorLocked(const std::string& message)
     return out;
 }
 
+#if CONFIG_WQN_FLASH_PROTOCOL_V2
 // Build a v2 binary uplink frame: little-endian header (24 B) + audio bytes.
 struct AudioFrameHeader {
     uint32_t magic;        // 'WFLV'
@@ -565,6 +578,8 @@ void BuildV2AudioFrame(std::vector<uint8_t>* frame, const uint8_t* pcm,
         std::memcpy(p, pcm, pcm_size);
     }
 }
+
+#endif
 
 [[maybe_unused]] std::vector<uint8_t> DecodeBase64Chunk(const char* encoded, size_t len)
 {
@@ -1051,8 +1066,7 @@ esp_err_t InitStreamI2sDuplex(
     }
     // [duplex-fix] Create BOTH RX and TX channels on I2S_NUM_0 together.
     // This mirrors the official firmware's CreateDuplexChannels pattern and
-    // prevents the port-occupied conflict that occurs when audio_player.cpp
-    // later tries to create a standalone TX on the same I2S port.
+    // avoids a port conflict between independently allocated RX and TX owners.
     return wqn::services::CreateAudioDuplexChannels(
         g_flash_audio_session, kSampleRate, kStreamDmaFrameNum, true,
         rx_handle, &g_flash.stream_tx);
@@ -1143,6 +1157,7 @@ void FinishAudioStreamingTask(const char* error_message = nullptr)
     CleanupStreamHardware();
     xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
     g_flash.capture_started = false;
+    SetFlashCaptureIndicatorLocked(false);
     g_flash.stream_task = nullptr;
     if (error_message != nullptr) {
         SetErrorLocked(error_message);
@@ -1246,8 +1261,8 @@ void AudioStreamingTask(void* param)
     // of allocating/freeing a 744-byte vector every 15 ms.
     std::vector<uint8_t> uplink_frame;
     uplink_frame.reserve(sizeof(AudioFrameHeader) + kStreamChunkBytes);
-#endif
     uint32_t uplink_append_count = 0;
+#endif
     if (g_flash.stream_rx == nullptr || g_flash.stream_tx == nullptr) {
         ESP_LOGW(kTag, "stream hardware missing after preflight");
         FinishAudioStreamingTask("音频通道初始化失败");
@@ -1296,6 +1311,9 @@ void AudioStreamingTask(void* param)
             g_flash_audio_session, g_flash.stream_rx, i2s_buf,
             sizeof(i2s_buf), &bytes_read, pdMS_TO_TICKS(200));
         if (read_err != ESP_OK || bytes_read == 0) {
+            xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+            SetFlashCaptureIndicatorLocked(false);
+            xSemaphoreGive(g_flash.mutex);
             if (read_err == ESP_ERR_TIMEOUT) {
                 // [i2s-diag] Timeout = DMA has no data = ADC path not running.
                 // Distinguishes a dead capture path (timeouts, no pcm diag)
@@ -1314,6 +1332,12 @@ void AudioStreamingTask(void* param)
             vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
+
+        // First valid post-warmup PCM is the actual-ready edge. Merely
+        // connecting or setting capture_started never lights the LED.
+        xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+        SetFlashCaptureIndicatorLocked(true);
+        xSemaphoreGive(g_flash.mutex);
 
         // [channel-fix] Convert stereo interleaved to mono by averaging L+R
         // (matches audio_capture.cpp:476-484). The mic may be routed to either
@@ -1468,6 +1492,8 @@ void StartAudioStreaming()
     g_flash.amp_idle_armed = false;
     SetStreamAudioAmp(false);
 
+    g_flash_indicator_session = g_flash_audio_session;
+    g_flash_indicator_on = false;
     StackType_t* stack = EnsurePsramTaskStack(
         &g_stream_task_stack, kStreamTaskStackBytes, "flash_stream");
     g_flash.stream_task = stack == nullptr ? nullptr
@@ -1477,6 +1503,7 @@ void StartAudioStreaming()
     if (g_flash.stream_task == nullptr) {
         g_flash.stream_task = nullptr;
         g_flash.capture_started = false;
+        SetFlashCaptureIndicatorLocked(false);
         SetErrorLocked("录音任务启动失败");
         ESP_LOGE(kTag, "audio streaming task create failed");
         RequestFlashTerminalStop(FlashTerminalReason::kTransportError);
@@ -1495,6 +1522,7 @@ void StopAudioStreaming()
     // while we also try to delete it) and a double-free of hardware resources.
     xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
     g_flash.capture_started = false;
+    SetFlashCaptureIndicatorLocked(false);
     const TaskHandle_t task = g_flash.stream_task;
     xSemaphoreGive(g_flash.mutex);
     if (task == nullptr) {
@@ -1570,8 +1598,6 @@ void ParseAndHandleEvent(const char* data, size_t len)
     }
 #if CONFIG_WQN_FLASH_PROTOCOL_V2
     const char* stage = JsonStr(g.p, "stage");
-#else
-    const char* stage = nullptr;
 #endif
 
     // ============================================================
@@ -2303,14 +2329,6 @@ esp_err_t StartFlashSessionNow(uint32_t generation)
     // Network association happens before I2S ownership. This keeps an absent
     // AP from pinning AudioActivity for the entire connection budget and the
     // lifecycle task, not the UI task, owns every blocking step.
-    const esp_err_t playback_stop_result = wqn::StopAudioPlayback();
-    if (playback_stop_result != ESP_OK) {
-        xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
-        SetErrorLocked("音频资源释放失败");
-        g_flash_connectivity_demand.Reset();
-        xSemaphoreGive(g_flash.mutex);
-        return playback_stop_result;
-    }
     const esp_err_t audio_result = wqn::services::BeginAudioActivity(
         wqn::services::AudioActivity::kFlash, &g_flash_audio_session);
     if (audio_result != ESP_OK) {
@@ -2447,6 +2465,7 @@ esp_err_t StopFlashSessionNow()
     {
         xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
         g_flash.capture_started = false;
+        SetFlashCaptureIndicatorLocked(false);
         g_flash.button_pressed = false;
         bool had_stream_task = (g_flash.stream_task != nullptr);
         xSemaphoreGive(g_flash.mutex);
@@ -2577,40 +2596,6 @@ esp_err_t StopFlashSession()
     return ESP_OK;
 }
 
-FlashStatus GetFlashStatus()
-{
-    if (g_flash.mutex == nullptr) {
-        return FlashStatus::kIdle;
-    }
-    xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
-    InternalStatus s = g_flash.status;
-    xSemaphoreGive(g_flash.mutex);
-
-    switch (s) {
-        case InternalStatus::kIdle:
-            return FlashStatus::kIdle;
-        case InternalStatus::kConnecting:
-        case InternalStatus::kSessionUpdating:
-            return FlashStatus::kConnecting;
-        case InternalStatus::kStreaming:
-            return FlashStatus::kStreaming;
-        case InternalStatus::kError:
-            return FlashStatus::kError;
-    }
-    return FlashStatus::kIdle;
-}
-
-bool IsFlashConnected()
-{
-    if (g_flash.mutex == nullptr) {
-        return false;
-    }
-    xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
-    const bool connected = g_flash.ws_connected;
-    xSemaphoreGive(g_flash.mutex);
-    return connected;
-}
-
 bool CopyFlashStateToUi(FlashUiState* state)
 {
     if (state == nullptr || g_flash.mutex == nullptr) {
@@ -2657,33 +2642,6 @@ bool CopyFlashStateToUi(FlashUiState* state)
     g_flash.changed = false;
     xSemaphoreGive(g_flash.mutex);
     return true;
-}
-
-bool IsFlashTranscribing()
-{
-    if (g_flash.mutex == nullptr) {
-        return false;
-    }
-    xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
-    const bool transcribing = g_flash.capture_started && g_flash.ws_connected;
-    xSemaphoreGive(g_flash.mutex);
-    return transcribing;
-}
-
-bool IsFlashSessionActive()
-{
-    if (g_flash.mutex == nullptr) {
-        return false;
-    }
-    xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
-    const bool active =
-        g_flash.ws_client != nullptr || g_flash.status == InternalStatus::kConnecting ||
-        g_flash.status == InternalStatus::kSessionUpdating ||
-        g_flash.status == InternalStatus::kStreaming || g_flash.capture_started ||
-        g_flash.response_in_flight || g_flash.playback_write_active ||
-        g_flash.playback_queued_bytes.load(std::memory_order_acquire) > 0;
-    xSemaphoreGive(g_flash.mutex);
-    return active;
 }
 
 void PollFlashAmpIdle()
@@ -2803,6 +2761,7 @@ void OnFlashButtonReleased(bool submit)
         !was_capturing && !g_flash.ws_connected &&
         g_flash.status == InternalStatus::kConnecting;
     g_flash.capture_started = false;
+    SetFlashCaptureIndicatorLocked(false);
     g_flash.button_pressed = false;
     g_flash.status_since_ms = esp_timer_get_time() / 1000;
     MarkChanged();
@@ -2847,7 +2806,9 @@ void OnFlashButtonReleased(bool submit)
     // release, then send.
     bool should_send = false;
     esp_websocket_client_handle_t client = nullptr;
+#if CONFIG_WQN_FLASH_PROTOCOL_V2
     uint32_t seq = 0;
+#endif
 
     xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
     const bool captured_audio = (g_flash.uplink_seq != g_flash.capture_base_seq);
@@ -2867,7 +2828,9 @@ void OnFlashButtonReleased(bool submit)
         client = g_flash.ws_client;
         g_flash.active_ws_sends.fetch_add(1, std::memory_order_relaxed);
         ++g_flash.uplink_seq;
+#if CONFIG_WQN_FLASH_PROTOCOL_V2
         seq = g_flash.uplink_seq;
+#endif
         g_flash.response_in_flight = true;  // in-flight until response.done/error
         g_flash.response_started = false;   // [phase-fix] no delta for this turn yet
     } else if (was_capturing && captured_audio && prev_in_flight) {
@@ -2937,10 +2900,7 @@ namespace wqn {
 esp_err_t InitFlashSession() { return ESP_OK; }
 esp_err_t StartFlashSession() { return ESP_ERR_NOT_SUPPORTED; }
 esp_err_t StopFlashSession() { return ESP_ERR_NOT_SUPPORTED; }
-FlashStatus GetFlashStatus() { return FlashStatus::kIdle; }
-bool IsFlashConnected() { return false; }
 bool CopyFlashStateToUi(FlashUiState*) { return false; }
-bool IsFlashTranscribing() { return false; }
 void PollFlashAmpIdle() {}
 void OnFlashButtonPressed() {}
 void OnFlashButtonReleased(bool) {}

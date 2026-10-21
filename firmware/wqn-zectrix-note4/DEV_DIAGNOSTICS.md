@@ -1,6 +1,8 @@
 # Dev 诊断菜单规范（DEV_DIAGNOSTICS）
 
-> 状态：已批准的实施规范。本文档是 Dev 菜单的**唯一结构定义**：新增调试信息必须进本文档列出的既有对话框；要加第四行菜单，先改本文档再改代码。
+> 状态：已批准的实施规范。本文档是 Dev 菜单的唯一结构定义：新增调试信息必须进本文档列出的既有详情；要加第七项菜单，先改本文档再改代码。
+
+> 2026-10-18：按用户确认的设置 HTML 重写视觉。Dev 仍是六项，只读边界与同步诊断的唯一动作保持；列表改为五行滚动窗口，详情改为全页，取消常驻底部操作说明。固件改动及验证见 `SETTINGS_UI_REWRITE.md`。本次没有修改持久化事务、配网 owner 或关机协议。
 
 ## 1. 目的与范围
 
@@ -23,34 +25,34 @@
 
 ## 3. 入口结构：一级一行 + 二级六行（固定）
 
-设置页一级在「固件版本」之后、「恢复出厂」之前插入**一行**入口（`ui/page_settings.cpp` 的 `root_titles`/`root_values`）：
+设置页一级在「关于设备」（原「固件版本」项）之后、「恢复出厂」之前插入**一行**入口（`ui/page_settings.cpp`）：
 
 | 一级行 | 标题 | 值列 | 动作 |
 |---|---|---|---|
-| +1 | 开发者选项 | `只读诊断` | 进入二级列表（`SettingsView::kDev`）；其中「同步诊断」有一个动作，见 §4.2 |
+| +1 | 开发者选项 | `诊断与记录` | 进入二级列表（`SettingsView::kDev`）；其中「同步诊断」有一个动作，见 §4.2 |
 
-确认该行进入二级列表（`dev_titles`/`dev_values`，六行 = 面板 6 行窗口，不需要滚动）：
+确认该行进入二级列表（六项、五行可见，焦点带动窗口滚动）：
 
-| 二级行 | 标题 | 值列 | 对话框 | 内容 |
+| 二级行 | 标题 | 主要数据 | 对话框 | 内容 |
 |---|---|---|---|---|
-| 1 | Dev 信息 | git hash 短码 | `kDevInfo` | 构建标识、复位原因、运行时长、堆/PSRAM（§4.1） |
+| 1 | 构建与运行信息 | 详情中显示 | `kDevInfo` | 构建标识、复位原因、运行时长、堆/PSRAM（§4.1） |
 | 2 | 同步诊断 | 上轮结果 | `kDevSync` | 同步计数、三内容域与三 outbox 的 phase/重试/last_error（§4.2） |
 | 3 | 错误记录 | N 条 | `kDevErrors` | `error_recorder` 环形缓冲最近 6 条（§4.3） |
 | 4 | 电量原始 | battery_mv | `kBattery` | adc_raw / adc_mv / battery_mv / percent / 充电标志 / 拟合公式（§4.4，原一级「电量详情」对话框） |
 | 5 | 存储详情 | NVS used/total | `kStorage` | Flash、内容同步 revision、NVS 条目、PSRAM（§4.5，原一级「存储详情」行） |
 | 6 | 电源睡眠诊断 | N 条 | `kSleepDiag` | `sleep_diagnostics` RTC 环最近 6 条（§4.6） |
 
-一级「电量」行保留用户可见的百分比，确认只写 notice（`电量 87%`，照「固件版本」行的做法）；原始数字移到二级。
+一级「电量」行保留用户可见的百分比，确认打开独立 `kBatterySummary`，只展示电量与充电状态；原始数字与公式仍在二级 `kBattery`。一级「关于设备」打开 `kAbout`，品牌为 W 图标 + `rongNoteBook`、型号 Note4，版本来自真实构建。
 
 **导航**：上下移动 `dev_selected`（环绕），确认打开对应的对话框，**长按确认返回一级**（一级长按确认仍是回首页）。对话框除 §4.2 外均为只读。
 
 **为什么是二级而不是平铺**：一级已有 12 行（「AI 回复时翻页」加入后），而 dev 信息还在增长（电源睡眠诊断是第六项），平铺会把「恢复出厂」「关机」推得更远；二级把 dev 信息收敛到一屏，且门控只需挡住一行入口。
 
-**实现形态**：二级是 `SettingsAppState.view` 切换的**同屏行列表**，不是新 `UiScreen` —— 避免改动顶级导航环、深睡屏幕恢复白名单、`DeepSleepUiPolicyForScreen` 以及 `ui_runtime.cpp` 里各处 `screen == kSettings` 判定。切换用 `kConfig` 局部刷：标题栏（y<32）不在 `kSettingsContentRect` 内，因此标题保持「设置」，方向感由底部提示行「上下选择，确认查看，长按确认返回设置」承担（要改标题就得用 `kCommit` 整屏全刷）。
+**实现形态**：二级仍是 `SettingsAppState.view` 切换的同屏行列表，不新增 `UiScreen`，不改变顶级导航环、深睡屏幕恢复白名单或设置页睡眠策略。`kConfig` / `kSelection` 先合成完整 400×300 帧，再走原 display owner 的稳定区域刷新策略；`kSettingsContentRect` 现覆盖全页，标题随视图更新，方向由页头「设置 / 开发者」表达。面板实际脏区与波形仍由既有 display service 决定，完整帧合成不等于每次强制全刷。
 
-**扩展规则**：新的调试信息一律加进这六个对话框之一（数据面进 `SettingsDiagnosticsSnapshot` + `UpdateSettingsDiagnostics`，登记 `FrameSignature`）。要加第七行，必须先修订本文档并说明为何六行装不下（超过 6 行需启用现成的 selection-following 窗口逻辑）。
+**扩展规则**：新的调试信息一律加进这六个详情之一（数据面进 `SettingsDiagnosticsSnapshot` + `UpdateSettingsDiagnostics`，登记 `FrameSignature`）。要加第七项，必须先修订本文档并说明现有六类无法容纳的原因；列表已有五行滚动窗口。
 
-五个对话框（`kBattery/kStorage/kDevInfo/kDevErrors/kSleepDiag`）沿用 **只读模式**（`ui_input.cpp` 的对应输入块）：确认（短按或长按）关闭，Up/Down 无操作，无滚动，快照在打开时取一次。`kDevSync` 单独一块：短按/长按确认同样关闭，另加**双击确认 = 重下词库包**（§4.2）。驻留设置页时由既有的 60s 状态重载（`device_ui.cpp` `kStatusRefreshDelayTicks` → `LoadUiState`）被动更新。
+五个详情（`kBattery/kStorage/kDevInfo/kDevErrors/kSleepDiag`）沿用只读模式：确认（短按或长按）关闭，Up/Down 无操作，无滚动，快照在打开时取一次。`kDevSync` 单独处理：长按确认关闭；单击等待驱动的 300ms 双击窗口后返回，双击确认请求重下词库包。超时在 UI 输入队列排空后处理，保留生产时间内已排队的第二击。该动作同样受 Prepare/reserve/apply 持久化窗口保护。驻留设置页仍由既有 60s 状态重载被动更新，重载不重置正在浏览的单选候选。
 
 **新增可见状态必须登记**：`view` 与 `dev_selected` 已进 `FrameSignature`；以后再加二级状态同理，否则 dedup 会吞掉重绘。
 
@@ -75,13 +77,13 @@ phase 标签 helper 放 `ui/diagnostics.cpp`（照 `OnlineSyncStatusLabel` 风�
 **本对话框是全菜单唯一能执行动作的对话框：双击确认 = 重下词库包。**
 
 - 动作内容（`ui_input.cpp` `RequestWordPackRedownload`，三个既有调用，无测试专用分支）：
-  1. `wqn::ResetWordPackStorageCache()` 删本地 manifest + 包文件 → `!had_local_manifest`；
+  1. `wqn::InvalidateWordPackManifest()` 只使 manifest 失效 → `!had_local_manifest`；包文件由 bulk lane 处理，不在 UI 线程全量清理；
   2. `wqn::services::RequestContentRefresh(kWordPacks)` 置内容相 pending 并叫醒 sync task；
   3. `QueueWordReviewRefresh()` claim 刷新票据并排 bulk lane 的 `kPackSync`——与词页进屏时同一个调用。
 - **为什么需要它**：健康设备上没有任何生产路径能按需造出多 MB 包写负载。词页只在 `cloud_sync_requested`（本地无 manifest / 包错误 / 无词可学）为真时才同步；`RequestSyncNow` 走 full sync 且只在服务端 revision 更新时才真正收敛；`RequestContentRefresh` 也只能在 claim 层绕过 revision 门，manifest 不变时仍走「词库无变更」分支、不下载包体。C.2 HIL 判据（测量 foreground cursor 写在包写进行中的 `queue_wait_ms`）因此无法运行。
 - **为什么是双击而非长按**：长按确认在这套设置树里是「离开/返回」的通用手势（一级回首页、二级回一级），拿它触发一个会丢弃已下载内容的动作既违背惯例又易误触。双击确认在设置树里空闲（仅 AI 页用于状态栏编辑），且是刻意手势，适合破坏性动作。
 - **操作序列**：开发者选项 → 同步诊断 → 双击确认 → notice「已重下词库包，去词页看」→ 去词页开始答题，包在后台全量重下。
-- 成功后 `ResetWordPackStorageCache` 会打 `cleared incompatible word pack cache` 警告，动作本身打 `dev: word pack redownload requested`，两者都是 HIL 的 grep 锚点。
+- 动作打 `dev: word pack redownload requested`，包文件的清理由后续 bulk lane 负责；HIL 应区分请求已提交与实际下载 / 安装完成。
 - 只影响词包内容相；同步轮次的其它部分不变。
 
 ### 4.3 错误记录（`kDevErrors`，≤6 行）
@@ -145,14 +147,14 @@ size_t CopyRecentErrors(ErrorRecord* out, size_t cap);
 1. **所有权**：不新增任务、队列、信号量；不动态分配。跨任务发布的数据一律定长 char 数组 POD（照 `SyncSnapshot` / `ConnectivitySnapshot.active_ssid` 先例）；`std::string` 仅限 UI 任务私有的 `SettingsAppState` / 快照结构（照 `SettingsDiagnosticsSnapshot` 既有 5 个 string 字段先例）。
 2. **生命周期**：错误环与全部模块状态为静态存储期，无 init/teardown 顺序依赖；快照在对话框打开时按值拷贝，UI 状态不持有任何指向服务层对象的指针/引用。
 3. **并发**：短临界区用 `portMUX_TYPE` 自旋锁（照 `GetSyncSnapshot`）；**不用**阻塞互斥锁；载荷先备好、锁内只拷贝（AGENTS.md §4.7）。
-4. **墨水屏**：只用 `DrawSettingsDialogBox` / `DrawClippedText` / `DrawWrappedText` / `DrawCenteredText` / `DrawProgressBar` 与 `ESP_RETURN_ON_ERROR` 包装；刷新走既有 kConfig/kSelection 语义，**不新增 RefreshSchedule 值**；对话框内可见的新字段必须登记进 `FrameSignature`（`ui/ui_refresh.cpp` settings 段），否则 60s 驻留重载后 dedup 会吞掉重绘。
+4. **墨水屏**：使用 `page_settings.cpp` 的原生字号文字、细线列表和参数绘制辅助函数，不恢复旧中央弹框与底部操作栏；CPU 绘制经 display service，刷新保留既有 kConfig/kSelection 语义，不新增 RefreshSchedule。可见新字段必须登记进 `FrameSignature`（`ui/ui_refresh.cpp` settings 段），包括有效性、容量变化、勾选值与词库可见窗口，否则重载后 dedup 会吞帧。
 5. **构建门禁**：新 .cpp 登记 SRCS；每次构建必须 0 警告 + `wqn_architecture_check`（M8）通过；条件编译用裸 `#if CONFIG_WQN_...`（仓库主流风格），整文件门控照 `audio_selftest.cpp` 先例。
 6. **行索引单源**：`kSettingsItemCount`、`kDevItemCount` 与各行索引常量（`kSettingsRow*`、`kDevRow*`）唯一存在于 `ui_model.h`（namespace `wqn`），`ui_internal.h` 引用之；任何代码不得再硬编码行号字面量（`ui_model.cpp` 的 `ClampUiSelection`/`HandleUiInput` 历史上硬编码 9 是本规范的由来）。`ClampUiSelection` 必须钳制 `dev_selected`，并在 flag 关闭时强制 `view = kRoot`。
 
 ## 7. 验证流程
 
-1. **双配置构建**：default n（发布等价，Dev 行不可见）与 sdkconfig 置 y（三行可用）都要 0 警告 + M8 通过；对比 bin 大小并记录。
-2. **上机冒烟**（需硬件）：逐个进入三个对话框并确认关闭；制造一次可观测失败（如断开 WiFi 触发同步失败）验证错误记录；驻留设置页 ≥60s 验证重载后无吞帧、无残影。
+1. **双配置构建**：default n（发布等价，Dev 行不可见）与 sdkconfig 置 y（六项可达）都要 0 警告 + M8 通过；对比 bin 大小并记录。
+2. **上机冒烟**（需硬件）：逐个进入六个详情并确认关闭；制造一次可观测失败验证错误记录；驻留设置页 ≥60s 验证候选不跳动、数据重绘、无吞帧或残影。
 3. **发布演练**：按 `RELEASE_CHECKLIST.md` 走一遍 §1 的 flag 校验步。
 
 ## 8. 已知局限（有意为之）
@@ -161,3 +163,5 @@ size_t CopyRecentErrors(ErrorRecord* out, size_t cap);
 - 错误环不持久化：重启即失（崩溃类信息由「上次复位原因」兜底）；要做持久化先修订本文档并评估 NVS 写入频率。
 - 电源睡眠诊断屏上只显示最近 6 条，完整 64 条要靠 USB 日志（见 §4.6）；环本身跨深睡保留，但 `USB_UART_CHIP_RESET` 会清空 RTC slow memory。
 - `WQN_FIRMWARE_VERSION` 保持手写、**不掺 hash**：它进同步 `image_id`（`sync_service.cpp`）与刷新签名（`ui/ui_refresh.cpp`），每次提交变化会污染这两处。
+
+2026-10-18 真机布局反馈修正：开发者列表随设置列表统一为 10px 外边距、原生 20px 主文字、36px 行距，五行滚动与六类诊断保持。状态栏使用全宽 y=27 的公共坐标，图标 y=6，右边距 10px；未新增底部操作说明栏。详情中的真实数据与输入语义保持。

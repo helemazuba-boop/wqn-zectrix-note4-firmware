@@ -114,6 +114,9 @@ void GetLatestSyncEvent(SyncEvent* event);
 // its task-notification thunk during startup.
 void SetSyncEventSink(SyncEventSink sink);
 
+// Validate/recover the durable journal before any business task starts. This
+// starts no network/task work; failure belongs to the boot storage recovery gate.
+esp_err_t PrepareSyncServiceAtBoot();
 esp_err_t StartSyncService();
 // Seeds the sync scheduler's durable boot admission cache. It never starts
 // WiFi; a dispatched sync round owns the corresponding ConnectivityDemand.

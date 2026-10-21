@@ -44,6 +44,31 @@ namespace {
 
 constexpr char kTag[] = "sync_service";
 
+// The token query is also exported in builds without WiFi.
+bool LoadUsableToken(std::string* token)
+{
+    if (token == nullptr) {
+        return false;
+    }
+
+    token->clear();
+    const esp_err_t result = wqn::LoadAccessToken(token);
+    if (result != ESP_OK) {
+        ESP_LOGW(kTag, "access token reload failed: %s", esp_err_to_name(result));
+        return false;
+    }
+    if (token->empty()) {
+        return false;
+    }
+    if (!wqn::IsValidAccessToken(*token)) {
+        ESP_LOGW(kTag, "stored token invalid during sync setup; clearing");
+        ESP_ERROR_CHECK_WITHOUT_ABORT(wqn::ClearAccessToken());
+        token->clear();
+        return false;
+    }
+    return true;
+}
+
 #if CONFIG_WQN_WIFI_STA_ENABLE
 wqn::services::SyncSnapshot g_sync_snapshot = {};
 portMUX_TYPE g_sync_snapshot_lock = portMUX_INITIALIZER_UNLOCKED;
@@ -63,7 +88,6 @@ constexpr size_t kFullSyncRetryLadderSize =
 // RTC retention keeps the escalation alive across deep-sleep wake cycles;
 // only the sync task touches it (schedule/retry decisions are single-tasked).
 RTC_DATA_ATTR uint8_t g_full_sync_retry_attempts = 0;
-bool LoadUsableToken(std::string* token);
 TaskHandle_t g_sync_service_task = nullptr;
 enum FullSyncReason : uint32_t {
     kFullSyncManual = 1u << 0,
@@ -2098,30 +2122,6 @@ void PublishSyncEvent(
     }
 }
 
-bool LoadUsableToken(std::string* token)
-{
-    if (token == nullptr) {
-        return false;
-    }
-
-    token->clear();
-    const esp_err_t result = wqn::LoadAccessToken(token);
-    if (result != ESP_OK) {
-        ESP_LOGW(kTag, "access token reload failed: %s", esp_err_to_name(result));
-        return false;
-    }
-    if (token->empty()) {
-        return false;
-    }
-    if (!wqn::IsValidAccessToken(*token)) {
-        ESP_LOGW(kTag, "stored token invalid during sync setup; clearing");
-        ESP_ERROR_CHECK_WITHOUT_ABORT(wqn::ClearAccessToken());
-        token->clear();
-        return false;
-    }
-    return true;
-}
-
 #if CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE
 esp_err_t BootstrapControlV3(const std::string& token)
 {
@@ -3661,6 +3661,22 @@ wqn::protocol::v3::RequestMetadata MakeDeviceRequestMetadata()
 #endif
 }
 
+esp_err_t PrepareSyncServiceAtBoot()
+{
+#if CONFIG_WQN_WIFI_STA_ENABLE
+    if (g_sync_journal_mutex == nullptr) {
+        g_sync_journal_mutex =
+            xSemaphoreCreateMutexStatic(&g_sync_journal_mutex_storage);
+        if (g_sync_journal_mutex == nullptr) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    return EnsureSyncJournalLoaded();
+#else
+    return ESP_OK;
+#endif
+}
+
 #if CONFIG_WQN_WIFI_STA_ENABLE
 
 bool EvaluateSyncWorkAtBoot()
@@ -3711,17 +3727,10 @@ bool EvaluateSyncWorkAtBoot()
 
 esp_err_t StartSyncService()
 {
+    ESP_RETURN_ON_ERROR(PrepareSyncServiceAtBoot(), kTag, "prepare sync journal");
     if (!g_boot_policy_evaluated.load(std::memory_order_acquire)) {
         (void)EvaluateSyncWorkAtBoot();
     }
-    if (g_sync_journal_mutex == nullptr) {
-        g_sync_journal_mutex =
-            xSemaphoreCreateMutexStatic(&g_sync_journal_mutex_storage);
-        if (g_sync_journal_mutex == nullptr) {
-            return ESP_ERR_NO_MEM;
-        }
-    }
-    ESP_RETURN_ON_ERROR(EnsureSyncJournalLoaded(), kTag, "load sync journal");
     if (!wqn::runtime::GetWakeContext().deep_sleep_resume &&
         BootFullSyncDue()) {
         g_full_sync_reasons.fetch_or(kFullSyncBoot, std::memory_order_release);

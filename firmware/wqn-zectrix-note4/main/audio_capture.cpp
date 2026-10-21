@@ -10,6 +10,7 @@
 #include "esp_check.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "runtime/memory_diagnostics.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -57,6 +58,10 @@ struct AudioServiceState {
     int16_t* capture_buffer = nullptr;
     wqn::AudioCaptureChunk chunk;
     wqn::services::AudioSession session;
+    // Copy bound at begin, protected by mutex; EndAudioActivity only mutates
+    // the worker-owned session above. Stop must never read that mutable token.
+    wqn::services::AudioSession indicator_session;
+    bool recording_indicator_on = false;
     wqn::AudioCaptureTapFn tap_cb = nullptr;
     void* tap_ctx = nullptr;
 };
@@ -262,8 +267,21 @@ esp_err_t InitI2s(wqn::services::AudioChannelHandle* rx_handle)
     return ESP_OK;
 }
 
+// All callers hold g_audio.mutex. Stop wins over a late warm-up completion.
+void SetCaptureIndicatorLocked(bool ready)
+{
+    const bool enabled = ready && g_audio.running && !g_audio.stop_requested;
+    if (!g_audio.indicator_session || enabled == g_audio.recording_indicator_on) return;
+    const esp_err_t result = wqn::services::SetAudioRecordingIndicator(g_audio.indicator_session, enabled);
+    if (result == ESP_OK) g_audio.recording_indicator_on = enabled;
+    else ESP_LOGW(kTag, "recording indicator: %s", esp_err_to_name(result));
+}
+
 esp_err_t CleanupCaptureHardware(bool keep_power)
 {
+    xSemaphoreTake(g_audio.mutex, portMAX_DELAY);
+    SetCaptureIndicatorLocked(false);
+    xSemaphoreGive(g_audio.mutex);
     esp_err_t result = ESP_OK;
     ESP_LOGI(kTag,
              "capture cleanup begin: keep_power=%d session=%lu bus=%p rx=%p rx_enabled=%d",
@@ -284,8 +302,7 @@ esp_err_t CleanupCaptureHardware(bool keep_power)
     // I2S_NUM_0 RX slot is released for Flash's duplex channels. A disabled
     // channel still holds the port slot (i2s_new_channel returns
     // ESP_ERR_NOT_FOUND/"no available channel"), which is what blocked Flash
-    // after a STD recording. Mirrors audio_player.cpp StopAudioPlayback (which
-    // deletes g_player.tx). InitI2s recreates the channel on next start.
+    // after a STD recording. InitI2s recreates the channel on next start.
     if (g_audio.rx != nullptr) {
         const esp_err_t delete_result =
             wqn::services::DeleteAudioChannel(g_audio.session, &g_audio.rx);
@@ -444,6 +461,7 @@ void CaptureSession()
         return;
     }
     xSemaphoreTake(g_audio.mutex, portMAX_DELAY);
+    SetCaptureIndicatorLocked(true);
     g_audio.initialized = true;
     xSemaphoreGive(g_audio.mutex);
     ESP_LOGI(kTag,
@@ -574,6 +592,8 @@ void CaptureTask(void*)
         // statically-stored stack/TCB are reused with no teardown race and no
         // heap churn between turns.
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        const wqn::runtime::MemoryDiagnosticScope memory_scope(
+            wqn::runtime::MemoryStage::kAudioBegin, wqn::runtime::MemoryStage::kAudioEnd);
         CaptureSession();
     }
 }
@@ -650,6 +670,8 @@ esp_err_t StartAudioCapture()
         xSemaphoreGive(g_audio.mutex);
         return session_result;
     }
+    g_audio.indicator_session = g_audio.session;
+    g_audio.recording_indicator_on = false;
     g_audio.running = true;
     g_audio.stop_requested = false;
     g_audio.initialized = false;
@@ -683,6 +705,7 @@ esp_err_t StartAudioCapture()
     xSemaphoreTake(g_audio.mutex, portMAX_DELAY);
     if (g_audio.running) {
         g_audio.stop_requested = true;
+        SetCaptureIndicatorLocked(false);
     }
     xSemaphoreGive(g_audio.mutex);
     ESP_LOGE(kTag, "audio capture init handshake timed out");
@@ -713,6 +736,7 @@ esp_err_t StopAudioCapture(AudioCaptureChunk* chunk)
         return has_samples ? ESP_OK : ESP_ERR_INVALID_STATE;
     }
     g_audio.stop_requested = true;
+    SetCaptureIndicatorLocked(false);
     xSemaphoreGive(g_audio.mutex);
 
     for (int i = 0; i < 80; ++i) {

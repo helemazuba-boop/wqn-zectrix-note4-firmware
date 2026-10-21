@@ -95,7 +95,6 @@ bool TryBeginSleepQuiesce(uint32_t generation);
 bool BeginEmergencySleepQuiesce(uint32_t generation);
 void CancelSleepQuiesce(uint32_t generation);
 bool IsSleepQuiescing();
-uint32_t CurrentSleepGeneration();
 bool HasActiveSleepBlockers();
 uint32_t ActiveSleepBlockerCount(SleepBlocker blocker);
 void LogLongHeldSleepLeases(int64_t now_us, int64_t warning_after_us);

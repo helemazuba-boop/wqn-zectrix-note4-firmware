@@ -17,11 +17,6 @@ std::time_t CurrentUnixTime()
     return now;
 }
 
-bool SystemClockIsReasonable()
-{
-    return CurrentUnixTime() >= kMinReasonableUnixTime;
-}
-
 void SeedClockFromBuildTimeIfNeeded()
 {
     (void)wqn::power::timekeep::SeedSystemTimeFromBuildTimeIfNeeded();
@@ -114,11 +109,18 @@ int PomodoroStartField()
 
 std::string ChooseHomePrimaryTimeLine(const wqn::TimeAppState& time_app)
 {
-    const std::string active_timer = wqn::TimeAppPrimaryLine(time_app);
-    if (!active_timer.empty()) {
-        return active_timer;
+    if (!wqn::TimeAppHasActiveTimer(time_app)) return "";
+    if (time_app.status == wqn::TimerStatus::kPaused) return "已暂停";
+    if (time_app.status == wqn::TimerStatus::kAlerting) return "计时结束";
+    if (time_app.phase_ends_unix_seconds >= kMinReasonableUnixTime) {
+        const std::time_t end = time_app.phase_ends_unix_seconds;
+        std::tm info = {};
+        localtime_r(&end, &info);
+        char label[24] = {};
+        std::strftime(label, sizeof(label), "%H:%M 结束", &info);
+        return label;
     }
-    return CurrentClockLabel();
+    return "计时进行中";
 }
 
 void UpdateHomePrimaryTimeLine(wqn::UiState* state)
@@ -129,16 +131,13 @@ void UpdateHomePrimaryTimeLine(wqn::UiState* state)
     state->home.primary_time_line = ChooseHomePrimaryTimeLine(state->time_app);
 }
 
-bool ShouldRefreshTimeTick(const wqn::UiState& state)
-{
-    if (state.screen != wqn::UiScreen::kHome && state.screen != wqn::UiScreen::kTime) {
-        return false;
-    }
-    return wqn::TimeAppHasActiveTimer(state.time_app);
-}
-
 bool ScreenUsesClockMinute(const wqn::UiState& state)
 {
+    // The application bar owns the composed page until it closes. A cosmetic
+    // minute tick would become a full-frame partial; switching to a local
+    // window after that partial would instead hit the driver's full-refresh
+    // wedge guard. Closing the bar redraws the current clock/date normally.
+    if (state.navigation.visible) return false;
     if (state.screen == wqn::UiScreen::kHome) {
         // The home primary line becomes a static timer-status sentence while
         // a timer runs, but the status-bar wall clock must keep its normal

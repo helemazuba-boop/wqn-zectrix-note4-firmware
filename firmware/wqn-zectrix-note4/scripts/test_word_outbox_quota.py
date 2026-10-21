@@ -37,10 +37,10 @@ def main():
         '@@VALID_MODE@@': section(source, 'bool ValidMode(', '\nbool ValidPurpose('),
         '@@READ@@': section(source, 'uint32_t RecordCrc(',
                            '\nconstexpr size_t kOutboxMaxRecords =' if quota else
-                           '\n// [measure] §五之十 §6. `open_ms`'),
+                           '\n// [word-batch] One open/write/flush/sync/close'),
         '@@QUOTA@@': ('#define FIXTURE_QUOTA 1\n' + section(
             source, 'constexpr size_t kOutboxMaxRecords =',
-            '\n// [measure] §五之十 §6. `open_ms`') if quota else
+            '\n// [word-batch] One open/write/flush/sync/close') if quota else
             '#define FIXTURE_QUOTA 0\nconstexpr size_t kOutboxMaxRecords = 2064;\n'
             'constexpr size_t kOutboxMaxBytes = kOutboxMaxRecords * sizeof(OutboxRecord);\n'),
         '@@APPEND_TO@@': section(source,

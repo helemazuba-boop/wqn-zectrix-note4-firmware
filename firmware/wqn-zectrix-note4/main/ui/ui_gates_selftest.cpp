@@ -179,6 +179,22 @@ bool CheckWordRowScopeGateDuringPersist()
             Check(name, "user told to wait", state.note_app.message == "正在保存，请稍后"));
 }
 
+// Drive the real menu path without entering a target page unless its gate
+// permits it. Raw release consumes the opening hold before a fresh click.
+void ConfirmMenuTarget(wqn::UiState* state, wqn::UiScreen target)
+{
+    using wqn::ButtonEventType;
+    using wqn::ButtonId;
+    device_ui_internal::ApplyButtonEvent(Press(ButtonId::kUp, ButtonEventType::kLongPress), 1000, state);
+    device_ui_internal::ApplyButtonEvent(Press(ButtonId::kUp, ButtonEventType::kLongRelease), 1100, state);
+    device_ui_internal::ApplyButtonEvent(Press(ButtonId::kUp, ButtonEventType::kRelease), 1101, state);
+    for (size_t i = 0; i < wqn::kNavigationPages.size() &&
+         wqn::kNavigationPages[state->navigation.selected].screen != target; ++i) {
+        device_ui_internal::ApplyButtonEvent(Press(ButtonId::kDownPower, ButtonEventType::kShortPress), 1200 + i * 100, state);
+    }
+    device_ui_internal::ApplyButtonEvent(Press(ButtonId::kConfirm, ButtonEventType::kShortPress), 2200, state);
+}
+
 // AGENTS 4.2: top navigation away from a scoped word page. The guard lives
 // before the screen switch, so a refusal leaves the screen untouched.
 bool CheckTopNavigationGateDuringWordPersist()
@@ -188,8 +204,7 @@ bool CheckTopNavigationGateDuringWordPersist()
     state.word_app.scoped_deck_id = "deck-1";
     state.word_app.session.commit_state = wqn::WordObservationCommitState::kPersisting;
 
-    device_ui_internal::ApplyButtonEvent(
-        Press(wqn::ButtonId::kUp, wqn::ButtonEventType::kLongPress), 0, &state);
+    ConfirmMenuTarget(&state, wqn::UiScreen::kHome);
 
     const char* name = "top navigation refused while a scoped word commit is persisting";
     return Case(
@@ -199,8 +214,8 @@ bool CheckTopNavigationGateDuringWordPersist()
             Check(name, "user told to wait", !state.word_app.message.empty()));
 }
 
-// Same contract for a problem verdict reached from the note screen: a long
-// UP/DOWN maps straight to top navigation and would bypass the in-layer gate.
+// Same contract for a problem verdict reached from the note screen: menu
+// confirmation must retain the gate even when its destination skips pages.
 bool CheckTopNavigationGateDuringProblemPersist()
 {
     wqn::UiState& state = FreshState();
@@ -208,8 +223,7 @@ bool CheckTopNavigationGateDuringProblemPersist()
     state.problem_app.active = true;
     state.problem_app.commit_state = wqn::ProblemVerdictCommitState::kPersisting;
 
-    device_ui_internal::ApplyButtonEvent(
-        Press(wqn::ButtonId::kDownPower, wqn::ButtonEventType::kLongPress), 0, &state);
+    ConfirmMenuTarget(&state, wqn::UiScreen::kHome);
 
     const char* name = "top navigation refused while a problem verdict is persisting";
     return Case(

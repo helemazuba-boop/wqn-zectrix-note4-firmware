@@ -26,6 +26,10 @@ enum class OpenCodeRejectReason : uint8_t {
 };
 
 esp_err_t InitOpenCodeSession();
+// Bounded query on the existing worker; refuses busy work, never detaches it.
+esp_err_t RequestOpenCodeHomeStatus();
+esp_err_t OpenCodeHomeSession(const std::string& session_id, const std::string& title,
+                              OpenCodeRejectReason* reason = nullptr);
 // `reason` (optional) is written only when the call fails, so a caller that does
 // not care can pass nullptr. When a stream is attached, the list request is not
 // refused at all: it detaches from that stream -- leaving the run going in the
@@ -64,7 +68,7 @@ void InterruptOpenCodeRun();
 // (GetAiScrollBounds) and are the only correct bounds: on that page 0 is the
 // anchor and NEGATIVE offsets scroll further down, so the offset must not be
 // floored at 0 here. See the definition in opencode_session.cpp.
-void ScrollOpenCodeResponse(int direction, int32_t min_scroll, int32_t max_scroll);
+bool ScrollOpenCodeResponse(int direction, int32_t min_scroll, int32_t max_scroll, int step_lines);
 // [follow] Absolute, clamped write of the Agent viewport offset. ScrollOpenCode-
 // Response moves relative to the offset the worker last saw; a turn jump and the
 // per-tick auto-follow both compute an absolute target from the renderer's own

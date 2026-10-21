@@ -9,9 +9,12 @@
 #include "device_protocol/note_study.h"
 #include "esp_err.h"
 #include "note_pack.h"
+#include "note_list_model.h"
 #include "note_store.h"
 #include "storage.h"
 #include "wqn_api.h"
+
+namespace device_ui_internal { struct AiTextLayout; }
 
 namespace wqn {
 
@@ -96,10 +99,9 @@ struct NoteAppState {
     size_t notebook_window_start = 0;
     size_t note_list_window_start = 0;
     uint32_t note_scroll_offset_lines = 0;
-    // Total wrapped body lines for the open note (computed at load with the same
-    // wrap width as RenderNoteBody). Bounds Down-scroll so over-scrolling past the
-    // end cannot inflate the offset and leave Up-scroll with nothing to repaint.
-    uint32_t note_body_total_lines = 0;
+    // Produced once at body load, then shared immutably with the EPD snapshot.
+    // The same rows determine counting, bounds and native rendering.
+    std::shared_ptr<const device_ui_internal::AiTextLayout> body_layout;
 
     NoteSessionState session;
     NoteOutboxState outbox;
@@ -184,13 +186,17 @@ struct NoteAppState {
     std::string message;
 };
 
+enum class NoteLibraryRowKind : uint8_t { kNotebook, kProblemSet, kWordDeck };
+
 struct NoteNotebookRow {
+    NoteLibraryRowKind kind = NoteLibraryRowKind::kNotebook;
     std::string title;
     size_t note_count = 0;
     bool has_pack = false;
 };
 
 struct NoteTitleRow {
+    bool content_available = false;
     std::string title;
     // Empty when never viewed; otherwise the pinned last-viewed ISO timestamp.
     std::string last_opened_at;
@@ -216,10 +222,10 @@ struct NoteAppSnapshot {
     std::vector<NoteNotebookRow> notebooks;
     std::string notebook_title;
     std::vector<NoteTitleRow> titles;
+    bool titles_have_more = false;
     std::string note_title;
-    std::string note_body;
-    // Identity of the currently-open note; the render layer keys its wrapped-line
-    // cache on this so scrolling does not re-wrap the body every frame.
+    std::shared_ptr<const device_ui_internal::AiTextLayout> body_layout;
+    // Content identity remains separate from the immutable text-only layout.
     std::string note_id;
     // Image layer: count enables the body entry line; the payload pointer is
     // only set when ready and matching note_image_id.
@@ -233,6 +239,8 @@ struct NoteAppSnapshot {
     // loading page and the body "正在同步内容" page.
     int8_t transfer_progress_bucket = -1;
     std::string status_line;
+    // Actual feedback only; normal navigation hints and boundary no-ops stay hidden.
+    std::string notice;
     std::string hint;
 };
 
@@ -333,6 +341,7 @@ bool UpdateNoteTransferProgress(
 bool NoteImageLoadingGraceActive(const NoteAppState& state, int64_t now_us);
 NoteAppSnapshot BuildNoteAppSnapshot(const NoteAppState& state);
 std::string NoteAppStatusLine(const NoteAppState& state);
+std::string NoteAppNotice(const NoteAppState& state);
 std::string NoteAppSignature(const NoteAppState& state);
 bool RunNotePageStateSelfTest();
 

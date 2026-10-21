@@ -140,63 +140,14 @@ const char* ScreenName(wqn::UiScreen screen)
     return "WQN";
 }
 
-// Inverse of NextTopScreen: the page you would have come FROM by pressing
-// "next". These two must stay exact inverses -- when they agree, long-press Up
-// and long-press Down do the same thing and half the ring becomes unreachable.
-// Derivation after kOpenCode was demoted into the AI page: the forward ring is
-// Ai -> Settings -> Home -> Time -> Word -> Note -> Todo -> Ai, so the reverse
-// ring is that same list walked backwards.
 wqn::UiScreen PreviousTopScreen(wqn::UiScreen screen)
 {
-    switch (screen) {
-        case wqn::UiScreen::kAi:
-            return wqn::UiScreen::kTodo;
-        case wqn::UiScreen::kSettings:
-            return wqn::UiScreen::kAi;
-        case wqn::UiScreen::kHome:
-            return wqn::UiScreen::kSettings;
-        case wqn::UiScreen::kTime:
-            return wqn::UiScreen::kHome;
-        case wqn::UiScreen::kWord:
-            return wqn::UiScreen::kTime;
-        case wqn::UiScreen::kNote:
-            return wqn::UiScreen::kWord;
-        case wqn::UiScreen::kTodo:
-            return wqn::UiScreen::kNote;
-        case wqn::UiScreen::kOpenCode:
-            // [agent] Reserved, unreachable. Kept so the default-less switch
-            // stays exhaustive; IsRestorableScreen rejects ID 14.
-            return wqn::UiScreen::kAi;
-        case wqn::UiScreen::kProvisioning:
-            return wqn::UiScreen::kHome;
-    }
-    return wqn::UiScreen::kHome;
+    return wqn::AdjacentNavigationPage(screen, -1);
 }
 
 wqn::UiScreen NextTopScreen(wqn::UiScreen screen)
 {
-    switch (screen) {
-        case wqn::UiScreen::kAi:
-            return wqn::UiScreen::kSettings;
-        case wqn::UiScreen::kSettings:
-            return wqn::UiScreen::kHome;
-        case wqn::UiScreen::kHome:
-            return wqn::UiScreen::kTime;
-        case wqn::UiScreen::kTime:
-            return wqn::UiScreen::kWord;
-        case wqn::UiScreen::kWord:
-            return wqn::UiScreen::kNote;
-        case wqn::UiScreen::kNote:
-            return wqn::UiScreen::kTodo;
-        case wqn::UiScreen::kTodo:
-            return wqn::UiScreen::kAi;
-        case wqn::UiScreen::kOpenCode:
-            // [agent] Reserved, unreachable. The ring is Ai -> Settings.
-            return wqn::UiScreen::kHome;
-        case wqn::UiScreen::kProvisioning:
-            return wqn::UiScreen::kHome;
-    }
-    return wqn::UiScreen::kHome;
+    return wqn::AdjacentNavigationPage(screen, 1);
 }
 
 void AddLine(wqn::UiFrame* frame, wqn::UiTextStyle style, const std::string& text)
@@ -236,8 +187,8 @@ void RenderTodo(const wqn::UiState& state, wqn::UiFrame* frame)
     }
 
     const size_t selected = std::min(todo.selected, todo.todos.size() - 1);
-    const size_t window_start = selected > 3 ? selected - 3 : 0;
-    const size_t window_end = std::min(todo.todos.size(), window_start + static_cast<size_t>(8));
+    const size_t window_start = wqn::ClampTodoListWindow(todo.window_start, selected, todo.todos.size());
+    const size_t window_end = std::min(todo.todos.size(), window_start + wqn::kTodoListVisibleRows);
     for (size_t i = window_start; i < window_end; ++i) {
         const wqn::WqnTodoItem& item = todo.todos[i];
         std::string line = item.title.empty() ? "Todo" : item.title;
@@ -253,20 +204,6 @@ void RenderTodo(const wqn::UiState& state, wqn::UiFrame* frame)
             is_selected ? wqn::UiTextStyle::kSelected : wqn::UiTextStyle::kBody,
             std::string(is_selected ? "> " : "  ") + Truncate(line, 34));
     }
-
-    std::string footer = std::to_string(selected + 1) + "/" + std::to_string(todo.todos.size()) + "  确认：完成";
-    if (todo.sync_status == wqn::TodoSyncStatus::kLoading) {
-        footer += "  同步中";
-    } else if (todo.sync_status == wqn::TodoSyncStatus::kCompleting) {
-        footer += "  完成中";
-    } else if (todo.sync_status == wqn::TodoSyncStatus::kCompleteFailed) {
-        footer += "  完成失败";
-    } else if (todo.sync_status == wqn::TodoSyncStatus::kCompleted) {
-        footer += "  已完成";
-    } else if (todo.sync_status == wqn::TodoSyncStatus::kSyncFailed) {
-        footer += "  同步失败";
-    }
-    AddLine(frame, wqn::UiTextStyle::kMeta, footer);
 }
 
 void RenderHome(const wqn::UiState& state, wqn::UiFrame* frame)
@@ -343,16 +280,14 @@ void ClampUiSelection(UiState* state)
     if (state == nullptr) {
         return;
     }
-    if (state->home.tasks.empty()) {
-        state->selected_home_task = 0;
-    } else if (state->selected_home_task >= state->home.tasks.size()) {
-        state->selected_home_task = state->home.tasks.size() - 1;
-    }
+    state->selected_home_task = std::min<size_t>(state->selected_home_task, 1);
     if (state->todo.todos.empty()) {
         state->todo.selected = 0;
     } else if (state->todo.selected >= state->todo.todos.size()) {
         state->todo.selected = state->todo.todos.size() - 1;
     }
+    state->todo.window_start = ClampTodoListWindow(
+        state->todo.window_start, state->todo.selected, state->todo.todos.size());
     if (state->settings.selected >= kSettingsItemCount) {
         state->settings.selected = kSettingsItemCount - 1;
     }
@@ -370,278 +305,8 @@ void ClampUiSelection(UiState* state)
     }
 }
 
-void HandleUiInput(UiState* state, UiInput input)
+static void ApplyUiScreenTransition(UiState* state, UiScreen screen_before)
 {
-    if (state == nullptr) {
-        return;
-    }
-    ClampUiSelection(state);
-    const wqn::UiScreen screen_before = state->screen;
-
-    switch (input) {
-        case UiInput::kTopPrevious:
-            // [persist-worker] Do not leave a scoped word page while its
-            // observation is still persisting: leaving triggers a synchronous
-            // ResetWordSessionsForScopeChange (two session-file clears) that
-            // would queue behind the in-flight persist transaction and stall
-            // the UI, and drop session ownership out from under the worker.
-            // Within-word input stays responsive; only the top-screen switch
-            // waits. Uses commit_state so the model layer stays unaware of the
-            // task infrastructure.
-            if (state->screen == wqn::UiScreen::kWord &&
-                !state->word_app.scoped_deck_id.empty() &&
-                state->word_app.session.commit_state ==
-                    wqn::WordObservationCommitState::kPersisting) {
-                state->word_app.message = "正在保存，请稍后离开";
-                break;
-            }
-            // Same contract for a problem verdict: the in-layer LongConfirm
-            // gate blocks the escape chain, but a long UP/DOWN maps straight to
-            // top-screen navigation and would bypass it, hiding the saving
-            // status mid-commit.
-            if (state->screen == wqn::UiScreen::kNote &&
-                state->problem_app.active &&
-                state->problem_app.commit_state ==
-                    wqn::ProblemVerdictCommitState::kPersisting) {
-                state->problem_app.message = "正在保存，请稍后离开";
-                break;
-            }
-            state->screen = PreviousTopScreen(state->screen);
-            break;
-
-        case UiInput::kTopNext:
-            if (state->screen == wqn::UiScreen::kWord &&
-                !state->word_app.scoped_deck_id.empty() &&
-                state->word_app.session.commit_state ==
-                    wqn::WordObservationCommitState::kPersisting) {
-                state->word_app.message = "正在保存，请稍后离开";
-                break;
-            }
-            if (state->screen == wqn::UiScreen::kNote &&
-                state->problem_app.active &&
-                state->problem_app.commit_state ==
-                    wqn::ProblemVerdictCommitState::kPersisting) {
-                state->problem_app.message = "正在保存，请稍后离开";
-                break;
-            }
-            state->screen = NextTopScreen(state->screen);
-            break;
-
-        case UiInput::kUp:
-            if (state->screen == UiScreen::kTime) {
-                HandleTimeAppInput(&state->time_app, TimeInput::kUp);
-                break;
-            } else if (state->screen == UiScreen::kWord) {
-                HandleWordAppInput(&state->word_app, WordInput::kUp);
-                break;
-            } else if (state->screen == UiScreen::kNote) {
-                if (state->problem_app.active) {
-                    HandleProblemAppInput(&state->problem_app, ProblemInput::kUp);
-                } else {
-                    HandleNoteAppInput(&state->note_app, NoteInput::kUp);
-                }
-                break;
-            } else if (state->screen == UiScreen::kAi) {
-                if (state->ai.page > 0) {
-                    --state->ai.page;
-                }
-            } else if (state->screen == UiScreen::kHome && state->selected_home_task > 0) {
-                --state->selected_home_task;
-            } else if (state->screen == UiScreen::kTodo && state->todo.selected > 0) {
-                --state->todo.selected;
-            } else if (state->screen == UiScreen::kSettings) {
-                if (state->settings.selected > 0) {
-                    --state->settings.selected;
-                }
-            }
-            break;
-
-        case UiInput::kDown:
-            if (state->screen == UiScreen::kTime) {
-                HandleTimeAppInput(&state->time_app, TimeInput::kDown);
-                break;
-            } else if (state->screen == UiScreen::kWord) {
-                HandleWordAppInput(&state->word_app, WordInput::kDown);
-                break;
-            } else if (state->screen == UiScreen::kNote) {
-                if (state->problem_app.active) {
-                    HandleProblemAppInput(&state->problem_app, ProblemInput::kDown);
-                } else {
-                    HandleNoteAppInput(&state->note_app, NoteInput::kDown);
-                }
-                break;
-            } else if (state->screen == UiScreen::kAi) {
-                if (state->ai.page + 1 < AiSessionPageCount(state->ai)) {
-                    ++state->ai.page;
-                }
-            } else if (state->screen == UiScreen::kHome && state->selected_home_task + 1 < state->home.tasks.size()) {
-                ++state->selected_home_task;
-            } else if (state->screen == UiScreen::kTodo && state->todo.selected + 1 < state->todo.todos.size()) {
-                ++state->todo.selected;
-            } else if (state->screen == UiScreen::kSettings) {
-                if (state->settings.selected + 1 < kSettingsItemCount) {
-                    ++state->settings.selected;
-                }
-            }
-            break;
-
-        case UiInput::kConfirm:
-            if (state->screen == UiScreen::kTime) {
-                HandleTimeAppInput(&state->time_app, TimeInput::kConfirm);
-                break;
-            } else if (state->screen == UiScreen::kWord) {
-                HandleWordAppInput(&state->word_app, WordInput::kConfirm);
-                break;
-            } else if (state->screen == UiScreen::kNote) {
-                if (state->problem_app.active) {
-                    HandleProblemAppInput(&state->problem_app, ProblemInput::kConfirm);
-                    break;
-                }
-                HandleNoteAppInput(&state->note_app, NoteInput::kConfirm);
-                // Selecting a [题] row opens the problem layer synchronously:
-                // it browses the local pack index, no network involved.
-                std::string requested_set_id;
-                if (TakeNoteProblemSetOpenRequest(&state->note_app, &requested_set_id)) {
-                    if (!ActivateProblemBrowse(&state->problem_app, requested_set_id)) {
-                        state->note_app.message = state->problem_app.message;
-                    }
-                }
-                // Selecting a [词] row scopes the word page to that deck and
-                // switches screens; the word page's own UI takes over.
-                std::string requested_deck_id;
-                if (TakeNoteWordDeckOpenRequest(&state->note_app, &requested_deck_id)) {
-                    // AGENTS §4.2, [词]-row: this path breaks the gate twice over.
-                    // (a) SubmitWordSessionReset resets the word session, and the
-                    //     observation armed by the worker is still between here
-                    //     and the reserve -- commit_state already reads kPersisting
-                    //     while the word domain still looks free, so TryReserve
-                    //     cannot see the window and the reset's generation bump
-                    //     would clear the session out from under the commit.
-                    // (b) The durable ACK switches screens, which navigates away
-                    //     from the note screen's answering context.
-                    // Consume the request and say nothing else, so a retry is the
-                    // only thing left to do. Mirrors the top-nav guards above.
-                    if (state->word_app.session.commit_state ==
-                            wqn::WordObservationCommitState::kPersisting ||
-                        (state->problem_app.active &&
-                         state->problem_app.commit_state ==
-                             wqn::ProblemVerdictCommitState::kPersisting)) {
-                        state->note_app.message = "正在保存，请稍后";
-                        break;
-                    }
-                    // Arm + submit; nothing is installed until
-                    // the durable ACK (DispatchWordSessionResetResult), so a scope
-                    // switch never blocks the UI task on the reset transaction.
-                    // The pending pair stays armed on a submit reject or a write
-                    // failure, exactly like the default-deck switch, so the user
-                    // re-picks the row and retries.
-                    std::string requested_deck_title;
-                    for (const WordDeckInfo& deck : state->word_app.deck_catalog) {
-                        if (deck.deck_id == requested_deck_id) {
-                            requested_deck_title = deck.title;
-                            break;
-                        }
-                    }
-                    state->word_app.scope_reset_pending_deck_id = requested_deck_id;
-                    state->word_app.scope_reset_pending_deck_title = requested_deck_title;
-                    const uint32_t op_id = device_ui_internal::SubmitWordSessionReset(requested_deck_id);
-                    if (op_id != 0) {
-                        state->word_app.scope_reset_pending_valid = true;
-                        state->word_app.scope_reset_save_op_id = op_id;
-                        state->note_app.message = "正在切换词库…";
-                    } else {
-                        state->word_app.scope_reset_save_op_id = 0;
-                        state->note_app.message =
-                            device_ui_internal::IsPersistDomainBusy(
-                                device_ui_internal::PersistDomain::kWord)
-                                ? "正在保存，请稍后"
-                                : "切换繁忙，请重试";
-                    }
-                }
-                break;
-            } else if (state->screen == UiScreen::kHome) {
-                state->screen = state->selected_home_task == 1
-                    ? UiScreen::kWord
-                    : UiScreen::kNote;
-            } else if (state->screen == UiScreen::kSettings) {
-                // Settings actions are handled in device_ui.cpp because they need storage and diagnostics.
-            }
-            break;
-
-        case UiInput::kLongConfirm:
-            if (state->screen == UiScreen::kTime) {
-                HandleTimeAppInput(&state->time_app, TimeInput::kLongConfirm);
-                break;
-            } else if (state->screen == UiScreen::kWord) {
-                // Long-press confirm = universal back. At the word home, exit to
-                // the device home screen; in any deeper word mode, let the word
-                // app pop one level.
-                if (state->word_app.mode == WordAppMode::kHome) {
-                    state->screen = UiScreen::kHome;
-                } else {
-                    HandleWordAppInput(&state->word_app, WordInput::kLongConfirm);
-                }
-                break;
-            } else if (state->screen == UiScreen::kNote) {
-                // Long-press = universal back. The problem layer owns its own
-                // escape chain (弹窗→题目→标题列表→混排列表); at the notebook
-                // list (top level) exit to the device home; deeper note levels
-                // pop one level.
-                if (state->problem_app.active) {
-                    HandleProblemAppInput(&state->problem_app, ProblemInput::kLongConfirm);
-                } else if (state->note_app.mode == NoteAppMode::kNotebookList) {
-                    state->screen = UiScreen::kHome;
-                } else {
-                    HandleNoteAppInput(&state->note_app, NoteInput::kLongConfirm);
-                }
-                break;
-            } else if (state->screen == UiScreen::kAi) {
-                // [agent-fix] The Agent tier runs its own hold-to-record PTT
-                // and its long-confirm interrupt gesture (ui_input.cpp); it
-                // never populates ai.status, so this legacy branch would read
-                // as idle and start a STD recording behind a running Agent
-                // run. Skip the branch entirely for kAgent.
-                if (state->ai.tier != AiTier::kAgent &&
-                    state->ai.status != AiSessionStatus::kListening &&
-                    state->ai.status != AiSessionStatus::kPreparingCapture &&
-                    state->ai.status != AiSessionStatus::kWaitingReply) {
-#if CONFIG_WQN_AI_ENABLE
-                    // [ptt-fix] Flash tier uses instant kPress/kRelease events
-                    // routed through ui_input.cpp; skip the long-confirm path
-                    // entirely so PTT doesn't have to wait 1 s for the long-
-                    // press threshold.
-                    if (state->ai.tier != AiTier::kFlash &&
-                        StartAiRecordingSession() == ESP_OK) {
-                        AiSessionState ai_state;
-                        if (CopyAiSessionToUi(&ai_state)) {
-                            state->ai = ai_state;
-                        }
-                    } else {
-                        AiSessionState ai_error;
-                        if (CopyAiSessionToUi(&ai_error)) {
-                            state->ai = ai_error;
-                        } else {
-                            state->ai.status = AiSessionStatus::kError;
-                            state->ai.pending_text.clear();
-                            state->ai.assistant_text = "AI 启动失败";
-                        }
-                    }
-#else
-                    state->ai.status = AiSessionStatus::kListening;
-                    state->ai.pending_text = "AI 功能未启用";
-                    state->ai.status_since_ms = 0;
-#endif
-                }
-                break;
-            } else if (state->screen == UiScreen::kHome) {
-                state->screen = UiScreen::kSettings;
-            } else if (state->screen == UiScreen::kSettings) {
-                state->screen = UiScreen::kHome;
-            } else {
-                state->screen = UiScreen::kHome;
-            }
-            break;
-    }
     ClampUiSelection(state);
     // Leaving the note screen drops the 15 KB image payload: internal SRAM is
     // too scarce to park it behind an invisible page. Re-entry reloads it
@@ -666,8 +331,8 @@ void HandleUiInput(UiState* state, UiInput input)
         // because the user is already on another screen and the next direct
         // word entry must study the default deck, not the override they left.
         //
-        // The kTopPrevious/kTopNext guards already block leaving a scoped word
-        // page while a commit is persisting, so there is no in-flight persist
+        // NavigateUiToScreen blocks leaving a scoped word page while a
+        // commit is persisting, so there is no in-flight persist
         // transaction for this to queue behind.
         const std::string leaving_deck_id = state->word_app.scoped_deck_id;
         state->word_app.scoped_deck_id.clear();
@@ -754,6 +419,266 @@ void HandleUiInput(UiState* state, UiInput input)
 #endif
 }
 
+bool NavigateUiToScreen(UiState* state, UiScreen target)
+{
+    if (state == nullptr || NavigationPageIndex(target) == kNavigationPages.size()) return false;
+    if (state->screen == target) return true;
+    if (state->screen == UiScreen::kWord &&
+        (state->word_app.session.commit_state == WordObservationCommitState::kPersisting ||
+         HasBufferedWordObservations(state->word_app))) {
+        state->word_app.session.batch_flush_requested = true;
+        state->word_app.session.batch_retry_after_ms = 0;
+        state->word_app.message = "正在保存，请稍后离开";
+        return false;
+    }
+    if (state->screen == UiScreen::kNote &&
+        (state->note_app.session.commit_state == NoteObservationCommitState::kPersisting ||
+         (state->problem_app.active &&
+          state->problem_app.commit_state == ProblemVerdictCommitState::kPersisting))) {
+        state->note_app.message = "正在保存，请稍后离开";
+        state->problem_app.message = "正在保存，请稍后离开";
+        return false;
+    }
+    const UiScreen previous = state->screen;
+    state->screen = target;
+    ApplyUiScreenTransition(state, previous);
+    return true;
+}
+
+void HandleUiInput(UiState* state, UiInput input)
+{
+    if (state == nullptr) {
+        return;
+    }
+    ClampUiSelection(state);
+    const wqn::UiScreen screen_before = state->screen;
+
+    switch (input) {
+        case UiInput::kTopPrevious:
+            NavigateUiToScreen(state, PreviousTopScreen(state->screen));
+            return;
+        case UiInput::kTopNext:
+            NavigateUiToScreen(state, NextTopScreen(state->screen));
+            return;
+
+        case UiInput::kUp:
+            if (state->screen == UiScreen::kTime) {
+                HandleTimeAppInput(&state->time_app, TimeInput::kUp);
+                break;
+            } else if (state->screen == UiScreen::kWord) {
+                HandleWordAppInput(&state->word_app, WordInput::kUp);
+                break;
+            } else if (state->screen == UiScreen::kNote) {
+                if (state->problem_app.active) {
+                    HandleProblemAppInput(&state->problem_app, ProblemInput::kUp);
+                } else {
+                    HandleNoteAppInput(&state->note_app, NoteInput::kUp);
+                }
+                break;
+            } else if (state->screen == UiScreen::kAi) {
+                if (state->ai.page > 0) {
+                    --state->ai.page;
+                }
+            } else if (state->screen == UiScreen::kHome && state->selected_home_task > 0) {
+                --state->selected_home_task;
+            } else if (state->screen == UiScreen::kTodo && state->todo.selected > 0) {
+                --state->todo.selected;
+            } else if (state->screen == UiScreen::kSettings) {
+                if (state->settings.selected > 0) {
+                    --state->settings.selected;
+                }
+            }
+            break;
+
+        case UiInput::kDown:
+            if (state->screen == UiScreen::kTime) {
+                HandleTimeAppInput(&state->time_app, TimeInput::kDown);
+                break;
+            } else if (state->screen == UiScreen::kWord) {
+                HandleWordAppInput(&state->word_app, WordInput::kDown);
+                break;
+            } else if (state->screen == UiScreen::kNote) {
+                if (state->problem_app.active) {
+                    HandleProblemAppInput(&state->problem_app, ProblemInput::kDown);
+                } else {
+                    HandleNoteAppInput(&state->note_app, NoteInput::kDown);
+                }
+                break;
+            } else if (state->screen == UiScreen::kAi) {
+                if (state->ai.page + 1 < AiSessionPageCount(state->ai)) {
+                    ++state->ai.page;
+                }
+            } else if (state->screen == UiScreen::kHome && state->selected_home_task < 1) {
+                ++state->selected_home_task;
+            } else if (state->screen == UiScreen::kTodo && state->todo.selected + 1 < state->todo.todos.size()) {
+                ++state->todo.selected;
+            } else if (state->screen == UiScreen::kSettings) {
+                if (state->settings.selected + 1 < kSettingsItemCount) {
+                    ++state->settings.selected;
+                }
+            }
+            break;
+
+        case UiInput::kConfirm:
+            if (state->screen == UiScreen::kTime) {
+                HandleTimeAppInput(&state->time_app, TimeInput::kConfirm);
+                break;
+            } else if (state->screen == UiScreen::kWord) {
+                HandleWordAppInput(&state->word_app, WordInput::kConfirm);
+                break;
+            } else if (state->screen == UiScreen::kNote) {
+                if (state->problem_app.active) {
+                    HandleProblemAppInput(&state->problem_app, ProblemInput::kConfirm);
+                    break;
+                }
+                HandleNoteAppInput(&state->note_app, NoteInput::kConfirm);
+                // Selecting a [题] row opens the problem layer synchronously:
+                // it browses the local pack index, no network involved.
+                std::string requested_set_id;
+                if (TakeNoteProblemSetOpenRequest(&state->note_app, &requested_set_id)) {
+                    if (!ActivateProblemBrowse(&state->problem_app, requested_set_id)) {
+                        state->note_app.message = state->problem_app.message;
+                    }
+                }
+                // Selecting a [词] row scopes the word page to that deck and
+                // switches screens; the word page's own UI takes over.
+                std::string requested_deck_id;
+                if (TakeNoteWordDeckOpenRequest(&state->note_app, &requested_deck_id)) {
+                    // AGENTS §4.2, [词]-row: this path breaks the gate twice over.
+                    // (a) SubmitWordSessionReset resets the word session, and the
+                    //     observation armed by the worker is still between here
+                    //     and the reserve -- commit_state already reads kPersisting
+                    //     while the word domain still looks free, so TryReserve
+                    //     cannot see the window and the reset's generation bump
+                    //     would clear the session out from under the commit.
+                    // (b) The durable ACK switches screens, which navigates away
+                    //     from the note screen's answering context.
+                    // Consume the request and say nothing else, so a retry is the
+                    // only thing left to do. Mirrors the top-nav guards above.
+                    if (state->word_app.session.commit_state ==
+                            wqn::WordObservationCommitState::kPersisting ||
+                        (state->problem_app.active &&
+                         state->problem_app.commit_state ==
+                             wqn::ProblemVerdictCommitState::kPersisting)) {
+                        state->note_app.message = "正在保存，请稍后";
+                        break;
+                    }
+                    // Arm + submit; nothing is installed until
+                    // the durable ACK (DispatchWordSessionResetResult), so a scope
+                    // switch never blocks the UI task on the reset transaction.
+                    // The pending pair stays armed on a submit reject or a write
+                    // failure, exactly like the default-deck switch, so the user
+                    // re-picks the row and retries.
+                    std::string requested_deck_title;
+                    for (const WordDeckInfo& deck : state->word_app.deck_catalog) {
+                        if (deck.deck_id == requested_deck_id) {
+                            requested_deck_title = deck.title;
+                            break;
+                        }
+                    }
+                    state->word_app.scope_reset_pending_deck_id = requested_deck_id;
+                    state->word_app.scope_reset_pending_deck_title = requested_deck_title;
+                    const uint32_t op_id = device_ui_internal::SubmitWordSessionReset(requested_deck_id);
+                    if (op_id != 0) {
+                        state->word_app.scope_reset_pending_valid = true;
+                        state->word_app.scope_reset_save_op_id = op_id;
+                        state->note_app.message = "正在切换词库…";
+                    } else {
+                        state->word_app.scope_reset_save_op_id = 0;
+                        state->note_app.message =
+                            device_ui_internal::IsPersistDomainBusy(
+                                device_ui_internal::PersistDomain::kWord)
+                                ? "正在保存，请稍后"
+                                : "切换繁忙，请重试";
+                    }
+                }
+                break;
+            } else if (state->screen == UiScreen::kHome) {
+                NavigateUiToScreen(state, state->selected_home_task == 0
+                    ? state->home.ai.target : state->home.study.target);
+                return;
+            } else if (state->screen == UiScreen::kSettings) {
+                // Settings actions are handled in device_ui.cpp because they need storage and diagnostics.
+            }
+            break;
+
+        case UiInput::kLongConfirm:
+            if (state->screen == UiScreen::kTime) {
+                HandleTimeAppInput(&state->time_app, TimeInput::kLongConfirm);
+                break;
+            } else if (state->screen == UiScreen::kWord) {
+                // Long-press confirm = universal back. At the word home, exit to
+                // the device home screen; in any deeper word mode, let the word
+                // app pop one level.
+                if (state->word_app.mode == WordAppMode::kHome) {
+                    state->screen = UiScreen::kHome;
+                } else {
+                    HandleWordAppInput(&state->word_app, WordInput::kLongConfirm);
+                }
+                break;
+            } else if (state->screen == UiScreen::kNote) {
+                // Long-press = universal back. The problem layer owns its own
+                // escape chain (弹窗→题目→标题列表→混排列表); at the notebook
+                // list (top level) exit to the device home; deeper note levels
+                // pop one level.
+                if (state->problem_app.active) {
+                    HandleProblemAppInput(&state->problem_app, ProblemInput::kLongConfirm);
+                } else if (state->note_app.mode == NoteAppMode::kNotebookList) {
+                    state->screen = UiScreen::kHome;
+                } else {
+                    HandleNoteAppInput(&state->note_app, NoteInput::kLongConfirm);
+                }
+                break;
+            } else if (state->screen == UiScreen::kAi) {
+                // [agent-fix] The Agent tier runs its own hold-to-record PTT
+                // and its long-confirm interrupt gesture (ui_input.cpp); it
+                // never populates ai.status, so this legacy branch would read
+                // as idle and start a STD recording behind a running Agent
+                // run. Skip the branch entirely for kAgent.
+                if (state->ai.tier != AiTier::kAgent &&
+                    state->ai.status != AiSessionStatus::kListening &&
+                    state->ai.status != AiSessionStatus::kPreparingCapture &&
+                    state->ai.status != AiSessionStatus::kWaitingReply) {
+#if CONFIG_WQN_AI_ENABLE
+                    // [ptt-fix] Flash tier uses instant kPress/kRelease events
+                    // routed through ui_input.cpp; skip the long-confirm path
+                    // entirely so PTT doesn't have to wait 1 s for the long-
+                    // press threshold.
+                    if (state->ai.tier != AiTier::kFlash &&
+                        StartAiRecordingSession() == ESP_OK) {
+                        AiSessionState ai_state;
+                        if (CopyAiSessionToUi(&ai_state)) {
+                            state->ai = ai_state;
+                        }
+                    } else {
+                        AiSessionState ai_error;
+                        if (CopyAiSessionToUi(&ai_error)) {
+                            state->ai = ai_error;
+                        } else {
+                            state->ai.status = AiSessionStatus::kError;
+                            state->ai.pending_text.clear();
+                            state->ai.assistant_text = "AI 启动失败";
+                        }
+                    }
+#else
+                    state->ai.status = AiSessionStatus::kListening;
+                    state->ai.pending_text = "AI 功能未启用";
+                    state->ai.status_since_ms = 0;
+#endif
+                }
+                break;
+            } else if (state->screen == UiScreen::kHome) {
+                state->screen = UiScreen::kSettings;
+            } else if (state->screen == UiScreen::kSettings) {
+                state->screen = UiScreen::kHome;
+            } else {
+                state->screen = UiScreen::kHome;
+            }
+            break;
+    }
+    ApplyUiScreenTransition(state, screen_before);
+}
+
 bool TickAiSession(UiState* state, int64_t now_ms)
 {
 #if CONFIG_WQN_AI_ENABLE
@@ -791,25 +716,23 @@ UiFrame RenderUiFrame(const UiState& state)
 {
     UiFrame frame;
 
-    // [fix] While WiFi provisioning is active, override the screen with a
-    // provisioning prompt (which SoftAP to join + captive-portal URL). The
-    // generic fallback in RenderFrameToEpd draws frame.lines for screens it
-    // doesn't specialise, so no new renderer/dispatch is needed.
+    // Project the existing provisioning owner's state; rendering never drives
+    // the portal. Storage recovery also uses kProvisioning, with phase Idle,
+    // and must continue through the generic recovery renderer.
+    const wqn::ProvisionState provisioning_phase = wqn::GetProvisioningState();
     const std::string provisioning_ssid = wqn::GetProvisioningApSsid();
-    if (wqn::GetProvisioningState() != wqn::ProvisionState::kIdle &&
-        !provisioning_ssid.empty()) {
+    frame.provisioning_phase = provisioning_phase;
+    if (wqn::IsProvisioningActive() && provisioning_phase != wqn::ProvisionState::kIdle) {
         frame.screen = UiScreen::kProvisioning;
         frame.prefer_full_refresh = true;
-        AddLine(&frame, UiTextStyle::kTitle, "设备配网");
-        AddLine(&frame, UiTextStyle::kBody, "请用手机连接 WiFi 热点:");
-        AddLine(&frame, UiTextStyle::kSelected, provisioning_ssid);
-        AddLine(&frame, UiTextStyle::kBody, "然后浏览器访问:");
-        AddLine(&frame, UiTextStyle::kSelected, "192.168.4.1");
-        AddLine(&frame, UiTextStyle::kMeta, "输入家庭 WiFi 完成配网");
+        frame.provisioning_ssid = provisioning_ssid;
+        frame.home = state.home;
+        frame.settings = state.settings;
         return frame;
     }
 
     frame.screen = state.screen;
+    frame.navigation = state.navigation;
     frame.paired = state.status.paired;
     frame.claim_code = state.status.claim_code;
     frame.home = state.home;
@@ -841,7 +764,8 @@ UiFrame RenderUiFrame(const UiState& state)
     // call eats the flag and the actual render frame gets prefer_full=false.
     // Consumption is deferred to ConsumeForceFullRefresh() called by the
     // render path in device_ui.cpp after it has the final frame.
-    frame.prefer_full_refresh = (state.screen == UiScreen::kHome) || g_force_full_refresh_next;
+    frame.prefer_full_refresh =
+        g_force_full_refresh_next;
     if (state.screen != UiScreen::kHome) {
         AddLine(&frame, UiTextStyle::kMeta, ScreenName(state.screen));
     }
@@ -892,20 +816,6 @@ AiTier NextAiTier(AiTier current)
     // The ring collapses to Flash <-> Std, which is exactly the pre-Agent set.
     return (current == AiTier::kStd) ? AiTier::kFlash : AiTier::kStd;
 #endif
-}
-
-const char* AiTierLabel(AiTier tier)
-{
-    switch (tier) {
-        case AiTier::kFlash:
-            return "Flash";
-        case AiTier::kStd:
-            return "STD";
-        case AiTier::kAgent:
-            return "Agent";
-        default:
-            return "???";
-    }
 }
 
 }  // namespace wqn

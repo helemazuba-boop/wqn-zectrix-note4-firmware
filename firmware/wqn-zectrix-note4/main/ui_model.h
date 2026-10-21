@@ -8,38 +8,21 @@
 #include <vector>
 
 #include "sdkconfig.h"
+#include "ui/navigation_model.h"
+#include "ui/home_model.h"
+#include "todo_list_model.h"
 
 #include "ai_history.h"
 #include "note_app.h"
 #include "opencode_model.h"
 #include "problem_app.h"
+#include "provision_manager.h"
 #include "storage.h"
 #include "time_app.h"
 #include "word_app.h"
 #include "wqn_api.h"
 
 namespace wqn {
-
-enum class UiScreen : uint8_t {
-    // Values are persisted in RTC slow memory across deep sleep. Keep retained
-    // IDs stable so firmware updates can reject removed prototype screens 7-12
-    // instead of reinterpreting them as another page.
-    kAi = 0,
-    kTodo = 1,
-    kSettings = 2,
-    kHome = 3,
-    kTime = 4,
-    kWord = 5,
-    kNote = 6,
-    kProvisioning = 13,
-    // [agent] Reserved. The standalone OpenCode Agent page was demoted into
-    // the AI page as AiTier::kAgent, so this screen is no longer reachable
-    // from the page ring. The ID stays occupied for the same reason 7-12 do:
-    // a device that wakes from deep sleep with 14 in RTC memory must reject it
-    // (see IsRestorableScreen in ui_state.cpp) instead of rendering a page
-    // that no longer exists.
-    kOpenCode = 14,
-};
 
 enum class UiInput {
     kUp,
@@ -86,8 +69,6 @@ enum class AiTier : uint8_t {
 };
 
 AiTier NextAiTier(AiTier current);
-const char* AiTierLabel(AiTier tier);
-
 // [shell] Thinking effort level shown as the status-bar lightbulb icon
 // (off/low/med/high = 0..3 rays). Local-only for now (server controls the real
 // thinking level); the status-bar toggle cycles this for display.
@@ -175,6 +156,11 @@ enum class TodoSyncStatus {
 struct TodoUiState {
     std::vector<WqnTodoItem> todos;
     size_t selected = 0;
+    size_t window_start = 0;
+    std::string current_cursor;
+    bool paging_stale = false;
+    std::string completion_task_id;
+    std::string completion_title;
     TodoSyncStatus sync_status = TodoSyncStatus::kIdle;
     std::string status_message;
     bool loaded_once = false;
@@ -183,17 +169,6 @@ struct TodoUiState {
     std::string next_cursor;
     bool has_earlier = false;
     bool has_later = false;
-};
-
-struct HomeMetric {
-    std::string value;
-    std::string label;
-};
-
-struct HomeTask {
-    std::string title;
-    std::string subtitle;
-    std::string tag;
 };
 
 struct HomeSummary {
@@ -207,11 +182,11 @@ struct HomeSummary {
     bool full = false;
     bool wifi_connected = false;
     int wifi_rssi = 0;  // dBm (e.g. -65); 0 if not connected.
-    HomeMetric review_metric = {"0", "今日复习"};
-    HomeMetric todo_metric = {"--", "今日 Todo"};
-    HomeMetric word_metric = {"--%", "单词进度"};
-    std::string current_status = "当前进行";
-    std::vector<HomeTask> tasks;
+    HomeAiCard ai;
+    HomeStudyCard study;
+    std::string review_label;
+    std::string todo_label;
+    std::string notice;
 };
 
 // Settings-page row count, the single source of truth for every layer that
@@ -238,7 +213,7 @@ constexpr size_t kSettingsRowWordDeck = 6;
 // [ai-follow] The auto-follow toggle's new home: it left the AI status-bar
 // cluster (where a set-once preference did not belong) for the settings page.
 constexpr size_t kSettingsRowAiFollow = 7;
-constexpr size_t kSettingsRowVersion = 8;
+constexpr size_t kSettingsRowAbout = 8;
 #if CONFIG_WQN_DEV_MENU_ENABLE
 constexpr size_t kSettingsRowDevMenu = 9;
 constexpr size_t kSettingsRowFactoryReset = 10;
@@ -248,8 +223,8 @@ constexpr size_t kSettingsRowFactoryReset = 9;
 constexpr size_t kSettingsRowPowerOff = 10;
 #endif
 
-// Second-level dev list (DEV_DIAGNOSTICS.md §3): six rows, which is exactly the
-// panel's 6-row window, so it needs no scrolling. kDevRowBatteryRaw and
+// Second-level dev list (DEV_DIAGNOSTICS.md §3): six rows in the five-row
+// selection-following window. kDevRowBatteryRaw and
 // kDevRowStorage carry the two detail dialogs that used to sit on the root
 // list; the flag gates only the root entry row, not these constants.
 constexpr size_t kDevItemCount = 6;
@@ -271,6 +246,8 @@ enum class SettingsView {
     kDev,
 };
 
+enum class SettingsDeckStatus { kReady, kEmpty, kLoading, kFailed };
+
 enum class SettingsDialog {
     kNone,
     kWifiManage,
@@ -287,6 +264,10 @@ enum class SettingsDialog {
     kSleepDiag,
     kFactoryReset,
     kPowerOff,
+    kAbout,
+    kBatterySummary,
+    kPairing,
+    kProvisioningResult,
 };
 
 // [dev-diag] One formatted error-log line for the Dev error dialog, built at
@@ -307,6 +288,11 @@ struct SettingsSleepDiagLine {
 };
 
 struct SettingsDiagnosticsSnapshot {
+    bool battery_valid = false;
+    bool external_power_present = false;
+    bool flash_valid = false;
+    bool nvs_valid = false;
+    bool psram_valid = false;
     int adc_raw = 0;
     int adc_mv = 0;
     int battery_mv = 0;
@@ -324,6 +310,7 @@ struct SettingsDiagnosticsSnapshot {
     std::string firmware_version;
     std::string board_id;
     std::string idf_target;
+    std::string idf_version;
     std::string content_sync_label;
     // [dev-diag] Dev-menu fields (structure fixed by DEV_DIAGNOSTICS.md).
     // Filled by UpdateSettingsDiagnostics on dialog open / state reload; the
@@ -358,6 +345,11 @@ struct SettingsAppState {
     // a deep-sleep wake or a fresh state reload never lands in the dev list.
     SettingsView view = SettingsView::kRoot;
     size_t dev_selected = 0;
+    size_t wifi_action_selected = 0;
+    // A single diagnostic Confirm waits out the driver's double-click window.
+    // Transient interaction state, never persisted or restored across sleep.
+    bool sync_confirm_pending = false;
+    int64_t sync_confirm_at_ms = 0;
     SettingsDialog dialog = SettingsDialog::kNone;
     size_t auto_sync_selected = 0;
     uint32_t auto_sync_interval_min = 0;
@@ -368,8 +360,10 @@ struct SettingsAppState {
     // 「WQN Word 默认词库」单选对话框: option 0 is the fixed 「全部词库」
     // (empty id), the rest mirror the mounted word deck catalog.
     std::vector<WordDeckInfo> word_deck_options;
+    SettingsDeckStatus word_deck_status = SettingsDeckStatus::kReady;
     size_t word_deck_selected = 0;
     // Display value of the settings row (empty = 全部词库).
+    std::string default_word_deck_id;
     std::string default_word_deck_title;
     std::string sync_status;
     std::string notice;
@@ -431,6 +425,9 @@ struct SettingsAppState {
     // UpdateSettingsDiagnostics for the WiFi-manage row/dialog. Empty = not set.
     char wifi_primary_ssid[33] = {};
     char wifi_backup_ssid[33] = {};
+    char wifi_active_ssid[33] = {};
+    bool wifi_online = false;
+    uint32_t wifi_switch_op_id = 0;
     SettingsDiagnosticsSnapshot diagnostics;
 };
 
@@ -487,10 +484,13 @@ struct UiGestureState {
 struct AppState {
     uint64_t revision = 0;
     UiScreen screen = UiScreen::kHome;
+    NavigationState navigation;
     StatusBarEditState status_edit;
     UiGestureState gestures;
     AgentOptionState agent_option;  // [agent] option-bar focus
     size_t selected_home_task = 0;
+    std::string home_viewed_session_id;
+    int64_t home_viewed_result_version = 0;
     UiRuntimeStatus status;
     AiSessionState ai;
     AgentSessionState agent;
@@ -513,9 +513,12 @@ struct UiLine {
 
 struct UiFrame {
     UiScreen screen = UiScreen::kHome;
+    NavigationState navigation;
     bool prefer_full_refresh = false;
     bool paired = false;
     std::string claim_code;
+    ProvisionState provisioning_phase = ProvisionState::kIdle;
+    std::string provisioning_ssid;
     StatusBarEditState status_edit;  // [shell] status-bar edit mode for render
     AgentOptionState agent_option;   // [agent] option-bar focus for render
     HomeSummary home;
@@ -535,6 +538,7 @@ struct UiFrame {
 
 void ClampUiSelection(UiState* state);
 void HandleUiInput(UiState* state, UiInput input);
+bool NavigateUiToScreen(UiState* state, UiScreen target);
 size_t AiSessionTextPageCount(const AiSessionState& ai);
 size_t AiSessionPageCount(const AiSessionState& ai);
 bool TickAiSession(UiState* state, int64_t now_ms);

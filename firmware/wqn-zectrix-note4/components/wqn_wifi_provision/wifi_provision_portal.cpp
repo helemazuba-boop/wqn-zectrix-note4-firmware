@@ -624,9 +624,7 @@ esp_err_t WifiProvisionPortal::HandleSubmit(httpd_req_t* req)
     httpd_resp_set_hdr(req, "Connection", "close");
     return httpd_resp_send(
         req,
-        role == NetworkRole::kPrimary
-            ? "{\"success\":true,\"connect\":true}"
-            : "{\"success\":true,\"connect\":false}",
+        "{\"success\":true,\"connect\":false}",
         HTTPD_RESP_USE_STRLEN);
 }
 

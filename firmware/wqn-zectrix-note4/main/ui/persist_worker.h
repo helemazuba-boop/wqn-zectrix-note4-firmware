@@ -122,10 +122,6 @@ PersistTicket TryReservePersist(PersistKind kind);
 void CancelPersistReservation(const PersistTicket& ticket);
 // Phase 2: move the payload into the reserved slot and enqueue. Must be paired
 // with a valid ticket of the matching kind; cannot fail after a reservation.
-void EnqueueReservedWordObservation(
-    const PersistTicket& ticket,
-    wqn::DurableWordObservation observation,
-    wqn::PersistedWordSession advanced_session);
 void EnqueueReservedWordObservations(
     const PersistTicket& ticket,
     std::vector<wqn::DurableWordObservation> observations,

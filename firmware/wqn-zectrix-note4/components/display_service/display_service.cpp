@@ -24,6 +24,10 @@
 #define CONFIG_WQN_EPD_IDLE_POWER_OFF_MS 1500
 #endif
 
+#ifndef CONFIG_WQN_EPD_IDLE_CLEANUP_MS
+#define CONFIG_WQN_EPD_IDLE_CLEANUP_MS 45000
+#endif
+
 namespace wqn {
 
 static void PowerOffEpd();
@@ -115,7 +119,6 @@ constexpr uint32_t kIdleCleanupFramePartials = 24;
 constexpr int kTextGlyphWidth = 5;
 constexpr int kTextGlyphHeight = 7;
 constexpr int kTextCellWidth = 6;
-constexpr int kTextLineHeight = 9;
 constexpr int kCjkLineHeight = 18;
 constexpr int kCjkFallbackWidth = 16;
 constexpr int kCjkFontHeight = 16;
@@ -1221,51 +1224,6 @@ void DrawGlyphFromFont(int x, int y, const lv_font_t* font, uint32_t codepoint, 
     }
 }
 
-void DrawGlyphFromFontScaled(
-    int x,
-    int y,
-    const lv_font_t* font,
-    uint32_t codepoint,
-    uint8_t scale,
-    bool black)
-{
-    if (scale <= 1) {
-        DrawGlyphFromFont(x, y, font, codepoint, black);
-        return;
-    }
-    if (font == nullptr) {
-        return;
-    }
-    const lv_font_fmt_txt_dsc_t* font_dsc = font->dsc;
-    const lv_font_fmt_txt_glyph_dsc_t* glyph = FindGlyphInFont(font, codepoint);
-    if (font_dsc == nullptr || glyph == nullptr || glyph->box_w == 0 || glyph->box_h == 0) {
-        return;
-    }
-
-    const uint8_t* bitmap = &font_dsc->glyph_bitmap[glyph->bitmap_index];
-    const int draw_x = x + glyph->ofs_x * scale;
-    const int draw_y = y +
-        ((font->line_height - font->base_line) - glyph->box_h - glyph->ofs_y) * scale;
-    int bit_index = 0;
-    for (int row = 0; row < glyph->box_h; ++row) {
-        for (int col = 0; col < glyph->box_w; ++col, ++bit_index) {
-            const uint8_t byte = bitmap[bit_index >> 3];
-            const uint8_t mask = static_cast<uint8_t>(0x80U >> (bit_index & 0x07));
-            if ((byte & mask) == 0) {
-                continue;
-            }
-            for (uint8_t yy = 0; yy < scale; ++yy) {
-                for (uint8_t xx = 0; xx < scale; ++xx) {
-                    DrawEpdPixel(
-                        draw_x + col * scale + xx,
-                        draw_y + row * scale + yy,
-                        black);
-                }
-            }
-        }
-    }
-}
-
 void DrawCjkGlyph(int x, int y, uint32_t codepoint, bool black)
 {
     DrawGlyphFromFont(x, y, &SourceHanSansSC_Regular_slim, codepoint, black);
@@ -1329,6 +1287,13 @@ void BlitEpdFramebuffer(const uint8_t* bitmap, size_t size)
         return;
     }
     std::memcpy(g_framebuffer, bitmap, kEpdFramebufferSize);
+}
+
+bool ReadEpdPixel(int x, int y)
+{
+    if (g_framebuffer == nullptr || x < 0 || x >= kEpdWidth || y < 0 || y >= kEpdHeight) return false;
+    const size_t index = static_cast<size_t>(y) * kEpdBytesPerRow + static_cast<size_t>(x / 8);
+    return (g_framebuffer[index] & (0x80U >> (x & 7))) == 0;
 }
 
 void DrawEpdPixel(int x, int y, bool black)
@@ -1490,55 +1455,6 @@ int MeasureTextWithFont(const lv_font_t* font, const char* text)
     return std::max(max_width, current_width);
 }
 
-void DrawTextWithFontCentered(int x, int y, int width, const lv_font_t* font, const char* text, bool black)
-{
-    if (font == nullptr || text == nullptr) {
-        return;
-    }
-    const int text_width = MeasureTextWithFont(font, text);
-    const int draw_x = x + std::max(0, (width - text_width) / 2);
-    DrawTextWithFont(draw_x, y, font, text, black);
-}
-
-void DrawTextWithFontScaledCentered(
-    int x,
-    int y,
-    int width,
-    const lv_font_t* font,
-    const char* text,
-    uint8_t scale,
-    bool black)
-{
-    if (font == nullptr || text == nullptr || scale == 0) {
-        return;
-    }
-    const int text_width = MeasureTextWithFont(font, text) * scale;
-    int cursor_x = x + std::max(0, (width - text_width) / 2);
-    int cursor_y = y;
-    const char* cursor = text;
-    while (*cursor != '\0') {
-        uint32_t codepoint = 0;
-        const char* before = cursor;
-        if (!DecodeUtf8(cursor, &codepoint) || cursor == before) {
-            break;
-        }
-        if (codepoint == '\r') {
-            continue;
-        }
-        if (codepoint == '\n') {
-            cursor_y += font->line_height * scale;
-            cursor_x = x;
-            continue;
-        }
-        const int glyph_width = MeasureGlyphWidthInFont(font, codepoint) * scale;
-        if (cursor_x + glyph_width > x + width || cursor_x + glyph_width > kEpdWidth) {
-            break;
-        }
-        DrawGlyphFromFontScaled(cursor_x, cursor_y, font, codepoint, scale, black);
-        cursor_x += glyph_width;
-    }
-}
-
 std::string TruncateUtf8TextToWidth(const std::string& text, int max_width_px)
 {
     if (max_width_px <= 0 || MeasureUtf8TextWidth(text.c_str()) <= max_width_px) {
@@ -1649,6 +1565,28 @@ esp_err_t PreparePanelForFramebufferWrite()
     return ESP_OK;
 }
 
+esp_err_t SetPartialWindow(const DirtyRect& rect)
+{
+    ESP_RETURN_ON_FALSE(rect.valid, ESP_ERR_INVALID_ARG, kTag, "invalid EPD partial window");
+
+    const uint16_t x_start = static_cast<uint16_t>(rect.x_start_byte * 8);
+    const uint16_t x_end = static_cast<uint16_t>((rect.x_end_byte + 1) * 8 - 1);
+    const uint16_t y_start = static_cast<uint16_t>(rect.y_start);
+    const uint16_t y_end = static_cast<uint16_t>(rect.y_end);
+
+    ESP_RETURN_ON_ERROR(SendCommand(0x83), kTag, "EPD partial window");
+    ESP_RETURN_ON_ERROR(SendData(static_cast<uint8_t>((x_start >> 8) & 0x03)), kTag, "EPD partial x start high");
+    ESP_RETURN_ON_ERROR(SendData(static_cast<uint8_t>(x_start & 0xFF)), kTag, "EPD partial x start low");
+    ESP_RETURN_ON_ERROR(SendData(static_cast<uint8_t>((x_end >> 8) & 0x03)), kTag, "EPD partial x end high");
+    ESP_RETURN_ON_ERROR(SendData(static_cast<uint8_t>(x_end & 0xFF)), kTag, "EPD partial x end low");
+    ESP_RETURN_ON_ERROR(SendData(static_cast<uint8_t>((y_start >> 8) & 0x03)), kTag, "EPD partial y start high");
+    ESP_RETURN_ON_ERROR(SendData(static_cast<uint8_t>(y_start & 0xFF)), kTag, "EPD partial y start low");
+    ESP_RETURN_ON_ERROR(SendData(static_cast<uint8_t>((y_end >> 8) & 0x03)), kTag, "EPD partial y end high");
+    ESP_RETURN_ON_ERROR(SendData(static_cast<uint8_t>(y_end & 0xFF)), kTag, "EPD partial y end low");
+    ESP_RETURN_ON_ERROR(SendData(0x01), kTag, "EPD partial scan data");
+    return ESP_OK;
+}
+
 esp_err_t PreparePanelForHotFramebufferWrite()
 {
     // [epd-temp-fix] Reset the temperature input source to the internal sensor
@@ -1665,6 +1603,12 @@ esp_err_t PreparePanelForHotFramebufferWrite()
     ESP_RETURN_ON_ERROR(SendData(0x00), kTag, "EPD hot CCSET: TSFIX=0 use internal sensor");
     vTaskDelay(pdMS_TO_TICKS(10));
 
+    // 0x83 survives hot reuse. A preceding clock/timer window must not
+    // constrain this 400x300 transfer while the software mirror advances for
+    // the whole frame. Specify the full target before DTM1, just as the local
+    // path always specifies its target. Propagate errors before any RAM write.
+    const DirtyRect full_window{0, kEpdBytesPerRow - 1, 0, kEpdHeight - 1, true};
+    ESP_RETURN_ON_ERROR(SetPartialWindow(full_window), kTag, "set EPD full-frame partial window");
     ESP_RETURN_ON_ERROR(SendCommand(0x10), kTag, "EPD hot DTM1 write");
     ESP_RETURN_ON_ERROR(WaitBusyTimeout(kPartialCommandBusyTimeoutMs), kTag, "wait EPD hot RAM command");
     return ESP_OK;
@@ -1726,28 +1670,6 @@ esp_err_t SendFramebufferToPanel(bool partial, bool hot_update)
     }
 
     return TriggerDisplayUpdate(partial, partial && ShouldKeepEpdPowered());
-}
-
-esp_err_t SetPartialWindow(const DirtyRect& rect)
-{
-    ESP_RETURN_ON_FALSE(rect.valid, ESP_ERR_INVALID_ARG, kTag, "invalid EPD partial window");
-
-    const uint16_t x_start = static_cast<uint16_t>(rect.x_start_byte * 8);
-    const uint16_t x_end = static_cast<uint16_t>((rect.x_end_byte + 1) * 8 - 1);
-    const uint16_t y_start = static_cast<uint16_t>(rect.y_start);
-    const uint16_t y_end = static_cast<uint16_t>(rect.y_end);
-
-    ESP_RETURN_ON_ERROR(SendCommand(0x83), kTag, "EPD partial window");
-    ESP_RETURN_ON_ERROR(SendData(static_cast<uint8_t>((x_start >> 8) & 0x03)), kTag, "EPD partial x start high");
-    ESP_RETURN_ON_ERROR(SendData(static_cast<uint8_t>(x_start & 0xFF)), kTag, "EPD partial x start low");
-    ESP_RETURN_ON_ERROR(SendData(static_cast<uint8_t>((x_end >> 8) & 0x03)), kTag, "EPD partial x end high");
-    ESP_RETURN_ON_ERROR(SendData(static_cast<uint8_t>(x_end & 0xFF)), kTag, "EPD partial x end low");
-    ESP_RETURN_ON_ERROR(SendData(static_cast<uint8_t>((y_start >> 8) & 0x03)), kTag, "EPD partial y start high");
-    ESP_RETURN_ON_ERROR(SendData(static_cast<uint8_t>(y_start & 0xFF)), kTag, "EPD partial y start low");
-    ESP_RETURN_ON_ERROR(SendData(static_cast<uint8_t>((y_end >> 8) & 0x03)), kTag, "EPD partial y end high");
-    ESP_RETURN_ON_ERROR(SendData(static_cast<uint8_t>(y_end & 0xFF)), kTag, "EPD partial y end low");
-    ESP_RETURN_ON_ERROR(SendData(0x01), kTag, "EPD partial scan data");
-    return ESP_OK;
 }
 
 esp_err_t SendDirtyRectToPanel(const DirtyRect& rect)
@@ -2325,18 +2247,30 @@ static void RunIdleEpdCleanupIfNeeded(int64_t now_ms, int64_t last_activity_ms)
     }
 }
 
-bool IsEpdIdleCleanupDue()
+int64_t EpdIdleMaintenanceDelayMs()
 {
-    const int cleanup_ms = CONFIG_WQN_EPD_IDLE_CLEANUP_MS;
-    if (cleanup_ms <= 0 || !IdleCleanupPending()) {
-        return false;  // legacy mode: the cleanup rides the power-off point
-    }
     const int64_t last_activity_ms =
         g_last_epd_activity_ms.load(std::memory_order_relaxed);
-    if (last_activity_ms == 0) {
-        return false;
+    if (last_activity_ms == 0) return -1;
+    const int off_ms = CONFIG_WQN_EPD_IDLE_POWER_OFF_MS;
+    const int cleanup_ms = CONFIG_WQN_EPD_IDLE_CLEANUP_MS;
+    int64_t deadline_ms = -1;
+    if (off_ms > 0 && g_epd_rail_powered &&
+        !g_epd_idle_cut.load(std::memory_order_relaxed)) {
+        deadline_ms = last_activity_ms + off_ms;
     }
-    return (esp_timer_get_time() / 1000 - last_activity_ms) >= cleanup_ms;
+    if (IdleCleanupPending()) {
+        // Legacy cleanup=0 rides the configured rail-cut deadline, including
+        // a retry after the rail was cut but its preceding cleanup failed.
+        const int delay_ms = cleanup_ms > 0 ? cleanup_ms : off_ms;
+        if (delay_ms > 0) {
+            const int64_t cleanup_deadline = last_activity_ms + delay_ms;
+            deadline_ms = deadline_ms < 0 ? cleanup_deadline
+                : std::min(deadline_ms, cleanup_deadline);
+        }
+    }
+    return deadline_ms < 0 ? -1
+        : std::max<int64_t>(0, deadline_ms - esp_timer_get_time() / 1000);
 }
 
 } // namespace wqn
@@ -2377,29 +2311,14 @@ uint32_t wqn::GetEpdActivityGeneration()
     return g_epd_activity_generation.load(std::memory_order_acquire);
 }
 
-bool wqn::IsEpdIdleMaintenanceDue()
-{
-    const int idle_ms = CONFIG_WQN_EPD_IDLE_POWER_OFF_MS;
-    const int64_t last_activity_ms =
-        g_last_epd_activity_ms.load(std::memory_order_relaxed);
-    if (idle_ms <= 0 || g_epd_idle_cut.load(std::memory_order_relaxed) ||
-        last_activity_ms == 0) {
-        return false;
-    }
-    return (esp_timer_get_time() / 1000 - last_activity_ms) >= idle_ms;
-}
-
 void wqn::PowerOffEpdAfterIdleIfNeeded()
 {
     const int idle_ms_config = CONFIG_WQN_EPD_IDLE_POWER_OFF_MS;
     const int64_t last_activity_ms =
         g_last_epd_activity_ms.load(std::memory_order_relaxed);
     const int64_t now_ms = esp_timer_get_time() / 1000;
-    // Cleanup first, on its own deadline. It must not be gated on
-    // g_epd_idle_cut: once this function has cut the rail, that flag keeps
-    // IsEpdIdleMaintenanceDue() -- and therefore RequestEpdIdleMaintenance --
-    // false for the rest of the idle period, so a cleanup that waited for the
-    // power-off point would never be armed again.
+    // Cleanup first on its independent deadline, even if the rail is already
+    // cut. The owner keeps that deadline alive until the debt is retired.
     RunIdleEpdCleanupIfNeeded(now_ms, last_activity_ms);
     if (idle_ms_config <= 0 || g_epd_idle_cut.load(std::memory_order_relaxed) ||
         last_activity_ms == 0) {
@@ -2500,8 +2419,9 @@ void wqn::RegisterEpdOwnerTask(void* owner_task_handle)
     g_epd_owner_task = static_cast<TaskHandle_t>(owner_task_handle);
 }
 
-bool wqn::ServiceDisplaySleepPrepCommand()
+bool wqn::ServiceDisplaySleepPrepCommand(bool* prepared)
 {
+    if (prepared != nullptr) *prepared = false;
     // Claim a pending request. If it is not Pending (idle, or already cancelled
     // by a power-side timeout), do nothing.
     uint32_t expected = kSleepPrepPending;
@@ -2524,6 +2444,7 @@ bool wqn::ServiceDisplaySleepPrepCommand()
     const esp_err_t result = clear_first
         ? RunShutdownClearLocal(0)
         : RunSleepPrepLocal(0);
+    if (prepared != nullptr) *prepared = result == ESP_OK;
     // Publish order (mirror of the requester's drain-then-post): write the
     // result, GIVE the semaphore, and only THEN drop to Idle. If Idle were
     // published before the give, a new request could enter Pending and then be

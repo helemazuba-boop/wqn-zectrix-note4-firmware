@@ -1207,37 +1207,6 @@ esp_err_t SuspendObservationTransaction(void* opaque)
     return MaybeCompactCachedOutbox(scan);
 }
 
-struct PrepareOutboxContext {
-    int64_t deadline_us;
-};
-
-esp_err_t PrepareOutboxForSleepTransaction(void* opaque)
-{
-    auto* context = static_cast<PrepareOutboxContext*>(opaque);
-    if (context == nullptr) return ESP_ERR_INVALID_ARG;
-    if (context->deadline_us > 0 && esp_timer_get_time() >= context->deadline_us) {
-        ESP_LOGW(kTag, "note outbox sleep maintenance deferred: deadline reached");
-        return ESP_OK;
-    }
-    OutboxScan* scan = nullptr;
-    ESP_RETURN_ON_ERROR(EnsureOutboxCache(&scan), kTag, "load outbox before note sleep");
-    if (scan->ack_records == 0 && !scan->partial_tail && !scan->backup_source) {
-        return ESP_OK;
-    }
-    ESP_RETURN_ON_ERROR(
-        CheckpointSessionFromOutbox(*scan), kTag, "checkpoint note outbox before sleep");
-    if (context->deadline_us > 0 && esp_timer_get_time() >= context->deadline_us) {
-        ESP_LOGW(kTag, "note outbox compaction deferred after checkpoint");
-        return ESP_OK;
-    }
-    ESP_RETURN_ON_ERROR(CompactCachedOutbox(scan), kTag, "compact note outbox before sleep");
-    ESP_LOGI(
-        kTag,
-        "note outbox prepared for sleep: pending=%u",
-        static_cast<unsigned>(scan->pending.size()));
-    return ESP_OK;
-}
-
 esp_err_t SnapshotTransaction(void* context)
 {
     auto* snapshot = static_cast<wqn::NoteOutboxSnapshot*>(context);
@@ -1393,15 +1362,6 @@ esp_err_t ReadNoteOutboxSnapshot(NoteOutboxSnapshot* snapshot)
     if (snapshot == nullptr) return ESP_ERR_INVALID_ARG;
     *snapshot = {};
     return ExecuteWithStorageLease("note-outbox-snapshot", SnapshotTransaction, snapshot);
-}
-
-esp_err_t PrepareNoteObservationOutboxForSleep(int64_t deadline_us)
-{
-    PrepareOutboxContext context{deadline_us};
-    // Sleep quiescing rejects new SleepLeases; PowerCoordinator calls this only
-    // after storage blockers are drained, so submit directly to the owner task.
-    return services::ExecuteStorageTransactionNamed(
-        PrepareOutboxForSleepTransaction, &context, "note-outbox-sleep-compact");
 }
 
 }  // namespace wqn

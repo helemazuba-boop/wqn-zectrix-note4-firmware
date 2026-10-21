@@ -95,7 +95,6 @@ struct ObservationData {
 };
 
 const char* ReviewActionName(ReviewAction action);
-const char* ProblemStatusName(ProblemStatus status);
 bool ParseProblemStatus(const std::string& value, ProblemStatus* status);
 
 esp_err_t BuildManifestRequest(

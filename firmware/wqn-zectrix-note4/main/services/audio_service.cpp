@@ -6,6 +6,7 @@
 #include <cmath>
 #include <utility>
 
+#include "board_zectrix_note4.h"
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
 #include "driver/i2s_std.h"
@@ -40,7 +41,6 @@ constexpr UBaseType_t kCommandQueueDepth = 12;
 constexpr UBaseType_t kReplyQueueDepth = 8;
 constexpr uint32_t kTaskStackBytes = 4096;
 constexpr UBaseType_t kTaskPriority = 7;
-constexpr TickType_t kCallTimeout = pdMS_TO_TICKS(5000);
 constexpr int64_t kCallTimeoutUs = 5 * 1000 * 1000;
 constexpr int64_t kEmergencyForceCallBudgetUs = 500 * 1000;
 constexpr size_t kMaxCodecHandles = 2;
@@ -806,6 +806,9 @@ esp_err_t EndActivity(const AudioCommand& command)
         g_accept_operations.store(true, std::memory_order_release);
         return result != ESP_OK ? result : ESP_ERR_INVALID_STATE;
     }
+    // Driver operations have drained. No old readiness write can relight the
+    // indicator after this fallback; LED failure must not retain an audio lease.
+    ESP_ERROR_CHECK_WITHOUT_ABORT(wqn::SetNote4RecordingLed(false));
     result = ApplyAmplifier(false);
     if (result != ESP_OK) {
         g_accept_operations.store(true, std::memory_order_release);
@@ -1348,6 +1351,18 @@ esp_err_t SetAudioAmplifier(const AudioSession& session, bool enabled)
     return Call(&command, &reply);
 }
 
+esp_err_t SetAudioRecordingIndicator(const AudioSession& session, bool enabled)
+{
+    if (session.activity != AudioActivity::kCapture && session.activity != AudioActivity::kFlash) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    // Shares the driver's session/inflight guard: EndActivity drains this
+    // immediate write before releasing the capability. No queue or wait here.
+    DriverOperation operation(session);
+    if (!operation) return ESP_ERR_INVALID_STATE;
+    return wqn::SetNote4RecordingLed(enabled);
+}
+
 esp_err_t RecoverAudioCodec(const AudioSession& session)
 {
     if (!session) {
@@ -1842,46 +1857,6 @@ esp_err_t CreateAudioRxChannel(
     *rx = reinterpret_cast<AudioChannelHandle>(channel);
     ESP_LOGI(kTag, "create I2S RX ok: session=%lu rx=%p",
              static_cast<unsigned long>(session.id), *rx);
-    return ESP_OK;
-}
-
-esp_err_t CreateAudioTxChannel(
-    const AudioSession& session,
-    uint32_t sample_rate_hz,
-    uint32_t dma_frame_count,
-    bool left_aligned,
-    AudioChannelHandle* tx)
-{
-    DriverOperation operation(session);
-    if (!operation || tx == nullptr || *tx != nullptr) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    i2s_chan_handle_t channel = nullptr;
-    i2s_chan_config_t channel_config = MakeChannelConfig(dma_frame_count);
-    esp_err_t result = i2s_new_channel(
-        &channel_config, &channel, nullptr);
-    if (result == ESP_OK) {
-        i2s_std_config_t standard = MakeStandardConfig(
-            sample_rate_hz, left_aligned, false);
-        result = i2s_channel_init_std_mode(channel, &standard);
-    }
-    if (result == ESP_OK) {
-        result = i2s_channel_enable(channel);
-    }
-    if (result != ESP_OK) {
-        if (channel != nullptr) {
-            i2s_del_channel(channel);
-        }
-        return result;
-    }
-    result = RegisterResource(
-        g_channel_slots, kMaxChannelHandles, session, channel);
-    if (result != ESP_OK) {
-        i2s_channel_disable(channel);
-        i2s_del_channel(channel);
-        return result;
-    }
-    *tx = reinterpret_cast<AudioChannelHandle>(channel);
     return ESP_OK;
 }
 

@@ -1,12 +1,16 @@
 #include "ui_runtime.h"
 
 #include <utility>
+#include <cstdio>
+#include <cstring>
 
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "opencode_session.h"  // [follow] Agent viewport setters
 #include "persist_worker.h"    // [detail] SubmitAgentDetailLevelSave
 #include "ui_internal.h"
 #include "services/sync_service.h"
+#include "services/connectivity_service.h"
 #include "storage.h"
 #include "word_app.h"
 
@@ -82,6 +86,8 @@ const char* AppEventKindName(AppEventKind event)
             return "agent-list-poll";
         case AppEventKind::kWordCardPrefetch:
             return "word-card-prefetch";
+        case AppEventKind::kSettingsTick:
+            return "settings-tick";
         default:
             return "unknown";
     }
@@ -130,6 +136,12 @@ UiUpdate UiRuntime::FinishEvent(
 void UiRuntime::Initialize(wqn::AppState&& initial_state)
 {
     state_ = std::move(initial_state);
+    state_.navigation = {};
+    state_.settings.sync_confirm_pending = false;
+    settings_provision_phase_ = wqn::ProvisionState::kIdle;
+    settings_provision_active_ = false;
+    settings_provision_ssid_.clear();
+    home_activity_at_ms_ = esp_timer_get_time() / 1000;
     // Bootstrap always owns revision 1, including a degraded load. The UI can
     // therefore submit its recovery frame without using reserved revision 0.
     FinishEvent(AppEventKind::kBootstrap, RefreshSchedule::kImmediate, true);
@@ -139,8 +151,16 @@ UiUpdate UiRuntime::DispatchButton(
     const wqn::ButtonEvent& event,
     int64_t event_time_ms)
 {
+    if (event.HasEvent() && !event.repeat && event_time_ms >= home_activity_at_ms_) {
+        if (event_time_ms - home_activity_at_ms_ >= wqn::kHomeAgentActiveMs ||
+            event_time_ms - state_.agent.home.checked_at_ms >= wqn::kHomeAgentFreshMs)
+            home_poll_next_ms_ = 0;
+        home_activity_at_ms_ = event_time_ms;
+    }
     if (wqn::HasBufferedWordObservations(state_.word_app) &&
-        event.type == wqn::ButtonEventType::kLongPress) {
+        event.type == wqn::ButtonEventType::kLongPress &&
+        event.button == wqn::ButtonId::kConfirm && !state_.navigation.visible &&
+        (state_.navigation.blocked_mask & (1U << static_cast<unsigned>(event.button))) == 0) {
         if (!word_boundary_pending_) {
             word_boundary_pending_ = true;
             word_boundary_event_ = event;
@@ -172,11 +192,16 @@ UiUpdate UiRuntime::DispatchTodoCloudResult(const TodoCloudResult& result)
 
 UiUpdate UiRuntime::DispatchWordCloudResult(WordCloudResult& result)
 {
+    const bool settings_visible = state_.screen == wqn::UiScreen::kSettings &&
+        state_.settings.dialog == wqn::SettingsDialog::kDefaultWordDeck && result.op == WordCloudOp::kPackSync;
+    const std::string before = settings_visible ? FrameSignature(wqn::RenderUiFrame(state_)) : std::string();
     const bool changed = ApplyWordCloudResult(&state_, result);
-    const RefreshSchedule refresh =
+    if (settings_visible) InstallSettingsDeckOptions(&state_, true);
+    RefreshSchedule refresh =
         changed && state_.screen == wqn::UiScreen::kWord
             ? RefreshSchedule::kCommit
             : RefreshSchedule::kNone;
+    if (settings_visible && before != FrameSignature(wqn::RenderUiFrame(state_))) refresh = RefreshSchedule::kConfig;
     return FinishEvent(AppEventKind::kWordCloudResult, refresh, changed);
 }
 
@@ -724,6 +749,7 @@ UiUpdate UiRuntime::DispatchDefaultDeckChangeResult(
         wqn::SetDefaultWordDeck(
             &state_.word_app, settings.pending_word_deck_id,
             settings.pending_word_deck_title);
+        settings.default_word_deck_id = state_.word_app.default_deck_id;
         settings.default_word_deck_title = state_.word_app.default_deck_title;
         wqn::ResetWordSessionsForScopeChange(&state_.word_app, false);
         RebuildNoteWordDeckRows(&state_);
@@ -831,6 +857,31 @@ UiUpdate UiRuntime::DispatchAgentDetailPersist(int64_t now_ms)
     settings.agent_detail_save_op_id = op_id;
     return FinishEvent(AppEventKind::kSettingsPersist,
                        RefreshSchedule::kNone, true);
+}
+
+UiUpdate UiRuntime::DispatchHomeStatusPoll(int64_t now_ms)
+{
+    if (state_.screen != wqn::UiScreen::kHome) {
+        home_poll_next_ms_ = 0;
+        return FinishEvent(AppEventKind::kAgentListPoll, RefreshSchedule::kNone, false);
+    }
+    const std::string before = wqn::HomeContentSignature(state_.home.ai, state_.home.study,
+        state_.home.review_label, state_.home.todo_label, state_.home.notice);
+    UpdateHomeAiSummary(&state_, now_ms);
+#if CONFIG_WQN_AGENT_ENABLE
+    if (wqn::ShouldPollHomeAgent(now_ms, home_activity_at_ms_, home_poll_next_ms_,
+        true, state_.navigation.visible, state_.status.paired, state_.status.wifi_connected,
+        state_.home.ai.status == wqn::HomeAiStatus::kRunning)) {
+        const esp_err_t result = wqn::RequestOpenCodeHomeStatus();
+        // A busy slot retries within the active window; no input/activity is
+        // produced by this timer, and no dedicated wake source is installed.
+        if (result == ESP_OK) home_poll_next_ms_ = now_ms + wqn::kHomeAgentPollMs;
+    }
+#endif
+    const bool changed = before != wqn::HomeContentSignature(state_.home.ai, state_.home.study,
+        state_.home.review_label, state_.home.todo_label, state_.home.notice);
+    return FinishEvent(AppEventKind::kAgentListPoll,
+        changed ? RefreshSchedule::kSelection : RefreshSchedule::kNone, changed);
 }
 
 UiUpdate UiRuntime::DispatchAgentSessionListPoll(int64_t now_ms)
@@ -1192,7 +1243,21 @@ UiUpdate UiRuntime::DispatchFlashSnapshot(const wqn::FlashUiState& flash)
 UiUpdate UiRuntime::DispatchAgentSnapshot(const wqn::AgentSessionState& snapshot)
 {
     const wqn::AiFeaturePhase previous_phase = state_.agent.ui.phase;
+    const bool home_query_finished = snapshot.home.checked_at_ms != state_.agent.home.checked_at_ms;
     state_.agent = snapshot;
+    const auto previous_home = state_.home.ai;
+    UpdateHomeAiSummary(&state_, esp_timer_get_time() / 1000);
+    if (home_query_finished && state_.screen == wqn::UiScreen::kAi &&
+        state_.ai.tier == wqn::AiTier::kAgent && !snapshot.stream_active &&
+        (snapshot.ui.phase == wqn::AiFeaturePhase::kIdle ||
+         snapshot.ui.phase == wqn::AiFeaturePhase::kComplete ||
+         snapshot.ui.phase == wqn::AiFeaturePhase::kRunning ||
+         snapshot.ui.phase == wqn::AiFeaturePhase::kError)) {
+        // A menu jump may have reached AI while the bounded Home query owned
+        // the single worker. Re-arm entry after that query publishes its tail.
+        if (snapshot.current_session_id.empty()) wqn::RequestOpenCodeSessionList();
+        else wqn::ObserveOpenCodeSession();
+    }
     // Keep the logical state current while the codec is being initialized,
     // but avoid overlapping that hardware transaction with an EPD refresh.
     const bool defer_refresh_for_audio_init =
@@ -1209,6 +1274,9 @@ UiUpdate UiRuntime::DispatchAgentSnapshot(const wqn::AgentSessionState& snapshot
             ? RefreshSchedule::kCommit
             : RefreshSchedule::kAi;
     }
+    if (state_.screen == wqn::UiScreen::kHome &&
+        (previous_home.title != state_.home.ai.title || previous_home.badge != state_.home.ai.badge ||
+         previous_home.action != state_.home.ai.action)) refresh = RefreshSchedule::kSelection;
     return FinishEvent(
         AppEventKind::kAgentSnapshot,
         refresh,
@@ -1240,16 +1308,95 @@ UiUpdate UiRuntime::DispatchStatusEditTimeout(int64_t now_ms)
         expired);
 }
 
+UiUpdate UiRuntime::DispatchSettingsTick(int64_t now_ms)
+{
+    RefreshSchedule refresh = RefreshSchedule::kNone;
+    auto& settings = state_.settings;
+    if (state_.screen == wqn::UiScreen::kSettings && settings.dialog == wqn::SettingsDialog::kWifiManage) {
+        const auto network = wqn::services::GetWifiSwitchSnapshot();
+        if (settings.wifi_online != network.online ||
+            std::strcmp(settings.wifi_active_ssid, network.active_ssid) != 0) {
+            settings.wifi_online = network.online;
+            std::snprintf(settings.wifi_active_ssid, sizeof(settings.wifi_active_ssid), "%s", network.active_ssid);
+            refresh = RefreshSchedule::kConfig;
+        }
+        if (settings.wifi_switch_op_id != 0 && settings.wifi_switch_op_id == network.operation_id) {
+            using wqn::services::WifiSwitchState;
+            const bool terminal = network.state != WifiSwitchState::kQueued &&
+                network.state != WifiSwitchState::kConnecting && network.state != WifiSwitchState::kIdle;
+            if (terminal) {
+                settings.wifi_switch_op_id = 0;
+                switch (network.state) {
+                    case WifiSwitchState::kConnected: settings.notice = "已连接所选 WiFi"; break;
+                    case WifiSwitchState::kRestored: settings.notice = "目标连接失败，已回退到另一网络"; break;
+                    case WifiSwitchState::kBusy: settings.notice = "联网任务进行中，请稍后切换"; break;
+                    default: settings.notice = "WiFi 切换失败，请检查网络后重试"; break;
+                }
+                refresh = RefreshSchedule::kConfig;
+            }
+        }
+    }
+    if (state_.screen == wqn::UiScreen::kSettings && settings.dialog == wqn::SettingsDialog::kDefaultWordDeck &&
+        UpdateSettingsDeckStatus(&state_)) refresh = RefreshSchedule::kConfig;
+    if (settings.sync_confirm_pending &&
+        (state_.screen != wqn::UiScreen::kSettings || settings.dialog != wqn::SettingsDialog::kDevSync))
+        settings.sync_confirm_pending = false;
+    if (settings.sync_confirm_pending && now_ms - settings.sync_confirm_at_ms > wqn::kButtonDoublePressWindowMs) {
+        settings.sync_confirm_pending = false;
+        settings.dialog = wqn::SettingsDialog::kNone;
+        refresh = RefreshSchedule::kConfig;
+    }
+    const auto phase = wqn::GetProvisioningState();
+    const bool active = wqn::IsProvisioningActive();
+    const std::string ssid = wqn::GetProvisioningApSsid();
+    const bool provision_changed = phase != settings_provision_phase_ || active != settings_provision_active_ || ssid != settings_provision_ssid_;
+    if (provision_changed) {
+        settings_provision_phase_ = phase;
+        settings_provision_active_ = active;
+        settings_provision_ssid_ = ssid;
+        if (state_.screen == wqn::UiScreen::kSettings &&
+            (phase == wqn::ProvisionState::kFailed || phase == wqn::ProvisionState::kConnected ||
+             (phase == wqn::ProvisionState::kConnecting && !active))) {
+            settings.dialog = wqn::SettingsDialog::kProvisioningResult;
+            settings.notice.clear();
+        }
+        refresh = RefreshSchedule::kConfig;
+    }
+    if (phase != wqn::ProvisionState::kIdle &&
+        (active || settings.dialog == wqn::SettingsDialog::kProvisioningResult)) {
+        // Read cached identities through the service; QR/result rendering never
+        // reloads NVS or starts network work. These fields also feed the normal
+        // frame signature so late STA handoff data gets its own refresh.
+        const auto network = wqn::services::GetConnectivitySnapshot();
+        const auto copy_identity = [&](char* target, size_t size, const char* value) {
+            if (std::strcmp(target, value) == 0) return;
+            std::snprintf(target, size, "%s", value);
+            refresh = RefreshSchedule::kConfig;
+        };
+        copy_identity(settings.wifi_primary_ssid, sizeof(settings.wifi_primary_ssid), network.primary_ssid);
+        copy_identity(settings.wifi_backup_ssid, sizeof(settings.wifi_backup_ssid), network.backup_ssid);
+        copy_identity(settings.wifi_active_ssid, sizeof(settings.wifi_active_ssid), network.active_ssid);
+    }
+    return FinishEvent(AppEventKind::kSettingsTick, refresh, refresh != RefreshSchedule::kNone);
+}
+
 UiUpdate UiRuntime::DispatchStatusReload(wqn::AppState&& snapshot)
 {
     // A status reload updates background data; it is not a navigation event.
     // Preserve the foreground screen even if a snapshot loader regresses and
     // supplies a stale/default screen value.
     snapshot.screen = state_.screen;
+    snapshot.navigation = state_.navigation;
+    snapshot.home_viewed_session_id = state_.home_viewed_session_id;
+    snapshot.home_viewed_result_version = state_.home_viewed_result_version;
+    snapshot.selected_home_task = state_.selected_home_task;
+    if (snapshot.agent.home.checked_at_ms < state_.agent.home.checked_at_ms)
+        snapshot.agent.home = state_.agent.home;
     const std::string before = FrameSignature(wqn::RenderUiFrame(state_));
     const uint64_t revision = state_.revision;
     state_ = std::move(snapshot);
     state_.revision = revision;
+    UpdateHomeAiSummary(&state_, esp_timer_get_time() / 1000);
     const std::string after = FrameSignature(wqn::RenderUiFrame(state_));
     const bool changed = before != after;
     return FinishEvent(

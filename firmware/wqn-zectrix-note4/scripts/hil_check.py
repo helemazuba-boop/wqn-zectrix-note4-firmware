@@ -5019,6 +5019,21 @@ def selftest():
         hil_word_commit_queue, lifecycle + commit(t=11000, wait=600), queue_name), 'SKIP')
     check('总 END 后的排队 FAIL 仍保留，不全日志剔除', verdict(
         hil_word_commit_queue, lifecycle + commit(t=25000, wait=600), queue_name), 'FAIL')
+    # Measurement removal keeps debug summaries, without pretending they carry
+    # the old latency/accounting schema. Historical malformed records still FAIL
+    # in the tests below; summaries must not turn a missing measurement into FAIL.
+    retired_summaries = ('unrelated first line\n'
+        'D (500) word_store: word observation committed: sequence=16 mode=3 '
+        f'session={fixture_sid}\n'
+        'D (1000) word_store: word observation batch committed: count=5 appended=5 '
+        f'first_sequence=16 last_sequence=20 mode=3 session={fixture_sid}\n'
+        'D (1500) word_store: word ACK batch committed: count=5\n')
+    for name in ('LOG:word-batches-parsed', 'WRITE:word-batch-record-accounting',
+                 'WRITE:word-batch-transaction-window'):
+        check('退役测量后的摘要不冒充证据 ' + name,
+              verdict(hil_word_batches, retired_summaries, name), 'SKIP')
+    check('单笔摘要不进入旧延迟样本',
+          len(Log.from_text(retired_summaries, '<retired-measurements>').obs_durable), 0)
     # Batch-era fixtures are deliberately multi-line with a non-match first.
     batch_ram = ('I (100) word_app: word observation RAM accepted: sequence=16 pending=2 inflight=1 '
                  f'session={fixture_sid}\n')

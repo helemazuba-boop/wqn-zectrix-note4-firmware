@@ -150,6 +150,4 @@ esp_err_t SuspendPendingNoteObservation(
     const std::string& request_id,
     OutboxSuspendReason reason);
 esp_err_t ReadNoteOutboxSnapshot(NoteOutboxSnapshot* snapshot);
-esp_err_t PrepareNoteObservationOutboxForSleep(int64_t deadline_us);
-
 }  // namespace wqn

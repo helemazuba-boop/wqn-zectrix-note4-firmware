@@ -149,11 +149,11 @@ int main() {
     Check(sizeof(OutboxRecord)==200 && kOutboxMaxRecords==2064 && kOutboxMaxBytes==412800,
           "physical byte budget uses the actual packed production record, not the replay mock layout");
     Reset(); WriteRecords(kOutboxPath,one,kOutboxMaxRecords-1);
-    size_t bytes=0; int64_t open_ms=0;
-    Check(AppendOutboxRecord(two,&open_ms,&bytes)==ESP_OK && bytes==200 && Size(kOutboxPath)==412800,
+    size_t bytes=0;
+    Check(AppendOutboxRecord(two,&bytes)==ESP_OK && bytes==200 && Size(kOutboxPath)==412800,
           "physical append admits the last complete record at the exact byte boundary");
     g_outbox_cache_loaded=true; bytes=999;
-    Check(AppendOutboxRecord(two,&open_ms,&bytes)==ESP_ERR_INVALID_SIZE && bytes==0 &&
+    Check(AppendOutboxRecord(two,&bytes)==ESP_ERR_INVALID_SIZE && bytes==0 &&
           Size(kOutboxPath)==412800 && !g_outbox_cache_loaded,
           "physical full-file refusal writes zero bytes and invalidates stale cache");
     Reset(); WriteRecords(kOutboxPath,one,1,7); g_outbox_cache_loaded=true;
@@ -216,7 +216,7 @@ int main() {
     std::vector<OutboxRecord> batch;
     for(int i=0;i<10;++i) batch.push_back(Record("batch-"+std::to_string(i)));
     Reset(); bytes=999;
-    const auto batch_result=AppendOutboxRecords(batch.data(),5,&open_ms,&bytes);
+    const auto batch_result=AppendOutboxRecords(batch.data(),5,&bytes);
     const bool one_flush=write_calls==1 && flush_calls==1 && sync_calls==1 && close_calls==1;
     Check(batch_result==ESP_OK && bytes==1000 && one_flush &&
           ScanOutboxFile(kOutboxPath,&scan)==ESP_OK && scan.pending.size()==5 &&
@@ -228,7 +228,7 @@ int main() {
     for(int invalid=0;invalid<4;++invalid) {
         Reset(); bytes=999;
         const auto result=AppendOutboxRecordsTo(invalid==0?nullptr:kOutboxPath,
-            invalid==1?nullptr:batch.data(),invalid==2?0:invalid==3?11:5,&open_ms,&bytes,kOutboxMaxBytes);
+            invalid==1?nullptr:batch.data(),invalid==2?0:invalid==3?11:5,&bytes,kOutboxMaxBytes);
         Check(result==ESP_ERR_INVALID_ARG && bytes==0 && write_calls==0 && !FileExists(kOutboxPath),
               "invalid batch is refused before creating a journal");
     }
@@ -236,7 +236,7 @@ int main() {
     Check(AppendOutboxRecords(batch.data(),5)==ESP_OK && Size(kOutboxPath)==kOutboxMaxBytes,
           "entire batch fits the exact physical byte boundary");
     Reset(); WriteRecords(kOutboxPath,one,kOutboxMaxRecords-4); g_outbox_cache_loaded=true; bytes=999;
-    Check(AppendOutboxRecords(batch.data(),5,nullptr,&bytes)==ESP_ERR_INVALID_SIZE &&
+    Check(AppendOutboxRecords(batch.data(),5,&bytes)==ESP_ERR_INVALID_SIZE &&
           bytes==0 && write_calls==0 && !g_outbox_cache_loaded &&
           Size(kOutboxPath)==kOutboxMaxBytes-800,
           "batch quota checks all records before writing any prefix");
@@ -251,7 +251,7 @@ int main() {
     for(int prefix=0;prefix<5;++prefix) {
         Reset(); partial_write=true; partial_write_bytes=size_t(prefix)*200+7;
         g_outbox_cache_loaded=true; bytes=999;
-        const bool failed=AppendOutboxRecords(batch.data(),5,nullptr,&bytes)==ESP_FAIL &&
+        const bool failed=AppendOutboxRecords(batch.data(),5,&bytes)==ESP_FAIL &&
             !g_outbox_cache_loaded && bytes==size_t(prefix)*200+7 && sync_calls==0;
         Check(failed && EnsureOutboxCache(&cached)==ESP_OK && cached->partial_tail &&
               cached->pending.size()==size_t(prefix) && cached->total_records==size_t(prefix),

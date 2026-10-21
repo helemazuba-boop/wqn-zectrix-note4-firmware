@@ -73,15 +73,11 @@ struct TimeAppState {
     char task_name[32] = "";
 };
 
-void ResetTimeApp(TimeAppState* state);
 bool HandleTimeAppInput(TimeAppState* state, TimeInput input);
 bool TickTimeApp(TimeAppState* state, int64_t now_ms);
 bool TimeAppHasActiveTimer(const TimeAppState& state);
 bool TimeAppIsEditingValue(const TimeAppState& state);
 void DisarmTimeAppAction(TimeAppState* state);
-std::string TimeAppPrimaryLine(const TimeAppState& state);
-std::string FormatTimerDuration(int total_seconds);
-const char* PomodoroPhaseLabel(PomodoroPhase phase);
 int TimeAppPhaseTotalSeconds(const TimeAppState& state);
 int TimeAppVisualProgressBucket(const TimeAppState& state);
 int TimeAppVisualProgressSeconds(const TimeAppState& state);
@@ -91,7 +87,6 @@ int PomodoroGroupTotalSeconds(const TimeAppState& state);
 // fields, then Start / Exit. The UI renderer and the input reducer share
 // these helpers so box selection and confirm routing never drift apart.
 int TimeAppPresetFieldBase(TimeTile tile);
-int TimeAppPresetFieldCount(TimeTile tile);
 int TimeAppStartField(TimeTile tile);
 void TimeAppVisibleRoundWindow(
     const TimeAppState& state,

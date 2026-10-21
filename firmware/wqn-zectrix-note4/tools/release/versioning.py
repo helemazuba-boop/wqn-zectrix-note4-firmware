@@ -29,7 +29,7 @@ DEFAULT_BUILD_DIR = "build-ai-local-s3"
 # produce a different firmware with an unchanged version.
 EXTRA_BUILD_INPUTS = ("sdkconfig",)
 
-MANIFEST_EXCLUDE_SUFFIX = (".log", ".bin", ".elf", ".map", ".lock", ".tmp", ".tgz", ".zip")
+MANIFEST_EXCLUDE_SUFFIX = (".log", ".bin", ".elf", ".map", ".tmp", ".tgz", ".zip")
 MANIFEST_EXCLUDE_DIRS = {
     "dist",
     "backups",
@@ -45,6 +45,7 @@ MANIFEST_EXCLUDE_DIRS = {
 SNAPSHOT_DIRS = ("main", "components", "partitions", "cmake", "tools")
 SNAPSHOT_FILES = (
     "CMakeLists.txt",
+    "dependencies.lock",
     "sdkconfig",
     "sdkconfig.defaults",
     "sdkconfig.ai-local.defaults",
@@ -137,7 +138,11 @@ def _excluded(rel_path: str) -> bool:
     parts = rel_path.split("/")
     if any(p in MANIFEST_EXCLUDE_DIRS or p.startswith("build-") or p == "build" for p in parts):
         return True
-    return rel_path.endswith(MANIFEST_EXCLUDE_SUFFIX)
+    # ESP-IDF's tracked dependency lock selects component versions and is a
+    # build input. Other lock files are transient coordination artifacts.
+    return rel_path.endswith(MANIFEST_EXCLUDE_SUFFIX) or (
+        rel_path.endswith(".lock") and rel_path != "dependencies.lock"
+    )
 
 
 def source_manifest() -> dict[str, str]:
@@ -233,21 +238,39 @@ def assign_version(
     kind: str,
     date: str | None = None,
     remote_max_serial: int = 0,
+    remote_index: dict | None = None,
 ) -> tuple[str, bool]:
     """Return (version, reused). Reuses the serial when the fingerprint is known."""
     date = date or datetime.now().strftime("%Y%m%d")
     index = load_version_index()
     day = index.setdefault("days", {}).setdefault(date, {})
+    remote_day = (remote_index or {}).get("days", {}).get(date, {})
+
+    # A serial remembered locally can belong to another image on the server.
+    # Keep its historical record, but never select it again for a new build.
+    for serial, record in day.items():
+        remote = remote_day.get(serial)
+        if remote is not None and remote.get("fingerprint") != record.get("fingerprint"):
+            record["remote_conflict"] = True
 
     for serial, record in day.items():
-        if not serial.isdigit() or record.get("fingerprint") != fingerprint:
+        if (not serial.isdigit() or record.get("fingerprint") != fingerprint
+                or record.get("remote_conflict")):
             continue
         if kind == "release" and record.get("kind") != "release":
             record["kind"] = "release"
-            save_version_index(index)
+        save_version_index(index)
         return f"{date}.{serial}", True
 
-    used = [int(s) for s in day if s.isdigit()]
+    # A fresh machine can reuse the server's identity for the same content.
+    for serial, record in remote_day.items():
+        if (serial.isdigit() and record.get("fingerprint") == fingerprint
+                and serial not in day):
+            day[serial] = {**record, "kind": kind}
+            save_version_index(index)
+            return f"{date}.{serial}", True
+
+    used = [int(s) for s in (*day, *remote_day) if s.isdigit()]
     serial = str(max([*used, remote_max_serial], default=0) + 1)
     day[serial] = {
         "fingerprint": fingerprint,

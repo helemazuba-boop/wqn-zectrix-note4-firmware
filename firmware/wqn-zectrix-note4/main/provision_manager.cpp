@@ -142,9 +142,7 @@ void ProvisionTask(void*)
                 g_prov_ssid = updated_store.slots[updated_store.preferred].ssid;
                 g_prov_password = updated_store.slots[updated_store.preferred].password;
             }
-            g_prov_state = role == wqn::provision::NetworkRole::kPrimary
-                ? wqn::ProvisionState::kConnecting
-                : wqn::ProvisionState::kScanning;
+            g_prov_state = wqn::ProvisionState::kScanning;
             xEventGroupSetBits(g_prov_events, kCredentialsSavedBit);
             ESP_LOGI(
                 kTag,
@@ -207,10 +205,12 @@ void ProvisionTask(void*)
                 ssid = g_prov_ssid;
                 password = g_prov_password;
             }
-            g_prov_state = wqn::ProvisionState::kConnected;
-            ESP_LOGI(kTag, "provisioning completed: SSID=%s", ssid.c_str());
+            g_prov_state = wqn::ProvisionState::kConnecting;
+            ESP_LOGI(kTag, "provisioning saved; starting STA: SSID=%s", ssid.c_str());
             if (callback && !ssid.empty()) {
                 callback(ssid, password);  // AP/DNS/httpd are stopped before STA handoff.
+            } else {
+                g_prov_state = wqn::ProvisionState::kFailed;
             }
         } else if (cancelled) {
             ESP_LOGI(kTag, "provisioning cancelled");
@@ -360,6 +360,17 @@ void SetProvisionDoneCallback(ProvisionDoneCallback callback)
     g_prov_done_callback = std::move(callback);
 #else
     (void)callback;
+#endif
+}
+
+void ReportProvisioningConnectionResult(bool connected)
+{
+#if defined(CONFIG_WQN_WIFI_STA_ENABLE) && defined(CONFIG_WQN_PROVISION_ENABLE)
+    ProvisionState expected = ProvisionState::kConnecting;
+    g_prov_state.compare_exchange_strong(
+        expected, connected ? ProvisionState::kConnected : ProvisionState::kFailed);
+#else
+    (void)connected;
 #endif
 }
 

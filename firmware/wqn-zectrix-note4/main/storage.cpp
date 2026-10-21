@@ -957,11 +957,6 @@ esp_err_t InitStorage()
     ESP_LOGW(kTag, "NVS encryption is disabled; device credentials are stored as plaintext NVS values");
 #endif
     ESP_LOGI(kTag, "NVS ready");
-    // [measure] §五之十 §6: seed the entry-budget baseline before any session
-    // write, so the first per-write delta has something to be a delta against.
-    // total_entries here is the denominator every percentage in §五之十 relies
-    // on and it has so far only been derived (4 pages x 126), never measured.
-    LogNvsStatsProbe();
     ESP_RETURN_ON_ERROR(InitStoragePartition(), kTag, "init storage partition");
     ESP_RETURN_ON_ERROR(services::StartStorageService(), kTag, "start storage service");
     // [deck-scope] Replay an interrupted default-deck change and seed the
@@ -1022,45 +1017,6 @@ bool ReadStorageCapacitySnapshot(StorageCapacitySnapshot* snapshot)
     return snapshot->spiffs_valid || snapshot->nvs_valid;
 }
 
-// [measure] §五之十 §6. Field names are a contract with scripts/hil_check.py:
-// WRITE:nvs-entry-budget-measured greps `nvs stats:` and requires total_entries,
-// and WRITE:parts-account-for-transaction folds `nvs write:`'s total_ms into the
-// per-transaction write sum. Renaming either is a silent SKIP, which this judge
-// has already been bitten by four times (three renames, plus one field INSERTED
-// in the middle of an existing line that a positional regex matched). Do not add
-// fields to the middle of a line: append them at the end.
-void LogNvsWriteProbe(const NvsWriteProbe& probe)
-{
-    ESP_LOGI(
-        kTag,
-        "nvs write: key=%s bytes=%u total_ms=%lld changed=%d",
-        probe.key != nullptr ? probe.key : "?",
-        static_cast<unsigned>(probe.bytes),
-        static_cast<long long>(probe.total_ms),
-        probe.changed ? 1 : 0);
-}
-
-void LogNvsStatsProbe()
-{
-    nvs_stats_t stats = {};
-    // nullptr means "the default NVS partition" (nvs_api.cpp:555 maps it to
-    // NVS_DEFAULT_PART_NAME); spelling "nvs" literally would fail on a partition
-    // table that renames it. A silent return here is unreachable in practice:
-    // every caller has already opened the namespace successfully, and
-    // nvs_get_stats can only fail with NOT_INITIALIZED / INVALID_STATE.
-    if (nvs_get_stats(nullptr, &stats) != ESP_OK) {
-        return;
-    }
-    ESP_LOGI(
-        kTag,
-        "nvs stats: used_entries=%zu free_entries=%zu available_entries=%zu "
-        "total_entries=%zu",
-        stats.used_entries,
-        stats.free_entries,
-        stats.available_entries,
-        stats.total_entries);
-}
-
 // [word-session-cursor-nvs] The 52 B pause/resume cursor used to be a 52 B
 // AtomicWrite on SPIFFS, measured at a 1,766 ms median (n=7 late-boot,
 // doc/1005-storage-rewrite-todo.md §五之八). That write is what made answering
@@ -1074,16 +1030,10 @@ void LogNvsStatsProbe()
 // already execute on the storage owner task. Re-queueing them would nest a
 // second write inside a transaction that is already the single writer (§7.4).
 //
-// Read-then-compare instead of an unconditional set is not a micro-optimization
-// -- it is what makes the probe honest. IDF short-circuits an identical value
-// itself (nvs_storage.cpp:504-507 for a single chunk, :478-480 multi-page), so
-// an unconditional nvs_set_blob would report changed=1 for a write that never
-// touched flash, and the WRITE:parts-account-for-transaction judge could not
-// tell "the cursor was unchanged, so it cost nothing" from "NVS is just fast".
-// Those are different conclusions and only one of them is evidence.
+// Compare before committing so unchanged cursors avoid a write and preserve
+// the existing error and retry behavior.
 esp_err_t SaveWordSessionCursorNvs(const char* key, const void* record, size_t size)
 {
-    const int64_t entered_us = esp_timer_get_time();
     NvsHandle nvs;
     ESP_RETURN_ON_ERROR(
         nvs_open(WQN_NVS_NAMESPACE, NVS_READWRITE, &nvs.handle), kTag, "open NVS namespace");
@@ -1115,15 +1065,6 @@ esp_err_t SaveWordSessionCursorNvs(const char* key, const void* record, size_t s
         }
     }
 
-    NvsWriteProbe probe = {};
-    probe.key = key;
-    probe.bytes = size;
-    probe.total_ms = (esp_timer_get_time() - entered_us) / 1000;
-    probe.changed = changed;
-    LogNvsWriteProbe(probe);
-    // Per-write, not just at boot: the whole point is the free_entries trend
-    // across a run of answers, which is what locates the §五之十 cliff.
-    LogNvsStatsProbe();
     return ESP_OK;
 }
 
@@ -1137,12 +1078,6 @@ esp_err_t SaveWordSessionCursorNvs(const char* key, const void* record, size_t s
 // NOT_FOUND is success: clearing a mode that never had a cursor is normal.
 esp_err_t ClearWordSessionCursorNvs(const char* key)
 {
-    // The window starts before nvs_open, not before nvs_commit: nvs_commit is a
-    // no-op in IDF v5.5 (nvs_api.cpp:411-420, "no-op for now"), so timing only
-    // the commit would report ~0 ms for an operation that really costs an open
-    // plus an erase. SaveWordSessionCursorNvs opens its window the same place, so
-    // the two lines are comparable.
-    const int64_t entered_us = esp_timer_get_time();
     NvsHandle nvs;
     esp_err_t result = nvs_open(WQN_NVS_NAMESPACE, NVS_READWRITE, &nvs.handle);
     if (result == ESP_ERR_NVS_NOT_FOUND) {
@@ -1158,23 +1093,6 @@ esp_err_t ClearWordSessionCursorNvs(const char* key)
         return result;
     }
     result = nvs_commit(nvs.handle);
-    NvsWriteProbe probe = {};
-    probe.key = key;
-    probe.bytes = 0;
-    probe.total_ms = (esp_timer_get_time() - entered_us) / 1000;
-    // changed=true, NOT false: this function returns early on NOT_FOUND without
-    // emitting a probe at all, so reaching the line means the key existed and
-    // three entries were really erased. Reporting changed=0 here would make the
-    // judge's breakdown file this under "same value, flash untouched" (see G.4),
-    // which is the opposite of what an erase does -- and it would hide exactly
-    // the entry consumption that §五之十's 504-entry budget is watching.
-    probe.changed = true;
-    LogNvsWriteProbe(probe);
-    // So the erase shows up on the same free_entries curve the saves do: without
-    // it, the one moment used_entries should DROP is the one moment with no
-    // reading, and an entry leak after a clear would be invisible until the next
-    // answer.
-    LogNvsStatsProbe();
     return result;
 }
 
@@ -1210,74 +1128,6 @@ esp_err_t LoadWordSessionCursorNvs(const char* key, void* record, size_t size, b
         nvs_get_blob(nvs.handle, key, record, &stored_size), kTag, "read word session cursor");
     *found = true;
     return ESP_OK;
-}
-esp_err_t RunWordCursorNvsSmokeProbe(void*)
-{
-    if (!services::IsStorageServiceTask()) return ESP_ERR_INVALID_STATE;
-    constexpr char key[] = "_hil_cur52";
-    constexpr size_t bytes = 52;
-    NvsHandle preflight;
-    ESP_RETURN_ON_ERROR(nvs_open(WQN_NVS_NAMESPACE, NVS_READONLY, &preflight.handle),
-                        kTag, "smoke requires an existing namespace");
-    size_t size = 0;
-    const esp_err_t existing = nvs_get_blob(preflight.handle, key, nullptr, &size);
-    if (existing != ESP_ERR_NVS_NOT_FOUND) {
-        ESP_LOGW(kTag, "NVS cursor smoke refused: scratch key not absent result=%s",
-                 esp_err_to_name(existing));
-        return ESP_ERR_INVALID_STATE;  // Do not overwrite or clean up a prior value.
-    }
-    size_t base_entries = 0;
-    ESP_RETURN_ON_ERROR(nvs_get_used_entry_count(preflight.handle, &base_entries),
-                        kTag, "smoke namespace entry count");
-    ESP_LOGI(kTag, "NVS cursor smoke BEGIN key=%s bytes=%u namespace_entries=%u synthetic=1",
-             key, static_cast<unsigned>(bytes), static_cast<unsigned>(base_entries));
-    LogNvsStatsProbe();
-    uint8_t first[bytes] = {}, second[bytes] = {}, loaded[bytes] = {};
-    for (size_t i = 0; i < bytes; ++i) first[i] = static_cast<uint8_t>(17 * i + 0x45);
-    std::memcpy(second, first, bytes);
-    second[0] ^= 1;
-    const auto check_step = [&](const char* phase, esp_err_t result, size_t expected_entries) {
-        size_t actual = 0;
-        const esp_err_t counted = nvs_get_used_entry_count(preflight.handle, &actual);
-        if (result == ESP_OK && counted != ESP_OK) result = counted;
-        if (result == ESP_OK && actual != expected_entries) result = ESP_ERR_INVALID_STATE;
-        ESP_LOGI(kTag,
-                 "NVS cursor smoke step: phase=%s result=%s namespace_entries=%u expected_entries=%u synthetic=1",
-                 phase, esp_err_to_name(result), static_cast<unsigned>(actual),
-                 static_cast<unsigned>(expected_entries));
-        // Feed IDLE0 between tiny operations; this is not a timing deadline.
-        vTaskDelay(1);
-        return result;
-    };
-    esp_err_t result = check_step("create", SaveWordSessionCursorNvs(key, first, bytes), base_entries + 4);
-    bool found = false;
-    if (result == ESP_OK) {
-        result = LoadWordSessionCursorNvs(key, loaded, bytes, &found);
-        if (result == ESP_OK && (!found || std::memcmp(first, loaded, bytes) != 0)) result = ESP_FAIL;
-        result = check_step("read-created", result, base_entries + 4);
-    }
-    if (result == ESP_OK) result = check_step("same-value", SaveWordSessionCursorNvs(key, first, bytes), base_entries + 4);
-    if (result == ESP_OK) result = check_step("rewrite", SaveWordSessionCursorNvs(key, second, bytes), base_entries + 4);
-    if (result == ESP_OK) {
-        found = false;
-        result = LoadWordSessionCursorNvs(key, loaded, bytes, &found);
-        if (result == ESP_OK && (!found || std::memcmp(second, loaded, bytes) != 0)) result = ESP_FAIL;
-        result = check_step("read-rewritten", result, base_entries + 4);
-    }
-    // Preflight proved absent and the sole writer owns this whole transaction.
-    // Cleanup is safe even if the first attempted set partially failed.
-    const esp_err_t erased = check_step("erase", ClearWordSessionCursorNvs(key), base_entries);
-    if (result == ESP_OK) result = erased;
-    if (erased == ESP_OK) {
-        found = false;
-        esp_err_t absent = LoadWordSessionCursorNvs(key, loaded, bytes, &found);
-        if (absent == ESP_OK && found) absent = ESP_FAIL;
-        absent = check_step("read-erased", absent, base_entries);
-        if (result == ESP_OK) result = absent;
-    }
-    ESP_LOGI(kTag, "NVS cursor smoke END key=%s result=%s cleanup=%s synthetic=1",
-             key, esp_err_to_name(result), esp_err_to_name(erased));
-    return result;
 }
 
 esp_err_t EnsurePackDownloadCapacity(
@@ -1562,18 +1412,6 @@ esp_err_t LoadAutoSyncIntervalMinutes(uint32_t* minutes)
     return ESP_OK;
 }
 
-esp_err_t SaveAutoSyncIntervalMinutes(uint32_t minutes)
-{
-    StorageWriteGuard write("save-sync-interval", __FILE__, __LINE__);
-    if (!write) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    if (!IsValidAutoSyncInterval(minutes)) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    return SaveU64ToNvs(kAutoSyncIntervalMinKey, minutes);
-}
-
 esp_err_t SaveAutoSyncIntervalMinutesForeground(uint32_t minutes)
 {
     StorageWriteGuard write("save-sync-interval", __FILE__, __LINE__);
@@ -1770,22 +1608,6 @@ esp_err_t SaveWordSequentialCursor(uint32_t cursor)
         SaveU64Transaction, &context, "word-sequential-cursor");
 }
 
-esp_err_t SaveDefaultWordDeckId(const std::string& deck_id)
-{
-    StorageWriteGuard write("save-word-deck", __FILE__, __LINE__);
-    if (!write) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    if (deck_id.empty()) {
-        // Empty selection = all decks; drop the key entirely.
-        return ClearNvsKey(kDefaultWordDeckKey);
-    }
-    if (deck_id.size() != 36) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    return SaveStringToNvs(kDefaultWordDeckKey, deck_id);
-}
-
 namespace {
 
 // [deck-scope] Recoverable default-deck change (c5). NVS keys:
@@ -1950,7 +1772,6 @@ esp_err_t ChangeDefaultWordDeckForeground(const std::string& deck_id)
 //
 // kDefaultWordDeckKey is deliberately untouched: this path scopes the word page,
 // it does not change what "default deck" means.
-struct WordSessionScopeResetContext {};
 
 esp_err_t WordSessionScopeResetTransaction(void*)
 {
@@ -2041,10 +1862,10 @@ std::string AutoSyncIntervalLabel(uint32_t minutes)
 constexpr int kVolumeDefaultPercent = 100;
 constexpr const char* kAudioNamespace = "audio";
 constexpr const char* kVolumeNvsKey = "output_volume";
-// [persist-worker] Read by the audio task, written by the UI task (the sync
-// SaveVolumePercent and SubmitVolumeSave's post-reserve update via
-// SetPlaybackVolumeCache) plus the boot restore in main.cpp. Atomic + relaxed
-// removes the cross-task data race; the value is a self-contained scalar so no
+// [persist-worker] Read by the audio task, written by the UI task after
+// SubmitVolumeSave reserves/enqueues via SetPlaybackVolumeCache, plus the
+// boot restore in main.cpp. Atomic + relaxed removes the cross-task data race;
+// the value is a self-contained scalar so no
 // ordering with other state is needed.
 std::atomic<int> g_volume_percent_cache{kVolumeDefaultPercent};
 
@@ -2109,19 +1930,6 @@ esp_err_t LoadVolumePercent(int* percent)
     // rolled the audible volume back under the user. Boot explicitly seeds the
     // cache via SetPlaybackVolumeCache (main.cpp).
     return ret;
-}
-
-esp_err_t SaveVolumePercent(int percent)
-{
-    StorageWriteGuard write("save-volume", __FILE__, __LINE__);
-    if (!write) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    if (percent < 0 || percent > 100) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    g_volume_percent_cache.store(percent, std::memory_order_relaxed);
-    return services::ExecuteStorageTransactionNamed(SaveVolumeTransaction, &percent, "save-volume");
 }
 
 esp_err_t SaveVolumePercentForeground(int percent)
@@ -2532,20 +2340,6 @@ esp_err_t SetWifiCredentialForRole(
         store.preferred = target;
     }
     store.version = kWifiCredentialStoreVersion;
-    return SaveWifiCredentialStore(store);
-}
-
-esp_err_t MarkWifiSlotPreferred(uint8_t index)
-{
-    WifiCredentialStore store;
-    ESP_RETURN_ON_ERROR(LoadWifiCredentialStore(&store), kTag, "load store for mark preferred");
-    if (index >= store.count) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    if (store.preferred == index) {
-        return ESP_OK;  // unchanged; skip the NVS commit
-    }
-    store.preferred = index;
     return SaveWifiCredentialStore(store);
 }
 

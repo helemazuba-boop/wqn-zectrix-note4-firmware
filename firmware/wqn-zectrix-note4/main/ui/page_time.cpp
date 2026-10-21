@@ -47,20 +47,6 @@ void DrawTimerStatusBar(const char* title, const wqn::HomeSummary& home)
     DrawStatusBarIcons(wqn::kEpdWidth - 10, 6, home);
 }
 
-void DrawProgressBar(int x, int y, int width, int height, int current, int total)
-{
-    // [v2] Rounded container outline (progress bar is a content container).
-    // Shared by the timer page and the settings storage/NVS/PSRAM bars.
-    DrawRoundedRect(x, y, width, height, kChipRadius);
-    if (total <= 0) {
-        return;
-    }
-    const int filled = std::min(width - 2, std::max(0, (width - 2) * current / total));
-    if (filled > 0) {
-        FillRect(x + 1, y + 1, filled, height - 2, true);
-    }
-}
-
 void DrawConfigBox(int x, int y, int width, int height, const std::string& value, const std::string& label, bool selected)
 {
     // [v2] Focus decoration: rounded reverse-fill (kInvert) when selected --

@@ -3,6 +3,7 @@
 // Extracted from device_ui.cpp.
 
 #include "ui_internal.h"
+#include "ai_scroll_geometry.h"
 #include "persist_worker.h"
 
 #include <string>
@@ -14,7 +15,9 @@
 #include "flash_session.h"
 #include "opencode_session.h"
 #include "power_manager.h"
+#include "provision_manager.h"
 #include "runtime/sleep_diagnostics.h"
+#include "runtime/memory_diagnostics.h"
 #include "word_pack.h"
 #include "services/connectivity_service.h"
 #include "services/sync_service.h"
@@ -82,13 +85,14 @@ void RequestWordPackRedownload(wqn::UiState* state)
     }
 }
 
-RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiState* state)
+static RefreshSchedule ReduceSettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiState* state)
 {
     if (state == nullptr || state->screen != wqn::UiScreen::kSettings || !event.HasEvent()) {
         return RefreshSchedule::kNone;
     }
 
     const bool short_press = event.type == wqn::ButtonEventType::kShortPress;
+    const bool move_press = short_press || event.type == wqn::ButtonEventType::kDoublePress;
     const bool long_press = event.type == wqn::ButtonEventType::kLongPress;
     // [longpress-fix] Driver-marked auto-repeat; the old duration-based gate
     // (>=1150ms) let the 2nd repeat (650+260=910ms) through as a fresh long
@@ -102,15 +106,44 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
         return RefreshSchedule::kNone;
     }
 
+    auto& settings = state->settings;
+    const bool saving = settings.auto_sync_save_op_id || settings.volume_save_op_id ||
+        settings.image_render_save_op_id || settings.word_deck_save_op_id || settings.auto_follow_save_op_id;
+    if (saving && event.button == wqn::ButtonId::kConfirm && (short_press || long_press)) {
+        settings.notice = "正在保存，请稍候";
+        return RefreshSchedule::kConfig;
+    }
+    if (move_press && event.button != wqn::ButtonId::kConfirm && !saving) settings.notice.clear();
+
+    // The candidate is separate from the durable value. Cancel drops only an
+    // unsaved draft; it never resets an operation id awaiting the worker ACK.
+    if (long_press && event.button == wqn::ButtonId::kConfirm) {
+        bool choice = true;
+        switch (settings.dialog) {
+            case wqn::SettingsDialog::kAutoSync: settings.auto_sync_pending_valid = false; break;
+            case wqn::SettingsDialog::kVolume: settings.volume_pending_valid = false; break;
+            case wqn::SettingsDialog::kImageRendering: settings.image_render_pending_valid = false; break;
+            case wqn::SettingsDialog::kAiFollow: settings.auto_follow_pending_valid = false; break;
+            case wqn::SettingsDialog::kDefaultWordDeck:
+                settings.word_deck_pending_valid = false;
+                settings.pending_word_deck_id.clear(); settings.pending_word_deck_title.clear(); break;
+            default: choice = false; break;
+        }
+        if (choice) {
+            settings.dialog = wqn::SettingsDialog::kNone; settings.notice.clear();
+            return RefreshSchedule::kConfig;
+        }
+    }
+
     if (state->settings.dialog == wqn::SettingsDialog::kAutoSync) {
-        if (short_press && event.button == wqn::ButtonId::kUp) {
+        if (move_press && event.button == wqn::ButtonId::kUp) {
             if (state->settings.auto_sync_selected == 0) {
                 return RefreshSchedule::kNone;
             }
             --state->settings.auto_sync_selected;
             return RefreshSchedule::kConfig;
         }
-        if (short_press && event.button == wqn::ButtonId::kDownPower) {
+        if (move_press && event.button == wqn::ButtonId::kDownPower) {
             if (state->settings.auto_sync_selected + 1 >= kAutoSyncOptionsCount) {
                 return RefreshSchedule::kNone;
             }
@@ -144,14 +177,14 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
     }
 
     if (state->settings.dialog == wqn::SettingsDialog::kVolume) {
-        if (short_press && event.button == wqn::ButtonId::kUp) {
+        if (move_press && event.button == wqn::ButtonId::kUp) {
             if (state->settings.volume_selected == 0) {
                 return RefreshSchedule::kNone;
             }
             --state->settings.volume_selected;
             return RefreshSchedule::kConfig;
         }
-        if (short_press && event.button == wqn::ButtonId::kDownPower) {
+        if (move_press && event.button == wqn::ButtonId::kDownPower) {
             if (state->settings.volume_selected + 1 >= kVolumeOptionsCount) {
                 return RefreshSchedule::kNone;
             }
@@ -180,14 +213,14 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
     }
 
     if (state->settings.dialog == wqn::SettingsDialog::kImageRendering) {
-        if (short_press && event.button == wqn::ButtonId::kUp) {
+        if (move_press && event.button == wqn::ButtonId::kUp) {
             if (state->settings.image_render_selected == 0) {
                 return RefreshSchedule::kNone;
             }
             --state->settings.image_render_selected;
             return RefreshSchedule::kConfig;
         }
-        if (short_press && event.button == wqn::ButtonId::kDownPower) {
+        if (move_press && event.button == wqn::ButtonId::kDownPower) {
             if (state->settings.image_render_selected >= 1) {
                 return RefreshSchedule::kNone;
             }
@@ -219,14 +252,14 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
     }
 
     if (state->settings.dialog == wqn::SettingsDialog::kAiFollow) {
-        if (short_press && event.button == wqn::ButtonId::kUp) {
+        if (move_press && event.button == wqn::ButtonId::kUp) {
             if (state->settings.ai_follow_selected == 0) {
                 return RefreshSchedule::kNone;
             }
             --state->settings.ai_follow_selected;
             return RefreshSchedule::kConfig;
         }
-        if (short_press && event.button == wqn::ButtonId::kDownPower) {
+        if (move_press && event.button == wqn::ButtonId::kDownPower) {
             if (state->settings.ai_follow_selected >= 1) {
                 return RefreshSchedule::kNone;
             }
@@ -262,14 +295,25 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
 
     if (state->settings.dialog == wqn::SettingsDialog::kDefaultWordDeck) {
         auto& settings = state->settings;
-        if (short_press && event.button == wqn::ButtonId::kUp) {
+        if (settings.word_deck_status != wqn::SettingsDeckStatus::kReady) {
+            if (short_press && event.button == wqn::ButtonId::kConfirm &&
+                settings.word_deck_status != wqn::SettingsDeckStatus::kLoading) {
+                wqn::services::RequestContentRefresh(wqn::services::SyncContentDomain::kWordPacks);
+                const bool queued = QueueWordReviewRefresh();
+                UpdateSettingsDeckStatus(state);
+                settings.notice = queued ? "正在同步词库…" : "已请求同步，请稍候";
+                return RefreshSchedule::kConfig;
+            }
+            return RefreshSchedule::kNone;
+        }
+        if (move_press && event.button == wqn::ButtonId::kUp) {
             if (settings.word_deck_selected == 0) {
                 return RefreshSchedule::kNone;
             }
             --settings.word_deck_selected;
             return RefreshSchedule::kConfig;
         }
-        if (short_press && event.button == wqn::ButtonId::kDownPower) {
+        if (move_press && event.button == wqn::ButtonId::kDownPower) {
             if (settings.word_deck_selected + 1 >= settings.word_deck_options.size()) {
                 return RefreshSchedule::kNone;
             }
@@ -319,7 +363,42 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
     }
 
     if (state->settings.dialog == wqn::SettingsDialog::kWifiManage) {
+        if (long_press && event.button == wqn::ButtonId::kConfirm) {
+            state->settings.dialog = wqn::SettingsDialog::kNone;
+            return RefreshSchedule::kConfig;
+        }
+        if (move_press && (event.button == wqn::ButtonId::kUp || event.button == wqn::ButtonId::kDownPower)) {
+            auto& selected = state->settings.wifi_action_selected;
+            selected = event.button == wqn::ButtonId::kUp ? (selected + 3) % 4 : (selected + 1) % 4;
+            return RefreshSchedule::kConfig;
+        }
         if (event.button == wqn::ButtonId::kConfirm && short_press) {
+            auto& settings = state->settings;
+            if (settings.wifi_switch_op_id != 0) {
+                settings.notice = "正在切换 WiFi，请稍候";
+                return RefreshSchedule::kConfig;
+            }
+            if (settings.wifi_action_selected < 2) {
+                const bool primary = settings.wifi_action_selected == 0;
+                if ((primary ? settings.wifi_primary_ssid : settings.wifi_backup_ssid)[0] == '\0') {
+                    settings.notice = primary ? "请先配置主 WiFi" : "尚未配置备用 WiFi";
+                    return RefreshSchedule::kConfig;
+                }
+                if (AnyLocalPersistPending(*state)) {
+                    state->word_app.session.batch_flush_requested = true;
+                    settings.notice = "正在保存，请稍后切换";
+                    return RefreshSchedule::kConfig;
+                }
+                settings.wifi_switch_op_id = wqn::services::RequestWifiNetworkSwitch(primary
+                    ? wqn::services::WifiNetworkRole::kPrimary : wqn::services::WifiNetworkRole::kBackup);
+                settings.notice = settings.wifi_switch_op_id != 0
+                    ? "正在切换 WiFi…" : "网络正忙，请稍后重试";
+                return RefreshSchedule::kConfig;
+            }
+            if (settings.wifi_action_selected == 3) {
+                OpenSettingsDialog(state, wqn::SettingsDialog::kPairing);
+                return RefreshSchedule::kConfig;
+            }
             // [wifi-redundancy] Route through the connectivity service rather
             // than the provisioning component directly, keeping the
             // UI -> services dependency direction.
@@ -328,9 +407,23 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
             wqn::services::SetConnectivityProvisioning();
             return RefreshSchedule::kConfig;
         }
-        if ((event.button == wqn::ButtonId::kUp || event.button == wqn::ButtonId::kDownPower) &&
-            short_press) {
-            state->settings.dialog = wqn::SettingsDialog::kNone;
+        return RefreshSchedule::kNone;
+    }
+
+    if (state->settings.dialog == wqn::SettingsDialog::kPairing) {
+        if (event.button == wqn::ButtonId::kConfirm && (short_press || long_press)) {
+            OpenSettingsDialog(state, wqn::SettingsDialog::kWifiManage);
+            return RefreshSchedule::kConfig;
+        }
+        return RefreshSchedule::kNone;
+    }
+    if (state->settings.dialog == wqn::SettingsDialog::kProvisioningResult) {
+        if (event.button == wqn::ButtonId::kConfirm && (short_press || long_press)) {
+            if (short_press && wqn::GetProvisioningState() == wqn::ProvisionState::kFailed) {
+                state->settings.dialog = wqn::SettingsDialog::kNone;
+                state->settings.notice = "正在启动配网…";
+                wqn::services::SetConnectivityProvisioning();
+            } else OpenSettingsDialog(state, wqn::SettingsDialog::kWifiManage);
             return RefreshSchedule::kConfig;
         }
         return RefreshSchedule::kNone;
@@ -341,6 +434,8 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
     // nothing. kDevSync is deliberately NOT in this list -- see its own block
     // below, which is the one dev dialog that can act.
     if (state->settings.dialog == wqn::SettingsDialog::kBattery ||
+        state->settings.dialog == wqn::SettingsDialog::kBatterySummary ||
+        state->settings.dialog == wqn::SettingsDialog::kAbout ||
         state->settings.dialog == wqn::SettingsDialog::kStorage ||
         state->settings.dialog == wqn::SettingsDialog::kDevInfo ||
         state->settings.dialog == wqn::SettingsDialog::kDevErrors ||
@@ -366,10 +461,25 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
     if (state->settings.dialog == wqn::SettingsDialog::kDevSync) {
         if (event.button == wqn::ButtonId::kConfirm &&
             event.type == wqn::ButtonEventType::kDoublePress) {
+            const int64_t elapsed = event.occurred_at_ms - state->settings.sync_confirm_at_ms;
+            if (!state->settings.sync_confirm_pending || elapsed < 0 || elapsed > wqn::kButtonDoublePressWindowMs)
+                return RefreshSchedule::kNone;
+            state->settings.sync_confirm_pending = false;
+            if (AnyLocalPersistPending(*state)) {
+                state->word_app.session.batch_flush_requested = true;
+                state->settings.notice = "正在保存，请稍后";
+                return RefreshSchedule::kConfig;
+            }
             RequestWordPackRedownload(state);
             return RefreshSchedule::kConfig;
         }
-        if (event.button == wqn::ButtonId::kConfirm && (short_press || long_press)) {
+        if (event.button == wqn::ButtonId::kConfirm && short_press) {
+            state->settings.sync_confirm_pending = true;
+            state->settings.sync_confirm_at_ms = event.occurred_at_ms;
+            return RefreshSchedule::kNone;
+        }
+        if (event.button == wqn::ButtonId::kConfirm && long_press) {
+            state->settings.sync_confirm_pending = false;
             state->settings.dialog = wqn::SettingsDialog::kNone;
             return RefreshSchedule::kConfig;
         }
@@ -440,7 +550,7 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
             state->settings.notice.clear();
             return RefreshSchedule::kConfig;
         }
-        if (!short_press) {
+        if (!short_press && !(move_press && event.button != wqn::ButtonId::kConfirm)) {
             return RefreshSchedule::kNone;
         }
         if (event.button == wqn::ButtonId::kUp) {
@@ -461,6 +571,7 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
         }
         switch (state->settings.dev_selected) {
             case wqn::kDevRowDevInfo:
+                wqn::runtime::RequestMemoryDiagnosticsDump();
                 OpenSettingsDialog(state, wqn::SettingsDialog::kDevInfo);
                 return RefreshSchedule::kConfig;
             case wqn::kDevRowDevSync:
@@ -494,18 +605,7 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
         BuildHomeSummary(state);
         return RefreshSchedule::kCommit;
     }
-    if (long_press && event.button == wqn::ButtonId::kUp) {
-        wqn::HandleUiInput(state, wqn::UiInput::kTopPrevious);
-        BuildHomeSummary(state);
-        return RefreshSchedule::kCommit;
-    }
-    if (long_press && event.button == wqn::ButtonId::kDownPower) {
-        wqn::HandleUiInput(state, wqn::UiInput::kTopNext);
-        BuildHomeSummary(state);
-        return RefreshSchedule::kCommit;
-    }
-
-    if (!short_press) {
+    if (!short_press && !(move_press && event.button != wqn::ButtonId::kConfirm)) {
         return RefreshSchedule::kNone;
     }
 
@@ -556,12 +656,7 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
             OpenSettingsDialog(state, wqn::SettingsDialog::kAutoSync);
             return RefreshSchedule::kConfig;
         case wqn::kSettingsRowBattery:
-            // [dev-diag] The raw ADC numbers and the fit formula moved to the
-            // second-level dev list (电量原始); the root row keeps the
-            // user-facing percent and just reports it in the notice line.
-            UpdateSettingsDiagnostics(state);
-            state->settings.notice =
-                "电量 " + std::to_string(state->settings.diagnostics.battery_percent) + "%";
+            OpenSettingsDialog(state, wqn::SettingsDialog::kBatterySummary);
             return RefreshSchedule::kConfig;
         case wqn::kSettingsRowImageRender:
             OpenSettingsDialog(state, wqn::SettingsDialog::kImageRendering);
@@ -575,9 +670,8 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
         case wqn::kSettingsRowAiFollow:
             OpenSettingsDialog(state, wqn::SettingsDialog::kAiFollow);
             return RefreshSchedule::kConfig;
-        case wqn::kSettingsRowVersion:
-            UpdateSettingsDiagnostics(state);
-            state->settings.notice = "固件 " + state->settings.diagnostics.firmware_version;
+        case wqn::kSettingsRowAbout:
+            OpenSettingsDialog(state, wqn::SettingsDialog::kAbout);
             return RefreshSchedule::kConfig;
 #if CONFIG_WQN_DEV_MENU_ENABLE
         case wqn::kSettingsRowDevMenu:
@@ -600,6 +694,26 @@ RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiS
         default:
             return RefreshSchedule::kNone;
     }
+}
+
+RefreshSchedule ApplySettingsButtonEvent(const wqn::ButtonEvent& event, wqn::UiState* state)
+{
+    if (state == nullptr) return RefreshSchedule::kNone;
+    const auto before_dialog = state->settings.dialog;
+    const auto before_view = state->settings.view;
+    const auto before_screen = state->screen;
+    const bool had_notice = !state->settings.notice.empty();
+    auto refresh = ReduceSettingsButtonEvent(event, state);
+    if (had_notice && state->settings.notice.empty() && refresh == RefreshSchedule::kNone)
+        refresh = RefreshSchedule::kConfig;
+    if (before_dialog != state->settings.dialog || before_view != state->settings.view || before_screen != state->screen) {
+        state->navigation.blocked_mask |= state->navigation.held_mask;
+        if (event.button == wqn::ButtonId::kConfirm) {
+            state->navigation.guard_confirm_double = true;
+            state->navigation.confirmed_at_ms = event.occurred_at_ms;
+        }
+    }
+    return refresh;
 }
 
 // [detail] Cycle the Agent tier's cloud detail level (0 简要 / 1 标准 / 2 详细,
@@ -1199,6 +1313,78 @@ static RefreshSchedule ApplyStatusBarEditEvent(
     return RefreshSchedule::kNone;
 }
 
+static RefreshSchedule FinishScreenNavigation(wqn::UiState* state, wqn::UiScreen old_screen)
+{
+    if (state->screen != old_screen) {
+        if (state->screen == wqn::UiScreen::kHome) state->selected_home_task = 0;
+        if (old_screen == wqn::UiScreen::kSettings) {
+            // A deferred single Confirm must not fire a sync after navigating
+            // away. Preserve candidates and pending worker operation IDs.
+            state->settings.sync_confirm_pending = false;
+        }
+        if (old_screen == wqn::UiScreen::kTime) {
+            wqn::DisarmTimeAppAction(&state->time_app);
+        }
+        state->gestures.flash_ptt_started = false;
+        state->gestures.agent_ptt_started = false;
+        state->gestures.last_ai_confirm_tap_ms = 0;
+        // [agent] The OpenCode session list is no longer loaded on screen
+        // entry: the picker opens from the AI page's status-bar edit mode and
+        // that path issues the request itself.
+        if (state->screen == wqn::UiScreen::kTodo) {
+            RefreshTodosFromCloud(state);
+        } else if (state->screen == wqn::UiScreen::kWord && state->word_app.cloud_sync_requested) {
+            wqn::services::RequestContentRefresh(
+                wqn::services::SyncContentDomain::kWordPacks);
+            if (!QueueWordReviewRefresh()) {
+                state->word_app.message = IsWordCloudBusy() ? "单词同步中" : "单词同步失败";
+            } else {
+                state->word_app.message = "单词同步中";
+            }
+        } else if (state->screen == wqn::UiScreen::kNote &&
+                   state->note_app.cloud_sync_requested) {
+            wqn::services::RequestContentRefresh(
+                wqn::services::SyncContentDomain::kNotePacks);
+            if (!QueueNotePackSync()) {
+                state->note_app.message = IsNoteCloudBusy() ? "笔记同步中" : "笔记同步失败";
+            } else {
+                state->note_app.message = "笔记同步中";
+            }
+            // The mixed list also carries the [题] rows: give the problem
+            // packs the same entry refresh (coalesced by the busy CAS).
+            if (state->problem_app.cloud_sync_requested) {
+                wqn::services::RequestContentRefresh(
+                    wqn::services::SyncContentDomain::kProblemPacks);
+                QueueProblemPackSync();
+            }
+        }
+        BuildHomeSummary(state);
+        return RefreshSchedule::kCommit;
+    }
+    return RefreshSchedule::kNone;
+}
+
+static bool CanOpenNavigation(const wqn::UiState& state)
+{
+    if (wqn::IsProvisioningActive()) return false;
+    // Settings "dialogs" are full-page detail/choice screens. Their short
+    // presses stay local; Up/Down holds still belong to global navigation.
+    // The active provisioning portal is the exclusive owner checked above.
+    if (state.screen == wqn::UiScreen::kTime &&
+        wqn::TimeAppIsEditingValue(state.time_app)) return false;
+    if (state.screen == wqn::UiScreen::kAi) {
+        if (state.status_edit.active || state.gestures.flash_ptt_started ||
+            state.gestures.agent_ptt_started ||
+            (state.ai.tier == wqn::AiTier::kStd &&
+             (state.ai.status == wqn::AiSessionStatus::kPreparingCapture ||
+              state.ai.status == wqn::AiSessionStatus::kListening))) return false;
+        if (state.ai.tier == wqn::AiTier::kAgent &&
+            (state.agent.ui.phase == wqn::AiFeaturePhase::kRecording ||
+             AgentOptionModeFor(state.agent) != AgentOptionMode::kNone)) return false;
+    }
+    return wqn::NavigationPageIndex(state.screen) < wqn::kNavigationPages.size();
+}
+
 RefreshSchedule ApplyButtonEvent(
     const wqn::ButtonEvent& event,
     int64_t event_time_ms,
@@ -1207,6 +1393,27 @@ RefreshSchedule ApplyButtonEvent(
     if (state == nullptr || !event.HasEvent()) {
         return RefreshSchedule::kNone;
     }
+    // The portal owns the visible screen. Do not activate hidden root rows
+    // while its owner task is still configuring WiFi.
+    if (wqn::IsProvisioningActive()) {
+        if (event.type == wqn::ButtonEventType::kRelease) {
+            const uint8_t bit = 1U << static_cast<unsigned>(event.button);
+            state->navigation.held_mask &= ~bit;
+            state->navigation.blocked_mask &= ~bit;
+        }
+        return RefreshSchedule::kNone;
+    }
+
+    const wqn::NavigationAction navigation = wqn::ReduceNavigationInput(
+        &state->navigation, state->screen, event, event_time_ms, CanOpenNavigation(*state));
+    if (navigation == wqn::NavigationAction::kConfirm) {
+        const wqn::UiScreen previous = state->screen;
+        wqn::NavigateUiToScreen(state, wqn::kNavigationPages[state->navigation.selected].screen);
+        const RefreshSchedule entered = FinishScreenNavigation(state, previous);
+        return entered == RefreshSchedule::kNone ? RefreshSchedule::kNavigation : entered;
+    }
+    if (navigation == wqn::NavigationAction::kRepaint) return RefreshSchedule::kNavigation;
+    if (navigation == wqn::NavigationAction::kConsumed) return RefreshSchedule::kNone;
 
     // [shell] Status-bar edit mode intercepts all input on the AI page.
     if (state->screen == wqn::UiScreen::kAi && state->status_edit.active) {
@@ -1255,7 +1462,7 @@ RefreshSchedule ApplyButtonEvent(
 
     // Agent PTT is intentionally a two-step operation. Releasing this gesture
     // can only stop capture and start transcription; it cannot submit a prompt.
-    // The resulting kAwaitingConfirmation state requires a separate Up press.
+    // The resulting kAwaitingConfirmation state requires a separate option-bar confirmation.
     if (is_agent_ptt &&
         (event.type == wqn::ButtonEventType::kPress ||
          event.type == wqn::ButtonEventType::kRelease ||
@@ -1545,7 +1752,13 @@ RefreshSchedule ApplyButtonEvent(
         // started -- that is the user asking to watch the run again, so the
         // follow is re-armed (user_moved stays true: they did move it).
         const bool body_started = AnswerBodyStarted(state->ai, snapshot);
-        wqn::ScrollOpenCodeResponse(direction, min_scroll, max_scroll);
+        const int viewport_height = wqn::kEpdHeight - device_ui_internal::kAiViewportY -
+            device_ui_internal::AiBottomReserve(state->agent);
+        const int step = device_ui_internal::AiPageStepRows(
+            viewport_height, device_ui_internal::kAiLineH);
+        if (!wqn::ScrollOpenCodeResponse(direction, min_scroll, max_scroll, step)) {
+            return RefreshSchedule::kNone;
+        }
         SyncAgentSnapshot(state);
         const bool resumed =
             state->ai.auto_follow && direction < 0 &&
@@ -1672,6 +1885,41 @@ RefreshSchedule ApplyButtonEvent(
         return RefreshSchedule::kNone;
     }
 
+    // [home-actions] Bind shortcuts to the card that was projected, never to
+    // a worker's newer selection. The navigation guard also owns their tails.
+    if (state->screen == wqn::UiScreen::kHome) {
+        const bool click = event.type == wqn::ButtonEventType::kShortPress ||
+                           event.type == wqn::ButtonEventType::kDoublePress;
+        if (click && (event.button == wqn::ButtonId::kUp || event.button == wqn::ButtonId::kDownPower)) {
+            state->selected_home_task = (state->selected_home_task + 1) % 2;
+            return RefreshSchedule::kSelection;
+        }
+        if (event.type == wqn::ButtonEventType::kShortPress && event.button == wqn::ButtonId::kConfirm) {
+            const auto card = state->home.ai;
+            const auto target = state->selected_home_task == 0 ? card.target : state->home.study.target;
+            if (state->selected_home_task == 0 && target == wqn::UiScreen::kAi && !card.session_id.empty()) {
+                const esp_err_t result = wqn::OpenCodeHomeSession(card.session_id, card.session_title);
+                if (result != ESP_OK) {
+                    state->home.notice = "任务繁忙，请稍后重试";
+                    return RefreshSchedule::kSelection;
+                }
+                state->ai.tier = wqn::AiTier::kAgent;
+                SyncAgentSnapshot(state);
+            }
+            if (!wqn::NavigateUiToScreen(state, target)) return RefreshSchedule::kSelection;
+            if (state->selected_home_task == 0 && card.status == wqn::HomeAiStatus::kComplete) {
+                state->home_viewed_session_id = card.session_id;
+                state->home_viewed_result_version = card.result_version;
+            }
+            state->navigation.blocked_mask |= state->navigation.held_mask |
+                (1U << static_cast<unsigned>(wqn::ButtonId::kConfirm));
+            state->navigation.guard_confirm_double = true;
+            state->navigation.confirmed_at_ms = event_time_ms;
+            return FinishScreenNavigation(state, wqn::UiScreen::kHome);
+        }
+    }
+    // [home-actions-end]
+
     const wqn::UiScreen old_screen = state->screen;
     const size_t old_home_task = state->selected_home_task;
     const size_t old_todo = state->todo.selected;
@@ -1679,39 +1927,21 @@ RefreshSchedule ApplyButtonEvent(
     const std::string old_word_signature = wqn::WordAppSignature(state->word_app);
     const std::string old_note_signature = wqn::NoteAppSignature(state->note_app);
     const wqn::NoteAppMode old_note_mode = state->note_app.mode;
-    const size_t old_notebook_window = state->note_app.notebook_window_start;
-    const size_t old_note_list_window = state->note_app.note_list_window_start;
     const std::string old_problem_signature =
         wqn::ProblemAppSignature(state->problem_app);
     const bool old_problem_active = state->problem_app.active;
     const wqn::ProblemAppMode old_problem_mode = state->problem_app.mode;
     const size_t old_problem_segment = state->problem_app.ring_segment;
-    const size_t old_problem_list_window = state->problem_app.list_window_start;
     ESP_LOGI(
         kTag,
         "button event: id=%d type=%d duration_ms=%lld",
         static_cast<int>(event.button),
         static_cast<int>(event.type),
         static_cast<long long>(event.duration_ms));
-    if (!long_press && !long_release && event.button == wqn::ButtonId::kConfirm && state->screen == wqn::UiScreen::kTodo) {
-        return CompleteSelectedTodo(state);
-    }
-    if (!long_press && !long_release && state->screen == wqn::UiScreen::kTodo && event.button == wqn::ButtonId::kUp &&
-        state->todo.selected == 0 && state->todo.has_earlier && !state->todo.previous_cursor.empty()) {
-        if (QueueTodoRefreshCursor(state->todo.previous_cursor)) {
-            state->todo.sync_status = wqn::TodoSyncStatus::kLoading;
-            state->todo.status_message = "Todo syncing";
-            return RefreshSchedule::kSelection;
-        }
-    }
-    if (!long_press && !long_release && state->screen == wqn::UiScreen::kTodo && event.button == wqn::ButtonId::kDownPower &&
-        !state->todo.todos.empty() && state->todo.selected + 1 >= state->todo.todos.size() &&
-        state->todo.has_later && !state->todo.next_cursor.empty()) {
-        if (QueueTodoRefreshCursor(state->todo.next_cursor)) {
-            state->todo.sync_status = wqn::TodoSyncStatus::kLoading;
-            state->todo.status_message = "Todo syncing";
-            return RefreshSchedule::kSelection;
-        }
+    if (!long_press && !long_release && state->screen == wqn::UiScreen::kTodo) {
+        const auto input = event.button == wqn::ButtonId::kUp ? wqn::UiInput::kUp
+            : event.button == wqn::ButtonId::kDownPower ? wqn::UiInput::kDown : wqn::UiInput::kConfirm;
+        return HandleTodoInput(state, input);
     }
 
     switch (event.button) {
@@ -1719,14 +1949,14 @@ RefreshSchedule ApplyButtonEvent(
             if (long_press && state->screen == wqn::UiScreen::kTime && wqn::TimeAppIsEditingValue(state->time_app)) {
                 wqn::HandleTimeAppInput(&state->time_app, wqn::TimeInput::kLongUp);
             } else {
-                wqn::HandleUiInput(state, long_press ? wqn::UiInput::kTopPrevious : wqn::UiInput::kUp);
+                if (!long_press) wqn::HandleUiInput(state, wqn::UiInput::kUp);
             }
             break;
         case wqn::ButtonId::kDownPower:
             if (long_press && state->screen == wqn::UiScreen::kTime && wqn::TimeAppIsEditingValue(state->time_app)) {
                 wqn::HandleTimeAppInput(&state->time_app, wqn::TimeInput::kLongDown);
             } else {
-                wqn::HandleUiInput(state, long_press ? wqn::UiInput::kTopNext : wqn::UiInput::kDown);
+                if (!long_press) wqn::HandleUiInput(state, wqn::UiInput::kDown);
             }
             break;
         case wqn::ButtonId::kConfirm:
@@ -1741,44 +1971,7 @@ RefreshSchedule ApplyButtonEvent(
     }
 
     if (state->screen != old_screen) {
-        if (old_screen == wqn::UiScreen::kTime) {
-            wqn::DisarmTimeAppAction(&state->time_app);
-        }
-        state->gestures.flash_ptt_started = false;
-        state->gestures.agent_ptt_started = false;
-        state->gestures.last_ai_confirm_tap_ms = 0;
-        // [agent] The OpenCode session list is no longer loaded on screen
-        // entry: the picker opens from the AI page's status-bar edit mode and
-        // that path issues the request itself.
-        if (state->screen == wqn::UiScreen::kTodo) {
-            RefreshTodosFromCloud(state);
-        } else if (state->screen == wqn::UiScreen::kWord && state->word_app.cloud_sync_requested) {
-            wqn::services::RequestContentRefresh(
-                wqn::services::SyncContentDomain::kWordPacks);
-            if (!QueueWordReviewRefresh()) {
-                state->word_app.message = IsWordCloudBusy() ? "单词同步中" : "单词同步失败";
-            } else {
-                state->word_app.message = "单词同步中";
-            }
-        } else if (state->screen == wqn::UiScreen::kNote &&
-                   state->note_app.cloud_sync_requested) {
-            wqn::services::RequestContentRefresh(
-                wqn::services::SyncContentDomain::kNotePacks);
-            if (!QueueNotePackSync()) {
-                state->note_app.message = IsNoteCloudBusy() ? "笔记同步中" : "笔记同步失败";
-            } else {
-                state->note_app.message = "笔记同步中";
-            }
-            // The mixed list also carries the [题] rows: give the problem
-            // packs the same entry refresh (coalesced by the busy CAS).
-            if (state->problem_app.cloud_sync_requested) {
-                wqn::services::RequestContentRefresh(
-                    wqn::services::SyncContentDomain::kProblemPacks);
-                QueueProblemPackSync();
-            }
-        }
-        BuildHomeSummary(state);
-        return RefreshSchedule::kCommit;
+        return FinishScreenNavigation(state, old_screen);
     }
     if (state->screen == wqn::UiScreen::kAi) {
         if (state->ai.page != old_page || state->ai.tier != old_ai_tier) {
@@ -1814,14 +2007,12 @@ RefreshSchedule ApplyButtonEvent(
         wqn::ProblemAppSignature(state->problem_app) != old_problem_signature) {
         BuildHomeSummary(state);
         // Layer activation, mode transitions (列表<->题目<->弹窗), ring segment
-        // hops (题面<->图<->答案) and list viewport jumps repaint most of the
-        // panel; commit them so the full refresh clears large-partial ghosting
-        // (the note domain's SSD1683 lesson). In-face scrolling and verdict
-        // highlight moves ride the fast partial path.
+        // hops (题面<->图<->答案) keep their full-refresh requirement.
+        // List windows now follow focus one row at a time, using the same
+        // full-frame partial path as text scrolling and verdict selection.
         if (state->problem_app.active != old_problem_active ||
             state->problem_app.mode != old_problem_mode ||
-            state->problem_app.ring_segment != old_problem_segment ||
-            state->problem_app.list_window_start != old_problem_list_window) {
+            state->problem_app.ring_segment != old_problem_segment) {
             return RefreshSchedule::kCommit;
         }
         return RefreshSchedule::kSelection;
@@ -1843,19 +2034,13 @@ RefreshSchedule ApplyButtonEvent(
         // UI task: PumpNoteObservationCommit hands it to the persist worker
         // and the kPersisting gate covers the in-flight window.
         BuildHomeSummary(state);
-        // A note mode transition (notebook<->title<->body<->image) or a list
-        // viewport jump repaints most of the screen; do a full refresh so the
-        // panel is cleared (large partial waveforms ghost, and HIL logs show a
-        // windowed local partial issued right after such a full-frame partial
-        // wedges the SSD1683 BUSY line for 4+ s). Every step inside the image
-        // layer is a whole-frame change too, so it always commits. Same-window
-        // navigation -- including body scroll -- uses the fast partial path;
-        // body over-scroll is bounded by the reducer clamp so reverse-scroll
-        // always reveals new content.
+        // Mode changes and attachment navigation keep their full refresh.
+        // List windows follow the selection one row at a time; treating each
+        // movement as a commit forces a full waveform on every edge step.
+        // Use the same full-frame partial path as body/selection scrolling;
+        // the display owner still enforces its periodic full-refresh limits.
         if (state->note_app.mode != old_note_mode ||
-            state->note_app.mode == wqn::NoteAppMode::kNoteImageView ||
-            state->note_app.notebook_window_start != old_notebook_window ||
-            state->note_app.note_list_window_start != old_note_list_window) {
+            state->note_app.mode == wqn::NoteAppMode::kNoteImageView) {
             return RefreshSchedule::kCommit;
         }
         return RefreshSchedule::kSelection;

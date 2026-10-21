@@ -27,6 +27,8 @@ bool IsEpdFramebufferSynchronized();
 // private to the service; clients receive drawing operations, not a pointer.
 void ClearEpdFramebuffer(bool white = true);
 void DrawEpdPixel(int x, int y, bool black);
+// CPU framebuffer readback for owner-task composition; no panel I/O.
+bool ReadEpdPixel(int x, int y);
 // Copies a full pre-rendered 1bpp frame (kEpdFramebufferSize bytes, same
 // row-major/MSB-first/1=white layout as the framebuffer) in one memcpy.
 // Server-rendered note images (WQNI payloads) display through this.
@@ -35,25 +37,17 @@ void BlitEpdFramebuffer(const uint8_t* bitmap, size_t size);
 esp_err_t DrawUtf8Text(int x, int y, const char* text, bool black = true);
 int MeasureUtf8TextWidth(const char* text);
 
-// Draw / measure text with an arbitrary LVGL-format font (e.g. font_zectrix_48_1).
+// Draw / measure text with an arbitrary LVGL-format font.
 // Iterates UTF-8 codepoints; missing glyphs are skipped (zero width, nothing drawn).
 // PrimaryUiFont exposes the firmware's 16 px text face so a page can opt into
 // real Latin glyphs instead of the compact 5x7 body-text fallback.
 const lv_font_t* PrimaryUiFont();
 void DrawTextWithFont(int x, int y, const lv_font_t* font, const char* text, bool black = true);
+// CPU-only nearest-neighbour sizing of existing 1bpp glyphs; no new font blob.
 int MeasureTextWithFont(const lv_font_t* font, const char* text);
-void DrawTextWithFontCentered(int x, int y, int width, const lv_font_t* font, const char* text, bool black = true);
 // Nearest-neighbour bitmap scaling is intended for short, static hero labels
 // such as a vocabulary headword. It changes framebuffer composition only; it
 // does not alter the panel refresh policy or waveform.
-void DrawTextWithFontScaledCentered(
-    int x,
-    int y,
-    int width,
-    const lv_font_t* font,
-    const char* text,
-    uint8_t scale,
-    bool black = true);
 std::string TruncateUtf8TextToWidth(const std::string& text, int max_width_px);
 std::vector<std::string> WrapUtf8TextToWidth(const std::string& text, int max_width_px, size_t max_lines);
 
@@ -91,28 +85,20 @@ void RegisterEpdOwnerTask(void* owner_task_handle);
 // claimed this call (the caller then skips idle maintenance this round so a
 // 1-3 s cleanup cannot make the power side miss its deadline). Must run only
 // outside an EpdFrameTransaction (the idle command point guarantees this).
-bool ServiceDisplaySleepPrepCommand();
+// Optional owner-local result: distinguishes a successful preparation from a
+// claimed command which failed, without consuming its completion mailbox.
+bool ServiceDisplaySleepPrepCommand(bool* prepared = nullptr);
 void NoteEpdActivity();
-// [epd-owner] Monotonic counter bumped by NoteEpdActivity. The idle-maintenance
-// command samples it before yielding to the EPD task and the EPD task re-checks
-// it just before running maintenance: a change means activity happened in
-// between, so the (1-3 s) cleanup full refresh is skipped rather than run on
-// top of a fresh frame. Acquire-load pairs with the release bump.
+// [epd-owner] Monotonic counter bumped by NoteEpdActivity. The owner samples
+// it when a maintenance deadline is due and rechecks before hardware work.
+// A change retires that attempt so cleanup cannot run on top of fresh activity.
+// Acquire-load pairs with the release bump.
 uint32_t GetEpdActivityGeneration();
-// [epd-owner] True when idle maintenance is actually due: the idle-off feature
-// is enabled, activity exists, the idle deadline has elapsed, and the rail has
-// NOT already been cut. RequestEpdIdleMaintenance gates on this so an idle UI
-// poll does not wake the EPD task every cycle (edge-trigger the request only
-// when it flips to due).
-bool IsEpdIdleMaintenanceDue();
-// [epd-owner] True when the heavy-partial cleanup full refresh is due. It is
-// deliberately independent of IsEpdIdleMaintenanceDue(): that one stays false
-// for the rest of the idle period once g_epd_idle_cut is set, so a cleanup
-// moved past the power-off point would never arm the EPD task again. False while the debt
-// is below kIdleCleanupHeavyPartials, and always false when
-// CONFIG_WQN_EPD_IDLE_CLEANUP_MS is 0 (the cleanup then rides the power-off
-// point exactly as before).
-bool IsEpdIdleCleanupDue();
+// [epd-owner] Owner-task-only query: milliseconds until the nearest idle
+// rail-cut or owed-cleanup deadline, 0 when due, -1 when no work is owed.
+// Reads private panel/debt state; callers outside the EPD owner must not poll
+// it. Uses the same configured intervals and activity epoch as the runner.
+int64_t EpdIdleMaintenanceDelayMs();
 void PowerOffEpdAfterIdleIfNeeded();
 
 // [epd-owner] RAII lock over the WHOLE clear->draw->refresh sequence of one

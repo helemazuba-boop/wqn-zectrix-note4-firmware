@@ -50,8 +50,6 @@ public:
     esp_err_t Stop();
 
     std::string GetSsid() const;
-    bool IsRunning() const { return running_.load(); }
-
 private:
     static void WifiEventHandler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data);
     static void ScanTimerCallback(void* arg);

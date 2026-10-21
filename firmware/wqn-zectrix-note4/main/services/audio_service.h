@@ -69,6 +69,12 @@ esp_err_t EndAudioActivity(AudioSession* session);
 // the sole bootstrap exception before this task starts.
 esp_err_t SetAudioAmplifier(const AudioSession& session, bool enabled);
 
+// Signal actual acquisition readiness, not session admission or network setup.
+// Capture/Flash only. Callers serialize ready/stop transitions with their own
+// capture mutex; stale capabilities cannot change a newer session's indicator.
+// This operation is immediate and adds no task, timer, or sleep policy.
+esp_err_t SetAudioRecordingIndicator(const AudioSession& session, bool enabled);
+
 // Recover the codec rail after a failed/aborted initialization. This is an
 // AudioService operation because GPIO42 is service-owned; callers must not
 // toggle the codec power pin directly.
@@ -107,12 +113,6 @@ esp_err_t CreateAudioRxChannel(
     uint32_t dma_frame_count,
     bool left_aligned,
     AudioChannelHandle* rx);
-esp_err_t CreateAudioTxChannel(
-    const AudioSession& session,
-    uint32_t sample_rate_hz,
-    uint32_t dma_frame_count,
-    bool left_aligned,
-    AudioChannelHandle* tx);
 esp_err_t CreateAudioDuplexChannels(
     const AudioSession& session,
     uint32_t sample_rate_hz,

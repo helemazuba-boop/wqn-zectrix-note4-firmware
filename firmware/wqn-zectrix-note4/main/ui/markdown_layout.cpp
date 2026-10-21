@@ -13,7 +13,8 @@
 #include <cctype>
 #include <cstring>
 
-#include "display_service.h"  // wqn::MeasureUtf8TextWidth
+#include "display_service.h"  // legacy metric for callers without a font
+#include "ai_native_text.h"
 
 namespace device_ui_internal {
 
@@ -42,19 +43,20 @@ int Utf8Len(unsigned char lead)
 }
 
 // Width of a single codepoint via the shared fixed-width metric, no heap.
-int CpWidth(const std::string& s, size_t pos, int nbytes)
+int CpWidth(const std::string& s, size_t pos, int nbytes, const lv_font_t* font)
 {
     char buf[8];
     if (nbytes > 7) nbytes = 7;
     std::memcpy(buf, s.data() + pos, static_cast<size_t>(nbytes));
     buf[nbytes] = '\0';
-    return wqn::MeasureUtf8TextWidth(buf);
+    return font ? wqn::MeasureTextWithFont(font, buf) : wqn::MeasureUtf8TextWidth(buf);
 }
 
-int MeasureRange(const std::string& s, size_t a, size_t b)
+int MeasureRange(const std::string& s, size_t a, size_t b, const lv_font_t* font)
 {
     if (b <= a) return 0;
-    return wqn::MeasureUtf8TextWidth(s.substr(a, b - a).c_str());
+    const std::string text = s.substr(a, b - a);
+    return font ? wqn::MeasureTextWithFont(font, text.c_str()) : wqn::MeasureUtf8TextWidth(text.c_str());
 }
 
 std::string RStrip(const std::string& s)
@@ -213,13 +215,14 @@ struct WrappedLine {
     std::vector<MdDecoration> decorations;
 };
 
-std::vector<WrappedLine> WrapStyled(const StyledText& st, int avail)
+std::vector<WrappedLine> WrapStyled(const StyledText& st, int avail, const lv_font_t* font, bool* truncated)
 {
     std::vector<WrappedLine> out;
     if (avail < 8) avail = 8;
     const std::string& p = st.plain;
     size_t line_start = 0;
     int line_w = 0;
+    size_t last_space = 0;
 
     auto flush = [&](size_t end) {
         WrappedLine wl;
@@ -231,8 +234,8 @@ std::vector<WrappedLine> WrapStyled(const StyledText& st, int avail)
             const size_t e2 = std::min(sp.end, e);
             if (s2 < e2) {
                 MdDecoration d;
-                d.x = static_cast<int16_t>(MeasureRange(p, line_start, s2));
-                d.w = static_cast<int16_t>(MeasureRange(p, s2, e2));
+                d.x = static_cast<int16_t>(MeasureRange(p, line_start, s2, font));
+                d.w = static_cast<int16_t>(MeasureRange(p, s2, e2, font));
                 d.kind = sp.kind;
                 wl.decorations.push_back(d);
             }
@@ -241,28 +244,36 @@ std::vector<WrappedLine> WrapStyled(const StyledText& st, int avail)
     };
 
     size_t i = 0;
-    while (i < p.size()) {
+    while (i < p.size() && out.size() < static_cast<size_t>(kMaxLines)) {
         if (p[i] == '\n') {
             flush(i);
             line_start = i + 1;
+            last_space = line_start;
             line_w = 0;
             ++i;
             continue;
         }
         int n = Utf8Len(static_cast<unsigned char>(p[i]));
         if (i + static_cast<size_t>(n) > p.size()) n = 1;
-        const int w = CpWidth(p, i, n);
+        const int w = CpWidth(p, i, n, font);
         if (line_w > 0 && line_w + w > avail) {
-            flush(i);
+            const size_t end = font && p[i] != ' ' ? AiWrapBoundary(p, line_start, i, last_space) : i;
+            flush(end);
+            i = end;
+            while (font && i < p.size() && p[i] == ' ') ++i;
             line_start = i;
+            last_space = i;
             line_w = 0;
+            continue;
         }
+        if (p[i] == ' ') last_space = i;
         line_w += w;
         i += static_cast<size_t>(n);
     }
-    if (line_start < p.size()) {
+    if (line_start < p.size() && out.size() < static_cast<size_t>(kMaxLines)) {
         flush(p.size());
     }
+    if (i < p.size() && truncated) *truncated = true;
     return out;
 }
 
@@ -402,8 +413,10 @@ bool IsDelimiterRow(const std::string& raw)
 
 }  // namespace
 
-std::vector<MdLine> LayoutMarkdown(const std::string& body, int content_width_px, uint8_t opts)
+std::vector<MdLine> LayoutMarkdown(const std::string& body, int content_width_px, uint8_t opts,
+                                   const lv_font_t* font, bool* truncated)
 {
+    if (truncated) *truncated = false;
     std::vector<MdLine> out;
     const int width = std::max(40, content_width_px);
     std::vector<std::string> src;
@@ -428,6 +441,7 @@ std::vector<MdLine> LayoutMarkdown(const std::string& body, int content_width_px
 
     auto push = [&](MdLine&& line) {
         if (static_cast<int>(out.size()) < kMaxLines) out.push_back(std::move(line));
+        else if (truncated) *truncated = true;
     };
     auto push_blank = [&]() {
         if (last_blank) return;
@@ -457,7 +471,7 @@ std::vector<MdLine> LayoutMarkdown(const std::string& body, int content_width_px
             }
             StyledText st;
             st.plain = raw;  // literal, no inline parsing inside code
-            for (const WrappedLine& wl : WrapStyled(st, width - kCodeIndentPx)) {
+            for (const WrappedLine& wl : WrapStyled(st, width - kCodeIndentPx, font, truncated)) {
                 MdLine ml;
                 ml.text = wl.text;
                 ml.indent_px = static_cast<int16_t>(kCodeIndentPx);
@@ -521,7 +535,7 @@ std::vector<MdLine> LayoutMarkdown(const std::string& body, int content_width_px
                         if (c) joined += " | ";
                         joined += rows[r][c];
                     }
-                    for (const WrappedLine& wl : WrapStyled(ParseInline(joined, opts), width)) {
+                    for (const WrappedLine& wl : WrapStyled(ParseInline(joined, opts), width, font, truncated)) {
                         push_text(wl, 0);
                     }
                 }
@@ -534,7 +548,8 @@ std::vector<MdLine> LayoutMarkdown(const std::string& body, int content_width_px
             std::vector<int> colw(ncols, 6);
             for (const auto& r : rows) {
                 for (size_t c = 0; c < r.size(); ++c) {
-                    colw[c] = std::max(colw[c], wqn::MeasureUtf8TextWidth(r[c].c_str()));
+                    colw[c] = std::max(colw[c], font ? wqn::MeasureTextWithFont(font, r[c].c_str())
+                                                    : wqn::MeasureUtf8TextWidth(r[c].c_str()));
                 }
             }
             const int overhead =
@@ -546,6 +561,16 @@ std::vector<MdLine> LayoutMarkdown(const std::string& body, int content_width_px
             if (sum_natural > avail_text) {
                 for (size_t c = 0; c < ncols; ++c) {
                     colw[c] = std::max(kTableMinColPx, colw[c] * avail_text / sum_natural);
+                }
+            }
+            if (font) {
+                int sum = 0;
+                for (const int col : colw) sum += col;
+                while (sum > width - overhead) {
+                    auto widest = std::max_element(colw.begin(), colw.end());
+                    if (*widest <= 1) break;
+                    --*widest;
+                    --sum;
                 }
             }
             std::vector<int> sep(ncols + 1, 0);
@@ -561,7 +586,7 @@ std::vector<MdLine> LayoutMarkdown(const std::string& body, int content_width_px
                 size_t row_h = 1;
                 for (size_t c = 0; c < ncols; ++c) {
                     const std::string cell = c < rows[r].size() ? rows[r][c] : std::string();
-                    for (const WrappedLine& wl : WrapStyled(ParseInline(cell, opts), colw[c])) {
+                    for (const WrappedLine& wl : WrapStyled(ParseInline(cell, opts), colw[c], font, truncated)) {
                         cell_lines[c].push_back(wl.text);
                     }
                     row_h = std::max(row_h, cell_lines[c].size());
@@ -597,7 +622,7 @@ std::vector<MdLine> LayoutMarkdown(const std::string& body, int content_width_px
         if (IsHeading(trimmed, &level, &htext)) {
             push_blank();  // headings breathe
             const int indent = level >= 3 ? kHeadingMarkPx : 0;
-            const std::vector<WrappedLine> wl = WrapStyled(ParseInline(htext, opts), width - indent);
+            const std::vector<WrappedLine> wl = WrapStyled(ParseInline(htext, opts), width - indent, font, truncated);
             for (size_t k = 0; k < wl.size(); ++k) {
                 MdLine ml;
                 ml.text = wl[k].text;
@@ -620,7 +645,7 @@ std::vector<MdLine> LayoutMarkdown(const std::string& body, int content_width_px
         std::string inner;
         if (ParseQuote(raw, &depth, &inner)) {
             const int indent = depth * kQuoteStepPx + kQuoteTextPad;
-            const std::vector<WrappedLine> wl = WrapStyled(ParseInline(LStrip(inner), opts), width - indent);
+            const std::vector<WrappedLine> wl = WrapStyled(ParseInline(LStrip(inner), opts), width - indent, font, truncated);
             if (wl.empty()) {  // "> " with no text still shows the bar
                 MdLine ml;
                 ml.indent_px = static_cast<int16_t>(indent);
@@ -645,7 +670,7 @@ std::vector<MdLine> LayoutMarkdown(const std::string& body, int content_width_px
         std::string marker;
         if (ParseUnordered(raw, &list_level, &content)) {
             const int indent = kListBasePx + list_level * kListStepPx + kBulletAreaPx;
-            const std::vector<WrappedLine> wl = WrapStyled(ParseInline(content, opts), width - indent);
+            const std::vector<WrappedLine> wl = WrapStyled(ParseInline(content, opts), width - indent, font, truncated);
             for (size_t k = 0; k < wl.size(); ++k) {
                 MdLine ml;
                 ml.text = wl[k].text;
@@ -671,7 +696,7 @@ std::vector<MdLine> LayoutMarkdown(const std::string& body, int content_width_px
                 sp.end += marker.size();
             }
             const int first_indent = kListBasePx + list_level * kListStepPx;
-            const std::vector<WrappedLine> wl = WrapStyled(st, width - first_indent);
+            const std::vector<WrappedLine> wl = WrapStyled(st, width - (font ? indent : first_indent), font, truncated);
             for (size_t k = 0; k < wl.size(); ++k) {
                 push_text(wl[k], k == 0 ? first_indent : indent);
             }
@@ -679,12 +704,17 @@ std::vector<MdLine> LayoutMarkdown(const std::string& body, int content_width_px
             continue;
         }
 
-        for (const WrappedLine& wl : WrapStyled(ParseInline(LStrip(raw), opts), width)) {
+        for (const WrappedLine& wl : WrapStyled(ParseInline(LStrip(raw), opts), width, font, truncated)) {
             push_text(wl, 0);
         }
         ++i;
     }
 
+    size_t pending = i;
+    if (in_fence && pending < src.size() && IsFenceClose(LStrip(src[pending]), fence_ch)) ++pending;
+    if (truncated && std::any_of(src.begin() + pending, src.end(), [](const std::string& line) {
+            return !RStrip(LStrip(line)).empty();
+        })) *truncated = true;
     while (!out.empty() && out.back().kind == MdLineKind::kText && out.back().text.empty() &&
            out.back().decorations.empty()) {
         out.pop_back();  // drop trailing blank rows

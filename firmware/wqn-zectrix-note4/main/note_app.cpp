@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <functional>
 #include <cstring>
 #include <new>
 #include <utility>
@@ -11,7 +12,9 @@
 #include "esp_timer.h"
 
 #include "display_service.h"
-#include "ui/markdown_layout.h"
+#include "ui/ai_native_text.h"
+#include "ui/ai_text_layout.h"
+#include "ui/note_reading_geometry.h"
 #include "ui/ui_layout.h"
 
 namespace {
@@ -36,35 +39,10 @@ size_t FindNotebookRow(const wqn::NoteAppState& state, const std::string& notebo
     return static_cast<size_t>(-1);
 }
 
-// Visible rows on the notebook/title lists; mirrors page_note.cpp geometry
-// ((kHintY - 4 - kContentTop) / kListRowH = (284 - 4 - 32) / 30 = 8).
-constexpr size_t kNoteListVisibleRows = 8;
-
-// Edge-triggered viewport: the window moves only when the selection walks off
-// an edge, and then jumps so the selection lands on the opposite edge. The
-// previous centered window (start = selected - visible/2) shifted the whole
-// window one row on EVERY step past row visible/2, repainting all 8 rows as a
-// heavy full-frame partial per step -- the 4th<->5th row stutter and the long
-// BUSY stretches. With this rule, in-window steps flip just two rows (fast
-// local partial) and sustained scrolling costs one whole-window repaint per 8
-// steps in either direction.
+// The renderer and reducer share the same four-row window contract.
 void UpdateListViewport(size_t selected, size_t count, size_t* start)
 {
-    constexpr size_t visible = kNoteListVisibleRows;
-    if (count <= visible) {
-        *start = 0;
-        return;
-    }
-    const size_t max_start = count - visible;
-    if (*start > max_start) *start = max_start;
-    if (selected < *start) {
-        // Walked off the top: park the selection on the bottom row so the next
-        // 7 up-steps stay in-window.
-        *start = selected + 1 >= visible ? selected + 1 - visible : 0;
-    } else if (selected >= *start + visible) {
-        // Walked off the bottom: park the selection on the top row.
-        *start = std::min(selected, max_start);
-    }
+    *start = wqn::ClampNoteListWindow(*start, selected, count);
 }
 
 // Finds the mounted pack entry for a note id, scanning only its notebook's
@@ -124,6 +102,7 @@ void ArmNoteBodyFetch(wqn::NoteAppState* state, const char* notebook_id)
 void LoadCurrentNoteBody(wqn::NoteAppState* state)
 {
     state->current_note = wqn::WqnNoteEntry{};
+    state->body_layout.reset();
     state->current_note_loaded = false;
     const auto& items = state->session.persisted.remote.items;
     if (state->note_list_selected >= items.size()) return;
@@ -151,16 +130,16 @@ void LoadCurrentNoteBody(wqn::NoteAppState* state)
             state->current_note.note_id.c_str(),
             static_cast<unsigned>(state->current_note.image_ids.size()),
             static_cast<unsigned>(state->current_note.content.size()));
-        // Precompute the Markdown row count with the SAME width and layout as
-        // RenderNoteBody (ui/page_note.cpp: kMarkdownWidthDense) so the scroll handler
-        // can clamp Down to the last page. Both sides MUST route through LayoutMarkdown or the offsets desync.
-        state->note_body_total_lines = static_cast<uint32_t>(
-            device_ui_internal::CountMarkdownLines(state->current_note.content, device_ui_internal::kMarkdownWidthDense));
+        // The shared cache verifies exact source text, width and font. Note
+        // identity is a cache hint only; the immutable result has no UI state.
+        const uint64_t layout_id = std::hash<std::string>{}(state->current_note.note_id);
+        state->body_layout = device_ui_internal::GetAiTextLayout(layout_id,
+            state->current_note.content, device_ui_internal::AiTextKind::kMarkdown,
+            device_ui_internal::kNoteBodyWidth, device_ui_internal::AiNativeFont());
     } else {
         ESP_LOGW(
             "note_app", "note open read failed: id=%.8s err=%s",
             item.item_id, esp_err_to_name(read_result));
-        state->note_body_total_lines = 0;
     }
 }
 
@@ -399,6 +378,7 @@ void HandleNoteListInput(wqn::NoteAppState* state, wqn::NoteInput input)
         }
         case wqn::NoteInput::kLongConfirm:
             state->current_note = wqn::WqnNoteEntry{};
+            state->body_layout.reset();
             state->current_note_loaded = false;
             // Leaving the list abandons the auto-open intent; an in-flight
             // fetch still lands in the index for the next visit.
@@ -478,20 +458,14 @@ void SetNoteImageRenderModeImpl(wqn::NoteAppState* state, wqn::ImageRenderMode m
     }
 }
 
-// The note is one vertical ring: [image 1 .. image N] above the body, ends
-// joined. UP always moves up, DOWN always moves down, both wrap around --
-// no dead ends, and leaving the image layer needs no long-press.
+// Body and attachments have independent, bounded navigation. The image
+// entry above the body opens the last attachment without changing its offset.
 
-uint32_t NoteBodyMaxScroll(const wqn::NoteAppState& state)
+device_ui_internal::NoteReadingGeometry NoteBodyReadingGeometry(const wqn::NoteAppState& state)
 {
-    // RenderNoteBody shows 13 body lines (kContentTop=32, no footer line) or
-    // 12 when the image entry line occupies the first row; clamping to the
-    // last page keeps over-scroll from inflating the offset.
-    const uint32_t visible_lines =
-        state.current_note.image_ids.empty() ? 13 : 12;
-    return state.note_body_total_lines > visible_lines
-        ? state.note_body_total_lines - visible_lines
-        : 0;
+    const size_t rows = state.body_layout ? state.body_layout->markdown.size() : 0;
+    return device_ui_internal::ComputeNoteReadingGeometry(rows,
+        !state.current_note.image_ids.empty(), !wqn::NoteAppNotice(state).empty());
 }
 
 void EnterNoteImageView(wqn::NoteAppState* state, uint8_t index)
@@ -500,7 +474,6 @@ void EnterNoteImageView(wqn::NoteAppState* state, uint8_t index)
     state->image_index = index;
     state->image_view_entered_us = esp_timer_get_time();
     RequestCurrentNoteImage(state);
-    state->message.clear();
 }
 
 void ExitNoteImageViewToBody(wqn::NoteAppState* state, uint32_t scroll_lines)
@@ -511,7 +484,6 @@ void ExitNoteImageViewToBody(wqn::NoteAppState* state, uint32_t scroll_lines)
     state->note_scroll_offset_lines = scroll_lines;
     state->image_request = false;
     state->image_error = false;
-    state->message.clear();
 }
 
 void HandleNoteViewInput(wqn::NoteAppState* state, wqn::NoteInput input)
@@ -538,6 +510,7 @@ void HandleNoteViewInput(wqn::NoteAppState* state, wqn::NoteInput input)
                 // in_flight stays: a live fetch result still installs the
                 // fresher index; the mode guard keeps view state untouched.
                 state->current_note = wqn::WqnNoteEntry{};
+                state->body_layout.reset();
                 state->current_note_loaded = false;
                 state->note_scroll_offset_lines = 0;
                 ResetNoteImageViewer(state);
@@ -549,9 +522,11 @@ void HandleNoteViewInput(wqn::NoteAppState* state, wqn::NoteInput input)
         }
         return;
     }
+    const auto geometry = NoteBodyReadingGeometry(*state);
+    state->note_scroll_offset_lines = std::min(
+        state->note_scroll_offset_lines, geometry.max_scroll);
     switch (input) {
         case wqn::NoteInput::kUp: {
-            constexpr uint32_t kNoteBodyScrollStep = 4;
             if (state->note_scroll_offset_lines == 0) {
                 if (!state->current_note.image_ids.empty()) {
                     // Up from the body top reaches the image directly above
@@ -560,42 +535,26 @@ void HandleNoteViewInput(wqn::NoteAppState* state, wqn::NoteInput input)
                         state,
                         static_cast<uint8_t>(
                             state->current_note.image_ids.size() - 1));
-                } else {
-                    // No images: the ring is just the body; wrap to its end.
-                    state->note_scroll_offset_lines = NoteBodyMaxScroll(*state);
-                    state->message.clear();
                 }
             } else {
                 state->note_scroll_offset_lines =
-                    state->note_scroll_offset_lines > kNoteBodyScrollStep
-                        ? state->note_scroll_offset_lines - kNoteBodyScrollStep
+                    state->note_scroll_offset_lines > geometry.step
+                        ? state->note_scroll_offset_lines - geometry.step
                         : 0;
-                state->message.clear();
             }
             break;
         }
         case wqn::NoteInput::kDown:
         case wqn::NoteInput::kConfirm: {
-            constexpr uint32_t kNoteBodyScrollStep = 4;
-            const uint32_t max_scroll = NoteBodyMaxScroll(*state);
-            if (state->note_scroll_offset_lines >= max_scroll) {
-                if (!state->current_note.image_ids.empty()) {
-                    // Down past the body end wraps around the ring to the
-                    // first image at the very top.
-                    EnterNoteImageView(state, 0);
-                } else {
-                    state->note_scroll_offset_lines = 0;
-                    state->message.clear();
-                }
-            } else {
-                state->note_scroll_offset_lines = std::min<uint32_t>(
-                    state->note_scroll_offset_lines + kNoteBodyScrollStep, max_scroll);
-                state->message.clear();
-            }
+            // Aligned rows retain one complete line between viewports. At
+            // the bottom both inputs are no-ops, including on short notes.
+            state->note_scroll_offset_lines = std::min<uint32_t>(
+                state->note_scroll_offset_lines + geometry.step, geometry.max_scroll);
             break;
         }
         case wqn::NoteInput::kLongConfirm:
             state->current_note = wqn::WqnNoteEntry{};
+            state->body_layout.reset();
             state->current_note_loaded = false;
             state->note_scroll_offset_lines = 0;
             ResetNoteImageViewer(state);
@@ -614,29 +573,24 @@ void HandleNoteImageViewInput(wqn::NoteAppState* state, wqn::NoteInput input)
                 --state->image_index;
                 state->image_view_entered_us = esp_timer_get_time();
                 RequestCurrentNoteImage(state);
-            } else {
-                // Up past the first image wraps around the ring to the body
-                // end.
-                ExitNoteImageViewToBody(state, NoteBodyMaxScroll(*state));
             }
             break;
         case wqn::NoteInput::kDown:
         case wqn::NoteInput::kConfirm:
+            if (input == wqn::NoteInput::kConfirm && state->image_error) {
+                // Retrying must keep the failed attachment selected.
+                state->image_view_entered_us = esp_timer_get_time();
+                RequestCurrentNoteImage(state);
+                break;
+            }
             if (count > 0 && static_cast<size_t>(state->image_index) + 1 < count) {
                 ++state->image_index;
                 state->image_view_entered_us = esp_timer_get_time();
                 RequestCurrentNoteImage(state);
-            } else {
-                // Down past the last image lands on the body top right below.
-                ExitNoteImageViewToBody(state, 0);
             }
             break;
         case wqn::NoteInput::kLongConfirm:
-            // Escape hatch kept for muscle memory: straight back to the body.
-            state->mode = wqn::NoteAppMode::kNoteView;
-            state->image_request = false;
-            state->image_error = false;
-            state->message.clear();
+            ExitNoteImageViewToBody(state, state->note_scroll_offset_lines);
             break;
     }
 }
@@ -721,6 +675,15 @@ esp_err_t InitNoteApp(NoteAppState* state)
 esp_err_t HandleNoteAppInput(NoteAppState* state, NoteInput input)
 {
     if (state == nullptr) return ESP_ERR_INVALID_ARG;
+    // Keep the complete Prepare -> reserve -> apply context until its ACK.
+    // Body paging and image browsing remain safe while the open is saving.
+    const bool reading = state->mode == NoteAppMode::kNoteView ||
+                         state->mode == NoteAppMode::kNoteImageView;
+    if (state->session.commit_state == NoteObservationCommitState::kPersisting &&
+        (input == NoteInput::kLongConfirm ||
+         (input == NoteInput::kConfirm && !reading))) {
+        return ESP_OK;
+    }
     if (!state->initialized) {
         ESP_RETURN_ON_ERROR(InitNoteApp(state), kTag, "init note app");
     }
@@ -922,6 +885,7 @@ void ResetNoteSessionForServerInvalid(NoteAppState* state)
     state->note_list_selected = 0;
     state->note_scroll_offset_lines = 0;
     state->current_note = WqnNoteEntry{};
+    state->body_layout.reset();
     state->current_note_loaded = false;
     state->mode = NoteAppMode::kNotebookList;
     state->message = "会话已重置，请重新打开";
@@ -1490,7 +1454,8 @@ NoteAppSnapshot BuildNoteAppSnapshot(const NoteAppState& state)
     // column shows their problem count so the mixed list stays scannable.
     for (const NoteProblemSetRow& set : state.problem_sets) {
         NoteNotebookRow row;
-        row.title = "[题] " + set.name;
+        row.kind = NoteLibraryRowKind::kProblemSet;
+        row.title = set.name;
         row.note_count = set.entry_count;
         row.has_pack = true;
         snapshot.notebooks.push_back(std::move(row));
@@ -1498,7 +1463,8 @@ NoteAppSnapshot BuildNoteAppSnapshot(const NoteAppState& state)
     // Non-default word decks follow as [词] rows (word counts trailing).
     for (const NoteWordDeckRow& deck : state.word_decks) {
         NoteNotebookRow row;
-        row.title = "[词] " + deck.title;
+        row.kind = NoteLibraryRowKind::kWordDeck;
+        row.title = deck.title;
         row.note_count = deck.entry_count;
         row.has_pack = true;
         snapshot.notebooks.push_back(std::move(row));
@@ -1512,10 +1478,12 @@ NoteAppSnapshot BuildNoteAppSnapshot(const NoteAppState& state)
             snapshot.notebook_title = state.pack_index.notebooks[row].title;
         }
         const auto& items = state.session.persisted.remote.items;
+        snapshot.titles_have_more = state.session.persisted.remote.has_more;
         snapshot.titles.reserve(items.size());
         for (const StoredNoteSessionItem& item : items) {
             NoteTitleRow title_row;
             const NotePackIndexEntry* entry = FindPackEntry(state, item.notebook_id, item.item_id);
+            title_row.content_available = entry != nullptr;
             title_row.title = entry != nullptr ? entry->title : std::string("(未同步)");
             title_row.last_opened_at = item.last_opened_at;
             snapshot.titles.push_back(std::move(title_row));
@@ -1528,7 +1496,7 @@ NoteAppSnapshot BuildNoteAppSnapshot(const NoteAppState& state)
         snapshot.body_fetch_failed =
             !state.current_note_loaded && state.body_fetch_error;
         snapshot.note_title = state.current_note.title;
-        snapshot.note_body = state.current_note.content;
+        snapshot.body_layout = state.body_layout;
         snapshot.note_id = state.current_note.note_id;
         snapshot.note_image_count =
             static_cast<uint8_t>(std::min<size_t>(state.current_note.image_ids.size(), 4));
@@ -1553,6 +1521,7 @@ NoteAppSnapshot BuildNoteAppSnapshot(const NoteAppState& state)
     // strip while a body pack downloads behind it.
     snapshot.transfer_progress_bucket = state.transfer_progress_bucket;
     snapshot.status_line = NoteAppStatusLine(state);
+    snapshot.notice = NoteAppNotice(state);
     switch (state.mode) {
         case NoteAppMode::kNotebookList:
             snapshot.hint = "确认进入 · 长按返回";
@@ -1604,6 +1573,25 @@ std::string NoteAppStatusLine(const NoteAppState& state)
     return "";
 }
 
+std::string NoteAppNotice(const NoteAppState& state)
+{
+    if (state.outbox.suspended_count > 0) return NoteAppStatusLine(state);
+    if (state.body_fetch_request || state.body_fetch_in_flight) return "正在同步内容...";
+    const std::string& message = state.message;
+    // Ordinary page labels are not notices. Preserve actual failure reasons
+    // (including pairing and full storage) instead of replacing them by a retry.
+    for (const char* quiet : {"", "已到顶部", "已到底部", "阅读中", "查看图片",
+            "笔记已就绪", "后续笔记已就绪", "内容已就绪", "已恢复上次浏览",
+            "选择笔记本", "选择要看的笔记", "已取消", "该笔记本暂无笔记"}) {
+        if (message != quiet) continue;
+        if (state.session.commit_state == NoteObservationCommitState::kFailed)
+            return "阅读记录未保存，请重新打开重试";
+        if (state.body_fetch_error) return "同步失败，确认重试";
+        return {};
+    }
+    return message;
+}
+
 std::string NoteAppSignature(const NoteAppState& state)
 {
     // Compact identity for the render layer to detect meaningful frame changes.
@@ -1633,7 +1621,7 @@ std::string NoteAppSignature(const NoteAppState& state)
             (state.body_fetch_request || state.body_fetch_in_flight) ? 1 : 0),
         static_cast<unsigned>(state.body_fetch_error ? 1 : 0),
         static_cast<int>(state.transfer_progress_bucket));
-    return std::string(buffer);
+    return std::string(buffer) + "|" + NoteAppNotice(state);
 }
 
 namespace {

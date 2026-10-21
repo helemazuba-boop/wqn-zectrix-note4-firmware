@@ -1,5 +1,73 @@
 menu "WQN firmware"
 
+    config WQN_MEMORY_DIAGNOSTICS
+        bool "Enable bounded RAM diagnostics"
+        default y
+        help
+            Log internal byte-addressable, internal DMA and PSRAM heap samples
+            periodically and at WiFi/cloud/AI/audio worker boundaries. Failed
+            allocations are captured without logging or allocating in the hook.
+            A low-priority worker drains bounded rings; overwrites are counted.
+            Its 4 KiB stack uses PSRAM when external task stacks are allowed.
+
+    config WQN_MEMORY_SAMPLE_SECONDS
+        int "RAM sample interval in seconds"
+        depends on WQN_MEMORY_DIAGNOSTICS
+        default 30
+        range 5 3600
+
+    config WQN_MEMORY_TRACE_ENABLE
+        bool "Run one short standalone heap trace per boot"
+        depends on WQN_MEMORY_DIAGNOSTICS && HEAP_TRACING_STANDALONE
+        default n
+        help
+            Diagnostic builds only: start a single HEAP_TRACE_LEAKS window after
+            the configured boot delay, then stop automatically and gradually
+            log remaining allocations with caller addresses. Live allocations
+            are not proof of a leak. Buffer overflow is reported explicitly.
+            Enable standalone tracing under Component config / Heap memory
+            debugging first. Normal builds keep heap tracing disabled.
+
+    config WQN_MEMORY_HISTORY_ENABLE
+        bool "Keep RAM diagnostic history in PSRAM for offline tests"
+        depends on WQN_MEMORY_DIAGNOSTICS && SPIRAM && WQN_DEV_MENU_ENABLE
+        default y
+        help
+            Keep one snapshot per minute, 128 recent operation/event snapshots,
+            and 32 recent allocation failures in a fixed PSRAM allocation.
+            Open Developer / Build and runtime info after attaching the no-reset
+            USB monitor to export the retained history. Export is asynchronous
+            and does not erase history. No Flash writes are performed.
+            All history is lost on restart, power loss, or deep sleep.
+
+    config WQN_MEMORY_HISTORY_HOURS
+        int "RAM history retention capacity in hours"
+        depends on WQN_MEMORY_HISTORY_ENABLE
+        default 24
+        range 1 48
+        help
+            Capacity at the default one-minute history interval. With the
+            default 30-second live sampling, 24 hours uses about 112 KiB PSRAM.
+            A live sample interval above 60 seconds reduces history resolution.
+
+    config WQN_MEMORY_TRACE_DELAY_SECONDS
+        int "Heap trace start delay since boot in seconds"
+        depends on WQN_MEMORY_TRACE_ENABLE
+        default 60
+        range 0 86400
+
+    config WQN_MEMORY_TRACE_SECONDS
+        int "Heap trace window in seconds"
+        depends on WQN_MEMORY_TRACE_ENABLE
+        default 5
+        range 1 30
+
+    config WQN_MEMORY_TRACE_RECORDS
+        int "Maximum heap trace records (internal RAM)"
+        depends on WQN_MEMORY_TRACE_ENABLE
+        default 128
+        range 16 256
+
     config WQN_WIFI_STA_ENABLE
         bool "Enable WQN WiFi station"
         default n
@@ -94,11 +162,10 @@ menu "WQN firmware"
             refresh. This is deliberately NOT the power-off point: while the
             cleanup rode WQN_EPD_IDLE_POWER_OFF_MS, every pause longer than a
             few seconds flashed the panel even though nothing had changed.
-            The default sits below WQN_RETAINED_STANDBY_IDLE_MS so the UI task
-            is still polling when it fires -- once it enters light sleep the
-            debt survives and is paid by the ordinary heavy-threshold
-            promotion on the next interaction. A cold rail is fine: the
-            genuine full refresh powers the panel itself and ends with the
+            The EPD owner tracks this deadline independently of UI polling
+            and retained standby. No cleanup wake is scheduled without debt.
+            A cold rail is fine: the genuine full refresh powers the panel
+            itself and ends with the
             rail down again. Set 0 to attach the cleanup back to the
             power-off point (pre-2026-09-11 behaviour).
 
@@ -189,27 +256,6 @@ menu "WQN firmware"
             only for builds against a cloud that does not serve the agent
             routes.
 
-    config WQN_AI_STREAMING_ENABLE
-        bool "Enable v2 SSE streaming for Std/Pro AI tier (new default)"
-        default y
-        depends on WQN_AI_ENABLE
-        help
-            When enabled, STD/PRO tiers request X-WQN-Protocol: v2-streaming
-            and consume an SSE event stream from POST /api/esp32/ai/transcribe-chat.
-            The firmware renders partial ASR delta, assistant transcript deltas,
-            tool calls, and incremental status chips to the EPD as events arrive.
-            When disabled, falls back to the legacy v1 one-shot JSON response.
-
-    config WQN_AI_V1_FALLBACK
-        bool "Compile legacy v1 one-shot JSON path (debug fallback)"
-        default y
-        depends on WQN_AI_ENABLE
-        help
-            Keeps the legacy UploadAiAudioChat() + HttpBinaryPost() path compiled
-            behind a macro so the firmware can be temporarily rebuilt for
-            comparison against the v2 SSE stream. Used at runtime only when
-            WQN_AI_STREAMING_ENABLE is n.
-
     config WQN_FLASH_PROTOCOL_V2
         bool "Flash mode uses the wqn-flash-v2 Realtime protocol (WQN proxy)"
         default y
@@ -240,36 +286,6 @@ menu "WQN firmware"
             PCM_DUMP_END markers. Diagnostic only: at 115200 baud this
             blocks the AI worker for roughly 10 s per turn, so never enable
             it outside a targeted capture session.
-
-    config WQN_BATTERY_LOW_THRESHOLD_MV
-        int "Battery low shutdown threshold in millivolts"
-        default 3450
-        help
-            When battery voltage drops below this and USB is not connected,
-            the device shuts down. Official firmware uses 3450mV (3.45V).
-
-    config WQN_BATTERY_OTA_THRESHOLD_PCT
-        int "Minimum battery percent for OTA upgrades"
-        default 50
-        help
-            Prevent OTA upgrades when battery is below this threshold.
-            From official firmware string: "电量不足...请充电至50%%以上"
-
-    config WQN_CHARGING_DEEP_SLEEP_EXTRA_MS
-        int "Extra idle time before deep sleep when charging (ms)"
-        default 300000
-        help
-            When charging, extend deep sleep idle timeout by this amount
-            so the device stays awake longer for syncing/updates.
-            Default 5 minutes extra.
-
-            Currently unused: external power holds the kUsbPower sleep lease,
-            which blocks deep sleep outright, so the idle threshold is never
-            reached while charging. Kept for a future policy change.
-
-            Currently unused: external power holds the kUsbPower sleep lease,
-            which blocks deep sleep outright, so the idle threshold is never
-            reached while charging. Kept for a future policy change.
 
     config WQN_DEV_MENU_ENABLE
         bool "Enable the dev diagnostics submenu in the settings page"

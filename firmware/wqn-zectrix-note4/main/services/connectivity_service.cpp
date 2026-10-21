@@ -58,7 +58,6 @@ constexpr size_t kMaxSsidBytes = 32;
 // submitting thread must get ESP_ERR_TIMEOUT back instead of hanging
 // forever on g_call_mutex / the reply queue. 30 s matches the STA connect
 // budget (kWifiConnectTimeout in wqn_api.cpp).
-constexpr TickType_t kSubmitCommandTimeout = pdMS_TO_TICKS(30000);
 constexpr size_t kMaxPasswordBytes = 64;
 constexpr EventBits_t kOnlineBit = BIT0;
 constexpr EventBits_t kStateChangedBit = BIT1;
@@ -75,6 +74,7 @@ enum class CommandType : uint8_t {
     kProvisioned,
     kPrepareSleep,
     kRollbackSleep,
+    kSwitchNetwork,
 };
 
 enum class ScheduledAction : uint8_t {
@@ -94,6 +94,9 @@ struct ConnectivityCommand {
     wqn::power::PrepareSleepCommand sleep = {};
     int reason = 0;
     int rssi = 0;
+    uint32_t operation_id = 0;
+    uint32_t station_generation = 0;
+    wqn::services::WifiNetworkRole network_role = wqn::services::WifiNetworkRole::kPrimary;
 };
 
 struct ConnectivityReply {
@@ -184,8 +187,21 @@ std::atomic<bool> g_legacy_wifi_migration_attempted{false};
 // under the spinlock so a cross-core reader never sees a torn string.
 portMUX_TYPE g_snapshot_lock = portMUX_INITIALIZER_UNLOCKED;
 char g_snapshot_active_ssid[33] = {};
+char g_snapshot_primary_ssid[33] = {};
 char g_snapshot_backup_ssid[33] = {};
 bool g_snapshot_has_backup = false;
+
+std::atomic<bool> g_wifi_switch_pending{false};
+std::atomic<uint32_t> g_next_wifi_switch_id{1};
+portMUX_TYPE g_wifi_switch_lock = portMUX_INITIALIZER_UNLOCKED;
+wqn::services::WifiSwitchSnapshot g_wifi_switch_snapshot{};
+// Requester owns this until queue publication; ConnectivityTask then owns it
+// until the terminal result is published before pending is released.
+wqn::runtime::SleepLease g_wifi_switch_lease;
+uint8_t g_wifi_switch_target_slot = 0;
+bool g_wifi_switch_active = false;  // ConnectivityTask only, after queue admission.
+int g_selected_start_slot = -1;  // Manual choice for this boot; never persisted.
+int g_wifi_switch_previous_start_slot = -1;
 
 const char* StateName(wqn::services::ConnectivityState state)
 {
@@ -428,6 +444,34 @@ void ScheduleBackoff(
 esp_err_t EnsureServiceStarted();
 void ReleaseDemand(uint32_t id);
 
+bool HasPendingUserConnection()
+{
+    return g_wifi_switch_pending.load(std::memory_order_acquire) ||
+        wqn::GetProvisioningState() == wqn::ProvisionState::kConnecting;
+}
+
+void PublishWifiSwitchState(wqn::services::WifiSwitchState state, esp_err_t error = ESP_OK)
+{
+    taskENTER_CRITICAL(&g_wifi_switch_lock);
+    g_wifi_switch_snapshot.state = state;
+    g_wifi_switch_snapshot.error = error;
+    taskEXIT_CRITICAL(&g_wifi_switch_lock);
+}
+
+void CompleteWifiSwitch(wqn::services::WifiSwitchState state, esp_err_t error)
+{
+    if (!g_wifi_switch_pending.load(std::memory_order_acquire)) {
+        return;
+    }
+    PublishWifiSwitchState(state, error);
+    if (g_wifi_switch_active && state == wqn::services::WifiSwitchState::kFailed) {
+        g_selected_start_slot = g_wifi_switch_previous_start_slot;
+    }
+    g_wifi_switch_active = false;
+    g_wifi_switch_lease.Reset();
+    g_wifi_switch_pending.store(false, std::memory_order_release);
+}
+
 // [wifi-redundancy] Publishes the active/backup SSID identity for snapshots.
 // Runs on ConnectivityTask; the copy is short and under a spinlock so a reader
 // on the other core (UI snapshot) never sees a torn string.
@@ -446,12 +490,14 @@ void PublishSnapshotIdentity()
         CopyCredential(
             g_snapshot_backup_ssid,
             sizeof(g_snapshot_backup_ssid),
-            g_cred_store.slots[1 - g_active_slot].ssid);
+            g_cred_store.slots[1 - g_cred_store.preferred].ssid);
         g_snapshot_has_backup = true;
     } else {
         g_snapshot_backup_ssid[0] = '\0';
         g_snapshot_has_backup = false;
     }
+    CopyCredential(g_snapshot_primary_ssid, sizeof(g_snapshot_primary_ssid),
+        g_cred_store.count > 0 ? g_cred_store.slots[g_cred_store.preferred].ssid : "");
     taskEXIT_CRITICAL(&g_snapshot_lock);
 }
 
@@ -499,6 +545,9 @@ esp_err_t KickConnectFromStore()
         return ESP_ERR_NOT_FOUND;
     }
     g_active_slot = g_cred_store.preferred;
+    if (g_selected_start_slot >= 0 && g_selected_start_slot < g_cred_store.count) {
+        g_active_slot = static_cast<uint8_t>(g_selected_start_slot);
+    }
     g_slot_fail_count[0] = g_slot_fail_count[1] = 0;
     PublishSnapshotIdentity();
     const wqn::WifiCredentialSlot& slot = g_cred_store.slots[g_active_slot];
@@ -554,11 +603,12 @@ bool PostAsyncCommand(const ConnectivityCommand& command)
     return true;
 }
 
-void WifiEventSink(wqn::WifiStationEvent event, int reason, int rssi)
+void WifiEventSink(wqn::WifiStationEvent event, int reason, int rssi, uint32_t generation)
 {
     ConnectivityCommand command;
     command.reason = reason;
     command.rssi = rssi;
+    command.station_generation = generation;
     switch (event) {
         case wqn::WifiStationEvent::kStarted:
             command.type = CommandType::kWifiStarted;
@@ -583,7 +633,9 @@ void ProvisionDone(const std::string& ssid, const std::string& password)
     command.type = CommandType::kProvisioned;
     CopyCredential(command.ssid, sizeof(command.ssid), ssid.c_str());
     CopyCredential(command.password, sizeof(command.password), password.c_str());
-    PostAsyncCommand(command);
+    if (!PostAsyncCommand(command)) {
+        wqn::ReportProvisioningConnectionResult(false);
+    }
 }
 #endif
 
@@ -635,6 +687,10 @@ esp_err_t BeginConnectionAttempt()
 
 void ScheduleBackoff(wqn::services::ConnectivityWaitResult failure)
 {
+    wqn::ReportProvisioningConnectionResult(false);
+    if (g_wifi_switch_active) {
+        CompleteWifiSwitch(wqn::services::WifiSwitchState::kFailed, ESP_FAIL);
+    }
     PublishFailure(failure);
     SetOnline(false);
     g_attempt_active = false;
@@ -726,6 +782,10 @@ void RecordAttemptFailure(const char* cause, bool credential_failure)
 esp_err_t BeginProvisioning()
 {
 #if defined(CONFIG_WQN_WIFI_STA_ENABLE) && defined(CONFIG_WQN_PROVISION_ENABLE)
+    if (g_wifi_switch_pending.load(std::memory_order_acquire)) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    g_selected_start_slot = -1;
     if (!HoldConnectivityLease()) {
         return ESP_ERR_INVALID_STATE;
     }
@@ -734,6 +794,13 @@ esp_err_t BeginProvisioning()
     g_attempt_active = false;
     ClearScheduledAction();
     SetState(wqn::services::ConnectivityState::kProvisioning);
+    // Stop the previous STA before APSTA starts so old association/IP events
+    // cannot race the provisioning owner's scans and handoff.
+    const esp_err_t stop_result = wqn::StopWifiStationRadio();
+    if (stop_result != ESP_OK) {
+        SetState(wqn::services::ConnectivityState::kOff);
+        return stop_result;
+    }
     const esp_err_t result = wqn::StartProvisioningMode();
     if (result != ESP_OK) {
         SetState(wqn::services::ConnectivityState::kOff);
@@ -884,6 +951,9 @@ void HandleDemandPolicyChanged()
     const wqn::services::ConnectivityState state =
         g_state.load(std::memory_order_acquire);
     if (current.count == 0) {
+        if (HasPendingUserConnection()) {
+            return;  // The bounded provisioning handoff owns its connect lease.
+        }
         if (state == wqn::services::ConnectivityState::kOnline) {
             SetState(wqn::services::ConnectivityState::kOnlineIdleTail);
             ScheduleAction(
@@ -965,6 +1035,8 @@ esp_err_t StartWithCredentials(const ConnectivityCommand& command)
     // A credential change is an explicit user action: restart the backoff
     // ladder from rung 0 and lift any auto-retry suspension.
     ResetBackoffEscalation();
+    SetOnline(false);
+    g_selected_start_slot = -1;
 
     // [wifi-redundancy] Persist first (dedup by SSID, the new credential becomes
     // preferred), then connect from the refreshed store. If the upsert fails we
@@ -1008,6 +1080,72 @@ esp_err_t StartWithCredentials(const ConnectivityCommand& command)
     }
     return result;
 #endif
+}
+
+esp_err_t SwitchStoredNetwork(const ConnectivityCommand& command)
+{
+    using wqn::services::ConnectivityState;
+    using wqn::services::WifiSwitchState;
+    if (!g_wifi_switch_pending.load(std::memory_order_acquire) ||
+        wqn::services::GetWifiSwitchSnapshot().operation_id != command.operation_id) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    const ConnectivityState state = g_state.load(std::memory_order_acquire);
+    if (state == ConnectivityState::kQuiescing || state == ConnectivityState::kProvisioning ||
+        wqn::IsProvisioningActive() ||
+        wqn::GetProvisioningState() == wqn::ProvisionState::kConnecting ||
+        g_demand_count.load(std::memory_order_acquire) != 0) {
+        CompleteWifiSwitch(WifiSwitchState::kBusy, ESP_ERR_INVALID_STATE);
+        return ESP_ERR_INVALID_STATE;
+    }
+    wqn::WifiCredentialStore store;
+    const esp_err_t load_result = wqn::LoadWifiCredentialStore(&store);
+    if (load_result != ESP_OK || store.count == 0 ||
+        (command.network_role == wqn::services::WifiNetworkRole::kBackup && store.count < 2)) {
+        const esp_err_t error = load_result == ESP_OK ? ESP_ERR_NOT_FOUND : load_result;
+        CompleteWifiSwitch(WifiSwitchState::kFailed, error);
+        return error;
+    }
+    const uint8_t target = command.network_role == wqn::services::WifiNetworkRole::kPrimary
+        ? store.preferred : static_cast<uint8_t>(1 - store.preferred);
+    if (g_online.load(std::memory_order_acquire) && wqn::IsWifiStationConnected() &&
+        std::strcmp(g_snapshot_active_ssid, store.slots[target].ssid) == 0) {
+        g_cred_store = store;
+        g_active_slot = target;
+        g_selected_start_slot = target;
+        PublishSnapshotIdentity();
+        CompleteWifiSwitch(WifiSwitchState::kConnected, ESP_OK);
+        return ESP_OK;
+    }
+    if (!HoldConnectivityLease()) {
+        CompleteWifiSwitch(WifiSwitchState::kFailed, ESP_ERR_INVALID_STATE);
+        return ESP_ERR_INVALID_STATE;
+    }
+    g_wifi_switch_target_slot = target;
+    g_wifi_switch_active = true;
+    g_cred_store = store;
+    g_wifi_switch_previous_start_slot = g_selected_start_slot;
+    g_selected_start_slot = target;
+    g_slot_fail_count[0] = g_slot_fail_count[1] = kPerSlotAttemptLimit - 1;
+    g_attempt_active = false;
+    ClearScheduledAction();
+    ResetBackoffEscalation();
+    SetOnline(false);
+    g_active_slot = target;
+    PublishSnapshotIdentity();
+    PublishWifiSwitchState(WifiSwitchState::kConnecting);
+    SetState(ConnectivityState::kConnecting);
+    const auto& slot = g_cred_store.slots[target];
+    const esp_err_t result = wqn::StartWifiWithCredentials(slot.ssid, slot.password);
+    if (result != ESP_OK) {
+        RecordAttemptFailure("manual-configure", true);
+        return result;
+    }
+    const esp_err_t connect_result = BeginConnectionAttempt();
+    if (connect_result != ESP_OK) {
+        RecordAttemptFailure("manual-connect", true);
+    }
+    return connect_result;
 }
 
 esp_err_t PrepareForSleep(const wqn::power::PrepareSleepCommand& command)
@@ -1081,9 +1219,17 @@ esp_err_t RollbackAfterSleepAbort()
 
 esp_err_t HandleCommand(const ConnectivityCommand& command)
 {
+    const bool station_event = command.type == CommandType::kWifiStarted ||
+        command.type == CommandType::kWifiAssociated || command.type == CommandType::kWifiGotIp ||
+        command.type == CommandType::kWifiDisconnected;
+    if (station_event && command.station_generation != wqn::GetWifiStationGeneration()) {
+        return ESP_OK;  // An already-queued event belongs to the old connection.
+    }
     const wqn::services::ConnectivityState state =
         g_state.load(std::memory_order_acquire);
     switch (command.type) {
+        case CommandType::kSwitchNetwork:
+            return SwitchStoredNetwork(command);
         case CommandType::kStartWithCredentials:
         case CommandType::kProvisioned:
             return StartWithCredentials(command);
@@ -1112,6 +1258,7 @@ esp_err_t HandleCommand(const ConnectivityCommand& command)
             if (state == wqn::services::ConnectivityState::kQuiescing ||
                 state == wqn::services::ConnectivityState::kBackoff ||
                 state == wqn::services::ConnectivityState::kProvisioning ||
+                state == wqn::services::ConnectivityState::kWaitingIp ||
                 state == wqn::services::ConnectivityState::kOnline ||
                 state == wqn::services::ConnectivityState::kOnlineIdleTail) {
                 return ESP_OK;
@@ -1129,7 +1276,10 @@ esp_err_t HandleCommand(const ConnectivityCommand& command)
             return ESP_OK;
         case CommandType::kWifiGotIp:
             if (state == wqn::services::ConnectivityState::kQuiescing ||
-                state == wqn::services::ConnectivityState::kBackoff) {
+                state == wqn::services::ConnectivityState::kBackoff ||
+                state == wqn::services::ConnectivityState::kProvisioning ||
+                state == wqn::services::ConnectivityState::kOff ||
+                !wqn::IsWifiStationConnected()) {
                 return ESP_OK;
             }
             g_attempt_active = false;
@@ -1137,6 +1287,14 @@ esp_err_t HandleCommand(const ConnectivityCommand& command)
             ClearScheduledAction();
             ResetBackoffEscalation();
             SetOnline(true, wqn::GetWifiRssi());
+            if (g_wifi_switch_active) {
+                const bool reached_target = g_active_slot == g_wifi_switch_target_slot;
+                g_selected_start_slot = g_active_slot;
+                CompleteWifiSwitch(reached_target
+                    ? wqn::services::WifiSwitchState::kConnected
+                    : wqn::services::WifiSwitchState::kRestored,
+                    reached_target ? ESP_OK : ESP_FAIL);
+            }
             if (g_demand_count.load(std::memory_order_acquire) == 0) {
                 SetState(wqn::services::ConnectivityState::kOnlineIdleTail);
                 ScheduleAction(
@@ -1145,18 +1303,9 @@ esp_err_t HandleCommand(const ConnectivityCommand& command)
             } else {
                 SetState(wqn::services::ConnectivityState::kOnline);
             }
-            // [wifi-redundancy] The slot that just connected becomes the next
-            // cycle's first try; the NVS write is skipped when unchanged.
-            if (g_cred_store.count > 0 && g_active_slot < g_cred_store.count) {
-                const esp_err_t preferred_result =
-                    wqn::MarkWifiSlotPreferred(g_active_slot);
-                if (preferred_result != ESP_OK) {
-                    ESP_LOGW(
-                        kTag,
-                        "mark WiFi slot preferred failed: %s",
-                        esp_err_to_name(preferred_result));
-                }
-            }
+            // [wifi-roles] Association changes the active link, never the
+            // configured primary/backup identities or their durable priority.
+            wqn::ReportProvisioningConnectionResult(true);
             // Connectivity is readiness, not a synchronization intent. The
             // sync scheduler wakes and runs only if a manual/periodic/retry/
             // outbox reason is already pending; reconnecting by itself must
@@ -1171,7 +1320,8 @@ esp_err_t HandleCommand(const ConnectivityCommand& command)
                 state == wqn::services::ConnectivityState::kOff) {
                 return ESP_OK;
             }
-            if (g_demand_count.load(std::memory_order_acquire) == 0) {
+            if (g_demand_count.load(std::memory_order_acquire) == 0 &&
+                !HasPendingUserConnection()) {
                 return StopRadioAndSetOff("disconnect-no-demand");
             }
             ESP_LOGW(
@@ -1858,6 +2008,64 @@ int GetConnectivityRssi()
     return g_rssi.load(std::memory_order_acquire);
 }
 
+uint32_t RequestWifiNetworkSwitch(WifiNetworkRole role)
+{
+#if CONFIG_WQN_WIFI_STA_ENABLE
+    if ((role != WifiNetworkRole::kPrimary && role != WifiNetworkRole::kBackup) ||
+        EnsureServiceStarted() != ESP_OK) {
+        return 0;
+    }
+    bool expected = false;
+    if (!g_wifi_switch_pending.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+        return 0;
+    }
+    auto lease = runtime::SleepLease::TryAcquire(
+        runtime::SleepBlocker::kConnectivity, "wifi-switch", __FILE__, __LINE__);
+    if (!lease) {
+        g_wifi_switch_pending.store(false, std::memory_order_release);
+        return 0;
+    }
+    g_wifi_switch_lease = std::move(lease);
+    uint32_t operation_id = g_next_wifi_switch_id.fetch_add(1, std::memory_order_relaxed);
+    if (operation_id == 0) {
+        operation_id = g_next_wifi_switch_id.fetch_add(1, std::memory_order_relaxed);
+    }
+    taskENTER_CRITICAL(&g_wifi_switch_lock);
+    g_wifi_switch_snapshot = {};
+    g_wifi_switch_snapshot.operation_id = operation_id;
+    g_wifi_switch_snapshot.target = role;
+    g_wifi_switch_snapshot.state = WifiSwitchState::kQueued;
+    taskEXIT_CRITICAL(&g_wifi_switch_lock);
+    ConnectivityCommand command;
+    command.type = CommandType::kSwitchNetwork;
+    command.operation_id = operation_id;
+    command.network_role = role;
+    if (!PostAsyncCommand(command)) {
+        PublishWifiSwitchState(WifiSwitchState::kFailed, ESP_ERR_NO_MEM);
+        g_wifi_switch_lease.Reset();
+        g_wifi_switch_pending.store(false, std::memory_order_release);
+        return 0;
+    }
+    return operation_id;
+#else
+    (void)role;
+    return 0;
+#endif
+}
+
+WifiSwitchSnapshot GetWifiSwitchSnapshot()
+{
+    WifiSwitchSnapshot snapshot;
+    taskENTER_CRITICAL(&g_wifi_switch_lock);
+    snapshot = g_wifi_switch_snapshot;
+    taskEXIT_CRITICAL(&g_wifi_switch_lock);
+    snapshot.online = g_online.load(std::memory_order_acquire);
+    taskENTER_CRITICAL(&g_snapshot_lock);
+    CopyCredential(snapshot.active_ssid, sizeof(snapshot.active_ssid), g_snapshot_active_ssid);
+    taskEXIT_CRITICAL(&g_snapshot_lock);
+    return snapshot;
+}
+
 void SetConnectivityProvisioning()
 {
     ConnectivityCommand command;
@@ -1885,6 +2093,7 @@ ConnectivitySnapshot GetConnectivitySnapshot()
     // (ConnectivityTask) uses, so the SSID strings are never torn.
     taskENTER_CRITICAL(&g_snapshot_lock);
     CopyCredential(snapshot.active_ssid, sizeof(snapshot.active_ssid), g_snapshot_active_ssid);
+    CopyCredential(snapshot.primary_ssid, sizeof(snapshot.primary_ssid), g_snapshot_primary_ssid);
     CopyCredential(snapshot.backup_ssid, sizeof(snapshot.backup_ssid), g_snapshot_backup_ssid);
     snapshot.has_backup = g_snapshot_has_backup;
     taskEXIT_CRITICAL(&g_snapshot_lock);

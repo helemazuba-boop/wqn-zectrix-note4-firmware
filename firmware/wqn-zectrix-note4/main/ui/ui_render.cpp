@@ -27,15 +27,25 @@ esp_err_t RenderFrameToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
     ESP_RETURN_ON_FALSE(
         frame_txn.locked(), ESP_ERR_NO_MEM, kTag,
         "take EPD frame transaction");
+    if (frame.screen != wqn::UiScreen::kTodo) InvalidateTodoRenderCache();
     // A background sync wake deliberately defers panel initialization until
     // pixels actually need to change. Initialize before any draw operation;
     // relying on RefreshEpdFull's later lazy init would clear the framebuffer
     // after rendering and transmit a blank/incomplete page.
     ESP_RETURN_ON_ERROR(
         wqn::InitEpdDisplay(), kTag, "initialize EPD before frame render");
-    ESP_LOGI(kTag, "RenderFrameToEpd: enter schedule=%s screen=%d", RefreshScheduleName(schedule), static_cast<int>(frame.screen));
+    ESP_LOGI(kTag, "RenderFrameToEpd: enter schedule=%s screen=%d home_focus=%u",
+             RefreshScheduleName(schedule), static_cast<int>(frame.screen),
+             static_cast<unsigned>(frame.selected_home_task));
     const UBaseType_t hwm_before_render = uxTaskGetStackHighWaterMark(nullptr);
     ESP_LOGI(kTag, "RenderFrameToEpd: stack HWM before render: %u bytes free", static_cast<unsigned>(hwm_before_render * sizeof(StackType_t)));
+    // A modal overlay must be composed after a complete base page, including
+    // clock/config updates whose regional renderer would bypass RefreshFrame.
+    if ((frame.navigation.visible || g_last_rendered_navigation_visible) &&
+        schedule != RefreshSchedule::kCommit &&
+        schedule != RefreshSchedule::kImmediate) {
+        schedule = RefreshSchedule::kNavigation;
+    }
     const bool region_frame_available = wqn::IsEpdFramebufferSynchronized();
     const bool region_schedule =
         schedule == RefreshSchedule::kClock ||
@@ -103,6 +113,10 @@ esp_err_t RenderFrameToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
     }
     if (frame.screen == wqn::UiScreen::kSettings) {
         return RenderSettingsToEpd(frame, schedule);
+    }
+    if (frame.screen == wqn::UiScreen::kProvisioning &&
+        frame.provisioning_phase != wqn::ProvisionState::kIdle) {
+        return RenderProvisioningToEpd(frame, schedule);
     }
 
     wqn::ClearEpdFramebuffer(true);

@@ -60,7 +60,7 @@ def main():
         '@@OUTBOX_QUOTA@@': (
             '#define FIXTURE_OUTBOX_QUOTA 1\n' + section(
                 source, 'constexpr size_t kOutboxMaxRecords =',
-                '\n// [measure] §五之十 §6. `open_ms`')
+                '\n// [word-batch] One open/write/flush/sync/close')
             if 'constexpr size_t kOutboxMaxRecords =' in source else
             '#define FIXTURE_OUTBOX_QUOTA 0\n'),
         '@@MODES@@': section(source,
@@ -85,7 +85,7 @@ def main():
                             '\nesp_err_t SaveCursorTransaction('),
         '@@COMMIT@@': section(source, 'struct CommitContext {',
                               '\nesp_err_t PeekObservationTransaction('),
-        '@@ACK@@': section(source, 'struct AckContext {', '\nstruct QuarantineContext {'),
+        '@@ACK@@': section(source, 'struct AckBatchContext {', '\nstruct QuarantineContext {'),
         '@@TERMINAL@@': section(source, 'struct QuarantineContext {',
                                 '\nesp_err_t SnapshotTransaction('),
         '@@MAINTENANCE_DRIVER@@': (
@@ -94,10 +94,10 @@ def main():
             if 'esp_err_t RunOutboxMaintenance(' in source else ''),
         '@@PUBLIC_MAINTENANCE@@': (
             'namespace wqn {\n' + section(
-                source, 'esp_err_t AcknowledgeWordObservation(',
+                source, 'esp_err_t AcknowledgeWordObservations(',
                 '\nesp_err_t ReadWordOutboxSnapshot(') + section(
                 source, 'esp_err_t PrepareWordObservationOutboxForSleep(',
-                '\n}  // namespace wqn\n\n// [measure] Temporary bench starter.') + '\n}\n'
+                '\n}  // namespace wqn\n') + '\n}\n'
             if 'esp_err_t RunOutboxMaintenance(' in source else ''),
     }
     template = (root / 'scripts/testdata/word_session_replay.cpp').read_text(

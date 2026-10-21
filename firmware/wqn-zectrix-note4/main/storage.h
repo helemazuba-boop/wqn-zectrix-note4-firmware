@@ -23,28 +23,6 @@ struct StorageCapacitySnapshot {
     size_t nvs_total_entries = 0;
 };
 
-// [measure] §五之十 §6 probe contract. `nvs write:` is emitted per NVS write and
-// is folded into WRITE:parts-account-for-transaction's sum automatically by
-// hil_check.py, so the judge keeps working after the 52 B cursor leaves SPIFFS
-// and `atomic write:` drops from 2 rows to 1 per answer. Do not rename the field
-// names -- the criteria grep for them literally and a rename is a silent SKIP.
-struct NvsWriteProbe {
-    const char* key = nullptr;
-    size_t bytes = 0;
-    int64_t total_ms = 0;
-    // False when the value already matched what NVS holds, which is also the
-    // case IDF itself short-circuits in (nvs_storage.cpp:504-507 / :478-480).
-    bool changed = false;
-};
-
-// Emits `nvs write:`. Any task may call; it only formats a log line.
-void LogNvsWriteProbe(const NvsWriteProbe& probe);
-// Emits `nvs stats: used_entries=… free_entries=… available_entries=… total_entries=…`
-// from nvs_get_stats. This is the line that turns §五之十's derived NVS
-// arithmetic ("~4.7 writes", "21.2%", 504 entries) into a measurement: if the
-// measured total_entries is not 504, every percentage in that section is wrong.
-void LogNvsStatsProbe();
-
 // [word-session-cursor-nvs] The 52 B pause/resume cursor, moved off SPIFFS
 // (doc/1005-storage-rewrite-todo.md §五之十). It used to cost a 1,766 ms median
 // AtomicWrite per answer, which is half of the "answering takes 4.3 s" symptom.
@@ -53,7 +31,6 @@ void LogNvsStatsProbe();
 // task; re-queuing through SaveBlobToNvs would nest a second writer inside a
 // transaction (§7.4). `key` comes from the caller's per-mode table so this
 // header keeps no dependency on the word protocol types.
-// Emits the `nvs write:` / `nvs stats:` probes of §五之十 §6.
 esp_err_t SaveWordSessionCursorNvs(const char* key, const void* record, size_t size);
 // `*found` stays false and the result stays ESP_OK when no cursor is stored --
 // that is the "this mode is unused / not migrated yet" case, not an error. The
@@ -65,10 +42,6 @@ esp_err_t LoadWordSessionCursorNvs(const char* key, void* record, size_t size, b
 // orphan blob behind (4 entries of the 504-entry budget, §五之十). NOT_FOUND is
 // success: clearing a mode that never had a cursor is the normal case.
 esp_err_t ClearWordSessionCursorNvs(const char* key);
-// [measure] Owner-task-only synthetic 52 B CRUD smoke test. Refuses an
-// existing scratch key, never uses a real mode key, and cleans up its own key.
-// This is not a word-session migration/clear or physical power-loss test.
-esp_err_t RunWordCursorNvsSmokeProbe(void* context);
 
 struct DeviceControlState {
     uint64_t config_revision = 0;
@@ -155,7 +128,6 @@ esp_err_t SaveSyncJournalThroughStorageService(
     const SyncJournal& journal, const char* reason = "unspecified");
 
 esp_err_t LoadAutoSyncIntervalMinutes(uint32_t* minutes);
-esp_err_t SaveAutoSyncIntervalMinutes(uint32_t minutes);
 // [persist-worker] Worker-dedicated variant: routes the NVS commit through the
 // FOREGROUND storage queue so the persist worker's wait behind background pack
 // writes is bounded (once a transaction starts it may still wait without a
@@ -194,7 +166,6 @@ esp_err_t SaveWordSequentialCursor(uint32_t cursor);
 // study sessions scope to it; the other decks enter via the note screen's
 // mixed [词] rows.
 esp_err_t LoadDefaultWordDeckId(std::string* deck_id);
-esp_err_t SaveDefaultWordDeckId(const std::string& deck_id);
 // [deck-scope] Recoverable default-deck change protocol (c5). A deck switch
 // must clear both persisted word sessions (SPIFFS) and save the new deck +
 // scope generation (NVS); there is no cross-NVS/SPIFFS atomicity, so a marker
@@ -219,7 +190,6 @@ uint32_t GetDeckScopeGeneration();
 // today is the UI task.
 esp_err_t ResetWordSessionScope();
 esp_err_t LoadVolumePercent(int* percent);
-esp_err_t SaveVolumePercent(int percent);
 // [persist-worker] Worker-dedicated variant (see SaveAutoSyncIntervalMinutesForeground).
 esp_err_t SaveVolumePercentForeground(int percent);
 std::string VolumeLabel(int percent);
@@ -235,7 +205,9 @@ esp_err_t LoadWifiCredentials(std::string* ssid, std::string* password);
 
 // [wifi-redundancy] Dual-slot WiFi credential store. The store is a versioned
 // NVS blob holding up to two (ssid, password) slots plus a `preferred` index
-// pointing at the last slot that connected successfully. Persistence is a
+// pointing at the configured primary network. Automatic failover never changes
+// this identity. Existing blobs retain their current preferred slot as primary;
+// the layout and version are unchanged. Persistence is a
 // single atomic blob commit (the legacy per-key wifi_ssid/wifi_pass pair could
 // tear across power loss). Load is a pure read; MigrateLegacyWifiCredentialsIfNeeded
 // performs the legacy-key migration explicitly.
@@ -245,7 +217,7 @@ struct WifiCredentialSlot {
 };
 struct WifiCredentialStore {
     uint8_t version = 0;    // kWifiCredentialStoreVersion when valid
-    uint8_t preferred = 0;  // index of last successfully-connected slot
+    uint8_t preferred = 0;  // index of the configured primary slot
     uint8_t count = 0;      // 0..2 occupied slots
     WifiCredentialSlot slots[2] = {};
 };
@@ -298,10 +270,8 @@ esp_err_t SetWifiCredentialForRole(
     const std::string& ssid,
     const std::string& password,
     bool keep_existing_password);
-// Marks `index` as the preferred (last-good) slot. Writes only when the value
+// Explicitly makes `index` the configured primary slot. Writes only when the value
 // actually changes, to bound NVS wear.
-esp_err_t MarkWifiSlotPreferred(uint8_t index);
-
 // PowerCoordinator boundary. Writes are serialized by StorageService and each
 // accepted transaction holds kStorage, so Ready means every commit is durable.
 esp_err_t PrepareStorageForSleep(int64_t deadline_us);

@@ -60,12 +60,6 @@ void DrawSelectableIcon(int x, int y, const WqnBitmapAsset& asset, bool focused,
 // `text` is centered and truncated to fit the chip width.
 void DrawStatusChip(int x, int y, int width, int height, int radius, const std::string& text);
 
-// [v2] Unified tag/label chip: rounded badge with centered text, used for row
-// tags (home task tag, settings row tag) and inline status labels. Replaces the
-// per-page inline rounded-rect + centered-text tag implementations. Width is
-// caller-chosen (fixed for settings rows, content-measured for home rows).
-void DrawChip(int x, int y, int width, int height, const std::string& text);
-
 // [v2] Unified empty/error state: a rounded container with a centered title,
 // an optional body line, and an optional status/hint line. Replaces the three
 // divergent empty states (todo's boxed card vs note/problem/word's bare text)
@@ -76,10 +70,5 @@ esp_err_t DrawEmptyState(
     const std::string& title,
     const std::string& body = "",
     const std::string& hint = "");
-
-// Draw the page footer hint line at the shared footer y (kBottomHintY) across
-// the standard content width. Replaces per-page DrawClippedText(..., 12, 278, 376, ...)
-// footers so the hint slot geometry is owned in one place.
-esp_err_t DrawPageFooterHint(const std::string& text);
 
 }  // namespace device_ui_internal

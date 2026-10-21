@@ -1,297 +1,401 @@
-// Word page rendering: home (智能复习 / 随机 / 遗忘的单词), the review completion
-// page and one shared card surface. Extracted from device_ui.cpp.
-
+// Word pages share Home's paper sections and native type. Learning input stays
+// in word_app: there is no reader, text paging, or new button gesture here.
 #include "ui_internal.h"
-#include "ui_widgets.h"
-
-#include <string>
-
 #include "display_service.h"
-#include "esp_log.h"
-#include "ui/assets/font_wqn_card_24_1.h"
+#include "ui_fonts.h"
+#include "word_fonts.h"
 #include "word_app.h"
 
+#include <algorithm>
+#include <cstdint>
+#include <string>
+#include <utility>
+#include <vector>
+
 namespace device_ui_internal {
+namespace {
 
-constexpr char kTag[] = "wqn_ui";
+struct WordCharacter {
+    std::string text;
+    uint32_t codepoint;
+};
 
-// ---- Word page internal geometry (page-local, derives from ui_layout tokens) ----
-// Page header summary band: status (left) + progress (right) under the system
-// status bar (y=kStatusBarDividerY), with a divider a couple of px below the
-// status line.
-constexpr int kWordHeaderLineY = 36;
-constexpr int kWordHeaderDividerY = 58;
-constexpr int kWordProgressX = 282;          // right-aligned progress, width 108 to kEpdWidth-kMarginX
-constexpr int kWordProgressWidth = (wqn::kEpdWidth - kMarginX) - kWordProgressX;
-constexpr int kWordActionDividerY = 274;
-constexpr int kWordActionTextY = 280;
-
-// Word home feature cards (the rounded-card language).
-constexpr int kWordCardH = 60;
-constexpr int kWordCardGap = 12;
-constexpr int kWordCardY0 = 66;
-constexpr int kStatusChipWidth = 88;
-constexpr int kStatusChipHeight = 26;
-constexpr int kStatusChipRadius = 6;
-constexpr int kStatusChipOffsetX = 278;     // chip origin offset from the card x
-
-// Completion page rows (kInvert focus -- compact operable items).
-constexpr int kWordChoiceX = 38;
-constexpr int kWordChoiceW = 324;
-constexpr int kWordChoiceH = 42;
-
-// Content (non-focus) display frames -- plain outlined containers drawn with
-// DrawRect outlines directly (the decoration layer owns FOCUS only).
-constexpr int kWordBackX = 22;
-constexpr int kWordBackW = 356;
-constexpr int kWordBackH = 116;
-constexpr int kWordBackTextX = 34;
-constexpr int kWordBackTextW = 332;
-constexpr int kWordRecallX = 74;
-constexpr int kWordRecallW = 252;
-constexpr int kWordRecallH = 48;
-
-std::string WordActionHint(const wqn::WordAppSnapshot& word)
+WordCharacter WordNextCharacter(const std::string& text, size_t* position)
 {
-    if (word.commit_state == wqn::WordObservationCommitState::kFailed) {
-        return "保存失败 · 确认重试";
+    const size_t first = *position;
+    const auto c = static_cast<unsigned char>(text[first]);
+    size_t count = c < 0x80 ? 1 : (c & 0xe0) == 0xc0 ? 2 :
+        (c & 0xf0) == 0xe0 ? 3 : (c & 0xf8) == 0xf0 ? 4 : 1;
+    if (first + count > text.size()) count = 1;
+    uint32_t cp = c & (count == 1 ? 0x7f : count == 2 ? 0x1f : count == 3 ? 0x0f : 0x07);
+    for (size_t i = 1; i < count; ++i) {
+        const auto next = static_cast<unsigned char>(text[first + i]);
+        if ((next & 0xc0) != 0x80) { count = 1; cp = '?'; break; }
+        cp = (cp << 6) | (next & 0x3f);
     }
-    if (word.card_phase == wqn::WordCardPhase::kPersisting) {
-        return "正在保存，请稍候";
+    *position += count;
+    return {count == 1 && c >= 0x80 ? "?" : text.substr(first, count), cp};
+}
+
+const lv_font_t* WordPrimaryFont(int size)
+{
+    switch (size) {
+        case 12: return &wqn_ui_sans_12;
+        case 16: return &wqn_word_regular_16;
+        case 20: return &wqn_ui_sans_20;
+        case 24: return &wqn_word_bold_24;
+        case 32: return &wqn_word_bold_32;
+        case 48: return &wqn_ui_latin_48;
+        default: return wqn::PrimaryUiFont();
     }
-    switch (word.mode) {
-        case wqn::WordAppMode::kHome:
-            return "上下选择 · 确认进入 · 长按确认返回";
-        case wqn::WordAppMode::kSessionStarting:
-            return "长按确认取消";
-        case wqn::WordAppMode::kReviewComplete:
-            return "上下选择 · 确认执行 · 长按确认返回";
-        case wqn::WordAppMode::kWordCard:
-            if (word.card_phase == wqn::WordCardPhase::kFront) {
-                return "确认看释义 · 下键跳过 · 长按确认暂停";
+}
+
+const lv_font_t* WordFallbackFont(int size)
+{
+    switch (size) {
+        case 12: return &wqn_ui_sans_12;
+        case 20: return &wqn_word_regular_20;
+        case 24: case 32: return &wqn_ui_sans_24;
+        default: return wqn::PrimaryUiFont();
+    }
+}
+
+std::pair<const lv_font_t*, std::string> WordGlyph(int size, const std::string& text)
+{
+    const auto* primary = WordPrimaryFont(size);
+    if (wqn::MeasureTextWithFont(primary, text.c_str()) > 0) return {primary, text};
+    const auto* fallback = WordFallbackFont(size);
+    if (wqn::MeasureTextWithFont(fallback, text.c_str()) > 0) return {fallback, text};
+    // Unsupported user text stays visible rather than silently losing letters.
+    return wqn::MeasureTextWithFont(fallback, "□") > 0
+        ? std::make_pair(fallback, std::string("□"))
+        : std::make_pair(primary, std::string("?"));
+}
+
+int WordMeasure(int size, const std::string& text)
+{
+    int width = 0;
+    for (size_t i = 0; i < text.size();) {
+        const auto character = WordNextCharacter(text, &i);
+        const auto glyph = WordGlyph(size, character.text);
+        width += wqn::MeasureTextWithFont(glyph.first, glyph.second.c_str());
+    }
+    return width;
+}
+
+std::string WordOneLine(std::string text)
+{
+    std::replace_if(text.begin(), text.end(), [](unsigned char c) {
+        return c < 0x20 || c == 0x7f;
+    }, ' ');
+    return text;
+}
+
+void WordRemoveLast(std::string* text)
+{
+    if (text->empty()) return;
+    size_t end = text->size() - 1;
+    while (end && (static_cast<unsigned char>((*text)[end]) & 0xc0) == 0x80) --end;
+    text->resize(end);
+}
+
+std::string WordClip(const std::string& value, int size, int width)
+{
+    const std::string text = WordOneLine(value);
+    if (width <= 0) return {};
+    if (WordMeasure(size, text) <= width) return text;
+    const int ellipsis = WordMeasure(size, "...");
+    if (ellipsis > width) return {};
+    std::string output;
+    int used = 0;
+    for (size_t i = 0; i < text.size();) {
+        const auto c = WordNextCharacter(text, &i);
+        const int advance = WordMeasure(size, c.text);
+        if (used + advance + ellipsis > width) break;
+        output += c.text; used += advance;
+    }
+    return output + "...";
+}
+
+std::string WordEllipsis(std::string text, int size, int width)
+{
+    while (!text.empty() && (text.back() == ' ' || text.back() == '\t')) text.pop_back();
+    while (!text.empty() && WordMeasure(size, text + "...") > width) WordRemoveLast(&text);
+    return WordMeasure(size, "...") <= width ? text + "..." : std::string();
+}
+
+void WordDrawLine(int x, int top, int size, const std::string& text, bool ink = true)
+{
+    for (size_t i = 0; i < text.size();) {
+        const auto c = WordNextCharacter(text, &i);
+        const auto glyph = WordGlyph(size, c.text);
+        // Align the native glyph baselines when Latin/IPA and CJK share a run.
+        wqn::DrawTextWithFont(x, top + size - glyph.first->line_height + glyph.first->base_line,
+            glyph.first, glyph.second.c_str(), ink);
+        x += wqn::MeasureTextWithFont(glyph.first, glyph.second.c_str());
+    }
+}
+
+void WordText(int x, int top, const std::string& text, int size = 16,
+              int width = kWordWidth, bool right = false, bool ink = true)
+{
+    const auto clipped = WordClip(text, size, width);
+    WordDrawLine(right ? x - WordMeasure(size, clipped) : x, top, size, clipped, ink);
+}
+
+struct WordWrapped {
+    std::vector<std::string> lines;
+    bool truncated = false;
+};
+
+WordWrapped WordWrap(const std::string& text, int size, int width, size_t max_lines)
+{
+    WordWrapped result;
+    if (width <= 0 || !max_lines) { result.truncated = !text.empty(); return result; }
+    size_t position = 0, break_input = 0, break_output = std::string::npos;
+    int used = 0;
+    std::string line;
+    auto flush = [&]() {
+        while (!line.empty() && (line.back() == ' ' || line.back() == '\t')) line.pop_back();
+        result.lines.push_back(line); line.clear(); used = 0; break_output = std::string::npos;
+    };
+    while (position < text.size()) {
+        const size_t start = position;
+        auto c = WordNextCharacter(text, &position);
+        if (c.codepoint == '\r') continue;
+        if (c.codepoint == '\n') {
+            flush();
+        } else {
+            if (c.codepoint == '\t') c = {" ", ' '};
+            if (line.empty() && c.codepoint == ' ') continue;
+            const int advance = WordMeasure(size, c.text);
+            if (!line.empty() && used + advance > width) {
+                // Prefer whitespace breaks in Latin prose; CJK keeps character
+                // wrapping. A single overlong word/IPA can still span lines.
+                if (c.codepoint < 0x2e80 && c.codepoint != ' ' && break_output != std::string::npos) {
+                    line.resize(break_output); position = break_input;
+                } else {
+                    position = start;
+                }
+                flush();
+            } else {
+                if (advance > width) { result.truncated = true; continue; }
+                if (c.codepoint == ' ') { break_output = line.size(); break_input = position; }
+                line += c.text; used += advance;
             }
-            return "上键不认识 · 确认认识 · 下键跳过";
+        }
+        if (result.lines.size() == max_lines) {
+            result.truncated = text.find_first_not_of(" \t\r\n", position) != std::string::npos;
+            return result;
+        }
     }
-    return "";
+    if (!line.empty()) result.lines.push_back(line);
+    return result;
 }
 
-esp_err_t DrawWordActionFooter(const wqn::WordAppSnapshot& word)
+int WordParagraph(int top, const std::string& text, int size, int pitch, size_t max_lines)
 {
-    DrawHorizontalLine(kMarginX, kWordActionDividerY, kContentWidth);
-    return DrawCenteredText(
-        kMarginX, kWordActionTextY, kContentWidth, WordActionHint(word));
+    auto wrapped = WordWrap(text, size, kWordWidth, max_lines);
+    if (wrapped.truncated && !wrapped.lines.empty())
+        wrapped.lines.back() = WordEllipsis(wrapped.lines.back(), size, kWordWidth);
+    for (const auto& line : wrapped.lines) { WordDrawLine(kWordLeft, top, size, line); top += pitch; }
+    return top;
 }
 
-void DrawWordHeadline(const std::string& text)
+void WordHeader(const wqn::UiFrame& frame)
 {
-    const lv_font_t* font = wqn::PrimaryUiFont();
-    const int base_width = wqn::MeasureTextWithFont(font, text.c_str());
-    if (base_width <= 0 || base_width > 360) {
-        // Very long or unsupported entries retain the compact fallback so the
-        // headword never runs outside the card surface.
-        (void)DrawCenteredText(20, 80, 360, text);
-        return;
-    }
-    const uint8_t scale = base_width * 2 <= 360 ? 2 : 1;
-    const int y = scale == 2 ? 70 : 80;
-    wqn::DrawTextWithFontScaledCentered(
-        20, y, 360, font, text.c_str(), scale, true);
+    WordText(kStatusBarTitleX, kStatusBarTitleY, "WQN / 单词", 12, 260);
+    DrawStatusBarIcons(kScreenWidth - kStatusBarRightInset, kStatusBarIconY, frame.home);
+    DrawHorizontalLine(0, kStatusBarDividerY, kScreenWidth);
 }
+
+void WordFocus(int top, int height, bool selected)
+{
+    if (selected) FillRect(kWordLeft - 9, top + 6, 3, height - 12, true);
+}
+
+void WordHome(const wqn::WordAppSnapshot& word)
+{
+    WordText(kWordLeft, kWordHomeTitleY, "今日学习", 24);
+    const std::string today = "已复习 " + std::to_string(word.reviewed_today) +
+        "  答对 " + std::to_string(word.correct_today);
+    const int today_width = std::min(210, WordMeasure(12, today));
+    WordText(kWordLeft, kWordHomeSummaryY, word.scope_title, 12, kWordWidth - today_width - 10);
+    WordText(kWordRight, kWordHomeSummaryY, today, 12, today_width, true);
+    WordText(kWordLeft, kWordHomeNoticeY, word.hint.empty() ? word.status_line : word.hint, 12);
+    DrawHorizontalLine(kWordLeft, kWordMenuTop - 2, kWordWidth);
+    const char* titles[] = {"智能复习", "随机浏览", "遗忘的单词"};
+    const char* subtitles[] = {"按到期顺序复习", "从当前词库随机抽取", "复习曾经答错的单词"};
+    const bool resume[] = {word.review_session_resumable, word.shuffle_session_resumable, word.mistakes_session_resumable};
+    const std::string counts[] = {
+        word.review_due_known ? std::to_string(word.review_due_count) + " 到期" : "-- 到期",
+        std::to_string(word.total_count) + " 词",
+        word.mistake_count >= 0 ? std::to_string(word.mistake_count) + " 词" : "-- 词",
+    };
+    for (int i = 0; i < 3; ++i) {
+        const int top = kWordMenuTop + i * kWordMenuPitch;
+        WordFocus(top, kWordMenuPitch, static_cast<int>(word.home_selection) == i);
+        WordText(kWordLeft, top + 4, titles[i], 20, 225);
+        WordText(kWordRight, top + 10, word.pack_ready ? counts[i] : "未同步", 12, 130, true);
+        WordText(kWordLeft, top + 31,
+            !word.pack_ready ? "需同步词库" : resume[i] ? "可继续上次会话" : subtitles[i], 12);
+        if (i != 2) DrawHorizontalLine(kWordLeft, top + kWordMenuPitch, kWordWidth);
+    }
+}
+
+void WordComplete(const wqn::WordAppSnapshot& word)
+{
+    WordText(kWordLeft, 44, word.review_complete_empty ? "今天没有到期单词" : "本轮复习完成", 24);
+    if (word.review_complete_empty) {
+        WordText(kWordLeft, 94, "当前词库到期 0 词。");
+        WordText(kWordLeft, 120, "可以继续顺序学习，或稍后再来。");
+    } else {
+        WordText(kWordLeft, 82, std::to_string(word.review_complete_reviewed), 48, 140);
+        WordText(kWordLeft, 140, "本轮复习 / 张", 12, 150);
+        WordText(kWordLeft + 154, 92, "没答对 " + std::to_string(word.review_complete_unknown) + " 张", 16, 214);
+        WordText(kWordLeft + 154, 118, "重学 " + std::to_string(word.review_complete_replayed) + " 张", 16, 214);
+    }
+    DrawHorizontalLine(kWordLeft, kWordChoiceTop - 1, kWordWidth);
+    const std::string cursor = word.sequential_total == 0 ? "" :
+        word.sequential_cursor >= word.sequential_total ? "从头开始" :
+        "#" + std::to_string(word.sequential_cursor) + " / " + std::to_string(word.sequential_total);
+    for (int i = 0; i < 2; ++i) {
+        const int top = kWordChoiceTop + i * kWordChoicePitch;
+        WordFocus(top, kWordChoicePitch, static_cast<int>(word.complete_selection) == i);
+        WordText(kWordLeft, top + 10, i == 0 ? "顺序过词库" : "返回单词首页", 20, 220);
+        if (i == 0) {
+            WordText(kWordRight, top + 17, cursor, 12, 140, true);
+            DrawHorizontalLine(kWordLeft, top + kWordChoicePitch, kWordWidth);
+        }
+    }
+}
+
+struct WordBodyParagraph {
+    int size;
+    int pitch;
+    WordWrapped wrapped;
+    size_t shown = 0;
+};
+
+std::string WordMeaning(const wqn::WordAppSnapshot& word)
+{
+    const auto trim = [](const std::string& text) {
+        const auto first = text.find_first_not_of(" \t\r\n");
+        return first == std::string::npos ? std::string() :
+            text.substr(first, text.find_last_not_of(" \t\r\n") - first + 1);
+    };
+    const std::string meaning = trim(word.meaning);
+    if (meaning.empty()) return "暂无释义";
+    const std::string part_of_speech = trim(word.part_of_speech);
+    if (part_of_speech.empty()) return meaning;
+
+    size_t end = 0;
+    while (end < meaning.size() && ((meaning[end] >= 'a' && meaning[end] <= 'z') ||
+                                   (meaning[end] >= 'A' && meaning[end] <= 'Z'))) ++end;
+    std::string label = meaning.substr(0, end);
+    for (auto& c : label) if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+    if (end < meaning.size() && (meaning[end] == '.' || meaning[end] == ':' ||
+        meaning[end] == ' ' || meaning[end] == '\t' || meaning[end] == '\r' ||
+        meaning[end] == '\n' || static_cast<unsigned char>(meaning[end]) >= 0x80)) {
+        // Imported meanings carry their own labels, including multiple senses.
+        // Keep that text intact instead of prepending the summary POS again.
+        for (const auto* prefix : {"n", "v", "vt", "vi", "adj", "adv", "pron", "prep",
+             "conj", "num", "art", "int", "interj", "aux", "det", "modal", "abbr",
+             "phr", "noun", "verb", "adjective", "adverb"})
+            if (label == prefix) return meaning;
+        if (label == "a" && meaning[end] == '.') return meaning;
+    }
+    return part_of_speech + " " + meaning;
+}
+
+void WordBack(int top, const wqn::WordAppSnapshot& word)
+{
+    if (!word.feedback.empty()) {
+        FillRect(kWordLeft, top, 2, 17, true);
+        WordText(kWordLeft + 8, top, word.feedback, 12, kWordWidth - 8);
+        top += 25;
+    }
+    std::vector<WordBodyParagraph> paragraphs;
+    paragraphs.push_back({20, 28, WordWrap(WordMeaning(word), 20, kWordWidth, 12), 0});
+    if (!word.example.empty()) paragraphs.push_back({16, 22, WordWrap(word.example, 16, kWordWidth, 12), 0});
+    if (!word.example_translation.empty()) paragraphs.push_back({16, 22, WordWrap(word.example_translation, 16, kWordWidth, 12), 0});
+    int remaining = kWordBottom - top;
+    bool omitted = false;
+    // Reserve one line per field, then spend remaining room in reading order.
+    // This keeps short meanings from wasting space and never invents a reader.
+    for (auto& p : paragraphs) {
+        if (!p.wrapped.lines.empty() && remaining >= p.pitch + 7) { p.shown = 1; remaining -= p.pitch + 7; }
+        else omitted = omitted || !p.wrapped.lines.empty();
+    }
+    for (auto& p : paragraphs)
+        while (p.shown && p.shown < p.wrapped.lines.size() && remaining >= p.pitch) { ++p.shown; remaining -= p.pitch; }
+    size_t last_visible = 0;
+    for (size_t i = 0; i < paragraphs.size(); ++i) if (paragraphs[i].shown) last_visible = i;
+    for (size_t i = 0; i < paragraphs.size(); ++i) {
+        auto& p = paragraphs[i];
+        if (!p.shown) continue;
+        const bool truncated = p.wrapped.truncated || p.shown < p.wrapped.lines.size() || (omitted && i == last_visible);
+        for (size_t line = 0; line < p.shown; ++line) {
+            const auto text = truncated && line + 1 == p.shown
+                ? WordEllipsis(p.wrapped.lines[line], p.size, kWordWidth) : p.wrapped.lines[line];
+            WordDrawLine(kWordLeft, top, p.size, text); top += p.pitch;
+        }
+        top += 7;
+    }
+}
+
+void WordCard(const wqn::WordAppSnapshot& word)
+{
+    const std::string progress = word.mode_label + (word.progress_line.empty() ? "" : " " + word.progress_line);
+    const std::string badge = word.save_failed ? "保存失败" : word.saving ? "保存中" : "";
+    const int right_width = badge.empty() ? std::min(200, WordMeasure(12, progress)) : WordMeasure(12, badge) + 12;
+    WordText(kWordLeft, kWordMetaY, word.scope_title, 12, kWordWidth - right_width - 12);
+    if (badge.empty()) WordText(kWordRight, kWordMetaY, progress, 12, right_width, true);
+    else {
+        FillRect(kWordRight - right_width, kWordMetaY - 1, right_width, 20, true);
+        WordText(kWordRight - 6, kWordMetaY, badge, 12, right_width - 12, true, false);
+    }
+    bool primary = true;
+    for (size_t i = 0; i < word.word.size();) {
+        const auto c = WordNextCharacter(word.word, &i);
+        primary = primary && wqn::MeasureTextWithFont(WordPrimaryFont(32), c.text.c_str()) > 0;
+    }
+    const int size = primary && WordMeasure(32, WordOneLine(word.word)) <= kWordWidth ? 32 : 24;
+    int top = WordParagraph(kWordHeadlineY, WordOneLine(word.word), size, size + 8, 2);
+    if (!word.phonetic.empty()) top = WordParagraph(top + 4, word.phonetic, 16, 22, 2);
+    const int divider = top + 10;
+    DrawHorizontalLine(kWordLeft, divider, kWordWidth);
+    if (word.card_phase == wqn::WordCardPhase::kFront) {
+        if (!word.feedback.empty()) WordText(kWordLeft, divider + 13, word.feedback, 12);
+        WordText(kWordLeft, std::max(178, divider + 37), "回忆这个词的意思");
+    } else {
+        WordBack(divider + 13, word);
+    }
+}
+
+}  // namespace
 
 esp_err_t RenderWordToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
 {
-    const wqn::WordAppSnapshot& word = frame.word_app;
+    const auto& word = frame.word_app;
     wqn::ClearEpdFramebuffer(true);
-    DrawStatusBar("单词", frame.home);
+    WordHeader(frame);
+    if (word.mode == wqn::WordAppMode::kHome) WordHome(word);
+    else if (word.mode == wqn::WordAppMode::kReviewComplete) WordComplete(word);
+    else if (word.mode == wqn::WordAppMode::kSessionStarting || !word.has_card) {
+        WordText(kWordLeft, 64,
+            word.mode == wqn::WordAppMode::kSessionStarting ? "正在准备本轮单词" : "单词暂不可用", 24);
+        WordText(kWordLeft, 118, word.scope_title);
+        WordText(kWordLeft, 150, word.mode_label, 12);
+        WordParagraph(180, word.hint.empty() ? word.status_line : word.hint, 16, 24, 3);
+    } else WordCard(word);
 
-    ESP_RETURN_ON_ERROR(DrawClippedText(kMarginX, kWordHeaderLineY, 250, word.status_line), kTag, "draw word status");
-    const std::string header_progress = word.mode == wqn::WordAppMode::kHome
-        ? "今日 " + std::to_string(word.reviewed_today) + "/" +
-            std::to_string(word.correct_today)
-        : word.progress_line;
-    ESP_RETURN_ON_ERROR(DrawClippedText(kWordProgressX, kWordHeaderLineY, kWordProgressWidth, header_progress), kTag, "draw word progress");
-    DrawHorizontalLine(kMarginX, kWordHeaderDividerY, kContentWidth);
-
-    auto draw_choice = [](int y, const std::string& title, const std::string& subtitle, bool selected) -> esp_err_t {
-        DrawSelectionDecoration(kWordChoiceX, y, kWordChoiceW, kWordChoiceH,
-                                selected ? SelectionStyle::kInvert : SelectionStyle::kNone);
-        const bool black_text = !selected;
-        ESP_RETURN_ON_ERROR(DrawClippedText(kWordChoiceX + 12, y + 7, 180, title, black_text), kTag, "draw word choice title");
-        ESP_RETURN_ON_ERROR(DrawClippedText(kWordChoiceX + 160, y + 7, 150, subtitle, black_text), kTag, "draw word choice subtitle");
-        return ESP_OK;
-    };
-
-    auto draw_word_back = [&word]() -> esp_err_t {
-        DrawRoundedRect(kWordBackX, 128, kWordBackW, kWordBackH, kRoundedOuterRadius);  // content container outline
-        const std::string title = word.part_of_speech.empty() ? word.meaning : word.part_of_speech + "  " + word.meaning;
-        ESP_RETURN_ON_ERROR(DrawWrappedText(kWordBackTextX, 140, kWordBackTextW, title, 2), kTag, "draw word meaning");
-        if (!word.example.empty()) {
-            ESP_RETURN_ON_ERROR(DrawWrappedText(kWordBackTextX, 184, kWordBackTextW, word.example, 2), kTag, "draw word example");
-        }
-        if (!word.example_translation.empty()) {
-            ESP_RETURN_ON_ERROR(DrawWrappedText(kWordBackTextX, 224, kWordBackTextW, word.example_translation, 1), kTag, "draw word translation");
-        }
-        return ESP_OK;
-    };
-
-    if (word.mode == wqn::WordAppMode::kHome) {
-        // [word-home-cards] Three rounded feature cards. The card body outline
-        // (rounded r6) is always drawn; when selected, a 2px-inset concentric
-        // rounded double-line is added as the kRoundedInnerBorder FOCUS
-        // decoration. Left = 24px 1bpp asset, center = title + dynamic
-        // subtitle, right = a rounded status chip (DrawStatusChip, non-focus).
-        constexpr int kCardX = kMarginX;
-        constexpr int kCardW = kContentWidth;
-        const std::string count_chip = std::to_string(word.total_count) + " 词";
-        // [word-due-hint] The review card advertises today's due queue when the
-        // last sync reported one; the shuffle card keeps the pack size.
-        const std::string review_chip = word.review_due_count > 0
-            ? std::to_string(word.review_due_count) + " 到期"
-            : count_chip;
-        // [word-mistake-hint] The mistakes card advertises the pool the last
-        // sync reported (0 is a real "empty pool"); -1 means no hint yet and
-        // falls back to the pack size like the review card.
-        const std::string mistake_chip = word.mistake_count >= 0
-            ? std::to_string(word.mistake_count) + " 词"
-            : count_chip;
-        auto draw_card = [&word, &count_chip](int y0, const WqnBitmapAsset& icon, const std::string& title, const std::string& subtitle,
-                                               const std::string& chip, bool selected) -> esp_err_t {
-            // Card outline: drawn by the focus decoration when selected (it
-            // draws outline + 2px-inset concentric inner), or as a plain
-            // rounded outline when unselected. One path owns the outline.
-            if (selected) {
-                DrawSelectionDecoration(kCardX, y0, kCardW, kWordCardH, SelectionStyle::kRoundedInnerBorder);
-            } else {
-                DrawRoundedRect(kCardX, y0, kCardW, kWordCardH, kRoundedOuterRadius);
-            }
-            DrawWqnBitmapAsset(kCardX + 16, y0 + 18, icon, true);
-            ESP_RETURN_ON_ERROR(DrawClippedText(kCardX + 48, y0 + 10, 220, title), kTag, "draw word card title");
-            ESP_RETURN_ON_ERROR(DrawClippedText(kCardX + 48, y0 + 34, 220, subtitle), kTag, "draw word card subtitle");
-            // Right status chip (non-selectable badge).
-            const std::string chip_text = wqn::TruncateUtf8TextToWidth(chip, 80);
-            DrawStatusChip(kCardX + kStatusChipOffsetX, y0 + 17, kStatusChipWidth, kStatusChipHeight, kStatusChipRadius, chip_text);
-            return ESP_OK;
-        };
-        const bool ready = word.pack_ready;
-        ESP_RETURN_ON_ERROR(
-            draw_card(kWordCardY0,
-                      w01_word_review_sequential_24_asset,
-                      "智能复习",
-                      ready ? (word.review_session_resumable
-                                   ? "可继续上次会话"
-                                   : "按到期顺序复习")
-                            : "需同步词库",
-                      ready ? review_chip : "未同步",
-                      word.home_selection == wqn::WordHomeSelection::kReview),
-            kTag,
-            "draw review card");
-        ESP_RETURN_ON_ERROR(
-            draw_card(kWordCardY0 + (kWordCardH + kWordCardGap),
-                      w02_word_review_random_24_asset,
-                      "随机",
-                      ready ? (word.shuffle_session_resumable
-                                   ? "可继续上次会话"
-                                   : "完全随机浏览")
-                            : "需同步词库",
-                      ready ? count_chip : "未同步",
-                      word.home_selection == wqn::WordHomeSelection::kShuffle),
-            kTag,
-            "draw shuffle card");
-        // The mistakes card reuses the retired dictionary glyph (a word-book):
-        // no dedicated 24px asset exists yet.
-        ESP_RETURN_ON_ERROR(
-            draw_card(kWordCardY0 + 2 * (kWordCardH + kWordCardGap),
-                      w03_word_dictionary_24_asset,
-                      "遗忘的单词",
-                      ready ? (word.mistakes_session_resumable
-                                   ? "可继续上次会话"
-                                   : "复习答错的单词")
-                            : "需同步词库",
-                      ready ? mistake_chip : "未同步",
-                      word.home_selection == wqn::WordHomeSelection::kMistakes),
-            kTag,
-            "draw mistakes card");
-        ESP_RETURN_ON_ERROR(DrawWordActionFooter(word), kTag, "draw word home actions");
-        if (schedule == RefreshSchedule::kSelection || schedule == RefreshSchedule::kConfig) {
-            return RefreshStableRegion({0, 64, wqn::kEpdWidth, 220, "word-home"}, schedule);
-        }
-        return RefreshFrame(frame, schedule);
-    }
-
-    if (word.mode == wqn::WordAppMode::kReviewComplete) {
-        // [word-modes-v2] Local completion page of the review entry. The
-        // session is over (queue and replay pool are empty), so this screen is
-        // decided entirely on device and works offline.
-        const std::string title = word.review_complete_empty
-            ? "今天没有到期的单词"
-            : "今天的复习完成了";
-        ESP_RETURN_ON_ERROR(DrawCenteredText(20, 74, 360, title), kTag, "draw review complete title");
-        const std::string totals =
-            "复习 " + std::to_string(word.review_complete_reviewed) + " 张 · 重学 " +
-            std::to_string(word.review_complete_replayed) + " 张";
-        ESP_RETURN_ON_ERROR(DrawCenteredText(20, 102, 360, totals), kTag, "draw review complete totals");
-        if (word.review_complete_unknown > 0) {
-            const std::string missed = std::to_string(word.review_complete_unknown) +
-                " 张没答对，下次优先复习";
-            ESP_RETURN_ON_ERROR(DrawCenteredText(20, 128, 360, missed), kTag, "draw review complete missed");
-        }
-        const std::string cursor_chip =
-            word.sequential_total == 0
-            ? std::string()
-            : (word.sequential_cursor >= word.sequential_total
-                   ? "从头开始"
-                   : "#" + std::to_string(word.sequential_cursor) + " / " +
-                         std::to_string(word.sequential_total));
-        ESP_RETURN_ON_ERROR(
-            draw_choice(172, "顺序过词库", cursor_chip,
-                        word.complete_selection ==
-                            wqn::WordCompleteSelection::kSequential),
-            kTag,
-            "draw sequential action");
-        ESP_RETURN_ON_ERROR(
-            draw_choice(226, "返回", "",
-                        word.complete_selection ==
-                            wqn::WordCompleteSelection::kReturn),
-            kTag,
-            "draw return action");
-        ESP_RETURN_ON_ERROR(DrawWordActionFooter(word), kTag, "draw review complete actions");
-        if (schedule == RefreshSchedule::kSelection ||
-            schedule == RefreshSchedule::kConfig) {
-            return RefreshRegion(
-                {0, 64, wqn::kEpdWidth, 236, "word-review-complete"}, schedule);
-        }
-        return RefreshFrame(frame, schedule);
-    }
-
-    if (!word.has_card) {
-        const std::string empty_title = word.mode == wqn::WordAppMode::kSessionStarting
-            ? "正在准备"
-            : "词库未同步";
-        // [v2] Unified empty-state surface (was bare centered text).
-        ESP_RETURN_ON_ERROR(DrawEmptyState(empty_title, word.hint), kTag, "draw word empty state");
-        ESP_RETURN_ON_ERROR(DrawWordActionFooter(word), kTag, "draw word empty actions");
-        return RefreshFrame(frame, schedule);
-    }
-
-    DrawWordHeadline(word.word);
-    if (!word.phonetic.empty()) {
-        ESP_RETURN_ON_ERROR(DrawCenteredText(20, 110, 360, word.phonetic), kTag, "draw word phonetic");
-    }
-
-    if (word.card_phase == wqn::WordCardPhase::kFront) {
-        DrawRoundedRect(kWordRecallX, 164, kWordRecallW, kWordRecallH, kRoundedOuterRadius);  // content container outline
-        ESP_RETURN_ON_ERROR(DrawCenteredText(kWordRecallX, 181, kWordRecallW, "先回忆释义"), kTag, "draw recall prompt");
-    } else {
-        ESP_RETURN_ON_ERROR(draw_word_back(), kTag, "draw word back");
-    }
-
-    ESP_RETURN_ON_ERROR(DrawWordActionFooter(word), kTag, "draw word card actions");
-
-    if (schedule == RefreshSchedule::kSelection ||
-        schedule == RefreshSchedule::kConfig) {
-        return RefreshRegion(
-            {0, 64, wqn::kEpdWidth, 236, "word-card"},
-            schedule);
+    // Preserve the existing owner-task refresh policy. A region is a dirty
+    // hint, not a hard clip; no panel timing or power behavior changes here.
+    if (schedule == RefreshSchedule::kSelection || schedule == RefreshSchedule::kConfig) {
+        const UiRect content = {0, kStatusBarHeight, kScreenWidth, kScreenHeight - kStatusBarHeight, "word-paper"};
+        return word.mode == wqn::WordAppMode::kHome
+            ? RefreshStableRegion(content, schedule) : RefreshRegion(content, schedule);
     }
     return RefreshFrame(frame, schedule);
 }

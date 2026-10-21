@@ -388,11 +388,6 @@ bool IsSleepQuiescing()
     return g_quiescing.load(std::memory_order_acquire);
 }
 
-uint32_t CurrentSleepGeneration()
-{
-    return g_quiesce_generation.load(std::memory_order_acquire);
-}
-
 bool HasActiveSleepBlockers()
 {
     return g_total_blockers.load(std::memory_order_acquire) != 0;

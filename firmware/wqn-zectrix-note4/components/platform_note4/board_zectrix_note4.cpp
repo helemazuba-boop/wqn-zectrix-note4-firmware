@@ -56,6 +56,11 @@ esp_err_t ConfigureInputs(uint64_t pin_mask, gpio_pullup_t pull_up = GPIO_PULLUP
 
 namespace wqn {
 
+esp_err_t SetNote4RecordingLed(bool enabled)
+{
+    return gpio_set_level(kLed, enabled ? 0 : 1);
+}
+
 esp_err_t InitZectrixNote4SafePins()
 {
     // Bootstrap is the only platform-level exception to runtime resource

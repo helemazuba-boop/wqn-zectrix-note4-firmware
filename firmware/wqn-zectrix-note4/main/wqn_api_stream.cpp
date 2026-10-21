@@ -8,9 +8,6 @@
 //   * We tolerate mid-stream disconnects: a partial frame is discarded and
 //     ESP_FAIL is returned after the 10 minute outer timeout.
 //
-// We intentionally DO NOT touch the existing v1 UploadAiAudioChat /
-// HttpBinaryPost path so that re-enabling v1 fallback stays a one-line config.
-
 #include "wqn_api.h"
 
 #include <algorithm>

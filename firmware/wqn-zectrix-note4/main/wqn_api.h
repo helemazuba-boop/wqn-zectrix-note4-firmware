@@ -224,10 +224,7 @@ esp_err_t SyncDeviceControlV3(
     uint32_t auto_sync_interval_minutes,
     protocol::v3::SyncData* data,
     protocol::v3::Error* error);
-esp_err_t ProbeSyncAndClearTokenOnUnauthorized(const std::string& token);
 esp_err_t FetchTodoTimeline(const std::string& token, const WqnTodoTimelineRequest& request, WqnTodoListPage* page);
-esp_err_t FetchTodoTimeline(const std::string& token, WqnTodoListPage* page);
-esp_err_t FetchTodayPendingTodos(const std::string& token, WqnTodoListPage* page);
 esp_err_t CompleteTodo(const std::string& token, const std::string& todo_id, WqnTodoItem* todo);
 esp_err_t FetchWordPackManifest(
     const std::string& token,
@@ -391,7 +388,7 @@ esp_err_t SubmitProblemReviewObservationV1(
     protocol::v3::Error* error,
     bool* transport_failure);
 
-// === v2 SSE streaming (Std/Pro tier, default path when WQN_AI_STREAMING_ENABLE=y) ===
+// === v2 SSE streaming (Std/Pro tier) ===
 //
 // StreamParser callbacks are invoked from the audio-streaming task. Callbacks
 // MUST return quickly (no blocking, no nested esp_http_client calls) and the
@@ -478,18 +475,6 @@ struct WqnAiStreamRequest {
 // failure occurred before the stream could deliver any final frame; the caller
 // should look at response->error_code / error_message.
 esp_err_t UploadAiAudioChatStream(const WqnAiStreamRequest& request, WqnAiChatResponse* response);
-
-// === Legacy v1 one-shot JSON (Std/Pro tier, kept behind WQN_AI_V1_FALLBACK) ===
-//   This remains in case the v2 SSE server regresses; the firmware rebuild with
-//   WQN_AI_STREAMING_ENABLE=n will pick up the legacy path.
-esp_err_t UploadAiAudioChat(
-    const std::string& token,
-    const uint8_t* pcm_data,
-    size_t pcm_size,
-    int duration_ms,
-    const std::string& conversation_id,
-    const std::string& tier,
-    WqnAiChatResponse* response);
 
 esp_err_t ParseTodoListResponse(const std::string& body, WqnTodoListPage* page);
 esp_err_t ParseTodoCompleteResponse(const std::string& body, WqnTodoItem* todo);

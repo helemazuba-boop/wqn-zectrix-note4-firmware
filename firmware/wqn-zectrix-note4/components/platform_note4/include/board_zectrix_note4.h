@@ -13,4 +13,8 @@ inline constexpr int kNote4I2cClockHz = 100000;
 
 esp_err_t InitZectrixNote4SafePins();
 
+// Active-low indicator only. Pins are already configured by bootstrap;
+// AudioService validates the recording session before runtime changes.
+esp_err_t SetNote4RecordingLed(bool enabled);
+
 }  // namespace wqn

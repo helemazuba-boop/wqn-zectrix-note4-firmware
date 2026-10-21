@@ -6,10 +6,12 @@
 
 #include <algorithm>
 #include <cstring>
+#include <cstdio>
 #include <string>
 #include <vector>
 
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "services/sync_service.h"
 #include "services/connectivity_service.h"
 #include "storage.h"
@@ -50,6 +52,46 @@ bool TimeAppStructureChanged(const wqn::TimeAppState& before, const wqn::TimeApp
            before.config_mode != after.config_mode || before.pomodoro_phase != after.pomodoro_phase;
 }
 
+void UpdateHomeAiSummary(wqn::UiState* state, int64_t now_ms)
+{
+    if (state == nullptr) return;
+    const auto& agent = state->agent;
+    const auto& cached = agent.home;
+    const bool current_differs = !agent.current_session_id.empty() &&
+        agent.current_session_id != cached.session.id;
+    std::string id = current_differs ? agent.current_session_id : cached.session.id;
+    std::string title = current_differs ? agent.current_session_title : cached.session.title;
+    wqn::HomeAiStatus status = wqn::HomeAiStatus::kIdle;
+    if (!id.empty() || cached.failed) status = wqn::HomeAiStatus::kUnknown;
+    const bool fresh = cached.loaded && !cached.failed && !current_differs && state->status.wifi_connected &&
+        now_ms >= cached.checked_at_ms && now_ms - cached.checked_at_ms <= wqn::kHomeAgentFreshMs;
+    if (fresh) {
+        switch (cached.session.outcome) {
+            case wqn::OpenCodeSessionOutcome::kRunning: status = wqn::HomeAiStatus::kRunning; break;
+            case wqn::OpenCodeSessionOutcome::kSucceeded: status = wqn::HomeAiStatus::kComplete; break;
+            case wqn::OpenCodeSessionOutcome::kFailed: status = wqn::HomeAiStatus::kFailed; break;
+            case wqn::OpenCodeSessionOutcome::kInterrupted: status = wqn::HomeAiStatus::kInterrupted; break;
+            case wqn::OpenCodeSessionOutcome::kUnknown: status = wqn::HomeAiStatus::kIdle; break;
+        }
+    }
+    // Only an attached interaction can authoritatively claim a pending ask.
+    if (agent.stream_active && !agent.current_session_id.empty()) {
+        id = agent.current_session_id; title = agent.current_session_title;
+        if (!agent.pending_permission_id.empty()) status = wqn::HomeAiStatus::kPermission;
+        else if (!agent.pending_question_id.empty()) status = wqn::HomeAiStatus::kQuestion;
+        else if (agent.run_live) status = wqn::HomeAiStatus::kRunning;
+    }
+    state->home.ai = wqn::MakeHomeAiCard(
+        status, id, title, cached.session.updated_at, state->status.paired,
+#if CONFIG_WQN_AI_ENABLE
+        true,
+#else
+        false,
+#endif
+        cached.session.updated_at > 0 && id == state->home_viewed_session_id &&
+        cached.session.updated_at == state->home_viewed_result_version);
+}
+
 void BuildHomeSummary(wqn::UiState* state)
 {
     if (state == nullptr) {
@@ -74,44 +116,43 @@ void BuildHomeSummary(wqn::UiState* state)
     home.primary_time_line = ChooseHomePrimaryTimeLine(state->time_app);
     home.timer_status_only = wqn::TimeAppHasActiveTimer(state->time_app);
 
-    const size_t problem_count = state->problem_app.pack_index.entries.size();
     const uint8_t mastered = static_cast<uint8_t>(
         wqn::protocol::problem_study_v1::ProblemStatus::kMastered);
-    const size_t review_count = static_cast<size_t>(std::count_if(
-        state->problem_app.pack_index.entries.begin(),
-        state->problem_app.pack_index.entries.end(),
-        [mastered](const wqn::ProblemPackIndexEntry& entry) {
-            return entry.status != mastered;
-        }));
-    const size_t problem_set_count = state->problem_app.pack_index.sets.size();
-    home.review_metric.value = std::to_string(review_count);
-    home.review_metric.label = "今日复习";
-    home.todo_metric.value = std::to_string(std::max(0, state->todo.total_pending));
-    home.todo_metric.label = "今日 Todo";
-    home.word_metric.value = wqn::WordAppProgressLabel(state->word_app);
-    home.word_metric.label = "单词进度";
+    const auto review_count = std::count_if(
+        state->problem_app.pack_index.entries.begin(), state->problem_app.pack_index.entries.end(),
+        [mastered](const wqn::ProblemPackIndexEntry& entry) { return entry.status != mastered; });
+    home.review_label = "待复习 " + std::to_string(review_count);
+    home.todo_label = state->todo.loaded_once
+        ? "待办 " + std::to_string(std::max(0, state->todo.total_pending)) : "待办 --";
     if (!state->status.paired && !state->status.claim_code.empty()) {
-        home.current_status = "配对码 " + state->status.claim_code + " · 请在网页确认";
-    } else {
-        home.current_status =
-            "本地 " + std::to_string(problem_count) + " 题 · 待上传 " +
-            std::to_string(state->problem_app.outbox.pending_count);
+        home.notice = "配对码 " + state->status.claim_code;
     }
-
-    home.tasks.clear();
-    if (problem_count > 0) {
-        home.tasks.push_back(wqn::HomeTask{
-            "错题复习",
-            std::to_string(problem_set_count) + " 个错题集 · " +
-                std::to_string(review_count) + " 题待复习",
-            "错题"});
-    } else {
-        home.tasks.push_back(wqn::HomeTask{
-            "同步错题后开始复习", "当前没有本地错题集", "错题"});
+    if (state->problem_app.active && state->problem_app.current_loaded) {
+        home.study.title = state->problem_app.set_name.empty() ? "继续错题复习" : state->problem_app.set_name;
+        home.study.resumable = true;
+    } else if (state->note_app.current_note_loaded &&
+               (state->note_app.mode == wqn::NoteAppMode::kNoteView ||
+                state->note_app.mode == wqn::NoteAppMode::kNoteImageView)) {
+        home.study.title = state->note_app.current_note.title;
+        home.study.resumable = true;
+    } else if (state->word_app.mode == wqn::WordAppMode::kWordCard &&
+               state->word_app.scoped_deck_id.empty() &&
+               !state->word_app.scope_reset_pending_valid) {
+        home.study.target = wqn::UiScreen::kWord;
+        home.study.title = state->word_app.default_deck_title.empty() ? "单词复习" : state->word_app.default_deck_title;
+        home.study.progress = wqn::WordAppProgressLabel(state->word_app);
+        home.study.resumable = true;
+        size_t position = 0, total = 0;
+        const char* progress = home.study.progress.c_str();
+        if (*progress == '#') ++progress;
+        if (std::sscanf(progress, "%zu/%zu", &position, &total) == 2 && total != 0) {
+            home.study.progress_percent = static_cast<int>(
+                std::min<uint64_t>(100, static_cast<uint64_t>(position) * 100 / total));
+        }
     }
-    home.tasks.push_back(wqn::HomeTask{"单词复习", wqn::WordAppStatusLine(state->word_app), "单词"});
 
     state->home = std::move(home);
+    UpdateHomeAiSummary(state, esp_timer_get_time() / 1000);
     wqn::ClampUiSelection(state);
 }
 
@@ -185,6 +226,7 @@ bool LoadUiState(wqn::UiState* state, bool restore_screen_from_rtc)
     // Mixed [词] rows + the settings row value both mirror the word deck
     // catalog loaded by InitWordApp above.
     RebuildNoteWordDeckRows(state);
+    state->settings.default_word_deck_id = state->word_app.default_deck_id;
     state->settings.default_word_deck_title = state->word_app.default_deck_title;
 
     std::string token;

@@ -63,6 +63,7 @@ sync journal save: reason=control-response outcome=written bytes=... payload_has
 python3 scripts/test_sync_retry.py
 python3 scripts/test_sync_control.py
 python3 scripts/test_sync_journal.py
+python3 scripts/test_sync_boot_recovery.py
 python3 scripts/test_word_ack_upload.py
 python3 scripts/hil_check.py --selftest
 source /home/unknow/esp/esp-idf-v5.5/export.sh
@@ -73,6 +74,12 @@ git -c core.whitespace=cr-at-eol diff --check
 主要覆盖：真实 admission/helper、v3 JSON builder、journal codec、存储队列接口、
 临时主机文件系统、调用边界故障、备份恢复、分配失败与单次互斥锁释放。
 不覆盖真实 RTOS 竞争、NOR 半写/半擦或线上去重数据库。
+
+PR #7 启动恢复修复：`PrepareSyncServiceAtBoot()` 在业务任务启动前完成 journal
+加载及恢复；失败进入既有存储恢复页面。同步任务/定时器启动失败也不再被忽略。
+`test_sync_boot_recovery.py` 编译真实 `app_main`、恢复入口及同步启动函数，
+注入 journal/分配错误，覆盖 WiFi/Agent 开关；它只验证主机启动控制流。
+该修复允许本地提交，**HIL 仍未验证**。
 
 本轮结果：退避 36/36、控制 51/51、journal 34/34、ACK 上传 24/24；
 另 10 组相关单词/空包回归合计 507/507。ESP-IDF 构建 EXIT 0、0 warnings，M8 passed。
@@ -121,5 +128,8 @@ python3 scripts/test_sync_journal.py --mutation cache-failed-write
 8. 深睡/唤醒与压力：测栈 HWM、互斥等待、StorageService 队列、公平性及真实耗时。
    本地 dirty/响应缓存本身在 RAM，重启后回到最后有效 journal，可能保守重试或重装；
    不宣称“未成功落盘的意图跨掉电仍必保留”。
+9. 在受控测试设备验证启动完整性门：主/备 journal 均无效或恢复保存失败时，
+   显示存储恢复错误，业务 UI/音频/同步任务和 PowerCoordinator 不启动；
+   有效备份、正常 journal 以及无 journal 的首次启动仍按既有策略启动业务。
 
 只有补齐这些证据后才能判新链路 HIL 通过；本轮本地提交不是发布或合并批准。

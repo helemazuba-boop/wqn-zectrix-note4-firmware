@@ -68,6 +68,4 @@ constexpr int64_t kAiActivityBannerTtlMs = 2000;
 const char* AiFeaturePhaseLabel(AiFeaturePhase phase);
 bool AiFeatureCanStartVoiceInput(AiFeaturePhase phase);
 bool AiFeatureCanSubmit(const AiFeatureUiState& state);
-AiFeaturePhase AiFeaturePhaseFromLegacy(AiSessionStatus status);
-
 }  // namespace wqn

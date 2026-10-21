@@ -344,17 +344,6 @@ bool ConsumeSleepDiagnosticsDumpRequest()
     return g_dump_requested.exchange(false, std::memory_order_acq_rel);
 }
 
-size_t SleepDiagnosticEntryCount()
-{
-    size_t count = 0;
-    for (const RtcSleepDiagnosticEntry& entry : g_sleep_diagnostic_entries) {
-        if (IsValid(entry)) {
-            ++count;
-        }
-    }
-    return count;
-}
-
 size_t CopySleepDiagnosticEntries(SleepDiagnosticEvent* out, size_t cap)
 {
     if (out == nullptr || cap == 0) {

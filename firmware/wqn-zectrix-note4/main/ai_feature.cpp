@@ -47,25 +47,4 @@ bool AiFeatureCanSubmit(const AiFeatureUiState& state)
            state.requires_confirmation && !state.prompt_text.empty();
 }
 
-AiFeaturePhase AiFeaturePhaseFromLegacy(AiSessionStatus status)
-{
-    switch (status) {
-        case AiSessionStatus::kPreparingCapture:
-            return AiFeaturePhase::kLoading;
-        case AiSessionStatus::kListening:
-            return AiFeaturePhase::kRecording;
-        case AiSessionStatus::kWaitingReply:
-            return AiFeaturePhase::kSubmitting;
-        case AiSessionStatus::kStreaming:
-            return AiFeaturePhase::kRunning;
-        case AiSessionStatus::kReplyReady:
-            return AiFeaturePhase::kComplete;
-        case AiSessionStatus::kError:
-            return AiFeaturePhase::kError;
-        case AiSessionStatus::kIdle:
-        default:
-            return AiFeaturePhase::kIdle;
-    }
-}
-
 }  // namespace wqn

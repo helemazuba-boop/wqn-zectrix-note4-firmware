@@ -28,7 +28,7 @@ constexpr int64_t kHoldPressMs = 200;  // [mistouch] Flash PTT start threshold
 // the slowest observed intentional short press (~630 ms).
 constexpr int64_t kLongPressMs = 650;
 constexpr int64_t kLongPressRepeatMs = 260;
-constexpr int64_t kDoublePressWindowMs = 300;
+constexpr int64_t kDoublePressWindowMs = wqn::kButtonDoublePressWindowMs;
 
 // [input-capture] Active-window sampling period. Only runs while some key is
 // inside a debounce/hold/double window; a fully idle keypad parks the task on

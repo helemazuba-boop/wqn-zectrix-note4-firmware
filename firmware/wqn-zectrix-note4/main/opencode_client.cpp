@@ -524,6 +524,8 @@ esp_err_t ReadAgentEventStream(const AgentStreamRequest& request)
             }
             break;
         }
+        // Drain even when the stream is silent; replies must not wait for a heartbeat.
+        DrainOutboundReplies(request);
         const int count = esp_http_client_read(client, buffer.data(), buffer.size());
         if (count == -ESP_ERR_HTTP_EAGAIN) {
             // The idle window closed with no bytes: a quiet stream, not a
@@ -578,7 +580,6 @@ esp_err_t ReadAgentEventStream(const AgentStreamRequest& request)
             request_result = ESP_FAIL;
             break;
         }
-        DrainOutboundReplies(request);
     }
     esp_http_client_close(client);
     esp_http_client_cleanup(client);

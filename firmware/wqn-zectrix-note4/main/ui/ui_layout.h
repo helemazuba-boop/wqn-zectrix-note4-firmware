@@ -18,30 +18,146 @@ constexpr int kScreenHeight = wqn::kEpdHeight;  // 300
 
 // ---- Status bar ----
 // Replaces the dead kStatusBarRect={0,0,400,30} (height 30 was never used).
-// Real divider line is at y=27 across all pages (AI's y=26 is the 1px outlier
-// to be fixed in L2).
+// Home and Settings use the same full-width divider as Todo and AI.
 constexpr int kStatusBarHeight = 28;            // visual height of the top status band
 constexpr int kStatusBarDividerY = 27;          // y of the separator line under the status bar
 constexpr int kStatusBarTitleX = 10;            // left x of the status bar title (= kMarginX)
-constexpr int kStatusBarTitleY = 6;             // text baseline y of the status bar title
+constexpr int kStatusBarTitleY = 6;             // font line-box top, not alphabetic baseline
+constexpr int kStatusBarIconY = 6;
 constexpr int kStatusBarRightInset = 10;        // right inset for status text (x = kScreenWidth - inset)
 
 // ---- Content margins (two tiers, by page density) ----
 // 标准页(卡片/对话框/配置): 视觉宽松.
 // 密度页(AI/note/problem/word 正文): 信息密度优先, 边距收窄到 6.
 constexpr int kMarginX = 10;                    // 全局标准水平边距(卡片/对话框页)
-constexpr int kMarginPage = kMarginX;           // 标准页边距别名 (=10)
 constexpr int kMarginDense = 6;                 // 密度页边距 (note/problem/word/AI 正文)
-constexpr int kEdgeFlushX = 6;                  // [legacy] AI 助手 role-bar 贴边框阴影专用, == kMarginDense
-constexpr int kContentTopY = 35;                // 状态栏下第一内容行 (divider 27 + 8px gap)
 constexpr int kContentWidth = kScreenWidth - 2 * kMarginX;  // 380 (标准页内容宽)
 constexpr int kContentWidthDense = kScreenWidth - 2 * kMarginDense;  // 388 (密度页内容宽)
 constexpr int kMarkdownWidthDense = kContentWidthDense - 14;  // 374 (密度页 Markdown 绘制宽度)
 constexpr int kBottomHintY = 278;               // 底部提示/脚注行 y
 
-// ---- 组件间距 (gutter) ----
-constexpr int kGutterCard = 12;                 // 卡片垂直间距
-constexpr int kGutterRow = 8;                   // 列表行垂直间距
+// ---- Home, reference A: ink on paper ----
+constexpr int kHomeLeft = 16;
+constexpr int kHomeWidth = 368;
+constexpr int kHomeClockY = 40;
+constexpr int kHomeDateX = 280;
+constexpr int kHomeAiCaptionY = 112;
+constexpr int kHomeAiTitleY = 141;
+constexpr int kHomeAiActionY = 184;
+constexpr int kHomeStudyCaptionY = 220;
+constexpr int kHomeStudyTitleY = 240;
+constexpr int kHomeFooterY = 276;
+constexpr int kHomeAiDividerY = 102;
+constexpr int kHomeStudyDividerY = 210;
+
+// ---- Word: Home's paper sections, native text, no persistent help footer ----
+constexpr int kWordLeft = kHomeLeft;
+constexpr int kWordWidth = kHomeWidth;
+constexpr int kWordRight = kWordLeft + kWordWidth;
+constexpr int kWordBottom = kScreenHeight - 8;
+constexpr int kWordMetaY = 35;
+constexpr int kWordHeadlineY = 62;
+constexpr int kWordHomeTitleY = 36;
+constexpr int kWordHomeSummaryY = 70;
+constexpr int kWordHomeNoticeY = 91;
+constexpr int kWordMenuTop = 116;
+constexpr int kWordMenuPitch = 56;
+constexpr int kWordChoiceTop = 178;
+constexpr int kWordChoicePitch = 50;
+
+// ---- Settings: approved B layout, native type, no persistent help footer ----
+constexpr int kSettingsListX = kMarginX;
+constexpr int kSettingsDetailX = kMarginX;
+constexpr int kSettingsRight = kScreenWidth - kMarginX;
+constexpr int kSettingsTextX = kSettingsListX + 30;
+constexpr int kSettingsOptionTextX = kSettingsDetailX + 30;
+constexpr int kSettingsHeaderDividerY = kStatusBarDividerY;
+constexpr int kSettingsHeaderTextBaseline = kStatusBarTitleY + 14;
+constexpr int kSettingsTitleBaseline = 61;
+constexpr int kSettingsSubtitleBaseline = 84;
+constexpr int kSettingsContentDividerY = 95;
+constexpr int kSettingsRowTop = 96;
+constexpr int kSettingsRowPitch = 36;
+constexpr int kSettingsOptionTop = 111;
+constexpr int kSettingsOptionPitch = 31;
+constexpr int kSettingsDetailWidth = kContentWidth;
+
+// ---- Provisioning: approved About identity, no status bar or help footer ----
+constexpr int kProvisionLeft = 24;
+constexpr int kProvisionRight = 376;
+constexpr int kProvisionWidth = kProvisionRight - kProvisionLeft;
+constexpr int kProvisionBrandY = 17;
+constexpr int kProvisionBrandBaseline = 45;
+constexpr int kProvisionModelBaseline = 89;
+constexpr int kProvisionStatusBaseline = 86;
+constexpr int kProvisionDividerY = 101;
+constexpr int kProvisionQrColumnWidth = 166;
+constexpr int kProvisionQrSecondX = 210;
+constexpr int kProvisionQrLabelBaseline = 122;
+constexpr int kProvisionQrSlotY = 127;
+constexpr int kProvisionQrSlotSize = 123;
+constexpr int kProvisionQrCaptionBaseline = 267;
+constexpr int kProvisionQrDividerX = 199;
+constexpr int kProvisionQrDividerY = 114;
+constexpr int kProvisionQrDividerHeight = 150;
+constexpr int kProvisionStateTitleBaseline = 150;
+constexpr int kProvisionStateRowBaseline = 190;
+constexpr int kProvisionStateRowPitch = 32;
+constexpr int kProvisionStateNoteBaseline = 258;
+
+// Agent picker follows the approved Editorial reference, with four real rows.
+constexpr int kAgentPickerLeft = 13;
+constexpr int kAgentPickerWidth = kScreenWidth - 2 * kAgentPickerLeft;
+constexpr int kAgentPickerKickerY = 38;
+constexpr int kAgentPickerTitleY = 53;
+constexpr int kAgentPickerDividerY = 90;
+constexpr int kAgentPickerListY = 96;
+constexpr int kAgentPickerRowStep = 46;
+
+// ---- Todo: approved Editorial sheet, four double-line rows ----
+constexpr int kTodoLeft = 14;
+constexpr int kTodoWidth = kScreenWidth - 2 * kTodoLeft;
+constexpr int kTodoMetaY = 35;
+constexpr int kTodoTitleY = 55;
+constexpr int kTodoDividerY = 96;
+constexpr int kTodoListTop = 97;
+constexpr int kTodoRowPitch = 46;
+constexpr int kTodoScrollX = kScreenWidth - 6;
+
+// ---- Notes: approved four-row list, shared with the Agent picker ----
+constexpr int kNoteListX = kAgentPickerLeft;
+constexpr int kNoteListWidth = kAgentPickerWidth;
+constexpr int kNoteListKickerY = kAgentPickerKickerY;
+constexpr int kNoteListTitleY = kAgentPickerTitleY;
+constexpr int kNoteListDividerY = kAgentPickerDividerY;
+constexpr int kNoteListTop = kAgentPickerListY;
+constexpr int kNoteListPitch = kAgentPickerRowStep;
+constexpr int kNoteBodyX = 8;
+constexpr int kNoteBodyWidth = 378;
+constexpr int kNoteBodyTop = 32;
+constexpr int kNoteBodyBottom = kScreenHeight - 4;
+constexpr int kNoteBodyLineHeight = 20;
+
+// ---- Problem review: native Note geometry, dedicated four-action menu ----
+constexpr int kProblemVerdictSubtitleY = 86;
+constexpr int kProblemVerdictDividerY = 112;
+constexpr int kProblemVerdictTop = 122;
+constexpr int kProblemVerdictPitch = 41;
+
+// ---- Global page navigation ----
+constexpr int kNavigationX = 8;
+constexpr int kNavigationY = 214;
+constexpr int kNavigationWidth = 384;
+constexpr int kNavigationHeight = 78;
+constexpr int kNavigationRadius = 6;
+constexpr int kNavigationItemX = 20;
+constexpr int kNavigationItemY = 222;
+constexpr int kNavigationItemWidth = 48;
+constexpr int kNavigationItemHeight = 60;
+constexpr int kNavigationItemStep = 52;
+constexpr int kNavigationIconY = 228;
+constexpr int kNavigationLabelY = 260;
+constexpr int kNavigationCurrentY = 285;
 
 // ---- AI page ---------------------------------------------------------------
 // [agent] Shared by page_ai.cpp (STD/Pro + Flash tiers) and page_ai_agent.cpp
@@ -52,7 +168,6 @@ constexpr int kGutterRow = 8;                   // 列表行垂直间距
 constexpr int kAiStatusBarY = 0;
 constexpr int kAiStatusBarH = kStatusBarHeight;  // 28, divider on kStatusBarDividerY
 constexpr int kAiViewportY = kAiStatusBarY + kAiStatusBarH;  // 27
-constexpr int kAiViewportH = kScreenHeight - kAiViewportY;   // 273
 constexpr int kAiLineH = kCjkLineHeight;                     // 18
 constexpr int kAiLineGap = 4;
 constexpr int kAiAssistantLeftBorder = 4;
@@ -62,7 +177,6 @@ constexpr int kAiHistoryRightEdge = kScreenWidth - kAiHistoryRightPad;  // 394
 constexpr int kAiHistoryUsableW = kAiHistoryRightEdge - kAiHistoryLeftPad;  // 388
 constexpr int kAiUserPillMaxW = kAiHistoryUsableW * 78 / 100;              // ~302
 constexpr int kAiAssistantW = kAiHistoryUsableW;
-constexpr int kAiRowTopPad = 2;
 // [band] The bottom band of the AI transcript. The Agent tier's option bar --
 // asks, confirmations, the question counter -- is exactly this tall.
 //

@@ -66,11 +66,9 @@ enum class ConnectionState : uint8_t {
 enum class TurnState : uint8_t {
     kIdle,
     kRecording,
-    kFinalQueued,
-    kFinalInFlight,
+    kFinalInFlight = 3,
     kRemoteHandoff,
-    kFailedPreFinal,
-    kComplete,
+    kComplete = 6,
 };
 
 struct PcmBlock {
@@ -1378,12 +1376,6 @@ esp_err_t EnsureConnected(const std::string& token, uint32_t timeout_ms)
     return ret;
 }
 
-bool IsConnected()
-{
-    return g_is_connected.load(std::memory_order_acquire) &&
-           g_session_ready.load(std::memory_order_acquire);
-}
-
 void RequestIdleDisconnect()
 {
     // No initialization, allocation, semaphore wait or driver call on the UI
@@ -1696,21 +1688,6 @@ TurnWaitResult WaitForTurnRelease(uint32_t expected_turn_gen,
     }
 
     return result;
-}
-
-bool WaitForTurnComplete(uint32_t timeout_ms)
-{
-    TurnWaitResult res = WaitForTurnRelease(g_turn_gen.load(std::memory_order_acquire),
-                                           g_current_req_id, timeout_ms);
-    return (res.wait_status == TurnWaitStatus::kTerminalObserved &&
-            res.release_state == TurnReleaseState::kReleased);
-}
-
-void SignalTurnComplete()
-{
-    if (g_turn_complete_sem != nullptr) {
-        xSemaphoreGive(g_turn_complete_sem);
-    }
 }
 
 }  // namespace wqn::stdpro_ws

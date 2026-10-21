@@ -21,7 +21,7 @@ namespace {
 constexpr char kTag[] = "wqn_word";
 constexpr size_t kWordHomeSelectionCount = 3;
 // Written by the sync service, read by the UI task when it builds a snapshot.
-std::atomic<int32_t> g_word_review_due_count{0};
+std::atomic<int32_t> g_word_review_due_count{-1};
 // Mistakes-pool hint written by the sync service; -1 = unknown (no sync yet).
 std::atomic<int32_t> g_word_mistake_count{-1};
 // [word-modes-v2] Local replay rules of the review entry: a word the user did
@@ -864,7 +864,7 @@ namespace wqn {
 void SetWordReviewDueCount(int count)
 {
     g_word_review_due_count.store(
-        count > 0 ? count : 0, std::memory_order_release);
+        count >= 0 ? count : -1, std::memory_order_release);
 }
 
 void SetWordMistakeCount(int count)
@@ -1999,6 +1999,16 @@ WordAppSnapshot BuildWordAppSnapshot(const WordAppState& state)
     snapshot.pack_ready = HasPackWords(state);
     snapshot.pack_truncated = state.pack_index.truncated;
     snapshot.cloud_sync_failed = state.cloud_sync_failed;
+    snapshot.save_failed = state.session.batch_error != ESP_OK ||
+        state.session.commit_state == WordObservationCommitState::kFailed;
+    snapshot.saving = !snapshot.save_failed &&
+        (state.session.commit_state == WordObservationCommitState::kPersisting ||
+         (state.session.batch_flush_requested && HasBufferedWordObservations(state)));
+    if (snapshot.save_failed || snapshot.saving) {
+        snapshot.feedback = state.message.empty()
+            ? (snapshot.save_failed ? "保存失败，确认重试" : "正在保存")
+            : state.message;
+    }
     snapshot.review_session_resumable = state.review_session_resumable;
     snapshot.shuffle_session_resumable = state.shuffle_session_resumable;
     snapshot.mistakes_session_resumable = state.mistakes_session_resumable;
@@ -2023,6 +2033,7 @@ WordAppSnapshot BuildWordAppSnapshot(const WordAppState& state)
     snapshot.review_complete_replayed = state.review.replayed;
     const int32_t due_hint =
         g_word_review_due_count.load(std::memory_order_acquire);
+    snapshot.review_due_known = due_hint >= 0;
     snapshot.review_due_count =
         ClampUint16(static_cast<size_t>(due_hint > 0 ? due_hint : 0));
     const int32_t mistake_hint =
@@ -2035,7 +2046,21 @@ WordAppSnapshot BuildWordAppSnapshot(const WordAppState& state)
     snapshot.pack_bytes = state.pack_index.pack_bytes;
     snapshot.progress_line = WordAppProgressLabel(state);
     snapshot.status_line = WordAppStatusLine(state);
-    snapshot.hint = state.message.empty() ? "确认选择，长按确认返回" : state.message;
+    snapshot.hint = state.message;
+    snapshot.scope_title = !state.scoped_deck_title.empty()
+        ? state.scoped_deck_title : state.default_deck_title;
+    if (snapshot.scope_title.empty()) snapshot.scope_title = "全部词库";
+    const auto study_mode = state.mode == WordAppMode::kSessionStarting
+        ? state.session.requested_mode : state.session.persisted.remote.mode;
+    switch (study_mode) {
+        case protocol::word_study_v1::Mode::kRandom: snapshot.mode_label = "随机浏览"; break;
+        case protocol::word_study_v1::Mode::kDictionary: snapshot.mode_label = "词库浏览"; break;
+        case protocol::word_study_v1::Mode::kReview: snapshot.mode_label = "智能复习"; break;
+        case protocol::word_study_v1::Mode::kShuffle: snapshot.mode_label = "随机浏览"; break;
+        case protocol::word_study_v1::Mode::kMistakes: snapshot.mode_label = "遗忘的单词"; break;
+        case protocol::word_study_v1::Mode::kSequential: snapshot.mode_label = "顺序过词库"; break;
+        case protocol::word_study_v1::Mode::kIntake: snapshot.mode_label = "今日新词"; break;
+    }
 
     const WqnWordEntry& word = state.current_word;
     if (!word.word.empty()) {
@@ -2177,6 +2202,16 @@ std::string WordAppSignature(const WordAppState& state)
 
 namespace {
 
+// The boot contract fixtures complete a synthetic review, which sets due=0.
+// They run before SyncService starts; preserve the real unknown/cached hint.
+class WordDueCountFixtureGuard {
+public:
+    WordDueCountFixtureGuard() : saved_(g_word_review_due_count.load(std::memory_order_acquire)) {}
+    ~WordDueCountFixtureGuard() { g_word_review_due_count.store(saved_, std::memory_order_release); }
+private:
+    int32_t saved_;
+};
+
 // WordAppState is intentionally large (currently 1408 bytes). The boot
 // contract test needs several independent states, so keeping them as ordinary
 // locals would exceed app_main's fixed 8 KiB stack even though the test runs
@@ -2217,6 +2252,7 @@ private:
 
 bool RunWordPageStateSelfTest()
 {
+    const WordDueCountFixtureGuard preserve_due_hint;
     auto require = [](bool condition, const char* label) {
         if (!condition) {
             ESP_LOGE(kTag, "word page self-test failed: %s", label);

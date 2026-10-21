@@ -80,7 +80,6 @@ struct PowerStatusSnapshot {
 // Returns a value snapshot; callers never receive ADC/GPIO driver handles.
 bool ReadPowerStatus(PowerStatusSnapshot* snapshot);
 
-int GetBatteryPercent();
 uint16_t GetBatteryVoltageMv();
 bool IsCharging();
 bool IsFullyCharged();
@@ -91,7 +90,6 @@ bool IsUsbHostConnected();
 // charge-complete status only and may remain asserted after cable removal, so
 // it does not independently block sleep.
 bool IsUsbPowered();
-bool IsBatteryLow();
 bool IsBatteryVeryLow();
 
 }  // namespace wqn

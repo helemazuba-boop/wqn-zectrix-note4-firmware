@@ -8,8 +8,6 @@
 namespace wqn {
 
 constexpr int kAudioCaptureSampleRate = 16000;
-constexpr int kAudioCaptureChannels = 1;
-constexpr const char* kAudioCaptureSampleFormat = "s16le";
 
 struct AudioCaptureChunk {
     // Non-owning view into AudioCapture's fixed PSRAM buffer. It remains valid

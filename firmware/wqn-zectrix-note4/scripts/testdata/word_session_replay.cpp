@@ -21,6 +21,7 @@ constexpr const char* kTag = "replay-fixture";
 @@BATCH_ENABLED@@
 void FixtureLog(const char*, const char*, ...) {}
 #define ESP_LOGI(...) FixtureLog(__VA_ARGS__)
+#define ESP_LOGD(...) FixtureLog(__VA_ARGS__)
 #define ESP_LOGW(...) FixtureLog(__VA_ARGS__)
 #define ESP_LOGE(...) FixtureLog(__VA_ARGS__)
 #define ESP_RETURN_ON_ERROR(expr, ...) do { \
@@ -125,12 +126,12 @@ esp_err_t BuildObservationRecord(const wqn::DurableWordObservation& observation,
     record->mode = static_cast<uint8_t>(observation.mode);
     return ESP_OK;
 }
-esp_err_t AppendOutboxRecord(const OutboxRecord&, int64_t* = nullptr, size_t* = nullptr) {
+esp_err_t AppendOutboxRecord(const OutboxRecord&, size_t* = nullptr) {
     ++appends;
     return append_error;
 }
 [[maybe_unused]] esp_err_t AppendOutboxRecords(const OutboxRecord*, size_t count,
-                                              int64_t* = nullptr, size_t* bytes = nullptr) {
+                                              size_t* bytes = nullptr) {
     ++appends;
     if(bytes) *bytes=count*200;
     return append_error;
@@ -530,8 +531,8 @@ void TestInteractionMaintenance() {
 }
 void TestMaintenanceDriver() {
     PrepareAckBoundary(); const std::string request = cache.pending.front().request_id;
-    Check(wqn::AcknowledgeWordObservation(request) == ESP_OK && wqn::services::dispatches == 9 &&
-          wqn::services::owners.front() == "word-outbox-ack" &&
+    Check(wqn::AcknowledgeWordObservations({request}, {}) == ESP_OK && wqn::services::dispatches == 9 &&
+          wqn::services::owners.front() == "word-outbox-ack-batch" &&
           std::count(wqn::services::owners.begin(), wqn::services::owners.end(), "word-outbox-maintenance") == 8 &&
           compactions == 1 && saves == 1 && appends == 1,
           "public ACK dispatches a durable ACK plus seven checkpoint boundaries and a separate reclaim");
@@ -548,33 +549,33 @@ void TestMaintenanceDriver() {
         CommitContext commit{&new_observation, &advanced};
         foreground_committed = CommitObservationTransaction(&commit) == ESP_OK;
     };
-    Check(wqn::AcknowledgeWordObservation(request) == ESP_OK && foreground_committed &&
+    Check(wqn::AcknowledgeWordObservations({request}, {}) == ESP_OK && foreground_committed &&
           appends == 2 && compactions == 1 && journal.pending.size() == 1 &&
           journal.pending.front().sequence == 1 && disk[0].remote.next_sequence == 1,
           "production commit at an injected boundary remains durable in the live rewrite set");
 
     PrepareAckBoundary(); wqn::services::inject_at = 3;
     wqn::services::interleave = []() { SaveSessionRaw(disk[0]); };
-    Check(wqn::AcknowledgeWordObservation(request) == ESP_OK && wqn::services::dispatches == 3 &&
+    Check(wqn::AcknowledgeWordObservations({request}, {}) == ESP_OK && wqn::services::dispatches == 3 &&
           compactions == 0 && cache.acknowledged.size() == 1 && cache.pending.empty(),
           "invalidated proof defers maintenance without falsely failing the already-durable ACK");
 
     PrepareAckBoundary(); wqn::runtime::lease_allowed = false;
-    Check(wqn::AcknowledgeWordObservation(request) == ESP_ERR_INVALID_STATE && appends == 0 &&
+    Check(wqn::AcknowledgeWordObservations({request}, {}) == ESP_ERR_INVALID_STATE && appends == 0 &&
           wqn::services::dispatches == 0 && cache.pending.size() == 1,
           "lease denial rejects before any ACK dispatch or cache mutation");
     PrepareAckBoundary(); append_error = ESP_FAIL;
-    Check(wqn::AcknowledgeWordObservation(request) == ESP_FAIL && wqn::services::dispatches == 1 &&
+    Check(wqn::AcknowledgeWordObservations({request}, {}) == ESP_FAIL && wqn::services::dispatches == 1 &&
           cache.pending.size() == 1 && cache.acknowledged.empty() &&
           wqn::runtime::active_leases == 0 && wqn::runtime::released_leases == 1,
           "ACK write failure propagates, skips maintenance and releases the lease");
     PrepareAckBoundary(); save_error = ESP_FAIL;
-    Check(wqn::AcknowledgeWordObservation(request) == ESP_FAIL && compactions == 0 &&
+    Check(wqn::AcknowledgeWordObservations({request}, {}) == ESP_FAIL && compactions == 0 &&
           cache.acknowledged.size() == 1 && wqn::runtime::active_leases == 0 &&
           wqn::runtime::released_leases == 1,
           "checkpoint I/O failure remains visible through the public ACK API");
     PrepareAckBoundary(); wqn::services::fail_dispatch_at = 2;
-    Check(wqn::AcknowledgeWordObservation(request) == ESP_FAIL && cache.acknowledged.size() == 1 &&
+    Check(wqn::AcknowledgeWordObservations({request}, {}) == ESP_FAIL && cache.acknowledged.size() == 1 &&
           compactions == 0 && wqn::runtime::active_leases == 0,
           "maintenance dispatch failure does not lose the durable ACK and still reports an error");
 
@@ -604,13 +605,13 @@ void TestOutboxQuota() {
           cache.total_records == limit - 1 && cache.pending.size() == 1,
           "exact two-slot boundary admits the observation");
     const std::string request = observation.request_id;
-    AckContext ack{&request};
-    Check(AckObservationTransaction(&ack) == ESP_OK && cache.total_records == limit &&
+    const std::vector<std::string> ack_ids{request}; AckBatchContext ack{&ack_ids};
+    Check(AckObservationBatchTransaction(&ack) == ESP_OK && cache.total_records == limit &&
           cache.pending.empty() && appends == 2,
           "reserved terminal slot remains writable at the exact hard boundary");
     Reset(); cache_loaded = true; cache.total_records = limit - 1;
     cache.pending.push_back(Record());
-    Check(wqn::AcknowledgeWordObservation(request) == ESP_OK && compactions == 1 &&
+    Check(wqn::AcknowledgeWordObservations({request}, {}) == ESP_OK && compactions == 1 &&
           cache.total_records == 0 && cache.pending.empty() && appends == 1,
           "the final ACK triggers space-pressure reclaim even when it is the last pending item");
 
@@ -632,8 +633,8 @@ void TestOutboxQuota() {
     bool terminal_capacity = true;
     while (!cache.pending.empty()) {
         const std::string head = cache.pending.front().request_id;
-        AckContext head_ack{&head};
-        if (AckObservationTransaction(&head_ack) != ESP_OK) { terminal_capacity = false; break; }
+        const std::vector<std::string> head_ack_ids{head}; AckBatchContext head_ack{&head_ack_ids};
+        if (AckObservationBatchTransaction(&head_ack) != ESP_OK) { terminal_capacity = false; break; }
     }
     Check(terminal_capacity && cache.acknowledged.size() == 1000 && cache.total_records == 2000,
           "every admitted offline observation has a reserved ACK slot even without any maintenance");
@@ -642,15 +643,15 @@ void TestOutboxQuota() {
     cache.acknowledged.push_back(Record()); cache.ack_records = 1;
     cache.pending.push_back(Record(1, 12));
     const std::string legacy_request = cache.pending.front().request_id;
-    AckContext legacy_ack{&legacy_request};
-    Check(AckObservationTransaction(&legacy_ack) == ESP_ERR_INVALID_SIZE && appends == 0 &&
+    const std::vector<std::string> legacy_ack_ids{legacy_request}; AckBatchContext legacy_ack{&legacy_ack_ids};
+    Check(AckObservationBatchTransaction(&legacy_ack) == ESP_ERR_INVALID_SIZE && appends == 0 &&
           cache.pending.size() == 1,
           "legacy over-budget ACK is rejected without growing or deleting its pending record");
     QuarantineContext quarantine{&legacy_request};
     Check(QuarantineObservationTransaction(&quarantine) == ESP_ERR_INVALID_SIZE &&
           forensic_appends == 0 && appends == 0,
           "quota rejection happens before quarantine touches the forensic journal");
-    Check(wqn::AcknowledgeWordObservation(legacy_request) == ESP_OK && compactions == 1 &&
+    Check(wqn::AcknowledgeWordObservations({legacy_request}, {}) == ESP_OK && compactions == 1 &&
           saves == 1 && disk[0].remote.next_sequence == 2 && appends == 1 &&
           cache.total_records == 2 && cache.pending.empty(),
           "public ACK heals oversized legacy history via stepped reclaim then retries exactly once");
@@ -662,27 +663,27 @@ void TestOutboxQuota() {
     cache.pending.push_back(Record(1, 12)); cache.acknowledged.push_back(Record());
     wqn::services::inject_at = 3;
     wqn::services::interleave = []() { SaveSessionRaw(disk[0]); };
-    Check(wqn::AcknowledgeWordObservation(legacy_request) == ESP_ERR_INVALID_SIZE &&
+    Check(wqn::AcknowledgeWordObservations({legacy_request}, {}) == ESP_ERR_INVALID_SIZE &&
           compactions == 0 && appends == 0 && cache.pending.size() == 1 &&
           wqn::runtime::active_leases == 0 && wqn::services::dispatches == 3,
           "invalidated forced-reclaim proof preserves the original quota error and pending payload");
     Reset(); cache_loaded = true; cache.total_records = limit + 1;
     cache.pending.push_back(Record(1, 12)); cache.acknowledged.push_back(Record());
     save_error = ESP_FAIL;
-    Check(wqn::AcknowledgeWordObservation(legacy_request) == ESP_FAIL && compactions == 0 &&
+    Check(wqn::AcknowledgeWordObservations({legacy_request}, {}) == ESP_FAIL && compactions == 0 &&
           appends == 0 && cache.pending.size() == 1,
           "failed legacy checkpoint blocks both reclamation and ACK retry");
     Reset(); cache_loaded = true; cache.total_records = limit + 1;
     cache.pending.push_back(Record(1, 12)); cache.acknowledged.push_back(Record());
     compact_error = ESP_FAIL;
-    Check(wqn::AcknowledgeWordObservation(legacy_request) == ESP_FAIL && appends == 0 &&
+    Check(wqn::AcknowledgeWordObservations({legacy_request}, {}) == ESP_FAIL && appends == 0 &&
           cache.pending.size() == 1 && wqn::runtime::active_leases == 0,
           "failed forced compaction stays visible and never consumes the reserved ACK");
     for (bool backup : {false, true}) {
         Reset(); cache_loaded = true; cache.pending.push_back(Record(1, 12));
         cache.acknowledged.push_back(Record()); cache.ack_records = 1; cache.total_records = 3;
         cache.backup_source = backup; cache.partial_tail = !backup;
-        Check(wqn::AcknowledgeWordObservation(legacy_request) == ESP_OK && compactions == 1 &&
+        Check(wqn::AcknowledgeWordObservations({legacy_request}, {}) == ESP_OK && compactions == 1 &&
               saves == 1 && cache.pending.empty() && appends == 1 && cache.total_records == 2,
               "ACK repairs damaged or backup journal before appending its marker");
     }
@@ -1175,8 +1176,8 @@ int main() {
     Reset(); cache_loaded = true; cache.pending.push_back(Record());
     cache.ack_records = kRuntimeCompactAckThreshold - 1;
     const std::string ack_request = cache.pending.front().request_id;
-    AckContext ack_context{&ack_request};
-    Check(AckObservationTransaction(&ack_context) == ESP_OK && appends == 1 && saves == 0 &&
+    const std::vector<std::string> ack_context_ids{ack_request}; AckBatchContext ack_context{&ack_context_ids};
+    Check(AckObservationBatchTransaction(&ack_context) == ESP_OK && appends == 1 && saves == 0 &&
           reads == 0 && compactions == 0 && cache.ack_records == kRuntimeCompactAckThreshold &&
           cache.pending.empty() && cache.acknowledged.size() == 1,
           "threshold-crossing ACK transaction only commits its ACK, not whole maintenance");

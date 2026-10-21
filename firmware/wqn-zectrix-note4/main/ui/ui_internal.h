@@ -23,6 +23,7 @@
 
 #include "ui_model.h"
 #include "markdown_layout.h"
+#include "ai_text_layout.h"
 #include "wqn_api.h"
 #include "config.h"
 #include "display_service.h"
@@ -62,6 +63,7 @@ enum class RefreshSchedule {
     kCoalesced,
     kCommit,
     kImmediate,
+    kNavigation,
 };
 
 int RefreshRank(RefreshSchedule schedule);
@@ -90,9 +92,7 @@ constexpr TickType_t kAiRefreshDelay = pdMS_TO_TICKS(120);
 // Aliases the model-layer constant (ui_model.h) — the row count must have
 // exactly one definition because ui_model.cpp clamps against it too.
 constexpr size_t kSettingsItemCount = wqn::kSettingsItemCount;
-// Settings rows overflow the panel at 38px pitch; the list renders a
-// selection-following window of this many rows.
-constexpr size_t kSettingsVisibleRows = 6;
+constexpr size_t kSettingsVisibleRows = 5;
 constexpr uint32_t kAutoSyncOptions[] = {0, 15, 30, 60, 240};
 constexpr std::size_t kAutoSyncOptionsCount = sizeof(kAutoSyncOptions) / sizeof(kAutoSyncOptions[0]);
 constexpr int kVolumeOptions[] = {0, 25, 50, 75, 100};
@@ -100,12 +100,13 @@ constexpr std::size_t kVolumeOptionsCount = sizeof(kVolumeOptions) / sizeof(kVol
 
 // kStatusBarRect removed: dead constant (height 30 was never referenced).
 // Use kStatusBarHeight / kStatusBarDividerY in ui_layout.h instead.
-constexpr UiRect kHomePrimaryRect = {8, 33, 384, 31, "home-primary-time"};
+constexpr UiRect kHomePrimaryRect = {0, kStatusBarHeight, wqn::kEpdWidth,
+                                   kHomeAiDividerY + 2 - kStatusBarHeight, "home-clock-and-date"};
 constexpr UiRect kTimeStandbyRect = {0, 42, wqn::kEpdWidth, 172, "time-standby"};
 constexpr UiRect kTimerRunRect = {0, 32, wqn::kEpdWidth, 268, "timer-run"};
 constexpr UiRect kCountdownConfigRect = {0, 70, wqn::kEpdWidth, 205, "countdown-config"};
 constexpr UiRect kPomodoroConfigRect = {0, 54, wqn::kEpdWidth, 218, "pomodoro-config"};
-constexpr UiRect kSettingsContentRect = {0, 32, wqn::kEpdWidth, 252, "settings-content"};
+constexpr UiRect kSettingsContentRect = {0, 0, wqn::kEpdWidth, wqn::kEpdHeight, "settings-page"};
 
 UiRect ConfigRefreshRect(const wqn::TimeAppState& time_app);
 
@@ -139,7 +140,6 @@ void UpdateSettingsDiagnostics(wqn::UiState* state);
 
 void DrawStatusBar(const char* title, const wqn::HomeSummary& home);
 void DrawClockStatusBar(const wqn::HomeSummary& home);
-void DrawProgressBar(int x, int y, int width, int height, int current, int total);
 void DrawConfigBox(int x, int y, int width, int height, const std::string& value, const std::string& label, bool selected);
 void DrawActionBox(int x, int y, int width, int height, const std::string& label, bool selected);
 
@@ -159,6 +159,9 @@ struct TodoCloudRequest {
 
 struct TodoCloudResult {
     TodoCloudOp op = TodoCloudOp::kRefresh;
+    bool cursor_request = false;
+    bool has_refreshed_page = false;
+    char cursor[160] = {};
     esp_err_t result = ESP_FAIL;
     bool auth_required = false;
     char todo_id[64] = {};
@@ -330,10 +333,6 @@ struct ProblemCloudResult {
     std::shared_ptr<const std::vector<uint8_t>> image_wqni;
 };
 
-struct ProblemCloudResultReady {
-    uint32_t generation = 0;
-};
-
 // --- Unified cloud runner ---------------------------------------------------
 // One executor replaces the three per-domain cloud tasks. Two lanes so bulk
 // transfers (pack sync: multi-MB downloads + index rebuilds) can never sit in
@@ -455,7 +454,7 @@ bool QueueProblemCloudRequest(const ProblemCloudRequest& request);
 bool QueueTodoRefresh();
 bool QueueTodoRefreshForRevision(uint64_t target_revision);
 bool QueueTodoRefreshCursor(const std::string& cursor);
-bool QueueTodoComplete(const std::string& todo_id);
+bool QueueTodoComplete(const std::string& todo_id, const std::string& cursor);
 
 bool QueueWordReviewRefresh();
 bool QueueWordSessionStart(
@@ -528,6 +527,7 @@ bool ApplyProblemCloudResult(wqn::UiState* state, ProblemCloudResult& result);
 
 bool RefreshTodosFromCloud(wqn::UiState* state);
 RefreshSchedule CompleteSelectedTodo(wqn::UiState* state);
+RefreshSchedule HandleTodoInput(wqn::UiState* state, wqn::UiInput input);
 
 void ExecuteTodoCloudRequest(const TodoCloudRequest& request);
 void ExecuteWordCloudRequest(const WordCloudRequest& request);
@@ -545,10 +545,10 @@ void RetainTimeAppState(const wqn::TimeAppState& state);
 bool RestoreRetainedTimeApp(wqn::TimeAppState* state);
 bool HasRetainedTimeApp();
 void BuildHomeSummary(wqn::UiState* state);
+void UpdateHomeAiSummary(wqn::UiState* state, int64_t now_ms);
 
 bool SameTimeAppState(const wqn::TimeAppState& a, const wqn::TimeAppState& b);
 bool TimeAppStructureChanged(const wqn::TimeAppState& before, const wqn::TimeAppState& after);
-bool ShouldRefreshTimeTick(const wqn::UiState& state);
 bool ScreenUsesClockMinute(const wqn::UiState& state);
 
 RefreshSchedule ApplyButtonEvent(
@@ -560,6 +560,10 @@ void OpenSettingsDialog(wqn::UiState* state, wqn::SettingsDialog dialog);
 
 // ---- Render -----------------------------------------------------------------
 
+// Read/written only by the EPD owner, never retained across sleep.
+extern bool g_last_rendered_navigation_visible;
+esp_err_t DrawNavigationOverlay(const wqn::UiFrame& frame);
+esp_err_t RefreshNavigationGrayImage(const wqn::UiFrame& frame, const uint8_t* gray4, size_t size);
 esp_err_t RenderFrameToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule);
 wqn::display::DisplaySubmission RequestEpdUiRefresh(
     const wqn::UiFrame& frame,
@@ -568,12 +572,8 @@ wqn::display::DisplaySubmission RequestEpdUiRefresh(
     RefreshSchedule schedule,
     wqn::display::WaveformRequirement waveform);
 void AcknowledgeDisplayResult(wqn::display::DisplayRevision revision);
-// [epd-owner] Ask the EPD refresh task (the sole panel owner) to run idle
-// maintenance (heavy-partial cleanup full refresh + rail power-off). The UI
-// task must NOT touch the panel directly: it only sets the request flag and
-// notifies. The EPD task runs it from its idle wait, after re-checking that no
-// frame is pending and no activity happened since the request.
-void RequestEpdIdleMaintenance();
+// [epd-owner] Sole panel owner: renders frames and independently schedules
+// idle maintenance, rechecking queued frames and activity before hardware work.
 void EpdRefreshTask(void*);
 void DeviceUiTask(void*);
 
@@ -582,7 +582,6 @@ std::string FrameSignature(const wqn::UiFrame& frame);
 // ---- Clock ------------------------------------------------------------------
 
 std::time_t CurrentUnixTime();
-bool SystemClockIsReasonable();
 std::string CurrentClockLabel();
 std::string CurrentDateLabel();
 std::string CurrentIsoTimestamp();
@@ -606,14 +605,10 @@ void DrawDashedRect(int x, int y, int width, int height);
 void DrawRoundedRect(int x, int y, int width, int height, int radius);
 // [rowfill] Filled rounded rect: the density-list row selection block and the
 // rounded reverse-fill action block (SelectionStyle::kRowFill / kInvert).
-void FillRoundedRect(int x, int y, int width, int height, int radius);
+void FillRoundedRect(int x, int y, int width, int height, int radius, bool black = true);
 void FillRect(int x, int y, int width, int height, bool black);
 void ClearRect(const UiRect& rect);
 // [L3-semantics] Named black-fill wrappers (defined in graphics.cpp). L2 migrates call sites.
-void DrawSelectedFill(int x, int y, int width, int height);
-void DrawProgressFill(int x, int y, int width, int height);
-void DrawRoleBar(int x, int y, int width, int height);
-void DrawActivityDot(int x, int y, int size);
 void DrawWqnBitmapAsset(int x, int y, const WqnBitmapAsset& asset, bool black = true);
 esp_err_t RefreshRegion(const UiRect& rect, RefreshSchedule schedule);
 esp_err_t RefreshStableRegion(const UiRect& rect, RefreshSchedule schedule);
@@ -621,15 +616,11 @@ esp_err_t RefreshFrame(const wqn::UiFrame& frame, RefreshSchedule schedule);
 
 esp_err_t DrawClippedText(int x, int y, int max_width, const std::string& text, bool black = true);
 esp_err_t DrawCenteredText(int x, int y, int width, const std::string& text, bool black = true);
-esp_err_t DrawWrappedText(int x, int y, int width, const std::string& text, int max_lines, bool black = true);
 // Shared Markdown row renderer (markdown_render.cpp). The MdLine must come
 // from LayoutMarkdown at the same content_w or geometry desyncs.
-esp_err_t DrawMarkdownLine(const MdLine& line, int x, int y, int content_w, int line_h);
+esp_err_t DrawMarkdownLine(const MdLine& line, int x, int y, int content_w, int line_h,
+                            const lv_font_t* font = nullptr);
 std::string LimitForEpd(const std::string& text);
-std::string Utf8PageSlice(const std::string& text, size_t page, size_t chars_per_page);
-std::string JoinAiFunctionCallSummaries(const std::vector<std::string>& summaries);
-std::string FormatAiFunctionCallSummaries(const std::vector<std::string>& summaries);
-
 // ---- Bitmap digits and status icons ----------------------------------------
 
 void DrawStandbyClockDigits(int y, const std::string& text);
@@ -648,8 +639,6 @@ int DrawStatusBarIcons(int right_edge, int y, const wqn::HomeSummary& home);
 
 // ---- Home page --------------------------------------------------------------
 
-esp_err_t DrawMetricCard(int x, int y, int width, const wqn::HomeMetric& metric);
-esp_err_t DrawHomeTaskRow(int x, int y, int width, int index, const wqn::HomeTask& task, bool selected);
 esp_err_t RenderHomeToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule);
 esp_err_t RenderHomePrimaryRegion(const wqn::HomeSummary& home, RefreshSchedule schedule);
 esp_err_t RenderHomeStatusBarRegion(const wqn::HomeSummary& home, RefreshSchedule schedule);
@@ -684,11 +673,12 @@ void GetAiScrollBounds(
 struct AiHistoryLayout {
     std::vector<int> heights;       // chronological, per message
     std::vector<int> virtual_tops;  // chronological, includes kAiLineGap
+    std::vector<std::shared_ptr<const AiTextLayout>> text;
     int total_content_h = 0;
     int anchor_top = 0;  // virtual top of the newest user message (0 if none)
 };
-AiHistoryLayout ComputeAiHistoryLayout(
-    const std::vector<wqn::ChatMessageSnapshot>& messages, bool expand_content);
+std::shared_ptr<const AiHistoryLayout> GetAiHistoryLayout(
+    const std::shared_ptr<const wqn::AiHistorySnapshot>& snapshot, bool expand_content);
 // Scroll offset that brings the previous/next answer to the top of the
 // viewport. `direction` < 0 = older, > 0 = newer. Returns false when there is
 // no answer in that direction, so the caller can show the "已最新" style hint
@@ -792,34 +782,18 @@ esp_err_t RenderProblemBrowseToEpd(const wqn::UiFrame& frame, RefreshSchedule sc
 
 // ---- Settings page ----------------------------------------------------------
 
-// `view` selects the row list semantics: the root list tags rows by the kind
-// of action they perform, the dev list (kDev) is uniformly read-only.
-esp_err_t DrawSettingsRow(wqn::SettingsView view, size_t row_index, int y, const std::string& title, const std::string& value, bool selected);
-// Footer defaults to the dismiss hint ("确认关闭"); action dialogs pass their
-// own (e.g. "确认进入配网").
-esp_err_t DrawSettingsDialogBox(const std::string& title, const char* footer = "确认关闭");
-esp_err_t DrawSettingsOptionCard(int x, int y, int width, const std::string& label, bool selected);
-esp_err_t RenderSettingsDialog(const wqn::SettingsAppState& settings);
 esp_err_t RenderSettingsToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule);
+esp_err_t RenderProvisioningToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule);
+bool UpdateSettingsDeckStatus(wqn::UiState* state);
+bool AnyLocalPersistPending(const wqn::UiState& state);
+void InstallSettingsDeckOptions(wqn::UiState* state, bool preserve_focus);
 
 // ---- Todo page --------------------------------------------------------------
 
-void DrawDashedVerticalLine(int x, int y, int height);
-void DrawTimelineNode(int cx, int cy, bool selected);
-esp_err_t DrawTodoStatusBar(const wqn::TodoUiState& todo, const wqn::HomeSummary& home);
-esp_err_t DrawTodoCard(const wqn::WqnTodoItem& item, bool selected, wqn::TodoSyncStatus sync_status, int x, int y, int width, int height);
-esp_err_t DrawTodoEmptyState(const wqn::TodoUiState& todo);
 esp_err_t RenderTodoToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule);
-std::string TodoDueTimeLabel(const std::string& due_at);
-std::string TodoDueDateLabel(const std::string& due_at);
-const char* TodoSyncStatusText(wqn::TodoSyncStatus status);
-std::string TodoItemStatusText(const wqn::WqnTodoItem& item, bool selected, wqn::TodoSyncStatus sync_status);
-std::string TodoCardMetaLabel(const wqn::WqnTodoItem& item, bool selected, wqn::TodoSyncStatus sync_status);
-std::string TodoStatusNote(const wqn::TodoUiState& todo);
-int TodoPendingCount(const wqn::TodoUiState& todo);
-int TodoOverdueCount(const wqn::TodoUiState& todo);
-bool ParseTodoDueTime(const std::string& due_at, std::tm* due_tm);
-size_t TodoVisibleStart(const wqn::TodoUiState& todo, size_t selected, size_t visible_count);
+// EPD-owner only: another page can replace the current draw buffer even when
+// its presentation fails and g_last_rendered_screen still says Todo.
+void InvalidateTodoRenderCache();
 
 // ---- Extern globals (defined in ui_refresh.cpp) ----------------------------
 
