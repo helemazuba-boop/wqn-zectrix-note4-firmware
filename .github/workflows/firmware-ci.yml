@@ -22,6 +22,19 @@ jobs:
       - name: Exercise production I2S boundary and caller units
         run: python3 firmware/wqn-zectrix-note4/scripts/test_audio_channel_timeout.py
 
+  storage-schema:
+    name: Boot storage schema fault characterization
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Exercise real boot schema decisions with host fault ports
+        run: python3 firmware/wqn-zectrix-note4/scripts/test_storage_schema.py
+
+      - name: Exercise production startup and journal recovery gates
+        run: python3 firmware/wqn-zectrix-note4/scripts/test_sync_boot_recovery.py
+
   contract:
     name: Architecture gate fixtures
     runs-on: ubuntu-latest

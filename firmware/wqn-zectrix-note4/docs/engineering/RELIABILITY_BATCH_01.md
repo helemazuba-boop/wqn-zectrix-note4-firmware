@@ -1,6 +1,6 @@
 # Note4 可靠性第一批实施记录
 
-日期：2026-10-21；分支：`fix/firmware-reliability`。
+实施日期：2026-10-21 至 2026-10-22；分支：`fix/firmware-reliability`。
 路线与问题定义见 [FIRMWARE_RELIABILITY_PLAN.md](FIRMWARE_RELIABILITY_PLAN.md)。
 
 ## 范围与状态
@@ -9,8 +9,8 @@
 |---|---|---|
 | 文档基线 | 已本地提交 `6dcbd8a` | 12 个问题、B0–B5 路线与证据边界 |
 | B0 工具链与配置基线 | 已本地提交 `0e81504` | CI 对齐 IDF 5.5.6；干净导出树从 defaults 构建 |
-| B1 音频时间单位 | 代码/host/build 通过，设备待测 | 修复 7 处调用及服务 API，补实际边界回归 |
-| B2 启动存储恢复 | 待实施 | 先执行真实 schema 决策；行为补丁须另有决策与 HIL |
+| B1 音频时间单位 | 已本地提交 `2cf5e97`，设备待测 | 修复 7 处调用及服务 API，补实际边界回归 |
+| B2 启动存储恢复 | 真实实现回归完成，行为未改 | 表征当前数据处置与中断重入；保全策略和 HIL 待后续批次 |
 
 本记录中的 host/build 结果不代表设备 HIL、音质/停止延迟、实际功耗或远端 CI。
 
@@ -92,3 +92,65 @@ ASan/LeakSanitizer 测试在沙箱 ptrace 下出现环境错误；以上最终�
 
 REL-002 的 6 个短延时调用位于 ADC、wake assembly 和 EPD 路径。本批只定位并
 保留它们，不统一改成一个 tick；其硬件/睡眠影响需逐调用点判断和相应 HIL。
+
+## B2：真实 schema 实现回归与策略决策边界
+
+新增 `scripts/test_storage_schema.py` 直接编译并链接生产
+`main/runtime/storage_schema.cpp` 和真实公开头文件。NVS、SPIFFS 和 SleepLease
+为故障可控的 host 端口；不再用 `EnsureStorageSchema() { return {}; }` 代替待测决策。
+原有 startup/journal 回归继续保留，两个测试负责不同层。
+
+这次运行原有 startup 回归还发现 fixture 漏掉了生产启动新增的
+`InitMemoryDiagnostics()` 端口，导致它无法编译。本批补齐无行为替身，恢复原来的
+启动门测试（`dfc1b78`）；没有改变生产启动顺序或诊断初始化。
+
+| 验证 | 结果与边界 |
+|---|---|
+| 真实 schema 回归 | ASan/UBSan，39 场景 / 1,229 检查 PASS |
+| 跳过 current-schema 检查的变体 | 预期 FAIL；新设备/旧 generation 不能被误判为 Ready |
+| 忽略重置失败的变体 | 预期 FAIL；失败不能发布 RestartRequired 成功结果 |
+| 开启挂载失败自动格式化的变体 | 预期 FAIL；校验挂载必须保持非破坏策略 |
+| 既有 sync boot recovery | 三配置共 27 PASS / 0 FAIL，UBSan；校验 journal/启动顺序 |
+| 既有 startup 两种故障变体 | 延后 journal 门、忽略服务启动失败均被原断言拒绝 |
+| M8 gate fixtures | 11 PASS / 0 FAIL |
+| NOR 部分写入/擦除、真实断电及设备并发 | 未验证；host 状态重入不等同于真实掉电恢复 |
+
+39 个场景覆盖当前有效 schema、新设备、旧/未来/零 generation、reset_id 缺失或
+长度异常、marker 读取故障、NVS 两类特殊错误、挂载/容量查询/卸载故障、重置各
+步骤失败、部分已完成步骤后的重试、主动恢复出厂设置及 storage lease 拒绝/释放。
+测试模拟 staging/commit 的可见性，不证明 NVS 或 SPIFFS 自身的介质原子性。
+
+### 已观察的当前决策
+
+| 条件 | 真实实现当前结果 | 本批处理 |
+|---|---|---|
+| 当前 generation、16 B reset_id、校验成功 | Ready；不 erase/format/commit | 保留此保护回归 |
+| 缺 namespace/marker、旧/未来/零 generation、缺/短 reset_id | erase NVS、format SPIFFS、提交 marker 后请求重启 | 明确记录会清除模拟离线记录，不将其称为保全 PASS |
+| NVS NO_FREE_PAGES / NEW_VERSION_FOUND、marker 读取错误 | 同样进入全量重置 | 作为 REL-003 的策略复审输入 |
+| 当前 schema 挂载/info/unmount 失败 | RecoveryRequired；不进行全量重置 | 验证错误原样返回与业务门控边界 |
+| 重置过程失败 | RecoveryRequired；已完成的操作不会自动回滚 | 记录具体破坏进度及再次启动决策 |
+| 恢复出厂 invalidation 的 commit 失败 | 返回失败；模拟持久 generation 保持原值 | 保留主动重置提交失败回归 |
+
+### 下一行为批次的决策要求
+
+当前重置顺序是先擦 NVS，再格式化 SPIFFS，最后提交 schema marker。失败后再次
+启动能凭 marker 缺失重做，是现有中断重入机制的一部分。因此只把“marker 缺失”
+改成永久恢复错误，会同时改变新设备初始化和授权重置/迁移被打断后的恢复行为。
+
+下一批需先把以下情形区别开，再编写最小保全补丁：
+
+1. 全新且明确可初始化的介质；
+2. 明确授权的 factory reset 或旧 generation 迁移；
+3. 未知原因造成 marker 缺失、不可读或与数据不一致；
+4. 授权重置已擦 NVS、但 SPIFFS/最终 marker 尚未完成的中断状态；
+5. 新于当前固件的 generation，避免回退固件把未知格式当作可擦旧数据。
+
+应评审重置意图在上述中断阶段的保留方式、可重复步骤、错误返回和未上传记录
+的处置，然后用新策略替换本测试中明确标注的 characterization 用例。第一批没有
+修改 schema 决策、擦除/格式化顺序、generation 或文件格式，REL-003 未关闭。
+存储行为补丁依 AGENTS.md §7 完成相应 HIL 后再提交；本测试提交不含该行为变更。
+
+schema 与既有 startup 回归也已接入 CI。最终默认构建零警告、M8/UI 栈门通过；远端 CI、刷机和
+设备 HIL 均未执行。本机记录为 `/tmp/note4-batch01-storage-schema.log`、
+`/tmp/note4-batch01-schema-mutation-*.log`、`/tmp/note4-batch01-sync-boot*.log`、
+`/tmp/note4-batch01-m8-fixtures.log` 和 `/tmp/note4-batch01-final-build.log`。

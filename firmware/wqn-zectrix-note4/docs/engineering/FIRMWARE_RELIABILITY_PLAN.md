@@ -96,6 +96,9 @@ USB 后的功耗。新增补丁按影响补测，不为了延长时间而重复�
 
 ## 4. 问题详情与处理要求
 
+本节描述审计基线 `7851989` 的证据与处理要求。修复后的状态以第 8 节和
+第一批实施记录为准，不能把基线代码描述当作补丁后的现状。
+
 ### REL-001：I2S 超时参数发生重复单位转换
 
 证据入口：[audio_service.h](../../main/services/audio_service.h)、
@@ -479,6 +482,8 @@ git -c core.whitespace=cr-at-eol diff --check
 # 按补丁影响选择现有回归，不把它们的范围扩大为所有硬件行为。
 python3 scripts/test_audio_runtime.py
 python3 scripts/test_audio_rx_dma.py
+python3 scripts/test_audio_channel_timeout.py
+python3 scripts/test_storage_schema.py
 python3 scripts/test_sync_boot_recovery.py
 python3 scripts/test_sync_journal.py
 python3 scripts/test_sync_control.py
@@ -489,8 +494,8 @@ python3 scripts/test_epd_refresh_windows.py
 python3 scripts/test_epd_idle_scheduler.py
 ```
 
-尚待新增的实现回归：I2S 超时边界、真实 schema 决策、RTC/计时保留、底层按键采集。
-它们目前没有在本计划中预设为已存在的脚本名称。
+I2S 超时边界与真实 schema 决策回归已新增。尚待补充的实现回归为 RTC/计时保留和
+底层按键采集，当前不预设它们已经存在的脚本名称。
 
 ### 7.3 针对变更补充的设备证据
 
@@ -513,13 +518,13 @@ python3 scripts/test_epd_idle_scheduler.py
 
 ## 8. 执行台账
 
-状态更新于 2026-10-21；下面仅表示本补丁路线的新工作，不抹除历史测试结果。
+状态更新于 2026-10-22；下面仅表示本补丁路线的新工作，不抹除历史测试结果。
 
 | 批次 | 状态 | 当前已具备的内容 | 下一交付 |
 |---|---|---|---|
 | B0 | 本地基线完成 | 文档 `6dcbd8a`；CI 对齐 5.5.6、tag 核验、干净 defaults 构建及配置差异记录 | 远端 CI 未执行；后续候选继续绑定自身身份 |
 | B1 | 音频代码与 host/build 完成 | 7 处调用毫秒契约及 100/1000 Hz 回归；原基线与两种错误变体均被捕获 | 音频 HIL；REL-002 的硬件短延时另批处理 |
-| B2 | 未实施 | 现有恢复行为与测试替身范围已定位 | 真实 schema 测试、恢复决策表、最小策略补丁 |
+| B2 | 实现回归与决策记录完成 | 真实 schema 39 场景、3 个错误变体、既有启动回归已修复；生产存储行为未改 | 区分重置意图与 marker 损坏，落实保全策略及相应 HIL |
 | B3 | 未实施 | 维护历史与已有计时自测已核对 | RTC/计时/I2C 有边界的审计与回归 |
 | B4 | 未实施 | 采集层与上层测试范围已区分 | 真实采集/ring 回放与设备场景 |
 | B5 | 未实施 | 既有诊断与历史 RAM 证据可复用 | 摘要、尾延迟/功耗证据和候选收口 |
@@ -528,9 +533,9 @@ python3 scripts/test_epd_idle_scheduler.py
 检查范围和依据。新增事实推翻早期推断时，修订问题类别与优先级，不保留误导性的
 “确定故障”措辞。
 
-## 9. 本次文档落地验证
+## 9. 初始文档落地验证
 
-2026-10-21，本次只新增本计划并更新文档索引及中英文入口，未修改运行时代码、
+2026-10-21，初始文档批次只新增本计划并更新文档索引及中英文入口，未修改运行时代码、
 配置或 CI。下面的 PASS 仅属于这次文档变更，不关闭 REL-001–REL-012，也不将
 B1–B5 标为已实施。
 
