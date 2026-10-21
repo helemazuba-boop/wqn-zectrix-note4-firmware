@@ -93,6 +93,8 @@ by code, `AGENTS.md`, and the architecture/product references above.
   issue IDs, recovery-policy questions, patch batches, and acceptance criteria.
 - `docs/engineering/RELIABILITY_BATCH_01.md` — first-batch implementation status,
   clean SDK/configuration baseline, focused checks, and remaining device evidence.
+- `docs/engineering/RELIABILITY_BATCH_02.md` — boot-data preservation decisions,
+  durable reset intent, regression evidence, and user-confirmed device acceptance.
 - `docs/engineering/DEAD_CODE_CLEANUP.md` — evidence and scope for firmware
   cleanup decisions.
 - `docs/engineering/SYNC_V3_REPAIR.md` — sync repair findings, host checks, and
