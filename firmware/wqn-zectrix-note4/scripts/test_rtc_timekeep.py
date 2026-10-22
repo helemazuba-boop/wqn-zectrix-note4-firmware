@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Run full RTC/timekeep/lock sources and codec register functions at 100/1000 Hz.
+"""Run RTC, clock-source/timer continuity and codec contracts at 100/1000 Hz.
 
 Real public headers are used. Driver, semaphore, clock and wake-context ports
-are host substitutes; this is not electrical, scheduler or deep-sleep HIL.
+are host substitutes. Complete retention/timer sources and real WiFi/HTTPS
+SNTP callback bodies are included; this is not electrical, network or SMP HIL.
 """
 import argparse
 from pathlib import Path
@@ -93,16 +94,22 @@ def main():
     parser.add_argument('--pcf-source', type=Path)
     parser.add_argument('--timekeep-source', type=Path)
     parser.add_argument('--codec-source', type=Path)
+    parser.add_argument('--retention-source', type=Path)
     parser.add_argument('--mutation', choices=('driver-ticks', 'infinite-lock',
         'keep-old-trust', 'ignore-generation', 'ignore-snapshot',
         'ignore-settime-error', 'codec-ticks', 'ignore-write-budget',
         'ignore-persist-budget', 'late-persist-trust', 'omit-stop-cleanup',
-        'stop-error-no-cleanup', 'ignore-late-write'))
+        'stop-error-no-cleanup', 'ignore-late-write', 'assume-calibrated',
+        'keep-changed-clock-trust', 'ignore-continuity', 'ignore-retained-epoch',
+        'snapshot-now', 'skip-source-on-seed', 'skip-source-on-restore', 'skip-rebase',
+        'ignore-sntp-readback'))
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
     pcf = (args.pcf_source or root / 'main/pcf8563.cpp').read_text()
     timekeep = (args.timekeep_source or root / 'main/power/rtc_timekeep.cpp').read_text()
     codec = (args.codec_source or root / 'main/services/audio_service.cpp').read_text()
+    retention = (args.retention_source or root / 'main/ui/time_app_retention.cpp').read_text()
+    clock = (root / 'main/runtime/wall_clock.cpp').read_text()
     power = (root / 'main/power_manager.cpp').read_text()
     if power.count('PersistSystemTimeToRtc(generation, command.deadline_us)') != 1:
         raise ValueError('sleep coordinator must forward the prepare deadline')
@@ -160,6 +167,27 @@ def main():
         if pcf.count(guard) != 2:
             raise ValueError('write deadline boundary drift')
         pcf = ''.join(pcf.rsplit(guard, 1))
+    elif args.mutation == 'assume-calibrated':
+        timekeep = replace_once(timekeep, 'clock.network_calibrated() ? 1 : 0', '1')
+    elif args.mutation == 'keep-changed-clock-trust':
+        timekeep = replace_once(timekeep,
+            '    if (runtime::GetWallClockSnapshot().epoch != clock.epoch) return false;\n', '')
+    elif args.mutation == 'ignore-continuity':
+        retention = replace_once(retention, 'clock.rtc_continuity &&', 'true &&')
+    elif args.mutation == 'ignore-retained-epoch':
+        retention = replace_once(retention, 'clock.epoch == retained.clock_epoch &&', 'true &&')
+    elif args.mutation == 'snapshot-now':
+        retention = replace_once(retention,
+            '        budget_at -= (monotonic_ms - state.last_tick_ms) / 1000;', '        (void)monotonic_ms;')
+    elif args.mutation == 'skip-source-on-seed':
+        timekeep = replace_once(timekeep, '    runtime::NoteBuildTimeApplied();\n', '')
+    elif args.mutation == 'skip-source-on-restore':
+        timekeep = replace_once(timekeep, '''    runtime::NoteRtcTimeRestored(
+        g_trust_record.network_calibrated != 0, g_trust_record.clock_epoch);\n''', '')
+    elif args.mutation == 'skip-rebase':
+        retention = replace_once(retention, '    wqn::AlignTimeAppWallClock(&restored, now);\n', '')
+    elif args.mutation == 'ignore-sntp-readback':
+        clock = replace_once(clock, '    if (difference > 2) return;', '    (void)difference;')
 
     # Compile historical translation units against the current header too.
     # These compatibility shims deliberately preserve their missing deadline
@@ -200,6 +228,15 @@ bool PersistSystemTimeToRtc(uint32_t generation, int64_t) {
     fixture = fixture.replace('@@CODEC_FUNCTIONS@@', functions)
     fixture = fixture.replace('@@CODEC_HELPERS@@', helpers)
     fixture = fixture.replace('@@RETRYABLE@@', function(codec, 'bool IsRetryableCodecI2cError('))
+    wifi = (root / 'main/wifi_manager.cpp').read_text()
+    api = (root / 'main/wqn_api.cpp').read_text()
+    clock_functions = '\n'.join(function(body, signature) for body, signature in (
+        (wifi, 'void TimeSyncCallback('), (wifi, 'void StartSntpOnce('),
+        (api, 'bool IsClockReasonable('), (api, 'esp_err_t EnsureClockSyncedForHttps(')))
+    constants = '\n'.join(re.findall(
+        r'^constexpr (?:std::time_t kMinReasonableUnixTime|TickType_t kSntpSyncTimeout) = [^;]+;',
+        api, re.M))
+    fixture = fixture.replace('@@CLOCK_FUNCTIONS@@', constants + '\n' + clock_functions)
     compiler = shutil.which('g++')
     if not compiler:
         raise SystemExit('g++ unavailable')
@@ -211,6 +248,17 @@ bool PersistSystemTimeToRtc(uint32_t generation, int64_t) {
             header.write_text(body)
         (directory / 'pcf.cpp').write_text(pcf)
         (directory / 'timekeep.cpp').write_text(timekeep)
+        (directory / 'retention.cpp').write_text(retention)
+        (directory / 'runtime').mkdir(exist_ok=True)
+        (directory / 'runtime/wall_clock.cpp').write_text(clock)
+        (directory / 'ui_internal.h').write_text('''#pragma once
+#include <cstdio>
+#include <ctime>
+#include "time_app.h"
+namespace device_ui_internal {
+constexpr std::time_t kMinReasonableUnixTime = 1704067200;
+}
+''')
         (directory / 'fixture.cpp').write_text(fixture)
         for hz in (100, 1000):
             binary = directory / f'rtc-{hz}'
@@ -220,6 +268,7 @@ bool PersistSystemTimeToRtc(uint32_t generation, int64_t) {
                 '-I', str(root / 'main'),
                 '-I', str(root / 'components/power_runtime/include'),
                 str(directory / 'pcf.cpp'), str(directory / 'timekeep.cpp'),
+                str(root / 'main/time_app.cpp'),
                 str(root / 'main/i2c_bus_lock.cpp'), str(directory / 'fixture.cpp'),
                 '-Wl,--wrap=time,--wrap=settimeofday', '-o', str(binary)],
                 check=True, timeout=60)

@@ -21,6 +21,8 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "esp_log.h"
+#include "runtime/wall_clock.cpp"
+#include "retention.cpp"
 
 static unsigned checks = 0;
 #define CHECK(x) do { ++checks; if (!(x)) { \
@@ -40,6 +42,8 @@ static int64_t monotonic_us = 1000000;
 static int64_t lock_cost_us, transfer_cost_us, verify_log_cost_us;
 static bool failed_write_applies;
 static bool deadline_cases;
+static bool synchronize_during_time_read;
+static unsigned synchronize_at_transfer;
 static std::vector<int> timeouts;
 static std::vector<TickType_t> lock_timeouts;
 int64_t esp_timer_get_time() { return monotonic_us; }
@@ -63,8 +67,14 @@ const WakeContext& GetWakeContext() { return wake; }
 }
 extern "C" time_t __wrap_time(time_t* out)
 {
-    if (out) *out = now;
-    return now;
+    const time_t sampled = now;
+    if (synchronize_during_time_read) {
+        synchronize_during_time_read = false;
+        now += 3600;
+        wqn::runtime::NoteSntpTimeSynchronized(now, now);
+    }
+    if (out) *out = sampled;
+    return sampled;
 }
 extern "C" int __wrap_settimeofday(const timeval* value, const struct timezone*)
 {
@@ -120,6 +130,10 @@ static bool BeginTransfer(int milliseconds)
     monotonic_us += transfer_cost_us;
     CHECK(mutex.depth > 0);
     ++transfers;
+    if (synchronize_at_transfer == transfers) {
+        now += 3600;
+        wqn::runtime::NoteSntpTimeSynchronized(now, now);
+    }
     return (failure_mask & (1U << transfers)) == 0;
 }
 esp_err_t i2c_master_transmit(i2c_master_dev_handle_t dev,
@@ -151,6 +165,31 @@ esp_err_t i2c_master_transmit_receive(i2c_master_dev_handle_t dev,
 // recovery ports preserve lifetime/ordering assertions without a fake audio task.
 namespace {
 constexpr char kTag[] = "codec_fixture";
+struct esp_sntp_config_t { void (*sync_cb)(timeval*) = nullptr; };
+#define ESP_NETIF_SNTP_DEFAULT_CONFIG(server) esp_sntp_config_t{}
+static bool g_sntp_started;
+static unsigned sntp_starts, sntp_waits, watchdog_feeds;
+static int sntp_start_result = ESP_OK, sntp_wait_result = ESP_OK;
+static void (*sntp_callback)(timeval*);
+esp_err_t esp_netif_sntp_init(const esp_sntp_config_t* config)
+{
+    ++sntp_starts;
+    if (sntp_start_result == ESP_OK) sntp_callback = config->sync_cb;
+    return sntp_start_result;
+}
+esp_err_t esp_netif_sntp_sync_wait(TickType_t ticks)
+{
+    CHECK(ticks == pdMS_TO_TICKS(15000));
+    ++sntp_waits;
+    if (sntp_wait_result == ESP_OK) {
+        now = 1792627200;
+        timeval synchronized{now, 0};
+        if (sntp_callback) sntp_callback(&synchronized);
+    }
+    return sntp_wait_result;
+}
+void FeedTaskWatchdogIfSubscribed() { ++watchdog_feeds; }
+@@CLOCK_FUNCTIONS@@
 using wqn::services::detail::CodecDeadline;
 @@CODEC_CONSTANTS@@
 class DriverOperation {
@@ -193,6 +232,8 @@ static void ResetPorts()
     monotonic_us = 1000000;
     lock_cost_us = transfer_cost_us = verify_log_cost_us = 0;
     failed_write_applies = false;
+    synchronize_during_time_read = false;
+    synchronize_at_transfer = 0;
     applied = {};
     // RTC memory and trust intentionally survive between attempts.
 }
@@ -518,12 +559,196 @@ static void PersistDeadlineCases()
     deadline_cases = false;
 }
 
+static void ColdClock()
+{
+    // Model a new boot's BSS without adding reset hooks to product code.
+    wqn::runtime::g_wall_clock_state.store(0, std::memory_order_relaxed);
+}
+static void ResetSntp()
+{
+    ColdClock();
+    g_sntp_started = false;
+    sntp_starts = sntp_waits = watchdog_feeds = 0;
+    sntp_start_result = sntp_wait_result = ESP_OK;
+    sntp_callback = nullptr;
+}
+static void SourceCases()
+{
+    using namespace wqn::runtime;
+    ResetPorts(); ResetSntp(); now = 1792627200;
+    CHECK(GetWallClockSnapshot().source == WallClockSource::kUnknown);
+    StartSntpOnce(); StartSntpOnce();
+    CHECK(sntp_starts == 1 && sntp_callback != nullptr);
+    CHECK(GetWallClockSnapshot().epoch == 0);  // Started is not calibrated.
+    TimeSyncCallback(nullptr);
+    timeval invalid{};
+    sntp_callback(&invalid);
+    CHECK(GetWallClockSnapshot().epoch == 0);
+    timeval unapplied{now + 3600, 0};
+    sntp_callback(&unapplied);
+    CHECK(GetWallClockSnapshot().epoch == 0);
+    timeval synchronized{now, 0};
+    sntp_callback(&synchronized);
+    CHECK(GetWallClockSnapshot().source == WallClockSource::kSntp);
+    CHECK(GetWallClockSnapshot().network_calibrated());
+    CHECK(!GetWallClockSnapshot().rtc_continuity);
+    const uint32_t epoch = GetWallClockSnapshot().epoch;
+    sntp_callback(&synchronized);
+    CHECK(GetWallClockSnapshot().epoch == epoch + 1);
+    NoteRtcTimeRestored(true, kWallClockEpochMax + 1);
+    CHECK(GetWallClockSnapshot().epoch == epoch + 1);
+
+    // Execute actual HTTPS clock admission, including its fallback callback.
+    ResetSntp(); now = 1792627200; NoteBuildTimeApplied();
+    CHECK(EnsureClockSyncedForHttps() == ESP_OK);
+    CHECK(sntp_starts == 0 && sntp_waits == 0);
+    CHECK(GetWallClockSnapshot().source == WallClockSource::kBuildTime);
+    ResetSntp(); now = 0;
+    CHECK(EnsureClockSyncedForHttps() == ESP_OK);
+    CHECK(sntp_starts == 1 && sntp_waits == 1 && watchdog_feeds == 2);
+    CHECK(GetWallClockSnapshot().source == WallClockSource::kSntp);
+    ResetSntp(); now = 0; sntp_start_result = ESP_FAIL;
+    CHECK(EnsureClockSyncedForHttps() == ESP_FAIL && sntp_waits == 0);
+    CHECK(GetWallClockSnapshot().source == WallClockSource::kUnknown);
+    ResetSntp(); now = 0; sntp_wait_result = ESP_ERR_TIMEOUT;
+    CHECK(EnsureClockSyncedForHttps() == ESP_ERR_TIMEOUT);
+    CHECK(GetWallClockSnapshot().source == WallClockSource::kUnknown);
+    ResetSntp(); now = 0; sntp_start_result = ESP_ERR_INVALID_STATE;
+    CHECK(EnsureClockSyncedForHttps() == ESP_OK);  // Other initializer owns callback.
+    CHECK(GetWallClockSnapshot().source == WallClockSource::kUnknown);
+
+    ResetPorts(); ColdClock(); now = 0; set_fails = true;
+    CHECK(!wqn::power::timekeep::SeedSystemTimeFromBuildTimeIfNeeded());
+    CHECK(GetWallClockSnapshot().source == WallClockSource::kUnknown);
+    set_fails = false;
+    CHECK(wqn::power::timekeep::SeedSystemTimeFromBuildTimeIfNeeded());
+    CHECK(GetWallClockSnapshot().source == WallClockSource::kBuildTime);
+    CHECK(!GetWallClockSnapshot().network_calibrated());
+    const auto seeded = GetWallClockSnapshot();
+    CHECK(!wqn::power::timekeep::SeedSystemTimeFromBuildTimeIfNeeded());
+    CHECK(GetWallClockSnapshot().epoch == seeded.epoch);
+}
+
+static wqn::TimeAppState RunningTimer()
+{
+    wqn::TimeAppState state;
+    state.tile = wqn::TimeTile::kCountdown;
+    state.active_mode = wqn::TimerMode::kCountdown;
+    state.status = wqn::TimerStatus::kRunning;
+    state.remaining_seconds = 120;
+    state.last_tick_ms = monotonic_us / 1000;
+    state.session_started_unix_seconds = state.phase_started_unix_seconds = now - 180;
+    state.phase_ends_unix_seconds = now + 120;
+    return state;
+}
+static void ResumeClock(uint32_t generation, unsigned sleep_seconds)
+{
+    // Advance the simulated chip using production calendar/driver functions.
+    now += sleep_seconds;
+    wqn::power::timekeep::RtcCalendar calendar;
+    CHECK(wqn::power::timekeep::CalendarFromUnixSeconds(now, &calendar));
+    CHECK(wqn::Pcf8563WriteTime(calendar.year, calendar.month, calendar.day,
+        calendar.hour, calendar.min, calendar.sec, calendar.weekday));
+    ColdClock(); ResetPorts(); Resume(generation);
+    CHECK(wqn::power::timekeep::RestoreSystemTimeFromRtc());
+}
+static void ClockRetentionCases()
+{
+    using namespace wqn;
+    using namespace wqn::runtime;
+    using namespace wqn::power::timekeep;
+    using namespace device_ui_internal;
+    for (bool calibrated : {false, true}) {
+        ResetPorts(); ColdClock(); now = 1792627200;
+        if (calibrated) { timeval tv{now, 0}; TimeSyncCallback(&tv); }
+        else NoteBuildTimeApplied();
+        const auto before = GetWallClockSnapshot();
+        auto state = RunningTimer(); RetainTimeAppState(state);
+        CHECK(PersistSystemTimeToRtc(100));
+        ResumeClock(100, 30);
+        const auto after = GetWallClockSnapshot();
+        CHECK(after.source == (calibrated ? WallClockSource::kRtcSntp : WallClockSource::kRtcApproximate));
+        CHECK(after.epoch == before.epoch && after.rtc_continuity);
+        CHECK(after.network_calibrated() == calibrated);
+        CHECK(RestoreRetainedTimeApp(&state));
+        CHECK(state.remaining_seconds == 90 && state.status == TimerStatus::kRunning);
+        CHECK(state.phase_ends_unix_seconds == now + 90 && state.last_tick_ms == 0);
+        CHECK(PersistSystemTimeToRtc(101));
+        ResumeClock(101, 30);
+        CHECK(GetWallClockSnapshot().network_calibrated() == calibrated);
+        CHECK(RestoreRetainedTimeApp(&state) && state.remaining_seconds == 60);
+    }
+
+    ResetPorts(); ColdClock(); now = 1792627200; NoteBuildTimeApplied();
+    auto state = RunningTimer(); RetainTimeAppState(state);
+    CHECK(PersistSystemTimeToRtc(110));
+    rtc_regs[2] |= 0x80; ColdClock(); Resume(110);
+    CHECK(!RestoreSystemTimeFromRtc());
+    CHECK(GetWallClockSnapshot().source == WallClockSource::kUnknown);
+    now += 86400; NoteBuildTimeApplied();  // A future fallback must not expire it.
+    CHECK(RestoreRetainedTimeApp(&state));
+    CHECK(state.remaining_seconds == 120 && state.status == TimerStatus::kRunning);
+    CHECK(state.phase_ends_unix_seconds == now + 120);
+
+    for (bool calibration_before_persist : {false, true}) {
+        ResetPorts(); ColdClock(); now = 1792627200; NoteBuildTimeApplied();
+        state = RunningTimer(); RetainTimeAppState(state);
+        if (calibration_before_persist) {
+            now += 3600; timeval tv{now, 0}; TimeSyncCallback(&tv);
+        }
+        CHECK(PersistSystemTimeToRtc(111));
+        ResumeClock(111, 30);
+        if (!calibration_before_persist) {
+            now += 3600; timeval tv{now, 0}; TimeSyncCallback(&tv);
+        }
+        CHECK(RestoreRetainedTimeApp(&state));
+        CHECK(state.remaining_seconds == 120 && state.status == TimerStatus::kRunning);
+        CHECK(state.phase_ends_unix_seconds == now + 120);
+    }
+
+    // Calibration before Retain can leave display timestamps on the old basis.
+    // The relative snapshot uses the actual current clock and saved budget.
+    ResetPorts(); ColdClock(); now = 1792627200; NoteBuildTimeApplied();
+    state = RunningTimer(); now += 3600;
+    timeval tv{now, 0}; TimeSyncCallback(&tv);
+    RetainTimeAppState(state); CHECK(PersistSystemTimeToRtc(112));
+    ResumeClock(112, 30);
+    CHECK(RestoreRetainedTimeApp(&state) && state.remaining_seconds == 90);
+    CHECK(state.phase_ends_unix_seconds == now + 90);
+
+    // Preserve awake time pending between the last deduction and a button.
+    ResetPorts(); ColdClock(); now = 1792627200; NoteBuildTimeApplied();
+    state = RunningTimer(); monotonic_us += 5000000; now += 5;
+    RetainTimeAppState(state); CHECK(PersistSystemTimeToRtc(113));
+    ResumeClock(113, 30);
+    CHECK(RestoreRetainedTimeApp(&state) && state.remaining_seconds == 85);
+
+    // A source change during RTC I/O revokes the persist attempt's trust.
+    ResetPorts(); ColdClock(); now = 1792627200; NoteBuildTimeApplied();
+    CHECK(PersistSystemTimeToRtc(114));
+    ResetPorts(); synchronize_at_transfer = 2;
+    CHECK(!PersistSystemTimeToRtc(115));
+    ResetPorts(); ColdClock(); Resume(115);
+    CHECK(!RestoreSystemTimeFromRtc() && transfers == 0);
+    Resume(114);
+    CHECK(!RestoreSystemTimeFromRtc() && transfers == 0);
+
+    // A calibration while capturing retained time invalidates that anchor.
+    ResetPorts(); ColdClock(); now = 1792627200; NoteBuildTimeApplied();
+    state = RunningTimer(); synchronize_during_time_read = true;
+    RetainTimeAppState(state); CHECK(PersistSystemTimeToRtc(116));
+    ResumeClock(116, 30);
+    CHECK(RestoreRetainedTimeApp(&state) && state.remaining_seconds == 120);
+}
+
 int main()
 {
     DriverCases();
     TimekeepCases();
     CodecCases();
     PersistDeadlineCases();
+    SourceCases();
+    ClockRetentionCases();
     CHECK(mutex.depth == 0 && active_operations == 0);
     std::printf("RTC/timekeep/codec %d Hz: %u checks PASS\n", FIXTURE_TICK_RATE_HZ, checks);
 }

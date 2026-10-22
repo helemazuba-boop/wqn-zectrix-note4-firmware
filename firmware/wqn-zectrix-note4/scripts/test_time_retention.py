@@ -42,6 +42,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix='note4-time-retention-') as temporary:
         directory = Path(temporary)
         (directory / 'esp_attr.h').write_text('#pragma once\n#define RTC_DATA_ATTR\n')
+        (directory / 'esp_timer.h').write_text('#pragma once\n#include <cstdint>\nint64_t esp_timer_get_time();\n')
         (directory / 'ui_internal.h').write_text('''#pragma once
 #include <cstdio>
 #include <ctime>

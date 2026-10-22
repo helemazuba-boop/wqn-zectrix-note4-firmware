@@ -23,13 +23,13 @@ jobs:
         run: python3 firmware/wqn-zectrix-note4/scripts/test_audio_channel_timeout.py
 
   rtc-timekeep:
-    name: RTC and shared I2C fault contracts (100/1000 Hz)
+    name: RTC, clock source, timer continuity and I2C (100/1000 Hz)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Exercise production RTC, trust, lock and codec register paths (not HIL)
+      - name: Exercise RTC, SNTP callbacks, timer restore, lock and codec paths (not HIL)
         run: python3 firmware/wqn-zectrix-note4/scripts/test_rtc_timekeep.py
 
   wake-and-timer:

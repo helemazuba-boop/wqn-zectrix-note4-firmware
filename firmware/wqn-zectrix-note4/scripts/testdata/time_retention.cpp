@@ -3,6 +3,7 @@
 #include <cstdlib>
 #include <ctime>
 #include "time_app.h"
+#include "runtime/wall_clock.cpp"
 
 // Include the complete production retention translation unit so checksum
 // corruption can be injected into its actual retained record, without hooks
@@ -13,6 +14,7 @@ static unsigned checks;
 #define CHECK(x) do { ++checks; if (!(x)) { \
     std::fprintf(stderr,"FAIL line %d: %s\n",__LINE__,#x); std::exit(1); } } while (0)
 static time_t wall = 1792627200;
+int64_t esp_timer_get_time() { return 0; }
 extern "C" time_t __wrap_time(time_t* out) { if(out)*out=wall; return wall; }
 using namespace wqn;
 using namespace device_ui_internal;
@@ -71,6 +73,7 @@ static void ClockCases()
 }
 static void RetentionCases()
 {
+    wqn::runtime::NoteRtcTimeRestored(false, 0);
     wall = 1792627200;
     auto s = Running();
     s.action_armed = true;
@@ -105,6 +108,10 @@ static void RetentionCases()
     CHECK(!HasRetainedTimeApp() && !RestoreRetainedTimeApp(&restored));
     s.remaining_seconds = 8000; RetainTimeAppState(s);
     CHECK(!HasRetainedTimeApp());
+    s = Running(); RetainTimeAppState(s);
+    --g_rtc_time_app.version;
+    g_rtc_time_app.checksum = RetainedTimeAppChecksum(g_rtc_time_app);
+    CHECK(!HasRetainedTimeApp() && !RestoreRetainedTimeApp(&restored));
     RetainTimeAppState({});
     CHECK(!HasRetainedTimeApp() && !RestoreRetainedTimeApp(&restored));
     CHECK(!RestoreRetainedTimeApp(nullptr));
@@ -115,7 +122,7 @@ static void RetentionCases()
     s = Running(); RetainTimeAppState(s); wall -= 3600;
     CHECK(RestoreRetainedTimeApp(&restored));
     CHECK(restored.remaining_seconds == 120);
-    CHECK(TickTimeApp(&restored, 1000));  // Rebase timestamps to this wall clock.
+    CHECK(!TickTimeApp(&restored, 1000));  // Restore already rebased the first frame.
     CHECK(restored.phase_ends_unix_seconds == wall + 120);
 }
 static void PomodoroCases()
