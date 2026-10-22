@@ -17,6 +17,7 @@
 #include "runtime/wake_context.h"
 #include "i2c_bus_lock.h"
 #include "services/audio_service.h"
+#include "services/audio_codec_deadline.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "esp_log.h"
@@ -69,8 +70,7 @@ SemaphoreHandle_t xSemaphoreCreateRecursiveMutex() { return &mutex; }
 BaseType_t xSemaphoreTakeRecursive(SemaphoreHandle_t value, TickType_t ticks)
 {
     CHECK(value == &mutex);
-    // Codec behavior is unchanged; all RTC holds must now have a finite budget.
-    CHECK(ticks == (active_operations ? portMAX_DELAY : pdMS_TO_TICKS(100)));
+    CHECK(ticks == pdMS_TO_TICKS(100));
     ++takes;
     if (fail_take == takes) return pdFALSE;
     ++mutex.depth;
@@ -135,6 +135,7 @@ esp_err_t i2c_master_transmit_receive(i2c_master_dev_handle_t dev,
 // recovery ports preserve lifetime/ordering assertions without a fake audio task.
 namespace {
 constexpr char kTag[] = "codec_fixture";
+using wqn::services::detail::CodecDeadline;
 @@CODEC_CONSTANTS@@
 class DriverOperation {
 public:
@@ -157,6 +158,7 @@ esp_err_t RecoverCodecI2cBusLocked(const wqn::services::AudioSession&,
     ++recoveries;
     return recovery_fails ? ESP_FAIL : ESP_OK;
 }
+@@CODEC_HELPERS@@
 }
 namespace wqn::services {
 @@CODEC_FUNCTIONS@@

@@ -120,13 +120,19 @@ def main():
         if timekeep.count('if ((settimeofday(&tv, nullptr), false))') != 2:
             raise ValueError('settimeofday boundary drift')
     elif args.mutation == 'codec-ticks':
-        codec = codec.replace('100);  // ESP-IDF I2C timeout is milliseconds.',
-                              'pdMS_TO_TICKS(100));')
-        if codec.count('pdMS_TO_TICKS(100));') != 2:
+        old = 'timeout_ms);  // ESP-IDF I2C timeout is milliseconds.'
+        codec = codec.replace(old, 'pdMS_TO_TICKS(timeout_ms));')
+        if codec.count('pdMS_TO_TICKS(timeout_ms));') != 2:
             raise ValueError('codec boundary drift')
 
     declarations = []
-    for name in ('kEs8311Address', 'kCodecI2cMaxAttempts', 'kCodecI2cRetryDelay'):
+    names = ['kEs8311Address', 'kCodecI2cMaxAttempts', 'kCodecI2cRetryDelay']
+    helpers = ''
+    if 'esp_err_t WriteAudioCodecRegisterBefore(' in codec:
+        names.append('kCallTimeoutUs')
+        helpers = '\n'.join(function(codec, f'esp_err_t {name}(') for name in
+            ('WriteAudioCodecRegisterBefore', 'ReadAudioCodecRegisterBefore'))
+    for name in names:
         found = re.findall(r'^constexpr [^\n]+ ' + name + r' = [^;]+;', codec, re.M)
         if len(found) != 1:
             raise ValueError(f'codec constant boundary drift: {name}')
@@ -136,6 +142,7 @@ def main():
     fixture = (root / 'scripts/testdata/rtc_timekeep.cpp').read_text()
     fixture = fixture.replace('@@CODEC_CONSTANTS@@', '\n'.join(declarations))
     fixture = fixture.replace('@@CODEC_FUNCTIONS@@', functions)
+    fixture = fixture.replace('@@CODEC_HELPERS@@', helpers)
     fixture = fixture.replace('@@RETRYABLE@@', function(codec, 'bool IsRetryableCodecI2cError('))
     compiler = shutil.which('g++')
     if not compiler:

@@ -48,6 +48,16 @@ jobs:
       - name: Check complete ADC batches and synchronous UI battery callers (not HIL)
         run: python3 firmware/wqn-zectrix-note4/scripts/test_power_sampling.py
 
+  audio-codec:
+    name: Complete codec configuration budget (100/1000 Hz)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Exercise full production codec program and cleanup (not HIL)
+        run: python3 firmware/wqn-zectrix-note4/scripts/test_audio_codec_budget.py
+
   storage-schema:
     name: Boot storage schema fault characterization
     runs-on: ubuntu-latest
