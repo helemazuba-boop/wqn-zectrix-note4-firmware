@@ -1,11 +1,13 @@
 #include "pcf8563.h"
 
+#include <algorithm>
 #include <cstring>
 
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
 #include "esp_check.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "i2c_bus_lock.h"
@@ -47,25 +49,53 @@ uint8_t EncodeBcd(int value)
     return static_cast<uint8_t>((tens << 4) | ones);
 }
 
-esp_err_t I2cWriteReg(uint8_t reg, uint8_t data)
+bool DeadlineExpired(int64_t deadline_us)
 {
+    return deadline_us > 0 && esp_timer_get_time() >= deadline_us;
+}
+
+TickType_t LockWaitTicks(int64_t deadline_us)
+{
+    if (deadline_us <= 0) return kI2cLockWaitTicks;
+    const int64_t remaining_us = std::max<int64_t>(0, deadline_us - esp_timer_get_time());
+    const int64_t remaining_ms = std::min<int64_t>(remaining_us / 1000, 100);
+    return std::min(kI2cLockWaitTicks, pdMS_TO_TICKS(remaining_ms));
+}
+
+int TransferTimeoutMs(int64_t deadline_us)
+{
+    if (deadline_us <= 0) return kI2cTransferTimeoutMs;
+    return static_cast<int>(std::clamp<int64_t>(
+        (deadline_us - esp_timer_get_time()) / 1000, 0, kI2cTransferTimeoutMs));
+}
+
+esp_err_t I2cWriteReg(uint8_t reg, uint8_t data, int64_t deadline_us = 0)
+{
+    if (DeadlineExpired(deadline_us)) return ESP_ERR_TIMEOUT;
     uint8_t buf[2] = {reg, data};
     // [i2c-bus-lock] Shared with the ES8311 codec; serialize every
     // synchronous transaction (see i2c_bus_lock.h).
-    ScopedI2cBusLock bus_lock("pcf8563_write", kI2cLockWaitTicks);
+    ScopedI2cBusLock bus_lock("pcf8563_write", LockWaitTicks(deadline_us));
     if (!bus_lock.locked()) {
         return bus_lock.status();
     }
-    return i2c_master_transmit(g_dev, buf, sizeof(buf), kI2cTransferTimeoutMs);
+    const int timeout_ms = TransferTimeoutMs(deadline_us);
+    if (timeout_ms == 0 || DeadlineExpired(deadline_us)) return ESP_ERR_TIMEOUT;
+    const esp_err_t result = i2c_master_transmit(g_dev, buf, sizeof(buf), timeout_ms);
+    return DeadlineExpired(deadline_us) ? ESP_ERR_TIMEOUT : result;
 }
 
-esp_err_t I2cReadReg(uint8_t reg, uint8_t* data, size_t len)
+esp_err_t I2cReadReg(uint8_t reg, uint8_t* data, size_t len, int64_t deadline_us = 0)
 {
-    ScopedI2cBusLock bus_lock("pcf8563_read", kI2cLockWaitTicks);
+    if (DeadlineExpired(deadline_us)) return ESP_ERR_TIMEOUT;
+    ScopedI2cBusLock bus_lock("pcf8563_read", LockWaitTicks(deadline_us));
     if (!bus_lock.locked()) {
         return bus_lock.status();
     }
-    return i2c_master_transmit_receive(g_dev, &reg, 1, data, len, kI2cTransferTimeoutMs);
+    const int timeout_ms = TransferTimeoutMs(deadline_us);
+    if (timeout_ms == 0 || DeadlineExpired(deadline_us)) return ESP_ERR_TIMEOUT;
+    const esp_err_t result = i2c_master_transmit_receive(g_dev, &reg, 1, data, len, timeout_ms);
+    return DeadlineExpired(deadline_us) ? ESP_ERR_TIMEOUT : result;
 }
 
 }  // namespace
@@ -216,6 +246,11 @@ bool Pcf8563WriteTime(int year, int month, int day, int hour, int min,
 
 bool Pcf8563ConfigureTimerWake(uint8_t seconds)
 {
+    return Pcf8563ConfigureTimerWake(seconds, 0);
+}
+
+bool Pcf8563ConfigureTimerWake(uint8_t seconds, int64_t deadline_us)
+{
     if (!g_initialized) {
         return false;
     }
@@ -228,24 +263,24 @@ bool Pcf8563ConfigureTimerWake(uint8_t seconds)
     // Stop the countdown before changing its value. Control_status_2 is
     // deliberately written as a complete value: AF/TF clear when written as
     // zero, unused bits must be zero, and this firmware does not use alarms.
-    if (I2cWriteReg(kTimerControlReg, kTimerClock1Hz) != ESP_OK) {
+    if (I2cWriteReg(kTimerControlReg, kTimerClock1Hz, deadline_us) != ESP_OK) {
         return false;
     }
-    if (I2cWriteReg(kControlStatus2Reg, 0x00) != ESP_OK) {
+    if (I2cWriteReg(kControlStatus2Reg, 0x00, deadline_us) != ESP_OK) {
         return false;
     }
-    if (I2cWriteReg(kTimerValueReg, seconds) != ESP_OK) {
+    if (I2cWriteReg(kTimerValueReg, seconds, deadline_us) != ESP_OK) {
         return false;
     }
-    if (I2cWriteReg(kControlStatus2Reg, kTimerInterruptEnable) != ESP_OK) {
+    if (I2cWriteReg(kControlStatus2Reg, kTimerInterruptEnable, deadline_us) != ESP_OK) {
         return false;
     }
-    if (I2cWriteReg(kTimerControlReg, kTimerEnable | kTimerClock1Hz) != ESP_OK) {
+    if (I2cWriteReg(kTimerControlReg, kTimerEnable | kTimerClock1Hz, deadline_us) != ESP_OK) {
         return false;
     }
 
     uint8_t ctrl2 = 0;
-    if (I2cReadReg(kControlStatus2Reg, &ctrl2, 1) != ESP_OK ||
+    if (I2cReadReg(kControlStatus2Reg, &ctrl2, 1, deadline_us) != ESP_OK ||
         (ctrl2 & (kAlarmFlag | kTimerFlag)) != 0 ||
         (ctrl2 & kTimerInterruptEnable) == 0) {
         ESP_LOGW(kTag, "timer wake arm verification failed: ctrl2=0x%02x", ctrl2);
@@ -273,17 +308,22 @@ bool Pcf8563ReadInterruptFlags(Pcf8563InterruptFlags* flags)
 
 bool Pcf8563DisableTimerWakeAndClearFlags()
 {
+    return Pcf8563DisableTimerWakeAndClearFlags(0);
+}
+
+bool Pcf8563DisableTimerWakeAndClearFlags(int64_t deadline_us)
+{
     if (!g_initialized) {
         return false;
     }
 
-    if (I2cWriteReg(kTimerControlReg, kTimerClock1Hz) != ESP_OK ||
-        I2cWriteReg(kControlStatus2Reg, 0x00) != ESP_OK) {
+    if (I2cWriteReg(kTimerControlReg, kTimerClock1Hz, deadline_us) != ESP_OK ||
+        I2cWriteReg(kControlStatus2Reg, 0x00, deadline_us) != ESP_OK) {
         return false;
     }
 
     uint8_t ctrl2 = 0;
-    if (I2cReadReg(kControlStatus2Reg, &ctrl2, 1) != ESP_OK) {
+    if (I2cReadReg(kControlStatus2Reg, &ctrl2, 1, deadline_us) != ESP_OK) {
         return false;
     }
     const bool cleared = (ctrl2 & (kAlarmFlag | kTimerFlag | kTimerInterruptEnable)) == 0;

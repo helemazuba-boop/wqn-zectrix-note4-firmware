@@ -23,6 +23,9 @@ bool Pcf8563WriteTime(int year, int month, int day, int hour, int min,
                       int sec, int weekday);
 
 bool Pcf8563ConfigureTimerWake(uint8_t seconds);
+// Positive absolute esp_timer deadlines cover all register steps and shared
+// lock waits. Reject late completion; IDF transfer timeout is not a hard WCET.
+bool Pcf8563ConfigureTimerWake(uint8_t seconds, int64_t deadline_us);
 
 struct Pcf8563InterruptFlags {
     bool alarm = false;
@@ -36,5 +39,6 @@ bool Pcf8563ReadInterruptFlags(Pcf8563InterruptFlags* flags);
 // Stops the countdown, disables its interrupt and clears AF/TF so GPIO5 can
 // be validated before it is armed as an EXT1 wake source.
 bool Pcf8563DisableTimerWakeAndClearFlags();
+bool Pcf8563DisableTimerWakeAndClearFlags(int64_t deadline_us);
 
 }  // namespace wqn

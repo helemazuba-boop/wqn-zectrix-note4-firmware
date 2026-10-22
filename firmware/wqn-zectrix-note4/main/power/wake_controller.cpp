@@ -11,6 +11,7 @@
 #include "freertos/task.h"
 #include "pcf8563.h"
 #include "runtime/wake_context.h"
+#include "runtime/task_delay.h"
 
 namespace {
 
@@ -100,6 +101,20 @@ bool DeadlineExpired(int64_t deadline_us)
     return deadline_us > 0 && esp_timer_get_time() >= deadline_us;
 }
 
+bool WaitForWakeLineSettle(int64_t deadline_us)
+{
+    constexpr int64_t kMaxDelayUs =
+        (int64_t{wqn::runtime::MinimumDelayTicks<2>()} * 1000000 +
+         configTICK_RATE_HZ - 1) / configTICK_RATE_HZ;
+    // Reserve the coarse RTOS wait before starting it. A late scheduler wake
+    // still fails the post-check instead of accepting an expired arm result.
+    if (deadline_us > 0 && deadline_us - esp_timer_get_time() <= kMaxDelayUs) {
+        return false;
+    }
+    wqn::runtime::DelayAtLeastMs<2>();
+    return !DeadlineExpired(deadline_us);
+}
+
 // [sleep-wake-fix] On ESP32-S3 there is no deep-sleep GPIO wakeup
 // (SOC_GPIO_SUPPORT_DEEPSLEEP_WAKEUP is absent), so RTC_GPIO_TRIG_EN is the
 // light-sleep-only wakeup master switch: rtc_sleep_start() writes it straight
@@ -177,21 +192,29 @@ WakeArmResult ArmWakeSources(uint32_t timer_wakeup_seconds, int64_t deadline_us)
     esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_TIMER);
     WakeSourceScope wake_scope;
 
+    if (DeadlineExpired(deadline_us)) {
+        result.error = ESP_ERR_TIMEOUT;
+        return result;
+    }
+
     const bool pcf_available = g_pcf8563_available.load(std::memory_order_acquire);
-    if (pcf_available && !Pcf8563DisableTimerWakeAndClearFlags()) {
+    if (pcf_available && !Pcf8563DisableTimerWakeAndClearFlags(deadline_us)) {
         ESP_LOGE(kTag, "cannot clear PCF8563 AF/TF before wake assembly");
-        result.error = ESP_FAIL;
+        result.error = DeadlineExpired(deadline_us) ? ESP_ERR_TIMEOUT : ESP_FAIL;
         return result;
     }
 
     // AF/TF are cleared before sampling the active-low line. A button pressed
     // during this window is also an ordinary, fully rolled-back sleep denial.
-    vTaskDelay(pdMS_TO_TICKS(2));
-    if (DeadlineExpired(deadline_us)) {
+    if (!WaitForWakeLineSettle(deadline_us)) {
         result.error = ESP_ERR_TIMEOUT;
         return result;
     }
     result.active_gpio_mask = ActiveLowWakePins(result.wake_gpio_mask);
+    if (DeadlineExpired(deadline_us)) {
+        result.error = ESP_ERR_TIMEOUT;
+        return result;
+    }
     if (result.active_gpio_mask != 0) {
         RecordActiveWakeLineDenial(result.active_gpio_mask, "before");
         result.error = ESP_ERR_INVALID_STATE;
@@ -201,12 +224,21 @@ WakeArmResult ArmWakeSources(uint32_t timer_wakeup_seconds, int64_t deadline_us)
     if (timer_wakeup_seconds > 0) {
         if (pcf_available && timer_wakeup_seconds <= UINT8_MAX &&
             Pcf8563ConfigureTimerWake(
-                static_cast<uint8_t>(timer_wakeup_seconds))) {
+                static_cast<uint8_t>(timer_wakeup_seconds), deadline_us)) {
             result.timer_source = TimerWakeSource::kPcf8563;
         } else {
-            if (pcf_available && !Pcf8563DisableTimerWakeAndClearFlags()) {
+            if (DeadlineExpired(deadline_us)) {
+                DisarmWakeSources(deadline_us);
+                result.error = ESP_ERR_TIMEOUT;
+                return result;
+            }
+            if (pcf_available && !Pcf8563DisableTimerWakeAndClearFlags(deadline_us)) {
                 ESP_LOGE(kTag, "cannot clear PCF8563 after timer arm failure");
-                result.error = ESP_FAIL;
+                result.error = DeadlineExpired(deadline_us) ? ESP_ERR_TIMEOUT : ESP_FAIL;
+                return result;
+            }
+            if (DeadlineExpired(deadline_us)) {
+                result.error = ESP_ERR_TIMEOUT;
                 return result;
             }
             const esp_err_t timer_result = esp_sleep_enable_timer_wakeup(
@@ -225,16 +257,20 @@ WakeArmResult ArmWakeSources(uint32_t timer_wakeup_seconds, int64_t deadline_us)
 
     // Arming the PCF timer is itself fallible. Verify that it did not assert
     // GPIO5 before the ESP32 EXT1 source is assembled.
-    vTaskDelay(pdMS_TO_TICKS(2));
-    if (DeadlineExpired(deadline_us)) {
-        DisarmWakeSources();
+    if (!WaitForWakeLineSettle(deadline_us)) {
+        DisarmWakeSources(deadline_us);
         result.error = ESP_ERR_TIMEOUT;
         return result;
     }
     result.active_gpio_mask = ActiveLowWakePins(result.wake_gpio_mask);
+    if (DeadlineExpired(deadline_us)) {
+        DisarmWakeSources(deadline_us);
+        result.error = ESP_ERR_TIMEOUT;
+        return result;
+    }
     if (result.active_gpio_mask != 0) {
         RecordActiveWakeLineDenial(result.active_gpio_mask, "after-timer");
-        DisarmWakeSources();
+        DisarmWakeSources(deadline_us);
         result.error = ESP_ERR_INVALID_STATE;
         return result;
     }
@@ -242,7 +278,12 @@ WakeArmResult ArmWakeSources(uint32_t timer_wakeup_seconds, int64_t deadline_us)
     result.error = esp_sleep_enable_ext1_wakeup(
         result.wake_gpio_mask, ESP_EXT1_WAKEUP_ANY_LOW);
     if (result.error != ESP_OK) {
-        DisarmWakeSources();
+        DisarmWakeSources(deadline_us);
+        return result;
+    }
+    if (DeadlineExpired(deadline_us)) {
+        DisarmWakeSources(deadline_us);
+        result.error = ESP_ERR_TIMEOUT;
         return result;
     }
     ResetActiveWakeLineDenialTracking();
@@ -255,11 +296,16 @@ WakeArmResult ArmWakeSources(uint32_t timer_wakeup_seconds, int64_t deadline_us)
 
 void DisarmWakeSources()
 {
+    DisarmWakeSources(0);
+}
+
+void DisarmWakeSources(int64_t deadline_us)
+{
     esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_EXT1);
     esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_TIMER);
     if (g_pcf8563_available.load(std::memory_order_acquire) &&
-        !Pcf8563DisableTimerWakeAndClearFlags()) {
-        ESP_LOGW(kTag, "PCF8563 wake flags could not be cleared during rollback");
+        !Pcf8563DisableTimerWakeAndClearFlags(deadline_us)) {
+        ESP_LOGW(kTag, "PCF8563 rollback clear failed or wake budget exhausted");
     }
     RestoreLightSleepGpioWake();
 }
