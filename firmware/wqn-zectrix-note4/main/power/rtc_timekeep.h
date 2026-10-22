@@ -29,11 +29,14 @@ bool UnixSecondsFromCalendar(const RtcCalendar& calendar, int64_t* seconds_out);
 // Sleep-side hook: writes the current system wall clock into the PCF8563 and
 // stamps an internal cross-deep-sleep trust record. Designed to be called by
 // PowerCoordinator after every service has quiesced and before wake-source
-// assembly; failure is logged and never blocks the sleep transaction.
+// assembly. Every attempt revokes old trust before validation/I/O; only a
+// verified write publishes trust for this generation. Failure never prevents
+// the sleep transaction from proceeding.
 bool PersistSystemTimeToRtc(uint32_t sleep_generation);
 
 // Boot-side hook: on a trusted deep-sleep resume (ext1/timer resume reason,
-// deep-sleep reset reason, valid trust record, PCF8563 VL clear), reads the
+// deep-sleep reset reason, valid trust record matching the committed sleep
+// snapshot generation, PCF8563 VL clear), reads the
 // RTC clock back and applies it via settimeofday() so downstream consumers
 // (UI seeding, sync deadlines, outbox stamps, HTTPS clock gating) start from
 // real wall-clock time instead of the build-time seed. Returns true only when

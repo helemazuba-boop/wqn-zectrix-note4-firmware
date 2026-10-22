@@ -1,6 +1,7 @@
 #include "power/rtc_timekeep.h"
 
 #include <cstddef>
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -148,6 +149,9 @@ bool UnixSecondsFromCalendar(const RtcCalendar& calendar, int64_t* seconds_out)
 
 bool PersistSystemTimeToRtc(uint32_t sleep_generation)
 {
+    // A skipped or failed write must not lend the previous sleep's trust to
+    // this attempt, including failures before touching the RTC registers.
+    g_trust_record = {};
     const std::time_t now = std::time(nullptr);
     if (now < kMinReasonableUnixTime) {
         ESP_LOGW(kTag, "system clock unreasonable (%lld); skip RTC persist",
@@ -184,7 +188,8 @@ bool RestoreSystemTimeFromRtc()
     if (!wake.deep_sleep_resume || wake.reset_reason != ESP_RST_DEEPSLEEP) {
         return false;
     }
-    if (!TrustRecordValid()) {
+    if (!TrustRecordValid() || !wake.sleep_snapshot_valid ||
+        g_trust_record.generation != wake.sleep_generation) {
         return false;
     }
 
@@ -223,7 +228,10 @@ bool RestoreSystemTimeFromRtc()
         .tv_sec = static_cast<time_t>(restored_seconds),
         .tv_usec = 0,
     };
-    settimeofday(&tv, nullptr);
+    if (settimeofday(&tv, nullptr) != 0) {
+        ESP_LOGW(kTag, "RTC clock calibration failed: %s", std::strerror(errno));
+        return false;
+    }
     ESP_LOGI(kTag,
              "system clock calibrated from PCF8563: generation=%lu/%lu utc=%lld",
              static_cast<unsigned long>(g_trust_record.generation),
@@ -269,7 +277,10 @@ bool SeedSystemTimeFromBuildTimeIfNeeded()
         .tv_sec = build_time,
         .tv_usec = 0,
     };
-    settimeofday(&tv, nullptr);
+    if (settimeofday(&tv, nullptr) != 0) {
+        ESP_LOGW(kTag, "build-time clock seeding failed: %s", std::strerror(errno));
+        return false;
+    }
     ESP_LOGI(
         kTag,
         "clock seeded from build time: %04d-%02d-%02d %02d:%02d:%02d CST",
