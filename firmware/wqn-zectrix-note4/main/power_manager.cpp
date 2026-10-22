@@ -33,7 +33,6 @@
 #include "runtime/sleep_diagnostics.h"
 #include "runtime/sleep_snapshot.h"
 #include "runtime/wake_context.h"
-#include "runtime/task_delay.h"
 #include "sdkconfig.h"
 #include "storage.h"
 #include "wifi_manager.h"
@@ -816,7 +815,12 @@ bool ReadPowerStatus(PowerStatusSnapshot* snapshot)
         sum_mv += mv;
         ++valid_samples;
 
-        runtime::DelayAtLeastMs<1>();
+        // [adc-latency] This 10-sample batch is also called synchronously by
+        // UI input guards, summaries and diagnostics. Preserve its original
+        // yield: a phase-safe 2-tick wait here added ~200 ms to EACH read at
+        // 100 Hz and multiplied input-to-frame latency. A physical sampling
+        // interval needs acquisition off the UI path, not a coarse delay here.
+        vTaskDelay(pdMS_TO_TICKS(1));
     }
 
     if (valid_samples == 0) {
