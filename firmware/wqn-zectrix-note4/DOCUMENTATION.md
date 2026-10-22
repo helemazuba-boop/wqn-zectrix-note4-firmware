@@ -96,7 +96,9 @@ by code, `AGENTS.md`, and the architecture/product references above.
 - `docs/engineering/RELIABILITY_BATCH_02.md` — boot-data preservation decisions,
   durable reset intent, regression evidence, and user-confirmed device acceptance.
 - `docs/engineering/RELIABILITY_BATCH_03.md` — runtime outbox preservation fixes,
-  consolidated fault regressions, and the pending on-device checkpoint.
+  consolidated fault regressions, and user-confirmed checkpoint acceptance.
+- `docs/engineering/RELIABILITY_BATCH_04.md` — RTC trust, shared I2C timeout
+  repairs, production-source fault regressions, and remaining device checks.
 - `docs/engineering/DEAD_CODE_CLEANUP.md` — evidence and scope for firmware
   cleanup decisions.
 - `docs/engineering/SYNC_V3_REPAIR.md` — sync repair findings, host checks, and
