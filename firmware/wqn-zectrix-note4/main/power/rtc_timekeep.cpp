@@ -259,7 +259,7 @@ bool RestoreSystemTimeFromRtc()
         return false;
     }
     runtime::NoteRtcTimeRestored(
-        g_trust_record.network_calibrated != 0, g_trust_record.clock_epoch);
+        g_trust_record.network_calibrated != 0, g_trust_record.clock_epoch, restored_seconds);
     ESP_LOGI(kTag,
              "system clock calibrated from PCF8563: generation=%lu/%lu basis=%lu calibrated=%u utc=%lld",
              static_cast<unsigned long>(g_trust_record.generation),

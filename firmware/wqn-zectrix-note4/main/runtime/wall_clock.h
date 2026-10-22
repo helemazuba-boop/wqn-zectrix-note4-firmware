@@ -27,6 +27,6 @@ void NoteBuildTimeApplied();
 // Require the applied system clock to agree with the callback (within 2 s).
 void NoteSntpTimeSynchronized(int64_t unix_seconds, int64_t applied_unix_seconds);
 // Boot-only, after validated RTC I/O and successful system clock application.
-void NoteRtcTimeRestored(bool network_calibrated, uint32_t epoch);
+void NoteRtcTimeRestored(bool network_calibrated, uint32_t epoch, int64_t unix_seconds);
 
 }  // namespace wqn::runtime

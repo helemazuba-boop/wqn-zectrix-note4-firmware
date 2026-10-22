@@ -595,7 +595,7 @@ static void SourceCases()
     const uint32_t epoch = GetWallClockSnapshot().epoch;
     sntp_callback(&synchronized);
     CHECK(GetWallClockSnapshot().epoch == epoch + 1);
-    NoteRtcTimeRestored(true, kWallClockEpochMax + 1);
+    NoteRtcTimeRestored(true, kWallClockEpochMax + 1, now);
     CHECK(GetWallClockSnapshot().epoch == epoch + 1);
 
     // Execute actual HTTPS clock admission, including its fallback callback.
@@ -677,6 +677,28 @@ static void ClockRetentionCases()
         ResumeClock(101, 30);
         CHECK(GetWallClockSnapshot().network_calibrated() == calibrated);
         CHECK(RestoreRetainedTimeApp(&state) && state.remaining_seconds == 60);
+    }
+
+    // An online boot must still spend sleep time when SNTP agrees with the
+    // restored RTC. Include callback delay and tolerance boundaries.
+    for (int correction : {-3, -2, 0, 2, 3}) {
+        ResetPorts(); ColdClock(); now = 1792627200; NoteBuildTimeApplied();
+        auto online = RunningTimer(); RetainTimeAppState(online);
+        CHECK(PersistSystemTimeToRtc(105));
+        ResumeClock(105, 30);
+        const auto rtc = GetWallClockSnapshot();
+        monotonic_us += 7000000; now += 7 + correction;
+        timeval tv{now, 0}; TimeSyncCallback(&tv);
+        const auto synced = GetWallClockSnapshot();
+        CHECK(synced.network_calibrated());
+        if (correction >= -2 && correction <= 2) {
+            CHECK(synced.epoch == rtc.epoch && synced.rtc_continuity);
+            CHECK(RestoreRetainedTimeApp(&online));
+            CHECK(online.remaining_seconds == 120 - (37 + correction));
+        } else {
+            CHECK(synced.epoch != rtc.epoch && !synced.rtc_continuity);
+            CHECK(RestoreRetainedTimeApp(&online) && online.remaining_seconds == 120);
+        }
     }
 
     ResetPorts(); ColdClock(); now = 1792627200; NoteBuildTimeApplied();

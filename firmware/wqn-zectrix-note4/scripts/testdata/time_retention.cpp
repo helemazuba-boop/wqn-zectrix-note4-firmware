@@ -73,7 +73,7 @@ static void ClockCases()
 }
 static void RetentionCases()
 {
-    wqn::runtime::NoteRtcTimeRestored(false, 0);
+    wqn::runtime::NoteRtcTimeRestored(false, 0, wall);
     wall = 1792627200;
     auto s = Running();
     s.action_armed = true;

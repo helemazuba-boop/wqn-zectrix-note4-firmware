@@ -102,7 +102,7 @@ def main():
         'stop-error-no-cleanup', 'ignore-late-write', 'assume-calibrated',
         'keep-changed-clock-trust', 'ignore-continuity', 'ignore-retained-epoch',
         'snapshot-now', 'skip-source-on-seed', 'skip-source-on-restore', 'skip-rebase',
-        'ignore-sntp-readback'))
+        'ignore-sntp-readback', 'always-break-continuity'))
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
     pcf = (args.pcf_source or root / 'main/pcf8563.cpp').read_text()
@@ -183,11 +183,13 @@ def main():
         timekeep = replace_once(timekeep, '    runtime::NoteBuildTimeApplied();\n', '')
     elif args.mutation == 'skip-source-on-restore':
         timekeep = replace_once(timekeep, '''    runtime::NoteRtcTimeRestored(
-        g_trust_record.network_calibrated != 0, g_trust_record.clock_epoch);\n''', '')
+        g_trust_record.network_calibrated != 0, g_trust_record.clock_epoch, restored_seconds);\n''', '')
     elif args.mutation == 'skip-rebase':
         retention = replace_once(retention, '    wqn::AlignTimeAppWallClock(&restored, now);\n', '')
     elif args.mutation == 'ignore-sntp-readback':
         clock = replace_once(clock, '    if (difference > 2) return;', '    (void)difference;')
+    elif args.mutation == 'always-break-continuity':
+        clock = replace_once(clock, 'if ((previous & kRtcContinuityBit) != 0)', 'if (false)')
 
     # Compile historical translation units against the current header too.
     # These compatibility shims deliberately preserve their missing deadline
