@@ -83,6 +83,9 @@ esp_err_t RecoverAudioCodec(const AudioSession& session);
 // Configure ES8311 after the session's I2S channel(s) have been created and
 // enabled, so the external MCLK/BCLK domain is already stable. volume_percent
 // is applied only by playback/duplex profiles and must be in [0, 100].
+// Cold configuration shares one 5 s admission budget across probe, register
+// retries and program retries. Late completion fails; private-handle cleanup
+// still runs. This does not bound SDK internals or cleanup as a hard WCET.
 esp_err_t ConfigureAudioCodec(
     const AudioSession& session,
     AudioCodecProfile profile,
@@ -96,6 +99,9 @@ esp_err_t AddAudioCodec(
     AudioCodecHandle* codec);
 esp_err_t RemoveAudioCodec(
     const AudioSession& session, AudioCodecHandle* codec);
+// Standalone register calls use one 5 s budget, finite bus-lock waits and
+// millisecond driver parameters. Backoff releases the per-register lock;
+// ConfigureAudioCodec retains its outer lock across the complete program.
 esp_err_t WriteAudioCodecRegister(
     const AudioSession& session,
     AudioCodecHandle codec,
