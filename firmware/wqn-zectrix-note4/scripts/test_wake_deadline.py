@@ -6,7 +6,6 @@ No physical BUSY/ADC/interrupt timing or task scheduling is proven here.
 """
 import argparse
 from pathlib import Path
-import re
 import shutil
 import subprocess
 import tempfile
@@ -20,7 +19,6 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--wake-source', type=Path)
     parser.add_argument('--display-source', type=Path)
-    parser.add_argument('--power-source', type=Path)
     parser.add_argument('--mutation', choices=('renew-rollback', 'ignore-rtc-deadline',
         'accept-late-i2c', 'ignore-ext1-deadline', 'zero-settle', 'omit-tick-phase'))
     args = parser.parse_args()
@@ -54,16 +52,10 @@ def main():
                              'configTICK_RATE_HZ + 999) / 1000;')
 
     display = (args.display_source or root / 'components/display_service/display_service.cpp').read_text()
-    power = (args.power_source or root / 'main/power_manager.cpp').read_text()
-    adc = function(power, 'bool ReadPowerStatus(')
-    expressions = re.findall(r'^\s*(?:vTaskDelay\([^;]+\)|runtime::DelayAtLeastMs<\d+>\(\));', adc, re.M)
-    if len(expressions) != 1:
-        raise ValueError('ADC spacing boundary drift')
     fixture = (root / 'scripts/testdata/wake_deadline.cpp').read_text()
     for marker, value in {
         '@@EPD_BUSY@@': function(display, 'esp_err_t WaitBusyTimeout('),
         '@@EPD_STATUS@@': function(display, 'esp_err_t WaitPanelStatusReady('),
-        '@@ADC_SPACING@@': expressions[0],
     }.items():
         if fixture.count(marker) != 1:
             raise ValueError(f'fixture boundary drift: {marker}')

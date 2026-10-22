@@ -155,10 +155,6 @@ esp_err_t SendData(uint8_t) { return ++commands == fail_command ? ESP_FAIL : ESP
 @@EPD_BUSY@@
 @@EPD_STATUS@@
 
-// Evaluate the actual ADC spacing expression; ADC acquisition/averaging is not
-// replaced by a second implementation and is not claimed as tested here.
-void AdcSpacing() { using namespace wqn; @@ADC_SPACING@@ }
-
 static void Reset(bool rtc = true)
 {
     CHECK(mutex.depth == 0);
@@ -283,9 +279,6 @@ static void ShortWaitCases()
         wqn::runtime::DelayAtLeastMs<1>();
         CHECK(monotonic_us - start >= 1000);
         CHECK(monotonic_us - start <= 1000 + 2 * kTickUs);
-        const auto before_adc = monotonic_us;
-        AdcSpacing();
-        CHECK(monotonic_us - before_adc >= 1000);
     }
     Reset(); busy_low_until = monotonic_us + 2500;
     CHECK(WaitBusyTimeout(100) == ESP_OK && !waits.empty() && feed_calls > 0);

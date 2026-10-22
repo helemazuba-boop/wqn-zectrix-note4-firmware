@@ -45,6 +45,9 @@ jobs:
       - name: Exercise production timer and RTC-retained state (not HIL)
         run: python3 firmware/wqn-zectrix-note4/scripts/test_time_retention.py
 
+      - name: Check complete ADC batches and synchronous UI battery callers (not HIL)
+        run: python3 firmware/wqn-zectrix-note4/scripts/test_power_sampling.py
+
   storage-schema:
     name: Boot storage schema fault characterization
     runs-on: ubuntu-latest
