@@ -126,7 +126,7 @@ std::string EncodeObservationLine(const wqn::DurableProblemObservation& observat
 bool DecodeObservationLine(
     const std::string& line, wqn::DurableProblemObservation* observation)
 {
-    if (observation == nullptr) return false;
+    if (observation == nullptr || line.find('\0') != std::string::npos) return false;
     *observation = {};
     cJSON* root = wqn::protocol::JsonNestingWithinLimit(
                       line.data(), line.size())
@@ -167,7 +167,9 @@ esp_err_t RecoverOutboxPublication()
         return errno == ENOENT ? ESP_OK : ESP_FAIL;
     }
     g_empty_problem_outbox_known = false;
-    return std::rename(kOutboxBackupPath, kOutboxPath) == 0 ? ESP_OK : ESP_FAIL;
+    if (std::rename(kOutboxBackupPath, kOutboxPath) != 0) return ESP_FAIL;
+    ESP_LOGW(kTag, "recovered problem outbox from interrupted publication");
+    return ESP_OK;
 }
 
 esp_err_t ReadOutboxLines(
@@ -188,31 +190,35 @@ esp_err_t ReadOutboxLines(
     std::string line;
     line.reserve(kMaxLineBytes);
     bool saw_bytes = false, discard_line = false, repair = false;
-    int ch = 0;
-    while ((ch = std::fgetc(file)) != EOF) {
-        saw_bytes = true;
-        if (ch != '\n') {
-            if (ch == 0 || line.size() >= kMaxLineBytes) {
-                discard_line = repair = true;
-            } else if (!discard_line) {
-                line.push_back(static_cast<char>(ch));
+    char chunk[128];
+    size_t read = 0;
+    while ((read = std::fread(chunk, 1, sizeof(chunk), file)) > 0) {
+        for (size_t index = 0; index < read; ++index) {
+            const unsigned char ch = static_cast<unsigned char>(chunk[index]);
+            saw_bytes = true;
+            if (ch != '\n') {
+                if (ch == 0 || line.size() >= kMaxLineBytes + 1) {
+                    discard_line = repair = true;
+                } else if (!discard_line) {
+                    line.push_back(static_cast<char>(ch));
+                }
+                continue;
             }
-            continue;
-        }
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-        if (!discard_line && !line.empty()) {
-            wqn::DurableProblemObservation parsed;
-            if (DecodeObservationLine(line, &parsed)) {
-                lines->push_back(line);
-            } else {
-                repair = true;
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (!discard_line && !line.empty()) {
+                wqn::DurableProblemObservation parsed;
+                if (line.size() <= kMaxLineBytes && DecodeObservationLine(line, &parsed)) {
+                    lines->push_back(line);
+                } else {
+                    repair = true;
+                }
             }
-        }
-        line.clear();
-        discard_line = false;
-        if (lines->size() > wqn::kProblemObservationOutboxCapacity + 8) {
-            std::fclose(file);
-            return ESP_ERR_INVALID_SIZE;
+            line.clear();
+            discard_line = false;
+            if (lines->size() > wqn::kProblemObservationOutboxCapacity + 8) {
+                std::fclose(file);
+                return ESP_ERR_INVALID_SIZE;
+            }
         }
     }
     repair = repair || discard_line || !line.empty();

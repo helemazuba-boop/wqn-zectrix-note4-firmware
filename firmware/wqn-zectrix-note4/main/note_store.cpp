@@ -1194,6 +1194,11 @@ esp_err_t SuspendObservationTransaction(void* opaque)
     }
     OutboxScan* scan = nullptr;
     ESP_RETURN_ON_ERROR(EnsureOutboxCache(&scan), kTag, "load outbox before note suspend");
+    if (scan->partial_tail || scan->backup_source) {
+        ESP_RETURN_ON_ERROR(
+            CheckpointSessionFromOutbox(*scan), kTag, "checkpoint before note suspend repair");
+        ESP_RETURN_ON_ERROR(CompactCachedOutbox(scan), kTag, "repair before note suspend append");
+    }
     auto pending = std::find_if(
         scan->pending.begin(), scan->pending.end(),
         [&](const auto& value) { return *context->request_id == value.request_id; });

@@ -48,7 +48,7 @@ constexpr uint16_t kOutboxSchemaVersion=1;
 @@RECORDS@@
 OutboxScan g_outbox_cache;
 bool g_outbox_cache_loaded=false;
-char kOutboxPath[256], kOutboxTempPath[256], kOutboxBackupPath[256], direct_path[256];
+char kOutboxPath[256], kOutboxTempPath[256], kOutboxBackupPath[256], kOutboxRecoveryPath[256], direct_path[256];
 bool fail_stat=false, fail_read=false, fail_flush=false, fail_sync=false, fail_close=false, partial_write=false;
 size_t partial_write_bytes=7;
 int write_calls=0, flush_calls=0, sync_calls=0, close_calls=0;
@@ -121,7 +121,7 @@ void Reset() {
     write_calls=flush_calls=sync_calls=close_calls=0;
     rename_call=fail_rename_call=0;
     g_outbox_cache={}; g_outbox_cache_loaded=false;
-    for(const char* path : {kOutboxPath,kOutboxTempPath,kOutboxBackupPath,direct_path}) std::remove(path);
+    for(const char* path : {kOutboxPath,kOutboxTempPath,kOutboxBackupPath,kOutboxRecoveryPath,direct_path}) std::remove(path);
 }
 OutboxRecord Record(const std::string& request="request-1") {
     wqn::DurableWordObservation value;
@@ -144,6 +144,7 @@ int main() {
     std::snprintf(kOutboxPath,sizeof(kOutboxPath),"%s/wout.v1",directory);
     std::snprintf(kOutboxTempPath,sizeof(kOutboxTempPath),"%s/wout.tmp",directory);
     std::snprintf(kOutboxBackupPath,sizeof(kOutboxBackupPath),"%s/wout.bak",directory);
+    std::snprintf(kOutboxRecoveryPath,sizeof(kOutboxRecoveryPath),"%s/wout.rec",directory);
     std::snprintf(direct_path,sizeof(direct_path),"%s/direct.log",directory);
     const auto one=Record(), two=Record("request-2");
     Check(sizeof(OutboxRecord)==200 && kOutboxMaxRecords==2064 && kOutboxMaxBytes==412800,

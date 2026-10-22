@@ -5,12 +5,14 @@
 #include <cstring>
 #include <string>
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <vector>
 
 using esp_err_t = int;
 constexpr esp_err_t ESP_OK = 0, ESP_FAIL = -1;
 constexpr esp_err_t ESP_ERR_INVALID_ARG = 0x102, ESP_ERR_NOT_FOUND = 0x105;
+constexpr esp_err_t ESP_ERR_INVALID_STATE = 0x103;
 constexpr esp_err_t ESP_ERR_NO_MEM = 0x101, ESP_ERR_INVALID_SIZE = 0x104;
 constexpr const char* kTag = "problem-fixture";
 void FixtureLog(const char*, const char*, ...) {}
@@ -22,6 +24,7 @@ enum class OutboxSuspendReason { kActorOwnership };
 const char* OutboxSuspendReasonName(OutboxSuspendReason) { return "actor-ownership"; }
 struct DurableProblemObservation {
     std::string request_id, problem_id, occurred_at;
+    int action = 0;
 };
 struct ProblemOutboxSnapshot {
     size_t pending_count = 0, suspended_count = 0, capacity = 0;
@@ -29,14 +32,37 @@ struct ProblemOutboxSnapshot {
 constexpr size_t kProblemObservationOutboxCapacity = 200;
 }
 using Observation = wqn::DurableProblemObservation;
-char kOutboxPath[512], kOutboxTempPath[512], kParkedPath[512], kRejectedPath[512];
+char kOutboxPath[512], kOutboxTempPath[512], kOutboxBackupPath[512], kParkedPath[512], kRejectedPath[512];
 int read_opens = 0, write_opens = 0;
 std::string bad_open_path, bad_read_path, bad_close_path, partial_write_path;
 FILE* bad_close_stream = nullptr;
 FILE* partial_write_stream = nullptr;
+bool fail_publish=false, fail_restore=false, stop_after_rotate=false;
+bool fail_empty_backup_cleanup=false, fail_newline=false;
+struct PublicationStop {};
 extern "C" FILE* __real_fopen(const char*, const char*);
 extern "C" int __real_fclose(FILE*);
 extern "C" size_t __real_fwrite(const void*, size_t, size_t, FILE*);
+extern "C" int __real_rename(const char*, const char*);
+extern "C" int __real_remove(const char*);
+extern "C" int __real_fputc(int, FILE*);
+extern "C" int __wrap_rename(const char* from, const char* to) {
+    if ((fail_publish && std::strcmp(from,kOutboxTempPath)==0) ||
+        (fail_restore && std::strcmp(from,kOutboxBackupPath)==0)) { errno=EIO; return -1; }
+    const int result=__real_rename(from,to);
+    if(result==0 && stop_after_rotate && std::strcmp(from,kOutboxPath)==0 &&
+       std::strcmp(to,kOutboxBackupPath)==0) throw PublicationStop{};
+    return result;
+}
+extern "C" int __wrap_remove(const char* path) {
+    struct stat info={};
+    if(fail_empty_backup_cleanup && std::strcmp(path,kOutboxBackupPath)==0 &&
+       ::stat(kOutboxPath,&info)==0 && info.st_size==0) { errno=EIO; return -1; }
+    return __real_remove(path);
+}
+extern "C" int __wrap_fputc(int ch, FILE* file) {
+    return fail_newline && ch=='\n' ? EOF : __real_fputc(ch,file);
+}
 ssize_t FailRead(void*, char*, size_t) { errno = EIO; return -1; }
 extern "C" FILE* __wrap_fopen(const char* path, const char* mode) {
     const bool reading = std::strcmp(mode, "rb") == 0;
@@ -94,9 +120,10 @@ void Check(bool condition, const char* name) {
     condition ? ++passes : ++failures;
 }
 void Reset() {
+    fail_publish=fail_restore=stop_after_rotate=fail_empty_backup_cleanup=fail_newline=false;
     bad_open_path.clear(); bad_read_path.clear(); bad_close_path.clear(); partial_write_path.clear();
     bad_close_stream = partial_write_stream = nullptr;
-    for (const char* path : {kOutboxPath, kOutboxTempPath, kParkedPath, kRejectedPath}) {
+    for (const char* path : {kOutboxPath, kOutboxTempPath, kOutboxBackupPath, kParkedPath, kRejectedPath}) {
         if (std::remove(path) != 0 && errno != ENOENT) std::abort();
     }
     read_opens = write_opens = 0;
@@ -105,6 +132,10 @@ void Reset() {
 Observation Value(const char* suffix = "A") {
     return {std::string("fixture-request-") + suffix,
             "00000000-0000-0000-0000-000000000001", "2026-10-08T00:00:00Z"};
+}
+void RawPut(const std::string& bytes) {
+    FILE* f=__real_fopen(kOutboxPath,"wb");
+    if(!f || __real_fwrite(bytes.data(),1,bytes.size(),f)!=bytes.size() || __real_fclose(f)!=0) std::abort();
 }
 esp_err_t Commit(const Observation& value) {
     CommitContext context{&value}; return CommitTransaction(&context);
@@ -122,10 +153,73 @@ bool PrimeEmpty() {
     Observation value;
     return Peek(&value) == ESP_ERR_NOT_FOUND;
 }
+void RecoveryCases() {
+    const auto a=Value("A"), b=Value("B"); Observation out;
+    Reset(); Check(Commit(a)==ESP_OK && Commit(b)==ESP_OK,"seed two accepted verdicts");
+    fail_publish=fail_restore=true;
+    Check(Remove(a)==ESP_FAIL,"failed publication and rollback report failure");
+    fail_publish=fail_restore=false; g_empty_problem_outbox_known=false;
+    Check(Peek(&out)==ESP_OK && out.request_id==a.request_id,"latest backup restores all accepted verdicts");
+    Check(Remove(a)==ESP_OK && Peek(&out)==ESP_OK && out.request_id==b.request_id,
+          "retry ACK preserves the next unuploaded verdict");
+    Reset(); Commit(a); Commit(b); stop_after_rotate=true; bool stopped=false;
+    try { Remove(a); } catch(PublicationStop&) { stopped=true; }
+    stop_after_rotate=false; g_empty_problem_outbox_known=false;
+    Check(stopped && Peek(&out)==ESP_OK && out.request_id==a.request_id,
+          "restart after primary rotation recovers accepted records");
+    Reset(); Commit(a); fail_empty_backup_cleanup=true;
+    Check(Remove(a)==ESP_OK,"empty publication succeeds despite deferred backup cleanup");
+    fail_empty_backup_cleanup=false; g_empty_problem_outbox_known=false;
+    Check(Peek(&out)==ESP_ERR_NOT_FOUND,"committed empty primary never resurrects an ACKed backup");
+    Check(Commit(b)==ESP_OK && Peek(&out)==ESP_OK && out.request_id==b.request_id,
+          "new append starts from the authoritative empty generation");
+    Reset(); partial_write_path=kOutboxPath;
+    Check(Commit(a)==ESP_FAIL,"leave real partial bytes before retry");
+    partial_write_path.clear();
+    Check(Commit(a)==ESP_OK && Peek(&out)==ESP_OK && out.request_id==a.request_id,
+          "matching text in partial bytes cannot report durable success");
+    Reset(); partial_write_path=kOutboxPath; Commit(a); partial_write_path.clear();
+    Check(Commit(b)==ESP_OK && Peek(&out)==ESP_OK && out.request_id==b.request_id,
+          "successful next append repairs the preceding broken frame");
+    Reset(); fail_newline=true;
+    Check(Commit(a)==ESP_FAIL,"missing newline is a failed uncommitted frame");
+    fail_newline=false;
+    Check(Commit(a)==ESP_OK && Peek(&out)==ESP_OK && out.request_id==a.request_id,
+          "retry of a full JSON body without newline writes a framed durable record");
+    Reset(); const auto longer=Value("A-longer"); Commit(longer);
+    Check(Commit(a)==ESP_OK && Remove(longer)==ESP_OK && Peek(&out)==ESP_OK && out.request_id==a.request_id,
+          "request ID prefix does not suppress a distinct observation");
+    Reset(); Commit(a); auto conflict=a; conflict.problem_id="00000000-0000-0000-0000-000000000002";
+    Check(Commit(conflict)==ESP_ERR_INVALID_STATE && Peek(&out)==ESP_OK && out.problem_id==a.problem_id,
+          "same request ID with changed payload is rejected");
+    Reset(); RawPut(std::string(513,'x')+EncodeObservationLine(a)+'\n'+EncodeObservationLine(b)+'\n');
+    Check(Peek(&out)==ESP_OK && out.request_id==b.request_id,
+          "overlong line cannot expose its valid-looking suffix as a record");
+#if REAL_CODEC
+    Reset(); Commit(a); conflict=a;
+    conflict.action=wqn::protocol::problem_study_v1::ReviewAction::kWrong;
+    Check(Commit(conflict)==ESP_ERR_INVALID_STATE,"same ID cannot change the review action");
+    conflict=a; conflict.occurred_at="2026-10-09T00:00:00Z";
+    Check(Commit(conflict)==ESP_ERR_INVALID_STATE,"same ID cannot change the observation timestamp");
+    Check(!DecodeObservationLine(EncodeObservationLine(a)+"garbage",&out),
+          "production JSON decoder rejects trailing non-JSON bytes");
+    Check(!DecodeObservationLine(EncodeObservationLine(a)+std::string("\0junk",5),&out),
+          "production JSON decoder rejects embedded NUL suffixes");
+    Reset(); RawPut(EncodeObservationLine(a)+std::string("\0junk\n",6)+EncodeObservationLine(b)+'\n');
+    Check(Peek(&out)==ESP_OK && out.request_id==b.request_id,
+          "NUL-corrupted line cannot hide a valid record behind it");
+    Reset(); std::string padded=EncodeObservationLine(a); padded.pop_back(); padded+=",\"padding\":\"";
+    padded.append(512-padded.size()-2,'x'); padded+="\"}";
+    RawPut(padded+"\r\n");
+    Check(Peek(&out)==ESP_OK && out.request_id==a.request_id,
+          "maximum-sized valid JSON survives CRLF at a chunk boundary");
+#endif
+}
 int main(int argc, char** argv) {
     if (argc != 2) return 2;
     std::snprintf(kOutboxPath, sizeof(kOutboxPath), "%s/outbox", argv[1]);
     std::snprintf(kOutboxTempPath, sizeof(kOutboxTempPath), "%s/temp", argv[1]);
+    std::snprintf(kOutboxBackupPath, sizeof(kOutboxBackupPath), "%s/outbox.bak", argv[1]);
     std::snprintf(kParkedPath, sizeof(kParkedPath), "%s/parked", argv[1]);
     std::snprintf(kRejectedPath, sizeof(kRejectedPath), "%s/rejected", argv[1]);
     Observation out, a = Value(), b = Value("B");
@@ -226,7 +320,8 @@ int main(int argc, char** argv) {
     Reset(); PrimeEmpty(); bad_open_path = kParkedPath;
     Check(Suspend(a) == ESP_FAIL && Peek(&out) == ESP_FAIL,
           "failed park preparatory read invalidates older empty evidence");
-    std::printf("%d PASS / %d FAIL (temporary libc files; codec stub; NOT ESP32 HIL)\n",
+    RecoveryCases();
+    std::printf("%d PASS / %d FAIL (temporary libc files; NOT ESP32 HIL)\n",
                 passes, failures);
     Reset();
     return failures ? 1 : 0;

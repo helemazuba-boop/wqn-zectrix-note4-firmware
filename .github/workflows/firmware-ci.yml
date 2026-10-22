@@ -99,6 +99,17 @@ jobs:
           restore-keys: |
             idf-
 
+      - name: Outbox recovery host regressions (not HIL)
+        working-directory: firmware/wqn-zectrix-note4
+        shell: bash
+        run: |
+          source "$IDF_PATH/export.sh"
+          python3 scripts/test_binary_outbox_recovery.py
+          python3 scripts/test_problem_outbox_recovery.py
+          python3 scripts/test_word_outbox_quota.py
+          python3 scripts/test_problem_empty_cache.py
+          python3 scripts/test_word_session_replay.py
+
       # wqn_architecture_check is an ALL target, so the M8 ownership gate runs
       # as part of the build.
       - name: Build
