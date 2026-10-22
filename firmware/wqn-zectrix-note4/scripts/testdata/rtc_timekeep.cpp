@@ -35,6 +35,7 @@ static bool add_fails, corrupt_read, set_fails, apply_power_fails, recovery_fail
 static int transfer_failure = ESP_ERR_TIMEOUT;
 static time_t now = 1792627200;  // 2026-10-22 00:00:00 UTC.
 static timeval applied{};
+int64_t esp_timer_get_time() { return 1000000; }
 static wqn::runtime::WakeContext wake;
 static std::array<uint8_t, 256> rtc_regs{}, codec_regs{};
 struct Transfer { bool read; uint8_t reg; std::vector<uint8_t> bytes; };

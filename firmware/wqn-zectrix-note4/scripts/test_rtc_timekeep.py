@@ -23,6 +23,7 @@ constexpr int ESP_ERR_INVALID_RESPONSE=264;
 inline const char* esp_err_to_name(int e) { return e ? "FAULT" : "ESP_OK"; }
 ''',
     'esp_attr.h': '#pragma once\n#define RTC_DATA_ATTR\n',
+    'esp_timer.h': '#pragma once\n#include <cstdint>\nint64_t esp_timer_get_time();\n',
     'esp_check.h': '#pragma once\n#include "esp_err.h"\n',
     'esp_log.h': '''#pragma once
 void FixtureLog(const char*, const char*, ...);
@@ -44,6 +45,7 @@ using TickType_t = uint32_t;
 using BaseType_t = int;
 constexpr TickType_t portMAX_DELAY=UINT32_MAX;
 constexpr BaseType_t pdTRUE=1, pdFALSE=0;
+#define configTICK_RATE_HZ FIXTURE_TICK_RATE_HZ
 #define configASSERT(x) do { if (!(x)) std::abort(); } while (0)
 #define pdMS_TO_TICKS(ms) (static_cast<TickType_t>((uint64_t(ms)*FIXTURE_TICK_RATE_HZ)/1000))
 ''',

@@ -1523,8 +1523,8 @@ static void EnterDeepSleepIfEnabled(DeepSleepUiPolicy ui_policy)
         ESP_LOGW(kTag, "RTC time persist skipped; next boot falls back to build-time seeding");
     }
 #endif
-    // [sleep-budget] Arming only waits ~4 ms; it must not inherit the display
-    // budget via the transaction deadline.
+    // [sleep-budget] Wake assembly has its own budget, including tick-phase
+    // allowance for GPIO settling, rather than inheriting the display budget.
     const int64_t wake_arm_deadline_us =
         std::min(command.deadline_us, esp_timer_get_time() + kWakeArmTimeoutUs);
     const power::WakeArmResult wake =

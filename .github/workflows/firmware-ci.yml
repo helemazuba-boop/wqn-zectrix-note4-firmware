@@ -32,6 +32,19 @@ jobs:
       - name: Exercise production RTC, trust, lock and codec register paths (not HIL)
         run: python3 firmware/wqn-zectrix-note4/scripts/test_rtc_timekeep.py
 
+  wake-and-timer:
+    name: Wake deadline, short waits and timer retention
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Exercise production wake and hardware wait contracts (not HIL)
+        run: python3 firmware/wqn-zectrix-note4/scripts/test_wake_deadline.py
+
+      - name: Exercise production timer and RTC-retained state (not HIL)
+        run: python3 firmware/wqn-zectrix-note4/scripts/test_time_retention.py
+
   storage-schema:
     name: Boot storage schema fault characterization
     runs-on: ubuntu-latest
