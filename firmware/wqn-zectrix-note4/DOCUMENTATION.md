@@ -100,7 +100,9 @@ by code, `AGENTS.md`, and the architecture/product references above.
 - `docs/engineering/RELIABILITY_BATCH_04.md` — RTC trust, shared I2C timeout
   repairs, production-source fault regressions, and user-confirmed acceptance.
 - `docs/engineering/RELIABILITY_BATCH_05.md` — wake deadlines, short hardware
-  waits, timer restoration, and the pending device timing checkpoint.
+  waits, timer restoration, and the failed device acceptance record.
+- `docs/engineering/RELIABILITY_BATCH_05_HOTFIX.md` — ADC/UI latency regression
+  evidence, targeted rollback, complete-batch tests, and the response recheck.
 - `docs/engineering/DEAD_CODE_CLEANUP.md` — evidence and scope for firmware
   cleanup decisions.
 - `docs/engineering/SYNC_V3_REPAIR.md` — sync repair findings, host checks, and
