@@ -28,6 +28,7 @@ constexpr char kSessionBackupPath[] = "/storage/nses.bak";
 constexpr char kOutboxPath[] = "/storage/nout.v1";
 constexpr char kOutboxTempPath[] = "/storage/nout.tmp";
 constexpr char kOutboxBackupPath[] = "/storage/nout.bak";
+constexpr char kOutboxRecoveryPath[] = "/storage/nout.rec";
 constexpr char kRejectedOutboxPath[] = "/storage/nrej.v1";
 constexpr char kRejectedOutboxTempPath[] = "/storage/nrej.tmp";
 constexpr char kRejectedOutboxBackupPath[] = "/storage/nrej.bak";
@@ -536,6 +537,10 @@ esp_err_t ScanOutboxFile(const char* path, OutboxScan* scan)
     while (true) {
         OutboxRecord record = {};
         const size_t read = std::fread(&record, 1, sizeof(record), file);
+        if (std::ferror(file)) {
+            std::fclose(file);
+            return ESP_FAIL;
+        }
         if (read == 0 && std::feof(file)) break;
         if (read != sizeof(record)) {
             scan->partial_tail = true;
@@ -614,7 +619,7 @@ esp_err_t ScanOutboxFile(const char* path, OutboxScan* scan)
             return ESP_ERR_INVALID_RESPONSE;
         }
     }
-    std::fclose(file);
+    if (std::fclose(file) != 0) return ESP_FAIL;
     return scan->pending.size() + scan->suspended.size() <=
             wqn::kNoteObservationOutboxCapacity
         ? ESP_OK
@@ -626,6 +631,18 @@ esp_err_t ScanOutbox(OutboxScan* scan)
     if (scan == nullptr) return ESP_ERR_INVALID_ARG;
     esp_err_t primary_result = ScanOutboxFile(kOutboxPath, scan);
     if (primary_result == ESP_OK) return ESP_OK;
+    if (primary_result == ESP_FAIL) return primary_result;
+    // A protected publication may have moved the latest primary aside while
+    // retaining the older, downgrade-readable backup. Prefer that latest copy.
+    OutboxScan recovery;
+    const esp_err_t recovery_result = ScanOutboxFile(kOutboxRecoveryPath, &recovery);
+    if (recovery_result == ESP_OK) {
+        recovery.backup_source = true;
+        *scan = std::move(recovery);
+        ESP_LOGW(kTag, "recovered note outbox from interrupted publication");
+        return ESP_OK;
+    }
+    if (recovery_result == ESP_FAIL) return recovery_result;
     if (!FileExists(kOutboxBackupPath)) {
         if (primary_result == ESP_ERR_NOT_FOUND) {
             *scan = {};
@@ -681,7 +698,11 @@ esp_err_t AppendOutboxRecordTo(const char* path, const OutboxRecord& record)
 
 esp_err_t AppendOutboxRecord(const OutboxRecord& record)
 {
-    return AppendOutboxRecordTo(kOutboxPath, record);
+    const esp_err_t result = AppendOutboxRecordTo(kOutboxPath, record);
+    // Failure can leave a complete record or a short tail on disk. Reload
+    // before the next idempotence check, cursor reconciliation or append.
+    if (result != ESP_OK) g_outbox_cache_loaded = false;
+    return result;
 }
 
 // Bounded rolling forensic journal so a long run of terminal server errors
@@ -755,7 +776,8 @@ esp_err_t AppendRejectedOutboxRecord(const OutboxRecord& record)
 
 esp_err_t CompactOutbox(
     const std::vector<OutboxRecord, wqn::NoteStorePsramAllocator<OutboxRecord>>& pending,
-    bool preserve_backup = false)
+    bool preserve_backup = false,
+    bool primary_authoritative = true)
 {
     FILE* file = std::fopen(kOutboxTempPath, "wb");
     if (file == nullptr) return ESP_FAIL;
@@ -773,14 +795,30 @@ esp_err_t CompactOutbox(
         return ESP_FAIL;
     }
     const bool had_primary = FileExists(kOutboxPath);
+    if (primary_authoritative && had_primary &&
+        std::remove(kOutboxRecoveryPath) != 0 && errno != ENOENT) {
+        std::remove(kOutboxTempPath);
+        return ESP_FAIL;
+    }
     if (preserve_backup) {
-        if (had_primary && std::remove(kOutboxPath) != 0 && errno != ENOENT) {
-            std::remove(kOutboxTempPath);
-            return ESP_FAIL;
+        if (had_primary) {
+            // A normal primary can be newer than the preserved backup. Keep
+            // it recoverable until publication succeeds. A recovery-sourced
+            // scan instead keeps its .rec/.bak and discards only the bad primary.
+            const int result = primary_authoritative
+                ? std::rename(kOutboxPath, kOutboxRecoveryPath)
+                : std::remove(kOutboxPath);
+            if (result != 0) {
+                std::remove(kOutboxTempPath);
+                return ESP_FAIL;
+            }
         }
         if (std::rename(kOutboxTempPath, kOutboxPath) != 0) {
             std::remove(kOutboxTempPath);
             return ESP_FAIL;
+        }
+        if (std::remove(kOutboxRecoveryPath) != 0 && errno != ENOENT) {
+            ESP_LOGW(kTag, "note outbox published; recovery copy cleanup deferred");
         }
         return ESP_OK;
     }
@@ -826,11 +864,12 @@ esp_err_t CompactCachedOutbox(OutboxScan* scan)
             "rebuild note suspend marker");
         rewrite.push_back(marker);
     }
-    ESP_RETURN_ON_ERROR(
-        CompactOutbox(
-            rewrite, scan->backup_source || !scan->suspended.empty()),
-        kTag,
-        "compact cached note outbox");
+    const esp_err_t compacted = CompactOutbox(
+        rewrite, scan->backup_source || !scan->suspended.empty(), !scan->backup_source);
+    if (compacted != ESP_OK) {
+        g_outbox_cache_loaded = false;
+        return compacted;
+    }
     scan->acknowledged.clear();
     scan->total_records = rewrite.size();
     scan->ack_records = 0;
@@ -1071,6 +1110,11 @@ esp_err_t AckObservationTransaction(void* opaque)
     }
     OutboxScan* scan = nullptr;
     ESP_RETURN_ON_ERROR(EnsureOutboxCache(&scan), kTag, "load outbox before note ack");
+    if (scan->partial_tail || scan->backup_source) {
+        ESP_RETURN_ON_ERROR(
+            CheckpointSessionFromOutbox(*scan), kTag, "checkpoint before note marker repair");
+        ESP_RETURN_ON_ERROR(CompactCachedOutbox(scan), kTag, "repair before note marker append");
+    }
     const auto pending = std::find_if(
         scan->pending.begin(), scan->pending.end(),
         [&](const auto& value) { return *context->request_id == value.request_id; });
@@ -1103,6 +1147,11 @@ esp_err_t QuarantineObservationTransaction(void* opaque)
     }
     OutboxScan* scan = nullptr;
     ESP_RETURN_ON_ERROR(EnsureOutboxCache(&scan), kTag, "load outbox before note quarantine");
+    if (scan->partial_tail || scan->backup_source) {
+        ESP_RETURN_ON_ERROR(
+            CheckpointSessionFromOutbox(*scan), kTag, "checkpoint before note marker repair");
+        ESP_RETURN_ON_ERROR(CompactCachedOutbox(scan), kTag, "repair before note marker append");
+    }
     const auto pending = std::find_if(
         scan->pending.begin(), scan->pending.end(),
         [&](const auto& value) { return *context->request_id == value.request_id; });
