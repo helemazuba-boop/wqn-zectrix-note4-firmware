@@ -27,6 +27,7 @@ namespace {
 constexpr char kTag[] = "problem_store";
 constexpr char kOutboxPath[] = "/storage/po_outbox.jsonl";
 constexpr char kOutboxTempPath[] = "/storage/po_outbox.tmp";
+constexpr char kOutboxBackupPath[] = "/storage/po_outbox.bak";
 constexpr char kRejectedPath[] = "/storage/po_rejected.jsonl";
 // Park markers (request_id + reason) for verdicts that must not be retried
 // nor deleted. The payload line stays in po_outbox.jsonl; Peek consults this
@@ -129,7 +130,7 @@ bool DecodeObservationLine(
     *observation = {};
     cJSON* root = wqn::protocol::JsonNestingWithinLimit(
                       line.data(), line.size())
-        ? cJSON_Parse(line.c_str())
+        ? cJSON_ParseWithOpts(line.c_str(), nullptr, true)
         : nullptr;
     if (root == nullptr) return false;
     cJSON* request_id = cJSON_GetObjectItemCaseSensitive(root, "request_id");
@@ -155,56 +156,83 @@ bool DecodeObservationLine(
 }
 
 // Reads every journal line (bounded); malformed lines are dropped so one
-// corrupt record cannot wedge the queue forever.
-esp_err_t ReadOutboxLines(
-    std::vector<std::string>* lines, bool* physically_empty = nullptr)
+// corrupt record cannot wedge the queue forever. Only newline-framed, fully
+// decoded records are eligible for idempotence or a later rewrite.
+esp_err_t RecoverOutboxPublication()
 {
+    struct stat info = {};
+    if (::stat(kOutboxPath, &info) == 0) return ESP_OK;
+    if (errno != ENOENT) return ESP_FAIL;
+    if (::stat(kOutboxBackupPath, &info) != 0) {
+        return errno == ENOENT ? ESP_OK : ESP_FAIL;
+    }
+    g_empty_problem_outbox_known = false;
+    return std::rename(kOutboxBackupPath, kOutboxPath) == 0 ? ESP_OK : ESP_FAIL;
+}
+
+esp_err_t ReadOutboxLines(
+    std::vector<std::string>* lines, bool* physically_empty = nullptr,
+    bool* needs_repair = nullptr)
+{
+    if (lines == nullptr) return ESP_ERR_INVALID_ARG;
     if (physically_empty != nullptr) *physically_empty = false;
+    if (needs_repair != nullptr) *needs_repair = false;
     lines->clear();
+    const esp_err_t recovery = RecoverOutboxPublication();
+    if (recovery != ESP_OK) return recovery;
     FILE* file = std::fopen(kOutboxPath, "rb");
     if (file == nullptr) {
         if (errno == ENOENT && physically_empty != nullptr) *physically_empty = true;
         return errno == ENOENT ? ESP_OK : ESP_FAIL;
     }
-    std::vector<char> buffer(kMaxLineBytes + 2, 0);
-    bool saw_bytes = false;
-    while (std::fgets(buffer.data(), buffer.size(), file) != nullptr) {
+    std::string line;
+    line.reserve(kMaxLineBytes);
+    bool saw_bytes = false, discard_line = false, repair = false;
+    int ch = 0;
+    while ((ch = std::fgetc(file)) != EOF) {
         saw_bytes = true;
-        size_t length = std::strlen(buffer.data());
-        while (length > 0 &&
-               (buffer[length - 1] == '\n' || buffer[length - 1] == '\r')) {
-            --length;
-        }
-        if (length == 0) continue;
-        if (length > kMaxLineBytes) {
-            ESP_LOGW(kTag, "dropping overlong problem outbox line");
+        if (ch != '\n') {
+            if (ch == 0 || line.size() >= kMaxLineBytes) {
+                discard_line = repair = true;
+            } else if (!discard_line) {
+                line.push_back(static_cast<char>(ch));
+            }
             continue;
         }
-        lines->emplace_back(buffer.data(), length);
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (!discard_line && !line.empty()) {
+            wqn::DurableProblemObservation parsed;
+            if (DecodeObservationLine(line, &parsed)) {
+                lines->push_back(line);
+            } else {
+                repair = true;
+            }
+        }
+        line.clear();
+        discard_line = false;
         if (lines->size() > wqn::kProblemObservationOutboxCapacity + 8) {
             std::fclose(file);
             return ESP_ERR_INVALID_SIZE;
         }
     }
+    repair = repair || discard_line || !line.empty();
     const bool read_ok = std::ferror(file) == 0;
     const bool closed = std::fclose(file) == 0;
-    if (read_ok && closed && physically_empty != nullptr) *physically_empty = !saw_bytes;
-    return read_ok && closed ? ESP_OK : ESP_FAIL;
+    if (!read_ok || !closed) return ESP_FAIL;
+    if (physically_empty != nullptr) *physically_empty = !saw_bytes;
+    if (needs_repair != nullptr) *needs_repair = repair;
+    return ESP_OK;
 }
 
 esp_err_t WriteOutboxLines(const std::vector<std::string>& lines)
 {
     g_empty_problem_outbox_known = false;
-    if (lines.empty()) {
-        if (std::remove(kOutboxPath) != 0 && errno != ENOENT) {
-            return ESP_FAIL;
-        }
-        return ESP_OK;
-    }
+    const esp_err_t recovery = RecoverOutboxPublication();
+    if (recovery != ESP_OK) return recovery;
+    // An empty file is a committed empty generation. Removing it would allow
+    // an interrupted cleanup's backup to resurrect already-acknowledged data.
     FILE* file = std::fopen(kOutboxTempPath, "wb");
-    if (file == nullptr) {
-        return ESP_FAIL;
-    }
+    if (file == nullptr) return ESP_FAIL;
     bool ok = true;
     for (const std::string& line : lines) {
         ok = ok && std::fwrite(line.data(), 1, line.size(), file) == line.size() &&
@@ -216,13 +244,29 @@ esp_err_t WriteOutboxLines(const std::vector<std::string>& lines)
         std::remove(kOutboxTempPath);
         return ESP_FAIL;
     }
-    if (std::remove(kOutboxPath) != 0 && errno != ENOENT) {
+    struct stat info = {};
+    const bool had_primary = ::stat(kOutboxPath, &info) == 0;
+    if (!had_primary && errno != ENOENT) {
         std::remove(kOutboxTempPath);
         return ESP_FAIL;
     }
+    if (had_primary) {
+        if (std::remove(kOutboxBackupPath) != 0 && errno != ENOENT) {
+            std::remove(kOutboxTempPath);
+            return ESP_FAIL;
+        }
+        if (std::rename(kOutboxPath, kOutboxBackupPath) != 0) {
+            std::remove(kOutboxTempPath);
+            return ESP_FAIL;
+        }
+    }
     if (std::rename(kOutboxTempPath, kOutboxPath) != 0) {
+        if (had_primary) std::rename(kOutboxBackupPath, kOutboxPath);
         std::remove(kOutboxTempPath);
         return ESP_FAIL;
+    }
+    if (std::remove(kOutboxBackupPath) != 0 && errno != ENOENT) {
+        ESP_LOGW(kTag, "problem outbox published; backup cleanup deferred");
     }
     return ESP_OK;
 }
@@ -367,12 +411,17 @@ esp_err_t CommitTransaction(void* opaque)
     // hide that storage error behind the older successful empty probe.
     g_empty_problem_outbox_known = false;
     std::vector<std::string> lines;
-    esp_err_t result = ReadOutboxLines(&lines);
+    bool needs_repair = false;
+    esp_err_t result = ReadOutboxLines(&lines, nullptr, &needs_repair);
     if (result != ESP_OK) return result;
     for (const std::string& line : lines) {
-        // Idempotent by request_id: a retried commit is already durable.
-        if (line.find(context->observation->request_id) != std::string::npos) {
-            return ESP_OK;
+        wqn::DurableProblemObservation parsed;
+        if (DecodeObservationLine(line, &parsed) &&
+            parsed.request_id == context->observation->request_id) {
+            return parsed.problem_id == context->observation->problem_id &&
+                parsed.action == context->observation->action &&
+                parsed.occurred_at == context->observation->occurred_at
+                ? ESP_OK : ESP_ERR_INVALID_STATE;
         }
     }
     if (lines.size() >= wqn::kProblemObservationOutboxCapacity) {
@@ -381,6 +430,10 @@ esp_err_t CommitTransaction(void* opaque)
     const std::string encoded = EncodeObservationLine(*context->observation);
     if (encoded.empty() || encoded.size() > kMaxLineBytes) {
         return ESP_ERR_INVALID_SIZE;
+    }
+    if (needs_repair) {
+        result = WriteOutboxLines(lines);
+        if (result != ESP_OK) return result;
     }
     FILE* file = std::fopen(kOutboxPath, "ab");
     if (file == nullptr) {
