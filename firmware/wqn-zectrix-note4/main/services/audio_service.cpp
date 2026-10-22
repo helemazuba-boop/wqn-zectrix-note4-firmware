@@ -1527,7 +1527,7 @@ esp_err_t WriteAudioCodecRegister(
             if (result == ESP_OK) {
                 result = i2c_master_transmit(
                     AsCodec(codec), data, sizeof(data),
-                    pdMS_TO_TICKS(100));
+                    100);  // ESP-IDF I2C timeout is milliseconds.
             }
             if (IsRetryableCodecI2cError(result)) {
                 const esp_err_t recovery_result =
@@ -1591,7 +1591,7 @@ esp_err_t ReadAudioCodecRegister(
             if (result == ESP_OK) {
                 result = i2c_master_transmit_receive(
                     AsCodec(codec), &reg, sizeof(reg), value, sizeof(*value),
-                    pdMS_TO_TICKS(100));
+                    100);  // ESP-IDF I2C timeout is milliseconds.
             }
             if (IsRetryableCodecI2cError(result)) {
                 const esp_err_t recovery_result =
