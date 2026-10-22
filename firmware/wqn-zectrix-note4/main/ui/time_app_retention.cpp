@@ -153,8 +153,10 @@ bool RestoreRetainedTimeApp(wqn::TimeAppState* state)
                 ? wqn::TimeTile::kPomodoro
                 : wqn::TimeTile::kCountdown;
         } else {
+            // A backwards wall clock (including build-time fallback after a
+            // failed RTC restore) cannot grant time beyond the saved budget.
             restored.remaining_seconds =
-                static_cast<int>(std::min<int64_t>(remaining, 7200));
+                static_cast<int>(std::min<int64_t>(remaining, retained.remaining_seconds));
         }
     }
     *state = restored;
