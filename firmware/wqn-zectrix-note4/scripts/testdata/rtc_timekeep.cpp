@@ -36,7 +36,13 @@ static bool add_fails, corrupt_read, set_fails, apply_power_fails, recovery_fail
 static int transfer_failure = ESP_ERR_TIMEOUT;
 static time_t now = 1792627200;  // 2026-10-22 00:00:00 UTC.
 static timeval applied{};
-int64_t esp_timer_get_time() { return 1000000; }
+static int64_t monotonic_us = 1000000;
+static int64_t lock_cost_us, transfer_cost_us, verify_log_cost_us;
+static bool failed_write_applies;
+static bool deadline_cases;
+static std::vector<int> timeouts;
+static std::vector<TickType_t> lock_timeouts;
+int64_t esp_timer_get_time() { return monotonic_us; }
 static wqn::runtime::WakeContext wake;
 static std::array<uint8_t, 256> rtc_regs{}, codec_regs{};
 struct Transfer { bool read; uint8_t reg; std::vector<uint8_t> bytes; };
@@ -45,6 +51,9 @@ static std::vector<Transfer> trace;
 void FixtureLog(const char*, const char* fmt, ...)
 {
     if (std::strstr(fmt, "RTC STOP cleanup failed")) ++cleanup_warnings;
+    if (std::strstr(fmt, "PCF8563 time written and verified")) {
+        monotonic_us += verify_log_cost_us;
+    }
 }
 namespace wqn {
 void RecordError(const char*, const char*, ...) { ++errors; }
@@ -70,7 +79,10 @@ SemaphoreHandle_t xSemaphoreCreateRecursiveMutex() { return &mutex; }
 BaseType_t xSemaphoreTakeRecursive(SemaphoreHandle_t value, TickType_t ticks)
 {
     CHECK(value == &mutex);
-    CHECK(ticks == pdMS_TO_TICKS(100));
+    CHECK(ticks <= pdMS_TO_TICKS(100));
+    if (!deadline_cases) CHECK(ticks == pdMS_TO_TICKS(100));
+    lock_timeouts.push_back(ticks);
+    monotonic_us += lock_cost_us;
     ++takes;
     if (fail_take == takes) return pdFALSE;
     ++mutex.depth;
@@ -102,7 +114,10 @@ static std::array<uint8_t, 256>& Registers(i2c_master_dev_handle_t dev)
 }
 static bool BeginTransfer(int milliseconds)
 {
-    CHECK(milliseconds == 100);
+    CHECK(milliseconds > 0 && milliseconds <= 100);
+    if (!deadline_cases) CHECK(milliseconds == 100);
+    timeouts.push_back(milliseconds);
+    monotonic_us += transfer_cost_us;
     CHECK(mutex.depth > 0);
     ++transfers;
     return (failure_mask & (1U << transfers)) == 0;
@@ -114,9 +129,10 @@ esp_err_t i2c_master_transmit(i2c_master_dev_handle_t dev,
     auto& regs = Registers(dev);
     const bool success = BeginTransfer(milliseconds);
     trace.push_back({false, bytes[0], {bytes + 1, bytes + length}});
-    if (!success) return transfer_failure;
-    std::memcpy(regs.data() + bytes[0], bytes + 1, length - 1);
-    return ESP_OK;
+    if (success || failed_write_applies) {
+        std::memcpy(regs.data() + bytes[0], bytes + 1, length - 1);
+    }
+    return success ? ESP_OK : transfer_failure;
 }
 esp_err_t i2c_master_transmit_receive(i2c_master_dev_handle_t dev,
     const uint8_t* reg, size_t write_length, uint8_t* out, size_t length, int milliseconds)
@@ -172,6 +188,11 @@ static void ResetPorts()
     add_fails = corrupt_read = set_fails = apply_power_fails = recovery_fails = false;
     transfer_failure = ESP_ERR_TIMEOUT;
     trace.clear();
+    timeouts.clear();
+    lock_timeouts.clear();
+    monotonic_us = 1000000;
+    lock_cost_us = transfer_cost_us = verify_log_cost_us = 0;
+    failed_write_applies = false;
     applied = {};
     // RTC memory and trust intentionally survive between attempts.
 }
@@ -225,8 +246,9 @@ static void DriverCases()
         failure_mask = 1U << step;
         CHECK(!WriteTime());
         CHECK(takes == 1 && gives == 1);
-        CHECK(transfers == (step == 2 ? 3 : step));
-        if (step == 2) CHECK(rtc_regs[0] == 0 && trace.back().reg == 0);
+        CHECK(transfers == (step < 4 ? step + 1 : step));
+        CHECK(rtc_regs[0] == 0);
+        if (step < 4) CHECK(trace.back().reg == 0);
     }
     ResetPorts();
     failure_mask = (1U << 2) | (1U << 3);
@@ -407,11 +429,101 @@ static void CodecCases()
     }
 }
 
+static void PersistDeadlineCases()
+{
+    using namespace wqn;
+    using namespace wqn::power::timekeep;
+    deadline_cases = true;
+    const auto write = [](int64_t deadline) {
+        return Pcf8563WriteTime(126, 9, 22, 12, 34, 56, 4, deadline);
+    };
+    ResetPorts();
+    // An expired/sub-millisecond budget never starts STOP. Lock admission and
+    // the driver budget use the same absolute time, including late acquisition.
+    CHECK(!write(monotonic_us));
+    CHECK(takes == 0 && transfers == 0);
+    CHECK(!write(monotonic_us - 1));
+    CHECK(takes == 0 && transfers == 0);
+    CHECK(!write(monotonic_us + 500));
+    CHECK(takes == 1 && transfers == 0 && lock_timeouts.back() == 0);
+    ResetPorts(); lock_cost_us = 12000;
+    CHECK(!write(monotonic_us + 5000));
+    CHECK(takes == gives && transfers == 0 && lock_timeouts.back() == pdMS_TO_TICKS(5));
+    ResetPorts(); fail_take = 1;
+    CHECK(!write(monotonic_us + 50000));
+    CHECK(transfers == 0 && gives == 0);
+    CHECK(lock_timeouts.back() == pdMS_TO_TICKS(50));
+
+    ResetPorts(); transfer_cost_us = 30000;
+    CHECK(write(monotonic_us + 125000));
+    CHECK(timeouts == (std::vector<int>{100, 95, 65, 35}));
+    CHECK(transfers == 4 && takes == 1 && gives == 1 && rtc_regs[0] == 0);
+    // Expiry after STOP or burst must release STOP once, using the separate
+    // cleanup allowance. A late successful release needs no duplicate cleanup.
+    for (int window_ms : {25, 60, 65, 90, 100}) {
+        ResetPorts(); transfer_cost_us = 30000;
+        CHECK(!write(monotonic_us + window_ms * 1000));
+        CHECK(takes == 1 && gives == 1 && rtc_regs[0] == 0);
+        if (window_ms == 25) {
+            CHECK(transfers == 2 && timeouts == (std::vector<int>{25, 100}));
+        } else if (window_ms == 60) {
+            CHECK(transfers == 3 && timeouts == (std::vector<int>{60, 30, 100}));
+        } else if (window_ms == 65) {
+            CHECK(transfers == 3 && timeouts == (std::vector<int>{65, 35, 5}));
+        } else if (window_ms == 90) {
+            CHECK(transfers == 3 && timeouts == (std::vector<int>{90, 60, 30}));
+        } else {
+            CHECK(transfers == 4 && timeouts == (std::vector<int>{100, 70, 40, 10}));
+        }
+    }
+    // A timeout is not proof that a write had no device-side effect.
+    for (unsigned step : {1U, 2U, 3U}) {
+        ResetPorts(); failed_write_applies = true; failure_mask = 1U << step;
+        CHECK(!write(monotonic_us + 200000));
+        CHECK(transfers == step + 1 && rtc_regs[0] == 0);
+        CHECK(trace.back().reg == 0 && trace.back().bytes == std::vector<uint8_t>{0});
+    }
+    ResetPorts(); failure_mask = (1U << 1) | (1U << 2); failed_write_applies = true;
+    CHECK(!write(monotonic_us + 200000));
+    CHECK(transfers == 2 && errors == 1 && cleanup_warnings == 1);
+    ResetPorts(); failure_mask = (1U << 3) | (1U << 4);
+    CHECK(!write(monotonic_us + 200000));
+    CHECK(transfers == 4 && errors == 1 && cleanup_warnings == 1);
+
+    // Timekeep must forward the budget, revoke old trust before any early
+    // exit, and reject expiry after the driver's final validation/logging.
+    for (unsigned fault = 0; fault < 4; ++fault) {
+        ResetPorts(); now = 1792627200;
+        CHECK(PersistSystemTimeToRtc(80));
+        ResetPorts();
+        int64_t deadline = monotonic_us;
+        if (fault == 1) { lock_cost_us = 60000; deadline += 50000; }
+        if (fault == 2) { transfer_cost_us = 30000; deadline += 60000; }
+        if (fault == 3) {
+            transfer_cost_us = 30000; verify_log_cost_us = 6000; deadline += 125000;
+        }
+        CHECK(!PersistSystemTimeToRtc(81, deadline));
+        CHECK(transfers == (fault < 2 ? 0 : (fault == 2 ? 3 : 4)));
+        CHECK(takes == gives && rtc_regs[0] == 0);
+        ResetPorts(); Resume(81);
+        CHECK(!RestoreSystemTimeFromRtc() && transfers == 0 && set_calls == 0);
+        Resume(80);
+        CHECK(!RestoreSystemTimeFromRtc() && transfers == 0 && set_calls == 0);
+    }
+    ResetPorts(); now = 1792627200; transfer_cost_us = 30000;
+    CHECK(PersistSystemTimeToRtc(82, monotonic_us + 125000));
+    CHECK(timeouts == (std::vector<int>{100, 95, 65, 35}));
+    ResetPorts(); Resume(82);
+    CHECK(RestoreSystemTimeFromRtc() && applied.tv_sec == 1792627200);
+    deadline_cases = false;
+}
+
 int main()
 {
     DriverCases();
     TimekeepCases();
     CodecCases();
+    PersistDeadlineCases();
     CHECK(mutex.depth == 0 && active_operations == 0);
     std::printf("RTC/timekeep/codec %d Hz: %u checks PASS\n", FIXTURE_TICK_RATE_HZ, checks);
 }
