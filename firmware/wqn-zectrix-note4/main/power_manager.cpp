@@ -1520,10 +1520,10 @@ static void EnterDeepSleepIfEnabled(DeepSleepUiPolicy ui_policy)
 #if CONFIG_WQN_RTC_TIMEKEEP_ENABLE
     // [rtc-timekeep] Persist the wall clock after every service has quiesced
     // (shared I2C bus idle) and before wake-source assembly reprograms the
-    // PCF8563 timer. Deliberately fault-tolerant and non-rollbackable: a
-    // failed write only costs one sleep cycle of clock freshness, and a
-    // rollback that retries the sleep simply overwrites the record.
-    if (!power::timekeep::PersistSystemTimeToRtc(generation)) {
+    // PCF8563 timer. A failed/skipped write revokes restore trust but does not
+    // itself deny sleep; a later retry overwrites the record. Work shares the
+    // prepare deadline, while mandatory STOP cleanup may outlive that budget.
+    if (!power::timekeep::PersistSystemTimeToRtc(generation, command.deadline_us)) {
         ESP_LOGW(kTag, "RTC time persist skipped; next boot falls back to build-time seeding");
     }
 #endif

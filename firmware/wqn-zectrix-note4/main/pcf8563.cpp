@@ -161,7 +161,13 @@ bool Pcf8563ReadTime(int* year, int* month, int* day, int* hour, int* min, int* 
 bool Pcf8563WriteTime(int year, int month, int day, int hour, int min,
                       int sec, int weekday)
 {
-    if (!g_initialized) {
+    return Pcf8563WriteTime(year, month, day, hour, min, sec, weekday, 0);
+}
+
+bool Pcf8563WriteTime(int year, int month, int day, int hour, int min,
+                      int sec, int weekday, int64_t deadline_us)
+{
+    if (!g_initialized || DeadlineExpired(deadline_us)) {
         return false;
     }
     if (year < 100 || year > 199 || month < 0 || month > 11 ||
@@ -190,26 +196,16 @@ bool Pcf8563WriteTime(int year, int month, int day, int hour, int min,
 
     // One bus-lock hold covers STOP -> burst -> release so an audio transaction
     // cannot interleave while the prescaler is halted.
-    ScopedI2cBusLock bus_lock("pcf8563_settime", kI2cLockWaitTicks);
+    ScopedI2cBusLock bus_lock("pcf8563_settime", LockWaitTicks(deadline_us));
     if (!bus_lock.locked()) {
         return false;
     }
 
-    uint8_t stop_on[2] = {kControlStatus1Reg, kStopBit};
-    esp_err_t err = i2c_master_transmit(g_dev, stop_on, sizeof(stop_on),
-                                        kI2cTransferTimeoutMs);
-    if (err != ESP_OK) {
-        ESP_LOGW(kTag, "RTC STOP set failed: %s", esp_err_to_name(err));
-        return false;
-    }
-
-    uint8_t burst[8] = {0x02};
-    std::memcpy(&burst[1], time_regs, sizeof(time_regs));
-    err = i2c_master_transmit(g_dev, burst, sizeof(burst), kI2cTransferTimeoutMs);
-    if (err != ESP_OK) {
-        ESP_LOGW(kTag, "RTC time burst write failed: %s", esp_err_to_name(err));
-        // Best effort: a failed release can still leave the clock stopped.
-        uint8_t stop_off[2] = {kControlStatus1Reg, 0x00};
+    uint8_t stop_off[2] = {kControlStatus1Reg, 0x00};
+    const auto release_after_failure = [&]() {
+        // A failed/late STOP transfer can have reached the chip. Once it was
+        // attempted, do not leave the prescaler stopped just to obey the work
+        // deadline. One cleanup attempt retains the existing 100 ms limit.
         const esp_err_t release_err = i2c_master_transmit(
             g_dev, stop_off, sizeof(stop_off), kI2cTransferTimeoutMs);
         if (release_err != ESP_OK) {
@@ -217,18 +213,44 @@ bool Pcf8563WriteTime(int year, int month, int day, int hour, int min,
             wqn::RecordError("rtc", "STOP cleanup failed: %s", esp_err_to_name(release_err));
         }
         return false;
+    };
+    int timeout_ms = TransferTimeoutMs(deadline_us);
+    if (timeout_ms == 0 || DeadlineExpired(deadline_us)) return false;
+    uint8_t stop_on[2] = {kControlStatus1Reg, kStopBit};
+    esp_err_t err = i2c_master_transmit(g_dev, stop_on, sizeof(stop_on),
+                                        timeout_ms);
+    if (err != ESP_OK) {
+        ESP_LOGW(kTag, "RTC STOP set failed: %s", esp_err_to_name(err));
+        return release_after_failure();
     }
+    if (DeadlineExpired(deadline_us)) return release_after_failure();
 
-    uint8_t stop_off[2] = {kControlStatus1Reg, 0x00};
-    err = i2c_master_transmit(g_dev, stop_off, sizeof(stop_off), kI2cTransferTimeoutMs);
+    uint8_t burst[8] = {0x02};
+    std::memcpy(&burst[1], time_regs, sizeof(time_regs));
+    timeout_ms = TransferTimeoutMs(deadline_us);
+    if (timeout_ms == 0 || DeadlineExpired(deadline_us)) return release_after_failure();
+    err = i2c_master_transmit(g_dev, burst, sizeof(burst), timeout_ms);
+    if (err != ESP_OK) {
+        ESP_LOGW(kTag, "RTC time burst write failed: %s", esp_err_to_name(err));
+        return release_after_failure();
+    }
+    if (DeadlineExpired(deadline_us)) return release_after_failure();
+
+    timeout_ms = TransferTimeoutMs(deadline_us);
+    if (timeout_ms == 0 || DeadlineExpired(deadline_us)) return release_after_failure();
+    err = i2c_master_transmit(g_dev, stop_off, sizeof(stop_off), timeout_ms);
     if (err != ESP_OK) {
         ESP_LOGW(kTag, "RTC STOP release failed: %s", esp_err_to_name(err));
-        return false;
+        return release_after_failure();
     }
+    if (DeadlineExpired(deadline_us)) return false;
 
     uint8_t readback[7] = {};
+    timeout_ms = TransferTimeoutMs(deadline_us);
+    if (timeout_ms == 0 || DeadlineExpired(deadline_us)) return false;
     err = i2c_master_transmit_receive(g_dev, &burst[0], 1, readback,
-                                      sizeof(readback), kI2cTransferTimeoutMs);
+                                      sizeof(readback), timeout_ms);
+    if (DeadlineExpired(deadline_us)) return false;
     if (err != ESP_OK || std::memcmp(readback, time_regs, sizeof(time_regs)) != 0) {
         ESP_LOGW(kTag, "RTC write verify failed: err=%s regs=%02x%02x%02x%02x%02x%02x%02x",
                  esp_err_to_name(err),

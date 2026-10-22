@@ -10,6 +10,7 @@
 
 #include "esp_attr.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "pcf8563.h"
 #include "runtime/wake_context.h"
 
@@ -150,9 +151,17 @@ bool UnixSecondsFromCalendar(const RtcCalendar& calendar, int64_t* seconds_out)
 
 bool PersistSystemTimeToRtc(uint32_t sleep_generation)
 {
+    return PersistSystemTimeToRtc(sleep_generation, 0);
+}
+
+bool PersistSystemTimeToRtc(uint32_t sleep_generation, int64_t deadline_us)
+{
     // A skipped or failed write must not lend the previous sleep's trust to
     // this attempt, including failures before touching the RTC registers.
     g_trust_record = {};
+    if (deadline_us > 0 && esp_timer_get_time() >= deadline_us) {
+        return false;
+    }
     const std::time_t now = std::time(nullptr);
     if (now < kMinReasonableUnixTime) {
         ESP_LOGW(kTag, "system clock unreasonable (%lld); skip RTC persist",
@@ -166,7 +175,10 @@ bool PersistSystemTimeToRtc(uint32_t sleep_generation)
     }
     if (!Pcf8563WriteTime(calendar.year, calendar.month, calendar.day,
                           calendar.hour, calendar.min, calendar.sec,
-                          calendar.weekday)) {
+                          calendar.weekday, deadline_us)) {
+        return false;
+    }
+    if (deadline_us > 0 && esp_timer_get_time() >= deadline_us) {
         return false;
     }
     TimekeepTrustRecord record = {};

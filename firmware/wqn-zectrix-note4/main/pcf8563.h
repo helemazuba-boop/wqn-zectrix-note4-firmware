@@ -21,6 +21,12 @@ bool Pcf8563ReadTime(int* year, int* month, int* day, int* hour, int* min, int* 
 // interleave between STOP and the time registers.
 bool Pcf8563WriteTime(int year, int month, int day, int hour, int min,
                       int sec, int weekday);
+// The sleep transaction passes its absolute esp_timer deadline. Work stops
+// at expiry and late success is rejected. Once STOP may have been written,
+// one best-effort STOP release can use a separate 100 ms driver timeout;
+// cleanup and SDK internals are not covered by a hard completion deadline.
+bool Pcf8563WriteTime(int year, int month, int day, int hour, int min,
+                      int sec, int weekday, int64_t deadline_us);
 
 bool Pcf8563ConfigureTimerWake(uint8_t seconds);
 // Positive absolute esp_timer deadlines cover all register steps and shared
