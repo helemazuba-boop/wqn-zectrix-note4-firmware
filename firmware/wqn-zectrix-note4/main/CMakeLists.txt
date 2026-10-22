@@ -22,6 +22,7 @@ idf_component_register(
         "provision_manager.cpp"
         "runtime/storage_schema.cpp"
         "runtime/memory_diagnostics.cpp"
+        "runtime/wall_clock.cpp"
         "services/connectivity_service.cpp"
         "services/audio_service.cpp"
         "services/storage_service.cpp"
