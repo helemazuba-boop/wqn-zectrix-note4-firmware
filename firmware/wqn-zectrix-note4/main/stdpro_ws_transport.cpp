@@ -302,7 +302,7 @@ void DoDestroyWs()
     g_is_connected.store(false, std::memory_order_release);
     g_session_ready.store(false, std::memory_order_release);
     g_control_reassembly_buf.clear();
-    g_sse_parser.clear();
+    g_sse_parser.reset();
 
     if (g_active_conn_op_gen != 0) {
         PublishCompletion(g_active_conn_op_gen, ESP_FAIL, CmdDisposition::kCancelled);
@@ -545,15 +545,23 @@ void ProcessTextStream()
           ESP_LOGE(kTag,
                    "SSE frame overflow (>%u bytes) — fatal stream loss",
                    static_cast<unsigned>(wqn::kMaxSseFrameBytes));
-          xTaskNotify(g_transport_task, kEvtBitResetRequired, eSetBits);
-          continue;
+          TeardownFailedTurn();
+          return;
         }
         std::string ev_name;
         uint64_t ev_id = 0;
         std::string ev_data;
 
-        while (g_sse_parser.extract(&ev_name, &ev_id, &ev_data) ==
-               wqn::SseFrameBuffer::FrameState::kComplete) {
+        while (true) {
+            const auto frame = g_sse_parser.extract(&ev_name, &ev_id, &ev_data);
+            if (g_sse_parser.overflowed()) {
+                ESP_LOGE(kTag, "SSE accumulated frame overflow — fatal stream loss");
+                TeardownFailedTurn();
+                return;
+            }
+            if (frame != wqn::SseFrameBuffer::FrameState::kComplete) {
+                break;
+            }
             if (ev_data.empty()) {
                 continue;
             }
@@ -805,7 +813,7 @@ void ExecuteCtrlCmdSingleStep(const CtrlCmd& cmd)
             g_turn_state.store(TurnState::kRecording,
                                std::memory_order_release);
             g_prefinal_pcm_lost.store(false, std::memory_order_release);
-            g_sse_parser.clear();
+            g_sse_parser.reset();
 
             PublishCompletion(cmd.gen, ESP_OK, CmdDisposition::kExecuted);
             break;

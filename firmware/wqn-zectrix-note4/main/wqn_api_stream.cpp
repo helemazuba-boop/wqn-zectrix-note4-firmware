@@ -5,12 +5,13 @@
 //     X-WQN-* headers shared with the cloud route's validated contract.
 //   * The event handler drives an SSE frame parser that calls back into the
 //     caller's WqnAiSseCallback on every complete frame.
-//   * We tolerate mid-stream disconnects: a partial frame is discarded and
-//     ESP_FAIL is returned after the 10 minute outer timeout.
+//   * One monotonic budget covers upload, headers and streaming. A disconnect
+//     before final/error fails the request; it is never automatically replayed.
 //
 #include "wqn_api.h"
 
 #include <algorithm>
+#include <climits>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -24,6 +25,7 @@
 #include "esp_http_client.h"
 #include "esp_log.h"
 #include "esp_mac.h"
+#include "esp_timer.h"
 #include "sse_chunk.h"
 #include "storage.h"
 #include "wqn_api_stream_internal.h"
@@ -44,6 +46,9 @@ struct StreamContext {
   std::string error_message;
   uint64_t last_event_id = 0;
   bool terminal_event_seen = false;
+  int64_t deadline_us = 0;
+  bool timed_out = false;
+  bool close_requested = false;
 };
 
 std::string BuildMacAddress()
@@ -154,11 +159,52 @@ void DispatchEvent(StreamContext* ctx, const wqn::SseFrameBuffer& /*frame*/,
   ctx->request.callback(ev, ctx->request.user_ctx);
 }
 
-esp_err_t WriteRequestBody(esp_http_client_handle_t client,
+bool CheckDeadline(StreamContext* ctx)
+{
+  if (ctx->terminal_event_seen || ctx->fatal) {
+    return !ctx->timed_out;
+  }
+  if (ctx->deadline_us - esp_timer_get_time() < 1000) {
+    ctx->fatal = true;
+    ctx->timed_out = true;
+    ctx->error_code = "chat_timeout";
+    ctx->error_message = "stream request deadline exceeded";
+    return false;
+  }
+  return true;
+}
+
+bool ApplyRemainingTimeout(StreamContext* ctx, esp_http_client_handle_t client)
+{
+  if (!CheckDeadline(ctx)) {
+    return false;
+  }
+  const int64_t remaining_ms = (ctx->deadline_us - esp_timer_get_time()) / 1000;
+  if (remaining_ms <= 0) {
+    CheckDeadline(ctx);
+    return false;
+  }
+  return esp_http_client_set_timeout_ms(client, static_cast<int>(remaining_ms)) == ESP_OK;
+}
+
+void CloseStream(StreamContext* ctx, esp_http_client_handle_t client)
+{
+  if (!ctx->close_requested) {
+    ctx->close_requested = true;  // close dispatches DISCONNECTED synchronously
+    // The HTTP owner closes the transport, keeping the parser/context alive
+    // until the SDK read returns. cleanup() belongs exclusively to the caller.
+    esp_http_client_close(client);
+  }
+}
+
+esp_err_t WriteRequestBody(StreamContext* ctx, esp_http_client_handle_t client,
                            const uint8_t* body, size_t body_size)
 {
   size_t written = 0;
   while (written < body_size) {
+    if (!ApplyRemainingTimeout(ctx, client)) {
+      return ESP_FAIL;
+    }
     const size_t chunk = std::min<size_t>(body_size - written, 2048);
     const int w = esp_http_client_write(
         client, reinterpret_cast<const char*>(body + written), chunk);
@@ -170,8 +216,8 @@ esp_err_t WriteRequestBody(esp_http_client_handle_t client,
   return ESP_OK;
 }
 
-// Sole authoritative capture point for the response status. It must be called
-// only after esp_http_client_fetch_headers() returns.
+// Capture after headers complete: ON_DATA may run inside fetch_headers(), so
+// capture there too, before any body is dispatched to the business callback.
 //
 // Capturing from HTTP_EVENT_ON_HEADER cannot work: in IDF v5.5 the status code
 // is assigned in http_on_headers_complete (esp_http_client.c:289), i.e. *after*
@@ -193,7 +239,7 @@ void CaptureHttpStatus(StreamContext* ctx, esp_http_client_handle_t client)
   }
   ctx->http_status = status;
   ESP_LOGI(kTag, "HTTP status=%d", status);
-  if (status >= 400) {
+  if (status >= 400 && !ctx->fatal) {
     ctx->fatal = true;
     ctx->error_code = wqn::internal::AiStreamHttpErrorCode(status);
   }
@@ -211,12 +257,16 @@ esp_err_t OnHttpEvent(esp_http_client_event_t* evt)
       // ESP-IDF v5.4+ removed HTTP_EVENT_HEADERS_RECEIVED in favour of
       // HTTP_EVENT_ON_HEADER, which fires once per header line. The status
       // code is deliberately not read here: it is still -1 at every ON_HEADER
-      // (see CaptureHttpStatus). Fall through unchanged.
+      // (see CaptureHttpStatus). Clamp the next SDK wait to the same budget.
+      if (!ApplyRemainingTimeout(ctx, evt->client)) {
+        CloseStream(ctx, evt->client);
+      }
       break;
     }
     case HTTP_EVENT_ON_DATA: {
-      if (ctx->fatal) {
-        // discard the body of an error response; we'll surface the code shortly
+      CaptureHttpStatus(ctx, evt->client);
+      if (!CheckDeadline(ctx) || ctx->fatal || ctx->terminal_event_seen) {
+        CloseStream(ctx, evt->client);
         return ESP_OK;
       }
       if (!ctx->parser.feed(static_cast<const char*>(evt->data), evt->data_len)) {
@@ -227,22 +277,37 @@ esp_err_t OnHttpEvent(esp_http_client_event_t* evt)
           ctx->error_code = "frame_overflow";
           ctx->error_message = "stream frame exceeded the device limit";
         }
+        CloseStream(ctx, evt->client);
         return ESP_OK;
       }
       std::string ev_name;
       uint64_t ev_id = 0;
       std::string ev_data;
-      while (ctx->parser.extract(&ev_name, &ev_id, &ev_data) ==
-             wqn::SseFrameBuffer::FrameState::kComplete) {
+      while (CheckDeadline(ctx)) {
+        const auto frame = ctx->parser.extract(&ev_name, &ev_id, &ev_data);
+        if (ctx->parser.overflowed()) {
+          ctx->fatal = true;
+          ctx->error_code = "frame_overflow";
+          ctx->error_message = "stream frame exceeded the device limit";
+          break;
+        }
+        if (frame != wqn::SseFrameBuffer::FrameState::kComplete) {
+          break;
+        }
         if (!ev_data.empty()) {
           DispatchEvent(ctx, ctx->parser, ev_name, ev_id, ev_data);
         }
+        if (ctx->terminal_event_seen) {
+          break;
+        }
+      }
+      if (ctx->fatal || ctx->terminal_event_seen || !ApplyRemainingTimeout(ctx, evt->client)) {
+        CloseStream(ctx, evt->client);
       }
       break;
     }
     case HTTP_EVENT_ON_FINISH: {
-      // flush a partial frame so the user callback sees `final` if it was the last
-      // partial chunk of the stream.
+      // Unterminated frames are never delivered as completed business events.
       break;
     }
     case HTTP_EVENT_DISCONNECTED: {
@@ -306,10 +371,12 @@ esp_err_t UploadAiAudioChatStream(const WqnAiStreamRequest& request,
     return ESP_ERR_INVALID_STATE;
   }
   if (request.pcm_data == nullptr || request.pcm_sample_count == 0 ||
-      request.duration_ms <= 0) {
+      request.duration_ms <= 0 || request.pcm_sample_count > INT_MAX / sizeof(int16_t)) {
     return ESP_ERR_INVALID_ARG;
   }
 
+  const int timeout_ms = request.timeout_ms > 0 ? request.timeout_ms : WQN_AI_SSE_TIMEOUT_MS;
+  const int64_t deadline_us = esp_timer_get_time() + static_cast<int64_t>(timeout_ms) * 1000;
   const uint8_t* pcm_bytes =
       reinterpret_cast<const uint8_t*>(request.pcm_data);
   const size_t pcm_size = request.pcm_sample_count * sizeof(int16_t);
@@ -322,11 +389,12 @@ esp_err_t UploadAiAudioChatStream(const WqnAiStreamRequest& request,
   ctx.request = request;
   ctx.response = response;
   ctx.mac = BuildMacAddress();
+  ctx.deadline_us = deadline_us;
 
   esp_http_client_config_t cfg = {};
   cfg.url = url.c_str();
   cfg.method = HTTP_METHOD_POST;
-  cfg.timeout_ms = request.timeout_ms > 0 ? request.timeout_ms : WQN_AI_SSE_TIMEOUT_MS;
+  cfg.timeout_ms = timeout_ms;
   cfg.crt_bundle_attach = esp_crt_bundle_attach;
   cfg.buffer_size = 1024;                  // SSE lines are short; keep the buffer small
   cfg.buffer_size_tx = 4096;
@@ -371,12 +439,13 @@ esp_err_t UploadAiAudioChatStream(const WqnAiStreamRequest& request,
         client, "X-WQN-Reasoning-Effort", request.reasoning_effort.c_str());
   }
 
-  esp_err_t err = esp_http_client_open(client, pcm_size);
+  esp_err_t err = ApplyRemainingTimeout(&ctx, client)
+                      ? esp_http_client_open(client, static_cast<int>(pcm_size)) : ESP_FAIL;
   if (err == ESP_OK) {
-    err = WriteRequestBody(client, pcm_bytes, pcm_size);
+    err = WriteRequestBody(&ctx, client, pcm_bytes, pcm_size);
   }
 
-  if (err == ESP_OK) {
+  if (err == ESP_OK && ApplyRemainingTimeout(&ctx, client)) {
     // fetch_headers returns the response Content-Length (0 for a chunked SSE
     // response), not esp_err_t. Treat every non-negative value as success so a
     // buffered/non-chunked SSE response is still consumed.
@@ -393,10 +462,9 @@ esp_err_t UploadAiAudioChatStream(const WqnAiStreamRequest& request,
       err = ESP_FAIL;
     }
   }
-  if (err == ESP_OK) {
-    // Pull the chunked stream until close.
+  if (err == ESP_OK && !ctx.fatal && !ctx.terminal_event_seen) {
     char buf[1024];
-    while (true) {
+    while (!ctx.fatal && !ctx.terminal_event_seen && ApplyRemainingTimeout(&ctx, client)) {
       const int r = esp_http_client_read(client, buf, sizeof(buf));
       if (r < 0) {
         err = ESP_FAIL;
@@ -408,7 +476,20 @@ esp_err_t UploadAiAudioChatStream(const WqnAiStreamRequest& request,
     }
   }
 
-  esp_http_client_close(client);
+  if (!ctx.fatal && !ctx.terminal_event_seen) {
+    CheckDeadline(&ctx);
+    if (!ctx.fatal) {
+      ctx.fatal = true;
+      if (ctx.error_code.empty()) {
+        ctx.error_code = "model_failed";
+        ctx.error_message = "stream ended before completion";
+      }
+    }
+  }
+  if (ctx.terminal_event_seen && !ctx.fatal) {
+    err = ESP_OK;  // intentional close may make the SDK read return an error
+  }
+  CloseStream(&ctx, client);
   esp_http_client_cleanup(client);
 
   // Populate caller-facing response fields.
@@ -420,7 +501,7 @@ esp_err_t UploadAiAudioChatStream(const WqnAiStreamRequest& request,
   // The user callback may have already gotten a `final` event. Either way,
   // return ESP_OK when the stream completed; transport-level failures map to
   // ESP_FAIL and surface via `response->error_*` fields.
-  return internal::FinalizeAiStreamResult(ctx.fatal, err);
+  return ctx.timed_out ? ESP_ERR_TIMEOUT : internal::FinalizeAiStreamResult(ctx.fatal, err);
 }
 
 }  // namespace wqn
