@@ -1,8 +1,9 @@
 #include "power/rtc_timekeep.h"
 
-#include <cstddef>
 #include <cerrno>
+#include <cstddef>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <sys/time.h>

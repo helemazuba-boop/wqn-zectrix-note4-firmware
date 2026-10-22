@@ -22,6 +22,16 @@ jobs:
       - name: Exercise production I2S boundary and caller units
         run: python3 firmware/wqn-zectrix-note4/scripts/test_audio_channel_timeout.py
 
+  rtc-timekeep:
+    name: RTC and shared I2C fault contracts (100/1000 Hz)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Exercise production RTC, trust, lock and codec register paths (not HIL)
+        run: python3 firmware/wqn-zectrix-note4/scripts/test_rtc_timekeep.py
+
   storage-schema:
     name: Boot storage schema fault characterization
     runs-on: ubuntu-latest
