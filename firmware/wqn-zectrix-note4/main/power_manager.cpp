@@ -33,6 +33,7 @@
 #include "runtime/sleep_diagnostics.h"
 #include "runtime/sleep_snapshot.h"
 #include "runtime/wake_context.h"
+#include "runtime/task_delay.h"
 #include "sdkconfig.h"
 #include "storage.h"
 #include "wifi_manager.h"
@@ -815,7 +816,7 @@ bool ReadPowerStatus(PowerStatusSnapshot* snapshot)
         sum_mv += mv;
         ++valid_samples;
 
-        vTaskDelay(pdMS_TO_TICKS(1));
+        runtime::DelayAtLeastMs<1>();
     }
 
     if (valid_samples == 0) {
