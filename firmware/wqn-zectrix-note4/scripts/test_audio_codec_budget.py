@@ -22,7 +22,7 @@ def main():
     parser.add_argument('--happy-only', action='store_true')
     parser.add_argument('--mutation', choices=('infinite-locks', 'renew-register-budget',
         'skip-cleanup', 'accept-late-cache', 'skip-session-guard', 'hold-backoff',
-        'retry-after-cleanup-error'))
+        'retry-after-cleanup-error', 'deny-admitted-cleanup'))
     args = parser.parse_args()
     source = (args.source or root / 'main/services/audio_service.cpp').read_text()
     if args.mutation == 'infinite-locks':
@@ -52,6 +52,9 @@ def main():
                 result = remove_result;
             } else if (remove_result != ESP_OK) {
                 ESP_LOGE(kTag,''')
+    elif args.mutation == 'deny-admitted-cleanup':
+        source = replace_once(source, 'RemoveAudioCodecInternal(session, &codec, true);',
+                               'RemoveAudioCodecInternal(session, &codec, false);')
 
     constants = []
     wanted = {'kCallTimeoutUs', 'kEs8311Address', 'kCodecI2cClockHz', 'kCodecI2cMaxAttempts',
@@ -69,12 +72,19 @@ def main():
     for name in ('AddAudioCodecBefore', 'WriteAudioCodecRegisterBefore', 'ReadAudioCodecRegisterBefore'):
         if f'esp_err_t {name}(' in source:
             internals.append(function(source, f'esp_err_t {name}('))
+    if 'esp_err_t RemoveAudioCodecInternal(' in source:
+        internals.append(function(source, 'esp_err_t RemoveAudioCodecInternal('))
     internals.append(function(source, 'esp_err_t RunEs8311RegisterProgram('))
     public = '\n'.join(function(source, f'esp_err_t {name}(') for name in
         ('AddAudioCodec', 'RemoveAudioCodec', 'WriteAudioCodecRegister',
          'ReadAudioCodecRegister', 'ConfigureAudioCodec'))
     fixture = (root / 'scripts/testdata/audio_codec_budget.cpp').read_text()
+    close_helpers = '\n'.join(function(source, f'{ret} {name}(') for ret, name in
+        [('esp_err_t', 'BeginCloseResource'), ('esp_err_t', 'WaitForResourceDrain'),
+         ('void', 'FinishCloseResource')])
     for marker, body in {'@@CONSTANTS@@': '\n'.join(constants),
+        '@@RESOURCE_SLOT@@': function(source, 'struct ResourceSlot {') + ';',
+        '@@CLOSE_HELPERS@@': close_helpers,
         '@@RETRYABLE@@': function(source, 'bool IsRetryableCodecI2cError('),
         '@@INTERNALS@@': '\n'.join(internals), '@@PUBLIC@@': public}.items():
         if fixture.count(marker) != 1:
@@ -107,6 +117,8 @@ esp_err_t i2c_master_bus_reset(void*);
         for hz in (100, 1000):
             binary = directory / f'codec-{hz}'
             flags = ['-DFIXTURE_HAPPY_ONLY'] if args.happy_only else []
+            if 'bool previously_admitted' in source:
+                flags.append('-DFIXTURE_ADMITTED_CLOSE')
             subprocess.run([compiler, '-std=c++17', '-Wall', '-Wextra', '-Werror',
                 '-fsanitize=address,undefined', '-fno-omit-frame-pointer',
                 f'-DFIXTURE_TICK_RATE_HZ={hz}', *flags, '-I', str(directory),

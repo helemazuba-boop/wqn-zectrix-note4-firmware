@@ -439,14 +439,18 @@ esp_err_t BeginCloseResource(
     size_t count,
     const wqn::services::AudioSession& session,
     void* handle,
-    ResourceSlot** closing_slot)
+    ResourceSlot** closing_slot,
+    bool previously_admitted = false)
 {
     if (handle == nullptr || closing_slot == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
     *closing_slot = nullptr;
     taskENTER_CRITICAL(&g_resource_lock);
-    if (g_accept_operations.load(std::memory_order_acquire) &&
+    // A complete codec configuration holds an admitted DriverOperation while
+    // the coordinator drains it. Its private handle must still be removable
+    // after new operations have been denied; session/slot ownership stays required.
+    if ((previously_admitted || g_accept_operations.load(std::memory_order_acquire)) &&
         SessionMatches(session)) {
         for (size_t i = 0; i < count; ++i) {
             if (slots[i].handle == handle &&
@@ -1221,6 +1225,31 @@ esp_err_t ReadAudioCodecRegisterBefore(
     return result;
 }
 
+esp_err_t RemoveAudioCodecInternal(
+    const wqn::services::AudioSession& session,
+    wqn::services::AudioCodecHandle* codec,
+    bool previously_admitted)
+{
+    if (codec == nullptr || *codec == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    ResourceSlot* slot = nullptr;
+    ESP_RETURN_ON_ERROR(
+        BeginCloseResource(
+            g_codec_slots, kMaxCodecHandles, session, *codec, &slot, previously_admitted),
+        kTag, "begin codec removal");
+    esp_err_t result = WaitForResourceDrain(
+        slot, esp_timer_get_time() + kCallTimeoutUs);
+    if (result == ESP_OK) {
+        result = i2c_master_bus_rm_device(AsCodec(*codec));
+    }
+    FinishCloseResource(slot, result == ESP_OK);
+    if (result == ESP_OK) {
+        *codec = nullptr;
+    }
+    return result;
+}
+
 esp_err_t RunEs8311RegisterProgram(
     const wqn::services::AudioSession& session,
     wqn::services::AudioCodecHandle codec,
@@ -1644,24 +1673,7 @@ esp_err_t AddAudioCodec(
 esp_err_t RemoveAudioCodec(
     const AudioSession& session, AudioCodecHandle* codec)
 {
-    if (codec == nullptr || *codec == nullptr) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    ResourceSlot* slot = nullptr;
-    ESP_RETURN_ON_ERROR(
-        BeginCloseResource(
-            g_codec_slots, kMaxCodecHandles, session, *codec, &slot),
-        kTag, "begin codec removal");
-    esp_err_t result = WaitForResourceDrain(
-        slot, esp_timer_get_time() + kCallTimeoutUs);
-    if (result == ESP_OK) {
-        result = i2c_master_bus_rm_device(AsCodec(*codec));
-    }
-    FinishCloseResource(slot, result == ESP_OK);
-    if (result == ESP_OK) {
-        *codec = nullptr;
-    }
-    return result;
+    return RemoveAudioCodecInternal(session, codec, false);
 }
 
 esp_err_t WriteAudioCodecRegister(
@@ -1744,7 +1756,7 @@ esp_err_t ConfigureAudioCodec(
         }
         if (codec != nullptr) {
             const esp_err_t remove_result =
-                RemoveAudioCodec(session, &codec);
+                RemoveAudioCodecInternal(session, &codec, true);
             if (remove_result != ESP_OK) {
                 ESP_LOGE(kTag,
                          "ES8311 cleanup failed; program retry stopped: session=%lu result=%s (%d)",
@@ -1757,6 +1769,7 @@ esp_err_t ConfigureAudioCodec(
         // Removal is mandatory even after the operation budget expires.
         // It must finish before this private handle leaves scope.
         if (budget.expired()) return ESP_ERR_TIMEOUT;
+        if (!g_accept_operations.load(std::memory_order_acquire)) return ESP_ERR_INVALID_STATE;
         if (result == ESP_OK) {
             g_codec_configuration_profile.store(
                 profile, std::memory_order_relaxed);

@@ -86,6 +86,8 @@ esp_err_t RecoverAudioCodec(const AudioSession& session);
 // Cold configuration shares one 5 s admission budget across probe, register
 // retries and program retries. Late completion fails; private-handle cleanup
 // still runs. This does not bound SDK internals or cleanup as a hard WCET.
+// Already-admitted configuration can close its own handle while new driver
+// operations are being denied by session drain; public removal stays gated.
 esp_err_t ConfigureAudioCodec(
     const AudioSession& session,
     AudioCodecProfile profile,

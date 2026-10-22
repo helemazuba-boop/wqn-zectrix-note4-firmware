@@ -20,7 +20,7 @@ static unsigned checks;
 static int64_t clock_us=1000000, expected_deadline;
 static int64_t io_cost=100, lock_cost, reset_cost, remove_cost;
 static unsigned active_ops, probes, adds, removes, resets, transfers, takes, gives, denials;
-static unsigned fail_at, late_at, failures_each_register;
+static unsigned fail_at, late_at, failures_each_register, close_admission_at;
 static bool fail_all, fail_attach, late_probe, remove_fails, registry_fails, standalone;
 static bool deny_locks;
 static int bus_token, device_token;
@@ -30,8 +30,12 @@ static void HashIo(uint8_t byte) { io_hash=(io_hash^byte)*16777619U; }
 static std::vector<uint8_t> write_order;
 struct FixtureMutex { unsigned depth=0; };
 static FixtureMutex mutex;
-struct ResourceSlot { void* handle=nullptr; bool closing=false; };
+@@RESOURCE_SLOT@@
 static ResourceSlot g_codec_slots[2];
+static int g_resource_lock;
+static std::atomic<uint32_t> g_inflight_operations{0};
+#define taskENTER_CRITICAL(p) ((void)(p))
+#define taskEXIT_CRITICAL(p) ((void)(p))
 static std::atomic<bool> g_codec_powered{true}, g_codec_configuration_valid{false};
 static std::atomic<int> g_codec_configuration_volume{-1};
 static std::atomic<wqn::services::AudioCodecProfile> g_codec_configuration_profile{wqn::services::AudioCodecProfile::kCapture};
@@ -39,6 +43,7 @@ static std::atomic<bool> g_accept_operations{true};
 static std::atomic<wqn::services::AudioState> g_state{wqn::services::AudioState::kCapturing};
 static uint32_t valid_session=1;
 constexpr char kTag[]="codec-host";
+#define ESP_RETURN_ON_ERROR(expr,...) do { auto result_=(expr); if(result_!=ESP_OK)return result_; } while(0)
 constexpr int kI2cSda=47, kI2cScl=48;
 @@CONSTANTS@@
 using wqn::services::detail::CodecDeadline;
@@ -109,6 +114,7 @@ esp_err_t i2c_master_bus_reset(void* bus)
 static bool DoTransfer(void* dev,int ms)
 {
     CHECK(dev==&device_token); TransferBudget(ms); ++transfers; clock_us+=io_cost;
+    if(transfers==close_admission_at)g_accept_operations=false;
     if(transfers==late_at)clock_us=expected_deadline;
     return !fail_all && transfers!=fail_at &&
         !(failures_each_register && transfers%10<=failures_each_register && transfers%10!=0);
@@ -131,11 +137,12 @@ public:
     enum class Kind { kSession, kCodec };
     DriverOperation(const wqn::services::AudioSession& s,Kind kind=Kind::kSession,void* dev=nullptr)
       : ok_(s.id==valid_session && s.id!=0 && g_accept_operations.load() &&
-           (kind!=Kind::kCodec || (dev==&device_token && g_codec_slots[0].handle==dev && !g_codec_slots[0].closing)))
-    { if(ok_)++active_ops; }
-    ~DriverOperation() { if(ok_)--active_ops; }
+           (kind!=Kind::kCodec || (dev==&device_token && g_codec_slots[0].handle==dev &&
+             g_codec_slots[0].owner_session_id==s.id && !g_codec_slots[0].closing)))
+    { if(ok_) { ++active_ops; if(kind==Kind::kCodec)slot_=&g_codec_slots[0]; if(slot_)++slot_->inflight; } }
+    ~DriverOperation() { if(ok_) { --active_ops; if(slot_)--slot_->inflight; } }
     explicit operator bool()const { return ok_; }
-private: bool ok_;
+private: bool ok_; ResourceSlot* slot_=nullptr;
 };
 void* AsBus(void* b) { return b; }
 void* AsCodec(void* d) { return d; }
@@ -144,20 +151,13 @@ esp_err_t ApplyCodecPower(bool on) { CHECK(on); return ESP_OK; }
 esp_err_t RegisterResource(ResourceSlot*,size_t,const wqn::services::AudioSession&,void* dev)
 {
     if(registry_fails)return ESP_FAIL;
-    CHECK(g_codec_slots[0].handle==nullptr);g_codec_slots[0].handle=dev;return ESP_OK;
+    CHECK(g_codec_slots[0].handle==nullptr);g_codec_slots[0].handle=dev;
+    g_codec_slots[0].owner_session_id=valid_session;return ESP_OK;
 }
-esp_err_t BeginCloseResource(ResourceSlot*,size_t,const wqn::services::AudioSession&,void* dev,ResourceSlot** out)
-{
-    CHECK(dev==g_codec_slots[0].handle);*out=&g_codec_slots[0];(*out)->closing=true;return ESP_OK;
-}
-esp_err_t WaitForResourceDrain(ResourceSlot*,int64_t) { return ESP_OK; }
-void FinishCloseResource(ResourceSlot* slot,bool removed)
-{
-    if(removed)*slot={};else slot->closing=false;
-}
+bool SessionMatches(const wqn::services::AudioSession& session) { return session.id==valid_session; }
+@@CLOSE_HELPERS@@
 @@INTERNALS@@
 }
-#define ESP_RETURN_ON_ERROR(expr,...) do { auto result_=(expr); if(result_!=ESP_OK)return result_; } while(0)
 namespace wqn::services {
 const char* AudioStateName(AudioState) { return "active"; }
 esp_err_t GetSharedAudioBus(const AudioSession&,AudioBusHandle* out) { *out=&bus_token;return ESP_OK; }
@@ -165,13 +165,13 @@ esp_err_t GetSharedAudioBus(const AudioSession&,AudioBusHandle* out) { *out=&bus
 }
 static void Clear()
 {
-    CHECK(active_ops==0 && mutex.depth==0);
+    CHECK(active_ops==0 && mutex.depth==0 && g_inflight_operations==0);
     g_codec_slots[0]={};g_codec_configuration_valid=false;g_codec_configuration_volume=-1;
     g_codec_powered=true;g_accept_operations=true;valid_session=1;
     clock_us=1000000;expected_deadline=clock_us+kCallTimeoutUs;
     io_cost=100;lock_cost=reset_cost=remove_cost=0;
     probes=adds=removes=resets=transfers=takes=gives=denials=0;
-    fail_at=late_at=failures_each_register=0;
+    fail_at=late_at=failures_each_register=close_admission_at=0;
     fail_all=fail_attach=late_probe=remove_fails=registry_fails=standalone=deny_locks=false;
     regs.fill(0);write_order.clear();io_hash=2166136261U;
 }
@@ -179,7 +179,7 @@ static esp_err_t Configure(wqn::services::AudioCodecProfile profile=wqn::service
 {
     expected_deadline=clock_us+kCallTimeoutUs;
     auto result=wqn::services::ConfigureAudioCodec({1,wqn::services::AudioActivity::kCapture},profile,volume);
-    CHECK(active_ops==0 && mutex.depth==0 && takes==gives+denials);
+    CHECK(active_ops==0 && mutex.depth==0 && takes==gives+denials && g_inflight_operations==0);
     return result;
 }
 static void Happy()
@@ -229,6 +229,16 @@ static void Faults()
     CHECK(Configure()==ESP_ERR_TIMEOUT && transfers==1 && resets==1 && removes==1);
     Clear();fail_at=1;
     CHECK(Configure()==ESP_OK && removes==1 && resets==1);
+    Clear();close_admission_at=1;
+    CHECK(Configure()==ESP_ERR_INVALID_STATE && transfers==1 && removes==1);
+    CHECK(g_codec_slots[0].handle==nullptr && !g_codec_configuration_valid && resets==0);
+    Clear();g_codec_slots[0].handle=&device_token;g_codec_slots[0].owner_session_id=1;
+    g_accept_operations=false;AudioCodecHandle denied=&device_token;
+    CHECK(RemoveAudioCodec({1,AudioActivity::kCapture},&denied)==ESP_ERR_INVALID_STATE && removes==0);
+#ifdef FIXTURE_ADMITTED_CLOSE
+    ResourceSlot* close_slot=nullptr;
+    CHECK(BeginCloseResource(g_codec_slots,2,{2,AudioActivity::kCapture},denied,&close_slot,true)==ESP_ERR_INVALID_STATE);
+#endif
     Clear();registry_fails=true;
     CHECK(Configure()==ESP_FAIL && adds==2 && removes==2 && g_codec_slots[0].handle==nullptr);
     Clear();remove_fails=true;
@@ -236,12 +246,14 @@ static void Faults()
     remove_fails=false;
     AudioCodecHandle dev=&device_token;
     CHECK(RemoveAudioCodec({1,AudioActivity::kCapture},&dev)==ESP_OK && dev==nullptr);
-    Clear();g_codec_slots[0].handle=&device_token;standalone=true;fail_at=1;
+    Clear();g_codec_slots[0].handle=&device_token;g_codec_slots[0].owner_session_id=1;
+    standalone=true;fail_at=1;
     CHECK(WriteAudioCodecRegister({1,AudioActivity::kCapture},&device_token,0x16,0x24)==ESP_OK);
     CHECK(transfers==2 && mutex.depth==0);
     uint8_t value=0;fail_at=transfers+1;expected_deadline=clock_us+kCallTimeoutUs;
     CHECK(ReadAudioCodecRegister({1,AudioActivity::kCapture},&device_token,0x16,&value)==ESP_OK && value==0x24);
-    Clear();g_codec_slots[0].handle=&device_token;standalone=deny_locks=true;
+    Clear();g_codec_slots[0].handle=&device_token;g_codec_slots[0].owner_session_id=1;
+    standalone=deny_locks=true;
     CHECK(WriteAudioCodecRegister({1,AudioActivity::kCapture},&device_token,0x16,0x24)==ESP_ERR_TIMEOUT);
     CHECK(transfers==0 && active_ops==0 && mutex.depth==0 && denials==10);
 }
