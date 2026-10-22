@@ -43,8 +43,9 @@ bool PersistSystemTimeToRtc(uint32_t sleep_generation, int64_t deadline_us);
 // snapshot generation, PCF8563 VL clear), reads the
 // RTC clock back and applies it via settimeofday() so downstream consumers
 // (UI seeding, sync deadlines, outbox stamps, HTTPS clock gating) resume from
-// the clock written before sleep. Trust here proves write/generation integrity,
-// not network calibration: a reasonable build-time seed can also be persisted.
+// the clock written before sleep. The record also carries the observed SNTP
+// provenance and clock epoch; RTC restore is not a new network calibration.
+// A reasonable build-time seed remains approximate across repeated sleeps.
 // Returns true only when the system clock was actually applied.
 bool RestoreSystemTimeFromRtc();
 

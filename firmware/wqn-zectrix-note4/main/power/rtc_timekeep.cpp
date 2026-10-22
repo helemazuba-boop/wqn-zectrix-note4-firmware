@@ -13,13 +13,14 @@
 #include "esp_timer.h"
 #include "pcf8563.h"
 #include "runtime/wake_context.h"
+#include "runtime/wall_clock.h"
 
 namespace {
 
 constexpr char kTag[] = "wqn_rtc_time";
 
 constexpr uint32_t kTrustMagic = 0x57514B54;  // "WQTK"
-constexpr uint32_t kTrustVersion = 1;
+constexpr uint32_t kTrustVersion = 2;
 // Matches the copies in ui_internal.h and wqn_api.cpp (2024-01-01 UTC).
 constexpr int64_t kMinReasonableUnixTime = 1704067200;
 
@@ -32,6 +33,8 @@ struct TimekeepTrustRecord {
     uint32_t magic;
     uint32_t version;
     uint32_t generation;
+    uint32_t clock_epoch;
+    uint32_t network_calibrated;
     uint32_t checksum;
 };
 
@@ -53,6 +56,8 @@ bool TrustRecordValid()
 {
     return g_trust_record.magic == kTrustMagic &&
            g_trust_record.version == kTrustVersion &&
+           g_trust_record.clock_epoch <= wqn::runtime::kWallClockEpochMax &&
+           g_trust_record.network_calibrated <= 1 &&
            g_trust_record.checksum == TrustChecksum(g_trust_record);
 }
 
@@ -162,6 +167,7 @@ bool PersistSystemTimeToRtc(uint32_t sleep_generation, int64_t deadline_us)
     if (deadline_us > 0 && esp_timer_get_time() >= deadline_us) {
         return false;
     }
+    const runtime::WallClockSnapshot clock = runtime::GetWallClockSnapshot();
     const std::time_t now = std::time(nullptr);
     if (now < kMinReasonableUnixTime) {
         ESP_LOGW(kTag, "system clock unreasonable (%lld); skip RTC persist",
@@ -181,15 +187,22 @@ bool PersistSystemTimeToRtc(uint32_t sleep_generation, int64_t deadline_us)
     if (deadline_us > 0 && esp_timer_get_time() >= deadline_us) {
         return false;
     }
+    // A calibration during time sampling or I/O changes the basis. The next
+    // sleep attempt can persist it; this attempt must not publish stale trust.
+    if (runtime::GetWallClockSnapshot().epoch != clock.epoch) return false;
     TimekeepTrustRecord record = {};
     record.magic = kTrustMagic;
     record.version = kTrustVersion;
     record.generation = sleep_generation;
+    record.clock_epoch = clock.epoch;
+    record.network_calibrated = clock.network_calibrated() ? 1 : 0;
     record.checksum = TrustChecksum(record);
     g_trust_record = record;
     ESP_LOGI(kTag,
-             "wall clock persisted to PCF8563: generation=%lu utc=%04d-%02d-%02d %02d:%02d:%02d",
+             "wall clock persisted to PCF8563: generation=%lu basis=%lu calibrated=%u utc=%04d-%02d-%02d %02d:%02d:%02d",
              static_cast<unsigned long>(sleep_generation),
+             static_cast<unsigned long>(record.clock_epoch),
+             static_cast<unsigned>(record.network_calibrated),
              calendar.year + 1900, calendar.month + 1, calendar.day,
              calendar.hour, calendar.min, calendar.sec);
     return true;
@@ -245,10 +258,14 @@ bool RestoreSystemTimeFromRtc()
         ESP_LOGW(kTag, "RTC clock calibration failed: %s", std::strerror(errno));
         return false;
     }
+    runtime::NoteRtcTimeRestored(
+        g_trust_record.network_calibrated != 0, g_trust_record.clock_epoch);
     ESP_LOGI(kTag,
-             "system clock calibrated from PCF8563: generation=%lu/%lu utc=%lld",
+             "system clock calibrated from PCF8563: generation=%lu/%lu basis=%lu calibrated=%u utc=%lld",
              static_cast<unsigned long>(g_trust_record.generation),
              static_cast<unsigned long>(wake.sleep_generation),
+             static_cast<unsigned long>(g_trust_record.clock_epoch),
+             static_cast<unsigned>(g_trust_record.network_calibrated),
              static_cast<long long>(restored_seconds));
     return true;
 }
@@ -294,6 +311,7 @@ bool SeedSystemTimeFromBuildTimeIfNeeded()
         ESP_LOGW(kTag, "build-time clock seeding failed: %s", std::strerror(errno));
         return false;
     }
+    runtime::NoteBuildTimeApplied();
     ESP_LOGI(
         kTag,
         "clock seeded from build time: %04d-%02d-%02d %02d:%02d:%02d CST",

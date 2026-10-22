@@ -75,6 +75,9 @@ struct TimeAppState {
 
 bool HandleTimeAppInput(TimeAppState* state, TimeInput input);
 bool TickTimeApp(TimeAppState* state, int64_t now_ms);
+// Rebase display/session wall-clock boundaries without consuming timer budget.
+// Used after restoring elapsed time, or when sleep clock continuity was lost.
+bool AlignTimeAppWallClock(TimeAppState* state, int64_t now_unix_seconds);
 bool TimeAppHasActiveTimer(const TimeAppState& state);
 bool TimeAppIsEditingValue(const TimeAppState& state);
 void DisarmTimeAppAction(TimeAppState* state);

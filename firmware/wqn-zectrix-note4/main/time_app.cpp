@@ -584,6 +584,11 @@ bool TickTimeApp(TimeAppState* state, int64_t now_ms)
     return TickTimeAppAt(state, now_ms, CurrentUnixSeconds());
 }
 
+bool AlignTimeAppWallClock(TimeAppState* state, int64_t now_unix_seconds)
+{
+    return state != nullptr && AlignWallClockTiming(state, now_unix_seconds);
+}
+
 bool TimeAppHasActiveTimer(const TimeAppState& state)
 {
     return state.active_mode != TimerMode::kNone &&
