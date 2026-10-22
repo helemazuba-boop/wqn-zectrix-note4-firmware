@@ -5,6 +5,7 @@
 #include <cstring>
 #include "cJSON.h"
 #include "config.h"
+#include "voice_endpoint.h"
 #include "device_protocol/json_depth_guard.h"
 #include "esp_crt_bundle.h"
 #include "esp_heap_caps.h"
@@ -664,7 +665,12 @@ void ExecuteCtrlCmdSingleStep(const CtrlCmd& cmd)
                 "Authorization: Bearer " + g_current_token + "\r\n";
 
             esp_websocket_client_config_t cfg = {};
-            cfg.uri = "wss://" WQN_API_BASE_HOST WQN_FLASH_WS_PATH;
+            const std::string ws_url = wqn::BuildVoiceWebSocketUrl();
+            if (ws_url.empty()) {
+                PublishCompletion(cmd.gen, ESP_ERR_INVALID_ARG, CmdDisposition::kExecuted);
+                return;
+            }
+            cfg.uri = ws_url.c_str();
             cfg.subprotocol = WQN_VOICE_WS_SUBPROTOCOL;
             cfg.headers = auth_header.c_str();
             cfg.network_timeout_ms = 2500;

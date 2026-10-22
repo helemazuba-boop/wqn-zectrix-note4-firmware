@@ -15,6 +15,7 @@
 #include "ai_history.h"
 #include "cJSON.h"
 #include "config.h"
+#include "voice_endpoint.h"
 #include "device_protocol/json_depth_guard.h"
 #include "esp_check.h"
 #include "esp_crt_bundle.h"
@@ -2389,12 +2390,11 @@ esp_err_t StartFlashSessionNow(uint32_t generation)
 
     esp_websocket_client_config_t cfg = {};
 #if CONFIG_WQN_FLASH_PROTOCOL_V2
-    // [port-fix] ESP-IDF's host+path mode sometimes ignores cfg.port and
-    // defaults to 80, causing "connecting to host ...:80" + HTTP 301
-    // redirect instead of a WS upgrade on 443. Use the full URI form
-    // (wss://host/path) which makes esp_websocket_client respect 443
-    // implicitly from the "wss://" scheme.
-    cfg.uri = "wss://" WQN_API_BASE_HOST WQN_FLASH_WS_PATH;
+    const std::string ws_url = wqn::BuildVoiceWebSocketUrl();
+    if (ws_url.empty()) {
+        return fail_after_audio_begin("语音服务地址配置无效", ESP_ERR_INVALID_ARG);
+    }
+    cfg.uri = ws_url.c_str();
     cfg.subprotocol = kWsSubprotocol;
 #else
     cfg.uri = kWsUri;

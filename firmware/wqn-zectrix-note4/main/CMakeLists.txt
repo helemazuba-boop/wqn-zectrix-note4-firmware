@@ -127,6 +127,7 @@ if(CONFIG_WQN_WIFI_STA_ENABLE AND NOT CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE)
 endif()
 
 set(WQN_API_BASE "" CACHE STRING "Override the WQN ESP32 API base URL")
+set(WQN_VOICE_WS_URL "" CACHE STRING "Override the full STD/PRO and Flash v2 WebSocket URL")
 
 # [dev-diag] Build identity for the Dev info dialog (docs/development/DEV_DIAGNOSTICS.md §4.1).
 # Both values are configure-time snapshots: a commit made after configure only
@@ -174,4 +175,8 @@ if(WQN_API_BASE)
         PRIVATE
             WQN_API_BASE=\"${WQN_API_BASE}\"
     )
+endif()
+
+if(WQN_VOICE_WS_URL)
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE WQN_VOICE_WS_URL=\"${WQN_VOICE_WS_URL}\")
 endif()
