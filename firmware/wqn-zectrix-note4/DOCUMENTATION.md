@@ -110,7 +110,9 @@ by code, `AGENTS.md`, and the architecture/product references above.
 - `docs/engineering/RELIABILITY_BATCH_08.md` — clock source/epoch tracking,
   conservative timer restoration, integrated SNTP/RTC tests, and user-confirmed acceptance.
 - `docs/engineering/RELIABILITY_BATCH_09.md` — SSE whole-request budgets,
-  HTTP/WS overflow termination, shared voice endpoint configuration, and device checks.
+  HTTP/WS overflow termination, shared voice endpoint configuration, and user-confirmed acceptance.
+- `docs/engineering/RELIABILITY_BATCH_10.md` — production GPIO/task/ring replay,
+  delayed PTT release preservation, burst capacity, ISR state and device checks.
 - `docs/engineering/DEAD_CODE_CLEANUP.md` — evidence and scope for firmware
   cleanup decisions.
 - `docs/engineering/SYNC_V3_REPAIR.md` — sync repair findings, host checks, and
