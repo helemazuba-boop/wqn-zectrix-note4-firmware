@@ -14,6 +14,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "runtime/wall_clock.h"
+#include "sdkconfig.h"
 
 namespace wqn::runtime {
 namespace {
@@ -229,12 +230,17 @@ void DumpFaultDiagnosticsToLog()
 {
     FaultDiagnosticsSnapshot view{};
     CopyFaultDiagnostics(&view);
-    ESP_LOGI(kTag, "FAULT:boot build=%s boot=%lu reset=%lu phase=%lu recovered=%lu previous_build=%s previous_boot=%lu previous_phase=%lu reports=%lu overwritten=%lu integrity_rejections=%lu count=%lu",
+#if CONFIG_WQN_MEMORY_DIAGNOSTICS
+    constexpr unsigned memory_diagnostics = 1;
+#else
+    constexpr unsigned memory_diagnostics = 0;
+#endif
+    ESP_LOGI(kTag, "FAULT:boot build=%s boot=%lu reset=%lu phase=%lu recovered=%lu previous_build=%s previous_boot=%lu previous_phase=%lu reports=%lu overwritten=%lu integrity_rejections=%lu count=%lu mem_diag=%u",
         view.build, static_cast<unsigned long>(view.boot_id), static_cast<unsigned long>(view.reset_reason),
         static_cast<unsigned long>(view.boot_phase), static_cast<unsigned long>(view.recovered), view.previous_build,
         static_cast<unsigned long>(view.previous_boot_id), static_cast<unsigned long>(view.previous_boot_phase),
         static_cast<unsigned long>(view.reports), static_cast<unsigned long>(view.overwritten),
-        static_cast<unsigned long>(view.integrity_rejections), static_cast<unsigned long>(view.count));
+        static_cast<unsigned long>(view.integrity_rejections), static_cast<unsigned long>(view.count), memory_diagnostics);
     for (size_t i = 0; i < view.count; ++i) {
         const auto& r = view.records[i];
         ESP_LOGI(kTag, "FAULT:record seq=%lu build=%s boot=%lu reset=%u boot_phase=%u domain=%u phase=%u code=%ld operation=%lu generation=%lu uptime_ms=%lld unix_sec=%lld clock_source=%u epoch=%lu continuity=%u",

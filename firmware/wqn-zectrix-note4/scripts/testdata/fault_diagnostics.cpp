@@ -121,6 +121,7 @@ static void ErrorsAndPrivacy() {
     CHECK(std::search(raw,raw+sizeof(fd::g_copies),secret,secret+std::strlen(secret))==raw+sizeof(fd::g_copies));
     Boot(ESP_RST_SW); CHECK(wqn::CopyRecentErrors(text,8)==0 && Snapshot().count==2);
     fd::DumpFaultDiagnosticsToLog(); CHECK(logs.size()==3 && logs[0].find("FAULT:boot")!=std::string::npos);
+    CHECK(logs[0].find("mem_diag=" + std::to_string(CONFIG_WQN_MEMORY_DIAGNOSTICS))!=std::string::npos);
     for(const auto& line:logs) CHECK(line.find(secret)==std::string::npos);
     const auto count=Snapshot().count; wqn::RecordError(nullptr,"x"); wqn::RecordError("x",nullptr);
     fd::RecordLegacyFault(nullptr); CHECK(Snapshot().count==count);

@@ -1001,11 +1001,23 @@ bool ReadStorageCapacitySnapshot(StorageCapacitySnapshot* snapshot)
     }
     *snapshot = {};
 
-    snapshot->spiffs_valid =
-        esp_spiffs_info(
-            kStoragePartitionLabel,
-            &snapshot->spiffs_total_bytes,
-            &snapshot->spiffs_used_bytes) == ESP_OK;
+    const int64_t query_start_us = esp_timer_get_time();
+    const esp_err_t spiffs_result = esp_spiffs_info(
+        kStoragePartitionLabel,
+        &snapshot->spiffs_total_bytes,
+        &snapshot->spiffs_used_bytes);
+    const int64_t query_end_us = esp_timer_get_time();
+    snapshot->spiffs_valid = spiffs_result == ESP_OK;
+    // Reuse the existing settings query, never walk SPIFFS after every write.
+    // This is one observation over this interval, not the occupancy of all
+    // later transactions. Failed observations must remain visible as gaps.
+    ESP_LOGI(kTag,
+        "STORAGE:capacity query_start_us=%lld query_end_us=%lld total_bytes=%u used_bytes=%u result=%s",
+        static_cast<long long>(query_start_us),
+        static_cast<long long>(query_end_us),
+        static_cast<unsigned>(snapshot->spiffs_total_bytes),
+        static_cast<unsigned>(snapshot->spiffs_used_bytes),
+        esp_err_to_name(spiffs_result));
 
     nvs_stats_t stats = {};
     snapshot->nvs_valid = nvs_get_stats(nullptr, &stats) == ESP_OK;

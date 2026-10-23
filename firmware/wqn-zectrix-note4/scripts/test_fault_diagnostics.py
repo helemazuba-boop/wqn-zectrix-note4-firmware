@@ -33,6 +33,7 @@ void FaultHostExit(portMUX_TYPE*);
 def main():
     root = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--memory-diagnostics', type=int, choices=(0, 1), default=1)
     parser.add_argument('--error-source', type=Path, default=root/'main/error_recorder.cpp')
     parser.add_argument('--mutation', choices=('ignore-crc', 'old-copy', 'retain-cold',
                         'single-copy', 'clear-history', 'relabel-origin', 'lose-context',
@@ -66,6 +67,7 @@ def main():
         tmp=Path(tmp)
         for name,body in HEADERS.items():
             path=tmp/name; path.parent.mkdir(parents=True,exist_ok=True); path.write_text(body)
+        (tmp/'sdkconfig.h').write_text(f'#pragma once\n#define CONFIG_WQN_MEMORY_DIAGNOSTICS {args.memory_diagnostics}\n')
         (tmp/'fault_diagnostics.cpp').write_text(source)
         (tmp/'error_recorder.cpp').write_text(error)
         (tmp/'fixture.cpp').write_text((root/'scripts/testdata/fault_diagnostics.cpp').read_text())
