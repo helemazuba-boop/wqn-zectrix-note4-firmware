@@ -154,7 +154,9 @@ void StorageServiceTask(void*)
         }
         const int64_t completed_us = esp_timer_get_time();
         const int64_t elapsed_ms = (completed_us - started_us) / 1000;
-        if (result != ESP_OK) {
+        // Empty queries use NOT_FOUND as an ordinary result. Domain callers
+        // can explicitly report it when absence violates their own contract.
+        if (result != ESP_OK && result != ESP_ERR_NOT_FOUND) {
             wqn::runtime::RecordFault(wqn::runtime::FaultDomain::kStorage,
                 wqn::runtime::FaultPhase::kStorageExecution, result, command.request_id);
         }

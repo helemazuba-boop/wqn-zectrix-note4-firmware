@@ -31,7 +31,7 @@ def main():
     root = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--mutation', choices=('direct-nvs', 'clock-every-tick',
-                                              'ignore-active-use', 'abandon-running'))
+                                              'ignore-active-use', 'abandon-running', 'empty-query-fault'))
     args = parser.parse_args()
     storage = (root / 'main/storage.cpp').read_text()
     service = (root / 'main/services/storage_service.cpp').read_text()
@@ -58,6 +58,11 @@ def main():
         bodies['@@STORAGE_CALLER@@'] = bodies['@@STORAGE_CALLER@@'].replace(
             'xSemaphoreTake(completion->semaphore, portMAX_DELAY);',
             'return ESP_ERR_TIMEOUT;')
+    elif args.mutation == 'empty-query-fault':
+        needle = 'result != ESP_OK && result != ESP_ERR_NOT_FOUND'
+        if bodies['@@STORAGE_OWNER@@'].count(needle) != 1:
+            raise SystemExit('FAIL: mutation boundary drift')
+        bodies['@@STORAGE_OWNER@@'] = bodies['@@STORAGE_OWNER@@'].replace(needle, 'result != ESP_OK')
     gate = (root / 'main/voice_idle_disconnect.h').read_text()
     if args.mutation == 'ignore-active-use':
         gate = gate.replace('users_.load(std::memory_order_acquire) != 0 || ', '')

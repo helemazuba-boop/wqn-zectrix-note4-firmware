@@ -17,6 +17,7 @@ struct StaticSemaphore_t { bool ready = false; };
 using SemaphoreHandle_t = StaticSemaphore_t*;
 constexpr int ESP_OK = 0, ESP_FAIL = -1, ESP_ERR_INVALID_ARG = 258;
 constexpr int ESP_ERR_INVALID_STATE = 259, ESP_ERR_NO_MEM = 260, ESP_ERR_TIMEOUT = 261;
+constexpr int ESP_ERR_NOT_FOUND = 262;
 constexpr int pdTRUE = 1, pdFALSE = 0;
 constexpr TickType_t portMAX_DELAY = UINT32_MAX;
 #define pdMS_TO_TICKS(ms) (ms)
@@ -240,6 +241,12 @@ int main()
     on_storage_owner = false;
     CHECK(nvs_reads == 4 && !queue_has_command);
     CHECK(storage_leases == 0);
+
+    const auto reports_before_empty_query = wqn::runtime::fault_reports;
+    nvs_result = ESP_ERR_NOT_FOUND;
+    CHECK(LoadAccessTokenFromStorageService(&token) == ESP_ERR_NOT_FOUND);
+    CHECK(wqn::runtime::fault_reports == reports_before_empty_query);
+    nvs_result = ESP_OK;
 
     SetAiRecordingLabel(0);
     CHECK(revisions == 1 && g_state.toast_label.find("00:00") != std::string::npos);
