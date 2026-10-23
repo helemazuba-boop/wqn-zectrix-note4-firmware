@@ -19,7 +19,7 @@ DEPENDENCIES = {
     'CONFIG_WQN_MEMORY_TRACE_DELAY_SECONDS', 'CONFIG_WQN_MEMORY_TRACE_SECONDS',
     'CONFIG_WQN_MEMORY_TRACE_RECORDS',
 }
-CACHE_OVERRIDES = ('WQN_API_BASE', 'WQN_VOICE_WS_URL', 'WQN_DEBUG_PROBLEM_IDS', 'CMAKE_BUILD_TYPE')
+CACHE_OVERRIDES = ('WQN_API_BASE', 'WQN_VOICE_WS_URL', 'CMAKE_BUILD_TYPE')
 
 
 def config_values(text):
@@ -80,6 +80,11 @@ def run_build(build, config, overrides, log, environment):
     command = ['idf.py', '-B', str(build), f'-DSDKCONFIG={config}', *overrides, 'reconfigure', 'build']
     print(f'Building {build.name}; output: {log}', flush=True)
     with log.open('w', encoding='utf-8') as stream:
+        if (build / 'CMakeCache.txt').exists():
+            # SOURCE_DATE_EPOCH alone cannot invalidate cached __DATE__/__TIME__
+            # objects or an old bootloader. Config lives outside this directory.
+            subprocess.run(['idf.py', '-B', str(build), 'fullclean'], cwd=ROOT,
+                           env=environment, stdout=stream, stderr=subprocess.STDOUT, check=True)
         subprocess.run(command, cwd=ROOT, env=environment, stdout=stream, stderr=subprocess.STDOUT, check=True)
     output = log.read_text(errors='replace')
     if re.search(r'\bwarning:', output, flags=re.IGNORECASE):
@@ -88,6 +93,18 @@ def run_build(build, config, overrides, log, environment):
         raise ValueError(f'M8 gate result missing; inspect {log}.')
     if '[PASS] UI owner fixed frame:' not in output or '[FAIL]' in output:
         raise ValueError(f'Compiled UI stack result missing; inspect {log}.')
+
+
+def application_metadata(path):
+    # ESP32-S3 application header (24 B), first segment header (8 B), then
+    # esp_app_desc_t. Refuse unknown layouts instead of guessing artifact identity.
+    data = path.read_bytes()[32:32 + 256]
+    if len(data) != 256 or int.from_bytes(data[:4], 'little') != 0xabcd5432:
+        raise ValueError('Unrecognized ESP32-S3 application descriptor.')
+    fields = {'version': (16, 32), 'project': (48, 32), 'time': (80, 16),
+              'date': (96, 16), 'idf_ver': (112, 32)}
+    return {key: data[start:start + size].split(b'\0')[0].decode('ascii')
+            for key, (start, size) in fields.items()}
 
 
 def archive(build, config, destination):
@@ -114,6 +131,7 @@ def archive(build, config, destination):
     sdk = Path(description['idf_path'])
     idf_version = subprocess.check_output(['git', '-C', str(sdk), 'describe', '--tags', '--always', '--dirty'], text=True).strip()
     return {'build_directory': str(build), 'artifacts': artifacts,
+            'application': application_metadata(destination / f'{project}.bin'),
             'idf_ver': idf_version, 'project_version': description['project_version']}
 
 
@@ -163,6 +181,11 @@ def main():
     off = archive(control, control_config, output / 'diagnostics-off')
     if on['idf_ver'] != off['idf_ver'] or on['project_version'] != off['project_version']:
         raise ValueError('SDK/project version differs between pair members.')
+    if on['application'] != off['application']:
+        raise ValueError('Application descriptor identity/date differs between pair members.')
+    for name in ('bootloader/bootloader.bin', 'partition_table/partition-table.bin', 'ota_data_initial.bin'):
+        if on['artifacts'][name] != off['artifacts'][name]:
+            raise ValueError('Flash support artifact differs between pair members: ' + name)
     manifest = {'schema_version': 1, 'source_commit': commit,
                 'baked_build': git('describe', '--always', '--dirty', '--abbrev=8'),
                 'source_date_epoch': int(epoch), 'build_time_utc': build_time,

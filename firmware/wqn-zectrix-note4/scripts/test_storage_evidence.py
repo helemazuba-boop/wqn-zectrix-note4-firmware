@@ -8,7 +8,7 @@ import tempfile
 import unittest
 
 from analyze_storage_log import analyze, parse_log, statistics
-from build_diagnostic_pair import compare_configs, disabled_config
+from build_diagnostic_pair import application_metadata, cache_overrides, compare_configs, disabled_config
 
 
 def identity(build='1234abcd', boot=2, mode=1):
@@ -179,6 +179,29 @@ class ControlConfigTests(unittest.TestCase):
             compare_configs(self.ON, self.ON)
         with self.assertRaises(ValueError):
             disabled_config(disabled_config(self.ON))
+
+    def test_stale_cache_variable_not_forwarded_to_fresh_control(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'CMakeCache.txt').write_text('WQN_DEBUG_PROBLEM_IDS:STRING=\n'
+                'WQN_API_BASE:STRING=https://dev.example/api/esp32\nWQN_VOICE_WS_URL:STRING=\n')
+            self.assertEqual(cache_overrides(root), ['-DWQN_API_BASE=https://dev.example/api/esp32',
+                                                     '-DWQN_VOICE_WS_URL='])
+
+    def test_descriptor_comes_from_binary_and_unknown_layout_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'app.bin'
+            data = bytearray(288)
+            data[32:36] = (0xabcd5432).to_bytes(4, 'little')
+            data[32 + 96:32 + 96 + 11] = b'Oct 23 2026'
+            data[32 + 112:32 + 112 + 6] = b'v5.5.6'
+            path.write_bytes(data)
+            self.assertEqual(application_metadata(path)['date'], 'Oct 23 2026')
+            self.assertEqual(application_metadata(path)['idf_ver'], 'v5.5.6')
+            data[32] = 0
+            path.write_bytes(data)
+            with self.assertRaises(ValueError):
+                application_metadata(path)
 
 
 if __name__ == '__main__':
