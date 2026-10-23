@@ -28,6 +28,7 @@
 #include "freertos/task.h"
 #include "mbedtls/sha256.h"
 #include "runtime/sleep_coordinator.h"
+#include "runtime/storage_temp_file_lease.h"
 #include "services/storage_service.h"
 
 namespace {
@@ -1377,6 +1378,7 @@ esp_err_t DownloadNotePackToStorage(
     if (!storage_lease) {
         return ESP_ERR_INVALID_STATE;
     }
+    runtime::StorageTempFileLease temp_file_lease;
     NotePackStreamContext context;
     context.notebook = &notebook;
     mbedtls_sha256_init(&context.sha);

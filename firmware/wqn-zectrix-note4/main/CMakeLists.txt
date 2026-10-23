@@ -21,6 +21,7 @@ idf_component_register(
         "pcf8563.cpp"
         "provision_manager.cpp"
         "runtime/storage_schema.cpp"
+        "runtime/storage_temp_file_lease.cpp"
         "runtime/memory_diagnostics.cpp"
         "runtime/wall_clock.cpp"
         "runtime/fault_diagnostics.cpp"
