@@ -8,6 +8,7 @@ import tempfile
 from test_audio_runtime import function
 
 HEADERS = {
+    'esp_attr.h': '#pragma once\n#define DRAM_ATTR\n',
     'esp_err.h': '''#pragma once
 using esp_err_t = int;
 constexpr int ESP_OK=0, ESP_FAIL=-1, ESP_ERR_INVALID_STATE=259, ESP_ERR_NO_MEM=257;

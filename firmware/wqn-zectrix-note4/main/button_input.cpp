@@ -4,6 +4,7 @@
 #include <atomic>
 
 #include "driver/gpio.h"
+#include "esp_attr.h"
 #include "esp_log.h"
 #include "esp_sleep.h"
 #include "esp_timer.h"
@@ -69,7 +70,9 @@ struct ButtonState {
     std::atomic<uint32_t> isr_disabled{0};
 };
 
-std::array<ButtonState, 3> g_buttons = {{
+// IDF's SPIRAM atomic workaround may use out-of-line helpers. Keep ISR-shared
+// state in internal DRAM so those helpers take their hardware atomic path.
+DRAM_ATTR std::array<ButtonState, 3> g_buttons = {{
     {wqn::ButtonId::kUp, kUpPin},
     {wqn::ButtonId::kDownPower, kDownPowerPin},
     {wqn::ButtonId::kConfirm, kConfirmPin},
@@ -81,11 +84,11 @@ std::array<ButtonState, 3> g_buttons = {{
 // xQueueSend cannot express. All head/tail mutation happens inside the
 // spinlock; producer is the button task, consumer is the UI task.
 //
-// A 200..649 ms short hold adds HoldPress: Press + HoldPress + ShortPress
+// A short hold that reports HoldPress adds: Press + HoldPress + ShortPress
 // (or DoublePress) + Release. Reserve 20 complete gestures (80 events) plus
 // one gesture of margin while the UI is blocked. All four are critical.
 constexpr size_t kEventRingCapacity = 84;
-static_assert(std::atomic<uint32_t>::is_always_lock_free);
+static_assert(sizeof(std::atomic<uint32_t>) == sizeof(uint32_t));
 wqn::ButtonEvent g_event_ring[kEventRingCapacity];
 size_t g_ring_head = 0;  // next slot to write
 size_t g_ring_tail = 0;  // next slot to read
