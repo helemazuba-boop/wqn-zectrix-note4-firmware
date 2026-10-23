@@ -117,6 +117,8 @@ by code, `AGENTS.md`, and the architecture/product references above.
   boot/storage provenance, torn-write recovery, resource budget and user-confirmed checkpoint.
 - `docs/engineering/RELIABILITY_BATCH_12.md` — timed storage observations, log attribution,
   matched RAM-diagnostic builds, artifact identities and remaining device measurements.
+- `docs/engineering/RELIABILITY_BATCH_13.md` — live pack temp-file protection during
+  capacity reclaim, clock-step regressions, identified low-occupancy evidence and new paired builds.
 - `docs/engineering/DEAD_CODE_CLEANUP.md` — evidence and scope for firmware
   cleanup decisions.
 - `docs/engineering/SYNC_V3_REPAIR.md` — sync repair findings, host checks, and

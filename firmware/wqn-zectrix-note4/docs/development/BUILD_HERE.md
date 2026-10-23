@@ -129,6 +129,17 @@ on hardware, preserve NVS/SPIFFS with the existing app-only flashing procedure;
 an entry point that erases the whole chip destroys the comparison conditions.
 Neither image was flashed during pair preparation.
 
+Batch 13 adds a runtime fix, so its current matched pair is
+`dist/b5-diagnostic-pair-b13-20261023/manifest.json`, baked build `ab8abed8`.
+Its dedicated control directory is `build-b5-diag-off-b13-20261023`, another
+explicit B5 comparison output; the batch 12 artifacts remain historical.
+The preparation command was
+`python3 scripts/build_diagnostic_pair.py --control-build build-b5-diag-off-b13-20261023 --output dist/b5-diagnostic-pair-b13-20261023`.
+For a later pair, choose new `--control-build build-<purpose>-<YYYYMMDD>` and
+`--output` paths. Do not compare one old-runtime image with one new-runtime
+image as a RAM-diagnostics experiment. See [batch 13](../engineering/RELIABILITY_BATCH_13.md)
+for the active-file protection and device matrix.
+
 ## History
 
 - 2026-06-14: Removed 15 stale `build-*` dirs; moved 13 `.bat` files to `scripts/`;
