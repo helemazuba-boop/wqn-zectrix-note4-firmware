@@ -68,6 +68,19 @@ jobs:
       - name: Replay production sampling, consumers and sleep commit (not HIL)
         run: python3 firmware/wqn-zectrix-note4/scripts/test_button_input.py
 
+  fault-diagnostics:
+    name: RTC fault journal and storage failure context
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Exercise production fault journal, torn writes and provenance (not HIL)
+        run: python3 firmware/wqn-zectrix-note4/scripts/test_fault_diagnostics.py
+
+      - name: Exercise production storage owner and typed failure context (not HIL)
+        run: python3 firmware/wqn-zectrix-note4/scripts/test_audio_runtime.py
+
   storage-schema:
     name: Boot storage schema fault characterization
     runs-on: ubuntu-latest

@@ -12,6 +12,7 @@
 #include "esp_mac.h"
 #include "esp_psram.h"
 #include "esp_system.h"
+#include "runtime/fault_diagnostics.h"
 
 namespace {
 
@@ -126,6 +127,7 @@ void PrintBootDiagnostics()
     }
 
     ESP_LOGI(kTag, "reset_reason=%s", ResetReasonToString(esp_reset_reason()));
+    runtime::DumpFaultDiagnosticsToLog();
 }
 
 }  // namespace wqn

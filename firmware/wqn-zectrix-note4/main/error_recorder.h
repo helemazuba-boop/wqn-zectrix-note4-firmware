@@ -1,7 +1,7 @@
 // [dev-diag] Central recent-error ring (docs/development/DEV_DIAGNOSTICS.md §5). Always
-// compiled in: failure paths are rare and the whole module is ~0.8 KB of
-// static storage, so release builds keep the capture even though the Kconfig
-// flag hides the Dev menu rows that display it.
+// compiled in: the legacy text ring uses ~0.8 KB of ordinary static RAM.
+// The numeric RTC summary has a separate bounded budget. Release builds keep
+// capture even when the Kconfig flag hides the Dev menu rows that display it.
 
 #pragma once
 
@@ -21,8 +21,9 @@ struct ErrorRecord {
 constexpr size_t kErrorRecordDepth = 8;
 
 // Task-context only (no ISR caller today). Never allocates, never blocks on a
-// mutex (short portMUX critical section), never logs — safe to call from any
-// failure path, including before the services start.
+// mutex (short portMUX critical sections), never logs. Also publishes a numeric
+// RTC fault summary; formatted text stays here in ordinary RAM. Task failure
+// paths may call before services start; this is not an ISR/panic hook.
 void RecordError(const char* tag, const char* fmt, ...) __attribute__((format(printf, 2, 3)));
 
 // Copies up to `cap` most-recent records into `out`, oldest first. Returns the

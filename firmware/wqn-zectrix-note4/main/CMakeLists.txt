@@ -23,6 +23,7 @@ idf_component_register(
         "runtime/storage_schema.cpp"
         "runtime/memory_diagnostics.cpp"
         "runtime/wall_clock.cpp"
+        "runtime/fault_diagnostics.cpp"
         "services/connectivity_service.cpp"
         "services/audio_service.cpp"
         "services/storage_service.cpp"
