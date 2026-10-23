@@ -12,6 +12,16 @@ permissions:
   contents: read
 
 jobs:
+  diagnostic-evidence:
+    name: Storage evidence attribution and diagnostic control configuration
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Reject misleading log attribution, percentiles and config drift (not HIL)
+        run: python3 firmware/wqn-zectrix-note4/scripts/test_storage_evidence.py
+
   audio-timeout:
     name: Audio channel timeout contract (100/1000 Hz)
     runs-on: ubuntu-latest
