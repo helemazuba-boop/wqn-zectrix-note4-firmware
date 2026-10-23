@@ -19,7 +19,7 @@
 ## 2. 配置与发布策略
 
 - 新 Kconfig 开关：`CONFIG_WQN_DEV_MENU_ENABLE`（`main/Kconfig.projbuild`，`depends on WQN_EPD_UI_ENABLE`，**default n**）。
-- 门控语义：开关**只门控设置页一级的「开发者选项」入口行**（`#if` 预处理器裁剪；二级六行随之不可达）；错误捕获（`RecordError`）**常开编译**，发布固件同样保留——失败路径才执行，代价约 1KB flash / 0.8KB RAM 静态环，换来现场设备的问题回溯能力。
+- 门控语义：开关**只门控设置页一级的「开发者选项」入口行**（`#if` 预处理器裁剪；二级六行随之不可达）；错误捕获（`RecordError`）**常开编译**，发布固件同样保留——失败路径才执行，旧文本环约占 0.8KB 普通 RAM；第十一批另加固定预算的 RTC 数字摘要，见 §5 与批次记录。
 - 发布保障：default n + `../release/RELEASE_CHECKLIST.md` §1 校验步（记录的 sdkconfig 中 `# CONFIG_WQN_DEV_MENU_ENABLE is not set`）。开发机用 menuconfig 打开（写入 gitignored 的 `sdkconfig`，不进版本库）。
 - `sdkconfig.ai-local.defaults` 中保留注释行 `# CONFIG_WQN_DEV_MENU_ENABLE is not set`（照 `WQN_AI_AUDIO_SELFTEST_ENABLE` 先例），显式文档化 off 态。
 
@@ -126,6 +126,8 @@ size_t CopyRecentErrors(ErrorRecord* out, size_t cap);
 
 **并发模型**：专用 `portMUX_TYPE` 自旋锁 + 整环拷贝，**照抄 `GetSyncSnapshot` 先例**（`sync_service.cpp`）。格式化（`vsnprintf` 到任务栈缓冲）在锁外完成，锁内只做定长拷贝与 `++seq`。
 
+**数字故障摘要**（第十一批）：旧文本环锁释放后，RecordError 将固定 domain 与“错误码未知”写入四条 RTC 数字报告；消息/tag 原文不保留。启动阶段、存储恢复和事务失败另有明确错误码及 operation/generation。双副本、CRC、720 B RTC 与 360 B RAM cache 的预算及保留边界见 [第十一批记录](../engineering/RELIABILITY_BATCH_11.md)。启动及既有睡眠诊断导出附带 `FAULT:boot` / `FAULT:record`；错误详情 UI 仍显示原八条 RAM 文本环的快照。录制不写 Flash、不新增采样任务，物理保留与时间开销仍需设备验证。
+
 **tag 约定**（≤11 字符）：`persist`、`sync`、`cloud`、`audio`、`audio_cap`、`audio_play`、`ai`、`provision`、`rtc`、`storage`、`ui`。
 
 **v1 埋点清单**（各一行 `RecordError(...)` + `// [dev-diag]` 热点标签；同步的 content/outbox 路径**不埋**——`last_error` 已随快照发布）：
@@ -160,7 +162,7 @@ size_t CopyRecentErrors(ErrorRecord* out, size_t cap);
 ## 8. 已知局限（有意为之）
 
 - `WQN_GIT_COMMIT` / 构建时间为 **configure 期快照**：同一构建目录内 commit 后需重新 configure 才刷新；拿不到 git 时回退 `"unknown"`。
-- 错误环不持久化：重启即失（崩溃类信息由「上次复位原因」兜底）；要做持久化先修订本文档并评估 NVS 写入频率。
+- 八条文本错误环重启即失；四条数字摘要可在符合策略且 RTC 内容有效的软件/深睡等复位后恢复，USB/冷/低压等重置保守重建。不承诺掉电保留，也不替代 panic 调用栈，精确边界见第十一批记录。
 - 电源睡眠诊断屏上只显示最近 6 条，完整 64 条要靠 USB 日志（见 §4.6）；环本身跨深睡保留，但 `USB_UART_CHIP_RESET` 会清空 RTC slow memory。
 - `WQN_FIRMWARE_VERSION` 保持手写、**不掺 hash**：它进同步 `image_id`（`sync_service.cpp`）与刷新签名（`ui/ui_refresh.cpp`），每次提交变化会污染这两处。
 
