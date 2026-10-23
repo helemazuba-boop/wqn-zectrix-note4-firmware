@@ -56,6 +56,7 @@ def main():
             subprocess.run([
                 compiler, '-std=c++17', '-Wall', '-Wextra', '-Werror',
                 '-fsanitize=undefined', '-fno-sanitize-recover=all',
+                '-I', str(root/'main'),
                 f'-DCONFIG_WQN_WIFI_STA_ENABLE={wifi}', f'-DCONFIG_WQN_AGENT_ENABLE={agent}',
                 '-x', 'c++', '-', '-o', str(binary)],
                 input=fixture, text=True, check=True, timeout=30)

@@ -75,6 +75,7 @@ def main():
         unit.write_text(fixture)
         subprocess.run([compiler, '-std=c++17', '-Wall', '-Wextra', '-Werror',
                         '-fsanitize=address,undefined', '-fno-omit-frame-pointer',
+                        '-I', str(root / 'main'),
                         str(unit), '-o', str(binary)], check=True, timeout=30)
         return subprocess.run([str(binary)], timeout=10).returncode
 

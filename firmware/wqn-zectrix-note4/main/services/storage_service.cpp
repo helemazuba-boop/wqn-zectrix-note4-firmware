@@ -10,6 +10,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "runtime/sleep_coordinator.h"
+#include "runtime/fault_diagnostics.h"
 
 namespace {
 
@@ -153,6 +154,10 @@ void StorageServiceTask(void*)
         }
         const int64_t completed_us = esp_timer_get_time();
         const int64_t elapsed_ms = (completed_us - started_us) / 1000;
+        if (result != ESP_OK) {
+            wqn::runtime::RecordFault(wqn::runtime::FaultDomain::kStorage,
+                wqn::runtime::FaultPhase::kStorageExecution, result, command.request_id);
+        }
         // ESP-IDF reports this high-water mark in bytes, unlike upstream
         // FreeRTOS which documents stack words.
         const UBaseType_t free_stack_bytes = uxTaskGetStackHighWaterMark(nullptr);
@@ -233,6 +238,8 @@ esp_err_t ExecuteStorageTransactionInternal(
     QueueHandle_t queue = foreground ? g_foreground_queue : g_background_queue;
     if (xQueueSend(queue, &command, wait_ticks) != pdTRUE) {
         delete completion;  // Never enqueued: this caller is the sole owner.
+        wqn::runtime::RecordFault(wqn::runtime::FaultDomain::kStorage,
+            wqn::runtime::FaultPhase::kStorageQueueTimeout, ESP_ERR_TIMEOUT, command.request_id);
         return ESP_ERR_TIMEOUT;
     }
     xTaskNotifyGive(g_task);
@@ -253,6 +260,8 @@ esp_err_t ExecuteStorageTransactionInternal(
             "storage transaction timed out in queue: request=%lu owner=%s",
             static_cast<unsigned long>(command.request_id),
             owner == nullptr ? "unknown" : owner);
+        wqn::runtime::RecordFault(wqn::runtime::FaultDomain::kStorage,
+            wqn::runtime::FaultPhase::kStorageQueueTimeout, ESP_ERR_TIMEOUT, command.request_id);
         return ESP_ERR_TIMEOUT;
     }
     // The service already started this transaction; `context` (usually the

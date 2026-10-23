@@ -1,4 +1,5 @@
 #include "power_manager.h"
+#include "runtime/fault_diagnostics.h"
 
 #include <algorithm>
 #include <array>
@@ -482,6 +483,7 @@ void RefreshSleepDiagnosticPowerPolicy()
     }
     if (now_us >= g_sleep_diag_dump_not_before_us) {
         wqn::runtime::DumpSleepDiagnosticsToLog();
+        wqn::runtime::DumpFaultDiagnosticsToLog();
         g_sleep_diag_dumped_for_host = true;
     }
 }
@@ -1650,6 +1652,7 @@ static void PowerCoordinatorTask(void*)
         // never blocks the UI task.
         if (runtime::ConsumeSleepDiagnosticsDumpRequest()) {
             runtime::DumpSleepDiagnosticsToLog();
+            runtime::DumpFaultDiagnosticsToLog();
         }
         RefreshUsbPowerSleepPolicy();
         runtime::LogLongHeldSleepLeases(esp_timer_get_time(), kLeaseWarningAfterUs);

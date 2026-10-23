@@ -5,6 +5,7 @@
 #include <new>
 #include <string>
 #include "voice_idle_disconnect.h"
+#include "runtime/fault_diagnostics.h"
 
 using esp_err_t = int;
 using TickType_t = uint32_t;
@@ -39,6 +40,14 @@ unsigned storage_leases = 0;
 namespace wqn {
 enum class AiSessionStatus { kIdle, kListening };
 namespace runtime {
+unsigned fault_reports = 0;
+FaultPhase fault_phase = FaultPhase::kReportedError;
+int32_t fault_code = 0;
+uint32_t fault_operation = 0;
+void RecordFault(FaultDomain domain, FaultPhase phase, int32_t code, uint32_t operation, uint32_t) {
+    CHECK(domain == FaultDomain::kStorage);
+    ++fault_reports; fault_phase = phase; fault_code = code; fault_operation = operation;
+}
 enum class SleepBlocker { kStorage };
 struct SleepLease {
     bool held;
@@ -203,10 +212,13 @@ int main()
     nvs_result = ESP_FAIL;
     CHECK(LoadAccessTokenFromStorageService(&token) == ESP_FAIL);
     CHECK(token.empty() && nvs_reads == 2);
+    CHECK(wqn::runtime::fault_reports == 1 && wqn::runtime::fault_phase == wqn::runtime::FaultPhase::kStorageExecution);
+    CHECK(wqn::runtime::fault_code == ESP_FAIL && wqn::runtime::fault_operation != 0);
     nvs_result = ESP_OK;
     queue_send_ok = false;
     CHECK(LoadAccessTokenFromStorageService(&token) == ESP_ERR_TIMEOUT);
     CHECK(nvs_reads == 2 && !queue_has_command);
+    CHECK(wqn::runtime::fault_reports == 2 && wqn::runtime::fault_phase == wqn::runtime::FaultPhase::kStorageQueueTimeout);
     queue_send_ok = true;
     semaphore_create_ok = false;
     CHECK(LoadAccessTokenFromStorageService(&token) == ESP_ERR_NO_MEM);
@@ -214,6 +226,7 @@ int main()
     semaphore_create_ok = true;
     queued_timeout = true;
     CHECK(LoadAccessTokenFromStorageService(&token) == ESP_ERR_TIMEOUT);
+    CHECK(wqn::runtime::fault_reports == 3 && wqn::runtime::fault_code == ESP_ERR_TIMEOUT);
     CHECK(queued.completion->state.load() == kCompletionAbandoned);
     queued_timeout = false;
     PumpOwner(); // Production owner skips the abandoned caller context.
