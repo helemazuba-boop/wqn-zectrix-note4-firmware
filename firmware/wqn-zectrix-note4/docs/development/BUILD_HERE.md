@@ -104,6 +104,31 @@ scripts\flash-fix.bat        :: re-flash bootloader + app
 
 ---
 
+## WSL B5 diagnostic comparison (2026-10-23)
+
+The active WSL build remains `build-wsl` with ESP-IDF 5.5.6. The one-purpose
+control directory `build-b5-diag-off-20261023` is an explicit exception to the
+single-directory rule: it uses its own sdkconfig with RAM diagnostics disabled.
+The normal root sdkconfig and `build-wsl` stay diagnostics-on.
+
+After loading this checkout's IDF environment, run
+`python3 scripts/build_diagnostic_pair.py --output dist/<new-artifact-directory>`
+from the firmware root on a clean tracked worktree. The tool **fullcleans the
+default build output**, rebuilds both profiles with the same build timestamp,
+checks the full config delta and artifact identities, and archives both without
+flashing. The control directory and output directory must be new; it refuses
+to overwrite an existing pair. Config archives may contain local WiFi credentials
+and stay private and ignored. Only the RAM diagnostic switch and dependent
+options may differ. Existing API/WS/build-type overrides are carried over.
+
+The verified pair is in `dist/b5-diagnostic-pair-20261023-clean/manifest.json`;
+the first attempt in `dist/b5-diagnostic-pair-20261023/` is superseded.
+See [batch 12](../engineering/RELIABILITY_BATCH_12.md) for hashes, the build
+gate correction, storage collection, and device measurements. To compare images
+on hardware, preserve NVS/SPIFFS with the existing app-only flashing procedure;
+an entry point that erases the whole chip destroys the comparison conditions.
+Neither image was flashed during pair preparation.
+
 ## History
 
 - 2026-06-14: Removed 15 stale `build-*` dirs; moved 13 `.bat` files to `scripts/`;

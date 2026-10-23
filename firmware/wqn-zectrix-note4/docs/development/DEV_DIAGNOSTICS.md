@@ -167,3 +167,20 @@ size_t CopyRecentErrors(ErrorRecord* out, size_t cap);
 - `WQN_FIRMWARE_VERSION` 保持手写、**不掺 hash**：它进同步 `image_id`（`sync_service.cpp`）与刷新签名（`ui/ui_refresh.cpp`），每次提交变化会污染这两处。
 
 2026-10-18 真机布局反馈修正：开发者列表随设置列表统一为 10px 外边距、原生 20px 主文字、36px 行距，五行滚动与六类诊断保持。状态栏使用全宽 y=27 的公共坐标，图标 y=6，右边距 10px；未新增底部操作说明栏。详情中的真实数据与输入语义保持。
+
+## 9. B5 存储采集与 RAM 诊断对照
+
+第十二批复用设置页面已有 `ReadStorageCapacitySnapshot()` 查询，输出
+`STORAGE:capacity query_start_us=... query_end_us=... total_bytes=... used_bytes=... result=...`。
+没有增加容量查询频率、事务后扫描或菜单行。两个时间来自 esp_timer，只描述该次查询；
+并发写入、观测间隔和查询失败必须保留为缺口，不能推算整段占用率。
+
+启动或「电源睡眠诊断」导出的 `FAULT:boot` 追加 `mem_diag=0/1`。中途挂接 no-reset
+monitor 后，先请求该导出，等身份头出现，再打开存储详情取得之后的容量观测。
+正常设置快照更新也会产生日志；这是日志/格式化开销，不能称为零成本。
+
+`scripts/analyze_storage_log.py` 按文件、观测到的 boot、build 与开关保守切段，输出
+JSON/CSV 和各存储 owner 的 queue/exec/样本数/结果；缺身份片段保持未知。
+完整规则、分位数报告门槛、同板 RAM 诊断开/关构建和设备测量矩阵见
+[第十二批记录](../engineering/RELIABILITY_BATCH_12.md)。关闭 RAM 诊断时，历史导出
+不再提供内存样本；RTC 故障摘要与既有电源诊断导出仍保留。

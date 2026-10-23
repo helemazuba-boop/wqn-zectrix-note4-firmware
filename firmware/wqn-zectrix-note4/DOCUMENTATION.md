@@ -114,7 +114,9 @@ by code, `AGENTS.md`, and the architecture/product references above.
 - `docs/engineering/RELIABILITY_BATCH_10.md` — production GPIO/task/ring replay,
   delayed PTT release preservation, burst capacity, ISR state and user-confirmed acceptance.
 - `docs/engineering/RELIABILITY_BATCH_11.md` — bounded RTC fault journal,
-  boot/storage provenance, torn-write recovery, resource budget and device checks.
+  boot/storage provenance, torn-write recovery, resource budget and user-confirmed checkpoint.
+- `docs/engineering/RELIABILITY_BATCH_12.md` — timed storage observations, log attribution,
+  matched RAM-diagnostic builds, artifact identities and remaining device measurements.
 - `docs/engineering/DEAD_CODE_CLEANUP.md` — evidence and scope for firmware
   cleanup decisions.
 - `docs/engineering/SYNC_V3_REPAIR.md` — sync repair findings, host checks, and
