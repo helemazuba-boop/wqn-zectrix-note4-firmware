@@ -1,6 +1,7 @@
 #include "button_input.h"
 
 #include <array>
+#include <atomic>
 
 #include "driver/gpio.h"
 #include "esp_log.h"
@@ -64,7 +65,8 @@ struct ButtonState {
     // [input-capture] The low-level ISR disables its own interrupt (a held key
     // would otherwise storm level interrupts); the task re-enables it once the
     // key is back to idle and every window has drained.
-    bool isr_disabled = false;
+    // Shared by the GPIO ISR and sampler (possibly on different cores).
+    std::atomic<uint32_t> isr_disabled{0};
 };
 
 std::array<ButtonState, 3> g_buttons = {{
@@ -79,18 +81,19 @@ std::array<ButtonState, 3> g_buttons = {{
 // xQueueSend cannot express. All head/tail mutation happens inside the
 // spinlock; producer is the button task, consumer is the UI task.
 //
-// Capacity contract: one short press produces up to 3 events (Press +
-// ShortPress + Release). 64 slots hold 20 full short presses (60 events) plus
-// margin while the UI is blocked for 12 s -- the design burst from the review.
-constexpr size_t kEventRingCapacity = 64;
+// A 200..649 ms short hold adds HoldPress: Press + HoldPress + ShortPress
+// (or DoublePress) + Release. Reserve 20 complete gestures (80 events) plus
+// one gesture of margin while the UI is blocked. All four are critical.
+constexpr size_t kEventRingCapacity = 84;
+static_assert(std::atomic<uint32_t>::is_always_lock_free);
 wqn::ButtonEvent g_event_ring[kEventRingCapacity];
 size_t g_ring_head = 0;  // next slot to write
 size_t g_ring_tail = 0;  // next slot to read
 size_t g_ring_count = 0;
 portMUX_TYPE g_ring_lock = portMUX_INITIALIZER_UNLOCKED;
-uint32_t g_dropped_critical = 0;
-uint32_t g_coalesced_repeat = 0;
-uint32_t g_ring_high_water = 0;
+std::atomic<uint32_t> g_dropped_critical{0};
+std::atomic<uint32_t> g_coalesced_repeat{0};
+std::atomic<uint32_t> g_ring_high_water{0};
 uint32_t g_event_seq = 0;
 
 TaskHandle_t g_button_task = nullptr;
@@ -134,7 +137,7 @@ void PushButtonEvent(wqn::ButtonEvent event)
         wqn::ButtonEvent& newest = g_event_ring[RingIndexFromNewest(0)];
         if (IsRepeatEvent(newest) && newest.button == event.button) {
             newest = event;
-            ++g_coalesced_repeat;
+            g_coalesced_repeat.fetch_add(1, std::memory_order_relaxed);
             taskEXIT_CRITICAL(&g_ring_lock);
             return;
         }
@@ -142,7 +145,7 @@ void PushButtonEvent(wqn::ButtonEvent event)
     if (g_ring_count == kEventRingCapacity) {
         if (IsRepeatEvent(event)) {
             // Full ring never spends a slot on a new repeat.
-            ++g_coalesced_repeat;
+            g_coalesced_repeat.fetch_add(1, std::memory_order_relaxed);
             taskEXIT_CRITICAL(&g_ring_lock);
             return;
         }
@@ -158,7 +161,7 @@ void PushButtonEvent(wqn::ButtonEvent event)
                 g_ring_head =
                     (g_ring_head + kEventRingCapacity - 1) % kEventRingCapacity;
                 --g_ring_count;
-                ++g_coalesced_repeat;
+                g_coalesced_repeat.fetch_add(1, std::memory_order_relaxed);
                 evicted = true;
                 break;
             }
@@ -166,7 +169,7 @@ void PushButtonEvent(wqn::ButtonEvent event)
         if (!evicted) {
             // Best effort exhausted: count it loudly instead of blocking the
             // sampler (a blocked producer stops capturing altogether).
-            ++g_dropped_critical;
+            g_dropped_critical.fetch_add(1, std::memory_order_relaxed);
             taskEXIT_CRITICAL(&g_ring_lock);
             return;
         }
@@ -174,8 +177,8 @@ void PushButtonEvent(wqn::ButtonEvent event)
     g_event_ring[g_ring_head] = event;
     g_ring_head = (g_ring_head + 1) % kEventRingCapacity;
     ++g_ring_count;
-    if (g_ring_count > g_ring_high_water) {
-        g_ring_high_water = static_cast<uint32_t>(g_ring_count);
+    if (g_ring_count > g_ring_high_water.load(std::memory_order_relaxed)) {
+        g_ring_high_water.store(static_cast<uint32_t>(g_ring_count), std::memory_order_relaxed);
     }
     taskEXIT_CRITICAL(&g_ring_lock);
 }
@@ -317,7 +320,7 @@ void IRAM_ATTR ButtonIsrHandler(void* arg)
     gpio_intr_disable(pin);
     for (ButtonState& button : g_buttons) {
         if (button.pin == pin) {
-            button.isr_disabled = true;
+            button.isr_disabled.store(1, std::memory_order_release);
             break;
         }
     }
@@ -331,8 +334,11 @@ void IRAM_ATTR ButtonIsrHandler(void* arg)
 void ReenableIdleButtonInterrupts()
 {
     for (ButtonState& button : g_buttons) {
-        if (button.isr_disabled && !button.raw_pressed && !button.stable_pressed) {
-            button.isr_disabled = false;
+        if (button.isr_disabled.load(std::memory_order_acquire) &&
+            !button.raw_pressed && !button.stable_pressed) {
+            // Clear before enabling: an asserted line can immediately enter
+            // the ISR again and publish a new disabled state.
+            button.isr_disabled.store(0, std::memory_order_release);
             gpio_intr_enable(button.pin);
         }
     }
@@ -449,17 +455,17 @@ bool ReceiveButtonEvent(ButtonEvent* out)
 
 uint32_t ButtonEventsDroppedCritical()
 {
-    return g_dropped_critical;
+    return g_dropped_critical.load(std::memory_order_relaxed);
 }
 
 uint32_t ButtonEventsCoalescedRepeat()
 {
-    return g_coalesced_repeat;
+    return g_coalesced_repeat.load(std::memory_order_relaxed);
 }
 
 uint32_t ButtonEventRingHighWater()
 {
-    return g_ring_high_water;
+    return g_ring_high_water.load(std::memory_order_relaxed);
 }
 
 }  // namespace wqn
