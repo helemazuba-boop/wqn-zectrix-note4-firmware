@@ -265,7 +265,11 @@ menu "WQN firmware"
             Sec-WebSocket-Protocol: wqn-flash-v2. Uplink audio is PCM16 binary
             frames (480 B each), downlink TTS audio is also binary and is
             rendered to ES8311 via the existing flash I2S duplex path.
-            Disable only to fall back to the legacy StepFun-shaped protocol.
+            Disabling selects a compile-only legacy StepFun-shaped fallback.
+            Both modes use the per-device pairing Bearer token; a legacy
+            deployment must independently verify it (for example auth_request
+            to /api/esp32/auth-verify). No firmware-wide shared key is sent.
+            Legacy runtime service acceptance is not release-verified.
 
     config WQN_AI_AUDIO_SELFTEST_ENABLE
         bool "Run WQN audio capture self-test at boot"

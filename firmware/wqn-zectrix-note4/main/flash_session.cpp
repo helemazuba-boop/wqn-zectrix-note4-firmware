@@ -2432,10 +2432,6 @@ esp_err_t StartFlashSessionNow(uint32_t generation)
     esp_websocket_client_append_header(g_flash.ws_client, "X-WQN-Client-Version",
                                        WQN_FIRMWARE_NAME "@" WQN_FIRMWARE_VERSION);
     esp_websocket_client_append_header(g_flash.ws_client, "X-WQN-Protocol", WQN_FLASH_WS_SUBPROTOCOL);
-#else
-    // Legacy v1 StepFun-shaped deployment still gates the WS upgrade behind a
-    // shared secret (nginx `if ($http_x_ws_secret != ...) return 401;`).
-    esp_websocket_client_append_header(g_flash.ws_client, "X-WS-Secret", "WQN_Flash_Secret_2026");
 #endif
 
     esp_err_t reg_err = esp_websocket_register_events(
