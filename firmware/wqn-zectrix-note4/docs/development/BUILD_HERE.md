@@ -140,6 +140,22 @@ For a later pair, choose new `--control-build build-<purpose>-<YYYYMMDD>` and
 image as a RAM-diagnostics experiment. See [batch 13](../engineering/RELIABILITY_BATCH_13.md)
 for the active-file protection and device matrix.
 
+## Reliability worktree, batch 14 (2026-10-24)
+
+The main checkout is on `fix/cross-repo-security-20261023`. Reliability work
+continues on `fix/firmware-reliability` in
+`/home/unknow/projects/firmware/.worktrees/reliability-20261024`, retaining
+the existing `a565923` security commit. This worktree has its own private
+sdkconfig and `build-wsl`; the main checkout's build output was not reused.
+
+From this worktree's firmware directory, the verified pair was prepared with
+`python3 scripts/build_diagnostic_pair.py --control-build build-b5-diag-off-b14-20261024 --output dist/b5-diagnostic-pair-b14-20261024`.
+The dated control directory is an explicit B5 comparison output. Its manifest
+is at `dist/b5-diagnostic-pair-b14-20261024/manifest.json`, within the worktree.
+Use that pair for the current runtime. Building from the main security checkout
+does not include the new reliability commit. See
+[batch 14](../engineering/RELIABILITY_BATCH_14.md) for identity and device checks.
+
 ## History
 
 - 2026-06-14: Removed 15 stale `build-*` dirs; moved 13 `.bat` files to `scripts/`;
