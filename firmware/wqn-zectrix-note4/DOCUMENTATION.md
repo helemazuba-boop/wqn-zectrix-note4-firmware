@@ -125,6 +125,8 @@ by code, `AGENTS.md`, and the architecture/product references above.
   real callback allocation-denial regressions, retained-buffer cost and current paired builds.
 - `docs/engineering/RELIABILITY_BATCH_16.md` — per-path pack stream admission, active cache
   reset deferral, nested download regressions, bounded ownership resources and device checks.
+- `docs/engineering/RELIABILITY_BATCH_17.md` — rollback pack retention when backup references
+  are uncertain, real manifest publication/parser fault regressions and the current build pair.
 - `docs/engineering/DEAD_CODE_CLEANUP.md` — evidence and scope for firmware
   cleanup decisions.
 - `docs/engineering/SYNC_V3_REPAIR.md` — sync repair findings, host checks, and

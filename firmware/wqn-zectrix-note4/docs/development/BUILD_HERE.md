@@ -164,13 +164,21 @@ pairs remain historical. Use the same-source batch 15 images when evaluating
 the pack callback change. See [batch 15](../engineering/RELIABILITY_BATCH_15.md)
 for identity, resource costs and device measurements.
 
-Batch 16's current runtime pair is
+Batch 16's archived runtime pair is
 `dist/b5-diagnostic-pair-b16-20261024/manifest.json` in the same reliability
 worktree. Its dedicated control build was prepared with
 `--control-build build-b5-diag-off-b16-20261024 --output dist/b5-diagnostic-pair-b16-20261024`.
 The dated directory is an explicit B5 comparison output. Use this same-source
 pair for path admission/cache-reset validation; prior pairs remain historical.
 See [batch 16](../engineering/RELIABILITY_BATCH_16.md).
+
+Batch 17's current runtime pair is
+`dist/b5-diagnostic-pair-b17-20261025/manifest.json` in the reliability worktree.
+Its dedicated control build was prepared with
+`--control-build build-b5-diag-off-b17-20261025 --output dist/b5-diagnostic-pair-b17-20261025`.
+The dated directory is an explicit B5 comparison output. Use this same-source
+pair for backup retention/pruning validation; earlier pairs remain historical.
+See [batch 17](../engineering/RELIABILITY_BATCH_17.md) for artifact identity and device checks.
 
 ## History
 
