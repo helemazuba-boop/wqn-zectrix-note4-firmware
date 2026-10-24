@@ -2,7 +2,8 @@
 """Exercise production Word/Note/Problem publication and rollback pruning.
 
 Uses real libc files, manifest parsers and ESP-IDF cJSON with injected read/
-allocation faults. Does not prove SPIFFS scheduling, power loss or device RAM.
+allocation faults, including single failed encoder allocations that recover.
+Does not prove SPIFFS scheduling, power loss or device RAM.
 """
 import argparse
 import os
@@ -24,7 +25,9 @@ def main():
                         default=Path(os.environ.get('IDF_PATH', '/home/unknow/esp/esp-idf-v5.5')))
     parser.add_argument('--mutation', choices=('ignore-read-word', 'ignore-read-note', 'ignore-read-problem',
                         'ignore-parse', 'no-backup-stems', 'prune-current',
-                        'skip-all', 'stat-gate'))
+                        'skip-all', 'stat-gate', 'unchecked-sha-word', 'unchecked-sha-note',
+                        'unchecked-sha-problem', 'unchecked-success', 'unchecked-null',
+                        'unchecked-has-more', 'leak-failed-tree'))
     args = parser.parse_args()
     cjson = args.idf_path / 'components/json/cJSON'
     if not (cjson / 'cJSON.c').is_file():
@@ -86,6 +89,21 @@ def main():
             document = ''
         functions = '\n'.join(function(text, signature) for signature in signatures)
         save = function(text, f'esp_err_t Save{suffix}PackManifestRaw(')
+        ignored = None
+        if args.mutation == 'unchecked-sha-' + domain:
+            ignored = 'cJSON_AddStringToObject(pack, "sha256", item.sha256.c_str())'
+        elif args.mutation == 'unchecked-success':
+            ignored = 'cJSON_AddBoolToObject(root, "success", true)'
+        elif args.mutation == 'unchecked-has-more':
+            ignored = 'cJSON_AddBoolToObject(data, "has_more", manifest.has_more)'
+        elif args.mutation == 'unchecked-null' and domain != 'word':
+            ignored = f'cJSON_AddNullToObject({"notebook" if domain == "note" else "set"}, "pack")'
+        if ignored:
+            assert save.count('!' + ignored) == 1
+            save = save.replace('!' + ignored, '(' + ignored + ', false)')
+        if args.mutation == 'leak-failed-tree':
+            assert 'cJSON_Delete(root);' in save
+            save = save.replace('cJSON_Delete(root);', '(void)root;', 1)
         pieces.append('namespace wqn {\n' + safe_stem + '\n}\nnamespace ' + domain + '_fixture {\n'
             + 'using namespace wqn;\n' + constants + '\n' + document + '\n' + functions
             + '\n' + prune + '\n' + save + '\n}\n')

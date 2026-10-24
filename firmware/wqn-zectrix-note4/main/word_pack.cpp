@@ -890,43 +890,51 @@ esp_err_t MergeWordPackManifestDelta(
 esp_err_t SaveWordPackManifestRaw(const WqnWordPackManifest& manifest)
 {
     cJSON* root = cJSON_CreateObject();
-    cJSON* data = cJSON_CreateObject();
-    cJSON* packs = cJSON_CreateArray();
-    if (root == nullptr || data == nullptr || packs == nullptr) {
+    if (root == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
+    if (!cJSON_AddBoolToObject(root, "success", true)) {
         cJSON_Delete(root);
-        cJSON_Delete(data);
-        cJSON_Delete(packs);
+        return ESP_ERR_NO_MEM;
+    }
+    cJSON* data = cJSON_AddObjectToObject(root, "data");
+    if (data == nullptr ||
+        !cJSON_AddStringToObject(data, "server_time", manifest.server_time.c_str()) ||
+        !cJSON_AddNumberToObject(data, "cursor", static_cast<double>(manifest.cursor)) ||
+        !cJSON_AddBoolToObject(data, "has_more", manifest.has_more)) {
+        cJSON_Delete(root);
+        return ESP_ERR_NO_MEM;
+    }
+    cJSON* packs = cJSON_AddArrayToObject(data, "packs");
+    if (packs == nullptr) {
+        cJSON_Delete(root);
         return ESP_ERR_NO_MEM;
     }
 
-    cJSON_AddBoolToObject(root, "success", true);
-    cJSON_AddItemToObject(root, "data", data);
-    cJSON_AddStringToObject(data, "server_time", manifest.server_time.c_str());
-    cJSON_AddNumberToObject(data, "cursor", static_cast<double>(manifest.cursor));
-    cJSON_AddBoolToObject(data, "has_more", manifest.has_more);
-    cJSON_AddItemToObject(data, "packs", packs);
-
     for (const WqnWordPackManifestItem& item : manifest.packs) {
         cJSON* pack = cJSON_CreateObject();
-        if (pack == nullptr) {
+        if (!cJSON_AddItemToArray(packs, pack)) {
+            cJSON_Delete(pack);
             cJSON_Delete(root);
             return ESP_ERR_NO_MEM;
         }
-        cJSON_AddStringToObject(pack, "pack_id", item.pack_id.c_str());
-        cJSON_AddStringToObject(pack, "deck_id", item.deck_id.c_str());
-        cJSON_AddStringToObject(pack, "title", item.title.c_str());
-        cJSON_AddNumberToObject(pack, "revision", static_cast<double>(item.revision));
-        cJSON_AddNumberToObject(pack, "content_revision", static_cast<double>(item.content_revision));
-        cJSON_AddNumberToObject(pack, "pack_revision", static_cast<double>(item.pack_revision));
-        cJSON_AddNumberToObject(pack, "change_sequence", static_cast<double>(item.change_sequence));
-        cJSON_AddNumberToObject(pack, "schema_version", item.schema_version);
-        cJSON_AddStringToObject(pack, "format", item.format.c_str());
-        cJSON_AddStringToObject(pack, "compression", item.compression.c_str());
-        cJSON_AddStringToObject(pack, "sha256", item.sha256.c_str());
-        cJSON_AddStringToObject(pack, "download_url", item.download_url.c_str());
-        cJSON_AddNumberToObject(pack, "entry_count", item.entry_count);
-        cJSON_AddNumberToObject(pack, "byte_size", item.byte_size);
-        cJSON_AddItemToArray(packs, pack);
+        if (!cJSON_AddStringToObject(pack, "pack_id", item.pack_id.c_str()) ||
+            !cJSON_AddStringToObject(pack, "deck_id", item.deck_id.c_str()) ||
+            !cJSON_AddStringToObject(pack, "title", item.title.c_str()) ||
+            !cJSON_AddNumberToObject(pack, "revision", static_cast<double>(item.revision)) ||
+            !cJSON_AddNumberToObject(pack, "content_revision", static_cast<double>(item.content_revision)) ||
+            !cJSON_AddNumberToObject(pack, "pack_revision", static_cast<double>(item.pack_revision)) ||
+            !cJSON_AddNumberToObject(pack, "change_sequence", static_cast<double>(item.change_sequence)) ||
+            !cJSON_AddNumberToObject(pack, "schema_version", item.schema_version) ||
+            !cJSON_AddStringToObject(pack, "format", item.format.c_str()) ||
+            !cJSON_AddStringToObject(pack, "compression", item.compression.c_str()) ||
+            !cJSON_AddStringToObject(pack, "sha256", item.sha256.c_str()) ||
+            !cJSON_AddStringToObject(pack, "download_url", item.download_url.c_str()) ||
+            !cJSON_AddNumberToObject(pack, "entry_count", item.entry_count) ||
+            !cJSON_AddNumberToObject(pack, "byte_size", item.byte_size)) {
+            cJSON_Delete(root);
+            return ESP_ERR_NO_MEM;
+        }
     }
 
     char* rendered = cJSON_PrintUnformatted(root);

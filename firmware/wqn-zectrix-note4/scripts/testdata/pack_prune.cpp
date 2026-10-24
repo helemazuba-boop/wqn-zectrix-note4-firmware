@@ -20,6 +20,8 @@
 #include "device_protocol/json_depth_guard.h"
 
 static unsigned checks = 0, backup_opens = 0, open_handles = 0, json_allocs = 0;
+static unsigned live_json = 0, json_failures = 0, write_opens = 0, encoder_fault_cases = 0;
+static bool encode_mode = false, fail_once = false;
 #define CHECK(expression) do { ++checks; if (!(expression)) { \
     std::fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #expression); std::abort(); } } while (false)
 static std::string directory, primary, temporary, backup;
@@ -44,9 +46,11 @@ extern "C" int __real_remove(const char*);
 extern "C" FILE* __wrap_fopen(const char* path, const char* mode)
 {
     const bool is_backup = path == backup && mode[0] == 'r';
+    if (encode_mode) count_json = false;  // Encoding must finish before any file is opened.
+    if (mode[0] != 'r') ++write_opens;
     if (is_backup) {
         ++backup_opens;
-        count_json = true;
+        count_json = !encode_mode;
         if (fault == Fault::kOpen) { errno = EIO; return nullptr; }
     }
     FILE* file = __real_fopen(path, mode);
@@ -77,10 +81,25 @@ extern "C" int __wrap_remove(const char* path)
 }
 static void* JsonAlloc(size_t bytes)
 {
-    if (count_json && fail_json_at >= 0 && json_allocs++ >= static_cast<unsigned>(fail_json_at))
-        return nullptr;
-    if (count_json && fail_json_at < 0) ++json_allocs;
-    return std::malloc(bytes);
+    if (count_json) {
+        const unsigned index = json_allocs++;
+        if (fail_json_at >= 0 && (index == static_cast<unsigned>(fail_json_at) ||
+            (!fail_once && index > static_cast<unsigned>(fail_json_at)))) {
+            ++json_failures;
+            return nullptr;
+        }
+    }
+    void* pointer = std::malloc(bytes);
+    if (pointer) ++live_json;
+    return pointer;
+}
+static void JsonFree(void* pointer)
+{
+    if (pointer) {
+        if (live_json == 0) std::abort();
+        --live_json;
+        std::free(pointer);
+    }
 }
 
 // Persisted Word sessions are a controlled port; the prune/hash matching is real.
@@ -186,6 +205,7 @@ static std::string PreparedPayload(unsigned domain)
 static void Reset(const std::string& base, unsigned domain)
 {
     CHECK(open_handles == 0);
+    CHECK(live_json == 0);
     directory = base; std::filesystem::remove_all(directory); std::filesystem::create_directories(directory);
     const std::string prefix = std::string(Prefix(domain)) + "manifest";
     primary = directory + prefix + ".json"; temporary = directory + prefix + ".tmp";
@@ -194,6 +214,7 @@ static void Reset(const std::string& base, unsigned domain)
     kManifestTempPath = temporary.c_str(); kManifestBackupPath = backup.c_str();
     backup_file = nullptr; backup_opens = 0; json_allocs = 0;
     fault = Fault::kNone; fail_json_at = -1; count_json = false; removals.clear(); pinned_sha.clear();
+    encode_mode = false; fail_once = false; json_failures = 0; write_opens = 0;
 }
 static void SeedPacks(unsigned domain)
 {
@@ -283,13 +304,94 @@ static void TestDomain(const std::string& base, unsigned domain)
         pinned_sha.clear(); Prune(domain); CheckSurvivors(domain, false);
     }
 }
+static int SaveShape(unsigned domain, unsigned shape)
+{
+    if (domain == 2) {
+        wqn::WqnWordPackManifest manifest;
+        manifest.server_time = "2026-10-25T00:00:00Z"; manifest.cursor = 42; manifest.has_more = true;
+        if (shape) for (unsigned value : {3, 4}) manifest.packs.push_back(Word(value));
+        return word_fixture::SaveWordPackManifestRaw(manifest);
+    }
+    if (domain == 1) {
+        wqn::WqnProblemPackManifest manifest; manifest.cursor = 42; manifest.has_more = true;
+        if (shape) for (unsigned value : {3, 4}) {
+            auto item = Problem(value); item.has_pack = shape != 2;
+            item.name = "quoted \"name\"\n中文"; manifest.problem_sets.push_back(item);
+        }
+        return problem_fixture::SaveProblemPackManifestRaw(manifest);
+    }
+    wqn::WqnNotePackManifest manifest; manifest.cursor = 42; manifest.has_more = true;
+    if (shape) for (unsigned value : {3, 4}) {
+        auto item = Note(value); item.has_pack = shape != 2;
+        item.title = "quoted \"title\"\n中文"; manifest.notebooks.push_back(item);
+    }
+    return note_fixture::SaveNotePackManifestRaw(manifest);
+}
+static void CheckLoadedShape(unsigned domain, unsigned shape)
+{
+    const size_t size = shape ? 2 : 0;
+    if (domain == 2) {
+        wqn::WqnWordPackManifest parsed;
+        CHECK(word_fixture::ParsePackManifestFile(&parsed) == ESP_OK);
+        CHECK(parsed.cursor == 42 && parsed.has_more && parsed.packs.size() == size);
+        if (shape) CHECK(parsed.packs.back().sha256 == Word(4).sha256);
+    } else if (domain) {
+        wqn::WqnProblemPackManifest parsed;
+        CHECK(problem_fixture::ParseStoredProblemManifest(&parsed) == ESP_OK);
+        CHECK(parsed.cursor == 42 && parsed.has_more && parsed.problem_sets.size() == size);
+        if (shape) CHECK(parsed.problem_sets.back().has_pack == (shape != 2));
+    } else {
+        wqn::WqnNotePackManifest parsed;
+        CHECK(note_fixture::ParseStoredNoteManifest(&parsed) == ESP_OK);
+        CHECK(parsed.cursor == 42 && parsed.has_more && parsed.notebooks.size() == size);
+        if (shape) CHECK(parsed.notebooks.back().has_pack == (shape != 2));
+    }
+}
+static void TestEncoding(const std::string& base, unsigned domain)
+{
+    Reset(base, domain); const std::string older = PreparedPayload(domain);
+    CHECK(Save(domain, 2) == ESP_OK); const std::string previous = Read(primary);
+    for (unsigned shape = 0; shape < (domain == 2 ? 2U : 3U); ++shape) {
+        Reset(base, domain); encode_mode = true; count_json = true;
+        CHECK(SaveShape(domain, shape) == ESP_OK);
+        const unsigned allocations = json_allocs; const std::string expected = Read(primary);
+        CHECK(allocations > 0); CHECK(live_json == 0); CheckLoadedShape(domain, shape);
+        for (bool installed : {false, true}) for (unsigned index = 0; index < allocations; ++index) {
+            Reset(base, domain);
+            if (installed) { Write(primary, previous); Write(backup, older); }
+            SeedPacks(domain); removals.clear(); write_opens = 0;
+            encode_mode = true; count_json = true; fail_once = true;
+            fail_json_at = static_cast<int>(index);
+            const int result = SaveShape(domain, shape);
+            count_json = false; fail_json_at = -1;
+            if (result != ESP_ERR_NO_MEM) std::fprintf(stderr,
+                "encoder fault domain=%u shape=%u installed=%d allocation=%u result=%d\n",
+                domain, shape, installed, index, result);
+            CHECK(json_failures == 1); CHECK(result == ESP_ERR_NO_MEM);
+            CHECK(live_json == 0); CHECK(open_handles == 0); CHECK(write_opens == 0);
+            CHECK(removals.empty()); CHECK(!Exists(temporary));
+            CHECK(Exists(primary) == installed); CHECK(Exists(backup) == installed);
+            if (installed) { CHECK(Read(primary) == previous); CHECK(Read(backup) == older); }
+            CheckSurvivors(domain, true);
+            CHECK(SaveShape(domain, shape) == ESP_OK);
+            CHECK(Read(primary) == expected); CheckLoadedShape(domain, shape);
+            if (installed) CHECK(Read(backup) == previous); else CHECK(!Exists(backup));
+            CHECK(!Exists(temporary)); CHECK(live_json == 0); ++encoder_fault_cases;
+        }
+        std::printf("Encoder domain=%u shape=%u: %u single-allocation sites, first install + replacement PASS\n",
+                    domain, shape, allocations);
+    }
+}
 int main(int argc, char** argv)
 {
-    CHECK(argc == 3); cJSON_Hooks hooks{JsonAlloc, std::free}; cJSON_InitHooks(&hooks);
+    CHECK(argc == 3); cJSON_Hooks hooks{JsonAlloc, JsonFree}; cJSON_InitHooks(&hooks);
     const char* domains[] = {"note", "problem", "word"};
     for (unsigned domain : {0, 1, 2}) {
-        if (std::strcmp(argv[2], "all") == 0 || std::strcmp(argv[2], domains[domain]) == 0)
+        if (std::strcmp(argv[2], "all") == 0 || std::strcmp(argv[2], domains[domain]) == 0) {
             TestDomain(argv[1], domain);
+            TestEncoding(argv[1], domain);
+        }
     }
-    std::printf("Production Word/Note/Problem publish + rollback pruning: %u checks PASS; libc/cJSON/session ports, not SPIFFS HIL\n", checks);
+    CHECK(live_json == 0);
+    std::printf("Production Word/Note/Problem publish + rollback pruning: %u checks, %u single-allocation encoder faults PASS; libc/cJSON/session ports, not SPIFFS HIL\n", checks, encoder_fault_cases);
 }

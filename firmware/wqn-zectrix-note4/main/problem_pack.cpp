@@ -803,48 +803,59 @@ esp_err_t LoadProblemPackManifest(WqnProblemPackManifest* manifest)
 esp_err_t SaveProblemPackManifestRaw(const WqnProblemPackManifest& manifest)
 {
     cJSON* root = cJSON_CreateObject();
-    cJSON* data = cJSON_CreateObject();
-    cJSON* sets = cJSON_CreateArray();
-    if (root == nullptr || data == nullptr || sets == nullptr) {
-        cJSON_Delete(root);
-        cJSON_Delete(data);
-        cJSON_Delete(sets);
+    if (root == nullptr) {
         return ESP_ERR_NO_MEM;
     }
-    cJSON_AddBoolToObject(root, "success", true);
-    cJSON_AddItemToObject(root, "data", data);
-    cJSON_AddNumberToObject(data, "cursor", static_cast<double>(manifest.cursor));
-    cJSON_AddBoolToObject(data, "has_more", manifest.has_more);
-    cJSON_AddItemToObject(data, "problem_sets", sets);
+    if (!cJSON_AddBoolToObject(root, "success", true)) {
+        cJSON_Delete(root);
+        return ESP_ERR_NO_MEM;
+    }
+    cJSON* data = cJSON_AddObjectToObject(root, "data");
+    if (data == nullptr ||
+        !cJSON_AddNumberToObject(data, "cursor", static_cast<double>(manifest.cursor)) ||
+        !cJSON_AddBoolToObject(data, "has_more", manifest.has_more)) {
+        cJSON_Delete(root);
+        return ESP_ERR_NO_MEM;
+    }
+    cJSON* sets = cJSON_AddArrayToObject(data, "problem_sets");
+    if (sets == nullptr) {
+        cJSON_Delete(root);
+        return ESP_ERR_NO_MEM;
+    }
 
     for (const WqnProblemPackManifestSet& item : manifest.problem_sets) {
         cJSON* set = cJSON_CreateObject();
-        if (set == nullptr) {
+        if (!cJSON_AddItemToArray(sets, set)) {
+            cJSON_Delete(set);
             cJSON_Delete(root);
             return ESP_ERR_NO_MEM;
         }
-        cJSON_AddItemToArray(sets, set);
-        cJSON_AddStringToObject(set, "problem_set_id", item.problem_set_id.c_str());
-        cJSON_AddStringToObject(set, "name", item.name.c_str());
-        cJSON_AddBoolToObject(set, "is_smart", item.is_smart);
-        cJSON_AddBoolToObject(set, "has_pack", item.has_pack);
+        if (!cJSON_AddStringToObject(set, "problem_set_id", item.problem_set_id.c_str()) ||
+            !cJSON_AddStringToObject(set, "name", item.name.c_str()) ||
+            !cJSON_AddBoolToObject(set, "is_smart", item.is_smart) ||
+            !cJSON_AddBoolToObject(set, "has_pack", item.has_pack)) {
+            cJSON_Delete(root);
+            return ESP_ERR_NO_MEM;
+        }
         if (!item.has_pack) {
-            cJSON_AddNullToObject(set, "pack");
+            if (!cJSON_AddNullToObject(set, "pack")) {
+                cJSON_Delete(root);
+                return ESP_ERR_NO_MEM;
+            }
             continue;
         }
-        cJSON* pack = cJSON_CreateObject();
-        if (pack == nullptr) {
+        cJSON* pack = cJSON_AddObjectToObject(set, "pack");
+        if (pack == nullptr ||
+            !cJSON_AddStringToObject(pack, "pack_id", item.pack_id.c_str()) ||
+            !cJSON_AddNumberToObject(pack, "pack_revision", static_cast<double>(item.pack_revision)) ||
+            !cJSON_AddNumberToObject(pack, "schema_version", item.schema_version) ||
+            !cJSON_AddNumberToObject(pack, "entry_count", item.entry_count) ||
+            !cJSON_AddNumberToObject(pack, "byte_size", item.byte_size) ||
+            !cJSON_AddStringToObject(pack, "sha256", item.sha256.c_str()) ||
+            !cJSON_AddStringToObject(pack, "download_url", item.download_url.c_str())) {
             cJSON_Delete(root);
             return ESP_ERR_NO_MEM;
         }
-        cJSON_AddItemToObject(set, "pack", pack);
-        cJSON_AddStringToObject(pack, "pack_id", item.pack_id.c_str());
-        cJSON_AddNumberToObject(pack, "pack_revision", static_cast<double>(item.pack_revision));
-        cJSON_AddNumberToObject(pack, "schema_version", item.schema_version);
-        cJSON_AddNumberToObject(pack, "entry_count", item.entry_count);
-        cJSON_AddNumberToObject(pack, "byte_size", item.byte_size);
-        cJSON_AddStringToObject(pack, "sha256", item.sha256.c_str());
-        cJSON_AddStringToObject(pack, "download_url", item.download_url.c_str());
     }
 
     char* rendered = cJSON_PrintUnformatted(root);
