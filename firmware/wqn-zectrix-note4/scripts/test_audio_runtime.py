@@ -30,11 +30,13 @@ def function(source, signature):
 def main():
     root = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--service-source', type=Path, default=root / 'main/services/storage_service.cpp')
     parser.add_argument('--mutation', choices=('direct-nvs', 'clock-every-tick',
-                                              'ignore-active-use', 'abandon-running', 'empty-query-fault'))
+                                              'ignore-active-use', 'abandon-running', 'empty-query-fault',
+                                              'heap-background', 'abandon-background', 'skip-background-wait'))
     args = parser.parse_args()
     storage = (root / 'main/storage.cpp').read_text()
-    service = (root / 'main/services/storage_service.cpp').read_text()
+    service = args.service_source.read_text()
     transport = (root / 'main/stdpro_ws_transport.cpp').read_text()
     clock = (root / 'main/ai_session.cpp').read_text()
     bodies = {
@@ -48,6 +50,22 @@ def main():
         '@@IDLE@@': function(transport, 'void TryIdleDisconnect()') + '\n' +
                      function(transport, 'void RequestIdleDisconnect()'),
     }
+    helper = 'esp_err_t ExecuteBackgroundStorageTransaction('
+    if helper in service:
+        background = function(service, helper)
+        if args.mutation == 'abandon-background':
+            old = 'while (xSemaphoreTake(completion.semaphore, portMAX_DELAY) != pdTRUE) {\n        vTaskDelay(1);\n    }'
+            assert background.count(old) == 1
+            background = background.replace(old, 'if (xSemaphoreTake(completion.semaphore, portMAX_DELAY) != pdTRUE) return ESP_ERR_TIMEOUT;')
+        elif args.mutation == 'skip-background-wait':
+            old = 'while (xSemaphoreTake(completion.semaphore, portMAX_DELAY) != pdTRUE)'
+            assert background.count(old) == 1
+            background = background.replace(old, 'while (false)')
+        if args.mutation == 'heap-background':
+            old = 'if (!foreground) {'
+            assert bodies['@@STORAGE_CALLER@@'].count(old) == 1
+            bodies['@@STORAGE_CALLER@@'] = bodies['@@STORAGE_CALLER@@'].replace(old, 'if (false) {')
+        bodies['@@STORAGE_CALLER@@'] = background + '\n' + bodies['@@STORAGE_CALLER@@']
     if args.mutation == 'direct-nvs':
         bodies['@@TOKEN@@'] = ('esp_err_t LoadAccessTokenFromStorageService(std::string* token) '
                                 '{ return LoadAccessToken(token); }')

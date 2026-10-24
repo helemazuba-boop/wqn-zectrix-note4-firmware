@@ -7,6 +7,16 @@
 #include "voice_idle_disconnect.h"
 #include "runtime/fault_diagnostics.h"
 
+bool deny_completion_allocation = false;
+unsigned completion_allocations = 0;
+void* operator new(std::size_t bytes, const std::nothrow_t&) noexcept
+{
+    ++completion_allocations;
+    if (deny_completion_allocation) return nullptr;
+    try { return ::operator new(bytes); } catch (...) { return nullptr; }
+}
+void operator delete(void* pointer, const std::nothrow_t&) noexcept { ::operator delete(pointer); }
+
 using esp_err_t = int;
 using TickType_t = uint32_t;
 using UBaseType_t = unsigned;
@@ -80,6 +90,9 @@ TaskHandle_t g_task = reinterpret_cast<void*>(3);
 StorageCommand queued;
 bool queue_has_command = false, queue_send_ok = true, semaphore_create_ok = true;
 bool queued_timeout = false, running_timeout = false;
+bool background_wait_retry = false;
+unsigned caller_retry_delays = 0;
+QueueHandle_t last_queue = nullptr;
 unsigned nvs_reads = 0, infinite_waits = 0;
 esp_err_t nvs_result = ESP_OK;
 struct OwnerYield {};
@@ -98,7 +111,8 @@ SemaphoreHandle_t xSemaphoreCreateBinaryStatic(StaticSemaphore_t* storage)
 }
 int xQueueSend(QueueHandle_t queue, const StorageCommand* command, TickType_t)
 {
-    CHECK(queue == g_foreground_queue);
+    CHECK(queue == g_foreground_queue || queue == g_background_queue);
+    last_queue = queue;
     if (!queue_send_ok) return pdFALSE;
     CHECK(!queue_has_command);
     queued = *command;
@@ -107,7 +121,10 @@ int xQueueSend(QueueHandle_t queue, const StorageCommand* command, TickType_t)
 }
 void xTaskNotifyGive(TaskHandle_t task) { CHECK(task == g_task); }
 void ulTaskNotifyTake(int, TickType_t) { throw OwnerYield{}; }
-void vTaskDelay(int) { throw OwnerYield{}; }
+void vTaskDelay(int ticks) {
+    if (on_storage_owner) throw OwnerYield{};
+    CHECK(ticks == 1); ++caller_retry_delays;
+}
 void PumpOwner()
 {
     on_storage_owner = true;
@@ -124,6 +141,10 @@ int xSemaphoreGive(SemaphoreHandle_t semaphore)
 int xSemaphoreTake(SemaphoreHandle_t semaphore, TickType_t ticks)
 {
     if (semaphore == &ui_mutex) return pdTRUE;
+    if (background_wait_retry && ticks == portMAX_DELAY) {
+        background_wait_retry = false;
+        return pdFALSE;
+    }
     if (queued_timeout) return pdFALSE;
     if (running_timeout && ticks != portMAX_DELAY) {
         // Controlled RTOS interleave: the owner won kQueued -> kRunning
@@ -195,6 +216,71 @@ void DoDestroyWs()
 }
 @@IDLE@@
 
+struct BackgroundContext { bool open = false; unsigned calls = 0; };
+int BeginBackground(void* pointer)
+{
+    auto* context = static_cast<BackgroundContext*>(pointer);
+    CHECK(on_storage_owner); context->open = true; ++context->calls;
+    return ESP_OK;
+}
+int AbortBackground(void* pointer)
+{
+    auto* context = static_cast<BackgroundContext*>(pointer);
+    CHECK(on_storage_owner && context->open); context->open = false; ++context->calls;
+    return ESP_OK;
+}
+void BackgroundTransactions()
+{
+    BackgroundContext context;
+    CHECK(ExecuteStorageTransactionInternal(BeginBackground, &context, "begin", false) == ESP_OK);
+    CHECK(context.open && context.calls == 1 && last_queue == g_background_queue);
+    const unsigned before_abort = completion_allocations;
+    deny_completion_allocation = true;
+    const auto result = ExecuteStorageTransactionInternal(AbortBackground, &context, "abort", false);
+    CHECK(result == ESP_OK && !context.open && context.calls == 2);
+    CHECK(completion_allocations == before_abort && !queue_has_command);
+    CHECK(ExecuteStorageTransactionInternal(BeginBackground, &context, "foreground", true) == ESP_ERR_NO_MEM);
+    CHECK(!context.open && !queue_has_command && context.calls == 2);
+    deny_completion_allocation = false;
+
+    background_wait_retry = true;
+    const auto delays_before = caller_retry_delays;
+    CHECK(ExecuteStorageTransactionInternal(BeginBackground, &context, "wait-retry", false) == ESP_OK);
+    CHECK(context.open && context.calls == 3 && caller_retry_delays == delays_before + 1);
+    CHECK(!queue_has_command);
+    CHECK(ExecuteStorageTransactionInternal(AbortBackground, &context, "abort", false) == ESP_OK);
+    CHECK(!context.open && context.calls == 4);
+
+    const auto allocations_before = completion_allocations;
+    queue_send_ok = false;
+    CHECK(ExecuteStorageTransactionInternal(BeginBackground, &context, "queue-reject", false) == ESP_ERR_TIMEOUT);
+    CHECK(!queue_has_command && !context.open && context.calls == 4);
+    queue_send_ok = true;
+    semaphore_create_ok = false;
+    CHECK(ExecuteStorageTransactionInternal(BeginBackground, &context, "semaphore-reject", false) == ESP_ERR_NO_MEM);
+    semaphore_create_ok = true;
+    g_task = nullptr;
+    CHECK(ExecuteStorageTransactionInternal(BeginBackground, &context, "not-started", false) == ESP_ERR_INVALID_STATE);
+    g_task = reinterpret_cast<void*>(3);
+    CHECK(context.calls == 4 && completion_allocations == allocations_before);
+    on_storage_owner = true;
+    CHECK(ExecuteStorageTransactionInternal(BeginBackground, &context, "nested", false) == ESP_OK);
+    CHECK(ExecuteStorageTransactionInternal(AbortBackground, &context, "nested", false) == ESP_OK);
+    on_storage_owner = false;
+    CHECK(context.calls == 6 && !context.open && completion_allocations == allocations_before);
+    const auto reports_before_empty = wqn::runtime::fault_reports;
+    deny_completion_allocation = true;
+    CHECK(ExecuteStorageTransactionInternal([](void*) { return ESP_ERR_NOT_FOUND; },
+        &context, "background-empty", false) == ESP_ERR_NOT_FOUND);
+    CHECK(wqn::runtime::fault_reports == reports_before_empty);
+    CHECK(ExecuteStorageTransactionInternal([](void*) { return ESP_FAIL; },
+        &context, "background-error", false) == ESP_FAIL);
+    CHECK(wqn::runtime::fault_reports == reports_before_empty + 1 &&
+        wqn::runtime::fault_phase == wqn::runtime::FaultPhase::kStorageExecution);
+    CHECK(completion_allocations == allocations_before && !queue_has_command);
+    deny_completion_allocation = false;
+}
+
 int main()
 {
     using wqn::LoadAccessTokenFromStorageService;
@@ -247,6 +333,8 @@ int main()
     CHECK(LoadAccessTokenFromStorageService(&token) == ESP_ERR_NOT_FOUND);
     CHECK(wqn::runtime::fault_reports == reports_before_empty_query);
     nvs_result = ESP_OK;
+
+    BackgroundTransactions();
 
     SetAiRecordingLabel(0);
     CHECK(revisions == 1 && g_state.toast_label.find("00:00") != std::string::npos);

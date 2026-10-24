@@ -195,6 +195,43 @@ void StorageServiceTask(void*)
     }
 }
 
+esp_err_t ExecuteBackgroundStorageTransaction(
+    wqn::services::StorageTransaction transaction,
+    void* context,
+    const char* owner)
+{
+    // Background calls never abandon queued work. Keep their completion on
+    // the caller's stack so memory pressure cannot reject an Abort merely
+    // because its completion block needs another heap allocation.
+    StorageCompletion completion;
+    completion.semaphore = xSemaphoreCreateBinaryStatic(
+        &completion.semaphore_storage);
+    if (completion.semaphore == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
+    completion.request_id = NextRequestId();
+
+    StorageCommand command;
+    command.transaction = transaction;
+    command.context = context;
+    command.request_id = completion.request_id;
+    command.owner = owner;
+    command.completion = &completion;
+    command.queued_at_us = esp_timer_get_time();
+    if (xQueueSend(g_background_queue, &command, portMAX_DELAY) != pdTRUE) {
+        wqn::runtime::RecordFault(wqn::runtime::FaultDomain::kStorage,
+            wqn::runtime::FaultPhase::kStorageQueueTimeout, ESP_ERR_TIMEOUT, command.request_id);
+        return ESP_ERR_TIMEOUT;
+    }
+    xTaskNotifyGive(g_task);
+    // The worker may still reference both stack objects. An unsuccessful
+    // wait must never let this caller return or mark them abandoned.
+    while (xSemaphoreTake(completion.semaphore, portMAX_DELAY) != pdTRUE) {
+        vTaskDelay(1);
+    }
+    return completion.result;
+}
+
 esp_err_t ExecuteStorageTransactionInternal(
     wqn::services::StorageTransaction transaction,
     void* context,
@@ -210,6 +247,9 @@ esp_err_t ExecuteStorageTransactionInternal(
     if (g_background_queue == nullptr || g_foreground_queue == nullptr ||
         g_task == nullptr) {
         return ESP_ERR_INVALID_STATE;
+    }
+    if (!foreground) {
+        return ExecuteBackgroundStorageTransaction(transaction, context, owner);
     }
 
     // Heap-allocated so a timed-out foreground caller can abandon the block
