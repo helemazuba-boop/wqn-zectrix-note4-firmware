@@ -121,6 +121,8 @@ by code, `AGENTS.md`, and the architecture/product references above.
   capacity reclaim, clock-step regressions, identified low-occupancy evidence and new paired builds.
 - `docs/engineering/RELIABILITY_BATCH_14.md` — background completion lifetime without
   per-command heap allocation, allocation-failure regressions and an isolated build checkpoint.
+- `docs/engineering/RELIABILITY_BATCH_15.md` — prepared pack paths and fixed digest rendering,
+  real callback allocation-denial regressions, retained-buffer cost and current paired builds.
 - `docs/engineering/DEAD_CODE_CLEANUP.md` — evidence and scope for firmware
   cleanup decisions.
 - `docs/engineering/SYNC_V3_REPAIR.md` — sync repair findings, host checks, and

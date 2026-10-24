@@ -156,6 +156,14 @@ Use that pair for the current runtime. Building from the main security checkout
 does not include the new reliability commit. See
 [batch 14](../engineering/RELIABILITY_BATCH_14.md) for identity and device checks.
 
+Batch 15 continues in the same worktree. Its current runtime pair is
+`dist/b5-diagnostic-pair-b15-20261024/manifest.json`, prepared with
+`--control-build build-b5-diag-off-b15-20261024 --output dist/b5-diagnostic-pair-b15-20261024`.
+This dated control directory is another explicit B5 comparison output; earlier
+pairs remain historical. Use the same-source batch 15 images when evaluating
+the pack callback change. See [batch 15](../engineering/RELIABILITY_BATCH_15.md)
+for identity, resource costs and device measurements.
+
 ## History
 
 - 2026-06-14: Removed 15 stale `build-*` dirs; moved 13 `.bat` files to `scripts/`;
