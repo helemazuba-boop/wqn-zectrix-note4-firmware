@@ -110,6 +110,9 @@ jobs:
       - name: Exercise pack callbacks with C++ allocation denied after Begin (not HIL)
         run: python3 firmware/wqn-zectrix-note4/scripts/test_pack_stream_allocations.py
 
+      - name: Exercise bounded pack-path ownership and task contention (not HIL)
+        run: python3 firmware/wqn-zectrix-note4/scripts/test_pack_stream_path_lease.py
+
   contract:
     name: Architecture gate fixtures
     runs-on: ubuntu-latest

@@ -22,6 +22,7 @@ idf_component_register(
         "provision_manager.cpp"
         "runtime/storage_schema.cpp"
         "runtime/storage_temp_file_lease.cpp"
+        "runtime/pack_stream_path_lease.cpp"
         "runtime/memory_diagnostics.cpp"
         "runtime/wall_clock.cpp"
         "runtime/fault_diagnostics.cpp"

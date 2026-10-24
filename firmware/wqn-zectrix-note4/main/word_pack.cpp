@@ -26,6 +26,7 @@
 #include "mbedtls/sha256.h"
 #include "runtime/sleep_coordinator.h"
 #include "runtime/storage_temp_file_lease.h"
+#include "runtime/pack_stream_path_lease.h"
 #include "services/storage_service.h"
 #include "word_study_store.h"
 
@@ -464,6 +465,11 @@ void PruneUnreferencedPackFiles(const wqn::WqnWordPackManifest& current)
 
 esp_err_t ResetWordPackStorageCacheRaw(void*)
 {
+    // Streams keep FILEs open across owner transactions, so a reset must
+    // defer before touching manifests or temporary files owned by a stream.
+    if (wqn::runtime::HasActivePackStreamPath()) {
+        return ESP_ERR_INVALID_STATE;
+    }
     const char* manifest_paths[] = {
         kManifestPath,
         kManifestTempPath,
@@ -1376,6 +1382,11 @@ esp_err_t DownloadWordPackToStorage(
     // must not rebuild them while memory pressure may require cleanup.
     context.temp_path = TempPackPathForItem(item);
     context.final_path = PackPathForItem(item);
+    // Declared after context: unregister before its path buffers are freed.
+    runtime::PackStreamPathLease path_lease(context.temp_path.c_str());
+    if (!path_lease) {
+        return ESP_ERR_INVALID_STATE;
+    }
     mbedtls_sha256_init(&context.sha);
     context.operation = WordPackStreamOperation::kBegin;
     esp_err_t result = services::ExecuteStorageTransactionNamed(

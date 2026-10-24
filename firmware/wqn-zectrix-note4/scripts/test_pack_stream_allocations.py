@@ -11,6 +11,7 @@ import subprocess
 import tempfile
 
 from test_audio_runtime import function
+from test_storage_temp_lease import write_freertos_port
 
 
 def main():
@@ -19,7 +20,9 @@ def main():
     parser.add_argument('--source-dir', type=Path, default=root / 'main')
     parser.add_argument('--measure-only', action='store_true')
     parser.add_argument('--mutation', choices=('rebuild-word', 'rebuild-note', 'rebuild-problem',
-                        'heap-digest', 'ignore-digest', 'omit-paths', 'wrong-final-path'))
+                        'heap-digest', 'ignore-digest', 'omit-paths', 'wrong-final-path',
+                        'unlease-word', 'unlease-note', 'unlease-problem', 'release-path-early',
+                        'unguard-reset', 'late-cache-guard'))
     args = parser.parse_args()
     sources = []
     for domain, member, stem, temp, final in (
@@ -44,6 +47,16 @@ def main():
         start = text.index(f'enum class {name}PackStreamOperation :')
         end = text.index(f'\nbool {name}PackNeedsDownload(', start)
         body = text[start:end]
+        guard = '''    runtime::PackStreamPathLease path_lease(context.temp_path.c_str());
+    if (!path_lease) {
+        return ESP_ERR_INVALID_STATE;
+    }'''
+        if args.mutation == 'unlease-' + domain:
+            assert body.count(guard) == 1
+            body = body.replace(guard, '')
+        elif args.mutation == 'release-path-early':
+            assert body.count(guard) == 1
+            body = body.replace(guard, '    {\n' + guard + '\n    }')
         if args.mutation == 'rebuild-' + domain:
             old = 'const std::string& temp_path = context->temp_path;\n    const std::string& final_path = context->final_path;'
             assert body.count(old) == 1
@@ -56,19 +69,30 @@ def main():
             body = body.replace(f'context.final_path = {final}({member});', '')
         if args.mutation == 'wrong-final-path':
             body = body.replace('const std::string& final_path = context->final_path;', 'const std::string& final_path = context->temp_path;')
-        sources.append('\n'.join([safe_stem, factory, *builders, body]))
+        reset = function(text, f'esp_err_t Reset{name}PackStorageCacheRaw(')
+        reset_guard = '''    if (wqn::runtime::HasActivePackStreamPath()) {
+        return ESP_ERR_INVALID_STATE;
+    }'''
+        if args.mutation in ('unguard-reset', 'late-cache-guard'):
+            assert reset.count(reset_guard) == 1
+            reset = reset.replace(reset_guard, '')
+            if args.mutation == 'late-cache-guard':
+                reset = reset.replace('    DIR* directory = opendir(kStorageRoot);', reset_guard + '\n    DIR* directory = opendir(kStorageRoot);')
+        sources.append('\n'.join([safe_stem, factory, *builders, reset, body]))
     fixture = (root / 'scripts/testdata/pack_stream_allocations.cpp').read_text()
     fixture = fixture.replace('@@PRODUCTION@@', '\n'.join(sources))
     fixture = fixture.replace('@@FILE_EXISTS@@', function((args.source_dir / 'word_pack.cpp').read_text(), 'bool FileExists('))
     with tempfile.TemporaryDirectory(prefix='note4-stream-allocation-') as directory:
         port = Path(directory)
         (port / 'fixture.cpp').write_text(fixture)
+        write_freertos_port(port)
         binary = port / 'test'
         command = ['g++', '-std=c++17', '-O1', '-Wall', '-Wextra', '-Werror',
                    '-fsanitize=address,undefined', '-fno-sanitize-recover=all',
                    '-fno-omit-frame-pointer', '-fno-pie', '-no-pie', '-pthread',
-                   '-I', str(root / 'main'), str(port / 'fixture.cpp'),
+                   '-I', str(port), '-I', str(root / 'main'), str(port / 'fixture.cpp'),
                    str(root / 'main/runtime/storage_temp_file_lease.cpp'),
+                   str(root / 'main/runtime/pack_stream_path_lease.cpp'),
                    '-Wl,--wrap=fopen', '-Wl,--wrap=fclose', '-Wl,--wrap=fflush',
                    '-Wl,--wrap=fsync', '-Wl,--wrap=rename', '-o', str(binary)]
         subprocess.run(command, check=True, timeout=45)

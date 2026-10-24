@@ -16,6 +16,19 @@ def section(text, start, end):
     return text[text.index(start):text.index(end, text.index(start))]
 
 
+def write_freertos_port(directory):
+    port = directory / 'freertos'
+    port.mkdir(exist_ok=True)
+    (port / 'FreeRTOS.h').write_text('''#pragma once
+#include <mutex>
+using portMUX_TYPE = std::mutex;
+#define portMUX_INITIALIZER_UNLOCKED {}
+#define taskENTER_CRITICAL(pointer) ((pointer)->lock())
+#define taskEXIT_CRITICAL(pointer) ((pointer)->unlock())
+''')
+    (port / 'task.h').write_text('#pragma once\n#include "FreeRTOS.h"\n')
+
+
 def main():
     root = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(description=__doc__)
@@ -56,11 +69,13 @@ def main():
         port = Path(directory)
         (port / 'fixture.cpp').write_text(fixture)
         (port / 'lease.cpp').write_text(lease)
+        write_freertos_port(port)
         binary = port / 'test'
         subprocess.run(['g++', '-std=c++17', '-O1', '-Wall', '-Wextra', '-Werror',
                         '-fsanitize=address,undefined', '-fno-sanitize-recover=all',
                         '-fno-omit-frame-pointer', '-fno-pie', '-no-pie', '-pthread',
-                        '-I', str(root / 'main'), str(port / 'fixture.cpp'), str(port / 'lease.cpp'),
+                        '-I', str(port), '-I', str(root / 'main'), str(port / 'fixture.cpp'), str(port / 'lease.cpp'),
+                        str(root / 'main/runtime/pack_stream_path_lease.cpp'),
                         '-Wl,--wrap=time', '-o', str(binary)], check=True, timeout=45)
         return subprocess.run([str(binary), str(port / 'files')], timeout=20).returncode
 

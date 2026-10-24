@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <dirent.h>
 #include <filesystem>
 #include <fstream>
 #include <new>
@@ -14,6 +15,7 @@
 #include <unistd.h>
 #include <utility>
 #include "runtime/storage_temp_file_lease.h"
+#include "runtime/pack_stream_path_lease.h"
 
 static bool deny_cpp = false, inside_transaction = false;
 static unsigned callback_allocations = 0, denied_allocations = 0, checks = 0, path_calls = 0;
@@ -44,6 +46,10 @@ static constexpr char payload[] = "0123456789abcdef";
 static constexpr char kTag[] = "pack_test";
 static int current_phase = -1;
 static unsigned digest_seed = 0;
+static unsigned nesting_mode = 0, nested_calls = 0;
+static bool inside_nested_download = false;
+static int nested_result = ESP_OK;
+static bool probe_resets = false;
 extern "C" FILE* __real_fopen(const char*, const char*);
 extern "C" int __real_fclose(FILE*);
 extern "C" int __real_fflush(FILE*);
@@ -123,6 +129,8 @@ using WqnTransferProgressSink = void*;
 static constexpr unsigned kPackSchemaVersion = 1, kMaxPackEntries = 1024, kMaxIndexEntries = 1024;
 static constexpr size_t kMaxPackBytes = 1024 * 1024;
 static const char* kStorageRoot = nullptr;
+static std::string manifest_path, manifest_temp_path, manifest_backup_path;
+static const char *kManifestPath = nullptr, *kManifestTempPath = nullptr, *kManifestBackupPath = nullptr;
 @@FILE_EXISTS@@
 static bool WordPackNeedsDownload(const Manifest&) { return true; }
 static bool NotePackNeedsDownload(const Manifest&) { return true; }
@@ -130,9 +138,38 @@ static bool ProblemPackNeedsDownload(const Manifest&) { return true; }
 namespace services {
 esp_err_t ExecuteStorageTransactionNamed(esp_err_t (*transaction)(void*), void*, const char*);
 }
-static int Download(WqnHttpChunkSink sink, void* context)
+static int Download(unsigned, const Manifest&, WqnHttpChunkSink, void*);
+static int DownloadWordPackStream(const std::string&, const protocol::v3::RequestMetadata&, const Manifest& item,
+                                  WqnHttpChunkSink sink, void* context) { return Download(0, item, sink, context); }
+static int DownloadNotePackStream(const std::string&, const protocol::v3::RequestMetadata&, const Manifest& item,
+                                  WqnHttpChunkSink sink, void* context, WqnTransferProgressSink) { return Download(1, item, sink, context); }
+static int DownloadProblemPackStream(const std::string&, const protocol::v3::RequestMetadata&, const Manifest& item,
+                                     WqnHttpChunkSink sink, void* context) { return Download(2, item, sink, context); }
+
+@@PRODUCTION@@
+
+static int Download(unsigned domain, const Manifest& item, WqnHttpChunkSink sink, void* context)
 {
     deny_cpp = deny_after_begin;
+    if (probe_resets) {
+        for (auto reset : {ResetWordPackStorageCacheRaw, ResetNotePackStorageCacheRaw, ResetProblemPackStorageCacheRaw})
+            CHECK(reset(nullptr) == ESP_ERR_INVALID_STATE);
+        CHECK(::access(kManifestPath, F_OK) == 0 && ::access(kManifestTempPath, F_OK) == 0 &&
+              ::access(kManifestBackupPath, F_OK) == 0);
+    }
+    if (nesting_mode && !inside_nested_download) {
+        inside_nested_download = true;
+        Manifest nested = item;
+        if (nesting_mode == 2) nested.pack_id = "ffeedd33-4455-6677-8899-aabbccddeeff";
+        protocol::v3::RequestMetadata metadata;
+        nested_result = domain == 0 ? DownloadWordPackToStorage("token", metadata, nested) :
+                        domain == 1 ? DownloadNotePackToStorage("token", metadata, nested, nullptr) :
+                                      DownloadProblemPackToStorage("token", metadata, nested);
+        ++nested_calls;
+        inside_nested_download = false;
+        CHECK(nested_result == (nesting_mode == 1 ? ESP_ERR_INVALID_STATE : ESP_OK));
+        CHECK(opens == closes + 1); // The original stream still owns its FILE.
+    }
     if (failure == Failure::kNetwork) return ESP_FAIL;
     for (const auto& chunk : {std::pair<size_t, size_t>{0, 3}, {3, 5}, {8, sizeof(payload) - 1 - 8}}) {
         const int result = sink(context, reinterpret_cast<const uint8_t*>(payload) + chunk.first, chunk.second);
@@ -140,14 +177,6 @@ static int Download(WqnHttpChunkSink sink, void* context)
     }
     return ESP_OK;
 }
-static int DownloadWordPackStream(const std::string&, const protocol::v3::RequestMetadata&, const Manifest&,
-                                  WqnHttpChunkSink sink, void* context) { return Download(sink, context); }
-static int DownloadNotePackStream(const std::string&, const protocol::v3::RequestMetadata&, const Manifest&,
-                                  WqnHttpChunkSink sink, void* context, WqnTransferProgressSink) { return Download(sink, context); }
-static int DownloadProblemPackStream(const std::string&, const protocol::v3::RequestMetadata&, const Manifest&,
-                                     WqnHttpChunkSink sink, void* context) { return Download(sink, context); }
-
-@@PRODUCTION@@
 
 namespace services {
 esp_err_t ExecuteStorageTransactionNamed(esp_err_t (*transaction)(void*), void* context, const char*)
@@ -169,15 +198,23 @@ esp_err_t ExecuteStorageTransactionNamed(esp_err_t (*transaction)(void*), void* 
 static void Reset()
 {
     deny_cpp = inside_transaction = false;
-    CHECK(!runtime::HasActiveStorageTempFileLease());
+    CHECK(!runtime::HasActiveStorageTempFileLease() && !runtime::HasActivePackStreamPath());
     for (FILE* handle : handles) CHECK(handle == nullptr);
     std::filesystem::remove_all(root); std::filesystem::create_directories(root);
     opens = closes = abort_calls = begin_calls = path_calls = callback_allocations = denied_allocations = 0;
     failure = Failure::kNone; deny_after_begin = false;
+    nesting_mode = nested_calls = 0; inside_nested_download = false;
+    probe_resets = false;
 }
-static void Case(unsigned domain, Failure point, bool deny, bool measure = false)
+static void Case(unsigned domain, Failure point, bool deny, bool measure = false, bool check_reset = false)
 {
     Reset(); failure = point; deny_after_begin = deny;
+    probe_resets = check_reset;
+    if (probe_resets) {
+        for (const char* path : {kManifestPath, kManifestTempPath, kManifestBackupPath}) {
+            std::ofstream file(path); file << "existing manifest";
+        }
+    }
     Manifest item;
     const std::string final = domain == 0 ? PackPathForItem(item) : domain == 1 ? PackPathForNotebook(item) : PackPathForSet(item);
     const std::string temporary = domain == 0 ? TempPackPathForItem(item) : domain == 1 ? TempPackPathForNotebook(item) : TempPackPathForSet(item);
@@ -192,7 +229,7 @@ static void Case(unsigned domain, Failure point, bool deny, bool measure = false
     deny_cpp = false;
     CHECK(!escaped);  // Cleanup must not throw on a new path/digest allocation.
     CHECK(opens == closes);
-    CHECK(!runtime::HasActiveStorageTempFileLease());
+    CHECK(!runtime::HasActiveStorageTempFileLease() && !runtime::HasActivePackStreamPath());
     const int expected = point == Failure::kNone ? ESP_OK : point == Failure::kDigest ? ESP_ERR_INVALID_CRC : ESP_FAIL;
     CHECK(result == expected);
     CHECK(abort_calls == (point == Failure::kNone ? 0u : 1u));
@@ -207,6 +244,33 @@ static void Case(unsigned domain, Failure point, bool deny, bool measure = false
     } else {
         CHECK(path_calls == 2 && callback_allocations == 0 && denied_allocations == 0);
     }
+    if (probe_resets) {
+        const int cleared = domain == 0 ? ResetWordPackStorageCacheRaw(nullptr) :
+                            domain == 1 ? ResetNotePackStorageCacheRaw(nullptr) : ResetProblemPackStorageCacheRaw(nullptr);
+        CHECK(cleared == ESP_OK && !FileExists(final));
+        CHECK(::access(kManifestPath, F_OK) != 0 && ::access(kManifestTempPath, F_OK) != 0 &&
+              ::access(kManifestBackupPath, F_OK) != 0);
+    }
+}
+static void ConcurrentDownloads(unsigned domain, unsigned mode)
+{
+    Reset(); nesting_mode = mode;
+    Manifest item; protocol::v3::RequestMetadata metadata;
+    const int result = domain == 0 ? DownloadWordPackToStorage("token", metadata, item) :
+                       domain == 1 ? DownloadNotePackToStorage("token", metadata, item, nullptr) :
+                                     DownloadProblemPackToStorage("token", metadata, item);
+    CHECK(result == ESP_OK && nested_calls == 1 && opens == closes && abort_calls == 0);
+    CHECK(begin_calls == (mode == 1 ? 1u : 2u));
+    CHECK(callback_allocations == 0 && !runtime::HasActiveStorageTempFileLease());
+    const std::string final = domain == 0 ? PackPathForItem(item) : domain == 1 ? PackPathForNotebook(item) : PackPathForSet(item);
+    std::ifstream stream(final); std::string body; stream >> body; CHECK(body == payload);
+    nesting_mode = 0;
+    // A failed duplicate must not release the owner's slot; after the owner
+    // completes, the same path can be acquired again without leaking a slot.
+    CHECK((domain == 0 ? DownloadWordPackToStorage("token", metadata, item) :
+           domain == 1 ? DownloadNotePackToStorage("token", metadata, item, nullptr) :
+                         DownloadProblemPackToStorage("token", metadata, item)) == ESP_OK);
+    CHECK(opens == closes);
 }
 }
 
@@ -214,11 +278,20 @@ int main(int argc, char** argv)
 {
     CHECK(argc == 3);
     root = argv[1]; wqn::kStorageRoot = root.c_str();
+    wqn::manifest_path = root + "/fixture_manifest.json";
+    wqn::manifest_temp_path = root + "/fixture_manifest.tmp";
+    wqn::manifest_backup_path = root + "/fixture_manifest.bak";
+    wqn::kManifestPath = wqn::manifest_path.c_str();
+    wqn::kManifestTempPath = wqn::manifest_temp_path.c_str();
+    wqn::kManifestBackupPath = wqn::manifest_backup_path.c_str();
     const bool measure = std::atoi(argv[2]) != 0;
     if (measure) {
         for (unsigned domain = 0; domain < 3; ++domain) wqn::Case(domain, Failure::kNone, false, true);
     } else {
         for (unsigned domain = 0; domain < 3; ++domain) {
+            wqn::ConcurrentDownloads(domain, 1);
+            wqn::ConcurrentDownloads(domain, 2);
+            wqn::Case(domain, Failure::kNone, true, false, true);
             wqn::Case(domain, Failure::kNetwork, true);
             wqn::Case(domain, Failure::kNone, true);
             for (Failure point : {Failure::kOpen, Failure::kStart, Failure::kAppend, Failure::kDigest,

@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "runtime/storage_temp_file_lease.h"
+#include "runtime/pack_stream_path_lease.h"
 
 static unsigned checks = 0;
 #define CHECK(condition) do { ++checks; if (!(condition)) { \
@@ -75,7 +76,7 @@ static void File(const char* name, size_t size, time_t when)
 }
 static void Reset()
 {
-    CHECK(!wqn::runtime::HasActiveStorageTempFileLease());
+    CHECK(!wqn::runtime::HasActiveStorageTempFileLease() && !wqn::runtime::HasActivePackStreamPath());
     std::filesystem::remove_all(root); std::filesystem::create_directories(root);
     now_sec = 100000; base_used = 800; capacity_total = 1024;
     gc_freed = last_gc_target = 0; info_calls = fail_info_at = gc_calls = 0;

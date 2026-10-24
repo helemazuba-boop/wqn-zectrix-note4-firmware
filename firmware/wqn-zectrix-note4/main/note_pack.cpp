@@ -29,6 +29,7 @@
 #include "mbedtls/sha256.h"
 #include "runtime/sleep_coordinator.h"
 #include "runtime/storage_temp_file_lease.h"
+#include "runtime/pack_stream_path_lease.h"
 #include "services/storage_service.h"
 
 namespace {
@@ -605,6 +606,11 @@ void PruneUnreferencedNotePackFiles(const wqn::WqnNotePackManifest& current)
 
 esp_err_t ResetNotePackStorageCacheRaw(void*)
 {
+    // Streams keep FILEs open across owner transactions, so a reset must
+    // defer before touching manifests or temporary files owned by a stream.
+    if (wqn::runtime::HasActivePackStreamPath()) {
+        return ESP_ERR_INVALID_STATE;
+    }
     const char* manifest_paths[] = {
         kManifestPath,
         kManifestTempPath,
@@ -1388,6 +1394,11 @@ esp_err_t DownloadNotePackToStorage(
     // must not rebuild them while memory pressure may require cleanup.
     context.temp_path = TempPackPathForNotebook(notebook);
     context.final_path = PackPathForNotebook(notebook);
+    // Declared after context: unregister before its path buffers are freed.
+    runtime::PackStreamPathLease path_lease(context.temp_path.c_str());
+    if (!path_lease) {
+        return ESP_ERR_INVALID_STATE;
+    }
     mbedtls_sha256_init(&context.sha);
     context.operation = NotePackStreamOperation::kBegin;
     esp_err_t result = services::ExecuteStorageTransactionNamed(
