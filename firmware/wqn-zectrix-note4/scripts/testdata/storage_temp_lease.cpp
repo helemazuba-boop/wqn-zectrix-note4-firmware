@@ -135,6 +135,7 @@ struct Context {
     const uint8_t* chunk = nullptr;
     size_t chunk_size = 0;
     std::string temporary;
+    std::string temp_path, final_path;
 };
 using WordPackStreamContext = Context;
 using NotePackStreamContext = Context;
@@ -182,6 +183,12 @@ static int ProblemPackStreamTransaction(void* p) { return HostStream(static_cast
 static bool WordPackNeedsDownload(const Manifest&) { return needs_download; }
 static bool NotePackNeedsDownload(const Manifest&) { return needs_download; }
 static bool ProblemPackNeedsDownload(const Manifest&) { return needs_download; }
+static std::string TempPackPathForItem(const Manifest&) { return Path("wp_live.tmp"); }
+static std::string PackPathForItem(const Manifest&) { return Path("final.pack"); }
+static std::string TempPackPathForNotebook(const Manifest&) { return Path("np_live.tmp"); }
+static std::string PackPathForNotebook(const Manifest&) { return Path("final.pack"); }
+static std::string TempPackPathForSet(const Manifest&) { return Path("pp_live.tmp"); }
+static std::string PackPathForSet(const Manifest&) { return Path("final.pack"); }
 static int Http(WqnHttpChunkSink sink, void* opaque)
 {
     auto* context = static_cast<Context*>(opaque);

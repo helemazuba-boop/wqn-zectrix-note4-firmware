@@ -1197,16 +1197,19 @@ struct ProblemPackStreamContext {
     const uint8_t* chunk = nullptr;
     size_t chunk_size = 0;
     ProblemPackStreamOperation operation = ProblemPackStreamOperation::kBegin;
+    std::string temp_path;
+    std::string final_path;
 };
 
 esp_err_t ProblemPackStreamTransaction(void* opaque)
 {
     auto* context = static_cast<ProblemPackStreamContext*>(opaque);
-    if (context == nullptr || context->set == nullptr) {
+    if (context == nullptr || context->set == nullptr ||
+        context->temp_path.empty() || context->final_path.empty()) {
         return ESP_ERR_INVALID_ARG;
     }
-    const std::string temp_path = TempPackPathForSet(*context->set);
-    const std::string final_path = PackPathForSet(*context->set);
+    const std::string& temp_path = context->temp_path;
+    const std::string& final_path = context->final_path;
     switch (context->operation) {
         case ProblemPackStreamOperation::kBegin:
             std::remove(temp_path.c_str());
@@ -1253,13 +1256,13 @@ esp_err_t ProblemPackStreamTransaction(void* opaque)
             }
             context->sha_started = false;
             constexpr char kHex[] = "0123456789abcdef";
-            std::string actual_sha;
-            actual_sha.reserve(64);
-            for (const unsigned char byte : digest) {
-                actual_sha.push_back(kHex[byte >> 4]);
-                actual_sha.push_back(kHex[byte & 0x0f]);
+            std::array<char, 64> actual_sha = {};
+            for (size_t i = 0; i < digest.size(); ++i) {
+                actual_sha[i * 2] = kHex[digest[i] >> 4];
+                actual_sha[i * 2 + 1] = kHex[digest[i] & 0x0f];
             }
-            if (actual_sha != context->set->sha256) {
+            if (context->set->sha256.size() != actual_sha.size() ||
+                std::memcmp(actual_sha.data(), context->set->sha256.data(), actual_sha.size()) != 0) {
                 std::fclose(context->file);
                 context->file = nullptr;
                 std::remove(temp_path.c_str());
@@ -1330,6 +1333,10 @@ esp_err_t DownloadProblemPackToStorage(
     runtime::StorageTempFileLease temp_file_lease;
     ProblemPackStreamContext context;
     context.set = &set;
+    // Prepare immutable paths before opening the FILE. Append/Commit/Abort
+    // must not rebuild them while memory pressure may require cleanup.
+    context.temp_path = TempPackPathForSet(set);
+    context.final_path = PackPathForSet(set);
     mbedtls_sha256_init(&context.sha);
     context.operation = ProblemPackStreamOperation::kBegin;
     esp_err_t result = services::ExecuteStorageTransactionNamed(
