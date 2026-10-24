@@ -152,17 +152,25 @@ From this worktree's firmware directory, the verified pair was prepared with
 `python3 scripts/build_diagnostic_pair.py --control-build build-b5-diag-off-b14-20261024 --output dist/b5-diagnostic-pair-b14-20261024`.
 The dated control directory is an explicit B5 comparison output. Its manifest
 is at `dist/b5-diagnostic-pair-b14-20261024/manifest.json`, within the worktree.
-Use that pair for the current runtime. Building from the main security checkout
+Use that archived pair to evaluate batch 14. Building from the main security checkout
 does not include the new reliability commit. See
 [batch 14](../engineering/RELIABILITY_BATCH_14.md) for identity and device checks.
 
-Batch 15 continues in the same worktree. Its current runtime pair is
+Batch 15 continued in the same worktree. Its archived runtime pair is
 `dist/b5-diagnostic-pair-b15-20261024/manifest.json`, prepared with
 `--control-build build-b5-diag-off-b15-20261024 --output dist/b5-diagnostic-pair-b15-20261024`.
 This dated control directory is another explicit B5 comparison output; earlier
 pairs remain historical. Use the same-source batch 15 images when evaluating
 the pack callback change. See [batch 15](../engineering/RELIABILITY_BATCH_15.md)
 for identity, resource costs and device measurements.
+
+Batch 16's current runtime pair is
+`dist/b5-diagnostic-pair-b16-20261024/manifest.json` in the same reliability
+worktree. Its dedicated control build was prepared with
+`--control-build build-b5-diag-off-b16-20261024 --output dist/b5-diagnostic-pair-b16-20261024`.
+The dated directory is an explicit B5 comparison output. Use this same-source
+pair for path admission/cache-reset validation; prior pairs remain historical.
+See [batch 16](../engineering/RELIABILITY_BATCH_16.md).
 
 ## History
 

@@ -123,6 +123,8 @@ by code, `AGENTS.md`, and the architecture/product references above.
   per-command heap allocation, allocation-failure regressions and an isolated build checkpoint.
 - `docs/engineering/RELIABILITY_BATCH_15.md` — prepared pack paths and fixed digest rendering,
   real callback allocation-denial regressions, retained-buffer cost and current paired builds.
+- `docs/engineering/RELIABILITY_BATCH_16.md` — per-path pack stream admission, active cache
+  reset deferral, nested download regressions, bounded ownership resources and device checks.
 - `docs/engineering/DEAD_CODE_CLEANUP.md` — evidence and scope for firmware
   cleanup decisions.
 - `docs/engineering/SYNC_V3_REPAIR.md` — sync repair findings, host checks, and
