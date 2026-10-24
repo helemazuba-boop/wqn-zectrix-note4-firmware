@@ -187,6 +187,7 @@ jobs:
           python3 scripts/test_word_outbox_quota.py
           python3 scripts/test_problem_empty_cache.py
           python3 scripts/test_word_session_replay.py
+          python3 scripts/test_pack_prune.py
 
       - name: SSE and voice endpoint host regressions (not HIL)
         working-directory: firmware/wqn-zectrix-note4

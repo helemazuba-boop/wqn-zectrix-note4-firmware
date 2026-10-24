@@ -412,15 +412,19 @@ void PruneUnreferencedPackFiles(const wqn::WqnWordPackManifest& current)
         }
     }
 
-    if (FileExists(kManifestBackupPath)) {
+    {
         std::string backup_payload;
-        wqn::WqnWordPackManifest backup;
-        if (ReadWholeFile(kManifestBackupPath, &backup_payload) != ESP_OK ||
-            wqn::ParseWordPackManifestResponse(backup_payload, &backup) != ESP_OK) {
-            ESP_LOGW(kTag, "word pack backup manifest invalid; skip pruning rollback files");
-            return;
+        const esp_err_t backup_result = ReadWholeFile(kManifestBackupPath, &backup_payload);
+        // Do not treat a failed stat/open as proof that no rollback exists.
+        if (backup_result != ESP_ERR_NOT_FOUND) {
+            wqn::WqnWordPackManifest backup;
+            if (backup_result != ESP_OK ||
+                wqn::ParseWordPackManifestResponse(backup_payload, &backup) != ESP_OK) {
+                ESP_LOGW(kTag, "word pack backup manifest unreadable or invalid; skip pruning");
+                return;
+            }
+            AddManifestPackStems(backup, &retained_stems);
         }
-        AddManifestPackStems(backup, &retained_stems);
     }
 
     DIR* directory = opendir(kStorageRoot);

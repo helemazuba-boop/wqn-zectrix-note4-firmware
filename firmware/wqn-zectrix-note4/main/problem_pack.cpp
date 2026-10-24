@@ -554,13 +554,18 @@ void PruneUnreferencedProblemPackFiles(const wqn::WqnProblemPackManifest& curren
     std::vector<std::string> retained_stems;
     AddManifestSetStems(current, &retained_stems);
 
-    if (FileExists(kManifestBackupPath)) {
-        wqn::WqnProblemPackManifest backup;
+    {
         std::string backup_payload;
-        // Best-effort: keep files referenced by a readable backup so a rollback
-        // still has its packs. A corrupt backup simply prunes more aggressively.
-        if (ReadWholeFile(kManifestBackupPath, &backup_payload) == ESP_OK &&
-            ParseProblemManifestPayload(backup_payload, &backup) == ESP_OK) {
+        const esp_err_t backup_result = ReadWholeFile(kManifestBackupPath, &backup_payload);
+        // A failed read/parse cannot establish which rollback files are stale.
+        // Bypass backup references only for a confirmed ENOENT, not a stat failure.
+        if (backup_result != ESP_ERR_NOT_FOUND) {
+            wqn::WqnProblemPackManifest backup;
+            if (backup_result != ESP_OK ||
+                ParseProblemManifestPayload(backup_payload, &backup) != ESP_OK) {
+                ESP_LOGW(kTag, "problem pack backup manifest unreadable or invalid; skip pruning");
+                return;
+            }
             AddManifestSetStems(backup, &retained_stems);
         }
     }

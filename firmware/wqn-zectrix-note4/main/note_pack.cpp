@@ -538,39 +538,20 @@ void PruneUnreferencedNotePackFiles(const wqn::WqnNotePackManifest& current)
     std::vector<std::string> retained_stems;
     AddManifestNotebookStems(current, &retained_stems);
 
-    if (FileExists(kManifestBackupPath)) {
-        wqn::WqnNotePackManifest backup;
+    {
         std::string backup_payload;
-        // Best-effort: keep files referenced by a readable backup so a rollback
-        // still has its packs. A corrupt backup simply prunes more aggressively.
-        if (ReadWholeFile(kManifestBackupPath, &backup_payload) == ESP_OK) {
-            JsonDocument document(backup_payload.c_str());
-            cJSON* data = document.ok()
-                ? cJSON_GetObjectItemCaseSensitive(document.root(), "data")
-                : nullptr;
-            cJSON* notebooks = data != nullptr
-                ? cJSON_GetObjectItemCaseSensitive(data, "notebooks")
-                : nullptr;
-            const int count = cJSON_GetArraySize(notebooks);
-            for (int index = 0; index < count; ++index) {
-                cJSON* object = cJSON_GetArrayItem(notebooks, index);
-                cJSON* has_pack = cJSON_GetObjectItemCaseSensitive(object, "has_pack");
-                if (!cJSON_IsTrue(has_pack)) {
-                    continue;
-                }
-                wqn::WqnNotePackManifestNotebook notebook;
-                cJSON* pack = cJSON_GetObjectItemCaseSensitive(object, "pack");
-                notebook.pack_id = GetOptionalString(pack, "pack_id");
-                notebook.sha256 = GetOptionalString(pack, "sha256");
-                if (notebook.pack_id.empty() || notebook.sha256.empty()) {
-                    continue;
-                }
-                const std::string stem = wqn::SafeNotePackStem(notebook);
-                if (std::find(retained_stems.begin(), retained_stems.end(), stem) ==
-                    retained_stems.end()) {
-                    retained_stems.push_back(stem);
-                }
+        const esp_err_t backup_result = ReadWholeFile(kManifestBackupPath, &backup_payload);
+        // Only a confirmed missing backup permits pruning without its references.
+        // Read/parse failure (including parser allocation failure) leaves the
+        // rollback set unknown: keep all files and retry on a later manifest save.
+        if (backup_result != ESP_ERR_NOT_FOUND) {
+            wqn::WqnNotePackManifest backup;
+            if (backup_result != ESP_OK ||
+                ParseNoteManifestPayload(backup_payload, &backup) != ESP_OK) {
+                ESP_LOGW(kTag, "note pack backup manifest unreadable or invalid; skip pruning");
+                return;
             }
+            AddManifestNotebookStems(backup, &retained_stems);
         }
     }
 
