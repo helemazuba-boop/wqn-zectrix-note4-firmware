@@ -109,12 +109,17 @@ std::string EncodeObservationLine(const wqn::DurableProblemObservation& observat
 {
     cJSON* root = cJSON_CreateObject();
     if (root == nullptr) return std::string();
-    cJSON_AddStringToObject(root, "request_id", observation.request_id.c_str());
-    cJSON_AddStringToObject(root, "problem_id", observation.problem_id.c_str());
-    cJSON_AddStringToObject(
-        root, "action",
-        wqn::protocol::problem_study_v1::ReviewActionName(observation.action));
-    cJSON_AddStringToObject(root, "occurred_at", observation.occurred_at.c_str());
+    // A local durable ACK requires every field, even if one allocation fails
+    // and later allocations recover enough for cJSON_Print to succeed.
+    if (!cJSON_AddStringToObject(root, "request_id", observation.request_id.c_str()) ||
+        !cJSON_AddStringToObject(root, "problem_id", observation.problem_id.c_str()) ||
+        !cJSON_AddStringToObject(
+            root, "action",
+            wqn::protocol::problem_study_v1::ReviewActionName(observation.action)) ||
+        !cJSON_AddStringToObject(root, "occurred_at", observation.occurred_at.c_str())) {
+        cJSON_Delete(root);
+        return std::string();
+    }
     char* rendered = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
     if (rendered == nullptr) return std::string();
@@ -434,7 +439,8 @@ esp_err_t CommitTransaction(void* opaque)
         return ESP_ERR_NO_MEM;
     }
     const std::string encoded = EncodeObservationLine(*context->observation);
-    if (encoded.empty() || encoded.size() > kMaxLineBytes) {
+    if (encoded.empty()) return ESP_ERR_NO_MEM;
+    if (encoded.size() > kMaxLineBytes) {
         return ESP_ERR_INVALID_SIZE;
     }
     if (needs_repair) {

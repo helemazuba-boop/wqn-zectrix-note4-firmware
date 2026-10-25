@@ -18,7 +18,9 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--source',type=Path,default=root/'main/problem_store.cpp')
     parser.add_argument('--mutation',choices=('delete-primary','substring-id',
-                                             'skip-tail-repair','allow-trailing-json'))
+                                             'skip-tail-repair','allow-trailing-json',
+                                             'unchecked-request','unchecked-problem',
+                                             'unchecked-action','unchecked-time','leak-encoder'))
     parser.add_argument('--idf-path',type=Path,default=Path(os.environ.get('IDF_PATH','/home/unknow/esp/esp-idf-v5.5')))
     args=parser.parse_args()
     cjson=args.idf_path/'components/json/cJSON'
@@ -29,7 +31,20 @@ def main():
         raise SystemExit('gcc/g++ unavailable')
     body=args.source.read_text()
     if args.mutation:
-        if args.mutation=='delete-primary':
+        if args.mutation in ('unchecked-request','unchecked-problem','unchecked-action','unchecked-time'):
+            calls = {
+                'unchecked-request': 'cJSON_AddStringToObject(root, "request_id", observation.request_id.c_str())',
+                'unchecked-problem': 'cJSON_AddStringToObject(root, "problem_id", observation.problem_id.c_str())',
+                'unchecked-action': 'cJSON_AddStringToObject(\n            root, "action",\n            wqn::protocol::problem_study_v1::ReviewActionName(observation.action))',
+                'unchecked-time': 'cJSON_AddStringToObject(root, "occurred_at", observation.occurred_at.c_str())',
+            }
+            call = calls[args.mutation]
+            old,new='!'+call,'('+call+', false)'
+        elif args.mutation=='leak-encoder':
+            old,new='''        cJSON_Delete(root);
+        return std::string();''','''        (void)root;
+        return std::string();'''
+        elif args.mutation=='delete-primary':
             old,new='std::rename(kOutboxPath, kOutboxBackupPath)','std::remove(kOutboxPath)'
         elif args.mutation=='skip-tail-repair':
             old,new='if (needs_repair)', 'if (false)'
@@ -85,7 +100,7 @@ namespace wqn::protocol::problem_study_v1 {
                         '-DWQN_DEVICE_CONTROL_SCHEMA_SHA256="host"','-DWQN_PROBLEM_STUDY_SCHEMA_SHA256="host"',
                         '-I',str(directory),'-I',str(root/'main'),'-I',str(root/'components/device_protocol/include'),
                         '-I',str(cjson),str(unit),str(directory/'cJSON.o'),'-o',str(binary),
-                        '-Wl,--wrap=fopen,--wrap=fclose,--wrap=fwrite,--wrap=rename,--wrap=remove,--wrap=fputc'],
+                        '-Wl,--wrap=fopen,--wrap=fclose,--wrap=fwrite,--wrap=rename,--wrap=remove,--wrap=fputc,--wrap=cJSON_CreateObject'],
                        check=True,timeout=60)
         return subprocess.run([str(binary),tmp],timeout=30).returncode
 

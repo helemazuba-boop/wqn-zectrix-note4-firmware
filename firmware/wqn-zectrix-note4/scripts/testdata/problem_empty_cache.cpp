@@ -3,6 +3,8 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
+#include <fstream>
 #include <string>
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -215,7 +217,111 @@ void RecoveryCases() {
           "maximum-sized valid JSON survives CRLF at a chunk boundary");
 #endif
 }
+#if REAL_CODEC
+static bool arm_encoder = false, encode_allocations = false;
+static unsigned encoder_allocations = 0, encoder_live_nodes = 0, encoder_denials = 0;
+static int fail_encoder_at = -1;
+extern "C" cJSON* __real_cJSON_CreateObject(void);
+extern "C" cJSON* __wrap_cJSON_CreateObject(void) {
+    if (arm_encoder) {
+        arm_encoder = false; encode_allocations = true; encoder_allocations = 0;
+    }
+    return __real_cJSON_CreateObject();
+}
+static void* EncoderAllocate(size_t bytes) {
+    if (encode_allocations && encoder_allocations++ == static_cast<unsigned>(fail_encoder_at)) {
+        ++encoder_denials;
+        return nullptr;  // All later allocations recover.
+    }
+    void* pointer = std::malloc(bytes);
+    if (pointer) ++encoder_live_nodes;
+    return pointer;
+}
+static void EncoderFree(void* pointer) {
+    if (pointer) {
+        if (encoder_live_nodes == 0) std::abort();
+        --encoder_live_nodes;
+        std::free(pointer);
+    }
+}
+static std::string FileBytes(const char* path) {
+    std::ifstream file(path, std::ios::binary);
+    return {std::istreambuf_iterator<char>(file), {}};
+}
+static void RawPutAt(const char* path, const std::string& bytes) {
+    FILE* file = __real_fopen(path, "wb");
+    if (!file || __real_fwrite(bytes.data(), 1, bytes.size(), file) != bytes.size() ||
+        __real_fclose(file) != 0) std::abort();
+}
+static void EncoderAllocationCases() {
+    cJSON_Hooks hooks{EncoderAllocate, EncoderFree}; cJSON_InitHooks(&hooks);
+    auto previous = Value("previous"), observation = Value("encoder"), older = Value("older");
+    for (unsigned action = 0; action < 4; ++action) {
+        observation.action = static_cast<wqn::protocol::problem_study_v1::ReviewAction>(action);
+        arm_encoder = true; encode_allocations = false; fail_encoder_at = -1;
+        const std::string golden = EncodeObservationLine(observation);
+        encode_allocations = false;
+        const unsigned allocation_sites = encoder_allocations;
+        Observation decoded;
+        Check(!golden.empty() && DecodeObservationLine(golden, &decoded) &&
+              decoded.request_id == observation.request_id && decoded.problem_id == observation.problem_id &&
+              decoded.action == observation.action && decoded.occurred_at == observation.occurred_at,
+              "all problem actions round trip through the real JSON codec");
+        Check(encoder_live_nodes == 0 && allocation_sites > 0, "encoder frees its successful JSON tree");
+        for (unsigned state = 0; state < 3; ++state) for (unsigned site = 0; site < allocation_sites; ++site) {
+            Reset();
+            if (state) {
+                RawPut(EncodeObservationLine(previous) + '\n' + (state == 2 ? "{torn" : ""));
+                RawPutAt(kOutboxBackupPath, EncodeObservationLine(older) + '\n');
+                RawPutAt(kParkedPath, ""); RawPutAt(kRejectedPath, "");
+            }
+            const std::string original = FileBytes(kOutboxPath), backup = FileBytes(kOutboxBackupPath);
+            write_opens = 0; encoder_denials = 0; arm_encoder = true;
+            encode_allocations = false; fail_encoder_at = static_cast<int>(site);
+            const int result = Commit(observation);
+            encode_allocations = false; fail_encoder_at = -1;
+            if (result == ESP_OK) {
+                std::string accepted = FileBytes(kOutboxPath);
+                if (!accepted.empty() && accepted.back() == '\n') accepted.pop_back();
+                const size_t separator = accepted.rfind('\n');
+                if (separator != std::string::npos) accepted.erase(0, separator + 1);
+                Observation read_back;
+                const bool decodable = DecodeObservationLine(accepted, &read_back);
+                std::fprintf(stderr, "FALSE ACK: action=%u state=%u allocation=%u wrote=%d decodable=%d\n",
+                             action, state, site, write_opens, decodable ? 1 : 0);
+            }
+            Check(result != ESP_OK, "encoder allocation failure never acknowledges a partial observation");
+            if (result == ESP_OK) return;
+            Check(encoder_denials == 1 && encoder_live_nodes == 0,
+                  "one failed encoder allocation recovers and releases every JSON node");
+            if (encoder_live_nodes != 0) return;
+            Check(write_opens == 0 && FileBytes(kOutboxPath) == original && FileBytes(kOutboxBackupPath) == backup,
+                  "failed encoding preserves primary and backup before tail repair or append");
+            Check(::access(kOutboxTempPath, F_OK) != 0 &&
+                  FileBytes(kParkedPath).empty() && FileBytes(kRejectedPath).empty(),
+                  "failed encoding leaves no temp file or new markers");
+            if (state) Check(Peek(&decoded) == ESP_OK && decoded.request_id == previous.request_id,
+                             "previous accepted observation remains queryable after failed encoding");
+            Check(Commit(observation) == ESP_OK, "observation retry succeeds after encoder allocation recovers");
+            const std::string committed = FileBytes(kOutboxPath);
+            Check(committed.find(golden + '\n') != std::string::npos,
+                  "retry persists the complete original observation");
+            const int writes = write_opens;
+            Check(Commit(observation) == ESP_OK && write_opens == writes && FileBytes(kOutboxPath) == committed,
+                  "retry remains idempotent after successful persistence");
+            Check(encoder_live_nodes == 0, "retry/query cycle releases all cJSON allocations");
+        }
+        std::printf("Encoder action=%u: %u allocation sites x 3 journal states PASS\n", action, allocation_sites);
+    }
+    Reset(); arm_encoder = true; encode_allocations = false; fail_encoder_at = 0;
+    Check(Commit(observation) == ESP_ERR_NO_MEM, "empty encoder output reports memory failure");
+    encode_allocations = false; fail_encoder_at = -1;
+    Check(encoder_live_nodes == 0, "final failed root allocation leaves no JSON nodes");
+    cJSON_InitHooks(nullptr);
+}
+#endif
 int main(int argc, char** argv) {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
     if (argc != 2) return 2;
     std::snprintf(kOutboxPath, sizeof(kOutboxPath), "%s/outbox", argv[1]);
     std::snprintf(kOutboxTempPath, sizeof(kOutboxTempPath), "%s/temp", argv[1]);
@@ -321,6 +427,9 @@ int main(int argc, char** argv) {
     Check(Suspend(a) == ESP_FAIL && Peek(&out) == ESP_FAIL,
           "failed park preparatory read invalidates older empty evidence");
     RecoveryCases();
+#if REAL_CODEC
+    EncoderAllocationCases();
+#endif
     std::printf("%d PASS / %d FAIL (temporary libc files; NOT ESP32 HIL)\n",
                 passes, failures);
     Reset();
