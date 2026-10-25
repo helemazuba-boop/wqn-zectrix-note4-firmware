@@ -127,6 +127,8 @@ by code, `AGENTS.md`, and the architecture/product references above.
   reset deferral, nested download regressions, bounded ownership resources and device checks.
 - `docs/engineering/RELIABILITY_BATCH_17.md` — rollback pack retention when backup references
   are uncertain, real manifest publication/parser fault regressions and the current build pair.
+- `docs/engineering/RELIABILITY_BATCH_18.md` — reject partial manifest JSON after a single
+  allocation failure, preserve both generations, recover on retry and verify candidate identity.
 - `docs/engineering/DEAD_CODE_CLEANUP.md` — evidence and scope for firmware
   cleanup decisions.
 - `docs/engineering/SYNC_V3_REPAIR.md` — sync repair findings, host checks, and
