@@ -27,6 +27,7 @@
 #include "runtime/sleep_coordinator.h"
 #include "runtime/storage_temp_file_lease.h"
 #include "services/storage_service.h"
+#include "voice_diagnostics.h"
 #include "word_study_store.h"
 
 namespace {
@@ -1203,6 +1204,19 @@ enum class WordPackStreamOperation : uint8_t {
     kAbort,
 };
 
+struct WordPackAppendProfile {
+    int64_t started_us = 0;
+    int64_t append_wall_us = 0;
+    int64_t write_us = 0;
+    int64_t sha_us = 0;
+    int64_t log_us = 0;
+    uint64_t requested_bytes = 0;
+    uint64_t fwrite_bytes = 0;
+    uint32_t append_calls = 0;
+    uint32_t short_writes = 0;
+    uint32_t sha_failures = 0;
+};
+
 struct WordPackStreamContext {
     const WqnWordPackManifestItem* item = nullptr;
     FILE* file = nullptr;
@@ -1211,6 +1225,7 @@ struct WordPackStreamContext {
     size_t bytes_written = 0;
     const uint8_t* chunk = nullptr;
     size_t chunk_size = 0;
+    WordPackAppendProfile profile;
     WordPackStreamOperation operation = WordPackStreamOperation::kBegin;
 };
 
@@ -1244,20 +1259,28 @@ esp_err_t WordPackStreamTransaction(void* opaque)
             context->bytes_written = 0;
             return ESP_OK;
 
-        case WordPackStreamOperation::kAppend:
+        case WordPackStreamOperation::kAppend: {
             if (context->file == nullptr || !context->sha_started ||
                 context->chunk == nullptr || context->chunk_size == 0 ||
                 context->bytes_written + context->chunk_size > context->item->byte_size ||
                 context->bytes_written + context->chunk_size > kMaxPackBytes) {
                 return ESP_ERR_INVALID_SIZE;
             }
-            if (std::fwrite(
-                    context->chunk, 1, context->chunk_size, context->file) !=
-                context->chunk_size) {
+            const int64_t write_started_us = esp_timer_get_time();
+            const size_t written = std::fwrite(
+                context->chunk, 1, context->chunk_size, context->file);
+            context->profile.write_us += esp_timer_get_time() - write_started_us;
+            context->profile.fwrite_bytes += written;
+            if (written != context->chunk_size) {
+                ++context->profile.short_writes;
                 return ESP_FAIL;
             }
-            if (mbedtls_sha256_update(
-                    &context->sha, context->chunk, context->chunk_size) != 0) {
+            const int64_t sha_started_us = esp_timer_get_time();
+            const int sha_result = mbedtls_sha256_update(
+                &context->sha, context->chunk, context->chunk_size);
+            context->profile.sha_us += esp_timer_get_time() - sha_started_us;
+            if (sha_result != 0) {
+                ++context->profile.sha_failures;
                 return ESP_FAIL;
             }
             context->bytes_written += context->chunk_size;
@@ -1270,13 +1293,16 @@ esp_err_t WordPackStreamTransaction(void* opaque)
             // as 22.0% but is bytes-off-the-wire over plaintext bytes. The
             // decompressed truth was ~88%. Without this line, a per-byte
             // figure can be off by 4x and no log can show which is right.
+            const int64_t log_started_us = esp_timer_get_time();
             ESP_LOGI(kTag,
                      "word pack stream append: chunk_bytes=%u total_bytes=%u "
                      "of %lu",
                      static_cast<unsigned>(context->chunk_size),
                      static_cast<unsigned>(context->bytes_written),
                      static_cast<unsigned long>(context->item->byte_size));
+            context->profile.log_us += esp_timer_get_time() - log_started_us;
             return ESP_OK;
+        }
 
         case WordPackStreamOperation::kCommit: {
             if (context->file == nullptr || !context->sha_started ||
@@ -1343,8 +1369,31 @@ esp_err_t AppendWordPackStream(
     context->operation = WordPackStreamOperation::kAppend;
     context->chunk = bytes;
     context->chunk_size = size;
-    return services::ExecuteStorageTransactionNamed(
+    const int64_t started_us = esp_timer_get_time();
+    ++context->profile.append_calls;
+    context->profile.requested_bytes += size;
+    const esp_err_t result = services::ExecuteStorageTransactionNamed(
         WordPackStreamTransaction, context, "wp-stream");
+    // This caller resumes only after owner completion. It includes queue wait
+    // and scheduling; it must not be reported as Flash-driver execution time.
+    context->profile.append_wall_us += esp_timer_get_time() - started_us;
+    return result;
+}
+
+void LogWordPackStreamProfile(const WordPackStreamContext& context, esp_err_t result)
+{
+    const auto& p = context.profile;
+    ESP_LOGI(kTag,
+             "event=pack.append_profile domain=word pack=%s started_us=%lld expected_bytes=%lu result=0x%x append_calls=%lu requested_bytes=%llu fwrite_bytes=%llu accepted_bytes=%u append_wall_us=%lld fwrite_us=%lld sha_us=%lld append_log_us=%lld short_writes=%lu sha_failures=%lu elapsed_us=%lld",
+             wqn::voice_diagnostics::SafeKey(context.item->pack_id.c_str()),
+             static_cast<long long>(p.started_us), static_cast<unsigned long>(context.item->byte_size),
+             static_cast<unsigned>(result), static_cast<unsigned long>(p.append_calls),
+             static_cast<unsigned long long>(p.requested_bytes),
+             static_cast<unsigned long long>(p.fwrite_bytes), static_cast<unsigned>(context.bytes_written),
+             static_cast<long long>(p.append_wall_us), static_cast<long long>(p.write_us),
+             static_cast<long long>(p.sha_us), static_cast<long long>(p.log_us),
+             static_cast<unsigned long>(p.short_writes), static_cast<unsigned long>(p.sha_failures),
+             static_cast<long long>(esp_timer_get_time() - p.started_us));
 }
 
 esp_err_t DownloadWordPackToStorage(
@@ -1369,6 +1418,7 @@ esp_err_t DownloadWordPackToStorage(
     runtime::StorageTempFileLease temp_file_lease;
     WordPackStreamContext context;
     context.item = &item;
+    context.profile.started_us = esp_timer_get_time();
     mbedtls_sha256_init(&context.sha);
     context.operation = WordPackStreamOperation::kBegin;
     esp_err_t result = services::ExecuteStorageTransactionNamed(
@@ -1389,6 +1439,7 @@ esp_err_t DownloadWordPackToStorage(
                 WordPackStreamTransaction, &context, "wp-stream"));
     }
     mbedtls_sha256_free(&context.sha);
+    LogWordPackStreamProfile(context, result);
     return result;
 }
 

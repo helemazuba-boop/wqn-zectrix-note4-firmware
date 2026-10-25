@@ -30,6 +30,8 @@ def main():
         assert capacity.count(old) == 1
         capacity = capacity.replace(old, 'false')
     downloads = {}
+    word_source = (root / 'main/word_pack.cpp').read_text()
+    word_profile = section(word_source, 'struct WordPackAppendProfile {', 'struct WordPackStreamContext {')
     for domain in ('word', 'note', 'problem'):
         name = domain.title()
         source = (root / f'main/{domain}_pack.cpp').read_text()
@@ -49,7 +51,7 @@ def main():
     if args.mutation == 'leak-lease':
         lease = lease.replace('g_temp_file_leases.fetch_sub(1, std::memory_order_acq_rel);', '')
     fixture = (root / 'scripts/testdata/storage_temp_lease.cpp').read_text()
-    for marker, body in {'@@CAPACITY@@': capacity, **downloads}.items():
+    for marker, body in {'@@CAPACITY@@': capacity, '@@WORD_PROFILE@@': word_profile, **downloads}.items():
         assert fixture.count(marker) == 1
         fixture = fixture.replace(marker, body)
     with tempfile.TemporaryDirectory(prefix='note4-temp-lease-') as directory:
