@@ -6,6 +6,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstdint>
+#include <cstring>
 #include <ctime>
 #include <random>
 #include <string>
@@ -28,6 +29,7 @@
 #include "runtime/sleep_coordinator.h"
 #include "services/connectivity_service.h"
 #include "stdpro_ws_transport.h"
+#include "voice_diagnostics.h"
 #include "storage.h"
 #include "wqn_api.h"
 #include "error_recorder.h"
@@ -133,6 +135,8 @@ void AudioCaptureTapHandler(const int16_t* samples, size_t count, void*)
 }
 
 struct StdProTurnAssembly {
+    char diagnostic_stage[48] = "none";
+    uint8_t diagnostic_stage_logs = 0;
     uint64_t last_event_id = 0;
     bool user_committed = false;
     bool thinking_seen = false;
@@ -150,12 +154,13 @@ struct StdProTurnAssembly {
 };
 StdProTurnAssembly g_turn;
 
-void LogAiMemory(const char* stage)
+void LogAiMemory(const char* stage, const char* request_id = nullptr)
 {
     ESP_LOGI(
         kTag,
-        "memory stage=%s internal_free=%u internal_largest=%u psram_free=%u psram_largest=%u dma_free=%u dma_largest=%u stack_hwm=%u",
+        "memory stage=%s req=%s internal_free=%u internal_largest=%u psram_free=%u psram_largest=%u dma_free=%u dma_largest=%u stack_hwm=%u",
         stage,
+        wqn::voice_diagnostics::SafeKey(request_id),
         static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
         static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)),
         static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)),
@@ -163,6 +168,18 @@ void LogAiMemory(const char* stage)
         static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_DMA)),
         static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_DMA)),
         static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
+}
+
+void LogAiTransport(const char* stage, const char* request_id, uint32_t generation,
+                    const char* selected, const char* reason, esp_err_t result,
+                    int64_t elapsed_ms)
+{
+    ESP_LOGI(kTag,
+             "event=ai.transport stage=%s req=%s gen=%lu selected=%s reason=%s err=0x%x elapsed_ms=%lld at_ms=%lld",
+             stage, wqn::voice_diagnostics::SafeKey(request_id),
+             static_cast<unsigned long>(generation), selected, reason,
+             static_cast<unsigned>(result), static_cast<long long>(elapsed_ms),
+             static_cast<long long>(esp_timer_get_time() / 1000));
 }
 
 // [font-fix] The 💭 prefix this used to carry cannot be drawn: U+1F4AD is not in
@@ -489,6 +506,28 @@ void OnSseEvent(const wqn::WqnAiSseEvent& ev)
     }
     if (ev.event_id != 0) {
         g_turn.last_event_id = ev.event_id;
+    }
+
+    const char* server_stage = wqn::voice_diagnostics::SafeKey(ev.stage.c_str(), 47);
+    const bool stage_changed = ev.kind == wqn::WqnAiSseEvent::Kind::kStage &&
+        std::strcmp(g_turn.diagnostic_stage, server_stage) != 0;
+    const bool log_stage = stage_changed && g_turn.diagnostic_stage_logs < 32;
+    if (stage_changed) {
+        std::strncpy(g_turn.diagnostic_stage, server_stage, sizeof(g_turn.diagnostic_stage) - 1);
+        if (log_stage) ++g_turn.diagnostic_stage_logs;
+    }
+    if (log_stage || ev.kind == wqn::WqnAiSseEvent::Kind::kReady ||
+        ev.kind == wqn::WqnAiSseEvent::Kind::kAsrComplete ||
+        ev.kind == wqn::WqnAiSseEvent::Kind::kFinal ||
+        ev.kind == wqn::WqnAiSseEvent::Kind::kError ||
+        ev.kind == wqn::WqnAiSseEvent::Kind::kTurnDone) {
+        ESP_LOGI(kTag,
+                 "event=ai.transport stage=server_event req=%s observed_req=%s turn_gen=%lu kind=%u server_stage=%s error=%s at_ms=%lld",
+                 wqn::voice_diagnostics::SafeKey(g_current_turn_req_id.c_str()),
+                 wqn::voice_diagnostics::SafeKey(ev.request_id.c_str()),
+                 static_cast<unsigned long>(g_current_turn_gen), static_cast<unsigned>(ev.kind),
+                 g_turn.diagnostic_stage, wqn::voice_diagnostics::SafeKey(ev.error_code.c_str()),
+                 static_cast<long long>(now_ms));
     }
 
     // [ui-throttle] Streaming deltas land every ~15 ms; the EPD cannot render
@@ -1021,6 +1060,7 @@ void LoadTodaySessionLocked()
 // published and the worker parks again.
 void SubmitSession()
 {
+    const int64_t submit_started_us = esp_timer_get_time();
     LogAiMemory("submit-start");
     wqn::AudioCaptureChunk audio;
     esp_err_t result = wqn::StopAudioCapture(&audio);
@@ -1121,12 +1161,28 @@ void SubmitSession()
     wqn::WqnAiChatResponse response;
     bool used_streaming = true;
     bool handoff_to_ws_succeeded = false;
+    const char* selected_transport = "none";
+    const char* transport_reason = "not_ws_capable";
 
     if (is_ws_turn) {
+        const int64_t final_started_us = esp_timer_get_time();
         const auto handoff_res = wqn::stdpro_ws::SendFinalAndWait(
             turn_req_id, audio.duration_ms, 2000);
+        const char* final_result =
+            handoff_res == wqn::stdpro_ws::FinalHandoffResult::kFinalSent ? "sent" :
+            handoff_res == wqn::stdpro_ws::FinalHandoffResult::kAmbiguous ? "ambiguous" : "not_sent";
+        ESP_LOGI(kTag,
+                 "event=ai.transport stage=final req=%s turn_gen=%lu handoff=%s elapsed_ms=%lld",
+                 wqn::voice_diagnostics::SafeKey(turn_req_id.c_str()),
+                 static_cast<unsigned long>(turn_gen), final_result,
+                 static_cast<long long>((esp_timer_get_time() - final_started_us) / 1000));
 
         if (handoff_res == wqn::stdpro_ws::FinalHandoffResult::kFinalSent) {
+            selected_transport = "ws";
+            transport_reason = "final_sent";
+            LogAiTransport("submit", turn_req_id.c_str(), turn_gen, "ws",
+                           transport_reason, ESP_OK,
+                           (esp_timer_get_time() - submit_started_us) / 1000);
             ESP_LOGI(kTag, "final_sent: entering REMOTE_HANDOFF for req_id=%s",
                      turn_req_id.c_str());
             handoff_to_ws_succeeded = true;
@@ -1139,16 +1195,23 @@ void SubmitSession()
                 submit_result = ESP_ERR_TIMEOUT;
             }
         } else if (handoff_res == wqn::stdpro_ws::FinalHandoffResult::kAmbiguous) {
+            selected_transport = "ws";
+            transport_reason = "final_ambiguous_no_replay";
+            LogAiTransport("submit", turn_req_id.c_str(), turn_gen, "ws",
+                           transport_reason, ESP_OK,
+                           (esp_timer_get_time() - submit_started_us) / 1000);
             ESP_LOGW(kTag, "FINAL result ambiguous, skipping HTTP resubmit to prevent duplicate turn");
             handoff_to_ws_succeeded = true;
             wqn::stdpro_ws::WaitForTurnRelease(turn_gen, turn_req_id, 5000);
         } else {
+            transport_reason = "final_definitely_not_sent";
             ESP_LOGW(kTag, "FINAL failed to send over WS, falling back to HTTP");
             handoff_to_ws_succeeded = false;
         }
     }
 
     if (!handoff_to_ws_succeeded) {
+        selected_transport = "http";
         // Fallback HTTP POST path
         wqn::WqnAiStreamRequest req;
         req.token = token;
@@ -1172,10 +1235,16 @@ void SubmitSession()
         req.request_id = turn_req_id.empty() ? GenerateAiRequestId() : turn_req_id;
         req.callback = &TrampolineSseEvent;
         req.user_ctx = nullptr;
-        LogAiMemory("before-sse-upload");
+        LogAiTransport("submit", req.request_id.c_str(), turn_gen, "http",
+                       transport_reason, ESP_OK, (esp_timer_get_time() - submit_started_us) / 1000);
+        LogAiMemory("before-sse-upload", req.request_id.c_str());
         submit_result = wqn::UploadAiAudioChatStream(req, &response);
-        LogAiMemory("after-sse-upload");
+        LogAiMemory("after-sse-upload", req.request_id.c_str());
     }
+
+    LogAiTransport("submit_return", turn_req_id.c_str(), turn_gen,
+                   selected_transport, transport_reason, submit_result,
+                   (esp_timer_get_time() - submit_started_us) / 1000);
 
     wqn::ReleaseAudioCapturePower();
 
@@ -1293,6 +1362,7 @@ void SubmitSession()
 
 void PrepareRecordingSession(uint32_t generation)
 {
+    const int64_t prepare_started_us = esp_timer_get_time();
     std::string token;
     enum class PrepareFailure {
         kNone,
@@ -1420,9 +1490,15 @@ void PrepareRecordingSession(uint32_t generation)
     // of contiguous DMA memory while TLS transiently holds ~17 KiB
     // (device-measured: post-connect dma_largest pinned at 736 B). PCM captured
     // before voice.turn.start commits is dropped by PushPcm's turn-state gate.
+    LogAiMemory("before-capture-start", req_id.c_str());
+    const int64_t capture_started_us = esp_timer_get_time();
     result = wqn::StartAudioCapture();
+    LogAiTransport("capture_start", req_id.c_str(), generation, "none",
+                   "capture_first", result, (esp_timer_get_time() - capture_started_us) / 1000);
+    LogAiMemory("after-capture-start", req_id.c_str());
 
     bool ws_ready = false;
+    const char* selection_reason = "connect_not_attempted";
     if (result == ESP_OK) {
         // Skip the expensive handshake entirely when the user already
         // cancelled during codec bring-up.
@@ -1434,7 +1510,14 @@ void PrepareRecordingSession(uint32_t generation)
         xSemaphoreGive(g_lock);
 
         if (proceed_network) {
-            ws_ready = (wqn::stdpro_ws::EnsureConnected(token, 2500) == ESP_OK);
+            const int64_t connect_started_us = esp_timer_get_time();
+            const esp_err_t connect_result =
+                wqn::stdpro_ws::EnsureConnected(token, 2500, req_id.c_str());
+            ws_ready = connect_result == ESP_OK;
+            selection_reason = ws_ready ? "connected" : "connect_failed";
+            LogAiTransport("connect", req_id.c_str(), generation, "none",
+                           selection_reason, connect_result,
+                           (esp_timer_get_time() - connect_started_us) / 1000);
             ESP_LOGI(kTag,
                      "[dma-attrib] post-connect ws=%d dma_free=%u dma_largest=%u",
                      ws_ready ? 1 : 0,
@@ -1455,8 +1538,13 @@ void PrepareRecordingSession(uint32_t generation)
         // the tap can deliver a live block before StartTurn even returns.
         // Arming first is what keeps the backlog ahead of the live audio.
         g_preroll_pending.store(true, std::memory_order_release);
+        const int64_t turn_started_us = esp_timer_get_time();
         esp_err_t start_turn_err = wqn::stdpro_ws::StartTurn(
             req_id, tier_str, conv_id, enable_thinking, effort, &g_current_turn_gen);
+        selection_reason = start_turn_err == ESP_OK ? "start_turn_ready" : "start_turn_failed";
+        LogAiTransport("start_turn", req_id.c_str(), generation, "none",
+                       selection_reason, start_turn_err,
+                       (esp_timer_get_time() - turn_started_us) / 1000);
         if (start_turn_err == ESP_OK) {
             xSemaphoreTake(g_lock, portMAX_DELAY);
             g_turn_ws_capable = true;
@@ -1500,10 +1588,15 @@ void PrepareRecordingSession(uint32_t generation)
         g_state.toast_recording_ms = 0;
         g_state.status_since_ms = g_state.toast_since_ms;
         MarkChanged();
+        const bool effective_ws = g_turn_ws_capable;
         FinishPrepareTaskLocked(generation);
         xSemaphoreGive(g_lock);
-        ESP_LOGI(kTag, "record_start: generation=%lu req_id=%s ws=%d; toast=录音中",
-                 static_cast<unsigned long>(generation), req_id.c_str(), ws_ready);
+        ESP_LOGI(kTag, "record_start: generation=%lu req_id=%s ws=%d connected_ws=%d; toast=录音中",
+                 static_cast<unsigned long>(generation), req_id.c_str(), effective_ws ? 1 : 0,
+                 ws_ready ? 1 : 0);
+        LogAiTransport("record_ready", req_id.c_str(), generation,
+                       effective_ws ? "ws" : "http", selection_reason, ESP_OK,
+                       (esp_timer_get_time() - prepare_started_us) / 1000);
         return;
     }
 

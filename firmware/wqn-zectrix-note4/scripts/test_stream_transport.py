@@ -13,10 +13,11 @@ from test_audio_runtime import function
 PORTS = {
     'esp_check.h': '#pragma once\n',
     'esp_log.h': '''#pragma once
-#define ESP_LOGI(tag, ...) ((void)(tag))
-#define ESP_LOGD(tag, ...) ((void)(tag))
-#define ESP_LOGW(tag, ...) ((void)(tag))
-#define ESP_LOGE(tag, ...) ((void)(tag))
+void HostLog(const char*, const char*, ...) __attribute__((format(printf, 2, 3)));
+#define ESP_LOGI(tag, ...) HostLog(tag, __VA_ARGS__)
+#define ESP_LOGD(tag, ...) HostLog(tag, __VA_ARGS__)
+#define ESP_LOGW(tag, ...) HostLog(tag, __VA_ARGS__)
+#define ESP_LOGE(tag, ...) HostLog(tag, __VA_ARGS__)
 ''',
     'esp_timer.h': '#pragma once\n#include <cstdint>\nint64_t esp_timer_get_time();\n',
     'esp_mac.h': '''#pragma once
@@ -56,6 +57,7 @@ esp_err_t esp_http_client_open(esp_http_client_handle_t, int);
 int esp_http_client_write(esp_http_client_handle_t, const char*, int);
 int64_t esp_http_client_fetch_headers(esp_http_client_handle_t);
 int esp_http_client_get_status_code(esp_http_client_handle_t);
+int esp_http_client_get_errno(esp_http_client_handle_t);
 int esp_http_client_read(esp_http_client_handle_t, char*, int);
 esp_err_t esp_http_client_close(esp_http_client_handle_t);
 esp_err_t esp_http_client_cleanup(esp_http_client_handle_t);
@@ -112,7 +114,8 @@ def main():
     # Include the actual teardown: FINAL ambiguity and terminal ledger decisions
     # are production behavior, not a replacement that just increments a count.
     ws_body = '\n'.join(function(ws, signature) for signature in (
-        'void DoDestroyWs()', 'void TeardownFailedTurn(', 'void ProcessTextStream()'))
+        'void DoDestroyWs()', 'void TeardownFailedTurn(', 'void ProcessTextStream()',
+        'void* AllocPrefersPsram('))
     ws_unit = ws_unit.replace('@@PRODUCTION@@', ws_body)
     cjson = Path(os.environ.get('IDF_PATH', '/home/unknow/esp/esp-idf-v5.5'))/'components/json/cJSON'
     if not (cjson/'cJSON.c').is_file():

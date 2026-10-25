@@ -1,6 +1,7 @@
 // Production owner consumer and teardown; SDK/queue/ledger publication ports.
 #include <algorithm>
 #include <atomic>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -8,15 +9,38 @@
 #include <vector>
 #include "cJSON.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "sse_chunk.h"
 #include "stdpro_ws_transport.h"
+#include "voice_diagnostics.h"
 #include "device_protocol/json_depth_guard.h"
 
 @@TYPES@@
 
 static int checks = 0;
+static std::vector<std::string> log_lines;
+int64_t esp_timer_get_time() { return 0; }
+void HostLog(const char* tag, const char* format, ...) {
+    char line[1536];
+    va_list args; va_start(args, format);
+    std::vsnprintf(line, sizeof(line), format, args); va_end(args);
+    log_lines.emplace_back(std::string(tag) + " " + line);
+}
 #define CHECK(x) do { ++checks; if (!(x)) { std::fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #x); std::abort(); } } while (0)
 constexpr char kTag[] = "ws-test";
+constexpr int MALLOC_CAP_SPIRAM = 1, MALLOC_CAP_8BIT = 2, MALLOC_CAP_INTERNAL = 4;
+static char psram_block, internal_block;
+static bool psram_available = true, internal_available = true;
+static std::vector<int> alloc_caps;
+static void* heap_caps_malloc(size_t, int caps) {
+    alloc_caps.push_back(caps);
+    if (caps & MALLOC_CAP_SPIRAM) return psram_available ? &psram_block : nullptr;
+    return internal_available ? &internal_block : nullptr;
+}
+static bool esp_ptr_external_ram(void* ptr) { return ptr == &psram_block; }
+static size_t heap_caps_get_largest_free_block(int caps) {
+    return caps == MALLOC_CAP_INTERNAL ? 8192 : 65536;
+}
 static std::atomic<ConnectionState> g_conn_state{ConnectionState::kReady};
 static std::atomic<TurnState> g_turn_state{TurnState::kIdle};
 static std::atomic<bool> g_is_connected{true}, g_session_ready{true};
@@ -57,7 +81,7 @@ static void PublishTurnTerminalRecord(uint32_t gen, const char* request_id,
 }
 static void xStreamBufferReset(void*) { offset = input.size(); }
 static int xQueueReceive(void*, PcmBlock*, int) { return 0; }
-static void LogTransportMemory(const char*) {}
+static void LogTransportMemory(const char*, const char* = nullptr, uint32_t = 0) {}
 static void xSemaphoreGive(void*) { ++signalled; }
 [[maybe_unused]] static void xTaskNotify(void*, int, int) { ++notified; }
 static size_t xStreamBufferReceive(void*, char* dst, size_t size, int) {
@@ -85,6 +109,24 @@ static void Feed(const std::string& text) { input = text; offset = 0; ProcessTex
 int main() {
     using Release = wqn::stdpro_ws::TurnReleaseState;
     using Observation = wqn::stdpro_ws::TurnStreamObservation;
+    // Actual allocator: fallback success differs from allocation failure, and
+    // diagnostic metadata does not change the preference/order of allocations.
+    bool in_psram = false;
+    CHECK(AllocPrefersPsram(32, &in_psram, "owner_stack", "req") == &psram_block);
+    CHECK(in_psram && alloc_caps == std::vector<int>{MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT});
+    CHECK(log_lines.empty());
+    psram_available = false; alloc_caps.clear();
+    CHECK(AllocPrefersPsram(32, &in_psram, "owner_stack", "req") == &internal_block);
+    CHECK(!in_psram && alloc_caps.size() == 2 && alloc_caps.back() == MALLOC_CAP_8BIT);
+    CHECK(log_lines.size() == 1);
+    CHECK(log_lines.back().find("req=req resource=owner_stack bytes=32") != std::string::npos);
+    CHECK(log_lines.back().find("result=ok placement=internal") != std::string::npos);
+    internal_available = false; log_lines.clear(); alloc_caps.clear();
+    CHECK(AllocPrefersPsram(32, nullptr, "pcm_queue", "unsafe id\n") == nullptr);
+    CHECK(alloc_caps.size() == 2 && log_lines.size() == 1);
+    CHECK(log_lines.back().find("req=redacted resource=pcm_queue") != std::string::npos);
+    CHECK(log_lines.back().find("result=failed placement=none internal_largest=8192 psram_largest=65536") != std::string::npos);
+    CHECK(log_lines.back().find("unsafe id") == std::string::npos);
     for (size_t chunk : {size_t(1), size_t(17), size_t(512)}) {
         packet_limit = chunk;
         Reset(TurnState::kRemoteHandoff);

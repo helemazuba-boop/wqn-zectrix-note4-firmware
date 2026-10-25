@@ -29,6 +29,7 @@
 #include "sse_chunk.h"
 #include "storage.h"
 #include "wqn_api_stream_internal.h"
+#include "voice_diagnostics.h"
 
 namespace {
 
@@ -49,7 +50,43 @@ struct StreamContext {
   int64_t deadline_us = 0;
   bool timed_out = false;
   bool close_requested = false;
+  // Owner-local observations only; no extra timers, tasks or per-delta logs.
+  int64_t started_us = 0;
+  int64_t first_data_us = -1;
+  int64_t last_data_us = -1;
+  int64_t first_event_us = -1;
+  int64_t last_event_us = -1;
+  int64_t last_progress_us = -1;
+  uint64_t received_bytes = 0;
+  uint32_t data_callbacks = 0;
+  uint32_t decoded_events = 0;
+  uint8_t stage_logs = 0;
+  int last_read_result = 0;
+  int last_read_errno = 0;
+  const char* phase = "init";
+  char last_server_stage[48] = "none";
 };
+
+void LogHttpTrace(const StreamContext* ctx, const char* stage, esp_err_t result)
+{
+  const int64_t now_us = esp_timer_get_time();
+  ESP_LOGI(kTag,
+           "event=ai.http stage=%s req=%s phase=%s server_stage=%s err=0x%x http_status=%d terminal=%d error=%s elapsed_ms=%lld first_data_ms=%lld first_event_ms=%lld data_gap_ms=%lld event_gap_ms=%lld progress_gap_ms=%lld body_bytes=%llu callbacks=%lu events=%lu read_result=%d read_errno=%d stage_logs=%u",
+           stage, wqn::voice_diagnostics::SafeKey(ctx->request.request_id.c_str()),
+           ctx->phase, ctx->last_server_stage, static_cast<unsigned>(result),
+           ctx->http_status, ctx->terminal_event_seen ? 1 : 0,
+           wqn::voice_diagnostics::SafeKey(ctx->error_code.c_str()),
+           static_cast<long long>((now_us - ctx->started_us) / 1000),
+           static_cast<long long>(ctx->first_data_us < 0 ? -1 : (ctx->first_data_us - ctx->started_us) / 1000),
+           static_cast<long long>(ctx->first_event_us < 0 ? -1 : (ctx->first_event_us - ctx->started_us) / 1000),
+           static_cast<long long>(ctx->last_data_us < 0 ? -1 : (now_us - ctx->last_data_us) / 1000),
+           static_cast<long long>(ctx->last_event_us < 0 ? -1 : (now_us - ctx->last_event_us) / 1000),
+           static_cast<long long>(ctx->last_progress_us < 0 ? -1 : (now_us - ctx->last_progress_us) / 1000),
+           static_cast<unsigned long long>(ctx->received_bytes),
+           static_cast<unsigned long>(ctx->data_callbacks),
+           static_cast<unsigned long>(ctx->decoded_events),
+           ctx->last_read_result, ctx->last_read_errno, static_cast<unsigned>(ctx->stage_logs));
+}
 
 std::string BuildMacAddress()
 {
@@ -74,12 +111,43 @@ void DispatchEvent(StreamContext* ctx, const wqn::SseFrameBuffer& /*frame*/,
   wqn::WqnAiSseEvent ev;
   cJSON* root = nullptr;
   if (!wqn::DecodeSseEvent(event_name, event_id, data_json, &ev, &root)) {
-    ESP_LOGW(kTag, "SSE JSON parse failed: %s",
-             data_json.size() > 80 ? "<large>" : data_json.c_str());
+    ESP_LOGW(kTag, "SSE JSON parse failed: bytes=%u req=%s",
+             static_cast<unsigned>(data_json.size()),
+             wqn::voice_diagnostics::SafeKey(ctx->request.request_id.c_str()));
     return;
   }
 
   const auto k = ev.kind;
+  using Kind = wqn::WqnAiSseEvent::Kind;
+  ctx->last_event_us = esp_timer_get_time();
+  ++ctx->decoded_events;
+  // A heartbeat/unknown event or repeated stage is traffic, not business
+  // progress. This observation never renews or changes the request budget.
+  bool progress = k != Kind::kUnknown && k != Kind::kReady &&
+                  k != Kind::kState && k != Kind::kStage;
+  if (k == Kind::kAsrDelta || k == Kind::kThinkingDelta || k == Kind::kTextDelta) {
+    progress = !ev.delta.empty() || !ev.text.empty() || !ev.full_text.empty();
+  }
+  if (k == Kind::kStage) {
+    const char* key = wqn::voice_diagnostics::SafeKey(ev.stage.c_str(), sizeof(ctx->last_server_stage) - 1);
+    progress = !ev.stage.empty() && std::strcmp(key, "redacted") != 0 &&
+               std::strcmp(ctx->last_server_stage, key) != 0;
+  }
+  if (progress) ctx->last_progress_us = ctx->last_event_us;
+  if (ctx->first_event_us < 0) {
+    ctx->first_event_us = ctx->last_event_us;
+    LogHttpTrace(ctx, "first_event", ESP_OK);
+  }
+  if (k == wqn::WqnAiSseEvent::Kind::kStage) {
+    const char* key = wqn::voice_diagnostics::SafeKey(ev.stage.c_str(), sizeof(ctx->last_server_stage) - 1);
+    if (std::strcmp(ctx->last_server_stage, key) != 0) {
+      std::strncpy(ctx->last_server_stage, key, sizeof(ctx->last_server_stage) - 1);
+      if (ctx->stage_logs < 32) {
+        ++ctx->stage_logs;
+        LogHttpTrace(ctx, "server_stage", ESP_OK);
+      }
+    }
+  }
 
   // Snapshot conversation_id into the response (used by the final callback).
   if (!ev.conversation_id.empty() && ctx->response != nullptr) {
@@ -155,6 +223,11 @@ void DispatchEvent(StreamContext* ctx, const wqn::SseFrameBuffer& /*frame*/,
     ctx->response->transcript = ev.text;
   }
 
+  if (k == wqn::WqnAiSseEvent::Kind::kAsrComplete ||
+      k == wqn::WqnAiSseEvent::Kind::kFinal ||
+      k == wqn::WqnAiSseEvent::Kind::kError) {
+    LogHttpTrace(ctx, k == wqn::WqnAiSseEvent::Kind::kAsrComplete ? "asr_complete" : "terminal", ESP_OK);
+  }
   cJSON_Delete(root);
   ctx->request.callback(ev, ctx->request.user_ctx);
 }
@@ -169,6 +242,7 @@ bool CheckDeadline(StreamContext* ctx)
     ctx->timed_out = true;
     ctx->error_code = "chat_timeout";
     ctx->error_message = "stream request deadline exceeded";
+    LogHttpTrace(ctx, "deadline", ESP_ERR_TIMEOUT);
     return false;
   }
   return true;
@@ -238,7 +312,8 @@ void CaptureHttpStatus(StreamContext* ctx, esp_http_client_handle_t client)
     return;
   }
   ctx->http_status = status;
-  ESP_LOGI(kTag, "HTTP status=%d", status);
+  ESP_LOGI(kTag, "HTTP status=%d req=%s", status,
+           wqn::voice_diagnostics::SafeKey(ctx->request.request_id.c_str()));
   if (status >= 400 && !ctx->fatal) {
     ctx->fatal = true;
     ctx->error_code = wqn::internal::AiStreamHttpErrorCode(status);
@@ -250,7 +325,7 @@ esp_err_t OnHttpEvent(esp_http_client_event_t* evt)
   StreamContext* ctx = static_cast<StreamContext*>(evt->user_data);
   switch (evt->event_id) {
     case HTTP_EVENT_ON_CONNECTED: {
-      ESP_LOGD(kTag, "HTTP connected");
+      LogHttpTrace(ctx, "socket_connected", ESP_OK);
       break;
     }
     case HTTP_EVENT_ON_HEADER: {
@@ -264,6 +339,14 @@ esp_err_t OnHttpEvent(esp_http_client_event_t* evt)
       break;
     }
     case HTTP_EVENT_ON_DATA: {
+      const int64_t now_us = esp_timer_get_time();
+      ctx->last_data_us = now_us;
+      ++ctx->data_callbacks;
+      if (evt->data_len > 0) ctx->received_bytes += static_cast<uint64_t>(evt->data_len);
+      if (ctx->first_data_us < 0) {
+        ctx->first_data_us = now_us;
+        LogHttpTrace(ctx, "first_data", ESP_OK);
+      }
       CaptureHttpStatus(ctx, evt->client);
       if (!CheckDeadline(ctx) || ctx->fatal || ctx->terminal_event_seen) {
         CloseStream(ctx, evt->client);
@@ -390,6 +473,10 @@ esp_err_t UploadAiAudioChatStream(const WqnAiStreamRequest& request,
   ctx.response = response;
   ctx.mac = BuildMacAddress();
   ctx.deadline_us = deadline_us;
+  ctx.started_us = deadline_us - static_cast<int64_t>(timeout_ms) * 1000;
+  ESP_LOGI(kTag, "event=ai.http stage=begin req=%s budget_ms=%d pcm_bytes=%u",
+           wqn::voice_diagnostics::SafeKey(request.request_id.c_str()), timeout_ms,
+           static_cast<unsigned>(pcm_size));
 
   esp_http_client_config_t cfg = {};
   cfg.url = url.c_str();
@@ -403,6 +490,7 @@ esp_err_t UploadAiAudioChatStream(const WqnAiStreamRequest& request,
 
   esp_http_client_handle_t client = esp_http_client_init(&cfg);
   if (client == nullptr) {
+    LogHttpTrace(&ctx, "client_init_failed", ESP_ERR_NO_MEM);
     return ESP_ERR_NO_MEM;
   }
 
@@ -439,13 +527,17 @@ esp_err_t UploadAiAudioChatStream(const WqnAiStreamRequest& request,
         client, "X-WQN-Reasoning-Effort", request.reasoning_effort.c_str());
   }
 
+  ctx.phase = "open";
   esp_err_t err = ApplyRemainingTimeout(&ctx, client)
                       ? esp_http_client_open(client, static_cast<int>(pcm_size)) : ESP_FAIL;
   if (err == ESP_OK) {
+    ctx.phase = "upload";
     err = WriteRequestBody(&ctx, client, pcm_bytes, pcm_size);
+    LogHttpTrace(&ctx, "upload_return", err);
   }
 
   if (err == ESP_OK && ApplyRemainingTimeout(&ctx, client)) {
+    ctx.phase = "headers";
     // fetch_headers returns the response Content-Length (0 for a chunked SSE
     // response), not esp_err_t. Treat every non-negative value as success so a
     // buffered/non-chunked SSE response is still consumed.
@@ -463,9 +555,12 @@ esp_err_t UploadAiAudioChatStream(const WqnAiStreamRequest& request,
     }
   }
   if (err == ESP_OK && !ctx.fatal && !ctx.terminal_event_seen) {
+    ctx.phase = "read";
     char buf[1024];
     while (!ctx.fatal && !ctx.terminal_event_seen && ApplyRemainingTimeout(&ctx, client)) {
       const int r = esp_http_client_read(client, buf, sizeof(buf));
+      ctx.last_read_result = r;
+      ctx.last_read_errno = r < 0 ? esp_http_client_get_errno(client) : 0;
       if (r < 0) {
         err = ESP_FAIL;
         break;
@@ -501,7 +596,10 @@ esp_err_t UploadAiAudioChatStream(const WqnAiStreamRequest& request,
   // The user callback may have already gotten a `final` event. Either way,
   // return ESP_OK when the stream completed; transport-level failures map to
   // ESP_FAIL and surface via `response->error_*` fields.
-  return ctx.timed_out ? ESP_ERR_TIMEOUT : internal::FinalizeAiStreamResult(ctx.fatal, err);
+  const esp_err_t result =
+      ctx.timed_out ? ESP_ERR_TIMEOUT : internal::FinalizeAiStreamResult(ctx.fatal, err);
+  LogHttpTrace(&ctx, "return", result);
+  return result;
 }
 
 }  // namespace wqn
