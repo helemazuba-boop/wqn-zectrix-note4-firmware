@@ -129,6 +129,8 @@ by code, `AGENTS.md`, and the architecture/product references above.
   are uncertain, real manifest publication/parser fault regressions and the current build pair.
 - `docs/engineering/RELIABILITY_BATCH_18.md` — reject partial manifest JSON after a single
   allocation failure, preserve both generations, recover on retry and verify candidate identity.
+- `docs/engineering/RELIABILITY_BATCH_19.md` — preserve Problem observations on encoder
+  allocation failure, defer device acceptance and queue decoder/concurrent-install repairs.
 - `docs/engineering/DEAD_CODE_CLEANUP.md` — evidence and scope for firmware
   cleanup decisions.
 - `docs/engineering/SYNC_V3_REPAIR.md` — sync repair findings, host checks, and

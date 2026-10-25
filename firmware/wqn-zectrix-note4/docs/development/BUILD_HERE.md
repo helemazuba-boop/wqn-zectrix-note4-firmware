@@ -180,7 +180,7 @@ The dated directory is an explicit B5 comparison output. Use this same-source
 pair for backup retention/pruning validation; earlier pairs remain historical.
 See [batch 17](../engineering/RELIABILITY_BATCH_17.md) for artifact identity and device checks.
 
-Batch 18's current runtime pair is
+Batch 18's archived runtime pair is
 `dist/b5-diagnostic-pair-b18-20261025/manifest.json` in the reliability worktree.
 Its dedicated control build was prepared with
 `--control-build build-b5-diag-off-b18-20261025 --output dist/b5-diagnostic-pair-b18-20261025`.
@@ -188,6 +188,14 @@ Use this same-source pair for manifest encoder-failure validation; earlier pairs
 remain historical. The latest observed serial identity is `a565923a-dirty`, so
 verify the candidate build label before attributing device results to this batch.
 See [batch 18](../engineering/RELIABILITY_BATCH_18.md) for identity and device checks.
+
+With device acceptance deferred, batch 19 updates the default diagnostic-on
+`build-wsl` only. Its current artifact manifest is
+`dist/reliability-b19-20261025/manifest.json` in the reliability worktree,
+prepared after `idf.py -B build-wsl reconfigure build` at runtime commit `c4bc7ec`.
+This is a single build; a new diagnostic-off control was not prepared. Generate
+a matching pair for the eventual joint power comparison. See
+[batch 19](../engineering/RELIABILITY_BATCH_19.md) for the code queue and boundaries.
 
 ## History
 
