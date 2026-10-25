@@ -230,6 +230,7 @@ void DispatchEvent(StreamContext* ctx, const wqn::SseFrameBuffer& /*frame*/,
   }
   cJSON_Delete(root);
   ctx->request.callback(ev, ctx->request.user_ctx);
+  if (ctx->terminal_event_seen) LogHttpTrace(ctx, "terminal_callback_return", ESP_OK);
 }
 
 bool CheckDeadline(StreamContext* ctx)
@@ -267,7 +268,9 @@ void CloseStream(StreamContext* ctx, esp_http_client_handle_t client)
     ctx->close_requested = true;  // close dispatches DISCONNECTED synchronously
     // The HTTP owner closes the transport, keeping the parser/context alive
     // until the SDK read returns. cleanup() belongs exclusively to the caller.
-    esp_http_client_close(client);
+    LogHttpTrace(ctx, "close_begin", ESP_OK);
+    const esp_err_t result = esp_http_client_close(client);
+    LogHttpTrace(ctx, "close_return", result);
   }
 }
 
@@ -561,6 +564,9 @@ esp_err_t UploadAiAudioChatStream(const WqnAiStreamRequest& request,
       const int r = esp_http_client_read(client, buf, sizeof(buf));
       ctx.last_read_result = r;
       ctx.last_read_errno = r < 0 ? esp_http_client_get_errno(client) : 0;
+      if (ctx.terminal_event_seen || ctx.fatal) {
+        LogHttpTrace(&ctx, "read_return", r < 0 ? ESP_FAIL : ESP_OK);
+      }
       if (r < 0) {
         err = ESP_FAIL;
         break;
@@ -585,7 +591,9 @@ esp_err_t UploadAiAudioChatStream(const WqnAiStreamRequest& request,
     err = ESP_OK;  // intentional close may make the SDK read return an error
   }
   CloseStream(&ctx, client);
-  esp_http_client_cleanup(client);
+  LogHttpTrace(&ctx, "cleanup_begin", ESP_OK);
+  const esp_err_t cleanup_result = esp_http_client_cleanup(client);
+  LogHttpTrace(&ctx, "cleanup_return", cleanup_result);
 
   // Populate caller-facing response fields.
   if (!ctx.error_code.empty() && response != nullptr) {

@@ -166,6 +166,9 @@ int main() {
     CHECK(LogCount("stage=first_data ") == 1 && LogCount("stage=first_event ") == 1);
     CHECK(HasLog("callbacks=3 events=3"));
     CHECK(!HasLog(test_token) && !HasLog("Bearer ") && !HasLog("heard") && !HasLog("saved"));
+    for (const char* stage : {"terminal_callback_return", "close_begin", "close_return", "read_return", "cleanup_begin", "cleanup_return"}) {
+        CHECK(LogCount(std::string("stage=") + stage + " ") == 1);
+    }
 
     Reset(); scenario.packets = {final_frame}; scenario.data_in_headers = true;
     CHECK(Run() == ESP_OK); CHECK(read_count == 0 && delivered.size() == 1);
@@ -204,7 +207,7 @@ int main() {
     Timeout(); CHECK(read_count == 1 && client.packet < 11);
     CHECK(LogCount("stage=deadline ") == 1 && !HasLog("stage=first_event "));
     CHECK(HasLog("progress_gap_ms=-1") && HasLog("events=0"));
-    CHECK(log_lines.size() < 15);
+    CHECK(log_lines.size() < 24);
     // Framed heartbeats still count as events, never as business progress.
     Reset(); scenario.packet_us = 11000; scenario.drain_in_read = true;
     scenario.packets = {"event: stage\ndata: {\"stage\":\"asr\"}\n\n"};
@@ -212,12 +215,12 @@ int main() {
     CHECK(Run() == ESP_ERR_TIMEOUT);
     // The deadline packet is counted as traffic, but is rejected before decode.
     CHECK(HasLog("data_gap_ms=0 event_gap_ms=11 progress_gap_ms=99"));
-    CHECK(log_lines.size() < 16);
+    CHECK(log_lines.size() < 24);
     // Thousands of content deltas do not produce thousands of log records.
     Reset(); scenario.packets.assign(1000, "event: text.delta\ndata: {\"delta\":\"PRIVATE_RESPONSE_TEXT\"}\n\n");
     scenario.packets.push_back(final_frame);
     CHECK(Run() == ESP_OK && delivered.size() == 1001);
-    CHECK(log_lines.size() < 15 && !HasLog("PRIVATE_RESPONSE_TEXT"));
+    CHECK(log_lines.size() < 24 && !HasLog("PRIVATE_RESPONSE_TEXT"));
     CHECK(HasLog("callbacks=1001 events=1001"));
     // Even noisy stage transitions have a fixed logging cap; retain the latest.
     Reset();

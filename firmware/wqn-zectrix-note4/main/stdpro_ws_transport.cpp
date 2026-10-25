@@ -229,6 +229,26 @@ void LogWsPhase(const char* stage, const char* request_id, uint32_t op,
              static_cast<long long>(esp_timer_get_time() / 1000));
 }
 
+void LogWsSocketEvent(const char* stage, const esp_websocket_event_data_t* event)
+{
+    if (event == nullptr) return;
+    const auto& error = event->error_handle;
+    // This vendored component emits ERROR before abort_connection publishes
+    // TCP_TRANSPORT. In that first event, TLS/socket members are uninitialized;
+    // only the type and handshake status are guaranteed. The later DISCONNECTED
+    // event carries transport fields when its type is TCP_TRANSPORT.
+    const bool transport_error = error.error_type == WEBSOCKET_ERROR_TYPE_TCP_TRANSPORT;
+    ESP_LOGW(kTag,
+             "event=ai.ws stage=%s client=%p type=%u transport_fields=%u tls_esp=0x%x tls_stack=%d cert_flags=0x%x http_status=%d sock_errno=%d at_ms=%lld",
+             stage, event->client, static_cast<unsigned>(error.error_type), transport_error ? 1U : 0U,
+             transport_error ? static_cast<unsigned>(error.esp_tls_last_esp_err) : 0U,
+             transport_error ? error.esp_tls_stack_err : 0,
+             transport_error ? static_cast<unsigned>(error.esp_tls_cert_verify_flags) : 0U,
+             error.esp_ws_handshake_status_code,
+             transport_error ? error.esp_transport_sock_errno : 0,
+             static_cast<long long>(esp_timer_get_time() / 1000));
+}
+
 void PublishCompletion(uint32_t op_gen, esp_err_t result, CmdDisposition disposition)
 {
     if (op_gen == 0) {
@@ -481,22 +501,13 @@ void WebsocketEventHandler(void*, esp_event_base_t, int32_t event_id,
                      event == nullptr ? nullptr : event->client,
                      event == nullptr ? 0 : event->close_status_code,
                      static_cast<long long>(esp_timer_get_time() / 1000));
+            LogWsSocketEvent("socket_disconnected_detail", event);
             xTaskNotify(g_transport_task, kEvtBitWsDisconnected, eSetBits);
             break;
         }
 
         case WEBSOCKET_EVENT_ERROR: {
-            if (event != nullptr) {
-                const auto& error = event->error_handle;
-                ESP_LOGW(kTag,
-                         "event=ai.ws stage=socket_error client=%p type=%u tls_esp=0x%x tls_stack=%d cert_flags=0x%x http_status=%d sock_errno=%d at_ms=%lld",
-                         event->client, static_cast<unsigned>(error.error_type),
-                         static_cast<unsigned>(error.esp_tls_last_esp_err),
-                         error.esp_tls_stack_err,
-                         static_cast<unsigned>(error.esp_tls_cert_verify_flags),
-                         error.esp_ws_handshake_status_code, error.esp_transport_sock_errno,
-                         static_cast<long long>(esp_timer_get_time() / 1000));
-            }
+            LogWsSocketEvent("socket_error", event);
             xTaskNotify(g_transport_task, kEvtBitWsError, eSetBits);
             break;
         }

@@ -115,7 +115,7 @@ def main():
     # are production behavior, not a replacement that just increments a count.
     ws_body = '\n'.join(function(ws, signature) for signature in (
         'void DoDestroyWs()', 'void TeardownFailedTurn(', 'void ProcessTextStream()',
-        'void* AllocPrefersPsram('))
+        'void* AllocPrefersPsram(', 'void LogWsSocketEvent('))
     ws_unit = ws_unit.replace('@@PRODUCTION@@', ws_body)
     cjson = Path(os.environ.get('IDF_PATH', '/home/unknow/esp/esp-idf-v5.5'))/'components/json/cJSON'
     if not (cjson/'cJSON.c').is_file():

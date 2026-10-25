@@ -28,6 +28,14 @@ void HostLog(const char* tag, const char* format, ...) {
 }
 #define CHECK(x) do { ++checks; if (!(x)) { std::fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #x); std::abort(); } } while (0)
 constexpr char kTag[] = "ws-test";
+constexpr int WEBSOCKET_ERROR_TYPE_NONE = 0, WEBSOCKET_ERROR_TYPE_TCP_TRANSPORT = 1;
+struct esp_websocket_event_data_t {
+    void* client;
+    struct {
+        int error_type, esp_tls_last_esp_err, esp_tls_stack_err;
+        int esp_tls_cert_verify_flags, esp_ws_handshake_status_code, esp_transport_sock_errno;
+    } error_handle;
+};
 constexpr int MALLOC_CAP_SPIRAM = 1, MALLOC_CAP_8BIT = 2, MALLOC_CAP_INTERNAL = 4;
 static char psram_block, internal_block;
 static bool psram_available = true, internal_available = true;
@@ -109,6 +117,18 @@ static void Feed(const std::string& text) { input = text; offset = 0; ProcessTex
 int main() {
     using Release = wqn::stdpro_ws::TurnReleaseState;
     using Observation = wqn::stdpro_ws::TurnStreamObservation;
+    // ERROR can precede the component's publication of TCP_TRANSPORT. Poison
+    // those fields to catch consumers treating unavailable values as evidence.
+    esp_websocket_event_data_t error_event{};
+    error_event.error_handle = {WEBSOCKET_ERROR_TYPE_NONE, 123456, 123456, 123456, 503, 123456};
+    LogWsSocketEvent("socket_error", &error_event);
+    CHECK(log_lines.size() == 1 && log_lines.back().find("123456") == std::string::npos);
+    CHECK(log_lines.back().find("transport_fields=0 tls_esp=0x0 tls_stack=0 cert_flags=0x0 http_status=503 sock_errno=0") != std::string::npos);
+    error_event.error_handle = {WEBSOCKET_ERROR_TYPE_TCP_TRANSPORT, 0x8006, -1234, 4, 503, 119};
+    LogWsSocketEvent("socket_disconnected_detail", &error_event);
+    CHECK(log_lines.back().find("transport_fields=1 tls_esp=0x8006 tls_stack=-1234 cert_flags=0x4 http_status=503 sock_errno=119") != std::string::npos);
+    LogWsSocketEvent("socket_error", nullptr); CHECK(log_lines.size() == 2);
+    log_lines.clear();
     // Actual allocator: fallback success differs from allocation failure, and
     // diagnostic metadata does not change the preference/order of allocations.
     bool in_psram = false;
