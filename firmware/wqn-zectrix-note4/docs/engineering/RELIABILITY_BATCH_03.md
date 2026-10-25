@@ -2,6 +2,8 @@
 
 日期：2026-10-22。分支：`fix/firmware-reliability`。起点：`13c436b`。
 
+> 当前需要执行的验收见[统一验收清单](FIRMWARE_RELIABILITY_ACCEPTANCE.md)；本文保留历史范围与证据，不要求逐批重复设备矩阵。
+
 ## 交付范围与工作节奏
 
 本批处理全仓审查的 R-04、R-05、R-06。B2 / REL-003 的启动 schema 保全结论

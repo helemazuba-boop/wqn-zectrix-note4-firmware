@@ -2,6 +2,8 @@
 
 日期：2026-10-22。分支：`fix/firmware-reliability`；起点：`52bb42b`。
 
+> 当前需要执行的验收见[统一验收清单](FIRMWARE_RELIABILITY_ACCEPTANCE.md)；本文保留历史范围与证据，不要求逐批重复设备矩阵。
+
 ## 范围与决策
 
 本批落实 B2 / REL-003 的保全行为，保持 generation 3、业务文件格式、分区表和

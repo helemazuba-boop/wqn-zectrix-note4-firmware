@@ -18,6 +18,8 @@ contract they describe.
 - `docs/release/RELEASE_CHECKLIST.md`: coordinated firmware/cloud release gates.
 - `docs/engineering/FIRMWARE_RELIABILITY_PLAN.md`: current reliability findings,
   maintenance gaps, and the staged patch plan for `fix/firmware-reliability`.
+- `docs/engineering/FIRMWARE_RELIABILITY_ACCEPTANCE.md`: current deduplicated
+  automated, stage-device and release acceptance scope, status, evidence and retest triggers.
 
 ## Architecture
 
@@ -91,6 +93,8 @@ by code, `AGENTS.md`, and the architecture/product references above.
   procedure and evidence boundary.
 - `docs/engineering/FIRMWARE_RELIABILITY_PLAN.md` — dated source/history findings,
   issue IDs, recovery-policy questions, patch batches, and acceptance criteria.
+- `docs/engineering/FIRMWARE_RELIABILITY_ACCEPTANCE.md` — the current acceptance
+  entry point, grouped checks, historical evidence reuse and deferred device items.
 - `docs/engineering/RELIABILITY_BATCH_01.md` — first-batch implementation status,
   clean SDK/configuration baseline, focused checks, and remaining device evidence.
 - `docs/engineering/RELIABILITY_BATCH_02.md` — boot-data preservation decisions,

@@ -3,6 +3,8 @@
 开始：2026-10-22；节点交付：2026-10-23（Asia/Shanghai）。
 分支：`fix/firmware-reliability`。起点：`18cdd9d`。
 
+> 当前需要执行的验收见[统一验收清单](FIRMWARE_RELIABILITY_ACCEPTANCE.md)；本文保留历史范围与证据，不要求逐批重复设备矩阵。
+
 ## 状态与交付
 
 用户确认第六批“通过 继续”，本节点记为用户确认验收；未附新设备日志，不补录

@@ -3,6 +3,8 @@
 实施日期：2026-10-21 至 2026-10-22；分支：`fix/firmware-reliability`。
 路线与问题定义见 [FIRMWARE_RELIABILITY_PLAN.md](FIRMWARE_RELIABILITY_PLAN.md)。
 
+> 当前需要执行的验收见[统一验收清单](FIRMWARE_RELIABILITY_ACCEPTANCE.md)；本文保留历史范围与证据，不要求逐批重复设备矩阵。
+
 ## 范围与状态
 
 | 分组 | 状态 | 内容 |

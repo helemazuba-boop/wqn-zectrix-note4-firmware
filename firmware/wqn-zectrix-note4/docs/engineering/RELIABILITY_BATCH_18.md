@@ -2,6 +2,8 @@
 
 日期：2026-10-25（Asia/Shanghai）。分支：`fix/firmware-reliability`。起点：`023f671`。
 
+> 当前需要执行的验收见[统一验收清单](FIRMWARE_RELIABILITY_ACCEPTANCE.md)；本文保留历史范围与证据，不要求逐批重复设备矩阵。
+
 ## 状态与交付
 
 用户回复“通过，继续”，第十七批记为用户确认节点验收。本轮修复 Word/Note/Problem

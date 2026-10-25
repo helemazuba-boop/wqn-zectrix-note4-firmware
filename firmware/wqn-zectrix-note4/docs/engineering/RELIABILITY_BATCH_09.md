@@ -2,6 +2,8 @@
 
 日期：2026-10-23（Asia/Shanghai）。分支：`fix/firmware-reliability`。起点：`44c7c73`。
 
+> 当前需要执行的验收见[统一验收清单](FIRMWARE_RELIABILITY_ACCEPTANCE.md)；本文保留历史范围与证据，不要求逐批重复设备矩阵。
+
 ## 状态与范围
 
 用户确认第八批“通过，继续”。记为用户确认设备节点验收，未附新串口日志，不补录

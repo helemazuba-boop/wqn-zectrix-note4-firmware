@@ -92,6 +92,10 @@ scripts\flash-fix.bat        :: re-flash bootloader + app
 
 ## Rules of engagement (for AI / humans)
 
+Use the [reliability acceptance checklist](../engineering/FIRMWARE_RELIABILITY_ACCEPTANCE.md)
+to choose automated, stage-device and release checks by impact. Historical batch
+device matrices are retained evidence, not repeated per-patch instructions.
+
 1. **One build dir.** Do NOT create a new `build-*` dir. Reuse `build-ai-local-s3`.
    If you absolutely need a new one, name it `build-<purpose>-<date>` and document it here.
 2. **Scripts go in `scripts/`.** Do NOT drop new `.bat` files in project root.

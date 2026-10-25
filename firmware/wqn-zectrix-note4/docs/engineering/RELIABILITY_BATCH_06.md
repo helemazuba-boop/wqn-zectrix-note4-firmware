@@ -2,6 +2,8 @@
 
 日期：2026-10-22。分支：`fix/firmware-reliability`。起点：`623f458`。
 
+> 当前需要执行的验收见[统一验收清单](FIRMWARE_RELIABILITY_ACCEPTANCE.md)；本文保留历史范围与证据，不要求逐批重复设备矩阵。
+
 ## 状态和范围
 
 用户确认第五批 ADC 回归修复“通过 继续推进”，本批继续 B3 / REL-005。该确认
