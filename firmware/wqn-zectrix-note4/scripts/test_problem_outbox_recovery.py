@@ -20,7 +20,10 @@ def main():
     parser.add_argument('--mutation',choices=('delete-primary','substring-id',
                                              'skip-tail-repair','allow-trailing-json',
                                              'unchecked-request','unchecked-problem',
-                                             'unchecked-action','unchecked-time','leak-encoder'))
+                                             'unchecked-action','unchecked-time','leak-encoder',
+                                             'parse-null-is-malformed','parse-null-is-unavailable',
+                                             'ignore-read-oom','ignore-commit-oom','ignore-peek-oom',
+                                             'ignore-remove-oom','ignore-snapshot-oom','ignore-suspend-oom'))
     parser.add_argument('--idf-path',type=Path,default=Path(os.environ.get('IDF_PATH','/home/unknow/esp/esp-idf-v5.5')))
     args=parser.parse_args()
     cjson=args.idf_path/'components/json/cJSON'
@@ -31,7 +34,22 @@ def main():
         raise SystemExit('gcc/g++ unavailable')
     body=args.source.read_text()
     if args.mutation:
-        if args.mutation in ('unchecked-request','unchecked-problem','unchecked-action','unchecked-time'):
+        if args.mutation.startswith('parse-null-is-'):
+            old = '''return ObservationJsonSyntax(line).Complete()
+            ? ObservationDecode::kUnavailable : ObservationDecode::kMalformed;'''
+            new = ('return ObservationDecode::kMalformed;' if args.mutation.endswith('malformed')
+                   else 'return ObservationDecode::kUnavailable;')
+        elif args.mutation.startswith('ignore-'):
+            owner = args.mutation.split('-')[1]
+            starts = {'read': 'esp_err_t ReadOutboxLines(', 'commit': 'esp_err_t CommitTransaction(',
+                      'peek': 'esp_err_t PeekTransaction(', 'remove': 'esp_err_t RemoveTransaction(',
+                      'snapshot': 'esp_err_t SnapshotTransaction(', 'suspend': 'esp_err_t SuspendTransaction('}
+            start = body.index(starts[owner]); end = body.index('\nesp_err_t ', start + 1)
+            old = body[start:end]
+            new = old.replace('if (decoded == ObservationDecode::kUnavailable)', 'if (false)', 1)
+            if old == new:
+                raise ValueError('missing decoder error propagation mutation boundary')
+        elif args.mutation in ('unchecked-request','unchecked-problem','unchecked-action','unchecked-time'):
             calls = {
                 'unchecked-request': 'cJSON_AddStringToObject(root, "request_id", observation.request_id.c_str())',
                 'unchecked-problem': 'cJSON_AddStringToObject(root, "problem_id", observation.problem_id.c_str())',
@@ -100,7 +118,7 @@ namespace wqn::protocol::problem_study_v1 {
                         '-DWQN_DEVICE_CONTROL_SCHEMA_SHA256="host"','-DWQN_PROBLEM_STUDY_SCHEMA_SHA256="host"',
                         '-I',str(directory),'-I',str(root/'main'),'-I',str(root/'components/device_protocol/include'),
                         '-I',str(cjson),str(unit),str(directory/'cJSON.o'),'-o',str(binary),
-                        '-Wl,--wrap=fopen,--wrap=fclose,--wrap=fwrite,--wrap=rename,--wrap=remove,--wrap=fputc,--wrap=cJSON_CreateObject'],
+                        '-Wl,--wrap=fopen,--wrap=fclose,--wrap=fwrite,--wrap=rename,--wrap=remove,--wrap=fputc,--wrap=cJSON_CreateObject,--wrap=cJSON_ParseWithOpts'],
                        check=True,timeout=60)
         return subprocess.run([str(binary),tmp],timeout=30).returncode
 

@@ -104,13 +104,14 @@ extern "C" size_t __wrap_fwrite(const void* data, size_t size, size_t count, FIL
 std::string EncodeObservationLine(const Observation& value) {
     return value.request_id + '|' + value.problem_id + '|' + value.occurred_at;
 }
-bool DecodeObservationLine(const std::string& line, Observation* out) {
+enum class ObservationDecode { kValid, kMalformed, kUnavailable };
+ObservationDecode DecodeObservationLine(const std::string& line, Observation* out) {
     const size_t a = line.find('|'), b = line.find('|', a + 1);
-    if (a == std::string::npos || b == std::string::npos) return false;
+    if (a == std::string::npos || b == std::string::npos) return ObservationDecode::kMalformed;
     out->request_id = line.substr(0, a);
     out->problem_id = line.substr(a + 1, b - a - 1);
     out->occurred_at = line.substr(b + 1);
-    return IsValidObservation(*out);
+    return IsValidObservation(*out) ? ObservationDecode::kValid : ObservationDecode::kMalformed;
 }
 
 @@IO@@
@@ -203,9 +204,9 @@ void RecoveryCases() {
     Check(Commit(conflict)==ESP_ERR_INVALID_STATE,"same ID cannot change the review action");
     conflict=a; conflict.occurred_at="2026-10-09T00:00:00Z";
     Check(Commit(conflict)==ESP_ERR_INVALID_STATE,"same ID cannot change the observation timestamp");
-    Check(!DecodeObservationLine(EncodeObservationLine(a)+"garbage",&out),
+    Check(DecodeObservationLine(EncodeObservationLine(a)+"garbage",&out) == ObservationDecode::kMalformed,
           "production JSON decoder rejects trailing non-JSON bytes");
-    Check(!DecodeObservationLine(EncodeObservationLine(a)+std::string("\0junk",5),&out),
+    Check(DecodeObservationLine(EncodeObservationLine(a)+std::string("\0junk",5),&out) == ObservationDecode::kMalformed,
           "production JSON decoder rejects embedded NUL suffixes");
     Reset(); RawPut(EncodeObservationLine(a)+std::string("\0junk\n",6)+EncodeObservationLine(b)+'\n');
     Check(Peek(&out)==ESP_OK && out.request_id==b.request_id,
@@ -244,6 +245,24 @@ static void EncoderFree(void* pointer) {
         std::free(pointer);
     }
 }
+static bool trace_decodes = false;
+static int fail_decode_call = -1, fail_decode_site = -1;
+static std::vector<std::string> watched_lines;
+static std::vector<unsigned> decode_sites;
+extern "C" cJSON* __real_cJSON_ParseWithOpts(const char*, const char**, cJSON_bool);
+extern "C" cJSON* __wrap_cJSON_ParseWithOpts(const char* text, const char** end, cJSON_bool complete) {
+    if (!trace_decodes || std::find(watched_lines.begin(), watched_lines.end(), text) == watched_lines.end()) {
+        return __real_cJSON_ParseWithOpts(text, end, complete);
+    }
+    const bool previous_tracking = encode_allocations;
+    const int previous_failure = fail_encoder_at;
+    encode_allocations = true; encoder_allocations = 0;
+    fail_encoder_at = static_cast<int>(decode_sites.size()) == fail_decode_call ? fail_decode_site : -1;
+    cJSON* result = __real_cJSON_ParseWithOpts(text, end, complete);
+    decode_sites.push_back(encoder_allocations);
+    encode_allocations = previous_tracking; fail_encoder_at = previous_failure;
+    return result;
+}
 static std::string FileBytes(const char* path) {
     std::ifstream file(path, std::ios::binary);
     return {std::istreambuf_iterator<char>(file), {}};
@@ -263,7 +282,7 @@ static void EncoderAllocationCases() {
         encode_allocations = false;
         const unsigned allocation_sites = encoder_allocations;
         Observation decoded;
-        Check(!golden.empty() && DecodeObservationLine(golden, &decoded) &&
+        Check(!golden.empty() && DecodeObservationLine(golden, &decoded) == ObservationDecode::kValid &&
               decoded.request_id == observation.request_id && decoded.problem_id == observation.problem_id &&
               decoded.action == observation.action && decoded.occurred_at == observation.occurred_at,
               "all problem actions round trip through the real JSON codec");
@@ -286,7 +305,7 @@ static void EncoderAllocationCases() {
                 const size_t separator = accepted.rfind('\n');
                 if (separator != std::string::npos) accepted.erase(0, separator + 1);
                 Observation read_back;
-                const bool decodable = DecodeObservationLine(accepted, &read_back);
+                const bool decodable = DecodeObservationLine(accepted, &read_back) == ObservationDecode::kValid;
                 std::fprintf(stderr, "FALSE ACK: action=%u state=%u allocation=%u wrote=%d decodable=%d\n",
                              action, state, site, write_opens, decodable ? 1 : 0);
             }
@@ -318,6 +337,136 @@ static void EncoderAllocationCases() {
     encode_allocations = false; fail_encoder_at = -1;
     Check(encoder_live_nodes == 0, "final failed root allocation leaves no JSON nodes");
     cJSON_InitHooks(nullptr);
+}
+
+static void DecoderAllocationCases() {
+    cJSON_Hooks hooks{EncoderAllocate, EncoderFree}; cJSON_InitHooks(&hooks);
+    const auto a = Value("decode-A"), b = Value("decode-B"), next = Value("decode-new");
+    auto conflict = a; conflict.occurred_at = "2026-10-09T00:00:00Z";
+    const std::string line_a = EncodeObservationLine(a), line_b = EncodeObservationLine(b);
+    watched_lines = {line_a, line_b};
+    auto prepare = [&]() {
+        trace_decodes = false; Reset();
+        Check(Commit(a) == ESP_OK && Commit(b) == ESP_OK, "decoder fixture records were durably accepted");
+        // A complete bad frame and torn tail keep repair/rewrite in the path.
+        RawPut(FileBytes(kOutboxPath) + "{bad}\n{torn");
+        RawPutAt(kOutboxBackupPath, line_a + '\n');
+        RawPutAt(kParkedPath, ""); RawPutAt(kRejectedPath, "");
+        write_opens = 0; decode_sites.clear(); encoder_denials = 0;
+    };
+    auto operation = [&](unsigned action) {
+        Observation out; wqn::ProblemOutboxSnapshot snapshot;
+        switch (action) {
+            case 0: return Commit(next);
+            case 1: return Commit(a);
+            case 2: return Commit(conflict);
+            case 3: return Peek(&out);
+            case 4: return Snapshot(&snapshot);
+            case 5: return Remove(b);
+            case 6: return Remove(b, true);
+            default: return Suspend(b);
+        }
+    };
+    unsigned faults = 0;
+    for (unsigned action = 0; action < 8; ++action) {
+        prepare(); trace_decodes = true; fail_decode_call = fail_decode_site = -1;
+        Check(operation(action) == (action == 2 ? ESP_ERR_INVALID_STATE : ESP_OK),
+              "normal decoder transaction preserves its result contract");
+        trace_decodes = false;
+        const auto sites = decode_sites;
+        Check(!sites.empty() && encoder_live_nodes == 0, "decoder baseline records allocations and frees its tree");
+        for (unsigned call = 0; call < sites.size(); ++call) for (unsigned site = 0; site < sites[call]; ++site) {
+            prepare();
+            const std::string primary = FileBytes(kOutboxPath), backup = FileBytes(kOutboxBackupPath);
+            trace_decodes = true; fail_decode_call = static_cast<int>(call); fail_decode_site = static_cast<int>(site);
+            const int result = operation(action);
+            trace_decodes = false; fail_decode_call = fail_decode_site = -1;
+            if (result != ESP_ERR_NO_MEM || encoder_denials != 1) {
+                std::fprintf(stderr, "DECODER FAULT: action=%u call=%u site=%u result=%d denials=%u\n",
+                             action, call, site, result, encoder_denials);
+            }
+            Check(result == ESP_ERR_NO_MEM && encoder_denials == 1,
+                  "every valid-record decode allocation failure returns a retryable memory error");
+            Check(encoder_live_nodes == 0, "failed decoder releases every partially built JSON node");
+            Check(write_opens == 0 && FileBytes(kOutboxPath) == primary && FileBytes(kOutboxBackupPath) == backup &&
+                  ::access(kOutboxTempPath, F_OK) != 0 && FileBytes(kParkedPath).empty() && FileBytes(kRejectedPath).empty(),
+                  "failed decoding preserves primary, backup and marker journals without writes");
+            // Resume another local save then ACK it: A/B must survive both rewrites.
+            wqn::ProblemOutboxSnapshot snapshot;
+            Check(Commit(next) == ESP_OK && Remove(next) == ESP_OK && Snapshot(&snapshot) == ESP_OK &&
+                  snapshot.pending_count == 2 && FileBytes(kOutboxPath).find(line_a) != std::string::npos &&
+                  FileBytes(kOutboxPath).find(line_b) != std::string::npos,
+                  "accepted records survive recovered append and subsequent ACK");
+            Check(operation(action) == (action == 2 ? ESP_ERR_INVALID_STATE : ESP_OK),
+                  "failed decoder operation can be retried after memory recovers");
+            Check(encoder_live_nodes == 0, "decoder retry releases every JSON allocation");
+            ++faults;
+        }
+    }
+    // Noncanonical but readable records must receive the same protection. Extra
+    // fields exercise strings, escapes, nested containers, scalars and cJSON's
+    // permissive legacy number/Unicode syntax without changing the wire format.
+    std::vector<std::string> extras = {
+        "null", "true", "false", "0", "-0", "001", "-.5", "1.", "1.e+02", "1e309",
+        "[]", "{}", "[{},true,false,null,1.5e-2]", "{\"nested\":[1,{\"x\":2}]}",
+        R"("\"\\\/\b\f\n\r\t")", R"("\u0000\u00ff\uD834\uDD1E")", R"("\uxxxx")", R"("\u1\"f")",
+        std::string("\"raw") + '\x01' + "\"",
+        std::string(31, '[') + "0" + std::string(31, ']'),
+    };
+    unsigned compatibility_faults = 0;
+    for (const auto& extra : extras) {
+        const std::string line = "\xef\xbb\xbf \t" + line_a.substr(0, line_a.size()-1) + ",\"extra\":" + extra + "}\r ";
+        Observation out;
+        encode_allocations = true; encoder_allocations = 0; fail_encoder_at = -1;
+        const auto decoded = DecodeObservationLine(line, &out);
+        encode_allocations = false;
+        const unsigned sites = encoder_allocations;
+        Check(decoded == ObservationDecode::kValid && out.request_id == a.request_id,
+              "legacy JSON syntax remains readable with extra fields and BOM/whitespace");
+        for (unsigned site = 0; site < sites; ++site) {
+            encode_allocations = true; encoder_allocations = 0; fail_encoder_at = static_cast<int>(site); encoder_denials = 0;
+            const auto result = DecodeObservationLine(line, &out);
+            encode_allocations = false; fail_encoder_at = -1;
+            Check(result == ObservationDecode::kUnavailable && encoder_denials == 1 && encoder_live_nodes == 0,
+                  "allocation failure cannot turn a readable legacy JSON record into malformed data");
+            ++compatibility_faults;
+        }
+    }
+    const std::vector<std::string> malformed = {
+        "", "garbage", "{bad}", "[", "{\"x\":}", "[1,]", "{\"x\":1,}", "{\"x\" 1}",
+        "{\"x\":true false}", "{\"x\":1e}", "{\"x\":-.}", "{\"x\":[1,2}",
+        R"({"x":"unterminated})", R"({"x":"\q"})", R"({"x":"\u12"})",
+        R"({"x":"\ud800"})", R"({"x":"\udc00"})", R"({"x":"\ud800\u0000"})",
+        line_a + "garbage", line_a + line_b,
+    };
+    for (const auto& line : malformed) {
+        Observation out;
+        Check(DecodeObservationLine(line, &out) == ObservationDecode::kMalformed,
+              "syntax-corrupt complete frames still follow the bounded repair policy");
+        encode_allocations = true; encoder_allocations = 0; fail_encoder_at = 0;
+        const auto result = DecodeObservationLine(line, &out);
+        encode_allocations = false; fail_encoder_at = -1;
+        Check(result == ObservationDecode::kMalformed && encoder_live_nodes == 0,
+              "independently proven corrupt syntax stays recoverable even during memory pressure");
+    }
+    // Compare the probe against real cJSON on deterministic one-byte mutations.
+    // Only accepted syntax is authoritative here: a conservative false-positive
+    // delays repair, whereas a false-negative could delete a valid record.
+    const std::string seed = "{\"a\":[true,false,null,-.12e+3,{\"x\":\"\\uD834\\uDD1E\"}]}";
+    std::string replacements;
+    for (unsigned byte = 1; byte < 128; ++byte) replacements.push_back(static_cast<char>(byte));
+    unsigned accepted = 0;
+    bool all_safe = true;
+    for (size_t index = 0; index < seed.size(); ++index) for (char ch : replacements) {
+        std::string changed = seed; changed[index] = ch;
+        cJSON* root = cJSON_ParseWithOpts(changed.c_str(), nullptr, true);
+        if (root) { ++accepted; all_safe = all_safe && ObservationJsonSyntax(changed).Complete(); cJSON_Delete(root); }
+    }
+    Check(accepted > 50 && all_safe && encoder_live_nodes == 0,
+          "syntax probe never rejects cJSON-accepted one-byte mutation corpus");
+    std::printf("Decoder: %u transaction faults, %u compatibility faults, %u accepted syntax mutations PASS\n",
+                faults, compatibility_faults, accepted);
+    Reset(); watched_lines.clear(); cJSON_InitHooks(nullptr);
 }
 #endif
 int main(int argc, char** argv) {
@@ -429,6 +578,7 @@ int main(int argc, char** argv) {
     RecoveryCases();
 #if REAL_CODEC
     EncoderAllocationCases();
+    DecoderAllocationCases();
 #endif
     std::printf("%d PASS / %d FAIL (temporary libc files; NOT ESP32 HIL)\n",
                 passes, failures);

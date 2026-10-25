@@ -128,16 +128,159 @@ std::string EncodeObservationLine(const wqn::DurableProblemObservation& observat
     return line;
 }
 
-bool DecodeObservationLine(
+enum class ObservationDecode { kValid, kMalformed, kUnavailable };
+
+// cJSON reports the same null result for malformed JSON and allocation failure.
+// Only run this allocation-free syntax probe after failure: a complete document
+// may have failed for lack of memory and must never be dropped during repair.
+// Fixed container states bound stack use; no recursion or global allocator hooks.
+// Match cJSON's whitespace, BOM, raw string bytes and permissive number forms.
+class ObservationJsonSyntax {
+public:
+    explicit ObservationJsonSyntax(const std::string& text) : text_(text) {}
+    bool Complete()
+    {
+        enum State : unsigned char {
+            kValue, kDone, kArrayFirst, kArrayNext, kArrayAfter,
+            kObjectFirst, kObjectNext, kObjectColon, kObjectAfter,
+        };
+        State states[wqn::protocol::kMaxJsonNestingDepth + 1] = {kValue};
+        size_t depth = 0;
+        if (text_.compare(0, 3, "\xef\xbb\xbf") == 0) position_ = 3;
+        while (true) {
+            while (position_ < text_.size() &&
+                   static_cast<unsigned char>(text_[position_]) <= 32) ++position_;
+            const char ch = position_ < text_.size() ? text_[position_] : '\0';
+            State& state = states[depth];
+            if (state == kDone) return position_ == text_.size();
+            if ((state == kArrayFirst && ch == ']') ||
+                (state == kObjectFirst && ch == '}')) {
+                ++position_; --depth; continue;
+            }
+            if (state == kArrayAfter || state == kObjectAfter) {
+                if (ch == (state == kArrayAfter ? ']' : '}')) {
+                    ++position_; --depth; continue;
+                }
+                if (ch != ',') return false;
+                state = state == kArrayAfter ? kArrayNext : kObjectNext;
+                ++position_; continue;
+            }
+            if (state == kObjectFirst || state == kObjectNext) {
+                if (!String()) return false;
+                state = kObjectColon; continue;
+            }
+            if (state == kObjectColon) {
+                if (ch != ':') return false;
+                ++position_; state = kValue; continue;
+            }
+            state = depth == 0 ? kDone :
+                (state == kArrayFirst || state == kArrayNext ? kArrayAfter : kObjectAfter);
+            if (ch == '[' || ch == '{') {
+                if (depth == wqn::protocol::kMaxJsonNestingDepth) return false;
+                states[++depth] = ch == '[' ? kArrayFirst : kObjectFirst;
+                ++position_;
+            } else if (ch == '"') {
+                if (!String()) return false;
+            } else if (ch == '-' || (ch >= '0' && ch <= '9')) {
+                if (!Number()) return false;
+            } else if (text_.compare(position_, 4, "null") == 0 ||
+                       text_.compare(position_, 4, "true") == 0) {
+                position_ += 4;
+            } else if (text_.compare(position_, 5, "false") == 0) {
+                position_ += 5;
+            } else return false;
+        }
+    }
+private:
+    bool String()
+    {
+        if (position_ >= text_.size() || text_[position_++] != '"') return false;
+        size_t end = position_;
+        while (end < text_.size() && text_[end] != '"') {
+            if (text_[end] == '\\') ++end;
+            ++end;
+        }
+        if (end >= text_.size()) return false;
+        while (position_ < end) {
+            const char ch = text_[position_++];
+            if (ch != '\\') continue;
+            if (position_ == text_.size()) return false;
+            const char escaped = text_[position_++];
+            if (escaped == 'u') {
+                unsigned first = 0;
+                if (!Unicode(&first, end) || (first >= 0xdc00 && first <= 0xdfff)) return false;
+                if (first >= 0xd800 && first <= 0xdbff) {
+                    if (text_.compare(position_, 2, "\\u") != 0) return false;
+                    position_ += 2;
+                    unsigned second = 0;
+                    if (!Unicode(&second, end) || second < 0xdc00 || second > 0xdfff) return false;
+                }
+            } else if (escaped != '"' && escaped != '\\' && escaped != '/' &&
+                       escaped != 'b' && escaped != 'f' && escaped != 'n' &&
+                       escaped != 'r' && escaped != 't') return false;
+        }
+        position_ = end + 1;
+        return true;
+    }
+    bool Unicode(unsigned* value, size_t end)
+    {
+        if (position_ > end || end - position_ < 4) return false;
+        bool hex = true;
+        for (unsigned i = 0; i < 4; ++i) {
+            const unsigned char ch = text_[position_++];
+            *value <<= 4;
+            if (ch >= '0' && ch <= '9') *value += ch - '0';
+            else if (ch >= 'a' && ch <= 'f') *value += ch - 'a' + 10;
+            else if (ch >= 'A' && ch <= 'F') *value += ch - 'A' + 10;
+            else hex = false;
+        }
+        // cJSON's parse_hex4 maps non-hex sequences to zero too. Keeping that
+        // compatibility prevents discarding an older readable record on OOM.
+        if (!hex) *value = 0;
+        return true;
+    }
+    bool Number()
+    {
+        if (text_[position_] == '-') ++position_;
+        const size_t integer = position_;
+        while (Digit()) ++position_;
+        bool digits = position_ != integer;
+        if (position_ < text_.size() && text_[position_] == '.') {
+            const size_t fraction = ++position_;
+            while (Digit()) ++position_;
+            digits = digits || position_ != fraction;
+        }
+        if (!digits) return false;
+        if (position_ < text_.size() && (text_[position_] == 'e' || text_[position_] == 'E')) {
+            ++position_;
+            if (position_ < text_.size() && (text_[position_] == '+' || text_[position_] == '-')) ++position_;
+            const size_t exponent = position_;
+            while (Digit()) ++position_;
+            if (position_ == exponent) return false;
+        }
+        return true;
+    }
+    bool Digit() const
+    {
+        return position_ < text_.size() && text_[position_] >= '0' && text_[position_] <= '9';
+    }
+    const std::string& text_;
+    size_t position_ = 0;
+};
+
+ObservationDecode DecodeObservationLine(
     const std::string& line, wqn::DurableProblemObservation* observation)
 {
-    if (observation == nullptr || line.find('\0') != std::string::npos) return false;
+    if (observation == nullptr || line.find('\0') != std::string::npos ||
+        !wqn::protocol::JsonNestingWithinLimit(line.data(), line.size())) {
+        return ObservationDecode::kMalformed;
+    }
     *observation = {};
-    cJSON* root = wqn::protocol::JsonNestingWithinLimit(
-                      line.data(), line.size())
-        ? cJSON_ParseWithOpts(line.c_str(), nullptr, true)
-        : nullptr;
-    if (root == nullptr) return false;
+    cJSON* root = cJSON_ParseWithOpts(line.c_str(), nullptr, true);
+    if (root == nullptr) {
+        return ObservationJsonSyntax(line).Complete()
+            ? ObservationDecode::kUnavailable : ObservationDecode::kMalformed;
+    }
     cJSON* request_id = cJSON_GetObjectItemCaseSensitive(root, "request_id");
     cJSON* problem_id = cJSON_GetObjectItemCaseSensitive(root, "problem_id");
     cJSON* action = cJSON_GetObjectItemCaseSensitive(root, "action");
@@ -157,7 +300,8 @@ bool DecodeObservationLine(
         else ok = false;
     }
     cJSON_Delete(root);
-    return ok && IsValidObservation(*observation);
+    return ok && IsValidObservation(*observation)
+        ? ObservationDecode::kValid : ObservationDecode::kMalformed;
 }
 
 // Reads every journal line (bounded); malformed lines are dropped so one
@@ -212,11 +356,15 @@ esp_err_t ReadOutboxLines(
             if (!line.empty() && line.back() == '\r') line.pop_back();
             if (!discard_line && !line.empty()) {
                 wqn::DurableProblemObservation parsed;
-                if (line.size() <= kMaxLineBytes && DecodeObservationLine(line, &parsed)) {
-                    lines->push_back(line);
-                } else {
-                    repair = true;
+                const auto decoded = line.size() <= kMaxLineBytes
+                    ? DecodeObservationLine(line, &parsed) : ObservationDecode::kMalformed;
+                if (decoded == ObservationDecode::kUnavailable) {
+                    std::fclose(file);
+                    lines->clear();
+                    return ESP_ERR_NO_MEM;
                 }
+                if (decoded == ObservationDecode::kValid) lines->push_back(line);
+                else repair = true;
             }
             line.clear();
             discard_line = false;
@@ -427,7 +575,9 @@ esp_err_t CommitTransaction(void* opaque)
     if (result != ESP_OK) return result;
     for (const std::string& line : lines) {
         wqn::DurableProblemObservation parsed;
-        if (DecodeObservationLine(line, &parsed) &&
+        const auto decoded = DecodeObservationLine(line, &parsed);
+        if (decoded == ObservationDecode::kUnavailable) return ESP_ERR_NO_MEM;
+        if (decoded == ObservationDecode::kValid &&
             parsed.request_id == context->observation->request_id) {
             return parsed.problem_id == context->observation->problem_id &&
                 parsed.action == context->observation->action &&
@@ -469,7 +619,9 @@ esp_err_t PeekTransaction(void* opaque)
     const esp_err_t result = ReadOutboxForQuery(&lines, &parked);
     if (result != ESP_OK) return result;
     for (const std::string& line : lines) {
-        if (!DecodeObservationLine(line, observation)) {
+        const auto decoded = DecodeObservationLine(line, observation);
+        if (decoded == ObservationDecode::kUnavailable) return ESP_ERR_NO_MEM;
+        if (decoded != ObservationDecode::kValid) {
             ESP_LOGW(kTag, "skipping malformed problem outbox head");
             continue;
         }
@@ -501,7 +653,9 @@ esp_err_t RemoveTransaction(void* opaque)
     std::string removed;
     for (const std::string& line : lines) {
         wqn::DurableProblemObservation parsed;
-        if (!DecodeObservationLine(line, &parsed)) {
+        const auto decoded = DecodeObservationLine(line, &parsed);
+        if (decoded == ObservationDecode::kUnavailable) return ESP_ERR_NO_MEM;
+        if (decoded != ObservationDecode::kValid) {
             // Malformed lines are dropped as part of any rewrite.
             continue;
         }
@@ -547,7 +701,9 @@ esp_err_t SnapshotTransaction(void* opaque)
     size_t suspended = 0;
     for (const std::string& line : lines) {
         wqn::DurableProblemObservation parsed;
-        if (!DecodeObservationLine(line, &parsed)) continue;
+        const auto decoded = DecodeObservationLine(line, &parsed);
+        if (decoded == ObservationDecode::kUnavailable) return ESP_ERR_NO_MEM;
+        if (decoded != ObservationDecode::kValid) continue;
         const bool is_parked =
             std::find(parked.begin(), parked.end(), parsed.request_id) !=
             parked.end();
@@ -590,7 +746,9 @@ esp_err_t SuspendTransaction(void* opaque)
     bool exists = false;
     for (const std::string& line : lines) {
         wqn::DurableProblemObservation parsed;
-        if (DecodeObservationLine(line, &parsed) &&
+        const auto decoded = DecodeObservationLine(line, &parsed);
+        if (decoded == ObservationDecode::kUnavailable) return ESP_ERR_NO_MEM;
+        if (decoded == ObservationDecode::kValid &&
             parsed.request_id == *context->request_id) {
             exists = true;
             break;
