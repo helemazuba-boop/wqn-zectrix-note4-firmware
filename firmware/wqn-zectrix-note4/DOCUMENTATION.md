@@ -135,6 +135,8 @@ by code, `AGENTS.md`, and the architecture/product references above.
   allocation failure, preserve both generations, recover on retry and verify candidate identity.
 - `docs/engineering/RELIABILITY_BATCH_19.md` — preserve Problem observations on encoder
   allocation failure, defer device acceptance and queue decoder/concurrent-install repairs.
+- `docs/engineering/RELIABILITY_BATCH_20.md` — preserve accepted Problem records on decoder
+  allocation failure, retain corrupt-frame repair, and prioritize Note concurrent installation.
 - `docs/engineering/DEAD_CODE_CLEANUP.md` — evidence and scope for firmware
   cleanup decisions.
 - `docs/engineering/SYNC_V3_REPAIR.md` — sync repair findings, host checks, and

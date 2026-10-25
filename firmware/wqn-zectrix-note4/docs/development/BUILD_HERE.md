@@ -193,13 +193,14 @@ remain historical. The latest observed serial identity is `a565923a-dirty`, so
 verify the candidate build label before attributing device results to this batch.
 See [batch 18](../engineering/RELIABILITY_BATCH_18.md) for identity and device checks.
 
-With device acceptance deferred, batch 19 updates the default diagnostic-on
+With device acceptance deferred, batch 20 updates the default diagnostic-on
 `build-wsl` only. Its current artifact manifest is
-`dist/reliability-b19-20261025/manifest.json` in the reliability worktree,
-prepared after `idf.py -B build-wsl reconfigure build` at runtime commit `c4bc7ec`.
+`dist/reliability-b20-20261026/manifest.json` in the reliability worktree,
+prepared after `idf.py -B build-wsl reconfigure build` at runtime commit `8997119`.
 This is a single build; a new diagnostic-off control was not prepared. Generate
 a matching pair for the eventual joint power comparison. See
-[batch 19](../engineering/RELIABILITY_BATCH_19.md) for the code queue and boundaries.
+[batch 20](../engineering/RELIABILITY_BATCH_20.md) for decoder preservation,
+the next code tasks and verification boundaries.
 
 ## History
 
