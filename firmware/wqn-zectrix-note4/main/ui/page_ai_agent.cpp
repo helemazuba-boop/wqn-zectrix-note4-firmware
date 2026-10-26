@@ -1,6 +1,6 @@
 // Agent tier on the AI page: the OpenCode gateway rendered through the shared
-// chat viewport, plus the two interaction surfaces the gateway needs that the
-// STD/Pro tiers do not have --
+// chat viewport and the gateway's interaction surfaces. STD also reuses the
+// decision renderer through ai_std_interaction.cpp --
 //
 //   1. a session picker (the gateway's conversations are server-side and
 //      long-lived, so the user must be able to switch and to re-attach), and
@@ -76,7 +76,6 @@ constexpr int kAgentBarTextY = kAgentBarY + 3;                      // baseline
 constexpr int kAgentIndicatorColumn = 44;
 // Gap between the pending bubble's bottom edge and the option bar.
 constexpr int kAgentBubbleGap = 6;
-constexpr int kAgentBubbleMaxLines = 3;
 
 #define AGENT_TEXT(...) do { (void)wqn::DrawUtf8Text(__VA_ARGS__); } while (0)
 
@@ -123,7 +122,8 @@ int AiBottomReserve(const wqn::AgentSessionState& agent)
 // interrupt path). Two of them are visible at a time.
 int AgentQuestionItemCount(const wqn::AgentSessionState& agent)
 {
-    return static_cast<int>(agent.pending_question_options.size()) + 1;
+    return static_cast<int>(agent.pending_question_options.size()) +
+           (agent.question_allow_custom ? 1 : 0);
 }
 
 int AgentQuestionWindowStart(const wqn::AgentSessionState& agent, uint8_t focused)
@@ -181,8 +181,7 @@ static std::string AgentQuestionPrompt(const wqn::AgentSessionState& agent)
     return ask;
 }
 
-static void DrawAgentOptionBar(AgentOptionMode mode, uint8_t focused,
-                                const wqn::AgentSessionState& agent)
+void DrawAgentOptionBar(AgentOptionMode mode, uint8_t focused, const wqn::AgentSessionState& agent)
 {
     // The band is cleared here rather than by the caller so a disappearing
     // option bar cannot leave a ghost on the E-ink panel. Only the width left of
@@ -240,13 +239,13 @@ static void DrawAgentOptionBar(AgentOptionMode mode, uint8_t focused,
 // option bar. It deliberately overlays history rather than scrolling it: the
 // user is mid-decision and the newest committed turn is not what they are
 // reading.
-static void DrawAgentPendingBubble(const std::string& text, const char* title)
+void DrawAgentPendingBubble(const std::string& text, const char* title, size_t max_lines)
 {
     if (text.empty()) {
         return;
     }
-    const auto lines = WrapAiNativeText(
-        text, kAiAssistantW - 2 * kAiAssistantLeftBorder - 8, AiNativeFont(), kAgentBubbleMaxLines);
+    const auto lines = WrapAiNativeText(text, kAiAssistantW - 2 * kAiAssistantLeftBorder - 8,
+                                        AiNativeFont(), max_lines);
     if (lines.empty()) {
         return;
     }

@@ -21,6 +21,7 @@
 
 #include "runtime/storage_temp_file_lease.h"
 #include "runtime/pack_stream_path_lease.h"
+#include "voice_diagnostics.h"
 
 static unsigned checks = 0;
 #define CHECK(condition) do { ++checks; if (!(condition)) { \
@@ -29,6 +30,10 @@ using esp_err_t = int;
 constexpr int ESP_OK = 0, ESP_FAIL = -1, ESP_ERR_INVALID_ARG = 258,
     ESP_ERR_INVALID_STATE = 259, ESP_ERR_NO_MEM = 257, ESP_ERR_NOT_FINISHED = 264;
 static time_t now_sec = 100000;
+static int64_t esp_timer_get_time() {
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 extern "C" time_t __wrap_time(time_t* out) { if (out) *out = now_sec; return now_sec; }
 static void HostLog(const char*, const char*, ...) __attribute__((format(printf, 2, 3)));
 static void HostLog(const char*, const char*, ...) {}
@@ -128,6 +133,7 @@ enum class Operation { kBegin, kAppend, kCommit, kAbort };
 using WordPackStreamOperation = Operation;
 using NotePackStreamOperation = Operation;
 using ProblemPackStreamOperation = Operation;
+@@WORD_PROFILE@@
 struct Context {
     const Manifest *item = nullptr, *notebook = nullptr, *set = nullptr;
     Hash sha;
@@ -137,6 +143,8 @@ struct Context {
     size_t chunk_size = 0;
     std::string temporary;
     std::string temp_path, final_path;
+    WordPackAppendProfile profile;
+    size_t bytes_written = 0;
 };
 using WordPackStreamContext = Context;
 using NotePackStreamContext = Context;

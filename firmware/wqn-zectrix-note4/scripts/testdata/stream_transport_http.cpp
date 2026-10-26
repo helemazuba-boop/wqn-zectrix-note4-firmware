@@ -1,7 +1,9 @@
 // Real HTTP owner + parser/decoder, with controllable SDK I/O and monotonic time.
 #include <algorithm>
 #include <cassert>
+#include <cerrno>
 #include <climits>
+#include <cstdarg>
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -15,27 +17,38 @@ static int checks = 0;
 #define CHECK(x) do { ++checks; if (!(x)) { std::fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #x); std::abort(); } } while (0)
 struct Scenario {
     int status = 200, write_max = 2048;
+    int quiet_reads = 0;
     int64_t init_us = 0, open_us = 0, write_us = 0, headers_us = 0, packet_us = 0;
     bool fail_init = false, fail_open = false, fail_write = false, fail_headers = false;
-    bool data_in_headers = false, drain_in_read = false;
+    bool data_in_headers = false, drain_in_read = false, fail_read = false;
     std::vector<std::string> packets;
 } scenario;
 struct HostClient {
     esp_http_client_config_t cfg{};
     bool closed = false;
     int status = -1;
+    int socket_errno = 0;
     size_t packet = 0;
 };
 static HostClient client;
+static std::string requested_url,request_body;
 static int64_t clock_us = 0;
 static int cleanup_count = 0, close_count = 0, read_count = 0, write_count = 0, written = 0;
 static std::vector<int> timeouts;
 static std::map<std::string, std::string> headers;
 static std::vector<wqn::WqnAiSseEvent> delivered;
+static std::vector<std::string> log_lines;
+void HostLog(const char* tag, const char* format, ...) {
+    char line[1536];
+    va_list args; va_start(args, format);
+    std::vsnprintf(line, sizeof(line), format, args); va_end(args);
+    log_lines.emplace_back(std::string(tag) + " " + line);
+}
 static int64_t callback_us = 0;
 int64_t esp_timer_get_time() { return clock_us; }
 esp_err_t esp_read_mac(uint8_t* mac, int) { std::memset(mac, 1, 6); return ESP_OK; }
-namespace wqn { bool IsValidAccessToken(const std::string& token) { return token == "token"; } }
+constexpr char test_token[] = "SYNTHETIC_CREDENTIAL_MUST_NOT_BE_LOGGED";
+namespace wqn { bool IsValidAccessToken(const std::string& token) { return token == test_token; } }
 static void Emit(esp_http_client_event_id_t id, const std::string& data = {}) {
     esp_http_client_event_t event{id, &client, client.cfg.user_data,
                                  const_cast<char*>(data.data()), static_cast<int>(data.size())};
@@ -45,7 +58,7 @@ static void Emit(esp_http_client_event_id_t id, const std::string& data = {}) {
 esp_http_client_handle_t esp_http_client_init(const esp_http_client_config_t* cfg) {
     clock_us += scenario.init_us;
     if (scenario.fail_init) return nullptr;
-    client = HostClient{}; client.cfg = *cfg; return &client;
+    client = HostClient{}; client.cfg = *cfg; requested_url=cfg->url; return &client;
 }
 esp_err_t esp_http_client_set_header(HostClient*, const char* k, const char* v) {
     headers[k] = v; return ESP_OK;
@@ -58,10 +71,10 @@ esp_err_t esp_http_client_open(HostClient*, int) {
     if (scenario.fail_open) return ESP_FAIL;
     Emit(HTTP_EVENT_ON_CONNECTED); return ESP_OK;
 }
-int esp_http_client_write(HostClient*, const char*, int len) {
+int esp_http_client_write(HostClient*, const char* data, int len) {
     ++write_count; clock_us += scenario.write_us;
     if (scenario.fail_write) return -1;
-    const int count = std::min(len, scenario.write_max); written += count; return count;
+    const int count = std::min(len, scenario.write_max); request_body.append(data,count); written += count; return count;
 }
 static int Packet() {
     if (client.packet == scenario.packets.size()) return 0;
@@ -78,9 +91,14 @@ int64_t esp_http_client_fetch_headers(HostClient*) {
     return scenario.fail_headers ? -1 : 0;
 }
 int esp_http_client_get_status_code(HostClient*) { return client.status; }
+int esp_http_client_get_errno(HostClient*) { return client.socket_errno; }
 int esp_http_client_read(HostClient*, char*, int) {
     ++read_count;
+    if (scenario.quiet_reads > 0) { --scenario.quiet_reads;clock_us+=200000;return -ESP_ERR_HTTP_EAGAIN; }
     if (client.closed) return -1;
+    if (scenario.fail_read) {
+        client.socket_errno = ECONNRESET; errno = EINVAL; return -1;
+    }
     int result = Packet();
     if (scenario.drain_in_read) {
         int guard = 0;
@@ -108,14 +126,15 @@ static void Callback(const wqn::WqnAiSseEvent& ev, void*) {
 }
 static wqn::WqnAiStreamRequest Request() {
     wqn::WqnAiStreamRequest request;
-    request.token = "token"; request.pcm_data = pcm.data(); request.pcm_sample_count = pcm.size();
+    request.token = test_token; request.pcm_data = pcm.data(); request.pcm_sample_count = pcm.size();
     request.duration_ms = 100; request.timeout_ms = 100; request.request_id = "same-id";
     request.reasoning_effort = "low"; request.enable_thinking = false; request.callback = Callback;
     return request;
 }
 static void Reset() {
     scenario = Scenario{}; clock_us = 0; cleanup_count = close_count = read_count = write_count = written = 0;
-    headers.clear(); timeouts.clear(); delivered.clear(); callback_us = 0;
+    requested_url.clear();request_body.clear();
+    headers.clear(); timeouts.clear(); delivered.clear(); log_lines.clear(); callback_us = 0; errno = 0;
     response = wqn::WqnAiChatResponse{};
 }
 static esp_err_t Run() {
@@ -128,6 +147,12 @@ static void Timeout() {
     CHECK(Run() == ESP_ERR_TIMEOUT); CHECK(response.error_code == "chat_timeout");
     CHECK(delivered.empty());
 }
+static size_t LogCount(const std::string& fragment) {
+    return std::count_if(log_lines.begin(), log_lines.end(), [&](const std::string& line) {
+        return line.find(fragment) != std::string::npos;
+    });
+}
+static bool HasLog(const std::string& fragment) { return LogCount(fragment) != 0; }
 int main() {
     Reset(); scenario.write_max = 137; scenario.write_us = 100;
     scenario.open_us = 5000; scenario.headers_us = 7000;
@@ -140,11 +165,20 @@ int main() {
     CHECK(headers["X-WQN-Reasoning-Effort"] == "low" && headers["X-WQN-Enable-Thinking"] == "false");
     CHECK(timeouts.front() == 100 && timeouts.back() < 90);
     CHECK(std::is_sorted(timeouts.rbegin(), timeouts.rend()));
+    CHECK(HasLog("event=ai.http stage=begin req=same-id budget_ms=100 pcm_bytes=10000"));
+    CHECK(HasLog("stage=return req=same-id phase=read server_stage=none err=0x0 http_status=200 terminal=1"));
+    CHECK(LogCount("stage=first_data ") == 1 && LogCount("stage=first_event ") == 1);
+    CHECK(HasLog("callbacks=3 events=3"));
+    CHECK(!HasLog(test_token) && !HasLog("Bearer ") && !HasLog("heard") && !HasLog("saved"));
+    for (const char* stage : {"terminal_callback_return", "close_begin", "close_return", "read_return", "cleanup_begin", "cleanup_return"}) {
+        CHECK(LogCount(std::string("stage=") + stage + " ") == 1);
+    }
 
     Reset(); scenario.packets = {final_frame}; scenario.data_in_headers = true;
     CHECK(Run() == ESP_OK); CHECK(read_count == 0 && delivered.size() == 1);
     Reset(); scenario.packets = {"event: error\ndata: {\"error_code\":\"provider_busy\",\"message\":\"later\"}\n\n", delta_frame};
     CHECK(Run() == ESP_OK); CHECK(response.error_code == "provider_busy" && delivered.size() == 1);
+    CHECK(HasLog("terminal=1 error=provider_busy") && HasLog("stage=return "));
     Reset(); CHECK(Run() == ESP_FAIL); CHECK(response.error_code == "model_failed");
     Reset(); scenario.packets = {"event: final\ndata: {}"};
     CHECK(Run() == ESP_FAIL); CHECK(delivered.empty());
@@ -159,6 +193,9 @@ int main() {
     Reset(); scenario.fail_init = true; CHECK(Run() == ESP_ERR_NO_MEM);
     Reset(); scenario.fail_open = true; CHECK(Run() == ESP_FAIL && write_count == 0);
     Reset(); scenario.fail_write = true; CHECK(Run() == ESP_FAIL && read_count == 0);
+    CHECK(HasLog("stage=return req=same-id phase=upload"));
+    Reset(); scenario.fail_read = true; CHECK(Run() == ESP_FAIL);
+    CHECK(HasLog("read_result=-1 read_errno=" + std::to_string(ECONNRESET)));
     Reset(); scenario.init_us = 100001; Timeout(); CHECK(write_count == 0);
     Reset(); scenario.open_us = 100001; Timeout(); CHECK(write_count == 0);
     Reset(); scenario.write_max = 1000; scenario.write_us = 21000; Timeout(); CHECK(written == 5000);
@@ -172,6 +209,45 @@ int main() {
     Reset(); scenario.packet_us = 11000; scenario.drain_in_read = true;
     scenario.packets.assign(200, ": heartbeat\n\n"); scenario.packets.push_back(final_frame);
     Timeout(); CHECK(read_count == 1 && client.packet < 11);
+    CHECK(LogCount("stage=deadline ") == 1 && !HasLog("stage=first_event "));
+    CHECK(HasLog("progress_gap_ms=-1") && HasLog("events=0"));
+    CHECK(log_lines.size() < 24);
+    // Framed heartbeats still count as events, never as business progress.
+    Reset(); scenario.packet_us = 11000; scenario.drain_in_read = true;
+    scenario.packets = {"event: stage\ndata: {\"stage\":\"asr\"}\n\n"};
+    scenario.packets.insert(scenario.packets.end(), 200, "event: heartbeat\ndata: {}\n\n");
+    CHECK(Run() == ESP_ERR_TIMEOUT);
+    // The deadline packet is counted as traffic, but is rejected before decode.
+    CHECK(HasLog("data_gap_ms=0 event_gap_ms=11 progress_gap_ms=99"));
+    CHECK(log_lines.size() < 24);
+    // Thousands of content deltas do not produce thousands of log records.
+    Reset(); scenario.packets.assign(1000, "event: text.delta\ndata: {\"delta\":\"PRIVATE_RESPONSE_TEXT\"}\n\n");
+    scenario.packets.push_back(final_frame);
+    CHECK(Run() == ESP_OK && delivered.size() == 1001);
+    CHECK(log_lines.size() < 24 && !HasLog("PRIVATE_RESPONSE_TEXT"));
+    CHECK(HasLog("callbacks=1001 events=1001"));
+    // Even noisy stage transitions have a fixed logging cap; retain the latest.
+    Reset();
+    for (int i = 0; i < 40; ++i) {
+        scenario.packets.push_back("event: stage\ndata: {\"stage\":\"phase_" + std::to_string(i) + "\"}\n\n");
+    }
+    scenario.packets.push_back(final_frame); CHECK(Run() == ESP_OK);
+    CHECK(LogCount("stage=server_stage ") == 32);
+    CHECK(HasLog("stage=return req=same-id phase=read server_stage=phase_39"));
+    CHECK(HasLog("stage_logs=32"));
+    // Malformed provider payload and unsafe metadata must not escape into logs.
+    Reset(); scenario.packets = {"event: text.delta\ndata: PRIVATE_BAD_JSON\n\n", final_frame};
+    CHECK(Run() == ESP_OK && HasLog("SSE JSON parse failed: bytes="));
+    CHECK(!HasLog("PRIVATE_BAD_JSON"));
+    Reset(); scenario.packets = {"event: stage\ndata: {\"stage\":\"PRIVATE STAGE\\nspoof\"}\n\n", final_frame};
+    auto unsafe_request = Request(); unsafe_request.request_id = "PRIVATE ID\nspoof";
+    CHECK(wqn::UploadAiAudioChatStream(unsafe_request, &response) == ESP_OK);
+    CHECK(HasLog("req=redacted") && HasLog("server_stage=redacted"));
+    CHECK(!HasLog("PRIVATE ID") && !HasLog("PRIVATE STAGE"));
+    CHECK(headers["X-WQN-Request-Id"] == unsafe_request.request_id);
+    CHECK(std::string(wqn::voice_diagnostics::SafeKey(nullptr)) == "none");
+    CHECK(std::string(wqn::voice_diagnostics::SafeKey(std::string(64, 'x').c_str())) == "redacted");
+    CHECK(std::string(wqn::voice_diagnostics::SafeKey(std::string(63, 'x').c_str())) == std::string(63, 'x'));
     // Callback work also spends the same budget; no later business frame leaks.
     Reset(); callback_us = 110000; scenario.packets = {delta_frame + final_frame};
     CHECK(Run() == ESP_ERR_TIMEOUT && delivered.size() == 1);
@@ -191,6 +267,37 @@ int main() {
     scenario.data_in_headers = true; scenario.packets = {std::string(17000, 'x')}; Timeout();
     auto request = Request(); request.pcm_sample_count = static_cast<size_t>(INT_MAX);
     CHECK(wqn::UploadAiAudioChatStream(request, &response) == ESP_ERR_INVALID_ARG);
+
+    // Confirmed text travels only to the interactive route; audio-only
+    // transcription never reaches the chat endpoint.
+    Reset();scenario.packets={final_frame};
+    auto text_request=Request();text_request.confirmed_text="已确认的输入";
+    text_request.pcm_data=nullptr;text_request.pcm_sample_count=0;
+    CHECK(wqn::UploadAiAudioChatStream(text_request,&response)==ESP_OK);
+    CHECK(requested_url.find("/ai/chat?protocol=v2-streaming")!=std::string::npos);
+    CHECK(headers["Content-Type"]=="application/json"&&headers["X-WQN-Ai-Interaction"]=="1");
+    CHECK(request_body.find("已确认的输入")!=std::string::npos&&request_body.find("true")!=std::string::npos);
+    Reset();scenario.packets={final_frame};auto asr_request=Request();asr_request.transcribe_only=true;
+    CHECK(wqn::UploadAiAudioChatStream(asr_request,&response)==ESP_OK);
+    CHECK(requested_url.find("/agent/transcribe?")!=std::string::npos);
+    CHECK(headers.find("X-WQN-Ai-Interaction")==headers.end());
+    Reset();scenario.packets={delta_frame,final_frame};auto pumping=Request();int pumped=0;
+    pumping.pump=[](void* value){++*static_cast<int*>(value);};pumping.pump_ctx=&pumped;
+    CHECK(wqn::UploadAiAudioChatStream(pumping,&response)==ESP_OK&&pumped>=1);
+    Reset();scenario.quiet_reads=2;scenario.packets={final_frame};auto quiet=Request();quiet.timeout_ms=2000;
+    quiet.pump=[](void* value){++*static_cast<int*>(value);};quiet.pump_ctx=&pumped;pumped=0;
+    CHECK(wqn::UploadAiAudioChatStream(quiet,&response)==ESP_OK&&pumped>=3);
+    Reset();auto cancelled_request=Request();cancelled_request.cancelled=[] {return true;};
+    CHECK(wqn::UploadAiAudioChatStream(cancelled_request,&response)!=ESP_OK);
+    CHECK(response.error_code=="cancelled"&&written==0);
+    wqn::WqnAiSseEvent decision;
+    const std::string question=R"({"interaction_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","kind":"question","prompt":"选择","allow_custom":true,"options":[{"value":"yes","label":"是"}]})";
+    CHECK(wqn::DecodeSseEvent("interaction.request",1,question,&decision));
+    CHECK(decision.kind==wqn::WqnAiSseEvent::Kind::kInteractionRequest&&decision.interaction.options.size()==1);
+    CHECK(!wqn::DecodeSseEvent("interaction.request",2,R"({"interaction_id":"short","kind":"write","prompt":"x","options":[]})",&decision));
+
+    Reset();scenario.packets={"event: interaction.request\ndata: {}\n\n",final_frame};
+    CHECK(Run()!=ESP_OK&&response.error_code=="invalid_response");
 
     CHECK(wqn::BuildVoiceWebSocketUrl() == "wss://wqn.helema.cn/api/esp32/realtime");
     CHECK(wqn::BuildVoiceWebSocketUrl("http://dev.local:3000/api/esp32", "/voice", "") == "ws://dev.local:3000/voice");

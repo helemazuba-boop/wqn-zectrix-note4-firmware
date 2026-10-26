@@ -43,7 +43,9 @@ struct TurnWaitResult {
     uint32_t turn_gen = 0;
 };
 
-esp_err_t EnsureConnected(const std::string& token, uint32_t timeout_ms);
+// request_id is diagnostic correlation only; it is not sent in the handshake.
+esp_err_t EnsureConnected(const std::string& token, uint32_t timeout_ms,
+                          const char* request_id = nullptr);
 void Disconnect();
 // Nonblocking: close only an idle connection on the transport owner. A later
 // connect/start operation supersedes this request; active turns finish first.

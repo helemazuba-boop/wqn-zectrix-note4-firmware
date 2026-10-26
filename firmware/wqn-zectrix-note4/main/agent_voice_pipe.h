@@ -6,17 +6,17 @@
 #include "esp_err.h"
 #include "wqn_api.h"
 
-// [agent-voice] Agent-tier voice input over the shared Std/Pro WebSocket.
+// [agent-voice] ASR-only input for Agent and STD over the shared WebSocket.
 //
 // The Agent tier records a clip and transcribes it through the relay's
 // tier=agent route -- the same WFLV PCM path the Std/Pro tiers use, with the
 // ASR-only pipeline behind it. This module owns the transport-side turn: the
 // request identity, the transport's SSE callback slot, the text accumulated
 // from the stream and the cancel flags. opencode_session owns the capture and
-// the UI around it.
+// the UI around it. STD uses the same pipe before its input confirmation gate.
 //
-// The STD driver in ai_session.cpp keeps its own turn lifecycle. The two never
-// overlap (one transport, one turn at a time), and each installs its own SSE
+// The two session drivers never overlap (one transport, one turn at a time),
+// and each installs its own SSE
 // callback before starting a turn because the transport holds a single,
 // never-unregistered callback slot.
 namespace wqn {

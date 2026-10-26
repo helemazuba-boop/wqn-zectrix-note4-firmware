@@ -12,6 +12,8 @@
 #include <vector>
 #include "display_service.h"
 #include "ai_history.h"
+#include "ai_interaction.h"
+#include "opencode_session.h"
 #include "ui/ai_native_text.h"
 #include "ui/ai_scroll_geometry.h"
 #include "ui/ai_text_layout.h"
@@ -45,9 +47,26 @@ int MeasureUtf8TextWidth(const char* text) {
     return width;
 }
 esp_err_t DrawUtf8Text(int x,int y,const char* text,bool ink) { DrawTextWithFont(x,y,PrimaryUiFont(),text,ink);return ESP_OK; }
-enum class AiTier { kAgent,kStd,kFlash };
-enum class AiSessionStatus { kIdle,kStreaming };
-struct AiSessionState { AiTier tier=AiTier::kAgent;AiSessionStatus status=AiSessionStatus::kIdle;bool expand_content=true;int64_t scroll_no_op_hint_ms=0; };
+@@AI_MODEL@@
+enum class UiScreen { kAi,kHome };
+struct UiState { UiScreen screen=UiScreen::kAi;AiSessionState ai;AgentSessionState agent; };
+AgentSessionState g_state;
+std::shared_ptr<const AiHistorySnapshot> follow_snapshots[3];
+std::shared_ptr<const AiHistorySnapshot> GetAiHistorySnapshot(AiHistoryChannel channel) { return follow_snapshots[static_cast<int>(channel)]; }
+void* g_lock=reinterpret_cast<void*>(1);
+constexpr int portMAX_DELAY=0;
+void xSemaphoreTake(void*,int) {}
+void xSemaphoreGive(void*) {}
+int follow_marks=0;
+void MarkChangedLocked() { ++follow_marks; }
+AiSessionState std_follow_state;
+namespace std_owner {
+AiSessionState& g_state=std_follow_state;
+void MarkChanged() { ++follow_marks; }
+@@STD_FOLLOW_OWNER@@
+}
+bool ApplyAiViewportFollow(uint32_t epoch,int32_t target,int32_t low,int32_t high,bool finished) { return std_owner::ApplyAiViewportFollow(epoch,target,low,high,finished); }
+@@FOLLOW_OWNER@@
 }
 
 namespace device_ui_internal {
@@ -69,6 +88,16 @@ esp_err_t DrawMarkdownLine(const MdLine&,int,int,int,int,const lv_font_t* font=n
 namespace device_ui_internal {
 #define DRC(...) do { (void)wqn::DrawUtf8Text(__VA_ARGS__); } while(0)
 @@PAGE@@
+}
+
+namespace device_ui_internal {
+enum class AppEventKind { kAiViewportFollow };
+enum class RefreshSchedule { kNone,kAi };
+struct UiUpdate { bool changed; };
+int AiBottomReserve(const wqn::AgentSessionState& agent) { return agent.ui.requires_confirmation || !agent.pending_permission_id.empty() || !agent.pending_question_id.empty() ? 22 : 0; }
+struct UiRuntime { wqn::UiState state_;UiUpdate DispatchAiViewportFollow();UiUpdate FinishEvent(AppEventKind,RefreshSchedule,bool changed) {return {changed};} };
+#define ESP_LOGI(...) do {} while(0)
+@@FOLLOW_RUNTIME@@
 }
 
 void Save(const std::string& folder,const std::string& name) {
@@ -96,7 +125,7 @@ int main(int argc,char**argv) {
     wqn::ChatMessageSnapshot user;user.id=1;user.kind=wqn::ChatMessageKind::kUser;user.text="Q";
     wqn::ChatMessageSnapshot reply;reply.id=2;reply.kind=wqn::ChatMessageKind::kAssistant;
     for(int i=1;i<=14;++i){if(i>1)reply.text+='\n';reply.text+="ROW_"+std::to_string(i);}
-    snapshot->messages={user,reply};wqn::AiSessionState ai;
+    snapshot->messages={user,reply};wqn::AiSessionState ai;ai.tier=wqn::AiTier::kAgent;
     int32_t minimum=0,maximum=0;GetAiScrollBounds(snapshot,true,0,&minimum,&maximum);
     CHECK(minimum==-1&&maximum==0);
     RenderAiHistoryViewport(ai,snapshot,minimum,0);CHECK(HasText("ROW_14"));Bounds();Save(folder,"tail-reachable");
@@ -155,6 +184,99 @@ int main(int argc,char**argv) {
         }
         for(int i=0;i<100;++i)CHECK(std::find(visited.begin(),visited.end(),"PAGE-"+std::to_string(i))!=visited.end());
     }
+    // A STD collapse never changes Agent pixels or any Agent scroll bound.
+    auto details=std::make_shared<wqn::AiHistorySnapshot>();details->revision=9000;
+    auto thought=reply;thought.id=9000;thought.kind=wqn::ChatMessageKind::kThinking;
+    thought.text="THINK-1\nTHINK-2\nTHINK-3\nTHINK-4";
+    auto tool=reply;tool.id=9001;tool.kind=wqn::ChatMessageKind::kToolResult;
+    tool.text.clear();tool.tool_name="inspect";tool.tool_args_json="file";tool.tool_result_json="done";
+    details->messages={user,thought,tool};
+    ai.expand_content=true;
+    CHECK(wqn::AiHistoryContentExpanded(ai));
+    GetAiScrollBounds(details,wqn::AiHistoryContentExpanded(ai),0,&minimum,&maximum);
+    const auto expanded_layout=GetAiHistoryLayout(details,wqn::AiHistoryContentExpanded(ai));
+    RenderAiHistoryViewport(ai,details,minimum,0);const auto agent_pixels=wqn::pixels;
+    ai.expand_content=false;
+    CHECK(wqn::AiHistoryContentExpanded(ai));
+    CHECK(GetAiHistoryLayout(details,wqn::AiHistoryContentExpanded(ai))==expanded_layout);
+    RenderAiHistoryViewport(ai,details,minimum,0);CHECK(wqn::pixels==agent_pixels);
+    ai.tier=wqn::AiTier::kStd;
+    CHECK(!wqn::AiHistoryContentExpanded(ai));
+    const auto collapsed_layout=GetAiHistoryLayout(details,wqn::AiHistoryContentExpanded(ai));
+    CHECK(collapsed_layout->total_content_h<expanded_layout->total_content_h);
+    RenderAiHistoryViewport(ai,details,0,0);CHECK(wqn::pixels!=agent_pixels);
+    ai.expand_content=true;CHECK(wqn::AiHistoryContentExpanded(ai));ai.tier=wqn::AiTier::kAgent;
+    // Replay the production follow dispatcher and epoch-checked owner. The
+    // same event sequence must land on the same final answer at any UI cadence.
+    auto tick=[&](UiRuntime& runtime,const std::shared_ptr<wqn::AiHistorySnapshot>& history) {
+        wqn::follow_snapshots[static_cast<int>(wqn::AiHistoryChannel::kAgent)]=history;
+        runtime.DispatchAiViewportFollow();runtime.state_.agent=wqn::g_state;
+    };
+    auto thinking=std::make_shared<wqn::AiHistorySnapshot>();thinking->revision=10000;
+    thought.id=10000;thought.text.clear();for(int i=0;i<30;++i)thought.text+="THINK-"+std::to_string(i)+"\n";
+    thinking->messages={user,thought};
+    auto preface=std::make_shared<wqn::AiHistorySnapshot>(*thinking);preface->revision++;
+    reply.id=10001;reply.text="I will inspect it first.";preface->messages.push_back(reply);
+    auto working=std::make_shared<wqn::AiHistorySnapshot>(*preface);working->revision++;
+    tool.id=10002;tool.kind=wqn::ChatMessageKind::kToolStart;working->messages.push_back(tool);
+    auto answered=std::make_shared<wqn::AiHistorySnapshot>(*working);answered->revision++;
+    reply.id=10003;reply.text="Final answer";for(int i=0;i<25;++i)reply.text+="\nANSWER-"+std::to_string(i);
+    answered->messages.push_back(reply);
+    int32_t final_top=0;CHECK(GetAiNewestAnswerTopOffsetLines(answered,true,0,&final_top));
+    for(bool sample_preface:{false,true}) {
+        UiRuntime runtime;runtime.state_.ai.tier=wqn::AiTier::kAgent;
+        wqn::g_state={};wqn::g_state.ui.phase=wqn::AiFeaturePhase::kRunning;
+        wqn::follow_snapshots[2]=thinking;wqn::ArmAgentFollowLocked();runtime.state_.agent=wqn::g_state;
+        tick(runtime,thinking);CHECK(runtime.state_.agent.follow_active);
+        if(sample_preface){tick(runtime,preface);CHECK(runtime.state_.agent.follow_active);}
+        tick(runtime,working);CHECK(runtime.state_.agent.follow_active);
+        tick(runtime,answered);CHECK(runtime.state_.agent.ui.scroll_offset_lines==final_top);
+        CHECK(runtime.state_.agent.follow_active);
+        // More body text stays parked at its first line, then a later round
+        // is followed without undoing a manual reading decision.
+        wqn::g_state.ui.phase=wqn::AiFeaturePhase::kComplete;runtime.state_.agent=wqn::g_state;
+        tick(runtime,answered);CHECK(!runtime.state_.agent.follow_active);
+    }
+    UiRuntime resumed;resumed.state_.ai.tier=wqn::AiTier::kAgent;
+    wqn::g_state={};wqn::g_state.ui.phase=wqn::AiFeaturePhase::kRunning;
+    wqn::follow_snapshots[2]=answered;wqn::ArmAgentFollowLocked();resumed.state_.agent=wqn::g_state;
+    tick(resumed,answered);CHECK(resumed.state_.agent.follow_active);
+    CHECK(resumed.state_.agent.ui.scroll_offset_lines!=final_top); // old answer is not the resumed body
+    const auto stale_epoch=wqn::g_state.follow_epoch;
+    wqn::ArmAgentFollowLocked();
+    CHECK(!wqn::ApplyOpenCodeViewportFollow(stale_epoch,0,-100,100,true));
+    const auto epoch=wqn::g_state.follow_epoch;
+    wqn::SetOpenCodeFollowState(false,true);const auto manual_offset=wqn::g_state.ui.scroll_offset_lines;
+    CHECK(!wqn::ApplyOpenCodeViewportFollow(epoch,0,-100,100,false));
+    resumed.state_.agent=wqn::g_state;tick(resumed,working);
+    CHECK(wqn::g_state.ui.scroll_offset_lines==manual_offset&&!wqn::g_state.follow_active&&wqn::g_state.user_moved);
+    wqn::ArmAgentFollowLocked();wqn::g_state.ui.phase=wqn::AiFeaturePhase::kAwaitingQuestion;
+    CHECK(!wqn::ApplyOpenCodeViewportFollow(wqn::g_state.follow_epoch,0,-100,100,false));
+    resumed.state_.agent=wqn::g_state;CHECK(!resumed.DispatchAiViewportFollow().changed);
+
+    // STD consumes the same sequence and geometry, with its own owner/epoch.
+    for(bool sample_preface:{false,true}) {
+        UiRuntime runtime;runtime.state_.ai.tier=wqn::AiTier::kStd;
+        wqn::std_follow_state={};wqn::std_follow_state.status=wqn::AiSessionStatus::kStreaming;
+        wqn::follow_snapshots[0]=thinking;wqn::std_owner::ArmAiFollowLocked();runtime.state_.ai=wqn::std_follow_state;
+        auto std_tick=[&](const std::shared_ptr<wqn::AiHistorySnapshot>& history) {
+            wqn::follow_snapshots[0]=history;runtime.DispatchAiViewportFollow();runtime.state_.ai=wqn::std_follow_state;
+        };
+        std_tick(thinking);CHECK(runtime.state_.ai.follow_active);
+        if(sample_preface){std_tick(preface);CHECK(runtime.state_.ai.follow_active);}
+        std_tick(working);std_tick(answered);
+        CHECK(runtime.state_.ai.follow_active&&runtime.state_.ai.scroll_offset_lines==final_top);
+        wqn::std_follow_state.status=wqn::AiSessionStatus::kReplyReady;runtime.state_.ai=wqn::std_follow_state;
+        std_tick(answered);CHECK(!runtime.state_.ai.follow_active&&runtime.state_.ai.scroll_offset_lines==final_top);
+        wqn::std_owner::ArmAiFollowLocked();const auto old_epoch=wqn::std_follow_state.follow_epoch;
+        wqn::std_owner::SetAiFollowState(false,true);
+        CHECK(!wqn::ApplyAiViewportFollow(old_epoch,0,-100,100,false));
+        wqn::std_owner::ArmAiFollowLocked();wqn::std_follow_state.status=wqn::AiSessionStatus::kAwaitingDecision;
+        CHECK(!wqn::ApplyAiViewportFollow(wqn::std_follow_state.follow_epoch,0,-100,100,false));
+        wqn::std_follow_state.status=wqn::AiSessionStatus::kStreaming;wqn::std_follow_state.auto_follow=false;
+        CHECK(!wqn::ApplyAiViewportFollow(wqn::std_follow_state.follow_epoch,0,-100,100,false));
+    }
+
     const auto* font=AiNativeFont();
     auto english=WrapAiNativeText("alpha beta gamma",wqn::MeasureTextWithFont(font,"alpha beta"),font,10);
     CHECK(english.size()==2&&english[0]=="alpha beta"&&english[1]=="gamma");

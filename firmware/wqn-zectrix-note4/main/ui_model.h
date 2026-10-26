@@ -49,8 +49,11 @@ enum class AiSessionStatus {
     // status before a recording buffer exists.
     kPreparingCapture,
     kListening,
+    kTranscribing,
+    kAwaitingConfirmation,
+    kAwaitingDecision,
     kWaitingReply,
-    kStreaming,         // v2 SSE: connected, server is producing events
+    kStreaming, // v2 SSE: connected, server is producing events
     kReplyReady,
     kError,
 };
@@ -81,6 +84,9 @@ enum class ThinkingLevel : uint8_t {
 };
 
 struct AiSessionState {
+    std::string pending_input;
+    int64_t input_armed_at_ms = 0;
+    AiInteraction interaction;
     AiSessionStatus status = AiSessionStatus::kIdle;
     AiTier tier = AiTier::kStd;
     std::string user_text;
@@ -113,13 +119,14 @@ struct AiSessionState {
     // signal by the toast being present at all, with a blink dot.
     int32_t scroll_offset_lines = 0;
     // [follow] Per-turn viewport-follow state, owned here because this struct
-    // owns the offset it drives. follow_active: the viewport is still chasing
-    // the newest content this turn (cleared when the answer text arrives, so
-    // the reply stays readable). user_moved: the user moved the viewport this
-    // turn, which disables the follow AND the completion recenter. Both are
-    // armed by the turn-start paths in ai_session.cpp.
+    // owns the offset it drives. Following parks at each answer's first line
+    // and watches subsequent thinking/tool rounds until completion. Manual
+    // reading disables it. An epoch and revision bind automatic moves to the
+    // turn that armed them, as on Agent.
     bool follow_active = false;
     bool user_moved = false;
+    uint32_t follow_epoch = 0;
+    uint64_t follow_after_revision = 0;
     bool toast_visible = false;
     std::string toast_label;       // e.g. "\xe2\x97\x8f 录音中 00:04" / "\xe2\x97\x8f 上传…"
     int64_t toast_since_ms = 0;
@@ -132,11 +139,16 @@ struct AiSessionState {
     ThinkingLevel thinking_level = ThinkingLevel::kMed;
     bool tts_on = false;
     bool expand_content = true;   // [expand] default full thinking/tool display (Flash can't toggle)
-    // [follow] Auto-follow the newest content while a reply streams, stopping
-    // when the answer text (正文) arrives. Exposed as the 4th edit-cluster
-    // toggle; STD/Pro and Agent only (Flash hides the whole cluster).
+    // Durable settings-page choice, shared by STD and Agent.
     bool auto_follow = true;
 };
+
+// Agent detail is selected by its own gateway setting. The STD collapse toggle
+// must not hide Agent content or change its viewport geometry.
+inline bool AiHistoryContentExpanded(const AiSessionState& ai)
+{
+    return ai.tier == AiTier::kAgent || ai.expand_content;
+}
 
 // Returns the current scroll offset in 18-px line units (0 == bottom / newest).
 // UI tasks read this under the AI mutex; safe to call from any task.
@@ -468,6 +480,8 @@ struct AgentOptionState {
 struct UiGestureState {
     bool flash_ptt_started = false;
     bool agent_ptt_started = false;
+    bool std_ptt_started = false;
+    int64_t std_decision_press_ms = 0;
     int64_t last_ai_confirm_tap_ms = 0;
     // [agent] Separate from last_ai_confirm_tap_ms on purpose: on the AI page a
     // double-confirm enters status-bar edit mode, but in the Agent session

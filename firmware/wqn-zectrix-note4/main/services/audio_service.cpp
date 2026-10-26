@@ -12,6 +12,7 @@
 #include "driver/i2c_master.h"
 #include "driver/i2s_std.h"
 #include "esp_check.h"
+#include "esp_attr.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_rom_lldesc.h"
@@ -58,6 +59,27 @@ static_assert(sizeof(lldesc_t) == 12, "ESP32-S3 DMA descriptor size changed");
 // conservative floor so admission fails before TX takes half of a ring that RX
 // cannot also obtain. A-H heap deltas report the real driver cost on-device.
 constexpr size_t kDuplexAdmissionInternalHeadroom = 4096;
+// ISR-visible storage stays internal even if external BSS is enabled later.
+// Duplex RX has one hardware owner. This boot-monotonic counter measures
+// driver queue-overflow events, not an exact number of lost microphone samples.
+DRAM_ATTR std::atomic<uint32_t> g_duplex_rx_overflows{0};
+// The S32C1I/PSRAM workaround makes is_always_lock_free false. IDF routes
+// internal 32-bit atomics through IRAM hardware helpers; verify ELF placement
+// together with this callback rather than assuming a host lock-free property.
+
+bool IRAM_ATTR CountDuplexRxOverflow(i2s_chan_handle_t,
+                                    i2s_event_data_t*, void*)
+{
+    g_duplex_rx_overflows.fetch_add(1, std::memory_order_relaxed);
+    return false; // no higher-priority task is woken
+}
+
+esp_err_t ObserveDuplexRxOverflows(i2s_chan_handle_t channel)
+{
+    i2s_event_callbacks_t callbacks{};
+    callbacks.on_recv_q_ovf = CountDuplexRxOverflow;
+    return i2s_channel_register_event_callback(channel, &callbacks, nullptr);
+}
 // Match the factory esp_codec_dev control interface. The shared bus remains
 // free to use a different per-device rate for the RTC.
 constexpr uint32_t kCodecI2cClockHz = 100000;
@@ -2043,6 +2065,9 @@ esp_err_t CreateAudioDuplexChannels(
     LogDuplexHeapPoint(
         "E-after-configure-rx", session, dma_frame_count,
         tx_channel, rx_channel, &before_rx_config);
+    if (result == ESP_OK) {
+        result = ObserveDuplexRxOverflows(rx_channel);
+    }
     const AudioHeapSnapshot before_tx_enable = after_rx_config;
     if (result == ESP_OK) {
         LogDuplexHeapPoint(
@@ -2193,6 +2218,11 @@ esp_err_t ReadAudioChannel(
     }
     return i2s_channel_read(
         AsChannel(channel), destination, bytes, bytes_read, timeout_ms);
+}
+
+uint32_t AudioDuplexRxOverflowCount()
+{
+    return g_duplex_rx_overflows.load(std::memory_order_relaxed);
 }
 
 esp_err_t WriteAudioChannel(

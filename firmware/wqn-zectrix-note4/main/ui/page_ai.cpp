@@ -41,6 +41,12 @@ const char* AiStatusLabel(wqn::AiSessionStatus status)
     switch (status) {
         case wqn::AiSessionStatus::kPreparingCapture:
             return "准备录音";
+        case wqn::AiSessionStatus::kTranscribing:
+            return "转写中";
+        case wqn::AiSessionStatus::kAwaitingConfirmation:
+            return "确认发送";
+        case wqn::AiSessionStatus::kAwaitingDecision:
+            return "等你回答";
         case wqn::AiSessionStatus::kListening:
             return "录音";
         case wqn::AiSessionStatus::kWaitingReply:
@@ -468,7 +474,7 @@ void RenderAiHistoryViewport(const wqn::AiSessionState& ai,
     // single source of truth for GetAiScrollBounds as well: the input-path
     // scroll clamp MUST agree with what is actually drawn, or the viewport
     // desyncs from its own bounds.
-    const auto layout_snapshot = GetAiHistoryLayout(snapshot, ai.expand_content);
+    const auto layout_snapshot = GetAiHistoryLayout(snapshot, wqn::AiHistoryContentExpanded(ai));
     const AiHistoryLayout& layout = *layout_snapshot;
     const int layout_size = static_cast<int>(messages.size());
 
@@ -528,7 +534,7 @@ void RenderAiHistoryViewport(const wqn::AiSessionState& ai,
             DrawAssistantBlock(x_left, block_top, kAiAssistantW, text->markdown, effective_bottom);
         } else if (msg.kind == wqn::ChatMessageKind::kThinking) {
             DrawThinkingBlock(x_left, block_top, text->plain, effective_bottom);
-        } else DrawToolBlock(x_left, block_top, kAiAssistantW, msg, ai.expand_content, effective_bottom);
+        } else DrawToolBlock(x_left, block_top, kAiAssistantW, msg, wqn::AiHistoryContentExpanded(ai), effective_bottom);
     }
 
     // 3. Scroll chevrons. ▲ sits in the top-right corner when there's more
@@ -769,7 +775,10 @@ esp_err_t RenderAiToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
     // reserve 22 px here, which was the Agent tier's option bar charged to a
     // page that never drew one -- a permanent blank strip at the bottom of every
     // STD/Flash transcript.
-    RenderAiHistoryViewport(ai, frame.ai_history, ai.scroll_offset_lines, 0);
+    RenderAiHistoryViewport(ai, frame.ai_history, ai.scroll_offset_lines,
+                            ai.tier == wqn::AiTier::kStd ? StdAiBottomReserve(ai) : 0);
+    if (ai.tier == wqn::AiTier::kStd)
+        DrawStdAiInteraction(frame);
 
     return RefreshFrame(frame, schedule);
 }

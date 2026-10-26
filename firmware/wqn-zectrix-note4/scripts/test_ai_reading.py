@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import subprocess
 import tempfile
+from test_audio_runtime import function
 
 
 def section(source, start, end):
@@ -25,7 +26,16 @@ def main():
     display = (root/'components/display_service/display_service.cpp').read_text()
     page = (root/'main/ui/page_ai.cpp').read_text()
     fixture = (root/'scripts/testdata/ai_reading.cpp').read_text()
+    owner = (root/'main/opencode_session.cpp').read_text()
+    owner = owner[:owner.rindex('\n#else')]
+    std_owner = (root/'main/ai_session.cpp').read_text()
+    std_owner = std_owner[:std_owner.rindex('\n#else')]
+    runtime = (root/'main/ui/ui_runtime.cpp').read_text()
     replacements = {
+        '@@STD_FOLLOW_OWNER@@': '\n'.join(function(std_owner, name) for name in ['void ArmAiFollowLocked()', 'bool ApplyAiViewportFollow(', 'void SetAiFollowState(']),
+        '@@FOLLOW_OWNER@@': '\n'.join(function(owner, name) for name in ['void ArmAgentFollowLocked()', 'bool ApplyOpenCodeViewportFollow(', 'void SetOpenCodeFollowState(']),
+        '@@FOLLOW_RUNTIME@@': section(runtime, 'UiUpdate UiRuntime::DispatchAiViewportFollow()', 'UiUpdate UiRuntime::DispatchFlashSnapshot('),
+        '@@AI_MODEL@@': section((root/'main/ui_model.h').read_text(), 'enum class AiSessionStatus {', 'enum class TodoSyncStatus {'),
         '@@FONT_LOOKUP@@': section(display, 'const lv_font_fmt_txt_glyph_dsc_t* FindGlyphInFont(', 'int MeasureCodepointWidth('),
         '@@FONT_DRAW@@': section(display, 'void DrawGlyphFromFont(', 'void DrawCjkGlyph('),
         '@@FONT_MEASURE@@': section(display, 'int MeasureTextWithFont(', 'std::string TruncateUtf8TextToWidth('),

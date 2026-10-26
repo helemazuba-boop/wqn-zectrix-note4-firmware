@@ -88,6 +88,8 @@ constexpr TickType_t kTimerRefreshDelay = pdMS_TO_TICKS(80);
 constexpr TickType_t kSelectionRefreshDelay = pdMS_TO_TICKS(100);
 constexpr TickType_t kConfigRefreshDelay = pdMS_TO_TICKS(120);
 constexpr TickType_t kAiRefreshDelay = pdMS_TO_TICKS(120);
+// UI frame sampling only; panel waveform/owner timing stays with DisplayService.
+constexpr int64_t kAiStreamingRefreshFloorMs = 500;
 
 // Aliases the model-layer constant (ui_model.h) — the row count must have
 // exactly one definition because ui_model.cpp clamps against it too.
@@ -750,6 +752,12 @@ AgentOptionMode AgentOptionModeFor(const wqn::AgentSessionState& agent);
 // clip and 0 for the clamp would let a keypress ask for a window the viewport
 // cannot draw -- which is precisely the desync page_ai.cpp's geometry comments
 // have been warning about for five rounds.
+int StdAiBottomReserve(const wqn::AiSessionState& ai);
+void DrawStdAiInteraction(const wqn::UiFrame& frame);
+void DrawAgentPendingBubble(const std::string& text, const char* title, size_t max_lines = 3);
+void DrawAgentOptionBar(AgentOptionMode mode, uint8_t focused, const wqn::AgentSessionState& agent);
+bool ApplyStdAiInteractionEvent(const wqn::ButtonEvent& event, int64_t now_ms, wqn::UiState* state,
+                                RefreshSchedule* schedule);
 int AiBottomReserve(const wqn::AgentSessionState& agent);
 // [agent] Names why an Agent request was refused. Every one of these used to
 // log the same "busy or empty list", which is indistinguishable when reading a

@@ -25,7 +25,13 @@ void ArmAiVoicePreroll();
 // Request-id used by the SSE idempotency headers: 16 hex chars.
 std::string GenerateRequestId();
 esp_err_t StartAiRecordingSession();
+// Release stops capture and transcribes only. ConfirmAiPrompt is the sole submit gate.
 esp_err_t StopAiRecordingAndSubmit();
+esp_err_t ConfirmAiPrompt(int64_t confirmed_at_ms);
+void CancelAiPrompt();
+void CancelAiVoiceInput();
+void LeaveStdAiTier();
+esp_err_t ReplyAiInteraction(int index);
 // Clear STD/PRO conversation context (AiHistory + conversation_id + display
 // state). Called on leave-AI-screen so each visit starts a fresh conversation;
 // the cloud (esp32_ai_conversations) keeps the saved history for reuse later.
@@ -43,6 +49,8 @@ void SetAiExpandContent(bool expanded);
 // the UI's copy would be reverted by the next snapshot.
 void SetAiAutoFollow(bool follow);
 void SetAiFollowState(bool active, bool user_moved);
+bool ApplyAiViewportFollow(uint32_t epoch, int32_t target, int32_t min_scroll,
+                           int32_t max_scroll, bool finished);
 
 // Lightweight, mutex-free snapshot of v2 SSE streaming bookkeeping. UI calls
 // this from its own task to drive the EPD throttle and the status-bar chip

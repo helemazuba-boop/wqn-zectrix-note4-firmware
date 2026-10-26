@@ -1,5 +1,6 @@
 #include <array>
 #include <cerrno>
+#include <chrono>
 #include <cctype>
 #include <cstdarg>
 #include <cstdint>
@@ -16,6 +17,13 @@
 #include <utility>
 #include "runtime/storage_temp_file_lease.h"
 #include "runtime/pack_stream_path_lease.h"
+#include "voice_diagnostics.h"
+
+static int64_t esp_timer_get_time() {
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
 
 static bool deny_cpp = false, inside_transaction = false;
 static unsigned callback_allocations = 0, denied_allocations = 0, checks = 0, path_calls = 0;

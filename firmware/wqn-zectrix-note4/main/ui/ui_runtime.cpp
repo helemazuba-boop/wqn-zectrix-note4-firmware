@@ -1057,6 +1057,16 @@ UiUpdate UiRuntime::DispatchAiStreamingSnapshot(const wqn::AiStreamingStatusView
 
 UiUpdate UiRuntime::DispatchAiSessionSnapshot(const wqn::AiSessionState& snapshot)
 {
+    if (state_.ai.interaction.id != snapshot.interaction.id ||
+        state_.ai.status != snapshot.status) {
+        state_.agent_option.focused = 0;
+        state_.gestures.std_decision_press_ms = 0;
+    }
+    if (snapshot.status == wqn::AiSessionStatus::kAwaitingConfirmation ||
+        snapshot.status == wqn::AiSessionStatus::kAwaitingDecision) {
+        state_.status_edit.active = false;
+        state_.gestures.last_ai_confirm_tap_ms = 0;
+    }
     state_.ai = snapshot;
     // Keep the logical state in "preparing" immediately, but do not wake the
     // EPD while the ES8311 is being configured.  A physical panel refresh was
@@ -1075,9 +1085,8 @@ UiUpdate UiRuntime::DispatchAiSessionSnapshot(const wqn::AiSessionState& snapsho
 // [follow] Per-tick auto-follow. See the declaration in ui_runtime.h and the
 // [follow] block in ui_model.h for the setting's semantics: while a turn is in
 // flight the viewport is pinned to the live tail so the user watches the
-// execution; as soon as the answer body lands the follow retires -- the Agent
-// parks on the answer's first line, STD/Pro leave the position to the
-// conditional recenter at the end of the turn (ai_session.cpp kFinal).
+// execution. Agent parks on each answer's first line, then follows subsequent
+// tool/thinking rounds. STD uses the same presentation and owner checks.
 UiUpdate UiRuntime::DispatchAiViewportFollow()
 {
     constexpr AppEventKind kEvent = AppEventKind::kAiViewportFollow;
@@ -1096,7 +1105,10 @@ UiUpdate UiRuntime::DispatchAiViewportFollow()
                                        : wqn::AiHistoryChannel::kStdPro);
     const bool follow_active =
         agent_tier ? state_.agent.follow_active : state_.ai.follow_active;
-    if (!state_.ai.auto_follow || !follow_active) {
+    if (!state_.ai.auto_follow || !follow_active ||
+        (!agent_tier && (state_.ai.status == wqn::AiSessionStatus::kTranscribing ||
+                         state_.ai.status == wqn::AiSessionStatus::kAwaitingConfirmation ||
+                         state_.ai.status == wqn::AiSessionStatus::kAwaitingDecision))) {
         return FinishEvent(kEvent, RefreshSchedule::kNone, false);
     }
 
@@ -1108,7 +1120,10 @@ UiUpdate UiRuntime::DispatchAiViewportFollow()
         const wqn::AiFeaturePhase phase = state_.agent.ui.phase;
         if (phase == wqn::AiFeaturePhase::kLoading ||
             phase == wqn::AiFeaturePhase::kRecording ||
-            phase == wqn::AiFeaturePhase::kTranscribing) {
+            phase == wqn::AiFeaturePhase::kTranscribing ||
+            phase == wqn::AiFeaturePhase::kAwaitingConfirmation ||
+            phase == wqn::AiFeaturePhase::kAwaitingPermission ||
+            phase == wqn::AiFeaturePhase::kAwaitingQuestion) {
             return FinishEvent(kEvent, RefreshSchedule::kNone, false);
         }
     } else if (state_.ai.status == wqn::AiSessionStatus::kPreparingCapture ||
@@ -1124,65 +1139,50 @@ UiUpdate UiRuntime::DispatchAiViewportFollow()
     int32_t max_scroll = 0;
     // The Agent tier's band is only up while there is something to answer, so
     // the reserve the follow computes with is the one the renderer draws with.
-    GetAiScrollBounds(snapshot, state_.ai.expand_content,
+    GetAiScrollBounds(snapshot, wqn::AiHistoryContentExpanded(state_.ai),
                       agent_tier ? AiBottomReserve(state_.agent) : 0, &min_scroll,
                       &max_scroll);
 
-    // Has the answer body started? Both tiers now mirror their streamed text
-    // straight into history, so the newest non-empty assistant entry IS the body
-    // on either one and GetAiNewestAnswerTopOffsetLines can answer it directly.
-    // assistant_partial stays in the predicate as the tier-independent fallback:
-    // it is set unconditionally on every delta while the mirror rides the 50 ms
-    // render watermark (ai_session.cpp), so on the tick a body starts it can be
-    // non-empty up to a watermark period before the history write lands.
-    // `answer_top` is still consumed only by the Agent tier -- the STD viewport
-    // follow has no per-tier scroll offset of its own to park.
+    const bool agent_finished = agent_tier &&
+        (state_.agent.ui.phase == wqn::AiFeaturePhase::kComplete ||
+         state_.agent.ui.phase == wqn::AiFeaturePhase::kError ||
+         state_.agent.ui.phase == wqn::AiFeaturePhase::kIdle);
+    // A resumed run must see fresh history before an old assistant can count
+    // as its answer. Settled observes may display an existing final answer.
+    const bool finished = agent_tier ? agent_finished :
+        (state_.ai.status == wqn::AiSessionStatus::kReplyReady ||
+         state_.ai.status == wqn::AiSessionStatus::kError ||
+         state_.ai.status == wqn::AiSessionStatus::kIdle);
+    const uint64_t after_revision = agent_tier ? state_.agent.follow_after_revision
+                                              : state_.ai.follow_after_revision;
+    const bool fresh_body = finished || snapshot->revision > after_revision;
     int32_t answer_top = 0;
-    const bool body_started =
-        GetAiNewestAnswerTopOffsetLines(snapshot, state_.ai.expand_content,
-                                        agent_tier ? AiBottomReserve(state_.agent) : 0,
-                                        &answer_top) ||
-        (!agent_tier && !state_.ai.assistant_partial.empty());
+    const bool body_started = fresh_body &&
+        (GetAiNewestAnswerTopOffsetLines(snapshot, wqn::AiHistoryContentExpanded(state_.ai),
+                                         agent_tier ? AiBottomReserve(state_.agent) : 0,
+                                         &answer_top) ||
+         (!agent_tier && !state_.ai.assistant_partial.empty()));
 
-    if (body_started) {
-        bool moved = false;
-        if (agent_tier && state_.agent.ui.scroll_offset_lines != answer_top) {
-            wqn::SetOpenCodeScrollOffsetClamped(answer_top, min_scroll, max_scroll);
-            // Mirror into the UI copy: the renderer reads this field this very
-            // tick, and the next snapshot would otherwise lag one frame behind.
-            state_.agent.ui.scroll_offset_lines = answer_top;
-            moved = true;
-        }
-        // Retire the follow for the rest of the turn, keeping user_moved as it
-        // is: the follow retired itself, the user did not move the viewport.
-        if (agent_tier) {
-            wqn::SetOpenCodeFollowState(false, state_.agent.user_moved);
-        } else {
-            wqn::SetAiFollowState(false, state_.ai.user_moved);
-        }
-        ESP_LOGI(kTag, "ai-follow: body started -> retire (tier=%d parked=%d offset=%ld)",
-                 static_cast<int>(tier), moved ? 1 : 0,
-                 static_cast<long>(agent_tier ? state_.agent.ui.scroll_offset_lines
-                                              : state_.ai.scroll_offset_lines));
-        return FinishEvent(kEvent, moved ? RefreshSchedule::kAi : RefreshSchedule::kNone, true);
-    }
-
-    // No body yet: pin to the live tail (min_scroll), where the newest line
-    // stays put as the run appends thinking/tool blocks above it.
     if (agent_tier) {
-        if (state_.agent.ui.scroll_offset_lines == min_scroll) {
+        const int32_t target = body_started ? answer_top : min_scroll;
+        const bool moved = state_.agent.ui.scroll_offset_lines != target;
+        if (!wqn::ApplyOpenCodeViewportFollow(state_.agent.follow_epoch, target,
+                                              min_scroll, max_scroll, agent_finished))
             return FinishEvent(kEvent, RefreshSchedule::kNone, false);
-        }
-        wqn::SetOpenCodeScrollOffsetClamped(min_scroll, min_scroll, max_scroll);
-        state_.agent.ui.scroll_offset_lines = min_scroll;
-    } else {
-        if (state_.ai.scroll_offset_lines == min_scroll) {
-            return FinishEvent(kEvent, RefreshSchedule::kNone, false);
-        }
-        wqn::SetAiScrollOffsetLinesClamped(min_scroll, min_scroll, max_scroll);
-        state_.ai.scroll_offset_lines = min_scroll;
+        state_.agent.ui.scroll_offset_lines = target;
+        state_.agent.follow_active = !agent_finished;
+        return FinishEvent(kEvent, moved ? RefreshSchedule::kAi : RefreshSchedule::kNone,
+                           moved || agent_finished);
     }
-    return FinishEvent(kEvent, RefreshSchedule::kAi, true);
+
+    const int32_t target = body_started ? answer_top : min_scroll;
+    const bool moved = state_.ai.scroll_offset_lines != target;
+    if (!wqn::ApplyAiViewportFollow(state_.ai.follow_epoch, target, min_scroll, max_scroll, finished))
+        return FinishEvent(kEvent, RefreshSchedule::kNone, false);
+    state_.ai.scroll_offset_lines = target;
+    state_.ai.follow_active = !finished;
+    return FinishEvent(kEvent, moved ? RefreshSchedule::kAi : RefreshSchedule::kNone,
+                       moved || finished);
 }
 
 UiUpdate UiRuntime::DispatchFlashSnapshot(const wqn::FlashUiState& flash)

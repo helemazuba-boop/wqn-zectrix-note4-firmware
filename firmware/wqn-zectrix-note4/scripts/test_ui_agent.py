@@ -25,7 +25,13 @@ def main():
     refresh = (root/'main/ui/ui_refresh.cpp').read_text()
     fixture = (root/'scripts/testdata/ui_agent.cpp').read_text()
     input_source = (root/'main/ui/ui_input.cpp').read_text()
+    ai_model = (root/'main/ui_model.h').read_text()
+    ai_model = ai_model[ai_model.index('enum class AiSessionStatus'):ai_model.index('enum class TodoSyncStatus')]
+    std_ui = (root/'main/ui/ai_std_interaction.cpp').read_text()
+    std_ui = std_ui[std_ui.index('wqn::AgentSessionState StdDecisionSurface('):std_ui.rfind('\n}')]
     replacements = {
+        '@@AI_MODEL@@': ai_model,
+        '@@STD_UI@@': std_ui,
         '@@FONT_LOOKUP@@': section(display, 'const lv_font_fmt_txt_glyph_dsc_t* FindGlyphInFont(', 'int MeasureCodepointWidth('),
         '@@FONT_DRAW@@': section(display, 'void DrawGlyphFromFont(', 'void DrawCjkGlyph('),
         '@@FONT_MEASURE@@': section(display, 'int MeasureTextWithFont(', 'std::string TruncateUtf8TextToWidth('),

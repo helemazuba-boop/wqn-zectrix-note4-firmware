@@ -1,6 +1,7 @@
 #include "sse_chunk.h"
 
 #include <cstdlib>
+#include <cstring>
 #include <utility>
 #include "cJSON.h"
 #include "device_protocol/json_depth_guard.h"
@@ -175,6 +176,12 @@ bool DecodeSseEvent(const std::string& event_name,
   else if (ev_name == "text.start")    k = Kind::kTextStart;
   else if (ev_name == "text.delta")    k = Kind::kTextDelta;
   else if (ev_name == "text.end")      k = Kind::kTextEnd;
+  else if (ev_name == "interaction.request")
+    k = Kind::kInteractionRequest;
+  else if (ev_name == "interaction.waiting")
+    k = Kind::kInteractionWaiting;
+  else if (ev_name == "interaction.closed")
+    k = Kind::kInteractionClosed;
   else if (ev_name == "tool.start")    k = Kind::kToolStart;
   else if (ev_name == "tool.result")   k = Kind::kToolResult;
   else if (ev_name == "tool.error")    k = Kind::kToolError;
@@ -183,6 +190,61 @@ bool DecodeSseEvent(const std::string& event_name,
                                             k = Kind::kTurnDone;
   else if (ev_name == "error")         k = Kind::kError;
   else if (ev_name == "final")         k = Kind::kFinal;
+  if (k == Kind::kInteractionClosed || k == Kind::kInteractionWaiting) {
+    const char* id = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(root, "interaction_id"));
+    if (id != nullptr)
+      out_ev->interaction.id = id;
+  }
+  if (k == Kind::kInteractionRequest) {
+    const auto field = [&](const char* name) {
+      const char* value = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(root, name));
+      return std::string(value != nullptr ? value : "");
+    };
+    AiInteraction next;
+    next.id = field("interaction_id");
+    next.kind = field("kind");
+    next.prompt = field("prompt");
+    next.allow_custom = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(root, "allow_custom"));
+    cJSON* options = cJSON_GetObjectItemCaseSensitive(root, "options");
+    bool valid_id = next.id.size() == 36;
+    if (valid_id)
+      for (size_t i = 0; i < next.id.size(); ++i) {
+        const char ch = next.id[i];
+        const bool separator = i == 8 || i == 13 || i == 18 || i == 23;
+        valid_id = valid_id && (separator ? ch == '-'
+                                          : (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') ||
+                                                (ch >= 'A' && ch <= 'F'));
+      }
+    bool valid = valid_id && cJSON_IsBool(cJSON_GetObjectItemCaseSensitive(root, "allow_custom")) &&
+                 (next.kind == "write" || next.kind == "question") && !next.prompt.empty() &&
+                 next.prompt.size() <= 8192 && cJSON_IsArray(options) &&
+                 cJSON_GetArraySize(options) >= 1 && cJSON_GetArraySize(options) <= 8;
+    if (valid)
+      for (int i = 0; i < cJSON_GetArraySize(options); ++i) {
+        cJSON* option = cJSON_GetArrayItem(options, i);
+        const char* value = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(option, "value"));
+        const char* label = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(option, "label"));
+        if (value == nullptr || label == nullptr || value[0] == 0 || label[0] == 0 ||
+            std::strlen(value) > 512 || std::strlen(label) > 320 ||
+            std::strcmp(value, "__custom__") == 0) {
+          valid = false;
+          break;
+        }
+        for (const auto& prior : next.options)
+          if (prior.value == value)
+            valid = false;
+        next.options.push_back({value, label});
+      }
+    if (next.kind == "write" &&
+        (next.allow_custom || next.options.size() != 2 || next.options[0].value != "approve" ||
+         next.options[1].value != "reject"))
+      valid = false;
+    if (!valid) {
+      cJSON_Delete(root);
+      return false;
+    }
+    out_ev->interaction = std::move(next);
+  }
   out_ev->kind = k;
 
   cJSON* n = nullptr;

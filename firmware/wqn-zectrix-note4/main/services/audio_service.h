@@ -57,6 +57,11 @@ using AudioBusHandle = void*;
 using AudioCodecHandle = void*;
 using AudioChannelHandle = void*;
 
+// Boot-monotonic I2S duplex RX queue-overflow events, incremented by the
+// AudioService ISR callback. A per-turn unsigned delta excludes idle/warmup
+// history. This is neither an exact lost-sample count nor an audio quality score.
+uint32_t AudioDuplexRxOverflowCount();
+
 esp_err_t StartAudioService();
 
 // Capture, playback, Flash and self-test are mutually exclusive. Every begin

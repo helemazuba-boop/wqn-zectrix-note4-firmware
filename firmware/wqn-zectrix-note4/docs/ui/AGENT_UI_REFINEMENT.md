@@ -92,3 +92,34 @@ with zero warnings and pass M8 plus the compiled UI entry-frame gate. Reading
 These are host/build checks; no device flashing or HIL was performed.
 
 No push or device flashing is part of the approved local commit delivery.
+
+## Mode-local expansion, 2026-10-26
+
+Agent always lays out the content admitted by its own detail setting. The STD
+expand/collapse toggle no longer affects Agent thinking/tool rows, scroll bounds,
+turn jumps, automatic following or the display signature. All these consumers
+use `AiHistoryContentExpanded`; the history channels remain independent.
+
+`test_ai_reading.py --sanitize` replays the real renderer with an unchanged
+Agent snapshot and both STD toggle values, asserting identical pixels/layout.
+STD still has distinct expanded and collapsed layouts. This is host evidence;
+physical panel acceptance remains separate.
+
+## Follow across execution rounds, 2026-10-26
+
+Following parks at the first line of each assistant segment while it grows. It
+stays armed through later tool/thinking segments, so an interim “I'll inspect”
+message cannot prevent the final answer from being brought into view. Completion
+retires following; a manual scroll or turn jump retains its reading position.
+Recording and confirmation/question/permission cards pause automatic movement.
+
+Each arm records the history revision and increments an epoch. A resumed ask
+cannot mistake an unchanged old assistant for a new answer. Automatic viewport
+writes check that epoch and the current phase under the Agent mutex, so a stale
+UI calculation cannot retire or move a newly armed run or a manually stopped one.
+
+The reading host test now extracts the production follow dispatcher and owner
+functions. It covers preface/tool/final sequences at different UI cadences,
+completion, resume over an old answer, manual interruption, stale epochs and
+modal pauses. It uses the actual layout geometry and sanitizers; device event
+scheduling and physical panel latency still require HIL.
