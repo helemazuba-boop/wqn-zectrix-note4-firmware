@@ -28,8 +28,11 @@ def main():
     fixture = (root/'scripts/testdata/ai_reading.cpp').read_text()
     owner = (root/'main/opencode_session.cpp').read_text()
     owner = owner[:owner.rindex('\n#else')]
+    std_owner = (root/'main/ai_session.cpp').read_text()
+    std_owner = std_owner[:std_owner.rindex('\n#else')]
     runtime = (root/'main/ui/ui_runtime.cpp').read_text()
     replacements = {
+        '@@STD_FOLLOW_OWNER@@': '\n'.join(function(std_owner, name) for name in ['void ArmAiFollowLocked()', 'bool ApplyAiViewportFollow(', 'void SetAiFollowState(']),
         '@@FOLLOW_OWNER@@': '\n'.join(function(owner, name) for name in ['void ArmAgentFollowLocked()', 'bool ApplyOpenCodeViewportFollow(', 'void SetOpenCodeFollowState(']),
         '@@FOLLOW_RUNTIME@@': section(runtime, 'UiUpdate UiRuntime::DispatchAiViewportFollow()', 'UiUpdate UiRuntime::DispatchFlashSnapshot('),
         '@@AI_MODEL@@': section((root/'main/ui_model.h').read_text(), 'enum class AiSessionStatus {', 'enum class TodoSyncStatus {'),

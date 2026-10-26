@@ -49,6 +49,8 @@ void SetAiExpandContent(bool expanded);
 // the UI's copy would be reverted by the next snapshot.
 void SetAiAutoFollow(bool follow);
 void SetAiFollowState(bool active, bool user_moved);
+bool ApplyAiViewportFollow(uint32_t epoch, int32_t target, int32_t min_scroll,
+                           int32_t max_scroll, bool finished);
 
 // Lightweight, mutex-free snapshot of v2 SSE streaming bookkeeping. UI calls
 // this from its own task to drive the EPD throttle and the status-bar chip

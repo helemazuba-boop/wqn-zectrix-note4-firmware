@@ -59,8 +59,13 @@ void xSemaphoreTake(void*,int) {}
 void xSemaphoreGive(void*) {}
 int follow_marks=0;
 void MarkChangedLocked() { ++follow_marks; }
-void SetAiFollowState(bool,bool) {}
-void SetAiScrollOffsetLinesClamped(int32_t,int32_t,int32_t) {}
+AiSessionState std_follow_state;
+namespace std_owner {
+AiSessionState& g_state=std_follow_state;
+void MarkChanged() { ++follow_marks; }
+@@STD_FOLLOW_OWNER@@
+}
+bool ApplyAiViewportFollow(uint32_t epoch,int32_t target,int32_t low,int32_t high,bool finished) { return std_owner::ApplyAiViewportFollow(epoch,target,low,high,finished); }
 @@FOLLOW_OWNER@@
 }
 
@@ -248,6 +253,29 @@ int main(int argc,char**argv) {
     wqn::ArmAgentFollowLocked();wqn::g_state.ui.phase=wqn::AiFeaturePhase::kAwaitingQuestion;
     CHECK(!wqn::ApplyOpenCodeViewportFollow(wqn::g_state.follow_epoch,0,-100,100,false));
     resumed.state_.agent=wqn::g_state;CHECK(!resumed.DispatchAiViewportFollow().changed);
+
+    // STD consumes the same sequence and geometry, with its own owner/epoch.
+    for(bool sample_preface:{false,true}) {
+        UiRuntime runtime;runtime.state_.ai.tier=wqn::AiTier::kStd;
+        wqn::std_follow_state={};wqn::std_follow_state.status=wqn::AiSessionStatus::kStreaming;
+        wqn::follow_snapshots[0]=thinking;wqn::std_owner::ArmAiFollowLocked();runtime.state_.ai=wqn::std_follow_state;
+        auto std_tick=[&](const std::shared_ptr<wqn::AiHistorySnapshot>& history) {
+            wqn::follow_snapshots[0]=history;runtime.DispatchAiViewportFollow();runtime.state_.ai=wqn::std_follow_state;
+        };
+        std_tick(thinking);CHECK(runtime.state_.ai.follow_active);
+        if(sample_preface){std_tick(preface);CHECK(runtime.state_.ai.follow_active);}
+        std_tick(working);std_tick(answered);
+        CHECK(runtime.state_.ai.follow_active&&runtime.state_.ai.scroll_offset_lines==final_top);
+        wqn::std_follow_state.status=wqn::AiSessionStatus::kReplyReady;runtime.state_.ai=wqn::std_follow_state;
+        std_tick(answered);CHECK(!runtime.state_.ai.follow_active&&runtime.state_.ai.scroll_offset_lines==final_top);
+        wqn::std_owner::ArmAiFollowLocked();const auto old_epoch=wqn::std_follow_state.follow_epoch;
+        wqn::std_owner::SetAiFollowState(false,true);
+        CHECK(!wqn::ApplyAiViewportFollow(old_epoch,0,-100,100,false));
+        wqn::std_owner::ArmAiFollowLocked();wqn::std_follow_state.status=wqn::AiSessionStatus::kAwaitingDecision;
+        CHECK(!wqn::ApplyAiViewportFollow(wqn::std_follow_state.follow_epoch,0,-100,100,false));
+        wqn::std_follow_state.status=wqn::AiSessionStatus::kStreaming;wqn::std_follow_state.auto_follow=false;
+        CHECK(!wqn::ApplyAiViewportFollow(wqn::std_follow_state.follow_epoch,0,-100,100,false));
+    }
 
     const auto* font=AiNativeFont();
     auto english=WrapAiNativeText("alpha beta gamma",wqn::MeasureTextWithFont(font,"alpha beta"),font,10);

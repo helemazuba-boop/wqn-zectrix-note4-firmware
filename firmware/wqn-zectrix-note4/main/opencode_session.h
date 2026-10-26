@@ -78,7 +78,7 @@ void SetOpenCodeScrollOffsetClamped(int32_t target, int32_t min_scroll, int32_t 
 // A manual move or a resumed/new run invalidates an older UI calculation.
 bool ApplyOpenCodeViewportFollow(uint32_t epoch, int32_t target, int32_t min_scroll,
                                  int32_t max_scroll, bool finished);
-// [follow] Per-turn viewport-follow state (see AgentSessionState). The per-tick
+// [follow] Per-turn viewport-follow state (see AgentSessionState). The
 // input path clears it on a manual scroll. A body parks at its first line while
 // subsequent tool/thinking phases keep following until the run settles.
 void SetOpenCodeFollowState(bool active, bool user_moved);

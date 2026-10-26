@@ -88,3 +88,48 @@ No cloud deployment, production migration or flashing is part of local commits.
   handling. No production database was used.
 
 The device acceptance items above remain pending.
+
+## Streaming display parity, 2026-10-26
+
+STD keeps its existing confirmed-text SSE route and model. Its thinking deltas
+now update the live history throughout generation, with a new entry for each
+post-tool reasoning round. Text and tool blocks retain their original order;
+a cumulative final reply cannot duplicate already sealed pre-tool narration.
+Terminal/error frames flush the last coalesced prefix. The existing UTF-8 text
+budgets remain in force.
+
+STD and Agent now share the same viewport behavior: watch thinking/tool stages,
+park at the beginning of each answer while it grows, continue through later
+rounds, and stop at completion or a manual reading gesture. Capture, input
+confirmation and pending decisions pause movement. Automatic viewport writes
+check the owner's current epoch and phase, and respect the disabled-follow
+setting. Completion no longer resets STD to the top of the question.
+
+Both modes sample live display frames at the same 500 ms floor. This changes UI
+coalescing only; the display owner, waveform, rail and sleep policies are intact.
+The cloud already emits thinking/text/tool deltas; this follow-up changes no wire
+schema, provider API or database migration.
+
+Additional validation entrypoints:
+
+- `python3 scripts/test_std_stream.py` — actual STD SSE consumer and real
+  `AiHistory`, with ASan/UBSan. Covers live thinking, multiple model/tool rounds,
+  final narration deduplication, event order, coalesced terminal flushes and caps.
+- `python3 scripts/test_ai_reading.py --sanitize` — actual STD/Agent viewport
+  dispatch and epoch-checked owners with real layout geometry. Covers variable
+  UI cadence, resume over old content, manual reading, modal pauses and disabled
+  following, alongside the existing pixel/cache/reading regressions.
+
+Device acceptance must additionally cover a preface followed by several tools,
+question/write decisions between model rounds, long thinking/body generation,
+manual paging during execution and the final answer's physical panel position.
+Host replays and builds do not complete those device checks.
+
+Follow-up local results: reading/layout/follow **24,472** assertions; STD
+SSE/history **26**; STD input/decision gates **31**; Agent/STD UI **1,764**;
+navigation **1,492**; HTTP **2,844** / WS **232**; audio runtime **90**;
+recording indicator **67**. The Agent-disabled host link covered **23** entry
+points. Each batch built successfully with zero compiler warnings, M8 and UI
+entry-frame gates; the final enabled and independently disabled Agent profiles
+both passed. Device HIL remains pending. The unrelated Flash/audio working-tree
+changes were excluded from these commits.

@@ -311,9 +311,9 @@ bool FinalizeAssistantLocked(wqn::AiHistory& history, const std::string& authori
 // a run already entered history through text.end is only closed out here.
 void SealAssistantSegmentLocked(wqn::AiHistory& history, int64_t now_ms)
 {
-    if (!g_turn.assistant_terminal && g_turn.user_committed &&
-        !g_turn.assistant_text.empty()) {
-        FinalizeAssistantLocked(history, std::string(), now_ms);
+    if (g_turn.user_committed && !g_turn.assistant_text.empty()) {
+        if (!g_turn.assistant_terminal)
+            FinalizeAssistantLocked(history, std::string(), now_ms);
         ++g_turn.segments_sealed;
     }
     g_turn.assistant_id = wqn::kInvalidChatMessageId;
@@ -329,9 +329,12 @@ void SealAssistantSegmentLocked(wqn::AiHistory& history, int64_t now_ms)
 // turn, so adopting it verbatim would duplicate already-sealed entries: when
 // the open segment carries streamed deltas those win; only a run with no
 // streamed content of its own adopts the payload.
-std::string ResolveSegmentTextLocked(const std::string& full, const std::string& text)
+std::string ResolveSegmentTextLocked(const std::string& full, const std::string& text,
+                                     bool aggregate = false)
 {
     const std::string& streamed = g_turn.assistant_text;
+    if (aggregate && g_turn.segments_sealed != 0 && streamed.empty())
+        return {}; // aggregate text is already present in the sealed entries
     if (g_turn.segments_sealed == 0 || streamed.empty()) {
         return !full.empty() ? full : (!text.empty() ? text : streamed);
     }
@@ -344,20 +347,17 @@ void MarkChanged()
     g_changed = true;
 }
 
-// [follow] Arm the STD/Pro viewport follow for a fresh turn. Called from the
-// two capture-start paths (the recording request and the transition into
-// kListening), because the STD/Pro turn is submitted by the key release rather
-// than by an explicit confirm call -- by the time the reply starts there is no
-// further hook to arm from. The per-tick step
-// (UiRuntime::DispatchAiViewportFollow) skips the capture phases, so nothing
-// moves while the codec is being configured; from kWaitingReply on it pins the
-// viewport to the live tail and retires the follow as soon as the answer body
-// lands. `user_moved=false` marks this turn's viewport as untouched.
+// [follow] Each capture/confirmed submit arms a new viewport epoch. The UI
+// skips input/decision phases, follows thinking/tool segments, and parks at
+// each answer's first line until completion or a manual reading gesture.
 //
 // Caller must hold g_lock; the caller's own MarkChanged() covers the state
 // change (the follow flags ride the same snapshot).
 void ArmAiFollowLocked()
 {
+    ++g_state.follow_epoch;
+    const auto history = wqn::GetAiHistorySnapshot(wqn::AiHistoryChannel::kStdPro);
+    g_state.follow_after_revision = history ? history->revision : 0;
     g_state.follow_active = true;
     g_state.user_moved = false;
 }
@@ -632,6 +632,10 @@ void OnSseEvent(const wqn::WqnAiSseEvent& ev)
             g_state.status_since_ms = now_ms;
             break;
         case wqn::WqnAiSseEvent::Kind::kThinkingStart:
+            FinalizeThinkingLocked(history, std::string(), now_ms);
+            g_turn.thinking_id = wqn::kInvalidChatMessageId;
+            g_turn.thinking_text.clear();
+            g_turn.thinking_done = false;
             g_turn.thinking_seen = true;
             break;
         case wqn::WqnAiSseEvent::Kind::kThinkingDelta:
@@ -652,10 +656,9 @@ void OnSseEvent(const wqn::WqnAiSseEvent& ev)
                     g_turn.thinking_text.resize(
                         wqn::Utf8SafePrefixBytes(g_turn.thinking_text, wqn::kMaxThinkingBytes));
                 }
-                if (g_turn.thinking_id == wqn::kInvalidChatMessageId) {
-                    EnsureThinkingHistoryLocked(history, now_ms); // first visible prefix only
-                    g_streaming_force_full_render = true;
-                }
+                if (delta_watermark_open || g_turn.thinking_id == wqn::kInvalidChatMessageId)
+                    EnsureThinkingHistoryLocked(history, now_ms);
+                g_state.last_render_ms = now_ms;
             }
             break;
         case wqn::WqnAiSseEvent::Kind::kThinkingDone: {
@@ -767,6 +770,10 @@ void OnSseEvent(const wqn::WqnAiSseEvent& ev)
             // [tool-order] Seal before appending so pre-tool text stays above
             // this block.
             SealAssistantSegmentLocked(history, now_ms);
+            FinalizeThinkingLocked(history, std::string(), now_ms);
+            g_turn.thinking_id = wqn::kInvalidChatMessageId;
+            g_turn.thinking_text.clear();
+            g_turn.thinking_done = false;
             std::string label =
                 (ev.tool_name.empty() ? std::string("tool") : ev.tool_name) + "…";
             g_pending_tool_label = label;
@@ -812,6 +819,8 @@ void OnSseEvent(const wqn::WqnAiSseEvent& ev)
             g_streaming_force_full_render = true;
             break;
         case wqn::WqnAiSseEvent::Kind::kError: {
+            FinalizeThinkingLocked(history, std::string(), now_ms);
+            FinalizeAssistantLocked(history, std::string(), now_ms);
             g_state.interaction = {};
             g_reply_pending = false;
             const std::string msg = ev.error_message.empty() ? ev.error_code : ev.error_message;
@@ -824,15 +833,15 @@ void OnSseEvent(const wqn::WqnAiSseEvent& ev)
             break;
         }
         case wqn::WqnAiSseEvent::Kind::kFinal: {
+            FinalizeThinkingLocked(history, std::string(), now_ms);
             g_state.interaction = {};
             g_reply_pending = false;
-            const std::string final_text = ResolveSegmentTextLocked(ev.full_text, ev.text);
+            const std::string final_text = ResolveSegmentTextLocked(ev.full_text, ev.text, true);
             if (final_text.empty()) {
                 // Nothing streamed or authoritative for the open run; keep the
                 // last known reply text instead of blanking the session.
             } else {
                 g_turn.assistant_terminal = true;
-                FinalizeThinkingLocked(history, std::string(), now_ms);
                 FinalizeAssistantLocked(history, final_text, now_ms);
                 g_state.assistant_text = final_text;
             }
@@ -844,14 +853,8 @@ void OnSseEvent(const wqn::WqnAiSseEvent& ev)
             if (!ev.conversation_id.empty()) g_conversation_id = ev.conversation_id;
             g_state.conversation_id = g_conversation_id;
             g_state.page = 0;
-            // [follow] Conditional recenter: land on the newest exchange only
-            // when the user did not move the viewport during this turn. A
-            // retired auto-follow leaves user_moved false, so a followed reply
-            // still gets presented from its first line; a viewport the user
-            // scrolled (or turn-jumped) is left exactly where they put it.
-            if (!g_state.user_moved) {
-                g_state.scroll_offset_lines = 0;
-            }
+            // The UI parks at the actual answer top using the rendered layout.
+            // Its epoch-checked owner preserves disabled/manual following.
             g_streaming_force_full_render = true;
             g_streaming_active = false;
             g_state.status_since_ms = now_ms;
@@ -1751,8 +1754,8 @@ void SetAiAutoFollow(bool follow)
 }
 
 // [follow] Per-turn follow state. Mark only on a real change: the per-tick
-// follow step calls this to retire the follow when the answer lands, and a
-// redundant mark would cost an EPD refresh on every later tick.
+// input path uses this to pause/resume following; automatic moves are epoch
+// checked by ApplyAiViewportFollow.
 void SetAiFollowState(bool active, bool user_moved)
 {
     if (g_lock == nullptr) {
@@ -1760,11 +1763,40 @@ void SetAiFollowState(bool active, bool user_moved)
     }
     xSemaphoreTake(g_lock, portMAX_DELAY);
     if (g_state.follow_active != active || g_state.user_moved != user_moved) {
+        ++g_state.follow_epoch;
         g_state.follow_active = active;
         g_state.user_moved = user_moved;
         MarkChanged();
     }
     xSemaphoreGive(g_lock);
+}
+
+bool ApplyAiViewportFollow(uint32_t epoch, int32_t target, int32_t min_scroll,
+                           int32_t max_scroll, bool finished)
+{
+    if (g_lock == nullptr || min_scroll > max_scroll)
+        return false;
+    xSemaphoreTake(g_lock, portMAX_DELAY);
+    const auto status = g_state.status;
+    if (!g_state.auto_follow || !g_state.follow_active || g_state.follow_epoch != epoch ||
+        status == AiSessionStatus::kPreparingCapture || status == AiSessionStatus::kListening ||
+        status == AiSessionStatus::kTranscribing || status == AiSessionStatus::kAwaitingConfirmation ||
+        status == AiSessionStatus::kAwaitingDecision) {
+        xSemaphoreGive(g_lock);
+        return false;
+    }
+    target = std::clamp<int32_t>(std::clamp(target, min_scroll, max_scroll), -4096, 4096);
+    const bool settled = finished &&
+        (status == AiSessionStatus::kReplyReady || status == AiSessionStatus::kError ||
+         status == AiSessionStatus::kIdle);
+    if (g_state.scroll_offset_lines != target || settled) {
+        g_state.scroll_offset_lines = target;
+        if (settled)
+            g_state.follow_active = false;
+        MarkChanged();
+    }
+    xSemaphoreGive(g_lock);
+    return true;
 }
 
 void ClearAiConversationContext()
@@ -1788,6 +1820,8 @@ void ClearAiConversationContext()
     g_state.function_call_summaries.clear();
     g_pending_tool_label.clear();
     g_state.status = wqn::AiSessionStatus::kIdle;
+    g_state.follow_active = false;
+    ++g_state.follow_epoch;
     g_state.status_since_ms = esp_timer_get_time() / 1000;
     g_state.page = 0;
     g_state.toast_visible = false;
@@ -1993,6 +2027,7 @@ void SetAiTtsOn(bool) {}
 void SetAiExpandContent(bool) {}
 void SetAiAutoFollow(bool) {}
 void SetAiFollowState(bool, bool) {}
+bool ApplyAiViewportFollow(uint32_t, int32_t, int32_t, int32_t, bool) { return false; }
 
 int32_t GetAiScrollOffsetLines()
 {

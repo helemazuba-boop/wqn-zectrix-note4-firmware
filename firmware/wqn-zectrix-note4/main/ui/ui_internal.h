@@ -88,6 +88,8 @@ constexpr TickType_t kTimerRefreshDelay = pdMS_TO_TICKS(80);
 constexpr TickType_t kSelectionRefreshDelay = pdMS_TO_TICKS(100);
 constexpr TickType_t kConfigRefreshDelay = pdMS_TO_TICKS(120);
 constexpr TickType_t kAiRefreshDelay = pdMS_TO_TICKS(120);
+// UI frame sampling only; panel waveform/owner timing stays with DisplayService.
+constexpr int64_t kAiStreamingRefreshFloorMs = 500;
 
 // Aliases the model-layer constant (ui_model.h) — the row count must have
 // exactly one definition because ui_model.cpp clamps against it too.
