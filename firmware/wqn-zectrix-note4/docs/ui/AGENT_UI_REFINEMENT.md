@@ -92,3 +92,15 @@ with zero warnings and pass M8 plus the compiled UI entry-frame gate. Reading
 These are host/build checks; no device flashing or HIL was performed.
 
 No push or device flashing is part of the approved local commit delivery.
+
+## Mode-local expansion, 2026-10-26
+
+Agent always lays out the content admitted by its own detail setting. The STD
+expand/collapse toggle no longer affects Agent thinking/tool rows, scroll bounds,
+turn jumps, automatic following or the display signature. All these consumers
+use `AiHistoryContentExpanded`; the history channels remain independent.
+
+`test_ai_reading.py --sanitize` replays the real renderer with an unchanged
+Agent snapshot and both STD toggle values, asserting identical pixels/layout.
+STD still has distinct expanded and collapsed layouts. This is host evidence;
+physical panel acceptance remains separate.

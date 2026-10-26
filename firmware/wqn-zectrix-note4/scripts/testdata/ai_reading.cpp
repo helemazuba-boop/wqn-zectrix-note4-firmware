@@ -12,6 +12,7 @@
 #include <vector>
 #include "display_service.h"
 #include "ai_history.h"
+#include "ai_interaction.h"
 #include "ui/ai_native_text.h"
 #include "ui/ai_scroll_geometry.h"
 #include "ui/ai_text_layout.h"
@@ -45,9 +46,7 @@ int MeasureUtf8TextWidth(const char* text) {
     return width;
 }
 esp_err_t DrawUtf8Text(int x,int y,const char* text,bool ink) { DrawTextWithFont(x,y,PrimaryUiFont(),text,ink);return ESP_OK; }
-enum class AiTier { kAgent,kStd,kFlash };
-enum class AiSessionStatus { kIdle,kStreaming };
-struct AiSessionState { AiTier tier=AiTier::kAgent;AiSessionStatus status=AiSessionStatus::kIdle;bool expand_content=true;int64_t scroll_no_op_hint_ms=0; };
+@@AI_MODEL@@
 }
 
 namespace device_ui_internal {
@@ -96,7 +95,7 @@ int main(int argc,char**argv) {
     wqn::ChatMessageSnapshot user;user.id=1;user.kind=wqn::ChatMessageKind::kUser;user.text="Q";
     wqn::ChatMessageSnapshot reply;reply.id=2;reply.kind=wqn::ChatMessageKind::kAssistant;
     for(int i=1;i<=14;++i){if(i>1)reply.text+='\n';reply.text+="ROW_"+std::to_string(i);}
-    snapshot->messages={user,reply};wqn::AiSessionState ai;
+    snapshot->messages={user,reply};wqn::AiSessionState ai;ai.tier=wqn::AiTier::kAgent;
     int32_t minimum=0,maximum=0;GetAiScrollBounds(snapshot,true,0,&minimum,&maximum);
     CHECK(minimum==-1&&maximum==0);
     RenderAiHistoryViewport(ai,snapshot,minimum,0);CHECK(HasText("ROW_14"));Bounds();Save(folder,"tail-reachable");
@@ -155,6 +154,28 @@ int main(int argc,char**argv) {
         }
         for(int i=0;i<100;++i)CHECK(std::find(visited.begin(),visited.end(),"PAGE-"+std::to_string(i))!=visited.end());
     }
+    // A STD collapse never changes Agent pixels or any Agent scroll bound.
+    auto details=std::make_shared<wqn::AiHistorySnapshot>();details->revision=9000;
+    auto thought=reply;thought.id=9000;thought.kind=wqn::ChatMessageKind::kThinking;
+    thought.text="THINK-1\nTHINK-2\nTHINK-3\nTHINK-4";
+    auto tool=reply;tool.id=9001;tool.kind=wqn::ChatMessageKind::kToolResult;
+    tool.text.clear();tool.tool_name="inspect";tool.tool_args_json="file";tool.tool_result_json="done";
+    details->messages={user,thought,tool};
+    ai.expand_content=true;
+    CHECK(wqn::AiHistoryContentExpanded(ai));
+    GetAiScrollBounds(details,wqn::AiHistoryContentExpanded(ai),0,&minimum,&maximum);
+    const auto expanded_layout=GetAiHistoryLayout(details,wqn::AiHistoryContentExpanded(ai));
+    RenderAiHistoryViewport(ai,details,minimum,0);const auto agent_pixels=wqn::pixels;
+    ai.expand_content=false;
+    CHECK(wqn::AiHistoryContentExpanded(ai));
+    CHECK(GetAiHistoryLayout(details,wqn::AiHistoryContentExpanded(ai))==expanded_layout);
+    RenderAiHistoryViewport(ai,details,minimum,0);CHECK(wqn::pixels==agent_pixels);
+    ai.tier=wqn::AiTier::kStd;
+    CHECK(!wqn::AiHistoryContentExpanded(ai));
+    const auto collapsed_layout=GetAiHistoryLayout(details,wqn::AiHistoryContentExpanded(ai));
+    CHECK(collapsed_layout->total_content_h<expanded_layout->total_content_h);
+    RenderAiHistoryViewport(ai,details,0,0);CHECK(wqn::pixels!=agent_pixels);
+    ai.expand_content=true;CHECK(wqn::AiHistoryContentExpanded(ai));ai.tier=wqn::AiTier::kAgent;
     const auto* font=AiNativeFont();
     auto english=WrapAiNativeText("alpha beta gamma",wqn::MeasureTextWithFont(font,"alpha beta"),font,10);
     CHECK(english.size()==2&&english[0]=="alpha beta"&&english[1]=="gamma");

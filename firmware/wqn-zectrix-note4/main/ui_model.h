@@ -144,6 +144,13 @@ struct AiSessionState {
     bool auto_follow = true;
 };
 
+// Agent detail is selected by its own gateway setting. The STD collapse toggle
+// must not hide Agent content or change its viewport geometry.
+inline bool AiHistoryContentExpanded(const AiSessionState& ai)
+{
+    return ai.tier == AiTier::kAgent || ai.expand_content;
+}
+
 // Returns the current scroll offset in 18-px line units (0 == bottom / newest).
 // UI tasks read this under the AI mutex; safe to call from any task.
 int32_t GetAiScrollOffsetLines();

@@ -512,7 +512,7 @@ std::string FrameSignature(const wqn::UiFrame& frame)
         signature.push_back('/');
         signature.append(frame.ai.tts_on ? "1" : "0");
         signature.push_back('/');
-        signature.append(frame.ai.expand_content ? "1" : "0");
+        signature.append(wqn::AiHistoryContentExpanded(frame.ai) ? "1" : "0");
         signature.push_back('/');
         // [follow] No tier draws the follow toggle in the cluster any more (it
         // moved to the settings page), so auto_follow no longer changes a pixel

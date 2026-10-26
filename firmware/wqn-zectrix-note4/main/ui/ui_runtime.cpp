@@ -1137,7 +1137,7 @@ UiUpdate UiRuntime::DispatchAiViewportFollow()
     int32_t max_scroll = 0;
     // The Agent tier's band is only up while there is something to answer, so
     // the reserve the follow computes with is the one the renderer draws with.
-    GetAiScrollBounds(snapshot, state_.ai.expand_content,
+    GetAiScrollBounds(snapshot, wqn::AiHistoryContentExpanded(state_.ai),
                       agent_tier ? AiBottomReserve(state_.agent) : 0, &min_scroll,
                       &max_scroll);
 
@@ -1152,7 +1152,7 @@ UiUpdate UiRuntime::DispatchAiViewportFollow()
     // follow has no per-tier scroll offset of its own to park.
     int32_t answer_top = 0;
     const bool body_started =
-        GetAiNewestAnswerTopOffsetLines(snapshot, state_.ai.expand_content,
+        GetAiNewestAnswerTopOffsetLines(snapshot, wqn::AiHistoryContentExpanded(state_.ai),
                                         agent_tier ? AiBottomReserve(state_.agent) : 0,
                                         &answer_top) ||
         (!agent_tier && !state_.ai.assistant_partial.empty());
