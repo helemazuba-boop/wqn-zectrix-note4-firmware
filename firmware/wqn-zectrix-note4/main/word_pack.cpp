@@ -25,6 +25,8 @@
 #include "freertos/task.h"
 #include "mbedtls/sha256.h"
 #include "runtime/sleep_coordinator.h"
+#include "runtime/storage_temp_file_lease.h"
+#include "runtime/pack_stream_path_lease.h"
 #include "services/storage_service.h"
 #include "word_study_store.h"
 
@@ -410,15 +412,19 @@ void PruneUnreferencedPackFiles(const wqn::WqnWordPackManifest& current)
         }
     }
 
-    if (FileExists(kManifestBackupPath)) {
+    {
         std::string backup_payload;
-        wqn::WqnWordPackManifest backup;
-        if (ReadWholeFile(kManifestBackupPath, &backup_payload) != ESP_OK ||
-            wqn::ParseWordPackManifestResponse(backup_payload, &backup) != ESP_OK) {
-            ESP_LOGW(kTag, "word pack backup manifest invalid; skip pruning rollback files");
-            return;
+        const esp_err_t backup_result = ReadWholeFile(kManifestBackupPath, &backup_payload);
+        // Do not treat a failed stat/open as proof that no rollback exists.
+        if (backup_result != ESP_ERR_NOT_FOUND) {
+            wqn::WqnWordPackManifest backup;
+            if (backup_result != ESP_OK ||
+                wqn::ParseWordPackManifestResponse(backup_payload, &backup) != ESP_OK) {
+                ESP_LOGW(kTag, "word pack backup manifest unreadable or invalid; skip pruning");
+                return;
+            }
+            AddManifestPackStems(backup, &retained_stems);
         }
-        AddManifestPackStems(backup, &retained_stems);
     }
 
     DIR* directory = opendir(kStorageRoot);
@@ -463,6 +469,11 @@ void PruneUnreferencedPackFiles(const wqn::WqnWordPackManifest& current)
 
 esp_err_t ResetWordPackStorageCacheRaw(void*)
 {
+    // Streams keep FILEs open across owner transactions, so a reset must
+    // defer before touching manifests or temporary files owned by a stream.
+    if (wqn::runtime::HasActivePackStreamPath()) {
+        return ESP_ERR_INVALID_STATE;
+    }
     const char* manifest_paths[] = {
         kManifestPath,
         kManifestTempPath,
@@ -879,43 +890,51 @@ esp_err_t MergeWordPackManifestDelta(
 esp_err_t SaveWordPackManifestRaw(const WqnWordPackManifest& manifest)
 {
     cJSON* root = cJSON_CreateObject();
-    cJSON* data = cJSON_CreateObject();
-    cJSON* packs = cJSON_CreateArray();
-    if (root == nullptr || data == nullptr || packs == nullptr) {
+    if (root == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
+    if (!cJSON_AddBoolToObject(root, "success", true)) {
         cJSON_Delete(root);
-        cJSON_Delete(data);
-        cJSON_Delete(packs);
+        return ESP_ERR_NO_MEM;
+    }
+    cJSON* data = cJSON_AddObjectToObject(root, "data");
+    if (data == nullptr ||
+        !cJSON_AddStringToObject(data, "server_time", manifest.server_time.c_str()) ||
+        !cJSON_AddNumberToObject(data, "cursor", static_cast<double>(manifest.cursor)) ||
+        !cJSON_AddBoolToObject(data, "has_more", manifest.has_more)) {
+        cJSON_Delete(root);
+        return ESP_ERR_NO_MEM;
+    }
+    cJSON* packs = cJSON_AddArrayToObject(data, "packs");
+    if (packs == nullptr) {
+        cJSON_Delete(root);
         return ESP_ERR_NO_MEM;
     }
 
-    cJSON_AddBoolToObject(root, "success", true);
-    cJSON_AddItemToObject(root, "data", data);
-    cJSON_AddStringToObject(data, "server_time", manifest.server_time.c_str());
-    cJSON_AddNumberToObject(data, "cursor", static_cast<double>(manifest.cursor));
-    cJSON_AddBoolToObject(data, "has_more", manifest.has_more);
-    cJSON_AddItemToObject(data, "packs", packs);
-
     for (const WqnWordPackManifestItem& item : manifest.packs) {
         cJSON* pack = cJSON_CreateObject();
-        if (pack == nullptr) {
+        if (!cJSON_AddItemToArray(packs, pack)) {
+            cJSON_Delete(pack);
             cJSON_Delete(root);
             return ESP_ERR_NO_MEM;
         }
-        cJSON_AddStringToObject(pack, "pack_id", item.pack_id.c_str());
-        cJSON_AddStringToObject(pack, "deck_id", item.deck_id.c_str());
-        cJSON_AddStringToObject(pack, "title", item.title.c_str());
-        cJSON_AddNumberToObject(pack, "revision", static_cast<double>(item.revision));
-        cJSON_AddNumberToObject(pack, "content_revision", static_cast<double>(item.content_revision));
-        cJSON_AddNumberToObject(pack, "pack_revision", static_cast<double>(item.pack_revision));
-        cJSON_AddNumberToObject(pack, "change_sequence", static_cast<double>(item.change_sequence));
-        cJSON_AddNumberToObject(pack, "schema_version", item.schema_version);
-        cJSON_AddStringToObject(pack, "format", item.format.c_str());
-        cJSON_AddStringToObject(pack, "compression", item.compression.c_str());
-        cJSON_AddStringToObject(pack, "sha256", item.sha256.c_str());
-        cJSON_AddStringToObject(pack, "download_url", item.download_url.c_str());
-        cJSON_AddNumberToObject(pack, "entry_count", item.entry_count);
-        cJSON_AddNumberToObject(pack, "byte_size", item.byte_size);
-        cJSON_AddItemToArray(packs, pack);
+        if (!cJSON_AddStringToObject(pack, "pack_id", item.pack_id.c_str()) ||
+            !cJSON_AddStringToObject(pack, "deck_id", item.deck_id.c_str()) ||
+            !cJSON_AddStringToObject(pack, "title", item.title.c_str()) ||
+            !cJSON_AddNumberToObject(pack, "revision", static_cast<double>(item.revision)) ||
+            !cJSON_AddNumberToObject(pack, "content_revision", static_cast<double>(item.content_revision)) ||
+            !cJSON_AddNumberToObject(pack, "pack_revision", static_cast<double>(item.pack_revision)) ||
+            !cJSON_AddNumberToObject(pack, "change_sequence", static_cast<double>(item.change_sequence)) ||
+            !cJSON_AddNumberToObject(pack, "schema_version", item.schema_version) ||
+            !cJSON_AddStringToObject(pack, "format", item.format.c_str()) ||
+            !cJSON_AddStringToObject(pack, "compression", item.compression.c_str()) ||
+            !cJSON_AddStringToObject(pack, "sha256", item.sha256.c_str()) ||
+            !cJSON_AddStringToObject(pack, "download_url", item.download_url.c_str()) ||
+            !cJSON_AddNumberToObject(pack, "entry_count", item.entry_count) ||
+            !cJSON_AddNumberToObject(pack, "byte_size", item.byte_size)) {
+            cJSON_Delete(root);
+            return ESP_ERR_NO_MEM;
+        }
     }
 
     char* rendered = cJSON_PrintUnformatted(root);
@@ -1211,16 +1230,19 @@ struct WordPackStreamContext {
     const uint8_t* chunk = nullptr;
     size_t chunk_size = 0;
     WordPackStreamOperation operation = WordPackStreamOperation::kBegin;
+    std::string temp_path;
+    std::string final_path;
 };
 
 esp_err_t WordPackStreamTransaction(void* opaque)
 {
     auto* context = static_cast<WordPackStreamContext*>(opaque);
-    if (context == nullptr || context->item == nullptr) {
+    if (context == nullptr || context->item == nullptr ||
+        context->temp_path.empty() || context->final_path.empty()) {
         return ESP_ERR_INVALID_ARG;
     }
-    const std::string temp_path = TempPackPathForItem(*context->item);
-    const std::string final_path = PackPathForItem(*context->item);
+    const std::string& temp_path = context->temp_path;
+    const std::string& final_path = context->final_path;
     switch (context->operation) {
         case WordPackStreamOperation::kBegin:
             std::remove(temp_path.c_str());
@@ -1288,13 +1310,13 @@ esp_err_t WordPackStreamTransaction(void* opaque)
             }
             context->sha_started = false;
             constexpr char kHex[] = "0123456789abcdef";
-            std::string actual_sha;
-            actual_sha.reserve(64);
-            for (const unsigned char byte : digest) {
-                actual_sha.push_back(kHex[byte >> 4]);
-                actual_sha.push_back(kHex[byte & 0x0f]);
+            std::array<char, 64> actual_sha = {};
+            for (size_t i = 0; i < digest.size(); ++i) {
+                actual_sha[i * 2] = kHex[digest[i] >> 4];
+                actual_sha[i * 2 + 1] = kHex[digest[i] & 0x0f];
             }
-            if (actual_sha != context->item->sha256) {
+            if (context->item->sha256.size() != actual_sha.size() ||
+                std::memcmp(actual_sha.data(), context->item->sha256.data(), actual_sha.size()) != 0) {
                 std::fclose(context->file);
                 context->file = nullptr;
                 std::remove(temp_path.c_str());
@@ -1365,8 +1387,18 @@ esp_err_t DownloadWordPackToStorage(
     if (!storage_lease) {
         return ESP_ERR_INVALID_STATE;
     }
+    runtime::StorageTempFileLease temp_file_lease;
     WordPackStreamContext context;
     context.item = &item;
+    // Prepare immutable paths before opening the FILE. Append/Commit/Abort
+    // must not rebuild them while memory pressure may require cleanup.
+    context.temp_path = TempPackPathForItem(item);
+    context.final_path = PackPathForItem(item);
+    // Declared after context: unregister before its path buffers are freed.
+    runtime::PackStreamPathLease path_lease(context.temp_path.c_str());
+    if (!path_lease) {
+        return ESP_ERR_INVALID_STATE;
+    }
     mbedtls_sha256_init(&context.sha);
     context.operation = WordPackStreamOperation::kBegin;
     esp_err_t result = services::ExecuteStorageTransactionNamed(

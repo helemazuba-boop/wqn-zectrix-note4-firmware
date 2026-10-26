@@ -27,6 +27,7 @@ namespace {
 constexpr char kTag[] = "problem_store";
 constexpr char kOutboxPath[] = "/storage/po_outbox.jsonl";
 constexpr char kOutboxTempPath[] = "/storage/po_outbox.tmp";
+constexpr char kOutboxBackupPath[] = "/storage/po_outbox.bak";
 constexpr char kRejectedPath[] = "/storage/po_rejected.jsonl";
 // Park markers (request_id + reason) for verdicts that must not be retried
 // nor deleted. The payload line stays in po_outbox.jsonl; Peek consults this
@@ -108,12 +109,17 @@ std::string EncodeObservationLine(const wqn::DurableProblemObservation& observat
 {
     cJSON* root = cJSON_CreateObject();
     if (root == nullptr) return std::string();
-    cJSON_AddStringToObject(root, "request_id", observation.request_id.c_str());
-    cJSON_AddStringToObject(root, "problem_id", observation.problem_id.c_str());
-    cJSON_AddStringToObject(
-        root, "action",
-        wqn::protocol::problem_study_v1::ReviewActionName(observation.action));
-    cJSON_AddStringToObject(root, "occurred_at", observation.occurred_at.c_str());
+    // A local durable ACK requires every field, even if one allocation fails
+    // and later allocations recover enough for cJSON_Print to succeed.
+    if (!cJSON_AddStringToObject(root, "request_id", observation.request_id.c_str()) ||
+        !cJSON_AddStringToObject(root, "problem_id", observation.problem_id.c_str()) ||
+        !cJSON_AddStringToObject(
+            root, "action",
+            wqn::protocol::problem_study_v1::ReviewActionName(observation.action)) ||
+        !cJSON_AddStringToObject(root, "occurred_at", observation.occurred_at.c_str())) {
+        cJSON_Delete(root);
+        return std::string();
+    }
     char* rendered = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
     if (rendered == nullptr) return std::string();
@@ -122,16 +128,159 @@ std::string EncodeObservationLine(const wqn::DurableProblemObservation& observat
     return line;
 }
 
-bool DecodeObservationLine(
+enum class ObservationDecode { kValid, kMalformed, kUnavailable };
+
+// cJSON reports the same null result for malformed JSON and allocation failure.
+// Only run this allocation-free syntax probe after failure: a complete document
+// may have failed for lack of memory and must never be dropped during repair.
+// Fixed container states bound stack use; no recursion or global allocator hooks.
+// Match cJSON's whitespace, BOM, raw string bytes and permissive number forms.
+class ObservationJsonSyntax {
+public:
+    explicit ObservationJsonSyntax(const std::string& text) : text_(text) {}
+    bool Complete()
+    {
+        enum State : unsigned char {
+            kValue, kDone, kArrayFirst, kArrayNext, kArrayAfter,
+            kObjectFirst, kObjectNext, kObjectColon, kObjectAfter,
+        };
+        State states[wqn::protocol::kMaxJsonNestingDepth + 1] = {kValue};
+        size_t depth = 0;
+        if (text_.compare(0, 3, "\xef\xbb\xbf") == 0) position_ = 3;
+        while (true) {
+            while (position_ < text_.size() &&
+                   static_cast<unsigned char>(text_[position_]) <= 32) ++position_;
+            const char ch = position_ < text_.size() ? text_[position_] : '\0';
+            State& state = states[depth];
+            if (state == kDone) return position_ == text_.size();
+            if ((state == kArrayFirst && ch == ']') ||
+                (state == kObjectFirst && ch == '}')) {
+                ++position_; --depth; continue;
+            }
+            if (state == kArrayAfter || state == kObjectAfter) {
+                if (ch == (state == kArrayAfter ? ']' : '}')) {
+                    ++position_; --depth; continue;
+                }
+                if (ch != ',') return false;
+                state = state == kArrayAfter ? kArrayNext : kObjectNext;
+                ++position_; continue;
+            }
+            if (state == kObjectFirst || state == kObjectNext) {
+                if (!String()) return false;
+                state = kObjectColon; continue;
+            }
+            if (state == kObjectColon) {
+                if (ch != ':') return false;
+                ++position_; state = kValue; continue;
+            }
+            state = depth == 0 ? kDone :
+                (state == kArrayFirst || state == kArrayNext ? kArrayAfter : kObjectAfter);
+            if (ch == '[' || ch == '{') {
+                if (depth == wqn::protocol::kMaxJsonNestingDepth) return false;
+                states[++depth] = ch == '[' ? kArrayFirst : kObjectFirst;
+                ++position_;
+            } else if (ch == '"') {
+                if (!String()) return false;
+            } else if (ch == '-' || (ch >= '0' && ch <= '9')) {
+                if (!Number()) return false;
+            } else if (text_.compare(position_, 4, "null") == 0 ||
+                       text_.compare(position_, 4, "true") == 0) {
+                position_ += 4;
+            } else if (text_.compare(position_, 5, "false") == 0) {
+                position_ += 5;
+            } else return false;
+        }
+    }
+private:
+    bool String()
+    {
+        if (position_ >= text_.size() || text_[position_++] != '"') return false;
+        size_t end = position_;
+        while (end < text_.size() && text_[end] != '"') {
+            if (text_[end] == '\\') ++end;
+            ++end;
+        }
+        if (end >= text_.size()) return false;
+        while (position_ < end) {
+            const char ch = text_[position_++];
+            if (ch != '\\') continue;
+            if (position_ == text_.size()) return false;
+            const char escaped = text_[position_++];
+            if (escaped == 'u') {
+                unsigned first = 0;
+                if (!Unicode(&first, end) || (first >= 0xdc00 && first <= 0xdfff)) return false;
+                if (first >= 0xd800 && first <= 0xdbff) {
+                    if (text_.compare(position_, 2, "\\u") != 0) return false;
+                    position_ += 2;
+                    unsigned second = 0;
+                    if (!Unicode(&second, end) || second < 0xdc00 || second > 0xdfff) return false;
+                }
+            } else if (escaped != '"' && escaped != '\\' && escaped != '/' &&
+                       escaped != 'b' && escaped != 'f' && escaped != 'n' &&
+                       escaped != 'r' && escaped != 't') return false;
+        }
+        position_ = end + 1;
+        return true;
+    }
+    bool Unicode(unsigned* value, size_t end)
+    {
+        if (position_ > end || end - position_ < 4) return false;
+        bool hex = true;
+        for (unsigned i = 0; i < 4; ++i) {
+            const unsigned char ch = text_[position_++];
+            *value <<= 4;
+            if (ch >= '0' && ch <= '9') *value += ch - '0';
+            else if (ch >= 'a' && ch <= 'f') *value += ch - 'a' + 10;
+            else if (ch >= 'A' && ch <= 'F') *value += ch - 'A' + 10;
+            else hex = false;
+        }
+        // cJSON's parse_hex4 maps non-hex sequences to zero too. Keeping that
+        // compatibility prevents discarding an older readable record on OOM.
+        if (!hex) *value = 0;
+        return true;
+    }
+    bool Number()
+    {
+        if (text_[position_] == '-') ++position_;
+        const size_t integer = position_;
+        while (Digit()) ++position_;
+        bool digits = position_ != integer;
+        if (position_ < text_.size() && text_[position_] == '.') {
+            const size_t fraction = ++position_;
+            while (Digit()) ++position_;
+            digits = digits || position_ != fraction;
+        }
+        if (!digits) return false;
+        if (position_ < text_.size() && (text_[position_] == 'e' || text_[position_] == 'E')) {
+            ++position_;
+            if (position_ < text_.size() && (text_[position_] == '+' || text_[position_] == '-')) ++position_;
+            const size_t exponent = position_;
+            while (Digit()) ++position_;
+            if (position_ == exponent) return false;
+        }
+        return true;
+    }
+    bool Digit() const
+    {
+        return position_ < text_.size() && text_[position_] >= '0' && text_[position_] <= '9';
+    }
+    const std::string& text_;
+    size_t position_ = 0;
+};
+
+ObservationDecode DecodeObservationLine(
     const std::string& line, wqn::DurableProblemObservation* observation)
 {
-    if (observation == nullptr) return false;
+    if (observation == nullptr || line.find('\0') != std::string::npos ||
+        !wqn::protocol::JsonNestingWithinLimit(line.data(), line.size())) {
+        return ObservationDecode::kMalformed;
+    }
     *observation = {};
-    cJSON* root = wqn::protocol::JsonNestingWithinLimit(
-                      line.data(), line.size())
-        ? cJSON_Parse(line.c_str())
-        : nullptr;
-    if (root == nullptr) return false;
+    cJSON* root = cJSON_ParseWithOpts(line.c_str(), nullptr, true);
+    if (root == nullptr) {
+        return ObservationJsonSyntax(line).Complete()
+            ? ObservationDecode::kUnavailable : ObservationDecode::kMalformed;
+    }
     cJSON* request_id = cJSON_GetObjectItemCaseSensitive(root, "request_id");
     cJSON* problem_id = cJSON_GetObjectItemCaseSensitive(root, "problem_id");
     cJSON* action = cJSON_GetObjectItemCaseSensitive(root, "action");
@@ -151,60 +300,98 @@ bool DecodeObservationLine(
         else ok = false;
     }
     cJSON_Delete(root);
-    return ok && IsValidObservation(*observation);
+    return ok && IsValidObservation(*observation)
+        ? ObservationDecode::kValid : ObservationDecode::kMalformed;
 }
 
 // Reads every journal line (bounded); malformed lines are dropped so one
-// corrupt record cannot wedge the queue forever.
-esp_err_t ReadOutboxLines(
-    std::vector<std::string>* lines, bool* physically_empty = nullptr)
+// corrupt record cannot wedge the queue forever. Only newline-framed, fully
+// decoded records are eligible for idempotence or a later rewrite.
+esp_err_t RecoverOutboxPublication()
 {
+    struct stat info = {};
+    if (::stat(kOutboxPath, &info) == 0) return ESP_OK;
+    if (errno != ENOENT) return ESP_FAIL;
+    if (::stat(kOutboxBackupPath, &info) != 0) {
+        return errno == ENOENT ? ESP_OK : ESP_FAIL;
+    }
+    g_empty_problem_outbox_known = false;
+    if (std::rename(kOutboxBackupPath, kOutboxPath) != 0) return ESP_FAIL;
+    ESP_LOGW(kTag, "recovered problem outbox from interrupted publication");
+    return ESP_OK;
+}
+
+esp_err_t ReadOutboxLines(
+    std::vector<std::string>* lines, bool* physically_empty = nullptr,
+    bool* needs_repair = nullptr)
+{
+    if (lines == nullptr) return ESP_ERR_INVALID_ARG;
     if (physically_empty != nullptr) *physically_empty = false;
+    if (needs_repair != nullptr) *needs_repair = false;
     lines->clear();
+    const esp_err_t recovery = RecoverOutboxPublication();
+    if (recovery != ESP_OK) return recovery;
     FILE* file = std::fopen(kOutboxPath, "rb");
     if (file == nullptr) {
         if (errno == ENOENT && physically_empty != nullptr) *physically_empty = true;
         return errno == ENOENT ? ESP_OK : ESP_FAIL;
     }
-    std::vector<char> buffer(kMaxLineBytes + 2, 0);
-    bool saw_bytes = false;
-    while (std::fgets(buffer.data(), buffer.size(), file) != nullptr) {
-        saw_bytes = true;
-        size_t length = std::strlen(buffer.data());
-        while (length > 0 &&
-               (buffer[length - 1] == '\n' || buffer[length - 1] == '\r')) {
-            --length;
-        }
-        if (length == 0) continue;
-        if (length > kMaxLineBytes) {
-            ESP_LOGW(kTag, "dropping overlong problem outbox line");
-            continue;
-        }
-        lines->emplace_back(buffer.data(), length);
-        if (lines->size() > wqn::kProblemObservationOutboxCapacity + 8) {
-            std::fclose(file);
-            return ESP_ERR_INVALID_SIZE;
+    std::string line;
+    line.reserve(kMaxLineBytes);
+    bool saw_bytes = false, discard_line = false, repair = false;
+    char chunk[128];
+    size_t read = 0;
+    while ((read = std::fread(chunk, 1, sizeof(chunk), file)) > 0) {
+        for (size_t index = 0; index < read; ++index) {
+            const unsigned char ch = static_cast<unsigned char>(chunk[index]);
+            saw_bytes = true;
+            if (ch != '\n') {
+                if (ch == 0 || line.size() >= kMaxLineBytes + 1) {
+                    discard_line = repair = true;
+                } else if (!discard_line) {
+                    line.push_back(static_cast<char>(ch));
+                }
+                continue;
+            }
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (!discard_line && !line.empty()) {
+                wqn::DurableProblemObservation parsed;
+                const auto decoded = line.size() <= kMaxLineBytes
+                    ? DecodeObservationLine(line, &parsed) : ObservationDecode::kMalformed;
+                if (decoded == ObservationDecode::kUnavailable) {
+                    std::fclose(file);
+                    lines->clear();
+                    return ESP_ERR_NO_MEM;
+                }
+                if (decoded == ObservationDecode::kValid) lines->push_back(line);
+                else repair = true;
+            }
+            line.clear();
+            discard_line = false;
+            if (lines->size() > wqn::kProblemObservationOutboxCapacity + 8) {
+                std::fclose(file);
+                return ESP_ERR_INVALID_SIZE;
+            }
         }
     }
+    repair = repair || discard_line || !line.empty();
     const bool read_ok = std::ferror(file) == 0;
     const bool closed = std::fclose(file) == 0;
-    if (read_ok && closed && physically_empty != nullptr) *physically_empty = !saw_bytes;
-    return read_ok && closed ? ESP_OK : ESP_FAIL;
+    if (!read_ok || !closed) return ESP_FAIL;
+    if (physically_empty != nullptr) *physically_empty = !saw_bytes;
+    if (needs_repair != nullptr) *needs_repair = repair;
+    return ESP_OK;
 }
 
 esp_err_t WriteOutboxLines(const std::vector<std::string>& lines)
 {
     g_empty_problem_outbox_known = false;
-    if (lines.empty()) {
-        if (std::remove(kOutboxPath) != 0 && errno != ENOENT) {
-            return ESP_FAIL;
-        }
-        return ESP_OK;
-    }
+    const esp_err_t recovery = RecoverOutboxPublication();
+    if (recovery != ESP_OK) return recovery;
+    // An empty file is a committed empty generation. Removing it would allow
+    // an interrupted cleanup's backup to resurrect already-acknowledged data.
     FILE* file = std::fopen(kOutboxTempPath, "wb");
-    if (file == nullptr) {
-        return ESP_FAIL;
-    }
+    if (file == nullptr) return ESP_FAIL;
     bool ok = true;
     for (const std::string& line : lines) {
         ok = ok && std::fwrite(line.data(), 1, line.size(), file) == line.size() &&
@@ -216,13 +403,29 @@ esp_err_t WriteOutboxLines(const std::vector<std::string>& lines)
         std::remove(kOutboxTempPath);
         return ESP_FAIL;
     }
-    if (std::remove(kOutboxPath) != 0 && errno != ENOENT) {
+    struct stat info = {};
+    const bool had_primary = ::stat(kOutboxPath, &info) == 0;
+    if (!had_primary && errno != ENOENT) {
         std::remove(kOutboxTempPath);
         return ESP_FAIL;
     }
+    if (had_primary) {
+        if (std::remove(kOutboxBackupPath) != 0 && errno != ENOENT) {
+            std::remove(kOutboxTempPath);
+            return ESP_FAIL;
+        }
+        if (std::rename(kOutboxPath, kOutboxBackupPath) != 0) {
+            std::remove(kOutboxTempPath);
+            return ESP_FAIL;
+        }
+    }
     if (std::rename(kOutboxTempPath, kOutboxPath) != 0) {
+        if (had_primary) std::rename(kOutboxBackupPath, kOutboxPath);
         std::remove(kOutboxTempPath);
         return ESP_FAIL;
+    }
+    if (std::remove(kOutboxBackupPath) != 0 && errno != ENOENT) {
+        ESP_LOGW(kTag, "problem outbox published; backup cleanup deferred");
     }
     return ESP_OK;
 }
@@ -367,20 +570,32 @@ esp_err_t CommitTransaction(void* opaque)
     // hide that storage error behind the older successful empty probe.
     g_empty_problem_outbox_known = false;
     std::vector<std::string> lines;
-    esp_err_t result = ReadOutboxLines(&lines);
+    bool needs_repair = false;
+    esp_err_t result = ReadOutboxLines(&lines, nullptr, &needs_repair);
     if (result != ESP_OK) return result;
     for (const std::string& line : lines) {
-        // Idempotent by request_id: a retried commit is already durable.
-        if (line.find(context->observation->request_id) != std::string::npos) {
-            return ESP_OK;
+        wqn::DurableProblemObservation parsed;
+        const auto decoded = DecodeObservationLine(line, &parsed);
+        if (decoded == ObservationDecode::kUnavailable) return ESP_ERR_NO_MEM;
+        if (decoded == ObservationDecode::kValid &&
+            parsed.request_id == context->observation->request_id) {
+            return parsed.problem_id == context->observation->problem_id &&
+                parsed.action == context->observation->action &&
+                parsed.occurred_at == context->observation->occurred_at
+                ? ESP_OK : ESP_ERR_INVALID_STATE;
         }
     }
     if (lines.size() >= wqn::kProblemObservationOutboxCapacity) {
         return ESP_ERR_NO_MEM;
     }
     const std::string encoded = EncodeObservationLine(*context->observation);
-    if (encoded.empty() || encoded.size() > kMaxLineBytes) {
+    if (encoded.empty()) return ESP_ERR_NO_MEM;
+    if (encoded.size() > kMaxLineBytes) {
         return ESP_ERR_INVALID_SIZE;
+    }
+    if (needs_repair) {
+        result = WriteOutboxLines(lines);
+        if (result != ESP_OK) return result;
     }
     FILE* file = std::fopen(kOutboxPath, "ab");
     if (file == nullptr) {
@@ -404,7 +619,9 @@ esp_err_t PeekTransaction(void* opaque)
     const esp_err_t result = ReadOutboxForQuery(&lines, &parked);
     if (result != ESP_OK) return result;
     for (const std::string& line : lines) {
-        if (!DecodeObservationLine(line, observation)) {
+        const auto decoded = DecodeObservationLine(line, observation);
+        if (decoded == ObservationDecode::kUnavailable) return ESP_ERR_NO_MEM;
+        if (decoded != ObservationDecode::kValid) {
             ESP_LOGW(kTag, "skipping malformed problem outbox head");
             continue;
         }
@@ -436,7 +653,9 @@ esp_err_t RemoveTransaction(void* opaque)
     std::string removed;
     for (const std::string& line : lines) {
         wqn::DurableProblemObservation parsed;
-        if (!DecodeObservationLine(line, &parsed)) {
+        const auto decoded = DecodeObservationLine(line, &parsed);
+        if (decoded == ObservationDecode::kUnavailable) return ESP_ERR_NO_MEM;
+        if (decoded != ObservationDecode::kValid) {
             // Malformed lines are dropped as part of any rewrite.
             continue;
         }
@@ -482,7 +701,9 @@ esp_err_t SnapshotTransaction(void* opaque)
     size_t suspended = 0;
     for (const std::string& line : lines) {
         wqn::DurableProblemObservation parsed;
-        if (!DecodeObservationLine(line, &parsed)) continue;
+        const auto decoded = DecodeObservationLine(line, &parsed);
+        if (decoded == ObservationDecode::kUnavailable) return ESP_ERR_NO_MEM;
+        if (decoded != ObservationDecode::kValid) continue;
         const bool is_parked =
             std::find(parked.begin(), parked.end(), parsed.request_id) !=
             parked.end();
@@ -525,7 +746,9 @@ esp_err_t SuspendTransaction(void* opaque)
     bool exists = false;
     for (const std::string& line : lines) {
         wqn::DurableProblemObservation parsed;
-        if (DecodeObservationLine(line, &parsed) &&
+        const auto decoded = DecodeObservationLine(line, &parsed);
+        if (decoded == ObservationDecode::kUnavailable) return ESP_ERR_NO_MEM;
+        if (decoded == ObservationDecode::kValid &&
             parsed.request_id == *context->request_id) {
             exists = true;
             break;

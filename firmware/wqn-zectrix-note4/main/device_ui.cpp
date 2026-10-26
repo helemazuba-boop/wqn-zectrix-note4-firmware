@@ -54,22 +54,23 @@ namespace {
 // on safely after the UI task was blocked and the ring replayed a backlog.
 // Navigation events (nav/short/double) replay fine -- the user still wants
 // them. But a completed PTT gesture (a Confirm hold: kHoldPress .. kRelease)
-// must NOT fire audio side effects seconds after the user let go, so a stale
-// Confirm press/hold/release is dropped wholesale. kLongPress repeats are
-// already coalesced in the ring; a straggler older than the repeat cadence is
-// also dropped so menus do not lurch on unblock.
+// must NOT start capture seconds after the user let go, so stale Confirm
+// press/hold events are dropped. Release always reaches the reducer: a hold
+// may already have started capture before the UI stalled, and navigation also
+// needs it to clear held/blocked state. PTT consumers only stop a started hold.
+// Held-key repeats are coalesced in the ring; a straggler older than the
+// repeat cadence is also dropped so menus do not lurch on unblock.
 bool ShouldDropStaleButtonEvent(const wqn::ButtonEvent& event, int64_t now_ms)
 {
     const int64_t age_ms = now_ms - event.occurred_at_ms;
     if (age_ms <= 0) {
         return false;
     }
-    // Confirm is the PTT key; its raw press/hold/release drive audio capture.
-    // Drop the whole gesture if it aged past the capture-relevant window.
+    // Reject stale capture starts; preserve releases for already-active PTT
+    // and navigation cleanup, even when the UI has been blocked for seconds.
     if (event.button == wqn::ButtonId::kConfirm &&
         (event.type == wqn::ButtonEventType::kPress ||
-         event.type == wqn::ButtonEventType::kHoldPress ||
-         event.type == wqn::ButtonEventType::kRelease)) {
+         event.type == wqn::ButtonEventType::kHoldPress)) {
         constexpr int64_t kStalePttMs = 2000;
         return age_ms > kStalePttMs;
     }

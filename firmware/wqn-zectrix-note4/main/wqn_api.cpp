@@ -31,6 +31,7 @@
 #include "mbedtls/sha256.h"
 #include "miniz.h"
 #include "services/connectivity_service.h"
+#include "runtime/wall_clock.h"
 #include "storage.h"
 
 namespace {
@@ -317,6 +318,11 @@ esp_err_t EnsureClockSyncedForHttps()
 
     ESP_LOGI(kTag, "starting SNTP sync before HTTPS requests");
     esp_sntp_config_t config = ESP_NETIF_SNTP_DEFAULT_CONFIG("ntp.aliyun.com");
+    config.sync_cb = [](struct timeval* synchronized) {
+        if (synchronized != nullptr) {
+            wqn::runtime::NoteSntpTimeSynchronized(synchronized->tv_sec, std::time(nullptr));
+        }
+    };
     esp_err_t result = esp_netif_sntp_init(&config);
     if (result != ESP_OK && result != ESP_ERR_INVALID_STATE) {
         return result;

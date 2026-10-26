@@ -540,7 +540,7 @@ static RefreshSchedule ReduceSettingsButtonEvent(const wqn::ButtonEvent& event, 
         return RefreshSchedule::kNone;
     }
 
-    // [dev-diag] Second-level dev list (DEV_DIAGNOSTICS.md §3). Reached only
+    // [dev-diag] Second-level dev list (docs/development/DEV_DIAGNOSTICS.md §3). Reached only
     // from the root row kSettingsRowDevMenu; long-Confirm returns to the root
     // list instead of Home, and every Confirm opens a read-only dialog. Placed
     // after all dialog blocks so an open dev dialog keeps its own handling.

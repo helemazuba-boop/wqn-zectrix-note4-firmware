@@ -325,7 +325,7 @@ void PersistWorkerTask(void*)
         command.result = ExecutePersistCommand(command);
         if (command.result != ESP_OK) {
             // [dev-diag] One hook covers every domain's durable-write failure
-            // (DEV_DIAGNOSTICS.md §5); the ring keeps the kind + esp_err that
+            // (docs/development/DEV_DIAGNOSTICS.md §5); the ring keeps the kind + esp_err that
             // the transient notice drops.
             wqn::RecordError(
                 "persist", "kind=%u %s", static_cast<unsigned>(command.kind),

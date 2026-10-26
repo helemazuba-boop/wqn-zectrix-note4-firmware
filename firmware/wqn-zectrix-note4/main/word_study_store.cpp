@@ -25,6 +25,7 @@ constexpr char kTag[] = "word_store";
 constexpr char kOutboxPath[] = "/storage/wout.v1";
 constexpr char kOutboxTempPath[] = "/storage/wout.tmp";
 constexpr char kOutboxBackupPath[] = "/storage/wout.bak";
+constexpr char kOutboxRecoveryPath[] = "/storage/wout.rec";
 constexpr char kRejectedOutboxPath[] = "/storage/wrej.v1";
 constexpr char kRejectedOutboxTempPath[] = "/storage/wrej.tmp";
 constexpr char kRejectedOutboxBackupPath[] = "/storage/wrej.bak";
@@ -939,6 +940,18 @@ esp_err_t ScanOutbox(OutboxScan* scan)
     if (scan == nullptr) return ESP_ERR_INVALID_ARG;
     esp_err_t primary_result = ScanOutboxFile(kOutboxPath, scan);
     if (primary_result == ESP_OK) return ESP_OK;
+    if (primary_result == ESP_FAIL) return primary_result;
+    // A protected publication may have moved the latest primary aside while
+    // retaining the older, downgrade-readable backup. Prefer that latest copy.
+    OutboxScan recovery;
+    const esp_err_t recovery_result = ScanOutboxFile(kOutboxRecoveryPath, &recovery);
+    if (recovery_result == ESP_OK) {
+        recovery.backup_source = true;
+        *scan = std::move(recovery);
+        ESP_LOGW(kTag, "recovered word outbox from interrupted publication");
+        return ESP_OK;
+    }
+    if (recovery_result == ESP_FAIL) return recovery_result;
     if (!FileExists(kOutboxBackupPath)) {
         if (primary_result == ESP_ERR_NOT_FOUND) {
             *scan = {};
@@ -1156,7 +1169,8 @@ esp_err_t AppendOutboxRecord(
 
 esp_err_t CompactOutbox(
     const std::vector<OutboxRecord, wqn::WordStorePsramAllocator<OutboxRecord>>& pending,
-    bool preserve_backup = false)
+    bool preserve_backup = false,
+    bool primary_authoritative = true)
 {
     if (pending.size() > kOutboxMaxRecords) return ESP_ERR_INVALID_SIZE;
     FILE* file = std::fopen(kOutboxTempPath, "wb");
@@ -1175,16 +1189,30 @@ esp_err_t CompactOutbox(
         return ESP_FAIL;
     }
     const bool had_primary = FileExists(kOutboxPath);
+    if (primary_authoritative && had_primary &&
+        std::remove(kOutboxRecoveryPath) != 0 && errno != ENOENT) {
+        std::remove(kOutboxTempPath);
+        return ESP_FAIL;
+    }
     if (preserve_backup) {
-        // The scan came from the last known-good backup. Never replace that
-        // backup with the corrupt primary during recovery.
-        if (had_primary && std::remove(kOutboxPath) != 0 && errno != ENOENT) {
-            std::remove(kOutboxTempPath);
-            return ESP_FAIL;
+        if (had_primary) {
+            // A normal primary can be newer than the preserved backup. Keep
+            // it recoverable until publication succeeds. A recovery-sourced
+            // scan instead keeps its .rec/.bak and discards only the bad primary.
+            const int result = primary_authoritative
+                ? std::rename(kOutboxPath, kOutboxRecoveryPath)
+                : std::remove(kOutboxPath);
+            if (result != 0) {
+                std::remove(kOutboxTempPath);
+                return ESP_FAIL;
+            }
         }
         if (std::rename(kOutboxTempPath, kOutboxPath) != 0) {
             std::remove(kOutboxTempPath);
             return ESP_FAIL;
+        }
+        if (std::remove(kOutboxRecoveryPath) != 0 && errno != ENOENT) {
+            ESP_LOGW(kTag, "word outbox published; recovery copy cleanup deferred");
         }
         return ESP_OK;
     }
@@ -1234,7 +1262,7 @@ esp_err_t CompactCachedOutbox(OutboxScan* scan)
         rewrite.push_back(marker);
     }
     const esp_err_t compacted = CompactOutbox(
-        rewrite, scan->backup_source || !scan->suspended.empty());
+        rewrite, scan->backup_source || !scan->suspended.empty(), !scan->backup_source);
     if (compacted != ESP_OK) {
         g_outbox_cache_loaded = false;
         return compacted;

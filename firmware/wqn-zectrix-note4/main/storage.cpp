@@ -29,6 +29,7 @@
 #include "services/sync_service.h"
 #include "runtime/sleep_coordinator.h"
 #include "runtime/storage_schema.h"
+#include "runtime/storage_temp_file_lease.h"
 #include "services/storage_service.h"
 #include "sdkconfig.h"
 #include "word_study_store.h"
@@ -110,10 +111,12 @@ esp_err_t EnsurePackDownloadCapacityTransaction(void* opaque)
         return ESP_OK;
     }
 
-    // [storage-capacity-fix] StorageService serialization means no writer is
-    // inside a transaction while this runs. Remove interrupted transaction
-    // files first; final pack/manifests and their backups remain untouched.
-    DIR* directory = opendir(kStorageBasePath);
+    // [storage-capacity-fix] Serialization covers individual transactions,
+    // but pack streams hold FILEs across them. Wall-clock age does not prove
+    // abandonment (SNTP can jump forward). Skip generic temp reclamation while
+    // a stream lease is active; image eviction and bounded GC remain available.
+    DIR* directory = wqn::runtime::HasActiveStorageTempFileLease()
+        ? nullptr : opendir(kStorageBasePath);
     if (directory != nullptr) {
         const time_t now = std::time(nullptr);
         while (dirent* entry = readdir(directory)) {
@@ -126,9 +129,8 @@ esp_err_t EnsurePackDownloadCapacityTransaction(void* opaque)
             if (stat(path.c_str(), &info) != 0 || info.st_mtime <= 0 ||
                 now <= info.st_mtime ||
                 now - info.st_mtime < kStaleTempAgeSeconds) {
-                // Pack streams intentionally keep their temp file open across
-                // chunk transactions. Age-gating prevents a capacity check in
-                // another lane from unlinking an active download.
+                // With no live stream lease, still retain fresh, unclocked or
+                // future-dated remnants instead of guessing their age.
                 continue;
             }
             if (unlink(path.c_str()) == 0) {
@@ -1001,11 +1003,23 @@ bool ReadStorageCapacitySnapshot(StorageCapacitySnapshot* snapshot)
     }
     *snapshot = {};
 
-    snapshot->spiffs_valid =
-        esp_spiffs_info(
-            kStoragePartitionLabel,
-            &snapshot->spiffs_total_bytes,
-            &snapshot->spiffs_used_bytes) == ESP_OK;
+    const int64_t query_start_us = esp_timer_get_time();
+    const esp_err_t spiffs_result = esp_spiffs_info(
+        kStoragePartitionLabel,
+        &snapshot->spiffs_total_bytes,
+        &snapshot->spiffs_used_bytes);
+    const int64_t query_end_us = esp_timer_get_time();
+    snapshot->spiffs_valid = spiffs_result == ESP_OK;
+    // Reuse the existing settings query, never walk SPIFFS after every write.
+    // This is one observation over this interval, not the occupancy of all
+    // later transactions. Failed observations must remain visible as gaps.
+    ESP_LOGI(kTag,
+        "STORAGE:capacity query_start_us=%lld query_end_us=%lld total_bytes=%u used_bytes=%u result=%s",
+        static_cast<long long>(query_start_us),
+        static_cast<long long>(query_end_us),
+        static_cast<unsigned>(snapshot->spiffs_total_bytes),
+        static_cast<unsigned>(snapshot->spiffs_used_bytes),
+        esp_err_to_name(spiffs_result));
 
     nvs_stats_t stats = {};
     snapshot->nvs_valid = nvs_get_stats(nullptr, &stats) == ESP_OK;
@@ -1887,11 +1901,11 @@ esp_err_t SaveVolumeTransaction(void* opaque)
 
 esp_err_t FactoryResetTransaction(void*)
 {
-    ESP_LOGW(kTag, "factory reset requested: invalidating schema marker and restarting");
+    ESP_LOGW(kTag, "factory reset requested: recording reset intent and restarting");
     ESP_RETURN_ON_ERROR(
         wqn::runtime::InvalidateStorageSchemaForFactoryReset(),
         kTag,
-        "invalidate storage schema marker");
+        "record storage reset intent");
     esp_restart();
     return ESP_OK;
 }

@@ -29,21 +29,31 @@ bool UnixSecondsFromCalendar(const RtcCalendar& calendar, int64_t* seconds_out);
 // Sleep-side hook: writes the current system wall clock into the PCF8563 and
 // stamps an internal cross-deep-sleep trust record. Designed to be called by
 // PowerCoordinator after every service has quiesced and before wake-source
-// assembly; failure is logged and never blocks the sleep transaction.
+// assembly. Every attempt revokes old trust before validation/I/O; only a
+// verified write publishes trust for this generation. Failure never prevents
+// the sleep transaction from proceeding.
 bool PersistSystemTimeToRtc(uint32_t sleep_generation);
+// Shares the prepare transaction's absolute esp_timer deadline with every
+// write/verify step. Revokes old trust even if already expired. Mandatory
+// STOP cleanup may outlive this work budget; failure remains nonfatal to sleep.
+bool PersistSystemTimeToRtc(uint32_t sleep_generation, int64_t deadline_us);
 
 // Boot-side hook: on a trusted deep-sleep resume (ext1/timer resume reason,
-// deep-sleep reset reason, valid trust record, PCF8563 VL clear), reads the
+// deep-sleep reset reason, valid trust record matching the committed sleep
+// snapshot generation, PCF8563 VL clear), reads the
 // RTC clock back and applies it via settimeofday() so downstream consumers
-// (UI seeding, sync deadlines, outbox stamps, HTTPS clock gating) start from
-// real wall-clock time instead of the build-time seed. Returns true only when
-// the system clock was actually calibrated.
+// (UI seeding, sync deadlines, outbox stamps, HTTPS clock gating) resume from
+// the clock written before sleep. The record also carries the observed SNTP
+// provenance and clock epoch; RTC restore is not a new network calibration.
+// A reasonable build-time seed remains approximate across repeated sleeps.
+// Returns true only when the system clock was actually applied.
 bool RestoreSystemTimeFromRtc();
 
 // Establishes the process timezone and, only when neither the platform nor
-// RestoreSystemTimeFromRtc supplied a reasonable wall clock, seeds a lower
-// bound from the firmware build timestamp. Call before any scheduler performs
-// wall-clock admission; later HTTPS/SNTP calibration may refine it.
+// RestoreSystemTimeFromRtc supplied a reasonable wall clock, seeds a
+// fallback from the firmware build timestamp. This is approximate, not proof
+// of network calibration. Call before any scheduler performs wall-clock
+// admission; later SNTP calibration may refine it.
 bool SeedSystemTimeFromBuildTimeIfNeeded();
 
 }  // namespace wqn::power::timekeep

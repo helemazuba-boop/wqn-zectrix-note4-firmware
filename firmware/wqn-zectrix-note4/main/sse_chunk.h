@@ -69,6 +69,10 @@ public:
 
   void clear();
 
+  // Only at a new request/session boundary, after the failed stream is closed.
+  // Ordinary frame cleanup must retain the sticky failure below.
+  void reset() { clear(); overflowed_ = false; }
+
   // True once a frame was dropped for exceeding kMaxSseFrameBytes. Sticky: it
   // survives clear() on purpose, because the caller's recovery is to fail the
   // request -- the dropped frame's remainder is gone, so anything parsed after

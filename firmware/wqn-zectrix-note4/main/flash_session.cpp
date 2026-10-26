@@ -15,6 +15,7 @@
 #include "ai_history.h"
 #include "cJSON.h"
 #include "config.h"
+#include "voice_endpoint.h"
 #include "device_protocol/json_depth_guard.h"
 #include "esp_check.h"
 #include "esp_crt_bundle.h"
@@ -947,7 +948,7 @@ void FlashPlaybackTask(void* /*param*/)
             last_werr = wqn::services::WriteAudioChannel(
                 g_flash_audio_session, g_flash.stream_tx,
                 reinterpret_cast<const uint8_t*>(stereo.data()) + total,
-                total_bytes - total, &written, pdMS_TO_TICKS(250));
+                total_bytes - total, &written, 250);
             if (last_werr != ESP_OK || written == 0) {
                 break;  // channel disabled/closed on stop - drop the rest
             }
@@ -1087,7 +1088,7 @@ esp_err_t WarmupStreamAdc()
         const esp_err_t read_result = wqn::services::ReadAudioChannel(
             g_flash_audio_session, g_flash.stream_rx,
             buffer, sizeof(buffer), &bytes_read,
-            pdMS_TO_TICKS(200));
+            200);
         if (read_result != ESP_OK) {
             ESP_LOGE(kTag,
                      "Flash ADC warmup read failed: result=%s (%d) rx=%p discarded_frames=%u",
@@ -1284,7 +1285,7 @@ void AudioStreamingTask(void* param)
         size_t warmup_bytes = 0;
         wqn::services::ReadAudioChannel(
             g_flash_audio_session, g_flash.stream_rx, i2s_buf,
-            sizeof(i2s_buf), &warmup_bytes, pdMS_TO_TICKS(100));
+            sizeof(i2s_buf), &warmup_bytes, 100);
     }
 
     const int64_t capture_started_us = esp_timer_get_time();
@@ -1303,13 +1304,14 @@ void AudioStreamingTask(void* param)
         size_t bytes_read = 0;
         // [timeout-fix] 200ms (was 20ms). i2s_channel_read returns immediately
         // when DMA data is ready, so a larger timeout adds zero normal-case
-        // latency - it only bounds the worst case. 20ms was too tight: 960 bytes
+        // latency when data is ready. 20ms was too tight: 960 bytes
         // @ 64 B/ms needs 15ms to fill, and EPD/WS preemption of this priority-10
         // task left no margin -> ~98% false timeouts + fragmented audio. 200ms
-        // covers fill time + scheduling jitter; stop latency stays <200ms.
+        // covers fill time + scheduling jitter. This is the driver's per-wait
+        // budget; a read can contain several waits before stop is observed.
         esp_err_t read_err = wqn::services::ReadAudioChannel(
             g_flash_audio_session, g_flash.stream_rx, i2s_buf,
-            sizeof(i2s_buf), &bytes_read, pdMS_TO_TICKS(200));
+            sizeof(i2s_buf), &bytes_read, 200);
         if (read_err != ESP_OK || bytes_read == 0) {
             xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
             SetFlashCaptureIndicatorLocked(false);
@@ -2388,12 +2390,11 @@ esp_err_t StartFlashSessionNow(uint32_t generation)
 
     esp_websocket_client_config_t cfg = {};
 #if CONFIG_WQN_FLASH_PROTOCOL_V2
-    // [port-fix] ESP-IDF's host+path mode sometimes ignores cfg.port and
-    // defaults to 80, causing "connecting to host ...:80" + HTTP 301
-    // redirect instead of a WS upgrade on 443. Use the full URI form
-    // (wss://host/path) which makes esp_websocket_client respect 443
-    // implicitly from the "wss://" scheme.
-    cfg.uri = "wss://" WQN_API_BASE_HOST WQN_FLASH_WS_PATH;
+    const std::string ws_url = wqn::BuildVoiceWebSocketUrl();
+    if (ws_url.empty()) {
+        return fail_after_audio_begin("语音服务地址配置无效", ESP_ERR_INVALID_ARG);
+    }
+    cfg.uri = ws_url.c_str();
     cfg.subprotocol = kWsSubprotocol;
 #else
     cfg.uri = kWsUri;
@@ -2431,10 +2432,6 @@ esp_err_t StartFlashSessionNow(uint32_t generation)
     esp_websocket_client_append_header(g_flash.ws_client, "X-WQN-Client-Version",
                                        WQN_FIRMWARE_NAME "@" WQN_FIRMWARE_VERSION);
     esp_websocket_client_append_header(g_flash.ws_client, "X-WQN-Protocol", WQN_FLASH_WS_SUBPROTOCOL);
-#else
-    // Legacy v1 StepFun-shaped deployment still gates the WS upgrade behind a
-    // shared secret (nginx `if ($http_x_ws_secret != ...) return 401;`).
-    esp_websocket_client_append_header(g_flash.ws_client, "X-WS-Secret", "WQN_Flash_Secret_2026");
 #endif
 
     esp_err_t reg_err = esp_websocket_register_events(

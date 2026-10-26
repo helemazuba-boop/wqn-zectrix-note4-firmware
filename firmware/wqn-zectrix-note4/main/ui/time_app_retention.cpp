@@ -8,12 +8,14 @@
 #include <ctime>
 
 #include "esp_attr.h"
+#include "esp_timer.h"
+#include "runtime/wall_clock.h"
 
 namespace device_ui_internal {
 namespace {
 
 constexpr uint32_t kRetainedTimeAppMagic = 0x57514E54;  // WQNT
-constexpr uint32_t kRetainedTimeAppVersion = 3;
+constexpr uint32_t kRetainedTimeAppVersion = 4;
 
 struct RetainedTimeAppState {
     uint32_t magic;
@@ -32,6 +34,8 @@ struct RetainedTimeAppState {
     int32_t pomodoro_long_break_minutes;
     int32_t pomodoro_current_round;
     int32_t remaining_seconds;
+    uint32_t clock_epoch;
+    int64_t retained_at_unix_seconds;
     int64_t session_started_unix_seconds;
     int64_t phase_started_unix_seconds;
     int64_t phase_ends_unix_seconds;
@@ -104,6 +108,20 @@ void RetainTimeAppState(const wqn::TimeAppState& state)
     retained.pomodoro_long_break_minutes = state.pomodoro_long_break_minutes;
     retained.pomodoro_current_round = state.pomodoro_current_round;
     retained.remaining_seconds = state.remaining_seconds;
+    const auto clock = wqn::runtime::GetWallClockSnapshot();
+    int64_t budget_at = static_cast<int64_t>(std::time(nullptr));
+    // A button can retain state between timer ticks. Anchor the saved budget
+    // to its last monotonic deduction, including any pending awake seconds.
+    const int64_t monotonic_ms = esp_timer_get_time() / 1000;
+    if (state.status == wqn::TimerStatus::kRunning && state.last_tick_ms > 0 &&
+        monotonic_ms >= state.last_tick_ms) {
+        budget_at -= (monotonic_ms - state.last_tick_ms) / 1000;
+    }
+    retained.clock_epoch = clock.epoch;
+    if (budget_at >= kMinReasonableUnixTime &&
+        wqn::runtime::GetWallClockSnapshot().epoch == clock.epoch) {
+        retained.retained_at_unix_seconds = budget_at;
+    }
     retained.session_started_unix_seconds = state.session_started_unix_seconds;
     retained.phase_started_unix_seconds = state.phase_started_unix_seconds;
     retained.phase_ends_unix_seconds = state.phase_ends_unix_seconds;
@@ -143,9 +161,13 @@ bool RestoreRetainedTimeApp(wqn::TimeAppState* state)
     wqn::DisarmTimeAppAction(&restored);
 
     const int64_t now = static_cast<int64_t>(std::time(nullptr));
+    const auto clock = wqn::runtime::GetWallClockSnapshot();
     if (restored.status == wqn::TimerStatus::kRunning &&
-        now >= kMinReasonableUnixTime && restored.phase_ends_unix_seconds > 0) {
-        const int64_t remaining = restored.phase_ends_unix_seconds - now;
+        clock.rtc_continuity && clock.epoch == retained.clock_epoch &&
+        now >= kMinReasonableUnixTime &&
+        retained.retained_at_unix_seconds >= kMinReasonableUnixTime) {
+        const int64_t elapsed = std::max<int64_t>(0, now - retained.retained_at_unix_seconds);
+        const int64_t remaining = retained.remaining_seconds - elapsed;
         if (remaining <= 0) {
             restored.remaining_seconds = 0;
             restored.status = wqn::TimerStatus::kAlerting;
@@ -153,10 +175,12 @@ bool RestoreRetainedTimeApp(wqn::TimeAppState* state)
                 ? wqn::TimeTile::kPomodoro
                 : wqn::TimeTile::kCountdown;
         } else {
-            restored.remaining_seconds =
-                static_cast<int>(std::min<int64_t>(remaining, 7200));
+            restored.remaining_seconds = static_cast<int>(remaining);
         }
     }
+    // With no verified continuity, keep the saved budget rather than spending
+    // a build/SNTP jump. Rebase immediately so the first frame has a valid end.
+    wqn::AlignTimeAppWallClock(&restored, now);
     *state = restored;
     RetainTimeAppState(*state);
     return true;

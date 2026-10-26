@@ -10,7 +10,8 @@ from test_sync_retry import section
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--mutation', choices=('late-journal-gate', 'ignore-sync-start-failure'))
+    parser.add_argument('--mutation', choices=('late-journal-gate', 'ignore-sync-start-failure',
+                                              'ignore-schema-recovery', 'ignore-schema-restart'))
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
     boot = (root / 'main/main.cpp').read_text()
@@ -23,6 +24,14 @@ def main():
     elif args.mutation == 'ignore-sync-start-failure':
         boot = boot.replace('ESP_ERROR_CHECK(wqn::services::StartSyncService());',
                             'ESP_ERROR_CHECK_WITHOUT_ABORT(wqn::services::StartSyncService());', 1)
+    elif args.mutation in ('ignore-schema-recovery', 'ignore-schema-restart'):
+        action = ('kRecoveryRequired' if args.mutation == 'ignore-schema-recovery'
+                  else 'kRestartRequired')
+        old = ('(storage_schema.action ==\n'
+               '        wqn::runtime::StorageSchemaBootAction::' + action + ')')
+        if boot.count(old) != 1:
+            raise ValueError('startup schema gate mutation boundary drift')
+        boot = boot.replace(old, '(false)', 1)
     sync = (root / 'main/services/sync_service.cpp').read_text()
     fixture = (root / 'scripts/testdata/sync_boot_recovery.cpp').read_text()
     parts = {
@@ -47,6 +56,7 @@ def main():
             subprocess.run([
                 compiler, '-std=c++17', '-Wall', '-Wextra', '-Werror',
                 '-fsanitize=undefined', '-fno-sanitize-recover=all',
+                '-I', str(root/'main'),
                 f'-DCONFIG_WQN_WIFI_STA_ENABLE={wifi}', f'-DCONFIG_WQN_AGENT_ENABLE={agent}',
                 '-x', 'c++', '-', '-o', str(binary)],
                 input=fixture, text=True, check=True, timeout=30)

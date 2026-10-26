@@ -10,6 +10,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "runtime/sleep_coordinator.h"
+#include "runtime/fault_diagnostics.h"
 
 namespace {
 
@@ -153,6 +154,12 @@ void StorageServiceTask(void*)
         }
         const int64_t completed_us = esp_timer_get_time();
         const int64_t elapsed_ms = (completed_us - started_us) / 1000;
+        // Empty queries use NOT_FOUND as an ordinary result. Domain callers
+        // can explicitly report it when absence violates their own contract.
+        if (result != ESP_OK && result != ESP_ERR_NOT_FOUND) {
+            wqn::runtime::RecordFault(wqn::runtime::FaultDomain::kStorage,
+                wqn::runtime::FaultPhase::kStorageExecution, result, command.request_id);
+        }
         // ESP-IDF reports this high-water mark in bytes, unlike upstream
         // FreeRTOS which documents stack words.
         const UBaseType_t free_stack_bytes = uxTaskGetStackHighWaterMark(nullptr);
@@ -188,6 +195,43 @@ void StorageServiceTask(void*)
     }
 }
 
+esp_err_t ExecuteBackgroundStorageTransaction(
+    wqn::services::StorageTransaction transaction,
+    void* context,
+    const char* owner)
+{
+    // Background calls never abandon queued work. Keep their completion on
+    // the caller's stack so memory pressure cannot reject an Abort merely
+    // because its completion block needs another heap allocation.
+    StorageCompletion completion;
+    completion.semaphore = xSemaphoreCreateBinaryStatic(
+        &completion.semaphore_storage);
+    if (completion.semaphore == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
+    completion.request_id = NextRequestId();
+
+    StorageCommand command;
+    command.transaction = transaction;
+    command.context = context;
+    command.request_id = completion.request_id;
+    command.owner = owner;
+    command.completion = &completion;
+    command.queued_at_us = esp_timer_get_time();
+    if (xQueueSend(g_background_queue, &command, portMAX_DELAY) != pdTRUE) {
+        wqn::runtime::RecordFault(wqn::runtime::FaultDomain::kStorage,
+            wqn::runtime::FaultPhase::kStorageQueueTimeout, ESP_ERR_TIMEOUT, command.request_id);
+        return ESP_ERR_TIMEOUT;
+    }
+    xTaskNotifyGive(g_task);
+    // The worker may still reference both stack objects. An unsuccessful
+    // wait must never let this caller return or mark them abandoned.
+    while (xSemaphoreTake(completion.semaphore, portMAX_DELAY) != pdTRUE) {
+        vTaskDelay(1);
+    }
+    return completion.result;
+}
+
 esp_err_t ExecuteStorageTransactionInternal(
     wqn::services::StorageTransaction transaction,
     void* context,
@@ -203,6 +247,9 @@ esp_err_t ExecuteStorageTransactionInternal(
     if (g_background_queue == nullptr || g_foreground_queue == nullptr ||
         g_task == nullptr) {
         return ESP_ERR_INVALID_STATE;
+    }
+    if (!foreground) {
+        return ExecuteBackgroundStorageTransaction(transaction, context, owner);
     }
 
     // Heap-allocated so a timed-out foreground caller can abandon the block
@@ -233,6 +280,8 @@ esp_err_t ExecuteStorageTransactionInternal(
     QueueHandle_t queue = foreground ? g_foreground_queue : g_background_queue;
     if (xQueueSend(queue, &command, wait_ticks) != pdTRUE) {
         delete completion;  // Never enqueued: this caller is the sole owner.
+        wqn::runtime::RecordFault(wqn::runtime::FaultDomain::kStorage,
+            wqn::runtime::FaultPhase::kStorageQueueTimeout, ESP_ERR_TIMEOUT, command.request_id);
         return ESP_ERR_TIMEOUT;
     }
     xTaskNotifyGive(g_task);
@@ -253,6 +302,8 @@ esp_err_t ExecuteStorageTransactionInternal(
             "storage transaction timed out in queue: request=%lu owner=%s",
             static_cast<unsigned long>(command.request_id),
             owner == nullptr ? "unknown" : owner);
+        wqn::runtime::RecordFault(wqn::runtime::FaultDomain::kStorage,
+            wqn::runtime::FaultPhase::kStorageQueueTimeout, ESP_ERR_TIMEOUT, command.request_id);
         return ESP_ERR_TIMEOUT;
     }
     // The service already started this transaction; `context` (usually the

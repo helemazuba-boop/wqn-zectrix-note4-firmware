@@ -18,6 +18,7 @@
 #include "freertos/task.h"
 #include "font_fmt.h"
 #include "runtime/wake_context.h"
+#include "runtime/task_delay.h"
 #include "sdkconfig.h"
 
 #ifndef CONFIG_WQN_EPD_IDLE_POWER_OFF_MS
@@ -414,7 +415,8 @@ esp_err_t WaitBusyTimeout(int timeout_ms)
             return ESP_ERR_TIMEOUT;
         }
         FeedTwdtIfSubscribed();
-        vTaskDelay(pdMS_TO_TICKS(1));
+        // One blocking tick lets lower-priority tasks run during BUSY polls.
+        vTaskDelay(1);
     }
     ESP_LOGD(kTag, "[BUSY-PROBE] OK to=%dms entry=%d exit=%d trans=%s first_trans_lvl=%d trans_at=%dms elapsed=%dms",
              timeout_ms, entry_level, static_cast<int>(gpio_get_level(kEpdBusy)),
@@ -909,11 +911,11 @@ esp_err_t WaitPanelStatusReady(int max_retries, int busy_timeout_ms)
         ESP_RETURN_ON_ERROR(SendCommand(0xA5), kTag, "EPD status probe cmd");
         const esp_err_t busy_ret = WaitBusyTimeout(busy_timeout_ms);
         if (busy_ret == ESP_OK) {
-            vTaskDelay(pdMS_TO_TICKS(1));
+            runtime::DelayAtLeastMs<1>();
             return ESP_OK;
         }
         ESP_LOGW(kTag, "EPD panel status probe retry %d/%d", i + 1, max_retries);
-        vTaskDelay(pdMS_TO_TICKS(1));
+        runtime::DelayAtLeastMs<1>();
     }
     ESP_LOGW(kTag, "EPD panel status not ready after %d retries", max_retries);
     return ESP_ERR_TIMEOUT;

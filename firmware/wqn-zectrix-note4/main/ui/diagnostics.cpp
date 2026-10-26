@@ -91,7 +91,7 @@ std::string UptimeLabel()
     return std::to_string(minutes / 60) + "h" + std::to_string(minutes % 60) + "m";
 }
 
-// [dev-diag] Sync content/outbox phase labels (DEV_DIAGNOSTICS.md §4.2).
+// [dev-diag] Sync content/outbox phase labels (docs/development/DEV_DIAGNOSTICS.md §4.2).
 std::string SyncContentPhaseLabel(wqn::services::SyncContentPhase phase)
 {
     switch (phase) {
@@ -143,7 +143,7 @@ std::string SyncDomainLine(
     return line;
 }
 
-// [dev-diag] Sleep/power diagnostic event labels (DEV_DIAGNOSTICS.md §4.6).
+// [dev-diag] Sleep/power diagnostic event labels (docs/development/DEV_DIAGNOSTICS.md §4.6).
 std::string SleepEventKindLabel(wqn::runtime::SleepDiagnosticEventKind kind)
 {
     switch (kind) {
@@ -300,7 +300,7 @@ void UpdateSettingsDiagnostics(wqn::UiState* state)
     snapshot.idf_target = CONFIG_IDF_TARGET;
     snapshot.idf_version = esp_get_idf_version();
 
-    // [dev-diag] Dev info dialog fields (DEV_DIAGNOSTICS.md §4.1). All cheap
+    // [dev-diag] Dev info dialog fields (docs/development/DEV_DIAGNOSTICS.md §4.1). All cheap
     // queries on the UI task; no locks beyond the spinlocks inside the heap
     // APIs. heap_min_free is the all-time watermark, i.e. the tightest the
     // internal heap has ever been since boot.
@@ -310,7 +310,7 @@ void UpdateSettingsDiagnostics(wqn::UiState* state)
     snapshot.uptime_label = UptimeLabel();
     snapshot.heap_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
     snapshot.heap_min_free = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL);
-    // [dev-diag] Error-log ring copy (DEV_DIAGNOSTICS.md §4.3/§5). The ring is
+    // [dev-diag] Error-log ring copy (docs/development/DEV_DIAGNOSTICS.md §4.3/§5). The ring is
     // snapshotted under its own spinlock via CopyRecentErrors, then formatted
     // here on the UI task; render draws the prepared lines verbatim.
     wqn::ErrorRecord records[wqn::kErrorRecordDepth] = {};
@@ -359,7 +359,7 @@ void UpdateSettingsDiagnostics(wqn::UiState* state)
         state->settings.sync_status = OnlineSyncStatusLabel(online.status);
     }
 
-    // [dev-diag] Sync diagnostics dialog lines (DEV_DIAGNOSTICS.md §4.2),
+    // [dev-diag] Sync diagnostics dialog lines (docs/development/DEV_DIAGNOSTICS.md §4.2),
     // formatted here so the render path stays dumb. `online` is the copy
     // GetSyncSnapshot already made under its spinlock — no shared state is
     // referenced past this point.
@@ -389,7 +389,7 @@ void UpdateSettingsDiagnostics(wqn::UiState* state)
         "题箱", SyncOutboxPhaseLabel(online.problem_outbox.phase),
         online.problem_outbox.retry_attempt, online.problem_outbox.last_error);
 
-    // [dev-diag] Sleep/power diagnostics (DEV_DIAGNOSTICS.md §4.6). The ring
+    // [dev-diag] Sleep/power diagnostics (docs/development/DEV_DIAGNOSTICS.md §4.6). The ring
     // lives in RTC slow memory and survives deep sleep, but it is only readable
     // through CopySleepDiagnosticEntries -- the log dump needs a console that
     // does not exist on battery. Refreshed with the rest of the snapshot (every

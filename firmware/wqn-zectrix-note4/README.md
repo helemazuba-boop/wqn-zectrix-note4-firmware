@@ -93,14 +93,19 @@ Development builds can override it:
 idf.py -B build-ai-local-s3 -DWQN_API_BASE=https://your-host.example.com/api/esp32 build
 ```
 
+## Documentation map
+
+See [DOCUMENTATION.md](DOCUMENTATION.md) for the purpose and status of every
+firmware document, including local-only investigation areas.
+
 ## Word reference baseline
 
-- [Product and runtime baseline](WORD_BASELINE.md)
-- [StudySession lifecycle](STUDY_SESSION_PROTOCOL.md)
-- [Deterministic Word Pack v2](WORD_PACK_V2.md)
-- [Durable offline outbox](WORD_OFFLINE_OUTBOX.md)
-- [Word cutover checklist](WORD_RELEASE_CHECKLIST.md)
-- [Reuse guide for problems and notes](STUDY_RUNTIME_REUSE.md)
+- [Product and runtime baseline](docs/product/word-study/WORD_BASELINE.md)
+- [StudySession lifecycle](docs/product/word-study/STUDY_SESSION_PROTOCOL.md)
+- [Deterministic Word Pack v2](docs/product/word-study/WORD_PACK_V2.md)
+- [Durable offline outbox](docs/product/word-study/WORD_OFFLINE_OUTBOX.md)
+- [Word cutover checklist](docs/product/word-study/WORD_RELEASE_CHECKLIST.md)
+- [Reuse guide for problems and notes](docs/architecture/STUDY_RUNTIME_REUSE.md)
 
 ## Main Configuration Switches
 
@@ -127,7 +132,7 @@ Configure features through `idf.py menuconfig` under `WQN firmware`:
 - `CONFIG_WQN_DEV_MENU_ENABLE`: adds a "开发者选项" (developer options) entry to the
   settings page that opens a second-level read-only list (dev info / sync
   diagnostics / error log / raw battery / storage detail / sleep diagnostics);
-  the structure is fixed by `DEV_DIAGNOSTICS.md`. Release builds keep it n;
+  the structure is fixed by `docs/development/DEV_DIAGNOSTICS.md`. Release builds keep it n;
   error capture is always compiled.
 
 ## Local Flashing
@@ -175,9 +180,10 @@ python -m esptool --chip esp32s3 -p COMx -b 460800 write_flash --flash_mode dio 
 
 Current runtime and release references:
 
-- [Architecture and resource ownership](ARCHITECTURE.md)
-- [Coordinated firmware/cloud release checklist](RELEASE_CHECKLIST.md)
-- [Firmware troubleshooting](TROUBLESHOOTING.md)
+- [Architecture and resource ownership](docs/architecture/ARCHITECTURE.md)
+- [Coordinated firmware/cloud release checklist](docs/release/RELEASE_CHECKLIST.md)
+- [Firmware troubleshooting](docs/development/TROUBLESHOOTING.md)
+- [Reliability findings and patch roadmap](docs/engineering/FIRMWARE_RELIABILITY_PLAN.md)
 
 - Keep firmware-side changes focused on device behavior, transport contracts,
   power control, local rendering, and local caches.

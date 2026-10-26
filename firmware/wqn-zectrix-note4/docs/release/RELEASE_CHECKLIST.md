@@ -1,5 +1,10 @@
 # Note4 v3 coordinated release checklist
 
+For firmware reliability batches, select the applicable scope from the
+[reliability acceptance checklist](../engineering/FIRMWARE_RELIABILITY_ACCEPTANCE.md).
+This document retains the coordinated firmware/cloud release requirements below;
+its device iteration counts and cutover steps are not per-patch local commit gates.
+
 Firmware and WQN control-plane v3 are one release unit. Do not point production
 traffic at a firmware/cloud pair that was not tested together. The authoritative
 self-hosted database and proxy procedure is

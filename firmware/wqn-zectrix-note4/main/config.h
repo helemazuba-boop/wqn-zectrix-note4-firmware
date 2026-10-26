@@ -24,11 +24,10 @@
 #define WQN_API_BASE "https://wqn.helema.cn/api/esp32"
 #endif
 
-// Derived from WQN_API_BASE: used as the WebSocket origin / host. Today we
-// only ship one deployment, so the literal is fine; if we ever support
-// multiple environments, we will compute this from WQN_API_BASE at startup.
-#ifndef WQN_API_BASE_HOST
-#define WQN_API_BASE_HOST "wqn.helema.cn"
+// Empty: derive WS scheme/authority from WQN_API_BASE, use WQN_FLASH_WS_PATH.
+// Full ws(s):// URL: intentional separate voice service or proxy route.
+#ifndef WQN_VOICE_WS_URL
+#define WQN_VOICE_WS_URL ""
 #endif
 
 #define WQN_NVS_NAMESPACE "wqn"

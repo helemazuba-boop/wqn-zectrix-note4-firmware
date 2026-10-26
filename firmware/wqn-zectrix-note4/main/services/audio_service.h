@@ -83,6 +83,11 @@ esp_err_t RecoverAudioCodec(const AudioSession& session);
 // Configure ES8311 after the session's I2S channel(s) have been created and
 // enabled, so the external MCLK/BCLK domain is already stable. volume_percent
 // is applied only by playback/duplex profiles and must be in [0, 100].
+// Cold configuration shares one 5 s admission budget across probe, register
+// retries and program retries. Late completion fails; private-handle cleanup
+// still runs. This does not bound SDK internals or cleanup as a hard WCET.
+// Already-admitted configuration can close its own handle while new driver
+// operations are being denied by session drain; public removal stays gated.
 esp_err_t ConfigureAudioCodec(
     const AudioSession& session,
     AudioCodecProfile profile,
@@ -96,6 +101,9 @@ esp_err_t AddAudioCodec(
     AudioCodecHandle* codec);
 esp_err_t RemoveAudioCodec(
     const AudioSession& session, AudioCodecHandle* codec);
+// Standalone register calls use one 5 s budget, finite bus-lock waits and
+// millisecond driver parameters. Backoff releases the per-register lock;
+// ConfigureAudioCodec retains its outer lock across the complete program.
 esp_err_t WriteAudioCodecRegister(
     const AudioSession& session,
     AudioCodecHandle codec,
@@ -126,20 +134,22 @@ esp_err_t DisableAudioChannel(
     const AudioSession& session, AudioChannelHandle channel);
 esp_err_t DeleteAudioChannel(
     const AudioSession& session, AudioChannelHandle* channel);
+// Match the ESP-IDF I2S API: timeouts are milliseconds, never RTOS ticks.
+// The driver applies this budget to its waits, not as a whole-call deadline.
 esp_err_t ReadAudioChannel(
     const AudioSession& session,
     AudioChannelHandle channel,
     void* destination,
     size_t bytes,
     size_t* bytes_read,
-    TickType_t timeout);
+    uint32_t timeout_ms);
 esp_err_t WriteAudioChannel(
     const AudioSession& session,
     AudioChannelHandle channel,
     const void* source,
     size_t bytes,
     size_t* bytes_written,
-    TickType_t timeout);
+    uint32_t timeout_ms);
 esp_err_t ResetAudioTxChannel(
     const AudioSession& session,
     AudioChannelHandle channel,

@@ -5,6 +5,7 @@
 #include <cstring>
 #include "cJSON.h"
 #include "config.h"
+#include "voice_endpoint.h"
 #include "device_protocol/json_depth_guard.h"
 #include "esp_crt_bundle.h"
 #include "esp_heap_caps.h"
@@ -301,7 +302,7 @@ void DoDestroyWs()
     g_is_connected.store(false, std::memory_order_release);
     g_session_ready.store(false, std::memory_order_release);
     g_control_reassembly_buf.clear();
-    g_sse_parser.clear();
+    g_sse_parser.reset();
 
     if (g_active_conn_op_gen != 0) {
         PublishCompletion(g_active_conn_op_gen, ESP_FAIL, CmdDisposition::kCancelled);
@@ -544,15 +545,23 @@ void ProcessTextStream()
           ESP_LOGE(kTag,
                    "SSE frame overflow (>%u bytes) — fatal stream loss",
                    static_cast<unsigned>(wqn::kMaxSseFrameBytes));
-          xTaskNotify(g_transport_task, kEvtBitResetRequired, eSetBits);
-          continue;
+          TeardownFailedTurn();
+          return;
         }
         std::string ev_name;
         uint64_t ev_id = 0;
         std::string ev_data;
 
-        while (g_sse_parser.extract(&ev_name, &ev_id, &ev_data) ==
-               wqn::SseFrameBuffer::FrameState::kComplete) {
+        while (true) {
+            const auto frame = g_sse_parser.extract(&ev_name, &ev_id, &ev_data);
+            if (g_sse_parser.overflowed()) {
+                ESP_LOGE(kTag, "SSE accumulated frame overflow — fatal stream loss");
+                TeardownFailedTurn();
+                return;
+            }
+            if (frame != wqn::SseFrameBuffer::FrameState::kComplete) {
+                break;
+            }
             if (ev_data.empty()) {
                 continue;
             }
@@ -664,7 +673,12 @@ void ExecuteCtrlCmdSingleStep(const CtrlCmd& cmd)
                 "Authorization: Bearer " + g_current_token + "\r\n";
 
             esp_websocket_client_config_t cfg = {};
-            cfg.uri = "wss://" WQN_API_BASE_HOST WQN_FLASH_WS_PATH;
+            const std::string ws_url = wqn::BuildVoiceWebSocketUrl();
+            if (ws_url.empty()) {
+                PublishCompletion(cmd.gen, ESP_ERR_INVALID_ARG, CmdDisposition::kExecuted);
+                return;
+            }
+            cfg.uri = ws_url.c_str();
             cfg.subprotocol = WQN_VOICE_WS_SUBPROTOCOL;
             cfg.headers = auth_header.c_str();
             cfg.network_timeout_ms = 2500;
@@ -799,7 +813,7 @@ void ExecuteCtrlCmdSingleStep(const CtrlCmd& cmd)
             g_turn_state.store(TurnState::kRecording,
                                std::memory_order_release);
             g_prefinal_pcm_lost.store(false, std::memory_order_release);
-            g_sse_parser.clear();
+            g_sse_parser.reset();
 
             PublishCompletion(cmd.gen, ESP_OK, CmdDisposition::kExecuted);
             break;

@@ -25,6 +25,8 @@
 #include "freertos/task.h"
 #include "mbedtls/sha256.h"
 #include "runtime/sleep_coordinator.h"
+#include "runtime/storage_temp_file_lease.h"
+#include "runtime/pack_stream_path_lease.h"
 #include "services/storage_service.h"
 
 namespace {
@@ -552,13 +554,18 @@ void PruneUnreferencedProblemPackFiles(const wqn::WqnProblemPackManifest& curren
     std::vector<std::string> retained_stems;
     AddManifestSetStems(current, &retained_stems);
 
-    if (FileExists(kManifestBackupPath)) {
-        wqn::WqnProblemPackManifest backup;
+    {
         std::string backup_payload;
-        // Best-effort: keep files referenced by a readable backup so a rollback
-        // still has its packs. A corrupt backup simply prunes more aggressively.
-        if (ReadWholeFile(kManifestBackupPath, &backup_payload) == ESP_OK &&
-            ParseProblemManifestPayload(backup_payload, &backup) == ESP_OK) {
+        const esp_err_t backup_result = ReadWholeFile(kManifestBackupPath, &backup_payload);
+        // A failed read/parse cannot establish which rollback files are stale.
+        // Bypass backup references only for a confirmed ENOENT, not a stat failure.
+        if (backup_result != ESP_ERR_NOT_FOUND) {
+            wqn::WqnProblemPackManifest backup;
+            if (backup_result != ESP_OK ||
+                ParseProblemManifestPayload(backup_payload, &backup) != ESP_OK) {
+                ESP_LOGW(kTag, "problem pack backup manifest unreadable or invalid; skip pruning");
+                return;
+            }
             AddManifestSetStems(backup, &retained_stems);
         }
     }
@@ -595,6 +602,11 @@ void PruneUnreferencedProblemPackFiles(const wqn::WqnProblemPackManifest& curren
 
 esp_err_t ResetProblemPackStorageCacheRaw(void*)
 {
+    // Streams keep FILEs open across owner transactions, so a reset must
+    // defer before touching manifests or temporary files owned by a stream.
+    if (wqn::runtime::HasActivePackStreamPath()) {
+        return ESP_ERR_INVALID_STATE;
+    }
     const char* manifest_paths[] = {
         kManifestPath,
         kManifestTempPath,
@@ -791,48 +803,59 @@ esp_err_t LoadProblemPackManifest(WqnProblemPackManifest* manifest)
 esp_err_t SaveProblemPackManifestRaw(const WqnProblemPackManifest& manifest)
 {
     cJSON* root = cJSON_CreateObject();
-    cJSON* data = cJSON_CreateObject();
-    cJSON* sets = cJSON_CreateArray();
-    if (root == nullptr || data == nullptr || sets == nullptr) {
-        cJSON_Delete(root);
-        cJSON_Delete(data);
-        cJSON_Delete(sets);
+    if (root == nullptr) {
         return ESP_ERR_NO_MEM;
     }
-    cJSON_AddBoolToObject(root, "success", true);
-    cJSON_AddItemToObject(root, "data", data);
-    cJSON_AddNumberToObject(data, "cursor", static_cast<double>(manifest.cursor));
-    cJSON_AddBoolToObject(data, "has_more", manifest.has_more);
-    cJSON_AddItemToObject(data, "problem_sets", sets);
+    if (!cJSON_AddBoolToObject(root, "success", true)) {
+        cJSON_Delete(root);
+        return ESP_ERR_NO_MEM;
+    }
+    cJSON* data = cJSON_AddObjectToObject(root, "data");
+    if (data == nullptr ||
+        !cJSON_AddNumberToObject(data, "cursor", static_cast<double>(manifest.cursor)) ||
+        !cJSON_AddBoolToObject(data, "has_more", manifest.has_more)) {
+        cJSON_Delete(root);
+        return ESP_ERR_NO_MEM;
+    }
+    cJSON* sets = cJSON_AddArrayToObject(data, "problem_sets");
+    if (sets == nullptr) {
+        cJSON_Delete(root);
+        return ESP_ERR_NO_MEM;
+    }
 
     for (const WqnProblemPackManifestSet& item : manifest.problem_sets) {
         cJSON* set = cJSON_CreateObject();
-        if (set == nullptr) {
+        if (!cJSON_AddItemToArray(sets, set)) {
+            cJSON_Delete(set);
             cJSON_Delete(root);
             return ESP_ERR_NO_MEM;
         }
-        cJSON_AddItemToArray(sets, set);
-        cJSON_AddStringToObject(set, "problem_set_id", item.problem_set_id.c_str());
-        cJSON_AddStringToObject(set, "name", item.name.c_str());
-        cJSON_AddBoolToObject(set, "is_smart", item.is_smart);
-        cJSON_AddBoolToObject(set, "has_pack", item.has_pack);
+        if (!cJSON_AddStringToObject(set, "problem_set_id", item.problem_set_id.c_str()) ||
+            !cJSON_AddStringToObject(set, "name", item.name.c_str()) ||
+            !cJSON_AddBoolToObject(set, "is_smart", item.is_smart) ||
+            !cJSON_AddBoolToObject(set, "has_pack", item.has_pack)) {
+            cJSON_Delete(root);
+            return ESP_ERR_NO_MEM;
+        }
         if (!item.has_pack) {
-            cJSON_AddNullToObject(set, "pack");
+            if (!cJSON_AddNullToObject(set, "pack")) {
+                cJSON_Delete(root);
+                return ESP_ERR_NO_MEM;
+            }
             continue;
         }
-        cJSON* pack = cJSON_CreateObject();
-        if (pack == nullptr) {
+        cJSON* pack = cJSON_AddObjectToObject(set, "pack");
+        if (pack == nullptr ||
+            !cJSON_AddStringToObject(pack, "pack_id", item.pack_id.c_str()) ||
+            !cJSON_AddNumberToObject(pack, "pack_revision", static_cast<double>(item.pack_revision)) ||
+            !cJSON_AddNumberToObject(pack, "schema_version", item.schema_version) ||
+            !cJSON_AddNumberToObject(pack, "entry_count", item.entry_count) ||
+            !cJSON_AddNumberToObject(pack, "byte_size", item.byte_size) ||
+            !cJSON_AddStringToObject(pack, "sha256", item.sha256.c_str()) ||
+            !cJSON_AddStringToObject(pack, "download_url", item.download_url.c_str())) {
             cJSON_Delete(root);
             return ESP_ERR_NO_MEM;
         }
-        cJSON_AddItemToObject(set, "pack", pack);
-        cJSON_AddStringToObject(pack, "pack_id", item.pack_id.c_str());
-        cJSON_AddNumberToObject(pack, "pack_revision", static_cast<double>(item.pack_revision));
-        cJSON_AddNumberToObject(pack, "schema_version", item.schema_version);
-        cJSON_AddNumberToObject(pack, "entry_count", item.entry_count);
-        cJSON_AddNumberToObject(pack, "byte_size", item.byte_size);
-        cJSON_AddStringToObject(pack, "sha256", item.sha256.c_str());
-        cJSON_AddStringToObject(pack, "download_url", item.download_url.c_str());
     }
 
     char* rendered = cJSON_PrintUnformatted(root);
@@ -1196,16 +1219,19 @@ struct ProblemPackStreamContext {
     const uint8_t* chunk = nullptr;
     size_t chunk_size = 0;
     ProblemPackStreamOperation operation = ProblemPackStreamOperation::kBegin;
+    std::string temp_path;
+    std::string final_path;
 };
 
 esp_err_t ProblemPackStreamTransaction(void* opaque)
 {
     auto* context = static_cast<ProblemPackStreamContext*>(opaque);
-    if (context == nullptr || context->set == nullptr) {
+    if (context == nullptr || context->set == nullptr ||
+        context->temp_path.empty() || context->final_path.empty()) {
         return ESP_ERR_INVALID_ARG;
     }
-    const std::string temp_path = TempPackPathForSet(*context->set);
-    const std::string final_path = PackPathForSet(*context->set);
+    const std::string& temp_path = context->temp_path;
+    const std::string& final_path = context->final_path;
     switch (context->operation) {
         case ProblemPackStreamOperation::kBegin:
             std::remove(temp_path.c_str());
@@ -1252,13 +1278,13 @@ esp_err_t ProblemPackStreamTransaction(void* opaque)
             }
             context->sha_started = false;
             constexpr char kHex[] = "0123456789abcdef";
-            std::string actual_sha;
-            actual_sha.reserve(64);
-            for (const unsigned char byte : digest) {
-                actual_sha.push_back(kHex[byte >> 4]);
-                actual_sha.push_back(kHex[byte & 0x0f]);
+            std::array<char, 64> actual_sha = {};
+            for (size_t i = 0; i < digest.size(); ++i) {
+                actual_sha[i * 2] = kHex[digest[i] >> 4];
+                actual_sha[i * 2 + 1] = kHex[digest[i] & 0x0f];
             }
-            if (actual_sha != context->set->sha256) {
+            if (context->set->sha256.size() != actual_sha.size() ||
+                std::memcmp(actual_sha.data(), context->set->sha256.data(), actual_sha.size()) != 0) {
                 std::fclose(context->file);
                 context->file = nullptr;
                 std::remove(temp_path.c_str());
@@ -1326,8 +1352,18 @@ esp_err_t DownloadProblemPackToStorage(
     if (!storage_lease) {
         return ESP_ERR_INVALID_STATE;
     }
+    runtime::StorageTempFileLease temp_file_lease;
     ProblemPackStreamContext context;
     context.set = &set;
+    // Prepare immutable paths before opening the FILE. Append/Commit/Abort
+    // must not rebuild them while memory pressure may require cleanup.
+    context.temp_path = TempPackPathForSet(set);
+    context.final_path = PackPathForSet(set);
+    // Declared after context: unregister before its path buffers are freed.
+    runtime::PackStreamPathLease path_lease(context.temp_path.c_str());
+    if (!path_lease) {
+        return ESP_ERR_INVALID_STATE;
+    }
     mbedtls_sha256_init(&context.sha);
     context.operation = ProblemPackStreamOperation::kBegin;
     esp_err_t result = services::ExecuteStorageTransactionNamed(

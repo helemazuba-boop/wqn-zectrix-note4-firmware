@@ -19,8 +19,8 @@
 ## 2. 配置与发布策略
 
 - 新 Kconfig 开关：`CONFIG_WQN_DEV_MENU_ENABLE`（`main/Kconfig.projbuild`，`depends on WQN_EPD_UI_ENABLE`，**default n**）。
-- 门控语义：开关**只门控设置页一级的「开发者选项」入口行**（`#if` 预处理器裁剪；二级六行随之不可达）；错误捕获（`RecordError`）**常开编译**，发布固件同样保留——失败路径才执行，代价约 1KB flash / 0.8KB RAM 静态环，换来现场设备的问题回溯能力。
-- 发布保障：default n + `RELEASE_CHECKLIST.md` §1 校验步（记录的 sdkconfig 中 `# CONFIG_WQN_DEV_MENU_ENABLE is not set`）。开发机用 menuconfig 打开（写入 gitignored 的 `sdkconfig`，不进版本库）。
+- 门控语义：开关**只门控设置页一级的「开发者选项」入口行**（`#if` 预处理器裁剪；二级六行随之不可达）；错误捕获（`RecordError`）**常开编译**，发布固件同样保留——失败路径才执行，旧文本环约占 0.8KB 普通 RAM；第十一批另加固定预算的 RTC 数字摘要，见 §5 与批次记录。
+- 发布保障：default n + `../release/RELEASE_CHECKLIST.md` §1 校验步（记录的 sdkconfig 中 `# CONFIG_WQN_DEV_MENU_ENABLE is not set`）。开发机用 menuconfig 打开（写入 gitignored 的 `sdkconfig`，不进版本库）。
 - `sdkconfig.ai-local.defaults` 中保留注释行 `# CONFIG_WQN_DEV_MENU_ENABLE is not set`（照 `WQN_AI_AUDIO_SELFTEST_ENABLE` 先例），显式文档化 off 态。
 
 ## 3. 入口结构：一级一行 + 二级六行（固定）
@@ -126,6 +126,8 @@ size_t CopyRecentErrors(ErrorRecord* out, size_t cap);
 
 **并发模型**：专用 `portMUX_TYPE` 自旋锁 + 整环拷贝，**照抄 `GetSyncSnapshot` 先例**（`sync_service.cpp`）。格式化（`vsnprintf` 到任务栈缓冲）在锁外完成，锁内只做定长拷贝与 `++seq`。
 
+**数字故障摘要**（第十一批）：旧文本环锁释放后，RecordError 将固定 domain 与“错误码未知”写入四条 RTC 数字报告；消息/tag 原文不保留。启动阶段、存储恢复和事务失败另有明确错误码及 operation/generation。双副本、CRC、720 B RTC 与 360 B RAM cache 的预算及保留边界见 [第十一批记录](../engineering/RELIABILITY_BATCH_11.md)。启动及既有睡眠诊断导出附带 `FAULT:boot` / `FAULT:record`；错误详情 UI 仍显示原八条 RAM 文本环的快照。录制不写 Flash、不新增采样任务，物理保留与时间开销仍需设备验证。
+
 **tag 约定**（≤11 字符）：`persist`、`sync`、`cloud`、`audio`、`audio_cap`、`audio_play`、`ai`、`provision`、`rtc`、`storage`、`ui`。
 
 **v1 埋点清单**（各一行 `RecordError(...)` + `// [dev-diag]` 热点标签；同步的 content/outbox 路径**不埋**——`last_error` 已随快照发布）：
@@ -155,13 +157,30 @@ size_t CopyRecentErrors(ErrorRecord* out, size_t cap);
 
 1. **双配置构建**：default n（发布等价，Dev 行不可见）与 sdkconfig 置 y（六项可达）都要 0 警告 + M8 通过；对比 bin 大小并记录。
 2. **上机冒烟**（需硬件）：逐个进入六个详情并确认关闭；制造一次可观测失败验证错误记录；驻留设置页 ≥60s 验证候选不跳动、数据重绘、无吞帧或残影。
-3. **发布演练**：按 `RELEASE_CHECKLIST.md` 走一遍 §1 的 flag 校验步。
+3. **发布演练**：按 `../release/RELEASE_CHECKLIST.md` 走一遍 §1 的 flag 校验步。
 
 ## 8. 已知局限（有意为之）
 
 - `WQN_GIT_COMMIT` / 构建时间为 **configure 期快照**：同一构建目录内 commit 后需重新 configure 才刷新；拿不到 git 时回退 `"unknown"`。
-- 错误环不持久化：重启即失（崩溃类信息由「上次复位原因」兜底）；要做持久化先修订本文档并评估 NVS 写入频率。
+- 八条文本错误环重启即失；四条数字摘要可在符合策略且 RTC 内容有效的软件/深睡等复位后恢复，USB/冷/低压等重置保守重建。不承诺掉电保留，也不替代 panic 调用栈，精确边界见第十一批记录。
 - 电源睡眠诊断屏上只显示最近 6 条，完整 64 条要靠 USB 日志（见 §4.6）；环本身跨深睡保留，但 `USB_UART_CHIP_RESET` 会清空 RTC slow memory。
 - `WQN_FIRMWARE_VERSION` 保持手写、**不掺 hash**：它进同步 `image_id`（`sync_service.cpp`）与刷新签名（`ui/ui_refresh.cpp`），每次提交变化会污染这两处。
 
 2026-10-18 真机布局反馈修正：开发者列表随设置列表统一为 10px 外边距、原生 20px 主文字、36px 行距，五行滚动与六类诊断保持。状态栏使用全宽 y=27 的公共坐标，图标 y=6，右边距 10px；未新增底部操作说明栏。详情中的真实数据与输入语义保持。
+
+## 9. B5 存储采集与 RAM 诊断对照
+
+第十二批复用设置页面已有 `ReadStorageCapacitySnapshot()` 查询，输出
+`STORAGE:capacity query_start_us=... query_end_us=... total_bytes=... used_bytes=... result=...`。
+没有增加容量查询频率、事务后扫描或菜单行。两个时间来自 esp_timer，只描述该次查询；
+并发写入、观测间隔和查询失败必须保留为缺口，不能推算整段占用率。
+
+启动或「电源睡眠诊断」导出的 `FAULT:boot` 追加 `mem_diag=0/1`。中途挂接 no-reset
+monitor 后，先请求该导出，等身份头出现，再打开存储详情取得之后的容量观测。
+正常设置快照更新也会产生日志；这是日志/格式化开销，不能称为零成本。
+
+`scripts/analyze_storage_log.py` 按文件、观测到的 boot、build 与开关保守切段，输出
+JSON/CSV 和各存储 owner 的 queue/exec/样本数/结果；缺身份片段保持未知。
+完整规则、分位数报告门槛、同板 RAM 诊断开/关构建和设备测量矩阵见
+[第十二批记录](../engineering/RELIABILITY_BATCH_12.md)。关闭 RAM 诊断时，历史导出
+不再提供内存样本；RTC 故障摘要与既有电源诊断导出仍保留。

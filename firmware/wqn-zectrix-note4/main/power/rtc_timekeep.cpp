@@ -1,22 +1,26 @@
 #include "power/rtc_timekeep.h"
 
+#include <cerrno>
 #include <cstddef>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <sys/time.h>
 
 #include "esp_attr.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "pcf8563.h"
 #include "runtime/wake_context.h"
+#include "runtime/wall_clock.h"
 
 namespace {
 
 constexpr char kTag[] = "wqn_rtc_time";
 
 constexpr uint32_t kTrustMagic = 0x57514B54;  // "WQTK"
-constexpr uint32_t kTrustVersion = 1;
+constexpr uint32_t kTrustVersion = 2;
 // Matches the copies in ui_internal.h and wqn_api.cpp (2024-01-01 UTC).
 constexpr int64_t kMinReasonableUnixTime = 1704067200;
 
@@ -29,6 +33,8 @@ struct TimekeepTrustRecord {
     uint32_t magic;
     uint32_t version;
     uint32_t generation;
+    uint32_t clock_epoch;
+    uint32_t network_calibrated;
     uint32_t checksum;
 };
 
@@ -50,6 +56,8 @@ bool TrustRecordValid()
 {
     return g_trust_record.magic == kTrustMagic &&
            g_trust_record.version == kTrustVersion &&
+           g_trust_record.clock_epoch <= wqn::runtime::kWallClockEpochMax &&
+           g_trust_record.network_calibrated <= 1 &&
            g_trust_record.checksum == TrustChecksum(g_trust_record);
 }
 
@@ -148,6 +156,18 @@ bool UnixSecondsFromCalendar(const RtcCalendar& calendar, int64_t* seconds_out)
 
 bool PersistSystemTimeToRtc(uint32_t sleep_generation)
 {
+    return PersistSystemTimeToRtc(sleep_generation, 0);
+}
+
+bool PersistSystemTimeToRtc(uint32_t sleep_generation, int64_t deadline_us)
+{
+    // A skipped or failed write must not lend the previous sleep's trust to
+    // this attempt, including failures before touching the RTC registers.
+    g_trust_record = {};
+    if (deadline_us > 0 && esp_timer_get_time() >= deadline_us) {
+        return false;
+    }
+    const runtime::WallClockSnapshot clock = runtime::GetWallClockSnapshot();
     const std::time_t now = std::time(nullptr);
     if (now < kMinReasonableUnixTime) {
         ESP_LOGW(kTag, "system clock unreasonable (%lld); skip RTC persist",
@@ -161,18 +181,28 @@ bool PersistSystemTimeToRtc(uint32_t sleep_generation)
     }
     if (!Pcf8563WriteTime(calendar.year, calendar.month, calendar.day,
                           calendar.hour, calendar.min, calendar.sec,
-                          calendar.weekday)) {
+                          calendar.weekday, deadline_us)) {
         return false;
     }
+    if (deadline_us > 0 && esp_timer_get_time() >= deadline_us) {
+        return false;
+    }
+    // A calibration during time sampling or I/O changes the basis. The next
+    // sleep attempt can persist it; this attempt must not publish stale trust.
+    if (runtime::GetWallClockSnapshot().epoch != clock.epoch) return false;
     TimekeepTrustRecord record = {};
     record.magic = kTrustMagic;
     record.version = kTrustVersion;
     record.generation = sleep_generation;
+    record.clock_epoch = clock.epoch;
+    record.network_calibrated = clock.network_calibrated() ? 1 : 0;
     record.checksum = TrustChecksum(record);
     g_trust_record = record;
     ESP_LOGI(kTag,
-             "wall clock persisted to PCF8563: generation=%lu utc=%04d-%02d-%02d %02d:%02d:%02d",
+             "wall clock persisted to PCF8563: generation=%lu basis=%lu calibrated=%u utc=%04d-%02d-%02d %02d:%02d:%02d",
              static_cast<unsigned long>(sleep_generation),
+             static_cast<unsigned long>(record.clock_epoch),
+             static_cast<unsigned>(record.network_calibrated),
              calendar.year + 1900, calendar.month + 1, calendar.day,
              calendar.hour, calendar.min, calendar.sec);
     return true;
@@ -184,7 +214,8 @@ bool RestoreSystemTimeFromRtc()
     if (!wake.deep_sleep_resume || wake.reset_reason != ESP_RST_DEEPSLEEP) {
         return false;
     }
-    if (!TrustRecordValid()) {
+    if (!TrustRecordValid() || !wake.sleep_snapshot_valid ||
+        g_trust_record.generation != wake.sleep_generation) {
         return false;
     }
 
@@ -223,11 +254,18 @@ bool RestoreSystemTimeFromRtc()
         .tv_sec = static_cast<time_t>(restored_seconds),
         .tv_usec = 0,
     };
-    settimeofday(&tv, nullptr);
+    if (settimeofday(&tv, nullptr) != 0) {
+        ESP_LOGW(kTag, "RTC clock calibration failed: %s", std::strerror(errno));
+        return false;
+    }
+    runtime::NoteRtcTimeRestored(
+        g_trust_record.network_calibrated != 0, g_trust_record.clock_epoch, restored_seconds);
     ESP_LOGI(kTag,
-             "system clock calibrated from PCF8563: generation=%lu/%lu utc=%lld",
+             "system clock calibrated from PCF8563: generation=%lu/%lu basis=%lu calibrated=%u utc=%lld",
              static_cast<unsigned long>(g_trust_record.generation),
              static_cast<unsigned long>(wake.sleep_generation),
+             static_cast<unsigned long>(g_trust_record.clock_epoch),
+             static_cast<unsigned>(g_trust_record.network_calibrated),
              static_cast<long long>(restored_seconds));
     return true;
 }
@@ -269,7 +307,11 @@ bool SeedSystemTimeFromBuildTimeIfNeeded()
         .tv_sec = build_time,
         .tv_usec = 0,
     };
-    settimeofday(&tv, nullptr);
+    if (settimeofday(&tv, nullptr) != 0) {
+        ESP_LOGW(kTag, "build-time clock seeding failed: %s", std::strerror(errno));
+        return false;
+    }
+    runtime::NoteBuildTimeApplied();
     ESP_LOGI(
         kTag,
         "clock seeded from build time: %04d-%02d-%02d %02d:%02d:%02d CST",

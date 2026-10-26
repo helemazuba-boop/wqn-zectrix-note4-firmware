@@ -21,14 +21,16 @@ struct StorageSchemaBootResult {
     char reset_id[33] = {};
 };
 
-// Runs before any business service starts. A missing/stale generation causes
-// an idempotent full local reset: erase default NVS, format the storage SPIFFS
-// partition, then atomically commit generation + reset id as the final step.
+// Runs before business services. Only verified empty media, a complete legacy
+// factory-reset request, or a durable reset intent permits initialization/reset.
+// Unknown/old/future schemas and I/O errors preserve data and require recovery.
+// A reset keeps its intent in wqn_boot while clearing other NVS namespaces and
+// SPIFFS; final schema keys precede intent removal (not a multi-key transaction).
 StorageSchemaBootResult EnsureStorageSchema();
 
-// Marks the current generation stale. The next boot performs the destructive
-// reset above; keeping the destructive work in boot context avoids racing live
-// NVS/SPIFFS clients during a settings-triggered factory reset.
+// Records an explicit reset intent for boot; called by the storage owner during
+// settings-triggered reset, without destroying live NVS/SPIFFS clients' data.
+// A write/commit error does not guarantee that the intent was never persisted.
 esp_err_t InvalidateStorageSchemaForFactoryReset();
 
 }  // namespace wqn::runtime

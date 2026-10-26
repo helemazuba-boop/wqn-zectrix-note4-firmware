@@ -8,6 +8,7 @@
 
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "runtime/fault_diagnostics.h"
 
 namespace wqn {
 namespace {
@@ -41,6 +42,9 @@ void RecordError(const char* tag, const char* fmt, ...)
     g_error_ring[seq % kErrorRecordDepth] = record;
     g_error_seq = seq;
     taskEXIT_CRITICAL(&g_error_ring_lock);
+    // Keep formatted text in ordinary RAM. The RTC journal accepts only a
+    // fixed domain and an explicit "code unavailable" marker for this API.
+    runtime::RecordLegacyFault(tag);
 }
 
 size_t CopyRecentErrors(ErrorRecord* out, size_t cap)

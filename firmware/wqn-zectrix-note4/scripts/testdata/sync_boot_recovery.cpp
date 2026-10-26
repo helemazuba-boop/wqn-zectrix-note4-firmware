@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <vector>
 #include <string>
+#include "runtime/fault_diagnostics.h"
 
 #define CONFIG_WQN_RTC_TIMEKEEP_ENABLE 0
 #define CONFIG_PM_ENABLE 0
@@ -20,6 +21,7 @@ using BaseType_t = int;
 struct StaticTimer_t {};
 struct StaticSemaphore_t {};
 struct RecoveryStop {};
+struct RestartStop {};
 struct Abort { int error; };
 const char* kTag = "host-boot";
 const char* esp_err_to_name(int) { return "host-error"; }
@@ -69,11 +71,11 @@ int xTaskCreate(void (*)(void*), const char*, int, void*, int, TaskHandle_t* han
     return fail_task ? 0 : pdPASS;
 }
 [[noreturn]] void vTaskDelay(int) { throw RecoveryStop{}; }
-void esp_restart() { throw Abort{ESP_FAIL}; }
+void esp_restart() { calls.push_back("restart"); throw RestartStop{}; }
 void uart_wait_tx_idle_polling(int) {}
 void LogTokenState() {}
 void LogWifiCredentialState() {}
-void ConfirmRunningApp() {}
+void ConfirmRunningApp() { calls.push_back("confirm-app"); }
 
 namespace wqn {
 constexpr int kNote4I2cPort = 0, kNote4I2cSda = 47, kNote4I2cScl = 48, kNote4I2cClockHz = 100000;
@@ -95,6 +97,15 @@ esp_err_t ShowStorageRecoveryUi(int error) {
     calls.push_back("recovery-ui"); recovery_error = error; return ESP_OK;
 }
 namespace runtime {
+int fault_code = 0;
+uint32_t fault_generation = 0;
+BootPhase fault_boot_phase = BootPhase::kPlatform;
+void InitFaultDiagnostics() {}
+void SetFaultBootPhase(BootPhase phase) { fault_boot_phase = phase; }
+void RecordFault(FaultDomain domain, FaultPhase phase, int32_t code, uint32_t operation, uint32_t generation) {
+    if (domain != FaultDomain::kStorage || phase != FaultPhase::kBootInit || operation != 0) std::abort();
+    fault_code = code; fault_generation = generation;
+}
 constexpr uint32_t kStorageSchemaGeneration = 3;
 enum class StorageSchemaBootAction { kReady, kRestartRequired, kRecoveryRequired };
 struct StorageSchemaBootResult {
@@ -103,8 +114,12 @@ struct StorageSchemaBootResult {
     uint32_t observed_generation = 3;
     const char* reset_id = "host";
 };
-StorageSchemaBootResult EnsureStorageSchema() { return {}; }
+StorageSchemaBootResult schema_result;
+StorageSchemaBootResult EnsureStorageSchema() { calls.push_back("schema"); return schema_result; }
 esp_err_t InitSleepCoordinator() { return ESP_OK; }
+// Diagnostics is an independent startup dependency; this fixture exercises
+// journal/startup gates rather than the diagnostic worker implementation.
+void InitMemoryDiagnostics() {}
 struct WakeContext { bool deep_sleep_resume = false; };
 const WakeContext& GetWakeContext() { static WakeContext wake; return wake; }
 }
@@ -140,6 +155,9 @@ void Reset() {
     g_boot_outbox_pending.store(false);
     g_word_outbox_sync_requested.store(false);
     g_full_sync_reasons.store(0);
+    wqn::runtime::schema_result = {};
+    wqn::runtime::fault_code = 0; wqn::runtime::fault_generation = 0;
+    wqn::runtime::fault_boot_phase = wqn::runtime::BootPhase::kPlatform;
 }
 bool BootRecovers() {
     try { app_main(); } catch (RecoveryStop&) { return true; }
@@ -150,6 +168,26 @@ bool NoBusiness() {
         !Called("ui") && !Called("sync-task") && !Called("power");
 }
 int main() {
+    for (int error : {ESP_ERR_INVALID_CRC, ESP_ERR_INVALID_STATE}) {
+        Reset();
+        wqn::runtime::schema_result.action = wqn::runtime::StorageSchemaBootAction::kRecoveryRequired;
+        wqn::runtime::schema_result.error = error;
+        Check(BootRecovers() && NoBusiness() && !Called("storage") && !Called("journal"),
+              "schema preservation/replay failure blocks storage and all business startup");
+        Check(Called("recovery-ui") && recovery_error == error,
+              "schema failure reaches recovery UI with original error");
+        Check(wqn::runtime::fault_code == error && wqn::runtime::fault_generation == 3 &&
+              wqn::runtime::fault_boot_phase == wqn::runtime::BootPhase::kStorage,
+              "recovery preserves typed fault code, observed generation and startup stage");
+    }
+    Reset();
+    wqn::runtime::schema_result.action = wqn::runtime::StorageSchemaBootAction::kRestartRequired;
+    bool restarted = false;
+    try { app_main(); } catch (RestartStop&) { restarted = true; }
+    Check(restarted && NoBusiness() && !Called("storage") && !Called("journal") &&
+          std::find(calls.begin(), calls.end(), "confirm-app") <
+          std::find(calls.begin(), calls.end(), "restart"),
+          "completed authorized reset confirms app and restarts before business");
 #if CONFIG_WQN_WIFI_STA_ENABLE
     for (int error : {ESP_ERR_INVALID_CRC, ESP_FAIL}) {
         Reset(); journal_error = error;
@@ -162,6 +200,8 @@ int main() {
     Reset();
     app_main();
     Check(Called("ui") && Called("sync-task") && Called("power"), "valid or recovered journal starts normal services");
+    Check(wqn::runtime::fault_boot_phase == wqn::runtime::BootPhase::kStartupComplete,
+          "startup-complete phase is published only after power coordinator admission");
     Check(journal_reads == 1 && mutex_creations == 1, "task startup reuses boot-validated journal and mutex");
     Check(std::find(calls.begin(), calls.end(), "journal") < std::find(calls.begin(), calls.end(), "audio"),
           "journal gate completes before first business task");
@@ -173,11 +213,15 @@ int main() {
         bool aborted = false;
         try { app_main(); } catch (Abort& abort) { aborted = abort.error == ESP_ERR_NO_MEM; }
         Check(aborted && !Called("power"), "sync task/timer startup failure cannot continue to power coordinator");
+        Check(wqn::runtime::fault_boot_phase != wqn::runtime::BootPhase::kStartupComplete,
+              "startup failure does not publish startup-complete phase");
     }
 #else
     Reset(); journal_error = ESP_ERR_INVALID_CRC;
     app_main();
     Check(Called("ui") && Called("power") && !Called("sync-task"), "WiFi-disabled build still boots normally");
+    Check(wqn::runtime::fault_boot_phase == wqn::runtime::BootPhase::kStartupComplete,
+          "offline build publishes final startup phase");
     Check(journal_reads == 0 && mutex_creations == 0, "WiFi-disabled preparation needs no sync journal resources");
 #endif
     Reset(); storage_error = ESP_FAIL;

@@ -12,6 +12,107 @@ permissions:
   contents: read
 
 jobs:
+  diagnostic-evidence:
+    name: Storage evidence attribution and diagnostic control configuration
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Reject misleading log attribution, percentiles and config drift (not HIL)
+        run: python3 firmware/wqn-zectrix-note4/scripts/test_storage_evidence.py
+
+  audio-timeout:
+    name: Audio channel timeout contract (100/1000 Hz)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Exercise production I2S boundary and caller units
+        run: python3 firmware/wqn-zectrix-note4/scripts/test_audio_channel_timeout.py
+
+  rtc-timekeep:
+    name: RTC, clock source, timer continuity and I2C (100/1000 Hz)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Exercise RTC, SNTP callbacks, timer restore, lock and codec paths (not HIL)
+        run: python3 firmware/wqn-zectrix-note4/scripts/test_rtc_timekeep.py
+
+  wake-and-timer:
+    name: Wake deadline, short waits and timer retention
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Exercise production wake and hardware wait contracts (not HIL)
+        run: python3 firmware/wqn-zectrix-note4/scripts/test_wake_deadline.py
+
+      - name: Exercise production timer and RTC-retained state (not HIL)
+        run: python3 firmware/wqn-zectrix-note4/scripts/test_time_retention.py
+
+      - name: Check complete ADC batches and synchronous UI battery callers (not HIL)
+        run: python3 firmware/wqn-zectrix-note4/scripts/test_power_sampling.py
+
+  audio-codec:
+    name: Complete codec configuration budget (100/1000 Hz)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Exercise full production codec program and cleanup (not HIL)
+        run: python3 firmware/wqn-zectrix-note4/scripts/test_audio_codec_budget.py
+
+  button-input:
+    name: GPIO capture, event ring, PTT release and final sleep gate (100/1000 Hz)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Replay production sampling, consumers and sleep commit (not HIL)
+        run: python3 firmware/wqn-zectrix-note4/scripts/test_button_input.py
+
+  fault-diagnostics:
+    name: RTC fault journal and storage failure context
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Exercise production fault journal, torn writes and provenance (not HIL)
+        run: python3 firmware/wqn-zectrix-note4/scripts/test_fault_diagnostics.py
+
+      - name: Exercise production storage owner and typed failure context (not HIL)
+        run: python3 firmware/wqn-zectrix-note4/scripts/test_audio_runtime.py
+
+  storage-schema:
+    name: Boot storage schema fault characterization
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Exercise real boot schema decisions with host fault ports
+        run: python3 firmware/wqn-zectrix-note4/scripts/test_storage_schema.py
+
+      - name: Exercise production startup and journal recovery gates
+        run: python3 firmware/wqn-zectrix-note4/scripts/test_sync_boot_recovery.py
+
+      - name: Protect live pack temp files during capacity reclamation (not HIL)
+        run: python3 firmware/wqn-zectrix-note4/scripts/test_storage_temp_lease.py
+
+      - name: Exercise pack callbacks with C++ allocation denied after Begin (not HIL)
+        run: python3 firmware/wqn-zectrix-note4/scripts/test_pack_stream_allocations.py
+
+      - name: Exercise bounded pack-path ownership and task contention (not HIL)
+        run: python3 firmware/wqn-zectrix-note4/scripts/test_pack_stream_path_lease.py
+
   contract:
     name: Architecture gate fixtures
     runs-on: ubuntu-latest
@@ -59,7 +160,7 @@ jobs:
     name: ESP-IDF build (esp32s3)
     runs-on: ubuntu-latest
     container:
-      image: espressif/idf:v5.5.4
+      image: espressif/idf:v5.5.6
     env:
       IDF_CCACHE_ENABLE: '1'
     steps:
@@ -76,6 +177,26 @@ jobs:
           restore-keys: |
             idf-
 
+      - name: Outbox recovery host regressions (not HIL)
+        working-directory: firmware/wqn-zectrix-note4
+        shell: bash
+        run: |
+          source "$IDF_PATH/export.sh"
+          python3 scripts/test_binary_outbox_recovery.py
+          python3 scripts/test_problem_outbox_recovery.py
+          python3 scripts/test_word_outbox_quota.py
+          python3 scripts/test_problem_empty_cache.py
+          python3 scripts/test_word_session_replay.py
+          python3 scripts/test_pack_prune.py
+
+      - name: SSE and voice endpoint host regressions (not HIL)
+        working-directory: firmware/wqn-zectrix-note4
+        shell: bash
+        run: |
+          source "$IDF_PATH/export.sh"
+          python3 scripts/test_stream_transport.py
+          python3 scripts/test_voice_endpoint.py
+
       # wqn_architecture_check is an ALL target, so the M8 ownership gate runs
       # as part of the build.
       - name: Build
@@ -83,5 +204,6 @@ jobs:
         shell: bash
         run: |
           source "$IDF_PATH/export.sh"
+          idf.py --version
           idf.py -B build-ci set-target esp32s3
           idf.py -B build-ci build

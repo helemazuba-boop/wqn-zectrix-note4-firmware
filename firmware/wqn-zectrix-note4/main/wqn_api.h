@@ -458,7 +458,9 @@ struct WqnAiStreamRequest {
     std::string tier = "std";        // "std" | "pro"
     std::string conversation_id;     // optional
     std::string request_id;          // optional idempotency UUID, server generates if empty
-    int timeout_ms = 0;              // 0 = use WQN_AI_SSE_TIMEOUT_MS
+    // One monotonic budget for upload, headers and SSE; 0 uses the default.
+    // SDK blocking calls and final cleanup remain cooperative, not hard WCET.
+    int timeout_ms = 0;
     WqnAiSseCallback callback = nullptr;
     void* user_ctx = nullptr;
     // Thinking controls sent as validated X-WQN headers on the raw PCM request.
@@ -474,6 +476,10 @@ struct WqnAiStreamRequest {
 // the client received an error event.  On ESP_FAIL a transport/HTTP-level
 // failure occurred before the stream could deliver any final frame; the caller
 // should look at response->error_code / error_message.
+// ESP_ERR_TIMEOUT means the shared budget expired (chat_timeout). The owner
+// closes a dripping SSE body from ON_DATA; it never destroys the client there.
+// A blocking SDK connect/header call or user callback can outlive the budget;
+// expiry is checked again when control returns. No automatic retry is made.
 esp_err_t UploadAiAudioChatStream(const WqnAiStreamRequest& request, WqnAiChatResponse* response);
 
 esp_err_t ParseTodoListResponse(const std::string& body, WqnTodoListPage* page);
