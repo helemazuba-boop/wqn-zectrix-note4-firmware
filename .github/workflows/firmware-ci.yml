@@ -197,6 +197,19 @@ jobs:
           python3 scripts/test_stream_transport.py
           python3 scripts/test_voice_endpoint.py
 
+      - name: Integrated storage, STD and Flash host regressions (not HIL)
+        working-directory: firmware/wqn-zectrix-note4
+        shell: bash
+        run: |
+          source "$IDF_PATH/export.sh"
+          python3 scripts/test_pack_stream_allocations.py
+          python3 scripts/test_pack_stream_path_lease.py
+          python3 scripts/test_pack_stream_profile.py
+          python3 scripts/test_std_ai.py
+          python3 scripts/test_std_stream.py
+          python3 scripts/test_flash_uplink.py
+          python3 scripts/test_audio_rx_overflow.py
+
       # wqn_architecture_check is an ALL target, so the M8 ownership gate runs
       # as part of the build.
       - name: Build
