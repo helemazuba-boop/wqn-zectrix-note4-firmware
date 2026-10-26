@@ -90,6 +90,8 @@ by code, `AGENTS.md`, and the architecture/product references above.
 
 - `docs/engineering/AUDIO_RUNTIME_REPAIR.md` — audio runtime device acceptance
   procedure and evidence boundary.
+- `docs/engineering/FLASH_UPLINK_QUEUE.md` — capture/send separation, queue and
+  FINAL lifetime, host verification and pending device acceptance.
 - `docs/engineering/FIRMWARE_RELIABILITY_PLAN.md` — dated source/history findings,
   issue IDs, recovery-policy questions, patch batches, and acceptance criteria.
 - `docs/engineering/RELIABILITY_BATCH_01.md` — first-batch implementation status,

@@ -30,6 +30,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "psram_task_stack.h"
+#include "flash_uplink_queue.h"
 #include "services/audio_service.h"
 #include "services/connectivity_service.h"
 #include "storage.h"
@@ -94,6 +95,9 @@ constexpr uint32_t kLifecycleTaskStackBytes = 8192;
 constexpr UBaseType_t kLifecycleTaskPriority = 6;
 constexpr uint32_t kPlaybackTaskStackBytes = 4096;
 constexpr uint32_t kStreamTaskStackBytes = 8192;
+constexpr uint32_t kUplinkTaskStackBytes = 8192;
+constexpr int64_t kUplinkDrainBudgetUs = 3000000;
+using FlashUplink = wqn::FlashUplinkQueue<192, 360>;
 
 enum class InternalStatus {
     kIdle,
@@ -130,7 +134,7 @@ struct FlashState {
     // WebSocket frame reassembly buffer for fragmented payloads
     std::string ws_reassembly_buf;
     // Streaming audio state
-    TaskHandle_t stream_task = nullptr;
+    TaskHandle_t stream_task = nullptr; // active marker; permanent task is g_capture_task
     wqn::services::AudioChannelHandle stream_rx = nullptr;
     wqn::services::AudioChannelHandle stream_tx = nullptr;
     wqn::services::AudioBusHandle stream_i2c_bus = nullptr;
@@ -143,7 +147,7 @@ struct FlashState {
     int64_t amp_idle_due_ms = 0;
     bool amp_idle_armed = false;
     // v2 uplink frame counter
-    uint32_t uplink_seq = 0;
+    std::atomic<uint32_t> uplink_seq{0};
     // [barge-fix] uplink_seq snapshot at PTT press. If unchanged on release,
     // the user tapped too fast (<250ms) for the streaming task to capture any
     // audio -> skip the empty final frame, which would otherwise trigger a
@@ -211,21 +215,28 @@ enum class FlashTerminalReason : uint8_t {
     kDisconnected,
     kTransportError,
     kServerError,
+    kUplinkOverflow,
+    kFinalUnconfirmed,
 };
 
 StaticTask_t g_lifecycle_task_tcb;
 // Token reads execute on StorageService, not this PSRAM-backed lifecycle stack.
 StackType_t* g_lifecycle_task_stack = nullptr;
 TaskHandle_t g_lifecycle_task = nullptr;
-// These realtime workers exist only while Flash is active, but allocating
-// their 12 KiB of stacks from the default internal heap made that memory also
+// These workers' stacks live in PSRAM; allocating them internally made memory
 // disappear from MALLOC_CAP_DMA.  Retain one PSRAM stack for each worker and
-// keep only their TCBs in internal RAM.  The tasks use static creation, so
-// their self-deletion never frees or reallocates these stable buffers.
+// keep their TCBs in internal RAM. Capture/uplink tasks persist and block while
+// idle; playback retains its existing session-level lifetime.
 StaticTask_t g_playback_task_tcb;
 StackType_t* g_playback_task_stack = nullptr;
 StaticTask_t g_stream_task_tcb;
 StackType_t* g_stream_task_stack = nullptr;
+TaskHandle_t g_capture_task = nullptr;
+StaticTask_t g_uplink_task_tcb;
+StackType_t* g_uplink_task_stack = nullptr;
+TaskHandle_t g_uplink_task = nullptr;
+FlashUplink g_uplink;
+FlashUplink::Block* g_uplink_storage = nullptr;
 std::atomic<FlashTerminalReason> g_terminal_reason{
     FlashTerminalReason::kNone};
 std::atomic<bool> g_intentional_stop{false};
@@ -268,6 +279,10 @@ const char* FlashTerminalMessage(FlashTerminalReason reason)
             return "WebSocket 错误";
         case FlashTerminalReason::kServerError:
             return "服务端错误";
+        case FlashTerminalReason::kUplinkOverflow:
+            return "网络拥堵，录音未提交，请重试";
+        case FlashTerminalReason::kFinalUnconfirmed:
+            return "结果暂无法确认，请先检查原记录";
         default:
             return "Flash 会话已结束";
     }
@@ -554,7 +569,7 @@ void WriteLE32(uint8_t* dst, uint32_t v) {
     dst[3] = static_cast<uint8_t>((v >> 24) & 0xff);
 }
 
-void BuildV2AudioFrame(std::vector<uint8_t>* frame, const uint8_t* pcm,
+void EncodeV2AudioFrame(uint8_t* p, const uint8_t* pcm,
                        size_t pcm_size, uint32_t seq, bool final)
 {
     AudioFrameHeader h{};
@@ -565,9 +580,6 @@ void BuildV2AudioFrame(std::vector<uint8_t>* frame, const uint8_t* pcm,
     h.sample_rate = static_cast<uint32_t>(kSampleRate);
     h.channels = 1;
     h.reserved = 0;
-    const size_t base = frame->size();
-    frame->resize(base + sizeof(AudioFrameHeader) + pcm_size);
-    uint8_t* p = frame->data() + base;
     WriteLE32(p, h.magic);     p += 4;
     WriteLE16(p, h.version);   p += 2;
     WriteLE16(p, h.flags);     p += 2;
@@ -578,6 +590,14 @@ void BuildV2AudioFrame(std::vector<uint8_t>* frame, const uint8_t* pcm,
     if (pcm_size > 0) {
         std::memcpy(p, pcm, pcm_size);
     }
+}
+
+void BuildV2AudioFrame(std::vector<uint8_t>* frame, const uint8_t* pcm,
+                       size_t pcm_size, uint32_t seq, bool final)
+{
+    const size_t base = frame->size();
+    frame->resize(base + sizeof(AudioFrameHeader) + pcm_size);
+    EncodeV2AudioFrame(frame->data() + base, pcm, pcm_size, seq, final);
 }
 
 #endif
@@ -1153,21 +1173,22 @@ void CleanupStreamHardware()
     // would race with the first playback block.
 }
 
-void FinishAudioStreamingTask(const char* error_message = nullptr)
+void FinishAudioStreamingTask(uint32_t generation, const char* error_message = nullptr)
 {
     CleanupStreamHardware();
     xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
     g_flash.capture_started = false;
     SetFlashCaptureIndicatorLocked(false);
-    g_flash.stream_task = nullptr;
     if (error_message != nullptr) {
         SetErrorLocked(error_message);
-    }
-    xSemaphoreGive(g_flash.mutex);
-    if (error_message != nullptr) {
         RequestFlashTerminalStop(FlashTerminalReason::kTransportError);
     }
-    vTaskDelete(nullptr);
+    g_uplink.ProducerDone(generation);
+    g_flash.stream_task = nullptr;
+    xSemaphoreGive(g_flash.mutex);
+    if (g_uplink_task != nullptr) xTaskNotifyGive(g_uplink_task);
+    // The capture worker is persistent. Publish idle only after its last
+    // hardware/queue access; the next notification cannot reuse a dying TCB.
 }
 
 // [i2s-handoff] Session-level teardown of the duplex I2S channels. Unlike
@@ -1253,20 +1274,103 @@ esp_err_t TearDownStreamChannels()
         : ESP_ERR_INVALID_STATE;
 }
 
-void AudioStreamingTask(void* param)
+bool SendFlashUplinkPcm(uint32_t generation, const FlashUplink::Block& block)
 {
-    (void)param;
-    uint8_t i2s_buf[kStreamChunkBytes * 2];  // stereo, 2 bytes/sample
+    esp_websocket_client_handle_t client = nullptr;
+    uint32_t seq = 0;
+    xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+    if (g_uplink.Current(generation) && !g_uplink.Stopped() &&
+        g_uplink.Session() == g_session_generation.load(std::memory_order_acquire) &&
+        !g_teardown_pending.load(std::memory_order_acquire) &&
+        !g_intentional_stop.load(std::memory_order_acquire) &&
+        g_flash.ws_connected && g_flash.ws_client != nullptr) {
+        client = g_flash.ws_client;
+        g_flash.active_ws_sends.fetch_add(1, std::memory_order_relaxed);
+        seq = g_flash.uplink_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+    }
+    xSemaphoreGive(g_flash.mutex);
+    FlashWsSendRegistration registration(client);
+    if (client == nullptr) return false;
+    const size_t bytes = block.sample_count * sizeof(int16_t);
+    const int64_t started = esp_timer_get_time();
 #if CONFIG_WQN_FLASH_PROTOCOL_V2
-    // Reuse one PSRAM-backed frame allocation for the whole session instead
-    // of allocating/freeing a 744-byte vector every 15 ms.
-    std::vector<uint8_t> uplink_frame;
-    uplink_frame.reserve(sizeof(AudioFrameHeader) + kStreamChunkBytes);
-    uint32_t uplink_append_count = 0;
+    // This worker's stack is PSRAM. No per-chunk vector/string allocation.
+    uint8_t frame[sizeof(AudioFrameHeader) + kStreamChunkBytes];
+    EncodeV2AudioFrame(frame, reinterpret_cast<const uint8_t*>(block.samples),
+                       bytes, seq, false);
+    const size_t expected = sizeof(AudioFrameHeader) + bytes;
+    const int sent = esp_websocket_client_send_bin(
+        client, reinterpret_cast<const char*>(frame), expected, pdMS_TO_TICKS(2500));
+#else
+    const std::string b64 = EncodeBase64(
+        reinterpret_cast<const uint8_t*>(block.samples), bytes);
+    const std::string message = R"({"type":"input_audio_buffer.append","audio":")" + b64 + R"("})";
+    const size_t expected = message.size();
+    const int sent = esp_websocket_client_send_text(
+        client, message.c_str(), expected, pdMS_TO_TICKS(2500));
 #endif
+    const int64_t elapsed = (esp_timer_get_time() - started) / 1000;
+    if (sent != static_cast<int>(expected)) {
+        ESP_LOGW(kTag, "Flash uplink failed: gen=%u seq=%u sent=%d expected=%u elapsed_ms=%lld",
+                 generation, seq, sent, static_cast<unsigned>(expected),
+                 static_cast<long long>(elapsed));
+        return false;
+    }
+    if (elapsed >= 100) {
+        ESP_LOGW(kTag, "uplink send recovered after backpressure: seq=%u bytes=%u elapsed_ms=%lld",
+                 seq, static_cast<unsigned>(expected), static_cast<long long>(elapsed));
+    }
+    return true;
+}
+
+void FlashUplinkTask(void*)
+{
+    while (true) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        // Begin publishes this flag last. Load the generation only after it.
+        if (g_uplink.SenderFinished()) continue;
+        const uint32_t generation = g_uplink.Generation();
+        while (g_uplink.Current(generation)) {
+            FlashUplink::Block block;
+            if (g_uplink.Pop(generation, &block)) {
+                if (!SendFlashUplinkPcm(generation, block)) {
+                    if (g_uplink.Current(generation) && !g_uplink.Stopped()) {
+                        g_uplink.Fail(generation, FlashUplink::Failure::kTransport);
+                        RequestFlashTerminalStop(FlashTerminalReason::kTransportError);
+                    }
+                } else {
+                    g_uplink.RecordSent(generation);
+                }
+                continue;
+            }
+            if (g_uplink.SenderCanFinish(generation)) {
+                ESP_LOGI(kTag, "Flash uplink drained: gen=%u accepted=%u sent=%u peak_blocks=%u failure=%u stack_hwm=%u",
+                         generation, g_uplink.Accepted(), g_uplink.Sent(), g_uplink.Peak(),
+                         static_cast<unsigned>(g_uplink.Error()),
+                         static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
+                ESP_LOGI(kTag, "Flash uplink heap: gen=%u internal_free=%u internal_largest=%u dma_free=%u dma_largest=%u psram_free=%u psram_largest=%u",
+                         generation,
+                         static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
+                         static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)),
+                         static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_DMA)),
+                         static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_DMA)),
+                         static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)),
+                         static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM)));
+                g_uplink.SenderDone(generation);
+                // No queue writes after this acknowledgement: Begin may reset it.
+                break;
+            }
+            ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        }
+    }
+}
+
+void CaptureFlashPcmTurn(uint32_t generation)
+{
+    uint8_t i2s_buf[kStreamChunkBytes * 2];  // stereo, 2 bytes/sample
     if (g_flash.stream_rx == nullptr || g_flash.stream_tx == nullptr) {
         ESP_LOGW(kTag, "stream hardware missing after preflight");
-        FinishAudioStreamingTask("音频通道初始化失败");
+        FinishAudioStreamingTask(generation, "音频通道初始化失败");
         return;
     }
 
@@ -1282,6 +1386,10 @@ void AudioStreamingTask(void* param)
     // ring once more here so a long session handshake cannot prepend stale
     // pre-session samples to the user's turn.
     for (int warmup = 0; warmup < 4; ++warmup) {
+        xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+        const bool active = g_flash.capture_started && !g_uplink.Stopped();
+        xSemaphoreGive(g_flash.mutex);
+        if (!active) break;
         size_t warmup_bytes = 0;
         wqn::services::ReadAudioChannel(
             g_flash_audio_session, g_flash.stream_rx, i2s_buf,
@@ -1289,18 +1397,20 @@ void AudioStreamingTask(void* param)
     }
 
     const int64_t capture_started_us = esp_timer_get_time();
+    const uint32_t rx_overflows_before = wqn::services::AudioDuplexRxOverflowCount();
     uint64_t capture_samples = 0;
     while (true) {
         // Check if capture should stop
         bool should_capture = false;
         xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
-        should_capture = g_flash.capture_started;
+        should_capture = g_flash.capture_started && g_uplink.Current(generation) &&
+            !g_uplink.Stopped();
         xSemaphoreGive(g_flash.mutex);
         if (!should_capture) {
             break;
         }
 
-        // Read one chunk (stereo 16-bit, 240 frames = 960 bytes per channel)
+        // Read one 360-frame chunk (stereo 16-bit).
         size_t bytes_read = 0;
         // [timeout-fix] 200ms (was 20ms). i2s_channel_read returns immediately
         // when DMA data is ready, so a larger timeout adds zero normal-case
@@ -1312,7 +1422,13 @@ void AudioStreamingTask(void* param)
         esp_err_t read_err = wqn::services::ReadAudioChannel(
             g_flash_audio_session, g_flash.stream_rx, i2s_buf,
             sizeof(i2s_buf), &bytes_read, 200);
-        if (read_err != ESP_OK || bytes_read == 0) {
+        if (read_err != ESP_OK && read_err != ESP_ERR_TIMEOUT) {
+            ESP_LOGW(kTag, "I2S capture failed: %s", esp_err_to_name(read_err));
+            g_uplink.Fail(generation, FlashUplink::Failure::kInvalidAudio);
+            RequestFlashTerminalStop(FlashTerminalReason::kTransportError);
+            break;
+        }
+        if (bytes_read == 0) {
             xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
             SetFlashCaptureIndicatorLocked(false);
             xSemaphoreGive(g_flash.mutex);
@@ -1334,6 +1450,13 @@ void AudioStreamingTask(void* param)
             vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
+        // The driver may return a valid partial buffer with ESP_ERR_TIMEOUT.
+        // Keep complete stereo frames; malformed data fails the whole turn.
+        if (bytes_read > sizeof(i2s_buf) || bytes_read % (sizeof(int16_t) * 2) != 0) {
+            g_uplink.Fail(generation, FlashUplink::Failure::kInvalidAudio);
+            RequestFlashTerminalStop(FlashTerminalReason::kTransportError);
+            break;
+        }
 
         // First valid post-warmup PCM is the actual-ready edge. Merely
         // connecting or setting capture_started never lights the LED.
@@ -1341,9 +1464,7 @@ void AudioStreamingTask(void* param)
         SetFlashCaptureIndicatorLocked(true);
         xSemaphoreGive(g_flash.mutex);
 
-        // [channel-fix] Convert stereo interleaved to mono by averaging L+R
-        // (matches audio_capture.cpp:476-484). The mic may be routed to either
-        // channel; left-only (old code) read a floating pin -> max_sample=0.
+        // Convert the stereo layout to the measured live L microphone channel.
         // I2S stereo 16-bit layout: [L0 R0 L1 R1 ...] (2 bytes/sample).
         const int stereo_frames = static_cast<int>(bytes_read / 4);
         const int frames = std::min(stereo_frames, kStreamChunkFrames);
@@ -1357,7 +1478,6 @@ void AudioStreamingTask(void* param)
         for (int i = 0; i < frames; ++i) {
             mono_buf[i] = stereo_samples[i * 2];  // L channel (mic)
         }
-        size_t mono_bytes = static_cast<size_t>(frames) * 2;
 
         // [diag] Log PCM level every ~1 second (66 chunks at 15ms = ~1s).
         // If max_sample is ~0, microphone/ADC isn't working. If >1000, audio
@@ -1379,96 +1499,72 @@ void AudioStreamingTask(void* param)
                      frames, left_peak, right_peak, max_sample);
         }
 
-        // Send via WebSocket if connected.
-        // v2 uses binary frames (24-byte header + PCM); v1 fallback sends
-        // {"type":"input_audio_buffer.append","audio":"<base64>"}.
-        esp_websocket_client_handle_t send_client = nullptr;
-        xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
-        if (g_flash.ws_connected && g_flash.ws_client != nullptr) {
-            send_client = g_flash.ws_client;
-            g_flash.active_ws_sends.fetch_add(1, std::memory_order_relaxed);
+        // Never wait for TCP/TLS on the capture task. Queue overflow is a
+        // terminal turn failure; dropping a block and committing the rest
+        // would disguise a damaged recording as a successful upload.
+        if (!g_uplink.Push(generation, mono_buf, static_cast<size_t>(frames))) {
+            if (g_uplink.Error() == FlashUplink::Failure::kOverflow) {
+                RequestFlashTerminalStop(FlashTerminalReason::kUplinkOverflow);
+            } else if (g_uplink.Error() != FlashUplink::Failure::kNone ||
+                       (!g_uplink.Stopped() && g_uplink.Current(generation))) {
+                RequestFlashTerminalStop(FlashTerminalReason::kTransportError);
+            }
+            break;
         }
-        xSemaphoreGive(g_flash.mutex);
-        FlashWsSendRegistration send_registration(send_client);
-        if (send_client != nullptr) {
-#if CONFIG_WQN_FLASH_PROTOCOL_V2
-            uplink_frame.clear();
-            const uint32_t seq = ++g_flash.uplink_seq;
-            BuildV2AudioFrame(
-                &uplink_frame, reinterpret_cast<const uint8_t*>(mono_buf),
-                mono_bytes, seq, /*final=*/false);
-            // Sustained 24 kHz PCM can briefly fill the TCP send window while
-            // WiFi retransmits.  The previous 1 s deadline made that ordinary
-            // backpressure fatal inside esp_websocket_client.  Use the same
-            // bounded 2.5 s transport budget as STD/PRO and verify the exact
-            // number of bytes accepted; never report an append that failed.
-            const int64_t send_started_us = esp_timer_get_time();
-            const int sent = esp_websocket_client_send_bin(
-                send_client,
-                reinterpret_cast<const char*>(uplink_frame.data()),
-                uplink_frame.size(), pdMS_TO_TICKS(2500));
-            const int64_t send_elapsed_ms =
-                (esp_timer_get_time() - send_started_us) / 1000;
-            if (sent != static_cast<int>(uplink_frame.size())) {
-                ESP_LOGW(kTag,
-                         "uplink send failed: seq=%u sent=%d expected=%u elapsed_ms=%lld dma_free=%u dma_largest=%u internal_free=%u internal_largest=%u stack_hwm=%u",
-                         static_cast<unsigned>(seq), sent,
-                         static_cast<unsigned>(uplink_frame.size()),
-                         static_cast<long long>(send_elapsed_ms),
-                         static_cast<unsigned>(
-                             heap_caps_get_free_size(MALLOC_CAP_DMA)),
-                         static_cast<unsigned>(
-                             heap_caps_get_largest_free_block(MALLOC_CAP_DMA)),
-                         static_cast<unsigned>(
-                             heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
-                         static_cast<unsigned>(
-                             heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)),
-                         static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
-                RequestFlashTerminalStop(
-                    FlashTerminalReason::kTransportError);
-                break;
-            }
-            if (send_elapsed_ms >= 100) {
-                ESP_LOGW(kTag,
-                         "uplink send recovered after backpressure: seq=%u bytes=%u elapsed_ms=%lld",
-                         static_cast<unsigned>(seq),
-                         static_cast<unsigned>(uplink_frame.size()),
-                         static_cast<long long>(send_elapsed_ms));
-            }
-            // [i2s-diag] Confirm uplink audio is actually being sent. Paired
-            // with the I2S timeout log above: if this never prints but timeouts
-            // do, the capture path is dead. If this prints but StepFun still
-            // says "append not called", the proxy/StepFun side is dropping them.
-            ++uplink_append_count;
-            if (uplink_append_count % 66 == 1) {
-                ESP_LOGI(kTag,
-                         "uplink append #%u seq=%u bytes=%u dma_free=%u dma_largest=%u internal_free=%u stack_hwm=%u",
-                         static_cast<unsigned>(uplink_append_count), seq,
-                         static_cast<unsigned>(mono_bytes),
-                         static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_DMA)),
-                         static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_DMA)),
-                         static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
-                         static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
-            }
-#else
-            std::string b64 = EncodeBase64(reinterpret_cast<const uint8_t*>(mono_buf), mono_bytes);
-            std::string msg = R"({"type":"input_audio_buffer.append","audio":"}" + b64 + R"("})";
-            esp_websocket_client_send_text(send_client, msg.c_str(), msg.size(), pdMS_TO_TICKS(1000));
-#endif
-        }
+        xTaskNotifyGive(g_uplink_task);
     }
 
     ESP_LOGI(kTag,
              "Flash capture stop: duration_ms=%llu wall_duration_ms=%lld "
-             "mono_samples=%llu stack_hwm=%u",
+             "mono_samples=%llu stack_hwm=%u gen=%u rx_queue_overflows=%u",
              static_cast<unsigned long long>(capture_samples * 1000 / kSampleRate),
              static_cast<long long>((esp_timer_get_time() - capture_started_us) / 1000),
              static_cast<unsigned long long>(capture_samples),
-             static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
+             static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)), generation,
+             wqn::services::AudioDuplexRxOverflowCount() - rx_overflows_before);
     ESP_LOGI(kTag, "audio streaming task exiting");
-    // Clear the global handle before self-deletion so StopAudioStreaming can
-    // detect every exit path, including hardware-init failures above.
-    FinishAudioStreamingTask();
+    // Publish capture quiescence on every path, including init failures.
+    FinishAudioStreamingTask(generation);
+}
+
+void AudioStreamingTask(void* param)
+{
+    (void)param;
+    while (true) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        CaptureFlashPcmTurn(g_uplink.Generation());
+    }
+}
+
+esp_err_t EnsureFlashUplinkRuntime()
+{
+    if (g_uplink_storage == nullptr) {
+        g_uplink_storage = static_cast<FlashUplink::Block*>(heap_caps_calloc(
+            1, FlashUplink::kStorageBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        if (g_uplink_storage == nullptr) return ESP_ERR_NO_MEM;
+        g_uplink.Configure(g_uplink_storage);
+        ESP_LOGI(kTag, "Flash uplink PSRAM queue: bytes=%u capacity_blocks=192 buffered_ms=2880",
+                 static_cast<unsigned>(FlashUplink::kStorageBytes));
+    }
+    if (g_capture_task == nullptr) {
+        StackType_t* stack = EnsurePsramTaskStack(
+            &g_stream_task_stack, kStreamTaskStackBytes, "flash_stream");
+        if (stack == nullptr) return ESP_ERR_NO_MEM;
+        g_capture_task = xTaskCreateStaticPinnedToCore(
+            AudioStreamingTask, "flash_stream", wqn::TaskStackWords(kStreamTaskStackBytes),
+            nullptr, 10, stack, &g_stream_task_tcb, 1);
+        if (g_capture_task == nullptr) return ESP_ERR_NO_MEM;
+    }
+    if (g_uplink_task == nullptr) {
+        StackType_t* stack = EnsurePsramTaskStack(
+            &g_uplink_task_stack, kUplinkTaskStackBytes, "flash_uplink");
+        if (stack == nullptr) return ESP_ERR_NO_MEM;
+        g_uplink_task = xTaskCreateStaticPinnedToCore(
+            FlashUplinkTask, "flash_uplink", wqn::TaskStackWords(kUplinkTaskStackBytes),
+            nullptr, 7, stack, &g_uplink_task_tcb, 1);
+        if (g_uplink_task == nullptr) return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
 }
 
 void StartAudioStreaming()
@@ -1477,8 +1573,21 @@ void StartAudioStreaming()
         return;
     }
     xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
-    if (g_flash.stream_task != nullptr) {
+    if (!g_flash.capture_started || g_flash.stream_task != nullptr) {
         xSemaphoreGive(g_flash.mutex);
+        return;
+    }
+    const uint32_t generation =
+        (g_capture_task && g_uplink_task &&
+         !g_teardown_pending.load(std::memory_order_acquire) &&
+         !g_intentional_stop.load(std::memory_order_acquire))
+        ? g_uplink.Begin(g_session_generation.load(std::memory_order_acquire)) : 0;
+    if (generation == 0) {
+        g_flash.capture_started = false;
+        SetFlashCaptureIndicatorLocked(false);
+        SetErrorLocked("上一段录音未结束，请重试");
+        xSemaphoreGive(g_flash.mutex);
+        RequestFlashTerminalStop(FlashTerminalReason::kTransportError);
         return;
     }
     // The codec rail is owned by AudioService and remains warm while running.
@@ -1496,20 +1605,10 @@ void StartAudioStreaming()
 
     g_flash_indicator_session = g_flash_audio_session;
     g_flash_indicator_on = false;
-    StackType_t* stack = EnsurePsramTaskStack(
-        &g_stream_task_stack, kStreamTaskStackBytes, "flash_stream");
-    g_flash.stream_task = stack == nullptr ? nullptr
-        : xTaskCreateStaticPinnedToCore(
-            &AudioStreamingTask, "flash_stream", kStreamTaskStackBytes,
-            nullptr, 10, stack, &g_stream_task_tcb, 1);
-    if (g_flash.stream_task == nullptr) {
-        g_flash.stream_task = nullptr;
-        g_flash.capture_started = false;
-        SetFlashCaptureIndicatorLocked(false);
-        SetErrorLocked("录音任务启动失败");
-        ESP_LOGE(kTag, "audio streaming task create failed");
-        RequestFlashTerminalStop(FlashTerminalReason::kTransportError);
-    }
+    g_flash.capture_base_seq = g_flash.uplink_seq.load(std::memory_order_relaxed);
+    g_flash.stream_task = g_capture_task; // active marker, not task ownership
+    xTaskNotifyGive(g_capture_task);
+    xTaskNotifyGive(g_uplink_task);
     xSemaphoreGive(g_flash.mutex);
 }
 
@@ -1518,10 +1617,8 @@ void StopAudioStreaming()
     if (g_flash.mutex == nullptr) {
         return;
     }
-    // Signal the task to stop by clearing the flag. Do NOT externally call
-    // vTaskDelete() here — let the task delete itself after it reads the flag
-    // and cleans up. Otherwise we risk a double-cleanup (task deleting itself
-    // while we also try to delete it) and a double-free of hardware resources.
+    // The permanent capture worker acknowledges quiescence after its final
+    // hardware/queue access. No external deletion or TCB/stack reuse.
     xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
     g_flash.capture_started = false;
     SetFlashCaptureIndicatorLocked(false);
@@ -1530,28 +1627,29 @@ void StopAudioStreaming()
     if (task == nullptr) {
         return;
     }
-    // [panic-fix] Wait for the task to self-delete. The task can block in
-    // esp_websocket_client_send_bin (2.5 s timeout) or i2s_channel_read
-    // (200 ms), so 3.0 s covers the bounded call plus scheduling jitter. If it
-    // still doesn't exit, leave it alive; the lifecycle task will not destroy
-    // the registered WebSocket client while this sender remains active.
+    // I2S reads may contain multiple driver waits. Retain the audio lease if
+    // quiescence is not acknowledged; lifecycle teardown retries safely.
     for (int i = 0; i < 300; ++i) {  // 3.0s (was 2.0s)
         vTaskDelay(pdMS_TO_TICKS(10));
         xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
         const bool stopped = g_flash.stream_task == nullptr;
         xSemaphoreGive(g_flash.mutex);
         if (stopped) {
-            // Task self-deleted successfully
             return;
         }
     }
     // Task still alive — keep the task and its WebSocket lifetime registered.
-    ESP_LOGE(kTag, "streaming task did not exit within 3s; deferring client destroy");
-    CleanupStreamHardware();
-    // Do not query or delete `task` here: it may self-delete between the poll
-    // and this point, making even eTaskGetState(task) a stale-handle access.
-    // WebSocket destruction will unblock a still-live sender so it can exit.
+    ESP_LOGE(kTag, "capture worker did not quiesce within 3s; retaining audio lease");
     (void)task;
+}
+
+bool WaitForFlashUplink(int64_t deadline_us)
+{
+    while (!g_uplink.ProducerFinished() || !g_uplink.SenderFinished()) {
+        if (esp_timer_get_time() >= deadline_us) return false;
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    return esp_timer_get_time() <= deadline_us;
 }
 
 // RAII guard so each early-return path automatically frees the cJSON tree.
@@ -2378,6 +2476,10 @@ esp_err_t StartFlashSessionNow(uint32_t generation)
     if (result != ESP_OK) {
         return fail_after_audio_begin("音频硬件初始化失败", result);
     }
+    result = EnsureFlashUplinkRuntime();
+    if (result != ESP_OK) {
+        return fail_after_audio_begin("音频发送任务初始化失败", result);
+    }
     result = EnsurePlaybackRingbuf();
     if (result != ESP_OK) {
         return fail_after_audio_begin("音频播放任务初始化失败", result);
@@ -2459,16 +2561,21 @@ esp_err_t StopFlashSessionNow()
     }
 
     // Signal streaming task to stop (outside mutex so task can read it)
+    bool had_stream_task = false;
     {
         xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
         g_flash.capture_started = false;
         SetFlashCaptureIndicatorLocked(false);
+        g_uplink.Cancel(g_uplink.Generation());
         g_flash.button_pressed = false;
-        bool had_stream_task = (g_flash.stream_task != nullptr);
+        had_stream_task = (g_flash.stream_task != nullptr);
         xSemaphoreGive(g_flash.mutex);
-        if (had_stream_task) {
-            StopAudioStreaming();
-        }
+    }
+    if (g_uplink_task != nullptr) xTaskNotifyGive(g_uplink_task);
+    if (had_stream_task) StopAudioStreaming();
+    if (!WaitForFlashUplink(esp_timer_get_time() + kUplinkDrainBudgetUs)) {
+        ESP_LOGE(kTag, "Flash workers did not quiesce; retain client and audio lease");
+        return ESP_ERR_TIMEOUT;
     }
 
     // [playback-fix] Drop any PCM already enqueued for the playback task so
@@ -2526,9 +2633,8 @@ esp_err_t StopFlashSessionNow()
         xSemaphoreGive(g_flash.mutex);
     }
 
-    // Wait briefly for the drained AudioStreamingTask to publish its terminal
-    // state, then tear down the duplex I2S channels so STD/Pro can claim
-    // I2S_NUM_0. TearDownStreamChannels verifies stream_task is gone before
+    // Tear down only after the capture worker has published quiescence so
+    // STD/Pro can claim I2S_NUM_0. TearDownStreamChannels verifies capture idle before
     // deleting stream_rx.
     {
         xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
@@ -2581,8 +2687,13 @@ esp_err_t StopFlashSession()
     xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
     // Cancels a lifecycle-task WiFi wait without blocking the UI task. The
     // radio remains alive for the bounded idle tail while teardown completes.
+    g_flash.capture_started = false;
+    g_flash.button_pressed = false;
+    SetFlashCaptureIndicatorLocked(false);
+    g_uplink.Cancel(g_uplink.Generation());
     g_flash_connectivity_demand.Reset();
     xSemaphoreGive(g_flash.mutex);
+    if (g_uplink_task != nullptr) xTaskNotifyGive(g_uplink_task);
     g_intentional_stop.store(true, std::memory_order_release);
     g_terminal_generation.store(
         g_session_generation.load(std::memory_order_acquire),
@@ -2649,7 +2760,7 @@ void PollFlashAmpIdle()
 void OnFlashButtonPressed()
 {
     if (g_flash.mutex == nullptr) {
-        InitFlashSession();
+        if (InitFlashSession() != ESP_OK) return;
     }
     xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
 
@@ -2670,6 +2781,23 @@ void OnFlashButtonPressed()
         xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
     }
 
+    if (g_teardown_pending.load(std::memory_order_acquire) ||
+        g_intentional_stop.load(std::memory_order_acquire)) {
+        g_flash.pending_text = "正在结束，请稍后重试";
+        MarkChanged();
+        xSemaphoreGive(g_flash.mutex);
+        return;
+    }
+    if (g_flash.capture_started || g_flash.stream_task != nullptr) {
+        xSemaphoreGive(g_flash.mutex);
+        return;
+    }
+    if (!g_uplink.SenderFinished()) {
+        g_flash.pending_text = "正在上传，请稍后重试";
+        MarkChanged();
+        xSemaphoreGive(g_flash.mutex);
+        return;
+    }
     g_flash.button_pressed = true;
 
     // [barge-in-fix] User pressed PTT while the server is mid-playback.
@@ -2692,7 +2820,7 @@ void OnFlashButtonPressed()
         // threshold, so it is a real PTT turn (short/double taps never get here).
         ResetFlashTurnAssemblyLocked();
         g_flash.capture_started = true;
-        g_flash.capture_base_seq = g_flash.uplink_seq;  // [barge-fix] detect empty capture on release
+        g_flash.capture_base_seq = g_flash.uplink_seq.load(std::memory_order_relaxed);
         g_flash.pending_text = "正在录音...";
         g_flash.status_since_ms = esp_timer_get_time() / 1000;
         MarkChanged();
@@ -2750,6 +2878,7 @@ void OnFlashButtonReleased(bool submit)
     if (g_flash.mutex == nullptr) {
         return;
     }
+    const int64_t drain_deadline = esp_timer_get_time() + kUplinkDrainBudgetUs;
     xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
     // Always stop streaming if it was started, regardless of WS connection state.
     // If WS disconnected mid-recording, we still need to release the I2S hardware.
@@ -2759,14 +2888,16 @@ void OnFlashButtonReleased(bool submit)
         g_flash.status == InternalStatus::kConnecting;
     g_flash.capture_started = false;
     SetFlashCaptureIndicatorLocked(false);
+    const uint32_t uplink_generation = g_uplink.Generation();
+    if (!submit) g_uplink.Cancel(uplink_generation);
     g_flash.button_pressed = false;
     g_flash.status_since_ms = esp_timer_get_time() / 1000;
     MarkChanged();
     if (was_capturing) {
         g_flash.pending_text = g_flash.ws_connected ? "正在处理..." : "录音中断";
     }
-    bool ws_connected = g_flash.ws_connected;
     xSemaphoreGive(g_flash.mutex);
+    if (g_uplink_task != nullptr) xTaskNotifyGive(g_uplink_task);
 
     if (cancel_pending_connect) {
         ESP_LOGI(kTag, "Flash PTT released before online; cancelling connect");
@@ -2776,6 +2907,17 @@ void OnFlashButtonReleased(bool submit)
 
     if (was_capturing) {
         StopAudioStreaming();
+    }
+    const bool drained = !was_capturing || WaitForFlashUplink(drain_deadline);
+    if (!drained) {
+        g_uplink.Fail(uplink_generation, FlashUplink::Failure::kTransport);
+        if (g_uplink_task != nullptr) xTaskNotifyGive(g_uplink_task);
+        RequestFlashTerminalStop(FlashTerminalReason::kTransportError);
+    }
+    if (!submit && was_capturing) {
+        // Disconnect clears all uncommitted upstream audio. Never append the
+        // abandoned turn to a later recording on the same connection.
+        RequestFlashTerminalStop(FlashTerminalReason::kTransportError);
     }
 
     // Force the PA off when capture ends. Mark any playback write racing with
@@ -2808,9 +2950,15 @@ void OnFlashButtonReleased(bool submit)
 #endif
 
     xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
-    const bool captured_audio = (g_flash.uplink_seq != g_flash.capture_base_seq);
+    const bool captured_audio = g_uplink.Accepted() != 0 &&
+        g_flash.uplink_seq.load(std::memory_order_relaxed) != g_flash.capture_base_seq;
     const bool prev_in_flight = g_flash.response_in_flight;
-    if (submit && ws_connected && g_flash.ws_client != nullptr && was_capturing && captured_audio && !prev_in_flight) {
+    if (submit && drained && g_flash.ws_connected && g_flash.ws_client != nullptr &&
+        was_capturing && captured_audio && !prev_in_flight &&
+        !g_teardown_pending.load(std::memory_order_acquire) &&
+        !g_intentional_stop.load(std::memory_order_acquire) &&
+        g_uplink.Session() == g_session_generation.load(std::memory_order_acquire) &&
+        g_uplink.ClaimFinal(uplink_generation)) {
         // [barge-fix] Only send the final end-of-turn frame if real audio was
         // captured (uplink_seq advanced past capture_base_seq). A fast barge-in
         // tap leaves uplink_seq unchanged; sending an empty final frame would
@@ -2824,31 +2972,54 @@ void OnFlashButtonReleased(bool submit)
         should_send = true;
         client = g_flash.ws_client;
         g_flash.active_ws_sends.fetch_add(1, std::memory_order_relaxed);
-        ++g_flash.uplink_seq;
+        const uint32_t final_seq =
+            g_flash.uplink_seq.fetch_add(1, std::memory_order_relaxed) + 1;
 #if CONFIG_WQN_FLASH_PROTOCOL_V2
-        seq = g_flash.uplink_seq;
+        seq = final_seq;
+#else
+        (void)final_seq;
 #endif
         g_flash.response_in_flight = true;  // in-flight until response.done/error
         g_flash.response_started = false;   // [phase-fix] no delta for this turn yet
-    } else if (was_capturing && captured_audio && prev_in_flight) {
-        ESP_LOGW(kTag, "skip turn-end: prior response still in-flight");
+    } else if (was_capturing && g_uplink.Accepted() != 0) {
+        // Any uncommitted PCM requires a fresh connection before reuse.
+        g_uplink.Cancel(uplink_generation);
+        RequestFlashTerminalStop(FlashTerminalReason::kTransportError);
+        ESP_LOGW(kTag, "skip turn-end: undrained, failed, cancelled or prior response in-flight");
+    } else if (was_capturing) {
+        g_flash.pending_text.clear();
+        MarkChanged();
     }
     xSemaphoreGive(g_flash.mutex);
 
     FlashWsSendRegistration send_registration(should_send ? client : nullptr);
     if (should_send) {
+        bool final_sent = false;
 #if CONFIG_WQN_FLASH_PROTOCOL_V2
         std::vector<uint8_t> end;
         BuildV2AudioFrame(&end, nullptr, 0, seq, /*final=*/true);
-        esp_websocket_client_send_bin(client,
-                                      reinterpret_cast<const char*>(end.data()),
-                                      end.size(), pdMS_TO_TICKS(1000));
+        final_sent = esp_websocket_client_send_bin(
+            client, reinterpret_cast<const char*>(end.data()), end.size(),
+            pdMS_TO_TICKS(1000)) == static_cast<int>(end.size());
 #else
         std::string commit = R"({"type":"input_audio_buffer.commit"})";
-        esp_websocket_client_send_text(client, commit.c_str(), commit.size(), pdMS_TO_TICKS(1000));
+        const bool committed = esp_websocket_client_send_text(
+            client, commit.c_str(), commit.size(), pdMS_TO_TICKS(1000)) ==
+            static_cast<int>(commit.size());
         std::string resp_create = R"({"type":"response.create"})";
-        esp_websocket_client_send_text(client, resp_create.c_str(), resp_create.size(), pdMS_TO_TICKS(1000));
+        final_sent = committed && esp_websocket_client_send_text(
+            client, resp_create.c_str(), resp_create.size(), pdMS_TO_TICKS(1000)) ==
+            static_cast<int>(resp_create.size());
 #endif
+        g_uplink.FinalDone(uplink_generation, final_sent);
+        ESP_LOGI(kTag, "Flash FINAL transport: gen=%u accepted=%u sent=%u complete=%u",
+                 uplink_generation, g_uplink.Accepted(), g_uplink.Sent(),
+                 static_cast<unsigned>(final_sent));
+        if (!final_sent) {
+            // Delivery may have succeeded remotely. Do not retry FINAL or
+            // replay this utterance; close and let the user resolve the result.
+            RequestFlashTerminalStop(FlashTerminalReason::kFinalUnconfirmed);
+        }
     }
 }
 
