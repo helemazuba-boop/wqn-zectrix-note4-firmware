@@ -202,6 +202,22 @@ a matching pair for the eventual joint power comparison. See
 [batch 20](../engineering/RELIABILITY_BATCH_20.md) for decoder preservation,
 the next code tasks and verification boundaries.
 
+## Current release integration (2026-10-27)
+
+The `merge/firmware-release-20261026` worktree has a clean defaults build in
+`build-wsl` (ESP32-S3, IDF 5.5.6, baked build `d01acf59`), plus the dedicated
+`build-release-agent-off-20261027` configuration with its own private sdkconfig.
+The Agent-off build changes the Agent feature switch and is not a power control.
+
+Artifacts and the 63 host script results are under
+`dist/release-validation-20261026/manifest.json` in that worktree. Both builds
+have zero compiler warnings and pass M8 / compiled UI stack gates. The actual
+source identities and configuration hashes are in the manifest; documentation
+and host-port-only commits do not change the already built runtime source.
+See [integration record](../release/RELEASE_INTEGRATION_20261027.md) and the
+[unified acceptance checklist](../engineering/FIRMWARE_RELIABILITY_ACCEPTANCE.md)
+for device work still required.
+
 ## History
 
 - 2026-06-14: Removed 15 stale `build-*` dirs; moved 13 `.bat` files to `scripts/`;

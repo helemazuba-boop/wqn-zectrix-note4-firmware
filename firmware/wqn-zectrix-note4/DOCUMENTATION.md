@@ -149,6 +149,8 @@ by code, `AGENTS.md`, and the architecture/product references above.
 
 ## Release
 
+- `docs/release/RELEASE_INTEGRATION_20261027.md` — current cloud/firmware integration,
+  merge resolutions, host/SDK evidence and remaining device release gates.
 - `docs/release/RELEASE_CHECKLIST.md` — coordinated firmware and WQN release,
   including automated gates, device HIL, and rollback.
 
