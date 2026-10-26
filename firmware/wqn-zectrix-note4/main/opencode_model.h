@@ -66,6 +66,7 @@ struct AgentSessionState {
     // The session that raised the pending question; see pending_permission_session.
     std::string pending_question_session;
     std::vector<OpenCodeQuestionOption> pending_question_options;
+    bool question_allow_custom = true;
     // Session id whose transcript is already in the kAgent channel. Backfill
     // runs once per session, on switch and on first observe, so a reconnect
     // cannot append the same turns twice.

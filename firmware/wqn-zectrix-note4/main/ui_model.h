@@ -49,8 +49,11 @@ enum class AiSessionStatus {
     // status before a recording buffer exists.
     kPreparingCapture,
     kListening,
+    kTranscribing,
+    kAwaitingConfirmation,
+    kAwaitingDecision,
     kWaitingReply,
-    kStreaming,         // v2 SSE: connected, server is producing events
+    kStreaming, // v2 SSE: connected, server is producing events
     kReplyReady,
     kError,
 };
@@ -81,6 +84,9 @@ enum class ThinkingLevel : uint8_t {
 };
 
 struct AiSessionState {
+    std::string pending_input;
+    int64_t input_armed_at_ms = 0;
+    AiInteraction interaction;
     AiSessionStatus status = AiSessionStatus::kIdle;
     AiTier tier = AiTier::kStd;
     std::string user_text;
@@ -468,6 +474,8 @@ struct AgentOptionState {
 struct UiGestureState {
     bool flash_ptt_started = false;
     bool agent_ptt_started = false;
+    bool std_ptt_started = false;
+    int64_t std_decision_press_ms = 0;
     int64_t last_ai_confirm_tap_ms = 0;
     // [agent] Separate from last_ai_confirm_tap_ms on purpose: on the AI page a
     // double-confirm enters status-bar edit mode, but in the Agent session

@@ -25,7 +25,13 @@ void ArmAiVoicePreroll();
 // Request-id used by the SSE idempotency headers: 16 hex chars.
 std::string GenerateRequestId();
 esp_err_t StartAiRecordingSession();
+// Release stops capture and transcribes only. ConfirmAiPrompt is the sole submit gate.
 esp_err_t StopAiRecordingAndSubmit();
+esp_err_t ConfirmAiPrompt(int64_t confirmed_at_ms);
+void CancelAiPrompt();
+void CancelAiVoiceInput();
+void LeaveStdAiTier();
+esp_err_t ReplyAiInteraction(int index);
 // Clear STD/PRO conversation context (AiHistory + conversation_id + display
 // state). Called on leave-AI-screen so each visit starts a fresh conversation;
 // the cloud (esp32_ai_conversations) keeps the saved history for reuse later.

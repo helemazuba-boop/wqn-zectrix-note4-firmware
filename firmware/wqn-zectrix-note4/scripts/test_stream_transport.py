@@ -42,6 +42,7 @@ struct esp_http_client_event_t {
     int data_len;
 };
 constexpr int HTTP_METHOD_POST = 1;
+constexpr int ESP_ERR_HTTP_EAGAIN = 0x7007;
 struct esp_http_client_config_t {
     const char* url;
     int method, timeout_ms;

@@ -17,6 +17,7 @@ static int checks = 0;
 #define CHECK(x) do { ++checks; if (!(x)) { std::fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #x); std::abort(); } } while (0)
 struct Scenario {
     int status = 200, write_max = 2048;
+    int quiet_reads = 0;
     int64_t init_us = 0, open_us = 0, write_us = 0, headers_us = 0, packet_us = 0;
     bool fail_init = false, fail_open = false, fail_write = false, fail_headers = false;
     bool data_in_headers = false, drain_in_read = false, fail_read = false;
@@ -30,6 +31,7 @@ struct HostClient {
     size_t packet = 0;
 };
 static HostClient client;
+static std::string requested_url,request_body;
 static int64_t clock_us = 0;
 static int cleanup_count = 0, close_count = 0, read_count = 0, write_count = 0, written = 0;
 static std::vector<int> timeouts;
@@ -56,7 +58,7 @@ static void Emit(esp_http_client_event_id_t id, const std::string& data = {}) {
 esp_http_client_handle_t esp_http_client_init(const esp_http_client_config_t* cfg) {
     clock_us += scenario.init_us;
     if (scenario.fail_init) return nullptr;
-    client = HostClient{}; client.cfg = *cfg; return &client;
+    client = HostClient{}; client.cfg = *cfg; requested_url=cfg->url; return &client;
 }
 esp_err_t esp_http_client_set_header(HostClient*, const char* k, const char* v) {
     headers[k] = v; return ESP_OK;
@@ -69,10 +71,10 @@ esp_err_t esp_http_client_open(HostClient*, int) {
     if (scenario.fail_open) return ESP_FAIL;
     Emit(HTTP_EVENT_ON_CONNECTED); return ESP_OK;
 }
-int esp_http_client_write(HostClient*, const char*, int len) {
+int esp_http_client_write(HostClient*, const char* data, int len) {
     ++write_count; clock_us += scenario.write_us;
     if (scenario.fail_write) return -1;
-    const int count = std::min(len, scenario.write_max); written += count; return count;
+    const int count = std::min(len, scenario.write_max); request_body.append(data,count); written += count; return count;
 }
 static int Packet() {
     if (client.packet == scenario.packets.size()) return 0;
@@ -92,6 +94,7 @@ int esp_http_client_get_status_code(HostClient*) { return client.status; }
 int esp_http_client_get_errno(HostClient*) { return client.socket_errno; }
 int esp_http_client_read(HostClient*, char*, int) {
     ++read_count;
+    if (scenario.quiet_reads > 0) { --scenario.quiet_reads;clock_us+=200000;return -ESP_ERR_HTTP_EAGAIN; }
     if (client.closed) return -1;
     if (scenario.fail_read) {
         client.socket_errno = ECONNRESET; errno = EINVAL; return -1;
@@ -130,6 +133,7 @@ static wqn::WqnAiStreamRequest Request() {
 }
 static void Reset() {
     scenario = Scenario{}; clock_us = 0; cleanup_count = close_count = read_count = write_count = written = 0;
+    requested_url.clear();request_body.clear();
     headers.clear(); timeouts.clear(); delivered.clear(); log_lines.clear(); callback_us = 0; errno = 0;
     response = wqn::WqnAiChatResponse{};
 }
@@ -263,6 +267,37 @@ int main() {
     scenario.data_in_headers = true; scenario.packets = {std::string(17000, 'x')}; Timeout();
     auto request = Request(); request.pcm_sample_count = static_cast<size_t>(INT_MAX);
     CHECK(wqn::UploadAiAudioChatStream(request, &response) == ESP_ERR_INVALID_ARG);
+
+    // Confirmed text travels only to the interactive route; audio-only
+    // transcription never reaches the chat endpoint.
+    Reset();scenario.packets={final_frame};
+    auto text_request=Request();text_request.confirmed_text="已确认的输入";
+    text_request.pcm_data=nullptr;text_request.pcm_sample_count=0;
+    CHECK(wqn::UploadAiAudioChatStream(text_request,&response)==ESP_OK);
+    CHECK(requested_url.find("/ai/chat?protocol=v2-streaming")!=std::string::npos);
+    CHECK(headers["Content-Type"]=="application/json"&&headers["X-WQN-Ai-Interaction"]=="1");
+    CHECK(request_body.find("已确认的输入")!=std::string::npos&&request_body.find("true")!=std::string::npos);
+    Reset();scenario.packets={final_frame};auto asr_request=Request();asr_request.transcribe_only=true;
+    CHECK(wqn::UploadAiAudioChatStream(asr_request,&response)==ESP_OK);
+    CHECK(requested_url.find("/agent/transcribe?")!=std::string::npos);
+    CHECK(headers.find("X-WQN-Ai-Interaction")==headers.end());
+    Reset();scenario.packets={delta_frame,final_frame};auto pumping=Request();int pumped=0;
+    pumping.pump=[](void* value){++*static_cast<int*>(value);};pumping.pump_ctx=&pumped;
+    CHECK(wqn::UploadAiAudioChatStream(pumping,&response)==ESP_OK&&pumped>=1);
+    Reset();scenario.quiet_reads=2;scenario.packets={final_frame};auto quiet=Request();quiet.timeout_ms=2000;
+    quiet.pump=[](void* value){++*static_cast<int*>(value);};quiet.pump_ctx=&pumped;pumped=0;
+    CHECK(wqn::UploadAiAudioChatStream(quiet,&response)==ESP_OK&&pumped>=3);
+    Reset();auto cancelled_request=Request();cancelled_request.cancelled=[] {return true;};
+    CHECK(wqn::UploadAiAudioChatStream(cancelled_request,&response)!=ESP_OK);
+    CHECK(response.error_code=="cancelled"&&written==0);
+    wqn::WqnAiSseEvent decision;
+    const std::string question=R"({"interaction_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","kind":"question","prompt":"选择","allow_custom":true,"options":[{"value":"yes","label":"是"}]})";
+    CHECK(wqn::DecodeSseEvent("interaction.request",1,question,&decision));
+    CHECK(decision.kind==wqn::WqnAiSseEvent::Kind::kInteractionRequest&&decision.interaction.options.size()==1);
+    CHECK(!wqn::DecodeSseEvent("interaction.request",2,R"({"interaction_id":"short","kind":"write","prompt":"x","options":[]})",&decision));
+
+    Reset();scenario.packets={"event: interaction.request\ndata: {}\n\n",final_frame};
+    CHECK(Run()!=ESP_OK&&response.error_code=="invalid_response");
 
     CHECK(wqn::BuildVoiceWebSocketUrl() == "wss://wqn.helema.cn/api/esp32/realtime");
     CHECK(wqn::BuildVoiceWebSocketUrl("http://dev.local:3000/api/esp32", "/voice", "") == "ws://dev.local:3000/voice");

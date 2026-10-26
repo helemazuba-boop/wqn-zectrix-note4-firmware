@@ -69,6 +69,7 @@ These are feature design, implementation, or regression records for the native
 UI. Use the architecture and development references above for system-wide rules.
 
 - `docs/ui/AGENT_UI_REFINEMENT.md` — Agent page layout and interaction work.
+- `docs/ui/STD_AI_INTERACTION.md` — STD input confirmation, device questions, and MCP write decisions.
 - `docs/ui/HOME_UI_REWRITE.md` — home screen presentation and standby behavior.
 - `docs/ui/NOTE_UI_REFINEMENT.md` — Note list, reader, paging, and refresh work.
 - `docs/ui/PROBLEM_UI_REFINEMENT.md` — problem review layouts and interaction.

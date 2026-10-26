@@ -114,6 +114,11 @@ void DispatchEvent(StreamContext* ctx, const wqn::SseFrameBuffer& /*frame*/,
     ESP_LOGW(kTag, "SSE JSON parse failed: bytes=%u req=%s",
              static_cast<unsigned>(data_json.size()),
              wqn::voice_diagnostics::SafeKey(ctx->request.request_id.c_str()));
+    if (event_name == "interaction.request") {
+      ctx->fatal = true;
+      ctx->error_code = "invalid_response";
+      ctx->error_message = "暂时无法显示确认，请稍后重试";
+    }
     return;
   }
 
@@ -123,8 +128,8 @@ void DispatchEvent(StreamContext* ctx, const wqn::SseFrameBuffer& /*frame*/,
   ++ctx->decoded_events;
   // A heartbeat/unknown event or repeated stage is traffic, not business
   // progress. This observation never renews or changes the request budget.
-  bool progress = k != Kind::kUnknown && k != Kind::kReady &&
-                  k != Kind::kState && k != Kind::kStage;
+  bool progress = k != Kind::kUnknown && k != Kind::kReady && k != Kind::kState &&
+                  k != Kind::kStage && k != Kind::kInteractionWaiting;
   if (k == Kind::kAsrDelta || k == Kind::kThinkingDelta || k == Kind::kTextDelta) {
     progress = !ev.delta.empty() || !ev.text.empty() || !ev.full_text.empty();
   }
@@ -235,6 +240,12 @@ void DispatchEvent(StreamContext* ctx, const wqn::SseFrameBuffer& /*frame*/,
 
 bool CheckDeadline(StreamContext* ctx)
 {
+  if (ctx->request.cancelled != nullptr && ctx->request.cancelled()) {
+    ctx->fatal = true;
+    ctx->error_code = "cancelled";
+    ctx->error_message = "input cancelled";
+    return false;
+  }
   if (ctx->terminal_event_seen || ctx->fatal) {
     return !ctx->timed_out;
   }
@@ -456,19 +467,40 @@ esp_err_t UploadAiAudioChatStream(const WqnAiStreamRequest& request,
   if (!wqn::IsValidAccessToken(request.token)) {
     return ESP_ERR_INVALID_STATE;
   }
-  if (request.pcm_data == nullptr || request.pcm_sample_count == 0 ||
-      request.duration_ms <= 0 || request.pcm_sample_count > INT_MAX / sizeof(int16_t)) {
+  const bool text_request = !request.confirmed_text.empty();
+  if (request.confirmed_text.size() > 4096 ||
+      (!text_request &&
+       (request.pcm_data == nullptr || request.pcm_sample_count == 0 || request.duration_ms <= 0 ||
+        request.pcm_sample_count > INT_MAX / sizeof(int16_t)))) {
     return ESP_ERR_INVALID_ARG;
   }
 
   const int timeout_ms = request.timeout_ms > 0 ? request.timeout_ms : WQN_AI_SSE_TIMEOUT_MS;
   const int64_t deadline_us = esp_timer_get_time() + static_cast<int64_t>(timeout_ms) * 1000;
-  const uint8_t* pcm_bytes =
-      reinterpret_cast<const uint8_t*>(request.pcm_data);
-  const size_t pcm_size = request.pcm_sample_count * sizeof(int16_t);
+  std::string json_body;
+  if (text_request) {
+    cJSON* body = cJSON_CreateObject();
+    if (body == nullptr)
+      return ESP_ERR_NO_MEM;
+    cJSON_AddStringToObject(body, "text", request.confirmed_text.c_str());
+    cJSON_AddBoolToObject(body, "confirmed", true);
+    char* encoded = cJSON_PrintUnformatted(body);
+    cJSON_Delete(body);
+    if (encoded == nullptr)
+      return ESP_ERR_NO_MEM;
+    json_body = encoded;
+    cJSON_free(encoded);
+  }
+  const uint8_t* pcm_bytes = text_request ? reinterpret_cast<const uint8_t*>(json_body.data())
+                                          : reinterpret_cast<const uint8_t*>(request.pcm_data);
+  const size_t pcm_size =
+      text_request ? json_body.size() : request.pcm_sample_count * sizeof(int16_t);
 
   // Build the URL with the protocol query so v2 servers unambiguously switch.
-  std::string url = std::string(WQN_API_BASE) + WQN_AI_SSE_REQUEST_PATH +
+  std::string url = std::string(WQN_API_BASE) +
+                    (text_request              ? "/ai/chat"
+                     : request.transcribe_only ? "/agent/transcribe"
+                                               : WQN_AI_SSE_REQUEST_PATH) +
                     "?protocol=v2-streaming";
 
   StreamContext ctx;
@@ -499,7 +531,10 @@ esp_err_t UploadAiAudioChatStream(const WqnAiStreamRequest& request,
 
   std::string auth = "Bearer " + request.token;
   esp_http_client_set_header(client, "Authorization", auth.c_str());
-  esp_http_client_set_header(client, "Content-Type", "application/octet-stream");
+  esp_http_client_set_header(client, "Content-Type",
+                             text_request ? "application/json" : "application/octet-stream");
+  if (text_request)
+    esp_http_client_set_header(client, "X-WQN-Ai-Interaction", "1");
   esp_http_client_set_header(client, "X-WQN-Audio-Sample-Rate", "16000");
   esp_http_client_set_header(client, "X-WQN-Audio-Sample-Format", "s16le");
   esp_http_client_set_header(client, "X-WQN-Audio-Channels", "1");
@@ -561,12 +596,30 @@ esp_err_t UploadAiAudioChatStream(const WqnAiStreamRequest& request,
     ctx.phase = "read";
     char buf[1024];
     while (!ctx.fatal && !ctx.terminal_event_seen && ApplyRemainingTimeout(&ctx, client)) {
+      if (request.pump != nullptr)
+        request.pump(request.pump_ctx);
+      if (!CheckDeadline(&ctx))
+        break;
+      const bool interactive_poll = request.pump != nullptr || request.cancelled != nullptr;
+      if (interactive_poll) {
+        // IDF returns -ESP_ERR_HTTP_EAGAIN on a quiet socket. Keep one
+        // absolute turn budget, but give its owner a bounded chance to drain
+        // decisions/cancellation even while the model is silent.
+        const int remaining = static_cast<int>((deadline_us - esp_timer_get_time()) / 1000);
+        if (esp_http_client_set_timeout_ms(client, std::max(1, std::min(500, remaining))) !=
+            ESP_OK) {
+          err = ESP_FAIL;
+          break;
+        }
+      }
       const int r = esp_http_client_read(client, buf, sizeof(buf));
       ctx.last_read_result = r;
       ctx.last_read_errno = r < 0 ? esp_http_client_get_errno(client) : 0;
       if (ctx.terminal_event_seen || ctx.fatal) {
         LogHttpTrace(&ctx, "read_return", r < 0 ? ESP_FAIL : ESP_OK);
       }
+      if (interactive_poll && r == -ESP_ERR_HTTP_EAGAIN)
+        continue;
       if (r < 0) {
         err = ESP_FAIL;
         break;

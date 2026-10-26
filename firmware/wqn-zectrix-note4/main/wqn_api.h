@@ -1,4 +1,5 @@
 #pragma once
+#include "ai_interaction.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -408,6 +409,9 @@ struct WqnAiSseEvent {
         kTextStart,
         kTextDelta,
         kTextEnd,
+        kInteractionRequest,
+        kInteractionWaiting,
+        kInteractionClosed,
         kToolStart,
         kToolResult,
         kToolError,
@@ -416,6 +420,7 @@ struct WqnAiSseEvent {
         kError,
         kFinal,
     };
+    AiInteraction interaction;
     Kind kind = Kind::kUnknown;
     uint64_t event_id = 0;
     std::string raw_json;
@@ -450,6 +455,12 @@ typedef void (*WqnAiSseCallback)(const WqnAiSseEvent& event, void* user_ctx);
 
 struct WqnAiStreamRequest {
     std::string token;
+    std::string confirmed_text;
+    bool transcribe_only = false;
+    // Called only by the stream owner between reads, never by the SSE callback.
+    void (*pump)(void*) = nullptr;
+    void* pump_ctx = nullptr;
+    bool (*cancelled)() = nullptr;
     // Borrowed mono s16le 16 kHz samples. UploadAiAudioChatStream is
     // synchronous; the caller keeps this storage valid until it returns.
     const int16_t* pcm_data = nullptr;
@@ -481,6 +492,9 @@ struct WqnAiStreamRequest {
 // A blocking SDK connect/header call or user callback can outlive the budget;
 // expiry is checked again when control returns. No automatic retry is made.
 esp_err_t UploadAiAudioChatStream(const WqnAiStreamRequest& request, WqnAiChatResponse* response);
+
+esp_err_t PostAiInteractionReply(const std::string& token, const std::string& id,
+                                 const std::string& answer, std::string* error);
 
 esp_err_t ParseTodoListResponse(const std::string& body, WqnTodoListPage* page);
 esp_err_t ParseTodoCompleteResponse(const std::string& body, WqnTodoItem* todo);

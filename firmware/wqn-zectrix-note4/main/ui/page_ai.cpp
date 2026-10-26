@@ -41,6 +41,12 @@ const char* AiStatusLabel(wqn::AiSessionStatus status)
     switch (status) {
         case wqn::AiSessionStatus::kPreparingCapture:
             return "准备录音";
+        case wqn::AiSessionStatus::kTranscribing:
+            return "转写中";
+        case wqn::AiSessionStatus::kAwaitingConfirmation:
+            return "确认发送";
+        case wqn::AiSessionStatus::kAwaitingDecision:
+            return "等你回答";
         case wqn::AiSessionStatus::kListening:
             return "录音";
         case wqn::AiSessionStatus::kWaitingReply:
@@ -769,7 +775,10 @@ esp_err_t RenderAiToEpd(const wqn::UiFrame& frame, RefreshSchedule schedule)
     // reserve 22 px here, which was the Agent tier's option bar charged to a
     // page that never drew one -- a permanent blank strip at the bottom of every
     // STD/Flash transcript.
-    RenderAiHistoryViewport(ai, frame.ai_history, ai.scroll_offset_lines, 0);
+    RenderAiHistoryViewport(ai, frame.ai_history, ai.scroll_offset_lines,
+                            ai.tier == wqn::AiTier::kStd ? StdAiBottomReserve(ai) : 0);
+    if (ai.tier == wqn::AiTier::kStd)
+        DrawStdAiInteraction(frame);
 
     return RefreshFrame(frame, schedule);
 }

@@ -9,6 +9,7 @@
 #include <vector>
 #include "display_service.h"
 #include "opencode_session.h"
+#include "ai_interaction.h"
 #include "button_event.h"
 #include "ui/ai_text_layout.h"
 #include "ui/ai_scroll_geometry.h"
@@ -45,16 +46,22 @@ const char* AiFeaturePhaseLabel(AiFeaturePhase) { return "空闲"; }
 struct HomeSummary {};
 struct StatusBarEditState { bool active=false; int selected=0; };
 enum class UiScreen { kAi,kTodo };
-enum class AiTier { kAgent };
+@@AI_MODEL@@
 struct UiState {
     UiScreen screen=UiScreen::kAi;
-    struct { AiTier tier=AiTier::kAgent; } ai;
+    AiSessionState ai = []{ AiSessionState value; value.tier=AiTier::kAgent; return value; }();
     AgentSessionState agent;
     struct { uint8_t focused=0; } agent_option;
-    struct { int64_t last_agent_confirm_tap_ms=0; } gestures;
+    struct { int64_t last_agent_confirm_tap_ms=0; int64_t std_decision_press_ms=0; } gestures;
 };
 int sends=0, discards=0, approvals=0, denials=0, answers=0, interrupts=0, creates=0, locks=0, observes=0, moves=0;
 int answer_index=-1;
+int std_sends=0,std_discards=0,std_answers=0;
+AiSessionState std_backend;
+int ConfirmAiPrompt(int64_t) { ++std_sends; std_backend.status=AiSessionStatus::kWaitingReply;std_backend.pending_input.clear();return ESP_OK; }
+void CancelAiPrompt() { ++std_discards;std_backend.pending_input.clear();std_backend.status=AiSessionStatus::kIdle; }
+int ReplyAiInteraction(int) { ++std_answers;std_backend.interaction.sending=true;return ESP_OK; }
+bool CopyAiSessionToUi(AiSessionState* target) { *target=std_backend;return true; }
 AgentSessionState backend;
 int ConfirmOpenCodePrompt(int64_t) { ++sends;return ESP_OK; }
 void CancelOpenCodePrompt() { ++discards; }
@@ -75,7 +82,7 @@ void MarkChangedLocked() { ++changes; }
 @@SCROLL_OWNER@@
 struct UiFrame {
     UiScreen screen=UiScreen::kAi;
-    struct { AiTier tier=AiTier::kAgent; } ai;
+    AiSessionState ai = []{ AiSessionState value; value.tier=AiTier::kAgent; return value; }();
     AgentSessionState agent;
     struct { int focused=0; } agent_option;
 };
@@ -100,6 +107,7 @@ void DrawDashedRect(int x,int y,int w,int h) { DrawRect(x,y,w,h); }
 enum class AgentOption { kSend,kReinput,kApprove,kDeny,kCount };
 enum class AgentOptionMode { kNone,kPermission,kQuestion,kConfirmSend };
 @@BAR_CONSTANTS@@
+void DrawAgentPendingBubble(const std::string&, const char*, size_t = 3);
 @@DECISIONS@@
 enum class RefreshSchedule { kNone,kAi };
 void SyncAgentSnapshot(wqn::UiState*) {}
@@ -108,6 +116,7 @@ void SyncAgentSnapshot(wqn::UiState*) {}
 @@INPUT@@
 @@PICKER@@
 @@STATUS@@
+@@STD_UI@@
 std::string AgentSignature(const wqn::UiFrame& frame) {
     std::string signature;
 @@SIGNATURE@@
@@ -224,5 +233,39 @@ int main(int argc,char**argv) {
     const auto changed=wqn::changes;CHECK(!wqn::ScrollOpenCodeResponse(1,-10,40,step));CHECK(wqn::changes==changed);
     for(int i=0;i<5;++i)wqn::ScrollOpenCodeResponse(-1,-10,40,step);
     CHECK(wqn::backend.ui.scroll_offset_lines==-10);CHECK(!wqn::ScrollOpenCodeResponse(-1,-10,40,step));
-    std::printf("Agent production UI: %d assertions passed\n",checks);
+    // STD uses the same pixels/option window, with a separate backend adapter.
+    state={};state.ai.tier=wqn::AiTier::kStd;state.ai.status=wqn::AiSessionStatus::kAwaitingConfirmation;
+    state.ai.pending_input="这句话还没有发送";wqn::std_backend=state.ai;
+    RefreshSchedule std_schedule=RefreshSchedule::kNone;
+    auto std_event=[&](wqn::ButtonId button,wqn::ButtonEventType type) {
+        CHECK(ApplyStdAiInteractionEvent({button,type},3000,&state,&std_schedule));
+    };
+    for(auto type:{wqn::ButtonEventType::kPress,wqn::ButtonEventType::kHoldPress,wqn::ButtonEventType::kLongPress,wqn::ButtonEventType::kLongRelease,wqn::ButtonEventType::kRelease})
+        std_event(wqn::ButtonId::kConfirm,type);
+    CHECK(wqn::std_sends==0);
+    std_event(wqn::ButtonId::kConfirm,wqn::ButtonEventType::kShortPress);CHECK(wqn::std_sends==0);
+    std_event(wqn::ButtonId::kConfirm,wqn::ButtonEventType::kPress);
+    std_event(wqn::ButtonId::kConfirm,wqn::ButtonEventType::kShortPress);CHECK(wqn::std_sends==1);
+    state.ai.status=wqn::AiSessionStatus::kAwaitingConfirmation;state.ai.pending_input="discard";
+    wqn::std_backend=state.ai;state.agent_option.focused=1;
+    std_event(wqn::ButtonId::kConfirm,wqn::ButtonEventType::kPress);
+    std_event(wqn::ButtonId::kConfirm,wqn::ButtonEventType::kShortPress);CHECK(wqn::std_discards==1);
+    CHECK(state.ai.status==wqn::AiSessionStatus::kIdle&&state.ai.pending_input.empty());
+    state.ai.status=wqn::AiSessionStatus::kAwaitingDecision;state.ai.interaction.id="question";
+    state.ai.interaction.kind="question";state.ai.interaction.prompt="请选择提醒时间";
+    for(int i=0;i<8;++i)state.ai.interaction.options.push_back({std::to_string(i),"选项"+std::to_string(i)});
+    state.ai.interaction.allow_custom=true;state.agent_option.focused=0;wqn::std_backend=state.ai;
+    std_event(wqn::ButtonId::kUp,wqn::ButtonEventType::kShortPress);CHECK(state.agent_option.focused==8);
+    std_event(wqn::ButtonId::kConfirm,wqn::ButtonEventType::kPress);
+    std_event(wqn::ButtonId::kConfirm,wqn::ButtonEventType::kShortPress);CHECK(wqn::std_answers==1&&state.ai.interaction.sending);
+    std_event(wqn::ButtonId::kConfirm,wqn::ButtonEventType::kShortPress);CHECK(wqn::std_answers==1);
+    wqn::UiFrame std_frame;std_frame.ai=state.ai;std_frame.ai.interaction.sending=false;
+    wqn::ClearEpdFramebuffer();DrawStdAiInteraction(std_frame);CheckBounds();
+    CHECK(StdAiBottomReserve(std_frame.ai)==22);
+    std_frame.ai.interaction.prompt="新增 Todo：复习数学\n截止：2026/10/27 23:59:59\n提醒：2026/10/27 09:00:00";
+    std_frame.ai.interaction.kind="write";std_frame.ai.interaction.allow_custom=false;
+    std_frame.ai.interaction.options={{"approve","执行"},{"reject","取消"}};
+    auto std_surface=StdDecisionSurface(std_frame.ai);CHECK(AgentQuestionItemCount(std_surface)==2);
+    wqn::ClearEpdFramebuffer();DrawStdAiInteraction(std_frame);CheckBounds();Save(folder,"std-write-confirmation");
+    std::printf("Agent and STD production UI: %d assertions passed\n",checks);
 }

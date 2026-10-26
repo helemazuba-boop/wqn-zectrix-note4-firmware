@@ -41,7 +41,7 @@ std::array<uint8_t, 400 * 300> pixels;
 
 namespace wqn {
 enum class AiTier { kFlash, kStd, kAgent };
-enum class AiSessionStatus { kIdle, kPreparingCapture, kListening };
+enum class AiSessionStatus { kIdle, kPreparingCapture, kListening, kTranscribing, kAwaitingConfirmation, kAwaitingDecision };
 enum class AiFeaturePhase { kIdle, kRecording };
 @@SETTINGS_DIALOG@@
 enum class WordObservationCommitState { kIdle, kPersisting };
@@ -85,7 +85,7 @@ struct UiState {
     } agent;
     struct { SettingsDialog dialog = SettingsDialog::kNone; bool sync_confirm_pending = false; unsigned volume_save_op_id = 0; } settings;
     struct { bool active = false; } status_edit;
-    struct { bool flash_ptt_started = false, agent_ptt_started = false; int last_ai_confirm_tap_ms = 0; } gestures;
+    struct { bool flash_ptt_started = false, agent_ptt_started = false, std_ptt_started = false; int last_ai_confirm_tap_ms = 0; } gestures;
 };
 struct UiFrame {
     UiScreen screen = UiScreen::kHome;
@@ -102,6 +102,7 @@ void ClampUiSelection(UiState*) { ++calls.clamp; }
 void ReleaseNoteImagePayload(NoteState*) { ++calls.note; }
 void ReleaseProblemImagePayload(ProblemState*) { ++calls.problem; }
 void StopFlashSession() { ++calls.flash; }
+void LeaveStdAiTier() {}
 void LeaveOpenCodeAgentTier() { ++calls.leave; }
 int RequestOpenCodeSessionList() { ++calls.list; return ESP_OK; }
 int ObserveOpenCodeSession() { ++calls.observe; return ESP_OK; }
@@ -338,6 +339,12 @@ void CheckGatesAndEffects() {
         if (mode == 5) state.agent.ui.phase = AiFeaturePhase::kRecording;
         CHECK(!CanOpenNavigation(state));
     }
+    for (auto pending : {AiSessionStatus::kTranscribing, AiSessionStatus::kAwaitingConfirmation, AiSessionStatus::kAwaitingDecision}) {
+        state = {}; state.screen = UiScreen::kAi; state.ai.tier = AiTier::kStd; state.ai.status = pending;
+        CHECK(!CanOpenNavigation(state));
+    }
+    state = {}; state.screen = UiScreen::kAi; state.gestures.std_ptt_started = true;
+    CHECK(!CanOpenNavigation(state));
     state = {}; state.screen = UiScreen::kAi; state.ai.tier = AiTier::kAgent;
     state.agent.session_locked = false;
     CHECK(CanOpenNavigation(state)); // Empty session lists have no local Back gesture.

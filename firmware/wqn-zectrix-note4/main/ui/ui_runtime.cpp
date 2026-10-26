@@ -1057,6 +1057,16 @@ UiUpdate UiRuntime::DispatchAiStreamingSnapshot(const wqn::AiStreamingStatusView
 
 UiUpdate UiRuntime::DispatchAiSessionSnapshot(const wqn::AiSessionState& snapshot)
 {
+    if (state_.ai.interaction.id != snapshot.interaction.id ||
+        state_.ai.status != snapshot.status) {
+        state_.agent_option.focused = 0;
+        state_.gestures.std_decision_press_ms = 0;
+    }
+    if (snapshot.status == wqn::AiSessionStatus::kAwaitingConfirmation ||
+        snapshot.status == wqn::AiSessionStatus::kAwaitingDecision) {
+        state_.status_edit.active = false;
+        state_.gestures.last_ai_confirm_tap_ms = 0;
+    }
     state_.ai = snapshot;
     // Keep the logical state in "preparing" immediately, but do not wake the
     // EPD while the ES8311 is being configured.  A physical panel refresh was
@@ -1096,7 +1106,10 @@ UiUpdate UiRuntime::DispatchAiViewportFollow()
                                        : wqn::AiHistoryChannel::kStdPro);
     const bool follow_active =
         agent_tier ? state_.agent.follow_active : state_.ai.follow_active;
-    if (!state_.ai.auto_follow || !follow_active) {
+    if (!state_.ai.auto_follow || !follow_active ||
+        (!agent_tier && (state_.ai.status == wqn::AiSessionStatus::kTranscribing ||
+                         state_.ai.status == wqn::AiSessionStatus::kAwaitingConfirmation ||
+                         state_.ai.status == wqn::AiSessionStatus::kAwaitingDecision))) {
         return FinishEvent(kEvent, RefreshSchedule::kNone, false);
     }
 
