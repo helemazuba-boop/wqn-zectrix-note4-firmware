@@ -28,9 +28,10 @@ enum class CmdDisposition { kExecuted };
 std::string std_url, flash_url;
 int completion = -1, cleanup = 0;
 void PublishCompletion(int, int result, CmdDisposition) { completion = result; }
+void LogWsPhase(const char*, const char*, int, esp_err_t) {}
 void Std() {
     struct { const char* uri = nullptr; } cfg;
-    struct { int gen = 1; } cmd;
+    struct { int gen = 1; const char* request_id = "fixture"; } cmd;
     @@STD@@
     std_url = cfg.uri;
 }
