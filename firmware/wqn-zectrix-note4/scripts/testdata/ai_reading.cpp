@@ -13,6 +13,7 @@
 #include "display_service.h"
 #include "ai_history.h"
 #include "ai_interaction.h"
+#include "opencode_session.h"
 #include "ui/ai_native_text.h"
 #include "ui/ai_scroll_geometry.h"
 #include "ui/ai_text_layout.h"
@@ -47,6 +48,20 @@ int MeasureUtf8TextWidth(const char* text) {
 }
 esp_err_t DrawUtf8Text(int x,int y,const char* text,bool ink) { DrawTextWithFont(x,y,PrimaryUiFont(),text,ink);return ESP_OK; }
 @@AI_MODEL@@
+enum class UiScreen { kAi,kHome };
+struct UiState { UiScreen screen=UiScreen::kAi;AiSessionState ai;AgentSessionState agent; };
+AgentSessionState g_state;
+std::shared_ptr<const AiHistorySnapshot> follow_snapshots[3];
+std::shared_ptr<const AiHistorySnapshot> GetAiHistorySnapshot(AiHistoryChannel channel) { return follow_snapshots[static_cast<int>(channel)]; }
+void* g_lock=reinterpret_cast<void*>(1);
+constexpr int portMAX_DELAY=0;
+void xSemaphoreTake(void*,int) {}
+void xSemaphoreGive(void*) {}
+int follow_marks=0;
+void MarkChangedLocked() { ++follow_marks; }
+void SetAiFollowState(bool,bool) {}
+void SetAiScrollOffsetLinesClamped(int32_t,int32_t,int32_t) {}
+@@FOLLOW_OWNER@@
 }
 
 namespace device_ui_internal {
@@ -68,6 +83,16 @@ esp_err_t DrawMarkdownLine(const MdLine&,int,int,int,int,const lv_font_t* font=n
 namespace device_ui_internal {
 #define DRC(...) do { (void)wqn::DrawUtf8Text(__VA_ARGS__); } while(0)
 @@PAGE@@
+}
+
+namespace device_ui_internal {
+enum class AppEventKind { kAiViewportFollow };
+enum class RefreshSchedule { kNone,kAi };
+struct UiUpdate { bool changed; };
+int AiBottomReserve(const wqn::AgentSessionState& agent) { return agent.ui.requires_confirmation || !agent.pending_permission_id.empty() || !agent.pending_question_id.empty() ? 22 : 0; }
+struct UiRuntime { wqn::UiState state_;UiUpdate DispatchAiViewportFollow();UiUpdate FinishEvent(AppEventKind,RefreshSchedule,bool changed) {return {changed};} };
+#define ESP_LOGI(...) do {} while(0)
+@@FOLLOW_RUNTIME@@
 }
 
 void Save(const std::string& folder,const std::string& name) {
@@ -176,6 +201,54 @@ int main(int argc,char**argv) {
     CHECK(collapsed_layout->total_content_h<expanded_layout->total_content_h);
     RenderAiHistoryViewport(ai,details,0,0);CHECK(wqn::pixels!=agent_pixels);
     ai.expand_content=true;CHECK(wqn::AiHistoryContentExpanded(ai));ai.tier=wqn::AiTier::kAgent;
+    // Replay the production follow dispatcher and epoch-checked owner. The
+    // same event sequence must land on the same final answer at any UI cadence.
+    auto tick=[&](UiRuntime& runtime,const std::shared_ptr<wqn::AiHistorySnapshot>& history) {
+        wqn::follow_snapshots[static_cast<int>(wqn::AiHistoryChannel::kAgent)]=history;
+        runtime.DispatchAiViewportFollow();runtime.state_.agent=wqn::g_state;
+    };
+    auto thinking=std::make_shared<wqn::AiHistorySnapshot>();thinking->revision=10000;
+    thought.id=10000;thought.text.clear();for(int i=0;i<30;++i)thought.text+="THINK-"+std::to_string(i)+"\n";
+    thinking->messages={user,thought};
+    auto preface=std::make_shared<wqn::AiHistorySnapshot>(*thinking);preface->revision++;
+    reply.id=10001;reply.text="I will inspect it first.";preface->messages.push_back(reply);
+    auto working=std::make_shared<wqn::AiHistorySnapshot>(*preface);working->revision++;
+    tool.id=10002;tool.kind=wqn::ChatMessageKind::kToolStart;working->messages.push_back(tool);
+    auto answered=std::make_shared<wqn::AiHistorySnapshot>(*working);answered->revision++;
+    reply.id=10003;reply.text="Final answer";for(int i=0;i<25;++i)reply.text+="\nANSWER-"+std::to_string(i);
+    answered->messages.push_back(reply);
+    int32_t final_top=0;CHECK(GetAiNewestAnswerTopOffsetLines(answered,true,0,&final_top));
+    for(bool sample_preface:{false,true}) {
+        UiRuntime runtime;runtime.state_.ai.tier=wqn::AiTier::kAgent;
+        wqn::g_state={};wqn::g_state.ui.phase=wqn::AiFeaturePhase::kRunning;
+        wqn::follow_snapshots[2]=thinking;wqn::ArmAgentFollowLocked();runtime.state_.agent=wqn::g_state;
+        tick(runtime,thinking);CHECK(runtime.state_.agent.follow_active);
+        if(sample_preface){tick(runtime,preface);CHECK(runtime.state_.agent.follow_active);}
+        tick(runtime,working);CHECK(runtime.state_.agent.follow_active);
+        tick(runtime,answered);CHECK(runtime.state_.agent.ui.scroll_offset_lines==final_top);
+        CHECK(runtime.state_.agent.follow_active);
+        // More body text stays parked at its first line, then a later round
+        // is followed without undoing a manual reading decision.
+        wqn::g_state.ui.phase=wqn::AiFeaturePhase::kComplete;runtime.state_.agent=wqn::g_state;
+        tick(runtime,answered);CHECK(!runtime.state_.agent.follow_active);
+    }
+    UiRuntime resumed;resumed.state_.ai.tier=wqn::AiTier::kAgent;
+    wqn::g_state={};wqn::g_state.ui.phase=wqn::AiFeaturePhase::kRunning;
+    wqn::follow_snapshots[2]=answered;wqn::ArmAgentFollowLocked();resumed.state_.agent=wqn::g_state;
+    tick(resumed,answered);CHECK(resumed.state_.agent.follow_active);
+    CHECK(resumed.state_.agent.ui.scroll_offset_lines!=final_top); // old answer is not the resumed body
+    const auto stale_epoch=wqn::g_state.follow_epoch;
+    wqn::ArmAgentFollowLocked();
+    CHECK(!wqn::ApplyOpenCodeViewportFollow(stale_epoch,0,-100,100,true));
+    const auto epoch=wqn::g_state.follow_epoch;
+    wqn::SetOpenCodeFollowState(false,true);const auto manual_offset=wqn::g_state.ui.scroll_offset_lines;
+    CHECK(!wqn::ApplyOpenCodeViewportFollow(epoch,0,-100,100,false));
+    resumed.state_.agent=wqn::g_state;tick(resumed,working);
+    CHECK(wqn::g_state.ui.scroll_offset_lines==manual_offset&&!wqn::g_state.follow_active&&wqn::g_state.user_moved);
+    wqn::ArmAgentFollowLocked();wqn::g_state.ui.phase=wqn::AiFeaturePhase::kAwaitingQuestion;
+    CHECK(!wqn::ApplyOpenCodeViewportFollow(wqn::g_state.follow_epoch,0,-100,100,false));
+    resumed.state_.agent=wqn::g_state;CHECK(!resumed.DispatchAiViewportFollow().changed);
+
     const auto* font=AiNativeFont();
     auto english=WrapAiNativeText("alpha beta gamma",wqn::MeasureTextWithFont(font,"alpha beta"),font,10);
     CHECK(english.size()==2&&english[0]=="alpha beta"&&english[1]=="gamma");

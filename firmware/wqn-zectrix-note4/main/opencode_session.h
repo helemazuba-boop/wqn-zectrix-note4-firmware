@@ -74,10 +74,13 @@ bool ScrollOpenCodeResponse(int direction, int32_t min_scroll, int32_t max_scrol
 // per-tick auto-follow both compute an absolute target from the renderer's own
 // layout pass, so they must not go through the relative path.
 void SetOpenCodeScrollOffsetClamped(int32_t target, int32_t min_scroll, int32_t max_scroll);
+// Apply an automatic viewport move only while the sampled follow epoch is live.
+// A manual move or a resumed/new run invalidates an older UI calculation.
+bool ApplyOpenCodeViewportFollow(uint32_t epoch, int32_t target, int32_t min_scroll,
+                                 int32_t max_scroll, bool finished);
 // [follow] Per-turn viewport-follow state (see AgentSessionState). The per-tick
-// follow step (UiRuntime::DispatchAiViewportFollow) retires the follow through
-// this setter when the answer body lands, and the input path clears it on a
-// manual scroll -- the UI copy alone would be overwritten by the next snapshot.
+// input path clears it on a manual scroll. A body parks at its first line while
+// subsequent tool/thinking phases keep following until the run settles.
 void SetOpenCodeFollowState(bool active, bool user_moved);
 // [detail] The cloud detail tier every Agent request is projected at (0 简要 /
 // 1 标准 / 2 详细, kOpenCodeDetailDefault in opencode_model.h), written from the

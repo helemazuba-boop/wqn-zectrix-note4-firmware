@@ -104,3 +104,22 @@ use `AiHistoryContentExpanded`; the history channels remain independent.
 Agent snapshot and both STD toggle values, asserting identical pixels/layout.
 STD still has distinct expanded and collapsed layouts. This is host evidence;
 physical panel acceptance remains separate.
+
+## Follow across execution rounds, 2026-10-26
+
+Following parks at the first line of each assistant segment while it grows. It
+stays armed through later tool/thinking segments, so an interim “I'll inspect”
+message cannot prevent the final answer from being brought into view. Completion
+retires following; a manual scroll or turn jump retains its reading position.
+Recording and confirmation/question/permission cards pause automatic movement.
+
+Each arm records the history revision and increments an epoch. A resumed ask
+cannot mistake an unchanged old assistant for a new answer. Automatic viewport
+writes check that epoch and the current phase under the Agent mutex, so a stale
+UI calculation cannot retire or move a newly armed run or a manually stopped one.
+
+The reading host test now extracts the production follow dispatcher and owner
+functions. It covers preface/tool/final sequences at different UI cadences,
+completion, resume over an old answer, manual interruption, stale epochs and
+modal pauses. It uses the actual layout geometry and sanitizers; device event
+scheduling and physical panel latency still require HIL.
