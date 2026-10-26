@@ -1146,8 +1146,8 @@ void ResetAgentHistoryTurnLocked()
 // path (submit, permission/question reply, voice capture, observe) calls this
 // so the viewport watches the run: the per-tick step
 // (UiRuntime::DispatchAiViewportFollow) pins it to the live tail while the run
-// executes and retires the follow -- parking the viewport on the answer's first
-// line -- as soon as a non-empty answer body lands. `user_moved=false` marks
+// executes and parks at each answer's first line. Following stays armed for
+// later tools/rounds until completion or a manual reading gesture. `user_moved=false` marks
 // this turn's viewport as untouched, which is what the follow step needs to
 // decide whether it may move it at all.
 //
@@ -1155,6 +1155,9 @@ void ResetAgentHistoryTurnLocked()
 // state change (the follow flags are read from the same snapshot).
 void ArmAgentFollowLocked()
 {
+    ++g_state.follow_epoch;
+    const auto history = wqn::GetAiHistorySnapshot(wqn::AiHistoryChannel::kAgent);
+    g_state.follow_after_revision = history ? history->revision : 0;
     g_state.follow_active = true;
     g_state.user_moved = false;
 }
@@ -3244,6 +3247,34 @@ void SetOpenCodeScrollOffsetClamped(int32_t target, int32_t min_scroll, int32_t 
     xSemaphoreGive(g_lock);
 }
 
+bool ApplyOpenCodeViewportFollow(uint32_t epoch, int32_t target, int32_t min_scroll,
+                                 int32_t max_scroll, bool finished)
+{
+    if (g_lock == nullptr || min_scroll > max_scroll)
+        return false;
+    xSemaphoreTake(g_lock, portMAX_DELAY);
+    const auto phase = g_state.ui.phase;
+    if (!g_state.follow_active || g_state.follow_epoch != epoch ||
+        phase == AiFeaturePhase::kLoading || phase == AiFeaturePhase::kRecording ||
+        phase == AiFeaturePhase::kTranscribing || phase == AiFeaturePhase::kAwaitingConfirmation ||
+        phase == AiFeaturePhase::kAwaitingPermission || phase == AiFeaturePhase::kAwaitingQuestion) {
+        xSemaphoreGive(g_lock);
+        return false;
+    }
+    target = std::clamp<int32_t>(std::clamp(target, min_scroll, max_scroll), -4096, 4096);
+    const bool settled = finished &&
+        (phase == AiFeaturePhase::kComplete || phase == AiFeaturePhase::kError ||
+         phase == AiFeaturePhase::kIdle);
+    if (g_state.ui.scroll_offset_lines != target || settled) {
+        g_state.ui.scroll_offset_lines = target;
+        if (settled)
+            g_state.follow_active = false;
+        MarkChangedLocked();
+    }
+    xSemaphoreGive(g_lock);
+    return true;
+}
+
 void SetOpenCodeFollowState(bool active, bool user_moved)
 {
     if (g_lock == nullptr) {
@@ -3251,6 +3282,7 @@ void SetOpenCodeFollowState(bool active, bool user_moved)
     }
     xSemaphoreTake(g_lock, portMAX_DELAY);
     if (g_state.follow_active != active || g_state.user_moved != user_moved) {
+        ++g_state.follow_epoch;
         g_state.follow_active = active;
         g_state.user_moved = user_moved;
         MarkChangedLocked();
@@ -3309,6 +3341,7 @@ void InterruptOpenCodeRun() {}
 bool ScrollOpenCodeResponse(int, int32_t, int32_t, int) { return false; }
 void SetOpenCodeScrollOffsetClamped(int32_t, int32_t, int32_t) {}
 void SetOpenCodeFollowState(bool, bool) {}
+bool ApplyOpenCodeViewportFollow(uint32_t, int32_t, int32_t, int32_t, bool) { return false; }
 void SetOpenCodeDetailLevel(uint8_t) {}
 bool CopyOpenCodeSessionToUi(AgentSessionState*) { return false; }
 

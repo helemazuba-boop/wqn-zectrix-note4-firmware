@@ -24,6 +24,7 @@
 #include "runtime/sleep_coordinator.h"
 #include "runtime/storage_schema.h"
 #include "runtime/memory_diagnostics.h"
+#include "runtime/fault_diagnostics.h"
 #include "runtime/wake_context.h"
 #include "sdkconfig.h"
 #include "services/audio_service.h"
@@ -79,6 +80,8 @@ void ConfirmRunningApp()
     esp_err_t error,
     uint32_t observed_generation)
 {
+    wqn::runtime::RecordFault(wqn::runtime::FaultDomain::kStorage,
+        wqn::runtime::FaultPhase::kBootInit, error, 0, observed_generation);
     ESP_LOGE(
         kTag,
         "storage recovery mode: generation_observed=%lu error=%s; business startup blocked",
@@ -98,6 +101,7 @@ void ConfirmRunningApp()
 extern "C" void app_main(void)
 {
     ESP_ERROR_CHECK(wqn::InitZectrixNote4SafePins());
+    wqn::runtime::InitFaultDiagnostics();
     ESP_ERROR_CHECK(wqn::InitPowerHardware(
         wqn::kNote4I2cPort,
         wqn::kNote4I2cSda,
@@ -138,9 +142,10 @@ extern "C" void app_main(void)
     ESP_ERROR_CHECK(wqn::runtime::InitSleepCoordinator());
     wqn::RefreshUsbPowerSleepPolicy();
 
-    // M7 boot gate: destructive local migration is complete (including its
-    // durable generation marker) before any audio, storage, network, UI or
-    // synchronization business task can start.
+    // M7 boot gate: validate storage or finish an explicitly authorized reset
+    // (including final marker and intent removal) before any audio, storage,
+    // network, UI or synchronization business task can start.
+    wqn::runtime::SetFaultBootPhase(wqn::runtime::BootPhase::kStorage);
     const wqn::runtime::StorageSchemaBootResult storage_schema =
         wqn::runtime::EnsureStorageSchema();
     if (storage_schema.action ==
@@ -181,6 +186,7 @@ extern "C" void app_main(void)
             sync_boot_result,
             wqn::runtime::kStorageSchemaGeneration);
     }
+    wqn::runtime::SetFaultBootPhase(wqn::runtime::BootPhase::kServices);
     ESP_ERROR_CHECK(wqn::services::StartAudioService());
     LogTokenState();
     LogWifiCredentialState();
@@ -220,6 +226,7 @@ extern "C" void app_main(void)
     }
 #endif
 
+    wqn::runtime::SetFaultBootPhase(wqn::runtime::BootPhase::kUi);
     ESP_ERROR_CHECK(wqn::StartDeviceUiIfEnabled());
     ESP_ERROR_CHECK_WITHOUT_ABORT(wqn::RunAudioSelfTestIfEnabled());
 
@@ -231,4 +238,5 @@ extern "C" void app_main(void)
 
     ESP_LOGI(kTag, "firmware initialization complete");
     ESP_ERROR_CHECK(wqn::StartPowerCoordinator());
+    wqn::runtime::SetFaultBootPhase(wqn::runtime::BootPhase::kStartupComplete);
 }

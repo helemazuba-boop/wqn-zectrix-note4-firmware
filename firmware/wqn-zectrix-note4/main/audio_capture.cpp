@@ -433,7 +433,7 @@ void CaptureSession()
         size_t bytes_read = 0;
         const esp_err_t warmup_result = wqn::services::ReadAudioChannel(
             g_audio.session, g_audio.rx, buffer, sizeof(buffer),
-            &bytes_read, pdMS_TO_TICKS(1000));
+            &bytes_read, 1000);
         if (warmup_result != ESP_OK) {
             ESP_LOGW(kTag,
                      "ADC warmup discard failed: read=%d/%d result=%s (%d)",
@@ -487,7 +487,7 @@ void CaptureSession()
         size_t bytes_read = 0;
         result = wqn::services::ReadAudioChannel(
             g_audio.session, g_audio.rx, buffer, sizeof(buffer),
-            &bytes_read, pdMS_TO_TICKS(1000));
+            &bytes_read, 1000);
         if (result != ESP_OK) {
             ESP_LOGW(kTag, "I2S read failed: %s", esp_err_to_name(result));
             if (++consecutive_timeouts >= kMaxConsecutiveReadTimeouts) {

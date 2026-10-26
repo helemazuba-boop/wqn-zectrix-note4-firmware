@@ -21,7 +21,11 @@ idf_component_register(
         "pcf8563.cpp"
         "provision_manager.cpp"
         "runtime/storage_schema.cpp"
+        "runtime/storage_temp_file_lease.cpp"
+        "runtime/pack_stream_path_lease.cpp"
         "runtime/memory_diagnostics.cpp"
+        "runtime/wall_clock.cpp"
+        "runtime/fault_diagnostics.cpp"
         "services/connectivity_service.cpp"
         "services/audio_service.cpp"
         "services/storage_service.cpp"
@@ -45,6 +49,7 @@ idf_component_register(
         "ui/markdown_render.cpp"
         "ui/ai_text_layout.cpp"
         "ui/page_ai.cpp"
+        "ui/ai_std_interaction.cpp"
         "ui/page_ai_agent.cpp"
         "ui/page_home.cpp"
         "ui/page_provisioning.cpp"
@@ -99,6 +104,7 @@ idf_component_register(
         esp_http_client
         esp_websocket_client
         esp_event
+        esp_partition
         esp_netif
         esp_psram
         esp_rom
@@ -125,8 +131,9 @@ if(CONFIG_WQN_WIFI_STA_ENABLE AND NOT CONFIG_WQN_DEVICE_CONTROL_V3_ENABLE)
 endif()
 
 set(WQN_API_BASE "" CACHE STRING "Override the WQN ESP32 API base URL")
+set(WQN_VOICE_WS_URL "" CACHE STRING "Override the full STD/PRO and Flash v2 WebSocket URL")
 
-# [dev-diag] Build identity for the Dev info dialog (DEV_DIAGNOSTICS.md §4.1).
+# [dev-diag] Build identity for the Dev info dialog (docs/development/DEV_DIAGNOSTICS.md §4.1).
 # Both values are configure-time snapshots: a commit made after configure only
 # shows up on the next reconfigure. Git absence (building from an export)
 # degrades to "unknown". Deliberately separate from WQN_FIRMWARE_VERSION --
@@ -172,4 +179,8 @@ if(WQN_API_BASE)
         PRIVATE
             WQN_API_BASE=\"${WQN_API_BASE}\"
     )
+endif()
+
+if(WQN_VOICE_WS_URL)
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE WQN_VOICE_WS_URL=\"${WQN_VOICE_WS_URL}\")
 endif()

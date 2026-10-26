@@ -438,6 +438,29 @@ std::string FrameSignature(const wqn::UiFrame& frame)
     }
     if (frame.screen == wqn::UiScreen::kAi) {
         signature.append("|ai:");
+        signature.append(frame.ai.pending_input);
+        signature.push_back('/');
+        signature.append(frame.ai.user_partial);
+        const auto& decision = frame.ai.interaction;
+        signature.push_back('/');
+        signature.append(decision.id);
+        signature.push_back('/');
+        signature.append(decision.kind);
+        signature.push_back('/');
+        signature.append(decision.prompt);
+        signature.push_back('/');
+        signature.append(decision.error);
+        signature.push_back('/');
+        signature.append(decision.reply_value);
+        signature.push_back(decision.sending ? '1' : '0');
+        signature.push_back(decision.allow_custom ? '1' : '0');
+        for (const auto& option : decision.options) {
+            signature.push_back('/');
+            signature.append(option.value);
+            signature.push_back('/');
+            signature.append(option.label);
+        }
+        signature.append(std::to_string(frame.agent_option.focused));
         // [sig-fix] Do NOT include frame.home.battery_label here: it changes
         // every minute when BuildHomeSummary refreshes the ADC reading, which
         // would trigger a signature change → refresh → full refresh (dirty
@@ -489,7 +512,7 @@ std::string FrameSignature(const wqn::UiFrame& frame)
         signature.push_back('/');
         signature.append(frame.ai.tts_on ? "1" : "0");
         signature.push_back('/');
-        signature.append(frame.ai.expand_content ? "1" : "0");
+        signature.append(wqn::AiHistoryContentExpanded(frame.ai) ? "1" : "0");
         signature.push_back('/');
         // [follow] No tier draws the follow toggle in the cluster any more (it
         // moved to the settings page), so auto_follow no longer changes a pixel

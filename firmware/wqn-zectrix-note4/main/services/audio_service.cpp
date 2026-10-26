@@ -1,4 +1,5 @@
 #include "services/audio_service.h"
+#include "services/audio_codec_deadline.h"
 
 #include <algorithm>
 #include <array>
@@ -11,6 +12,7 @@
 #include "driver/i2c_master.h"
 #include "driver/i2s_std.h"
 #include "esp_check.h"
+#include "esp_attr.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_rom_lldesc.h"
@@ -25,6 +27,8 @@
 #include "error_recorder.h"
 
 namespace {
+
+using wqn::services::detail::CodecDeadline;
 
 constexpr char kTag[] = "audio_service";
 constexpr gpio_num_t kCodecPower = GPIO_NUM_42;
@@ -55,6 +59,27 @@ static_assert(sizeof(lldesc_t) == 12, "ESP32-S3 DMA descriptor size changed");
 // conservative floor so admission fails before TX takes half of a ring that RX
 // cannot also obtain. A-H heap deltas report the real driver cost on-device.
 constexpr size_t kDuplexAdmissionInternalHeadroom = 4096;
+// ISR-visible storage stays internal even if external BSS is enabled later.
+// Duplex RX has one hardware owner. This boot-monotonic counter measures
+// driver queue-overflow events, not an exact number of lost microphone samples.
+DRAM_ATTR std::atomic<uint32_t> g_duplex_rx_overflows{0};
+// The S32C1I/PSRAM workaround makes is_always_lock_free false. IDF routes
+// internal 32-bit atomics through IRAM hardware helpers; verify ELF placement
+// together with this callback rather than assuming a host lock-free property.
+
+bool IRAM_ATTR CountDuplexRxOverflow(i2s_chan_handle_t,
+                                    i2s_event_data_t*, void*)
+{
+    g_duplex_rx_overflows.fetch_add(1, std::memory_order_relaxed);
+    return false; // no higher-priority task is woken
+}
+
+esp_err_t ObserveDuplexRxOverflows(i2s_chan_handle_t channel)
+{
+    i2s_event_callbacks_t callbacks{};
+    callbacks.on_recv_q_ovf = CountDuplexRxOverflow;
+    return i2s_channel_register_event_callback(channel, &callbacks, nullptr);
+}
 // Match the factory esp_codec_dev control interface. The shared bus remains
 // free to use a different per-device rate for the RTC.
 constexpr uint32_t kCodecI2cClockHz = 100000;
@@ -436,14 +461,18 @@ esp_err_t BeginCloseResource(
     size_t count,
     const wqn::services::AudioSession& session,
     void* handle,
-    ResourceSlot** closing_slot)
+    ResourceSlot** closing_slot,
+    bool previously_admitted = false)
 {
     if (handle == nullptr || closing_slot == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
     *closing_slot = nullptr;
     taskENTER_CRITICAL(&g_resource_lock);
-    if (g_accept_operations.load(std::memory_order_acquire) &&
+    // A complete codec configuration holds an admitted DriverOperation while
+    // the coordinator drains it. Its private handle must still be removable
+    // after new operations have been denied; session/slot ownership stays required.
+    if ((previously_admitted || g_accept_operations.load(std::memory_order_acquire)) &&
         SessionMatches(session)) {
         for (size_t i = 0; i < count; ++i) {
             if (slots[i].handle == handle &&
@@ -1000,18 +1029,263 @@ uint8_t PercentToCodecVolumeRegister(int percent)
         value, 0, static_cast<int>(kDacVolumeZeroDb)));
 }
 
+esp_err_t AddAudioCodecBefore(
+    const wqn::services::AudioSession& session,
+    wqn::services::AudioBusHandle bus,
+    wqn::services::AudioCodecHandle* codec,
+    const CodecDeadline& budget)
+{
+    ESP_LOGI(kTag, "add ES8311: session=%lu bus=%p codec_in=%p state=%s accept=%d",
+             static_cast<unsigned long>(session.id), bus,
+             codec == nullptr ? nullptr : *codec,
+             wqn::services::AudioStateName(
+                 g_state.load(std::memory_order_acquire)),
+             g_accept_operations.load(std::memory_order_acquire) ? 1 : 0);
+    DriverOperation operation(session);
+    if (!operation || bus == nullptr || codec == nullptr || *codec != nullptr) {
+        ESP_LOGE(kTag, "add ES8311 rejected: session=%lu result=%s (%d)",
+                 static_cast<unsigned long>(session.id),
+                 esp_err_to_name(ESP_ERR_INVALID_STATE),
+                 static_cast<int>(ESP_ERR_INVALID_STATE));
+        // [dev-diag] Codec bring-up refused.
+        wqn::RecordError("audio", "add ES8311 rejected");
+        return ESP_ERR_INVALID_STATE;
+    }
+    // `i2c_master_bus_add_device` only allocates and attaches a software
+    // device object; it does not verify that the codec ACKs on the wires.
+    // Probe while the AudioService operation is held so a stale/unpowered
+    // ES8311 is reported before any register sequence is attempted.
+    if (budget.expired()) return ESP_ERR_TIMEOUT;
+    esp_err_t probe_result = ESP_FAIL;
+    ScopedI2cBusLock bus_lock("audio_codec_probe", budget.lock_ticks());
+    if (!bus_lock.locked()) return bus_lock.status();
+    const int timeout_ms = budget.transfer_ms();
+    if (timeout_ms == 0) return ESP_ERR_TIMEOUT;
+    probe_result = budget.result(i2c_master_probe(AsBus(bus), kEs8311Address, timeout_ms));
+    ESP_LOGI(kTag, "probe ES8311: session=%lu bus=%p addr=0x%02x result=%s (%d)",
+             static_cast<unsigned long>(session.id), bus,
+             static_cast<unsigned>(kEs8311Address),
+             esp_err_to_name(probe_result), static_cast<int>(probe_result));
+    if (probe_result != ESP_OK) {
+        return probe_result;
+    }
+    i2c_device_config_t config = {};
+    config.dev_addr_length = I2C_ADDR_BIT_LEN_7;
+    config.device_address = kEs8311Address;
+    config.scl_speed_hz = kCodecI2cClockHz;
+    config.scl_wait_us = 0;
+    i2c_master_dev_handle_t device = nullptr;
+    esp_err_t result = i2c_master_bus_add_device(
+        AsBus(bus), &config, &device);
+    if (result == ESP_OK) {
+        result = RegisterResource(
+            g_codec_slots, kMaxCodecHandles, session, device);
+    }
+    if (result == ESP_OK) {
+        *codec = reinterpret_cast<wqn::services::AudioCodecHandle>(device);
+    } else if (device != nullptr) {
+        i2c_master_bus_rm_device(device);
+    }
+    ESP_LOGI(kTag, "add ES8311 result: session=%lu result=%s (%d) device=%p scl_hz=%lu",
+             static_cast<unsigned long>(session.id),
+             esp_err_to_name(result), static_cast<int>(result), device,
+             static_cast<unsigned long>(kCodecI2cClockHz));
+    return result;
+}
+
+esp_err_t WriteAudioCodecRegisterBefore(
+    const wqn::services::AudioSession& session,
+    wqn::services::AudioCodecHandle codec,
+    uint8_t reg,
+    uint8_t value,
+    const CodecDeadline& budget)
+{
+    DriverOperation operation(
+        session, DriverOperation::Kind::kCodec, codec);
+    if (!operation || codec == nullptr) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    const uint8_t data[] = {reg, value};
+    esp_err_t result = ESP_FAIL;
+    int attempts_used = 0;
+    for (int attempt = 1; attempt <= kCodecI2cMaxAttempts; ++attempt) {
+        if (budget.expired()) return ESP_ERR_TIMEOUT;
+        attempts_used = attempt;
+        // [i2c-bus-lock] One locked transaction per attempt: the shared bus
+        // also serves the PCF8563 RTC from the power tasks, and an unserialized
+        // transmit from either side fails with ESP_ERR_INVALID_STATE while the
+        // other side is mid-transaction. Standalone calls release this lock
+        // before backoff; complete configuration retains its outer lock.
+        {
+            ScopedI2cBusLock bus_lock("audio_codec_write", budget.lock_ticks());
+            if (bus_lock.locked()) {
+                // The factory board wrapper reasserts GPIO42 before every codec
+                // transaction. This is idempotent while the rail is already held
+                // high and repairs a stale hold left by a standby transition.
+                if (budget.expired()) return ESP_ERR_TIMEOUT;
+                result = ApplyCodecPower(true);
+                const int timeout_ms = budget.transfer_ms();
+                if (timeout_ms == 0) return ESP_ERR_TIMEOUT;
+                if (result == ESP_OK) {
+                    result = i2c_master_transmit(
+                        AsCodec(codec), data, sizeof(data),
+                        timeout_ms);  // ESP-IDF I2C timeout is milliseconds.
+                }
+                if (budget.expired()) return ESP_ERR_TIMEOUT;
+                if (IsRetryableCodecI2cError(result)) {
+                    const esp_err_t recovery_result =
+                        RecoverCodecI2cBusLocked(
+                            session, "write", reg, result);
+                    if (recovery_result != ESP_OK) {
+                        result = recovery_result;
+                    }
+                }
+            } else {
+                result = bus_lock.status();
+            }
+        }
+        if (budget.expired()) return ESP_ERR_TIMEOUT;
+        if (result == ESP_OK) {
+            if (attempt > 1) {
+                ESP_LOGI(kTag,
+                         "codec write recovered: session=%lu dev=%p reg=0x%02x attempt=%d",
+                         static_cast<unsigned long>(session.id), codec, reg,
+                         attempt);
+            }
+            return ESP_OK;
+        }
+        if (!IsRetryableCodecI2cError(result) ||
+            attempt == kCodecI2cMaxAttempts) {
+            break;
+        }
+        ESP_LOGW(kTag,
+                 "codec write retry: session=%lu dev=%p reg=0x%02x attempt=%d/%d result=%s (%d)",
+                 static_cast<unsigned long>(session.id), codec, reg, attempt,
+                 kCodecI2cMaxAttempts, esp_err_to_name(result),
+                 static_cast<int>(result));
+        if (!budget.delay(kCodecI2cRetryDelay)) return ESP_ERR_TIMEOUT;
+    }
+    ESP_LOGE(kTag,
+             "codec write API=i2c_master_transmit session=%lu dev=%p addr=0x%02x reg=0x%02x value=0x%02x attempts=%d result=%s (%d)",
+             static_cast<unsigned long>(session.id), codec,
+             static_cast<unsigned>(kEs8311Address), reg, value,
+             attempts_used, esp_err_to_name(result),
+             static_cast<int>(result));
+    return result;
+}
+
+esp_err_t ReadAudioCodecRegisterBefore(
+    const wqn::services::AudioSession& session,
+    wqn::services::AudioCodecHandle codec,
+    uint8_t reg,
+    uint8_t* value,
+    const CodecDeadline& budget)
+{
+    DriverOperation operation(
+        session, DriverOperation::Kind::kCodec, codec);
+    if (!operation || codec == nullptr || value == nullptr) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    esp_err_t result = ESP_FAIL;
+    int attempts_used = 0;
+    for (int attempt = 1; attempt <= kCodecI2cMaxAttempts; ++attempt) {
+        if (budget.expired()) return ESP_ERR_TIMEOUT;
+        attempts_used = attempt;
+        // [i2c-bus-lock] Same per-attempt serialization as the write path.
+        {
+            ScopedI2cBusLock bus_lock("audio_codec_read", budget.lock_ticks());
+            if (bus_lock.locked()) {
+                if (budget.expired()) return ESP_ERR_TIMEOUT;
+                result = ApplyCodecPower(true);
+                const int timeout_ms = budget.transfer_ms();
+                if (timeout_ms == 0) return ESP_ERR_TIMEOUT;
+                if (result == ESP_OK) {
+                    result = i2c_master_transmit_receive(
+                        AsCodec(codec), &reg, sizeof(reg), value, sizeof(*value),
+                        timeout_ms);  // ESP-IDF I2C timeout is milliseconds.
+                }
+                if (budget.expired()) return ESP_ERR_TIMEOUT;
+                if (IsRetryableCodecI2cError(result)) {
+                    const esp_err_t recovery_result =
+                        RecoverCodecI2cBusLocked(
+                            session, "read", reg, result);
+                    if (recovery_result != ESP_OK) {
+                        result = recovery_result;
+                    }
+                }
+            } else {
+                result = bus_lock.status();
+            }
+        }
+        if (budget.expired()) return ESP_ERR_TIMEOUT;
+        if (result == ESP_OK) {
+            if (attempt > 1) {
+                ESP_LOGI(kTag,
+                         "codec read recovered: session=%lu dev=%p reg=0x%02x attempt=%d",
+                         static_cast<unsigned long>(session.id), codec, reg,
+                         attempt);
+            }
+            return ESP_OK;
+        }
+        if (!IsRetryableCodecI2cError(result) ||
+            attempt == kCodecI2cMaxAttempts) {
+            break;
+        }
+        ESP_LOGW(kTag,
+                 "codec read retry: session=%lu dev=%p reg=0x%02x attempt=%d/%d result=%s (%d)",
+                 static_cast<unsigned long>(session.id), codec, reg, attempt,
+                 kCodecI2cMaxAttempts, esp_err_to_name(result),
+                 static_cast<int>(result));
+        if (!budget.delay(kCodecI2cRetryDelay)) return ESP_ERR_TIMEOUT;
+    }
+    ESP_LOGE(kTag,
+             "codec read API=i2c_master_transmit_receive session=%lu dev=%p addr=0x%02x reg=0x%02x attempts=%d result=%s (%d)",
+             static_cast<unsigned long>(session.id), codec,
+             static_cast<unsigned>(kEs8311Address), reg,
+             attempts_used, esp_err_to_name(result),
+             static_cast<int>(result));
+    return result;
+}
+
+esp_err_t RemoveAudioCodecInternal(
+    const wqn::services::AudioSession& session,
+    wqn::services::AudioCodecHandle* codec,
+    bool previously_admitted)
+{
+    if (codec == nullptr || *codec == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    ResourceSlot* slot = nullptr;
+    ESP_RETURN_ON_ERROR(
+        BeginCloseResource(
+            g_codec_slots, kMaxCodecHandles, session, *codec, &slot, previously_admitted),
+        kTag, "begin codec removal");
+    esp_err_t result = WaitForResourceDrain(
+        slot, esp_timer_get_time() + kCallTimeoutUs);
+    if (result == ESP_OK) {
+        result = i2c_master_bus_rm_device(AsCodec(*codec));
+    }
+    FinishCloseResource(slot, result == ESP_OK);
+    if (result == ESP_OK) {
+        *codec = nullptr;
+    }
+    return result;
+}
+
 esp_err_t RunEs8311RegisterProgram(
     const wqn::services::AudioSession& session,
     wqn::services::AudioCodecHandle codec,
     wqn::services::AudioCodecProfile profile,
-    int volume_percent)
+    int volume_percent,
+    const CodecDeadline& budget)
 {
+    if (budget.expired()) return ESP_ERR_TIMEOUT;
     // Match the factory esp_codec_dev wrapper, which holds the shared-bus
     // mutex for the whole codec open/configure operation.  The per-register
     // helpers acquire the same recursive mutex, so this prevents an RTC
     // transaction from being inserted between clock/reset writes without
     // changing their validation or retry behavior.
-    ScopedI2cBusLock program_bus_lock("audio_codec_program");
+    ScopedI2cBusLock program_bus_lock("audio_codec_program", budget.lock_ticks());
     if (!program_bus_lock.locked()) {
         return program_bus_lock.status();
     }
@@ -1022,8 +1296,8 @@ esp_err_t RunEs8311RegisterProgram(
             return;
         }
         ++sequence;
-        result = wqn::services::WriteAudioCodecRegister(
-            session, codec, reg, value);
+        result = WriteAudioCodecRegisterBefore(
+            session, codec, reg, value, budget);
         if (result != ESP_OK) {
             ESP_LOGE(kTag,
                      "ES8311 program failed: profile=%s seq=%d reg=0x%02x value=0x%02x result=%s (%d)",
@@ -1035,8 +1309,8 @@ esp_err_t RunEs8311RegisterProgram(
         if (result != ESP_OK) {
             return;
         }
-        result = wqn::services::ReadAudioCodecRegister(
-            session, codec, reg, value);
+        result = ReadAudioCodecRegisterBefore(
+            session, codec, reg, value, budget);
         if (result != ESP_OK) {
             ESP_LOGE(kTag,
                      "ES8311 program read failed: profile=%s reg=0x%02x result=%s (%d)",
@@ -1067,7 +1341,7 @@ esp_err_t RunEs8311RegisterProgram(
     write(kRegClk04, 0x10);
     write(kRegClk05, 0x00);
     if (result == ESP_OK) {
-        vTaskDelay(kCodecClockSwitchSettle);
+        if (!budget.delay(kCodecClockSwitchSettle)) result = ESP_ERR_TIMEOUT;
     }
     write(kRegSystem0B, 0x00);
     write(kRegSystem0C, 0x00);
@@ -1075,7 +1349,7 @@ esp_err_t RunEs8311RegisterProgram(
     write(kRegSystem11, 0x7F);
     write(kRegReset, 0x80);
     if (result == ESP_OK) {
-        vTaskDelay(kCodecResetSettle);
+        if (!budget.delay(kCodecResetSettle)) result = ESP_ERR_TIMEOUT;
     }
     update(kRegReset, 0x40, 0x00);
     write(kRegClk01, 0x3F);
@@ -1095,7 +1369,7 @@ esp_err_t RunEs8311RegisterProgram(
     write(kRegClk08, 0xFF);
     write(kRegClk06, 0x0F);
     if (result == ESP_OK) {
-        vTaskDelay(kCodecClockSwitchSettle);
+        if (!budget.delay(kCodecClockSwitchSettle)) result = ESP_ERR_TIMEOUT;
     }
     update(kRegSdpOut, 0x40, 0x0C);
     update(kRegSdpIn, 0x40, 0x0C);
@@ -1414,87 +1688,14 @@ esp_err_t AddAudioCodec(
     AudioBusHandle bus,
     AudioCodecHandle* codec)
 {
-    ESP_LOGI(kTag, "add ES8311: session=%lu bus=%p codec_in=%p state=%s accept=%d",
-             static_cast<unsigned long>(session.id), bus,
-             codec == nullptr ? nullptr : *codec,
-             wqn::services::AudioStateName(
-                 g_state.load(std::memory_order_acquire)),
-             g_accept_operations.load(std::memory_order_acquire) ? 1 : 0);
-    DriverOperation operation(session);
-    if (!operation || bus == nullptr || codec == nullptr || *codec != nullptr) {
-        ESP_LOGE(kTag, "add ES8311 rejected: session=%lu result=%s (%d)",
-                 static_cast<unsigned long>(session.id),
-                 esp_err_to_name(ESP_ERR_INVALID_STATE),
-                 static_cast<int>(ESP_ERR_INVALID_STATE));
-        // [dev-diag] Codec bring-up refused.
-        wqn::RecordError("audio", "add ES8311 rejected");
-        return ESP_ERR_INVALID_STATE;
-    }
-    // `i2c_master_bus_add_device` only allocates and attaches a software
-    // device object; it does not verify that the codec ACKs on the wires.
-    // Probe while the AudioService operation is held so a stale/unpowered
-    // ES8311 is reported before any register sequence is attempted.
-    esp_err_t probe_result = ESP_FAIL;
-    {
-        ScopedI2cBusLock bus_lock("audio_codec_probe");
-        if (bus_lock.locked()) {
-            probe_result = i2c_master_probe(AsBus(bus), kEs8311Address, 100);
-        } else {
-            probe_result = bus_lock.status();
-        }
-    }
-    ESP_LOGI(kTag, "probe ES8311: session=%lu bus=%p addr=0x%02x result=%s (%d)",
-             static_cast<unsigned long>(session.id), bus,
-             static_cast<unsigned>(kEs8311Address),
-             esp_err_to_name(probe_result), static_cast<int>(probe_result));
-    if (probe_result != ESP_OK) {
-        return probe_result;
-    }
-    i2c_device_config_t config = {};
-    config.dev_addr_length = I2C_ADDR_BIT_LEN_7;
-    config.device_address = kEs8311Address;
-    config.scl_speed_hz = kCodecI2cClockHz;
-    config.scl_wait_us = 0;
-    i2c_master_dev_handle_t device = nullptr;
-    esp_err_t result = i2c_master_bus_add_device(
-        AsBus(bus), &config, &device);
-    if (result == ESP_OK) {
-        result = RegisterResource(
-            g_codec_slots, kMaxCodecHandles, session, device);
-    }
-    if (result == ESP_OK) {
-        *codec = reinterpret_cast<AudioCodecHandle>(device);
-    } else if (device != nullptr) {
-        i2c_master_bus_rm_device(device);
-    }
-    ESP_LOGI(kTag, "add ES8311 result: session=%lu result=%s (%d) device=%p scl_hz=%lu",
-             static_cast<unsigned long>(session.id),
-             esp_err_to_name(result), static_cast<int>(result), device,
-             static_cast<unsigned long>(kCodecI2cClockHz));
-    return result;
+    const CodecDeadline budget(esp_timer_get_time() + kCallTimeoutUs);
+    return AddAudioCodecBefore(session, bus, codec, budget);
 }
 
 esp_err_t RemoveAudioCodec(
     const AudioSession& session, AudioCodecHandle* codec)
 {
-    if (codec == nullptr || *codec == nullptr) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    ResourceSlot* slot = nullptr;
-    ESP_RETURN_ON_ERROR(
-        BeginCloseResource(
-            g_codec_slots, kMaxCodecHandles, session, *codec, &slot),
-        kTag, "begin codec removal");
-    esp_err_t result = WaitForResourceDrain(
-        slot, esp_timer_get_time() + kCallTimeoutUs);
-    if (result == ESP_OK) {
-        result = i2c_master_bus_rm_device(AsCodec(*codec));
-    }
-    FinishCloseResource(slot, result == ESP_OK);
-    if (result == ESP_OK) {
-        *codec = nullptr;
-    }
-    return result;
+    return RemoveAudioCodecInternal(session, codec, false);
 }
 
 esp_err_t WriteAudioCodecRegister(
@@ -1503,70 +1704,8 @@ esp_err_t WriteAudioCodecRegister(
     uint8_t reg,
     uint8_t value)
 {
-    DriverOperation operation(
-        session, DriverOperation::Kind::kCodec, codec);
-    if (!operation || codec == nullptr) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    const uint8_t data[] = {reg, value};
-    esp_err_t result = ESP_FAIL;
-    int attempts_used = 0;
-    for (int attempt = 1; attempt <= kCodecI2cMaxAttempts; ++attempt) {
-        attempts_used = attempt;
-        // [i2c-bus-lock] One locked transaction per attempt: the shared bus
-        // also serves the PCF8563 RTC from the power tasks, and an unserialized
-        // transmit from either side fails with ESP_ERR_INVALID_STATE while the
-        // other side is mid-transaction. Locking per attempt keeps the retry
-        // cadence and never starves the RTC owner.
-        ScopedI2cBusLock bus_lock("audio_codec_write");
-        if (bus_lock.locked()) {
-            // The factory board wrapper reasserts GPIO42 before every codec
-            // transaction. This is idempotent while the rail is already held
-            // high and repairs a stale hold left by a standby transition.
-            result = ApplyCodecPower(true);
-            if (result == ESP_OK) {
-                result = i2c_master_transmit(
-                    AsCodec(codec), data, sizeof(data),
-                    pdMS_TO_TICKS(100));
-            }
-            if (IsRetryableCodecI2cError(result)) {
-                const esp_err_t recovery_result =
-                    RecoverCodecI2cBusLocked(
-                        session, "write", reg, result);
-                if (recovery_result != ESP_OK) {
-                    result = recovery_result;
-                }
-            }
-        } else {
-            result = bus_lock.status();
-        }
-        if (result == ESP_OK) {
-            if (attempt > 1) {
-                ESP_LOGI(kTag,
-                         "codec write recovered: session=%lu dev=%p reg=0x%02x attempt=%d",
-                         static_cast<unsigned long>(session.id), codec, reg,
-                         attempt);
-            }
-            return ESP_OK;
-        }
-        if (!IsRetryableCodecI2cError(result) ||
-            attempt == kCodecI2cMaxAttempts) {
-            break;
-        }
-        ESP_LOGW(kTag,
-                 "codec write retry: session=%lu dev=%p reg=0x%02x attempt=%d/%d result=%s (%d)",
-                 static_cast<unsigned long>(session.id), codec, reg, attempt,
-                 kCodecI2cMaxAttempts, esp_err_to_name(result),
-                 static_cast<int>(result));
-        vTaskDelay(kCodecI2cRetryDelay);
-    }
-    ESP_LOGE(kTag,
-             "codec write API=i2c_master_transmit session=%lu dev=%p addr=0x%02x reg=0x%02x value=0x%02x attempts=%d result=%s (%d)",
-             static_cast<unsigned long>(session.id), codec,
-             static_cast<unsigned>(kEs8311Address), reg, value,
-             attempts_used, esp_err_to_name(result),
-             static_cast<int>(result));
-    return result;
+    const CodecDeadline budget(esp_timer_get_time() + kCallTimeoutUs);
+    return WriteAudioCodecRegisterBefore(session, codec, reg, value, budget);
 }
 
 esp_err_t ReadAudioCodecRegister(
@@ -1575,62 +1714,8 @@ esp_err_t ReadAudioCodecRegister(
     uint8_t reg,
     uint8_t* value)
 {
-    DriverOperation operation(
-        session, DriverOperation::Kind::kCodec, codec);
-    if (!operation || codec == nullptr || value == nullptr) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    esp_err_t result = ESP_FAIL;
-    int attempts_used = 0;
-    for (int attempt = 1; attempt <= kCodecI2cMaxAttempts; ++attempt) {
-        attempts_used = attempt;
-        // [i2c-bus-lock] Same per-attempt serialization as the write path.
-        ScopedI2cBusLock bus_lock("audio_codec_read");
-        if (bus_lock.locked()) {
-            result = ApplyCodecPower(true);
-            if (result == ESP_OK) {
-                result = i2c_master_transmit_receive(
-                    AsCodec(codec), &reg, sizeof(reg), value, sizeof(*value),
-                    pdMS_TO_TICKS(100));
-            }
-            if (IsRetryableCodecI2cError(result)) {
-                const esp_err_t recovery_result =
-                    RecoverCodecI2cBusLocked(
-                        session, "read", reg, result);
-                if (recovery_result != ESP_OK) {
-                    result = recovery_result;
-                }
-            }
-        } else {
-            result = bus_lock.status();
-        }
-        if (result == ESP_OK) {
-            if (attempt > 1) {
-                ESP_LOGI(kTag,
-                         "codec read recovered: session=%lu dev=%p reg=0x%02x attempt=%d",
-                         static_cast<unsigned long>(session.id), codec, reg,
-                         attempt);
-            }
-            return ESP_OK;
-        }
-        if (!IsRetryableCodecI2cError(result) ||
-            attempt == kCodecI2cMaxAttempts) {
-            break;
-        }
-        ESP_LOGW(kTag,
-                 "codec read retry: session=%lu dev=%p reg=0x%02x attempt=%d/%d result=%s (%d)",
-                 static_cast<unsigned long>(session.id), codec, reg, attempt,
-                 kCodecI2cMaxAttempts, esp_err_to_name(result),
-                 static_cast<int>(result));
-        vTaskDelay(kCodecI2cRetryDelay);
-    }
-    ESP_LOGE(kTag,
-             "codec read API=i2c_master_transmit_receive session=%lu dev=%p addr=0x%02x reg=0x%02x attempts=%d result=%s (%d)",
-             static_cast<unsigned long>(session.id), codec,
-             static_cast<unsigned>(kEs8311Address), reg,
-             attempts_used, esp_err_to_name(result),
-             static_cast<int>(result));
-    return result;
+    const CodecDeadline budget(esp_timer_get_time() + kCallTimeoutUs);
+    return ReadAudioCodecRegisterBefore(session, codec, reg, value, budget);
 }
 
 esp_err_t ConfigureAudioCodec(
@@ -1646,6 +1731,10 @@ esp_err_t ConfigureAudioCodec(
         return ESP_ERR_INVALID_ARG;
     }
 
+    DriverOperation operation(session);
+    if (!operation) return ESP_ERR_INVALID_STATE;
+    const CodecDeadline budget(esp_timer_get_time() + kCallTimeoutUs);
+
     // The rail is intentionally kept high between sessions.  Preserve the
     // factory driver's open-once lifecycle: if no other audio profile or
     // volume has replaced a known-good configuration, restoring I2S clocks is
@@ -1660,7 +1749,7 @@ esp_err_t ConfigureAudioCodec(
                  "ES8311 configuration reused: session=%lu profile=%s volume=%d rail=warm",
                  static_cast<unsigned long>(session.id),
                  CodecProfileName(profile), volume_percent);
-        return ESP_OK;
+        return budget.result(ESP_OK);
     }
 
     AudioBusHandle bus = nullptr;
@@ -1673,28 +1762,36 @@ esp_err_t ConfigureAudioCodec(
     g_codec_configuration_valid.store(false, std::memory_order_release);
     g_codec_configuration_volume.store(-1, std::memory_order_relaxed);
 
+    // Hold the shared bus through attach/program/remove as well. The codec
+    // handle is private to this call, so cleanup sees no other bus transaction
+    // and cannot lose the handle by starting a new lock wait after timeout.
+    ScopedI2cBusLock configuration_lock("audio_codec_configure", budget.lock_ticks());
+    if (!configuration_lock.locked()) return configuration_lock.status();
     esp_err_t final_result = ESP_FAIL;
     for (int attempt = 1; attempt <= kCodecProgramMaxAttempts; ++attempt) {
+        if (budget.expired()) return ESP_ERR_TIMEOUT;
         AudioCodecHandle codec = nullptr;
-        esp_err_t result = AddAudioCodec(session, bus, &codec);
+        esp_err_t result = AddAudioCodecBefore(session, bus, &codec, budget);
         if (result == ESP_OK) {
             result = RunEs8311RegisterProgram(
-                session, codec, profile, volume_percent);
+                session, codec, profile, volume_percent, budget);
         }
         if (codec != nullptr) {
             const esp_err_t remove_result =
-                RemoveAudioCodec(session, &codec);
-            if (result == ESP_OK) {
-                result = remove_result;
-            } else if (remove_result != ESP_OK) {
+                RemoveAudioCodecInternal(session, &codec, true);
+            if (remove_result != ESP_OK) {
                 ESP_LOGE(kTag,
-                         "ES8311 cleanup failed after program error: session=%lu result=%s (%d)",
+                         "ES8311 cleanup failed; program retry stopped: session=%lu result=%s (%d)",
                          static_cast<unsigned long>(session.id),
                          esp_err_to_name(remove_result),
                          static_cast<int>(remove_result));
                 return remove_result;
             }
         }
+        // Removal is mandatory even after the operation budget expires.
+        // It must finish before this private handle leaves scope.
+        if (budget.expired()) return ESP_ERR_TIMEOUT;
+        if (!g_accept_operations.load(std::memory_order_acquire)) return ESP_ERR_INVALID_STATE;
         if (result == ESP_OK) {
             g_codec_configuration_profile.store(
                 profile, std::memory_order_relaxed);
@@ -1711,9 +1808,11 @@ esp_err_t ConfigureAudioCodec(
         if (attempt < kCodecProgramMaxAttempts) {
             esp_err_t reset_result = ESP_ERR_TIMEOUT;
             {
-                ScopedI2cBusLock reset_lock("audio_codec_bus_reset");
+                ScopedI2cBusLock reset_lock("audio_codec_bus_reset", budget.lock_ticks());
                 if (reset_lock.locked()) {
-                    reset_result = i2c_master_bus_reset(AsBus(bus));
+                    if (!budget.expired()) {
+                        reset_result = i2c_master_bus_reset(AsBus(bus));
+                    }
                 } else {
                     reset_result = reset_lock.status();
                 }
@@ -1726,7 +1825,7 @@ esp_err_t ConfigureAudioCodec(
                      esp_err_to_name(result), static_cast<int>(result),
                      esp_err_to_name(reset_result),
                      static_cast<int>(reset_result));
-            vTaskDelay(kCodecProgramRetryDelay);
+            if (!budget.delay(kCodecProgramRetryDelay)) return ESP_ERR_TIMEOUT;
         }
     }
     return final_result;
@@ -1966,6 +2065,9 @@ esp_err_t CreateAudioDuplexChannels(
     LogDuplexHeapPoint(
         "E-after-configure-rx", session, dma_frame_count,
         tx_channel, rx_channel, &before_rx_config);
+    if (result == ESP_OK) {
+        result = ObserveDuplexRxOverflows(rx_channel);
+    }
     const AudioHeapSnapshot before_tx_enable = after_rx_config;
     if (result == ESP_OK) {
         LogDuplexHeapPoint(
@@ -2106,7 +2208,7 @@ esp_err_t ReadAudioChannel(
     void* destination,
     size_t bytes,
     size_t* bytes_read,
-    TickType_t timeout)
+    uint32_t timeout_ms)
 {
     DriverOperation operation(
         session, DriverOperation::Kind::kChannel, channel);
@@ -2115,7 +2217,12 @@ esp_err_t ReadAudioChannel(
         return ESP_ERR_INVALID_STATE;
     }
     return i2s_channel_read(
-        AsChannel(channel), destination, bytes, bytes_read, timeout);
+        AsChannel(channel), destination, bytes, bytes_read, timeout_ms);
+}
+
+uint32_t AudioDuplexRxOverflowCount()
+{
+    return g_duplex_rx_overflows.load(std::memory_order_relaxed);
 }
 
 esp_err_t WriteAudioChannel(
@@ -2124,7 +2231,7 @@ esp_err_t WriteAudioChannel(
     const void* source,
     size_t bytes,
     size_t* bytes_written,
-    TickType_t timeout)
+    uint32_t timeout_ms)
 {
     DriverOperation operation(
         session, DriverOperation::Kind::kChannel, channel);
@@ -2133,7 +2240,7 @@ esp_err_t WriteAudioChannel(
         return ESP_ERR_INVALID_STATE;
     }
     return i2s_channel_write(
-        AsChannel(channel), source, bytes, bytes_written, timeout);
+        AsChannel(channel), source, bytes, bytes_written, timeout_ms);
 }
 
 esp_err_t ResetAudioTxChannel(

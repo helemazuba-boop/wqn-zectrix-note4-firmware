@@ -25,7 +25,10 @@
 #include "freertos/task.h"
 #include "mbedtls/sha256.h"
 #include "runtime/sleep_coordinator.h"
+#include "runtime/storage_temp_file_lease.h"
+#include "runtime/pack_stream_path_lease.h"
 #include "services/storage_service.h"
+#include "voice_diagnostics.h"
 #include "word_study_store.h"
 
 namespace {
@@ -410,15 +413,19 @@ void PruneUnreferencedPackFiles(const wqn::WqnWordPackManifest& current)
         }
     }
 
-    if (FileExists(kManifestBackupPath)) {
+    {
         std::string backup_payload;
-        wqn::WqnWordPackManifest backup;
-        if (ReadWholeFile(kManifestBackupPath, &backup_payload) != ESP_OK ||
-            wqn::ParseWordPackManifestResponse(backup_payload, &backup) != ESP_OK) {
-            ESP_LOGW(kTag, "word pack backup manifest invalid; skip pruning rollback files");
-            return;
+        const esp_err_t backup_result = ReadWholeFile(kManifestBackupPath, &backup_payload);
+        // Do not treat a failed stat/open as proof that no rollback exists.
+        if (backup_result != ESP_ERR_NOT_FOUND) {
+            wqn::WqnWordPackManifest backup;
+            if (backup_result != ESP_OK ||
+                wqn::ParseWordPackManifestResponse(backup_payload, &backup) != ESP_OK) {
+                ESP_LOGW(kTag, "word pack backup manifest unreadable or invalid; skip pruning");
+                return;
+            }
+            AddManifestPackStems(backup, &retained_stems);
         }
-        AddManifestPackStems(backup, &retained_stems);
     }
 
     DIR* directory = opendir(kStorageRoot);
@@ -463,6 +470,11 @@ void PruneUnreferencedPackFiles(const wqn::WqnWordPackManifest& current)
 
 esp_err_t ResetWordPackStorageCacheRaw(void*)
 {
+    // Streams keep FILEs open across owner transactions, so a reset must
+    // defer before touching manifests or temporary files owned by a stream.
+    if (wqn::runtime::HasActivePackStreamPath()) {
+        return ESP_ERR_INVALID_STATE;
+    }
     const char* manifest_paths[] = {
         kManifestPath,
         kManifestTempPath,
@@ -879,43 +891,51 @@ esp_err_t MergeWordPackManifestDelta(
 esp_err_t SaveWordPackManifestRaw(const WqnWordPackManifest& manifest)
 {
     cJSON* root = cJSON_CreateObject();
-    cJSON* data = cJSON_CreateObject();
-    cJSON* packs = cJSON_CreateArray();
-    if (root == nullptr || data == nullptr || packs == nullptr) {
+    if (root == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
+    if (!cJSON_AddBoolToObject(root, "success", true)) {
         cJSON_Delete(root);
-        cJSON_Delete(data);
-        cJSON_Delete(packs);
+        return ESP_ERR_NO_MEM;
+    }
+    cJSON* data = cJSON_AddObjectToObject(root, "data");
+    if (data == nullptr ||
+        !cJSON_AddStringToObject(data, "server_time", manifest.server_time.c_str()) ||
+        !cJSON_AddNumberToObject(data, "cursor", static_cast<double>(manifest.cursor)) ||
+        !cJSON_AddBoolToObject(data, "has_more", manifest.has_more)) {
+        cJSON_Delete(root);
+        return ESP_ERR_NO_MEM;
+    }
+    cJSON* packs = cJSON_AddArrayToObject(data, "packs");
+    if (packs == nullptr) {
+        cJSON_Delete(root);
         return ESP_ERR_NO_MEM;
     }
 
-    cJSON_AddBoolToObject(root, "success", true);
-    cJSON_AddItemToObject(root, "data", data);
-    cJSON_AddStringToObject(data, "server_time", manifest.server_time.c_str());
-    cJSON_AddNumberToObject(data, "cursor", static_cast<double>(manifest.cursor));
-    cJSON_AddBoolToObject(data, "has_more", manifest.has_more);
-    cJSON_AddItemToObject(data, "packs", packs);
-
     for (const WqnWordPackManifestItem& item : manifest.packs) {
         cJSON* pack = cJSON_CreateObject();
-        if (pack == nullptr) {
+        if (!cJSON_AddItemToArray(packs, pack)) {
+            cJSON_Delete(pack);
             cJSON_Delete(root);
             return ESP_ERR_NO_MEM;
         }
-        cJSON_AddStringToObject(pack, "pack_id", item.pack_id.c_str());
-        cJSON_AddStringToObject(pack, "deck_id", item.deck_id.c_str());
-        cJSON_AddStringToObject(pack, "title", item.title.c_str());
-        cJSON_AddNumberToObject(pack, "revision", static_cast<double>(item.revision));
-        cJSON_AddNumberToObject(pack, "content_revision", static_cast<double>(item.content_revision));
-        cJSON_AddNumberToObject(pack, "pack_revision", static_cast<double>(item.pack_revision));
-        cJSON_AddNumberToObject(pack, "change_sequence", static_cast<double>(item.change_sequence));
-        cJSON_AddNumberToObject(pack, "schema_version", item.schema_version);
-        cJSON_AddStringToObject(pack, "format", item.format.c_str());
-        cJSON_AddStringToObject(pack, "compression", item.compression.c_str());
-        cJSON_AddStringToObject(pack, "sha256", item.sha256.c_str());
-        cJSON_AddStringToObject(pack, "download_url", item.download_url.c_str());
-        cJSON_AddNumberToObject(pack, "entry_count", item.entry_count);
-        cJSON_AddNumberToObject(pack, "byte_size", item.byte_size);
-        cJSON_AddItemToArray(packs, pack);
+        if (!cJSON_AddStringToObject(pack, "pack_id", item.pack_id.c_str()) ||
+            !cJSON_AddStringToObject(pack, "deck_id", item.deck_id.c_str()) ||
+            !cJSON_AddStringToObject(pack, "title", item.title.c_str()) ||
+            !cJSON_AddNumberToObject(pack, "revision", static_cast<double>(item.revision)) ||
+            !cJSON_AddNumberToObject(pack, "content_revision", static_cast<double>(item.content_revision)) ||
+            !cJSON_AddNumberToObject(pack, "pack_revision", static_cast<double>(item.pack_revision)) ||
+            !cJSON_AddNumberToObject(pack, "change_sequence", static_cast<double>(item.change_sequence)) ||
+            !cJSON_AddNumberToObject(pack, "schema_version", item.schema_version) ||
+            !cJSON_AddStringToObject(pack, "format", item.format.c_str()) ||
+            !cJSON_AddStringToObject(pack, "compression", item.compression.c_str()) ||
+            !cJSON_AddStringToObject(pack, "sha256", item.sha256.c_str()) ||
+            !cJSON_AddStringToObject(pack, "download_url", item.download_url.c_str()) ||
+            !cJSON_AddNumberToObject(pack, "entry_count", item.entry_count) ||
+            !cJSON_AddNumberToObject(pack, "byte_size", item.byte_size)) {
+            cJSON_Delete(root);
+            return ESP_ERR_NO_MEM;
+        }
     }
 
     char* rendered = cJSON_PrintUnformatted(root);
@@ -1202,6 +1222,19 @@ enum class WordPackStreamOperation : uint8_t {
     kAbort,
 };
 
+struct WordPackAppendProfile {
+    int64_t started_us = 0;
+    int64_t append_wall_us = 0;
+    int64_t write_us = 0;
+    int64_t sha_us = 0;
+    int64_t log_us = 0;
+    uint64_t requested_bytes = 0;
+    uint64_t fwrite_bytes = 0;
+    uint32_t append_calls = 0;
+    uint32_t short_writes = 0;
+    uint32_t sha_failures = 0;
+};
+
 struct WordPackStreamContext {
     const WqnWordPackManifestItem* item = nullptr;
     FILE* file = nullptr;
@@ -1210,17 +1243,21 @@ struct WordPackStreamContext {
     size_t bytes_written = 0;
     const uint8_t* chunk = nullptr;
     size_t chunk_size = 0;
+    WordPackAppendProfile profile;
     WordPackStreamOperation operation = WordPackStreamOperation::kBegin;
+    std::string temp_path;
+    std::string final_path;
 };
 
 esp_err_t WordPackStreamTransaction(void* opaque)
 {
     auto* context = static_cast<WordPackStreamContext*>(opaque);
-    if (context == nullptr || context->item == nullptr) {
+    if (context == nullptr || context->item == nullptr ||
+        context->temp_path.empty() || context->final_path.empty()) {
         return ESP_ERR_INVALID_ARG;
     }
-    const std::string temp_path = TempPackPathForItem(*context->item);
-    const std::string final_path = PackPathForItem(*context->item);
+    const std::string& temp_path = context->temp_path;
+    const std::string& final_path = context->final_path;
     switch (context->operation) {
         case WordPackStreamOperation::kBegin:
             std::remove(temp_path.c_str());
@@ -1243,20 +1280,28 @@ esp_err_t WordPackStreamTransaction(void* opaque)
             context->bytes_written = 0;
             return ESP_OK;
 
-        case WordPackStreamOperation::kAppend:
+        case WordPackStreamOperation::kAppend: {
             if (context->file == nullptr || !context->sha_started ||
                 context->chunk == nullptr || context->chunk_size == 0 ||
                 context->bytes_written + context->chunk_size > context->item->byte_size ||
                 context->bytes_written + context->chunk_size > kMaxPackBytes) {
                 return ESP_ERR_INVALID_SIZE;
             }
-            if (std::fwrite(
-                    context->chunk, 1, context->chunk_size, context->file) !=
-                context->chunk_size) {
+            const int64_t write_started_us = esp_timer_get_time();
+            const size_t written = std::fwrite(
+                context->chunk, 1, context->chunk_size, context->file);
+            context->profile.write_us += esp_timer_get_time() - write_started_us;
+            context->profile.fwrite_bytes += written;
+            if (written != context->chunk_size) {
+                ++context->profile.short_writes;
                 return ESP_FAIL;
             }
-            if (mbedtls_sha256_update(
-                    &context->sha, context->chunk, context->chunk_size) != 0) {
+            const int64_t sha_started_us = esp_timer_get_time();
+            const int sha_result = mbedtls_sha256_update(
+                &context->sha, context->chunk, context->chunk_size);
+            context->profile.sha_us += esp_timer_get_time() - sha_started_us;
+            if (sha_result != 0) {
+                ++context->profile.sha_failures;
                 return ESP_FAIL;
             }
             context->bytes_written += context->chunk_size;
@@ -1269,13 +1314,16 @@ esp_err_t WordPackStreamTransaction(void* opaque)
             // as 22.0% but is bytes-off-the-wire over plaintext bytes. The
             // decompressed truth was ~88%. Without this line, a per-byte
             // figure can be off by 4x and no log can show which is right.
+            const int64_t log_started_us = esp_timer_get_time();
             ESP_LOGI(kTag,
                      "word pack stream append: chunk_bytes=%u total_bytes=%u "
                      "of %lu",
                      static_cast<unsigned>(context->chunk_size),
                      static_cast<unsigned>(context->bytes_written),
                      static_cast<unsigned long>(context->item->byte_size));
+            context->profile.log_us += esp_timer_get_time() - log_started_us;
             return ESP_OK;
+        }
 
         case WordPackStreamOperation::kCommit: {
             if (context->file == nullptr || !context->sha_started ||
@@ -1288,13 +1336,13 @@ esp_err_t WordPackStreamTransaction(void* opaque)
             }
             context->sha_started = false;
             constexpr char kHex[] = "0123456789abcdef";
-            std::string actual_sha;
-            actual_sha.reserve(64);
-            for (const unsigned char byte : digest) {
-                actual_sha.push_back(kHex[byte >> 4]);
-                actual_sha.push_back(kHex[byte & 0x0f]);
+            std::array<char, 64> actual_sha = {};
+            for (size_t i = 0; i < digest.size(); ++i) {
+                actual_sha[i * 2] = kHex[digest[i] >> 4];
+                actual_sha[i * 2 + 1] = kHex[digest[i] & 0x0f];
             }
-            if (actual_sha != context->item->sha256) {
+            if (context->item->sha256.size() != actual_sha.size() ||
+                std::memcmp(actual_sha.data(), context->item->sha256.data(), actual_sha.size()) != 0) {
                 std::fclose(context->file);
                 context->file = nullptr;
                 std::remove(temp_path.c_str());
@@ -1342,8 +1390,31 @@ esp_err_t AppendWordPackStream(
     context->operation = WordPackStreamOperation::kAppend;
     context->chunk = bytes;
     context->chunk_size = size;
-    return services::ExecuteStorageTransactionNamed(
+    const int64_t started_us = esp_timer_get_time();
+    ++context->profile.append_calls;
+    context->profile.requested_bytes += size;
+    const esp_err_t result = services::ExecuteStorageTransactionNamed(
         WordPackStreamTransaction, context, "wp-stream");
+    // This caller resumes only after owner completion. It includes queue wait
+    // and scheduling; it must not be reported as Flash-driver execution time.
+    context->profile.append_wall_us += esp_timer_get_time() - started_us;
+    return result;
+}
+
+void LogWordPackStreamProfile(const WordPackStreamContext& context, esp_err_t result)
+{
+    const auto& p = context.profile;
+    ESP_LOGI(kTag,
+             "event=pack.append_profile domain=word pack=%s started_us=%lld expected_bytes=%lu result=0x%x append_calls=%lu requested_bytes=%llu fwrite_bytes=%llu accepted_bytes=%u append_wall_us=%lld fwrite_us=%lld sha_us=%lld append_log_us=%lld short_writes=%lu sha_failures=%lu elapsed_us=%lld",
+             wqn::voice_diagnostics::SafeKey(context.item->pack_id.c_str()),
+             static_cast<long long>(p.started_us), static_cast<unsigned long>(context.item->byte_size),
+             static_cast<unsigned>(result), static_cast<unsigned long>(p.append_calls),
+             static_cast<unsigned long long>(p.requested_bytes),
+             static_cast<unsigned long long>(p.fwrite_bytes), static_cast<unsigned>(context.bytes_written),
+             static_cast<long long>(p.append_wall_us), static_cast<long long>(p.write_us),
+             static_cast<long long>(p.sha_us), static_cast<long long>(p.log_us),
+             static_cast<unsigned long>(p.short_writes), static_cast<unsigned long>(p.sha_failures),
+             static_cast<long long>(esp_timer_get_time() - p.started_us));
 }
 
 esp_err_t DownloadWordPackToStorage(
@@ -1365,8 +1436,19 @@ esp_err_t DownloadWordPackToStorage(
     if (!storage_lease) {
         return ESP_ERR_INVALID_STATE;
     }
+    runtime::StorageTempFileLease temp_file_lease;
     WordPackStreamContext context;
     context.item = &item;
+    context.profile.started_us = esp_timer_get_time();
+    // Prepare immutable paths before opening the FILE. Append/Commit/Abort
+    // must not rebuild them while memory pressure may require cleanup.
+    context.temp_path = TempPackPathForItem(item);
+    context.final_path = PackPathForItem(item);
+    // Declared after context: unregister before its path buffers are freed.
+    runtime::PackStreamPathLease path_lease(context.temp_path.c_str());
+    if (!path_lease) {
+        return ESP_ERR_INVALID_STATE;
+    }
     mbedtls_sha256_init(&context.sha);
     context.operation = WordPackStreamOperation::kBegin;
     esp_err_t result = services::ExecuteStorageTransactionNamed(
@@ -1387,6 +1469,7 @@ esp_err_t DownloadWordPackToStorage(
                 WordPackStreamTransaction, &context, "wp-stream"));
     }
     mbedtls_sha256_free(&context.sha);
+    LogWordPackStreamProfile(context, result);
     return result;
 }
 

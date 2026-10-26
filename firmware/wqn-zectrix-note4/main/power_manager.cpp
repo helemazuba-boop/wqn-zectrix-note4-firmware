@@ -1,4 +1,5 @@
 #include "power_manager.h"
+#include "runtime/fault_diagnostics.h"
 
 #include <algorithm>
 #include <array>
@@ -482,6 +483,7 @@ void RefreshSleepDiagnosticPowerPolicy()
     }
     if (now_us >= g_sleep_diag_dump_not_before_us) {
         wqn::runtime::DumpSleepDiagnosticsToLog();
+        wqn::runtime::DumpFaultDiagnosticsToLog();
         g_sleep_diag_dumped_for_host = true;
     }
 }
@@ -815,6 +817,11 @@ bool ReadPowerStatus(PowerStatusSnapshot* snapshot)
         sum_mv += mv;
         ++valid_samples;
 
+        // [adc-latency] This 10-sample batch is also called synchronously by
+        // UI input guards, summaries and diagnostics. Preserve its original
+        // yield: a phase-safe 2-tick wait here added ~200 ms to EACH read at
+        // 100 Hz and multiplied input-to-frame latency. A physical sampling
+        // interval needs acquisition off the UI path, not a coarse delay here.
         vTaskDelay(pdMS_TO_TICKS(1));
     }
 
@@ -1515,15 +1522,15 @@ static void EnterDeepSleepIfEnabled(DeepSleepUiPolicy ui_policy)
 #if CONFIG_WQN_RTC_TIMEKEEP_ENABLE
     // [rtc-timekeep] Persist the wall clock after every service has quiesced
     // (shared I2C bus idle) and before wake-source assembly reprograms the
-    // PCF8563 timer. Deliberately fault-tolerant and non-rollbackable: a
-    // failed write only costs one sleep cycle of clock freshness, and a
-    // rollback that retries the sleep simply overwrites the record.
-    if (!power::timekeep::PersistSystemTimeToRtc(generation)) {
+    // PCF8563 timer. A failed/skipped write revokes restore trust but does not
+    // itself deny sleep; a later retry overwrites the record. Work shares the
+    // prepare deadline, while mandatory STOP cleanup may outlive that budget.
+    if (!power::timekeep::PersistSystemTimeToRtc(generation, command.deadline_us)) {
         ESP_LOGW(kTag, "RTC time persist skipped; next boot falls back to build-time seeding");
     }
 #endif
-    // [sleep-budget] Arming only waits ~4 ms; it must not inherit the display
-    // budget via the transaction deadline.
+    // [sleep-budget] Wake assembly has its own budget, including tick-phase
+    // allowance for GPIO settling, rather than inheriting the display budget.
     const int64_t wake_arm_deadline_us =
         std::min(command.deadline_us, esp_timer_get_time() + kWakeArmTimeoutUs);
     const power::WakeArmResult wake =
@@ -1645,6 +1652,7 @@ static void PowerCoordinatorTask(void*)
         // never blocks the UI task.
         if (runtime::ConsumeSleepDiagnosticsDumpRequest()) {
             runtime::DumpSleepDiagnosticsToLog();
+            runtime::DumpFaultDiagnosticsToLog();
         }
         RefreshUsbPowerSleepPolicy();
         runtime::LogLongHeldSleepLeases(esp_timer_get_time(), kLeaseWarningAfterUs);

@@ -5,6 +5,7 @@
 #include <cstring>
 #include "cJSON.h"
 #include "config.h"
+#include "voice_endpoint.h"
 #include "device_protocol/json_depth_guard.h"
 #include "esp_crt_bundle.h"
 #include "esp_heap_caps.h"
@@ -14,6 +15,7 @@
 #include "esp_websocket_client.h"
 #include "audio_capture.h"
 #include "voice_idle_disconnect.h"
+#include "voice_diagnostics.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
@@ -216,6 +218,37 @@ std::string g_current_req_id;
 std::string g_control_reassembly_buf;
 wqn::SseFrameBuffer g_sse_parser;
 
+void LogWsPhase(const char* stage, const char* request_id, uint32_t op,
+                esp_err_t result, int64_t elapsed_ms = -1)
+{
+    ESP_LOGI(kTag,
+             "event=ai.ws stage=%s req=%s op=%lu err=0x%x elapsed_ms=%lld at_ms=%lld",
+             stage, wqn::voice_diagnostics::SafeKey(request_id),
+             static_cast<unsigned long>(op), static_cast<unsigned>(result),
+             static_cast<long long>(elapsed_ms),
+             static_cast<long long>(esp_timer_get_time() / 1000));
+}
+
+void LogWsSocketEvent(const char* stage, const esp_websocket_event_data_t* event)
+{
+    if (event == nullptr) return;
+    const auto& error = event->error_handle;
+    // This vendored component emits ERROR before abort_connection publishes
+    // TCP_TRANSPORT. In that first event, TLS/socket members are uninitialized;
+    // only the type and handshake status are guaranteed. The later DISCONNECTED
+    // event carries transport fields when its type is TCP_TRANSPORT.
+    const bool transport_error = error.error_type == WEBSOCKET_ERROR_TYPE_TCP_TRANSPORT;
+    ESP_LOGW(kTag,
+             "event=ai.ws stage=%s client=%p type=%u transport_fields=%u tls_esp=0x%x tls_stack=%d cert_flags=0x%x http_status=%d sock_errno=%d at_ms=%lld",
+             stage, event->client, static_cast<unsigned>(error.error_type), transport_error ? 1U : 0U,
+             transport_error ? static_cast<unsigned>(error.esp_tls_last_esp_err) : 0U,
+             transport_error ? error.esp_tls_stack_err : 0,
+             transport_error ? static_cast<unsigned>(error.esp_tls_cert_verify_flags) : 0U,
+             error.esp_ws_handshake_status_code,
+             transport_error ? error.esp_transport_sock_errno : 0,
+             static_cast<long long>(esp_timer_get_time() / 1000));
+}
+
 void PublishCompletion(uint32_t op_gen, esp_err_t result, CmdDisposition disposition)
 {
     if (op_gen == 0) {
@@ -250,12 +283,20 @@ void PublishTurnTerminalRecord(uint32_t turn_gen,
     g_terminal_turn_record.release_state = release_state;
     g_terminal_turn_record.stream_observation = stream_obs;
 
+    ESP_LOGI(kTag,
+             "event=ai.ws stage=turn_terminal req=%s turn_gen=%lu release=%u observation=%u at_ms=%lld",
+             wqn::voice_diagnostics::SafeKey(req_id),
+             static_cast<unsigned long>(turn_gen),
+             static_cast<unsigned>(release_state), static_cast<unsigned>(stream_obs),
+             static_cast<long long>(esp_timer_get_time() / 1000));
+
     if (g_turn_complete_sem != nullptr) {
         xSemaphoreGive(g_turn_complete_sem);
     }
 }
 
-void LogTransportMemory(const char* stage)
+void LogTransportMemory(const char* stage, const char* request_id = nullptr,
+                        uint32_t op = 0)
 {
     const unsigned owner_stack_hwm = g_transport_task == nullptr
         ? 0U
@@ -271,8 +312,9 @@ void LogTransportMemory(const char* stage)
         : static_cast<unsigned>(uxTaskGetStackHighWaterMark(ws_task));
     ESP_LOGI(
         kTag,
-        "memory stage=%s internal_free=%u internal_largest=%u dma_free=%u dma_largest=%u psram_free=%u psram_largest=%u owner_stack_hwm=%u ws_stack_hwm=%u",
+        "memory stage=%s req=%s op=%lu internal_free=%u internal_largest=%u dma_free=%u dma_largest=%u psram_free=%u psram_largest=%u owner_stack_hwm=%u ws_stack_hwm=%u",
         stage,
+        wqn::voice_diagnostics::SafeKey(request_id), static_cast<unsigned long>(op),
         static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
         static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)),
         static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_DMA)),
@@ -301,7 +343,7 @@ void DoDestroyWs()
     g_is_connected.store(false, std::memory_order_release);
     g_session_ready.store(false, std::memory_order_release);
     g_control_reassembly_buf.clear();
-    g_sse_parser.clear();
+    g_sse_parser.reset();
 
     if (g_active_conn_op_gen != 0) {
         PublishCompletion(g_active_conn_op_gen, ESP_FAIL, CmdDisposition::kCancelled);
@@ -442,6 +484,9 @@ void WebsocketEventHandler(void*, esp_event_base_t, int32_t event_id,
 
     switch (static_cast<esp_websocket_event_id_t>(event_id)) {
         case WEBSOCKET_EVENT_CONNECTED: {
+            ESP_LOGI(kTag, "event=ai.ws stage=socket_connected client=%p at_ms=%lld",
+                     event == nullptr ? nullptr : event->client,
+                     static_cast<long long>(esp_timer_get_time() / 1000));
             const esp_err_t result = esp_websocket_client_set_tcp_nodelay(
                 event->client, true);
             if (result != ESP_OK) {
@@ -452,11 +497,17 @@ void WebsocketEventHandler(void*, esp_event_base_t, int32_t event_id,
         }
 
         case WEBSOCKET_EVENT_DISCONNECTED: {
+            ESP_LOGI(kTag, "event=ai.ws stage=socket_disconnected client=%p close_code=%d at_ms=%lld",
+                     event == nullptr ? nullptr : event->client,
+                     event == nullptr ? 0 : event->close_status_code,
+                     static_cast<long long>(esp_timer_get_time() / 1000));
+            LogWsSocketEvent("socket_disconnected_detail", event);
             xTaskNotify(g_transport_task, kEvtBitWsDisconnected, eSetBits);
             break;
         }
 
         case WEBSOCKET_EVENT_ERROR: {
+            LogWsSocketEvent("socket_error", event);
             xTaskNotify(g_transport_task, kEvtBitWsError, eSetBits);
             break;
         }
@@ -517,8 +568,12 @@ void ProcessTextStream()
                 if (type_item != nullptr && cJSON_IsString(type_item) &&
                     std::strcmp(type_item->valuestring, "session.ready") == 0) {
                     ESP_LOGI(kTag, "session.ready control frame validated");
+                    ESP_LOGI(kTag,
+                             "event=ai.ws stage=session_ready op=%lu client=%p at_ms=%lld",
+                             static_cast<unsigned long>(g_active_conn_op_gen), g_ws_client,
+                             static_cast<long long>(esp_timer_get_time() / 1000));
                     g_session_ready.store(true, std::memory_order_release);
-                    LogTransportMemory("session-ready");
+                    LogTransportMemory("session-ready", nullptr, g_active_conn_op_gen);
                     if (g_conn_state.load(std::memory_order_acquire) ==
                         ConnectionState::kConnecting) {
                         g_conn_state.store(ConnectionState::kReady,
@@ -544,15 +599,23 @@ void ProcessTextStream()
           ESP_LOGE(kTag,
                    "SSE frame overflow (>%u bytes) — fatal stream loss",
                    static_cast<unsigned>(wqn::kMaxSseFrameBytes));
-          xTaskNotify(g_transport_task, kEvtBitResetRequired, eSetBits);
-          continue;
+          TeardownFailedTurn();
+          return;
         }
         std::string ev_name;
         uint64_t ev_id = 0;
         std::string ev_data;
 
-        while (g_sse_parser.extract(&ev_name, &ev_id, &ev_data) ==
-               wqn::SseFrameBuffer::FrameState::kComplete) {
+        while (true) {
+            const auto frame = g_sse_parser.extract(&ev_name, &ev_id, &ev_data);
+            if (g_sse_parser.overflowed()) {
+                ESP_LOGE(kTag, "SSE accumulated frame overflow — fatal stream loss");
+                TeardownFailedTurn();
+                return;
+            }
+            if (frame != wqn::SseFrameBuffer::FrameState::kComplete) {
+                break;
+            }
             if (ev_data.empty()) {
                 continue;
             }
@@ -637,6 +700,7 @@ void ExecuteCtrlCmdSingleStep(const CtrlCmd& cmd)
 {
     const int64_t now_ms = esp_timer_get_time() / 1000;
     if (cmd.deadline_ms > 0 && now_ms >= cmd.deadline_ms) {
+        LogWsPhase("command_expired", cmd.request_id, cmd.gen, ESP_ERR_TIMEOUT);
         if (cmd.type == CtrlCmdType::kDisconnect) {
             // Expiry of caller wait does not cancel local transport recovery side-effect
             TeardownFailedTurn(TeardownReason::kLocalDisconnect);
@@ -647,12 +711,14 @@ void ExecuteCtrlCmdSingleStep(const CtrlCmd& cmd)
 
     switch (cmd.type) {
         case CtrlCmdType::kConnect: {
+            LogWsPhase("connect_dispatch", cmd.request_id, cmd.gen, ESP_OK);
             if (g_ws_client != nullptr &&
                 esp_websocket_client_is_connected(g_ws_client) &&
                 g_session_ready.load(std::memory_order_acquire) &&
                 g_current_token == cmd.token) {
                 g_conn_state.store(ConnectionState::kReady,
                                    std::memory_order_release);
+                LogWsPhase("connect_reused", cmd.request_id, cmd.gen, ESP_OK);
                 PublishCompletion(cmd.gen, ESP_OK, CmdDisposition::kExecuted);
                 return;
             }
@@ -664,7 +730,13 @@ void ExecuteCtrlCmdSingleStep(const CtrlCmd& cmd)
                 "Authorization: Bearer " + g_current_token + "\r\n";
 
             esp_websocket_client_config_t cfg = {};
-            cfg.uri = "wss://" WQN_API_BASE_HOST WQN_FLASH_WS_PATH;
+            const std::string ws_url = wqn::BuildVoiceWebSocketUrl();
+            if (ws_url.empty()) {
+                LogWsPhase("url_invalid", cmd.request_id, cmd.gen, ESP_ERR_INVALID_ARG);
+                PublishCompletion(cmd.gen, ESP_ERR_INVALID_ARG, CmdDisposition::kExecuted);
+                return;
+            }
+            cfg.uri = ws_url.c_str();
             cfg.subprotocol = WQN_VOICE_WS_SUBPROTOCOL;
             cfg.headers = auth_header.c_str();
             cfg.network_timeout_ms = 2500;
@@ -689,6 +761,8 @@ void ExecuteCtrlCmdSingleStep(const CtrlCmd& cmd)
 
             g_ws_client = esp_websocket_client_init(&cfg);
             if (g_ws_client == nullptr) {
+                LogWsPhase("client_init_failed", cmd.request_id, cmd.gen, ESP_ERR_NO_MEM);
+                LogTransportMemory("client-init-failed", cmd.request_id, cmd.gen);
                 PublishCompletion(cmd.gen, ESP_ERR_NO_MEM, CmdDisposition::kExecuted);
                 return;
             }
@@ -697,7 +771,13 @@ void ExecuteCtrlCmdSingleStep(const CtrlCmd& cmd)
                 g_ws_client, WEBSOCKET_EVENT_ANY,
                 WebsocketEventHandler, nullptr);
 
-            LogTransportMemory("before-ws-task-start");
+            ESP_LOGI(kTag,
+                     "event=ai.ws stage=handshake_begin req=%s op=%lu client=%p remaining_ms=%lld at_ms=%lld",
+                     wqn::voice_diagnostics::SafeKey(cmd.request_id),
+                     static_cast<unsigned long>(cmd.gen), g_ws_client,
+                     static_cast<long long>(cmd.deadline_ms - esp_timer_get_time() / 1000),
+                     static_cast<long long>(esp_timer_get_time() / 1000));
+            LogTransportMemory("before-ws-task-start", cmd.request_id, cmd.gen);
 #if CONFIG_WQN_AUDIO_RESOURCE_DIAGNOSTICS
             if (!wqn::IsAudioCaptureRunning()) {
                 DumpResourceLedger("before-ws-task-start");
@@ -706,12 +786,13 @@ void ExecuteCtrlCmdSingleStep(const CtrlCmd& cmd)
             const esp_err_t start_err =
                 esp_websocket_client_start(g_ws_client);
             if (start_err != ESP_OK) {
-                LogTransportMemory("ws-task-start-failed");
+                LogWsPhase("ws_task_start_failed", cmd.request_id, cmd.gen, start_err);
+                LogTransportMemory("ws-task-start-failed", cmd.request_id, cmd.gen);
                 DoDestroyWs();
                 PublishCompletion(cmd.gen, start_err, CmdDisposition::kExecuted);
                 return;
             }
-            LogTransportMemory("after-ws-task-start");
+            LogTransportMemory("after-ws-task-start", cmd.request_id, cmd.gen);
 
             // Asynchronous connecting state: owner task records active operation and returns to root loop
             g_active_conn_op_gen = cmd.gen;
@@ -727,6 +808,7 @@ void ExecuteCtrlCmdSingleStep(const CtrlCmd& cmd)
                 g_ws_client == nullptr ||
                 !esp_websocket_client_is_connected(g_ws_client) ||
                 !g_session_ready.load(std::memory_order_acquire)) {
+                LogWsPhase("start_turn_rejected", cmd.request_id, cmd.gen, ESP_ERR_INVALID_STATE);
                 PublishCompletion(cmd.gen, ESP_ERR_INVALID_STATE, CmdDisposition::kRejected);
                 return;
             }
@@ -752,6 +834,7 @@ void ExecuteCtrlCmdSingleStep(const CtrlCmd& cmd)
                 if (root != nullptr) {
                     cJSON_Delete(root);
                 }
+                LogWsPhase("start_turn_json_failed", cmd.request_id, cmd.gen, ESP_ERR_NO_MEM);
                 PublishCompletion(cmd.gen, ESP_ERR_NO_MEM, CmdDisposition::kExecuted);
                 return;
             }
@@ -760,6 +843,7 @@ void ExecuteCtrlCmdSingleStep(const CtrlCmd& cmd)
             cJSON_Delete(root);
 
             if (json_str == nullptr) {
+                LogWsPhase("start_turn_encode_failed", cmd.request_id, cmd.gen, ESP_ERR_NO_MEM);
                 PublishCompletion(cmd.gen, ESP_ERR_NO_MEM, CmdDisposition::kExecuted);
                 return;
             }
@@ -771,6 +855,7 @@ void ExecuteCtrlCmdSingleStep(const CtrlCmd& cmd)
             std::free(json_str);
 
             if (sent != static_cast<int>(json_len)) {
+                LogWsPhase("start_turn_send_failed", cmd.request_id, cmd.gen, ESP_FAIL);
                 ESP_LOGW(kTag,
                          "failed to send voice.turn.start: sent=%d "
                          "expected=%u",
@@ -799,8 +884,13 @@ void ExecuteCtrlCmdSingleStep(const CtrlCmd& cmd)
             g_turn_state.store(TurnState::kRecording,
                                std::memory_order_release);
             g_prefinal_pcm_lost.store(false, std::memory_order_release);
-            g_sse_parser.clear();
+            g_sse_parser.reset();
 
+            ESP_LOGI(kTag,
+                     "event=ai.ws stage=start_turn_committed req=%s op=%lu turn_gen=%lu client=%p at_ms=%lld",
+                     wqn::voice_diagnostics::SafeKey(cmd.request_id),
+                     static_cast<unsigned long>(cmd.gen), static_cast<unsigned long>(g_active_turn_gen),
+                     g_ws_client, static_cast<long long>(esp_timer_get_time() / 1000));
             PublishCompletion(cmd.gen, ESP_OK, CmdDisposition::kExecuted);
             break;
         }
@@ -967,6 +1057,7 @@ void VoiceWsTransportTask(void*)
         if (g_conn_state.load(std::memory_order_acquire) == ConnectionState::kConnecting &&
             g_conn_deadline_ms > 0 && now_ms >= g_conn_deadline_ms) {
             ESP_LOGW(kTag, "Connection handshake timed out at deadline");
+            LogWsPhase("handshake_deadline", nullptr, g_active_conn_op_gen, ESP_ERR_TIMEOUT);
             const uint32_t expired_gen = g_active_conn_op_gen;
             g_active_conn_op_gen = 0;
             g_conn_deadline_ms = 0;
@@ -1067,7 +1158,9 @@ bool PrimitivesReady()
 // placement exists to avoid - every turn then falls back to HTTP. Fall back to
 // any 8-bit-capable memory (internal included) instead of failing outright.
 // `in_psram` is optional and only used for diagnostics.
-void* AllocPrefersPsram(size_t size, bool* in_psram = nullptr)
+void* AllocPrefersPsram(size_t size, bool* in_psram = nullptr,
+                       const char* resource = nullptr,
+                       const char* request_id = nullptr)
 {
     void* ptr = heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (in_psram != nullptr) {
@@ -1076,7 +1169,17 @@ void* AllocPrefersPsram(size_t size, bool* in_psram = nullptr)
     if (ptr != nullptr) {
         return ptr;
     }
-    return heap_caps_malloc(size, MALLOC_CAP_8BIT);
+    ptr = heap_caps_malloc(size, MALLOC_CAP_8BIT);
+    if (resource != nullptr) {
+        ESP_LOGW(kTag,
+                 "event=ai.alloc req=%s resource=%s bytes=%u preferred=psram fallback=8bit result=%s placement=%s internal_largest=%u psram_largest=%u",
+                 wqn::voice_diagnostics::SafeKey(request_id), resource,
+                 static_cast<unsigned>(size), ptr == nullptr ? "failed" : "ok",
+                 ptr == nullptr ? "none" : (esp_ptr_external_ram(ptr) ? "psram" : "internal"),
+                 static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)),
+                 static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM)));
+    }
+    return ptr;
 }
 
 // [diag] Resource ledger for the internal-RAM investigation.
@@ -1193,13 +1296,15 @@ void DeleteUncommittedPrimitives(const UncommittedPrimitives& p)
     }
 }
 
-esp_err_t InitPrimitives()
+esp_err_t InitPrimitives(const char* request_id = nullptr)
 {
     SemaphoreHandle_t init_mutex = GetInitMutex();
     if (init_mutex == nullptr) {
+        LogWsPhase("init_mutex_failed", request_id, 0, ESP_ERR_NO_MEM);
         return ESP_ERR_NO_MEM;
     }
     if (xSemaphoreTake(init_mutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        LogWsPhase("init_mutex_timeout", request_id, 0, ESP_ERR_TIMEOUT);
         return ESP_ERR_TIMEOUT;
     }
     if (PrimitivesReady()) {
@@ -1215,14 +1320,14 @@ esp_err_t InitPrimitives()
     prims.final_sem = xSemaphoreCreateBinary();
     prims.turn_complete_sem = xSemaphoreCreateBinary();
     prims.pcm_queue_storage = static_cast<uint8_t*>(
-        AllocPrefersPsram(kPcmQueueLength * sizeof(PcmBlock)));
+        AllocPrefersPsram(kPcmQueueLength * sizeof(PcmBlock), nullptr, "pcm_queue", request_id));
     prims.pcm_queue = prims.pcm_queue_storage == nullptr
         ? nullptr
         : xQueueCreateStatic(
             kPcmQueueLength, sizeof(PcmBlock), prims.pcm_queue_storage,
             &g_pcm_queue_control);
     prims.ctrl_queue_storage = static_cast<uint8_t*>(
-        AllocPrefersPsram(kCtrlQueueLength * sizeof(CtrlCmd)));
+        AllocPrefersPsram(kCtrlQueueLength * sizeof(CtrlCmd), nullptr, "ctrl_queue", request_id));
     prims.ctrl_queue = prims.ctrl_queue_storage == nullptr
         ? nullptr
         : xQueueCreateStatic(
@@ -1230,7 +1335,8 @@ esp_err_t InitPrimitives()
             &g_ctrl_queue_control);
     prims.ctrl_completion_queue_storage = static_cast<uint8_t*>(
         AllocPrefersPsram(
-            kCtrlCompletionQueueLength * sizeof(CtrlCompletion)));
+            kCtrlCompletionQueueLength * sizeof(CtrlCompletion), nullptr,
+            "completion_queue", request_id));
     prims.ctrl_completion_queue =
         prims.ctrl_completion_queue_storage == nullptr
         ? nullptr
@@ -1239,7 +1345,7 @@ esp_err_t InitPrimitives()
             prims.ctrl_completion_queue_storage,
             &g_ctrl_completion_queue_control);
     prims.text_stream_storage = static_cast<uint8_t*>(
-        AllocPrefersPsram(kTextStreamBufferSize));
+        AllocPrefersPsram(kTextStreamBufferSize, nullptr, "text_stream", request_id));
     prims.text_stream = prims.text_stream_storage == nullptr
         ? nullptr
         : xStreamBufferCreateStatic(
@@ -1250,7 +1356,7 @@ esp_err_t InitPrimitives()
     // would touch the whole stack for nothing.
     prims.transport_task_stack = static_cast<StackType_t*>(
         AllocPrefersPsram(kTransportTaskStackWords * sizeof(StackType_t),
-                          &task_stack_in_psram));
+                          &task_stack_in_psram, "owner_stack", request_id));
 
     const bool allocations_ok = prims.transport_mutex != nullptr &&
         prims.sync_op_sem != nullptr && prims.final_sem != nullptr &&
@@ -1259,9 +1365,25 @@ esp_err_t InitPrimitives()
         prims.ctrl_completion_queue != nullptr &&
         prims.text_stream != nullptr && prims.transport_task_stack != nullptr;
     if (!allocations_ok) {
+        const char* resource = prims.transport_mutex == nullptr ? "transport_mutex" :
+            prims.sync_op_sem == nullptr ? "sync_sem" :
+            prims.final_sem == nullptr ? "final_sem" :
+            prims.turn_complete_sem == nullptr ? "turn_complete_sem" :
+            prims.pcm_queue_storage == nullptr ? "pcm_storage" :
+            prims.pcm_queue == nullptr ? "pcm_control" :
+            prims.ctrl_queue_storage == nullptr ? "ctrl_storage" :
+            prims.ctrl_queue == nullptr ? "ctrl_control" :
+            prims.ctrl_completion_queue_storage == nullptr ? "completion_storage" :
+            prims.ctrl_completion_queue == nullptr ? "completion_control" :
+            prims.text_stream_storage == nullptr ? "text_storage" :
+            prims.text_stream == nullptr ? "text_control" : "owner_stack";
+        ESP_LOGE(kTag, "event=ai.alloc req=%s resource=%s result=failed",
+                 wqn::voice_diagnostics::SafeKey(request_id), resource);
+        LogTransportMemory("init-rollback-before", request_id);
         DeleteUncommittedPrimitives(prims);
         xSemaphoreGive(init_mutex);
         ESP_LOGE(kTag, "transport primitive allocation failed; rolled back");
+        LogTransportMemory("init-rollback-after", request_id);
         return ESP_ERR_NO_MEM;
     }
 
@@ -1270,9 +1392,12 @@ esp_err_t InitPrimitives()
         kTransportTaskPriority,
         prims.transport_task_stack, &g_transport_task_tcb);
     if (transport_task == nullptr) {
+        LogWsPhase("owner_task_create_failed", request_id, 0, ESP_ERR_NO_MEM);
+        LogTransportMemory("owner-task-rollback-before", request_id);
         DeleteUncommittedPrimitives(prims);
         xSemaphoreGive(init_mutex);
         ESP_LOGE(kTag, "transport task allocation failed; primitives rolled back");
+        LogTransportMemory("owner-task-rollback-after", request_id);
         return ESP_ERR_NO_MEM;
     }
 
@@ -1306,7 +1431,7 @@ esp_err_t InitPrimitives()
              g_transport_task_stack,
              static_cast<unsigned>(kTransportTaskStackWords * sizeof(StackType_t)),
              task_stack_in_psram ? 1 : 0);
-    LogTransportMemory("transport-primitives-ready");
+    LogTransportMemory("transport-primitives-ready", request_id);
     return ESP_OK;
 }
 
@@ -1314,24 +1439,33 @@ esp_err_t InitPrimitives()
 
 namespace wqn::stdpro_ws {
 
-esp_err_t EnsureConnected(const std::string& token, uint32_t timeout_ms)
+esp_err_t EnsureConnected(const std::string& token, uint32_t timeout_ms,
+                          const char* request_id)
 {
+    const int64_t started_us = esp_timer_get_time();
     TransportUseRegistration use;
-    const esp_err_t init_result = InitPrimitives();
+    const esp_err_t init_result = InitPrimitives(request_id);
+    const int64_t initialized_us = esp_timer_get_time();
     if (init_result != ESP_OK) {
+        LogWsPhase("init_failed", request_id, 0, init_result,
+                   (initialized_us - started_us) / 1000);
         return init_result;
     }
 
     CtrlCmd cmd = {};
     if (token.size() >= sizeof(cmd.token)) {
+        LogWsPhase("token_size_invalid", request_id, 0, ESP_ERR_INVALID_SIZE);
         return ESP_ERR_INVALID_SIZE;
     }
 
     if (xSemaphoreTake(g_transport_mutex, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
+        LogWsPhase("transport_lock_timeout", request_id, 0, ESP_ERR_TIMEOUT,
+                   (esp_timer_get_time() - initialized_us) / 1000);
         return ESP_ERR_TIMEOUT;
     }
 
     const uint32_t my_gen = ++g_sync_op_gen;
+    const int64_t locked_us = esp_timer_get_time();
     const int64_t deadline_ms = (timeout_ms > 0)
         ? ((esp_timer_get_time() / 1000) + timeout_ms)
         : 0;
@@ -1340,11 +1474,18 @@ esp_err_t EnsureConnected(const std::string& token, uint32_t timeout_ms)
     cmd.gen = my_gen;
     cmd.deadline_ms = deadline_ms;
     std::strncpy(cmd.token, token.c_str(), sizeof(cmd.token) - 1);
+    if (request_id != nullptr) {
+        // Existing command storage is reused for correlation only.
+        std::strncpy(cmd.request_id, request_id, sizeof(cmd.request_id) - 1);
+    }
 
     if (xQueueSend(g_ctrl_queue, &cmd, pdMS_TO_TICKS(500)) != pdTRUE) {
         xSemaphoreGive(g_transport_mutex);
+        LogWsPhase("connect_queue_timeout", request_id, my_gen, ESP_ERR_TIMEOUT,
+                   (esp_timer_get_time() - locked_us) / 1000);
         return ESP_ERR_TIMEOUT;
     }
+    const int64_t queued_us = esp_timer_get_time();
     xTaskNotify(g_transport_task, kEvtBitCtrlPending, eSetBits);
 
     esp_err_t ret = ESP_ERR_TIMEOUT;
@@ -1373,6 +1514,16 @@ esp_err_t EnsureConnected(const std::string& token, uint32_t timeout_ms)
     }
 
     xSemaphoreGive(g_transport_mutex);
+    const int64_t finished_us = esp_timer_get_time();
+    ESP_LOGI(kTag,
+             "event=ai.ws stage=connect_result req=%s op=%lu err=0x%x budget_ms=%u init_ms=%lld lock_ms=%lld enqueue_ms=%lld wait_ms=%lld elapsed_ms=%lld",
+             wqn::voice_diagnostics::SafeKey(request_id), static_cast<unsigned long>(my_gen),
+             static_cast<unsigned>(ret), static_cast<unsigned>(timeout_ms),
+             static_cast<long long>((initialized_us - started_us) / 1000),
+             static_cast<long long>((locked_us - initialized_us) / 1000),
+             static_cast<long long>((queued_us - locked_us) / 1000),
+             static_cast<long long>((finished_us - queued_us) / 1000),
+             static_cast<long long>((finished_us - started_us) / 1000));
     return ret;
 }
 
@@ -1441,7 +1592,7 @@ esp_err_t StartTurn(const std::string& request_id,
                     uint32_t* out_turn_gen)
 {
     TransportUseRegistration use;
-    const esp_err_t init_result = InitPrimitives();
+    const esp_err_t init_result = InitPrimitives(request_id.c_str());
     if (init_result != ESP_OK) {
         return init_result;
     }
@@ -1644,11 +1795,13 @@ TurnWaitResult WaitForTurnRelease(uint32_t expected_turn_gen,
                                  const std::string& expected_request_id,
                                  uint32_t timeout_ms)
 {
+    const int64_t started_us = esp_timer_get_time();
     TurnWaitResult result;
     result.turn_gen = expected_turn_gen;
     result.wait_status = TurnWaitStatus::kTimedOut;
 
     if (g_turn_complete_sem == nullptr || expected_turn_gen == 0) {
+        LogWsPhase("wait_unavailable", expected_request_id.c_str(), 0, ESP_ERR_INVALID_STATE);
         return result;
     }
 
@@ -1681,6 +1834,13 @@ TurnWaitResult WaitForTurnRelease(uint32_t expected_turn_gen,
         }
     }
 
+    ESP_LOGI(kTag,
+             "event=ai.ws stage=wait_return req=%s turn_gen=%lu wait_status=%u release=%u observation=%u budget_ms=%u elapsed_ms=%lld",
+             wqn::voice_diagnostics::SafeKey(expected_request_id.c_str()),
+             static_cast<unsigned long>(expected_turn_gen), static_cast<unsigned>(result.wait_status),
+             static_cast<unsigned>(result.release_state), static_cast<unsigned>(result.stream_observation),
+             static_cast<unsigned>(timeout_ms),
+             static_cast<long long>((esp_timer_get_time() - started_us) / 1000));
     if (result.wait_status == TurnWaitStatus::kTimedOut) {
         ESP_LOGW(kTag, "WaitForTurnRelease timed out for req=%s gen=%lu — tearing down",
                  expected_request_id.c_str(), (unsigned long)expected_turn_gen);

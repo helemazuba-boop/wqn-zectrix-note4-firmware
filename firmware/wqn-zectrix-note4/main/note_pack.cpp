@@ -28,6 +28,8 @@
 #include "freertos/task.h"
 #include "mbedtls/sha256.h"
 #include "runtime/sleep_coordinator.h"
+#include "runtime/storage_temp_file_lease.h"
+#include "runtime/pack_stream_path_lease.h"
 #include "services/storage_service.h"
 
 namespace {
@@ -536,39 +538,20 @@ void PruneUnreferencedNotePackFiles(const wqn::WqnNotePackManifest& current)
     std::vector<std::string> retained_stems;
     AddManifestNotebookStems(current, &retained_stems);
 
-    if (FileExists(kManifestBackupPath)) {
-        wqn::WqnNotePackManifest backup;
+    {
         std::string backup_payload;
-        // Best-effort: keep files referenced by a readable backup so a rollback
-        // still has its packs. A corrupt backup simply prunes more aggressively.
-        if (ReadWholeFile(kManifestBackupPath, &backup_payload) == ESP_OK) {
-            JsonDocument document(backup_payload.c_str());
-            cJSON* data = document.ok()
-                ? cJSON_GetObjectItemCaseSensitive(document.root(), "data")
-                : nullptr;
-            cJSON* notebooks = data != nullptr
-                ? cJSON_GetObjectItemCaseSensitive(data, "notebooks")
-                : nullptr;
-            const int count = cJSON_GetArraySize(notebooks);
-            for (int index = 0; index < count; ++index) {
-                cJSON* object = cJSON_GetArrayItem(notebooks, index);
-                cJSON* has_pack = cJSON_GetObjectItemCaseSensitive(object, "has_pack");
-                if (!cJSON_IsTrue(has_pack)) {
-                    continue;
-                }
-                wqn::WqnNotePackManifestNotebook notebook;
-                cJSON* pack = cJSON_GetObjectItemCaseSensitive(object, "pack");
-                notebook.pack_id = GetOptionalString(pack, "pack_id");
-                notebook.sha256 = GetOptionalString(pack, "sha256");
-                if (notebook.pack_id.empty() || notebook.sha256.empty()) {
-                    continue;
-                }
-                const std::string stem = wqn::SafeNotePackStem(notebook);
-                if (std::find(retained_stems.begin(), retained_stems.end(), stem) ==
-                    retained_stems.end()) {
-                    retained_stems.push_back(stem);
-                }
+        const esp_err_t backup_result = ReadWholeFile(kManifestBackupPath, &backup_payload);
+        // Only a confirmed missing backup permits pruning without its references.
+        // Read/parse failure (including parser allocation failure) leaves the
+        // rollback set unknown: keep all files and retry on a later manifest save.
+        if (backup_result != ESP_ERR_NOT_FOUND) {
+            wqn::WqnNotePackManifest backup;
+            if (backup_result != ESP_OK ||
+                ParseNoteManifestPayload(backup_payload, &backup) != ESP_OK) {
+                ESP_LOGW(kTag, "note pack backup manifest unreadable or invalid; skip pruning");
+                return;
             }
+            AddManifestNotebookStems(backup, &retained_stems);
         }
     }
 
@@ -604,6 +587,11 @@ void PruneUnreferencedNotePackFiles(const wqn::WqnNotePackManifest& current)
 
 esp_err_t ResetNotePackStorageCacheRaw(void*)
 {
+    // Streams keep FILEs open across owner transactions, so a reset must
+    // defer before touching manifests or temporary files owned by a stream.
+    if (wqn::runtime::HasActivePackStreamPath()) {
+        return ESP_ERR_INVALID_STATE;
+    }
     const char* manifest_paths[] = {
         kManifestPath,
         kManifestTempPath,
@@ -935,49 +923,61 @@ esp_err_t MergeNotePackManifestDelta(
 esp_err_t SaveNotePackManifestRaw(const WqnNotePackManifest& manifest)
 {
     cJSON* root = cJSON_CreateObject();
-    cJSON* data = cJSON_CreateObject();
-    cJSON* notebooks = cJSON_CreateArray();
-    if (root == nullptr || data == nullptr || notebooks == nullptr) {
-        cJSON_Delete(root);
-        cJSON_Delete(data);
-        cJSON_Delete(notebooks);
+    if (root == nullptr) {
         return ESP_ERR_NO_MEM;
     }
-    cJSON_AddBoolToObject(root, "success", true);
-    cJSON_AddItemToObject(root, "data", data);
-    cJSON_AddNumberToObject(data, "cursor", static_cast<double>(manifest.cursor));
-    cJSON_AddBoolToObject(data, "has_more", manifest.has_more);
-    cJSON_AddItemToObject(data, "notebooks", notebooks);
+    // A single failed field/key allocation must not publish a partial manifest.
+    if (!cJSON_AddBoolToObject(root, "success", true)) {
+        cJSON_Delete(root);
+        return ESP_ERR_NO_MEM;
+    }
+    cJSON* data = cJSON_AddObjectToObject(root, "data");
+    if (data == nullptr ||
+        !cJSON_AddNumberToObject(data, "cursor", static_cast<double>(manifest.cursor)) ||
+        !cJSON_AddBoolToObject(data, "has_more", manifest.has_more)) {
+        cJSON_Delete(root);
+        return ESP_ERR_NO_MEM;
+    }
+    cJSON* notebooks = cJSON_AddArrayToObject(data, "notebooks");
+    if (notebooks == nullptr) {
+        cJSON_Delete(root);
+        return ESP_ERR_NO_MEM;
+    }
 
     for (const WqnNotePackManifestNotebook& item : manifest.notebooks) {
         cJSON* notebook = cJSON_CreateObject();
-        if (notebook == nullptr) {
+        if (!cJSON_AddItemToArray(notebooks, notebook)) {
+            cJSON_Delete(notebook);
             cJSON_Delete(root);
             return ESP_ERR_NO_MEM;
         }
-        cJSON_AddItemToArray(notebooks, notebook);
-        cJSON_AddStringToObject(notebook, "notebook_id", item.notebook_id.c_str());
-        cJSON_AddStringToObject(notebook, "title", item.title.c_str());
-        cJSON_AddNumberToObject(notebook, "change_sequence", static_cast<double>(item.change_sequence));
-        cJSON_AddNumberToObject(notebook, "content_revision", static_cast<double>(item.content_revision));
-        cJSON_AddBoolToObject(notebook, "has_pack", item.has_pack);
+        if (!cJSON_AddStringToObject(notebook, "notebook_id", item.notebook_id.c_str()) ||
+            !cJSON_AddStringToObject(notebook, "title", item.title.c_str()) ||
+            !cJSON_AddNumberToObject(notebook, "change_sequence", static_cast<double>(item.change_sequence)) ||
+            !cJSON_AddNumberToObject(notebook, "content_revision", static_cast<double>(item.content_revision)) ||
+            !cJSON_AddBoolToObject(notebook, "has_pack", item.has_pack)) {
+            cJSON_Delete(root);
+            return ESP_ERR_NO_MEM;
+        }
         if (!item.has_pack) {
-            cJSON_AddNullToObject(notebook, "pack");
+            if (!cJSON_AddNullToObject(notebook, "pack")) {
+                cJSON_Delete(root);
+                return ESP_ERR_NO_MEM;
+            }
             continue;
         }
-        cJSON* pack = cJSON_CreateObject();
-        if (pack == nullptr) {
+        cJSON* pack = cJSON_AddObjectToObject(notebook, "pack");
+        if (pack == nullptr ||
+            !cJSON_AddStringToObject(pack, "pack_id", item.pack_id.c_str()) ||
+            !cJSON_AddNumberToObject(pack, "pack_revision", static_cast<double>(item.pack_revision)) ||
+            !cJSON_AddNumberToObject(pack, "schema_version", item.schema_version) ||
+            !cJSON_AddNumberToObject(pack, "entry_count", item.entry_count) ||
+            !cJSON_AddNumberToObject(pack, "byte_size", item.byte_size) ||
+            !cJSON_AddStringToObject(pack, "sha256", item.sha256.c_str()) ||
+            !cJSON_AddStringToObject(pack, "download_url", item.download_url.c_str())) {
             cJSON_Delete(root);
             return ESP_ERR_NO_MEM;
         }
-        cJSON_AddItemToObject(notebook, "pack", pack);
-        cJSON_AddStringToObject(pack, "pack_id", item.pack_id.c_str());
-        cJSON_AddNumberToObject(pack, "pack_revision", static_cast<double>(item.pack_revision));
-        cJSON_AddNumberToObject(pack, "schema_version", item.schema_version);
-        cJSON_AddNumberToObject(pack, "entry_count", item.entry_count);
-        cJSON_AddNumberToObject(pack, "byte_size", item.byte_size);
-        cJSON_AddStringToObject(pack, "sha256", item.sha256.c_str());
-        cJSON_AddStringToObject(pack, "download_url", item.download_url.c_str());
     }
 
     char* rendered = cJSON_PrintUnformatted(root);
@@ -1246,16 +1246,19 @@ struct NotePackStreamContext {
     const uint8_t* chunk = nullptr;
     size_t chunk_size = 0;
     NotePackStreamOperation operation = NotePackStreamOperation::kBegin;
+    std::string temp_path;
+    std::string final_path;
 };
 
 esp_err_t NotePackStreamTransaction(void* opaque)
 {
     auto* context = static_cast<NotePackStreamContext*>(opaque);
-    if (context == nullptr || context->notebook == nullptr) {
+    if (context == nullptr || context->notebook == nullptr ||
+        context->temp_path.empty() || context->final_path.empty()) {
         return ESP_ERR_INVALID_ARG;
     }
-    const std::string temp_path = TempPackPathForNotebook(*context->notebook);
-    const std::string final_path = PackPathForNotebook(*context->notebook);
+    const std::string& temp_path = context->temp_path;
+    const std::string& final_path = context->final_path;
     switch (context->operation) {
         case NotePackStreamOperation::kBegin:
             std::remove(temp_path.c_str());
@@ -1302,13 +1305,13 @@ esp_err_t NotePackStreamTransaction(void* opaque)
             }
             context->sha_started = false;
             constexpr char kHex[] = "0123456789abcdef";
-            std::string actual_sha;
-            actual_sha.reserve(64);
-            for (const unsigned char byte : digest) {
-                actual_sha.push_back(kHex[byte >> 4]);
-                actual_sha.push_back(kHex[byte & 0x0f]);
+            std::array<char, 64> actual_sha = {};
+            for (size_t i = 0; i < digest.size(); ++i) {
+                actual_sha[i * 2] = kHex[digest[i] >> 4];
+                actual_sha[i * 2 + 1] = kHex[digest[i] & 0x0f];
             }
-            if (actual_sha != context->notebook->sha256) {
+            if (context->notebook->sha256.size() != actual_sha.size() ||
+                std::memcmp(actual_sha.data(), context->notebook->sha256.data(), actual_sha.size()) != 0) {
                 std::fclose(context->file);
                 context->file = nullptr;
                 std::remove(temp_path.c_str());
@@ -1377,8 +1380,18 @@ esp_err_t DownloadNotePackToStorage(
     if (!storage_lease) {
         return ESP_ERR_INVALID_STATE;
     }
+    runtime::StorageTempFileLease temp_file_lease;
     NotePackStreamContext context;
     context.notebook = &notebook;
+    // Prepare immutable paths before opening the FILE. Append/Commit/Abort
+    // must not rebuild them while memory pressure may require cleanup.
+    context.temp_path = TempPackPathForNotebook(notebook);
+    context.final_path = PackPathForNotebook(notebook);
+    // Declared after context: unregister before its path buffers are freed.
+    runtime::PackStreamPathLease path_lease(context.temp_path.c_str());
+    if (!path_lease) {
+        return ESP_ERR_INVALID_STATE;
+    }
     mbedtls_sha256_init(&context.sha);
     context.operation = NotePackStreamOperation::kBegin;
     esp_err_t result = services::ExecuteStorageTransactionNamed(

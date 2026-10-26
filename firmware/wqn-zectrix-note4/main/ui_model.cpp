@@ -363,6 +363,8 @@ static void ApplyUiScreenTransition(UiState* state, UiScreen screen_before)
     // cycle first, which already released; this is the same release for the user
     // who leaves straight from the Agent tier.
     if (screen_before == wqn::UiScreen::kAi && state->screen != wqn::UiScreen::kAi) {
+        if (state->ai.tier == wqn::AiTier::kStd)
+            wqn::LeaveStdAiTier();
         wqn::stdpro_ws::RequestIdleDisconnect();
         wqn::LeaveOpenCodeAgentTier();
     }

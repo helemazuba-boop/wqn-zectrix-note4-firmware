@@ -36,7 +36,7 @@ def main():
     assert worker.index('warmup_bytes +=') < worker.index('SetCaptureIndicatorLocked(true)') < worker.index('g_audio.initialized = true')
     assert 'SetCaptureIndicatorLocked(false)' in function(capture, 'esp_err_t CleanupCaptureHardware(')
     assert 'SetCaptureIndicatorLocked(false)' in function(capture, 'esp_err_t StopAudioCapture(AudioCaptureChunk* chunk)')
-    stream = function(flash, 'void AudioStreamingTask(void* param)')
+    stream = function(flash, 'void CaptureFlashPcmTurn(uint32_t generation)')
     assert stream.index('for (int warmup') < stream.index('if (read_err != ESP_OK') < stream.index('SetFlashCaptureIndicatorLocked(true)')
     for signature in ['void FinishAudioStreamingTask(', 'void StopAudioStreaming()', 'void OnFlashButtonReleased(bool submit)', 'esp_err_t StopFlashSessionNow()\n{']:
         assert 'SetFlashCaptureIndicatorLocked(false)' in function(flash, signature)

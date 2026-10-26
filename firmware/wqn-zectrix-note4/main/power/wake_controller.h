@@ -23,6 +23,7 @@ void SetPcf8563WakeAvailable(bool available);
 void CaptureWakeContext();
 WakeArmResult ArmWakeSources(uint32_t timer_wakeup_seconds, int64_t deadline_us);
 void DisarmWakeSources();
+void DisarmWakeSources(int64_t deadline_us);
 const char* TimerWakeSourceName(TimerWakeSource source);
 
 }  // namespace wqn::power

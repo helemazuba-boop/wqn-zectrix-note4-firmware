@@ -31,6 +31,7 @@
 #include "mbedtls/sha256.h"
 #include "miniz.h"
 #include "services/connectivity_service.h"
+#include "runtime/wall_clock.h"
 #include "storage.h"
 
 namespace {
@@ -317,6 +318,11 @@ esp_err_t EnsureClockSyncedForHttps()
 
     ESP_LOGI(kTag, "starting SNTP sync before HTTPS requests");
     esp_sntp_config_t config = ESP_NETIF_SNTP_DEFAULT_CONFIG("ntp.aliyun.com");
+    config.sync_cb = [](struct timeval* synchronized) {
+        if (synchronized != nullptr) {
+            wqn::runtime::NoteSntpTimeSynchronized(synchronized->tv_sec, std::time(nullptr));
+        }
+    };
     esp_err_t result = esp_netif_sntp_init(&config);
     if (result != ESP_OK && result != ESP_ERR_INVALID_STATE) {
         return result;
@@ -1034,6 +1040,46 @@ esp_err_t PollPairingOnce(const std::string& mac_address, bool* paired)
 }  // namespace
 
 namespace wqn {
+
+esp_err_t PostAiInteractionReply(const std::string& token, const std::string& id,
+                                 const std::string& answer, std::string* error)
+{
+    if (!IsValidAccessToken(token) || id.size() != 36 || answer.empty() || error == nullptr)
+        return ESP_ERR_INVALID_ARG;
+    for (char ch : id)
+        if (!((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F') ||
+              ch == '-'))
+            return ESP_ERR_INVALID_ARG;
+    cJSON* root = cJSON_CreateObject();
+    if (root == nullptr)
+        return ESP_ERR_NO_MEM;
+    cJSON_AddStringToObject(root, "answer", answer.c_str());
+    cJSON_AddBoolToObject(root, "confirmed", true);
+    char* json = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (json == nullptr)
+        return ESP_ERR_NO_MEM;
+    const std::string body(json);
+    cJSON_free(json);
+    int status = 0;
+    std::string response;
+    const esp_err_t result =
+        HttpRequest("POST", BuildUrl(("/ai/interactions/" + id).c_str()), &token, &body, &status,
+                    &response, nullptr, nullptr, 15000);
+    if (status == 401) {
+        ESP_ERROR_CHECK_WITHOUT_ABORT(ClearAccessToken());
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (result != ESP_OK) {
+        *error = "回答发送失败，请重试原选项";
+        return result;
+    }
+    root = cJSON_Parse(response.c_str());
+    const bool ok = root != nullptr && status == 200 && GetSuccess(root);
+    *error = ok ? "" : "回答未确认，请重试原选项";
+    cJSON_Delete(root);
+    return ok ? ESP_OK : ESP_FAIL;
+}
 
 esp_err_t RunPairingFlowIfNeeded()
 {

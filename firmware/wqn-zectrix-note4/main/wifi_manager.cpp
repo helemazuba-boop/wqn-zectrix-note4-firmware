@@ -8,6 +8,7 @@
 #include "esp_event.h"
 #include "esp_log.h"
 #include "runtime/memory_diagnostics.h"
+#include "runtime/wall_clock.h"
 #include "esp_netif.h"
 #include "esp_netif_sntp.h"
 #include "esp_timer.h"
@@ -139,10 +140,13 @@ bool MatchesConfiguredSsid(const uint8_t* ssid, uint8_t ssid_len)
         std::memcmp(configured.sta.ssid, ssid, ssid_len) == 0;
 }
 
-void TimeSyncCallback(struct timeval*)
+void TimeSyncCallback(struct timeval* synchronized)
 {
     std::time_t now = 0;
     std::time(&now);
+    if (synchronized != nullptr) {
+        wqn::runtime::NoteSntpTimeSynchronized(synchronized->tv_sec, now);
+    }
     char buffer[32] = {};
     std::tm time_info = {};
     localtime_r(&now, &time_info);

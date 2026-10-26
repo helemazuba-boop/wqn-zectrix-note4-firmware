@@ -19,8 +19,9 @@ esp_err_t InitButtonInput();
 // so standby adds zero polling wakeups. Every classified event is pushed into
 // a static ring and `ui_task_to_notify` gets an xTaskNotifyGive.
 // Loss contract: Press/Release and semantic events survive at least 20 full
-// short presses (3 events each) while the UI is blocked; only consecutive
-// kLongPress repeats are coalesced/dropped under pressure.
+// short presses (up to 4 events each, including HoldPress) while the UI is
+// blocked, with one gesture of margin. Only kLongPress repeats are
+// coalesced/dropped under pressure; critical exhaustion is counted below.
 esp_err_t StartButtonInputTask(TaskHandle_t ui_task_to_notify);
 
 // Non-blocking consume from the event ring (UI task side). Returns false when

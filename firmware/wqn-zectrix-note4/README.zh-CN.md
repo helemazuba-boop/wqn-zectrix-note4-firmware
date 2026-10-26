@@ -51,16 +51,17 @@ idf.py -B build-ai-local-s3 -DWQN_API_BASE=https://your-host.example.com/api/esp
 - `CONFIG_WQN_AI_AUDIO_SELFTEST_ENABLE`：启动时采集并打印音频统计，不上传音频。
 - `CONFIG_WQN_DEV_MENU_ENABLE`：设置页增加一个「开发者选项」入口，进入只读二级菜单
   （Dev 信息 / 同步诊断 / 错误记录 / 电量原始 / 存储详情 / 电源睡眠诊断），结构由
-  `DEV_DIAGNOSTICS.md` 固定；发布构建保持 n，错误捕获始终编译。
+  `docs/development/DEV_DIAGNOSTICS.md` 固定；发布构建保持 n，错误捕获始终编译。
 
-## 架构与发布资料
+## 文档目录
 
-- [M8 架构和资源所有权](ARCHITECTURE.md)
-- [固件/云端同步发布清单](RELEASE_CHECKLIST.md)
-- [固件故障排查手册](TROUBLESHOOTING.md)
-- [单词产品与运行时参考基线](WORD_BASELINE.md)
-- [StudySession 生命周期](STUDY_SESSION_PROTOCOL.md)
-- [确定性 Word Pack v2](WORD_PACK_V2.md)
-- [单词离线 durable outbox](WORD_OFFLINE_OUTBOX.md)
-- [单词端云切换清单](WORD_RELEASE_CHECKLIST.md)
-- [错题与笔记复用 StudyRuntime 指南](STUDY_RUNTIME_REUSE.md)
+- [完整文档索引](DOCUMENTATION.md)：说明每篇文档的用途及本地资料边界。
+- [M8 架构和资源所有权](docs/architecture/ARCHITECTURE.md)
+- [固件/云端同步发布清单](docs/release/RELEASE_CHECKLIST.md)
+- [固件故障排查手册](docs/development/TROUBLESHOOTING.md)
+- [构建、烧录和恢复指南](docs/development/BUILD_HERE.md)
+- [开发者诊断规范](docs/development/DEV_DIAGNOSTICS.md)
+- [Word 学习文档](docs/product/word-study/WORD_BASELINE.md)
+- [界面改版和交互记录](docs/ui/)
+- [工程修复和维护记录](docs/engineering/)
+- [可靠性问题与分批补丁路线](docs/engineering/FIRMWARE_RELIABILITY_PLAN.md)

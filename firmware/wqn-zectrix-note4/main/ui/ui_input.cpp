@@ -540,7 +540,7 @@ static RefreshSchedule ReduceSettingsButtonEvent(const wqn::ButtonEvent& event, 
         return RefreshSchedule::kNone;
     }
 
-    // [dev-diag] Second-level dev list (DEV_DIAGNOSTICS.md §3). Reached only
+    // [dev-diag] Second-level dev list (docs/development/DEV_DIAGNOSTICS.md §3). Reached only
     // from the root row kSettingsRowDevMenu; long-Confirm returns to the root
     // list instead of Home, and every Confirm opens a read-only dialog. Placed
     // after all dialog blocks so an open dev dialog keeps its own handling.
@@ -821,7 +821,7 @@ static bool AnswerBodyStarted(
 {
     int32_t probe = 0;
     if (device_ui_internal::GetAiNewestAnswerTopOffsetLines(
-            snapshot, ai.expand_content, /*bottom_pad=*/0, &probe)) {
+            snapshot, wqn::AiHistoryContentExpanded(ai), /*bottom_pad=*/0, &probe)) {
         return true;
     }
     return ai.tier != wqn::AiTier::kAgent && !ai.assistant_partial.empty();
@@ -841,7 +841,7 @@ static bool ApplyAgentTurnJump(wqn::UiState* state, int direction)
     }
     int32_t next = 0;
     if (!device_ui_internal::GetAiTurnJumpOffsetLines(
-            snapshot, state->ai.expand_content,
+            snapshot, wqn::AiHistoryContentExpanded(state->ai),
             device_ui_internal::AiBottomReserve(state->agent),
             state->agent.ui.scroll_offset_lines, direction, &next)) {
         return false;
@@ -854,7 +854,7 @@ static bool ApplyAgentTurnJump(wqn::UiState* state, int direction)
     int32_t min_scroll = 0;
     int32_t max_scroll = 0;
     device_ui_internal::GetAiScrollBounds(
-        snapshot, state->ai.expand_content,
+        snapshot, wqn::AiHistoryContentExpanded(state->ai),
         device_ui_internal::AiBottomReserve(state->agent), &min_scroll,
         &max_scroll);
     wqn::SetOpenCodeScrollOffsetClamped(next, min_scroll, max_scroll);
@@ -1143,6 +1143,8 @@ static RefreshSchedule ApplyStatusBarEditEvent(
                 wqn::AiTier prev_tier = state->ai.tier;
                 wqn::AiTier next = wqn::NextAiTier(prev_tier);
                 state->ai.tier = next;
+                if (prev_tier == wqn::AiTier::kStd && next != prev_tier)
+                    wqn::LeaveStdAiTier();
                 wqn::SetAiTier(next);  // swaps dual history + MarkChanged
                 // [i2s-handoff] Leaving Flash tier must tear down its WS +
                 // AudioStreamingTask + 常驻 I2S duplex channels, otherwise they
@@ -1374,10 +1376,14 @@ static bool CanOpenNavigation(const wqn::UiState& state)
         wqn::TimeAppIsEditingValue(state.time_app)) return false;
     if (state.screen == wqn::UiScreen::kAi) {
         if (state.status_edit.active || state.gestures.flash_ptt_started ||
-            state.gestures.agent_ptt_started ||
+            state.gestures.agent_ptt_started || state.gestures.std_ptt_started ||
             (state.ai.tier == wqn::AiTier::kStd &&
-             (state.ai.status == wqn::AiSessionStatus::kPreparingCapture ||
-              state.ai.status == wqn::AiSessionStatus::kListening))) return false;
+             (state.ai.status == wqn::AiSessionStatus::kTranscribing ||
+              state.ai.status == wqn::AiSessionStatus::kAwaitingConfirmation ||
+              state.ai.status == wqn::AiSessionStatus::kAwaitingDecision ||
+              state.ai.status == wqn::AiSessionStatus::kPreparingCapture ||
+              state.ai.status == wqn::AiSessionStatus::kListening)))
+            return false;
         if (state.ai.tier == wqn::AiTier::kAgent &&
             (state.agent.ui.phase == wqn::AiFeaturePhase::kRecording ||
              AgentOptionModeFor(state.agent) != AgentOptionMode::kNone)) return false;
@@ -1426,6 +1432,9 @@ RefreshSchedule ApplyButtonEvent(
     // or a scroll event. The sub-handlers' own schedule is returned verbatim so
     // a swallowed edge (kPress/kRelease while the bar is up) costs no EPD
     // refresh.
+    RefreshSchedule std_schedule = RefreshSchedule::kNone;
+    if (ApplyStdAiInteractionEvent(event, event_time_ms, state, &std_schedule))
+        return std_schedule;
     RefreshSchedule agent_schedule = RefreshSchedule::kNone;
     if (TryApplyAgentAiButtonEvent(event, event_time_ms, state, &agent_schedule) ==
         AgentInputResult::kHandled) {
@@ -1452,6 +1461,33 @@ RefreshSchedule ApplyButtonEvent(
         state->screen == wqn::UiScreen::kAi &&
         event.button == wqn::ButtonId::kConfirm &&
         state->ai.tier == wqn::AiTier::kAgent;
+
+    const bool is_std_ptt = state->screen == wqn::UiScreen::kAi &&
+                            event.button == wqn::ButtonId::kConfirm &&
+                            state->ai.tier == wqn::AiTier::kStd;
+    if (is_std_ptt && (event.type == wqn::ButtonEventType::kPress ||
+                       event.type == wqn::ButtonEventType::kHoldPress ||
+                       event.type == wqn::ButtonEventType::kRelease)) {
+        if (event.type == wqn::ButtonEventType::kPress) {
+            state->gestures.std_ptt_started = false;
+        } else if (event.type == wqn::ButtonEventType::kHoldPress) {
+            state->gestures.std_ptt_started = wqn::StartAiRecordingSession() == ESP_OK;
+        } else if (state->gestures.std_ptt_started) {
+            state->gestures.std_ptt_started = false;
+            (void)wqn::StopAiRecordingAndSubmit();
+        }
+        wqn::AiSessionState snapshot;
+        const bool changed = wqn::CopyAiSessionToUi(&snapshot);
+        if (changed)
+            state->ai = std::move(snapshot);
+        return changed && state->ai.status != wqn::AiSessionStatus::kPreparingCapture
+                   ? RefreshSchedule::kAi
+                   : RefreshSchedule::kNone;
+    }
+    if (is_std_ptt && state->gestures.std_ptt_started &&
+        (event.type == wqn::ButtonEventType::kShortPress ||
+         event.type == wqn::ButtonEventType::kDoublePress))
+        return RefreshSchedule::kNone;
 
     if ((event.type == wqn::ButtonEventType::kPress ||
          event.type == wqn::ButtonEventType::kRelease ||
@@ -1636,7 +1672,7 @@ RefreshSchedule ApplyButtonEvent(
     // kLongPress repeats so HandleUiInput(kLongConfirm) cannot start/error a
     // second recording path. kLongRelease is likewise handled by raw kRelease.
     if (state->screen == wqn::UiScreen::kAi &&
-        state->ai.tier == wqn::AiTier::kFlash &&
+        (state->ai.tier == wqn::AiTier::kFlash || state->ai.tier == wqn::AiTier::kStd) &&
         event.button == wqn::ButtonId::kConfirm && long_press) {
         return RefreshSchedule::kAi;
     }
@@ -1665,7 +1701,7 @@ RefreshSchedule ApplyButtonEvent(
         // (delivered ~50 ms after the press transition), which arrives before
         // this kLongRelease. Calling OnFlashButtonReleased twice would
         // double-submit the audio buffer, so skip here.
-        if (state->ai.tier == wqn::AiTier::kFlash) {
+        if (state->ai.tier == wqn::AiTier::kFlash || state->ai.tier == wqn::AiTier::kStd) {
             return RefreshSchedule::kAi;
         }
         if (state->ai.status == wqn::AiSessionStatus::kListening ||
@@ -1742,7 +1778,7 @@ RefreshSchedule ApplyButtonEvent(
         int32_t min_scroll = 0;
         int32_t max_scroll = 0;
         device_ui_internal::GetAiScrollBounds(
-            snapshot, state->ai.expand_content,
+            snapshot, wqn::AiHistoryContentExpanded(state->ai),
             device_ui_internal::AiBottomReserve(state->agent), &min_scroll,
             &max_scroll);
         // [follow] A manual scroll is the user taking the viewport back: the
@@ -1795,7 +1831,10 @@ RefreshSchedule ApplyButtonEvent(
         (event.type == wqn::ButtonEventType::kShortPress) &&
         (event.button == wqn::ButtonId::kUp || event.button == wqn::ButtonId::kDownPower)) {
         if (state->ai.status == wqn::AiSessionStatus::kPreparingCapture ||
-            state->ai.status == wqn::AiSessionStatus::kListening) {
+            state->ai.status == wqn::AiSessionStatus::kListening ||
+            state->ai.status == wqn::AiSessionStatus::kTranscribing) {
+            if (state->ai.tier == wqn::AiTier::kStd && event.button == wqn::ButtonId::kDownPower)
+                wqn::CancelAiVoiceInput();
             return RefreshSchedule::kNone;
         }
         constexpr int32_t kScrollStepRows = 4;  // [scroll-2x] was 2; doubled per request
@@ -1817,7 +1856,7 @@ RefreshSchedule ApplyButtonEvent(
             int32_t max_scroll = 0;
             // 0: this tier has no bottom band, so it reserves nothing.
             device_ui_internal::GetAiScrollBounds(
-                snapshot, state->ai.expand_content, /*bottom_pad=*/0, &min_scroll,
+                snapshot, wqn::AiHistoryContentExpanded(state->ai), /*bottom_pad=*/0, &min_scroll,
                 &max_scroll);
             const int32_t current = wqn::GetAiScrollOffsetLines();
             if (event.button == wqn::ButtonId::kUp) {

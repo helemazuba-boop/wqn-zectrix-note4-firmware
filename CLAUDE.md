@@ -14,12 +14,13 @@ talks to the **WQN ESP32 API** using a device-pairing token.
 All firmware source lives under `firmware/wqn-zectrix-note4/`. The repo root also holds
 `README.md` (Chinese, project overview + dev order), `LICENSE` (GPL-3.0), and
 gitignored local dirs `analysis/` (official-firmware reverse engineering), `docs/`
-(local spec/handoff notes), and `.claude/` / `.opencode/` / `.vscode/` (tool state).
+(local spec/handoff notes, classified in `firmware/wqn-zectrix-note4/DOCUMENTATION.md`), and `.claude/` /
+`.opencode/` / `.vscode/` (tool state).
 The detailed English firmware README is `firmware/wqn-zectrix-note4/README.md`;
-`firmware/wqn-zectrix-note4/BUILD_HERE.md` is the build/flash playbook. Inline code
+`firmware/wqn-zectrix-note4/docs/development/BUILD_HERE.md` is the build/flash playbook. Inline code
 comments are mixed Chinese/English; identifiers are English.
 
-> Environment note: the tracked READMEs and `BUILD_HERE.md` were written for the
+> Environment note: the tracked READMEs and `docs/development/BUILD_HERE.md` were written for the
 > maintainer's Windows workspace and reference `<repo-root>`
 > plus `<esp-idf-dir>`. This checkout lives at
 > `<repo-root>` (WSL). The `idf.py` commands below are
@@ -29,7 +30,7 @@ comments are mixed Chinese/English; identifiers are English.
 ## Build, flash, monitor
 
 ESP-IDF **v5.5.x** is required. **Always build into the `build-ai-local-s3` directory**
-— it is the only build dir kept on purpose (see `BUILD_HERE.md`).
+— it is the only build dir kept on purpose (see `docs/development/BUILD_HERE.md`).
 
 ```sh
 cd firmware/wqn-zectrix-note4
@@ -86,7 +87,7 @@ Feature toggles live in `idf.py menuconfig` under **WQN firmware** (defined in
 - `CONFIG_WQN_DEV_MENU_ENABLE` — a settings row that opens the second-level read-only
   dev list (Dev info / sync diagnostics / error log / raw battery / storage detail /
   sleep diagnostics); structure fixed by
-  `firmware/wqn-zectrix-note4/DEV_DIAGNOSTICS.md`. Default n; error capture
+  `firmware/wqn-zectrix-note4/docs/development/DEV_DIAGNOSTICS.md`. Default n; error capture
   (`wqn::RecordError`) is always compiled regardless of this flag.
 
 Defaults are **layered**: the root `CMakeLists.txt` appends both `sdkconfig.defaults`
@@ -120,7 +121,7 @@ enter sleep itself.
 
 The enforced dependency direction is features → service interfaces → services →
 runtime primitives → Note4 HAL/ESP-IDF. See
-`firmware/wqn-zectrix-note4/ARCHITECTURE.md` for the full ownership map. Every build
+`firmware/wqn-zectrix-note4/docs/architecture/ARCHITECTURE.md` for the full ownership map. Every build
 runs `cmake/verify_architecture.cmake` and rejects driver/HAL access from features,
 second hardware owners, or a second deep-sleep call site.
 
@@ -220,7 +221,7 @@ pins live only in their owning services. The load-bearing rules:
   sub-module over growing `device_ui.cpp` inline. `ui_layout.h` tokens replace
   scattered magic numbers.
 - **One build dir** (`build-ai-local-s3`). If you genuinely need another, name it
-  `build-<purpose>-<date>` and document it in `BUILD_HERE.md`. Scripts go in `scripts/`,
+  `build-<purpose>-<date>` and document it in `docs/development/BUILD_HERE.md`. Scripts go in `scripts/`,
   not the repo root.
 - **No secrets in firmware**: no Supabase service-role keys, no provider (ASR/LLM/
   DashScope) keys, no committed WiFi passwords or tokens. `sdkconfig` (which may hold

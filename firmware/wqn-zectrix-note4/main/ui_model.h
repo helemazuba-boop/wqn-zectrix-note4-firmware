@@ -49,8 +49,11 @@ enum class AiSessionStatus {
     // status before a recording buffer exists.
     kPreparingCapture,
     kListening,
+    kTranscribing,
+    kAwaitingConfirmation,
+    kAwaitingDecision,
     kWaitingReply,
-    kStreaming,         // v2 SSE: connected, server is producing events
+    kStreaming, // v2 SSE: connected, server is producing events
     kReplyReady,
     kError,
 };
@@ -81,6 +84,9 @@ enum class ThinkingLevel : uint8_t {
 };
 
 struct AiSessionState {
+    std::string pending_input;
+    int64_t input_armed_at_ms = 0;
+    AiInteraction interaction;
     AiSessionStatus status = AiSessionStatus::kIdle;
     AiTier tier = AiTier::kStd;
     std::string user_text;
@@ -113,13 +119,14 @@ struct AiSessionState {
     // signal by the toast being present at all, with a blink dot.
     int32_t scroll_offset_lines = 0;
     // [follow] Per-turn viewport-follow state, owned here because this struct
-    // owns the offset it drives. follow_active: the viewport is still chasing
-    // the newest content this turn (cleared when the answer text arrives, so
-    // the reply stays readable). user_moved: the user moved the viewport this
-    // turn, which disables the follow AND the completion recenter. Both are
-    // armed by the turn-start paths in ai_session.cpp.
+    // owns the offset it drives. Following parks at each answer's first line
+    // and watches subsequent thinking/tool rounds until completion. Manual
+    // reading disables it. An epoch and revision bind automatic moves to the
+    // turn that armed them, as on Agent.
     bool follow_active = false;
     bool user_moved = false;
+    uint32_t follow_epoch = 0;
+    uint64_t follow_after_revision = 0;
     bool toast_visible = false;
     std::string toast_label;       // e.g. "\xe2\x97\x8f 录音中 00:04" / "\xe2\x97\x8f 上传…"
     int64_t toast_since_ms = 0;
@@ -132,11 +139,16 @@ struct AiSessionState {
     ThinkingLevel thinking_level = ThinkingLevel::kMed;
     bool tts_on = false;
     bool expand_content = true;   // [expand] default full thinking/tool display (Flash can't toggle)
-    // [follow] Auto-follow the newest content while a reply streams, stopping
-    // when the answer text (正文) arrives. Exposed as the 4th edit-cluster
-    // toggle; STD/Pro and Agent only (Flash hides the whole cluster).
+    // Durable settings-page choice, shared by STD and Agent.
     bool auto_follow = true;
 };
+
+// Agent detail is selected by its own gateway setting. The STD collapse toggle
+// must not hide Agent content or change its viewport geometry.
+inline bool AiHistoryContentExpanded(const AiSessionState& ai)
+{
+    return ai.tier == AiTier::kAgent || ai.expand_content;
+}
 
 // Returns the current scroll offset in 18-px line units (0 == bottom / newest).
 // UI tasks read this under the AI mutex; safe to call from any task.
@@ -193,7 +205,7 @@ struct HomeSummary {
 // indexes settings rows (model clamps, button dispatch, row rendering). It
 // lives here — not in device_ui_internal — because the model layer
 // (ui_model.cpp) clamps the selection without including ui/ headers.
-// Structure (rows, order, dialogs) is specified by DEV_DIAGNOSTICS.md.
+// Structure (rows, order, dialogs) is specified by docs/development/DEV_DIAGNOSTICS.md.
 #if CONFIG_WQN_DEV_MENU_ENABLE
 constexpr size_t kSettingsItemCount = 12;
 #else
@@ -223,7 +235,7 @@ constexpr size_t kSettingsRowFactoryReset = 9;
 constexpr size_t kSettingsRowPowerOff = 10;
 #endif
 
-// Second-level dev list (DEV_DIAGNOSTICS.md §3): six rows in the five-row
+// Second-level dev list (docs/development/DEV_DIAGNOSTICS.md §3): six rows in the five-row
 // selection-following window. kDevRowBatteryRaw and
 // kDevRowStorage carry the two detail dialogs that used to sit on the root
 // list; the flag gates only the root entry row, not these constants.
@@ -234,7 +246,7 @@ constexpr size_t kDevRowDevErrors = 2;
 constexpr size_t kDevRowBatteryRaw = 3;
 constexpr size_t kDevRowStorage = 4;
 constexpr size_t kDevRowSleepDiag = 5;
-// On-panel sleep/power diagnostic lines (DEV_DIAGNOSTICS.md §4.6).
+// On-panel sleep/power diagnostic lines (docs/development/DEV_DIAGNOSTICS.md §4.6).
 constexpr size_t kSleepDiagLines = 6;
 
 // Which row list the settings page is showing. The dev list is a second-level
@@ -312,7 +324,7 @@ struct SettingsDiagnosticsSnapshot {
     std::string idf_target;
     std::string idf_version;
     std::string content_sync_label;
-    // [dev-diag] Dev-menu fields (structure fixed by DEV_DIAGNOSTICS.md).
+    // [dev-diag] Dev-menu fields (structure fixed by docs/development/DEV_DIAGNOSTICS.md).
     // Filled by UpdateSettingsDiagnostics on dialog open / state reload; the
     // Kconfig flag only gates the visible rows, these fields always exist.
     std::string git_commit;  // configure-time git describe, "unknown" fallback
@@ -329,7 +341,7 @@ struct SettingsDiagnosticsSnapshot {
     std::string error_count_label;      // row value: "3 条" / "无"
     size_t error_line_count = 0;
     SettingsErrorLine error_lines[6];
-    // [dev-diag] Sleep/power diagnostics (DEV_DIAGNOSTICS.md §4.6): the ring
+    // [dev-diag] Sleep/power diagnostics (docs/development/DEV_DIAGNOSTICS.md §4.6): the ring
     // lives in RTC slow memory and is only readable through
     // CopySleepDiagnosticEntries, so this copy is the on-panel view of it.
     // Newest first, formatted at snapshot time like the error lines.
@@ -468,6 +480,8 @@ struct AgentOptionState {
 struct UiGestureState {
     bool flash_ptt_started = false;
     bool agent_ptt_started = false;
+    bool std_ptt_started = false;
+    int64_t std_decision_press_ms = 0;
     int64_t last_ai_confirm_tap_ms = 0;
     // [agent] Separate from last_ai_confirm_tap_ms on purpose: on the AI page a
     // double-confirm enters status-bar edit mode, but in the Agent session

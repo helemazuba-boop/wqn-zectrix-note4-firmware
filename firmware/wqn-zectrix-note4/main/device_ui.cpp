@@ -54,22 +54,23 @@ namespace {
 // on safely after the UI task was blocked and the ring replayed a backlog.
 // Navigation events (nav/short/double) replay fine -- the user still wants
 // them. But a completed PTT gesture (a Confirm hold: kHoldPress .. kRelease)
-// must NOT fire audio side effects seconds after the user let go, so a stale
-// Confirm press/hold/release is dropped wholesale. kLongPress repeats are
-// already coalesced in the ring; a straggler older than the repeat cadence is
-// also dropped so menus do not lurch on unblock.
+// must NOT start capture seconds after the user let go, so stale Confirm
+// press/hold events are dropped. Release always reaches the reducer: a hold
+// may already have started capture before the UI stalled, and navigation also
+// needs it to clear held/blocked state. PTT consumers only stop a started hold.
+// Held-key repeats are coalesced in the ring; a straggler older than the
+// repeat cadence is also dropped so menus do not lurch on unblock.
 bool ShouldDropStaleButtonEvent(const wqn::ButtonEvent& event, int64_t now_ms)
 {
     const int64_t age_ms = now_ms - event.occurred_at_ms;
     if (age_ms <= 0) {
         return false;
     }
-    // Confirm is the PTT key; its raw press/hold/release drive audio capture.
-    // Drop the whole gesture if it aged past the capture-relevant window.
+    // Reject stale capture starts; preserve releases for already-active PTT
+    // and navigation cleanup, even when the UI has been blocked for seconds.
     if (event.button == wqn::ButtonId::kConfirm &&
         (event.type == wqn::ButtonEventType::kPress ||
-         event.type == wqn::ButtonEventType::kHoldPress ||
-         event.type == wqn::ButtonEventType::kRelease)) {
+         event.type == wqn::ButtonEventType::kHoldPress)) {
         constexpr int64_t kStalePttMs = 2000;
         return age_ms > kStalePttMs;
     }
@@ -1466,7 +1467,7 @@ wqn::AiStreamingStatusView streaming_view{};
                     // same floor.
                     static int64_t last_agent_render_ms = 0;
                     const int64_t now_ms_d = esp_timer_get_time() / 1000;
-                    if (now_ms_d - last_agent_render_ms < 500) {
+                    if (now_ms_d - last_agent_render_ms < device_ui_internal::kAiStreamingRefreshFloorMs) {
                         skip_for_throttle = true;
                     } else {
                         last_agent_render_ms = now_ms_d;
@@ -1474,24 +1475,14 @@ wqn::AiStreamingStatusView streaming_view{};
                 } else if (state.screen == wqn::UiScreen::kAi &&
                            state.ai.tier == wqn::AiTier::kStd &&
                            (state.ai.status == wqn::AiSessionStatus::kStreaming ||
+                            state.ai.status == wqn::AiSessionStatus::kTranscribing ||
                             state.ai.status == wqn::AiSessionStatus::kListening)) {
-                    // [std-throttle] STD/Pro had no merge floor at all, so every SSE delta
-                    // reached the panel: each ReplaceText on the mirrored answer
-                    // bumps the history revision, which invalidates the snapshot
-                    // cache and re-copies the whole message vector. The panel
-                    // partial is ~734 ms, so a token-cadence stream kept the EPD
-                    // owner permanently behind. Same 300 ms tier as Flash, not
-                    // the Agent's 500 ms: STD carries text only -- no tool frames
-                    // -- so its cadence is Flash's cadence. (Flash keeps its own
-                    // branch above, keyed on flash_is_streaming, which also
-                    // covers its kWaitingReply gap; that is Flash's business,
-                    // not this change's.)
-                    // kListening is in the gate on purpose: asr.delta grows the
-                    // pending user bubble at recognizer cadence, which is the
-                    // same burn through a different buffer.
+                    // STD now carries thinking, tools and decision events too.
+                    // Sample live content at the same floor as Agent; modal
+                    // cards and terminal states are outside this streaming gate.
                     static int64_t last_std_render_ms = 0;
                     const int64_t now_ms_d = esp_timer_get_time() / 1000;
-                    if (now_ms_d - last_std_render_ms < 300) {
+                    if (now_ms_d - last_std_render_ms < device_ui_internal::kAiStreamingRefreshFloorMs) {
                         skip_for_throttle = true;
                     } else {
                         last_std_render_ms = now_ms_d;

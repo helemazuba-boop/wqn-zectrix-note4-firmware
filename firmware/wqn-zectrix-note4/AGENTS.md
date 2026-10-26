@@ -6,9 +6,10 @@ invariants that took months of review to establish, and the review workflow are
 all here. When it disagrees with older docs, **this file + the code win**.
 
 Companion docs (read for depth, not for rules): `README.md` /
-`README.zh-CN.md` (overview), `ARCHITECTURE.md` (ownership map),
-`BUILD_HERE.md` (flash playbook), `CLAUDE.md` at the repo root (overlapping
-guidance written for the maintainer's Windows workspace).
+`README.zh-CN.md` (overview), `docs/architecture/ARCHITECTURE.md` (ownership
+map), `docs/development/BUILD_HERE.md` (flash playbook),
+`DOCUMENTATION.md` (full document map), and `CLAUDE.md` at the repo root
+(overlapping guidance written for the maintainer's Windows workspace).
 
 ---
 
@@ -64,11 +65,12 @@ source <esp-idf-dir>/export.sh
 idf.py -B build-wsl build
 ```
 
-> The tracked READMEs / `BUILD_HERE.md` / `CLAUDE.md` were written for the
+> The tracked READMEs / `docs/development/BUILD_HERE.md` / `CLAUDE.md` were written for the
 > maintainer's Windows workspace and use `build-ai-local-s3` + a Windows-local
 > ESP-IDF path. Both are valid; **match whichever build dir already exists in
 > the current checkout** and do not create a second one casually. If you truly
-> need another, name it `build-<purpose>-<date>` and note it in `BUILD_HERE.md`.
+> need another, name it `build-<purpose>-<date>` and note it in
+> `docs/development/BUILD_HERE.md`.
 
 Override the WQN API base for a dev backend (the ESP32 can't reach your
 `localhost`):
@@ -107,7 +109,8 @@ from the tier ring, so the tier is unreachable rather than present and broken),
 rail cut so a short pause does not flash the panel; 0 re-attaches it to the
 power-off point),
 `CONFIG_WQN_DEV_MENU_ENABLE` (default n; one settings row opening a
-second-level read-only dev list, structure fixed by `DEV_DIAGNOSTICS.md`;
+  second-level read-only dev list, structure fixed by
+  `docs/development/DEV_DIAGNOSTICS.md`;
 `wqn::RecordError` capture is always compiled regardless of this flag).
 
 > A **new** Kconfig symbol does not reach `sdkconfig.h` until a reconfigure.
@@ -142,7 +145,8 @@ or sleeps itself. **A boot-time failure in a storage-integrity/recovery step
 must abort into storage recovery mode, not continue into business services.**
 
 Enforced dependency direction (M8 gate): features → service interfaces →
-services → runtime primitives → Note4 HAL/ESP-IDF. See `ARCHITECTURE.md`.
+services → runtime primitives → Note4 HAL/ESP-IDF. See
+`docs/architecture/ARCHITECTURE.md`.
 
 **Extracted IDF components** — `platform_note4` owns boot safe pins;
 `power_runtime` holds `SleepLease` / `WakeContext` / snapshots / sleep protocol;

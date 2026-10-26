@@ -66,6 +66,7 @@ struct AgentSessionState {
     // The session that raised the pending question; see pending_permission_session.
     std::string pending_question_session;
     std::vector<OpenCodeQuestionOption> pending_question_options;
+    bool question_allow_custom = true;
     // Session id whose transcript is already in the kAgent channel. Backfill
     // runs once per session, on switch and on first observe, so a reconnect
     // cannot append the same turns twice.
@@ -89,11 +90,12 @@ struct AgentSessionState {
     // in the frame signature, or layer-1 dedup skips the repaint the flip needs
     // and the fix is invisible.
     bool run_live = false;
-    // [follow] Per-turn viewport-follow state for the Agent tier; same
-    // semantics as AiSessionState::follow_active / user_moved. Armed by the
-    // turn-start paths in opencode_session.cpp, cleared by manual scrolls.
+    // Follow survives intermediate answer/tool rounds. Each arm binds a fresh
+    // epoch and history watermark; old content cannot finish a resumed follow.
     bool follow_active = false;
     bool user_moved = false;
+    uint32_t follow_epoch = 0;
+    uint64_t follow_after_revision = 0;
     // [detail] See kOpenCodeDetailDefault. Rides the snapshot to the UI with
     // every other field; the request builders read it at command-arm time.
     uint8_t detail_level = kOpenCodeDetailDefault;

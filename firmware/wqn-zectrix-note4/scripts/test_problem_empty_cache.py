@@ -57,7 +57,7 @@ def main():
         unit.write_text(template, encoding='utf-8')
         subprocess.run([compiler, '-std=c++17', '-Wall', '-Wextra', '-Werror',
                         '-fno-builtin', str(unit), '-o', str(binary),
-                        '-Wl,--wrap=fopen,--wrap=fclose,--wrap=fwrite'],
+                        '-Wl,--wrap=fopen,--wrap=fclose,--wrap=fwrite,--wrap=rename,--wrap=remove,--wrap=fputc'],
                        check=True, timeout=30)
         return subprocess.run([str(binary), directory], timeout=15).returncode
 

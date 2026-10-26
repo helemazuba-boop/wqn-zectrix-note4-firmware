@@ -1,4 +1,5 @@
 #pragma once
+#include "ai_interaction.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -408,6 +409,9 @@ struct WqnAiSseEvent {
         kTextStart,
         kTextDelta,
         kTextEnd,
+        kInteractionRequest,
+        kInteractionWaiting,
+        kInteractionClosed,
         kToolStart,
         kToolResult,
         kToolError,
@@ -416,6 +420,7 @@ struct WqnAiSseEvent {
         kError,
         kFinal,
     };
+    AiInteraction interaction;
     Kind kind = Kind::kUnknown;
     uint64_t event_id = 0;
     std::string raw_json;
@@ -450,6 +455,12 @@ typedef void (*WqnAiSseCallback)(const WqnAiSseEvent& event, void* user_ctx);
 
 struct WqnAiStreamRequest {
     std::string token;
+    std::string confirmed_text;
+    bool transcribe_only = false;
+    // Called only by the stream owner between reads, never by the SSE callback.
+    void (*pump)(void*) = nullptr;
+    void* pump_ctx = nullptr;
+    bool (*cancelled)() = nullptr;
     // Borrowed mono s16le 16 kHz samples. UploadAiAudioChatStream is
     // synchronous; the caller keeps this storage valid until it returns.
     const int16_t* pcm_data = nullptr;
@@ -458,7 +469,9 @@ struct WqnAiStreamRequest {
     std::string tier = "std";        // "std" | "pro"
     std::string conversation_id;     // optional
     std::string request_id;          // optional idempotency UUID, server generates if empty
-    int timeout_ms = 0;              // 0 = use WQN_AI_SSE_TIMEOUT_MS
+    // One monotonic budget for upload, headers and SSE; 0 uses the default.
+    // SDK blocking calls and final cleanup remain cooperative, not hard WCET.
+    int timeout_ms = 0;
     WqnAiSseCallback callback = nullptr;
     void* user_ctx = nullptr;
     // Thinking controls sent as validated X-WQN headers on the raw PCM request.
@@ -474,7 +487,14 @@ struct WqnAiStreamRequest {
 // the client received an error event.  On ESP_FAIL a transport/HTTP-level
 // failure occurred before the stream could deliver any final frame; the caller
 // should look at response->error_code / error_message.
+// ESP_ERR_TIMEOUT means the shared budget expired (chat_timeout). The owner
+// closes a dripping SSE body from ON_DATA; it never destroys the client there.
+// A blocking SDK connect/header call or user callback can outlive the budget;
+// expiry is checked again when control returns. No automatic retry is made.
 esp_err_t UploadAiAudioChatStream(const WqnAiStreamRequest& request, WqnAiChatResponse* response);
+
+esp_err_t PostAiInteractionReply(const std::string& token, const std::string& id,
+                                 const std::string& answer, std::string* error);
 
 esp_err_t ParseTodoListResponse(const std::string& body, WqnTodoListPage* page);
 esp_err_t ParseTodoCompleteResponse(const std::string& body, WqnTodoItem* todo);
