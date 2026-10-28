@@ -1057,6 +1057,13 @@ UiUpdate UiRuntime::DispatchAiStreamingSnapshot(const wqn::AiStreamingStatusView
 
 UiUpdate UiRuntime::DispatchAiSessionSnapshot(const wqn::AiSessionState& snapshot)
 {
+    if (state_.ai.tier == wqn::AiTier::kFlash && snapshot.tier == wqn::AiTier::kFlash) {
+        // STD owns settings, Flash owns its turn and viewport. A settings or
+        // idle STD snapshot cannot erase a running Flash projection.
+        state_.ai.auto_follow = snapshot.auto_follow;
+        state_.ai.expand_content = snapshot.expand_content;
+        return FinishEvent(AppEventKind::kAiSessionSnapshot, RefreshSchedule::kNone, true);
+    }
     if (state_.ai.interaction.id != snapshot.interaction.id ||
         state_.ai.status != snapshot.status) {
         state_.agent_option.focused = 0;
@@ -1096,9 +1103,7 @@ UiUpdate UiRuntime::DispatchAiViewportFollow()
 
     const wqn::AiTier tier = state_.ai.tier;
     const bool agent_tier = tier == wqn::AiTier::kAgent;
-    // Which history channel and which follow flags this tier owns. Flash never
-    // arms the follow (it has no turn to watch), so the check below no-ops
-    // there without needing its own branch.
+    // Each tier follows its own history and input ownership.
     const wqn::AiHistoryChannel channel = agent_tier
         ? wqn::AiHistoryChannel::kAgent
         : (tier == wqn::AiTier::kFlash ? wqn::AiHistoryChannel::kFlash
@@ -1149,7 +1154,9 @@ UiUpdate UiRuntime::DispatchAiViewportFollow()
          state_.agent.ui.phase == wqn::AiFeaturePhase::kIdle);
     // A resumed run must see fresh history before an old assistant can count
     // as its answer. Settled observes may display an existing final answer.
-    const bool finished = agent_tier ? agent_finished :
+    const bool finished = tier == wqn::AiTier::kFlash
+        ? !state_.ai.flash_is_streaming && state_.ai.status != wqn::AiSessionStatus::kListening
+        : agent_tier ? agent_finished :
         (state_.ai.status == wqn::AiSessionStatus::kReplyReady ||
          state_.ai.status == wqn::AiSessionStatus::kError ||
          state_.ai.status == wqn::AiSessionStatus::kIdle);
@@ -1161,7 +1168,7 @@ UiUpdate UiRuntime::DispatchAiViewportFollow()
         (GetAiNewestAnswerTopOffsetLines(snapshot, wqn::AiHistoryContentExpanded(state_.ai),
                                          agent_tier ? AiBottomReserve(state_.agent) : 0,
                                          &answer_top) ||
-         (!agent_tier && !state_.ai.assistant_partial.empty()));
+         (!agent_tier && tier != wqn::AiTier::kFlash && !state_.ai.assistant_partial.empty()));
 
     if (agent_tier) {
         const int32_t target = body_started ? answer_top : min_scroll;
@@ -1177,6 +1184,14 @@ UiUpdate UiRuntime::DispatchAiViewportFollow()
 
     const int32_t target = body_started ? answer_top : min_scroll;
     const bool moved = state_.ai.scroll_offset_lines != target;
+    if (tier == wqn::AiTier::kFlash) {
+        // The UI task is the sole Flash viewport owner; no STD worker receipt
+        // participates in this move. Manual input runs on this same owner.
+        state_.ai.scroll_offset_lines = target;
+        state_.ai.follow_active = !finished;
+        return FinishEvent(kEvent, moved ? RefreshSchedule::kAi : RefreshSchedule::kNone,
+                           moved || finished);
+    }
     if (!wqn::ApplyAiViewportFollow(state_.ai.follow_epoch, target, min_scroll, max_scroll, finished))
         return FinishEvent(kEvent, RefreshSchedule::kNone, false);
     state_.ai.scroll_offset_lines = target;
@@ -1187,6 +1202,16 @@ UiUpdate UiRuntime::DispatchAiViewportFollow()
 
 UiUpdate UiRuntime::DispatchFlashSnapshot(const wqn::FlashUiState& flash)
 {
+    if (state_.ai.tier != wqn::AiTier::kFlash)
+        return FinishEvent(AppEventKind::kFlashSnapshot, RefreshSchedule::kNone, false);
+    if (state_.ai.flash_turn_epoch != flash.turn_epoch) {
+        state_.ai.flash_turn_epoch = flash.turn_epoch;
+        ++state_.ai.follow_epoch;
+        state_.ai.follow_after_revision = flash.history_after_revision;
+        state_.ai.follow_active = state_.ai.auto_follow;
+        state_.ai.user_moved = false;
+        state_.ai.scroll_offset_lines = 0;
+    }
     switch (flash.status) {
         case wqn::FlashStatus::kError:
             state_.ai.status = wqn::AiSessionStatus::kError;
@@ -1210,7 +1235,7 @@ UiUpdate UiRuntime::DispatchFlashSnapshot(const wqn::FlashUiState& flash)
                 state_.ai.status = wqn::AiSessionStatus::kIdle;
                 state_.ai.flash_status_label = "就绪";
             }
-            state_.ai.flash_is_streaming = flash.response_in_flight;
+            state_.ai.flash_is_streaming = flash.response_in_flight || flash.playback_active || flash.capture_started;
             break;
         case wqn::FlashStatus::kConnecting:
             state_.ai.status = wqn::AiSessionStatus::kListening;

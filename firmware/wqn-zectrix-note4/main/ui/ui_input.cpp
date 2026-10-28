@@ -1843,6 +1843,24 @@ RefreshSchedule ApplyButtonEvent(
             : wqn::AiHistoryChannel::kStdPro;
         auto snapshot = wqn::GetAiHistorySnapshot(channel);
 
+        if (state->ai.tier == wqn::AiTier::kFlash) {
+            int32_t min_scroll = 0, max_scroll = 0;
+            if (snapshot && !snapshot->messages.empty()) {
+                device_ui_internal::GetAiScrollBounds(snapshot, true, 0, &min_scroll, &max_scroll);
+                const int32_t previous = state->ai.scroll_offset_lines;
+                const bool older = event.button == wqn::ButtonId::kUp;
+                state->ai.scroll_offset_lines = std::clamp<int32_t>(
+                    previous + (older ? kScrollStepRows : -kScrollStepRows), min_scroll, max_scroll);
+                const bool resumed = !older && state->ai.auto_follow &&
+                    state->ai.scroll_offset_lines == min_scroll && !AnswerBodyStarted(state->ai, snapshot);
+                if (!older && previous == min_scroll && !state->ai.follow_active)
+                    state->ai.scroll_no_op_hint_ms = event_time_ms;
+                state->ai.follow_active = resumed;
+                state->ai.user_moved = true;
+            }
+            return RefreshSchedule::kAi;
+        }
+
         // [follow] Whether the viewport is currently following this turn. Read
         // before the scroll: a viewport the follow is holding at the tail must
         // not flash the "已最新" hint -- the hint means "you cannot go further

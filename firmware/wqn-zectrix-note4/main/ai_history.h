@@ -95,6 +95,10 @@ public:
     ChatMessageId AppendToolResult(std::string_view name, std::string_view args,
                                    std::string_view result, bool ok, int32_t elapsed_ms,
                                    int64_t now_ms);
+    // Complete exactly the start card identified by the caller's call ID map.
+    // An evicted/mismatched card is never recreated inside a newer turn.
+    bool CompleteTool(ChatMessageId id, std::string_view result, bool ok,
+                      int32_t elapsed_ms, int64_t now_ms);
 
     // Replace a known message without changing order. The kind guard prevents a
     // late event from overwriting a different message after eviction/clear.

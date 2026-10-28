@@ -104,6 +104,7 @@ struct AiSessionState {
     std::string flash_error;
     std::string flash_status_label;  // [phase-fix] 连接/就绪/录音/识别/生成/播放/错误
     bool flash_is_streaming = false;
+    uint32_t flash_turn_epoch = 0;
 
     // v2 SSE incremental render fields (Std/Pro tiers).
     // assistant_partial accumulates streamed text.delta events between two
@@ -147,7 +148,7 @@ struct AiSessionState {
 // must not hide Agent content or change its viewport geometry.
 inline bool AiHistoryContentExpanded(const AiSessionState& ai)
 {
-    return ai.tier == AiTier::kAgent || ai.expand_content;
+    return ai.tier == AiTier::kAgent || ai.tier == AiTier::kFlash || ai.expand_content;
 }
 
 // Returns the current scroll offset in 18-px line units (0 == bottom / newest).

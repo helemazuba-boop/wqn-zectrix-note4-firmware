@@ -193,6 +193,30 @@ ChatMessageId AiHistory::AppendToolResult(std::string_view name, std::string_vie
     return id;
 }
 
+bool AiHistory::CompleteTool(ChatMessageId id, std::string_view result, bool ok,
+                              int32_t elapsed_ms, int64_t now_ms)
+{
+    if (id == kInvalidChatMessageId || mutex_ == nullptr) return false;
+    xSemaphoreTake(mutex_, portMAX_DELAY);
+    for (auto& msg : messages_) {
+        if (msg.id != id) continue;
+        if (msg.kind != ChatMessageKind::kToolStart && msg.kind != ChatMessageKind::kToolResult) break;
+        byte_size_ -= CostOf(msg);
+        msg.kind = ChatMessageKind::kToolResult;
+        msg.tool_result_json.assign(result.data(), result.size());
+        msg.tool_ok = ok;
+        msg.tool_elapsed_ms = elapsed_ms;
+        msg.timestamp_ms = now_ms;
+        byte_size_ += CostOf(msg);
+        TrimLocked();
+        ++revision_;
+        xSemaphoreGive(mutex_);
+        return true;
+    }
+    xSemaphoreGive(mutex_);
+    return false;
+}
+
 bool AiHistory::ReplaceText(ChatMessageId id, ChatMessageKind expected_kind,
                             std::string_view text, int64_t now_ms)
 {

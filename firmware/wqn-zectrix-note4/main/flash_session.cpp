@@ -7,6 +7,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstring>
+#include <deque>
 #include <string>
 #include <utility>
 #include <vector>
@@ -109,6 +110,13 @@ enum class InternalStatus {
     kError,
 };
 
+struct FlashToolCard {
+    std::string call_id;
+    wqn::ChatMessageId message_id = wqn::kInvalidChatMessageId;
+    int64_t started_ms = 0;
+    bool completed = false;
+};
+
 struct FlashState {
     SemaphoreHandle_t mutex = nullptr;
     InternalStatus status = InternalStatus::kIdle;
@@ -127,6 +135,17 @@ struct FlashState {
     std::string assistant_text;
     std::string thinking_text;
     bool history_user_committed = false;
+    wqn::ChatMessageId user_message_id = wqn::kInvalidChatMessageId;
+    bool asr_done = false;
+    uint32_t turn_epoch = 0;
+    uint64_t history_after_revision = 0;
+    uint32_t server_turn_id = 0;
+    bool awaiting_server_turn = false;
+    bool accept_turn_events = false;
+    std::string assistant_response_id;
+    std::string assistant_text_source;
+    std::string last_error_history;
+    std::deque<FlashToolCard> tool_cards;
     bool thinking_done = false;
     bool turn_done_received = false;
     wqn::ChatMessageId thinking_message_id = wqn::kInvalidChatMessageId;
@@ -362,6 +381,9 @@ void FlashLifecycleTask(void*)
             continue;
         }
 
+        xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+        const std::string detail = g_flash.error_message;
+        xSemaphoreGive(g_flash.mutex);
         g_intentional_stop.store(true, std::memory_order_release);
         const int64_t deadline_us = esp_timer_get_time() + 30LL * 1000 * 1000;
         esp_err_t stop_result = ESP_FAIL;
@@ -406,7 +428,7 @@ void FlashLifecycleTask(void*)
             g_restart_after_teardown.exchange(false, std::memory_order_acq_rel);
         xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
         if (reason != FlashTerminalReason::kIntentional) {
-            SetErrorLocked(FlashTerminalMessage(reason));
+            SetErrorLocked(reason == FlashTerminalReason::kServerError && !detail.empty() ? detail : FlashTerminalMessage(reason));
         }
         xSemaphoreGive(g_flash.mutex);
         if (restart) {
@@ -465,37 +487,55 @@ void RequestFlashTerminalStop(FlashTerminalReason reason)
     xTaskNotifyGive(g_lifecycle_task);
 }
 
+std::string BoundedFlashText(std::string text, size_t limit)
+{
+    if (text.size() <= limit) return text;
+    const std::string suffix = "\n（显示已截断）";
+    size_t end = limit - suffix.size();
+    while (end > 0 && (static_cast<unsigned char>(text[end]) & 0xc0) == 0x80) --end;
+    text.resize(end);
+    text += suffix;
+    return text;
+}
+
 #if CONFIG_WQN_FLASH_PROTOCOL_V2
+bool EnsureFlashUserHistoryLocked(int64_t now_ms)
+{
+    auto& history = wqn::GetAiHistory(wqn::AiHistoryChannel::kFlash);
+    const std::string text = g_flash.user_transcript.empty()
+        ? (g_flash.asr_done ? "语音提问（未识别到文本）" : "语音提问（识别中…）")
+        : g_flash.user_transcript;
+    if (g_flash.user_message_id != wqn::kInvalidChatMessageId &&
+        history.ReplaceText(g_flash.user_message_id, wqn::ChatMessageKind::kUser, text, now_ms)) return true;
+    if (g_flash.user_message_id == wqn::kInvalidChatMessageId || !history.Contains(g_flash.user_message_id))
+        g_flash.user_message_id = history.AppendUser(text, now_ms);
+    g_flash.history_user_committed = g_flash.user_message_id != wqn::kInvalidChatMessageId;
+    return g_flash.history_user_committed;
+}
+
+bool MirrorFlashMessageLocked(wqn::ChatMessageId* id, wqn::ChatMessageKind kind,
+                               const std::string& text, int64_t now_ms)
+{
+    if (text.empty()) return false;
+    EnsureFlashUserHistoryLocked(now_ms);
+    auto& history = wqn::GetAiHistory(wqn::AiHistoryChannel::kFlash);
+    if (*id != wqn::kInvalidChatMessageId && history.ReplaceText(*id, kind, text, now_ms)) return true;
+    if (*id != wqn::kInvalidChatMessageId && history.Contains(*id)) return false;
+    *id = kind == wqn::ChatMessageKind::kThinking
+        ? history.AppendThinking(text, now_ms) : history.AppendAssistant(text, now_ms);
+    return *id != wqn::kInvalidChatMessageId;
+}
+
 bool EnsureFlashThinkingHistoryLocked(int64_t now_ms)
 {
-    if (!g_flash.history_user_committed || g_flash.thinking_text.empty()) {
-        return false;
-    }
-    const std::string label = g_flash.thinking_text;
-    wqn::AiHistory& history = wqn::GetAiHistory(wqn::AiHistoryChannel::kFlash);
-    if (g_flash.thinking_message_id == wqn::kInvalidChatMessageId) {
-        g_flash.thinking_message_id = history.AppendThinking(label, now_ms);
-        return g_flash.thinking_message_id != wqn::kInvalidChatMessageId;
-    }
-    return history.ReplaceText(g_flash.thinking_message_id,
-                               wqn::ChatMessageKind::kThinking,
-                               label, now_ms);
+    return MirrorFlashMessageLocked(&g_flash.thinking_message_id,
+        wqn::ChatMessageKind::kThinking, g_flash.thinking_text, now_ms);
 }
 
 bool FinalizeFlashAssistantLocked(int64_t now_ms)
 {
-    if (!g_flash.history_user_committed || g_flash.assistant_text.empty()) {
-        return false;
-    }
-    wqn::AiHistory& history = wqn::GetAiHistory(wqn::AiHistoryChannel::kFlash);
-    if (g_flash.assistant_message_id == wqn::kInvalidChatMessageId) {
-        g_flash.assistant_message_id =
-            history.AppendAssistant(g_flash.assistant_text, now_ms);
-        return g_flash.assistant_message_id != wqn::kInvalidChatMessageId;
-    }
-    return history.ReplaceText(g_flash.assistant_message_id,
-                               wqn::ChatMessageKind::kAssistant,
-                               g_flash.assistant_text, now_ms);
+    return MirrorFlashMessageLocked(&g_flash.assistant_message_id,
+        wqn::ChatMessageKind::kAssistant, g_flash.assistant_text, now_ms);
 }
 
 #endif
@@ -506,6 +546,17 @@ void ResetFlashTurnAssemblyLocked()
     g_flash.assistant_text.clear();
     g_flash.thinking_text.clear();
     g_flash.history_user_committed = false;
+    g_flash.user_message_id = wqn::kInvalidChatMessageId;
+    g_flash.asr_done = false;
+    ++g_flash.turn_epoch;
+    const auto history = wqn::GetAiHistorySnapshot(wqn::AiHistoryChannel::kFlash);
+    g_flash.history_after_revision = history ? history->revision : 0;
+    g_flash.server_turn_id = 0;
+    g_flash.awaiting_server_turn = false;
+    g_flash.accept_turn_events = false;
+    g_flash.assistant_response_id.clear();
+    g_flash.assistant_text_source.clear();
+    g_flash.last_error_history.clear();
     g_flash.thinking_done = false;
     g_flash.turn_done_received = false;
     g_flash.thinking_message_id = wqn::kInvalidChatMessageId;
@@ -563,7 +614,12 @@ void SetErrorLocked(const std::string& message)
     g_flash.status = InternalStatus::kError;
     SetFlashCaptureIndicatorLocked(false);
     g_flash.pending_text.clear();
-    g_flash.error_message = message;
+    g_flash.error_message = BoundedFlashText(message, 4096);
+    if (g_flash.last_error_history != g_flash.error_message) {
+        wqn::GetAiHistory(wqn::AiHistoryChannel::kFlash).AppendAssistant(
+            "提示：" + g_flash.error_message, esp_timer_get_time() / 1000);
+        g_flash.last_error_history = g_flash.error_message;
+    }
     g_flash.response_in_flight = false;  // [inflight-fix] error ends any in-flight response
     g_flash.response_started = false;
     g_flash.status_since_ms = esp_timer_get_time() / 1000;
@@ -1611,6 +1667,10 @@ void StartAudioStreaming()
     g_flash.amp_idle_armed = false;
     g_flash_indicator_session = g_flash_audio_session;
     g_flash.capture_base_seq = g_flash.uplink_seq.load(std::memory_order_relaxed);
+#if CONFIG_WQN_FLASH_PROTOCOL_V2
+    EnsureFlashUserHistoryLocked(esp_timer_get_time() / 1000);
+    MarkChanged();
+#endif
     g_flash.stream_task = g_capture_task; // active marker, not task ownership
     xSemaphoreGive(g_flash.mutex);
     SetStreamAudioAmp(false);
@@ -1665,7 +1725,7 @@ struct CJsonGuard {
 };
 
 // Convenience: read a string field, return nullptr if absent or wrong type.
-const char* JsonStr(cJSON* obj, const char* key)
+const char* JsonStr(const cJSON* obj, const char* key)
 {
     cJSON* node = cJSON_GetObjectItemCaseSensitive(obj, key);
     return (cJSON_IsString(node) && node->valuestring != nullptr) ? node->valuestring : nullptr;
@@ -1711,34 +1771,12 @@ void ParseAndHandleEvent(const char* data, size_t len)
     // ============================================================
 #if CONFIG_WQN_FLASH_PROTOCOL_V2
     if (std::strcmp(type, "error") == 0) {
-        // [error-fix] Surface StepFun/proxy error messages instead of relying solely
-        // on the subsequent WS close. Event shape per StepFun docs:
-        // {"type":"error","error":{"type":..,"code":..,"message":..}}
-        std::string msg = "服务错误";
-        const cJSON* err_obj = cJSON_GetObjectItem(g.p, "error");
-        if (err_obj != nullptr) {
-            const cJSON* m_item = cJSON_GetObjectItem(err_obj, "message");
-            if (cJSON_IsString(m_item) && m_item->valuestring != nullptr && m_item->valuestring[0] != '\0') {
-                msg = m_item->valuestring;
-            }
-        }
-        ESP_LOGW(kTag, "flash session error event: %s", msg.c_str());
-        // [barge-tolerate] Two StepFun errors are expected timing artifacts of
-        // barge-in / fast PTT, not real failures:
-        //  - "ongoing response already exists": response.create reached StepFun
-        //    before the prior response.cancel was applied (cancel/create race).
-        //  - "no ongoing response to cancel": response.cancel sent when no
-        //    response is currently in-flight.
-        // The Realtime session stays usable after both, so downgrade to a
-        // warning instead of SetErrorLocked (which would flip the session to
-        // kError and block further interaction until a reconnect).
-        if (msg.find("ongoing response already exists") != std::string::npos ||
-            msg.find("no ongoing response to cancel") != std::string::npos) {
-            return;
-        }
+        const char* message = JsonStr(cJSON_GetObjectItemCaseSensitive(g.p, "error"), "message");
+        if (message == nullptr) message = JsonStr(g.p, "message");
         xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
-        SetErrorLocked(msg);
+        SetErrorLocked(message ? message : "服务错误");
         xSemaphoreGive(g_flash.mutex);
+        RequestFlashTerminalStop(FlashTerminalReason::kServerError);
         return;
     }
     if (std::strcmp(type, "playback.reset") == 0 ||
@@ -1766,6 +1804,15 @@ void ParseAndHandleEvent(const char* data, size_t len)
         return;
     }
     if (std::strcmp(type, "session.ready") == 0) {
+        const cJSON* capability = cJSON_GetObjectItemCaseSensitive(
+            cJSON_GetObjectItemCaseSensitive(g.p, "wqn"), "playback_epoch");
+        if (!cJSON_IsNumber(capability) || capability->valuedouble != 1) {
+            xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+            SetErrorLocked("Flash 播放协议不兼容，请更新服务端");
+            xSemaphoreGive(g_flash.mutex);
+            RequestFlashTerminalStop(FlashTerminalReason::kServerError);
+            return;
+        }
         ESP_LOGI(kTag, "session event: %s", type);
         xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
         if (g_flash.status == InternalStatus::kConnecting ||
@@ -1783,166 +1830,180 @@ void ParseAndHandleEvent(const char* data, size_t len)
         return;
     }
 
-    if (std::strcmp(type, "asr.delta") == 0 ||
-        std::strcmp(type, "conversation.item.input_audio_transcription.delta") == 0) {
-        const char* delta = JsonStr(g.p, "delta");
-        if (delta != nullptr && delta[0] != '\0') {
-            xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
-            g_flash.user_transcript += delta;
+    if (std::strcmp(type, "turn.started") == 0) {
+        const cJSON* turn = cJSON_GetObjectItemCaseSensitive(g.p, "turn_id");
+        xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+        if (g_flash.awaiting_server_turn && g_flash.response_in_flight && cJSON_IsNumber(turn) &&
+            turn->valuedouble >= 1 && turn->valuedouble <= UINT32_MAX &&
+            std::floor(turn->valuedouble) == turn->valuedouble) {
+            g_flash.server_turn_id = static_cast<uint32_t>(turn->valuedouble);
+            g_flash.awaiting_server_turn = false;
+            g_flash.accept_turn_events = true;
             g_flash.status_since_ms = esp_timer_get_time() / 1000;
             MarkChanged();
-            xSemaphoreGive(g_flash.mutex);
         }
-        return;
-    }
-
-    if (std::strcmp(type, "asr.complete") == 0 ||
-        std::strcmp(type, "conversation.item.input_audio_transcription.completed") == 0) {
-        const char* tr = JsonStr(g.p, "transcript");
-        if (tr != nullptr) {
-            const int64_t now_ms = esp_timer_get_time() / 1000;
-            xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
-            g_flash.user_transcript = tr;
-            g_flash.pending_text.clear();
-            if (!g_flash.history_user_committed && tr[0] != '\0') {
-                g_flash.history_user_committed =
-                    wqn::GetAiHistory(wqn::AiHistoryChannel::kFlash)
-                        .AppendUser(tr, now_ms) != wqn::kInvalidChatMessageId;
-            }
-            // ASR establishes the ordering boundary. Any Thinking accumulated
-            // before ASR now appears once, immediately after User. Do not clear
-            // the accumulator; thinking.done/turn.done will replace this row.
-            EnsureFlashThinkingHistoryLocked(now_ms);
-            if (g_flash.turn_done_received) {
-                EnsureFlashThinkingHistoryLocked(now_ms);
-                FinalizeFlashAssistantLocked(now_ms);
-            }
-            g_flash.status_since_ms = now_ms;
-            MarkChanged();
-            xSemaphoreGive(g_flash.mutex);
-            ESP_LOGI(kTag, "transcription: %s", tr);
-        }
-        return;
-    }
-
-    if (std::strcmp(type, "response.thinking.delta") == 0 ||
-        std::strcmp(type, "response.reasoning.delta") == 0 ||
-        std::strcmp(type, "response.reasoning_summary_text.delta") == 0) {
-        const char* delta = JsonStr(g.p, "delta");
-        if (delta != nullptr && delta[0] != '\0') {
-            xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
-            const bool first_visible =
-                g_flash.history_user_committed &&
-                g_flash.thinking_message_id == wqn::kInvalidChatMessageId;
-            g_flash.response_started = true;
-            if (!g_flash.thinking_done) {
-                g_flash.thinking_text += delta;
-            }
-            if (first_visible) {
-                // Show the first available prefix once. Later deltas only
-                // accumulate; thinking.done replaces this row with full text.
-                EnsureFlashThinkingHistoryLocked(esp_timer_get_time() / 1000);
-                MarkChanged();
-            }
-            xSemaphoreGive(g_flash.mutex);
-        }
-        return;
-    }
-
-    if (std::strcmp(type, "response.thinking.done") == 0 ||
-        std::strcmp(type, "response.reasoning.done") == 0 ||
-        std::strcmp(type, "response.reasoning_summary_text.done") == 0) {
-        const char* full = JsonStr(g.p, "full_text");
-        if (full == nullptr || full[0] == '\0') full = JsonStr(g.p, "text");
-        if (full == nullptr || full[0] == '\0') full = JsonStr(g.p, "thinking");
-        if (full == nullptr || full[0] == '\0') full = JsonStr(g.p, "content");
-        const int64_t now_ms = esp_timer_get_time() / 1000;
-        xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
-        if (full != nullptr && full[0] != '\0') {
-            g_flash.thinking_text = full;
-        }
-        g_flash.thinking_done = true;
-        EnsureFlashThinkingHistoryLocked(now_ms);
-        const size_t thinking_chars = g_flash.thinking_text.size();
-        MarkChanged();
-        xSemaphoreGive(g_flash.mutex);
-        ESP_LOGI(kTag, "thinking done: chars=%u",
-                 static_cast<unsigned>(thinking_chars));
-        return;
-    }
-
-    if (std::strcmp(type, "text.delta") == 0 ||
-        std::strcmp(type, "response.audio_transcript.delta") == 0) {
-        const char* delta = JsonStr(g.p, "delta");
-        if (delta != nullptr && delta[0] != '\0') {
-            // [thinking-display] Replace the "思考中..." placeholder with the
-            // final摘要 once the actual reply starts streaming. Snapshot +
-            // clear thinking_text inside the lock; do the AppendThinking
-            // outside the lock (matches the AppendUser/AppendAssistant pattern
-            // - PMR alloc off the streaming critical section).
-            xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
-            g_flash.response_started = true;  // [phase-fix] current turn entered generation
-            // [order-fix] Do NOT clear thinking_text or AppendThinking here.
-            // thinking_text is appended as a summary when the transcription
-            // arrives (asr.complete), so it lands after the user message. We
-            // only accumulate assistant_text here.
-            g_flash.assistant_text += delta;
-            g_flash.status_since_ms = esp_timer_get_time() / 1000;
-            MarkChanged();
-            xSemaphoreGive(g_flash.mutex);
-        }
-        return;
-    }
-
-    if (std::strcmp(type, "tool.start") == 0) {
-        const char* name = JsonStr(g.p, "name");
-        xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
-        g_flash.tool_label = std::string(name ? name : "tool") + "…";
-        g_flash.status_since_ms = esp_timer_get_time() / 1000;
-        MarkChanged();
         xSemaphoreGive(g_flash.mutex);
         return;
     }
+    const bool receipt = std::strcmp(type, "tool.receipt") == 0;
+    const cJSON* turn = cJSON_GetObjectItemCaseSensitive(g.p, "turn_id");
+    xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+    const bool current = g_flash.accept_turn_events && cJSON_IsNumber(turn) &&
+        turn->valuedouble == g_flash.server_turn_id;
+    xSemaphoreGive(g_flash.mutex);
+    if (!current && !receipt) return;
+    const int64_t now_ms = esp_timer_get_time() / 1000;
 
-    if (std::strcmp(type, "tool.result") == 0 || std::strcmp(type, "tool.error") == 0) {
-        const char* display = JsonStr(g.p, "display");
-        const char* name = JsonStr(g.p, "name");
-        const bool ok = std::strcmp(type, "tool.result") == 0;
+    if (std::strcmp(type, "response.created") == 0) {
+        const char* id = JsonStr(cJSON_GetObjectItemCaseSensitive(g.p, "response"), "id");
+        if (id == nullptr) return;
         xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
-        g_flash.tool_label = std::string(ok ? "ok " : "fail ") +
-                             (display && display[0] ? display : (name ? name : "tool"));
-        g_flash.status_since_ms = esp_timer_get_time() / 1000;
-        MarkChanged();
-        xSemaphoreGive(g_flash.mutex);
-        return;
-    }
-
-    if (std::strcmp(type, "state") == 0) {
-        const char* s = JsonStr(g.p, "stage");
-        xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
-        if (s != nullptr) g_flash.pending_text = s;
-        g_flash.status_since_ms = esp_timer_get_time() / 1000;
-        MarkChanged();
-        xSemaphoreGive(g_flash.mutex);
-        return;
-    }
-
-    if (std::strcmp(type, "turn.done") == 0 || std::strcmp(type, "response.done") == 0) {
-        ESP_LOGI(kTag, "turn done");
-        const int64_t now_ms = esp_timer_get_time() / 1000;
-        xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
-        g_flash.turn_done_received = true;
-        // Finalize in strict order only after ASR established User. If ASR is
-        // late, keep both accumulators; the ASR branch completes this sequence.
-        if (g_flash.history_user_committed) {
-            EnsureFlashThinkingHistoryLocked(now_ms);
+        if (!g_flash.assistant_response_id.empty() && g_flash.assistant_response_id != id) {
             FinalizeFlashAssistantLocked(now_ms);
+            g_flash.assistant_message_id = wqn::kInvalidChatMessageId;
+            g_flash.assistant_text.clear();
+            g_flash.thinking_message_id = wqn::kInvalidChatMessageId;
+            g_flash.thinking_text.clear();
+            g_flash.thinking_done = false;
         }
-        g_flash.response_in_flight = false;
-        g_flash.response_started = false;
+        g_flash.assistant_response_id = id;
+        g_flash.assistant_text_source.clear();
         g_flash.status_since_ms = now_ms;
         MarkChanged();
         xSemaphoreGive(g_flash.mutex);
+        return;
+    }
+    if (std::strcmp(type, "asr.delta") == 0 ||
+        std::strcmp(type, "conversation.item.input_audio_transcription.delta") == 0 ||
+        std::strcmp(type, "asr.complete") == 0 ||
+        std::strcmp(type, "conversation.item.input_audio_transcription.completed") == 0) {
+        const char* delta = JsonStr(g.p, "delta");
+        const char* full = JsonStr(g.p, "transcript");
+        if (full == nullptr) full = JsonStr(g.p, "text");
+        xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+        if (delta != nullptr) g_flash.user_transcript = BoundedFlashText(g_flash.user_transcript + delta, 8192);
+        else {
+            if (full != nullptr && full[0] != '\0') g_flash.user_transcript = BoundedFlashText(full, 8192);
+            g_flash.asr_done = true;
+        }
+        EnsureFlashUserHistoryLocked(now_ms);
+        g_flash.status_since_ms = now_ms;
+        MarkChanged();
+        xSemaphoreGive(g_flash.mutex);
+        return;
+    }
+    if (std::strcmp(type, "response.thinking.delta") == 0 ||
+        std::strcmp(type, "response.reasoning.delta") == 0 ||
+        std::strcmp(type, "response.reasoning_summary_text.delta") == 0 ||
+        std::strcmp(type, "response.thinking.done") == 0 ||
+        std::strcmp(type, "response.reasoning.done") == 0 ||
+        std::strcmp(type, "response.reasoning_summary_text.done") == 0) {
+        const char* delta = JsonStr(g.p, "delta");
+        const char* full = JsonStr(g.p, "full_text");
+        if (full == nullptr) full = JsonStr(g.p, "text");
+        if (full == nullptr) full = JsonStr(g.p, "thinking");
+        xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+        if (delta != nullptr && !g_flash.thinking_done)
+            g_flash.thinking_text = BoundedFlashText(g_flash.thinking_text + delta, 16384);
+        if (delta == nullptr) {
+            if (full != nullptr) g_flash.thinking_text = BoundedFlashText(full, 16384);
+            g_flash.thinking_done = true;
+        }
+        g_flash.response_started = true;
+        EnsureFlashThinkingHistoryLocked(now_ms);
+        g_flash.status_since_ms = now_ms;
+        MarkChanged();
+        xSemaphoreGive(g_flash.mutex);
+        return;
+    }
+    if (std::strcmp(type, "text.delta") == 0 ||
+        std::strcmp(type, "response.text.delta") == 0 ||
+        std::strcmp(type, "response.audio_transcript.delta") == 0) {
+        const char* delta = JsonStr(g.p, "delta");
+        if (delta == nullptr) return;
+        xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+        if (g_flash.assistant_text_source.empty()) g_flash.assistant_text_source = type;
+        if (g_flash.assistant_text_source == type) {
+            g_flash.assistant_text = BoundedFlashText(g_flash.assistant_text + delta, 32768);
+            g_flash.response_started = true;
+            FinalizeFlashAssistantLocked(now_ms);
+            g_flash.status_since_ms = now_ms;
+            MarkChanged();
+        }
+        xSemaphoreGive(g_flash.mutex);
+        return;
+    }
+    if (std::strcmp(type, "tool.start") == 0 || std::strcmp(type, "tool.result") == 0 ||
+        std::strcmp(type, "tool.error") == 0 || receipt) {
+        const char* call_id = JsonStr(g.p, "call_id");
+        if (call_id == nullptr || call_id[0] == '\0' || std::strlen(call_id) > 256) return;
+        xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+        auto card = std::find_if(g_flash.tool_cards.begin(), g_flash.tool_cards.end(),
+            [call_id](const FlashToolCard& item) { return item.call_id == call_id; });
+        auto& history = wqn::GetAiHistory(wqn::AiHistoryChannel::kFlash);
+        if (std::strcmp(type, "tool.start") == 0) {
+            if (card == g_flash.tool_cards.end()) {
+                if (g_flash.tool_cards.size() >= 64) {
+                    const auto old = std::find_if(g_flash.tool_cards.begin(), g_flash.tool_cards.end(),
+                        [](const FlashToolCard& item) { return item.completed; });
+                    if (old != g_flash.tool_cards.end()) g_flash.tool_cards.erase(old);
+                }
+                if (g_flash.tool_cards.size() < 64) {
+                    const char* name = JsonStr(g.p, "name");
+                    const char* args = JsonStr(g.p, "args");
+                    EnsureFlashUserHistoryLocked(now_ms);
+                    const auto id = history.AppendToolStart(BoundedFlashText(name ? name : "工具", 128),
+                        BoundedFlashText(args ? args : "", 8192), now_ms);
+                    g_flash.tool_cards.push_back({call_id, id, now_ms, false});
+                } else {
+                    SetErrorLocked("待确认工具过多，请先检查原记录");
+                    RequestFlashTerminalStop(FlashTerminalReason::kServerError);
+                }
+            }
+        } else if (card != g_flash.tool_cards.end() && !card->completed) {
+            const char* display = JsonStr(g.p, "display");
+            const cJSON* error = cJSON_GetObjectItemCaseSensitive(g.p, "error");
+            const char* detail = JsonStr(error, "message");
+            std::string result = display ? display : "";
+            if (detail != nullptr && result.find(detail) == std::string::npos) result += std::string("；") + detail;
+            const cJSON* ok_value = cJSON_GetObjectItemCaseSensitive(g.p, "ok");
+            const bool ok = cJSON_IsTrue(ok_value);
+            history.CompleteTool(card->message_id, BoundedFlashText(result, 4096), ok,
+                static_cast<int32_t>(std::min<int64_t>(INT32_MAX, now_ms - card->started_ms)), now_ms);
+            card->completed = true;
+        }
+        if (!receipt) g_flash.status_since_ms = now_ms;
+        MarkChanged();
+        xSemaphoreGive(g_flash.mutex);
+        return;
+    }
+    if (std::strcmp(type, "state") == 0) {
+        xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+        if (stage != nullptr && std::strcmp(stage, "tool.waiting") == 0) g_flash.pending_text = "正在执行工具…";
+        g_flash.status_since_ms = now_ms;
+        MarkChanged();
+        xSemaphoreGive(g_flash.mutex);
+        return;
+    }
+    if (std::strcmp(type, "turn.done") == 0 || std::strcmp(type, "response.done") == 0) {
+        const char* status = JsonStr(g.p, "status");
+        if (status == nullptr) status = JsonStr(cJSON_GetObjectItemCaseSensitive(g.p, "response"), "status");
+        const bool complete = status != nullptr && std::strcmp(status, "completed") == 0;
+        xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+        g_flash.turn_done_received = true;
+        g_flash.asr_done = true;
+        EnsureFlashUserHistoryLocked(now_ms);
+        EnsureFlashThinkingHistoryLocked(now_ms);
+        FinalizeFlashAssistantLocked(now_ms);
+        g_flash.response_in_flight = false;
+        g_flash.response_started = false;
+        g_flash.pending_text.clear();
+        if (!complete) SetErrorLocked(status != nullptr && std::strcmp(status, "cancelled") == 0
+            ? "本轮已取消，已有写入请查看工具回执" : "本轮响应未完成，请查看已有内容和工具回执");
+        g_flash.status_since_ms = now_ms;
+        MarkChanged();
+        xSemaphoreGive(g_flash.mutex);
+        if (!complete) RequestFlashTerminalStop(FlashTerminalReason::kServerError);
         return;
     }
 #endif  // CONFIG_WQN_FLASH_PROTOCOL_V2
@@ -2282,6 +2343,7 @@ esp_err_t StartFlashSession()
     g_flash.pending_text = "正在连接...";
     g_flash.error_message.clear();
     // A cold/automatic first capture must not inherit the prior session IDs.
+    g_flash.tool_cards.clear();
     ResetFlashTurnAssemblyLocked();
     g_flash.response_in_flight = false;
     g_flash.response_started = false;
@@ -2529,6 +2591,14 @@ esp_err_t StopFlashSessionNow()
         g_flash.ptt_release_pending = false;
         g_flash.ptt_ready_pending = false;
         g_flash.playback_abort_pending = false;
+        g_flash.accept_turn_events = false;
+        g_flash.awaiting_server_turn = false;
+        for (const auto& card : g_flash.tool_cards) {
+            if (!card.completed) wqn::GetAiHistory(wqn::AiHistoryChannel::kFlash).CompleteTool(
+                card.message_id, "结果暂未确认，请检查原记录", false,
+                static_cast<int32_t>(std::min<int64_t>(INT32_MAX, esp_timer_get_time() / 1000 - card.started_ms)),
+                esp_timer_get_time() / 1000);
+        }
         had_stream_task = (g_flash.stream_task != nullptr);
         xSemaphoreGive(g_flash.mutex);
     }
@@ -2712,6 +2782,8 @@ bool CopyFlashStateToUi(FlashUiState* state)
     state->tool_label = g_flash.tool_label;
     state->error_message = g_flash.error_message;
     state->status_since_ms = g_flash.status_since_ms;
+    state->turn_epoch = g_flash.turn_epoch;
+    state->history_after_revision = g_flash.history_after_revision;
     // [phase-fix] Snapshot actual turn state. InternalStatus::kStreaming alone
     // only says the WebSocket session is connected.
     state->connected = g_flash.ws_connected;
@@ -2957,6 +3029,7 @@ void FlashButtonReleasedNow(bool submit)
 #else
         (void)final_seq;
 #endif
+        g_flash.awaiting_server_turn = true;
         g_flash.response_in_flight = true;  // in-flight until response.done/error
         g_flash.response_started = false;   // [phase-fix] no delta for this turn yet
         g_flash.status_since_ms = esp_timer_get_time() / 1000;
@@ -3097,6 +3170,8 @@ void AbortFlashPlayback()
     g_flash.playback_abort_pending = true;
     g_flash.response_in_flight = false;
     g_flash.response_started = false;
+    g_flash.accept_turn_events = false;
+    g_flash.awaiting_server_turn = false;
     xSemaphoreGive(g_flash.mutex);
     xTaskNotifyGive(g_lifecycle_task);
 }

@@ -25,6 +25,8 @@ struct FlashUiState {
     int64_t status_since_ms = 0;
     // [phase-fix] kStreaming means "WebSocket connected", not "ASR active".
     // Expose turn-level facts so the UI can render the real Flash phase.
+    uint32_t turn_epoch = 0;
+    uint64_t history_after_revision = 0;
     bool connected = false;
     bool capture_started = false;
     bool response_in_flight = false;
