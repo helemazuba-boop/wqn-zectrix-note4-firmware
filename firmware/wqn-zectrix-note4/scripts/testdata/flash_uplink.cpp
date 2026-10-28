@@ -1,4 +1,5 @@
 #include "flash_uplink_queue.h"
+#include "flash_frame_assembly.h"
 #include <algorithm>
 #include <atomic>
 #include <cassert>
@@ -25,17 +26,31 @@ template <typename... Args> void HostLog(const char*, Args...) {}
 #define ESP_ERROR_CHECK_WITHOUT_ABORT(x) ((void)(x))
 #define ESP_RETURN_ON_ERROR(x, ...) do { const int code = (x); if (code != ESP_OK) return code; } while (0)
 using esp_err_t = int;
-namespace wqn::services { uint32_t AudioDuplexRxOverflowCount() { return 0; } }
+uint32_t overflow_count = 0;
+namespace wqn::services { uint32_t AudioDuplexRxOverflowCount() { return overflow_count; } }
+namespace wqn {
+enum class AiHistoryChannel { kFlash };
+int empty_notices=0;
+struct HistoryPort { template<class... Args> void CompleteTool(Args... ) {}
+ void AppendAssistant(const std::string&,int64_t){++empty_notices;} };
+HistoryPort& GetAiHistory(AiHistoryChannel) { static HistoryPort history;return history; }
+}
+struct ToolCardPort { bool completed=false;uint64_t message_id=0;int64_t started_ms=0; };
 using TaskHandle_t = void*;
 struct Client { bool alive = true; } client;
 using esp_websocket_client_handle_t = Client*;
-enum class InternalStatus { kIdle, kConnecting, kStreaming, kError };
-enum class FlashTerminalReason { kNone, kTransportError, kUplinkOverflow, kFinalUnconfirmed };
+enum class InternalStatus { kIdle, kConnecting, kSessionUpdating, kStreaming, kError };
+enum class FlashTerminalReason { kNone, kTransportError, kUplinkOverflow, kFinalUnconfirmed, kCaptureIncomplete };
 struct {
     void* mutex = reinterpret_cast<void*>(1);
     InternalStatus status = InternalStatus::kStreaming;
     bool capture_started = false, ws_connected = true, button_pressed = true;
     bool response_in_flight = false, response_started = false;
+    bool ptt_admitted=false,ptt_capture_admitted=false,ptt_press_pending=false,ptt_release_pending=false;
+    bool ptt_release_submit=false,ptt_ready_pending=false,playback_abort_pending=false;
+    bool accept_turn_events=false,awaiting_server_turn=false,finalizing=false,asr_done=false;
+    wqn::FlashFrameAssembly ws_assembly;
+    std::vector<ToolCardPort> tool_cards;
     bool playback_abort_requested = false, amp_idle_armed = false;
     bool stream_audio_powered = false;
     void* stream_i2c_bus = nullptr;
@@ -52,6 +67,7 @@ struct {
 } g_flash;
 FlashUplink g_uplink;
 FlashUplink::Block storage[FlashUplink::kStorageSlots]{};
+TaskHandle_t g_lifecycle_task = reinterpret_cast<void*>(5);
 TaskHandle_t g_uplink_task = reinterpret_cast<void*>(3);
 std::atomic<uint32_t> g_session_generation{1};
 std::atomic<bool> g_teardown_pending{false}, g_intentional_stop{false};
@@ -64,6 +80,7 @@ bool short_pcm = false, short_final = false, disconnect_during_send = false;
 bool drain_on_stop = true, capture_indicator = false;
 bool producer_ack = true;
 bool partial_first_read = false, malformed_first_read = false, fatal_first_read = false;
+bool dma_stalled=false,inject_overflow=false;int transient_zero_reads=0;
 int pcm_blocks = 0, read_calls = 0;
 std::vector<int> packet_first_samples;
 std::vector<uint32_t> wire_sequences;
@@ -82,6 +99,8 @@ unsigned heap_caps_get_largest_free_block(int) { return 4096; }
 const char* esp_err_to_name(int) { return "fixture"; }
 void MarkChanged() {}
 void SetFlashCaptureIndicatorLocked(bool ready) { capture_indicator = ready && g_flash.capture_started; }
+bool EnsureFlashUserHistoryLocked(int64_t){return true;}
+void ApplyFlashIndicator() {}
 void SetStreamAudioAmp(bool enabled) { assert(!enabled); }
 void SetErrorLocked(const std::string&) { g_flash.status = InternalStatus::kError; }
 void RequestFlashTerminalStop(FlashTerminalReason reason) {
@@ -130,6 +149,11 @@ esp_err_t ReadAudioChannel(int, void*, void* output, size_t size, size_t* bytes,
     *bytes = size;
     ++read_calls;
     clock_us += 15000;
+    if (read_calls >= 5 && (dma_stalled || transient_zero_reads > 0)) {
+        if (transient_zero_reads > 0) --transient_zero_reads;
+        *bytes=0;clock_us+=200000;return ESP_ERR_TIMEOUT;
+    }
+    if (read_calls == 7 && inject_overflow) ++overflow_count;
     if (read_calls >= pcm_blocks + 4) g_flash.capture_started = false;
     if (read_calls == 5) {
         if (partial_first_read) { *bytes = size / 2; return ESP_ERR_TIMEOUT; }
@@ -200,6 +224,7 @@ void StopAudioStreaming() {
     if (drain_on_stop) RunSender();
 }
 @@RELEASE@@
+@@PUBLIC_RELEASE@@
 @@STOP@@
 
 void RunSender() {
@@ -222,6 +247,9 @@ uint32_t Reset(unsigned session = 1) {
     g_session_generation = session; lock_depth = 0;
     short_pcm = short_final = disconnect_during_send = false;
     partial_first_read = malformed_first_read = fatal_first_read = false;
+    dma_stalled=inject_overflow=false;transient_zero_reads=0;overflow_count=0;
+    g_flash.ptt_admitted=false;g_flash.ptt_capture_admitted=true;g_flash.ptt_release_pending=false;
+    g_flash.finalizing=false;g_flash.asr_done=false;wqn::empty_notices=0;
     clock_us = capture_stop_cost = 0;
     first_network_stall_us = 0;
     network_calls = final_calls = stop_requests = read_calls = 0;
@@ -263,7 +291,7 @@ void TestCapture() {
 }
 void TestRelease() {
     auto gen = Reset(); Queue(3, gen);
-    OnFlashButtonReleased(true);
+    FlashButtonReleasedNow(true);
     assert(g_uplink.State() == FlashUplink::Phase::kFinalSent);
     assert(g_uplink.Sent() == 3 && g_flash.active_ws_sends == 0);
     assert(g_flash.response_in_flight);
@@ -273,40 +301,53 @@ void TestRelease() {
     assert(final_calls == 2);
 #endif
     const auto calls = network_calls;
-    OnFlashButtonReleased(true); assert(network_calls == calls);
+    FlashButtonReleasedNow(true); assert(network_calls == calls);
 
     gen = Reset(); Queue(2, gen); short_pcm = true;
-    OnFlashButtonReleased(true);
+    FlashButtonReleasedNow(true);
     assert(final_calls == 0 && g_uplink.Error() == FlashUplink::Failure::kTransport);
     assert(g_flash.active_ws_sends == 0 && stop_requests > 0);
 
     gen = Reset(); Queue(2, gen); short_final = true;
-    OnFlashButtonReleased(true);
+    FlashButtonReleasedNow(true);
     assert(terminal_reason == FlashTerminalReason::kFinalUnconfirmed);
     assert(g_flash.active_ws_sends == 0 && g_uplink.State() == FlashUplink::Phase::kFailed);
     const auto after_failure = network_calls;
-    OnFlashButtonReleased(true); assert(network_calls == after_failure);
+    FlashButtonReleasedNow(true); assert(network_calls == after_failure);
 
     gen = Reset(); Queue(2, gen); g_flash.response_in_flight = true;
-    OnFlashButtonReleased(true); assert(final_calls == 0 && stop_requests > 0);
+    FlashButtonReleasedNow(true); assert(final_calls == 0 && stop_requests > 0);
 
-    Reset(); OnFlashButtonReleased(true);
+    Reset(); FlashButtonReleasedNow(true);
     assert(network_calls == 0 && final_calls == 0);
+#if CONFIG_WQN_FLASH_PROTOCOL_V2
+    assert(g_flash.asr_done&&wqn::empty_notices==1);
+#endif
     assert(g_uplink.Begin(1) != 0); // empty tap did not dirty the upstream buffer
 
     gen = Reset(); Queue(2, gen);
-    OnFlashButtonReleased(false);
+    FlashButtonReleasedNow(false);
     assert(network_calls == 0 && final_calls == 0 && stop_requests > 0);
     assert(g_uplink.Begin(1) == 0 && g_uplink.Begin(2) != 0);
 
     gen = Reset(); Queue(2, gen); disconnect_during_send = true;
-    OnFlashButtonReleased(true);
+    FlashButtonReleasedNow(true);
     assert(final_calls == 0 && g_flash.active_ws_sends == 0);
 
     gen = Reset(); Queue(2, gen); drain_on_stop = false; capture_stop_cost = 2800000;
-    OnFlashButtonReleased(true);
+    FlashButtonReleasedNow(true);
     assert(clock_us == 3000000 && final_calls == 0 && network_calls == 0);
     assert(g_uplink.Stopped());
+}
+void TestAsyncRelease() {
+    auto gen=Reset();Queue(2,gen);g_flash.ptt_admitted=true;
+    OnFlashButtonReleased(true);
+    assert(clock_us==0&&network_calls==0&&g_flash.ptt_release_pending&&!g_flash.button_pressed);
+    assert(g_flash.capture_started);
+    FinishAudioStreamingTask(gen);
+    assert(!g_flash.capture_started&&g_flash.ptt_capture_admitted&&g_uplink.ProducerFinished());
+    FlashButtonReleasedNow(g_flash.ptt_release_submit);
+    assert(g_flash.response_in_flight&&g_uplink.State()==FlashUplink::Phase::kFinalSent);
 }
 void TestCaptureFailures() {
     Reset(); pcm_blocks = 2; partial_first_read = true; notifications = 0;
@@ -324,6 +365,16 @@ void TestCaptureFailures() {
         assert(g_uplink.Accepted() == 0 && g_uplink.Error() == FlashUplink::Failure::kInvalidAudio);
         assert(stop_requests > 0 && final_calls == 0);
     }
+    Reset();pcm_blocks=500;notifications=0;dma_stalled=true;
+    try { AudioStreamingTask(nullptr); } catch (const WorkerWait&) {}
+    assert(g_uplink.Error()==FlashUplink::Failure::kInvalidAudio&&clock_us<3000000);
+    assert(terminal_reason==FlashTerminalReason::kCaptureIncomplete&&final_calls==0);
+    Reset();pcm_blocks=5;notifications=0;transient_zero_reads=1;
+    try { AudioStreamingTask(nullptr); } catch (const WorkerWait&) {}
+    RunSender();assert(g_uplink.Accepted()>0&&g_uplink.Error()==FlashUplink::Failure::kNone);
+    Reset();pcm_blocks=10;notifications=0;inject_overflow=true;
+    try { AudioStreamingTask(nullptr); } catch (const WorkerWait&) {}
+    assert(g_uplink.Error()==FlashUplink::Failure::kInvalidAudio&&final_calls==0);
     Reset(); pcm_blocks = 205; notifications = 0;
     try { AudioStreamingTask(nullptr); } catch (const WorkerWait&) {}
     RunSender();
@@ -412,7 +463,7 @@ int main() {
     assert(network_calls == 170 && clock_us - 4 * 15000 == 5050000);
     std::puts("CAPTURE_SIMULATION baseline blocks=170 capture_loop_ms=5050 network_calls_during_capture=170 simulated_first_send_stall_ms=2500");
 #else
-    TestCapture(); TestCaptureFailures(); TestRelease(); TestOverflowAndGenerations(); TestTeardown(); TestConcurrentRing();
+    TestCapture(); TestCaptureFailures(); TestRelease(); TestAsyncRelease(); TestOverflowAndGenerations(); TestTeardown(); TestConcurrentRing();
     std::printf("Flash mode=%d production capture/sender/FINAL cases + 40000 ordered blocks passed; storage=%zu bytes\n",
                 CONFIG_WQN_FLASH_PROTOCOL_V2, FlashUplink::kStorageBytes);
 #endif

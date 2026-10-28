@@ -36,7 +36,8 @@ def main():
             'void CaptureFlashPcmTurn(', 'void AudioStreamingTask(void* param)')),
         '@@SENDER@@': function(source, 'bool SendFlashUplinkPcm(') + '\n' + function(source, 'void FlashUplinkTask('),
         '@@WAIT@@': function(source, 'bool WaitForFlashUplink('),
-        '@@RELEASE@@': function(source, 'void OnFlashButtonReleased(bool submit)'),
+        '@@RELEASE@@': function(source, 'void FlashButtonReleasedNow(bool submit)'),
+        '@@PUBLIC_RELEASE@@': function(source, 'void OnFlashButtonReleased(bool submit)'),
         '@@STOP@@': function(source, 'esp_err_t StopFlashSessionNow()\n{'),
     }
     fixture = (root / 'scripts/testdata/flash_uplink.cpp').read_text()
@@ -62,7 +63,7 @@ def main():
                 f'-DBASELINE_CAPTURE={int(baseline is not None)}',
                 '-I', str(root / 'main'), str(unit), '-o', str(binary),
             ], check=True, timeout=60)
-            environment = {**os.environ, 'ASAN_OPTIONS': 'detect_leaks=1'}
+            environment = {**os.environ, 'ASAN_OPTIONS': os.environ.get('ASAN_OPTIONS', 'detect_leaks=1')}
             subprocess.run([str(binary)], check=True, timeout=30, env=environment)
     print('Flash baseline capture simulation passed' if baseline else
           'Flash production queue/capture/sender/FINAL host ports passed; not device HIL')

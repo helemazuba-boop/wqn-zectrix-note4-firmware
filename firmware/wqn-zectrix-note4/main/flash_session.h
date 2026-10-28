@@ -29,6 +29,8 @@ struct FlashUiState {
     uint64_t history_after_revision = 0;
     bool connected = false;
     bool capture_started = false;
+    bool capture_preparing = false;
+    bool finalizing = false;
     bool response_in_flight = false;
     bool response_started = false;  // thinking/text delta received
     bool playback_active = false;

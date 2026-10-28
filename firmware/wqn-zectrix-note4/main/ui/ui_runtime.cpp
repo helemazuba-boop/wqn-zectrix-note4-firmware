@@ -1219,9 +1219,15 @@ UiUpdate UiRuntime::DispatchFlashSnapshot(const wqn::FlashUiState& flash)
             state_.ai.flash_is_streaming = false;
             break;
         case wqn::FlashStatus::kStreaming:
-            if (flash.capture_started) {
+            if (flash.capture_preparing) {
+                state_.ai.status = wqn::AiSessionStatus::kPreparingCapture;
+                state_.ai.flash_status_label = "准备";
+            } else if (flash.capture_started) {
                 state_.ai.status = wqn::AiSessionStatus::kListening;
                 state_.ai.flash_status_label = "录音";
+            } else if (flash.finalizing) {
+                state_.ai.status = wqn::AiSessionStatus::kWaitingReply;
+                state_.ai.flash_status_label = "上传";
             } else if (flash.playback_active) {
                 state_.ai.status = wqn::AiSessionStatus::kReplyReady;
                 state_.ai.flash_status_label = "播放";
@@ -1235,7 +1241,8 @@ UiUpdate UiRuntime::DispatchFlashSnapshot(const wqn::FlashUiState& flash)
                 state_.ai.status = wqn::AiSessionStatus::kIdle;
                 state_.ai.flash_status_label = "就绪";
             }
-            state_.ai.flash_is_streaming = flash.response_in_flight || flash.playback_active || flash.capture_started;
+            state_.ai.flash_is_streaming = flash.response_in_flight || flash.playback_active ||
+                flash.capture_started || flash.capture_preparing || flash.finalizing;
             break;
         case wqn::FlashStatus::kConnecting:
             state_.ai.status = wqn::AiSessionStatus::kListening;

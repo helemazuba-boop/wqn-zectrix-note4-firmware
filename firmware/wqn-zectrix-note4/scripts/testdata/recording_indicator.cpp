@@ -62,15 +62,27 @@ namespace capture {
 struct State { AudioSession indicator_session;bool running=false,stop_requested=false,recording_indicator_on=false; } g_audio;
 @@CAPTURE@@
 }
+namespace wqn {
+enum class AiHistoryChannel { kFlash };
+struct HistoryPort { void AppendAssistant(const std::string&,int64_t){} };
+HistoryPort& GetAiHistory(AiHistoryChannel){static HistoryPort history;return history;}
+}
 namespace flash {
 enum class InternalStatus { kIdle,kConnecting,kStreaming,kError };
 struct State {
     bool capture_started=false,ws_connected=false,response_in_flight=false,response_started=false;
     InternalStatus status=InternalStatus::kIdle;
-    std::string pending_text,error_message;int64_t status_since_ms=0;
+    std::string pending_text,error_message,last_error_history;int64_t status_since_ms=0;void* mutex=nullptr;
 } g_flash;
 AudioSession g_flash_indicator_session;
-bool g_flash_indicator_on=false;
+bool g_flash_indicator_on=false,g_flash_indicator_desired=false,g_flash_indicator_dirty=false;
+void* g_lifecycle_task=reinterpret_cast<void*>(1);
+void xTaskNotifyGive(void*){}
+void xSemaphoreTake(void*,int){}
+void xSemaphoreGive(void*){}
+constexpr int portMAX_DELAY=0;
+std::string BoundedFlashText(const std::string& text,size_t){return text;}
+
 void MarkChanged() {}
 @@FLASH@@
 }
@@ -115,22 +127,22 @@ int main() {
     CHECK(EndActivity({3,AudioActivity::kPlayback})==ESP_OK);
     auto realtime=Begin(4,AudioActivity::kFlash);flash::g_flash_indicator_session=realtime;
     flash::g_flash.status=flash::InternalStatus::kConnecting;
-    flash::SetFlashCaptureIndicatorLocked(true);CHECK(led_level==1);
+    flash::SetFlashCaptureIndicatorLocked(true);flash::ApplyFlashIndicator();CHECK(led_level==1);
     flash::g_flash.capture_started=true;flash::g_flash.ws_connected=true;flash::g_flash.status=flash::InternalStatus::kStreaming;
     CHECK(led_level==1); // Network ready alone does not light the LED.
-    flash::SetFlashCaptureIndicatorLocked(true);CHECK(led_level==0);
-    flash::g_flash.capture_started=false;flash::SetFlashCaptureIndicatorLocked(false);CHECK(led_level==1);
-    flash::SetFlashCaptureIndicatorLocked(true);CHECK(led_level==1); // Late read after release.
-    flash::g_flash.capture_started=true;flash::SetFlashCaptureIndicatorLocked(true);CHECK(led_level==0);
-    flash::SetFlashCaptureIndicatorLocked(false);CHECK(led_level==1); // Read failure.
-    flash::SetFlashCaptureIndicatorLocked(true);CHECK(led_level==0); // First recovered PCM.
-    flash::SetErrorLocked("transport failed");CHECK(led_level==1);
-    flash::SetFlashCaptureIndicatorLocked(true);CHECK(led_level==1); // Late read after error.
+    flash::SetFlashCaptureIndicatorLocked(true);flash::ApplyFlashIndicator();CHECK(led_level==0);
+    flash::g_flash.capture_started=false;flash::SetFlashCaptureIndicatorLocked(false);flash::ApplyFlashIndicator();CHECK(led_level==1);
+    flash::SetFlashCaptureIndicatorLocked(true);flash::ApplyFlashIndicator();CHECK(led_level==1); // Late read after release.
+    flash::g_flash.capture_started=true;flash::SetFlashCaptureIndicatorLocked(true);flash::ApplyFlashIndicator();CHECK(led_level==0);
+    flash::SetFlashCaptureIndicatorLocked(false);flash::ApplyFlashIndicator();CHECK(led_level==1); // Read failure.
+    flash::SetFlashCaptureIndicatorLocked(true);flash::ApplyFlashIndicator();CHECK(led_level==0); // First recovered PCM.
+    flash::SetErrorLocked("transport failed");flash::ApplyFlashIndicator();CHECK(led_level==1);
+    flash::SetFlashCaptureIndicatorLocked(true);flash::ApplyFlashIndicator();CHECK(led_level==1); // Late read after error.
     flash::g_flash.status=flash::InternalStatus::kStreaming;flash::g_flash.ws_connected=false;
-    flash::SetFlashCaptureIndicatorLocked(true);CHECK(led_level==1);
+    flash::SetFlashCaptureIndicatorLocked(true);flash::ApplyFlashIndicator();CHECK(led_level==1);
     flash::g_flash.ws_connected=true;gpio_result=ESP_ERR_TIMEOUT;
-    flash::SetFlashCaptureIndicatorLocked(true);CHECK(!flash::g_flash_indicator_on&&led_level==1);
-    gpio_result=ESP_OK;flash::SetFlashCaptureIndicatorLocked(true);CHECK(led_level==0);
+    flash::SetFlashCaptureIndicatorLocked(true);flash::ApplyFlashIndicator();CHECK(!flash::g_flash_indicator_on&&led_level==1);
+    gpio_result=ESP_OK;flash::SetFlashCaptureIndicatorLocked(true);flash::ApplyFlashIndicator();CHECK(led_level==0);
     CHECK(EndActivity({4,AudioActivity::kFlash})==ESP_OK);CHECK(led_level==1); // Service fallback even if a caller missed stop.
     CHECK(g_audio_lease.resets==4);CHECK(g_inflight_operations==0);
     std::printf("Recording indicator production gates: %d assertions passed (ASan/UBSan)\n",checks);

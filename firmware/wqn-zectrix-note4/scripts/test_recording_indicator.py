@@ -28,7 +28,7 @@ def main():
         '@@END@@': function(service, 'esp_err_t EndActivity('),
         '@@HAL@@': function(board, 'esp_err_t SetNote4RecordingLed('),
         '@@CAPTURE@@': function(capture, 'void SetCaptureIndicatorLocked('),
-        '@@FLASH@@': function(flash, 'void SetFlashCaptureIndicatorLocked(') + '\n' + function(flash, 'void SetErrorLocked(const std::string& message)\n'),
+        '@@FLASH@@': function(flash, 'void SetFlashCaptureIndicatorLocked(') + '\n' + function(flash, 'void ApplyFlashIndicator()\n{') + '\n' + function(flash, 'void SetErrorLocked(const std::string& message)\n'),
     }
     # Check the wiring around the tested production policies: no admission light;
     # ready comes after discarded warmup, and every terminal path clears it.

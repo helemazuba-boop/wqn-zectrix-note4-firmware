@@ -284,7 +284,11 @@ int main(int argc,char**argv) {
     UiRuntime flash_runtime;flash_runtime.state_.ai.tier=wqn::AiTier::kFlash;
     wqn::FlashUiState flash;flash.status=wqn::FlashStatus::kStreaming;
     flash.response_in_flight=true;flash.turn_epoch=1;flash.history_after_revision=0;
-    flash_runtime.DispatchFlashSnapshot(flash);
+    flash.capture_preparing=true;flash_runtime.DispatchFlashSnapshot(flash);
+    CHECK(flash_runtime.state_.ai.status==wqn::AiSessionStatus::kPreparingCapture);
+    flash.capture_preparing=false;flash.finalizing=true;flash_runtime.DispatchFlashSnapshot(flash);
+    CHECK(flash_runtime.state_.ai.status==wqn::AiSessionStatus::kWaitingReply);
+    flash.finalizing=false;flash_runtime.DispatchFlashSnapshot(flash);
     CHECK(flash_runtime.state_.ai.follow_active);
     CHECK(wqn::AiHistoryContentExpanded(flash_runtime.state_.ai));
     wqn::follow_snapshots[1]=working;flash_runtime.DispatchAiViewportFollow();
@@ -303,10 +307,18 @@ int main(int argc,char**argv) {
     flash_runtime.state_.ai.status=wqn::AiSessionStatus::kStreaming;
     flash.status=wqn::FlashStatus::kError;flash_runtime.DispatchFlashSnapshot(flash);
     CHECK(flash_runtime.state_.ai.status==wqn::AiSessionStatus::kStreaming);
+    auto flash_parity=std::make_shared<wqn::AiHistorySnapshot>();flash_parity->revision=72;
+    wqn::ChatMessageSnapshot pu,pt,tc,pa;
+    pu.id=71;pu.kind=wqn::ChatMessageKind::kUser;pu.text="明天的学习计划";
+    pt.id=72;pt.kind=wqn::ChatMessageKind::kThinking;pt.text="先核对待办与复习进度";
+    tc.id=73;tc.kind=wqn::ChatMessageKind::kToolResult;tc.tool_name="查询待办";
+    tc.tool_args_json="{}";tc.tool_result_json="找到 3 条学习任务";tc.tool_ok=true;tc.tool_elapsed_ms=8;
+    pa.id=74;pa.kind=wqn::ChatMessageKind::kAssistant;pa.text="**计划已整理**\n- 复习数学错题\n- 完成英语练习";
+    flash_parity->messages={pu,pt,tc,pa};
     ai.tier=wqn::AiTier::kAgent;ai.expand_content=false;
-    RenderAiHistoryViewport(ai,details,0,0);const auto agent_pixels=wqn::pixels;
-    ai.tier=wqn::AiTier::kFlash;RenderAiHistoryViewport(ai,details,0,0);
-    CHECK(agent_pixels==wqn::pixels);Save(folder,"flash-agent-content-parity");
+    RenderAiHistoryViewport(ai,flash_parity,0,0);const auto flash_agent_pixels=wqn::pixels;
+    ai.tier=wqn::AiTier::kFlash;RenderAiHistoryViewport(ai,flash_parity,0,0);
+    CHECK(flash_agent_pixels==wqn::pixels);Save(folder,"flash-agent-content-parity");
 
     const auto* font=AiNativeFont();
     auto english=WrapAiNativeText("alpha beta gamma",wqn::MeasureTextWithFont(font,"alpha beta"),font,10);

@@ -78,6 +78,7 @@ int checks=0;
 void event(const std::string& text){ParseAndHandleEvent(text.data(),text.size());}
 auto snapshot(){return wqn::GetAiHistorySnapshot(wqn::AiHistoryChannel::kFlash);}
 void reset(){
+ g_flash.mutex=reinterpret_cast<void*>(1);
  wqn::GetAiHistory(wqn::AiHistoryChannel::kFlash).Clear();ResetFlashTurnAssemblyLocked();
  g_flash.status=InternalStatus::kStreaming;g_flash.ws_connected=true;g_flash.tool_cards.clear();
  g_flash.response_in_flight=true;g_flash.awaiting_server_turn=true;g_flash.changed=false;
@@ -136,6 +137,12 @@ int main(){
  reset();event(R"({"type":"error","error_code":"internal","message":"precise relay failure"})");
  CHECK(g_flash.error_message=="precise relay failure"&&terminal_requests==1);
  CHECK(snapshot()->messages.back().text=="提示：precise relay failure");
+ reset();
+ event(R"({"type":"text.complete","turn_id":7,"text":"complete only"})");
+ CHECK(snapshot()->messages.size()==2&&snapshot()->messages[1].text=="complete only");
+ const auto complete_id=snapshot()->messages[1].id;
+ event(R"({"type":"text.complete","turn_id":7,"text":"complete only"})");
+ CHECK(snapshot()->messages.size()==2&&snapshot()->messages[1].id==complete_id);
  reset();
  event("{\"type\":\"text.delta\",\"turn_id\":7,\"delta\":\""+std::string(100000,'a')+"\"}");
  CHECK(g_flash.assistant_text.size()<=32768);
