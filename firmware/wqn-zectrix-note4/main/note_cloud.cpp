@@ -6,6 +6,7 @@
 #include "note_cloud.h"
 
 #include <algorithm>
+#include <atomic>
 #include <utility>
 
 #include "esp_log.h"
@@ -24,6 +25,27 @@ constexpr char kTag[] = "note_cloud";
 constexpr size_t kMaxManifestPagesPerSync = 32;
 constexpr size_t kMaxManifestNotebooks = 200;
 constexpr size_t kMaxSnapshotRestarts = 2;
+
+// The bulk and interactive lanes share one manifest and pruning namespace.
+// Admit before fetching a remote snapshot, and keep ownership through index
+// rebuild: serializing only the final write would still publish stale rows.
+std::atomic_flag g_note_install_busy = ATOMIC_FLAG_INIT;
+
+class NotePackInstallGuard {
+public:
+    NotePackInstallGuard()
+        : acquired_(!g_note_install_busy.test_and_set(std::memory_order_acquire)) {}
+    ~NotePackInstallGuard()
+    {
+        if (acquired_) g_note_install_busy.clear(std::memory_order_release);
+    }
+    NotePackInstallGuard(const NotePackInstallGuard&) = delete;
+    NotePackInstallGuard& operator=(const NotePackInstallGuard&) = delete;
+    explicit operator bool() const { return acquired_; }
+
+private:
+    bool acquired_;
+};
 
 const WqnNotePackManifestNotebook* FindManifestNotebook(
     const WqnNotePackManifest& manifest, const std::string& notebook_id)
@@ -178,6 +200,13 @@ esp_err_t SyncNotePacks(const std::string& token, NotePackSyncResult* out)
         return out->result;
     }
 
+    NotePackInstallGuard install_guard;
+    if (!install_guard) {
+        out->result = ESP_ERR_INVALID_STATE;
+        out->message = "笔记正在同步，请稍后重试";
+        return out->result;
+    }
+
     WqnNotePackManifest local_manifest;
     bool had_local_manifest = true;
     bool manifest_content_changed = false;
@@ -306,6 +335,15 @@ esp_err_t SyncSingleNotebookPack(
     if (token.empty()) {
         out->auth_required = true;
         out->result = ESP_ERR_INVALID_STATE;
+        return out->result;
+    }
+
+    // Do not wait behind a potentially multi-minute bulk download on the
+    // interactive worker. The caller can retry from a fresh remote snapshot.
+    NotePackInstallGuard install_guard;
+    if (!install_guard) {
+        out->result = ESP_ERR_INVALID_STATE;
+        out->message = "笔记正在同步，请稍后重试";
         return out->result;
     }
 

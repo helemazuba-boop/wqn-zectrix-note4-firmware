@@ -26,11 +26,13 @@ struct NotePackSyncResult {
 //
 // The caller supplies a validated bearer token and is expected to hold the
 // note-cloud sleep lease for the call. Storage writes take their own storage
-// leases internally.
+// leases internally. Full and targeted installs share a nonblocking admission
+// gate covering remote snapshot fetch through index rebuild. A competing call
+// returns ESP_ERR_INVALID_STATE with a retry message and performs no I/O.
 esp_err_t SyncNotePacks(const std::string& token, NotePackSyncResult* out);
 
 // Targeted variant for a user who is actively waiting: opening a note whose
-// pack is not on disk. Pages the manifest only until `notebook_id` is found,
+// pack is not on disk. Validates the complete stable manifest snapshot,
 // downloads that single pack, merges ONLY that notebook's manifest row (other
 // rows must keep their on-disk sha or the next index rebuild would fail their
 // verification), and rebuilds the index. Full-catalog convergence stays with
