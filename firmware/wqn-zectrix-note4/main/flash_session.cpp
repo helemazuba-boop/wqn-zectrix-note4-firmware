@@ -38,6 +38,7 @@
 namespace wqn {
 esp_err_t StartFlashSessionNow(uint32_t generation);
 esp_err_t StopFlashSessionNow();
+void ProcessFlashControlCommands();
 }
 
 namespace {
@@ -111,6 +112,14 @@ struct FlashState {
     SemaphoreHandle_t mutex = nullptr;
     InternalStatus status = InternalStatus::kIdle;
     bool button_pressed = false;
+    // One admitted press plus its release. A release cannot be displaced by
+    // repeated input while the lifecycle owner is draining/sending FINAL.
+    bool ptt_admitted = false;
+    bool ptt_press_pending = false;
+    bool ptt_release_pending = false;
+    bool ptt_release_submit = false;
+    bool ptt_ready_pending = false;
+    bool playback_abort_pending = false;
     bool capture_started = false;
     bool ws_connected = false;
     std::string user_transcript;
@@ -188,6 +197,8 @@ wqn::services::AudioSession g_flash_audio_session;
 // Stable copy for the active acquisition turn, protected by g_flash.mutex.
 wqn::services::AudioSession g_flash_indicator_session;
 bool g_flash_indicator_on = false;
+bool g_flash_indicator_desired = false;
+bool g_flash_indicator_dirty = false;
 wqn::services::ConnectivityDemand g_flash_connectivity_demand;
 
 class FlashWsSendRegistration {
@@ -218,6 +229,7 @@ enum class FlashTerminalReason : uint8_t {
     kUplinkOverflow,
     kFinalUnconfirmed,
     kPlaybackIncomplete,
+    kCaptureIncomplete,
 };
 
 StaticTask_t g_lifecycle_task_tcb;
@@ -249,6 +261,9 @@ std::atomic<bool> g_start_pending{false};
 std::atomic<uint32_t> g_start_generation{0};
 
 void SetErrorLocked(const std::string& message);
+void ApplyFlashIndicator();
+void CheckAmpIdleTail();
+void CheckFlashProgressDeadline();
 
 StackType_t* EnsurePsramTaskStack(
     StackType_t** stack, size_t bytes, const char* owner)
@@ -276,6 +291,8 @@ const char* FlashTerminalMessage(FlashTerminalReason reason)
     switch (reason) {
         case FlashTerminalReason::kPlaybackIncomplete:
             return "播放中断，请查看本轮结果";
+        case FlashTerminalReason::kCaptureIncomplete:
+            return "录音中断，本轮未提交";
         case FlashTerminalReason::kDisconnected:
             return "连接断开";
         case FlashTerminalReason::kTransportError:
@@ -294,34 +311,40 @@ const char* FlashTerminalMessage(FlashTerminalReason reason)
 void FlashLifecycleTask(void*)
 {
     while (true) {
-        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(100));
         // Let the WebSocket event callback return before destroying its client.
         vTaskDelay(pdMS_TO_TICKS(20));
         const FlashTerminalReason reason =
             g_terminal_reason.exchange(
                 FlashTerminalReason::kNone, std::memory_order_acq_rel);
         if (reason == FlashTerminalReason::kNone) {
-            if (!g_start_pending.exchange(false, std::memory_order_acq_rel)) {
-                continue;
-            }
-            const uint32_t generation =
-                g_start_generation.load(std::memory_order_acquire);
-            const esp_err_t start_result =
-                wqn::StartFlashSessionNow(generation);
-            ESP_LOGI(kTag, "Flash lifecycle stack HWM: phase=start free_bytes=%u",
-                     static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
-            if (start_result != ESP_OK &&
-                !g_teardown_pending.load(std::memory_order_acquire)) {
-                xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
-                if (generation ==
-                    g_session_generation.load(std::memory_order_acquire)) {
-                    if (g_flash.status != InternalStatus::kError) {
-                        SetErrorLocked("Flash 会话启动失败");
+            if (g_start_pending.exchange(false, std::memory_order_acq_rel)) {
+                const uint32_t generation =
+                    g_start_generation.load(std::memory_order_acquire);
+                const esp_err_t start_result =
+                    wqn::StartFlashSessionNow(generation);
+                ESP_LOGI(kTag, "Flash lifecycle stack HWM: phase=start free_bytes=%u",
+                         static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
+                if (start_result != ESP_OK &&
+                    !g_teardown_pending.load(std::memory_order_acquire)) {
+                    xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+                    if (generation ==
+                        g_session_generation.load(std::memory_order_acquire)) {
+                        if (g_flash.status != InternalStatus::kError) {
+                            SetErrorLocked("Flash 会话启动失败");
+                        }
+                        g_flash_connectivity_demand.Reset();
                     }
-                    g_flash_connectivity_demand.Reset();
+                    xSemaphoreGive(g_flash.mutex);
                 }
-                xSemaphoreGive(g_flash.mutex);
             }
+            ApplyFlashIndicator();
+            if (!g_teardown_pending.load(std::memory_order_acquire)) {
+                wqn::ProcessFlashControlCommands();
+                CheckAmpIdleTail();
+                CheckFlashProgressDeadline();
+            }
+            ApplyFlashIndicator();
             continue;
         }
         const uint32_t generation =
@@ -495,10 +518,39 @@ void SetFlashCaptureIndicatorLocked(bool ready)
 {
     const bool enabled = ready && g_flash.capture_started && g_flash.ws_connected &&
         g_flash.status != InternalStatus::kError;
-    if (!g_flash_indicator_session || enabled == g_flash_indicator_on) return;
-    const esp_err_t result = wqn::services::SetAudioRecordingIndicator(g_flash_indicator_session, enabled);
-    if (result == ESP_OK) g_flash_indicator_on = enabled;
-    else ESP_LOGW(kTag, "Flash recording indicator: %s", esp_err_to_name(result));
+    if (enabled == g_flash_indicator_desired && !g_flash_indicator_dirty) return;
+    g_flash_indicator_desired = enabled;
+    g_flash_indicator_dirty = true;
+    if (g_lifecycle_task != nullptr) xTaskNotifyGive(g_lifecycle_task);
+}
+
+// Never hold the UI snapshot mutex across an AudioService operation.
+void ApplyFlashIndicator()
+{
+    xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+    const bool dirty = g_flash_indicator_dirty;
+    const bool enabled = g_flash_indicator_desired;
+    const auto session = g_flash_indicator_session;
+    g_flash_indicator_dirty = false;
+    xSemaphoreGive(g_flash.mutex);
+    if (!dirty || !session) return;
+    const esp_err_t result = wqn::services::SetAudioRecordingIndicator(session, enabled);
+    if (result != ESP_OK) {
+        ESP_LOGW(kTag, "Flash recording indicator: %s", esp_err_to_name(result));
+    }
+}
+
+void CheckFlashProgressDeadline()
+{
+    xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+    const int64_t elapsed = esp_timer_get_time() / 1000 - g_flash.status_since_ms;
+    const bool final_unconfirmed = g_flash.response_in_flight && elapsed > 45000;
+    const bool config_stalled =
+        (g_flash.status == InternalStatus::kConnecting ||
+         g_flash.status == InternalStatus::kSessionUpdating) && elapsed > 45000;
+    xSemaphoreGive(g_flash.mutex);
+    if (final_unconfirmed) RequestFlashTerminalStop(FlashTerminalReason::kFinalUnconfirmed);
+    else if (config_stalled) RequestFlashTerminalStop(FlashTerminalReason::kTransportError);
 }
 
 void SetErrorLocked(const std::string& message)
@@ -753,6 +805,7 @@ void CheckAmpIdleTail()
         return;
     }
     xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+    bool turn_off = false;
     if (g_flash.amp_idle_armed) {
         const int64_t now_ms = esp_timer_get_time() / 1000;
         const bool queue_empty =
@@ -760,10 +813,11 @@ void CheckAmpIdleTail()
         if (!g_flash.playback_write_active && queue_empty &&
             now_ms >= g_flash.amp_idle_due_ms) {
             g_flash.amp_idle_armed = false;
-            SetStreamAudioAmp(false);
+            turn_off = true;
         }
     }
     xSemaphoreGive(g_flash.mutex);
+    if (turn_off) SetStreamAudioAmp(false);
 }
 
 // Retire exactly the bytes owned by one returned item. A concurrent producer
@@ -1412,7 +1466,7 @@ void CaptureFlashPcmTurn(uint32_t generation)
     // pre-session samples to the user's turn.
     for (int warmup = 0; warmup < 4; ++warmup) {
         xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
-        const bool active = g_flash.capture_started && !g_uplink.Stopped();
+        const bool active = g_flash.capture_started && g_flash.button_pressed && !g_uplink.Stopped();
         xSemaphoreGive(g_flash.mutex);
         if (!active) break;
         size_t warmup_bytes = 0;
@@ -1422,13 +1476,14 @@ void CaptureFlashPcmTurn(uint32_t generation)
     }
 
     const int64_t capture_started_us = esp_timer_get_time();
+    int64_t last_pcm_us = capture_started_us;
     const uint32_t rx_overflows_before = wqn::services::AudioDuplexRxOverflowCount();
     uint64_t capture_samples = 0;
     while (true) {
         // Check if capture should stop
         bool should_capture = false;
         xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
-        should_capture = g_flash.capture_started && g_uplink.Current(generation) &&
+        should_capture = g_flash.capture_started && g_flash.button_pressed && g_uplink.Current(generation) &&
             !g_uplink.Stopped();
         xSemaphoreGive(g_flash.mutex);
         if (!should_capture) {
@@ -1457,6 +1512,11 @@ void CaptureFlashPcmTurn(uint32_t generation)
             xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
             SetFlashCaptureIndicatorLocked(false);
             xSemaphoreGive(g_flash.mutex);
+            if (esp_timer_get_time() - last_pcm_us >= 2000000) {
+                g_uplink.Fail(generation, FlashUplink::Failure::kInvalidAudio);
+                RequestFlashTerminalStop(FlashTerminalReason::kCaptureIncomplete);
+                break;
+            }
             if (read_err == ESP_ERR_TIMEOUT) {
                 // [i2s-diag] Timeout = DMA has no data = ADC path not running.
                 // Distinguishes a dead capture path (timeouts, no pcm diag)
@@ -1482,6 +1542,7 @@ void CaptureFlashPcmTurn(uint32_t generation)
             RequestFlashTerminalStop(FlashTerminalReason::kTransportError);
             break;
         }
+        last_pcm_us = esp_timer_get_time();
 
         // First valid post-warmup PCM is the actual-ready edge. Merely
         // connecting or setting capture_started never lights the LED.
@@ -1598,7 +1659,7 @@ void StartAudioStreaming()
         return;
     }
     xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
-    if (!g_flash.capture_started || g_flash.stream_task != nullptr) {
+    if (!g_flash.capture_started || !g_flash.button_pressed || g_flash.stream_task != nullptr) {
         xSemaphoreGive(g_flash.mutex);
         return;
     }
@@ -1626,15 +1687,14 @@ void StartAudioStreaming()
     // first item, and a stale drain request would discard that response.
     g_flash.playback_abort_requested = true;
     g_flash.amp_idle_armed = false;
-    SetStreamAudioAmp(false);
-
     g_flash_indicator_session = g_flash_audio_session;
     g_flash_indicator_on = false;
     g_flash.capture_base_seq = g_flash.uplink_seq.load(std::memory_order_relaxed);
     g_flash.stream_task = g_capture_task; // active marker, not task ownership
+    xSemaphoreGive(g_flash.mutex);
+    SetStreamAudioAmp(false);
     xTaskNotifyGive(g_capture_task);
     xTaskNotifyGive(g_uplink_task);
-    xSemaphoreGive(g_flash.mutex);
 }
 
 void StopAudioStreaming()
@@ -1760,11 +1820,8 @@ void ParseAndHandleEvent(const char* data, size_t len)
         xSemaphoreGive(g_flash.mutex);
         return;
     }
-    if (std::strcmp(type, "session.ready") == 0 ||
-        std::strcmp(type, "session.created") == 0 ||
-        std::strcmp(type, "session.updated") == 0) {
+    if (std::strcmp(type, "session.ready") == 0) {
         ESP_LOGI(kTag, "session event: %s", type);
-        bool should_auto_record = false;
         xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
         if (g_flash.status == InternalStatus::kConnecting ||
             g_flash.status == InternalStatus::kSessionUpdating) {
@@ -1772,16 +1829,12 @@ void ParseAndHandleEvent(const char* data, size_t len)
             g_flash.pending_text = stage ? stage : "开始对话";
             g_flash.status_since_ms = esp_timer_get_time() / 1000;
             if (g_flash.button_pressed && !g_flash.capture_started) {
-                g_flash.capture_started = true;
-                g_flash.pending_text = "正在录音...";
-                should_auto_record = true;
+                g_flash.ptt_ready_pending = true;
             }
             MarkChanged();
         }
         xSemaphoreGive(g_flash.mutex);
-        if (should_auto_record) {
-            StartAudioStreaming();
-        }
+        if (g_lifecycle_task != nullptr) xTaskNotifyGive(g_lifecycle_task);
         return;
     }
 
@@ -2592,9 +2645,15 @@ esp_err_t StopFlashSessionNow()
         SetFlashCaptureIndicatorLocked(false);
         g_uplink.Cancel(g_uplink.Generation());
         g_flash.button_pressed = false;
+        g_flash.ptt_admitted = false;
+        g_flash.ptt_press_pending = false;
+        g_flash.ptt_release_pending = false;
+        g_flash.ptt_ready_pending = false;
+        g_flash.playback_abort_pending = false;
         had_stream_task = (g_flash.stream_task != nullptr);
         xSemaphoreGive(g_flash.mutex);
     }
+    ApplyFlashIndicator();
     if (g_uplink_task != nullptr) xTaskNotifyGive(g_uplink_task);
     if (had_stream_task) StopAudioStreaming();
     if (!WaitForFlashUplink(esp_timer_get_time() + kUplinkDrainBudgetUs)) {
@@ -2683,7 +2742,6 @@ esp_err_t StopFlashSessionNow()
     }
     esp_err_t teardown_result = TearDownStreamChannels();
 
-    xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
     if (teardown_result == ESP_OK) {
         teardown_result =
             services::EndAudioActivity(&g_flash_audio_session);
@@ -2694,6 +2752,7 @@ esp_err_t StopFlashSessionNow()
     } else {
         ESP_LOGE(kTag, "Flash audio teardown incomplete; retaining session lease");
     }
+    xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
     if (teardown_result == ESP_OK) {
         g_flash_connectivity_demand.Reset();
     }
@@ -2723,6 +2782,11 @@ esp_err_t StopFlashSession()
     // radio remains alive for the bounded idle tail while teardown completes.
     g_flash.capture_started = false;
     g_flash.button_pressed = false;
+    g_flash.ptt_admitted = false;
+    g_flash.ptt_press_pending = false;
+    g_flash.ptt_release_pending = false;
+    g_flash.ptt_ready_pending = false;
+    g_flash.playback_abort_pending = false;
     SetFlashCaptureIndicatorLocked(false);
     g_uplink.Cancel(g_uplink.Generation());
     g_flash_connectivity_demand.Reset();
@@ -2788,15 +2852,19 @@ bool CopyFlashStateToUi(FlashUiState* state)
 
 void PollFlashAmpIdle()
 {
-    CheckAmpIdleTail();
+    // Maintenance is serviced by the lifecycle owner, independently of UI polls.
 }
 
-void OnFlashButtonPressed()
+void FlashButtonPressedNow()
 {
     if (g_flash.mutex == nullptr) {
         if (InitFlashSession() != ESP_OK) return;
     }
     xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+    if (!g_flash.ptt_admitted || !g_flash.button_pressed) {
+        xSemaphoreGive(g_flash.mutex);
+        return;
+    }
 
     if (g_flash.status == InternalStatus::kIdle || g_flash.status == InternalStatus::kError) {
         // [error-recovery-fix] When in kError, the old WS client is still
@@ -2813,6 +2881,11 @@ void OnFlashButtonPressed()
         xSemaphoreGive(g_flash.mutex);
         StartFlashSession();
         xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+    }
+
+    if (!g_flash.ptt_admitted || !g_flash.button_pressed) {
+        xSemaphoreGive(g_flash.mutex);
+        return;
     }
 
     if (g_teardown_pending.load(std::memory_order_acquire) ||
@@ -2840,7 +2913,8 @@ void OnFlashButtonPressed()
     // device half of the CLEAR_PLAYER double-action; the proxy then sends
     // response.cancelled / conversation.item.truncate to StepFun Realtime.
     bool need_barge_in = false;
-    if (g_flash.ws_connected && g_flash.response_in_flight) {
+    if (g_flash.ws_connected && (g_flash.response_in_flight || g_flash.response_started ||
+        g_flash.playback_write_active || g_flash.playback_queued_bytes.load(std::memory_order_acquire) != 0)) {
         // [inflight-fix] Only cancel when a response is actually in-flight
         // (tracked via response_in_flight: set on turn-end, cleared on
         // response.done/error). The old check (playback_queued || tool_label)
@@ -2849,7 +2923,7 @@ void OnFlashButtonPressed()
     }
 
     if (g_flash.ws_connected &&
-        (g_flash.status == InternalStatus::kStreaming || g_flash.status == InternalStatus::kSessionUpdating)) {
+        g_flash.status == InternalStatus::kStreaming) {
         // [turn-lifecycle] This function is only reached after the 200ms hold
         // threshold, so it is a real PTT turn (short/double taps never get here).
         ResetFlashTurnAssemblyLocked();
@@ -2907,7 +2981,7 @@ void OnFlashButtonPressed()
     }
 }
 
-void OnFlashButtonReleased(bool submit)
+void FlashButtonReleasedNow(bool submit)
 {
     if (g_flash.mutex == nullptr) {
         return;
@@ -3015,13 +3089,15 @@ void OnFlashButtonReleased(bool submit)
 #endif
         g_flash.response_in_flight = true;  // in-flight until response.done/error
         g_flash.response_started = false;   // [phase-fix] no delta for this turn yet
+        g_flash.status_since_ms = esp_timer_get_time() / 1000;
+        MarkChanged();
     } else if (was_capturing && g_uplink.Accepted() != 0) {
         // Any uncommitted PCM requires a fresh connection before reuse.
         g_uplink.Cancel(uplink_generation);
         RequestFlashTerminalStop(FlashTerminalReason::kTransportError);
         ESP_LOGW(kTag, "skip turn-end: undrained, failed, cancelled or prior response in-flight");
     } else if (was_capturing) {
-        g_flash.pending_text.clear();
+        g_flash.pending_text = "未收到麦克风数据，本轮未提交";
         MarkChanged();
     }
     xSemaphoreGive(g_flash.mutex);
@@ -3057,7 +3133,7 @@ void OnFlashButtonReleased(bool submit)
     }
 }
 
-void AbortFlashPlayback()
+void AbortFlashPlaybackNow()
 {
     if (g_flash.mutex == nullptr) {
         return;
@@ -3077,7 +3153,7 @@ void AbortFlashPlayback()
     // stops sending more TTS audio. Without this, audio.delta frames already
     // in flight would refill the ringbuf and playback would resume.
     xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
-    const bool cancel = g_flash.ws_connected && g_flash.response_in_flight;
+    const bool cancel = g_flash.ws_connected;
     esp_websocket_client_handle_t client = g_flash.ws_client;
     if (cancel && client != nullptr) {
         g_flash.active_ws_sends.fetch_add(1, std::memory_order_relaxed);
@@ -3092,6 +3168,76 @@ void AbortFlashPlayback()
     } else {
         ESP_LOGI(kTag, "flash playback aborted (local only)");
     }
+}
+
+void ProcessFlashControlCommands()
+{
+    xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+    const bool begin = g_flash.ptt_press_pending || g_flash.ptt_ready_pending;
+    const bool end = g_flash.ptt_release_pending;
+    const bool submit = g_flash.ptt_release_submit;
+    const bool abort = g_flash.playback_abort_pending;
+    g_flash.ptt_press_pending = false;
+    g_flash.ptt_ready_pending = false;
+    g_flash.ptt_release_pending = false;
+    g_flash.playback_abort_pending = false;
+    xSemaphoreGive(g_flash.mutex);
+    if (abort) AbortFlashPlaybackNow();
+    if (begin && !g_teardown_pending.load(std::memory_order_acquire)) FlashButtonPressedNow();
+    if (end && !g_teardown_pending.load(std::memory_order_acquire)) FlashButtonReleasedNow(submit);
+    if (end) {
+        xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+        g_flash.ptt_admitted = false;
+        xSemaphoreGive(g_flash.mutex);
+    }
+}
+
+void OnFlashButtonPressed()
+{
+    if (g_flash.mutex == nullptr && InitFlashSession() != ESP_OK) return;
+    xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+    if (g_flash.ptt_admitted || g_teardown_pending.load(std::memory_order_acquire)) {
+        g_flash.pending_text = "正在结束，请稍后重试";
+        MarkChanged();
+    } else {
+        g_flash.ptt_admitted = true;
+        g_flash.button_pressed = true;
+        g_flash.ptt_press_pending = true;
+    }
+    xSemaphoreGive(g_flash.mutex);
+    xTaskNotifyGive(g_lifecycle_task);
+}
+
+void OnFlashButtonReleased(bool submit)
+{
+    if (g_flash.mutex == nullptr) return;
+    xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+    if (!g_flash.ptt_admitted || !g_flash.button_pressed) {
+        xSemaphoreGive(g_flash.mutex);
+        return;
+    }
+    // The producer observes release before the owner next runs, including
+    // during a slow network send. Keep capture_started for FINAL accounting.
+    g_flash.button_pressed = false;
+    g_flash.ptt_release_submit = submit;
+    g_flash.ptt_release_pending = true;
+    SetFlashCaptureIndicatorLocked(false);
+    const bool cancel_connect = !g_flash.ws_connected &&
+        (g_flash.status == InternalStatus::kConnecting || g_flash.status == InternalStatus::kSessionUpdating);
+    xSemaphoreGive(g_flash.mutex);
+    if (cancel_connect) StopFlashSession();
+    xTaskNotifyGive(g_lifecycle_task);
+}
+
+void AbortFlashPlayback()
+{
+    if (g_flash.mutex == nullptr) return;
+    xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+    g_flash.playback_abort_requested = true;
+    g_flash.playback_abort_pending = true;
+    g_flash.drain_playback.store(true, std::memory_order_release);
+    xSemaphoreGive(g_flash.mutex);
+    xTaskNotifyGive(g_lifecycle_task);
 }
 
 }  // namespace wqn
