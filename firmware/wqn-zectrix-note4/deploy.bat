@@ -15,7 +15,8 @@ setlocal EnableExtensions EnableDelayedExpansion
 set "WSL_DISTRO=Ubuntu"
 set "WSL_IDF_EXPORT=~/esp/esp-idf-v5.5/export.sh"
 set "BUILD_DIR=build-ai-local-s3"
-set "COM_PORT=COM7"
+:: COM7 is the dev port. scripts/deploy_com5.bat presets this to COM5.
+if not defined COM_PORT set "COM_PORT=COM7"
 set "BAUD=460800"
 :: esptool reset mode. default-reset is what ESP-IDF's own `idf.py flash`
 :: emits for this board (see build output) and is accepted by esptool v5.2.0.
@@ -63,6 +64,7 @@ echo.
 echo ========================================
 echo  WQN Note4 Flash Deploy (Unified Script)
 echo  Build: WSL  ^|  Flash+Monitor: Windows
+echo  Port:  %COM_PORT%
 echo  Tree:  !FW_DIR!
 echo ========================================
 echo.
@@ -74,9 +76,12 @@ if /I "%PLAN_ONLY%"=="1" (
     exit /b 0
 )
 
-:: Preflight: refuse COM5 (official-firmware checkpoint)
-if /I "%COM_PORT%"=="COM5" (
+:: Preflight: refuse COM5 (official-firmware checkpoint) unless the caller
+:: opted in. Only scripts/deploy_com5.bat sets ALLOW_COM5, so an ordinary
+:: deploy.bat run still cannot overwrite the checkpoint by accident.
+if /I "%COM_PORT%"=="COM5" if not "%ALLOW_COM5%"=="1" (
     echo ERROR: COM5 is the official-firmware checkpoint. Refusing to flash COM5.
+    echo        Use scripts\deploy_com5.bat if that is really what you want.
     call :pause_if_interactive
     exit /b 1
 )
