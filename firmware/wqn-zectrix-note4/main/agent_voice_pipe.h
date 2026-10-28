@@ -40,6 +40,8 @@ esp_err_t AgentVoiceTurnStart(const std::string& token,
 // means no turn was established or FINAL never left the device: the caller
 // must use the batch endpoint. A soft cancel returns ESP_OK with an empty
 // transcript; the caller checks AgentVoiceCancelRequested() to discard it.
+// A matching transport terminal without ASR returns ESP_ERR_INVALID_RESPONSE
+// promptly. Sent/ambiguous FINAL never permits a second HTTP submission.
 esp_err_t AgentVoiceTurnFinalize(int duration_ms, uint32_t timeout_ms,
                                  std::string* out_transcript);
 

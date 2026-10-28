@@ -212,6 +212,7 @@ wqn::stdpro_ws::TurnStreamObservation g_active_turn_stream_obs =
     wqn::stdpro_ws::TurnStreamObservation::kNone;
 
 TurnTerminalRecord g_terminal_turn_record = {};
+portMUX_TYPE g_terminal_turn_mux = portMUX_INITIALIZER_UNLOCKED;
 
 std::string g_current_token;
 std::string g_current_req_id;
@@ -276,12 +277,14 @@ void PublishTurnTerminalRecord(uint32_t turn_gen,
     if (turn_gen == 0 || req_id == nullptr || req_id[0] == '\0') {
         return;
     }
+    portENTER_CRITICAL(&g_terminal_turn_mux);
     g_terminal_turn_record.turn_gen = turn_gen;
     std::strncpy(g_terminal_turn_record.request_id, req_id,
                  sizeof(g_terminal_turn_record.request_id) - 1);
     g_terminal_turn_record.request_id[sizeof(g_terminal_turn_record.request_id) - 1] = '\0';
     g_terminal_turn_record.release_state = release_state;
     g_terminal_turn_record.stream_observation = stream_obs;
+    portEXIT_CRITICAL(&g_terminal_turn_mux);
 
     ESP_LOGI(kTag,
              "event=ai.ws stage=turn_terminal req=%s turn_gen=%lu release=%u observation=%u at_ms=%lld",
@@ -1791,6 +1794,28 @@ void SetSseCallback(WqnAiSseCallback cb, void* user_ctx)
     g_sse_user_ctx = user_ctx;
 }
 
+bool TryGetTurnTerminal(uint32_t expected_turn_gen,
+                        const std::string& expected_request_id,
+                        TurnWaitResult* result)
+{
+    if (result == nullptr || expected_turn_gen == 0 || expected_request_id.empty()) {
+        return false;
+    }
+    TurnTerminalRecord snapshot;
+    portENTER_CRITICAL(&g_terminal_turn_mux);
+    snapshot = g_terminal_turn_record;
+    portEXIT_CRITICAL(&g_terminal_turn_mux);
+    if (snapshot.turn_gen != expected_turn_gen ||
+        expected_request_id != snapshot.request_id) {
+        return false;
+    }
+    result->wait_status = TurnWaitStatus::kTerminalObserved;
+    result->release_state = snapshot.release_state;
+    result->stream_observation = snapshot.stream_observation;
+    result->turn_gen = snapshot.turn_gen;
+    return true;
+}
+
 TurnWaitResult WaitForTurnRelease(uint32_t expected_turn_gen,
                                  const std::string& expected_request_id,
                                  uint32_t timeout_ms)
@@ -1810,6 +1835,11 @@ TurnWaitResult WaitForTurnRelease(uint32_t expected_turn_gen,
         : 0;
 
     while (true) {
+        // The ledger remains observable even if a previous observer consumed
+        // the binary semaphore. It is protected independently of that signal.
+        if (TryGetTurnTerminal(expected_turn_gen, expected_request_id, &result)) {
+            break;
+        }
         const int64_t now_ms = esp_timer_get_time() / 1000;
         if (deadline_ms > 0 && now_ms >= deadline_ms) {
             result.wait_status = TurnWaitStatus::kTimedOut;
@@ -1819,16 +1849,12 @@ TurnWaitResult WaitForTurnRelease(uint32_t expected_turn_gen,
             ? pdMS_TO_TICKS(deadline_ms - now_ms + 10)
             : portMAX_DELAY;
 
-        if (xSemaphoreTake(g_turn_complete_sem, wait_ticks) == pdTRUE) {
-            if (g_terminal_turn_record.turn_gen == expected_turn_gen &&
-                std::strcmp(g_terminal_turn_record.request_id, expected_request_id.c_str()) == 0) {
-                result.wait_status = TurnWaitStatus::kTerminalObserved;
-                result.release_state = g_terminal_turn_record.release_state;
-                result.stream_observation = g_terminal_turn_record.stream_observation;
+        if (xSemaphoreTake(g_turn_complete_sem, wait_ticks) != pdTRUE) {
+            // Publication may race the timeout. Recheck the identity-bound
+            // snapshot once before taking the timeout recovery path.
+            if (TryGetTurnTerminal(expected_turn_gen, expected_request_id, &result)) {
                 break;
             }
-            // Stale terminal record from a previous turn; ignore and continue waiting
-        } else {
             result.wait_status = TurnWaitStatus::kTimedOut;
             break;
         }

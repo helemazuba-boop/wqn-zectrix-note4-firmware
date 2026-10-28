@@ -68,6 +68,12 @@ void AbortTurn(const std::string& request_id, uint32_t target_turn_gen = 0);
 
 void SetSseCallback(WqnAiSseCallback cb, void* user_ctx);
 
+// Nonblocking, identity-bound snapshot. Does not consume a completion signal,
+// wait, disconnect or change the turn. Leaves *result unchanged when absent.
+bool TryGetTurnTerminal(uint32_t expected_turn_gen,
+                        const std::string& expected_request_id,
+                        TurnWaitResult* result);
+
 TurnWaitResult WaitForTurnRelease(uint32_t expected_turn_gen,
                                  const std::string& expected_request_id,
                                  uint32_t timeout_ms);

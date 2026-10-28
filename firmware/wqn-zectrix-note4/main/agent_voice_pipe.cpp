@@ -90,6 +90,10 @@ void AgentVoiceSseTrampoline(const wqn::WqnAiSseEvent& ev, void* /*user_ctx*/)
     }
     bool forward = false;
     bool signal = false;
+    bool complete = false;
+    bool error = false;
+    uint32_t signal_turn_gen = 0;
+    std::string signal_request_id;
     wqn::WqnAiSseCallback forward_cb = nullptr;
     void* forward_ctx = nullptr;
     xSemaphoreTake(g_lock, portMAX_DELAY);
@@ -110,7 +114,7 @@ void AgentVoiceSseTrampoline(const wqn::WqnAiSseEvent& ev, void* /*user_ctx*/)
                 break;
             case Kind::kAsrComplete:
                 g_complete_text = ev.text;
-                g_saw_complete = true;
+                complete = true;
                 signal = true;
                 break;
             case Kind::kAsrFailed:
@@ -119,12 +123,16 @@ void AgentVoiceSseTrampoline(const wqn::WqnAiSseEvent& ev, void* /*user_ctx*/)
                     ? ev.error_message
                     : ev.error_code;
                 ESP_LOGW(kTag, "turn error: %s", msg.c_str());
-                g_saw_error = true;
+                error = true;
                 signal = true;
                 break;
             }
             default:
                 break;
+        }
+        if (signal) {
+            signal_turn_gen = g_active_turn_gen;
+            signal_request_id = g_active_req_id;
         }
     }
     xSemaphoreGive(g_lock);
@@ -133,6 +141,18 @@ void AgentVoiceSseTrampoline(const wqn::WqnAiSseEvent& ev, void* /*user_ctx*/)
     // the observer stashes, so the stash must land first.
     if (forward && forward_cb != nullptr) {
         forward_cb(ev, forward_ctx);
+    }
+    if (signal) {
+        // These flags are polled as well as signalled. Publish them only
+        // after the observer has committed its result/error message.
+        xSemaphoreTake(g_lock, portMAX_DELAY);
+        signal = g_turn_active && g_active_turn_gen == signal_turn_gen &&
+                 g_active_req_id == signal_request_id;
+        if (signal) {
+            g_saw_complete = g_saw_complete || complete;
+            g_saw_error = g_saw_error || error;
+        }
+        xSemaphoreGive(g_lock);
     }
     if (signal && g_result_sem != nullptr) {
         xSemaphoreGive(g_result_sem);
@@ -254,9 +274,29 @@ esp_err_t AgentVoiceTurnFinalize(int duration_ms, uint32_t timeout_ms,
     bool complete = false;
     bool error = false;
     bool cancelled = false;
+    bool terminal_observed = false;
+    wqn::stdpro_ws::TurnWaitResult terminal;
     for (;;) {
         if (g_cancel_requested.load(std::memory_order_acquire)) {
             cancelled = true;
+            break;
+        }
+        xSemaphoreTake(g_lock, portMAX_DELAY);
+        complete = g_saw_complete;
+        error = g_saw_error;
+        xSemaphoreGive(g_lock);
+        if (complete || error) {
+            break;
+        }
+        if (wqn::stdpro_ws::TryGetTurnTerminal(turn_gen, req_id, &terminal)) {
+            // The owner delivers ASR before publishing its terminal. Re-read
+            // after the snapshot so a result in that race wins over failure.
+            xSemaphoreTake(g_lock, portMAX_DELAY);
+            complete = g_saw_complete;
+            error = g_saw_error;
+            xSemaphoreGive(g_lock);
+            cancelled = g_cancel_requested.load(std::memory_order_acquire);
+            terminal_observed = true;
             break;
         }
         const int64_t slice_now_ms = esp_timer_get_time() / 1000;
@@ -265,15 +305,8 @@ esp_err_t AgentVoiceTurnFinalize(int duration_ms, uint32_t timeout_ms,
         }
         const int64_t remaining_ms = deadline_ms - slice_now_ms;
         const TickType_t slice =
-            std::min(kWaitSlice, pdMS_TO_TICKS(remaining_ms));
+            std::max<TickType_t>(1, std::min(kWaitSlice, pdMS_TO_TICKS(remaining_ms)));
         xSemaphoreTake(g_result_sem, slice);
-        xSemaphoreTake(g_lock, portMAX_DELAY);
-        complete = g_saw_complete;
-        error = g_saw_error;
-        xSemaphoreGive(g_lock);
-        if (complete || error) {
-            break;
-        }
     }
 
     esp_err_t result = ESP_OK;
@@ -290,6 +323,14 @@ esp_err_t AgentVoiceTurnFinalize(int duration_ms, uint32_t timeout_ms,
             result = ESP_ERR_INVALID_SIZE;  // no speech
         }
     } else if (error) {
+        result = ESP_ERR_INVALID_RESPONSE;
+    } else if (terminal_observed) {
+        // FINAL was sent or ambiguous: a lost/released turn without ASR is a
+        // failure, never authorization to submit the audio a second time.
+        ESP_LOGW(kTag, "turn ended before ASR req=%s gen=%lu release=%u observation=%u",
+                 req_id.c_str(), static_cast<unsigned long>(turn_gen),
+                 static_cast<unsigned>(terminal.release_state),
+                 static_cast<unsigned>(terminal.stream_observation));
         result = ESP_ERR_INVALID_RESPONSE;
     } else {
         // Nothing arrived before the deadline: observe the turn terminal so a
