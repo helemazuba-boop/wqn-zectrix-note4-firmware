@@ -119,7 +119,7 @@ if "%SKIP_BUILD%"=="1" (
 echo [Step 1] Building in WSL ^(ESP-IDF %WSL_IDF_EXPORT%^)...
 if not exist "%BUILD_UNC%\CMakeCache.txt" (
     echo         Initializing clean build directory for ESP32-S3...
-    wsl -d %WSL_DISTRO% -- bash -c "cd %WSL_FW_DIR% && . %WSL_IDF_EXPORT% && idf.py --no-ccache -B %BUILD_DIR% set-target esp32s3"
+    wsl -d %WSL_DISTRO% -- bash -c "cd %FW_DIR% && . %WSL_IDF_EXPORT% && idf.py --no-ccache -B %BUILD_DIR% set-target esp32s3"
     if errorlevel 1 (
         echo   ERROR: WSL target initialization failed^!
         call :pause_if_interactive
@@ -130,7 +130,7 @@ if not exist "%BUILD_UNC%\CMakeCache.txt" (
 :: version (WQN_RELEASE_VERSION) and a source diff is recorded under dist/.
 :: It runs `idf.py reconfigure` first: a plain build skips cmake when no
 :: CMakeLists changed, which would bake in whatever version was configured last.
-wsl -d %WSL_DISTRO% -- bash -c "cd %WSL_FW_DIR% && . %WSL_IDF_EXPORT% && python3 tools/release/release.py build --build-dir %BUILD_DIR%"
+wsl -d %WSL_DISTRO% -- bash -c "cd %FW_DIR% && . %WSL_IDF_EXPORT% && python3 tools/release/release.py build --build-dir %BUILD_DIR%"
 if errorlevel 1 (
     echo   ERROR: WSL build failed^!
     call :pause_if_interactive
@@ -155,7 +155,7 @@ echo   Done.
 ::          SKIP_BUILD=1, which is the case where a stale stamp is likeliest.
 echo.
 echo [Step 1b] Verifying build artifacts against their baked version...
-wsl -d %WSL_DISTRO% -- bash -c "cd %WSL_FW_DIR% && . %WSL_IDF_EXPORT% && python3 tools/release/release.py verify-build --build-dir %BUILD_DIR%"
+wsl -d %WSL_DISTRO% -- bash -c "cd %FW_DIR% && . %WSL_IDF_EXPORT% && python3 tools/release/release.py verify-build --build-dir %BUILD_DIR%"
 if errorlevel 1 (
     echo   ERROR: build artifacts failed verification -- refusing to flash^!
     echo          Re-run without SKIP_BUILD so the release tooling rebuilds them.
@@ -189,14 +189,14 @@ set "FLASH_RC=%ERRORLEVEL%"
 popd
 if not "%FLASH_RC%"=="0" (
     echo   ERROR: Flash failed ^(esptool exit %FLASH_RC%^)^!
-    wsl -d %WSL_DISTRO% -- bash -c "cd %WSL_FW_DIR% && . %WSL_IDF_EXPORT% && python3 tools/release/release.py record-flash --build-dir %BUILD_DIR% --port %COM_PORT% --status failed"
+    wsl -d %WSL_DISTRO% -- bash -c "cd %FW_DIR% && . %WSL_IDF_EXPORT% && python3 tools/release/release.py record-flash --build-dir %BUILD_DIR% --port %COM_PORT% --status failed"
     call :pause_if_interactive
     exit /b 1
 )
 :: Append to dist/flash-history.jsonl so we can always answer "which source is
 :: on this device right now" -- the version alone is not enough, the tree is
 :: usually dirty when we flash.
-wsl -d %WSL_DISTRO% -- bash -c "cd %WSL_FW_DIR% && . %WSL_IDF_EXPORT% && python3 tools/release/release.py record-flash --build-dir %BUILD_DIR% --port %COM_PORT% --status ok"
+wsl -d %WSL_DISTRO% -- bash -c "cd %FW_DIR% && . %WSL_IDF_EXPORT% && python3 tools/release/release.py record-flash --build-dir %BUILD_DIR% --port %COM_PORT% --status ok"
 echo   Done.
 
 echo.
