@@ -1920,6 +1920,21 @@ void ParseAndHandleEvent(const char* data, size_t len)
         xSemaphoreGive(g_flash.mutex);
         return;
     }
+    if (std::strcmp(type, "asr.partial") == 0) {
+        const char* text = JsonStr(g.p, "text");
+        if (text == nullptr) return;
+        xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+        // Provider partials may revise words/numbers; they are full snapshots.
+        // A late partial cannot overwrite a completed recognition.
+        if (!g_flash.asr_done) {
+            g_flash.user_transcript = BoundedFlashText(text, 8192);
+            EnsureFlashUserHistoryLocked(now_ms);
+            g_flash.status_since_ms = now_ms;
+            MarkChanged();
+        }
+        xSemaphoreGive(g_flash.mutex);
+        return;
+    }
     if (std::strcmp(type, "asr.delta") == 0 ||
         std::strcmp(type, "conversation.item.input_audio_transcription.delta") == 0 ||
         std::strcmp(type, "asr.complete") == 0 ||

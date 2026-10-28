@@ -84,7 +84,7 @@ assert int(re.search(r'kFrameVersion = (\d+);', source).group(1)) == manifest['b
 for name, digest in manifest['fixtures_sha256'].items():
     assert hashlib.sha256((contract/name).read_bytes()).hexdigest() == digest, name
 for variable, name in [
-    ('gold_ready', 'valid/session-ready'), ('gold_text', 'valid/text-complete'),
+    ('gold_partial', 'valid/asr-partial'), ('gold_ready', 'valid/session-ready'), ('gold_text', 'valid/text-complete'),
     ('gold_reset', 'valid/playback-reset'), ('gold_tool', 'valid/tool-start'),
     ('gold_result', 'valid/tool-result'), ('gold_done', 'valid/turn-done-completed'),
     ('bad_epoch', 'invalid/zero-epoch'), ('bad_vad', 'invalid/unconfirmed-vad'),
@@ -177,6 +177,14 @@ int main(){
  CHECK(snapshot()->messages[1].id==thought_id&&snapshot()->messages[1].text=="前缀追加");
  event(R"({"type":"response.thinking.done","turn_id":7,"text":"摘要"})");
  CHECK(snapshot()->messages[1].id==thought_id&&snapshot()->messages[1].text=="摘要");
+ reset();event(gold_partial);
+ CHECK(snapshot()->messages.size()==1&&snapshot()->messages[0].text=="明天上午 9 点提醒我复习"&&!g_flash.asr_done);
+ const auto partial_user_id=snapshot()->messages[0].id;
+ event(R"({"type":"asr.partial","turn_id":7,"text":"明天上午九点"})");
+ CHECK(snapshot()->messages[0].id==partial_user_id&&snapshot()->messages[0].text=="明天上午九点");
+ event(R"({"type":"conversation.item.input_audio_transcription.completed","turn_id":7,"transcript":"最终识别"})");
+ event(R"({"type":"asr.partial","turn_id":7,"text":"迟到片段"})");
+ CHECK(snapshot()->messages[0].text=="最终识别"&&g_flash.asr_done);
  reset();event(gold_ready);event(gold_reset);event(gold_text);event(gold_tool);event(gold_result);event(gold_done);
  CHECK(g_flash.playback_epoch_valid&&g_flash.playback_epoch==2);
  CHECK(snapshot()->messages.size()==3&&snapshot()->messages[1].text=="完整回答");
