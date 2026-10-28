@@ -48,6 +48,7 @@ int MeasureUtf8TextWidth(const char* text) {
 }
 esp_err_t DrawUtf8Text(int x,int y,const char* text,bool ink) { DrawTextWithFont(x,y,PrimaryUiFont(),text,ink);return ESP_OK; }
 @@AI_MODEL@@
+@@FLASH_MODEL@@
 enum class UiScreen { kAi,kHome };
 struct UiState { UiScreen screen=UiScreen::kAi;AiSessionState ai;AgentSessionState agent; };
 AgentSessionState g_state;
@@ -91,13 +92,14 @@ namespace device_ui_internal {
 }
 
 namespace device_ui_internal {
-enum class AppEventKind { kAiViewportFollow };
+enum class AppEventKind { kAiViewportFollow,kFlashSnapshot };
 enum class RefreshSchedule { kNone,kAi };
 struct UiUpdate { bool changed; };
 int AiBottomReserve(const wqn::AgentSessionState& agent) { return agent.ui.requires_confirmation || !agent.pending_permission_id.empty() || !agent.pending_question_id.empty() ? 22 : 0; }
-struct UiRuntime { wqn::UiState state_;UiUpdate DispatchAiViewportFollow();UiUpdate FinishEvent(AppEventKind,RefreshSchedule,bool changed) {return {changed};} };
+struct UiRuntime { wqn::UiState state_;UiUpdate DispatchAiViewportFollow();UiUpdate DispatchFlashSnapshot(const wqn::FlashUiState&);UiUpdate FinishEvent(AppEventKind,RefreshSchedule,bool changed) {return {changed};} };
 #define ESP_LOGI(...) do {} while(0)
 @@FOLLOW_RUNTIME@@
+@@FLASH_RUNTIME@@
 }
 
 void Save(const std::string& folder,const std::string& name) {
@@ -276,6 +278,35 @@ int main(int argc,char**argv) {
         wqn::std_follow_state.status=wqn::AiSessionStatus::kStreaming;wqn::std_follow_state.auto_follow=false;
         CHECK(!wqn::ApplyAiViewportFollow(wqn::std_follow_state.follow_epoch,0,-100,100,false));
     }
+
+    // Flash owns its viewport locally, with the same content expansion and
+    // answer-first-line geometry. A late off-tier snapshot cannot replace Agent.
+    UiRuntime flash_runtime;flash_runtime.state_.ai.tier=wqn::AiTier::kFlash;
+    wqn::FlashUiState flash;flash.status=wqn::FlashStatus::kStreaming;
+    flash.response_in_flight=true;flash.turn_epoch=1;flash.history_after_revision=0;
+    flash_runtime.DispatchFlashSnapshot(flash);
+    CHECK(flash_runtime.state_.ai.follow_active);
+    CHECK(wqn::AiHistoryContentExpanded(flash_runtime.state_.ai));
+    wqn::follow_snapshots[1]=working;flash_runtime.DispatchAiViewportFollow();
+    wqn::follow_snapshots[1]=answered;flash_runtime.DispatchAiViewportFollow();
+    CHECK(flash_runtime.state_.ai.scroll_offset_lines==final_top&&flash_runtime.state_.ai.follow_active);
+    flash_runtime.state_.ai.follow_active=false;flash_runtime.state_.ai.user_moved=true;
+    flash_runtime.state_.ai.scroll_offset_lines=17;flash_runtime.DispatchFlashSnapshot(flash);
+    flash_runtime.DispatchAiViewportFollow();CHECK(flash_runtime.state_.ai.scroll_offset_lines==17);
+    ++flash.turn_epoch;flash_runtime.DispatchFlashSnapshot(flash);
+    CHECK(flash_runtime.state_.ai.follow_active&&!flash_runtime.state_.ai.user_moved);
+    flash.response_in_flight=false;flash.playback_active=true;flash_runtime.DispatchFlashSnapshot(flash);
+    flash_runtime.DispatchAiViewportFollow();CHECK(flash_runtime.state_.ai.follow_active);
+    flash.playback_active=false;flash_runtime.DispatchFlashSnapshot(flash);
+    flash_runtime.DispatchAiViewportFollow();CHECK(!flash_runtime.state_.ai.follow_active);
+    flash_runtime.state_.ai.tier=wqn::AiTier::kAgent;
+    flash_runtime.state_.ai.status=wqn::AiSessionStatus::kStreaming;
+    flash.status=wqn::FlashStatus::kError;flash_runtime.DispatchFlashSnapshot(flash);
+    CHECK(flash_runtime.state_.ai.status==wqn::AiSessionStatus::kStreaming);
+    ai.tier=wqn::AiTier::kAgent;ai.expand_content=false;
+    RenderAiHistoryViewport(ai,details,0,0);const auto agent_pixels=wqn::pixels;
+    ai.tier=wqn::AiTier::kFlash;RenderAiHistoryViewport(ai,details,0,0);
+    CHECK(agent_pixels==wqn::pixels);Save(folder,"flash-agent-content-parity");
 
     const auto* font=AiNativeFont();
     auto english=WrapAiNativeText("alpha beta gamma",wqn::MeasureTextWithFont(font,"alpha beta"),font,10);

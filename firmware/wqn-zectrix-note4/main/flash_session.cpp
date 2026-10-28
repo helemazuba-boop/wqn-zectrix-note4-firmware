@@ -1521,6 +1521,11 @@ void CaptureFlashPcmTurn(uint32_t generation)
             break;
         }
         last_pcm_us = esp_timer_get_time();
+        if (wqn::services::AudioDuplexRxOverflowCount() != rx_overflows_before) {
+            g_uplink.Fail(generation, FlashUplink::Failure::kInvalidAudio);
+            RequestFlashTerminalStop(FlashTerminalReason::kCaptureIncomplete);
+            break;
+        }
 
         // First valid post-warmup PCM is the actual-ready edge. Merely
         // connecting or setting capture_started never lights the LED.
@@ -2668,7 +2673,7 @@ esp_err_t StopFlashSessionNow()
     // Only clear/shrink after stop/destroy has joined that receiver.
     {
         xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
-        g_flash.ws_assembly.Reset();
+        g_flash.ws_assembly.Release();
         xSemaphoreGive(g_flash.mutex);
     }
 

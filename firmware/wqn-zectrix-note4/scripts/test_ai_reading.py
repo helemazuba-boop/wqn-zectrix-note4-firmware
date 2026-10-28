@@ -35,6 +35,8 @@ def main():
         '@@STD_FOLLOW_OWNER@@': '\n'.join(function(std_owner, name) for name in ['void ArmAiFollowLocked()', 'bool ApplyAiViewportFollow(', 'void SetAiFollowState(']),
         '@@FOLLOW_OWNER@@': '\n'.join(function(owner, name) for name in ['void ArmAgentFollowLocked()', 'bool ApplyOpenCodeViewportFollow(', 'void SetOpenCodeFollowState(']),
         '@@FOLLOW_RUNTIME@@': section(runtime, 'UiUpdate UiRuntime::DispatchAiViewportFollow()', 'UiUpdate UiRuntime::DispatchFlashSnapshot('),
+        '@@FLASH_MODEL@@': section((root/'main/flash_session.h').read_text(), 'enum class FlashStatus {', 'esp_err_t InitFlashSession();'),
+        '@@FLASH_RUNTIME@@': function(runtime, 'UiUpdate UiRuntime::DispatchFlashSnapshot('),
         '@@AI_MODEL@@': section((root/'main/ui_model.h').read_text(), 'enum class AiSessionStatus {', 'enum class TodoSyncStatus {'),
         '@@FONT_LOOKUP@@': section(display, 'const lv_font_fmt_txt_glyph_dsc_t* FindGlyphInFont(', 'int MeasureCodepointWidth('),
         '@@FONT_DRAW@@': section(display, 'void DrawGlyphFromFont(', 'void DrawCjkGlyph('),

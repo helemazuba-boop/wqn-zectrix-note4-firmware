@@ -45,6 +45,8 @@ public:
         return Result::kComplete;
     }
 
+    void Release() { Reset(); std::string().swap(bytes_); }
+
     uint8_t opcode() const { return opcode_; }
     const std::string& bytes() const { return bytes_; }
     void Reset()
