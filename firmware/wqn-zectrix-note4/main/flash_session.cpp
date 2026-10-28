@@ -2324,9 +2324,8 @@ esp_err_t StartFlashSession()
     g_flash.status = InternalStatus::kConnecting;
     g_flash.pending_text = "正在连接...";
     g_flash.error_message.clear();
-    g_flash.user_transcript.clear();
-    g_flash.assistant_text.clear();
-    g_flash.thinking_text.clear();
+    // A cold/automatic first capture must not inherit the prior session IDs.
+    ResetFlashTurnAssemblyLocked();
     g_flash.response_in_flight = false;
     g_flash.response_started = false;
     g_flash.status_since_ms = esp_timer_get_time() / 1000;
@@ -2597,8 +2596,6 @@ esp_err_t StopFlashSessionNow()
         g_flash.pending_text.clear();
         g_flash.tool_label.clear();
         g_flash.error_message.clear();
-        g_flash.audio_reassembly_buf.clear();
-        g_flash.audio_reassembly_buf.shrink_to_fit();
         g_flash.status_since_ms = esp_timer_get_time() / 1000;
         MarkChanged();
         xSemaphoreGive(g_flash.mutex);
@@ -2630,6 +2627,18 @@ esp_err_t StopFlashSessionNow()
         if (g_flash.ws_client_to_destroy == client_to_destroy) {
             g_flash.ws_client_to_destroy = nullptr;
         }
+        xSemaphoreGive(g_flash.mutex);
+    }
+
+    // The receiver owns both strings while its task is alive. Sender
+    // quiescence alone does not protect a DATA callback's borrowed PCM pointer.
+    // Only clear/shrink after stop/destroy has joined that receiver.
+    {
+        xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+        g_flash.audio_reassembly_buf.clear();
+        g_flash.audio_reassembly_buf.shrink_to_fit();
+        g_flash.ws_reassembly_buf.clear();
+        g_flash.ws_reassembly_buf.shrink_to_fit();
         xSemaphoreGive(g_flash.mutex);
     }
 
