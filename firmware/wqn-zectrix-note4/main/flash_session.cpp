@@ -1833,9 +1833,12 @@ void ParseAndHandleEvent(const char* data, size_t len)
         return;
     }
     if (std::strcmp(type, "session.ready") == 0) {
+        const cJSON* negotiated = cJSON_GetObjectItemCaseSensitive(g.p, "wqn");
         const cJSON* capability = cJSON_GetObjectItemCaseSensitive(
-            cJSON_GetObjectItemCaseSensitive(g.p, "wqn"), "playback_epoch");
-        if (!cJSON_IsNumber(capability) || capability->valuedouble != 1) {
+            negotiated, "playback_epoch");
+        const char* detection = JsonStr(negotiated, "turn_detection");
+        if (!cJSON_IsNumber(capability) || capability->valuedouble != 1 ||
+            detection == nullptr || std::strcmp(detection, "manual") != 0) {
             xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
             SetErrorLocked("Flash 播放协议不兼容，请更新服务端");
             xSemaphoreGive(g_flash.mutex);

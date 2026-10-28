@@ -2,6 +2,9 @@
 """Real Flash parser/history on host ports; excludes scheduling, I2S and HIL."""
 from pathlib import Path
 import os
+import json
+import hashlib
+import re
 import subprocess
 import tempfile
 from test_audio_runtime import function
@@ -72,6 +75,22 @@ body += function(header, 'enum class FlashStatus {') + ';\n'
 body += function(header, 'struct FlashUiState {') + ';\n'
 body += function(source, 'esp_err_t StartFlashSession()\n{') + '\n'
 body += function(source, 'bool CopyFlashStateToUi(') + '\n}\n'
+contract = ROOT / 'contracts/flash-realtime-v2'
+manifest = json.loads((contract/'manifest.json').read_text())
+assert hashlib.sha256((contract/manifest['schema']).read_bytes()).hexdigest() == manifest['schema_sha256']
+assert int(re.search(r'constexpr int kSampleRate = (\d+);', source).group(1)) == manifest['binary']['sample_rate_hz']
+assert int(re.search(r'kAudioFrameMagic = (0x[0-9a-fA-F]+)u;', source).group(1), 16) == manifest['binary']['magic_u32_le']
+assert int(re.search(r'kFrameVersion = (\d+);', source).group(1)) == manifest['binary']['version']
+for name, digest in manifest['fixtures_sha256'].items():
+    assert hashlib.sha256((contract/name).read_bytes()).hexdigest() == digest, name
+for variable, name in [
+    ('gold_ready', 'valid/session-ready'), ('gold_text', 'valid/text-complete'),
+    ('gold_reset', 'valid/playback-reset'), ('gold_tool', 'valid/tool-start'),
+    ('gold_result', 'valid/tool-result'), ('gold_done', 'valid/turn-done-completed'),
+    ('bad_epoch', 'invalid/zero-epoch'), ('bad_vad', 'invalid/unconfirmed-vad'),
+]:
+    payload = (contract/'fixtures'/f'{name}.json').read_text()
+    body += f'const char* {variable}=R"gold({payload})gold";\n'
 main = r'''
 int checks=0;
 #define CHECK(x) do{if(!(x)){std::fprintf(stderr,"FAIL %d %s\n",__LINE__,#x);std::abort();}++checks;}while(0)
@@ -150,6 +169,21 @@ int main(){
  wqn::GetAiHistory(wqn::AiHistoryChannel::kFlash).Clear();
  event(R"({"type":"text.delta","turn_id":7,"delta":"tail"})");
  CHECK(snapshot()->messages.size()==2&&snapshot()->messages[1].kind==wqn::ChatMessageKind::kAssistant);
+ reset();
+ event(R"({"type":"response.thinking.delta","turn_id":7,"delta":"前缀"})");
+ CHECK(snapshot()->messages.size()==2&&snapshot()->messages[1].kind==wqn::ChatMessageKind::kThinking);
+ const auto thought_id=snapshot()->messages[1].id;
+ event(R"({"type":"response.thinking.delta","turn_id":7,"delta":"追加"})");
+ CHECK(snapshot()->messages[1].id==thought_id&&snapshot()->messages[1].text=="前缀追加");
+ event(R"({"type":"response.thinking.done","turn_id":7,"text":"摘要"})");
+ CHECK(snapshot()->messages[1].id==thought_id&&snapshot()->messages[1].text=="摘要");
+ reset();event(gold_ready);event(gold_reset);event(gold_text);event(gold_tool);event(gold_result);event(gold_done);
+ CHECK(g_flash.playback_epoch_valid&&g_flash.playback_epoch==2);
+ CHECK(snapshot()->messages.size()==3&&snapshot()->messages[1].text=="完整回答");
+ CHECK(snapshot()->messages[2].kind==wqn::ChatMessageKind::kToolResult&&snapshot()->messages[2].tool_ok);
+ CHECK(g_flash.status==InternalStatus::kStreaming&&!g_flash.response_in_flight);
+ reset();event(bad_epoch);CHECK(terminal_requests==1);
+ reset();event(bad_vad);CHECK(terminal_requests==1&&g_flash.status==InternalStatus::kError);
  reset();g_flash.amp_idle_armed=true;g_flash.amp_idle_due_ms=0;g_flash.changed=false;
  CheckAmpIdleTail();CHECK(!g_flash.amp_idle_armed&&g_flash.changed);
  wqn::FlashUiState ui;CHECK(wqn::CopyFlashStateToUi(&ui)&&!ui.playback_active);
