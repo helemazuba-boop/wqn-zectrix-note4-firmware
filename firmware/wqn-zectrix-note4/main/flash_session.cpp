@@ -266,8 +266,9 @@ StackType_t* g_lifecycle_task_stack = nullptr;
 TaskHandle_t g_lifecycle_task = nullptr;
 // These workers' stacks live in PSRAM; allocating them internally made memory
 // disappear from MALLOC_CAP_DMA.  Retain one PSRAM stack for each worker and
-// keep their TCBs in internal RAM. Capture/uplink tasks persist and block while
-// idle; playback retains its existing session-level lifetime.
+// keep their TCBs in internal RAM. Capture/uplink/playback workers persist and
+// block while idle. Active markers acknowledge session-level quiescence.
+TaskHandle_t g_permanent_playback_task = nullptr;
 StaticTask_t g_playback_task_tcb;
 StackType_t* g_playback_task_stack = nullptr;
 StaticTask_t g_stream_task_tcb;
@@ -984,101 +985,112 @@ void FlashPlaybackTask(void*)
 {
     ESP_LOGI(kTag, "flash playback task started");
     std::vector<int16_t> stereo;
-    stereo.reserve(kPlaybackRingbufItemMax);
     while (true) {
-        if (g_flash.playback_stop.load(std::memory_order_acquire)) {
-            SetStreamAudioAmp(false);
-            xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
-            g_flash.playback_task = nullptr;
-            MarkChanged();
-            xSemaphoreGive(g_flash.mutex);
-            vTaskDelete(nullptr);
-            return;
-        }
-        // Only the playback owner resets TX or changes the idle amp state.
-        // No reset races a borrowed item still inside WriteAudioChannel.
-        if (g_flash.drain_playback.exchange(false, std::memory_order_acq_rel)) {
-            const uint32_t generation = g_flash.playback_generation.load(std::memory_order_acquire);
-            SetStreamAudioAmp(false);
-            if (g_flash.stream_tx != nullptr) {
-                if (wqn::services::ResetAudioTxChannel(g_flash_audio_session,
-                        g_flash.stream_tx, kStreamTxDmaBytes) != ESP_OK) {
-                    RequestFlashTerminalStop(FlashTerminalReason::kPlaybackIncomplete);
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        stereo.reserve(kPlaybackRingbufItemMax);
+        while (true) {
+            if (g_flash.playback_stop.load(std::memory_order_acquire)) {
+                SetStreamAudioAmp(false);
+                size_t stale_size = 0;
+                void* stale = nullptr;
+                while ((stale = xRingbufferReceive(g_flash.playback_ringbuf, &stale_size, 0)) != nullptr) {
+                    RetirePlaybackBytes(stale_size > sizeof(uint32_t) ? stale_size - sizeof(uint32_t) : 0);
+                    vRingbufferReturnItem(g_flash.playback_ringbuf, stale);
                 }
+                std::vector<int16_t>().swap(stereo);
+                xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+                g_flash.playback_write_active = false;
+                g_flash.amp_idle_armed = false;
+                g_flash.playback_task = nullptr;
+                MarkChanged();
+                xSemaphoreGive(g_flash.mutex);
+                break;
             }
+            // Only the playback owner resets TX or changes the idle amp state.
+            // No reset races a borrowed item still inside WriteAudioChannel.
+            if (g_flash.drain_playback.exchange(false, std::memory_order_acq_rel)) {
+                const uint32_t generation = g_flash.playback_generation.load(std::memory_order_acquire);
+                SetStreamAudioAmp(false);
+                if (g_flash.stream_tx != nullptr) {
+                    if (wqn::services::ResetAudioTxChannel(g_flash_audio_session,
+                            g_flash.stream_tx, kStreamTxDmaBytes) != ESP_OK) {
+                        RequestFlashTerminalStop(FlashTerminalReason::kPlaybackIncomplete);
+                    }
+                }
+                xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+                g_flash.playback_write_active = false;
+                g_flash.playback_abort_requested = !g_flash.playback_accepting || g_flash.capture_started;
+                g_flash.amp_idle_armed = false;
+                MarkChanged();
+                xSemaphoreGive(g_flash.mutex);
+                g_flash.playback_reset_generation.store(generation, std::memory_order_release);
+            }
+            CheckAmpIdleTail();
+            size_t item_size = 0;
+            auto* item = static_cast<uint8_t*>(xRingbufferReceive(
+                g_flash.playback_ringbuf, &item_size, pdMS_TO_TICKS(100)));
+            if (item == nullptr) continue;
+            if (item_size <= sizeof(uint32_t) || item_size > sizeof(uint32_t) + kPlaybackRingbufItemMax) {
+                vRingbufferReturnItem(g_flash.playback_ringbuf, item);
+                RequestFlashTerminalStop(FlashTerminalReason::kPlaybackIncomplete);
+                continue;
+            }
+            uint32_t generation;
+            std::memcpy(&generation, item, sizeof(generation));
+            const size_t pcm_bytes = item_size - sizeof(generation);
             xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
-            g_flash.playback_write_active = false;
-            g_flash.playback_abort_requested = !g_flash.playback_accepting || g_flash.capture_started;
-            g_flash.amp_idle_armed = false;
+            const bool allowed = generation == g_flash.playback_generation.load(std::memory_order_acquire) &&
+                g_flash.playback_accepting && !g_flash.capture_started &&
+                !g_flash.playback_abort_requested && !g_flash.drain_playback.load(std::memory_order_acquire);
+            g_flash.playback_write_active = allowed;
+            if (allowed) g_flash.amp_idle_armed = false;
             MarkChanged();
             xSemaphoreGive(g_flash.mutex);
-            g_flash.playback_reset_generation.store(generation, std::memory_order_release);
-        }
-        CheckAmpIdleTail();
-        size_t item_size = 0;
-        auto* item = static_cast<uint8_t*>(xRingbufferReceive(
-            g_flash.playback_ringbuf, &item_size, pdMS_TO_TICKS(100)));
-        if (item == nullptr) continue;
-        if (item_size <= sizeof(uint32_t) || item_size > sizeof(uint32_t) + kPlaybackRingbufItemMax) {
-            vRingbufferReturnItem(g_flash.playback_ringbuf, item);
-            RequestFlashTerminalStop(FlashTerminalReason::kPlaybackIncomplete);
-            continue;
-        }
-        uint32_t generation;
-        std::memcpy(&generation, item, sizeof(generation));
-        const size_t pcm_bytes = item_size - sizeof(generation);
-        xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
-        const bool allowed = generation == g_flash.playback_generation.load(std::memory_order_acquire) &&
-            g_flash.playback_accepting && !g_flash.capture_started &&
-            !g_flash.playback_abort_requested && !g_flash.drain_playback.load(std::memory_order_acquire);
-        g_flash.playback_write_active = allowed;
-        if (allowed) g_flash.amp_idle_armed = false;
-        MarkChanged();
-        xSemaphoreGive(g_flash.mutex);
-        if (!allowed) {
+            if (!allowed) {
+                RetirePlaybackBytes(pcm_bytes);
+                vRingbufferReturnItem(g_flash.playback_ringbuf, item);
+                continue;
+            }
+            SetStreamAudioAmp(true);
+            const size_t samples = pcm_bytes / sizeof(int16_t);
+            const auto* mono = reinterpret_cast<const int16_t*>(item + sizeof(generation));
+            stereo.resize(samples * 2);
+            for (size_t i = 0; i < samples; ++i) stereo[i * 2] = stereo[i * 2 + 1] = mono[i];
+            const size_t total_bytes = stereo.size() * sizeof(int16_t);
+            const int64_t deadline = esp_timer_get_time() + 1000000;
+            size_t total = 0;
+            while (total < total_bytes && esp_timer_get_time() < deadline &&
+                   generation == g_flash.playback_generation.load(std::memory_order_acquire) &&
+                   !g_flash.playback_stop.load(std::memory_order_acquire)) {
+                size_t written = 0;
+                const esp_err_t result = wqn::services::WriteAudioChannel(
+                    g_flash_audio_session, g_flash.stream_tx,
+                    reinterpret_cast<const uint8_t*>(stereo.data()) + total,
+                    total_bytes - total, &written, 250);
+                if (written > total_bytes - total) break;
+                total += written;
+                if (result != ESP_OK || written == 0) break;
+            }
             RetirePlaybackBytes(pcm_bytes);
             vRingbufferReturnItem(g_flash.playback_ringbuf, item);
-            continue;
+            xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+            const bool interrupted = generation != g_flash.playback_generation.load(std::memory_order_acquire) ||
+                g_flash.playback_stop.load(std::memory_order_acquire);
+            g_flash.playback_write_active = false;
+            if (!interrupted && total == total_bytes) {
+                // Write returns on DMA admission, not acoustic completion. Preserve
+                // the reservoir and idle tail in the visible playback state.
+                const int64_t dma_ms = (static_cast<int64_t>(kStreamDmaDescNum) * kStreamDmaFrameNum * 1000 + kSampleRate - 1) / kSampleRate;
+                g_flash.amp_idle_due_ms = esp_timer_get_time() / 1000 +
+                    (samples * 1000 + kSampleRate - 1) / kSampleRate + dma_ms + kAmpIdleTailMs;
+                g_flash.amp_idle_armed = true;
+            } else {
+                g_flash.amp_idle_armed = false;
+            }
+            MarkChanged();
+            xSemaphoreGive(g_flash.mutex);
+            if (!interrupted && total != total_bytes) RequestFlashTerminalStop(FlashTerminalReason::kPlaybackIncomplete);
         }
-        SetStreamAudioAmp(true);
-        const size_t samples = pcm_bytes / sizeof(int16_t);
-        const auto* mono = reinterpret_cast<const int16_t*>(item + sizeof(generation));
-        stereo.resize(samples * 2);
-        for (size_t i = 0; i < samples; ++i) stereo[i * 2] = stereo[i * 2 + 1] = mono[i];
-        const size_t total_bytes = stereo.size() * sizeof(int16_t);
-        const int64_t deadline = esp_timer_get_time() + 1000000;
-        size_t total = 0;
-        while (total < total_bytes && esp_timer_get_time() < deadline &&
-               generation == g_flash.playback_generation.load(std::memory_order_acquire) &&
-               !g_flash.playback_stop.load(std::memory_order_acquire)) {
-            size_t written = 0;
-            const esp_err_t result = wqn::services::WriteAudioChannel(
-                g_flash_audio_session, g_flash.stream_tx,
-                reinterpret_cast<const uint8_t*>(stereo.data()) + total,
-                total_bytes - total, &written, 250);
-            if (written > total_bytes - total) break;
-            total += written;
-            if (result != ESP_OK || written == 0) break;
-        }
-        RetirePlaybackBytes(pcm_bytes);
-        vRingbufferReturnItem(g_flash.playback_ringbuf, item);
-        xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
-        const bool interrupted = generation != g_flash.playback_generation.load(std::memory_order_acquire) ||
-            g_flash.playback_stop.load(std::memory_order_acquire);
-        g_flash.playback_write_active = false;
-        if (!interrupted && total == total_bytes) {
-            // Write returns on DMA admission, not acoustic completion. Preserve
-            // the reservoir and idle tail in the visible playback state.
-            const int64_t dma_ms = (static_cast<int64_t>(kStreamDmaDescNum) * kStreamDmaFrameNum * 1000 + kSampleRate - 1) / kSampleRate;
-            g_flash.amp_idle_due_ms = esp_timer_get_time() / 1000 +
-                (samples * 1000 + kSampleRate - 1) / kSampleRate + dma_ms + kAmpIdleTailMs;
-            g_flash.amp_idle_armed = true;
-        } else {
-            g_flash.amp_idle_armed = false;
-        }
-        MarkChanged();
-        xSemaphoreGive(g_flash.mutex);
-        if (!interrupted && total != total_bytes) RequestFlashTerminalStop(FlashTerminalReason::kPlaybackIncomplete);
     }
 }
 
@@ -1118,16 +1130,19 @@ esp_err_t EnsurePlaybackRingbuf()
         g_flash.playback_write_active = false;
         g_flash.amp_idle_armed = false;
         g_flash.playback_stop.store(false, std::memory_order_relaxed);  // [i2s-handoff] clear stale stop from a prior StopFlashSession
-        StackType_t* stack = EnsurePsramTaskStack(
-            &g_playback_task_stack, kPlaybackTaskStackBytes,
-            "flash_playback");
-        g_flash.playback_task = stack == nullptr ? nullptr
-            : xTaskCreateStaticPinnedToCore(
-                FlashPlaybackTask, "flash_playback",
-                kPlaybackTaskStackBytes, nullptr, 10, stack,
-                &g_playback_task_tcb, 1);
-        if (g_flash.playback_task == nullptr) {
+        if (g_permanent_playback_task == nullptr) {
+            StackType_t* stack = EnsurePsramTaskStack(
+                &g_playback_task_stack, kPlaybackTaskStackBytes, "flash_playback");
+            g_permanent_playback_task = stack == nullptr ? nullptr
+                : xTaskCreateStaticPinnedToCore(
+                    FlashPlaybackTask, "flash_playback", kPlaybackTaskStackBytes,
+                    nullptr, 10, stack, &g_playback_task_tcb, 1);
+        }
+        g_flash.playback_task = g_permanent_playback_task;
+        if (g_permanent_playback_task == nullptr) {
             ESP_LOGE(kTag, "flash playback task create failed");
+        } else {
+            xTaskNotifyGive(g_permanent_playback_task);
         }
     }
     const esp_err_t result =
@@ -1273,7 +1288,7 @@ void FinishAudioStreamingTask(uint32_t generation, const char* error_message = n
 // capture stops), this DELETES stream_rx/stream_tx so STD/Pro can claim
 // I2S_NUM_0. Called only from StopFlashSession, AFTER StopAudioStreaming + WS
 // destroy, so AudioStreamingTask is no longer reading stream_rx. The persistent
-// FlashPlaybackTask (writer of stream_tx) is stopped here first.
+// FlashPlaybackTask (writer of stream_tx) acknowledges quiescence here first.
 esp_err_t TearDownStreamChannels()
 {
     const wqn::services::AudioChannelHandle tx_before = g_flash.stream_tx;
@@ -1283,8 +1298,8 @@ esp_err_t TearDownStreamChannels()
     esp_err_t rx_disable_result = ESP_OK;
     esp_err_t rx_delete_result = ESP_OK;
     // 1. Stop FlashPlaybackTask so stream_tx has no writer. drain_playback
-    //    discards in-flight PCM; playback_stop makes the task self-exit at its
-    //    loop top (polled every 100 ms). Disabling stream_tx first breaks any
+    //    discards in-flight PCM; playback_stop makes the worker acknowledge idle
+    //    at its loop top (polled every 100 ms), then block on a notification. Disabling stream_tx first breaks any
     //    blocked i2s_channel_write (returns INVALID_STATE) so the task unblocks
     //    even mid-write.
     if (g_flash.stream_tx != nullptr) {
@@ -1302,7 +1317,7 @@ esp_err_t TearDownStreamChannels()
         }
     }
 
-    // 2. Delete stream_tx (safe now: playback task stopped). If the playback
+    // 2. Delete stream_tx (safe now: playback worker acknowledged idle). If the playback
     //    task somehow didn't exit, skip to avoid use-after-free on stream_tx.
     if (g_flash.playback_task == nullptr && g_flash.stream_tx != nullptr) {
         tx_delete_result = wqn::services::DeleteAudioChannel(

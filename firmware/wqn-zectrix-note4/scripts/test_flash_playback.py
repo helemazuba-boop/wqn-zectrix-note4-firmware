@@ -43,7 +43,8 @@ std::atomic<bool> g_teardown_pending{false};
 int g_flash_audio_session=1,lock_depth=0,stop_requests=0,tx_resets=0;
 int64_t clock_us=0;
 bool amplifier=false;
-std::function<void()> write_hook,delay_hook;
+std::function<void()> write_hook,delay_hook,restart_hook;
+int wakes=0,deletes=0;
 std::vector<int> played;
 void xSemaphoreTake(void*,int){assert(lock_depth==0);++lock_depth;}
 void xSemaphoreGive(void*){assert(lock_depth==1);--lock_depth;}
@@ -51,15 +52,20 @@ void MarkChanged(){g_flash.changed=true;}
 void SetStreamAudioAmp(bool enabled){assert(lock_depth==0);amplifier=enabled;}
 int64_t esp_timer_get_time(){return clock_us;}
 void vTaskDelay(int ms){clock_us+=ms*1000;if(delay_hook)delay_hook();}
-void vTaskDelete(void*){throw Pause{};}
+void vTaskDelete(void*){++deletes;throw Pause{};}
+unsigned ulTaskNotifyTake(int,int timeout){assert(timeout==portMAX_DELAY);
+ if(wakes++==0)return 1;
+ if(restart_hook){auto hook=std::move(restart_hook);restart_hook={};hook();return 1;}
+ throw Pause{};
+}
 enum class FlashTerminalReason{kPlaybackIncomplete};
 void RequestFlashTerminalStop(FlashTerminalReason){++stop_requests;}
 int xRingbufferSend(Ring* r,const void* data,size_t size,int){
  if(r->used+size>r->capacity)return 0;
  const auto* p=static_cast<const uint8_t*>(data);r->items.emplace_back(p,p+size);r->used+=size;return pdTRUE;
 }
-void* xRingbufferReceive(Ring* r,size_t* size,int){
- assert(r->borrowed.empty());if(r->items.empty())throw Pause{};
+void* xRingbufferReceive(Ring* r,size_t* size,int timeout){
+ assert(r->borrowed.empty());if(r->items.empty()){if(timeout==0)return nullptr;throw Pause{};}
  r->borrowed=std::move(r->items.front());r->items.pop_front();*size=r->borrowed.size();return r->borrowed.data();
 }
 void vRingbufferReturnItem(Ring* r,void* item){assert(item==r->borrowed.data());r->used-=r->borrowed.size();r->borrowed.clear();}
@@ -76,12 +82,13 @@ body = '\n'.join(function(source, name) for name in [
     'void DrainPlaybackRingbuf()', 'bool WaitForPlaybackReset()', 'void FlashPlaybackTask(',
 ])
 main = r'''
-void run(){try{FlashPlaybackTask(nullptr);}catch(const Pause&){}assert(lock_depth==0&&ring.borrowed.empty());}
+void run(){wakes=0;try{FlashPlaybackTask(nullptr);}catch(const Pause&){}assert(lock_depth==0&&ring.borrowed.empty());}
 void reset(){ring={};g_flash.playback_queued_bytes=0;g_flash.playback_generation=1;g_flash.playback_reset_generation=0;
  g_flash.playback_stop=false;g_flash.drain_playback=false;g_flash.playback_accepting=true;g_flash.playback_epoch_valid=true;
  g_flash.playback_abort_requested=false;g_flash.capture_started=false;g_flash.amp_idle_armed=false;
  g_flash.playback_write_active=false;g_flash.changed=false;g_teardown_pending=false;
- stop_requests=tx_resets=0;clock_us=0;amplifier=false;played.clear();write_hook={};delay_hook={};}
+ stop_requests=tx_resets=deletes=0;clock_us=0;amplifier=false;played.clear();write_hook={};delay_hook={};restart_hook={};
+ g_flash.playback_task=reinterpret_cast<void*>(1);}
 int main(){
  reset();std::vector<int16_t> old(2500,11),fresh(480,22);
  assert(EnqueuePlaybackPcm(reinterpret_cast<uint8_t*>(old.data()),old.size()*2));
@@ -103,7 +110,16 @@ int main(){
  reset();int steps=0;delay_hook=[&]{++steps;if(steps==1)++g_flash.playback_generation;
   if(steps==2)g_flash.playback_reset_generation=g_flash.playback_generation.load();};
  assert(WaitForPlaybackReset()&&steps==2); // latest reset supersedes the first
- std::puts("Flash playback owner: stale/new packets, abort accounting, overflow, reset race and idle publication PASS");
+ reset();assert(EnqueuePlaybackPcm(reinterpret_cast<uint8_t*>(old.data()),old.size()*2));
+ write_hook=[] { g_flash.playback_stop=true; };
+ restart_hook=[&] {
+  assert(g_flash.playback_task==nullptr&&!amplifier&&g_flash.playback_queued_bytes==0);
+  g_flash.playback_stop=false;g_flash.playback_task=reinterpret_cast<void*>(1);
+  ++g_flash.playback_generation;
+  assert(EnqueuePlaybackPcm(reinterpret_cast<uint8_t*>(fresh.data()),fresh.size()*2));
+ };
+ run();assert(played==std::vector<int>({11,22})&&deletes==0&&wakes==2);
+ std::puts("Flash playback owner: stale/new packets, abort accounting, overflow, reset race, fast session restart and idle publication PASS");
 }
 '''
 with tempfile.TemporaryDirectory(prefix='flash-playback-') as directory:
