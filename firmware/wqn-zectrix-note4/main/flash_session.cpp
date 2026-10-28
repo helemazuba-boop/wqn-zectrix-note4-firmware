@@ -31,6 +31,7 @@
 #include "freertos/task.h"
 #include "psram_task_stack.h"
 #include "flash_uplink_queue.h"
+#include "flash_frame_assembly.h"
 #include "services/audio_service.h"
 #include "services/connectivity_service.h"
 #include "storage.h"
@@ -58,7 +59,7 @@ void HandleV2DownlinkAudio(const uint8_t* data, size_t len,
 //   * Subproto:  wqn-flash-v2
 //   * Auth:      Bearer {access_token} (same long-term token as the v2 SSE path)
 //   * Uplink:    binary frames (0x02).  Frame layout is a 24-byte little-endian
-//                header followed by raw PCM s16le mono audio at 16 kHz:
+//                header followed by raw PCM s16le mono audio at 24 kHz:
 //                  [u32 magic      = 0x57464C56  ('WFLV')]
 //                  [u16 version    = 2]
 //                  [u16 flags      = 0x0001 stream | 0x0002 final]
@@ -141,7 +142,7 @@ struct FlashState {
     bool changed = false;
     wqn::AiTier tier = wqn::AiTier::kFlash;
     // WebSocket frame reassembly buffer for fragmented payloads
-    std::string ws_reassembly_buf;
+    wqn::FlashFrameAssembly ws_assembly;
     // Streaming audio state
     TaskHandle_t stream_task = nullptr; // active marker; permanent task is g_capture_task
     wqn::services::AudioChannelHandle stream_rx = nullptr;
@@ -173,7 +174,13 @@ struct FlashState {
     bool response_in_flight = false;
     bool response_started = false;  // [phase-fix] delta received for CURRENT turn
     // v2 downlink binary frame reassembly buffer
-    std::string audio_reassembly_buf;
+    std::atomic<uint32_t> playback_generation{1};
+    std::atomic<uint32_t> playback_reset_generation{0};
+    bool playback_accepting = false;
+    bool playback_epoch_valid = false;
+    uint32_t playback_epoch = 0;
+    uint32_t downlink_seq = 0;
+    bool downlink_seq_valid = false;
     // [playback-fix] Decouple I2S writes from the WebSocket event task.
     // The WS task only enqueues decoded PCM into a FreeRTOS byte ringbuffer;
     // a dedicated FlashPlaybackTask drains the ringbuffer and writes to I2S.
@@ -196,7 +203,6 @@ FlashState g_flash;
 wqn::services::AudioSession g_flash_audio_session;
 // Stable copy for the active acquisition turn, protected by g_flash.mutex.
 wqn::services::AudioSession g_flash_indicator_session;
-bool g_flash_indicator_on = false;
 bool g_flash_indicator_desired = false;
 bool g_flash_indicator_dirty = false;
 wqn::services::ConnectivityDemand g_flash_connectivity_demand;
@@ -341,7 +347,6 @@ void FlashLifecycleTask(void*)
             ApplyFlashIndicator();
             if (!g_teardown_pending.load(std::memory_order_acquire)) {
                 wqn::ProcessFlashControlCommands();
-                CheckAmpIdleTail();
                 CheckFlashProgressDeadline();
             }
             ApplyFlashIndicator();
@@ -813,6 +818,7 @@ void CheckAmpIdleTail()
         if (!g_flash.playback_write_active && queue_empty &&
             now_ms >= g_flash.amp_idle_due_ms) {
             g_flash.amp_idle_armed = false;
+            MarkChanged();
             turn_off = true;
         }
     }
@@ -838,257 +844,166 @@ void RetirePlaybackBytes(size_t bytes)
 //
 // Never block the socket callback for space. Overflow ends the audio session
 // explicitly; it must not be reported as a complete spoken answer.
-bool EnqueuePlaybackPcm(const uint8_t* pcm, size_t bytes)
+bool EnqueuePlaybackPcm(const uint8_t* pcm, size_t bytes, uint32_t generation = 0)
 {
-    if (g_flash.playback_ringbuf == nullptr || pcm == nullptr || bytes == 0) {
-        return false;
+    if (g_flash.playback_ringbuf == nullptr || pcm == nullptr || bytes == 0 || (bytes & 1) != 0) return false;
+    if (generation == 0) generation = g_flash.playback_generation.load(std::memory_order_acquire);
+    std::vector<uint8_t> packet(sizeof(generation) + std::min(bytes, kPlaybackRingbufItemMax));
+    for (size_t offset = 0; offset < bytes;) {
+        const size_t count = std::min(bytes - offset, kPlaybackRingbufItemMax);
+        std::memcpy(packet.data(), &generation, sizeof(generation));
+        std::memcpy(packet.data() + sizeof(generation), pcm + offset, count);
+        xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+        if (generation != g_flash.playback_generation.load(std::memory_order_acquire) ||
+            !g_flash.playback_accepting || g_flash.capture_started ||
+            g_teardown_pending.load(std::memory_order_acquire)) {
+            xSemaphoreGive(g_flash.mutex);
+            return false;
+        }
+        // Reserve before publication: the consumer may retire immediately.
+        g_flash.playback_queued_bytes.fetch_add(count, std::memory_order_release);
+        const BaseType_t ok = xRingbufferSend(g_flash.playback_ringbuf,
+            packet.data(), count + sizeof(generation), 0);
+        if (ok != pdTRUE) {
+            RetirePlaybackBytes(count);
+            g_flash.playback_dropped_bytes += count;
+        }
+        MarkChanged();
+        xSemaphoreGive(g_flash.mutex);
+        if (ok != pdTRUE) {
+            RequestFlashTerminalStop(FlashTerminalReason::kPlaybackIncomplete);
+            return false;
+        }
+        offset += count;
     }
-    const size_t aligned = bytes & ~static_cast<size_t>(1);
-    if (aligned == 0) {
-        return false;
-    }
-    // Nonblocking admission; failure reports incomplete playback through the
-    // lifecycle owner instead of silently continuing with a missing chunk.
-    // Reserve accounting before making the block visible to the consumer.
-    g_flash.playback_queued_bytes.fetch_add(aligned, std::memory_order_release);
-    const BaseType_t ok = xRingbufferSend(g_flash.playback_ringbuf,
-                                          pcm, aligned, 0);
-    if (ok != pdTRUE) {
-        RetirePlaybackBytes(aligned);
-        g_flash.playback_dropped_bytes += aligned;
-        ESP_LOGW(kTag, "playback ringbuf full, dropped %u B (total %u)",
-                 static_cast<unsigned>(aligned),
-                 static_cast<unsigned>(g_flash.playback_dropped_bytes));
-        RequestFlashTerminalStop(FlashTerminalReason::kPlaybackIncomplete);
-        return false;
-    }
-    xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
-    MarkChanged();
-    xSemaphoreGive(g_flash.mutex);
     return true;
 }
 
-// [playback-fix] Reset the playback ringbuffer. Used when the user barge-ins
-// or when the session transitions to idle/error, so queued audio is dropped
-// immediately and the next response starts from silence.
+// Invalidate queued AND currently borrowed packets. New response packets have
+// their own generation and survive a slow consumer retiring the previous turn.
 void DrainPlaybackRingbuf()
 {
-    // The playback task is the only ringbuffer consumer. Request a drain and
-    // remember that any write currently returning must not re-arm the PA tail.
+    xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+    g_flash.playback_generation.fetch_add(1, std::memory_order_acq_rel);
+    g_flash.playback_accepting = false;
+    g_flash.playback_epoch_valid = false;
+    g_flash.playback_abort_requested = true;
+    g_flash.amp_idle_armed = false;
     g_flash.drain_playback.store(true, std::memory_order_release);
-    if (g_flash.mutex != nullptr) {
-        xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
-        g_flash.playback_abort_requested = true;
-        g_flash.amp_idle_armed = false;
-        xSemaphoreGive(g_flash.mutex);
-    }
+    MarkChanged();
+    xSemaphoreGive(g_flash.mutex);
 }
 
-// [playback-fix] Independent FreeRTOS task that drains the ringbuffer and
-// writes to I2S. Runs on core 1 alongside the streaming (capture) task so
-// neither path competes with the UI loop on core 0.
-void FlashPlaybackTask(void* /*param*/)
+bool WaitForPlaybackReset()
+{
+    const int64_t deadline = esp_timer_get_time() + 2000000;
+    const uint32_t generation = g_flash.playback_generation.load(std::memory_order_acquire);
+    while (g_flash.playback_reset_generation.load(std::memory_order_acquire) != generation) {
+        if (esp_timer_get_time() >= deadline || g_teardown_pending.load(std::memory_order_acquire)) return false;
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    return true;
+}
+
+void FlashPlaybackTask(void*)
 {
     ESP_LOGI(kTag, "flash playback task started");
-    std::vector<int16_t> stereo;  // reused scratch buffer
+    std::vector<int16_t> stereo;
     stereo.reserve(kPlaybackRingbufItemMax);
     while (true) {
-        // [i2s-handoff] StopFlashSession sets this before deleting stream_tx.
-        // The receive below uses a 100 ms timeout so we re-check this flag
-        // promptly even when idle (blocked on the ringbuf). A blocked
-        // i2s_channel_write is unblocked separately by i2s_channel_disable
-        // in TearDownStreamChannels.
-        if (g_flash.playback_stop.load(std::memory_order_relaxed)) {
-            ESP_LOGI(kTag, "flash playback task exiting (stop)");
+        if (g_flash.playback_stop.load(std::memory_order_acquire)) {
+            SetStreamAudioAmp(false);
             xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
             g_flash.playback_task = nullptr;
+            MarkChanged();
             xSemaphoreGive(g_flash.mutex);
             vTaskDelete(nullptr);
+            return;
         }
-        // Interrupts must be honored even while the duplex TX channel does
-        // not exist yet (warmup): dropping queued PCM and resetting the
-        // PA/amp bookkeeping needs no I2S handle. Keeping this above the
-        // stream_tx guard means a stop pressed during first-turn codec init
-        // drains the queue instead of waiting for audio to come up.
-        if (g_flash.drain_playback.load(std::memory_order_relaxed)) {
-            size_t drain_size = 0;
-            char* drain_item = nullptr;
-            while ((drain_item = static_cast<char*>(xRingbufferReceive(
-                           g_flash.playback_ringbuf, &drain_size, 0))) != nullptr) {
-                RetirePlaybackBytes(drain_size);
-                vRingbufferReturnItem(g_flash.playback_ringbuf, drain_item);
+        // Only the playback owner resets TX or changes the idle amp state.
+        // No reset races a borrowed item still inside WriteAudioChannel.
+        if (g_flash.drain_playback.exchange(false, std::memory_order_acq_rel)) {
+            const uint32_t generation = g_flash.playback_generation.load(std::memory_order_acquire);
+            SetStreamAudioAmp(false);
+            if (g_flash.stream_tx != nullptr) {
+                if (wqn::services::ResetAudioTxChannel(g_flash_audio_session,
+                        g_flash.stream_tx, kStreamTxDmaBytes) != ESP_OK) {
+                    RequestFlashTerminalStop(FlashTerminalReason::kPlaybackIncomplete);
+                }
             }
-            g_flash.drain_playback.store(false, std::memory_order_relaxed);
             xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
             g_flash.playback_write_active = false;
-            g_flash.playback_abort_requested = false;
+            g_flash.playback_abort_requested = !g_flash.playback_accepting || g_flash.capture_started;
             g_flash.amp_idle_armed = false;
             MarkChanged();
             xSemaphoreGive(g_flash.mutex);
-            continue;
+            g_flash.playback_reset_generation.store(generation, std::memory_order_release);
         }
-        if (g_flash.stream_tx == nullptr) {
-            // PCM cannot be played until the duplex TX channel exists.
-            // Wait and retry, leaving items in the ring buffer.
-            vTaskDelay(pdMS_TO_TICKS(10));
-            continue;
-        }
+        CheckAmpIdleTail();
         size_t item_size = 0;
-        char* item = static_cast<char*>(xRingbufferReceiveUpTo(
-            g_flash.playback_ringbuf, &item_size, pdMS_TO_TICKS(100),
-            kPlaybackRingbufItemMax));
-        if (item == nullptr) {
-            continue;
-        }
-        // If playback was explicitly interrupted, do not leave the PA state
-        // marked active while discarding the current and queued PCM.
-        if (g_flash.drain_playback.load(std::memory_order_relaxed)) {
-            // A byte-mode RingBuffer item remains owned by the receiver until
-            // it is returned.  Do that before receiving any more items: the
-            // FreeRTOS ringbuffer does not permit a second receive while an
-            // item is outstanding, and doing so can stall/corrupt the drain.
-            RetirePlaybackBytes(item_size);
+        auto* item = static_cast<uint8_t*>(xRingbufferReceive(
+            g_flash.playback_ringbuf, &item_size, pdMS_TO_TICKS(100)));
+        if (item == nullptr) continue;
+        if (item_size <= sizeof(uint32_t) || item_size > sizeof(uint32_t) + kPlaybackRingbufItemMax) {
             vRingbufferReturnItem(g_flash.playback_ringbuf, item);
-            item = nullptr;
-            size_t drain_size = 0;
-            char* drain_item = nullptr;
-            while ((drain_item = static_cast<char*>(xRingbufferReceive(
-                           g_flash.playback_ringbuf, &drain_size, 0))) != nullptr) {
-                RetirePlaybackBytes(drain_size);
-                vRingbufferReturnItem(g_flash.playback_ringbuf, drain_item);
-            }
-            g_flash.drain_playback.store(false, std::memory_order_relaxed);
-            xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
-            g_flash.playback_write_active = false;
-            g_flash.playback_abort_requested = false;
-            g_flash.amp_idle_armed = false;
-            MarkChanged();
-            xSemaphoreGive(g_flash.mutex);
+            RequestFlashTerminalStop(FlashTerminalReason::kPlaybackIncomplete);
             continue;
         }
-
-        const size_t sample_count = item_size / sizeof(int16_t);
-        const int16_t* mono = reinterpret_cast<const int16_t*>(item);
-
-        // [tts-diag] Downlink PCM level (mirrors uplink pcm diag). If max is
-        // full-scale (~32767) -> noisy source data (StepFun content issue). If
-        // speech level (few thousand) -> data OK (points to ES8311 analog domain).
-        static int downlink_diag_counter = 0;
-        if (downlink_diag_counter++ % 10 == 0) {
-            int16_t max_sample = 0;
-            int64_t sum_sq = 0;
-            for (size_t i = 0; i < sample_count; ++i) {
-                int16_t s = mono[i];
-                int16_t a = s < 0 ? static_cast<int16_t>(-s) : s;
-                if (a > max_sample) max_sample = a;
-                sum_sq += static_cast<int64_t>(s) * s;
-            }
-            int32_t rms = sample_count > 0
-                ? static_cast<int32_t>(std::sqrt(static_cast<double>(sum_sq) / sample_count))
-                : 0;
-            // max=peak, rms=energy. rms/max>0.5 -> noisy data (StepFun content).
-            // rms/max<0.3 -> clean speech (DAC analog issue).
-            ESP_LOGI(kTag, "downlink pcm diag: frames=%u max=%d rms=%d",
-                     static_cast<unsigned>(sample_count), max_sample, rms);
-        }
-
-        // Mark the full blocking write as active before opening the PA. Do not
-        // start the idle tail yet: a byte-buffer receive can represent much more
-        // than 600 ms of PCM, and another task must not close GPIO46 mid-write.
-        {
-            xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
-            if (g_flash.playback_abort_requested ||
-                g_flash.drain_playback.load(std::memory_order_acquire)) {
-                g_flash.playback_write_active = false;
-                g_flash.amp_idle_armed = false;
-                RetirePlaybackBytes(item_size);
-                MarkChanged();
-                xSemaphoreGive(g_flash.mutex);
-                vRingbufferReturnItem(g_flash.playback_ringbuf, item);
-                continue;
-            }
-            g_flash.playback_write_active = true;
-            g_flash.amp_idle_armed = false;
-            MarkChanged();
-            xSemaphoreGive(g_flash.mutex);
+        uint32_t generation;
+        std::memcpy(&generation, item, sizeof(generation));
+        const size_t pcm_bytes = item_size - sizeof(generation);
+        xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+        const bool allowed = generation == g_flash.playback_generation.load(std::memory_order_acquire) &&
+            g_flash.playback_accepting && !g_flash.capture_started &&
+            !g_flash.playback_abort_requested && !g_flash.drain_playback.load(std::memory_order_acquire);
+        g_flash.playback_write_active = allowed;
+        if (allowed) g_flash.amp_idle_armed = false;
+        MarkChanged();
+        xSemaphoreGive(g_flash.mutex);
+        if (!allowed) {
+            RetirePlaybackBytes(pcm_bytes);
+            vRingbufferReturnItem(g_flash.playback_ringbuf, item);
+            continue;
         }
         SetStreamAudioAmp(true);
-
-        // [hw-volume] PCM sent at 100% - volume is the ES8311 DAC register
-        // (0x32/0x31) set by AudioService's duplex profile, not software scaling
-        // (which ruined SNR + quantization + log feel).
-        stereo.resize(sample_count * 2);
-        for (size_t i = 0; i < sample_count; ++i) {
-            stereo[i * 2] = mono[i];
-            stereo[i * 2 + 1] = mono[i];
-        }
-        // A bounded 250 ms write keeps normal 85 ms audio blocks lossless but
-        // still gives emergency PrepareSleep a finite drain bound. Looping
-        // handles short writes without allowing a portMAX_DELAY operation to
-        // pin the audio Lease forever.
+        const size_t samples = pcm_bytes / sizeof(int16_t);
+        const auto* mono = reinterpret_cast<const int16_t*>(item + sizeof(generation));
+        stereo.resize(samples * 2);
+        for (size_t i = 0; i < samples; ++i) stereo[i * 2] = stereo[i * 2 + 1] = mono[i];
         const size_t total_bytes = stereo.size() * sizeof(int16_t);
-        // GPIO46 must cover the samples already queued in I2S DMA as well as
-        // the blocking write itself. At 24 kHz stereo s16, 6 x 256 DMA frames
-        // hold about 64 ms; add that to the post-write PA tail.
-        constexpr int64_t kStreamDmaTailMs =
-            (static_cast<int64_t>(kStreamDmaDescNum) *
-                 kStreamDmaFrameNum * 1000 +
-             kSampleRate - 1) /
-            kSampleRate;
-        const int64_t audio_duration_ms =
-            (static_cast<int64_t>(sample_count) * 1000 + kSampleRate - 1) /
-            kSampleRate;
+        const int64_t deadline = esp_timer_get_time() + 1000000;
         size_t total = 0;
-        int64_t write_start_us = esp_timer_get_time();
-        esp_err_t last_werr = ESP_OK;
-        while (total < total_bytes) {
+        while (total < total_bytes && esp_timer_get_time() < deadline &&
+               generation == g_flash.playback_generation.load(std::memory_order_acquire) &&
+               !g_flash.playback_stop.load(std::memory_order_acquire)) {
             size_t written = 0;
-            last_werr = wqn::services::WriteAudioChannel(
+            const esp_err_t result = wqn::services::WriteAudioChannel(
                 g_flash_audio_session, g_flash.stream_tx,
                 reinterpret_cast<const uint8_t*>(stereo.data()) + total,
                 total_bytes - total, &written, 250);
-            if (last_werr != ESP_OK || written == 0) {
-                break;  // channel disabled/closed on stop - drop the rest
-            }
+            if (written > total_bytes - total) break;
             total += written;
+            if (result != ESP_OK || written == 0) break;
         }
-        // The write duration should track the PCM duration at 1x. With the
-        // 4096-byte mono receive cap this is about 85 ms per block.
-        int64_t write_ms = (esp_timer_get_time() - write_start_us) / 1000;
-        static int write_log_counter = 0;
-        if (write_log_counter++ % 10 == 0 || write_ms > 200) {
-            ESP_LOGI(kTag, "i2s write: ms=%lld total=%u werr=%s",
-                     static_cast<long long>(write_ms),
-                     static_cast<unsigned>(total), esp_err_to_name(last_werr));
-        }
-        RetirePlaybackBytes(item_size);
+        RetirePlaybackBytes(pcm_bytes);
         vRingbufferReturnItem(g_flash.playback_ringbuf, item);
-
-        // Arm the PA deadline after this write. `i2s_channel_write` returns when
-        // data is copied to DMA, so include this block's audio duration and the
-        // DMA reservoir before applying the idle tail. If another block follows,
-        // it cancels/replaces this deadline while keeping GPIO46 high.
-        {
-            xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
-            g_flash.playback_write_active = false;
-            const bool interrupted = g_flash.playback_abort_requested ||
-                g_flash.drain_playback.load(std::memory_order_acquire) ||
-                g_flash.playback_stop.load(std::memory_order_acquire);
-            if (total < total_bytes && !interrupted) {
-                RequestFlashTerminalStop(FlashTerminalReason::kPlaybackIncomplete);
-            }
-            MarkChanged();
-            if (g_flash.playback_abort_requested) {
-                g_flash.playback_abort_requested = false;
-                g_flash.amp_idle_armed = false;
-            } else {
-                g_flash.amp_idle_due_ms = esp_timer_get_time() / 1000 +
-                                          audio_duration_ms + kStreamDmaTailMs +
-                                          kAmpIdleTailMs;
-                g_flash.amp_idle_armed = true;
-            }
-            xSemaphoreGive(g_flash.mutex);
+        xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+        const bool interrupted = generation != g_flash.playback_generation.load(std::memory_order_acquire) ||
+            g_flash.playback_stop.load(std::memory_order_acquire);
+        g_flash.playback_write_active = false;
+        if (!interrupted && total == total_bytes) {
+            // Write returns on DMA admission, not acoustic completion. Preserve
+            // the reservoir and idle tail in the visible playback state.
+            const int64_t dma_ms = (static_cast<int64_t>(kStreamDmaDescNum) * kStreamDmaFrameNum * 1000 + kSampleRate - 1) / kSampleRate;
+            g_flash.amp_idle_due_ms = esp_timer_get_time() / 1000 +
+                (samples * 1000 + kSampleRate - 1) / kSampleRate + dma_ms + kAmpIdleTailMs;
+            g_flash.amp_idle_armed = true;
+        } else {
+            g_flash.amp_idle_armed = false;
         }
+        MarkChanged();
+        xSemaphoreGive(g_flash.mutex);
+        if (!interrupted && total != total_bytes) RequestFlashTerminalStop(FlashTerminalReason::kPlaybackIncomplete);
     }
 }
 
@@ -1102,7 +1017,7 @@ esp_err_t EnsurePlaybackRingbuf()
     xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
     if (g_flash.playback_ringbuf == nullptr) {
         g_flash.playback_ringbuf = xRingbufferCreate(
-            kPlaybackRingbufBytes, RINGBUF_TYPE_BYTEBUF);
+            kPlaybackRingbufBytes, RINGBUF_TYPE_NOSPLIT);
         if (g_flash.playback_ringbuf == nullptr) {
             ESP_LOGE(kTag, "playback ringbuf alloc failed (%u B)",
                      static_cast<unsigned>(kPlaybackRingbufBytes));
@@ -1116,6 +1031,13 @@ esp_err_t EnsurePlaybackRingbuf()
             vRingbufferReturnItem(g_flash.playback_ringbuf, stale_item);
         }
         g_flash.playback_queued_bytes.store(0, std::memory_order_release);
+        g_flash.playback_generation.fetch_add(1, std::memory_order_acq_rel);
+        g_flash.playback_epoch_valid = false;
+#if CONFIG_WQN_FLASH_PROTOCOL_V2
+        g_flash.playback_accepting = false;
+#else
+        g_flash.playback_accepting = true;
+#endif
         g_flash.drain_playback.store(false, std::memory_order_release);
         g_flash.playback_abort_requested = false;
         g_flash.playback_write_active = false;
@@ -1688,7 +1610,6 @@ void StartAudioStreaming()
     g_flash.playback_abort_requested = true;
     g_flash.amp_idle_armed = false;
     g_flash_indicator_session = g_flash_audio_session;
-    g_flash_indicator_on = false;
     g_flash.capture_base_seq = g_flash.uplink_seq.load(std::memory_order_relaxed);
     g_flash.stream_task = g_capture_task; // active marker, not task ownership
     xSemaphoreGive(g_flash.mutex);
@@ -1817,6 +1738,30 @@ void ParseAndHandleEvent(const char* data, size_t len)
         }
         xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
         SetErrorLocked(msg);
+        xSemaphoreGive(g_flash.mutex);
+        return;
+    }
+    if (std::strcmp(type, "playback.reset") == 0 ||
+        std::strcmp(type, "playback.response") == 0) {
+        const cJSON* epoch = cJSON_GetObjectItemCaseSensitive(g.p, "epoch");
+        if (!cJSON_IsNumber(epoch) || epoch->valuedouble < 1 ||
+            epoch->valuedouble > UINT32_MAX || std::floor(epoch->valuedouble) != epoch->valuedouble) {
+            RequestFlashTerminalStop(FlashTerminalReason::kTransportError);
+            return;
+        }
+        const bool reset = std::strcmp(type, "playback.reset") == 0;
+        if (reset) DrainPlaybackRingbuf();
+        xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+        if (reset) {
+            g_flash.playback_epoch = static_cast<uint32_t>(epoch->valuedouble);
+            g_flash.playback_epoch_valid = true;
+            g_flash.downlink_seq_valid = false;
+        }
+        if (g_flash.playback_epoch_valid && g_flash.playback_epoch == static_cast<uint32_t>(epoch->valuedouble)) {
+            g_flash.playback_accepting = !g_flash.capture_started;
+            g_flash.playback_abort_requested = g_flash.capture_started;
+        }
+        MarkChanged();
         xSemaphoreGive(g_flash.mutex);
         return;
     }
@@ -2146,7 +2091,7 @@ void WebsocketEventHandler(void* handler_args, esp_event_base_t, int32_t event_i
             // 5x continuous). Hypothesis: default max_response_output_tokens
             // is small -> StepFun segments TTS into many small chunks, each
             // with a generation pause. Setting 4096 enables whole-response TTS.
-            std::string session_update = std::string(R"({"type":"session.update","session":)") +
+            std::string session_update = std::string(R"({"type":"session.update","wqn":{"playback_epoch":1},"session":)") +
                 R"({"modalities":["text","audio"],)" +
                 R"("instructions":")" + std::string(kDefaultInstructions) +
                 R"(","voice":")" + kDefaultVoice +
@@ -2179,62 +2124,29 @@ void WebsocketEventHandler(void* handler_args, esp_event_base_t, int32_t event_i
             break;
         }
 
-        case WEBSOCKET_EVENT_DATA:
-            if (event->data_ptr != nullptr && event->data_len > 0) {
+        case WEBSOCKET_EVENT_DATA: {
+            if (event->op_code > 2 || event->data_len < 0 ||
+                event->payload_offset < 0 || event->payload_len < 0 ||
+                g_teardown_pending.load(std::memory_order_acquire)) break;
+            const auto result = g_flash.ws_assembly.Feed(
+                event->op_code, event->fin, event->payload_offset,
+                event->payload_len, event->data_ptr, static_cast<size_t>(event->data_len));
+            if (result == wqn::FlashFrameAssembly::Result::kInvalid) {
+                RequestFlashTerminalStop(FlashTerminalReason::kTransportError);
+            } else if (result == wqn::FlashFrameAssembly::Result::kComplete) {
+                const auto& bytes = g_flash.ws_assembly.bytes();
 #if CONFIG_WQN_FLASH_PROTOCOL_V2
-                // v2: text frames = control JSON, binary frames = audio.
-                if (event->op_code == 0x02) {
-                    HandleV2DownlinkAudio(reinterpret_cast<const uint8_t*>(event->data_ptr),
-                                          static_cast<size_t>(event->data_len),
-                                          static_cast<uint64_t>(event->payload_offset),
-                                          static_cast<uint64_t>(event->payload_len));
-                    break;
-                }
-                if (event->op_code != 0x01 && event->op_code != 0x00) {
-                    break;
-                }
-#else
-                if (event->op_code != 0x01 && event->op_code != 0x00) {
-                    break;
-                }
+                if (g_flash.ws_assembly.opcode() == 2) {
+                    HandleV2DownlinkAudio(reinterpret_cast<const uint8_t*>(bytes.data()),
+                                          bytes.size(), 0, bytes.size());
+                } else
 #endif
-                // [frag-fix] Handle WebSocket frame fragmentation. When the
-                // payload exceeds buffer_size, esp_websocket_client delivers
-                // it across multiple WEBSOCKET_EVENT_DATA callbacks with
-                // payload_offset tracking progress through the full frame.
-                if (event->payload_offset == 0 &&
-                    event->data_len == event->payload_len) {
-                    // Complete frame in a single callback (fast path)
-                    ParseAndHandleEvent(static_cast<const char*>(event->data_ptr),
-                                        static_cast<size_t>(event->data_len));
-                } else {
-                    // Fragmented frame — accumulate into reassembly buffer
-                    if (event->payload_offset == 0) {
-                        // [oom-guard] Cap control-frame reassembly at 128 KB.
-                        constexpr size_t kMaxWsFrameBytes = 128 * 1024;
-                        if (event->payload_len > kMaxWsFrameBytes) {
-                            ESP_LOGW(kTag, "WS control frame payload_len=%llu exceeds cap, dropping",
-                                     static_cast<unsigned long long>(event->payload_len));
-                            break;
-                        }
-                        g_flash.ws_reassembly_buf.clear();
-                        g_flash.ws_reassembly_buf.reserve(
-                            static_cast<size_t>(event->payload_len));
-                    }
-                    g_flash.ws_reassembly_buf.append(
-                        static_cast<const char*>(event->data_ptr),
-                        static_cast<size_t>(event->data_len));
-                    // All fragments received — parse complete frame
-                    if (event->payload_len > 0 &&
-                        event->payload_offset + event->data_len >=
-                        event->payload_len) {
-                        ParseAndHandleEvent(g_flash.ws_reassembly_buf.data(),
-                                            g_flash.ws_reassembly_buf.size());
-                        g_flash.ws_reassembly_buf.clear();
-                    }
+                if (g_flash.ws_assembly.opcode() == 1) {
+                    ParseAndHandleEvent(bytes.data(), bytes.size());
                 }
             }
             break;
+        }
 
         case WEBSOCKET_EVENT_ERROR: {
             ESP_LOGW(kTag, "WebSocket error");
@@ -2271,79 +2183,46 @@ void WebsocketEventHandler(void* handler_args, esp_event_base_t, int32_t event_i
 // in the session.update.  We decode, mix mono → stereo, and write to the
 // already-running I2S TX channel from the streaming task.
 //
-// TODO(opus): StepAudio Realtime ships Opus-encoded audio. The proxy is
-// expected to do the decode and forward PCM frames; if a future deployment
-// forwards raw Opus we'll need to plug in libopus here.
+// The negotiated provider output is pcm16/24k/mono; no Opus decoder is involved.
 // ============================================================================
 #if CONFIG_WQN_FLASH_PROTOCOL_V2
 void HandleV2DownlinkAudio(const uint8_t* data, size_t len,
                            uint64_t payload_offset, uint64_t payload_len)
 {
-    if (data == nullptr || len == 0) {
+    if (data == nullptr || payload_offset != 0 || len != payload_len ||
+        len < sizeof(AudioFrameHeader) || len > 64 * 1024) {
+        RequestFlashTerminalStop(FlashTerminalReason::kTransportError);
         return;
     }
-    if (payload_offset == 0) {
-        // [oom-guard] Cap the reassembly buffer at 64 KB. TTS audio chunks are
-        // typically 2-6 KB; a malicious or buggy proxy claiming a huge
-        // payload_len would otherwise exhaust PSRAM.
-        constexpr size_t kMaxAudioFrameBytes = 64 * 1024;
-        if (payload_len > kMaxAudioFrameBytes) {
-            ESP_LOGW(kTag, "audio frame payload_len=%llu exceeds cap %u, dropping",
-                     static_cast<unsigned long long>(payload_len),
-                     static_cast<unsigned>(kMaxAudioFrameBytes));
-            g_flash.audio_reassembly_buf.clear();  // [oom-guard] drop stale buf so later fragments don't pollute
-            return;
-        }
-        g_flash.audio_reassembly_buf.clear();
-        g_flash.audio_reassembly_buf.reserve(static_cast<size_t>(payload_len));
-    }
-    g_flash.audio_reassembly_buf.append(reinterpret_cast<const char*>(data), len);
-    if (g_flash.audio_reassembly_buf.size() < payload_len) {
-        return;  // wait for full frame
-    }
-    if (g_flash.audio_reassembly_buf.size() < sizeof(AudioFrameHeader)) {
-        return;  // corrupt or malformed
-    }
-    const uint8_t* p = reinterpret_cast<const uint8_t*>(g_flash.audio_reassembly_buf.data());
     AudioFrameHeader hdr{};
-    std::memcpy(&hdr.magic,       p + 0,  4);
-    std::memcpy(&hdr.version,     p + 4,  2);
-    std::memcpy(&hdr.flags,       p + 6,  2);
-    std::memcpy(&hdr.seq,         p + 8,  4);
-    std::memcpy(&hdr.sample_rate, p + 12, 4);
-    std::memcpy(&hdr.channels,    p + 16, 4);
-    std::memcpy(&hdr.reserved,    p + 20, 4);
-
-    if (hdr.magic != kAudioFrameMagic || hdr.version != kFrameVersion) {
-        g_flash.audio_reassembly_buf.clear();
+    std::memcpy(&hdr, data, sizeof(hdr));
+    const size_t pcm_bytes = len - sizeof(hdr);
+    if (hdr.magic != kAudioFrameMagic || hdr.version != kFrameVersion ||
+        hdr.sample_rate != kSampleRate || hdr.channels != 1 ||
+        hdr.flags != kFlagStream || pcm_bytes == 0 || (pcm_bytes & 1) != 0) {
+        RequestFlashTerminalStop(FlashTerminalReason::kTransportError);
         return;
     }
-
-    const size_t pcm_bytes = g_flash.audio_reassembly_buf.size() - sizeof(AudioFrameHeader);
-    const size_t safe_bytes = pcm_bytes & ~static_cast<size_t>(1);  // align to int16
-    if (safe_bytes < 2) {
-        ESP_LOGD(kTag, "audio frame seq=%u has %u PCM bytes (< 1 sample), skipping",
-                 static_cast<unsigned>(hdr.seq), static_cast<unsigned>(safe_bytes));
-        g_flash.audio_reassembly_buf.clear();
+    xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+    if (!g_flash.playback_epoch_valid || hdr.reserved != g_flash.playback_epoch ||
+        !g_flash.playback_accepting || g_flash.capture_started) {
+        xSemaphoreGive(g_flash.mutex);
+        return;  // cancelled/retired media must not reactivate the speaker
+    }
+    const bool contiguous = !g_flash.downlink_seq_valid ||
+        hdr.seq == g_flash.downlink_seq + 1;
+    g_flash.downlink_seq = hdr.seq;
+    g_flash.downlink_seq_valid = true;
+    const uint32_t generation = g_flash.playback_generation.load(std::memory_order_acquire);
+    g_flash.status_since_ms = esp_timer_get_time() / 1000;
+    xSemaphoreGive(g_flash.mutex);
+    if (!contiguous) {
+        RequestFlashTerminalStop(FlashTerminalReason::kPlaybackIncomplete);
         return;
     }
-
-    // [playback-fix] Enqueue the post-header PCM bytes into the playback
-    // ringbuffer instead of writing to I2S from the WS event task. The
-    // dedicated FlashPlaybackTask drains it and writes to stream_tx.
-    EnqueuePlaybackPcm(reinterpret_cast<const uint8_t*>(
-                           g_flash.audio_reassembly_buf.data() + sizeof(AudioFrameHeader)),
-                       safe_bytes);
-    // [tts-diag] Confirm TTS audio frames reach the device. If this prints but
-    // no sound, the ES8311 DAC path is the culprit (see dac-fix on 0x37); if it
-    // never prints, the proxy isn't forwarding response.audio.delta as binary.
-    static int downlink_frame_count = 0;
-    if (++downlink_frame_count % 50 == 1) {
-        ESP_LOGI(kTag, "downlink audio frame #%d seq=%u pcm_bytes=%u",
-                 downlink_frame_count, (unsigned)hdr.seq, (unsigned)safe_bytes);
-    }
-    g_flash.audio_reassembly_buf.clear();
+    EnqueuePlaybackPcm(data + sizeof(hdr), pcm_bytes, generation);
 }
+
 #endif  // CONFIG_WQN_FLASH_PROTOCOL_V2
 
 }  // namespace
@@ -2719,10 +2598,7 @@ esp_err_t StopFlashSessionNow()
     // Only clear/shrink after stop/destroy has joined that receiver.
     {
         xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
-        g_flash.audio_reassembly_buf.clear();
-        g_flash.audio_reassembly_buf.shrink_to_fit();
-        g_flash.ws_reassembly_buf.clear();
-        g_flash.ws_reassembly_buf.shrink_to_fit();
+        g_flash.ws_assembly.Reset();
         xSemaphoreGive(g_flash.mutex);
     }
 
@@ -2843,7 +2719,7 @@ bool CopyFlashStateToUi(FlashUiState* state)
     state->response_in_flight = g_flash.response_in_flight;
     state->response_started = g_flash.response_started;
     state->playback_active =
-        g_flash.playback_write_active ||
+        g_flash.playback_write_active || g_flash.amp_idle_armed ||
         g_flash.playback_queued_bytes.load(std::memory_order_acquire) > 0;
     g_flash.changed = false;
     xSemaphoreGive(g_flash.mutex);
@@ -2927,6 +2803,8 @@ void FlashButtonPressedNow()
         // [turn-lifecycle] This function is only reached after the 200ms hold
         // threshold, so it is a real PTT turn (short/double taps never get here).
         ResetFlashTurnAssemblyLocked();
+        g_flash.response_in_flight = false;
+        g_flash.response_started = false;
         g_flash.capture_started = true;
         g_flash.capture_base_seq = g_flash.uplink_seq.load(std::memory_order_relaxed);
         g_flash.pending_text = "正在录音...";
@@ -2934,20 +2812,12 @@ void FlashButtonPressedNow()
         MarkChanged();
         xSemaphoreGive(g_flash.mutex);
 
+        DrainPlaybackRingbuf();
+        if (!WaitForPlaybackReset()) {
+            RequestFlashTerminalStop(FlashTerminalReason::kPlaybackIncomplete);
+            return;
+        }
         if (need_barge_in) {
-            // Local side: drop everything still waiting in the ringbuffer so
-            // the speaker goes silent the instant the user lets go of PTT.
-            DrainPlaybackRingbuf();
-            SetStreamAudioAmp(false);
-            // [inflight-fix] Flush I2S TX DMA: disable+enable clears any residual
-            // TTS samples the DMA already fetched (DrainPlaybackRingbuf only
-            // clears the ringbuffer, not the DMA buffer). Mirrors xiaozhi
-            // ResetDecoder clearing audio_playback_queue.
-            if (g_flash.stream_tx != nullptr) {
-                wqn::services::ResetAudioTxChannel(
-                    g_flash_audio_session, g_flash.stream_tx,
-                    kStreamTxDmaBytes);
-            }
             // Remote side: ask the proxy to cancel the in-progress response.
             esp_websocket_client_handle_t cancel_client = nullptr;
             xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
@@ -3138,17 +3008,7 @@ void AbortFlashPlaybackNow()
     if (g_flash.mutex == nullptr) {
         return;
     }
-    // [barge-in] Local silence: drain queued PCM + flush I2S TX DMA + amp off.
-    // Mirrors the local half of OnFlashButtonPressed's barge-in (without
-    // starting a new turn). FlashPlaybackTask keeps running (idle, blocked on
-    // its ringbuf receive); it is NOT stopped here - that is session-level, in
-    // TearDownStreamChannels.
     DrainPlaybackRingbuf();
-    SetStreamAudioAmp(false);
-    if (g_flash.stream_tx != nullptr) {
-        wqn::services::ResetAudioTxChannel(
-            g_flash_audio_session, g_flash.stream_tx, kStreamTxDmaBytes);
-    }
     // Remote: ask the proxy to cancel the in-flight response so the server
     // stops sending more TTS audio. Without this, audio.delta frames already
     // in flight would refill the ringbuf and playback would resume.
@@ -3232,10 +3092,11 @@ void OnFlashButtonReleased(bool submit)
 void AbortFlashPlayback()
 {
     if (g_flash.mutex == nullptr) return;
+    DrainPlaybackRingbuf();
     xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
-    g_flash.playback_abort_requested = true;
     g_flash.playback_abort_pending = true;
-    g_flash.drain_playback.store(true, std::memory_order_release);
+    g_flash.response_in_flight = false;
+    g_flash.response_started = false;
     xSemaphoreGive(g_flash.mutex);
     xTaskNotifyGive(g_lifecycle_task);
 }

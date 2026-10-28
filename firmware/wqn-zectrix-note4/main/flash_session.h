@@ -36,15 +36,15 @@ esp_err_t InitFlashSession();
 esp_err_t StartFlashSession();
 esp_err_t StopFlashSession();
 bool CopyFlashStateToUi(FlashUiState* state);
-// Periodically called from the UI task; closes the audio amp after the configured
-// idle tail so long pauses between server audio deltas don't leave the speaker
-// enabled (pop/click at the next turn). Safe to call when flash is idle.
+// Compatibility UI poll. Amp maintenance runs on the playback owner task.
 void PollFlashAmpIdle();
+// UI calls publish one admitted press/release to the lifecycle owner; they
+// perform no synchronous network, audio, or drain operations.
 void OnFlashButtonPressed();
 void OnFlashButtonReleased(bool submit = true);  // [mistouch] submit=false discards the turn (short tap)
 
-// [barge-in] Stop Flash TTS playback immediately: drain the local playback
-// ringbuffer, flush the I2S TX DMA (silence the speaker), and ask the proxy to
+// [barge-in] Invalidate Flash TTS packets immediately; the playback owner drains
+// the ringbuffer and I2S DMA, and the lifecycle owner asks the proxy to
 // cancel the in-flight response so the server stops sending more audio. Called
 // by non-PTT button events so the user is not forced to listen to the whole
 // reply. PTT (Confirm hold) keeps its own barge-in in OnFlashButtonPressed
