@@ -213,20 +213,16 @@ esp_err_t SyncNotePacks(const std::string& token, NotePackSyncResult* out)
     out->result = LoadNotePackManifest(&local_manifest);
     if (out->result == ESP_ERR_NOT_FOUND) {
         had_local_manifest = false;
-        out->result = ResetNotePackStorageCache();
-        if (out->result == ESP_OK) {
-            local_manifest = {};
-        }
+        local_manifest = {};
+        out->result = ESP_OK;
     } else if (out->result != ESP_OK) {
+        // INVALID_RESPONSE is ambiguous with parser OOM. A failed load is
+        // not proof of incompatible content and cannot authorize deletion.
         ESP_LOGW(
             kTag,
-            "local note pack manifest is incompatible; reset cache: %s",
+            "local note pack manifest unavailable; preserve cache: %s",
             esp_err_to_name(out->result));
-        had_local_manifest = false;
-        out->result = ResetNotePackStorageCache();
-        if (out->result == ESP_OK) {
-            local_manifest = {};
-        }
+        out->message = "笔记清单读取失败，已保留本地内容";
     }
 
     // [snapshot-fix] Fetch and validate the complete offset-relisted snapshot

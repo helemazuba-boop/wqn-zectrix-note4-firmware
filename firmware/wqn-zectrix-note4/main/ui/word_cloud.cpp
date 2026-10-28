@@ -598,22 +598,18 @@ void ExecuteWordCloudRequest(const WordCloudRequest& request)
         bool manifest_content_changed = false;
         if (result.result == ESP_OK) {
             result.result = wqn::LoadWordPackManifest(&local_manifest);
-        }
-        if (result.result == ESP_ERR_NOT_FOUND) {
-            had_local_manifest = false;
-            result.result = wqn::ResetWordPackStorageCache();
-            if (result.result == ESP_OK) {
+            if (result.result == ESP_ERR_NOT_FOUND) {
+                had_local_manifest = false;
                 local_manifest = {};
-            }
-        } else if (result.result != ESP_OK && result.message.empty()) {
-            ESP_LOGW(
-                kTag,
-                "local word pack manifest is incompatible; reset cache: %s",
-                esp_err_to_name(result.result));
-            had_local_manifest = false;
-            result.result = wqn::ResetWordPackStorageCache();
-            if (result.result == ESP_OK) {
-                local_manifest = {};
+                result.result = ESP_OK;
+            } else if (result.result != ESP_OK) {
+                // Keep every file when a load cannot distinguish resource
+                // failure from corruption. Only confirmed absence starts at 0.
+                ESP_LOGW(
+                    kTag,
+                    "local word pack manifest unavailable; preserve cache: %s",
+                    esp_err_to_name(result.result));
+                result.message = "词库清单读取失败，已保留本地内容";
             }
         }
         constexpr size_t kMaxManifestPagesPerSync = 32;

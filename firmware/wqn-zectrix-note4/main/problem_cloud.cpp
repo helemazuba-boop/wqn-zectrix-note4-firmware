@@ -184,20 +184,15 @@ esp_err_t SyncProblemPacks(const std::string& token, ProblemPackSyncResult* out)
     out->result = LoadProblemPackManifest(&local_manifest);
     if (out->result == ESP_ERR_NOT_FOUND) {
         had_local_manifest = false;
-        out->result = ResetProblemPackStorageCache();
-        if (out->result == ESP_OK) {
-            local_manifest = {};
-        }
+        local_manifest = {};
+        out->result = ESP_OK;
     } else if (out->result != ESP_OK) {
         ESP_LOGW(
             kTag,
-            "local problem pack manifest is incompatible; reset cache: %s",
+            "local problem pack manifest unavailable; preserve cache: %s",
             esp_err_to_name(out->result));
-        had_local_manifest = false;
-        out->result = ResetProblemPackStorageCache();
-        if (out->result == ESP_OK) {
-            local_manifest = {};
-        }
+        // Parse failure may be resource exhaustion, not damaged data.
+        out->message = "错题清单读取失败，已保留本地内容";
     }
 
     // [snapshot-fix] Install nothing until the complete offset-relisted
