@@ -7,6 +7,7 @@
 
 #include "cJSON.h"
 #include "device_protocol/json_depth_guard.h"
+#include "device_protocol/json_build_helpers.h"
 #include "esp_check.h"
 
 namespace {
@@ -171,19 +172,22 @@ esp_err_t AddMetadata(cJSON* root, const v3::RequestMetadata& metadata)
         metadata.firmware_version.empty() || metadata.firmware_version.size() > 64) {
         return ESP_ERR_INVALID_ARG;
     }
-    cJSON* capabilities = cJSON_CreateArray();
+    if (cJSON_AddStringToObject(root, "request_id", metadata.request_id.c_str()) == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
+    if (cJSON_AddStringToObject(root, "boot_id", metadata.boot_id.c_str()) == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
+    if (cJSON_AddStringToObject(
+        root, "firmware_version", metadata.firmware_version.c_str()) == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
+    cJSON* capabilities = cJSON_AddArrayToObject(root, "capabilities");
     if (capabilities == nullptr) return ESP_ERR_NO_MEM;
-    cJSON_AddStringToObject(root, "request_id", metadata.request_id.c_str());
-    cJSON_AddStringToObject(root, "boot_id", metadata.boot_id.c_str());
-    cJSON_AddStringToObject(
-        root, "firmware_version", metadata.firmware_version.c_str());
-    cJSON_AddItemToObject(root, "capabilities", capabilities);
     const char* values[] = {
         "display.epd", "sync.v3", "note.study.v1", "ai.sse.v2", "flash.v2"};
     for (const char* value : values) {
-        cJSON* item = cJSON_CreateString(value);
-        if (item == nullptr) return ESP_ERR_NO_MEM;
-        cJSON_AddItemToArray(capabilities, item);
+        if (!AppendJsonString(capabilities, value)) return ESP_ERR_NO_MEM;
     }
     return ESP_OK;
 }
@@ -356,25 +360,30 @@ esp_err_t BuildCreateSessionRequest(
     JsonDocument document(cJSON_CreateObject());
     if (document.root() == nullptr) return ESP_ERR_NO_MEM;
     ESP_RETURN_ON_ERROR(AddMetadata(document.root(), request.metadata), "note_study", "metadata");
-    cJSON_AddStringToObject(document.root(), "domain", "note");
-    cJSON_AddStringToObject(document.root(), "mode", ModeName(request.mode));
-    cJSON* scope = cJSON_CreateObject();
-    cJSON* notebook_ids = cJSON_CreateArray();
-    if (scope == nullptr || notebook_ids == nullptr) {
-        cJSON_Delete(scope);
-        cJSON_Delete(notebook_ids);
+    if (cJSON_AddStringToObject(document.root(), "domain", "note") == nullptr) {
         return ESP_ERR_NO_MEM;
     }
-    cJSON_AddItemToObject(document.root(), "scope", scope);
-    cJSON_AddItemToObject(scope, "notebook_ids", notebook_ids);
+    if (cJSON_AddStringToObject(document.root(), "mode", ModeName(request.mode)) == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
+    cJSON* scope = cJSON_AddObjectToObject(document.root(), "scope");
+    if (scope == nullptr) return ESP_ERR_NO_MEM;
+    cJSON* notebook_ids = cJSON_AddArrayToObject(scope, "notebook_ids");
+    if (notebook_ids == nullptr) return ESP_ERR_NO_MEM;
     for (const std::string& id : request.scope.notebook_ids) {
         if (!IsUuid(id)) return ESP_ERR_INVALID_ARG;
-        cJSON_AddItemToArray(notebook_ids, cJSON_CreateString(id.c_str()));
+        if (!AppendJsonString(notebook_ids, id.c_str())) return ESP_ERR_NO_MEM;
     }
-    cJSON_AddBoolToObject(scope, "include_archived", request.scope.include_archived);
-    cJSON_AddNumberToObject(document.root(), "optional_count", request.optional_count);
+    if (cJSON_AddBoolToObject(scope, "include_archived", request.scope.include_archived) == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
+    if (cJSON_AddNumberToObject(document.root(), "optional_count", request.optional_count) == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
     if (!request.seed.empty()) {
-        cJSON_AddStringToObject(document.root(), "seed", request.seed.c_str());
+        if (cJSON_AddStringToObject(document.root(), "seed", request.seed.c_str()) == nullptr) {
+            return ESP_ERR_NO_MEM;
+        }
     }
     return Render(document.root(), body);
 }
@@ -391,14 +400,26 @@ esp_err_t BuildObservationRequest(
     JsonDocument document(cJSON_CreateObject());
     if (document.root() == nullptr) return ESP_ERR_NO_MEM;
     ESP_RETURN_ON_ERROR(AddMetadata(document.root(), request.metadata), "note_study", "metadata");
-    cJSON_AddStringToObject(document.root(), "session_id", request.session_id.c_str());
-    cJSON_AddNumberToObject(
-        document.root(), "sequence", static_cast<double>(request.sequence));
-    cJSON_AddStringToObject(document.root(), "item_id", request.item_id.c_str());
-    cJSON_AddStringToObject(
-        document.root(), "action", ObservationActionName(request.action));
-    cJSON_AddStringToObject(document.root(), "mode", ModeName(request.mode));
-    cJSON_AddStringToObject(document.root(), "occurred_at", request.occurred_at.c_str());
+    if (cJSON_AddStringToObject(document.root(), "session_id", request.session_id.c_str()) == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
+    if (cJSON_AddNumberToObject(
+        document.root(), "sequence", static_cast<double>(request.sequence)) == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
+    if (cJSON_AddStringToObject(document.root(), "item_id", request.item_id.c_str()) == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
+    if (cJSON_AddStringToObject(
+        document.root(), "action", ObservationActionName(request.action)) == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
+    if (cJSON_AddStringToObject(document.root(), "mode", ModeName(request.mode)) == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
+    if (cJSON_AddStringToObject(document.root(), "occurred_at", request.occurred_at.c_str()) == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
     return Render(document.root(), body);
 }
 
@@ -418,8 +439,12 @@ esp_err_t BuildCandidatePageRequest(
         AddMetadata(document.root(), request.metadata),
         "note_study",
         "candidate metadata");
-    cJSON_AddStringToObject(document.root(), "cursor", request.cursor.c_str());
-    cJSON_AddNumberToObject(document.root(), "limit", request.limit);
+    if (cJSON_AddStringToObject(document.root(), "cursor", request.cursor.c_str()) == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
+    if (cJSON_AddNumberToObject(document.root(), "limit", request.limit) == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
     return Render(document.root(), body);
 }
 
@@ -438,10 +463,16 @@ esp_err_t BuildManifestRequest(
     if (document.root() == nullptr) return ESP_ERR_NO_MEM;
     ESP_RETURN_ON_ERROR(AddMetadata(document.root(), metadata), "note_study", "metadata");
     const std::string cursor_text = std::to_string(cursor);
-    cJSON_AddStringToObject(document.root(), "cursor", cursor_text.c_str());
-    cJSON_AddNumberToObject(document.root(), "limit", limit);
+    if (cJSON_AddStringToObject(document.root(), "cursor", cursor_text.c_str()) == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
+    if (cJSON_AddNumberToObject(document.root(), "limit", limit) == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
     if (!snapshot_id.empty()) {
-        cJSON_AddStringToObject(document.root(), "snapshot_id", snapshot_id.c_str());
+        if (cJSON_AddStringToObject(document.root(), "snapshot_id", snapshot_id.c_str()) == nullptr) {
+            return ESP_ERR_NO_MEM;
+        }
     }
     return Render(document.root(), body);
 }

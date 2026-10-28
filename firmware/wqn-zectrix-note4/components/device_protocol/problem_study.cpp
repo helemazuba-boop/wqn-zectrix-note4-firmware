@@ -6,6 +6,7 @@
 
 #include "cJSON.h"
 #include "device_protocol/json_depth_guard.h"
+#include "device_protocol/json_build_helpers.h"
 #include "esp_check.h"
 
 namespace {
@@ -136,19 +137,22 @@ esp_err_t AddMetadata(cJSON* root, const v3::RequestMetadata& metadata)
         metadata.firmware_version.empty() || metadata.firmware_version.size() > 64) {
         return ESP_ERR_INVALID_ARG;
     }
-    cJSON* capabilities = cJSON_CreateArray();
+    if (cJSON_AddStringToObject(root, "request_id", metadata.request_id.c_str()) == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
+    if (cJSON_AddStringToObject(root, "boot_id", metadata.boot_id.c_str()) == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
+    if (cJSON_AddStringToObject(
+        root, "firmware_version", metadata.firmware_version.c_str()) == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
+    cJSON* capabilities = cJSON_AddArrayToObject(root, "capabilities");
     if (capabilities == nullptr) return ESP_ERR_NO_MEM;
-    cJSON_AddStringToObject(root, "request_id", metadata.request_id.c_str());
-    cJSON_AddStringToObject(root, "boot_id", metadata.boot_id.c_str());
-    cJSON_AddStringToObject(
-        root, "firmware_version", metadata.firmware_version.c_str());
-    cJSON_AddItemToObject(root, "capabilities", capabilities);
     const char* values[] = {
         "display.epd", "sync.v3", "problem.study.v1"};
     for (const char* value : values) {
-        cJSON* item = cJSON_CreateString(value);
-        if (item == nullptr) return ESP_ERR_NO_MEM;
-        cJSON_AddItemToArray(capabilities, item);
+        if (!AppendJsonString(capabilities, value)) return ESP_ERR_NO_MEM;
     }
     return ESP_OK;
 }
@@ -234,10 +238,16 @@ esp_err_t BuildManifestRequest(
     if (document.root() == nullptr) return ESP_ERR_NO_MEM;
     ESP_RETURN_ON_ERROR(AddMetadata(document.root(), metadata), "problem_study", "metadata");
     const std::string cursor_text = std::to_string(cursor);
-    cJSON_AddStringToObject(document.root(), "cursor", cursor_text.c_str());
-    cJSON_AddNumberToObject(document.root(), "limit", limit);
+    if (cJSON_AddStringToObject(document.root(), "cursor", cursor_text.c_str()) == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
+    if (cJSON_AddNumberToObject(document.root(), "limit", limit) == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
     if (!snapshot_id.empty()) {
-        cJSON_AddStringToObject(document.root(), "snapshot_id", snapshot_id.c_str());
+        if (cJSON_AddStringToObject(document.root(), "snapshot_id", snapshot_id.c_str()) == nullptr) {
+            return ESP_ERR_NO_MEM;
+        }
     }
     return Render(document.root(), body);
 }
@@ -253,10 +263,16 @@ esp_err_t BuildObservationRequest(
     JsonDocument document(cJSON_CreateObject());
     if (document.root() == nullptr) return ESP_ERR_NO_MEM;
     ESP_RETURN_ON_ERROR(AddMetadata(document.root(), request.metadata), "problem_study", "metadata");
-    cJSON_AddStringToObject(document.root(), "problem_id", request.problem_id.c_str());
-    cJSON_AddStringToObject(
-        document.root(), "action", ReviewActionName(request.action));
-    cJSON_AddStringToObject(document.root(), "occurred_at", request.occurred_at.c_str());
+    if (cJSON_AddStringToObject(document.root(), "problem_id", request.problem_id.c_str()) == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
+    if (cJSON_AddStringToObject(
+        document.root(), "action", ReviewActionName(request.action)) == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
+    if (cJSON_AddStringToObject(document.root(), "occurred_at", request.occurred_at.c_str()) == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
     return Render(document.root(), body);
 }
 

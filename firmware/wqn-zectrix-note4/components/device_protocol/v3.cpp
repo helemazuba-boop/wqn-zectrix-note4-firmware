@@ -7,6 +7,7 @@
 
 #include "cJSON.h"
 #include "device_protocol/json_depth_guard.h"
+#include "device_protocol/json_build_helpers.h"
 
 namespace {
 
@@ -76,19 +77,55 @@ esp_err_t AddRequestMetadata(
         metadata.boot_id.size() < 16 || metadata.firmware_version.empty()) {
         return ESP_ERR_INVALID_ARG;
     }
-    cJSON* capabilities = cJSON_CreateArray();
-    if (capabilities == nullptr) {
+    if (cJSON_AddStringToObject(root, "request_id", metadata.request_id.c_str()) == nullptr) {
         return ESP_ERR_NO_MEM;
     }
-    cJSON_AddStringToObject(root, "request_id", metadata.request_id.c_str());
-    cJSON_AddStringToObject(root, "boot_id", metadata.boot_id.c_str());
-    cJSON_AddStringToObject(root, "firmware_version", metadata.firmware_version.c_str());
-    cJSON_AddItemToObject(root, "capabilities", capabilities);
+    if (cJSON_AddStringToObject(root, "boot_id", metadata.boot_id.c_str()) == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
+    if (cJSON_AddStringToObject(root, "firmware_version", metadata.firmware_version.c_str()) == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
+    cJSON* capabilities = cJSON_AddArrayToObject(root, "capabilities");
+    if (capabilities == nullptr) return ESP_ERR_NO_MEM;
     const char* values[] = {
         "display.epd", "sync.v3", "content-sync.v1", "word.study.v1",
         "ai.sse.v2", "flash.v2"};
     for (const char* value : values) {
-        cJSON_AddItemToArray(capabilities, cJSON_CreateString(value));
+        if (!wqn::protocol::AppendJsonString(capabilities, value)) return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
+}
+
+esp_err_t FillRequest(
+    cJSON* root,
+    const wqn::protocol::v3::RequestMetadata& metadata,
+    bool include_limit)
+{
+    if (metadata.config_revision > wqn::protocol::v3::kMaxSafeJsonInteger ||
+        metadata.sync_cursor > wqn::protocol::v3::kMaxSafeJsonInteger) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    const esp_err_t metadata_result = AddRequestMetadata(root, metadata);
+    if (metadata_result != ESP_OK) {
+        return metadata_result;
+    }
+    if (cJSON_AddNumberToObject(
+        root,
+        "config_revision",
+        static_cast<double>(metadata.config_revision)) == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
+    if (cJSON_AddNumberToObject(
+        root,
+        "sync_cursor",
+        static_cast<double>(metadata.sync_cursor)) == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
+    if (include_limit) {
+        if (cJSON_AddNumberToObject(root, "limit", metadata.limit) == nullptr) {
+            return ESP_ERR_NO_MEM;
+        }
     }
     return ESP_OK;
 }
@@ -98,32 +135,11 @@ esp_err_t BuildRequest(
     bool include_limit,
     std::string* body)
 {
-    if (body == nullptr) {
-        return ESP_ERR_INVALID_ARG;
-    }
+    if (body == nullptr) return ESP_ERR_INVALID_ARG;
     JsonDocument document(cJSON_CreateObject());
-    if (document.root() == nullptr) {
-        return ESP_ERR_NO_MEM;
-    }
-    if (metadata.config_revision > wqn::protocol::v3::kMaxSafeJsonInteger ||
-        metadata.sync_cursor > wqn::protocol::v3::kMaxSafeJsonInteger) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    const esp_err_t metadata_result = AddRequestMetadata(document.root(), metadata);
-    if (metadata_result != ESP_OK) {
-        return metadata_result;
-    }
-    cJSON_AddNumberToObject(
-        document.root(),
-        "config_revision",
-        static_cast<double>(metadata.config_revision));
-    cJSON_AddNumberToObject(
-        document.root(),
-        "sync_cursor",
-        static_cast<double>(metadata.sync_cursor));
-    if (include_limit) {
-        cJSON_AddNumberToObject(document.root(), "limit", metadata.limit);
-    }
+    if (document.root() == nullptr) return ESP_ERR_NO_MEM;
+    const esp_err_t result = FillRequest(document.root(), metadata, include_limit);
+    if (result != ESP_OK) return result;
     return Render(document.root(), body);
 }
 
@@ -178,28 +194,30 @@ esp_err_t BuildSyncRequest(
     uint32_t auto_sync_interval_minutes,
     std::string* body)
 {
+    if (body == nullptr) return ESP_ERR_INVALID_ARG;
     if (auto_sync_interval_minutes != 0 && auto_sync_interval_minutes != 15 &&
         auto_sync_interval_minutes != 30 && auto_sync_interval_minutes != 60 &&
         auto_sync_interval_minutes != 240) {
         return ESP_ERR_INVALID_ARG;
     }
-    esp_err_t result = BuildRequest(metadata, true, body);
+    // Build once and publish only after the entire request has serialized.
+    // An intermediate render/parse exposed incomplete output on later OOM.
+    JsonDocument document(cJSON_CreateObject());
+    if (document.root() == nullptr) return ESP_ERR_NO_MEM;
+    const esp_err_t result = FillRequest(document.root(), metadata, true);
     if (result != ESP_OK) {
         return result;
     }
-    JsonDocument document(*body);
-    if (document.root() == nullptr) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    cJSON* configuration = cJSON_CreateObject();
+    cJSON* configuration = cJSON_AddObjectToObject(document.root(), "configuration");
     if (configuration == nullptr) {
         return ESP_ERR_NO_MEM;
     }
-    cJSON_AddNumberToObject(
+    if (cJSON_AddNumberToObject(
         configuration,
         "auto_sync_interval_minutes",
-        static_cast<double>(auto_sync_interval_minutes));
-    cJSON_AddItemToObject(document.root(), "configuration", configuration);
+        static_cast<double>(auto_sync_interval_minutes)) == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
     return Render(document.root(), body);
 }
 
@@ -221,9 +239,13 @@ esp_err_t BuildClaimStartRequest(
     if (metadata_result != ESP_OK) {
         return metadata_result;
     }
-    cJSON_AddStringToObject(document.root(), "hardware_id", hardware_id.c_str());
-    cJSON_AddStringToObject(
-        document.root(), "device_public_key", device_public_key.c_str());
+    if (cJSON_AddStringToObject(document.root(), "hardware_id", hardware_id.c_str()) == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
+    if (cJSON_AddStringToObject(
+        document.root(), "device_public_key", device_public_key.c_str()) == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
     return Render(document.root(), body);
 }
 
@@ -243,7 +265,9 @@ esp_err_t BuildClaimPollRequest(
     if (metadata_result != ESP_OK) {
         return metadata_result;
     }
-    cJSON_AddStringToObject(document.root(), "claim_id", claim_id.c_str());
+    if (cJSON_AddStringToObject(document.root(), "claim_id", claim_id.c_str()) == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
     return Render(document.root(), body);
 }
 
