@@ -1047,6 +1047,12 @@ static esp_err_t esp_websocket_client_recv(esp_websocket_client_handle_t client)
  return ESP_FAIL;
  }
  do {
+ // A peer may stop halfway through a frame. Never keep the receiver alive
+ // indefinitely on zero-byte reads after stop_wait_task requested shutdown.
+ if (xEventGroupGetBits(client->status_bits) & REQUESTED_STOP_BIT) {
+ esp_websocket_free_buf(client, false);
+ return ESP_FAIL;
+ }
  rlen = esp_transport_read(client->transport, client->rx_buffer, client->buffer_size, client->config->network_timeout_ms);
  if (rlen < 0) {
  esp_websocket_free_buf(client, false);
@@ -1064,6 +1070,12 @@ static esp_err_t esp_websocket_client_recv(esp_websocket_client_handle_t client)
  client->payload_len = esp_transport_ws_get_read_payload_len(client->transport);
  client->last_fin = esp_transport_ws_get_fin_flag(client->transport);
  client->last_opcode = esp_transport_ws_get_read_opcode(client->transport);
+
+ if (rlen == 0 && client->payload_offset < client->payload_len) {
+ ESP_LOGW(TAG, "Incomplete WebSocket frame: offset=%d payload=%d", client->payload_offset, client->payload_len);
+ esp_websocket_free_buf(client, false);
+ return ESP_FAIL;
+ }
 
  if (client->last_opcode == WS_TRANSPORT_OPCODES_PING &&
  client->payload_len > WEBSOCKET_CONTROL_PAYLOAD_MAX) {
