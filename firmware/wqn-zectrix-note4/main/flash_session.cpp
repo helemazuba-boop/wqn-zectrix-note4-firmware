@@ -217,6 +217,7 @@ enum class FlashTerminalReason : uint8_t {
     kServerError,
     kUplinkOverflow,
     kFinalUnconfirmed,
+    kPlaybackIncomplete,
 };
 
 StaticTask_t g_lifecycle_task_tcb;
@@ -273,6 +274,8 @@ StackType_t* EnsurePsramTaskStack(
 const char* FlashTerminalMessage(FlashTerminalReason reason)
 {
     switch (reason) {
+        case FlashTerminalReason::kPlaybackIncomplete:
+            return "播放中断，请查看本轮结果";
         case FlashTerminalReason::kDisconnected:
             return "连接断开";
         case FlashTerminalReason::kTransportError:
@@ -763,15 +766,24 @@ void CheckAmpIdleTail()
     xSemaphoreGive(g_flash.mutex);
 }
 
+// Retire exactly the bytes owned by one returned item. A concurrent producer
+// may publish another block: never overwrite that admission with store(0).
+void RetirePlaybackBytes(size_t bytes)
+{
+    size_t queued = g_flash.playback_queued_bytes.load(std::memory_order_acquire);
+    while (!g_flash.playback_queued_bytes.compare_exchange_weak(
+        queued, queued >= bytes ? queued - bytes : 0,
+        std::memory_order_acq_rel, std::memory_order_acquire)) {}
+}
+
 // [playback-fix] Decode PCM (mono s16le) into the playback ringbuffer.
 //
 // Called from two places:
 //   1. v1 WS event handler for `response.audio.delta` (base64 + mono audio).
 //   2. v2 WS event handler for binary downlink frames (post header parse).
 //
-// Returns true if the bytes were enqueued, false if the ringbuffer is full
-// and we had to drop the most recent bytes (preserving older audio so the
-// user still hears the leading edge of the response).
+// Never block the socket callback for space. Overflow ends the audio session
+// explicitly; it must not be reported as a complete spoken answer.
 bool EnqueuePlaybackPcm(const uint8_t* pcm, size_t bytes)
 {
     if (g_flash.playback_ringbuf == nullptr || pcm == nullptr || bytes == 0) {
@@ -781,18 +793,24 @@ bool EnqueuePlaybackPcm(const uint8_t* pcm, size_t bytes)
     if (aligned == 0) {
         return false;
     }
-    // No-blocking send; if there is no room we drop the *newest* chunk. Older
-    // queued audio plays through so the start of the response is preserved.
+    // Nonblocking admission; failure reports incomplete playback through the
+    // lifecycle owner instead of silently continuing with a missing chunk.
+    // Reserve accounting before making the block visible to the consumer.
+    g_flash.playback_queued_bytes.fetch_add(aligned, std::memory_order_release);
     const BaseType_t ok = xRingbufferSend(g_flash.playback_ringbuf,
                                           pcm, aligned, 0);
     if (ok != pdTRUE) {
+        RetirePlaybackBytes(aligned);
         g_flash.playback_dropped_bytes += aligned;
         ESP_LOGW(kTag, "playback ringbuf full, dropped %u B (total %u)",
                  static_cast<unsigned>(aligned),
                  static_cast<unsigned>(g_flash.playback_dropped_bytes));
+        RequestFlashTerminalStop(FlashTerminalReason::kPlaybackIncomplete);
         return false;
     }
-    g_flash.playback_queued_bytes.fetch_add(aligned, std::memory_order_relaxed);
+    xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
+    MarkChanged();
+    xSemaphoreGive(g_flash.mutex);
     return true;
 }
 
@@ -843,14 +861,15 @@ void FlashPlaybackTask(void* /*param*/)
             char* drain_item = nullptr;
             while ((drain_item = static_cast<char*>(xRingbufferReceive(
                            g_flash.playback_ringbuf, &drain_size, 0))) != nullptr) {
+                RetirePlaybackBytes(drain_size);
                 vRingbufferReturnItem(g_flash.playback_ringbuf, drain_item);
             }
-            g_flash.playback_queued_bytes.store(0, std::memory_order_release);
             g_flash.drain_playback.store(false, std::memory_order_relaxed);
             xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
             g_flash.playback_write_active = false;
             g_flash.playback_abort_requested = false;
             g_flash.amp_idle_armed = false;
+            MarkChanged();
             xSemaphoreGive(g_flash.mutex);
             continue;
         }
@@ -874,20 +893,22 @@ void FlashPlaybackTask(void* /*param*/)
             // it is returned.  Do that before receiving any more items: the
             // FreeRTOS ringbuffer does not permit a second receive while an
             // item is outstanding, and doing so can stall/corrupt the drain.
+            RetirePlaybackBytes(item_size);
             vRingbufferReturnItem(g_flash.playback_ringbuf, item);
             item = nullptr;
             size_t drain_size = 0;
             char* drain_item = nullptr;
             while ((drain_item = static_cast<char*>(xRingbufferReceive(
                            g_flash.playback_ringbuf, &drain_size, 0))) != nullptr) {
+                RetirePlaybackBytes(drain_size);
                 vRingbufferReturnItem(g_flash.playback_ringbuf, drain_item);
             }
-            g_flash.playback_queued_bytes.store(0, std::memory_order_release);
             g_flash.drain_playback.store(false, std::memory_order_relaxed);
             xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
             g_flash.playback_write_active = false;
             g_flash.playback_abort_requested = false;
             g_flash.amp_idle_armed = false;
+            MarkChanged();
             xSemaphoreGive(g_flash.mutex);
             continue;
         }
@@ -926,12 +947,15 @@ void FlashPlaybackTask(void* /*param*/)
                 g_flash.drain_playback.load(std::memory_order_acquire)) {
                 g_flash.playback_write_active = false;
                 g_flash.amp_idle_armed = false;
+                RetirePlaybackBytes(item_size);
+                MarkChanged();
                 xSemaphoreGive(g_flash.mutex);
                 vRingbufferReturnItem(g_flash.playback_ringbuf, item);
                 continue;
             }
             g_flash.playback_write_active = true;
             g_flash.amp_idle_armed = false;
+            MarkChanged();
             xSemaphoreGive(g_flash.mutex);
         }
         SetStreamAudioAmp(true);
@@ -983,14 +1007,8 @@ void FlashPlaybackTask(void* /*param*/)
                      static_cast<long long>(write_ms),
                      static_cast<unsigned>(total), esp_err_to_name(last_werr));
         }
+        RetirePlaybackBytes(item_size);
         vRingbufferReturnItem(g_flash.playback_ringbuf, item);
-
-        size_t queued = g_flash.playback_queued_bytes.load(std::memory_order_relaxed);
-        if (queued >= item_size) {
-            g_flash.playback_queued_bytes.fetch_sub(item_size, std::memory_order_release);
-        } else {
-            g_flash.playback_queued_bytes.store(0, std::memory_order_release);
-        }
 
         // Arm the PA deadline after this write. `i2s_channel_write` returns when
         // data is copied to DMA, so include this block's audio duration and the
@@ -999,6 +1017,13 @@ void FlashPlaybackTask(void* /*param*/)
         {
             xSemaphoreTake(g_flash.mutex, portMAX_DELAY);
             g_flash.playback_write_active = false;
+            const bool interrupted = g_flash.playback_abort_requested ||
+                g_flash.drain_playback.load(std::memory_order_acquire) ||
+                g_flash.playback_stop.load(std::memory_order_acquire);
+            if (total < total_bytes && !interrupted) {
+                RequestFlashTerminalStop(FlashTerminalReason::kPlaybackIncomplete);
+            }
+            MarkChanged();
             if (g_flash.playback_abort_requested) {
                 g_flash.playback_abort_requested = false;
                 g_flash.amp_idle_armed = false;
