@@ -14,6 +14,7 @@
 #include "stdpro_ws_transport.h"
 #include "voice_diagnostics.h"
 #include "device_protocol/json_depth_guard.h"
+#include "network_response_limits.h"
 
 @@TYPES@@
 
@@ -66,7 +67,7 @@ static void* g_ws_client = nullptr;
 static void* g_text_stream = &handle;
 static void* g_pcm_queue = &handle;
 static void* g_final_sem = &handle;
-static void* g_transport_task = &handle;
+[[maybe_unused]] static void* g_transport_task = &handle;
 constexpr int pdTRUE = 1, eSetBits = 1, kEvtBitResetRequired = 1;
 struct PcmBlock {};
 static std::string input;
@@ -82,7 +83,11 @@ static std::vector<Terminal> terminals;
 static std::vector<wqn::WqnAiSseEvent> events;
 static void esp_websocket_client_stop(void*) { ++stopped; }
 static void esp_websocket_client_destroy(void*) { ++destroyed; }
-static void PublishCompletion(uint32_t, esp_err_t, CmdDisposition) {}
+static int ready_completions = 0, failed_completions = 0;
+static void PublishCompletion(uint32_t, esp_err_t error, CmdDisposition) {
+    if (error == ESP_OK) ++ready_completions;
+    else ++failed_completions;
+}
 static void PublishTurnTerminalRecord(uint32_t gen, const char* request_id,
         wqn::stdpro_ws::TurnReleaseState release, wqn::stdpro_ws::TurnStreamObservation observation) {
     terminals.push_back({gen, request_id, release, observation});
@@ -106,12 +111,19 @@ static void Reset(TurnState state) {
     DoDestroyWs();
     CHECK(!g_sse_parser.overflowed());
     stopped = destroyed = signalled = notified = 0;
+    ready_completions = failed_completions = 0;
     events.clear(); terminals.clear(); input.clear(); offset = 0;
     g_ws_client = &handle; g_session_ready.store(true); g_is_connected.store(true);
     g_conn_state.store(ConnectionState::kReady); g_turn_state.store(state);
     g_active_turn_gen = 7; std::strcpy(g_active_turn_req_id, "req"); g_current_req_id = "req";
     g_active_turn_stream_obs = wqn::stdpro_ws::TurnStreamObservation::kNone;
     g_sse_callback = Callback;
+}
+static void ResetControl() {
+    Reset(TurnState::kIdle);
+    g_active_turn_gen = 0; g_active_turn_req_id[0] = '\0';
+    g_session_ready.store(false); g_conn_state.store(ConnectionState::kConnecting);
+    g_active_conn_op_gen = 11;
 }
 static void Feed(const std::string& text) { input = text; offset = 0; ProcessTextStream(); }
 int main() {
@@ -192,5 +204,29 @@ int main() {
     }
     CHECK(parser.overflowed()); parser.clear(); CHECK(parser.overflowed());
     parser.reset(); CHECK(!parser.overflowed());
+    constexpr size_t cap = wqn::network_limits::kMaxSessionControlBytes;
+    const std::string prefix = "{\"type\":\"session.ready\",\"padding\":\"";
+    const auto control = [&](size_t size) { return prefix + std::string(size - prefix.size() - 2, 'x') + "\"}"; };
+    for (size_t chunk : {size_t(1), size_t(17), size_t(512)}) {
+        packet_limit = chunk;
+        for (size_t size : {cap - 1, cap}) {
+            ResetControl(); Feed(control(size));
+            CHECK(g_session_ready.load() && ready_completions == 1 && destroyed == 0);
+            CHECK(g_control_reassembly_buf.empty());
+        }
+        for (const auto& bad : {control(cap + 1), std::string(cap * 8, 'x'), std::string(33, '[')}) {
+            ResetControl(); Feed(bad + control(64));
+            CHECK(!g_session_ready.load() && ready_completions == 0);
+            CHECK(stopped == 1 && destroyed == 1 && notified == 0 && failed_completions == 1);
+            CHECK(g_control_reassembly_buf.empty() && g_control_reassembly_buf.capacity() == std::string().capacity());
+            CHECK(offset == input.size()); // no buffered suffix survives fatal control loss
+            ResetControl(); Feed(control(64));
+            CHECK(g_session_ready.load() && ready_completions == 1 && destroyed == 0);
+        }
+        ResetControl(); Feed(std::string(cap, 'x'));
+        CHECK(!g_session_ready.load() && g_control_reassembly_buf.size() == cap && destroyed == 0);
+        Feed("x");
+        CHECK(destroyed == 1 && g_control_reassembly_buf.empty());
+    }
     std::printf("WS consumer/FINAL teardown: %d checks passed (host ports; not HIL)\n", checks);
 }

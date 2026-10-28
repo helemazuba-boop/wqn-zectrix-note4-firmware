@@ -16,6 +16,7 @@
 #include "audio_capture.h"
 #include "voice_idle_disconnect.h"
 #include "voice_diagnostics.h"
+#include "network_response_limits.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
@@ -345,7 +346,7 @@ void DoDestroyWs()
     g_conn_state.store(ConnectionState::kDisconnected, std::memory_order_release);
     g_is_connected.store(false, std::memory_order_release);
     g_session_ready.store(false, std::memory_order_release);
-    g_control_reassembly_buf.clear();
+    std::string().swap(g_control_reassembly_buf);
     g_sse_parser.reset();
 
     if (g_active_conn_op_gen != 0) {
@@ -553,14 +554,20 @@ void ProcessTextStream()
     while ((bytes_read = xStreamBufferReceive(g_text_stream, buf, sizeof(buf),
                                              0)) > 0) {
         if (!g_session_ready.load(std::memory_order_acquire)) {
+            constexpr size_t cap = wqn::network_limits::kMaxSessionControlBytes;
+            if (bytes_read > cap || g_control_reassembly_buf.size() > cap - bytes_read) {
+                ESP_LOGE(kTag, "session control JSON exceeded byte budget (%u bytes)",
+                         static_cast<unsigned>(cap));
+                TeardownFailedTurn();
+                return;
+            }
             g_control_reassembly_buf.append(buf, bytes_read);
             if (!wqn::protocol::JsonNestingWithinLimit(
                     g_control_reassembly_buf.data(),
                     g_control_reassembly_buf.size())) {
                 ESP_LOGE(kTag, "session control JSON nesting too deep");
-                g_control_reassembly_buf.clear();
-                xTaskNotify(g_transport_task, kEvtBitResetRequired, eSetBits);
-                continue;
+                TeardownFailedTurn();
+                return;
             }
             cJSON* root = cJSON_ParseWithLength(
                 g_control_reassembly_buf.data(),
@@ -590,7 +597,7 @@ void ProcessTextStream()
                     }
                 }
                 cJSON_Delete(root);
-                g_control_reassembly_buf.clear();
+                std::string().swap(g_control_reassembly_buf);
             }
             continue;
         }

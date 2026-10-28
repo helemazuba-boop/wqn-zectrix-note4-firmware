@@ -30,6 +30,7 @@
 #include "freertos/task.h"
 #include "mbedtls/sha256.h"
 #include "miniz.h"
+#include "network_response_limits.h"
 #include "services/connectivity_service.h"
 #include "runtime/wall_clock.h"
 #include "storage.h"
@@ -367,7 +368,8 @@ esp_err_t HttpRequest(
         return ESP_ERR_INVALID_ARG;
     }
 
-    response_body->clear();
+    std::string().swap(*response_body);
+    *status_code = 0;
     const bool is_post = std::strcmp(method, "POST") == 0;
     const std::string empty_post_body = "{}";
     const std::string& post_body = request_body != nullptr ? *request_body : empty_post_body;
@@ -420,8 +422,15 @@ esp_err_t HttpRequest(
         }
     }
 
-    const int content_length = esp_http_client_fetch_headers(client);
+    const int64_t content_length = esp_http_client_fetch_headers(client);
     *status_code = esp_http_client_get_status_code(client);
+    if (content_length > static_cast<int64_t>(wqn::network_limits::kMaxBufferedJsonBytes)) {
+        ESP_LOGW(kTag, "HTTP JSON response exceeds byte budget (%u bytes)",
+                 static_cast<unsigned>(wqn::network_limits::kMaxBufferedJsonBytes));
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        return ESP_ERR_INVALID_SIZE;
+    }
     if (content_length < 0) {
         ESP_LOGW(kTag, "HTTP response has unknown content length");
     }
@@ -444,7 +453,15 @@ esp_err_t HttpRequest(
         if (read == 0) {
             break;
         }
-        response_body->append(buffer.data(), read);
+        const size_t bytes = static_cast<size_t>(read);
+        constexpr size_t cap = wqn::network_limits::kMaxBufferedJsonBytes;
+        if (bytes > cap || response_body->size() > cap - bytes) {
+            ESP_LOGW(kTag, "HTTP JSON response exceeded cumulative byte budget (%u bytes)",
+                     static_cast<unsigned>(cap));
+            result = ESP_ERR_INVALID_SIZE;
+            break;
+        }
+        response_body->append(buffer.data(), bytes);
         if (esp_timer_get_time() >= read_deadline_us) {
             ESP_LOGW(kTag, "HTTP read exceeded overall deadline (%d ms x3)", timeout_ms);
             result = ESP_ERR_TIMEOUT;
@@ -454,6 +471,11 @@ esp_err_t HttpRequest(
 
     esp_http_client_close(client);
     esp_http_client_cleanup(client);
+    if (result != ESP_OK) {
+        // A truncated prefix is not a response. Release its allocation before
+        // returning the failure so callers cannot parse or retain it.
+        std::string().swap(*response_body);
+    }
     return result;
 }
 

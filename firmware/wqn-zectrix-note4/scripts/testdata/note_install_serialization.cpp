@@ -17,6 +17,7 @@ std::function<void()> interleave;
 Stage trigger = Stage::kNone, fail_stage = Stage::kNone;
 size_t calls = 0, checks = 0, failures = 0;
 bool missing = false;
+esp_err_t fetch_error = ESP_FAIL;
 
 void Check(bool ok, const char* message)
 {
@@ -64,6 +65,7 @@ void Reset()
     interleave = {};
     trigger = fail_stage = Stage::kNone;
     missing = false;
+    fetch_error = ESP_FAIL;
     calls = 0;
 }
 
@@ -94,7 +96,7 @@ esp_err_t FetchNoteStudyManifest(const std::string&, const protocol::v3::Request
                                uint64_t, Manifest* out, const std::string&, protocol::v3::Error*)
 {
     Boundary(Stage::kFetch);
-    if (fail_stage == Stage::kFetch) return ESP_FAIL;
+    if (fail_stage == Stage::kFetch) return fetch_error;
     *out = remote;
     return ESP_OK;
 }
@@ -193,6 +195,13 @@ int main()
     Check(wqn::SyncNotePacks("", &out) == ESP_ERR_INVALID_STATE && out.auth_required, "invalid token does not acquire the gate");
     Check(wqn::SyncNotePacks("synthetic-token", nullptr) == ESP_ERR_INVALID_ARG, "null output rejected");
     Check(Install(false, &out) == ESP_OK, "invalid arguments cannot leave gate claimed");
+    Reset();
+    fail_stage = Stage::kFetch;
+    fetch_error = ESP_ERR_INVALID_SIZE;
+    Check(Install(true, &out) == ESP_ERR_INVALID_SIZE && !out.index_ready && !out.content_changed,
+          "oversize remote response cannot publish a partial index");
+    Check(stored.notebooks[0].content_revision == 0 && files.count(stored.notebooks[0].sha256) == 1,
+          "remote size rejection preserves installed manifest and pack");
     std::printf("%zu checks, %zu failures (real Note orchestration; host network/storage ports; NOT HIL)\n", checks, failures);
     return failures == 0 ? 0 : 1;
 }
