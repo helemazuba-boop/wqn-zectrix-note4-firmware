@@ -52,7 +52,7 @@ python3 -m venv --system-site-packages /tmp/wqn-robustness-schema-venv
   --cloud-root /home/unknow/projects/.worktrees/WQN-robustness-20261029
 /tmp/wqn-robustness-schema-venv/bin/python scripts/test_problem_request_contract.py \
   --before 5482509
-python3 scripts/test_protocol_request_oom.py --validate-schema
+/tmp/wqn-robustness-schema-venv/bin/python scripts/test_protocol_request_oom.py --validate-schema
 source /home/unknow/esp/esp-idf-v5.5/export.sh
 idf.py -B build-wsl build
 ```

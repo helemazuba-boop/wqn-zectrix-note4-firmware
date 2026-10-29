@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Fault every cJSON allocation in 14 production request builders. No device/network I/O.
 
-Requires C/C++ compilers, the project ESP-IDF cJSON, and, for --validate-schema, Python jsonschema.
+Requires C/C++ compilers, the project ESP-IDF cJSON, and, for --validate-schema,
+Python jsonschema plus rfc3339-validator. Schema validation also covers Word's
+canonical wire fixtures; candidate-order.json is an ordering algorithm input.
 --source-root can target an immutable older checkout with the same interfaces.
 """
 import argparse
@@ -12,6 +14,45 @@ from pathlib import Path
 import subprocess
 import tempfile
 
+
+def validate_word_fixtures(source, schema, checker):
+    from jsonschema.validators import validator_for
+    fixtures = source/'contracts/word-study-v1/fixtures'
+    definitions = {
+        'session-request.json': 'createSessionRequest',
+        'session-request-review.json': 'createSessionRequest',
+        'session-request-intake.json': 'createSessionRequest',
+        'session-request-sequential-cursor.json': 'createSessionRequest',
+        'session-response.json': 'createSessionResponse',
+        'candidate-page-request.json': 'candidatePageRequest',
+        'candidate-page-response.json': 'candidatePageResponse',
+        'observation-request.json': 'observationRequest',
+        'observation-response.json': 'observationResponse',
+        'skip-request.json': 'skipObservationRequest',
+        'skip-response.json': 'skipObservationResponse',
+        'manifest-request.json': 'manifestRequest',
+        'manifest-response.json': 'manifestResponse',
+    }
+    actual = {p.name for p in (fixtures/'valid').glob('*.json')}
+    if actual != set(definitions) | {'candidate-order.json'}:
+        raise SystemExit('FAIL: Word fixture inventory changed; classify every wire fixture explicitly')
+    cases = [(name, definition, True, fixtures/'valid'/name) for name, definition in definitions.items()]
+    cases.append(('unsafe-sequence.json', 'observationRequest', False, fixtures/'invalid/unsafe-sequence.json'))
+    root_validator = validator_for(schema)(schema, format_checker=checker)
+    failures = 0
+    for name, definition, expected, path in cases:
+        selected = dict(schema, **{'$ref': f'#/$defs/{definition}'})
+        selected.pop('oneOf', None)
+        validator = validator_for(selected)(selected, format_checker=checker)
+        payload = json.loads(path.read_text())
+        for label, current in (('definition', validator), ('root', root_validator)):
+            if current.is_valid(payload) != expected:
+                failures += 1
+                print(f'FAIL Word fixture {name} ({label}): expected valid={expected}', flush=True)
+    print(f'Word canonical wire fixtures: {len(cases)} cases, {2*len(cases)} checks, {failures} failures', flush=True)
+    return failures
+
+
 def main():
     root = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(description=__doc__)
@@ -19,8 +60,19 @@ def main():
     parser.add_argument('--normal-json', type=Path, help='write successful JSON requests')
     parser.add_argument('--normal-only', action='store_true', help='skip injected failures')
     parser.add_argument('--validate-schema', action='store_true', help='also validate against pinned schemas')
+    parser.add_argument('--cloud-root', type=Path, help='also verify mirrored Word JSON artifacts in this WQN worktree')
     args = parser.parse_args()
     source = args.source_root.resolve()
+    if args.cloud_root:
+        contract = source/'contracts/word-study-v1'
+        other = args.cloud_root/'web/contracts/word-study-v1'
+        paths = sorted(p.relative_to(contract) for p in contract.rglob('*.json'))
+        if paths != sorted(p.relative_to(other) for p in other.rglob('*.json')):
+            raise SystemExit('FAIL: mirrored Word JSON file inventory drift')
+        for path in paths:
+            if (contract/path).read_bytes() != (other/path).read_bytes():
+                raise SystemExit('FAIL: mirrored Word artifact byte drift: '+str(path))
+        print(f'{len(paths)} Word JSON artifacts are byte-identical across repositories', flush=True)
     cjson = Path(os.environ.get('IDF_PATH', '/home/unknow/esp/esp-idf-v5.5')) / 'components/json/cJSON'
     component = source / 'components/device_protocol'
     schemas = {}
@@ -61,17 +113,22 @@ def main():
         if args.validate_schema:
             from jsonschema import FormatChecker
             from jsonschema.validators import validator_for
+            checker = FormatChecker()
+            if 'date-time' not in checker.checkers:
+                raise SystemExit('FAIL: date-time checker unavailable; install rfc3339-validator')
             failed = 0
             for row in rows:
                 schema = dict(schemas[row['schema']], **{'$ref': f"#/$defs/{row['definition']}"})
                 schema.pop('oneOf', None)
                 schema.pop('anyOf', None)
-                errors = list(validator_for(schema)(schema, format_checker=FormatChecker()).iter_errors(row['payload']))
+                errors = list(validator_for(schema)(schema, format_checker=checker).iter_errors(row['payload']))
                 if errors:
                     failed += 1
                     print(f"FAIL schema {row['name']}: {errors[0].message}", flush=True)
             print(f'{len(rows) - failed}/{len(rows)} requests passed pinned JSON Schema validation', flush=True)
             if failed:
+                return 1
+            if validate_word_fixtures(source, schemas['word-study-v1'], checker):
                 return 1
         if args.normal_only:
             return 0
