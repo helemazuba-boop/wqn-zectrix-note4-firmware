@@ -10,6 +10,10 @@
 #include <vector>
 
 #include "cJSON.h"
+#include "turn_release_deadline.h"
+
+bool g_active_turn_asr_only=false;
+wqn::stdpro_ws::TurnReleaseDeadline g_turn_release_deadline;
 
 using esp_err_t = int;
 constexpr int ESP_OK=0, ESP_FAIL=-1, ESP_ERR_NO_MEM=257, ESP_ERR_INVALID_ARG=258;

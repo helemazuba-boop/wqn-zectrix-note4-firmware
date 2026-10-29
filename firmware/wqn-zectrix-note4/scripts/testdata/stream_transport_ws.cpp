@@ -15,6 +15,10 @@
 #include "voice_diagnostics.h"
 #include "device_protocol/json_depth_guard.h"
 #include "network_response_limits.h"
+#include "turn_release_deadline.h"
+
+bool g_active_turn_asr_only = false;
+wqn::stdpro_ws::TurnReleaseDeadline g_turn_release_deadline;
 
 @@TYPES@@
 

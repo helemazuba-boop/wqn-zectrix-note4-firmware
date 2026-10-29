@@ -89,7 +89,7 @@ def main():
         binary = tmp/'test'
         subprocess.run(['g++', '-std=c++17', '-Wall', '-Wextra', '-Werror',
                         '-fsanitize=address,undefined', '-fno-sanitize-recover=all',
-                        '-fno-omit-frame-pointer', '-I'+str(cjson),
+                        '-fno-omit-frame-pointer', '-I'+str(cjson), '-I'+str(root/'main'),
                         str(tmp/'test.cpp'), str(cjson/'cJSON.c'), '-o', str(binary)],
                        check=True, timeout=60)
         env = dict(os.environ, ASAN_OPTIONS='detect_leaks=1:halt_on_error=1',

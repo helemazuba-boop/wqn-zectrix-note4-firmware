@@ -17,6 +17,7 @@
 #include "voice_idle_disconnect.h"
 #include "voice_diagnostics.h"
 #include "network_response_limits.h"
+#include "turn_release_deadline.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
@@ -212,6 +213,8 @@ int64_t g_conn_deadline_ms = 0;
 
 uint32_t g_active_turn_gen = 0;
 char g_active_turn_req_id[64] = {};
+bool g_active_turn_asr_only = false;
+wqn::stdpro_ws::TurnReleaseDeadline g_turn_release_deadline;
 wqn::stdpro_ws::TurnStreamObservation g_active_turn_stream_obs =
     wqn::stdpro_ws::TurnStreamObservation::kNone;
 
@@ -339,6 +342,8 @@ void DumpResourceLedger(const char* stage);
 
 void DoDestroyWs()
 {
+    g_turn_release_deadline.Reset();
+    g_active_turn_asr_only = false;
     bool destroyed = false;
     if (g_ws_client != nullptr) {
         esp_websocket_client_stop(g_ws_client);
@@ -674,6 +679,21 @@ void ProcessTextStream()
                     g_sse_callback(ev, g_sse_user_ctx);
                 }
 
+                const bool asr_terminal = g_active_turn_asr_only &&
+                    (ev.kind == wqn::WqnAiSseEvent::Kind::kAsrComplete ||
+                     ev.kind == wqn::WqnAiSseEvent::Kind::kAsrFailed ||
+                     ev.kind == wqn::WqnAiSseEvent::Kind::kError);
+                if (state == TurnState::kRemoteHandoff && g_active_turn_gen != 0 &&
+                    (asr_terminal || ev.kind == wqn::WqnAiSseEvent::Kind::kTurnDone) &&
+                    (ev.request_id.empty() || ev.request_id == g_active_turn_req_id)) {
+                    // Legacy business frames omit request_id. They belong to
+                    // this owner's active handoff; store its full identity so
+                    // no later turn can inherit a stale timeout.
+                    g_turn_release_deadline.Arm(g_active_turn_gen, g_active_turn_req_id,
+                        esp_timer_get_time() / 1000,
+                        wqn::stdpro_ws::TurnReleaseDeadline::kResultGraceMs);
+                }
+
                 // Transport-level release ONLY occurs on matching turn.released in RemoteHandoff
                 if (ev_name == "turn.released") {
                     if (g_active_turn_gen != 0 && !ev.request_id.empty() &&
@@ -688,6 +708,8 @@ void ProcessTextStream()
                             wqn::stdpro_ws::TurnReleaseState::kReleased,
                             g_active_turn_stream_obs);
                         g_active_turn_gen = 0;
+                        g_turn_release_deadline.Reset();
+                        g_active_turn_asr_only = false;
                         g_active_turn_req_id[0] = '\0';
                         g_active_turn_stream_obs =
                             wqn::stdpro_ws::TurnStreamObservation::kNone;
@@ -886,6 +908,8 @@ void ExecuteCtrlCmdSingleStep(const CtrlCmd& cmd)
 
             // ATOMIC COMMIT UPON EXACT FULL SEND CONFIRMATION:
             g_current_req_id = cmd.request_id;
+            g_turn_release_deadline.Reset();
+            g_active_turn_asr_only = std::strcmp(cmd.tier, "agent") == 0;
             g_active_turn_gen = ++g_turn_gen;
             std::strncpy(g_active_turn_req_id, cmd.request_id,
                          sizeof(g_active_turn_req_id) - 1);
@@ -1079,6 +1103,14 @@ void VoiceWsTransportTask(void*)
             PublishCompletion(expired_gen, ESP_ERR_TIMEOUT, CmdDisposition::kExpired);
         }
 
+        if (g_turn_state.load(std::memory_order_acquire) == TurnState::kRemoteHandoff &&
+            g_turn_release_deadline.Expired(g_active_turn_gen, g_active_turn_req_id, now_ms)) {
+            LogWsPhase("release_deadline", g_active_turn_req_id, g_active_turn_gen, ESP_ERR_TIMEOUT);
+            // Local ownership ends with an unknown remote release outcome.
+            // Never issue a second FINAL, HTTP request, or remote abort here.
+            TeardownFailedTurn(TeardownReason::kLocalDisconnect);
+        }
+
         // Single PCM / FINAL frame step: process at most ONE block per root loop iteration
         TryIdleDisconnect();
         if (g_turn_state.load(std::memory_order_acquire) == TurnState::kRecording &&
@@ -1103,6 +1135,11 @@ void VoiceWsTransportTask(void*)
                                  static_cast<unsigned long>(block.seq));
                         g_turn_state.store(TurnState::kRemoteHandoff,
                                            std::memory_order_release);
+                        if (g_active_turn_asr_only) {
+                            g_turn_release_deadline.Arm(g_active_turn_gen, g_active_turn_req_id,
+                                esp_timer_get_time() / 1000,
+                                wqn::stdpro_ws::TurnReleaseDeadline::kMaxAsrHandoffMs);
+                        }
                         g_final_result =
                             wqn::stdpro_ws::FinalHandoffResult::kFinalSent;
                         if (g_final_sem != nullptr) {

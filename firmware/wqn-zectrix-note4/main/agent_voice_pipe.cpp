@@ -304,8 +304,9 @@ esp_err_t AgentVoiceTurnFinalize(int duration_ms, uint32_t timeout_ms,
     esp_err_t result = ESP_OK;
     if (cancelled) {
         // Soft cancel: the caller discards. The turn is left to finish on the
-        // transport's own time -- turn.released resets it to kIdle there, so a
-        // prompt re-record only pays the batch fallback, never a wedge.
+        // transport's own time. Matching release returns it to Idle; the
+        // ASR-only owner deadline also bounds a missing result/release. Until
+        // then a prompt re-record follows the existing start/fallback policy.
         ESP_LOGI(kTag, "turn cancelled before a result; discarding");
     } else if (complete) {
         xSemaphoreTake(g_lock, portMAX_DELAY);
