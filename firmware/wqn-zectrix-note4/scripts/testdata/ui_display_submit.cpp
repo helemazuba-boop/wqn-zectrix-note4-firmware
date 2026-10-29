@@ -5,6 +5,10 @@
 #include <cstdio>
 #include <string>
 #include <vector>
+#include "ui/display_recovery.h"
+
+device_ui_internal::DisplayRecoveryPolicy g_display_recovery;
+int64_t esp_timer_get_time() { return 100000; }
 
 using TickType_t = uint32_t;
 constexpr int portMAX_DELAY = -1;

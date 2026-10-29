@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "esp_err.h"
+#include "display_recovery.h"
 #include "esp_check.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -72,6 +73,8 @@ TickType_t RefreshDelay(RefreshSchedule schedule);
 bool TickReached(TickType_t now, TickType_t due);
 TickType_t TicksUntil(TickType_t now, TickType_t due);
 RefreshSchedule StrongerSchedule(RefreshSchedule a, RefreshSchedule b);
+DisplayRecoveryStatus CopyDisplayRecoveryStatus();
+bool RequestDisplayRecovery(int64_t input_at_ms);
 
 // ---- Shared types -----------------------------------------------------------
 

@@ -33,7 +33,7 @@ def main():
         unit, binary = Path(directory) / 'submit.cpp', Path(directory) / 'submit'
         unit.write_text(fixture, encoding='utf-8')
         subprocess.run([compiler, '-std=c++17', '-Wall', '-Wextra', '-Werror',
-                        str(unit), '-o', str(binary)], check=True, timeout=30)
+                        '-I'+str(root/'main'), str(unit), '-o', str(binary)], check=True, timeout=30)
         return subprocess.run([str(binary)], timeout=10).returncode
 
 

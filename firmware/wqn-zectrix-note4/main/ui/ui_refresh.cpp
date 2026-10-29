@@ -16,6 +16,7 @@
 #include "esp_log.h"
 #include "esp_task_wdt.h"
 #include "esp_timer.h"
+#include "error_recorder.h"
 #include "runtime/sleep_coordinator.h"
 
 namespace device_ui_internal {
@@ -167,6 +168,8 @@ using wqn::display::DisplayResult;
 using wqn::display::DisplayRevision;
 using wqn::display::DisplayStatus;
 using wqn::display::WaveformRequirement;
+
+DisplayRecoveryPolicy g_display_recovery;
 
 void MaybeReleaseDisplayLeaseLocked()
 {
@@ -950,6 +953,12 @@ wqn::display::DisplaySubmission RequestEpdUiRefresh(
     TickType_t due_tick = now + RefreshDelay(schedule);
 
     xSemaphoreTake(g_refresh_mutex, portMAX_DELAY);
+    if (!g_display_recovery.status().CanQueue(esp_timer_get_time() / 1000)) {
+        xSemaphoreGive(g_refresh_mutex);
+        return submission;
+    }
+    const bool recovering = g_display_recovery.status().RequiresFull();
+    if (recovering) waveform = WaveformRequirement::kFull;
     if (HasOutstandingRevisionLocked(revision)) {
         xSemaphoreGive(g_refresh_mutex);
         ESP_LOGE(kTag, "RequestEpdUiRefresh rejected: duplicate revision=%llu",
@@ -977,7 +986,7 @@ wqn::display::DisplaySubmission RequestEpdUiRefresh(
     // [ui-stack] A UiFrame is >4 KiB. Merge only the scalar safety policy;
     // copy pixels/state directly into the existing slot after supersession
     // succeeds, under the same mutex. Failed supersession leaves slots intact.
-    bool merged_prefer_full_refresh = frame.prefer_full_refresh;
+    bool merged_prefer_full_refresh = frame.prefer_full_refresh || recovering;
     wqn::display::DisplayIntent merged_intent =
         NewDisplayIntent(revision, schedule, due_tick, waveform);
 
@@ -1097,6 +1106,28 @@ void AcknowledgeDisplayResult(wqn::display::DisplayRevision revision)
 }
 
 // ---- Consumer-side: EPD render task -----------------------------------------
+
+DisplayRecoveryStatus CopyDisplayRecoveryStatus()
+{
+    if (g_refresh_mutex == nullptr) return {};
+    xSemaphoreTake(g_refresh_mutex, portMAX_DELAY);
+    const auto status = g_display_recovery.status();
+    xSemaphoreGive(g_refresh_mutex);
+    return status;
+}
+
+bool RequestDisplayRecovery(int64_t input_at_ms)
+{
+    if (g_refresh_mutex == nullptr || g_refresh_task == nullptr) return false;
+    xSemaphoreTake(g_refresh_mutex, portMAX_DELAY);
+    const bool requested = g_display_recovery.RequestProbe(input_at_ms, esp_timer_get_time() / 1000);
+    xSemaphoreGive(g_refresh_mutex);
+    if (requested) {
+        ESP_LOGI(kTag, "display recovery probe requested by fresh key press");
+        xTaskNotifyGive(g_refresh_task);
+    }
+    return requested;
+}
 
 // [epd-owner] Run only from the owner's idle command point. Revalidate the
 // sampled activity generation and frame queue before touching the panel.
@@ -1263,10 +1294,23 @@ void EpdRefreshTask(void*)
         const wqn::UiFrame& frame = g_pending_frames[consume_idx];
 
         esp_err_t render_result = ESP_OK;
+        xSemaphoreTake(g_refresh_mutex, portMAX_DELAY);
+        const bool recovering = g_display_recovery.status().RequiresFull();
+        const bool permitted = g_display_recovery.TryBegin(esp_timer_get_time() / 1000);
+        xSemaphoreGive(g_refresh_mutex);
+        if (recovering) {
+            // Also upgrade a secondary intent accepted before the failure.
+            local_intent.waveform = wqn::display::WaveformRequirement::kFull;
+            schedule = RefreshSchedule::kCommit;
+        }
         const bool can_deduplicate =
             local_sig == displayed_signature &&
             local_intent.waveform != wqn::display::WaveformRequirement::kFull;
-        if (!can_deduplicate) {
+        if (!permitted) {
+            // Accepted work still receives its terminal/ACK. Backoff must not
+            // park a queued frame/lease or delay the owner's sleep-prep loop.
+            render_result = ESP_ERR_INVALID_STATE;
+        } else if (!can_deduplicate) {
             const int64_t refresh_start_us = esp_timer_get_time();
 #if CONFIG_ESP_TASK_WDT_EN
             const bool wdt_subscribed =
@@ -1308,6 +1352,11 @@ void EpdRefreshTask(void*)
         terminal_result.revision = local_intent.revision;
         terminal_result.error = render_result;
         xSemaphoreTake(g_refresh_mutex, portMAX_DELAY);
+        if (permitted) {
+            if (render_result == ESP_OK) g_display_recovery.Presented();
+            else g_display_recovery.Failed(esp_timer_get_time() / 1000);
+        }
+        const auto recovery_status = g_display_recovery.status();
         if (render_result == ESP_OK) {
             g_last_presented_revision = local_intent.revision;
             terminal_result.status = wqn::display::DisplayStatus::kPresented;
@@ -1316,6 +1365,17 @@ void EpdRefreshTask(void*)
         }
         terminal_result.presented_revision = g_last_presented_revision;
         xSemaphoreGive(g_refresh_mutex);
+        if (permitted && render_result != ESP_OK) {
+            ESP_LOGW(kTag, "display recovery: failures=%u paused=%d retry_at_ms=%lld",
+                     static_cast<unsigned>(recovery_status.consecutive_failures),
+                     recovery_status.paused ? 1 : 0,
+                     static_cast<long long>(recovery_status.retry_at_ms));
+            if (recovery_status.paused) {
+                wqn::RecordError("display", "paused after %u failures (%s); fresh key retries once",
+                                 static_cast<unsigned>(recovery_status.consecutive_failures),
+                                 esp_err_to_name(render_result));
+            }
+        }
         // A result slot was reserved when the intent was accepted. Wait a
         // bounded time for the UI to drain the queue; if it never does (UI
         // task wedged in storage I/O or worse), drop the result and release

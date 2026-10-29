@@ -474,6 +474,43 @@ wqn::display::WaveformRequirement RequestedWaveform(
     return wqn::display::WaveformRequirement::kAuto;
 }
 
+void MaybeRecoverDisplayForButton(
+    const wqn::ButtonEvent& event,
+    device_ui_internal::UiRuntime* runtime,
+    DisplayTrackingState* tracking,
+    RefreshSchedule* schedule)
+{
+    if (event.type != wqn::ButtonEventType::kPress || event.repeat ||
+        !device_ui_internal::RequestDisplayRecovery(event.occurred_at_ms)) return;
+    const auto update = runtime->DispatchDisplayRecovery();
+    *schedule = StrongerSchedule(*schedule, update.refresh);
+    tracking->force_next_submission = true;
+}
+
+void ApplyDisplayRecoveryGate(
+    device_ui_internal::UiRuntime* runtime,
+    DisplayTrackingState* tracking,
+    RefreshSchedule* schedule)
+{
+    if (!device_ui_internal::CopyDisplayRecoveryStatus().CanQueue(esp_timer_get_time() / 1000)) {
+        if (*schedule != RefreshSchedule::kNone) tracking->force_next_submission = true;
+        *schedule = RefreshSchedule::kNone;
+    } else if (tracking->force_next_submission && *schedule == RefreshSchedule::kNone) {
+        // A completed manual probe can reopen a display whose latest state
+        // changed while submissions were paused. Use fresh pixels/revision.
+        *schedule = runtime->DispatchDisplayRecovery().refresh;
+    }
+}
+
+TickType_t DisplayRecoveryPollDelay(const DisplayTrackingState& tracking, TickType_t fallback)
+{
+    const auto recovery = device_ui_internal::CopyDisplayRecoveryStatus();
+    if (tracking.force_next_submission && recovery.HasPendingRetry()) {
+        return std::min(fallback, DelayMsToTicks(recovery.retry_at_ms - esp_timer_get_time() / 1000));
+    }
+    return fallback;
+}
+
 void DrainDisplayResults(
     device_ui_internal::UiRuntime* runtime,
     DisplayTrackingState* tracking,
@@ -779,6 +816,7 @@ void TrackHeldCloudResult(device_ui_internal::CloudDomain domain, bool gated)
         }
         if (event.HasEvent()) {
             button_consumed_this_iter = true;
+            MaybeRecoverDisplayForButton(event, &ui_runtime, &display_tracking, &refresh_schedule);
             // [sleep-race] The activity generation/timestamp were already
             // published at PRODUCTION (PushButtonEvent -> NoteUserActivityAtMs,
             // before the event entered the ring); consuming must not publish
@@ -1386,6 +1424,7 @@ wqn::AiStreamingStatusView streaming_view{};
         // lease is acquired before acceptance; durable work stays off UI.
         refresh_schedule = StrongerSchedule(refresh_schedule,
             device_ui_internal::PumpWordObservationCommit(&ui_runtime));
+        ApplyDisplayRecoveryGate(&ui_runtime, &display_tracking, &refresh_schedule);
         if (refresh_schedule != RefreshSchedule::kNone &&
             state.screen == wqn::UiScreen::kNote &&
             (wqn::NoteImageLoadingGraceActive(
@@ -1644,6 +1683,7 @@ wqn::AiStreamingStatusView streaming_view{};
         // nearest real deadline. Before retained standby the short timeout
         // preserves legacy pump/tick behavior; in retained standby the wait is
         // minute/retry/notification driven and may be indefinite.
+        poll_delay = DisplayRecoveryPollDelay(display_tracking, poll_delay);
         ulTaskNotifyTake(pdTRUE, poll_delay);
     }
 }

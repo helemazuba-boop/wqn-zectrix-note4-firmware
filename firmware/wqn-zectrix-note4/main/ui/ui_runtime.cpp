@@ -72,6 +72,8 @@ const char* AppEventKindName(AppEventKind event)
             return "sync-result";
         case AppEventKind::kDisplayResult:
             return "display-result";
+        case AppEventKind::kDisplayRecovery:
+            return "display-recovery";
         case AppEventKind::kTransferProgress:
             return "transfer-progress";
         case AppEventKind::kWordObservationPersist:
@@ -1503,6 +1505,12 @@ UiUpdate UiRuntime::DispatchDisplayResult(const wqn::display::DisplayResult& res
         failed ? RefreshSchedule::kImmediate : RefreshSchedule::kNone,
         false,
         failed);
+}
+
+UiUpdate UiRuntime::DispatchDisplayRecovery()
+{
+    return FinishEvent(AppEventKind::kDisplayRecovery,
+                       RefreshSchedule::kImmediate, false, true);
 }
 
 }  // namespace device_ui_internal

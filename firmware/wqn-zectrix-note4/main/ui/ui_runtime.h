@@ -48,6 +48,7 @@ enum class AppEventKind : uint8_t {
     kAgentListPoll,
     kWordCardPrefetch,
     kSettingsTick,
+    kDisplayRecovery,
 };
 
 struct UiUpdate {
@@ -97,6 +98,7 @@ public:
     UiUpdate DispatchStatusReload(wqn::AppState&& snapshot);
     UiUpdate DispatchSyncResult(const wqn::services::SyncEvent& event);
     UiUpdate DispatchDisplayResult(const wqn::display::DisplayResult& result);
+    UiUpdate DispatchDisplayRecovery();
     // Folds the runner-side transfer-progress mailbox into the note domain's
     // waiting-page presentation (quantize + throttle live in note_app).
     UiUpdate DispatchTransferProgress(
