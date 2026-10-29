@@ -33,6 +33,36 @@ std::string StringField(cJSON* object, const char* key)
         : "";
 }
 
+bool IsUuid(const char* value)
+{
+    if (value == nullptr) return false;
+    for (size_t index = 0; index < 36; ++index) {
+        const char ch = value[index];
+        if (index == 8 || index == 13 || index == 18 || index == 23) {
+            if (ch != '-') return false;
+        } else if (!((ch >= '0' && ch <= '9') ||
+                     (ch >= 'a' && ch <= 'f') ||
+                     (ch >= 'A' && ch <= 'F'))) {
+            return false;
+        }
+    }
+    return value[36] == '\0';
+}
+
+bool HasUnrepresentableJsonNul(const std::string& body)
+{
+    // cJSON exposes strings as NUL-terminated pointers without a decoded
+    // length. Reject truncation rather than accepting UUID + U+0000 + suffix.
+    if (body.find('\0') != std::string::npos) return true;
+    for (size_t index = 0; index < body.size(); ++index) {
+        if (body[index] == '\\') {
+            if (body.compare(index, 6, "\\u0000") == 0) return true;
+            ++index; // Skip one escaped byte; literal \\u0000 stays valid.
+        }
+    }
+    return false;
+}
+
 bool U64Field(cJSON* object, const char* key, uint64_t* output)
 {
     if (output == nullptr) {
@@ -405,14 +435,18 @@ esp_err_t ParseSyncResponse(
         return ESP_ERR_INVALID_ARG;
     }
     *data = {};
+    SyncData parsed;
     JsonDocument document(body);
     cJSON* payload = nullptr;
     const esp_err_t result = ParseEnvelope(body, expected_request_id, &document, &payload, error);
     if (result != ESP_OK) {
         return result;
     }
-    if (!U64Field(payload, "config_revision", &data->config_revision) ||
-        !U64Field(payload, "sync_cursor", &data->sync_cursor)) {
+    if (HasUnrepresentableJsonNul(body)) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    if (!U64Field(payload, "config_revision", &parsed.config_revision) ||
+        !U64Field(payload, "sync_cursor", &parsed.sync_cursor)) {
         return ESP_ERR_INVALID_RESPONSE;
     }
     cJSON* configuration = cJSON_GetObjectItemCaseSensitive(payload, "configuration");
@@ -434,10 +468,10 @@ esp_err_t ParseSyncResponse(
         auto_sync_interval_minutes != 240) {
         return ESP_ERR_INVALID_RESPONSE;
     }
-    data->auto_sync_interval_minutes = static_cast<uint32_t>(
+    parsed.auto_sync_interval_minutes = static_cast<uint32_t>(
         std::min<uint64_t>(auto_sync_interval_minutes, UINT32_MAX));
-    data->todo_count = static_cast<int>(std::min<uint64_t>(todo_count, INT_MAX));
-    data->word_due_count = static_cast<int>(std::min<uint64_t>(word_due_count, INT_MAX));
+    parsed.todo_count = static_cast<int>(std::min<uint64_t>(todo_count, INT_MAX));
+    parsed.word_due_count = static_cast<int>(std::min<uint64_t>(word_due_count, INT_MAX));
     // Additive field: an older server omits it and the hint stays -1, so the
     // home card keeps rendering the pack size.
     if (cJSON_GetObjectItemCaseSensitive(summaries, "word_mistake_count") != nullptr) {
@@ -445,17 +479,22 @@ esp_err_t ParseSyncResponse(
         if (!U64Field(summaries, "word_mistake_count", &word_mistake_count)) {
             return ESP_ERR_INVALID_RESPONSE;
         }
-        data->word_mistake_count =
+        parsed.word_mistake_count =
             static_cast<int>(std::min<uint64_t>(word_mistake_count, INT_MAX));
     }
     const int count = cJSON_GetArraySize(due);
-    data->due_problem_ids.reserve(count);
-    for (int index = 0; index < count; ++index) {
-        cJSON* item = cJSON_GetArrayItem(due, index);
-        if (!cJSON_IsString(item) || item->valuestring == nullptr || item->valuestring[0] == '\0') {
+    if (count > 100) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    // Validate the entire bounded collection before reserving/copying any IDs.
+    for (const cJSON* item = due->child; item != nullptr; item = item->next) {
+        if (!cJSON_IsString(item) || !IsUuid(item->valuestring)) {
             return ESP_ERR_INVALID_RESPONSE;
         }
-        data->due_problem_ids.emplace_back(item->valuestring);
+    }
+    parsed.due_problem_ids.reserve(count);
+    for (const cJSON* item = due->child; item != nullptr; item = item->next) {
+        parsed.due_problem_ids.emplace_back(item->valuestring);
     }
 
     cJSON* manifest = cJSON_GetObjectItemCaseSensitive(payload, "content_manifest");
@@ -511,9 +550,10 @@ esp_err_t ParseSyncResponse(
                 target.cursor = cursor->valuestring;
             }
             seen[seen_index] = true;
-            data->content_targets.push_back(std::move(target));
+            parsed.content_targets.push_back(std::move(target));
         }
     }
+    *data = std::move(parsed);
     return ESP_OK;
 }
 
