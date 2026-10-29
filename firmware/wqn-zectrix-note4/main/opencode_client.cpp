@@ -17,6 +17,8 @@
 #include "esp_heap_caps.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
+#include "esp_timer.h"
+#include "agent_run_progress.h"
 #include "sse_chunk.h"
 
 namespace wqn {
@@ -274,32 +276,29 @@ esp_err_t OpenJsonRequest(
     return request_result;
 }
 
-void DispatchAgentEvent(
+bool DispatchAgentEvent(
     const std::string& event_name,
     const std::string& data,
     wqn::OpenCodeEventCallback callback,
-    void* callback_ctx)
+    void* callback_ctx,
+    wqn::OpenCodeEvent* event)
 {
-    if (callback == nullptr) {
-        return;
-    }
-    wqn::OpenCodeEvent event;
-    const esp_err_t parsed = wqn::ParseOpenCodeAgentFrame(event_name, data, &event);
+    const esp_err_t parsed = wqn::ParseOpenCodeAgentFrame(event_name, data, event);
     switch (parsed) {
         case ESP_OK:
-            callback(event, callback_ctx);
-            return;
+            if (callback != nullptr) callback(*event, callback_ctx);
+            return true;
         case ESP_ERR_NOT_SUPPORTED:
             // Whitelist stays whitelist: an event the gateway invented and this
             // firmware does not know is dropped, never surfaced as text. Log it
             // at debug level so on-device verification can spot "cloud maps it,
             // firmware does not" without a reflash-to-printf cycle.
             ESP_LOGD(kTag, "unhandled Agent SSE event: %s", event_name.c_str());
-            return;
+            return false;
         default:
             ESP_LOGW(kTag, "dropped Agent SSE frame %s (%s)", event_name.c_str(),
                      esp_err_to_name(parsed));
-            return;
+            return false;
     }
 }
 
@@ -416,7 +415,7 @@ struct AgentStreamRequest {
     std::atomic<bool>* switch_delivered = nullptr;
 };
 
-void DrainOutboundReplies(const AgentStreamRequest& request)
+void DrainOutboundReplies(const AgentStreamRequest& request, wqn::AgentRunProgress& progress)
 {
     if (request.outbound_replies == nullptr) {
         return;
@@ -428,6 +427,7 @@ void DrainOutboundReplies(const AgentStreamRequest& request)
         // long-lived TLS session, and the stream itself keeps its socket.
         const esp_err_t reply_error =
             PostOutboundReply(request.token, request.session_id, reply);
+        progress.Replied(reply, reply_error == ESP_OK, esp_timer_get_time());
         if (reply_error != ESP_OK && request.reply_failed != nullptr) {
             request.reply_failed(reply, reply_error, request.reply_failed_ctx);
         }
@@ -485,8 +485,13 @@ esp_err_t ReadAgentEventStream(const AgentStreamRequest& request)
     if (request_result == ESP_OK) {
         // [interrupt-fix] Connect and header fetch above keep the long
         // timeout; only the streaming read gets the short idle window.
-        esp_http_client_set_timeout_ms(client, kAgentStreamIdleReadTimeoutMs);
+        request_result = esp_http_client_set_timeout_ms(client, kAgentStreamIdleReadTimeoutMs);
+        if (request_result != ESP_OK) {
+            SetResultError(request.result, request.result->http_status, "stream_configuration_failed",
+                           "任务状态未确认，请重新进入任务查看");
+        }
     }
+    wqn::AgentRunProgress progress(request.request_body != nullptr, esp_timer_get_time(), request.session_id);
     wqn::SseFrameBuffer parser;
     std::array<char, 768> buffer = {};
     // Either terminal status ends the read loop: `idle` is the contract's
@@ -525,7 +530,22 @@ esp_err_t ReadAgentEventStream(const AgentStreamRequest& request)
             break;
         }
         // Drain even when the stream is silent; replies must not wait for a heartbeat.
-        DrainOutboundReplies(request);
+        DrainOutboundReplies(request, progress);
+        // A reply POST may have taken time. Do not let deadline recovery eat
+        // an explicit interrupt/switch that arrived while that POST ran.
+        if ((request.interrupt_requested != nullptr && request.interrupt_requested->load(std::memory_order_acquire)) ||
+            (request.switch_requested != nullptr && request.switch_requested->load(std::memory_order_acquire))) {
+            continue;
+        }
+        const auto timeout = progress.Expired(esp_timer_get_time());
+        if (timeout != wqn::AgentRunProgress::Timeout::kNone) {
+            SetResultError(request.result, request.result->http_status,
+                           timeout == wqn::AgentRunProgress::Timeout::kFirstEvent
+                               ? "run_first_event_timeout" : "run_progress_timeout",
+                           "任务状态未确认，请重新进入任务查看");
+            request_result = ESP_ERR_TIMEOUT;
+            break;
+        }
         const int count = esp_http_client_read(client, buffer.data(), buffer.size());
         if (count == -ESP_ERR_HTTP_EAGAIN) {
             // The idle window closed with no bytes: a quiet stream, not a
@@ -554,15 +574,11 @@ esp_err_t ReadAgentEventStream(const AgentStreamRequest& request)
         while (parser.extract(&event_name, &event_id, &event_data) ==
                wqn::SseFrameBuffer::FrameState::kComplete) {
             (void)event_id;
-            DispatchAgentEvent(event_name, event_data, request.callback, request.callback_ctx);
-            if (event_name == "agent.status") {
-                cJSON* status_root = wqn::protocol::JsonNestingWithinLimit(
-                    event_data.data(), event_data.size())
-                    ? cJSON_ParseWithLength(event_data.data(), event_data.size())
-                    : nullptr;
-                const std::string status = JsonString(status_root, "status");
-                terminal_seen = status == "idle" || status == "error";
-                cJSON_Delete(status_root);
+            wqn::OpenCodeEvent event;
+            if (DispatchAgentEvent(event_name, event_data, request.callback, request.callback_ctx, &event)) {
+                progress.Observe(event, esp_timer_get_time());
+                terminal_seen = event.kind == wqn::OpenCodeEventKind::kStatus &&
+                                (event.status == "idle" || event.status == "error");
                 if (terminal_seen) {
                     // Frames after a terminator belong to no run this device is
                     // watching; stop extracting rather than dispatching them.
@@ -823,12 +839,18 @@ esp_err_t RunOpenCodePrompt(
     if (root == nullptr) {
         return ESP_ERR_NO_MEM;
     }
-    cJSON_AddStringToObject(root, "text", prompt.c_str());
-    cJSON_AddBoolToObject(root, "confirmed", true);
+    if (cJSON_AddStringToObject(root, "text", prompt.c_str()) == nullptr ||
+        cJSON_AddBoolToObject(root, "confirmed", true) == nullptr) {
+        cJSON_Delete(root);
+        return ESP_ERR_NO_MEM;
+    }
     // Omitted when empty so a caller with no key keeps the pre-P2 body byte
     // for byte. The cloud validates the shape (16 lowercase hex chars).
     if (!request_id.empty()) {
-        cJSON_AddStringToObject(root, "request_id", request_id.c_str());
+        if (cJSON_AddStringToObject(root, "request_id", request_id.c_str()) == nullptr) {
+            cJSON_Delete(root);
+            return ESP_ERR_NO_MEM;
+        }
     }
     char* printed = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
